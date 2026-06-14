@@ -1,16 +1,13 @@
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { expandHomePath } from "./roots.js";
-import type { AutoCommitConfig, AutoCommitProviderId } from "./autocommit/types.js";
 import type { LoggingConfig, LogFormat, LogLevel } from "./logger.js";
 import type { OAuthConfig } from "./oauth-provider.js";
 
 export type ToolNamingMode = "legacy" | "short";
 export type WidgetMode = "off" | "changes" | "full";
-const DEFAULT_AUTOCOMMIT_MODEL = "gpt-5.3-codex-spark";
 const DEFAULT_OAUTH_ACCESS_TOKEN_TTL_SECONDS = 60 * 60;
 const DEFAULT_OAUTH_REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
-const DEFAULT_AUTOCOMMIT_CODEX_REASONING_EFFORT = "low";
 
 export interface ServerConfig {
   host: string;
@@ -28,7 +25,6 @@ export interface ServerConfig {
   skillPaths: string[];
   agentDir: string;
   logging: LoggingConfig;
-  autocommit: AutoCommitConfig;
 }
 
 function parsePort(value: string | undefined): number {
@@ -113,42 +109,6 @@ function parsePositiveInteger(value: string | undefined, fallback: number, name:
   }
 
   return parsed;
-}
-
-function parseAutoCommitProvider(value: string | undefined): AutoCommitProviderId {
-  const provider = value?.trim() || "codex";
-  if (provider !== "pi" && provider !== "codex") {
-    throw new Error(`Invalid DEVSPACE_AUTOCOMMIT_PROVIDER: ${provider}`);
-  }
-
-  return provider;
-}
-
-function parseAutoCommitConfig(env: NodeJS.ProcessEnv): AutoCommitConfig {
-  const provider = parseAutoCommitProvider(env.DEVSPACE_AUTOCOMMIT_PROVIDER);
-  return {
-    enabled: parseBoolean(env.DEVSPACE_AUTOCOMMIT),
-    provider,
-    afterMutatingToolCalls: parsePositiveInteger(
-      env.DEVSPACE_AUTOCOMMIT_AFTER,
-      8,
-      "DEVSPACE_AUTOCOMMIT_AFTER",
-    ),
-    includeUntracked: parseBoolean(env.DEVSPACE_AUTOCOMMIT_INCLUDE_UNTRACKED),
-    maxDiffBytes: parsePositiveInteger(
-      env.DEVSPACE_AUTOCOMMIT_MAX_DIFF_BYTES,
-      200_000,
-      "DEVSPACE_AUTOCOMMIT_MAX_DIFF_BYTES",
-    ),
-    refPrefix: env.DEVSPACE_AUTOCOMMIT_REF_PREFIX ?? "refs/devspace/autocommit",
-    model:
-      env.DEVSPACE_AUTOCOMMIT_MODEL ??
-      (provider === "codex" ? DEFAULT_AUTOCOMMIT_MODEL : undefined),
-    codexReasoningEffort:
-      env.DEVSPACE_AUTOCOMMIT_CODEX_REASONING_EFFORT ??
-      DEFAULT_AUTOCOMMIT_CODEX_REASONING_EFFORT,
-    codexFastMode: parseBoolean(env.DEVSPACE_AUTOCOMMIT_CODEX_FAST),
-  };
 }
 
 function parseToolNaming(value: string | undefined): ToolNamingMode {
@@ -239,6 +199,5 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     skillPaths: parsePathList(env.DEVSPACE_SKILL_PATHS),
     agentDir: resolve(expandHomePath(env.DEVSPACE_AGENT_DIR ?? defaultAgentDir())),
     logging: parseLoggingConfig(env),
-    autocommit: parseAutoCommitConfig(env),
   };
 }
