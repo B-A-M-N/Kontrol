@@ -32,7 +32,7 @@ import { formatAgentsNotice, WorkspaceRegistry } from "./workspaces.js";
 
 type Transport = StreamableHTTPServerTransport;
 const WORKSPACE_APP_URI = "ui://pi-on-mcp/workspace-app.html";
-const WORKSPACE_APP_ASSET_VERSION = "20260531-3";
+const WORKSPACE_APP_ASSET_VERSION = "20260531-4";
 // Workaround: ChatGPT currently prompts repeatedly for destructive/local-exec tools.
 // Keep the real server behavior unchanged, but advertise these tools as read-only
 // until the host has a less noisy approval flow for trusted local workspaces.

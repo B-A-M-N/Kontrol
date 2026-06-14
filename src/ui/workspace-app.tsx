@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { createRoot } from "react-dom/client";
-import { File, PatchDiff } from "@pierre/diffs/react";
+import { FileStream, getFiletypeFromFileName } from "@pierre/diffs";
+import type { FileStreamOptions } from "@pierre/diffs";
+import { PatchDiff } from "@pierre/diffs/react";
 import {
   App,
   applyDocumentTheme,
@@ -54,6 +56,7 @@ interface ToolPayload {
 
 interface PayloadResult {
   payload?: ToolPayload;
+  summary?: Record<string, unknown>;
 }
 
 function isToolResultCard(value: unknown): value is ToolResultCard {
@@ -158,7 +161,6 @@ function AppRoot() {
       },
       themeType,
       overflow: "scroll" as const,
-      disableFileHeader: true,
     }),
     [themeType],
   );
@@ -197,6 +199,19 @@ function AppRoot() {
         },
       });
       const structured = getStructuredContent<PayloadResult>(result);
+      if (structured?.summary) {
+        setCard((current) =>
+          current?.resultId === card.resultId
+            ? {
+                ...current,
+                summary: {
+                  ...current.summary,
+                  ...structured.summary,
+                },
+              }
+            : current,
+        );
+      }
       setPayload(structured?.payload ?? {});
       setLoadState("loaded");
     } catch (payloadError) {
@@ -283,7 +298,7 @@ function ToolPayloadView({
   payload: ToolPayload | null;
   loadState: LoadState;
   errorMessage: string | null;
-  fileOptions: React.ComponentProps<typeof File>["options"];
+  fileOptions: FileStreamOptions;
   diffOptions: React.ComponentProps<typeof PatchDiff>["options"];
 }) {
   if (loadState === "loading") return <StatusLine message="Loading details..." />;
@@ -305,7 +320,6 @@ function ToolPayloadView({
     return (
       <FilePayload
         path={card.path ?? card.label ?? "file"}
-        resultId={card.resultId}
         text={text}
         startLine={summaryNumber(card.summary, "offset") ?? 1}
         fileOptions={fileOptions}
@@ -318,39 +332,48 @@ function ToolPayloadView({
 
 function FilePayload({
   path,
-  resultId,
   text,
   startLine,
   fileOptions,
 }: {
   path: string;
-  resultId: string;
   text: string;
   startLine: number;
-  fileOptions: React.ComponentProps<typeof File>["options"];
+  fileOptions: FileStreamOptions;
 }) {
-  const adjustedFileOptions = useMemo<React.ComponentProps<typeof File>["options"]>(
-    () => ({
-      ...fileOptions,
-      onPostRender: (node, instance, phase) => {
-        fileOptions?.onPostRender?.(node, instance, phase);
-        adjustFileLineNumbers(node, startLine);
-      },
-    }),
-    [fileOptions, startLine],
-  );
+  const wrapperRef = useRef<HTMLDivElement | null>(null);
 
-  return (
-    <File
-      file={{
-        name: path,
-        contents: text,
-        cacheKey: `${resultId}:${path}:${startLine}`,
-      }}
-      options={adjustedFileOptions}
-      className="pierre-file"
-    />
-  );
+  useEffect(() => {
+    const wrapper = wrapperRef.current;
+    if (!wrapper) return;
+
+    const fileStream = new FileStream({
+      ...fileOptions,
+      lang: getFiletypeFromFileName(path),
+      startingLineIndex: startLine,
+    });
+    const source = new ReadableStream<string>({
+      start(controller) {
+        controller.enqueue(text);
+        controller.close();
+      },
+    });
+    let disposed = false;
+
+    void fileStream.setup(source, wrapper).then(() => {
+      if (!disposed) return;
+      fileStream.cleanUp();
+      wrapper.replaceChildren();
+    });
+
+    return () => {
+      disposed = true;
+      fileStream.cleanUp();
+      wrapper.replaceChildren();
+    };
+  }, [fileOptions, path, startLine, text]);
+
+  return <div ref={wrapperRef} className="pierre-file" />;
 }
 
 function DiffPayload({
@@ -567,25 +590,6 @@ function summaryNumber(
 ): number | undefined {
   const value = summary?.[key];
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
-}
-
-function adjustFileLineNumbers(node: HTMLElement, startLine: number): void {
-  const offset = startLine - 1;
-  if (offset === 0) return;
-
-  const root = node.shadowRoot ?? node;
-  const gutters = root.querySelectorAll<HTMLElement>("[data-column-number][data-line-index]");
-
-  for (const gutter of gutters) {
-    const lineIndex = Number(gutter.dataset.lineIndex);
-    if (!Number.isInteger(lineIndex)) continue;
-
-    const lineNumber = lineIndex + startLine;
-    gutter.dataset.columnNumber = String(lineNumber);
-    gutter
-      .querySelector<HTMLElement>("[data-line-number-content]")
-      ?.replaceChildren(String(lineNumber));
-  }
 }
 
 function EmptyState({
