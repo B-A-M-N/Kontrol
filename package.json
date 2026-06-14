@@ -10,7 +10,7 @@
     "dev": "tsx watch src/server.ts",
     "start": "node dist/server.js",
     "release:build": "node scripts/build-release.mjs",
-    "release:start": "node releases/current/dist/server.js",
+    "release:start": "node scripts/ensure-native-deps.mjs && node releases/current/dist/server.js",
     "test": "tsx src/config.test.ts && tsx src/roots.test.ts && tsx src/skills.test.ts && tsx src/workspaces.test.ts && tsx src/review-checkpoints.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
