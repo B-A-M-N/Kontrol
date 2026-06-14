@@ -117,39 +117,19 @@ body {
   color: var(--color-danger-text, #ee7676);
 }
 
-.diff {
-  max-height: 420px;
-  margin: 0;
-  overflow: auto;
-  padding: 12px 0;
-  font-family: var(--font-mono, ui-monospace, SFMono-Regular, monospace);
-  font-size: var(--font-text-sm-size, 12px);
-  line-height: 1.5;
-}
-
-.line {
+.pierre-diff {
+  --diffs-bg: var(--color-background-primary, #18191d);
+  --diffs-light-bg: var(--color-background-primary, #ffffff);
+  --diffs-dark-bg: var(--color-background-primary, #18191d);
+  --diffs-font-family: var(--font-mono, ui-monospace, SFMono-Regular, monospace);
+  --diffs-header-font-family: var(--font-sans, ui-sans-serif, system-ui, sans-serif);
+  --diffs-font-size: var(--font-text-sm-size, 12px);
+  --diffs-line-height: 20px;
   display: block;
-  min-width: max-content;
-  padding: 0 14px;
-  white-space: pre;
-}
-
-.add-line {
-  background: color-mix(in srgb, var(--color-success-text, #6fda83) 13%, transparent);
-  color: var(--color-success-text, #8be99b);
-}
-
-.remove-line {
-  background: color-mix(in srgb, var(--color-danger-text, #ee7676) 13%, transparent);
-  color: var(--color-danger-text, #ff8b8b);
-}
-
-.hunk-line {
-  color: var(--color-accent-text, #83a7ff);
-}
-
-.context-line {
-  color: var(--color-text-secondary, #c9c9d1);
+  max-height: 420px;
+  overflow: auto;
+  border-bottom-right-radius: 8px;
+  border-bottom-left-radius: 8px;
 }
 
 @media (max-width: 520px) {
