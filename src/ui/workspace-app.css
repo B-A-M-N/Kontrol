@@ -9,14 +9,17 @@
   box-sizing: border-box;
 }
 
+html,
 body {
   margin: 0;
   background: transparent;
+  overflow: hidden;
 }
 
 .shell {
   width: 100%;
-  padding: 8px;
+  padding: 0;
+  overflow: hidden;
 }
 
 .empty,
@@ -25,9 +28,7 @@ body {
   border: 1px solid color-mix(in srgb, var(--color-border-primary, #3a3a40) 86%, transparent);
   border-radius: 8px;
   background: color-mix(in srgb, var(--color-background-secondary, #28282d) 92%, transparent);
-  box-shadow:
-    0 1px 0 color-mix(in srgb, white 7%, transparent) inset,
-    0 12px 30px color-mix(in srgb, black 18%, transparent);
+  box-shadow: none;
   color: var(--color-text-primary, #f5f5f6);
 }
 
