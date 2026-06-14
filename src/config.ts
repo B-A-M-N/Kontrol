@@ -130,16 +130,11 @@ function parseToolNaming(value: string | undefined): ToolNamingMode {
   throw new Error(`Invalid DEVSPACE_TOOL_NAMING: ${value}`);
 }
 
-function parseWidgetMode(env: NodeJS.ProcessEnv): WidgetMode {
-  const value = env.DEVSPACE_WIDGETS ?? env.DEVSPACE_TOOL_CARD_MODE;
-
-  if (!value || value === "changes" || value === "write-only" || value === "minimal") {
-    return "changes";
-  }
+function parseWidgetMode(value: string | undefined): WidgetMode {
+  if (!value || value === "changes") return "changes";
   if (value === "off" || value === "full") return value;
 
-  const variable = env.DEVSPACE_WIDGETS ? "DEVSPACE_WIDGETS" : "DEVSPACE_TOOL_CARD_MODE";
-  throw new Error(`Invalid ${variable}: ${value}`);
+  throw new Error(`Invalid DEVSPACE_WIDGETS: ${value}`);
 }
 
 function defaultStateDir(): string {
@@ -164,7 +159,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     publicBaseUrl: env.DEVSPACE_PUBLIC_BASE_URL ?? "https://agent.gitcms.blog",
     minimalTools: parseMinimalTools(env),
     toolNaming: parseToolNaming(env.DEVSPACE_TOOL_NAMING),
-    widgets: parseWidgetMode(env),
+    widgets: parseWidgetMode(env.DEVSPACE_WIDGETS),
     stateDir: resolve(env.DEVSPACE_STATE_DIR ?? defaultStateDir()),
     worktreeRoot: resolve(expandHomePath(env.DEVSPACE_WORKTREE_ROOT ?? defaultWorktreeRoot())),
     skillsEnabled: parseBoolean(env.DEVSPACE_SKILLS),

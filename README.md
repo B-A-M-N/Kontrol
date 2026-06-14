@@ -42,8 +42,6 @@ default, exposes `review_changes` and only attaches widget UI to that aggregate
 review tool. Use `full` to restore legacy per-tool cards for debugging without
 the aggregate review tool, or `off` to disable widget UI entirely.
 
-`DEVSPACE_TOOL_CARD_MODE` remains supported as a deprecated compatibility alias.
-
 Server-level workflow guidance is exposed through MCP initialize instructions,
 not a dedicated info tool.
 
