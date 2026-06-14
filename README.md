@@ -141,56 +141,6 @@ DEVSPACE_WIDGETS="changes" \
 npm run dev
 ```
 
-## Automatic Git Commits
-
-DevSpace can optionally create background git commits after successful mutating
-MCP tool calls. This feature is disabled by default and never blocks normal tool
-responses.
-
-Enable it with:
-
-```bash
-DEVSPACE_AUTOCOMMIT="on" \
-DEVSPACE_AUTOCOMMIT_AFTER="8"
-```
-
-Autocommit counts successful `write`, `edit`, and shell tool calls only. Read,
-search, list, and workspace-opening calls do not count toward the threshold. When
-the threshold is reached, DevSpace captures hidden checkpoint refs, diffs the
-current checkpoint against the workspace baseline, asks the configured provider
-for structured commit metadata, validates the diff is stable, and performs the
-git commit itself.
-
-Providers reuse local auth/config. `DEVSPACE_AUTOCOMMIT_PROVIDER` accepts one
-provider, either `codex` or `pi`, with no fallback chain. When autocommit is
-enabled and no provider is configured, DevSpace uses `codex`. The `codex`
-provider uses the local `codex exec` command in a read-only sandbox with
-structured output. The `pi` provider uses Pi with all tools disabled; when
-`DEVSPACE_AUTOCOMMIT_MODEL` is set for Pi, use `provider/model` format. DevSpace
-does not add API key environment variables for either provider.
-
-Safety rules in the first version:
-
-- requires an existing Git repository with a HEAD commit
-- does not run `git init` or create the first commit
-- pauses when pre-existing staged changes are detected
-- skips pre-existing dirty or untracked paths
-- skips untracked files by default
-- stages only safe DevSpace-owned paths
-- skips instead of committing when the provider fails or returns invalid metadata
-
-Additional optional settings:
-
-```bash
-DEVSPACE_AUTOCOMMIT_INCLUDE_UNTRACKED="false"
-DEVSPACE_AUTOCOMMIT_MAX_DIFF_BYTES="200000"
-DEVSPACE_AUTOCOMMIT_REF_PREFIX="refs/devspace/autocommit"
-DEVSPACE_AUTOCOMMIT_PROVIDER="codex"
-DEVSPACE_AUTOCOMMIT_MODEL="gpt-5.3-codex-spark"
-DEVSPACE_AUTOCOMMIT_CODEX_REASONING_EFFORT="low"
-DEVSPACE_AUTOCOMMIT_CODEX_FAST="false"
-```
-
 ## Release Builds
 
 Use release builds for long-running MCP server processes:
