@@ -1,7 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { git, getGitEligibility, safeWorkspaceRefSegment } from "./autocommit/git.js";
+import { git, getGitEligibility, safeWorkspaceRefSegment } from "./git.js";
 
 export type ReviewSince = "last_review" | "workspace_open";
 
