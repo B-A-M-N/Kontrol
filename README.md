@@ -127,11 +127,49 @@ read.
 npm install --include=dev
 npm run typecheck
 npm run build
+npm run start
+```
 
+The CLI creates first-run config when needed:
+
+```bash
+devspace init
+devspace serve
+```
+
+The default config files are:
+
+```text
+~/.devspace/config.json
+~/.devspace/auth.json
+```
+
+`auth.json` contains the generated owner token used by the local OAuth approval
+screen. Keep it private.
+
+For temporary tunnel or reverse-proxy URLs, keep the URL out of persistent
+config and pass it for that run:
+
+```bash
+DEVSPACE_PUBLIC_BASE_URL="https://your-temporary-host.example.com" devspace serve
+```
+
+For stable public URLs, persist it once:
+
+```bash
+devspace config set publicBaseUrl https://devspace.example.com
+devspace serve
+```
+
+DevSpace derives the inbound Host allowlist from the resolved public URL, so
+most users do not need to configure `DEVSPACE_ALLOWED_HOSTS`.
+
+For env-driven development without persisted config:
+
+```bash
 DEVSPACE_OAUTH_OWNER_TOKEN="$(openssl rand -base64 32)" \
 DEVSPACE_ALLOWED_ROOTS="/home/waishnav/personal,/home/waishnav/work" \
-DEVSPACE_ALLOWED_HOSTS="localhost,127.0.0.1,agent.gitcms.blog" \
-DEVSPACE_PUBLIC_BASE_URL="https://agent.gitcms.blog" \
+DEVSPACE_PUBLIC_BASE_URL="https://devspace.example.com" \
 DEVSPACE_WORKTREE_ROOT="/home/waishnav/.devspace/worktrees" \
 DEVSPACE_SKILLS="1" \
 DEVSPACE_SKILL_PATHS="/home/waishnav/.codex/skills,/home/waishnav/.claude/skills" \
@@ -151,8 +189,7 @@ npm run release:build
 env \
   DEVSPACE_OAUTH_OWNER_TOKEN="your-long-random-owner-token" \
   DEVSPACE_ALLOWED_ROOTS="/home/waishnav/personal,/home/waishnav/work" \
-  DEVSPACE_ALLOWED_HOSTS="localhost,127.0.0.1,agent.gitcms.blog" \
-  DEVSPACE_PUBLIC_BASE_URL="https://agent.gitcms.blog" \
+  DEVSPACE_PUBLIC_BASE_URL="https://devspace.example.com" \
   DEVSPACE_WORKTREE_ROOT="/home/waishnav/.devspace/worktrees" \
   DEVSPACE_TOOL_MODE="minimal" \
   DEVSPACE_TOOL_NAMING="short" \
@@ -195,26 +232,39 @@ configured `/mcp` endpoint, and must be sent by the MCP client as a normal
 
 ## Cloudflare Tunnel
 
-Point a Cloudflare Tunnel hostname at the local server:
+DevSpace does not create or manage tunnels. Point your tunnel, reverse proxy, or
+public ingress at the local server:
 
 ```text
 http://127.0.0.1:7676
 ```
 
-Then configure the remote MCP client with:
+Then start DevSpace with that public origin:
+
+```bash
+DEVSPACE_PUBLIC_BASE_URL="https://your-tunnel-hostname.example.com" devspace serve
+```
+
+Configure the remote MCP client with:
 
 ```text
 https://your-tunnel-hostname.example.com/mcp
 ```
+
+If your tunnel URL changes every run, pass the new URL through
+`DEVSPACE_PUBLIC_BASE_URL` for that run instead of saving it in config.
 
 ## Security Notes
 
 This server exposes local filesystem and shell capabilities. Treat it like
 remote code execution on this machine.
 
-- Always set a long random `DEVSPACE_OAUTH_OWNER_TOKEN`; generate one with `openssl rand -base64 32`.
+- Let `devspace init` generate the owner token, or set a long random
+  `DEVSPACE_OAUTH_OWNER_TOKEN` for env-driven deployments.
 - Keep `DEVSPACE_ALLOWED_ROOTS` narrow.
-- If you expose the server through a tunnel, add the tunnel hostname to `DEVSPACE_ALLOWED_HOSTS`.
+- `DEVSPACE_ALLOWED_HOSTS` is derived from `DEVSPACE_PUBLIC_BASE_URL` by default.
+  Use `DEVSPACE_ALLOWED_HOSTS=*` only for local debugging when you intentionally
+  want to disable Host header allowlist protection.
 - Put Cloudflare Access or equivalent in front of the tunnel before exposing it when possible; OAuth still protects the MCP endpoint if the tunnel URL leaks.
 - The shell tool can escape filesystem allowlists by design; shell access relies
   on authentication and client trust, not path containment.

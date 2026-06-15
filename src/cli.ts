@@ -1,10 +1,9 @@
 #!/usr/bin/env node
 import { createInterface } from "node:readline/promises";
+import { createRequire } from "node:module";
 import { stdin as input, stdout as output } from "node:process";
 import { resolve } from "node:path";
-import Database from "better-sqlite3";
 import { loadConfig } from "./config.js";
-import { createServer } from "./server.js";
 import {
   generateOwnerToken,
   loadDevspaceFiles,
@@ -15,6 +14,7 @@ import {
 import { expandHomePath } from "./roots.js";
 
 type Command = "serve" | "init" | "doctor" | "config" | "help";
+const require = createRequire(import.meta.url);
 
 async function main(argv: string[]): Promise<void> {
   const [rawCommand, ...args] = argv;
@@ -23,7 +23,7 @@ async function main(argv: string[]): Promise<void> {
   switch (command) {
     case "serve":
       await ensureConfigured();
-      serve();
+      await serve();
       return;
     case "init":
       await runInit({ force: args.includes("--force") });
@@ -136,7 +136,21 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
   }
 }
 
-function serve(): void {
+async function serve(): Promise<void> {
+  const sqliteStatus = checkSqliteNative();
+  if (sqliteStatus !== "ok") {
+    throw new Error(
+      [
+        "better-sqlite3 could not load for this Node runtime.",
+        sqliteStatus,
+        "",
+        "Try reinstalling or rebuilding dependencies under the active Node version:",
+        "  npm rebuild better-sqlite3",
+      ].join("\n"),
+    );
+  }
+
+  const { createServer } = await import("./server.js");
   const config = loadConfig();
   const { app } = createServer(config);
   const httpServer = app.listen(config.port, config.host, () => {
@@ -247,6 +261,7 @@ function normalizeOptionalPublicBaseUrl(value: string): string | null {
 
 function checkSqliteNative(): string {
   try {
+    const Database = require("better-sqlite3") as typeof import("better-sqlite3");
     const db = new Database(":memory:");
     db.close();
     return "ok";
