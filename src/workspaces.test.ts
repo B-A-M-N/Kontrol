@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, rm, stat, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdtemp, mkdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { platform, tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import assert from "node:assert/strict";
@@ -104,6 +104,23 @@ try {
   assert.equal(restoredWorktree.root, persistentWorktree.workspace.root);
   assert.equal(restoredWorktree.worktree?.managed, true);
   secondStore.close();
+
+  if (platform() !== "win32") {
+    const aliasRoot = join(root, "alias-root");
+    await symlink(root, aliasRoot, "dir");
+    const aliasConfig = loadConfig({
+      DEVSPACE_ALLOWED_ROOTS: aliasRoot,
+      DEVSPACE_WORKTREE_ROOT: join(aliasRoot, ".devspace", "alias-worktrees"),
+      DEVSPACE_AGENT_DIR: agentDir,
+      DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+      PORT: "1",
+    });
+    const aliasWorkspace = await new WorkspaceRegistry(aliasConfig).openWorkspace({
+      path: join(aliasRoot, "git-project"),
+      mode: "worktree",
+    });
+    assert.equal(aliasWorkspace.workspace.sourceRoot, join(aliasRoot, "git-project"));
+  }
 } finally {
   await rm(root, { recursive: true, force: true });
 }

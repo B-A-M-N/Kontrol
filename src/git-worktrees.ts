@@ -2,9 +2,9 @@ import { randomBytes } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { mkdir, realpath, rm, stat } from "node:fs/promises";
-import { basename, join } from "node:path";
+import { basename, join, relative, resolve } from "node:path";
 import type { ServerConfig } from "./config.js";
-import { assertAllowedPath } from "./roots.js";
+import { assertAllowedPath, isPathInsideRoot } from "./roots.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -93,7 +93,7 @@ export async function createManagedWorktree(input: {
 async function resolveGitRoot(path: string, allowedRoots: string[]): Promise<string> {
   try {
     const output = await git(["rev-parse", "--show-toplevel"], path);
-    return assertAllowedPath(await realpath(output.trim()), allowedRoots);
+    return await assertGitRootAllowed(output.trim(), allowedRoots);
   } catch (error) {
     if (isGitUnavailable(error)) {
       throw new GitWorktreeError(
@@ -106,6 +106,25 @@ async function resolveGitRoot(path: string, allowedRoots: string[]): Promise<str
       "GIT_REPOSITORY_NOT_FOUND",
       `Cannot open workspace in worktree mode because this path is not inside a Git repository: ${path}. Use mode=\"checkout\" to work directly in this directory, or initialize Git and create an initial commit first.`,
     );
+  }
+}
+
+async function assertGitRootAllowed(gitRoot: string, allowedRoots: string[]): Promise<string> {
+  try {
+    return assertAllowedPath(gitRoot, allowedRoots);
+  } catch {
+    const canonicalGitRoot = await realpath(gitRoot);
+    for (const allowedRoot of allowedRoots) {
+      const canonicalAllowedRoot = await realpath(allowedRoot).catch(() => undefined);
+      if (!canonicalAllowedRoot || !isPathInsideRoot(canonicalGitRoot, canonicalAllowedRoot)) {
+        continue;
+      }
+
+      const logicalGitRoot = resolve(allowedRoot, relative(canonicalAllowedRoot, canonicalGitRoot));
+      return assertAllowedPath(logicalGitRoot, allowedRoots);
+    }
+
+    return assertAllowedPath(canonicalGitRoot, allowedRoots);
   }
 }
 
