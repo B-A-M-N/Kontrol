@@ -80,7 +80,13 @@ function parseBoolean(value: string | undefined): boolean {
 }
 
 function parseMinimalTools(env: NodeJS.ProcessEnv): boolean {
-  return env.DEVSPACE_TOOL_MODE === "minimal" || parseBoolean(env.DEVSPACE_MINIMAL_TOOLS);
+  if (env.DEVSPACE_TOOL_MODE === "minimal") return true;
+  if (env.DEVSPACE_TOOL_MODE === "full") return false;
+  if (env.DEVSPACE_TOOL_MODE) {
+    throw new Error(`Invalid DEVSPACE_TOOL_MODE: ${env.DEVSPACE_TOOL_MODE}`);
+  }
+  if (env.DEVSPACE_MINIMAL_TOOLS !== undefined) return parseBoolean(env.DEVSPACE_MINIMAL_TOOLS);
+  return true;
 }
 
 function parseLogLevel(value: string | undefined): LogLevel {
@@ -128,8 +134,8 @@ function parsePositiveInteger(value: string | undefined, fallback: number, name:
 }
 
 function parseToolNaming(value: string | undefined): ToolNamingMode {
-  if (!value || value === "legacy") return "legacy";
-  if (value === "short") return "short";
+  if (!value || value === "short") return "short";
+  if (value === "legacy") return "legacy";
 
   throw new Error(`Invalid DEVSPACE_TOOL_NAMING: ${value}`);
 }
@@ -147,8 +153,8 @@ function parseLoggingConfig(env: NodeJS.ProcessEnv): LoggingConfig {
 }
 
 function parseWidgetMode(value: string | undefined): WidgetMode {
-  if (!value || value === "changes") return "changes";
-  if (value === "off" || value === "full") return value;
+  if (!value || value === "full") return "full";
+  if (value === "off" || value === "changes") return value;
 
   throw new Error(`Invalid DEVSPACE_WIDGETS: ${value}`);
 }

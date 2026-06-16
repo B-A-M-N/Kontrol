@@ -4,15 +4,25 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "./config.js";
 
+const emptyConfigDir = mkdtempSync(join(tmpdir(), "devspace-empty-config-test-"));
 const baseEnv = {
+  DEVSPACE_CONFIG_DIR: emptyConfigDir,
   DEVSPACE_ALLOWED_ROOTS: process.cwd(),
   DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
 };
 
-assert.equal(loadConfig(baseEnv).widgets, "changes");
+assert.equal(loadConfig(baseEnv).widgets, "full");
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_WIDGETS: "changes" }).widgets, "changes");
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_WIDGETS: "full" }).widgets, "full");
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_WIDGETS: "off" }).widgets, "off");
+assert.equal(loadConfig(baseEnv).toolNaming, "short");
+assert.equal(loadConfig({ ...baseEnv, DEVSPACE_TOOL_NAMING: "short" }).toolNaming, "short");
+assert.equal(loadConfig({ ...baseEnv, DEVSPACE_TOOL_NAMING: "legacy" }).toolNaming, "legacy");
+assert.equal(loadConfig(baseEnv).minimalTools, true);
+assert.equal(loadConfig({ ...baseEnv, DEVSPACE_TOOL_MODE: "minimal" }).minimalTools, true);
+assert.equal(loadConfig({ ...baseEnv, DEVSPACE_TOOL_MODE: "full" }).minimalTools, false);
+assert.equal(loadConfig({ ...baseEnv, DEVSPACE_MINIMAL_TOOLS: "0" }).minimalTools, false);
+assert.equal(loadConfig({ ...baseEnv, DEVSPACE_MINIMAL_TOOLS: "1" }).minimalTools, true);
 assert.equal(loadConfig(baseEnv).skillsEnabled, true);
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_SKILLS: "0" }).skillsEnabled, false);
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_SKILLS: "1" }).skillsEnabled, true);
@@ -28,6 +38,14 @@ assert.throws(
 assert.throws(
   () => loadConfig({ ...baseEnv, DEVSPACE_WIDGETS: "write-only" }),
   /Invalid DEVSPACE_WIDGETS: write-only/,
+);
+assert.throws(
+  () => loadConfig({ ...baseEnv, DEVSPACE_TOOL_MODE: "invalid" }),
+  /Invalid DEVSPACE_TOOL_MODE: invalid/,
+);
+assert.throws(
+  () => loadConfig({ ...baseEnv, DEVSPACE_TOOL_NAMING: "invalid" }),
+  /Invalid DEVSPACE_TOOL_NAMING: invalid/,
 );
 
 assert.deepEqual(loadConfig(baseEnv).logging, {
@@ -96,7 +114,7 @@ assert.equal(
 );
 
 assert.throws(
-  () => loadConfig({ DEVSPACE_ALLOWED_ROOTS: process.cwd() }),
+  () => loadConfig({ DEVSPACE_CONFIG_DIR: emptyConfigDir, DEVSPACE_ALLOWED_ROOTS: process.cwd() }),
   /DEVSPACE_OAUTH_OWNER_TOKEN is required/,
 );
 assert.throws(
