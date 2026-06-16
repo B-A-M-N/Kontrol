@@ -85,7 +85,7 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
 
     const defaultRoots = files.config.allowedRoots?.join(", ") || process.cwd();
     const rootsAnswer = await textPrompt({
-      message: "Where are your projects located?",
+      message: `Where are your projects located? Press Enter to use ${defaultRoots}`,
       placeholder: defaultRoots,
       defaultValue: defaultRoots,
       validate: (value) => value?.trim() ? undefined : "Enter at least one project root.",
@@ -95,10 +95,11 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
       .map((root) => resolve(expandHomePath(root.trim())))
       .filter(Boolean);
 
+    const defaultPort = String(files.config.port ?? 7676);
     const portAnswer = await textPrompt({
-      message: "Which local port should DevSpace use?",
-      placeholder: String(files.config.port ?? 7676),
-      defaultValue: String(files.config.port ?? 7676),
+      message: `Which local port should DevSpace use? Press Enter to use ${defaultPort}`,
+      placeholder: defaultPort,
+      defaultValue: defaultPort,
       validate: validatePort,
     });
     const port = Number(portAnswer);
@@ -109,7 +110,9 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
     });
     const publicBaseUrl = configurePublicUrl
       ? normalizeOptionalPublicBaseUrl(await textPrompt({
-          message: "What is the public base URL?",
+          message: files.config.publicBaseUrl
+            ? `What is the public base URL? Press Enter to use ${files.config.publicBaseUrl}`
+            : "What is the public base URL?",
           placeholder: files.config.publicBaseUrl ?? "https://devspace.example.com",
           defaultValue: files.config.publicBaseUrl ?? "",
           validate: validateOptionalPublicBaseUrl,
@@ -261,8 +264,16 @@ function normalizeOptionalPublicBaseUrl(value: string): string | null {
   return parsed.toString().replace(/\/$/, "");
 }
 
-async function textPrompt(options: Parameters<typeof prompts.text>[0] & { defaultValue: string }): Promise<string> {
-  const result = await prompts.text(options);
+type TextPromptOptions = Omit<Parameters<typeof prompts.text>[0], "validate"> & {
+  defaultValue: string;
+  validate?: (value: string | undefined) => string | Error | undefined;
+};
+
+async function textPrompt(options: TextPromptOptions): Promise<string> {
+  const result = await prompts.text({
+    ...options,
+    validate: (value) => options.validate?.(value?.trim() ? value : options.defaultValue),
+  });
   if (prompts.isCancel(result)) throw new SetupCancelledError();
   const value = String(result).trim();
   return value || options.defaultValue;
