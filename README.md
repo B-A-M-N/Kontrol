@@ -150,9 +150,9 @@ The default config files are:
 ~/.devspace/auth.json
 ```
 
-`auth.json` contains the generated Owner password used by the local approval
-screen. Keep it private. You will need that password when ChatGPT or Claude asks
-you to approve DevSpace access.
+`devspace init` prints the Owner password and stores it in `auth.json`. Keep it
+private. You will need that password when ChatGPT or Claude asks you to approve
+DevSpace access.
 
 Before entering the public base URL, create a tunnel or reverse proxy with a
 service such as Cloudflare Tunnel, ngrok, Pinggy, Tailscale Funnel, or your own

@@ -145,7 +145,7 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
     prompts.note(lines.join("\n"), "DevSpace configured");
     prompts.note(
       [
-        "Owner password: generated in the auth file",
+        `Owner password: ${auth.ownerToken}`,
         "Use this when ChatGPT or Claude asks you to approve DevSpace access.",
         `Stored at: ${authPath}`,
       ].join("\n"),
