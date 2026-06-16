@@ -73,8 +73,16 @@ writeFileSync(
 );
 
 rmSync(tmpLink, { force: true, recursive: true });
-symlinkSync(releaseId, tmpLink, "dir");
-renameSync(tmpLink, currentLink);
+try {
+  symlinkSync(releaseId, tmpLink, "dir");
+  renameSync(tmpLink, currentLink);
+} catch (error) {
+  rmSync(tmpLink, { force: true, recursive: true });
+  rmSync(currentLink, { force: true, recursive: true });
+  cpSync(releaseDir, currentLink, { recursive: true });
+  const reason = error instanceof Error ? error.message : String(error);
+  console.warn(`Could not update releases/current as a symlink; copied release instead. ${reason}`);
+}
 
 console.log(`Created release ${releaseId}`);
 console.log(`Run it with: npm run release:start`);
