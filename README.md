@@ -126,6 +126,22 @@ read.
 
 DevSpace requires Node `>=20.12 <27`; Node 22 LTS is the recommended runtime.
 
+## Platform Support
+
+DevSpace is supported on Linux, macOS, and Windows environments that provide a
+Bash-compatible shell. On Windows, install Git for Windows, use WSL, or provide
+another Bash-compatible shell through `PATH`.
+
+The shell tool executes Bash commands. Native PowerShell and `cmd.exe` command
+execution are not supported yet.
+
+| Platform | Status | Notes |
+| --- | --- | --- |
+| Linux | Supported | Requires Node, npm, Git, and Bash. |
+| macOS | Supported | Requires Node, npm, Git, and Bash. |
+| Windows with Git Bash, WSL, MSYS2, or Cygwin Bash | Supported | Git Bash is the simplest native Windows setup. |
+| Windows PowerShell or `cmd.exe` only | Not supported yet | Install Git Bash or use WSL. |
+
 ```bash
 npm install --include=dev
 npm run typecheck
@@ -195,6 +211,24 @@ DEVSPACE_TOOL_NAMING="legacy" \
 DEVSPACE_WIDGETS="changes" \
 npm run dev
 ```
+
+On macOS, project roots usually look like:
+
+```bash
+DEVSPACE_ALLOWED_ROOTS="/Users/alice/personal,/Users/alice/work" npm run dev
+```
+
+On Windows PowerShell, set environment variables before starting DevSpace:
+
+```powershell
+$env:DEVSPACE_OAUTH_OWNER_TOKEN = "your-long-random-owner-token"
+$env:DEVSPACE_ALLOWED_ROOTS = "C:\Users\alice\dev,C:\Users\alice\work"
+$env:DEVSPACE_PUBLIC_BASE_URL = "https://devspace.example.com"
+npm run dev
+```
+
+Windows command execution still requires Git Bash, WSL, MSYS2, or Cygwin Bash.
+Use `devspace doctor` to confirm that DevSpace can find a compatible shell.
 
 ## Release Builds
 
