@@ -108,11 +108,12 @@ instruction file before working under that path.
 
 ## Skills
 
-Skills are disabled by default. Set `DEVSPACE_SKILLS=1` to expose Agent Skills
-through `open_workspace` output. DevSpace uses Pi's skill loader to discover
-skills from `DEVSPACE_AGENT_DIR` (`~/.pi/agent` by default), project `.pi/skills`,
-and optional comma-separated `DEVSPACE_SKILL_PATHS` for locations such as
-`~/.agents/skills`, `~/.codex/skills`, or `~/.claude/skills`.
+Skills are enabled by default for Codex-oriented workflows. Set
+`DEVSPACE_SKILLS=0` to hide Agent Skills from `open_workspace` output. DevSpace
+uses Pi's skill loader to discover skills from `DEVSPACE_AGENT_DIR` (`~/.codex`
+by default), project `.pi/skills`, and optional comma-separated
+`DEVSPACE_SKILL_PATHS` for locations such as `~/.agents/skills`,
+`~/.codex/skills`, or `~/.claude/skills`.
 
 When enabled, `open_workspace` returns a structured catalog of skill names,
 descriptions, and readable `SKILL.md` paths. The model should use the normal
@@ -188,7 +189,6 @@ DEVSPACE_OAUTH_OWNER_TOKEN="$(openssl rand -base64 32)" \
 DEVSPACE_ALLOWED_ROOTS="/home/waishnav/personal,/home/waishnav/work" \
 DEVSPACE_PUBLIC_BASE_URL="https://devspace.example.com" \
 DEVSPACE_WORKTREE_ROOT="/home/waishnav/.devspace/worktrees" \
-DEVSPACE_SKILLS="1" \
 DEVSPACE_SKILL_PATHS="/home/waishnav/.codex/skills,/home/waishnav/.claude/skills" \
 DEVSPACE_TOOL_MODE="full" \
 DEVSPACE_TOOL_NAMING="legacy" \
