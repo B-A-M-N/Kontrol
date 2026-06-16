@@ -1,8 +1,9 @@
 #!/usr/bin/env node
-import { createInterface } from "node:readline/promises";
 import { createRequire } from "node:module";
 import { stdin as input, stdout as output } from "node:process";
 import { resolve } from "node:path";
+import * as prompts from "@clack/prompts";
+import { satisfies } from "semver";
 import { loadConfig } from "./config.js";
 import {
   generateOwnerToken,
@@ -15,8 +16,11 @@ import { expandHomePath } from "./roots.js";
 
 type Command = "serve" | "init" | "doctor" | "config" | "help";
 const require = createRequire(import.meta.url);
+const SUPPORTED_NODE_RANGE = ">=20.12 <27";
 
 async function main(argv: string[]): Promise<void> {
+  assertSupportedNode();
+
   const [rawCommand, ...args] = argv;
   const command = normalizeCommand(rawCommand);
 
@@ -71,43 +75,46 @@ async function ensureConfigured(): Promise<void> {
 async function runInit({ force }: { force: boolean }): Promise<void> {
   const files = loadDevspaceFiles();
   if (!force && files.configExists && files.authExists) {
-    console.log(`DevSpace is already configured at ${files.dir}`);
-    console.log("Run `devspace init --force` to update it.");
+    prompts.log.info(`DevSpace is already configured at ${files.dir}`);
+    prompts.log.info("Run `devspace init --force` to update it.");
     return;
   }
 
-  const rl = createInterface({ input, output });
   try {
-    console.log("No DevSpace config found. Let's set it up.");
-    console.log("");
+    prompts.intro("DevSpace setup");
 
     const defaultRoots = files.config.allowedRoots?.join(", ") || process.cwd();
-    const rootsAnswer = await promptWithDefault(
-      rl,
-      "Where are your projects located?",
-      defaultRoots,
-    );
+    const rootsAnswer = await textPrompt({
+      message: "Where are your projects located?",
+      placeholder: defaultRoots,
+      defaultValue: defaultRoots,
+      validate: (value) => value?.trim() ? undefined : "Enter at least one project root.",
+    });
     const allowedRoots = rootsAnswer
       .split(",")
       .map((root) => resolve(expandHomePath(root.trim())))
       .filter(Boolean);
 
-    const portAnswer = await promptWithDefault(
-      rl,
-      "Which local port should DevSpace use?",
-      String(files.config.port ?? 7676),
-    );
+    const portAnswer = await textPrompt({
+      message: "Which local port should DevSpace use?",
+      placeholder: String(files.config.port ?? 7676),
+      defaultValue: String(files.config.port ?? 7676),
+      validate: validatePort,
+    });
     const port = Number(portAnswer);
-    if (!Number.isInteger(port) || port < 1 || port > 65535) {
-      throw new Error(`Invalid port: ${portAnswer}`);
-    }
 
-    const publicBaseUrlAnswer = await promptWithDefault(
-      rl,
-      "Public base URL for a tunnel or reverse proxy? Leave blank for local-only.",
-      files.config.publicBaseUrl ?? "",
-    );
-    const publicBaseUrl = normalizeOptionalPublicBaseUrl(publicBaseUrlAnswer);
+    const configurePublicUrl = await confirmPrompt({
+      message: "Do you have a stable public URL for a tunnel or reverse proxy?",
+      initialValue: Boolean(files.config.publicBaseUrl),
+    });
+    const publicBaseUrl = configurePublicUrl
+      ? normalizeOptionalPublicBaseUrl(await textPrompt({
+          message: "What is the public base URL?",
+          placeholder: files.config.publicBaseUrl ?? "https://devspace.example.com",
+          defaultValue: files.config.publicBaseUrl ?? "",
+          validate: validateOptionalPublicBaseUrl,
+        }))
+      : null;
 
     const config: DevspaceUserConfig = {
       host: files.config.host ?? "127.0.0.1",
@@ -122,17 +129,20 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
     const configPath = writeDevspaceConfig(config);
     const authPath = writeDevspaceAuth(auth);
 
-    console.log("");
-    console.log("DevSpace is configured.");
-    console.log(`Config: ${configPath}`);
-    console.log(`Auth: ${authPath}`);
-    console.log("");
-    console.log(`Local MCP URL: http://${config.host}:${config.port}/mcp`);
-    if (publicBaseUrl) {
-      console.log(`Public MCP URL: ${publicBaseUrl}/mcp`);
+    const lines = [
+      `Config: ${configPath}`,
+      `Auth: ${authPath}`,
+      `Local MCP URL: http://${config.host}:${config.port}/mcp`,
+      ...(publicBaseUrl ? [`Public MCP URL: ${publicBaseUrl}/mcp`] : []),
+    ];
+    prompts.note(lines.join("\n"), "DevSpace configured");
+    prompts.outro("Run `devspace serve` to start the MCP server.");
+  } catch (error) {
+    if (error instanceof SetupCancelledError) {
+      prompts.cancel("Setup cancelled");
+      return;
     }
-  } finally {
-    rl.close();
+    throw error;
   }
 }
 
@@ -177,7 +187,9 @@ async function runDoctor(): Promise<void> {
   console.log(`Config dir: ${files.dir}`);
   console.log(`Config file: ${files.configExists ? files.configPath : "missing"}`);
   console.log(`Auth file: ${files.authExists ? files.authPath : "missing"}`);
-  console.log(`Node: ${process.version}`);
+  console.log(`Node: ${process.version} (${nodeVersionStatus()})`);
+  console.log(`Node ABI: ${process.versions.modules}`);
+  console.log(`Platform: ${process.platform} ${process.arch}`);
   console.log(`SQLite native dependency: ${checkSqliteNative()}`);
 
   try {
@@ -238,16 +250,6 @@ function printHelp(): void {
   );
 }
 
-async function promptWithDefault(
-  rl: ReturnType<typeof createInterface>,
-  question: string,
-  defaultValue: string,
-): Promise<string> {
-  const suffix = defaultValue ? ` (${defaultValue})` : "";
-  const answer = await rl.question(`${question}${suffix}\n> `);
-  return answer.trim() || defaultValue;
-}
-
 function normalizeOptionalPublicBaseUrl(value: string): string | null {
   const trimmed = value.trim();
   if (!trimmed || trimmed === "null" || trimmed === "none") return null;
@@ -258,6 +260,61 @@ function normalizeOptionalPublicBaseUrl(value: string): string | null {
   parsed.pathname = parsed.pathname.replace(/\/+$/, "");
   return parsed.toString().replace(/\/$/, "");
 }
+
+async function textPrompt(options: Parameters<typeof prompts.text>[0] & { defaultValue: string }): Promise<string> {
+  const result = await prompts.text(options);
+  if (prompts.isCancel(result)) throw new SetupCancelledError();
+  const value = String(result).trim();
+  return value || options.defaultValue;
+}
+
+async function confirmPrompt(options: Parameters<typeof prompts.confirm>[0]): Promise<boolean> {
+  const result = await prompts.confirm(options);
+  if (prompts.isCancel(result)) throw new SetupCancelledError();
+  return Boolean(result);
+}
+
+function validatePort(value: string | undefined): string | undefined {
+  const port = Number(value);
+  return Number.isInteger(port) && port >= 1 && port <= 65535
+    ? undefined
+    : "Enter a port between 1 and 65535.";
+}
+
+function validateOptionalPublicBaseUrl(value: string | undefined): string | undefined {
+  const trimmed = value?.trim() ?? "";
+  if (!trimmed || trimmed === "null" || trimmed === "none") return undefined;
+
+  try {
+    const parsed = new URL(trimmed);
+    return parsed.protocol === "http:" || parsed.protocol === "https:"
+      ? undefined
+      : "Use an http or https URL.";
+  } catch {
+    return "Enter a valid URL, for example https://devspace.example.com.";
+  }
+}
+
+function assertSupportedNode(): void {
+  if (satisfies(process.versions.node, SUPPORTED_NODE_RANGE)) return;
+
+  throw new Error(
+    [
+      `DevSpace requires Node ${SUPPORTED_NODE_RANGE}.`,
+      `Current Node: ${process.version}`,
+      "",
+      "Install Node 22 LTS or use a version manager such as nvm, fnm, or mise.",
+    ].join("\n"),
+  );
+}
+
+function nodeVersionStatus(): string {
+  return satisfies(process.versions.node, SUPPORTED_NODE_RANGE)
+    ? `supported ${SUPPORTED_NODE_RANGE}`
+    : `unsupported, requires ${SUPPORTED_NODE_RANGE}`;
+}
+
+class SetupCancelledError extends Error {}
 
 function checkSqliteNative(): string {
   try {

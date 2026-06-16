@@ -123,6 +123,8 @@ read.
 
 ## Run Locally
 
+DevSpace requires Node `>=20.12 <27`; Node 22 LTS is the recommended runtime.
+
 ```bash
 npm install --include=dev
 npm run typecheck
@@ -136,6 +138,9 @@ The CLI creates first-run config when needed:
 devspace init
 devspace serve
 ```
+
+`devspace init` uses an interactive, one-question-at-a-time setup flow for the
+project roots, local port, and optional stable public URL.
 
 The default config files are:
 
@@ -163,6 +168,9 @@ devspace serve
 
 DevSpace derives the inbound Host allowlist from the resolved public URL, so
 most users do not need to configure `DEVSPACE_ALLOWED_HOSTS`.
+
+Use `devspace doctor` to inspect the resolved config, Node version, Node ABI,
+platform, public URL, allowed hosts, and SQLite native dependency status.
 
 For env-driven development without persisted config:
 
