@@ -135,12 +135,18 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
     const lines = [
       `Config: ${configPath}`,
       `Auth: ${authPath}`,
-      "Owner password: generated in the auth file",
-      "Use it when ChatGPT or Claude asks you to approve DevSpace access.",
       `Local MCP URL: http://${config.host}:${config.port}/mcp`,
       ...(publicBaseUrl ? [`Public MCP URL: ${publicBaseUrl}/mcp`] : []),
     ];
     prompts.note(lines.join("\n"), "DevSpace configured");
+    prompts.note(
+      [
+        "Owner password: generated in the auth file",
+        "Use this when ChatGPT or Claude asks you to approve DevSpace access.",
+        `Stored at: ${authPath}`,
+      ].join("\n"),
+      "Owner password",
+    );
     prompts.outro("Run `devspace serve` to start the MCP server.");
   } catch (error) {
     if (error instanceof SetupCancelledError) {
