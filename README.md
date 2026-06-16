@@ -65,12 +65,12 @@ After the MCP client connects, ChatGPT can open a project with
 DevSpace provides tools for:
 
 - reading, writing, and editing files inside the opened workspace
-- searching files and listing directories
+- running shell-backed search and directory inspection in the default minimal tool mode
 - running shell commands for tests, builds, git, and package scripts
 - opening isolated Git worktrees when you want parallel work
 - loading `AGENTS.md` and `CLAUDE.md` instructions
 - exposing local agent skills from your skill folders
-- showing ChatGPT Apps review cards for aggregate diffs
+- showing ChatGPT Apps tool cards, with an opt-in aggregate `show_changes` card
 
 The default local endpoint is:
 

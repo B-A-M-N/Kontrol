@@ -14,8 +14,8 @@ ChatGPT should call `open_workspace` once for a project folder:
 }
 ```
 
-The result includes a `workspaceId`. All later file, search, edit, review, and
-shell calls should reuse that same `workspaceId`.
+The result includes a `workspaceId`. All later file, search, edit, show-changes,
+and shell calls should reuse that same `workspaceId`.
 
 Do not reopen the same folder unless:
 
@@ -97,37 +97,37 @@ Set `DEVSPACE_SKILLS=0` to hide skills from workspace output.
 
 ## Tool Names
 
-Legacy names are the default:
-
-- `open_workspace`
-- `read_file`
-- `write_file`
-- `edit_file`
-- `grep_files`
-- `find_files`
-- `list_directory`
-- `run_shell`
-
-Short names are available with `DEVSPACE_TOOL_NAMING=short`:
+Short names are the default:
 
 - `open_workspace`
 - `read`
 - `write`
 - `edit`
-- `grep`
-- `glob`
-- `ls`
 - `bash`
 
-## Review Changes
+By default, DevSpace also runs in `DEVSPACE_TOOL_MODE=minimal`, so dedicated
+`grep`, `glob`, and `ls` tools are hidden. Use `bash` with command-line tools
+such as `rg`, `find`, and `ls` for search and directory inspection.
 
-By default, `DEVSPACE_WIDGETS=changes`.
+Legacy names are available with `DEVSPACE_TOOL_NAMING=legacy`:
 
-In that mode, DevSpace exposes `review_changes`. After a coherent set of edits,
-the model should call it once to show an aggregate diff review card.
+- `open_workspace`
+- `read_file`
+- `write_file`
+- `edit_file`
+- `run_shell`
 
-Use `DEVSPACE_WIDGETS=off` to disable widget UI, or `DEVSPACE_WIDGETS=full` to
-restore per-tool debug cards.
+Use `DEVSPACE_TOOL_MODE=full` to restore dedicated search and directory tools.
+
+## Show Changes
+
+By default, `DEVSPACE_WIDGETS=full`.
+
+In that mode, DevSpace attaches widget UI to the exposed workspace, file, edit,
+and shell tools. The aggregate `show_changes` tool is not exposed by default.
+
+Use `DEVSPACE_WIDGETS=off` to disable widget UI, or `DEVSPACE_WIDGETS=changes`
+to expose the aggregate show-changes flow.
 
 ## Shell Use
 

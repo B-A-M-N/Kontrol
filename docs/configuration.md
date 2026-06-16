@@ -63,12 +63,15 @@ MCP clients discover metadata from:
 
 | Value | Behavior |
 | --- | --- |
-| `legacy` | Default. Uses `read_file`, `edit_file`, `run_shell`, and related names. |
-| `short` | Uses `read`, `edit`, `bash`, and related names. |
+| `short` | Default. Uses `read`, `edit`, `bash`, and related names. |
+| `legacy` | Uses `read_file`, `edit_file`, `run_shell`, and related names. |
 
-`DEVSPACE_TOOL_MODE=minimal` disables dedicated search and list tools. In
-minimal mode, clients use the shell tool with `rg`, `grep`, `find`, `ls`, or
-`tree` for inspection.
+`DEVSPACE_TOOL_MODE` controls the tool surface.
+
+| Value | Behavior |
+| --- | --- |
+| `minimal` | Default. Disables dedicated search and list tools. Clients use the shell tool with `rg`, `grep`, `find`, `ls`, or `tree` for inspection. |
+| `full` | Enables dedicated `grep`, `glob`, and `ls` tools. |
 
 ## Widgets
 
@@ -76,8 +79,8 @@ minimal mode, clients use the shell tool with `rg`, `grep`, `find`, `ls`, or
 
 | Value | Behavior |
 | --- | --- |
-| `changes` | Default. Widget UI is attached to `open_workspace` and `review_changes`. |
-| `full` | Enables legacy per-tool cards for debugging. |
+| `full` | Default. Widget UI is attached to exposed workspace, file, edit, and shell tools. |
+| `changes` | Enables the aggregate `show_changes` tool and attaches widget UI to `open_workspace` and `show_changes`. |
 | `off` | Disables widget UI. |
 
 ## Skills
@@ -119,9 +122,9 @@ DEVSPACE_OAUTH_OWNER_TOKEN="$(openssl rand -base64 32)" \
 DEVSPACE_ALLOWED_ROOTS="$HOME/personal,$HOME/work" \
 DEVSPACE_PUBLIC_BASE_URL="https://devspace.example.com" \
 DEVSPACE_WORKTREE_ROOT="$HOME/.devspace/worktrees" \
-DEVSPACE_TOOL_MODE="full" \
-DEVSPACE_TOOL_NAMING="legacy" \
-DEVSPACE_WIDGETS="changes" \
+DEVSPACE_TOOL_MODE="minimal" \
+DEVSPACE_TOOL_NAMING="short" \
+DEVSPACE_WIDGETS="full" \
 npx @waishnav/devspace serve
 ```
 
