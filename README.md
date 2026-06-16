@@ -16,14 +16,11 @@
 
 [![DevSpace connected to ChatGPT](docs/assets/devspace-screenshot.png)](docs/assets/devspace-screenshot.png)
 
-DevSpace is a self-hosted MCP server that gives ChatGPT a secure connection to
-your real local projects: your files, your tools, your terminal. You run it on
-your machine, expose it through a tunnel you control, and approve the connection
-with a password only you have.
+**Give ChatGPT a secure connection to your own machine and Turn ChatGPT into Codex**
 
-The goal is to bring the practical Codex experience into ChatGPT: inspect the
-repo, understand instructions, edit files, run tests, and review changes through
-explicit tool calls.
+DevSpace is a self-hosted MCP server that lets ChatGPT read, edit, search, and run code in your real local projects — your files, your tools, your terminal — without uploading anything to a third party. You run it on your machine, expose it through a tunnel you control, and approve the connection with a password only you have.
+
+> Think of it as bringing the code assistant you already talk to into the codebase you actually work in.
 
 ## Quick Start
 
@@ -38,7 +35,7 @@ During setup, DevSpace asks for:
 
 - the local project folders ChatGPT is allowed to open through DevSpace
 - the local port, usually `7676`
-- your public HTTPS base URL from Cloudflare Tunnel, ngrok, Tailscale Funnel, or
+- your public HTTPS base URL from Cloudflare Tunnel, ngrok, Pinggy, Tailscale Funnel, or
   another reverse proxy
 
 Use the public origin without `/mcp` during setup:
