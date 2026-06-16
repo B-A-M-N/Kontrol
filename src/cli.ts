@@ -104,20 +104,24 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
     });
     const port = Number(portAnswer);
 
-    const configurePublicUrl = await confirmPrompt({
-      message: "Do you have a stable public URL for a tunnel or reverse proxy?",
-      initialValue: Boolean(files.config.publicBaseUrl),
-    });
-    const publicBaseUrl = configurePublicUrl
-      ? normalizeOptionalPublicBaseUrl(await textPrompt({
-          message: files.config.publicBaseUrl
-            ? `What is the public base URL? Press Enter to use ${files.config.publicBaseUrl}`
-            : "What is the public base URL?",
-          placeholder: files.config.publicBaseUrl ?? "https://devspace.example.com",
-          defaultValue: files.config.publicBaseUrl ?? "",
-          validate: validateOptionalPublicBaseUrl,
-        }))
-      : null;
+    prompts.note(
+      [
+        "DevSpace needs a public base URL so ChatGPT or Claude can reach this MCP server.",
+        "Create a tunnel or reverse proxy with Cloudflare Tunnel, ngrok, Pinggy, Tailscale Funnel, or your own HTTPS proxy.",
+        "Paste the public origin here, without /mcp.",
+        "",
+        "Example: https://your-tunnel-host.example.com",
+      ].join("\n"),
+      "Public URL required",
+    );
+    const publicBaseUrl = normalizePublicBaseUrl(await textPrompt({
+      message: files.config.publicBaseUrl
+        ? `What is the public base URL? Press Enter to keep ${files.config.publicBaseUrl}`
+        : "What is the public base URL?",
+      placeholder: files.config.publicBaseUrl ?? "https://your-tunnel-host.example.com",
+      defaultValue: files.config.publicBaseUrl ?? "",
+      validate: validateRequiredPublicBaseUrl,
+    }));
 
     const config: DevspaceUserConfig = {
       host: files.config.host ?? "127.0.0.1",
@@ -265,6 +269,11 @@ function normalizeOptionalPublicBaseUrl(value: string): string | null {
   const trimmed = value.trim();
   if (!trimmed || trimmed === "null" || trimmed === "none") return null;
 
+  return normalizePublicBaseUrl(trimmed);
+}
+
+function normalizePublicBaseUrl(value: string): string {
+  const trimmed = value.trim();
   const parsed = new URL(trimmed);
   parsed.hash = "";
   parsed.search = "";
@@ -287,12 +296,6 @@ async function textPrompt(options: TextPromptOptions): Promise<string> {
   return value || options.defaultValue;
 }
 
-async function confirmPrompt(options: Parameters<typeof prompts.confirm>[0]): Promise<boolean> {
-  const result = await prompts.confirm(options);
-  if (prompts.isCancel(result)) throw new SetupCancelledError();
-  return Boolean(result);
-}
-
 function validatePort(value: string | undefined): string | undefined {
   const port = Number(value);
   return Number.isInteger(port) && port >= 1 && port <= 65535
@@ -300,17 +303,21 @@ function validatePort(value: string | undefined): string | undefined {
     : "Enter a port between 1 and 65535.";
 }
 
-function validateOptionalPublicBaseUrl(value: string | undefined): string | undefined {
+function validateRequiredPublicBaseUrl(value: string | undefined): string | undefined {
   const trimmed = value?.trim() ?? "";
-  if (!trimmed || trimmed === "null" || trimmed === "none") return undefined;
+  if (!trimmed) return "Enter the public URL from your tunnel or reverse proxy.";
+  if (trimmed.endsWith("/mcp")) return "Enter the base URL only, without /mcp.";
+  return validatePublicBaseUrl(trimmed);
+}
 
+function validatePublicBaseUrl(value: string): string | undefined {
   try {
-    const parsed = new URL(trimmed);
+    const parsed = new URL(value);
     return parsed.protocol === "http:" || parsed.protocol === "https:"
       ? undefined
       : "Use an http or https URL.";
   } catch {
-    return "Enter a valid URL, for example https://devspace.example.com.";
+    return "Enter a valid URL, for example https://your-tunnel-host.example.com.";
   }
 }
 
