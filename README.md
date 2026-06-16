@@ -140,7 +140,8 @@ devspace serve
 ```
 
 `devspace init` uses an interactive, one-question-at-a-time setup flow for the
-project roots, local port, and optional stable public URL.
+project roots, local port, and public base URL. DevSpace needs that public URL
+so ChatGPT or Claude can reach the local MCP server.
 
 The default config files are:
 
@@ -153,14 +154,21 @@ The default config files are:
 screen. Keep it private. You will need that password when ChatGPT or Claude asks
 you to approve DevSpace access.
 
-For temporary tunnel or reverse-proxy URLs, keep the URL out of persistent
-config and pass it for that run:
+Before entering the public base URL, create a tunnel or reverse proxy with a
+service such as Cloudflare Tunnel, ngrok, Pinggy, Tailscale Funnel, or your own
+HTTPS proxy. Use the public origin without `/mcp`:
+
+```text
+https://your-tunnel-host.example.com
+```
+
+If your tunnel URL changes, pass the current URL for that run:
 
 ```bash
 DEVSPACE_PUBLIC_BASE_URL="https://your-temporary-host.example.com" devspace serve
 ```
 
-For stable public URLs, persist it once:
+For stable public URLs, update the persisted value once:
 
 ```bash
 devspace config set publicBaseUrl https://devspace.example.com
