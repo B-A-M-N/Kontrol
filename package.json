@@ -12,6 +12,7 @@
   },
   "files": [
     "dist",
+    "docs",
     "scripts",
     "README.md"
   ],
@@ -34,7 +35,7 @@
   "license": "MIT",
   "dependencies": {
     "@clack/prompts": "^1.5.1",
-    "@earendil-works/pi-coding-agent": "^0.78.0",
+    "@earendil-works/pi-coding-agent": "^0.79.4",
     "@modelcontextprotocol/ext-apps": "^1.7.2",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@pierre/diffs": "^1.2.5",
@@ -54,9 +55,12 @@
     "@types/react-dom": "^19.2.3",
     "@types/semver": "^7.7.1",
     "@vitejs/plugin-react": "^6.0.2",
-    "drizzle-kit": "^0.31.10",
     "tsx": "^4.22.3",
     "typescript": "^6.0.3",
     "vite": "^8.0.14"
+  },
+  "overrides": {
+    "protobufjs": "7.6.4",
+    "ws": "8.21.0"
   }
 }
