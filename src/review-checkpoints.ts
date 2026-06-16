@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { git, getGitEligibility, safeWorkspaceRefSegment } from "./git.js";
 
-export type ReviewSince = "last_review" | "workspace_open";
+export type ReviewSince = "last_shown" | "last_review" | "workspace_open";
 
 export interface ReviewSummary {
   files: number;
@@ -58,7 +58,7 @@ export function createReviewCheckpointManager(): ReviewCheckpointManager {
       try {
         const eligibility = await getGitEligibility(root);
         if (!eligibility.ok || !eligibility.gitRoot) {
-          state.diagnostic = eligibility.message ?? "review_changes requires a Git workspace in this version.";
+          state.diagnostic = eligibility.message ?? "show_changes requires a Git workspace in this version.";
           return;
         }
 
@@ -71,7 +71,7 @@ export function createReviewCheckpointManager(): ReviewCheckpointManager {
       }
     },
 
-    async reviewChanges({ workspaceId, root, since = "last_review", markReviewed = true }) {
+    async reviewChanges({ workspaceId, root, since = "last_shown", markReviewed = true }) {
       let state = states.get(workspaceId);
       if (!state) {
         await this.initializeWorkspace({ workspaceId, root });
@@ -79,7 +79,7 @@ export function createReviewCheckpointManager(): ReviewCheckpointManager {
       }
 
       if (!state?.gitRoot) {
-        throw new Error(state?.diagnostic ?? "review_changes requires a Git workspace in this version.");
+        throw new Error(state?.diagnostic ?? "show_changes requires a Git workspace in this version.");
       }
 
       const baselineRef = since === "workspace_open" ? state.openRef : state.baselineRef;
@@ -101,7 +101,7 @@ export function createReviewCheckpointManager(): ReviewCheckpointManager {
       return {
         result:
           summary.files === 0
-            ? `No changes since ${since === "workspace_open" ? "workspace open" : "last review"}.`
+            ? `No changes since ${since === "workspace_open" ? "workspace open" : "last shown changes"}.`
             : `Changed ${summary.files} ${summary.files === 1 ? "file" : "files"} (+${summary.additions} -${summary.removals}).`,
         summary,
         files,

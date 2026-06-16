@@ -92,7 +92,7 @@ type ToolWidgetKind =
   | "search"
   | "directory"
   | "shell"
-  | "review_changes";
+  | "show_changes";
 
 interface ToolDefinitionMeta extends Record<string, unknown> {
   ui: {
@@ -114,7 +114,7 @@ function shouldAttachWidget(mode: WidgetMode, kind: ToolWidgetKind): boolean {
     case "off":
       return false;
     case "changes":
-      return kind === "workspace" || kind === "review_changes";
+      return kind === "workspace" || kind === "show_changes";
     case "full":
       return true;
   }
@@ -194,12 +194,12 @@ function serverInstructions(config: ServerConfig, toolNames: ToolNames): string 
 
   const agentsMd = `Follow instructions returned by ${toolNames.openWorkspace}. Before working under a path listed in availableAgentsFiles, use ${toolNames.read} to inspect that instruction file and follow it. `;
 
-  const review =
+  const showChanges =
     config.widgets === "changes"
-      ? " After completing a coherent set of file modifications, call review_changes once to show the user an aggregate diff review."
+      ? " After creating, editing, or overwriting files, call show_changes once after the related file changes are complete so the user can see the aggregate diff."
       : "";
 
-  return `Use DevSpace as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree to obtain a workspaceId. Reuse that same workspaceId for all later file, search, edit, write, review, and shell tools in that folder; do not call ${toolNames.openWorkspace} again unless switching folders/worktrees, changing checkout/worktree mode, the workspaceId is rejected as unknown, or the user explicitly asks to reopen. ${agentsMd}${skills}${inspection}Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not create or modify files with ${toolNames.shell}; avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or any command whose purpose is to write project files.${review}`;
+  return `Use DevSpace as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree to obtain a workspaceId. Reuse that same workspaceId for all later file, search, edit, write, show-changes, and shell tools in that folder; do not call ${toolNames.openWorkspace} again unless switching folders/worktrees, changing checkout/worktree mode, the workspaceId is rejected as unknown, or the user explicitly asks to reopen. ${agentsMd}${skills}${inspection}Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not create or modify files with ${toolNames.shell}; avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or any command whose purpose is to write project files.${showChanges}`;
 }
 function resultOutputSchema(extra: z.ZodRawShape = {}): z.ZodRawShape {
   return {
@@ -507,7 +507,7 @@ function createMcpServer(
     {
       title: "Open workspace",
       description:
-        "Open a local project directory as a coding workspace. Call this once per project folder or worktree before reading, editing, searching, writing, reviewing, or running commands. Reuse the returned workspaceId for later calls in the same folder; do not call open_workspace again unless switching folders/worktrees, changing checkout/worktree mode, the workspaceId is rejected as unknown, or the user explicitly asks to reopen. By default this opens the actual checkout; set mode=\"worktree\" when the user asks for an isolated or parallel coding session. Returns a workspaceId, loaded root project instructions, and nested instruction file paths the model should read before working in those directories.",
+        "Open a local project directory as a coding workspace. Call this once per project folder or worktree before reading, editing, searching, writing, showing changes, or running commands. Reuse the returned workspaceId for later calls in the same folder; do not call open_workspace again unless switching folders/worktrees, changing checkout/worktree mode, the workspaceId is rejected as unknown, or the user explicitly asks to reopen. By default this opens the actual checkout; set mode=\"worktree\" when the user asks for an isolated or parallel coding session. Returns a workspaceId, loaded root project instructions, and nested instruction file paths the model should read before working in those directories.",
       inputSchema: {
         path: z
           .string()
@@ -899,26 +899,26 @@ function createMcpServer(
   if (config.widgets === "changes") {
     registerAppTool(
       server,
-      "review_changes",
+      "show_changes",
       {
-        title: "Review changes",
+        title: "Show changes",
         description:
-          "Review aggregate file changes in an open workspace since the last review checkpoint or since the workspace was opened. Use this after a coherent set of file modifications to show a single diff review card.",
+          "Show aggregate file changes in an open workspace since the last shown checkpoint or since the workspace was opened. After you create, edit, or overwrite files, call this once when the related file changes are complete so the user can inspect the combined diff.",
         inputSchema: {
           workspaceId: z
             .string()
             .describe("Workspace identifier returned by open_workspace."),
           since: z
-            .enum(["last_review", "workspace_open"])
+            .enum(["last_shown", "workspace_open"])
             .optional()
-            .describe("Defaults to last_review. Use workspace_open to compare against the initial open_workspace checkpoint."),
+            .describe("Defaults to last_shown. Use workspace_open to compare against the initial open_workspace checkpoint."),
           markReviewed: z
             .boolean()
             .optional()
-            .describe("Defaults to true. When true, advances the last_review checkpoint to the current workspace state."),
+            .describe("Defaults to true. When true, advances the last shown checkpoint to the current workspace state."),
         },
         outputSchema: resultOutputSchema(),
-        ...toolWidgetDescriptorMeta(config, "review_changes"),
+        ...toolWidgetDescriptorMeta(config, "show_changes"),
         annotations: { readOnlyHint: true },
       },
       async ({ workspaceId, since, markReviewed }) => {
@@ -927,13 +927,13 @@ function createMcpServer(
         const review = await reviewCheckpoints.reviewChanges({
           workspaceId,
           root: workspace.root,
-          since: since ?? "last_review",
+          since: since ?? "last_shown",
           markReviewed: markReviewed ?? true,
         });
 
         const content = [textBlock(review.result)];
         logToolCall(config, {
-          tool: "review_changes",
+          tool: "show_changes",
           workspaceId,
           success: true,
           durationMs: Math.round(performance.now() - startedAt),
@@ -942,7 +942,7 @@ function createMcpServer(
         return {
           content,
           _meta: {
-            tool: "review_changes",
+            tool: "show_changes",
             card: {
               workspaceId,
               summary: review.summary,

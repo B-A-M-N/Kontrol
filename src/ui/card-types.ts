@@ -9,7 +9,7 @@ export type ToolName =
   | "find_files"
   | "list_directory"
   | "run_shell"
-  | "review_changes"
+  | "show_changes"
   | "read"
   | "write"
   | "edit"
@@ -74,7 +74,7 @@ export function isToolName(value: unknown): value is ToolName {
     value === "find_files" ||
     value === "list_directory" ||
     value === "run_shell" ||
-    value === "review_changes" ||
+    value === "show_changes" ||
     value === "read" ||
     value === "write" ||
     value === "edit" ||
@@ -106,7 +106,7 @@ export function isShellTool(tool: ToolName): boolean {
 }
 
 export function isReviewTool(tool: ToolName): boolean {
-  return tool === "review_changes";
+  return tool === "show_changes";
 }
 
 export function isToolResultCard(value: unknown): value is Omit<ToolResultCard, "tool"> {

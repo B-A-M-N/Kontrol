@@ -487,8 +487,8 @@ function getToolDisplay(card: ToolResultCard): ToolDisplay {
     case "run_shell":
     case "bash":
       return { icon: terminalIcon(), title: "Bash", label, tone: "shell" };
-    case "review_changes":
-      return { icon: reviewIcon(), title: "Review Changes", label, tone: "review" };
+    case "show_changes":
+      return { icon: reviewIcon(), title: "Show Changes", label, tone: "review" };
   }
 }
 
