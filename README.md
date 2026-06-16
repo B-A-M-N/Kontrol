@@ -20,6 +20,21 @@
 
 DevSpace is a self-hosted MCP server that lets ChatGPT read, edit, search, and run code in your real local projects — your files, your tools, your terminal — without uploading anything to a third party. You run it on your machine, expose it through a tunnel you control, and approve the connection with a password only you have.
 
+## Philosophy
+
+Every piece of software is becoming conversational. Natural language is
+redefining how we interact with tools, workflows, and systems.
+
+My bet is that ChatGPT becomes the operating system for everything. Once we
+reach AGI, we will simply talk to ChatGPT, and it will prompt, coordinate, and
+orchestrate sub-agents that set up the right loops for us.
+
+We are not there yet.
+
+DevSpace is one attempt to fast-forward that future: a way for MCP-capable
+hosts like ChatGPT and Claude to work directly with local project files through
+explicit, inspectable tools.
+
 ## Quick Start
 
 DevSpace requires Node `>=20.12 <27`. Node 22 LTS is recommended.
@@ -125,6 +140,16 @@ npx @waishnav/devspace doctor
 - [Configuration Reference](docs/configuration.md)
 - [Security Model](docs/security.md)
 - [Troubleshooting Gotchas](docs/gotchas.md)
+
+## Built by Waishnav
+
+I'm Waishnav, the creator of [GitCMS](https://gitcms.dev/), a Git-backed CMS
+for markdown sites.
+
+I like building opinionated products, and DevSpace is another example of that.
+I'm on a journey to build a single-person company doing multiple millions in
+revenue. If you want to watch the failures, wins, lessons, and everything in
+between, come hang out with me on [X](https://x.com/wshxnv).
 
 ## Local Development
 
