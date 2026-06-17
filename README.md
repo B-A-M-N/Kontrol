@@ -20,24 +20,24 @@
 
 DevSpace is a self-hosted MCP server that lets ChatGPT read, edit, search, and run code in your real local projects — your files, your tools, your terminal — without uploading anything to a third party. You run it on your machine, expose it through a tunnel you control, and approve the connection with a password only you have.
 
-## Philosophy
-
-Every piece of software is becoming conversational. Natural language is
-redefining how we interact with tools, workflows, and systems.
-
-My bet is that ChatGPT becomes the operating system for everything. Once we
-reach AGI, we will simply talk to ChatGPT, and it will prompt, coordinate, and
-orchestrate sub-agents that set up the right loops for us.
-
-We are not there yet.
-
-DevSpace is one attempt to fast-forward that future: a way for MCP-capable
-hosts like ChatGPT and Claude to work directly with local project files through
-explicit, inspectable tools.
-
-## Quick Start
+## Installation
 
 DevSpace requires Node `>=20.12 <27`. Node 22 LTS is recommended.
+
+Install the DevSpace CLI:
+
+```bash
+npm install -g @waishnav/devspace
+```
+
+Then initialize and start the server:
+
+```bash
+devspace init
+devspace serve
+```
+
+Or run it without a global install:
 
 ```bash
 npx @waishnav/devspace init
@@ -110,7 +110,7 @@ connected client like a trusted coding partner with access to your machine.
 For a normal ChatGPT coding session:
 
 1. Start your tunnel.
-2. Run `npx @waishnav/devspace serve`.
+2. Run `devspace serve`.
 3. Connect the MCP client to your public `/mcp` URL.
 4. Approve the connection with the Owner password.
 5. Ask ChatGPT to open a project inside one of your allowed roots.
@@ -130,7 +130,7 @@ shell.
 Run this to inspect your local setup:
 
 ```bash
-npx @waishnav/devspace doctor
+devspace doctor
 ```
 
 ## Documentation
@@ -140,6 +140,21 @@ npx @waishnav/devspace doctor
 - [Configuration Reference](docs/configuration.md)
 - [Security Model](docs/security.md)
 - [Troubleshooting Gotchas](docs/gotchas.md)
+
+## Philosophy
+
+Every piece of software is becoming conversational. Natural language is
+redefining how we interact with tools, workflows, and systems.
+
+My bet is that ChatGPT becomes the operating system for everything. Once we
+reach AGI, we will simply talk to ChatGPT, and it will prompt, coordinate, and
+orchestrate sub-agents that set up the right loops for us.
+
+We are not there yet.
+
+DevSpace is one attempt to fast-forward that future: a way for MCP-capable
+hosts like ChatGPT and Claude to work directly with local project files through
+explicit, inspectable tools.
 
 ## Built by Waishnav
 
