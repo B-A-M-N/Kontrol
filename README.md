@@ -20,6 +20,41 @@
 
 DevSpace is a self-hosted MCP server that lets ChatGPT read, edit, search, and run code in your real local projects — your files, your tools, your terminal — without uploading anything to a third party. You run it on your machine, expose it through a tunnel you control, and approve the connection with a password only you have.
 
+## Sponsors and Special Thanks
+
+<table>
+  <thead>
+    <tr>
+      <th>Sponsor</th>
+      <th>About</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td align="center" width="220">
+        <a href="https://rebates.ai/">
+          <img
+            src="https://app.rebates.ai/brand/rebates-lockup.svg"
+            alt="Rebates"
+            width="170"
+          >
+        </a>
+      </td>
+      <td>
+        <strong>The ads in your terminal pay you.</strong><br><br>
+        <a href="https://rebates.ai/">Rebates</a> adds one optional
+        sponsored footer to your coding agent and pays you cash back for every
+        session in which it is shown. Turn it off at any time.
+      </td>
+    </tr>
+  </tbody>
+</table>
+
+<p align="center">
+  DevSpace is open to new sponsors.
+  <a href="https://x.com/wshxnv">Get in touch to become one.</a>
+</p>
+
 ## Installation
 
 DevSpace requires Node `>=20.12 <27`. Node 22 LTS is recommended.
