@@ -42,7 +42,6 @@ export class SqliteOAuthStore {
 
   constructor(stateDir: string) {
     this.database = openDatabase(stateDir);
-    this.migrate();
     this.deleteExpiredTokens(Math.floor(Date.now() / 1000));
   }
 
@@ -181,49 +180,6 @@ export class SqliteOAuthStore {
 
   close(): void {
     this.database.close();
-  }
-
-  private migrate(): void {
-    this.database.sqlite.exec(`
-      create table if not exists oauth_clients (
-        client_id text primary key,
-        client_json text not null,
-        issued_at integer not null
-      );
-
-      create index if not exists oauth_clients_issued_at_idx
-        on oauth_clients(issued_at desc);
-
-      create table if not exists oauth_access_tokens (
-        token_hash text primary key,
-        client_id text not null,
-        scopes_json text not null,
-        expires_at integer not null,
-        resource text,
-        foreign key (client_id) references oauth_clients(client_id) on delete cascade
-      );
-
-      create index if not exists oauth_access_tokens_client_id_idx
-        on oauth_access_tokens(client_id);
-
-      create index if not exists oauth_access_tokens_expires_at_idx
-        on oauth_access_tokens(expires_at);
-
-      create table if not exists oauth_refresh_tokens (
-        token_hash text primary key,
-        client_id text not null,
-        scopes_json text not null,
-        expires_at integer not null,
-        resource text,
-        foreign key (client_id) references oauth_clients(client_id) on delete cascade
-      );
-
-      create index if not exists oauth_refresh_tokens_client_id_idx
-        on oauth_refresh_tokens(client_id);
-
-      create index if not exists oauth_refresh_tokens_expires_at_idx
-        on oauth_refresh_tokens(expires_at);
-    `);
   }
 
   private deleteExpiredTokens(nowSeconds: number): void {
