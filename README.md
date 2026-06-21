@@ -1,6 +1,6 @@
 <p align="center">
   <picture>
-    <img src="docs/assets/devspace-logo-light.png" alt="DevSpace logo" width="140">
+    <img src="https://raw.githubusercontent.com/Waishnav/devspace/main/docs/assets/devspace-logo-light.png" alt="DevSpace logo" width="140">
   </picture>
 </p>
 
@@ -14,7 +14,7 @@
   <a href="https://github.com/Waishnav/devspace/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/npm/l/%40waishnav%2Fdevspace?style=flat-square" /></a>
 </p>
 
-[![DevSpace connected to ChatGPT](docs/assets/devspace-screenshot.png)](docs/assets/devspace-screenshot.png)
+[![DevSpace connected to ChatGPT](https://raw.githubusercontent.com/Waishnav/devspace/main/docs/assets/devspace-screenshot.png)](https://raw.githubusercontent.com/Waishnav/devspace/main/docs/assets/devspace-screenshot.png)
 
 **Give ChatGPT a secure connection to your own machine and Turn ChatGPT into Codex**
 
@@ -169,11 +169,11 @@ devspace doctor
 
 ## Documentation
 
-- [Setup Guide](docs/setup.md)
-- [ChatGPT Coding Workflow](docs/chatgpt-coding-workflow.md)
-- [Configuration Reference](docs/configuration.md)
-- [Security Model](docs/security.md)
-- [Troubleshooting Gotchas](docs/gotchas.md)
+- [Setup Guide](https://github.com/Waishnav/devspace/blob/main/docs/setup.md)
+- [ChatGPT Coding Workflow](https://github.com/Waishnav/devspace/blob/main/docs/chatgpt-coding-workflow.md)
+- [Configuration Reference](https://github.com/Waishnav/devspace/blob/main/docs/configuration.md)
+- [Security Model](https://github.com/Waishnav/devspace/blob/main/docs/security.md)
+- [Troubleshooting Gotchas](https://github.com/Waishnav/devspace/blob/main/docs/gotchas.md)
 
 ## Philosophy
 
