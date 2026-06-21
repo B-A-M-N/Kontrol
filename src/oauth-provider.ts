@@ -283,7 +283,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     const accessExpiresAt = now + this.config.accessTokenTtlSeconds;
     const refreshExpiresAt = now + this.config.refreshTokenTtlSeconds;
 
-    this.oauthStore.saveTokenPair(
+    const saved = this.oauthStore.saveTokenPair(
       {
         accessTokenHash: hashToken(accessToken),
         accessToken: {
@@ -302,6 +302,9 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
       },
       consumedRefreshTokenHash,
     );
+    if (!saved) {
+      throw new InvalidGrantError("Invalid refresh token");
+    }
 
     return {
       access_token: accessToken,
