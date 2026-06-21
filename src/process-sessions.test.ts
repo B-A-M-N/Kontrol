@@ -1,0 +1,77 @@
+import assert from "node:assert/strict";
+import { ProcessSessionManager } from "./process-sessions.js";
+
+const manager = new ProcessSessionManager({
+  maxBufferCharacters: 1_024,
+  completedSessionTtlMs: 1_000,
+});
+
+const node = JSON.stringify(process.execPath);
+
+const foreground = await manager.start({
+  workspaceId: "workspace-a",
+  cwd: process.cwd(),
+  command: `${node} -e "console.log('foreground')"`,
+  yieldTimeMs: 2_000,
+});
+assert.equal(foreground.running, false);
+assert.equal(foreground.exitCode, 0);
+assert.match(foreground.output, /foreground/);
+assert.equal(foreground.sessionId, undefined);
+
+const background = await manager.start({
+  workspaceId: "workspace-a",
+  cwd: process.cwd(),
+  command: `${node} -e "setTimeout(() => console.log('finished'), 100)"`,
+  yieldTimeMs: 5,
+});
+assert.equal(background.running, true);
+assert.ok(background.sessionId);
+
+await assert.rejects(
+  manager.write({
+    workspaceId: "workspace-b",
+    sessionId: background.sessionId,
+    yieldTimeMs: 1,
+  }),
+  /does not belong to workspace/,
+);
+
+const completed = await manager.write({
+  workspaceId: "workspace-a",
+  sessionId: background.sessionId,
+  yieldTimeMs: 2_000,
+});
+assert.equal(completed.running, false);
+assert.equal(completed.exitCode, 0);
+assert.match(completed.output, /finished/);
+
+const interactive = await manager.start({
+  workspaceId: "workspace-a",
+  cwd: process.cwd(),
+  command: `${node} -e "process.stdin.once('data', data => { console.log('input:' + data.toString().trim()); process.exit(0); })"`,
+  yieldTimeMs: 5,
+});
+assert.equal(interactive.running, true);
+assert.ok(interactive.sessionId);
+
+const inputResult = await manager.write({
+  workspaceId: "workspace-a",
+  sessionId: interactive.sessionId,
+  chars: "hello\n",
+  yieldTimeMs: 2_000,
+});
+assert.equal(inputResult.running, false);
+assert.match(inputResult.output, /input:hello/);
+
+const buffered = await manager.start({
+  workspaceId: "workspace-a",
+  cwd: process.cwd(),
+  command: `${node} -e "console.log('x'.repeat(5000)); setTimeout(() => {}, 100)"`,
+  yieldTimeMs: 50,
+  maxOutputTokens: 100,
+});
+assert.equal(buffered.outputTruncated, true);
+if (buffered.sessionId) manager.terminate("workspace-a", buffered.sessionId);
+
+manager.shutdown();
