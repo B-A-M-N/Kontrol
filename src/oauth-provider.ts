@@ -256,6 +256,10 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     this.oauthStore.deleteRefreshToken(hashed);
   }
 
+  close(): void {
+    this.oauthStore.close();
+  }
+
   private validCodeRecord(
     client: OAuthClientInformationFull,
     authorizationCode: string,
