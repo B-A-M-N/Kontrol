@@ -220,16 +220,26 @@ export class ProcessSessionManager {
 
   private startPipe(session: ProcessSession, input: StartCommandInput): void {
     const shell = shellCommand(input.command);
+    const detached = process.platform !== "win32";
     const child = spawn(shell.executable, shell.args, {
       cwd: input.cwd,
       env: process.env,
       stdio: "pipe",
       windowsHide: true,
+      detached,
     });
 
     session.process = {
       write: (data) => child.stdin.write(data),
       kill: (signal) => {
+        if (detached && child.pid) {
+          try {
+            process.kill(-child.pid, signal);
+            return;
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "ESRCH") return;
+          }
+        }
         child.kill(signal);
       },
     };
