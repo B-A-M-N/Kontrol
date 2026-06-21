@@ -50,7 +50,7 @@ DevSpace is a self-hosted MCP server that lets ChatGPT read, edit, search, and r
   </tbody>
 </table>
 
-<p align="center">
+<p>
   DevSpace is open to new sponsors.
   <a href="https://x.com/wshxnv">Get in touch to become one.</a>
 </p>
