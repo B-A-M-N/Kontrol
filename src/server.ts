@@ -163,7 +163,7 @@ interface ToolLogFields {
 }
 
 function toolNamesFor(config: ServerConfig): ToolNames {
-  return config.toolNaming === "short"
+  return config.toolNaming === "short" || config.toolMode === "codex"
     ? {
         openWorkspace: "open_workspace",
         read: "read",

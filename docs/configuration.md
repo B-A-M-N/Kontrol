@@ -76,7 +76,8 @@ MCP clients discover metadata from:
 
 `DEVSPACE_MINIMAL_TOOLS` remains a backward-compatible alias when
 `DEVSPACE_TOOL_MODE` is unset: `1` selects `minimal` and `0` selects `full`.
-The `codex` mode must be selected through `DEVSPACE_TOOL_MODE`.
+The `codex` mode must be selected through `DEVSPACE_TOOL_MODE` and always uses
+its fixed short tool names regardless of `DEVSPACE_TOOL_NAMING`.
 
 Codex-mode commands run without a PTY by default. Set `tty: true` on
 `exec_command` for interactive terminal programs. PTY support uses the optional
