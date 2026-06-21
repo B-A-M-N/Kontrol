@@ -18,6 +18,13 @@ export interface PersistedRefreshTokenRecord {
   resource?: string;
 }
 
+export interface PersistedTokenPair {
+  accessTokenHash: string;
+  accessToken: PersistedAccessTokenRecord;
+  refreshTokenHash: string;
+  refreshToken: PersistedRefreshTokenRecord;
+}
+
 function redirectHostAllowed(redirectUri: string, allowedHosts: string[]): boolean {
   let parsed: URL;
   try {
@@ -131,6 +138,24 @@ export class SqliteOAuthStore {
         record.expiresAt,
         record.resource ?? null,
       );
+  }
+
+  saveTokenPair(pair: PersistedTokenPair, consumedRefreshTokenHash?: string): void {
+    const save = this.database.sqlite.transaction(() => {
+      if (consumedRefreshTokenHash) {
+        const result = this.database.sqlite
+          .prepare("delete from oauth_refresh_tokens where token_hash = ?")
+          .run(consumedRefreshTokenHash);
+        if (result.changes !== 1) {
+          throw new Error("Refresh token was already consumed");
+        }
+      }
+
+      this.saveAccessToken(pair.accessTokenHash, pair.accessToken);
+      this.saveRefreshToken(pair.refreshTokenHash, pair.refreshToken);
+    });
+
+    save.immediate();
   }
 
   getRefreshToken(tokenHash: string): PersistedRefreshTokenRecord | undefined {

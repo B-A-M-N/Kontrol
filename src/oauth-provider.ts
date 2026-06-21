@@ -213,7 +213,8 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     scopes?: string[],
     resource?: URL,
   ): Promise<OAuthTokens> {
-    const record = this.oauthStore.getRefreshToken(hashToken(refreshToken));
+    const refreshTokenHash = hashToken(refreshToken);
+    const record = this.oauthStore.getRefreshToken(refreshTokenHash);
     if (!record || record.clientId !== client.client_id || record.expiresAt < Math.floor(Date.now() / 1000)) {
       throw new InvalidGrantError("Invalid refresh token");
     }
@@ -226,11 +227,11 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
       throw new AccessDeniedError("Refresh token cannot grant requested scopes");
     }
 
-    this.oauthStore.deleteRefreshToken(hashToken(refreshToken));
     return this.issueTokens(
       client.client_id,
       requestedScopes,
       resource ?? (record.resource ? new URL(record.resource) : undefined),
+      refreshTokenHash,
     );
   }
 
@@ -266,25 +267,37 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     return record;
   }
 
-  private issueTokens(clientId: string, scopes: string[], resource?: URL): OAuthTokens {
+  private issueTokens(
+    clientId: string,
+    scopes: string[],
+    resource?: URL,
+    consumedRefreshTokenHash?: string,
+  ): OAuthTokens {
     const now = Math.floor(Date.now() / 1000);
     const accessToken = randomToken();
     const refreshToken = randomToken();
     const accessExpiresAt = now + this.config.accessTokenTtlSeconds;
     const refreshExpiresAt = now + this.config.refreshTokenTtlSeconds;
 
-    this.oauthStore.saveAccessToken(hashToken(accessToken), {
-      clientId,
-      scopes,
-      expiresAt: accessExpiresAt,
-      resource: resource?.href,
-    });
-    this.oauthStore.saveRefreshToken(hashToken(refreshToken), {
-      clientId,
-      scopes,
-      expiresAt: refreshExpiresAt,
-      resource: resource?.href,
-    });
+    this.oauthStore.saveTokenPair(
+      {
+        accessTokenHash: hashToken(accessToken),
+        accessToken: {
+          clientId,
+          scopes,
+          expiresAt: accessExpiresAt,
+          resource: resource?.href,
+        },
+        refreshTokenHash: hashToken(refreshToken),
+        refreshToken: {
+          clientId,
+          scopes,
+          expiresAt: refreshExpiresAt,
+          resource: resource?.href,
+        },
+      },
+      consumedRefreshTokenHash,
+    );
 
     return {
       access_token: accessToken,
