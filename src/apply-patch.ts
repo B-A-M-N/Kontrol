@@ -226,6 +226,28 @@ async function fileExists(path: string): Promise<boolean> {
   }
 }
 
+export async function replaceFile(
+  temporary: string,
+  destination: string,
+  destinationExists: boolean,
+  platform: NodeJS.Platform = process.platform,
+): Promise<void> {
+  if (platform !== "win32" || !destinationExists) {
+    await rename(temporary, destination);
+    return;
+  }
+
+  const backup = `${temporary}.original`;
+  await rename(destination, backup);
+  try {
+    await rename(temporary, destination);
+  } catch (error) {
+    await rename(backup, destination);
+    throw error;
+  }
+  await rm(backup, { force: true });
+}
+
 export async function applyPatch(root: string, patch: string): Promise<ApplyPatchResult> {
   const actions = parsePatch(patch);
   const staged = new Map<string, StagedFile | null>();
@@ -310,17 +332,27 @@ export async function applyPatch(root: string, patch: string): Promise<ApplyPatc
   const unifiedPatch = patches.join("\n");
   const stats = countPatchStats(unifiedPatch);
 
-  const pendingWrites: Array<{ temporary: string; destination: string }> = [];
+  const pendingWrites: Array<{
+    temporary: string;
+    destination: string;
+    destinationExists: boolean;
+  }> = [];
   for (const [destination, file] of staged) {
     if (!file) continue;
     await mkdir(dirname(destination), { recursive: true });
     const temporary = `${destination}.devspace-patch-${process.pid}-${pendingWrites.length}`;
     await writeFile(temporary, file.content, file.mode === undefined ? undefined : { mode: file.mode });
-    pendingWrites.push({ temporary, destination });
+    pendingWrites.push({
+      temporary,
+      destination,
+      destinationExists: originals.get(destination)?.content !== null,
+    });
   }
 
   try {
-    for (const write of pendingWrites) await rename(write.temporary, write.destination);
+    for (const write of pendingWrites) {
+      await replaceFile(write.temporary, write.destination, write.destinationExists);
+    }
     for (const [path, file] of staged) {
       if (!file) await rm(path, { force: true });
     }

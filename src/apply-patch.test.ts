@@ -2,9 +2,15 @@ import assert from "node:assert/strict";
 import { chmod, mkdtemp, readFile, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { applyPatch, parsePatch } from "./apply-patch.js";
+import { applyPatch, parsePatch, replaceFile } from "./apply-patch.js";
 
 const root = await mkdtemp(join(tmpdir(), "devspace-apply-patch-"));
+const replacement = join(root, "replacement.txt");
+const replacementTemporary = join(root, "replacement.tmp");
+await writeFile(replacement, "old\n");
+await writeFile(replacementTemporary, "new\n");
+await replaceFile(replacementTemporary, replacement, true, "win32");
+assert.equal(await readFile(replacement, "utf8"), "new\n");
 await writeFile(join(root, "alpha.txt"), "one\ntwo\nthree\n");
 await writeFile(join(root, "remove.txt"), "remove me\n");
 await writeFile(join(root, "windows.txt"), "first\r\nsecond\r\n");
