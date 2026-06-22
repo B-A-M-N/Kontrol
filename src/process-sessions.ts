@@ -265,9 +265,10 @@ export class ProcessSessionManager {
       if (scriptDirectory) void rm(scriptDirectory, { recursive: true, force: true });
     };
     const shell = resolveShellCommand(command);
+    const shellArgs = process.platform === "win32" ? `/d /c "${command}"` : shell.args;
     let pty: import("node-pty").IPty;
     try {
-      pty = nodePty.spawn(shell.executable, shell.args, {
+      pty = nodePty.spawn(shell.executable, shellArgs, {
         cwd: input.cwd,
         env: processEnvironment(),
         name: "xterm-256color",
