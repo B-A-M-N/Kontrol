@@ -197,7 +197,7 @@ This year, I started my journey to build a single-person and multiple-agents com
 revenue. If you want to watch the failures, wins, lessons, and everything in
 between, come hang out with me on [X](https://x.com/wshxnv).
 
-## Products by me
+## More from me
 
 <table>
   <thead>
