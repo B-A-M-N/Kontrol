@@ -250,16 +250,13 @@ export class ProcessSessionManager {
     }
 
     let scriptDirectory: string | undefined;
-    let readyPath: string | undefined;
     let command = input.command;
     if (process.platform === "win32") {
       scriptDirectory = await mkdtemp(join(tmpdir(), "devspace-pty-"));
-      readyPath = join(scriptDirectory, "ready");
       command = join(scriptDirectory, "command.cmd");
-      const batchReadyPath = readyPath.replaceAll("%", "%%");
       await writeFile(
         command,
-        `@echo off\r\n:wait\r\nif not exist "${batchReadyPath}" goto wait\r\n${input.command}\r\n`,
+        `@ping 127.0.0.1 -n 2 > nul\r\n@echo off\r\n${input.command}\r\n`,
         "utf8",
       );
     }
@@ -292,15 +289,6 @@ export class ProcessSessionManager {
       cleanupScript();
       this.finish(session, exitCode, signal === 0 ? undefined : String(signal));
     });
-    if (readyPath) {
-      try {
-        await writeFile(readyPath, "", "utf8");
-      } catch (error) {
-        pty.kill();
-        cleanupScript();
-        throw error;
-      }
-    }
   }
 
   private finish(session: ProcessSession, exitCode?: number, signal?: string): void {
