@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
+import { resolveShellCommand } from "./process-platform.js";
 
 const DEFAULT_YIELD_MS = 10_000;
 const DEFAULT_MAX_OUTPUT_TOKENS = 10_000;
@@ -82,20 +83,6 @@ function terminalSize(value: number | undefined, fallback: number): number {
     throw new Error("Terminal dimensions must be integers between 1 and 1000.");
   }
   return value;
-}
-
-function shellCommand(command: string): { executable: string; args: string[] } {
-  if (process.platform === "win32") {
-    return {
-      executable: process.env.ComSpec ?? "cmd.exe",
-      args: ["/d", "/s", "/c", command],
-    };
-  }
-
-  return {
-    executable: process.env.SHELL ?? "/bin/bash",
-    args: ["-lc", command],
-  };
 }
 
 function processEnvironment(): Record<string, string> {
@@ -230,7 +217,7 @@ export class ProcessSessionManager {
   }
 
   private startPipe(session: ProcessSession, input: StartCommandInput): void {
-    const shell = shellCommand(input.command);
+    const shell = resolveShellCommand(input.command);
     const detached = process.platform !== "win32";
     const child = spawn(shell.executable, shell.args, {
       cwd: input.cwd,
@@ -268,7 +255,7 @@ export class ProcessSessionManager {
       throw new Error("PTY support requires the optional node-pty dependency.");
     }
 
-    const shell = shellCommand(input.command);
+    const shell = resolveShellCommand(input.command);
     const pty = nodePty.spawn(shell.executable, shell.args, {
       cwd: input.cwd,
       env: processEnvironment(),
