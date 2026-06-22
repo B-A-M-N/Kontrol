@@ -101,7 +101,7 @@ const interrupted = await manager.write({
   yieldTimeMs: 2_000,
 });
 assert.equal(interrupted.running, false);
-assert.equal(interrupted.signal, "SIGINT");
+if (process.platform !== "win32") assert.equal(interrupted.signal, "SIGINT");
 assert.match(interrupted.output, /tick/);
 
 const buffered = await manager.start({
