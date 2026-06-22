@@ -12,6 +12,9 @@ export interface AppliedPatchFile {
 
 export interface ApplyPatchResult {
   files: AppliedPatchFile[];
+  patch: string;
+  additions: number;
+  removals: number;
 }
 
 interface HunkLine {
@@ -226,7 +229,18 @@ async function fileExists(path: string): Promise<boolean> {
 export async function applyPatch(root: string, patch: string): Promise<ApplyPatchResult> {
   const actions = parsePatch(patch);
   const staged = new Map<string, StagedFile | null>();
+  const originals = new Map<string, { content: string | null; path: string }>();
+  const currentPaths = new Map<string, string>();
   const results: AppliedPatchFile[] = [];
+
+  const rememberOriginal = (
+    absolute: string,
+    displayPath: string,
+    content: string | null,
+  ): void => {
+    if (!originals.has(absolute)) originals.set(absolute, { content, path: displayPath });
+    currentPaths.set(absolute, displayPath);
+  };
 
   const load = async (displayPath: string): Promise<{ absolute: string; file: StagedFile }> => {
     const absolute = await resolveConfinedPath(root, displayPath);
@@ -239,6 +253,7 @@ export async function applyPatch(root: string, patch: string): Promise<ApplyPatc
     const metadata = await stat(absolute);
     if (!metadata.isFile()) throw patchError(`path is not a regular file: ${displayPath}`);
     const file = { content: await readFile(absolute, "utf8"), mode: metadata.mode };
+    rememberOriginal(absolute, displayPath, file.content);
     staged.set(absolute, file);
     return { absolute, file };
   };
@@ -249,6 +264,7 @@ export async function applyPatch(root: string, patch: string): Promise<ApplyPatc
       if (staged.get(absolute) || (!staged.has(absolute) && (await fileExists(absolute)))) {
         throw patchError(`file already exists: ${action.path}`);
       }
+      rememberOriginal(absolute, action.path, null);
       staged.set(absolute, { content: action.content });
       results.push({ path: action.path, operation: "add" });
       continue;
@@ -271,6 +287,7 @@ export async function applyPatch(root: string, patch: string): Promise<ApplyPatc
       ) {
         throw patchError(`move destination already exists: ${action.moveTo}`);
       }
+      rememberOriginal(destination, action.moveTo, null);
       staged.set(absolute, null);
       staged.set(destination, { content: updated, mode: file.mode });
       results.push({ path: action.moveTo, previousPath: action.path, operation: "move" });
@@ -279,6 +296,19 @@ export async function applyPatch(root: string, patch: string): Promise<ApplyPatc
       results.push({ path: action.path, operation: "update" });
     }
   }
+
+  const patches = Array.from(staged, ([absolute, file]) => {
+    const original = originals.get(absolute);
+    if (!original || original.content === file?.content) return "";
+    return unifiedFilePatch(
+      original.path,
+      currentPaths.get(absolute) ?? original.path,
+      original.content,
+      file?.content ?? null,
+    );
+  }).filter(Boolean);
+  const unifiedPatch = patches.join("\n");
+  const stats = countPatchStats(unifiedPatch);
 
   const pendingWrites: Array<{ temporary: string; destination: string }> = [];
   for (const [destination, file] of staged) {
@@ -299,5 +329,82 @@ export async function applyPatch(root: string, patch: string): Promise<ApplyPatc
     throw error;
   }
 
-  return { files: results };
+  return { files: results, patch: unifiedPatch, ...stats };
+}
+
+function fileLines(content: string): string[] {
+  if (content.length === 0) return [];
+  const normalized = content.replace(/\r\n/g, "\n");
+  const lines = normalized.split("\n");
+  if (normalized.endsWith("\n")) lines.pop();
+  return lines;
+}
+
+function hunkRange(start: number, count: number): string {
+  return count === 0 ? "0,0" : `${start},${count}`;
+}
+
+function unifiedFilePatch(
+  oldPath: string,
+  newPath: string,
+  oldContent: string | null,
+  newContent: string | null,
+): string {
+  const oldLines = fileLines(oldContent ?? "");
+  const newLines = fileLines(newContent ?? "");
+  let prefix = 0;
+  while (
+    prefix < oldLines.length &&
+    prefix < newLines.length &&
+    oldLines[prefix] === newLines[prefix]
+  ) {
+    prefix += 1;
+  }
+
+  let suffix = 0;
+  while (
+    suffix < oldLines.length - prefix &&
+    suffix < newLines.length - prefix &&
+    oldLines[oldLines.length - 1 - suffix] === newLines[newLines.length - 1 - suffix]
+  ) {
+    suffix += 1;
+  }
+
+  const contextBefore = Math.min(3, prefix);
+  const contextAfter = Math.min(3, suffix);
+  const oldChanged = oldLines.slice(prefix, oldLines.length - suffix);
+  const newChanged = newLines.slice(prefix, newLines.length - suffix);
+  const before = oldLines.slice(prefix - contextBefore, prefix);
+  const after = oldLines.slice(oldLines.length - suffix, oldLines.length - suffix + contextAfter);
+  const oldCount = contextBefore + oldChanged.length + contextAfter;
+  const newCount = contextBefore + newChanged.length + contextAfter;
+  const oldStart = oldContent === null ? 0 : prefix - contextBefore + 1;
+  const newStart = newContent === null ? 0 : prefix - contextBefore + 1;
+  const displayOld = oldContent === null ? "/dev/null" : `a/${oldPath}`;
+  const displayNew = newContent === null ? "/dev/null" : `b/${newPath}`;
+
+  return [
+    `diff --git a/${oldPath} b/${newPath}`,
+    oldContent === null ? "new file mode 100644" : undefined,
+    newContent === null ? "deleted file mode 100644" : undefined,
+    `--- ${displayOld}`,
+    `+++ ${displayNew}`,
+    `@@ -${hunkRange(oldStart, oldCount)} +${hunkRange(newStart, newCount)} @@`,
+    ...before.map((line) => ` ${line}`),
+    ...oldChanged.map((line) => `-${line}`),
+    ...newChanged.map((line) => `+${line}`),
+    ...after.map((line) => ` ${line}`),
+  ]
+    .filter((line): line is string => line !== undefined)
+    .join("\n");
+}
+
+function countPatchStats(patch: string): { additions: number; removals: number } {
+  let additions = 0;
+  let removals = 0;
+  for (const line of patch.split("\n")) {
+    if (line.startsWith("+") && !line.startsWith("+++")) additions += 1;
+    if (line.startsWith("-") && !line.startsWith("---")) removals += 1;
+  }
+  return { additions, removals };
 }

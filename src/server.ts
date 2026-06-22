@@ -486,13 +486,14 @@ function processToolResponse(
 ) {
   const result = processResult(snapshot);
   const content = [textBlock(result)];
+  const outputSummary = textSummary(snapshot.output ? [textBlock(snapshot.output)] : []);
   return {
     content,
     _meta: {
       tool,
       card: {
         workspaceId,
-        summary,
+        summary: { ...summary, ...outputSummary },
         payload: { content },
       },
     },
@@ -1116,6 +1117,8 @@ function createMcpServer(
             .describe("Patch text enclosed by *** Begin Patch and *** End Patch markers."),
         },
         outputSchema: resultOutputSchema({
+          additions: z.number(),
+          removals: z.number(),
           files: z.array(
             z.object({
               path: z.string(),
@@ -1134,6 +1137,9 @@ function createMcpServer(
         const paths = applied.files.map((file) => file.path).join(", ");
         const result = `Applied patch to ${applied.files.length} file(s): ${paths}`;
         const content = [textBlock(result)];
+        const displayPath = applied.files.length === 1
+          ? applied.files[0]?.path
+          : `${applied.files.length} files`;
 
         logToolCall(config, {
           tool: "apply_patch",
@@ -1148,12 +1154,19 @@ function createMcpServer(
             tool: "apply_patch",
             card: {
               workspaceId,
-              summary: { files: applied.files.length },
-              payload: { patch },
+              path: displayPath,
+              summary: {
+                files: applied.files.length,
+                additions: applied.additions,
+                removals: applied.removals,
+              },
+              payload: { patch: applied.patch },
             },
           },
           structuredContent: {
             result,
+            additions: applied.additions,
+            removals: applied.removals,
             files: applied.files,
           },
         };

@@ -36,6 +36,10 @@ assert.deepEqual(result.files, [
   { path: "windows.txt", operation: "update" },
   { path: "remove.txt", operation: "delete" },
 ]);
+assert.equal(result.additions, 4);
+assert.equal(result.removals, 3);
+assert.match(result.patch, /diff --git a\/alpha\.txt b\/alpha\.txt/);
+assert.match(result.patch, /-two\n\+changed/);
 assert.equal(await readFile(join(root, "nested/added.txt"), "utf8"), "new\nfile\n");
 assert.equal(await readFile(join(root, "alpha.txt"), "utf8"), "one\nchanged\nthree\n");
 assert.equal(await readFile(join(root, "windows.txt"), "utf8"), "first\r\nupdated\r\n");
