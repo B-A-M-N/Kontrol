@@ -281,7 +281,7 @@ export class ProcessSessionManager {
 
     session.process = {
       write: (data) => pty.write(data),
-      kill: (signal) => pty.kill(signal),
+      kill: (signal) => process.platform === "win32" ? pty.kill() : pty.kill(signal),
       resize: (columns, rows) => pty.resize(columns, rows),
     };
     pty.onData((data) => this.append(session, data));
