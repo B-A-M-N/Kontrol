@@ -219,12 +219,13 @@ export class ProcessSessionManager {
   private startPipe(session: ProcessSession, input: StartCommandInput): void {
     const shell = resolveShellCommand(input.command);
     const detached = process.platform !== "win32";
-    const child = spawn(shell.executable, shell.args, {
+    const child = spawn(input.command, {
       cwd: input.cwd,
       env: process.env,
       stdio: "pipe",
       windowsHide: true,
       detached,
+      shell: shell.executable,
     });
 
     session.process = {
