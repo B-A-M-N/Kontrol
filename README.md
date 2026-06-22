@@ -192,13 +192,41 @@ explicit, inspectable tools.
 
 ## Built by Waishnav
 
-I'm Waishnav, the creator of [GitCMS](https://gitcms.dev/), a Git-backed CMS
-for markdown sites.
-
-I like building opinionated products, and DevSpace is another example of that.
-I'm on a journey to build a single-person company doing multiple millions in
+I'm Waishnav, I like building opinionated products and tools, and DevSpace is one example of that.
+This year, I started my journey to build a single-person and multiple-agents company doing multiple millions in
 revenue. If you want to watch the failures, wins, lessons, and everything in
 between, come hang out with me on [X](https://x.com/wshxnv).
+
+## Products by me
+
+<table>
+  <thead>
+    <tr>
+      <th>Project</th>
+      <th>About</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td align="center" width="220">
+        <a href="https://gitcms.dev/">
+          <img
+            src="https://gitcms.dev/brand/gitcms-logo.svg"
+            alt="GitCMS"
+            width="48"
+          /><br />
+          <strong>GitCMS</strong>
+        </a>
+      </td>
+      <td>
+        <strong>Modern CMS and tooling for markdown based content sites — built for agents and humans.</strong><br><br>
+        Visual editing, editorial workflow, and ChatGPT/Claude content agents, with
+        every post and page stored as files in your repo.
+        <a href="https://gitcms.dev/">Learn more</a>.
+      </td>
+    </tr>
+  </tbody>
+</table>
 
 ## Local Development
 
