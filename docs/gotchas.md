@@ -15,7 +15,7 @@ If you installed globally, confirm npm's global bin directory is on `PATH`.
 
 ## Unsupported Node Version
 
-DevSpace requires Node `>=20.12 <27`.
+DevSpace requires Node `>=22.19 <27`.
 
 Check:
 
