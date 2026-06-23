@@ -15,7 +15,7 @@ import {
 } from "./user-config.js";
 import { expandHomePath } from "./roots.js";
 
-type Command = "serve" | "init" | "doctor" | "config" | "help";
+type Command = "serve" | "init" | "doctor" | "config" | "help" | "version";
 const require = createRequire(import.meta.url);
 const SUPPORTED_NODE_RANGE = ">=20.12 <27";
 
@@ -42,6 +42,9 @@ async function main(argv: string[]): Promise<void> {
     case "help":
       printHelp();
       return;
+    case "version":
+      printVersion();
+      return;
   }
 }
 
@@ -49,6 +52,7 @@ function normalizeCommand(command: string | undefined): Command {
   if (!command || command === "serve" || command === "start") return "serve";
   if (command === "init" || command === "doctor" || command === "config") return command;
   if (command === "help" || command === "--help" || command === "-h") return "help";
+  if (command === "version" || command === "--version" || command === "-v") return "version";
   throw new Error(`Unknown command: ${command}`);
 }
 
@@ -264,11 +268,21 @@ function printHelp(): void {
       "  devspace doctor          Show config, runtime, and native dependency status",
       "  devspace config get      Print persisted config",
       "  devspace config set publicBaseUrl <url|null>",
+      "  devspace -v, --version   Print the installed version",
       "",
       "For temporary tunnels:",
       "  DEVSPACE_PUBLIC_BASE_URL=https://example.trycloudflare.com devspace serve",
     ].join("\n"),
   );
+}
+
+function printVersion(): void {
+  const packageJson = require("../package.json") as { version?: unknown };
+  if (typeof packageJson.version !== "string") {
+    throw new Error("Unable to read DevSpace package version.");
+  }
+
+  console.log(packageJson.version);
 }
 
 function normalizeOptionalPublicBaseUrl(value: string): string | null {
