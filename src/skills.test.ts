@@ -115,7 +115,7 @@ try {
   const loaded = loadWorkspaceSkills(config, projectRoot);
   assert.equal(loaded.skills.some((skill) => skill.name === "agent-global-skill"), true);
   assert.equal(loaded.skills.some((skill) => skill.name === "agent-project-skill"), true);
-  assert.equal(loaded.skills.some((skill) => skill.name === "project-skill"), true);
+  assert.equal(loaded.skills.some((skill) => skill.name === "project-skill"), false);
   assert.equal(loaded.skills.filter((skill) => skill.name === "duplicate-skill").length, 1);
   assert.equal(loaded.skills.some((skill) => skill.name === "hidden-skill"), true);
   assert.equal(loaded.diagnostics.some((diagnostic) => diagnostic.type === "collision"), true);
@@ -132,7 +132,19 @@ try {
     1,
   );
 
-  const projectSkill = loaded.skills.find((skill) => skill.name === "project-skill");
+  const legacyPiConfig = loadConfig({
+    DEVSPACE_ALLOWED_ROOTS: projectRoot,
+    DEVSPACE_AGENT_DIR: agentDir,
+    DEVSPACE_SKILL_PATHS: [explicitSkills, join(projectRoot, ".pi", "skills")].join(","),
+    DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+    PORT: "1",
+  });
+  assert.equal(
+    loadWorkspaceSkills(legacyPiConfig, projectRoot).skills.some((skill) => skill.name === "project-skill"),
+    true,
+  );
+
+  const projectSkill = loaded.skills.find((skill) => skill.name === "agent-project-skill");
   assert.ok(projectSkill);
   assert.match(formatPathForPrompt(projectSkill.filePath), /SKILL\.md$/);
 

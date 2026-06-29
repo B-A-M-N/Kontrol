@@ -24,6 +24,7 @@ export function effectiveSkillPaths(config: ServerConfig, cwd: string): string[]
   const defaultPaths = [
     join(homedir(), ".agents", "skills"),
     resolve(cwd, ".agents", "skills"),
+    join(config.agentDir, "skills"),
   ].filter((path) => existsSync(path));
 
   const seen = new Set<string>();
@@ -42,7 +43,7 @@ export function loadWorkspaceSkills(config: ServerConfig, cwd: string): LoadedSk
     cwd,
     agentDir: config.agentDir,
     skillPaths: effectiveSkillPaths(config, cwd),
-    includeDefaults: true,
+    includeDefaults: false,
   });
 }
 
