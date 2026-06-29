@@ -48,6 +48,15 @@ assert.equal(foreground.exitCode, 0);
 assert.match(foreground.output, /foreground/);
 assert.equal(foreground.sessionId, undefined);
 
+const environment = await manager.start({
+  workspaceId: "workspace-a",
+  cwd: process.cwd(),
+  command: `${node} -e "console.log([process.env.NO_COLOR, process.env.TERM, process.env.PAGER, process.env.GIT_PAGER, process.env.GH_PAGER, process.env.CODEX_CI].join(','))"`,
+  yieldTimeMs: 2_000,
+});
+assert.equal(environment.running, false);
+assert.match(environment.output, /1,dumb,cat,cat,cat,1/);
+
 const background = await manager.start({
   workspaceId: "workspace-a",
   cwd: process.cwd(),
@@ -92,6 +101,23 @@ const inputResult = await manager.write({
 });
 assert.equal(inputResult.running, false);
 assert.match(inputResult.output, /input:hello/);
+
+const defaultInteractive = await manager.start({
+  workspaceId: "workspace-a",
+  cwd: process.cwd(),
+  command: `${node} -e "process.stdin.once('data', data => setTimeout(() => { console.log('default-input:' + data.toString().trim()); process.exit(0); }, 100))"`,
+  yieldTimeMs: 5,
+});
+assert.equal(defaultInteractive.running, true);
+assert.ok(defaultInteractive.sessionId);
+
+const defaultInputResult = await manager.write({
+  workspaceId: "workspace-a",
+  sessionId: defaultInteractive.sessionId,
+  chars: "hello\n",
+});
+assert.equal(defaultInputResult.running, false);
+assert.match(defaultInputResult.output, /default-input:hello/);
 
 const noisyInteractive = await manager.start({
   workspaceId: "workspace-a",

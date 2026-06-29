@@ -2,7 +2,11 @@ import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { resolveShellCommand, terminateProcessTree } from "./process-platform.js";
 
-const DEFAULT_YIELD_MS = 10_000;
+const DEFAULT_EXEC_YIELD_MS = 10_000;
+const DEFAULT_INTERACTIVE_YIELD_MS = 250;
+const DEFAULT_POLL_YIELD_MS = 5_000;
+const MAX_COMMAND_YIELD_MS = 30_000;
+const MAX_POLL_YIELD_MS = 110_000;
 const DEFAULT_MAX_OUTPUT_TOKENS = 10_000;
 const DEFAULT_BUFFER_CHARACTERS = 1_000_000;
 const COMPLETED_SESSION_TTL_MS = 5 * 60 * 1_000;
@@ -84,9 +88,19 @@ function terminalSize(value: number | undefined, fallback: number): number {
 }
 
 function processEnvironment(): Record<string, string> {
-  return Object.fromEntries(
-    Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined),
-  );
+  return {
+    ...Object.fromEntries(
+      Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined),
+    ),
+    NO_COLOR: "1",
+    TERM: "dumb",
+    PAGER: "cat",
+    GIT_PAGER: "cat",
+    GH_PAGER: "cat",
+    CODEX_CI: "1",
+    LANG: process.env.LANG ?? "C.UTF-8",
+    LC_ALL: process.env.LC_ALL ?? "C.UTF-8",
+  };
 }
 
 function codePointLength(value: string): number {
@@ -214,7 +228,7 @@ export class ProcessSessionManager {
       throw error;
     }
 
-    const yieldTimeMs = boundedInteger(input.yieldTimeMs, DEFAULT_YIELD_MS, 30_000);
+    const yieldTimeMs = boundedInteger(input.yieldTimeMs, DEFAULT_EXEC_YIELD_MS, MAX_COMMAND_YIELD_MS);
     await this.waitForExit(session, yieldTimeMs);
 
     const snapshot = this.consume(session, input.maxOutputTokens);
@@ -245,7 +259,9 @@ export class ProcessSessionManager {
     if (writableChars && session.running) session.process?.write(writableChars);
 
     if ((interactionRequested || !session.buffer.hasOutput()) && session.running) {
-      const yieldTimeMs = boundedInteger(input.yieldTimeMs, DEFAULT_YIELD_MS, 30_000);
+      const fallback = interactionRequested ? DEFAULT_INTERACTIVE_YIELD_MS : DEFAULT_POLL_YIELD_MS;
+      const maximum = interactionRequested ? MAX_COMMAND_YIELD_MS : MAX_POLL_YIELD_MS;
+      const yieldTimeMs = boundedInteger(input.yieldTimeMs, fallback, maximum);
       await this.waitForExit(session, yieldTimeMs);
     }
 
@@ -305,7 +321,7 @@ export class ProcessSessionManager {
     const detached = process.platform !== "win32";
     const child = spawn(input.command, {
       cwd: input.cwd,
-      env: process.env,
+      env: processEnvironment(),
       stdio: "pipe",
       windowsHide: true,
       detached,
