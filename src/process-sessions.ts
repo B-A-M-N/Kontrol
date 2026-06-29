@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { resolveShellCommand, terminateProcessTree } from "./process-platform.js";
 
@@ -26,7 +25,7 @@ export interface StartCommandInput {
 
 export interface WriteStdinInput {
   workspaceId: string;
-  sessionId: string;
+  sessionId: number;
   chars?: string;
   columns?: number;
   rows?: number;
@@ -35,7 +34,7 @@ export interface WriteStdinInput {
 }
 
 export interface ProcessSnapshot {
-  sessionId?: string;
+  sessionId?: number;
   output: string;
   outputTruncated: boolean;
   running: boolean;
@@ -51,7 +50,7 @@ interface ManagedProcess {
 }
 
 interface ProcessSession {
-  id: string;
+  id: number;
   workspaceId: string;
   process?: ManagedProcess;
   startedAt: number;
@@ -207,9 +206,10 @@ function truncateOutput(output: string, maxCharacters: number): { output: string
 }
 
 export class ProcessSessionManager {
-  private readonly sessions = new Map<string, ProcessSession>();
+  private readonly sessions = new Map<number, ProcessSession>();
   private readonly maxBufferCharacters: number;
   private readonly completedSessionTtlMs: number;
+  private nextSessionId = 1;
 
   constructor(options: ProcessSessionManagerOptions = {}) {
     this.maxBufferCharacters = options.maxBufferCharacters ?? DEFAULT_BUFFER_CHARACTERS;
@@ -270,7 +270,7 @@ export class ProcessSessionManager {
     return snapshot;
   }
 
-  terminate(workspaceId: string, sessionId: string): void {
+  terminate(workspaceId: string, sessionId: number): void {
     const session = this.getOwnedSession(workspaceId, sessionId);
     if (session.running) session.process?.kill("SIGTERM");
   }
@@ -304,7 +304,7 @@ export class ProcessSessionManager {
     });
 
     return {
-      id: randomUUID(),
+      id: this.nextSessionId++,
       workspaceId: input.workspaceId,
       startedAt: Date.now(),
       columns: terminalSize(input.columns, DEFAULT_COLUMNS),
@@ -405,7 +405,7 @@ export class ProcessSessionManager {
     };
   }
 
-  private getOwnedSession(workspaceId: string, sessionId: string): ProcessSession {
+  private getOwnedSession(workspaceId: string, sessionId: number): ProcessSession {
     const session = this.sessions.get(sessionId);
     if (!session) throw new Error(`Unknown process session: ${sessionId}`);
     if (session.workspaceId !== workspaceId) {
@@ -414,7 +414,7 @@ export class ProcessSessionManager {
     return session;
   }
 
-  private removeSession(sessionId: string): void {
+  private removeSession(sessionId: number): void {
     const session = this.sessions.get(sessionId);
     if (session?.cleanupTimer) clearTimeout(session.cleanupTimer);
     this.sessions.delete(sessionId);

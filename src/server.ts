@@ -469,7 +469,7 @@ function processResult(snapshot: ProcessSnapshot): string {
 
 function processOutputSchema(): z.ZodRawShape {
   return resultOutputSchema({
-    sessionId: z.string().optional(),
+    sessionId: z.number().optional(),
     running: z.boolean(),
     exitCode: z.number().int().optional(),
     signal: z.string().optional(),
@@ -598,7 +598,7 @@ function registerCodexProcessTools(
         "Poll or write characters to a process returned by exec_command. Omit chars or pass an empty string to poll. Pass \\u0003 to send Ctrl-C.",
       inputSchema: {
         workspaceId: z.string().describe("Workspace identifier used to start the process."),
-        sessionId: z.string().describe("Process session identifier returned by exec_command."),
+        sessionId: z.number().describe("Process session identifier returned by exec_command."),
         chars: z.string().optional().describe("Characters to write. Omit or pass an empty string to poll."),
         columns: z.number().int().min(1).max(1_000).optional().describe("Resize a PTY to this width."),
         rows: z.number().int().min(1).max(1_000).optional().describe("Resize a PTY to this height."),
