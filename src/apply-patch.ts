@@ -1,6 +1,8 @@
+import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { access, mkdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
+import { TextDecoder } from "node:util";
 
 export type PatchOperation = "add" | "update" | "delete" | "move";
 
@@ -24,6 +26,8 @@ interface HunkLine {
 
 interface UpdateHunk {
   lines: HunkLine[];
+  changeContext?: string;
+  endOfFile?: boolean;
 }
 
 type PatchAction =
@@ -31,7 +35,7 @@ type PatchAction =
   | { kind: "delete"; path: string }
   | { kind: "update"; path: string; moveTo?: string; hunks: UpdateHunk[] };
 
-interface StagedFile {
+interface TextFile {
   content: string;
   mode?: number;
 }
@@ -41,12 +45,11 @@ function patchError(message: string): Error {
 }
 
 export function parsePatch(patch: string): PatchAction[] {
-  const lines = patch.replace(/\r\n/g, "\n").split("\n");
-  if (lines.at(-1) === "") lines.pop();
-  if (lines.shift() !== "*** Begin Patch") {
+  const lines = patchLines(patch);
+  if (lines.shift()?.trim() !== "*** Begin Patch") {
     throw patchError("missing *** Begin Patch marker");
   }
-  if (lines.pop() !== "*** End Patch") {
+  if (lines.pop()?.trim() !== "*** End Patch") {
     throw patchError("missing *** End Patch marker");
   }
 
@@ -54,22 +57,31 @@ export function parsePatch(patch: string): PatchAction[] {
   let index = 0;
 
   while (index < lines.length) {
-    const header = lines[index++];
+    const header = lines[index++].trim();
+    if (header === "") continue;
+
+    if (header.startsWith("*** Environment ID: ")) {
+      if (!header.slice("*** Environment ID: ".length).trim()) {
+        throw patchError("environment id cannot be empty");
+      }
+      continue;
+    }
 
     if (header.startsWith("*** Add File: ")) {
       const path = header.slice("*** Add File: ".length);
       const content: string[] = [];
-      while (index < lines.length && !lines[index].startsWith("*** ")) {
+      while (index < lines.length && !isTopLevelHeader(lines[index])) {
         const line = lines[index++];
         if (!line.startsWith("+")) {
           throw patchError(`added file line must start with +: ${line}`);
         }
         content.push(line.slice(1));
       }
+      if (content.length === 0) throw patchError(`add file for ${path} has no content`);
       actions.push({
         kind: "add",
         path,
-        content: content.length > 0 ? `${content.join("\n")}\n` : "",
+        content: `${content.join("\n")}\n`,
       });
       continue;
     }
@@ -84,33 +96,51 @@ export function parsePatch(patch: string): PatchAction[] {
       let moveTo: string | undefined;
       const hunks: UpdateHunk[] = [];
 
-      if (lines[index]?.startsWith("*** Move to: ")) {
-        moveTo = lines[index++].slice("*** Move to: ".length);
+      if (lines[index]?.trim().startsWith("*** Move to: ")) {
+        moveTo = lines[index++].trim().slice("*** Move to: ".length);
       }
 
-      while (index < lines.length && !lines[index].startsWith("*** ")) {
-        const hunkHeader = lines[index++];
-        if (!hunkHeader.startsWith("@@")) {
-          throw patchError(`expected hunk header, received: ${hunkHeader}`);
+      let current: UpdateHunk | undefined;
+      const finishCurrent = (): void => {
+        if (!current) return;
+        if (current.lines.length === 0) throw patchError(`empty update hunk for ${path}`);
+        hunks.push(current);
+        current = undefined;
+      };
+
+      while (index < lines.length) {
+        const line = lines[index];
+        const trimmed = line.trim();
+        if (!current && trimmed === "") {
+          index++;
+          continue;
+        }
+        if (trimmed === "*** End of File") {
+          if (!current) throw patchError(`end-of-file marker without update hunk for ${path}`);
+          current.endOfFile = true;
+          index++;
+          continue;
         }
 
-        const hunkLines: HunkLine[] = [];
-        while (
-          index < lines.length &&
-          !lines[index].startsWith("@@") &&
-          !lines[index].startsWith("*** ")
-        ) {
-          const line = lines[index++];
-          if (line.startsWith(" ")) hunkLines.push({ kind: "context", text: line.slice(1) });
-          else if (line.startsWith("+")) hunkLines.push({ kind: "add", text: line.slice(1) });
-          else if (line.startsWith("-")) hunkLines.push({ kind: "remove", text: line.slice(1) });
-          else if (line === "\\ No newline at end of file") continue;
-          else throw patchError(`hunk line must start with space, +, or -: ${line}`);
+        if ((!current || !line.startsWith(" ")) && isTopLevelHeader(line)) break;
+
+        if (trimmed.startsWith("@@") && !line.startsWith(" ")) {
+          finishCurrent();
+          const changeContext = trimmed.slice(2).trim();
+          current = { lines: [], changeContext: changeContext || undefined };
+          index++;
+          continue;
         }
 
-        if (hunkLines.length === 0) throw patchError(`empty update hunk for ${path}`);
-        hunks.push({ lines: hunkLines });
+        current ??= { lines: [] };
+        index++;
+        if (line.startsWith(" ")) current.lines.push({ kind: "context", text: line.slice(1) });
+        else if (line.startsWith("+")) current.lines.push({ kind: "add", text: line.slice(1) });
+        else if (line.startsWith("-")) current.lines.push({ kind: "remove", text: line.slice(1) });
+        else if (line === "\\ No newline at end of file") continue;
+        else throw patchError(`hunk line must start with space, +, or -: ${line}`);
       }
+      finishCurrent();
 
       if (hunks.length === 0 && !moveTo) {
         throw patchError(`update for ${path} has no hunks or move destination`);
@@ -124,6 +154,30 @@ export function parsePatch(patch: string): PatchAction[] {
 
   if (actions.length === 0) throw patchError("contains no file actions");
   return actions;
+}
+
+function patchLines(patch: string): string[] {
+  let lines = patch.replace(/\r\n/g, "\n").trim().split("\n");
+  const first = lines[0]?.trim();
+  const last = lines.at(-1)?.trim();
+  if (
+    (first === "<<EOF" || first === "<<'EOF'" || first === '<<"EOF"') &&
+    last?.endsWith("EOF") &&
+    lines.length >= 4
+  ) {
+    lines = lines.slice(1, -1);
+  }
+  return lines;
+}
+
+function isTopLevelHeader(line: string): boolean {
+  const trimmed = line.trim();
+  return (
+    trimmed.startsWith("*** Add File: ") ||
+    trimmed.startsWith("*** Delete File: ") ||
+    trimmed.startsWith("*** Update File: ") ||
+    trimmed.startsWith("*** Environment ID: ")
+  );
 }
 
 function isInside(root: string, path: string): boolean {
@@ -171,7 +225,7 @@ function splitFile(content: string): { lines: string[]; eol: string; finalNewlin
   return { lines, eol, finalNewline };
 }
 
-function findSequence(haystack: string[], needle: string[], from: number): number {
+function findSequence(haystack: string[], needle: string[], from: number, endOfFile = false): number {
   if (needle.length === 0) return from;
 
   const matchAt = (index: number, normalize: (value: string) => string): boolean =>
@@ -182,8 +236,10 @@ function findSequence(haystack: string[], needle: string[], from: number): numbe
     (value: string) => value.trimEnd(),
     (value: string) => value.trim(),
   ]) {
-    for (let index = from; index <= haystack.length - needle.length; index += 1) {
-      if (matchAt(index, normalize)) return index;
+    const start = endOfFile ? haystack.length - needle.length : from;
+    const end = haystack.length - needle.length;
+    for (let index = start; index <= end; index += 1) {
+      if (index >= from && matchAt(index, normalize)) return index;
     }
   }
 
@@ -196,13 +252,23 @@ function applyHunks(path: string, content: string, hunks: UpdateHunk[]): string 
   let cursor = 0;
 
   for (const hunk of hunks) {
+    if (hunk.changeContext) {
+      const contextIndex = findSequence(lines, [hunk.changeContext], cursor);
+      if (contextIndex < 0) {
+        throw patchError(`could not find hunk context in ${path}: ${hunk.changeContext}`);
+      }
+      cursor = contextIndex + 1;
+    }
+
     const oldLines = hunk.lines
       .filter((line) => line.kind !== "add")
       .map((line) => line.text);
     const newLines = hunk.lines
       .filter((line) => line.kind !== "remove")
       .map((line) => line.text);
-    const index = findSequence(lines, oldLines, cursor);
+    const index = hunk.endOfFile && oldLines.length === 0
+      ? lines.length
+      : findSequence(lines, oldLines, cursor, hunk.endOfFile);
 
     if (index < 0) {
       const preview = oldLines.slice(0, 3).join("\n");
@@ -213,7 +279,7 @@ function applyHunks(path: string, content: string, hunks: UpdateHunk[]): string 
     cursor = index + newLines.length;
   }
 
-  const normalized = lines.join("\n") + (file.finalNewline ? "\n" : "");
+  const normalized = `${lines.join("\n")}\n`;
   return file.eol === "\r\n" ? normalized.replace(/\n/g, "\r\n") : normalized;
 }
 
@@ -250,52 +316,25 @@ export async function replaceFile(
 
 export async function applyPatch(root: string, patch: string): Promise<ApplyPatchResult> {
   const actions = parsePatch(patch);
-  const staged = new Map<string, StagedFile | null>();
-  const originals = new Map<string, { content: string | null; path: string }>();
-  const currentPaths = new Map<string, string>();
   const results: AppliedPatchFile[] = [];
-
-  const rememberOriginal = (
-    absolute: string,
-    displayPath: string,
-    content: string | null,
-  ): void => {
-    if (!originals.has(absolute)) originals.set(absolute, { content, path: displayPath });
-    currentPaths.set(absolute, displayPath);
-  };
-
-  const load = async (displayPath: string): Promise<{ absolute: string; file: StagedFile }> => {
-    const absolute = await resolveConfinedPath(root, displayPath);
-    if (staged.has(absolute)) {
-      const file = staged.get(absolute);
-      if (!file) throw patchError(`file does not exist: ${displayPath}`);
-      return { absolute, file };
-    }
-    if (!(await fileExists(absolute))) throw patchError(`file does not exist: ${displayPath}`);
-    const metadata = await stat(absolute);
-    if (!metadata.isFile()) throw patchError(`path is not a regular file: ${displayPath}`);
-    const file = { content: await readFile(absolute, "utf8"), mode: metadata.mode };
-    rememberOriginal(absolute, displayPath, file.content);
-    staged.set(absolute, file);
-    return { absolute, file };
-  };
+  const patches: string[] = [];
 
   for (const action of actions) {
     if (action.kind === "add") {
       const absolute = await resolveConfinedPath(root, action.path);
-      if (staged.get(absolute) || (!staged.has(absolute) && (await fileExists(absolute)))) {
-        throw patchError(`file already exists: ${action.path}`);
-      }
-      rememberOriginal(absolute, action.path, null);
-      staged.set(absolute, { content: action.content });
+      const original = await readOptionalTextFile(absolute, action.path);
+      await writeTextFile(absolute, action.content, original?.mode);
+      patches.push(unifiedFilePatch(action.path, action.path, original?.content ?? null, action.content));
       results.push({ path: action.path, operation: "add" });
       continue;
     }
 
-    const { absolute, file } = await load(action.path);
+    const absolute = await resolveConfinedPath(root, action.path);
+    const file = await readRequiredTextFile(absolute, action.path);
 
     if (action.kind === "delete") {
-      staged.set(absolute, null);
+      await rm(absolute);
+      patches.push(unifiedFilePatch(action.path, action.path, file.content, null));
       results.push({ path: action.path, operation: "delete" });
       continue;
     }
@@ -303,65 +342,59 @@ export async function applyPatch(root: string, patch: string): Promise<ApplyPatc
     const updated = applyHunks(action.path, file.content, action.hunks);
     if (action.moveTo) {
       const destination = await resolveConfinedPath(root, action.moveTo);
-      if (
-        destination !== absolute &&
-        (staged.get(destination) || (!staged.has(destination) && (await fileExists(destination))))
-      ) {
-        throw patchError(`move destination already exists: ${action.moveTo}`);
-      }
-      rememberOriginal(destination, action.moveTo, null);
-      staged.set(absolute, null);
-      staged.set(destination, { content: updated, mode: file.mode });
+      if (destination !== absolute) await readOptionalTextFile(destination, action.moveTo);
+      await writeTextFile(destination, updated, file.mode);
+      if (destination !== absolute) await rm(absolute);
+      patches.push(unifiedFilePatch(action.path, action.moveTo, file.content, updated));
       results.push({ path: action.moveTo, previousPath: action.path, operation: "move" });
     } else {
-      staged.set(absolute, { content: updated, mode: file.mode });
+      await writeTextFile(absolute, updated, file.mode);
+      patches.push(unifiedFilePatch(action.path, action.path, file.content, updated));
       results.push({ path: action.path, operation: "update" });
     }
   }
 
-  const patches = Array.from(staged, ([absolute, file]) => {
-    const original = originals.get(absolute);
-    if (!original || original.content === file?.content) return "";
-    return unifiedFilePatch(
-      original.path,
-      currentPaths.get(absolute) ?? original.path,
-      original.content,
-      file?.content ?? null,
-    );
-  }).filter(Boolean);
-  const unifiedPatch = patches.join("\n");
+  const unifiedPatch = patches.filter(Boolean).join("\n");
   const stats = countPatchStats(unifiedPatch);
+  return { files: results, patch: unifiedPatch, ...stats };
+}
 
-  const pendingWrites: Array<{
-    temporary: string;
-    destination: string;
-    destinationExists: boolean;
-  }> = [];
-  for (const [destination, file] of staged) {
-    if (!file) continue;
-    await mkdir(dirname(destination), { recursive: true });
-    const temporary = `${destination}.devspace-patch-${process.pid}-${pendingWrites.length}`;
-    await writeFile(temporary, file.content, file.mode === undefined ? undefined : { mode: file.mode });
-    pendingWrites.push({
-      temporary,
-      destination,
-      destinationExists: originals.get(destination)?.content !== null,
-    });
-  }
+async function readRequiredTextFile(absolute: string, displayPath: string): Promise<TextFile> {
+  if (!(await fileExists(absolute))) throw patchError(`file does not exist: ${displayPath}`);
+  const metadata = await stat(absolute);
+  if (!metadata.isFile()) throw patchError(`path is not a regular file: ${displayPath}`);
+  return { content: await readUtf8Text(absolute, displayPath), mode: metadata.mode };
+}
 
+async function readOptionalTextFile(absolute: string, displayPath: string): Promise<TextFile | null> {
+  if (!(await fileExists(absolute))) return null;
+  const metadata = await stat(absolute);
+  if (!metadata.isFile()) throw patchError(`path is not a regular file: ${displayPath}`);
+  return { content: await readUtf8Text(absolute, displayPath), mode: metadata.mode };
+}
+
+async function readUtf8Text(absolute: string, displayPath: string): Promise<string> {
+  const bytes = await readFile(absolute);
+  let content: string;
   try {
-    for (const write of pendingWrites) {
-      await replaceFile(write.temporary, write.destination, write.destinationExists);
-    }
-    for (const [path, file] of staged) {
-      if (!file) await rm(path, { force: true });
-    }
+    content = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    throw patchError(`file is not valid UTF-8 text: ${displayPath}`);
+  }
+  if (content.includes("\0")) throw patchError(`file appears to be binary: ${displayPath}`);
+  return content;
+}
+
+async function writeTextFile(destination: string, content: string, mode?: number): Promise<void> {
+  await mkdir(dirname(destination), { recursive: true });
+  const temporary = `${destination}.devspace-patch-${process.pid}-${randomUUID()}`;
+  try {
+    await writeFile(temporary, content, mode === undefined ? undefined : { mode });
+    await replaceFile(temporary, destination, await fileExists(destination));
   } catch (error) {
-    await Promise.all(pendingWrites.map(({ temporary }) => rm(temporary, { force: true })));
+    await rm(temporary, { force: true });
     throw error;
   }
-
-  return { files: results, patch: unifiedPatch, ...stats };
 }
 
 function fileLines(content: string): string[] {

@@ -124,7 +124,129 @@ await assert.rejects(
   ),
   /could not find hunk context/,
 );
-await assert.rejects(readFile(join(root, "should-not-exist.txt"), "utf8"), /ENOENT/);
+assert.equal(await readFile(join(root, "should-not-exist.txt"), "utf8"), "staged\n");
 
 assert.throws(() => parsePatch("*** Begin Patch\n*** End Patch"), /contains no file actions/);
 assert.throws(() => parsePatch("*** Add File: bad.txt\n+x"), /missing .* marker/);
+assert.throws(
+  () => parsePatch("*** Begin Patch\n*** Add File: empty.txt\n*** End Patch"),
+  /has no content/,
+);
+
+const overwriteRoot = await mkdtemp(join(tmpdir(), "devspace-apply-patch-overwrite-"));
+await writeFile(join(overwriteRoot, "duplicate.txt"), "old content\n");
+await applyPatch(
+  overwriteRoot,
+  `*** Begin Patch
+*** Add File: duplicate.txt
++new content
+*** End Patch`,
+);
+assert.equal(await readFile(join(overwriteRoot, "duplicate.txt"), "utf8"), "new content\n");
+
+await writeFile(join(overwriteRoot, "source.txt"), "from\n");
+await writeFile(join(overwriteRoot, "destination.txt"), "existing\n");
+await applyPatch(
+  overwriteRoot,
+  `*** Begin Patch
+*** Update File: source.txt
+*** Move to: destination.txt
+@@
+-from
++new
+*** End Patch`,
+);
+assert.equal(await readFile(join(overwriteRoot, "destination.txt"), "utf8"), "new\n");
+await assert.rejects(readFile(join(overwriteRoot, "source.txt"), "utf8"), /ENOENT/);
+
+const noNewlineRoot = await mkdtemp(join(tmpdir(), "devspace-apply-patch-newline-"));
+await writeFile(join(noNewlineRoot, "no-newline.txt"), "old");
+await applyPatch(
+  noNewlineRoot,
+  `*** Begin Patch
+*** Update File: no-newline.txt
+@@
+-old
++new
+*** End Patch`,
+);
+assert.equal(await readFile(join(noNewlineRoot, "no-newline.txt"), "utf8"), "new\n");
+
+const eofRoot = await mkdtemp(join(tmpdir(), "devspace-apply-patch-eof-"));
+await writeFile(join(eofRoot, "tail.txt"), "first\nsecond\n");
+await applyPatch(
+  eofRoot,
+  `*** Begin Patch
+*** Update File: tail.txt
+@@
+ first
+-second
++second updated
+*** End of File
+*** End Patch`,
+);
+assert.equal(await readFile(join(eofRoot, "tail.txt"), "utf8"), "first\nsecond updated\n");
+await assert.rejects(
+  applyPatch(
+    eofRoot,
+    `*** Begin Patch
+*** Update File: tail.txt
+@@
+ first
++not tail
+*** End of File
+*** End Patch`,
+  ),
+  /could not find hunk context/,
+);
+
+const lenientRoot = await mkdtemp(join(tmpdir(), "devspace-apply-patch-lenient-"));
+await writeFile(join(lenientRoot, "file.txt"), "one\n");
+await applyPatch(
+  lenientRoot,
+  `<<'EOF'
+ *** Begin Patch
+  *** Update File: file.txt
+@@
+-one
++two
+ *** End Patch
+EOF`,
+);
+assert.equal(await readFile(join(lenientRoot, "file.txt"), "utf8"), "two\n");
+
+await applyPatch(
+  lenientRoot,
+  `*** Begin Patch
+*** Environment ID: ignored
+*** Update File: file.txt
+ two
++three
+*** End Patch`,
+);
+assert.equal(await readFile(join(lenientRoot, "file.txt"), "utf8"), "two\nthree\n");
+
+await assert.rejects(
+  applyPatch(
+    lenientRoot,
+    `*** Begin Patch
+*** Add File: ${join(lenientRoot, "absolute.txt")}
++no
+*** End Patch`,
+  ),
+  /path must be relative/,
+);
+
+await writeFile(join(lenientRoot, "binary.dat"), Buffer.from([0, 159, 146, 150]));
+await assert.rejects(
+  applyPatch(
+    lenientRoot,
+    `*** Begin Patch
+*** Update File: binary.dat
+@@
+-x
++y
+*** End Patch`,
+  ),
+  /not valid UTF-8|binary/,
+);
