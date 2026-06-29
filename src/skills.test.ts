@@ -12,9 +12,11 @@ import {
 
 const root = await mkdtemp(join(tmpdir(), "devspace-skills-test-"));
 const originalHome = process.env.HOME;
+const originalUserProfile = process.env.USERPROFILE;
 
 try {
   process.env.HOME = root;
+  process.env.USERPROFILE = root;
   const projectRoot = join(root, "project");
   const agentDir = join(root, "agent");
   const explicitSkills = join(root, "explicit-skills");
@@ -163,5 +165,7 @@ try {
 } finally {
   if (originalHome === undefined) delete process.env.HOME;
   else process.env.HOME = originalHome;
+  if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+  else process.env.USERPROFILE = originalUserProfile;
   await rm(root, { recursive: true, force: true });
 }
