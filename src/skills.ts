@@ -1,5 +1,6 @@
+import { existsSync } from "node:fs";
 import { homedir } from "node:os";
-import { resolve, sep } from "node:path";
+import { join, resolve, sep } from "node:path";
 import {
   loadSkills,
   type Skill,
@@ -19,13 +20,28 @@ export interface SkillReadResolution {
   isSkillFile: boolean;
 }
 
+export function effectiveSkillPaths(config: ServerConfig, cwd: string): string[] {
+  const defaultPaths = [
+    join(homedir(), ".agents", "skills"),
+    resolve(cwd, ".agents", "skills"),
+  ].filter((path) => existsSync(path));
+
+  const seen = new Set<string>();
+  return [...defaultPaths, ...config.skillPaths].filter((path) => {
+    const resolvedPath = resolve(expandHomePath(path));
+    if (seen.has(resolvedPath)) return false;
+    seen.add(resolvedPath);
+    return true;
+  });
+}
+
 export function loadWorkspaceSkills(config: ServerConfig, cwd: string): LoadedSkills {
   if (!config.skillsEnabled) return { skills: [], diagnostics: [] };
 
   return loadSkills({
     cwd,
     agentDir: config.agentDir,
-    skillPaths: config.skillPaths,
+    skillPaths: effectiveSkillPaths(config, cwd),
     includeDefaults: true,
   });
 }
