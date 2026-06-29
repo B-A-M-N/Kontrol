@@ -201,8 +201,9 @@ DevSpace looks in standard Agent Skills locations:
 It also checks compatibility and custom paths:
 
 - `DEVSPACE_AGENT_DIR/skills`, defaulting to `~/.codex/skills`
-- project `.pi/skills`
 - additional paths from `DEVSPACE_SKILL_PATHS`
+
+Legacy project paths such as `.pi/skills` can be added through `DEVSPACE_SKILL_PATHS` when needed.
 
 If a skill appears in `open_workspace`, the model must read that skill's
 `SKILL.md` before reading other files inside the skill directory.
