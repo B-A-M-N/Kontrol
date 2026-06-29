@@ -193,11 +193,16 @@ Skills are enabled by default. Check:
 DEVSPACE_SKILLS=1 npx @waishnav/devspace serve
 ```
 
-DevSpace looks in:
+DevSpace looks in standard Agent Skills locations:
 
-- `DEVSPACE_AGENT_DIR`, defaulting to `~/.codex`
+- `~/.agents/skills`
+- project `.agents/skills`
+
+It also checks compatibility and custom paths:
+
+- `DEVSPACE_AGENT_DIR/skills`, defaulting to `~/.codex/skills`
 - project `.pi/skills`
-- `DEVSPACE_SKILL_PATHS`
+- additional paths from `DEVSPACE_SKILL_PATHS`
 
 If a skill appears in `open_workspace`, the model must read that skill's
 `SKILL.md` before reading other files inside the skill directory.

@@ -79,11 +79,16 @@ new context during later tool calls.
 
 Skills are enabled by default for coding-agent workflows.
 
-DevSpace discovers skills from:
+DevSpace discovers standard Agent Skills from:
 
-- `DEVSPACE_AGENT_DIR`, which defaults to `~/.codex`
+- `~/.agents/skills`
+- project `.agents/skills`
+
+It also keeps compatibility with:
+
+- `DEVSPACE_AGENT_DIR/skills`, defaulting to `~/.codex/skills`
 - project `.pi/skills`
-- optional paths from `DEVSPACE_SKILL_PATHS`
+- additional paths from `DEVSPACE_SKILL_PATHS`
 
 When `open_workspace` returns matching skills, the model should read the
 advertised `SKILL.md` before following that skill.

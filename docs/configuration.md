@@ -99,13 +99,24 @@ sessions.
 | Variable | Purpose |
 | --- | --- |
 | `DEVSPACE_SKILLS` | Set to `0` to hide skills. Enabled by default. |
-| `DEVSPACE_AGENT_DIR` | Defaults to `~/.codex`. |
-| `DEVSPACE_SKILL_PATHS` | Optional comma-separated skill directories. |
+| `DEVSPACE_AGENT_DIR` | Defaults to `~/.codex`; its `skills` child is loaded for compatibility. |
+| `DEVSPACE_SKILL_PATHS` | Optional comma-separated additional skill directories. |
+
+DevSpace discovers standard Agent Skills from:
+
+- `~/.agents/skills`
+- project `.agents/skills`
+
+It also keeps compatibility with:
+
+- `DEVSPACE_AGENT_DIR/skills`, defaulting to `~/.codex/skills`
+- project `.pi/skills`
+- additional paths from `DEVSPACE_SKILL_PATHS`
 
 Example:
 
 ```bash
-DEVSPACE_SKILL_PATHS="$HOME/.codex/skills,$HOME/.claude/skills" \
+DEVSPACE_SKILL_PATHS="$HOME/.claude/skills,$HOME/company/skills" \
 npx @waishnav/devspace serve
 ```
 
