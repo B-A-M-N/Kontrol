@@ -1,5 +1,32 @@
 import assert from "node:assert/strict";
-import { ProcessSessionManager } from "./process-sessions.js";
+import { HeadTailBuffer, ProcessSessionManager } from "./process-sessions.js";
+
+const smallBuffer = new HeadTailBuffer(100);
+smallBuffer.append("hello\n");
+assert.deepEqual(smallBuffer.drain(100), { output: "hello\n", truncated: false });
+assert.deepEqual(smallBuffer.drain(100), { output: "", truncated: false });
+
+const headTail = new HeadTailBuffer(10);
+headTail.append("start-middle-end");
+const headTailResult = headTail.drain(1_000);
+assert.equal(headTailResult.truncated, true);
+assert.match(headTailResult.output, /^start/);
+assert.match(headTailResult.output, /e-end$/);
+assert.match(headTailResult.output, /characters omitted/);
+
+const responseLimited = new HeadTailBuffer(100);
+responseLimited.append("abcdef".repeat(20));
+const responseLimitedResult = responseLimited.drain(40);
+assert.equal(responseLimitedResult.truncated, true);
+assert.match(responseLimitedResult.output, /^abc/);
+assert.match(responseLimitedResult.output, /def$/);
+
+const unicodeBuffer = new HeadTailBuffer(4);
+unicodeBuffer.append("a🙂b🙂c");
+const unicodeResult = unicodeBuffer.drain(1_000);
+assert.equal(unicodeResult.truncated, true);
+assert.match(unicodeResult.output, /^a🙂/);
+assert.match(unicodeResult.output, /🙂c$/);
 
 const manager = new ProcessSessionManager({
   maxBufferCharacters: 1_024,

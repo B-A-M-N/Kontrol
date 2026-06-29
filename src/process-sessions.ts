@@ -53,9 +53,7 @@ interface ProcessSession {
   startedAt: number;
   columns: number;
   rows: number;
-  buffer: string;
-  bufferStart: number;
-  consumedThrough: number;
+  buffer: HeadTailBuffer;
   running: boolean;
   exitCode?: number;
   signal?: string;
@@ -91,16 +89,105 @@ function processEnvironment(): Record<string, string> {
   );
 }
 
-function truncateOutput(output: string, maxOutputTokens: number): { output: string; truncated: boolean } {
-  const maxCharacters = Math.max(256, maxOutputTokens * 4);
-  if (output.length <= maxCharacters) return { output, truncated: false };
+function codePointLength(value: string): number {
+  return Array.from(value).length;
+}
+
+function sliceCodePoints(value: string, start: number, end?: number): string {
+  return Array.from(value).slice(start, end).join("");
+}
+
+function takeHead(value: string, count: number): string {
+  if (count <= 0) return "";
+  return sliceCodePoints(value, 0, count);
+}
+
+function takeTail(value: string, count: number): string {
+  if (count <= 0) return "";
+  const characters = Array.from(value);
+  return characters.slice(Math.max(0, characters.length - count)).join("");
+}
+
+function splitBudget(maxCharacters: number): { head: number; tail: number } {
+  return {
+    head: Math.ceil(maxCharacters / 2),
+    tail: Math.floor(maxCharacters / 2),
+  };
+}
+
+function formatHeadTail(head: string, tail: string, omittedCharacters: number): string {
+  if (omittedCharacters <= 0) return head + tail;
+  return `${head}\n... output truncated (${omittedCharacters} characters omitted) ...\n${tail}`;
+}
+
+export class HeadTailBuffer {
+  private head = "";
+  private tail = "";
+  private totalCharacters = 0;
+
+  constructor(private readonly maxCharacters: number) {
+    if (!Number.isInteger(maxCharacters) || maxCharacters < 1) {
+      throw new Error("Head/tail buffer limit must be a positive integer.");
+    }
+  }
+
+  append(output: string): void {
+    if (!output) return;
+
+    const previousTotal = this.totalCharacters;
+    this.totalCharacters += codePointLength(output);
+
+    if (this.totalCharacters <= this.maxCharacters) {
+      this.head += output;
+      return;
+    }
+
+    const budget = splitBudget(this.maxCharacters);
+    if (previousTotal <= this.maxCharacters) {
+      const fullOutput = this.head + output;
+      this.head = takeHead(fullOutput, budget.head);
+      this.tail = takeTail(fullOutput, budget.tail);
+      return;
+    }
+
+    this.tail = takeTail(this.tail + output, budget.tail);
+  }
+
+  hasOutput(): boolean {
+    return this.totalCharacters > 0;
+  }
+
+  drain(maxCharacters: number): { output: string; truncated: boolean } {
+    if (!Number.isInteger(maxCharacters) || maxCharacters < 1) {
+      throw new Error("Output limit must be a positive integer.");
+    }
+
+    const omittedByBuffer = Math.max(
+      0,
+      this.totalCharacters - codePointLength(this.head) - codePointLength(this.tail),
+    );
+    const retained = formatHeadTail(this.head, this.tail, omittedByBuffer);
+    const output = truncateOutput(retained, maxCharacters);
+    const truncated = omittedByBuffer > 0 || output.truncated;
+
+    this.head = "";
+    this.tail = "";
+    this.totalCharacters = 0;
+
+    return { output: output.output, truncated };
+  }
+}
+
+function truncateOutput(output: string, maxCharacters: number): { output: string; truncated: boolean } {
+  const outputCharacters = codePointLength(output);
+  if (outputCharacters <= maxCharacters) return { output, truncated: false };
 
   const marker = "\n... output truncated ...\n";
-  const available = maxCharacters - marker.length;
-  const head = Math.ceil(available / 2);
-  const tail = Math.floor(available / 2);
+  const markerCharacters = codePointLength(marker);
+  const available = Math.max(0, maxCharacters - markerCharacters);
+  const budget = splitBudget(available);
   return {
-    output: output.slice(0, head) + marker + output.slice(output.length - tail),
+    output: takeHead(output, budget.head) + marker + takeTail(output, budget.tail),
     truncated: true,
   };
 }
@@ -157,8 +244,7 @@ export class ProcessSessionManager {
     const writableChars = chars.replaceAll("\u0003", "");
     if (writableChars && session.running) session.process?.write(writableChars);
 
-    const hasUnreadOutput = session.consumedThrough < session.bufferStart + session.buffer.length;
-    if ((interactionRequested || !hasUnreadOutput) && session.running) {
+    if ((interactionRequested || !session.buffer.hasOutput()) && session.running) {
       const yieldTimeMs = boundedInteger(input.yieldTimeMs, DEFAULT_YIELD_MS, 30_000);
       await this.waitForExit(session, yieldTimeMs);
     }
@@ -207,9 +293,7 @@ export class ProcessSessionManager {
       startedAt: Date.now(),
       columns: terminalSize(input.columns, DEFAULT_COLUMNS),
       rows: terminalSize(input.rows, DEFAULT_ROWS),
-      buffer: "",
-      bufferStart: 0,
-      consumedThrough: 0,
+      buffer: new HeadTailBuffer(this.maxBufferCharacters),
       running: true,
       exitPromise,
       resolveExit,
@@ -286,27 +370,18 @@ export class ProcessSessionManager {
   }
 
   private append(session: ProcessSession, output: string): void {
-    session.buffer += output;
-    if (session.buffer.length <= this.maxBufferCharacters) return;
-
-    const remove = session.buffer.length - this.maxBufferCharacters;
-    session.buffer = session.buffer.slice(remove);
-    session.bufferStart += remove;
+    session.buffer.append(output);
   }
 
   private consume(session: ProcessSession, maxOutputTokens?: number): ProcessSnapshot {
-    const missedOutput = session.consumedThrough < session.bufferStart;
-    const start = Math.max(0, session.consumedThrough - session.bufferStart);
-    const unread = session.buffer.slice(start);
-    session.consumedThrough = session.bufferStart + session.buffer.length;
-
     const limit = boundedInteger(maxOutputTokens, DEFAULT_MAX_OUTPUT_TOKENS, 100_000);
-    const truncated = truncateOutput(unread, limit);
+    const maxCharacters = Math.max(256, limit * 4);
+    const buffered = session.buffer.drain(maxCharacters);
 
     return {
       sessionId: session.running ? session.id : undefined,
-      output: truncated.output,
-      outputTruncated: missedOutput || truncated.truncated,
+      output: buffered.output,
+      outputTruncated: buffered.truncated,
       running: session.running,
       exitCode: session.exitCode,
       signal: session.signal,
