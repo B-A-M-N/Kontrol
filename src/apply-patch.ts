@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { constants } from "node:fs";
-import { access, mkdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { constants, type Stats } from "node:fs";
+import { access, lstat, mkdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { TextDecoder } from "node:util";
 import { createTwoFilesPatch, FILE_HEADERS_ONLY } from "diff";
@@ -42,6 +42,8 @@ interface TextFile {
 }
 
 type StagedTextFile = TextFile | null;
+type FileIdentity = Pick<Stats, "dev" | "ino">;
+type FileIdentityReader = (path: string) => Promise<FileIdentity>;
 
 function patchError(message: string): Error {
   return new Error(`Invalid patch: ${message}`);
@@ -317,6 +319,27 @@ export async function replaceFile(
   await rm(backup, { force: true });
 }
 
+export async function isSamePatchFile(
+  source: string,
+  destination: string,
+  readIdentity: FileIdentityReader = lstat,
+): Promise<boolean> {
+  if (source === destination) return true;
+  if (source.toLowerCase() !== destination.toLowerCase()) return false;
+
+  try {
+    const [sourceIdentity, destinationIdentity] = await Promise.all([
+      readIdentity(source),
+      readIdentity(destination),
+    ]);
+    return sourceIdentity.dev === destinationIdentity.dev && sourceIdentity.ino === destinationIdentity.ino;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return false;
+    throw error;
+  }
+}
+
 export async function applyPatch(root: string, patch: string): Promise<ApplyPatchResult> {
   const actions = parsePatch(patch);
   const results: AppliedPatchFile[] = [];
@@ -359,9 +382,11 @@ export async function applyPatch(root: string, patch: string): Promise<ApplyPatc
     const updated = applyHunks(action.path, file.content, action.hunks);
     if (action.moveTo) {
       const destination = await resolveConfinedPath(root, action.moveTo);
-      if (destination !== absolute) await readStagedOptional(destination, action.moveTo);
+      const samePatchFile = await isSamePatchFile(absolute, destination);
+      if (!samePatchFile) await readStagedOptional(destination, action.moveTo);
+      if (samePatchFile) staged.delete(absolute);
       staged.set(destination, { content: updated, mode: file.mode });
-      if (destination !== absolute) staged.set(absolute, null);
+      if (!samePatchFile) staged.set(absolute, null);
       patches.push(unifiedFilePatch(action.path, action.moveTo, file.content, updated));
       results.push({ path: action.moveTo, previousPath: action.path, operation: "move" });
     } else {

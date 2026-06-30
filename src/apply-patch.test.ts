@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { chmod, mkdtemp, readFile, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { applyPatch, parsePatch, replaceFile } from "./apply-patch.js";
+import { applyPatch, isSamePatchFile, parsePatch, replaceFile } from "./apply-patch.js";
 
 const root = await mkdtemp(join(tmpdir(), "devspace-apply-patch-"));
 const replacement = join(root, "replacement.txt");
@@ -11,6 +11,17 @@ await writeFile(replacement, "old\n");
 await writeFile(replacementTemporary, "new\n");
 await replaceFile(replacementTemporary, replacement, true, "win32");
 assert.equal(await readFile(replacement, "utf8"), "new\n");
+
+const sameIdentity = async (): Promise<{ dev: number; ino: number }> => ({ dev: 1, ino: 2 });
+const differentIdentity = async (path: string): Promise<{ dev: number; ino: number }> => ({
+  dev: 1,
+  ino: path.endsWith("foo.txt") ? 3 : 2,
+});
+assert.equal(await isSamePatchFile("/tmp/Foo.txt", "/tmp/Foo.txt"), true);
+assert.equal(await isSamePatchFile("/tmp/Foo.txt", "/tmp/foo.txt", sameIdentity), true);
+assert.equal(await isSamePatchFile("/tmp/Foo.txt", "/tmp/bar.txt", sameIdentity), false);
+assert.equal(await isSamePatchFile("/tmp/Foo.txt", "/tmp/foo.txt", differentIdentity), false);
+
 await writeFile(join(root, "alpha.txt"), "one\ntwo\nthree\n");
 await writeFile(join(root, "remove.txt"), "remove me\n");
 await writeFile(join(root, "windows.txt"), "first\r\nsecond\r\n");
