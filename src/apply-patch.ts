@@ -40,6 +40,8 @@ interface TextFile {
   mode?: number;
 }
 
+type StagedTextFile = TextFile | null;
+
 function patchError(message: string): Error {
   return new Error(`Invalid patch: ${message}`);
 }
@@ -318,22 +320,36 @@ export async function applyPatch(root: string, patch: string): Promise<ApplyPatc
   const actions = parsePatch(patch);
   const results: AppliedPatchFile[] = [];
   const patches: string[] = [];
+  const staged = new Map<string, StagedTextFile>();
+
+  const readStagedOptional = async (absolute: string, displayPath: string): Promise<StagedTextFile> => {
+    if (staged.has(absolute)) return staged.get(absolute) ?? null;
+    const file = await readOptionalTextFile(absolute, displayPath);
+    staged.set(absolute, file);
+    return file;
+  };
+
+  const readStagedRequired = async (absolute: string, displayPath: string): Promise<TextFile> => {
+    const file = await readStagedOptional(absolute, displayPath);
+    if (!file) throw patchError(`file does not exist: ${displayPath}`);
+    return file;
+  };
 
   for (const action of actions) {
     if (action.kind === "add") {
       const absolute = await resolveConfinedPath(root, action.path);
-      const original = await readOptionalTextFile(absolute, action.path);
-      await writeTextFile(absolute, action.content, original?.mode);
+      const original = await readStagedOptional(absolute, action.path);
+      staged.set(absolute, { content: action.content, mode: original?.mode });
       patches.push(unifiedFilePatch(action.path, action.path, original?.content ?? null, action.content));
       results.push({ path: action.path, operation: "add" });
       continue;
     }
 
     const absolute = await resolveConfinedPath(root, action.path);
-    const file = await readRequiredTextFile(absolute, action.path);
+    const file = await readStagedRequired(absolute, action.path);
 
     if (action.kind === "delete") {
-      await rm(absolute);
+      staged.set(absolute, null);
       patches.push(unifiedFilePatch(action.path, action.path, file.content, null));
       results.push({ path: action.path, operation: "delete" });
       continue;
@@ -342,28 +358,29 @@ export async function applyPatch(root: string, patch: string): Promise<ApplyPatc
     const updated = applyHunks(action.path, file.content, action.hunks);
     if (action.moveTo) {
       const destination = await resolveConfinedPath(root, action.moveTo);
-      if (destination !== absolute) await readOptionalTextFile(destination, action.moveTo);
-      await writeTextFile(destination, updated, file.mode);
-      if (destination !== absolute) await rm(absolute);
+      if (destination !== absolute) await readStagedOptional(destination, action.moveTo);
+      staged.set(destination, { content: updated, mode: file.mode });
+      if (destination !== absolute) staged.set(absolute, null);
       patches.push(unifiedFilePatch(action.path, action.moveTo, file.content, updated));
       results.push({ path: action.moveTo, previousPath: action.path, operation: "move" });
     } else {
-      await writeTextFile(absolute, updated, file.mode);
+      staged.set(absolute, { content: updated, mode: file.mode });
       patches.push(unifiedFilePatch(action.path, action.path, file.content, updated));
       results.push({ path: action.path, operation: "update" });
     }
   }
 
+  for (const [absolute, file] of staged) {
+    if (file) await writeTextFile(absolute, file.content, file.mode);
+  }
+
+  for (const [absolute, file] of staged) {
+    if (!file) await rm(absolute, { force: true });
+  }
+
   const unifiedPatch = patches.filter(Boolean).join("\n");
   const stats = countPatchStats(unifiedPatch);
   return { files: results, patch: unifiedPatch, ...stats };
-}
-
-async function readRequiredTextFile(absolute: string, displayPath: string): Promise<TextFile> {
-  if (!(await fileExists(absolute))) throw patchError(`file does not exist: ${displayPath}`);
-  const metadata = await stat(absolute);
-  if (!metadata.isFile()) throw patchError(`path is not a regular file: ${displayPath}`);
-  return { content: await readUtf8Text(absolute, displayPath), mode: metadata.mode };
 }
 
 async function readOptionalTextFile(absolute: string, displayPath: string): Promise<TextFile | null> {
