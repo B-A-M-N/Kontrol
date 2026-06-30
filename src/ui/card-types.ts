@@ -23,6 +23,8 @@ export type ToolName =
 
 export type HostContext = NonNullable<ReturnType<App["getHostContext"]>>;
 
+export type PatchOperation = "add" | "update" | "delete" | "move";
+
 export interface ToolResultCard {
   tool: ToolName;
   workspaceId?: string;
@@ -33,6 +35,7 @@ export interface ToolResultCard {
   files?: Array<{
     path?: string;
     previousPath?: string;
+    operation?: PatchOperation;
     type?: string;
     additions?: number;
     removals?: number;

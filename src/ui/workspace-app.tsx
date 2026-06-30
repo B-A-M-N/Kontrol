@@ -19,9 +19,11 @@ import {
   payloadText,
   summaryNumber,
   type HostContext,
+  type PatchOperation,
   type ToolName,
   type ToolResultCard,
 } from "./card-types.js";
+import { getPatchDisplayParts } from "./patch-display.js";
 import "./workspace-app.css";
 
 interface ToolDisplay {
@@ -491,6 +493,24 @@ function formatAgentsFilesForPayload(
     .join("\n\n");
 }
 
+function getPatchToolDisplay(card: ToolResultCard, label: string): ToolDisplay {
+  const display = getPatchDisplayParts(card);
+
+  return {
+    icon: patchIcon(display.iconOperation),
+    title: display.title,
+    label,
+    tone: display.tone,
+  };
+}
+
+function patchIcon(operation: PatchOperation | undefined): string {
+  if (operation === "add") return filePlusIcon();
+  if (operation === "delete") return fileIcon();
+  if (operation === "move") return filesIcon();
+  return editIcon();
+}
+
 function getToolDisplay(card: ToolResultCard): ToolDisplay {
   const label = getToolLabel(card);
 
@@ -507,7 +527,7 @@ function getToolDisplay(card: ToolResultCard): ToolDisplay {
     case "edit":
       return { icon: editIcon(), title: "Edit File", label, tone: "edit" };
     case "apply_patch":
-      return { icon: editIcon(), title: "Apply Patch", label, tone: "edit" };
+      return getPatchToolDisplay(card, label);
     case "grep_files":
     case "grep":
       return { icon: searchIcon(), title: "Grep", label, tone: "search" };
