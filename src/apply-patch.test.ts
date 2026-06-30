@@ -127,6 +127,29 @@ await assert.rejects(
 await assert.rejects(readFile(join(root, "should-not-exist.txt"), "utf8"), /ENOENT/);
 assert.equal(await readFile(join(root, "moved/alpha.txt"), "utf8"), "ONE\nchanged\nthree\n");
 
+const splitHunkRoot = await mkdtemp(join(tmpdir(), "devspace-apply-patch-split-hunk-"));
+await writeFile(
+  join(splitHunkRoot, "long.txt"),
+  Array.from({ length: 20 }, (_, index) => String(index + 1)).join("\n") + "\n",
+);
+const splitHunkResult = await applyPatch(
+  splitHunkRoot,
+  `*** Begin Patch
+*** Update File: long.txt
+@@
+ 1
+-2
++two
+ 3
+@@
+ 17
+-18
++eighteen
+ 19
+*** End Patch`,
+);
+assert.equal(splitHunkResult.patch.match(/^@@ /gm)?.length, 2);
+
 assert.throws(() => parsePatch("*** Begin Patch\n*** End Patch"), /contains no file actions/);
 assert.throws(() => parsePatch("*** Add File: bad.txt\n+x"), /missing .* marker/);
 assert.throws(

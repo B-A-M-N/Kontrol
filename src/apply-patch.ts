@@ -3,6 +3,7 @@ import { constants } from "node:fs";
 import { access, mkdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { TextDecoder } from "node:util";
+import { createTwoFilesPatch, FILE_HEADERS_ONLY } from "diff";
 
 export type PatchOperation = "add" | "update" | "delete" | "move";
 
@@ -414,68 +415,29 @@ async function writeTextFile(destination: string, content: string, mode?: number
   }
 }
 
-function fileLines(content: string): string[] {
-  if (content.length === 0) return [];
-  const normalized = content.replace(/\r\n/g, "\n");
-  const lines = normalized.split("\n");
-  if (normalized.endsWith("\n")) lines.pop();
-  return lines;
-}
-
-function hunkRange(start: number, count: number): string {
-  return count === 0 ? "0,0" : `${start},${count}`;
-}
-
 function unifiedFilePatch(
   oldPath: string,
   newPath: string,
   oldContent: string | null,
   newContent: string | null,
 ): string {
-  const oldLines = fileLines(oldContent ?? "");
-  const newLines = fileLines(newContent ?? "");
-  let prefix = 0;
-  while (
-    prefix < oldLines.length &&
-    prefix < newLines.length &&
-    oldLines[prefix] === newLines[prefix]
-  ) {
-    prefix += 1;
-  }
-
-  let suffix = 0;
-  while (
-    suffix < oldLines.length - prefix &&
-    suffix < newLines.length - prefix &&
-    oldLines[oldLines.length - 1 - suffix] === newLines[newLines.length - 1 - suffix]
-  ) {
-    suffix += 1;
-  }
-
-  const contextBefore = Math.min(3, prefix);
-  const contextAfter = Math.min(3, suffix);
-  const oldChanged = oldLines.slice(prefix, oldLines.length - suffix);
-  const newChanged = newLines.slice(prefix, newLines.length - suffix);
-  const before = oldLines.slice(prefix - contextBefore, prefix);
-  const after = oldLines.slice(oldLines.length - suffix, oldLines.length - suffix + contextAfter);
-  const oldCount = contextBefore + oldChanged.length + contextAfter;
-  const newCount = contextBefore + newChanged.length + contextAfter;
-  const oldStart = oldContent === null ? 0 : prefix - contextBefore + 1;
-  const newStart = newContent === null ? 0 : prefix - contextBefore + 1;
-  const displayOld = oldContent === null ? "/dev/null" : `a/${oldPath}`;
-  const displayNew = newContent === null ? "/dev/null" : `b/${newPath}`;
+  const oldFileName = oldContent === null ? "/dev/null" : `a/${oldPath}`;
+  const newFileName = newContent === null ? "/dev/null" : `b/${newPath}`;
+  const body = createTwoFilesPatch(
+    oldFileName,
+    newFileName,
+    oldContent ?? "",
+    newContent ?? "",
+    "",
+    "",
+    { context: 3, headerOptions: FILE_HEADERS_ONLY },
+  ).trimEnd();
 
   return [
     `diff --git a/${oldPath} b/${newPath}`,
     oldContent === null ? "new file mode 100644" : undefined,
     newContent === null ? "deleted file mode 100644" : undefined,
-    `--- ${displayOld}`,
-    `+++ ${displayNew}`,
-    `@@ -${hunkRange(oldStart, oldCount)} +${hunkRange(newStart, newCount)} @@`,
-    ...before.map((line) => ` ${line}`),
-    ...oldChanged.map((line) => `-${line}`),
-    ...newChanged.map((line) => `+${line}`),
-    ...after.map((line) => ` ${line}`),
+    body,
   ]
     .filter((line): line is string => line !== undefined)
     .join("\n");
