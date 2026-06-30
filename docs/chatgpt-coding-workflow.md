@@ -79,11 +79,17 @@ new context during later tool calls.
 
 Skills are enabled by default for coding-agent workflows.
 
-DevSpace discovers skills from:
+DevSpace discovers standard Agent Skills from:
 
-- `DEVSPACE_AGENT_DIR`, which defaults to `~/.codex`
-- project `.pi/skills`
-- optional paths from `DEVSPACE_SKILL_PATHS`
+- `~/.agents/skills`
+- project `.agents/skills`
+
+It also keeps compatibility with:
+
+- `DEVSPACE_AGENT_DIR/skills`, defaulting to `~/.codex/skills`
+- additional paths from `DEVSPACE_SKILL_PATHS`
+
+Legacy project paths such as `.pi/skills` can be added through `DEVSPACE_SKILL_PATHS` when needed.
 
 When `open_workspace` returns matching skills, the model should read the
 advertised `SKILL.md` before following that skill.
@@ -110,6 +116,20 @@ By default, DevSpace also runs in `DEVSPACE_TOOL_MODE=minimal`, so dedicated
 such as `rg`, `find`, and `ls` for search and directory inspection.
 
 Use `DEVSPACE_TOOL_MODE=full` to restore dedicated search and directory tools.
+
+The experimental Codex-style surface is enabled with
+`DEVSPACE_TOOL_MODE=codex`. It exposes:
+
+- `open_workspace`
+- `read`
+- `apply_patch`
+- `exec_command`
+- `write_stdin`
+
+In this mode, `write`, `edit`, `bash`, `grep`, `glob`, and `ls` are not
+registered. `exec_command` returns a process session ID when a command is still
+running after its yield window. Use `write_stdin` to poll it, send input, resize
+a PTY, or send Ctrl-C. Set `tty: true` only for commands that need a terminal.
 
 ## Show Changes
 

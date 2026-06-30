@@ -15,7 +15,7 @@ If you installed globally, confirm npm's global bin directory is on `PATH`.
 
 ## Unsupported Node Version
 
-DevSpace requires Node `>=20.12 <27`.
+DevSpace requires Node `>=22.19 <27`.
 
 Check:
 
@@ -193,11 +193,17 @@ Skills are enabled by default. Check:
 DEVSPACE_SKILLS=1 npx @waishnav/devspace serve
 ```
 
-DevSpace looks in:
+DevSpace looks in standard Agent Skills locations:
 
-- `DEVSPACE_AGENT_DIR`, defaulting to `~/.codex`
-- project `.pi/skills`
-- `DEVSPACE_SKILL_PATHS`
+- `~/.agents/skills`
+- project `.agents/skills`
+
+It also checks compatibility and custom paths:
+
+- `DEVSPACE_AGENT_DIR/skills`, defaulting to `~/.codex/skills`
+- additional paths from `DEVSPACE_SKILL_PATHS`
+
+Legacy project paths such as `.pi/skills` can be added through `DEVSPACE_SKILL_PATHS` when needed.
 
 If a skill appears in `open_workspace`, the model must read that skill's
 `SKILL.md` before reading other files inside the skill directory.
