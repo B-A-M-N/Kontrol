@@ -125,6 +125,7 @@ await assert.rejects(
   /could not find hunk context/,
 );
 await assert.rejects(readFile(join(root, "should-not-exist.txt"), "utf8"), /ENOENT/);
+assert.equal(await readFile(join(root, "moved/alpha.txt"), "utf8"), "ONE\nchanged\nthree\n");
 
 assert.throws(() => parsePatch("*** Begin Patch\n*** End Patch"), /contains no file actions/);
 assert.throws(() => parsePatch("*** Add File: bad.txt\n+x"), /missing .* marker/);
