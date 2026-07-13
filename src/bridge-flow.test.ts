@@ -334,6 +334,30 @@ try {
     );
   }
 
+  // ── Scenario 2b: cancellation supersedes pending continuations and prevents relaunch ──
+  {
+    const sessionId = createSession();
+    await callWorker("submit_for_review", { sessionId });
+    agentRegistry.createRun({
+      agentName: "cli-coding-agent",
+      workspaceSessionId: WS,
+      workSessionId: sessionId,
+      inputPreview: "cancellable dispatch",
+      status: "running",
+    });
+    await callReviewer("provide_review_feedback", { sessionId, verdict: "changes_requested" });
+    const pending = continuationManager.listForSession(sessionId).find((c) => c.status === "pending");
+    assert.ok(pending, "changes_requested creates a pending continuation");
+
+    config.reviewWorkflow.cancelSession({ sessionId, reason: "test cancellation" });
+    assert.equal(workSessions.get(sessionId)!.status, "cancelled");
+    assert.equal(continuationManager.get(pending.id)?.status, "superseded");
+
+    const before = resumeCalls;
+    await runContinuationTick(config);
+    assert.equal(resumeCalls, before, "cancelled sessions are not relaunched from continuations");
+  }
+
   // ── Scenario 3: stale feedback is not replayed ──
   {
     const sessionId = createSession();

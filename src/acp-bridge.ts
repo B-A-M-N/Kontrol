@@ -8,8 +8,8 @@ import type { ReviewCheckpointManager } from "./review-checkpoints.js";
 import type { AgentRegistryManager } from "./acp-registry.js";
 import type { EventStore, EventStoreEvent, EventPredicate } from "./event-log.js";
 import { type ContinuationManager, type Continuation, DEFAULT_CLAIM_LEASE_MS } from "./continuation.js";
-import { callRemoteAgent, selectHealthyAgent, probeAgent, type AgentCallResult } from "./acp-gateway.js";
-import type { ReviewWorkflowService } from "./review-workflow.js";
+import { callRemoteAgent, cancelRemoteRun, selectHealthyAgent, probeAgent, type AgentCallResult } from "./acp-gateway.js";
+import { TERMINAL_STATUSES, type ReviewWorkflowService } from "./review-workflow.js";
 import { authorizeWorkSessionAction } from "./work-session-action-guard.js";
 import type { PrincipalRole } from "./policy-enforcement.js";
 import type { MissionLedger } from "./mission-ledger.js";
@@ -292,10 +292,30 @@ export async function runContinuationTick(
 
       const session = config.workSessions.get(cont.sessionId);
       if (!session) continue;
+      if (TERMINAL_STATUSES.has(session.status)) {
+        config.continuationManager.supersede(cont.id, `session is ${session.status}`);
+        config.eventStore.appendEvent({
+          type: "continuation.superseded",
+          sessionId: cont.sessionId,
+          payload: { continuationId: cont.id, reason: `session is ${session.status}` },
+        });
+        continue;
+      }
 
       // Atomic claim (CAS): only one dispatcher owns a given continuation.
       const claimed = config.continuationManager.claim(dispatcherId, { id: cont.id });
       if (!claimed) continue;
+      const claimedSession = config.workSessions.get(claimed.sessionId);
+      if (!claimedSession || TERMINAL_STATUSES.has(claimedSession.status)) {
+        const reason = claimedSession ? `session is ${claimedSession.status}` : "session not found";
+        config.continuationManager.supersede(claimed.id, reason);
+        config.eventStore.appendEvent({
+          type: "continuation.superseded",
+          sessionId: claimed.sessionId,
+          payload: { continuationId: claimed.id, reason },
+        });
+        continue;
+      }
 
       if (claimed.verdict !== "changes_requested") {
         // Defensive: pending continuations should only be changes_requested.
@@ -548,7 +568,13 @@ export function registerBridgeTools(
         // Capture the diff WITHOUT advancing the checkpoint. The checkpoint is only
         // committed AFTER the submission is persisted, so a failure between capture
         // and persistence cannot silently drop the diff from the next review.
-        const review = await config.reviewCheckpoints.reviewChanges({ workspaceId: session.workspaceSessionId, root: ws.root, since: "last_shown", markReviewed: false });
+        const review = await config.reviewCheckpoints.reviewChanges({
+          workspaceId: session.workspaceSessionId,
+          root: ws.root,
+          since: "work_session",
+          workSessionId: session.id,
+          markReviewed: false,
+        });
 
         // Delegate the state transition to the authoritative workflow service
         // (validates status, transitions to awaiting_review, updates the correlated
@@ -566,7 +592,12 @@ export function registerBridgeTools(
 
         // Persisted successfully — now advance the checkpoint to the exact captured
         // snapshot (do not recompute: the tree may have changed since capture).
-        await config.reviewCheckpoints.commitReviewed({ workspaceId: session.workspaceSessionId, root: ws.root, snapshotCommit: review.snapshotCommit });
+        await config.reviewCheckpoints.commitReviewed({
+          workspaceId: session.workspaceSessionId,
+          root: ws.root,
+          workSessionId: session.id,
+          snapshotCommit: review.snapshotCommit,
+        });
 
         const completedContinuationId =
           continuationId ??
@@ -1652,8 +1683,9 @@ export function registerBridgeTools(
       // Compare the FEEDBACK id (carried in the event payload as feedbackId),
       // not the event id — the anchor/lastConsumedFeedbackId is a feedback id.
       const predicate: EventPredicate = (event) =>
-        event.type === "review.feedback.provided" &&
-        String((event.payload as { feedbackId?: unknown }).feedbackId ?? event.id) !== anchor;
+        (event.type === "review.feedback.provided" &&
+          String((event.payload as { feedbackId?: unknown }).feedbackId ?? event.id) !== anchor) ||
+        event.type === "agent.run.cancelled";
 
       let matched: EventStoreEvent | null = null;
       try {
@@ -1673,6 +1705,16 @@ export function registerBridgeTools(
         return {
           content: [{ type: "text" as const, text: `No review feedback received within ${Math.round((timeoutMs ?? 300_000) / 1000)}s. Use list_pending_reviews or get_work_session to recover, or call await_review_feedback again.` }],
           structuredContent: { status: "timeout", sessionId, message: "Timeout waiting for feedback" },
+        };
+      }
+
+      if (matched.type === "agent.run.cancelled") {
+        cleanup();
+        const reason = String((matched.payload as { reason?: unknown }).reason ?? "cancelled");
+        return {
+          content: [{ type: "text" as const, text: `Session cancelled: ${reason}` }],
+          structuredContent: { status: "error" as const, sessionId, nextSeq: matched.seq, message: `Session cancelled: ${reason}` },
+          isError: true,
         };
       }
 
@@ -2004,11 +2046,11 @@ export function registerBridgeTools(
     "cancel_work_session",
     {
       title: "Cancel work session",
-      description: "Abandon a work session. Transitions status to cancelled. Any pending await_review_feedback waiters will time out naturally.",
+      description: "Abandon a work session. Transitions status to cancelled, wakes blocked waiters, supersedes pending continuations, and requests remote worker cancellation.",
       inputSchema: {
         sessionId: z.string().describe("Work session ID to cancel."),
       },
-      outputSchema: { status: z.string(), sessionId: z.string() },
+      outputSchema: { status: z.string(), sessionId: z.string(), remoteCancellation: z.unknown().optional() },
       _meta: {},
       annotations: { readOnlyHint: false },
     },
@@ -2022,9 +2064,13 @@ export function registerBridgeTools(
       if (bind) return bind;
 
       config.reviewWorkflow.cancelSession({ sessionId });
+      const run = config.agentRegistry.getRunByWorkSessionId(sessionId);
+      const remoteCancellation = run
+        ? await cancelRemoteRun(config, run)
+        : { acknowledged: false, error: "No correlated ACP run" };
       return {
-        content: [{ type: "text" as const, text: `Session ${sessionId} cancelled.` }],
-        structuredContent: { status: "cancelled", sessionId },
+        content: [{ type: "text" as const, text: `Session ${sessionId} cancelled.${remoteCancellation.acknowledged ? " Remote worker cancellation acknowledged." : ""}` }],
+        structuredContent: { status: "cancelled", sessionId, remoteCancellation },
       };
     },
   );

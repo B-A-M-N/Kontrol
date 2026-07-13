@@ -317,7 +317,7 @@ export function createReviewWorkflowService(
       const current = await reviewCheckpoints.reviewChanges({
         workspaceId: session.workspaceSessionId,
         root: ws.root,
-        since: "last_shown",
+        since: "workspace_open",
         markReviewed: false,
       });
       if (current.snapshotCommit !== currentPending.snapshotCommit) {
@@ -464,6 +464,10 @@ export function createReviewWorkflowService(
     };
     db.sqlite.transaction(() => {
       workSessions.updateStatus(input.sessionId, "cancelled");
+      const supersededContinuations = continuationManager.supersedeForSession(
+        input.sessionId,
+        input.reason ?? "session cancelled",
+      );
       const correlatedRun = agentRegistry.getRunByWorkSessionId(input.sessionId);
       if (correlatedRun) {
         agentRegistry.updateRun(correlatedRun.runId, { status: "cancelled" });
@@ -471,7 +475,7 @@ export function createReviewWorkflowService(
       appendWorkflowEvent({
         type: "agent.run.cancelled",
         sessionId: input.sessionId,
-        payload: { reason: input.reason ?? "cancelled" },
+        payload: { reason: input.reason ?? "cancelled", supersededContinuations },
       });
     })();
     eventStore.publishEvents(publishQueue);

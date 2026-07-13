@@ -108,6 +108,19 @@ async function handle(req, res) {
   if (req.method === "GET" && req.url === "/health") {
     return writeJson(res, 200, { ok: true, agent: "hermes-agent", active: active.size, native: true });
   }
+  const cancelMatch = (req.url || "").match(/^\/runs\/([^/]+)\/cancel$/);
+  if (req.method === "POST" && cancelMatch) {
+    if ((req.headers.authorization || "") !== `Bearer ${ADAPTER_SECRET}`) {
+      return writeJson(res, 401, { error: { code: "unauthorized" } });
+    }
+    const remoteRunId = decodeURIComponent(cancelMatch[1]);
+    const run = active.get(remoteRunId);
+    if (!run) {
+      return writeJson(res, 404, { error: { code: "not_found", message: `active run not found: ${remoteRunId}` } });
+    }
+    cancelRun(run, "cancelled by DevSpace");
+    return writeJson(res, 202, { run_id: remoteRunId, status: "cancelled" });
+  }
   if (req.method !== "POST" || req.url !== "/runs") {
     return writeJson(res, 404, { error: { code: "not_found" } });
   }
@@ -127,6 +140,7 @@ async function handle(req, res) {
     task: extractTask(body.input),
     workspaceRoot,
     child: null,
+    finalized: false,
     pendingPermissions: new Map(),
   };
   if (run.workSessionId && hasActiveSession(run.workSessionId)) {
@@ -169,12 +183,16 @@ async function handle(req, res) {
   child.on("error", (err) => {
     clearInterval(heartbeatTimer);
     active.delete(run.remoteRunId);
+    if (run.finalized) return;
+    run.finalized = true;
     void reportEvent(run, "failed", err.message);
   });
   child.on("exit", (code, signal) => {
     clearInterval(heartbeatTimer);
     if (stdoutBuffer.trim()) handleRunnerLine(run, stdoutBuffer);
     active.delete(run.remoteRunId);
+    if (run.finalized) return;
+    run.finalized = true;
     if (code === 0) reportEvent(run, "completed");
     else reportEvent(run, "failed", signal ? `terminated by ${signal}` : `exit code ${code}`);
   });
@@ -351,6 +369,26 @@ async function reportEvent(run, type, errorMessage) {
       payload: errorMessage ? { error: errorMessage } : {},
     }),
   }).catch(() => {});
+}
+
+function cancelRun(run, reason) {
+  run.finalized = true;
+  active.delete(run.remoteRunId);
+  if (run.child?.pid) {
+    try {
+      process.kill(-run.child.pid, "SIGTERM");
+    } catch {
+      try { run.child.kill("SIGTERM"); } catch { /* ignore */ }
+    }
+    setTimeout(() => {
+      try {
+        process.kill(-run.child.pid, "SIGKILL");
+      } catch {
+        try { run.child.kill("SIGKILL"); } catch { /* ignore */ }
+      }
+    }, 1500).unref?.();
+  }
+  void reportEvent(run, "cancelled", reason);
 }
 
 function reportOutput(run, text, channel) {

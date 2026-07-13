@@ -167,6 +167,20 @@ async function handleRequest(req, res) {
     return handleRunRequest(req, res, body);
   }
 
+  const cancelMatch = url.match(/^\/runs\/([^/]+)\/cancel$/);
+  if (cancelMatch && method === "POST") {
+    const auth = req.headers.authorization || "";
+    if (auth !== `Bearer ${ADAPTER_SECRET}`) {
+      return res.writeHead(401).end(JSON.stringify({ error: { code: "unauthorized", message: "invalid adapter secret" } }));
+    }
+    const remoteRunId = decodeURIComponent(cancelMatch[1]);
+    const cancelled = cancelActiveRun(remoteRunId, "cancelled by DevSpace");
+    if (!cancelled) {
+      return writeJson(res, 404, { error: { code: "not_found", message: `active run not found: ${remoteRunId}` } });
+    }
+    return writeJson(res, 202, { run_id: remoteRunId, status: "cancelled" });
+  }
+
   // Event reporting endpoint (DevSpace calls this for terminal events)
   const eventMatch = url.match(/^\/runs\/([^/]+)\/events$/);
   if (eventMatch && method === "POST") {
@@ -524,6 +538,33 @@ function finalizeRun(run, status, error, details) {
   console.log(`[run ${run.remoteRunId}] finalize: ${status}${error ? `: ${error}` : ""}`);
 
   reportEvent(run, status, error, details);
+}
+
+function cancelActiveRun(remoteRunId, reason) {
+  for (const [pid, entry] of activeProcesses.entries()) {
+    if (entry.run.remoteRunId !== remoteRunId) continue;
+    const { child, run } = entry;
+    if (run.workSessionId && activeBySession.get(run.workSessionId) === run) {
+      activeBySession.delete(run.workSessionId);
+    }
+    try {
+      process.kill(-child.pid, "SIGTERM");
+    } catch {
+      try { child.kill("SIGTERM"); } catch { /* ignore */ }
+    }
+    finalizeRun(run, "cancelled", reason);
+    setTimeout(() => {
+      if (activeProcesses.has(pid)) {
+        try {
+          process.kill(-child.pid, "SIGKILL");
+        } catch {
+          try { child.kill("SIGKILL"); } catch { /* ignore */ }
+        }
+      }
+    }, 1500).unref?.();
+    return true;
+  }
+  return false;
 }
 
 async function reportEvent(run, type, errorMessage, details) {
