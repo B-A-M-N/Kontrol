@@ -7,6 +7,7 @@ import {
   readFileSync,
   readdirSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -43,6 +44,7 @@ try {
     false,
     "fixed-path systemd units must not ship until service install generation exists",
   );
+  assertUserFacingBranding(pkg);
 
   const rootNodeModules = join(root, "node_modules");
   if (existsSync(rootNodeModules)) {
@@ -73,6 +75,63 @@ try {
   console.log("package-release.test.mjs: shipped adapter imports validated");
 } finally {
   rmSync(tmp, { recursive: true, force: true });
+}
+
+function assertUserFacingBranding(pkg) {
+  const checkedFiles = listFiles(pkg).filter((file) =>
+    [
+      ".env.example",
+      "README.md",
+      "package.json",
+      "NOTICE",
+      "docs",
+    ].some((prefix) => file === prefix || file.startsWith(`${prefix}/`)),
+  );
+
+  for (const file of checkedFiles) {
+    if (/\.(png|jpg|jpeg|gif|webp|ico)$/i.test(file)) continue;
+    const text = readFileSync(join(pkg, file), "utf8");
+    const withoutAttribution = removeAllowedAttribution(file, text);
+
+    assert.equal(
+      /Dev Desktop|devdesktop|dev desktop/.test(withoutAttribution),
+      false,
+      `${file} contains old Dev Desktop branding`,
+    );
+    assert.equal(
+      /(^|[^A-Za-z])devspace([^A-Za-z]|$)/i.test(withoutAttribution),
+      false,
+      `${file} contains old DevSpace branding outside attribution`,
+    );
+    assert.equal(
+      /OpenCollective|GitHub Sponsors|sponsor|funding|donate|buy me a coffee/i.test(text),
+      false,
+      `${file} contains funding/sponsor copy`,
+    );
+    assert.equal(
+      /github\.com\/bamn\/kontrol/i.test(text),
+      false,
+      `${file} uses lowercase bamn GitHub owner; use B-A-M-N`,
+    );
+  }
+}
+
+function removeAllowedAttribution(file, text) {
+  if (file === "NOTICE") return "";
+  if (file !== "README.md") return text;
+  return text.replace(/## Attribution[\s\S]*?(?=\n## |\n# |\s*$)/, "");
+}
+
+function listFiles(base, dir = "") {
+  const out = [];
+  for (const entry of readdirSync(join(base, dir))) {
+    const rel = dir ? `${dir}/${entry}` : entry;
+    const path = join(base, rel);
+    const stat = statSync(path);
+    if (stat.isDirectory()) out.push(...listFiles(base, rel));
+    else if (stat.isFile()) out.push(rel);
+  }
+  return out;
 }
 
 function extractTgz(tarball, destination) {

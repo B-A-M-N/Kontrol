@@ -133,6 +133,7 @@ let agentBar: HTMLElement | null = null;
 // Per-session watcher generations so starting a second run cancels only the
 // watcher for the same work session, not all watchers.
 const watcherGenerations = new Map<string, number>();
+let watcherGenerationCounter = 0;
 
 const maybeAppRoot = document.querySelector<HTMLElement>("#app");
 if (!maybeAppRoot) {
@@ -197,10 +198,10 @@ async function boot(): Promise<void> {
       }
     }
 
-    // Any other tool result is a transient card; it does not destroy the
-    // work-session view, but clears the selection so the card renders.
+    // Any other tool result is a transient card. It must not discard the active
+    // work-session selection; session recovery and supervision should remain
+    // anchored even when unrelated tool cards arrive.
     lastToolCard = { ...structured, tool };
-    selectedWorkSessionId = null;
     expanded = false;
     reviewFilesExpanded = false;
     errorMessage = null;
@@ -214,7 +215,11 @@ async function boot(): Promise<void> {
   };
 
   app.onteardown = async () => {
+    connected = false;
+    watcherGenerations.clear();
     unmountPayload();
+    agentBar = null;
+    app = null;
     return {};
   };
 
@@ -526,7 +531,7 @@ function eventLabel(e: AgentActivityEvent): string {
 
 async function watchWorkSession(sessionId: string, initialSeq = 0): Promise<void> {
   let cursor = initialSeq;
-  const myGen = Date.now();
+  const myGen = ++watcherGenerationCounter;
   watcherGenerations.set(sessionId, myGen);
 
   while (app && watcherGenerations.get(sessionId) === myGen) {
@@ -627,7 +632,21 @@ function reduceWorkSessionEvent(sessionId: string, event: AgentActivityEvent): v
   } else if (event.type === "review.feedback.provided") {
     const sid = String(event.payload?.submissionId ?? view.activeSubmissionId ?? "");
     if (sid && view.submissions.has(sid)) view.feedbackStateBySubmission.set(sid, "submitted");
+    const verdict = String(event.payload?.verdict ?? "");
+    if (verdict === "changes_requested") view.status = "changes_requested";
+    else if (verdict === "approve") view.status = "approved";
+    else if (verdict === "reject") view.status = "rejected";
     view.feedbackMessage = "Feedback submitted. The waiting agent has been notified.";
+  } else if (event.type === "continuation.created") {
+    view.status = "continuation_queued";
+  } else if (event.type === "continuation.delivered") {
+    view.status = "resuming";
+  } else if (event.type === "continuation.superseded") {
+    view.status = "awaiting_resume";
+  } else if (event.type === "worker.attempt.failed" || event.type === "worker.attempt.exited") {
+    view.status = "awaiting_resume";
+  } else if (event.type === "agent.run.failed_protocol") {
+    view.status = "failed_protocol";
   } else if (event.type === "agent.run.approved") {
     view.status = "approved";
   } else if (event.type === "agent.run.rejected") {
