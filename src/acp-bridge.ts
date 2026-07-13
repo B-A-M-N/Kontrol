@@ -15,6 +15,8 @@ import { authorizeWorkSessionAction } from "./work-session-action-guard.js";
 import type { PrincipalRole } from "./policy-enforcement.js";
 import type { MissionLedger } from "./mission-ledger.js";
 import type { DispatchOutbox, DispatchOutboxEvent } from "./dispatch-outbox.js";
+import type { AgentMessageManager } from "./agent-messages.js";
+import { AGENT_MESSAGE_KINDS } from "./agent-messages.js";
 
 const WORKSPACE_APP_URI = "ui://kontrol/workspace-app.html";
 
@@ -38,6 +40,8 @@ export interface BridgeConfig {
   reviewWorkflow: ReviewWorkflowService;
   dispatchOutbox?: DispatchOutbox;
   missionLedger?: MissionLedger;
+  /** Durable agent→WebUI messages/artifacts (clarifications, blockers, findings). */
+  agentMessages?: AgentMessageManager;
   knownAgents: Array<{ name: string; url: string; description?: string }>;
   sharedSecret?: string;
   /**
@@ -2199,6 +2203,280 @@ export function registerBridgeTools(
             updatedAt: s.updatedAt,
           })),
         },
+      };
+    },
+  );
+
+  // ── Agent → WebUI messages / artifacts (item 6) ────
+
+  registerAppTool(
+    server,
+    "post_agent_message",
+    {
+      title: "Post message to WebUI",
+      description: "Send a general message or artifact from the worker to the WebUI: ask for clarification, report a blocker, publish a finding, submit an artifact, or leave a note. Durable and ordered — the WebUI receives it live and can re-list it after a reload. Use kind='clarification_request' or 'blocker' when you need a human to act (these show as open until resolved).",
+      inputSchema: {
+        sessionId: z.string().describe("Work session ID."),
+        kind: z.enum(AGENT_MESSAGE_KINDS as [string, ...string[]]).describe("Message kind."),
+        title: z.string().optional().describe("Short headline."),
+        body: z.string().optional().describe("Message text / question / description."),
+        data: z.record(z.string(), z.unknown()).optional().describe("Structured payload: artifact ref, finding evidence, or answer options."),
+      },
+      outputSchema: { messageId: z.string(), status: z.string(), kind: z.string() },
+      _meta: workspaceAppModelAndAppMeta(),
+      annotations: { readOnlyHint: false },
+    },
+    async ({ sessionId, kind, title, body, data }) => {
+      if (!isWorkerOrClient(config.principalRole)) {
+        return forbidden(config.principalRole, "post_agent_message");
+      }
+      if (!config.agentMessages) {
+        return { content: [{ type: "text" as const, text: "Agent-message store unavailable." }], isError: true };
+      }
+      const session = config.workSessions.get(sessionId);
+      if (!session) return { content: [{ type: "text" as const, text: "Session not found." }], isError: true };
+      const bind = assertWorkerSessionBinding(config, sessionId);
+      if (bind) return bind;
+
+      const run = config.agentRegistry.getRunByWorkSessionId(sessionId);
+      const message = config.agentMessages.post({
+        workSessionId: sessionId,
+        runId: run?.runId,
+        kind: kind as (typeof AGENT_MESSAGE_KINDS)[number],
+        author: config.principalRole === "worker" ? "worker" : "agent",
+        title,
+        body,
+        data,
+      });
+      // Durable wakeup so the WebUI watcher renders it without polling.
+      config.eventStore.appendEvent({
+        type: "agent.message.posted",
+        sessionId,
+        payload: {
+          messageId: message.id,
+          kind: message.kind,
+          title: message.title,
+          body: message.body,
+          status: message.status,
+          runId: run?.runId,
+        },
+      });
+      return {
+        content: [{ type: "text" as const, text: `Posted ${message.kind} (${message.id}).` }],
+        structuredContent: { messageId: message.id, status: message.status, kind: message.kind },
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
+    "list_agent_messages",
+    {
+      title: "List agent messages",
+      description: "List durable agent→WebUI messages/artifacts for a work session (clarification requests, blockers, findings, artifacts, notes). Use for WebUI rehydration and to surface open questions/blockers awaiting a reply.",
+      inputSchema: {
+        sessionId: z.string().describe("Work session ID."),
+        openOnly: z.boolean().optional().describe("Only return unresolved gating messages (questions/blockers)."),
+      },
+      outputSchema: {
+        messages: z.array(z.object({
+          messageId: z.string(),
+          kind: z.string(),
+          author: z.string(),
+          title: z.string().optional(),
+          body: z.string().optional(),
+          status: z.string(),
+          createdAt: z.string(),
+        })),
+      },
+      _meta: {},
+      annotations: { readOnlyHint: true },
+    },
+    async ({ sessionId, openOnly }) => {
+      const denied = requireWorkSessionRead(config, sessionId);
+      if (denied) return denied;
+      if (!config.agentMessages) {
+        return { content: [{ type: "text" as const, text: "Agent-message store unavailable." }], isError: true };
+      }
+      const messages = config.agentMessages.list(sessionId, { openOnly });
+      return {
+        content: [{ type: "text" as const, text: `${messages.length} message(s).` }],
+        structuredContent: {
+          messages: messages.map((m) => ({
+            messageId: m.id,
+            kind: m.kind,
+            author: m.author,
+            title: m.title,
+            body: m.body,
+            status: m.status,
+            createdAt: m.createdAt,
+          })),
+        },
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
+    "resolve_agent_message",
+    {
+      title: "Resolve agent message",
+      description: "Mark an open clarification request or blocker as resolved (e.g. after the reviewer has answered it). Optional reply text is delivered back to the worker as a durable event.",
+      inputSchema: {
+        sessionId: z.string().describe("Work session ID."),
+        messageId: z.string().describe("The agent message to resolve."),
+        reply: z.string().optional().describe("Answer / resolution text sent back to the worker."),
+      },
+      outputSchema: { messageId: z.string(), status: z.string() },
+      _meta: {},
+      annotations: { readOnlyHint: false },
+    },
+    async ({ sessionId, messageId, reply }) => {
+      if (!isReviewer(config.principalRole)) {
+        return forbidden(config.principalRole, "resolve_agent_message");
+      }
+      if (!config.agentMessages) {
+        return { content: [{ type: "text" as const, text: "Agent-message store unavailable." }], isError: true };
+      }
+      const existing = config.agentMessages.get(messageId);
+      if (!existing || existing.workSessionId !== sessionId) {
+        return { content: [{ type: "text" as const, text: "Message not found for this session." }], isError: true };
+      }
+      const resolved = config.agentMessages.resolve(messageId);
+      config.eventStore.appendEvent({
+        type: "agent.message.resolved",
+        sessionId,
+        payload: { messageId, reply, replyToKind: existing.kind },
+      });
+      return {
+        content: [{ type: "text" as const, text: `Resolved ${messageId}.` }],
+        structuredContent: { messageId, status: resolved?.status ?? "resolved" },
+      };
+    },
+  );
+
+  // ── List Active Work Sessions (WebUI rehydration) ──
+
+  registerAppTool(
+    server,
+    "list_active_work_sessions",
+    {
+      title: "List active work sessions",
+      description: "List all non-terminal work sessions (optionally scoped to a workspace) so the WebUI can rehydrate every resumable session after a reload or reconnect — including ones still being driven by the worker (in_progress / resuming) or sent back for changes. Replay each returned session's events from seq 0 to rebuild its view.",
+      inputSchema: {
+        workspaceId: z.string().optional().describe("Optional workspace ID to scope the listing."),
+      },
+      outputSchema: {
+        sessions: z.array(z.object({
+          sessionId: z.string(),
+          workspaceSessionId: z.string(),
+          status: z.string(),
+          title: z.string().optional(),
+          submittedBy: z.string(),
+          runId: z.string().optional(),
+          submissionCount: z.number(),
+          updatedAt: z.string(),
+        })),
+      },
+      _meta: {},
+      annotations: { readOnlyHint: true },
+    },
+    async ({ workspaceId }) => {
+      if (!isReviewer(config.principalRole)) {
+        return forbidden(config.principalRole, "list_active_work_sessions");
+      }
+      const sessions = config.workSessions.listActiveWorkSessions(workspaceId);
+      const mapped = sessions.map((s) => {
+        const run = config.agentRegistry.getRunByWorkSessionId(s.id);
+        return {
+          sessionId: s.id,
+          workspaceSessionId: s.workspaceSessionId,
+          status: s.status,
+          title: s.title,
+          submittedBy: s.submittedBy,
+          runId: run?.runId,
+          submissionCount: config.workSessions.getSubmissions(s.id).length,
+          updatedAt: s.updatedAt,
+        };
+      });
+      const text = mapped.length === 0
+        ? "No active work sessions."
+        : `${mapped.length} active session(s):\n${mapped.map((s) => `  ${s.sessionId} [${s.status}] ${s.title ?? "untitled"} — updated ${s.updatedAt}`).join("\n")}`;
+
+      return {
+        content: [{ type: "text" as const, text }],
+        structuredContent: { sessions: mapped },
+      };
+    },
+  );
+
+  // ── Session Handoff between agents (item 7) ────────
+
+  registerAppTool(
+    server,
+    "handoff_work_session",
+    {
+      title: "Hand off work session to another agent",
+      description: "Reassign an in-flight work session to a different registered CLI agent (e.g. hand investigation from CRUSH to Hermes, or route a review to a dedicated reviewer agent). The session, workspace, mission, submissions, and review history are preserved; only the agent that will handle the NEXT resume changes. The handoff takes effect on the next continuation dispatch — a currently-parked worker is not force-killed unless you also cancel it.",
+      inputSchema: {
+        sessionId: z.string().describe("Work session ID to hand off."),
+        toAgent: z.string().describe("Name of the target registered agent (role=agent)."),
+        reason: z.string().optional().describe("Why the session is being handed off (recorded)."),
+      },
+      outputSchema: { sessionId: z.string(), fromAgent: z.string().optional(), toAgent: z.string(), status: z.string() },
+      _meta: {},
+      annotations: { readOnlyHint: false },
+    },
+    async ({ sessionId, toAgent, reason }) => {
+      if (!isReviewer(config.principalRole)) {
+        return forbidden(config.principalRole, "handoff_work_session");
+      }
+      const session = config.workSessions.get(sessionId);
+      if (!session) return { content: [{ type: "text" as const, text: "Session not found." }], isError: true };
+      if (TERMINAL_STATUSES.has(session.status)) {
+        return { content: [{ type: "text" as const, text: `Session is ${session.status}; cannot hand off a terminal session.` }], isError: true };
+      }
+
+      // The target must be a real, registered agent — otherwise the next resume
+      // would fail with "no healthy agent" and strand the session.
+      const selection = await selectHealthyAgent(config.agentRegistry.listAlive(), {
+        name: toAgent,
+        role: "agent",
+        sharedSecret: config.sharedSecret,
+      });
+      if (!selection.agent) {
+        return { content: [{ type: "text" as const, text: `No healthy agent named ${toAgent} (role=agent) is registered.` }], isError: true };
+      }
+
+      const run = config.agentRegistry.getRunByWorkSessionId(sessionId);
+      if (!run) {
+        return { content: [{ type: "text" as const, text: "No correlated run to reassign for this session." }], isError: true };
+      }
+      const fromAgent = run.agentName;
+      if (fromAgent === toAgent) {
+        return {
+          content: [{ type: "text" as const, text: `Session already assigned to ${toAgent}.` }],
+          structuredContent: { sessionId, fromAgent, toAgent, status: "unchanged" },
+        };
+      }
+
+      // Reassign the correlated run. The continuation dispatcher reads
+      // run.agentName when it routes the next resume, so this reroutes future
+      // work without disturbing the durable session/review state.
+      config.agentRegistry.updateRun(run.runId, { agentName: toAgent });
+      // Keep the mission's preferredAgent in sync — the dispatcher prefers it
+      // over run.agentName, so a stale work-order value would otherwise re-route
+      // the very next resume back to the old agent, silently undoing the handoff.
+      config.missionLedger?.setWorkOrderPreferredAgent(sessionId, toAgent);
+      config.eventStore.appendEvent({
+        type: "session.handoff",
+        sessionId,
+        payload: { runId: run.runId, fromAgent, toAgent, reason },
+      });
+
+      return {
+        content: [{ type: "text" as const, text: `Handed off session ${sessionId} from ${fromAgent} to ${toAgent}.` }],
+        structuredContent: { sessionId, fromAgent, toAgent, status: "handed_off" },
       };
     },
   );
