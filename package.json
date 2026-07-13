@@ -23,7 +23,6 @@
     "scripts/fix-node-pty-permissions.mjs",
     "scripts/hermes-acp-compat/sitecustomize.py",
     "scripts/hermes-native-runner.py",
-    "scripts/kontrol-acp-crush-adapter.service",
     "scripts/lib/acp-worker-token.mjs",
     "scripts/mcp-stdio-bridge.mjs",
     "README.md"
