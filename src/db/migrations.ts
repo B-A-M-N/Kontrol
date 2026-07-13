@@ -26,6 +26,7 @@ const migrations: Migration[] = [
   { version: 17, name: "supervisor-mission-ledger", up: migrateSupervisorMissionLedger },
   { version: 18, name: "mission-scope-guard", up: migrateMissionScopeGuard },
   { version: 19, name: "workspace-leases", up: migrateWorkspaceLeases },
+  { version: 20, name: "dispatch-outbox-logical-key", up: migrateDispatchOutboxLogicalKey },
 ];
 
 /**
@@ -584,6 +585,7 @@ function migrateDispatchOutbox(sqlite: Database.Database): void {
       id text primary key,
       event_type text not null,
       aggregate_id text not null,
+      aggregate_revision integer not null default 0,
       payload_json text not null default '{}',
       status text not null default 'pending',
       attempt_count integer not null default 0,
@@ -600,6 +602,27 @@ function migrateDispatchOutbox(sqlite: Database.Database): void {
 
     create index if not exists dispatch_outbox_aggregate_idx
       on dispatch_outbox(aggregate_id);
+
+    create unique index if not exists dispatch_outbox_logical_unique
+      on dispatch_outbox(event_type, aggregate_id, aggregate_revision);
+  `);
+}
+
+function migrateDispatchOutboxLogicalKey(sqlite: Database.Database): void {
+  const columns = sqlite.prepare("pragma table_info(dispatch_outbox)").all() as Array<{ name: string }>;
+  if (!columns.some((column) => column.name === "aggregate_revision")) {
+    sqlite.exec("alter table dispatch_outbox add column aggregate_revision integer not null default 0");
+  }
+  sqlite.exec(`
+    delete from dispatch_outbox
+    where rowid not in (
+      select min(rowid)
+      from dispatch_outbox
+      group by event_type, aggregate_id, aggregate_revision
+    );
+
+    create unique index if not exists dispatch_outbox_logical_unique
+      on dispatch_outbox(event_type, aggregate_id, aggregate_revision);
   `);
 }
 

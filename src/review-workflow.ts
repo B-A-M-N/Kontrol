@@ -431,6 +431,7 @@ export function createReviewWorkflowService(
         dispatchOutbox?.enqueue({
           eventType: "continuation.ready",
           aggregateId: createdContinuation.id,
+          aggregateRevision: createdContinuation.reviewEpoch,
           payload: {
             sessionId: input.sessionId,
             runId: correlatedRun?.runId,

@@ -333,6 +333,7 @@ export const dispatchOutbox = sqliteTable("dispatch_outbox", {
   id: text("id").primaryKey(),
   eventType: text("event_type").notNull(),
   aggregateId: text("aggregate_id").notNull(),
+  aggregateRevision: integer("aggregate_revision").notNull().default(0),
   payloadJson: text("payload_json").notNull().default("{}"),
   status: text("status").notNull().default("pending"),
   attemptCount: integer("attempt_count").notNull().default(0),
@@ -345,6 +346,7 @@ export const dispatchOutbox = sqliteTable("dispatch_outbox", {
 }, (table) => [
   index("dispatch_outbox_status_available_idx").on(table.status, table.availableAt),
   index("dispatch_outbox_aggregate_idx").on(table.aggregateId),
+  uniqueIndex("dispatch_outbox_logical_unique").on(table.eventType, table.aggregateId, table.aggregateRevision),
 ]);
 
 export type DispatchOutboxRow = typeof dispatchOutbox.$inferSelect;

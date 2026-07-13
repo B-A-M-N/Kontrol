@@ -444,6 +444,37 @@ try {
     assert.equal(continuationManager.get(legacy.id)?.status, "dispatched");
   }
 
+  // ── Scenario 2e: dead-lettered outbox rows block automatic backfill until explicit redrive ──
+  {
+    const sessionId = createSession();
+    await callWorker("submit_for_review", { sessionId });
+    await callReviewer("provide_review_feedback", { sessionId, verdict: "changes_requested" });
+    const continuation = continuationManager.listForSession(sessionId).find((c) => c.status === "pending");
+    assert.ok(continuation, "changes_requested creates a pending continuation for dead-letter test");
+
+    for (let i = 0; i < 3; i++) {
+      await runContinuationTick(config);
+      db.sqlite
+        .prepare("update dispatch_outbox set available_at = ? where aggregate_id = ? and status = 'pending'")
+        .run("2000-01-01T00:00:00.000Z", continuation.id);
+    }
+
+    const deadLetter = db.sqlite
+      .prepare("select status, attempt_count from dispatch_outbox where aggregate_id = ?")
+      .get(continuation.id) as { status: string; attempt_count: number };
+    assert.equal(deadLetter.status, "dead_lettered", "third failed dispatch dead-letters the outbox row");
+
+    await runContinuationTick(config);
+    const rowCount = db.sqlite
+      .prepare("select count(*) as count from dispatch_outbox where aggregate_id = ?")
+      .get(continuation.id) as { count: number };
+    assert.equal(rowCount.count, 1, "dead-lettered continuation is not automatically backfilled as a fresh outbox row");
+
+    const redriven = dispatchOutbox.redriveDeadLetter("continuation.ready", continuation.id, continuation.reviewEpoch);
+    assert.equal(redriven?.status, "pending", "explicit redrive resets the dead-lettered row");
+    assert.equal(redriven?.attemptCount, 0, "explicit redrive resets attempt count");
+  }
+
   // ── Scenario 3: stale feedback is not replayed ──
   {
     const sessionId = createSession();
