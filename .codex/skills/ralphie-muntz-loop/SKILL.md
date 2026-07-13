@@ -162,3 +162,7 @@ Each WaiterEntry = { callback, timeout, cleanup }
 - Debugging review feedback not reaching the CLI agent
 - Designing agent-to-human review rendezvous patterns
 - When someone suggests polling `check_review_status` every N seconds (don't)
+
+## Mission-Led Work
+
+For enhanced project supervision with acceptance criteria, evidence, findings, work orders, and approval blockers, use the kontrol-supervised-mission skill in addition to this loop. This skill handles the review rendezvous; the mission skill handles the completion predicate.
