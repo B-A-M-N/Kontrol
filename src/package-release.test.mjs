@@ -38,6 +38,11 @@ try {
   assert.ok(existsSync(join(pkg, "dist/server.js")), "packed package is missing dist/server.js");
   assert.ok(existsSync(join(pkg, "dist/cli.js")), "packed package is missing dist/cli.js");
   assert.ok(existsSync(join(pkg, "dist/acp-worker-token.mjs")), "packed package is missing dist/acp-worker-token.mjs");
+  assert.equal(
+    existsSync(join(pkg, "scripts/kontrol-acp-crush-adapter.service")),
+    false,
+    "fixed-path systemd units must not ship until service install generation exists",
+  );
 
   const rootNodeModules = join(root, "node_modules");
   if (existsSync(rootNodeModules)) {
