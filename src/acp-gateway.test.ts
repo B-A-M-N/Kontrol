@@ -204,6 +204,83 @@ try {
     agentRegistry.close();
   }
 
+  {
+    let resolveDispatch: (() => void) | undefined;
+    let cancelSeen = false;
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => { markStarted = resolve; });
+    const delayedServer = createServer(async (req, res) => {
+      if (req.method === "GET" && req.url === "/health") {
+        res.writeHead(200).end(JSON.stringify({ ok: true }));
+        return;
+      }
+      if (req.method === "POST" && req.url === "/runs") {
+        await readJson(req);
+        markStarted();
+        await new Promise<void>((r) => { resolveDispatch = r; });
+        res.writeHead(202, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ run_id: "remote-delayed", status: "running", output: [] }));
+        return;
+      }
+      if (req.method === "POST" && req.url === "/runs/remote-delayed/cancel") {
+        cancelSeen = true;
+        res.writeHead(202, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ run_id: "remote-delayed", status: "cancelled" }));
+        return;
+      }
+      res.writeHead(404).end();
+    });
+    servers.push(delayedServer);
+    const delayedPort = await listen(delayedServer, "127.0.0.1");
+
+    const root = await mkdtemp(join(tmpdir(), "devdesktop-acp-gateway-race-"));
+    tempDirs.push(root);
+    const db = openDatabase(root);
+    seedWorkspace(root, "ws-race");
+    const workSessions = createWorkSessionManager(db);
+    const agentRegistry = createAgentRegistryManager(db);
+    const workSession = workSessions.create({ workspaceSessionId: "ws-race", submittedBy: "test" });
+    const run = agentRegistry.createRun({
+      agentName: "remote-agent",
+      workspaceSessionId: "ws-race",
+      workSessionId: workSession.id,
+      inputPreview: "race",
+      status: "running",
+    });
+
+    const call = callRemoteAgent(
+      {
+        agentRegistry,
+        workspaces: { getWorkspace: () => ({ id: "ws-race", root: "/tmp", mode: "checkout" }) } as any,
+        workSessions,
+        sharedSecret: "secret",
+      },
+      {
+        agentUrl: `http://127.0.0.1:${delayedPort}`,
+        agentName: "remote-agent",
+        task: "resume",
+        workspaceSessionId: "ws-race",
+        workSessionId: workSession.id,
+        existingRunId: run.runId,
+        mode: "async",
+        fireAndForget: true,
+      },
+    );
+    await started;
+    workSessions.updateStatus(workSession.id, "cancelled");
+    agentRegistry.updateRun(run.runId, { status: "cancelled" });
+    resolveDispatch?.();
+    const result = await call;
+    assert.equal(result.status, "cancelled", "in-flight cancellation keeps logical run cancelled");
+    assert.equal(cancelSeen, true, "accepted remote attempt is cancelled after late cancellation");
+    const finalRun = agentRegistry.getRun(run.runId);
+    assert.equal(finalRun?.status, "cancelled");
+    assert.equal(finalRun?.remoteRunId, undefined, "late remote id is not recorded on cancelled logical run");
+
+    workSessions.close();
+    agentRegistry.close();
+  }
+
   console.log("acp-gateway.test.ts: all assertions passed");
 } finally {
   await Promise.all(servers.map((server) => new Promise<void>((resolve) => server.close(() => resolve()))));

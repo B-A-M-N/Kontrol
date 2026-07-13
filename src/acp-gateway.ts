@@ -149,6 +149,7 @@ export async function selectHealthyAgent(
 
 const AGENT_SUBMIT_TIMEOUT_MS = 5 * 60 * 1000; // bound the "did it submit?" wait
 const TERMINAL_RUN_STATUSES = new Set(["approved", "rejected", "cancelled", "failed", "failed_protocol"]);
+const TERMINAL_WORK_SESSION_STATUSES = new Set(["approved", "rejected", "cancelled", "failed", "failed_protocol"]);
 
 async function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -197,11 +198,19 @@ export async function cancelRemoteRun(
     return { acknowledged: false, error: `No healthy registered adapter for ${run.agentName}` };
   }
 
-  const baseUrl = selection.agent.url.replace(/\/+$/, "");
+  return cancelRemoteRunById(selection.agent.url, config.sharedSecret, run.remoteRunId);
+}
+
+export async function cancelRemoteRunById(
+  agentUrl: string,
+  sharedSecret: string | undefined,
+  remoteRunId: string,
+): Promise<AgentCancelResult> {
+  const baseUrl = agentUrl.replace(/\/+$/, "");
   try {
-    const response = await fetch(`${baseUrl}/runs/${encodeURIComponent(run.remoteRunId)}/cancel`, {
+    const response = await fetch(`${baseUrl}/runs/${encodeURIComponent(remoteRunId)}/cancel`, {
       method: "POST",
-      headers: authHeadersForAgent(selection.agent.url, config.sharedSecret),
+      headers: authHeadersForAgent(agentUrl, sharedSecret),
       signal: AbortSignal.timeout(10_000),
     });
     const text = await response.text().catch(() => "");
@@ -243,6 +252,7 @@ export async function callRemoteAgent(
   // one run while a resumed worker updates the same record (higher attempt #).
   let run: ReturnType<GatewayConfig["agentRegistry"]["createRun"]>;
   let attemptNumber = 1;
+  let expectedDispatchStatus = "created";
   if (params.existingRunId) {
     const existing = config.agentRegistry.getRun(params.existingRunId);
     if (!existing) {
@@ -253,6 +263,7 @@ export async function callRemoteAgent(
     }
     run = existing;
     attemptNumber = (existing.attemptNumber ?? 1) + 1;
+    expectedDispatchStatus = "resuming";
     config.agentRegistry.updateRun(run.runId, {
       attemptNumber,
       status: "resuming",
@@ -321,17 +332,61 @@ export async function callRemoteAgent(
     const errorMessage = result.error?.message;
 
     if (useAsync) {
+      const currentRun = config.agentRegistry.getRun(run.runId);
+      const currentSession = params.workSessionId
+        ? config.workSessions.get(params.workSessionId)
+        : undefined;
+      const runStillDispatchable =
+        currentRun?.status === expectedDispatchStatus &&
+        currentRun.attemptNumber === attemptNumber;
+      const sessionTerminal =
+        currentSession !== undefined &&
+        TERMINAL_WORK_SESSION_STATUSES.has(currentSession.status);
+
+      if (!runStillDispatchable || sessionTerminal) {
+        await cancelRemoteRunById(params.agentUrl, config.sharedSecret, remoteRunId);
+        const status = currentRun?.status ?? (sessionTerminal ? currentSession?.status : "failed") ?? "failed";
+        return {
+          runId: run.runId,
+          remoteRunId,
+          attemptNumber,
+          agentName: params.agentName,
+          status,
+          output: `Adapter accepted the run after the logical session became ${status}; remote attempt was cancelled.`,
+          error: sessionTerminal ? `Session is ${currentSession?.status}` : `Run is ${currentRun?.status ?? "missing"}`,
+          workSessionId: params.workSessionId,
+        };
+      }
+
       // Fire-and-forget: the WebUI dispatch path returns immediately with the
       // DEVDESKTOP run ID (not the adapter's), and observes progress via the
       // durable event log / get_work_session. The authoritative run ID is
       // run.runId; remoteRunId is only an execution-attempt pointer.
       if (params.fireAndForget) {
-        config.agentRegistry.updateRun(run.runId, {
+        const updated = config.agentRegistry.updateRunIfCurrent(
+          run.runId,
+          { status: expectedDispatchStatus, attemptNumber },
+          {
           status: "running",
           remoteRunId,
           attemptNumber,
           lastHeartbeatAt: new Date().toISOString(),
-        });
+          },
+        );
+        if (!updated) {
+          await cancelRemoteRunById(params.agentUrl, config.sharedSecret, remoteRunId);
+          const latest = config.agentRegistry.getRun(run.runId);
+          return {
+            runId: run.runId,
+            remoteRunId,
+            attemptNumber,
+            agentName: params.agentName,
+            status: latest?.status ?? "failed",
+            output: "Adapter accepted the run, but the logical run changed before it could be marked running; remote attempt was cancelled.",
+            error: `Run changed before dispatch acceptance could be recorded.`,
+            workSessionId: params.workSessionId,
+          };
+        }
         return {
           runId: run.runId,
           remoteRunId,
