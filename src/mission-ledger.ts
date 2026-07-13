@@ -116,6 +116,13 @@ export interface MissionLedger {
    * round counter is only a backstop — it bites when rounds stop converging.
    */
   evaluateLoopExtension(workSessionId: string, round: NewRoundInput): LoopExtensionDecision;
+  /**
+   * Point the active work order at a different agent. Used by session handoff so
+   * the mission's preferredAgent (which the continuation dispatcher honors) stays
+   * consistent with the reviewer's reassignment. No-op if the session has no
+   * mission or no active work order. Returns the number of work orders updated.
+   */
+  setWorkOrderPreferredAgent(workSessionId: string, preferredAgent: string): number;
   close(): void;
 }
 
@@ -435,6 +442,16 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
     database.db.update(missionContracts).set({ updatedAt: new Date().toISOString() }).where(eq(missionContracts.id, missionId)).run();
   }
 
+  function setWorkOrderPreferredAgent(workSessionId: string, preferredAgent: string): number {
+    const mission = getMissionByWorkSession(workSessionId);
+    if (!mission) return 0;
+    const result = database.db.update(missionWorkOrders)
+      .set({ preferredAgent })
+      .where(and(eq(missionWorkOrders.missionId, mission.id), eq(missionWorkOrders.status, "active")))
+      .run();
+    return result.changes;
+  }
+
   return {
     createMission,
     getMissionByWorkSession,
@@ -446,6 +463,7 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
     getPacket,
     canApprove,
     evaluateLoopExtension,
+    setWorkOrderPreferredAgent,
     close: () => database.close(),
   };
 }
