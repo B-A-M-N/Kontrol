@@ -91,6 +91,14 @@ interface PolicyApprovalView {
   error?: string;
 }
 
+interface AgentMessageView {
+  messageId: string;
+  kind: string;
+  title?: string;
+  body?: string;
+  status: string;
+}
+
 type FeedbackState = "idle" | "submitting" | "submitted" | "error";
 
 interface WorkSessionViewState {
@@ -102,6 +110,8 @@ interface WorkSessionViewState {
   activity: AgentActivityEvent[];
   submissions: Map<string, ReviewSubmissionView>;
   policyApprovals: Map<string, PolicyApprovalView>;
+  /** Open agent→WebUI questions/blockers awaiting a reviewer reply. */
+  openMessages: Map<string, AgentMessageView>;
   activeSubmissionId?: string;
   feedbackStateBySubmission: Map<string, FeedbackState>;
   feedbackErrorBySubmission: Map<string, string>;
@@ -229,6 +239,10 @@ async function boot(): Promise<void> {
     if (initialContext) hostContext = initialContext;
     applyHostContext();
     connected = true;
+    // Rehydrate any sessions that were already live before this WebUI (re)loaded.
+    // Without this, sessions only appear reactively when a fresh tool card
+    // arrives — so a reload silently drops in-flight and awaiting-review work.
+    void rehydrateActiveSessions();
   } catch (connectError) {
     connectionError = connectError instanceof Error
       ? connectError.message
@@ -236,6 +250,50 @@ async function boot(): Promise<void> {
   }
 
   render();
+}
+
+/**
+ * On connect/reconnect, ask the server for every non-terminal work session and
+ * rebuild each one's view by replaying its event log from seq 0. The durable
+ * event log + reduceWorkSessionEvent already know how to reconstruct state; this
+ * is the missing client-side trigger that makes reload lossless.
+ */
+async function rehydrateActiveSessions(): Promise<void> {
+  if (!app) return;
+  try {
+    const result = await app.callServerTool({
+      name: "list_active_work_sessions",
+      arguments: activeWorkspaceId ? { workspaceId: activeWorkspaceId } : {},
+    });
+    const content = getStructuredContent<{
+      sessions: Array<{
+        sessionId: string;
+        workspaceSessionId: string;
+        status: string;
+        runId?: string;
+      }>;
+    }>(result);
+    if (!content?.sessions?.length) return;
+
+    for (const s of content.sessions) {
+      // Don't clobber a session already being watched in this connection.
+      if (watcherGenerations.has(s.sessionId)) continue;
+      const view = ensureWorkSessionView(s.sessionId, s.workspaceSessionId, s.runId ?? "");
+      view.status = s.status;
+      // Replay from the beginning so the reducer rebuilds full state; the watcher
+      // caps retained activity and dedupes by seq.
+      void watchWorkSession(s.sessionId, 0);
+    }
+    // If nothing is selected yet, surface the most recently updated session so
+    // the reloaded UI lands on live work instead of an empty pane.
+    if (!selectedWorkSessionId && content.sessions[0]) {
+      selectedWorkSessionId = content.sessions[0].sessionId;
+    }
+    render();
+  } catch {
+    // Recovery is best-effort: a failure here must not block the WebUI from
+    // connecting. Reactive tool cards still populate sessions as they arrive.
+  }
 }
 
 function ensureWorkSessionView(workSessionId: string, workspaceSessionId: string, runId: string): WorkSessionViewState {
@@ -250,6 +308,7 @@ function ensureWorkSessionView(workSessionId: string, workspaceSessionId: string
       activity: [],
       submissions: new Map(),
       policyApprovals: new Map(),
+      openMessages: new Map(),
       feedbackStateBySubmission: new Map(),
       feedbackErrorBySubmission: new Map(),
     };
@@ -519,6 +578,13 @@ function eventLabel(e: AgentActivityEvent): string {
     case "agent.run.cancelled": return "cancelled";
     case "continuation.created": return "continuation queued";
     case "continuation.delivered": return "continuation delivered";
+    case "agent.message.posted": {
+      const kind = String(e.payload?.kind ?? "message");
+      const title = e.payload?.title ? `: ${String(e.payload.title)}` : "";
+      return `${kind.replace(/_/g, " ")}${title}`;
+    }
+    case "agent.message.resolved": return "message resolved";
+    case "session.handoff": return `handed off → ${String(e.payload?.toAgent ?? "agent")}`;
     case "policy.approval_requested": return `approval needed: ${String(e.payload?.tool ?? "tool")}`;
     case "policy.approval.provided":
     case "approval.resolved":
@@ -671,6 +737,28 @@ function reduceWorkSessionEvent(sessionId: string, event: AgentActivityEvent): v
   } else if (event.type === "policy.approval.provided" || event.type === "approval.resolved") {
     const approvalId = String(event.payload?.approvalId ?? "");
     if (approvalId) view.policyApprovals.delete(approvalId);
+  } else if (event.type === "agent.message.posted") {
+    const messageId = String(event.payload?.messageId ?? "");
+    const kind = String(event.payload?.kind ?? "note");
+    // Only gating kinds (questions/blockers) go into the open-messages tray;
+    // findings/artifacts/notes remain in the activity feed as records.
+    if (messageId && String(event.payload?.status ?? "") === "open") {
+      view.openMessages.set(messageId, {
+        messageId,
+        kind,
+        title: typeof event.payload?.title === "string" ? event.payload.title : undefined,
+        body: typeof event.payload?.body === "string" ? event.payload.body : undefined,
+        status: "open",
+      });
+    }
+  } else if (event.type === "agent.message.resolved") {
+    const messageId = String(event.payload?.messageId ?? "");
+    if (messageId) view.openMessages.delete(messageId);
+  } else if (event.type === "session.handoff") {
+    // Run identity and durable state are unchanged; only the agent handling the
+    // next resume differs, so we just surface a notice.
+    const toAgent = String(event.payload?.toAgent ?? "");
+    view.feedbackMessage = `Session handed off to ${toAgent || "another agent"}.`;
   }
 }
 
