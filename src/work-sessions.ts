@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { eq, and, desc, sql } from "drizzle-orm";
+import { eq, and, desc, gte, sql } from "drizzle-orm";
 import { openDatabase, type DatabaseHandle } from "./db/client.js";
 import {
   workSessions,
@@ -122,6 +122,15 @@ export interface WorkSessionManager {
     ttlMs?: number;
   }): WorkspaceLeaseResult;
   releaseWorkspaceLeasesForSession(workSessionId: string): number;
+  /**
+   * Renew the checkout lease(s) held by a still-working session, extending
+   * expiry from a worker heartbeat. Returns the number of leases renewed (0 if
+   * the session holds none). Unlike acquireWorkspaceLease this never seizes or
+   * transfers ownership — it only pushes out expiry for leases this session
+   * already owns, so a long-running worker's checkout is not pruned out from
+   * under it.
+   */
+  renewWorkspaceLeaseForSession(workSessionId: string, ttlMs?: number): number;
   submitForReview(input: {
     workSessionId: string;
     diff?: string;
@@ -156,6 +165,15 @@ export interface WorkSessionManager {
   markFeedbackConsumed(workSessionId: string, feedbackId: string): void;
   getLatestFeedbackAfter(workSessionId: string, afterFeedbackId?: string): WorkSessionFeedback | undefined;
   listPendingReviews(workspaceSessionId?: string, limit?: number): WorkSession[];
+  /**
+   * All non-terminal work sessions (optionally scoped to a workspace), most
+   * recently updated first. Unlike listPendingReviews (which only surfaces
+   * sessions awaiting a reviewer), this returns every session the WebUI must
+   * rehydrate on reconnect — including ones the worker is still driving
+   * (in_progress / resuming) or ones sent back for changes. The WebUI replays
+   * each returned session's event log from seq 0 to rebuild its view.
+   */
+  listActiveWorkSessions(workspaceSessionId?: string, limit?: number): WorkSession[];
   close(): void;
 }
 
@@ -305,6 +323,25 @@ class SqliteWorkSessionManager implements WorkSessionManager {
     const result = this.database.sqlite
       .prepare("delete from workspace_leases where work_session_id = ?")
       .run(workSessionId);
+    return result.changes;
+  }
+
+  renewWorkspaceLeaseForSession(workSessionId: string, ttlMs?: number): number {
+    const now = new Date();
+    const nowIso = now.toISOString();
+    const expiresAt = new Date(now.getTime() + (ttlMs ?? 60 * 60 * 1000)).toISOString();
+    // Scoped to this session's own leases: a renewal must never resurrect a
+    // lease that already expired and was (or is about to be) taken by another
+    // session. Guard on the current owner AND on not-yet-expired so a stale
+    // heartbeat arriving after eviction is a no-op rather than a silent seizure.
+    const result = this.database.db
+      .update(workspaceLeases)
+      .set({ heartbeatAt: nowIso, expiresAt })
+      .where(and(
+        eq(workspaceLeases.workSessionId, workSessionId),
+        gte(workspaceLeases.expiresAt, nowIso),
+      ))
+      .run();
     return result.changes;
   }
 
@@ -570,6 +607,27 @@ class SqliteWorkSessionManager implements WorkSessionManager {
     const condition = workspaceSessionId
       ? and(statusFilter, eq(workSessions.workspaceSessionId, workspaceSessionId))
       : statusFilter;
+
+    const rows = this.database.db
+      .select()
+      .from(workSessions)
+      .where(condition)
+      .orderBy(desc(workSessions.updatedAt))
+      .limit(limit)
+      .all();
+
+    return rows.map((row) => this.enrichSession(row));
+  }
+
+  listActiveWorkSessions(workspaceSessionId?: string, limit = 50): WorkSession[] {
+    // Non-terminal = anything the WebUI can still act on or watch. Kept in sync
+    // with review-workflow's TERMINAL_STATUSES by exclusion so a newly-added
+    // live status is included by default rather than silently dropped.
+    const terminal = ["approved", "rejected", "cancelled", "failed", "failed_protocol"];
+    const notTerminal = sql`${workSessions.status} NOT IN (${sql.join(terminal.map((s) => sql`${s}`), sql`, `)})`;
+    const condition = workspaceSessionId
+      ? and(notTerminal, eq(workSessions.workspaceSessionId, workspaceSessionId))
+      : notTerminal;
 
     const rows = this.database.db
       .select()
