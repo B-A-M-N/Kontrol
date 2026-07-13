@@ -16,10 +16,18 @@ ngrok, Pinggy, Tailscale Funnel, or your own HTTPS reverse proxy.
 
 ## Install And Configure
 
-Run:
+Install the CLI from GitHub, then run setup:
 
 ```bash
-npx @b-a-m-n/kontrol init
+npm install -g git+ssh://git@github.com/B-A-M-N/Kontrol.git
+kontrol init
+```
+
+Without GitHub SSH keys:
+
+```bash
+npm install -g git+https://github.com/B-A-M-N/Kontrol.git
+kontrol init
 ```
 
 The setup flow asks one question at a time.
@@ -79,20 +87,20 @@ https://your-tunnel-host.example.com/mcp
 Run:
 
 ```bash
-npx @b-a-m-n/kontrol serve
+kontrol serve
 ```
 
 If your tunnel URL changes for one run, override it without rewriting config:
 
 ```bash
-KONTROL_PUBLIC_BASE_URL="https://new-tunnel.example.com" npx @b-a-m-n/kontrol serve
+KONTROL_PUBLIC_BASE_URL="https://new-tunnel.example.com" kontrol serve
 ```
 
 For a stable public URL, persist it:
 
 ```bash
-npx @b-a-m-n/kontrol config set publicBaseUrl https://kontrol.example.com
-npx @b-a-m-n/kontrol serve
+kontrol config set publicBaseUrl https://kontrol.example.com
+kontrol serve
 ```
 
 ## Approve The Client
@@ -114,7 +122,7 @@ Keep `auth.json` private.
 Run:
 
 ```bash
-npx @b-a-m-n/kontrol doctor
+kontrol doctor
 ```
 
 The doctor command reports the resolved config, Node version, Node ABI, platform,
@@ -122,11 +130,13 @@ Git, Bash, public URL, allowed hosts, and SQLite native dependency status.
 
 ## Running From A Local Checkout
 
-If you are developing Kontrol itself instead of using the published package:
+If you are running from a local checkout instead of a global GitHub install:
 
 ```bash
 npm install --include=dev
-npm run dev
+npm run build
+npm link
+kontrol serve
 ```
 
 The same setup rules apply.
