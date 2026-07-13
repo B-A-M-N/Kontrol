@@ -212,7 +212,7 @@ async function handleRunRequest(req, res, body) {
   const dispatchKey = continuationId ? `${devRunId}:${continuationId}` : undefined;
   const smokeTest = body.smoke_test === true || body?.metadata?.kontrol_smoke_test === true;
 
-  console.log(`[/runs] dispatch runId=${devRunId} ws=${workspaceSessionId} wss=${workSessionId} task=${task.slice(0, 120)}`);
+  console.log(`[/runs] dispatch runId=${devRunId} ws=${workspaceSessionId} wss=${workSessionId} taskBytes=${Buffer.byteLength(task, "utf8")}`);
 
   if (dispatchKey) {
     pruneReplayStore();
@@ -396,12 +396,12 @@ export function extractTask(input) {
 // Exported so it can be unit-tested without spawning the model. The installed
 // CRUSH build does not support `--no-color`; it supports `--quiet`, and the
 // adapter already suppresses ANSI via NO_COLOR=1 in workerEnvironment().
-export function buildCrushArgs(task) {
-  return ["run", "--debug", "--quiet", task];
+export function buildCrushArgs() {
+  return ["run", "--debug", "--quiet"];
 }
 
-export function buildAgentArgs(task) {
-  return buildCrushArgs(task);
+export function buildAgentArgs() {
+  return buildCrushArgs();
 }
 
 export function resolveAgentBin() {
@@ -410,13 +410,14 @@ export function resolveAgentBin() {
 
 function spawnAgent(run) {
   const bin = resolveAgentBin();
-  const args = buildAgentArgs(run.task);
+  const args = buildAgentArgs();
   console.log(`[run ${run.remoteRunId}] launching ${CRUSH_BIN} ${args.slice(0, 3).join(" ")} ...`);
   const child = spawn(bin, args, {
     cwd: run.workspaceRoot,
     env: workerEnvironment(run),
     detached: true,
   });
+  child.stdin.end(run.task);
   return child;
 }
 

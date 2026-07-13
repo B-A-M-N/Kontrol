@@ -47,8 +47,9 @@ try {
   {
     const mod = await loadAdapter({ ACP_AGENT_BIN: "crush" });
     const args = mod.buildAgentArgs("do the thing");
-    await t("crush builds run --debug --quiet argv", () => {
-      assert.deepEqual(args, ["run", "--debug", "--quiet", "do the thing"]);
+    await t("crush builds run --debug --quiet argv without prompt leakage", () => {
+      assert.deepEqual(args, ["run", "--debug", "--quiet"]);
+      assert.equal(args.some((arg) => arg.includes("do the thing")), false);
     });
     await t("crush registered agent name is cli-coding-agent", () => {
       assert.equal(mod.REGISTERED_AGENT_NAME, "cli-coding-agent");
