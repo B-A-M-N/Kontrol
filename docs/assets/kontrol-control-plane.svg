@@ -1,0 +1,88 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1400 900" role="img" aria-labelledby="title desc">
+  <title id="title">Kontrol control plane overview</title>
+  <desc id="desc">A control plane diagram showing Kontrol coordinating WebUI review, CLI coding agents, ACP and MCP tools, policy approval, and evidence-bound mission completion.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1400" y2="900" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#08111f"/>
+      <stop offset="0.55" stop-color="#0e1726"/>
+      <stop offset="1" stop-color="#111827"/>
+    </linearGradient>
+    <linearGradient id="kontrol" x1="520" y1="230" x2="880" y2="690" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2dd4bf"/>
+      <stop offset="0.5" stop-color="#60a5fa"/>
+      <stop offset="1" stop-color="#f59e0b"/>
+    </linearGradient>
+    <filter id="softShadow" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="18" stdDeviation="18" flood-color="#020617" flood-opacity="0.35"/>
+    </filter>
+    <style>
+      .band{fill:#0f172a;stroke:#293548;stroke-width:2}
+      .node{fill:#121c2e;stroke:#334155;stroke-width:2}
+      .small{fill:#182235;stroke:#3f4e66;stroke-width:2}
+      .title{font-family:sans-serif;font-weight:700;font-size:52px;fill:#f8fafc;letter-spacing:0}
+      .subtitle{font-family:sans-serif;font-weight:400;font-size:24px;fill:#94a3b8;letter-spacing:0}
+      .label{font-family:sans-serif;font-weight:700;font-size:24px;fill:#f8fafc;letter-spacing:0}
+      .body{font-family:sans-serif;font-weight:400;font-size:19px;fill:#cbd5e1;letter-spacing:0}
+      .mini{font-family:sans-serif;font-weight:700;font-size:16px;fill:#e2e8f0;letter-spacing:0}
+      .line{fill:none;stroke:#64748b;stroke-width:4;stroke-linecap:round;stroke-linejoin:round}
+      .teal{stroke:#2dd4bf}.blue{stroke:#60a5fa}.amber{stroke:#f59e0b}.violet{stroke:#a78bfa}
+    </style>
+  </defs>
+  <rect width="1400" height="900" fill="url(#bg)"/>
+  <g transform="translate(86 74)">
+    <text class="title" x="0" y="0">Kontrol</text>
+    <text class="subtitle" x="0" y="42">A local control plane for WebUI-reviewed CLI coding agents</text>
+  </g>
+  <g class="line teal">
+    <path d="M512 354 C400 302 322 248 244 206"/>
+    <path d="M512 444 C386 438 296 438 184 438"/>
+    <path d="M512 546 C410 622 330 680 236 724"/>
+  </g>
+  <g class="line blue">
+    <path d="M888 354 C1000 300 1086 246 1168 206"/>
+    <path d="M888 444 C1014 438 1104 438 1216 438"/>
+    <path d="M888 546 C990 622 1070 680 1164 724"/>
+  </g>
+  <g filter="url(#softShadow)">
+    <rect x="512" y="270" width="376" height="348" rx="34" fill="#0b1220" stroke="url(#kontrol)" stroke-width="5"/>
+    <circle cx="700" cy="390" r="70" fill="#101827" stroke="url(#kontrol)" stroke-width="8"/>
+    <path d="M672 345 V435 M672 390 L728 346 M692 392 L732 435" fill="none" stroke="#f8fafc" stroke-width="18" stroke-linecap="round" stroke-linejoin="round"/>
+    <text class="label" x="700" y="505" text-anchor="middle">Control Plane</text>
+    <text class="body" x="700" y="540" text-anchor="middle">dispatch · review · policy · evidence</text>
+  </g>
+  <g filter="url(#softShadow)">
+    <rect class="node" x="70" y="144" width="300" height="124" rx="18"/>
+    <text class="label" x="104" y="190">WebUI Reviewer</text>
+    <text class="body" x="104" y="226">approves, rejects, or issues</text>
+    <text class="body" x="104" y="252">bounded correction work orders</text>
+    <rect class="node" x="70" y="376" width="300" height="124" rx="18"/>
+    <text class="label" x="104" y="422">MCP Workspace</text>
+    <text class="body" x="104" y="458">read, edit, shell, search</text>
+    <text class="body" x="104" y="484">inside allowed local roots</text>
+    <rect class="node" x="70" y="660" width="300" height="124" rx="18"/>
+    <text class="label" x="104" y="706">Mission Ledger</text>
+    <text class="body" x="104" y="742">criteria, findings, evidence</text>
+    <text class="body" x="104" y="768">and snapshot-bound approval</text>
+  </g>
+  <g filter="url(#softShadow)">
+    <rect class="node" x="1030" y="144" width="300" height="124" rx="18"/>
+    <text class="label" x="1064" y="190">CLI Agents</text>
+    <text class="body" x="1064" y="226">Crush, Hermes, Codex,</text>
+    <text class="body" x="1064" y="252">or ACP stdio workers</text>
+    <rect class="node" x="1030" y="376" width="300" height="124" rx="18"/>
+    <text class="label" x="1064" y="422">ACP Duplex</text>
+    <text class="body" x="1064" y="458">agent requests permission</text>
+    <text class="body" x="1064" y="484">while a run is active</text>
+    <rect class="node" x="1030" y="660" width="300" height="124" rx="18"/>
+    <text class="label" x="1064" y="706">Policy Gate</text>
+    <text class="body" x="1064" y="742">tool, command, and path</text>
+    <text class="body" x="1064" y="768">approvals with scoped grants</text>
+  </g>
+  <g>
+    <rect class="small" x="534" y="672" width="156" height="54" rx="14"/>
+    <text class="mini" x="612" y="705" text-anchor="middle">Human sign-off</text>
+    <rect class="small" x="710" y="672" width="156" height="54" rx="14"/>
+    <text class="mini" x="788" y="705" text-anchor="middle">Agent resumes</text>
+    <path class="line amber" d="M690 699 H710"/>
+  </g>
+</svg>

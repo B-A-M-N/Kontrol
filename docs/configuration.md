@@ -13,17 +13,17 @@ The default files are:
 Use another config directory with:
 
 ```bash
-KONTROL_CONFIG_DIR=/path/to/config npx @b-a-m-n/kontrol serve
+KONTROL_CONFIG_DIR=/path/to/config kontrol serve
 ```
 
 ## Commands
 
 ```bash
-npx @b-a-m-n/kontrol init
-npx @b-a-m-n/kontrol serve
-npx @b-a-m-n/kontrol doctor
-npx @b-a-m-n/kontrol config get
-npx @b-a-m-n/kontrol config set publicBaseUrl https://kontrol.example.com
+kontrol init
+kontrol serve
+kontrol doctor
+kontrol config get
+kontrol config set publicBaseUrl https://kontrol.example.com
 ```
 
 ## Core Environment Variables
@@ -94,7 +94,7 @@ Example:
 KONTROL_AUTH_MODE=tunnel
 HOST=127.0.0.1
 PORT=7676
-npx @b-a-m-n/kontrol serve
+kontrol serve
 ```
 
 In the OpenAI tunnel client, register this server with **No Authentication** and
@@ -163,8 +163,20 @@ Example:
 
 ```bash
 KONTROL_SKILL_PATHS="$HOME/.claude/skills,$HOME/company/skills" \
-npx @b-a-m-n/kontrol serve
+kontrol serve
 ```
+
+Kontrol's bundled skills use memorable names for the two halves of the review
+rendezvous:
+
+- `ralphie-muntz-loop`: worker-side submit, wait, resume.
+- `nelson-wiggum-loop`: reviewer-side start, inspect, approve or redirect.
+- `kontrol-supervised-mission`: objective, acceptance criteria, evidence,
+  findings, work orders, and mission approval blockers.
+
+Those names are local Agent Skill identifiers. The enforced authority boundary
+is role based: workers can submit and continue work, reviewers can approve, and
+mission approval is checked against durable evidence and the current snapshot.
 
 ## ACP Stdio Duplex Adapter
 
@@ -212,7 +224,7 @@ KONTROL_PUBLIC_BASE_URL="https://kontrol.example.com" \
 KONTROL_WORKTREE_ROOT="$HOME/.kontrol/worktrees" \
 KONTROL_TOOL_MODE="minimal" \
 KONTROL_WIDGETS="full" \
-npx @b-a-m-n/kontrol serve
+kontrol serve
 ```
 
 The environment assignments must be part of the same command invocation, or

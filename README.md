@@ -6,15 +6,15 @@
 
 <h1 align="center">Kontrol</h1>
 
-<p align="center">A self-hosted MCP server that lets any AI coding agent read, edit, search, and run code in your local projects — with structured human review loops and policy controls.</p>
+<p align="center">A local control plane for WebUI and CLI coding agents: MCP workspace access, ACP worker dispatch, human review gates, and policy authority.</p>
 
 [![Kontrol connected to a coding agent](https://raw.githubusercontent.com/B-A-M-N/Kontrol/main/docs/assets/kontrol-screenshot.png)](https://raw.githubusercontent.com/B-A-M-N/Kontrol/main/docs/assets/kontrol-screenshot.png)
 
-**Any MCP-capable agent. Your machine. Your projects. Your rules.**
+**Your machine. Your agents. Your approval gate.**
 
-Kontrol is a self-hosted MCP server that exposes your local project files to any AI coding agent — ChatGPT, Claude, Codex, Cursor, or whatever speaks MCP over Streamable HTTP. It adds an event-driven review loop so humans can inspect and approve agent work, and a policy engine so you control which tools and paths require approval.
+Kontrol is a self-hosted control plane for extending WebUI and CLI coding agents in a specific, review-gated way. It exposes your local project files over MCP, dispatches bounded work to registered ACP agents, routes results back through human review, and enforces policy around the tools and paths agents can touch.
 
-You run it on your machine, expose it through a tunnel you control, and connect any MCP client.
+You run it on your machine, expose it through a tunnel you control, and decide which agents get to operate, what they can do, and when their work is allowed to land.
 
 ## What Makes It Different
 
@@ -26,28 +26,36 @@ Most MCP file-server bridges stop at "read/write/edit." Kontrol adds three layer
 
 **Policy Mode** — Per-tool and per-path approval rules. A dangerous command can require a one-time approval, or you can approve it for an entire workspace session. Read-only inspection stays fast; destructive ops pause for human judgment.
 
-Underneath it all is an **event-sourced architecture**: every submission, feedback, approval, and continuation is an immutable event in an SQLite log. State is a projection. Live waiters are just one subscriber.
+Underneath it all is **transactional workflow state with an append-only event log**: submissions, feedback, approvals, continuations, runs, and policy decisions are persisted in SQLite, and the event stream wakes WebUI watchers and blocked agents.
 
 ## Installation
 
 Kontrol requires Node `>=22.19 <27`.
 
-```bash
-npm install -g @b-a-m-n/kontrol
-```
-
-Then initialize and start:
+The npm package name is reserved for `@b-a-m-n/kontrol`, but the public package is not published yet. Install from GitHub for now:
 
 ```bash
+npm install -g git+ssh://git@github.com/B-A-M-N/Kontrol.git
 kontrol init
 kontrol serve
 ```
 
-Or without a global install:
+If you do not use SSH keys with GitHub, use the HTTPS URL:
 
 ```bash
-npx @b-a-m-n/kontrol init
-npx @b-a-m-n/kontrol serve
+npm install -g git+https://github.com/B-A-M-N/Kontrol.git
+```
+
+For source development, clone the repo and link the CLI locally:
+
+```bash
+git clone git@github.com:B-A-M-N/Kontrol.git
+cd Kontrol
+npm install --include=dev
+npm run build
+npm link
+kontrol init
+kontrol serve
 ```
 
 During setup, Kontrol asks for:
@@ -95,7 +103,7 @@ route ChatGPT through an [OpenAI Secure MCP Tunnel](https://developers.openai.co
 KONTROL_AUTH_MODE=tunnel
 HOST=127.0.0.1
 PORT=7676
-npx @b-a-m-n/kontrol serve
+kontrol serve
 ```
 
 Register the server in the tunnel client with **No Authentication**, pointing at the loopback origin:
@@ -142,6 +150,18 @@ If agent stopped: it reads feedback when it resumes
 
 This loop lives in Kontrol's event log, not in any specific host. You can review submissions from the same interface you use to chat, from a terminal, or from a future tool.
 
+## Skill Names
+
+![Kontrol Ralphie and Nelson skill loop](https://raw.githubusercontent.com/B-A-M-N/Kontrol/main/docs/assets/kontrol-skill-loop.png)
+
+The project ships a few deliberately memorable Agent Skills. The names are not the product surface; they are protocol handles for the loop:
+
+- `ralphie-muntz-loop` is the worker-side contract. The CLI agent does bounded work, submits a diff, waits for feedback, and resumes only from durable review state.
+- `nelson-wiggum-loop` is the reviewer-side contract. The WebUI or MCP reviewer starts work, inspects the submission, and is the only side allowed to say the work is done.
+- `kontrol-supervised-mission` is the mission-control contract. It adds objective, criteria, findings, evidence, work orders, and approval blockers on top of the transport loop.
+
+The joke names make the rendezvous easy to remember. The authority model is serious: workers do not approve themselves, review is bound to the exact submission and workspace snapshot, and completion is gated by the reviewer or mission predicate.
+
 ## Policy Mode
 
 Control which operations require human approval:
@@ -173,7 +193,7 @@ When a call requires approval, the agent's tool invocation blocks (long-poll) un
 
 Kontrol is a **durable review mailbox and policy authority**, not just a file server.
 
-You decide which roots are allowed. You decide which tools require approval. The agent does its work, submits for review, and continues from structured feedback. The event log is the source of truth; every surface (CLI, WebUI, MCP tool) reads and writes events.
+You decide which roots are allowed. You decide which tools require approval. The agent does its work, submits for review, and continues from structured feedback. Durable workflow state and the append-only event log are the authority every surface reads from: CLI, WebUI, MCP tools, and ACP adapters.
 
 For a normal session:
 
