@@ -28,6 +28,14 @@
   "publishConfig": {
     "access": "public"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/B-A-M-N/Kontrol.git"
+  },
+  "homepage": "https://github.com/B-A-M-N/Kontrol#readme",
+  "bugs": {
+    "url": "https://github.com/B-A-M-N/Kontrol/issues"
+  },
   "scripts": {
     "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
     "build": "npm run clean && npm run build:app && tsc -p tsconfig.build.json && npm run build:copy-mjs",

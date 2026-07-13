@@ -39,8 +39,7 @@ WebUI (Nelson)                    Kontrol Server                 CLI Coding Agen
     │                                    │                                ├─ start_work_session
     │                                    │                                ├─ [do work: edit, shell, test]
     │                                    │◄─ submit_for_review ───────────┤
-    │                                    │   (or kontrol-submit-        │
-    │                                    │    work-to-webui via ACP)       │
+    │                                    │   (or kontrol-submit-work-to-webui via ACP) │
     │                                    ├─ status: awaiting_review        │
     │◄── diff card + feedback form ──────┤                                │
     │                                    │                                ├─ await_review_feedback (BLOCKS)
@@ -125,7 +124,7 @@ drafting
 │    → callRemoteAgent(agentUrl, task)             │
 │    → returns agent output to WebUI               │
 │                                                  │
-│  kontrol-submit-work-to-webui (ACP)           │
+│  kontrol-submit-work-to-webui (ACP)              │
 │    → reviewCheckpoints.reviewChanges()           │
 │    → workSessions.submitForReview()              │
 │    → eventStore.appendEvent("review.submitted") │
@@ -148,3 +147,7 @@ The registry (`agent_registry` table, `role` column) records both participants:
 - Explaining why a session is "stuck" in `awaiting_review`
 - Designing agent-to-human review rendezvous patterns
 - When someone suggests the agent can self-declare "done" without WebUI sign-off (it can't)
+
+## Mission-Led Work
+
+For enhanced project supervision with acceptance criteria, evidence, findings, and approval blockers, use the kontrol-supervised-mission skill. Ralph/Nelson remains the transport loop; the mission skill defines the completion predicate.
