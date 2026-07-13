@@ -26,7 +26,7 @@ const t = async (name, fn) => {
 
 const tempDirs = [];
 async function makeRealDir() {
-  const dir = await mkdtemp(join(tmpdir(), "dd-adapter-test-"));
+  const dir = await mkdtemp(join(tmpdir(), "kontrol-adapter-test-"));
   tempDirs.push(dir);
   await writeFile(join(dir, "marker.txt"), "x");
   return realpath(dir);

@@ -19,7 +19,7 @@ ngrok, Pinggy, Tailscale Funnel, or your own HTTPS reverse proxy.
 Run:
 
 ```bash
-npx @bamn/kontrol init
+npx @b-a-m-n/kontrol init
 ```
 
 The setup flow asks one question at a time.
@@ -79,20 +79,20 @@ https://your-tunnel-host.example.com/mcp
 Run:
 
 ```bash
-npx @bamn/kontrol serve
+npx @b-a-m-n/kontrol serve
 ```
 
 If your tunnel URL changes for one run, override it without rewriting config:
 
 ```bash
-KONTROL_PUBLIC_BASE_URL="https://new-tunnel.example.com" npx @bamn/kontrol serve
+KONTROL_PUBLIC_BASE_URL="https://new-tunnel.example.com" npx @b-a-m-n/kontrol serve
 ```
 
 For a stable public URL, persist it:
 
 ```bash
-npx @bamn/kontrol config set publicBaseUrl https://kontrol.example.com
-npx @bamn/kontrol serve
+npx @b-a-m-n/kontrol config set publicBaseUrl https://kontrol.example.com
+npx @b-a-m-n/kontrol serve
 ```
 
 ## Approve The Client
@@ -114,7 +114,7 @@ Keep `auth.json` private.
 Run:
 
 ```bash
-npx @bamn/kontrol doctor
+npx @b-a-m-n/kontrol doctor
 ```
 
 The doctor command reports the resolved config, Node version, Node ABI, platform,

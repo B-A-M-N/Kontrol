@@ -1,6 +1,6 @@
 <p align="center">
   <picture>
-    <img src="https://raw.githubusercontent.com/BAMN/kontrol/main/docs/assets/kontrol-logo-light.png" alt="Kontrol logo" width="140">
+    <img src="https://raw.githubusercontent.com/B-A-M-N/Kontrol/main/docs/assets/kontrol-logo-light.png" alt="Kontrol logo" width="140">
   </picture>
 </p>
 
@@ -8,13 +8,7 @@
 
 <p align="center">A self-hosted MCP server that lets any AI coding agent read, edit, search, and run code in your local projects — with structured human review loops and policy controls.</p>
 
-<p align="center">
-  <a href="https://www.npmjs.com/package/@bamn/kontrol"><img alt="npm" src="https://img.shields.io/npm/v/%40bamn%2Fkontrol?style=flat-square" /></a>
-  <a href="https://github.com/BAMN/kontrol/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/BAMN/kontrol/ci.yml?style=flat-square&branch=main" /></a>
-  <a href="https://github.com/BAMN/kontrol/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/npm/l/%40bamn%2Fkontrol?style=flat-square" /></a>
-</p>
-
-[![Kontrol connected to a coding agent](https://raw.githubusercontent.com/BAMN/kontrol/main/docs/assets/kontrol-screenshot.png)](https://raw.githubusercontent.com/BAMN/kontrol/main/docs/assets/kontrol-screenshot.png)
+[![Kontrol connected to a coding agent](https://raw.githubusercontent.com/B-A-M-N/Kontrol/main/docs/assets/kontrol-screenshot.png)](https://raw.githubusercontent.com/B-A-M-N/Kontrol/main/docs/assets/kontrol-screenshot.png)
 
 **Any MCP-capable agent. Your machine. Your projects. Your rules.**
 
@@ -39,7 +33,7 @@ Underneath it all is an **event-sourced architecture**: every submission, feedba
 Kontrol requires Node `>=22.19 <27`.
 
 ```bash
-npm install -g @bamn/kontrol
+npm install -g @b-a-m-n/kontrol
 ```
 
 Then initialize and start:
@@ -52,8 +46,8 @@ kontrol serve
 Or without a global install:
 
 ```bash
-npx @bamn/kontrol init
-npx @bamn/kontrol serve
+npx @b-a-m-n/kontrol init
+npx @b-a-m-n/kontrol serve
 ```
 
 During setup, Kontrol asks for:
@@ -101,7 +95,7 @@ route ChatGPT through an [OpenAI Secure MCP Tunnel](https://developers.openai.co
 KONTROL_AUTH_MODE=tunnel
 HOST=127.0.0.1
 PORT=7676
-npx @bamn/kontrol serve
+npx @b-a-m-n/kontrol serve
 ```
 
 Register the server in the tunnel client with **No Authentication**, pointing at the loopback origin:
@@ -192,11 +186,11 @@ For a normal session:
 
 ## Documentation
 
-- [Setup Guide](https://github.com/BAMN/kontrol/blob/main/docs/setup.md)
-- [Coding Workflow](https://github.com/BAMN/kontrol/blob/main/docs/chatgpt-coding-workflow.md)
-- [Configuration Reference](https://github.com/BAMN/kontrol/blob/main/docs/configuration.md)
-- [Security Model](https://github.com/BAMN/kontrol/blob/main/docs/security.md)
-- [Troubleshooting](https://github.com/BAMN/kontrol/blob/main/docs/gotchas.md)
+- [Setup Guide](https://github.com/B-A-M-N/Kontrol/blob/main/docs/setup.md)
+- [Coding Workflow](https://github.com/B-A-M-N/Kontrol/blob/main/docs/chatgpt-coding-workflow.md)
+- [Configuration Reference](https://github.com/B-A-M-N/Kontrol/blob/main/docs/configuration.md)
+- [Security Model](https://github.com/B-A-M-N/Kontrol/blob/main/docs/security.md)
+- [Troubleshooting](https://github.com/B-A-M-N/Kontrol/blob/main/docs/gotchas.md)
 
 ## Platform Support
 
@@ -210,10 +204,6 @@ For a normal session:
 ```bash
 kontrol doctor
 ```
-
-## Built by B-A-M-N
-
-I'm B-A-M-N. Kontrol is an opinionated take on how local coding agents and desktop environments can be extended novelly.
 
 ## Attribution
 
