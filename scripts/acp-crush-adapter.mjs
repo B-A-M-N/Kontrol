@@ -53,6 +53,7 @@ const HEARTBEAT_INTERVAL_MS = 55_000;
 const RUN_HEARTBEAT_MS = 10_000;
 const REPLAY_WINDOW_MS = 24 * 60 * 60 * 1000;
 const REPLAY_STORE_PATH = process.env.ACP_ADAPTER_REPLAY_STORE || "/tmp/kontrol-acp-adapter-replay.json";
+export const OUTPUT_TAIL_CHARS = 64 * 1024;
 
 // Dedicated port variable — must NOT share the generic PORT that kontrol
 // server reads, or the adapter collides with :7676 on boot.
@@ -346,12 +347,14 @@ async function handleRunRequest(req, res, body) {
     });
 
     child.stdout.on("data", (d) => {
-      run.stdout += d.toString();
-      reportOutputDelta(run, d.toString());
+      const text = d.toString();
+      run.stdout = appendBoundedOutput(run.stdout, text);
+      reportOutputDelta(run, text);
     });
     child.stderr.on("data", (d) => {
-      run.stderr += d.toString();
-      reportOutputDelta(run, d.toString());
+      const text = d.toString();
+      run.stderr = appendBoundedOutput(run.stderr, text);
+      reportOutputDelta(run, text);
     });
 
     if (workSessionId) {
@@ -406,6 +409,11 @@ export function buildAgentArgs() {
 
 export function resolveAgentBin() {
   return CRUSH_BIN;
+}
+
+export function appendBoundedOutput(current, next, limit = OUTPUT_TAIL_CHARS) {
+  const combined = `${current ?? ""}${next ?? ""}`;
+  return combined.length > limit ? combined.slice(-limit) : combined;
 }
 
 function spawnAgent(run) {

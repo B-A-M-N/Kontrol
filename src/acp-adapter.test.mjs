@@ -54,6 +54,11 @@ try {
     await t("crush registered agent name is cli-coding-agent", () => {
       assert.equal(mod.REGISTERED_AGENT_NAME, "cli-coding-agent");
     });
+    await t("adapter keeps a bounded output tail", () => {
+      const tail = mod.appendBoundedOutput("abc", "def", 4);
+      assert.equal(tail, "cdef");
+      assert.equal(mod.appendBoundedOutput("", "x".repeat(mod.OUTPUT_TAIL_CHARS + 1)).length, mod.OUTPUT_TAIL_CHARS);
+    });
   }
 
   // ── Fail-closed workspace root validation (P0 #6) ──
