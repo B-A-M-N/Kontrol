@@ -63,25 +63,29 @@ export function createAcpServer(
    * reviewer secret. An agent secret must NOT allow self-registration as
    * "client" or "reviewer".
    */
-  function authGate(req: Request, res: Response, expectedRole?: "agent" | "reviewer"): boolean {
-    let requiredSecret: string | undefined;
-    if (expectedRole === "reviewer") requiredSecret = reviewerSecret;
-    else if (expectedRole === "agent") requiredSecret = agentSecret;
-    else requiredSecret = sharedSecret ?? agentSecret ?? reviewerSecret;
+  type AcpRole = "agent" | "reviewer" | "operator";
 
-    if (!requiredSecret) {
+  function authenticateAcpRequest(req: Request): AcpRole | undefined {
+    const auth = req.headers.authorization;
+    if (agentSecret && auth === `Bearer ${agentSecret}`) return "agent";
+    if (reviewerSecret && auth === `Bearer ${reviewerSecret}`) return "reviewer";
+    if (sharedSecret && auth === `Bearer ${sharedSecret}`) return "operator";
+    return undefined;
+  }
+
+  function authGate(req: Request, res: Response, allowedRoles: AcpRole[] = ["agent", "reviewer", "operator"]): boolean {
+    if (!sharedSecret && !agentSecret && !reviewerSecret) {
       res.status(401).json({ error: { code: "unauthorized", message: "ACP is disabled: no shared secret configured" } });
       return false;
     }
-    const auth = req.headers.authorization;
-    if (auth === `Bearer ${requiredSecret}`) return true;
+    const role = authenticateAcpRequest(req);
+    if (role && allowedRoles.includes(role)) return true;
+    if (role) {
+      res.status(403).json({ error: { code: "forbidden", message: `ACP role ${role} is not allowed for this operation` } });
+      return false;
+    }
     res.status(401).json({ error: { code: "unauthorized", message: "Missing or invalid authorization" } });
     return false;
-  }
-
-  // Back-compat gate for endpoints that don't enforce role
-  function authGateAny(req: Request, res: Response): boolean {
-    return authGate(req, res);
   }
 
   function emitSse(runId: string, event: string, data: unknown): void {
@@ -185,7 +189,7 @@ export function createAcpServer(
   // ── Agent Discovery ──────────────────────────────────
 
   router.get("/agents", (req, res) => {
-    if (!authGate(req, res)) return;
+    if (!authGate(req, res, ["reviewer", "operator"])) return;
     const local = ACP_AGENTS.map((a) => ({
       name: a.name,
       description: a.description,
@@ -211,7 +215,7 @@ export function createAcpServer(
   });
 
   router.get("/agents/:name", (req, res) => {
-    if (!authGate(req, res)) return;
+    if (!authGate(req, res, ["reviewer", "operator"])) return;
     const local = agentMap.get(req.params.name);
     if (local) {
       res.json({ name: local.name, description: local.description, input_content_types: ["application/json", "text/plain"], output_content_types: ["text/plain"], metadata: { tags: ["Code", "Kontrol"] } });
@@ -235,7 +239,7 @@ export function createAcpServer(
   // ── Agent Registration ──────────────────────────────
 
   router.post("/agents/register", (req, res) => {
-    if (!authGate(req, res, "agent")) return;
+    if (!authGate(req, res, ["agent", "operator"])) return;
     const { name, url, description, publicKey, capabilities, tags, ttlSeconds, role } = req.body;
     if (!name || !url) {
       res.status(400).json({ error: { code: "invalid_input", message: "name and url are required" } });
@@ -252,13 +256,13 @@ export function createAcpServer(
   });
 
   router.post("/agents/:id/heartbeat", (req, res) => {
-    if (!authGate(req, res, "agent")) return;
+    if (!authGate(req, res, ["agent", "operator"])) return;
     agentRegistry.heartbeat(req.params.id);
     res.json({ ok: true });
   });
 
   router.delete("/agents/:id", (req, res) => {
-    if (!authGate(req, res)) return;
+    if (!authGate(req, res, ["reviewer", "operator"])) return;
     agentRegistry.unregister(req.params.id);
     res.status(204).end();
   });
@@ -266,7 +270,7 @@ export function createAcpServer(
   // ── Run Execution ──────────────────────────────────
 
   router.post("/runs", async (req: Request, res: Response) => {
-    if (!authGate(req, res)) return;
+    if (!authGate(req, res, ["reviewer", "operator"])) return;
 
     const { agent_name, input, mode, session_id, work_session_id, workspace_id, workspace_session_id, webhook_url } = req.body as {
       agent_name?: string;
@@ -560,7 +564,7 @@ export function createAcpServer(
 
   // GET /runs/{run_id}
   router.get("/runs/:run_id", (req, res) => {
-    if (!authGate(req, res)) return;
+    if (!authGate(req, res, ["reviewer", "operator"])) return;
     const run = agentRegistry.getRun(req.params.run_id);
     if (!run) { res.status(404).json({ error: { code: "not_found", message: "Run not found" } }); return; }
     res.json({
@@ -577,7 +581,7 @@ export function createAcpServer(
 
   // GET /runs/{run_id}/events — SSE stream
   router.get("/runs/:run_id/events", (req, res) => {
-    if (!authGate(req, res)) return;
+    if (!authGate(req, res, ["reviewer", "operator"])) return;
     const run = agentRegistry.getRun(req.params.run_id);
     if (!run) { res.status(404).json({ error: { code: "not_found", message: "Run not found" } }); return; }
 
@@ -592,7 +596,7 @@ export function createAcpServer(
 
   // POST /runs/{run_id} — resume an awaiting run (submit feedback)
   router.post("/runs/:run_id", async (req, res) => {
-    if (!authGate(req, res, "reviewer")) return;
+    if (!authGate(req, res, ["reviewer", "operator"])) return;
 
     const run = agentRegistry.getRun(req.params.run_id);
     if (!run) { res.status(404).json({ error: { code: "not_found", message: "Run not found" } }); return; }
@@ -688,7 +692,7 @@ export function createAcpServer(
 
   // POST /runs/{run_id}/cancel
   router.post("/runs/:run_id/cancel", async (req, res) => {
-    if (!authGate(req, res)) return;
+    if (!authGate(req, res, ["reviewer", "operator"])) return;
     const run = agentRegistry.getRun(req.params.run_id);
     if (!run) {
       res.status(404).json({ error: { code: "not_found", message: "Run not found" } });
@@ -883,7 +887,7 @@ export function createAcpServer(
   }
 
   router.post("/runs/:run_id/events", async (req, res) => {
-    if (!authGate(req, res)) return;
+    if (!authGate(req, res, ["agent", "operator"])) return;
 
     const run = agentRegistry.getRun(req.params.run_id);
     if (!run) { res.status(404).json({ error: { code: "not_found", message: "Run not found" } }); return; }
@@ -1095,7 +1099,7 @@ export function createAcpServer(
 
   // GET /session/{session_id}
   router.get("/session/:session_id", (req, res) => {
-    if (!authGate(req, res)) return;
+    if (!authGate(req, res, ["reviewer", "operator"])) return;
     const session = workSessions.get(req.params.session_id);
     if (!session) { res.status(404).json({ error: { code: "not_found", message: "Session not found" } }); return; }
 
@@ -1121,7 +1125,7 @@ export function createAcpServer(
   });
 
   router.get("/approvals/:approval_id", (req, res) => {
-    if (!authGate(req, res)) return;
+    if (!authGate(req, res, ["agent", "reviewer", "operator"])) return;
     const approval = approvalRequests?.get(req.params.approval_id);
     if (!approval) {
       res.status(404).json({ error: { code: "not_found", message: "Approval request not found" } });
@@ -1137,7 +1141,7 @@ export function createAcpServer(
   // simply re-parks — the human may be away for hours, exactly like the CLI
   // coding agents. A resolved approval returns its decision immediately.
   router.get("/approvals/:approval_id/decision", async (req, res) => {
-    if (!authGate(req, res)) return;
+    if (!authGate(req, res, ["agent", "operator"])) return;
     if (!approvalRequests) {
       res.status(500).json({ error: { code: "server_error", message: "Approval request store unavailable" } });
       return;
@@ -1248,7 +1252,7 @@ export function createAcpServer(
 
   // GET /runs — list runs
   router.get("/runs", (req, res) => {
-    if (!authGate(req, res)) return;
+    if (!authGate(req, res, ["reviewer", "operator"])) return;
     const workspaceId = req.query.workspace_id as string | undefined;
     const limit = parseInt(req.query.limit as string, 10) || 20;
     const runs = agentRegistry.listRuns(workspaceId, limit);

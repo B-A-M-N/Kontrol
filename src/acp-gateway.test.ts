@@ -174,6 +174,59 @@ try {
   }
 
   {
+    const root = await mkdtemp(join(tmpdir(), "kontrol-acp-roles-"));
+    tempDirs.push(root);
+    const db = openDatabase(root);
+    seedWorkspace(root, "ws-roles");
+    const workSessions = createWorkSessionManager(db);
+    const agentRegistry = createAgentRegistryManager(db);
+    const run = agentRegistry.createRun({
+      agentName: "role-agent",
+      workspaceSessionId: "ws-roles",
+      workSessionId: "wsess-roles",
+      inputPreview: "role test",
+      status: "running",
+    });
+
+    const app = express();
+    app.use(express.json());
+    app.use("/acp", createAcpServer(
+      { getWorkspace: () => ({ id: "ws-roles", root: "/tmp", mode: "checkout" }) } as any,
+      workSessions,
+      agentRegistry,
+      "operator-secret",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      "agent-secret",
+      "reviewer-secret",
+    ));
+    const acpServer = app.listen(0, "127.0.0.1");
+    servers.push(acpServer);
+    await new Promise<void>((resolve) => acpServer.once("listening", resolve));
+    const addr = acpServer.address();
+    const port = typeof addr === "object" && addr ? addr.port : 0;
+    const base = `http://127.0.0.1:${port}/acp`;
+
+    const agentList = await fetch(`${base}/agents`, { headers: { Authorization: "Bearer agent-secret" } });
+    assert.equal(agentList.status, 403, "agent secret cannot enumerate registry");
+    const reviewerEvent = await fetch(`${base}/runs/${run.runId}/events`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: "Bearer reviewer-secret" },
+      body: JSON.stringify({ type: "started" }),
+    });
+    assert.equal(reviewerEvent.status, 403, "reviewer secret cannot publish adapter events");
+    const operatorRuns = await fetch(`${base}/runs`, { headers: { Authorization: "Bearer operator-secret" } });
+    assert.equal(operatorRuns.status, 200, "legacy shared secret acts as operator principal");
+
+    workSessions.close();
+    agentRegistry.close();
+  }
+
+  {
     const root = await mkdtemp(join(tmpdir(), "kontrol-acp-gateway-terminal-"));
     tempDirs.push(root);
     const db = openDatabase(root);
