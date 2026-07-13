@@ -58,6 +58,7 @@ import { authorizeWorkSessionAction } from "./work-session-action-guard.js";
 import { verifyWorkerToken, type WorkerTokenClaims } from "./acp-worker-token.mjs";
 import { createApprovalRequestManager } from "./approval-requests.js";
 import { createMissionLedger } from "./mission-ledger.js";
+import { createAgentMessageManager } from "./agent-messages.js";
 
 type Transport = StreamableHTTPServerTransport;
 const WORKSPACE_APP_URI = "ui://kontrol/workspace-app.html";
@@ -747,6 +748,7 @@ function createMcpServer(
   connectionContext?: ConnectionContext,
   reviewWorkflow?: ReviewWorkflowService,
   liveWaiters?: LiveWaiterRegistry,
+  agentMessages?: ReturnType<typeof createAgentMessageManager>,
 ): McpServer {
   const server = new McpServer(
     {
@@ -1834,6 +1836,7 @@ function createMcpServer(
       dispatchOutbox,
       reviewWorkflow,
       missionLedger,
+      agentMessages,
       knownAgents: config.acpKnownAgents,
       sharedSecret: config.acpSharedSecret,
       // Role is derived from the AUTHENTICATED envelope only. A connection is a
@@ -1921,6 +1924,7 @@ export function createServer(config = loadConfig()): RunningServer {
   const dispatchOutbox = createDispatchOutbox(db);
   const approvalRequests = createApprovalRequestManager(db);
   const missionLedger = createMissionLedger(db);
+  const agentMessages = createAgentMessageManager(db);
   const reviewWorkflow = createReviewWorkflowService({
     workSessions,
     eventStore,
@@ -2219,6 +2223,7 @@ export function createServer(config = loadConfig()): RunningServer {
           connectionContext,
           reviewWorkflow,
           liveWaiters,
+          agentMessages,
         );
         await server.connect(transport);
       } else {
@@ -2253,6 +2258,7 @@ export function createServer(config = loadConfig()): RunningServer {
       dispatchOutbox,
       reviewWorkflow,
       missionLedger,
+      agentMessages,
       knownAgents: config.acpKnownAgents,
       sharedSecret: config.acpSharedSecret,
       liveWaiters,
