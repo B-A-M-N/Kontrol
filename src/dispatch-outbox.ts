@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, asc, eq, lt } from "drizzle-orm";
+import { and, asc, eq, lt, lte, or } from "drizzle-orm";
 import { openDatabase, type DatabaseHandle } from "./db/client.js";
 import { dispatchOutbox, type DispatchOutboxRow } from "./db/schema.js";
 
@@ -34,11 +34,16 @@ export interface DispatchOutbox {
   /** Reap expired claims back to pending. Returns count requeued. */
   reapExpiredClaims(leaseMs: number): number;
 
+  /** Release a claimed event without recording a failed attempt. */
+  release(id: string, retryDelayMs?: number, note?: string): void;
+
   markCompleted(id: string): void;
 
   markFailed(id: string, error: string, retryDelayMs: number): void;
 
   listPending(limit?: number): DispatchOutboxEvent[];
+
+  hasActive(eventType: string, aggregateId: string): boolean;
 
   close(): void;
 }
@@ -91,7 +96,7 @@ export function createDispatchOutbox(
     const candidate = database.db
       .select()
       .from(dispatchOutbox)
-      .where(and(eq(dispatchOutbox.status, "pending"), lt(dispatchOutbox.availableAt, now)))
+      .where(and(eq(dispatchOutbox.status, "pending"), lte(dispatchOutbox.availableAt, now)))
       .orderBy(asc(dispatchOutbox.availableAt))
       .limit(1)
       .get();
@@ -115,7 +120,7 @@ export function createDispatchOutbox(
   }
 
   function reapExpiredClaims(leaseMs: number): number {
-    const cutoff = new Date(Date.now() - leaseMs).toISOString();
+    const cutoff = new Date().toISOString();
     const rows = database.db
       .select()
       .from(dispatchOutbox)
@@ -130,6 +135,21 @@ export function createDispatchOutbox(
         .run();
     }
     return rows.length;
+  }
+
+  function release(id: string, retryDelayMs = 0, note?: string): void {
+    const availableAt = new Date(Date.now() + retryDelayMs).toISOString();
+    database.db
+      .update(dispatchOutbox)
+      .set({
+        status: "pending",
+        claimedBy: null,
+        claimExpiresAt: null,
+        availableAt,
+        lastError: note ?? null,
+      })
+      .where(and(eq(dispatchOutbox.id, id), eq(dispatchOutbox.status, "claimed")))
+      .run();
   }
 
   function markCompleted(id: string): void {
@@ -178,6 +198,20 @@ export function createDispatchOutbox(
       .map(rowToEvent);
   }
 
+  function hasActive(eventType: string, aggregateId: string): boolean {
+    const row = database.db
+      .select({ id: dispatchOutbox.id })
+      .from(dispatchOutbox)
+      .where(and(
+        eq(dispatchOutbox.eventType, eventType),
+        eq(dispatchOutbox.aggregateId, aggregateId),
+        or(eq(dispatchOutbox.status, "pending"), eq(dispatchOutbox.status, "claimed")),
+      ))
+      .limit(1)
+      .get();
+    return Boolean(row);
+  }
+
   function close(): void {
     database.close();
   }
@@ -186,9 +220,11 @@ export function createDispatchOutbox(
     enqueue,
     claimNext,
     reapExpiredClaims,
+    release,
     markCompleted,
     markFailed,
     listPending,
+    hasActive,
     close,
   };
 }

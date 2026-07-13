@@ -14,6 +14,7 @@ import { TERMINAL_STATUSES, type ReviewWorkflowService } from "./review-workflow
 import { authorizeWorkSessionAction } from "./work-session-action-guard.js";
 import type { PrincipalRole } from "./policy-enforcement.js";
 import type { MissionLedger } from "./mission-ledger.js";
+import type { DispatchOutbox, DispatchOutboxEvent } from "./dispatch-outbox.js";
 
 const WORKSPACE_APP_URI = "ui://kontrol/workspace-app.html";
 
@@ -35,6 +36,7 @@ export interface BridgeConfig {
   continuationManager: ContinuationManager;
   /** Authoritative review state machine; both transports must use it. */
   reviewWorkflow: ReviewWorkflowService;
+  dispatchOutbox?: DispatchOutbox;
   missionLedger?: MissionLedger;
   knownAgents: Array<{ name: string; url: string; description?: string }>;
   sharedSecret?: string;
@@ -335,34 +337,51 @@ export async function runContinuationTick(
   // Requeue continuations whose claim lease expired (e.g. a dispatcher crashed
   // mid-dispatch), so they are not stranded forever.
   config.continuationManager.reapExpiredClaims(DEFAULT_CLAIM_LEASE_MS);
+  config.dispatchOutbox?.reapExpiredClaims(DEFAULT_CLAIM_LEASE_MS);
 
-  try {
-    for (const cont of config.continuationManager.listPending()) {
+  const dispatchContinuation = async (
+    cont: Continuation,
+    outboxEvent?: DispatchOutboxEvent,
+  ): Promise<"completed" | "deferred" | "failed"> => {
       // A live agent is already parked on await_review_feedback for this session:
       // the feedback event will wake it directly. Do NOT spawn a second worker.
-      if (liveWaiters.has(cont.sessionId)) continue;
+      if (liveWaiters.has(cont.sessionId)) {
+        outboxEvent
+          ? config.dispatchOutbox?.release(outboxEvent.id, DEFAULT_CLAIM_LEASE_MS, "live waiter attached")
+          : undefined;
+        return "deferred";
+      }
 
       const session = config.workSessions.get(cont.sessionId);
-      if (!session) continue;
+      if (!session) {
+        outboxEvent ? config.dispatchOutbox?.markCompleted(outboxEvent.id) : undefined;
+        return "completed";
+      }
       if (TERMINAL_STATUSES.has(session.status)) {
         supersedeContinuation(cont.id, cont.sessionId, `session is ${session.status}`);
-        continue;
+        outboxEvent ? config.dispatchOutbox?.markCompleted(outboxEvent.id) : undefined;
+        return "completed";
       }
 
       // Atomic claim (CAS): only one dispatcher owns a given continuation.
       const claimed = config.continuationManager.claim(dispatcherId, { id: cont.id });
-      if (!claimed) continue;
+      if (!claimed) {
+        outboxEvent ? config.dispatchOutbox?.markCompleted(outboxEvent.id) : undefined;
+        return "completed";
+      }
       const claimedSession = config.workSessions.get(claimed.sessionId);
       if (!claimedSession || TERMINAL_STATUSES.has(claimedSession.status)) {
         const reason = claimedSession ? `session is ${claimedSession.status}` : "session not found";
         supersedeContinuation(claimed.id, claimed.sessionId, reason);
-        continue;
+        outboxEvent ? config.dispatchOutbox?.markCompleted(outboxEvent.id) : undefined;
+        return "completed";
       }
 
       if (claimed.verdict !== "changes_requested") {
         // Defensive: pending continuations should only be changes_requested.
         config.continuationManager.markCompleted(claimed.id);
-        continue;
+        outboxEvent ? config.dispatchOutbox?.markCompleted(outboxEvent.id) : undefined;
+        return "completed";
       }
 
       const existingRun = config.agentRegistry.getRunByWorkSessionId(claimed.sessionId);
@@ -376,7 +395,10 @@ export async function runContinuationTick(
             reason: "Original ACP run not found",
           },
         });
-        continue;
+        outboxEvent
+          ? config.dispatchOutbox?.markFailed(outboxEvent.id, "Original ACP run not found", DEFAULT_CLAIM_LEASE_MS)
+          : undefined;
+        return "failed";
       }
       const missionPacket = config.missionLedger?.getPacket(claimed.sessionId);
       const preferredAgent = missionPacket?.workOrders[0]?.preferredAgent;
@@ -390,7 +412,10 @@ export async function runContinuationTick(
         // No healthy agent — release the claim so a later wakeup retries it
         // (the lease prevents it from being re-claimed too eagerly after a blip).
         config.continuationManager.release(dispatcherId, { id: claimed.id });
-        continue;
+        outboxEvent
+          ? config.dispatchOutbox?.markFailed(outboxEvent.id, "No healthy agent available", DEFAULT_CLAIM_LEASE_MS)
+          : undefined;
+        return "failed";
       }
 
       try {
@@ -398,7 +423,8 @@ export async function runContinuationTick(
         if (!preDispatchSession || TERMINAL_STATUSES.has(preDispatchSession.status)) {
           const reason = preDispatchSession ? `session is ${preDispatchSession.status}` : "session not found";
           supersedeContinuation(claimed.id, claimed.sessionId, reason);
-          continue;
+          outboxEvent ? config.dispatchOutbox?.markCompleted(outboxEvent.id) : undefined;
+          return "completed";
         }
         if (config.beforeContinuationDispatch) {
           await config.beforeContinuationDispatch(claimed, claimed.sessionId);
@@ -406,7 +432,8 @@ export async function runContinuationTick(
           if (!afterHookSession || TERMINAL_STATUSES.has(afterHookSession.status)) {
             const reason = afterHookSession ? `session is ${afterHookSession.status}` : "session not found";
             supersedeContinuation(claimed.id, claimed.sessionId, reason);
-            continue;
+            outboxEvent ? config.dispatchOutbox?.markCompleted(outboxEvent.id) : undefined;
+            return "completed";
           }
         }
 
@@ -437,7 +464,10 @@ export async function runContinuationTick(
           targetRunId: result.runId,
         });
         if (!delivered) {
-          continue;
+          outboxEvent
+            ? config.dispatchOutbox?.release(outboxEvent.id, DEFAULT_CLAIM_LEASE_MS, "continuation delivery CAS failed")
+            : undefined;
+          return "deferred";
         }
 
         // Publish after the continuation is delivered so subscribers react without
@@ -447,10 +477,53 @@ export async function runContinuationTick(
           sessionId: claimed.sessionId,
           payload: { continuationId: claimed.id, runId: result.runId, remoteRunId: result.remoteRunId, attemptNumber: result.attemptNumber },
         });
+        outboxEvent ? config.dispatchOutbox?.markCompleted(outboxEvent.id) : undefined;
+        return "completed";
       } catch {
         // Dispatch failed — release so a later wakeup retries it.
         config.continuationManager.release(dispatcherId, { id: claimed.id });
+        outboxEvent
+          ? config.dispatchOutbox?.markFailed(outboxEvent.id, "ACP continuation dispatch failed", DEFAULT_CLAIM_LEASE_MS)
+          : undefined;
+        return "failed";
       }
+  };
+
+  try {
+    if (config.dispatchOutbox) {
+      for (const cont of config.continuationManager.listPending()) {
+        if (!config.dispatchOutbox.hasActive("continuation.ready", cont.id)) {
+          config.dispatchOutbox.enqueue({
+            eventType: "continuation.ready",
+            aggregateId: cont.id,
+            payload: {
+              sessionId: cont.sessionId,
+              continuationId: cont.id,
+              revision: cont.reviewEpoch,
+            },
+          });
+        }
+      }
+
+      for (;;) {
+        const event = config.dispatchOutbox.claimNext(dispatcherId, DEFAULT_CLAIM_LEASE_MS);
+        if (!event) break;
+        if (event.eventType !== "continuation.ready") {
+          config.dispatchOutbox.markCompleted(event.id);
+          continue;
+        }
+        const cont = config.continuationManager.get(event.aggregateId);
+        if (!cont || cont.status !== "pending") {
+          config.dispatchOutbox.markCompleted(event.id);
+          continue;
+        }
+        await dispatchContinuation(cont, event);
+      }
+      return;
+    }
+
+    for (const cont of config.continuationManager.listPending()) {
+      await dispatchContinuation(cont);
     }
   } catch {
     // Swallow; next drain retries unclaimed continuations.

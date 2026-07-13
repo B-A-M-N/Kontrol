@@ -47,6 +47,7 @@ import { createAcpServer } from "./acp-server.js";
 import { registerBridgeTools, createContinuationDispatcher, type ContinuationDispatcher, type LiveWaiterRegistry, type BridgeConfig } from "./acp-bridge.js";
 import { createEventStore } from "./event-log.js";
 import { createContinuationManager } from "./continuation.js";
+import { createDispatchOutbox } from "./dispatch-outbox.js";
 import { createReviewWorkflowService, type ReviewWorkflowService } from "./review-workflow.js";
 import { openDatabase, type DatabaseHandle } from "./db/client.js";
 import { createPolicyEngine, type PolicyConfig, type PolicyEngine, type ApprovalScope } from "./policy.js";
@@ -738,6 +739,7 @@ function createMcpServer(
   agentRegistry?: import("./acp-registry.js").AgentRegistryManager,
   eventStore?: import("./event-log.js").EventStore,
   continuationManager?: import("./continuation.js").ContinuationManager,
+  dispatchOutbox?: import("./dispatch-outbox.js").DispatchOutbox,
   policyEngine?: PolicyEngine,
   policyEnforcer?: import("./policy-enforcement.js").PolicyEnforcer,
   approvalRequests?: ReturnType<typeof createApprovalRequestManager>,
@@ -1829,6 +1831,7 @@ function createMcpServer(
       agentRegistry: agentRegistry!,
       eventStore,
       continuationManager: continuationManager!,
+      dispatchOutbox,
       reviewWorkflow,
       missionLedger,
       knownAgents: config.acpKnownAgents,
@@ -1915,6 +1918,7 @@ export function createServer(config = loadConfig()): RunningServer {
   });
   const eventStore = createEventStore(db);
   const continuationManager = createContinuationManager(db);
+  const dispatchOutbox = createDispatchOutbox(db);
   const approvalRequests = createApprovalRequestManager(db);
   const missionLedger = createMissionLedger(db);
   const reviewWorkflow = createReviewWorkflowService({
@@ -1926,6 +1930,7 @@ export function createServer(config = loadConfig()): RunningServer {
     workspaces,
     reviewCheckpoints,
     missionLedger,
+    dispatchOutbox,
   });
   // Shared live-waiter registry: the singleton dispatcher and every MCP client
   // consult the SAME instance, so a parked agent suppresses duplicate dispatch
@@ -2206,6 +2211,7 @@ export function createServer(config = loadConfig()): RunningServer {
           agentRegistry,
           eventStore,
           continuationManager,
+          dispatchOutbox,
           policyEngine,
           policyEnforcer,
           approvalRequests,
@@ -2244,6 +2250,7 @@ export function createServer(config = loadConfig()): RunningServer {
       agentRegistry,
       eventStore,
       continuationManager,
+      dispatchOutbox,
       reviewWorkflow,
       missionLedger,
       knownAgents: config.acpKnownAgents,
@@ -2265,6 +2272,7 @@ export function createServer(config = loadConfig()): RunningServer {
       dispatcher?.stop();
       eventStore.close();
       continuationManager.close();
+      dispatchOutbox.close();
       processSessions.shutdown();
       oauthProvider?.close();
       workspaceStore.close?.();
