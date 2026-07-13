@@ -166,6 +166,26 @@ KONTROL_SKILL_PATHS="$HOME/.claude/skills,$HOME/company/skills" \
 npx @b-a-m-n/kontrol serve
 ```
 
+## ACP Stdio Duplex Adapter
+
+Kontrol includes a generic stdio JSON-RPC ACP adapter for agents that speak the
+duplex Agent Client Protocol directly over stdin/stdout:
+
+```bash
+ACP_STDIO_AGENT_NAME=my-agent \
+ACP_STDIO_COMMAND=/path/to/agent \
+ACP_STDIO_ARGS_JSON='["acp"]' \
+ACP_STDIO_DISPATCH_METHOD=session/prompt \
+ACP_STDIO_ADAPTER_PORT=9921 \
+node scripts/acp-stdio-duplex-adapter.mjs
+```
+
+The adapter registers as a normal Kontrol ACP peer and uses the reusable
+`createAcpDuplex` transport. Agent-initiated `session/request_permission` calls
+are converted into Kontrol approval requests and parked until the reviewer
+decides. Hermes currently uses `scripts/acp-hermes-native-adapter.mjs`, which
+bridges Hermes's Python ACP client into the same Kontrol approval/event system.
+
 ## Logging
 
 | Variable | Default |
