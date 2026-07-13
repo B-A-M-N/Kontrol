@@ -25,6 +25,7 @@ const migrations: Migration[] = [
   { version: 16, name: "work-session-snapshot-binding", up: migrateWorkSessionSnapshotBinding },
   { version: 17, name: "supervisor-mission-ledger", up: migrateSupervisorMissionLedger },
   { version: 18, name: "mission-scope-guard", up: migrateMissionScopeGuard },
+  { version: 19, name: "workspace-leases", up: migrateWorkspaceLeases },
 ];
 
 /**
@@ -49,6 +50,29 @@ function migrateMissionScopeGuard(sqlite: Database.Database): void {
   if (!missionCols.includes("max_correction_rounds")) {
     sqlite.exec("alter table mission_contracts add column max_correction_rounds integer not null default 5");
   }
+}
+
+function migrateWorkspaceLeases(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table if not exists workspace_leases (
+      canonical_root text primary key,
+      workspace_session_id text not null,
+      work_session_id text not null,
+      lease_kind text not null default 'modify',
+      owner_instance_id text not null,
+      acquired_at text not null,
+      heartbeat_at text not null,
+      expires_at text not null,
+      foreign key (workspace_session_id) references workspace_sessions(id) on delete cascade,
+      foreign key (work_session_id) references work_sessions(id) on delete cascade
+    );
+
+    create index if not exists workspace_leases_session_idx
+      on workspace_leases(work_session_id);
+
+    create index if not exists workspace_leases_expires_idx
+      on workspace_leases(expires_at);
+  `);
 }
 
 export function migrateDatabase(sqlite: Database.Database): void {

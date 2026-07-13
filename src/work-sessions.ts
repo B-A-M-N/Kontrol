@@ -3,10 +3,12 @@ import { eq, and, desc, sql } from "drizzle-orm";
 import { openDatabase, type DatabaseHandle } from "./db/client.js";
 import {
   workSessions,
+  workspaceLeases,
   workSessionSubmissions,
   workSessionFeedback,
   workSessionToolEvents,
   type WorkSessionRow,
+  type WorkspaceLeaseRow,
   type WorkSessionSubmissionRow,
   type WorkSessionFeedbackRow,
   type WorkSessionToolEventRow,
@@ -87,6 +89,21 @@ export interface ToolEvent {
   createdAt: string;
 }
 
+export interface WorkspaceLease {
+  canonicalRoot: string;
+  workspaceSessionId: string;
+  workSessionId: string;
+  leaseKind: "modify";
+  ownerInstanceId: string;
+  acquiredAt: string;
+  heartbeatAt: string;
+  expiresAt: string;
+}
+
+export type WorkspaceLeaseResult =
+  | { acquired: true; lease: WorkspaceLease }
+  | { acquired: false; conflictingWorkSessionId: string; workspaceSessionId: string; expiresAt: string };
+
 export interface WorkSessionManager {
   create(input: {
     workspaceSessionId: string;
@@ -97,6 +114,14 @@ export interface WorkSessionManager {
   get(id: string): WorkSession | undefined;
   listByWorkspace(workspaceSessionId: string, limit?: number): WorkSession[];
   updateStatus(id: string, status: WorkSessionStatus): void;
+  acquireWorkspaceLease(input: {
+    canonicalRoot: string;
+    workspaceSessionId: string;
+    workSessionId: string;
+    ownerInstanceId?: string;
+    ttlMs?: number;
+  }): WorkspaceLeaseResult;
+  releaseWorkspaceLeasesForSession(workSessionId: string): number;
   submitForReview(input: {
     workSessionId: string;
     diff?: string;
@@ -206,6 +231,81 @@ class SqliteWorkSessionManager implements WorkSessionManager {
       .set({ status, updatedAt: now })
       .where(eq(workSessions.id, id))
       .run();
+    if (isTerminalStatus(status)) {
+      this.releaseWorkspaceLeasesForSession(id);
+    }
+  }
+
+  acquireWorkspaceLease(input: {
+    canonicalRoot: string;
+    workspaceSessionId: string;
+    workSessionId: string;
+    ownerInstanceId?: string;
+    ttlMs?: number;
+  }): WorkspaceLeaseResult {
+    const now = new Date();
+    const nowIso = now.toISOString();
+    const expiresAt = new Date(now.getTime() + (input.ttlMs ?? 60 * 60 * 1000)).toISOString();
+    const ownerInstanceId = input.ownerInstanceId ?? process.pid.toString();
+
+    return this.database.db.transaction(() => {
+      this.database.db
+        .delete(workspaceLeases)
+        .where(sql`${workspaceLeases.expiresAt} < ${nowIso}`)
+        .run();
+
+      const existing = this.database.db
+        .select()
+        .from(workspaceLeases)
+        .where(eq(workspaceLeases.canonicalRoot, input.canonicalRoot))
+        .get();
+
+      if (existing && existing.workSessionId !== input.workSessionId) {
+        return {
+          acquired: false as const,
+          conflictingWorkSessionId: existing.workSessionId,
+          workspaceSessionId: existing.workspaceSessionId,
+          expiresAt: existing.expiresAt,
+        };
+      }
+
+      if (existing) {
+        this.database.db
+          .update(workspaceLeases)
+          .set({ heartbeatAt: nowIso, expiresAt, ownerInstanceId })
+          .where(eq(workspaceLeases.canonicalRoot, input.canonicalRoot))
+          .run();
+      } else {
+        this.database.db
+          .insert(workspaceLeases)
+          .values({
+            canonicalRoot: input.canonicalRoot,
+            workspaceSessionId: input.workspaceSessionId,
+            workSessionId: input.workSessionId,
+            leaseKind: "modify",
+            ownerInstanceId,
+            acquiredAt: nowIso,
+            heartbeatAt: nowIso,
+            expiresAt,
+          })
+          .run();
+      }
+
+      const lease = this.database.db
+        .select()
+        .from(workspaceLeases)
+        .where(eq(workspaceLeases.canonicalRoot, input.canonicalRoot))
+        .get();
+      if (!lease) throw new Error("Workspace lease acquisition failed");
+      return { acquired: true as const, lease: rowToWorkspaceLease(lease) };
+    });
+  }
+
+  releaseWorkspaceLeasesForSession(workSessionId: string): number {
+    const result = this.database.sqlite
+      .prepare("delete from workspace_leases where work_session_id = ?")
+      .run(workSessionId);
+    return result.changes;
   }
 
   submitForReview(input: {
@@ -327,6 +427,9 @@ class SqliteWorkSessionManager implements WorkSessionManager {
         .set({ status: nextStatus, updatedAt: now })
         .where(eq(workSessions.id, input.workSessionId))
         .run();
+      if (isTerminalStatus(nextStatus)) {
+        this.releaseWorkspaceLeasesForSession(input.workSessionId);
+      }
     });
 
     return feedback;
@@ -502,6 +605,23 @@ class SqliteWorkSessionManager implements WorkSessionManager {
       latestFeedback: latestSubmission?.feedback,
     };
   }
+}
+
+function rowToWorkspaceLease(row: WorkspaceLeaseRow): WorkspaceLease {
+  return {
+    canonicalRoot: row.canonicalRoot,
+    workspaceSessionId: row.workspaceSessionId,
+    workSessionId: row.workSessionId,
+    leaseKind: "modify",
+    ownerInstanceId: row.ownerInstanceId,
+    acquiredAt: row.acquiredAt,
+    heartbeatAt: row.heartbeatAt,
+    expiresAt: row.expiresAt,
+  };
+}
+
+function isTerminalStatus(status: WorkSessionStatus): boolean {
+  return status === "approved" || status === "rejected" || status === "cancelled" || status === "failed" || status === "failed_protocol";
 }
 
 function rowToSubmission(row: WorkSessionSubmissionRow): WorkSessionSubmission {

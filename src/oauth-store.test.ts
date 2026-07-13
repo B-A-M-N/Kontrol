@@ -59,6 +59,7 @@ async function testDatabaseConfiguration(stateDir: string): Promise<void> {
       { version: 16, name: "work-session-snapshot-binding" },
       { version: 17, name: "supervisor-mission-ledger" },
       { version: 18, name: "mission-scope-guard" },
+      { version: 19, name: "workspace-leases" },
     ]);
   } finally {
     database.close();

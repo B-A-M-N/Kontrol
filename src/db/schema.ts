@@ -144,6 +144,28 @@ export const workSessionToolEvents = sqliteTable("work_session_tool_events", {
 
 export type WorkSessionRow = typeof workSessions.$inferSelect;
 export type NewWorkSessionRow = typeof workSessions.$inferInsert;
+
+export const workspaceLeases = sqliteTable("workspace_leases", {
+  canonicalRoot: text("canonical_root").primaryKey(),
+  workspaceSessionId: text("workspace_session_id")
+    .notNull()
+    .references(() => workspaceSessions.id, { onDelete: "cascade" }),
+  workSessionId: text("work_session_id")
+    .notNull()
+    .references(() => workSessions.id, { onDelete: "cascade" }),
+  leaseKind: text("lease_kind").notNull().default("modify"),
+  ownerInstanceId: text("owner_instance_id").notNull(),
+  acquiredAt: text("acquired_at").notNull(),
+  heartbeatAt: text("heartbeat_at").notNull(),
+  expiresAt: text("expires_at").notNull(),
+}, (table) => [
+  index("workspace_leases_session_idx").on(table.workSessionId),
+  index("workspace_leases_expires_idx").on(table.expiresAt),
+]);
+
+export type WorkspaceLeaseRow = typeof workspaceLeases.$inferSelect;
+export type NewWorkspaceLeaseRow = typeof workspaceLeases.$inferInsert;
+
 export type WorkSessionSubmissionRow = typeof workSessionSubmissions.$inferSelect;
 export type NewWorkSessionSubmissionRow = typeof workSessionSubmissions.$inferInsert;
 export type WorkSessionFeedbackRow = typeof workSessionFeedback.$inferSelect;

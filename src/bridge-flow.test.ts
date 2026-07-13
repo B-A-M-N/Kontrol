@@ -445,6 +445,11 @@ try {
     assert.equal(agentRegistry.getRun(r.structuredContent.runId)!.agentName, "cli-coding-agent");
     assert.equal(workSessions.get(r.structuredContent.workSessionId)!.completionPolicy, "webui_approval_required");
 
+    const busy = await callReviewer("submit_to_coding_agent", { task: "second checkout worker", workspaceSessionId: WS });
+    assert.ok(busy.isError, "second modifying dispatch in same checkout is rejected");
+    assert.match(String(busy.content[0]?.text ?? ""), /already controlled/i, "busy checkout message names the conflict");
+    await callReviewer("cancel_work_session", { sessionId: r.structuredContent.workSessionId });
+
     const legacySessionId = workSessions.create({
       workspaceSessionId: WS,
       submittedBy: "webui",
@@ -454,10 +459,12 @@ try {
     assert.ok(!legacy.isError, "legacy sessionId alias resolves workspace from existing work session");
     assert.equal(legacy.structuredContent.workSessionId, legacySessionId);
     assert.equal(receivedRuns.at(-1)?.workspace_root, "/tmp", "legacy alias dispatch still supplies workspace_root");
+    await callReviewer("cancel_work_session", { sessionId: legacySessionId });
 
     const publicAlias = await callReviewer("submit_to_coding_agent", { task: "public workspace alias", workspaceId: WS });
     assert.ok(!publicAlias.isError, "public workspaceId alias dispatches");
     assert.equal(publicAlias.structuredContent.workspaceSessionId, WS);
+    await callReviewer("cancel_work_session", { sessionId: publicAlias.structuredContent.workSessionId });
 
     const mimo = await callReviewer("submit_to_coding_agent", {
       task: "do a MIMO thing",
@@ -467,6 +474,7 @@ try {
     assert.ok(!mimo.isError, "submit_to_coding_agent can target mimo-code");
     assert.equal(agentRegistry.getRun(mimo.structuredContent.runId)!.agentName, "mimo-code");
     assert.equal(receivedRuns.at(-1)?.agent_name, "mimo-code", "initial dispatch uses selected agent name");
+    await callReviewer("cancel_work_session", { sessionId: mimo.structuredContent.workSessionId });
 
     const unsafeUrl = await callReviewer("call_acp_agent", {
       agentName: "cli-coding-agent",
@@ -483,6 +491,7 @@ try {
     });
     assert.ok(!generic.isError, "call_acp_agent routes through registered agent with workspace");
     assert.equal(receivedRuns.at(-1)?.workspace_root, "/tmp", "call_acp_agent supplies workspace_root");
+    await callReviewer("cancel_work_session", { sessionId: generic.structuredContent.workSessionId });
   }
 
   // ── Scenario 4b: gated sessions enforce action guard + exact artifact approval ──

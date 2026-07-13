@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { realpath } from "node:fs/promises";
 import { Router } from "express";
 import type { Request, Response } from "express";
 import type { WorkspaceRegistry } from "./workspaces.js";
@@ -38,6 +39,14 @@ const ACP_AGENTS = [
     description: "Submit completed work (diff/checkpoint) to the Kontrol WebUI for human review. (Ralphie Muntz Loop terminus: the WebUI's 'A-okay' is the only completion criterion.)",
   },
 ];
+
+const MUTATING_LOCAL_AGENTS = new Set([
+  "kontrol-write",
+  "kontrol-edit",
+  "kontrol-shell",
+  "kontrol-review",
+  "kontrol-submit-work-to-webui",
+]);
 
 export function createAcpServer(
   workspaces: WorkspaceRegistry,
@@ -130,7 +139,7 @@ export function createAcpServer(
       submittedBy: string;
       title: string;
     },
-  ): { workspaceId: string; workspaceRoot: string; session: ReturnType<WorkSessionManager["create"]> } | undefined {
+  ): { workspaceId: string; workspaceRoot: string; session: ReturnType<WorkSessionManager["create"]>; createdSession: boolean } | undefined {
     const suppliedWorkSessionId = input.work_session_id ?? input.session_id;
     const suppliedWorkspaceId = input.workspace_id ?? input.workspace_session_id;
 
@@ -169,15 +178,62 @@ export function createAcpServer(
       return undefined;
     }
 
+    let createdSession = false;
     if (!session) {
       session = workSessions.create({
         workspaceSessionId: workspaceId,
         submittedBy: input.submittedBy,
         title: input.title,
       });
+      createdSession = true;
     }
 
-    return { workspaceId, workspaceRoot, session };
+    return { workspaceId, workspaceRoot, session, createdSession };
+  }
+
+  async function acquireCheckoutModifyLease(
+    res: Response,
+    workspaceId: string,
+    workspaceRoot: string,
+    workSessionId: string,
+  ): Promise<boolean> {
+    let workspaceMode = "checkout";
+    try {
+      workspaceMode = workspaces.getWorkspace(workspaceId).mode;
+    } catch {
+      workspaceMode = "checkout";
+    }
+    if (workspaceMode !== "checkout") return true;
+
+    let canonicalRoot: string;
+    try {
+      canonicalRoot = await realpath(workspaceRoot);
+    } catch (error) {
+      res.status(400).json({
+        error: {
+          code: "invalid_workspace",
+          message: `Unable to resolve checkout root: ${error instanceof Error ? error.message : String(error)}`,
+        },
+      });
+      return false;
+    }
+
+    const lease = workSessions.acquireWorkspaceLease({
+      canonicalRoot,
+      workspaceSessionId: workspaceId,
+      workSessionId,
+    });
+    if (lease.acquired) return true;
+    res.status(409).json({
+      error: {
+        code: "checkout_busy",
+        message: `Checkout is already controlled by work session ${lease.conflictingWorkSessionId}. Use an isolated worktree or cancel the existing session before dispatching another modifying worker.`,
+        conflicting_work_session_id: lease.conflictingWorkSessionId,
+        workspace_session_id: lease.workspaceSessionId,
+        expires_at: lease.expiresAt,
+      },
+    });
+    return false;
   }
 
   // GET /ping
@@ -317,7 +373,11 @@ export function createAcpServer(
         title: `${agent_name}: ${taskText.slice(0, 100)}`,
       });
       if (!context) return;
-      const { session, workspaceRoot } = context;
+      const { session, workspaceRoot, createdSession } = context;
+      if (!(await acquireCheckoutModifyLease(res, session.workspaceSessionId, workspaceRoot, session.id))) {
+        if (createdSession) workSessions.updateStatus(session.id, "cancelled");
+        return;
+      }
 
       const run = agentRegistry.createRun({ agentName: agent_name, workspaceSessionId: session.workspaceSessionId, workSessionId: session.id, inputPreview: taskText.slice(0, 500), webhookUrl: webhook_url, status: "running" });
 
@@ -370,7 +430,11 @@ export function createAcpServer(
       title: `${agent_name}: ${taskText.slice(0, 100)}`,
     });
     if (!context) return;
-    const { session } = context;
+    const { session, workspaceRoot, createdSession } = context;
+    if (MUTATING_LOCAL_AGENTS.has(agent_name) && !(await acquireCheckoutModifyLease(res, session.workspaceSessionId, workspaceRoot, session.id))) {
+      if (createdSession) workSessions.updateStatus(session.id, "cancelled");
+      return;
+    }
 
     const run = agentRegistry.createRun({ agentName: agent_name, workspaceSessionId: session.workspaceSessionId, workSessionId: session.id, inputPreview: taskText.slice(0, 500), webhookUrl: webhook_url, status: "in-progress" });
 

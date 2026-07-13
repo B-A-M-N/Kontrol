@@ -1,5 +1,6 @@
 import * as z from "zod/v4";
 import { createHash } from "node:crypto";
+import { realpath } from "node:fs/promises";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { WorkSessionManager } from "./work-sessions.js";
@@ -170,6 +171,41 @@ function requireWorkSessionRead(config: BridgeConfig, sessionId: string) {
   if (isReviewer(config.principalRole)) return null;
   if (config.principalRole === "worker" && config.connectionWorkSessionId === sessionId) return null;
   return forbidden(config.principalRole, "work-session read");
+}
+
+async function acquireCheckoutModifyLease(config: BridgeConfig, workspaceSessionId: string, workSessionId: string) {
+  const workspace = config.workspaces.getWorkspace(workspaceSessionId);
+  if (workspace.mode !== "checkout") return null;
+  let canonicalRoot: string;
+  try {
+    canonicalRoot = await realpath(workspace.root);
+  } catch (error) {
+    return {
+      content: [{ type: "text" as const, text: `Unable to resolve checkout root for ${workspaceSessionId}: ${error instanceof Error ? error.message : String(error)}` }],
+      isError: true as const,
+    };
+  }
+  const lease = config.workSessions.acquireWorkspaceLease({
+    canonicalRoot,
+    workspaceSessionId,
+    workSessionId,
+  });
+  if (lease.acquired) return null;
+  return {
+    content: [{
+      type: "text" as const,
+      text: `Checkout is already controlled by work session ${lease.conflictingWorkSessionId}. Use an isolated worktree or cancel the existing session before dispatching another modifying worker.`,
+    }],
+    structuredContent: {
+      conflict: {
+        canonicalRoot,
+        conflictingWorkSessionId: lease.conflictingWorkSessionId,
+        workspaceSessionId: lease.workspaceSessionId,
+        expiresAt: lease.expiresAt,
+      },
+    },
+    isError: true as const,
+  };
 }
 
 function parsePatchFiles(patch: string): Array<{ path: string; operation: "add" | "update" | "delete"; additions: number; removals: number }> {
@@ -986,6 +1022,11 @@ export function registerBridgeTools(
         title: objective.slice(0, 80),
         completionPolicy: "webui_approval_required",
       });
+      const leaseError = await acquireCheckoutModifyLease(config, workspaceSessionId, created.id);
+      if (leaseError) {
+        config.workSessions.updateStatus(created.id, "cancelled");
+        return leaseError;
+      }
       const mission = config.missionLedger.createMission({
         workSessionId: created.id,
         workspaceSessionId,
@@ -1286,6 +1327,7 @@ export function registerBridgeTools(
       // here and hand its ID to the CLI so the agent reuses it for submit_for_review
       // correlation instead of making a disjoint session.
       let wsId = workSessionId;
+      let createdSessionForDispatch = false;
       if (!wsId) {
         const created = config.workSessions.create({
           workspaceSessionId,
@@ -1294,6 +1336,7 @@ export function registerBridgeTools(
           completionPolicy: completionPolicy ?? "webui_approval_required",
         });
         wsId = created.id;
+        createdSessionForDispatch = true;
       } else {
         // P1 #5: when an existing session is supplied, validate it before
         // reusing — a mismatched / terminal / non-review session must not be
@@ -1321,6 +1364,12 @@ export function registerBridgeTools(
             isError: true,
           };
         }
+      }
+
+      const leaseError = await acquireCheckoutModifyLease(config, workspaceSessionId, wsId);
+      if (leaseError) {
+        if (createdSessionForDispatch) config.workSessions.updateStatus(wsId, "cancelled");
+        return leaseError;
       }
 
       if (missionContract && !config.missionLedger) {
@@ -2164,6 +2213,11 @@ export function registerBridgeTools(
         title: task.slice(0, 80),
         completionPolicy: "webui_approval_required",
       }).id;
+      const leaseError = await acquireCheckoutModifyLease(config, workspaceSessionId, wsId);
+      if (leaseError) {
+        if (!workSessionId) config.workSessions.updateStatus(wsId, "cancelled");
+        return leaseError;
+      }
 
       try {
         const result = await callRemoteAgent(
@@ -2277,6 +2331,11 @@ export function registerBridgeTools(
           title: task.slice(0, 80),
           completionPolicy: "webui_approval_required",
         }).id;
+        const leaseError = await acquireCheckoutModifyLease(config, resolvedWorkspaceSessionId, resolvedWorkSessionId);
+        if (leaseError) {
+          if (!resolved.workSessionId) config.workSessions.updateStatus(resolvedWorkSessionId, "cancelled");
+          return leaseError;
+        }
         try {
           const result = await callRemoteAgent(
             { agentRegistry: config.agentRegistry, workspaces: config.workspaces, workSessions: config.workSessions, sharedSecret: config.sharedSecret },
