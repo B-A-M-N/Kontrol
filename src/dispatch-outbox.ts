@@ -9,6 +9,7 @@ export interface DispatchOutboxEvent {
   id: string;
   eventType: string;
   aggregateId: string;
+  aggregateRevision: number;
   payload: Record<string, unknown>;
   status: OutboxStatus;
   attemptCount: number;
@@ -24,6 +25,7 @@ export interface DispatchOutbox {
   enqueue(input: {
     eventType: string;
     aggregateId: string;
+    aggregateRevision?: number;
     payload?: Record<string, unknown>;
     availableAt?: string;
   }): DispatchOutboxEvent;
@@ -44,6 +46,8 @@ export interface DispatchOutbox {
   listPending(limit?: number): DispatchOutboxEvent[];
 
   hasActive(eventType: string, aggregateId: string): boolean;
+  hasLogical(eventType: string, aggregateId: string, aggregateRevision?: number): boolean;
+  redriveDeadLetter(eventType: string, aggregateId: string, aggregateRevision?: number): DispatchOutboxEvent | null;
 
   close(): void;
 }
@@ -57,10 +61,15 @@ export function createDispatchOutbox(
   function enqueue(input: {
     eventType: string;
     aggregateId: string;
+    aggregateRevision?: number;
     payload?: Record<string, unknown>;
     availableAt?: string;
   }): DispatchOutboxEvent {
     const now = new Date().toISOString();
+    const aggregateRevision = input.aggregateRevision ?? payloadRevision(input.payload) ?? 0;
+    const existing = getByLogical(input.eventType, input.aggregateId, aggregateRevision);
+    if (existing) return existing;
+
     const id = `out_${randomUUID()}`;
 
     database.db
@@ -69,6 +78,7 @@ export function createDispatchOutbox(
         id,
         eventType: input.eventType,
         aggregateId: input.aggregateId,
+        aggregateRevision,
         payloadJson: JSON.stringify(input.payload ?? {}),
         status: "pending",
         attemptCount: 0,
@@ -81,6 +91,7 @@ export function createDispatchOutbox(
       id,
       eventType: input.eventType,
       aggregateId: input.aggregateId,
+      aggregateRevision,
       payload: input.payload ?? {},
       status: "pending",
       attemptCount: 0,
@@ -212,6 +223,45 @@ export function createDispatchOutbox(
     return Boolean(row);
   }
 
+  function hasLogical(eventType: string, aggregateId: string, aggregateRevision = 0): boolean {
+    return Boolean(getByLogical(eventType, aggregateId, aggregateRevision));
+  }
+
+  function redriveDeadLetter(eventType: string, aggregateId: string, aggregateRevision = 0): DispatchOutboxEvent | null {
+    const existing = getByLogical(eventType, aggregateId, aggregateRevision);
+    if (!existing || existing.status !== "dead_lettered") return null;
+    const now = new Date().toISOString();
+    database.db
+      .update(dispatchOutbox)
+      .set({
+        status: "pending",
+        attemptCount: 0,
+        availableAt: now,
+        claimedBy: null,
+        claimExpiresAt: null,
+        lastError: null,
+        completedAt: null,
+      })
+      .where(eq(dispatchOutbox.id, existing.id))
+      .run();
+    const row = database.db.select().from(dispatchOutbox).where(eq(dispatchOutbox.id, existing.id)).get();
+    return row ? rowToEvent(row) : null;
+  }
+
+  function getByLogical(eventType: string, aggregateId: string, aggregateRevision: number): DispatchOutboxEvent | null {
+    const row = database.db
+      .select()
+      .from(dispatchOutbox)
+      .where(and(
+        eq(dispatchOutbox.eventType, eventType),
+        eq(dispatchOutbox.aggregateId, aggregateId),
+        eq(dispatchOutbox.aggregateRevision, aggregateRevision),
+      ))
+      .limit(1)
+      .get();
+    return row ? rowToEvent(row) : null;
+  }
+
   function close(): void {
     database.close();
   }
@@ -225,8 +275,17 @@ export function createDispatchOutbox(
     markFailed,
     listPending,
     hasActive,
+    hasLogical,
+    redriveDeadLetter,
     close,
   };
+}
+
+function payloadRevision(payload: Record<string, unknown> | undefined): number | undefined {
+  const revision = payload?.revision;
+  return typeof revision === "number" && Number.isInteger(revision) && revision >= 0
+    ? revision
+    : undefined;
 }
 
 function rowToEvent(row: DispatchOutboxRow): DispatchOutboxEvent {
@@ -234,6 +293,7 @@ function rowToEvent(row: DispatchOutboxRow): DispatchOutboxEvent {
     id: row.id,
     eventType: row.eventType,
     aggregateId: row.aggregateId,
+    aggregateRevision: row.aggregateRevision ?? 0,
     payload: JSON.parse(row.payloadJson) as Record<string, unknown>,
     status: row.status as OutboxStatus,
     attemptCount: row.attemptCount ?? 0,

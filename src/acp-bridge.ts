@@ -492,10 +492,11 @@ export async function runContinuationTick(
   try {
     if (config.dispatchOutbox) {
       for (const cont of config.continuationManager.listPending()) {
-        if (!config.dispatchOutbox.hasActive("continuation.ready", cont.id)) {
+        if (!config.dispatchOutbox.hasLogical("continuation.ready", cont.id, cont.reviewEpoch)) {
           config.dispatchOutbox.enqueue({
             eventType: "continuation.ready",
             aggregateId: cont.id,
+            aggregateRevision: cont.reviewEpoch,
             payload: {
               sessionId: cont.sessionId,
               continuationId: cont.id,

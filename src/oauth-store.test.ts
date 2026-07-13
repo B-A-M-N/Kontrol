@@ -60,6 +60,7 @@ async function testDatabaseConfiguration(stateDir: string): Promise<void> {
       { version: 17, name: "supervisor-mission-ledger" },
       { version: 18, name: "mission-scope-guard" },
       { version: 19, name: "workspace-leases" },
+      { version: 20, name: "dispatch-outbox-logical-key" },
     ]);
   } finally {
     database.close();
