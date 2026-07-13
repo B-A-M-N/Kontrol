@@ -1085,6 +1085,15 @@ export function createAcpServer(
         : run.workerLeaseUntil,
     });
 
+    // Renew the CHECKOUT lease from the same worker heartbeat. The worker lease
+    // above is short (30s) but the checkout (workspace) lease defaults to 1h and
+    // was previously renewed only at acquire time — so a worker on a long task
+    // would let its checkout lease lapse and another session could seize the
+    // checkout out from under it. Renewal is ownership-scoped and never seizes.
+    if ((body.type === "started" || body.type === "heartbeat") && sessionId) {
+      workSessions.renewWorkspaceLeaseForSession(sessionId);
+    }
+
     // Defect #1: a worker CRASH while the review is still open must not emit the
     // terminal agent.run.failed — the WebUI would drop a resumable session. That
     // case is handled below with the non-terminal worker.attempt.failed event.
