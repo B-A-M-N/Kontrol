@@ -14,7 +14,7 @@ import { authorizeWorkSessionAction } from "./work-session-action-guard.js";
 import type { PrincipalRole } from "./policy-enforcement.js";
 import type { MissionLedger } from "./mission-ledger.js";
 
-const WORKSPACE_APP_URI = "ui://devdesktop/workspace-app.html";
+const WORKSPACE_APP_URI = "ui://kontrol/workspace-app.html";
 
 function workspaceAppModelAndAppMeta() {
   return {
@@ -194,7 +194,7 @@ function parsePatchFiles(patch: string): Array<{ path: string; operation: "add" 
 /**
  * Durable, background continuation dispatcher (Ralphie Muntz Loop auto-driver).
  *
- * Single-instance ownership: the DevSpace process creates ONE dispatcher in
+ * Single-instance ownership: the Kontrol process creates ONE dispatcher in
  * createServer() and shares its liveWaiters with every MCP client's
  * BridgeConfig. It is NOT started per-MCP-initialization (that leaked timers and
  * database scans on every client connect).
@@ -219,7 +219,7 @@ export interface ContinuationDispatcher {
 
 export function createContinuationDispatcher(config: BridgeConfig): ContinuationDispatcher {
   const liveWaiters = config.liveWaiters ?? defaultLiveWaiters;
-  const dispatcherId = "devspace-dispatcher";
+  const dispatcherId = "kontrol-dispatcher";
   let leaseTimer: ReturnType<typeof setTimeout> | null = null;
   let stopped = false;
   let unsub: (() => void) | null = null;
@@ -280,7 +280,7 @@ export async function runContinuationTick(
   config: BridgeConfig,
   liveWaiters: LiveWaiterRegistry = config.liveWaiters ?? defaultLiveWaiters,
 ): Promise<void> {
-  const dispatcherId = "devspace-dispatcher";
+  const dispatcherId = "kontrol-dispatcher";
   const supersedeContinuation = (continuationId: string, sessionId: string, reason: string) => {
     config.continuationManager.supersede(continuationId, reason);
     config.eventStore.appendEvent({
@@ -386,7 +386,7 @@ export async function runContinuationTick(
           throw new Error(result.error ?? "ACP continuation dispatch failed");
         }
 
-        // Persist the REAL devspace run id so reconciliation/delivery records are
+        // Persist the REAL kontrol run id so reconciliation/delivery records are
         // accurate (the dispatcher id is not a run identity).
         const delivered = config.continuationManager.markDelivered({
           id: claimed.id,
@@ -426,7 +426,7 @@ async function defaultResume(
   const task = [
     continuation.promptText,
     missionPrompt,
-    "[DevSpace work session " + continuation.sessionId +
+    "[Kontrol work session " + continuation.sessionId +
       "] Continue from review feedback. When done, call submit_for_review with sessionId=\"" +
       continuation.sessionId + "\", then await_review_feedback(sessionId=\"" +
       continuation.sessionId + "\").",
@@ -455,7 +455,7 @@ function renderMissionPrompt(config: BridgeConfig, workSessionId: string, fallba
   const requiredCriteria = packet.criteria.filter((c) => c.priority === "required");
   const openFindings = packet.findings.filter((f) => ["open", "claimed_resolved"].includes(f.status));
   const lines: string[] = [];
-  lines.push("DevSpace supervised mission contract:");
+  lines.push("Kontrol supervised mission contract:");
   lines.push(`Objective: ${mission.objective ?? fallbackObjective}`);
   lines.push(`Desired outcome: ${mission.desiredOutcome ?? fallbackObjective}`);
   if (workOrder) {
@@ -826,7 +826,7 @@ export function registerBridgeTools(
     }
     const task = input.appendSessionInstructions === false
       ? input.task
-      : `${input.task}\n\n[DevSpace work session ${wsId}] Use this existing session: call submit_for_review with sessionId="${wsId}" when done, then await_review_feedback(sessionId="${wsId}"). Do NOT call start_work_session.`;
+      : `${input.task}\n\n[Kontrol work session ${wsId}] Use this existing session: call submit_for_review with sessionId="${wsId}" when done, then await_review_feedback(sessionId="${wsId}"). Do NOT call start_work_session.`;
     const result = await callRemoteAgent(
       {
         agentRegistry: config.agentRegistry,
@@ -1198,7 +1198,7 @@ export function registerBridgeTools(
         task: z.string().describe("Instruction or task for the coding agent."),
         workspaceId: z.string().optional().describe("Workspace ID from open_workspace. Preferred public name; aliases workspaceSessionId."),
         workspaceSessionId: z.string().optional().describe("Workspace session ID (legacy/internal alias for workspaceId)."),
-        workSessionId: z.string().optional().describe("Optional existing work session ID. If omitted, DevSpace creates one before dispatch so the agent can reuse it for submit_for_review correlation."),
+        workSessionId: z.string().optional().describe("Optional existing work session ID. If omitted, Kontrol creates one before dispatch so the agent can reuse it for submit_for_review correlation."),
         sessionId: z.string().optional().describe("Legacy alias for workSessionId."),
         agentName: z.string().optional().describe("Registered ACP agent name to dispatch to. Defaults to cli-coding-agent; use mimo-code or another registered agent name when available."),
         completionPolicy: z.enum(["agent_completion", "webui_approval_required"]).optional().describe("Completion policy for newly-created work sessions. Defaults to webui_approval_required for reviewed WebUI dispatch."),
@@ -1274,7 +1274,7 @@ export function registerBridgeTools(
       }
       const peer = selection.agent;
 
-      // DevSpace owns work-session creation (Nelson Wiggum Loop): create the session
+      // Kontrol owns work-session creation (Nelson Wiggum Loop): create the session
       // here and hand its ID to the CLI so the agent reuses it for submit_for_review
       // correlation instead of making a disjoint session.
       let wsId = workSessionId;
@@ -1354,7 +1354,7 @@ export function registerBridgeTools(
             agentUrl: peer.url,
             agentName: selectedAgentName,
             task: wsId
-              ? `${dispatchTask}\n\n[DevSpace work session ${wsId}] Use this existing session: call submit_for_review with sessionId="${wsId}" when done, then await_review_feedback(sessionId="${wsId}"). Do NOT call start_work_session.`
+              ? `${dispatchTask}\n\n[Kontrol work session ${wsId}] Use this existing session: call submit_for_review with sessionId="${wsId}" when done, then await_review_feedback(sessionId="${wsId}"). Do NOT call start_work_session.`
               : dispatchTask,
             workspaceSessionId: workspaceSessionId,
             workSessionId: wsId,
@@ -2115,7 +2115,7 @@ export function registerBridgeTools(
         workSessionId: z.string().optional().describe("Optional existing work session ID."),
         sessionId: z.string().optional().describe("Legacy alias for workSessionId."),
         agentUrl: z.string().optional().describe("Deprecated and rejected. Agents must be selected from the trusted registry."),
-        webhookUrl: z.string().optional().describe("Deprecated and rejected. Agent progress is tracked through DevSpace events."),
+        webhookUrl: z.string().optional().describe("Deprecated and rejected. Agent progress is tracked through Kontrol events."),
       },
       outputSchema: { runId: z.string(), workSessionId: z.string().optional(), workspaceSessionId: z.string().optional(), status: z.string(), output: z.string(), error: z.string().optional() },
       _meta: {},
@@ -2154,7 +2154,7 @@ export function registerBridgeTools(
           {
             agentUrl: selection.agent.url,
             agentName,
-            task: `${task}\n\n[DevSpace work session ${wsId}] Use this existing session: call submit_for_review with sessionId="${wsId}" when done, then await_review_feedback(sessionId="${wsId}"). Do NOT call start_work_session.`,
+            task: `${task}\n\n[Kontrol work session ${wsId}] Use this existing session: call submit_for_review with sessionId="${wsId}" when done, then await_review_feedback(sessionId="${wsId}"). Do NOT call start_work_session.`,
             workspaceSessionId,
             workSessionId: wsId,
             mode: "async",
@@ -2263,7 +2263,7 @@ export function registerBridgeTools(
             {
               agentUrl: agent.url,
               agentName: agent.name,
-              task: `${task}\n\n[DevSpace work session ${resolvedWorkSessionId}] Use this existing session: call submit_for_review with sessionId="${resolvedWorkSessionId}" when done, then await_review_feedback(sessionId="${resolvedWorkSessionId}"). Do NOT call start_work_session.`,
+              task: `${task}\n\n[Kontrol work session ${resolvedWorkSessionId}] Use this existing session: call submit_for_review with sessionId="${resolvedWorkSessionId}" when done, then await_review_feedback(sessionId="${resolvedWorkSessionId}"). Do NOT call start_work_session.`,
               workspaceSessionId: resolvedWorkspaceSessionId,
               workSessionId: resolvedWorkSessionId,
               mode: "async",

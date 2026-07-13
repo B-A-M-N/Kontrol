@@ -1,7 +1,7 @@
 /**
- * DevSpace's host-side handler for agent-initiated ACP calls.
+ * Kontrol's host-side handler for agent-initiated ACP calls.
  *
- * This is where the reverse channel of {@link createAcpDuplex} meets DevSpace's
+ * This is where the reverse channel of {@link createAcpDuplex} meets Kontrol's
  * durable approval + policy machinery. When an agent calls
  * `session/request_permission` mid-tool, we create a real approval request,
  * surface it in the WebUI (via the `approval.requested` event), and PARK — with
@@ -34,7 +34,7 @@ function toApprovalOptions(options: RequestPermissionParams["options"]): Approva
   const mapped = options
     .map((o): ApprovalOption | null => {
       if (!o.optionId) return null;
-      // Map ACP option kinds to DevSpace approval effects. Anything not clearly
+      // Map ACP option kinds to Kontrol approval effects. Anything not clearly
       // an allow is treated as a deny effect so the UI renders it correctly.
       const kind = (o.kind ?? "").toLowerCase();
       const effect: ApprovalOption["effect"] = kind.includes("allow") || kind.includes("accept") ? "approve" : "deny";
@@ -45,7 +45,7 @@ function toApprovalOptions(options: RequestPermissionParams["options"]): Approva
   return mapped.length ? mapped : [{ id: "deny", label: "Deny", effect: "deny" }];
 }
 
-export function createDevSpaceDuplexHandler(config: DuplexHandlerConfig): AcpClientHandler {
+export function createKontrolDuplexHandler(config: DuplexHandlerConfig): AcpClientHandler {
   return {
     requestPermission(params: RequestPermissionParams, signal: AbortSignal): Promise<PermissionOutcome> {
       const eventSessionId = config.workSessionId ?? config.workspaceSessionId;

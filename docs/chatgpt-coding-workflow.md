@@ -1,6 +1,6 @@
 # ChatGPT Coding Workflow
 
-Dev Desktop brings a Codex-style coding-agent loop to ChatGPT and other MCP hosts:
+Kontrol brings a Codex-style coding-agent loop to ChatGPT and other MCP hosts:
 inspect the repo, follow local instructions, make scoped edits, run
 verification, and show the user what changed.
 
@@ -26,7 +26,7 @@ Do not reopen the same folder unless:
 
 ## Checkout Mode
 
-Checkout mode is the default. Dev Desktop opens the actual directory:
+Checkout mode is the default. Kontrol opens the actual directory:
 
 ```json
 {
@@ -50,19 +50,19 @@ Use worktree mode for isolated parallel work:
 Managed worktrees are created under:
 
 ```text
-~/.devdesktop/worktrees
+~/.kontrol/worktrees
 ```
 
 Worktree mode requires a Git repository with at least one commit. It starts from
 `HEAD` unless `baseRef` is provided.
 
 Uncommitted source checkout changes are not copied into the managed worktree.
-Dev Desktop reports when the source checkout was dirty so the model can decide how
+Kontrol reports when the source checkout was dirty so the model can decide how
 to proceed with the user.
 
 ## Project Instructions
 
-When a workspace opens, Dev Desktop loads root-level instruction files:
+When a workspace opens, Kontrol loads root-level instruction files:
 
 - `AGENTS.md`
 - `AGENTS.MD`
@@ -79,31 +79,31 @@ new context during later tool calls.
 
 Skills are enabled by default for coding-agent workflows.
 
-Dev Desktop discovers standard Agent Skills from:
+Kontrol discovers standard Agent Skills from:
 
 - `~/.agents/skills`
 - project `.agents/skills`
 
 It also keeps compatibility with:
 
-- `DEVDESKTOP_AGENT_DIR/skills`, defaulting to `~/.codex/skills`
-- additional paths from `DEVDESKTOP_SKILL_PATHS`
+- `KONTROL_AGENT_DIR/skills`, defaulting to `~/.codex/skills`
+- additional paths from `KONTROL_SKILL_PATHS`
 
-Legacy project paths such as `.pi/skills` can be added through `DEVDESKTOP_SKILL_PATHS` when needed.
+Legacy project paths such as `.pi/skills` can be added through `KONTROL_SKILL_PATHS` when needed.
 
 When `open_workspace` returns matching skills, the model should read the
 advertised `SKILL.md` before following that skill.
 
-Skill paths may be outside the workspace. Dev Desktop only permits reading:
+Skill paths may be outside the workspace. Kontrol only permits reading:
 
 - advertised `SKILL.md` files
 - files under a skill directory after that skill's `SKILL.md` has been read
 
-Set `DEVDESKTOP_SKILLS=0` to hide skills from workspace output.
+Set `KONTROL_SKILLS=0` to hide skills from workspace output.
 
 ## Tool Names
 
-Dev Desktop exposes these tool names:
+Kontrol exposes these tool names:
 
 - `open_workspace`
 - `read`
@@ -111,14 +111,14 @@ Dev Desktop exposes these tool names:
 - `edit`
 - `bash`
 
-By default, Dev Desktop also runs in `DEVDESKTOP_TOOL_MODE=minimal`, so dedicated
+By default, Kontrol also runs in `KONTROL_TOOL_MODE=minimal`, so dedicated
 `grep`, `glob`, and `ls` tools are hidden. Use `bash` with command-line tools
 such as `rg`, `find`, and `ls` for search and directory inspection.
 
-Use `DEVDESKTOP_TOOL_MODE=full` to restore dedicated search and directory tools.
+Use `KONTROL_TOOL_MODE=full` to restore dedicated search and directory tools.
 
 The experimental Codex-style surface is enabled with
-`DEVDESKTOP_TOOL_MODE=codex`. It exposes:
+`KONTROL_TOOL_MODE=codex`. It exposes:
 
 - `open_workspace`
 - `read`
@@ -133,12 +133,12 @@ a PTY, or send Ctrl-C. Set `tty: true` only for commands that need a terminal.
 
 ## Show Changes
 
-By default, `DEVDESKTOP_WIDGETS=full`.
+By default, `KONTROL_WIDGETS=full`.
 
-In that mode, Dev Desktop attaches widget UI to the exposed workspace, file, edit,
+In that mode, Kontrol attaches widget UI to the exposed workspace, file, edit,
 and shell tools. The aggregate `show_changes` tool is not exposed by default.
 
-Use `DEVDESKTOP_WIDGETS=off` to disable widget UI, or `DEVDESKTOP_WIDGETS=changes`
+Use `KONTROL_WIDGETS=off` to disable widget UI, or `KONTROL_WIDGETS=changes`
 to expose the aggregate show-changes flow.
 
 ## Shell Use

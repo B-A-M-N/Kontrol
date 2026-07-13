@@ -1,30 +1,30 @@
 <p align="center">
   <picture>
-    <img src="https://raw.githubusercontent.com/BAMN/devdesktop/main/docs/assets/devdesktop-logo-light.png" alt="Dev Desktop logo" width="140">
+    <img src="https://raw.githubusercontent.com/BAMN/kontrol/main/docs/assets/kontrol-logo-light.png" alt="Kontrol logo" width="140">
   </picture>
 </p>
 
-<h1 align="center">Dev Desktop</h1>
+<h1 align="center">Kontrol</h1>
 
 <p align="center">A self-hosted MCP server that lets any AI coding agent read, edit, search, and run code in your local projects — with structured human review loops and policy controls.</p>
 
 <p align="center">
-  <a href="https://www.npmjs.com/package/@bamn/devdesktop"><img alt="npm" src="https://img.shields.io/npm/v/%40bamn%2Fdevdesktop?style=flat-square" /></a>
-  <a href="https://github.com/BAMN/devdesktop/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/BAMN/devdesktop/ci.yml?style=flat-square&branch=main" /></a>
-  <a href="https://github.com/BAMN/devdesktop/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/npm/l/%40bamn%2Fdevdesktop?style=flat-square" /></a>
+  <a href="https://www.npmjs.com/package/@bamn/kontrol"><img alt="npm" src="https://img.shields.io/npm/v/%40bamn%2Fkontrol?style=flat-square" /></a>
+  <a href="https://github.com/BAMN/kontrol/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/BAMN/kontrol/ci.yml?style=flat-square&branch=main" /></a>
+  <a href="https://github.com/BAMN/kontrol/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/npm/l/%40bamn%2Fkontrol?style=flat-square" /></a>
 </p>
 
-[![Dev Desktop connected to a coding agent](https://raw.githubusercontent.com/BAMN/devdesktop/main/docs/assets/devdesktop-screenshot.png)](https://raw.githubusercontent.com/BAMN/devdesktop/main/docs/assets/devdesktop-screenshot.png)
+[![Kontrol connected to a coding agent](https://raw.githubusercontent.com/BAMN/kontrol/main/docs/assets/kontrol-screenshot.png)](https://raw.githubusercontent.com/BAMN/kontrol/main/docs/assets/kontrol-screenshot.png)
 
 **Any MCP-capable agent. Your machine. Your projects. Your rules.**
 
-Dev Desktop is a self-hosted MCP server that exposes your local project files to any AI coding agent — ChatGPT, Claude, Codex, Cursor, or whatever speaks MCP over Streamable HTTP. It adds an event-driven review loop so humans can inspect and approve agent work, and a policy engine so you control which tools and paths require approval.
+Kontrol is a self-hosted MCP server that exposes your local project files to any AI coding agent — ChatGPT, Claude, Codex, Cursor, or whatever speaks MCP over Streamable HTTP. It adds an event-driven review loop so humans can inspect and approve agent work, and a policy engine so you control which tools and paths require approval.
 
 You run it on your machine, expose it through a tunnel you control, and connect any MCP client.
 
 ## What Makes It Different
 
-Most MCP file-server bridges stop at "read/write/edit." Dev Desktop adds three layers on top:
+Most MCP file-server bridges stop at "read/write/edit." Kontrol adds three layers on top:
 
 **Ralphie Muntz Loop** — Agents submit work for human review. The review surface (WebUI or any MCP client) shows the diff. Human approves, requests changes, or rejects. The agent continues from durable feedback state — even if the agent process died and restarted.
 
@@ -36,27 +36,27 @@ Underneath it all is an **event-sourced architecture**: every submission, feedba
 
 ## Installation
 
-Dev Desktop requires Node `>=22.19 <27`.
+Kontrol requires Node `>=22.19 <27`.
 
 ```bash
-npm install -g @bamn/devdesktop
+npm install -g @bamn/kontrol
 ```
 
 Then initialize and start:
 
 ```bash
-devdesktop init
-devdesktop serve
+kontrol init
+kontrol serve
 ```
 
 Or without a global install:
 
 ```bash
-npx @bamn/devdesktop init
-npx @bamn/devdesktop serve
+npx @bamn/kontrol init
+npx @bamn/kontrol serve
 ```
 
-During setup, Dev Desktop asks for:
+During setup, Kontrol asks for:
 
 - the local project folders agents are allowed to open
 - the local port, usually `7676`
@@ -68,10 +68,10 @@ Use the public origin without `/mcp`:
 https://your-tunnel-host.example.com
 ```
 
-When the client connects, Dev Desktop opens an Owner password approval page. Enter the password printed by `devdesktop init`. It's also stored in:
+When the client connects, Kontrol opens an Owner password approval page. Enter the password printed by `kontrol init`. It's also stored in:
 
 ```text
-~/.devdesktop/auth.json
+~/.kontrol/auth.json
 ```
 
 Keep that password private.
@@ -90,18 +90,18 @@ Most users connect through a public HTTPS tunnel:
 https://your-tunnel-host.example.com/mcp
 ```
 
-Dev Desktop speaks standard MCP over Streamable HTTP. Any compatible client works: ChatGPT, Claude, Codex, Cursor, Windsurf, custom tooling.
+Kontrol speaks standard MCP over Streamable HTTP. Any compatible client works: ChatGPT, Claude, Codex, Cursor, Windsurf, custom tooling.
 
 ## OpenAI Secure MCP Tunnel
 
-To connect Dev Desktop to ChatGPT without exposing an inbound port, run it locally and
-route ChatGPT through an [OpenAI Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels). In that setup use `DEVDESKTOP_AUTH_MODE=tunnel`: Dev Desktop binds a loopback address and **disables its own auth gate** on `/mcp`, so ChatGPT connects with **No Authentication**. Access control is delegated to the tunnel and to the OpenAI workspace that owns it. OAuth (the default for public deployments) is intentionally off here, because its authorization server is not reachable through the tunnel.
+To connect Kontrol to ChatGPT without exposing an inbound port, run it locally and
+route ChatGPT through an [OpenAI Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels). In that setup use `KONTROL_AUTH_MODE=tunnel`: Kontrol binds a loopback address and **disables its own auth gate** on `/mcp`, so ChatGPT connects with **No Authentication**. Access control is delegated to the tunnel and to the OpenAI workspace that owns it. OAuth (the default for public deployments) is intentionally off here, because its authorization server is not reachable through the tunnel.
 
 ```bash
-DEVDESKTOP_AUTH_MODE=tunnel
+KONTROL_AUTH_MODE=tunnel
 HOST=127.0.0.1
 PORT=7676
-npx @bamn/devdesktop serve
+npx @bamn/kontrol serve
 ```
 
 Register the server in the tunnel client with **No Authentication**, pointing at the loopback origin:
@@ -134,19 +134,19 @@ Once connected, an agent can open an approved project folder as a workspace and:
 The review loop is event-driven and provider-agnostic:
 
 ```
-Agent submits work → DevDesktop captures diff, emits ReviewRequested
+Agent submits work → Kontrol captures diff, emits ReviewRequested
      ↓
 Human reviews diff in WebUI / any MCP client
      ↓
 Human approves, requests changes, or rejects
      ↓
-DevDesktop persists feedback event + generates continuation packet
+Kontrol persists feedback event + generates continuation packet
      ↓
 If agent is live: it unblocks and continues
 If agent stopped: it reads feedback when it resumes
 ```
 
-This loop lives in Dev Desktop's event log, not in any specific host. You can review submissions from the same interface you use to chat, from a terminal, or from a future tool.
+This loop lives in Kontrol's event log, not in any specific host. You can review submissions from the same interface you use to chat, from a terminal, or from a future tool.
 
 ## Policy Mode
 
@@ -154,15 +154,15 @@ Control which operations require human approval:
 
 ```bash
 # Require approval for bash, allow file edits freely
-DEVDESKTOP_POLICY_TOOL_BASH=ask DEVDESKTOP_POLICY_TOOL_WRITE=allow
+KONTROL_POLICY_TOOL_BASH=ask KONTROL_POLICY_TOOL_WRITE=allow
 
 # Deny access to sensitive paths (structured JSON — the per-rule env format
-# `DEVDESKTOP_POLICY_PATH_<glob>` is no longer supported; it is not valid
+# `KONTROL_POLICY_PATH_<glob>` is no longer supported; it is not valid
 # shell assignment syntax)
-DEVDESKTOP_POLICY_PATH_RULES='[{"pattern":"/etc/ssh/**","mode":"deny"}]'
+KONTROL_POLICY_PATH_RULES='[{"pattern":"/etc/ssh/**","mode":"deny"}]'
 
 # Default: ask for anything not explicitly allowed
-DEVDESKTOP_POLICY_MODE=ask
+KONTROL_POLICY_MODE=ask
 ```
 
 Modes:
@@ -177,14 +177,14 @@ When a call requires approval, the agent's tool invocation blocks (long-poll) un
 
 ## Mental Model
 
-Dev Desktop is a **durable review mailbox and policy authority**, not just a file server.
+Kontrol is a **durable review mailbox and policy authority**, not just a file server.
 
 You decide which roots are allowed. You decide which tools require approval. The agent does its work, submits for review, and continues from structured feedback. The event log is the source of truth; every surface (CLI, WebUI, MCP tool) reads and writes events.
 
 For a normal session:
 
 1. Start your tunnel.
-2. Run `devdesktop serve`.
+2. Run `kontrol serve`.
 3. Connect your MCP agent to the public `/mcp` URL.
 4. Approve the connection with the Owner password.
 5. Ask the agent to open a project inside one of your allowed roots.
@@ -192,11 +192,11 @@ For a normal session:
 
 ## Documentation
 
-- [Setup Guide](https://github.com/BAMN/devdesktop/blob/main/docs/setup.md)
-- [Coding Workflow](https://github.com/BAMN/devdesktop/blob/main/docs/chatgpt-coding-workflow.md)
-- [Configuration Reference](https://github.com/BAMN/devdesktop/blob/main/docs/configuration.md)
-- [Security Model](https://github.com/BAMN/devdesktop/blob/main/docs/security.md)
-- [Troubleshooting](https://github.com/BAMN/devdesktop/blob/main/docs/gotchas.md)
+- [Setup Guide](https://github.com/BAMN/kontrol/blob/main/docs/setup.md)
+- [Coding Workflow](https://github.com/BAMN/kontrol/blob/main/docs/chatgpt-coding-workflow.md)
+- [Configuration Reference](https://github.com/BAMN/kontrol/blob/main/docs/configuration.md)
+- [Security Model](https://github.com/BAMN/kontrol/blob/main/docs/security.md)
+- [Troubleshooting](https://github.com/BAMN/kontrol/blob/main/docs/gotchas.md)
 
 ## Platform Support
 
@@ -208,12 +208,18 @@ For a normal session:
 | Windows PowerShell or `cmd.exe` only              | Not supported yet | Install Git Bash or use WSL.                   |
 
 ```bash
-devdesktop doctor
+kontrol doctor
 ```
 
 ## Built by B-A-M-N
 
-I'm B-A-M-N. Dev Desktop is an opinionated take on how local coding agents and desktop environments can be extended novelly.
+I'm B-A-M-N. Kontrol is an opinionated take on how local coding agents and desktop environments can be extended novelly.
+
+## Attribution
+
+Kontrol grew out of an idea I had been kicking around for a while, then side-binned because the local MCP/workspace layer was the hard part to get right. When I saw that [Waishnav had built DevSpace](https://github.com/Waishnav/devspace), I used that MCP implementation as the base and extended it in the direction I had been trying to reach.
+
+The original DevSpace project is distributed under the MIT License. Kontrol keeps that attribution while adding ACP worker dispatch, durable review loops, supervised missions, policy approvals, and adapter integrations. I can see how this style of local, review-gated agent control plane might be useful beyond my own setup, so the fork now has its own name and product direction.
 
 ## Local Development
 

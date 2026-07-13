@@ -5,7 +5,7 @@ import type { LoggingConfig, LogFormat, LogLevel } from "./logger.js";
 import type { OAuthConfig } from "./oauth-provider.js";
 import type { PolicyConfig } from "./policy.js";
 import { loadPolicyConfig } from "./policy.js";
-import { loadDevDesktopFiles } from "./user-config.js";
+import { loadKontrolFiles } from "./user-config.js";
 
 export type ToolMode = "minimal" | "full" | "codex";
 export type WidgetMode = "off" | "changes" | "full";
@@ -93,12 +93,12 @@ function parseBoolean(value: string | undefined): boolean {
 }
 
 function parseToolMode(env: NodeJS.ProcessEnv): ToolMode {
-  const mode = env.DEVDESKTOP_TOOL_MODE;
+  const mode = env.KONTROL_TOOL_MODE;
   if (mode === "minimal" || mode === "full" || mode === "codex") return mode;
-  if (mode) throw new Error(`Invalid DEVDESKTOP_TOOL_MODE: ${mode}`);
+  if (mode) throw new Error(`Invalid KONTROL_TOOL_MODE: ${mode}`);
 
-  if (env.DEVDESKTOP_MINIMAL_TOOLS !== undefined) {
-    return parseBoolean(env.DEVDESKTOP_MINIMAL_TOOLS) ? "minimal" : "full";
+  if (env.KONTROL_MINIMAL_TOOLS !== undefined) {
+    return parseBoolean(env.KONTROL_MINIMAL_TOOLS) ? "minimal" : "full";
   }
   return "minimal";
 }
@@ -107,14 +107,14 @@ function parseLogLevel(value: string | undefined): LogLevel {
   if (!value || value === "info") return "info";
   if (["silent", "error", "warn", "debug"].includes(value)) return value as LogLevel;
 
-  throw new Error(`Invalid DEVDESKTOP_LOG_LEVEL: ${value}`);
+  throw new Error(`Invalid KONTROL_LOG_LEVEL: ${value}`);
 }
 
 function parseLogFormat(value: string | undefined): LogFormat {
   if (!value || value === "json") return "json";
   if (value === "pretty") return "pretty";
 
-  throw new Error(`Invalid DEVDESKTOP_LOG_FORMAT: ${value}`);
+  throw new Error(`Invalid KONTROL_LOG_FORMAT: ${value}`);
 }
 
 function parsePathList(value: string | undefined): string[] {
@@ -148,13 +148,13 @@ function parsePositiveInteger(value: string | undefined, fallback: number, name:
 
 function parseLoggingConfig(env: NodeJS.ProcessEnv): LoggingConfig {
   return {
-    level: parseLogLevel(env.DEVDESKTOP_LOG_LEVEL),
-    format: parseLogFormat(env.DEVDESKTOP_LOG_FORMAT),
-    requests: env.DEVDESKTOP_LOG_REQUESTS === undefined ? true : parseBoolean(env.DEVDESKTOP_LOG_REQUESTS),
-    assets: parseBoolean(env.DEVDESKTOP_LOG_ASSETS),
-    toolCalls: env.DEVDESKTOP_LOG_TOOL_CALLS === undefined ? true : parseBoolean(env.DEVDESKTOP_LOG_TOOL_CALLS),
-    shellCommands: parseBoolean(env.DEVDESKTOP_LOG_SHELL_COMMANDS),
-    trustProxy: parseBoolean(env.DEVDESKTOP_TRUST_PROXY),
+    level: parseLogLevel(env.KONTROL_LOG_LEVEL),
+    format: parseLogFormat(env.KONTROL_LOG_FORMAT),
+    requests: env.KONTROL_LOG_REQUESTS === undefined ? true : parseBoolean(env.KONTROL_LOG_REQUESTS),
+    assets: parseBoolean(env.KONTROL_LOG_ASSETS),
+    toolCalls: env.KONTROL_LOG_TOOL_CALLS === undefined ? true : parseBoolean(env.KONTROL_LOG_TOOL_CALLS),
+    shellCommands: parseBoolean(env.KONTROL_LOG_SHELL_COMMANDS),
+    trustProxy: parseBoolean(env.KONTROL_TRUST_PROXY),
   };
 }
 
@@ -162,7 +162,7 @@ function parseWidgetMode(value: string | undefined): WidgetMode {
   if (!value || value === "full") return "full";
   if (value === "off" || value === "changes") return value;
 
-  throw new Error(`Invalid DEVDESKTOP_WIDGETS: ${value}`);
+  throw new Error(`Invalid KONTROL_WIDGETS: ${value}`);
 }
 
 function parseAcpKnownAgents(
@@ -187,29 +187,29 @@ function parseOAuthConfig(
   ownerToken: string | undefined,
   required: boolean,
 ): OAuthConfig {
-  const resolvedToken = env.DEVDESKTOP_OAUTH_OWNER_TOKEN ?? ownerToken;
+  const resolvedToken = env.KONTROL_OAUTH_OWNER_TOKEN ?? ownerToken;
   if (required) {
     if (!resolvedToken) {
-      throw new Error("DEVDESKTOP_OAUTH_OWNER_TOKEN is required for Dev Desktop OAuth. Run: devdesktop init");
+      throw new Error("KONTROL_OAUTH_OWNER_TOKEN is required for Kontrol OAuth. Run: kontrol init");
     }
     if (resolvedToken.length < 16) {
-      throw new Error("DEVDESKTOP_OAUTH_OWNER_TOKEN must be at least 16 characters long.");
+      throw new Error("KONTROL_OAUTH_OWNER_TOKEN must be at least 16 characters long.");
     }
   }
   return {
     ownerToken: resolvedToken ?? "",
     accessTokenTtlSeconds: parsePositiveInteger(
-      env.DEVDESKTOP_OAUTH_ACCESS_TOKEN_TTL_SECONDS,
+      env.KONTROL_OAUTH_ACCESS_TOKEN_TTL_SECONDS,
       DEFAULT_OAUTH_ACCESS_TOKEN_TTL_SECONDS,
-      "DEVDESKTOP_OAUTH_ACCESS_TOKEN_TTL_SECONDS",
+      "KONTROL_OAUTH_ACCESS_TOKEN_TTL_SECONDS",
     ),
     refreshTokenTtlSeconds: parsePositiveInteger(
-      env.DEVDESKTOP_OAUTH_REFRESH_TOKEN_TTL_SECONDS,
+      env.KONTROL_OAUTH_REFRESH_TOKEN_TTL_SECONDS,
       DEFAULT_OAUTH_REFRESH_TOKEN_TTL_SECONDS,
-      "DEVDESKTOP_OAUTH_REFRESH_TOKEN_TTL_SECONDS",
+      "KONTROL_OAUTH_REFRESH_TOKEN_TTL_SECONDS",
     ),
-    scopes: parseStringList(env.DEVDESKTOP_OAUTH_SCOPES, ["devdesktop"]),
-    allowedRedirectHosts: parseStringList(env.DEVDESKTOP_OAUTH_ALLOWED_REDIRECT_HOSTS, [
+    scopes: parseStringList(env.KONTROL_OAUTH_SCOPES, ["kontrol"]),
+    allowedRedirectHosts: parseStringList(env.KONTROL_OAUTH_ALLOWED_REDIRECT_HOSTS, [
       "chatgpt.com",
       "localhost",
       "127.0.0.1",
@@ -220,7 +220,7 @@ function parseOAuthConfig(
 function parseAuthMode(value: string | undefined): AuthMode {
   if (!value || value === "oauth") return "oauth";
   if (value === "tunnel") return "tunnel";
-  throw new Error(`Invalid DEVDESKTOP_AUTH_MODE: ${value}. Expected "oauth" or "tunnel".`);
+  throw new Error(`Invalid KONTROL_AUTH_MODE: ${value}. Expected "oauth" or "tunnel".`);
 }
 
 function isLoopbackHost(host: string): boolean {
@@ -228,11 +228,11 @@ function isLoopbackHost(host: string): boolean {
 }
 
 function defaultStateDir(): string {
-  return join(homedir(), ".local", "share", "devdesktop");
+  return join(homedir(), ".local", "share", "kontrol");
 }
 
 function defaultWorktreeRoot(): string {
-  return join(homedir(), ".devdesktop", "worktrees");
+  return join(homedir(), ".kontrol", "worktrees");
 }
 
 function defaultAgentDir(): string {
@@ -240,22 +240,22 @@ function defaultAgentDir(): string {
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
-  const files = loadDevDesktopFiles(env);
+  const files = loadKontrolFiles(env);
   const host = env.HOST ?? files.config.host ?? "127.0.0.1";
   const port = parsePort(env.PORT ?? files.config.port);
   const publicBaseUrl = parsePublicBaseUrl(
-    env.DEVDESKTOP_PUBLIC_BASE_URL ?? files.config.publicBaseUrl ?? localPublicBaseUrl(host, port),
+    env.KONTROL_PUBLIC_BASE_URL ?? files.config.publicBaseUrl ?? localPublicBaseUrl(host, port),
   );
-  const authMode = parseAuthMode(env.DEVDESKTOP_AUTH_MODE);
+  const authMode = parseAuthMode(env.KONTROL_AUTH_MODE);
 
   if (authMode === "tunnel" && !isLoopbackHost(host)) {
     throw new Error(
-      `DEVDESKTOP_AUTH_MODE=tunnel requires HOST to bind a loopback address (127.0.0.1, ::1, or localhost), but HOST=${host}. Tunnel mode disables Dev Desktop's OAuth gate and must only be reachable through the OpenAI Secure MCP Tunnel on a loopback interface.`,
+      `KONTROL_AUTH_MODE=tunnel requires HOST to bind a loopback address (127.0.0.1, ::1, or localhost), but HOST=${host}. Tunnel mode disables Kontrol's OAuth gate and must only be reachable through the OpenAI Secure MCP Tunnel on a loopback interface.`,
     );
   }
 
-  if (env.DEVDESKTOP_TUNNEL_TOKEN !== undefined && env.DEVDESKTOP_TUNNEL_TOKEN.length > 0 && env.DEVDESKTOP_TUNNEL_TOKEN.length < 16) {
-    throw new Error("DEVDESKTOP_TUNNEL_TOKEN must be at least 16 characters when set.");
+  if (env.KONTROL_TUNNEL_TOKEN !== undefined && env.KONTROL_TUNNEL_TOKEN.length > 0 && env.KONTROL_TUNNEL_TOKEN.length < 16) {
+    throw new Error("KONTROL_TUNNEL_TOKEN must be at least 16 characters when set.");
   }
   const derivedAllowedHosts = [
     "localhost",
@@ -270,27 +270,27 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     host,
     port,
     oauth: parseOAuthConfig(env, files.auth.ownerToken, authMode === "oauth"),
-    allowedRoots: parseAllowedRoots(env.DEVDESKTOP_ALLOWED_ROOTS ?? files.config.allowedRoots),
-    allowedHosts: parseAllowedHosts(env.DEVDESKTOP_ALLOWED_HOSTS, derivedAllowedHosts),
+    allowedRoots: parseAllowedRoots(env.KONTROL_ALLOWED_ROOTS ?? files.config.allowedRoots),
+    allowedHosts: parseAllowedHosts(env.KONTROL_ALLOWED_HOSTS, derivedAllowedHosts),
     publicBaseUrl,
     authMode,
-    tunnelToken: env.DEVDESKTOP_TUNNEL_TOKEN,
+    tunnelToken: env.KONTROL_TUNNEL_TOKEN,
     toolMode: parseToolMode(env),
-    widgets: parseWidgetMode(env.DEVDESKTOP_WIDGETS),
-    stateDir: resolve(expandHomePath(env.DEVDESKTOP_STATE_DIR ?? files.config.stateDir ?? defaultStateDir())),
-    worktreeRoot: resolve(expandHomePath(env.DEVDESKTOP_WORKTREE_ROOT ?? files.config.worktreeRoot ?? defaultWorktreeRoot())),
-    skillsEnabled: env.DEVDESKTOP_SKILLS === undefined ? true : parseBoolean(env.DEVDESKTOP_SKILLS),
-    skillPaths: parsePathList(env.DEVDESKTOP_SKILL_PATHS),
-    agentDir: resolve(expandHomePath(env.DEVDESKTOP_AGENT_DIR ?? files.config.agentDir ?? defaultAgentDir())),
+    widgets: parseWidgetMode(env.KONTROL_WIDGETS),
+    stateDir: resolve(expandHomePath(env.KONTROL_STATE_DIR ?? files.config.stateDir ?? defaultStateDir())),
+    worktreeRoot: resolve(expandHomePath(env.KONTROL_WORKTREE_ROOT ?? files.config.worktreeRoot ?? defaultWorktreeRoot())),
+    skillsEnabled: env.KONTROL_SKILLS === undefined ? true : parseBoolean(env.KONTROL_SKILLS),
+    skillPaths: parsePathList(env.KONTROL_SKILL_PATHS),
+    agentDir: resolve(expandHomePath(env.KONTROL_AGENT_DIR ?? files.config.agentDir ?? defaultAgentDir())),
     logging: parseLoggingConfig(env),
-    acpEnabled: env.DEVDESKTOP_ACP_ENABLED === undefined ? true : parseBoolean(env.DEVDESKTOP_ACP_ENABLED),
-    acpPort: parsePort(env.DEVDESKTOP_ACP_PORT),
-    acpKnownAgents: parseAcpKnownAgents(env.DEVDESKTOP_ACP_AGENTS ?? files.config.acpKnownAgents),
-    acpSharedSecret: env.DEVDESKTOP_ACP_SHARED_SECRET,
+    acpEnabled: env.KONTROL_ACP_ENABLED === undefined ? true : parseBoolean(env.KONTROL_ACP_ENABLED),
+    acpPort: parsePort(env.KONTROL_ACP_PORT),
+    acpKnownAgents: parseAcpKnownAgents(env.KONTROL_ACP_AGENTS ?? files.config.acpKnownAgents),
+    acpSharedSecret: env.KONTROL_ACP_SHARED_SECRET,
     /** Shared secret used by the coding agent (worker) for ACP registration/calls. */
-    acpAgentSecret: env.DEVDESKTOP_ACP_AGENT_SECRET,
+    acpAgentSecret: env.KONTROL_ACP_AGENT_SECRET,
     /** Shared secret used by the reviewer (WebUI) for ACP calls. */
-    acpReviewerSecret: env.DEVDESKTOP_ACP_REVIEWER_SECRET,
+    acpReviewerSecret: env.KONTROL_ACP_REVIEWER_SECRET,
     policy: loadPolicyConfig(env),
   };
 }

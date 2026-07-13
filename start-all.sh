@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# start-all.sh — DevSpace MCP + ACP adapter + OpenAI tunnel
+# start-all.sh — Kontrol MCP + ACP adapter + OpenAI tunnel
 # Reliable daemon start via tmux. Readiness is mandatory before "BOTH UP".
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -10,12 +10,12 @@ DESKTOP_PWD="$PWD"
 set -a; source .env; set +a
 
 # --- Reviewer secret required for the WebUI review loop (Nelson/Ralphie) ---
-# The WebUI reaches DevSpace through the tunnel as a reviewer; without the
-# reviewer secret forwarded as X-DevDesktop-Reviewer-Token it would arrive as
+# The WebUI reaches Kontrol through the tunnel as a reviewer; without the
+# reviewer secret forwarded as X-Kontrol-Reviewer-Token it would arrive as
 # an ordinary client and submit_to_coding_agent / provide_review_feedback
 # would be forbidden. Refuse to launch rather than start in a broken state.
-if [[ "${DEVDESKTOP_ACP_ENABLED:-true}" != "false" && -z "${DEVDESKTOP_ACP_REVIEWER_SECRET:-}" ]]; then
-  echo "ERROR: DEVDESKTOP_ACP_REVIEWER_SECRET is required when ACP is enabled (the WebUI review loop needs reviewer authority)." >&2
+if [[ "${KONTROL_ACP_ENABLED:-true}" != "false" && -z "${KONTROL_ACP_REVIEWER_SECRET:-}" ]]; then
+  echo "ERROR: KONTROL_ACP_REVIEWER_SECRET is required when ACP is enabled (the WebUI review loop needs reviewer authority)." >&2
   echo "Set it to a long random value, e.g. \`openssl rand -hex 32\`." >&2
   exit 1
 fi
@@ -57,7 +57,7 @@ echo "[*] Preflight + build passed."
 
 # --- Graceful stop: signal, wait, escalate ---
 echo "[*] Stopping any stale processes (graceful first)..."
-for s in dd-adapter dd-adapter-crush dd-adapter-hermes dd-devspace dd-tunnel; do
+for s in dd-adapter dd-adapter-crush dd-adapter-hermes dd-kontrol dd-tunnel; do
   tmux send-keys -t "$s" C-c 2>/dev/null || true
 done
 sleep 2
@@ -67,7 +67,7 @@ pkill -9 -f "cli.js serve" >/dev/null 2>&1 || true
 pkill -9 -f "tunnel-client" >/dev/null 2>&1 || true
 pkill -9 -f "acp-crush-adapter.mjs" >/dev/null 2>&1 || true
 pkill -9 -f "acp-hermes-native-adapter.mjs" >/dev/null 2>&1 || true
-tmux kill-session -t dd-devspace 2>/dev/null || true
+tmux kill-session -t dd-kontrol 2>/dev/null || true
 tmux kill-session -t dd-tunnel 2>/dev/null || true
 tmux kill-session -t dd-adapter 2>/dev/null || true
 tmux kill-session -t dd-adapter-crush 2>/dev/null || true
@@ -140,19 +140,19 @@ fi
   # is attached to an env var so it can be passed through env: as well.
   # OPERATOR ACTION: rotate the tunnel + reviewer secrets after deploying — they
   # were previously exposed in argv.
-  export DEVDESKTOP_TUNNEL_AUTH_HEADER="Bearer \${DEVDESKTOP_TUNNEL_TOKEN}"
+  export KONTROL_TUNNEL_AUTH_HEADER="Bearer \${KONTROL_TUNNEL_TOKEN}"
   exec tunnel-client run --profile sample_mcp_with_dcr \\
-    --mcp.extra-headers "Authorization: env:DEVDESKTOP_TUNNEL_AUTH_HEADER" \\
-    --mcp.extra-headers "X-DevDesktop-Reviewer-Token: env:DEVDESKTOP_ACP_REVIEWER_SECRET"
+    --mcp.extra-headers "Authorization: env:KONTROL_TUNNEL_AUTH_HEADER" \\
+    --mcp.extra-headers "X-Kontrol-Reviewer-Token: env:KONTROL_ACP_REVIEWER_SECRET"
 EOF
 chmod +x "$LAUNCH_DIR/tunnel.sh"
 
-# --- Start DevSpace ---
-echo "[*] Starting devspace MCP server on ${DEV_HOST}:${DEV_PORT}/mcp ..."
-tmux new-session -d -s dd-devspace "cd '$PWD' && set -a && source .env && set +a && node dist/cli.js serve"
+# --- Start Kontrol ---
+echo "[*] Starting kontrol MCP server on ${DEV_HOST}:${DEV_PORT}/mcp ..."
+tmux new-session -d -s dd-kontrol "cd '$PWD' && set -a && source .env && set +a && node dist/cli.js serve"
 
 # Mandatory: /healthz + discovery before anything downstream
-echo -n "[*] Waiting for devspace to serve"
+echo -n "[*] Waiting for kontrol to serve"
 DEV_READY=0
 for _ in $(seq 1 60); do
   D=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 "http://${DEV_HOST}:${DEV_PORT}/healthz" 2>/dev/null || echo 000)
@@ -165,10 +165,10 @@ for _ in $(seq 1 60); do
 done
 if [[ "$DEV_READY" != "1" ]]; then
   echo ""
-  echo "ERROR: devspace did not serve /healthz + discovery in time." >&2
+  echo "ERROR: kontrol did not serve /healthz + discovery in time." >&2
   exit 1
 fi
-echo " devspace ready."
+echo " kontrol ready."
 
 # --- Start managed ACP adapters ---
 wait_adapter_health() {
@@ -195,13 +195,13 @@ smoke_adapter() {
   local name="$1" port="$2" agent="$3" session="$4"
   echo -n "[*] Running ${name} adapter /runs smoke"
   local body
-  body="{\"agent_name\":\"${agent}\",\"mode\":\"async\",\"input\":[{\"role\":\"user\",\"parts\":[{\"content_type\":\"text/plain\",\"content\":\"DEVDESKTOP_ADAPTER_SMOKE\"}]}],\"parent_run_id\":\"startup-smoke-${agent}\",\"smoke_test\":true}"
+  body="{\"agent_name\":\"${agent}\",\"mode\":\"async\",\"input\":[{\"role\":\"user\",\"parts\":[{\"content_type\":\"text/plain\",\"content\":\"KONTROL_ADAPTER_SMOKE\"}]}],\"parent_run_id\":\"startup-smoke-${agent}\",\"smoke_test\":true}"
   local ok=0
   for _ in $(seq 1 10); do
     local response
     response=$(curl -s --max-time 5 -X POST "http://127.0.0.1:${port}/runs" \
       -H "Content-Type: application/json" \
-      -H "Authorization: Bearer ${DEVDESKTOP_ACP_ADAPTER_SECRET:-${DEVDESKTOP_ACP_SHARED_SECRET:-}}" \
+      -H "Authorization: Bearer ${KONTROL_ACP_ADAPTER_SECRET:-${KONTROL_ACP_SHARED_SECRET:-}}" \
       --data "$body" 2>/dev/null || echo "")
     if echo "$response" | grep -q '"smoke_test":true'; then ok=1; break; fi
     echo -n "."
@@ -218,21 +218,21 @@ smoke_adapter() {
 
 wait_agent_registered() {
   local agent="$1"
-  echo -n "[*] Waiting for ${agent} registration in DevSpace..."
+  echo -n "[*] Waiting for ${agent} registration in Kontrol..."
   local ok=0
   local last_status=""
   local last_body=""
-  local devspace_secret="${DEVDESKTOP_ACP_SHARED_SECRET:-${DEVDESKTOP_ACP_AGENT_SECRET:-${DEVDESKTOP_ACP_REVIEWER_SECRET:-}}}"
-  if [[ -z "$devspace_secret" ]]; then
+  local kontrol_secret="${KONTROL_ACP_SHARED_SECRET:-${KONTROL_ACP_AGENT_SECRET:-${KONTROL_ACP_REVIEWER_SECRET:-}}}"
+  if [[ -z "$kontrol_secret" ]]; then
     echo ""
-    echo "ERROR: no DevSpace ACP auth secret is configured for registry probing." >&2
+    echo "ERROR: no Kontrol ACP auth secret is configured for registry probing." >&2
     exit 1
   fi
   for _ in $(seq 1 45); do
     local reg
     local tmp_body
     tmp_body="$(mktemp)"
-    last_status=$(curl -s -o "$tmp_body" -w "%{http_code}" --max-time 3 -H "Authorization: Bearer ${devspace_secret}" "http://${DEV_HOST}:${DEV_PORT}/acp/agents/${agent}" 2>/dev/null || echo "000")
+    last_status=$(curl -s -o "$tmp_body" -w "%{http_code}" --max-time 3 -H "Authorization: Bearer ${kontrol_secret}" "http://${DEV_HOST}:${DEV_PORT}/acp/agents/${agent}" 2>/dev/null || echo "000")
     reg="$(cat "$tmp_body" 2>/dev/null || true)"
     rm -f "$tmp_body"
     last_body="$reg"
@@ -310,8 +310,8 @@ assert_no_secret_in_cmdline() {
     fi
   done
 }
-assert_no_secret_in_cmdline "$DEVDESKTOP_TUNNEL_TOKEN" "DEVDESKTOP_TUNNEL_TOKEN"
-assert_no_secret_in_cmdline "$DEVDESKTOP_ACP_REVIEWER_SECRET" "DEVDESKTOP_ACP_REVIEWER_SECRET"
+assert_no_secret_in_cmdline "$KONTROL_TUNNEL_TOKEN" "KONTROL_TUNNEL_TOKEN"
+assert_no_secret_in_cmdline "$KONTROL_ACP_REVIEWER_SECRET" "KONTROL_ACP_REVIEWER_SECRET"
 
 echo ""
 echo "=== BOTH UP (tunnel READY, adapter HEALTHY, agent REGISTERED) ==="
@@ -323,5 +323,5 @@ if [[ "$START_HERMES_ADAPTER" == "true" || "$START_HERMES_ADAPTER" == "auto" ]];
   echo "  Hermes:   http://127.0.0.1:${HERMES_ACP_PORT}  (hermes-agent)"
 fi
 echo "  Tunnel:   http://127.0.0.1:8080/ui"
-echo "  Logs:     tmux attach -t dd-devspace | dd-adapter-crush | dd-adapter-hermes | dd-tunnel"
+echo "  Logs:     tmux attach -t dd-kontrol | dd-adapter-crush | dd-adapter-hermes | dd-tunnel"
 echo "  Stop:     bash stop-all.sh"

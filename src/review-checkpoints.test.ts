@@ -7,12 +7,12 @@ import assert from "node:assert/strict";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
 
 const execFileAsync = promisify(execFile);
-const root = await mkdtemp(join(tmpdir(), "devdesktop-review-checkpoints-test-"));
+const root = await mkdtemp(join(tmpdir(), "kontrol-review-checkpoints-test-"));
 
 try {
   await git(root, ["init"]);
-  await git(root, ["config", "user.email", "devdesktop@example.com"]);
-  await git(root, ["config", "user.name", "Dev Desktop Test"]);
+  await git(root, ["config", "user.email", "kontrol@example.com"]);
+  await git(root, ["config", "user.name", "Kontrol Test"]);
   await writeFile(join(root, "README.md"), "hello\n");
   await git(root, ["add", "README.md"]);
   await git(root, ["commit", "-m", "Initial commit"]);

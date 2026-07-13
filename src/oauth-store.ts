@@ -58,13 +58,13 @@ export class SqliteOAuthStore {
     allowedRedirectHosts: string[],
   ): OAuthClientInformationFull {
     if (!client.redirect_uris.every((uri) => redirectHostAllowed(String(uri), allowedRedirectHosts))) {
-      throw new InvalidRequestError("Client redirect_uri is not allowed for this Dev Desktop server");
+      throw new InvalidRequestError("Client redirect_uri is not allowed for this Kontrol server");
     }
 
     const now = Math.floor(Date.now() / 1000);
     const registered: OAuthClientInformationFull = {
       ...client,
-      client_id: `devdesktop-${randomUUID()}`,
+      client_id: `kontrol-${randomUUID()}`,
       client_id_issued_at: now,
       token_endpoint_auth_method: client.token_endpoint_auth_method ?? "none",
       grant_types: client.grant_types ?? ["authorization_code", "refresh_token"],

@@ -393,7 +393,7 @@ function renderPrompt(input: {
 }): string {
   const lines: string[] = [];
 
-  lines.push(`Review feedback has arrived for Dev Desktop work session ${input.sessionId}.`);
+  lines.push(`Review feedback has arrived for Kontrol work session ${input.sessionId}.`);
   lines.push("");
   lines.push(`Review ID: ${input.reviewId}`);
   lines.push(`Feedback event: ${input.feedbackEventId}`);
@@ -416,7 +416,7 @@ function renderPrompt(input: {
     lines.push("");
   }
 
-  lines.push("Use Dev Desktop MCP:");
+  lines.push("Use Kontrol MCP:");
   lines.push(`- get_work_session(sessionId="${input.sessionId}")`);
   lines.push(`- get_review_submission(sessionId="${input.sessionId}")`);
   lines.push("- continue from the persisted session state.");

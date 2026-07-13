@@ -7,7 +7,7 @@ import { createMissionLedger } from "./mission-ledger.js";
 import { createWorkSessionManager } from "./work-sessions.js";
 import { databasePath, openDatabase } from "./db/client.js";
 
-const root = mkdtempSync(join(tmpdir(), "devdesktop-mission-ledger-test-"));
+const root = mkdtempSync(join(tmpdir(), "kontrol-mission-ledger-test-"));
 
 try {
   const db = openDatabase(root);

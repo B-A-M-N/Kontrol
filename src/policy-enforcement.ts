@@ -17,17 +17,17 @@ export interface PolicyInvocation {
 
 /**
  * Canonical ACP tool names map onto the same policy keys as the MCP tools.
- * If ACP `devdesktop-write` is gated as `write`, then the MCP `write` tool is
+ * If ACP `kontrol-write` is gated as `write`, then the MCP `write` tool is
  * gated by the exact same rule. Without this mapping the ACP surface bypasses
  * policy entirely.
  */
 export const ACP_TOOL_POLICY_NAMES: Record<string, string> = {
-  "devdesktop-read": "read",
-  "devdesktop-write": "write",
-  "devdesktop-edit": "edit",
-  "devdesktop-grep": "grep",
-  "devdesktop-glob": "glob",
-  "devdesktop-shell": "bash",
+  "kontrol-read": "read",
+  "kontrol-write": "write",
+  "kontrol-edit": "edit",
+  "kontrol-grep": "grep",
+  "kontrol-glob": "glob",
+  "kontrol-shell": "bash",
 };
 
 export function canonicalToolName(tool: string): string {

@@ -88,7 +88,7 @@ export async function probeAgent(url: string, sharedSecret?: string): Promise<Ag
       return { healthy: false, status: health.status };
     }
 
-    // Generic ACP-style fallback: /health is a DevSpace adapter convention, not
+    // Generic ACP-style fallback: /health is a Kontrol adapter convention, not
     // a universal ACP requirement. A peer that exposes /runs is dispatchable.
     const runs = await fetch(baseUrl + "/runs", {
       method: "GET",
@@ -144,7 +144,7 @@ export async function selectHealthyAgent(
 
 // Correlation between a work session and its ACP run is persisted on the
 // acp_runs row (workSessionId column), not held in an in-memory map. That keeps
-// it durable across DevSpace restarts — submit_for_review looks the run up by
+// it durable across Kontrol restarts — submit_for_review looks the run up by
 // workSessionId via agentRegistry.getRunByWorkSessionId().
 
 const AGENT_SUBMIT_TIMEOUT_MS = 5 * 60 * 1000; // bound the "did it submit?" wait
@@ -163,7 +163,7 @@ export interface GatewayConfig {
 }
 
 export interface AgentCallResult {
-  /** DevSpace-owned durable run ID (authoritative). */
+  /** Kontrol-owned durable run ID (authoritative). */
   runId: string;
   /** Adapter-side execution-attempt identifier (informational only). */
   remoteRunId?: string;
@@ -284,7 +284,7 @@ export async function callRemoteAgent(
   const started = Date.now();
   try {
     // Resolve the workspace root for the dispatch so the adapter can spawn
-    // CRUSH in the correct repository, not in the DevSpace directory.
+    // CRUSH in the correct repository, not in the Kontrol directory.
     const workspace = params.workspaceSessionId
       ? config.workspaces.getWorkspace(params.workspaceSessionId)
       : undefined;
@@ -298,7 +298,7 @@ export async function callRemoteAgent(
           parts: [{ content_type: "text/plain", content: params.task }],
         },
       ],
-      // Bind the DevSpace-owned identities into the adapter request so the
+      // Bind the Kontrol-owned identities into the adapter request so the
       // spawned CRUSH process can attribute its tool activity to the exact
       // work session. The MCP connection envelope carries these downstream.
       workspace_session_id: params.workspaceSessionId,
@@ -359,7 +359,7 @@ export async function callRemoteAgent(
       }
 
       // Fire-and-forget: the WebUI dispatch path returns immediately with the
-      // DEVDESKTOP run ID (not the adapter's), and observes progress via the
+      // KONTROL run ID (not the adapter's), and observes progress via the
       // durable event log / get_work_session. The authoritative run ID is
       // run.runId; remoteRunId is only an execution-attempt pointer.
       if (params.fireAndForget) {
@@ -508,10 +508,10 @@ export async function callRemoteAgent(
 }
 
 /**
- * Execute a Dev Desktop tool directly (used by ACP server for devdesktop-* agents).
+ * Execute a Kontrol tool directly (used by ACP server for kontrol-* agents).
  * Maps agent name to the underlying pi-tools function.
  */
-export async function executeDevDesktopTool(
+export async function executeKontrolTool(
   agentName: string,
   input: string,
   cwd: string,
@@ -521,7 +521,7 @@ export async function executeDevDesktopTool(
   if (!parsed) return input; // treat raw text as default
 
   switch (agentName) {
-    case "devdesktop-read": {
+    case "kontrol-read": {
       const result = await readFileTool(
         { path: String(parsed.path ?? "."), offset: 1, limit: 500 },
         { cwd, root },
@@ -529,7 +529,7 @@ export async function executeDevDesktopTool(
       return result.content.map((c) => ("text" in c ? c.text : "")).join("");
     }
 
-    case "devdesktop-write": {
+    case "kontrol-write": {
       const result = await writeFileTool(
         { path: String(parsed.path), content: String(parsed.content ?? "") },
         { cwd, root },
@@ -537,7 +537,7 @@ export async function executeDevDesktopTool(
       return result.content.map((c) => ("text" in c ? c.text : "")).join("");
     }
 
-    case "devdesktop-edit": {
+    case "kontrol-edit": {
       const result = await editFileTool(
         { path: String(parsed.path), edits: (parsed.edits ?? []) as { oldText: string; newText: string }[] },
         { cwd, root },
@@ -547,7 +547,7 @@ export async function executeDevDesktopTool(
       return `${text}${details ? ` (+${details.additions ?? 0} -${details.removals ?? 0})` : ""}`;
     }
 
-    case "devdesktop-grep": {
+    case "kontrol-grep": {
       const result = await grepFilesTool(
         { pattern: String(parsed.pattern), path: typeof parsed.path === "string" ? parsed.path : undefined },
         { cwd, root },
@@ -555,7 +555,7 @@ export async function executeDevDesktopTool(
       return result.content.map((c) => ("text" in c ? c.text : "")).join("");
     }
 
-    case "devdesktop-glob": {
+    case "kontrol-glob": {
       const result = await findFilesTool(
         { pattern: String(parsed.pattern), path: typeof parsed.path === "string" ? parsed.path : undefined },
         { cwd, root },
@@ -563,7 +563,7 @@ export async function executeDevDesktopTool(
       return result.content.map((c) => ("text" in c ? c.text : "")).join("");
     }
 
-    case "devdesktop-shell": {
+    case "kontrol-shell": {
       const result = await runShellTool(
         { command: String(parsed.command ?? input), timeout: Number(parsed.timeout ?? 30) },
         { cwd, root: cwd },
@@ -572,7 +572,7 @@ export async function executeDevDesktopTool(
     }
 
     default:
-      throw new Error(`Unknown Dev Desktop agent: ${agentName}`);
+      throw new Error(`Unknown Kontrol agent: ${agentName}`);
   }
 }
 

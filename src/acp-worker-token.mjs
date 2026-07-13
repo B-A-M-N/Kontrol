@@ -2,7 +2,7 @@
 //
 // The adapter (trusted, server-side) signs a WorkerToken when it dispatches a
 // coding-agent run. The stdio bridge (which runs INSIDE the untrusted worker
-// process) merely relays the token to DevSpace. DevSpace verifies the HMAC and
+// process) merely relays the token to Kontrol. Kontrol verifies the HMAC and
 // derives the caller's role + bound work session from the SIGNED payload — so a
 // worker cannot drop its work-session identity to acquire reviewer rights, nor
 // forge a token it was not issued.

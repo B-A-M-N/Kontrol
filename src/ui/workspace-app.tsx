@@ -146,7 +146,7 @@ async function boot(): Promise<void> {
   render();
 
   app = new App(
-    { name: "devdesktop-tool-cards", version: "0.4.0" },
+    { name: "kontrol-tool-cards", version: "0.4.0" },
     {},
   );
 

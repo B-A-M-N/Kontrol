@@ -5,11 +5,11 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadConfig } from "./config.js";
 
-const emptyConfigDir = mkdtempSync(join(tmpdir(), "devdesktop-auth-test-"));
+const emptyConfigDir = mkdtempSync(join(tmpdir(), "kontrol-auth-test-"));
 const baseEnv = {
-  DEVDESKTOP_CONFIG_DIR: emptyConfigDir,
-  DEVDESKTOP_ALLOWED_ROOTS: process.cwd(),
-  DEVDESKTOP_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+  KONTROL_CONFIG_DIR: emptyConfigDir,
+  KONTROL_ALLOWED_ROOTS: process.cwd(),
+  KONTROL_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
 };
 
 // --- default mode is oauth and still requires the OAuth owner token ---
@@ -20,19 +20,19 @@ const baseEnv = {
 
 // --- oauth mode without an owner token is rejected ---
 assert.throws(
-  () => loadConfig({ ...baseEnv, DEVDESKTOP_OAUTH_OWNER_TOKEN: undefined }),
+  () => loadConfig({ ...baseEnv, KONTROL_OAUTH_OWNER_TOKEN: undefined }),
   /owner.?token/i,
 );
 
-// --- invalid DEVDESKTOP_AUTH_MODE is rejected ---
+// --- invalid KONTROL_AUTH_MODE is rejected ---
 assert.throws(
-  () => loadConfig({ ...baseEnv, DEVDESKTOP_AUTH_MODE: "bogus" }),
-  /Invalid DEVDESKTOP_AUTH_MODE/,
+  () => loadConfig({ ...baseEnv, KONTROL_AUTH_MODE: "bogus" }),
+  /Invalid KONTROL_AUTH_MODE/,
 );
 
 // --- tunnel mode requires a loopback HOST at startup ---
 assert.throws(
-  () => loadConfig({ ...baseEnv, DEVDESKTOP_AUTH_MODE: "tunnel", HOST: "0.0.0.0" }),
+  () => loadConfig({ ...baseEnv, KONTROL_AUTH_MODE: "tunnel", HOST: "0.0.0.0" }),
   /loopback/i,
 );
 
@@ -40,8 +40,8 @@ assert.throws(
 {
   const noOauthEnv = {
     ...baseEnv,
-    DEVDESKTOP_OAUTH_OWNER_TOKEN: undefined,
-    DEVDESKTOP_AUTH_MODE: "tunnel",
+    KONTROL_OAUTH_OWNER_TOKEN: undefined,
+    KONTROL_AUTH_MODE: "tunnel",
     HOST: "127.0.0.1",
   };
   const cfg = loadConfig(noOauthEnv);
@@ -52,11 +52,11 @@ assert.throws(
 // --- config: tunnel bearer token parses + validates length ---
 {
   assert.equal(loadConfig(baseEnv).tunnelToken, undefined);
-  const cfg = loadConfig({ ...baseEnv, DEVDESKTOP_TUNNEL_TOKEN: "test-token-that-is-long-enough" });
+  const cfg = loadConfig({ ...baseEnv, KONTROL_TUNNEL_TOKEN: "test-token-that-is-long-enough" });
   assert.equal(cfg.tunnelToken, "test-token-that-is-long-enough");
 }
 assert.throws(
-  () => loadConfig({ ...baseEnv, DEVDESKTOP_TUNNEL_TOKEN: "short" }),
+  () => loadConfig({ ...baseEnv, KONTROL_TUNNEL_TOKEN: "short" }),
   /at least 16 characters/,
 );
 
@@ -78,18 +78,18 @@ assert.throws(
   );
 }
 
-// --- /mcp bearer gate with DEVDESKTOP_TUNNEL_TOKEN ---
+// --- /mcp bearer gate with KONTROL_TUNNEL_TOKEN ---
 {
   const token = "test-bearer-that-is-long-enough";
   // Boot a server in tunnel mode WITH a token; expect 401 without it and 200 with it.
   const { createServer } = await import("./server.js");
   const tokenEnv = {
     ...baseEnv,
-    DEVDESKTOP_AUTH_MODE: "tunnel",
+    KONTROL_AUTH_MODE: "tunnel",
     HOST: "127.0.0.1",
     PORT: "7691",
-    DEVDESKTOP_TUNNEL_TOKEN: token,
-    DEVDESKTOP_ACP_SHARED_SECRET: "test-acp-secret-shared-for-bearer-gate",
+    KONTROL_TUNNEL_TOKEN: token,
+    KONTROL_ACP_SHARED_SECRET: "test-acp-secret-shared-for-bearer-gate",
   };
   const tokenConfig = loadConfig(tokenEnv);
   tokenConfig.publicBaseUrl = "http://127.0.0.1:7691";

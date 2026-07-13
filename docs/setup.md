@@ -1,7 +1,7 @@
 # Setup Guide
 
 This guide is for users who want ChatGPT or another MCP host to work in local
-projects through Dev Desktop.
+projects through Kontrol.
 
 ## Requirements
 
@@ -9,9 +9,9 @@ projects through Dev Desktop.
 - npm
 - Git
 - Bash, including Git Bash or WSL on Windows
-- a public HTTPS URL that forwards to the local Dev Desktop server
+- a public HTTPS URL that forwards to the local Kontrol server
 
-Dev Desktop does not create the public tunnel for you. Use Cloudflare Tunnel,
+Kontrol does not create the public tunnel for you. Use Cloudflare Tunnel,
 ngrok, Pinggy, Tailscale Funnel, or your own HTTPS reverse proxy.
 
 ## Install And Configure
@@ -19,14 +19,14 @@ ngrok, Pinggy, Tailscale Funnel, or your own HTTPS reverse proxy.
 Run:
 
 ```bash
-npx @bamn/devdesktop init
+npx @bamn/kontrol init
 ```
 
 The setup flow asks one question at a time.
 
 ### Project Roots
 
-Choose the folders ChatGPT is allowed to open through Dev Desktop. Keep this
+Choose the folders ChatGPT is allowed to open through Kontrol. Keep this
 narrow.
 
 Examples:
@@ -79,32 +79,32 @@ https://your-tunnel-host.example.com/mcp
 Run:
 
 ```bash
-npx @bamn/devdesktop serve
+npx @bamn/kontrol serve
 ```
 
 If your tunnel URL changes for one run, override it without rewriting config:
 
 ```bash
-DEVDESKTOP_PUBLIC_BASE_URL="https://new-tunnel.example.com" npx @bamn/devdesktop serve
+KONTROL_PUBLIC_BASE_URL="https://new-tunnel.example.com" npx @bamn/kontrol serve
 ```
 
 For a stable public URL, persist it:
 
 ```bash
-npx @bamn/devdesktop config set publicBaseUrl https://devdesktop.example.com
-npx @bamn/devdesktop serve
+npx @bamn/kontrol config set publicBaseUrl https://kontrol.example.com
+npx @bamn/kontrol serve
 ```
 
 ## Approve The Client
 
-When ChatGPT, Claude, or another MCP client connects, Dev Desktop shows an Owner
+When ChatGPT, Claude, or another MCP client connects, Kontrol shows an Owner
 password approval page. Enter the Owner password printed during setup.
 
 The default config files are:
 
 ```text
-~/.devdesktop/config.json
-~/.devdesktop/auth.json
+~/.kontrol/config.json
+~/.kontrol/auth.json
 ```
 
 Keep `auth.json` private.
@@ -114,7 +114,7 @@ Keep `auth.json` private.
 Run:
 
 ```bash
-npx @bamn/devdesktop doctor
+npx @bamn/kontrol doctor
 ```
 
 The doctor command reports the resolved config, Node version, Node ABI, platform,
@@ -122,7 +122,7 @@ Git, Bash, public URL, allowed hosts, and SQLite native dependency status.
 
 ## Running From A Local Checkout
 
-If you are developing Dev Desktop itself instead of using the published package:
+If you are developing Kontrol itself instead of using the published package:
 
 ```bash
 npm install --include=dev

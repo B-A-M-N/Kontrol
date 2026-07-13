@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# stop-all.sh — tear down DevSpace + tunnel + ACP adapters
-echo "[*] Stopping devspace + tunnel-client + ACP adapters ..."
-tmux kill-session -t dd-devspace 2>/dev/null || true
+# stop-all.sh — tear down Kontrol + tunnel + ACP adapters
+echo "[*] Stopping kontrol + tunnel-client + ACP adapters ..."
+tmux kill-session -t dd-kontrol 2>/dev/null || true
 tmux kill-session -t dd-tunnel 2>/dev/null || true
 tmux kill-session -t dd-adapter 2>/dev/null || true
 tmux kill-session -t dd-adapter-crush 2>/dev/null || true

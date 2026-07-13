@@ -1,0 +1,7 @@
+Kontrol is based on DevSpace by Waishnav:
+https://github.com/Waishnav/devspace
+
+The original project was licensed under the MIT License. Kontrol preserves that
+license and includes substantial modifications for ACP worker dispatch, durable
+review loops, supervised mission workflows, policy approval flows, adapter
+integrations, and the Kontrol product identity.

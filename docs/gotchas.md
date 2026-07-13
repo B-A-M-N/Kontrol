@@ -2,20 +2,20 @@
 
 This page collects the setup issues users are most likely to hit.
 
-## `devdesktop` Command Not Found
+## `kontrol` Command Not Found
 
 Use `npx`:
 
 ```bash
-npx @bamn/devdesktop init
-npx @bamn/devdesktop serve
+npx @bamn/kontrol init
+npx @bamn/kontrol serve
 ```
 
 If you installed globally, confirm npm's global bin directory is on `PATH`.
 
 ## Unsupported Node Version
 
-Dev Desktop requires Node `>=22.19 <27`.
+Kontrol requires Node `>=22.19 <27`.
 
 Check:
 
@@ -40,7 +40,7 @@ npm rebuild better-sqlite3
 Then run:
 
 ```bash
-npx @bamn/devdesktop doctor
+npx @bamn/kontrol doctor
 ```
 
 Release starts run a native dependency check before launching.
@@ -62,7 +62,7 @@ https://your-tunnel-host.example.com/mcp
 If you saved the wrong value:
 
 ```bash
-npx @bamn/devdesktop config set publicBaseUrl https://your-tunnel-host.example.com
+npx @bamn/kontrol config set publicBaseUrl https://your-tunnel-host.example.com
 ```
 
 ## Tunnel URL Changed
@@ -72,23 +72,23 @@ Temporary tunnels often change URLs between runs.
 For a one-off run:
 
 ```bash
-DEVDESKTOP_PUBLIC_BASE_URL="https://new-tunnel.example.com" npx @bamn/devdesktop serve
+KONTROL_PUBLIC_BASE_URL="https://new-tunnel.example.com" npx @bamn/kontrol serve
 ```
 
 For a stable URL:
 
 ```bash
-npx @bamn/devdesktop config set publicBaseUrl https://devdesktop.example.com
+npx @bamn/kontrol config set publicBaseUrl https://kontrol.example.com
 ```
 
 ## Host Header Or 403 Problems
 
-Dev Desktop derives allowed hosts from the configured public URL.
+Kontrol derives allowed hosts from the configured public URL.
 
 Run:
 
 ```bash
-npx @bamn/devdesktop doctor
+npx @bamn/kontrol doctor
 ```
 
 Confirm the public URL hostname appears in allowed hosts. If you changed tunnel
@@ -97,12 +97,12 @@ URLs, update `publicBaseUrl`.
 Use this only for intentional local debugging:
 
 ```bash
-DEVDESKTOP_ALLOWED_HOSTS="*" npx @bamn/devdesktop serve
+KONTROL_ALLOWED_HOSTS="*" npx @bamn/kontrol serve
 ```
 
 ## OAuth Redirect Host Rejected
 
-By default, Dev Desktop allows redirects for:
+By default, Kontrol allows redirects for:
 
 ```text
 chatgpt.com
@@ -113,7 +113,7 @@ localhost
 If another MCP client uses a different redirect host, configure:
 
 ```bash
-DEVDESKTOP_OAUTH_ALLOWED_REDIRECT_HOSTS="chatgpt.com,example.com" npx @bamn/devdesktop serve
+KONTROL_OAUTH_ALLOWED_REDIRECT_HOSTS="chatgpt.com,example.com" npx @bamn/kontrol serve
 ```
 
 ## Owner Password Not Accepted
@@ -121,13 +121,13 @@ DEVDESKTOP_OAUTH_ALLOWED_REDIRECT_HOSTS="chatgpt.com,example.com" npx @bamn/devd
 Make sure you are entering the Owner password from:
 
 ```text
-~/.devdesktop/auth.json
+~/.kontrol/auth.json
 ```
 
 To regenerate setup:
 
 ```bash
-npx @bamn/devdesktop init --force
+npx @bamn/kontrol init --force
 ```
 
 ## Unknown `workspaceId`
@@ -146,13 +146,13 @@ The path must be inside one of the allowed roots configured during setup.
 Run:
 
 ```bash
-npx @bamn/devdesktop config get
+npx @bamn/kontrol config get
 ```
 
 Then either open a project under an allowed root or rerun setup:
 
 ```bash
-npx @bamn/devdesktop init --force
+npx @bamn/kontrol init --force
 ```
 
 ## Worktree Mode Fails
@@ -172,7 +172,7 @@ needed.
 
 ## Windows Shell Commands Fail
 
-Dev Desktop shell execution requires Bash. Native PowerShell and `cmd.exe` command
+Kontrol shell execution requires Bash. Native PowerShell and `cmd.exe` command
 execution are not supported yet.
 
 Install Git for Windows and use Git Bash, or use WSL, MSYS2, or Cygwin Bash.
@@ -180,7 +180,7 @@ Install Git for Windows and use Git Bash, or use WSL, MSYS2, or Cygwin Bash.
 Run:
 
 ```bash
-npx @bamn/devdesktop doctor
+npx @bamn/kontrol doctor
 ```
 
 Confirm Bash is detected.
@@ -190,20 +190,20 @@ Confirm Bash is detected.
 Skills are enabled by default. Check:
 
 ```bash
-DEVDESKTOP_SKILLS=1 npx @bamn/devdesktop serve
+KONTROL_SKILLS=1 npx @bamn/kontrol serve
 ```
 
-Dev Desktop looks in standard Agent Skills locations:
+Kontrol looks in standard Agent Skills locations:
 
 - `~/.agents/skills`
 - project `.agents/skills`
 
 It also checks compatibility and custom paths:
 
-- `DEVDESKTOP_AGENT_DIR/skills`, defaulting to `~/.codex/skills`
-- additional paths from `DEVDESKTOP_SKILL_PATHS`
+- `KONTROL_AGENT_DIR/skills`, defaulting to `~/.codex/skills`
+- additional paths from `KONTROL_SKILL_PATHS`
 
-Legacy project paths such as `.pi/skills` can be added through `DEVDESKTOP_SKILL_PATHS` when needed.
+Legacy project paths such as `.pi/skills` can be added through `KONTROL_SKILL_PATHS` when needed.
 
 If a skill appears in `open_workspace`, the model must read that skill's
 `SKILL.md` before reading other files inside the skill directory.
@@ -213,9 +213,9 @@ If a skill appears in `open_workspace`, the model must read that skill's
 Per-tool widget cards are enabled by default with:
 
 ```bash
-DEVDESKTOP_WIDGETS=full
+KONTROL_WIDGETS=full
 ```
 
 The aggregate `show_changes` tool is only exposed with
-`DEVDESKTOP_WIDGETS=changes`. Plain MCP clients may ignore ChatGPT Apps widget
+`KONTROL_WIDGETS=changes`. Plain MCP clients may ignore ChatGPT Apps widget
 metadata and only show text results.

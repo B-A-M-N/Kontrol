@@ -1,5 +1,5 @@
 /**
- * PolicyEngine — tool + filesystem approval policy for Dev Desktop.
+ * PolicyEngine — tool + filesystem approval policy for Kontrol.
  *
  * Modes:
  *   allow  — tool/path always allowed
@@ -123,8 +123,8 @@ export function loadPolicyConfig(env: NodeJS.ProcessEnv): PolicyConfig {
   const toolRules: Record<string, PolicyMode> = {};
   const pathRules: Array<{ pattern: string; mode: PolicyMode }> = [];
 
-  // Structured path rules: DEVDESKTOP_POLICY_PATH_RULES='[{"pattern":"/etc/ssh/**","mode":"deny"}]'
-  const pathRulesJson = env.DEVDESKTOP_POLICY_PATH_RULES;
+  // Structured path rules: KONTROL_POLICY_PATH_RULES='[{"pattern":"/etc/ssh/**","mode":"deny"}]'
+  const pathRulesJson = env.KONTROL_POLICY_PATH_RULES;
   if (pathRulesJson) {
     try {
       const parsed = JSON.parse(pathRulesJson) as Array<{ pattern?: string; mode?: string }>;
@@ -133,14 +133,14 @@ export function loadPolicyConfig(env: NodeJS.ProcessEnv): PolicyConfig {
         const mode = parseMode(entry.mode);
         if (!pattern || !mode) {
           throw new Error(
-            `DEVDESKTOP_POLICY_PATH_RULES: each entry needs a "pattern" and a valid "mode" (allow|deny|ask)`,
+            `KONTROL_POLICY_PATH_RULES: each entry needs a "pattern" and a valid "mode" (allow|deny|ask)`,
           );
         }
         pathRules.push({ pattern, mode });
       }
     } catch (error) {
       if (error instanceof SyntaxError) {
-        throw new Error(`DEVDESKTOP_POLICY_PATH_RULES is not valid JSON: ${error.message}`);
+        throw new Error(`KONTROL_POLICY_PATH_RULES is not valid JSON: ${error.message}`);
       }
       throw error;
     }
@@ -148,24 +148,24 @@ export function loadPolicyConfig(env: NodeJS.ProcessEnv): PolicyConfig {
 
   for (const [key, value] of Object.entries(env)) {
     if (!value) continue;
-    if (key.startsWith("DEVDESKTOP_POLICY_TOOL_")) {
-      const tool = key.replace("DEVDESKTOP_POLICY_TOOL_", "").toLowerCase();
+    if (key.startsWith("KONTROL_POLICY_TOOL_")) {
+      const tool = key.replace("KONTROL_POLICY_TOOL_", "").toLowerCase();
       const mode = parseMode(value);
       if (mode) toolRules[tool] = mode;
     }
-    // NOTE: per-rule env vars like DEVDESKTOP_POLICY_PATH_<glob>=... are no
+    // NOTE: per-rule env vars like KONTROL_POLICY_PATH_<glob>=... are no
     // longer supported (they are not valid shell assignment syntax). Use
-    // DEVDESKTOP_POLICY_PATH_RULES instead. Unknown DEVDESKTOP_POLICY_PATH_*
+    // KONTROL_POLICY_PATH_RULES instead. Unknown KONTROL_POLICY_PATH_*
     // keys are intentionally ignored.
   }
 
   // Default mode must be parsed strictly. Silently ignoring a malformed
   // security configuration is the wrong failure mode — a typo like "asks"
   // must not fall through to a permissive default.
-  const defaultMode = parseMode(env.DEVDESKTOP_POLICY_MODE ?? "allow");
+  const defaultMode = parseMode(env.KONTROL_POLICY_MODE ?? "allow");
   if (!defaultMode) {
     throw new Error(
-      `DEVDESKTOP_POLICY_MODE must be one of allow|deny|ask (got "${env.DEVDESKTOP_POLICY_MODE}")`,
+      `KONTROL_POLICY_MODE must be one of allow|deny|ask (got "${env.KONTROL_POLICY_MODE}")`,
     );
   }
 

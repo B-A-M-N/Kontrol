@@ -117,7 +117,7 @@ try {
     servers.push(peer);
     const peerPort = await listen(peer, "0.0.0.0");
 
-    const root = await mkdtemp(join(tmpdir(), "devdesktop-acp-gateway-"));
+    const root = await mkdtemp(join(tmpdir(), "kontrol-acp-gateway-"));
     tempDirs.push(root);
     const db = openDatabase(root);
     seedWorkspace(root, "ws-gateway");
@@ -166,7 +166,7 @@ try {
   }
 
   {
-    const root = await mkdtemp(join(tmpdir(), "devdesktop-acp-gateway-terminal-"));
+    const root = await mkdtemp(join(tmpdir(), "kontrol-acp-gateway-terminal-"));
     tempDirs.push(root);
     const db = openDatabase(root);
     seedWorkspace(root, "ws-terminal");
@@ -233,7 +233,7 @@ try {
     servers.push(delayedServer);
     const delayedPort = await listen(delayedServer, "127.0.0.1");
 
-    const root = await mkdtemp(join(tmpdir(), "devdesktop-acp-gateway-race-"));
+    const root = await mkdtemp(join(tmpdir(), "kontrol-acp-gateway-race-"));
     tempDirs.push(root);
     const db = openDatabase(root);
     seedWorkspace(root, "ws-race");

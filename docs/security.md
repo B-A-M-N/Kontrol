@@ -1,6 +1,6 @@
 # Security Model
 
-Dev Desktop exposes local coding capabilities over MCP. Treat it as remote access
+Kontrol exposes local coding capabilities over MCP. Treat it as remote access
 to your development machine.
 
 The security model is simple:
@@ -12,7 +12,7 @@ The security model is simple:
 
 ## Filesystem Allowlist
 
-Dev Desktop only opens workspaces under configured roots.
+Kontrol only opens workspaces under configured roots.
 
 Good examples:
 
@@ -34,24 +34,24 @@ reach.
 
 ## Owner Password
 
-`devdesktop init` generates an Owner password and stores it in:
+`kontrol init` generates an Owner password and stores it in:
 
 ```text
-~/.devdesktop/auth.json
+~/.kontrol/auth.json
 ```
 
-When an MCP client connects, Dev Desktop shows an approval page. Enter the Owner
+When an MCP client connects, Kontrol shows an approval page. Enter the Owner
 password only when you intentionally want that client to access this server.
 
 For env-driven deployments, set a long random value:
 
 ```bash
-DEVDESKTOP_OAUTH_OWNER_TOKEN="$(openssl rand -base64 32)"
+KONTROL_OAUTH_OWNER_TOKEN="$(openssl rand -base64 32)"
 ```
 
 ## Public URL And Host Allowlist
 
-Dev Desktop needs `DEVDESKTOP_PUBLIC_BASE_URL` so MCP clients can discover OAuth
+Kontrol needs `KONTROL_PUBLIC_BASE_URL` so MCP clients can discover OAuth
 metadata and connect to the correct resource.
 
 The value should be the origin only:
@@ -60,21 +60,21 @@ The value should be the origin only:
 https://your-tunnel-host.example.com
 ```
 
-Do not include `/mcp` in `DEVDESKTOP_PUBLIC_BASE_URL`.
+Do not include `/mcp` in `KONTROL_PUBLIC_BASE_URL`.
 
-By default, Dev Desktop derives allowed Host headers from the local host and public
-URL. Use `DEVDESKTOP_ALLOWED_HOSTS=*` only for intentional local debugging.
+By default, Kontrol derives allowed Host headers from the local host and public
+URL. Use `KONTROL_ALLOWED_HOSTS=*` only for intentional local debugging.
 
 ## Tunnels
 
-Dev Desktop does not manage tunnels. Your tunnel or reverse proxy should point to:
+Kontrol does not manage tunnels. Your tunnel or reverse proxy should point to:
 
 ```text
 http://127.0.0.1:7676
 ```
 
 Prefer adding Cloudflare Access, Tailscale identity controls, or equivalent
-protection in front of public tunnels. Dev Desktop OAuth still protects the MCP
+protection in front of public tunnels. Kontrol OAuth still protects the MCP
 endpoint, but the tunnel URL should not be treated as a secret.
 
 ## Shell Access
@@ -82,7 +82,7 @@ endpoint, but the tunnel URL should not be treated as a secret.
 The shell tool is powerful by design. It is meant for tests, builds, git, and
 package scripts.
 
-Filesystem path containment applies to Dev Desktop file tools. Shell commands run
+Filesystem path containment applies to Kontrol file tools. Shell commands run
 as local commands and can do what your user account can do. This is why the MCP
 client must be trusted and the Owner password must stay private.
 
@@ -94,7 +94,7 @@ sessions.
 
 ## Logs
 
-By default, Dev Desktop logs requests and tool calls. Shell command previews are
-disabled unless `DEVDESKTOP_LOG_SHELL_COMMANDS=1`.
+By default, Kontrol logs requests and tool calls. Shell command previews are
+disabled unless `KONTROL_LOG_SHELL_COMMANDS=1`.
 
 Do not enable shell command logging if commands may contain secrets.

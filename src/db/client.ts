@@ -15,7 +15,7 @@ export interface DatabaseHandle {
 }
 
 export function databasePath(stateDir: string): string {
-  return join(stateDir, "devdesktop.sqlite");
+  return join(stateDir, "kontrol.sqlite");
 }
 
 export function openDatabase(stateDir: string): DatabaseHandle {
