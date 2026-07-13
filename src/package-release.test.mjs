@@ -31,6 +31,14 @@ try {
   const tarball = join(tmp, packedFilename);
   extractTgz(tarball, tmp);
   const pkg = join(tmp, "package");
+  const packedPackageJson = JSON.parse(readFileSync(join(pkg, "package.json"), "utf8"));
+  assert.equal(packedPackageJson.name, "@b-a-m-n/kontrol", "package name changed unexpectedly");
+  assert.equal(packedPackageJson.main, "dist/server.js", "package main must point at built server output");
+  assert.equal(packedPackageJson.bin?.kontrol, "dist/cli.js", "kontrol bin must point at built CLI output");
+  assert.ok(existsSync(join(pkg, "dist/server.js")), "packed package is missing dist/server.js");
+  assert.ok(existsSync(join(pkg, "dist/cli.js")), "packed package is missing dist/cli.js");
+  assert.ok(existsSync(join(pkg, "dist/acp-worker-token.mjs")), "packed package is missing dist/acp-worker-token.mjs");
+
   const rootNodeModules = join(root, "node_modules");
   if (existsSync(rootNodeModules)) {
     symlinkSync(rootNodeModules, join(pkg, "node_modules"), "dir");
