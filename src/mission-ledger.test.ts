@@ -178,6 +178,22 @@ try {
   assert.equal(p2.extend, true, "progress earns headroom past the raw ceiling");
   assert.ok(p2.maxRounds > progressMission.maxCorrectionRounds, "effective ceiling raised by progress");
 
+  // setWorkOrderPreferredAgent (session handoff keeps mission routing in sync).
+  const wo = ledger.createWorkOrder(mission.id, session.id, {
+    objectiveForThisTurn: "investigate",
+    preferredAgent: "crush",
+  });
+  assert.equal(wo.preferredAgent, "crush");
+  const changed = ledger.setWorkOrderPreferredAgent(session.id, "hermes");
+  assert.equal(changed, 1, "the active work order should be repointed");
+  assert.equal(
+    ledger.getPacket(session.id).workOrders[0]?.preferredAgent,
+    "hermes",
+    "handoff must update the active work order's preferredAgent so the dispatcher routes to the new agent",
+  );
+  // No mission for an unknown session → no-op, not a throw.
+  assert.equal(ledger.setWorkOrderPreferredAgent("ws_no_mission", "hermes"), 0);
+
   ledger.close();
   console.log("mission-ledger.test.ts: all assertions passed");
 } finally {
