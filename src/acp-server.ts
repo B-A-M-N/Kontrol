@@ -8,7 +8,7 @@ import type { EventStore } from "./event-log.js";
 import type { ContinuationManager } from "./continuation.js";
 import type { ReviewCheckpointManager } from "./review-checkpoints.js";
 import type { ReviewWorkflowService } from "./review-workflow.js";
-import { dispatchToPeer, executeDevDesktopTool, selectHealthyAgent } from "./acp-gateway.js";
+import { cancelRemoteRun, dispatchToPeer, executeDevDesktopTool, selectHealthyAgent } from "./acp-gateway.js";
 import { createPolicyEnforcer, type PolicyEnforcer, type PolicyInvocation, ACP_TOOL_POLICY_NAMES, type PrincipalRole } from "./policy-enforcement.js";
 import type { ApprovalRequestManager, ApprovalOption } from "./approval-requests.js";
 import { authorizeWorkSessionAction } from "./work-session-action-guard.js";
@@ -336,7 +336,13 @@ export function createAcpServer(
         // only committed AFTER the submission is persisted, so a failure between
         // capture and persistence cannot silently drop the diff (mirrors the
         // safe MCP path; P1 #2).
-        const review = await reviewCheckpoints.reviewChanges({ workspaceId: session.workspaceSessionId, root: wsRoot, since: "last_shown", markReviewed: false });
+        const review = await reviewCheckpoints.reviewChanges({
+          workspaceId: session.workspaceSessionId,
+          root: wsRoot,
+          since: "work_session",
+          workSessionId: session.id,
+          markReviewed: false,
+        });
 
         // Delegate the state transition to the authoritative workflow service.
         const submitted = reviewWorkflow
@@ -349,7 +355,12 @@ export function createAcpServer(
         // Advance the review baseline to the EXACT captured snapshot only after
         // the submission was persisted, so a crash cannot strand the diff.
         if (reviewWorkflow) {
-          await reviewCheckpoints.commitReviewed({ workspaceId: session.workspaceSessionId, root: wsRoot, snapshotCommit: review.snapshotCommit });
+          await reviewCheckpoints.commitReviewed({
+            workspaceId: session.workspaceSessionId,
+            root: wsRoot,
+            workSessionId: session.id,
+            snapshotCommit: review.snapshotCommit,
+          });
         }
 
         agentRegistry.updateRun(run.runId, { status: "awaiting", finishedAt: new Date().toISOString() });
@@ -591,6 +602,7 @@ export function createAcpServer(
     // Resolve the correlated work session and delegate to the authoritative
     // workflow so the session transitions to `cancelled` and emits exactly one
     // canonical agent.run.cancelled terminal event (P2 #2).
+    let remoteCancellation: unknown = undefined;
     if (workSessionId && reviewWorkflow) {
       try {
         await reviewWorkflow.cancelSession({ sessionId: workSessionId, reason: "cancelled via ACP" });
@@ -612,8 +624,12 @@ export function createAcpServer(
         });
       }
     }
+    remoteCancellation = await cancelRemoteRun(
+      { agentRegistry, workspaces, workSessions, sharedSecret },
+      run,
+    );
     emitSse(run.runId, "run.cancelled", { run_id: run.runId, status: "cancelled" });
-    res.status(202).json({ run_id: run.runId, status: "cancelled", output: [], created_at: run.createdAt, finished_at: new Date().toISOString() });
+    res.status(202).json({ run_id: run.runId, status: "cancelled", remote_cancellation: remoteCancellation, output: [], created_at: run.createdAt, finished_at: new Date().toISOString() });
   });
 
   // ── Adapter → DevSpace lifecycle events ──────────────
@@ -631,6 +647,7 @@ export function createAcpServer(
     plan_updated: "agent.plan.updated",
     completed: "agent.run.completed",
     failed: "agent.run.failed",
+    cancelled: "agent.run.cancelled",
     // Migration: older adapters reported a nonzero exit as `exited`, which
     // DevSpace rejected with HTTP 400 and silently stranded the work session.
     // Map it to the same durable event as `failed` so legacy adapters still work.
@@ -673,7 +690,8 @@ export function createAcpServer(
     const review = await reviewCheckpoints.reviewChanges({
       workspaceId: session.workspaceSessionId,
       root,
-      since: "last_shown",
+      since: "work_session",
+      workSessionId,
       markReviewed: false,
     });
     const submitted = reviewWorkflow.submitForReview({
@@ -690,6 +708,7 @@ export function createAcpServer(
     await reviewCheckpoints.commitReviewed({
       workspaceId: session.workspaceSessionId,
       root,
+      workSessionId,
       snapshotCommit: review.snapshotCommit,
     });
     agentRegistry.updateRun(runId, {
@@ -909,7 +928,13 @@ export function createAcpServer(
       (body.type === "failed" || body.type === "exited") &&
       sessionId !== undefined &&
       workSessions.get(sessionId)?.status === "awaiting_review";
-    if (sessionId && eventStore && !awaitingReviewCrash) {
+    const workflowHandledCancellation =
+      body.type === "cancelled" &&
+      sessionId !== undefined &&
+      reviewWorkflow !== undefined &&
+      session !== undefined &&
+      !TERMINAL_SESSION_STATUSES.has(session.status);
+    if (sessionId && eventStore && !awaitingReviewCrash && !workflowHandledCancellation) {
       eventStore.appendEvent({
         type: gatedCompletedTurn ? "worker.turn.completed" : ADAPTER_EVENT_TYPE_TO_RUN[body.type],
         sessionId,
@@ -924,6 +949,13 @@ export function createAcpServer(
 
     if (body.type === "completed") {
       await evaluateCompletion(run.runId, sessionId ?? "");
+    } else if (body.type === "cancelled") {
+      const session = sessionId ? workSessions.get(sessionId) : undefined;
+      if (session && !TERMINAL_SESSION_STATUSES.has(session.status) && reviewWorkflow) {
+        await reviewWorkflow.cancelSession({ sessionId: session.id, reason: stringPayload(body.payload?.message) ?? "worker cancelled" });
+      } else {
+        agentRegistry.updateRun(run.runId, { status: "cancelled", finishedAt: now, workerLeaseUntil: null });
+      }
     } else if (body.type === "failed" || body.type === "exited") {
       // An execution/infrastructure failure is distinct from a protocol
       // violation. Conflation (the old `failed_protocol` rewrite) wrongly

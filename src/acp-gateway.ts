@@ -174,6 +174,45 @@ export interface AgentCallResult {
   workSessionId?: string;
 }
 
+export interface AgentCancelResult {
+  acknowledged: boolean;
+  status?: number;
+  error?: string;
+}
+
+export async function cancelRemoteRun(
+  config: GatewayConfig,
+  run: PersistentAcpRun,
+): Promise<AgentCancelResult> {
+  if (!run.remoteRunId) {
+    return { acknowledged: false, error: "Run has no remoteRunId" };
+  }
+  const selection = await selectHealthyAgent(config.agentRegistry.listAlive(), {
+    name: run.agentName,
+    role: "agent",
+    sharedSecret: config.sharedSecret,
+  });
+  if (!selection.agent) {
+    return { acknowledged: false, error: `No healthy registered adapter for ${run.agentName}` };
+  }
+
+  const baseUrl = selection.agent.url.replace(/\/+$/, "");
+  try {
+    const response = await fetch(`${baseUrl}/runs/${encodeURIComponent(run.remoteRunId)}/cancel`, {
+      method: "POST",
+      headers: authHeadersForAgent(selection.agent.url, config.sharedSecret),
+      signal: AbortSignal.timeout(10_000),
+    });
+    const text = await response.text().catch(() => "");
+    if (!response.ok) {
+      return { acknowledged: false, status: response.status, error: text.slice(0, 500) || `HTTP ${response.status}` };
+    }
+    return { acknowledged: true, status: response.status };
+  } catch (error) {
+    return { acknowledged: false, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
 /**
  * Call a remote ACP agent with full lifecycle:
  * 1. Create persistent run

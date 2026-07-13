@@ -55,6 +55,8 @@ export interface ContinuationManager {
   claim(owner: string, opts?: { id?: string; sessionId?: string }): Continuation | null;
   release(owner: string, opts?: { id?: string; sessionId?: string }): void;
   reapExpiredClaims(leaseMs: number, owner?: string): number;
+  supersede(id: string, reason: string): boolean;
+  supersedeForSession(sessionId: string, reason: string): number;
   markDelivered(id: string, target: string): void;
   markDispatched(id: string): void;
   markCompleted(id: string): void;
@@ -231,6 +233,47 @@ export function createContinuationManager(
     return expired.length;
   }
 
+  function supersede(id: string, reason: string): boolean {
+    const updated = database.db
+      .update(continuations)
+      .set({
+        status: "superseded",
+        claimOwner: null,
+        claimedAt: null,
+        feedbackSummary: reason,
+        consumedAt: new Date().toISOString(),
+      })
+      .where(eq(continuations.id, id))
+      .run();
+    return updated.changes > 0;
+  }
+
+  function supersedeForSession(sessionId: string, reason: string): number {
+    const updated = database.db
+      .update(continuations)
+      .set({
+        status: "superseded",
+        claimOwner: null,
+        claimedAt: null,
+        feedbackSummary: reason,
+        consumedAt: new Date().toISOString(),
+      })
+      .where(and(eq(continuations.sessionId, sessionId), eq(continuations.status, "pending")))
+      .run();
+    const claimed = database.db
+      .update(continuations)
+      .set({
+        status: "superseded",
+        claimOwner: null,
+        claimedAt: null,
+        feedbackSummary: reason,
+        consumedAt: new Date().toISOString(),
+      })
+      .where(and(eq(continuations.sessionId, sessionId), eq(continuations.status, "claimed")))
+      .run();
+    return updated.changes + claimed.changes;
+  }
+
   function listForSession(sessionId: string): Continuation[] {
     const rows = database.db
       .select()
@@ -289,6 +332,8 @@ export function createContinuationManager(
     claim,
     release,
     reapExpiredClaims,
+    supersede,
+    supersedeForSession,
     markDelivered,
     markDispatched,
     markCompleted,

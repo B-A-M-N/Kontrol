@@ -49,6 +49,52 @@ try {
 
   const afterReviewed = await manager.reviewChanges({ workspaceId: "ws_review", root });
   assert.equal(afterReviewed.summary.files, 0);
+
+  await writeFile(join(root, "README.md"), "hello\nworld\nshown but unsubmitted\n");
+  const presentationOnly = await manager.reviewChanges({
+    workspaceId: "ws_review",
+    root,
+    since: "last_shown",
+    markReviewed: true,
+  });
+  assert.equal(presentationOnly.summary.files, 1);
+
+  const sessionReview = await manager.reviewChanges({
+    workspaceId: "ws_review",
+    root,
+    since: "work_session",
+    workSessionId: "work_session_a",
+    markReviewed: false,
+  });
+  assert.equal(sessionReview.summary.files, 2);
+  assert.match(sessionReview.patch, /shown but unsubmitted/);
+
+  await manager.commitReviewed({
+    workspaceId: "ws_review",
+    root,
+    workSessionId: "work_session_a",
+    snapshotCommit: sessionReview.snapshotCommit,
+  });
+
+  await writeFile(join(root, "correction.txt"), "round two\n");
+  const correctionRound = await manager.reviewChanges({
+    workspaceId: "ws_review",
+    root,
+    since: "work_session",
+    workSessionId: "work_session_a",
+    markReviewed: false,
+  });
+  assert.equal(correctionRound.summary.files, 1);
+  assert.equal(correctionRound.files[0]?.path, "correction.txt");
+
+  const otherSession = await manager.reviewChanges({
+    workspaceId: "ws_review",
+    root,
+    since: "work_session",
+    workSessionId: "work_session_b",
+    markReviewed: false,
+  });
+  assert.equal(otherSession.summary.files, 3);
 } finally {
   await rm(root, { recursive: true, force: true });
 }

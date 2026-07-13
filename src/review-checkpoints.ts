@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { git, getGitEligibility, safeWorkspaceRefSegment } from "./git.js";
 
-export type ReviewSince = "last_shown" | "last_review" | "workspace_open";
+export type ReviewSince = "last_shown" | "last_review" | "workspace_open" | "work_session";
 
 export interface ReviewSummary {
   files: number;
@@ -32,7 +32,8 @@ interface WorkspaceReviewState {
   root: string;
   gitRoot?: string;
   openRef: string;
-  baselineRef: string;
+  presentationRef: string;
+  legacyBaselineRef: string;
   diagnostic?: string;
 }
 
@@ -43,6 +44,7 @@ export interface ReviewCheckpointManager {
     root: string;
     since?: ReviewSince;
     markReviewed?: boolean;
+    workSessionId?: string;
   }): Promise<ReviewChangesResult>;
   reviewChangesAgainstCommit(input: {
     workspaceId: string;
@@ -55,7 +57,7 @@ export interface ReviewCheckpointManager {
    * tree (which may have changed since capture). Call only after the review
    * submission was persisted, so a failure cannot silently drop the diff.
    */
-  commitReviewed(input: { workspaceId: string; root: string; snapshotCommit: string }): Promise<void>;
+  commitReviewed(input: { workspaceId: string; root: string; snapshotCommit: string; workSessionId?: string }): Promise<void>;
 }
 
 const REVIEW_REF_PREFIX = "refs/devdesktop/review";
@@ -79,13 +81,14 @@ export function createReviewCheckpointManager(): ReviewCheckpointManager {
         state.gitRoot = eligibility.gitRoot;
         const commit = await createWorkingTreeSnapshot(eligibility.gitRoot);
         await git(eligibility.gitRoot, ["update-ref", state.openRef, commit]);
-        await git(eligibility.gitRoot, ["update-ref", state.baselineRef, commit]);
+        await git(eligibility.gitRoot, ["update-ref", state.presentationRef, commit]);
+        await git(eligibility.gitRoot, ["update-ref", state.legacyBaselineRef, commit]);
       } catch (error) {
         state.diagnostic = error instanceof Error ? error.message : String(error);
       }
     },
 
-    async reviewChanges({ workspaceId, root, since = "last_shown", markReviewed = true }) {
+    async reviewChanges({ workspaceId, root, since = "last_shown", markReviewed = true, workSessionId }) {
       let state = states.get(workspaceId);
       if (!state) {
         await this.initializeWorkspace({ workspaceId, root });
@@ -96,7 +99,7 @@ export function createReviewCheckpointManager(): ReviewCheckpointManager {
         throw new Error(state?.diagnostic ?? "show_changes requires a Git workspace in this version.");
       }
 
-      const baselineRef = since === "workspace_open" ? state.openRef : state.baselineRef;
+      const baselineRef = await resolveBaselineRef(state, workspaceId, since, workSessionId);
       const baseline = (await git(state.gitRoot, ["rev-parse", "--verify", `${baselineRef}^{commit}`])).stdout.trim();
       const current = await createWorkingTreeSnapshot(state.gitRoot);
       const patch = (await git(state.gitRoot, ["diff", "--binary", "--no-color", baseline, current], {
@@ -109,7 +112,7 @@ export function createReviewCheckpointManager(): ReviewCheckpointManager {
       const summary = summarizeFiles(files);
 
       if (markReviewed) {
-        await git(state.gitRoot, ["update-ref", state.baselineRef, current]);
+        await git(state.gitRoot, ["update-ref", checkpointRefForMark(state, workspaceId, since, workSessionId), current]);
       }
 
       return {
@@ -155,7 +158,7 @@ export function createReviewCheckpointManager(): ReviewCheckpointManager {
       };
     },
 
-    async commitReviewed({ workspaceId, root, snapshotCommit }) {
+    async commitReviewed({ workspaceId, root, snapshotCommit, workSessionId }) {
       let state = states.get(workspaceId);
       if (!state) {
         await this.initializeWorkspace({ workspaceId, root });
@@ -166,17 +169,59 @@ export function createReviewCheckpointManager(): ReviewCheckpointManager {
       }
       // Advance baseline to the EXACT captured snapshot (no recompute — the tree
       // may have changed between capture and persistence).
-      await git(state.gitRoot, ["update-ref", state.baselineRef, snapshotCommit]);
+      await git(state.gitRoot, ["update-ref", sessionBaselineRef(workspaceId, workSessionId), snapshotCommit]);
     },
   };
 }
 
-function reviewRefs(workspaceId: string): Pick<WorkspaceReviewState, "openRef" | "baselineRef"> {
+function reviewRefs(workspaceId: string): Pick<WorkspaceReviewState, "openRef" | "presentationRef" | "legacyBaselineRef"> {
   const segment = safeWorkspaceRefSegment(workspaceId);
   return {
     openRef: `${REVIEW_REF_PREFIX}/${segment}/open`,
-    baselineRef: `${REVIEW_REF_PREFIX}/${segment}/baseline`,
+    presentationRef: `refs/devdesktop/presentation/${segment}/last-shown`,
+    legacyBaselineRef: `${REVIEW_REF_PREFIX}/${segment}/baseline`,
   };
+}
+
+async function resolveBaselineRef(
+  state: WorkspaceReviewState,
+  workspaceId: string,
+  since: ReviewSince,
+  workSessionId: string | undefined,
+): Promise<string> {
+  if (since === "workspace_open") return state.openRef;
+  if (since === "work_session" || since === "last_review") {
+    const ref = sessionBaselineRef(workspaceId, workSessionId);
+    await ensureRef(state.gitRoot!, ref, state.openRef);
+    return ref;
+  }
+  return state.presentationRef;
+}
+
+function checkpointRefForMark(
+  state: WorkspaceReviewState,
+  workspaceId: string,
+  since: ReviewSince,
+  workSessionId: string | undefined,
+): string {
+  if (since === "work_session" || since === "last_review") return sessionBaselineRef(workspaceId, workSessionId);
+  return state.presentationRef;
+}
+
+function sessionBaselineRef(workspaceId: string, workSessionId: string | undefined): string {
+  const workspaceSegment = safeWorkspaceRefSegment(workspaceId);
+  const sessionSegment = workSessionId ? safeWorkspaceRefSegment(workSessionId) : "_legacy";
+  return `refs/devdesktop/session/${workspaceSegment}/${sessionSegment}/baseline`;
+}
+
+async function ensureRef(gitRoot: string, ref: string, fallbackRef: string): Promise<void> {
+  try {
+    await git(gitRoot, ["rev-parse", "--verify", `${ref}^{commit}`]);
+    return;
+  } catch {
+    const fallback = (await git(gitRoot, ["rev-parse", "--verify", `${fallbackRef}^{commit}`])).stdout.trim();
+    await git(gitRoot, ["update-ref", ref, fallback]);
+  }
 }
 
 async function createWorkingTreeSnapshot(gitRoot: string): Promise<string> {
