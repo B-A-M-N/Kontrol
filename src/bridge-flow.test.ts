@@ -10,6 +10,7 @@ import { createEventStore } from "./event-log.js";
 import { createContinuationManager } from "./continuation.js";
 import { createMissionLedger } from "./mission-ledger.js";
 import { createAgentRegistryManager } from "./acp-registry.js";
+import { createDispatchOutbox } from "./dispatch-outbox.js";
 import { registerBridgeTools, runContinuationTick, type BridgeConfig } from "./acp-bridge.js";
 import { createAcpServer } from "./acp-server.js";
 import { openDatabase, databasePath } from "./db/client.js";
@@ -91,6 +92,7 @@ const db = openDatabase(root);
 const workSessions = createWorkSessionManager(db);
 const eventStore = createEventStore(db);
 const continuationManager = createContinuationManager(db);
+const dispatchOutbox = createDispatchOutbox(db);
 const missionLedger = createMissionLedger(db);
 const approvalRequests = createApprovalRequestManager(db);
 const agentRegistry = createAgentRegistryManager(db);
@@ -124,6 +126,7 @@ const reviewWorkflow = createReviewWorkflowService({
   db,
   workspaces,
   reviewCheckpoints,
+  dispatchOutbox,
 });
 const policyEngine = createPolicyEngine({ defaultMode: "allow", toolRules: {}, pathRules: [] });
 
@@ -134,6 +137,7 @@ const config: BridgeConfig = {
   agentRegistry,
   eventStore,
   continuationManager,
+  dispatchOutbox,
   reviewWorkflow,
   missionLedger,
   knownAgents: [],
@@ -342,6 +346,11 @@ try {
       status: "running",
     });
     await callReviewer("provide_review_feedback", { sessionId, verdict: "changes_requested" });
+    assert.equal(
+      dispatchOutbox.listPending().filter((event) => event.aggregateId === continuationManager.listForSession(sessionId)[0]?.id).length,
+      1,
+      "changes_requested enqueues a durable continuation dispatch event",
+    );
 
     // No live waiter registered -> dispatcher re-dispatches.
     await runContinuationTick(config);
@@ -410,6 +419,29 @@ try {
     assert.equal(workSessions.get(sessionId)!.status, "cancelled");
     assert.equal(continuationManager.get(pending.id)?.status, "superseded", "late delivery CAS does not overwrite superseded continuation");
     assert.equal(agentRegistry.getRun(run.runId)?.status, "cancelled", "logical run remains cancelled");
+  }
+
+  // ── Scenario 2d: pre-outbox pending continuations are backfilled into the outbox ──
+  {
+    const sessionId = createSession();
+    agentRegistry.createRun({
+      agentName: "cli-coding-agent",
+      workspaceSessionId: WS,
+      workSessionId: sessionId,
+      inputPreview: "legacy pending continuation",
+      status: "running",
+    });
+    const legacy = continuationManager.create({
+      sessionId,
+      reviewId: "review-legacy",
+      feedbackEventId: "feedback-legacy",
+      verdict: "changes_requested",
+    });
+    assert.equal(dispatchOutbox.hasActive("continuation.ready", legacy.id), false, "legacy continuation starts without outbox row");
+    const before = resumeCalls;
+    await runContinuationTick(config);
+    assert.equal(resumeCalls, before + 1, "dispatcher backfills and redrives legacy pending continuation");
+    assert.equal(continuationManager.get(legacy.id)?.status, "dispatched");
   }
 
   // ── Scenario 3: stale feedback is not replayed ──

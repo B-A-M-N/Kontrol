@@ -9,6 +9,7 @@ import type { AgentRegistryManager } from "./acp-registry.js";
 import type { WorkspaceRegistry } from "./workspaces.js";
 import type { ReviewCheckpointManager } from "./review-checkpoints.js";
 import type { MissionLedger } from "./mission-ledger.js";
+import type { DispatchOutbox } from "./dispatch-outbox.js";
 
 export type WorkflowVerdict = "approve" | "changes_requested" | "reject";
 
@@ -104,6 +105,8 @@ export interface ReviewWorkflowDeps {
   reviewCheckpoints?: ReviewCheckpointManager;
   /** Optional mission ledger. When present for a session, approval is gated by it. */
   missionLedger?: MissionLedger;
+  /** Optional durable dispatch outbox for continuation redrive. */
+  dispatchOutbox?: DispatchOutbox;
 }
 
 /**
@@ -155,7 +158,7 @@ const SUBMITTABLE_STATUSES = new Set([
 export function createReviewWorkflowService(
   deps: ReviewWorkflowDeps,
 ): ReviewWorkflowService {
-  const { workSessions, eventStore, continuationManager, agentRegistry, db, workspaces, reviewCheckpoints, missionLedger } = deps;
+  const { workSessions, eventStore, continuationManager, agentRegistry, db, workspaces, reviewCheckpoints, missionLedger, dispatchOutbox } = deps;
 
   function submitForReview(input: SubmitForReviewInput): SubmitForReviewResult {
     const session = workSessions.get(input.workSessionId);
@@ -424,6 +427,16 @@ export function createReviewWorkflowService(
           type: "continuation.created",
           sessionId: input.sessionId,
           payload: { continuationId: createdContinuation.id, runId: correlatedRun?.runId },
+        });
+        dispatchOutbox?.enqueue({
+          eventType: "continuation.ready",
+          aggregateId: createdContinuation.id,
+          payload: {
+            sessionId: input.sessionId,
+            runId: correlatedRun?.runId,
+            continuationId: createdContinuation.id,
+            revision: createdContinuation.reviewEpoch,
+          },
         });
       }
 
