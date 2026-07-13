@@ -358,6 +358,38 @@ try {
     assert.equal(resumeCalls, before, "cancelled sessions are not relaunched from continuations");
   }
 
+  // ── Scenario 2c: cancellation during dispatch cannot overwrite superseded -> dispatched ──
+  {
+    const sessionId = createSession();
+    await callWorker("submit_for_review", { sessionId });
+    const run = agentRegistry.createRun({
+      agentName: "cli-coding-agent",
+      workspaceSessionId: WS,
+      workSessionId: sessionId,
+      inputPreview: "race dispatch",
+      status: "running",
+    });
+    await callReviewer("provide_review_feedback", { sessionId, verdict: "changes_requested" });
+    const pending = continuationManager.listForSession(sessionId).find((c) => c.status === "pending");
+    assert.ok(pending, "changes_requested creates pending continuation for race test");
+
+    let adapterCalls = 0;
+    const raceConfig: BridgeConfig = {
+      ...config,
+      beforeContinuationDispatch: async () => {
+        config.reviewWorkflow.cancelSession({ sessionId, reason: "cancelled during dispatch" });
+      },
+      resumeAgent: async () => {
+        adapterCalls++;
+      },
+    };
+    await runContinuationTick(raceConfig);
+    assert.equal(adapterCalls, 0, "no adapter call occurs after cancellation wins the dispatch race");
+    assert.equal(workSessions.get(sessionId)!.status, "cancelled");
+    assert.equal(continuationManager.get(pending.id)?.status, "superseded", "late delivery CAS does not overwrite superseded continuation");
+    assert.equal(agentRegistry.getRun(run.runId)?.status, "cancelled", "logical run remains cancelled");
+  }
+
   // ── Scenario 3: stale feedback is not replayed ──
   {
     const sessionId = createSession();

@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import express from "express";
 import Database from "better-sqlite3";
-import { authHeadersForAgent, dispatchToPeer, probeAgent } from "./acp-gateway.js";
+import { authHeadersForAgent, callRemoteAgent, dispatchToPeer, probeAgent } from "./acp-gateway.js";
 import { createAcpServer } from "./acp-server.js";
 import { openDatabase, databasePath } from "./db/client.js";
 import { createAgentRegistryManager } from "./acp-registry.js";
@@ -160,6 +160,45 @@ try {
     assert.equal(response.status, 200);
     assert.equal(peerAuth, undefined, "direct /acp/runs forwarding does not leak shared bearer to non-loopback peers");
     assert.equal(peerBody?.agent_name, "remote-agent");
+
+    workSessions.close();
+    agentRegistry.close();
+  }
+
+  {
+    const root = await mkdtemp(join(tmpdir(), "devdesktop-acp-gateway-terminal-"));
+    tempDirs.push(root);
+    const db = openDatabase(root);
+    seedWorkspace(root, "ws-terminal");
+    const workSessions = createWorkSessionManager(db);
+    const agentRegistry = createAgentRegistryManager(db);
+    const run = agentRegistry.createRun({
+      agentName: "remote-agent",
+      workspaceSessionId: "ws-terminal",
+      workSessionId: "wsess-terminal",
+      inputPreview: "resume terminal",
+      status: "running",
+    });
+    agentRegistry.updateRun(run.runId, { status: "cancelled" });
+
+    await assert.rejects(
+      () => callRemoteAgent(
+        {
+          agentRegistry,
+          workspaces: { getWorkspace: () => ({ id: "ws-terminal", root: "/tmp", mode: "checkout" }) } as any,
+          workSessions,
+          sharedSecret: "secret",
+        },
+        {
+          agentUrl: "http://127.0.0.1:9",
+          agentName: "remote-agent",
+          task: "resume",
+          existingRunId: run.runId,
+          mode: "async",
+        },
+      ),
+      /Cannot resume terminal run/,
+    );
 
     workSessions.close();
     agentRegistry.close();

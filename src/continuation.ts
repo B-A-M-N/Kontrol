@@ -57,7 +57,12 @@ export interface ContinuationManager {
   reapExpiredClaims(leaseMs: number, owner?: string): number;
   supersede(id: string, reason: string): boolean;
   supersedeForSession(sessionId: string, reason: string): number;
-  markDelivered(id: string, target: string): void;
+  markDelivered(input: {
+    id: string;
+    expectedStatus: "claimed";
+    claimOwner: string;
+    targetRunId: string;
+  }): boolean;
   markDispatched(id: string): void;
   markCompleted(id: string): void;
   getPrompt(feedbackEventId: string): string | undefined;
@@ -284,12 +289,22 @@ export function createContinuationManager(
     return rows.map(rowToContinuation);
   }
 
-  function markDelivered(id: string, deliveredRunId: string): void {
-    database.db
+  function markDelivered(input: {
+    id: string;
+    expectedStatus: "claimed";
+    claimOwner: string;
+    targetRunId: string;
+  }): boolean {
+    const updated = database.db
       .update(continuations)
-      .set({ status: "dispatched", target: deliveredRunId, deliveredAt: new Date().toISOString() })
-      .where(eq(continuations.id, id))
+      .set({ status: "dispatched", target: input.targetRunId, deliveredAt: new Date().toISOString() })
+      .where(and(
+        eq(continuations.id, input.id),
+        eq(continuations.status, input.expectedStatus),
+        eq(continuations.claimOwner, input.claimOwner),
+      ))
       .run();
+    return updated.changes > 0;
   }
 
   function markDispatched(id: string): void {

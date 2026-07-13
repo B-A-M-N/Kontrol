@@ -43,7 +43,15 @@ function testAtomicClaim(): void {
 
   assert.equal(m.listPending().length, 0, "claimed continuation must leave the pending list");
 
-  m.markDelivered(first!.id, "dispatcher-a");
+  assert.equal(
+    m.markDelivered({
+      id: first!.id,
+      expectedStatus: "claimed",
+      claimOwner: "dispatcher-a",
+      targetRunId: "run-a",
+    }),
+    true,
+  );
   assert.equal(m.get(first!.id)?.status, "dispatched");
   m.markCompleted(first!.id);
   assert.equal(m.get(first!.id)?.status, "completed");
@@ -80,6 +88,16 @@ function testSupersedeForSession(): void {
   assert.equal(m.get(other.id)?.status, "pending");
   assert.equal(m.listPending("s1").length, 0);
   assert.equal(m.listPending("s2").length, 1);
+  assert.equal(
+    m.markDelivered({
+      id: claimed.id,
+      expectedStatus: "claimed",
+      claimOwner: "live-worker:s1",
+      targetRunId: "late-run",
+    }),
+    false,
+    "superseded continuation cannot be overwritten as dispatched",
+  );
 
   m.close();
 }
