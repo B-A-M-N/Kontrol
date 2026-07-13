@@ -2168,6 +2168,14 @@ export function createServer(config = loadConfig()): RunningServer {
         }
         const reviewerToken = req.header("x-kontrol-reviewer-token");
         const verifiedReviewer = constantTimeStringEqual(reviewerToken, config.acpReviewerSecret);
+        const oauthScopes = Array.isArray(req.auth?.scopes) ? req.auth.scopes : [];
+        const verifiedOAuthReviewer = oauthEnabled && oauthScopes.some((scope) =>
+          scope === "kontrol" ||
+          scope === "kontrol:review" ||
+          scope === "kontrol:approve" ||
+          scope === "kontrol:mission" ||
+          scope === "kontrol:dispatch"
+        );
 
         // A verified worker token authenticates this connection as a worker. It
         // also provides the bound work sessions (workspace/run/continuation) so
@@ -2175,7 +2183,7 @@ export function createServer(config = loadConfig()): RunningServer {
         // headers are used ONLY when no token is present (a reviewer/client
         // reaching /mcp directly) and never grant worker rights.
         const connectionContext: ConnectionContext = {
-          authenticatedRole: verifiedClaims ? "worker" : verifiedReviewer ? "reviewer" : "client",
+          authenticatedRole: verifiedClaims ? "worker" : (verifiedReviewer || verifiedOAuthReviewer) ? "reviewer" : "client",
           workspaceSessionId:
             verifiedClaims?.workspaceSessionId
             || (req.header("x-kontrol-workspace-session") ?? undefined),
