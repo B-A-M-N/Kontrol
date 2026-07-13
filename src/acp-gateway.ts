@@ -148,6 +148,7 @@ export async function selectHealthyAgent(
 // workSessionId via agentRegistry.getRunByWorkSessionId().
 
 const AGENT_SUBMIT_TIMEOUT_MS = 5 * 60 * 1000; // bound the "did it submit?" wait
+const TERMINAL_RUN_STATUSES = new Set(["approved", "rejected", "cancelled", "failed", "failed_protocol"]);
 
 async function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -246,6 +247,9 @@ export async function callRemoteAgent(
     const existing = config.agentRegistry.getRun(params.existingRunId);
     if (!existing) {
       throw new Error(`No logical run for continuation: ${params.existingRunId}`);
+    }
+    if (TERMINAL_RUN_STATUSES.has(existing.status)) {
+      throw new Error(`Cannot resume terminal run ${existing.runId}: ${existing.status}`);
     }
     run = existing;
     attemptNumber = (existing.attemptNumber ?? 1) + 1;

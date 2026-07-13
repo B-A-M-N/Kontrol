@@ -62,6 +62,8 @@ export interface BridgeConfig {
    * callRemoteAgent path runs.
    */
   resumeAgent?: (continuation: Continuation, sessionId: string) => Promise<void>;
+  /** Test hook used to exercise cancellation between claim and dispatch. */
+  beforeContinuationDispatch?: (continuation: Continuation, sessionId: string) => Promise<void>;
 }
 
 export interface LiveWaiterRegistry {
@@ -279,6 +281,14 @@ export async function runContinuationTick(
   liveWaiters: LiveWaiterRegistry = config.liveWaiters ?? defaultLiveWaiters,
 ): Promise<void> {
   const dispatcherId = "devspace-dispatcher";
+  const supersedeContinuation = (continuationId: string, sessionId: string, reason: string) => {
+    config.continuationManager.supersede(continuationId, reason);
+    config.eventStore.appendEvent({
+      type: "continuation.superseded",
+      sessionId,
+      payload: { continuationId, reason },
+    });
+  };
 
   // Requeue continuations whose claim lease expired (e.g. a dispatcher crashed
   // mid-dispatch), so they are not stranded forever.
@@ -293,12 +303,7 @@ export async function runContinuationTick(
       const session = config.workSessions.get(cont.sessionId);
       if (!session) continue;
       if (TERMINAL_STATUSES.has(session.status)) {
-        config.continuationManager.supersede(cont.id, `session is ${session.status}`);
-        config.eventStore.appendEvent({
-          type: "continuation.superseded",
-          sessionId: cont.sessionId,
-          payload: { continuationId: cont.id, reason: `session is ${session.status}` },
-        });
+        supersedeContinuation(cont.id, cont.sessionId, `session is ${session.status}`);
         continue;
       }
 
@@ -308,12 +313,7 @@ export async function runContinuationTick(
       const claimedSession = config.workSessions.get(claimed.sessionId);
       if (!claimedSession || TERMINAL_STATUSES.has(claimedSession.status)) {
         const reason = claimedSession ? `session is ${claimedSession.status}` : "session not found";
-        config.continuationManager.supersede(claimed.id, reason);
-        config.eventStore.appendEvent({
-          type: "continuation.superseded",
-          sessionId: claimed.sessionId,
-          payload: { continuationId: claimed.id, reason },
-        });
+        supersedeContinuation(claimed.id, claimed.sessionId, reason);
         continue;
       }
 
@@ -352,6 +352,22 @@ export async function runContinuationTick(
       }
 
       try {
+        const preDispatchSession = config.workSessions.get(claimed.sessionId);
+        if (!preDispatchSession || TERMINAL_STATUSES.has(preDispatchSession.status)) {
+          const reason = preDispatchSession ? `session is ${preDispatchSession.status}` : "session not found";
+          supersedeContinuation(claimed.id, claimed.sessionId, reason);
+          continue;
+        }
+        if (config.beforeContinuationDispatch) {
+          await config.beforeContinuationDispatch(claimed, claimed.sessionId);
+          const afterHookSession = config.workSessions.get(claimed.sessionId);
+          if (!afterHookSession || TERMINAL_STATUSES.has(afterHookSession.status)) {
+            const reason = afterHookSession ? `session is ${afterHookSession.status}` : "session not found";
+            supersedeContinuation(claimed.id, claimed.sessionId, reason);
+            continue;
+          }
+        }
+
         let result: AgentCallResult;
         if (config.resumeAgent) {
           // Test hook: treat a resolved hook as a successful dispatch. The real
@@ -372,7 +388,15 @@ export async function runContinuationTick(
 
         // Persist the REAL devspace run id so reconciliation/delivery records are
         // accurate (the dispatcher id is not a run identity).
-        config.continuationManager.markDelivered(claimed.id, result.runId);
+        const delivered = config.continuationManager.markDelivered({
+          id: claimed.id,
+          expectedStatus: "claimed",
+          claimOwner: dispatcherId,
+          targetRunId: result.runId,
+        });
+        if (!delivered) {
+          continue;
+        }
 
         // Publish after the continuation is delivered so subscribers react without
         // a poll, and ordering is: feedback -> continuation -> delivered event.
