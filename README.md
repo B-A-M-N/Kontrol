@@ -8,7 +8,7 @@
 
 <p align="center">A local control plane for WebUI and CLI coding agents: MCP workspace access, ACP worker dispatch, human review gates, and policy authority.</p>
 
-[![Kontrol connected to a coding agent](https://raw.githubusercontent.com/B-A-M-N/Kontrol/main/docs/assets/kontrol-screenshot.png)](https://raw.githubusercontent.com/B-A-M-N/Kontrol/main/docs/assets/kontrol-screenshot.png)
+[![Kontrol control plane overview](https://raw.githubusercontent.com/B-A-M-N/Kontrol/main/docs/assets/kontrol-control-plane.png)](https://raw.githubusercontent.com/B-A-M-N/Kontrol/main/docs/assets/kontrol-control-plane.png)
 
 **Your machine. Your agents. Your approval gate.**
 
