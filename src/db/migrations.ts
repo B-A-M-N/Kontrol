@@ -27,6 +27,8 @@ const migrations: Migration[] = [
   { version: 18, name: "mission-scope-guard", up: migrateMissionScopeGuard },
   { version: 19, name: "workspace-leases", up: migrateWorkspaceLeases },
   { version: 20, name: "dispatch-outbox-logical-key", up: migrateDispatchOutboxLogicalKey },
+  { version: 21, name: "dispatch-outbox-failure-count", up: migrateDispatchOutboxFailureCount },
+  { version: 22, name: "agent-messages", up: migrateAgentMessages },
 ];
 
 /**
@@ -608,6 +610,57 @@ function migrateDispatchOutbox(sqlite: Database.Database): void {
   `);
 }
 
+/**
+ * v21: split "attempts" into two distinct counters.
+ *
+ * The original schema had a single `attempt_count` that was incremented in
+ * `claimNext` (once per claim) but consulted in `markFailed` to decide
+ * dead-lettering and exponential backoff. Because a claim can be reaped back to
+ * pending after a dispatcher crash WITHOUT ever recording a failure, the counter
+ * measured claims, not failures — so an event could dead-letter after fewer than
+ * the intended real failures, and backoff was keyed off the wrong exponent.
+ *
+ * `failure_count` now counts ONLY genuine dispatch failures (markFailed);
+ * `attempt_count` is retained purely as a claim odometer for observability. New
+ * rows start at 0; existing rows seed `failure_count` from the old `attempt_count`
+ * so no in-flight event loses its accrued failure budget on upgrade.
+ */
+function migrateDispatchOutboxFailureCount(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "dispatch_outbox", "failure_count", "integer not null default 0");
+  // Best-effort backfill: treat prior attempt_count as the failure budget already
+  // spent. Over-counts slightly for events reaped without failing, which only
+  // makes dead-lettering more conservative — never less.
+  sqlite.exec("update dispatch_outbox set failure_count = attempt_count where failure_count = 0");
+}
+
+/**
+ * v22: durable agent→WebUI messages and artifacts. See schema.ts agentMessages.
+ */
+function migrateAgentMessages(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table if not exists agent_messages (
+      id text primary key,
+      work_session_id text not null references work_sessions(id) on delete cascade,
+      run_id text,
+      kind text not null,
+      author text not null default 'worker',
+      title text,
+      body text,
+      data_json text not null default '{}',
+      reply_to_id text,
+      status text not null default 'open',
+      created_at text not null,
+      resolved_at text
+    );
+
+    create index if not exists agent_messages_session_idx
+      on agent_messages(work_session_id, created_at);
+
+    create index if not exists agent_messages_kind_idx
+      on agent_messages(work_session_id, kind, status);
+  `);
+}
+
 function migrateDispatchOutboxLogicalKey(sqlite: Database.Database): void {
   const columns = sqlite.prepare("pragma table_info(dispatch_outbox)").all() as Array<{ name: string }>;
   if (!columns.some((column) => column.name === "aggregate_revision")) {
@@ -678,7 +731,7 @@ function migrateWorkSessionSnapshotBinding(sqlite: Database.Database): void {
 
 function addColumnIfMissing(
   sqlite: Database.Database,
-  table: "workspace_sessions" | "work_sessions" | "work_session_submissions" | "work_session_feedback" | "agent_registry" | "continuations" | "acp_runs",
+  table: "workspace_sessions" | "work_sessions" | "work_session_submissions" | "work_session_feedback" | "agent_registry" | "continuations" | "acp_runs" | "dispatch_outbox",
   column: string,
   definition: string,
 ): void {

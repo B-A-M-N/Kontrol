@@ -12,7 +12,10 @@ export interface DispatchOutboxEvent {
   aggregateRevision: number;
   payload: Record<string, unknown>;
   status: OutboxStatus;
+  /** Claim odometer (observability). Bumped on every claim. */
   attemptCount: number;
+  /** Genuine dispatch failures. Drives backoff + dead-lettering. */
+  failureCount: number;
   availableAt: string;
   claimedBy?: string;
   claimExpiresAt?: string;
@@ -95,6 +98,7 @@ export function createDispatchOutbox(
       payload: input.payload ?? {},
       status: "pending",
       attemptCount: 0,
+      failureCount: 0,
       availableAt: input.availableAt ?? now,
       createdAt: now,
     };
@@ -175,21 +179,29 @@ export function createDispatchOutbox(
     const row = database.db.select().from(dispatchOutbox).where(eq(dispatchOutbox.id, id)).get();
     if (!row) return;
 
-    const attempts = row.attemptCount;
-    if (attempts >= 3) {
+    // Count THIS failure. Dead-lettering and backoff are keyed off genuine
+    // failures, not claims — a claim reaped after a dispatcher crash must not
+    // consume the failure budget (that was the pre-v21 bug).
+    const failures = (row.failureCount ?? 0) + 1;
+    if (failures >= 3) {
       database.db
         .update(dispatchOutbox)
-        .set({ status: "dead_lettered", lastError: error })
+        .set({ status: "dead_lettered", failureCount: failures, lastError: error })
         .where(eq(dispatchOutbox.id, id))
         .run();
     } else {
-      const availableAt = new Date(Date.now() + retryDelayMs * Math.pow(2, attempts)).toISOString();
+      // Backoff exponent is (failures - 1): first retry waits retryDelayMs,
+      // second waits 2×, matching the intended geometric schedule.
+      const availableAt = new Date(
+        Date.now() + retryDelayMs * Math.pow(2, failures - 1),
+      ).toISOString();
       database.db
         .update(dispatchOutbox)
         .set({
           status: "pending",
           claimedBy: null,
           claimExpiresAt: null,
+          failureCount: failures,
           lastError: error,
           availableAt,
         })
@@ -236,6 +248,7 @@ export function createDispatchOutbox(
       .set({
         status: "pending",
         attemptCount: 0,
+        failureCount: 0,
         availableAt: now,
         claimedBy: null,
         claimExpiresAt: null,
@@ -297,6 +310,7 @@ function rowToEvent(row: DispatchOutboxRow): DispatchOutboxEvent {
     payload: JSON.parse(row.payloadJson) as Record<string, unknown>,
     status: row.status as OutboxStatus,
     attemptCount: row.attemptCount ?? 0,
+    failureCount: row.failureCount ?? 0,
     availableAt: row.availableAt,
     claimedBy: row.claimedBy ?? undefined,
     claimExpiresAt: row.claimExpiresAt ?? undefined,
