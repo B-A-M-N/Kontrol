@@ -5,10 +5,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/bamn/devspace
-EnvironmentFile=-/home/bamn/devspace/.env
+WorkingDirectory=%h/Kontrol
+EnvironmentFile=-%h/.kontrol/acp-crush-adapter.env
 Environment=ACP_ADAPTER_PORT=9877
-ExecStart=/usr/bin/env node /home/bamn/devspace/scripts/acp-crush-adapter.mjs
+ExecStart=/usr/bin/env node %h/Kontrol/scripts/acp-crush-adapter.mjs
 Restart=on-failure
 RestartSec=2s
 

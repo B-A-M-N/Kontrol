@@ -15,7 +15,7 @@
 //
 // Optional:
 //   CRUSH_BIN: path to the CRUSH CLI runner (used when ACP_AGENT_BIN=crush;
-//              default: /home/bamn/Crush-ACP/crush)
+//              default: crush from PATH)
 //   AGENT_CWD: fallback cwd only used if NO workspace_root is supplied AND the
 //              registration is a smoke test. Real dispatches REQUIRE a valid
 //              workspace_root (fail-closed, see validateWorkspaceRoot).
@@ -26,7 +26,7 @@ import { resolve } from "node:path";
 import { createServer } from "node:http";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { signWorkerToken, TOKEN_TTL_MS } from "../src/acp-worker-token.mjs";
+import { signWorkerToken, TOKEN_TTL_MS } from "./lib/acp-worker-token.mjs";
 
 const KONTROL_ACP_URL = process.env.KONTROL_ACP_URL || "http://127.0.0.1:7676/acp";
 const AGENT_SECRET = process.env.KONTROL_ACP_AGENT_SECRET;
@@ -38,7 +38,7 @@ if (AGENT_BIN !== "crush") {
     "Hermes must be integrated through its native `hermes acp` stdio server, not this subprocess adapter.",
   );
 }
-const CRUSH_BIN = process.env.CRUSH_BIN || "/home/bamn/Crush-ACP/crush";
+const CRUSH_BIN = process.env.CRUSH_BIN || "crush";
 // Fallback cwd ONLY used when a dispatch carries no workspace_root at all (which
 // Kontrol does not normally send — it always passes workspace_root). Kept for
 // the synthetic smoke path. Never substituted for an invalid/mismatched root:
@@ -61,6 +61,10 @@ const ADAPTER_HOST = process.env.HOST || "127.0.0.1";
 
 // NOTE: the "secret required" guard lives inside main() so this module can be
 // imported for unit tests without KONTROL_ACP_* secrets present.
+if (process.argv.includes("--validate-imports")) {
+  console.log("[adapter] import validation ok");
+  process.exit(0);
+}
 
 // Runner registry
 const activeProcesses = new Map(); // pid -> { child, run }

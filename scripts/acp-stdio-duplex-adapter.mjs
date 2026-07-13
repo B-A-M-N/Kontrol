@@ -29,6 +29,14 @@ const AGENT_COMMAND = process.env.ACP_STDIO_COMMAND;
 const AGENT_ARGS = parseJsonArray(process.env.ACP_STDIO_ARGS_JSON) ?? [];
 const DISPATCH_METHOD = process.env.ACP_STDIO_DISPATCH_METHOD || "session/prompt";
 
+const VALIDATE_IMPORTS = process.argv.includes("--validate-imports");
+
+const { createAcpDuplex } = await import(new URL("../dist/acp-duplex.js", import.meta.url));
+if (VALIDATE_IMPORTS) {
+  console.log("[stdio-duplex] import validation ok");
+  process.exit(0);
+}
+
 if (!AGENT_SECRET || !ADAPTER_SECRET) {
   console.error("[stdio-duplex] KONTROL_ACP_AGENT_SECRET and KONTROL_ACP_ADAPTER_SECRET are required");
   process.exit(1);
@@ -38,7 +46,6 @@ if (!AGENT_COMMAND) {
   process.exit(1);
 }
 
-const { createAcpDuplex } = await import(new URL("../dist/acp-duplex.js", import.meta.url));
 const active = new Map();
 let agentId = null;
 

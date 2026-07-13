@@ -108,8 +108,8 @@ try {
       if (req.method === "POST" && req.url === "/runs") {
         peerAuth = req.headers.authorization;
         peerBody = await readJson(req);
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ run_id: "remote-direct", status: "completed", output: [] }));
+        res.writeHead(202, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ run_id: "remote-direct", remote_run_id: "remote-direct", accepted: true }));
         return;
       }
       res.writeHead(404).end();
@@ -157,9 +157,17 @@ try {
         input: [{ parts: [{ content: "hello" }] }],
       }),
     });
-    assert.equal(response.status, 200);
+    const responseBody = await response.json() as Record<string, unknown>;
+    assert.equal(response.status, 202);
     assert.equal(peerAuth, undefined, "direct /acp/runs forwarding does not leak shared bearer to non-loopback peers");
     assert.equal(peerBody?.agent_name, "remote-agent");
+    assert.equal(peerBody?.work_session_id, workSession.id);
+    assert.equal(peerBody?.workspace_session_id, "ws-gateway");
+    assert.equal(peerBody?.workspace_root, "/tmp");
+    assert.equal(responseBody.remote_run_id, "remote-direct");
+    const persistedRun = agentRegistry.getRun(String(responseBody.kontrol_run_id));
+    assert.equal(persistedRun?.status, "running", "adapter acceptance keeps logical run running");
+    assert.equal(persistedRun?.remoteRunId, "remote-direct");
 
     workSessions.close();
     agentRegistry.close();

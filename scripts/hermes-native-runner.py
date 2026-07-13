@@ -27,7 +27,7 @@ async def main() -> int:
         return 2
     spec = json.loads(raw)
 
-    hermes_root = Path(os.environ.get("HERMES_AGENT_ROOT", "/home/bamn/hermes-agent"))
+    hermes_root = Path(os.environ.get("HERMES_AGENT_ROOT", os.getcwd()))
     sys.path.insert(0, str(hermes_root))
 
     pending_permissions: dict[str, asyncio.Future[dict]] = {}
