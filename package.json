@@ -1,5 +1,5 @@
 {
-  "name": "@bamn/kontrol",
+  "name": "@b-a-m-n/kontrol",
   "version": "1.0.3",
   "description": "Local agent control plane with MCP workspaces, ACP workers, review loops, and policy gates.",
   "type": "module",
@@ -14,7 +14,15 @@
     "dist",
     "docs",
     "NOTICE",
-    "scripts",
+    "scripts/acp-crush-adapter.mjs",
+    "scripts/acp-crush-adapter.sh",
+    "scripts/acp-hermes-native-adapter.mjs",
+    "scripts/dev-server.mjs",
+    "scripts/fix-node-pty-permissions.mjs",
+    "scripts/hermes-acp-compat/sitecustomize.py",
+    "scripts/hermes-native-runner.py",
+    "scripts/kontrol-acp-crush-adapter.service",
+    "scripts/mcp-stdio-bridge.mjs",
     "README.md"
   ],
   "publishConfig": {

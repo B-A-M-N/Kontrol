@@ -57,7 +57,7 @@ echo "[*] Preflight + build passed."
 
 # --- Graceful stop: signal, wait, escalate ---
 echo "[*] Stopping any stale processes (graceful first)..."
-for s in dd-adapter dd-adapter-crush dd-adapter-hermes dd-kontrol dd-tunnel; do
+for s in kontrol-adapter kontrol-adapter-crush kontrol-adapter-hermes kontrol-server kontrol-tunnel; do
   tmux send-keys -t "$s" C-c 2>/dev/null || true
 done
 sleep 2
@@ -67,11 +67,11 @@ pkill -9 -f "cli.js serve" >/dev/null 2>&1 || true
 pkill -9 -f "tunnel-client" >/dev/null 2>&1 || true
 pkill -9 -f "acp-crush-adapter.mjs" >/dev/null 2>&1 || true
 pkill -9 -f "acp-hermes-native-adapter.mjs" >/dev/null 2>&1 || true
-tmux kill-session -t dd-kontrol 2>/dev/null || true
-tmux kill-session -t dd-tunnel 2>/dev/null || true
-tmux kill-session -t dd-adapter 2>/dev/null || true
-tmux kill-session -t dd-adapter-crush 2>/dev/null || true
-tmux kill-session -t dd-adapter-hermes 2>/dev/null || true
+tmux kill-session -t kontrol-server 2>/dev/null || true
+tmux kill-session -t kontrol-tunnel 2>/dev/null || true
+tmux kill-session -t kontrol-adapter 2>/dev/null || true
+tmux kill-session -t kontrol-adapter-crush 2>/dev/null || true
+tmux kill-session -t kontrol-adapter-hermes 2>/dev/null || true
 sleep 1
 
 DEV_HOST="${HOST:-127.0.0.1}"
@@ -149,7 +149,7 @@ chmod +x "$LAUNCH_DIR/tunnel.sh"
 
 # --- Start Kontrol ---
 echo "[*] Starting kontrol MCP server on ${DEV_HOST}:${DEV_PORT}/mcp ..."
-tmux new-session -d -s dd-kontrol "cd '$PWD' && set -a && source .env && set +a && node dist/cli.js serve"
+tmux new-session -d -s kontrol-server "cd '$PWD' && set -a && source .env && set +a && node dist/cli.js serve"
 
 # Mandatory: /healthz + discovery before anything downstream
 echo -n "[*] Waiting for kontrol to serve"
@@ -253,25 +253,25 @@ wait_agent_registered() {
 
 if [[ "$START_CRUSH_ADAPTER" == "true" ]]; then
   echo "[*] Starting CRUSH ACP adapter on 127.0.0.1:${CRUSH_ACP_PORT} ..."
-  tmux new-session -d -s dd-adapter-crush "cd '$PWD' && set -a && source .env && set +a && ACP_AGENT_BIN=crush PORT=${CRUSH_ACP_PORT} node scripts/acp-crush-adapter.mjs"
-  wait_adapter_health "CRUSH" "$CRUSH_ACP_PORT" "dd-adapter-crush"
-  smoke_adapter "CRUSH" "$CRUSH_ACP_PORT" "cli-coding-agent" "dd-adapter-crush"
+  tmux new-session -d -s kontrol-adapter-crush "cd '$PWD' && set -a && source .env && set +a && ACP_AGENT_BIN=crush PORT=${CRUSH_ACP_PORT} node scripts/acp-crush-adapter.mjs"
+  wait_adapter_health "CRUSH" "$CRUSH_ACP_PORT" "kontrol-adapter-crush"
+  smoke_adapter "CRUSH" "$CRUSH_ACP_PORT" "cli-coding-agent" "kontrol-adapter-crush"
   wait_agent_registered "cli-coding-agent"
 fi
 
 if [[ "$START_HERMES_ADAPTER" == "true" || "$START_HERMES_ADAPTER" == "auto" ]]; then
   if [[ "$START_HERMES_ADAPTER" != "false" ]]; then
     echo "[*] Starting Hermes native ACP adapter on 127.0.0.1:${HERMES_ACP_PORT} ..."
-    tmux new-session -d -s dd-adapter-hermes "cd '$PWD' && set -a && source .env && set +a && HERMES_ACP_ADAPTER_PORT=${HERMES_ACP_PORT} node scripts/acp-hermes-native-adapter.mjs"
-    wait_adapter_health "Hermes" "$HERMES_ACP_PORT" "dd-adapter-hermes"
-    smoke_adapter "Hermes" "$HERMES_ACP_PORT" "hermes-agent" "dd-adapter-hermes"
+    tmux new-session -d -s kontrol-adapter-hermes "cd '$PWD' && set -a && source .env && set +a && HERMES_ACP_ADAPTER_PORT=${HERMES_ACP_PORT} node scripts/acp-hermes-native-adapter.mjs"
+    wait_adapter_health "Hermes" "$HERMES_ACP_PORT" "kontrol-adapter-hermes"
+    smoke_adapter "Hermes" "$HERMES_ACP_PORT" "hermes-agent" "kontrol-adapter-hermes"
     wait_agent_registered "hermes-agent"
   fi
 fi
 
 # --- Start tunnel ---
 echo "[*] Starting tunnel-client ..."
-tmux new-session -d -s dd-tunnel "$LAUNCH_DIR/tunnel.sh"
+tmux new-session -d -s kontrol-tunnel "$LAUNCH_DIR/tunnel.sh"
 
 # Mandatory: tunnel readiness
 echo -n "[*] Waiting for tunnel READY"
@@ -323,5 +323,5 @@ if [[ "$START_HERMES_ADAPTER" == "true" || "$START_HERMES_ADAPTER" == "auto" ]];
   echo "  Hermes:   http://127.0.0.1:${HERMES_ACP_PORT}  (hermes-agent)"
 fi
 echo "  Tunnel:   http://127.0.0.1:8080/ui"
-echo "  Logs:     tmux attach -t dd-kontrol | dd-adapter-crush | dd-adapter-hermes | dd-tunnel"
+echo "  Logs:     tmux attach -t kontrol-server | kontrol-adapter-crush | kontrol-adapter-hermes | kontrol-tunnel"
 echo "  Stop:     bash stop-all.sh"

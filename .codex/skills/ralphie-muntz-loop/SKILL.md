@@ -1,6 +1,6 @@
 ---
 name: ralphie-muntz-loop
-description: Event-driven review rendezvous for DevSpace ACP — the CLI agent submits work to WebUI, blocks until feedback arrives, then continues. Replaces polling with a deterministic wake-up. Use when working with DevSpace work sessions, WebUI review loops, or ACP review feedback.
+description: Event-driven review rendezvous for Kontrol ACP — the CLI agent submits work to WebUI, blocks until feedback arrives, then continues. Replaces polling with a deterministic wake-up. Use when working with Kontrol work sessions, WebUI review loops, or ACP review feedback.
 version: 0.1.0
 ---
 
@@ -8,14 +8,14 @@ version: 0.1.0
 
 > "I'm learnin'!" — Ralphie Muntz, until Nelson says not to anymore.
 
-Event-driven review rendezvous pattern for DevSpace's ACP. The CLI agent submits work to WebUI, the MCP tool call blocks server-side until the human reviews and commits feedback, then the agent continues with the verdict.
+Event-driven review rendezvous pattern for Kontrol's ACP. The CLI agent submits work to WebUI, the MCP tool call blocks server-side until the human reviews and commits feedback, then the agent continues with the verdict.
 
 **No polling. No busy loops. No 30-second timers.**
 
 ## The Pattern
 
 ```
-CLI Agent                          DevSpace Server                    WebUI (Human)
+CLI Agent                          Kontrol Server                    WebUI (Human)
     │                                    │                                │
     ├─ start_work_session ──────────────►│                                │
     ├─ [do work: edit, write, shell]     │                                │
@@ -157,7 +157,7 @@ Each WaiterEntry = { callback, timeout, cleanup }
 
 ## When to Use This Skill
 
-- Building or reviewing DevSpace ACP review workflows
+- Building or reviewing Kontrol ACP review workflows
 - Implementing CLI agent ↔ WebUI review loops
 - Debugging review feedback not reaching the CLI agent
 - Designing agent-to-human review rendezvous patterns

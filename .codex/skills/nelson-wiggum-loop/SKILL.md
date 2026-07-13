@@ -1,6 +1,6 @@
 ---
 name: nelson-wiggum-loop
-description: WebUI-side review rendezvous for DevSpace ACP — the WebUI submits work to the CLI coding agent, the agent works and submits back, and the loop only completes when the WebUI signs off "A-okay". The mirror of ralphie-muntz-loop. Use when wiring the review WebUI, the submit_to_coding_agent tool, or the agent↔WebUI completion gate.
+description: WebUI-side review rendezvous for Kontrol ACP — the WebUI submits work to the CLI coding agent, the agent works and submits back, and the loop only completes when the WebUI signs off "A-okay". The mirror of ralphie-muntz-loop. Use when wiring the review WebUI, the submit_to_coding_agent tool, or the agent↔WebUI completion gate.
 version: 0.1.0
 ---
 
@@ -23,23 +23,23 @@ The agent registry makes the split explicit:
 | Name | Role | Meaning |
 |------|------|---------|
 | `cli-coding-agent` | `agent` | The worker. Registers itself at runtime via `POST /acp/agents/register`. Executes tasks, submits work for review. |
-| `webui` | `client` | The reviewer. Seeded by DevSpace as a well-known `role: "client"` entry. Submits tasks to the agent; is the only signer of "A-okay". |
+| `webui` | `client` | The reviewer. Seeded by Kontrol as a well-known `role: "client"` entry. Submits tasks to the agent; is the only signer of "A-okay". |
 
-DevSpace is the **broker** that hosts both the WebUI's client tool
+Kontrol is the **broker** that hosts both the WebUI's client tool
 (`submit_to_coding_agent`) and the WebUI-facing ACP agent
-(`devdesktop-submit-work-to-webui`).
+(`kontrol-submit-work-to-webui`).
 
 ## The Pattern
 
 ```
-WebUI (Nelson)                    DevSpace Server                 CLI Coding Agent (Ralphie)
+WebUI (Nelson)                    Kontrol Server                 CLI Coding Agent (Ralphie)
     │                                    │                                │
     ├─ submit_to_coding_agent ──────────►│                                │
     │   (task from the human)            ├─ forward over ACP ─────────────►│
     │                                    │                                ├─ start_work_session
     │                                    │                                ├─ [do work: edit, shell, test]
     │                                    │◄─ submit_for_review ───────────┤
-    │                                    │   (or devdesktop-submit-        │
+    │                                    │   (or kontrol-submit-        │
     │                                    │    work-to-webui via ACP)       │
     │                                    ├─ status: awaiting_review        │
     │◄── diff card + feedback form ──────┤                                │
@@ -66,7 +66,7 @@ WebUI (Nelson)                    DevSpace Server                 CLI Coding Age
 | Tool | Purpose |
 |------|---------|
 | `submit_for_review` | (MCP) Capture git diff, submit for human review. |
-| `devdesktop-submit-work-to-webui` | (ACP) The coding agent submits completed work to the WebUI for review. Ralphie Muntz terminus. |
+| `kontrol-submit-work-to-webui` | (ACP) The coding agent submits completed work to the WebUI for review. Ralphie Muntz terminus. |
 
 ### The Completion Gate (WebUI sign-off)
 
@@ -80,7 +80,7 @@ WebUI (Nelson)                    DevSpace Server                 CLI Coding Age
 When the WebUI is the active surface in a work session:
 
 1. The human can type a task into the "Send a task to the coding agent" bar → calls `submit_to_coding_agent`.
-2. When a `submit_for_review` / `devdesktop-submit-work-to-webui` card arrives, render the diff and the feedback form.
+2. When a `submit_for_review` / `kontrol-submit-work-to-webui` card arrives, render the diff and the feedback form.
 3. The human reviews. The available verdicts are `approve`, `changes_requested`, `reject`.
 4. **`approve` is the "A-okay"** — it is the sole signal that the loop is complete. Only emit it when the work is genuinely acceptable.
 5. `changes_requested` returns control to the agent with comments; the loop continues.
@@ -125,7 +125,7 @@ drafting
 │    → callRemoteAgent(agentUrl, task)             │
 │    → returns agent output to WebUI               │
 │                                                  │
-│  devdesktop-submit-work-to-webui (ACP)           │
+│  kontrol-submit-work-to-webui (ACP)           │
 │    → reviewCheckpoints.reviewChanges()           │
 │    → workSessions.submitForReview()              │
 │    → eventStore.appendEvent("review.submitted") │

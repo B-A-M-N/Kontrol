@@ -13,17 +13,17 @@ The default files are:
 Use another config directory with:
 
 ```bash
-KONTROL_CONFIG_DIR=/path/to/config npx @bamn/kontrol serve
+KONTROL_CONFIG_DIR=/path/to/config npx @b-a-m-n/kontrol serve
 ```
 
 ## Commands
 
 ```bash
-npx @bamn/kontrol init
-npx @bamn/kontrol serve
-npx @bamn/kontrol doctor
-npx @bamn/kontrol config get
-npx @bamn/kontrol config set publicBaseUrl https://kontrol.example.com
+npx @b-a-m-n/kontrol init
+npx @b-a-m-n/kontrol serve
+npx @b-a-m-n/kontrol doctor
+npx @b-a-m-n/kontrol config get
+npx @b-a-m-n/kontrol config set publicBaseUrl https://kontrol.example.com
 ```
 
 ## Core Environment Variables
@@ -94,7 +94,7 @@ Example:
 KONTROL_AUTH_MODE=tunnel
 HOST=127.0.0.1
 PORT=7676
-npx @bamn/kontrol serve
+npx @b-a-m-n/kontrol serve
 ```
 
 In the OpenAI tunnel client, register this server with **No Authentication** and
@@ -163,7 +163,7 @@ Example:
 
 ```bash
 KONTROL_SKILL_PATHS="$HOME/.claude/skills,$HOME/company/skills" \
-npx @bamn/kontrol serve
+npx @b-a-m-n/kontrol serve
 ```
 
 ## Logging
@@ -192,7 +192,7 @@ KONTROL_PUBLIC_BASE_URL="https://kontrol.example.com" \
 KONTROL_WORKTREE_ROOT="$HOME/.kontrol/worktrees" \
 KONTROL_TOOL_MODE="minimal" \
 KONTROL_WIDGETS="full" \
-npx @bamn/kontrol serve
+npx @b-a-m-n/kontrol serve
 ```
 
 The environment assignments must be part of the same command invocation, or

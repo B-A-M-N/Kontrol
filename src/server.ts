@@ -2003,7 +2003,7 @@ export function createServer(config = loadConfig()): RunningServer {
       authorization_servers: [],
       bearer_methods_supported: ["header"],
       scopes_supported: config.oauth.scopes,
-      resource_documentation: "https://github.com/BAMN/kontrol",
+      resource_documentation: "https://github.com/B-A-M-N/Kontrol",
     };
     const discovery = (_req: Request, res: Response) => {
       res.setHeader("Access-Control-Allow-Origin", "*");

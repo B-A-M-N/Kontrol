@@ -7,8 +7,8 @@ This page collects the setup issues users are most likely to hit.
 Use `npx`:
 
 ```bash
-npx @bamn/kontrol init
-npx @bamn/kontrol serve
+npx @b-a-m-n/kontrol init
+npx @b-a-m-n/kontrol serve
 ```
 
 If you installed globally, confirm npm's global bin directory is on `PATH`.
@@ -40,7 +40,7 @@ npm rebuild better-sqlite3
 Then run:
 
 ```bash
-npx @bamn/kontrol doctor
+npx @b-a-m-n/kontrol doctor
 ```
 
 Release starts run a native dependency check before launching.
@@ -62,7 +62,7 @@ https://your-tunnel-host.example.com/mcp
 If you saved the wrong value:
 
 ```bash
-npx @bamn/kontrol config set publicBaseUrl https://your-tunnel-host.example.com
+npx @b-a-m-n/kontrol config set publicBaseUrl https://your-tunnel-host.example.com
 ```
 
 ## Tunnel URL Changed
@@ -72,13 +72,13 @@ Temporary tunnels often change URLs between runs.
 For a one-off run:
 
 ```bash
-KONTROL_PUBLIC_BASE_URL="https://new-tunnel.example.com" npx @bamn/kontrol serve
+KONTROL_PUBLIC_BASE_URL="https://new-tunnel.example.com" npx @b-a-m-n/kontrol serve
 ```
 
 For a stable URL:
 
 ```bash
-npx @bamn/kontrol config set publicBaseUrl https://kontrol.example.com
+npx @b-a-m-n/kontrol config set publicBaseUrl https://kontrol.example.com
 ```
 
 ## Host Header Or 403 Problems
@@ -88,7 +88,7 @@ Kontrol derives allowed hosts from the configured public URL.
 Run:
 
 ```bash
-npx @bamn/kontrol doctor
+npx @b-a-m-n/kontrol doctor
 ```
 
 Confirm the public URL hostname appears in allowed hosts. If you changed tunnel
@@ -97,7 +97,7 @@ URLs, update `publicBaseUrl`.
 Use this only for intentional local debugging:
 
 ```bash
-KONTROL_ALLOWED_HOSTS="*" npx @bamn/kontrol serve
+KONTROL_ALLOWED_HOSTS="*" npx @b-a-m-n/kontrol serve
 ```
 
 ## OAuth Redirect Host Rejected
@@ -113,7 +113,7 @@ localhost
 If another MCP client uses a different redirect host, configure:
 
 ```bash
-KONTROL_OAUTH_ALLOWED_REDIRECT_HOSTS="chatgpt.com,example.com" npx @bamn/kontrol serve
+KONTROL_OAUTH_ALLOWED_REDIRECT_HOSTS="chatgpt.com,example.com" npx @b-a-m-n/kontrol serve
 ```
 
 ## Owner Password Not Accepted
@@ -127,7 +127,7 @@ Make sure you are entering the Owner password from:
 To regenerate setup:
 
 ```bash
-npx @bamn/kontrol init --force
+npx @b-a-m-n/kontrol init --force
 ```
 
 ## Unknown `workspaceId`
@@ -146,13 +146,13 @@ The path must be inside one of the allowed roots configured during setup.
 Run:
 
 ```bash
-npx @bamn/kontrol config get
+npx @b-a-m-n/kontrol config get
 ```
 
 Then either open a project under an allowed root or rerun setup:
 
 ```bash
-npx @bamn/kontrol init --force
+npx @b-a-m-n/kontrol init --force
 ```
 
 ## Worktree Mode Fails
@@ -180,7 +180,7 @@ Install Git for Windows and use Git Bash, or use WSL, MSYS2, or Cygwin Bash.
 Run:
 
 ```bash
-npx @bamn/kontrol doctor
+npx @b-a-m-n/kontrol doctor
 ```
 
 Confirm Bash is detected.
@@ -190,7 +190,7 @@ Confirm Bash is detected.
 Skills are enabled by default. Check:
 
 ```bash
-KONTROL_SKILLS=1 npx @bamn/kontrol serve
+KONTROL_SKILLS=1 npx @b-a-m-n/kontrol serve
 ```
 
 Kontrol looks in standard Agent Skills locations:
