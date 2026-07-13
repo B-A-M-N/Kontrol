@@ -336,7 +336,11 @@ export const dispatchOutbox = sqliteTable("dispatch_outbox", {
   aggregateRevision: integer("aggregate_revision").notNull().default(0),
   payloadJson: text("payload_json").notNull().default("{}"),
   status: text("status").notNull().default("pending"),
+  /** Claim odometer — bumped every time claimNext() hands this row to a worker.
+   * Observability only; NOT the dead-letter trigger (see failureCount). */
   attemptCount: integer("attempt_count").notNull().default(0),
+  /** Genuine dispatch failures (markFailed). Drives backoff + dead-lettering. */
+  failureCount: integer("failure_count").notNull().default(0),
   availableAt: text("available_at").notNull(),
   claimedBy: text("claimed_by"),
   claimExpiresAt: text("claim_expires_at"),
@@ -455,3 +459,34 @@ export type MissionWorkOrderRow = typeof missionWorkOrders.$inferSelect;
 export type NewMissionWorkOrderRow = typeof missionWorkOrders.$inferInsert;
 export type MissionEvidenceRow = typeof missionEvidence.$inferSelect;
 export type NewMissionEvidenceRow = typeof missionEvidence.$inferInsert;
+
+// v22: durable agent→WebUI messages and artifacts. The event log carries the
+// wakeup; this table is the durable record so a reloaded WebUI can re-list every
+// clarification request, blocker, finding, note, and artifact for a session
+// without replaying the entire event stream.
+export const agentMessages = sqliteTable("agent_messages", {
+  id: text("id").primaryKey(),
+  workSessionId: text("work_session_id")
+    .notNull()
+    .references(() => workSessions.id, { onDelete: "cascade" }),
+  runId: text("run_id"),
+  /** clarification_request | blocker | finding | artifact | note */
+  kind: text("kind").notNull(),
+  /** Sender role: "worker" | "agent". Reviewer replies flow via feedback/approval. */
+  author: text("author").notNull().default("worker"),
+  title: text("title"),
+  body: text("body"),
+  /** Structured payload (artifact ref, finding evidence, options for a question). */
+  dataJson: text("data_json").notNull().default("{}"),
+  /** Correlates a reviewer reply back to this message (e.g. a clarification answer). */
+  replyToId: text("reply_to_id"),
+  status: text("status").notNull().default("open"),
+  createdAt: text("created_at").notNull(),
+  resolvedAt: text("resolved_at"),
+}, (table) => [
+  index("agent_messages_session_idx").on(table.workSessionId, table.createdAt),
+  index("agent_messages_kind_idx").on(table.workSessionId, table.kind, table.status),
+]);
+
+export type AgentMessageRow = typeof agentMessages.$inferSelect;
+export type NewAgentMessageRow = typeof agentMessages.$inferInsert;
