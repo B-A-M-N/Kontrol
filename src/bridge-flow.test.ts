@@ -236,6 +236,28 @@ try {
     assert.equal(workSessions.get(reviewed.structuredContent.sessionId)!.completionPolicy, "webui_approval_required");
   }
 
+  // ── Session/approval read authorization ──
+  {
+    const sessionA = createSession();
+    const sessionB = createSession();
+    const clientRead = await callClient("get_work_session", { sessionId: sessionA });
+    assert.ok(clientRead.isError, "ordinary client cannot read arbitrary work session state");
+    const clientReviews = await callClient("list_pending_reviews", {});
+    assert.ok(clientReviews.isError, "ordinary client cannot enumerate pending reviews");
+
+    const clientPolicyServer = fakeServer();
+    registerPolicyTools(clientPolicyServer as any, { eventStore, policyEngine, approvalRequests, principalRole: "client" });
+    const clientPolicy = (name: string, args: any) => clientPolicyServer.handlers.get(name)!(args);
+    const approvalList = await clientPolicy("list_pending_approvals", {});
+    assert.ok(approvalList.isError, "ordinary client cannot enumerate pending approvals");
+
+    const boundA = fakeServer();
+    registerBridgeTools(boundA as any, { ...config, principalRole: "worker", connectionWorkSessionId: sessionA } as BridgeConfig);
+    const callBoundA = (name: string, args: any) => boundA.handlers.get(name)!(args);
+    assert.ok(!(await callBoundA("get_work_session", { sessionId: sessionA })).isError, "bound worker can read own session");
+    assert.ok((await callBoundA("get_work_session", { sessionId: sessionB })).isError, "bound worker cannot read another session");
+  }
+
   // ── Scenario 1: full WebUI→agent→review→changes→resume→approve ──
   // A live parked waiter must suppress the duplicate dispatcher worker.
   {

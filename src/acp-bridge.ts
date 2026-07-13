@@ -166,6 +166,12 @@ function assertWorkerSessionBinding(config: BridgeConfig, sessionId: string) {
   return null;
 }
 
+function requireWorkSessionRead(config: BridgeConfig, sessionId: string) {
+  if (isReviewer(config.principalRole)) return null;
+  if (config.principalRole === "worker" && config.connectionWorkSessionId === sessionId) return null;
+  return forbidden(config.principalRole, "work-session read");
+}
+
 function parsePatchFiles(patch: string): Array<{ path: string; operation: "add" | "update" | "delete"; additions: number; removals: number }> {
   const files: Array<{ path: string; operation: "add" | "update" | "delete"; additions: number; removals: number }> = [];
   const blocks = patch.split(/^diff --git /m).filter(Boolean);
@@ -688,6 +694,8 @@ export function registerBridgeTools(
       annotations: { readOnlyHint: true },
     },
     async ({ sessionId, submissionId }) => {
+      const access = requireWorkSessionRead(config, sessionId);
+      if (access) return access;
       const session = config.workSessions.get(sessionId);
       if (!session) return { content: [{ type: "text" as const, text: "Session not found." }], isError: true };
 
@@ -1478,6 +1486,8 @@ export function registerBridgeTools(
       annotations: { readOnlyHint: true },
     },
     async ({ sessionId }) => {
+      const access = requireWorkSessionRead(config, sessionId);
+      if (access) return access;
       const session = config.workSessions.get(sessionId);
       if (!session) return { content: [{ type: "text" as const, text: "Session not found." }], isError: true };
 
@@ -1540,6 +1550,8 @@ export function registerBridgeTools(
       annotations: { readOnlyHint: true },
     },
     async ({ sessionId, afterSeq, timeoutMs }) => {
+      const access = requireWorkSessionRead(config, sessionId);
+      if (access) return access;
       const session = config.workSessions.get(sessionId);
       if (!session) {
         return { content: [{ type: "text" as const, text: "Session not found." }], isError: true };
@@ -1957,6 +1969,8 @@ export function registerBridgeTools(
       annotations: { readOnlyHint: true },
     },
     async ({ sessionId }) => {
+      const access = requireWorkSessionRead(config, sessionId);
+      if (access) return access;
       const session = config.workSessions.get(sessionId);
       if (!session) return { content: [{ type: "text" as const, text: "Session not found." }], isError: true };
 
@@ -2039,6 +2053,9 @@ export function registerBridgeTools(
       annotations: { readOnlyHint: true },
     },
     async ({ workspaceId }) => {
+      if (!isReviewer(config.principalRole)) {
+        return forbidden(config.principalRole, "list_pending_reviews");
+      }
       const sessions = config.workSessions.listPendingReviews(workspaceId);
       const text = sessions.length === 0
         ? "No sessions awaiting review."
@@ -2193,6 +2210,9 @@ export function registerBridgeTools(
       annotations: { readOnlyHint: true },
     },
     async () => {
+      if (!isReviewer(config.principalRole)) {
+        return forbidden(config.principalRole, "discover_agents");
+      }
       const all = config.agentRegistry.listAll();
       const alive = all.filter((a) => a.alive);
       // Probe each alive peer for protocol readiness so a stale/gRPC-only endpoint

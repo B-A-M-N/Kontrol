@@ -128,6 +128,12 @@ export function registerPolicyTools(
       annotations: { readOnlyHint: true, destructiveHint: false },
     },
     async ({ workspaceId }) => {
+      if (!isReviewer(config.principalRole)) {
+        return {
+          content: [{ type: "text" as const, text: "Forbidden: open_approval_center requires reviewer authority." }],
+          isError: true,
+        };
+      }
       const approvals = listAllApprovals(config, workspaceId);
       return {
         content: [{ type: "text" as const, text: `${approvals.length} pending approval(s).` }],
@@ -168,6 +174,12 @@ export function registerPolicyTools(
       annotations: { readOnlyHint: true, destructiveHint: false },
     },
     async ({ workspaceId }) => {
+      if (!isReviewer(config.principalRole)) {
+        return {
+          content: [{ type: "text" as const, text: "Forbidden: list_pending_approvals requires reviewer authority." }],
+          isError: true,
+        };
+      }
       const pending = listAllApprovals(config, workspaceId);
 
       return {
