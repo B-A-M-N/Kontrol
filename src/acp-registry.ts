@@ -78,6 +78,11 @@ export interface AgentRegistryManager {
     attemptNumber?: number;
   }): PersistentAcpRun;
   updateRun(runId: string, updates: Partial<PersistentAcpRun>): void;
+  updateRunIfCurrent(
+    runId: string,
+    expected: { status: string; attemptNumber: number },
+    updates: Partial<PersistentAcpRun>,
+  ): boolean;
   getRun(runId: string): PersistentAcpRun | undefined;
   getRunByWorkSessionId(workSessionId: string): PersistentAcpRun | undefined;
   listRuns(workspaceSessionId?: string, limit?: number): PersistentAcpRun[];
@@ -318,6 +323,25 @@ class SqliteAgentRegistryManager implements AgentRegistryManager {
       .run();
   }
 
+  updateRunIfCurrent(
+    runId: string,
+    expected: { status: string; attemptNumber: number },
+    updates: Partial<PersistentAcpRun>,
+  ): boolean {
+    const values = runUpdateValues(updates);
+    if (Object.keys(values).length === 0) return true;
+    const result = this.database.db
+      .update(acpRuns)
+      .set(values)
+      .where(and(
+        eq(acpRuns.runId, runId),
+        eq(acpRuns.status, expected.status),
+        eq(acpRuns.attemptNumber, expected.attemptNumber),
+      ))
+      .run();
+    return result.changes > 0;
+  }
+
   getRun(runId: string): PersistentAcpRun | undefined {
     const row = this.database.db
       .select()
@@ -436,6 +460,23 @@ class SqliteAgentRegistryManager implements AgentRegistryManager {
     if (this.webhookTimer) clearInterval(this.webhookTimer);
     this.database.close();
   }
+}
+
+function runUpdateValues(updates: Partial<PersistentAcpRun>): Record<string, unknown> {
+  const values: Record<string, unknown> = {};
+  if (updates.status !== undefined) values.status = updates.status;
+  if (updates.outputPreview !== undefined) values.outputPreview = updates.outputPreview;
+  if (updates.outputJson !== undefined) values.outputJson = updates.outputJson;
+  if (updates.errorMessage !== undefined) values.errorMessage = updates.errorMessage;
+  if (updates.webhookDelivered !== undefined) values.webhookDelivered = updates.webhookDelivered ? 1 : 0;
+  if (updates.finishedAt !== undefined) values.finishedAt = updates.finishedAt;
+  if (updates.remoteRunId !== undefined) values.remoteRunId = updates.remoteRunId;
+  if (updates.attemptNumber !== undefined) values.attemptNumber = updates.attemptNumber;
+  if (updates.lastHeartbeatAt !== undefined) values.lastHeartbeatAt = updates.lastHeartbeatAt;
+  if (Object.prototype.hasOwnProperty.call(updates, "workerLeaseUntil")) {
+    values.workerLeaseUntil = updates.workerLeaseUntil ?? null;
+  }
+  return values;
 }
 
 function rowToAgentInfo(row: AgentRegistryRow): AgentInfo {
