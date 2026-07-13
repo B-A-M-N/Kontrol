@@ -1,7 +1,7 @@
 # Setup Guide
 
 This guide is for users who want ChatGPT or another MCP host to work in local
-projects through DevSpace.
+projects through Dev Desktop.
 
 ## Requirements
 
@@ -9,9 +9,9 @@ projects through DevSpace.
 - npm
 - Git
 - Bash, including Git Bash or WSL on Windows
-- a public HTTPS URL that forwards to the local DevSpace server
+- a public HTTPS URL that forwards to the local Dev Desktop server
 
-DevSpace does not create the public tunnel for you. Use Cloudflare Tunnel,
+Dev Desktop does not create the public tunnel for you. Use Cloudflare Tunnel,
 ngrok, Pinggy, Tailscale Funnel, or your own HTTPS reverse proxy.
 
 ## Install And Configure
@@ -19,14 +19,14 @@ ngrok, Pinggy, Tailscale Funnel, or your own HTTPS reverse proxy.
 Run:
 
 ```bash
-npx @waishnav/devspace init
+npx @bamn/devdesktop init
 ```
 
 The setup flow asks one question at a time.
 
 ### Project Roots
 
-Choose the folders ChatGPT is allowed to open through DevSpace. Keep this
+Choose the folders ChatGPT is allowed to open through Dev Desktop. Keep this
 narrow.
 
 Examples:
@@ -79,32 +79,32 @@ https://your-tunnel-host.example.com/mcp
 Run:
 
 ```bash
-npx @waishnav/devspace serve
+npx @bamn/devdesktop serve
 ```
 
 If your tunnel URL changes for one run, override it without rewriting config:
 
 ```bash
-DEVSPACE_PUBLIC_BASE_URL="https://new-tunnel.example.com" npx @waishnav/devspace serve
+DEVDESKTOP_PUBLIC_BASE_URL="https://new-tunnel.example.com" npx @bamn/devdesktop serve
 ```
 
 For a stable public URL, persist it:
 
 ```bash
-npx @waishnav/devspace config set publicBaseUrl https://devspace.example.com
-npx @waishnav/devspace serve
+npx @bamn/devdesktop config set publicBaseUrl https://devdesktop.example.com
+npx @bamn/devdesktop serve
 ```
 
 ## Approve The Client
 
-When ChatGPT, Claude, or another MCP client connects, DevSpace shows an Owner
+When ChatGPT, Claude, or another MCP client connects, Dev Desktop shows an Owner
 password approval page. Enter the Owner password printed during setup.
 
 The default config files are:
 
 ```text
-~/.devspace/config.json
-~/.devspace/auth.json
+~/.devdesktop/config.json
+~/.devdesktop/auth.json
 ```
 
 Keep `auth.json` private.
@@ -114,7 +114,7 @@ Keep `auth.json` private.
 Run:
 
 ```bash
-npx @waishnav/devspace doctor
+npx @bamn/devdesktop doctor
 ```
 
 The doctor command reports the resolved config, Node version, Node ABI, platform,
@@ -122,7 +122,7 @@ Git, Bash, public URL, allowed hosts, and SQLite native dependency status.
 
 ## Running From A Local Checkout
 
-If you are developing DevSpace itself instead of using the published package:
+If you are developing Dev Desktop itself instead of using the published package:
 
 ```bash
 npm install --include=dev

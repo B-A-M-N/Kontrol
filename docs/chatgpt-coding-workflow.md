@@ -1,6 +1,6 @@
 # ChatGPT Coding Workflow
 
-DevSpace brings a Codex-style coding-agent loop to ChatGPT and other MCP hosts:
+Dev Desktop brings a Codex-style coding-agent loop to ChatGPT and other MCP hosts:
 inspect the repo, follow local instructions, make scoped edits, run
 verification, and show the user what changed.
 
@@ -26,7 +26,7 @@ Do not reopen the same folder unless:
 
 ## Checkout Mode
 
-Checkout mode is the default. DevSpace opens the actual directory:
+Checkout mode is the default. Dev Desktop opens the actual directory:
 
 ```json
 {
@@ -50,19 +50,19 @@ Use worktree mode for isolated parallel work:
 Managed worktrees are created under:
 
 ```text
-~/.devspace/worktrees
+~/.devdesktop/worktrees
 ```
 
 Worktree mode requires a Git repository with at least one commit. It starts from
 `HEAD` unless `baseRef` is provided.
 
 Uncommitted source checkout changes are not copied into the managed worktree.
-DevSpace reports when the source checkout was dirty so the model can decide how
+Dev Desktop reports when the source checkout was dirty so the model can decide how
 to proceed with the user.
 
 ## Project Instructions
 
-When a workspace opens, DevSpace loads root-level instruction files:
+When a workspace opens, Dev Desktop loads root-level instruction files:
 
 - `AGENTS.md`
 - `AGENTS.MD`
@@ -79,31 +79,31 @@ new context during later tool calls.
 
 Skills are enabled by default for coding-agent workflows.
 
-DevSpace discovers standard Agent Skills from:
+Dev Desktop discovers standard Agent Skills from:
 
 - `~/.agents/skills`
 - project `.agents/skills`
 
 It also keeps compatibility with:
 
-- `DEVSPACE_AGENT_DIR/skills`, defaulting to `~/.codex/skills`
-- additional paths from `DEVSPACE_SKILL_PATHS`
+- `DEVDESKTOP_AGENT_DIR/skills`, defaulting to `~/.codex/skills`
+- additional paths from `DEVDESKTOP_SKILL_PATHS`
 
-Legacy project paths such as `.pi/skills` can be added through `DEVSPACE_SKILL_PATHS` when needed.
+Legacy project paths such as `.pi/skills` can be added through `DEVDESKTOP_SKILL_PATHS` when needed.
 
 When `open_workspace` returns matching skills, the model should read the
 advertised `SKILL.md` before following that skill.
 
-Skill paths may be outside the workspace. DevSpace only permits reading:
+Skill paths may be outside the workspace. Dev Desktop only permits reading:
 
 - advertised `SKILL.md` files
 - files under a skill directory after that skill's `SKILL.md` has been read
 
-Set `DEVSPACE_SKILLS=0` to hide skills from workspace output.
+Set `DEVDESKTOP_SKILLS=0` to hide skills from workspace output.
 
 ## Tool Names
 
-DevSpace exposes these tool names:
+Dev Desktop exposes these tool names:
 
 - `open_workspace`
 - `read`
@@ -111,14 +111,14 @@ DevSpace exposes these tool names:
 - `edit`
 - `bash`
 
-By default, DevSpace also runs in `DEVSPACE_TOOL_MODE=minimal`, so dedicated
+By default, Dev Desktop also runs in `DEVDESKTOP_TOOL_MODE=minimal`, so dedicated
 `grep`, `glob`, and `ls` tools are hidden. Use `bash` with command-line tools
 such as `rg`, `find`, and `ls` for search and directory inspection.
 
-Use `DEVSPACE_TOOL_MODE=full` to restore dedicated search and directory tools.
+Use `DEVDESKTOP_TOOL_MODE=full` to restore dedicated search and directory tools.
 
 The experimental Codex-style surface is enabled with
-`DEVSPACE_TOOL_MODE=codex`. It exposes:
+`DEVDESKTOP_TOOL_MODE=codex`. It exposes:
 
 - `open_workspace`
 - `read`
@@ -133,12 +133,12 @@ a PTY, or send Ctrl-C. Set `tty: true` only for commands that need a terminal.
 
 ## Show Changes
 
-By default, `DEVSPACE_WIDGETS=full`.
+By default, `DEVDESKTOP_WIDGETS=full`.
 
-In that mode, DevSpace attaches widget UI to the exposed workspace, file, edit,
+In that mode, Dev Desktop attaches widget UI to the exposed workspace, file, edit,
 and shell tools. The aggregate `show_changes` tool is not exposed by default.
 
-Use `DEVSPACE_WIDGETS=off` to disable widget UI, or `DEVSPACE_WIDGETS=changes`
+Use `DEVDESKTOP_WIDGETS=off` to disable widget UI, or `DEVDESKTOP_WIDGETS=changes`
 to expose the aggregate show-changes flow.
 
 ## Shell Use

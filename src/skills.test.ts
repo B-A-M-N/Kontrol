@@ -10,7 +10,7 @@ import {
   resolveSkillReadPath,
 } from "./skills.js";
 
-const root = await mkdtemp(join(tmpdir(), "devspace-skills-test-"));
+const root = await mkdtemp(join(tmpdir(), "devdesktop-skills-test-"));
 const originalHome = process.env.HOME;
 const originalUserProfile = process.env.USERPROFILE;
 
@@ -124,20 +124,20 @@ try {
   );
 
   const disabledConfig = loadConfig({
-    DEVSPACE_ALLOWED_ROOTS: projectRoot,
-    DEVSPACE_AGENT_DIR: agentDir,
-    DEVSPACE_SKILL_PATHS: explicitSkills,
-    DEVSPACE_SKILLS: "0",
-    DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+    DEVDESKTOP_ALLOWED_ROOTS: projectRoot,
+    DEVDESKTOP_AGENT_DIR: agentDir,
+    DEVDESKTOP_SKILL_PATHS: explicitSkills,
+    DEVDESKTOP_SKILLS: "0",
+    DEVDESKTOP_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
     PORT: "1",
   });
   assert.deepEqual(loadWorkspaceSkills(disabledConfig, projectRoot).skills, []);
 
   const config = loadConfig({
-    DEVSPACE_ALLOWED_ROOTS: projectRoot,
-    DEVSPACE_AGENT_DIR: agentDir,
-    DEVSPACE_SKILL_PATHS: [explicitSkills, "~/.claude/skills", "./.claude/skills"].join(","),
-    DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+    DEVDESKTOP_ALLOWED_ROOTS: projectRoot,
+    DEVDESKTOP_AGENT_DIR: agentDir,
+    DEVDESKTOP_SKILL_PATHS: [explicitSkills, "~/.claude/skills", "./.claude/skills"].join(","),
+    DEVDESKTOP_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
     PORT: "1",
   });
   const loaded = loadWorkspaceSkills(config, projectRoot);
@@ -151,10 +151,10 @@ try {
   assert.equal(loaded.diagnostics.some((diagnostic) => diagnostic.type === "collision"), true);
 
   const duplicateConfig = loadConfig({
-    DEVSPACE_ALLOWED_ROOTS: projectRoot,
-    DEVSPACE_AGENT_DIR: agentDir,
-    DEVSPACE_SKILL_PATHS: [explicitSkills, "./.agents/skills"].join(","),
-    DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+    DEVDESKTOP_ALLOWED_ROOTS: projectRoot,
+    DEVDESKTOP_AGENT_DIR: agentDir,
+    DEVDESKTOP_SKILL_PATHS: [explicitSkills, "./.agents/skills"].join(","),
+    DEVDESKTOP_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
     PORT: "1",
   });
   assert.equal(
@@ -163,10 +163,10 @@ try {
   );
 
   const legacyPiConfig = loadConfig({
-    DEVSPACE_ALLOWED_ROOTS: projectRoot,
-    DEVSPACE_AGENT_DIR: agentDir,
-    DEVSPACE_SKILL_PATHS: [explicitSkills, join(projectRoot, ".pi", "skills")].join(","),
-    DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+    DEVDESKTOP_ALLOWED_ROOTS: projectRoot,
+    DEVDESKTOP_AGENT_DIR: agentDir,
+    DEVDESKTOP_SKILL_PATHS: [explicitSkills, join(projectRoot, ".pi", "skills")].join(","),
+    DEVDESKTOP_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
     PORT: "1",
   });
   assert.equal(
