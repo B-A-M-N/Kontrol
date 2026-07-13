@@ -16,11 +16,16 @@ const KONTROL_ACP_URL = process.env.KONTROL_ACP_URL || "http://127.0.0.1:7676/ac
 const AGENT_SECRET = process.env.KONTROL_ACP_AGENT_SECRET;
 const ADAPTER_SECRET = process.env.KONTROL_ACP_ADAPTER_SECRET;
 const HERMES_BIN = process.env.HERMES_BIN || "hermes";
-const HERMES_AGENT_ROOT = process.env.HERMES_AGENT_ROOT || "/home/bamn/hermes-agent";
+const HERMES_AGENT_ROOT = process.env.HERMES_AGENT_ROOT || process.cwd();
 const ADAPTER_PORT = Number(process.env.HERMES_ACP_ADAPTER_PORT || process.env.ACP_ADAPTER_PORT || "9911");
 const ADAPTER_HOST = process.env.HOST || "127.0.0.1";
 const RUNNER = new URL("./hermes-native-runner.py", import.meta.url).pathname;
 const HERMES_ACP_COMPAT_PATH = new URL("./hermes-acp-compat", import.meta.url).pathname;
+
+if (process.argv.includes("--validate-imports")) {
+  console.log("[hermes-native] import validation ok");
+  process.exit(0);
+}
 
 if (!AGENT_SECRET || !ADAPTER_SECRET) {
   console.error("[hermes-native] KONTROL_ACP_AGENT_SECRET and KONTROL_ACP_ADAPTER_SECRET are required");
@@ -438,7 +443,7 @@ function resolveHermesPython() {
     }
   }
   console.error("[hermes-native] no Python interpreter can import Hermes ACP modules");
-  console.error("Set HERMES_NATIVE_PYTHON to the Hermes virtualenv Python, e.g. /home/bamn/hermes-agent/.venv/bin/python");
+  console.error("Set HERMES_NATIVE_PYTHON to the Hermes virtualenv Python, e.g. /path/to/hermes-agent/.venv/bin/python");
   process.exit(1);
 }
 

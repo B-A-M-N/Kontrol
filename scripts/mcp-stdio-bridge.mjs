@@ -18,13 +18,12 @@
 //   "kontrol": {
 //     "type": "stdio",
 //     "command": "node",
-//     "args": ["/home/bamn/devspace/scripts/mcp-stdio-bridge.mjs"],
-//     "cwd": "/home/bamn/devspace"
+//     "args": ["/absolute/path/to/Kontrol/scripts/mcp-stdio-bridge.mjs"],
+//     "cwd": "/absolute/path/to/project"
 //   }
 //
-// Auth: Kontrol's /mcp requires `Authorization: Bearer <DEVDE...EN>`
-// in tunnel mode. The bridge loads that token from /home/bamn/devspace/.env (gitignored)
-// so the secret is never written into crush.json.
+// Auth: tunnel mode can use KONTROL_TUNNEL_TOKEN directly. If needed, point
+// KONTROL_BRIDGE_ENV at a 0600 env file containing KONTROL_TUNNEL_TOKEN.
 
 import { readFileSync } from "node:fs";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -41,7 +40,12 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 
 const KONTROL_URL = process.env.KONTROL_BRIDGE_URL || "http://127.0.0.1:7676/mcp";
-const KONTROL_ENV = process.env.KONTROL_BRIDGE_ENV || "/home/bamn/devspace/.env";
+const KONTROL_ENV = process.env.KONTROL_BRIDGE_ENV || "";
+
+if (process.argv.includes("--validate-imports")) {
+  console.log("[mcp-stdio-bridge] import validation ok");
+  process.exit(0);
+}
 
 // Tools the coding agent (worker) is permitted to use. Anything NOT in this
 // set — especially reviewer-only tools — is hidden from discovery AND rejected
@@ -77,6 +81,7 @@ const REVIEWER_TOOLS = new Set([
 
 function loadToken() {
   if (process.env.KONTROL_TUNNEL_TOKEN) return process.env.KONTROL_TUNNEL_TOKEN;
+  if (!KONTROL_ENV) return "";
   try {
     const text = readFileSync(KONTROL_ENV, "utf8");
     for (const line of text.split("\n")) {

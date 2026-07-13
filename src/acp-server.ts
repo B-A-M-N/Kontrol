@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { Router } from "express";
 import type { Request, Response } from "express";
 import type { WorkspaceRegistry } from "./workspaces.js";
@@ -112,6 +112,70 @@ export function createAcpServer(
     } catch { return undefined; }
   }
 
+  function extractTaskText(input: Array<{ parts?: Array<{ content?: string }> }>): string {
+    return input.map((m) => m.parts?.map((p) => p.content ?? "").join("\n") ?? "").filter(Boolean).join("\n");
+  }
+
+  function resolveRunContext(
+    res: Response,
+    input: {
+      workspace_id?: string;
+      workspace_session_id?: string;
+      work_session_id?: string;
+      session_id?: string;
+      submittedBy: string;
+      title: string;
+    },
+  ): { workspaceId: string; workspaceRoot: string; session: ReturnType<WorkSessionManager["create"]> } | undefined {
+    const suppliedWorkSessionId = input.work_session_id ?? input.session_id;
+    const suppliedWorkspaceId = input.workspace_id ?? input.workspace_session_id;
+
+    let session = suppliedWorkSessionId ? workSessions.get(suppliedWorkSessionId) : undefined;
+    if (suppliedWorkSessionId && !session) {
+      res.status(404).json({ error: { code: "not_found", message: `Unknown work session: ${suppliedWorkSessionId}` } });
+      return undefined;
+    }
+
+    const workspaceId = suppliedWorkspaceId ?? session?.workspaceSessionId;
+    if (!workspaceId) {
+      res.status(400).json({
+        error: {
+          code: "invalid_input",
+          message: "workspace_id or workspace_session_id is required unless work_session_id/session_id names an existing work session",
+        },
+      });
+      return undefined;
+    }
+
+    if (session && session.workspaceSessionId !== workspaceId) {
+      res.status(409).json({ error: { code: "conflict", message: "work_session_id does not belong to the supplied workspace" } });
+      return undefined;
+    }
+
+    let workspaceRoot: string;
+    try {
+      workspaceRoot = workspaces.getWorkspace(workspaceId).root;
+    } catch (error) {
+      res.status(400).json({
+        error: {
+          code: "invalid_workspace",
+          message: error instanceof Error ? error.message : `Unknown workspace: ${workspaceId}`,
+        },
+      });
+      return undefined;
+    }
+
+    if (!session) {
+      session = workSessions.create({
+        workspaceSessionId: workspaceId,
+        submittedBy: input.submittedBy,
+        title: input.title,
+      });
+    }
+
+    return { workspaceId, workspaceRoot, session };
+  }
+
   // GET /ping
   router.get("/ping", (req, res) => {
     if (!authGate(req, res)) return;
@@ -204,11 +268,14 @@ export function createAcpServer(
   router.post("/runs", async (req: Request, res: Response) => {
     if (!authGate(req, res)) return;
 
-    const { agent_name, input, mode, session_id, webhook_url } = req.body as {
+    const { agent_name, input, mode, session_id, work_session_id, workspace_id, workspace_session_id, webhook_url } = req.body as {
       agent_name?: string;
       input?: Array<{ parts?: Array<{ content?: string }> }>;
       mode?: string;
       session_id?: string;
+      work_session_id?: string;
+      workspace_id?: string;
+      workspace_session_id?: string;
       webhook_url?: string;
     };
 
@@ -236,24 +303,50 @@ export function createAcpServer(
         return;
       }
       const peer = selection.agent;
-      // Forward to peer
-      const taskText = input.map((m) => m.parts?.map((p) => p.content ?? "").join("\n") ?? "").filter(Boolean).join("\n");
-      const wsId = session_id ?? `wsess_acp_${randomUUID()}`;
-      let session = workSessions.get(wsId);
-      if (!session) session = workSessions.create({ workspaceSessionId: wsId, submittedBy: "acp", title: `${agent_name}: ${taskText.slice(0, 100)}` });
+      const taskText = extractTaskText(input);
+      const context = resolveRunContext(res, {
+        workspace_id,
+        workspace_session_id,
+        work_session_id,
+        session_id,
+        submittedBy: "acp",
+        title: `${agent_name}: ${taskText.slice(0, 100)}`,
+      });
+      if (!context) return;
+      const { session, workspaceRoot } = context;
 
-      const run = agentRegistry.createRun({ agentName: agent_name, workspaceSessionId: session.workspaceSessionId, workSessionId: session.id, inputPreview: taskText.slice(0, 500), webhookUrl: webhook_url, status: "in-progress" });
+      const run = agentRegistry.createRun({ agentName: agent_name, workspaceSessionId: session.workspaceSessionId, workSessionId: session.id, inputPreview: taskText.slice(0, 500), webhookUrl: webhook_url, status: "running" });
 
       try {
         const peerResp = await dispatchToPeer({
           agentUrl: peer.url,
           sharedSecret,
-          body: { agent_name, mode: mode ?? "sync", input, session_id: session.id, webhook_url },
+          body: {
+            agent_name,
+            mode: mode ?? "async",
+            input,
+            session_id: session.id,
+            work_session_id: session.id,
+            workspace_session_id: session.workspaceSessionId,
+            workspace_root: workspaceRoot,
+            parent_run_id: run.runId,
+            webhook_url,
+          },
           timeoutMs: 120_000,
         });
         const peerResult = peerResp.body;
-        agentRegistry.updateRun(run.runId, { status: "completed", outputJson: JSON.stringify(peerResult).slice(0, 10_000), finishedAt: new Date().toISOString() });
-        res.status(mode === "async" ? 202 : 200).json(peerResult);
+        const remoteRunId = typeof peerResult.remote_run_id === "string"
+          ? peerResult.remote_run_id
+          : typeof peerResult.run_id === "string"
+            ? peerResult.run_id
+            : undefined;
+        agentRegistry.updateRun(run.runId, {
+          status: peerResp.status === 202 || peerResult.accepted === true ? "running" : "completed",
+          remoteRunId,
+          outputJson: JSON.stringify(peerResult).slice(0, 10_000),
+          finishedAt: peerResp.status === 202 || peerResult.accepted === true ? undefined : new Date().toISOString(),
+        });
+        res.status(peerResp.status === 202 || mode === "async" ? 202 : 200).json({ ...peerResult, kontrol_run_id: run.runId, session_id: session.id });
       } catch (error) {
         agentRegistry.updateRun(run.runId, { status: "failed", errorMessage: error instanceof Error ? error.message : String(error), finishedAt: new Date().toISOString() });
         res.status(502).json({ agent_name, run_id: run.runId, status: "failed", error: { message: `Peer routing failed: ${error instanceof Error ? error.message : String(error)}` }, output: [], created_at: run.createdAt, finished_at: new Date().toISOString() });
@@ -263,10 +356,17 @@ export function createAcpServer(
 
     // ── Local agent execution ──
 
-    const taskText = input.map((m) => m.parts?.map((p) => p.content ?? "").join("\n") ?? "").filter(Boolean).join("\n");
-    const wsId = session_id ?? `wsess_acp_${randomUUID()}`;
-    let session = workSessions.get(wsId);
-    if (!session) session = workSessions.create({ workspaceSessionId: wsId, submittedBy: "acp", title: `${agent_name}: ${taskText.slice(0, 100)}` });
+    const taskText = extractTaskText(input);
+    const context = resolveRunContext(res, {
+      workspace_id,
+      workspace_session_id,
+      work_session_id,
+      session_id,
+      submittedBy: "acp",
+      title: `${agent_name}: ${taskText.slice(0, 100)}`,
+    });
+    if (!context) return;
+    const { session } = context;
 
     const run = agentRegistry.createRun({ agentName: agent_name, workspaceSessionId: session.workspaceSessionId, workSessionId: session.id, inputPreview: taskText.slice(0, 500), webhookUrl: webhook_url, status: "in-progress" });
 
@@ -304,10 +404,6 @@ export function createAcpServer(
         res.status(500).json({ agent_name, run_id: run.runId, status: "failed", error: { message: "Review checkpoints unavailable" }, output: [], created_at: run.createdAt, finished_at: new Date().toISOString() });
         return;
       }
-
-      const wsId = session_id ?? `wsess_acp_${randomUUID()}`;
-      let session = workSessions.get(wsId);
-      if (!session) session = workSessions.create({ workspaceSessionId: wsId, submittedBy: "acp", title: `${agent_name}: ${taskText.slice(0, 100)}` });
 
       // P1 #3: enforce the reviewer's allowedNextActions on resubmission. A
       // reviewer that omitted "resubmit" cannot be bypassed by calling
