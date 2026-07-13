@@ -12,11 +12,22 @@ export type ToolName =
   | "grep"
   | "glob"
   | "ls"
-  | "bash";
+  | "bash"
+  | "submit_for_review"
+  | "submit_to_coding_agent"
+  | "open_approval_center";
 
 export type HostContext = NonNullable<ReturnType<App["getHostContext"]>>;
 
 export type PatchOperation = "add" | "update" | "delete" | "move";
+
+export interface AgentToolEvent {
+  tool: string;
+  path?: string;
+  summary?: string;
+  success: boolean;
+  createdAt: string;
+}
 
 export interface ToolResultCard {
   tool: ToolName;
@@ -24,6 +35,11 @@ export interface ToolResultCard {
   path?: string;
   root?: string;
   status?: string;
+  runId?: string;
+  workSessionId?: string;
+  output?: string;
+  agentStatus?: string;
+  toolEvents?: AgentToolEvent[];
   summary?: Record<string, unknown>;
   files?: Array<{
     path?: string;
@@ -76,7 +92,10 @@ export function isToolName(value: unknown): value is ToolName {
     value === "grep" ||
     value === "glob" ||
     value === "ls" ||
-    value === "bash"
+    value === "bash" ||
+    value === "submit_for_review" ||
+    value === "submit_to_coding_agent" ||
+    value === "open_approval_center"
   );
 }
 
@@ -105,11 +124,16 @@ export function isShellTool(tool: ToolName): boolean {
 }
 
 export function isReviewTool(tool: ToolName): boolean {
-  return tool === "show_changes";
+  return tool === "show_changes" || tool === "submit_for_review";
 }
 
 export function isToolResultCard(value: unknown): value is Omit<ToolResultCard, "tool"> {
   return Boolean(value && typeof value === "object");
+}
+
+/** A card produced by submit_to_coding_agent — represents a dispatched CLI run. */
+export function isAgentRunCard(value: unknown): value is ToolResultCard {
+  return isToolResultCard(value) && (value as ToolResultCard).tool === "submit_to_coding_agent";
 }
 
 export function payloadText(payload: ToolPayload | undefined): string {

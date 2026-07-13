@@ -1,166 +1,204 @@
 <p align="center">
   <picture>
-    <img src="https://raw.githubusercontent.com/Waishnav/devspace/main/docs/assets/devspace-logo-light.png" alt="DevSpace logo" width="140">
+    <img src="https://raw.githubusercontent.com/BAMN/devdesktop/main/docs/assets/devdesktop-logo-light.png" alt="Dev Desktop logo" width="140">
   </picture>
 </p>
 
-<h1 align="center">DevSpace</h1>
+<h1 align="center">Dev Desktop</h1>
 
-<p align="center">Bring a Codex-style coding workflow to ChatGPT.</p>
+<p align="center">A self-hosted MCP server that lets any AI coding agent read, edit, search, and run code in your local projects — with structured human review loops and policy controls.</p>
 
 <p align="center">
-  <a href="https://www.npmjs.com/package/@waishnav/devspace"><img alt="npm" src="https://img.shields.io/npm/v/%40waishnav%2Fdevspace?style=flat-square" /></a>
-  <a href="https://github.com/Waishnav/devspace/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/Waishnav/devspace/ci.yml?style=flat-square&branch=main" /></a>
-  <a href="https://github.com/Waishnav/devspace/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/npm/l/%40waishnav%2Fdevspace?style=flat-square" /></a>
+  <a href="https://www.npmjs.com/package/@bamn/devdesktop"><img alt="npm" src="https://img.shields.io/npm/v/%40bamn%2Fdevdesktop?style=flat-square" /></a>
+  <a href="https://github.com/BAMN/devdesktop/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/BAMN/devdesktop/ci.yml?style=flat-square&branch=main" /></a>
+  <a href="https://github.com/BAMN/devdesktop/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/npm/l/%40bamn%2Fdevdesktop?style=flat-square" /></a>
 </p>
 
-[![DevSpace connected to ChatGPT](https://raw.githubusercontent.com/Waishnav/devspace/main/docs/assets/devspace-screenshot.png)](https://raw.githubusercontent.com/Waishnav/devspace/main/docs/assets/devspace-screenshot.png)
+[![Dev Desktop connected to a coding agent](https://raw.githubusercontent.com/BAMN/devdesktop/main/docs/assets/devdesktop-screenshot.png)](https://raw.githubusercontent.com/BAMN/devdesktop/main/docs/assets/devdesktop-screenshot.png)
 
-**Give ChatGPT a secure connection to your own machine and Turn ChatGPT into Codex**
+**Any MCP-capable agent. Your machine. Your projects. Your rules.**
 
-DevSpace is a self-hosted MCP server that lets ChatGPT read, edit, search, and run code in your real local projects — your files, your tools, your terminal — without uploading anything to a third party. You run it on your machine, expose it through a tunnel you control, and approve the connection with a password only you have.
+Dev Desktop is a self-hosted MCP server that exposes your local project files to any AI coding agent — ChatGPT, Claude, Codex, Cursor, or whatever speaks MCP over Streamable HTTP. It adds an event-driven review loop so humans can inspect and approve agent work, and a policy engine so you control which tools and paths require approval.
 
-## Sponsors and Special Thanks
+You run it on your machine, expose it through a tunnel you control, and connect any MCP client.
 
-<table>
-  <thead>
-    <tr>
-      <th>Sponsor</th>
-      <th>About</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td align="center" width="220">
-        <a href="https://rebates.ai/">
-          <img
-            src="https://app.rebates.ai/brand/rebates-lockup.svg"
-            alt="Rebates"
-            width="170"
-          >
-        </a>
-      </td>
-      <td>
-        <strong>The ads in your terminal pay you.</strong><br><br>
-        <a href="https://rebates.ai/">Rebates</a> adds one optional
-        sponsored footer to your coding agent and pays you cash back for every
-        session in which it is shown. Turn it off at any time.
-      </td>
-    </tr>
-  </tbody>
-</table>
+## What Makes It Different
 
-<p>
-  DevSpace is open to new sponsors.
-  <a href="https://x.com/wshxnv">Get in touch to become one.</a>
-</p>
+Most MCP file-server bridges stop at "read/write/edit." Dev Desktop adds three layers on top:
+
+**Ralphie Muntz Loop** — Agents submit work for human review. The review surface (WebUI or any MCP client) shows the diff. Human approves, requests changes, or rejects. The agent continues from durable feedback state — even if the agent process died and restarted.
+
+**Continuation Outbox** — Every review decision generates a structured continuation packet with verdict, required actions, and resumption instructions. The packet crosses from the review surface to the next agent turn, so work continues without losing context.
+
+**Policy Mode** — Per-tool and per-path approval rules. A dangerous command can require a one-time approval, or you can approve it for an entire workspace session. Read-only inspection stays fast; destructive ops pause for human judgment.
+
+Underneath it all is an **event-sourced architecture**: every submission, feedback, approval, and continuation is an immutable event in an SQLite log. State is a projection. Live waiters are just one subscriber.
 
 ## Installation
 
-DevSpace requires Node `>=22.19 <27`.
-
-Install the DevSpace CLI:
+Dev Desktop requires Node `>=22.19 <27`.
 
 ```bash
-npm install -g @waishnav/devspace
+npm install -g @bamn/devdesktop
 ```
 
-Then initialize and start the server:
+Then initialize and start:
 
 ```bash
-devspace init
-devspace serve
+devdesktop init
+devdesktop serve
 ```
 
-Or run it without a global install:
+Or without a global install:
 
 ```bash
-npx @waishnav/devspace init
-npx @waishnav/devspace serve
+npx @bamn/devdesktop init
+npx @bamn/devdesktop serve
 ```
 
-During setup, DevSpace asks for:
+During setup, Dev Desktop asks for:
 
-- the local project folders ChatGPT is allowed to open through DevSpace
+- the local project folders agents are allowed to open
 - the local port, usually `7676`
-- your public HTTPS base URL from Cloudflare Tunnel, ngrok, Pinggy, Tailscale Funnel, or
-  another reverse proxy
+- your public HTTPS base URL from Cloudflare Tunnel, ngrok, Pinggy, Tailscale Funnel, or another reverse proxy
 
-Use the public origin without `/mcp` during setup:
+Use the public origin without `/mcp`:
 
 ```text
 https://your-tunnel-host.example.com
 ```
 
-You will configure your MCP client with the public `/mcp` URL after setup.
-
-When the client connects, DevSpace opens an Owner password approval page. Enter
-the Owner password printed by `devspace init`. It is also stored in:
+When the client connects, Dev Desktop opens an Owner password approval page. Enter the password printed by `devdesktop init`. It's also stored in:
 
 ```text
-~/.devspace/auth.json
+~/.devdesktop/auth.json
 ```
 
 Keep that password private.
 
-## Connect Your MCP Client
+## Connect Any MCP Client
 
-The default local endpoint is:
+The default local endpoint:
 
 ```text
 http://127.0.0.1:7676/mcp
 ```
 
-Most users should connect through a public HTTPS tunnel:
+Most users connect through a public HTTPS tunnel:
 
 ```text
 https://your-tunnel-host.example.com/mcp
 ```
 
-> [!NOTE]
-> Using DevSpace as an MCP connector isn't against OpenAI's Usage Policies — it's
-> a standard custom App/connector setup, and writing or running code isn't a
-> restricted use case. But your account is governed by your usage, not by
-> DevSpace. Don't point it at anything that would violate your provider's terms.
-> Used normally, you're fine. (Based on OpenAI's Usage Policies and Service Terms
-> as of June 2026.)
+Dev Desktop speaks standard MCP over Streamable HTTP. Any compatible client works: ChatGPT, Claude, Codex, Cursor, Windsurf, custom tooling.
 
-## What ChatGPT Can Do
+## OpenAI Secure MCP Tunnel
 
-Once connected, ChatGPT can open one of your approved project folders as a
-workspace. From there, it can inspect the repo, make scoped edits, run commands,
-and show you what changed.
+To connect Dev Desktop to ChatGPT without exposing an inbound port, run it locally and
+route ChatGPT through an [OpenAI Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels). In that setup use `DEVDESKTOP_AUTH_MODE=tunnel`: Dev Desktop binds a loopback address and **disables its own auth gate** on `/mcp`, so ChatGPT connects with **No Authentication**. Access control is delegated to the tunnel and to the OpenAI workspace that owns it. OAuth (the default for public deployments) is intentionally off here, because its authorization server is not reachable through the tunnel.
 
-DevSpace gives ChatGPT tools to:
+```bash
+DEVDESKTOP_AUTH_MODE=tunnel
+HOST=127.0.0.1
+PORT=7676
+npx @bamn/devdesktop serve
+```
 
-- read, write, and edit files inside the opened workspace
+Register the server in the tunnel client with **No Authentication**, pointing at the loopback origin:
+
+```bash
+tunnel-client run \
+  --mcp.server-url "http://127.0.0.1:7676/mcp"
+```
+
+The review WebUI is served as a self-contained MCP App resource (its CSS and JS are
+inlined into a single `workspace-app.html`), so the ChatGPT iframe needs no localhost
+fetches. See [Configuration Reference](docs/configuration.md#mcp-authentication-modes)
+for the full security rules.
+
+## What Agents Can Do
+
+Once connected, an agent can open an approved project folder as a workspace and:
+
+- read, write, and edit files
 - search code and inspect directories
 - run shell commands for tests, builds, git, and package scripts
-- use isolated Git worktrees for parallel coding sessions
+- use isolated Git worktrees for parallel sessions
 - follow project instructions from `AGENTS.md` and `CLAUDE.md`
 - discover local agent skills from your skill folders
 - show tool cards and optional change summaries in ChatGPT Apps-compatible hosts
+- submit work for human review and continue from feedback
+
+## Ralphie Muntz Loop
+
+The review loop is event-driven and provider-agnostic:
+
+```
+Agent submits work → DevDesktop captures diff, emits ReviewRequested
+     ↓
+Human reviews diff in WebUI / any MCP client
+     ↓
+Human approves, requests changes, or rejects
+     ↓
+DevDesktop persists feedback event + generates continuation packet
+     ↓
+If agent is live: it unblocks and continues
+If agent stopped: it reads feedback when it resumes
+```
+
+This loop lives in Dev Desktop's event log, not in any specific host. You can review submissions from the same interface you use to chat, from a terminal, or from a future tool.
+
+## Policy Mode
+
+Control which operations require human approval:
+
+```bash
+# Require approval for bash, allow file edits freely
+DEVDESKTOP_POLICY_TOOL_BASH=ask DEVDESKTOP_POLICY_TOOL_WRITE=allow
+
+# Deny access to sensitive paths (structured JSON — the per-rule env format
+# `DEVDESKTOP_POLICY_PATH_<glob>` is no longer supported; it is not valid
+# shell assignment syntax)
+DEVDESKTOP_POLICY_PATH_RULES='[{"pattern":"/etc/ssh/**","mode":"deny"}]'
+
+# Default: ask for anything not explicitly allowed
+DEVDESKTOP_POLICY_MODE=ask
+```
+
+Modes:
+
+| Mode   | Behavior                                              |
+|--------|-------------------------------------------------------|
+| allow  | Tool or path is always permitted                      |
+| deny   | Tool or path is always blocked                        |
+| ask    | Blocks the call until a human approves or denies it   |
+
+When a call requires approval, the agent's tool invocation blocks (long-poll) until a human decides. "Approve for work session" caches the decision for the rest of the work session so repeat operations don't re-prompt; "Approve for workspace" caches until the workspace closes; "Approve once" does not cache.
 
 ## Mental Model
 
-DevSpace is remote access to selected local folders.
+Dev Desktop is a **durable review mailbox and policy authority**, not just a file server.
 
-You decide which roots are allowed. The MCP client still has powerful local
-capabilities inside an opened workspace, including shell execution. Treat a
-connected client like a trusted coding partner with access to your machine.
+You decide which roots are allowed. You decide which tools require approval. The agent does its work, submits for review, and continues from structured feedback. The event log is the source of truth; every surface (CLI, WebUI, MCP tool) reads and writes events.
 
-For a normal ChatGPT coding session:
+For a normal session:
 
 1. Start your tunnel.
-2. Run `devspace serve`.
-3. Connect the MCP client to your public `/mcp` URL.
+2. Run `devdesktop serve`.
+3. Connect your MCP agent to the public `/mcp` URL.
 4. Approve the connection with the Owner password.
-5. Ask ChatGPT to open a project inside one of your allowed roots.
+5. Ask the agent to open a project inside one of your allowed roots.
+6. Review submissions as they come in.
+
+## Documentation
+
+- [Setup Guide](https://github.com/BAMN/devdesktop/blob/main/docs/setup.md)
+- [Coding Workflow](https://github.com/BAMN/devdesktop/blob/main/docs/chatgpt-coding-workflow.md)
+- [Configuration Reference](https://github.com/BAMN/devdesktop/blob/main/docs/configuration.md)
+- [Security Model](https://github.com/BAMN/devdesktop/blob/main/docs/security.md)
+- [Troubleshooting](https://github.com/BAMN/devdesktop/blob/main/docs/gotchas.md)
 
 ## Platform Support
-
-DevSpace supports Linux, macOS, and Windows environments with a Bash-compatible
-shell.
 
 | Platform                                          | Status            | Notes                                          |
 | ------------------------------------------------- | ----------------- | ---------------------------------------------- |
@@ -169,76 +207,15 @@ shell.
 | Windows with Git Bash, WSL, MSYS2, or Cygwin Bash | Supported         | Git Bash is the simplest native Windows setup. |
 | Windows PowerShell or `cmd.exe` only              | Not supported yet | Install Git Bash or use WSL.                   |
 
-Run this to inspect your local setup:
-
 ```bash
-devspace doctor
+devdesktop doctor
 ```
 
-## Documentation
+## Built by B-A-M-N
 
-- [Setup Guide](https://github.com/Waishnav/devspace/blob/main/docs/setup.md)
-- [ChatGPT Coding Workflow](https://github.com/Waishnav/devspace/blob/main/docs/chatgpt-coding-workflow.md)
-- [Configuration Reference](https://github.com/Waishnav/devspace/blob/main/docs/configuration.md)
-- [Security Model](https://github.com/Waishnav/devspace/blob/main/docs/security.md)
-- [Troubleshooting Gotchas](https://github.com/Waishnav/devspace/blob/main/docs/gotchas.md)
-
-## Philosophy
-
-Every piece of software is becoming conversational. Natural language is
-redefining how we interact with tools, workflows, and systems.
-
-My bet is that ChatGPT becomes the operating system for everything. Once we
-reach AGI, we will simply talk to ChatGPT, and it will prompt, coordinate, and
-orchestrate sub-agents that set up the right loops for us.
-
-We are not there yet.
-
-DevSpace is one attempt to fast-forward that future: a way for MCP-capable
-hosts like ChatGPT and Claude to work directly with local project files through
-explicit, inspectable tools.
-
-## Built by Waishnav
-
-I'm Waishnav, I like building opinionated products and tools, and DevSpace is one example of that.
-This year, I started my journey to build a single-person and multiple-agents company doing multiple millions in
-revenue. If you want to watch the failures, wins, lessons, and everything in
-between, come hang out with me on [X](https://x.com/wshxnv).
-
-## More from me
-
-<table>
-  <thead>
-    <tr>
-      <th>Project</th>
-      <th>About</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td align="center" width="220">
-        <a href="https://gitcms.dev/">
-          <img
-            src="https://gitcms.dev/brand/gitcms-logo.svg"
-            alt="GitCMS"
-            width="48"
-          /><br />
-          <strong>GitCMS</strong>
-        </a>
-      </td>
-      <td>
-        <strong>Modern CMS and tooling for markdown based content sites — built for agents and humans.</strong><br><br>
-        Visual editing, editorial workflow, and ChatGPT/Claude content agents, with
-        every post and page stored as files in your repo.
-        <a href="https://gitcms.dev/">Learn more</a>.
-      </td>
-    </tr>
-  </tbody>
-</table>
+I'm B-A-M-N. Dev Desktop is an opinionated take on how local coding agents and desktop environments can be extended novelly.
 
 ## Local Development
-
-For working on DevSpace itself:
 
 ```bash
 npm install --include=dev

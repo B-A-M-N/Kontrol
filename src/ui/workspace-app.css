@@ -353,6 +353,103 @@ body {
   border-bottom-left-radius: 8px;
 }
 
+.feedback-form {
+  display: grid;
+  gap: 8px;
+  padding: 12px 14px;
+  border-top: 1px solid color-mix(in srgb, var(--color-border-primary, #3a3a40) 72%, transparent);
+}
+
+.feedback-label {
+  font-size: var(--font-text-sm-size, 13px);
+  font-weight: 600;
+  color: var(--color-text-primary, #f5f5f6);
+}
+
+.feedback-textarea {
+  width: 100%;
+  resize: vertical;
+  min-height: 60px;
+  padding: 8px 10px;
+  border: 1px solid color-mix(in srgb, var(--color-border-primary, #3a3a40) 80%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--color-background-primary, #17181c) 90%, transparent);
+  color: var(--color-text-primary, #f5f5f6);
+  font: inherit;
+  font-size: var(--font-text-sm-size, 13px);
+  line-height: 1.5;
+}
+
+.feedback-textarea:focus {
+  outline: none;
+  border-color: color-mix(in srgb, var(--color-text-secondary, #d6d6dc) 60%, transparent);
+}
+
+.feedback-buttons {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.feedback-btn {
+  min-height: 30px;
+  padding: 0 14px;
+  border: 1px solid color-mix(in srgb, var(--color-border-primary, #3a3a40) 80%, transparent);
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--color-background-primary, #17181c) 36%, transparent);
+  color: var(--color-text-secondary, #d6d6dc);
+  cursor: pointer;
+  font: inherit;
+  font-size: var(--font-text-sm-size, 12px);
+  font-weight: 500;
+}
+
+.feedback-btn:hover {
+  background: color-mix(in srgb, var(--color-background-tertiary, #333338) 80%, transparent);
+  color: var(--color-text-primary, #f5f5f6);
+}
+
+.feedback-btn.approve {
+  border-color: color-mix(in srgb, var(--color-success-text, #6fda83) 44%, var(--color-border-primary, #3a3a40));
+  color: var(--color-success-text, #6fda83);
+}
+
+.feedback-btn.approve:hover {
+  background: color-mix(in srgb, var(--color-success-text, #6fda83) 12%, transparent);
+}
+
+.feedback-btn.changes {
+  border-color: color-mix(in srgb, var(--color-warning-text, #f5c451) 44%, var(--color-border-primary, #3a3a40));
+  color: var(--color-warning-text, #f5c451);
+}
+
+.feedback-btn.changes:hover {
+  background: color-mix(in srgb, var(--color-warning-text, #f5c451) 12%, transparent);
+}
+
+.feedback-btn.reject {
+  border-color: color-mix(in srgb, var(--color-danger-text, #ee7676) 44%, var(--color-border-primary, #3a3a40));
+  color: var(--color-danger-text, #ee7676);
+}
+
+.feedback-btn.reject:hover {
+  background: color-mix(in srgb, var(--color-danger-text, #ee7676) 12%, transparent);
+}
+
+.feedback-submitted {
+  padding: 12px 14px;
+  border-top: 1px solid color-mix(in srgb, var(--color-border-primary, #3a3a40) 72%, transparent);
+  color: var(--color-success-text, #6fda83);
+  font-size: var(--font-text-sm-size, 13px);
+}
+
+.feedback-error {
+  padding: 8px 14px;
+  border-top: 1px solid color-mix(in srgb, var(--color-border-primary, #3a3a40) 72%, transparent);
+  color: var(--color-danger-text, #ee7676);
+  font-size: var(--font-text-sm-size, 13px);
+}
+
 .text-payload {
   max-height: 420px;
   margin: 0;
@@ -382,4 +479,78 @@ body {
     width: 32px;
     height: 32px;
   }
+}
+
+.tool-card.agent {
+  border-left: 3px solid #7c3aed;
+}
+
+.agent-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 8px;
+}
+
+.agent-meta-row {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  color: var(--color-text-secondary, #9ca3af);
+  word-break: break-all;
+}
+
+.agent-activity-header {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-text-secondary, #9ca3af);
+  margin: 6px 0 4px;
+}
+
+.agent-activity {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.approval-list {
+  display: grid;
+  gap: 8px;
+  margin: 8px 0 12px;
+}
+
+.approval-card {
+  border: 1px solid var(--border, #2d3748);
+  border-radius: 8px;
+  padding: 10px;
+  background: var(--surface-subtle, rgba(255, 255, 255, 0.04));
+}
+
+.approval-title {
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.approval-detail {
+  color: var(--muted, #9ca3af);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+  margin-bottom: 8px;
+}
+
+.agent-event {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  color: var(--color-text-primary, #f5f5f6);
+  padding: 3px 6px;
+  border-radius: 4px;
+  background: var(--surface-hover, #1f2937);
+}
+
+.agent-event.failed {
+  color: #fca5a5;
+  background: rgba(239, 68, 68, 0.12);
 }

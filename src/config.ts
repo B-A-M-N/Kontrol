@@ -3,10 +3,13 @@ import { join, resolve } from "node:path";
 import { expandHomePath } from "./roots.js";
 import type { LoggingConfig, LogFormat, LogLevel } from "./logger.js";
 import type { OAuthConfig } from "./oauth-provider.js";
-import { loadDevspaceFiles } from "./user-config.js";
+import type { PolicyConfig } from "./policy.js";
+import { loadPolicyConfig } from "./policy.js";
+import { loadDevDesktopFiles } from "./user-config.js";
 
 export type ToolMode = "minimal" | "full" | "codex";
 export type WidgetMode = "off" | "changes" | "full";
+export type AuthMode = "oauth" | "tunnel";
 const DEFAULT_OAUTH_ACCESS_TOKEN_TTL_SECONDS = 60 * 60;
 const DEFAULT_OAUTH_REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
 
@@ -14,6 +17,8 @@ export interface ServerConfig {
   host: string;
   port: number;
   oauth: OAuthConfig;
+  authMode: AuthMode;
+  tunnelToken?: string;
   allowedRoots: string[];
   allowedHosts: string[];
   publicBaseUrl: string;
@@ -25,6 +30,15 @@ export interface ServerConfig {
   skillPaths: string[];
   agentDir: string;
   logging: LoggingConfig;
+  acpEnabled: boolean;
+  acpPort: number;
+  acpKnownAgents: Array<{ name: string; url: string; description?: string }>;
+  acpSharedSecret?: string;
+  /** Shared secret used by the coding agent (worker) for ACP registration/calls. */
+  acpAgentSecret?: string;
+  /** Shared secret used by the reviewer (WebUI) for ACP calls. */
+  acpReviewerSecret?: string;
+  policy: PolicyConfig;
 }
 
 function parsePort(value: string | number | undefined): number {
@@ -79,12 +93,12 @@ function parseBoolean(value: string | undefined): boolean {
 }
 
 function parseToolMode(env: NodeJS.ProcessEnv): ToolMode {
-  const mode = env.DEVSPACE_TOOL_MODE;
+  const mode = env.DEVDESKTOP_TOOL_MODE;
   if (mode === "minimal" || mode === "full" || mode === "codex") return mode;
-  if (mode) throw new Error(`Invalid DEVSPACE_TOOL_MODE: ${mode}`);
+  if (mode) throw new Error(`Invalid DEVDESKTOP_TOOL_MODE: ${mode}`);
 
-  if (env.DEVSPACE_MINIMAL_TOOLS !== undefined) {
-    return parseBoolean(env.DEVSPACE_MINIMAL_TOOLS) ? "minimal" : "full";
+  if (env.DEVDESKTOP_MINIMAL_TOOLS !== undefined) {
+    return parseBoolean(env.DEVDESKTOP_MINIMAL_TOOLS) ? "minimal" : "full";
   }
   return "minimal";
 }
@@ -93,14 +107,14 @@ function parseLogLevel(value: string | undefined): LogLevel {
   if (!value || value === "info") return "info";
   if (["silent", "error", "warn", "debug"].includes(value)) return value as LogLevel;
 
-  throw new Error(`Invalid DEVSPACE_LOG_LEVEL: ${value}`);
+  throw new Error(`Invalid DEVDESKTOP_LOG_LEVEL: ${value}`);
 }
 
 function parseLogFormat(value: string | undefined): LogFormat {
   if (!value || value === "json") return "json";
   if (value === "pretty") return "pretty";
 
-  throw new Error(`Invalid DEVSPACE_LOG_FORMAT: ${value}`);
+  throw new Error(`Invalid DEVDESKTOP_LOG_FORMAT: ${value}`);
 }
 
 function parsePathList(value: string | undefined): string[] {
@@ -134,13 +148,13 @@ function parsePositiveInteger(value: string | undefined, fallback: number, name:
 
 function parseLoggingConfig(env: NodeJS.ProcessEnv): LoggingConfig {
   return {
-    level: parseLogLevel(env.DEVSPACE_LOG_LEVEL),
-    format: parseLogFormat(env.DEVSPACE_LOG_FORMAT),
-    requests: env.DEVSPACE_LOG_REQUESTS === undefined ? true : parseBoolean(env.DEVSPACE_LOG_REQUESTS),
-    assets: parseBoolean(env.DEVSPACE_LOG_ASSETS),
-    toolCalls: env.DEVSPACE_LOG_TOOL_CALLS === undefined ? true : parseBoolean(env.DEVSPACE_LOG_TOOL_CALLS),
-    shellCommands: parseBoolean(env.DEVSPACE_LOG_SHELL_COMMANDS),
-    trustProxy: parseBoolean(env.DEVSPACE_TRUST_PROXY),
+    level: parseLogLevel(env.DEVDESKTOP_LOG_LEVEL),
+    format: parseLogFormat(env.DEVDESKTOP_LOG_FORMAT),
+    requests: env.DEVDESKTOP_LOG_REQUESTS === undefined ? true : parseBoolean(env.DEVDESKTOP_LOG_REQUESTS),
+    assets: parseBoolean(env.DEVDESKTOP_LOG_ASSETS),
+    toolCalls: env.DEVDESKTOP_LOG_TOOL_CALLS === undefined ? true : parseBoolean(env.DEVDESKTOP_LOG_TOOL_CALLS),
+    shellCommands: parseBoolean(env.DEVDESKTOP_LOG_SHELL_COMMANDS),
+    trustProxy: parseBoolean(env.DEVDESKTOP_TRUST_PROXY),
   };
 }
 
@@ -148,35 +162,54 @@ function parseWidgetMode(value: string | undefined): WidgetMode {
   if (!value || value === "full") return "full";
   if (value === "off" || value === "changes") return value;
 
-  throw new Error(`Invalid DEVSPACE_WIDGETS: ${value}`);
+  throw new Error(`Invalid DEVDESKTOP_WIDGETS: ${value}`);
 }
 
-function parseRequiredSecret(value: string | undefined, name: string): string {
-  const secret = value?.trim();
-  if (!secret) {
-    throw new Error(`${name} is required for DevSpace OAuth. Run: devspace init`);
-  }
-  if (secret.length < 16) {
-    throw new Error(`${name} must be at least 16 characters long.`);
-  }
-  return secret;
+function parseAcpKnownAgents(
+  value: string | Array<{ name: string; url: string; description?: string }> | undefined,
+): Array<{ name: string; url: string; description?: string }> {
+  if (Array.isArray(value)) return value;
+  if (!value) return [];
+
+  return value.split(",").map((entry) => {
+    const [name, url, ...descParts] = entry.trim().split("=");
+    if (!name || !url) {
+      throw new Error(
+        `Invalid ACP agent entry: "${entry}". Use format: name=url or name=url=description`,
+      );
+    }
+    return { name, url, description: descParts.join("=") || undefined };
+  });
 }
 
-function parseOAuthConfig(env: NodeJS.ProcessEnv, ownerToken: string | undefined): OAuthConfig {
+function parseOAuthConfig(
+  env: NodeJS.ProcessEnv,
+  ownerToken: string | undefined,
+  required: boolean,
+): OAuthConfig {
+  const resolvedToken = env.DEVDESKTOP_OAUTH_OWNER_TOKEN ?? ownerToken;
+  if (required) {
+    if (!resolvedToken) {
+      throw new Error("DEVDESKTOP_OAUTH_OWNER_TOKEN is required for Dev Desktop OAuth. Run: devdesktop init");
+    }
+    if (resolvedToken.length < 16) {
+      throw new Error("DEVDESKTOP_OAUTH_OWNER_TOKEN must be at least 16 characters long.");
+    }
+  }
   return {
-    ownerToken: parseRequiredSecret(env.DEVSPACE_OAUTH_OWNER_TOKEN ?? ownerToken, "DEVSPACE_OAUTH_OWNER_TOKEN"),
+    ownerToken: resolvedToken ?? "",
     accessTokenTtlSeconds: parsePositiveInteger(
-      env.DEVSPACE_OAUTH_ACCESS_TOKEN_TTL_SECONDS,
+      env.DEVDESKTOP_OAUTH_ACCESS_TOKEN_TTL_SECONDS,
       DEFAULT_OAUTH_ACCESS_TOKEN_TTL_SECONDS,
-      "DEVSPACE_OAUTH_ACCESS_TOKEN_TTL_SECONDS",
+      "DEVDESKTOP_OAUTH_ACCESS_TOKEN_TTL_SECONDS",
     ),
     refreshTokenTtlSeconds: parsePositiveInteger(
-      env.DEVSPACE_OAUTH_REFRESH_TOKEN_TTL_SECONDS,
+      env.DEVDESKTOP_OAUTH_REFRESH_TOKEN_TTL_SECONDS,
       DEFAULT_OAUTH_REFRESH_TOKEN_TTL_SECONDS,
-      "DEVSPACE_OAUTH_REFRESH_TOKEN_TTL_SECONDS",
+      "DEVDESKTOP_OAUTH_REFRESH_TOKEN_TTL_SECONDS",
     ),
-    scopes: parseStringList(env.DEVSPACE_OAUTH_SCOPES, ["devspace"]),
-    allowedRedirectHosts: parseStringList(env.DEVSPACE_OAUTH_ALLOWED_REDIRECT_HOSTS, [
+    scopes: parseStringList(env.DEVDESKTOP_OAUTH_SCOPES, ["devdesktop"]),
+    allowedRedirectHosts: parseStringList(env.DEVDESKTOP_OAUTH_ALLOWED_REDIRECT_HOSTS, [
       "chatgpt.com",
       "localhost",
       "127.0.0.1",
@@ -184,12 +217,22 @@ function parseOAuthConfig(env: NodeJS.ProcessEnv, ownerToken: string | undefined
   };
 }
 
+function parseAuthMode(value: string | undefined): AuthMode {
+  if (!value || value === "oauth") return "oauth";
+  if (value === "tunnel") return "tunnel";
+  throw new Error(`Invalid DEVDESKTOP_AUTH_MODE: ${value}. Expected "oauth" or "tunnel".`);
+}
+
+function isLoopbackHost(host: string): boolean {
+  return host === "127.0.0.1" || host === "::1" || host === "localhost";
+}
+
 function defaultStateDir(): string {
-  return join(homedir(), ".local", "share", "devspace");
+  return join(homedir(), ".local", "share", "devdesktop");
 }
 
 function defaultWorktreeRoot(): string {
-  return join(homedir(), ".devspace", "worktrees");
+  return join(homedir(), ".devdesktop", "worktrees");
 }
 
 function defaultAgentDir(): string {
@@ -197,12 +240,23 @@ function defaultAgentDir(): string {
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
-  const files = loadDevspaceFiles(env);
+  const files = loadDevDesktopFiles(env);
   const host = env.HOST ?? files.config.host ?? "127.0.0.1";
   const port = parsePort(env.PORT ?? files.config.port);
   const publicBaseUrl = parsePublicBaseUrl(
-    env.DEVSPACE_PUBLIC_BASE_URL ?? files.config.publicBaseUrl ?? localPublicBaseUrl(host, port),
+    env.DEVDESKTOP_PUBLIC_BASE_URL ?? files.config.publicBaseUrl ?? localPublicBaseUrl(host, port),
   );
+  const authMode = parseAuthMode(env.DEVDESKTOP_AUTH_MODE);
+
+  if (authMode === "tunnel" && !isLoopbackHost(host)) {
+    throw new Error(
+      `DEVDESKTOP_AUTH_MODE=tunnel requires HOST to bind a loopback address (127.0.0.1, ::1, or localhost), but HOST=${host}. Tunnel mode disables Dev Desktop's OAuth gate and must only be reachable through the OpenAI Secure MCP Tunnel on a loopback interface.`,
+    );
+  }
+
+  if (env.DEVDESKTOP_TUNNEL_TOKEN !== undefined && env.DEVDESKTOP_TUNNEL_TOKEN.length > 0 && env.DEVDESKTOP_TUNNEL_TOKEN.length < 16) {
+    throw new Error("DEVDESKTOP_TUNNEL_TOKEN must be at least 16 characters when set.");
+  }
   const derivedAllowedHosts = [
     "localhost",
     "127.0.0.1",
@@ -215,18 +269,29 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
   return {
     host,
     port,
-    oauth: parseOAuthConfig(env, files.auth.ownerToken),
-    allowedRoots: parseAllowedRoots(env.DEVSPACE_ALLOWED_ROOTS ?? files.config.allowedRoots),
-    allowedHosts: parseAllowedHosts(env.DEVSPACE_ALLOWED_HOSTS, derivedAllowedHosts),
+    oauth: parseOAuthConfig(env, files.auth.ownerToken, authMode === "oauth"),
+    allowedRoots: parseAllowedRoots(env.DEVDESKTOP_ALLOWED_ROOTS ?? files.config.allowedRoots),
+    allowedHosts: parseAllowedHosts(env.DEVDESKTOP_ALLOWED_HOSTS, derivedAllowedHosts),
     publicBaseUrl,
+    authMode,
+    tunnelToken: env.DEVDESKTOP_TUNNEL_TOKEN,
     toolMode: parseToolMode(env),
-    widgets: parseWidgetMode(env.DEVSPACE_WIDGETS),
-    stateDir: resolve(expandHomePath(env.DEVSPACE_STATE_DIR ?? files.config.stateDir ?? defaultStateDir())),
-    worktreeRoot: resolve(expandHomePath(env.DEVSPACE_WORKTREE_ROOT ?? files.config.worktreeRoot ?? defaultWorktreeRoot())),
-    skillsEnabled: env.DEVSPACE_SKILLS === undefined ? true : parseBoolean(env.DEVSPACE_SKILLS),
-    skillPaths: parsePathList(env.DEVSPACE_SKILL_PATHS),
-    agentDir: resolve(expandHomePath(env.DEVSPACE_AGENT_DIR ?? files.config.agentDir ?? defaultAgentDir())),
+    widgets: parseWidgetMode(env.DEVDESKTOP_WIDGETS),
+    stateDir: resolve(expandHomePath(env.DEVDESKTOP_STATE_DIR ?? files.config.stateDir ?? defaultStateDir())),
+    worktreeRoot: resolve(expandHomePath(env.DEVDESKTOP_WORKTREE_ROOT ?? files.config.worktreeRoot ?? defaultWorktreeRoot())),
+    skillsEnabled: env.DEVDESKTOP_SKILLS === undefined ? true : parseBoolean(env.DEVDESKTOP_SKILLS),
+    skillPaths: parsePathList(env.DEVDESKTOP_SKILL_PATHS),
+    agentDir: resolve(expandHomePath(env.DEVDESKTOP_AGENT_DIR ?? files.config.agentDir ?? defaultAgentDir())),
     logging: parseLoggingConfig(env),
+    acpEnabled: env.DEVDESKTOP_ACP_ENABLED === undefined ? true : parseBoolean(env.DEVDESKTOP_ACP_ENABLED),
+    acpPort: parsePort(env.DEVDESKTOP_ACP_PORT),
+    acpKnownAgents: parseAcpKnownAgents(env.DEVDESKTOP_ACP_AGENTS ?? files.config.acpKnownAgents),
+    acpSharedSecret: env.DEVDESKTOP_ACP_SHARED_SECRET,
+    /** Shared secret used by the coding agent (worker) for ACP registration/calls. */
+    acpAgentSecret: env.DEVDESKTOP_ACP_AGENT_SECRET,
+    /** Shared secret used by the reviewer (WebUI) for ACP calls. */
+    acpReviewerSecret: env.DEVDESKTOP_ACP_REVIEWER_SECRET,
+    policy: loadPolicyConfig(env),
   };
 }
 

@@ -41,6 +41,7 @@ export interface Workspace {
   skills: LoadedSkills["skills"];
   skillDiagnostics: LoadedSkills["diagnostics"];
   activatedSkillDirs: Set<string>;
+  currentWorkSessionId?: string;
 }
 
 export interface WorkspaceContext {
@@ -147,6 +148,12 @@ export class WorkspaceRegistry {
         skillRead,
       };
     }
+  }
+
+  setActiveSession(workspaceId: string, sessionId: string | undefined): void {
+    const workspace = this.workspaces.get(workspaceId);
+    if (!workspace) throw new Error(`Unknown workspaceId: ${workspaceId}. Call open_workspace first.`);
+    workspace.currentWorkSessionId = sessionId;
   }
 
   markReadPathLoaded(workspace: Workspace, readPath: WorkspaceReadPath): void {
@@ -278,7 +285,7 @@ const SKIPPED_CONTEXT_DIRS = new Set([
   ".git",
   ".hg",
   ".svn",
-  ".devspace",
+  ".devdesktop",
   "node_modules",
   "dist",
   "build",

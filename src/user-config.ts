@@ -9,7 +9,7 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { expandHomePath } from "./roots.js";
 
-export interface DevspaceUserConfig {
+export interface DevDesktopUserConfig {
   host?: string;
   port?: number;
   allowedRoots?: string[];
@@ -18,36 +18,37 @@ export interface DevspaceUserConfig {
   stateDir?: string;
   worktreeRoot?: string;
   agentDir?: string;
+  acpKnownAgents?: Array<{ name: string; url: string; description?: string }>;
 }
 
-export interface DevspaceAuthConfig {
+export interface DevDesktopAuthConfig {
   ownerToken?: string;
 }
 
-export interface DevspaceFiles {
+export interface DevDesktopFiles {
   dir: string;
   configPath: string;
   authPath: string;
   configExists: boolean;
   authExists: boolean;
-  config: DevspaceUserConfig;
-  auth: DevspaceAuthConfig;
+  config: DevDesktopUserConfig;
+  auth: DevDesktopAuthConfig;
 }
 
-export function devspaceConfigDir(env: NodeJS.ProcessEnv = process.env): string {
-  return resolve(expandHomePath(env.DEVSPACE_CONFIG_DIR ?? join(homedir(), ".devspace")));
+export function devdesktopConfigDir(env: NodeJS.ProcessEnv = process.env): string {
+  return resolve(expandHomePath(env.DEVDESKTOP_CONFIG_DIR ?? join(homedir(), ".devdesktop")));
 }
 
-export function devspaceConfigPath(env: NodeJS.ProcessEnv = process.env): string {
-  return join(devspaceConfigDir(env), "config.json");
+export function devdesktopConfigPath(env: NodeJS.ProcessEnv = process.env): string {
+  return join(devdesktopConfigDir(env), "config.json");
 }
 
-export function devspaceAuthPath(env: NodeJS.ProcessEnv = process.env): string {
-  return join(devspaceConfigDir(env), "auth.json");
+export function devdesktopAuthPath(env: NodeJS.ProcessEnv = process.env): string {
+  return join(devdesktopConfigDir(env), "auth.json");
 }
 
-export function loadDevspaceFiles(env: NodeJS.ProcessEnv = process.env): DevspaceFiles {
-  const dir = devspaceConfigDir(env);
+export function loadDevDesktopFiles(env: NodeJS.ProcessEnv = process.env): DevDesktopFiles {
+  const dir = devdesktopConfigDir(env);
   const configPath = join(dir, "config.json");
   const authPath = join(dir, "auth.json");
   const configExists = existsSync(configPath);
@@ -59,27 +60,27 @@ export function loadDevspaceFiles(env: NodeJS.ProcessEnv = process.env): Devspac
     authPath,
     configExists,
     authExists,
-    config: configExists ? readJsonFile<DevspaceUserConfig>(configPath) : {},
-    auth: authExists ? readJsonFile<DevspaceAuthConfig>(authPath) : {},
+    config: configExists ? readJsonFile<DevDesktopUserConfig>(configPath) : {},
+    auth: authExists ? readJsonFile<DevDesktopAuthConfig>(authPath) : {},
   };
 }
 
-export function writeDevspaceConfig(
-  config: DevspaceUserConfig,
+export function writeDevDesktopConfig(
+  config: DevDesktopUserConfig,
   env: NodeJS.ProcessEnv = process.env,
 ): string {
-  const filePath = devspaceConfigPath(env);
-  mkdirSync(devspaceConfigDir(env), { recursive: true });
+  const filePath = devdesktopConfigPath(env);
+  mkdirSync(devdesktopConfigDir(env), { recursive: true });
   writeJsonFile(filePath, config, 0o600);
   return filePath;
 }
 
-export function writeDevspaceAuth(
-  auth: DevspaceAuthConfig,
+export function writeDevDesktopAuth(
+  auth: DevDesktopAuthConfig,
   env: NodeJS.ProcessEnv = process.env,
 ): string {
-  const filePath = devspaceAuthPath(env);
-  mkdirSync(devspaceConfigDir(env), { recursive: true });
+  const filePath = devdesktopAuthPath(env);
+  mkdirSync(devdesktopConfigDir(env), { recursive: true });
   writeJsonFile(filePath, auth, 0o600);
   return filePath;
 }

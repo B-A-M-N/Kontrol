@@ -8,12 +8,12 @@ import { databasePath, openDatabase } from "./db/client.js";
 import { SingleUserOAuthProvider } from "./oauth-provider.js";
 import { SqliteOAuthClientsStore, SqliteOAuthStore } from "./oauth-store.js";
 
-const root = await mkdtemp(join(tmpdir(), "devspace-oauth-test-"));
+const root = await mkdtemp(join(tmpdir(), "devdesktop-oauth-test-"));
 const oauthConfig = {
   ownerToken: "test-owner-token-that-is-long-enough",
   accessTokenTtlSeconds: 3600,
   refreshTokenTtlSeconds: 2592000,
-  scopes: ["devspace"],
+  scopes: ["devdesktop"],
   allowedRedirectHosts: ["chatgpt.com"],
 };
 const mcpUrl = new URL("https://agent.example.com/mcp");
@@ -38,11 +38,27 @@ async function testDatabaseConfiguration(stateDir: string): Promise<void> {
     assert.equal(database.sqlite.pragma("foreign_keys", { simple: true }), 1);
 
     const migrations = database.sqlite
-      .prepare("select version, name from devspace_schema_migrations order by version")
+      .prepare("select version, name from devdesktop_schema_migrations order by version")
       .all();
     assert.deepEqual(migrations, [
       { version: 1, name: "workspace-state" },
       { version: 2, name: "oauth-state" },
+      { version: 3, name: "work-sessions" },
+      { version: 4, name: "agent-registry" },
+      { version: 5, name: "review-feedback-structured" },
+      { version: 6, name: "event-log" },
+      { version: 7, name: "continuations" },
+      { version: 8, name: "agent-registry-role" },
+      { version: 9, name: "continuation-claim" },
+      { version: 10, name: "work-session-consumed-feedback" },
+      { version: 11, name: "acp-runs-workflow" },
+      { version: 12, name: "policy-approvals" },
+      { version: 13, name: "dispatch-outbox" },
+      { version: 14, name: "approval-requests" },
+      { version: 15, name: "work-session-completion-policy" },
+      { version: 16, name: "work-session-snapshot-binding" },
+      { version: 17, name: "supervisor-mission-ledger" },
+      { version: 18, name: "mission-scope-guard" },
     ]);
   } finally {
     database.close();
@@ -68,14 +84,14 @@ function testPersistenceAndTokenHashing(stateDir: string): void {
     accessTokenHash: hashToken(accessToken),
     accessToken: {
       clientId: client.client_id,
-      scopes: ["devspace"],
+      scopes: ["devdesktop"],
       expiresAt: Math.floor(Date.now() / 1000) + 3600,
       resource: mcpUrl.href,
     },
     refreshTokenHash: hashToken(refreshToken),
     refreshToken: {
       clientId: client.client_id,
-      scopes: ["devspace"],
+      scopes: ["devdesktop"],
       expiresAt: Math.floor(Date.now() / 1000) + 2592000,
       resource: mcpUrl.href,
     },
@@ -119,9 +135,9 @@ function testExpiredTokenCleanup(stateDir: string): void {
   const expiredAt = Math.floor(Date.now() / 1000) - 1;
   store.saveTokenPair({
     accessTokenHash: "expired-access-hash",
-    accessToken: { clientId: client.client_id, scopes: ["devspace"], expiresAt: expiredAt },
+    accessToken: { clientId: client.client_id, scopes: ["devdesktop"], expiresAt: expiredAt },
     refreshTokenHash: "expired-refresh-hash",
-    refreshToken: { clientId: client.client_id, scopes: ["devspace"], expiresAt: expiredAt },
+    refreshToken: { clientId: client.client_id, scopes: ["devdesktop"], expiresAt: expiredAt },
   });
   store.close();
 
@@ -143,7 +159,7 @@ function testTransactionalTokenRotation(stateDir: string): void {
     const expiresAt = Math.floor(Date.now() / 1000) + 3600;
     store.saveRefreshToken("old-refresh-hash", {
       clientId: client.client_id,
-      scopes: ["devspace"],
+      scopes: ["devdesktop"],
       expiresAt,
     });
 
@@ -151,9 +167,9 @@ function testTransactionalTokenRotation(stateDir: string): void {
       store.saveTokenPair(
         {
           accessTokenHash: "new-access-hash",
-          accessToken: { clientId: client.client_id, scopes: ["devspace"], expiresAt },
+          accessToken: { clientId: client.client_id, scopes: ["devdesktop"], expiresAt },
           refreshTokenHash: "new-refresh-hash",
-          refreshToken: { clientId: client.client_id, scopes: ["devspace"], expiresAt },
+          refreshToken: { clientId: client.client_id, scopes: ["devdesktop"], expiresAt },
         },
         "old-refresh-hash",
       ),
@@ -167,9 +183,9 @@ function testTransactionalTokenRotation(stateDir: string): void {
       store.saveTokenPair(
         {
           accessTokenHash: "losing-access-hash",
-          accessToken: { clientId: client.client_id, scopes: ["devspace"], expiresAt },
+          accessToken: { clientId: client.client_id, scopes: ["devdesktop"], expiresAt },
           refreshTokenHash: "losing-refresh-hash",
-          refreshToken: { clientId: client.client_id, scopes: ["devspace"], expiresAt },
+          refreshToken: { clientId: client.client_id, scopes: ["devdesktop"], expiresAt },
         },
         "old-refresh-hash",
       ),
@@ -196,7 +212,7 @@ async function testProviderRestartRotationAndRevocation(stateDir: string): Promi
     params: {
       redirectUri,
       codeChallenge: "challenge",
-      scopes: ["devspace"],
+      scopes: ["devdesktop"],
       resource: mcpUrl,
     },
     expiresAtMs: Date.now() + 60_000,
@@ -219,14 +235,14 @@ async function testProviderRestartRotationAndRevocation(stateDir: string): Promi
     const refreshed = await secondProvider.exchangeRefreshToken(
       client,
       issued.refresh_token,
-      ["devspace"],
+      ["devdesktop"],
       mcpUrl,
     );
     assert.ok(refreshed.refresh_token);
     assert.notEqual(refreshed.access_token, issued.access_token);
 
     await assert.rejects(
-      secondProvider.exchangeRefreshToken(client, issued.refresh_token, ["devspace"], mcpUrl),
+      secondProvider.exchangeRefreshToken(client, issued.refresh_token, ["devdesktop"], mcpUrl),
       InvalidGrantError,
     );
 
@@ -235,7 +251,7 @@ async function testProviderRestartRotationAndRevocation(stateDir: string): Promi
 
     await secondProvider.revokeToken(client, { token: refreshed.refresh_token });
     await assert.rejects(
-      secondProvider.exchangeRefreshToken(client, refreshed.refresh_token, ["devspace"], mcpUrl),
+      secondProvider.exchangeRefreshToken(client, refreshed.refresh_token, ["devdesktop"], mcpUrl),
       InvalidGrantError,
     );
   } finally {

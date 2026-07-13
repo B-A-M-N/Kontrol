@@ -24,6 +24,8 @@ export interface ReviewChangesResult {
   summary: ReviewSummary;
   files: ReviewFile[];
   patch: string;
+  /** The exact working-tree snapshot commit this diff was computed against. */
+  snapshotCommit: string;
 }
 
 interface WorkspaceReviewState {
@@ -42,9 +44,21 @@ export interface ReviewCheckpointManager {
     since?: ReviewSince;
     markReviewed?: boolean;
   }): Promise<ReviewChangesResult>;
+  reviewChangesAgainstCommit(input: {
+    workspaceId: string;
+    root: string;
+    baselineCommit: string;
+  }): Promise<ReviewChangesResult>;
+  /**
+   * Commit the review checkpoint to an exact previously-captured snapshot.
+   * Advances baselineRef to `snapshotCommit` WITHOUT recomputing the working
+   * tree (which may have changed since capture). Call only after the review
+   * submission was persisted, so a failure cannot silently drop the diff.
+   */
+  commitReviewed(input: { workspaceId: string; root: string; snapshotCommit: string }): Promise<void>;
 }
 
-const REVIEW_REF_PREFIX = "refs/devspace/review";
+const REVIEW_REF_PREFIX = "refs/devdesktop/review";
 
 export function createReviewCheckpointManager(): ReviewCheckpointManager {
   const states = new Map<string, WorkspaceReviewState>();
@@ -106,7 +120,53 @@ export function createReviewCheckpointManager(): ReviewCheckpointManager {
         summary,
         files,
         patch,
+        snapshotCommit: current,
       };
+    },
+
+    async reviewChangesAgainstCommit({ workspaceId, root, baselineCommit }) {
+      let state = states.get(workspaceId);
+      if (!state) {
+        await this.initializeWorkspace({ workspaceId, root });
+        state = states.get(workspaceId);
+      }
+      if (!state?.gitRoot) {
+        throw new Error(state?.diagnostic ?? "show_changes requires a Git workspace in this version.");
+      }
+      const baseline = (await git(state.gitRoot, ["rev-parse", "--verify", `${baselineCommit}^{commit}`])).stdout.trim();
+      const current = await createWorkingTreeSnapshot(state.gitRoot);
+      const patch = (await git(state.gitRoot, ["diff", "--binary", "--no-color", baseline, current], {
+        maxBuffer: 50 * 1024 * 1024,
+      })).stdout;
+      const numstat = (await git(state.gitRoot, ["diff", "--numstat", "-z", baseline, current], {
+        maxBuffer: 50 * 1024 * 1024,
+      })).stdout;
+      const files = parseNumstat(numstat);
+      const summary = summarizeFiles(files);
+      return {
+        result:
+          summary.files === 0
+            ? "No changes since mission baseline."
+            : `Changed ${summary.files} ${summary.files === 1 ? "file" : "files"} (+${summary.additions} -${summary.removals}) since mission baseline.`,
+        summary,
+        files,
+        patch,
+        snapshotCommit: current,
+      };
+    },
+
+    async commitReviewed({ workspaceId, root, snapshotCommit }) {
+      let state = states.get(workspaceId);
+      if (!state) {
+        await this.initializeWorkspace({ workspaceId, root });
+        state = states.get(workspaceId);
+      }
+      if (!state?.gitRoot) {
+        throw new Error(state?.diagnostic ?? "show_changes requires a Git workspace in this version.");
+      }
+      // Advance baseline to the EXACT captured snapshot (no recompute — the tree
+      // may have changed between capture and persistence).
+      await git(state.gitRoot, ["update-ref", state.baselineRef, snapshotCommit]);
     },
   };
 }
@@ -120,7 +180,7 @@ function reviewRefs(workspaceId: string): Pick<WorkspaceReviewState, "openRef" |
 }
 
 async function createWorkingTreeSnapshot(gitRoot: string): Promise<string> {
-  const tempDir = await mkdtemp(join(tmpdir(), "devspace-review-index-"));
+  const tempDir = await mkdtemp(join(tmpdir(), "devdesktop-review-index-"));
   const indexPath = join(tempDir, "index");
   const env = checkpointEnv(indexPath);
 
@@ -129,7 +189,7 @@ async function createWorkingTreeSnapshot(gitRoot: string): Promise<string> {
     await git(gitRoot, ["add", "-A", "--", "."], { env });
     const tree = (await git(gitRoot, ["write-tree"], { env })).stdout.trim();
     const parent = (await git(gitRoot, ["rev-parse", "--verify", "HEAD^{commit}"])).stdout.trim();
-    return (await git(gitRoot, ["commit-tree", tree, "-p", parent, "-m", "DevSpace review snapshot"], { env })).stdout.trim();
+    return (await git(gitRoot, ["commit-tree", tree, "-p", parent, "-m", "Dev Desktop review snapshot"], { env })).stdout.trim();
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
@@ -138,10 +198,10 @@ async function createWorkingTreeSnapshot(gitRoot: string): Promise<string> {
 function checkpointEnv(indexPath: string): NodeJS.ProcessEnv {
   return {
     GIT_INDEX_FILE: indexPath,
-    GIT_AUTHOR_NAME: "DevSpace",
-    GIT_AUTHOR_EMAIL: "devspace@users.noreply.local",
-    GIT_COMMITTER_NAME: "DevSpace",
-    GIT_COMMITTER_EMAIL: "devspace@users.noreply.local",
+    GIT_AUTHOR_NAME: "Dev Desktop",
+    GIT_AUTHOR_EMAIL: "devdesktop@users.noreply.local",
+    GIT_COMMITTER_NAME: "Dev Desktop",
+    GIT_COMMITTER_EMAIL: "devdesktop@users.noreply.local",
   };
 }
 

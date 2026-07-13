@@ -1,0 +1,16 @@
+[Unit]
+Description=Dev Desktop ACP CRUSH adapter
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/bamn/devspace
+EnvironmentFile=-/home/bamn/devspace/.env
+Environment=ACP_ADAPTER_PORT=9877
+ExecStart=/usr/bin/env node /home/bamn/devspace/scripts/acp-crush-adapter.mjs
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=default.target
