@@ -1,18 +1,19 @@
 {
-  "name": "@bamn/devdesktop",
+  "name": "@bamn/kontrol",
   "version": "1.0.3",
-  "description": "Expose a secure local coding workspace through an MCP server.",
+  "description": "Local agent control plane with MCP workspaces, ACP workers, review loops, and policy gates.",
   "type": "module",
   "main": "dist/server.js",
   "engines": {
     "node": ">=22.19 <27"
   },
   "bin": {
-    "devdesktop": "dist/cli.js"
+    "kontrol": "dist/cli.js"
   },
   "files": [
     "dist",
     "docs",
+    "NOTICE",
     "scripts",
     "README.md"
   ],

@@ -2,16 +2,16 @@
 // acp-crush-adapter.mjs
 //
 // ACP HTTP adapter that exposes the CRUSH CLI as an ACP-style HTTP
-// endpoint. DevSpace dispatches work to it via POST /runs. The adapter
+// endpoint. Kontrol dispatches work to it via POST /runs. The adapter
 // spawns the coding agent, captures its output, and reports lifecycle
-// events back to DevSpace.
+// events back to Kontrol.
 //
 // Usage:
 //   node scripts/acp-crush-adapter.mjs
 //
 // Required env:
-//   DEVDESKTOP_ACP_AGENT_SECRET: agent secret for registration/heartbeat
-//   DEVDESKTOP_ACP_ADAPTER_SECRET: adapter secret for incoming /runs auth
+//   KONTROL_ACP_AGENT_SECRET: agent secret for registration/heartbeat
+//   KONTROL_ACP_ADAPTER_SECRET: adapter secret for incoming /runs auth
 //
 // Optional:
 //   CRUSH_BIN: path to the CRUSH CLI runner (used when ACP_AGENT_BIN=crush;
@@ -28,9 +28,9 @@ import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { signWorkerToken, TOKEN_TTL_MS } from "../src/acp-worker-token.mjs";
 
-const DEVDESKTOP_ACP_URL = process.env.DEVDESKTOP_ACP_URL || "http://127.0.0.1:7676/acp";
-const AGENT_SECRET = process.env.DEVDESKTOP_ACP_AGENT_SECRET;
-const ADAPTER_SECRET = process.env.DEVDESKTOP_ACP_ADAPTER_SECRET;
+const KONTROL_ACP_URL = process.env.KONTROL_ACP_URL || "http://127.0.0.1:7676/acp";
+const AGENT_SECRET = process.env.KONTROL_ACP_AGENT_SECRET;
+const ADAPTER_SECRET = process.env.KONTROL_ACP_ADAPTER_SECRET;
 const AGENT_BIN = (process.env.ACP_AGENT_BIN || "crush").toLowerCase();
 if (AGENT_BIN !== "crush") {
   throw new Error(
@@ -40,27 +40,27 @@ if (AGENT_BIN !== "crush") {
 }
 const CRUSH_BIN = process.env.CRUSH_BIN || "/home/bamn/Crush-ACP/crush";
 // Fallback cwd ONLY used when a dispatch carries no workspace_root at all (which
-// DevSpace does not normally send — it always passes workspace_root). Kept for
+// Kontrol does not normally send — it always passes workspace_root). Kept for
 // the synthetic smoke path. Never substituted for an invalid/mismatched root:
 // a bad root is rejected (P0 #6), it is not redirected to another repo.
 const AGENT_CWD = process.env.AGENT_CWD || process.cwd();
 export const REGISTERED_AGENT_NAME = "cli-coding-agent";
 const HEARTBEAT_INTERVAL_MS = 55_000;
-// Per-run heartbeat to DevSpace while a worker is active. Keeps the worker
+// Per-run heartbeat to Kontrol while a worker is active. Keeps the worker
 // lease (workerLeaseUntil) alive so the durable Ralphie form survives a
 // worker that blocks inside await_review_feedback for longer than the
 // lease window. Cleared on spawn error / process exit.
 const RUN_HEARTBEAT_MS = 10_000;
 const REPLAY_WINDOW_MS = 24 * 60 * 60 * 1000;
-const REPLAY_STORE_PATH = process.env.ACP_ADAPTER_REPLAY_STORE || "/tmp/devdesktop-acp-adapter-replay.json";
+const REPLAY_STORE_PATH = process.env.ACP_ADAPTER_REPLAY_STORE || "/tmp/kontrol-acp-adapter-replay.json";
 
-// Dedicated port variable — must NOT share the generic PORT that devspace
+// Dedicated port variable — must NOT share the generic PORT that kontrol
 // server reads, or the adapter collides with :7676 on boot.
 const ADAPTER_PORT = parseInt(process.env.ACP_ADAPTER_PORT || process.env.PORT || "9877", 10);
 const ADAPTER_HOST = process.env.HOST || "127.0.0.1";
 
 // NOTE: the "secret required" guard lives inside main() so this module can be
-// imported for unit tests without DEVDESKTOP_ACP_* secrets present.
+// imported for unit tests without KONTROL_ACP_* secrets present.
 
 // Runner registry
 const activeProcesses = new Map(); // pid -> { child, run }
@@ -71,11 +71,11 @@ let shuttingDown = false;
 
 async function main() {
   if (!AGENT_SECRET) {
-    console.error("[adapter] ERROR: DEVDESKTOP_ACP_AGENT_SECRET is required");
+    console.error("[adapter] ERROR: KONTROL_ACP_AGENT_SECRET is required");
     process.exit(1);
   }
   if (!ADAPTER_SECRET) {
-    console.error("[adapter] ERROR: DEVDESKTOP_ACP_ADAPTER_SECRET is required");
+    console.error("[adapter] ERROR: KONTROL_ACP_ADAPTER_SECRET is required");
     process.exit(1);
   }
   await loadReplayStore();
@@ -103,7 +103,7 @@ async function registerAgent() {
   // actual Response to read the created agent id — so fetch directly here.
   let lastErr = "";
   for (let i = 0; i < 3; i++) {
-    const res = await fetch(`${DEVDESKTOP_ACP_URL}/agents/register`, {
+    const res = await fetch(`${KONTROL_ACP_URL}/agents/register`, {
       method: "POST",
       headers: { "Content-Type": "application/json", authorization: `Bearer ${AGENT_SECRET}` },
       body: JSON.stringify({
@@ -131,7 +131,7 @@ function startHeartbeat() {
   const tick = async () => {
     if (shuttingDown) return;
     try {
-      const res = await fetch(`${DEVDESKTOP_ACP_URL}/agents/${agentId}/heartbeat`, {
+      const res = await fetch(`${KONTROL_ACP_URL}/agents/${agentId}/heartbeat`, {
         method: "POST",
         headers: { authorization: `Bearer ${AGENT_SECRET}` },
       });
@@ -174,14 +174,14 @@ async function handleRequest(req, res) {
       return res.writeHead(401).end(JSON.stringify({ error: { code: "unauthorized", message: "invalid adapter secret" } }));
     }
     const remoteRunId = decodeURIComponent(cancelMatch[1]);
-    const cancelled = cancelActiveRun(remoteRunId, "cancelled by DevSpace");
+    const cancelled = cancelActiveRun(remoteRunId, "cancelled by Kontrol");
     if (!cancelled) {
       return writeJson(res, 404, { error: { code: "not_found", message: `active run not found: ${remoteRunId}` } });
     }
     return writeJson(res, 202, { run_id: remoteRunId, status: "cancelled" });
   }
 
-  // Event reporting endpoint (DevSpace calls this for terminal events)
+  // Event reporting endpoint (Kontrol calls this for terminal events)
   const eventMatch = url.match(/^\/runs\/([^/]+)\/events$/);
   if (eventMatch && method === "POST") {
     const auth = req.headers.authorization || "";
@@ -197,7 +197,7 @@ async function handleRequest(req, res) {
 async function handleRunRequest(req, res, body) {
   const devRunId = body.parent_run_id || body.run_id || `dev_${randomUUID()}`;
   const workspaceSessionId = body.workspace_session_id;
-  // The DevSpace-owned work session (review/work-session) id. This is what binds
+  // The Kontrol-owned work session (review/work-session) id. This is what binds
   // the worker to a specific review — distinct from workspace_session_id.
   const workSessionId = body.session_id;
   const continuationId = body.continuation_id;
@@ -206,7 +206,7 @@ async function handleRunRequest(req, res, body) {
   const mode = body.mode;
   const workspaceRootRaw = body.workspace_root;
   const dispatchKey = continuationId ? `${devRunId}:${continuationId}` : undefined;
-  const smokeTest = body.smoke_test === true || body?.metadata?.devdesktop_smoke_test === true;
+  const smokeTest = body.smoke_test === true || body?.metadata?.kontrol_smoke_test === true;
 
   console.log(`[/runs] dispatch runId=${devRunId} ws=${workspaceSessionId} wss=${workSessionId} task=${task.slice(0, 120)}`);
 
@@ -253,7 +253,7 @@ async function handleRunRequest(req, res, body) {
       run.workspaceRoot = AGENT_CWD;
     }
     run.remoteRunId = "smoke_" + randomUUID().slice(0, 8);
-    run.stdout = "DEVDESKTOP_ADAPTER_SMOKE_OK";
+    run.stdout = "KONTROL_ADAPTER_SMOKE_OK";
     console.log(`[run ${run.remoteRunId}] synthetic smoke accepted cwd=${run.workspaceRoot} bin=${resolveAgentBin()}`);
     setTimeout(() => finalizeRun(run, "completed"), 10);
     return writeJson(res, 202, {
@@ -279,7 +279,7 @@ async function handleRunRequest(req, res, body) {
     throw err;
   }
 
-  // Issue a signed worker token so DevSpace can authenticate this worker's role
+  // Issue a signed worker token so Kontrol can authenticate this worker's role
   // + bound session WITHOUT trusting client-supplied attribution headers. A worker
   // that omits/forges this token is treated as a (reviewer-role) client instead.
   if (workSessionId) {
@@ -297,7 +297,7 @@ async function handleRunRequest(req, res, body) {
     const child = spawnAgent(run);
     activeProcesses.set(child.pid, { child, run });
 
-    // Per-run heartbeat (P1 #7): DevSpace writes workerLeaseUntil on each
+    // Per-run heartbeat (P1 #7): Kontrol writes workerLeaseUntil on each
     // heartbeat, so a long-lived worker does not appear to have leaked its
     // lease. Cleared on spawn error / exit.
     const heartbeatTimer = setInterval(() => {
@@ -329,8 +329,8 @@ async function handleRunRequest(req, res, body) {
         finalizeRun(run, "completed");
       } else {
         // A nonzero exit is an execution/infrastructure failure, NOT a protocol
-        // violation. Report it as `failed` (which DevSpace persists) rather
-        // than the unsupported `exited` type that DevSpace would reject with
+        // violation. Report it as `failed` (which Kontrol persists) rather
+        // than the unsupported `exited` type that Kontrol would reject with
         // HTTP 400 and silently strand the work session.
         finalizeRun(
           run,
@@ -432,8 +432,8 @@ function workerEnvironment(run) {
     "XDG_DATA_HOME",
     "CODEX_HOME",
     "CRUSH_HOME",
-    "DEVDESKTOP_BRIDGE_URL",
-    "DEVDESKTOP_BRIDGE_ENV",
+    "KONTROL_BRIDGE_URL",
+    "KONTROL_BRIDGE_ENV",
   ];
   const env = {};
   for (const key of allowed) {
@@ -441,11 +441,11 @@ function workerEnvironment(run) {
   }
   env.NO_COLOR = "1";
   env.TERM = "dumb";
-  env.DEVDESKTOP_WORKSPACE_SESSION_ID = run.workspaceSessionId || "";
-  if (run.workSessionId) env.DEVDESKTOP_WORK_SESSION_ID = run.workSessionId;
-  if (run.devRunId) env.DEVDESKTOP_PARENT_RUN_ID = run.devRunId;
-  if (run.continuationId) env.DEVDESKTOP_CONTINUATION_ID = run.continuationId;
-  if (run.workerToken) env.DEVDESKTOP_WORKER_TOKEN = run.workerToken;
+  env.KONTROL_WORKSPACE_SESSION_ID = run.workspaceSessionId || "";
+  if (run.workSessionId) env.KONTROL_WORK_SESSION_ID = run.workSessionId;
+  if (run.devRunId) env.KONTROL_PARENT_RUN_ID = run.devRunId;
+  if (run.continuationId) env.KONTROL_CONTINUATION_ID = run.continuationId;
+  if (run.workerToken) env.KONTROL_WORKER_TOKEN = run.workerToken;
   return env;
 }
 
@@ -486,8 +486,8 @@ async function saveReplayStore() {
 }
 
 // P0 #6: fail closed on an invalid/missing workspace root. A malformed or stale
-// workspace id must NEVER be redirected to another repository (e.g. the DevSpace
-// checkout). If DevSpace does not send a root, or the resolved path is not a
+// workspace id must NEVER be redirected to another repository (e.g. the Kontrol
+// checkout). If Kontrol does not send a root, or the resolved path is not a
 // real directory, reject the dispatch instead of executing elsewhere.
 export class InvalidWorkspaceRootError extends Error {
   constructor(message) {
@@ -583,7 +583,7 @@ async function reportEvent(run, type, errorMessage, details) {
     },
   };
   const success = await withRetry(() =>
-    fetch(`${DEVDESKTOP_ACP_URL}/runs/${run.devRunId}/events`, {
+    fetch(`${KONTROL_ACP_URL}/runs/${run.devRunId}/events`, {
       method: "POST",
       headers: { "Content-Type": "application/json", authorization: `Bearer ${AGENT_SECRET}` },
       body: JSON.stringify(payload),
@@ -605,7 +605,7 @@ async function reportOutputDelta(run, text) {
       type: "output_delta",
       payload: { text: text.slice(-1000) },
     };
-    await fetch(`${DEVDESKTOP_ACP_URL}/runs/${run.devRunId}/events`, {
+    await fetch(`${KONTROL_ACP_URL}/runs/${run.devRunId}/events`, {
       method: "POST",
       headers: { "Content-Type": "application/json", authorization: `Bearer ${AGENT_SECRET}` },
       body: JSON.stringify(payload),

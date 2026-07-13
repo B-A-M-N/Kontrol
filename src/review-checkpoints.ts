@@ -60,7 +60,7 @@ export interface ReviewCheckpointManager {
   commitReviewed(input: { workspaceId: string; root: string; snapshotCommit: string; workSessionId?: string }): Promise<void>;
 }
 
-const REVIEW_REF_PREFIX = "refs/devdesktop/review";
+const REVIEW_REF_PREFIX = "refs/kontrol/review";
 
 export function createReviewCheckpointManager(): ReviewCheckpointManager {
   const states = new Map<string, WorkspaceReviewState>();
@@ -178,7 +178,7 @@ function reviewRefs(workspaceId: string): Pick<WorkspaceReviewState, "openRef" |
   const segment = safeWorkspaceRefSegment(workspaceId);
   return {
     openRef: `${REVIEW_REF_PREFIX}/${segment}/open`,
-    presentationRef: `refs/devdesktop/presentation/${segment}/last-shown`,
+    presentationRef: `refs/kontrol/presentation/${segment}/last-shown`,
     legacyBaselineRef: `${REVIEW_REF_PREFIX}/${segment}/baseline`,
   };
 }
@@ -211,7 +211,7 @@ function checkpointRefForMark(
 function sessionBaselineRef(workspaceId: string, workSessionId: string | undefined): string {
   const workspaceSegment = safeWorkspaceRefSegment(workspaceId);
   const sessionSegment = workSessionId ? safeWorkspaceRefSegment(workSessionId) : "_legacy";
-  return `refs/devdesktop/session/${workspaceSegment}/${sessionSegment}/baseline`;
+  return `refs/kontrol/session/${workspaceSegment}/${sessionSegment}/baseline`;
 }
 
 async function ensureRef(gitRoot: string, ref: string, fallbackRef: string): Promise<void> {
@@ -225,7 +225,7 @@ async function ensureRef(gitRoot: string, ref: string, fallbackRef: string): Pro
 }
 
 async function createWorkingTreeSnapshot(gitRoot: string): Promise<string> {
-  const tempDir = await mkdtemp(join(tmpdir(), "devdesktop-review-index-"));
+  const tempDir = await mkdtemp(join(tmpdir(), "kontrol-review-index-"));
   const indexPath = join(tempDir, "index");
   const env = checkpointEnv(indexPath);
 
@@ -234,7 +234,7 @@ async function createWorkingTreeSnapshot(gitRoot: string): Promise<string> {
     await git(gitRoot, ["add", "-A", "--", "."], { env });
     const tree = (await git(gitRoot, ["write-tree"], { env })).stdout.trim();
     const parent = (await git(gitRoot, ["rev-parse", "--verify", "HEAD^{commit}"])).stdout.trim();
-    return (await git(gitRoot, ["commit-tree", tree, "-p", parent, "-m", "Dev Desktop review snapshot"], { env })).stdout.trim();
+    return (await git(gitRoot, ["commit-tree", tree, "-p", parent, "-m", "Kontrol review snapshot"], { env })).stdout.trim();
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
@@ -243,10 +243,10 @@ async function createWorkingTreeSnapshot(gitRoot: string): Promise<string> {
 function checkpointEnv(indexPath: string): NodeJS.ProcessEnv {
   return {
     GIT_INDEX_FILE: indexPath,
-    GIT_AUTHOR_NAME: "Dev Desktop",
-    GIT_AUTHOR_EMAIL: "devdesktop@users.noreply.local",
-    GIT_COMMITTER_NAME: "Dev Desktop",
-    GIT_COMMITTER_EMAIL: "devdesktop@users.noreply.local",
+    GIT_AUTHOR_NAME: "Kontrol",
+    GIT_AUTHOR_EMAIL: "kontrol@users.noreply.local",
+    GIT_COMMITTER_NAME: "Kontrol",
+    GIT_COMMITTER_EMAIL: "kontrol@users.noreply.local",
   };
 }
 

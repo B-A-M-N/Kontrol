@@ -1,7 +1,7 @@
 /**
  * ACP duplex transport — spec-compliant bidirectional JSON-RPC over a stream.
  *
- * The legacy {@link AcpClient} is request/response only: DevSpace calls the
+ * The legacy {@link AcpClient} is request/response only: Kontrol calls the
  * agent and reads back a result. But the Agent Client Protocol is duplex — a
  * running agent calls BACK into the client for:
  *
@@ -12,7 +12,7 @@
  *
  * This module speaks that reverse channel over a newline-delimited JSON-RPC
  * stream (the framing every ACP stdio agent uses). Inbound requests are routed
- * to an {@link AcpClientHandler}; DevSpace wires that handler into its approval +
+ * to an {@link AcpClientHandler}; Kontrol wires that handler into its approval +
  * policy machinery so agent-initiated permission requests surface in the WebUI
  * and park — with NO fail-closed timeout — until a human decides.
  */

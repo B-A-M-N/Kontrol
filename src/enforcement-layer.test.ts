@@ -12,7 +12,7 @@ import { openDatabase, databasePath } from "./db/client.js";
 import { createReviewWorkflowService } from "./review-workflow.js";
 import { authorizeWorkSessionAction } from "./work-session-action-guard.js";
 
-const root = await mkdtemp(join(tmpdir(), "devdesktop-enforcement-"));
+const root = await mkdtemp(join(tmpdir(), "kontrol-enforcement-"));
 
 function fakeServer(): { registerTool: (n: string, _c: unknown, h: (a: any) => any) => undefined; handlers: Map<string, (a: any) => any> } {
   const handlers = new Map<string, (a: any) => any>();
@@ -191,15 +191,15 @@ try {
 
   // ── Test 3: webui/client reconciled to webui/reviewer via ensure() ──
   {
-    agentRegistry.register({ name: "webui", url: "ui://devdesktop/workspace-app.html", role: "client", ttlSeconds: 600 });
+    agentRegistry.register({ name: "webui", url: "ui://kontrol/workspace-app.html", role: "client", ttlSeconds: 600 });
     const before = agentRegistry.listAll().find((a) => a.name === "webui");
     assert.equal(before?.role, "client", "registered initially as client");
-    agentRegistry.ensure({ name: "webui", url: "ui://devdesktop/workspace-app.html", role: "reviewer", ttlSeconds: 600 });
+    agentRegistry.ensure({ name: "webui", url: "ui://kontrol/workspace-app.html", role: "reviewer", ttlSeconds: 600 });
     const after = agentRegistry.listAll().find((a) => a.name === "webui");
     assert.equal(after?.role, "reviewer", "ensure() reconciles stale client -> reviewer");
   }
 
-  // ── Test 4: MCP reviewer auth via role gate (X-DevDesktop-Reviewer-Token) ──
+  // ── Test 4: MCP reviewer auth via role gate (X-Kontrol-Reviewer-Token) ──
   {
     const sessionId = createGatedSession();
     const sub = await callWorker("submit_for_review", { sessionId });
@@ -220,7 +220,7 @@ try {
       reviewEpoch: sub.structuredContent.reviewEpoch,
       verdict: "approve",
     });
-    assert.ok(!reviewerApprove.isError, "reviewer (X-DevDesktop-Reviewer-Token) can approve");
+    assert.ok(!reviewerApprove.isError, "reviewer (X-Kontrol-Reviewer-Token) can approve");
     assert.equal(workSessions.get(sessionId)!.status, "approved");
   }
 

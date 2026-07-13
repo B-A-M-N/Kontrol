@@ -1,12 +1,12 @@
-// devdesktop-stdio-bridge.mjs
+// kontrol-stdio-bridge.mjs
 //
 // CRUSH (and MiMo) only speak the `stdio` MCP transport for external servers.
-// Dev Desktop exposes its tools over Streamable HTTP at /mcp. This bridge is a
-// thin stdio MCP *server* that proxies to Dev Desktop's HTTP MCP *server*, so a
-// stdio-only agent (CRUSH / MiMo) can use Dev Desktop's file tools
+// Kontrol exposes its tools over Streamable HTTP at /mcp. This bridge is a
+// thin stdio MCP *server* that proxies to Kontrol's HTTP MCP *server*, so a
+// stdio-only agent (CRUSH / MiMo) can use Kontrol's file tools
 // (read / write / edit / grep / glob / bash / ls / open_workspace / ...).
 //
-//   CRUSH (stdio client) -> this bridge (stdio server + HTTP client) -> devdesktop :7676/mcp
+//   CRUSH (stdio client) -> this bridge (stdio server + HTTP client) -> kontrol :7676/mcp
 //
 // SECURITY: this bridge runs INSIDE the coding-agent (worker) process. It must
 // NOT expose reviewer-only tools (provide_review_feedback, provide_policy_approval,
@@ -15,14 +15,14 @@
 // we filter BOTH ListTools and CallTool.
 //
 // Usage (CRUSH mcp config):
-//   "devdesktop": {
+//   "kontrol": {
 //     "type": "stdio",
 //     "command": "node",
 //     "args": ["/home/bamn/devspace/scripts/mcp-stdio-bridge.mjs"],
 //     "cwd": "/home/bamn/devspace"
 //   }
 //
-// Auth: Dev Desktop's /mcp requires `Authorization: Bearer <DEVDE...EN>`
+// Auth: Kontrol's /mcp requires `Authorization: Bearer <DEVDE...EN>`
 // in tunnel mode. The bridge loads that token from /home/bamn/devspace/.env (gitignored)
 // so the secret is never written into crush.json.
 
@@ -40,8 +40,8 @@ import {
   PingRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
-const DEVDESKTOP_URL = process.env.DEVDESKTOP_BRIDGE_URL || "http://127.0.0.1:7676/mcp";
-const DEVDESKTOP_ENV = process.env.DEVDESKTOP_BRIDGE_ENV || "/home/bamn/devspace/.env";
+const KONTROL_URL = process.env.KONTROL_BRIDGE_URL || "http://127.0.0.1:7676/mcp";
+const KONTROL_ENV = process.env.KONTROL_BRIDGE_ENV || "/home/bamn/devspace/.env";
 
 // Tools the coding agent (worker) is permitted to use. Anything NOT in this
 // set — especially reviewer-only tools — is hidden from discovery AND rejected
@@ -76,11 +76,11 @@ const REVIEWER_TOOLS = new Set([
 ]);
 
 function loadToken() {
-  if (process.env.DEVDESKTOP_TUNNEL_TOKEN) return process.env.DEVDESKTOP_TUNNEL_TOKEN;
+  if (process.env.KONTROL_TUNNEL_TOKEN) return process.env.KONTROL_TUNNEL_TOKEN;
   try {
-    const text = readFileSync(DEVDESKTOP_ENV, "utf8");
+    const text = readFileSync(KONTROL_ENV, "utf8");
     for (const line of text.split("\n")) {
-      const m = line.match(/^\s*export\s+DEVDESKTOP_TUNNEL_TOKEN=(.*)\s*$/);
+      const m = line.match(/^\s*export\s+KONTROL_TUNNEL_TOKEN=(.*)\s*$/);
       if (m) return m[1].trim().replace(/^["']|["']$/g, "");
     }
   } catch {
@@ -94,49 +94,49 @@ const headers = {};
 if (token) headers["Authorization"] = `Bearer ${token}`;
 
 // Carry the work-session attribution envelope (set by the adapter from the ACP
-// request) into Dev Desktop's HTTP MCP connection. Dev Desktop binds each tool
+// request) into Kontrol's HTTP MCP connection. Kontrol binds each tool
 // call on this connection to the exact work session named here.
-if (process.env.DEVDESKTOP_WORKSPACE_SESSION_ID) {
-  headers["X-DevDesktop-Workspace-Session"] = process.env.DEVDESKTOP_WORKSPACE_SESSION_ID;
+if (process.env.KONTROL_WORKSPACE_SESSION_ID) {
+  headers["X-Kontrol-Workspace-Session"] = process.env.KONTROL_WORKSPACE_SESSION_ID;
 }
-if (process.env.DEVDESKTOP_WORK_SESSION_ID) {
-  headers["X-DevDesktop-Work-Session"] = process.env.DEVDESKTOP_WORK_SESSION_ID;
+if (process.env.KONTROL_WORK_SESSION_ID) {
+  headers["X-Kontrol-Work-Session"] = process.env.KONTROL_WORK_SESSION_ID;
 }
-if (process.env.DEVDESKTOP_PARENT_RUN_ID) {
-  headers["X-DevDesktop-Run"] = process.env.DEVDESKTOP_PARENT_RUN_ID;
+if (process.env.KONTROL_PARENT_RUN_ID) {
+  headers["X-Kontrol-Run"] = process.env.KONTROL_PARENT_RUN_ID;
 }
-if (process.env.DEVDESKTOP_CONTINUATION_ID) {
-  headers["X-DevDesktop-Continuation"] = process.env.DEVDESKTOP_CONTINUATION_ID;
+if (process.env.KONTROL_CONTINUATION_ID) {
+  headers["X-Kontrol-Continuation"] = process.env.KONTROL_CONTINUATION_ID;
 }
 
-// Relay the signed worker envelope (issued by the adapter) so DevSpace can
+// Relay the signed worker envelope (issued by the adapter) so Kontrol can
 // authenticate this connection's role + bound work session via HMAC instead of
 // trusting the plain attribution headers above.
-if (process.env.DEVDESKTOP_WORKER_TOKEN) {
-  headers["X-DevDesktop-Worker-Token"] = process.env.DEVDESKTOP_WORKER_TOKEN;
+if (process.env.KONTROL_WORKER_TOKEN) {
+  headers["X-Kontrol-Worker-Token"] = process.env.KONTROL_WORKER_TOKEN;
 }
 
-// 1) HTTP MCP client -> Dev Desktop. Establishes the session + sends
+// 1) HTTP MCP client -> Kontrol. Establishes the session + sends
 //    notifications/initialized at connect() time.
 const client = new Client(
-  { name: "devdesktop-stdio-bridge", version: "1.0.0" },
+  { name: "kontrol-stdio-bridge", version: "1.0.0" },
   { capabilities: {} },
 );
-const httpTransport = new StreamableHTTPClientTransport(new URL(DEVDESKTOP_URL), {
+const httpTransport = new StreamableHTTPClientTransport(new URL(KONTROL_URL), {
   requestInit: { headers },
 });
 await client.connect(httpTransport);
 
 // 2) stdio MCP server -> the agent (CRUSH / MiMo).
 const server = new Server(
-  { name: "devdesktop-bridge", version: "1.0.0" },
+  { name: "kontrol-bridge", version: "1.0.0" },
   { capabilities: { tools: {}, resources: {} } },
 );
 
 server.setRequestHandler(InitializeRequestSchema, async () => ({
   protocolVersion: "2025-06-18",
   capabilities: { tools: {}, resources: {} },
-  serverInfo: { name: "devdesktop-bridge", version: "1.0.0" },
+  serverInfo: { name: "kontrol-bridge", version: "1.0.0" },
 }));
 
 function rejection(name) {

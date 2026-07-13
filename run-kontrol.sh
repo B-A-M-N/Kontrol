@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# run-devspace.sh — DevSpace server with explicit allowed roots (no .env ambiguity).
+# run-kontrol.sh — Kontrol server with explicit allowed roots (no .env ambiguity).
 cd /home/bamn/devspace
 [[ -f .env ]] || { echo "ERROR: .env missing" >&2; exit 1; }
 set -a; source .env; set +a
 
-export DEVDESKTOP_AUTH_MODE="${DEVDESKTOP_AUTH_MODE:-tunnel}"
+export KONTROL_AUTH_MODE="${KONTROL_AUTH_MODE:-tunnel}"
 export HOST="${HOST:-127.0.0.1}"
 export PORT="${PORT:-7676}"
-export DEVDESKTOP_ALLOWED_ROOTS="${DEVDESKTOP_ALLOWED_ROOTS:-/home/bamn/devspace,/home/bamn}"
-export DEVDESKTOP_OAUTH_OWNER_TOKEN="${DEVDESKTOP_OAUTH_OWNER_TOKEN:-test-owner-token-that-is-long-enough}"
+export KONTROL_ALLOWED_ROOTS="${KONTROL_ALLOWED_ROOTS:-/home/bamn/devspace,/home/bamn}"
+export KONTROL_OAUTH_OWNER_TOKEN="${KONTROL_OAUTH_OWNER_TOKEN:-test-owner-token-that-is-long-enough}"
 
 # --- Validate secrets (don't start half-configured) ---
-if [[ -z "${DEVDESKTOP_ACP_SHARED_SECRET:-}" ]]; then
-  echo "ERROR: DEVDESKTOP_ACP_SHARED_SECRET is required when ACP is enabled (.env)." >&2
+if [[ -z "${KONTROL_ACP_SHARED_SECRET:-}" ]]; then
+  echo "ERROR: KONTROL_ACP_SHARED_SECRET is required when ACP is enabled (.env)." >&2
   exit 1
 fi
 

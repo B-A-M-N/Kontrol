@@ -7,7 +7,7 @@ import {
 import type { GrantRecord, GrantStore } from "./policy.js";
 
 /**
- * SQLite-backed durable grant store. Approvals survive DevSpace restarts.
+ * SQLite-backed durable grant store. Approvals survive Kontrol restarts.
  * A grant is effective while it is not revoked and not past its optional
  * expiry. Work-session grants are revoked by the caller when the session
  * becomes terminal (the workflow service calls revokeForScope).

@@ -59,7 +59,7 @@ import { createApprovalRequestManager } from "./approval-requests.js";
 import { createMissionLedger } from "./mission-ledger.js";
 
 type Transport = StreamableHTTPServerTransport;
-const WORKSPACE_APP_URI = "ui://devdesktop/workspace-app.html";
+const WORKSPACE_APP_URI = "ui://kontrol/workspace-app.html";
 const WRITE_TOOL_ANNOTATIONS = {
   readOnlyHint: false,
   destructiveHint: true,
@@ -177,7 +177,7 @@ function serverInstructions(config: ServerConfig): string {
       : "";
 
   if (config.toolMode === "codex") {
-    return `Use Dev Desktop as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree and reuse its workspaceId. Use ${toolNames.read} for direct file reads, apply_patch for all file modifications, exec_command for inspection, tests, builds, and other commands, and write_stdin to poll or interact with running processes. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.${showChangesInstruction}`;
+    return `Use Kontrol as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree and reuse its workspaceId. Use ${toolNames.read} for direct file reads, apply_patch for all file modifications, exec_command for inspection, tests, builds, and other commands, and write_stdin to poll or interact with running processes. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.${showChangesInstruction}`;
   }
 
   const inspection = config.toolMode !== "full"
@@ -190,7 +190,7 @@ function serverInstructions(config: ServerConfig): string {
 
   const agentsMd = `Follow instructions returned by ${toolNames.openWorkspace}. Before working under a path listed in availableAgentsFiles, use ${toolNames.read} to inspect that instruction file and follow it. `;
 
-  return `Use Dev Desktop as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree to obtain a workspaceId. Reuse that same workspaceId for all later file, search, edit, write, show-changes, and shell tools in that folder; do not call ${toolNames.openWorkspace} again unless switching folders/worktrees, changing checkout/worktree mode, the workspaceId is rejected as unknown, or the user explicitly asks to reopen. ${agentsMd}${skills}${inspection}Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not create or modify files with ${toolNames.shell}; avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or any command whose purpose is to write project files.${showChangesInstruction}`;
+  return `Use Kontrol as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree to obtain a workspaceId. Reuse that same workspaceId for all later file, search, edit, write, show-changes, and shell tools in that folder; do not call ${toolNames.openWorkspace} again unless switching folders/worktrees, changing checkout/worktree mode, the workspaceId is rejected as unknown, or the user explicitly asks to reopen. ${agentsMd}${skills}${inspection}Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not create or modify files with ${toolNames.shell}; avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or any command whose purpose is to write project files.${showChangesInstruction}`;
 }
 function resultOutputSchema(extra: z.ZodRawShape = {}): z.ZodRawShape {
   return {
@@ -748,8 +748,8 @@ function createMcpServer(
 ): McpServer {
   const server = new McpServer(
     {
-      name: "devdesktop",
-      title: "Dev Desktop",
+      name: "kontrol",
+      title: "Kontrol",
       version: "0.1.0",
       description:
         "Secure local coding workspace for MCP clients. Provides workspace-scoped file, search, edit, write, and shell tools.",
@@ -817,10 +817,10 @@ function createMcpServer(
 
   registerAppResource(
     server,
-    "Dev Desktop Diff Card",
+    "Kontrol Diff Card",
     WORKSPACE_APP_URI,
     {
-      description: "Interactive card for viewing Dev Desktop file diffs.",
+      description: "Interactive card for viewing Kontrol file diffs.",
       _meta: {
         ui: {
           csp: appCsp(config),
@@ -1814,7 +1814,7 @@ function createMcpServer(
 
   // Policy approval tools — available whenever policy engine is configured.
   // The MCP /mcp surface is reached by the WebUI (reviewer) and ordinary
-  // clients, NOT by the worker (the worker reaches Dev Desktop through the
+  // clients, NOT by the worker (the worker reaches Kontrol through the
   // stdio bridge, which hides these tools). Mark the caller as a reviewer so
   // provide_policy_approval is permitted here.
   if (policyEngine && eventStore) {
@@ -1840,7 +1840,7 @@ function createMcpServer(
       // This lets the SAME bridge tool set enforce
       // reviewer-only vs worker-only server-side without registering the tools
       // twice — and crucially, a caller cannot gain worker rights by sending an
-      // unsigned X-DevDesktop-Work-Session header (P0 #3).
+      // unsigned X-Kontrol-Work-Session header (P0 #3).
       principalRole: connectionContext?.authenticatedRole ?? "client",
       connectionContinuationId: connectionContext?.continuationId,
       connectionWorkSessionId: connectionContext?.workSessionId,
@@ -1855,7 +1855,7 @@ function createMcpServer(
 export function createServer(config = loadConfig()): RunningServer {
   if (config.acpEnabled && !config.acpSharedSecret) {
     throw new Error(
-      "DEVDESKTOP_ACP_SHARED_SECRET is required when DEVDESKTOP_ACP_ENABLED=true (the default). " +
+      "KONTROL_ACP_SHARED_SECRET is required when KONTROL_ACP_ENABLED=true (the default). " +
         "Set it to a long random value, e.g. `openssl rand -hex 32`. The ACP surface (/acp) is authenticated with this secret.",
     );
   }
@@ -1880,7 +1880,7 @@ export function createServer(config = loadConfig()): RunningServer {
     oauthProvider = new SingleUserOAuthProvider(config.oauth, mcpUrl, config.stateDir);
     bearerAuth = requireBearerAuth({
       verifier: oauthProvider,
-      requiredScopes: [config.oauth.scopes[0] ?? "devdesktop"],
+      requiredScopes: [config.oauth.scopes[0] ?? "kontrol"],
       resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(resourceServerUrl),
     });
     app.use(
@@ -1890,7 +1890,7 @@ export function createServer(config = loadConfig()): RunningServer {
         baseUrl: new URL(config.publicBaseUrl),
         resourceServerUrl,
         scopesSupported: config.oauth.scopes,
-        resourceName: "Dev Desktop",
+        resourceName: "Kontrol",
       }),
     );
   }
@@ -1907,8 +1907,8 @@ export function createServer(config = loadConfig()): RunningServer {
   // the CLI coding agent registers itself as the ACP *agent* at runtime.
   agentRegistry.ensure({
     name: "webui",
-    url: "ui://devdesktop/workspace-app.html",
-    description: "Dev Desktop review WebUI — the ACP client that submits work to the coding agent and signs off (Nelson Wiggum Loop).",
+    url: "ui://kontrol/workspace-app.html",
+    description: "Kontrol review WebUI — the ACP client that submits work to the coding agent and signs off (Nelson Wiggum Loop).",
     role: "reviewer",
     tags: ["webui", "reviewer"],
     ttlSeconds: 60 * 60 * 24 * 365,
@@ -1989,7 +1989,7 @@ export function createServer(config = loadConfig()): RunningServer {
         baseUrl: new URL(config.publicBaseUrl),
         resourceServerUrl,
         scopesSupported: config.oauth.scopes,
-        resourceName: "Dev Desktop",
+        resourceName: "Kontrol",
       }),
     );
   } else if (config.authMode === "tunnel") {
@@ -2003,7 +2003,7 @@ export function createServer(config = loadConfig()): RunningServer {
       authorization_servers: [],
       bearer_methods_supported: ["header"],
       scopes_supported: config.oauth.scopes,
-      resource_documentation: "https://github.com/BAMN/devdesktop",
+      resource_documentation: "https://github.com/BAMN/kontrol",
     };
     const discovery = (_req: Request, res: Response) => {
       res.setHeader("Access-Control-Allow-Origin", "*");
@@ -2033,7 +2033,7 @@ export function createServer(config = loadConfig()): RunningServer {
   );
 
   app.get("/healthz", (_req, res) => {
-    res.json({ ok: true, name: "devdesktop" });
+    res.json({ ok: true, name: "kontrol" });
   });
 
   if (config.acpEnabled) {
@@ -2082,7 +2082,7 @@ export function createServer(config = loadConfig()): RunningServer {
       // Opt-in bearer for the OpenAI tunnel hop. Constant-time compare; never log the token.
       const auth = req.header("authorization") ?? "";
       const expected = `Bearer ${config.tunnelToken}`;
-      const workerToken = req.header("x-devdesktop-worker-token");
+      const workerToken = req.header("x-kontrol-worker-token");
       let workerOk = false;
       if (workerToken && config.acpAgentSecret) {
         try {
@@ -2147,13 +2147,13 @@ export function createServer(config = loadConfig()): RunningServer {
         };
 
         // Extract the work-session attribution envelope. Role is derived from a
-        // SIGNED worker token (X-DevDesktop-Worker-Token) when present, NOT from
+        // SIGNED worker token (X-Kontrol-Worker-Token) when present, NOT from
         // the plain attribution headers. The token is HMAC-signed by the adapter
         // and binds this connection to exactly one work session + the "worker"
         // role. A caller that omits/forges the token is treated as a
         // reviewer/client and cannot acquire worker rights (P0 #3: role is no
         // longer client-controlled).
-        const workerToken = req.header("x-devdesktop-worker-token");
+        const workerToken = req.header("x-kontrol-worker-token");
         let verifiedClaims: WorkerTokenClaims | undefined;
         if (workerToken && config.acpAgentSecret) {
           try {
@@ -2166,7 +2166,7 @@ export function createServer(config = loadConfig()): RunningServer {
             });
           }
         }
-        const reviewerToken = req.header("x-devdesktop-reviewer-token");
+        const reviewerToken = req.header("x-kontrol-reviewer-token");
         const verifiedReviewer = constantTimeStringEqual(reviewerToken, config.acpReviewerSecret);
 
         // A verified worker token authenticates this connection as a worker. It
@@ -2178,15 +2178,15 @@ export function createServer(config = loadConfig()): RunningServer {
           authenticatedRole: verifiedClaims ? "worker" : verifiedReviewer ? "reviewer" : "client",
           workspaceSessionId:
             verifiedClaims?.workspaceSessionId
-            || (req.header("x-devdesktop-workspace-session") ?? undefined),
+            || (req.header("x-kontrol-workspace-session") ?? undefined),
           workSessionId:
             verifiedClaims?.workSessionId
-            || (req.header("x-devdesktop-work-session") ?? undefined),
+            || (req.header("x-kontrol-work-session") ?? undefined),
           runId:
-            verifiedClaims?.runId || (req.header("x-devdesktop-run") ?? undefined),
+            verifiedClaims?.runId || (req.header("x-kontrol-run") ?? undefined),
           continuationId:
             verifiedClaims?.continuationId
-            || (req.header("x-devdesktop-continuation") ?? undefined),
+            || (req.header("x-kontrol-continuation") ?? undefined),
         };
 
         const server = createMcpServer(
@@ -2224,7 +2224,7 @@ export function createServer(config = loadConfig()): RunningServer {
     }
   });
 
-  // Singleton continuation dispatcher — owned by the DevSpace process, not by an
+  // Singleton continuation dispatcher — owned by the Kontrol process, not by an
   // individual MCP client connection. Shares the SAME liveWaiters instance used
   // by every createMcpServer so a parked agent suppresses duplicate dispatch.
   let dispatcher: ContinuationDispatcher | undefined;
@@ -2279,7 +2279,7 @@ if (await isMainModule()) {
   const { app, config, close } = createServer();
   const httpServer = app.listen(config.port, config.host, () => {
     console.log(
-      `devdesktop listening on http://${config.host}:${config.port}/mcp`,
+      `kontrol listening on http://${config.host}:${config.port}/mcp`,
     );
     console.log(`allowed roots: ${config.allowedRoots.join(", ")}`);
     console.log(

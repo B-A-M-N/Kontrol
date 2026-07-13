@@ -25,7 +25,7 @@ assert.match(adapter, /setInterval\(\(\) => reportEvent\(run, "heartbeat"\)/);
 assert.match(adapter, /duplicate_session/);
 
 assert.match(runner, /add_observer\(on_raw_event\)/);
-assert.match(runner, /DevSpaceACPClient/);
+assert.match(runner, /KontrolACPClient/);
 assert.match(runner, /request_permission/);
 assert.match(runner, /permission_request/);
 assert.match(runner, /permission_response/);

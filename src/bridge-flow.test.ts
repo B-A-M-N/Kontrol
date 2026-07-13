@@ -19,7 +19,7 @@ import { createPolicyEngine } from "./policy.js";
 import { registerPolicyTools } from "./policy-tools.js";
 import { authorizeWorkSessionAction } from "./work-session-action-guard.js";
 
-const root = await mkdtemp(join(tmpdir(), "devdesktop-bridge-flow-"));
+const root = await mkdtemp(join(tmpdir(), "kontrol-bridge-flow-"));
 
 // A minimal MCP server that captures each registered tool handler.
 function fakeServer(): {
@@ -415,10 +415,10 @@ try {
     assert.ok(missingWorkspace.isError, "submit_to_coding_agent without workspaceSessionId fails");
 
     // Dispatch with a valid workspace creates a work session and returns both
-    // the DevSpace-owned runId and the workSessionId.
+    // the Kontrol-owned runId and the workSessionId.
     const r = await callReviewer("submit_to_coding_agent", { task: "do a thing", workspaceSessionId: WS });
     assert.ok(!r.isError, "submit_to_coding_agent with workspaceSessionId succeeds");
-    assert.ok(r.structuredContent.runId, "returns a DevSpace runId");
+    assert.ok(r.structuredContent.runId, "returns a Kontrol runId");
     assert.ok(r.structuredContent.workSessionId, "returns a workSessionId");
     assert.equal(agentRegistry.getRun(r.structuredContent.runId)!.agentName, "cli-coding-agent");
     assert.equal(workSessions.get(r.structuredContent.workSessionId)!.completionPolicy, "webui_approval_required");

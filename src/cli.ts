@@ -8,10 +8,10 @@ import { satisfies } from "semver";
 import { loadConfig } from "./config.js";
 import {
   generateOwnerToken,
-  loadDevDesktopFiles,
-  writeDevDesktopAuth,
-  writeDevDesktopConfig,
-  type DevDesktopUserConfig,
+  loadKontrolFiles,
+  writeKontrolAuth,
+  writeKontrolConfig,
+  type KontrolUserConfig,
 } from "./user-config.js";
 import { expandHomePath } from "./roots.js";
 
@@ -57,19 +57,19 @@ function normalizeCommand(command: string | undefined): Command {
 }
 
 async function ensureConfigured(): Promise<void> {
-  const files = loadDevDesktopFiles();
+  const files = loadKontrolFiles();
   if (files.configExists && files.authExists) return;
-  if (process.env.DEVDESKTOP_OAUTH_OWNER_TOKEN) return;
+  if (process.env.KONTROL_OAUTH_OWNER_TOKEN) return;
 
   if (!input.isTTY || !output.isTTY) {
     throw new Error(
       [
-        "Dev Desktop is not configured and this terminal is non-interactive.",
+        "Kontrol is not configured and this terminal is non-interactive.",
         "",
         "Run:",
-        "  devdesktop init",
+        "  kontrol init",
         "",
-        "Or provide DEVDESKTOP_OAUTH_OWNER_TOKEN and DEVDESKTOP_ALLOWED_ROOTS.",
+        "Or provide KONTROL_OAUTH_OWNER_TOKEN and KONTROL_ALLOWED_ROOTS.",
       ].join("\n"),
     );
   }
@@ -78,15 +78,15 @@ async function ensureConfigured(): Promise<void> {
 }
 
 async function runInit({ force }: { force: boolean }): Promise<void> {
-  const files = loadDevDesktopFiles();
+  const files = loadKontrolFiles();
   if (!force && files.configExists && files.authExists) {
-    prompts.log.info(`Dev Desktop is already configured at ${files.dir}`);
-    prompts.log.info("Run `devdesktop init --force` to update it.");
+    prompts.log.info(`Kontrol is already configured at ${files.dir}`);
+    prompts.log.info("Run `kontrol init --force` to update it.");
     return;
   }
 
   try {
-    prompts.intro("Dev Desktop setup");
+    prompts.intro("Kontrol setup");
 
     const defaultRoots = files.config.allowedRoots?.join(", ") || process.cwd();
     const rootsAnswer = await textPrompt({
@@ -102,7 +102,7 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
 
     const defaultPort = String(files.config.port ?? 7676);
     const portAnswer = await textPrompt({
-      message: `Which local port should Dev Desktop use? Press Enter to use ${defaultPort}`,
+      message: `Which local port should Kontrol use? Press Enter to use ${defaultPort}`,
       placeholder: defaultPort,
       defaultValue: defaultPort,
       validate: validatePort,
@@ -111,7 +111,7 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
 
     prompts.note(
       [
-        "Dev Desktop needs a public base URL so ChatGPT or Claude can reach this MCP server.",
+        "Kontrol needs a public base URL so ChatGPT or Claude can reach this MCP server.",
         "Create a tunnel or reverse proxy with Cloudflare Tunnel, ngrok, Pinggy, Tailscale Funnel, or your own HTTPS proxy.",
         "Paste the public origin here, without /mcp.",
         "",
@@ -128,7 +128,7 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
       validate: validateRequiredPublicBaseUrl,
     }));
 
-    const config: DevDesktopUserConfig = {
+    const config: KontrolUserConfig = {
       host: files.config.host ?? "127.0.0.1",
       port,
       allowedRoots,
@@ -138,8 +138,8 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
       ownerToken: files.auth.ownerToken ?? generateOwnerToken(),
     };
 
-    const configPath = writeDevDesktopConfig(config);
-    const authPath = writeDevDesktopAuth(auth);
+    const configPath = writeKontrolConfig(config);
+    const authPath = writeKontrolAuth(auth);
 
     const lines = [
       `Config: ${configPath}`,
@@ -147,16 +147,16 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
       `Local MCP URL: http://${config.host}:${config.port}/mcp`,
       ...(publicBaseUrl ? [`Public MCP URL: ${publicBaseUrl}/mcp`] : []),
     ];
-    prompts.note(lines.join("\n"), "Dev Desktop configured");
+    prompts.note(lines.join("\n"), "Kontrol configured");
     prompts.note(
       [
         `Owner password: ${auth.ownerToken}`,
-        "Use this when ChatGPT or Claude asks you to approve Dev Desktop access.",
+        "Use this when ChatGPT or Claude asks you to approve Kontrol access.",
         `Stored at: ${authPath}`,
       ].join("\n"),
       "Owner password",
     );
-    prompts.outro("Run `devdesktop serve` to start the MCP server.");
+    prompts.outro("Run `kontrol serve` to start the MCP server.");
   } catch (error) {
     if (error instanceof SetupCancelledError) {
       prompts.cancel("Setup cancelled");
@@ -184,12 +184,12 @@ async function serve(): Promise<void> {
   const config = loadConfig();
   const { app, close } = createServer(config);
   const httpServer = app.listen(config.port, config.host, () => {
-    console.log(`devdesktop listening on http://${config.host}:${config.port}/mcp`);
+    console.log(`kontrol listening on http://${config.host}:${config.port}/mcp`);
     console.log(`public base url: ${config.publicBaseUrl}`);
     console.log(`allowed roots: ${config.allowedRoots.join(", ")}`);
     console.log(`allowed hosts: ${config.allowedHosts.join(", ")}`);
     if (config.allowedHosts.includes("*")) {
-      console.warn("warning: Host header allowlist is disabled because DEVDESKTOP_ALLOWED_HOSTS=*");
+      console.warn("warning: Host header allowlist is disabled because KONTROL_ALLOWED_HOSTS=*");
     }
     console.log(
       config.authMode === "tunnel"
@@ -210,7 +210,7 @@ async function serve(): Promise<void> {
 }
 
 async function runDoctor(): Promise<void> {
-  const files = loadDevDesktopFiles();
+  const files = loadKontrolFiles();
   console.log(`Config dir: ${files.dir}`);
   console.log(`Config file: ${files.configExists ? files.configPath : "missing"}`);
   console.log(`Auth file: ${files.authExists ? files.authPath : "missing"}`);
@@ -234,7 +234,7 @@ async function runDoctor(): Promise<void> {
 
 function runConfigCommand(args: string[]): void {
   const [subcommand, key, ...rest] = args;
-  const files = loadDevDesktopFiles();
+  const files = loadKontrolFiles();
 
   if (!subcommand || subcommand === "get") {
     console.log(JSON.stringify(files.config, null, 2));
@@ -245,7 +245,7 @@ function runConfigCommand(args: string[]): void {
     throw new Error(`Unknown config command: ${subcommand}`);
   }
   if (key !== "publicBaseUrl") {
-    throw new Error("Only `devdesktop config set publicBaseUrl <url|null>` is supported right now.");
+    throw new Error("Only `kontrol config set publicBaseUrl <url|null>` is supported right now.");
   }
 
   const value = rest.join(" ").trim();
@@ -253,7 +253,7 @@ function runConfigCommand(args: string[]): void {
     throw new Error("Missing publicBaseUrl value.");
   }
 
-  writeDevDesktopConfig({
+  writeKontrolConfig({
     ...files.config,
     publicBaseUrl: normalizeOptionalPublicBaseUrl(value),
   });
@@ -263,19 +263,19 @@ function runConfigCommand(args: string[]): void {
 function printHelp(): void {
   console.log(
     [
-      "Dev Desktop",
+      "Kontrol",
       "",
       "Usage:",
-      "  devdesktop                 Run first-time setup if needed, then start the server",
-      "  devdesktop serve           Start the server",
-      "  devdesktop init            Create or update ~/.devdesktop/config.json and auth.json",
-      "  devdesktop doctor          Show config, runtime, and native dependency status",
-      "  devdesktop config get      Print persisted config",
-      "  devdesktop config set publicBaseUrl <url|null>",
-      "  devdesktop -v, --version   Print the installed version",
+      "  kontrol                 Run first-time setup if needed, then start the server",
+      "  kontrol serve           Start the server",
+      "  kontrol init            Create or update ~/.kontrol/config.json and auth.json",
+      "  kontrol doctor          Show config, runtime, and native dependency status",
+      "  kontrol config get      Print persisted config",
+      "  kontrol config set publicBaseUrl <url|null>",
+      "  kontrol -v, --version   Print the installed version",
       "",
       "For temporary tunnels:",
-      "  DEVDESKTOP_PUBLIC_BASE_URL=https://example.trycloudflare.com devdesktop serve",
+      "  KONTROL_PUBLIC_BASE_URL=https://example.trycloudflare.com kontrol serve",
     ].join("\n"),
   );
 }
@@ -283,7 +283,7 @@ function printHelp(): void {
 function printVersion(): void {
   const packageJson = require("../package.json") as { version?: unknown };
   if (typeof packageJson.version !== "string") {
-    throw new Error("Unable to read Dev Desktop package version.");
+    throw new Error("Unable to read Kontrol package version.");
   }
 
   console.log(packageJson.version);
@@ -350,7 +350,7 @@ function assertSupportedNode(): void {
 
   throw new Error(
     [
-      `Dev Desktop requires Node ${SUPPORTED_NODE_RANGE}.`,
+      `Kontrol requires Node ${SUPPORTED_NODE_RANGE}.`,
       `Current Node: ${process.version}`,
       "",
       "Install Node 22 LTS or use a version manager such as nvm, fnm, or mise.",

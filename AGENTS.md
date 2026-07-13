@@ -1,4 +1,4 @@
-# Dev Desktop
+# Kontrol
 
 This project exposes local development workspaces over MCP so ChatGPT, Claude,
 or another MCP-capable host can operate on this machine's approved development
@@ -6,12 +6,12 @@ directories. It supports two complementary workflows:
 
 - Direct MCP workspace operations, where the host calls tools that read files,
   edit files, search code, and run shell commands against an opened workspace.
-- Delegated ACP worker runs, where DevSpace dispatches a bounded task to a
+- Delegated ACP worker runs, where Kontrol dispatches a bounded task to a
   registered local coding agent and routes completion through a human-reviewed
   Ralph/Nelson loop.
 
 Pi's SDK is currently used as the backend adapter for mature local coding
-primitives such as read, edit, write, grep, find, ls, and bash. Dev Desktop wraps
+primitives such as read, edit, write, grep, find, ls, and bash. Kontrol wraps
 those primitives behind a remote Streamable HTTP MCP interface, suitable for use
 through a Cloudflare Tunnel.
 

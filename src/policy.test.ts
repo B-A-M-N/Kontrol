@@ -10,7 +10,7 @@ import { createEventStore } from "./event-log.js";
 import { createWorkSessionManager } from "./work-sessions.js";
 import { createPolicyEnforcer } from "./policy-enforcement.js";
 
-const root = mkdtempSync(join(tmpdir(), "devdesktop-policy-test-"));
+const root = mkdtempSync(join(tmpdir(), "kontrol-policy-test-"));
 const db = openDatabase(root);
 const eventStore = createEventStore(db);
 const workSessions = createWorkSessionManager(db);
@@ -39,20 +39,20 @@ assert.equal(parseMode("invalid"), undefined);
 assert.equal(parseMode(undefined), undefined);
 
 const baseEnv = {
-  DEVDESKTOP_CONFIG_DIR: root,
-  DEVDESKTOP_ALLOWED_ROOTS: process.cwd(),
-  DEVDESKTOP_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+  KONTROL_CONFIG_DIR: root,
+  KONTROL_ALLOWED_ROOTS: process.cwd(),
+  KONTROL_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
 };
 
 assert.throws(
-  () => loadPolicyConfig({ ...baseEnv, DEVDESKTOP_POLICY_MODE: "asks" }),
-  /DEVDESKTOP_POLICY_MODE must be one of allow\|deny\|ask/,
+  () => loadPolicyConfig({ ...baseEnv, KONTROL_POLICY_MODE: "asks" }),
+  /KONTROL_POLICY_MODE must be one of allow\|deny\|ask/,
 );
 assert.doesNotThrow(
-  () => loadPolicyConfig({ ...baseEnv, DEVDESKTOP_POLICY_TOOL_WRITE: "asks" }),
+  () => loadPolicyConfig({ ...baseEnv, KONTROL_POLICY_TOOL_WRITE: "asks" }),
   "invalid tool mode is ignored, not thrown",
 );
-const cfgWithBadTool = loadPolicyConfig({ ...baseEnv, DEVDESKTOP_POLICY_TOOL_WRITE: "asks" });
+const cfgWithBadTool = loadPolicyConfig({ ...baseEnv, KONTROL_POLICY_TOOL_WRITE: "asks" });
 assert.equal(cfgWithBadTool.toolRules.write, undefined);
 
 const cfg = loadPolicyConfig(baseEnv);
@@ -61,7 +61,7 @@ assert.equal(cfg.defaultMode, "allow");
 // Path rules via JSON
 const envWithPathRules = {
   ...baseEnv,
-  DEVDESKTOP_POLICY_PATH_RULES: JSON.stringify([
+  KONTROL_POLICY_PATH_RULES: JSON.stringify([
     { pattern: "/etc/ssh/**", mode: "deny" },
     { pattern: "**/.env", mode: "ask" },
   ]),
@@ -73,11 +73,11 @@ assert.equal(cfg2.pathRules[0].mode, "deny");
 assert.equal(cfg2.pathRules[1].mode, "ask");
 
 assert.throws(
-  () => loadPolicyConfig({ ...baseEnv, DEVDESKTOP_POLICY_PATH_RULES: "not json" }),
-  /DEVDESKTOP_POLICY_PATH_RULES is not valid JSON/,
+  () => loadPolicyConfig({ ...baseEnv, KONTROL_POLICY_PATH_RULES: "not json" }),
+  /KONTROL_POLICY_PATH_RULES is not valid JSON/,
 );
 assert.throws(
-  () => loadPolicyConfig({ ...baseEnv, DEVDESKTOP_POLICY_PATH_RULES: "[{}]" }),
+  () => loadPolicyConfig({ ...baseEnv, KONTROL_POLICY_PATH_RULES: "[{}]" }),
   /each entry needs a "pattern" and a valid "mode"/,
 );
 

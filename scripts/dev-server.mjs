@@ -14,7 +14,7 @@ let stoppingForRestart = false;
 let shuttingDown = false;
 
 function log(message) {
-  console.error(`[devdesktop:dev] ${message}`);
+  console.error(`[kontrol:dev] ${message}`);
 }
 
 function start() {

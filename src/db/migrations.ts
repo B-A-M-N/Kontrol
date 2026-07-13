@@ -54,7 +54,7 @@ function migrateMissionScopeGuard(sqlite: Database.Database): void {
 export function migrateDatabase(sqlite: Database.Database): void {
   const migrate = sqlite.transaction(() => {
     sqlite.exec(`
-      create table if not exists devdesktop_schema_migrations (
+      create table if not exists kontrol_schema_migrations (
         version integer primary key,
         name text not null,
         applied_at text not null
@@ -63,13 +63,13 @@ export function migrateDatabase(sqlite: Database.Database): void {
 
     const applied = new Set(
       (
-        sqlite.prepare("select version from devdesktop_schema_migrations").all() as Array<{
+        sqlite.prepare("select version from kontrol_schema_migrations").all() as Array<{
           version: number;
         }>
       ).map((row) => row.version),
     );
     const recordMigration = sqlite.prepare(
-      "insert into devdesktop_schema_migrations (version, name, applied_at) values (?, ?, ?)",
+      "insert into kontrol_schema_migrations (version, name, applied_at) values (?, ?, ?)",
     );
 
     for (const migration of migrations) {

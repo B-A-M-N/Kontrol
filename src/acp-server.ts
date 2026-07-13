@@ -8,7 +8,7 @@ import type { EventStore } from "./event-log.js";
 import type { ContinuationManager } from "./continuation.js";
 import type { ReviewCheckpointManager } from "./review-checkpoints.js";
 import type { ReviewWorkflowService } from "./review-workflow.js";
-import { cancelRemoteRun, dispatchToPeer, executeDevDesktopTool, selectHealthyAgent } from "./acp-gateway.js";
+import { cancelRemoteRun, dispatchToPeer, executeKontrolTool, selectHealthyAgent } from "./acp-gateway.js";
 import { createPolicyEnforcer, type PolicyEnforcer, type PolicyInvocation, ACP_TOOL_POLICY_NAMES, type PrincipalRole } from "./policy-enforcement.js";
 import type { ApprovalRequestManager, ApprovalOption } from "./approval-requests.js";
 import { authorizeWorkSessionAction } from "./work-session-action-guard.js";
@@ -22,20 +22,20 @@ import { authorizeWorkSessionAction } from "./work-session-action-guard.js";
 const APPROVAL_WAIT_TIMEOUT_MS = 300_000;
 
 const ACP_AGENTS = [
-  { name: "devdesktop-read", description: "Read a file from the workspace." },
-  { name: "devdesktop-write", description: "Write or overwrite a file in the workspace." },
-  { name: "devdesktop-edit", description: "Edit a file by replacing exact text blocks." },
-  { name: "devdesktop-grep", description: "Search file contents by pattern." },
-  { name: "devdesktop-glob", description: "Find files by glob pattern." },
-  { name: "devdesktop-shell", description: "Execute a shell command in the workspace." },
-  { name: "devdesktop-review", description: "Submit work for human review and await feedback." },
+  { name: "kontrol-read", description: "Read a file from the workspace." },
+  { name: "kontrol-write", description: "Write or overwrite a file in the workspace." },
+  { name: "kontrol-edit", description: "Edit a file by replacing exact text blocks." },
+  { name: "kontrol-grep", description: "Search file contents by pattern." },
+  { name: "kontrol-glob", description: "Find files by glob pattern." },
+  { name: "kontrol-shell", description: "Execute a shell command in the workspace." },
+  { name: "kontrol-review", description: "Submit work for human review and await feedback." },
   {
-    name: "devdesktop-agent-registry",
+    name: "kontrol-agent-registry",
     description: "Register, discover, and list peer agents. For agent-to-agent routing.",
   },
   {
-    name: "devdesktop-submit-work-to-webui",
-    description: "Submit completed work (diff/checkpoint) to the Dev Desktop WebUI for human review. (Ralphie Muntz Loop terminus: the WebUI's 'A-okay' is the only completion criterion.)",
+    name: "kontrol-submit-work-to-webui",
+    description: "Submit completed work (diff/checkpoint) to the Kontrol WebUI for human review. (Ralphie Muntz Loop terminus: the WebUI's 'A-okay' is the only completion criterion.)",
   },
 ];
 
@@ -128,7 +128,7 @@ export function createAcpServer(
       input_content_types: ["application/json", "text/plain"],
       output_content_types: ["text/plain"],
       metadata: {
-        tags: ["Code", "Dev Desktop"],
+        tags: ["Code", "Kontrol"],
         capabilities: [{ name: a.name, description: a.description }],
       },
     }));
@@ -150,7 +150,7 @@ export function createAcpServer(
     if (!authGate(req, res)) return;
     const local = agentMap.get(req.params.name);
     if (local) {
-      res.json({ name: local.name, description: local.description, input_content_types: ["application/json", "text/plain"], output_content_types: ["text/plain"], metadata: { tags: ["Code", "Dev Desktop"] } });
+      res.json({ name: local.name, description: local.description, input_content_types: ["application/json", "text/plain"], output_content_types: ["text/plain"], metadata: { tags: ["Code", "Kontrol"] } });
       return;
     }
     const peer = agentRegistry.listAlive().find((a) => a.name === req.params.name);
@@ -270,8 +270,8 @@ export function createAcpServer(
 
     const run = agentRegistry.createRun({ agentName: agent_name, workspaceSessionId: session.workspaceSessionId, workSessionId: session.id, inputPreview: taskText.slice(0, 500), webhookUrl: webhook_url, status: "in-progress" });
 
-    // devdesktop-review: enter awaiting
-    if (agent_name === "devdesktop-review") {
+    // kontrol-review: enter awaiting
+    if (agent_name === "kontrol-review") {
       agentRegistry.updateRun(run.runId, { status: "awaiting" });
       emitSse(run.runId, "run.awaiting", { run });
 
@@ -285,8 +285,8 @@ export function createAcpServer(
       return;
     }
 
-    // devdesktop-agent-registry: list registered peers
-    if (agent_name === "devdesktop-agent-registry") {
+    // kontrol-agent-registry: list registered peers
+    if (agent_name === "kontrol-agent-registry") {
       const alive = agentRegistry.listAlive();
       const output = `Discovered ${alive.length} peer(s):\n${alive.map((a) => `  ${a.name} [${a.role}] → ${a.url}${a.alive ? "" : " (stale)"}`).join("\n")}`;
       agentRegistry.updateRun(run.runId, { status: "completed", outputPreview: output, finishedAt: new Date().toISOString() });
@@ -297,8 +297,8 @@ export function createAcpServer(
       return;
     }
 
-    // devdesktop-submit-work-to-webui: agent → WebUI review surface
-    if (agent_name === "devdesktop-submit-work-to-webui") {
+    // kontrol-submit-work-to-webui: agent → WebUI review surface
+    if (agent_name === "kontrol-submit-work-to-webui") {
       if (!reviewCheckpoints) {
         agentRegistry.updateRun(run.runId, { status: "failed", errorMessage: "Review checkpoints are not available.", finishedAt: new Date().toISOString() });
         res.status(500).json({ agent_name, run_id: run.runId, status: "failed", error: { message: "Review checkpoints unavailable" }, output: [], created_at: run.createdAt, finished_at: new Date().toISOString() });
@@ -311,10 +311,10 @@ export function createAcpServer(
 
       // P1 #3: enforce the reviewer's allowedNextActions on resubmission. A
       // reviewer that omitted "resubmit" cannot be bypassed by calling
-      // devdesktop-submit-work-to-webui again while changes_requested.
+      // kontrol-submit-work-to-webui again while changes_requested.
       const resubmitDecision = authorizeWorkSessionAction(workSessions, {
         workSessionId: session.id,
-        tool: "devdesktop-submit-work-to-webui",
+        tool: "kontrol-submit-work-to-webui",
       });
       if (!resubmitDecision.allowed) {
         agentRegistry.updateRun(run.runId, { status: "failed", errorMessage: resubmitDecision.reason, finishedAt: new Date().toISOString() });
@@ -398,7 +398,7 @@ export function createAcpServer(
       }
     }
 
-    // Execute Dev Desktop tool with policy enforcement
+    // Execute Kontrol tool with policy enforcement
     const wsCtx = resolveCwd(session.id);
     if (!wsCtx) {
       agentRegistry.updateRun(run.runId, { status: "failed", errorMessage: "Workspace not found. Open a workspace via MCP first.", finishedAt: new Date().toISOString() });
@@ -419,7 +419,7 @@ export function createAcpServer(
         return;
       }
 
-      // Policy enforcement for ACP tools (devdesktop-*)
+      // Policy enforcement for ACP tools (kontrol-*)
       if (policyEnforcer) {
         const { allowed } = await policyEnforcer.enforce({
           principalId: session.id,
@@ -437,7 +437,7 @@ export function createAcpServer(
         }
       }
 
-      const output = await executeDevDesktopTool(agent_name, taskText, wsCtx.cwd, wsCtx.root);
+      const output = await executeKontrolTool(agent_name, taskText, wsCtx.cwd, wsCtx.root);
       agentRegistry.updateRun(run.runId, { status: "completed", outputPreview: output.slice(0, 2000), finishedAt: new Date().toISOString() });
 
       workSessions.logToolEvent({ workSessionId: session.id, workspaceSessionId: session.workspaceSessionId, tool: agent_name, inputJson: taskText, outputSummary: output.slice(0, 500), success: true, elapsedMs: 0 });
@@ -632,9 +632,9 @@ export function createAcpServer(
     res.status(202).json({ run_id: run.runId, status: "cancelled", remote_cancellation: remoteCancellation, output: [], created_at: run.createdAt, finished_at: new Date().toISOString() });
   });
 
-  // ── Adapter → DevSpace lifecycle events ──────────────
+  // ── Adapter → Kontrol lifecycle events ──────────────
   // The CRUSH adapter POSTs run lifecycle events here (authenticated with the
-  // shared secret). DevSpace turns them into durable work-session events that
+  // shared secret). Kontrol turns them into durable work-session events that
   // drive the WebUI watcher, and updates the run's heartbeat/lease.
   const ADAPTER_EVENT_TYPE_TO_RUN: Record<string, string> = {
     started: "agent.run.started",
@@ -649,7 +649,7 @@ export function createAcpServer(
     failed: "agent.run.failed",
     cancelled: "agent.run.cancelled",
     // Migration: older adapters reported a nonzero exit as `exited`, which
-    // DevSpace rejected with HTTP 400 and silently stranded the work session.
+    // Kontrol rejected with HTTP 400 and silently stranded the work session.
     // Map it to the same durable event as `failed` so legacy adapters still work.
     exited: "agent.run.failed",
   };
@@ -767,7 +767,7 @@ export function createAcpServer(
       case "in_progress":
       case "resuming":
         // Native ACP agents are supervised from the outside: when a turn ends,
-        // DevSpace owns the review barrier. Capture the current diff and create
+        // Kontrol owns the review barrier. Capture the current diff and create
         // the review submission instead of requiring the agent to call
         // submit_for_review/await_review_feedback itself.
         if (await submitReviewBarrierForCompletedTurn(runId, workSessionId)) break;
@@ -776,7 +776,7 @@ export function createAcpServer(
         eventStore?.appendEvent({
           type: "agent.run.failed_protocol",
           sessionId: workSessionId,
-          payload: { runId, reason: `agent exited zero while session was ${session.status} and DevSpace could not create a review barrier` },
+          payload: { runId, reason: `agent exited zero while session was ${session.status} and Kontrol could not create a review barrier` },
         });
         break;
       default:

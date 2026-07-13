@@ -10,7 +10,7 @@ import { SqliteWorkspaceStore } from "./workspace-store.js";
 import { WorkspaceRegistry } from "./workspaces.js";
 
 const execFileAsync = promisify(execFile);
-const root = await mkdtemp(join(tmpdir(), "devdesktop-workspace-test-"));
+const root = await mkdtemp(join(tmpdir(), "kontrol-workspace-test-"));
 
 try {
   const agentDir = join(root, ".pi", "agent");
@@ -22,10 +22,10 @@ try {
   await writeFile(join(root, "nested", "file.txt"), "hello\n");
 
   const config = loadConfig({
-    DEVDESKTOP_ALLOWED_ROOTS: root,
-    DEVDESKTOP_WORKTREE_ROOT: join(root, ".devdesktop", "worktrees"),
-    DEVDESKTOP_AGENT_DIR: agentDir,
-    DEVDESKTOP_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+    KONTROL_ALLOWED_ROOTS: root,
+    KONTROL_WORKTREE_ROOT: join(root, ".kontrol", "worktrees"),
+    KONTROL_AGENT_DIR: agentDir,
+    KONTROL_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
     PORT: "1",
   });
   const registry = new WorkspaceRegistry(config);
@@ -58,8 +58,8 @@ try {
   await writeFile(join(gitRoot, "AGENTS.md"), "git root instructions\n");
   await writeFile(join(gitRoot, "README.md"), "hello\n");
   await git(gitRoot, ["init"]);
-  await git(gitRoot, ["config", "user.email", "devdesktop@example.com"]);
-  await git(gitRoot, ["config", "user.name", "Dev Desktop Test"]);
+  await git(gitRoot, ["config", "user.email", "kontrol@example.com"]);
+  await git(gitRoot, ["config", "user.name", "Kontrol Test"]);
   await git(gitRoot, ["add", "."]);
   await git(gitRoot, ["commit", "-m", "Initial commit"]);
   await writeFile(join(gitRoot, "dirty.txt"), "not copied\n");
@@ -109,10 +109,10 @@ try {
     const aliasRoot = join(root, "alias-root");
     await symlink(root, aliasRoot, "dir");
     const aliasConfig = loadConfig({
-      DEVDESKTOP_ALLOWED_ROOTS: aliasRoot,
-      DEVDESKTOP_WORKTREE_ROOT: join(aliasRoot, ".devdesktop", "alias-worktrees"),
-      DEVDESKTOP_AGENT_DIR: agentDir,
-      DEVDESKTOP_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+      KONTROL_ALLOWED_ROOTS: aliasRoot,
+      KONTROL_WORKTREE_ROOT: join(aliasRoot, ".kontrol", "alias-worktrees"),
+      KONTROL_AGENT_DIR: agentDir,
+      KONTROL_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
       PORT: "1",
     });
     const aliasWorkspace = await new WorkspaceRegistry(aliasConfig).openWorkspace({

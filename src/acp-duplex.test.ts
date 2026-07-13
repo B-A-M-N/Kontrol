@@ -3,13 +3,13 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createAcpDuplex, type DuplexStream, type JsonRpcMessage } from "./acp-duplex.js";
-import { createDevSpaceDuplexHandler } from "./acp-duplex-handler.js";
+import { createKontrolDuplexHandler } from "./acp-duplex-handler.js";
 import { createApprovalRequestManager } from "./approval-requests.js";
 import { createEventStore } from "./event-log.js";
 import { openDatabase, databasePath } from "./db/client.js";
 import Database from "better-sqlite3";
 
-const root = mkdtempSync(join(tmpdir(), "devdesktop-acp-duplex-test-"));
+const root = mkdtempSync(join(tmpdir(), "kontrol-acp-duplex-test-"));
 
 /** In-memory duplex stream: capture writes, inject lines. */
 function fakeStream() {
@@ -40,7 +40,7 @@ try {
   //     PARKS (no timeout), and returns "selected" once a human approves. ------
   {
     const io = fakeStream();
-    const handler = createDevSpaceDuplexHandler({ approvalRequests, eventStore, workspaceSessionId: "ws-duplex" });
+    const handler = createKontrolDuplexHandler({ approvalRequests, eventStore, workspaceSessionId: "ws-duplex" });
     createAcpDuplex(io.stream, handler);
 
     // Agent asks for permission (id=1).
@@ -79,7 +79,7 @@ try {
   // --- Denial routes to a cancelled outcome. ---------------------------------
   {
     const io = fakeStream();
-    const handler = createDevSpaceDuplexHandler({ approvalRequests, eventStore, workspaceSessionId: "ws-duplex" });
+    const handler = createKontrolDuplexHandler({ approvalRequests, eventStore, workspaceSessionId: "ws-duplex" });
     createAcpDuplex(io.stream, handler);
     io.feed({ jsonrpc: "2.0", id: 7, method: "session/request_permission", params: { sessionId: "ws-duplex", toolCall: { title: "danger" }, options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }] } });
     await tick();
@@ -94,7 +94,7 @@ try {
   // --- Stream close cancels a parked request (agent gets cancelled, not hung). -
   {
     const io = fakeStream();
-    const handler = createDevSpaceDuplexHandler({ approvalRequests, eventStore, workspaceSessionId: "ws-duplex" });
+    const handler = createKontrolDuplexHandler({ approvalRequests, eventStore, workspaceSessionId: "ws-duplex" });
     createAcpDuplex(io.stream, handler);
     io.feed({ jsonrpc: "2.0", id: 9, method: "session/request_permission", params: { sessionId: "ws-duplex", toolCall: {}, options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }] } });
     await tick();
@@ -108,7 +108,7 @@ try {
   // --- Outbound request/response correlation. --------------------------------
   {
     const io = fakeStream();
-    const handler = createDevSpaceDuplexHandler({ approvalRequests, eventStore, workspaceSessionId: "ws-duplex" });
+    const handler = createKontrolDuplexHandler({ approvalRequests, eventStore, workspaceSessionId: "ws-duplex" });
     const conn = createAcpDuplex(io.stream, handler);
     const p = conn.request<{ ok: boolean }>("session/prompt", { text: "hi" });
     await tick();

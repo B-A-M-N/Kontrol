@@ -24,7 +24,7 @@ function isReviewer(role?: PrincipalRole): boolean {
   return role === "reviewer";
 }
 
-const WORKSPACE_APP_URI = "ui://devdesktop/workspace-app.html";
+const WORKSPACE_APP_URI = "ui://kontrol/workspace-app.html";
 
 function workspaceAppModelAndAppMeta() {
   return {
@@ -108,7 +108,7 @@ export function registerPolicyTools(
     "open_approval_center",
     {
       title: "Open approval center",
-      description: "Render all pending Dev Desktop approval requests in an actionable iframe.",
+      description: "Render all pending Kontrol approval requests in an actionable iframe.",
       inputSchema: {
         workspaceId: z.string().optional().describe("Filter by workspace session ID."),
       },

@@ -285,7 +285,7 @@ const SKIPPED_CONTEXT_DIRS = new Set([
   ".git",
   ".hg",
   ".svn",
-  ".devdesktop",
+  ".kontrol",
   "node_modules",
   "dist",
   "build",

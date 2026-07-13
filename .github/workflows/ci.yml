@@ -19,9 +19,9 @@ jobs:
           - windows-latest
 
     env:
-      DEVDESKTOP_ALLOWED_ROOTS: ${{ github.workspace }}
-      DEVDESKTOP_OAUTH_OWNER_TOKEN: ci-owner-token-that-is-long-enough
-      DEVDESKTOP_PUBLIC_BASE_URL: http://127.0.0.1:7676
+      KONTROL_ALLOWED_ROOTS: ${{ github.workspace }}
+      KONTROL_OAUTH_OWNER_TOKEN: ci-owner-token-that-is-long-enough
+      KONTROL_PUBLIC_BASE_URL: http://127.0.0.1:7676
 
     steps:
       - name: Checkout

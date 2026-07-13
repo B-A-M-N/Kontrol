@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Run one Hermes native-ACP turn and emit JSONL events for DevSpace.
+"""Run one Hermes native-ACP turn and emit JSONL events for Kontrol.
 
 This intentionally talks to ``hermes acp`` through Hermes's ACP client helper.
-It does not wrap ``hermes chat`` and it does not enable ``--yolo``. DevSpace
+It does not wrap ``hermes chat`` and it does not enable ``--yolo``. Kontrol
 owns the outer review barrier after the turn completes.
 """
 
@@ -21,9 +21,9 @@ def emit(payload: dict) -> None:
 
 
 async def main() -> int:
-    raw = os.environ.get("DEVDESKTOP_HERMES_NATIVE_INPUT")
+    raw = os.environ.get("KONTROL_HERMES_NATIVE_INPUT")
     if not raw:
-        emit({"type": "error", "error": "missing DEVDESKTOP_HERMES_NATIVE_INPUT"})
+        emit({"type": "error", "error": "missing KONTROL_HERMES_NATIVE_INPUT"})
         return 2
     spec = json.loads(raw)
 
@@ -49,7 +49,7 @@ async def main() -> int:
             if future and not future.done():
                 future.set_result(msg)
 
-    class DevSpaceACPClient:
+    class KontrolACPClient:
         def on_connect(self, _conn) -> None:
             return None
 
@@ -101,19 +101,19 @@ async def main() -> int:
             return None
 
         async def read_text_file(self, **_kwargs):
-            raise RuntimeError("DevSpace native bridge does not expose client-side file reads")
+            raise RuntimeError("Kontrol native bridge does not expose client-side file reads")
 
         async def create_terminal(self, **_kwargs):
-            raise RuntimeError("DevSpace native bridge does not expose client-side terminals")
+            raise RuntimeError("Kontrol native bridge does not expose client-side terminals")
 
         async def terminal_output(self, **_kwargs):
-            raise RuntimeError("DevSpace native bridge does not expose client-side terminals")
+            raise RuntimeError("Kontrol native bridge does not expose client-side terminals")
 
         async def release_terminal(self, **_kwargs):
             return None
 
         async def wait_for_terminal_exit(self, **_kwargs):
-            raise RuntimeError("DevSpace native bridge does not expose client-side terminals")
+            raise RuntimeError("Kontrol native bridge does not expose client-side terminals")
 
         async def kill_terminal(self, **_kwargs):
             return None
@@ -134,10 +134,10 @@ async def main() -> int:
 
     original_connect_to_agent = acp.connect_to_agent
 
-    def connect_to_agent_with_devspace_client(client, *args, **kwargs):
-        return original_connect_to_agent(client or DevSpaceACPClient(), *args, **kwargs)
+    def connect_to_agent_with_kontrol_client(client, *args, **kwargs):
+        return original_connect_to_agent(client or KontrolACPClient(), *args, **kwargs)
 
-    acp.connect_to_agent = connect_to_agent_with_devspace_client
+    acp.connect_to_agent = connect_to_agent_with_kontrol_client
 
     def on_event(event: TaskEvent) -> None:
         emit({"type": "event", "eventType": event.event_type, "data": event.data})

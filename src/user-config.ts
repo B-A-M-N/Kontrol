@@ -9,7 +9,7 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { expandHomePath } from "./roots.js";
 
-export interface DevDesktopUserConfig {
+export interface KontrolUserConfig {
   host?: string;
   port?: number;
   allowedRoots?: string[];
@@ -21,34 +21,35 @@ export interface DevDesktopUserConfig {
   acpKnownAgents?: Array<{ name: string; url: string; description?: string }>;
 }
 
-export interface DevDesktopAuthConfig {
+export interface KontrolAuthConfig {
   ownerToken?: string;
 }
 
-export interface DevDesktopFiles {
+export interface KontrolFiles {
   dir: string;
   configPath: string;
   authPath: string;
   configExists: boolean;
   authExists: boolean;
-  config: DevDesktopUserConfig;
-  auth: DevDesktopAuthConfig;
+  config: KontrolUserConfig;
+  auth: KontrolAuthConfig;
 }
 
-export function devdesktopConfigDir(env: NodeJS.ProcessEnv = process.env): string {
-  return resolve(expandHomePath(env.DEVDESKTOP_CONFIG_DIR ?? join(homedir(), ".devdesktop")));
+export function kontrolConfigDir(env: NodeJS.ProcessEnv = process.env): string {
+  if (env.KONTROL_CONFIG_DIR) return resolve(expandHomePath(env.KONTROL_CONFIG_DIR));
+  return resolve(expandHomePath(join(homedir(), ".kontrol")));
 }
 
-export function devdesktopConfigPath(env: NodeJS.ProcessEnv = process.env): string {
-  return join(devdesktopConfigDir(env), "config.json");
+export function kontrolConfigPath(env: NodeJS.ProcessEnv = process.env): string {
+  return join(kontrolConfigDir(env), "config.json");
 }
 
-export function devdesktopAuthPath(env: NodeJS.ProcessEnv = process.env): string {
-  return join(devdesktopConfigDir(env), "auth.json");
+export function kontrolAuthPath(env: NodeJS.ProcessEnv = process.env): string {
+  return join(kontrolConfigDir(env), "auth.json");
 }
 
-export function loadDevDesktopFiles(env: NodeJS.ProcessEnv = process.env): DevDesktopFiles {
-  const dir = devdesktopConfigDir(env);
+export function loadKontrolFiles(env: NodeJS.ProcessEnv = process.env): KontrolFiles {
+  const dir = kontrolConfigDir(env);
   const configPath = join(dir, "config.json");
   const authPath = join(dir, "auth.json");
   const configExists = existsSync(configPath);
@@ -60,27 +61,27 @@ export function loadDevDesktopFiles(env: NodeJS.ProcessEnv = process.env): DevDe
     authPath,
     configExists,
     authExists,
-    config: configExists ? readJsonFile<DevDesktopUserConfig>(configPath) : {},
-    auth: authExists ? readJsonFile<DevDesktopAuthConfig>(authPath) : {},
+    config: configExists ? readJsonFile<KontrolUserConfig>(configPath) : {},
+    auth: authExists ? readJsonFile<KontrolAuthConfig>(authPath) : {},
   };
 }
 
-export function writeDevDesktopConfig(
-  config: DevDesktopUserConfig,
+export function writeKontrolConfig(
+  config: KontrolUserConfig,
   env: NodeJS.ProcessEnv = process.env,
 ): string {
-  const filePath = devdesktopConfigPath(env);
-  mkdirSync(devdesktopConfigDir(env), { recursive: true });
+  const filePath = kontrolConfigPath(env);
+  mkdirSync(kontrolConfigDir(env), { recursive: true });
   writeJsonFile(filePath, config, 0o600);
   return filePath;
 }
 
-export function writeDevDesktopAuth(
-  auth: DevDesktopAuthConfig,
+export function writeKontrolAuth(
+  auth: KontrolAuthConfig,
   env: NodeJS.ProcessEnv = process.env,
 ): string {
-  const filePath = devdesktopAuthPath(env);
-  mkdirSync(devdesktopConfigDir(env), { recursive: true });
+  const filePath = kontrolAuthPath(env);
+  mkdirSync(kontrolConfigDir(env), { recursive: true });
   writeJsonFile(filePath, auth, 0o600);
   return filePath;
 }

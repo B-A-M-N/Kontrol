@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createContinuationManager } from "./continuation.js";
 
-const root = await mkdtemp(join(tmpdir(), "devdesktop-continuation-test-"));
+const root = await mkdtemp(join(tmpdir(), "kontrol-continuation-test-"));
 
 try {
   testAtomicClaim();

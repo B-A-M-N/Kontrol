@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Native Hermes ACP bridge.
 //
-// This adapter registers `hermes-agent` as an HTTP ACP peer for DevSpace, but
+// This adapter registers `hermes-agent` as an HTTP ACP peer for Kontrol, but
 // executes turns by spawning Hermes's native `hermes acp` stdio server through
 // scripts/hermes-native-runner.py. It is separate from acp-crush-adapter.mjs on
 // purpose: Hermes must not be represented as a CRUSH-style subprocess wrapper.
@@ -12,9 +12,9 @@ import { randomUUID } from "node:crypto";
 import { delimiter, isAbsolute } from "node:path";
 import { realpath, stat } from "node:fs/promises";
 
-const DEVDESKTOP_ACP_URL = process.env.DEVDESKTOP_ACP_URL || "http://127.0.0.1:7676/acp";
-const AGENT_SECRET = process.env.DEVDESKTOP_ACP_AGENT_SECRET;
-const ADAPTER_SECRET = process.env.DEVDESKTOP_ACP_ADAPTER_SECRET;
+const KONTROL_ACP_URL = process.env.KONTROL_ACP_URL || "http://127.0.0.1:7676/acp";
+const AGENT_SECRET = process.env.KONTROL_ACP_AGENT_SECRET;
+const ADAPTER_SECRET = process.env.KONTROL_ACP_ADAPTER_SECRET;
 const HERMES_BIN = process.env.HERMES_BIN || "hermes";
 const HERMES_AGENT_ROOT = process.env.HERMES_AGENT_ROOT || "/home/bamn/hermes-agent";
 const ADAPTER_PORT = Number(process.env.HERMES_ACP_ADAPTER_PORT || process.env.ACP_ADAPTER_PORT || "9911");
@@ -23,7 +23,7 @@ const RUNNER = new URL("./hermes-native-runner.py", import.meta.url).pathname;
 const HERMES_ACP_COMPAT_PATH = new URL("./hermes-acp-compat", import.meta.url).pathname;
 
 if (!AGENT_SECRET || !ADAPTER_SECRET) {
-  console.error("[hermes-native] DEVDESKTOP_ACP_AGENT_SECRET and DEVDESKTOP_ACP_ADAPTER_SECRET are required");
+  console.error("[hermes-native] KONTROL_ACP_AGENT_SECRET and KONTROL_ACP_ADAPTER_SECRET are required");
   process.exit(1);
 }
 
@@ -73,7 +73,7 @@ async function registerAgentWithRetry() {
 }
 
 async function registerAgent() {
-  const res = await fetch(`${DEVDESKTOP_ACP_URL}/agents/register`, {
+  const res = await fetch(`${KONTROL_ACP_URL}/agents/register`, {
     method: "POST",
     headers: { "Content-Type": "application/json", authorization: `Bearer ${AGENT_SECRET}` },
     body: JSON.stringify({
@@ -93,7 +93,7 @@ async function registerAgent() {
 
 async function heartbeat() {
   if (!agentId) return;
-  const res = await fetch(`${DEVDESKTOP_ACP_URL}/agents/${agentId}/heartbeat`, {
+  const res = await fetch(`${KONTROL_ACP_URL}/agents/${agentId}/heartbeat`, {
     method: "POST",
     headers: { authorization: `Bearer ${AGENT_SECRET}` },
   });
@@ -118,7 +118,7 @@ async function handle(req, res) {
     if (!run) {
       return writeJson(res, 404, { error: { code: "not_found", message: `active run not found: ${remoteRunId}` } });
     }
-    cancelRun(run, "cancelled by DevSpace");
+    cancelRun(run, "cancelled by Kontrol");
     return writeJson(res, 202, { run_id: remoteRunId, status: "cancelled" });
   }
   if (req.method !== "POST" || req.url !== "/runs") {
@@ -157,7 +157,7 @@ async function handle(req, res) {
       ...safeEnv(),
       HERMES_AGENT_ROOT,
       PYTHONPATH: withHermesPythonPath(process.env.PYTHONPATH),
-      DEVDESKTOP_HERMES_NATIVE_INPUT: JSON.stringify({
+      KONTROL_HERMES_NATIVE_INPUT: JSON.stringify({
         command: HERMES_BIN,
         args: ["acp"],
         cwd: workspaceRoot,
@@ -272,7 +272,7 @@ async function handlePermissionRequest(run, msg) {
     : typeof toolCall.raw_input?.command === "string"
       ? toolCall.raw_input.command
       : undefined;
-  const approval = await createDevSpaceApproval(run, {
+  const approval = await createKontrolApproval(run, {
     title,
     description: textFromContent(toolCall.content) || undefined,
     command,
@@ -291,8 +291,8 @@ async function handlePermissionRequest(run, msg) {
   void waitForApprovalResolution(run, requestId, approval.approval_id, options);
 }
 
-async function createDevSpaceApproval(run, payload) {
-  const res = await fetch(`${DEVDESKTOP_ACP_URL}/runs/${run.devRunId}/events`, {
+async function createKontrolApproval(run, payload) {
+  const res = await fetch(`${KONTROL_ACP_URL}/runs/${run.devRunId}/events`, {
     method: "POST",
     headers: { "Content-Type": "application/json", authorization: `Bearer ${AGENT_SECRET}` },
     body: JSON.stringify({
@@ -341,7 +341,7 @@ async function waitForApprovalResolution(run, requestId, approvalId, options) {
 }
 
 async function fetchApprovalDecision(approvalId) {
-  const res = await fetch(`${DEVDESKTOP_ACP_URL}/approvals/${approvalId}/decision`, {
+  const res = await fetch(`${KONTROL_ACP_URL}/approvals/${approvalId}/decision`, {
     headers: { authorization: `Bearer ${AGENT_SECRET}` },
   }).catch(() => undefined);
   if (!res?.ok) return undefined;
@@ -359,7 +359,7 @@ function sendPermissionResponse(run, requestId, response) {
 }
 
 async function reportEvent(run, type, errorMessage) {
-  await fetch(`${DEVDESKTOP_ACP_URL}/runs/${run.devRunId}/events`, {
+  await fetch(`${KONTROL_ACP_URL}/runs/${run.devRunId}/events`, {
     method: "POST",
     headers: { "Content-Type": "application/json", authorization: `Bearer ${AGENT_SECRET}` },
     body: JSON.stringify({
@@ -397,7 +397,7 @@ function reportOutput(run, text, channel) {
 }
 
 function reportStructured(run, type, payload) {
-  void fetch(`${DEVDESKTOP_ACP_URL}/runs/${run.devRunId}/events`, {
+  void fetch(`${KONTROL_ACP_URL}/runs/${run.devRunId}/events`, {
     method: "POST",
     headers: { "Content-Type": "application/json", authorization: `Bearer ${AGENT_SECRET}` },
     body: JSON.stringify({
