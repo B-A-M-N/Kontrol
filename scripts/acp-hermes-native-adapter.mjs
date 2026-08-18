@@ -9,14 +9,15 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createServer } from "node:http";
 import { randomUUID } from "node:crypto";
-import { delimiter, isAbsolute } from "node:path";
+import { delimiter, dirname, isAbsolute, join } from "node:path";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { realpath, stat } from "node:fs/promises";
 
 const KONTROL_ACP_URL = process.env.KONTROL_ACP_URL || "http://127.0.0.1:7676/acp";
 const AGENT_SECRET = process.env.KONTROL_ACP_AGENT_SECRET;
 const ADAPTER_SECRET = process.env.KONTROL_ACP_ADAPTER_SECRET;
 const HERMES_BIN = process.env.HERMES_BIN || "hermes";
-const HERMES_AGENT_ROOT = process.env.HERMES_AGENT_ROOT || process.cwd();
+const HERMES_AGENT_ROOT = process.env.HERMES_AGENT_ROOT || detectHermesAgentRoot() || process.cwd();
 const ADAPTER_PORT = Number(process.env.HERMES_ACP_ADAPTER_PORT || process.env.ACP_ADAPTER_PORT || "9911");
 const ADAPTER_HOST = process.env.HOST || "127.0.0.1";
 const RUNNER = new URL("./hermes-native-runner.py", import.meta.url).pathname;
@@ -47,11 +48,23 @@ if (check.status !== 0) {
 }
 
 const PYTHON_BIN = resolveHermesPython();
+let degraded = PYTHON_BIN === null;
 const active = new Map();
 let agentId = null;
 
-await registerAgentWithRetry();
-setInterval(() => heartbeat().catch((err) => console.warn("[hermes-native] heartbeat:", err.message)), 55_000);
+if (degraded) {
+  console.error("[hermes-native] starting in DEGRADED mode — Hermes runs will be rejected until fixed");
+  console.error("Set HERMES_NATIVE_PYTHON to the Hermes virtualenv Python, e.g. /path/to/hermes-agent/.venv/bin/python");
+} else {
+  try {
+    await registerAgentWithRetry();
+    setInterval(() => heartbeat().catch((err) => console.warn("[hermes-native] heartbeat:", err.message)), 55_000);
+  } catch (err) {
+    degraded = true;
+    console.error(`[hermes-native] starting in DEGRADED mode — agent registration failed: ${err.message}`);
+    console.error("Hermes runs will be rejected until Kontrol is reachable and registration succeeds.");
+  }
+}
 
 createServer((req, res) => {
   handle(req, res).catch((err) => {
@@ -111,7 +124,7 @@ async function handle(req, res) {
   const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString()) : {};
 
   if (req.method === "GET" && req.url === "/health") {
-    return writeJson(res, 200, { ok: true, agent: "hermes-agent", active: active.size, native: true });
+    return writeJson(res, 200, { ok: !degraded, degraded, agent: "hermes-agent", active: active.size, native: true });
   }
   const cancelMatch = (req.url || "").match(/^\/runs\/([^/]+)\/cancel$/);
   if (req.method === "POST" && cancelMatch) {
@@ -132,6 +145,9 @@ async function handle(req, res) {
   if ((req.headers.authorization || "") !== `Bearer ${ADAPTER_SECRET}`) {
     return writeJson(res, 401, { error: { code: "unauthorized" } });
   }
+  if (degraded) {
+    return writeJson(res, 503, { error: { code: "degraded", message: "Hermes adapter is degraded: no Python interpreter found" } });
+  }
   if (body.smoke_test) {
     return writeJson(res, 202, { run_id: "hermes-native-smoke", smoke_test: true, native: true, accepted: true });
   }
@@ -145,8 +161,15 @@ async function handle(req, res) {
     task: extractTask(body.input),
     workspaceRoot,
     child: null,
+    lifecycle: "STARTING",
     finalized: false,
+    explicitCompletion: false,
     pendingPermissions: new Map(),
+    lastRunnerActivityAt: Date.now(),
+    sawAgentMessage: false,
+    sendChain: Promise.resolve(),
+    deliveryErrors: [],
+    terminalOutcome: null,
   };
   if (run.workSessionId && hasActiveSession(run.workSessionId)) {
     return writeJson(res, 409, { error: { code: "duplicate_session", message: `work session already active: ${run.workSessionId}` } });
@@ -172,6 +195,24 @@ async function handle(req, res) {
     },
   });
   run.child = child;
+  run.lifecycle = "RUNNING";
+
+  // P1 #11: The Python runner is the authoritative turn-end detector.
+  // It emits {"type":"complete"} when the turn is done. The JS adapter
+  // does NOT independently decide "turn completed" — that was the duplicate
+  // 20-second heuristic. The deadman timer is a periodic idle-activity
+  // check, NOT a wall-clock run limit — a healthy long-running task must
+  // never be killed merely because it has been running for a long time.
+  const DEADMAN_IDLE_MS = 5 * 60_000; // 5 minutes without any runner event = broken
+  run.deadmanTimer = setInterval(() => {
+    if (run.finalized) return;
+    const idleMs = Date.now() - run.lastRunnerActivityAt;
+    if (idleMs > DEADMAN_IDLE_MS) {
+      console.warn(`[hermes-native] deadman idle timeout for ${run.remoteRunId} — ${idleMs}ms since last runner event`);
+      finalizeRun(run, "failed", `deadman idle timeout — no runner event for ${Math.round(idleMs / 1000)}s`);
+      terminateChild(run, "deadman idle timeout");
+    }
+  }, 30_000).unref?.();
 
   let stdoutBuffer = "";
   child.stdout.setEncoding("utf8");
@@ -187,25 +228,31 @@ async function handle(req, res) {
   child.stderr.on("data", (chunk) => reportOutput(run, String(chunk), "stderr"));
   child.on("error", (err) => {
     clearInterval(heartbeatTimer);
-    active.delete(run.remoteRunId);
+    clearInterval(run.deadmanTimer);
     if (run.finalized) return;
-    run.finalized = true;
-    void reportEvent(run, "failed", err.message);
+    finalizeRun(run, "failed", err.message);
   });
   child.on("exit", (code, signal) => {
     clearInterval(heartbeatTimer);
     if (stdoutBuffer.trim()) handleRunnerLine(run, stdoutBuffer);
-    active.delete(run.remoteRunId);
     if (run.finalized) return;
-    run.finalized = true;
-    if (code === 0) reportEvent(run, "completed");
-    else reportEvent(run, "failed", signal ? `terminated by ${signal}` : `exit code ${code}`);
+    if (code === 0 && !run.explicitCompletion) {
+      // A clean process exit is not proof that the ACP turn completed. The
+      // runner must emit its authoritative complete frame; otherwise the
+      // review workflow would incorrectly advance on a truncated protocol.
+      finalizeRun(run, "failed", "protocol_incomplete: runner exited without an explicit complete event");
+    } else if (code === 0) {
+      finalizeRun(run, "completed");
+    } else {
+      finalizeRun(run, "failed", signal ? `terminated by ${signal}` : `exit code ${code}`);
+    }
   });
 
   return writeJson(res, 202, { run_id: run.remoteRunId, remote_run_id: run.remoteRunId, accepted: true, mode: body.mode || "async" });
 }
 
 function handleRunnerLine(run, line) {
+  run.lastRunnerActivityAt = Date.now();
   let msg;
   try { msg = JSON.parse(line); } catch { return reportOutput(run, line, "stdout"); }
   if (msg.type === "raw_update") return reportRawUpdate(run, msg.params);
@@ -218,6 +265,10 @@ function handleRunnerLine(run, line) {
   if (msg.type === "complete") {
     if (msg.thoughtText) reportOutput(run, msg.thoughtText, "thought");
     if (msg.responseText) reportOutput(run, msg.responseText, "message");
+    // P1 #11: Runner emitted explicit completion — finalize the turn.
+    // The runner is the authoritative turn-end detector, not a timer.
+    run.explicitCompletion = true;
+    finalizeRun(run, "completed", msg.stopReason);
     return;
   }
   if (msg.type === "error") return reportOutput(run, msg.error || "Hermes ACP error", "error");
@@ -354,7 +405,7 @@ async function fetchApprovalDecision(approvalId) {
 }
 
 function sendPermissionResponse(run, requestId, response) {
-  if (!run.child?.stdin?.writable) return;
+  if (run.lifecycle !== "RUNNING" || !run.child?.stdin?.writable) return;
   run.child.stdin.write(JSON.stringify({
     type: "permission_response",
     requestId,
@@ -363,22 +414,34 @@ function sendPermissionResponse(run, requestId, response) {
   }) + "\n");
 }
 
-async function reportEvent(run, type, errorMessage) {
-  await fetch(`${KONTROL_ACP_URL}/runs/${run.devRunId}/events`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", authorization: `Bearer ${AGENT_SECRET}` },
-    body: JSON.stringify({
-      type,
-      remote_run_id: run.remoteRunId,
-      work_session_id: run.workSessionId,
-      payload: errorMessage ? { error: errorMessage } : {},
-    }),
-  }).catch(() => {});
+function reportEvent(run, type, errorMessage, { allowFinalizing = false } = {}) {
+  const payload = {
+    payload: errorMessage ? { error: errorMessage } : {},
+  };
+  return enqueueRunEvent(run, type, payload.payload, {
+    allowFinalizing,
+    terminal: type === "completed" || type === "failed" || type === "cancelled",
+  });
+}
+
+async function withRetry(fn, { retries = 2, backoff = 500 } = {}) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const res = await fn();
+      if (res.ok) return true;
+    } catch { /* retry */ }
+    if (attempt < retries) await new Promise(r => setTimeout(r, backoff * (attempt + 1)));
+  }
+  return false;
 }
 
 function cancelRun(run, reason) {
-  run.finalized = true;
-  active.delete(run.remoteRunId);
+  if (run.lifecycle === "FINALIZING" || run.lifecycle === "TERMINAL") return;
+  finalizeRun(run, "cancelled", reason);
+  terminateChild(run, reason);
+}
+
+function terminateChild(run, reason) {
   if (run.child?.pid) {
     try {
       process.kill(-run.child.pid, "SIGTERM");
@@ -393,25 +456,151 @@ function cancelRun(run, reason) {
       }
     }, 1500).unref?.();
   }
-  void reportEvent(run, "cancelled", reason);
+}
+
+// P0 #3: Coalesce high-volume telemetry (output_delta, thought_delta) into
+// batched POSTs. Hermes can emit thousands of individual token/thought events
+// per turn; each previously triggered an independent HTTP POST + SQLite INSERT.
+// Now we accumulate these into buffers and flush on a short interval (250ms)
+// or when ~4KB of data has accumulated, whichever comes first.
+
+const COALESCE_INTERVAL_MS = 250;
+const COALESCE_MAX_BYTES = 4096;
+
+function coalescedReport(run, type, payload) {
+  if (!run.coalesceBuffers) {
+    run.coalesceBuffers = new Map();
+    run.coalesceTimers = new Map();
+  }
+  if (type === "output_delta" || type === "thought_delta") {
+    // Accumulate into a buffer; flush periodically.
+    let entry = run.coalesceBuffers.get(type);
+    if (!entry) {
+      entry = { bytes: 0, items: [] };
+      run.coalesceBuffers.set(type, entry);
+    }
+    const itemJson = JSON.stringify(payload);
+    entry.items.push(payload);
+    entry.bytes += itemJson.length;
+
+    // Flush immediately if buffer is large enough.
+    if (entry.bytes >= COALESCE_MAX_BYTES) {
+      flushCoalesced(run, type);
+      return;
+    }
+    // Otherwise schedule a flush if one isn't already pending.
+    if (!run.coalesceTimers.has(type)) {
+      run.coalesceTimers.set(type, setTimeout(() => {
+        run.coalesceTimers.delete(type);
+        flushCoalesced(run, type);
+      }, COALESCE_INTERVAL_MS));
+    }
+    return;
+  }
+  // Non-ephemeral events are sent immediately.
+  return sendEvent(run, type, payload);
+}
+
+function flushCoalesced(run, type, allowFinalizing = false) {
+  const buffers = run.coalesceBuffers;
+  const timers = run.coalesceTimers;
+  if (!buffers || !timers) return;
+  const entry = buffers.get(type);
+  if (!entry || entry.items.length === 0) return;
+  buffers.delete(type);
+  const timer = timers.get(type);
+  if (timer) {
+    clearTimeout(timer);
+    timers.delete(type);
+  }
+  // P1 #29: Produce a stable aggregate payload that downstream consumers
+  // (WebUI, event log) can understand — not raw { coalesced, items }.
+  const texts = entry.items.map((item) => item.text ?? "").filter(Boolean);
+  const channels = [...new Set(entry.items.map((item) => item.channel).filter(Boolean))];
+  const aggregated = texts.join("");
+  void enqueueRunEvent(run, type, {
+    text: aggregated,
+    channel: channels[0] ?? (type === "thought_delta" ? "thought" : "message"),
+    coalesced: true,
+    count: entry.items.length,
+    channels,
+  }, { allowFinalizing });
+}
+
+// P1 #12: Flush ALL coalesced buffers before terminal event
+function flushAllCoalesced(run) {
+  if (!run.coalesceBuffers) return;
+  for (const type of [...run.coalesceBuffers.keys()]) {
+    flushCoalesced(run, type, true);
+  }
+}
+
+// P1 #12: Ordered event delivery queue
+function enqueueRunEvent(run, type, payload, { allowFinalizing = false, terminal = false } = {}) {
+  if ((run.lifecycle === "FINALIZING" || run.lifecycle === "TERMINAL") && !allowFinalizing) {
+    return Promise.resolve(false);
+  }
+  const delivery = run.sendChain
+    .catch((error) => recordDeliveryError(run, error))
+    .then(async () => {
+      const acknowledged = await withRetry(() => fetch(`${KONTROL_ACP_URL}/runs/${run.devRunId}/events`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", authorization: `Bearer ${AGENT_SECRET}` },
+        body: JSON.stringify({
+          type,
+          remote_run_id: run.remoteRunId,
+          work_session_id: run.workSessionId,
+          payload,
+        }),
+      }), terminal ? { retries: 3, backoff: 2000 } : { retries: 0, backoff: 0 });
+      if (!acknowledged) throw new Error(`event delivery failed: ${type}`);
+      return true;
+    })
+    .catch((error) => {
+      recordDeliveryError(run, error);
+      return false;
+    });
+  run.sendChain = delivery;
+  return delivery;
+}
+
+function recordDeliveryError(run, error) {
+  const message = error instanceof Error ? error.message : String(error);
+  run.deliveryErrors.push({ at: new Date().toISOString(), message });
+  if (run.deliveryErrors.length > 50) run.deliveryErrors.shift();
+  console.warn(`[hermes-native] event delivery: ${message}`);
+}
+
+function sendEvent(run, type, payload) {
+  return enqueueRunEvent(run, type, payload);
+}
+
+function finalizeRun(run, status, stopReason) {
+  if (run.terminalOutcome) return run.terminalOutcome;
+  const outcome = { status, stopReason };
+  run.terminalOutcome = outcome;
+  run.lifecycle = "FINALIZING";
+  run.finalized = true;
+  clearInterval(run.deadmanTimer);
+  // P1 #12: Flush coalesced telemetry BEFORE terminal event
+  flushAllCoalesced(run);
+  void run.sendChain
+    .then(() => reportEvent(run, status, stopReason, { allowFinalizing: true }))
+    .finally(() => {
+      active.delete(run.remoteRunId);
+      run.lifecycle = "TERMINAL";
+    });
+  return outcome;
 }
 
 function reportOutput(run, text, channel) {
   if (!text) return;
-  return reportStructured(run, "output_delta", { text, channel });
+  if (channel === "message") run.sawAgentMessage = true;
+  return coalescedReport(run, "output_delta", { text, channel });
 }
 
 function reportStructured(run, type, payload) {
-  void fetch(`${KONTROL_ACP_URL}/runs/${run.devRunId}/events`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", authorization: `Bearer ${AGENT_SECRET}` },
-    body: JSON.stringify({
-      type,
-      remote_run_id: run.remoteRunId,
-      work_session_id: run.workSessionId,
-      payload,
-    }),
-  }).catch(() => {});
+  return coalescedReport(run, type, payload);
 }
 
 function safeEnv() {
@@ -426,6 +615,7 @@ function resolveHermesPython() {
     process.env.HERMES_NATIVE_PYTHON,
     `${HERMES_AGENT_ROOT}/.venv/bin/python`,
     `${HERMES_AGENT_ROOT}/venv/bin/python`,
+    detectHermesPython(),
     "python3",
   ].filter(Boolean);
   for (const candidate of candidates) {
@@ -444,7 +634,48 @@ function resolveHermesPython() {
   }
   console.error("[hermes-native] no Python interpreter can import Hermes ACP modules");
   console.error("Set HERMES_NATIVE_PYTHON to the Hermes virtualenv Python, e.g. /path/to/hermes-agent/.venv/bin/python");
-  process.exit(1);
+  return null;
+}
+
+function resolveHermesBinaryPath() {
+  if (isAbsolute(HERMES_BIN) && existsSync(HERMES_BIN)) {
+    return realpathSync(HERMES_BIN);
+  }
+  const which = spawnSync("which", [HERMES_BIN], { encoding: "utf8" });
+  if (which.status === 0) {
+    const p = which.stdout.trim();
+    if (p) return realpathSync(p);
+  }
+  return null;
+}
+
+function detectHermesAgentRoot() {
+  try {
+    const resolved = resolveHermesBinaryPath();
+    if (!resolved) return null;
+    const binDir = dirname(resolved);
+    const venvDir = dirname(binDir);
+    const root = dirname(venvDir);
+    if (existsSync(join(root, "acp")) || existsSync(join(root, "acp_adapter"))) {
+      return root;
+    }
+  } catch {}
+  return null;
+}
+
+function detectHermesPython() {
+  try {
+    const resolved = resolveHermesBinaryPath();
+    if (!resolved) return null;
+    const firstLine = readFileSync(resolved, "utf8").split("\n")[0];
+    if (firstLine.startsWith("#!")) {
+      const interpreter = firstLine.slice(2).trim().split(/\s+/)[0];
+      if (interpreter && /python3?$/.test(interpreter)) {
+        return interpreter;
+      }
+    }
+  } catch {}
+  return null;
 }
 
 function withHermesPythonPath(existing) {

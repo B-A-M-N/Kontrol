@@ -104,7 +104,7 @@ await assert.rejects(
 +no
 *** End Patch`,
   ),
-  /path resolves outside the workspace/,
+  /path resolves outside the workspace|symlink path components are not permitted/,
 );
 
 await assert.rejects(

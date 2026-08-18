@@ -23,6 +23,13 @@ assert.match(adapter, /plan_updated/);
 assert.match(adapter, /stdoutBuffer/);
 assert.match(adapter, /setInterval\(\(\) => reportEvent\(run, "heartbeat"\)/);
 assert.match(adapter, /duplicate_session/);
+assert.match(adapter, /explicitCompletion/);
+assert.match(adapter, /protocol_incomplete/);
+assert.match(adapter, /runner exited without an explicit complete event/);
+assert.match(adapter, /lifecycle: "STARTING"/);
+assert.match(adapter, /run\.lifecycle = "FINALIZING"/);
+assert.match(adapter, /flushAllCoalesced\(run\)/);
+assert.match(adapter, /finalizeRun\(run, "cancelled", reason\)/);
 
 assert.match(runner, /add_observer\(on_raw_event\)/);
 assert.match(runner, /KontrolACPClient/);
@@ -33,5 +40,12 @@ assert.match(runner, /RequestPermissionResponse/);
 assert.match(runner, /"raw_update"/);
 assert.match(runner, /"raw_request"/);
 assert.match(runner, /connects? to ``hermes acp``|hermes acp/);
+assert.doesNotMatch(runner, /hermes_idle_completion_fallback/);
+assert.doesNotMatch(runner, /stop_reason="idle_end_turn"/);
+assert.match(adapter, /function enqueueRunEvent\(run, type, payload/);
+assert.match(adapter, /deliveryErrors/);
+assert.match(adapter, /terminalOutcome/);
+assert.match(adapter, /flushCoalesced\(run, type, true\)/);
+assert.doesNotMatch(adapter, /stdoutBuffer \+= chunk;\s*stdoutBuffer \+= chunk;/);
 
 console.log("hermes-native-adapter.test.mjs: all assertions passed");

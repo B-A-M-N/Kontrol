@@ -1,7 +1,10 @@
 #!/usr/bin/env node
 import { createRequire } from "node:module";
+import { spawnSync } from "node:child_process";
+import { existsSync, statSync, statfsSync } from "node:fs";
 import { stdin as input, stdout as output } from "node:process";
-import { resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import * as prompts from "@clack/prompts";
 import { getShellConfig } from "@earendil-works/pi-coding-agent";
 import { satisfies } from "semver";
@@ -14,10 +17,17 @@ import {
   type KontrolUserConfig,
 } from "./user-config.js";
 import { expandHomePath } from "./roots.js";
+import {
+  createRuntimeIdentity,
+  isRuntimeIdentityLive,
+  readBuildIdentity,
+  readRuntimeIdentity,
+  removeRuntimeIdentity,
+} from "./runtime-identity.js";
 
-type Command = "serve" | "init" | "doctor" | "config" | "help" | "version";
+type Command = "serve" | "up" | "init" | "doctor" | "config" | "help" | "version";
 const require = createRequire(import.meta.url);
-const SUPPORTED_NODE_RANGE = ">=20.12 <27";
+const SUPPORTED_NODE_RANGE = ">=22.19 <27";
 
 async function main(argv: string[]): Promise<void> {
   assertSupportedNode();
@@ -29,6 +39,9 @@ async function main(argv: string[]): Promise<void> {
     case "serve":
       await ensureConfigured();
       await serve();
+      return;
+    case "up":
+      runUp(args);
       return;
     case "init":
       await runInit({ force: args.includes("--force") });
@@ -50,15 +63,38 @@ async function main(argv: string[]): Promise<void> {
 
 function normalizeCommand(command: string | undefined): Command {
   if (!command || command === "serve" || command === "start") return "serve";
-  if (command === "init" || command === "doctor" || command === "config") return command;
+  if (command === "up" || command === "init" || command === "doctor" || command === "config") return command;
   if (command === "help" || command === "--help" || command === "-h") return "help";
   if (command === "version" || command === "--version" || command === "-v") return "version";
   throw new Error(`Unknown command: ${command}`);
 }
 
+function runUp(args: string[]): void {
+  if (args.length > 0) {
+    throw new Error("`kontrol up` does not accept arguments.");
+  }
+
+  const launcher = resolve(process.cwd(), "start-all.sh");
+  if (!existsSync(launcher)) {
+    throw new Error(
+      "`kontrol up` must be run from a Kontrol checkout containing start-all.sh. "
+      + "For a regular installation, configure and run `kontrol serve`.",
+    );
+  }
+
+  const result = spawnSync("bash", [launcher], { cwd: process.cwd(), stdio: "inherit" });
+  if (result.error) throw result.error;
+  if (typeof result.status === "number" && result.status !== 0) process.exitCode = result.status;
+  if (result.signal) process.exitCode = 1;
+}
+
 async function ensureConfigured(): Promise<void> {
   const files = loadKontrolFiles();
   if (files.configExists && files.authExists) return;
+  // Tunnel mode is fully configured from the environment. Unlike OAuth mode,
+  // it has no owner credential to persist, so requiring ~/.kontrol files here
+  // incorrectly opens the interactive setup wizard before the server can bind.
+  if (process.env.KONTROL_AUTH_MODE === "tunnel" && process.env.KONTROL_ALLOWED_ROOTS?.trim()) return;
   if (process.env.KONTROL_OAUTH_OWNER_TOKEN) return;
 
   if (!input.isTTY || !output.isTTY) {
@@ -182,8 +218,13 @@ async function serve(): Promise<void> {
 
   const { createServer } = await import("./server.js");
   const config = loadConfig();
-  const { app, close } = createServer(config);
+  const { app, close, drain } = createServer(config);
+  const buildMeta = readBuildIdentity(resolve(dirname(fileURLToPath(import.meta.url)), "build-meta.json"));
+  const runtimeIdentity = createRuntimeIdentity(config.stateDir, buildMeta);
   const httpServer = app.listen(config.port, config.host, () => {
+    // Report the immutable artifact identity produced by the atomic build.
+    // Reading Git here would describe the checkout, not necessarily the code
+    // that is actually serving requests.
     console.log(`kontrol listening on http://${config.host}:${config.port}/mcp`);
     console.log(`public base url: ${config.publicBaseUrl}`);
     console.log(`allowed roots: ${config.allowedRoots.join(", ")}`);
@@ -197,13 +238,51 @@ async function serve(): Promise<void> {
         : "auth: Owner password approval required",
     );
     console.log(`logging: ${config.logging.level} ${config.logging.format}`);
+    console.log(`build identity: id=${buildMeta.buildId ?? "dev"} commit=${String(buildMeta.gitSha ?? "unknown").slice(0, 12)} dirty=${String(buildMeta.gitDirty ?? "unknown")}`);
+  });
+  httpServer.once("error", (error) => {
+    // Do not leave a live-looking identity behind when binding fails (for
+    // example, a stale second `start-all.sh` invocation on the same port).
+    removeRuntimeIdentity(config.stateDir, runtimeIdentity.instanceId);
+    close();
+    console.error(`kontrol failed to listen on ${config.host}:${config.port}: ${error instanceof Error ? error.message : String(error)}`);
+    process.exitCode = 1;
   });
 
-  const shutdown = () => {
-    httpServer.close(() => {
+  let shuttingDown = false;
+  let shutdownStarted = false;
+  const shutdown = async () => {
+    if (shutdownStarted) return;
+    shutdownStarted = true;
+    if (shuttingDown) return;
+    shuttingDown = true;
+    try {
+      await drain();
+      await new Promise<void>((resolve) => {
+        let settled = false;
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          resolve();
+        };
+        const deadline = setTimeout(() => {
+          httpServer.closeAllConnections?.();
+          finish();
+        }, 5_000);
+        httpServer.close(() => {
+          clearTimeout(deadline);
+          finish();
+        });
+      });
       close();
+      removeRuntimeIdentity(config.stateDir, runtimeIdentity.instanceId);
       process.exit(0);
-    });
+    } catch (error) {
+      console.error(`kontrol graceful shutdown failed: ${error instanceof Error ? error.message : String(error)}`);
+      close();
+      removeRuntimeIdentity(config.stateDir, runtimeIdentity.instanceId);
+      process.exit(1);
+    }
   };
   process.once("SIGINT", shutdown);
   process.once("SIGTERM", shutdown);
@@ -214,22 +293,180 @@ async function runDoctor(): Promise<void> {
   console.log(`Config dir: ${files.dir}`);
   console.log(`Config file: ${files.configExists ? files.configPath : "missing"}`);
   console.log(`Auth file: ${files.authExists ? files.authPath : "missing"}`);
-  console.log(`Node: ${process.version} (${nodeVersionStatus()})`);
-  console.log(`Node ABI: ${process.versions.modules}`);
-  console.log(`Platform: ${process.platform} ${process.arch}`);
-  console.log(`Git: ${checkGitAvailable()}`);
-  console.log(`Bash shell: ${checkBashShell()}`);
-  console.log(`SQLite native dependency: ${checkSqliteNative()}`);
+  doctorResult("Node/runtime", nodeVersionStatus(), satisfies(process.versions.node, SUPPORTED_NODE_RANGE) ? "" : `current=${process.version}`);
+  doctorResult("Node ABI", "PASS", process.versions.modules);
+  doctorResult("Platform", "PASS", `${process.platform} ${process.arch}`);
+  doctorResult("Git", checkGitAvailable().startsWith("unavailable") ? "UNAVAILABLE" : "PASS", checkGitAvailable());
+  doctorResult("Bash shell", checkBashShell().startsWith("unavailable") ? "UNAVAILABLE" : "PASS", checkBashShell());
+  doctorResult("SQLite native dependency", checkSqliteNative() === "ok" ? "PASS" : "FAIL", checkSqliteNative());
 
   try {
     const config = loadConfig();
-    console.log(`Local MCP URL: http://${config.host}:${config.port}/mcp`);
-    console.log(`Public MCP URL: ${new URL("/mcp", config.publicBaseUrl).toString()}`);
-    console.log(`Allowed roots: ${config.allowedRoots.join(", ")}`);
-    console.log(`Allowed hosts: ${config.allowedHosts.join(", ")}`);
+    const localHost = config.host === "0.0.0.0" || config.host === "::" ? "127.0.0.1" : config.host;
+    doctorResult("Auth mode", "PASS", `${config.authMode}; listen=${config.host}:${config.port}; tunnelExpected=${config.authMode === "tunnel"}`);
+    doctorResult("Allowed roots", "PASS", config.allowedRoots.join(", "));
+    doctorResult("Allowed hosts", config.allowedHosts.includes("*") ? "WARN" : "PASS", config.allowedHosts.join(", "));
+    doctorResult("Tunnel bind", config.authMode === "tunnel" && !isLoopbackHostForDoctor(config.host) ? "FAIL" : "PASS", config.host);
+
+    const distDir = resolve(process.cwd(), "dist");
+    const requiredArtifacts = ["cli.js", "server.js", "acp-duplex.js", "build-meta.json", "ui/workspace-app.html"];
+    const missingArtifacts = requiredArtifacts.filter((file) => !existsSync(resolve(distDir, file)));
+    doctorResult("Build artifacts", missingArtifacts.length === 0 ? "PASS" : "FAIL", missingArtifacts.length === 0 ? distDir : `missing ${missingArtifacts.join(", ")}`);
+    const buildMeta = readBuildIdentity(resolve(distDir, "build-meta.json"));
+    if (missingArtifacts.length === 0) {
+      doctorResult("Build identity", "PASS", `id=${buildMeta.buildId ?? "missing"} ${buildMeta.version ?? "unknown"} ${String(buildMeta.gitSha ?? "unknown").slice(0, 12)} dirty=${buildMeta.gitDirty ?? "unknown"}`);
+    }
+    const sourceSha = gitRevision();
+    const sourceBuildMismatch = Boolean(sourceSha && buildMeta.gitSha && sourceSha !== buildMeta.gitSha);
+    doctorResult("Source/build SHA", sourceBuildMismatch ? "FAIL" : "PASS", `source=${sourceSha ?? "unavailable"} build=${buildMeta.gitSha ?? "unavailable"}`);
+    const sourceDirty = gitDirtyFileCount();
+    if (sourceDirty !== undefined && Number(buildMeta.gitDirty ?? 0) !== sourceDirty) {
+      doctorResult("Source/build dirty state", "WARN", `source=${sourceDirty} build=${buildMeta.gitDirty ?? "unknown"}`);
+    } else {
+      doctorResult("Source/build dirty state", "PASS", `dirty=${buildMeta.gitDirty ?? sourceDirty ?? "unknown"}`);
+    }
+    doctorResult("State directory", existsSync(config.stateDir) ? "PASS" : "FAIL", config.stateDir);
+    if (existsSync(config.stateDir)) {
+      try {
+        const mode = statSync(config.stateDir).mode & 0o777;
+        doctorResult("State permissions", mode === 0o700 ? "PASS" : "WARN", `mode=${mode.toString(8)}`);
+        const fs = statfsSync(config.stateDir);
+        const freeBytes = Number(fs.bavail) * Number(fs.bsize);
+        doctorResult("Disk space", freeBytes > 100 * 1024 * 1024 ? "PASS" : "WARN", `${Math.round(freeBytes / 1024 / 1024)} MiB free`);
+      } catch (error) {
+        doctorResult("State filesystem", "UNAVAILABLE", error instanceof Error ? error.message : String(error));
+      }
+    }
+
+    const identity = readRuntimeIdentity(config.stateDir);
+    if (!identity) {
+      doctorResult("Server identity", "WARN", "server.identity.json not present");
+    } else {
+      doctorResult("Server identity", isRuntimeIdentityLive(identity) ? "PASS" : "WARN", `pid=${identity.pid} instance=${identity.instanceId} start=${identity.processStartTime}`);
+      if (identity.buildSha !== (buildMeta.gitSha ?? "unknown")) {
+        doctorResult("Running/source identity", "FAIL", `running=${identity.buildSha} current-build=${buildMeta.gitSha ?? "unknown"}`);
+      }
+    }
+
+    if (existsSync(resolve(process.cwd(), "tsconfig.json"))) {
+      const typecheck = spawnSync("npm", ["run", "--silent", "typecheck"], { cwd: process.cwd(), stdio: "ignore", timeout: 120_000 });
+      doctorResult("TypeScript", typecheck.status === 0 ? "PASS" : typecheck.error ? "UNAVAILABLE" : "FAIL", typecheck.error?.message ?? "typecheck");
+    } else {
+      doctorResult("TypeScript", "UNAVAILABLE", "not a source checkout");
+    }
+
+    const database = inspectDoctorDatabase(config.stateDir);
+    for (const [label, result] of Object.entries(database)) doctorResult(label, result.status, result.detail);
+
+    const probe = async (url: string): Promise<{ status: number; text: string }> => {
+      try {
+        const response = await fetch(url, { signal: AbortSignal.timeout(1_500) });
+        return { status: response.status, text: `${response.status} ${response.statusText}` };
+      } catch (error) {
+        return { status: 0, text: `unreachable (${error instanceof Error ? error.message : String(error)})` };
+      }
+    };
+    const localHealth = await probe(`http://${localHost}:${config.port}/healthz`);
+    doctorResult("Local /healthz", localHealth.status === 200 ? "PASS" : localHealth.status === 0 ? "UNAVAILABLE" : "FAIL", localHealth.text);
+    const discovery = await probe(`http://${localHost}:${config.port}/.well-known/oauth-protected-resource`);
+    doctorResult("Local discovery", discovery.status === 200 ? "PASS" : discovery.status === 0 ? "UNAVAILABLE" : "FAIL", discovery.text);
+    const mcp = await probeMcpInitialize(`http://${localHost}:${config.port}/mcp`);
+    const expectedMcp = config.authMode === "tunnel" ? mcp.status === 200 : mcp.status === 401;
+    doctorResult("Local MCP initialize", expectedMcp ? "PASS" : mcp.status === 0 ? "UNAVAILABLE" : "FAIL", mcp.text);
+    if (config.authMode === "tunnel") {
+      const tunnelHealth = await probe("http://127.0.0.1:8080/healthz");
+      doctorResult("Tunnel process", tunnelHealth.status === 200 ? "PASS" : tunnelHealth.status === 0 ? "UNAVAILABLE" : "FAIL", tunnelHealth.text);
+      const tunnelReady = await probe("http://127.0.0.1:8080/readyz");
+      doctorResult("Tunnel MCP initialize", tunnelReady.status === 200 ? "PASS" : tunnelReady.status === 0 ? "UNAVAILABLE" : "FAIL", tunnelReady.text);
+      doctorResult("Tunnel MCP auth", "PASS", "delegated; no local bearer header");
+    } else {
+      const publicProbe = await probeMcpInitialize(`${new URL("/mcp", config.publicBaseUrl).toString()}`);
+      doctorResult("External MCP initialize", publicProbe.status === 200 ? "PASS" : publicProbe.status === 0 ? "UNAVAILABLE" : "WARN", publicProbe.text);
+    }
   } catch (error) {
-    console.log(`Config status: ${error instanceof Error ? error.message : String(error)}`);
+    doctorResult("Config", "FAIL", error instanceof Error ? error.message : String(error));
   }
+}
+
+function doctorResult(label: string, status: "PASS" | "WARN" | "FAIL" | "UNAVAILABLE" | string, detail: string): void {
+  console.log(`[${status}] ${label}${detail ? `: ${detail}` : ""}`);
+}
+
+function isLoopbackHostForDoctor(host: string): boolean {
+  return host === "127.0.0.1" || host === "::1" || host === "localhost";
+}
+
+function gitRevision(): string | undefined {
+  try {
+    return (require("node:child_process") as typeof import("node:child_process")).execFileSync("git", ["rev-parse", "HEAD"], { cwd: process.cwd(), encoding: "utf8" }).trim();
+  } catch {
+    return undefined;
+  }
+}
+
+function gitDirtyFileCount(): number | undefined {
+  try {
+    const value = (require("node:child_process") as typeof import("node:child_process")).execFileSync("git", ["status", "--porcelain"], { cwd: process.cwd(), encoding: "utf8" }).trim();
+    return value ? value.split("\n").length : 0;
+  } catch {
+    return undefined;
+  }
+}
+
+async function probeMcpInitialize(url: string): Promise<{ status: number; text: string }> {
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { accept: "application/json, text/event-stream", "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: "doctor", method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "kontrol-doctor", version: "1" } } }),
+      signal: AbortSignal.timeout(1_500),
+    });
+    return { status: response.status, text: `${response.status} ${response.statusText}` };
+  } catch (error) {
+    return { status: 0, text: `unreachable (${error instanceof Error ? error.message : String(error)})` };
+  }
+}
+
+function inspectDoctorDatabase(stateDir: string): Record<string, { status: "PASS" | "WARN" | "FAIL" | "UNAVAILABLE"; detail: string }> {
+  const result: Record<string, { status: "PASS" | "WARN" | "FAIL" | "UNAVAILABLE"; detail: string }> = {};
+  const path = join(stateDir, "kontrol.sqlite");
+  if (!existsSync(path)) {
+    result.Database = { status: "WARN", detail: "kontrol.sqlite not present" };
+    return result;
+  }
+  let db: { pragma: (value: string, options?: { simple?: boolean }) => unknown; prepare: (sql: string) => { all: (...args: unknown[]) => unknown[]; get: (...args: unknown[]) => unknown }; close: () => void } | undefined;
+  try {
+    const Database = require("better-sqlite3") as typeof import("better-sqlite3");
+    db = new Database(path, { readonly: true, fileMustExist: true }) as typeof db;
+    const database = db!;
+    const integrity = database.pragma("integrity_check", { simple: true });
+    result.Database = { status: integrity === "ok" ? "PASS" : "FAIL", detail: `integrity=${String(integrity)}` };
+    const schema = database.prepare("select max(version) as version from kontrol_schema_migrations").get() as { version?: number };
+    result["Database schema"] = { status: "PASS", detail: `version=${schema?.version ?? "unknown"}` };
+    const count = (sql: string): number => {
+      const row = database.prepare(sql).get() as { count?: number; c?: number } | undefined;
+      return Number(row?.count ?? row?.c ?? 0);
+    };
+    const statusCounts = (table: string): string => {
+      const rows = db!.prepare(`select status, count(*) as count from ${table} group by status`).all() as Array<{ status: string; count: number }>;
+      return rows.map((row) => `${row.status}=${row.count}`).join(", ") || "none";
+    };
+    result["Event rows"] = { status: "PASS", detail: `total=${count("select count(*) as count from event_log")}; output_delta=${count("select count(*) as count from event_log where type = 'agent.run.output_delta'")}; thought_delta=${count("select count(*) as count from event_log where type = 'agent.run.thought_delta'")}` };
+    result["Work-session states"] = { status: "PASS", detail: statusCounts("work_sessions") };
+    result["Supervisor states"] = { status: "PASS", detail: statusCounts("supervisor_runs") };
+    result["Pending approvals"] = { status: "PASS", detail: statusCounts("approval_requests") };
+    const deadLetters = count("select count(*) as count from dispatch_outbox where status = 'dead_lettered'");
+    result["Dead-letter supervisor actions"] = { status: deadLetters > 0 ? "WARN" : "PASS", detail: String(deadLetters) };
+    const expiredApprovals = count("select count(*) as count from approval_requests where status = 'pending' and expires_at is not null and expires_at < datetime('now')");
+    result["Expired approvals"] = { status: expiredApprovals > 0 ? "WARN" : "PASS", detail: String(expiredApprovals) };
+    const aliveAgents = count("select count(*) as count from agent_registry where datetime(last_heartbeat, '+' || ttl_seconds || ' seconds') >= datetime('now')");
+    result["Registered ACP agents"] = { status: "PASS", detail: String(aliveAgents) };
+  } catch (error) {
+    result.Database = { status: "UNAVAILABLE", detail: error instanceof Error ? error.message : String(error) };
+  } finally {
+    try { db?.close(); } catch { /* diagnostic cleanup */ }
+  }
+  return result;
 }
 
 function runConfigCommand(args: string[]): void {
@@ -268,6 +505,7 @@ function printHelp(): void {
       "Usage:",
       "  kontrol                 Run first-time setup if needed, then start the server",
       "  kontrol serve           Start the server",
+      "  kontrol up              Start the full local stack from a Kontrol checkout",
       "  kontrol init            Create or update ~/.kontrol/config.json and auth.json",
       "  kontrol doctor          Show config, runtime, and native dependency status",
       "  kontrol config get      Print persisted config",

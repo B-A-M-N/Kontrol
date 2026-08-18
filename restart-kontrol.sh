@@ -1,3 +1,6 @@
-#!/bin/bash
-echo "=== Server will be fully restarted by start-all.sh ==="
-echo "The source changes will take effect on next server restart."
+#!/usr/bin/env bash
+# Restart the complete Kontrol generation through the transactional launcher.
+# The launcher performs the build gate before replacing any live process.
+set -euo pipefail
+cd "$(dirname "$0")"
+exec ./start-all.sh "$@"

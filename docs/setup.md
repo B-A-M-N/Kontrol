@@ -136,7 +136,25 @@ If you are running from a local checkout instead of a global GitHub install:
 npm install --include=dev
 npm run build
 npm link
-kontrol serve
+kontrol up
 ```
+
+`kontrol up` starts the full local development stack from the checkout. It uses
+the checkout's `.env`, so configure that file before launching. Use
+`kontrol serve` when only the MCP server is needed.
+
+For a restart from a checkout, use `./restart-kontrol.sh`. The launcher keeps
+readiness false until the replacement build, local MCP path, registered
+adapters, agent URLs, and tunnel readiness all pass. Failed startup stops only
+Kontrol-owned sessions started by that invocation and restores the previous
+`dist/` generation when one is available. Once ready, a persistent supervisor
+continues probing KONTROL, adapters, and the tunnel and applies thresholded
+component recovery.
+
+The local liveness endpoint is `GET /healthz`; startup infrastructure
+readiness is `GET /core-readyz`; strict operational readiness is `GET /readyz`.
+A successful checkout startup also runs
+`scripts/probe-kontrol-readiness.mjs`, exercising initialize, agent discovery,
+workspace opening, file reading, and bash execution.
 
 The same setup rules apply.

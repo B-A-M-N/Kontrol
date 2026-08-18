@@ -58,6 +58,24 @@ kontrol init
 kontrol serve
 ```
 
+To start the complete local development stack (MCP server, configured ACP adapters,
+and Secure MCP tunnel) from this checkout, use:
+
+```bash
+kontrol up
+```
+
+`kontrol up` uses the checkout's `.env` and performs the same preflight and
+readiness checks as `start-all.sh`.
+
+The checkout also provides `./restart-kontrol.sh`, which runs the same
+transactional launcher. It builds and verifies the replacement generation
+before stopping old owned processes and rolls back if a readiness stage fails.
+
+For constrained CI or sandbox environments only, set
+`KONTROL_SKIP_PREFLIGHT_TESTS=true` to skip the full test suite; all other
+preflight and readiness checks remain enabled.
+
 During setup, Kontrol asks for:
 
 - the local project folders agents are allowed to open
@@ -86,6 +104,14 @@ The default local endpoint:
 http://127.0.0.1:7676/mcp
 ```
 
+`GET /healthz` reports process liveness and the embedded build identity.
+`GET /core-readyz` checks KONTROL's own database, MCP handler,
+workspace/review/ACP initialization, and runtime build identity while adapters
+are still starting. `GET /readyz` is strict operational readiness: it also
+requires live configured worker agents. The launcher additionally performs an
+actual MCP initialize, agent discovery, workspace open, file read, and bash
+round trip before declaring the stack ready.
+
 Most users connect through a public HTTPS tunnel:
 
 ```text
@@ -106,17 +132,29 @@ PORT=7676
 kontrol serve
 ```
 
-Register the server in the tunnel client with **No Authentication**, pointing at the loopback origin:
+Register the server in the tunnel client with **No Authentication**, pointing at the loopback origin. The managed checkout launcher (`./start-all.sh`) keeps a persistent supervisor running after startup and repairs failed tunnel/adapter components using thresholded restarts:
 
 ```bash
 tunnel-client run \
   --mcp.server-url "http://127.0.0.1:7676/mcp"
 ```
 
+The launcher uses `KONTROL_TUNNEL_PROFILE` (default
+`sample_mcp_with_dcr`). If that profile points at a retired or stale tunnel,
+set `KONTROL_TUNNEL_ID=tunnel_...` in `.env` after creating or selecting the
+current registration in OpenAI Tunnels, then restart the stack and reconnect
+the ChatGPT connector to that same tunnel ID.
+
 The review WebUI is served as a self-contained MCP App resource (its CSS and JS are
 inlined into a single `workspace-app.html`), so the ChatGPT iframe needs no localhost
 fetches. See [Configuration Reference](docs/configuration.md#mcp-authentication-modes)
 for the full security rules.
+
+Each MCP `mcp-session-id` is an isolated transport context. Kontrol does not pool
+sessions merely because clients share a logical name, so multiple conversations
+can use the server concurrently. Workspace and review continuity is carried by
+explicit durable IDs rather than by assuming that separate transports belong to
+one conversation.
 
 ## What Agents Can Do
 

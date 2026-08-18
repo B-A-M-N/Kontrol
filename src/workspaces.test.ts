@@ -20,6 +20,11 @@ try {
   await mkdir(join(root, "nested"));
   await writeFile(join(root, "nested", "AGENTS.md"), "nested instructions\n");
   await writeFile(join(root, "nested", "file.txt"), "hello\n");
+  // Performance fixture: opening a workspace must not walk 10,000 unrelated
+  // descendant directories just to discover path-local instructions.
+  const largeFixture = join(root, "large-fixture");
+  await mkdir(largeFixture);
+  await Promise.all(Array.from({ length: 10_000 }, (_, index) => mkdir(join(largeFixture, `dir-${index}`))));
 
   const config = loadConfig({
     KONTROL_ALLOWED_ROOTS: root,
@@ -36,16 +41,21 @@ try {
     agentsFiles.map((file) => file.content),
     ["global instructions\n", "root instructions\n"],
   );
-  assert.deepEqual(
-    availableAgentsFiles.map((file) => file.path),
-    [join(root, "nested", "AGENTS.md")],
-  );
+  assert.deepEqual(availableAgentsFiles, [], "openWorkspace must not recursively scan descendants");
+  const largeStart = Date.now();
+  const largeOpen = await new WorkspaceRegistry(config).openWorkspace(root);
+  assert.deepEqual(largeOpen.availableAgentsFiles, [], "10,000 descendant directories do not trigger recursive instruction discovery");
+  assert.ok(Date.now() - largeStart < 2_000, "workspace open remains bounded with a 10,000-directory fixture");
+  const newlyLoaded = await registry.loadApplicableInstructions(workspace, "nested/file.txt");
+  assert.deepEqual(newlyLoaded.map((file) => file.path), [join(root, "nested", "AGENTS.md")]);
+  assert.deepEqual(await registry.loadApplicableInstructions(workspace, "nested/file.txt"), [], "nested instructions are cached");
 
   const missingWorkspaceRoot = join(root, "missing", "workspace");
-  const missingWorkspace = await registry.openWorkspace(missingWorkspaceRoot);
-  assert.equal(missingWorkspace.workspace.root, missingWorkspaceRoot);
-  assert.equal(missingWorkspace.workspace.mode, "checkout");
-  assert.equal((await stat(missingWorkspaceRoot)).isDirectory(), true);
+  await assert.rejects(
+    () => registry.openWorkspace(missingWorkspaceRoot),
+    /Workspace does not exist/,
+  );
+  await assert.rejects(() => stat(missingWorkspaceRoot), { code: "ENOENT" });
 
   await assert.rejects(
     () => registry.openWorkspace({ path: root, mode: "worktree" }),

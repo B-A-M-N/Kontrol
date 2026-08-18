@@ -1,0 +1,20 @@
+import assert from "node:assert/strict";
+import { FailureTracker, parseAgentSpecs } from "./kontrol-supervisor.mjs";
+
+const specs = parseAgentSpecs("cli-coding-agent=http://127.0.0.1:9877,hermes-agent=http://127.0.0.1:9911");
+assert.deepEqual(specs, [
+  { name: "cli-coding-agent", url: "http://127.0.0.1:9877" },
+  { name: "hermes-agent", url: "http://127.0.0.1:9911" },
+]);
+
+const tracker = new FailureTracker("tunnel");
+tracker.record({ ok: false, status: 502 }, "2026-08-18T00:00:00.000Z");
+tracker.record({ ok: false, status: 502 }, "2026-08-18T00:00:01.000Z");
+assert.equal(tracker.consecutiveFailures, 2);
+tracker.record({ ok: true, status: 200 }, "2026-08-18T00:00:02.000Z");
+assert.equal(tracker.consecutiveFailures, 0);
+assert.equal(tracker.lastHealthyAt, "2026-08-18T00:00:02.000Z");
+tracker.noteRestart("three consecutive failures");
+assert.equal(tracker.restartCount, 1);
+
+console.log("kontrol-supervisor.test.mjs: all assertions passed");

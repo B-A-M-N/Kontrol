@@ -1,4 +1,4 @@
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import react from "@vitejs/plugin-react";
 import { viteSingleFile } from "vite-plugin-singlefile";
 import { defineConfig } from "vite";
@@ -12,7 +12,12 @@ export default defineConfig({
   plugins: [react(), viteSingleFile()],
   base: "./",
   build: {
-    outDir: resolve(__dirname, "dist/ui"),
+    outDir: join(
+      process.env.KONTROL_BUILD_OUTPUT_DIR
+        ? resolve(process.env.KONTROL_BUILD_OUTPUT_DIR)
+        : resolve(__dirname, "dist"),
+      "ui",
+    ),
     emptyOutDir: true,
     cssCodeSplit: false,
     assetsInlineLimit: 100_000_000,

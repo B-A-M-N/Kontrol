@@ -5,6 +5,7 @@ import type { EventStore } from "./event-log.js";
 import type { PolicyEngine } from "./policy.js";
 import type { PrincipalRole } from "./policy-enforcement.js";
 import type { ApprovalRequestManager, ApprovalRequest } from "./approval-requests.js";
+import { workspaceAppToolMeta } from "./workspace-app-resource.js";
 
 interface PolicyToolConfig {
   eventStore: EventStore;
@@ -24,15 +25,8 @@ function isReviewer(role?: PrincipalRole): boolean {
   return role === "reviewer";
 }
 
-const WORKSPACE_APP_URI = "ui://kontrol/workspace-app.html";
-
 function workspaceAppModelAndAppMeta() {
-  return {
-    ui: {
-      resourceUri: WORKSPACE_APP_URI,
-      visibility: ["model", "app"] as const,
-    },
-  };
+  return workspaceAppToolMeta();
 }
 
 function policyApprovalToCard(a: ReturnType<PolicyEngine["getPendingApprovals"]>[number]) {

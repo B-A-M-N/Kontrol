@@ -63,6 +63,16 @@ async function testDatabaseConfiguration(stateDir: string): Promise<void> {
       { version: 20, name: "dispatch-outbox-logical-key" },
       { version: 21, name: "dispatch-outbox-failure-count" },
       { version: 22, name: "agent-messages" },
+      { version: 23, name: "supervisor-runs" },
+      { version: 24, name: "supervisor-run-pause" },
+      { version: 25, name: "mission-completion-reports" },
+      { version: 26, name: "supervisor-convergence-fingerprint" },
+      { version: 27, name: "mission-criterion-dependencies" },
+      { version: 28, name: "supervisor-run-deadline" },
+      { version: 29, name: "feedback-completion-report-binding" },
+      { version: 30, name: "verification-lease-identity" },
+      { version: 31, name: "supervisor-lease-fencing" },
+      { version: 32, name: "workspace-project-identity" },
     ]);
   } finally {
     database.close();

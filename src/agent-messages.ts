@@ -142,9 +142,8 @@ export function createAgentMessageManager(
     return get(id);
   }
 
-  function close(): void {
-    database.close();
-  }
+  // P1 #11: DB owned by server
+  function close(): void { }
 
   return { post, get, list, resolve, close };
 }

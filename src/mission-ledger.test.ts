@@ -66,9 +66,22 @@ try {
     status: "passed",
     source: "reviewer_manual_attestation",
     command: "npm test",
+    reviewEpoch: 1,
     details: { exitCode: 0 },
   }]);
-  approval = ledger.canApprove(session.id, { submissionId: "sub-current", snapshotCommit: "snap-current" });
+  approval = ledger.canApprove(session.id, { submissionId: "sub-current", snapshotCommit: "snap-current", reviewEpoch: 2 });
+  assert.equal(approval.allowed, false, "evidence from an older review epoch cannot approve the current card");
+  ledger.recordEvidence(mission.id, [{
+    criterionId: "crit-tests",
+    submissionId: "sub-current",
+    snapshotCommit: "snap-current",
+    reviewEpoch: 2,
+    status: "passed",
+    source: "reviewer_manual_attestation",
+    command: "npm test",
+    details: { exitCode: 0 },
+  }]);
+  approval = ledger.canApprove(session.id, { submissionId: "sub-current", snapshotCommit: "snap-current", reviewEpoch: 2 });
   assert.equal(approval.allowed, true);
 
   ledger.addFindings(mission.id, [{
@@ -85,7 +98,7 @@ try {
   ledger.updateFindingStatus(mission.id, [{ id: "find-security", status: "verified_resolved" }]);
   const packet = ledger.getPacket(session.id);
   assert.equal(ledger.canApprove(session.id, { submissionId: "sub-current", snapshotCommit: "snap-current" }).allowed, true);
-  assert.equal(packet.evidence.length, 3);
+  assert.equal(packet.evidence.length, 4);
   assert.equal(packet.findings[0].status, "verified_resolved");
 
   assert.throws(
@@ -193,6 +206,28 @@ try {
   );
   // No mission for an unknown session → no-op, not a throw.
   assert.equal(ledger.setWorkOrderPreferredAgent("ws_no_mission", "hermes"), 0);
+
+  const graphSession = workSessions.create({ workspaceSessionId: "workspace-1", submittedBy: "webui", title: "dependency graph", completionPolicy: "webui_approval_required" });
+  const graphMission = ledger.createMission({
+    workSessionId: graphSession.id,
+    workspaceSessionId: "workspace-1",
+    objective: "dependency graph",
+    acceptanceCriteria: [
+      { id: "base", description: "base requirement", priority: "required" },
+      { id: "integration", description: "integration requirement", priority: "required", dependsOnCriterionIds: ["base"] },
+    ],
+  });
+  assert.deepEqual(ledger.getPacket(graphSession.id).criteria.find((criterion) => criterion.id === "integration")?.dependsOnCriterionIds, ["base"]);
+  const cyclicSession = workSessions.create({ workspaceSessionId: "workspace-1", submittedBy: "webui", title: "cycle", completionPolicy: "webui_approval_required" });
+  assert.throws(() => ledger.createMission({
+    workSessionId: cyclicSession.id,
+    workspaceSessionId: "workspace-1",
+    objective: "cycle",
+    acceptanceCriteria: [
+      { id: "a", description: "a", priority: "required", dependsOnCriterionIds: ["b"] },
+      { id: "b", description: "b", priority: "required", dependsOnCriterionIds: ["a"] },
+    ],
+  }), /dependency cycle/);
 
   ledger.close();
   console.log("mission-ledger.test.ts: all assertions passed");

@@ -6,7 +6,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { WorkSessionManager } from "./work-sessions.js";
 import type { WorkspaceRegistry } from "./workspaces.js";
 import type { ReviewCheckpointManager } from "./review-checkpoints.js";
-import type { AgentRegistryManager } from "./acp-registry.js";
+import type { AgentInfo, AgentRegistryManager } from "./acp-registry.js";
 import type { EventStore, EventStoreEvent, EventPredicate } from "./event-log.js";
 import { type ContinuationManager, type Continuation, DEFAULT_CLAIM_LEASE_MS } from "./continuation.js";
 import { callRemoteAgent, cancelRemoteRun, selectHealthyAgent, probeAgent, type AgentCallResult } from "./acp-gateway.js";
@@ -17,19 +17,21 @@ import type { MissionLedger } from "./mission-ledger.js";
 import type { DispatchOutbox, DispatchOutboxEvent } from "./dispatch-outbox.js";
 import type { AgentMessageManager } from "./agent-messages.js";
 import { AGENT_MESSAGE_KINDS } from "./agent-messages.js";
-
-const WORKSPACE_APP_URI = "ui://kontrol/workspace-app.html";
+import { workspaceAppToolMeta } from "./workspace-app-resource.js";
+import { verifyMissionSubmission } from "./mission-verifier.js";
+import type { SupervisorRuns } from "./supervisor-runs.js";
+import type { ServerConfig } from "./config.js";
+import { loadSkillIndex } from "./skills.js";
+import type { DatabaseHandle } from "./db/client.js";
+import type { ReviewSubmissionDTO } from "./review-submission.js";
 
 function workspaceAppModelAndAppMeta() {
-  return {
-    ui: {
-      resourceUri: WORKSPACE_APP_URI,
-      visibility: ["model", "app"] as const,
-    },
-  };
+  return workspaceAppToolMeta();
 }
 
 export interface BridgeConfig {
+  /** Shared SQLite handle used for atomic snapshot+cursor reads. */
+  db?: DatabaseHandle;
   workspaces: WorkspaceRegistry;
   workSessions: WorkSessionManager;
   reviewCheckpoints: ReviewCheckpointManager;
@@ -40,10 +42,16 @@ export interface BridgeConfig {
   reviewWorkflow: ReviewWorkflowService;
   dispatchOutbox?: DispatchOutbox;
   missionLedger?: MissionLedger;
+  supervisorRuns?: SupervisorRuns;
+  onSupervisorResume?: (workSessionId: string) => void;
   /** Durable agent→WebUI messages/artifacts (clarifications, blockers, findings). */
   agentMessages?: AgentMessageManager;
+  /** Pending approval requests for tools/commands that require human approval. */
+  approvalRequests?: ReturnType<typeof import("./approval-requests.js").createApprovalRequestManager>;
   knownAgents: Array<{ name: string; url: string; description?: string }>;
   sharedSecret?: string;
+  /** Server config for skill discovery (P1 #10). */
+  serverConfig?: ServerConfig;
   /**
    * The role of the caller presenting this MCP connection. The WebUI connects
    * as a reviewer/client; the coding agent connects as a worker. Role checks
@@ -114,6 +122,24 @@ function isReviewer(role?: PrincipalRole): boolean {
 
 function isWorkerOrClient(role?: PrincipalRole): boolean {
   return role === "worker" || role === "client" || role === undefined;
+}
+
+/**
+ * Native ACP agents such as Hermes do not receive Kontrol's MCP tool list.
+ * Their adapter turns a completed native turn into the durable review
+ * submission on their behalf (see acp-server's native review barrier). Giving
+ * them the stdio-worker instruction would make them search for tools that do
+ * not exist and, in practice, keep an otherwise completed turn alive.
+ */
+function usesExternalReviewBarrier(agent?: Pick<AgentInfo, "capabilities">): boolean {
+  return agent?.capabilities.includes("native-acp") === true;
+}
+
+function workSessionInstructions(workSessionId: string, agent?: Pick<AgentInfo, "capabilities">): string {
+  if (usesExternalReviewBarrier(agent)) {
+    return `[Kontrol work session ${workSessionId}] This is a native ACP turn. Complete the bounded work order, run the requested checks, and return a concise summary. Kontrol will capture the review submission and enforce the review barrier after your turn returns. Do not wait for or search for submit_for_review, await_review_feedback, or start_work_session tools.`;
+  }
+  return `[Kontrol work session ${workSessionId}] Use this existing session: call submit_for_review with sessionId="${workSessionId}" when done, then await_review_feedback(sessionId="${workSessionId}"). Do NOT call start_work_session.`;
 }
 
 function forbidden(role?: PrincipalRole, tool?: string): { content: Array<{ type: "text"; text: string }>; isError: true } {
@@ -542,14 +568,12 @@ async function defaultResume(
   agentName = "cli-coding-agent",
 ): Promise<AgentCallResult> {
   const run = config.agentRegistry.getRunByWorkSessionId(continuation.sessionId);
+  const agent = config.agentRegistry.listAlive().find((candidate) => candidate.name === agentName);
   const missionPrompt = renderMissionPrompt(config, continuation.sessionId, continuation.promptText);
   const task = [
     continuation.promptText,
     missionPrompt,
-    "[Kontrol work session " + continuation.sessionId +
-      "] Continue from review feedback. When done, call submit_for_review with sessionId=\"" +
-      continuation.sessionId + "\", then await_review_feedback(sessionId=\"" +
-      continuation.sessionId + "\").",
+    `Continue from review feedback. ${workSessionInstructions(continuation.sessionId, agent)}`,
   ].filter(Boolean).join("\n\n");
   return callRemoteAgent(
     { agentRegistry: config.agentRegistry, workspaces: config.workspaces, workSessions: config.workSessions, sharedSecret: config.sharedSecret },
@@ -774,7 +798,20 @@ export function registerBridgeTools(
 
         return {
           content: [{ type: "text" as const, text: `Submitted #${submission.submissionNumber}: ${review.summary.files} file(s), +${review.summary.additions} -${review.summary.removals}. Status: awaiting_review.` }],
-          structuredContent: { submissionId: submission.id, status: "awaiting_review", files: review.summary.files, additions: review.summary.additions, removals: review.summary.removals, diffSha256: submitted.diffSha256, reviewEpoch: submitted.reviewEpoch },
+          structuredContent: {
+            submissionId: submission.id,
+            sessionId,
+            submissionNumber: submission.submissionNumber,
+            reviewEpoch: submitted.reviewEpoch,
+            status: "awaiting_review",
+            diffSha256: submitted.diffSha256,
+            patch: review.patch,
+            files: review.files,
+            fileCount: review.summary.files,
+            additions: review.summary.additions,
+            removals: review.summary.removals,
+            message: message ?? review.result,
+          } satisfies ReviewSubmissionDTO,
           _meta: {
             tool: "submit_for_review",
             card: {
@@ -803,7 +840,20 @@ export function registerBridgeTools(
         sessionId: z.string().describe("Work session ID."),
         submissionId: z.string().optional().describe("Specific submission ID; defaults to the latest."),
       },
-      outputSchema: { submissionId: z.string(), status: z.string(), files: z.number(), additions: z.number(), removals: z.number(), submissionNumber: z.number(), diffSha256: z.string().optional(), reviewEpoch: z.number() },
+      outputSchema: {
+        submissionId: z.string(),
+        sessionId: z.string(),
+        status: z.string(),
+        submissionNumber: z.number(),
+        reviewEpoch: z.number(),
+        diffSha256: z.string().optional(),
+        patch: z.string(),
+        files: z.array(z.object({ path: z.string(), previousPath: z.string().optional(), type: z.string().optional(), operation: z.string().optional(), additions: z.number(), removals: z.number() })),
+        fileCount: z.number(),
+        additions: z.number(),
+        removals: z.number(),
+        message: z.string().optional(),
+      },
       _meta: workspaceAppModelAndAppMeta(),
       annotations: { readOnlyHint: true },
     },
@@ -813,22 +863,23 @@ export function registerBridgeTools(
       const session = config.workSessions.get(sessionId);
       if (!session) return { content: [{ type: "text" as const, text: "Session not found." }], isError: true };
 
-      const submissions = config.workSessions.getSubmissions(sessionId);
-      if (!submissions.length) return { content: [{ type: "text" as const, text: "No submissions for this session." }], isError: true };
-
       const submission = submissionId
-        ? submissions.find((s) => s.id === submissionId)
-        : submissions[submissions.length - 1];
+        ? config.workSessions.getSubmissions(sessionId).find((s) => s.id === submissionId)
+        : config.workSessions.getLatestSubmission(sessionId);
       if (!submission) {
         return {
           content: [{ type: "text" as const, text: `Submission ${submissionId} was not found for session ${sessionId}.` }],
           structuredContent: {
             submissionId: submissionId ?? "",
+            sessionId,
             status: "not_found",
-            files: 0,
+            submissionNumber: 0,
+            reviewEpoch: 0,
+            patch: "",
+            files: [],
+            fileCount: 0,
             additions: 0,
             removals: 0,
-            submissionNumber: 0,
           },
           isError: true,
         };
@@ -837,18 +888,24 @@ export function registerBridgeTools(
       const summary = submission.summaryJson ? (JSON.parse(submission.summaryJson) as Record<string, unknown>) : {};
       const patch = submission.diff ?? "";
       const files = parsePatchFiles(patch);
+      const dto: ReviewSubmissionDTO = {
+        submissionId: submission.id,
+        sessionId,
+        submissionNumber: submission.submissionNumber,
+        reviewEpoch: submission.reviewEpoch,
+        status: submission.status,
+        diffSha256: submission.diffSha256,
+        patch,
+        files,
+        fileCount: files.length,
+        additions: Number(summary.additions ?? 0),
+        removals: Number(summary.removals ?? 0),
+        message: submission.message,
+      };
 
       return {
         content: [{ type: "text" as const, text: `Submission #${submission.submissionNumber}: ${files.length} file(s).` }],
-        structuredContent: {
-          submissionId: submission.id,
-          status: submission.status,
-          files: files.length,
-          additions: Number(summary.additions ?? 0),
-          removals: Number(summary.removals ?? 0),
-          diffSha256: submission.diffSha256,
-          reviewEpoch: submission.reviewEpoch,
-        },
+        structuredContent: dto,
         _meta: {
           tool: "submit_for_review",
           card: {
@@ -884,6 +941,7 @@ export function registerBridgeTools(
     verificationType: z.enum(["test", "code_inspection", "runtime_behavior", "security_review", "manual_review"]).optional(),
     verificationCommand: z.string().optional(),
     affectedAreas: z.array(z.string()).optional(),
+    dependsOnCriterionIds: z.array(z.string()).optional().describe("Stable criterion IDs that must be satisfied before this requirement is considered complete."),
   });
   const findingSchema = z.object({
     id: z.string().optional(),
@@ -948,7 +1006,7 @@ export function registerBridgeTools(
     }
     const task = input.appendSessionInstructions === false
       ? input.task
-      : `${input.task}\n\n[Kontrol work session ${wsId}] Use this existing session: call submit_for_review with sessionId="${wsId}" when done, then await_review_feedback(sessionId="${wsId}"). Do NOT call start_work_session.`;
+      : `${input.task}\n\n${workSessionInstructions(wsId, selection.agent)}`;
     const result = await callRemoteAgent(
       {
         agentRegistry: config.agentRegistry,
@@ -1030,6 +1088,7 @@ export function registerBridgeTools(
     }
     return {
       session,
+      supervisor: config.supervisorRuns?.getByWorkSession(workSessionId),
       mission: config.missionLedger?.getPacket(workSessionId),
       submission: latestSubmission
         ? {
@@ -1073,6 +1132,10 @@ export function registerBridgeTools(
         acceptanceCriteria: z.array(missionCriterionSchema).optional(),
         supervisorInstructions: z.string().optional(),
         maxCorrectionRounds: z.number().int().min(1).max(50).optional().describe("Backstop ceiling on auto-extended correction rounds when new blocking findings appear (default 5). Progress raises the effective ceiling; convergence ends the loop earlier."),
+        maxWallTimeMinutes: z.number().int().min(1).max(10_080).optional().describe("Wall-clock safety budget for autonomous supervision; defaults to 24 hours."),
+        finalVerification: z.array(z.string()).optional().describe("Mission-level integration commands that must pass against the final submitted snapshot."),
+        autonomyMode: z.enum(["manual", "verify_only", "correction_auto", "full"]).optional(),
+        approvalMode: z.enum(["human_required", "policy_auto", "fully_automatic"]).optional(),
         workOrder: workOrderSchema.optional(),
         agentName: z.string().optional(),
       },
@@ -1080,7 +1143,7 @@ export function registerBridgeTools(
       _meta: workspaceAppModelAndAppMeta(),
       annotations: { readOnlyHint: false },
     },
-    async ({ workspaceSessionId, objective, desiredOutcome, constraints, nonGoals, acceptanceCriteria, supervisorInstructions, maxCorrectionRounds, workOrder, agentName }) => {
+    async ({ workspaceSessionId, objective, desiredOutcome, constraints, nonGoals, acceptanceCriteria, supervisorInstructions, maxCorrectionRounds, maxWallTimeMinutes, finalVerification, autonomyMode, approvalMode, workOrder, agentName }) => {
       if (!isReviewer(config.principalRole)) return forbidden(config.principalRole, "begin_supervised_work");
       if (!config.missionLedger) return { content: [{ type: "text" as const, text: "Mission ledger unavailable." }], isError: true };
       const requiredCount = (acceptanceCriteria ?? []).filter((c) => (c.priority ?? "required") === "required").length;
@@ -1115,8 +1178,10 @@ export function registerBridgeTools(
         acceptanceCriteria,
         supervisorInstructions,
         maxCorrectionRounds,
+        finalVerification,
         baselineCommit,
       });
+      const supervisorRun = config.supervisorRuns?.create({ missionId: mission.id, workSessionId: created.id, workspaceSessionId, autonomyMode, approvalMode, maxCycles: maxCorrectionRounds, maxWallTimeMs: maxWallTimeMinutes ? maxWallTimeMinutes * 60_000 : undefined });
       config.missionLedger.createWorkOrder(mission.id, created.id, workOrder ?? { objectiveForThisTurn: objective });
       const prompt = renderMissionPrompt(config, created.id, objective);
       const dispatch = await dispatchAgentTask({
@@ -1126,6 +1191,7 @@ export function registerBridgeTools(
         agentName,
         appendSessionInstructions: true,
       });
+      if (supervisorRun) config.supervisorRuns?.transition({ id: supervisorRun.id, expectedStatus: "created", expectedRevision: supervisorRun.revision, nextStatus: "worker_active" });
       return {
         content: [{ type: "text" as const, text: `Supervised work started in ${created.id}; worker status=${dispatch.result.status}.` }],
         structuredContent: {
@@ -1153,6 +1219,106 @@ export function registerBridgeTools(
       if (!config.workSessions.get(workSessionId)) return { content: [{ type: "text" as const, text: "Session not found." }], isError: true };
       const packet = await supervisorPacket(workSessionId);
       return { content: [{ type: "text" as const, text: "Supervisor review packet ready." }], structuredContent: { packet } };
+    },
+  );
+
+  registerAppTool(
+    server,
+    "run_mission_verification",
+    {
+      title: "Run mission verification",
+      description: "Run declared criterion verification commands only when the current workspace matches the submitted snapshot, then record server-generated evidence.",
+      inputSchema: { workSessionId: z.string(), criterionIds: z.array(z.string()).optional() },
+      outputSchema: { packet: z.unknown(), results: z.array(z.unknown()) },
+      _meta: workspaceAppModelAndAppMeta(),
+      annotations: { readOnlyHint: false },
+    },
+    async ({ workSessionId, criterionIds }) => {
+      if (!isReviewer(config.principalRole)) return forbidden(config.principalRole, "run_mission_verification");
+      if (!config.missionLedger) return { content: [{ type: "text" as const, text: "Mission ledger unavailable." }], isError: true };
+      let results;
+      const currentSubmission = config.workSessions.get(workSessionId)?.latestSubmission;
+      try { results = await verifyMissionSubmission({ workSessionId, missionLedger: config.missionLedger, workSessions: config.workSessions, workspaces: config.workspaces, reviewCheckpoints: config.reviewCheckpoints, criterionIds, submissionId: currentSubmission?.id, reviewEpoch: currentSubmission?.reviewEpoch }); }
+      catch (error) { return { content: [{ type: "text" as const, text: error instanceof Error ? error.message : String(error) }], isError: true }; }
+      return { content: [{ type: "text" as const, text: `Recorded ${results.length} verification result(s).` }], structuredContent: { results, packet: await supervisorPacket(workSessionId) } };
+    },
+  );
+
+  registerAppTool(
+    server,
+    "pause_supervisor_run",
+    {
+      title: "Pause autonomous supervision",
+      description: "Durably pause new supervisor actions without cancelling the mission or deleting its recovery state.",
+      inputSchema: { workSessionId: z.string(), expectedRevision: z.number().int().positive() },
+      outputSchema: { packet: z.unknown() },
+      _meta: workspaceAppModelAndAppMeta(),
+      annotations: { readOnlyHint: false },
+    },
+    async ({ workSessionId, expectedRevision }) => {
+      if (!isReviewer(config.principalRole)) return forbidden(config.principalRole, "pause_supervisor_run");
+      const current = config.supervisorRuns?.getByWorkSession(workSessionId);
+      const paused = current && config.supervisorRuns?.pause(current.id, expectedRevision);
+      if (!paused) return { content: [{ type: "text" as const, text: "Supervisor run was not found or changed concurrently." }], isError: true };
+      config.eventStore.appendEvent({ type: "supervisor.run.paused", sessionId: workSessionId, payload: { supervisorRunId: paused.id, revision: paused.revision } });
+      return { content: [{ type: "text" as const, text: "Supervisor paused." }], structuredContent: { packet: await supervisorPacket(workSessionId) } };
+    },
+  );
+
+  registerAppTool(
+    server,
+    "resume_supervisor_run",
+    {
+      title: "Resume autonomous supervision",
+      description: "Resume a paused supervisor run from its exact prior durable state.",
+      inputSchema: { workSessionId: z.string(), expectedRevision: z.number().int().positive() },
+      outputSchema: { packet: z.unknown() },
+      _meta: workspaceAppModelAndAppMeta(),
+      annotations: { readOnlyHint: false },
+    },
+    async ({ workSessionId, expectedRevision }) => {
+      if (!isReviewer(config.principalRole)) return forbidden(config.principalRole, "resume_supervisor_run");
+      const current = config.supervisorRuns?.getByWorkSession(workSessionId);
+      const resumed = current && config.supervisorRuns?.resume(current.id, expectedRevision);
+      if (!resumed) return { content: [{ type: "text" as const, text: "Supervisor run was not paused or changed concurrently." }], isError: true };
+      config.eventStore.appendEvent({ type: "supervisor.run.resumed", sessionId: workSessionId, payload: { supervisorRunId: resumed.id, revision: resumed.revision, status: resumed.status } });
+      // The runtime reconstructs the exact durable next action for every
+      // non-paused state (verification, correction, or automatic approval).
+      // Restricting this wake-up to verification stranded paused correction
+      // and approval runs until a later unrelated event arrived.
+      config.onSupervisorResume?.(workSessionId);
+      return { content: [{ type: "text" as const, text: "Supervisor resumed." }], structuredContent: { packet: await supervisorPacket(workSessionId) } };
+    },
+  );
+
+  registerAppTool(
+    server,
+    "redrive_supervisor_run",
+    {
+      title: "Redrive stalled supervisor run",
+      description: "Requeue a dead-lettered supervisor action after reviewer intervention, preserving its durable audit trail.",
+      inputSchema: { workSessionId: z.string(), expectedRevision: z.number().int().positive() },
+      outputSchema: { redriven: z.number(), packet: z.unknown() },
+      _meta: workspaceAppModelAndAppMeta(),
+      annotations: { readOnlyHint: false },
+    },
+    async ({ workSessionId, expectedRevision }) => {
+      if (!isReviewer(config.principalRole)) return forbidden(config.principalRole, "redrive_supervisor_run");
+      const outbox = config.dispatchOutbox;
+      if (!outbox) return { content: [{ type: "text" as const, text: "Dispatch outbox is unavailable." }], isError: true };
+      const run = config.supervisorRuns?.getByWorkSession(workSessionId);
+      if (!run || run.status !== "awaiting_human" || run.revision !== expectedRevision) return { content: [{ type: "text" as const, text: "Supervisor run is not an unchanged human-intervention checkpoint." }], isError: true };
+      const events = outbox.listByAggregate(run.id);
+      let redriven = 0;
+      for (const event of events) {
+        if (event.status === "dead_lettered" && outbox.redriveDeadLetter(event.eventType, event.aggregateId, event.aggregateRevision)) redriven += 1;
+      }
+      if (!redriven) return { content: [{ type: "text" as const, text: "No dead-lettered supervisor action exists to redrive." }], isError: true };
+      const dead = events.filter((event) => event.status === "dead_lettered");
+      const nextStatus = dead.some((event) => event.eventType === "supervisor.correction.requested") ? "correction_pending" : dead.some((event) => event.eventType === "supervisor.approval.requested") ? "approval_pending" : "verification_pending";
+      config.supervisorRuns?.transition({ id: run.id, expectedStatus: "awaiting_human", expectedRevision, nextStatus });
+      config.eventStore.appendEvent({ type: "supervisor.run.redriven", sessionId: workSessionId, payload: { supervisorRunId: run.id, redriven, nextStatus } });
+      return { content: [{ type: "text" as const, text: `Redrove ${redriven} supervisor action(s).` }], structuredContent: { redriven, packet: await supervisorPacket(workSessionId) } };
     },
   );
 
@@ -1291,7 +1457,7 @@ export function registerBridgeTools(
           snapshotCommit: entry.snapshotCommit ?? latest.snapshotCommit,
         })));
       }
-      const approval = config.missionLedger.canApprove(workSessionId, { submissionId: latest.id, snapshotCommit: latest.snapshotCommit });
+      const approval = config.missionLedger.canApprove(workSessionId, { submissionId: latest.id, snapshotCommit: latest.snapshotCommit, reviewEpoch: latest.reviewEpoch });
       if (!approval.allowed) {
         return {
           content: [{ type: "text" as const, text: `Approval blocked: ${approval.reasons.join("; ")}` }],
@@ -1307,7 +1473,10 @@ export function registerBridgeTools(
         verdict: "approve",
         comments,
         reviewerId: "webui",
+        completionReportSha256: config.missionLedger.getCompletionReportHash(workSessionId, { submissionId: latest.id, snapshotCommit: latest.snapshotCommit, reviewEpoch: latest.reviewEpoch }),
       });
+      const supervisor = config.supervisorRuns?.getByWorkSession(workSessionId);
+      if (supervisor) config.supervisorRuns?.transition({ id: supervisor.id, expectedStatus: supervisor.status, expectedRevision: supervisor.revision, nextStatus: "completed" });
       return {
         content: [{ type: "text" as const, text: `Approved ${workSessionId}.` }],
         structuredContent: { status: "approved", approved: true, reasons: [], packet: await supervisorPacket(workSessionId) },
@@ -1336,6 +1505,11 @@ export function registerBridgeTools(
           nonGoals: z.array(z.string()).optional(),
           acceptanceCriteria: z.array(missionCriterionSchema).optional(),
           supervisorInstructions: z.string().optional(),
+          maxCorrectionRounds: z.number().int().min(1).max(100).optional(),
+          maxWallTimeMinutes: z.number().int().min(1).max(10_080).optional(),
+          finalVerification: z.array(z.string()).optional(),
+          autonomyMode: z.enum(["manual", "verify_only", "correction_auto", "full"]).optional(),
+          approvalMode: z.enum(["human_required", "policy_auto", "fully_automatic"]).optional(),
           workOrder: workOrderSchema.optional(),
         }).optional().describe("Optional durable mission contract. When present, WebUI approval is mission-gated rather than only snapshot-gated."),
       },
@@ -1456,6 +1630,7 @@ export function registerBridgeTools(
 
       try {
         let dispatchTask = task;
+        let supervisorRun: ReturnType<NonNullable<typeof config.supervisorRuns>["create"]> | undefined;
         if (missionContract && config.missionLedger) {
           const workspace = config.workspaces.getWorkspace(workspaceSessionId);
           let baselineCommit: string | undefined;
@@ -1473,7 +1648,18 @@ export function registerBridgeTools(
             nonGoals: missionContract.nonGoals,
             acceptanceCriteria: missionContract.acceptanceCriteria,
             supervisorInstructions: missionContract.supervisorInstructions,
+            maxCorrectionRounds: missionContract.maxCorrectionRounds,
+            finalVerification: missionContract.finalVerification,
             baselineCommit,
+          });
+          supervisorRun = config.supervisorRuns?.create({
+            missionId: mission.id,
+            workSessionId: wsId,
+            workspaceSessionId,
+            autonomyMode: missionContract.autonomyMode,
+            approvalMode: missionContract.approvalMode,
+            maxCycles: missionContract.maxCorrectionRounds,
+            maxWallTimeMs: missionContract.maxWallTimeMinutes ? missionContract.maxWallTimeMinutes * 60_000 : undefined,
           });
           config.missionLedger.createWorkOrder(mission.id, wsId, missionContract.workOrder ?? { objectiveForThisTurn: task });
           dispatchTask = renderMissionPrompt(config, wsId, task);
@@ -1489,7 +1675,7 @@ export function registerBridgeTools(
             agentUrl: peer.url,
             agentName: selectedAgentName,
             task: wsId
-              ? `${dispatchTask}\n\n[Kontrol work session ${wsId}] Use this existing session: call submit_for_review with sessionId="${wsId}" when done, then await_review_feedback(sessionId="${wsId}"). Do NOT call start_work_session.`
+              ? `${dispatchTask}\n\n${workSessionInstructions(wsId, peer)}`
               : dispatchTask,
             workspaceSessionId: workspaceSessionId,
             workSessionId: wsId,
@@ -1504,6 +1690,7 @@ export function registerBridgeTools(
             isError: true,
           };
         }
+        if (supervisorRun) config.supervisorRuns?.transition({ id: supervisorRun.id, expectedStatus: "created", expectedRevision: supervisorRun.revision, nextStatus: "worker_active" });
         return {
           content: [{ type: "text" as const, text: result.output || "(no output)" }],
           structuredContent: { runId: result.runId, remoteRunId: result.remoteRunId, workSessionId: wsId, workspaceSessionId, status: result.status, output: result.output },
@@ -2169,6 +2356,7 @@ export function registerBridgeTools(
       outputSchema: {
         sessions: z.array(z.object({
           sessionId: z.string(),
+          workspaceSessionId: z.string(),
           status: z.string(),
           title: z.string().optional(),
           submittedBy: z.string(),
@@ -2196,6 +2384,7 @@ export function registerBridgeTools(
         structuredContent: {
           sessions: sessions.map((s) => ({
             sessionId: s.id,
+            workspaceSessionId: s.workspaceSessionId,
             status: s.status,
             title: s.title,
             submittedBy: s.submittedBy,
@@ -2355,16 +2544,179 @@ export function registerBridgeTools(
     },
   );
 
-  // ── List Active Work Sessions (WebUI rehydration) ──
+  // ── Get Work Session Snapshot (P0 #1: replaces seq-0 replay) ──
+  // Returns a compact projection of the work session's current state so the
+  // WebUI can hydrate instantly without replaying thousands of events. The
+  // client then calls await_work_session_events starting from snapshot.lastSeq.
 
+  registerAppTool(
+    server,
+    "get_work_session_snapshot",
+    {
+      title: "Get work session snapshot",
+      description: "Return a compact projection of a work session's current state (status, workspace, latest submission/feedback, mission summary, last event seq) so the WebUI can hydrate without replaying the event log. The client should then call await_work_session_events with afterSeq = snapshot.lastSeq to receive only new activity.",
+      inputSchema: {
+        sessionId: z.string().describe("Work session ID to snapshot."),
+      },
+      outputSchema: {
+        sessionId: z.string(),
+        workspaceSessionId: z.string(),
+        status: z.string(),
+        title: z.string().optional(),
+        submittedBy: z.string(),
+        runId: z.string().optional(),
+        submissionCount: z.number(),
+        lastSeq: z.number(),
+        updatedAt: z.string(),
+        latestSubmission: z.object({
+          submissionId: z.string(),
+          submissionNumber: z.number(),
+          status: z.string(),
+          additions: z.number(),
+          removals: z.number(),
+          diffSha256: z.string().optional(),
+          reviewEpoch: z.number().optional(),
+        }).optional(),
+        latestFeedback: z.object({
+          id: z.string(),
+          verdict: z.string(),
+          comments: z.string().optional(),
+          reviewerId: z.string().optional(),
+        }).optional(),
+        hasMission: z.boolean(),
+        missionSummary: z.object({
+          objective: z.string().optional(),
+          status: z.string().optional(),
+          cycleNumber: z.number().optional(),
+          maxCycles: z.number().optional(),
+        }).optional(),
+        pendingApprovals: z.array(z.object({
+          approvalId: z.string(),
+          tool: z.string().optional(),
+          path: z.string().optional(),
+          command: z.string().optional(),
+        })).optional(),
+        agentMessages: z.array(z.object({
+          messageId: z.string(),
+          kind: z.string(),
+          title: z.string().optional(),
+          body: z.string().optional(),
+        })).optional(),
+        lastEventSeq: z.number().optional(),
+      },
+      _meta: {},
+      annotations: { readOnlyHint: true },
+    },
+    async ({ sessionId }) => {
+      const access = requireWorkSessionRead(config, sessionId);
+      if (access) return access;
+      const buildSnapshot = () => {
+      const session = config.workSessions.get(sessionId);
+      if (!session) {
+        return { content: [{ type: "text" as const, text: "Session not found." }], isError: true };
+      }
+      const run = config.agentRegistry.getRunByWorkSessionId(sessionId);
+      const latestSubmission = session.latestSubmission;
+      const latestFeedback = session.latestFeedback;
+
+      // Mission detection: check the mission ledger rather than calling inspect_supervised_work.
+      let hasMission = false;
+      let missionSummary: { objective?: string; status?: string; cycleNumber?: number; maxCycles?: number } | undefined;
+      if (config.missionLedger) {
+        const mission = config.missionLedger.getMissionByWorkSession(sessionId);
+        if (mission) {
+          hasMission = true;
+          const supervisor = config.supervisorRuns?.getByWorkSession(sessionId);
+          missionSummary = {
+            objective: mission.objective,
+            status: supervisor?.status,
+            cycleNumber: supervisor?.cycleNumber,
+            maxCycles: supervisor?.maxCycles,
+          };
+        }
+      }
+
+      // Get the last event seq for this session so the client can resume from there.
+      const lastEvent = config.eventStore.getLatestEvent(sessionId);
+      const lastSeq = lastEvent?.seq ?? 0;
+
+      // P0 #6: Expand snapshot to include pending approvals and agent messages
+      const pendingApprovals = config.approvalRequests
+        ? config.approvalRequests.listPending(sessionId).map((a) => ({
+            approvalId: a.approvalId,
+            tool: a.tool,
+            path: a.path,
+            command: a.command,
+          }))
+        : [];
+      const agentMessages = config.agentMessages
+        ? config.agentMessages.list(sessionId).filter((m) => m.status === "open").map((m) => ({
+            messageId: m.id,
+            kind: m.kind,
+            title: m.title,
+            body: m.body,
+          }))
+        : [];
+
+      return {
+        content: [{ type: "text" as const, text: `Snapshot for session ${sessionId}: status=${session.status}, submissions=${session.latestSubmission ? "yes" : "no"}, lastSeq=${lastSeq}.` }],
+        structuredContent: {
+          sessionId: session.id,
+          workspaceSessionId: session.workspaceSessionId,
+          status: session.status,
+          title: session.title,
+          submittedBy: session.submittedBy,
+          runId: run?.runId,
+          submissionCount: config.workSessions.getSubmissions(sessionId).length,
+          lastSeq,
+          updatedAt: session.updatedAt,
+          latestSubmission: latestSubmission ? {
+            submissionId: latestSubmission.id,
+            submissionNumber: latestSubmission.submissionNumber,
+            status: latestSubmission.status,
+            additions: latestSubmission.additions ?? 0,
+            removals: latestSubmission.removals ?? 0,
+            diffSha256: latestSubmission.diffSha256 ?? undefined,
+            reviewEpoch: latestSubmission.reviewEpoch ?? undefined,
+          } : undefined,
+          latestFeedback: latestFeedback ? {
+            id: latestFeedback.id,
+            verdict: latestFeedback.verdict,
+            comments: latestFeedback.comments ?? undefined,
+            reviewerId: latestFeedback.reviewerId ?? undefined,
+          } : undefined,
+          hasMission,
+          missionSummary,
+          // P0 #6: Include pending approvals and agent messages for full recovery
+          pendingApprovals,
+          agentMessages,
+          // Alias makes the cursor contract explicit to clients that use the
+          // event-sourced terminology from the reliability protocol.
+          lastEventSeq: lastSeq,
+        },
+      };
+      };
+      // All projection reads and the event cursor use the same SQLite
+      // connection and transaction. This closes the fetch-vs-subscribe race:
+      // the cursor is the exact boundary of the state returned above.
+      return config.db
+        ? config.db.sqlite.transaction(buildSnapshot)()
+        : buildSnapshot();
+    },
+  );
+
+  // ── List Live Work Sessions (WebUI rehydration) ──
+  // Returns only sessions with a current worker or a freshly-created pending
+  // worker state. Awaiting-review sessions have their own bounded listing so
+  // old human-review work cannot masquerade as a live worker.
   registerAppTool(
     server,
     "list_active_work_sessions",
     {
-      title: "List active work sessions",
-      description: "List all non-terminal work sessions (optionally scoped to a workspace) so the WebUI can rehydrate every resumable session after a reload or reconnect — including ones still being driven by the worker (in_progress / resuming) or sent back for changes. Replay each returned session's events from seq 0 to rebuild its view.",
+      title: "List live work sessions",
+      description: "List live worker sessions (optionally scoped to a workspace) for WebUI rehydration. Awaiting-review, detached, stale, and archived work is returned through its dedicated recovery/review listing instead of being presented as currently running.",
       inputSchema: {
-        workspaceId: z.string().optional().describe("Optional workspace ID to scope the listing."),
+        workspaceId: z.string().optional().describe("Optional workspace ID to scope the listing. Omit only when the user explicitly asks to view all sessions across all workspaces."),
       },
       outputSchema: {
         sessions: z.array(z.object({
@@ -2375,7 +2727,11 @@ export function registerBridgeTools(
           submittedBy: z.string(),
           runId: z.string().optional(),
           submissionCount: z.number(),
+          lastSeq: z.number(),
           updatedAt: z.string(),
+          hasMission: z.boolean(),
+          lifecycle: z.string(),
+          runtimeState: z.string(),
         })),
       },
       _meta: {},
@@ -2385,9 +2741,13 @@ export function registerBridgeTools(
       if (!isReviewer(config.principalRole)) {
         return forbidden(config.principalRole, "list_active_work_sessions");
       }
-      const sessions = config.workSessions.listActiveWorkSessions(workspaceId);
+      const sessions = config.workSessions.listLiveWorkSessions(workspaceId);
       const mapped = sessions.map((s) => {
         const run = config.agentRegistry.getRunByWorkSessionId(s.id);
+        const lastEvent = config.eventStore.getLatestEvent(s.id);
+        const hasMission = config.missionLedger
+          ? Boolean(config.missionLedger.getMissionByWorkSession(s.id))
+          : false;
         return {
           sessionId: s.id,
           workspaceSessionId: s.workspaceSessionId,
@@ -2396,7 +2756,11 @@ export function registerBridgeTools(
           submittedBy: s.submittedBy,
           runId: run?.runId,
           submissionCount: config.workSessions.getSubmissions(s.id).length,
+          lastSeq: lastEvent?.seq ?? 0,
           updatedAt: s.updatedAt,
+          hasMission,
+          lifecycle: s.lifecycle,
+          runtimeState: s.runtimeState,
         };
       });
       const text = mapped.length === 0
@@ -2406,6 +2770,71 @@ export function registerBridgeTools(
       return {
         content: [{ type: "text" as const, text }],
         structuredContent: { sessions: mapped },
+      };
+    },
+  );
+
+  // ── Search Skills (P1 #10: lazy global skill discovery) ──
+  // Returns a compact index of available skills (project-local + global)
+  // so the model can search without loading every skill on every open.
+
+  registerAppTool(
+    server,
+    "search_skills",
+    {
+      title: "Search skills",
+      description: "Search the available skill catalog by keyword. Returns a compact index of matching skills (name, description, path, source). Use this to discover global skills lazily instead of loading all skills on every workspace open. The model can then read a specific skill's path with the read tool.",
+      inputSchema: {
+        query: z.string().describe("Search query to match against skill names and descriptions."),
+        limit: z.number().int().min(1).max(50).optional().default(10).describe("Maximum number of results to return."),
+        workspaceId: z.string().optional().describe("Workspace ID to scope project-local skill discovery. If omitted, only global skills are returned."),
+      },
+      outputSchema: {
+        skills: z.array(z.object({
+          name: z.string(),
+          description: z.string(),
+          path: z.string(),
+          source: z.enum(["project-local", "global"]),
+        })),
+      },
+      _meta: {},
+      annotations: { readOnlyHint: true },
+    },
+    async ({ query, limit, workspaceId }) => {
+      // P1 #29: Use workspace-specific root for project-local skill discovery
+      const serverConfig = config.serverConfig;
+      if (!serverConfig) {
+        return {
+          content: [{ type: "text" as const, text: "Skill search is not available: server config not provided to bridge." }],
+          isError: true,
+        };
+      }
+      // P1 #29: Use workspace root if workspaceId provided, else fall back to server cwd
+      let cwd = process.cwd();
+      if (workspaceId) {
+        try {
+          const ws = config.workspaces.getWorkspace(workspaceId);
+          cwd = ws.root;
+        } catch {
+          // workspace not found, fall back to global-only
+        }
+      }
+      const allSkills = loadSkillIndex(serverConfig, cwd);
+      const queryLower = query.toLowerCase();
+      const matched = allSkills
+        .filter((skill: { name: string; description: string }) =>
+          skill.name.toLowerCase().includes(queryLower) ||
+          skill.description.toLowerCase().includes(queryLower)
+        )
+        .slice(0, limit);
+
+      const text = matched.length === 0
+        ? `No skills matching "${query}".`
+        : `${matched.length} skill(s) matching "${query}":\n${matched.map((s) => `  ${s.name} (${s.source}): ${s.description} — ${s.path}`).join("\n")}`;
+
+      return {
+        content: [{ type: "text" as const, text }],
+        structuredContent: { skills: matched },
       };
     },
   );
@@ -2506,6 +2935,8 @@ export function registerBridgeTools(
       if (bind) return bind;
 
       config.reviewWorkflow.cancelSession({ sessionId });
+      const supervisor = config.supervisorRuns?.getByWorkSession(sessionId);
+      if (supervisor) config.supervisorRuns?.transition({ id: supervisor.id, expectedStatus: supervisor.status, expectedRevision: supervisor.revision, nextStatus: "cancelled" });
       const run = config.agentRegistry.getRunByWorkSessionId(sessionId);
       const remoteCancellation = run
         ? await cancelRemoteRun(config, run)
@@ -2577,7 +3008,7 @@ export function registerBridgeTools(
           {
             agentUrl: selection.agent.url,
             agentName,
-            task: `${task}\n\n[Kontrol work session ${wsId}] Use this existing session: call submit_for_review with sessionId="${wsId}" when done, then await_review_feedback(sessionId="${wsId}"). Do NOT call start_work_session.`,
+            task: `${task}\n\n${workSessionInstructions(wsId, selection.agent)}`,
             workspaceSessionId,
             workSessionId: wsId,
             mode: "async",
@@ -2694,7 +3125,7 @@ export function registerBridgeTools(
             {
               agentUrl: agent.url,
               agentName: agent.name,
-              task: `${task}\n\n[Kontrol work session ${resolvedWorkSessionId}] Use this existing session: call submit_for_review with sessionId="${resolvedWorkSessionId}" when done, then await_review_feedback(sessionId="${resolvedWorkSessionId}"). Do NOT call start_work_session.`,
+              task: `${task}\n\n${workSessionInstructions(resolvedWorkSessionId, config.agentRegistry.listAlive().find((candidate) => candidate.name === agent.name))}`,
               workspaceSessionId: resolvedWorkspaceSessionId,
               workSessionId: resolvedWorkSessionId,
               mode: "async",

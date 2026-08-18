@@ -153,6 +153,7 @@ async function handle(req, res) {
     child: null,
     conn: null,
     finalized: false,
+    authoritativeCompletion: false,
   };
   active.set(run.remoteRunId, run);
   reportEvent(run, "started");
@@ -174,8 +175,10 @@ async function handle(req, res) {
       active.delete(run.remoteRunId);
       if (run.finalized) return;
       run.finalized = true;
-      if (code === 0) reportEvent(run, "completed");
-      else reportEvent(run, "failed", signal ? `terminated by ${signal}` : `exit code ${code}`);
+      if (code === 0 && run.authoritativeCompletion) reportEvent(run, "completed");
+      else reportEvent(run, "failed", code === 0
+        ? "protocol_incomplete: ACP turn ended without an authoritative result"
+        : signal ? `terminated by ${signal}` : `exit code ${code}`);
     });
 
     void dispatchTurn(run).catch((err) => {
@@ -217,6 +220,7 @@ async function dispatchTurn(run) {
     text: typeof result === "string" ? result : JSON.stringify(result),
     raw: result,
   });
+  run.authoritativeCompletion = true;
 }
 
 function createKontrolHttpHandler(run) {

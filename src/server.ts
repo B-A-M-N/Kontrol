@@ -1,5 +1,7 @@
+import { execSync } from "node:child_process";
 import { randomUUID, timingSafeEqual } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
+import { join, dirname } from "node:path";
 import { realpath } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -17,7 +19,7 @@ import {
 import express from "express";
 import type { Request, Response } from "express";
 import * as z from "zod/v4";
-import { applyPatch } from "./apply-patch.js";
+import { applyPatch, parsePatch } from "./apply-patch.js";
 import { loadConfig, type ServerConfig, type WidgetMode } from "./config.js";
 import {
   logEvent,
@@ -48,6 +50,10 @@ import { registerBridgeTools, createContinuationDispatcher, type ContinuationDis
 import { createEventStore } from "./event-log.js";
 import { createContinuationManager } from "./continuation.js";
 import { createDispatchOutbox } from "./dispatch-outbox.js";
+import { createSupervisorRuns } from "./supervisor-runs.js";
+import { createSupervisorRuntime } from "./supervisor-runtime.js";
+import { verifyMissionSubmission } from "./mission-verifier.js";
+import { evaluateSupervisorMission } from "./supervisor-evaluator.js";
 import { createReviewWorkflowService, type ReviewWorkflowService } from "./review-workflow.js";
 import { openDatabase, type DatabaseHandle } from "./db/client.js";
 import { createPolicyEngine, type PolicyConfig, type PolicyEngine, type ApprovalScope } from "./policy.js";
@@ -59,9 +65,58 @@ import { verifyWorkerToken, type WorkerTokenClaims } from "./acp-worker-token.mj
 import { createApprovalRequestManager } from "./approval-requests.js";
 import { createMissionLedger } from "./mission-ledger.js";
 import { createAgentMessageManager } from "./agent-messages.js";
+import { DEVDESKTOP_WORKSPACE_APP_URI, LEGACY_WORKSPACE_APP_URI, OPENAI_WORKSPACE_APP_URI, WORKSPACE_APP_BUILD_ID, WORKSPACE_APP_HTML, WORKSPACE_APP_URI, isWorkspaceAppUri, workspaceAppResourceMeta, workspaceAppToolMeta } from "./workspace-app-resource.js";
+import { createRuntimeIdentity, readBuildIdentity, readRuntimeIdentity, removeRuntimeIdentity } from "./runtime-identity.js";
+import { mcpSessionIdleReason, mcpSessionIdleTtl } from "./mcp-session-policy.js";
 
 type Transport = StreamableHTTPServerTransport;
-const WORKSPACE_APP_URI = "ui://kontrol/workspace-app.html";
+interface McpSessionState {
+  sessionId: string;
+  sessionLabel: string;
+  logicalClientId: string;
+  conversationId?: string;
+  createdAt: number;
+  lastActivityAt: number;
+  inFlightRequests: number;
+  requestCount: number;
+  notificationCount: number;
+  toolCallCount: number;
+  resourceReadCount: number;
+  activeLongPollCount: number;
+  closing: boolean;
+  closed: boolean;
+  endRecorded: boolean;
+  durableWorkerSession: boolean;
+  lastRpcMethod?: string;
+  lastToolName?: string;
+}
+
+type McpSessionWindowKind = "created" | "closed" | "expired" | "tool";
+
+interface McpSessionClientMetrics {
+  sessionsCreated: number;
+  currentSessions: number;
+  sessionsClosed: number;
+  sessionsExpired: number;
+  zeroToolSessions: number;
+  singleToolSessions: number;
+  multiToolSessions: number;
+  totalToolCalls: number;
+  totalLifetimeMs: number;
+  oldestIdleMs: number;
+}
+
+interface McpSessionMetrics {
+  created: number;
+  evicted: number;
+  closed: number;
+  expired: number;
+  inFlight: number;
+  clients: Map<string, McpSessionClientMetrics>;
+  windowEvents: Array<{ at: number; kind: McpSessionWindowKind }>;
+  completedToolCounts: number[];
+}
+
 const WRITE_TOOL_ANNOTATIONS = {
   readOnlyHint: false,
   destructiveHint: true,
@@ -86,6 +141,7 @@ interface RunningServer {
   config: ServerConfig;
   dispatcher?: ContinuationDispatcher;
   close(): void;
+  drain(): Promise<void>;
 }
 
 type ToolContent =
@@ -95,6 +151,129 @@ type ToolContent =
 interface DiffStats {
   additions: number;
   removals: number;
+}
+
+function logicalClientId(req: Request): string {
+  if (req.auth?.clientId) return `oauth:${req.auth.clientId}`;
+  const supplied = req.header("x-kontrol-client-instance")?.trim();
+  if (supplied) return `instance:${supplied.slice(0, 200)}`;
+  const clientInfo = (req.body as { params?: { clientInfo?: { name?: unknown; version?: unknown } } } | undefined)
+    ?.params?.clientInfo;
+  const name = typeof clientInfo?.name === "string" ? clientInfo.name : "unknown";
+  const version = typeof clientInfo?.version === "string" ? clientInfo.version : "unknown";
+  return `mcp:${name.slice(0, 100)}@${version.slice(0, 100)}`;
+}
+
+// MCP does not standardize a conversation identifier. If a trusted
+// deployment forwards one, retain it for diagnostics/labeling only. Never use
+// this value to pool transports or grant access; the MCP session ID remains the
+// isolation boundary.
+function conversationId(req: Request): string | undefined {
+  const value = req.header("x-kontrol-conversation-id")?.trim()
+    || req.header("x-openai-conversation-id")?.trim();
+  return value ? value.slice(0, 200) : undefined;
+}
+
+function mcpSessionLabel(logicalClientIdValue: string, sessionId: string, conversationIdValue?: string): string {
+  const owner = conversationIdValue ? `conversation:${conversationIdValue}` : logicalClientIdValue;
+  return `${owner}/mcp:${sessionIdPrefix(sessionId)}`;
+}
+
+interface McpAdmissionWaiter {
+  key: string;
+  resolve: (release: (() => void) | null) => void;
+  timer: NodeJS.Timeout;
+}
+
+/**
+ * Bounded request admission for the MCP HTTP hop. Session caps protect the
+ * transport map; this queue protects the process from an unbounded number of
+ * expensive tool calls and long polls running at once.
+ */
+export class McpAdmission {
+  private active = 0;
+  private readonly activeByKey = new Map<string, number>();
+  private readonly queue: McpAdmissionWaiter[] = [];
+  private closed = false;
+
+  constructor(
+    private readonly maxInflight: number,
+    private readonly maxInflightPerKey: number,
+    private readonly maxQueue: number,
+  ) {
+    if (!Number.isInteger(maxInflight) || maxInflight < 1) throw new Error("maxInflight must be positive");
+    if (!Number.isInteger(maxInflightPerKey) || maxInflightPerKey < 1) throw new Error("maxInflightPerKey must be positive");
+    if (!Number.isInteger(maxQueue) || maxQueue < 0) throw new Error("maxQueue must be non-negative");
+  }
+
+  getStats(): { active: number; queued: number; maxInflight: number; maxInflightPerKey: number; maxQueue: number } {
+    return {
+      active: this.active,
+      queued: this.queue.length,
+      maxInflight: this.maxInflight,
+      maxInflightPerKey: this.maxInflightPerKey,
+      maxQueue: this.maxQueue,
+    };
+  }
+
+  acquire(key: string, waitDeadlineMs: number): Promise<(() => void) | null> {
+    if (this.closed) return Promise.resolve(null);
+    if (this.canAdmit(key)) return Promise.resolve(this.grant(key));
+    if (this.queue.length >= this.maxQueue) return Promise.resolve(null);
+
+    return new Promise((resolve) => {
+      const waiter: McpAdmissionWaiter = {
+        key,
+        resolve,
+        timer: setTimeout(() => {
+          const index = this.queue.indexOf(waiter);
+          if (index >= 0) this.queue.splice(index, 1);
+          resolve(null);
+        }, Math.max(1, waitDeadlineMs)),
+      };
+      this.queue.push(waiter);
+    });
+  }
+
+  close(): void {
+    this.closed = true;
+    while (this.queue.length > 0) {
+      const waiter = this.queue.shift()!;
+      clearTimeout(waiter.timer);
+      waiter.resolve(null);
+    }
+  }
+
+  private canAdmit(key: string): boolean {
+    return this.active < this.maxInflight && (this.activeByKey.get(key) ?? 0) < this.maxInflightPerKey;
+  }
+
+  private grant(key: string): () => void {
+    this.active++;
+    this.activeByKey.set(key, (this.activeByKey.get(key) ?? 0) + 1);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.active = Math.max(0, this.active - 1);
+      const count = (this.activeByKey.get(key) ?? 1) - 1;
+      if (count > 0) this.activeByKey.set(key, count);
+      else this.activeByKey.delete(key);
+      this.drain();
+    };
+  }
+
+  private drain(): void {
+    if (this.closed) return;
+    for (let i = 0; i < this.queue.length; i++) {
+      const waiter = this.queue[i];
+      if (!this.canAdmit(waiter.key)) continue;
+      this.queue.splice(i, 1);
+      i--;
+      clearTimeout(waiter.timer);
+      waiter.resolve(this.grant(waiter.key));
+    }
+  }
 }
 
 type ToolWidgetKind =
@@ -140,12 +319,7 @@ function toolWidgetDescriptorMeta(
   if (!shouldAttachWidget(config.widgets, kind)) return { _meta: {} };
 
   return {
-    _meta: {
-      ui: {
-        resourceUri: WORKSPACE_APP_URI,
-        visibility: ["model"],
-      },
-    },
+    _meta: workspaceAppToolMeta(["model"]) as unknown as ToolDefinitionMeta,
   };
 }
 
@@ -190,7 +364,7 @@ function serverInstructions(config: ServerConfig): string {
     ? `When ${toolNames.openWorkspace} returns available skills and a task matches a skill, use ${toolNames.read} to read that skill's path before proceeding. Skill paths may be outside the workspace, but ${toolNames.read} only permits advertised SKILL.md files and files under already-loaded skill directories. `
     : "";
 
-  const agentsMd = `Follow instructions returned by ${toolNames.openWorkspace}. Before working under a path listed in availableAgentsFiles, use ${toolNames.read} to inspect that instruction file and follow it. `;
+  const agentsMd = `Follow instructions returned by ${toolNames.openWorkspace}. Kontrol loads additional AGENTS.md/CLAUDE.md files lazily from the ancestors of each requested path and returns newly applicable instructions with that tool call. `;
 
   return `Use Kontrol as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree to obtain a workspaceId. Reuse that same workspaceId for all later file, search, edit, write, show-changes, and shell tools in that folder; do not call ${toolNames.openWorkspace} again unless switching folders/worktrees, changing checkout/worktree mode, the workspaceId is rejected as unknown, or the user explicitly asks to reopen. ${agentsMd}${skills}${inspection}Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not create or modify files with ${toolNames.shell}; avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or any command whose purpose is to write project files.${showChangesInstruction}`;
 }
@@ -402,27 +576,6 @@ function newFilePatch(path: string, content: string): string {
     .join("\n");
 }
 
-function readWorkspaceAppHtml(): string {
-  return readFileSync(
-    fileURLToPath(new URL("../dist/ui/workspace-app.html", import.meta.url)),
-    "utf8",
-  );
-}
-
-function appCsp(config: ServerConfig): {
-  resourceDomains: string[];
-  connectDomains: string[];
-} {
-  const publicBaseUrl = config.publicBaseUrl.replace(/\/+$/, "");
-  // The embedded ext-apps UI runs in a ChatGPT iframe and must handshake back
-  // with its host (chatgpt.com) over postMessage. Lock connectDomains/resourceDomains
-  // to loopback alone blocks that handshake → "waiting for edit view" forever.
-  const domains = Array.from(new Set([publicBaseUrl, "https://chatgpt.com"]));
-  return {
-    resourceDomains: domains,
-    connectDomains: domains,
-  };
-}
 
 function uiBuildDirectory(): string {
   return fileURLToPath(new URL("../dist/ui", import.meta.url));
@@ -729,6 +882,12 @@ interface ConnectionContext {
   workSessionId?: string;
   runId?: string;
   continuationId?: string;
+  /** Transport identity, never shared across MCP sessions. */
+  mcpSessionId?: string;
+  /** Human-readable diagnostic label for this isolated transport. */
+  mcpSessionLabel?: string;
+  /** Optional upstream conversation correlation; not an authorization key. */
+  conversationId?: string;
 }
 
 function createMcpServer(
@@ -749,6 +908,9 @@ function createMcpServer(
   reviewWorkflow?: ReviewWorkflowService,
   liveWaiters?: LiveWaiterRegistry,
   agentMessages?: ReturnType<typeof createAgentMessageManager>,
+  supervisorRuns?: ReturnType<typeof createSupervisorRuns>,
+  onSupervisorResume?: (workSessionId: string) => void,
+  db?: DatabaseHandle,
 ): McpServer {
   const server = new McpServer(
     {
@@ -806,6 +968,9 @@ function createMcpServer(
         sessionId: workSessionId,
         payload: {
           runId: connectionContext?.runId,
+          mcpSessionId: connectionContext?.mcpSessionId,
+          mcpSessionLabel: connectionContext?.mcpSessionLabel,
+          conversationId: connectionContext?.conversationId,
           tool,
           path: typeof input.path === "string" ? input.path : undefined,
           input,
@@ -821,30 +986,66 @@ function createMcpServer(
 
   registerAppResource(
     server,
-    "Kontrol Diff Card",
+    "Kontrol Workspace App",
     WORKSPACE_APP_URI,
     {
-      description: "Interactive card for viewing Kontrol file diffs.",
-      _meta: {
-        ui: {
-          csp: appCsp(config),
-        },
-      },
+      description: "Interactive Kontrol workspace and review interface.",
+      _meta: workspaceAppResourceMeta(),
     },
-    async () => ({
-      contents: [
-        {
-          uri: WORKSPACE_APP_URI,
-          mimeType: RESOURCE_MIME_TYPE,
-          text: readWorkspaceAppHtml(),
-          _meta: {
-            ui: {
-              csp: appCsp(config),
-            },
-          },
-        },
-      ],
-    }),
+    async () => {
+      logEvent(config.logging, "info", "workspace_app_resource_served", {
+        uri: WORKSPACE_APP_URI,
+        buildId: WORKSPACE_APP_BUILD_ID,
+        mimeType: RESOURCE_MIME_TYPE,
+        bytes: Buffer.byteLength(WORKSPACE_APP_HTML, "utf8"),
+      });
+      return { contents: [{ uri: WORKSPACE_APP_URI, mimeType: RESOURCE_MIME_TYPE, text: WORKSPACE_APP_HTML, _meta: workspaceAppResourceMeta() }] };
+    },
+  );
+  // Existing ChatGPT cards already cache the original URI under OpenAI's
+  // output-template key. Serve its legacy representation so Retry can repair
+  // those cards; new MCP Apps use the content-hashed standards URI above.
+  server.registerResource(
+    "Kontrol Workspace App (legacy)",
+    LEGACY_WORKSPACE_APP_URI,
+    { mimeType: "text/html+skybridge", description: "Legacy ChatGPT template." },
+    async () => {
+      logEvent(config.logging, "info", "workspace_app_resource_served", {
+        uri: LEGACY_WORKSPACE_APP_URI,
+        buildId: WORKSPACE_APP_BUILD_ID,
+        mimeType: "text/html+skybridge",
+        bytes: Buffer.byteLength(WORKSPACE_APP_HTML, "utf8"),
+      });
+      return { contents: [{ uri: LEGACY_WORKSPACE_APP_URI, mimeType: "text/html+skybridge", text: WORKSPACE_APP_HTML }] };
+    },
+  );
+  server.registerResource(
+    "Kontrol Workspace App (OpenAI compatibility)",
+    OPENAI_WORKSPACE_APP_URI,
+    { mimeType: "text/html+skybridge", description: "OpenAI compatibility template." },
+    async () => {
+      logEvent(config.logging, "info", "workspace_app_resource_served", {
+        uri: OPENAI_WORKSPACE_APP_URI,
+        buildId: WORKSPACE_APP_BUILD_ID,
+        mimeType: "text/html+skybridge",
+        bytes: Buffer.byteLength(WORKSPACE_APP_HTML, "utf8"),
+      });
+      return { contents: [{ uri: OPENAI_WORKSPACE_APP_URI, mimeType: "text/html+skybridge", text: WORKSPACE_APP_HTML }] };
+    },
+  );
+  server.registerResource(
+    "Kontrol Workspace App (DevDesktop migration)",
+    DEVDESKTOP_WORKSPACE_APP_URI,
+    { mimeType: "text/html+skybridge", description: "Compatibility template for cached DevDesktop cards." },
+    async () => {
+      logEvent(config.logging, "info", "workspace_app_resource_served", {
+        uri: DEVDESKTOP_WORKSPACE_APP_URI,
+        buildId: WORKSPACE_APP_BUILD_ID,
+        mimeType: "text/html+skybridge",
+        bytes: Buffer.byteLength(WORKSPACE_APP_HTML, "utf8"),
+      });
+      return { contents: [{ uri: DEVDESKTOP_WORKSPACE_APP_URI, mimeType: "text/html+skybridge", text: WORKSPACE_APP_HTML }] };
+    },
   );
 
   registerAppTool(
@@ -919,8 +1120,8 @@ function createMcpServer(
         path: formatAgentsPath(file.path, workspace.root),
       }));
       const instruction = config.skillsEnabled
-        ? "Use this workspaceId in all subsequent tool calls for this project. Do not call open_workspace again for this same folder unless this workspaceId stops working, the user asks to reopen, or you switch to a different folder/worktree. Follow loaded agentsFiles instructions. Before working under a path listed in availableAgentsFiles, read that instruction file. When a task matches an available skill in skills, read its path before proceeding."
-        : "Use this workspaceId in all subsequent tool calls for this project. Do not call open_workspace again for this same folder unless this workspaceId stops working, the user asks to reopen, or you switch to a different folder/worktree. Follow loaded agentsFiles instructions. Before working under a path listed in availableAgentsFiles, read that instruction file.";
+        ? "Use this workspaceId in all subsequent tool calls for this project. Do not call open_workspace again for this same folder unless this workspaceId stops working, the user asks to reopen, or you switch to a different folder/worktree. Follow loaded agentsFiles instructions. Nested instructions are loaded automatically when later tools enter their directory. When a task matches an available skill in skills, read its path before proceeding. For skills not listed here, use the search_skills tool to discover global skills by keyword."
+        : "Use this workspaceId in all subsequent tool calls for this project. Do not call open_workspace again for this same folder unless this workspaceId stops working, the user asks to reopen, or you switch to a different folder/worktree. Follow loaded agentsFiles instructions. Nested instructions are loaded automatically when later tools enter their directory.";
       const resultContent: ToolContent[] = [
         {
           type: "text" as const,
@@ -1032,6 +1233,9 @@ function createMcpServer(
         if (bindingErr) return bindingErr;
       }
       const readPath = workspaces.resolveReadPath(workspace, input.path);
+      const newlyApplicable = readPath.skillRead
+        ? []
+        : await workspaces.loadApplicableInstructions(workspace, input.path);
       const response = await readFileTool(
         { ...input, path: readPath.absolutePath },
         {
@@ -1051,8 +1255,13 @@ function createMcpServer(
       }
       workspaces.markReadPathLoaded(workspace, readPath);
 
+      const instructionNotice = newlyApplicable.length > 0
+        ? textBlock(`Newly applicable instructions loaded: ${newlyApplicable.map((file) => formatAgentsPath(file.path, workspace.root)).join(", ")}`)
+        : undefined;
+      const responseContent = instructionNotice ? [instructionNotice, ...response.content] : response.content;
+      const responseForOutput = instructionNotice ? { ...response, content: responseContent } : response;
       const summary = {
-        ...textSummary(response.content),
+        ...textSummary(responseContent),
         offset: input.offset ?? 1,
         limited: input.limit !== undefined,
       };
@@ -1063,21 +1272,21 @@ function createMcpServer(
         success: true,
         durationMs: Math.round(performance.now() - startedAt),
       });
-      trackToolEvent(workspaceId, toolNames.read, input, response, startedAt);
+      trackToolEvent(workspaceId, toolNames.read, input, responseForOutput, startedAt);
 
       return {
-        ...response,
+        ...responseForOutput,
         _meta: {
           tool: toolNames.read,
           card: {
             workspaceId,
             path: input.path,
             summary,
-            payload: { content: response.content },
+            payload: { content: responseContent },
           },
         },
         structuredContent: {
-          result: contentText(response.content),
+          result: contentText(responseContent),
         },
       };
     },
@@ -1132,6 +1341,7 @@ function createMcpServer(
         const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
         if (bindingErr) return bindingErr;
       }
+      await workspaces.loadApplicableInstructions(workspace, input.path);
       workspaces.resolvePath(workspace, input.path);
       const response = await writeFileTool(input, {
         cwd: workspace.root,
@@ -1245,6 +1455,7 @@ function createMcpServer(
         const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
         if (bindingErr) return bindingErr;
       }
+      await workspaces.loadApplicableInstructions(workspace, input.path);
       workspaces.resolvePath(workspace, input.path);
       const response = await editFileTool(input, {
         cwd: workspace.root,
@@ -1360,6 +1571,13 @@ function createMcpServer(
         const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
         if (bindingErr) return bindingErr;
       }
+        // Load instructions for every path named by the patch before any file
+        // is changed. parsePatch is validation-only; applyPatch revalidates all
+        // confined destinations immediately before staging/rename.
+        for (const action of parsePatch(patch) as Array<{ path: string; moveTo?: string }>) {
+          await workspaces.loadApplicableInstructions(workspace, action.path);
+          if (action.moveTo) await workspaces.loadApplicableInstructions(workspace, action.moveTo);
+        }
         const applied = await applyPatch(workspace.root, patch);
         const paths = applied.files.map((file) => file.path).join(", ");
         const result = `Applied patch to ${applied.files.length} file(s): ${paths}`;
@@ -1503,7 +1721,7 @@ function createMcpServer(
         const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
         if (bindingErr) return bindingErr;
       }
-        if (input.path) workspaces.resolvePath(workspace, input.path);
+        if (input.path) await workspaces.loadApplicableInstructions(workspace, input.path);
         const response = await grepFilesTool(input, {
           cwd: workspace.root,
           root: workspace.root,
@@ -1577,7 +1795,7 @@ function createMcpServer(
         const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
         if (bindingErr) return bindingErr;
       }
-        if (input.path) workspaces.resolvePath(workspace, input.path);
+        if (input.path) await workspaces.loadApplicableInstructions(workspace, input.path);
         const response = await findFilesTool(input, {
           cwd: workspace.root,
           root: workspace.root,
@@ -1651,6 +1869,7 @@ function createMcpServer(
         const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
         if (bindingErr) return bindingErr;
       }
+        await workspaces.loadApplicableInstructions(workspace, input.path);
         workspaces.resolvePath(workspace, input.path);
         const response = await listDirectoryTool(input, {
           cwd: workspace.root,
@@ -1757,6 +1976,7 @@ function createMcpServer(
         const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
         if (bindingErr) return bindingErr;
       }
+      if (workingDirectory) await workspaces.loadApplicableInstructions(workspace, workingDirectory);
       const cwd = workspaces.resolveWorkingDirectory(
         workspace,
         workingDirectory,
@@ -1827,6 +2047,7 @@ function createMcpServer(
 
   if (workSessions && config.acpEnabled && eventStore && reviewWorkflow && liveWaiters) {
     const bridgeConfig: Parameters<typeof registerBridgeTools>[1] = {
+      db,
       workspaces,
       workSessions,
       reviewCheckpoints,
@@ -1836,9 +2057,13 @@ function createMcpServer(
       dispatchOutbox,
       reviewWorkflow,
       missionLedger,
+      supervisorRuns,
+      onSupervisorResume,
       agentMessages,
       knownAgents: config.acpKnownAgents,
       sharedSecret: config.acpSharedSecret,
+      // P1 #10: pass server config to bridge so search_skills has access to skill paths.
+      serverConfig: config,
       // Role is derived from the AUTHENTICATED envelope only. A connection is a
       // WORKER solely when a signed worker token verified (see
       // connectionContext.authenticatedRole); an ordinary MCP client is
@@ -1873,7 +2098,333 @@ export function createServer(config = loadConfig()): RunningServer {
     host: config.host,
     ...(allowedHosts ? { allowedHosts } : {}),
   });
+  const buildMeta = readBuildIdentity(join(dirname(fileURLToPath(import.meta.url)), "build-meta.json"));
   const transports = new Map<string, Transport>();
+  const mcpSessions = new Map<string, McpSessionState>();
+  let shuttingDown = false;
+  const mcpAdmission = new McpAdmission(
+    config.mcpMaxInflight,
+    config.mcpMaxInflightPerSession,
+    config.mcpMaxQueue,
+  );
+  const mcpSessionMetrics: McpSessionMetrics = {
+    created: 0,
+    evicted: 0,
+    closed: 0,
+    expired: 0,
+    inFlight: 0,
+    clients: new Map(),
+    windowEvents: [],
+    completedToolCounts: [],
+  };
+
+  function clientMcpMetrics(logicalClientId: string): McpSessionClientMetrics {
+    let metrics = mcpSessionMetrics.clients.get(logicalClientId);
+    if (!metrics) {
+      metrics = {
+        sessionsCreated: 0,
+        currentSessions: 0,
+        sessionsClosed: 0,
+        sessionsExpired: 0,
+        zeroToolSessions: 0,
+        singleToolSessions: 0,
+        multiToolSessions: 0,
+        totalToolCalls: 0,
+        totalLifetimeMs: 0,
+        oldestIdleMs: 0,
+      };
+      mcpSessionMetrics.clients.set(logicalClientId, metrics);
+    }
+    return metrics;
+  }
+
+  function recordMcpWindowEvent(kind: McpSessionWindowKind, at = Date.now()): void {
+    mcpSessionMetrics.windowEvents.push({ at, kind });
+    const cutoff = at - 15 * 60_000;
+    while (mcpSessionMetrics.windowEvents.length > 0 && mcpSessionMetrics.windowEvents[0].at < cutoff) {
+      mcpSessionMetrics.windowEvents.shift();
+    }
+  }
+
+  function sessionWindowMetrics(windowMs: number, now = Date.now()) {
+    const cutoff = now - windowMs;
+    const events = mcpSessionMetrics.windowEvents.filter((event) => event.at >= cutoff);
+    const sessionsCreated = events.filter((event) => event.kind === "created").length;
+    const toolCalls = events.filter((event) => event.kind === "tool").length;
+    return {
+      sessionsCreated,
+      sessionsClosed: events.filter((event) => event.kind === "closed").length,
+      sessionsExpired: events.filter((event) => event.kind === "expired").length,
+      toolCalls,
+      sessionsPerToolCall: sessionsCreated / Math.max(toolCalls, 1),
+    };
+  }
+
+  function recordMcpSessionEnd(state: McpSessionState, reason: string, now = Date.now()): void {
+    if (state.endRecorded) return;
+    state.endRecorded = true;
+    state.closed = true;
+    const metrics = clientMcpMetrics(state.logicalClientId);
+    metrics.currentSessions = Math.max(0, metrics.currentSessions - 1);
+    metrics.totalLifetimeMs += Math.max(0, now - state.createdAt);
+    metrics.totalToolCalls += state.toolCallCount;
+    metrics.oldestIdleMs = 0;
+    if (state.toolCallCount === 0) metrics.zeroToolSessions++;
+    else if (state.toolCallCount === 1) metrics.singleToolSessions++;
+    else metrics.multiToolSessions++;
+    mcpSessionMetrics.completedToolCounts.push(state.toolCallCount);
+    if (mcpSessionMetrics.completedToolCounts.length > 10_000) mcpSessionMetrics.completedToolCounts.shift();
+    if (reason === "expired") {
+      mcpSessionMetrics.expired++;
+      metrics.sessionsExpired++;
+      recordMcpWindowEvent("expired", now);
+    } else {
+      mcpSessionMetrics.closed++;
+      metrics.sessionsClosed++;
+      recordMcpWindowEvent("closed", now);
+    }
+  }
+
+  function recordMcpSessionCreated(logicalClientId: string, at = Date.now()): void {
+    const metrics = clientMcpMetrics(logicalClientId);
+    metrics.sessionsCreated++;
+    metrics.currentSessions++;
+    mcpSessionMetrics.created++;
+    recordMcpWindowEvent("created", at);
+  }
+
+  function completedToolPercentile(percentile: number): number {
+    if (mcpSessionMetrics.completedToolCounts.length === 0) return 0;
+    const sorted = [...mcpSessionMetrics.completedToolCounts].sort((a, b) => a - b);
+    return sorted[Math.min(sorted.length - 1, Math.ceil(sorted.length * percentile) - 1)] ?? 0;
+  }
+
+  function mcpSessionReuseMetrics() {
+    const now = Date.now();
+    const completed = mcpSessionMetrics.closed + mcpSessionMetrics.expired;
+    const perClient = [...mcpSessionMetrics.clients.entries()].map(([client, metrics]) => {
+      let currentZeroToolSessions = 0;
+      let currentSingleToolSessions = 0;
+      let currentMultiToolSessions = 0;
+      let oldestIdleMs = 0;
+      for (const state of mcpSessions.values()) {
+        if (state.logicalClientId !== client) continue;
+        if (state.toolCallCount === 0) currentZeroToolSessions++;
+        else if (state.toolCallCount === 1) currentSingleToolSessions++;
+        else currentMultiToolSessions++;
+        oldestIdleMs = Math.max(oldestIdleMs, now - state.lastActivityAt);
+      }
+      return {
+        client,
+        sessionsCreated: metrics.sessionsCreated,
+        currentSessions: metrics.currentSessions,
+        sessionsClosed: metrics.sessionsClosed,
+        sessionsExpired: metrics.sessionsExpired,
+        singleToolSessions: metrics.singleToolSessions,
+        multiToolSessions: metrics.multiToolSessions,
+        unusedSessions: metrics.zeroToolSessions,
+        currentZeroToolSessions,
+        currentSingleToolSessions,
+        currentMultiToolSessions,
+        averageToolCallsPerSession: metrics.sessionsCreated > 0 ? metrics.totalToolCalls / metrics.sessionsCreated : 0,
+        averageLifetimeMs: completed > 0 ? metrics.totalLifetimeMs / completed : 0,
+        oldestIdleMs,
+      };
+    });
+    const clientTotals = [...mcpSessionMetrics.clients.values()].reduce((totals, metrics) => ({
+      zeroToolSessions: totals.zeroToolSessions + metrics.zeroToolSessions,
+      singleToolSessions: totals.singleToolSessions + metrics.singleToolSessions,
+      multiToolSessions: totals.multiToolSessions + metrics.multiToolSessions,
+    }), { zeroToolSessions: 0, singleToolSessions: 0, multiToolSessions: 0 });
+    return {
+      sessionsCreated: mcpSessionMetrics.created,
+      sessionsClosed: mcpSessionMetrics.closed,
+      sessionsExpired: mcpSessionMetrics.expired,
+      zeroToolSessions: clientTotals.zeroToolSessions,
+      singleToolSessions: clientTotals.singleToolSessions,
+      multiToolSessions: clientTotals.multiToolSessions,
+      toolCallsPerSessionMean: completed > 0 ? mcpSessionMetrics.completedToolCounts.reduce((sum, count) => sum + count, 0) / completed : 0,
+      toolCallsPerSessionP50: completedToolPercentile(0.5),
+      toolCallsPerSessionP95: completedToolPercentile(0.95),
+      windows: {
+        last1m: sessionWindowMetrics(60_000, now),
+        last5m: sessionWindowMetrics(5 * 60_000, now),
+        last15m: sessionWindowMetrics(15 * 60_000, now),
+      },
+      perClient,
+    };
+  }
+
+  // P1 #33: Memory pressure tracking for adaptive caps
+  const mcpSessionBaseRss = process.memoryUsage().rss;
+  let mcpSessionPeakRss = mcpSessionBaseRss;
+  let mcpSessionCountAtPeak = 0;
+  let mcpSessionBytesPerSessionEstimate = 5_700_000;
+
+  function estimateMcpSessionMemoryCost() {
+    return {
+      bytesPerSession: mcpSessionBytesPerSessionEstimate,
+      peakRss: mcpSessionPeakRss,
+      peakCount: mcpSessionCountAtPeak,
+    };
+  }
+
+  function trackMcpSessionMemory() {
+    const current = process.memoryUsage();
+    if (mcpSessions.size > mcpSessionCountAtPeak) {
+      mcpSessionPeakRss = current.rss;
+      mcpSessionCountAtPeak = mcpSessions.size;
+      const delta = Math.max(0, current.rss - mcpSessionBaseRss);
+      mcpSessionBytesPerSessionEstimate = Math.max(1_000_000, Math.round(delta / mcpSessions.size));
+    }
+  }
+
+  function getMemoryPressureState() {
+    trackMcpSessionMemory();
+    const totalRss = process.memoryUsage().rss;
+    const rssLimit = 2_000_000_000; // 2 GB threshold for "high" pressure
+    if (totalRss > rssLimit * 0.8) {
+      return { level: "high" as const, effectiveHardCap: Math.min(config.mcpSessionHardCap, 100), effectiveSoftCap: Math.min(config.mcpSessionSoftCap, 75) };
+    }
+    if (totalRss > rssLimit * 0.5) {
+      return { level: "moderate" as const, effectiveHardCap: Math.min(config.mcpSessionHardCap, 150), effectiveSoftCap: Math.min(config.mcpSessionSoftCap, 100) };
+    }
+    return { level: "low" as const, effectiveHardCap: config.mcpSessionHardCap, effectiveSoftCap: config.mcpSessionSoftCap };
+  }
+
+  const reapIdleMcpSessions = (forceClientId?: string) => {
+    const pressure = getMemoryPressureState();
+    const now = Date.now();
+    // Phase 1: evict sessions with active requests (never evict in-flight)
+    // Phase 2: evict provisional one-tool sessions after their model-turn
+    // grace window. One completed tool is not treated as immediate completion.
+    // Phase 3: evict reusable sessions past their normal TTL.
+    // Phase 4: if still over soft cap, LRU evict idle sessions
+    const toEvict: string[] = [];
+    const evictionReasons = new Map<string, string>();
+    const queueEviction = (id: string, reason: string) => {
+      if (evictionReasons.has(id)) return;
+      toEvict.push(id);
+      evictionReasons.set(id, reason);
+    };
+    const clientCounts = new Map<string, number>();
+
+    for (const [id, state] of mcpSessions) {
+      const idle = now - state.lastActivityAt;
+      const ttl = mcpSessionIdleTtl(state, config);
+
+      if (state.inFlightRequests > 0 || state.activeLongPollCount > 0 || state.closing || state.closed) continue;
+
+      if (idle >= ttl) {
+        queueEviction(id, mcpSessionIdleReason(state));
+      } else {
+        clientCounts.set(state.logicalClientId, (clientCounts.get(state.logicalClientId) ?? 0) + 1);
+      }
+    }
+
+    // Admission at the per-client cap must not become a 503 wall when the
+    // client has accumulated idle, non-worker one-tool transports. Reclaim
+    // the oldest safe provisional sessions first, even if their ordinary TTL
+    // has not elapsed yet. Active requests, long polls, and worker-bound
+    // transports remain protected.
+    if (forceClientId) {
+      const currentClientCount = [...mcpSessions.values()].filter((state) => state.logicalClientId === forceClientId).length;
+      const alreadyQueued = [...evictionReasons.keys()].filter((id) => mcpSessions.get(id)?.logicalClientId === forceClientId).length;
+      const needed = Math.max(0, currentClientCount - config.mcpSessionMaxPerClient + 1 - alreadyQueued);
+      if (needed > 0) {
+        const candidates = [...mcpSessions.values()]
+          .filter((state) => (
+            state.logicalClientId === forceClientId
+            && state.toolCallCount <= 1
+            && !state.durableWorkerSession
+            && state.inFlightRequests === 0
+            && state.activeLongPollCount === 0
+            && !state.closing
+            && !state.closed
+            && !evictionReasons.has(state.sessionId)
+          ))
+          .sort((a, b) => a.lastActivityAt - b.lastActivityAt);
+        for (const state of candidates.slice(0, needed)) {
+          queueEviction(state.sessionId, "per_client_limit");
+        }
+      }
+    }
+
+    // Per-client limit: evict oldest idle sessions beyond limit
+    for (const [id, state] of mcpSessions) {
+      if (toEvict.includes(id)) continue;
+      if (state.inFlightRequests > 0 || state.activeLongPollCount > 0 || state.closing || state.closed) continue;
+      const count = clientCounts.get(state.logicalClientId) ?? 0;
+      if (count > config.mcpSessionMaxPerClient) {
+        queueEviction(id, "per_client_limit");
+        clientCounts.set(state.logicalClientId, count - 1);
+      }
+    }
+
+    // Adaptive soft cap: evict true LRU idle sessions before the hard cap.
+    const softExcess = mcpSessions.size - toEvict.length - pressure.effectiveSoftCap;
+    if (softExcess > 0) {
+      const candidates: Array<{ id: string; lastActivityAt: number }> = [];
+      for (const [id, state] of mcpSessions) {
+        if (toEvict.includes(id)) continue;
+        if (state.inFlightRequests > 0 || state.activeLongPollCount > 0 || state.closing || state.closed) continue;
+        candidates.push({ id, lastActivityAt: state.lastActivityAt });
+      }
+      candidates.sort((a, b) => a.lastActivityAt - b.lastActivityAt);
+      for (let i = 0; i < Math.min(softExcess, candidates.length); i++) {
+        queueEviction(candidates[i].id, "soft_cap_lru");
+      }
+    }
+
+    for (const id of toEvict) {
+      const transport = transports.get(id);
+      const state = mcpSessions.get(id);
+      if (state) {
+        state.closing = true;
+        recordMcpSessionEnd(state, "expired", now);
+      }
+      mcpSessions.delete(id);
+      transports.delete(id);
+      mcpSessionMetrics.evicted++;
+      void transport?.close().catch(() => {});
+      logEvent(config.logging, "info", "mcp_session_expired", {
+        sessionIdPrefix: sessionIdPrefix(id),
+        logicalClientId: state?.logicalClientId,
+        ageMs: now - (state?.createdAt ?? now),
+        idleMs: now - (state?.lastActivityAt ?? now),
+        requestCount: state?.requestCount ?? 0,
+        notificationCount: state?.notificationCount ?? 0,
+        toolCallCount: state?.toolCallCount ?? 0,
+        resourceReadCount: state?.resourceReadCount ?? 0,
+        lastRpcMethod: state?.lastRpcMethod,
+        lastToolName: state?.lastToolName,
+        reason: evictionReasons.get(id) ?? "bounded",
+        sessionLabel: state?.sessionLabel,
+        conversationId: state?.conversationId,
+      });
+    }
+  };
+  const mcpSessionReaper = setInterval(reapIdleMcpSessions, config.mcpSessionReaperIntervalMs);
+  mcpSessionReaper.unref?.();
+  const mcpMemorySampler = setInterval(trackMcpSessionMemory, 30_000);
+  mcpMemorySampler.unref?.();
+
+  // P1 #23: Periodic maintenance loop — event compaction, stale approval
+  // reconciliation, and DB checkpoint. Runs every 5 minutes.
+  const MAINTENANCE_INTERVAL_MS = 5 * 60_000;
+  const maintenanceTimer = setInterval(() => {
+    try {
+      workSessions.reconcileRuntimeStates();
+      // Compact telemetry for terminal sessions
+      const terminalStatuses = new Set(["approved", "rejected", "cancelled", "failed", "failed_protocol"]);
+      for (const session of workSessions.listAllWorkSessions(undefined, 200)) {
+        if (terminalStatuses.has(session.status)) {
+          try { eventStore.compactSessionEvents(session.id, { retentionDays: 7 }); } catch { /* ignore */ }
+        }
+      }
+    } catch { /* ignore */ }
+  }, MAINTENANCE_INTERVAL_MS);
+  maintenanceTimer.unref?.();
   const oauthEnabled = config.authMode === "oauth";
   let oauthProvider: SingleUserOAuthProvider | null = null;
   let bearerAuth:
@@ -1889,24 +2440,14 @@ export function createServer(config = loadConfig()): RunningServer {
       requiredScopes: [config.oauth.scopes[0] ?? "kontrol"],
       resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(resourceServerUrl),
     });
-    app.use(
-      mcpAuthRouter({
-        provider: oauthProvider,
-        issuerUrl: new URL(config.publicBaseUrl),
-        baseUrl: new URL(config.publicBaseUrl),
-        resourceServerUrl,
-        scopesSupported: config.oauth.scopes,
-        resourceName: "Kontrol",
-      }),
-    );
   }
-  const workspaceStore = createWorkspaceStore(config.stateDir);
-  const workspaces = new WorkspaceRegistry(config, workspaceStore);
-  const reviewCheckpoints = createReviewCheckpointManager();
-  const processSessions = new ProcessSessionManager();
   // ONE shared DB handle for every manager + the review workflow service, so the
   // workflow can commit state + event log in a SINGLE transaction (P1 #15).
   const db: DatabaseHandle = openDatabase(config.stateDir);
+  const workspaceStore = createWorkspaceStore(db);
+  const workspaces = new WorkspaceRegistry(config, workspaceStore);
+  const reviewCheckpoints = createReviewCheckpointManager();
+  const processSessions = new ProcessSessionManager();
   const workSessions = createWorkSessionManager(db);
   const agentRegistry = createAgentRegistryManager(db);
   // Seed the well-known topology: the WebUI is the ACP reviewer;
@@ -1922,9 +2463,85 @@ export function createServer(config = loadConfig()): RunningServer {
   const eventStore = createEventStore(db);
   const continuationManager = createContinuationManager(db);
   const dispatchOutbox = createDispatchOutbox(db);
+  const supervisorRuns = createSupervisorRuns(db);
   const approvalRequests = createApprovalRequestManager(db);
   const missionLedger = createMissionLedger(db);
   const agentMessages = createAgentMessageManager(db);
+  const startupRecovery = {
+    at: new Date().toISOString(),
+    expiredApprovals: 0,
+    cancelledApprovals: 0,
+    supersededContinuations: 0,
+    releasedSupervisorLeases: 0,
+    reconciledWorkSessions: 0,
+    markedStaleWorkSessions: 0,
+  };
+  const databaseIntegrity = {
+    ok: false,
+    checkedAt: undefined as string | undefined,
+    detail: "integrity check pending",
+  };
+  const refreshDatabaseIntegrity = () => {
+    try {
+      const result = db.sqlite.prepare("PRAGMA quick_check").get() as { quick_check?: string } | undefined;
+      databaseIntegrity.ok = result?.quick_check === "ok";
+      databaseIntegrity.detail = String(result?.quick_check ?? "quick_check returned no result");
+      databaseIntegrity.checkedAt = new Date().toISOString();
+    } catch (error) {
+      databaseIntegrity.ok = false;
+      databaseIntegrity.detail = error instanceof Error ? error.message : String(error);
+      databaseIntegrity.checkedAt = new Date().toISOString();
+    }
+  };
+  // Integrity scans are valuable, but must not run synchronously on every
+  // readiness request. Run once at startup and refresh in the background.
+  refreshDatabaseIntegrity();
+  const databaseIntegrityTimer = setInterval(refreshDatabaseIntegrity, 5 * 60_000);
+  databaseIntegrityTimer.unref?.();
+  const terminalWorkSessionStatuses = new Set(["approved", "rejected", "cancelled", "failed", "failed_protocol"]);
+  // Durable rows survive a process restart; live transports and in-memory
+  // worker maps do not. Reconcile only objects whose durable references make
+  // their liveness unambiguous, and record each repair in the session event
+  // log so recovery is inspectable rather than silently mutating state.
+  for (const approval of approvalRequests.listPending()) {
+    const session = approval.workSessionId ? workSessions.get(approval.workSessionId) : undefined;
+    const expired = Boolean(approval.expiresAt && Date.parse(approval.expiresAt) <= Date.now());
+    const orphaned = Boolean(approval.workSessionId && (!session || terminalWorkSessionStatuses.has(session.status)));
+    if (!expired && !orphaned) continue;
+    const status = expired ? "expired" : "cancelled";
+    approvalRequests.resolve(approval.approvalId, { status, reason: expired ? "startup_reconciliation: approval expired" : "startup_reconciliation: referenced work session is terminal or missing", reviewerId: "kontrol-startup" });
+    if (status === "expired") startupRecovery.expiredApprovals++;
+    else startupRecovery.cancelledApprovals++;
+    if (session) {
+      eventStore.appendEvent({
+        type: "recovery.approval.reconciled",
+        sessionId: session.id,
+        payload: { approvalId: approval.approvalId, status, reason: "startup_reconciliation" },
+      }, { publish: false });
+    }
+  }
+  const continuationRows = db.sqlite.prepare(`
+    select c.id, c.session_id as sessionId, c.status, ws.status as workSessionStatus
+    from continuations c
+    left join work_sessions ws on ws.id = c.session_id
+    where c.status in ('pending', 'claimed')
+  `).all() as Array<{ id: string; sessionId: string; status: string; workSessionStatus?: string | null }>;
+  for (const continuation of continuationRows) {
+    if (continuation.workSessionStatus && !terminalWorkSessionStatuses.has(continuation.workSessionStatus)) continue;
+    if (!continuationManager.supersede(continuation.id, "startup_reconciliation: referenced work session is terminal or missing")) continue;
+    startupRecovery.supersededContinuations++;
+    if (continuation.workSessionStatus) {
+      eventStore.appendEvent({
+        type: "recovery.continuation.superseded",
+        sessionId: continuation.sessionId,
+        payload: { continuationId: continuation.id, reason: "startup_reconciliation" },
+      }, { publish: false });
+    }
+  }
+  const runtimeReconciliation = workSessions.reconcileRuntimeStates();
+  startupRecovery.reconciledWorkSessions = runtimeReconciliation.reconciled;
+  startupRecovery.markedStaleWorkSessions = runtimeReconciliation.markedStale;
+  startupRecovery.releasedSupervisorLeases = supervisorRuns.releaseExpiredClaims();
   const reviewWorkflow = createReviewWorkflowService({
     workSessions,
     eventStore,
@@ -1983,6 +2600,10 @@ export function createServer(config = loadConfig()): RunningServer {
         path,
         status: res.statusCode,
         durationMs: Math.round(performance.now() - startedAt),
+        rpcMethod: typeof req.body?.method === "string" ? req.body.method : undefined,
+        resourceUri: req.body?.method === "resources/read" && typeof req.body?.params?.uri === "string"
+          ? req.body.params.uri
+          : undefined,
         ...requestLogFields(req, config),
       });
     });
@@ -2042,7 +2663,299 @@ export function createServer(config = loadConfig()): RunningServer {
   );
 
   app.get("/healthz", (_req, res) => {
-    res.json({ ok: true, name: "kontrol" });
+    const runtime = readRuntimeIdentity(config.stateDir);
+    const sessionWindow = sessionWindowMetrics(60_000);
+    res.json({
+      ok: true,
+      name: "kontrol",
+      build: buildMeta,
+      runtime: runtime ? {
+        instanceId: runtime.instanceId,
+        pid: runtime.pid,
+        buildId: runtime.buildId,
+        buildSha: runtime.buildSha,
+        buildDirty: runtime.buildDirty,
+        startedAt: runtime.startedAt,
+      } : undefined,
+      uptimeMs: Math.round(performance.now()),
+      mcpSessions: mcpSessions.size,
+      mcpSessionReuse: {
+        sessionsCreatedLastMinute: sessionWindow.sessionsCreated,
+        sessionsClosedLastMinute: sessionWindow.sessionsClosed,
+        sessionsExpiredLastMinute: sessionWindow.sessionsExpired,
+        toolCallsLastMinute: sessionWindow.toolCalls,
+        sessionsPerToolCall: sessionWindow.sessionsPerToolCall,
+      },
+      activeWorkSessions: workSessions?.countActiveWorkSessions?.() ?? workSessions?.listActiveWorkSessions?.()?.length ?? 0,
+      pendingReviews: workSessions?.countPendingReviews?.() ?? workSessions?.listPendingReviews?.()?.length ?? 0,
+    });
+  });
+
+  function readinessChecks(req: Request, includeAgents: boolean): Record<string, { ok: boolean; detail?: string; agents?: unknown[] }> {
+    const checks: Record<string, { ok: boolean; detail?: string; agents?: unknown[] }> = {};
+    const runtime = readRuntimeIdentity(config.stateDir);
+    let schemaVersion = 0;
+    try {
+      const databaseProbe = db.sqlite.prepare("select 1 as ok").get() as { ok?: number } | undefined;
+      checks.database = { ok: databaseProbe?.ok === 1, detail: databaseProbe?.ok === 1 ? "select 1 ok" : "database probe failed" };
+      const schema = db.sqlite.prepare("select max(version) as v from kontrol_schema_migrations").get() as { v?: number } | undefined;
+      schemaVersion = Number(schema?.v ?? 0);
+      checks.schema = { ok: schemaVersion > 0, detail: `version=${schemaVersion}` };
+    } catch (error) {
+      checks.database = { ok: false, detail: error instanceof Error ? error.message : String(error) };
+      checks.schema = { ok: false, detail: "schema query failed" };
+    }
+    const integrityAgeMs = databaseIntegrity.checkedAt ? Date.now() - Date.parse(databaseIntegrity.checkedAt) : Number.POSITIVE_INFINITY;
+    checks.databaseIntegrity = {
+      ok: databaseIntegrity.ok && integrityAgeMs <= 10 * 60_000,
+      detail: `${databaseIntegrity.detail}; ageMs=${Number.isFinite(integrityAgeMs) ? integrityAgeMs : "unknown"}`,
+    };
+    checks.mcpHandler = { ok: true, detail: `HTTP handler is serving ${includeAgents ? "/readyz" : "/core-readyz"}` };
+    checks.workspaceRegistry = { ok: Boolean(workspaces && workspaceStore), detail: "workspace registry initialized" };
+    checks.reviewSubsystem = { ok: Boolean(reviewWorkflow && workSessions && eventStore), detail: "review managers initialized" };
+    checks.acpBridge = { ok: !config.acpEnabled || Boolean(dispatcher), detail: config.acpEnabled ? "dispatcher initialized" : "ACP disabled" };
+    checks.build = {
+      ok: Boolean(buildMeta.buildId) && Boolean(runtime) && runtime?.buildId === buildMeta.buildId,
+      detail: `expected=${buildMeta.buildId ?? "missing"} live=${runtime?.buildId ?? "missing"}`,
+    };
+
+    if (!includeAgents) {
+      checks.agents = { ok: true, detail: "agent checks deferred to strict /readyz" };
+      return checks;
+    }
+
+    const rawAgents = typeof req.query.agents === "string" ? req.query.agents : "";
+    const requiredAgents = rawAgents
+      .split(",")
+      .map((entry) => entry.trim())
+      .filter(Boolean)
+      .map((entry) => {
+        const separator = entry.indexOf("=");
+        return separator >= 0
+          ? { name: entry.slice(0, separator), url: entry.slice(separator + 1) }
+          : { name: entry, url: undefined };
+      });
+    let configuredAgents = requiredAgents.length > 0 ? requiredAgents : config.acpKnownAgents;
+    const aliveAgents = agentRegistry.listAlive();
+    // In ACP mode an empty configured list is not "no requirements". It means
+    // the generation has not registered an operational coding agent yet. The
+    // WebUI is seeded separately and is not sufficient for worker readiness.
+    const dynamicAgentRequirement = config.acpEnabled && configuredAgents.length === 0;
+    if (dynamicAgentRequirement) {
+      configuredAgents = aliveAgents
+        .filter((agent) => agent.role === "agent" && agent.name !== "webui")
+        .map((agent) => ({ name: agent.name, url: agent.url }));
+    }
+    const agentResults = configuredAgents.map((required) => {
+      const found = aliveAgents.find((agent) => agent.name === required.name);
+      const urlMatches = !required.url || found?.url === required.url;
+      return {
+        name: required.name,
+        expectedUrl: required.url,
+        registeredUrl: found?.url,
+        alive: Boolean(found?.alive),
+        healthy: Boolean(found?.alive) && urlMatches,
+      };
+    });
+    checks.agents = {
+      ok: dynamicAgentRequirement ? agentResults.length > 0 && agentResults.every((agent) => agent.healthy) : agentResults.every((agent) => agent.healthy),
+      detail: dynamicAgentRequirement
+        ? (agentResults.length > 0 ? "registered worker agents checked" : "no live worker agents registered")
+        : (configuredAgents.length > 0 ? "required agents checked" : "ACP disabled; no agents required"),
+      agents: agentResults,
+    };
+    return checks;
+  }
+
+  function sendReadiness(res: Response, checks: Record<string, { ok: boolean; detail?: string; agents?: unknown[] }>): void {
+    const ready = Object.values(checks).every((check) => check.ok);
+    const schemaVersion = Number(checks.schema?.detail?.match(/version=(\d+)/)?.[1] ?? 0);
+    res.status(ready ? 200 : 503).json({
+      ok: ready,
+      ready,
+      name: "kontrol",
+      schemaVersion,
+      build: buildMeta,
+      checks,
+    });
+  }
+
+  // Core readiness is used while KONTROL is starting before adapters register.
+  app.get("/core-readyz", (_req, res) => sendReadiness(res, readinessChecks(_req, false)));
+  // Strict readiness is the operational contract used by the tunnel and the
+  // persistent supervisor. It must fail when a required worker disappears.
+  app.get("/readyz", (req, res) => sendReadiness(res, readinessChecks(req, true)));
+
+  // P2: Warn about low reuse using a rolling rate, not only a raw creation
+  // count. A client creating one session per tool call is operationally
+  // different from a healthy reusable session that happens to be busy.
+  let dbSizeBytes = 0;
+  const mcpSessionChurnTimer = setInterval(() => {
+    const window = sessionWindowMetrics(60_000);
+    if (window.sessionsCreated > 10 || (window.toolCalls > 0 && window.sessionsPerToolCall >= 0.75)) {
+      logEvent(config.logging, "warn", "mcp_session_reuse_low", {
+        ...window,
+        logicalClients: mcpSessionMetrics.clients.size,
+      });
+    }
+  }, 60_000);
+  mcpSessionChurnTimer.unref?.();
+
+  // P1 #23 / P1 #50: Protect /diagnostics — loopback-only AND require an
+  // explicit admin credential. Disabled diagnostics are not an accidental
+  // unauthenticated information endpoint.
+  app.get("/diagnostics", (req, res) => {
+    const ip = requestIp(req, config.logging.trustProxy) || "";
+    if (ip && !ip.startsWith("127.") && !ip.startsWith("::1") && ip !== "::ffff:127.0.0.1") {
+      return res.status(403).json({ ok: false, error: "Forbidden: diagnostics is loopback-only" });
+    }
+    if (!config.diagnosticsSecret) {
+      return res.status(404).json({ ok: false, error: "Diagnostics disabled" });
+    }
+    // Credentials are header-only. Query-string secrets leak through browser
+    // history, proxy logs, and referrer metadata.
+    const provided = req.header("x-kontrol-diagnostics") || "";
+    const expected = config.diagnosticsSecret;
+    const a = Buffer.from(String(provided));
+    const b = Buffer.from(expected);
+    if (a.length !== b.length || !timingSafeEqual(a, b)) {
+      return res.status(403).json({ ok: false, error: "Forbidden: valid X-Kontrol-Diagnostics credential required" });
+    }
+    try {
+      const sqlite = (db as unknown as { sqlite?: { prepare?: (sql: string) => { get?: () => unknown } } }).sqlite;
+      let dbSizeBytes = 0;
+      let walSizeBytes = 0;
+      let eventLogCount = 0;
+      let outputDeltaCount = 0;
+      let thoughtDeltaCount = 0;
+      let schemaVersion = 1;
+      if (sqlite && sqlite.prepare) {
+        try {
+          // P1 #47: Use filesystem stat for accurate DB + WAL size
+          const dbPath = join(config.stateDir, "kontrol.sqlite");
+          try {
+            const st = statSync(dbPath);
+            dbSizeBytes = st.size;
+          } catch { /* ignore */ }
+          try {
+            const st = statSync(`${dbPath}-wal`);
+            walSizeBytes = st.size;
+          } catch { /* ignore */ }
+        } catch { /* ignore */ }
+        try {
+          const r = sqlite.prepare("select count(*) as c from event_log").get?.();
+          eventLogCount = typeof r === "object" && r !== null && "c" in r ? (r as { c: number }).c : 0;
+          const od = sqlite.prepare("select count(*) as c from event_log where type = 'agent.run.output_delta'").get?.();
+          outputDeltaCount = typeof od === "object" && od !== null && "c" in od ? (od as { c: number }).c : 0;
+          const td = sqlite.prepare("select count(*) as c from event_log where type = 'agent.run.thought_delta'").get?.();
+          thoughtDeltaCount = typeof td === "object" && td !== null && "c" in td ? (td as { c: number }).c : 0;
+        } catch { /* ignore */ }
+        // P1 #48: Query actual schema version
+        try {
+          const sv = sqlite.prepare("select max(version) as v from kontrol_schema_migrations").get?.();
+          schemaVersion = typeof sv === "object" && sv !== null && "v" in sv ? (sv as { v: number }).v : 1;
+        } catch { schemaVersion = 1; }
+      }
+
+      // P1 #49: Use cheap count APIs instead of expensive hydration
+      const activeWorkSessions = workSessions.countActiveWorkSessions();
+      const pendingReviews = workSessions.countPendingReviews();
+      const activeAcps = agentRegistry?.listAlive?.()?.length ?? 0;
+      const totalMcpSessions = mcpSessions?.size ?? 0;
+
+      // P0 #2: Comprehensive session/heap metrics
+      const memUsage = process.memoryUsage();
+      const supervisorStatus = (() => {
+        try {
+          return JSON.parse(readFileSync(join(config.stateDir, "supervisor-status.json"), "utf8")) as Record<string, unknown>;
+        } catch {
+          return undefined;
+        }
+      })();
+      const mcpMetrics = {
+        created: mcpSessionMetrics.created,
+        evicted: mcpSessionMetrics.evicted,
+        current: totalMcpSessions,
+        inFlight: [...mcpSessions.values()].reduce((sum, s) => sum + s.inFlightRequests, 0),
+        admission: mcpAdmission.getStats(),
+        memoryPressure: getMemoryPressureState(),
+        memoryEstimate: estimateMcpSessionMemoryCost(),
+        reuse: mcpSessionReuseMetrics(),
+        policy: {
+          unusedSessionIdleMs: config.mcpUnusedSessionIdleMs,
+          ephemeralSessionIdleMs: config.mcpEphemeralSessionIdleMs,
+          reusableSessionIdleMs: config.mcpReusableSessionIdleMs,
+          sessionReaperIntervalMs: config.mcpSessionReaperIntervalMs,
+          sessionMaxPerClient: config.mcpSessionMaxPerClient,
+          sessionSoftCap: config.mcpSessionSoftCap,
+          sessionHardCap: config.mcpSessionHardCap,
+        },
+        // Each entry is a separate transport/context. The aggregate logical
+        // client label is deliberately not used as an ownership key.
+        sessions: [...mcpSessions.values()]
+          .sort((a, b) => a.lastActivityAt - b.lastActivityAt)
+          .map((state) => ({
+            sessionIdPrefix: sessionIdPrefix(state.sessionId),
+            sessionLabel: state.sessionLabel,
+            logicalClientId: state.logicalClientId,
+            conversationId: state.conversationId,
+            createdAt: new Date(state.createdAt).toISOString(),
+            ageMs: Date.now() - state.createdAt,
+            idleMs: Date.now() - state.lastActivityAt,
+            requestCount: state.requestCount,
+            notificationCount: state.notificationCount,
+            toolCallCount: state.toolCallCount,
+            resourceReadCount: state.resourceReadCount,
+            activeLongPollCount: state.activeLongPollCount,
+            inFlightRequests: state.inFlightRequests,
+            durableWorkerSession: state.durableWorkerSession,
+            lastRpcMethod: state.lastRpcMethod,
+            lastToolName: state.lastToolName,
+          })),
+        perClient: Object.entries([...mcpSessions.values()].reduce((acc, s) => {
+          acc[s.logicalClientId] = (acc[s.logicalClientId] || 0) + 1;
+          return acc;
+        }, {} as Record<string, number>)).map(([client, count]) => ({ client, count })),
+      };
+
+      // P1 #51: Report embedded build metadata (immutable artifact identity)
+      // rather than the working tree state.
+      let buildMeta: Record<string, unknown> | undefined;
+      try {
+        const metaPath = join(dirname(fileURLToPath(import.meta.url)), "build-meta.json");
+        buildMeta = JSON.parse(readFileSync(metaPath, "utf8"));
+      } catch { /* ignore */ }
+
+      res.json({
+        ok: true,
+        name: "kontrol",
+        build: buildMeta ?? process.env.KONTROL_BUILD_ID ?? "dev",
+        buildMeta,
+        schema: schemaVersion,
+        dbSizeBytes,
+        walSizeBytes,
+        eventLogCount,
+        outputDeltaCount,
+        thoughtDeltaCount,
+        activeWorkSessions,
+        pendingReviews,
+        activeAcps,
+        totalMcpSessions,
+        mcpSessionMetrics: mcpMetrics,
+        startupRecovery,
+        databaseIntegrity,
+        supervisor: supervisorStatus,
+        heapUsed: memUsage.heapUsed,
+        heapTotal: memUsage.heapTotal,
+        rss: memUsage.rss,
+        external: memUsage.external,
+        uptimeMs: Math.round(performance.now()),
+        memoryUsage: memUsage,
+        pid: process.pid,
+      });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
   });
 
   if (config.acpEnabled) {
@@ -2066,6 +2979,16 @@ export function createServer(config = loadConfig()): RunningServer {
     const requestId = res.locals.requestId as string | undefined;
     const sessionId = req.header("mcp-session-id");
     const initializeRequest = req.method === "POST" && isInitializeRequest(req.body);
+    let admissionRelease: (() => void) | undefined;
+    let sessionLongPoll = false;
+
+    if (shuttingDown) {
+      return res.status(503).json({
+        jsonrpc: "2.0",
+        id: (req.body as { id?: unknown } | undefined)?.id ?? null,
+        error: { code: -32000, message: "KONTROL is draining; retry after restart." },
+      });
+    }
 
     if (bearerAuth) {
       await new Promise<void>((resolve, reject) => {
@@ -2087,32 +3010,28 @@ export function createServer(config = loadConfig()): RunningServer {
         sendJsonRpcError(res, 401, -32001, "Unauthorized");
         return;
       }
-    } else if (config.tunnelToken) {
-      // Opt-in bearer for the OpenAI tunnel hop. Constant-time compare; never log the token.
-      const auth = req.header("authorization") ?? "";
-      const expected = `Bearer ${config.tunnelToken}`;
-      const workerToken = req.header("x-kontrol-worker-token");
-      let workerOk = false;
-      if (workerToken && config.acpAgentSecret) {
-        try {
-          verifyWorkerToken(workerToken, config.acpAgentSecret);
-          workerOk = true;
-        } catch {
-          workerOk = false;
-        }
-      }
-      const ok = constantTimeStringEqual(auth, expected);
-      if (!ok && !workerOk) {
-        logEvent(config.logging, "warn", "auth_denied", {
-          requestId,
-          method: req.method,
-          path: requestPath(req),
-          reason: "invalid_tunnel_bearer",
-          ...requestLogFields(req, config),
-        });
-        sendJsonRpcError(res, 401, -32001, "Unauthorized");
-        return;
-      }
+    } else if (config.authMode === "tunnel") {
+      // Tunnel mode is intentionally unauthenticated at the local MCP hop.
+      // The OpenAI Secure MCP Tunnel owns the external trust boundary. In
+      // particular, never let a stale KONTROL_TUNNEL_TOKEN or Authorization
+      // header turn this mode back into a second, unsynchronized auth gate.
+    }
+
+    // tunnel-client performs liveness and compatibility probes with an empty
+    // POST and a sessionless GET before/after initialize. These are not MCP
+    // tool requests and must not be reported as application 400s.
+    const emptyTunnelProbe = config.authMode === "tunnel" && !sessionId && (
+      req.method === "GET" ||
+      (req.method === "POST" && (!req.body || Object.keys(req.body).length === 0))
+    );
+    if (emptyTunnelProbe) {
+      logEvent(config.logging, "debug", "mcp_probe_request", {
+        requestId,
+        method: req.method,
+        reason: "sessionless_tunnel_probe",
+      });
+      res.status(req.method === "GET" ? 200 : 202).end();
+      return;
     }
 
     logEvent(config.logging, "debug", "mcp_request", {
@@ -2132,14 +3051,131 @@ export function createServer(config = loadConfig()): RunningServer {
           sendJsonRpcError(res, 404, -32000, "Unknown MCP session");
           return;
         }
+        const state = mcpSessions.get(sessionId);
+        if (config.authMode === "oauth" && state && state.logicalClientId !== logicalClientId(req)) {
+          logEvent(config.logging, "warn", "mcp_session_client_mismatch", {
+            requestId,
+            sessionIdPrefix: sessionIdPrefix(sessionId),
+            expectedClientId: state.logicalClientId,
+            actualClientId: logicalClientId(req),
+          });
+          sendJsonRpcError(res, 403, -32001, "MCP session belongs to another client");
+          return;
+        }
+        const requestedConversationId = conversationId(req);
+        if (state?.conversationId && requestedConversationId && state.conversationId !== requestedConversationId) {
+          logEvent(config.logging, "warn", "mcp_session_conversation_mismatch", {
+            requestId,
+            sessionIdPrefix: sessionIdPrefix(sessionId),
+            sessionLabel: state.sessionLabel,
+            expectedConversationId: state.conversationId,
+            actualConversationId: requestedConversationId,
+          });
+          sendJsonRpcError(res, 403, -32001, "MCP session belongs to another conversation");
+          return;
+        }
+        if (state) {
+          state.lastActivityAt = Date.now();
+          state.inFlightRequests++;
+          state.requestCount++;
+          const rpcMethod = (req.body as { method?: string })?.method;
+          state.lastRpcMethod = rpcMethod;
+          if (rpcMethod?.startsWith("notifications/")) {
+            state.notificationCount++;
+          }
+          if (rpcMethod === "resources/read") {
+            state.resourceReadCount++;
+          }
+          if (rpcMethod === "tools/call") {
+            state.toolCallCount++;
+            recordMcpWindowEvent("tool");
+            const toolName = (req.body as { params?: { name?: string } })?.params?.name;
+            state.lastToolName = toolName;
+            if (toolName === "await_review_feedback" || toolName === "await_work_session_events") {
+              state.activeLongPollCount++;
+              sessionLongPoll = true;
+            }
+          }
+        }
       } else if (initializeRequest) {
+        // P1 #31: Admission pressure control — enforce caps at session creation
+        const clientId = logicalClientId(req);
+        const pressure = getMemoryPressureState();
+        if (mcpSessions.size >= pressure.effectiveSoftCap) {
+          reapIdleMcpSessions();
+        }
+        if (mcpSessions.size >= pressure.effectiveHardCap) {
+          // Try idle eviction first to make room
+          reapIdleMcpSessions();
+          if (mcpSessions.size >= pressure.effectiveHardCap) {
+            logEvent(config.logging, "warn", "mcp_session_rejected", {
+              requestId,
+              reason: "global_hard_cap_reached",
+              current: mcpSessions.size,
+              hardCap: pressure.effectiveHardCap,
+              pressure: pressure.level,
+            });
+            return res.status(503).json({
+              jsonrpc: "2.0",
+              id: (req.body as { id?: unknown })?.id ?? null,
+              error: { code: -32000, message: "Server at capacity. Try again later." },
+            });
+          }
+        }
+        // Per-client limit at admission
+        let clientSessionCount = [...mcpSessions.values()].filter((s) => s.logicalClientId === clientId).length;
+        if (clientSessionCount >= config.mcpSessionMaxPerClient) {
+          reapIdleMcpSessions(clientId);
+          clientSessionCount = [...mcpSessions.values()].filter((s) => s.logicalClientId === clientId).length;
+        }
+        if (clientSessionCount >= config.mcpSessionMaxPerClient) {
+          logEvent(config.logging, "warn", "mcp_session_rejected", {
+            requestId,
+            reason: "per_client_limit_reached",
+            clientId,
+            current: clientSessionCount,
+            maxPerClient: config.mcpSessionMaxPerClient,
+          });
+          return res.status(503).json({
+            jsonrpc: "2.0",
+            id: (req.body as { id?: unknown })?.id ?? null,
+            error: { code: -32000, message: "Too many sessions for this client. Close some and retry." },
+          });
+        }
+        const sessionInitializedAt = performance.now();
         transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
           onsessioninitialized: (newSessionId) => {
-            if (transport) transports.set(newSessionId, transport);
+            if (transport) {
+              transports.set(newSessionId, transport);
+              const requestConversationId = conversationId(req);
+              mcpSessions.set(newSessionId, {
+                sessionId: newSessionId,
+                sessionLabel: mcpSessionLabel(clientId, newSessionId, requestConversationId),
+                logicalClientId: clientId,
+                conversationId: requestConversationId,
+                createdAt: Date.now(),
+                lastActivityAt: Date.now(),
+                inFlightRequests: 0,
+                requestCount: 1,
+                notificationCount: 0,
+                toolCallCount: 0,
+                resourceReadCount: 0,
+                activeLongPollCount: 0,
+                closing: false,
+                closed: false,
+                endRecorded: false,
+                durableWorkerSession: false,
+                lastRpcMethod: "initialize",
+              });
+              recordMcpSessionCreated(clientId);
+            }
             logEvent(config.logging, "info", "mcp_session_created", {
               requestId,
               sessionIdPrefix: sessionIdPrefix(newSessionId),
+              sessionLabel: mcpSessions.get(newSessionId)?.sessionLabel,
+              conversationId: mcpSessions.get(newSessionId)?.conversationId,
+              logicalClientId: clientId,
               ...requestLogFields(req, config),
             });
           },
@@ -2149,8 +3185,25 @@ export function createServer(config = loadConfig()): RunningServer {
           const closedSessionId = transport?.sessionId;
           if (closedSessionId) {
             transports.delete(closedSessionId);
+            const state = mcpSessions.get(closedSessionId);
+            if (state) {
+              recordMcpSessionEnd(state, state.closing ? "server_shutdown" : "client_closed");
+            }
+            mcpSessions.delete(closedSessionId);
             logEvent(config.logging, "info", "mcp_session_closed", {
               sessionIdPrefix: sessionIdPrefix(closedSessionId),
+              logicalClientId: state?.logicalClientId,
+              sessionLabel: state?.sessionLabel,
+              conversationId: state?.conversationId,
+              ageMs: state ? Date.now() - state.createdAt : undefined,
+              idleMs: state ? Date.now() - state.lastActivityAt : undefined,
+              requestCount: state?.requestCount,
+              notificationCount: state?.notificationCount,
+              toolCallCount: state?.toolCallCount,
+              resourceReadCount: state?.resourceReadCount,
+              lastRpcMethod: state?.lastRpcMethod,
+              lastToolName: state?.lastToolName,
+              closeReason: state?.closing ? "server_shutdown" : "client_closed",
             });
           }
         };
@@ -2204,8 +3257,10 @@ export function createServer(config = loadConfig()): RunningServer {
           continuationId:
             verifiedClaims?.continuationId
             || (req.header("x-kontrol-continuation") ?? undefined),
+          conversationId: conversationId(req),
         };
 
+        const serverCreateStarted = performance.now();
         const server = createMcpServer(
           config,
           workspaces,
@@ -2224,15 +3279,127 @@ export function createServer(config = loadConfig()): RunningServer {
           reviewWorkflow,
           liveWaiters,
           agentMessages,
+          supervisorRuns,
+          (workSessionId) => supervisorRuntime?.wake(workSessionId),
+          db,
         );
+        const serverCreateMs = performance.now() - serverCreateStarted;
+        const transportConnectStarted = performance.now();
         await server.connect(transport);
+        const state = transport.sessionId ? mcpSessions.get(transport.sessionId) : undefined;
+        if (state) {
+          state.durableWorkerSession = connectionContext.authenticatedRole === "worker" || Boolean(connectionContext.workSessionId);
+          connectionContext.mcpSessionId = state.sessionId;
+          connectionContext.mcpSessionLabel = state.sessionLabel;
+          connectionContext.conversationId = state.conversationId;
+        }
+        logEvent(config.logging, "info", "mcp_session_initialized", {
+          requestId,
+          sessionIdPrefix: sessionIdPrefix(transport.sessionId),
+          sessionLabel: state?.sessionLabel,
+          conversationId: state?.conversationId,
+          serverCreateMs: Math.round(serverCreateMs),
+          transportConnectMs: Math.round(performance.now() - transportConnectStarted),
+          totalMs: Math.round(performance.now() - sessionInitializedAt),
+        });
+      } else if (
+        (req.body as { method?: unknown; params?: { uri?: unknown } } | undefined)?.method === "resources/read" &&
+        isWorkspaceAppUri((req.body as { params?: { uri?: unknown } } | undefined)?.params?.uri)
+      ) {
+        // The OpenAI tunnel fetches app resources on a separate, sessionless
+        // channel after initialization. Resources are read-only and the outer
+        // bearer/tunnel authentication above has already succeeded, so serve
+        // this one protocol method statelessly rather than rejecting the WebUI
+        // template with "No valid MCP session".
+        transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+        const sessionlessServerCreateStarted = performance.now();
+        const server = createMcpServer(
+          config,
+          workspaces,
+          reviewCheckpoints,
+          processSessions,
+          workSessions,
+          agentRegistry,
+          eventStore,
+          continuationManager,
+          dispatchOutbox,
+          policyEngine,
+          policyEnforcer,
+          approvalRequests,
+          missionLedger,
+          undefined,
+          reviewWorkflow,
+          liveWaiters,
+          agentMessages,
+          supervisorRuns,
+          (workSessionId) => supervisorRuntime?.wake(workSessionId),
+          db,
+        );
+        const serverCreateMs = performance.now() - sessionlessServerCreateStarted;
+        const transportConnectStarted = performance.now();
+        await server.connect(transport);
+        logEvent(config.logging, "info", "mcp_session_initialized", {
+          requestId,
+          sessionless: true,
+          serverCreateMs: Math.round(serverCreateMs),
+          transportConnectMs: Math.round(performance.now() - transportConnectStarted),
+          totalMs: Math.round(performance.now() - sessionlessServerCreateStarted),
+        });
       } else {
         sendJsonRpcError(res, 400, -32000, "No valid MCP session");
         return;
       }
 
+      const acquiredAdmission = await mcpAdmission.acquire(
+        sessionId ?? logicalClientId(req),
+        config.mcpRequestDeadlineMs,
+      );
+      if (!acquiredAdmission) {
+        if (sessionId) {
+          const state = mcpSessions.get(sessionId);
+          if (state) {
+            if (state.inFlightRequests > 0) state.inFlightRequests--;
+            state.lastActivityAt = Date.now();
+          }
+        }
+        logEvent(config.logging, "warn", "mcp_request_rejected", {
+          requestId,
+          reason: "admission_queue_full_or_deadline",
+          sessionIdPrefix: sessionIdPrefix(sessionId),
+          admission: mcpAdmission.getStats(),
+        });
+        return res.status(503).json({
+          jsonrpc: "2.0",
+          id: (req.body as { id?: unknown })?.id ?? null,
+          error: { code: -32029, message: "MCP request capacity is temporarily exhausted. Retry later." },
+        });
+      }
+      admissionRelease = acquiredAdmission;
+
       await transport.handleRequest(req, res, req.body);
+      admissionRelease();
+      admissionRelease = undefined;
+      // Decrement in-flight count after response completes
+      if (sessionId) {
+        const state = mcpSessions.get(sessionId);
+        if (state) {
+          if (state.inFlightRequests > 0) state.inFlightRequests--;
+          if (sessionLongPoll && state.activeLongPollCount > 0) state.activeLongPollCount--;
+          state.lastActivityAt = Date.now();
+        }
+      }
     } catch (error) {
+      admissionRelease?.();
+      admissionRelease = undefined;
+      // Decrement in-flight count on error too
+      if (sessionId) {
+        const state = mcpSessions.get(sessionId);
+        if (state) {
+          if (state.inFlightRequests > 0) state.inFlightRequests--;
+          if (sessionLongPoll && state.activeLongPollCount > 0) state.activeLongPollCount--;
+          state.lastActivityAt = Date.now();
+        }
+      }
       logEvent(config.logging, "error", "mcp_request_error", {
         requestId,
         error: error instanceof Error ? error.message : String(error),
@@ -2247,6 +3414,7 @@ export function createServer(config = loadConfig()): RunningServer {
   // individual MCP client connection. Shares the SAME liveWaiters instance used
   // by every createMcpServer so a parked agent suppresses duplicate dispatch.
   let dispatcher: ContinuationDispatcher | undefined;
+  let supervisorRuntime: ReturnType<typeof createSupervisorRuntime> | undefined;
   if (config.acpEnabled) {
     const bridgeBase: BridgeConfig = {
       workspaces,
@@ -2258,6 +3426,8 @@ export function createServer(config = loadConfig()): RunningServer {
       dispatchOutbox,
       reviewWorkflow,
       missionLedger,
+      supervisorRuns,
+      onSupervisorResume: (workSessionId) => supervisorRuntime?.wake(workSessionId),
       agentMessages,
       knownAgents: config.acpKnownAgents,
       sharedSecret: config.acpSharedSecret,
@@ -2265,26 +3435,154 @@ export function createServer(config = loadConfig()): RunningServer {
     };
     dispatcher = createContinuationDispatcher(bridgeBase);
     dispatcher.start();
+    supervisorRuntime = createSupervisorRuntime({
+      outbox: dispatchOutbox,
+      events: eventStore,
+      runs: supervisorRuns,
+      onVerify: async (workSessionId, deadlineAt, submission) => {
+        await verifyMissionSubmission({
+          workSessionId,
+          missionLedger,
+          workSessions,
+          workspaces,
+          reviewCheckpoints,
+          deadlineAtMs: deadlineAt ? Date.parse(deadlineAt) : undefined,
+          submissionId: submission?.id,
+          reviewEpoch: submission?.reviewEpoch,
+        });
+      },
+      onEvaluate: async (workSessionId) => {
+        const run = supervisorRuns.getByWorkSession(workSessionId);
+        const latest = workSessions.get(workSessionId)?.latestSubmission;
+        return evaluateSupervisorMission(missionLedger, workSessionId, {
+          submissionId: latest?.id,
+          snapshotCommit: latest?.snapshotCommit,
+          cycleNumber: run?.cycleNumber ?? 0,
+          maxCycles: run?.maxCycles ?? 0,
+        });
+      },
+      onCorrect: async (workSessionId, reasons) => {
+        const mission = missionLedger.getMissionByWorkSession(workSessionId);
+        const session = workSessions.get(workSessionId);
+        const latest = session?.latestSubmission;
+        if (!mission || !latest?.id || !session) throw new Error("Cannot create a correction without a current mission submission.");
+        const packet = missionLedger.getPacket(workSessionId);
+        const failedCriteria = packet.criteria.filter((criterion) => criterion.priority === "required" && criterion.status !== "verified");
+        const openFindings = packet.findings.filter((finding) => finding.scope !== "out_of_scope" && ["blocker", "high"].includes(finding.severity) && !["verified_resolved", "waived"].includes(finding.status));
+        const workOrder = missionLedger.createWorkOrder(mission.id, workSessionId, {
+          objectiveForThisTurn: "Resolve the current failed mission verification and resubmit the exact workspace snapshot for review.",
+          acceptanceCriterionIds: failedCriteria.map((criterion) => criterion.id),
+          requiredFindingIds: openFindings.map((finding) => finding.id),
+          requiredActions: reasons,
+          prohibitedActions: mission.userLockedFields.map((field) => `Do not alter user-locked mission field: ${field}`),
+          requiredVerification: failedCriteria.map((criterion) => criterion.verificationCommand).filter(Boolean),
+          expectedDeliverables: ["A corrected submission with verification-ready workspace state."],
+        });
+        await reviewWorkflow.provideFeedback({
+          sessionId: workSessionId,
+          submissionId: latest.id,
+          diffSha256: latest.diffSha256,
+          reviewEpoch: latest.reviewEpoch,
+          verdict: "changes_requested",
+          comments: `Automatic verification requires correction:\n${reasons.join("\n")}`,
+          requiredActions: workOrder.requiredActions,
+          reviewerId: "supervisor-runtime",
+        });
+      },
+      currentSubmission: (workSessionId) => {
+        const session = workSessions.get(workSessionId);
+        if (session?.status !== "awaiting_review") return undefined;
+        const submission = session.latestSubmission;
+        return submission?.id ? { id: submission.id, snapshotCommit: submission.snapshotCommit, reviewEpoch: submission.reviewEpoch } : undefined;
+      },
+      currentSessionStatus: (workSessionId) => workSessions.get(workSessionId)?.status,
+      currentApproval: (workSessionId) => {
+        const latest = workSessions.get(workSessionId)?.latestSubmission;
+        return missionLedger.canApprove(workSessionId, latest?.id ? { submissionId: latest.id, snapshotCommit: latest.snapshotCommit, reviewEpoch: latest.reviewEpoch } : {});
+      },
+      onApprove: async (workSessionId) => {
+        const session = workSessions.get(workSessionId);
+        const latest = session?.latestSubmission;
+        if (!session || !latest?.id) throw new Error("Cannot automatically approve without a current submission.");
+        const approval = missionLedger.canApprove(workSessionId, { submissionId: latest.id, snapshotCommit: latest.snapshotCommit, reviewEpoch: latest.reviewEpoch });
+        if (!approval.allowed) throw new Error(`Automatic approval blocked: ${approval.reasons.join("; ")}`);
+        await reviewWorkflow.provideFeedback({
+          sessionId: workSessionId,
+          submissionId: latest.id,
+          diffSha256: latest.diffSha256,
+          reviewEpoch: latest.reviewEpoch,
+          verdict: "approve",
+          comments: "Automatically approved after current trusted mission verification.",
+          reviewerId: "supervisor-runtime",
+          completionReportSha256: missionLedger.getCompletionReportHash(workSessionId, { submissionId: latest.id, snapshotCommit: latest.snapshotCommit, reviewEpoch: latest.reviewEpoch }),
+        });
+      },
+    });
+    supervisorRuntime.start();
   }
 
   let closed = false;
+  let draining: Promise<void> | undefined;
+  const closeTransport = async (transport: Transport): Promise<void> => {
+    try {
+      await Promise.race([
+        Promise.resolve(transport.close()),
+        new Promise<void>((resolve) => setTimeout(resolve, 2_000)),
+      ]);
+    } catch {
+      // A transport that rejects during drain is already unusable; continue
+      // closing the rest of the generation.
+    }
+  };
+  const finalizeClose = () => {
+    if (closed) return;
+    closed = true;
+    dispatcher?.stop();
+    supervisorRuntime?.stop();
+    supervisorRuns.close();
+    mcpAdmission.close();
+    clearInterval(mcpSessionReaper);
+    clearInterval(mcpMemorySampler);
+    clearInterval(mcpSessionChurnTimer);
+    clearInterval(maintenanceTimer);
+    clearInterval(databaseIntegrityTimer);
+    const shutdownAt = Date.now();
+    for (const state of mcpSessions.values()) {
+      state.closing = true;
+      recordMcpSessionEnd(state, "server_shutdown", shutdownAt);
+    }
+    for (const transport of transports.values()) void transport.close().catch(() => {});
+    transports.clear();
+    mcpSessions.clear();
+    eventStore.close();
+    continuationManager.close();
+    dispatchOutbox.close();
+    processSessions.shutdown();
+    oauthProvider?.close();
+    workspaceStore.close?.();
+    workSessions?.close?.();
+    agentRegistry.close();
+    try { db.close(); } catch { /* ignore */ }
+  };
   return {
     app,
     config,
     dispatcher,
-    close: () => {
+    close: finalizeClose,
+    drain: async () => {
       if (closed) return;
-      closed = true;
-      dispatcher?.stop();
-      eventStore.close();
-      continuationManager.close();
-      dispatchOutbox.close();
-      processSessions.shutdown();
-      oauthProvider?.close();
-      workspaceStore.close?.();
-      workSessions?.close?.();
-      agentRegistry.close();
-      db.close();
+      if (draining) return draining;
+      draining = (async () => {
+        // Reject new MCP admission first, then close transports so long polls
+        // are woken before the Node HTTP server waits for connection closure.
+        shuttingDown = true;
+        mcpAdmission.close();
+        const activeTransports = [...transports.values()];
+        for (const state of mcpSessions.values()) state.closing = true;
+        await Promise.all(activeTransports.map(closeTransport));
+        finalizeClose();
+      })();
+      return draining;
     },
   };
 }
@@ -2298,8 +3596,35 @@ async function isMainModule(): Promise<boolean> {
 }
 
 if (await isMainModule()) {
-  const { app, config, close } = createServer();
+  const { app, config, close, drain } = createServer();
+  const runtimeIdentity = createRuntimeIdentity(
+    config.stateDir,
+    readBuildIdentity(join(dirname(fileURLToPath(import.meta.url)), "build-meta.json")),
+  );
   const httpServer = app.listen(config.port, config.host, () => {
+    // P2 / P1 #51: Log build info at startup for dirty-deployment visibility.
+    // Prefer the embedded build meta (artifact identity); fall back to git working tree.
+    let commit = "unknown";
+    let dirty = false;
+    let dirtyFileCount = 0;
+    try {
+      const metaPath = join(dirname(fileURLToPath(import.meta.url)), "build-meta.json");
+      const meta = JSON.parse(readFileSync(metaPath, "utf8"));
+      commit = meta.gitSha ?? "unknown";
+      dirty = (meta.gitDirty ?? 0) > 0;
+      dirtyFileCount = meta.gitDirty ?? 0;
+      console.log(`[build] id=${meta.buildId ?? "dev"} version=${meta.version} sha=${commit} dirty=${dirtyFileCount} schema=${meta.schemaHash} built=${meta.buildTimestamp}`);
+    } catch {
+      try {
+        commit = execSync("git rev-parse HEAD 2>/dev/null || echo unknown", { encoding: "utf8" }).trim();
+        const status = execSync("git status --porcelain 2>/dev/null", { encoding: "utf8" }).trim();
+        if (status) {
+          dirty = true;
+          dirtyFileCount = status.split("\n").length;
+        }
+      } catch { /* ignore */ }
+    }
+
     console.log(
       `kontrol listening on http://${config.host}:${config.port}/mcp`,
     );
@@ -2313,13 +3638,47 @@ if (await isMainModule()) {
     console.log(`request logging: ${config.logging.requests ? "enabled" : "disabled"}`);
     console.log(`asset logging: ${config.logging.assets ? "enabled" : "disabled"}`);
     console.log(`trust proxy: ${config.logging.trustProxy ? "enabled" : "disabled"}`);
+    // P2: Build info for dirty-deployment visibility
+    console.log(`build commit: ${commit.slice(0, 8)} dirty: ${dirty ? `YES (${dirtyFileCount} files)` : "no"} built: ${new Date().toISOString()}`);
+  });
+  httpServer.once("error", (error) => {
+    removeRuntimeIdentity(config.stateDir, runtimeIdentity.instanceId);
+    close();
+    console.error(`kontrol failed to listen on ${config.host}:${config.port}: ${error instanceof Error ? error.message : String(error)}`);
+    process.exitCode = 1;
   });
 
-  const shutdown = () => {
-    httpServer.close(() => {
+  let shutdownStarted = false;
+  const shutdown = async () => {
+    if (shutdownStarted) return;
+    shutdownStarted = true;
+    try {
+      await drain();
+      await new Promise<void>((resolve) => {
+        let settled = false;
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          resolve();
+        };
+        const deadline = setTimeout(() => {
+          httpServer.closeAllConnections?.();
+          finish();
+        }, 5_000);
+        httpServer.close(() => {
+          clearTimeout(deadline);
+          finish();
+        });
+      });
       close();
+      removeRuntimeIdentity(config.stateDir, runtimeIdentity.instanceId);
       process.exit(0);
-    });
+    } catch (error) {
+      console.error(`kontrol graceful shutdown failed: ${error instanceof Error ? error.message : String(error)}`);
+      close();
+      removeRuntimeIdentity(config.stateDir, runtimeIdentity.instanceId);
+      process.exit(1);
+    }
   };
   process.once("SIGINT", shutdown);
   process.once("SIGTERM", shutdown);

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, asc, eq, lt, lte, or } from "drizzle-orm";
+import { and, asc, eq, inArray, lt, lte, or } from "drizzle-orm";
 import { openDatabase, type DatabaseHandle } from "./db/client.js";
 import { dispatchOutbox, type DispatchOutboxRow } from "./db/schema.js";
 
@@ -34,7 +34,7 @@ export interface DispatchOutbox {
   }): DispatchOutboxEvent;
 
   /** Atomically claim the next available event for this worker. CAS on status. */
-  claimNext(workerId: string, leaseMs: number): DispatchOutboxEvent | null;
+  claimNext(workerId: string, leaseMs: number, eventTypes?: string[]): DispatchOutboxEvent | null;
 
   /** Reap expired claims back to pending. Returns count requeued. */
   reapExpiredClaims(leaseMs: number): number;
@@ -45,6 +45,9 @@ export interface DispatchOutbox {
   markCompleted(id: string): void;
 
   markFailed(id: string, error: string, retryDelayMs: number): void;
+
+  get(id: string): DispatchOutboxEvent | undefined;
+  listByAggregate(aggregateId: string): DispatchOutboxEvent[];
 
   listPending(limit?: number): DispatchOutboxEvent[];
 
@@ -104,14 +107,14 @@ export function createDispatchOutbox(
     };
   }
 
-  function claimNext(workerId: string, leaseMs: number): DispatchOutboxEvent | null {
+  function claimNext(workerId: string, leaseMs: number, eventTypes?: string[]): DispatchOutboxEvent | null {
     const now = new Date().toISOString();
     const claimExpiresAt = new Date(Date.now() + leaseMs).toISOString();
 
     const candidate = database.db
       .select()
       .from(dispatchOutbox)
-      .where(and(eq(dispatchOutbox.status, "pending"), lte(dispatchOutbox.availableAt, now)))
+      .where(and(eq(dispatchOutbox.status, "pending"), lte(dispatchOutbox.availableAt, now), ...(eventTypes?.length ? [inArray(dispatchOutbox.eventType, eventTypes)] : [])))
       .orderBy(asc(dispatchOutbox.availableAt))
       .limit(1)
       .get();
@@ -150,6 +153,15 @@ export function createDispatchOutbox(
         .run();
     }
     return rows.length;
+  }
+
+  function get(id: string): DispatchOutboxEvent | undefined {
+    const value = database.db.select().from(dispatchOutbox).where(eq(dispatchOutbox.id, id)).get();
+    return value ? rowToEvent(value) : undefined;
+  }
+
+  function listByAggregate(aggregateId: string): DispatchOutboxEvent[] {
+    return database.db.select().from(dispatchOutbox).where(eq(dispatchOutbox.aggregateId, aggregateId)).orderBy(asc(dispatchOutbox.createdAt)).all().map(rowToEvent);
   }
 
   function release(id: string, retryDelayMs = 0, note?: string): void {
@@ -275,9 +287,8 @@ export function createDispatchOutbox(
     return row ? rowToEvent(row) : null;
   }
 
-  function close(): void {
-    database.close();
-  }
+  // P1 #11: DB owned by server
+  function close(): void { }
 
   return {
     enqueue,
@@ -286,6 +297,8 @@ export function createDispatchOutbox(
     release,
     markCompleted,
     markFailed,
+    get,
+    listByAggregate,
     listPending,
     hasActive,
     hasLogical,

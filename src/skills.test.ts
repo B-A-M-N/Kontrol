@@ -158,7 +158,7 @@ try {
     PORT: "1",
   });
   assert.equal(
-    effectiveSkillPaths(duplicateConfig, projectRoot).filter((path) => path === projectAgentsSkills).length,
+    effectiveSkillPaths(duplicateConfig, projectRoot).projectLocal.filter((path: string) => path === projectAgentsSkills).length,
     1,
   );
 

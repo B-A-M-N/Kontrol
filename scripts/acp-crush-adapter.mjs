@@ -259,8 +259,8 @@ async function handleRunRequest(req, res, body) {
     }
     run.remoteRunId = "smoke_" + randomUUID().slice(0, 8);
     run.stdout = "KONTROL_ADAPTER_SMOKE_OK";
+    run.finalized = true; // P1 #14: smoke never reports lifecycle events
     console.log(`[run ${run.remoteRunId}] synthetic smoke accepted cwd=${run.workspaceRoot} bin=${resolveAgentBin()}`);
-    setTimeout(() => finalizeRun(run, "completed"), 10);
     return writeJson(res, 202, {
       run_id: run.remoteRunId,
       remote_run_id: run.remoteRunId,

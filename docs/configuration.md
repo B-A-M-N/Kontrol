@@ -37,9 +37,70 @@ kontrol config set publicBaseUrl https://kontrol.example.com
 | `KONTROL_ALLOWED_HOSTS` | Optional Host header allowlist override. |
 | `KONTROL_OAUTH_OWNER_TOKEN` | Owner password for OAuth approval. Must be at least 16 characters. |
 | `KONTROL_AUTH_MODE` | MCP auth mode: `oauth` (default) or `tunnel`. |
-| `KONTROL_TUNNEL_TOKEN` | Optional bearer token for `tunnel` mode. When set, the OpenAI tunnel hop must present `Authorization: Bearer <token>` on every `/mcp` call. Set via `--mcp.extra-headers` on the tunnel-client. Leave unset for no-token tunnel mode. |
+| `KONTROL_TUNNEL_TOKEN` | Legacy compatibility variable. Ignored in tunnel mode; do not forward it as an MCP header. Authentication belongs to the Secure MCP Tunnel. |
+| `KONTROL_TUNNEL_PROFILE` | tunnel-client profile name used by the managed launcher. Defaults to `sample_mcp_with_dcr`. |
+| `KONTROL_TUNNEL_ID` | Optional explicit tunnel registration ID passed to tunnel-client, overriding the profile’s ID. Use this after creating/rebinding a tunnel. |
+| `KONTROL_TUNNEL_DOCTOR` | Run `tunnel-client doctor` with the effective runtime profile/ID before launch. Defaults to `true`; it uses an ephemeral health port. |
+| `KONTROL_ACP_AGENTS` | Required worker registrations as `name=url,name=url`; the managed launcher derives its adapter URLs for the current generation. |
+| `KONTROL_DIAGNOSTICS_SECRET` | Header-only credential for loopback `/diagnostics`; when unset, diagnostics are disabled. |
+| `KONTROL_MCP_MAX_INFLIGHT` | Global concurrent MCP request limit. Defaults to `32`. |
+| `KONTROL_MCP_MAX_INFLIGHT_PER_SESSION` | Per-session concurrent MCP request limit. Defaults to `8`. |
+| `KONTROL_MCP_MAX_QUEUE` | Maximum queued MCP requests waiting for admission. Defaults to `128`. |
+| `KONTROL_MCP_REQUEST_DEADLINE_MS` | Maximum time a request waits for admission. Defaults to `120000`. |
+| `KONTROL_MCP_UNUSED_SESSION_IDLE_MS` | Idle TTL for initialized sessions with no tool calls. Defaults to `120000`, allowing model-side setup time. |
+| `KONTROL_MCP_EPHEMERAL_SESSION_IDLE_MS` | Grace TTL for non-worker sessions with exactly one tool call. Defaults to `300000`; one completed tool call does not mean the model is finished. |
+| `KONTROL_MCP_REUSABLE_SESSION_IDLE_MS` | Idle TTL for reusable or multi-tool sessions. Defaults to `900000`. |
+| `KONTROL_MCP_SESSION_REAPER_INTERVAL_MS` | Session reaper interval. Defaults to `15000`. |
+| `KONTROL_MCP_SESSION_MAX_PER_CLIENT` | Per-logical-client session cap. Defaults to `20`. |
+| `KONTROL_MCP_SESSION_SOFT_CAP` | Global session soft cap for LRU pressure cleanup. Defaults to `150`. |
+| `KONTROL_MCP_SESSION_HARD_CAP` | Global session admission hard cap. Defaults to `200`. |
 | `KONTROL_WORKTREE_ROOT` | Directory for managed Git worktrees. Defaults to `~/.kontrol/worktrees`. |
 | `KONTROL_STATE_DIR` | Directory for SQLite state. Defaults to `~/.local/share/kontrol`. |
+| `KONTROL_SUPERVISOR_INTERVAL_MS` | Probe interval for the managed component supervisor. Defaults to `5000`. |
+| `KONTROL_OPERATIONAL_UAT` | Set `true` to run the disposable real-agent startup UAT. Defaults to `false`. |
+| `KONTROL_RELEASE_MODE` | Set `true` to refuse dirty source trees unless `KONTROL_ALLOW_DIRTY_RELEASE=true`. |
+| `KONTROL_HARPOON_INCLUDE_LOOPBACK` | Passed to tunnel-client; defaults to `false` so Harpoon does not auto-register KONTROL's local HTTP OAuth metadata URLs. |
+
+MCP transports are isolated by their `mcp-session-id`. The logical client label
+(for example `mcp:openai-mcp@1.0.0`) is aggregate telemetry only and is never a
+transport-pooling or authorization key. If an upstream explicitly forwards a
+conversation identifier, diagnostics label the transport with it and reject a
+later explicit mismatch. Durable workspace, review, continuation, and mission
+identity comes from their explicit IDs, so separate conversations can use
+Kontrol concurrently against the same project without sharing transport
+context.
+
+## Liveness And Readiness
+
+`GET /healthz` only proves that KONTROL is serving HTTP and returns the
+immutable build identity (`buildId`, commit, dirty state, schema hash, and
+build timestamp). During startup, `GET /core-readyz` checks KONTROL's own
+database, MCP, workspace, review, ACP, and runtime-build infrastructure before
+adapters register. `GET /readyz` is the fail-closed operational check: it also
+requires every configured worker agent to be alive at its expected URL and
+returns HTTP 503 while any required check is unavailable.
+
+Readiness uses a cheap database probe and a cached integrity result. The full
+SQLite `quick_check` runs in background maintenance rather than blocking every
+readiness request. The managed checkout launcher starts a persistent supervisor
+after readiness; its state is written to
+`$KONTROL_STATE_DIR/supervisor-status.json` and includes failure counts,
+restart counts, and the last external probe result.
+
+When diagnostics are enabled, access `/diagnostics` from loopback with the
+`X-Kontrol-Diagnostics` header. Credentials in query strings are not accepted.
+
+The managed tunnel launcher keeps OAuth protected-resource discovery enabled but
+disables Harpoon loopback auto-registration by default. Set
+`KONTROL_HARPOON_INCLUDE_LOOPBACK=true` only when a separate Harpoon use case
+requires private loopback targets and the corresponding HTTPS configuration is
+available.
+
+The checkout launcher calls `scripts/probe-kontrol-readiness.mjs` after the
+adapters register. That probe performs a real MCP initialize, discovers the
+registered agents, opens the configured workspace, reads `package.json`, and
+runs `pwd`; it also verifies that the listening build ID equals the build just
+produced.
 
 ## OAuth
 
@@ -82,11 +143,9 @@ Requirements:
 - `HOST` must be a loopback address (`127.0.0.1`, `::1`, or `localhost`). Binding
   to a non-loopback interface is rejected at startup — tunnel mode must only be
   reachable through the tunnel, never directly from the network.
-- By default no per-call credential is required on `/mcp` (the OpenAI tunnel +
-  workspace identity is the access boundary). For defense-in-depth, set
-  `KONTROL_TUNNEL_TOKEN` (≥16 chars) and inject it from tunnel-client with:
-  `--mcp.extra-headers "Authorization: Bearer $KONTROL_TUNNEL_TOKEN"`. The token
-  is compared with a constant-time check and is never logged.
+- No per-call credential is required on `/mcp`: the OpenAI tunnel + workspace
+  identity is the access boundary. Kontrol deliberately does not forward or
+  validate a second `Authorization` header in this mode.
 
 Example:
 

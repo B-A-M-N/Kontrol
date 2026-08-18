@@ -114,6 +114,19 @@ try {
     assert.ok(acquired.acquired, "initial lease acquisition should succeed");
     const originalExpiry = acquired.lease.expiresAt;
 
+    // Re-acquisition rotates the fencing token. An old worker may no longer
+    // extend the lease after another owner generation has taken over.
+    const reacquired = workSessions.acquireWorkspaceLease({
+      canonicalRoot: "/tmp/checkout-a",
+      workspaceSessionId: "ws_1",
+      workSessionId: workspace.id,
+      ttlMs: 50,
+    });
+    assert.ok(reacquired.acquired);
+    assert.notEqual(reacquired.lease.leaseNonce, acquired.lease.leaseNonce, "lease generations use distinct fencing tokens");
+    assert.equal(workSessions.renewWorkspaceLeaseForSession(workspace.id, 60 * 60 * 1000, acquired.lease.leaseNonce), 0, "stale fencing token cannot renew");
+    assert.equal(workSessions.renewWorkspaceLeaseForSession(workspace.id, 60 * 60 * 1000, reacquired.lease.leaseNonce), 1, "current fencing token renews");
+
     // Renew from a "heartbeat" with a long TTL — expiry must move forward.
     const renewed = workSessions.renewWorkspaceLeaseForSession(workspace.id, 60 * 60 * 1000);
     assert.equal(renewed, 1, "renewal should touch exactly the one owned lease");
@@ -146,8 +159,8 @@ try {
     db.close();
   }
 
-  // --- WebUI rehydration: listActiveWorkSessions returns every non-terminal
-  //     session (not just awaiting_review) and excludes terminal ones. ---
+  // --- WebUI rehydration: listActiveWorkSessions returns only live worker
+  //     states. Awaiting-review and detached work use dedicated recovery lists. ---
   {
     const db = openDatabase(join(root, "active"));
     const workSessions = createWorkSessionManager(db);
@@ -183,20 +196,20 @@ try {
     const active = workSessions.listActiveWorkSessions("ws_a");
     const activeIds = new Set(active.map((s) => s.id));
 
-    for (const [key] of live) {
+    for (const [key] of live.slice(0, 2)) {
       assert.ok(
         activeIds.has(ids.get(key)!),
         `listActiveWorkSessions must include live status '${key}'`,
       );
     }
-    for (const [key] of terminal) {
+    for (const [key] of [...live.slice(2), ...terminal]) {
       assert.equal(
         activeIds.has(ids.get(key)!),
         false,
-        `listActiveWorkSessions must exclude terminal status '${key}'`,
+        `listActiveWorkSessions must exclude non-live status '${key}'`,
       );
     }
-    assert.equal(active.length, live.length, "only the 4 live sessions should be returned");
+    assert.equal(active.length, 2, "only the 2 live worker sessions should be returned");
 
     // Workspace scoping: a session in another workspace is not returned.
     db.sqlite

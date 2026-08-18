@@ -201,6 +201,11 @@ async function resolveConfinedPath(root: string, input: string): Promise<string>
     throw patchError(`path escapes the workspace: ${input}`);
   }
 
+  // Reject symlink traversal even when the link points back inside the root.
+  // This keeps validation and the later write/rename on the same filesystem
+  // identity and avoids a check-then-follow escape.
+  await rejectSymlinkComponents(target);
+
   let existing = target;
   while (true) {
     try {
@@ -219,6 +224,22 @@ async function resolveConfinedPath(root: string, input: string): Promise<string>
   }
 
   return target;
+}
+
+async function rejectSymlinkComponents(absolutePath: string): Promise<void> {
+  const components = absolutePath.split(absolutePath.includes("\\") ? "\\" : "/").filter(Boolean);
+  let current = absolutePath.startsWith("/") ? "/" : "";
+  for (const component of components) {
+    current = resolve(current || ".", component);
+    try {
+      const metadata = await lstat(current);
+      if (metadata.isSymbolicLink()) throw patchError(`symlink path components are not permitted: ${absolutePath}`);
+      if (!metadata.isDirectory() && current !== absolutePath) throw patchError(`path component is not a directory: ${current}`);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw error;
+    }
+  }
 }
 
 function splitFile(content: string): { lines: string[]; eol: string; finalNewline: boolean } {
@@ -397,16 +418,31 @@ export async function applyPatch(root: string, patch: string): Promise<ApplyPatc
   }
 
   for (const [absolute, file] of staged) {
-    if (file) await writeTextFile(absolute, file.content, file.mode);
+    if (file) {
+      await revalidateConfinedDestination(root, absolute);
+      await writeTextFile(absolute, file.content, file.mode);
+    }
   }
 
   for (const [absolute, file] of staged) {
-    if (!file) await rm(absolute, { force: true });
+    if (!file) {
+      await revalidateConfinedDestination(root, absolute);
+      await rm(absolute, { force: true });
+    }
   }
 
   const unifiedPatch = patches.filter(Boolean).join("\n");
   const stats = countPatchStats(unifiedPatch);
   return { files: results, patch: unifiedPatch, ...stats };
+}
+
+async function revalidateConfinedDestination(root: string, destination: string): Promise<void> {
+  const canonicalRoot = await realpath(root);
+  const relativePath = relative(canonicalRoot, destination);
+  if (relativePath.startsWith("..") || isAbsolute(relativePath)) {
+    throw patchError(`path escapes the workspace: ${destination}`);
+  }
+  await resolveConfinedPath(root, relativePath);
 }
 
 async function readOptionalTextFile(absolute: string, displayPath: string): Promise<TextFile | null> {

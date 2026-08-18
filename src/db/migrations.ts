@@ -1,4 +1,6 @@
 import type Database from "better-sqlite3";
+import { createHash } from "node:crypto";
+import { realpathSync } from "node:fs";
 
 interface Migration {
   version: number;
@@ -29,7 +31,189 @@ const migrations: Migration[] = [
   { version: 20, name: "dispatch-outbox-logical-key", up: migrateDispatchOutboxLogicalKey },
   { version: 21, name: "dispatch-outbox-failure-count", up: migrateDispatchOutboxFailureCount },
   { version: 22, name: "agent-messages", up: migrateAgentMessages },
+  { version: 23, name: "supervisor-runs", up: migrateSupervisorRuns },
+  { version: 24, name: "supervisor-run-pause", up: migrateSupervisorRunPause },
+  { version: 25, name: "mission-completion-reports", up: migrateMissionCompletionReports },
+  { version: 26, name: "supervisor-convergence-fingerprint", up: migrateSupervisorConvergenceFingerprint },
+  { version: 27, name: "mission-criterion-dependencies", up: migrateMissionCriterionDependencies },
+  { version: 28, name: "supervisor-run-deadline", up: migrateSupervisorRunDeadline },
+  { version: 29, name: "feedback-completion-report-binding", up: migrateFeedbackCompletionReportBinding },
+  { version: 30, name: "verification-lease-identity", up: migrateVerificationLeaseIdentity },
+  { version: 31, name: "supervisor-lease-fencing", up: migrateSupervisorLeaseFencing },
+  { version: 32, name: "workspace-project-identity", up: migrateWorkspaceProjectIdentity },
 ];
+
+function migrateSupervisorRuns(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table if not exists supervisor_runs (
+      id text primary key,
+      mission_id text not null unique,
+      work_session_id text not null unique,
+      workspace_session_id text not null,
+      status text not null default 'created',
+      revision integer not null default 1,
+      cycle_number integer not null default 0,
+      max_cycles integer not null default 10,
+      owner_instance_id text,
+      lease_expires_at text,
+      heartbeat_at text,
+      last_processed_event_seq integer not null default 0,
+      last_submission_id text,
+      last_snapshot_commit text,
+      next_action_at text,
+      failure_count integer not null default 0,
+      last_error text,
+      autonomy_mode text not null default 'manual',
+      approval_mode text not null default 'human_required',
+      created_at text not null,
+      updated_at text not null,
+      foreign key (mission_id) references mission_contracts(id) on delete cascade,
+      foreign key (work_session_id) references work_sessions(id) on delete cascade,
+      foreign key (workspace_session_id) references workspace_sessions(id) on delete cascade
+    );
+    create index if not exists supervisor_runs_status_next_idx on supervisor_runs(status, next_action_at);
+    create index if not exists supervisor_runs_lease_idx on supervisor_runs(lease_expires_at);
+  `);
+}
+
+function migrateSupervisorLeaseFencing(sqlite: Database.Database): void {
+  const columns = sqlite.prepare("pragma table_info(supervisor_runs)").all() as Array<{ name: string }>;
+  if (!columns.some((column) => column.name === "lease_nonce")) {
+    sqlite.exec("alter table supervisor_runs add column lease_nonce text");
+  }
+  sqlite.exec("create index if not exists supervisor_runs_lease_nonce_idx on supervisor_runs(owner_instance_id, lease_nonce)");
+}
+
+// A workspace session is an opening/worktree instance, not the durable
+// project identity. Backfill one project row for every canonical checkout
+// root and attach historical workspace/work-session rows without deleting or
+// merging their instance identities.
+function migrateWorkspaceProjectIdentity(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table if not exists workspace_projects (
+      id text primary key,
+      canonical_root text not null unique,
+      created_at text not null,
+      last_used_at text not null
+    );
+    create index if not exists workspace_projects_last_used_idx
+      on workspace_projects(last_used_at desc);
+  `);
+  addColumnIfMissing(sqlite, "workspace_sessions", "project_id", "text");
+  addColumnIfMissing(sqlite, "work_sessions", "project_id", "text");
+  addColumnIfMissing(sqlite, "work_sessions", "runtime_state", "text not null default 'pending'");
+  addColumnIfMissing(sqlite, "work_sessions", "runtime_classified_at", "text");
+
+  const rows = sqlite.prepare("select id, root, mode, source_root, created_at, last_used_at from workspace_sessions").all() as Array<{
+    id: string;
+    root: string;
+    mode: string;
+    source_root?: string | null;
+    created_at: string;
+    last_used_at: string;
+  }>;
+  const projectByRoot = new Map<string, string>();
+  const projectIdForRoot = (rawRoot: string): string => {
+    let canonicalRoot = rawRoot;
+    try { canonicalRoot = realpathSync(rawRoot); } catch { /* preserve historical path */ }
+    const existing = projectByRoot.get(canonicalRoot);
+    if (existing) return existing;
+    const id = `project_${createHash("sha256").update(canonicalRoot).digest("hex").slice(0, 24)}`;
+    const timestamps = rows.filter((row) => {
+      const candidate = row.mode === "worktree" && row.source_root ? row.source_root : row.root;
+      let resolved = candidate;
+      try { resolved = realpathSync(candidate); } catch { /* preserve historical path */ }
+      return resolved === canonicalRoot;
+    });
+    const createdAt = timestamps.map((row) => row.created_at).sort()[0] ?? new Date().toISOString();
+    const lastUsedAt = timestamps.map((row) => row.last_used_at).sort().at(-1) ?? createdAt;
+    sqlite.prepare("insert or ignore into workspace_projects (id, canonical_root, created_at, last_used_at) values (?, ?, ?, ?)").run(id, canonicalRoot, createdAt, lastUsedAt);
+    projectByRoot.set(canonicalRoot, id);
+    return id;
+  };
+
+  for (const row of rows) {
+    const projectRoot = row.mode === "worktree" && row.source_root ? row.source_root : row.root;
+    const projectId = projectIdForRoot(projectRoot);
+    sqlite.prepare("update workspace_sessions set project_id = ? where id = ?").run(projectId, row.id);
+  }
+  sqlite.exec(`
+    update work_sessions
+       set project_id = (select project_id from workspace_sessions where workspace_sessions.id = work_sessions.workspace_session_id)
+     where project_id is null;
+    create index if not exists workspace_sessions_project_idx
+      on workspace_sessions(project_id, last_used_at desc);
+    create index if not exists work_sessions_project_idx
+      on work_sessions(project_id, updated_at desc);
+    create index if not exists work_sessions_runtime_state_idx
+      on work_sessions(runtime_state, updated_at desc);
+  `);
+}
+
+function migrateSupervisorRunPause(sqlite: Database.Database): void {
+  const columns = sqlite.prepare("pragma table_info(supervisor_runs)").all() as Array<{ name: string }>;
+  if (!columns.some((column) => column.name === "resume_status")) {
+    sqlite.exec("alter table supervisor_runs add column resume_status text");
+  }
+}
+
+function migrateMissionCompletionReports(sqlite: Database.Database): void {
+  const columns = sqlite.prepare("pragma table_info(mission_contracts)").all() as Array<{ name: string }>;
+  if (!columns.some((column) => column.name === "final_verification_json")) {
+    sqlite.exec("alter table mission_contracts add column final_verification_json text not null default '[]'");
+  }
+  sqlite.exec(`
+    create table if not exists mission_completion_reports (
+      id text primary key,
+      mission_id text not null,
+      submission_id text not null,
+      snapshot_commit text not null,
+      status text not null,
+      results_json text not null,
+      report_sha256 text not null,
+      created_at text not null,
+      foreign key (mission_id) references mission_contracts(id) on delete cascade
+    );
+    create index if not exists mission_completion_reports_current_idx
+      on mission_completion_reports(mission_id, submission_id, snapshot_commit, created_at desc);
+  `);
+}
+
+function migrateSupervisorConvergenceFingerprint(sqlite: Database.Database): void {
+  const columns = sqlite.prepare("pragma table_info(supervisor_runs)").all() as Array<{ name: string }>;
+  if (!columns.some((column) => column.name === "last_failure_fingerprint")) sqlite.exec("alter table supervisor_runs add column last_failure_fingerprint text");
+  if (!columns.some((column) => column.name === "repeated_failure_count")) sqlite.exec("alter table supervisor_runs add column repeated_failure_count integer not null default 0");
+}
+
+function migrateMissionCriterionDependencies(sqlite: Database.Database): void {
+  const columns = sqlite.prepare("pragma table_info(mission_acceptance_criteria)").all() as Array<{ name: string }>;
+  if (!columns.some((column) => column.name === "depends_on_json")) sqlite.exec("alter table mission_acceptance_criteria add column depends_on_json text not null default '[]'");
+}
+
+function migrateSupervisorRunDeadline(sqlite: Database.Database): void {
+  const columns = sqlite.prepare("pragma table_info(supervisor_runs)").all() as Array<{ name: string }>;
+  if (!columns.some((column) => column.name === "deadline_at")) sqlite.exec("alter table supervisor_runs add column deadline_at text");
+}
+
+function migrateFeedbackCompletionReportBinding(sqlite: Database.Database): void {
+  const columns = sqlite.prepare("pragma table_info(work_session_feedback)").all() as Array<{ name: string }>;
+  if (!columns.some((column) => column.name === "completion_report_sha256")) sqlite.exec("alter table work_session_feedback add column completion_report_sha256 text");
+}
+
+function migrateVerificationLeaseIdentity(sqlite: Database.Database): void {
+  const leaseColumns = (sqlite.prepare("pragma table_info(workspace_leases)").all() as Array<{ name: string }>).map((column) => column.name);
+  if (!leaseColumns.includes("lease_nonce")) {
+    sqlite.exec("alter table workspace_leases add column lease_nonce text not null default 'legacy'");
+  }
+  const evidenceColumns = (sqlite.prepare("pragma table_info(mission_evidence)").all() as Array<{ name: string }>).map((column) => column.name);
+  if (!evidenceColumns.includes("review_epoch")) {
+    sqlite.exec("alter table mission_evidence add column review_epoch integer");
+  }
+  if (!evidenceColumns.includes("lease_nonce")) {
+    sqlite.exec("alter table mission_evidence add column lease_nonce text");
+  }
+  sqlite.exec("create index if not exists mission_evidence_binding_idx on mission_evidence(submission_id, review_epoch, snapshot_commit, lease_nonce)");
+}
 
 /**
  * Anti-runaway loop guard. A reviewer may extend a running loop when it finds
