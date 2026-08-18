@@ -59,3 +59,15 @@ Core constraints:
   open-ended autonomous loops.
 - Keep delegated work bounded by mission criteria, review checkpoints,
   continuation records, and human approval.
+
+MCP context isolation:
+
+- Treat each MCP transport session as an isolated conversation context. Never
+  pool or reuse a transport because clients share a logical name such as
+  `mcp:openai-mcp@1.0.0`.
+- Preserve the MCP session identity and any explicit upstream conversation
+  correlation in diagnostics and event telemetry. Reject an explicit
+  conversation-context mismatch on an existing transport.
+- Link workspaces, reviews, continuations, and missions through their explicit
+  durable IDs. Do not infer that separate MCP transports represent the same
+  conversation, even when they access the same project concurrently.

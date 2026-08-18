@@ -869,6 +869,18 @@ export function createAcpServer(
       additions: review.summary.additions,
       removals: review.summary.removals,
     });
+    // The native path can return immediately after a continuation. Defend
+    // against a stale `changes_requested` status surviving that resubmission:
+    // a fresh pending submission is authoritative. Do not overwrite feedback
+    // that has already been committed for this exact new submission.
+    const postSubmit = workSessions.get(workSessionId);
+    if (
+      postSubmit?.latestSubmission?.id === submitted.submissionId
+      && postSubmit.status !== "awaiting_review"
+      && postSubmit.latestFeedback?.submissionId !== submitted.submissionId
+    ) {
+      workSessions.updateStatus(workSessionId, "awaiting_review");
+    }
     await reviewCheckpoints.commitReviewed({
       workspaceId: session.workspaceSessionId,
       root,
@@ -925,7 +937,10 @@ export function createAcpServer(
         });
         break;
       case "changes_requested":
-        // A continuation is already queued; keep it resumable, not terminal.
+        // Native ACP continuations also return as bounded turns. Capture their
+        // new exact snapshot before leaving changes_requested; otherwise a
+        // successful Hermes correction can never re-enter verification.
+        if (await submitReviewBarrierForCompletedTurn(runId, workSessionId)) break;
         agentRegistry.updateRun(runId, { status: "changes_requested", finishedAt: new Date().toISOString() });
         break;
       case "in_progress":
@@ -1091,7 +1106,8 @@ export function createAcpServer(
     // would let its checkout lease lapse and another session could seize the
     // checkout out from under it. Renewal is ownership-scoped and never seizes.
     if ((body.type === "started" || body.type === "heartbeat") && sessionId) {
-      workSessions.renewWorkspaceLeaseForSession(sessionId);
+      const lease = workSessions.getWorkspaceLeaseForSession(sessionId);
+      workSessions.renewWorkspaceLeaseForSession(sessionId, undefined, lease?.leaseNonce);
     }
 
     // Defect #1: a worker CRASH while the review is still open must not emit the

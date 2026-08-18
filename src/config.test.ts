@@ -11,7 +11,7 @@ const baseEnv = {
   KONTROL_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
 };
 
-assert.equal(loadConfig(baseEnv).widgets, "full");
+assert.equal(loadConfig(baseEnv).widgets, "changes");
 assert.equal(loadConfig({ ...baseEnv, KONTROL_WIDGETS: "changes" }).widgets, "changes");
 assert.equal(loadConfig({ ...baseEnv, KONTROL_WIDGETS: "full" }).widgets, "full");
 assert.equal(loadConfig({ ...baseEnv, KONTROL_WIDGETS: "off" }).widgets, "off");
@@ -22,6 +22,14 @@ assert.equal(loadConfig({ ...baseEnv, KONTROL_TOOL_MODE: "codex" }).toolMode, "c
 assert.equal(loadConfig({ ...baseEnv, KONTROL_MINIMAL_TOOLS: "0" }).toolMode, "full");
 assert.equal(loadConfig({ ...baseEnv, KONTROL_MINIMAL_TOOLS: "1" }).toolMode, "minimal");
 assert.equal(loadConfig(baseEnv).skillsEnabled, true);
+assert.equal(loadConfig(baseEnv).mcpUnusedSessionIdleMs, 120_000);
+assert.equal(loadConfig(baseEnv).mcpEphemeralSessionIdleMs, 300_000);
+assert.equal(loadConfig(baseEnv).mcpReusableSessionIdleMs, 900_000);
+assert.equal(loadConfig(baseEnv).mcpSessionReaperIntervalMs, 15_000);
+assert.equal(loadConfig(baseEnv).mcpSessionMaxPerClient, 20);
+assert.equal(loadConfig(baseEnv).mcpSessionSoftCap, 150);
+assert.equal(loadConfig(baseEnv).mcpSessionHardCap, 200);
+assert.equal(loadConfig({ ...baseEnv, KONTROL_MCP_EPHEMERAL_SESSION_IDLE_MS: "1234" }).mcpEphemeralSessionIdleMs, 1234);
 assert.equal(loadConfig({ ...baseEnv, KONTROL_SKILLS: "0" }).skillsEnabled, false);
 assert.equal(loadConfig({ ...baseEnv, KONTROL_SKILLS: "1" }).skillsEnabled, true);
 

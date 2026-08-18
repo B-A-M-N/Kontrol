@@ -140,7 +140,9 @@ async def main() -> int:
     acp.connect_to_agent = connect_to_agent_with_kontrol_client
 
     def on_event(event: TaskEvent) -> None:
-        emit({"type": "event", "eventType": event.event_type, "data": event.data})
+        event_type = event.event_type
+        data = event.data or {}
+        emit({"type": "event", "eventType": event_type, "data": data})
 
     def on_raw_event(event: StreamEvent) -> None:
         if event.direction != StreamDirection.INCOMING:
@@ -150,6 +152,10 @@ async def main() -> int:
             return
         method = message.get("method")
         if method == "session/update" and "id" not in message:
+            note_activity()
+            update = message.get("params", {}).get("update", {})
+            if isinstance(update, dict):
+                update_type = str(update.get("sessionUpdate") or update.get("type") or "")
             emit({"type": "raw_update", "params": message.get("params", {})})
         elif isinstance(method, str) and method.startswith("session/"):
             emit({"type": "raw_request", "method": method, "params": message.get("params", {})})
@@ -175,12 +181,22 @@ async def main() -> int:
                 client._conn._conn.add_observer(on_raw_event)  # type: ignore[attr-defined]
             except Exception as exc:
                 emit({"type": "event", "eventType": "warning", "data": {"message": f"failed to attach raw ACP observer: {exc}"}})
-            result = await client.dispatch_task(
+            task = asyncio.create_task(client.dispatch_task(
                 prompt=str(spec.get("task") or ""),
                 task_id=str(spec.get("runId") or ""),
                 timeout=timeout,
                 cwd=cwd,
-            )
+            ))
+            # Completion is owned by the ACP task result.  Wall-clock silence
+            # is not a protocol event: Hermes may be running a long test,
+            # waiting for permission/review, or processing a large tool result.
+            # In particular, never cancel the task and synthesize success from
+            # an idle timer.  The outer timeout remains a failure boundary in
+            # ACPClient, not a successful turn.
+            while not task.done():
+                await asyncio.sleep(0.5)
+            else:
+                result = task.result()
     except Exception as exc:
         emit({"type": "error", "error": str(exc)})
         return 1

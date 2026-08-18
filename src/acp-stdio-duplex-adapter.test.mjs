@@ -20,7 +20,7 @@ assert.ok(
   pkg.files.includes("scripts/acp-stdio-duplex-adapter.mjs"),
   "stdio duplex adapter is included in the published package",
 );
-assert.match(pkg.scripts.test, /acp-stdio-duplex-adapter\.mjs/);
-assert.match(pkg.scripts.test, /acp-stdio-duplex-adapter\.test\.mjs/);
+assert.match(pkg.scripts["test:runtime"], /acp-stdio-duplex-adapter\.mjs/);
+assert.match(pkg.scripts["test:runtime"], /acp-stdio-duplex-adapter\.test\.mjs/);
 
 console.log("acp-stdio-duplex-adapter.test.mjs: all assertions passed");

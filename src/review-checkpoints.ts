@@ -1,6 +1,6 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { git, getGitEligibility, safeWorkspaceRefSegment } from "./git.js";
 
 export type ReviewSince = "last_shown" | "last_review" | "workspace_open" | "work_session";
@@ -31,10 +31,21 @@ export interface ReviewChangesResult {
 interface WorkspaceReviewState {
   root: string;
   gitRoot?: string;
+  workspaceRelativePath?: string;
   openRef: string;
   presentationRef: string;
   legacyBaselineRef: string;
   diagnostic?: string;
+}
+
+/**
+ * P0 #4: Single-flight, awaitable initialization. The state object exists
+ * immediately (so the workspace is visible), but the `initialization` promise
+ * must be awaited before any review operation can proceed. This eliminates
+ * the race where reviewChanges() could run against a half-initialized state.
+ */
+interface WorkspaceReviewStateWithInit extends WorkspaceReviewState {
+  initialization: Promise<void>;
 }
 
 export interface ReviewCheckpointManager {
@@ -63,37 +74,68 @@ export interface ReviewCheckpointManager {
 const REVIEW_REF_PREFIX = "refs/kontrol/review";
 
 export function createReviewCheckpointManager(): ReviewCheckpointManager {
-  const states = new Map<string, WorkspaceReviewState>();
+  const states = new Map<string, WorkspaceReviewStateWithInit>();
+
+  /**
+   * P1 #15: Retryable initialization. Track state explicitly.
+   * If initialization fails with a transient error (not "not a git repo"),
+   * the next call will retry. Permanent errors (not a git repo) are cached.
+   */
+  async function ensureInitialized(workspaceId: string, root: string): Promise<WorkspaceReviewStateWithInit> {
+    const existing = states.get(workspaceId);
+    if (existing) {
+      await existing.initialization;
+      // P1 #15: If previous init failed with transient error, retry
+      if (existing.diagnostic && !existing.gitRoot) {
+        // Check if it's a retryable error (not "not a git repo")
+        if (!existing.diagnostic.includes("not a git repo") && !existing.diagnostic.includes("requires a Git workspace")) {
+          states.delete(workspaceId);
+        } else {
+          return existing;
+        }
+      } else {
+        return existing;
+      }
+    }
+    // Create the state immediately so the workspace is visible, but the
+    // initialization promise gates all review operations.
+    let resolveInit!: () => void;
+    const initPromise = new Promise<void>((resolve) => { resolveInit = resolve; });
+    const refs = reviewRefs(workspaceId);
+    const state: WorkspaceReviewStateWithInit = { root, ...refs, initialization: initPromise };
+    states.set(workspaceId, state);
+
+    try {
+      const eligibility = await getGitEligibility(root);
+      if (!eligibility.ok || !eligibility.gitRoot) {
+        state.diagnostic = eligibility.message ?? "show_changes requires a Git workspace in this version.";
+        resolveInit();
+        return state;
+      }
+
+      state.gitRoot = eligibility.gitRoot;
+      state.workspaceRelativePath = relative(eligibility.gitRoot, root) || ".";
+      const commit = await createWorkingTreeSnapshot(eligibility.gitRoot, state.workspaceRelativePath);
+      await git(eligibility.gitRoot, ["update-ref", state.openRef, commit]);
+      await git(eligibility.gitRoot, ["update-ref", state.presentationRef, commit]);
+      await git(eligibility.gitRoot, ["update-ref", state.legacyBaselineRef, commit]);
+      // P1 #15: Clear diagnostic on success
+      state.diagnostic = undefined;
+    } catch (error) {
+      state.diagnostic = error instanceof Error ? error.message : String(error);
+    } finally {
+      resolveInit();
+    }
+    return state;
+  }
 
   return {
     async initializeWorkspace({ workspaceId, root }) {
-      const refs = reviewRefs(workspaceId);
-      const state: WorkspaceReviewState = { root, ...refs };
-      states.set(workspaceId, state);
-
-      try {
-        const eligibility = await getGitEligibility(root);
-        if (!eligibility.ok || !eligibility.gitRoot) {
-          state.diagnostic = eligibility.message ?? "show_changes requires a Git workspace in this version.";
-          return;
-        }
-
-        state.gitRoot = eligibility.gitRoot;
-        const commit = await createWorkingTreeSnapshot(eligibility.gitRoot);
-        await git(eligibility.gitRoot, ["update-ref", state.openRef, commit]);
-        await git(eligibility.gitRoot, ["update-ref", state.presentationRef, commit]);
-        await git(eligibility.gitRoot, ["update-ref", state.legacyBaselineRef, commit]);
-      } catch (error) {
-        state.diagnostic = error instanceof Error ? error.message : String(error);
-      }
+      await ensureInitialized(workspaceId, root);
     },
 
     async reviewChanges({ workspaceId, root, since = "last_shown", markReviewed = true, workSessionId }) {
-      let state = states.get(workspaceId);
-      if (!state) {
-        await this.initializeWorkspace({ workspaceId, root });
-        state = states.get(workspaceId);
-      }
+      const state = await ensureInitialized(workspaceId, root);
 
       if (!state?.gitRoot) {
         throw new Error(state?.diagnostic ?? "show_changes requires a Git workspace in this version.");
@@ -101,11 +143,13 @@ export function createReviewCheckpointManager(): ReviewCheckpointManager {
 
       const baselineRef = await resolveBaselineRef(state, workspaceId, since, workSessionId);
       const baseline = (await git(state.gitRoot, ["rev-parse", "--verify", `${baselineRef}^{commit}`])).stdout.trim();
-      const current = await createWorkingTreeSnapshot(state.gitRoot);
-      const patch = (await git(state.gitRoot, ["diff", "--binary", "--no-color", baseline, current], {
+      const scope = state.workspaceRelativePath ?? ".";
+      const current = await createWorkingTreeSnapshot(state.gitRoot, scope);
+      const diffArgs = ["diff", "--binary", "--no-color", baseline, current, "--", scope];
+      const patch = (await git(state.gitRoot, diffArgs, {
         maxBuffer: 50 * 1024 * 1024,
       })).stdout;
-      const numstat = (await git(state.gitRoot, ["diff", "--numstat", "-z", baseline, current], {
+      const numstat = (await git(state.gitRoot, ["diff", "--numstat", "-z", baseline, current, "--", scope], {
         maxBuffer: 50 * 1024 * 1024,
       })).stdout;
       const files = parseNumstat(numstat);
@@ -128,20 +172,17 @@ export function createReviewCheckpointManager(): ReviewCheckpointManager {
     },
 
     async reviewChangesAgainstCommit({ workspaceId, root, baselineCommit }) {
-      let state = states.get(workspaceId);
-      if (!state) {
-        await this.initializeWorkspace({ workspaceId, root });
-        state = states.get(workspaceId);
-      }
+      const state = await ensureInitialized(workspaceId, root);
       if (!state?.gitRoot) {
         throw new Error(state?.diagnostic ?? "show_changes requires a Git workspace in this version.");
       }
       const baseline = (await git(state.gitRoot, ["rev-parse", "--verify", `${baselineCommit}^{commit}`])).stdout.trim();
-      const current = await createWorkingTreeSnapshot(state.gitRoot);
-      const patch = (await git(state.gitRoot, ["diff", "--binary", "--no-color", baseline, current], {
+      const scope = state.workspaceRelativePath ?? ".";
+      const current = await createWorkingTreeSnapshot(state.gitRoot, scope);
+      const patch = (await git(state.gitRoot, ["diff", "--binary", "--no-color", baseline, current, "--", scope], {
         maxBuffer: 50 * 1024 * 1024,
       })).stdout;
-      const numstat = (await git(state.gitRoot, ["diff", "--numstat", "-z", baseline, current], {
+      const numstat = (await git(state.gitRoot, ["diff", "--numstat", "-z", baseline, current, "--", scope], {
         maxBuffer: 50 * 1024 * 1024,
       })).stdout;
       const files = parseNumstat(numstat);
@@ -159,11 +200,7 @@ export function createReviewCheckpointManager(): ReviewCheckpointManager {
     },
 
     async commitReviewed({ workspaceId, root, snapshotCommit, workSessionId }) {
-      let state = states.get(workspaceId);
-      if (!state) {
-        await this.initializeWorkspace({ workspaceId, root });
-        state = states.get(workspaceId);
-      }
+      const state = await ensureInitialized(workspaceId, root);
       if (!state?.gitRoot) {
         throw new Error(state?.diagnostic ?? "show_changes requires a Git workspace in this version.");
       }
@@ -224,14 +261,14 @@ async function ensureRef(gitRoot: string, ref: string, fallbackRef: string): Pro
   }
 }
 
-async function createWorkingTreeSnapshot(gitRoot: string): Promise<string> {
+async function createWorkingTreeSnapshot(gitRoot: string, workspaceRelativePath = "."): Promise<string> {
   const tempDir = await mkdtemp(join(tmpdir(), "kontrol-review-index-"));
   const indexPath = join(tempDir, "index");
   const env = checkpointEnv(indexPath);
 
   try {
     await git(gitRoot, ["read-tree", "HEAD"], { env });
-    await git(gitRoot, ["add", "-A", "--", "."], { env });
+    await git(gitRoot, ["add", "-A", "--", workspaceRelativePath], { env });
     const tree = (await git(gitRoot, ["write-tree"], { env })).stdout.trim();
     const parent = (await git(gitRoot, ["rev-parse", "--verify", "HEAD^{commit}"])).stdout.trim();
     return (await git(gitRoot, ["commit-tree", tree, "-p", parent, "-m", "Kontrol review snapshot"], { env })).stdout.trim();

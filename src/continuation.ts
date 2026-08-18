@@ -334,9 +334,8 @@ export function createContinuationManager(
     return row ? row.promptText : undefined;
   }
 
-  function close(): void {
-    database.close();
-  }
+  // P1 #11: DB owned by server
+  function close(): void { }
 
   return {
     create,

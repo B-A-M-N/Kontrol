@@ -1,5 +1,6 @@
 node_modules/
 dist/
+dist.previous/
 releases/
 *.log
 
@@ -18,3 +19,8 @@ __pycache__/
 
 test-mcp*.mjs
 scripts/test-*.mjs
+
+# Generated runtime/test state — must never be shipped or captured in review snapshots
+.kontrol-uat/
+.kontrol-build-*
+.kontrol-dist-backup-*

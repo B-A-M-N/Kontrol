@@ -174,6 +174,32 @@ const r2 = await enforcer.enforce({
 });
 assert.equal(r2.allowed, true);
 
+// ── Test 8: identical concurrent invocations remain independently approved ──
+
+const duplicatePolicy = createPolicyEngine({ defaultMode: "ask", toolRules: { write: "ask" }, pathRules: [] });
+const duplicateEnforcer = createPolicyEnforcer(duplicatePolicy, eventStore, { timeoutMs: 1_000 });
+const duplicateInvocation = {
+  principalId: "reconnecting-client",
+  principalRole: "client" as const,
+  workspaceId: WS,
+  tool: "write",
+  path: "same-file.txt",
+  command: undefined,
+};
+const firstReplay = duplicateEnforcer.enforce(duplicateInvocation);
+const secondReplay = duplicateEnforcer.enforce(duplicateInvocation);
+await new Promise((resolve) => setTimeout(resolve, 0));
+const pendingReplays = duplicatePolicy.getPendingApprovals();
+assert.equal(pendingReplays.length, 2, "approve-once must not merge separate identical invocations");
+for (const pending of pendingReplays) {
+  eventStore.appendEvent({
+    type: "policy.approval.provided",
+    sessionId: WS,
+    payload: { approvalId: pending.id, decision: "approve", scope: "once" },
+  });
+}
+assert.deepEqual((await Promise.all([firstReplay, secondReplay])).map((result) => result.allowed), [true, true]);
+
 db.close();
 
 console.log("policy.test.ts: all assertions passed");

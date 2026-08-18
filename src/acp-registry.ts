@@ -456,9 +456,9 @@ class SqliteAgentRegistryManager implements AgentRegistryManager {
     return delivered;
   }
 
+  // P1 #11: DB owned by server
   close(): void {
     if (this.webhookTimer) clearInterval(this.webhookTimer);
-    this.database.close();
   }
 }
 

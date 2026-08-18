@@ -8,8 +8,18 @@ import {
 } from "drizzle-orm/sqlite-core";
 import { sql } from "drizzle-orm";
 
+export const workspaceProjects = sqliteTable("workspace_projects", {
+  id: text("id").primaryKey(),
+  canonicalRoot: text("canonical_root").notNull(),
+  createdAt: text("created_at").notNull(),
+  lastUsedAt: text("last_used_at").notNull(),
+}, (table) => [
+  uniqueIndex("workspace_projects_root_unique").on(table.canonicalRoot),
+]);
+
 export const workspaceSessions = sqliteTable("workspace_sessions", {
   id: text("id").primaryKey(),
+  projectId: text("project_id"),
   root: text("root").notNull(),
   status: text("status").notNull().default("active"),
   mode: text("mode").notNull().default("checkout"),
@@ -67,10 +77,13 @@ export type NewLoadedAgentFileRow = typeof loadedAgentFiles.$inferInsert;
 
 export const workSessions = sqliteTable("work_sessions", {
   id: text("id").primaryKey(),
+  projectId: text("project_id"),
   workspaceSessionId: text("workspace_session_id")
     .notNull()
     .references(() => workspaceSessions.id, { onDelete: "cascade" }),
   status: text("status").notNull().default("in_progress"),
+  runtimeState: text("runtime_state").notNull().default("pending"),
+  runtimeClassifiedAt: text("runtime_classified_at"),
   completionPolicy: text("completion_policy").notNull().default("agent_completion"),
   reviewEpoch: integer("review_epoch").notNull().default(0),
   submittedBy: text("submitted_by").notNull(),
@@ -120,6 +133,7 @@ export const workSessionFeedback = sqliteTable("work_session_feedback", {
   requiredActionsJson: text("required_actions_json"),
   allowedNextActionsJson: text("allowed_next_actions_json"),
   reviewerId: text("reviewer_id"),
+  completionReportSha256: text("completion_report_sha256"),
   createdAt: text("created_at").notNull(),
 }, (table) => [
   uniqueIndex("work_session_feedback_submission_unique").on(table.submissionId),
@@ -155,6 +169,7 @@ export const workspaceLeases = sqliteTable("workspace_leases", {
     .references(() => workSessions.id, { onDelete: "cascade" }),
   leaseKind: text("lease_kind").notNull().default("modify"),
   ownerInstanceId: text("owner_instance_id").notNull(),
+  leaseNonce: text("lease_nonce").notNull().default("legacy"),
   acquiredAt: text("acquired_at").notNull(),
   heartbeatAt: text("heartbeat_at").notNull(),
   expiresAt: text("expires_at").notNull(),
@@ -370,12 +385,41 @@ export const missionContracts = sqliteTable("mission_contracts", {
   baselineCommit: text("baseline_commit"),
   correctionRounds: integer("correction_rounds").notNull().default(0),
   maxCorrectionRounds: integer("max_correction_rounds").notNull().default(5),
+  finalVerificationJson: text("final_verification_json").notNull().default("[]"),
   createdAt: text("created_at").notNull(),
   updatedAt: text("updated_at").notNull(),
 }, (table) => [
   uniqueIndex("mission_contracts_work_session_unique").on(table.workSessionId),
   index("mission_contracts_workspace_idx").on(table.workspaceSessionId, table.updatedAt),
 ]);
+
+export const supervisorRuns = sqliteTable("supervisor_runs", {
+  id: text("id").primaryKey(),
+  missionId: text("mission_id").notNull().references(() => missionContracts.id, { onDelete: "cascade" }),
+  workSessionId: text("work_session_id").notNull().references(() => workSessions.id, { onDelete: "cascade" }),
+  workspaceSessionId: text("workspace_session_id").notNull().references(() => workspaceSessions.id, { onDelete: "cascade" }),
+  status: text("status").notNull().default("created"), resumeStatus: text("resume_status"), revision: integer("revision").notNull().default(1),
+  cycleNumber: integer("cycle_number").notNull().default(0), maxCycles: integer("max_cycles").notNull().default(10),
+  ownerInstanceId: text("owner_instance_id"), leaseNonce: text("lease_nonce"), leaseExpiresAt: text("lease_expires_at"), heartbeatAt: text("heartbeat_at"),
+  lastProcessedEventSeq: integer("last_processed_event_seq").notNull().default(0), lastSubmissionId: text("last_submission_id"), lastSnapshotCommit: text("last_snapshot_commit"),
+  nextActionAt: text("next_action_at"), failureCount: integer("failure_count").notNull().default(0), lastError: text("last_error"),
+  lastFailureFingerprint: text("last_failure_fingerprint"), repeatedFailureCount: integer("repeated_failure_count").notNull().default(0),
+  deadlineAt: text("deadline_at"),
+  autonomyMode: text("autonomy_mode").notNull().default("manual"), approvalMode: text("approval_mode").notNull().default("human_required"),
+  createdAt: text("created_at").notNull(), updatedAt: text("updated_at").notNull(),
+}, (table) => [uniqueIndex("supervisor_runs_mission_unique").on(table.missionId), uniqueIndex("supervisor_runs_work_session_unique").on(table.workSessionId), index("supervisor_runs_status_next_idx").on(table.status, table.nextActionAt)]);
+
+export const missionCompletionReports = sqliteTable("mission_completion_reports", {
+  id: text("id").primaryKey(),
+  missionId: text("mission_id").notNull().references(() => missionContracts.id, { onDelete: "cascade" }),
+  submissionId: text("submission_id").notNull(),
+  snapshotCommit: text("snapshot_commit").notNull(),
+  status: text("status").notNull(),
+  resultsJson: text("results_json").notNull(),
+  reportSha256: text("report_sha256").notNull(),
+  createdAt: text("created_at").notNull(),
+}, (table) => [index("mission_completion_reports_current_idx").on(table.missionId, table.submissionId, table.snapshotCommit, table.createdAt)]);
+export type MissionCompletionReportRow = typeof missionCompletionReports.$inferSelect;
 
 export const missionAcceptanceCriteria = sqliteTable("mission_acceptance_criteria", {
   id: text("id").primaryKey(),
@@ -385,6 +429,7 @@ export const missionAcceptanceCriteria = sqliteTable("mission_acceptance_criteri
   verificationType: text("verification_type").notNull().default("manual_review"),
   verificationCommand: text("verification_command"),
   affectedAreasJson: text("affected_areas_json").notNull().default("[]"),
+  dependsOnJson: text("depends_on_json").notNull().default("[]"),
   status: text("status").notNull().default("unverified"),
   createdAt: text("created_at").notNull(),
   updatedAt: text("updated_at").notNull(),
@@ -438,7 +483,9 @@ export const missionEvidence = sqliteTable("mission_evidence", {
   missionId: text("mission_id").notNull().references(() => missionContracts.id, { onDelete: "cascade" }),
   criterionId: text("criterion_id"),
   submissionId: text("submission_id"),
+  reviewEpoch: integer("review_epoch"),
   snapshotCommit: text("snapshot_commit"),
+  leaseNonce: text("lease_nonce"),
   command: text("command"),
   outputDigest: text("output_digest"),
   status: text("status").notNull().default("inconclusive"),

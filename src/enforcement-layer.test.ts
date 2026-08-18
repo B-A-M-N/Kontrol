@@ -69,6 +69,13 @@ const reviewWorkflow = createReviewWorkflowService({
       files: [{ path: "x.txt", operation: "update", additions: 1, removals: 1 }],
       snapshotCommit: currentSnapshot,
     }),
+    reviewChangesAgainstCommit: async ({ baselineCommit }: { baselineCommit: string }) => ({
+      patch: baselineCommit === currentSnapshot ? "" : "diff --git a/x.txt b/x.txt\n",
+      result: baselineCommit === currentSnapshot ? "reviewed snapshot is current" : "workspace changed",
+      summary: baselineCommit === currentSnapshot ? { files: 0, additions: 0, removals: 0 } : { files: 1, additions: 1, removals: 1 },
+      files: baselineCommit === currentSnapshot ? [] : [{ path: "x.txt", operation: "update", additions: 1, removals: 1 }],
+      snapshotCommit: currentSnapshot,
+    }),
     commitReviewed: async () => {
       commitCalled = true;
     },

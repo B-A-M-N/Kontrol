@@ -146,7 +146,7 @@ export function createApprovalRequestManager(
     return get(id);
   }
 
-  return { create, get, listPending, resolve, close: () => database.close() };
+  return { create, get, listPending, resolve, close: () => { /* P1 #11: DB owned by server */ } };
 }
 
 function defaultOptions(): ApprovalOption[] {

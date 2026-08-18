@@ -9,6 +9,7 @@ import { createWorkSessionManager } from "./work-sessions.js";
 import { createEventStore } from "./event-log.js";
 import { createContinuationManager } from "./continuation.js";
 import { createMissionLedger } from "./mission-ledger.js";
+import { createSupervisorRuns } from "./supervisor-runs.js";
 import { createAgentRegistryManager } from "./acp-registry.js";
 import { createDispatchOutbox } from "./dispatch-outbox.js";
 import { registerBridgeTools, runContinuationTick, type BridgeConfig } from "./acp-bridge.js";
@@ -94,7 +95,9 @@ const eventStore = createEventStore(db);
 const continuationManager = createContinuationManager(db);
 const dispatchOutbox = createDispatchOutbox(db);
 const missionLedger = createMissionLedger(db);
+const supervisorRuns = createSupervisorRuns(db);
 const approvalRequests = createApprovalRequestManager(db);
+let supervisorWakeCalls = 0;
 const agentRegistry = createAgentRegistryManager(db);
 
 // Hoisted so the workflow service (created below) can share the exact same
@@ -115,6 +118,13 @@ const reviewCheckpoints = {
       files: reviewPatch ? [{ path: "x.txt", operation: "update", additions: 1, removals: 1 }] : [],
       snapshotCommit: currentSnapshot,
     }),
+  reviewChangesAgainstCommit: async ({ baselineCommit }: { baselineCommit: string }) => ({
+    patch: baselineCommit === currentSnapshot ? "" : reviewPatch || "diff --git a/x.txt b/x.txt\n",
+    result: baselineCommit === currentSnapshot ? "reviewed snapshot is current" : "workspace changed",
+    summary: baselineCommit === currentSnapshot ? { files: 0, additions: 0, removals: 0 } : { files: 1, additions: 1, removals: 1 },
+    files: baselineCommit === currentSnapshot ? [] : [{ path: "x.txt", operation: "update", additions: 1, removals: 1 }],
+    snapshotCommit: currentSnapshot,
+  }),
   commitReviewed: async () => {},
 } as any;
 
@@ -140,6 +150,8 @@ const config: BridgeConfig = {
   dispatchOutbox,
   reviewWorkflow,
   missionLedger,
+  supervisorRuns,
+  onSupervisorResume: () => { supervisorWakeCalls += 1; },
   knownAgents: [],
   sharedSecret: "test-secret",
   liveWaiters: liveWaiters as any,
@@ -903,6 +915,32 @@ try {
   // ── Scenario: anti-runaway loop guard stops a non-converging correction loop ──
   {
     const sessionId = createSession();
+    currentSnapshot = "verification-snapshot";
+    missionLedger.createMission({
+      workSessionId: sessionId, workspaceSessionId: WS, objective: "Verify command",
+      acceptanceCriteria: [{ id: "verify-command", description: "command exits cleanly", verificationType: "test", verificationCommand: "npm --version" }],
+      finalVerification: ["npm --version"],
+    });
+    await callWorker("submit_for_review", { sessionId });
+    const verification = await callReviewer("run_mission_verification", { workSessionId: sessionId });
+    assert.equal(verification.isError, undefined, "reviewer may run declared verification");
+    assert.equal(verification.structuredContent.results[0].status, "passed");
+    assert.equal(verification.structuredContent.results[1].status, "passed", "final integration command also passes");
+    const packet = missionLedger.getPacket(sessionId);
+    assert.equal(packet.criteria[0].status, "verified");
+    assert.equal((packet.evidence[0].details as { source?: string }).source, "server_test_runner");
+    assert.equal(packet.completionReports[0]?.status, "passed", "final integration produces a durable completion report");
+    const latest = workSessions.get(sessionId)?.latestSubmission;
+    assert.ok(latest?.id && latest.snapshotCommit);
+    assert.equal(missionLedger.canApprove(sessionId, { submissionId: latest.id, snapshotCommit: latest.snapshotCommit }).allowed, true, "current final integration report enables approval");
+    const approved = await callReviewer("approve_supervised_work", { workSessionId: sessionId });
+    assert.equal(approved.isError, undefined, "approval accepts the current completion report");
+    assert.equal(workSessions.get(sessionId)?.latestFeedback?.completionReportSha256, packet.completionReports[0]?.reportSha256, "approval feedback is bound to the exact completion report hash");
+    currentSnapshot = "deadbeef";
+  }
+
+  {
+    const sessionId = createSession();
     // Mission with a low ceiling and one required criterion, bound to a real
     // submission so continue_supervised_work has a `latestSubmission` to act on.
     missionLedger.createMission({
@@ -943,6 +981,31 @@ try {
     assert.ok(!approval.reasons.some((r) => r.includes("pre-existing")), "out_of_scope finding does not block approval");
   }
 
+  // A resumed supervisor must wake the runtime for every durable action, not
+  // only for verification.  Correction_pending is the previously stranded
+  // case because no new review event is guaranteed to arrive after resume.
+  {
+    const sessionId = createSession();
+    const mission = missionLedger.createMission({
+      workSessionId: sessionId,
+      workspaceSessionId: WS,
+      objective: "Resume a correction",
+      acceptanceCriteria: [{ id: "resume-correction", description: "Correction resumes", priority: "required" }],
+    });
+    const created = supervisorRuns.create({ missionId: mission.id, workSessionId: sessionId, workspaceSessionId: WS, autonomyMode: "correction_auto" });
+    const correction = supervisorRuns.transition({ id: created.id, expectedStatus: "created", expectedRevision: created.revision, nextStatus: "correction_pending" });
+    assert.ok(correction);
+    const before = supervisorWakeCalls;
+    const paused = await callReviewer("pause_supervisor_run", { workSessionId: sessionId, expectedRevision: correction.revision });
+    assert.equal(paused.isError, undefined);
+    const pausedRun = supervisorRuns.getByWorkSession(sessionId)!;
+    assert.equal(pausedRun.status, "paused");
+    const resumed = await callReviewer("resume_supervisor_run", { workSessionId: sessionId, expectedRevision: pausedRun.revision });
+    assert.equal(resumed.isError, undefined);
+    assert.equal(supervisorRuns.getByWorkSession(sessionId)?.status, "correction_pending");
+    assert.equal(supervisorWakeCalls, before + 1, "resuming correction_pending wakes the durable supervisor runtime");
+  }
+
   console.log("bridge-flow.test.ts: all assertions passed");
 } finally {
   if (httpServer) await new Promise<void>((resolve) => httpServer!.close(() => resolve()));
@@ -951,6 +1014,7 @@ try {
   eventStore.close();
   continuationManager.close();
   missionLedger.close();
+  supervisorRuns.close();
   approvalRequests.close();
   agentRegistry.close();
   await rm(root, { recursive: true, force: true });

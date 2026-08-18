@@ -22,33 +22,57 @@ export interface EventStoreEvent {
   createdAt: string;
 }
 
+interface TelemetryBuffer {
+  sessionId: string;
+  type: string;
+  items: Array<Record<string, unknown>>;
+  bytes: number;
+  timer?: ReturnType<typeof setTimeout>;
+  publish: boolean;
+}
+
 export type EventPredicate = (event: EventStoreEvent) => boolean;
 
 export interface EventStore {
-  appendEvent(input: {
-    type: string;
-    sessionId: string;
-    payload: Record<string, unknown>;
-  }, opts?: { publish?: boolean }): EventStoreEvent;
+ appendEvent(input: {
+   type: string;
+   sessionId: string;
+   payload: Record<string, unknown>;
+ }, opts?: { publish?: boolean }): EventStoreEvent;
 
-  publishEvents(events: EventStoreEvent[]): void;
+ publishEvents(events: EventStoreEvent[]): void;
 
-  getEventsForSession(sessionId: string): EventStoreEvent[];
+ getEventsForSession(sessionId: string): EventStoreEvent[];
 
-  /**
-   * Durable events strictly after a given seq. Used by the blocking
-   * await_work_session_events tool to fetch what was missed since the last poll
-   * without re-fetching already-seen events.
-   */
-  getEventsAfter(sessionId: string, afterSeq: number, limit?: number): EventStoreEvent[];
+ /**
+  * Durable events strictly after a given seq. Used by the blocking
+  * await_work_session_events tool to fetch what was missed since the last poll
+  * without re-fetching already-seen events.
+  */
+ getEventsAfter(sessionId: string, afterSeq: number, limit?: number): EventStoreEvent[];
 
-  /**
-   * Block until one or more events arrive after `afterSeq`. Resolves with the
-   * durable events. Ordering: subscribe FIRST, then query durable events after
-   * afterSeq; if events already exist they are returned immediately (no race
-   * window); otherwise the call remains subscribed and resolves when the next
-   * matching event arrives or the connection-liveness timeout elapses.
-   */
+ /**
+  * P1 #9: Count events by type for a session, grouped by event type.
+  * Used by diagnostics to show how much of the event log is telemetry vs workflow.
+  */
+ countEventsByType(sessionId: string): Record<string, number>;
+
+ /**
+  * P1 #9 / P2: Compact the event log for a completed session by replacing
+  * high-volume telemetry events (output_delta, thought_delta) with a single
+  * coalesced checkpoint. This preserves the audit trail (tool lifecycle,
+  * review events, state changes) while dramatically reducing row count.
+  * Returns the number of rows removed.
+  */
+ compactSessionEvents(sessionId: string, opts?: { retentionDays?: number }): number;
+
+ /**
+  * Block until one or more events arrive after `afterSeq`. Resolves with the
+  * durable events. Ordering: subscribe FIRST, then query durable events after
+  * afterSeq; if events already exist they are returned immediately (no race
+  * window); otherwise the call remains subscribed and resolves when the next
+  * matching event arrives or the connection-liveness timeout elapses.
+  */
   waitForEventsAfter(
     sessionId: string,
     afterSeq: number,
@@ -93,12 +117,20 @@ export function createEventStore(
     typeof stateDirOrHandle === "string" ? openDatabase(stateDirOrHandle) : stateDirOrHandle;
   const subscribers = new Map<string, Set<Subscriber>>();
   const globalSubscribers = new Set<Subscriber>();
+  const telemetryBuffers = new Map<string, TelemetryBuffer>();
+  const TELEMETRY_FLUSH_INTERVAL_MS = 250;
+  const TELEMETRY_MAX_BYTES = 16 * 1024;
 
-  function appendEvent(input: {
+  function isHighVolumeTelemetry(type: string): boolean {
+    return type === "agent.run.output_delta" || type === "agent.run.thought_delta";
+  }
+
+  function insertEvent(input: {
     type: string;
     sessionId: string;
     payload: Record<string, unknown>;
-  }, opts: { publish?: boolean } = {}): EventStoreEvent {
+    publish: boolean;
+  }): EventStoreEvent {
     const now = new Date().toISOString();
     const id = randomUUID();
 
@@ -110,7 +142,6 @@ export function createEventStore(
       .run(id, input.type, input.sessionId, JSON.stringify(input.payload), now);
 
     const seq = (database.sqlite.prepare("select last_insert_rowid() as seq").get() as { seq: number }).seq;
-
     const event: EventStoreEvent = {
       id,
       seq,
@@ -119,9 +150,105 @@ export function createEventStore(
       payload: input.payload,
       createdAt: now,
     };
-
-    if (opts.publish !== false) publish(event);
+    if (input.publish) publish(event);
     return event;
+  }
+
+  function flushTelemetry(key: string): void {
+    const buffer = telemetryBuffers.get(key);
+    if (!buffer || buffer.items.length === 0) return;
+    telemetryBuffers.delete(key);
+    if (buffer.timer) clearTimeout(buffer.timer);
+
+    const text = buffer.items
+      .map((item) => typeof item.text === "string" ? item.text : "")
+      .join("");
+    const channels = [...new Set(buffer.items
+      .map((item) => typeof item.channel === "string" ? item.channel : undefined)
+      .filter((channel): channel is string => Boolean(channel)))];
+    insertEvent({
+      type: buffer.type,
+      sessionId: buffer.sessionId,
+      publish: buffer.publish,
+      payload: {
+        text,
+        channel: channels[0] ?? (buffer.type === "agent.run.thought_delta" ? "thought" : "message"),
+        channels,
+        coalesced: true,
+        count: buffer.items.length,
+        segments: buffer.items.map((item) => ({
+          channel: typeof item.channel === "string" ? item.channel : undefined,
+          text: typeof item.text === "string" ? item.text : "",
+        })),
+      },
+    });
+  }
+
+  function flushTelemetryForSession(sessionId: string): void {
+    for (const [key, buffer] of telemetryBuffers) {
+      if (buffer.sessionId === sessionId) flushTelemetry(key);
+    }
+  }
+
+  function queueTelemetry(input: {
+    type: string;
+    sessionId: string;
+    payload: Record<string, unknown>;
+    publish: boolean;
+  }): EventStoreEvent {
+    const key = `${input.sessionId}\0${input.type}`;
+    let buffer = telemetryBuffers.get(key);
+    if (!buffer) {
+      buffer = {
+        sessionId: input.sessionId,
+        type: input.type,
+        items: [],
+        bytes: 0,
+        publish: input.publish,
+      };
+      telemetryBuffers.set(key, buffer);
+    }
+    buffer.items.push(input.payload);
+    buffer.bytes += JSON.stringify(input.payload).length;
+    buffer.publish ||= input.publish;
+    if (buffer.bytes >= TELEMETRY_MAX_BYTES) {
+      flushTelemetry(key);
+    } else if (!buffer.timer) {
+      buffer.timer = setTimeout(() => flushTelemetry(key), TELEMETRY_FLUSH_INTERVAL_MS);
+      buffer.timer.unref?.();
+    }
+
+    // Callers historically receive an EventStoreEvent synchronously. A queued
+    // fragment has no durable sequence yet, so return an explicit seq=0 marker;
+    // durable readers never expose or advance cursors from this placeholder.
+    return {
+      id: randomUUID(),
+      seq: 0,
+      type: input.type,
+      sessionId: input.sessionId,
+      payload: input.payload,
+      createdAt: new Date().toISOString(),
+    };
+  }
+
+  function appendEvent(input: {
+    type: string;
+    sessionId: string;
+    payload: Record<string, unknown>;
+  }, opts: { publish?: boolean } = {}): EventStoreEvent {
+    if (isHighVolumeTelemetry(input.type)) {
+      return queueTelemetry({
+        ...input,
+        publish: opts.publish !== false,
+      });
+    }
+    // Keep durable sequence order meaningful: a workflow event that follows a
+    // fragment must never overtake the buffered transcript preceding it.
+    flushTelemetryForSession(input.sessionId);
+    return insertEvent({
+      ...input,
+      publish: opts.publish !== false,
+    });
   }
 
   function getEventsForSession(sessionId: string): EventStoreEvent[] {
@@ -368,10 +495,78 @@ export function createEventStore(
     };
   }
 
+  function countEventsByType(sessionId: string): Record<string, number> {
+    const rows = database.sqlite
+      .prepare(
+        `select type, count(*) as count
+         from event_log
+         where session_id = ?
+         group by type`,
+      )
+      .all(sessionId) as Array<{ type: string; count: number }>;
+
+    const result: Record<string, number> = {};
+    for (const row of rows) {
+      result[row.type] = row.count;
+    }
+    return result;
+  }
+
+  /**
+   * P2 compaction: Replace high-volume telemetry events with a single checkpoint.
+   * Preserves all workflow events (tool lifecycle, review, state changes, etc.)
+   * and drops/replaces output_delta and thought_delta with a summary row.
+   */
+  function compactSessionEvents(sessionId: string, opts: { retentionDays?: number } = {}): number {
+    const retentionDays = opts.retentionDays ?? 7;
+    const cutoff = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000).toISOString();
+
+    // Count telemetry events before deletion for the checkpoint
+    const counts = countEventsByType(sessionId);
+    const telemetryTypes = new Set(["agent.run.output_delta", "agent.run.thought_delta"]);
+    let telemetryCount = 0;
+    for (const [type, count] of Object.entries(counts)) {
+      if (telemetryTypes.has(type)) telemetryCount += count;
+    }
+
+    if (telemetryCount === 0) return 0;
+
+    // Get the last seq for the session
+    const lastEvent = getLatestEvent(sessionId);
+    if (!lastEvent) return 0;
+
+    // P1 #25: Only compact old telemetry (past retention cutoff) to avoid losing recent events
+    const deleteResult = database.sqlite
+      .prepare(
+        `delete from event_log
+         where session_id = ?
+         and type in ('agent.run.output_delta', 'agent.run.thought_delta')
+         and created_at < ?`,
+      )
+      .run(sessionId, cutoff);
+
+    // Insert a single coalesced checkpoint event
+    if (deleteResult.changes > 0) {
+      appendEvent({
+        type: "agent.run.transcript_checkpoint",
+        sessionId,
+        payload: {
+          compacted: true,
+          originalTelemetryCount: deleteResult.changes,
+          cutoff,
+          compactedAt: new Date().toISOString(),
+        },
+      }, { publish: false });
+    }
+
+    return deleteResult.changes;
+  }
+
   function close(): void {
+    for (const key of [...telemetryBuffers.keys()]) flushTelemetry(key);
     subscribers.clear();
     globalSubscribers.clear();
-    database.close();
+    // P1 #11: Don't close shared DB handle - server owns it
   }
 
   return {
@@ -381,6 +576,8 @@ export function createEventStore(
     },
     getEventsForSession,
     getEventsAfter,
+    countEventsByType,
+    compactSessionEvents,
     waitForEventsAfter,
     getLatestEvent,
     subscribe,

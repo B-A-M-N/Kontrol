@@ -26,6 +26,7 @@ import {
   type ToolResultCard,
 } from "./card-types.js";
 import { getPatchDisplayParts } from "./patch-display.js";
+import type { ReviewSubmissionDTO } from "../review-submission.js";
 import "./workspace-app.css";
 
 interface ToolDisplay {
@@ -59,18 +60,7 @@ interface AgentActivityEvent {
   createdAt: string;
 }
 
-interface ReviewSubmissionView {
-  submissionId: string;
-  submissionNumber: number;
-  status: string;
-  message?: string;
-  files: Array<{ path?: string; previousPath?: string; operation?: string }>;
-  patch: string;
-  additions: number;
-  removals: number;
-  diffSha256?: string;
-  reviewEpoch?: number;
-}
+type ReviewSubmissionView = ReviewSubmissionDTO;
 
 interface PolicyApprovalView {
   approvalId: string;
@@ -99,6 +89,17 @@ interface AgentMessageView {
   status: string;
 }
 
+interface MissionPacketView {
+  supervisor?: { id: string; status: string; resumeStatus?: string | null; revision: number; cycleNumber: number; maxCycles: number; autonomyMode: string; approvalMode: string; repeatedFailureCount?: number; deadlineAt?: string; lastError?: string };
+  mission?: { id: string; objective: string; desiredOutcome?: string; correctionRounds?: number; maxCorrectionRounds?: number };
+  criteria: Array<{ id: string; description: string; priority: string; status: string; verificationType?: string; verificationCommand?: string; dependsOnCriterionIds?: string[] }>;
+  findings: Array<{ id: string; description: string; severity: string; scope: string; status: string; requiredAction?: string }>;
+  workOrders: Array<{ id: string; objectiveForThisTurn: string; status: string }>;
+  evidence: Array<{ id: string; criterionId?: string; status: string; source?: string; command?: string }>;
+  completionReports?: Array<{ id: string; status: string; reportSha256: string; createdAt: string }>;
+  approval: { allowed: boolean; reasons: string[] };
+}
+
 type FeedbackState = "idle" | "submitting" | "submitted" | "error";
 
 interface WorkSessionViewState {
@@ -116,6 +117,8 @@ interface WorkSessionViewState {
   feedbackStateBySubmission: Map<string, FeedbackState>;
   feedbackErrorBySubmission: Map<string, string>;
   feedbackMessage?: string;
+  mission?: MissionPacketView;
+  missionLoading?: boolean;
 }
 
 let app: App | null = null;
@@ -181,7 +184,10 @@ async function boot(): Promise<void> {
 
     // open_workspace carries the currently opened workspace ID.
     if (tool === "open_workspace" && structured.workspaceId) {
-      activeWorkspaceId = structured.workspaceId;
+      const newWorkspaceId = structured.workspaceId;
+      activeWorkspaceId = newWorkspaceId;
+      // P0 #3: When workspace becomes known, trigger rehydration.
+      void rehydrateActiveSessions();
     }
 
     // Agent run (submit_to_coding_agent) and review (submit_for_review) cards
@@ -253,46 +259,171 @@ async function boot(): Promise<void> {
 }
 
 /**
- * On connect/reconnect, ask the server for every non-terminal work session and
- * rebuild each one's view by replaying its event log from seq 0. The durable
- * event log + reduceWorkSessionEvent already know how to reconstruct state; this
- * is the missing client-side trigger that makes reload lossless.
+ * On connect/reconnect, ask the server for live workers and pending reviews,
+ * then rebuild each view from its durable snapshot and tail cursor. Stale and
+ * detached history is not silently presented as current work.
  */
 async function rehydrateActiveSessions(): Promise<void> {
   if (!app) return;
+  // P0 #2: scoped rehydration. Only rehydrate sessions within the current
+  // workspace. Never globally auto-rehydrate before the workspace is known.
+  // P0 #1: use server-side snapshot + resume from lastSeq instead of replaying
+  // the entire event log from seq 0.
+  const workspaceId = activeWorkspaceId ?? "";
+  if (!workspaceId) return;
+
   try {
-    const result = await app.callServerTool({
-      name: "list_active_work_sessions",
-      arguments: activeWorkspaceId ? { workspaceId: activeWorkspaceId } : {},
-    });
-    const content = getStructuredContent<{
+    const [liveResult, reviewResult] = await Promise.all([
+      app.callServerTool({
+        name: "list_active_work_sessions",
+        arguments: { workspaceId },
+      }),
+      app.callServerTool({
+        name: "list_pending_reviews",
+        arguments: { workspaceId },
+      }),
+    ]);
+    const liveContent = getStructuredContent<{
       sessions: Array<{
         sessionId: string;
         workspaceSessionId: string;
         status: string;
         runId?: string;
+        lastSeq: number;
+        hasMission: boolean;
       }>;
-    }>(result);
-    if (!content?.sessions?.length) return;
+    }>(liveResult);
+    const reviewContent = getStructuredContent<{
+      sessions: Array<{
+        sessionId: string;
+        workspaceSessionId: string;
+        status: string;
+        title?: string;
+        submittedBy: string;
+        submissionCount: number;
+        updatedAt: string;
+      }>;
+    }>(reviewResult);
+    const sessions = [
+      ...(liveContent?.sessions ?? []),
+      ...(reviewContent?.sessions ?? []).map((session) => ({
+        ...session,
+        runId: undefined,
+        lastSeq: 0,
+        hasMission: false,
+      })),
+    ];
+    if (!sessions.length) return;
 
-    for (const s of content.sessions) {
+    for (const s of sessions) {
       // Don't clobber a session already being watched in this connection.
       if (watcherGenerations.has(s.sessionId)) continue;
+
+      // P0 #1: Fetch the server-side snapshot instead of replaying from seq 0.
+      const snapResult = await app.callServerTool({
+        name: "get_work_session_snapshot",
+        arguments: { sessionId: s.sessionId },
+      });
+      const snap = getStructuredContent<{
+        sessionId: string;
+        workspaceSessionId: string;
+        status: string;
+        runId?: string;
+        lastSeq: number;
+        hasMission: boolean;
+        latestSubmission?: { submissionId: string; submissionNumber: number; status: string; additions: number; removals: number };
+        latestFeedback?: { id: string; verdict: string };
+        missionSummary?: { objective?: string; status?: string; cycleNumber?: number; maxCycles?: number };
+      }>(snapResult);
+
       const view = ensureWorkSessionView(s.sessionId, s.workspaceSessionId, s.runId ?? "");
       view.status = s.status;
-      // Replay from the beginning so the reducer rebuilds full state; the watcher
-      // caps retained activity and dedupes by seq.
-      void watchWorkSession(s.sessionId, 0);
+      if (snap) {
+        view.status = snap.status;
+        if (snap.latestSubmission) {
+          view.activeSubmissionId = snap.latestSubmission.submissionId;
+          view.submissions.set(snap.latestSubmission.submissionId, {
+            submissionId: snap.latestSubmission.submissionId,
+            sessionId: s.sessionId,
+            submissionNumber: snap.latestSubmission.submissionNumber,
+            reviewEpoch: 0,
+            status: snap.latestSubmission.status,
+            files: [],
+            patch: "",
+            fileCount: 0,
+            additions: snap.latestSubmission.additions,
+            removals: snap.latestSubmission.removals,
+          });
+          // P0 #7: Fetch the actual review diff for the active submission
+          void fetchReviewDiff(s.sessionId, snap.latestSubmission.submissionId);
+        }
+        if (snap.hasMission && snap.missionSummary) {
+          // P0 #8: Don't fabricate fake mission state. Show loading and fetch real packet.
+          view.missionLoading = true;
+          void refreshMission(view);
+        }
+      }
+      // P0 #1: Start watcher from the snapshot's lastSeq — no event log replay.
+      void watchWorkSession(s.sessionId, snap?.lastSeq ?? s.lastSeq ?? 0);
     }
-    // If nothing is selected yet, surface the most recently updated session so
-    // the reloaded UI lands on live work instead of an empty pane.
-    if (!selectedWorkSessionId && content.sessions[0]) {
-      selectedWorkSessionId = content.sessions[0].sessionId;
+    // If nothing is selected yet, surface the most recently updated session.
+    if (!selectedWorkSessionId && sessions[0]) {
+      selectedWorkSessionId = sessions[0].sessionId;
     }
     render();
   } catch {
     // Recovery is best-effort: a failure here must not block the WebUI from
     // connecting. Reactive tool cards still populate sessions as they arrive.
+  }
+}
+
+async function fetchReviewDiff(sessionId: string, submissionId: string): Promise<void> {
+  if (!app) return;
+  try {
+    const result = await app.callServerTool({
+      name: "get_review_submission",
+      arguments: { sessionId, submissionId },
+    });
+    const content = getStructuredContent<{
+      submissionId: string;
+      patch: string;
+      additions: number;
+      removals: number;
+      files: ReviewSubmissionView["files"];
+    }>(result);
+    if (!content?.patch) return;
+    const view = workSessionViews.get(sessionId);
+    if (view && content) {
+      const sub = view.submissions.get(submissionId);
+      if (sub) {
+        sub.patch = content.patch;
+        sub.additions = content.additions;
+        sub.removals = content.removals;
+        sub.files = content.files ?? [];
+        render();
+      }
+    }
+  } catch {
+    // Submission may not exist yet
+  }
+}
+
+async function refreshMission(view: WorkSessionViewState): Promise<void> {
+  if (!app) return;
+  try {
+    const result = await app.callServerTool({
+      name: "inspect_supervised_work",
+      arguments: { workSessionId: view.workSessionId },
+    });
+    const content = getStructuredContent<{ packet?: MissionPacketView }>(result);
+    if (content?.packet?.mission) {
+      view.mission = content.packet;
+      view.missionLoading = false;
+      render();
+    }
+  } catch {
+    // Ordinary work sessions have no mission contract. Keep their existing UI.
+    view.missionLoading = false;
   }
 }
 
@@ -507,6 +638,8 @@ function renderWorkSessionView(view: WorkSessionViewState): void {
   if (view.runId) meta.append(element("span", { className: "agent-meta-row", text: `run: ${view.runId}` }));
   section.append(meta);
 
+  if (view.mission) section.append(renderMissionPanel(view));
+
   // Activity timeline.
   const activityHeader = element("div", { className: "agent-activity-header", text: "Agent activity" });
   section.append(activityHeader);
@@ -555,6 +688,119 @@ function renderWorkSessionView(view: WorkSessionViewState): void {
   main.append(section);
   appRoot.replaceChildren(main);
   maybeAppendAgentBar();
+}
+
+function renderMissionPanel(view: WorkSessionViewState): HTMLElement {
+  const packet = view.mission!;
+  const panel = element("section", { className: "approval-card" });
+  panel.append(element("div", { className: "approval-title", text: "Supervised mission" }));
+  panel.append(element("div", { className: "approval-detail", text: packet.mission?.objective ?? "Mission contract" }));
+  if (packet.supervisor) {
+    const run = packet.supervisor;
+    panel.append(element("div", { className: "approval-detail", text: `Supervisor: ${run.status} · cycle ${run.cycleNumber}/${run.maxCycles} · ${run.autonomyMode} · ${run.approvalMode}${run.repeatedFailureCount ? ` · repeated failure ${run.repeatedFailureCount}` : ""}` }));
+    if (run.deadlineAt) panel.append(element("div", { className: "approval-detail", text: `Autonomous deadline: ${new Date(run.deadlineAt).toLocaleString()}` }));
+    if (run.lastError) panel.append(element("div", { className: "feedback-error", text: `Supervisor error: ${run.lastError}` }));
+    const control = element("button", { className: "feedback-btn changes", type: "button", text: run.status === "paused" ? "Resume supervisor" : "Pause supervisor" });
+    control.addEventListener("click", () => {
+      if (!app) return;
+      control.setAttribute("disabled", "true");
+      void app.callServerTool({ name: run.status === "paused" ? "resume_supervisor_run" : "pause_supervisor_run", arguments: { workSessionId: view.workSessionId, expectedRevision: run.revision } })
+        .then(() => refreshMission(view))
+        .catch((error) => { view.feedbackMessage = `Supervisor control failed: ${error instanceof Error ? error.message : String(error)}`; render(); });
+    });
+    panel.append(control);
+    if (run.status === "awaiting_human") {
+      const redrive = element("button", { className: "feedback-btn changes", type: "button", text: "Redrive stalled supervisor action" });
+      redrive.addEventListener("click", () => {
+        if (!app) return;
+        redrive.setAttribute("disabled", "true");
+        void app.callServerTool({ name: "redrive_supervisor_run", arguments: { workSessionId: view.workSessionId, expectedRevision: run.revision } })
+          .then(() => refreshMission(view))
+          .catch((error) => { view.feedbackMessage = `Supervisor redrive failed: ${error instanceof Error ? error.message : String(error)}`; render(); });
+      });
+      panel.append(redrive);
+    }
+  }
+  const progress = packet.criteria.map((criterion) => `${criterion.status === "verified" ? "✓" : "○"} ${criterion.description} — ${criterion.status}${criterion.dependsOnCriterionIds?.length ? ` · depends on ${criterion.dependsOnCriterionIds.join(", ")}` : ""}`);
+  for (const item of progress) panel.append(element("div", { className: "approval-detail", text: item }));
+  const blockers = packet.approval.reasons;
+  if (blockers.length) {
+    panel.append(element("div", { className: "feedback-error", text: `Mission approval blocked: ${blockers.join("; ")}` }));
+  } else {
+    panel.append(element("div", { className: "feedback-submitted", text: "Mission evidence is complete and approval is available." }));
+  }
+  const openFindings = packet.findings.filter((finding) => !["verified_resolved", "waived"].includes(finding.status));
+  for (const finding of openFindings) {
+    panel.append(element("div", { className: "approval-detail", text: `${finding.severity} ${finding.scope}: ${finding.description}` }));
+  }
+  for (const report of packet.completionReports ?? []) {
+    panel.append(element("div", { className: report.status === "passed" ? "approval-detail" : "feedback-error", text: `Final integration: ${report.status} · report ${report.reportSha256.slice(0, 12)}` }));
+  }
+  const refresh = element("button", { className: "feedback-btn changes", type: "button", text: "Refresh mission" });
+  refresh.addEventListener("click", () => { void refreshMission(view); });
+  panel.append(refresh);
+  if (packet.criteria.some((criterion) => criterion.verificationCommand)) {
+    const verify = element("button", { className: "feedback-btn approve", type: "button", text: "Run declared verification" });
+    verify.addEventListener("click", () => {
+      if (!app) return;
+      verify.setAttribute("disabled", "true");
+      void app.callServerTool({ name: "run_mission_verification", arguments: { workSessionId: view.workSessionId } })
+        .then(() => refreshMission(view))
+        .catch((error) => { view.feedbackMessage = `Verification failed: ${error instanceof Error ? error.message : String(error)}`; render(); });
+    });
+    panel.append(verify);
+  }
+  if (view.activeSubmissionId && !packet.approval.allowed) panel.append(renderMissionCorrectionForm(view));
+  return panel;
+}
+
+function renderMissionCorrectionForm(view: WorkSessionViewState): HTMLElement {
+  const packet = view.mission!;
+  const form = element("div", { className: "feedback-form" });
+  form.append(element("label", { className: "feedback-label", text: "Next bounded work order" }));
+  const instructions = document.createElement("textarea");
+  instructions.className = "feedback-textarea";
+  instructions.rows = 3;
+  instructions.placeholder = "State the exact corrective work and required verification.";
+  const finding = document.createElement("textarea");
+  finding.className = "feedback-textarea";
+  finding.rows = 2;
+  finding.placeholder = "Optional new blocking finding (recorded durably).";
+  form.append(instructions, finding);
+  const selectedCriteria = packet.criteria.filter((criterion) => criterion.priority === "required" && criterion.status !== "verified");
+  if (selectedCriteria.length) form.append(element("div", { className: "approval-detail", text: `Targets: ${selectedCriteria.map((criterion) => criterion.description).join("; ")}` }));
+  const submit = element("button", { className: "feedback-btn changes", type: "button", text: "Dispatch correction round" });
+  submit.addEventListener("click", () => {
+    const comments = instructions.value.trim();
+    if (!comments || !app) return;
+    submit.setAttribute("disabled", "true");
+    void app.callServerTool({
+      name: "continue_supervised_work",
+      arguments: {
+        workSessionId: view.workSessionId,
+        comments,
+        findings: finding.value.trim() ? [{
+          description: finding.value.trim(), requiredAction: comments, severity: "blocker", scope: "in_scope",
+        }] : undefined,
+        workOrder: {
+          objectiveForThisTurn: comments,
+          acceptanceCriterionIds: selectedCriteria.map((criterion) => criterion.id),
+          requiredActions: [comments],
+          requiredVerification: selectedCriteria.map((criterion) => criterion.verificationCommand).filter(Boolean),
+        },
+      },
+    }).then((result) => {
+      const content = getStructuredContent<{ packet?: MissionPacketView }>(result);
+      if (content?.packet) view.mission = content.packet;
+      view.feedbackMessage = "Correction round queued.";
+      render();
+    }).catch((error) => {
+      view.feedbackMessage = `Correction dispatch failed: ${error instanceof Error ? error.message : String(error)}`;
+      render();
+    });
+  });
+  form.append(submit);
+  return form;
 }
 
 function eventLabel(e: AgentActivityEvent): string {
@@ -620,7 +866,7 @@ async function watchWorkSession(sessionId: string, initialSeq = 0): Promise<void
       for (const event of content.events) {
         reduceWorkSessionEvent(sessionId, event);
       }
-      cursor = content.nextSeq;
+      cursor = Math.max(cursor, content.nextSeq);
       render();
       if (content.terminal) return;
     } catch (error) {
@@ -643,6 +889,10 @@ async function watchWorkSession(sessionId: string, initialSeq = 0): Promise<void
 function reduceWorkSessionEvent(sessionId: string, event: AgentActivityEvent): void {
   const view = workSessionViews.get(sessionId);
   if (!view) return;
+  // The server's snapshot+cursor handoff and reconnects are deliberately
+  // idempotent. Never duplicate an already-applied durable event if a host
+  // retries a tool call or returns an overlapping page.
+  if (event.seq > 0 && event.seq <= view.lastSeq) return;
   view.activity.push(event);
   if (view.activity.length > 200) view.activity.shift();
   view.lastSeq = Math.max(view.lastSeq, event.seq);
@@ -650,6 +900,7 @@ function reduceWorkSessionEvent(sessionId: string, event: AgentActivityEvent): v
   if (event.type === "review.submitted") {
     const submissionId = String(event.payload?.submissionId ?? "");
     view.status = "awaiting_review";
+    void refreshMission(view);
     // Auto-fetch the full submission card from the agent's submit_for_review
     // invocation (which occurred in CRUSH's MCP connection, not this iframe).
     if (submissionId && app) {
@@ -659,7 +910,9 @@ function reduceWorkSessionEvent(sessionId: string, event: AgentActivityEvent): v
           const sc = getStructuredContent<{
             submissionId: string;
             status: string;
-            files: number;
+            files: ReviewSubmissionView["files"];
+            fileCount: number;
+            patch: string;
             additions: number;
             removals: number;
             submissionNumber: number;
@@ -672,15 +925,17 @@ function reduceWorkSessionEvent(sessionId: string, event: AgentActivityEvent): v
           if (!view2) return;
           view2.submissions.set(submissionId, {
             submissionId,
+            sessionId,
             submissionNumber: Number(event.payload?.submissionNumber ?? sc.submissionNumber ?? 0),
+            reviewEpoch: Number(card?.summary?.reviewEpoch ?? sc.reviewEpoch ?? 0),
             status: sc.status,
-            files: card?.files ?? [],
-            patch: card?.payload?.patch ?? "",
+            files: sc.files ?? card?.files ?? [],
+            patch: sc.patch ?? card?.payload?.patch ?? "",
+            fileCount: Number(sc.fileCount ?? sc.files?.length ?? card?.files?.length ?? 0),
             additions: card?.summary?.additions ?? sc.additions ?? 0,
             removals: card?.summary?.removals ?? sc.removals ?? 0,
             message: card?.summary?.message,
             diffSha256: String(card?.summary?.diffSha256 ?? sc.diffSha256 ?? ""),
-            reviewEpoch: Number(card?.summary?.reviewEpoch ?? sc.reviewEpoch ?? 0),
           });
           view2.activeSubmissionId = submissionId;
           render();
@@ -1041,7 +1296,7 @@ function renderFeedbackFormForSubmission(view: WorkSessionViewState, submission:
   };
 
   buttonRow.append(
-    makeButton("approve", "Approve", "approve"),
+    makeButton("approve", view.mission ? "Check Mission Approval" : "Approve", "approve"),
     makeButton("changes_requested", "Request Changes", "changes"),
     makeButton("reject", "Reject", "reject"),
   );
@@ -1057,17 +1312,29 @@ async function submitFeedbackForSubmission(view: WorkSessionViewState, submissio
   view.feedbackErrorBySubmission.delete(submissionId);
   render();
   try {
-    await app.callServerTool({
-      name: "provide_review_feedback",
-      arguments: {
-        sessionId: view.workSessionId,
-        submissionId,
-        diffSha256: submission.diffSha256,
-        reviewEpoch: submission.reviewEpoch,
-        verdict,
-        comments,
-      },
-    });
+    if (verdict === "approve" && view.mission) {
+      const result = await app.callServerTool({
+        name: "approve_supervised_work",
+        arguments: { workSessionId: view.workSessionId, comments },
+      });
+      const approval = getStructuredContent<{ approved?: boolean; reasons?: string[]; packet?: MissionPacketView }>(result);
+      if (!approval?.approved) {
+        throw new Error(approval?.reasons?.join("; ") || "Mission approval remains blocked.");
+      }
+      if (approval.packet) view.mission = approval.packet;
+    } else {
+      await app.callServerTool({
+        name: "provide_review_feedback",
+        arguments: {
+          sessionId: view.workSessionId,
+          submissionId,
+          diffSha256: submission.diffSha256,
+          reviewEpoch: submission.reviewEpoch,
+          verdict,
+          comments,
+        },
+      });
+    }
     view.feedbackStateBySubmission.set(submissionId, "submitted");
     view.feedbackMessage = "Feedback submitted. The waiting agent has been notified.";
   } catch (err) {

@@ -18,6 +18,11 @@ export interface ServerConfig {
   port: number;
   oauth: OAuthConfig;
   authMode: AuthMode;
+  /**
+   * Legacy tunnel token, retained only so older callers can inspect the
+   * configuration during migration. Tunnel mode deliberately does not use it
+   * as an MCP bearer gate; the Secure MCP Tunnel is the trust boundary.
+   */
   tunnelToken?: string;
   allowedRoots: string[];
   allowedHosts: string[];
@@ -39,6 +44,20 @@ export interface ServerConfig {
   /** Shared secret used by the reviewer (WebUI) for ACP calls. */
   acpReviewerSecret?: string;
   policy: PolicyConfig;
+  /** P1 #50: Secret required for /diagnostics access (even on loopback). */
+  diagnosticsSecret?: string;
+  /** Bounded MCP request admission limits. */
+  mcpMaxInflight: number;
+  mcpMaxInflightPerSession: number;
+  mcpMaxQueue: number;
+  mcpRequestDeadlineMs: number;
+  mcpUnusedSessionIdleMs: number;
+  mcpEphemeralSessionIdleMs: number;
+  mcpReusableSessionIdleMs: number;
+  mcpSessionReaperIntervalMs: number;
+  mcpSessionMaxPerClient: number;
+  mcpSessionSoftCap: number;
+  mcpSessionHardCap: number;
 }
 
 function parsePort(value: string | number | undefined): number {
@@ -159,7 +178,11 @@ function parseLoggingConfig(env: NodeJS.ProcessEnv): LoggingConfig {
 }
 
 function parseWidgetMode(value: string | undefined): WidgetMode {
-  if (!value || value === "full") return "full";
+  // Full mode mounts the WebUI iframe for every tool result, which causes an
+  // avoidable host-connection prompt on routine reads/searches/commands. Keep
+  // the interactive surface for workspace and change-review cards by default.
+  if (!value) return "changes";
+  if (value === "full") return "full";
   if (value === "off" || value === "changes") return value;
 
   throw new Error(`Invalid KONTROL_WIDGETS: ${value}`);
@@ -254,9 +277,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     );
   }
 
-  if (env.KONTROL_TUNNEL_TOKEN !== undefined && env.KONTROL_TUNNEL_TOKEN.length > 0 && env.KONTROL_TUNNEL_TOKEN.length < 16) {
-    throw new Error("KONTROL_TUNNEL_TOKEN must be at least 16 characters when set.");
-  }
   const derivedAllowedHosts = [
     "localhost",
     "127.0.0.1",
@@ -274,6 +294,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     allowedHosts: parseAllowedHosts(env.KONTROL_ALLOWED_HOSTS, derivedAllowedHosts),
     publicBaseUrl,
     authMode,
+    // Kept for migration diagnostics only. The server never uses this value
+    // to challenge /mcp in tunnel mode.
     tunnelToken: env.KONTROL_TUNNEL_TOKEN,
     toolMode: parseToolMode(env),
     widgets: parseWidgetMode(env.KONTROL_WIDGETS),
@@ -292,6 +314,24 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     /** Shared secret used by the reviewer (WebUI) for ACP calls. */
     acpReviewerSecret: env.KONTROL_ACP_REVIEWER_SECRET,
     policy: loadPolicyConfig(env),
+    // P1 #50: Diagnostics secret — required for /diagnostics when set
+    diagnosticsSecret: env.KONTROL_DIAGNOSTICS_SECRET,
+    mcpMaxInflight: parsePositiveInteger(env.KONTROL_MCP_MAX_INFLIGHT, 32, "KONTROL_MCP_MAX_INFLIGHT"),
+    mcpMaxInflightPerSession: parsePositiveInteger(env.KONTROL_MCP_MAX_INFLIGHT_PER_SESSION, 8, "KONTROL_MCP_MAX_INFLIGHT_PER_SESSION"),
+    mcpMaxQueue: parsePositiveInteger(env.KONTROL_MCP_MAX_QUEUE, 128, "KONTROL_MCP_MAX_QUEUE"),
+    mcpRequestDeadlineMs: parsePositiveInteger(env.KONTROL_MCP_REQUEST_DEADLINE_MS, 120_000, "KONTROL_MCP_REQUEST_DEADLINE_MS"),
+    // Give a client time to finish model-side reasoning and issue its first
+    // useful operation; cleanup remains bounded by admission caps.
+    mcpUnusedSessionIdleMs: parsePositiveInteger(env.KONTROL_MCP_UNUSED_SESSION_IDLE_MS, 2 * 60_000, "KONTROL_MCP_UNUSED_SESSION_IDLE_MS"),
+    // One useful tool call does not prove that the model is finished. The
+    // soft/hard caps handle pathological one-session-per-tool churn without
+    // conflating separate transports.
+    mcpEphemeralSessionIdleMs: parsePositiveInteger(env.KONTROL_MCP_EPHEMERAL_SESSION_IDLE_MS, 5 * 60_000, "KONTROL_MCP_EPHEMERAL_SESSION_IDLE_MS"),
+    mcpReusableSessionIdleMs: parsePositiveInteger(env.KONTROL_MCP_REUSABLE_SESSION_IDLE_MS, 15 * 60_000, "KONTROL_MCP_REUSABLE_SESSION_IDLE_MS"),
+    mcpSessionReaperIntervalMs: parsePositiveInteger(env.KONTROL_MCP_SESSION_REAPER_INTERVAL_MS, 15_000, "KONTROL_MCP_SESSION_REAPER_INTERVAL_MS"),
+    mcpSessionMaxPerClient: parsePositiveInteger(env.KONTROL_MCP_SESSION_MAX_PER_CLIENT, 20, "KONTROL_MCP_SESSION_MAX_PER_CLIENT"),
+    mcpSessionSoftCap: parsePositiveInteger(env.KONTROL_MCP_SESSION_SOFT_CAP, 150, "KONTROL_MCP_SESSION_SOFT_CAP"),
+    mcpSessionHardCap: parsePositiveInteger(env.KONTROL_MCP_SESSION_HARD_CAP, 200, "KONTROL_MCP_SESSION_HARD_CAP"),
   };
 }
 

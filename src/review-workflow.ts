@@ -71,6 +71,7 @@ export interface ProvideFeedbackInput {
   requiredActions?: string[];
   allowedNextActions?: string[];
   reviewerId?: string;
+  completionReportSha256?: string;
 }
 
 export interface ProvideFeedbackResult {
@@ -301,6 +302,7 @@ export function createReviewWorkflowService(
       const missionApproval = missionLedger?.canApprove(input.sessionId, {
         submissionId: currentPending.id,
         snapshotCommit: currentPending.snapshotCommit,
+        reviewEpoch: currentPending.reviewEpoch,
       });
       if (missionApproval && !missionApproval.allowed) {
         throw new WorkflowError(
@@ -308,6 +310,14 @@ export function createReviewWorkflowService(
           "conflict",
           409,
         );
+      }
+      const expectedReportHash = missionLedger?.getCompletionReportHash(input.sessionId, {
+        submissionId: currentPending.id,
+        snapshotCommit: currentPending.snapshotCommit,
+        reviewEpoch: currentPending.reviewEpoch,
+      });
+      if (expectedReportHash && input.completionReportSha256 !== expectedReportHash) {
+        throw new WorkflowError("Completion report hash is missing or stale for this approval.", "stale_submission", 409);
       }
       if (!workspaces || !reviewCheckpoints) {
         throw new WorkflowError(
@@ -317,13 +327,24 @@ export function createReviewWorkflowService(
         );
       }
       const ws = workspaces.getWorkspace(session.workspaceSessionId);
-      const current = await reviewCheckpoints.reviewChanges({
+      // A snapshot commit is a synthetic commit over the current tree.  Its
+      // parent depends on the checkpoint used when it was created, so asking
+      // for a new `workspace_open` snapshot can produce a different commit ID
+      // even when the tree is byte-for-byte identical.  Compare the live tree
+      // with the submitted snapshot directly instead.
+      if (!currentPending.snapshotCommit) {
+        throw new WorkflowError(
+          `Submission ${input.submissionId} has no bound workspace snapshot.`,
+          "stale_submission",
+          409,
+        );
+      }
+      const current = await reviewCheckpoints.reviewChangesAgainstCommit({
         workspaceId: session.workspaceSessionId,
         root: ws.root,
-        since: "workspace_open",
-        markReviewed: false,
+        baselineCommit: currentPending.snapshotCommit,
       });
-      if (current.snapshotCommit !== currentPending.snapshotCommit) {
+      if (current.summary.files !== 0) {
         throw new WorkflowError(
           `Workspace snapshot changed since submission ${input.submissionId}; cannot approve a stale submission. Submit a fresh review.`,
           "stale_submission",
@@ -373,6 +394,7 @@ export function createReviewWorkflowService(
         requiredActions: input.requiredActions,
         allowedNextActions: resolvedAllowed,
         reviewerId: input.reviewerId,
+        completionReportSha256: input.completionReportSha256,
       });
 
       const correlatedRun = agentRegistry.getRunByWorkSessionId(input.sessionId);

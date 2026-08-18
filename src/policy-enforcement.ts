@@ -84,64 +84,71 @@ export function createPolicyEnforcer(
       });
       if (already) return { allowed: true, decision };
 
-      const approvalId = `pol_${randomUUID()}`;
-      policy.addPending({
-        id: approvalId,
-        principalId: inv.principalId,
-        workspaceId: inv.workspaceId,
-        workSessionId: inv.workSessionId,
-        tool: canonical,
-        path: inv.path,
-        command: inv.command,
-        requestedAt: new Date().toISOString(),
-      });
+      return waitForApproval();
 
-      const payload: PolicyApprovalEventPayload = {
-        approvalId,
-        workspaceId: inv.workspaceId,
-        workSessionId: inv.workSessionId,
-        runId: inv.runId,
-        principalId: inv.principalId,
-        tool: canonical,
-        path: inv.path,
-        command: inv.command,
-        approvalKey: decision.approvalKey!,
-        approvalKeyType: decision.source,
-        matchedPattern: decision.matchedPattern,
-      };
+      async function waitForApproval(): Promise<{ allowed: boolean; decision: PolicyDecision }> {
 
-      eventStore.appendEvent({
-        type: "policy.approval_requested",
-        sessionId: inv.workSessionId ?? inv.workspaceId,
-        payload: payload as unknown as Record<string, unknown>,
-      });
+        const approvalId = `pol_${randomUUID()}`;
+        policy.addPending({
+          id: approvalId,
+          principalId: inv.principalId,
+          workspaceId: inv.workspaceId,
+          workSessionId: inv.workSessionId,
+          tool: canonical,
+          path: inv.path,
+          command: inv.command,
+          requestedAt: new Date().toISOString(),
+        });
 
-      const event = await eventStore.waitForEvent(
-        inv.workSessionId ?? inv.workspaceId,
-        "policy.approval.provided",
-        (e: { payload?: Record<string, unknown> }) => e.payload?.approvalId === approvalId,
-        timeoutMs,
-      );
+        const payload: PolicyApprovalEventPayload = {
+          approvalId,
+          workspaceId: inv.workspaceId,
+          workSessionId: inv.workSessionId,
+          runId: inv.runId,
+          principalId: inv.principalId,
+          tool: canonical,
+          path: inv.path,
+          command: inv.command,
+          approvalKey: decision.approvalKey!,
+          approvalKeyType: decision.source,
+          matchedPattern: decision.matchedPattern,
+        };
 
-      policy.clearPending(approvalId);
+        eventStore.appendEvent({
+          type: "policy.approval_requested",
+          sessionId: inv.workSessionId ?? inv.workspaceId,
+          payload: payload as unknown as Record<string, unknown>,
+        });
 
-      if (!event) return { allowed: false, decision }; // timeout = denied
+        try {
+          const event = await eventStore.waitForEvent(
+          inv.workSessionId ?? inv.workspaceId,
+          "policy.approval.provided",
+          (e: { payload?: Record<string, unknown> }) => e.payload?.approvalId === approvalId,
+          timeoutMs,
+          );
 
-      const decision2 = String(event.payload.decision ?? "deny");
-      const scope = (event.payload.scope as ApprovalScope) ?? "once";
+        if (!event) return { allowed: false, decision }; // timeout = denied
 
-      if (decision2 === "deny") return { allowed: false, decision };
+        const decision2 = String(event.payload.decision ?? "deny");
+        const scope = (event.payload.scope as ApprovalScope) ?? "once";
+
+        if (decision2 === "deny") return { allowed: false, decision };
 
       // Record the approval under the CANONICAL key — never reconstruct from the
       // raw invocation. This fixes the broken "approve for session" caching.
-      if (decision2 === "approve" && decision.approvalKey) {
-        policy.recordApproval(inv.principalId, decision.approvalKey, scope, {
-          workspaceId: inv.workspaceId,
-          workSessionId: inv.workSessionId,
-        });
-      }
+        if (decision2 === "approve" && decision.approvalKey) {
+          policy.recordApproval(inv.principalId, decision.approvalKey, scope, {
+            workspaceId: inv.workspaceId,
+            workSessionId: inv.workSessionId,
+          });
+        }
 
-      return { allowed: decision2 === "approve", decision };
+          return { allowed: decision2 === "approve", decision };
+        } finally {
+          policy.clearPending(approvalId);
+        }
+      }
     },
   };
 }

@@ -20,34 +20,120 @@ export interface SkillReadResolution {
   isSkillFile: boolean;
 }
 
-export function effectiveSkillPaths(config: ServerConfig, cwd: string): string[] {
-  const defaultPaths = [
-    join(homedir(), ".agents", "skills"),
-    resolve(cwd, ".agents", "skills"),
-    join(config.agentDir, "skills"),
-  ].filter((path) => existsSync(path));
+export interface SkillConfig {
+  skillsEnabled: boolean;
+  agentDir: string;
+  skillPaths?: string[];
+}
 
+export function effectiveSkillPaths(config: SkillConfig, cwd: string): {
+  projectLocal: string[];
+  global: string[];
+} {
+  const projectLocal = uniqueExistingPaths([
+    resolve(cwd, ".agents", "skills"),
+  ]);
+  const projectLocalSet = new Set(projectLocal);
+
+  const global = uniqueExistingPaths([
+    join(homedir(), ".agents", "skills"),
+    join(config.agentDir, "skills"),
+    ...(config.skillPaths ?? []).map((path) => resolveSkillPath(path, cwd)),
+  ]).filter((path) => !projectLocalSet.has(path));
+
+  return { projectLocal, global };
+}
+
+function uniqueExistingPaths(paths: string[]): string[] {
   const seen = new Set<string>();
-  return [...defaultPaths, ...config.skillPaths]
-    .map((path) => resolveSkillPath(path, cwd))
-    .filter((path) => {
-      if (seen.has(path)) return false;
-      seen.add(path);
-      return true;
-    });
+  return paths.filter((path) => {
+    if (seen.has(path) || !existsSync(path)) return false;
+    seen.add(path);
+    return true;
+  });
 }
 
 function resolveSkillPath(path: string, cwd: string): string {
   return resolve(cwd, expandHomePath(path));
 }
 
-export function loadWorkspaceSkills(config: ServerConfig, cwd: string): LoadedSkills {
+/**
+ * P1 #10: Load only project-local skills (from workspace `.agents/skills`).
+ * Global skills are loaded lazily via `search_skills` to reduce model context.
+ */
+export function loadProjectLocalSkills(config: ServerConfig, cwd: string): LoadedSkills {
   if (!config.skillsEnabled) return { skills: [], diagnostics: [] };
+
+  const { projectLocal } = effectiveSkillPaths(config, cwd);
 
   return loadSkills({
     cwd,
     agentDir: config.agentDir,
-    skillPaths: effectiveSkillPaths(config, cwd),
+    skillPaths: projectLocal,
+    includeDefaults: false,
+  });
+}
+
+/**
+ * P1 #10: Load a compact index of all skills (project + global) for discovery.
+ * Returns only name, description, and path — no file content.
+ */
+export function loadSkillIndex(
+  config: SkillConfig,
+  cwd: string,
+): Array<{
+  name: string;
+  description: string;
+  path: string;
+  source: "project-local" | "global";
+}> {
+  if (!config.skillsEnabled) return [];
+
+  const { projectLocal, global } = effectiveSkillPaths(config, cwd);
+  const seen = new Set<string>();
+  const index: Array<{ name: string; description: string; path: string; source: "project-local" | "global" }> = [];
+
+  for (const source of ["project-local", "global"] as const) {
+    const paths = source === "project-local" ? projectLocal : global;
+    if (paths.length === 0) continue;
+
+    try {
+      const result = loadSkills({
+        cwd,
+        agentDir: config.agentDir,
+        skillPaths: paths,
+        includeDefaults: false,
+      });
+
+      for (const skill of result.skills) {
+        const resolved = resolve(skill.filePath);
+        if (seen.has(resolved)) continue;
+        seen.add(resolved);
+        index.push({
+          name: skill.name,
+          description: skill.description,
+          path: formatPathForPrompt(skill.filePath),
+          source,
+        });
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  return index;
+}
+
+export function loadWorkspaceSkills(config: ServerConfig, cwd: string): LoadedSkills {
+  if (!config.skillsEnabled) return { skills: [], diagnostics: [] };
+
+  const { projectLocal, global } = effectiveSkillPaths(config, cwd);
+  const allPaths = [...projectLocal, ...global];
+
+  return loadSkills({
+    cwd,
+    agentDir: config.agentDir,
+    skillPaths: allPaths,
     includeDefaults: false,
   });
 }

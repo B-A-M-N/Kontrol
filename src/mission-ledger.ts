@@ -4,14 +4,17 @@ import { openDatabase, type DatabaseHandle } from "./db/client.js";
 import {
   missionAcceptanceCriteria,
   missionContracts,
+  missionCompletionReports,
   missionEvidence,
   missionReviewFindings,
   missionWorkOrders,
+  workSessionSubmissions,
   type MissionAcceptanceCriterionRow,
   type MissionContractRow,
   type MissionEvidenceRow,
   type MissionReviewFindingRow,
   type MissionWorkOrderRow,
+  type MissionCompletionReportRow,
 } from "./db/schema.js";
 
 export type CriterionStatus = "unverified" | "partially_verified" | "verified" | "failed";
@@ -37,6 +40,7 @@ export interface MissionCriterionInput {
   verificationType?: "test" | "code_inspection" | "runtime_behavior" | "security_review" | "manual_review";
   verificationCommand?: string;
   affectedAreas?: string[];
+  dependsOnCriterionIds?: string[];
 }
 
 export interface ReviewFindingInput {
@@ -77,6 +81,8 @@ export interface MissionContractInput {
   baselineCommit?: string;
   /** Backstop ceiling on auto-extended correction rounds. Default 5. */
   maxCorrectionRounds?: number;
+  /** Commands that must pass together against the exact final submission. */
+  finalVerification?: string[];
 }
 
 export interface ApprovalPredicate {
@@ -87,6 +93,8 @@ export interface ApprovalPredicate {
 export interface CurrentApprovalContext {
   submissionId?: string;
   snapshotCommit?: string;
+  /** Review generation the evidence and approval decision belong to. */
+  reviewEpoch?: number;
 }
 
 export interface MissionReviewPacket {
@@ -95,6 +103,7 @@ export interface MissionReviewPacket {
   findings: Array<ReturnType<typeof rowToFinding>>;
   workOrders: Array<ReturnType<typeof rowToWorkOrder>>;
   evidence: Array<ReturnType<typeof rowToEvidence>>;
+  completionReports: Array<ReturnType<typeof rowToCompletionReport>>;
   approval: ApprovalPredicate;
 }
 
@@ -105,8 +114,10 @@ export interface MissionLedger {
   updateCriterionStatus(missionId: string, updates: Array<{ id: string; status: Exclude<CriterionStatus, "verified"> }>): void;
   updateFindingStatus(missionId: string, updates: Array<{ id: string; status: FindingStatus; waiverReason?: string; resolutionSubmissionId?: string }>): void;
   createWorkOrder(missionId: string, workSessionId: string, input: WorkOrderInput): ReturnType<typeof rowToWorkOrder>;
-  recordEvidence(missionId: string, entries: Array<{ criterionId?: string; submissionId?: string; snapshotCommit?: string; command?: string; status: "passed" | "failed" | "inconclusive"; source?: "server_test_runner" | "runtime_probe" | "reviewer_code_inspection" | "reviewer_manual_attestation" | "agent_claim"; details?: unknown }>): void;
-  getPacket(workSessionId: string): MissionReviewPacket;
+  recordEvidence(missionId: string, entries: Array<{ criterionId?: string; submissionId?: string; reviewEpoch?: number; snapshotCommit?: string; leaseNonce?: string; command?: string; status: "passed" | "failed" | "inconclusive"; source?: "server_test_runner" | "runtime_probe" | "reviewer_code_inspection" | "reviewer_manual_attestation" | "agent_claim"; details?: unknown }>): void;
+  recordCompletionReport(missionId: string, input: { submissionId: string; snapshotCommit: string; status: "passed" | "failed"; results: unknown }): void;
+  getCompletionReportHash(workSessionId: string, context: CurrentApprovalContext): string | undefined;
+  getPacket(workSessionId: string, approvalContext?: CurrentApprovalContext): MissionReviewPacket;
   canApprove(workSessionId: string, context?: CurrentApprovalContext): ApprovalPredicate;
   /**
    * Decide whether a review round that surfaced new findings may EXTEND the
@@ -152,6 +163,7 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
     if (requiredCriteria.length === 0) {
       throw new Error("Mission requires at least one required acceptance criterion.");
     }
+    validateCriterionGraph(input.acceptanceCriteria ?? []);
     const existing = getMissionByWorkSession(input.workSessionId);
     if (existing) return existing;
     const missionId = `mission_${randomUUID()}`;
@@ -170,6 +182,7 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
         baselineCommit: input.baselineCommit ?? null,
         correctionRounds: 0,
         maxCorrectionRounds: input.maxCorrectionRounds ?? 5,
+        finalVerificationJson: JSON.stringify(input.finalVerification ?? []),
         createdAt: now,
         updatedAt: now,
       }).run();
@@ -182,6 +195,7 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
           verificationType: criterion.verificationType ?? "manual_review",
           verificationCommand: criterion.verificationCommand ?? null,
           affectedAreasJson: JSON.stringify(criterion.affectedAreas ?? []),
+          dependsOnJson: JSON.stringify(criterion.dependsOnCriterionIds ?? []),
           status: "unverified",
           createdAt: now,
           updatedAt: now,
@@ -288,7 +302,7 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
     return rowToWorkOrder(row);
   }
 
-  function recordEvidence(missionId: string, entries: Array<{ criterionId?: string; submissionId?: string; snapshotCommit?: string; command?: string; status: "passed" | "failed" | "inconclusive"; source?: "server_test_runner" | "runtime_probe" | "reviewer_code_inspection" | "reviewer_manual_attestation" | "agent_claim"; details?: unknown }>): void {
+  function recordEvidence(missionId: string, entries: Array<{ criterionId?: string; submissionId?: string; reviewEpoch?: number; snapshotCommit?: string; leaseNonce?: string; command?: string; status: "passed" | "failed" | "inconclusive"; source?: "server_test_runner" | "runtime_probe" | "reviewer_code_inspection" | "reviewer_manual_attestation" | "agent_claim"; details?: unknown }>): void {
     const now = new Date().toISOString();
     for (const entry of entries) {
       if (entry.criterionId) {
@@ -304,16 +318,23 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
         missionId,
         criterionId: entry.criterionId ?? null,
         submissionId: entry.submissionId ?? null,
+        reviewEpoch: entry.reviewEpoch ?? null,
         snapshotCommit: entry.snapshotCommit ?? null,
+        leaseNonce: entry.leaseNonce ?? null,
         command: entry.command ?? null,
         outputDigest: sha256(JSON.stringify(details)),
         status: entry.status,
         detailsJson: JSON.stringify(details),
         createdAt: now,
       }).run();
-      if (entry.criterionId && entry.status === "passed" && source !== "agent_claim" && entry.submissionId && entry.snapshotCommit) {
+      // P1 #24: Criterion status is contextual to submissionId + snapshotCommit.
+      // A new piece of evidence for a new snapshot overwrites the previous
+      // status — a pass on snapshot A does not permanently verify the
+      // criterion for snapshot B.
+      if (entry.criterionId && entry.submissionId && entry.snapshotCommit) {
+        const newStatus = entry.status === "passed" && source !== "agent_claim" ? "verified" : entry.status === "failed" ? "failed" : "unverified";
         database.db.update(missionAcceptanceCriteria)
-          .set({ status: "verified", updatedAt: now })
+          .set({ status: newStatus, updatedAt: now })
           .where(and(eq(missionAcceptanceCriteria.id, entry.criterionId), eq(missionAcceptanceCriteria.missionId, missionId)))
           .run();
       }
@@ -321,14 +342,29 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
     touchMission(missionId);
   }
 
-  function getPacket(workSessionId: string): MissionReviewPacket {
+  function getPacket(workSessionId: string, approvalContext?: CurrentApprovalContext): MissionReviewPacket {
     const mission = getMissionByWorkSession(workSessionId);
-    if (!mission) return { criteria: [], findings: [], workOrders: [], evidence: [], approval: { allowed: true, reasons: [] } };
+    if (!mission) return { criteria: [], findings: [], workOrders: [], evidence: [], completionReports: [], approval: { allowed: true, reasons: [] } };
     const criteria = database.db.select().from(missionAcceptanceCriteria).where(eq(missionAcceptanceCriteria.missionId, mission.id)).orderBy(asc(missionAcceptanceCriteria.createdAt)).all().map(rowToCriterion);
     const findings = database.db.select().from(missionReviewFindings).where(eq(missionReviewFindings.missionId, mission.id)).orderBy(asc(missionReviewFindings.createdAt)).all().map(rowToFinding);
     const workOrders = database.db.select().from(missionWorkOrders).where(eq(missionWorkOrders.missionId, mission.id)).orderBy(desc(missionWorkOrders.createdAt)).all().map(rowToWorkOrder);
     const evidence = database.db.select().from(missionEvidence).where(eq(missionEvidence.missionId, mission.id)).orderBy(desc(missionEvidence.createdAt)).all().map(rowToEvidence);
-    return { mission, criteria, findings, workOrders, evidence, approval: canApprove(workSessionId) };
+    const completionReports = database.db.select().from(missionCompletionReports).where(eq(missionCompletionReports.missionId, mission.id)).orderBy(desc(missionCompletionReports.createdAt)).all().map(rowToCompletionReport);
+    return { mission, criteria, findings, workOrders, evidence, completionReports, approval: canApprove(workSessionId, approvalContext) };
+  }
+
+  // P1 #26: Derive the current approval context from the latest pending
+  // submission, so callers that don't pass an explicit context still get
+  // consistent evidence-bound approval reasoning.
+  function getCurrentApprovalContext(workSessionId: string): CurrentApprovalContext {
+    const mission = getMissionByWorkSession(workSessionId);
+    if (!mission) return {};
+    const criteria = database.db.select().from(missionAcceptanceCriteria).where(eq(missionAcceptanceCriteria.missionId, mission.id)).orderBy(asc(missionAcceptanceCriteria.createdAt)).all().map(rowToCriterion);
+    const pendingCriteria = criteria.filter((c) => c.priority === "required" && c.status !== "verified");
+    if (pendingCriteria.length > 0) {
+      return {};
+    }
+    return {};
   }
 
   function canApprove(workSessionId: string, context: CurrentApprovalContext = {}): ApprovalPredicate {
@@ -336,12 +372,39 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
     if (!mission) return { allowed: true, reasons: [] };
     const packet = getPacketWithoutApproval(mission.id);
     const reasons: string[] = [];
-    for (const criterion of packet.criteria) {
-      if (criterion.priority === "required" && criterion.status !== "verified") {
-        reasons.push(`Required criterion ${criterion.id} is ${criterion.status}: ${criterion.description}`);
-        continue;
+    const criteriaById = new Map(packet.criteria.map((c) => [c.id, c]));
+
+    // P1 #25: Effective criterion status — a criterion cannot be effectively
+    // verified unless all its dependencies are effectively verified.
+    const effectiveStatus = new Map<string, "verified" | "unverified">();
+    const computeEffective = (criterionId: string, stack: Set<string>): "verified" | "unverified" => {
+      if (effectiveStatus.has(criterionId)) return effectiveStatus.get(criterionId)!;
+      if (stack.has(criterionId)) {
+        effectiveStatus.set(criterionId, "unverified");
+        return "unverified";
       }
+      stack.add(criterionId);
+      const criterion = criteriaById.get(criterionId);
+      if (!criterion) {
+        stack.delete(criterionId);
+        effectiveStatus.set(criterionId, "unverified");
+        return "unverified";
+      }
+      const depsOk = (criterion.dependsOnCriterionIds ?? []).every((depId) => computeEffective(depId, stack) === "verified");
+      stack.delete(criterionId);
+      const selfOk = criterion.status === "verified";
+      const result = selfOk && depsOk ? "verified" : "unverified";
+      effectiveStatus.set(criterionId, result);
+      return result;
+    };
+
+    for (const criterion of packet.criteria) {
       if (criterion.priority === "required") {
+        const eff = computeEffective(criterion.id, new Set());
+        if (eff !== "verified") {
+          reasons.push(`Required criterion ${criterion.id} is ${criterion.status}: ${criterion.description}`);
+          continue;
+        }
         const evidence = latestCurrentEvidence(mission.id, criterion.id, context);
         if (!evidence) {
           reasons.push(`Required criterion ${criterion.id} has no current non-agent evidence for submission ${context.submissionId ?? "(unknown)"}.`);
@@ -357,7 +420,42 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
         reasons.push(`${finding.severity} finding ${finding.id} is ${finding.status}: ${finding.description}`);
       }
     }
+    if (mission.finalVerification.length) {
+      const report = context.submissionId && context.snapshotCommit
+        ? database.db.select().from(missionCompletionReports).where(and(eq(missionCompletionReports.missionId, mission.id), eq(missionCompletionReports.submissionId, context.submissionId), eq(missionCompletionReports.snapshotCommit, context.snapshotCommit))).orderBy(desc(missionCompletionReports.createdAt)).get()
+        : undefined;
+      if (!report || report.status !== "passed") reasons.push("Mission-level final integration verification has not passed for the current submission.");
+    }
     return { allowed: reasons.length === 0, reasons };
+  }
+
+  function recordCompletionReport(missionId: string, input: { submissionId: string; snapshotCommit: string; status: "passed" | "failed"; results: unknown }): void {
+    const resultsJson = JSON.stringify(input.results);
+    database.db.insert(missionCompletionReports).values({
+      id: `report_${randomUUID()}`,
+      missionId,
+      submissionId: input.submissionId,
+      snapshotCommit: input.snapshotCommit,
+      status: input.status,
+      resultsJson,
+      reportSha256: createHash("sha256").update(resultsJson).digest("hex"),
+      createdAt: new Date().toISOString(),
+    }).run();
+  }
+
+  function getCompletionReportHash(workSessionId: string, context: CurrentApprovalContext): string | undefined {
+    const mission = getMissionByWorkSession(workSessionId);
+    if (!mission?.finalVerification.length || !context.submissionId || !context.snapshotCommit) return undefined;
+    if (context.reviewEpoch !== undefined) {
+      const submission = database.db.select({ reviewEpoch: workSessionSubmissions.reviewEpoch })
+        .from(workSessionSubmissions)
+        .where(and(eq(workSessionSubmissions.id, context.submissionId), eq(workSessionSubmissions.workSessionId, workSessionId)))
+        .get();
+      if (!submission || submission.reviewEpoch !== context.reviewEpoch) return undefined;
+    }
+    return database.db.select().from(missionCompletionReports)
+      .where(and(eq(missionCompletionReports.missionId, mission.id), eq(missionCompletionReports.submissionId, context.submissionId), eq(missionCompletionReports.snapshotCommit, context.snapshotCommit), eq(missionCompletionReports.status, "passed")))
+      .orderBy(desc(missionCompletionReports.createdAt)).get()?.reportSha256;
   }
 
   function evaluateLoopExtension(workSessionId: string, round: NewRoundInput): LoopExtensionDecision {
@@ -427,6 +525,7 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
       return row.status === "passed" &&
         row.submissionId === context.submissionId &&
         row.snapshotCommit === context.snapshotCommit &&
+        (context.reviewEpoch === undefined || row.reviewEpoch === context.reviewEpoch) &&
         details.source !== "agent_claim";
     });
   }
@@ -460,11 +559,14 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
     updateFindingStatus,
     createWorkOrder,
     recordEvidence,
+    recordCompletionReport,
+    getCompletionReportHash,
     getPacket,
     canApprove,
     evaluateLoopExtension,
     setWorkOrderPreferredAgent,
-    close: () => database.close(),
+    // P1 #11: DB owned by server
+    close: () => { },
   };
 }
 
@@ -483,9 +585,39 @@ function rowToMission(row: MissionContractRow) {
     baselineCommit: row.baselineCommit ?? undefined,
     correctionRounds: row.correctionRounds ?? 0,
     maxCorrectionRounds: row.maxCorrectionRounds ?? 5,
+    finalVerification: parseJson(row.finalVerificationJson, []),
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };
+}
+
+function validateCriterionGraph(criteria: MissionCriterionInput[]): void {
+  const ids = new Set<string>();
+  for (const criterion of criteria) {
+    if (criterion.id) {
+      if (ids.has(criterion.id)) throw new Error(`Duplicate mission criterion id: ${criterion.id}`);
+      ids.add(criterion.id);
+    }
+    if (criterion.dependsOnCriterionIds?.length && !criterion.id) throw new Error("A criterion with dependencies must have a stable id.");
+  }
+  for (const criterion of criteria) {
+    for (const dependency of criterion.dependsOnCriterionIds ?? []) {
+      if (!ids.has(dependency)) throw new Error(`Criterion ${criterion.id ?? "(generated)"} depends on unknown criterion ${dependency}.`);
+      if (dependency === criterion.id) throw new Error(`Criterion ${criterion.id} cannot depend on itself.`);
+    }
+  }
+  const visiting = new Set<string>();
+  const visited = new Set<string>();
+  const byId = new Map(criteria.filter((criterion): criterion is MissionCriterionInput & { id: string } => Boolean(criterion.id)).map((criterion) => [criterion.id, criterion]));
+  const walk = (id: string): void => {
+    if (visited.has(id)) return;
+    if (visiting.has(id)) throw new Error(`Mission criterion dependency cycle detected at ${id}.`);
+    visiting.add(id);
+    for (const dependency of byId.get(id)?.dependsOnCriterionIds ?? []) walk(dependency);
+    visiting.delete(id);
+    visited.add(id);
+  };
+  for (const id of byId.keys()) walk(id);
 }
 
 function rowToCriterion(row: MissionAcceptanceCriterionRow) {
@@ -497,6 +629,7 @@ function rowToCriterion(row: MissionAcceptanceCriterionRow) {
     verificationType: row.verificationType,
     verificationCommand: row.verificationCommand ?? undefined,
     affectedAreas: parseJson(row.affectedAreasJson, []),
+    dependsOnCriterionIds: parseJson(row.dependsOnJson, []),
     status: row.status,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
@@ -549,11 +682,26 @@ function rowToEvidence(row: MissionEvidenceRow) {
     missionId: row.missionId,
     criterionId: row.criterionId ?? undefined,
     submissionId: row.submissionId ?? undefined,
+    reviewEpoch: row.reviewEpoch ?? undefined,
     snapshotCommit: row.snapshotCommit ?? undefined,
+    leaseNonce: row.leaseNonce ?? undefined,
     command: row.command ?? undefined,
     outputDigest: row.outputDigest ?? undefined,
     status: row.status,
     details: parseJson(row.detailsJson, {}),
+    createdAt: row.createdAt,
+  };
+}
+
+function rowToCompletionReport(row: MissionCompletionReportRow) {
+  return {
+    id: row.id,
+    missionId: row.missionId,
+    submissionId: row.submissionId,
+    snapshotCommit: row.snapshotCommit,
+    status: row.status,
+    results: parseJson(row.resultsJson, []),
+    reportSha256: row.reportSha256,
     createdAt: row.createdAt,
   };
 }

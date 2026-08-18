@@ -2,7 +2,11 @@ import { spawn } from "node:child_process";
 import { resolveShellCommand, terminateProcessTree } from "./process-platform.js";
 
 const DEFAULT_EXEC_YIELD_MS = 10_000;
-const DEFAULT_INTERACTIVE_YIELD_MS = 250;
+// A stdin write commonly wakes a shell/child before the child performs its
+// final output and exit. 250 ms is too short under ordinary machine load and
+// causes callers to receive a misleading still-running snapshot. Callers that
+// need an immediate yield may still pass an explicit shorter value.
+const DEFAULT_INTERACTIVE_YIELD_MS = 1_000;
 const DEFAULT_POLL_YIELD_MS = 5_000;
 const MAX_COMMAND_YIELD_MS = 30_000;
 const MAX_POLL_YIELD_MS = 110_000;
