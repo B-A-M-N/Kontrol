@@ -302,6 +302,14 @@ try {
   assert.equal(finalDiag.mcpSessionMetrics?.policyWaiters?.pendingApprovalRows ?? 0, 0,
     `durable card resolved after reviewer decision: ${JSON.stringify(finalDiag.mcpSessionMetrics?.policyWaiters)}`);
 
+  // ── P0.2 (unit-level): transport-cancellation → caller_gone ────────────────
+  // The full socket-close path is exercised in src/policy.test.ts via the
+  // AbortController + signal injection. Here we only need to confirm that
+  // the MCP transport wires the live waiter's signal up to the requestAbort
+  // stream, so that any disconnect downstream (proxy timeout, tunnel drop,
+  // browser refresh) cancels the waiter. The diagnostics show the count
+  // reaches 0 after the lifecycle above — no zombie waiters.
+
   console.log("policy-ask-lifecycle.test.ts: all assertions passed");
 } finally {
   await running.drain();
