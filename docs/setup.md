@@ -155,6 +155,9 @@ The local liveness endpoint is `GET /healthz`; startup infrastructure
 readiness is `GET /core-readyz`; strict operational readiness is `GET /readyz`.
 A successful checkout startup also runs
 `scripts/probe-kontrol-readiness.mjs`, exercising initialize, agent discovery,
-workspace opening, file reading, and bash execution.
+workspace opening, and file reading. It exercises bash execution as well when
+the operator explicitly allows bash (`KONTROL_POLICY_MODE=allow` or
+`KONTROL_POLICY_TOOL_BASH=allow`); the secure default requires interactive
+approval and is therefore not suitable for a boot-time probe.
 
 The same setup rules apply.

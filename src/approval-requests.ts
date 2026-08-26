@@ -67,6 +67,7 @@ export interface ApprovalRequestManager {
 export function createApprovalRequestManager(
   stateDirOrHandle: string | DatabaseHandle,
 ): ApprovalRequestManager {
+  const TOOL_APPROVAL_TTL_MS = 5 * 60_000;
   const database =
     typeof stateDirOrHandle === "string" ? openDatabase(stateDirOrHandle) : stateDirOrHandle;
 
@@ -89,7 +90,13 @@ export function createApprovalRequestManager(
       options: input.options?.length ? input.options : defaultOptions(),
       status: "pending",
       createdAt: now,
-      expiresAt: input.expiresAt,
+      // Policy waiters are in-memory. A tool approval must therefore carry a
+      // durable expiry so a server restart cannot leave an approval card (and
+      // its abandoned caller) pending forever. Explicit expiries remain
+      // authoritative for other approval kinds.
+      expiresAt: input.expiresAt ?? (input.kind === "tool"
+        ? new Date(Date.parse(now) + TOOL_APPROVAL_TTL_MS).toISOString()
+        : undefined),
     };
 
     database.db.insert(approvalRequests).values({

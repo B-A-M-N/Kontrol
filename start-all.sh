@@ -351,7 +351,7 @@ smoke_adapter() {
     local response
     response=$(curl -s --max-time 5 -X POST "http://127.0.0.1:${port}/runs" \
       -H "Content-Type: application/json" \
-      -H "Authorization: Bearer ${KONTROL_ACP_ADAPTER_SECRET:-}" \\
+      -H "Authorization: Bearer ${KONTROL_ACP_ADAPTER_SECRET:-}" \
       --data "$body" 2>/dev/null || echo "")
     if echo "$response" | grep -q '"smoke_test":true'; then ok=1; break; fi
     echo -n "."
@@ -412,6 +412,15 @@ echo "[*] Probing registered agents and MCP workspace round-trip..."
 PROBE_FLAGS=()
 if [[ "${KONTROL_ACP_ENABLED:-true}" == "false" ]]; then
   PROBE_FLAGS+=(--skip-discover)
+fi
+# Bash is secure-by-default and may require a human approval. A boot-time
+# readiness probe cannot satisfy an interactive approval, so exercise the
+# shell path only when the effective bash policy explicitly allows it. A
+# per-tool rule overrides the global mode; with neither configured, the secure
+# baseline is `ask`.
+EFFECTIVE_BASH_POLICY="${KONTROL_POLICY_TOOL_BASH:-${KONTROL_POLICY_MODE:-ask}}"
+if [[ "${EFFECTIVE_BASH_POLICY,,}" == "allow" ]]; then
+  PROBE_FLAGS+=(--probe-bash)
 fi
 if ! node scripts/probe-kontrol-readiness.mjs \
   --url "http://${DEV_HOST}:${DEV_PORT}/mcp" \
