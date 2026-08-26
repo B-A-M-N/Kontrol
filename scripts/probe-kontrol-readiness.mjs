@@ -14,6 +14,7 @@ function flag(name, fallback) {
 const url = flag("--url", "http://127.0.0.1:7676/mcp");
 const workspace = resolve(flag("--workspace", process.cwd()));
 const skipDiscover = args.includes("--skip-discover");
+const probeBash = args.includes("--probe-bash");
 const agentSpecs = args
   .map((value, index) => value === "--agent" ? args[index + 1] : undefined)
   .filter(Boolean)
@@ -113,8 +114,10 @@ const opened = await callTool("open_workspace", { path: workspace, mode: "checko
 assert.ok(opened?.workspaceId, "open_workspace did not return workspaceId");
 const read = await callTool("read", { workspaceId: opened.workspaceId, path: "package.json", limit: 5 });
 assert.ok(typeof read?.result === "string" || JSON.stringify(read).includes("@b-a-m-n/kontrol"), "read did not return the fixture file");
-const bash = await callTool("bash", { workspaceId: opened.workspaceId, command: "pwd", timeout: 10 });
-assert.ok(typeof bash?.result === "string" || JSON.stringify(bash).includes(workspace), "bash did not execute in the opened workspace");
+if (probeBash) {
+  const bash = await callTool("bash", { workspaceId: opened.workspaceId, command: "pwd", timeout: 10 });
+  assert.ok(typeof bash?.result === "string" || JSON.stringify(bash).includes(workspace), "bash did not execute in the opened workspace");
+}
 
 if (sessionId) {
   await fetch(url, {

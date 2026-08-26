@@ -99,6 +99,21 @@ interface PolicyApprovalView {
   error?: string;
 }
 
+interface PendingApprovalRecord {
+  approvalId: string;
+  workspaceId?: string;
+  workspaceSessionId?: string;
+  workSessionId?: string;
+  kind?: string;
+  title?: string;
+  description?: string;
+  risk?: string;
+  tool?: string;
+  path?: string;
+  command?: string;
+  options?: PolicyApprovalView["options"];
+}
+
 interface AgentMessageView {
   messageId: string;
   kind: string;
@@ -479,8 +494,36 @@ async function rehydrateActiveSessions(): Promise<void> {
     if (sessions.length && (!selectedWorkSessionId || !workSessionViews.has(selectedWorkSessionId))) {
       selectedWorkSessionId = sessions[0].sessionId;
     }
+
+    // Pending tool approvals are durable, but direct client calls do not
+    // belong to a work-session snapshot. Rehydrate them explicitly so a UI
+    // reconnect cannot miss the live approval event and strand the caller.
+    const directApprovals: PendingApprovalRecord[] = [];
+    try {
+      const approvalResult = await callServerToolChecked({
+        name: "list_pending_approvals",
+        arguments: { workspaceId },
+      });
+      const pending = getStructuredContent<{ approvals?: PendingApprovalRecord[] }>(approvalResult)?.approvals ?? [];
+      for (const approval of pending) {
+        const target = approval.workSessionId
+          ? ensureWorkSessionView(approval.workSessionId, approval.workspaceSessionId ?? workspaceId, "")
+          : undefined;
+        if (target) mergePendingApproval(target, approval, workspaceId);
+        else directApprovals.push(approval);
+      }
+    } catch {
+      // Approval visibility must not prevent the rest of the workspace from
+      // rehydrating. The live watcher remains the fallback for new requests.
+    }
+    if (directApprovals.length > 0) {
+      const selected = selectedWorkSessionId ? workSessionViews.get(selectedWorkSessionId) : undefined;
+      const target = selected ?? ensureWorkSessionView("__approval_center__", workspaceId, "");
+      for (const approval of directApprovals) mergePendingApproval(target, approval, workspaceId);
+      if (!selected) selectedWorkSessionId = target.workSessionId;
+    }
     const selected = selectedWorkSessionId ? workSessionViews.get(selectedWorkSessionId) : undefined;
-    if (selected) await hydrateWorkSessionSnapshot(selected);
+    if (selected && selected.workSessionId !== "__approval_center__") await hydrateWorkSessionSnapshot(selected);
     workspaceWatcherGeneration += 1;
     void watchWorkspaceEvents(workspaceId, workspaceEventCursor, workspaceWatcherGeneration);
     scheduleRender();
@@ -748,6 +791,23 @@ function ensureWorkSessionView(workSessionId: string, workspaceSessionId: string
   return view;
 }
 
+function mergePendingApproval(view: WorkSessionViewState, approval: PendingApprovalRecord, fallbackWorkspaceId: string): void {
+  view.policyApprovals.set(approval.approvalId, {
+    approvalId: approval.approvalId,
+    workspaceId: approval.workspaceId ?? approval.workspaceSessionId ?? fallbackWorkspaceId,
+    workSessionId: approval.workSessionId,
+    kind: approval.kind,
+    title: approval.title,
+    description: approval.description,
+    risk: approval.risk,
+    tool: approval.tool ?? "tool",
+    path: approval.path,
+    command: approval.command,
+    options: approval.options,
+  });
+  view.pendingApprovalCount = view.policyApprovals.size;
+}
+
 function applyHostContext(): void {
   if (hostContext?.theme) applyDocumentTheme(hostContext.theme);
   if (hostContext?.styles?.variables) {
@@ -968,7 +1028,9 @@ function renderWorkSessionView(view: WorkSessionViewState): void {
   const dom = currentWorkSessionDom ?? createWorkSessionDom(view.workSessionId);
   currentWorkSessionDom = dom;
 
-  dom.titleStatus.textContent = view.title ?? view.status;
+  dom.titleStatus.textContent = view.workSessionId === "__approval_center__"
+    ? "Approval Center"
+    : view.title ?? view.status;
   dom.statusBadge.textContent = view.status;
   dom.meta.replaceChildren();
   if (view.workspaceSessionId) dom.meta.append(element("span", { className: "agent-meta-row", text: `workspace: ${view.workspaceSessionId}` }));
@@ -1477,15 +1539,24 @@ async function watchWorkspaceEvents(workspaceId: string, initialSeq: number, gen
       }>(result);
       if (!content) continue;
       for (const event of content.events) {
-        if (!workSessionViews.has(event.sessionId)) {
+        const isApprovalEvent = event.type === "policy.approval_requested"
+          || event.type === "approval.requested"
+          || event.type === "policy.approval.provided"
+          || event.type === "approval.resolved";
+        const eventWorkSessionId = typeof event.payload?.workSessionId === "string"
+          ? event.payload.workSessionId
+          : undefined;
+        const targetSessionId = eventWorkSessionId
+          ?? (isApprovalEvent && selectedWorkSessionId ? selectedWorkSessionId : event.sessionId);
+        if (!workSessionViews.has(targetSessionId)) {
           // Correlation is enough to create a lightweight view immediately;
           // reduce the triggering event before the full snapshot arrives.
-          ensureWorkSessionView(event.sessionId, event.workspaceSessionId ?? workspaceId, "");
-          reduceWorkSessionEvent(event.sessionId, event);
+          ensureWorkSessionView(targetSessionId, event.workspaceSessionId ?? workspaceId, "");
+          reduceWorkSessionEvent(targetSessionId, event);
           queueSessionRehydration();
           continue;
         }
-        reduceWorkSessionEvent(event.sessionId, event);
+        reduceWorkSessionEvent(targetSessionId, event);
       }
       cursor = Math.max(cursor, content.nextSeq);
       workspaceEventCursor = cursor;

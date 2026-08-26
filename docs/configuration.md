@@ -116,9 +116,14 @@ available.
 
 The checkout launcher calls `scripts/probe-kontrol-readiness.mjs` after the
 adapters register. That probe performs a real MCP initialize, discovers the
-registered agents, opens the configured workspace, reads `package.json`, and
-runs `pwd`. Build identity remains an internal readiness check; unauthenticated
-liveness and readiness responses expose only boolean status fields.
+registered agents, opens the configured workspace, and reads `package.json`.
+It also runs `pwd` only when bash is explicitly configured with
+`KONTROL_POLICY_MODE=allow` or `KONTROL_POLICY_TOOL_BASH=allow`; the secure
+default requires human approval, which cannot be satisfied by a boot-time
+probe. Pass `--probe-bash` when invoking the probe directly under an equivalent
+explicit allow policy. Build identity remains an internal readiness check;
+unauthenticated liveness and readiness responses expose only boolean status
+fields.
 
 Workflow durability is split deliberately: lifecycle, review, approval,
 continuation, and policy events are append-only audit records. High-volume

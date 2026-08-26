@@ -21,6 +21,7 @@ const root = process.cwd();
 const tmp = mkdtempSync(join(tmpdir(), "kontrol-package-"));
 
 try {
+  console.log("[package-release] packing release artifact...");
   execFileSync("npm", ["pack", "--pack-destination", tmp], {
     cwd: root,
     env: { ...process.env, npm_config_cache: join(tmp, "npm-cache") },
@@ -52,10 +53,12 @@ try {
   // tarball. This catches missing runtime files and package-relative imports
   // that the checkout's node_modules symlink would otherwise hide.
   const installPrefix = join(tmp, "clean-prefix");
+  console.log("[package-release] installing clean artifact (using the configured npm cache)...");
   execFileSync("npm", [
     "install",
     "--prefix",
     installPrefix,
+    "--prefer-offline",
     "--no-audit",
     "--no-fund",
     "--package-lock=false",
@@ -64,7 +67,6 @@ try {
     cwd: tmp,
     env: {
       ...process.env,
-      npm_config_cache: join(tmp, "npm-cache-install"),
       npm_config_update_notifier: "false",
     },
     encoding: "utf8",
@@ -119,6 +121,7 @@ try {
     "scripts/acp-stdio-duplex-adapter.mjs",
     "scripts/mcp-stdio-bridge.mjs",
   ];
+  console.log("[package-release] validating installed server and shipped adapters...");
 
   for (const script of shippedScripts) {
     const source = await readFile(join(pkg, script), "utf8");
