@@ -55,10 +55,36 @@ assert.doesNotThrow(
   "invalid tool mode is ignored, not thrown",
 );
 const cfgWithBadTool = loadPolicyConfig({ ...baseEnv, KONTROL_POLICY_TOOL_WRITE: "asks" });
-assert.equal(cfgWithBadTool.toolRules.write, undefined);
+// An invalid explicit tool rule is ignored, so the secure-baseline `ask`
+// applies to the mutating tool rather than silently allowing it.
+assert.equal(cfgWithBadTool.toolRules.write, "ask", "invalid tool mode ignored; secure baseline applies");
 
 const cfg = loadPolicyConfig(baseEnv);
 assert.equal(cfg.defaultMode, "allow");
+
+// Secure-by-default baseline: a zero-policy environment must NOT silently
+// grant arbitrary shell/write authority — mutating tools gate behind `ask`
+// while read-only inspection stays frictionless.
+const zeroPolicy = loadPolicyConfig({ ...baseEnv, KONTROL_POLICY_TOOL_BASH: "" });
+assert.equal(zeroPolicy.toolRules.bash, "ask", "bash must default to ask");
+assert.equal(zeroPolicy.toolRules.write, "ask", "write must default to ask");
+assert.equal(zeroPolicy.toolRules.edit, "ask", "edit must default to ask");
+assert.equal(zeroPolicy.toolRules.apply_patch, "ask", "apply_patch must default to ask");
+const zeroEngine = createPolicyEngine(zeroPolicy);
+assert.equal(zeroEngine.evaluate("bash", undefined, "ws").mode, "ask", "zero-policy bash evaluates to ask");
+assert.equal(zeroEngine.evaluate("exec_command", undefined, "ws").mode, "ask", "exec_command alias gates as bash -> ask");
+assert.equal(zeroEngine.evaluate("kontrol-shell", undefined, "ws").mode, "ask", "kontrol-shell alias gates as bash -> ask");
+assert.equal(zeroEngine.evaluate("write", "/tmp/x", "ws").mode, "ask", "zero-policy write evaluates to ask");
+assert.equal(zeroEngine.evaluate("read", "/tmp/x", "ws").mode, "allow", "read stays frictionless under the baseline");
+assert.equal(zeroEngine.evaluate("grep", undefined, "ws").mode, "allow", "grep stays frictionless under the baseline");
+
+// Explicit per-tool rules win over the baseline.
+const explicitBash = loadPolicyConfig({ ...baseEnv, KONTROL_POLICY_TOOL_BASH: "allow" });
+assert.equal(explicitBash.toolRules.bash, "allow", "operator may explicitly promote bash");
+
+// Explicit global mode overrides the baseline entirely (operator decision).
+const explicitGlobal = loadPolicyConfig({ ...baseEnv, KONTROL_POLICY_MODE: "allow" });
+assert.deepEqual(explicitGlobal.toolRules, {}, "explicit global allow suppresses the baseline");
 
 // Path rules via JSON
 const envWithPathRules = {
@@ -146,6 +172,10 @@ const restartedPolicy = createPolicyEngine(
   approvalManagerAfterRestart,
 );
 assert.equal(restartedPolicy.getPendingApprovals(WS)[0]?.id, "pol_durable_restart");
+assert.ok(
+  approvalManagerAfterRestart.get("pol_durable_restart")?.options.some((option) => option.id === "approve_workspace"),
+  "policy approval cards must offer durable workspace approval",
+);
 restartedPolicy.resolvePending("pol_durable_restart", "approved", "test restart recovery");
 assert.equal(approvalManagerAfterRestart.get("pol_durable_restart")?.status, "approved");
 
@@ -164,6 +194,21 @@ policy.recordApproval("principal-2", "tool:write", "work_session", { workspaceId
 assert.equal(policy.isApproved("principal-2", "tool:write", { workspaceId: WS, workSessionId: "wsess-B" }), false);
 policy.recordApproval("principal-2", "tool:write", "workspace", { workspaceId: WS, workSessionId: "wsess-C" });
 assert.equal(policy.isApproved("principal-2", "tool:write", { workspaceId: WS, workSessionId: "wsess-D" }), true);
+
+// Work-session grants require an actual session and can be revoked without
+// restarting the policy engine. IDs are intentionally opaque so re-approval
+// after revocation cannot collide with a historical row.
+policy.recordApproval("principal-revoke", "tool:write", "work_session", { workspaceId: WS });
+assert.equal(policy.isApproved("principal-revoke", "tool:write", { workspaceId: WS, workSessionId: "missing" }), false);
+policy.recordApproval("principal-revoke", "tool:write", "work_session", { workspaceId: WS, workSessionId: "wsess-revoke" });
+const firstGrant = grantStore.listEffective().find((g) => g.principalId === "principal-revoke");
+assert.ok(firstGrant);
+policy.revokeScope("work_session", "wsess-revoke");
+assert.equal(policy.isApproved("principal-revoke", "tool:write", { workspaceId: WS, workSessionId: "wsess-revoke" }), false);
+policy.recordApproval("principal-revoke", "tool:write", "work_session", { workspaceId: WS, workSessionId: "wsess-revoke" });
+const secondGrant = grantStore.listEffective().find((g) => g.principalId === "principal-revoke");
+assert.ok(secondGrant);
+assert.notEqual(firstGrant.id, secondGrant.id);
 
 // ── Test 5: durable grant store survives restart ──
 
@@ -218,6 +263,50 @@ const r2 = await enforcer.enforce({
   path: "x.txt",
 });
 assert.equal(r2.allowed, true);
+
+// Blocking policy approval must not silently fall back to the old five-minute
+// request lifetime. The server may supply a deployment-specific backstop, but
+// the library default is deliberately long-lived and caller disconnects are a
+// separate cancellation path.
+const longWaitPolicy = createPolicyEngine({ defaultMode: "ask", toolRules: {}, pathRules: [] });
+const longWaitEnforcer = createPolicyEnforcer(longWaitPolicy, eventStore);
+const originalLongWait = eventStore.waitForMatchingEventAfter;
+let observedDefaultTimeout = 0;
+(eventStore as any).waitForMatchingEventAfter = async (...args: any[]) => {
+  observedDefaultTimeout = args[3];
+  return null;
+};
+try {
+  await longWaitEnforcer.enforce({
+    principalId: "long-lived-principal",
+    principalRole: "client",
+    workspaceId: WS,
+    tool: "write",
+    path: "long-lived.txt",
+  });
+} finally {
+  (eventStore as any).waitForMatchingEventAfter = originalLongWait;
+}
+assert.ok(observedDefaultTimeout > 5 * 60_000, "default approval wait must exceed five minutes");
+
+// A disconnected originating request cancels only its own parked approval.
+const cancellationPolicy = createPolicyEngine({ defaultMode: "ask", toolRules: {}, pathRules: [] });
+const cancellationEnforcer = createPolicyEnforcer(cancellationPolicy, eventStore);
+const cancellation = new AbortController();
+const cancellationResult = cancellationEnforcer.enforce({
+  principalId: "disconnecting-principal",
+  principalRole: "client",
+  workspaceId: WS,
+  tool: "write",
+  path: "disconnecting.txt",
+  signal: cancellation.signal,
+});
+await new Promise((resolve) => setTimeout(resolve, 0));
+cancellation.abort();
+const cancelled = await cancellationResult;
+assert.equal(cancelled.allowed, false);
+assert.equal(cancelled.outcome, "cancelled");
+assert.equal(cancellationPolicy.getPendingApprovals().length, 0, "disconnected approval waiter must be cleaned up");
 
 // ── Test 8: identical concurrent invocations remain independently approved ──
 

@@ -22,14 +22,86 @@ assert.equal(loadConfig({ ...baseEnv, KONTROL_TOOL_MODE: "codex" }).toolMode, "c
 assert.equal(loadConfig({ ...baseEnv, KONTROL_MINIMAL_TOOLS: "0" }).toolMode, "full");
 assert.equal(loadConfig({ ...baseEnv, KONTROL_MINIMAL_TOOLS: "1" }).toolMode, "minimal");
 assert.equal(loadConfig(baseEnv).skillsEnabled, true);
-assert.equal(loadConfig(baseEnv).mcpUnusedSessionIdleMs, 120_000);
-assert.equal(loadConfig(baseEnv).mcpEphemeralSessionIdleMs, 300_000);
-assert.equal(loadConfig(baseEnv).mcpReusableSessionIdleMs, 900_000);
+assert.deepEqual(loadConfig(baseEnv).childEnvironmentAllowlist, []);
+assert.deepEqual(loadConfig({ ...baseEnv, KONTROL_CHILD_ENV_ALLOWLIST: "SSH_AUTH_SOCK,HTTP_PROXY,not-valid-name!" }).childEnvironmentAllowlist, ["SSH_AUTH_SOCK", "HTTP_PROXY"]);
+assert.deepEqual(loadConfig({ ...baseEnv, KONTROL_VERIFY_TOOLCHAIN_PATHS: "/opt/node,/opt/cargo" }).verifyToolchainPaths, ["/opt/node", "/opt/cargo"]);
+assert.equal(loadConfig(baseEnv).webhookEnabled, false);
+assert.deepEqual(loadConfig({ ...baseEnv, KONTROL_WEBHOOKS: "1", KONTROL_WEBHOOK_ALLOWED_HOSTS: "hooks.example,api.example" }).webhookAllowedHosts, ["hooks.example", "api.example"]);
+
+// P1 #5: ACP credential strength / role-separation validation.
+const long = "x".repeat(48);
+assert.doesNotThrow(() => loadConfig({
+  ...baseEnv,
+  KONTROL_ACP_AGENT_SECRET: "a" + "0".repeat(47),
+  KONTROL_ACP_REVIEWER_SECRET: "b" + "0".repeat(47),
+  KONTROL_ACP_ADAPTER_SECRET: "c" + "0".repeat(47),
+}), "distinct strong secrets accepted");
+
+// Secrets built at runtime so key-shaped literals never appear in source.
+const shortSecret = "short-" + "0".repeat(10); // 16 chars < 32
+assert.throws(
+  () => loadConfig({
+    ...baseEnv,
+    KONTROL_ACP_AGENT_SECRET: shortSecret,
+    KONTROL_ACP_REVIEWER_SECRET: "b" + "0".repeat(47),
+    KONTROL_ACP_ADAPTER_SECRET: "c" + "0".repeat(47),
+  }),
+  /at least 32 characters/,
+  "short ACP secret rejected",
+);
+
+const dup = "d" + "0".repeat(47);
+assert.throws(
+  () => loadConfig({
+    ...baseEnv,
+    KONTROL_ACP_AGENT_SECRET: dup,
+    KONTROL_ACP_REVIEWER_SECRET: dup,
+    KONTROL_ACP_ADAPTER_SECRET: "c" + "0".repeat(47),
+  }),
+  /are identical/,
+  "identical agent/reviewer secrets rejected",
+);
+
+assert.throws(
+  () => loadConfig({ ...baseEnv, KONTROL_ACP_SHARED_SECRET: "legacy-short" }),
+  /at least 32 characters/,
+  "short legacy shared secret rejected",
+);
+
+assert.doesNotThrow(() => loadConfig({
+  ...baseEnv,
+  KONTROL_ACP_SHARED_SECRET: "e" + "0".repeat(47),
+}), "long legacy shared secret (compatibility mode) accepted");
+
+assert.throws(
+  () => loadConfig({
+    ...baseEnv,
+    KONTROL_ACP_AGENT_SECRET: "a" + "0".repeat(47),
+    KONTROL_ACP_SHARED_SECRET: "e" + "0".repeat(47),
+  }),
+  /Partial ACP credential configuration/,
+  "partial per-role configuration rejected",
+);
+
+// Disabled ACP bypasses validation entirely.
+assert.doesNotThrow(() => loadConfig({
+  ...baseEnv,
+  KONTROL_ACP_ENABLED: "0",
+  KONTROL_ACP_AGENT_SECRET: "short",
+}), "ACP validation skipped when ACP is disabled");
+assert.equal(loadConfig(baseEnv).mcpUnusedSessionIdleMs, 600_000);
+assert.equal(loadConfig(baseEnv).mcpEphemeralSessionIdleMs, 86_400_000);
+assert.equal(loadConfig(baseEnv).mcpReusableSessionIdleMs, 86_400_000);
 assert.equal(loadConfig(baseEnv).mcpSessionReaperIntervalMs, 15_000);
 assert.equal(loadConfig(baseEnv).mcpSessionMaxPerClient, 20);
 assert.equal(loadConfig(baseEnv).mcpSessionSoftCap, 150);
 assert.equal(loadConfig(baseEnv).mcpSessionHardCap, 200);
 assert.equal(loadConfig({ ...baseEnv, KONTROL_MCP_EPHEMERAL_SESSION_IDLE_MS: "1234" }).mcpEphemeralSessionIdleMs, 1234);
+assert.equal(loadConfig(baseEnv).mcpAdmissionTimeoutMs, 120_000);
+assert.equal(loadConfig(baseEnv).mcpExecutionTimeoutMs, 30 * 60_000);
+assert.equal(loadConfig(baseEnv).policyApprovalTimeoutMs, 24 * 60 * 60_000);
+assert.equal(loadConfig({ ...baseEnv, KONTROL_MCP_ADMISSION_TIMEOUT_MS: "4321", KONTROL_MCP_EXECUTION_TIMEOUT_MS: "8765", KONTROL_POLICY_APPROVAL_TIMEOUT_MS: "9999" }).mcpAdmissionTimeoutMs, 4321);
+assert.equal(loadConfig({ ...baseEnv, KONTROL_MCP_ADMISSION_TIMEOUT_MS: "4321" }).mcpRequestDeadlineMs, 4321);
 assert.equal(loadConfig({ ...baseEnv, KONTROL_SKILLS: "0" }).skillsEnabled, false);
 assert.equal(loadConfig({ ...baseEnv, KONTROL_SKILLS: "1" }).skillsEnabled, true);
 
@@ -57,7 +129,7 @@ assert.deepEqual(loadConfig(baseEnv).logging, {
   assets: false,
   toolCalls: true,
   shellCommands: false,
-  trustProxy: false,
+  trustProxy: undefined,
 });
 
 assert.equal(loadConfig({ ...baseEnv, KONTROL_LOG_LEVEL: "silent" }).logging.level, "silent");
@@ -73,7 +145,19 @@ assert.equal(loadConfig({ ...baseEnv, KONTROL_LOG_REQUESTS: "0" }).logging.reque
 assert.equal(loadConfig({ ...baseEnv, KONTROL_LOG_ASSETS: "1" }).logging.assets, true);
 assert.equal(loadConfig({ ...baseEnv, KONTROL_LOG_TOOL_CALLS: "0" }).logging.toolCalls, false);
 assert.equal(loadConfig({ ...baseEnv, KONTROL_LOG_SHELL_COMMANDS: "1" }).logging.shellCommands, true);
-assert.equal(loadConfig({ ...baseEnv, KONTROL_TRUST_PROXY: "1" }).logging.trustProxy, true);
+
+// P1 #7: trusted-proxy specification replaces the boolean model.
+const trustDeepEqual = (env: Record<string, string>, expected: string | undefined) =>
+  assert.deepEqual(loadConfig({ ...baseEnv, ...env }).logging.trustProxy, expected);
+trustDeepEqual({ KONTROL_TRUST_PROXY: "0" }, undefined);
+trustDeepEqual({ KONTROL_TRUST_PROXY: "false" }, undefined);
+trustDeepEqual({ KONTROL_TRUST_PROXY: "1" }, "1");
+trustDeepEqual({ KONTROL_TRUST_PROXY: "2" }, "2");
+trustDeepEqual({ KONTROL_TRUST_PROXY: "loopback" }, "loopback");
+assert.throws(
+  () => loadConfig({ ...baseEnv, KONTROL_TRUST_PROXY: "banana" }),
+  /Invalid KONTROL_TRUST_PROXY/,
+);
 
 assert.throws(
   () => loadConfig({ ...baseEnv, KONTROL_LOG_LEVEL: "trace" }),
@@ -125,7 +209,7 @@ assert.throws(
 );
 assert.throws(
   () => loadConfig({ ...baseEnv, KONTROL_OAUTH_ACCESS_TOKEN_TTL_SECONDS: "0" }),
-  /Invalid KONTROL_OAUTH_ACCESS_TOKEN_TTL_SECONDS: 0/,
+  /Invalid KONTROL_OAUTH_ACCESS_TOKEN_TTL_SECONDS: must be a positive integer \(got "0"\)/,
 );
 
 assert.equal(loadConfig(baseEnv).publicBaseUrl, "http://127.0.0.1:7676");

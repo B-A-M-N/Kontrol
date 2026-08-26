@@ -8,15 +8,22 @@ on:
 
 jobs:
   smoke:
-    name: Smoke (${{ matrix.os }})
+    name: Smoke (${{ matrix.os }}, Node ${{ matrix.node }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
-          - windows-latest
+        include:
+          - os: ubuntu-latest
+            node: 22.19.0
+          - os: ubuntu-latest
+            node: 24.x
+          - os: ubuntu-latest
+            node: 26.x
+          - os: macos-latest
+            node: 22.19.0
+          - os: windows-latest
+            node: 22.19.0
 
     env:
       KONTROL_ALLOWED_ROOTS: ${{ github.workspace }}
@@ -30,7 +37,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: ${{ matrix.node }}
           cache: npm
 
       - name: Install dependencies
@@ -38,6 +45,13 @@ jobs:
 
       - name: Typecheck
         run: npm run typecheck
+
+      # Review P1 #16: production dependency audit is a release gate. High or
+      # critical advisories in runtime deps fail CI; exceptions require an
+      # explicit, documented allowlist — not a global suppression.
+      - name: Production dependency audit
+        if: matrix.os == 'ubuntu-latest'
+        run: npm audit --omit=dev --audit-level=high
 
       - name: Test
         run: npm test
@@ -47,3 +61,26 @@ jobs:
 
       - name: Doctor
         run: node dist/cli.js doctor
+
+  # P1 #12: stable-release UAT. End-to-end exercise of the INSTALLED product
+  # (packed tarball, empty state dir, deterministic fakes — no model/API deps).
+  release-uat:
+    name: Release UAT (installed product)
+    runs-on: ubuntu-latest
+    needs: smoke
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.19.0
+          cache: npm
+
+      - run: npm ci
+
+      # Build once so the UAT script's npm pack is fast and deterministic.
+      - name: Build
+        run: npm run build
+
+      - name: Release UAT
+        run: npm run uat:release

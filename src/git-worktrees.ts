@@ -1,12 +1,9 @@
 import { randomBytes } from "node:crypto";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import { mkdir, realpath, rm, stat } from "node:fs/promises";
 import { basename, join, relative, resolve } from "node:path";
 import type { ServerConfig } from "./config.js";
+import { controlPlaneGit } from "./git-runner.js";
 import { assertAllowedPath, isPathInsideRoot } from "./roots.js";
-
-const execFileAsync = promisify(execFile);
 
 export class GitWorktreeError extends Error {
   constructor(
@@ -161,10 +158,8 @@ function sanitizePathSegment(value: string): string {
 
 async function git(args: string[], cwd: string): Promise<string> {
   try {
-    const { stdout } = await execFileAsync("git", args, {
-      cwd,
-      maxBuffer: 10 * 1024 * 1024,
-    });
+    // Hardened control-plane runner: scrubbed env, hooks/filters disabled.
+    const { stdout } = await controlPlaneGit(cwd, args, { maxBuffer: 10 * 1024 * 1024 });
     return stdout;
   } catch (error) {
     if (isGitUnavailable(error)) throw error;

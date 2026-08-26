@@ -3,6 +3,7 @@ import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { EventStore } from "./event-log.js";
 import type { PolicyEngine } from "./policy.js";
+import type { ApprovalScope } from "./policy.js";
 import type { PrincipalRole } from "./policy-enforcement.js";
 import type { ApprovalRequestManager, ApprovalRequest } from "./approval-requests.js";
 import { workspaceAppToolMeta } from "./workspace-app-resource.js";
@@ -43,9 +44,11 @@ function policyApprovalToCard(a: ReturnType<PolicyEngine["getPendingApprovals"]>
     command: a.command,
     requestedAt: a.requestedAt,
     createdAt: a.requestedAt,
+    expiresAt: a.expiresAt,
     options: [
       { id: "approve", label: "Approve Once", effect: "approve", scope: "once" },
-      { id: "approve_session", label: "Approve Session", effect: "approve", scope: "work_session" },
+      ...(a.workSessionId ? [{ id: "approve_session", label: "Approve Session", effect: "approve", scope: "work_session" }] : []),
+      { id: "approve_workspace", label: "Approve Workspace", effect: "approve", scope: "workspace" },
       { id: "deny", label: "Deny", effect: "deny" },
     ],
   };
@@ -274,9 +277,15 @@ export function registerPolicyTools(
           isError: true,
         };
       }
-      if (decision !== "approve" && decision !== "approve_session" && decision !== "deny") {
+      if (decision !== "approve" && decision !== "approve_session" && decision !== "approve_workspace" && decision !== "deny") {
         return {
           content: [{ type: "text" as const, text: `Decision "${decision}" is not valid for policy approval ${approvalId}.` }],
+          isError: true,
+        };
+      }
+      if ((decision === "approve_session" || scope === "work_session") && !match.workSessionId) {
+        return {
+          content: [{ type: "text" as const, text: "This approval has no work session; approve once or choose a workspace grant explicitly." }],
           isError: true,
         };
       }
@@ -292,8 +301,12 @@ export function registerPolicyTools(
         sessionId: match.workSessionId ?? match.workspaceId,
         payload: {
           approvalId,
-          decision: decision === "approve_session" ? "approve" : decision,
-          scope: decision === "approve_session" ? "work_session" : (scope ?? "once"),
+          decision: decision === "deny" ? "deny" : "approve",
+          scope: decision === "approve_session"
+            ? "work_session"
+            : decision === "approve_workspace"
+              ? "workspace"
+              : (scope ?? "once"),
           reason,
         },
       });
@@ -302,6 +315,59 @@ export function registerPolicyTools(
         content: [{ type: "text" as const, text: `Decision recorded: ${decision} for approval ${approvalId}.` }],
         structuredContent: { status: "recorded", approvalId },
       };
+    },
+  );
+
+  registerAppTool(
+    server,
+    "list_policy_grants",
+    {
+      title: "List policy grants",
+      description: "List durable effective policy approvals. Reviewer-only; scope filters are optional.",
+      inputSchema: {
+        scope: z.enum(["work_session", "workspace"]).optional(),
+        scopeId: z.string().min(1).optional(),
+      },
+      outputSchema: { grants: z.array(z.object({
+        id: z.string(), principalId: z.string(), scope: z.string(), scopeId: z.string(), approvalKey: z.string(), createdAt: z.string(), reviewerId: z.string().optional(),
+      })) },
+      _meta: workspaceAppModelAndAppMeta(),
+      annotations: { readOnlyHint: true, destructiveHint: false },
+    },
+    async ({ scope, scopeId }) => {
+      if (!isReviewer(config.principalRole)) {
+        return { content: [{ type: "text" as const, text: "Forbidden: list_policy_grants requires reviewer authority." }], isError: true };
+      }
+      const grants = config.policyEngine.listGrants(scope as ApprovalScope | undefined, scopeId);
+      return { content: [{ type: "text" as const, text: `${grants.length} effective policy grant(s).` }], structuredContent: { grants } };
+    },
+  );
+
+  registerAppTool(
+    server,
+    "revoke_policy_grants",
+    {
+      title: "Revoke policy grants",
+      description: "Revoke all durable policy approvals for an exact work session or workspace scope. Reviewer-only.",
+      inputSchema: {
+        scope: z.enum(["work_session", "workspace"]),
+        scopeId: z.string().min(1),
+      },
+      outputSchema: { status: z.string(), scope: z.string(), scopeId: z.string() },
+      _meta: workspaceAppModelAndAppMeta(),
+      annotations: { readOnlyHint: false, destructiveHint: true },
+    },
+    async ({ scope, scopeId }) => {
+      if (!isReviewer(config.principalRole)) {
+        return { content: [{ type: "text" as const, text: "Forbidden: revoke_policy_grants requires reviewer authority." }], isError: true };
+      }
+      config.policyEngine.revokeScope(scope as ApprovalScope, scopeId);
+      config.eventStore.appendEvent({
+        type: "policy.grants.revoked",
+        sessionId: scopeId,
+        payload: { scope, scopeId },
+      });
+      return { content: [{ type: "text" as const, text: `Revoked ${scope} policy grants for ${scopeId}.` }], structuredContent: { status: "revoked", scope, scopeId } };
     },
   );
 }

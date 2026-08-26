@@ -53,13 +53,15 @@ export function buildChildEnvironment(options: {
   sandbox?: boolean;
   allowUserEnvironment?: boolean;
   source?: NodeJS.ProcessEnv;
+  additionalKeys?: Iterable<string>;
 } = {}): Record<string, string> {
   const source = options.source ?? process.env;
   const result: Record<string, string> = {};
+  const additionalKeys = new Set(options.additionalKeys ?? []);
 
   for (const [key, value] of Object.entries(source)) {
     if (value === undefined || isControlPlaneEnvironmentKey(key)) continue;
-    if (ORDINARY_ENVIRONMENT_KEYS.has(key) || options.allowUserEnvironment === true) {
+    if (ORDINARY_ENVIRONMENT_KEYS.has(key) || additionalKeys.has(key) || options.allowUserEnvironment === true) {
       result[key] = value;
     }
   }

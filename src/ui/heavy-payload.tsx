@@ -20,6 +20,10 @@ interface PayloadRendererOptions {
   card: ToolResultCard;
   hostContext?: HostContext;
   errorMessage?: string | null;
+  // Kept in the shared lazy-renderer contract. Review payloads use this to
+  // bound the number of files displayed; heavy payloads intentionally ignore
+  // it so both renderer implementations can be updated through one handle.
+  visibleFileCount?: number;
 }
 
 interface MountedPayload {

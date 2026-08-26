@@ -91,6 +91,10 @@ if ! node --check scripts/acp-hermes-native-adapter.mjs; then
   echo "ERROR: acp-hermes-native-adapter.mjs failed syntax check. Aborting." >&2
   exit 1
 fi
+if ! node --check scripts/kontrol-supervisor.mjs; then
+  echo "ERROR: kontrol-supervisor.mjs failed syntax check. Aborting." >&2
+  exit 1
+fi
 if ! node --check scripts/probe-kontrol-readiness.mjs; then
   echo "ERROR: probe-kontrol-readiness.mjs failed syntax check. Aborting." >&2
   exit 1
@@ -107,12 +111,14 @@ fi
 # P2 #28: startup profiles. KONTROL_STARTUP_PROFILE selects how much preflight
 # runs: dev-fast (typecheck+build, no full test suite), normal (typecheck +
 # full unit suite + build), release (everything plus the dirty-checkout guard,
-# i.e. KONTROL_RELEASE_MODE=true). Legacy env vars still honored.
+# i.e. KONTROL_RELEASE_MODE=true). Development startup defaults to dev-fast so
+# a routine reconnect does not run the entire test suite; use normal/release
+# explicitly for the full gate. Legacy env vars are still honored.
 STARTUP_PROFILE="${KONTROL_STARTUP_PROFILE:-}"
 if [[ -z "$STARTUP_PROFILE" ]]; then
   if [[ "${KONTROL_RELEASE_MODE:-false}" == "true" ]]; then STARTUP_PROFILE="release";
   elif [[ "${KONTROL_SKIP_PREFLIGHT_TESTS:-false}" == "true" || "${KONTROL_USE_EXISTING_DIST:-false}" == "true" ]]; then STARTUP_PROFILE="dev-fast";
-  else STARTUP_PROFILE="normal"; fi
+  else STARTUP_PROFILE="dev-fast"; fi
 fi
 case "$STARTUP_PROFILE" in
   release|normal|dev-fast) ;;
@@ -163,6 +169,25 @@ else
 fi
 echo "[*] Preflight + build passed."
 
+# The server resolves its state directory from the full Kontrol configuration
+# (environment first, then ~/.kontrol/config.json, then the platform default).
+# Resolve that same value before launching the supervisor. Falling back to the
+# checkout-local directory here is incorrect when the server uses the durable
+# default at ~/.local/share/kontrol: the server can be healthy while the
+# supervisor cannot find its identity and rolls the whole stack back.
+STATE_DIR_ERROR="$LAUNCH_DIR/state-dir-error.log"
+if ! EFFECTIVE_STATE_DIR="$(node --input-type=module -e 'import { loadConfig } from "./dist/config.js"; process.stdout.write(loadConfig().stateDir)' 2>"$STATE_DIR_ERROR")"; then
+  echo "ERROR: could not resolve Kontrol state directory." >&2
+  [[ -s "$STATE_DIR_ERROR" ]] && cat "$STATE_DIR_ERROR" >&2 || true
+  exit 1
+fi
+if [[ -z "$EFFECTIVE_STATE_DIR" ]]; then
+  echo "ERROR: Kontrol resolved an empty state directory." >&2
+  exit 1
+fi
+export KONTROL_STATE_DIR="$EFFECTIVE_STATE_DIR"
+echo "[*] Kontrol state: $KONTROL_STATE_DIR"
+
 # --- Graceful stop: signal, wait, escalate (P1 #42: only our own sessions) ---
 echo "[*] Stopping any stale processes (graceful first)..."
 STALE_SESSIONS=("kontrol-adapter" "kontrol-adapter-crush" "kontrol-adapter-hermes" "kontrol-server" "kontrol-tunnel" "kontrol-supervisor")
@@ -212,6 +237,10 @@ sleep 1
 
 DEV_HOST="${HOST:-127.0.0.1}"
 DEV_PORT="${PORT:-7676}"
+LAUNCH_GENERATION_ID="gen-$(date +%s)-$$"
+export KONTROL_LAUNCH_GENERATION_ID="$LAUNCH_GENERATION_ID"
+EXPECTED_BUILD_ID="$(node -e 'const fs=require("node:fs"); try { process.stdout.write(JSON.parse(fs.readFileSync("dist/build-meta.json", "utf8")).buildId || "dev") } catch { process.stdout.write("dev") }')"
+export KONTROL_EXPECTED_BUILD_ID="$EXPECTED_BUILD_ID"
 CRUSH_ACP_PORT="${ACP_ADAPTER_PORT:-9877}"
 HERMES_ACP_PORT="${HERMES_ACP_ADAPTER_PORT:-9911}"
 HERMES_ACP_COMPAT_PATH="$DESKTOP_PWD/scripts/hermes-acp-compat"
@@ -286,7 +315,8 @@ fi
 # --- Start Kontrol ---
 echo "[*] Starting kontrol MCP server on ${DEV_HOST}:${DEV_PORT}/mcp ..."
 printf -v SERVER_LOG_QUOTED '%q' "$SERVER_LOG"
-tmux new-session -d -s kontrol-server -c "$DESKTOP_PWD" "set -a && source .env && set +a && ${SERVER_AGENT_EXPORT} exec node dist/cli.js serve >>${SERVER_LOG_QUOTED} 2>&1"
+printf -v GENERATION_EXPORT 'export KONTROL_LAUNCH_GENERATION_ID=%q KONTROL_EXPECTED_BUILD_ID=%q;' "$LAUNCH_GENERATION_ID" "$EXPECTED_BUILD_ID"
+tmux new-session -d -s kontrol-server -c "$DESKTOP_PWD" "set -a && source .env && set +a && ${GENERATION_EXPORT} ${SERVER_AGENT_EXPORT} exec node dist/cli.js serve >>${SERVER_LOG_QUOTED} 2>&1"
 LAUNCHED_SESSIONS+=("kontrol-server")
 echo "[*] Kontrol server log: $SERVER_LOG"
 
@@ -340,9 +370,18 @@ wait_adapter_health() {
   echo -n "[*] Waiting for ${name} adapter readiness"
   local ok=0
   for _ in $(seq 1 30); do
-    local code
-    code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 "http://127.0.0.1:${port}/health" 2>/dev/null || echo 000)
-    if [[ "$code" == "200" ]]; then ok=1; break; fi
+    local health_response health code
+    health_response=$(curl -s -w $'\n%{http_code}' --max-time 2 "http://127.0.0.1:${port}/health" 2>/dev/null || true)
+    code="${health_response##*$'\n'}"
+    health="${health_response%$'\n'*}"
+    [[ "$code" == "$health_response" ]] && code=000
+    if [[ "$code" == "200" ]] \
+      && grep -Eq '"ok"[[:space:]]*:[[:space:]]*true' <<<"$health" \
+      && grep -Eq '"ready"[[:space:]]*:[[:space:]]*true' <<<"$health" \
+      && grep -Eq '"reconciled"[[:space:]]*:[[:space:]]*true' <<<"$health" \
+      && grep -Eq '"lifecycle"[[:space:]]*:[[:space:]]*"READY"' <<<"$health"; then
+      ok=1; break
+    fi
     echo -n "."
     sleep 1
   done
@@ -389,7 +428,7 @@ smoke_adapter() {
 
 if [[ "$START_CRUSH_ADAPTER" == "true" ]]; then
   echo "[*] Starting CRUSH ACP adapter on 127.0.0.1:${CRUSH_ACP_PORT} ..."
-  tmux new-session -d -s kontrol-adapter-crush -c "$DESKTOP_PWD" "set -a && source .env && set +a && exec env ACP_AGENT_BIN=crush PORT=${CRUSH_ACP_PORT} node scripts/acp-crush-adapter.mjs > '$CRUSH_ADAPTER_LOG' 2>&1"
+  tmux new-session -d -s kontrol-adapter-crush -c "$DESKTOP_PWD" "set -a && source .env && set +a && ${GENERATION_EXPORT} exec env ACP_AGENT_BIN=crush PORT=${CRUSH_ACP_PORT} node scripts/acp-crush-adapter.mjs > '$CRUSH_ADAPTER_LOG' 2>&1"
   LAUNCHED_SESSIONS+=("kontrol-adapter-crush")
   wait_adapter_health "CRUSH" "$CRUSH_ACP_PORT" "kontrol-adapter-crush" "$CRUSH_ADAPTER_LOG"
   smoke_adapter "CRUSH" "$CRUSH_ACP_PORT" "cli-coding-agent" "kontrol-adapter-crush"
@@ -399,7 +438,7 @@ fi
 if [[ "$START_HERMES_ADAPTER" == "true" || "$START_HERMES_ADAPTER" == "auto" ]]; then
   if [[ "$START_HERMES_ADAPTER" != "false" ]]; then
     echo "[*] Starting Hermes native ACP adapter on 127.0.0.1:${HERMES_ACP_PORT} ..."
-    tmux new-session -d -s kontrol-adapter-hermes -c "$DESKTOP_PWD" "set -a && source .env && set +a && exec env HERMES_ACP_ADAPTER_PORT=${HERMES_ACP_PORT} node scripts/acp-hermes-native-adapter.mjs > '$HERMES_ADAPTER_LOG' 2>&1"
+    tmux new-session -d -s kontrol-adapter-hermes -c "$DESKTOP_PWD" "set -a && source .env && set +a && ${GENERATION_EXPORT} exec env HERMES_ACP_ADAPTER_PORT=${HERMES_ACP_PORT} node scripts/acp-hermes-native-adapter.mjs > '$HERMES_ADAPTER_LOG' 2>&1"
     LAUNCHED_SESSIONS+=("kontrol-adapter-hermes")
     if wait_adapter_health "Hermes" "$HERMES_ACP_PORT" "kontrol-adapter-hermes" "$HERMES_ADAPTER_LOG"; then
       if ! smoke_adapter "Hermes" "$HERMES_ACP_PORT" "hermes-agent" "kontrol-adapter-hermes"; then
@@ -512,6 +551,9 @@ SUPERVISOR_ARGS=(
   --kontrol-url "http://${DEV_HOST}:${DEV_PORT}"
   --tunnel-url "http://127.0.0.1:8080"
   --status-file "$SUPERVISOR_STATUS_FILE"
+  --state-dir "${KONTROL_STATE_DIR:-$DESKTOP_PWD/.kontrol-state}"
+  --generation-id "$LAUNCH_GENERATION_ID"
+  --expected-build-id "$EXPECTED_BUILD_ID"
   --crush-port "$CRUSH_ACP_PORT"
   --hermes-port "$HERMES_ACP_PORT"
   --start-crush "$START_CRUSH_ADAPTER"

@@ -38,7 +38,7 @@ try {
   function harness(input: { criteria: Array<Record<string, unknown>>; finalVerification?: string[]; changed?: boolean }) {
     const evidence: Array<Record<string, unknown>> = [];
     const mission = { id: "mission_verify", finalVerification: input.finalVerification ?? [] };
-    const session = { workspaceSessionId: "workspace_verify", latestSubmission: { id: "sub_verify", snapshotCommit: "snap_verify" } };
+    const session = { workspaceSessionId: "workspace_verify", latestSubmission: { id: "sub_verify", snapshotCommit: "snap_verify", files: [{ path: "src/target.ts", type: "change", additions: 1, removals: 0 }] } };
     const criteria: Array<any> = input.criteria.map((criterion) => ({ priority: "required", status: "unverified", ...criterion }));
     const ledger = {
       getMissionByWorkSession: () => mission,
@@ -56,7 +56,7 @@ try {
     };
     return {
       evidence,
-      run: (criterionIds?: string[], verificationPhase?: "progressive" | "final") => verifyMissionSubmission({
+      run: (criterionIds?: string[], verificationPhase?: "progressive" | "final", verificationScope?: "focused" | "affected" | "full") => verifyMissionSubmission({
         workSessionId: "work_verify",
         missionLedger: ledger as any,
         workSessions: { get: () => session } as any,
@@ -64,6 +64,7 @@ try {
         reviewCheckpoints: { reviewChangesAgainstCommit: async () => ({ summary: { files: input.changed ? 1 : 0 } }) } as any,
         criterionIds,
         verificationPhase,
+        verificationScope,
       }),
     };
   }
@@ -101,6 +102,15 @@ try {
   const filtered = await filteredHarness.run(["criterion-one"]);
   assert.equal(filtered.length, 1, "criterion filtering runs only the requested declared command");
   assert.equal(filtered[0].criterionId, "criterion-one");
+
+  const affectedHarness = harness({
+    criteria: [
+      { id: "affected", description: "affected", verificationCommand: "npm --version", affectedAreas: ["src/**"] },
+      { id: "unaffected", description: "unaffected", verificationCommand: "npm --version", affectedAreas: ["docs/**"] },
+    ],
+  });
+  const affected = await affectedHarness.run(undefined, "progressive", "affected");
+  assert.deepEqual(affected.map((result) => result.criterionId), ["affected"], "affected verification uses structured submitted file metadata");
 
   const skippedHarness = harness({ criteria: [{ id: "manual", description: "manual only" }] });
   assert.deepEqual(await skippedHarness.run(), [], "criteria without a declared command are skipped, not treated as verified");

@@ -78,7 +78,23 @@ Current implementation contracts:
   internal readiness or authenticated diagnostics boundary.
 - Project-controlled child processes receive an explicit non-secret
   environment allowlist. Mission verification is allowlisted and can be made
-  fail-closed sandboxed with `KONTROL_VERIFY_SANDBOX=1`.
+  fail-closed sandboxed with `KONTROL_VERIFY_SANDBOX=1`; additional ordinary
+  names require `KONTROL_CHILD_ENV_ALLOWLIST`, and approved user toolchains
+  require `KONTROL_VERIFY_TOOLCHAIN_PATHS` when sandboxed.
+- Review submissions persist structured checkpoint file metadata. Verification
+  uses those paths for affected-area selection and never parses unified diff
+  headers as a path protocol; legacy submissions without metadata are
+  conservative and cannot skip affected checks.
+- Policy grants are durable and reviewer-revocable. Work-session grants are
+  revoked at terminal session state (including startup reconciliation), while
+  workspace grants survive restart until explicitly revoked. A session grant
+  is never offered without a concrete work-session ID.
+- ACP outbound webhooks are disabled by default and require an explicit enable
+  flag plus an exact host allowlist (or an explicit `*` policy). Delivery
+  maintenance is single-flight and drained before server database shutdown.
+- Linux is the supported production lifecycle platform through the systemd
+  user service. macOS and Windows are development/integration platforms; no
+  bundled launchd or Windows Service manager is claimed.
 - Supervisor completion is evidence-driven: the persisted progress vector and
   stagnation/failure-fingerprint policy govern normal stopping; `maxCycles` is
   only an emergency cycle ceiling. Independent work sessions use the bounded
@@ -92,6 +108,15 @@ Current implementation contracts:
   known child operation or pending permission. `KONTROL_HERMES_MAX_RUN_SECONDS`
   remains the absolute safety ceiling, and `KONTROL_HERMES_DEADMAN_IDLE_MS`
   controls only the idle watchdog.
+- Adapter startup reconciles durable detached-child ownership before reporting
+  `READY`; inability to terminate an orphan or persist ownership is fail-closed.
+  CRUSH output events are coalesced and serialized so terminal lifecycle events
+  cannot overtake queued telemetry. Terminal events are spooled durably before
+  network delivery.
+- Policy approval remains a blocking operation with a durable stale-card
+  backstop. If the originating MCP/ACP HTTP caller disconnects, its in-memory
+  waiter is cancelled and removed without expiring the durable approval for
+  other authorized reviewers.
 
 MCP context isolation:
 

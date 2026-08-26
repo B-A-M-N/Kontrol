@@ -7,7 +7,7 @@ import type { EventStoreEvent } from "./event-log.js";
 import type { ContinuationManager, CreateContinuationInput } from "./continuation.js";
 import type { AgentRegistryManager } from "./acp-registry.js";
 import type { WorkspaceRegistry } from "./workspaces.js";
-import type { ReviewCheckpointManager } from "./review-checkpoints.js";
+import type { ReviewCheckpointManager, ReviewFile } from "./review-checkpoints.js";
 import type { MissionLedger } from "./mission-ledger.js";
 import type { DispatchOutbox } from "./dispatch-outbox.js";
 
@@ -45,6 +45,7 @@ export interface SubmitForReviewInput {
   message?: string;
   summaryJson?: string;
   files?: number;
+  changedFiles?: ReviewFile[];
   additions?: number;
   removals?: number;
   diffSha256?: string;
@@ -200,6 +201,7 @@ export function createReviewWorkflowService(
         diff: input.diff,
         message: input.message,
         summaryJson: input.summaryJson,
+        files: input.changedFiles,
         diffSha256: input.diffSha256,
         snapshotCommit: input.snapshotCommit,
       });

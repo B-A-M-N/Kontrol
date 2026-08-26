@@ -9,7 +9,7 @@ import {
   readdirSync,
   rmSync,
   statSync,
-  symlinkSync,
+  realpathSync,
   writeFileSync,
 } from "node:fs";
 import { readFile } from "node:fs/promises";
@@ -83,21 +83,34 @@ try {
 
   const servicePort = await unusedTcpPort();
   const serviceState = join(tmp, "installed-state");
+  const serviceEnv = {
+    ...process.env,
+    HOST: "127.0.0.1",
+    PORT: String(servicePort),
+    KONTROL_AUTH_MODE: "tunnel",
+    KONTROL_ALLOWED_ROOTS: installPrefix,
+    KONTROL_ALLOWED_HOSTS: "127.0.0.1,localhost",
+    KONTROL_PUBLIC_BASE_URL: `http://127.0.0.1:${servicePort}`,
+    KONTROL_STATE_DIR: serviceState,
+    KONTROL_WORKTREE_ROOT: join(tmp, "installed-worktrees"),
+    KONTROL_ACP_ENABLED: "false",
+    KONTROL_LOG_FORMAT: "pretty",
+    // This suite verifies execution plumbing, not the approval boundary.
+    // The secure baseline gates bash behind `ask`; promote it explicitly so
+    // an unattended smoke test can exercise shell execution.
+    KONTROL_POLICY_TOOL_BASH: "allow",
+  };
+  const doctorOutput = execFileSync("node", [installedCli, "doctor"], {
+    cwd: installPrefix,
+    env: serviceEnv,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"], // capture stderr — review #10
+  });
+  assert.match(doctorOutput, /Mutation policy/, "installed doctor reports the trust posture");
+
   const service = spawn("node", [installedCli, "serve"], {
     cwd: installPrefix,
-    env: {
-      ...process.env,
-      HOST: "127.0.0.1",
-      PORT: String(servicePort),
-      KONTROL_AUTH_MODE: "tunnel",
-      KONTROL_ALLOWED_ROOTS: installPrefix,
-      KONTROL_ALLOWED_HOSTS: "127.0.0.1,localhost",
-      KONTROL_PUBLIC_BASE_URL: `http://127.0.0.1:${servicePort}`,
-      KONTROL_STATE_DIR: serviceState,
-      KONTROL_WORKTREE_ROOT: join(tmp, "installed-worktrees"),
-      KONTROL_ACP_ENABLED: "false",
-      KONTROL_LOG_FORMAT: "pretty",
-    },
+    env: serviceEnv,
     stdio: ["ignore", "pipe", "pipe"],
   });
   let serviceStderr = "";
@@ -105,33 +118,107 @@ try {
   try {
     await waitForHttp(`http://127.0.0.1:${servicePort}/healthz`, service, () => serviceStderr);
     assert.equal(service.exitCode, null, "installed server remains alive after binding");
+
+    const mcpUrl = `http://127.0.0.1:${servicePort}/mcp`;
+    const initialized = await postMcp(mcpUrl, {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "package-release", version: "1" } },
+    });
+    assert.equal(initialized.response.status, 200, "installed MCP endpoint initializes");
+    const sessionId = initialized.response.headers.get("mcp-session-id");
+    assert.ok(sessionId, "MCP initialize returns a session identity");
+    await postMcp(mcpUrl, { jsonrpc: "2.0", method: "notifications/initialized", params: {} }, sessionId);
+
+    const opened = await postMcp(mcpUrl, {
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: { name: "open_workspace", arguments: { path: installPrefix } },
+    }, sessionId);
+    assert.equal(opened.response.status, 200, "installed open_workspace call succeeds");
+    const workspaceId = opened.body?.result?.structuredContent?.workspaceId;
+    assert.equal(typeof workspaceId, "string", "open_workspace returns a workspace ID");
+
+    const read = await postMcp(mcpUrl, {
+      jsonrpc: "2.0",
+      id: 3,
+      method: "tools/call",
+      params: { name: "read", arguments: { workspaceId, path: "package.json", limit: 5 } },
+    }, sessionId);
+    assert.equal(read.response.status, 200, "installed read call succeeds");
+    assert.match(JSON.stringify(read.body), /@b-a-m-n\/kontrol/, "installed read returns package contents");
+
+    const bash = await postMcp(mcpUrl, {
+      jsonrpc: "2.0",
+      id: 4,
+      method: "tools/call",
+      params: { name: "bash", arguments: { workspaceId, command: "pwd" } },
+    }, sessionId);
+    assert.equal(bash.response.status, 200, "installed bash call succeeds");
+    assert.match(JSON.stringify(bash.body), /clean-prefix/, "installed bash executes in the opened workspace");
   } finally {
     if (service.exitCode === null) service.kill("SIGTERM");
     await waitForChild(service);
+    assert.equal(service.exitCode, 0, "installed server exits cleanly on SIGTERM");
   }
 
+  // Review #9: shipped-adapter validation must run against the CLEAN
+  // installation only. The checkout's node_modules used to be symlinked in
+  // here, which could satisfy an adapter's imports with dependencies the
+  // package never declared — defeating the isolation this test exists for.
   const rootNodeModules = join(root, "node_modules");
-  if (existsSync(rootNodeModules)) {
-    symlinkSync(rootNodeModules, join(pkg, "node_modules"), "dir");
+  assert.equal(
+    existsSync(join(pkg, "node_modules")) && realpathSync(join(pkg, "node_modules")) === realpathSync(rootNodeModules),
+    false,
+    "installed package must not resolve modules through the checkout's node_modules",
+  );
+
+  // Packed-manifest hygiene: no secrets, state, or scratch artifacts ship.
+  // (.env.example is an intentional, secret-free template and is allowed.)
+  // build-meta.json / runtime-identity.js are required shipped code modules
+  // (immutable identity + reconciliation helpers), not user-specific state.
+  const forbiddenPatterns = [
+    [/^\.env$/, "environment file with potential secrets"],
+    [/^\.env\.(?!example$)/, "environment file variant"],
+    [/(^|\/)\.kontrol(\/|$)/, "runtime state directory"],
+    [/(^|\/)__pycache__(\/|$)/, "python bytecode cache"],
+    [/\.sqlite(-wal|-shm)?$/, "database state"],
+    [/server\.identity\.json/, "runtime identity state"],
+    [/(^|\/)(dist\.previous|\.kontrol-build-)/, "build scratch"],
+    [/\/(home|Users)\//, "user-specific absolute path"],
+    [/\.(log|pid)$/, "runtime artifact"],
+  ];
+  for (const file of listFiles(pkg)) {
+    for (const [pattern, reason] of forbiddenPatterns) {
+      if (pattern.test(file)) {
+        assert.fail(`packed manifest contains ${reason}: ${file}`);
+      }
+    }
   }
 
+  console.log("[package-release] validating installed server and shipped adapters...");
   const shippedScripts = [
     "scripts/acp-crush-adapter.mjs",
     "scripts/acp-hermes-native-adapter.mjs",
     "scripts/acp-stdio-duplex-adapter.mjs",
     "scripts/mcp-stdio-bridge.mjs",
   ];
-  console.log("[package-release] validating installed server and shipped adapters...");
 
   for (const script of shippedScripts) {
-    const source = await readFile(join(pkg, script), "utf8");
+    // Validate the script from the CLEAN INSTALL, not the extracted tarball —
+    // the installed copy is the artifact users actually run.
+    const scriptPath = join(installedPkg, script);
+    assert.ok(existsSync(scriptPath), `clean install is missing ${script}`);
+    const source = await readFile(scriptPath, "utf8");
     assert.equal(
       source.includes("../src/"),
       false,
       `${script} imports from ../src, which is not shipped`,
     );
-    execFileSync("node", [script, "--validate-imports"], {
-      cwd: pkg,
+    execFileSync("node", [scriptPath, "--validate-imports"], {
+      cwd: join(installPrefix, "node_modules", "@b-a-m-n", "kontrol"),
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -259,4 +346,17 @@ async function waitForHttp(url, child, stderr) {
 async function waitForChild(child) {
   if (child.exitCode !== null) return;
   await new Promise((resolve) => child.once("close", resolve));
+}
+
+async function postMcp(url, body, sessionId) {
+  const headers = {
+    accept: "application/json, text/event-stream",
+    "content-type": "application/json",
+    ...(sessionId ? { "mcp-session-id": sessionId } : {}),
+  };
+  const response = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
+  const text = await response.text();
+  if (!text) return { response, body: undefined };
+  const dataLine = text.split(/\r?\n/).filter((line) => line.startsWith("data:")).at(-1);
+  return { response, body: JSON.parse(dataLine ? dataLine.slice(5).trim() : text) };
 }

@@ -24,6 +24,8 @@ export interface ServerConfig {
    * as an MCP bearer gate; the Secure MCP Tunnel is the trust boundary.
    */
   tunnelToken?: string;
+  /** Secret injected by the managed tunnel for WebUI reviewer authority. */
+  tunnelReviewerSecret?: string;
   allowedRoots: string[];
   allowedHosts: string[];
   publicBaseUrl: string;
@@ -55,6 +57,17 @@ export interface ServerConfig {
   supervisorMaxInflight: number;
   verifyMaxInflight: number;
   verifySandbox: boolean;
+  childEnvironmentAllowlist: string[];
+  /** P1 #14: process-session resource controls (all optional, validated). */
+  processMaxRunning?: number;
+  processMaxRunningPerOwner?: number;
+  processIdleTimeoutMs?: number;
+  processMaxRuntimeMs?: number;
+  processMaxBufferCharacters?: number;
+  processReaperIntervalMs?: number;
+  verifyToolchainPaths: string[];
+  webhookEnabled: boolean;
+  webhookAllowedHosts: string[];
   /** Bounded MCP request admission limits. */
   mcpMaxInflight: number;
   mcpMaxInflightPerSession: number;
@@ -63,7 +76,14 @@ export interface ServerConfig {
   mcpMaxWaiters: number;
   mcpMaxWaitersPerSession: number;
   mcpMaxWaiterQueue: number;
+  /** Maximum time a request may wait for an admission slot. */
+  mcpAdmissionTimeoutMs: number;
+  /** Maximum execution time for ordinary, non-waiter MCP requests. */
+  mcpExecutionTimeoutMs: number;
+  /** @deprecated use mcpAdmissionTimeoutMs. */
   mcpRequestDeadlineMs: number;
+  /** Default blocking policy-approval lifetime. */
+  policyApprovalTimeoutMs: number;
   mcpUnusedSessionIdleMs: number;
   mcpEphemeralSessionIdleMs: number;
   mcpReusableSessionIdleMs: number;
@@ -158,6 +178,10 @@ function parsePathList(value: string | undefined): string[] {
   );
 }
 
+function parseEnvironmentAllowlist(value: string | undefined): string[] {
+  return parsePathList(value).filter((key) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(key));
+}
+
 function parseStringList(value: string | undefined, fallback: string[]): string[] {
   const entries = value
     ?.split(",")
@@ -168,14 +192,18 @@ function parseStringList(value: string | undefined, fallback: string[]): string[
 }
 
 function parsePositiveInteger(value: string | undefined, fallback: number, name: string): number {
-  if (!value) return fallback;
-
+  if (value === undefined || value === "") return fallback;
   const parsed = Number(value);
-  if (!Number.isInteger(parsed) || parsed < 1) {
-    throw new Error(`Invalid ${name}: ${value}`);
+  if (!Number.isFinite(parsed) || parsed < 1) {
+    throw new Error(`Invalid ${name}: must be a positive integer (got "${value}")`);
   }
+  return Math.floor(parsed);
+}
 
-  return parsed;
+/** P1 #14: like parsePositiveInteger but returns undefined when unset. */
+function parseOptionalPositiveInteger(value: string | undefined, name: string): number | undefined {
+  if (value === undefined || value === "") return undefined;
+  return parsePositiveInteger(value, 0, name);
 }
 
 function parseLoggingConfig(env: NodeJS.ProcessEnv): LoggingConfig {
@@ -186,8 +214,31 @@ function parseLoggingConfig(env: NodeJS.ProcessEnv): LoggingConfig {
     assets: parseBoolean(env.KONTROL_LOG_ASSETS),
     toolCalls: env.KONTROL_LOG_TOOL_CALLS === undefined ? true : parseBoolean(env.KONTROL_LOG_TOOL_CALLS),
     shellCommands: parseBoolean(env.KONTROL_LOG_SHELL_COMMANDS),
-    trustProxy: parseBoolean(env.KONTROL_TRUST_PROXY),
+    trustProxy: parseTrustProxy(env.KONTROL_TRUST_PROXY),
   };
+}
+
+/**
+ * P1 #7: replace the boolean trust-proxy model with an Express-compatible
+ * specification. Accepted values: unset/empty (no proxy trusted), a hop count
+ * ("1", "2", ...), "loopback", or "true" (legacy trust-all, deprecated).
+ */
+function parseTrustProxy(value: string | undefined): string | undefined {
+  if (value === undefined || value === "") return undefined;
+  if (/^\d+$/.test(value)) {
+    if (Number(value) < 1) return undefined;
+    return value;
+  }
+  const normalized = value.toLowerCase();
+  if (normalized === "false" || normalized === "0") return undefined;
+  if (normalized === "loopback") return "loopback";
+  if (parseBoolean(value)) {
+    console.warn(
+      "[kontrol] KONTROL_TRUST_PROXY=true is deprecated: it lets any direct caller spoof CF-Connecting-IP / X-Forwarded-For. Set KONTROL_TRUST_PROXY=<hop count> (e.g. 1) or 'loopback' instead.",
+    );
+    return "true";
+  }
+  throw new Error(`Invalid KONTROL_TRUST_PROXY: ${value} (use a hop count like 1, "loopback", or "true" for legacy trust-all)`);
 }
 
 function parseWidgetMode(value: string | undefined): WidgetMode {
@@ -275,8 +326,65 @@ function defaultAgentDir(): string {
   return join(homedir(), ".codex");
 }
 
+/**
+ * ACP role-separation invariant (P1 #5): agent/reviewer/adapter secrets must be
+ * strong, distinct random values. Equal or short secrets undermine first-match
+ * role resolution and make brute force feasible. The legacy shared secret is
+ * accepted as an explicit compatibility mode only — it cannot satisfy the
+ * strength requirement on its own.
+ */
+function validateAcpSecrets(env: NodeJS.ProcessEnv): void {
+  if (env.KONTROL_ACP_ENABLED !== undefined && !parseBoolean(env.KONTROL_ACP_ENABLED)) return;
+
+  const agent = env.KONTROL_ACP_AGENT_SECRET;
+  const reviewer = env.KONTROL_ACP_REVIEWER_SECRET;
+  const adapter = env.KONTROL_ACP_ADAPTER_SECRET;
+  const shared = env.KONTROL_ACP_SHARED_SECRET;
+  const configured = [agent, reviewer, adapter].filter((s): s is string => Boolean(s));
+
+  const MIN_LENGTH = 32;
+  for (const secret of configured) {
+    if (secret.length < MIN_LENGTH) {
+      throw new Error(
+        `ACP secrets must be at least ${MIN_LENGTH} characters of high entropy (generate with: openssl rand -base64 48). Short secrets are rejected because the authenticated caller is untrusted-by-design.`,
+      );
+    }
+  }
+  const labels: Array<[string, string | undefined]> = [
+    ["KONTROL_ACP_AGENT_SECRET", agent],
+    ["KONTROL_ACP_REVIEWER_SECRET", reviewer],
+    ["KONTROL_ACP_ADAPTER_SECRET", adapter],
+  ];
+  for (let i = 0; i < labels.length; i++) {
+    for (let j = i + 1; j < labels.length; j++) {
+      const a = labels[i][1];
+      const b = labels[j][1];
+      if (a && b && a === b) {
+        throw new Error(
+          `${labels[i][0]} and ${labels[j][0]} are identical. Distinct per-role credentials are required: equal secrets undermine role separation and produce surprising first-match authorization.`,
+        );
+      }
+    }
+  }
+  if (!configured.length && shared) {
+    // Legacy compatibility mode is allowed but must itself be non-trivial.
+    if (shared.length < MIN_LENGTH) {
+      throw new Error(
+        `KONTROL_ACP_SHARED_SECRET (legacy mode) must be at least ${MIN_LENGTH} characters. Prefer distinct KONTROL_ACP_AGENT_SECRET / KONTROL_ACP_REVIEWER_SECRET / KONTROL_ACP_ADAPTER_SECRET values.`,
+      );
+    }
+  } else if (configured.length < 3 && shared) {
+    // Partial configuration silently falls back to the shared secret for the
+    // missing roles — that hides a misconfiguration. Require completeness.
+    throw new Error(
+      "Partial ACP credential configuration: set ALL of KONTROL_ACP_AGENT_SECRET, KONTROL_ACP_REVIEWER_SECRET, and KONTROL_ACP_ADAPTER_SECRET, or unset them all to use legacy KONTROL_ACP_SHARED_SECRET compatibility mode.",
+    );
+  }
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
   const files = loadKontrolFiles(env);
+  validateAcpSecrets(env);
   const host = env.HOST ?? files.config.host ?? "127.0.0.1";
   const port = parsePort(env.PORT ?? files.config.port);
   const publicBaseUrl = parsePublicBaseUrl(
@@ -310,6 +418,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     // Kept for migration diagnostics only. The server never uses this value
     // to challenge /mcp in tunnel mode.
     tunnelToken: env.KONTROL_TUNNEL_TOKEN,
+    // Tunnel mode has no bearer gate at the local hop. The tunnel-client
+    // therefore carries an explicit reviewer assertion. A dedicated secret is
+    // preferred; the ACP reviewer secret is the migration fallback.
+    tunnelReviewerSecret: env.KONTROL_TUNNEL_REVIEWER_SECRET ?? env.KONTROL_ACP_REVIEWER_SECRET,
     toolMode: parseToolMode(env),
     widgets: parseWidgetMode(env.KONTROL_WIDGETS),
     stateDir: resolve(expandHomePath(env.KONTROL_STATE_DIR ?? files.config.stateDir ?? defaultStateDir())),
@@ -334,21 +446,63 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     supervisorMaxInflight: parsePositiveInteger(env.KONTROL_SUPERVISOR_MAX_INFLIGHT, 4, "KONTROL_SUPERVISOR_MAX_INFLIGHT"),
     verifyMaxInflight: parsePositiveInteger(env.KONTROL_VERIFY_MAX_INFLIGHT, 3, "KONTROL_VERIFY_MAX_INFLIGHT"),
     verifySandbox: env.KONTROL_VERIFY_SANDBOX === "1" || env.KONTROL_VERIFY_SANDBOX === "true",
+    childEnvironmentAllowlist: parseEnvironmentAllowlist(env.KONTROL_CHILD_ENV_ALLOWLIST),
+    // P1 #14: process-session resource controls, parsed/validated centrally.
+    processMaxRunning: parseOptionalPositiveInteger(env.KONTROL_PROCESS_MAX_RUNNING, "KONTROL_PROCESS_MAX_RUNNING"),
+    processMaxRunningPerOwner: parseOptionalPositiveInteger(env.KONTROL_PROCESS_MAX_RUNNING_PER_OWNER, "KONTROL_PROCESS_MAX_RUNNING_PER_OWNER"),
+    processIdleTimeoutMs: parseOptionalPositiveInteger(env.KONTROL_PROCESS_IDLE_TIMEOUT_MS, "KONTROL_PROCESS_IDLE_TIMEOUT_MS"),
+    processMaxRuntimeMs: parseOptionalPositiveInteger(env.KONTROL_PROCESS_MAX_RUNTIME_MS, "KONTROL_PROCESS_MAX_RUNTIME_MS"),
+    processMaxBufferCharacters: parseOptionalPositiveInteger(env.KONTROL_PROCESS_BUFFER_CHARACTERS, "KONTROL_PROCESS_BUFFER_CHARACTERS"),
+    processReaperIntervalMs: parseOptionalPositiveInteger(env.KONTROL_PROCESS_REAPER_INTERVAL_MS, "KONTROL_PROCESS_REAPER_INTERVAL_MS"),
+    verifyToolchainPaths: parsePathList(env.KONTROL_VERIFY_TOOLCHAIN_PATHS),
+    webhookEnabled: parseBoolean(env.KONTROL_WEBHOOKS),
+    webhookAllowedHosts: parseStringList(env.KONTROL_WEBHOOK_ALLOWED_HOSTS, []),
     mcpMaxInflight: parsePositiveInteger(env.KONTROL_MCP_MAX_INFLIGHT, 32, "KONTROL_MCP_MAX_INFLIGHT"),
     mcpMaxInflightPerSession: parsePositiveInteger(env.KONTROL_MCP_MAX_INFLIGHT_PER_SESSION, 8, "KONTROL_MCP_MAX_INFLIGHT_PER_SESSION"),
     mcpMaxQueue: parsePositiveInteger(env.KONTROL_MCP_MAX_QUEUE, 128, "KONTROL_MCP_MAX_QUEUE"),
     mcpMaxWaiters: parsePositiveInteger(env.KONTROL_MCP_MAX_WAITERS, 64, "KONTROL_MCP_MAX_WAITERS"),
     mcpMaxWaitersPerSession: parsePositiveInteger(env.KONTROL_MCP_MAX_WAITERS_PER_SESSION, 2, "KONTROL_MCP_MAX_WAITERS_PER_SESSION"),
     mcpMaxWaiterQueue: parsePositiveInteger(env.KONTROL_MCP_MAX_WAITER_QUEUE, 64, "KONTROL_MCP_MAX_WAITER_QUEUE"),
-    mcpRequestDeadlineMs: parsePositiveInteger(env.KONTROL_MCP_REQUEST_DEADLINE_MS, 120_000, "KONTROL_MCP_REQUEST_DEADLINE_MS"),
+    mcpAdmissionTimeoutMs: parsePositiveInteger(
+      env.KONTROL_MCP_ADMISSION_TIMEOUT_MS ?? env.KONTROL_MCP_REQUEST_DEADLINE_MS,
+      120_000,
+      "KONTROL_MCP_ADMISSION_TIMEOUT_MS",
+    ),
+    mcpExecutionTimeoutMs: parsePositiveInteger(
+      env.KONTROL_MCP_EXECUTION_TIMEOUT_MS,
+      30 * 60_000,
+      "KONTROL_MCP_EXECUTION_TIMEOUT_MS",
+    ),
+    // Approval calls are intentionally blocking. This is a stale-request
+    // backstop, not a normal conversational timeout; the WebUI can still
+    // approve a request many hours after it was created.
+    policyApprovalTimeoutMs: parsePositiveInteger(
+      env.KONTROL_POLICY_APPROVAL_TIMEOUT_MS,
+      24 * 60 * 60_000,
+      "KONTROL_POLICY_APPROVAL_TIMEOUT_MS",
+    ),
+    // Keep the old field for callers compiled against the previous config
+    // contract, but make the new name authoritative internally.
+    mcpRequestDeadlineMs: parsePositiveInteger(
+      env.KONTROL_MCP_ADMISSION_TIMEOUT_MS ?? env.KONTROL_MCP_REQUEST_DEADLINE_MS,
+      120_000,
+      "KONTROL_MCP_REQUEST_DEADLINE_MS",
+    ),
     // Give a client time to finish model-side reasoning and issue its first
     // useful operation; cleanup remains bounded by admission caps.
-    mcpUnusedSessionIdleMs: parsePositiveInteger(env.KONTROL_MCP_UNUSED_SESSION_IDLE_MS, 2 * 60_000, "KONTROL_MCP_UNUSED_SESSION_IDLE_MS"),
+    // MCP hosts commonly initialize, fetch the app template, and then pause
+    // while the model decides what to do. Keep those provisional sessions
+    // around long enough to survive that setup phase without making the
+    // admission caps unbounded.
+    mcpUnusedSessionIdleMs: parsePositiveInteger(env.KONTROL_MCP_UNUSED_SESSION_IDLE_MS, 10 * 60_000, "KONTROL_MCP_UNUSED_SESSION_IDLE_MS"),
     // One useful tool call does not prove that the model is finished. The
     // soft/hard caps handle pathological one-session-per-tool churn without
     // conflating separate transports.
-    mcpEphemeralSessionIdleMs: parsePositiveInteger(env.KONTROL_MCP_EPHEMERAL_SESSION_IDLE_MS, 5 * 60_000, "KONTROL_MCP_EPHEMERAL_SESSION_IDLE_MS"),
-    mcpReusableSessionIdleMs: parsePositiveInteger(env.KONTROL_MCP_REUSABLE_SESSION_IDLE_MS, 15 * 60_000, "KONTROL_MCP_REUSABLE_SESSION_IDLE_MS"),
+    // A completed tool call is not evidence that the host is finished. Keep
+    // active client transports for a day by default; the per-client/global
+    // caps and memory-pressure reaper still bound retained state.
+    mcpEphemeralSessionIdleMs: parsePositiveInteger(env.KONTROL_MCP_EPHEMERAL_SESSION_IDLE_MS, 24 * 60 * 60_000, "KONTROL_MCP_EPHEMERAL_SESSION_IDLE_MS"),
+    mcpReusableSessionIdleMs: parsePositiveInteger(env.KONTROL_MCP_REUSABLE_SESSION_IDLE_MS, 24 * 60 * 60_000, "KONTROL_MCP_REUSABLE_SESSION_IDLE_MS"),
     mcpSessionReaperIntervalMs: parsePositiveInteger(env.KONTROL_MCP_SESSION_REAPER_INTERVAL_MS, 15_000, "KONTROL_MCP_SESSION_REAPER_INTERVAL_MS"),
     mcpSessionMaxPerClient: parsePositiveInteger(env.KONTROL_MCP_SESSION_MAX_PER_CLIENT, 20, "KONTROL_MCP_SESSION_MAX_PER_CLIENT"),
     mcpSessionSoftCap: parsePositiveInteger(env.KONTROL_MCP_SESSION_SOFT_CAP, 150, "KONTROL_MCP_SESSION_SOFT_CAP"),
@@ -382,7 +536,23 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
 }
 
 function parsePublicBaseUrl(value: string): string {
-  const parsed = new URL(value);
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error(`KONTROL_PUBLIC_BASE_URL is not a valid URL: ${value}`);
+  }
+  // Deployment contract (P1 #7): the public base URL is embedded in OAuth
+  // redirects and issuer metadata, so it must be an origin we actually serve.
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+    throw new Error(`KONTROL_PUBLIC_BASE_URL must use http or https (got "${parsed.protocol}")`);
+  }
+  if (parsed.username || parsed.password) {
+    throw new Error("KONTROL_PUBLIC_BASE_URL must not contain username/password components");
+  }
+  if (parsed.hash) {
+    throw new Error("KONTROL_PUBLIC_BASE_URL must not contain a fragment");
+  }
   parsed.hash = "";
   parsed.search = "";
   parsed.pathname = parsed.pathname.replace(/\/+$/, "");

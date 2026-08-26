@@ -15,6 +15,7 @@ import {
   type WorkSessionFeedbackRow,
   type WorkSessionToolEventRow,
 } from "./db/schema.js";
+import type { ReviewFile } from "./review-checkpoints.js";
 
 export type WorkSessionStatus =
   | "in_progress"
@@ -114,6 +115,8 @@ export interface WorkSessionSubmission {
   reviewEpoch: number;
   message?: string;
   summaryJson?: string;
+  /** Structured checkpoint metadata; verification must not parse diff text. */
+  files?: ReviewFile[];
   status: "pending" | "reviewed";
   createdAt: string;
   feedback?: WorkSessionFeedback;
@@ -198,6 +201,7 @@ export interface WorkSessionManager {
     snapshotCommit?: string;
     message?: string;
     summaryJson?: string;
+    files?: ReviewFile[];
   }): WorkSessionSubmission;
   submitFeedback(input: {
     workSessionId: string;
@@ -270,19 +274,28 @@ export interface WorkSessionManager {
   close(): void;
 }
 
+export interface WorkSessionManagerOptions {
+  onTerminal?: (workSessionId: string) => void;
+}
+
 export function createWorkSessionManager(
   stateDirOrHandle: string | DatabaseHandle,
+  options: WorkSessionManagerOptions = {},
 ): WorkSessionManager {
   const database =
     typeof stateDirOrHandle === "string" ? openDatabase(stateDirOrHandle) : stateDirOrHandle;
-  return new SqliteWorkSessionManager(database, typeof stateDirOrHandle === "string");
+  return new SqliteWorkSessionManager(database, typeof stateDirOrHandle === "string", options);
 }
 
 class SqliteWorkSessionManager implements WorkSessionManager {
   private readonly database: DatabaseHandle;
   private readonly ownsDatabase: boolean;
 
-  constructor(database: DatabaseHandle, ownsDatabase: boolean) {
+  constructor(
+    database: DatabaseHandle,
+    ownsDatabase: boolean,
+    private readonly options: WorkSessionManagerOptions = {},
+  ) {
     this.database = database;
     this.ownsDatabase = ownsDatabase;
   }
@@ -361,6 +374,7 @@ class SqliteWorkSessionManager implements WorkSessionManager {
       .run();
     if (isTerminalStatus(status)) {
       this.releaseWorkspaceLeasesForSession(id);
+      this.options.onTerminal?.(id);
     }
   }
 
@@ -471,6 +485,7 @@ class SqliteWorkSessionManager implements WorkSessionManager {
     snapshotCommit?: string;
     message?: string;
     summaryJson?: string;
+    files?: ReviewFile[];
   }): WorkSessionSubmission {
     const diffSha256 = input.diffSha256 ?? sha256(input.diff ?? "");
     const now = new Date().toISOString();
@@ -495,14 +510,15 @@ class SqliteWorkSessionManager implements WorkSessionManager {
       const reviewEpoch = Number(session.review_epoch) + 1;
       this.database.sqlite.prepare(`
         insert into work_session_submissions
-          (id, work_session_id, submission_number, diff, diff_sha256, snapshot_commit, review_epoch, message, summary_json, status, created_at)
-        values (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+          (id, work_session_id, submission_number, diff, diff_sha256, files_json, snapshot_commit, review_epoch, message, summary_json, status, created_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
       `).run(
         submissionId,
         input.workSessionId,
         submissionNumber,
         input.diff ?? null,
         diffSha256,
+        input.files ? JSON.stringify(input.files) : null,
         input.snapshotCommit ?? null,
         reviewEpoch,
         input.message ?? null,
@@ -528,6 +544,7 @@ class SqliteWorkSessionManager implements WorkSessionManager {
       reviewEpoch: createSubmission.reviewEpoch,
       message: input.message,
       summaryJson: input.summaryJson,
+      files: input.files,
       status: "pending",
       createdAt: now,
     };
@@ -1255,9 +1272,29 @@ function rowToSubmission(row: WorkSessionSubmissionRow): WorkSessionSubmission {
     reviewEpoch: row.reviewEpoch ?? 1,
     message: row.message ?? undefined,
     summaryJson: row.summaryJson ?? undefined,
+    files: parseReviewFiles(row.filesJson),
     status: (row.status as "pending" | "reviewed") ?? "pending",
     createdAt: row.createdAt,
   };
+}
+
+function parseReviewFiles(value: string | null | undefined): ReviewFile[] | undefined {
+  if (!value) return undefined;
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (!Array.isArray(parsed)) return undefined;
+    const files = parsed.filter((file): file is ReviewFile => {
+      if (!file || typeof file !== "object") return false;
+      const candidate = file as Partial<ReviewFile>;
+      return typeof candidate.path === "string"
+        && typeof candidate.type === "string"
+        && typeof candidate.additions === "number"
+        && typeof candidate.removals === "number";
+    });
+    return files.length === parsed.length ? files : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function sha256(input: string): string {

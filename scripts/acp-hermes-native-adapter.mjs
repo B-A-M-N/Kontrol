@@ -14,6 +14,7 @@ import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { realpath, stat } from "node:fs/promises";
 import { clearAgentIdentity, identityHeaders, loadAgentIdentity, saveAgentIdentity } from "./lib/acp-agent-identity.mjs";
 import { readJsonBody, truncateUtf8Tail, writeAdapterError } from "./lib/adapter-http.mjs";
+import { adapterStatePath, atomicWriteJson, processStartToken, readJsonOr, reconcileOwnedProcesses, terminateProcessGroup } from "./lib/managed-agent-process.mjs";
 
 const KONTROL_ACP_URL = process.env.KONTROL_ACP_URL || "http://127.0.0.1:7676/acp";
 const AGENT_SECRET = process.env.KONTROL_ACP_AGENT_SECRET;
@@ -27,6 +28,10 @@ const HERMES_ACP_COMPAT_PATH = new URL("./hermes-acp-compat", import.meta.url).p
 const DEADMAN_IDLE_MS = positiveDuration(process.env.KONTROL_HERMES_DEADMAN_IDLE_MS, 5 * 60_000);
 const MAX_RUN_MS = positiveDuration(process.env.KONTROL_HERMES_MAX_RUN_SECONDS, 2 * 60 * 60) * 1000;
 const FINAL_OUTPUT_BYTES = 2 * 1024 * 1024;
+const OWNED_PROCESSES_PATH = process.env.KONTROL_HERMES_OWNED_PROCESSES
+  || adapterStatePath("hermes", "owned-processes.json");
+const TERMINAL_SPOOL_PATH = process.env.KONTROL_HERMES_TERMINAL_SPOOL
+  || adapterStatePath("hermes", "terminal-spool.json");
 
 if (process.argv.includes("--validate-imports")) {
   console.log("[hermes-native] import validation ok");
@@ -55,7 +60,19 @@ if (check.status !== 0) {
 const PYTHON_BIN = resolveHermesPython();
 let degraded = PYTHON_BIN === null;
 const active = new Map();
+const ownedProcesses = new Map();
+const pendingTerminalSpool = new Map();
 let agentIdentity = null;
+const adapterGenerationId = process.env.KONTROL_LAUNCH_GENERATION_ID || "unknown";
+let reconciliationComplete = false;
+let orphanProcessesTerminated = 0;
+
+const reconciliation = await reconcileOwnedProcesses(OWNED_PROCESSES_PATH, "hermes-native");
+orphanProcessesTerminated = reconciliation.terminated;
+reconciliationComplete = true;
+for (const entry of await readJsonOr(TERMINAL_SPOOL_PATH, [])) {
+  if (entry?.runId && entry.payload) pendingTerminalSpool.set(entry.runId, entry);
+}
 
 if (degraded) {
   console.error("[hermes-native] starting in DEGRADED mode — Hermes runs will be rejected until fixed");
@@ -71,7 +88,7 @@ if (degraded) {
   }
 }
 
-createServer((req, res) => {
+const httpServer = createServer((req, res) => {
   handle(req, res).catch((err) => {
     console.error("[hermes-native] request error:", err);
     writeAdapterError(res, err);
@@ -79,6 +96,19 @@ createServer((req, res) => {
 }).listen(ADAPTER_PORT, ADAPTER_HOST, () => {
   console.log(`[hermes-native] listening on ${ADAPTER_HOST}:${ADAPTER_PORT}`);
 });
+
+let shuttingDown = false;
+process.once("SIGTERM", () => { void shutdown(); });
+process.once("SIGINT", () => { void shutdown(); });
+
+async function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  httpServer.close();
+  await Promise.all([...active.values()].map((run) => terminateRun(run, "adapter shutdown", "cancelled")));
+  await flushTerminalSpool();
+  process.exit(0);
+}
 
 async function registerAgentWithRetry() {
   let lastError;
@@ -139,7 +169,19 @@ async function heartbeat() {
 
 async function handle(req, res) {
   if (req.method === "GET" && req.url === "/health") {
-    return writeJson(res, 200, { ok: !degraded, degraded, agent: "hermes-agent", active: active.size, native: true });
+    const ready = reconciliationComplete && !degraded && !shuttingDown;
+    return writeJson(res, ready ? 200 : 503, {
+      ok: ready,
+      ready,
+      lifecycle: ready ? "READY" : degraded ? "DEGRADED" : "STARTING_RECONCILIATION",
+      reconciled: reconciliationComplete,
+      orphanProcessesTerminated,
+      degraded,
+      agent: "hermes-agent",
+      active: active.size,
+      native: true,
+      generationId: adapterGenerationId,
+    });
   }
   const cancelMatch = (req.url || "").match(/^\/runs\/([^/]+)\/cancel$/);
   if (req.method === "POST" && cancelMatch) {
@@ -177,6 +219,8 @@ async function handle(req, res) {
     agentId: body.agent_id,
     task: extractTask(body.input),
     workspaceRoot,
+    workspaceLeaseNonce: body.workspace_lease_nonce,
+    startedAt: Date.now(),
     child: null,
     lifecycle: "STARTING",
     finalized: false,
@@ -205,6 +249,10 @@ async function handle(req, res) {
       ...safeEnv(),
       HERMES_AGENT_ROOT,
       PYTHONPATH: withHermesPythonPath(process.env.PYTHONPATH),
+      KONTROL_WORKSPACE_SESSION_ID: run.workspaceSessionId || "",
+      KONTROL_WORK_SESSION_ID: run.workSessionId || "",
+      KONTROL_PARENT_RUN_ID: run.devRunId || "",
+      KONTROL_WORKSPACE_LEASE_NONCE: run.workspaceLeaseNonce || "",
       KONTROL_HERMES_NATIVE_INPUT: JSON.stringify({
         command: HERMES_BIN,
         args: ["acp"],
@@ -216,6 +264,31 @@ async function handle(req, res) {
     },
   });
   run.child = child;
+  ownedProcesses.set(run.remoteRunId, {
+    remoteRunId: run.remoteRunId,
+    workSessionId: run.workSessionId,
+    workspaceSessionId: run.workspaceSessionId,
+    kontrolRunId: run.devRunId,
+    pid: child.pid,
+    processGroupId: child.pid,
+    processStartToken: processStartToken(child.pid),
+    workspaceRoot,
+    adapterGenerationId,
+    commandIdentity: `${HERMES_BIN} acp via hermes-native-runner.py`,
+    startedAt: run.startedAt,
+  });
+  try {
+    await saveOwnedProcesses();
+  } catch (error) {
+    const ownership = {
+      pid: child.pid,
+      processStartToken: processStartToken(child.pid),
+    };
+    active.delete(run.remoteRunId);
+    ownedProcesses.delete(run.remoteRunId);
+    try { await terminateProcessGroup(ownership, 5_000); } catch { /* report the original persistence failure */ }
+    throw new Error(`cannot durably record child ownership: ${error instanceof Error ? error.message : String(error)}`);
+  }
   run.lifecycle = "RUNNING";
 
   // P1 #11: The Python runner is the authoritative turn-end detector.
@@ -229,8 +302,7 @@ async function handle(req, res) {
     if (Date.now() >= run.absoluteDeadlineAt) {
       const elapsedMs = Date.now() - (run.absoluteDeadlineAt - MAX_RUN_MS);
       console.warn(`[hermes-native] absolute run ceiling for ${run.remoteRunId} — ${elapsedMs}ms elapsed`);
-      finalizeRun(run, "failed", `absolute run ceiling exceeded — ${Math.round(elapsedMs / 1000)}s`);
-      terminateChild(run, "absolute run ceiling");
+      void terminateRun(run, `absolute run ceiling exceeded — ${Math.round(elapsedMs / 1000)}s`, "failed");
       return;
     }
     // A permission request or explicitly reported child operation is
@@ -240,8 +312,7 @@ async function handle(req, res) {
     const idleMs = Date.now() - run.lastRunnerActivityAt;
     if (idleMs > DEADMAN_IDLE_MS) {
       console.warn(`[hermes-native] deadman idle timeout for ${run.remoteRunId} — ${idleMs}ms since last runner event`);
-      finalizeRun(run, "failed", `deadman idle timeout — no runner event for ${Math.round(idleMs / 1000)}s`);
-      terminateChild(run, "deadman idle timeout");
+      void terminateRun(run, `deadman idle timeout — no runner event for ${Math.round(idleMs / 1000)}s`, "failed");
     }
   }, 30_000).unref?.();
 
@@ -260,22 +331,26 @@ async function handle(req, res) {
   child.on("error", (err) => {
     clearInterval(heartbeatTimer);
     clearInterval(run.deadmanTimer);
-    if (run.finalized) return;
-    finalizeRun(run, "failed", err.message);
+    ownedProcesses.delete(run.remoteRunId);
+    void saveOwnedProcesses().catch((error) => console.warn(`[hermes-native] failed to persist child ownership cleanup: ${error.message}`));
+    if (run.finalized || run.terminating) return;
+    void finalizeRun(run, "failed", err.message);
   });
   child.on("exit", (code, signal) => {
     clearInterval(heartbeatTimer);
     if (stdoutBuffer.trim()) handleRunnerLine(run, stdoutBuffer);
-    if (run.finalized) return;
+    ownedProcesses.delete(run.remoteRunId);
+    void saveOwnedProcesses().catch((error) => console.warn(`[hermes-native] failed to persist child ownership cleanup: ${error.message}`));
+    if (run.finalized || run.terminating) return;
     if (code === 0 && !run.explicitCompletion) {
       // A clean process exit is not proof that the ACP turn completed. The
       // runner must emit its authoritative complete frame; otherwise the
       // review workflow would incorrectly advance on a truncated protocol.
-      finalizeRun(run, "failed", "protocol_incomplete: runner exited without an explicit complete event");
+      void finalizeRun(run, "failed", "protocol_incomplete: runner exited without an explicit complete event");
     } else if (code === 0) {
-      finalizeRun(run, "completed");
+      void finalizeRun(run, "completed");
     } else {
-      finalizeRun(run, "failed", signal ? `terminated by ${signal}` : `exit code ${code}`);
+      void finalizeRun(run, "failed", signal ? `terminated by ${signal}` : `exit code ${code}`);
     }
   });
 
@@ -300,7 +375,7 @@ function handleRunnerLine(run, line) {
     // P1 #11: Runner emitted explicit completion — finalize the turn.
     // The runner is the authoritative turn-end detector, not a timer.
     run.explicitCompletion = true;
-    finalizeRun(run, "completed", msg.stopReason);
+    void terminateRun(run, msg.stopReason || "Hermes reported completion", "completed");
     return;
   }
   if (msg.type === "error") return reportOutput(run, msg.error || "Hermes ACP error", "error");
@@ -501,26 +576,83 @@ async function withRetry(fn, { retries = 2, backoff = 500 } = {}) {
 
 function cancelRun(run, reason) {
   if (run.lifecycle === "FINALIZING" || run.lifecycle === "TERMINAL") return;
-  finalizeRun(run, "cancelled", reason);
-  terminateChild(run, reason);
+  void terminateRun(run, reason, "cancelled");
 }
 
 function terminateChild(run, reason) {
-  if (run.child?.pid) {
-    try {
-      process.kill(-run.child.pid, "SIGTERM");
-    } catch {
-      try { run.child.kill("SIGTERM"); } catch { /* ignore */ }
+  const child = run.child;
+  if (!child?.pid) return Promise.resolve(true);
+  const pid = child.pid;
+  console.warn(`[hermes-native] terminating process group ${pid}: ${reason}`);
+  const ownership = ownedProcesses.get(run.remoteRunId) ?? {
+    pid,
+    processGroupId: pid,
+    processStartToken: processStartToken(pid),
+  };
+  return terminateProcessGroup(
+    ownership,
+    positiveDuration(process.env.KONTROL_HERMES_TERMINATE_GRACE_MS, 5_000),
+  );
+}
+
+function terminateRun(run, reason, finalStatus = "failed") {
+  if (run.terminalOutcome) return Promise.resolve();
+  if (run.terminationPromise) return run.terminationPromise;
+  run.terminating = true;
+  run.lifecycle = "TERMINATING";
+  run.terminationPromise = (async () => {
+    const terminated = await terminateChild(run, reason);
+    if (!terminated) {
+      // Terminal state is withheld while the detached child could still be
+      // writing to the leased checkout. Retry the same state machine instead
+      // of falsely releasing the logical run.
+      console.error(`[hermes-native] could not confirm process group ${run.child?.pid ?? "unknown"} dead; terminal event withheld`);
+      run.terminationPromise = null;
+      setTimeout(() => {
+        if (!run.terminalOutcome) void terminateRun(run, reason, finalStatus);
+      }, 1_000).unref?.();
+      return false;
     }
-    setTimeout(() => {
-      try {
-        process.kill(-run.child.pid, "SIGKILL");
-      } catch {
-        try { run.child.kill("SIGKILL"); } catch { /* ignore */ }
-      }
-    }, 1500).unref?.();
+    ownedProcesses.delete(run.remoteRunId);
+    try {
+      await saveOwnedProcesses();
+    } catch (error) {
+      console.warn(`[hermes-native] failed to persist child ownership cleanup: ${error.message}`);
+    }
+    await finalizeRun(run, finalStatus, reason);
+    return true;
+  })();
+  return run.terminationPromise;
+}
+
+async function saveOwnedProcesses() {
+  await atomicWriteJson(OWNED_PROCESSES_PATH, [...ownedProcesses.values()]);
+}
+
+async function saveTerminalSpool() {
+  await atomicWriteJson(TERMINAL_SPOOL_PATH, [...pendingTerminalSpool.values()].slice(-100));
+}
+
+function spoolTerminalEvent(runId, event) {
+  pendingTerminalSpool.set(runId, { runId, payload: event, spooledAt: Date.now() });
+  return saveTerminalSpool();
+}
+
+async function flushTerminalSpool() {
+  for (const [runId, entry] of [...pendingTerminalSpool]) {
+    const delivered = await withRetry(() => fetch(`${KONTROL_ACP_URL}/runs/${entry.runId}/events`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", authorization: `Bearer ${AGENT_SECRET}`, ...identityHeaders(agentIdentity) },
+      body: JSON.stringify(entry.payload),
+    }), { retries: 0, backoff: 0 });
+    if (delivered) {
+      pendingTerminalSpool.delete(runId);
+      await saveTerminalSpool();
+    }
   }
 }
+
+setInterval(() => void flushTerminalSpool(), 30_000).unref?.();
 
 // P0 #3: Coalesce high-volume telemetry (output_delta, thought_delta) into
 // batched POSTs. Hermes can emit thousands of individual token/thought events
@@ -604,20 +736,31 @@ function enqueueRunEvent(run, type, payload, { allowFinalizing = false, terminal
   if ((run.lifecycle === "FINALIZING" || run.lifecycle === "TERMINAL") && !allowFinalizing) {
     return Promise.resolve(false);
   }
+  const event = {
+    type,
+    remote_run_id: run.remoteRunId,
+    work_session_id: run.workSessionId,
+    payload,
+  };
+  // Terminal state is written before network delivery. This makes a short
+  // Kontrol restart recoverable even if the adapter process also goes down.
+  const durableTerminal = terminal
+    ? spoolTerminalEvent(run.devRunId, event)
+    : Promise.resolve();
   const delivery = run.sendChain
     .catch((error) => recordDeliveryError(run, error))
     .then(async () => {
+      await durableTerminal;
       const acknowledged = await withRetry(() => fetch(`${KONTROL_ACP_URL}/runs/${run.devRunId}/events`, {
         method: "POST",
         headers: { "Content-Type": "application/json", authorization: `Bearer ${AGENT_SECRET}`, ...identityHeaders(agentIdentity) },
-        body: JSON.stringify({
-          type,
-          remote_run_id: run.remoteRunId,
-          work_session_id: run.workSessionId,
-          payload,
-        }),
+        body: JSON.stringify(event),
       }), terminal ? { retries: 3, backoff: 2000 } : { retries: 0, backoff: 0 });
       if (!acknowledged) throw new Error(`event delivery failed: ${type}`);
+      if (terminal) {
+        pendingTerminalSpool.delete(run.devRunId);
+        await saveTerminalSpool();
+      }
       return true;
     })
     .catch((error) => {
@@ -625,7 +768,7 @@ function enqueueRunEvent(run, type, payload, { allowFinalizing = false, terminal
       return false;
     });
   run.sendChain = delivery;
-  return delivery;
+  return run.sendChain;
 }
 
 function recordDeliveryError(run, error) {
@@ -639,7 +782,7 @@ function sendEvent(run, type, payload) {
   return enqueueRunEvent(run, type, payload);
 }
 
-function finalizeRun(run, status, stopReason) {
+async function finalizeRun(run, status, stopReason) {
   if (run.terminalOutcome) return run.terminalOutcome;
   const outcome = { status, stopReason };
   run.terminalOutcome = outcome;
@@ -648,12 +791,13 @@ function finalizeRun(run, status, stopReason) {
   clearInterval(run.deadmanTimer);
   // P1 #12: Flush coalesced telemetry BEFORE terminal event
   flushAllCoalesced(run);
-  void run.sendChain
-    .then(() => reportEvent(run, status, stopReason, { allowFinalizing: true }))
-    .finally(() => {
-      active.delete(run.remoteRunId);
-      run.lifecycle = "TERMINAL";
-    });
+  // Wait for every queued telemetry frame, including the coalesced buffers
+  // flushed above, before emitting the terminal frame. The terminal event is
+  // the durable boundary consumed by Kontrol; it must be last.
+  await run.sendChain;
+  await reportEvent(run, status, stopReason, { allowFinalizing: true });
+  active.delete(run.remoteRunId);
+  run.lifecycle = "TERMINAL";
   return outcome;
 }
 

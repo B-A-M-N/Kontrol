@@ -1,6 +1,7 @@
 import { randomUUID, createHash, timingSafeEqual } from "node:crypto";
 import { eq, and, lt, desc, sql } from "drizzle-orm";
 import { openDatabase, type DatabaseHandle } from "./db/client.js";
+import { validateWebhookUrl, type WebhookPolicy } from "./webhook-policy.js";
 import {
   agentRegistry,
   acpRuns,
@@ -213,25 +214,36 @@ export interface AgentRegistryManager {
   listRuns(workspaceSessionId?: string, limit?: number): PersistentAcpRun[];
   enqueueWebhook(runId: string, targetUrl: string, payload: unknown): void;
   processWebhooks(): Promise<number>;
+  /** Stop scheduling and wait for an in-flight delivery batch. */
+  drain?(): Promise<void>;
   close(): void;
 }
 
 export function createAgentRegistryManager(
   stateDirOrHandle: string | DatabaseHandle,
+  webhookPolicy?: WebhookPolicy,
 ): AgentRegistryManager {
   const database =
     typeof stateDirOrHandle === "string" ? openDatabase(stateDirOrHandle) : stateDirOrHandle;
-  return new SqliteAgentRegistryManager(database);
+  return new SqliteAgentRegistryManager(database, webhookPolicy);
 }
 
 class SqliteAgentRegistryManager implements AgentRegistryManager {
   private readonly database: DatabaseHandle;
+  private readonly webhookPolicy: WebhookPolicy;
   private readonly webhookWorkerId = `webhook_worker_${randomUUID()}`;
   private webhookTimer?: ReturnType<typeof setInterval>;
+  private webhookRun?: Promise<number>;
 
-  constructor(database: DatabaseHandle) {
+  constructor(database: DatabaseHandle, webhookPolicy?: WebhookPolicy) {
     this.database = database;
+    // Delivery-time policy binding: the CURRENT policy governs every delivery
+    // attempt. A queued event enqueued under yesterday's permissive policy is
+    // blocked rather than delivered after the operator disables webhooks or
+    // shrinks the allowlist and Kontrol restarts.
+    this.webhookPolicy = webhookPolicy ?? { enabled: false, allowedHosts: [] };
     this.pruneExpired();
+    if (!this.webhookPolicy.enabled) return; // no timer when webhooks are disabled
     this.webhookTimer = setInterval(() => {
       this.processWebhooks().catch((error) => {
         console.error(`[kontrol] webhook maintenance failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -651,7 +663,18 @@ class SqliteAgentRegistryManager implements AgentRegistryManager {
       .run();
   }
 
-  async processWebhooks(): Promise<number> {
+  processWebhooks(): Promise<number> {
+    if (this.webhookRun) return this.webhookRun;
+    const run = this.processWebhooksOnce();
+    let trackedRun!: Promise<number>;
+    trackedRun = run.finally(() => {
+      if (this.webhookRun === trackedRun) this.webhookRun = undefined;
+    });
+    this.webhookRun = trackedRun;
+    return trackedRun;
+  }
+
+  private async processWebhooksOnce(): Promise<number> {
     const now = new Date().toISOString();
 
     // Recover claims abandoned by a crashed worker. A live claim is never
@@ -683,14 +706,46 @@ class SqliteAgentRegistryManager implements AgentRegistryManager {
       })();
       if (!item) break;
 
+      // Raw `select *` returns snake_case columns; normalize the fields the
+      // delivery loop reads. (Previously targetUrl/retryCount/maxRetries were
+      // silently undefined — masked by tests whose fetch mock ignored them.)
+      const raw = item as unknown as Record<string, unknown>;
+      const targetUrl = (raw.target_url ?? raw.targetUrl ?? "") as string;
+      if (!targetUrl) {
+        throw new Error(`webhook queue row ${item.id} has no target_url`);
+      }
+      const retryCount = Number(raw.retry_count ?? raw.retryCount ?? 0);
+      const maxRetries = Number(raw.max_retries ?? raw.maxRetries ?? 3);
+
+      // Delivery-time revalidation: the CURRENT policy decides. A queued event
+      // whose target was allowlisted at enqueue time but has since been
+      // removed (or whose webhooks were disabled) is marked blocked_policy,
+      // never delivered.
+      const policyError = validateWebhookUrl(targetUrl, this.webhookPolicy);
+      if (policyError) {
+        this.database.db
+          .update(agentWebhookQueue)
+          .set({ status: "failed", lastError: `blocked_policy: ${policyError}`, claimedBy: null, claimExpiresAt: null })
+          .where(and(eq(agentWebhookQueue.id, item.id), eq(agentWebhookQueue.status, "processing"), eq(agentWebhookQueue.claimedBy, this.webhookWorkerId)))
+          .run();
+        continue;
+      }
+
       try {
-        const response = await fetch(item.targetUrl, {
+        // redirect: "manual" — an allowed host must not be able to redirect
+        // Kontrol to a destination that was never allowlisted. Any 3xx is
+        // treated as an error (retried/failed like other non-OK responses).
+        const response = await fetch(targetUrl, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: item.payloadJson,
+          redirect: "manual",
           signal: AbortSignal.timeout(10_000),
         });
 
+        if (response.status >= 300 && response.status < 400) {
+          throw new Error(`webhook redirects are not permitted by delivery policy (HTTP ${response.status})`);
+        }
         if (response.ok) {
           this.database.db
             .update(agentWebhookQueue)
@@ -702,21 +757,21 @@ class SqliteAgentRegistryManager implements AgentRegistryManager {
           throw new Error(`HTTP ${response.status}`);
         }
       } catch (error) {
-        const retryCount = item.retryCount + 1;
+        const nextRetryCount = retryCount + 1;
         let nextRetryAt: string | null = null;
         let finalStatus: "pending" | "failed" = "pending";
         const lastError = error instanceof Error ? error.message : String(error);
 
-        if (retryCount >= item.maxRetries) {
+        if (nextRetryCount >= maxRetries) {
           finalStatus = "failed";
         } else {
-          const delay = Math.pow(2, retryCount) * 5_000;
+          const delay = Math.pow(2, nextRetryCount) * 5_000;
           nextRetryAt = new Date(Date.now() + delay).toISOString();
         }
 
         this.database.db
           .update(agentWebhookQueue)
-          .set({ retryCount, lastError, status: finalStatus, nextRetryAt, claimedBy: null, claimExpiresAt: null })
+          .set({ retryCount: nextRetryCount, lastError, status: finalStatus, nextRetryAt, claimedBy: null, claimExpiresAt: null })
           .where(and(eq(agentWebhookQueue.id, item.id), eq(agentWebhookQueue.status, "processing"), eq(agentWebhookQueue.claimedBy, this.webhookWorkerId)))
           .run();
       }
@@ -734,6 +789,11 @@ class SqliteAgentRegistryManager implements AgentRegistryManager {
   }
 
   // P1 #11: DB owned by server
+  async drain(): Promise<void> {
+    if (this.webhookTimer) clearInterval(this.webhookTimer);
+    await this.webhookRun;
+  }
+
   close(): void {
     if (this.webhookTimer) clearInterval(this.webhookTimer);
   }

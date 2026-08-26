@@ -53,10 +53,18 @@ const migrations: Migration[] = [
   { version: 42, name: "semantic-finding-deduplication", up: migrateSemanticFindingDeduplication },
   { version: 43, name: "mission-review-coverage-uncertainty", up: migrateMissionReviewCoverageUncertainty },
   { version: 44, name: "agent-per-agent-credential", up: migrateAgentPerAgentCredential },
+  { version: 45, name: "submission-file-metadata", up: migrateSubmissionFileMetadata },
 ];
+
+function migrateSubmissionFileMetadata(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "work_session_submissions", "files_json", "text");
+}
 
 /** Canonical current schema version — readiness requires exact equality. */
 export const LATEST_SCHEMA_VERSION = migrations[migrations.length - 1]!.version;
+
+/** Ordered migration chain (exported for migration fixture tests). */
+export const migrationChain = migrations;
 
 function migrateAgentPerAgentCredential(sqlite: Database.Database): void {
   addColumnIfMissing(sqlite, "agent_registry", "agent_credential_hash", "text");

@@ -29,6 +29,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { signWorkerToken, TOKEN_TTL_MS } from "./lib/acp-worker-token.mjs";
 import { clearAgentIdentity, identityHeaders, loadAgentIdentity, saveAgentIdentity } from "./lib/acp-agent-identity.mjs";
 import { readJsonBody, truncateUtf8Tail, writeAdapterError } from "./lib/adapter-http.mjs";
+import { adapterStatePath, atomicWriteJson, processStartToken, reconcileOwnedProcesses, terminateProcessGroup } from "./lib/managed-agent-process.mjs";
 
 const KONTROL_ACP_URL = process.env.KONTROL_ACP_URL || "http://127.0.0.1:7676/acp";
 const AGENT_SECRET = process.env.KONTROL_ACP_AGENT_SECRET;
@@ -54,7 +55,10 @@ const HEARTBEAT_INTERVAL_MS = 55_000;
 // lease window. Cleared on spawn error / process exit.
 const RUN_HEARTBEAT_MS = 10_000;
 const REPLAY_WINDOW_MS = 24 * 60 * 60 * 1000;
-const REPLAY_STORE_PATH = process.env.ACP_ADAPTER_REPLAY_STORE || "/tmp/kontrol-acp-adapter-replay.json";
+const REPLAY_STORE_PATH = process.env.ACP_ADAPTER_REPLAY_STORE || adapterStatePath("crush", "replay.json");
+const OWNED_PROCESSES_PATH = process.env.KONTROL_CRUSH_OWNED_PROCESSES
+  || process.env.KONTROL_ACP_OWNED_PROCESSES
+  || adapterStatePath("crush", "owned-processes.json");
 export const OUTPUT_TAIL_BYTES = 64 * 1024;
 /** @deprecated Protocol budgets are bytes; retained for adapter compatibility. */
 export const OUTPUT_TAIL_CHARS = OUTPUT_TAIL_BYTES;
@@ -80,8 +84,12 @@ if (process.argv.includes("--validate-imports")) {
 const activeProcesses = new Map(); // pid -> { child, run }
 const activeBySession = new Map(); // workSessionId -> run
 const replayByDispatchKey = new Map(); // `${devRunId}:${continuationId}` -> accepted response
+const ownedProcesses = new Map(); // remoteRunId -> durable detached-child identity
 let agentIdentity = null;
 let shuttingDown = false;
+const adapterGenerationId = process.env.KONTROL_LAUNCH_GENERATION_ID || "unknown";
+let reconciliationComplete = false;
+let orphanProcessesTerminated = 0;
 
 async function main() {
   if (!AGENT_SECRET) {
@@ -92,6 +100,9 @@ async function main() {
     console.error("[adapter] ERROR: KONTROL_ACP_ADAPTER_SECRET is required");
     process.exit(1);
   }
+  const reconciliation = await reconcileOwnedProcesses(OWNED_PROCESSES_PATH, "adapter");
+  orphanProcessesTerminated = reconciliation.terminated;
+  reconciliationComplete = true;
   await loadReplayStore();
   agentIdentity = await registerAgent();
   startHeartbeat();
@@ -175,7 +186,16 @@ async function handleRequest(req, res) {
   const method = req.method || "";
 
   if (url === "/health" && method === "GET") {
-    return res.writeHead(200).end(JSON.stringify({ ok: true, workers: activeProcesses.size }));
+    const ready = reconciliationComplete && !shuttingDown;
+    return writeJson(res, ready ? 200 : 503, {
+      ok: ready,
+      ready,
+      lifecycle: ready ? "READY" : "STARTING_RECONCILIATION",
+      reconciled: reconciliationComplete,
+      orphanProcessesTerminated,
+      workers: activeProcesses.size,
+      generationId: adapterGenerationId,
+    });
   }
 
   if (url === "/runs" && method === "POST") {
@@ -261,12 +281,16 @@ async function handleRunRequest(req, res, body) {
     task,
     mode,
     token,
+    workspaceLeaseNonce: body.workspace_lease_nonce,
     startedAt: Date.now(),
     finalized: false,
     stdout: "",
     stderr: "",
     finalOutput: "",
     lastActivityAt: Date.now(), // P2 #27: output liveness for the stuck-process detector
+    sendChain: Promise.resolve(),
+    outputBuffers: new Map(),
+    outputTimers: new Map(),
   };
 
   if (smokeTest) {
@@ -314,6 +338,7 @@ async function handleRunRequest(req, res, body) {
       workspaceSessionId: workspaceSessionId ?? "",
       runId: devRunId,
       continuationId,
+      workspaceLeaseNonce: body.workspace_lease_nonce,
       exp: Date.now() + TOKEN_TTL_MS,
     }, AGENT_SECRET);
   }
@@ -322,6 +347,31 @@ async function handleRunRequest(req, res, body) {
     const child = spawnAgent(run);
     activeProcesses.set(child.pid, { child, run });
     run.childPid = child.pid;
+    ownedProcesses.set(run.remoteRunId, {
+      remoteRunId: run.remoteRunId,
+      workSessionId: run.workSessionId,
+      workspaceSessionId: run.workspaceSessionId,
+      kontrolRunId: run.devRunId,
+      pid: child.pid,
+      processGroupId: child.pid,
+      processStartToken: processStartToken(child.pid),
+      workspaceRoot: run.workspaceRoot,
+      adapterGenerationId,
+      commandIdentity: `${CRUSH_BIN} run --debug --quiet`,
+      startedAt: run.startedAt,
+    });
+    try {
+      await saveOwnedProcesses();
+    } catch (error) {
+      const ownership = {
+        pid: child.pid,
+        processStartToken: processStartToken(child.pid),
+      };
+      activeProcesses.delete(child.pid);
+      ownedProcesses.delete(run.remoteRunId);
+      try { await terminateProcessGroup(ownership, 5_000); } catch { /* report the original persistence failure */ }
+      throw new Error(`cannot durably record child ownership: ${error instanceof Error ? error.message : String(error)}`);
+    }
 
     // Per-run heartbeat (P1 #7): Kontrol writes workerLeaseUntil on each
     // heartbeat, so a long-lived worker does not appear to have leaked its
@@ -360,26 +410,31 @@ async function handleRunRequest(req, res, body) {
     child.on("error", (err) => {
       console.error(`[run ${run.remoteRunId}] spawn error:`, err.message);
       stopHeartbeat();
-      finalizeRun(run, "failed", err.message);
+      if (workSessionId && activeBySession.get(workSessionId) === run) activeBySession.delete(workSessionId);
+      ownedProcesses.delete(run.remoteRunId);
+      void saveOwnedProcesses().catch((error) => console.warn(`[adapter] failed to persist child ownership cleanup: ${error.message}`));
+      if (!run.terminating) void finalizeRun(run, "failed", err.message);
     });
 
     child.on("exit", (code, signal) => {
       stopHeartbeat();
       activeProcesses.delete(child.pid);
+      ownedProcesses.delete(run.remoteRunId);
+      void saveOwnedProcesses().catch((error) => console.warn(`[adapter] failed to persist child ownership cleanup: ${error.message}`));
       // Key by workSessionId (the review/work-session id), consistent with the
       // duplicate-dispatch check at the top of handleRunRequest.
       if (workSessionId && activeBySession.get(workSessionId) === run) {
         activeBySession.delete(workSessionId);
       }
-      if (run.finalized) return;
+      if (run.finalized || run.terminating) return;
       if (code === 0) {
-        finalizeRun(run, "completed");
+        void finalizeRun(run, "completed");
       } else {
         // A nonzero exit is an execution/infrastructure failure, NOT a protocol
         // violation. Report it as `failed` (which Kontrol persists) rather
         // than the unsupported `exited` type that Kontrol would reject with
         // HTTP 400 and silently strand the work session.
-        finalizeRun(
+        void finalizeRun(
           run,
           "failed",
           signal ? `terminated by ${signal}` : `exit code ${code}`,
@@ -393,13 +448,13 @@ async function handleRunRequest(req, res, body) {
       run.lastActivityAt = Date.now();
       run.stdout = appendBoundedOutput(run.stdout, text);
       run.finalOutput = appendBoundedOutput(run.finalOutput, text, FINAL_OUTPUT_CHARS);
-      reportOutputDelta(run, text);
+      reportOutputDelta(run, text, "stdout");
     });
     child.stderr.on("data", (d) => {
       const text = d.toString();
       run.lastActivityAt = Date.now();
       run.stderr = appendBoundedOutput(run.stderr, text);
-      reportOutputDelta(run, text);
+      reportOutputDelta(run, text, "stderr");
     });
 
     if (workSessionId) {
@@ -503,6 +558,7 @@ function workerEnvironment(run) {
   if (run.workSessionId) env.KONTROL_WORK_SESSION_ID = run.workSessionId;
   if (run.devRunId) env.KONTROL_PARENT_RUN_ID = run.devRunId;
   if (run.continuationId) env.KONTROL_CONTINUATION_ID = run.continuationId;
+  if (run.workspaceLeaseNonce) env.KONTROL_WORKSPACE_LEASE_NONCE = run.workspaceLeaseNonce;
   if (run.workerToken) env.KONTROL_WORKER_TOKEN = run.workerToken;
   return env;
 }
@@ -537,10 +593,14 @@ async function saveReplayStore() {
   pruneReplayStore();
   const obj = Object.fromEntries(replayByDispatchKey);
   try {
-    await writeFile(REPLAY_STORE_PATH, JSON.stringify(obj), { mode: 0o600 });
+    await atomicWriteJson(REPLAY_STORE_PATH, obj);
   } catch (err) {
     console.warn(`[adapter] failed to persist replay store: ${err.message}`);
   }
+}
+
+async function saveOwnedProcesses() {
+  await atomicWriteJson(OWNED_PROCESSES_PATH, [...ownedProcesses.values()]);
 }
 
 // P0 #6: fail closed on an invalid/missing workspace root. A malformed or stale
@@ -587,7 +647,7 @@ export async function validateWorkspaceRoot(workspaceRootRaw) {
   return real;
 }
 
-function finalizeRun(run, status, error, details) {
+async function finalizeRun(run, status, error, details) {
   if (run.finalized) {
     console.log(`[run ${run.remoteRunId}] already finalized, skip: ${status}`);
     return;
@@ -595,7 +655,12 @@ function finalizeRun(run, status, error, details) {
   run.finalized = true;
   console.log(`[run ${run.remoteRunId}] finalize: ${status}${error ? `: ${error}` : ""}`);
 
-  reportEvent(run, status, error, details);
+  flushAllOutput(run);
+  // Output telemetry and the terminal event share one ordered queue. This
+  // prevents a final result from overtaking chunks that were already emitted
+  // by CRUSH, and bounds request pressure on Kontrol.
+  await run.sendChain;
+  await reportEvent(run, status, error, details);
 }
 
 /**
@@ -609,75 +674,58 @@ function finalizeRun(run, status, error, details) {
  * -> confirm exit -> finalizeRun (terminal event).
  */
 function terminateRun(run, reason, finalStatus = "failed") {
-  if (run.finalized || run.terminating) {
+  if (run.finalized) {
+    return Promise.resolve();
+  }
+  if (run.terminationPromise) {
     if (!run.finalized) console.warn(`[run ${run.remoteRunId}] terminate already in progress`);
-    return;
+    return run.terminationPromise;
   }
   run.terminating = true;
-  const entry = run.childPid !== undefined ? activeProcesses.get(run.childPid) : undefined;
-  const child = entry?.child;
-  if (!child) {
-    // No live process to reap; safe to emit the terminal event immediately.
-    finalizeRun(run, finalStatus, reason);
-    return;
-  }
-  const pid = child.pid;
-  console.warn(`[run ${run.remoteRunId}] terminating process group ${pid}: ${reason}`);
-  try {
-    process.kill(-pid, "SIGTERM");
-  } catch {
-    try { child.kill("SIGTERM"); } catch { /* ignore */ }
-  }
-  const graceMs = Number(process.env.KONTROL_CRUSH_TERMINATE_GRACE_MS) > 0
-    ? Number(process.env.KONTROL_CRUSH_TERMINATE_GRACE_MS)
-    : 5_000;
-  const poll = setInterval(() => {
-    let alive = false;
-    try { alive = process.kill(-pid, 0); } catch { /* ESRCH: gone */ }
-    if (!alive && !activeProcesses.has(pid)) {
-      clearInterval(poll);
-      clearTimeout(escalate);
-      finalizeRun(run, finalStatus, reason);
-      return;
+  run.terminationPromise = (async () => {
+    const entry = run.childPid !== undefined ? activeProcesses.get(run.childPid) : undefined;
+    const child = entry?.child;
+    if (child) {
+      const pid = child.pid;
+      console.warn(`[run ${run.remoteRunId}] terminating process group ${pid}: ${reason}`);
+      const graceMs = Number(process.env.KONTROL_CRUSH_TERMINATE_GRACE_MS) > 0
+        ? Number(process.env.KONTROL_CRUSH_TERMINATE_GRACE_MS)
+        : 5_000;
+      const ownership = ownedProcesses.get(run.remoteRunId) ?? {
+        pid,
+        processGroupId: pid,
+        processStartToken: processStartToken(pid),
+      };
+      const terminated = await terminateProcessGroup(ownership, graceMs);
+      if (!terminated) {
+        // Never publish a terminal event while a detached worker may still be
+        // mutating the checkout. Leave the run fenced and retry the same
+        // termination state machine; a later retry may succeed after a
+        // transient process/cgroup race clears.
+        console.error(`[run ${run.remoteRunId}] could not confirm process group ${pid} dead; terminal event withheld`);
+        run.terminationPromise = null;
+        setTimeout(() => {
+          if (!run.finalized) void terminateRun(run, reason, finalStatus);
+        }, 1_000).unref?.();
+        return false;
+      }
     }
-  }, 200);
-  const escalate = setTimeout(() => {
-    clearInterval(poll);
-    console.error(`[run ${run.remoteRunId}] SIGTERM ignored — escalating to SIGKILL for process group ${pid}`);
+    ownedProcesses.delete(run.remoteRunId);
     try {
-      process.kill(-pid, "SIGKILL");
-    } catch {
-      try { child.kill("SIGKILL"); } catch { /* ignore */ }
+      await saveOwnedProcesses();
+    } catch (error) {
+      console.error(`[adapter] failed to persist child ownership cleanup: ${error instanceof Error ? error.message : String(error)}`);
     }
-    // Give the kill a moment, then finalize regardless. Exit handlers will
-    // reconcile if the process somehow lingers.
-    setTimeout(() => finalizeRun(run, finalStatus, `${reason} (escalated to SIGKILL)`), 500).unref?.();
-  }, graceMs);
-  escalate.unref?.();
+    await finalizeRun(run, finalStatus, reason);
+  })();
+  return run.terminationPromise;
 }
 
 function cancelActiveRun(remoteRunId, reason) {
   for (const [pid, entry] of activeProcesses.entries()) {
     if (entry.run.remoteRunId !== remoteRunId) continue;
-    const { child, run } = entry;
-    if (run.workSessionId && activeBySession.get(run.workSessionId) === run) {
-      activeBySession.delete(run.workSessionId);
-    }
-    try {
-      process.kill(-child.pid, "SIGTERM");
-    } catch {
-      try { child.kill("SIGTERM"); } catch { /* ignore */ }
-    }
-    finalizeRun(run, "cancelled", reason);
-    setTimeout(() => {
-      if (activeProcesses.has(pid)) {
-        try {
-          process.kill(-child.pid, "SIGKILL");
-        } catch {
-          try { child.kill("SIGKILL"); } catch { /* ignore */ }
-        }
-      }
-    }, 1500).unref?.();
+    const { run } = entry;
+    void terminateRun(run, reason, "cancelled");
     return true;
   }
   return false;
@@ -685,7 +733,7 @@ function cancelActiveRun(remoteRunId, reason) {
 
 async function reportEvent(run, type, errorMessage, details) {
   const terminal = type === "completed" || type === "failed" || type === "cancelled";
-  const payload = {
+  return enqueueRunEvent(run, {
     remote_run_id: run.remoteRunId,
     work_session_id: run.workSessionId,
     type,
@@ -699,30 +747,47 @@ async function reportEvent(run, type, errorMessage, details) {
       ...(terminal && run.finalOutput ? { final_output: run.finalOutput } : {}),
       message: errorMessage || "",
     },
-  };
-  const success = await withRetry(() =>
-    fetch(`${KONTROL_ACP_URL}/runs/${run.devRunId}/events`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", authorization: `Bearer ${AGENT_SECRET}`, ...identityHeaders(agentIdentity) },
-      body: JSON.stringify(payload),
-    }),
-    { retries: 3, backoff: 2000 },
-  );
-  if (!success) {
-    console.error(`[run ${run.remoteRunId}] failed to report ${type}`);
-    if (terminal) {
-      // P1 #12: terminal events are authoritative — a Kontrol outage at the
-      // moment the worker exits must not lose them. Spool durably (0600) for
-      // redrive by the background flush loop.
-      spoolTerminalEvent(run.devRunId, payload);
-    }
-  } else {
-    console.log(`[run ${run.remoteRunId}] reported ${type}`);
-  }
+  }, terminal);
+}
+
+function enqueueRunEvent(run, event, terminal = false) {
+  const durableTerminal = terminal
+    ? spoolTerminalEvent(run.devRunId, event)
+    : Promise.resolve();
+  const delivery = run.sendChain
+    .catch(() => undefined)
+    .then(async () => {
+      await durableTerminal;
+      const success = await withRetry(() =>
+        fetch(`${KONTROL_ACP_URL}/runs/${run.devRunId}/events`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", authorization: `Bearer ${AGENT_SECRET}`, ...identityHeaders(agentIdentity) },
+          body: JSON.stringify(event),
+        }),
+        terminal ? { retries: 3, backoff: 2000 } : { retries: 0, backoff: 0 },
+      );
+      if (!success) {
+        console.error(`[run ${run.remoteRunId}] failed to report ${event.type}`);
+        return false;
+      }
+      if (terminal) {
+        pendingTerminalSpool.delete(run.devRunId);
+        void saveTerminalSpool().catch((error) => console.warn(`[adapter] failed to persist terminal spool cleanup: ${error.message}`));
+      }
+      console.log(`[run ${run.remoteRunId}] reported ${event.type}`);
+      return true;
+    });
+  run.sendChain = delivery.catch((error) => {
+    console.error(`[run ${run.remoteRunId}] event delivery failed: ${error instanceof Error ? error.message : String(error)}`);
+    return false;
+  });
+  return run.sendChain;
 }
 
 // ── P1 #12: terminal-event spool ─────────────────────────────
-const SPOOL_PATH = process.env.KONTROL_ACP_TERMINAL_SPOOL || "/tmp/kontrol-acp-terminal-spool.json";
+const SPOOL_PATH = process.env.KONTROL_CRUSH_TERMINAL_SPOOL
+  || process.env.KONTROL_ACP_TERMINAL_SPOOL
+  || adapterStatePath("crush", "terminal-spool.json");
 const SPOOL_MAX_EVENTS = 100;
 const pendingTerminalSpool = new Map();
 
@@ -734,18 +799,14 @@ function loadTerminalSpool() {
 }
 
 async function saveTerminalSpool() {
-  try {
-    const entries = [...pendingTerminalSpool.values()].slice(-SPOOL_MAX_EVENTS);
-    await writeFile(SPOOL_PATH, JSON.stringify(entries), { mode: 0o600 });
-  } catch (err) {
-    console.warn(`[adapter] failed to persist terminal-event spool: ${err.message}`);
-  }
+  const entries = [...pendingTerminalSpool.values()].slice(-SPOOL_MAX_EVENTS);
+  await atomicWriteJson(SPOOL_PATH, entries);
 }
 
 function spoolTerminalEvent(runId, payload) {
   pendingTerminalSpool.set(runId, { runId, payload, spooledAt: Date.now() });
-  void saveTerminalSpool();
   console.warn(`[run ${runId}] terminal event spooled for redrive (${pendingTerminalSpool.size} pending)`);
+  return saveTerminalSpool();
 }
 
 async function flushTerminalSpool() {
@@ -769,20 +830,51 @@ async function flushTerminalSpool() {
 loadTerminalSpool();
 setInterval(() => void flushTerminalSpool(), 30_000).unref?.();
 
-async function reportOutputDelta(run, text) {
-  try {
-    const payload = {
-      remote_run_id: run.remoteRunId,
-      work_session_id: run.workSessionId || undefined,
-      type: "output_delta",
-      payload: { text: text.slice(-1000) },
-    };
-    await fetch(`${KONTROL_ACP_URL}/runs/${run.devRunId}/events`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", authorization: `Bearer ${AGENT_SECRET}`, ...identityHeaders(agentIdentity) },
-      body: JSON.stringify(payload),
-    });
-  } catch { /* best effort */ }
+function reportOutputDelta(run, text, channel = "stdout") {
+  if (!text || run.finalized) return Promise.resolve(false);
+  const bounded = truncateUtf8Tail(String(text), OUTPUT_COALESCE_MAX_BYTES);
+  let entry = run.outputBuffers.get(channel);
+  if (!entry) {
+    entry = { text: "", bytes: 0, count: 0 };
+    run.outputBuffers.set(channel, entry);
+  }
+  entry.text += bounded;
+  entry.bytes += Buffer.byteLength(bounded, "utf8");
+  entry.count += 1;
+  if (entry.bytes >= OUTPUT_COALESCE_MAX_BYTES) return flushOutput(run, channel);
+  if (!run.outputTimers.has(channel)) {
+    run.outputTimers.set(channel, setTimeout(() => {
+      run.outputTimers.delete(channel);
+      void flushOutput(run, channel);
+    }, OUTPUT_COALESCE_INTERVAL_MS));
+  }
+  return Promise.resolve(true);
+}
+
+const OUTPUT_COALESCE_INTERVAL_MS = 250;
+const OUTPUT_COALESCE_MAX_BYTES = 4096;
+
+function flushOutput(run, channel) {
+  const entry = run.outputBuffers.get(channel);
+  if (!entry) return Promise.resolve(false);
+  run.outputBuffers.delete(channel);
+  const timer = run.outputTimers.get(channel);
+  if (timer) {
+    clearTimeout(timer);
+    run.outputTimers.delete(channel);
+  }
+  return enqueueRunEvent(run, {
+    remote_run_id: run.remoteRunId,
+    work_session_id: run.workSessionId || undefined,
+    type: "output_delta",
+    payload: { text: entry.text, channel, coalesced: true, count: entry.count },
+  }, false);
+}
+
+function flushAllOutput(run) {
+  for (const channel of [...run.outputBuffers.keys()]) flushOutput(run, channel, true);
+  for (const timer of run.outputTimers.values()) clearTimeout(timer);
+  run.outputTimers.clear();
 }
 
 async function withRetry(fn, { retries = 2, backoff = 500 } = {}) {
@@ -803,16 +895,8 @@ async function shutdown() {
   if (shuttingDown) return;
   shuttingDown = true;
   console.log("[adapter] shutting down...");
-  for (const { child, run } of activeProcesses.values()) {
-    try {
-      process.kill(-child.pid, "SIGTERM");
-      finalizeRun(run, "cancelled", "adapter shutdown");
-    } catch { /* ignore */ }
-  }
-  await sleep(1500);
-  for (const { child } of activeProcesses.values()) {
-    try { process.kill(-child.pid, "SIGKILL"); } catch { /* ignore */ }
-  }
+  await Promise.all([...activeProcesses.values()].map(({ run }) => terminateRun(run, "adapter shutdown", "cancelled")));
+  await flushTerminalSpool();
   process.exit(0);
 }
 

@@ -38,6 +38,7 @@ kontrol config set publicBaseUrl https://kontrol.example.com
 | `KONTROL_OAUTH_OWNER_TOKEN` | Owner password for OAuth approval. Must be at least 16 characters. |
 | `KONTROL_AUTH_MODE` | MCP auth mode: `oauth` (default) or `tunnel`. |
 | `KONTROL_TUNNEL_TOKEN` | Legacy compatibility variable. Ignored in tunnel mode; do not forward it as an MCP header. Authentication belongs to the Secure MCP Tunnel. |
+| `KONTROL_TUNNEL_REVIEWER_SECRET` | Secret injected by `scripts/kontrol-tunnel.sh` into MCP target requests to establish WebUI reviewer authority in tunnel mode. Defaults to `KONTROL_ACP_REVIEWER_SECRET`; keep it private. |
 | `KONTROL_TUNNEL_PROFILE` | tunnel-client profile name used by the managed launcher. Defaults to `sample_mcp_with_dcr`. |
 | `KONTROL_TUNNEL_ID` | Optional explicit tunnel registration ID passed to tunnel-client, overriding the profile’s ID. Use this after creating/rebinding a tunnel. |
 | `KONTROL_TUNNEL_DOCTOR` | Run `tunnel-client doctor` with the effective runtime profile/ID before launch. Defaults to `true`; it uses an ephemeral health port. |
@@ -49,10 +50,12 @@ kontrol config set publicBaseUrl https://kontrol.example.com
 | `KONTROL_MCP_MAX_WAITERS` | Independent concurrent budget for parked event/review/terminal waiters. Defaults to `64`. |
 | `KONTROL_MCP_MAX_WAITERS_PER_SESSION` | Maximum parked waiters from one MCP session. Defaults to `2`. |
 | `KONTROL_MCP_MAX_WAITER_QUEUE` | Maximum queued parked waiters. Defaults to `64`. |
-| `KONTROL_MCP_REQUEST_DEADLINE_MS` | Maximum time a request waits for admission. Defaults to `120000`. |
-| `KONTROL_MCP_UNUSED_SESSION_IDLE_MS` | Idle TTL for initialized sessions with no tool calls. Defaults to `120000`, allowing model-side setup time. |
-| `KONTROL_MCP_EPHEMERAL_SESSION_IDLE_MS` | Grace TTL for non-worker sessions with exactly one tool call. Defaults to `300000`; one completed tool call does not mean the model is finished. |
-| `KONTROL_MCP_REUSABLE_SESSION_IDLE_MS` | Idle TTL for reusable or multi-tool sessions. Defaults to `900000`. |
+| `KONTROL_MCP_ADMISSION_TIMEOUT_MS` | Maximum time a request waits for an admission slot. Defaults to `120000`. `KONTROL_MCP_REQUEST_DEADLINE_MS` remains a legacy alias. |
+| `KONTROL_MCP_EXECUTION_TIMEOUT_MS` | Maximum execution time for ordinary MCP calls. Defaults to `1800000` (30 minutes). Long-poll waiters and approval-gated calls are exempt and use their own lifecycle. |
+| `KONTROL_POLICY_APPROVAL_TIMEOUT_MS` | Stale-card backstop for blocking policy approvals. Defaults to `86400000` (24 hours); it is not a normal request timeout. |
+| `KONTROL_MCP_UNUSED_SESSION_IDLE_MS` | Idle TTL for initialized sessions with no tool calls. Defaults to `600000` (10 minutes), allowing model-side setup time. |
+| `KONTROL_MCP_EPHEMERAL_SESSION_IDLE_MS` | Grace TTL for non-worker sessions with exactly one tool call. Defaults to `86400000` (24 hours); one completed tool call does not mean the model is finished. |
+| `KONTROL_MCP_REUSABLE_SESSION_IDLE_MS` | Idle TTL for reusable or multi-tool sessions. Defaults to `86400000` (24 hours). |
 | `KONTROL_MCP_SESSION_REAPER_INTERVAL_MS` | Session reaper interval. Defaults to `15000`. |
 | `KONTROL_MCP_SESSION_MAX_PER_CLIENT` | Per-logical-client session cap. Defaults to `20`. |
 | `KONTROL_MCP_SESSION_SOFT_CAP` | Global session soft cap for LRU pressure cleanup. Defaults to `150`. |
@@ -63,6 +66,16 @@ kontrol config set publicBaseUrl https://kontrol.example.com
 | `KONTROL_OPERATIONAL_UAT` | Set `true` to run the disposable real-agent startup UAT. Defaults to `false`. |
 | `KONTROL_VERIFY_SANDBOX` | Set `1` to require fail-closed Bubblewrap sandboxing for unattended mission verification. Defaults to trusted allowlisted execution. |
 | `KONTROL_BWRAP` | Optional explicit Bubblewrap executable path used when verification sandboxing is enabled. |
+| `KONTROL_CHILD_ENV_ALLOWLIST` | Comma-separated additional non-secret environment names passed to project child processes, for example `SSH_AUTH_SOCK,HTTP_PROXY,NO_PROXY`. Control-plane, token, credential, and secret names are always stripped. |
+| `KONTROL_PROCESS_MAX_RUNNING` | unset (default 64) | Maximum concurrently running process sessions globally |
+| `KONTROL_PROCESS_MAX_RUNNING_PER_OWNER` | unset (default 8) | Per-owner cap on running process sessions |
+| `KONTROL_PROCESS_IDLE_TIMEOUT_MS` | unset (default 900000) | Idle timeout before a process session is reaped |
+| `KONTROL_PROCESS_MAX_RUNTIME_MS` | unset (default 3600000) | Absolute runtime ceiling per process session |
+| `KONTROL_PROCESS_BUFFER_CHARACTERS` | unset (default 1000000) | Output buffer character limit per session |
+| `KONTROL_PROCESS_REAPER_INTERVAL_MS` | unset (manager default) | How often the session reaper sweeps |
+| `KONTROL_VERIFY_TOOLCHAIN_PATHS` | Comma-separated approved host files/directories mounted read-only into Bubblewrap verification. Use this for nvm/venv/cargo toolchains; an empty value means only the system mounts are available. |
+| `KONTROL_WEBHOOKS` | Set `1` to enable outbound ACP webhooks. Disabled by default. |
+| `KONTROL_WEBHOOK_ALLOWED_HOSTS` | Comma-separated exact webhook destination hostnames. `*` is an explicit opt-in to arbitrary HTTP/HTTPS destinations. |
 | `KONTROL_RELEASE_MODE` | Set `true` to refuse dirty source trees unless `KONTROL_ALLOW_DIRTY_RELEASE=true`. |
 | `KONTROL_HARPOON_INCLUDE_LOOPBACK` | Passed to tunnel-client; defaults to `false` so Harpoon does not auto-register KONTROL's local HTTP OAuth metadata URLs. |
 
@@ -300,21 +313,36 @@ Supervisor and verification concurrency are bounded independently:
 | `KONTROL_CRUSH_STUCK_IDLE_MS` | `3600000` | CRUSH stuck detector: zero-output idle beyond this is a suspect signal; the child is terminated (SIGTERM → grace → SIGKILL) BEFORE the terminal event releases the lease |
 | `KONTROL_CRUSH_MAX_RUN_MS` | `86400000` | CRUSH absolute emergency ceiling regardless of activity |
 | `KONTROL_CRUSH_TERMINATE_GRACE_MS` | `5000` | Grace between SIGTERM and SIGKILL when terminating a stuck/cancelled CRUSH run |
-| `KONTROL_STARTUP_PROFILE` | auto | `dev-fast` / `normal` / `release` preflight depth for start-all.sh; auto-selects from legacy env vars when unset |
+| `KONTROL_STARTUP_PROFILE` | `dev-fast` | `dev-fast` / `normal` / `release` preflight depth for start-all.sh. Fast development startup is the default; use `normal` or `release` for the complete test gate. |
 | `KONTROL_POLICY_MODE` | `allow` | Default trust posture: `allow` (read-only frictionless), `deny`, or `ask` (gate everything not explicitly allowed) |
+| `KONTROL_POLICY_TOOL_<TOOL>` | secure baseline (`ask` for bash/write/edit/apply_patch; read tools allow) | Per-tool override. With no explicit policy configured, Kontrol applies a secure baseline that gates shell and mutating tools behind approval while keeping read-only inspection frictionless. Any explicit per-tool rule or global mode replaces the baseline. |
 
 ### Policy
 
 Shell execution (`bash`, `exec_command`, `kontrol-shell`) is one policy tool: a
 rule on `bash` gates all three. Mutating `write_stdin` input is gated as shell;
-poll-only stdin stays read-only. For an approval-gated posture set
-`KONTROL_POLICY_MODE=ask` or per-tool e.g. `KONTROL_POLICY_TOOL_BASH=ask`.
+poll-only stdin stays read-only.
+
+With no explicit policy configured, Kontrol applies a **secure baseline**:
+`read`, `grep`, `glob`, and `ls` are allowed frictionlessly, while `bash`,
+`write`, `edit`, and `apply_patch` require approval (`ask`). This is the
+stable-beta default because the authenticated caller is an LLM consuming
+potentially adversarial project content — prompt injection is exactly the
+scenario where the default mutation boundary matters. An operator may promote
+tools explicitly (e.g. `KONTROL_POLICY_TOOL_BASH=allow`) or set a global
+`KONTROL_POLICY_MODE`, which replaces the baseline entirely.
 
 `KONTROL_POLICY_PATH_RULES` applies to structured filesystem tools after
 workspace path resolution. It does not parse shell commands or sandbox their
 filesystem access. When path rules are configured, set
 `KONTROL_POLICY_TOOL_BASH=ask` or `deny` (or provide an external OS sandbox) if
 shell must not bypass the path policy; `kontrol doctor` reports this posture.
+
+Session and workspace approvals are durable. Work-session grants are revoked
+when the session reaches a terminal state; workspace grants survive a Kontrol
+restart until a reviewer explicitly revokes them with the policy-grant tool.
+The approval center does not offer a session grant when no work-session ID is
+available.
 
 ## Logging
 
@@ -326,7 +354,7 @@ shell must not bypass the path policy; `kontrol doctor` reports this posture.
 | `KONTROL_LOG_ASSETS` | `0` |
 | `KONTROL_LOG_TOOL_CALLS` | `1` |
 | `KONTROL_LOG_SHELL_COMMANDS` | `0` |
-| `KONTROL_TRUST_PROXY` | `0` |
+| `KONTROL_TRUST_PROXY` | unset | Trusted-proxy specification. Unset: forwarded headers (`CF-Connecting-IP`, `X-Forwarded-For`) are ignored and the socket address is used — a direct caller cannot spoof its IP. Set to a hop count (e.g. `1`) to trust exactly N proxy hops, or `loopback` to trust only loopback proxies. `true` (trust-all) is deprecated and logs a warning because it lets any reachable caller forge these headers. |
 
 Set `KONTROL_LOG_FORMAT=pretty` for local debugging.
 

@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 import { realpath } from "node:fs/promises";
 import { Router } from "express";
 import type { Request, Response } from "express";
@@ -15,11 +15,13 @@ import type { EventStore } from "./event-log.js";
 import type { ContinuationManager } from "./continuation.js";
 import type { ReviewCheckpointManager } from "./review-checkpoints.js";
 import type { ReviewWorkflowService } from "./review-workflow.js";
-import { cancelRemoteRun, dispatchToPeer, executeKontrolTool, isLoopbackAgentUrl, selectHealthyAgent } from "./acp-gateway.js";
+import { cancelRemoteRun, DEFAULT_ACP_TIMEOUT, dispatchToPeer, executeKontrolTool, isLoopbackAgentUrl, selectHealthyAgent } from "./acp-gateway.js";
+import { constantTimeStringEqual } from "./server.js";
 import { createPolicyEnforcer, type PolicyEnforcer, type PolicyInvocation, ACP_TOOL_POLICY_NAMES, type PrincipalRole } from "./policy-enforcement.js";
 import type { ApprovalRequestManager, ApprovalOption } from "./approval-requests.js";
 import { authorizeWorkSessionAction } from "./work-session-action-guard.js";
 import * as z from "zod/v4";
+import { validateWebhookUrl, type WebhookPolicy } from "./webhook-policy.js";
 
 /**
  * Long-poll window for a blocking agent permission request. This is NOT a
@@ -105,8 +107,10 @@ export function createAcpServer(
   approvalRequests?: ApprovalRequestManager,
   agentSecret?: string,
   reviewerSecret?: string,
+  webhookPolicy?: WebhookPolicy,
 ): Router {
   const router = Router();
+  const effectiveWebhookPolicy = webhookPolicy ?? { enabled: false, allowedHosts: [] };
   const sseClients = new Map<string, Set<Response>>();
   const agentMap = new Map(ACP_AGENTS.map((a) => [a.name, a]));
 
@@ -119,10 +123,12 @@ export function createAcpServer(
   type AcpRole = "agent" | "reviewer" | "operator";
 
   function authenticateAcpRequest(req: Request): AcpRole | undefined {
-    const auth = req.headers.authorization;
-    if (agentSecret && auth === `Bearer ${agentSecret}`) return "agent";
-    if (reviewerSecret && auth === `Bearer ${reviewerSecret}`) return "reviewer";
-    if (sharedSecret && auth === `Bearer ${sharedSecret}`) return "operator";
+    const presented = req.headers.authorization;
+    // Timing-safe comparisons (P1 #5). First-match wins; distinct secrets are
+    // enforced by config validation, so role resolution is unambiguous.
+    if (agentSecret && constantTimeStringEqual(presented, `Bearer ${agentSecret}`)) return "agent";
+    if (reviewerSecret && constantTimeStringEqual(presented, `Bearer ${reviewerSecret}`)) return "reviewer";
+    if (sharedSecret && constantTimeStringEqual(presented, `Bearer ${sharedSecret}`)) return "operator";
     return undefined;
   }
 
@@ -174,6 +180,21 @@ export function createAcpServer(
       const clients = sseClients.get(runId);
       if (clients) { clients.delete(res); if (clients.size === 0) sseClients.delete(runId); }
     });
+  }
+
+  function requestAbortSignal(req: Request, res: Response): AbortSignal {
+    const controller = new AbortController();
+    const abortIfDisconnected = () => {
+      if (!res.writableFinished) controller.abort();
+    };
+    req.once("aborted", abortIfDisconnected);
+    res.once("close", abortIfDisconnected);
+    const cleanup = () => {
+      req.removeListener("aborted", abortIfDisconnected);
+      res.removeListener("close", abortIfDisconnected);
+    };
+    res.once("finish", cleanup);
+    return controller.signal;
   }
 
   function resolveCwd(sessionId: string): { cwd: string; root: string } | undefined {
@@ -454,6 +475,7 @@ export function createAcpServer(
 
   router.post("/runs", async (req: Request, res: Response) => {
     if (!authGate(req, res, ["reviewer", "operator"])) return;
+    const requestSignal = requestAbortSignal(req, res);
 
     const parsed = acpRunRequestSchema.safeParse(req.body);
     if (!parsed.success) {
@@ -461,6 +483,13 @@ export function createAcpServer(
       return;
     }
     const { agent_name, input, mode, session_id, work_session_id, workspace_id, workspace_session_id, webhook_url } = parsed.data;
+    if (webhook_url) {
+      const webhookError = validateWebhookUrl(webhook_url, effectiveWebhookPolicy);
+      if (webhookError) {
+        res.status(403).json({ error: { code: "webhook_not_allowed", message: webhookError } });
+        return;
+      }
+    }
 
     const agent = agentMap.get(agent_name);
     if (!agent) {
@@ -496,6 +525,7 @@ export function createAcpServer(
         if (createdSession) workSessions.updateStatus(session.id, "cancelled");
         return;
       }
+      const workspaceLeaseNonce = workSessions.getWorkspaceLeaseForSession(session.id)?.leaseNonce;
 
       const run = agentRegistry.createRun({ agentName: agent_name, agentId: peer.id, workspaceSessionId: session.workspaceSessionId, workSessionId: session.id, inputPreview: taskText.slice(0, 500), webhookUrl: webhook_url, status: "running" });
 
@@ -513,9 +543,10 @@ export function createAcpServer(
             workspace_root: workspaceRoot,
             parent_run_id: run.runId,
             agent_id: peer.id,
+            workspace_lease_nonce: workspaceLeaseNonce,
             webhook_url,
           },
-          timeoutMs: 120_000,
+          timeoutMs: DEFAULT_ACP_TIMEOUT,
         });
         const peerResult = peerResp.body;
         const remoteRunId = typeof peerResult.remote_run_id === "string"
@@ -629,9 +660,9 @@ export function createAcpServer(
 
         // Delegate the state transition to the authoritative workflow service.
         const submitted = reviewWorkflow
-          ? reviewWorkflow.submitForReview({ workSessionId: session.id, diff: review.patch, message: taskText || review.result, summaryJson: JSON.stringify(review.summary), files: review.summary.files, additions: review.summary.additions, removals: review.summary.removals, snapshotCommit: review.snapshotCommit })
+          ? reviewWorkflow.submitForReview({ workSessionId: session.id, diff: review.patch, message: taskText || review.result, summaryJson: JSON.stringify(review.summary), files: review.summary.files, changedFiles: review.files, additions: review.summary.additions, removals: review.summary.removals, snapshotCommit: review.snapshotCommit })
           : (() => {
-              const s = workSessions.submitForReview({ workSessionId: session.id, diff: review.patch, message: taskText || review.result, summaryJson: JSON.stringify(review.summary), snapshotCommit: review.snapshotCommit });
+              const s = workSessions.submitForReview({ workSessionId: session.id, diff: review.patch, message: taskText || review.result, summaryJson: JSON.stringify(review.summary), files: review.files, snapshotCommit: review.snapshotCommit });
               return { submissionId: s.id, submissionNumber: s.submissionNumber, diffSha256: s.diffSha256, reviewEpoch: s.reviewEpoch };
             })();
 
@@ -712,6 +743,7 @@ export function createAcpServer(
           runId: run.runId,
           tool: canonicalTool,
           path: wsCtx.cwd, // working dir for shell tools
+          signal: requestSignal,
         });
         if (!allowed) {
           agentRegistry.updateRun(run.runId, { status: "failed", errorMessage: `Tool "${agent_name}" denied by policy.`, finishedAt: new Date().toISOString() });
@@ -990,6 +1022,7 @@ export function createAcpServer(
       message: review.result,
       summaryJson: JSON.stringify(review.summary),
       files: review.summary.files,
+      changedFiles: review.files,
       additions: review.summary.additions,
       removals: review.summary.removals,
     });

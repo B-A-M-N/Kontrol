@@ -14,6 +14,14 @@ export const WORKSPACE_APP_URI = `ui://kontrol/workspace-app-${WORKSPACE_APP_BUI
 // resource above so each host receives the representation it understands.
 export const OPENAI_WORKSPACE_APP_URI = `ui://kontrol/workspace-app-${WORKSPACE_APP_BUILD_ID}.skybridge.html`;
 
+// Hosts can cache the template URI independently of the MCP connection. A
+// rebuild therefore must continue serving previously generated hashes; the
+// HTML is the same compatibility resource from the host's perspective.
+const HISTORICAL_WORKSPACE_APP_URI = /^ui:\/\/kontrol\/workspace-app-[a-f0-9]{12}\.html$/;
+const HISTORICAL_OPENAI_WORKSPACE_APP_URI = /^ui:\/\/kontrol\/workspace-app-[a-f0-9]{12}\.skybridge\.html$/;
+
+export type WorkspaceAppResourceKind = "current" | "openai" | "legacy" | "devdesktop";
+
 /**
  * P1 #35: measured sunset plan for compatibility resource URIs. Each legacy
  * URI is retained only while it still receives real traffic. The per-URI
@@ -34,11 +42,17 @@ export const OPENAI_WORKSPACE_APP_URI = `ui://kontrol/workspace-app-${WORKSPACE_
 const workspaceAppResourceMetadata = Object.freeze({ ui: Object.freeze({ prefersBorder: true }) });
 const workspaceAppToolMetadata = new Map<string, Readonly<Record<string, unknown>>>();
 
+export function workspaceAppResourceKind(value: unknown): WorkspaceAppResourceKind | undefined {
+  if (typeof value !== "string") return undefined;
+  if (value === WORKSPACE_APP_URI || HISTORICAL_WORKSPACE_APP_URI.test(value)) return "current";
+  if (value === OPENAI_WORKSPACE_APP_URI || HISTORICAL_OPENAI_WORKSPACE_APP_URI.test(value)) return "openai";
+  if (value === LEGACY_WORKSPACE_APP_URI) return "legacy";
+  if (value === DEVDESKTOP_WORKSPACE_APP_URI) return "devdesktop";
+  return undefined;
+}
+
 export function isWorkspaceAppUri(value: unknown): boolean {
-  return value === WORKSPACE_APP_URI
-    || value === LEGACY_WORKSPACE_APP_URI
-    || value === DEVDESKTOP_WORKSPACE_APP_URI
-    || value === OPENAI_WORKSPACE_APP_URI;
+  return workspaceAppResourceKind(value) !== undefined;
 }
 
 export function workspaceAppToolMeta(visibility: readonly ("model" | "app")[] = ["model", "app"]) {

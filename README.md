@@ -72,9 +72,12 @@ The checkout also provides `./restart-kontrol.sh`, which runs the same
 transactional launcher. It builds and verifies the replacement generation
 before stopping old owned processes and rolls back if a readiness stage fails.
 
-For constrained CI or sandbox environments only, set
-`KONTROL_SKIP_PREFLIGHT_TESTS=true` to skip the full test suite; all other
-preflight and readiness checks remain enabled.
+Routine development startup defaults to the fast preflight (syntax/typecheck
+plus a fresh atomic build) so reconnecting does not rerun the entire test
+suite. Set `KONTROL_STARTUP_PROFILE=normal` for the full test gate, or
+`KONTROL_STARTUP_PROFILE=release` for the full gate plus the dirty-checkout
+guard. `KONTROL_SKIP_PREFLIGHT_TESTS=true` remains a legacy alias for the fast
+profile; all readiness checks still run.
 
 During setup, Kontrol asks for:
 
@@ -162,12 +165,13 @@ KONTROL defines exactly one authoritative path per context:
 
 | Context | Path | Notes |
 |---|---|---|
-| Production / install | `scripts/kontrol-user-service.sh` (systemd user unit) | Owns restart/priority policy; the unit launches the validated build |
-| Development / integration | `./start-all.sh` (tmux sessions + component supervisor) | Full preflight gate; atomic build generation with rollback |
+| Production / install on Linux | `scripts/kontrol-user-service.sh` (systemd user unit) | Owns restart/priority policy; the unit launches the validated build |
+| Development / integration | `./start-all.sh` (tmux sessions + component supervisor) | Fast validated preflight by default; atomic build generation with rollback |
 | Test / release | `npm run typecheck && npm run test && npm run build` | The release gate CI and `kontrol-user-service.sh install` rely on |
 
-The systemd unit is the supported way to keep the installed server running
-across reboots/sessions. `kontrol serve` remains the underlying process it
+The systemd unit is the supported production lifecycle on Linux. macOS and
+Windows support development and integration runs, but Kontrol does not ship a
+production launchd or Windows Service manager. `kontrol serve` remains the underlying process it
 launches — it is not itself a production lifecycle manager. Startup
 preflight depth is controlled by `KONTROL_STARTUP_PROFILE` (see
 docs/configuration.md): `release` runs the complete gate including the
@@ -291,9 +295,9 @@ For a normal session:
 
 | Platform                                          | Status            | Notes                                          |
 | ------------------------------------------------- | ----------------- | ---------------------------------------------- |
-| Linux                                             | Supported         | Requires Node, npm, Git, and Bash.             |
-| macOS                                             | Supported         | Requires Node, npm, Git, and Bash.             |
-| Windows with Git Bash, WSL, MSYS2, or Cygwin Bash | Supported         | Git Bash is the simplest native Windows setup. |
+| Linux                                             | Supported / production | Requires Node, npm, Git, and Bash.        |
+| macOS                                             | Supported / development | Requires Node, npm, Git, and Bash; no bundled launchd service. |
+| Windows with Git Bash, WSL, MSYS2, or Cygwin Bash | Supported / development | Git Bash is the simplest native Windows setup; no bundled Windows Service. |
 | Windows PowerShell or `cmd.exe` only              | Not supported yet | Install Git Bash or use WSL.                   |
 
 ```bash

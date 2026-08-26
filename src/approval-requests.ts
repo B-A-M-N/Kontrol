@@ -67,7 +67,10 @@ export interface ApprovalRequestManager {
 export function createApprovalRequestManager(
   stateDirOrHandle: string | DatabaseHandle,
 ): ApprovalRequestManager {
-  const TOOL_APPROVAL_TTL_MS = 5 * 60_000;
+  // Policy approval calls block until the reviewer decides. Keep a generous
+  // durable backstop for abandoned cards, rather than expiring a live model
+  // operation after the old five-minute request budget.
+  const TOOL_APPROVAL_TTL_MS = 24 * 60 * 60_000;
   const database =
     typeof stateDirOrHandle === "string" ? openDatabase(stateDirOrHandle) : stateDirOrHandle;
 

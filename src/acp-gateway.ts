@@ -17,7 +17,15 @@ import {
   runShellTool,
 } from "./pi-tools.js";
 
-const DEFAULT_ACP_TIMEOUT = 60_000;
+// Dispatch is only the adapter handshake. The adapter should answer quickly,
+// but a busy host must not strand a durable run after an arbitrary one-minute
+// cap. The run itself remains supervised independently after the 202 response.
+// Keep the window tunable for slow local model startup without changing the
+// independent run/watchdog limits.
+const configuredAcpTimeout = Number(process.env.KONTROL_ACP_DISPATCH_TIMEOUT_MS);
+export const DEFAULT_ACP_TIMEOUT = Number.isSafeInteger(configuredAcpTimeout) && configuredAcpTimeout > 0
+  ? configuredAcpTimeout
+  : 5 * 60_000;
 
 export function isLoopbackAgentUrl(url: string): boolean {
   try {
@@ -254,6 +262,8 @@ export async function callRemoteAgent(
     existingRunId?: string;
     /** Continuation ID for resumed work (passed to the adapter, bound to the worker). */
     continuationId?: string;
+    /** Nonce of the checkout lease held by this work session. */
+    workspaceLeaseNonce?: string;
   },
 ): Promise<AgentCallResult> {
   // Reuse the existing logical run across continuations so the UI keeps watching
@@ -316,6 +326,7 @@ export async function callRemoteAgent(
       parent_run_id: run.runId,
       agent_id: run.agentId,
       continuation_id: params.continuationId,
+      workspace_lease_nonce: params.workspaceLeaseNonce,
     };
 
     if (params.webhookUrl) {

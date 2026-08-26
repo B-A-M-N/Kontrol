@@ -113,6 +113,9 @@ if (process.env.KONTROL_PARENT_RUN_ID) {
 if (process.env.KONTROL_CONTINUATION_ID) {
   headers["X-Kontrol-Continuation"] = process.env.KONTROL_CONTINUATION_ID;
 }
+if (process.env.KONTROL_WORKSPACE_LEASE_NONCE) {
+  headers["X-Kontrol-Workspace-Lease-Nonce"] = process.env.KONTROL_WORKSPACE_LEASE_NONCE;
+}
 
 // Relay the signed worker envelope (issued by the adapter) so Kontrol can
 // authenticate this connection's role + bound work session via HMAC instead of

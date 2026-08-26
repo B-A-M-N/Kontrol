@@ -4,6 +4,12 @@ import { InvalidRequestError } from "@modelcontextprotocol/sdk/server/auth/error
 import type { OAuthClientInformationFull } from "@modelcontextprotocol/sdk/shared/auth.js";
 import { openDatabase, type DatabaseHandle } from "./db/client.js";
 
+/**
+ * P1 #6: dynamic client registrations older than this (and with no live
+ * tokens) are compacted by the periodic maintenance sweep.
+ */
+export const CLIENT_RETENTION_SECONDS = 30 * 24 * 60 * 60;
+
 export interface PersistedAccessTokenRecord {
   clientId: string;
   scopes: string[];
@@ -33,8 +39,19 @@ function redirectHostAllowed(redirectUri: string, allowedHosts: string[]): boole
     return false;
   }
 
-  if (["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname)) return true;
-  return allowedHosts.includes(parsed.hostname);
+  // P1 #6: HTTPS for non-loopback destinations; HTTP only on loopback.
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") return false;
+  const isLoopback = ["localhost", "127.0.0.1", "[::1]", "::1"].includes(parsed.hostname);
+  if (parsed.protocol === "http:" && !isLoopback) return false;
+
+  // Credentials or fragments in a redirect URI are injection surface.
+  if (parsed.username || parsed.password || parsed.hash) return false;
+
+  // Normalize consistently: strip fragment, default ports, trailing slash.
+  if (parsed.port === "80" && parsed.protocol === "http:") parsed.port = "";
+  if (parsed.port === "443" && parsed.protocol === "https:") parsed.port = "";
+
+  return isLoopback || allowedHosts.includes(parsed.hostname);
 }
 
 export class SqliteOAuthStore {
@@ -181,9 +198,17 @@ export class SqliteOAuthStore {
     this.database.close();
   }
 
-  private deleteExpiredTokens(nowSeconds: number): void {
+  deleteExpiredTokens(nowSeconds: number): void {
     this.database.sqlite.prepare("delete from oauth_access_tokens where expires_at < ?").run(nowSeconds);
     this.database.sqlite.prepare("delete from oauth_refresh_tokens where expires_at < ?").run(nowSeconds);
+    // P1 #6: bound dynamic client registrations — clients that have never
+    // been used (no tokens) and were issued long ago are compacted.
+    this.database.sqlite.prepare(`
+      delete from oauth_clients
+       where issued_at < ?
+         and client_id not in (select distinct client_id from oauth_access_tokens)
+         and client_id not in (select distinct client_id from oauth_refresh_tokens)
+    `).run(nowSeconds - CLIENT_RETENTION_SECONDS);
   }
 }
 

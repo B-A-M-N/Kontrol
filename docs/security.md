@@ -109,6 +109,18 @@ falling back to unsandboxed execution. Without that setting, verification is a
 reviewer-declared trusted command and still runs with the non-secret child
 environment allowlist.
 
+Additional child environment names are opt-in through
+`KONTROL_CHILD_ENV_ALLOWLIST`; names in Kontrol/ACP/OAuth/tunnel/secret,
+token, cookie, credential, or private-key namespaces remain blocked even when
+listed. If sandboxed verification is enabled, `/usr`, `/bin`, `/lib`, `/lib64`,
+`/etc`, and the workspace are mounted; user-managed toolchains require explicit
+read-only entries in `KONTROL_VERIFY_TOOLCHAIN_PATHS`.
+
+ACP webhook delivery is disabled unless `KONTROL_WEBHOOKS=1` is set and the
+destination hostname is listed in `KONTROL_WEBHOOK_ALLOWED_HOSTS`. This makes
+the outbound network capability explicit and prevents an arbitrary
+`webhook_url` from becoming an SSRF primitive by default.
+
 ACP workers are bound to their registered opaque agent ID and the durable run
 ID; an agent cannot post events, approval decisions, or stdin operations for a
 different run. Cancellation first records a durable `cancelling` state and

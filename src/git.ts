@@ -1,13 +1,7 @@
 import { createHash } from "node:crypto";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
+import { controlPlaneGit, type GitCommandResult } from "./git-runner.js";
 
-const execFileAsync = promisify(execFile);
-
-export interface GitCommandResult {
-  stdout: string;
-  stderr: string;
-}
+export type { GitCommandResult };
 
 export interface GitEligibility {
   ok: boolean;
@@ -16,19 +10,21 @@ export interface GitEligibility {
   message?: string;
 }
 
+/**
+ * All internal Kontrol Git operations run through the hardened control-plane
+ * runner: scrubbed environment (never wholesale `process.env`), no repository
+ * hooks or filters, no credential prompting. See git-runner.ts.
+ */
 export async function git(
   cwd: string,
   args: string[],
   options: { env?: NodeJS.ProcessEnv; maxBuffer?: number; timeoutMs?: number } = {},
 ): Promise<GitCommandResult> {
-  const { stdout, stderr } = await execFileAsync("git", args, {
-    cwd,
-    env: options.env ? { ...process.env, ...options.env } : process.env,
-    maxBuffer: options.maxBuffer ?? 10 * 1024 * 1024,
-    timeout: options.timeoutMs ?? 30_000,
+  return controlPlaneGit(cwd, args, {
+    extraEnv: options.env,
+    maxBuffer: options.maxBuffer,
+    timeoutMs: options.timeoutMs,
   });
-
-  return { stdout, stderr };
 }
 
 export async function getGitEligibility(cwd: string): Promise<GitEligibility> {
