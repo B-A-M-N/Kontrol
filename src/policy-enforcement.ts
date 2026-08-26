@@ -16,6 +16,8 @@ export interface PolicyInvocation {
   /** All affected paths for a multi-file action such as apply_patch. */
   paths?: PolicyInputPath[];
   command?: string;
+  /** Abort when the originating MCP/ACP request genuinely disappears. */
+  signal?: AbortSignal;
 }
 
 /**
@@ -63,7 +65,7 @@ export interface PolicyEnforcer {
   enforce(inv: PolicyInvocation): Promise<{
     allowed: boolean;
     decision: PolicyDecision;
-    outcome?: "approved" | "denied" | "timed_out";
+    outcome?: "approved" | "denied" | "timed_out" | "cancelled";
   }>;
 }
 
@@ -72,10 +74,13 @@ export function createPolicyEnforcer(
   eventStore: EventStore,
   opts: { timeoutMs?: number } = {},
 ): PolicyEnforcer {
-  const timeoutMs = opts.timeoutMs ?? 300_000;
+  // Blocking approvals are intentionally long-lived. The server supplies a
+  // deployment backstop, while the originating request signal cancels a
+  // waiter when its caller actually disconnects.
+  const timeoutMs = opts.timeoutMs ?? 24 * 60 * 60_000;
 
   return {
-    async enforce(inv: PolicyInvocation): Promise<{ allowed: boolean; decision: PolicyDecision; outcome?: "approved" | "denied" | "timed_out" }> {
+    async enforce(inv: PolicyInvocation): Promise<{ allowed: boolean; decision: PolicyDecision; outcome?: "approved" | "denied" | "timed_out" | "cancelled" }> {
       const canonical = canonicalToolName(inv.tool);
       const paths = inv.paths && inv.paths.length > 0 ? inv.paths : [inv.path];
       const decisions = paths.map((path) => ({
@@ -89,7 +94,7 @@ export function createPolicyEnforcer(
       if (denied) return { allowed: false, decision: denied.decision };
 
       let firstDecision = decisions[0]?.decision;
-      let lastOutcome: "approved" | "denied" | "timed_out" | undefined;
+      let lastOutcome: "approved" | "denied" | "timed_out" | "cancelled" | undefined;
       for (const entry of decisions) {
         firstDecision ??= entry.decision;
         if (entry.decision.mode === "allow") continue;
@@ -111,7 +116,7 @@ export function createPolicyEnforcer(
       async function waitForApproval(
         decision: PolicyDecision,
         path: PolicyInputPath | undefined,
-      ): Promise<{ allowed: boolean; decision: PolicyDecision; outcome?: "approved" | "denied" | "timed_out" }> {
+      ): Promise<{ allowed: boolean; decision: PolicyDecision; outcome?: "approved" | "denied" | "timed_out" | "cancelled" }> {
 
         const approvalId = `pol_${randomUUID()}`;
         policy.addPending({
@@ -123,6 +128,9 @@ export function createPolicyEnforcer(
           path: policyPathLabel(path),
           command: inv.command,
           requestedAt: new Date().toISOString(),
+          expiresAt: Number.isFinite(timeoutMs)
+            ? new Date(Date.now() + timeoutMs).toISOString()
+            : undefined,
         });
 
         const payload: PolicyApprovalEventPayload = {
@@ -155,11 +163,13 @@ export function createPolicyEnforcer(
             (candidate) => candidate.type === "policy.approval.provided"
               && candidate.payload.approvalId === approvalId,
             timeoutMs,
+            inv.signal,
           );
 
           if (!event) {
-            policy.resolvePending(approvalId, "expired", "approval timed out");
-            return { allowed: false, decision, outcome: "timed_out" };
+            const cancelled = inv.signal?.aborted === true;
+            policy.resolvePending(approvalId, cancelled ? "cancelled" : "expired", cancelled ? "caller disconnected" : "approval timed out");
+            return { allowed: false, decision, outcome: cancelled ? "cancelled" : "timed_out" };
           }
 
           const decision2 = String(event.payload.decision ?? "deny");

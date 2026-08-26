@@ -212,7 +212,8 @@ const workSessionViews = new Map<string, WorkSessionViewState>();
 const snapshotHydrations = new Map<string, Promise<void>>();
 let selectedWorkSessionId: string | null = null;
 let lastToolCard: ToolResultCard | null = null;
-let rehydrationQueued = false;
+let rehydrationPromise: Promise<void> | null = null;
+let rehydrationRequested = false;
 
 // View-local UI state (replaced the previous globals).
 let expanded = false;
@@ -324,7 +325,7 @@ async function boot(): Promise<void> {
       }
       activeWorkspaceId = newWorkspaceId;
       // P0 #3: When workspace becomes known, trigger rehydration.
-      void rehydrateActiveSessions();
+      queueSessionRehydration();
     }
 
     // Agent run (submit_to_coding_agent) and review (submit_for_review) cards
@@ -340,7 +341,7 @@ async function boot(): Promise<void> {
           activeWorkspaceId = workspaceSessionId;
           workspaceWatcherGeneration += 1;
           workspaceEventCursor = 0;
-          void rehydrateActiveSessions();
+          queueSessionRehydration();
         }
         ensureWorkSessionView(
           wsId,
@@ -393,7 +394,7 @@ async function boot(): Promise<void> {
     // Rehydrate any sessions that were already live before this WebUI (re)loaded.
     // Without this, sessions only appear reactively when a fresh tool card
     // arrives — so a reload silently drops in-flight and awaiting-review work.
-    void rehydrateActiveSessions();
+    queueSessionRehydration();
   } catch (connectError) {
     connectionError = connectError instanceof Error
       ? connectError.message
@@ -414,7 +415,7 @@ async function rehydrateActiveSessions(): Promise<void> {
   // workspace. Never globally auto-rehydrate before the workspace is known.
   // P0 #1: use server-side snapshot + resume from lastSeq instead of replaying
   // the entire event log from seq 0.
-  const workspaceId = activeWorkspaceId ?? "";
+  const workspaceId = activeWorkspaceId;
   if (!workspaceId) return;
 
   try {
@@ -455,6 +456,7 @@ async function rehydrateActiveSessions(): Promise<void> {
     await loadSurface("live", 50, HYDRATION_MAX_SESSIONS / 50);
     await loadSurface("pending_review", 50, HYDRATION_MAX_SESSIONS / 50);
     await loadSurface("all", 25, 1);
+    if (!app || activeWorkspaceId !== workspaceId) return;
     const sessions = [...pagedSessions.values()].sort(
       (a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt),
     );
@@ -504,6 +506,7 @@ async function rehydrateActiveSessions(): Promise<void> {
         name: "list_pending_approvals",
         arguments: { workspaceId },
       });
+      if (!app || activeWorkspaceId !== workspaceId) return;
       const pending = getStructuredContent<{ approvals?: PendingApprovalRecord[] }>(approvalResult)?.approvals ?? [];
       for (const approval of pending) {
         const target = approval.workSessionId
@@ -524,10 +527,15 @@ async function rehydrateActiveSessions(): Promise<void> {
     }
     const selected = selectedWorkSessionId ? workSessionViews.get(selectedWorkSessionId) : undefined;
     if (selected && selected.workSessionId !== "__approval_center__") await hydrateWorkSessionSnapshot(selected);
+    if (!app || activeWorkspaceId !== workspaceId) return;
     workspaceWatcherGeneration += 1;
     void watchWorkspaceEvents(workspaceId, workspaceEventCursor, workspaceWatcherGeneration);
     scheduleRender();
   } catch (error) {
+    // A workspace switch or teardown can invalidate this run while one of the
+    // recovery calls is in flight. Do not paint its error over the new app
+    // context; the queued run for the current workspace owns that state.
+    if (!app || activeWorkspaceId !== workspaceId) return;
     const selected = selectedWorkSessionId ? workSessionViews.get(selectedWorkSessionId) : undefined;
     if (selected) {
       selected.notice = {
@@ -542,10 +550,22 @@ async function rehydrateActiveSessions(): Promise<void> {
 }
 
 function queueSessionRehydration(): void {
-  if (rehydrationQueued || !activeWorkspaceId || !app) return;
-  rehydrationQueued = true;
-  void rehydrateActiveSessions().finally(() => {
-    rehydrationQueued = false;
+  if (!activeWorkspaceId || !app) return;
+  rehydrationRequested = true;
+  if (rehydrationPromise) return;
+
+  rehydrationPromise = (async () => {
+    // Coalesce boot, workspace-result, and event-triggered requests while
+    // guaranteeing that only one snapshot/cursor handoff owns the watcher at
+    // a time. If the workspace changes during a run, the next iteration uses
+    // the new workspace instead of letting stale results win the race.
+    while (rehydrationRequested && activeWorkspaceId && app) {
+      rehydrationRequested = false;
+      await rehydrateActiveSessions();
+    }
+  })().finally(() => {
+    rehydrationPromise = null;
+    if (rehydrationRequested) queueSessionRehydration();
   });
 }
 

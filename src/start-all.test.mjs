@@ -9,10 +9,12 @@ assert.match(script, /\$CRUSH_CLI_BIN" run --help/);
 assert.match(script, /Run a single prompt in non-interactive mode/);
 assert.match(script, /Do not use crush-acp; it is the ACP\/TUI transport binary\./);
 assert.match(script, /node --check scripts\/acp-hermes-native-adapter\.mjs/);
+assert.match(script, /node --check scripts\/kontrol-supervisor\.mjs/);
 assert.match(script, /node --check scripts\/probe-kontrol-readiness\.mjs/);
 assert.match(script, /python3 -m py_compile scripts\/hermes-native-runner\.py/);
 assert.match(script, /KONTROL_SKIP_PREFLIGHT_TESTS:-false/);
 assert.match(script, /STARTUP_PROFILE" == "release"[\s\S]*export KONTROL_RELEASE_MODE=true/);
+assert.match(script, /else STARTUP_PROFILE="dev-fast"; fi/);
 assert.match(script, /PREFLIGHT_LOG=/);
 assert.match(script, /npm --silent test 2>&1 \| tee "\$PREFLIGHT_LOG"/);
 const smokeCurlStart = script.indexOf("response=\$(curl");
@@ -30,6 +32,7 @@ assert.match(readFileSync("scripts/kontrol-tunnel.sh", "utf8"), /KONTROL_TUNNEL_
 assert.match(readFileSync("scripts/kontrol-tunnel.sh", "utf8"), /KONTROL_TUNNEL_ID/);
 assert.match(readFileSync("scripts/kontrol-tunnel.sh", "utf8"), /"--harpoon\.hosts-include-loopback=\$\{KONTROL_HARPOON_INCLUDE_LOOPBACK:-false\}"/);
 assert.match(readFileSync("scripts/kontrol-tunnel.sh", "utf8"), /health\.listen-addr 127\.0\.0\.1:0/);
+assert.match(readFileSync("scripts/kontrol-tunnel.sh", "utf8"), /mcp\.extra-headers/);
 assert.match(script, /kontrol-tunnel\.sh" --doctor/);
 const effectiveTunnelArgs = execFileSync("bash", ["scripts/kontrol-tunnel.sh", "--print-effective-args"], {
   encoding: "utf8",
@@ -39,6 +42,8 @@ assert.ok(effectiveTunnelArgs.includes("--harpoon.hosts-include-loopback=false")
 assert.ok(!effectiveTunnelArgs.includes("--harpoon.hosts-include-loopback"));
 assert.match(script, /-c "\$DESKTOP_PWD"/);
 assert.match(script, /KONTROL_SERVER_LOG/);
+assert.match(script, /EFFECTIVE_STATE_DIR=.*loadConfig\(\)\.stateDir/);
+assert.match(script, /export KONTROL_STATE_DIR="\$EFFECTIVE_STATE_DIR"/);
 assert.match(script, /server exited before readiness/);
 assert.match(script, /Kontrol server log:/);
 assert.match(script, /kontrol-adapter-crush/);

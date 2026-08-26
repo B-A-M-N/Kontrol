@@ -28,6 +28,28 @@ interface AuthorizationCodeRecord {
 
 const CODE_TTL_MS = 5 * 60 * 1000;
 
+// P1 #6: brute-force and unbounded-state controls.
+/** Failed owner-password authorizations allowed per key before 429s. */
+export const AUTH_MAX_FAILURES = 5;
+/** How long a failure window / lockout persists. */
+export const AUTH_LOCKOUT_MS = 5 * 60 * 1000;
+/** Global ceiling on authorization failures before locking everything down. */
+export const AUTH_GLOBAL_MAX_FAILURES = 50;
+/** Hard cap on outstanding authorization codes (abandoned-code flood). */
+export const MAX_OUTSTANDING_CODES = 500;
+/** Interval for the expired-token/code maintenance sweep. */
+export const MAINTENANCE_INTERVAL_MS = 10 * 60 * 1000;
+
+interface FailureTracker {
+  count: number;
+  firstFailureAtMs: number;
+  lockedUntilMs: number;
+}
+
+function newFailureTracker(): FailureTracker {
+  return { count: 0, firstFailureAtMs: 0, lockedUntilMs: 0 };
+}
+
 function randomToken(): string {
   return randomBytes(32).toString("base64url");
 }
@@ -114,6 +136,10 @@ function requestedScopesAllowed(requested: string[], supported: string[]): boole
 export class SingleUserOAuthProvider implements OAuthServerProvider {
   readonly clientsStore: OAuthRegisteredClientsStore;
   private readonly codes = new Map<string, AuthorizationCodeRecord>();
+  /** Failed authorizations keyed by "clientId|sourceIp", plus a global bucket. */
+  private readonly failures = new Map<string, FailureTracker>();
+  private readonly globalFailures: FailureTracker = newFailureTracker();
+  private maintenanceTimer?: ReturnType<typeof setInterval>;
   private readonly oauthStore: SqliteOAuthStore;
   private readonly resourceServerUrl: URL;
 
@@ -125,6 +151,87 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     this.resourceServerUrl = resourceUrlFromServerUrl(resourceServerUrl);
     this.oauthStore = new SqliteOAuthStore(stateDir);
     this.clientsStore = new SqliteOAuthClientsStore(this.oauthStore, config.allowedRedirectHosts);
+    // P1 #6: expired tokens/codes are compacted on a schedule, not just at
+    // store-open time.
+    this.maintenanceTimer = setInterval(() => {
+      try {
+        this.purgeExpiredCodes();
+        this.oauthStore.deleteExpiredTokens(Math.floor(Date.now() / 1000));
+      } catch {
+        // Maintenance is best-effort; never crash the provider from a timer.
+      }
+    }, MAINTENANCE_INTERVAL_MS);
+    this.maintenanceTimer.unref?.();
+  }
+
+  /** True when the given key (or the global ceiling) is currently locked out. */
+  isLockedOut(key: string, nowMs = Date.now()): boolean {
+    const global = this.globalFailures;
+    if (global.lockedUntilMs > nowMs) return true;
+    const tracker = this.failures.get(key);
+    if (!tracker) return false;
+    // Window expiry resets the count.
+    if (nowMs - tracker.firstFailureAtMs > AUTH_LOCKOUT_MS) {
+      this.failures.delete(key);
+      return false;
+    }
+    return tracker.lockedUntilMs > nowMs || tracker.count >= AUTH_MAX_FAILURES;
+  }
+
+  recordFailure(key: string, nowMs = Date.now()): void {
+    for (const tracker of [this.failures.get(key), this.globalFailures]) {
+      const t = tracker ?? newFailureTracker();
+      if (!tracker) this.failures.set(key, t);
+      if (t.count === 0 || nowMs - t.firstFailureAtMs > AUTH_LOCKOUT_MS) {
+        t.firstFailureAtMs = nowMs;
+        t.count = 1;
+      } else {
+        t.count++;
+      }
+      if (t.count >= AUTH_MAX_FAILURES) {
+        t.lockedUntilMs = nowMs + AUTH_LOCKOUT_MS;
+      }
+    }
+    if (this.globalFailures.count >= AUTH_GLOBAL_MAX_FAILURES) {
+      this.globalFailures.lockedUntilMs = nowMs + AUTH_LOCKOUT_MS;
+    }
+  }
+
+  clearFailures(key: string): void {
+    this.failures.delete(key);
+    this.globalFailures.count = 0;
+    this.globalFailures.firstFailureAtMs = 0;
+    this.globalFailures.lockedUntilMs = 0;
+  }
+
+  /** Seconds until the key may retry (for Retry-After), 0 if not locked. */
+  retryAfterSeconds(key: string, nowMs = Date.now()): number {
+    const tracker = this.failures.get(key);
+    const until = Math.max(tracker?.lockedUntilMs ?? 0, this.globalFailures.lockedUntilMs);
+    return until > nowMs ? Math.ceil((until - nowMs) / 1000) : 0;
+  }
+
+  /** Remove expired codes; enforce the outstanding-code cap. */
+  purgeExpiredCodes(nowMs = Date.now()): number {
+    let removed = 0;
+    for (const [code, record] of this.codes) {
+      if (record.expiresAtMs < nowMs) {
+        this.codes.delete(code);
+        removed++;
+      }
+    }
+    // Hard-cap: drop oldest beyond the limit.
+    while (this.codes.size > MAX_OUTSTANDING_CODES) {
+      const oldest = this.codes.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.codes.delete(oldest);
+      removed++;
+    }
+    return removed;
+  }
+
+  outstandingCodeCount(): number {
+    return this.codes.size;
   }
 
   async authorize(
@@ -153,7 +260,26 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     }
 
     const providedToken = String(res.req.body?.owner_token ?? "");
+    // P1 #6: brute-force controls keyed by client + source address with a
+    // global fallback ceiling. Rejected attempts are counted, never logged
+    // with the presented token.
+    const failureKey = `${client.client_id}|${res.req.socket.remoteAddress ?? "unknown"}`;
+    if (this.isLockedOut(failureKey)) {
+      const retryAfter = this.retryAfterSeconds(failureKey);
+      res.status(429).setHeader("Retry-After", String(retryAfter)).setHeader("Content-Type", "text/html; charset=utf-8");
+      res.send(
+        formHtml({
+          error: `Too many failed attempts. Try again in ${retryAfter} seconds.`,
+          clientName: client.client_name ?? client.client_id,
+          scopes: params.scopes ?? this.config.scopes,
+          resource: params.resource,
+          fields: authorizationFormFields(client, params),
+        }),
+      );
+      return;
+    }
     if (!safeEquals(providedToken, this.config.ownerToken)) {
+      this.recordFailure(failureKey);
       res.status(401).setHeader("Content-Type", "text/html; charset=utf-8");
       res.send(
         formHtml({
@@ -166,7 +292,10 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
       );
       return;
     }
+    this.clearFailures(failureKey);
 
+    // Purge expired codes and enforce the outstanding-code cap before adding.
+    this.purgeExpiredCodes();
     const code = `code-${randomUUID()}`;
     this.codes.set(code, {
       clientId: client.client_id,
@@ -257,6 +386,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
   }
 
   close(): void {
+    if (this.maintenanceTimer) clearInterval(this.maintenanceTimer);
     this.oauthStore.close();
   }
 

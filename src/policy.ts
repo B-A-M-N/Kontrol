@@ -22,8 +22,10 @@
  * Approvals are scoped and keyed by (principalId, scope, scopeId, approvalKey):
  *   - `once`         : not cached (each call needs approval)
  *   - `work_session`: cached for the exact work session until it is terminal
- *   - `workspace`    : cached for the workspace until it closes
+ *   - `workspace`    : cached for the workspace until explicitly revoked
  */
+
+import { randomUUID } from "node:crypto";
 
 export type PolicyMode = "allow" | "deny" | "ask";
 export type PolicySource = "path" | "tool" | "default";
@@ -60,6 +62,7 @@ export interface ToolApprovalRequest {
   path?: string;
   command?: string;
   requestedAt: string;
+  expiresAt?: string;
 }
 
 export interface PolicyDecision {
@@ -108,6 +111,10 @@ export interface PolicyEngine {
   clearPending(approvalId: string): void;
   resolvePending(approvalId: string, status: "approved" | "denied" | "expired" | "cancelled", reason?: string): void;
   addPending(request: ToolApprovalRequest): void;
+  /** Revoke all durable and in-memory grants for an exact scope. */
+  revokeScope(scope: ApprovalScope, scopeId: string): void;
+  /** List effective durable grants for reviewer diagnostics/tools. */
+  listGrants(scope?: ApprovalScope, scopeId?: string): GrantRecord[];
 }
 
 export interface PolicyConfig {
@@ -115,6 +122,24 @@ export interface PolicyConfig {
   toolRules: Record<string, PolicyMode>;
   pathRules: Array<{ pattern: string; mode: PolicyMode }>;
 }
+
+/**
+ * Secure-by-default mutation boundary (stable-beta threat model).
+ *
+ * Authentication protects against arbitrary strangers, but the authenticated
+ * caller is an LLM consuming potentially adversarial project content, so a
+ * zero-policy environment must not silently hand out arbitrary shell or file
+ * mutation authority. Read-only inspection stays frictionless; mutating
+ * operations require an explicit approval decision unless the operator has
+ * explicitly configured policy (any KONTROL_POLICY_MODE / KONTROL_POLICY_TOOL_*
+ * setting takes precedence over this baseline).
+ */
+const SECURE_BASELINE_TOOL_RULES: Record<string, PolicyMode> = {
+  bash: "ask",
+  write: "ask",
+  edit: "ask",
+  apply_patch: "ask",
+};
 
 const CANONICAL_TOOLS = new Set([
   "read",
@@ -190,6 +215,17 @@ export function loadPolicyConfig(env: NodeJS.ProcessEnv): PolicyConfig {
     // longer supported (they are not valid shell assignment syntax). Use
     // KONTROL_POLICY_PATH_RULES instead. Unknown KONTROL_POLICY_PATH_*
     // keys are intentionally ignored.
+  }
+
+  // Secure baseline: mutating tools gate behind `ask` unless the operator has
+  // explicitly configured policy for them (explicit per-tool rules win, and an
+  // explicit global KONTROL_POLICY_MODE is an operator decision that overrides
+  // the baseline entirely).
+  const explicitGlobalMode = parseMode(env.KONTROL_POLICY_MODE);
+  if (!explicitGlobalMode) {
+    for (const [tool, mode] of Object.entries(SECURE_BASELINE_TOOL_RULES)) {
+      if (!toolRules[tool]) toolRules[tool] = mode;
+    }
   }
 
   // Default mode must be parsed strictly. Silently ignoring a malformed
@@ -301,10 +337,12 @@ export function createPolicyEngine(
   function isApproved(principalId: string, key: string, ctx: ScopeContext): boolean {
     const wsId = ctx.workspaceId;
     const wsKey = `${principalId}|workspace|${wsId}|${key}`;
-    if (sessionApprovals.get(wsKey)) return true;
+    if (sessionApprovals.get(wsKey) || grantStore?.listEffective().some((grant) =>
+      grant.principalId === principalId && grant.scope === "workspace" && grant.scopeId === wsId && grant.approvalKey === key)) return true;
     if (ctx.workSessionId) {
       const wsKey2 = `${principalId}|work_session|${ctx.workSessionId}|${key}`;
-      if (sessionApprovals.get(wsKey2)) return true;
+      if (sessionApprovals.get(wsKey2) || grantStore?.listEffective().some((grant) =>
+        grant.principalId === principalId && grant.scope === "work_session" && grant.scopeId === ctx.workSessionId && grant.approvalKey === key)) return true;
     }
     return false;
   }
@@ -318,13 +356,16 @@ export function createPolicyEngine(
   ): void {
     if (scope === "once") return; // no caching, each call needs approval
     const scopeId = scopeIdFor(scope, ctx);
-    if (!scopeId) return;
+    // A work-session grant without a work session would be durable under the
+    // workspace ID but never readable as a work-session grant. Do not offer or
+    // persist a grant with that ambiguous lifetime.
+    if (!scopeId || (scope === "work_session" && !ctx.workSessionId)) return;
     sessionApprovals.set(`${principalId}|${scope}|${scopeId}|${key}`, true);
 
     if (grantStore) {
       const now = new Date().toISOString();
       grantStore.insert({
-        id: `grant_${principalId}_${scope}_${scopeId}_${key}`,
+        id: `grant_${randomUUID()}`,
         principalId,
         scope,
         scopeId,
@@ -349,6 +390,7 @@ export function createPolicyEngine(
           path: request.path,
           command: request.command,
           requestedAt: request.createdAt,
+          expiresAt: request.expiresAt,
         }));
     }
     const all = Array.from(pendingApprovals.values());
@@ -382,13 +424,29 @@ export function createPolicyEngine(
         tool: request.tool,
         path: request.path,
         command: request.command,
-        options: [
-          { id: "approve", label: "Approve Once", effect: "approve", scope: "once" },
-          { id: "approve_session", label: "Approve Session", effect: "approve", scope: "work_session" },
-          { id: "deny", label: "Deny", effect: "deny" },
-        ],
+          options: [
+            { id: "approve", label: "Approve Once", effect: "approve", scope: "once" },
+            ...(request.workSessionId ? [{ id: "approve_session", label: "Approve Session", effect: "approve" as const, scope: "work_session" as const }] : []),
+            { id: "approve_workspace", label: "Approve Workspace", effect: "approve" as const, scope: "workspace" as const },
+            { id: "deny", label: "Deny", effect: "deny" },
+          ],
+        expiresAt: request.expiresAt,
       });
     }
+  }
+
+  function revokeScope(scope: ApprovalScope, scopeId: string): void {
+    for (const key of sessionApprovals.keys()) {
+      if (key.split("|", 3)[1] === scope && key.split("|", 3)[2] === scopeId) {
+        sessionApprovals.delete(key);
+      }
+    }
+    grantStore?.revokeForScope(scope, scopeId);
+  }
+
+  function listGrants(scope?: ApprovalScope, scopeId?: string): GrantRecord[] {
+    const grants = grantStore?.listEffective() ?? [];
+    return grants.filter((grant) => (!scope || grant.scope === scope) && (!scopeId || grant.scopeId === scopeId));
   }
 
   return {
@@ -399,6 +457,8 @@ export function createPolicyEngine(
     clearPending,
     resolvePending,
     addPending,
+    revokeScope,
+    listGrants,
   };
 }
 

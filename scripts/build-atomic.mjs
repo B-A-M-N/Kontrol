@@ -11,6 +11,8 @@ const previousDist = join(root, "dist.previous");
 function run(command, args) {
   execFileSync(command, args, {
     cwd: root,
+    // kontrol-env-exception: build tooling spawns the project's own vite/tsc on
+    // trusted build inputs (not repository content); needs PATH/npm lifecycle.
     env: { ...process.env, KONTROL_BUILD_OUTPUT_DIR: tempDist },
     stdio: "inherit",
   });

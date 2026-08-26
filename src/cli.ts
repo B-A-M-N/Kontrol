@@ -192,6 +192,15 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
     const configPath = writeKontrolConfig(config);
     const authPath = writeKontrolAuth(auth);
 
+    prompts.note(
+      [
+        "Secure default policy: read-only work is frictionless; bash/write/edit/apply_patch require approval unless explicitly overridden (e.g. KONTROL_POLICY_TOOL_BASH=allow or KONTROL_POLICY_MODE=ask).",
+        "Child processes receive only an explicit non-secret environment allowlist.",
+        "Outbound ACP webhooks are disabled until KONTROL_WEBHOOKS=1 and KONTROL_WEBHOOK_ALLOWED_HOSTS are configured.",
+      ].join("\n"),
+      "Security posture",
+    );
+
     const lines = [
       `Config: ${configPath}`,
       `Auth: ${authPath}`,
@@ -343,11 +352,17 @@ async function runDoctor(): Promise<void> {
     // P1 #30: policy posture surfaced without printing rules content.
     const bashPolicyMode = config.policy.toolRules.bash ?? config.policy.defaultMode;
     doctorResult(
-      "Policy mode",
-      config.policy.defaultMode === "allow" ? "WARN" : "PASS",
-      config.policy.defaultMode === "allow"
-        ? "allow (permissive default; consider KONTROL_POLICY_TOOL_BASH=ask)"
-        : config.policy.defaultMode,
+      "Mutation policy",
+      bashPolicyMode === "allow" ? "WARN" : "PASS",
+      bashPolicyMode === "allow"
+        ? "shell and mutations are globally allowed; the secure baseline (bash/write/edit/apply_patch=ask) has been overridden — set KONTROL_POLICY_TOOL_BASH=ask or unset explicit policy to restore approval gating"
+        : `shell/mutations gated (${bashPolicyMode})`,
+    );
+    // P1 #14: process-session resource controls visible to operators.
+    doctorResult(
+      "Process limits",
+      "PASS",
+      `maxRunning=${config.processMaxRunning ?? "64 (default)"} perOwner=${config.processMaxRunningPerOwner ?? "8 (default)"} idleTimeoutMs=${config.processIdleTimeoutMs ?? "900000 (default)"}`,
     );
     if (config.policy.pathRules.length > 0) {
       doctorResult(
@@ -471,9 +486,12 @@ function isLoopbackHostForDoctor(host: string): boolean {
   return host === "127.0.0.1" || host === "::1" || host === "localhost";
 }
 
+// Review #10: these are optional probes — outside a git checkout they must
+// fail QUIETLY. stdio is captured (never inherited) so Git's "fatal: not a
+// git repository" stderr never leaks into release-test output.
 function gitRevision(): string | undefined {
   try {
-    return (require("node:child_process") as typeof import("node:child_process")).execFileSync("git", ["rev-parse", "HEAD"], { cwd: process.cwd(), encoding: "utf8" }).trim();
+    return (require("node:child_process") as typeof import("node:child_process")).execFileSync("git", ["rev-parse", "HEAD"], { cwd: process.cwd(), encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
   } catch {
     return undefined;
   }
@@ -481,7 +499,7 @@ function gitRevision(): string | undefined {
 
 function gitDirtyFileCount(): number | undefined {
   try {
-    const value = (require("node:child_process") as typeof import("node:child_process")).execFileSync("git", ["status", "--porcelain"], { cwd: process.cwd(), encoding: "utf8" }).trim();
+    const value = (require("node:child_process") as typeof import("node:child_process")).execFileSync("git", ["status", "--porcelain"], { cwd: process.cwd(), encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
     return value ? value.split("\n").length : 0;
   } catch {
     return undefined;

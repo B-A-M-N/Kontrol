@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { readFileSync, existsSync } from "node:fs";
+import { join } from "node:path";
 
 const source = readFileSync(new URL("./workspace-app.tsx", import.meta.url), "utf8");
 const css = readFileSync(new URL("./workspace-app.css", import.meta.url), "utf8");
@@ -27,7 +28,15 @@ assert.doesNotMatch(documentRules, /overflow:\s*hidden/, "the document must be a
 assert.match(css, /\.agent-activity[\s\S]*max-height/, "activity must have bounded scrolling");
 assert.match(css, /\.review-payload[\s\S]*overflow:\s*auto/, "review payloads must have bounded scrolling");
 
-const builtPath = new URL("../../dist/ui/workspace-app.html", import.meta.url);
+// Review #8: built-artifact assertions use the explicit candidate directory
+// produced by workspace-app-size.test.mjs (KONTROL_UI_TEST_CANDIDATE_DIR).
+// If the candidate is absent the assertions are skipped here, but the size
+// test — which always builds — runs in the same `test:ui` chain, so a clean
+// checkout can no longer silently bypass the built-artifact gate.
+const candidateDir = process.env.KONTROL_UI_TEST_CANDIDATE_DIR;
+const builtPath = candidateDir
+  ? new URL(`file://${encodeURI(join(candidateDir, "ui", "workspace-app.html"))}`)
+  : new URL("../../dist/ui/workspace-app.html", import.meta.url);
 if (existsSync(builtPath)) {
   const built = readFileSync(builtPath, "utf8");
   assert.match(built, /mountHeavyPayload/, "built app must contain the rich file renderer");

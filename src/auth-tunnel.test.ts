@@ -16,6 +16,8 @@ function parseJsonRpcResponse(body: string): unknown {
 const emptyConfigDir = mkdtempSync(join(tmpdir(), "kontrol-auth-test-"));
 const baseEnv = {
   KONTROL_CONFIG_DIR: emptyConfigDir,
+  KONTROL_STATE_DIR: join(emptyConfigDir, "state"),
+  KONTROL_WORKTREE_ROOT: join(emptyConfigDir, "worktrees"),
   KONTROL_ALLOWED_ROOTS: process.cwd(),
   KONTROL_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
 };
@@ -96,6 +98,9 @@ assert.equal(loadConfig({ ...baseEnv, KONTROL_TUNNEL_TOKEN: "short" }).authMode,
     PORT: "7691",
     KONTROL_TUNNEL_TOKEN: token,
     KONTROL_ACP_SHARED_SECRET: "test-acp-secret-shared-for-bearer-gate",
+    KONTROL_ACP_AGENT_SECRET: "test-acp-agent-secret-that-is-long-enough-123",
+    KONTROL_ACP_REVIEWER_SECRET: "test-acp-reviewer-secret-that-is-long-enough-123",
+    KONTROL_ACP_ADAPTER_SECRET: "test-acp-adapter-secret-that-is-long-enough-123",
   };
   const tokenConfig = loadConfig(tokenEnv);
   tokenConfig.publicBaseUrl = "http://127.0.0.1:7691";
@@ -109,6 +114,62 @@ assert.equal(loadConfig({ ...baseEnv, KONTROL_TUNNEL_TOKEN: "short" }).authMode,
     assert.equal(badAuth.status, 200, "stale local Authorization must not create a second gate");
     const good = await fetch("http://127.0.0.1:7691/mcp", { method: "POST", headers: { "Content-Type": "application/json", "Accept": "application/json, text/event-stream", "Authorization": `Bearer ${token}` }, body: initBody });
     assert.equal(good.status, 200, "correct bearer must be 200");
+    const reviewer = await fetch("http://127.0.0.1:7691/mcp", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        "X-Kontrol-Tunnel-Reviewer": tokenConfig.tunnelReviewerSecret!,
+      },
+      body: initBody,
+    });
+    assert.equal(reviewer.status, 200, "managed tunnel reviewer assertion must initialize");
+    const reviewerSessionId = reviewer.headers.get("mcp-session-id");
+    assert.ok(reviewerSessionId, "reviewer initialize must return a session id");
+    const approvalCenter = await fetch("http://127.0.0.1:7691/mcp", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        "mcp-session-id": reviewerSessionId,
+        "X-Kontrol-Tunnel-Reviewer": tokenConfig.tunnelReviewerSecret!,
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 99, method: "tools/call", params: { name: "open_approval_center", arguments: {} } }),
+    });
+    assert.equal(approvalCenter.status, 200);
+    const approvalPayload = parseJsonRpcResponse(await approvalCenter.text()) as { result?: { isError?: boolean } };
+    assert.notEqual(approvalPayload.result?.isError, true, "tunnel reviewer may open the approval center");
+    const forgedReviewer = await fetch("http://127.0.0.1:7691/mcp", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        "X-Kontrol-Tunnel-Reviewer": "forged-reviewer-secret-that-must-not-work",
+      },
+      body: initBody,
+    });
+    assert.equal(forgedReviewer.status, 200, "forged reviewer assertion must not block MCP initialization");
+    const forgedReviewerSessionId = forgedReviewer.headers.get("mcp-session-id");
+    assert.ok(forgedReviewerSessionId, "forged reviewer initialize must still return a client session");
+    const forgedApproval = await fetch("http://127.0.0.1:7691/mcp", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        "mcp-session-id": forgedReviewerSessionId,
+        "X-Kontrol-Tunnel-Reviewer": "forged-reviewer-secret-that-must-not-work",
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 98, method: "tools/call", params: { name: "open_approval_center", arguments: {} } }),
+    });
+    const forgedApprovalPayload = parseJsonRpcResponse(await forgedApproval.text()) as { result?: { isError?: boolean } };
+    assert.equal(forgedApprovalPayload.result?.isError, true, "forged tunnel reviewer assertions must not grant reviewer authority");
+    const plainApproval = await fetch("http://127.0.0.1:7691/mcp", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Accept": "application/json, text/event-stream", "mcp-session-id": good.headers.get("mcp-session-id")! },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 100, method: "tools/call", params: { name: "open_approval_center", arguments: {} } }),
+    });
+    const plainApprovalPayload = parseJsonRpcResponse(await plainApproval.text()) as { result?: { isError?: boolean } };
+    assert.equal(plainApprovalPayload.result?.isError, true, "plain tunnel clients must not become reviewers");
     const emptyPostProbe = await fetch("http://127.0.0.1:7691/mcp", { method: "POST" });
     assert.equal(emptyPostProbe.status, 202, "tunnel empty POST probes must not become application 400s");
     const getProbe = await fetch("http://127.0.0.1:7691/mcp");
@@ -125,6 +186,30 @@ assert.equal(loadConfig({ ...baseEnv, KONTROL_TUNNEL_TOKEN: "short" }).authMode,
     assert.equal(resource?.mimeType, "text/html;profile=mcp-app");
     assert.equal(typeof resource?.text, "string");
     assert.equal(resource?.text?.includes('<main id="app"'), true);
+
+    // A host may cache a template hash from a previous build and send the
+    // read over the already-initialized MCP session. That request must not
+    // fall through to the per-session registry, which only knows this build's
+    // current hash.
+    const goodSessionId = good.headers.get("mcp-session-id");
+    assert.ok(goodSessionId, "initialize must return an MCP session id");
+    const staleResourceUri = "ui://kontrol/workspace-app-6fa984c4ceb8.html";
+    const staleResourceRead = await fetch("http://127.0.0.1:7691/mcp", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        "Authorization": `Bearer ${token}`,
+        "mcp-session-id": goodSessionId,
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 6, method: "resources/read", params: { uri: staleResourceUri } }),
+    });
+    assert.equal(staleResourceRead.status, 200, "stale template hashes must work on an existing session");
+    const stalePayload = parseJsonRpcResponse(await staleResourceRead.text()) as { result?: { contents?: unknown[] } };
+    const staleResource = stalePayload.result?.contents?.[0] as { uri?: string; mimeType?: string; text?: string } | undefined;
+    assert.equal(staleResource?.uri, staleResourceUri);
+    assert.equal(staleResource?.mimeType, "text/html;profile=mcp-app");
+    assert.equal(typeof staleResource?.text, "string");
 
     const openAiResourceRead = await fetch("http://127.0.0.1:7691/mcp", {
       method: "POST",

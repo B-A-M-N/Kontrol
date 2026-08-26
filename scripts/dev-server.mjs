@@ -21,6 +21,8 @@ function start() {
   stoppingForRestart = false;
   child = spawn("npx", ["tsx", "src/cli.ts", "serve"], {
     cwd: repoRoot,
+    // kontrol-env-exception: local dev server runs the developer's own
+    // checkout on their machine; not a remote control-plane spawn path.
     env: process.env,
     stdio: "inherit",
   });

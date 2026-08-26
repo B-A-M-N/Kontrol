@@ -10,6 +10,11 @@ const sqlite = new Database(":memory:");
 sqlite.pragma("foreign_keys = ON");
 try {
   migrateDatabase(sqlite);
+  assert.ok(
+    (sqlite.prepare("pragma table_info(work_session_submissions)").all() as Array<{ name: string }>)
+      .some((column) => column.name === "files_json"),
+    "submission file metadata column is present after migration",
+  );
 
   sqlite.exec("drop index if exists agent_registry_name_unique");
   sqlite.prepare(`

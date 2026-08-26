@@ -1,4 +1,5 @@
 import { execSync } from "node:child_process";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
 import os from "node:os";
@@ -67,7 +68,7 @@ import { verifyWorkerToken, type WorkerTokenClaims } from "./acp-worker-token.mj
 import { createApprovalRequestManager } from "./approval-requests.js";
 import { createMissionLedger } from "./mission-ledger.js";
 import { createAgentMessageManager } from "./agent-messages.js";
-import { DEVDESKTOP_WORKSPACE_APP_URI, LEGACY_WORKSPACE_APP_URI, OPENAI_WORKSPACE_APP_URI, WORKSPACE_APP_BUILD_ID, WORKSPACE_APP_HTML, WORKSPACE_APP_URI, isWorkspaceAppUri, workspaceAppResourceMeta, workspaceAppToolMeta } from "./workspace-app-resource.js";
+import { DEVDESKTOP_WORKSPACE_APP_URI, LEGACY_WORKSPACE_APP_URI, OPENAI_WORKSPACE_APP_URI, WORKSPACE_APP_BUILD_ID, WORKSPACE_APP_HTML, WORKSPACE_APP_URI, workspaceAppResourceKind, workspaceAppResourceMeta, workspaceAppToolMeta } from "./workspace-app-resource.js";
 import { createRuntimeIdentity, readBuildIdentity, readRuntimeIdentity, removeRuntimeIdentity } from "./runtime-identity.js";
 import { mcpSessionIdleReason, mcpSessionIdleTtl } from "./mcp-session-policy.js";
 import { installCachedToolList, toolListCacheDiagnostics } from "./mcp-tool-list-cache.js";
@@ -138,10 +139,19 @@ function resolveMcpMemoryBudget(): number {
 }
 
 type Transport = StreamableHTTPServerTransport;
+
+const mcpRequestContext = new AsyncLocalStorage<{ signal: AbortSignal }>();
+
+function currentMcpRequestSignal(): AbortSignal | undefined {
+  return mcpRequestContext.getStore()?.signal;
+}
+
 interface McpSessionState {
   sessionId: string;
   sessionLabel: string;
   logicalClientId: string;
+  authenticatedRole: "worker" | "reviewer" | "client";
+  authSource: "oauth" | "reviewer_token" | "worker_token" | "tunnel_reviewer" | "anonymous";
   conversationId?: string;
   createdAt: number;
   lastActivityAt: number;
@@ -257,10 +267,14 @@ function rejectOversizedBody(limitBytes: number, protocol: "mcp" | "acp") {
 
 function authenticatedAcpBodyGate(config: ServerConfig) {
   return (req: Request, res: Response, next: NextFunction): void => {
-    const configured = [config.acpAgentSecret, config.acpReviewerSecret, config.acpSharedSecret]
-      .filter((secret): secret is string => Boolean(secret))
-      .map((secret) => `Bearer ${secret}`);
-    if (!configured.includes(req.headers.authorization ?? "")) {
+    const presented = req.headers.authorization ?? "";
+    // Timing-safe comparison for every configured role secret. First-match
+    // wins, so secrets must be distinct (enforced by config validation).
+    const matches =
+      (config.acpAgentSecret && constantTimeStringEqual(presented, `Bearer ${config.acpAgentSecret}`)) ||
+      (config.acpReviewerSecret && constantTimeStringEqual(presented, `Bearer ${config.acpReviewerSecret}`)) ||
+      (config.acpSharedSecret && constantTimeStringEqual(presented, `Bearer ${config.acpSharedSecret}`));
+    if (!matches) {
       res.status(401).json({ error: { code: "unauthorized", message: "Missing or invalid authorization" } });
       return;
     }
@@ -315,7 +329,10 @@ interface McpAdmissionWaiter {
   key: string;
   weight: number;
   resolve: (release: (() => void) | null) => void;
-  timer: NodeJS.Timeout;
+  timer?: NodeJS.Timeout;
+  signal?: AbortSignal;
+  onAbort?: () => void;
+  settled: boolean;
 }
 
 function mcpAdmissionWeight(rpcMethod: string | undefined, toolName: string | undefined): number {
@@ -324,6 +341,75 @@ function mcpAdmissionWeight(rpcMethod: string | undefined, toolName: string | un
   if (toolName === "grep" || toolName === "glob" || toolName === "find" || toolName === "list_pending_reviews") return 2;
   if (toolName === "bash" || toolName === "exec_command" || toolName === "write_stdin" || toolName === "write" || toolName === "edit" || toolName === "apply_patch") return 3;
   return 1;
+}
+
+// These calls either own their own process/mission lifecycle or deliberately
+// park until a human/event arrives. A generic HTTP execution deadline would
+// strand the operation while its durable state still says it is running.
+const MCP_UNBOUNDED_TOOL_NAMES = new Set([
+  "await_review_feedback",
+  "await_work_session_events",
+  "await_work_session_terminal",
+  "await_workspace_events",
+  "bash",
+  "exec_command",
+  "write_stdin",
+  "write",
+  "edit",
+  "apply_patch",
+  "submit_to_coding_agent",
+  "call_acp_agent",
+  "begin_supervised_work",
+  "run_mission_verification",
+  "provide_policy_approval",
+]);
+
+function mcpRequestHasExecutionDeadline(rpcMethod: string | undefined, toolName: string | undefined): boolean {
+  return rpcMethod !== "tools/call" || !MCP_UNBOUNDED_TOOL_NAMES.has(toolName ?? "");
+}
+
+class McpExecutionTimeoutError extends Error {
+  constructor(public readonly timeoutMs: number) {
+    super(`MCP request exceeded the ${timeoutMs}ms execution deadline`);
+    this.name = "McpExecutionTimeoutError";
+  }
+}
+
+async function handleMcpRequestWithDeadline(
+  transport: Transport,
+  req: Request,
+  res: Response,
+  body: unknown,
+  timeoutMs: number,
+): Promise<void> {
+  const handler = transport.handleRequest(req, res, body);
+  // The MCP SDK does not expose cancellation for an in-flight handler. Keep
+  // its rejection observed, then close the transport on timeout so the caller
+  // can reconnect instead of leaving a dead HTTP request and retained session.
+  void handler.catch(() => undefined);
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([
+      handler,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new McpExecutionTimeoutError(timeoutMs)), timeoutMs);
+      }),
+    ]);
+  } catch (error) {
+    if (error instanceof McpExecutionTimeoutError) {
+      try {
+        await Promise.race([
+          Promise.resolve(transport.close()),
+          new Promise<void>((resolve) => setTimeout(resolve, 1_000)),
+        ]);
+      } catch {
+        // The transport is already considered unusable after a deadline.
+      }
+    }
+    throw error;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 /**
@@ -358,9 +444,10 @@ export class McpAdmission {
     };
   }
 
-  acquire(key: string, waitDeadlineMs: number, weight = 1): Promise<(() => void) | null> {
+  acquire(key: string, waitDeadlineMs: number, weight = 1, signal?: AbortSignal): Promise<(() => void) | null> {
     if (this.closed) return Promise.resolve(null);
     if (!Number.isInteger(weight) || weight < 1 || weight > this.maxInflight || weight > this.maxInflightPerKey) return Promise.resolve(null);
+    if (signal?.aborted) return Promise.resolve(null);
     if (this.canAdmit(key, weight)) return Promise.resolve(this.grant(key, weight));
     if (this.queue.length >= this.maxQueue) return Promise.resolve(null);
 
@@ -369,12 +456,36 @@ export class McpAdmission {
         key,
         weight,
         resolve,
-        timer: setTimeout(() => {
-          const index = this.queue.indexOf(waiter);
-          if (index >= 0) this.queue.splice(index, 1);
-          resolve(null);
-        }, Math.max(1, waitDeadlineMs)),
+        signal,
+        settled: false,
       };
+      const settle = (release: (() => void) | null) => {
+        if (waiter.settled) return;
+        waiter.settled = true;
+        if (waiter.timer) clearTimeout(waiter.timer);
+        if (waiter.signal && waiter.onAbort) waiter.signal.removeEventListener("abort", waiter.onAbort);
+        resolve(release);
+      };
+      const removeAndCancel = () => {
+        const index = this.queue.indexOf(waiter);
+        if (index >= 0) this.queue.splice(index, 1);
+        settle(null);
+      };
+      waiter.onAbort = removeAndCancel;
+      waiter.timer = setTimeout(() => {
+          removeAndCancel();
+        }, Math.max(1, waitDeadlineMs));
+      if (signal) {
+        signal.addEventListener("abort", waiter.onAbort, { once: true });
+        if (signal.aborted) {
+          removeAndCancel();
+          return;
+        }
+      }
+      if (this.closed) {
+        removeAndCancel();
+        return;
+      }
       this.queue.push(waiter);
     });
   }
@@ -383,7 +494,10 @@ export class McpAdmission {
     this.closed = true;
     while (this.queue.length > 0) {
       const waiter = this.queue.shift()!;
-      clearTimeout(waiter.timer);
+      if (waiter.settled) continue;
+      waiter.settled = true;
+      if (waiter.timer) clearTimeout(waiter.timer);
+      if (waiter.signal && waiter.onAbort) waiter.signal.removeEventListener("abort", waiter.onAbort);
       waiter.resolve(null);
     }
   }
@@ -413,10 +527,17 @@ export class McpAdmission {
     if (this.closed) return;
     for (let i = 0; i < this.queue.length; i++) {
       const waiter = this.queue[i];
+      if (waiter.settled) {
+        this.queue.splice(i, 1);
+        i--;
+        continue;
+      }
       if (!this.canAdmit(waiter.key, waiter.weight)) continue;
       this.queue.splice(i, 1);
       i--;
-      clearTimeout(waiter.timer);
+      waiter.settled = true;
+      if (waiter.timer) clearTimeout(waiter.timer);
+      if (waiter.signal && waiter.onAbort) waiter.signal.removeEventListener("abort", waiter.onAbort);
       waiter.resolve(this.grant(waiter.key, waiter.weight));
     }
   }
@@ -593,7 +714,7 @@ function requestLogFields(req: Request, config: ServerConfig): Record<string, un
   };
 }
 
-function constantTimeStringEqual(actual: string | undefined, expected: string | undefined): boolean {
+export function constantTimeStringEqual(actual: string | undefined, expected: string | undefined): boolean {
   if (!actual || !expected || actual.length !== expected.length) return false;
   return timingSafeEqual(Buffer.from(actual), Buffer.from(expected));
 }
@@ -697,6 +818,7 @@ async function enforceToolPolicy(
     path,
     paths,
     command,
+    signal: currentMcpRequestSignal(),
   });
   return allowed;
 }
@@ -1068,10 +1190,13 @@ interface ConnectionContext {
    * logging/attribution only and grant no privileges.
    */
   authenticatedRole?: "worker" | "reviewer" | "client";
+  authSource?: "oauth" | "reviewer_token" | "worker_token" | "tunnel_reviewer" | "anonymous";
   workspaceSessionId?: string;
   workSessionId?: string;
   runId?: string;
   continuationId?: string;
+  /** Checkout lease nonce issued for the bound worker work session. */
+  workspaceLeaseNonce?: string;
   /** Transport identity, never shared across MCP sessions. */
   mcpSessionId?: string;
   /** Human-readable diagnostic label for this isolated transport. */
@@ -2361,6 +2486,7 @@ function createMcpServer(
       principalRole: connectionContext?.authenticatedRole ?? "client",
       connectionContinuationId: connectionContext?.continuationId,
       connectionWorkSessionId: connectionContext?.workSessionId,
+      connectionWorkspaceLeaseNonce: connectionContext?.workspaceLeaseNonce,
       liveWaiters,
       onPhaseTiming,
     };
@@ -2464,6 +2590,49 @@ export function createServer(config = loadConfig()): RunningServer {
     if (!Number.isFinite(durationMs) || durationMs < 0) return;
     phaseTimingSamples.push({ at: Date.now(), phase, durationMs });
     if (phaseTimingSamples.length > 5_000) phaseTimingSamples.splice(0, phaseTimingSamples.length - 5_000);
+  }
+
+  function serveWorkspaceAppResource(
+    res: Response,
+    requestId: string | undefined,
+    body: { id?: unknown; params?: { uri?: unknown } },
+    sessionless: boolean,
+  ): boolean {
+    const resourceStartedAt = performance.now();
+    const uri = typeof body.params?.uri === "string" ? body.params.uri : undefined;
+    const kind = workspaceAppResourceKind(uri);
+    if (!kind) return false;
+
+    if (kind === "current") workspaceAppResourceMetrics.currentHashed++;
+    else if (kind === "openai") workspaceAppResourceMetrics.openAiCompatibility++;
+    else if (kind === "legacy") workspaceAppResourceMetrics.legacyKontrol++;
+    else if (kind === "devdesktop") workspaceAppResourceMetrics.devDesktopMigration++;
+
+    const isCurrent = kind === "current";
+    const content: { uri: string; mimeType: string; text: string; _meta?: Record<string, unknown> } = {
+      uri: uri ?? WORKSPACE_APP_URI,
+      mimeType: isCurrent ? RESOURCE_MIME_TYPE : "text/html+skybridge",
+      text: WORKSPACE_APP_HTML,
+      ...(isCurrent ? { _meta: workspaceAppResourceMeta() } : {}),
+    };
+    res.json({
+      jsonrpc: "2.0",
+      id: body.id ?? null,
+      result: { contents: [content] },
+    });
+
+    const totalMs = Math.round(performance.now() - resourceStartedAt);
+    workspaceAppResourceMetrics.servedTotal++;
+    workspaceAppResourceMetrics.lastDurationMs = totalMs;
+    if (totalMs > workspaceAppResourceMetrics.maxDurationMs) workspaceAppResourceMetrics.maxDurationMs = totalMs;
+    logEvent(config.logging, "info", "workspace_app_resource_served", {
+      requestId,
+      sessionless,
+      resourceFastPath: true,
+      resourceUri: uri,
+      totalMs,
+    });
+    return true;
   }
 
   function timingQuantiles(samples: number[]): { count: number; p50: number; p95: number; p99: number } {
@@ -2884,9 +3053,20 @@ export function createServer(config = loadConfig()): RunningServer {
   const workspaceStore = createWorkspaceStore(db);
   const workspaces = new WorkspaceRegistry(config, workspaceStore);
   const reviewCheckpoints = createReviewCheckpointManager();
-  const processSessions = new ProcessSessionManager();
-  const workSessions = createWorkSessionManager(db);
-  const agentRegistry = createAgentRegistryManager(db);
+  const processSessions = new ProcessSessionManager({
+    childEnvironmentAllowlist: config.childEnvironmentAllowlist,
+    // P1 #14: operator-tunable resource controls; manager applies defaults
+    // for anything unset.
+    ...(config.processMaxRunning !== undefined && { maxRunningProcesses: config.processMaxRunning }),
+    ...(config.processMaxRunningPerOwner !== undefined && { maxRunningProcessesPerOwner: config.processMaxRunningPerOwner }),
+    ...(config.processIdleTimeoutMs !== undefined && { idleTimeoutMs: config.processIdleTimeoutMs }),
+    ...(config.processMaxRuntimeMs !== undefined && { maxRuntimeMs: config.processMaxRuntimeMs }),
+    ...(config.processMaxBufferCharacters !== undefined && { maxBufferCharacters: config.processMaxBufferCharacters }),
+    ...(config.processReaperIntervalMs !== undefined && { reaperIntervalMs: config.processReaperIntervalMs }),
+  });
+  let revokeWorkSessionGrants: ((workSessionId: string) => void) | undefined;
+  const workSessions = createWorkSessionManager(db, { onTerminal: (workSessionId) => revokeWorkSessionGrants?.(workSessionId) });
+  const agentRegistry = createAgentRegistryManager(db, { enabled: config.webhookEnabled, allowedHosts: config.webhookAllowedHosts });
   // Seed the well-known topology: the WebUI is the ACP reviewer;
   // the CLI coding agent registers itself as the ACP *agent* at runtime.
   agentRegistry.ensure({
@@ -3038,10 +3218,25 @@ export function createServer(config = loadConfig()): RunningServer {
   };
   const grantStore = createSqliteGrantStore(db);
   const policyEngine = createPolicyEngine(config.policy, grantStore, approvalRequests);
-  const policyEnforcer = createPolicyEnforcer(policyEngine, eventStore);
+  revokeWorkSessionGrants = (workSessionId) => policyEngine.revokeScope("work_session", workSessionId);
+  // Reconcile grants created by an older process that terminated before its
+  // lifecycle callback ran. Workspace grants intentionally survive restart;
+  // work-session grants never survive the terminal boundary.
+  for (const session of workSessions.listAllWorkSessions()) {
+    if (terminalWorkSessionStatuses.has(session.status)) policyEngine.revokeScope("work_session", session.id);
+  }
+  const policyEnforcer = createPolicyEnforcer(policyEngine, eventStore, {
+    timeoutMs: config.policyApprovalTimeoutMs,
+  });
 
+  // P1 #7: pass the parsed trusted-proxy spec straight to Express. A hop
+  // count ("1") or "loopback" scopes forwarded-header trust precisely;
+  // undefined leaves Express's default (no proxy trusted).
   if (config.logging.trustProxy) {
-    app.set("trust proxy", true);
+    app.set(
+      "trust proxy",
+      config.logging.trustProxy === "true" ? true : config.logging.trustProxy,
+    );
   }
 
   app.use((req, res, next) => {
@@ -3198,17 +3393,12 @@ export function createServer(config = loadConfig()): RunningServer {
     // alone. Query-string agent selection was removed — arbitrary "check
     // these agents" requests could replace the configured requirement set.
     // Diagnostics/doctor tooling covers ad-hoc agent checks instead.
-    let configuredAgents = config.acpKnownAgents;
+    const configuredAgents = config.acpKnownAgents;
     const aliveAgents = agentRegistry.listAlive();
-    // In ACP mode an empty configured list is not "no requirements". It means
-    // the generation has not registered an operational coding agent yet. The
-    // WebUI is seeded separately and is not sufficient for worker readiness.
-    const dynamicAgentRequirement = config.acpEnabled && configuredAgents.length === 0;
-    if (dynamicAgentRequirement) {
-      configuredAgents = aliveAgents
-        .filter((agent) => agent.role === "agent" && agent.name !== "webui")
-        .map((agent) => ({ name: agent.name, url: agent.url }));
-    }
+    // P1 #12 review note: an empty configured list with zero registered
+    // workers is a legitimate deployment posture ("no ACP workers wanted"),
+    // not a readiness failure. Strict /readyz only fails when the operator
+    // has *configured* required agents that are absent/unhealthy.
     const agentResults = configuredAgents.map((required) => {
       const found = aliveAgents.find((agent) => agent.name === required.name);
       const urlMatches = !required.url || found?.url === required.url;
@@ -3221,10 +3411,10 @@ export function createServer(config = loadConfig()): RunningServer {
       };
     });
     checks.agents = {
-      ok: dynamicAgentRequirement ? agentResults.length > 0 && agentResults.every((agent) => agent.healthy) : agentResults.every((agent) => agent.healthy),
-      detail: dynamicAgentRequirement
-        ? (agentResults.length > 0 ? "registered worker agents checked" : "no live worker agents registered")
-        : (configuredAgents.length > 0 ? "required agents checked" : "ACP disabled; no agents required"),
+      ok: agentResults.every((agent) => agent.healthy),
+      detail: configuredAgents.length > 0
+        ? "required agents checked"
+        : "no agents configured; deployments without ACP workers are ready",
       agents: agentResults,
     };
     return checks;
@@ -3366,6 +3556,8 @@ export function createServer(config = loadConfig()): RunningServer {
             sessionIdPrefix: sessionIdPrefix(state.sessionId),
             sessionLabel: state.sessionLabel,
             logicalClientId: state.logicalClientId,
+            authenticatedRole: state.authenticatedRole,
+            authSource: state.authSource,
             conversationId: state.conversationId,
             createdAt: new Date(state.createdAt).toISOString(),
             ageMs: Date.now() - state.createdAt,
@@ -3443,6 +3635,7 @@ export function createServer(config = loadConfig()): RunningServer {
       approvalRequests,
       config.acpAgentSecret,
       config.acpReviewerSecret,
+      { enabled: config.webhookEnabled, allowedHosts: config.webhookAllowedHosts },
     ));
   }
 
@@ -3464,6 +3657,12 @@ export function createServer(config = loadConfig()): RunningServer {
     let admissionWaitMs = 0;
     let admissionClass: "execution" | "waiter" = requestIsWaiter ? "waiter" : "execution";
     let handlerStartedAt = 0;
+    const requestAbort = new AbortController();
+    const abortIfDisconnected = () => {
+      if (!res.writableFinished) requestAbort.abort();
+    };
+    req.once("aborted", abortIfDisconnected);
+    res.once("close", abortIfDisconnected);
     res.once("finish", () => {
       const finishedAt = performance.now();
       recordPhaseTiming("mcp.response", finishedAt - requestStartedAt);
@@ -3587,6 +3786,23 @@ export function createServer(config = loadConfig()): RunningServer {
             }
           }
         }
+
+        // App hosts can keep a template URI from an earlier build and send
+        // the later resources/read through the already-open MCP transport.
+        // Serve recognized historical hashes on that transport too; the
+        // transport's per-session resource registry only contains the hash
+        // from the build that created it.
+        if (requestRpcMethod === "resources/read" && workspaceAppResourceKind((req.body as { params?: { uri?: unknown } })?.params?.uri)) {
+          if (state && state.inFlightRequests > 0) state.inFlightRequests--;
+          if (state) state.lastActivityAt = Date.now();
+          serveWorkspaceAppResource(
+            res,
+            requestId,
+            req.body as { id?: unknown; params?: { uri?: unknown } },
+            false,
+          );
+          return;
+        }
       } else if (initializeRequest) {
         // P1 #31: Admission pressure control — enforce caps at session creation
         const clientId = logicalClientId(req);
@@ -3643,6 +3859,8 @@ export function createServer(config = loadConfig()): RunningServer {
                 sessionId: newSessionId,
                 sessionLabel: mcpSessionLabel(clientId, newSessionId, requestConversationId),
                 logicalClientId: clientId,
+                authenticatedRole: connectionContext.authenticatedRole ?? "client",
+                authSource: connectionContext.authSource ?? "anonymous",
                 conversationId: requestConversationId,
                 createdAt: Date.now(),
                 lastActivityAt: Date.now(),
@@ -3726,6 +3944,14 @@ export function createServer(config = loadConfig()): RunningServer {
         }
         const reviewerToken = req.header("x-kontrol-reviewer-token");
         const verifiedReviewer = constantTimeStringEqual(reviewerToken, config.acpReviewerSecret);
+        // Tunnel mode deliberately has no bearer gate on the local hop. The
+        // managed tunnel adds this separate secret-backed assertion only to
+        // MCP target traffic, allowing the WebUI to retain reviewer authority
+        // without promoting every loopback client or unsigned attribution
+        // header to reviewer.
+        const tunnelReviewerToken = req.header("x-kontrol-tunnel-reviewer");
+        const verifiedTunnelReviewer = config.authMode === "tunnel"
+          && constantTimeStringEqual(tunnelReviewerToken, config.tunnelReviewerSecret);
         const oauthScopes = Array.isArray(req.auth?.scopes) ? req.auth.scopes : [];
         const verifiedOAuthReviewer = oauthEnabled && oauthScopes.some((scope) =>
           scope === "kontrol" ||
@@ -3741,18 +3967,31 @@ export function createServer(config = loadConfig()): RunningServer {
         // headers are used ONLY when no token is present (a reviewer/client
         // reaching /mcp directly) and never grant worker rights.
         const connectionContext: ConnectionContext = {
-          authenticatedRole: verifiedClaims ? "worker" : (verifiedReviewer || verifiedOAuthReviewer) ? "reviewer" : "client",
+          authenticatedRole: verifiedClaims ? "worker" : (verifiedReviewer || verifiedTunnelReviewer || verifiedOAuthReviewer) ? "reviewer" : "client",
+          authSource: verifiedClaims
+            ? "worker_token"
+            : verifiedReviewer
+              ? "reviewer_token"
+              : verifiedTunnelReviewer
+                ? "tunnel_reviewer"
+                : oauthEnabled
+                  ? "oauth"
+                  : "anonymous",
           workspaceSessionId:
             verifiedClaims?.workspaceSessionId
             || (req.header("x-kontrol-workspace-session") ?? undefined),
-          workSessionId:
-            verifiedClaims?.workSessionId
-            || (req.header("x-kontrol-work-session") ?? undefined),
+          // A plain attribution header is never allowed to turn a client into
+          // a worker or to select the principal used for policy grants. Only
+          // the signed worker envelope supplies an operational work session.
+          workSessionId: verifiedClaims?.workSessionId,
           runId:
             verifiedClaims?.runId || (req.header("x-kontrol-run") ?? undefined),
           continuationId:
             verifiedClaims?.continuationId
             || (req.header("x-kontrol-continuation") ?? undefined),
+          workspaceLeaseNonce:
+            (verifiedClaims as (WorkerTokenClaims & { workspaceLeaseNonce?: string }) | undefined)?.workspaceLeaseNonce
+            || (verifiedClaims ? req.header("x-kontrol-workspace-lease-nonce") ?? undefined : undefined),
           conversationId: conversationId(req),
         };
 
@@ -3816,8 +4055,8 @@ export function createServer(config = loadConfig()): RunningServer {
           totalMs: Math.round(initializationTotalMs),
         });
       } else if (
-        (req.body as { method?: unknown; params?: { uri?: unknown } } | undefined)?.method === "resources/read" &&
-        isWorkspaceAppUri((req.body as { params?: { uri?: unknown } } | undefined)?.params?.uri)
+        requestRpcMethod === "resources/read" &&
+        workspaceAppResourceKind((req.body as { params?: { uri?: unknown } } | undefined)?.params?.uri)
       ) {
         // The OpenAI tunnel fetches app resources on a separate, sessionless
         // channel after initialization. Resources are read-only and the outer
@@ -3825,43 +4064,12 @@ export function createServer(config = loadConfig()): RunningServer {
         // this one protocol method statelessly rather than constructing the
         // complete file/shell/ACP/policy tool universe just to return a static
         // HTML document.
-        const resourceStartedAt = performance.now();
-        const body = req.body as { id?: unknown; params?: { uri?: unknown } };
-        const uri = typeof body.params?.uri === "string" ? body.params.uri : undefined;
-        const isCurrent = uri === WORKSPACE_APP_URI;
-        const isOpenAi = uri === OPENAI_WORKSPACE_APP_URI;
-        const isLegacy = uri === LEGACY_WORKSPACE_APP_URI;
-        const isDevDesktop = uri === DEVDESKTOP_WORKSPACE_APP_URI;
-        if (isCurrent) workspaceAppResourceMetrics.currentHashed++;
-        else if (isOpenAi) workspaceAppResourceMetrics.openAiCompatibility++;
-        else if (isLegacy) workspaceAppResourceMetrics.legacyKontrol++;
-        else if (isDevDesktop) workspaceAppResourceMetrics.devDesktopMigration++;
-        const mimeType = isCurrent ? RESOURCE_MIME_TYPE : "text/html+skybridge";
-        const meta = isCurrent ? workspaceAppResourceMeta() : undefined;
-        const content: { uri: string; mimeType: string; text: string; _meta?: Record<string, unknown> } = {
-          uri: uri ?? WORKSPACE_APP_URI,
-          mimeType,
-          text: WORKSPACE_APP_HTML,
-          ...(meta ? { _meta: meta } : {}),
-        };
-        res.json({
-          jsonrpc: "2.0",
-          id: body.id ?? null,
-          result: { contents: [content] },
-        });
-        const totalMs = Math.round(performance.now() - resourceStartedAt);
-        // P1 #32: track resource-serving latency; through the tunnel this
-        // dominates over server construction, so it must be measurable.
-        workspaceAppResourceMetrics.servedTotal++;
-        workspaceAppResourceMetrics.lastDurationMs = totalMs;
-        if (totalMs > workspaceAppResourceMetrics.maxDurationMs) workspaceAppResourceMetrics.maxDurationMs = totalMs;
-        logEvent(config.logging, "info", "workspace_app_resource_served", {
+        serveWorkspaceAppResource(
+          res,
           requestId,
-          sessionless: true,
-          resourceFastPath: true,
-          resourceUri: uri,
-          totalMs,
-        });
+          req.body as { id?: unknown; params?: { uri?: unknown } },
+          true,
+        );
         return;
       } else {
         sendJsonRpcError(res, 400, -32000, "No valid MCP session");
@@ -3874,8 +4082,9 @@ export function createServer(config = loadConfig()): RunningServer {
       const admissionStartedAt = performance.now();
       const acquiredAdmission = await admission.acquire(
         sessionId ?? logicalClientId(req),
-        config.mcpRequestDeadlineMs,
+        config.mcpAdmissionTimeoutMs,
         admissionWeight,
+        requestAbort.signal,
       );
       admissionWaitMs = performance.now() - admissionStartedAt;
       if (!acquiredAdmission) {
@@ -3904,7 +4113,19 @@ export function createServer(config = loadConfig()): RunningServer {
 
       res.setHeader("x-kontrol-admission-wait-ms", String(Math.round(admissionWaitMs)));
       handlerStartedAt = performance.now();
-      await transport.handleRequest(req, res, req.body);
+      await mcpRequestContext.run({ signal: requestAbort.signal }, async () => {
+        if (mcpRequestHasExecutionDeadline(requestRpcMethod, requestToolName)) {
+          await handleMcpRequestWithDeadline(
+            transport!,
+            req,
+            res,
+            req.body,
+            config.mcpExecutionTimeoutMs,
+          );
+        } else {
+          await transport!.handleRequest(req, res, req.body);
+        }
+      });
       const handlerMs = performance.now() - handlerStartedAt;
       const totalMs = performance.now() - requestStartedAt;
       recordMcpTiming({
@@ -3926,35 +4147,33 @@ export function createServer(config = loadConfig()): RunningServer {
         totalMs: Math.round(totalMs),
         status: res.statusCode,
       });
-      admissionRelease();
-      admissionRelease = undefined;
-      // Decrement in-flight count after response completes
-      if (sessionId) {
-        const state = mcpSessions.get(sessionId);
-        if (state) {
-          if (state.inFlightRequests > 0) state.inFlightRequests--;
-          if (sessionLongPoll && state.activeLongPollCount > 0) state.activeLongPollCount--;
-          state.lastActivityAt = Date.now();
-        }
-      }
     } catch (error) {
-      admissionRelease?.();
-      admissionRelease = undefined;
-      // Decrement in-flight count on error too
-      if (sessionId) {
-        const state = mcpSessions.get(sessionId);
-        if (state) {
-          if (state.inFlightRequests > 0) state.inFlightRequests--;
-          if (sessionLongPoll && state.activeLongPollCount > 0) state.activeLongPollCount--;
-          state.lastActivityAt = Date.now();
-        }
-      }
       logEvent(config.logging, "error", "mcp_request_error", {
         requestId,
         error: error instanceof Error ? error.message : String(error),
+        timedOut: error instanceof McpExecutionTimeoutError,
       });
       if (!res.headersSent) {
-        sendJsonRpcError(res, 500, -32603, "Internal server error");
+        sendJsonRpcError(
+          res,
+          error instanceof McpExecutionTimeoutError ? 504 : 500,
+          error instanceof McpExecutionTimeoutError ? -32008 : -32603,
+          error instanceof McpExecutionTimeoutError
+            ? "MCP request exceeded its execution deadline; reconnect and retry."
+            : "Internal server error",
+        );
+      }
+    } finally {
+      admissionRelease?.();
+      admissionRelease = undefined;
+      // Decrement in-flight count after response completes or is aborted.
+      if (sessionId) {
+        const state = mcpSessions.get(sessionId);
+        if (state) {
+          if (state.inFlightRequests > 0) state.inFlightRequests--;
+          if (sessionLongPoll && state.activeLongPollCount > 0) state.activeLongPollCount--;
+          state.lastActivityAt = Date.now();
+        }
       }
     }
   });
@@ -4011,6 +4230,8 @@ export function createServer(config = loadConfig()): RunningServer {
           workSessionId,
           maxInflight: config.verifyMaxInflight,
           sandbox: config.verifySandbox,
+          childEnvironmentAllowlist: config.childEnvironmentAllowlist,
+          verifyToolchainPaths: config.verifyToolchainPaths,
           missionLedger,
           workSessions,
           workspaces,
@@ -4158,6 +4379,7 @@ export function createServer(config = loadConfig()): RunningServer {
     continuationManager.close();
     dispatchOutbox.close();
     await processSessions.shutdown();
+    await agentRegistry.drain?.();
     oauthProvider?.close();
     workspaceStore.close?.();
     workSessions?.close?.();
@@ -4238,7 +4460,7 @@ if (await isMainModule()) {
     console.log(`logging: ${config.logging.level} ${config.logging.format}`);
     console.log(`request logging: ${config.logging.requests ? "enabled" : "disabled"}`);
     console.log(`asset logging: ${config.logging.assets ? "enabled" : "disabled"}`);
-    console.log(`trust proxy: ${config.logging.trustProxy ? "enabled" : "disabled"}`);
+    console.log(`trust proxy: ${config.logging.trustProxy ?? "disabled"}`);
     // P2: Build info for dirty-deployment visibility
     console.log(`build commit: ${commit.slice(0, 8)} dirty: ${dirty ? `YES (${dirtyFileCount} files)` : "no"} built: ${new Date().toISOString()}`);
   });

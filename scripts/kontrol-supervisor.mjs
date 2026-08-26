@@ -2,7 +2,7 @@
 // Long-lived local process supervisor. It owns only the Kontrol tmux sessions
 // named by start-all.sh and uses stateful failure thresholds so one transient
 // tunnel timeout does not restart the whole stack.
-import { existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, renameSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -11,6 +11,16 @@ const DEFAULT_INTERVAL_MS = 5_000;
 const FAILURE_THRESHOLD = 3;
 const ESCALATION_RESTART_THRESHOLD = 3;
 const PROBE_TIMEOUT_MS = 1_500;
+
+function readServerIdentity(stateDir) {
+  try { return JSON.parse(readFileSync(join(stateDir, "server.identity.json"), "utf8")); }
+  catch { return undefined; }
+}
+
+function processIsLive(pid) {
+  if (!Number.isInteger(Number(pid)) || Number(pid) <= 1) return false;
+  try { process.kill(Number(pid), 0); return true; } catch { return false; }
+}
 
 export class FailureTracker {
   constructor(name) {
@@ -105,7 +115,11 @@ function restartSession(name, root, command) {
 async function probe(url) {
   try {
     const response = await fetch(url, { signal: AbortSignal.timeout(PROBE_TIMEOUT_MS) });
-    return { ok: response.status === 200, status: response.status };
+    let body;
+    if ((response.headers.get("content-type") || "").includes("application/json")) {
+      body = await response.json().catch(() => undefined);
+    }
+    return { ok: response.status === 200, status: response.status, body };
   } catch (error) {
     return { ok: false, status: 0, error: error instanceof Error ? error.message : String(error) };
   }
@@ -116,6 +130,13 @@ export async function allHealthy(component, urls, probeFn = probe) {
   return { ok: results.every((result) => result.ok), results };
 }
 
+export function adapterHealthReady(health) {
+  return health?.ok === true
+    && health.ready === true
+    && health.reconciled === true
+    && health.lifecycle === "READY";
+}
+
 function writeStatus(statusFile, status) {
   mkdirSync(resolve(statusFile, ".."), { recursive: true });
   const temporary = `${statusFile}.tmp-${process.pid}`;
@@ -123,13 +144,14 @@ function writeStatus(statusFile, status) {
   renameSync(temporary, statusFile);
 }
 
-function buildComponents({ kontrolUrl, tunnelUrl, agents, crushPort, hermesPort, startCrush, startHermes }) {
+function buildComponents({ kontrolUrl, tunnelUrl, agents, crushPort, hermesPort, startCrush, startHermes, generationId, expectedBuildId }) {
+  const identityEnv = `export KONTROL_LAUNCH_GENERATION_ID=${shellQuote(generationId)} KONTROL_EXPECTED_BUILD_ID=${shellQuote(expectedBuildId)};`;
   const components = {
     kontrol: {
       tracker: new FailureTracker("kontrol"),
       urls: [`${kontrolUrl}/healthz`, `${kontrolUrl}/core-readyz`],
       session: "kontrol-server",
-      command: "set -a; source .env; set +a; exec node dist/cli.js serve",
+      command: `set -a; source .env; set +a; ${identityEnv} exec node dist/cli.js serve`,
     },
     operational: {
       tracker: new FailureTracker("operational"),
@@ -148,16 +170,18 @@ function buildComponents({ kontrolUrl, tunnelUrl, agents, crushPort, hermesPort,
     components.crush = {
       tracker: new FailureTracker("crush"),
       urls: [`http://127.0.0.1:${crushPort}/health`],
+      requireReadyHealth: true,
       session: "kontrol-adapter-crush",
-      command: `set -a; source .env; set +a; exec env ACP_AGENT_BIN=crush PORT=${Number(crushPort)} node scripts/acp-crush-adapter.mjs`,
+      command: `set -a; source .env; set +a; ${identityEnv} exec env ACP_AGENT_BIN=crush PORT=${Number(crushPort)} node scripts/acp-crush-adapter.mjs`,
     };
   }
   if (startHermes) {
     components.hermes = {
       tracker: new FailureTracker("hermes"),
       urls: [`http://127.0.0.1:${hermesPort}/health`],
+      requireReadyHealth: true,
       session: "kontrol-adapter-hermes",
-      command: `set -a; source .env; set +a; exec env HERMES_ACP_ADAPTER_PORT=${Number(hermesPort)} node scripts/acp-hermes-native-adapter.mjs`,
+      command: `set -a; source .env; set +a; ${identityEnv} exec env HERMES_ACP_ADAPTER_PORT=${Number(hermesPort)} node scripts/acp-hermes-native-adapter.mjs`,
     };
   }
   for (const agent of agents) {
@@ -177,13 +201,16 @@ async function main() {
   const kontrolUrl = originFromUrl(arg("--kontrol-url", "http://127.0.0.1:7676"));
   const tunnelUrl = arg("--tunnel-url", "http://127.0.0.1:8080").replace(/\/$/, "");
   const statusFile = resolve(arg("--status-file", join(process.env.KONTROL_STATE_DIR || join(root, ".kontrol-state"), "supervisor-status.json")));
+  const stateDir = resolve(arg("--state-dir", process.env.KONTROL_STATE_DIR || join(root, ".kontrol-state")));
+  const generationId = arg("--generation-id", process.env.KONTROL_LAUNCH_GENERATION_ID || "unknown");
+  const expectedBuildId = arg("--expected-build-id", process.env.KONTROL_EXPECTED_BUILD_ID || "");
   const agents = parseAgentSpecs(arg("--agents", ""));
   const crushPort = arg("--crush-port", process.env.ACP_ADAPTER_PORT || "9877");
   const hermesPort = arg("--hermes-port", process.env.HERMES_ACP_ADAPTER_PORT || "9911");
   const startCrush = arg("--start-crush", "false") === "true";
   const startHermes = arg("--start-hermes", "false") === "true";
   const intervalMs = Number(arg("--interval-ms", process.env.KONTROL_SUPERVISOR_INTERVAL_MS || DEFAULT_INTERVAL_MS));
-  const components = buildComponents({ kontrolUrl, tunnelUrl, agents, crushPort, hermesPort, startCrush, startHermes });
+  const components = buildComponents({ kontrolUrl, tunnelUrl, agents, crushPort, hermesPort, startCrush, startHermes, generationId, expectedBuildId });
   const startedAt = new Date().toISOString();
   let stopping = false;
   let recovering = false;
@@ -199,6 +226,9 @@ async function main() {
     restartCount: Object.values(components).reduce((sum, { tracker }) => sum + tracker.restartCount, 0),
     lastRestartReason: Object.values(components).map(({ tracker }) => tracker.lastRestartReason).filter(Boolean).at(-1),
     lastExternalProbeResult: externalProbeResult,
+    generationId,
+    expectedBuildId: expectedBuildId || undefined,
+    serverIdentity: readServerIdentity(stateDir),
     components: Object.fromEntries(Object.entries(components).map(([name, component]) => [name, component.tracker.snapshot()])),
   });
 
@@ -243,7 +273,36 @@ async function main() {
     const results = {};
     let healthy = true;
     const probeComponent = async ([name, component]) => {
-      const result = await allHealthy(name, component.urls);
+      let result = await allHealthy(name, component.urls);
+      if (result.ok && component.requireReadyHealth) {
+        const health = result.results.find((entry) => entry.body !== undefined)?.body;
+        if (!adapterHealthReady(health)) {
+          result = {
+            ...result,
+            ok: false,
+            healthError: "adapter health did not prove reconciled READY state",
+          };
+        }
+      }
+      if (name === "kontrol" && result.ok) {
+        const identity = readServerIdentity(stateDir);
+        const identityMatches = Boolean(identity)
+          && (generationId === "unknown" || identity.generationId === generationId)
+          && (!expectedBuildId || identity.buildId === expectedBuildId)
+          && processIsLive(identity.pid);
+        result = {
+          ...result,
+          ok: identityMatches,
+          identity: identity ? {
+            instanceId: identity.instanceId,
+            pid: identity.pid,
+            generationId: identity.generationId,
+            buildId: identity.buildId,
+            live: processIsLive(identity.pid),
+          } : undefined,
+          identityError: identityMatches ? undefined : "server identity does not match this launch generation/build",
+        };
+      }
       component.tracker.record(result);
       results[name] = result;
       if (!result.ok) healthy = false;

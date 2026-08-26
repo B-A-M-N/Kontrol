@@ -19,6 +19,7 @@ import { createHmac, timingSafeEqual } from "node:crypto";
  * @property {string} workspaceSessionId
  * @property {string} [runId]
  * @property {string} [continuationId]
+ * @property {string} [workspaceLeaseNonce]
  * @property {number} exp - epoch ms
  */
 

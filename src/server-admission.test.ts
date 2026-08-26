@@ -45,6 +45,21 @@ held();
 timeoutAdmission.close();
 assert.equal(timeoutAdmission.getStats().queued, 0);
 
+// A browser/tab/host can disappear while its request is waiting for a slot.
+// That waiter must leave immediately instead of occupying the bounded queue
+// until the admission deadline and delaying a later reconnect.
+const abortAdmission = new McpAdmission(1, 1, 1);
+const abortHeld = await abortAdmission.acquire("held", 100);
+assert.ok(abortHeld);
+const abortController = new AbortController();
+const abortedWaiter = abortAdmission.acquire("disconnected", 60_000, 1, abortController.signal);
+assert.equal(abortAdmission.getStats().queued, 1);
+abortController.abort();
+assert.equal(await abortedWaiter, null, "disconnected queued requests are cancelled immediately");
+assert.equal(abortAdmission.getStats().queued, 0, "aborted requests do not occupy admission capacity");
+abortHeld?.();
+abortAdmission.close();
+
 // Reliability fixture: a burst from 1,000 logical clients must remain bounded
 // in both active work and queued waiters. The remainder is rejected without
 // allocating an unbounded promise backlog.

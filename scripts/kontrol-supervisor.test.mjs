@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { allHealthy, FailureTracker, parseAgentSpecs } from "./kontrol-supervisor.mjs";
+import { adapterHealthReady, allHealthy, FailureTracker, parseAgentSpecs } from "./kontrol-supervisor.mjs";
 
 const specs = parseAgentSpecs("cli-coding-agent=http://127.0.0.1:9877,hermes-agent=http://127.0.0.1:9911");
 assert.deepEqual(specs, [
@@ -25,5 +25,8 @@ const health = await allHealthy("test", ["a", "b", "c"], async (url) => {
 assert.ok(performance.now() - probeStartedAt < 90, "independent supervisor probes run concurrently");
 assert.equal(health.ok, false);
 assert.deepEqual(health.results.map((result) => result.status), [200, 503, 200]);
+assert.equal(adapterHealthReady({ ok: true, ready: true, reconciled: true, lifecycle: "READY" }), true);
+assert.equal(adapterHealthReady({ ok: true, ready: true, reconciled: false, lifecycle: "READY" }), false);
+assert.equal(adapterHealthReady({ ok: false, ready: false, reconciled: true, lifecycle: "DEGRADED" }), false);
 
 console.log("kontrol-supervisor.test.mjs: all assertions passed");

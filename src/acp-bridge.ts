@@ -88,6 +88,8 @@ export interface BridgeConfig {
   connectionContinuationId?: string;
   /** Bound work session ID authenticated on this connection, when a dispatched worker reconnects. */
   connectionWorkSessionId?: string;
+  /** Checkout lease nonce authenticated on this worker connection. */
+  connectionWorkspaceLeaseNonce?: string;
   /**
    * Tracks which work sessions currently have a live agent parked inside
    * await_review_feedback. The continuation dispatcher consults this so it only
@@ -223,6 +225,12 @@ function assertWorkerSessionBinding(config: BridgeConfig, sessionId: string) {
   if (config.principalRole === "worker" && config.connectionWorkSessionId && sessionId !== config.connectionWorkSessionId) {
     return forbidden(config.principalRole, "cross-session access");
   }
+  if (config.principalRole === "worker" && config.connectionWorkSessionId === sessionId) {
+    const lease = config.workSessions.getWorkspaceLeaseForSession(sessionId);
+    if (lease && lease.leaseNonce !== config.connectionWorkspaceLeaseNonce) {
+      return forbidden(config.principalRole, "stale workspace lease");
+    }
+  }
   return null;
 }
 
@@ -265,6 +273,10 @@ async function acquireCheckoutModifyLease(config: BridgeConfig, workspaceSession
     },
     isError: true as const,
   };
+}
+
+function checkoutLeaseNonce(config: BridgeConfig, workSessionId: string): string | undefined {
+  return config.workSessions.getWorkspaceLeaseForSession(workSessionId)?.leaseNonce;
 }
 
 function parsePatchFiles(patch: string): Array<{ path: string; operation: "add" | "update" | "delete"; additions: number; removals: number }> {
@@ -781,6 +793,7 @@ export function registerBridgeTools(
           message: message ?? review.result,
           summaryJson: JSON.stringify(review.summary),
           files: review.summary.files,
+          changedFiles: review.files,
           additions: review.summary.additions,
           removals: review.summary.removals,
           snapshotCommit: review.snapshotCommit,
@@ -1045,7 +1058,7 @@ export function registerBridgeTools(
   async function dispatchAgentTask(input: {
     task: string;
     workspaceSessionId: string;
-    workSessionId?: string;
+    workSessionId: string;
     agentName?: string;
     completionPolicy?: "agent_completion" | "webui_approval_required";
     appendSessionInstructions?: boolean;
@@ -1061,16 +1074,7 @@ export function registerBridgeTools(
       if (!selection.agent) {
         throw new Error(`No healthy ACP agent named ${selectedAgentName} (role=agent) is registered.`);
       }
-      let wsId = input.workSessionId;
-      if (!wsId) {
-        const created = config.workSessions.create({
-          workspaceSessionId: input.workspaceSessionId,
-          submittedBy: "webui",
-          title: input.task.slice(0, 80),
-          completionPolicy: input.completionPolicy ?? "webui_approval_required",
-        });
-        wsId = created.id;
-      }
+      const wsId = input.workSessionId;
       const task = input.appendSessionInstructions === false
         ? input.task
         : `${input.task}\n\n${workSessionInstructions(wsId, selection.agent)}`;
@@ -1088,6 +1092,7 @@ export function registerBridgeTools(
           task,
           workspaceSessionId: input.workspaceSessionId,
           workSessionId: wsId,
+          workspaceLeaseNonce: checkoutLeaseNonce(config, wsId),
           mode: "async",
           fireAndForget: true,
         },
@@ -1249,44 +1254,73 @@ export function registerBridgeTools(
         config.workSessions.updateStatus(created.id, "cancelled");
         return leaseError;
       }
-      const mission = config.missionLedger.createMission({
-        workSessionId: created.id,
-        workspaceSessionId,
-        objective,
-        desiredOutcome,
-        constraints,
-        nonGoals,
-        acceptanceCriteria,
-        supervisorInstructions,
-        maxCorrectionRounds,
-        finalVerification,
-        reviewCoverage,
-        baselineCommit,
-      });
-      // Mission correction rounds are an evidence/convergence policy. They are
-      // deliberately not copied into the supervisor's emergency cycle guard;
-      // one supervisor cycle can include verification, evaluation, and a
-      // correction dispatch without being a failed correction round.
-      const supervisorRun = config.supervisorRuns?.create({ missionId: mission.id, workSessionId: created.id, workspaceSessionId, autonomyMode, approvalMode, maxWallTimeMs: maxWallTimeMinutes ? maxWallTimeMinutes * 60_000 : undefined });
-      config.missionLedger.createWorkOrder(mission.id, created.id, workOrder ?? { objectiveForThisTurn: objective });
-      const prompt = renderMissionPrompt(config, created.id, objective);
-      const dispatch = await dispatchAgentTask({
-        task: prompt,
-        workspaceSessionId,
-        workSessionId: created.id,
-        agentName,
-        appendSessionInstructions: true,
-      });
-      if (supervisorRun) config.supervisorRuns?.transition({ id: supervisorRun.id, expectedStatus: "created", expectedRevision: supervisorRun.revision, nextStatus: "worker_active" });
-      return {
-        content: [{ type: "text" as const, text: `Supervised work started in ${created.id}; worker status=${dispatch.result.status}.` }],
-        structuredContent: {
+      let mission: ReturnType<typeof config.missionLedger.createMission> | undefined;
+      let supervisorRun: ReturnType<NonNullable<typeof config.supervisorRuns>["create"]> | undefined;
+      try {
+        mission = config.missionLedger.createMission({
           workSessionId: created.id,
-          runId: dispatch.result.runId,
-          status: dispatch.result.status,
-          packet: await supervisorPacket(created.id),
-        },
-      };
+          workspaceSessionId,
+          objective,
+          desiredOutcome,
+          constraints,
+          nonGoals,
+          acceptanceCriteria,
+          supervisorInstructions,
+          maxCorrectionRounds,
+          finalVerification,
+          reviewCoverage,
+          baselineCommit,
+        });
+        // Mission correction rounds are an evidence/convergence policy. They
+        // are deliberately not copied into the supervisor's emergency cycle
+        // guard; one cycle can include verification and a correction dispatch.
+        supervisorRun = config.supervisorRuns?.create({ missionId: mission.id, workSessionId: created.id, workspaceSessionId, autonomyMode, approvalMode, maxWallTimeMs: maxWallTimeMinutes ? maxWallTimeMinutes * 60_000 : undefined });
+        config.missionLedger.createWorkOrder(mission.id, created.id, workOrder ?? { objectiveForThisTurn: objective });
+        const prompt = renderMissionPrompt(config, created.id, objective);
+        const dispatch = await dispatchAgentTask({
+          task: prompt,
+          workspaceSessionId,
+          workSessionId: created.id,
+          agentName,
+          appendSessionInstructions: true,
+        });
+        if (dispatch.result.status === "failed") {
+          throw new Error(dispatch.result.error ?? "ACP worker dispatch failed");
+        }
+        if (supervisorRun) config.supervisorRuns?.transition({ id: supervisorRun.id, expectedStatus: "created", expectedRevision: supervisorRun.revision, nextStatus: "worker_active" });
+        return {
+          content: [{ type: "text" as const, text: `Supervised work started in ${created.id}; worker status=${dispatch.result.status}.` }],
+          structuredContent: {
+            workSessionId: created.id,
+            runId: dispatch.result.runId,
+            status: dispatch.result.status,
+            packet: await supervisorPacket(created.id),
+          },
+        };
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        // Dispatch failure is a durable failed mission, not a half-created
+        // supervisor with a checkout fence left behind. Keep the mission and
+        // work order for diagnosis, then release every ownership record.
+        config.workSessions.updateStatus(created.id, "failed");
+        config.workSessions.releaseWorkspaceLeasesForSession(created.id);
+        if (supervisorRun) {
+          const current = config.supervisorRuns?.getByWorkSession(created.id);
+          if (current && !["failed", "cancelled", "completed"].includes(current.status)) {
+            config.supervisorRuns?.transition({ id: current.id, expectedStatus: current.status, expectedRevision: current.revision, nextStatus: "failed", lastError: reason });
+          }
+        }
+        config.eventStore.appendEvent({
+          type: "agent.run.failed",
+          sessionId: created.id,
+          payload: { reason, missionId: mission?.id, phase: "supervised_dispatch" },
+        });
+        return {
+          content: [{ type: "text" as const, text: `Supervised work failed before dispatch: ${reason}` }],
+          structuredContent: { workSessionId: created.id, runId: "", status: "failed", packet: await supervisorPacket(created.id) },
+          isError: true,
+        };
+      }
     },
   );
 
@@ -1810,6 +1844,7 @@ export function registerBridgeTools(
               : dispatchTask,
             workspaceSessionId: workspaceSessionId,
             workSessionId: wsId,
+            workspaceLeaseNonce: checkoutLeaseNonce(config, wsId),
             mode: "async",
             fireAndForget: true,
           },
@@ -3312,6 +3347,7 @@ export function registerBridgeTools(
         adapterSecret: config.adapterSecret,
       });
       if (!selection.agent) return { content: [{ type: "text" as const, text: `No healthy registered ACP agent named "${agentName}".` }], isError: true };
+      const createdWorkSession = !workSessionId;
       const wsId = workSessionId ?? config.workSessions.create({
         workspaceSessionId,
         submittedBy: "webui",
@@ -3334,12 +3370,16 @@ export function registerBridgeTools(
             task: `${task}\n\n${workSessionInstructions(wsId, selection.agent)}`,
             workspaceSessionId,
             workSessionId: wsId,
+            workspaceLeaseNonce: checkoutLeaseNonce(config, wsId),
             mode: "async",
             fireAndForget: true,
           },
         );
 
         if (result.status === "failed") {
+          if (createdWorkSession) config.workSessions.updateStatus(wsId, "failed");
+          config.workSessions.releaseWorkspaceLeasesForSession(wsId);
+          config.eventStore.appendEvent({ type: "agent.dispatch.failed", sessionId: wsId, payload: { runId: result.runId, reason: result.error ?? "ACP dispatch failed" } });
           return {
             content: [{ type: "text" as const, text: `${agentName}: failed\n${result.error ?? "(no error detail)"}` }],
             structuredContent: { runId: result.runId, workSessionId: wsId, workspaceSessionId, status: result.status, output: result.output, error: result.error },
@@ -3351,6 +3391,9 @@ export function registerBridgeTools(
           structuredContent: { runId: result.runId, workSessionId: wsId, workspaceSessionId, status: result.status, output: result.output, error: result.error },
         };
       } catch (error) {
+        if (createdWorkSession) config.workSessions.updateStatus(wsId, "failed");
+        config.workSessions.releaseWorkspaceLeasesForSession(wsId);
+        config.eventStore.appendEvent({ type: "agent.dispatch.failed", sessionId: wsId, payload: { reason: error instanceof Error ? error.message : String(error) } });
         return { content: [{ type: "text" as const, text: `Failed: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
       }
     },
@@ -3431,6 +3474,7 @@ export function registerBridgeTools(
           return { content: [{ type: "text" as const, text: resolved.error ?? "Unknown workspace." }], isError: true };
         }
         const resolvedWorkspaceSessionId = resolved.workspaceSessionId;
+        const createdWorkSession = !resolved.workSessionId;
         const resolvedWorkSessionId = resolved.workSessionId ?? config.workSessions.create({
           workspaceSessionId: resolvedWorkspaceSessionId,
           submittedBy: "webui",
@@ -3451,12 +3495,22 @@ export function registerBridgeTools(
               task: `${task}\n\n${workSessionInstructions(resolvedWorkSessionId, config.agentRegistry.listAlive().find((candidate) => candidate.name === agent.name))}`,
               workspaceSessionId: resolvedWorkspaceSessionId,
               workSessionId: resolvedWorkSessionId,
+              workspaceLeaseNonce: checkoutLeaseNonce(config, resolvedWorkSessionId),
               mode: "async",
               fireAndForget: true,
             },
           );
+          if (result.status === "failed") {
+            if (createdWorkSession) config.workSessions.updateStatus(resolvedWorkSessionId, "failed");
+            config.workSessions.releaseWorkspaceLeasesForSession(resolvedWorkSessionId);
+            config.eventStore.appendEvent({ type: "agent.dispatch.failed", sessionId: resolvedWorkSessionId, payload: { runId: result.runId, reason: result.error ?? "ACP dispatch failed" } });
+            return { content: [{ type: "text" as const, text: `${agent.name}: failed\n${result.error ?? "ACP dispatch failed"}` }], structuredContent: { runId: result.runId, workSessionId: resolvedWorkSessionId, workspaceSessionId: resolvedWorkspaceSessionId, status: result.status, output: result.output, error: result.error }, isError: true };
+          }
           return { content: [{ type: "text" as const, text: `${agent.name}: ${result.status}\n${result.output.slice(0, 5000)}` }], structuredContent: { runId: result.runId, workSessionId: resolvedWorkSessionId, workspaceSessionId: resolvedWorkspaceSessionId, status: result.status, output: result.output } };
         } catch (error) {
+          if (createdWorkSession) config.workSessions.updateStatus(resolvedWorkSessionId, "failed");
+          config.workSessions.releaseWorkspaceLeasesForSession(resolvedWorkSessionId);
+          config.eventStore.appendEvent({ type: "agent.dispatch.failed", sessionId: resolvedWorkSessionId, payload: { reason: error instanceof Error ? error.message : String(error) } });
           return { content: [{ type: "text" as const, text: `Failed: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
         }
       },

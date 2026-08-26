@@ -52,7 +52,12 @@ try {
   assert.deepEqual(new Set(combined), new Set(pagedIds), "surface cursor pages must cover sessions beyond the first 50");
 
   const raceSession = workSessions.create({ workspaceSessionId: secondWorkspace.id, submittedBy: "race-test" });
-  workSessions.submitForReview({ workSessionId: raceSession.id, diff: "first" });
+  workSessions.submitForReview({
+    workSessionId: raceSession.id,
+    diff: "diff --git a/quoted b/quoted",
+    files: [{ path: "src/quoted name.ts", type: "change", additions: 2, removals: 1 }],
+  });
+  assert.deepEqual(workSessions.getLatestSubmission(raceSession.id)?.files, [{ path: "src/quoted name.ts", type: "change", additions: 2, removals: 1 }]);
   assert.throws(
     () => workSessions.submitForReview({ workSessionId: raceSession.id, diff: "second" }),
     /cannot submit for review/,

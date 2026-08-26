@@ -10,7 +10,16 @@ export interface LoggingConfig {
   assets: boolean;
   toolCalls: boolean;
   shellCommands: boolean;
-  trustProxy: boolean;
+  /**
+   * Trusted-proxy specification (P1 #7). Replaces the old boolean model:
+   *   - undefined/false: no proxy is trusted; forwarded headers are ignored.
+   *   - a number as string (e.g. "1"): trust exactly N proxy hops — the
+   *     client address is taken N entries from the right of X-Forwarded-For,
+   *     so direct callers cannot spoof it past the configured hop count.
+   *   - "loopback": trust only loopback proxies (127.0.0.1/::1).
+   *   - "true" (legacy): trust all proxies — deprecated, logs a warning.
+   */
+  trustProxy?: string;
 }
 
 type LogFields = Record<string, unknown>;
@@ -52,13 +61,40 @@ export function logEvent(
   }
 }
 
-export function requestIp(req: Request, trustProxy: boolean): string | undefined {
-  if (trustProxy) {
-    const cfConnectingIp = firstHeaderValue(req.header("cf-connecting-ip"));
-    if (cfConnectingIp) return cfConnectingIp;
-
-    const forwardedFor = firstHeaderValue(req.header("x-forwarded-for"));
-    if (forwardedFor) return forwardedFor;
+/**
+ * Resolve the client IP honoring the trusted-proxy specification. Forwarded
+ * headers are only consulted when the spec says a proxy is present, and with
+ * a hop count the address is taken N from the RIGHT (nearest-to-us proxy
+ * appended last), so a direct caller cannot spoof past the configured trust.
+ */
+export function requestIp(req: Request, trustProxy: string | undefined): string | undefined {
+  const forwardedFor = firstHeaderValue(req.header("x-forwarded-for"));
+  if (trustProxy !== undefined && trustProxy !== "" && trustProxy !== "false" && trustProxy !== "0") {
+    const hopMatch = /^(\d+)$/.exec(trustProxy);
+    if (hopMatch) {
+      // Express-compatible: with `trust proxy` = N, req.ip is the Nth entry
+      // from the right of X-Forwarded-For. N=1 -> rightmost entry.
+      const hops = Number(hopMatch[1]);
+      const chain = (req.header("x-forwarded-for") ?? "")
+        .split(",")
+        .map((entry) => entry.trim())
+        .filter(Boolean);
+      if (chain.length >= hops) {
+        return chain[chain.length - hops];
+      }
+    } else if (trustProxy === "loopback") {
+      const remote = req.socket.remoteAddress ?? "";
+      const normalized = remote.replace(/^::ffff:/, "");
+      if (normalized === "127.0.0.1" || normalized === "::1") {
+        const cfConnectingIp = firstHeaderValue(req.header("cf-connecting-ip"));
+        if (cfConnectingIp) return cfConnectingIp;
+        if (forwardedFor) return forwardedFor;
+      }
+    } else { // "true" or other truthy legacy values: trust all (deprecated)
+      const cfConnectingIp = firstHeaderValue(req.header("cf-connecting-ip"));
+      if (cfConnectingIp) return cfConnectingIp;
+      if (forwardedFor) return forwardedFor;
+    }
   }
 
   return req.ip ?? req.socket.remoteAddress;

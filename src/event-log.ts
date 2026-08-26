@@ -122,6 +122,7 @@ export interface EventStore {
     afterSeq: number,
     predicate: EventPredicate,
     timeoutMs: number,
+    signal?: AbortSignal,
   ): Promise<EventStoreEvent | null>;
 
   close(): void;
@@ -491,18 +492,21 @@ export function createEventStore(
     afterSeq: number,
     predicate: EventPredicate,
     timeoutMs: number,
+    signal?: AbortSignal,
   ): Promise<EventStoreEvent | null> {
     return new Promise((resolve) => {
       let resolved = false;
 
       let timeout: ReturnType<typeof setTimeout> | undefined;
       let unsubscribe: (() => void) | undefined;
+      const abort = () => finish(null);
 
       const finish = (event: EventStoreEvent | null) => {
         if (resolved) return;
         resolved = true;
         if (timeout) clearTimeout(timeout);
         if (unsubscribe) unsubscribe();
+        signal?.removeEventListener("abort", abort);
         resolve(event);
       };
 
@@ -525,7 +529,12 @@ export function createEventStore(
         }
       }
 
-      timeout = setTimeout(() => finish(null), timeoutMs);
+      if (signal?.aborted) {
+        finish(null);
+        return;
+      }
+      signal?.addEventListener("abort", abort, { once: true });
+      if (Number.isFinite(timeoutMs)) timeout = setTimeout(() => finish(null), timeoutMs);
     });
   }
 

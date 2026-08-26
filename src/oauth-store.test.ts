@@ -85,6 +85,7 @@ async function testDatabaseConfiguration(stateDir: string): Promise<void> {
       { version: 42, name: "semantic-finding-deduplication" },
       { version: 43, name: "mission-review-coverage-uncertainty" },
       { version: 44, name: "agent-per-agent-credential" },
+      { version: 45, name: "submission-file-metadata" },
     ]);
   } finally {
     database.close();

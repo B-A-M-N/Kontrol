@@ -63,6 +63,7 @@ function sandboxArguments(
   args: string[],
   cwd: string,
   environment: Record<string, string>,
+  toolchainPaths: string[] = [],
 ): { command: string; args: string[] } {
   const bwrap = sandboxExecutable();
   const envArgs = Object.entries(environment).flatMap(([key, value]) => ["--setenv", key, value]);
@@ -78,6 +79,10 @@ function sandboxArguments(
       "--ro-bind-try", "/lib", "/lib",
       "--ro-bind-try", "/lib64", "/lib64",
       "--ro-bind-try", "/etc", "/etc",
+      ...toolchainPaths
+        .map((path) => resolve(path))
+        .filter((path) => existsSync(path))
+        .flatMap((path) => ["--ro-bind-try", path, path]),
       "--proc", "/proc",
       "--dev", "/dev",
       "--tmpfs", "/tmp",
@@ -158,13 +163,6 @@ function parsePositiveInteger(value: string | undefined, fallback: number): numb
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
 
-function changedPathsFromDiff(diff: string | undefined): string[] {
-  if (!diff) return [];
-  return [...diff.matchAll(/^diff --git a\/(.+?) b\/(.+?)$/gm)]
-    .flatMap((match) => [match[1], match[2]])
-    .filter((path, index, paths) => path && paths.indexOf(path) === index);
-}
-
 function pathMatchesAffectedArea(path: string, area: string): boolean {
   const normalizedPath = path.replace(/^\.\//, "");
   const normalizedArea = area.trim().replace(/^\.\//, "").replace(/^a\//, "").replace(/^b\//, "");
@@ -180,6 +178,8 @@ export async function runVerificationCommand(
   timeoutMs = 300_000,
   deadlineAtMs = Date.now() + timeoutMs,
   sandbox?: boolean,
+  childEnvironmentAllowlist?: string[],
+  toolchainPaths?: string[],
 ): Promise<Omit<VerificationResult, "criterionId" | "command">> {
   const { executable, args } = parseVerificationCommand(command);
   const startedAt = Date.now();
@@ -198,9 +198,9 @@ export async function runVerificationCommand(
     };
   }
   const sandboxEnabled = sandboxRequested({ sandbox });
-  const environment = buildChildEnvironment({ sandbox: sandboxEnabled });
+  const environment = buildChildEnvironment({ sandbox: sandboxEnabled, additionalKeys: childEnvironmentAllowlist });
   const launch = sandboxEnabled
-    ? sandboxArguments(executable, args, cwd, environment)
+    ? sandboxArguments(executable, args, cwd, environment, toolchainPaths)
     : { command: executable, args };
   return new Promise((resolve) => {
     const child = spawn(launch.command, launch.args, {
@@ -371,6 +371,8 @@ export async function verifyMissionSubmission(input: {
   /** P1 #22: injected configuration (parsed once in config.ts). */
   maxInflight?: number;
   sandbox?: boolean;
+  childEnvironmentAllowlist?: string[];
+  verifyToolchainPaths?: string[];
   /** Submission identity captured by the caller before dispatching verification. */
   submissionId?: string;
   reviewEpoch?: number;
@@ -439,7 +441,11 @@ export async function verifyMissionSubmission(input: {
   const explicitlySelected = input.criterionIds?.length ? new Set(input.criterionIds) : undefined;
   const requestedScope = input.verificationScope ?? (explicitlySelected ? "focused" : "full");
   const finalPhase = input.verificationPhase === "final";
-  const changedPaths = changedPathsFromDiff(latest.diff);
+  // Git's structured numstat metadata is the path protocol. Unified diffs are
+  // presentation data and are ambiguous for quoted, renamed, or newline
+  // containing paths. Missing metadata on legacy submissions is conservative:
+  // affected-area filters cannot skip checks.
+  const changedPaths = latest.files?.flatMap((file) => [file.path, file.previousPath].filter((path): path is string => Boolean(path))) ?? [];
   const scopeAllows = (criterion: typeof packet.criteria[number]): boolean => {
     if (requestedScope === "full") return true;
     if (requestedScope === "focused") return Boolean(explicitlySelected?.has(criterion.id));
@@ -525,7 +531,7 @@ export async function verifyMissionSubmission(input: {
           source: "reused_exact_snapshot",
         };
       } else {
-        result = await runVerificationCommand(command, verificationWorkspace.root, 300_000, deadlineAtMs, sandboxEnabled);
+        result = await runVerificationCommand(command, verificationWorkspace.root, 300_000, deadlineAtMs, sandboxEnabled, input.childEnvironmentAllowlist, input.verifyToolchainPaths);
       }
       await assertBinding();
       return recordResult(criterion, result);
@@ -591,7 +597,7 @@ export async function verifyMissionSubmission(input: {
             source: "reused_exact_snapshot",
           };
         } else {
-          result = await runVerificationCommand(command, verificationWorkspace.root, 300_000, deadlineAtMs, sandboxEnabled);
+          result = await runVerificationCommand(command, verificationWorkspace.root, 300_000, deadlineAtMs, sandboxEnabled, input.childEnvironmentAllowlist, input.verifyToolchainPaths);
         }
         await assertBinding();
       }

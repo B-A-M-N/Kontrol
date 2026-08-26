@@ -92,6 +92,7 @@ export interface ProcessSessionManagerOptions {
   idleTimeoutMs?: number;
   maxRuntimeMs?: number;
   reaperIntervalMs?: number;
+  childEnvironmentAllowlist?: string[];
 }
 
 export interface ProcessSessionMetrics {
@@ -125,8 +126,8 @@ function terminalSize(value: number | undefined, fallback: number): number {
   return value;
 }
 
-export function processEnvironment(): Record<string, string> {
-  return buildChildEnvironment();
+export function processEnvironment(additionalKeys?: Iterable<string>): Record<string, string> {
+  return buildChildEnvironment({ additionalKeys });
 }
 
 function codePointLength(value: string): number {
@@ -240,6 +241,7 @@ export class ProcessSessionManager {
   private readonly maxRunningProcessesPerOwner: number;
   private readonly idleTimeoutMs: number;
   private readonly maxRuntimeMs: number;
+  private readonly childEnvironmentAllowlist: string[];
   private readonly reaperTimer: NodeJS.Timeout;
 
   constructor(options: ProcessSessionManagerOptions = {}) {
@@ -249,6 +251,7 @@ export class ProcessSessionManager {
     this.maxRunningProcessesPerOwner = positiveLimit(options.maxRunningProcessesPerOwner, DEFAULT_MAX_RUNNING_PROCESSES_PER_OWNER, "maxRunningProcessesPerOwner");
     this.idleTimeoutMs = positiveLimit(options.idleTimeoutMs, DEFAULT_IDLE_TIMEOUT_MS, "idleTimeoutMs");
     this.maxRuntimeMs = positiveLimit(options.maxRuntimeMs, DEFAULT_MAX_RUNTIME_MS, "maxRuntimeMs");
+    this.childEnvironmentAllowlist = options.childEnvironmentAllowlist ?? [];
     const reaperIntervalMs = positiveLimit(options.reaperIntervalMs, DEFAULT_REAPER_INTERVAL_MS, "reaperIntervalMs");
     this.reaperTimer = setInterval(() => this.reapExpired(), reaperIntervalMs);
     this.reaperTimer.unref?.();
@@ -444,7 +447,7 @@ export class ProcessSessionManager {
     const detached = process.platform !== "win32";
     const child = spawn(input.command, {
       cwd: input.cwd,
-      env: processEnvironment(),
+      env: processEnvironment(this.childEnvironmentAllowlist),
       stdio: "pipe",
       windowsHide: true,
       detached,
@@ -475,7 +478,7 @@ export class ProcessSessionManager {
     try {
       pty = nodePty.spawn(shell.executable, shell.args, {
         cwd: input.cwd,
-        env: processEnvironment(),
+        env: processEnvironment(this.childEnvironmentAllowlist),
         name: "xterm-256color",
         cols: session.columns,
         rows: session.rows,

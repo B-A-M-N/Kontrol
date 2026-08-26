@@ -22,6 +22,8 @@ export interface RuntimeIdentity {
   buildTimestamp?: string;
   startedAt: string;
   command: string;
+  /** Launcher generation this server belongs to. */
+  generationId?: string;
 }
 
 export function runtimeIdentityPath(stateDir: string): string {
@@ -72,6 +74,9 @@ export function createRuntimeIdentity(
     ...(build.buildTimestamp ? { buildTimestamp: build.buildTimestamp } : {}),
     startedAt: new Date().toISOString(),
     command: command.slice(0, 2_000),
+    ...(process.env.KONTROL_LAUNCH_GENERATION_ID
+      ? { generationId: process.env.KONTROL_LAUNCH_GENERATION_ID }
+      : {}),
   };
   const path = runtimeIdentityPath(stateDir);
   const temporary = `${path}.${identity.instanceId}.tmp`;

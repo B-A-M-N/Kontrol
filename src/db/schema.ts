@@ -104,6 +104,8 @@ export const workSessionSubmissions = sqliteTable("work_session_submissions", {
   submissionNumber: integer("submission_number").notNull(),
   diff: text("diff"),
   diffSha256: text("diff_sha256"),
+  /** Structured file metadata captured by the checkpoint layer. */
+  filesJson: text("files_json"),
   /** Exact working-tree snapshot commit the diff was captured against. Bound to
    * the submission so approval can require the workspace to still equal this
    * tree (fixes stale-approval after a concurrent submission in the same
