@@ -161,6 +161,7 @@ interface McpSessionState {
   toolCallCount: number;
   resourceReadCount: number;
   activeLongPollCount: number;
+  activeSseStreams: number;
   closing: boolean;
   closed: boolean;
   endRecorded: boolean;
@@ -197,7 +198,7 @@ interface McpSessionMetrics {
 
 interface McpTimingSample {
   at: number;
-  admissionClass: "execution" | "waiter";
+  admissionClass: "execution" | "waiter" | "stream";
   admissionWaitMs: number;
   serverCreateMs: number;
   transportConnectMs: number;
@@ -434,9 +435,11 @@ export class McpAdmission {
     if (!Number.isInteger(maxQueue) || maxQueue < 0) throw new Error("maxQueue must be non-negative");
   }
 
-  getStats(): { active: number; queued: number; maxInflight: number; maxInflightPerKey: number; maxQueue: number } {
+  getStats(): { active: number; activeWeight: number; availableWeight: number; queued: number; maxInflight: number; maxInflightPerKey: number; maxQueue: number } {
     return {
       active: this.active,
+      activeWeight: this.activeWeight,
+      availableWeight: Math.max(0, this.maxInflight - this.activeWeight),
       queued: this.queue.length,
       maxInflight: this.maxInflight,
       maxInflightPerKey: this.maxInflightPerKey,
@@ -2566,6 +2569,8 @@ export function createServer(config = loadConfig()): RunningServer {
   };
   const mcpTimingSamples: McpTimingSample[] = [];
   const phaseTimingSamples: PhaseTimingSample[] = [];
+  const mcpCapacityRejectionsByTool = new Map<string, number>();
+  const mcpCapacityRejectionsByWeight = new Map<number, number>();
   const workspaceAppResourceMetrics: WorkspaceAppResourceMetrics = {
     currentHashed: 0,
     openAiCompatibility: 0,
@@ -2590,6 +2595,27 @@ export function createServer(config = loadConfig()): RunningServer {
     if (!Number.isFinite(durationMs) || durationMs < 0) return;
     phaseTimingSamples.push({ at: Date.now(), phase, durationMs });
     if (phaseTimingSamples.length > 5_000) phaseTimingSamples.splice(0, phaseTimingSamples.length - 5_000);
+  }
+
+  function recordMcpCapacityRejection(toolName: string | undefined, weight: number): void {
+    const toolKey = toolName || "rpc";
+    mcpCapacityRejectionsByTool.set(toolKey, (mcpCapacityRejectionsByTool.get(toolKey) ?? 0) + 1);
+    mcpCapacityRejectionsByWeight.set(weight, (mcpCapacityRejectionsByWeight.get(weight) ?? 0) + 1);
+  }
+
+  function mapNumberCounts<TKey extends string | number>(values: Map<TKey, number>): Record<string, number> {
+    return Object.fromEntries([...values.entries()].map(([key, count]) => [String(key), count]));
+  }
+
+  function mcpSseDiagnostics(): { active: number; byClient: Record<string, number> } {
+    const byClient = new Map<string, number>();
+    let active = 0;
+    for (const state of mcpSessions.values()) {
+      if (state.activeSseStreams <= 0) continue;
+      active += state.activeSseStreams;
+      byClient.set(state.logicalClientId, (byClient.get(state.logicalClientId) ?? 0) + state.activeSseStreams);
+    }
+    return { active, byClient: mapNumberCounts(byClient) };
   }
 
   function serveWorkspaceAppResource(
@@ -2681,8 +2707,10 @@ export function createServer(config = loadConfig()): RunningServer {
       handlerMs: by("handlerMs"),
       waiterRequests: requests.filter((sample) => sample.admissionClass === "waiter").length,
       executionRequests: requests.filter((sample) => sample.admissionClass === "execution").length,
+      streamRequests: requests.filter((sample) => sample.admissionClass === "stream").length,
       eventWaiterCount: waiterStats.active,
       waiterDurationMs: timingQuantiles(recent.filter((sample) => sample.admissionClass === "waiter").map((sample) => sample.totalMs)),
+      streamDurationMs: timingQuantiles(recent.filter((sample) => sample.admissionClass === "stream").map((sample) => sample.totalMs)),
       phaseTimings,
     };
   }
@@ -2885,7 +2913,7 @@ export function createServer(config = loadConfig()): RunningServer {
       const idle = now - state.lastActivityAt;
       const ttl = mcpSessionIdleTtl(state, config);
 
-      if (state.inFlightRequests > 0 || state.activeLongPollCount > 0 || state.closing || state.closed) continue;
+      if (state.inFlightRequests > 0 || state.activeLongPollCount > 0 || state.activeSseStreams > 0 || state.closing || state.closed) continue;
 
       if (idle >= ttl) {
         queueEviction(id, mcpSessionIdleReason(state));
@@ -2911,6 +2939,7 @@ export function createServer(config = loadConfig()): RunningServer {
             && !state.durableWorkerSession
             && state.inFlightRequests === 0
             && state.activeLongPollCount === 0
+            && state.activeSseStreams === 0
             && !state.closing
             && !state.closed
             && !evictionReasons.has(state.sessionId)
@@ -2925,7 +2954,7 @@ export function createServer(config = loadConfig()): RunningServer {
     // Per-client limit: evict oldest idle sessions beyond limit
     for (const [id, state] of mcpSessions) {
       if (toEvict.includes(id)) continue;
-      if (state.inFlightRequests > 0 || state.activeLongPollCount > 0 || state.closing || state.closed) continue;
+      if (state.inFlightRequests > 0 || state.activeLongPollCount > 0 || state.activeSseStreams > 0 || state.closing || state.closed) continue;
       const count = clientCounts.get(state.logicalClientId) ?? 0;
       if (count > config.mcpSessionMaxPerClient) {
         queueEviction(id, "per_client_limit");
@@ -2939,7 +2968,7 @@ export function createServer(config = loadConfig()): RunningServer {
       const candidates: Array<{ id: string; lastActivityAt: number }> = [];
       for (const [id, state] of mcpSessions) {
         if (toEvict.includes(id)) continue;
-        if (state.inFlightRequests > 0 || state.activeLongPollCount > 0 || state.closing || state.closed) continue;
+        if (state.inFlightRequests > 0 || state.activeLongPollCount > 0 || state.activeSseStreams > 0 || state.closing || state.closed) continue;
         candidates.push({ id, lastActivityAt: state.lastActivityAt });
       }
       candidates.sort((a, b) => a.lastActivityAt - b.lastActivityAt);
@@ -3376,6 +3405,16 @@ export function createServer(config = loadConfig()): RunningServer {
       detail: `${databaseIntegrity.detail}; ageMs=${Number.isFinite(integrityAgeMs) ? integrityAgeMs : "unknown"}; durationMs=${databaseIntegrity.durationMs}`,
     };
     checks.mcpHandler = { ok: true, detail: `HTTP handler is serving ${includeAgents ? "/readyz" : "/core-readyz"}` };
+    const executionAdmission = mcpAdmission.getStats();
+    checks.mcpExecutionAdmission = {
+      // Busy execution is healthy and must not make readiness flap. This
+      // check only detects an impossible accounting state that would strand
+      // capacity (negative counters or weight beyond the configured budget).
+      ok: executionAdmission.active >= 0
+        && executionAdmission.activeWeight >= 0
+        && executionAdmission.activeWeight <= executionAdmission.maxInflight,
+      detail: `active=${executionAdmission.active}; activeWeight=${executionAdmission.activeWeight}; availableWeight=${executionAdmission.availableWeight}; queued=${executionAdmission.queued}`,
+    };
     checks.workspaceRegistry = { ok: Boolean(workspaces && workspaceStore), detail: "workspace registry initialized" };
     checks.reviewSubsystem = { ok: Boolean(reviewWorkflow && workSessions && eventStore), detail: "review managers initialized" };
     checks.acpBridge = { ok: !config.acpEnabled || Boolean(dispatcher), detail: config.acpEnabled ? "dispatcher initialized" : "ACP disabled" };
@@ -3514,6 +3553,9 @@ export function createServer(config = loadConfig()): RunningServer {
       const pendingReviews = workSessions.countPendingReviews();
       const activeAcps = agentRegistry?.listAlive?.()?.length ?? 0;
       const totalMcpSessions = mcpSessions?.size ?? 0;
+      const executionAdmission = mcpAdmission.getStats();
+      const waiterAdmission = mcpWaiterAdmission.getStats();
+      const sse = mcpSseDiagnostics();
 
       // P0 #2: Comprehensive session/heap metrics
       const memUsage = process.memoryUsage();
@@ -3529,10 +3571,19 @@ export function createServer(config = loadConfig()): RunningServer {
         evicted: mcpSessionMetrics.evicted,
         current: totalMcpSessions,
         inFlight: [...mcpSessions.values()].reduce((sum, s) => sum + s.inFlightRequests, 0),
+        activeLongPolls: [...mcpSessions.values()].reduce((sum, s) => sum + s.activeLongPollCount, 0),
+        activeSseStreams: sse.active,
+        activeSseStreamsByClient: sse.byClient,
         admission: {
-          execution: mcpAdmission.getStats(),
-          waiter: mcpWaiterAdmission.getStats(),
+          execution: executionAdmission,
+          waiter: waiterAdmission,
         },
+        executionAdmission: {
+          ...executionAdmission,
+          capacityRejectionsByTool: mapNumberCounts(mcpCapacityRejectionsByTool),
+          capacityRejectionsByWeight: mapNumberCounts(mcpCapacityRejectionsByWeight),
+        },
+        waiterAdmission,
         timing: mcpTimingDiagnostics(),
         toolListDescriptorCache: toolListCacheDiagnostics()[0]?.metrics ?? { hits: 0, misses: 0 },
         workspaceAppResources: { ...workspaceAppResourceMetrics },
@@ -3567,6 +3618,7 @@ export function createServer(config = loadConfig()): RunningServer {
             toolCallCount: state.toolCallCount,
             resourceReadCount: state.resourceReadCount,
             activeLongPollCount: state.activeLongPollCount,
+            activeSseStreams: state.activeSseStreams,
             inFlightRequests: state.inFlightRequests,
             durableWorkerSession: state.durableWorkerSession,
             lastRpcMethod: state.lastRpcMethod,
@@ -3646,6 +3698,7 @@ export function createServer(config = loadConfig()): RunningServer {
     const initializeRequest = req.method === "POST" && isInitializeRequest(req.body);
     const requestRpcMethod = (req.body as { method?: string } | undefined)?.method;
     const requestToolName = (req.body as { params?: { name?: string } } | undefined)?.params?.name;
+    const requestIsSseStream = req.method === "GET" && Boolean(sessionId);
     const requestIsWaiter = requestRpcMethod === "tools/call" && (
       requestToolName === "await_review_feedback" ||
       requestToolName === "await_work_session_events" ||
@@ -3653,9 +3706,13 @@ export function createServer(config = loadConfig()): RunningServer {
       requestToolName === "await_workspace_events"
     );
     let admissionRelease: (() => void) | undefined;
-    let sessionLongPoll = false;
+    let sessionRequestClass: "execution" | "waiter" | "stream" | undefined;
     let admissionWaitMs = 0;
-    let admissionClass: "execution" | "waiter" = requestIsWaiter ? "waiter" : "execution";
+    let admissionClass: "execution" | "waiter" | "stream" = requestIsSseStream
+      ? "stream"
+      : requestIsWaiter
+        ? "waiter"
+        : "execution";
     let handlerStartedAt = 0;
     const requestAbort = new AbortController();
     const abortIfDisconnected = () => {
@@ -3765,7 +3822,10 @@ export function createServer(config = loadConfig()): RunningServer {
         }
         if (state) {
           state.lastActivityAt = Date.now();
-          state.inFlightRequests++;
+          sessionRequestClass = requestIsSseStream ? "stream" : requestIsWaiter ? "waiter" : "execution";
+          if (sessionRequestClass === "stream") state.activeSseStreams++;
+          else if (sessionRequestClass === "waiter") state.activeLongPollCount++;
+          else state.inFlightRequests++;
           state.requestCount++;
           const rpcMethod = (req.body as { method?: string })?.method;
           state.lastRpcMethod = rpcMethod;
@@ -3780,10 +3840,6 @@ export function createServer(config = loadConfig()): RunningServer {
             recordMcpWindowEvent("tool");
             const toolName = (req.body as { params?: { name?: string } })?.params?.name;
             state.lastToolName = toolName;
-            if (toolName === "await_review_feedback" || toolName === "await_work_session_events" || toolName === "await_work_session_terminal" || toolName === "await_workspace_events") {
-              state.activeLongPollCount++;
-              sessionLongPoll = true;
-            }
           }
         }
 
@@ -3793,7 +3849,6 @@ export function createServer(config = loadConfig()): RunningServer {
         // transport's per-session resource registry only contains the hash
         // from the build that created it.
         if (requestRpcMethod === "resources/read" && workspaceAppResourceKind((req.body as { params?: { uri?: unknown } })?.params?.uri)) {
-          if (state && state.inFlightRequests > 0) state.inFlightRequests--;
           if (state) state.lastActivityAt = Date.now();
           serveWorkspaceAppResource(
             res,
@@ -3870,6 +3925,7 @@ export function createServer(config = loadConfig()): RunningServer {
                 toolCallCount: 0,
                 resourceReadCount: 0,
                 activeLongPollCount: 0,
+                activeSseStreams: 0,
                 closing: false,
                 closed: false,
                 endRecorded: false,
@@ -4076,45 +4132,41 @@ export function createServer(config = loadConfig()): RunningServer {
         return;
       }
 
-      const admission = requestIsWaiter ? mcpWaiterAdmission : mcpAdmission;
-      admissionClass = requestIsWaiter ? "waiter" : "execution";
-      const admissionWeight = requestIsWaiter ? 1 : mcpAdmissionWeight(requestRpcMethod, requestToolName);
-      const admissionStartedAt = performance.now();
-      const acquiredAdmission = await admission.acquire(
-        sessionId ?? logicalClientId(req),
-        config.mcpAdmissionTimeoutMs,
-        admissionWeight,
-        requestAbort.signal,
-      );
-      admissionWaitMs = performance.now() - admissionStartedAt;
-      if (!acquiredAdmission) {
-        if (sessionId) {
-          const state = mcpSessions.get(sessionId);
-          if (state) {
-            if (state.inFlightRequests > 0) state.inFlightRequests--;
-            state.lastActivityAt = Date.now();
-          }
+      if (!requestIsSseStream) {
+        const admission = requestIsWaiter ? mcpWaiterAdmission : mcpAdmission;
+        admissionClass = requestIsWaiter ? "waiter" : "execution";
+        const admissionWeight = requestIsWaiter ? 1 : mcpAdmissionWeight(requestRpcMethod, requestToolName);
+        const admissionStartedAt = performance.now();
+        const acquiredAdmission = await admission.acquire(
+          sessionId ?? logicalClientId(req),
+          config.mcpAdmissionTimeoutMs,
+          admissionWeight,
+          requestAbort.signal,
+        );
+        admissionWaitMs = performance.now() - admissionStartedAt;
+        if (!acquiredAdmission) {
+          if (!requestIsWaiter) recordMcpCapacityRejection(requestToolName, admissionWeight);
+          logEvent(config.logging, "warn", "mcp_request_rejected", {
+            requestId,
+            reason: "admission_queue_full_or_deadline",
+            sessionIdPrefix: sessionIdPrefix(sessionId),
+            admissionClass,
+            admissionWaitMs: Math.round(admissionWaitMs),
+            admission: admission.getStats(),
+          });
+          return res.status(503).json({
+            jsonrpc: "2.0",
+            id: (req.body as { id?: unknown })?.id ?? null,
+            error: { code: -32029, message: "MCP request capacity is temporarily exhausted. Retry later." },
+          });
         }
-        logEvent(config.logging, "warn", "mcp_request_rejected", {
-          requestId,
-          reason: "admission_queue_full_or_deadline",
-          sessionIdPrefix: sessionIdPrefix(sessionId),
-          admissionClass,
-          admissionWaitMs: Math.round(admissionWaitMs),
-          admission: admission.getStats(),
-        });
-        return res.status(503).json({
-          jsonrpc: "2.0",
-          id: (req.body as { id?: unknown })?.id ?? null,
-          error: { code: -32029, message: "MCP request capacity is temporarily exhausted. Retry later." },
-        });
+        admissionRelease = acquiredAdmission;
+        res.setHeader("x-kontrol-admission-wait-ms", String(Math.round(admissionWaitMs)));
       }
-      admissionRelease = acquiredAdmission;
 
-      res.setHeader("x-kontrol-admission-wait-ms", String(Math.round(admissionWaitMs)));
       handlerStartedAt = performance.now();
       await mcpRequestContext.run({ signal: requestAbort.signal }, async () => {
-        if (mcpRequestHasExecutionDeadline(requestRpcMethod, requestToolName)) {
+        if (!requestIsSseStream && mcpRequestHasExecutionDeadline(requestRpcMethod, requestToolName)) {
           await handleMcpRequestWithDeadline(
             transport!,
             req,
@@ -4169,9 +4221,10 @@ export function createServer(config = loadConfig()): RunningServer {
       // Decrement in-flight count after response completes or is aborted.
       if (sessionId) {
         const state = mcpSessions.get(sessionId);
-        if (state) {
-          if (state.inFlightRequests > 0) state.inFlightRequests--;
-          if (sessionLongPoll && state.activeLongPollCount > 0) state.activeLongPollCount--;
+        if (state && sessionRequestClass) {
+          if (sessionRequestClass === "stream" && state.activeSseStreams > 0) state.activeSseStreams--;
+          else if (sessionRequestClass === "waiter" && state.activeLongPollCount > 0) state.activeLongPollCount--;
+          else if (sessionRequestClass === "execution" && state.inFlightRequests > 0) state.inFlightRequests--;
           state.lastActivityAt = Date.now();
         }
       }

@@ -118,8 +118,15 @@ The response includes rolling 15-minute p50/p95/p99 histograms. Use
 `mcpSessionMetrics.timing.phaseTimings` to distinguish MCP setup/handler time,
 workspace snapshot/surface queries, review-diff retrieval, ACP dispatch startup,
 event-waiter duration, SQLite commit/compaction, and agent first-event/interval
-latency. `mcpSessionMetrics.workspaceAppResources` counts current hashed,
-OpenAI compatibility, legacy Kontrol, and DevDesktop migration resource hits.
+latency. Persistent sessionful MCP GET/SSE streams are tracked separately from
+finite tool execution and application-level event waiters: `inFlight` counts
+finite execution only, while `activeLongPolls`, `activeSseStreams`, and
+`activeSseStreamsByClient` expose the other two categories. The
+`executionAdmission` object reports active/available weight, queue depth,
+capacity rejections by tool and weight, and the `waiterAdmission` object reports
+the independent parked-wait budget. `mcpSessionMetrics.workspaceAppResources`
+counts current hashed, OpenAI compatibility, legacy Kontrol, and DevDesktop
+migration resource hits.
 
 The managed tunnel launcher keeps OAuth protected-resource discovery enabled but
 disables Harpoon loopback auto-registration by default. Set
