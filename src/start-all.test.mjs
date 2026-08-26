@@ -38,6 +38,9 @@ const effectiveTunnelArgs = execFileSync("bash", ["scripts/kontrol-tunnel.sh", "
 assert.ok(effectiveTunnelArgs.includes("--harpoon.hosts-include-loopback=false"));
 assert.ok(!effectiveTunnelArgs.includes("--harpoon.hosts-include-loopback"));
 assert.match(script, /-c "\$DESKTOP_PWD"/);
+assert.match(script, /KONTROL_SERVER_LOG/);
+assert.match(script, /server exited before readiness/);
+assert.match(script, /Kontrol server log:/);
 assert.match(script, /kontrol-adapter-crush/);
 assert.match(script, /kontrol-adapter-hermes/);
 assert.match(script, /kontrol-adapter-hermes\.log/);
