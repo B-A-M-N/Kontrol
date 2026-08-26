@@ -215,6 +215,7 @@ DEV_PORT="${PORT:-7676}"
 CRUSH_ACP_PORT="${ACP_ADAPTER_PORT:-9877}"
 HERMES_ACP_PORT="${HERMES_ACP_ADAPTER_PORT:-9911}"
 HERMES_ACP_COMPAT_PATH="$DESKTOP_PWD/scripts/hermes-acp-compat"
+SERVER_LOG="${KONTROL_SERVER_LOG:-${TMPDIR:-/tmp}/kontrol-server-$(date +%Y%m%d-%H%M%S)-$$.log}"
 CRUSH_ADAPTER_LOG="${TMPDIR:-/tmp}/kontrol-adapter-crush.log"
 HERMES_ADAPTER_LOG="${TMPDIR:-/tmp}/kontrol-adapter-hermes.log"
 START_CRUSH_ADAPTER="${START_CRUSH_ADAPTER:-true}"
@@ -284,13 +285,26 @@ fi
 
 # --- Start Kontrol ---
 echo "[*] Starting kontrol MCP server on ${DEV_HOST}:${DEV_PORT}/mcp ..."
-tmux new-session -d -s kontrol-server -c "$DESKTOP_PWD" "set -a && source .env && set +a && ${SERVER_AGENT_EXPORT} exec node dist/cli.js serve"
+printf -v SERVER_LOG_QUOTED '%q' "$SERVER_LOG"
+tmux new-session -d -s kontrol-server -c "$DESKTOP_PWD" "set -a && source .env && set +a && ${SERVER_AGENT_EXPORT} exec node dist/cli.js serve >>${SERVER_LOG_QUOTED} 2>&1"
 LAUNCHED_SESSIONS+=("kontrol-server")
+echo "[*] Kontrol server log: $SERVER_LOG"
 
 # Mandatory: liveness + discovery before anything downstream
 echo -n "[*] Waiting for kontrol to serve"
 DEV_READY=0
 for _ in $(seq 1 60); do
+  if ! tmux has-session -t kontrol-server 2>/dev/null; then
+    echo ""
+    echo "ERROR: kontrol server exited before readiness." >&2
+    echo "Kontrol server log: $SERVER_LOG" >&2
+    if [[ -s "$SERVER_LOG" ]]; then
+      tail -n 120 "$SERVER_LOG" >&2 || true
+    else
+      echo "(server log is empty)" >&2
+    fi
+    exit 1
+  fi
   D=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 "http://${DEV_HOST}:${DEV_PORT}/healthz" 2>/dev/null || echo 000)
   R=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 "http://${DEV_HOST}:${DEV_PORT}/core-readyz" 2>/dev/null || echo 000)
   W=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 "http://${DEV_HOST}:${DEV_PORT}/.well-known/oauth-protected-resource" 2>/dev/null || echo 000)
@@ -303,6 +317,12 @@ done
 if [[ "$DEV_READY" != "1" ]]; then
   echo ""
   echo "ERROR: kontrol did not serve /healthz + /core-readyz + discovery in time (healthz=$D core-readyz=$R discovery=$W)." >&2
+  echo "Kontrol server log: $SERVER_LOG" >&2
+  if [[ -s "$SERVER_LOG" ]]; then
+    tail -n 120 "$SERVER_LOG" >&2 || true
+  else
+    echo "(server log is empty; the process may still be blocked before logging)" >&2
+  fi
   exit 1
 fi
 echo " kontrol ready."
