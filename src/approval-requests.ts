@@ -21,6 +21,15 @@ export interface ApprovalRequest {
   runId?: string;
   agentId?: string;
   principalId?: string;
+  approvalKey?: string;
+  mcpSessionId?: string;
+  mcpRequestId?: string;
+  waiterKey?: string;
+  /** Identity of the LIVE waiter currently attached to this row, or undefined
+   *  if no caller is waiting right now. A durable card can outlive its
+   *  current live waiter (P0.3); a future live invocation with the same
+   *  row key can reattach. */
+  liveWaiterId?: string;
   title: string;
   description?: string;
   risk?: string;
@@ -44,6 +53,11 @@ export interface CreateApprovalRequestInput {
   runId?: string;
   agentId?: string;
   principalId?: string;
+  approvalKey?: string;
+  mcpSessionId?: string;
+  mcpRequestId?: string;
+  waiterKey?: string;
+  liveWaiterId?: string;
   title: string;
   description?: string;
   risk?: string;
@@ -84,6 +98,11 @@ export function createApprovalRequestManager(
       runId: input.runId,
       agentId: input.agentId,
       principalId: input.principalId,
+      approvalKey: input.approvalKey,
+      mcpSessionId: input.mcpSessionId,
+      mcpRequestId: input.mcpRequestId,
+      waiterKey: input.waiterKey,
+      liveWaiterId: input.liveWaiterId,
       title: input.title,
       description: input.description,
       risk: input.risk,
@@ -110,6 +129,11 @@ export function createApprovalRequestManager(
       runId: request.runId ?? null,
       agentId: request.agentId ?? null,
       principalId: request.principalId ?? null,
+      approvalKey: request.approvalKey ?? null,
+      mcpSessionId: request.mcpSessionId ?? null,
+      mcpRequestId: request.mcpRequestId ?? null,
+      waiterKey: request.waiterKey ?? null,
+      liveWaiterId: request.liveWaiterId ?? null,
       title: request.title,
       description: request.description ?? null,
       risk: request.risk ?? null,
@@ -230,6 +254,11 @@ function rowToApproval(row: ApprovalRequestRow): ApprovalRequest {
     runId: row.runId ?? undefined,
     agentId: row.agentId ?? undefined,
     principalId: row.principalId ?? undefined,
+    approvalKey: row.approvalKey ?? undefined,
+    mcpSessionId: row.mcpSessionId ?? undefined,
+    mcpRequestId: row.mcpRequestId ?? undefined,
+    waiterKey: row.waiterKey ?? undefined,
+    liveWaiterId: row.liveWaiterId ?? undefined,
     title: row.title,
     description: row.description ?? undefined,
     risk: row.risk ?? undefined,

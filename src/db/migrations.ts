@@ -54,10 +54,30 @@ const migrations: Migration[] = [
   { version: 43, name: "mission-review-coverage-uncertainty", up: migrateMissionReviewCoverageUncertainty },
   { version: 44, name: "agent-per-agent-credential", up: migrateAgentPerAgentCredential },
   { version: 45, name: "submission-file-metadata", up: migrateSubmissionFileMetadata },
+  { version: 46, name: "policy-approval-waiter-identity", up: migratePolicyApprovalWaiterIdentity },
+  { version: 47, name: "policy-approval-live-waiter", up: migratePolicyApprovalLiveWaiter },
 ];
 
 function migrateSubmissionFileMetadata(sqlite: Database.Database): void {
   addColumnIfMissing(sqlite, "work_session_submissions", "files_json", "text");
+}
+
+function migratePolicyApprovalWaiterIdentity(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "approval_requests", "approval_key", "text");
+  addColumnIfMissing(sqlite, "approval_requests", "mcp_session_id", "text");
+  addColumnIfMissing(sqlite, "approval_requests", "mcp_request_id", "text");
+  addColumnIfMissing(sqlite, "approval_requests", "waiter_key", "text");
+  sqlite.exec("create index if not exists approval_requests_waiter_key_idx on approval_requests(waiter_key, status)");
+}
+
+/**
+ * P0.3/P0.4: durable approval rows now also store the live waiter id so a
+ * reconnecting MCP request can reattach to the same card and resume under
+ * the eventual reviewer decision. The card itself lives longer than the
+ * caller; the live waiter id marks whether ANY caller is currently attached.
+ */
+function migratePolicyApprovalLiveWaiter(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "approval_requests", "live_waiter_id", "text");
 }
 
 /** Canonical current schema version — readiness requires exact equality. */

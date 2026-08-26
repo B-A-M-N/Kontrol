@@ -62,7 +62,7 @@ import { LATEST_SCHEMA_VERSION } from "./db/migrations.js";
 import { createPolicyEngine, type PolicyConfig, type PolicyEngine, type ApprovalScope } from "./policy.js";
 import { createSqliteGrantStore } from "./policy-grants.js";
 import { registerPolicyTools } from "./policy-tools.js";
-import { createPolicyEnforcer, type PolicyInvocation, type PolicyEnforcer, ACP_TOOL_POLICY_NAMES, type PrincipalRole } from "./policy-enforcement.js";
+import { createPolicyEnforcer, type PolicyInvocation, type PolicyEnforcer, type PolicyWaitContext, type PolicyWaitOutcome, ACP_TOOL_POLICY_NAMES, type PrincipalRole } from "./policy-enforcement.js";
 import { authorizeWorkSessionAction } from "./work-session-action-guard.js";
 import { verifyWorkerToken, type WorkerTokenClaims } from "./acp-worker-token.mjs";
 import { createApprovalRequestManager } from "./approval-requests.js";
@@ -140,10 +140,22 @@ function resolveMcpMemoryBudget(): number {
 
 type Transport = StreamableHTTPServerTransport;
 
-const mcpRequestContext = new AsyncLocalStorage<{ signal: AbortSignal }>();
+interface McpRequestContext {
+  signal: AbortSignal;
+  mcpSessionId?: string;
+  mcpRequestId?: string;
+  onPolicyWaitStart?: (context: PolicyWaitContext) => void | Promise<void>;
+  onPolicyWaitEnd?: (context: PolicyWaitContext & { outcome: PolicyWaitOutcome }) => void | Promise<void>;
+}
+
+const mcpRequestContext = new AsyncLocalStorage<McpRequestContext>();
 
 function currentMcpRequestSignal(): AbortSignal | undefined {
   return mcpRequestContext.getStore()?.signal;
+}
+
+function currentMcpRequestContext(): McpRequestContext | undefined {
+  return mcpRequestContext.getStore();
 }
 
 interface McpSessionState {
@@ -162,12 +174,28 @@ interface McpSessionState {
   resourceReadCount: number;
   activeLongPollCount: number;
   activeSseStreams: number;
+  activePolicyWaiters: number;
   closing: boolean;
   closed: boolean;
   endRecorded: boolean;
   durableWorkerSession: boolean;
   lastRpcMethod?: string;
   lastToolName?: string;
+}
+
+interface McpPolicyWaiter {
+  id: string;
+  approvalId: string;
+  waiterKey: string;
+  principalId: string;
+  workspaceId: string;
+  workSessionId?: string;
+  tool: string;
+  mcpSessionId?: string;
+  mcpRequestId?: string;
+  startedAt: number;
+  signal: AbortSignal;
+  cancel: () => void;
 }
 
 type McpSessionWindowKind = "created" | "closed" | "expired" | "tool";
@@ -373,6 +401,13 @@ class McpExecutionTimeoutError extends Error {
   constructor(public readonly timeoutMs: number) {
     super(`MCP request exceeded the ${timeoutMs}ms execution deadline`);
     this.name = "McpExecutionTimeoutError";
+  }
+}
+
+class McpAdmissionUnavailableError extends Error {
+  constructor() {
+    super("MCP execution capacity was unavailable after policy approval");
+    this.name = "McpAdmissionUnavailableError";
   }
 }
 
@@ -822,6 +857,10 @@ async function enforceToolPolicy(
     paths,
     command,
     signal: currentMcpRequestSignal(),
+    mcpSessionId: currentMcpRequestContext()?.mcpSessionId,
+    mcpRequestId: currentMcpRequestContext()?.mcpRequestId,
+    onPolicyWaitStart: currentMcpRequestContext()?.onPolicyWaitStart,
+    onPolicyWaitEnd: currentMcpRequestContext()?.onPolicyWaitEnd,
   });
   return allowed;
 }
@@ -2546,6 +2585,11 @@ export function createServer(config = loadConfig()): RunningServer {
   const buildMeta = readBuildIdentity(join(dirname(fileURLToPath(import.meta.url)), "build-meta.json"));
   const transports = new Map<string, Transport>();
   const mcpSessions = new Map<string, McpSessionState>();
+  const mcpPolicyWaiters = new Map<string, McpPolicyWaiter>();
+  let policyWaiterDisconnects = 0;
+  let policyWaiterResumes = 0;
+  let lastPolicyWaiterDisconnectAt: number | undefined;
+  let lastPolicyWaiterResumeAt: number | undefined;
   let shuttingDown = false;
   const mcpAdmission = new McpAdmission(
     config.mcpMaxInflight,
@@ -2597,10 +2641,13 @@ export function createServer(config = loadConfig()): RunningServer {
     if (phaseTimingSamples.length > 5_000) phaseTimingSamples.splice(0, phaseTimingSamples.length - 5_000);
   }
 
-  function recordMcpCapacityRejection(toolName: string | undefined, weight: number): void {
+  let lastMcpCapacityRejection: { tool?: string; weight: number; requestId?: string; at: string } | undefined;
+
+  function recordMcpCapacityRejection(toolName: string | undefined, weight: number, requestId?: string): void {
     const toolKey = toolName || "rpc";
     mcpCapacityRejectionsByTool.set(toolKey, (mcpCapacityRejectionsByTool.get(toolKey) ?? 0) + 1);
     mcpCapacityRejectionsByWeight.set(weight, (mcpCapacityRejectionsByWeight.get(weight) ?? 0) + 1);
+    lastMcpCapacityRejection = { tool: toolName, weight, requestId, at: new Date().toISOString() };
   }
 
   function mapNumberCounts<TKey extends string | number>(values: Map<TKey, number>): Record<string, number> {
@@ -2616,6 +2663,45 @@ export function createServer(config = loadConfig()): RunningServer {
       byClient.set(state.logicalClientId, (byClient.get(state.logicalClientId) ?? 0) + state.activeSseStreams);
     }
     return { active, byClient: mapNumberCounts(byClient) };
+  }
+
+  function cancelMcpPolicyWaitersForSession(sessionId: string, _reason: string, requestId?: string): number {
+    let cancelled = 0;
+    for (const waiter of mcpPolicyWaiters.values()) {
+      if (waiter.mcpSessionId !== sessionId) continue;
+      if (requestId && waiter.mcpRequestId !== requestId) continue;
+      if (waiter.signal.aborted) continue;
+      waiter.cancel();
+      cancelled++;
+    }
+    return cancelled;
+  }
+
+  function policyWaiterDiagnostics() {
+    const byWorkspace = new Map<string, number>();
+    const bySession = new Map<string, number>();
+    let oldestStartedAt = Number.POSITIVE_INFINITY;
+    for (const waiter of mcpPolicyWaiters.values()) {
+      byWorkspace.set(waiter.workspaceId, (byWorkspace.get(waiter.workspaceId) ?? 0) + 1);
+      const sessionKey = waiter.mcpSessionId ?? "none";
+      bySession.set(sessionKey, (bySession.get(sessionKey) ?? 0) + 1);
+      oldestStartedAt = Math.min(oldestStartedAt, waiter.startedAt);
+    }
+    const pendingPolicyApprovals = approvalRequests.listPending().filter((request) => request.kind === "tool");
+    const liveApprovalIds = new Set([...mcpPolicyWaiters.values()].map((waiter) => waiter.approvalId));
+    return {
+      activePolicyWaiters: mcpPolicyWaiters.size,
+      policyWaitersByWorkspace: mapNumberCounts(byWorkspace),
+      policyWaitersByMcpSession: mapNumberCounts(bySession),
+      oldestPolicyWaitMs: Number.isFinite(oldestStartedAt) ? Math.max(0, Date.now() - oldestStartedAt) : 0,
+      pendingApprovalRows: pendingPolicyApprovals.length,
+      orphanedPendingApprovals: pendingPolicyApprovals.filter((approval) => !liveApprovalIds.has(approval.approvalId)).length,
+      suspendedExecutionRequests: mcpPolicyWaiters.size,
+      policyWaiterDisconnects,
+      policyWaiterResumes,
+      lastPolicyWaiterDisconnectAt: lastPolicyWaiterDisconnectAt ? new Date(lastPolicyWaiterDisconnectAt).toISOString() : undefined,
+      lastPolicyWaiterResumeAt: lastPolicyWaiterResumeAt ? new Date(lastPolicyWaiterResumeAt).toISOString() : undefined,
+    };
   }
 
   function serveWorkspaceAppResource(
@@ -2913,7 +2999,7 @@ export function createServer(config = loadConfig()): RunningServer {
       const idle = now - state.lastActivityAt;
       const ttl = mcpSessionIdleTtl(state, config);
 
-      if (state.inFlightRequests > 0 || state.activeLongPollCount > 0 || state.activeSseStreams > 0 || state.closing || state.closed) continue;
+      if (state.inFlightRequests > 0 || state.activeLongPollCount > 0 || state.activeSseStreams > 0 || state.activePolicyWaiters > 0 || state.closing || state.closed) continue;
 
       if (idle >= ttl) {
         queueEviction(id, mcpSessionIdleReason(state));
@@ -2940,6 +3026,7 @@ export function createServer(config = loadConfig()): RunningServer {
             && state.inFlightRequests === 0
             && state.activeLongPollCount === 0
             && state.activeSseStreams === 0
+            && state.activePolicyWaiters === 0
             && !state.closing
             && !state.closed
             && !evictionReasons.has(state.sessionId)
@@ -2954,7 +3041,7 @@ export function createServer(config = loadConfig()): RunningServer {
     // Per-client limit: evict oldest idle sessions beyond limit
     for (const [id, state] of mcpSessions) {
       if (toEvict.includes(id)) continue;
-      if (state.inFlightRequests > 0 || state.activeLongPollCount > 0 || state.activeSseStreams > 0 || state.closing || state.closed) continue;
+      if (state.inFlightRequests > 0 || state.activeLongPollCount > 0 || state.activeSseStreams > 0 || state.activePolicyWaiters > 0 || state.closing || state.closed) continue;
       const count = clientCounts.get(state.logicalClientId) ?? 0;
       if (count > config.mcpSessionMaxPerClient) {
         queueEviction(id, "per_client_limit");
@@ -2968,7 +3055,7 @@ export function createServer(config = loadConfig()): RunningServer {
       const candidates: Array<{ id: string; lastActivityAt: number }> = [];
       for (const [id, state] of mcpSessions) {
         if (toEvict.includes(id)) continue;
-        if (state.inFlightRequests > 0 || state.activeLongPollCount > 0 || state.activeSseStreams > 0 || state.closing || state.closed) continue;
+        if (state.inFlightRequests > 0 || state.activeLongPollCount > 0 || state.activeSseStreams > 0 || state.activePolicyWaiters > 0 || state.closing || state.closed) continue;
         candidates.push({ id, lastActivityAt: state.lastActivityAt });
       }
       candidates.sort((a, b) => a.lastActivityAt - b.lastActivityAt);
@@ -2984,6 +3071,7 @@ export function createServer(config = loadConfig()): RunningServer {
         state.closing = true;
         recordMcpSessionEnd(state, "expired", now);
       }
+      cancelMcpPolicyWaitersForSession(id, "session_expired");
       mcpSessions.delete(id);
       transports.delete(id);
       mcpSessionMetrics.evicted++;
@@ -3572,16 +3660,19 @@ export function createServer(config = loadConfig()): RunningServer {
         current: totalMcpSessions,
         inFlight: [...mcpSessions.values()].reduce((sum, s) => sum + s.inFlightRequests, 0),
         activeLongPolls: [...mcpSessions.values()].reduce((sum, s) => sum + s.activeLongPollCount, 0),
+        activePolicyWaiters: [...mcpSessions.values()].reduce((sum, s) => sum + s.activePolicyWaiters, 0),
         activeSseStreams: sse.active,
         activeSseStreamsByClient: sse.byClient,
+        policyWaiters: policyWaiterDiagnostics(),
         admission: {
           execution: executionAdmission,
           waiter: waiterAdmission,
         },
-        executionAdmission: {
-          ...executionAdmission,
-          capacityRejectionsByTool: mapNumberCounts(mcpCapacityRejectionsByTool),
-          capacityRejectionsByWeight: mapNumberCounts(mcpCapacityRejectionsByWeight),
+          executionAdmission: {
+            ...executionAdmission,
+            capacityRejectionsByTool: mapNumberCounts(mcpCapacityRejectionsByTool),
+            capacityRejectionsByWeight: mapNumberCounts(mcpCapacityRejectionsByWeight),
+            lastRejection: lastMcpCapacityRejection,
         },
         waiterAdmission,
         timing: mcpTimingDiagnostics(),
@@ -3619,6 +3710,7 @@ export function createServer(config = loadConfig()): RunningServer {
             resourceReadCount: state.resourceReadCount,
             activeLongPollCount: state.activeLongPollCount,
             activeSseStreams: state.activeSseStreams,
+            activePolicyWaiters: state.activePolicyWaiters,
             inFlightRequests: state.inFlightRequests,
             durableWorkerSession: state.durableWorkerSession,
             lastRpcMethod: state.lastRpcMethod,
@@ -3707,6 +3799,8 @@ export function createServer(config = loadConfig()): RunningServer {
     );
     let admissionRelease: (() => void) | undefined;
     let sessionRequestClass: "execution" | "waiter" | "stream" | undefined;
+    let sessionExecutionCounted = false;
+    let policyWaiterId: string | undefined;
     let admissionWaitMs = 0;
     let admissionClass: "execution" | "waiter" | "stream" = requestIsSseStream
       ? "stream"
@@ -3718,13 +3812,101 @@ export function createServer(config = loadConfig()): RunningServer {
     const abortIfDisconnected = () => {
       if (!res.writableFinished) requestAbort.abort();
     };
+    // P0.2: catch BOTH the request-level abort (req.once aborted) AND the
+    // underlying socket close. The latter fires earlier when a tunnel proxy
+    // silently drops the connection without sending a final response, which
+    // is the precise scenario the live audit surfaced. Cancelling on socket
+    // close alone is safe because the requestAbort signal is observed by
+    // every downstream caller (admission queue, policy enforcer, event-log
+    // waiters) and they all no-op on a duplicated abort.
     req.once("aborted", abortIfDisconnected);
     res.once("close", abortIfDisconnected);
+    req.socket?.once("close", abortIfDisconnected);
     res.once("finish", () => {
       const finishedAt = performance.now();
       recordPhaseTiming("mcp.response", finishedAt - requestStartedAt);
       if (handlerStartedAt > 0) recordPhaseTiming("mcp.serialization", finishedAt - handlerStartedAt);
     });
+
+    const restoreSessionExecutionCount = (): void => {
+      if (!sessionId || sessionRequestClass !== "execution" || sessionExecutionCounted) return;
+      const state = mcpSessions.get(sessionId);
+      if (!state) return;
+      state.inFlightRequests++;
+      sessionExecutionCounted = true;
+    };
+    const removePolicyWaiter = (): McpPolicyWaiter | undefined => {
+      if (!policyWaiterId) return undefined;
+      const waiter = mcpPolicyWaiters.get(policyWaiterId);
+      mcpPolicyWaiters.delete(policyWaiterId);
+      policyWaiterId = undefined;
+      const state = sessionId ? mcpSessions.get(sessionId) : undefined;
+      if (state && state.activePolicyWaiters > 0) state.activePolicyWaiters--;
+      return waiter;
+    };
+    const onPolicyWaitStart = async (context: PolicyWaitContext): Promise<void> => {
+      if (requestAbort.signal.aborted) return;
+      admissionRelease?.();
+      admissionRelease = undefined;
+      if (sessionId && sessionRequestClass === "execution" && sessionExecutionCounted) {
+        const state = mcpSessions.get(sessionId);
+        if (state && state.inFlightRequests > 0) state.inFlightRequests--;
+        sessionExecutionCounted = false;
+      }
+      const id = `${requestId ?? randomUUID()}:${context.approvalId}:${randomUUID()}`;
+      policyWaiterId = id;
+      const state = sessionId ? mcpSessions.get(sessionId) : undefined;
+      if (state) state.activePolicyWaiters++;
+      mcpPolicyWaiters.set(id, {
+        id,
+        approvalId: context.approvalId,
+        waiterKey: context.waiterKey,
+        principalId: context.principalId,
+        workspaceId: context.workspaceId,
+        workSessionId: context.workSessionId,
+        tool: context.tool,
+        mcpSessionId: context.mcpSessionId,
+        mcpRequestId: context.mcpRequestId,
+        startedAt: Date.now(),
+        signal: requestAbort.signal,
+        cancel: () => requestAbort.abort(),
+      });
+    };
+    const onPolicyWaitEnd = async (context: PolicyWaitContext & { outcome: PolicyWaitOutcome }): Promise<void> => {
+      const waiter = removePolicyWaiter();
+      if (context.outcome === "cancelled" && requestAbort.signal.aborted) {
+        policyWaiterDisconnects++;
+        lastPolicyWaiterDisconnectAt = Date.now();
+      }
+      if (context.outcome !== "approved") {
+        restoreSessionExecutionCount();
+        return;
+      }
+      const admissionStartedAt = performance.now();
+      const acquired = await mcpAdmission.acquire(
+        sessionId ?? logicalClientId(req),
+        config.mcpAdmissionTimeoutMs,
+        mcpAdmissionWeight(requestRpcMethod, requestToolName),
+        requestAbort.signal,
+      );
+      admissionWaitMs += performance.now() - admissionStartedAt;
+      if (!acquired) {
+        restoreSessionExecutionCount();
+        throw new McpAdmissionUnavailableError();
+      }
+      admissionRelease = acquired;
+      restoreSessionExecutionCount();
+      policyWaiterResumes++;
+      lastPolicyWaiterResumeAt = Date.now();
+      if (waiter) {
+        logEvent(config.logging, "debug", "mcp_policy_waiter_resumed", {
+          requestId,
+          approvalId: waiter.approvalId,
+          sessionIdPrefix: sessionIdPrefix(sessionId),
+          admissionWaitMs: Math.round(admissionWaitMs),
+        });
+      }
+    };
 
     if (shuttingDown) {
       return res.status(503).json({
@@ -3825,7 +4007,10 @@ export function createServer(config = loadConfig()): RunningServer {
           sessionRequestClass = requestIsSseStream ? "stream" : requestIsWaiter ? "waiter" : "execution";
           if (sessionRequestClass === "stream") state.activeSseStreams++;
           else if (sessionRequestClass === "waiter") state.activeLongPollCount++;
-          else state.inFlightRequests++;
+          else {
+            state.inFlightRequests++;
+            sessionExecutionCounted = true;
+          }
           state.requestCount++;
           const rpcMethod = (req.body as { method?: string })?.method;
           state.lastRpcMethod = rpcMethod;
@@ -3926,6 +4111,7 @@ export function createServer(config = loadConfig()): RunningServer {
                 resourceReadCount: 0,
                 activeLongPollCount: 0,
                 activeSseStreams: 0,
+                activePolicyWaiters: 0,
                 closing: false,
                 closed: false,
                 endRecorded: false,
@@ -3949,6 +4135,7 @@ export function createServer(config = loadConfig()): RunningServer {
           const closedSessionId = transport?.sessionId;
           if (closedSessionId) {
             transports.delete(closedSessionId);
+            cancelMcpPolicyWaitersForSession(closedSessionId, "transport_closed");
             const state = mcpSessions.get(closedSessionId);
             if (state) {
               recordMcpSessionEnd(state, state.closing ? "server_shutdown" : "client_closed");
@@ -4145,7 +4332,7 @@ export function createServer(config = loadConfig()): RunningServer {
         );
         admissionWaitMs = performance.now() - admissionStartedAt;
         if (!acquiredAdmission) {
-          if (!requestIsWaiter) recordMcpCapacityRejection(requestToolName, admissionWeight);
+          if (!requestIsWaiter) recordMcpCapacityRejection(requestToolName, admissionWeight, requestId);
           logEvent(config.logging, "warn", "mcp_request_rejected", {
             requestId,
             reason: "admission_queue_full_or_deadline",
@@ -4165,7 +4352,13 @@ export function createServer(config = loadConfig()): RunningServer {
       }
 
       handlerStartedAt = performance.now();
-      await mcpRequestContext.run({ signal: requestAbort.signal }, async () => {
+      await mcpRequestContext.run({
+        signal: requestAbort.signal,
+        mcpSessionId: sessionId,
+        mcpRequestId: requestId,
+        onPolicyWaitStart,
+        onPolicyWaitEnd,
+      }, async () => {
         if (!requestIsSseStream && mcpRequestHasExecutionDeadline(requestRpcMethod, requestToolName)) {
           await handleMcpRequestWithDeadline(
             transport!,
@@ -4204,18 +4397,22 @@ export function createServer(config = loadConfig()): RunningServer {
         requestId,
         error: error instanceof Error ? error.message : String(error),
         timedOut: error instanceof McpExecutionTimeoutError,
+        admissionUnavailable: error instanceof McpAdmissionUnavailableError,
       });
       if (!res.headersSent) {
         sendJsonRpcError(
           res,
-          error instanceof McpExecutionTimeoutError ? 504 : 500,
-          error instanceof McpExecutionTimeoutError ? -32008 : -32603,
+          error instanceof McpExecutionTimeoutError ? 504 : error instanceof McpAdmissionUnavailableError ? 503 : 500,
+          error instanceof McpExecutionTimeoutError ? -32008 : error instanceof McpAdmissionUnavailableError ? -32029 : -32603,
           error instanceof McpExecutionTimeoutError
             ? "MCP request exceeded its execution deadline; reconnect and retry."
-            : "Internal server error",
+            : error instanceof McpAdmissionUnavailableError
+              ? "MCP request capacity is temporarily exhausted after approval; retry later."
+              : "Internal server error",
         );
       }
     } finally {
+      removePolicyWaiter();
       admissionRelease?.();
       admissionRelease = undefined;
       // Decrement in-flight count after response completes or is aborted.
@@ -4224,7 +4421,7 @@ export function createServer(config = loadConfig()): RunningServer {
         if (state && sessionRequestClass) {
           if (sessionRequestClass === "stream" && state.activeSseStreams > 0) state.activeSseStreams--;
           else if (sessionRequestClass === "waiter" && state.activeLongPollCount > 0) state.activeLongPollCount--;
-          else if (sessionRequestClass === "execution" && state.inFlightRequests > 0) state.inFlightRequests--;
+          else if (sessionRequestClass === "execution" && sessionExecutionCounted && state.inFlightRequests > 0) state.inFlightRequests--;
           state.lastActivityAt = Date.now();
         }
       }

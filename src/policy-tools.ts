@@ -45,12 +45,7 @@ function policyApprovalToCard(a: ReturnType<PolicyEngine["getPendingApprovals"]>
     requestedAt: a.requestedAt,
     createdAt: a.requestedAt,
     expiresAt: a.expiresAt,
-    options: [
-      { id: "approve", label: "Approve Once", effect: "approve", scope: "once" },
-      ...(a.workSessionId ? [{ id: "approve_session", label: "Approve Session", effect: "approve", scope: "work_session" }] : []),
-      { id: "approve_workspace", label: "Approve Workspace", effect: "approve", scope: "workspace" },
-      { id: "deny", label: "Deny", effect: "deny" },
-    ],
+    options: a.options ?? [],
   };
 }
 
@@ -290,7 +285,24 @@ export function registerPolicyTools(
         };
       }
 
-      // Resolve the blocked tool call's waiter via event
+      // Resolve the blocked tool call's waiter via event. Record scoped grants
+      // here too, so a durable approval remains useful if the original live
+      // waiter disappeared before the reviewer responded. The live enforcer
+      // repeats this operation idempotently when it resumes.
+      const approvalScope: ApprovalScope = decision === "approve_session"
+        ? "work_session"
+        : decision === "approve_workspace"
+          ? "workspace"
+          : (scope ?? "once");
+      if (decision !== "deny" && match.approvalKey) {
+        config.policyEngine.recordApproval(
+          match.principalId,
+          match.approvalKey,
+          approvalScope,
+          { workspaceId: match.workspaceId, workSessionId: match.workSessionId },
+          "reviewer",
+        );
+      }
       config.policyEngine.resolvePending(
         approvalId,
         decision === "deny" ? "denied" : "approved",
@@ -302,11 +314,7 @@ export function registerPolicyTools(
         payload: {
           approvalId,
           decision: decision === "deny" ? "deny" : "approve",
-          scope: decision === "approve_session"
-            ? "work_session"
-            : decision === "approve_workspace"
-              ? "workspace"
-              : (scope ?? "once"),
+          scope: approvalScope,
           reason,
         },
       });

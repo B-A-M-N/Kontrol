@@ -290,6 +290,9 @@ try {
 assert.ok(observedDefaultTimeout > 5 * 60_000, "default approval wait must exceed five minutes");
 
 // A disconnected originating request cancels only its own parked approval.
+// P0.3: the durable approval row is RETAINED (only the live waiter is
+// detached) so a reconnecting invocation with the same row key can still
+// attach to it.
 const cancellationPolicy = createPolicyEngine({ defaultMode: "ask", toolRules: {}, pathRules: [] });
 const cancellationEnforcer = createPolicyEnforcer(cancellationPolicy, eventStore);
 const cancellation = new AbortController();
@@ -299,14 +302,18 @@ const cancellationResult = cancellationEnforcer.enforce({
   workspaceId: WS,
   tool: "write",
   path: "disconnecting.txt",
+  mcpSessionId: "mcp-cancel-session",
+  mcpRequestId: "mcp-cancel-request-1",
   signal: cancellation.signal,
 });
 await new Promise((resolve) => setTimeout(resolve, 0));
 cancellation.abort();
 const cancelled = await cancellationResult;
 assert.equal(cancelled.allowed, false);
-assert.equal(cancelled.outcome, "cancelled");
-assert.equal(cancellationPolicy.getPendingApprovals().length, 0, "disconnected approval waiter must be cleaned up");
+assert.equal(cancelled.outcome, "caller_gone");
+const cancellationRow = cancellationPolicy.getPendingApprovals()[0];
+assert.ok(cancellationRow, "durable approval row survives caller_gone");
+assert.equal(cancellationPolicy.countLiveWaiters(cancellationRow.id), 0, "live waiter is detached even though durable row survives");
 
 // ── Test 8: identical concurrent invocations remain independently approved ──
 
@@ -333,6 +340,51 @@ for (const pending of pendingReplays) {
   });
 }
 assert.deepEqual((await Promise.all([firstReplay, secondReplay])).map((result) => result.allowed), [true, true]);
+
+// ── Test 8b: same live MCP request retrying re-attaches to the durable row ──
+
+const reattachPolicy = createPolicyEngine({ defaultMode: "ask", toolRules: { write: "ask" }, pathRules: [] });
+const reattachEnforcer = createPolicyEnforcer(reattachPolicy, eventStore, { timeoutMs: 1_000 });
+const reattachInvocation = {
+  principalId: "reconnecting-client",
+  principalRole: "client" as const,
+  workspaceId: WS,
+  tool: "write",
+  path: "same-file.txt",
+  mcpSessionId: "mcp-reattach-session",
+  mcpRequestId: "mcp-reattach-request-1",
+};
+const firstAttempt = reattachEnforcer.enforce(reattachInvocation);
+await new Promise((resolve) => setTimeout(resolve, 0));
+const firstRow = reattachPolicy.getPendingApprovals()[0];
+assert.ok(firstRow, "first attempt created a durable approval row");
+assert.equal(reattachPolicy.countLiveWaiters(firstRow.id), 1, "first attempt attached a live waiter");
+
+// The MCP caller died; only the LIVE waiter detached, the durable row stays.
+reattachPolicy.detachLiveWaiter(firstRow.id, "mcp-reattach-request-1");
+assert.equal(reattachPolicy.countLiveWaiters(firstRow.id), 0, "detach removes the live waiter but preserves the durable row");
+assert.equal(reattachPolicy.getPendingApprovals().length, 1, "durable row survives the dead live waiter");
+
+// A reconnecting invocation with the SAME (mcpSessionId, mcpRequestId) reuses
+// the durable row; the liveWaiterId is recomputed from mcpRequestId, which
+// means the test uses the SAME mcpRequestId so the row key matches.
+const retryInvocation = { ...reattachInvocation };
+const secondAttempt = reattachEnforcer.enforce(retryInvocation);
+await new Promise((resolve) => setTimeout(resolve, 0));
+const allPending = reattachPolicy.getPendingApprovals();
+assert.equal(allPending.length, 1, "retry reattaches to the same durable row, no duplicate");
+const reusedRow = allPending[0];
+assert.equal(reusedRow.id, firstRow.id, "durable approvalId is reused for the reconnecting live invocation");
+assert.equal(reattachPolicy.countLiveWaiters(reusedRow.id), 1, "retry attached a fresh live waiter to the existing row");
+
+// Reviewer decides once — both invocations observe the same durable resolution.
+eventStore.appendEvent({
+  type: "policy.approval.provided",
+  sessionId: WS,
+  payload: { approvalId: reusedRow.id, decision: "approve", scope: "workspace" },
+});
+assert.equal((await Promise.all([firstAttempt, secondAttempt])).every((r) => r.allowed), true, "single reviewer decision resolves both the dead first attempt and the live retry");
+assert.equal(reattachPolicy.getPendingApprovals().length, 0, "durable row cleared after the resolution");
 
 // ── Test 9: approval emitted in the append/wait gap is not lost ──
 

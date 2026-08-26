@@ -20,5 +20,6 @@ assert.equal(mcpSessionIdleReason({ toolCallCount: 2, activeLongPollCount: 0, du
 
 assert.equal(mcpSessionIdleTtl({ toolCallCount: 1, activeLongPollCount: 0, durableWorkerSession: true }, config), 900_000);
 assert.equal(mcpSessionIdleTtl({ toolCallCount: 1, activeLongPollCount: 1, durableWorkerSession: false }, config), Number.POSITIVE_INFINITY);
+assert.equal(mcpSessionIdleTtl({ toolCallCount: 1, activeLongPollCount: 0, activePolicyWaiters: 1, durableWorkerSession: false }, config), Number.POSITIVE_INFINITY);
 
 console.log("mcp-session-policy.test.ts: all assertions passed");
