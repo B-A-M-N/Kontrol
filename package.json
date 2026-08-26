@@ -65,7 +65,7 @@
     "test:adapters": "node --check scripts/acp-stdio-duplex-adapter.mjs && node scripts/lib/managed-agent-process.test.mjs && node src/acp-adapter.test.mjs && node src/hermes-native-adapter.test.mjs && node src/acp-stdio-duplex-adapter.test.mjs && tsx src/acp-duplex.test.ts",
     "test:ui": "node scripts/run-ui-tests.mjs",
     "test:security": "tsx src/process-environment.test.ts && tsx src/webhook-policy.test.ts && tsx src/git-runner.test.ts && tsx src/acp-registry.test.ts && tsx src/auth-tunnel.test.ts && tsx src/mcp-sse-admission.test.ts && tsx src/policy.test.ts && tsx src/enforcement-layer.test.ts",
-    "test:integration": "node src/start-all.test.mjs && node scripts/kontrol-supervisor.test.mjs && tsx src/process-sessions.test.ts && tsx src/work-session-lifecycle.test.ts && tsx src/server-admission.test.ts && tsx src/acp-gateway.test.ts && tsx src/acp-identity.test.ts && tsx src/acp-lifecycle.test.ts && tsx src/continuation.test.ts && tsx src/dispatch-outbox.test.ts && tsx src/bridge-flow.test.ts",
+    "test:integration": "node src/start-all.test.mjs && node scripts/kontrol-supervisor.test.mjs && tsx src/process-sessions.test.ts && tsx src/work-session-lifecycle.test.ts && tsx src/server-admission.test.ts && tsx src/acp-gateway.test.ts && tsx src/acp-identity.test.ts && tsx src/acp-lifecycle.test.ts && tsx src/continuation.test.ts && tsx src/dispatch-outbox.test.ts && tsx src/bridge-flow.test.ts && tsx src/policy-ask-lifecycle.test.ts && tsx src/policy-longevity.test.ts",
     "test:lifecycle": "npm run test:integration",
     "test:runtime": "npm run test:syntax && npm run test:unit && npm run test:adapters && npm run test:ui && npm run test:security && npm run test:lifecycle",
     "test:package": "node src/package-release.test.mjs",
