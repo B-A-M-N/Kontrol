@@ -1,6 +1,7 @@
 export interface McpSessionPolicyState {
   toolCallCount: number;
   activeLongPollCount: number;
+  activePolicyWaiters?: number;
   durableWorkerSession: boolean;
 }
 
@@ -17,6 +18,7 @@ export function mcpSessionIdleTtl(
   config: McpSessionPolicyConfig,
 ): number {
   if (state.activeLongPollCount > 0) return Number.POSITIVE_INFINITY;
+  if ((state.activePolicyWaiters ?? 0) > 0) return Number.POSITIVE_INFINITY;
   if (state.toolCallCount === 0) return config.mcpUnusedSessionIdleMs;
   // A one-tool session may still be the transport for the next model turn.
   // This is a grace classification for metrics, not permission to reap it

@@ -26,6 +26,7 @@
  */
 
 import { randomUUID } from "node:crypto";
+import type { ApprovalOption, ApprovalRequestManager } from "./approval-requests.js";
 
 export type PolicyMode = "allow" | "deny" | "ask";
 export type PolicySource = "path" | "tool" | "default";
@@ -58,12 +59,27 @@ export interface ToolApprovalRequest {
   principalId: string;
   workspaceId: string;
   workSessionId?: string;
+  approvalKey?: string;
+  mcpSessionId?: string;
+  mcpRequestId?: string;
+  waiterKey?: string;
+  /**
+   * Identity of the CURRENTLY ATTACHED live waiter. When this matches an
+   * active MCP request, the durable approval row is "live". When it becomes
+   * undefined (caller disconnected), only a fresh live invocation with the
+   * matching (mcpSessionId, mcpRequestId) may reattach.
+   */
+  liveWaiterId?: string;
+  options?: ApprovalOption[];
   tool: string;
   path?: string;
   command?: string;
   requestedAt: string;
   expiresAt?: string;
 }
+
+/** State of a live waiter attached to a durable approval row. */
+export type LiveWaiterState = "live" | "dead";
 
 export interface PolicyDecision {
   mode: PolicyMode;
@@ -108,9 +124,36 @@ export interface PolicyEngine {
     reviewerId?: string,
   ): void;
   getPendingApprovals(workspaceId?: string): ToolApprovalRequest[];
+  /** Legacy matcher: coalesces by (principal, approvalKey, ctx). Kept for
+   *  the rare ACP path that needs to detect an existing card from a
+   *  different caller. The MCP enforcer uses findPendingByKey instead. */
+  findPending(
+    principalId: string,
+    approvalKey: string,
+    ctx: ScopeContext,
+  ): ToolApprovalRequest | undefined;
+  /** P0.4 dedup key: only invocations with the EXACT same (mcpSessionId,
+   *  mcpRequestId, approvalKey, ctx) reuse one durable row. Different MCP
+   *  requests each get their own row. */
+  findPendingByKey(rowKey: string): ToolApprovalRequest | undefined;
   clearPending(approvalId: string): void;
   resolvePending(approvalId: string, status: "approved" | "denied" | "expired" | "cancelled", reason?: string): void;
   addPending(request: ToolApprovalRequest): void;
+  /** Mark the live waiter for a durable approval row as detached. The
+   *  durable card remains available for a future live invocation with the
+   *  same row key to reattach to. */
+  detachLiveWaiter(approvalId: string, liveWaiterId: string): void;
+  /** Register a fresh live waiter for an existing durable approval row.
+   *  Called when a reconnecting invocation with the same row key reuses
+   *  the row created by a previous live invocation that has since gone. */
+  reattachLiveWaiter(approvalId: string, liveWaiterId: string): void;
+  /** Resolve the current liveness state for a live waiter. Used by the
+   *  enforcer to decide whether a resolved approval should wake the
+   *  in-flight invocation or be ignored because the caller is gone. */
+  getLiveWaiterState(approvalId: string, liveWaiterId: string): LiveWaiterState | undefined;
+  /** Count live waiters attached to a durable approval row. Used by
+   *  diagnostics to distinguish "durable cards" from "live waiters". */
+  countLiveWaiters(approvalId: string): number;
   /** Revoke all durable and in-memory grants for an exact scope. */
   revokeScope(scope: ApprovalScope, scopeId: string): void;
   /** List effective durable grants for reviewer diagnostics/tools. */
@@ -270,6 +313,11 @@ export function createPolicyEngine(
   // (principalId|scope|scopeId|approvalKey) -> true
   const sessionApprovals = new Map<string, boolean>();
   const pendingApprovals = new Map<string, ToolApprovalRequest>();
+  // approvalId -> set of currently attached LIVE waiter ids. A durable row
+  // may outlive its live waiter; this map is the source of truth for
+  // "is anyone actually waiting right now?" — used by diagnostics and the
+  // enforcer to detect a caller_gone outcome.
+  const liveWaitersByApproval = new Map<string, Set<string>>();
 
   // Seed memory cache from durable grants so restarts keep effective approvals.
   if (grantStore) {
@@ -347,6 +395,97 @@ export function createPolicyEngine(
     return false;
   }
 
+  function findPending(
+    principalId: string,
+    key: string,
+    ctx: ScopeContext,
+  ): ToolApprovalRequest | undefined {
+    const matches = (request: ToolApprovalRequest) => request.principalId === principalId
+      && request.workspaceId === ctx.workspaceId
+      && request.workSessionId === ctx.workSessionId
+      && request.approvalKey === key;
+    return Array.from(pendingApprovals.values()).find(matches)
+      ?? (approvalRequests
+        ? approvalRequests.listPending(ctx.workspaceId)
+          .filter((request) => request.kind === "tool")
+          .map((request) => ({
+            id: request.approvalId,
+            principalId: request.principalId ?? "",
+            workspaceId: request.workspaceSessionId,
+            workSessionId: request.workSessionId,
+            approvalKey: request.approvalKey,
+            mcpSessionId: request.mcpSessionId,
+            mcpRequestId: request.mcpRequestId,
+            waiterKey: request.waiterKey,
+            liveWaiterId: undefined,
+            options: request.options,
+            tool: request.tool ?? "",
+            path: request.path,
+            command: request.command,
+            requestedAt: request.createdAt,
+            expiresAt: request.expiresAt,
+          }))
+          .find(matches)
+        : undefined);
+  }
+
+  /**
+   * P0.4 dedup by row key: the durable approval row is keyed by the full
+   * MCP-identity + principal + approvalKey. Two invocations with the same
+   * row key are the SAME live call retrying; different row keys always
+   * create independent rows. Returns the row currently in memory, or
+   * looks it up in the durable approval store when one is configured.
+   */
+  function findPendingByKey(rowKey: string): ToolApprovalRequest | undefined {
+    return Array.from(pendingApprovals.values()).find((request) => request.waiterKey === rowKey)
+      ?? (approvalRequests
+        ? approvalRequests.listPending().filter((request) => request.kind === "tool" && request.waiterKey === rowKey)
+          .map((request) => ({
+            id: request.approvalId,
+            principalId: request.principalId ?? "",
+            workspaceId: request.workspaceSessionId,
+            workSessionId: request.workSessionId,
+            approvalKey: request.approvalKey,
+            mcpSessionId: request.mcpSessionId,
+            mcpRequestId: request.mcpRequestId,
+            waiterKey: request.waiterKey,
+            liveWaiterId: undefined,
+            options: request.options,
+            tool: request.tool ?? "",
+            path: request.path,
+            command: request.command,
+            requestedAt: request.createdAt,
+            expiresAt: request.expiresAt,
+          }))[0]
+        : undefined);
+  }
+
+  function detachLiveWaiter(approvalId: string, liveWaiterId: string): void {
+    const set = liveWaitersByApproval.get(approvalId);
+    if (!set) return;
+    set.delete(liveWaiterId);
+    if (set.size === 0) liveWaitersByApproval.delete(approvalId);
+  }
+
+  function reattachLiveWaiter(approvalId: string, liveWaiterId: string): void {
+    let set = liveWaitersByApproval.get(approvalId);
+    if (!set) {
+      set = new Set();
+      liveWaitersByApproval.set(approvalId, set);
+    }
+    set.add(liveWaiterId);
+  }
+
+  function getLiveWaiterState(approvalId: string, liveWaiterId: string): LiveWaiterState | undefined {
+    const set = liveWaitersByApproval.get(approvalId);
+    if (!set) return undefined;
+    return set.has(liveWaiterId) ? "live" : "dead";
+  }
+
+  function countLiveWaiters(approvalId: string): number {
+    return liveWaitersByApproval.get(approvalId)?.size ?? 0;
+  }
+
   function recordApproval(
     principalId: string,
     key: string,
@@ -362,7 +501,11 @@ export function createPolicyEngine(
     if (!scopeId || (scope === "work_session" && !ctx.workSessionId)) return;
     sessionApprovals.set(`${principalId}|${scope}|${scopeId}|${key}`, true);
 
-    if (grantStore) {
+    if (grantStore && !grantStore.listEffective().some((grant) =>
+      grant.principalId === principalId
+      && grant.scope === scope
+      && grant.scopeId === scopeId
+      && grant.approvalKey === key)) {
       const now = new Date().toISOString();
       grantStore.insert({
         id: `grant_${randomUUID()}`,
@@ -386,9 +529,15 @@ export function createPolicyEngine(
           principalId: request.principalId ?? "",
           workspaceId: request.workspaceSessionId,
           workSessionId: request.workSessionId,
+          approvalKey: request.approvalKey,
+          mcpSessionId: request.mcpSessionId,
+          mcpRequestId: request.mcpRequestId,
+          waiterKey: request.waiterKey,
+          liveWaiterId: request.liveWaiterId,
           tool: request.tool ?? "",
           path: request.path,
           command: request.command,
+          options: request.options,
           requestedAt: request.createdAt,
           expiresAt: request.expiresAt,
         }));
@@ -399,7 +548,7 @@ export function createPolicyEngine(
 
   function clearPending(approvalId: string): void {
     pendingApprovals.delete(approvalId);
-    if (approvalRequests) approvalRequests.resolve(approvalId, { status: "cancelled", reason: "policy waiter closed" });
+    liveWaitersByApproval.delete(approvalId);
   }
 
   function resolvePending(
@@ -408,28 +557,49 @@ export function createPolicyEngine(
     reason?: string,
   ): void {
     pendingApprovals.delete(approvalId);
+    // Live waiters do NOT outlive the durable row once the reviewer decides.
+    // Otherwise a stale live entry would let an obsolete waiter claim the
+    // resolved approval on a future attach attempt.
+    liveWaitersByApproval.delete(approvalId);
     if (approvalRequests) approvalRequests.resolve(approvalId, { status, reason });
   }
 
   function addPending(request: ToolApprovalRequest): void {
     pendingApprovals.set(request.id, request);
+    if (request.liveWaiterId) {
+      let set = liveWaitersByApproval.get(request.id);
+      if (!set) {
+        set = new Set();
+        liveWaitersByApproval.set(request.id, set);
+      }
+      set.add(request.liveWaiterId);
+    }
     if (approvalRequests) {
       approvalRequests.create({
         approvalId: request.id,
         kind: "tool",
         workspaceSessionId: request.workspaceId,
         workSessionId: request.workSessionId,
+        approvalKey: request.approvalKey,
+        mcpSessionId: request.mcpSessionId,
+        mcpRequestId: request.mcpRequestId,
+        waiterKey: request.waiterKey,
+        liveWaiterId: request.liveWaiterId,
         principalId: request.principalId,
         title: `Approve ${request.tool}`,
         tool: request.tool,
         path: request.path,
         command: request.command,
-          options: [
-            { id: "approve", label: "Approve Once", effect: "approve", scope: "once" },
-            ...(request.workSessionId ? [{ id: "approve_session", label: "Approve Session", effect: "approve" as const, scope: "work_session" as const }] : []),
-            { id: "approve_workspace", label: "Approve Workspace", effect: "approve" as const, scope: "workspace" as const },
-            { id: "deny", label: "Deny", effect: "deny" },
-          ],
+        // P1.10: server-created options are authoritative. They travel in
+        // the durable row so a rehydrated client (via list_pending_approvals)
+        // never has to invent scopes. Approve Session only appears when
+        // there is an actual work session to attach it to.
+        options: request.options ?? [
+          { id: "approve", label: "Approve Once", effect: "approve", scope: "once" },
+          ...(request.workSessionId ? [{ id: "approve_session", label: "Approve Session", effect: "approve" as const, scope: "work_session" as const }] : []),
+          { id: "approve_workspace", label: "Approve Workspace", effect: "approve" as const, scope: "workspace" as const },
+          { id: "deny", label: "Deny", effect: "deny" },
+        ],
         expiresAt: request.expiresAt,
       });
     }
@@ -454,6 +624,12 @@ export function createPolicyEngine(
     isApproved,
     recordApproval,
     getPendingApprovals,
+    findPending,
+    findPendingByKey,
+    detachLiveWaiter,
+    reattachLiveWaiter,
+    getLiveWaiterState,
+    countLiveWaiters,
     clearPending,
     resolvePending,
     addPending,
@@ -476,4 +652,3 @@ function pathRuleSpecificity(pattern: string): number {
   // makes `src/private/**` win over `src/**`, independent of declaration order.
   return pattern.replace(/[?*]/g, "").length;
 }
-import type { ApprovalRequestManager } from "./approval-requests.js";
