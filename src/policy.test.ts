@@ -413,6 +413,57 @@ eventStore.appendEvent({
 assert.equal((await Promise.all([firstAttempt, secondAttempt])).every((r) => r.allowed), true, "single reviewer decision resolves both the dead first attempt and the live retry");
 assert.equal(reattachPolicy.getPendingApprovals().length, 0, "durable row cleared after the resolution");
 
+// ── P1.10: authoritative approval options are carried in the event payload ──
+// Rehydrating clients (e.g. via list_pending_approvals) must reconcile
+// against the server-authored options, never invent their own. The
+// policy.approval_requested event carries the canonical list.
+{
+  const eventOptionsPolicy = createPolicyEngine(
+    { defaultMode: "ask", toolRules: { write: "ask" }, pathRules: [] },
+    undefined,
+    approvalRequests,
+  );
+  const eventOptionsEnforcer = createPolicyEnforcer(eventOptionsPolicy, eventStore, { timeoutMs: 200 });
+  const observer = (event: { type: string; payload: { options?: unknown[] } }): void => {
+    if (event.type !== "policy.approval_requested") return;
+    observedOptions = event.payload.options as Array<{ id: string; effect: string; scope?: string }>;
+  };
+  const unsubscribe = eventStore.subscribe("wsess-event-options", observer);
+  let observedOptions: Array<{ id: string; effect: string; scope?: string }> | undefined;
+  try {
+    const eventRequest = eventOptionsEnforcer.enforce({
+      principalId: "event-options-principal",
+      principalRole: "worker",
+      workspaceId: WS,
+      workSessionId: "wsess-event-options",
+      tool: "write",
+      path: "event-options.txt",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    const row = eventOptionsPolicy.getPendingApprovals(WS).find((p) => p.workSessionId === "wsess-event-options");
+    assert.ok(row, "policy approval row created");
+    eventStore.appendEvent({
+      type: "policy.approval.provided",
+      sessionId: "wsess-event-options",
+      payload: { approvalId: row.id, decision: "approve", scope: "once" },
+    });
+    await eventRequest;
+    assert.ok(observedOptions, "policy.approval_requested was observed");
+    const ids = observedOptions!.map((option) => option.id).sort();
+    assert.deepEqual(ids, ["approve", "approve_session", "approve_workspace", "deny"],
+      `event payload carries Approve Once / Approve Session / Approve Workspace / Deny: ${ids.join(",")}`);
+    // Approve Session only appears when a work session is bound.
+    const sessionOption = observedOptions!.find((option) => option.id === "approve_session");
+    assert.ok(sessionOption, "approve_session present when workSessionId is bound");
+    assert.equal(sessionOption?.scope, "work_session");
+    // Approve Workspace is the durable cross-session grant.
+    const workspaceOption = observedOptions!.find((option) => option.id === "approve_workspace");
+    assert.equal(workspaceOption?.scope, "workspace", "approve_workspace scoped to workspace");
+  } finally {
+    unsubscribe();
+  }
+}
+
 // ── Test 9: approval emitted in the append/wait gap is not lost ──
 
 const racePolicy = createPolicyEngine({ defaultMode: "ask", toolRules: { write: "ask" }, pathRules: [] });
