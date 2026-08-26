@@ -8,6 +8,8 @@ assert.ok(first);
 const queued = admission.acquire("session-a", 100);
 assert.deepEqual(admission.getStats(), {
   active: 1,
+  activeWeight: 1,
+  availableWeight: 0,
   queued: 1,
   maxInflight: 1,
   maxInflightPerKey: 1,
