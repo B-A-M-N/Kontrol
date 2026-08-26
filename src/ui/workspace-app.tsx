@@ -2136,6 +2136,7 @@ function renderPolicyApproval(view: WorkSessionViewState, approval: PolicyApprov
     : [
       { id: "approve", label: "Approve Once", effect: "approve" as const, scope: "once" as const },
       { id: "approve_session", label: "Approve Session", effect: "approve" as const, scope: "work_session" as const },
+      { id: "approve_workspace", label: "Approve Workspace", effect: "approve" as const, scope: "workspace" as const },
       { id: "deny", label: "Deny", effect: "deny" as const },
   ];
   const makeButton = (option: NonNullable<PolicyApprovalView["options"]>[number]): HTMLButtonElement => {
