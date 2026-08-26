@@ -46,6 +46,9 @@ kontrol config set publicBaseUrl https://kontrol.example.com
 | `KONTROL_MCP_MAX_INFLIGHT` | Global concurrent MCP request limit. Defaults to `32`. |
 | `KONTROL_MCP_MAX_INFLIGHT_PER_SESSION` | Per-session concurrent MCP request limit. Defaults to `8`. |
 | `KONTROL_MCP_MAX_QUEUE` | Maximum queued MCP requests waiting for admission. Defaults to `128`. |
+| `KONTROL_MCP_MAX_WAITERS` | Independent concurrent budget for parked event/review/terminal waiters. Defaults to `64`. |
+| `KONTROL_MCP_MAX_WAITERS_PER_SESSION` | Maximum parked waiters from one MCP session. Defaults to `2`. |
+| `KONTROL_MCP_MAX_WAITER_QUEUE` | Maximum queued parked waiters. Defaults to `64`. |
 | `KONTROL_MCP_REQUEST_DEADLINE_MS` | Maximum time a request waits for admission. Defaults to `120000`. |
 | `KONTROL_MCP_UNUSED_SESSION_IDLE_MS` | Idle TTL for initialized sessions with no tool calls. Defaults to `120000`, allowing model-side setup time. |
 | `KONTROL_MCP_EPHEMERAL_SESSION_IDLE_MS` | Grace TTL for non-worker sessions with exactly one tool call. Defaults to `300000`; one completed tool call does not mean the model is finished. |
@@ -58,8 +61,17 @@ kontrol config set publicBaseUrl https://kontrol.example.com
 | `KONTROL_STATE_DIR` | Directory for SQLite state. Defaults to `~/.local/share/kontrol`. |
 | `KONTROL_SUPERVISOR_INTERVAL_MS` | Probe interval for the managed component supervisor. Defaults to `5000`. |
 | `KONTROL_OPERATIONAL_UAT` | Set `true` to run the disposable real-agent startup UAT. Defaults to `false`. |
+| `KONTROL_VERIFY_SANDBOX` | Set `1` to require fail-closed Bubblewrap sandboxing for unattended mission verification. Defaults to trusted allowlisted execution. |
+| `KONTROL_BWRAP` | Optional explicit Bubblewrap executable path used when verification sandboxing is enabled. |
 | `KONTROL_RELEASE_MODE` | Set `true` to refuse dirty source trees unless `KONTROL_ALLOW_DIRTY_RELEASE=true`. |
 | `KONTROL_HARPOON_INCLUDE_LOOPBACK` | Passed to tunnel-client; defaults to `false` so Harpoon does not auto-register KONTROL's local HTTP OAuth metadata URLs. |
+
+For a stable scheduler boundary, use `scripts/kontrol-user-service.sh install`
+and `start` to run the installed `dist/cli.js serve` product under a per-user
+systemd unit. The unit sets `Nice=0`, `CPUWeight=100`, `Restart=on-failure`, and
+`KillMode=control-group`. It owns the server process only; adapters and tunnels
+remain separate components. The checkout launcher `start-all.sh` is reserved
+for development/integration orchestration.
 
 MCP transports are isolated by their `mcp-session-id`. The logical client label
 (for example `mcp:openai-mcp@1.0.0`) is aggregate telemetry only and is never a
@@ -72,9 +84,9 @@ context.
 
 ## Liveness And Readiness
 
-`GET /healthz` only proves that KONTROL is serving HTTP and returns the
-immutable build identity (`buildId`, commit, dirty state, schema hash, and
-build timestamp). During startup, `GET /core-readyz` checks KONTROL's own
+`GET /healthz` only proves that KONTROL is serving HTTP and returns a minimal
+`{ok,name}` response. It does not disclose process or build details. During
+startup, `GET /core-readyz` checks KONTROL's own
 database, MCP, workspace, review, ACP, and runtime-build infrastructure before
 adapters register. `GET /readyz` is the fail-closed operational check: it also
 requires every configured worker agent to be alive at its expected URL and
@@ -89,6 +101,12 @@ restart counts, and the last external probe result.
 
 When diagnostics are enabled, access `/diagnostics` from loopback with the
 `X-Kontrol-Diagnostics` header. Credentials in query strings are not accepted.
+The response includes rolling 15-minute p50/p95/p99 histograms. Use
+`mcpSessionMetrics.timing.phaseTimings` to distinguish MCP setup/handler time,
+workspace snapshot/surface queries, review-diff retrieval, ACP dispatch startup,
+event-waiter duration, SQLite commit/compaction, and agent first-event/interval
+latency. `mcpSessionMetrics.workspaceAppResources` counts current hashed,
+OpenAI compatibility, legacy Kontrol, and DevDesktop migration resource hits.
 
 The managed tunnel launcher keeps OAuth protected-resource discovery enabled but
 disables Harpoon loopback auto-registration by default. Set
@@ -99,8 +117,15 @@ available.
 The checkout launcher calls `scripts/probe-kontrol-readiness.mjs` after the
 adapters register. That probe performs a real MCP initialize, discovers the
 registered agents, opens the configured workspace, reads `package.json`, and
-runs `pwd`; it also verifies that the listening build ID equals the build just
-produced.
+runs `pwd`. Build identity remains an internal readiness check; unauthenticated
+liveness and readiness responses expose only boolean status fields.
+
+Workflow durability is split deliberately: lifecycle, review, approval,
+continuation, and policy events are append-only audit records. High-volume
+`agent.run.output_delta` and `agent.run.thought_delta` events are buffered into
+explicit non-durable receipts before commit, then coalesced when flushed. A
+retention job may compact old telemetry into a checkpoint without rewriting
+workflow events.
 
 ## OAuth
 
@@ -256,6 +281,35 @@ The adapter registers as a normal Kontrol ACP peer and uses the reusable
 are converted into Kontrol approval requests and parked until the reviewer
 decides. Hermes currently uses `scripts/acp-hermes-native-adapter.mjs`, which
 bridges Hermes's Python ACP client into the same Kontrol approval/event system.
+The adapter uses an activity-aware idle watchdog and a separate absolute run
+ceiling. Configure `KONTROL_HERMES_DEADMAN_IDLE_MS` for the idle threshold and
+`KONTROL_HERMES_MAX_RUN_SECONDS` for the hard upper bound; a known tool
+operation or pending permission is allowed to run until the absolute ceiling.
+
+Supervisor and verification concurrency are bounded independently:
+
+| Variable | Default | Purpose |
+| --- | ---: | --- |
+| `KONTROL_SUPERVISOR_MAX_INFLIGHT` | `4` | Maximum unrelated supervisor missions processed at once |
+| `KONTROL_VERIFY_MAX_INFLIGHT` | `3` | Maximum parallel read-only mission checks |
+| `KONTROL_CRUSH_STUCK_IDLE_MS` | `3600000` | CRUSH stuck detector: zero-output idle beyond this is a suspect signal; the child is terminated (SIGTERM → grace → SIGKILL) BEFORE the terminal event releases the lease |
+| `KONTROL_CRUSH_MAX_RUN_MS` | `86400000` | CRUSH absolute emergency ceiling regardless of activity |
+| `KONTROL_CRUSH_TERMINATE_GRACE_MS` | `5000` | Grace between SIGTERM and SIGKILL when terminating a stuck/cancelled CRUSH run |
+| `KONTROL_STARTUP_PROFILE` | auto | `dev-fast` / `normal` / `release` preflight depth for start-all.sh; auto-selects from legacy env vars when unset |
+| `KONTROL_POLICY_MODE` | `allow` | Default trust posture: `allow` (read-only frictionless), `deny`, or `ask` (gate everything not explicitly allowed) |
+
+### Policy
+
+Shell execution (`bash`, `exec_command`, `kontrol-shell`) is one policy tool: a
+rule on `bash` gates all three. Mutating `write_stdin` input is gated as shell;
+poll-only stdin stays read-only. For an approval-gated posture set
+`KONTROL_POLICY_MODE=ask` or per-tool e.g. `KONTROL_POLICY_TOOL_BASH=ask`.
+
+`KONTROL_POLICY_PATH_RULES` applies to structured filesystem tools after
+workspace path resolution. It does not parse shell commands or sandbox their
+filesystem access. When path rules are configured, set
+`KONTROL_POLICY_TOOL_BASH=ask` or `deny` (or provide an external OS sandbox) if
+shell must not bypass the path policy; `kontrol doctor` reports this posture.
 
 ## Logging
 

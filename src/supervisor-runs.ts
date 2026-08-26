@@ -1,17 +1,51 @@
 import { randomUUID } from "node:crypto";
 import { and, eq, isNull, lt, or, sql } from "drizzle-orm";
 import { openDatabase, type DatabaseHandle } from "./db/client.js";
-import { supervisorRuns } from "./db/schema.js";
+import { supervisorProgressSnapshots, supervisorRuns } from "./db/schema.js";
 
 export type SupervisorStatus = "created" | "planning" | "dispatch_pending" | "worker_active" | "awaiting_submission" | "verification_pending" | "verifying" | "evaluation_pending" | "correction_pending" | "approval_pending" | "awaiting_human" | "paused" | "completed" | "failed" | "cancelled";
 export type AutonomyMode = "manual" | "verify_only" | "correction_auto" | "full";
 export type ApprovalMode = "human_required" | "policy_auto" | "fully_automatic";
 const TERMINAL = new Set<SupervisorStatus>(["completed", "failed", "cancelled"]);
 
+export interface SupervisorProgressSnapshot {
+  blockingFindingCount: number;
+  failedCriterionCount: number;
+  passedCriterionCount: number;
+  failingVerificationCount: number;
+  verificationFailureFingerprint?: string;
+  changedRelevantFiles: number;
+  unresolvedRequiredActions: number;
+  submissionId: string;
+  reviewEpoch: number;
+}
+
+export interface SupervisorProgressDelta {
+  blockingFindingsDelta: number;
+  failedCriteriaDelta: number;
+  passedCriteriaDelta: number;
+  failingVerificationDelta: number;
+  unresolvedRequiredActionsDelta: number;
+  failureFingerprintChanged: boolean;
+  madeProgress: boolean;
+}
+
+export interface SupervisorProgressRecord {
+  snapshot: SupervisorProgressSnapshot;
+  delta: SupervisorProgressDelta;
+  stagnantCycleCount: number;
+}
+
+export interface SupervisorProgressPolicy {
+  maxConsecutiveStagnantCycles?: number;
+  repeatedFailureFingerprintLimit?: number;
+  emergencyCycleCeiling?: number;
+}
+
 export interface SupervisorRuns {
-  create(input: { missionId: string; workSessionId: string; workspaceSessionId: string; maxCycles?: number; maxWallTimeMs?: number; autonomyMode?: AutonomyMode; approvalMode?: ApprovalMode }): ReturnType<typeof row>;
+  create(input: { missionId: string; workSessionId: string; workspaceSessionId: string; maxCycles?: number; maxWallTimeMs?: number; autonomyMode?: AutonomyMode; approvalMode?: ApprovalMode; progressPolicy?: SupervisorProgressPolicy }): ReturnType<typeof row>;
   getByWorkSession(workSessionId: string): ReturnType<typeof row> | undefined;
-  transition(input: { id: string; expectedStatus: SupervisorStatus; expectedRevision: number; nextStatus: SupervisorStatus; cycleNumber?: number; lastProcessedEventSeq?: number; lastSubmissionId?: string; lastSnapshotCommit?: string; nextActionAt?: string; lastError?: string; lease?: { ownerInstanceId: string; leaseNonce: string } }): ReturnType<typeof row> | undefined;
+  transition(input: { id: string; expectedStatus: SupervisorStatus; expectedRevision: number; nextStatus: SupervisorStatus; cycleNumber?: number; lastProcessedEventSeq?: number; lastSubmissionId?: string; lastSnapshotCommit?: string; nextActionAt?: string | null; lastError?: string; stallReason?: string | null; lease?: { ownerInstanceId: string; leaseNonce: string } }): ReturnType<typeof row> | undefined;
   claim(id: string, instanceId: string, leaseMs: number): ReturnType<typeof row> | undefined;
   renew(id: string, instanceId: string, leaseNonce: string, leaseMs: number): ReturnType<typeof row> | undefined;
   release(id: string, instanceId: string, leaseNonce?: string): void;
@@ -19,6 +53,9 @@ export interface SupervisorRuns {
   resume(id: string, expectedRevision: number): ReturnType<typeof row> | undefined;
   noteFailure(id: string, instanceId: string, error: string, leaseNonce?: string): void;
   noteFailureFingerprint(id: string, instanceId: string, fingerprint: string, leaseNonce?: string): number;
+  clearFailureFingerprint(id: string, instanceId: string, leaseNonce?: string): void;
+  recordProgress(id: string, instanceId: string, snapshot: SupervisorProgressSnapshot, leaseNonce?: string): SupervisorProgressRecord | undefined;
+  getProgressHistory(workSessionId: string, limit?: number): SupervisorProgressRecord[];
   releaseExpiredClaims(): number;
   listRecoverable(): Array<ReturnType<typeof row>>;
   close(): void;
@@ -33,7 +70,11 @@ export function createSupervisorRuns(stateDirOrHandle: string | DatabaseHandle):
       const existing = getByWorkSession(input.workSessionId); if (existing) return existing;
       const time = now(); const id = `sup_${randomUUID()}`;
       const maxWallTimeMs = Math.max(60_000, Math.min(input.maxWallTimeMs ?? 24 * 60 * 60 * 1000, 7 * 24 * 60 * 60 * 1000));
-      database.db.insert(supervisorRuns).values({ id, missionId: input.missionId, workSessionId: input.workSessionId, workspaceSessionId: input.workspaceSessionId, maxCycles: input.maxCycles ?? 10, deadlineAt: new Date(Date.now() + maxWallTimeMs).toISOString(), autonomyMode: input.autonomyMode ?? "manual", approvalMode: input.approvalMode ?? "human_required", createdAt: time, updatedAt: time }).run();
+      const policy = input.progressPolicy ?? {};
+      const emergencyCycleCeiling = clamp(policy.emergencyCycleCeiling ?? input.maxCycles ?? 25, 1, 1_000);
+      const maxStagnantCycles = clamp(policy.maxConsecutiveStagnantCycles ?? 2, 1, 100);
+      const repeatedFailureFingerprintLimit = clamp(policy.repeatedFailureFingerprintLimit ?? 3, 1, 100);
+      database.db.insert(supervisorRuns).values({ id, missionId: input.missionId, workSessionId: input.workSessionId, workspaceSessionId: input.workspaceSessionId, maxCycles: emergencyCycleCeiling, maxStagnantCycles, repeatedFailureFingerprintLimit, deadlineAt: new Date(Date.now() + maxWallTimeMs).toISOString(), autonomyMode: input.autonomyMode ?? "manual", approvalMode: input.approvalMode ?? "human_required", createdAt: time, updatedAt: time }).run();
       return getByWorkSession(input.workSessionId)!;
     }, getByWorkSession,
     transition(input) {
@@ -45,6 +86,7 @@ export function createSupervisorRuns(stateDirOrHandle: string | DatabaseHandle):
       if (input.lastSnapshotCommit !== undefined) changes.lastSnapshotCommit = input.lastSnapshotCommit;
       if (input.nextActionAt !== undefined) changes.nextActionAt = input.nextActionAt;
       if (input.lastError !== undefined) changes.lastError = input.lastError;
+      if (input.stallReason !== undefined) changes.stallReason = input.stallReason;
       const leasePredicate = input.lease
         ? and(
             eq(supervisorRuns.ownerInstanceId, input.lease.ownerInstanceId),
@@ -80,6 +122,7 @@ export function createSupervisorRuns(stateDirOrHandle: string | DatabaseHandle):
       const updated = database.db.update(supervisorRuns).set({ ownerInstanceId: instanceId, leaseNonce: nonce, leaseExpiresAt: expires, heartbeatAt: currentTime, updatedAt: currentTime }).where(and(
         eq(supervisorRuns.id, id),
         or(isNull(supervisorRuns.ownerInstanceId), lt(supervisorRuns.leaseExpiresAt, currentTime)),
+        or(isNull(supervisorRuns.nextActionAt), lt(supervisorRuns.nextActionAt, currentTime)),
         sql`(${supervisorRuns.deadlineAt} is null or ${supervisorRuns.deadlineAt} > ${currentTime})`,
       )).run();
       if (!updated.changes) return undefined;
@@ -134,9 +177,66 @@ export function createSupervisorRuns(stateDirOrHandle: string | DatabaseHandle):
       database.db.update(supervisorRuns).set({ lastFailureFingerprint: fingerprint, repeatedFailureCount: count, updatedAt: now() }).where(and(eq(supervisorRuns.id, id), eq(supervisorRuns.ownerInstanceId, instanceId), leaseNonce ? eq(supervisorRuns.leaseNonce, leaseNonce) : undefined)).run();
       return count;
     },
+    clearFailureFingerprint(id, instanceId, leaseNonce) {
+      database.db.update(supervisorRuns).set({ lastFailureFingerprint: null, repeatedFailureCount: 0, updatedAt: now() }).where(and(eq(supervisorRuns.id, id), eq(supervisorRuns.ownerInstanceId, instanceId), leaseNonce ? eq(supervisorRuns.leaseNonce, leaseNonce) : undefined)).run();
+    },
+    recordProgress(id, instanceId, snapshot, leaseNonce) {
+      const current = database.db.select().from(supervisorRuns).where(and(eq(supervisorRuns.id, id), eq(supervisorRuns.ownerInstanceId, instanceId), leaseNonce ? eq(supervisorRuns.leaseNonce, leaseNonce) : undefined)).get();
+      if (!current) return undefined;
+      const previousRow = database.db.select().from(supervisorProgressSnapshots).where(eq(supervisorProgressSnapshots.supervisorRunId, id)).orderBy(sql`${supervisorProgressSnapshots.cycleNumber} desc`, sql`${supervisorProgressSnapshots.createdAt} desc`).limit(1).get();
+      const previous = previousRow ? parseJson<SupervisorProgressSnapshot>(previousRow.snapshotJson, undefined) : undefined;
+      const delta = progressDelta(previous, snapshot);
+      const stagnantCycleCount = delta.madeProgress ? 0 : current.stagnantCycleCount + 1;
+      const createdAt = now();
+      database.db.insert(supervisorProgressSnapshots).values({ id: `sup_progress_${randomUUID()}`, supervisorRunId: id, workSessionId: current.workSessionId, cycleNumber: current.cycleNumber, snapshotJson: JSON.stringify(snapshot), deltaJson: JSON.stringify({ ...delta, stagnantCycleCount }), createdAt }).run();
+      database.db.update(supervisorRuns).set({ progressJson: JSON.stringify(snapshot), stagnantCycleCount, stallReason: delta.madeProgress ? null : "no_new_evidence", updatedAt: createdAt }).where(and(eq(supervisorRuns.id, id), eq(supervisorRuns.ownerInstanceId, instanceId), leaseNonce ? eq(supervisorRuns.leaseNonce, leaseNonce) : undefined)).run();
+      return { snapshot, delta, stagnantCycleCount };
+    },
+    getProgressHistory(workSessionId, limit = 50) {
+      return database.db.select().from(supervisorProgressSnapshots).where(eq(supervisorProgressSnapshots.workSessionId, workSessionId)).orderBy(sql`${supervisorProgressSnapshots.cycleNumber} asc`, sql`${supervisorProgressSnapshots.createdAt} asc`).limit(Math.max(1, Math.min(limit, 500))).all().map((value) => {
+        const stored = parseJson<SupervisorProgressDelta & { stagnantCycleCount?: number }>(value.deltaJson, { ...emptyProgressDelta(), stagnantCycleCount: 0 });
+        return { snapshot: parseJson<SupervisorProgressSnapshot>(value.snapshotJson, emptyProgressSnapshot())!, delta: stored!, stagnantCycleCount: stored?.stagnantCycleCount ?? 0 };
+      });
+    },
     releaseExpiredClaims() { return database.db.update(supervisorRuns).set({ ownerInstanceId: null, leaseNonce: null, leaseExpiresAt: null }).where(lt(supervisorRuns.leaseExpiresAt, now())).run().changes; },
     listRecoverable() { return database.db.select().from(supervisorRuns).all().filter((value) => !TERMINAL.has(value.status as SupervisorStatus)).map(row); },
     close() {},
   };
 }
 function row(value: typeof supervisorRuns.$inferSelect) { return { ...value, status: value.status as SupervisorStatus, resumeStatus: value.resumeStatus as SupervisorStatus | null, autonomyMode: value.autonomyMode as AutonomyMode, approvalMode: value.approvalMode as ApprovalMode }; }
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, Math.trunc(value)));
+}
+
+function parseJson<T>(value: string, fallback: T | undefined): T | undefined {
+  try { return JSON.parse(value) as T; } catch { return fallback; }
+}
+
+function emptyProgressSnapshot(): SupervisorProgressSnapshot {
+  return { blockingFindingCount: 0, failedCriterionCount: 0, passedCriterionCount: 0, failingVerificationCount: 0, changedRelevantFiles: 0, unresolvedRequiredActions: 0, submissionId: "", reviewEpoch: 0 };
+}
+
+function emptyProgressDelta(): SupervisorProgressDelta {
+  return { blockingFindingsDelta: 0, failedCriteriaDelta: 0, passedCriteriaDelta: 0, failingVerificationDelta: 0, unresolvedRequiredActionsDelta: 0, failureFingerprintChanged: false, madeProgress: false };
+}
+
+function progressDelta(previous: SupervisorProgressSnapshot | undefined, current: SupervisorProgressSnapshot): SupervisorProgressDelta {
+  if (!previous) return { blockingFindingsDelta: 0, failedCriteriaDelta: 0, passedCriteriaDelta: 0, failingVerificationDelta: 0, unresolvedRequiredActionsDelta: 0, failureFingerprintChanged: false, madeProgress: true };
+  const delta: SupervisorProgressDelta = {
+    blockingFindingsDelta: current.blockingFindingCount - previous.blockingFindingCount,
+    failedCriteriaDelta: current.failedCriterionCount - previous.failedCriterionCount,
+    passedCriteriaDelta: current.passedCriterionCount - previous.passedCriterionCount,
+    failingVerificationDelta: current.failingVerificationCount - previous.failingVerificationCount,
+    unresolvedRequiredActionsDelta: current.unresolvedRequiredActions - previous.unresolvedRequiredActions,
+    failureFingerprintChanged: current.verificationFailureFingerprint !== previous.verificationFailureFingerprint,
+    madeProgress: false,
+  };
+  delta.madeProgress = delta.blockingFindingsDelta < 0
+    || delta.failedCriteriaDelta < 0
+    || delta.passedCriteriaDelta > 0
+    || delta.failingVerificationDelta < 0
+    || delta.unresolvedRequiredActionsDelta < 0
+    || (delta.failureFingerprintChanged && current.failingVerificationCount < previous.failingVerificationCount);
+  return delta;
+}

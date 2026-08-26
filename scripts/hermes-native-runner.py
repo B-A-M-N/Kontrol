@@ -164,7 +164,14 @@ async def main() -> int:
     command = spec.get("command") or "hermes"
     args = spec.get("args") or ["acp"]
     cwd = spec.get("cwd") or os.getcwd()
-    timeout = float(spec.get("timeoutSeconds") or 1800)
+    max_run_seconds = positive_duration(
+        spec.get("maxRunSeconds") or os.environ.get("KONTROL_HERMES_MAX_RUN_SECONDS"),
+        2 * 60 * 60,
+    )
+    # Keep request-level timeouts under the same configurable outer ceiling.
+    # The old fixed 30-minute default could kill a healthy long-running test
+    # or tool operation.
+    timeout = positive_duration(spec.get("timeoutSeconds"), max_run_seconds)
 
     try:
         stdin_task = asyncio.create_task(read_adapter_responses())
@@ -193,10 +200,12 @@ async def main() -> int:
             # In particular, never cancel the task and synthesize success from
             # an idle timer.  The outer timeout remains a failure boundary in
             # ACPClient, not a successful turn.
-            while not task.done():
-                await asyncio.sleep(0.5)
-            else:
-                result = task.result()
+            try:
+                result = await asyncio.wait_for(task, timeout=max_run_seconds)
+            except asyncio.TimeoutError:
+                task.cancel()
+                emit({"type": "error", "error": f"absolute run ceiling exceeded after {max_run_seconds:.0f}s"})
+                return 1
     except Exception as exc:
         emit({"type": "error", "error": str(exc)})
         return 1
@@ -217,6 +226,14 @@ async def main() -> int:
         "error": result.error,
     })
     return 0 if result.success else 1
+
+
+def positive_duration(value, fallback: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return fallback
+    return parsed if parsed > 0 else fallback
 
 
 if __name__ == "__main__":

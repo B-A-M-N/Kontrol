@@ -36,20 +36,33 @@ export interface ServerConfig {
   agentDir: string;
   logging: LoggingConfig;
   acpEnabled: boolean;
-  acpPort: number;
   acpKnownAgents: Array<{ name: string; url: string; description?: string }>;
   acpSharedSecret?: string;
   /** Shared secret used by the coding agent (worker) for ACP registration/calls. */
   acpAgentSecret?: string;
   /** Shared secret used by the reviewer (WebUI) for ACP calls. */
   acpReviewerSecret?: string;
+  /**
+   * P0 #9: secret Kontrol presents to ADAPTERS on outbound /runs, cancel, and
+   * probe calls. Distinct from acpSharedSecret (legacy operator ingress) so
+   * the adapter credential never doubles as a broad-authority operator key.
+   */
+  acpAdapterSecret?: string;
   policy: PolicyConfig;
   /** P1 #50: Secret required for /diagnostics access (even on loopback). */
   diagnosticsSecret?: string;
+  /** P1 #22: centralized supervisor/verifier runtime configuration. */
+  supervisorMaxInflight: number;
+  verifyMaxInflight: number;
+  verifySandbox: boolean;
   /** Bounded MCP request admission limits. */
   mcpMaxInflight: number;
   mcpMaxInflightPerSession: number;
   mcpMaxQueue: number;
+  /** Independent cap for parked event/review/terminal waiters. */
+  mcpMaxWaiters: number;
+  mcpMaxWaitersPerSession: number;
+  mcpMaxWaiterQueue: number;
   mcpRequestDeadlineMs: number;
   mcpUnusedSessionIdleMs: number;
   mcpEphemeralSessionIdleMs: number;
@@ -286,7 +299,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     ...(files.config.allowedHosts ?? []),
   ];
 
-  return {
+  const config: ServerConfig = {
     host,
     port,
     oauth: parseOAuthConfig(env, files.auth.ownerToken, authMode === "oauth"),
@@ -306,19 +319,27 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     agentDir: resolve(expandHomePath(env.KONTROL_AGENT_DIR ?? files.config.agentDir ?? defaultAgentDir())),
     logging: parseLoggingConfig(env),
     acpEnabled: env.KONTROL_ACP_ENABLED === undefined ? true : parseBoolean(env.KONTROL_ACP_ENABLED),
-    acpPort: parsePort(env.KONTROL_ACP_PORT),
     acpKnownAgents: parseAcpKnownAgents(env.KONTROL_ACP_AGENTS ?? files.config.acpKnownAgents),
     acpSharedSecret: env.KONTROL_ACP_SHARED_SECRET,
     /** Shared secret used by the coding agent (worker) for ACP registration/calls. */
     acpAgentSecret: env.KONTROL_ACP_AGENT_SECRET,
     /** Shared secret used by the reviewer (WebUI) for ACP calls. */
     acpReviewerSecret: env.KONTROL_ACP_REVIEWER_SECRET,
+    // P0 #9: outbound adapter credential; falls back to the legacy shared
+    // secret only for backward compatibility.
+    acpAdapterSecret: env.KONTROL_ACP_ADAPTER_SECRET ?? env.KONTROL_ACP_SHARED_SECRET,
     policy: loadPolicyConfig(env),
     // P1 #50: Diagnostics secret — required for /diagnostics when set
     diagnosticsSecret: env.KONTROL_DIAGNOSTICS_SECRET,
+    supervisorMaxInflight: parsePositiveInteger(env.KONTROL_SUPERVISOR_MAX_INFLIGHT, 4, "KONTROL_SUPERVISOR_MAX_INFLIGHT"),
+    verifyMaxInflight: parsePositiveInteger(env.KONTROL_VERIFY_MAX_INFLIGHT, 3, "KONTROL_VERIFY_MAX_INFLIGHT"),
+    verifySandbox: env.KONTROL_VERIFY_SANDBOX === "1" || env.KONTROL_VERIFY_SANDBOX === "true",
     mcpMaxInflight: parsePositiveInteger(env.KONTROL_MCP_MAX_INFLIGHT, 32, "KONTROL_MCP_MAX_INFLIGHT"),
     mcpMaxInflightPerSession: parsePositiveInteger(env.KONTROL_MCP_MAX_INFLIGHT_PER_SESSION, 8, "KONTROL_MCP_MAX_INFLIGHT_PER_SESSION"),
     mcpMaxQueue: parsePositiveInteger(env.KONTROL_MCP_MAX_QUEUE, 128, "KONTROL_MCP_MAX_QUEUE"),
+    mcpMaxWaiters: parsePositiveInteger(env.KONTROL_MCP_MAX_WAITERS, 64, "KONTROL_MCP_MAX_WAITERS"),
+    mcpMaxWaitersPerSession: parsePositiveInteger(env.KONTROL_MCP_MAX_WAITERS_PER_SESSION, 2, "KONTROL_MCP_MAX_WAITERS_PER_SESSION"),
+    mcpMaxWaiterQueue: parsePositiveInteger(env.KONTROL_MCP_MAX_WAITER_QUEUE, 64, "KONTROL_MCP_MAX_WAITER_QUEUE"),
     mcpRequestDeadlineMs: parsePositiveInteger(env.KONTROL_MCP_REQUEST_DEADLINE_MS, 120_000, "KONTROL_MCP_REQUEST_DEADLINE_MS"),
     // Give a client time to finish model-side reasoning and issue its first
     // useful operation; cleanup remains bounded by admission caps.
@@ -333,6 +354,31 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     mcpSessionSoftCap: parsePositiveInteger(env.KONTROL_MCP_SESSION_SOFT_CAP, 150, "KONTROL_MCP_SESSION_SOFT_CAP"),
     mcpSessionHardCap: parsePositiveInteger(env.KONTROL_MCP_SESSION_HARD_CAP, 200, "KONTROL_MCP_SESSION_HARD_CAP"),
   };
+  const mcpConfig = config;
+
+  // P1 #15: relational validation. Individually-valid values can combine into
+  // configurations where tools are permanently unadmittable or reaper timers
+  // are meaningless — fail at startup with concrete messages instead.
+  const MAX_ADMISSION_WEIGHT = 4; // heavy diff / mission verification (server.mcpAdmissionWeight)
+  if (mcpConfig.mcpMaxInflight < MAX_ADMISSION_WEIGHT) {
+    throw new Error(`KONTROL_MCP_MAX_INFLIGHT=${mcpConfig.mcpMaxInflight} is below the maximum single-request admission weight (${MAX_ADMISSION_WEIGHT}); heavy tools would never be admittable.`);
+  }
+  if (mcpConfig.mcpMaxInflightPerSession < MAX_ADMISSION_WEIGHT) {
+    throw new Error(`KONTROL_MCP_MAX_INFLIGHT_PER_SESSION=${mcpConfig.mcpMaxInflightPerSession} is below the maximum single-request admission weight (${MAX_ADMISSION_WEIGHT}); heavy tools would be permanently blocked per session.`);
+  }
+  if (mcpConfig.mcpMaxWaitersPerSession > mcpConfig.mcpMaxWaiters) {
+    throw new Error(`KONTROL_MCP_MAX_WAITERS_PER_SESSION=${mcpConfig.mcpMaxWaitersPerSession} must not exceed KONTROL_MCP_MAX_WAITERS=${mcpConfig.mcpMaxWaiters}.`);
+  }
+  if (mcpConfig.mcpSessionSoftCap > mcpConfig.mcpSessionHardCap) {
+    throw new Error(`KONTROL_MCP_SESSION_SOFT_CAP=${mcpConfig.mcpSessionSoftCap} must not exceed KONTROL_MCP_SESSION_HARD_CAP=${mcpConfig.mcpSessionHardCap}.`);
+  }
+  if (mcpConfig.mcpSessionMaxPerClient > mcpConfig.mcpSessionHardCap) {
+    throw new Error(`KONTROL_MCP_SESSION_MAX_PER_CLIENT=${mcpConfig.mcpSessionMaxPerClient} must not exceed KONTROL_MCP_SESSION_HARD_CAP=${mcpConfig.mcpSessionHardCap}.`);
+  }
+  if (mcpConfig.mcpSessionReaperIntervalMs > mcpConfig.mcpUnusedSessionIdleMs) {
+    throw new Error(`KONTROL_MCP_SESSION_REAPER_INTERVAL_MS=${mcpConfig.mcpSessionReaperIntervalMs} should not exceed the shortest idle TTL (KONTROL_MCP_UNUSED_SESSION_IDLE_MS=${mcpConfig.mcpUnusedSessionIdleMs}); idle sessions would linger a full extra interval.`);
+  }
+  return config;
 }
 
 function parsePublicBaseUrl(value: string): string {

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseVerificationCommand, runVerificationCommand, verifyMissionSubmission } from "./mission-verifier.js";
@@ -14,6 +14,22 @@ try {
   assert.equal(passing.status, "passed", "allowlisted verification command passes");
   assert.equal(passing.exitCode, 0);
   assert.ok(passing.outputSha256.length === 64);
+
+  const originalPath = process.env.PATH;
+  const originalSecret = process.env.KONTROL_ACP_WORKER_SECRET;
+  process.env.PATH = `${root}:${originalPath ?? ""}`;
+  process.env.KONTROL_ACP_WORKER_SECRET = "must-not-cross-verification-boundary";
+  await writeFile(join(root, "npm"), "#!/usr/bin/node\nconsole.log(process.env.KONTROL_ACP_WORKER_SECRET ?? 'missing')\n");
+  await chmod(join(root, "npm"), 0o755);
+  try {
+    const stripped = await runVerificationCommand("npm probe", root);
+    assert.match(stripped.outputTail, /missing/);
+  } finally {
+    if (originalPath === undefined) delete process.env.PATH;
+    else process.env.PATH = originalPath;
+    if (originalSecret === undefined) delete process.env.KONTROL_ACP_WORKER_SECRET;
+    else process.env.KONTROL_ACP_WORKER_SECRET = originalSecret;
+  }
 
   const failing = await runVerificationCommand("npm test", root);
   assert.equal(failing.status, "failed", "failing verification command is recorded as failed");
@@ -40,13 +56,14 @@ try {
     };
     return {
       evidence,
-      run: (criterionIds?: string[]) => verifyMissionSubmission({
+      run: (criterionIds?: string[], verificationPhase?: "progressive" | "final") => verifyMissionSubmission({
         workSessionId: "work_verify",
         missionLedger: ledger as any,
         workSessions: { get: () => session } as any,
         workspaces: { getWorkspace: () => ({ root }) } as any,
         reviewCheckpoints: { reviewChangesAgainstCommit: async () => ({ summary: { files: input.changed ? 1 : 0 } }) } as any,
         criterionIds,
+        verificationPhase,
       }),
     };
   }
@@ -61,6 +78,19 @@ try {
   assert.equal(full[1].criterionId, "final:1");
   assert.equal(passingHarness.evidence.filter((entry) => entry.source === "server_test_runner").length, 1, "trusted criterion evidence is recorded");
   assert.ok(passingHarness.evidence.some((entry) => entry.completion), "passing final integration records a completion report");
+
+  const phasedHarness = harness({
+    criteria: [
+      { id: "progressive", description: "progressive", verificationCommand: "npm --version", commandVersion: "test-toolchain-v1" },
+      { id: "final-only", description: "final-only", verificationCommand: "npm --version", finalOnly: true },
+    ],
+    finalVerification: ["npm --version"],
+  });
+  const progressive = await phasedHarness.run();
+  assert.deepEqual(progressive.map((result) => result.criterionId), ["progressive"], "progressive verification leaves finalOnly checks for the final phase");
+  const final = await phasedHarness.run(undefined, "final");
+  assert.deepEqual(final.map((result) => result.criterionId), ["progressive", "final-only", "final:1"], "final verification explicitly unlocks finalOnly and integration checks");
+  assert.equal(final[0].source, "reused_exact_snapshot", "already-passed progressive evidence is reused in the final phase");
 
   const filteredHarness = harness({
     criteria: [

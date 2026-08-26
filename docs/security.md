@@ -82,9 +82,38 @@ endpoint, but the tunnel URL should not be treated as a secret.
 The shell tool is powerful by design. It is meant for tests, builds, git, and
 package scripts.
 
-Filesystem path containment applies to Kontrol file tools. Shell commands run
-as local commands and can do what your user account can do. This is why the MCP
-client must be trusted and the Owner password must stay private.
+Filesystem path containment and `KONTROL_POLICY_PATH_RULES` apply to Kontrol's
+structured file tools (`read`, `write`, `edit`, `grep`, `glob`, `ls`, and
+`apply_patch`). They do not inspect arbitrary shell command text or make shell
+execution a filesystem sandbox. Shell commands run as local commands and can do
+what your user account can do. Gate shell independently with
+`KONTROL_POLICY_TOOL_BASH=ask` or `deny`, and use an external OS sandbox when a
+shell command must be confined to a directory. `kontrol doctor` warns when path
+rules are configured while shell remains allowed.
+
+## Child Processes And Verification
+
+Commands launched through process sessions and mission verification receive an
+explicit ordinary-environment allowlist. Kontrol/ACP/OAuth/tunnel/secret,
+token, cookie, and credential variables are stripped before a project command
+starts; ownership and workspace checks are enforced separately from that
+environment boundary.
+
+Mission verification is allowlisted to non-shell executables and rejects shell
+metacharacters and path escapes. For unattended verification, set
+`KONTROL_VERIFY_SANDBOX=1` on Linux. Kontrol then requires Bubblewrap, disables
+network and host namespaces, binds only the workspace, clears the environment,
+and applies CPU, address-space, process, file-descriptor, and output limits. If
+the sandbox primitive is unavailable, verification fails closed instead of
+falling back to unsandboxed execution. Without that setting, verification is a
+reviewer-declared trusted command and still runs with the non-secret child
+environment allowlist.
+
+ACP workers are bound to their registered opaque agent ID and the durable run
+ID; an agent cannot post events, approval decisions, or stdin operations for a
+different run. Cancellation first records a durable `cancelling` state and
+requests remote stop, then releases the workspace lease only after the worker
+has stopped or the remote endpoint is confirmed gone.
 
 ## Worktrees
 
@@ -98,3 +127,9 @@ By default, Kontrol logs requests and tool calls. Shell command previews are
 disabled unless `KONTROL_LOG_SHELL_COMMANDS=1`.
 
 Do not enable shell command logging if commands may contain secrets.
+
+High-volume worker output is buffered and coalesced for transport efficiency.
+The synchronous result is an explicit non-durable receipt until the event is
+committed. Lifecycle, review, policy, approval, and cancellation events remain
+the durable audit record; old output/thought telemetry may be compacted into a
+checkpoint after retention.

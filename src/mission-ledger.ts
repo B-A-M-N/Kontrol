@@ -19,6 +19,7 @@ import {
 
 export type CriterionStatus = "unverified" | "partially_verified" | "verified" | "failed";
 export type FindingStatus = "open" | "claimed_resolved" | "verified_resolved" | "waived";
+export type FindingDisposition = "blocking" | "required_followup" | "advisory" | "future_improvement";
 /**
  * Scope classification for a review finding — the core of the anti-runaway
  * guard. Only `in_scope` and `regression` findings may block approval and extend
@@ -41,6 +42,11 @@ export interface MissionCriterionInput {
   verificationCommand?: string;
   affectedAreas?: string[];
   dependsOnCriterionIds?: string[];
+  verificationGroup?: string;
+  verificationScope?: "focused" | "affected" | "full";
+  finalOnly?: boolean;
+  mutatesWorkspace?: boolean;
+  commandVersion?: string;
 }
 
 export interface ReviewFindingInput {
@@ -49,6 +55,7 @@ export interface ReviewFindingInput {
   scope?: FindingScope;
   severity?: "blocker" | "high" | "medium" | "low";
   category?: "correctness" | "architecture" | "security" | "testing" | "scope" | "maintainability" | "user_intent";
+  disposition?: FindingDisposition;
   description: string;
   evidence?: unknown[];
   requiredAction: string;
@@ -83,6 +90,8 @@ export interface MissionContractInput {
   maxCorrectionRounds?: number;
   /** Commands that must pass together against the exact final submission. */
   finalVerification?: string[];
+  /** Review lenses that must be explicitly covered before completion. */
+  reviewCoverage?: string[];
 }
 
 export interface ApprovalPredicate {
@@ -95,6 +104,18 @@ export interface CurrentApprovalContext {
   snapshotCommit?: string;
   /** Review generation the evidence and approval decision belong to. */
   reviewEpoch?: number;
+}
+
+export interface MissionEvidenceInput {
+  criterionId?: string;
+  submissionId?: string;
+  reviewEpoch?: number;
+  snapshotCommit?: string;
+  leaseNonce?: string;
+  command?: string;
+  status: "passed" | "failed" | "inconclusive";
+  details?: unknown;
+  actorPrincipal?: string;
 }
 
 export interface MissionReviewPacket {
@@ -112,10 +133,16 @@ export interface MissionLedger {
   getMissionByWorkSession(workSessionId: string): ReturnType<typeof rowToMission> | undefined;
   addFindings(missionId: string, findings: ReviewFindingInput[]): Array<ReturnType<typeof rowToFinding>>;
   updateCriterionStatus(missionId: string, updates: Array<{ id: string; status: Exclude<CriterionStatus, "verified"> }>): void;
-  updateFindingStatus(missionId: string, updates: Array<{ id: string; status: FindingStatus; waiverReason?: string; resolutionSubmissionId?: string }>): void;
+  updateFindingStatus(missionId: string, updates: Array<{ id: string; status: FindingStatus; waiverReason?: string; resolutionSubmissionId?: string; disposition?: FindingDisposition }>): void;
   createWorkOrder(missionId: string, workSessionId: string, input: WorkOrderInput): ReturnType<typeof rowToWorkOrder>;
-  recordEvidence(missionId: string, entries: Array<{ criterionId?: string; submissionId?: string; reviewEpoch?: number; snapshotCommit?: string; leaseNonce?: string; command?: string; status: "passed" | "failed" | "inconclusive"; source?: "server_test_runner" | "runtime_probe" | "reviewer_code_inspection" | "reviewer_manual_attestation" | "agent_claim"; details?: unknown }>): void;
-  recordCompletionReport(missionId: string, input: { submissionId: string; snapshotCommit: string; status: "passed" | "failed"; results: unknown }): void;
+  /** Legacy reviewer path: source is assigned by the server, never by input. */
+  recordEvidence(missionId: string, entries: MissionEvidenceInput[]): void;
+  recordReviewerEvidence(missionId: string, entries: MissionEvidenceInput[]): void;
+  recordVerifierEvidence(missionId: string, entries: MissionEvidenceInput[]): void;
+  recordRuntimeProbeEvidence(missionId: string, entries: MissionEvidenceInput[]): void;
+  recordAgentEvidence(missionId: string, entries: MissionEvidenceInput[]): void;
+  recordCompletionReport(missionId: string, input: { submissionId: string; snapshotCommit: string; status: "passed" | "failed"; results: unknown; reviewCoverage?: string[]; uncertainty?: unknown[] }): void;
+  recordReviewCoverage(missionId: string, input: { submissionId: string; snapshotCommit: string; reviewCoverage?: string[]; uncertainty?: unknown[] }): void;
   getCompletionReportHash(workSessionId: string, context: CurrentApprovalContext): string | undefined;
   getPacket(workSessionId: string, approvalContext?: CurrentApprovalContext): MissionReviewPacket;
   canApprove(workSessionId: string, context?: CurrentApprovalContext): ApprovalPredicate;
@@ -142,6 +169,15 @@ export interface NewRoundInput {
   newFindingIds: string[];
   /** Findings resolved (verified_resolved/waived) since the last round. */
   resolvedFindingIds?: string[];
+  /** Optional deterministic progress vector from the verifier/supervisor. */
+  progress?: {
+    blockingFindingCount?: number;
+    failedCriterionCount?: number;
+    passedCriterionCount?: number;
+    failingVerificationCount?: number;
+    unresolvedRequiredActions?: number;
+    madeProgress?: boolean;
+  };
 }
 
 export interface LoopExtensionDecision {
@@ -183,6 +219,7 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
         correctionRounds: 0,
         maxCorrectionRounds: input.maxCorrectionRounds ?? 5,
         finalVerificationJson: JSON.stringify(input.finalVerification ?? []),
+        reviewCoverageJson: JSON.stringify(input.reviewCoverage ?? []),
         createdAt: now,
         updatedAt: now,
       }).run();
@@ -196,6 +233,11 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
           verificationCommand: criterion.verificationCommand ?? null,
           affectedAreasJson: JSON.stringify(criterion.affectedAreas ?? []),
           dependsOnJson: JSON.stringify(criterion.dependsOnCriterionIds ?? []),
+          verificationGroup: criterion.verificationGroup ?? null,
+          verificationScope: criterion.verificationScope ?? "full",
+          finalOnly: criterion.finalOnly ?? false,
+          mutatesWorkspace: criterion.mutatesWorkspace ?? false,
+          commandVersion: criterion.commandVersion ?? null,
           status: "unverified",
           createdAt: now,
           updatedAt: now,
@@ -213,32 +255,68 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
   function addFindings(missionId: string, findings: ReviewFindingInput[]) {
     const now = new Date().toISOString();
     const created: MissionReviewFindingRow[] = [];
-    for (const finding of findings) {
-      const id = finding.id ?? `find_${randomUUID()}`;
-      // Default scope: a finding tied to a submission the agent produced is a
-      // regression; otherwise callers should classify explicitly. We never
-      // default to out_of_scope (that would silently let real issues through).
-      const scope: FindingScope = finding.scope ?? (finding.introducedInSubmissionId ? "regression" : "in_scope");
-      database.db.insert(missionReviewFindings).values({
-        id,
-        missionId,
-        introducedInSubmissionId: finding.introducedInSubmissionId ?? null,
-        scope,
-        severity: finding.severity ?? "medium",
-        category: finding.category ?? "correctness",
-        description: finding.description,
-        evidenceJson: JSON.stringify(finding.evidence ?? []),
-        requiredAction: finding.requiredAction,
-        requiredVerificationJson: JSON.stringify(finding.requiredVerification ?? []),
-        status: "open",
-        resolutionSubmissionId: null,
-        waiverReason: null,
-        createdAt: now,
-        updatedAt: now,
-      }).run();
-      const row = database.db.select().from(missionReviewFindings).where(eq(missionReviewFindings.id, id)).get();
-      if (row) created.push(row);
-    }
+    database.sqlite.transaction(() => {
+      const existingRows = database.db.select().from(missionReviewFindings).where(eq(missionReviewFindings.missionId, missionId)).all();
+      for (const finding of findings) {
+        const id = finding.id ?? `find_${randomUUID()}`;
+        // Default scope: a finding tied to a submission the agent produced is a
+        // regression; otherwise callers should classify explicitly. We never
+        // default to out_of_scope (that would silently let real issues through).
+        const scope: FindingScope = finding.scope ?? (finding.introducedInSubmissionId ? "regression" : "in_scope");
+        const severity = finding.severity ?? "medium";
+        const disposition: FindingDisposition = finding.disposition ?? (scope === "out_of_scope" || !["blocker", "high"].includes(severity) ? "advisory" : "blocking");
+        const fingerprint = semanticFindingFingerprint({
+          category: finding.category ?? "correctness",
+          scope,
+          description: finding.description,
+          requiredAction: finding.requiredAction,
+          evidence: finding.evidence,
+        });
+        const equivalent = existingRows.find((row) =>
+          !["verified_resolved", "waived"].includes(row.status) &&
+          (row.fingerprint === fingerprint || (!row.fingerprint && semanticFindingFingerprint(row) === fingerprint)),
+        );
+        if (equivalent) {
+          const oldEvidence = parseJson<unknown[]>(equivalent.evidenceJson, []);
+          const mergedEvidence = mergeEvidence(oldEvidence, finding.evidence ?? []);
+          const severityRank = (value: string) => ["low", "medium", "high", "blocker"].indexOf(value);
+          const mergedSeverity = severityRank(severity) > severityRank(equivalent.severity) ? severity : equivalent.severity;
+          database.db.update(missionReviewFindings).set({
+            fingerprint,
+            evidenceJson: JSON.stringify(mergedEvidence),
+            severity: mergedSeverity,
+            updatedAt: now,
+          }).where(eq(missionReviewFindings.id, equivalent.id)).run();
+          const refreshed = database.db.select().from(missionReviewFindings).where(eq(missionReviewFindings.id, equivalent.id)).get();
+          if (refreshed) existingRows[existingRows.indexOf(equivalent)] = refreshed;
+          continue;
+        }
+        database.db.insert(missionReviewFindings).values({
+          id,
+          missionId,
+          introducedInSubmissionId: finding.introducedInSubmissionId ?? null,
+          scope,
+          severity,
+          category: finding.category ?? "correctness",
+          disposition,
+          fingerprint,
+          description: finding.description,
+          evidenceJson: JSON.stringify(finding.evidence ?? []),
+          requiredAction: finding.requiredAction,
+          requiredVerificationJson: JSON.stringify(finding.requiredVerification ?? []),
+          status: "open",
+          resolutionSubmissionId: null,
+          waiverReason: null,
+          createdAt: now,
+          updatedAt: now,
+        }).run();
+        const row = database.db.select().from(missionReviewFindings).where(eq(missionReviewFindings.id, id)).get();
+        if (row) {
+          created.push(row);
+          existingRows.push(row);
+        }
+      }
+    })();
     return created.map(rowToFinding);
   }
 
@@ -253,7 +331,7 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
     touchMission(missionId);
   }
 
-  function updateFindingStatus(missionId: string, updates: Array<{ id: string; status: FindingStatus; waiverReason?: string; resolutionSubmissionId?: string }>): void {
+  function updateFindingStatus(missionId: string, updates: Array<{ id: string; status: FindingStatus; waiverReason?: string; resolutionSubmissionId?: string; disposition?: FindingDisposition }>): void {
     const now = new Date().toISOString();
     for (const update of updates) {
       if (update.status === "waived" && !update.waiverReason?.trim()) {
@@ -262,6 +340,7 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
       database.db.update(missionReviewFindings)
         .set({
           status: update.status,
+          ...(update.disposition ? { disposition: update.disposition } : {}),
           waiverReason: update.waiverReason ?? null,
           resolutionSubmissionId: update.resolutionSubmissionId ?? null,
           updatedAt: now,
@@ -302,7 +381,11 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
     return rowToWorkOrder(row);
   }
 
-  function recordEvidence(missionId: string, entries: Array<{ criterionId?: string; submissionId?: string; reviewEpoch?: number; snapshotCommit?: string; leaseNonce?: string; command?: string; status: "passed" | "failed" | "inconclusive"; source?: "server_test_runner" | "runtime_probe" | "reviewer_code_inspection" | "reviewer_manual_attestation" | "agent_claim"; details?: unknown }>): void {
+  function recordEvidenceWithSource(
+    missionId: string,
+    entries: MissionEvidenceInput[],
+    source: "server_test_runner" | "runtime_probe" | "reviewer_manual_attestation" | "agent_claim",
+  ): void {
     const now = new Date().toISOString();
     for (const entry of entries) {
       if (entry.criterionId) {
@@ -311,7 +394,6 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
           .get();
         if (!criterion) throw new Error(`Criterion ${entry.criterionId} does not belong to mission ${missionId}.`);
       }
-      const source = entry.source ?? "reviewer_manual_attestation";
       const details = { ...(typeof entry.details === "object" && entry.details ? entry.details as Record<string, unknown> : { value: entry.details }), source };
       database.db.insert(missionEvidence).values({
         id: `ev_${randomUUID()}`,
@@ -321,6 +403,7 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
         reviewEpoch: entry.reviewEpoch ?? null,
         snapshotCommit: entry.snapshotCommit ?? null,
         leaseNonce: entry.leaseNonce ?? null,
+        actorPrincipal: entry.actorPrincipal ?? null,
         command: entry.command ?? null,
         outputDigest: sha256(JSON.stringify(details)),
         status: entry.status,
@@ -342,6 +425,26 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
     touchMission(missionId);
   }
 
+  function recordEvidence(missionId: string, entries: MissionEvidenceInput[]): void {
+    recordEvidenceWithSource(missionId, entries, "reviewer_manual_attestation");
+  }
+
+  function recordReviewerEvidence(missionId: string, entries: MissionEvidenceInput[]): void {
+    recordEvidenceWithSource(missionId, entries, "reviewer_manual_attestation");
+  }
+
+  function recordVerifierEvidence(missionId: string, entries: MissionEvidenceInput[]): void {
+    recordEvidenceWithSource(missionId, entries, "server_test_runner");
+  }
+
+  function recordRuntimeProbeEvidence(missionId: string, entries: MissionEvidenceInput[]): void {
+    recordEvidenceWithSource(missionId, entries, "runtime_probe");
+  }
+
+  function recordAgentEvidence(missionId: string, entries: MissionEvidenceInput[]): void {
+    recordEvidenceWithSource(missionId, entries, "agent_claim");
+  }
+
   function getPacket(workSessionId: string, approvalContext?: CurrentApprovalContext): MissionReviewPacket {
     const mission = getMissionByWorkSession(workSessionId);
     if (!mission) return { criteria: [], findings: [], workOrders: [], evidence: [], completionReports: [], approval: { allowed: true, reasons: [] } };
@@ -357,19 +460,24 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
   // submission, so callers that don't pass an explicit context still get
   // consistent evidence-bound approval reasoning.
   function getCurrentApprovalContext(workSessionId: string): CurrentApprovalContext {
-    const mission = getMissionByWorkSession(workSessionId);
-    if (!mission) return {};
-    const criteria = database.db.select().from(missionAcceptanceCriteria).where(eq(missionAcceptanceCriteria.missionId, mission.id)).orderBy(asc(missionAcceptanceCriteria.createdAt)).all().map(rowToCriterion);
-    const pendingCriteria = criteria.filter((c) => c.priority === "required" && c.status !== "verified");
-    if (pendingCriteria.length > 0) {
-      return {};
-    }
-    return {};
+    const row = database.db.select({
+      submissionId: workSessionSubmissions.id,
+      snapshotCommit: workSessionSubmissions.snapshotCommit,
+      reviewEpoch: workSessionSubmissions.reviewEpoch,
+    }).from(workSessionSubmissions)
+      .where(eq(workSessionSubmissions.workSessionId, workSessionId))
+      .orderBy(desc(workSessionSubmissions.submissionNumber))
+      .limit(1)
+      .get();
+    return row?.submissionId
+      ? { submissionId: row.submissionId, snapshotCommit: row.snapshotCommit ?? undefined, reviewEpoch: row.reviewEpoch }
+      : {};
   }
 
-  function canApprove(workSessionId: string, context: CurrentApprovalContext = {}): ApprovalPredicate {
+  function canApprove(workSessionId: string, context?: CurrentApprovalContext): ApprovalPredicate {
     const mission = getMissionByWorkSession(workSessionId);
     if (!mission) return { allowed: true, reasons: [] };
+    const currentContext = context ?? getCurrentApprovalContext(workSessionId);
     const packet = getPacketWithoutApproval(mission.id);
     const reasons: string[] = [];
     const criteriaById = new Map(packet.criteria.map((c) => [c.id, c]));
@@ -377,9 +485,11 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
     // P1 #25: Effective criterion status — a criterion cannot be effectively
     // verified unless all its dependencies are effectively verified.
     const effectiveStatus = new Map<string, "verified" | "unverified">();
+    const dependencyCycles = new Set<string>();
     const computeEffective = (criterionId: string, stack: Set<string>): "verified" | "unverified" => {
       if (effectiveStatus.has(criterionId)) return effectiveStatus.get(criterionId)!;
       if (stack.has(criterionId)) {
+        dependencyCycles.add(criterionId);
         effectiveStatus.set(criterionId, "unverified");
         return "unverified";
       }
@@ -392,7 +502,11 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
       }
       const depsOk = (criterion.dependsOnCriterionIds ?? []).every((depId) => computeEffective(depId, stack) === "verified");
       stack.delete(criterionId);
-      const selfOk = criterion.status === "verified";
+      // Dependencies are current-snapshot claims too. Persisted `verified`
+      // status alone is not evidence that the dependency passed this review
+      // generation.
+      const selfOk = criterion.status === "verified"
+        && Boolean(latestCurrentEvidence(mission.id, criterion.id, currentContext));
       const result = selfOk && depsOk ? "verified" : "unverified";
       effectiveStatus.set(criterionId, result);
       return result;
@@ -402,35 +516,69 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
       if (criterion.priority === "required") {
         const eff = computeEffective(criterion.id, new Set());
         if (eff !== "verified") {
-          reasons.push(`Required criterion ${criterion.id} is ${criterion.status}: ${criterion.description}`);
+          if (criterion.status === "verified" && !latestCurrentEvidence(mission.id, criterion.id, currentContext)) {
+            reasons.push(`Required criterion ${criterion.id} has no current non-agent evidence for submission ${currentContext.submissionId ?? "(unknown)"}.`);
+          } else {
+            reasons.push(`Required criterion ${criterion.id} is ${criterion.status}: ${criterion.description}`);
+          }
           continue;
         }
-        const evidence = latestCurrentEvidence(mission.id, criterion.id, context);
+        const evidence = latestCurrentEvidence(mission.id, criterion.id, currentContext);
         if (!evidence) {
-          reasons.push(`Required criterion ${criterion.id} has no current non-agent evidence for submission ${context.submissionId ?? "(unknown)"}.`);
+          reasons.push(`Required criterion ${criterion.id} has no current non-agent evidence for submission ${currentContext.submissionId ?? "(unknown)"}.`);
         }
       }
     }
+    for (const cycle of dependencyCycles) reasons.push(`Dependency cycle detected at criterion ${cycle}.`);
     for (const finding of packet.findings) {
       // Out-of-scope findings are advisory only — they never block approval.
       // This is the anti-runaway guard: a reviewer can surface a pre-existing
       // issue for visibility without trapping the loop forever.
       if (finding.scope === "out_of_scope") continue;
-      if ((finding.severity === "blocker" || finding.severity === "high") && !["verified_resolved", "waived"].includes(finding.status)) {
+      if (finding.disposition === "blocking" && !["verified_resolved", "waived"].includes(finding.status)) {
         reasons.push(`${finding.severity} finding ${finding.id} is ${finding.status}: ${finding.description}`);
       }
     }
     if (mission.finalVerification.length) {
-      const report = context.submissionId && context.snapshotCommit
-        ? database.db.select().from(missionCompletionReports).where(and(eq(missionCompletionReports.missionId, mission.id), eq(missionCompletionReports.submissionId, context.submissionId), eq(missionCompletionReports.snapshotCommit, context.snapshotCommit))).orderBy(desc(missionCompletionReports.createdAt)).get()
+      const report = currentContext.submissionId && currentContext.snapshotCommit
+        ? database.db.select().from(missionCompletionReports).where(and(eq(missionCompletionReports.missionId, mission.id), eq(missionCompletionReports.submissionId, currentContext.submissionId), eq(missionCompletionReports.snapshotCommit, currentContext.snapshotCommit))).orderBy(desc(missionCompletionReports.createdAt)).get()
         : undefined;
       if (!report || report.status !== "passed") reasons.push("Mission-level final integration verification has not passed for the current submission.");
+    }
+    if (mission.reviewCoverage.length) {
+      const report = currentContext.submissionId && currentContext.snapshotCommit
+        ? database.db.select().from(missionCompletionReports).where(and(eq(missionCompletionReports.missionId, mission.id), eq(missionCompletionReports.submissionId, currentContext.submissionId), eq(missionCompletionReports.snapshotCommit, currentContext.snapshotCommit))).orderBy(desc(missionCompletionReports.createdAt)).get()
+        : undefined;
+      const covered = new Set(report ? parseJson<string[]>(report.reviewCoverageJson, []) : []);
+      const missing = mission.reviewCoverage.filter((area) => !covered.has(area));
+      if (missing.length) reasons.push(`Review coverage is incomplete; missing: ${missing.join(", ")}.`);
     }
     return { allowed: reasons.length === 0, reasons };
   }
 
-  function recordCompletionReport(missionId: string, input: { submissionId: string; snapshotCommit: string; status: "passed" | "failed"; results: unknown }): void {
+  function recordCompletionReport(missionId: string, input: { submissionId: string; snapshotCommit: string; status: "passed" | "failed"; results: unknown; reviewCoverage?: string[]; uncertainty?: unknown[] }): void {
     const resultsJson = JSON.stringify(input.results);
+    // P1 #14: keep one authoritative report per
+    // {missionId, submissionId, snapshotCommit}. If reviewer coverage was
+    // recorded first, the verifier's report must MERGE it — otherwise the
+    // newer row would displace covered lenses and block approval forever.
+    const prior = database.db.select().from(missionCompletionReports).where(and(
+      eq(missionCompletionReports.missionId, missionId),
+      eq(missionCompletionReports.submissionId, input.submissionId),
+      eq(missionCompletionReports.snapshotCommit, input.snapshotCommit),
+    )).orderBy(desc(missionCompletionReports.createdAt)).get();
+    const mergeInto = (current: string[], incoming?: string[]) => [...new Set([...current, ...(incoming ?? [])])];
+    if (prior) {
+      const mergedCoverage = mergeInto(parseJson<string[]>(prior.reviewCoverageJson, []), input.reviewCoverage);
+      database.db.update(missionCompletionReports).set({
+        status: input.status,
+        resultsJson,
+        reviewCoverageJson: JSON.stringify(mergedCoverage),
+        uncertaintyJson: JSON.stringify(input.uncertainty ?? parseJson<unknown[]>(prior.uncertaintyJson, [])),
+        reportSha256: createHash("sha256").update(resultsJson).digest("hex"),
+      }).where(eq(missionCompletionReports.id, prior.id)).run();
+      return;
+    }
     database.db.insert(missionCompletionReports).values({
       id: `report_${randomUUID()}`,
       missionId,
@@ -438,7 +586,47 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
       snapshotCommit: input.snapshotCommit,
       status: input.status,
       resultsJson,
+      reviewCoverageJson: JSON.stringify(input.reviewCoverage ?? []),
+      uncertaintyJson: JSON.stringify(input.uncertainty ?? []),
       reportSha256: createHash("sha256").update(resultsJson).digest("hex"),
+      createdAt: new Date().toISOString(),
+    }).run();
+  }
+
+  /** P2 #34/#35: Record which review lenses a reviewer covered and what remains uncertain. */
+  function recordReviewCoverage(missionId: string, input: { submissionId: string; snapshotCommit: string; reviewCoverage?: string[]; uncertainty?: unknown[] }): void {
+    const mission = database.db.select().from(missionContracts).where(eq(missionContracts.id, missionId)).get();
+    if (!mission) throw new Error(`No mission contract ${missionId}.`);
+    const existing = database.db.select().from(missionCompletionReports).where(and(
+      eq(missionCompletionReports.missionId, missionId),
+      eq(missionCompletionReports.submissionId, input.submissionId),
+      eq(missionCompletionReports.snapshotCommit, input.snapshotCommit),
+    )).orderBy(desc(missionCompletionReports.createdAt)).get();
+    const mergeInto = (current: string[], incoming: string[]) => [...new Set([...current, ...incoming])];
+    if (existing) {
+      // Coverage accumulates across reviewer passes for the same submission.
+      const covered = mergeInto(parseJson<string[]>(existing.reviewCoverageJson, []), input.reviewCoverage ?? []);
+      const uncertainty = input.uncertainty ?? parseJson<unknown[]>(existing.uncertaintyJson, []);
+      const changes: Partial<typeof missionCompletionReports.$inferInsert> = {
+        reviewCoverageJson: JSON.stringify(covered),
+      };
+      if (input.uncertainty !== undefined) changes.uncertaintyJson = JSON.stringify(uncertainty);
+      database.db.update(missionCompletionReports).set(changes).where(eq(missionCompletionReports.id, existing.id)).run();
+      return;
+    }
+    // No verifier report exists yet for this submission — create a
+    // coverage-only placeholder so the approval gate can see the lenses that
+    // were explicitly visited even before final integration verification runs.
+    database.db.insert(missionCompletionReports).values({
+      id: `report_${randomUUID()}`,
+      missionId,
+      submissionId: input.submissionId,
+      snapshotCommit: input.snapshotCommit,
+      status: "failed",
+      resultsJson: JSON.stringify([]),
+      reviewCoverageJson: JSON.stringify(input.reviewCoverage ?? []),
+      uncertaintyJson: JSON.stringify(input.uncertainty ?? []),
+      reportSha256: createHash("sha256").update(JSON.stringify([])).digest("hex"),
       createdAt: new Date().toISOString(),
     }).run();
   }
@@ -469,8 +657,7 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
     const newBlocking = round.newFindingIds
       .map((id) => database.db.select().from(missionReviewFindings).where(and(eq(missionReviewFindings.id, id), eq(missionReviewFindings.missionId, mission.id))).get())
       .filter((f): f is MissionReviewFindingRow => !!f)
-      .filter((f) => f.scope !== "out_of_scope")
-      .filter((f) => f.severity === "blocker" || f.severity === "high");
+      .filter((f) => f.scope !== "out_of_scope" && f.disposition === "blocking");
 
     // No new blocking work → the loop has converged. Nothing to extend; the
     // approval predicate decides whether remaining open findings block.
@@ -485,7 +672,8 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
     }
 
     const nextRound = mission.correctionRounds + 1;
-    const madeProgress = (round.resolvedFindingIds?.length ?? 0) > 0;
+    const madeProgress = round.progress?.madeProgress
+      ?? (round.resolvedFindingIds?.length ?? 0) > 0;
 
     // Progress-aware ceiling: if the round is actually resolving prior findings,
     // grant a little headroom so genuinely-needed work is never cut off just for
@@ -559,7 +747,12 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
     updateFindingStatus,
     createWorkOrder,
     recordEvidence,
+    recordReviewerEvidence,
+    recordVerifierEvidence,
+    recordRuntimeProbeEvidence,
+    recordAgentEvidence,
     recordCompletionReport,
+    recordReviewCoverage,
     getCompletionReportHash,
     getPacket,
     canApprove,
@@ -586,6 +779,7 @@ function rowToMission(row: MissionContractRow) {
     correctionRounds: row.correctionRounds ?? 0,
     maxCorrectionRounds: row.maxCorrectionRounds ?? 5,
     finalVerification: parseJson(row.finalVerificationJson, []),
+    reviewCoverage: parseJson<string[]>(row.reviewCoverageJson, []),
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };
@@ -630,6 +824,11 @@ function rowToCriterion(row: MissionAcceptanceCriterionRow) {
     verificationCommand: row.verificationCommand ?? undefined,
     affectedAreas: parseJson(row.affectedAreasJson, []),
     dependsOnCriterionIds: parseJson(row.dependsOnJson, []),
+    verificationGroup: row.verificationGroup ?? undefined,
+    verificationScope: row.verificationScope ?? "full",
+    finalOnly: Boolean(row.finalOnly),
+    mutatesWorkspace: Boolean(row.mutatesWorkspace),
+    commandVersion: row.commandVersion ?? undefined,
     status: row.status,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
@@ -644,6 +843,8 @@ function rowToFinding(row: MissionReviewFindingRow) {
     scope: (row.scope ?? "in_scope") as FindingScope,
     severity: row.severity,
     category: row.category,
+    disposition: (row.disposition ?? "blocking") as FindingDisposition,
+    fingerprint: row.fingerprint ?? undefined,
     description: row.description,
     evidence: parseJson(row.evidenceJson, []),
     requiredAction: row.requiredAction,
@@ -654,6 +855,53 @@ function rowToFinding(row: MissionReviewFindingRow) {
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };
+}
+
+function normalizeFindingText(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/\b(?:line|ln|at)\s*\d+\b/gi, "line")
+    .replace(/\b\d+(?::\d+)+\b/g, "position")
+    .replace(/[^a-z0-9_./ -]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function semanticFindingFingerprint(finding: {
+  category?: string | null;
+  scope?: string | null;
+  description: string;
+  requiredAction: string;
+  evidence?: unknown[] | string | null;
+}): string {
+  const rawEvidence = typeof finding.evidence === "string" ? parseJson<unknown[]>(finding.evidence, []) : finding.evidence ?? [];
+  const locations = rawEvidence.flatMap((entry) => {
+    if (!entry || typeof entry !== "object") return [];
+    const value = entry as Record<string, unknown>;
+    return [value.file, value.path, value.symbol]
+      .filter((part): part is string => typeof part === "string")
+      .map(normalizeFindingText);
+  }).sort();
+  return sha256(JSON.stringify({
+    category: normalizeFindingText(finding.category ?? "correctness"),
+    scope: normalizeFindingText(finding.scope ?? "in_scope"),
+    locations: [...new Set(locations)],
+    requiredAction: normalizeFindingText(finding.requiredAction),
+    description: normalizeFindingText(finding.description),
+  }));
+}
+
+function mergeEvidence(existing: unknown[], incoming: unknown[]): unknown[] {
+  const seen = new Set(existing.map((entry) => JSON.stringify(entry)));
+  const merged = [...existing];
+  for (const entry of incoming) {
+    const encoded = JSON.stringify(entry);
+    if (!seen.has(encoded)) {
+      seen.add(encoded);
+      merged.push(entry);
+    }
+  }
+  return merged;
 }
 
 function rowToWorkOrder(row: MissionWorkOrderRow) {
@@ -685,6 +933,7 @@ function rowToEvidence(row: MissionEvidenceRow) {
     reviewEpoch: row.reviewEpoch ?? undefined,
     snapshotCommit: row.snapshotCommit ?? undefined,
     leaseNonce: row.leaseNonce ?? undefined,
+    actorPrincipal: row.actorPrincipal ?? undefined,
     command: row.command ?? undefined,
     outputDigest: row.outputDigest ?? undefined,
     status: row.status,

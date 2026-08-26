@@ -137,6 +137,7 @@ export const workSessionFeedback = sqliteTable("work_session_feedback", {
   createdAt: text("created_at").notNull(),
 }, (table) => [
   uniqueIndex("work_session_feedback_submission_unique").on(table.submissionId),
+  index("work_session_feedback_session_created_idx").on(table.workSessionId, table.createdAt),
 ]);
 
 export const workSessionToolEvents = sqliteTable("work_session_tool_events", {
@@ -197,17 +198,20 @@ export const agentRegistry = sqliteTable("agent_registry", {
   capabilitiesJson: text("capabilities_json"),
   tags: text("tags"),
   role: text("role"),
+  /** P1 #11: sha256 of the per-agent opaque credential (never the raw secret). */
+  agentCredentialHash: text("agent_credential_hash"),
   lastHeartbeat: text("last_heartbeat").notNull(),
   createdAt: text("created_at").notNull(),
   ttlSeconds: integer("ttl_seconds").notNull().default(60),
 }, (table) => [
-  index("agent_registry_name_idx").on(table.name),
+  uniqueIndex("agent_registry_name_unique").on(table.name),
   index("agent_registry_heartbeat_idx").on(table.lastHeartbeat),
 ]);
 
 export const acpRuns = sqliteTable("acp_runs", {
   runId: text("run_id").primaryKey(),
   agentName: text("agent_name").notNull(),
+  agentId: text("agent_id"),
   workspaceSessionId: text("workspace_session_id"),
   workSessionId: text("work_session_id"),
   remoteRunId: text("remote_run_id"),
@@ -240,10 +244,13 @@ export const agentWebhookQueue = sqliteTable("agent_webhook_queue", {
   retryCount: integer("retry_count").notNull().default(0),
   maxRetries: integer("max_retries").notNull().default(3),
   lastError: text("last_error"),
+  claimedBy: text("claimed_by"),
+  claimExpiresAt: text("claim_expires_at"),
   createdAt: text("created_at").notNull(),
   nextRetryAt: text("next_retry_at"),
 }, (table) => [
   index("webhook_queue_status_idx").on(table.status, table.nextRetryAt),
+  index("webhook_queue_claim_idx").on(table.status, table.claimExpiresAt),
 ]);
 
 export type AgentRegistryRow = typeof agentRegistry.$inferSelect;
@@ -322,6 +329,7 @@ export const approvalRequests = sqliteTable("approval_requests", {
   workSessionId: text("work_session_id"),
   runId: text("run_id"),
   agentId: text("agent_id"),
+  principalId: text("principal_id"),
   title: text("title").notNull(),
   description: text("description"),
   risk: text("risk"),
@@ -338,6 +346,7 @@ export const approvalRequests = sqliteTable("approval_requests", {
   index("approval_requests_workspace_status_idx").on(table.workspaceSessionId, table.status, table.createdAt),
   index("approval_requests_work_session_status_idx").on(table.workSessionId, table.status, table.createdAt),
   index("approval_requests_run_idx").on(table.runId, table.createdAt),
+  index("approval_requests_status_expiry_idx").on(table.status, table.expiresAt),
 ]);
 
 export type ApprovalRequestRow = typeof approvalRequests.$inferSelect;
@@ -386,6 +395,7 @@ export const missionContracts = sqliteTable("mission_contracts", {
   correctionRounds: integer("correction_rounds").notNull().default(0),
   maxCorrectionRounds: integer("max_correction_rounds").notNull().default(5),
   finalVerificationJson: text("final_verification_json").notNull().default("[]"),
+  reviewCoverageJson: text("review_coverage_json").notNull().default("[]"),
   createdAt: text("created_at").notNull(),
   updatedAt: text("updated_at").notNull(),
 }, (table) => [
@@ -399,7 +409,11 @@ export const supervisorRuns = sqliteTable("supervisor_runs", {
   workSessionId: text("work_session_id").notNull().references(() => workSessions.id, { onDelete: "cascade" }),
   workspaceSessionId: text("workspace_session_id").notNull().references(() => workspaceSessions.id, { onDelete: "cascade" }),
   status: text("status").notNull().default("created"), resumeStatus: text("resume_status"), revision: integer("revision").notNull().default(1),
-  cycleNumber: integer("cycle_number").notNull().default(0), maxCycles: integer("max_cycles").notNull().default(10),
+  cycleNumber: integer("cycle_number").notNull().default(0), maxCycles: integer("max_cycles").notNull().default(25),
+  maxStagnantCycles: integer("max_stagnant_cycles").notNull().default(2),
+  repeatedFailureFingerprintLimit: integer("repeated_failure_fingerprint_limit").notNull().default(3),
+  stagnantCycleCount: integer("stagnant_cycle_count").notNull().default(0),
+  progressJson: text("progress_json"), stallReason: text("stall_reason"),
   ownerInstanceId: text("owner_instance_id"), leaseNonce: text("lease_nonce"), leaseExpiresAt: text("lease_expires_at"), heartbeatAt: text("heartbeat_at"),
   lastProcessedEventSeq: integer("last_processed_event_seq").notNull().default(0), lastSubmissionId: text("last_submission_id"), lastSnapshotCommit: text("last_snapshot_commit"),
   nextActionAt: text("next_action_at"), failureCount: integer("failure_count").notNull().default(0), lastError: text("last_error"),
@@ -409,6 +423,17 @@ export const supervisorRuns = sqliteTable("supervisor_runs", {
   createdAt: text("created_at").notNull(), updatedAt: text("updated_at").notNull(),
 }, (table) => [uniqueIndex("supervisor_runs_mission_unique").on(table.missionId), uniqueIndex("supervisor_runs_work_session_unique").on(table.workSessionId), index("supervisor_runs_status_next_idx").on(table.status, table.nextActionAt)]);
 
+export const supervisorProgressSnapshots = sqliteTable("supervisor_progress_snapshots", {
+  id: text("id").primaryKey(),
+  supervisorRunId: text("supervisor_run_id").notNull().references(() => supervisorRuns.id, { onDelete: "cascade" }),
+  workSessionId: text("work_session_id").notNull(),
+  cycleNumber: integer("cycle_number").notNull(),
+  snapshotJson: text("snapshot_json").notNull(),
+  deltaJson: text("delta_json").notNull(),
+  createdAt: text("created_at").notNull(),
+}, (table) => [index("supervisor_progress_run_idx").on(table.supervisorRunId, table.cycleNumber)]);
+export type SupervisorProgressSnapshotRow = typeof supervisorProgressSnapshots.$inferSelect;
+
 export const missionCompletionReports = sqliteTable("mission_completion_reports", {
   id: text("id").primaryKey(),
   missionId: text("mission_id").notNull().references(() => missionContracts.id, { onDelete: "cascade" }),
@@ -416,6 +441,8 @@ export const missionCompletionReports = sqliteTable("mission_completion_reports"
   snapshotCommit: text("snapshot_commit").notNull(),
   status: text("status").notNull(),
   resultsJson: text("results_json").notNull(),
+  reviewCoverageJson: text("review_coverage_json").notNull().default("[]"),
+  uncertaintyJson: text("uncertainty_json").notNull().default("[]"),
   reportSha256: text("report_sha256").notNull(),
   createdAt: text("created_at").notNull(),
 }, (table) => [index("mission_completion_reports_current_idx").on(table.missionId, table.submissionId, table.snapshotCommit, table.createdAt)]);
@@ -430,6 +457,11 @@ export const missionAcceptanceCriteria = sqliteTable("mission_acceptance_criteri
   verificationCommand: text("verification_command"),
   affectedAreasJson: text("affected_areas_json").notNull().default("[]"),
   dependsOnJson: text("depends_on_json").notNull().default("[]"),
+  verificationGroup: text("verification_group"),
+  verificationScope: text("verification_scope").notNull().default("full"),
+  finalOnly: integer("final_only", { mode: "boolean" }).notNull().default(false),
+  mutatesWorkspace: integer("mutates_workspace", { mode: "boolean" }).notNull().default(false),
+  commandVersion: text("command_version"),
   status: text("status").notNull().default("unverified"),
   createdAt: text("created_at").notNull(),
   updatedAt: text("updated_at").notNull(),
@@ -444,6 +476,8 @@ export const missionReviewFindings = sqliteTable("mission_review_findings", {
   scope: text("scope").notNull().default("in_scope"),
   severity: text("severity").notNull().default("medium"),
   category: text("category").notNull().default("correctness"),
+  disposition: text("disposition").notNull().default("blocking"),
+  fingerprint: text("fingerprint"),
   description: text("description").notNull(),
   evidenceJson: text("evidence_json").notNull().default("[]"),
   requiredAction: text("required_action").notNull(),
@@ -486,6 +520,7 @@ export const missionEvidence = sqliteTable("mission_evidence", {
   reviewEpoch: integer("review_epoch"),
   snapshotCommit: text("snapshot_commit"),
   leaseNonce: text("lease_nonce"),
+  actorPrincipal: text("actor_principal"),
   command: text("command"),
   outputDigest: text("output_digest"),
   status: text("status").notNull().default("inconclusive"),

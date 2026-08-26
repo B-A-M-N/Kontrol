@@ -38,8 +38,10 @@ ACP review workflow:
 - `begin_supervised_work`, `inspect_supervised_work`,
   `continue_supervised_work`, and `approve_supervised_work` are the mission
   control plane for acceptance-criterion-driven work.
-- Cancellation is terminal. It must stop the logical work session, supersede
-  pending continuations, and request cancellation from the remote worker.
+- Cancellation is durable and must stop the logical work session, supersede
+  pending continuations, and request cancellation from the remote worker. The
+  record remains in `cancelling` until worker shutdown or a confirmed missing
+  remote run, then becomes terminal; workspace leases stay fenced meanwhile.
 
 Worktree and concurrency guidance:
 
@@ -59,6 +61,37 @@ Core constraints:
   open-ended autonomous loops.
 - Keep delegated work bounded by mission criteria, review checkpoints,
   continuation records, and human approval.
+
+Project scope boundary:
+
+- FI-flow and its model/router integrations are not part of Kontrol/devspace.
+  Do not add them to the project workflow, runtime, documentation, or review
+  gates.
+
+Current implementation contracts:
+
+- Cancellation records a durable intermediate `cancelling` phase, requests the
+  remote worker stop, and becomes terminal only after worker shutdown or a
+  confirmed missing remote run; workspace leases remain fenced until then.
+- Unauthenticated liveness/readiness responses expose boolean status only.
+  Build, process, session, and workflow diagnostics require the appropriate
+  internal readiness or authenticated diagnostics boundary.
+- Project-controlled child processes receive an explicit non-secret
+  environment allowlist. Mission verification is allowlisted and can be made
+  fail-closed sandboxed with `KONTROL_VERIFY_SANDBOX=1`.
+- Supervisor completion is evidence-driven: the persisted progress vector and
+  stagnation/failure-fingerprint policy govern normal stopping; `maxCycles` is
+  only an emergency cycle ceiling. Independent work sessions use the bounded
+  `KONTROL_SUPERVISOR_MAX_INFLIGHT` pool, while each work session remains
+  single-flight.
+- Mission verification binds to the exact submitted tree, schedules dependency
+  aware read-only checks with the bounded `KONTROL_VERIFY_MAX_INFLIGHT` pool,
+  and may reuse evidence only when submission, snapshot, command version,
+  environment, and verifier policy match.
+- Native Hermes supervision distinguishes idle control-plane silence from a
+  known child operation or pending permission. `KONTROL_HERMES_MAX_RUN_SECONDS`
+  remains the absolute safety ceiling, and `KONTROL_HERMES_DEADMAN_IDLE_MS`
+  controls only the idle watchdog.
 
 MCP context isolation:
 

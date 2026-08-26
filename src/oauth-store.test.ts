@@ -73,6 +73,18 @@ async function testDatabaseConfiguration(stateDir: string): Promise<void> {
       { version: 30, name: "verification-lease-identity" },
       { version: 31, name: "supervisor-lease-fencing" },
       { version: 32, name: "workspace-project-identity" },
+      { version: 33, name: "approval-principal-and-expiry-index" },
+      { version: 34, name: "feedback-session-created-index" },
+      { version: 35, name: "mission-evidence-actor-principal" },
+      { version: 36, name: "event-workspace-correlation" },
+      { version: 37, name: "agent-registry-uniqueness" },
+      { version: 38, name: "webhook-queue-claims" },
+      { version: 39, name: "acp-run-agent-binding" },
+      { version: 40, name: "supervisor-progress-policy" },
+      { version: 41, name: "mission-verification-scheduling" },
+      { version: 42, name: "semantic-finding-deduplication" },
+      { version: 43, name: "mission-review-coverage-uncertainty" },
+      { version: 44, name: "agent-per-agent-credential" },
     ]);
   } finally {
     database.close();

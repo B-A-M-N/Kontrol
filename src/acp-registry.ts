@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash, timingSafeEqual } from "node:crypto";
 import { eq, and, lt, desc, sql } from "drizzle-orm";
 import { openDatabase, type DatabaseHandle } from "./db/client.js";
 import {
@@ -10,6 +10,96 @@ import {
   type AgentWebhookQueueRow,
 } from "./db/schema.js";
 
+/**
+ * The final agent report is authoritative run output, so it gets a larger
+ * bounded channel than live telemetry. Keep the bound explicit and shared by
+ * adapters, synchronous dispatch, and durable persistence.
+ */
+export const FINAL_RESULT_MAX_BYTES = 2 * 1024 * 1024;
+
+export function truncateUtf8Tail(value: string, maxBytes = FINAL_RESULT_MAX_BYTES): string {
+  const encoded = Buffer.from(value, "utf8");
+  if (encoded.byteLength <= maxBytes) return value;
+  let start = Math.max(0, encoded.byteLength - maxBytes);
+  while (start < encoded.byteLength && (encoded[start]! & 0xc0) === 0x80) start += 1;
+  return encoded.subarray(start).toString("utf8");
+}
+
+function acpOutputText(value: unknown): string {
+  if (!Array.isArray(value)) return "";
+  return value
+    .flatMap((message) => {
+      if (!message || typeof message !== "object") return [];
+      const parts = (message as { parts?: unknown }).parts;
+      if (!Array.isArray(parts)) return [];
+      return parts.flatMap((part) => {
+        if (!part || typeof part !== "object") return [];
+        const content = (part as { content?: unknown }).content;
+        return typeof content === "string" ? [content] : [];
+      });
+    })
+    .join("\n");
+}
+
+function withFinalOutput(source: Record<string, unknown>, outputText: string): Record<string, unknown> {
+  return {
+    ...source,
+    output: [{
+      role: "agent",
+      parts: [{ content_type: "text/plain", content: outputText }],
+    }],
+  };
+}
+
+function serializedUtf8(source: Record<string, unknown>, outputText: string): string {
+  return JSON.stringify(withFinalOutput(source, outputText));
+}
+
+/** Fit the output by measuring the actual UTF-8 JSON serialization. */
+function fitSerializedOutput(source: Record<string, unknown>, outputText: string): string {
+  const full = serializedUtf8(source, outputText);
+  if (Buffer.byteLength(full, "utf8") <= FINAL_RESULT_MAX_BYTES) return full;
+
+  let low = 0;
+  let high = Buffer.byteLength(outputText, "utf8");
+  let best = serializedUtf8(source, "");
+  while (low <= high) {
+    const candidateBytes = Math.floor((low + high) / 2);
+    const candidate = serializedUtf8(source, truncateUtf8Tail(outputText, candidateBytes));
+    if (Buffer.byteLength(candidate, "utf8") <= FINAL_RESULT_MAX_BYTES) {
+      best = candidate;
+      low = candidateBytes + 1;
+    } else {
+      high = candidateBytes - 1;
+    }
+  }
+  return best;
+}
+
+/** Serialize a final ACP result without turning the persisted JSON invalid. */
+export function serializeFinalAcpResult(result: unknown, finalOutput?: string): string {
+  const source = result && typeof result === "object" && !Array.isArray(result)
+    ? { ...(result as Record<string, unknown>) }
+    : {};
+  const outputText = finalOutput ?? acpOutputText(source.output);
+  const encoded = fitSerializedOutput(source, outputText);
+  if (Buffer.byteLength(encoded, "utf8") <= FINAL_RESULT_MAX_BYTES) return encoded;
+
+  // A peer may include an unexpectedly large diagnostic field. Preserve only
+  // stable scalar identity/status fields, bounded by bytes, before fitting the
+  // authoritative final report. The final fallback is always valid JSON under
+  // the protocol budget, even for a hostile result object.
+  const compact: Record<string, unknown> = {};
+  for (const key of ["run_id", "remote_run_id", "status", "accepted", "mode", "error"]) {
+    const value = source[key];
+    if (typeof value === "string") compact[key] = truncateUtf8Tail(value, 4_096);
+    else if (typeof value === "boolean" || typeof value === "number" || value === null) compact[key] = value;
+  }
+  const compactEncoded = fitSerializedOutput(compact, outputText);
+  if (Buffer.byteLength(compactEncoded, "utf8") <= FINAL_RESULT_MAX_BYTES) return compactEncoded;
+  return serializedUtf8({}, "");
+}
+
 export interface AgentRegistration {
   name: string;
   url: string;
@@ -19,6 +109,33 @@ export interface AgentRegistration {
   tags?: string[];
   role?: "agent" | "client" | string;
   ttlSeconds?: number;
+  /** Existing durable identity, supplied only for authenticated re-registration. */
+  agentId?: string;
+  /** Existing raw credential, supplied only for authenticated re-registration. */
+  agentCredential?: string;
+}
+
+export interface AgentRegistrationResult extends AgentInfo {
+  /** Present only when a new identity is created; never persisted or returned later. */
+  agentCredential?: string;
+}
+
+export class AgentRegistrationError extends Error {
+  constructor(
+    message: string,
+    readonly code: "agent_identity_not_found" | "agent_identity_conflict" | "agent_credential_required" | "agent_credential_invalid",
+    readonly status = code === "agent_credential_required" ? 409 : code === "agent_identity_not_found" ? 404 : 403,
+  ) {
+    super(message);
+    this.name = "AgentRegistrationError";
+  }
+}
+
+function credentialHashMatches(expected: string | null | undefined, presented: string | undefined): boolean {
+  if (!expected || !presented) return false;
+  const actual = Buffer.from(createHash("sha256").update(presented).digest("hex"), "utf8");
+  const wanted = Buffer.from(expected, "utf8");
+  return actual.length === wanted.length && timingSafeEqual(actual, wanted);
 }
 
 export interface AgentInfo {
@@ -38,6 +155,7 @@ export interface AgentInfo {
 export interface PersistentAcpRun {
   runId: string;
   agentName: string;
+  agentId?: string;
   workspaceSessionId?: string;
   workSessionId?: string;
   /** Adapter-side execution-attempt identifier (e.g. crush_local_*). */
@@ -59,16 +177,23 @@ export interface PersistentAcpRun {
 }
 
 export interface AgentRegistryManager {
-  register(registration: AgentRegistration): AgentInfo;
+  register(registration: AgentRegistration): AgentRegistrationResult;
+  /** P1 #11: verify a presented per-agent credential against the durable hash. */
+  verifyAgentCredential(agentId: string, presented: string | undefined): boolean;
+  /** Rotate an identity credential; raw output is returned once only. */
+  rotateAgentCredential(agentId: string, presentedCredential?: string, operatorAuthorized?: boolean): string;
+  /** Revoke an identity credential without deleting its durable identity row. */
+  revokeAgentCredential(agentId: string, presentedCredential?: string, operatorAuthorized?: boolean): void;
   ensure(registration: AgentRegistration): AgentInfo;
   unregister(id: string): void;
-  heartbeat(id: string): void;
+  heartbeat(id: string, presentedCredential?: string): boolean;
   get(id: string): AgentInfo | undefined;
   listAlive(): AgentInfo[];
   listAll(): AgentInfo[];
   pruneExpired(): number;
   createRun(input: {
     agentName: string;
+    agentId?: string;
     workspaceSessionId?: string;
     workSessionId?: string;
     inputPreview?: string;
@@ -101,45 +226,168 @@ export function createAgentRegistryManager(
 
 class SqliteAgentRegistryManager implements AgentRegistryManager {
   private readonly database: DatabaseHandle;
+  private readonly webhookWorkerId = `webhook_worker_${randomUUID()}`;
   private webhookTimer?: ReturnType<typeof setInterval>;
 
   constructor(database: DatabaseHandle) {
     this.database = database;
     this.pruneExpired();
     this.webhookTimer = setInterval(() => {
-      this.processWebhooks().catch(() => {});
+      this.processWebhooks().catch((error) => {
+        console.error(`[kontrol] webhook maintenance failed: ${error instanceof Error ? error.message : String(error)}`);
+      });
     }, 10_000);
   }
 
-  register(registration: AgentRegistration): AgentInfo {
+  register(registration: AgentRegistration): AgentRegistrationResult {
     const now = new Date().toISOString();
-    const id = `agent_${randomUUID()}`;
-    // A logical agent name maps to ONE current endpoint. Re-registering the same
-    // name (e.g. a corrected URL) must replace the stale entry, not create a
-    // duplicate. Without this, two `cli-coding-agent` rows (9876 + 9877) coexist
-    // and name-based dispatch grabs the first — often the broken one.
-    this.database.db
-      .delete(agentRegistry)
-      .where(eq(agentRegistry.name, registration.name))
-      .run();
-    this.database.db
-      .insert(agentRegistry)
-      .values({
-        id,
-        name: registration.name,
-        url: registration.url,
-        description: registration.description ?? null,
-        publicKey: registration.publicKey ?? null,
-        capabilitiesJson: registration.capabilities ? JSON.stringify(registration.capabilities) : null,
-        tags: registration.tags?.join(",") ?? null,
-        role: registration.role ?? "agent",
-        lastHeartbeat: now,
-        createdAt: now,
-        ttlSeconds: registration.ttlSeconds ?? 60,
-      })
-      .run();
+    const result = this.database.sqlite.transaction(() => {
+      const byId = registration.agentId
+        ? this.database.sqlite.prepare("select id, name, agent_credential_hash from agent_registry where id = ?")
+          .get(registration.agentId) as { id: string; name: string; agent_credential_hash?: string | null } | undefined
+        : undefined;
+      const byName = this.database.sqlite
+        .prepare("select id, name, agent_credential_hash from agent_registry where name = ?")
+        .get(registration.name) as { id: string; name: string; agent_credential_hash?: string | null } | undefined;
 
-    return this.get(id)!;
+      if (registration.agentId && !byId) {
+        throw new AgentRegistrationError(
+          `Unknown agent identity: ${registration.agentId}`,
+          "agent_identity_not_found",
+          404,
+        );
+      }
+      if (byId && byName && byId.id !== byName.id) {
+        throw new AgentRegistrationError(
+          `Agent name ${registration.name} belongs to another identity`,
+          "agent_identity_conflict",
+          409,
+        );
+      }
+
+      const existing = byId ?? byName;
+      if (existing) {
+        if (existing.name !== registration.name) {
+          throw new AgentRegistrationError(
+            `Agent identity ${existing.id} is registered as ${existing.name}, not ${registration.name}`,
+            "agent_identity_conflict",
+            409,
+          );
+        }
+        // A bootstrap secret authenticates the caller to ACP, but does not
+        // prove ownership of an existing agent identity. Re-registration must
+        // carry both the durable ID and its prior credential.
+        if (!registration.agentId || registration.agentId !== existing.id) {
+          throw new AgentRegistrationError(
+            `Agent identity ${existing.id} already exists; agentId and its credential are required to re-register it`,
+            "agent_credential_required",
+            409,
+          );
+        }
+        if (!credentialHashMatches(existing.agent_credential_hash, registration.agentCredential)) {
+          throw new AgentRegistrationError(
+            `Invalid credential for agent identity ${existing.id}`,
+            "agent_credential_invalid",
+            403,
+          );
+        }
+        // Preserve the credential on ordinary re-registration. Rotation is a
+        // separate operator-controlled operation, so a bootstrap-secret holder
+        // cannot silently seize a live identity by name.
+        this.database.sqlite.prepare(`
+          update agent_registry
+             set url = ?, description = ?, public_key = ?, capabilities_json = ?,
+                 tags = ?, role = ?, last_heartbeat = ?, ttl_seconds = ?
+           where id = ?
+        `).run(
+          registration.url,
+          registration.description ?? null,
+          registration.publicKey ?? null,
+          registration.capabilities ? JSON.stringify(registration.capabilities) : null,
+          registration.tags?.join(",") ?? null,
+          registration.role ?? "agent",
+          now,
+          registration.ttlSeconds ?? 60,
+          existing.id,
+        );
+        return { id: existing.id, agentCredential: undefined };
+      }
+
+      if (registration.agentCredential) {
+        throw new AgentRegistrationError(
+          "An agent credential cannot create a new identity",
+          "agent_credential_invalid",
+          403,
+        );
+      }
+
+      const newId = `agent_${randomUUID()}`;
+      const agentCredential = `agcred_${randomUUID()}`;
+      this.database.sqlite.prepare(`
+        insert into agent_registry
+          (id, name, url, description, public_key, capabilities_json, tags, role, agent_credential_hash, last_heartbeat, created_at, ttl_seconds)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        newId,
+        registration.name,
+        registration.url,
+        registration.description ?? null,
+        registration.publicKey ?? null,
+        registration.capabilities ? JSON.stringify(registration.capabilities) : null,
+        registration.tags?.join(",") ?? null,
+        registration.role ?? "agent",
+        createHash("sha256").update(agentCredential).digest("hex"),
+        now,
+        now,
+        registration.ttlSeconds ?? 60,
+      );
+      return { id: newId, agentCredential };
+    })();
+
+    const agent = this.get(result.id)! as AgentRegistrationResult;
+    if (result.agentCredential) agent.agentCredential = result.agentCredential;
+    return agent;
+  }
+
+  /**
+   * P1 #11: verify that a presented per-agent credential matches the durable
+   * credential issued for that agent ID. Returns false when the agent has no
+   * credential (pre-migration rows) or the value does not match.
+   */
+  verifyAgentCredential(agentId: string, presented: string | undefined): boolean {
+    if (!presented) return false;
+    const row = this.database.sqlite.prepare("select agent_credential_hash from agent_registry where id = ?")
+      .get(agentId) as { agent_credential_hash?: string | null } | undefined;
+    if (!row?.agent_credential_hash) return false;
+    return credentialHashMatches(row.agent_credential_hash, presented);
+  }
+
+  rotateAgentCredential(agentId: string, presentedCredential?: string, operatorAuthorized = false): string {
+    const nextCredential = `agcred_${randomUUID()}`;
+    const changed = this.database.sqlite.transaction(() => {
+      const row = this.database.sqlite.prepare("select agent_credential_hash from agent_registry where id = ?")
+        .get(agentId) as { agent_credential_hash?: string | null } | undefined;
+      if (!row) throw new AgentRegistrationError(`Unknown agent identity: ${agentId}`, "agent_identity_not_found", 404);
+      if (!operatorAuthorized && !credentialHashMatches(row.agent_credential_hash, presentedCredential)) {
+        throw new AgentRegistrationError(`Invalid credential for agent identity ${agentId}`, "agent_credential_invalid", 403);
+      }
+      return this.database.sqlite.prepare("update agent_registry set agent_credential_hash = ? where id = ?")
+        .run(createHash("sha256").update(nextCredential).digest("hex"), agentId).changes > 0;
+    })();
+    if (!changed) throw new AgentRegistrationError(`Unknown agent identity: ${agentId}`, "agent_identity_not_found", 404);
+    return nextCredential;
+  }
+
+  revokeAgentCredential(agentId: string, presentedCredential?: string, operatorAuthorized = false): void {
+    this.database.sqlite.transaction(() => {
+      const row = this.database.sqlite.prepare("select agent_credential_hash from agent_registry where id = ?")
+        .get(agentId) as { agent_credential_hash?: string | null } | undefined;
+      if (!row) throw new AgentRegistrationError(`Unknown agent identity: ${agentId}`, "agent_identity_not_found", 404);
+      if (!operatorAuthorized && !credentialHashMatches(row.agent_credential_hash, presentedCredential)) {
+        throw new AgentRegistrationError(`Invalid credential for agent identity ${agentId}`, "agent_credential_invalid", 403);
+      }
+      this.database.sqlite.prepare("update agent_registry set agent_credential_hash = null where id = ?").run(agentId);
+    })();
   }
 
   ensure(registration: AgentRegistration): AgentInfo {
@@ -183,13 +431,14 @@ class SqliteAgentRegistryManager implements AgentRegistryManager {
       .run();
   }
 
-  heartbeat(id: string): void {
+  heartbeat(id: string, presentedCredential?: string): boolean {
     const now = new Date().toISOString();
-    this.database.db
-      .update(agentRegistry)
-      .set({ lastHeartbeat: now })
-      .where(eq(agentRegistry.id, id))
-      .run();
+    const result = presentedCredential
+      ? this.database.sqlite.prepare(
+        "update agent_registry set last_heartbeat = ? where id = ? and agent_credential_hash = ?",
+      ).run(now, id, createHash("sha256").update(presentedCredential).digest("hex"))
+      : this.database.db.update(agentRegistry).set({ lastHeartbeat: now }).where(eq(agentRegistry.id, id)).run();
+    return result.changes > 0;
   }
 
   get(id: string): AgentInfo | undefined {
@@ -247,6 +496,7 @@ class SqliteAgentRegistryManager implements AgentRegistryManager {
 
   createRun(input: {
     agentName: string;
+    agentId?: string;
     workspaceSessionId?: string;
     workSessionId?: string;
     inputPreview?: string;
@@ -260,6 +510,7 @@ class SqliteAgentRegistryManager implements AgentRegistryManager {
     const run: PersistentAcpRun = {
       runId,
       agentName: input.agentName,
+      agentId: input.agentId,
       workspaceSessionId: input.workspaceSessionId,
       workSessionId: input.workSessionId,
       remoteRunId: input.remoteRunId,
@@ -276,6 +527,7 @@ class SqliteAgentRegistryManager implements AgentRegistryManager {
       .values({
         runId: run.runId,
         agentName: run.agentName,
+        agentId: run.agentId ?? null,
         workspaceSessionId: run.workspaceSessionId ?? null,
         workSessionId: run.workSessionId ?? null,
         remoteRunId: run.remoteRunId ?? null,
@@ -391,6 +643,8 @@ class SqliteAgentRegistryManager implements AgentRegistryManager {
         retryCount: 0,
         maxRetries: 3,
         lastError: null,
+        claimedBy: null,
+        claimExpiresAt: null,
         createdAt: now,
         nextRetryAt: now,
       })
@@ -399,20 +653,36 @@ class SqliteAgentRegistryManager implements AgentRegistryManager {
 
   async processWebhooks(): Promise<number> {
     const now = new Date().toISOString();
-    const pending = this.database.db
-      .select()
-      .from(agentWebhookQueue)
-      .where(
-        and(
-          eq(agentWebhookQueue.status, "pending"),
-          sql`${agentWebhookQueue.nextRetryAt} <= ${now}`,
-        ),
-      )
-      .limit(10)
-      .all();
+
+    // Recover claims abandoned by a crashed worker. A live claim is never
+    // handled by a second registry instance.
+    this.database.sqlite.prepare(`
+      update agent_webhook_queue
+         set status = 'pending', claimed_by = null, claim_expires_at = null
+       where status = 'processing' and claim_expires_at <= ?
+    `).run(now);
 
     let delivered = 0;
-    for (const item of pending) {
+    for (let index = 0; index < 10; index += 1) {
+      const item = this.database.sqlite.transaction(() => {
+        const candidate = this.database.sqlite.prepare(`
+          select * from agent_webhook_queue
+           where status = 'pending'
+             and (next_retry_at is null or next_retry_at <= ?)
+           order by created_at asc
+           limit 1
+        `).get(now) as AgentWebhookQueueRow | undefined;
+        if (!candidate) return undefined;
+        const claimUntil = new Date(Date.now() + 60_000).toISOString();
+        const claimed = this.database.sqlite.prepare(`
+          update agent_webhook_queue
+             set status = 'processing', claimed_by = ?, claim_expires_at = ?
+           where id = ? and status = 'pending'
+        `).run(this.webhookWorkerId, claimUntil, candidate.id);
+        return claimed.changes === 1 ? { ...candidate, status: "processing", claimedBy: this.webhookWorkerId, claimExpiresAt: claimUntil } : undefined;
+      })();
+      if (!item) break;
+
       try {
         const response = await fetch(item.targetUrl, {
           method: "POST",
@@ -424,8 +694,8 @@ class SqliteAgentRegistryManager implements AgentRegistryManager {
         if (response.ok) {
           this.database.db
             .update(agentWebhookQueue)
-            .set({ status: "delivered" })
-            .where(eq(agentWebhookQueue.id, item.id))
+            .set({ status: "delivered", claimedBy: null, claimExpiresAt: null })
+            .where(and(eq(agentWebhookQueue.id, item.id), eq(agentWebhookQueue.status, "processing"), eq(agentWebhookQueue.claimedBy, this.webhookWorkerId)))
             .run();
           delivered++;
         } else {
@@ -433,25 +703,32 @@ class SqliteAgentRegistryManager implements AgentRegistryManager {
         }
       } catch (error) {
         const retryCount = item.retryCount + 1;
-        const updates: Record<string, unknown> = {
-          retryCount,
-          lastError: error instanceof Error ? error.message : String(error),
-        };
+        let nextRetryAt: string | null = null;
+        let finalStatus: "pending" | "failed" = "pending";
+        const lastError = error instanceof Error ? error.message : String(error);
 
         if (retryCount >= item.maxRetries) {
-          updates.status = "failed";
+          finalStatus = "failed";
         } else {
           const delay = Math.pow(2, retryCount) * 5_000;
-          updates.nextRetryAt = new Date(Date.now() + delay).toISOString();
+          nextRetryAt = new Date(Date.now() + delay).toISOString();
         }
 
         this.database.db
           .update(agentWebhookQueue)
-          .set(updates)
-          .where(eq(agentWebhookQueue.id, item.id))
+          .set({ retryCount, lastError, status: finalStatus, nextRetryAt, claimedBy: null, claimExpiresAt: null })
+          .where(and(eq(agentWebhookQueue.id, item.id), eq(agentWebhookQueue.status, "processing"), eq(agentWebhookQueue.claimedBy, this.webhookWorkerId)))
           .run();
       }
     }
+
+    // Webhook delivery is an integration aid, not immutable workflow history.
+    // Retain terminal queue rows long enough for diagnosis, then compact them.
+    const retentionCutoff = new Date(Date.now() - 30 * 24 * 60 * 60_000).toISOString();
+    this.database.sqlite.prepare(`
+      delete from agent_webhook_queue
+       where status in ('delivered', 'failed') and created_at < ?
+    `).run(retentionCutoff);
 
     return delivered;
   }
@@ -503,6 +780,7 @@ function rowToPersistentRun(row: AcpRunRow): PersistentAcpRun {
   return {
     runId: row.runId,
     agentName: row.agentName,
+    agentId: row.agentId ?? undefined,
     workspaceSessionId: row.workspaceSessionId ?? undefined,
     workSessionId: row.workSessionId ?? undefined,
     remoteRunId: row.remoteRunId ?? undefined,

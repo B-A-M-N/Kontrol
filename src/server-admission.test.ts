@@ -21,6 +21,22 @@ assert.ok(second, "a released slot drains the queue");
 second();
 assert.equal(admission.getStats().active, 0);
 
+// Weighted admission protects lightweight control traffic from a small number
+// of expensive repository operations while retaining the request-count stats.
+const weightedAdmission = new McpAdmission(4, 4, 2);
+const heavy = await weightedAdmission.acquire("session-heavy", 100, 3);
+const light = await weightedAdmission.acquire("session-light", 100, 1);
+assert.ok(heavy && light);
+const weightedQueue = weightedAdmission.acquire("session-next", 100, 2);
+assert.equal(weightedAdmission.getStats().active, 2);
+assert.equal(weightedAdmission.getStats().queued, 1);
+light?.();
+await new Promise<void>((resolve) => setImmediate(resolve));
+assert.equal(weightedAdmission.getStats().queued, 1, "a queued operation must wait until its full weight is available");
+heavy?.();
+assert.ok(await weightedQueue, "weighted queue drains after enough capacity is released");
+weightedAdmission.close();
+
 const timeoutAdmission = new McpAdmission(1, 1, 1);
 const held = await timeoutAdmission.acquire("held", 100);
 assert.ok(held);
@@ -42,5 +58,18 @@ const initialLeases = await Promise.all(burst.slice(0, 32));
 assert.equal(initialLeases.filter((lease) => typeof lease === "function").length, 32, "the first burst is admitted as bounded leases");
 initialLeases.forEach((lease) => lease?.());
 burstAdmission.close();
+
+// Long-poll waiters have an independent budget: parked review/event calls do
+// not consume execution permits needed by read/edit/bash traffic.
+const executionAdmission = new McpAdmission(1, 1, 0);
+const waiterAdmission = new McpAdmission(1, 1, 0);
+const executionLease = await executionAdmission.acquire("tool-session", 10);
+const waiterLease = await waiterAdmission.acquire("ui-session", 10);
+assert.ok(executionLease, "execution admission grants normal work");
+assert.ok(waiterLease, "waiter admission grants a parked wait independently");
+executionLease?.();
+waiterLease?.();
+executionAdmission.close();
+waiterAdmission.close();
 
 console.log("server-admission.test.ts: all assertions passed");

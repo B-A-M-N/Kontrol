@@ -22,5 +22,7 @@ scripts/test-*.mjs
 
 # Generated runtime/test state — must never be shipped or captured in review snapshots
 .kontrol-uat/
+.kontrol-state/
 .kontrol-build-*
 .kontrol-dist-backup-*
+.claude/settings.local.json

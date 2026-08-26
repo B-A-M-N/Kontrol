@@ -12,6 +12,8 @@ import { randomUUID } from "node:crypto";
 import { delimiter, dirname, isAbsolute, join } from "node:path";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { realpath, stat } from "node:fs/promises";
+import { clearAgentIdentity, identityHeaders, loadAgentIdentity, saveAgentIdentity } from "./lib/acp-agent-identity.mjs";
+import { readJsonBody, truncateUtf8Tail, writeAdapterError } from "./lib/adapter-http.mjs";
 
 const KONTROL_ACP_URL = process.env.KONTROL_ACP_URL || "http://127.0.0.1:7676/acp";
 const AGENT_SECRET = process.env.KONTROL_ACP_AGENT_SECRET;
@@ -19,9 +21,12 @@ const ADAPTER_SECRET = process.env.KONTROL_ACP_ADAPTER_SECRET;
 const HERMES_BIN = process.env.HERMES_BIN || "hermes";
 const HERMES_AGENT_ROOT = process.env.HERMES_AGENT_ROOT || detectHermesAgentRoot() || process.cwd();
 const ADAPTER_PORT = Number(process.env.HERMES_ACP_ADAPTER_PORT || process.env.ACP_ADAPTER_PORT || "9911");
-const ADAPTER_HOST = process.env.HOST || "127.0.0.1";
+const ADAPTER_HOST = process.env.HERMES_ACP_ADAPTER_HOST || "127.0.0.1";
 const RUNNER = new URL("./hermes-native-runner.py", import.meta.url).pathname;
 const HERMES_ACP_COMPAT_PATH = new URL("./hermes-acp-compat", import.meta.url).pathname;
+const DEADMAN_IDLE_MS = positiveDuration(process.env.KONTROL_HERMES_DEADMAN_IDLE_MS, 5 * 60_000);
+const MAX_RUN_MS = positiveDuration(process.env.KONTROL_HERMES_MAX_RUN_SECONDS, 2 * 60 * 60) * 1000;
+const FINAL_OUTPUT_BYTES = 2 * 1024 * 1024;
 
 if (process.argv.includes("--validate-imports")) {
   console.log("[hermes-native] import validation ok");
@@ -50,7 +55,7 @@ if (check.status !== 0) {
 const PYTHON_BIN = resolveHermesPython();
 let degraded = PYTHON_BIN === null;
 const active = new Map();
-let agentId = null;
+let agentIdentity = null;
 
 if (degraded) {
   console.error("[hermes-native] starting in DEGRADED mode — Hermes runs will be rejected until fixed");
@@ -69,7 +74,7 @@ if (degraded) {
 createServer((req, res) => {
   handle(req, res).catch((err) => {
     console.error("[hermes-native] request error:", err);
-    writeJson(res, 500, { error: { message: String(err?.message || err) } });
+    writeAdapterError(res, err);
   });
 }).listen(ADAPTER_PORT, ADAPTER_HOST, () => {
   console.log(`[hermes-native] listening on ${ADAPTER_HOST}:${ADAPTER_PORT}`);
@@ -91,9 +96,10 @@ async function registerAgentWithRetry() {
 }
 
 async function registerAgent() {
+  let identity = agentIdentity || await loadAgentIdentity("hermes-agent");
   const res = await fetch(`${KONTROL_ACP_URL}/agents/register`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", authorization: `Bearer ${AGENT_SECRET}` },
+    headers: { "Content-Type": "application/json", authorization: `Bearer ${AGENT_SECRET}`, ...identityHeaders(identity) },
     body: JSON.stringify({
       name: "hermes-agent",
       url: `http://${ADAPTER_HOST}:${ADAPTER_PORT}`,
@@ -103,26 +109,35 @@ async function registerAgent() {
       ttlSeconds: 90,
     }),
   });
-  if (!res.ok) throw new Error(`registration failed ${res.status}: ${await res.text()}`);
+  if (!res.ok) {
+    if (res.status === 404 && identity) {
+      await clearAgentIdentity("hermes-agent");
+      agentIdentity = null;
+      return registerAgent();
+    }
+    throw new Error(`registration failed ${res.status}: ${await res.text()}`);
+  }
   const json = await res.json();
-  agentId = json.id;
-  console.log(`[hermes-native] registered as hermes-agent (id=${agentId})`);
+  const credential = typeof json.agentCredential === "string" ? json.agentCredential : identity?.agentCredential;
+  if (typeof json.id !== "string" || !credential) throw new Error("registration response did not include a usable agent identity");
+  agentIdentity = { agentId: json.id, agentCredential: credential };
+  await saveAgentIdentity("hermes-agent", agentIdentity);
+  console.log(`[hermes-native] registered as hermes-agent (id=${agentIdentity.agentId})`);
 }
 
 async function heartbeat() {
-  if (!agentId) return;
-  const res = await fetch(`${KONTROL_ACP_URL}/agents/${agentId}/heartbeat`, {
+  if (!agentIdentity) return;
+  const res = await fetch(`${KONTROL_ACP_URL}/agents/${agentIdentity.agentId}/heartbeat`, {
     method: "POST",
-    headers: { authorization: `Bearer ${AGENT_SECRET}` },
+    headers: { authorization: `Bearer ${AGENT_SECRET}`, ...identityHeaders(agentIdentity) },
   });
-  if (res.status === 404) await registerAgentWithRetry();
+  if (res.status === 404) {
+    agentIdentity = null;
+    await registerAgentWithRetry();
+  }
 }
 
 async function handle(req, res) {
-  const chunks = [];
-  for await (const chunk of req) chunks.push(chunk);
-  const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString()) : {};
-
   if (req.method === "GET" && req.url === "/health") {
     return writeJson(res, 200, { ok: !degraded, degraded, agent: "hermes-agent", active: active.size, native: true });
   }
@@ -145,6 +160,7 @@ async function handle(req, res) {
   if ((req.headers.authorization || "") !== `Bearer ${ADAPTER_SECRET}`) {
     return writeJson(res, 401, { error: { code: "unauthorized" } });
   }
+  const body = await readJsonBody(req);
   if (degraded) {
     return writeJson(res, 503, { error: { code: "degraded", message: "Hermes adapter is degraded: no Python interpreter found" } });
   }
@@ -158,6 +174,7 @@ async function handle(req, res) {
     devRunId: body.parent_run_id || body.run_id,
     workSessionId: body.session_id,
     workspaceSessionId: body.workspace_session_id,
+    agentId: body.agent_id,
     task: extractTask(body.input),
     workspaceRoot,
     child: null,
@@ -165,11 +182,14 @@ async function handle(req, res) {
     finalized: false,
     explicitCompletion: false,
     pendingPermissions: new Map(),
+    activeChildOperations: new Set(),
     lastRunnerActivityAt: Date.now(),
+    absoluteDeadlineAt: Date.now() + MAX_RUN_MS,
     sawAgentMessage: false,
     sendChain: Promise.resolve(),
     deliveryErrors: [],
     terminalOutcome: null,
+    finalOutput: "",
   };
   if (run.workSessionId && hasActiveSession(run.workSessionId)) {
     return writeJson(res, 409, { error: { code: "duplicate_session", message: `work session already active: ${run.workSessionId}` } });
@@ -191,6 +211,7 @@ async function handle(req, res) {
         cwd: workspaceRoot,
         task: run.task,
         runId: run.remoteRunId,
+        maxRunSeconds: Math.floor(MAX_RUN_MS / 1000),
       }),
     },
   });
@@ -203,9 +224,19 @@ async function handle(req, res) {
   // 20-second heuristic. The deadman timer is a periodic idle-activity
   // check, NOT a wall-clock run limit — a healthy long-running task must
   // never be killed merely because it has been running for a long time.
-  const DEADMAN_IDLE_MS = 5 * 60_000; // 5 minutes without any runner event = broken
   run.deadmanTimer = setInterval(() => {
     if (run.finalized) return;
+    if (Date.now() >= run.absoluteDeadlineAt) {
+      const elapsedMs = Date.now() - (run.absoluteDeadlineAt - MAX_RUN_MS);
+      console.warn(`[hermes-native] absolute run ceiling for ${run.remoteRunId} — ${elapsedMs}ms elapsed`);
+      finalizeRun(run, "failed", `absolute run ceiling exceeded — ${Math.round(elapsedMs / 1000)}s`);
+      terminateChild(run, "absolute run ceiling");
+      return;
+    }
+    // A permission request or explicitly reported child operation is
+    // meaningful activity even when Hermes is quiet while it runs. The
+    // absolute ceiling remains the final safety boundary for a wedged child.
+    if (run.pendingPermissions.size > 0 || run.activeChildOperations.size > 0) return;
     const idleMs = Date.now() - run.lastRunnerActivityAt;
     if (idleMs > DEADMAN_IDLE_MS) {
       console.warn(`[hermes-native] deadman idle timeout for ${run.remoteRunId} — ${idleMs}ms since last runner event`);
@@ -259,6 +290,7 @@ function handleRunnerLine(run, line) {
   if (msg.type === "raw_request") return reportRawRequest(run, msg);
   if (msg.type === "permission_request") return handlePermissionRequest(run, msg);
   if (msg.type === "event") {
+    noteChildOperation(run, msg.eventType, msg.data);
     const text = msg.data?.text || msg.data?.error || JSON.stringify(msg.data || {});
     return reportOutput(run, text, msg.eventType);
   }
@@ -277,6 +309,7 @@ function handleRunnerLine(run, line) {
 function reportRawUpdate(run, params) {
   const update = params?.update && typeof params.update === "object" ? params.update : {};
   const updateType = String(update.sessionUpdate || update.type || update.kind || "unknown");
+  noteChildOperation(run, updateType, update);
   if (updateType === "agent_message_chunk") {
     return reportOutput(run, textFromContent(update.content), "message");
   }
@@ -339,6 +372,7 @@ async function handlePermissionRequest(run, msg) {
     return sendPermissionResponse(run, requestId, { approved: false });
   }
   run.pendingPermissions.set(requestId, approval.approval_id);
+  refreshOperationActivity(run);
   reportStructured(run, "output_delta", {
     channel: "permission",
     text: `Hermes requested permission: ${title}`,
@@ -350,7 +384,7 @@ async function handlePermissionRequest(run, msg) {
 async function createKontrolApproval(run, payload) {
   const res = await fetch(`${KONTROL_ACP_URL}/runs/${run.devRunId}/events`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", authorization: `Bearer ${AGENT_SECRET}` },
+    headers: { "Content-Type": "application/json", authorization: `Bearer ${AGENT_SECRET}`, ...identityHeaders(agentIdentity) },
     body: JSON.stringify({
       type: "permission.requested",
       remote_run_id: run.remoteRunId,
@@ -375,9 +409,10 @@ async function waitForApprovalResolution(run, requestId, approvalId, options) {
     if (!active.has(run.remoteRunId)) {
       sendPermissionResponse(run, requestId, { approved: false });
       run.pendingPermissions.delete(requestId);
+      refreshOperationActivity(run);
       return;
     }
-    const decision = await fetchApprovalDecision(approvalId);
+    const decision = await fetchApprovalDecision(run, approvalId);
     if (!decision) {
       // Transient error reaching the server — back off briefly and re-park.
       await sleep(2000);
@@ -392,13 +427,14 @@ async function waitForApprovalResolution(run, requestId, approvalId, options) {
     const approved = decision.decision === "approve" && (option ? option.effect === "approve" : true);
     sendPermissionResponse(run, requestId, { approved, optionId });
     run.pendingPermissions.delete(requestId);
+    refreshOperationActivity(run);
     return;
   }
 }
 
-async function fetchApprovalDecision(approvalId) {
+async function fetchApprovalDecision(run, approvalId) {
   const res = await fetch(`${KONTROL_ACP_URL}/approvals/${approvalId}/decision`, {
-    headers: { authorization: `Bearer ${AGENT_SECRET}` },
+    headers: { authorization: `Bearer ${AGENT_SECRET}`, ...identityHeaders(agentIdentity) },
   }).catch(() => undefined);
   if (!res?.ok) return undefined;
   return res.json().catch(() => undefined);
@@ -414,9 +450,37 @@ function sendPermissionResponse(run, requestId, response) {
   }) + "\n");
 }
 
+function noteChildOperation(run, eventType, data) {
+  const type = String(eventType || "").toLowerCase();
+  const update = data && typeof data === "object" ? data : {};
+  if (!type.includes("tool") && !type.includes("command") && !type.includes("terminal")) return;
+  const explicitId = update.toolCallId || update.tool_call_id || update.toolCall?.id || update.tool_call?.id || update.id;
+  const id = String(explicitId || type);
+  const status = String(update.status || update.toolCallStatus || "").toLowerCase();
+  const starting = type.includes("start") || type.includes("requested") || (type === "tool_call" && !["completed", "failed", "cancelled", "canceled"].includes(status));
+  const terminal = type.includes("complete") || type.includes("end") || type.includes("finish") || type.includes("fail") || type.includes("cancel") || ["completed", "failed", "cancelled", "canceled"].includes(status);
+  if (starting) {
+    run.activeChildOperations.add(id);
+  } else if (terminal) {
+    if (explicitId) run.activeChildOperations.delete(id);
+    else run.activeChildOperations.delete(run.activeChildOperations.values().next().value);
+  }
+  refreshOperationActivity(run);
+}
+
+function refreshOperationActivity(run) {
+  if (run.pendingPermissions.size > 0 || run.activeChildOperations.size > 0) {
+    run.lastRunnerActivityAt = Date.now();
+  }
+}
+
 function reportEvent(run, type, errorMessage, { allowFinalizing = false } = {}) {
+  const terminal = type === "completed" || type === "failed" || type === "cancelled";
   const payload = {
-    payload: errorMessage ? { error: errorMessage } : {},
+    payload: {
+      ...(errorMessage ? { error: errorMessage } : {}),
+      ...(terminal && run.finalOutput ? { final_output: run.finalOutput } : {}),
+    },
   };
   return enqueueRunEvent(run, type, payload.payload, {
     allowFinalizing,
@@ -481,7 +545,7 @@ function coalescedReport(run, type, payload) {
     }
     const itemJson = JSON.stringify(payload);
     entry.items.push(payload);
-    entry.bytes += itemJson.length;
+    entry.bytes += Buffer.byteLength(itemJson, "utf8");
 
     // Flush immediately if buffer is large enough.
     if (entry.bytes >= COALESCE_MAX_BYTES) {
@@ -545,7 +609,7 @@ function enqueueRunEvent(run, type, payload, { allowFinalizing = false, terminal
     .then(async () => {
       const acknowledged = await withRetry(() => fetch(`${KONTROL_ACP_URL}/runs/${run.devRunId}/events`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", authorization: `Bearer ${AGENT_SECRET}` },
+        headers: { "Content-Type": "application/json", authorization: `Bearer ${AGENT_SECRET}`, ...identityHeaders(agentIdentity) },
         body: JSON.stringify({
           type,
           remote_run_id: run.remoteRunId,
@@ -596,7 +660,13 @@ function finalizeRun(run, status, stopReason) {
 function reportOutput(run, text, channel) {
   if (!text) return;
   if (channel === "message") run.sawAgentMessage = true;
+  if (channel === "message") run.finalOutput = appendBoundedOutput(run.finalOutput, text, FINAL_OUTPUT_BYTES);
   return coalescedReport(run, "output_delta", { text, channel });
+}
+
+function appendBoundedOutput(current, next, limit) {
+  const combined = `${current ?? ""}${next ?? ""}`;
+  return truncateUtf8Tail(combined, limit);
 }
 
 function reportStructured(run, type, payload) {
@@ -608,6 +678,11 @@ function safeEnv() {
   const env = {};
   for (const key of allowed) if (process.env[key] !== undefined) env[key] = process.env[key];
   return env;
+}
+
+function positiveDuration(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 function resolveHermesPython() {

@@ -16,8 +16,14 @@ import { openDatabase, type DatabaseHandle } from "./db/client.js";
 export interface EventStoreEvent {
   id: string;
   seq: number;
+  /** True for a committed event; false marks a non-durable telemetry receipt. */
+  durable: boolean;
+  /** Present only on the synchronous receipt returned for buffered telemetry. */
+  receipt?: boolean;
   type: string;
   sessionId: string;
+  workspaceSessionId?: string;
+  workspaceProjectId?: string;
   payload: Record<string, unknown>;
   createdAt: string;
 }
@@ -33,10 +39,13 @@ interface TelemetryBuffer {
 
 export type EventPredicate = (event: EventStoreEvent) => boolean;
 
+export type EventStoreTimingCallback = (phase: string, durationMs: number) => void;
+
 export interface EventStore {
  appendEvent(input: {
    type: string;
    sessionId: string;
+   workspaceSessionId?: string;
    payload: Record<string, unknown>;
  }, opts?: { publish?: boolean }): EventStoreEvent;
 
@@ -50,6 +59,9 @@ export interface EventStore {
   * without re-fetching already-seen events.
   */
  getEventsAfter(sessionId: string, afterSeq: number, limit?: number): EventStoreEvent[];
+
+ /** Return a single workspace/project event stream using the global event seq cursor. */
+ getWorkspaceEventsAfter(workspaceId: string, afterSeq: number, limit?: number): EventStoreEvent[];
 
  /**
   * P1 #9: Count events by type for a session, grouped by event type.
@@ -73,11 +85,18 @@ export interface EventStore {
   * window); otherwise the call remains subscribed and resolves when the next
   * matching event arrives or the connection-liveness timeout elapses.
   */
-  waitForEventsAfter(
+ waitForEventsAfter(
     sessionId: string,
     afterSeq: number,
     timeoutMs: number,
-  ): Promise<EventStoreEvent[]>;
+ ): Promise<EventStoreEvent[]>;
+
+ /** Event-driven workspace/project waiter; one waiter can multiplex many sessions. */
+ waitForWorkspaceEventsAfter(
+   workspaceId: string,
+   afterSeq: number,
+   timeoutMs: number,
+ ): Promise<EventStoreEvent[]>;
 
   getLatestEvent(sessionId: string, type?: string): EventStoreEvent | undefined;
 
@@ -112,44 +131,93 @@ type Subscriber = (event: EventStoreEvent) => void;
 
 export function createEventStore(
   stateDirOrHandle: string | DatabaseHandle,
+  onTiming?: EventStoreTimingCallback,
 ): EventStore {
   const database =
     typeof stateDirOrHandle === "string" ? openDatabase(stateDirOrHandle) : stateDirOrHandle;
   const subscribers = new Map<string, Set<Subscriber>>();
   const globalSubscribers = new Set<Subscriber>();
+  const workspaceSubscribers = new Map<string, Set<Subscriber>>();
   const telemetryBuffers = new Map<string, TelemetryBuffer>();
   const TELEMETRY_FLUSH_INTERVAL_MS = 250;
   const TELEMETRY_MAX_BYTES = 16 * 1024;
+  const MAX_TRACKED_AGENT_SESSIONS = 2048;
+  const lastAgentEventAt = new Map<string, number>();
+
+  function recordTiming(phase: string, startedAt: number): void {
+    try {
+      onTiming?.(phase, performance.now() - startedAt);
+    } catch {
+      // Diagnostics must never make the event ledger unavailable.
+    }
+  }
 
   function isHighVolumeTelemetry(type: string): boolean {
     return type === "agent.run.output_delta" || type === "agent.run.thought_delta";
   }
 
+  function resolveWorkspaceCorrelation(
+    sessionId: string,
+    explicitWorkspaceSessionId?: string,
+  ): { workspaceSessionId?: string; projectId?: string } {
+    if (explicitWorkspaceSessionId) {
+      const row = database.sqlite.prepare("select id, project_id from workspace_sessions where id = ?").get(explicitWorkspaceSessionId) as { id: string; project_id?: string | null } | undefined;
+      return row ? { workspaceSessionId: row.id, projectId: row.project_id ?? undefined } : { workspaceSessionId: explicitWorkspaceSessionId };
+    }
+    const workSession = database.sqlite.prepare("select ws.workspace_session_id, wss.project_id from work_sessions ws left join workspace_sessions wss on wss.id = ws.workspace_session_id where ws.id = ?").get(sessionId) as { workspace_session_id?: string; project_id?: string | null } | undefined;
+    if (workSession?.workspace_session_id) return { workspaceSessionId: workSession.workspace_session_id, projectId: workSession.project_id ?? undefined };
+    const workspace = database.sqlite.prepare("select id, project_id from workspace_sessions where id = ?").get(sessionId) as { id: string; project_id?: string | null } | undefined;
+    return workspace ? { workspaceSessionId: workspace.id, projectId: workspace.project_id ?? undefined } : {};
+  }
+
+  function projectIdForWorkspaceSession(workspaceSessionId?: string): string | undefined {
+    if (!workspaceSessionId) return undefined;
+    const row = database.sqlite.prepare("select project_id from workspace_sessions where id = ?").get(workspaceSessionId) as { project_id?: string | null } | undefined;
+    return row?.project_id ?? undefined;
+  }
+
   function insertEvent(input: {
     type: string;
     sessionId: string;
+    workspaceSessionId?: string;
     payload: Record<string, unknown>;
     publish: boolean;
   }): EventStoreEvent {
+    const startedAt = performance.now();
     const now = new Date().toISOString();
     const id = randomUUID();
+    const correlation = resolveWorkspaceCorrelation(input.sessionId, input.workspaceSessionId);
 
     database.sqlite
       .prepare(
-        `insert into event_log (id, type, session_id, payload, created_at)
-         values (?, ?, ?, ?, ?)`,
+        `insert into event_log (id, type, session_id, workspace_session_id, payload, created_at)
+         values (?, ?, ?, ?, ?, ?)`,
       )
-      .run(id, input.type, input.sessionId, JSON.stringify(input.payload), now);
+      .run(id, input.type, input.sessionId, correlation.workspaceSessionId ?? null, JSON.stringify(input.payload), now);
 
     const seq = (database.sqlite.prepare("select last_insert_rowid() as seq").get() as { seq: number }).seq;
     const event: EventStoreEvent = {
       id,
       seq,
+      durable: true,
       type: input.type,
       sessionId: input.sessionId,
+      workspaceSessionId: correlation.workspaceSessionId,
+      workspaceProjectId: correlation.projectId,
       payload: input.payload,
       createdAt: now,
     };
+    recordTiming("sqlite.commit", startedAt);
+    if (input.type.startsWith("agent.") || input.type.startsWith("worker.")) {
+      const eventNow = performance.now();
+      const previous = lastAgentEventAt.get(input.sessionId);
+      recordTiming(previous === undefined ? "agent.time_to_first_event" : "agent.event_interval", previous === undefined ? startedAt : previous);
+      if (previous === undefined && lastAgentEventAt.size >= MAX_TRACKED_AGENT_SESSIONS) {
+        const oldest = lastAgentEventAt.keys().next().value as string | undefined;
+        if (oldest) lastAgentEventAt.delete(oldest);
+      }
+      lastAgentEventAt.set(input.sessionId, eventNow);
+    }
     if (input.publish) publish(event);
     return event;
   }
@@ -176,10 +244,6 @@ export function createEventStore(
         channels,
         coalesced: true,
         count: buffer.items.length,
-        segments: buffer.items.map((item) => ({
-          channel: typeof item.channel === "string" ? item.channel : undefined,
-          text: typeof item.text === "string" ? item.text : "",
-        })),
       },
     });
   }
@@ -209,7 +273,7 @@ export function createEventStore(
       telemetryBuffers.set(key, buffer);
     }
     buffer.items.push(input.payload);
-    buffer.bytes += JSON.stringify(input.payload).length;
+    buffer.bytes += Buffer.byteLength(JSON.stringify(input.payload), "utf8");
     buffer.publish ||= input.publish;
     if (buffer.bytes >= TELEMETRY_MAX_BYTES) {
       flushTelemetry(key);
@@ -218,12 +282,13 @@ export function createEventStore(
       buffer.timer.unref?.();
     }
 
-    // Callers historically receive an EventStoreEvent synchronously. A queued
-    // fragment has no durable sequence yet, so return an explicit seq=0 marker;
-    // durable readers never expose or advance cursors from this placeholder.
+    // Callers receive an explicit non-durable receipt while the fragment is
+    // buffered. It is never published or exposed by durable cursor readers.
     return {
       id: randomUUID(),
       seq: 0,
+      durable: false,
+      receipt: true,
       type: input.type,
       sessionId: input.sessionId,
       payload: input.payload,
@@ -254,7 +319,7 @@ export function createEventStore(
   function getEventsForSession(sessionId: string): EventStoreEvent[] {
     const rows = database.sqlite
       .prepare(
-        `select id, seq, type, session_id, payload, created_at
+        `select id, seq, type, session_id, workspace_session_id, payload, created_at
          from event_log
          where session_id = ?
          order by seq`,
@@ -264,6 +329,7 @@ export function createEventStore(
       seq: number;
       type: string;
       session_id: string;
+      workspace_session_id?: string | null;
       payload: string;
       created_at: string;
     }>;
@@ -271,8 +337,11 @@ export function createEventStore(
     return rows.map((row) => ({
       id: row.id,
       seq: row.seq,
+      durable: true,
       type: row.type,
       sessionId: row.session_id,
+      workspaceSessionId: row.workspace_session_id ?? undefined,
+      workspaceProjectId: projectIdForWorkspaceSession(row.workspace_session_id ?? undefined),
       payload: JSON.parse(row.payload) as Record<string, unknown>,
       createdAt: row.created_at,
     }));
@@ -281,7 +350,7 @@ export function createEventStore(
   function getEventsAfter(sessionId: string, afterSeq: number, limit = 500): EventStoreEvent[] {
     const rows = database.sqlite
       .prepare(
-        `select id, seq, type, session_id, payload, created_at
+        `select id, seq, type, session_id, workspace_session_id, payload, created_at
          from event_log
          where session_id = ? and seq > ?
          order by seq
@@ -292,6 +361,7 @@ export function createEventStore(
       seq: number;
       type: string;
       session_id: string;
+      workspace_session_id?: string | null;
       payload: string;
       created_at: string;
     }>;
@@ -299,8 +369,46 @@ export function createEventStore(
     return rows.map((row) => ({
       id: row.id,
       seq: row.seq,
+      durable: true,
       type: row.type,
       sessionId: row.session_id,
+      workspaceSessionId: row.workspace_session_id ?? undefined,
+      workspaceProjectId: projectIdForWorkspaceSession(row.workspace_session_id ?? undefined),
+      payload: JSON.parse(row.payload) as Record<string, unknown>,
+      createdAt: row.created_at,
+    }));
+  }
+
+  function getWorkspaceEventsAfter(workspaceId: string, afterSeq: number, limit = 500): EventStoreEvent[] {
+    const rows = database.sqlite
+      .prepare(
+        `select el.id, el.seq, el.type, el.session_id, el.workspace_session_id, el.payload, el.created_at
+         from event_log el
+         where (
+           el.workspace_session_id = ?
+           or el.workspace_session_id in (select id from workspace_sessions where project_id = ?)
+         ) and el.seq > ?
+         order by el.seq
+         limit ?`,
+      )
+      .all(workspaceId, workspaceId, afterSeq, limit) as Array<{
+      id: string;
+      seq: number;
+      type: string;
+      session_id: string;
+      workspace_session_id?: string | null;
+      payload: string;
+      created_at: string;
+    }>;
+
+    return rows.map((row) => ({
+      id: row.id,
+      seq: row.seq,
+      durable: true,
+      type: row.type,
+      sessionId: row.session_id,
+      workspaceSessionId: row.workspace_session_id ?? undefined,
+      workspaceProjectId: projectIdForWorkspaceSession(row.workspace_session_id ?? undefined),
       payload: JSON.parse(row.payload) as Record<string, unknown>,
       createdAt: row.created_at,
     }));
@@ -339,6 +447,41 @@ export function createEventStore(
         return;
       }
 
+      timeout = setTimeout(() => finish([]), timeoutMs);
+    });
+  }
+
+  function waitForWorkspaceEventsAfter(
+    workspaceId: string,
+    afterSeq: number,
+    timeoutMs: number,
+  ): Promise<EventStoreEvent[]> {
+    return new Promise((resolve) => {
+      let resolved = false;
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      let unsubscribe: (() => void) | undefined;
+
+      const finish = (events: EventStoreEvent[]) => {
+        if (resolved) return;
+        resolved = true;
+        if (timeout) clearTimeout(timeout);
+        unsubscribe?.();
+        resolve(events);
+      };
+
+      // Subscribe only to the relevant workspace/project before querying so a
+      // concurrent event cannot be missed without waking unrelated waiters.
+      unsubscribe = subscribeWorkspace(workspaceId, (event) => {
+        if (resolved || event.seq <= afterSeq) return;
+        const events = getWorkspaceEventsAfter(workspaceId, afterSeq);
+        if (events.length > 0) finish(events);
+      });
+
+      const existing = getWorkspaceEventsAfter(workspaceId, afterSeq);
+      if (existing.length > 0) {
+        finish(existing);
+        return;
+      }
       timeout = setTimeout(() => finish([]), timeoutMs);
     });
   }
@@ -413,6 +556,7 @@ export function createEventStore(
     return {
       id: row.id,
       seq: row.seq,
+      durable: true,
       type: row.type,
       sessionId: row.session_id,
       payload: JSON.parse(row.payload) as Record<string, unknown>,
@@ -438,6 +582,15 @@ export function createEventStore(
     const set = subscribers.get(event.sessionId);
     if (set && set.size > 0) {
       for (const callback of set) callback(event);
+    }
+    const workspaceKeys = [event.workspaceSessionId, event.workspaceProjectId].filter((key): key is string => Boolean(key));
+    const notified = new Set<Subscriber>();
+    for (const key of workspaceKeys) {
+      for (const callback of workspaceSubscribers.get(key) ?? []) {
+        if (notified.has(callback)) continue;
+        notified.add(callback);
+        callback(event);
+      }
     }
     for (const callback of globalSubscribers) {
       callback(event);
@@ -495,6 +648,29 @@ export function createEventStore(
     };
   }
 
+  function subscribeWorkspace(workspaceId: string, callback: Subscriber): () => void {
+    const keys = new Set<string>([workspaceId]);
+    const workspace = database.sqlite.prepare("select id, project_id from workspace_sessions where id = ?").get(workspaceId) as { id: string; project_id?: string | null } | undefined;
+    if (workspace?.project_id) keys.add(workspace.project_id);
+    const project = database.sqlite.prepare("select project_id from workspace_sessions where id = ?").get(workspaceId) as { project_id?: string | null } | undefined;
+    if (!project?.project_id) {
+      const byProject = database.sqlite.prepare("select project_id from workspace_sessions where project_id = ? limit 1").get(workspaceId) as { project_id?: string | null } | undefined;
+      if (byProject?.project_id) keys.add(byProject.project_id);
+    }
+    for (const key of keys) {
+      if (!workspaceSubscribers.has(key)) workspaceSubscribers.set(key, new Set());
+      workspaceSubscribers.get(key)!.add(callback);
+    }
+    return () => {
+      for (const key of keys) {
+        const set = workspaceSubscribers.get(key);
+        if (!set) continue;
+        set.delete(callback);
+        if (set.size === 0) workspaceSubscribers.delete(key);
+      }
+    };
+  }
+
   function countEventsByType(sessionId: string): Record<string, number> {
     const rows = database.sqlite
       .prepare(
@@ -520,52 +696,48 @@ export function createEventStore(
   function compactSessionEvents(sessionId: string, opts: { retentionDays?: number } = {}): number {
     const retentionDays = opts.retentionDays ?? 7;
     const cutoff = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000).toISOString();
+    flushTelemetryForSession(sessionId);
 
-    // Count telemetry events before deletion for the checkpoint
-    const counts = countEventsByType(sessionId);
-    const telemetryTypes = new Set(["agent.run.output_delta", "agent.run.thought_delta"]);
-    let telemetryCount = 0;
-    for (const [type, count] of Object.entries(counts)) {
-      if (telemetryTypes.has(type)) telemetryCount += count;
-    }
+    // Deletion and its audit checkpoint are one SQLite transaction. A crash
+    // cannot leave the session compacted without the durable marker that
+    // explains what was removed.
+    const compact = database.sqlite.transaction(() => {
+      const deleteResult = database.sqlite
+        .prepare(
+          `delete from event_log
+           where session_id = ?
+           and type in ('agent.run.output_delta', 'agent.run.thought_delta')
+           and created_at < ?`,
+        )
+        .run(sessionId, cutoff);
 
-    if (telemetryCount === 0) return 0;
-
-    // Get the last seq for the session
-    const lastEvent = getLatestEvent(sessionId);
-    if (!lastEvent) return 0;
-
-    // P1 #25: Only compact old telemetry (past retention cutoff) to avoid losing recent events
-    const deleteResult = database.sqlite
-      .prepare(
-        `delete from event_log
-         where session_id = ?
-         and type in ('agent.run.output_delta', 'agent.run.thought_delta')
-         and created_at < ?`,
-      )
-      .run(sessionId, cutoff);
-
-    // Insert a single coalesced checkpoint event
-    if (deleteResult.changes > 0) {
-      appendEvent({
-        type: "agent.run.transcript_checkpoint",
-        sessionId,
-        payload: {
-          compacted: true,
-          originalTelemetryCount: deleteResult.changes,
-          cutoff,
-          compactedAt: new Date().toISOString(),
-        },
-      }, { publish: false });
-    }
-
-    return deleteResult.changes;
+      if (deleteResult.changes > 0) {
+        insertEvent({
+          type: "agent.run.transcript_checkpoint",
+          sessionId,
+          publish: false,
+          payload: {
+            compacted: true,
+            originalTelemetryCount: deleteResult.changes,
+            cutoff,
+            compactedAt: new Date().toISOString(),
+          },
+        });
+      }
+      return deleteResult.changes;
+    });
+    const startedAt = performance.now();
+    const removed = compact();
+    recordTiming("sqlite.compaction_commit", startedAt);
+    return removed;
   }
 
   function close(): void {
     for (const key of [...telemetryBuffers.keys()]) flushTelemetry(key);
     subscribers.clear();
     globalSubscribers.clear();
+    workspaceSubscribers.clear();
+    lastAgentEventAt.clear();
     // P1 #11: Don't close shared DB handle - server owns it
   }
 
@@ -576,9 +748,11 @@ export function createEventStore(
     },
     getEventsForSession,
     getEventsAfter,
+    getWorkspaceEventsAfter,
     countEventsByType,
     compactSessionEvents,
     waitForEventsAfter,
+    waitForWorkspaceEventsAfter,
     getLatestEvent,
     subscribe,
     subscribeAll,

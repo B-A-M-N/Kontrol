@@ -92,6 +92,7 @@ export interface ReviewWorkflowService {
   submitForReview(input: SubmitForReviewInput): SubmitForReviewResult;
   provideFeedback(input: ProvideFeedbackInput): Promise<ProvideFeedbackResult>;
   cancelSession(input: CancelSessionInput): { status: string };
+  finalizeCancellation(input: CancelSessionInput): { status: string };
 }
 
 export interface ReviewWorkflowDeps {
@@ -491,6 +492,51 @@ export function createReviewWorkflowService(
     if (TERMINAL_STATUSES.has(session.status)) {
       return { status: session.status };
     }
+    if (session.status === "cancelling") return { status: "cancelling" };
+
+    const publishQueue: EventStoreEvent[] = [];
+    let finalizeImmediately = false;
+    const appendWorkflowEvent = (event: Parameters<typeof eventStore.appendEvent>[0]) => {
+      const appended = eventStore.appendEvent(event, { publish: false });
+      publishQueue.push(appended);
+      return appended;
+    };
+    db.sqlite.transaction(() => {
+      workSessions.updateStatus(input.sessionId, "cancelling");
+      const supersededContinuations = continuationManager.supersedeForSession(
+        input.sessionId,
+        input.reason ?? "session cancelled",
+      );
+      const correlatedRun = agentRegistry.getRunByWorkSessionId(input.sessionId);
+      if (correlatedRun) {
+        agentRegistry.updateRun(correlatedRun.runId, { status: "cancelling" });
+        dispatchOutbox?.enqueue({
+          eventType: "worker.cancellation.requested",
+          aggregateId: input.sessionId,
+          aggregateRevision: session.reviewEpoch,
+          payload: { runId: correlatedRun.runId, reason: input.reason ?? "cancelled" },
+        });
+        finalizeImmediately = !correlatedRun.remoteRunId;
+      } else {
+        // No durable remote attempt exists, so there is no worker process whose
+        // stop must be awaited; the lease can be released immediately.
+        finalizeImmediately = true;
+      }
+      appendWorkflowEvent({
+        type: "agent.run.cancellation_requested",
+        sessionId: input.sessionId,
+        payload: { reason: input.reason ?? "cancelled", supersededContinuations },
+      });
+    })();
+    eventStore.publishEvents(publishQueue);
+
+    return finalizeImmediately ? finalizeCancellation(input) : { status: "cancelling" };
+  }
+
+  function finalizeCancellation(input: CancelSessionInput): { status: string } {
+    const session = workSessions.get(input.sessionId);
+    if (!session) throw new WorkflowError(`Session not found: ${input.sessionId}`, "not_found", 404);
+    if (TERMINAL_STATUSES.has(session.status)) return { status: session.status };
 
     const publishQueue: EventStoreEvent[] = [];
     const appendWorkflowEvent = (event: Parameters<typeof eventStore.appendEvent>[0]) => {
@@ -500,22 +546,19 @@ export function createReviewWorkflowService(
     };
     db.sqlite.transaction(() => {
       workSessions.updateStatus(input.sessionId, "cancelled");
-      const supersededContinuations = continuationManager.supersedeForSession(
-        input.sessionId,
-        input.reason ?? "session cancelled",
-      );
       const correlatedRun = agentRegistry.getRunByWorkSessionId(input.sessionId);
       if (correlatedRun) {
-        agentRegistry.updateRun(correlatedRun.runId, { status: "cancelled" });
+        agentRegistry.updateRun(correlatedRun.runId, { status: "cancelled", finishedAt: new Date().toISOString(), workerLeaseUntil: null });
       }
+      const cancellation = dispatchOutbox?.listByAggregate(input.sessionId).find((event) => event.eventType === "worker.cancellation.requested" && ["pending", "claimed"].includes(event.status));
+      if (cancellation) dispatchOutbox?.markCompleted(cancellation.id);
       appendWorkflowEvent({
         type: "agent.run.cancelled",
         sessionId: input.sessionId,
-        payload: { reason: input.reason ?? "cancelled", supersededContinuations },
+        payload: { reason: input.reason ?? "cancelled" },
       });
     })();
     eventStore.publishEvents(publishQueue);
-
     return { status: "cancelled" };
   }
 
@@ -523,5 +566,6 @@ export function createReviewWorkflowService(
     submitForReview,
     provideFeedback,
     cancelSession,
+    finalizeCancellation,
   };
 }

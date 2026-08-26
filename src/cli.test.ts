@@ -21,6 +21,19 @@ assert.match(
   "the compiled CLI must remain executable for npm's global bin symlink",
 );
 
+// P0 #3 regression: an owner token WITHOUT explicit allowed roots must fail
+// closed instead of inheriting process.cwd() as the filesystem boundary.
+assert.match(
+  cliSource,
+  /KONTROL_OAUTH_OWNER_TOKEN is set but KONTROL_ALLOWED_ROOTS is not/,
+  "environment-only startup with a credential but no roots must fail closed",
+);
+assert.match(
+  cliSource,
+  /process\.env\.KONTROL_OAUTH_OWNER_TOKEN && process\.env\.KONTROL_ALLOWED_ROOTS\?\.trim\(\)/,
+  "both credential AND explicit roots are required for environment-only startup",
+);
+
 for (const flag of ["-v", "--version"]) {
   const output = execFileSync("node", ["--import", "tsx", "src/cli.ts", flag], {
     encoding: "utf8",

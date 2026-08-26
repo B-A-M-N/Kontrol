@@ -3,7 +3,6 @@
 // This intentionally exercises the same boundary that Devdesktop uses:
 // initialize -> discover_agents -> open_workspace -> read -> bash.
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 const args = process.argv.slice(2);
@@ -77,25 +76,13 @@ async function callTool(name, arguments_) {
 
 const healthUrl = new URL("/healthz", url);
 const readyUrl = new URL("/readyz", url);
-const expectedBuild = (() => {
-  try {
-    return JSON.parse(readFileSync(resolve(process.cwd(), "dist/build-meta.json"), "utf8"));
-  } catch {
-    return undefined;
-  }
-})();
 const health = await (async () => {
   const response = await fetch(healthUrl, { signal: AbortSignal.timeout(3_000) });
   const body = await jsonOrText(response);
   assert.equal(response.status, 200, `healthz returned HTTP ${response.status}`);
   return body;
 })();
-// KONTROL /healthz exposes build identity. The tunnel-client health endpoint
-// intentionally exposes only plain `live`; its local readiness is still
-// checked by status/body below, while build identity is verified at KONTROL.
-if (expectedBuild?.buildId && health?.build?.buildId) {
-  assert.equal(health.build.buildId, expectedBuild.buildId, "live build ID differs from intended dist build");
-}
+assert.deepEqual(health, { ok: true, name: "kontrol" }, "liveness must not disclose runtime/build details");
 
 if (agentSpecs.length > 0) {
   readyUrl.searchParams.set("agents", agentSpecs.map((agent) => `${agent.name}=${agent.url}`).join(","));

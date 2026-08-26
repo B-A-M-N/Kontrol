@@ -41,7 +41,149 @@ const migrations: Migration[] = [
   { version: 30, name: "verification-lease-identity", up: migrateVerificationLeaseIdentity },
   { version: 31, name: "supervisor-lease-fencing", up: migrateSupervisorLeaseFencing },
   { version: 32, name: "workspace-project-identity", up: migrateWorkspaceProjectIdentity },
+  { version: 33, name: "approval-principal-and-expiry-index", up: migrateApprovalPrincipalAndExpiryIndex },
+  { version: 34, name: "feedback-session-created-index", up: migrateFeedbackSessionCreatedIndex },
+  { version: 35, name: "mission-evidence-actor-principal", up: migrateMissionEvidenceActorPrincipal },
+  { version: 36, name: "event-workspace-correlation", up: migrateEventWorkspaceCorrelation },
+  { version: 37, name: "agent-registry-uniqueness", up: migrateAgentRegistryUniqueness },
+  { version: 38, name: "webhook-queue-claims", up: migrateWebhookQueueClaims },
+  { version: 39, name: "acp-run-agent-binding", up: migrateAcpRunAgentBinding },
+  { version: 40, name: "supervisor-progress-policy", up: migrateSupervisorProgressPolicy },
+  { version: 41, name: "mission-verification-scheduling", up: migrateMissionVerificationScheduling },
+  { version: 42, name: "semantic-finding-deduplication", up: migrateSemanticFindingDeduplication },
+  { version: 43, name: "mission-review-coverage-uncertainty", up: migrateMissionReviewCoverageUncertainty },
+  { version: 44, name: "agent-per-agent-credential", up: migrateAgentPerAgentCredential },
 ];
+
+/** Canonical current schema version — readiness requires exact equality. */
+export const LATEST_SCHEMA_VERSION = migrations[migrations.length - 1]!.version;
+
+function migrateAgentPerAgentCredential(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "agent_registry", "agent_credential_hash", "text");
+}
+
+function migrateSupervisorProgressPolicy(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "supervisor_runs", "max_stagnant_cycles", "integer not null default 2");
+  addColumnIfMissing(sqlite, "supervisor_runs", "repeated_failure_fingerprint_limit", "integer not null default 3");
+  addColumnIfMissing(sqlite, "supervisor_runs", "stagnant_cycle_count", "integer not null default 0");
+  addColumnIfMissing(sqlite, "supervisor_runs", "progress_json", "text");
+  addColumnIfMissing(sqlite, "supervisor_runs", "stall_reason", "text");
+  sqlite.exec(`
+    create table if not exists supervisor_progress_snapshots (
+      id text primary key,
+      supervisor_run_id text not null,
+      work_session_id text not null,
+      cycle_number integer not null,
+      snapshot_json text not null,
+      delta_json text not null,
+      created_at text not null,
+      foreign key (supervisor_run_id) references supervisor_runs(id) on delete cascade
+    );
+    create index if not exists supervisor_progress_run_idx
+      on supervisor_progress_snapshots(supervisor_run_id, cycle_number);
+  `);
+}
+
+function migrateMissionVerificationScheduling(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "mission_acceptance_criteria", "verification_group", "text");
+  addColumnIfMissing(sqlite, "mission_acceptance_criteria", "verification_scope", "text not null default 'full'");
+  addColumnIfMissing(sqlite, "mission_acceptance_criteria", "final_only", "integer not null default 0");
+  addColumnIfMissing(sqlite, "mission_acceptance_criteria", "mutates_workspace", "integer not null default 0");
+  addColumnIfMissing(sqlite, "mission_acceptance_criteria", "command_version", "text");
+}
+
+function migrateSemanticFindingDeduplication(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "mission_review_findings", "disposition", "text not null default 'blocking'");
+  addColumnIfMissing(sqlite, "mission_review_findings", "fingerprint", "text");
+  sqlite.exec("create index if not exists mission_findings_fingerprint_idx on mission_review_findings(mission_id, fingerprint, status)");
+}
+
+function migrateMissionReviewCoverageUncertainty(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "mission_contracts", "review_coverage_json", "text not null default '[]'");
+  addColumnIfMissing(sqlite, "mission_completion_reports", "review_coverage_json", "text not null default '[]'");
+  addColumnIfMissing(sqlite, "mission_completion_reports", "uncertainty_json", "text not null default '[]'");
+}
+
+function migrateAcpRunAgentBinding(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "acp_runs", "agent_id", "text");
+}
+
+function migrateAgentRegistryUniqueness(sqlite: Database.Database): void {
+  // Keep the newest registration for each logical name before enforcing the
+  // invariant. Re-home historical run references first: deleting a duplicate
+  // registry row without doing this leaves old acp_runs.agent_id values
+  // pointing at an identity that no longer exists.
+  sqlite.exec(`
+    create table if not exists agent_registry_identity_aliases (
+      legacy_agent_id text primary key,
+      canonical_agent_id text not null,
+      original_name text not null,
+      migrated_at text not null
+    );
+  `);
+
+  const duplicates = sqlite.prepare(`
+    select id, name from (
+      select id, name, row_number() over (
+        partition by name order by last_heartbeat desc, created_at desc, id desc
+      ) as rn
+      from agent_registry
+    ) where rn > 1
+  `).all() as Array<{ id: string; name: string }>;
+  const canonicalForName = sqlite.prepare(`
+    select id from agent_registry
+     where name = ?
+     order by last_heartbeat desc, created_at desc, id desc
+     limit 1
+  `);
+  const alias = sqlite.prepare(`
+    insert or ignore into agent_registry_identity_aliases
+      (legacy_agent_id, canonical_agent_id, original_name, migrated_at)
+    values (?, ?, ?, ?)
+  `);
+  const rehomeRuns = sqlite.prepare("update acp_runs set agent_id = ? where agent_id = ?");
+  const removeDuplicate = sqlite.prepare("delete from agent_registry where id = ?");
+  for (const duplicate of duplicates) {
+    const canonical = canonicalForName.get(duplicate.name) as { id?: string } | undefined;
+    if (!canonical?.id || canonical.id === duplicate.id) continue;
+    alias.run(duplicate.id, canonical.id, duplicate.name, new Date().toISOString());
+    rehomeRuns.run(canonical.id, duplicate.id);
+    removeDuplicate.run(duplicate.id);
+  }
+  sqlite.exec("create unique index if not exists agent_registry_name_unique on agent_registry(name);");
+}
+
+function migrateWebhookQueueClaims(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "agent_webhook_queue", "claimed_by", "text");
+  addColumnIfMissing(sqlite, "agent_webhook_queue", "claim_expires_at", "text");
+  sqlite.exec("create index if not exists webhook_queue_claim_idx on agent_webhook_queue(status, claim_expires_at)");
+}
+
+function migrateApprovalPrincipalAndExpiryIndex(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "approval_requests", "principal_id", "text");
+  sqlite.exec("create index if not exists approval_requests_status_expiry_idx on approval_requests(status, expires_at)");
+}
+
+function migrateFeedbackSessionCreatedIndex(sqlite: Database.Database): void {
+  sqlite.exec("create index if not exists work_session_feedback_session_created_idx on work_session_feedback(work_session_id, created_at)");
+}
+
+function migrateMissionEvidenceActorPrincipal(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "mission_evidence", "actor_principal", "text");
+}
+
+function migrateEventWorkspaceCorrelation(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "event_log", "workspace_session_id", "text");
+  sqlite.exec("create index if not exists event_log_workspace_seq_idx on event_log(workspace_session_id, seq)");
+  sqlite.exec(`
+    update event_log
+       set workspace_session_id = coalesce(
+         (select ws.workspace_session_id from work_sessions ws where ws.id = event_log.session_id),
+         (select wss.id from workspace_sessions wss where wss.id = event_log.session_id)
+       )
+     where workspace_session_id is null;
+  `);
+}
 
 function migrateSupervisorRuns(sqlite: Database.Database): void {
   sqlite.exec(`
@@ -279,6 +421,10 @@ export function migrateDatabase(sqlite: Database.Database): void {
         }>
       ).map((row) => row.version),
     );
+    const futureVersions = [...applied].filter((version) => version > LATEST_SCHEMA_VERSION).sort((a, b) => a - b);
+    if (futureVersions.length > 0) {
+      throw new Error(`Database schema version ${futureVersions[0]} is newer than this Kontrol build (supports ${LATEST_SCHEMA_VERSION}); refusing startup.`);
+    }
     const recordMigration = sqlite.prepare(
       "insert into kontrol_schema_migrations (version, name, applied_at) values (?, ?, ?)",
     );
@@ -291,6 +437,15 @@ export function migrateDatabase(sqlite: Database.Database): void {
   });
 
   migrate.immediate();
+
+  const quickCheck = sqlite.prepare("pragma quick_check").get() as { quick_check?: string } | undefined;
+  if (quickCheck?.quick_check !== "ok") {
+    throw new Error(`Database integrity check failed after migration: ${String(quickCheck?.quick_check ?? "no result")}`);
+  }
+  const foreignKeyViolations = sqlite.prepare("pragma foreign_key_check").all();
+  if (foreignKeyViolations.length > 0) {
+    throw new Error(`Database foreign-key check failed after migration (${foreignKeyViolations.length} violation(s)).`);
+  }
 }
 
 function migrateWorkspaceState(sqlite: Database.Database): void {
@@ -430,6 +585,7 @@ function migrateSupervisorMissionLedger(sqlite: Database.Database): void {
       mission_id text not null,
       criterion_id text,
       submission_id text,
+      actor_principal text,
       snapshot_commit text,
       command text,
       output_digest text,
@@ -589,6 +745,7 @@ function migrateAgentRegistry(sqlite: Database.Database): void {
     create table if not exists acp_runs (
       run_id text primary key,
       agent_name text not null,
+      agent_id text,
       workspace_session_id text,
       work_session_id text,
       status text not null default 'created',
@@ -617,6 +774,8 @@ function migrateAgentRegistry(sqlite: Database.Database): void {
       retry_count integer not null default 0,
       max_retries integer not null default 3,
       last_error text,
+      claimed_by text,
+      claim_expires_at text,
       created_at text not null,
       next_retry_at text,
       foreign key (run_id) references acp_runs(run_id) on delete cascade
@@ -624,6 +783,8 @@ function migrateAgentRegistry(sqlite: Database.Database): void {
 
     create index if not exists webhook_queue_status_idx
       on agent_webhook_queue(status, next_retry_at);
+    create index if not exists webhook_queue_claim_idx
+      on agent_webhook_queue(status, claim_expires_at);
   `);
 }
 
@@ -720,6 +881,7 @@ function migrateEventLog(sqlite: Database.Database): void {
       id text not null unique,
       type text not null,
       session_id text not null,
+      workspace_session_id text,
       payload text not null,
       created_at text not null
     );
@@ -729,6 +891,9 @@ function migrateEventLog(sqlite: Database.Database): void {
 
     create index if not exists event_log_type_idx
       on event_log(type, seq);
+
+    create index if not exists event_log_workspace_seq_idx
+      on event_log(workspace_session_id, seq);
   `);
 }
 
@@ -872,6 +1037,7 @@ function migrateApprovalRequests(sqlite: Database.Database): void {
       work_session_id text,
       run_id text,
       agent_id text,
+      principal_id text,
       title text not null,
       description text,
       risk text,
@@ -915,7 +1081,7 @@ function migrateWorkSessionSnapshotBinding(sqlite: Database.Database): void {
 
 function addColumnIfMissing(
   sqlite: Database.Database,
-  table: "workspace_sessions" | "work_sessions" | "work_session_submissions" | "work_session_feedback" | "agent_registry" | "continuations" | "acp_runs" | "dispatch_outbox",
+  table: "workspace_sessions" | "work_sessions" | "work_session_submissions" | "work_session_feedback" | "agent_registry" | "continuations" | "acp_runs" | "agent_webhook_queue" | "dispatch_outbox" | "approval_requests" | "mission_evidence" | "event_log" | "supervisor_runs" | "mission_acceptance_criteria" | "mission_review_findings" | "mission_contracts" | "mission_completion_reports",
   column: string,
   definition: string,
 ): void {

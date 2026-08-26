@@ -58,6 +58,10 @@ try {
       const tail = mod.appendBoundedOutput("abc", "def", 4);
       assert.equal(tail, "cdef");
       assert.equal(mod.appendBoundedOutput("", "x".repeat(mod.OUTPUT_TAIL_CHARS + 1)).length, mod.OUTPUT_TAIL_CHARS);
+      assert.ok(
+        Buffer.byteLength(mod.appendBoundedOutput("", "💥".repeat(mod.OUTPUT_TAIL_CHARS), mod.OUTPUT_TAIL_CHARS), "utf8") <= mod.OUTPUT_TAIL_CHARS,
+        "output tail limit is measured in UTF-8 bytes",
+      );
     });
   }
 

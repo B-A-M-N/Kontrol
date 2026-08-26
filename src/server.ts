@@ -1,15 +1,16 @@
 import { execSync } from "node:child_process";
-import { randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
-import { join, dirname } from "node:path";
+import os from "node:os";
+import { join, dirname, relative, resolve, sep } from "node:path";
 import { realpath } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
+import { hostHeaderValidation, localhostHostValidation } from "@modelcontextprotocol/sdk/server/middleware/hostHeaderValidation.js";
 import { mcpAuthRouter, getOAuthProtectedResourceMetadataUrl } from "@modelcontextprotocol/sdk/server/auth/router.js";
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
+import { isInitializeRequest, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { checkResourceAllowed, resourceUrlFromServerUrl } from "@modelcontextprotocol/sdk/shared/auth-utils.js";
 import {
   registerAppResource,
@@ -17,7 +18,7 @@ import {
   RESOURCE_MIME_TYPE,
 } from "@modelcontextprotocol/ext-apps/server";
 import express from "express";
-import type { Request, Response } from "express";
+import type { Express, NextFunction, Request, Response } from "express";
 import * as z from "zod/v4";
 import { applyPatch, parsePatch } from "./apply-patch.js";
 import { loadConfig, type ServerConfig, type WidgetMode } from "./config.js";
@@ -52,10 +53,11 @@ import { createContinuationManager } from "./continuation.js";
 import { createDispatchOutbox } from "./dispatch-outbox.js";
 import { createSupervisorRuns } from "./supervisor-runs.js";
 import { createSupervisorRuntime } from "./supervisor-runtime.js";
-import { verifyMissionSubmission } from "./mission-verifier.js";
+import { shutdownMissionVerifiers, verifyMissionSubmission } from "./mission-verifier.js";
 import { evaluateSupervisorMission } from "./supervisor-evaluator.js";
 import { createReviewWorkflowService, type ReviewWorkflowService } from "./review-workflow.js";
 import { openDatabase, type DatabaseHandle } from "./db/client.js";
+import { LATEST_SCHEMA_VERSION } from "./db/migrations.js";
 import { createPolicyEngine, type PolicyConfig, type PolicyEngine, type ApprovalScope } from "./policy.js";
 import { createSqliteGrantStore } from "./policy-grants.js";
 import { registerPolicyTools } from "./policy-tools.js";
@@ -68,6 +70,72 @@ import { createAgentMessageManager } from "./agent-messages.js";
 import { DEVDESKTOP_WORKSPACE_APP_URI, LEGACY_WORKSPACE_APP_URI, OPENAI_WORKSPACE_APP_URI, WORKSPACE_APP_BUILD_ID, WORKSPACE_APP_HTML, WORKSPACE_APP_URI, isWorkspaceAppUri, workspaceAppResourceMeta, workspaceAppToolMeta } from "./workspace-app-resource.js";
 import { createRuntimeIdentity, readBuildIdentity, readRuntimeIdentity, removeRuntimeIdentity } from "./runtime-identity.js";
 import { mcpSessionIdleReason, mcpSessionIdleTtl } from "./mcp-session-policy.js";
+import { installCachedToolList, toolListCacheDiagnostics } from "./mcp-tool-list-cache.js";
+import { isPathInsideRoot } from "./roots.js";
+
+/** P1 #26: single source of runtime version identity — the package manifest. */
+let cachedPackageVersion: string | undefined;
+function readPackageVersion(): string {
+  if (cachedPackageVersion) return cachedPackageVersion;
+  try {
+    const manifest = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version?: string };
+    cachedPackageVersion = typeof manifest.version === "string" && manifest.version ? manifest.version : "0.0.0";
+  } catch {
+    cachedPackageVersion = "0.0.0";
+  }
+  return cachedPackageVersion;
+}
+
+/**
+ * P1 #25: audit-event writes are best-effort (they must never fail user
+ * work), but silent degradation is unacceptable. Track a counter per scope,
+ * warn rate-limited, and expose the counters under authenticated
+ * diagnostics so persistent failures surface.
+ */
+const degradedAuditCounters = new Map<string, { count: number; lastWarnedAt: number; lastError?: string }>();
+const DEGRADED_AUDIT_WARN_INTERVAL_MS = 60_000;
+
+function recordDegradedAudit(scope: string, error: unknown): void {
+  const entry = degradedAuditCounters.get(scope) ?? { count: 0, lastWarnedAt: 0 };
+  entry.count += 1;
+  entry.lastError = error instanceof Error ? error.message : String(error);
+  const now = Date.now();
+  if (now - entry.lastWarnedAt >= DEGRADED_AUDIT_WARN_INTERVAL_MS) {
+    entry.lastWarnedAt = now;
+    console.warn(`[kontrol] degraded audit telemetry (${scope}): ${entry.count} write failure(s); last error: ${entry.lastError}`);
+  }
+  degradedAuditCounters.set(scope, entry);
+}
+
+function degradedAuditSnapshot(): Record<string, { count: number; lastError?: string }> {
+  const snapshot: Record<string, { count: number; lastError?: string }> = {};
+  for (const [scope, entry] of degradedAuditCounters) {
+    snapshot[scope] = { count: entry.count, lastError: entry.lastError };
+  }
+  return snapshot;
+}
+
+/**
+ * P1 #24: MCP memory budget for adaptive session caps. Resolution order:
+ * 1. KONTROL_MCP_MEMORY_BUDGET_BYTES (explicit deployment budget)
+ * 2. cgroup memory limit (container ceiling), when readable
+ * 3. total system memory
+ */
+function resolveMcpMemoryBudget(): number {
+  const explicit = Number(process.env.KONTROL_MCP_MEMORY_BUDGET_BYTES);
+  if (Number.isFinite(explicit) && explicit > 0) return explicit;
+  try {
+    const cgroupLimit = Number(readFileSync("/sys/fs/cgroup/memory.max", "utf8").trim());
+    if (Number.isFinite(cgroupLimit) && cgroupLimit > 0) return cgroupLimit;
+  } catch {
+    // Not a cgroup-v2 container — fall through to total memory.
+  }
+  try {
+    return os.totalmem();
+  } catch {
+    return 2_000_000_000;
+  }
+}
 
 type Transport = StreamableHTTPServerTransport;
 interface McpSessionState {
@@ -117,6 +185,32 @@ interface McpSessionMetrics {
   completedToolCounts: number[];
 }
 
+interface McpTimingSample {
+  at: number;
+  admissionClass: "execution" | "waiter";
+  admissionWaitMs: number;
+  serverCreateMs: number;
+  transportConnectMs: number;
+  handlerMs: number;
+  totalMs: number;
+}
+
+interface PhaseTimingSample {
+  at: number;
+  phase: string;
+  durationMs: number;
+}
+
+interface WorkspaceAppResourceMetrics {
+  currentHashed: number;
+  openAiCompatibility: number;
+  legacyKontrol: number;
+  devDesktopMigration: number;
+  servedTotal: number;
+  lastDurationMs: number;
+  maxDurationMs: number;
+}
+
 const WRITE_TOOL_ANNOTATIONS = {
   readOnlyHint: false,
   destructiveHint: true,
@@ -136,11 +230,49 @@ const SHELL_TOOL_ANNOTATIONS = {
   openWorldHint: true,
 };
 
+/** Explicit route-level HTTP body caps. These are deliberately finite: MCP
+ * writes/patches need more than Express's default 100 KB, while ACP events
+ * must remain smaller than the final-result protocol budget plus envelope. */
+export const MCP_HTTP_BODY_LIMIT_BYTES = 8 * 1024 * 1024;
+export const ACP_HTTP_BODY_LIMIT_BYTES = 4 * 1024 * 1024;
+
+function rejectOversizedBody(limitBytes: number, protocol: "mcp" | "acp") {
+  return (req: Request, res: Response, next: NextFunction): void => {
+    const rawLength = req.header("content-length");
+    const contentLength = rawLength === undefined ? undefined : Number(rawLength);
+    if (contentLength !== undefined && (!Number.isSafeInteger(contentLength) || contentLength < 0)) {
+      if (protocol === "mcp") sendJsonRpcError(res, 400, -32700, "Invalid Content-Length");
+      else res.status(400).json({ error: { code: "invalid_request", message: "Invalid Content-Length" } });
+      return;
+    }
+    if (contentLength !== undefined && contentLength > limitBytes) {
+      res.setHeader("Connection", "close");
+      if (protocol === "mcp") sendJsonRpcError(res, 413, -32013, `Request body exceeds ${limitBytes} bytes`);
+      else res.status(413).json({ error: { code: "request_too_large", message: `Request body exceeds ${limitBytes} bytes` } });
+      return;
+    }
+    next();
+  };
+}
+
+function authenticatedAcpBodyGate(config: ServerConfig) {
+  return (req: Request, res: Response, next: NextFunction): void => {
+    const configured = [config.acpAgentSecret, config.acpReviewerSecret, config.acpSharedSecret]
+      .filter((secret): secret is string => Boolean(secret))
+      .map((secret) => `Bearer ${secret}`);
+    if (!configured.includes(req.headers.authorization ?? "")) {
+      res.status(401).json({ error: { code: "unauthorized", message: "Missing or invalid authorization" } });
+      return;
+    }
+    next();
+  };
+}
+
 interface RunningServer {
-  app: ReturnType<typeof createMcpExpressApp>;
+  app: Express;
   config: ServerConfig;
   dispatcher?: ContinuationDispatcher;
-  close(): void;
+  close(): Promise<void>;
   drain(): Promise<void>;
 }
 
@@ -181,8 +313,17 @@ function mcpSessionLabel(logicalClientIdValue: string, sessionId: string, conver
 
 interface McpAdmissionWaiter {
   key: string;
+  weight: number;
   resolve: (release: (() => void) | null) => void;
   timer: NodeJS.Timeout;
+}
+
+function mcpAdmissionWeight(rpcMethod: string | undefined, toolName: string | undefined): number {
+  if (rpcMethod !== "tools/call") return 1;
+  if (toolName === "show_changes" || toolName === "run_mission_verification") return 4;
+  if (toolName === "grep" || toolName === "glob" || toolName === "find" || toolName === "list_pending_reviews") return 2;
+  if (toolName === "bash" || toolName === "exec_command" || toolName === "write_stdin" || toolName === "write" || toolName === "edit" || toolName === "apply_patch") return 3;
+  return 1;
 }
 
 /**
@@ -192,6 +333,7 @@ interface McpAdmissionWaiter {
  */
 export class McpAdmission {
   private active = 0;
+  private activeWeight = 0;
   private readonly activeByKey = new Map<string, number>();
   private readonly queue: McpAdmissionWaiter[] = [];
   private closed = false;
@@ -216,14 +358,16 @@ export class McpAdmission {
     };
   }
 
-  acquire(key: string, waitDeadlineMs: number): Promise<(() => void) | null> {
+  acquire(key: string, waitDeadlineMs: number, weight = 1): Promise<(() => void) | null> {
     if (this.closed) return Promise.resolve(null);
-    if (this.canAdmit(key)) return Promise.resolve(this.grant(key));
+    if (!Number.isInteger(weight) || weight < 1 || weight > this.maxInflight || weight > this.maxInflightPerKey) return Promise.resolve(null);
+    if (this.canAdmit(key, weight)) return Promise.resolve(this.grant(key, weight));
     if (this.queue.length >= this.maxQueue) return Promise.resolve(null);
 
     return new Promise((resolve) => {
       const waiter: McpAdmissionWaiter = {
         key,
+        weight,
         resolve,
         timer: setTimeout(() => {
           const index = this.queue.indexOf(waiter);
@@ -244,19 +388,21 @@ export class McpAdmission {
     }
   }
 
-  private canAdmit(key: string): boolean {
-    return this.active < this.maxInflight && (this.activeByKey.get(key) ?? 0) < this.maxInflightPerKey;
+  private canAdmit(key: string, weight: number): boolean {
+    return this.activeWeight + weight <= this.maxInflight && (this.activeByKey.get(key) ?? 0) + weight <= this.maxInflightPerKey;
   }
 
-  private grant(key: string): () => void {
+  private grant(key: string, weight: number): () => void {
     this.active++;
-    this.activeByKey.set(key, (this.activeByKey.get(key) ?? 0) + 1);
+    this.activeWeight += weight;
+    this.activeByKey.set(key, (this.activeByKey.get(key) ?? 0) + weight);
     let released = false;
     return () => {
       if (released) return;
       released = true;
       this.active = Math.max(0, this.active - 1);
-      const count = (this.activeByKey.get(key) ?? 1) - 1;
+      this.activeWeight = Math.max(0, this.activeWeight - weight);
+      const count = (this.activeByKey.get(key) ?? weight) - weight;
       if (count > 0) this.activeByKey.set(key, count);
       else this.activeByKey.delete(key);
       this.drain();
@@ -267,11 +413,11 @@ export class McpAdmission {
     if (this.closed) return;
     for (let i = 0; i < this.queue.length; i++) {
       const waiter = this.queue[i];
-      if (!this.canAdmit(waiter.key)) continue;
+      if (!this.canAdmit(waiter.key, waiter.weight)) continue;
       this.queue.splice(i, 1);
       i--;
       clearTimeout(waiter.timer);
-      waiter.resolve(this.grant(waiter.key));
+      waiter.resolve(this.grant(waiter.key, waiter.weight));
     }
   }
 }
@@ -334,6 +480,12 @@ const toolNames = {
   shell: "bash",
 } as const;
 
+const serverInstructionCache = new Map<string, string>();
+
+// P1 #42: SDK internal-hook usage is isolated in mcp-tool-list-cache.ts.
+const toolListDescriptorCache = new Map<string, Promise<unknown>>();
+let toolListDescriptorCacheActive = false;
+
 interface ToolLogFields {
   tool: string;
   workspaceId?: string;
@@ -367,6 +519,15 @@ function serverInstructions(config: ServerConfig): string {
   const agentsMd = `Follow instructions returned by ${toolNames.openWorkspace}. Kontrol loads additional AGENTS.md/CLAUDE.md files lazily from the ancestors of each requested path and returns newly applicable instructions with that tool call. `;
 
   return `Use Kontrol as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree to obtain a workspaceId. Reuse that same workspaceId for all later file, search, edit, write, show-changes, and shell tools in that folder; do not call ${toolNames.openWorkspace} again unless switching folders/worktrees, changing checkout/worktree mode, the workspaceId is rejected as unknown, or the user explicitly asks to reopen. ${agentsMd}${skills}${inspection}Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not create or modify files with ${toolNames.shell}; avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or any command whose purpose is to write project files.${showChangesInstruction}`;
+}
+
+function cachedServerInstructions(config: ServerConfig): string {
+  const key = `${config.toolMode}|${config.widgets}|${config.skillsEnabled ? "skills" : "no-skills"}`;
+  const cached = serverInstructionCache.get(key);
+  if (cached) return cached;
+  const instructions = serverInstructions(config);
+  serverInstructionCache.set(key, instructions);
+  return instructions;
 }
 function resultOutputSchema(extra: z.ZodRawShape = {}): z.ZodRawShape {
   return {
@@ -513,14 +674,15 @@ async function enforceToolPolicy(
   workSessionId: string | undefined,
   runId: string | undefined,
   tool: string,
-  path: string | undefined,
+  path: PolicyInvocation["path"],
   command: string | undefined,
+  paths?: PolicyInvocation["paths"],
 ): Promise<boolean> {
   if (workSessions && workSessionId) {
     const sessionDecision = authorizeWorkSessionAction(workSessions, {
       workSessionId,
       tool,
-      path,
+      path: typeof path === "string" ? path : path?.relativePath,
       command,
     });
     if (!sessionDecision.allowed) return false;
@@ -533,9 +695,28 @@ async function enforceToolPolicy(
     runId,
     tool,
     path,
+    paths,
     command,
   });
   return allowed;
+}
+
+/**
+ * Build the only path representation that may enter policy evaluation from an
+ * MCP filesystem action. The lexical user path is retained only as the
+ * relative display form; the absolute form has already passed workspace
+ * resolution and symlink checks.
+ */
+function canonicalPolicyPath(
+  workspaceRoot: string,
+  inputPath: string | undefined,
+  resolvedPath?: string,
+): NonNullable<PolicyInvocation["path"]> {
+  const absolutePath = resolve(resolvedPath ?? workspaceRoot, resolvedPath ? "." : (inputPath ?? "."));
+  const relativePath = isPathInsideRoot(absolutePath, workspaceRoot)
+    ? (relative(workspaceRoot, absolutePath).split(sep).join("/") || ".")
+    : (inputPath ?? absolutePath).replaceAll("\\", "/");
+  return { relativePath, absolutePath };
 }
 
 function countDiffStats(diff: string | undefined): DiffStats {
@@ -599,7 +780,7 @@ function processResult(snapshot: ProcessSnapshot): string {
 
 function processOutputSchema(): z.ZodRawShape {
   return resultOutputSchema({
-    sessionId: z.number().optional(),
+    sessionId: z.string().optional(),
     running: z.boolean(),
     exitCode: z.number().int().optional(),
     signal: z.string().optional(),
@@ -716,6 +897,11 @@ function registerCodexProcessTools(
     },
     async ({ workspaceId, cmd, tty, columns, rows, workingDirectory, yieldTimeMs, maxOutputTokens }) => {
       const startedAt = performance.now();
+      const workspace = workspaces.getWorkspace(workspaceId);
+      const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
+      if (bindingErr) return bindingErr;
+      const cwd = workspaces.resolveWorkingDirectory(workspace, workingDirectory);
+      const policyPath = canonicalPolicyPath(workspace.root, workingDirectory, cwd);
 
       // Policy enforcement (P0 #3): Codex exec_command is a run_commands action
       // and must be gated exactly like the ordinary `bash` tool.
@@ -726,8 +912,9 @@ function registerCodexProcessTools(
           workspaceId,
           connectionContext?.workSessionId,
           connectionContext?.runId,
-          "exec_command",
-          workingDirectory,
+          // P0 #1: canonical policy name — exec_command is gated as "bash".
+          "bash",
+          policyPath,
           cmd,
         );
         if (!approved) {
@@ -738,14 +925,10 @@ function registerCodexProcessTools(
         }
       }
 
-      const workspace = workspaces.getWorkspace(workspaceId);
-      {
-        const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
-        if (bindingErr) return bindingErr;
-      }
-      const cwd = workspaces.resolveWorkingDirectory(workspace, workingDirectory);
       const snapshot = await processSessions.start({
         workspaceId,
+        ownerId: connectionContext?.mcpSessionId,
+        workSessionId: connectionContext?.workSessionId,
         command: cmd,
         cwd,
         tty,
@@ -784,7 +967,7 @@ function registerCodexProcessTools(
         "Poll or write characters to a process returned by exec_command. Omit chars or pass an empty string to poll. Pass \\u0003 to send Ctrl-C.",
       inputSchema: {
         workspaceId: z.string().describe("Workspace identifier used to start the process."),
-        sessionId: z.number().describe("Process session identifier returned by exec_command."),
+        sessionId: z.string().describe("Opaque process session identifier returned by exec_command."),
         chars: z.string().optional().describe("Characters to write. Omit or pass an empty string to poll."),
         columns: z.number().int().min(1).max(1_000).optional().describe("Resize a PTY to this width."),
         rows: z.number().int().min(1).max(1_000).optional().describe("Resize a PTY to this height."),
@@ -809,6 +992,9 @@ function registerCodexProcessTools(
     },
     async ({ workspaceId, sessionId, chars, columns, rows, yieldTimeMs, maxOutputTokens }) => {
       const startedAt = performance.now();
+      workspaces.getWorkspace(workspaceId);
+      const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
+      if (bindingErr) return bindingErr;
 
       // Policy enforcement (P0 #3): writing NONEMPTY input to a process is a
       // run_commands action and must be gated. A poll-only write_stdin (no
@@ -822,7 +1008,10 @@ function registerCodexProcessTools(
           workspaceId,
           connectionContext?.workSessionId,
           connectionContext?.runId,
-          "exec_command",
+          // P0 #1: a mutating write_stdin is a run_commands action. Pass the
+          // CANONICAL policy name ("bash") so it is gated by exactly the same
+          // rule as exec_command and the bash tool — never an alias.
+          "bash",
           undefined,
           chars,
         );
@@ -834,10 +1023,11 @@ function registerCodexProcessTools(
         }
       }
 
-      workspaces.getWorkspace(workspaceId);
       const snapshot = await processSessions.write({
         workspaceId,
         sessionId,
+        ownerId: connectionContext?.mcpSessionId,
+        workSessionId: connectionContext?.workSessionId,
         chars,
         columns,
         rows,
@@ -911,19 +1101,26 @@ function createMcpServer(
   supervisorRuns?: ReturnType<typeof createSupervisorRuns>,
   onSupervisorResume?: (workSessionId: string) => void,
   db?: DatabaseHandle,
+  onWorkspaceAppResource?: (uri: string) => void,
+  onPhaseTiming?: (phase: string, durationMs: number) => void,
 ): McpServer {
+  const serverConstructionStartedAt = performance.now();
   const server = new McpServer(
     {
       name: "kontrol",
       title: "Kontrol",
-      version: "0.1.0",
+      // P1 #26: runtime version derives from the package manifest so the MCP
+      // surface can never advertise an independent hardcoded version.
+      version: readPackageVersion(),
       description:
         "Secure local coding workspace for MCP clients. Provides workspace-scoped file, search, edit, write, and shell tools.",
     },
     {
-      instructions: serverInstructions(config),
+      instructions: cachedServerInstructions(config),
     },
   );
+  onPhaseTiming?.("mcp.server_construction", performance.now() - serverConstructionStartedAt);
+  const toolRegistrationStartedAt = performance.now();
 
   function trackToolEvent(
     workspaceId: string,
@@ -979,8 +1176,10 @@ function createMcpServer(
           elapsedMs: Math.round(performance.now() - startedAt),
         },
       });
-    } catch {
-      // Session tracking is non-critical
+    } catch (error) {
+      // P1 #25: session tracking is non-critical and must never fail the
+      // user's tool call, but persistent audit degradation must be visible.
+      recordDegradedAudit("work_session_tool_event", error);
     }
   }
 
@@ -993,6 +1192,7 @@ function createMcpServer(
       _meta: workspaceAppResourceMeta(),
     },
     async () => {
+      onWorkspaceAppResource?.(WORKSPACE_APP_URI);
       logEvent(config.logging, "info", "workspace_app_resource_served", {
         uri: WORKSPACE_APP_URI,
         buildId: WORKSPACE_APP_BUILD_ID,
@@ -1010,6 +1210,7 @@ function createMcpServer(
     LEGACY_WORKSPACE_APP_URI,
     { mimeType: "text/html+skybridge", description: "Legacy ChatGPT template." },
     async () => {
+      onWorkspaceAppResource?.(LEGACY_WORKSPACE_APP_URI);
       logEvent(config.logging, "info", "workspace_app_resource_served", {
         uri: LEGACY_WORKSPACE_APP_URI,
         buildId: WORKSPACE_APP_BUILD_ID,
@@ -1024,6 +1225,7 @@ function createMcpServer(
     OPENAI_WORKSPACE_APP_URI,
     { mimeType: "text/html+skybridge", description: "OpenAI compatibility template." },
     async () => {
+      onWorkspaceAppResource?.(OPENAI_WORKSPACE_APP_URI);
       logEvent(config.logging, "info", "workspace_app_resource_served", {
         uri: OPENAI_WORKSPACE_APP_URI,
         buildId: WORKSPACE_APP_BUILD_ID,
@@ -1038,6 +1240,7 @@ function createMcpServer(
     DEVDESKTOP_WORKSPACE_APP_URI,
     { mimeType: "text/html+skybridge", description: "Compatibility template for cached DevDesktop cards." },
     async () => {
+      onWorkspaceAppResource?.(DEVDESKTOP_WORKSPACE_APP_URI);
       logEvent(config.logging, "info", "workspace_app_resource_served", {
         uri: DEVDESKTOP_WORKSPACE_APP_URI,
         buildId: WORKSPACE_APP_BUILD_ID,
@@ -1233,6 +1436,24 @@ function createMcpServer(
         if (bindingErr) return bindingErr;
       }
       const readPath = workspaces.resolveReadPath(workspace, input.path);
+      if (policyEnforcer && policyEngine) {
+        const approved = await enforceToolPolicy(
+          workSessions,
+          policyEnforcer,
+          workspaceId,
+          connectionContext?.workSessionId,
+          connectionContext?.runId,
+          toolNames.read,
+          canonicalPolicyPath(workspace.root, input.path, readPath.absolutePath),
+          undefined,
+        );
+        if (!approved) {
+          return {
+            content: [{ type: "text" as const, text: `Tool "${toolNames.read}" denied by policy. Path: ${input.path}` }],
+            isError: true,
+          };
+        }
+      }
       const newlyApplicable = readPath.skillRead
         ? []
         : await workspaces.loadApplicableInstructions(workspace, input.path);
@@ -1315,6 +1536,11 @@ function createMcpServer(
     },
     async ({ workspaceId, ...input }) => {
       const startedAt = performance.now();
+      const workspace = workspaces.getWorkspace(workspaceId);
+      const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
+      if (bindingErr) return bindingErr;
+      const resolvedPath = workspaces.resolvePath(workspace, input.path);
+      const policyPath = canonicalPolicyPath(workspace.root, input.path, resolvedPath);
 
       // Policy enforcement for file writes
       if (policyEnforcer && policyEngine) {
@@ -1325,7 +1551,7 @@ function createMcpServer(
           connectionContext?.workSessionId,
           connectionContext?.runId,
           toolNames.write,
-          input.path,
+          policyPath,
           undefined,
         );
         if (!approved) {
@@ -1336,13 +1562,7 @@ function createMcpServer(
         }
       }
 
-      const workspace = workspaces.getWorkspace(workspaceId);
-      {
-        const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
-        if (bindingErr) return bindingErr;
-      }
       await workspaces.loadApplicableInstructions(workspace, input.path);
-      workspaces.resolvePath(workspace, input.path);
       const response = await writeFileTool(input, {
         cwd: workspace.root,
         root: workspace.root,
@@ -1429,6 +1649,11 @@ function createMcpServer(
     },
     async ({ workspaceId, ...input }) => {
       const startedAt = performance.now();
+      const workspace = workspaces.getWorkspace(workspaceId);
+      const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
+      if (bindingErr) return bindingErr;
+      const resolvedPath = workspaces.resolvePath(workspace, input.path);
+      const policyPath = canonicalPolicyPath(workspace.root, input.path, resolvedPath);
 
       // Policy enforcement for file edits
       if (policyEnforcer && policyEngine) {
@@ -1439,7 +1664,7 @@ function createMcpServer(
           connectionContext?.workSessionId,
           connectionContext?.runId,
           toolNames.edit,
-          input.path,
+          policyPath,
           undefined,
         );
         if (!approved) {
@@ -1450,13 +1675,7 @@ function createMcpServer(
         }
       }
 
-      const workspace = workspaces.getWorkspace(workspaceId);
-      {
-        const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
-        if (bindingErr) return bindingErr;
-      }
       await workspaces.loadApplicableInstructions(workspace, input.path);
-      workspaces.resolvePath(workspace, input.path);
       const response = await editFileTool(input, {
         cwd: workspace.root,
         root: workspace.root,
@@ -1544,6 +1763,16 @@ function createMcpServer(
       },
       async ({ workspaceId, patch }) => {
         const startedAt = performance.now();
+        const workspace = workspaces.getWorkspace(workspaceId);
+        const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
+        if (bindingErr) return bindingErr;
+        const actions = parsePatch(patch) as Array<{ path: string; moveTo?: string }>;
+        const affectedPaths = actions.flatMap((action) => [action.path, action.moveTo].filter((path): path is string => Boolean(path)));
+        const policyPaths = affectedPaths.map((path) => canonicalPolicyPath(
+          workspace.root,
+          path,
+          workspaces.resolvePath(workspace, path),
+        ));
 
         // Policy enforcement (P0 #3): Codex apply_patch is an edit_files action
         // and must be gated exactly like the ordinary `write`/`edit` tools.
@@ -1557,6 +1786,7 @@ function createMcpServer(
             "apply_patch",
             undefined,
             undefined,
+            policyPaths,
           );
           if (!approved) {
             return {
@@ -1566,15 +1796,10 @@ function createMcpServer(
           }
         }
 
-        const workspace = workspaces.getWorkspace(workspaceId);
-      {
-        const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
-        if (bindingErr) return bindingErr;
-      }
         // Load instructions for every path named by the patch before any file
         // is changed. parsePatch is validation-only; applyPatch revalidates all
         // confined destinations immediately before staging/rename.
-        for (const action of parsePatch(patch) as Array<{ path: string; moveTo?: string }>) {
+        for (const action of actions) {
           await workspaces.loadApplicableInstructions(workspace, action.path);
           if (action.moveTo) await workspaces.loadApplicableInstructions(workspace, action.moveTo);
         }
@@ -1721,6 +1946,27 @@ function createMcpServer(
         const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
         if (bindingErr) return bindingErr;
       }
+        const policyPath = input.path
+          ? canonicalPolicyPath(workspace.root, input.path, workspaces.resolvePath(workspace, input.path))
+          : undefined;
+        if (policyEnforcer && policyEngine) {
+          const approved = await enforceToolPolicy(
+            workSessions,
+            policyEnforcer,
+            workspaceId,
+            connectionContext?.workSessionId,
+            connectionContext?.runId,
+            toolNames.grep,
+            policyPath,
+            undefined,
+          );
+          if (!approved) {
+            return {
+              content: [{ type: "text" as const, text: `Tool "${toolNames.grep}" denied by policy.` }],
+              isError: true,
+            };
+          }
+        }
         if (input.path) await workspaces.loadApplicableInstructions(workspace, input.path);
         const response = await grepFilesTool(input, {
           cwd: workspace.root,
@@ -1795,6 +2041,27 @@ function createMcpServer(
         const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
         if (bindingErr) return bindingErr;
       }
+        const policyPath = input.path
+          ? canonicalPolicyPath(workspace.root, input.path, workspaces.resolvePath(workspace, input.path))
+          : undefined;
+        if (policyEnforcer && policyEngine) {
+          const approved = await enforceToolPolicy(
+            workSessions,
+            policyEnforcer,
+            workspaceId,
+            connectionContext?.workSessionId,
+            connectionContext?.runId,
+            toolNames.glob,
+            policyPath,
+            undefined,
+          );
+          if (!approved) {
+            return {
+              content: [{ type: "text" as const, text: `Tool "${toolNames.glob}" denied by policy.` }],
+              isError: true,
+            };
+          }
+        }
         if (input.path) await workspaces.loadApplicableInstructions(workspace, input.path);
         const response = await findFilesTool(input, {
           cwd: workspace.root,
@@ -1869,8 +2136,27 @@ function createMcpServer(
         const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
         if (bindingErr) return bindingErr;
       }
+        const resolvedPath = workspaces.resolvePath(workspace, input.path);
+        const policyPath = canonicalPolicyPath(workspace.root, input.path, resolvedPath);
+        if (policyEnforcer && policyEngine) {
+          const approved = await enforceToolPolicy(
+            workSessions,
+            policyEnforcer,
+            workspaceId,
+            connectionContext?.workSessionId,
+            connectionContext?.runId,
+            toolNames.ls,
+            policyPath,
+            undefined,
+          );
+          if (!approved) {
+            return {
+              content: [{ type: "text" as const, text: `Tool "${toolNames.ls}" denied by policy. Path: ${input.path}` }],
+              isError: true,
+            };
+          }
+        }
         await workspaces.loadApplicableInstructions(workspace, input.path);
-        workspaces.resolvePath(workspace, input.path);
         const response = await listDirectoryTool(input, {
           cwd: workspace.root,
           root: workspace.root,
@@ -1950,6 +2236,14 @@ function createMcpServer(
     },
     async ({ workspaceId, workingDirectory, ...input }) => {
       const startedAt = performance.now();
+      const workspace = workspaces.getWorkspace(workspaceId);
+      const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
+      if (bindingErr) return bindingErr;
+      const cwd = workspaces.resolveWorkingDirectory(
+        workspace,
+        workingDirectory,
+      );
+      const policyPath = canonicalPolicyPath(workspace.root, workingDirectory, cwd);
 
       // Policy enforcement: block until human approval if required
       if (policyEnforcer && policyEngine) {
@@ -1960,7 +2254,7 @@ function createMcpServer(
           connectionContext?.workSessionId,
           connectionContext?.runId,
           toolNames.shell,
-          workingDirectory,
+          policyPath,
           input.command,
         );
         if (!approved) {
@@ -1971,16 +2265,7 @@ function createMcpServer(
         }
       }
 
-      const workspace = workspaces.getWorkspace(workspaceId);
-      {
-        const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
-        if (bindingErr) return bindingErr;
-      }
       if (workingDirectory) await workspaces.loadApplicableInstructions(workspace, workingDirectory);
-      const cwd = workspaces.resolveWorkingDirectory(
-        workspace,
-        workingDirectory,
-      );
       const response = await runShellTool(input, {
         cwd,
         root: workspace.root,
@@ -2060,8 +2345,9 @@ function createMcpServer(
       supervisorRuns,
       onSupervisorResume,
       agentMessages,
+      approvalRequests,
       knownAgents: config.acpKnownAgents,
-      sharedSecret: config.acpSharedSecret,
+      adapterSecret: config.acpAdapterSecret,
       // P1 #10: pass server config to bridge so search_skills has access to skill paths.
       serverConfig: config,
       // Role is derived from the AUTHENTICATED envelope only. A connection is a
@@ -2076,28 +2362,58 @@ function createMcpServer(
       connectionContinuationId: connectionContext?.continuationId,
       connectionWorkSessionId: connectionContext?.workSessionId,
       liveWaiters,
+      onPhaseTiming,
     };
     registerBridgeTools(server, bridgeConfig);
   }
+
+  toolListDescriptorCacheActive = installCachedToolList(
+    server,
+    `${config.toolMode}|${config.widgets}|${config.skillsEnabled ? "skills" : "no-skills"}|${config.acpEnabled ? "acp" : "no-acp"}|${policyEngine ? "policy" : "no-policy"}`,
+    toolListDescriptorCache,
+    ListToolsRequestSchema,
+  );
+  if (!toolListDescriptorCacheActive) {
+    console.warn("[kontrol] tools/list descriptor cache unavailable (SDK internals changed); serving uncached");
+  }
+  onPhaseTiming?.("mcp.tool_registration", performance.now() - toolRegistrationStartedAt);
 
   return server;
 }
 
 export function createServer(config = loadConfig()): RunningServer {
-  if (config.acpEnabled && !config.acpSharedSecret) {
+  // P0 #9: the ACP surface requires at least one role credential. The legacy
+  // shared secret is compatibility-only: when it is the sole credential (or
+  // when it doubles as the operator ingress), warn — it carries broad
+  // operator authority and should be split into agent/reviewer/adapter roles.
+  if (config.acpEnabled && !config.acpSharedSecret && !config.acpAgentSecret && !config.acpReviewerSecret) {
     throw new Error(
-      "KONTROL_ACP_SHARED_SECRET is required when KONTROL_ACP_ENABLED=true (the default). " +
-        "Set it to a long random value, e.g. `openssl rand -hex 32`. The ACP surface (/acp) is authenticated with this secret.",
+      "ACP is enabled but no credentials are configured. Set KONTROL_ACP_AGENT_SECRET, " +
+        "KONTROL_ACP_REVIEWER_SECRET, and KONTROL_ACP_ADAPTER_SECRET to long random values " +
+        "(e.g. `openssl rand -hex 32`). KONTROL_ACP_SHARED_SECRET is legacy-only.",
+    );
+  }
+  if (config.acpEnabled && config.acpSharedSecret && (!config.acpAgentSecret || !config.acpReviewerSecret || !config.acpAdapterSecret)) {
+    console.warn(
+      "[kontrol] warning: KONTROL_ACP_SHARED_SECRET is set and acts as a broad-authority operator credential. " +
+        "Prefer the split role secrets: KONTROL_ACP_AGENT_SECRET / KONTROL_ACP_REVIEWER_SECRET / KONTROL_ACP_ADAPTER_SECRET.",
     );
   }
 
   const allowedHosts = config.allowedHosts.includes("*")
     ? undefined
     : Array.from(new Set([config.host, ...config.allowedHosts]));
-  const app = createMcpExpressApp({
-    host: config.host,
-    ...(allowedHosts ? { allowedHosts } : {}),
-  });
+  // Build the app locally so route-level body parsers remain under Kontrol's
+  // control. The SDK helper installs an unconditional express.json() parser
+  // with its ~100 KB default before callers can add a larger MCP/ACP limit.
+  const app = express();
+  if (allowedHosts) {
+    app.use(hostHeaderValidation(allowedHosts));
+  } else if (["127.0.0.1", "localhost", "::1"].includes(config.host)) {
+    app.use(localhostHostValidation());
+  } else if (config.host === "0.0.0.0" || config.host === "::") {
+    console.warn(`[kontrol] Server is binding to ${config.host} without DNS rebinding protection.`);
+  }
   const buildMeta = readBuildIdentity(join(dirname(fileURLToPath(import.meta.url)), "build-meta.json"));
   const transports = new Map<string, Transport>();
   const mcpSessions = new Map<string, McpSessionState>();
@@ -2106,6 +2422,11 @@ export function createServer(config = loadConfig()): RunningServer {
     config.mcpMaxInflight,
     config.mcpMaxInflightPerSession,
     config.mcpMaxQueue,
+  );
+  const mcpWaiterAdmission = new McpAdmission(
+    config.mcpMaxWaiters,
+    config.mcpMaxWaitersPerSession,
+    config.mcpMaxWaiterQueue,
   );
   const mcpSessionMetrics: McpSessionMetrics = {
     created: 0,
@@ -2117,6 +2438,85 @@ export function createServer(config = loadConfig()): RunningServer {
     windowEvents: [],
     completedToolCounts: [],
   };
+  const mcpTimingSamples: McpTimingSample[] = [];
+  const phaseTimingSamples: PhaseTimingSample[] = [];
+  const workspaceAppResourceMetrics: WorkspaceAppResourceMetrics = {
+    currentHashed: 0,
+    openAiCompatibility: 0,
+    legacyKontrol: 0,
+    devDesktopMigration: 0,
+    servedTotal: 0,
+    lastDurationMs: 0,
+    maxDurationMs: 0,
+  };
+
+  function recordMcpTiming(sample: Omit<McpTimingSample, "at">): void {
+    mcpTimingSamples.push({ at: Date.now(), ...sample });
+    if (mcpTimingSamples.length > 2_000) mcpTimingSamples.splice(0, mcpTimingSamples.length - 2_000);
+    recordPhaseTiming("mcp.admission_wait", sample.admissionWaitMs);
+    if (sample.serverCreateMs > 0) recordPhaseTiming("mcp.server_setup_total", sample.serverCreateMs);
+    if (sample.transportConnectMs > 0) recordPhaseTiming("mcp.transport_connect", sample.transportConnectMs);
+    if (sample.handlerMs > 0) recordPhaseTiming("mcp.handler", sample.handlerMs);
+    recordPhaseTiming("mcp.request_total", sample.totalMs);
+  }
+
+  function recordPhaseTiming(phase: string, durationMs: number): void {
+    if (!Number.isFinite(durationMs) || durationMs < 0) return;
+    phaseTimingSamples.push({ at: Date.now(), phase, durationMs });
+    if (phaseTimingSamples.length > 5_000) phaseTimingSamples.splice(0, phaseTimingSamples.length - 5_000);
+  }
+
+  function timingQuantiles(samples: number[]): { count: number; p50: number; p95: number; p99: number } {
+    if (samples.length === 0) return { count: 0, p50: 0, p95: 0, p99: 0 };
+    const ordered = [...samples].sort((a, b) => a - b);
+    const percentile = (fraction: number) => ordered[Math.min(ordered.length - 1, Math.floor((ordered.length - 1) * fraction))];
+    return {
+      count: ordered.length,
+      p50: Math.round(percentile(0.5)),
+      p95: Math.round(percentile(0.95)),
+      p99: Math.round(percentile(0.99)),
+    };
+  }
+
+  function mcpTimingDiagnostics(): Record<string, unknown> {
+    const recent = mcpTimingSamples.filter((sample) => sample.at >= Date.now() - 15 * 60_000);
+    const initialization = recent.filter((sample) => sample.serverCreateMs > 0);
+    const requests = recent.filter((sample) => sample.serverCreateMs === 0);
+    const by = (field: keyof Pick<McpTimingSample, "admissionWaitMs" | "serverCreateMs" | "transportConnectMs" | "handlerMs" | "totalMs">) =>
+      timingQuantiles(requests.map((sample) => sample[field]));
+    const initBy = (field: "serverCreateMs" | "transportConnectMs" | "totalMs") =>
+      timingQuantiles(initialization.map((sample) => sample[field]));
+    const phaseCutoff = Date.now() - 15 * 60_000;
+    const phaseGroups = new Map<string, number[]>();
+    for (const sample of phaseTimingSamples) {
+      if (sample.at < phaseCutoff) continue;
+      const values = phaseGroups.get(sample.phase) ?? [];
+      values.push(sample.durationMs);
+      phaseGroups.set(sample.phase, values);
+    }
+    const phaseTimings = Object.fromEntries(
+      [...phaseGroups.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([phase, values]) => [phase, timingQuantiles(values)]),
+    );
+    const waiterStats = mcpWaiterAdmission.getStats();
+    return {
+      windowMs: 15 * 60_000,
+      requests: requests.length,
+      totalMs: by("totalMs"),
+      admissionWaitMs: by("admissionWaitMs"),
+      initialization: {
+        count: initialization.length,
+        serverCreateMs: initBy("serverCreateMs"),
+        transportConnectMs: initBy("transportConnectMs"),
+        totalMs: initBy("totalMs"),
+      },
+      handlerMs: by("handlerMs"),
+      waiterRequests: requests.filter((sample) => sample.admissionClass === "waiter").length,
+      executionRequests: requests.filter((sample) => sample.admissionClass === "execution").length,
+      eventWaiterCount: waiterStats.active,
+      waiterDurationMs: timingQuantiles(recent.filter((sample) => sample.admissionClass === "waiter").map((sample) => sample.totalMs)),
+      phaseTimings,
+    };
+  }
 
   function clientMcpMetrics(logicalClientId: string): McpSessionClientMetrics {
     let metrics = mcpSessionMetrics.clients.get(logicalClientId);
@@ -2282,7 +2682,10 @@ export function createServer(config = loadConfig()): RunningServer {
   function getMemoryPressureState() {
     trackMcpSessionMemory();
     const totalRss = process.memoryUsage().rss;
-    const rssLimit = 2_000_000_000; // 2 GB threshold for "high" pressure
+    // P1 #24: configurable deployment budget instead of a magic 2 GB. Prefer
+    // an explicit KONTROL_MCP_MEMORY_BUDGET_BYTES; otherwise use a fraction
+    // of the container/host ceiling when cgroup limits expose one.
+    const rssLimit = resolveMcpMemoryBudget();
     if (totalRss > rssLimit * 0.8) {
       return { level: "high" as const, effectiveHardCap: Math.min(config.mcpSessionHardCap, 100), effectiveSoftCap: Math.min(config.mcpSessionSoftCap, 75) };
     }
@@ -2409,20 +2812,54 @@ export function createServer(config = loadConfig()): RunningServer {
   const mcpMemorySampler = setInterval(trackMcpSessionMemory, 30_000);
   mcpMemorySampler.unref?.();
 
+  const reportMaintenanceFailure = (scope: string, error: unknown, fields: Record<string, unknown> = {}) => {
+    const detail = error instanceof Error ? error.message : String(error);
+    logEvent(config.logging, "error", "maintenance_failure", { scope, detail, ...fields });
+    console.error(`[kontrol] maintenance failure (${scope}): ${detail}`);
+  };
+
   // P1 #23: Periodic maintenance loop — event compaction, stale approval
   // reconciliation, and DB checkpoint. Runs every 5 minutes.
   const MAINTENANCE_INTERVAL_MS = 5 * 60_000;
   const maintenanceTimer = setInterval(() => {
     try {
       workSessions.reconcileRuntimeStates();
-      // Compact telemetry for terminal sessions
-      const terminalStatuses = new Set(["approved", "rejected", "cancelled", "failed", "failed_protocol"]);
-      for (const session of workSessions.listAllWorkSessions(undefined, 200)) {
-        if (terminalStatuses.has(session.status)) {
-          try { eventStore.compactSessionEvents(session.id, { retentionDays: 7 }); } catch { /* ignore */ }
+      const expiredApprovals = approvalRequests.expirePending();
+      for (const approval of expiredApprovals) {
+        const session = approval.workSessionId ? workSessions.get(approval.workSessionId) : undefined;
+        if (!session) continue;
+        try {
+          eventStore.appendEvent({
+            type: "recovery.approval.expired",
+            sessionId: session.id,
+            payload: { approvalId: approval.approvalId, reason: "approval timed out during maintenance" },
+          }, { publish: false });
+        } catch (error) {
+          reportMaintenanceFailure("approval_expiry_event", error, { approvalId: approval.approvalId, sessionId: session.id });
         }
       }
-    } catch { /* ignore */ }
+      // P1 #18: compact telemetry via bounded ID pages of compaction-eligible
+      // sessions (terminal, or parked/stale reviews) instead of hydrating up
+      // to 10,000 full projections every cycle. Loop until a short page
+      // confirms the eligible set is exhausted.
+      const COMPACT_PAGE_SIZE = 500;
+      let afterSessionId: string | undefined;
+      for (;;) {
+        const page = workSessions.listSessionIdsNeedingCompaction(afterSessionId, COMPACT_PAGE_SIZE);
+        if (page.length === 0) break;
+        for (const sessionId of page) {
+          try {
+            eventStore.compactSessionEvents(sessionId, { retentionDays: 7 });
+          } catch (error) {
+            reportMaintenanceFailure("event_compaction", error, { sessionId });
+          }
+        }
+        if (page.length < COMPACT_PAGE_SIZE) break;
+        afterSessionId = page[page.length - 1];
+      }
+    } catch (error) {
+      reportMaintenanceFailure("maintenance_cycle", error);
+    }
   }, MAINTENANCE_INTERVAL_MS);
   maintenanceTimer.unref?.();
   const oauthEnabled = config.authMode === "oauth";
@@ -2460,7 +2897,7 @@ export function createServer(config = loadConfig()): RunningServer {
     tags: ["webui", "reviewer"],
     ttlSeconds: 60 * 60 * 24 * 365,
   });
-  const eventStore = createEventStore(db);
+  const eventStore = createEventStore(db, recordPhaseTiming);
   const continuationManager = createContinuationManager(db);
   const dispatchOutbox = createDispatchOutbox(db);
   const supervisorRuns = createSupervisorRuns(db);
@@ -2480,38 +2917,61 @@ export function createServer(config = loadConfig()): RunningServer {
     ok: false,
     checkedAt: undefined as string | undefined,
     detail: "integrity check pending",
+    durationMs: 0,
   };
   const refreshDatabaseIntegrity = () => {
+    const startedAt = performance.now();
     try {
       const result = db.sqlite.prepare("PRAGMA quick_check").get() as { quick_check?: string } | undefined;
+      databaseIntegrity.durationMs = Math.round(performance.now() - startedAt);
       databaseIntegrity.ok = result?.quick_check === "ok";
       databaseIntegrity.detail = String(result?.quick_check ?? "quick_check returned no result");
       databaseIntegrity.checkedAt = new Date().toISOString();
     } catch (error) {
+      databaseIntegrity.durationMs = Math.round(performance.now() - startedAt);
       databaseIntegrity.ok = false;
       databaseIntegrity.detail = error instanceof Error ? error.message : String(error);
       databaseIntegrity.checkedAt = new Date().toISOString();
     }
+    // P1 #19: a scan approaching its own refresh interval means the DB has
+    // outgrown the cadence — back the timer off instead of pinning the main
+    // thread every five minutes.
+    if (databaseIntegrity.durationMs > INTEGRITY_INTERVAL_MS / 2) {
+      console.warn(`[kontrol] quick_check took ${databaseIntegrity.durationMs}ms; consider moving integrity scans to an explicit diagnostic operation`);
+    }
   };
   // Integrity scans are valuable, but must not run synchronously on every
-  // readiness request. Run once at startup and refresh in the background.
+  // readiness request. Run once at startup and refresh at low frequency.
+  const INTEGRITY_INTERVAL_MS = 30 * 60_000;
   refreshDatabaseIntegrity();
-  const databaseIntegrityTimer = setInterval(refreshDatabaseIntegrity, 5 * 60_000);
+  const databaseIntegrityTimer = setInterval(refreshDatabaseIntegrity, INTEGRITY_INTERVAL_MS);
   databaseIntegrityTimer.unref?.();
   const terminalWorkSessionStatuses = new Set(["approved", "rejected", "cancelled", "failed", "failed_protocol"]);
+  // Expire pending approvals once during startup as well as during the normal
+  // maintenance loop. This keeps expiry correct across long idle periods and
+  // makes the recovery count reflect actual rows changed at startup.
+  for (const approval of approvalRequests.expirePending()) {
+    const session = approval.workSessionId ? workSessions.get(approval.workSessionId) : undefined;
+    startupRecovery.expiredApprovals++;
+    if (session) {
+      eventStore.appendEvent({
+        type: "recovery.approval.expired",
+        sessionId: session.id,
+        payload: { approvalId: approval.approvalId, reason: "approval expired during startup reconciliation" },
+      }, { publish: false });
+    }
+  }
   // Durable rows survive a process restart; live transports and in-memory
   // worker maps do not. Reconcile only objects whose durable references make
   // their liveness unambiguous, and record each repair in the session event
   // log so recovery is inspectable rather than silently mutating state.
   for (const approval of approvalRequests.listPending()) {
     const session = approval.workSessionId ? workSessions.get(approval.workSessionId) : undefined;
-    const expired = Boolean(approval.expiresAt && Date.parse(approval.expiresAt) <= Date.now());
     const orphaned = Boolean(approval.workSessionId && (!session || terminalWorkSessionStatuses.has(session.status)));
-    if (!expired && !orphaned) continue;
-    const status = expired ? "expired" : "cancelled";
-    approvalRequests.resolve(approval.approvalId, { status, reason: expired ? "startup_reconciliation: approval expired" : "startup_reconciliation: referenced work session is terminal or missing", reviewerId: "kontrol-startup" });
-    if (status === "expired") startupRecovery.expiredApprovals++;
-    else startupRecovery.cancelledApprovals++;
+    if (!orphaned) continue;
+    const status = "cancelled";
+    approvalRequests.resolve(approval.approvalId, { status, reason: "startup_reconciliation: referenced work session is terminal or missing", reviewerId: "kontrol-startup" });
+    startupRecovery.cancelledApprovals++;
     if (session) {
       eventStore.appendEvent({
         type: "recovery.approval.reconciled",
@@ -2577,7 +3037,7 @@ export function createServer(config = loadConfig()): RunningServer {
     has(id: string) { return (liveWaitersMap.get(id)?.size ?? 0) > 0; },
   };
   const grantStore = createSqliteGrantStore(db);
-  const policyEngine = createPolicyEngine(config.policy, grantStore);
+  const policyEngine = createPolicyEngine(config.policy, grantStore, approvalRequests);
   const policyEnforcer = createPolicyEnforcer(policyEngine, eventStore);
 
   if (config.logging.trustProxy) {
@@ -2647,6 +3107,27 @@ export function createServer(config = loadConfig()): RunningServer {
     });
   }
 
+  // Authenticate protected requests before consuming their bodies, then parse
+  // each protocol with its own explicit finite limit. This keeps a large
+  // unauthenticated request from spending parser memory and avoids the SDK's
+  // unconditional ~100 KB parser.
+  if (bearerAuth) {
+    app.use("/mcp", (req, res, next) => bearerAuth!(req, res, next));
+  }
+  if (config.acpEnabled) {
+    app.use(
+      "/acp",
+      authenticatedAcpBodyGate(config),
+      rejectOversizedBody(ACP_HTTP_BODY_LIMIT_BYTES, "acp"),
+      express.json({ limit: ACP_HTTP_BODY_LIMIT_BYTES }),
+    );
+  }
+  app.use(
+    "/mcp",
+    rejectOversizedBody(MCP_HTTP_BODY_LIMIT_BYTES, "mcp"),
+    express.json({ limit: MCP_HTTP_BODY_LIMIT_BYTES }),
+  );
+
   app.options("/mcp-app-assets/{*asset}", (_req, res) => {
     setAssetHeaders(res);
     res.sendStatus(204);
@@ -2663,31 +3144,13 @@ export function createServer(config = loadConfig()): RunningServer {
   );
 
   app.get("/healthz", (_req, res) => {
-    const runtime = readRuntimeIdentity(config.stateDir);
-    const sessionWindow = sessionWindowMetrics(60_000);
+    // Keep unauthenticated liveness deliberately minimal. Build/runtime
+    // identity, process details, session counts, and workflow diagnostics
+    // belong behind readiness/diagnostics controls.
+    res.setHeader("Cache-Control", "no-store");
     res.json({
       ok: true,
       name: "kontrol",
-      build: buildMeta,
-      runtime: runtime ? {
-        instanceId: runtime.instanceId,
-        pid: runtime.pid,
-        buildId: runtime.buildId,
-        buildSha: runtime.buildSha,
-        buildDirty: runtime.buildDirty,
-        startedAt: runtime.startedAt,
-      } : undefined,
-      uptimeMs: Math.round(performance.now()),
-      mcpSessions: mcpSessions.size,
-      mcpSessionReuse: {
-        sessionsCreatedLastMinute: sessionWindow.sessionsCreated,
-        sessionsClosedLastMinute: sessionWindow.sessionsClosed,
-        sessionsExpiredLastMinute: sessionWindow.sessionsExpired,
-        toolCallsLastMinute: sessionWindow.toolCalls,
-        sessionsPerToolCall: sessionWindow.sessionsPerToolCall,
-      },
-      activeWorkSessions: workSessions?.countActiveWorkSessions?.() ?? workSessions?.listActiveWorkSessions?.()?.length ?? 0,
-      pendingReviews: workSessions?.countPendingReviews?.() ?? workSessions?.listPendingReviews?.()?.length ?? 0,
     });
   });
 
@@ -2700,15 +3163,22 @@ export function createServer(config = loadConfig()): RunningServer {
       checks.database = { ok: databaseProbe?.ok === 1, detail: databaseProbe?.ok === 1 ? "select 1 ok" : "database probe failed" };
       const schema = db.sqlite.prepare("select max(version) as v from kontrol_schema_migrations").get() as { v?: number } | undefined;
       schemaVersion = Number(schema?.v ?? 0);
-      checks.schema = { ok: schemaVersion > 0, detail: `version=${schemaVersion}` };
+      // P1 #17: readiness requires the EXACT current schema, not just a
+      // migrated-at-some-point database. A partial/older schema must fail.
+      checks.schema = {
+        ok: schemaVersion === LATEST_SCHEMA_VERSION,
+        detail: `version=${schemaVersion} expected=${LATEST_SCHEMA_VERSION}`,
+      };
     } catch (error) {
       checks.database = { ok: false, detail: error instanceof Error ? error.message : String(error) };
       checks.schema = { ok: false, detail: "schema query failed" };
     }
     const integrityAgeMs = databaseIntegrity.checkedAt ? Date.now() - Date.parse(databaseIntegrity.checkedAt) : Number.POSITIVE_INFINITY;
     checks.databaseIntegrity = {
-      ok: databaseIntegrity.ok && integrityAgeMs <= 10 * 60_000,
-      detail: `${databaseIntegrity.detail}; ageMs=${Number.isFinite(integrityAgeMs) ? integrityAgeMs : "unknown"}`,
+      // P1 #19: freshness budget tracks the (now lower-frequency) 30-minute
+      // integrity cadence rather than the old five-minute one.
+      ok: databaseIntegrity.ok && integrityAgeMs <= 45 * 60_000,
+      detail: `${databaseIntegrity.detail}; ageMs=${Number.isFinite(integrityAgeMs) ? integrityAgeMs : "unknown"}; durationMs=${databaseIntegrity.durationMs}`,
     };
     checks.mcpHandler = { ok: true, detail: `HTTP handler is serving ${includeAgents ? "/readyz" : "/core-readyz"}` };
     checks.workspaceRegistry = { ok: Boolean(workspaces && workspaceStore), detail: "workspace registry initialized" };
@@ -2724,18 +3194,11 @@ export function createServer(config = loadConfig()): RunningServer {
       return checks;
     }
 
-    const rawAgents = typeof req.query.agents === "string" ? req.query.agents : "";
-    const requiredAgents = rawAgents
-      .split(",")
-      .map((entry) => entry.trim())
-      .filter(Boolean)
-      .map((entry) => {
-        const separator = entry.indexOf("=");
-        return separator >= 0
-          ? { name: entry.slice(0, separator), url: entry.slice(separator + 1) }
-          : { name: entry, url: undefined };
-      });
-    let configuredAgents = requiredAgents.length > 0 ? requiredAgents : config.acpKnownAgents;
+    // P1 #16: public readiness is deterministic from server configuration
+    // alone. Query-string agent selection was removed — arbitrary "check
+    // these agents" requests could replace the configured requirement set.
+    // Diagnostics/doctor tooling covers ad-hoc agent checks instead.
+    let configuredAgents = config.acpKnownAgents;
     const aliveAgents = agentRegistry.listAlive();
     // In ACP mode an empty configured list is not "no requirements". It means
     // the generation has not registered an operational coding agent yet. The
@@ -2769,14 +3232,13 @@ export function createServer(config = loadConfig()): RunningServer {
 
   function sendReadiness(res: Response, checks: Record<string, { ok: boolean; detail?: string; agents?: unknown[] }>): void {
     const ready = Object.values(checks).every((check) => check.ok);
-    const schemaVersion = Number(checks.schema?.detail?.match(/version=(\d+)/)?.[1] ?? 0);
+    const publicChecks = Object.fromEntries(Object.entries(checks).map(([name, check]) => [name, { ok: check.ok }]));
+    res.setHeader("Cache-Control", "no-store");
     res.status(ready ? 200 : 503).json({
       ok: ready,
       ready,
       name: "kontrol",
-      schemaVersion,
-      build: buildMeta,
-      checks,
+      checks: publicChecks,
     });
   }
 
@@ -2877,7 +3339,13 @@ export function createServer(config = loadConfig()): RunningServer {
         evicted: mcpSessionMetrics.evicted,
         current: totalMcpSessions,
         inFlight: [...mcpSessions.values()].reduce((sum, s) => sum + s.inFlightRequests, 0),
-        admission: mcpAdmission.getStats(),
+        admission: {
+          execution: mcpAdmission.getStats(),
+          waiter: mcpWaiterAdmission.getStats(),
+        },
+        timing: mcpTimingDiagnostics(),
+        toolListDescriptorCache: toolListCacheDiagnostics()[0]?.metrics ?? { hits: 0, misses: 0 },
+        workspaceAppResources: { ...workspaceAppResourceMetrics },
         memoryPressure: getMemoryPressureState(),
         memoryEstimate: estimateMcpSessionMemoryCost(),
         reuse: mcpSessionReuseMetrics(),
@@ -2932,6 +3400,8 @@ export function createServer(config = loadConfig()): RunningServer {
         build: buildMeta ?? process.env.KONTROL_BUILD_ID ?? "dev",
         buildMeta,
         schema: schemaVersion,
+        schemaExpected: LATEST_SCHEMA_VERSION,
+        degradedAudit: degradedAuditSnapshot(),
         dbSizeBytes,
         walSizeBytes,
         eventLogCount,
@@ -2964,6 +3434,7 @@ export function createServer(config = loadConfig()): RunningServer {
       workSessions,
       agentRegistry,
       config.acpSharedSecret,
+      config.acpAdapterSecret,
       eventStore,
       continuationManager,
       reviewCheckpoints,
@@ -2976,11 +3447,28 @@ export function createServer(config = loadConfig()): RunningServer {
   }
 
   app.all("/mcp", async (req, res) => {
+    const requestStartedAt = performance.now();
     const requestId = res.locals.requestId as string | undefined;
     const sessionId = req.header("mcp-session-id");
     const initializeRequest = req.method === "POST" && isInitializeRequest(req.body);
+    const requestRpcMethod = (req.body as { method?: string } | undefined)?.method;
+    const requestToolName = (req.body as { params?: { name?: string } } | undefined)?.params?.name;
+    const requestIsWaiter = requestRpcMethod === "tools/call" && (
+      requestToolName === "await_review_feedback" ||
+      requestToolName === "await_work_session_events" ||
+      requestToolName === "await_work_session_terminal" ||
+      requestToolName === "await_workspace_events"
+    );
     let admissionRelease: (() => void) | undefined;
     let sessionLongPoll = false;
+    let admissionWaitMs = 0;
+    let admissionClass: "execution" | "waiter" = requestIsWaiter ? "waiter" : "execution";
+    let handlerStartedAt = 0;
+    res.once("finish", () => {
+      const finishedAt = performance.now();
+      recordPhaseTiming("mcp.response", finishedAt - requestStartedAt);
+      if (handlerStartedAt > 0) recordPhaseTiming("mcp.serialization", finishedAt - handlerStartedAt);
+    });
 
     if (shuttingDown) {
       return res.status(503).json({
@@ -2990,7 +3478,7 @@ export function createServer(config = loadConfig()): RunningServer {
       });
     }
 
-    if (bearerAuth) {
+    if (bearerAuth && !req.auth) {
       await new Promise<void>((resolve, reject) => {
         bearerAuth(req, res, (error?: unknown) => {
           if (error) reject(error);
@@ -2998,7 +3486,9 @@ export function createServer(config = loadConfig()): RunningServer {
         });
       });
       if (res.headersSent) return;
-
+    }
+    if (bearerAuth) {
+      if (res.headersSent) return;
       if (!req.auth?.resource || !checkResourceAllowed({ requestedResource: req.auth.resource, configuredResource: resourceServerUrl! })) {
         logEvent(config.logging, "warn", "auth_denied", {
           requestId,
@@ -3091,7 +3581,7 @@ export function createServer(config = loadConfig()): RunningServer {
             recordMcpWindowEvent("tool");
             const toolName = (req.body as { params?: { name?: string } })?.params?.name;
             state.lastToolName = toolName;
-            if (toolName === "await_review_feedback" || toolName === "await_work_session_events") {
+            if (toolName === "await_review_feedback" || toolName === "await_work_session_events" || toolName === "await_work_session_terminal" || toolName === "await_workspace_events") {
               state.activeLongPollCount++;
               sessionLongPoll = true;
             }
@@ -3190,6 +3680,12 @@ export function createServer(config = loadConfig()): RunningServer {
               recordMcpSessionEnd(state, state.closing ? "server_shutdown" : "client_closed");
             }
             mcpSessions.delete(closedSessionId);
+            void processSessions.terminateByOwner(closedSessionId).catch((error) => {
+              logEvent(config.logging, "warn", "mcp_session_process_cleanup_failed", {
+                sessionIdPrefix: sessionIdPrefix(closedSessionId),
+                error: error instanceof Error ? error.message : String(error),
+              });
+            });
             logEvent(config.logging, "info", "mcp_session_closed", {
               sessionIdPrefix: sessionIdPrefix(closedSessionId),
               logicalClientId: state?.logicalClientId,
@@ -3282,6 +3778,13 @@ export function createServer(config = loadConfig()): RunningServer {
           supervisorRuns,
           (workSessionId) => supervisorRuntime?.wake(workSessionId),
           db,
+          (uri) => {
+            if (uri === WORKSPACE_APP_URI) workspaceAppResourceMetrics.currentHashed++;
+            else if (uri === OPENAI_WORKSPACE_APP_URI) workspaceAppResourceMetrics.openAiCompatibility++;
+            else if (uri === LEGACY_WORKSPACE_APP_URI) workspaceAppResourceMetrics.legacyKontrol++;
+            else if (uri === DEVDESKTOP_WORKSPACE_APP_URI) workspaceAppResourceMetrics.devDesktopMigration++;
+          },
+          recordPhaseTiming,
         );
         const serverCreateMs = performance.now() - serverCreateStarted;
         const transportConnectStarted = performance.now();
@@ -3293,14 +3796,24 @@ export function createServer(config = loadConfig()): RunningServer {
           connectionContext.mcpSessionLabel = state.sessionLabel;
           connectionContext.conversationId = state.conversationId;
         }
+        const transportConnectMs = performance.now() - transportConnectStarted;
+        const initializationTotalMs = performance.now() - sessionInitializedAt;
+        recordMcpTiming({
+          admissionClass: "execution",
+          admissionWaitMs: 0,
+          serverCreateMs,
+          transportConnectMs,
+          handlerMs: 0,
+          totalMs: initializationTotalMs,
+        });
         logEvent(config.logging, "info", "mcp_session_initialized", {
           requestId,
           sessionIdPrefix: sessionIdPrefix(transport.sessionId),
           sessionLabel: state?.sessionLabel,
           conversationId: state?.conversationId,
           serverCreateMs: Math.round(serverCreateMs),
-          transportConnectMs: Math.round(performance.now() - transportConnectStarted),
-          totalMs: Math.round(performance.now() - sessionInitializedAt),
+          transportConnectMs: Math.round(transportConnectMs),
+          totalMs: Math.round(initializationTotalMs),
         });
       } else if (
         (req.body as { method?: unknown; params?: { uri?: unknown } } | undefined)?.method === "resources/read" &&
@@ -3309,51 +3822,62 @@ export function createServer(config = loadConfig()): RunningServer {
         // The OpenAI tunnel fetches app resources on a separate, sessionless
         // channel after initialization. Resources are read-only and the outer
         // bearer/tunnel authentication above has already succeeded, so serve
-        // this one protocol method statelessly rather than rejecting the WebUI
-        // template with "No valid MCP session".
-        transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
-        const sessionlessServerCreateStarted = performance.now();
-        const server = createMcpServer(
-          config,
-          workspaces,
-          reviewCheckpoints,
-          processSessions,
-          workSessions,
-          agentRegistry,
-          eventStore,
-          continuationManager,
-          dispatchOutbox,
-          policyEngine,
-          policyEnforcer,
-          approvalRequests,
-          missionLedger,
-          undefined,
-          reviewWorkflow,
-          liveWaiters,
-          agentMessages,
-          supervisorRuns,
-          (workSessionId) => supervisorRuntime?.wake(workSessionId),
-          db,
-        );
-        const serverCreateMs = performance.now() - sessionlessServerCreateStarted;
-        const transportConnectStarted = performance.now();
-        await server.connect(transport);
-        logEvent(config.logging, "info", "mcp_session_initialized", {
+        // this one protocol method statelessly rather than constructing the
+        // complete file/shell/ACP/policy tool universe just to return a static
+        // HTML document.
+        const resourceStartedAt = performance.now();
+        const body = req.body as { id?: unknown; params?: { uri?: unknown } };
+        const uri = typeof body.params?.uri === "string" ? body.params.uri : undefined;
+        const isCurrent = uri === WORKSPACE_APP_URI;
+        const isOpenAi = uri === OPENAI_WORKSPACE_APP_URI;
+        const isLegacy = uri === LEGACY_WORKSPACE_APP_URI;
+        const isDevDesktop = uri === DEVDESKTOP_WORKSPACE_APP_URI;
+        if (isCurrent) workspaceAppResourceMetrics.currentHashed++;
+        else if (isOpenAi) workspaceAppResourceMetrics.openAiCompatibility++;
+        else if (isLegacy) workspaceAppResourceMetrics.legacyKontrol++;
+        else if (isDevDesktop) workspaceAppResourceMetrics.devDesktopMigration++;
+        const mimeType = isCurrent ? RESOURCE_MIME_TYPE : "text/html+skybridge";
+        const meta = isCurrent ? workspaceAppResourceMeta() : undefined;
+        const content: { uri: string; mimeType: string; text: string; _meta?: Record<string, unknown> } = {
+          uri: uri ?? WORKSPACE_APP_URI,
+          mimeType,
+          text: WORKSPACE_APP_HTML,
+          ...(meta ? { _meta: meta } : {}),
+        };
+        res.json({
+          jsonrpc: "2.0",
+          id: body.id ?? null,
+          result: { contents: [content] },
+        });
+        const totalMs = Math.round(performance.now() - resourceStartedAt);
+        // P1 #32: track resource-serving latency; through the tunnel this
+        // dominates over server construction, so it must be measurable.
+        workspaceAppResourceMetrics.servedTotal++;
+        workspaceAppResourceMetrics.lastDurationMs = totalMs;
+        if (totalMs > workspaceAppResourceMetrics.maxDurationMs) workspaceAppResourceMetrics.maxDurationMs = totalMs;
+        logEvent(config.logging, "info", "workspace_app_resource_served", {
           requestId,
           sessionless: true,
-          serverCreateMs: Math.round(serverCreateMs),
-          transportConnectMs: Math.round(performance.now() - transportConnectStarted),
-          totalMs: Math.round(performance.now() - sessionlessServerCreateStarted),
+          resourceFastPath: true,
+          resourceUri: uri,
+          totalMs,
         });
+        return;
       } else {
         sendJsonRpcError(res, 400, -32000, "No valid MCP session");
         return;
       }
 
-      const acquiredAdmission = await mcpAdmission.acquire(
+      const admission = requestIsWaiter ? mcpWaiterAdmission : mcpAdmission;
+      admissionClass = requestIsWaiter ? "waiter" : "execution";
+      const admissionWeight = requestIsWaiter ? 1 : mcpAdmissionWeight(requestRpcMethod, requestToolName);
+      const admissionStartedAt = performance.now();
+      const acquiredAdmission = await admission.acquire(
         sessionId ?? logicalClientId(req),
         config.mcpRequestDeadlineMs,
+        admissionWeight,
       );
+      admissionWaitMs = performance.now() - admissionStartedAt;
       if (!acquiredAdmission) {
         if (sessionId) {
           const state = mcpSessions.get(sessionId);
@@ -3366,7 +3890,9 @@ export function createServer(config = loadConfig()): RunningServer {
           requestId,
           reason: "admission_queue_full_or_deadline",
           sessionIdPrefix: sessionIdPrefix(sessionId),
-          admission: mcpAdmission.getStats(),
+          admissionClass,
+          admissionWaitMs: Math.round(admissionWaitMs),
+          admission: admission.getStats(),
         });
         return res.status(503).json({
           jsonrpc: "2.0",
@@ -3376,7 +3902,30 @@ export function createServer(config = loadConfig()): RunningServer {
       }
       admissionRelease = acquiredAdmission;
 
+      res.setHeader("x-kontrol-admission-wait-ms", String(Math.round(admissionWaitMs)));
+      handlerStartedAt = performance.now();
       await transport.handleRequest(req, res, req.body);
+      const handlerMs = performance.now() - handlerStartedAt;
+      const totalMs = performance.now() - requestStartedAt;
+      recordMcpTiming({
+        admissionClass,
+        admissionWaitMs,
+        serverCreateMs: 0,
+        transportConnectMs: 0,
+        handlerMs,
+        totalMs,
+      });
+      logEvent(config.logging, "debug", "mcp_request_completed", {
+        requestId,
+        sessionIdPrefix: sessionIdPrefix(sessionId),
+        rpcMethod: requestRpcMethod,
+        toolName: requestToolName,
+        admissionClass,
+        admissionWaitMs: Math.round(admissionWaitMs),
+        handlerMs: Math.round(handlerMs),
+        totalMs: Math.round(totalMs),
+        status: res.statusCode,
+      });
       admissionRelease();
       admissionRelease = undefined;
       // Decrement in-flight count after response completes
@@ -3410,6 +3959,24 @@ export function createServer(config = loadConfig()): RunningServer {
     }
   });
 
+  // Express's JSON parser reports oversize and malformed payloads through the
+  // error pipeline. Keep those responses deterministic and protocol-shaped;
+  // callers must never receive an HTML error page from a JSON endpoint.
+  app.use((error: unknown, req: Request, res: Response, next: NextFunction) => {
+    const parserError = error as { type?: string; status?: number; statusCode?: number };
+    if (parserError.type === "entity.too.large" || parserError.status === 413 || parserError.statusCode === 413) {
+      if (req.path.startsWith("/mcp")) sendJsonRpcError(res, 413, -32013, "Request body is too large");
+      else res.status(413).json({ error: { code: "request_too_large", message: "Request body is too large" } });
+      return;
+    }
+    if (parserError.type === "entity.parse.failed") {
+      if (req.path.startsWith("/mcp")) sendJsonRpcError(res, 400, -32700, "Malformed JSON request body");
+      else res.status(400).json({ error: { code: "invalid_json", message: "Malformed JSON request body" } });
+      return;
+    }
+    next(error);
+  });
+
   // Singleton continuation dispatcher — owned by the Kontrol process, not by an
   // individual MCP client connection. Shares the SAME liveWaiters instance used
   // by every createMcpServer so a parked agent suppresses duplicate dispatch.
@@ -3430,7 +3997,7 @@ export function createServer(config = loadConfig()): RunningServer {
       onSupervisorResume: (workSessionId) => supervisorRuntime?.wake(workSessionId),
       agentMessages,
       knownAgents: config.acpKnownAgents,
-      sharedSecret: config.acpSharedSecret,
+      adapterSecret: config.acpAdapterSecret,
       liveWaiters,
     };
     dispatcher = createContinuationDispatcher(bridgeBase);
@@ -3442,6 +4009,8 @@ export function createServer(config = loadConfig()): RunningServer {
       onVerify: async (workSessionId, deadlineAt, submission) => {
         await verifyMissionSubmission({
           workSessionId,
+          maxInflight: config.verifyMaxInflight,
+          sandbox: config.verifySandbox,
           missionLedger,
           workSessions,
           workspaces,
@@ -3458,8 +4027,37 @@ export function createServer(config = loadConfig()): RunningServer {
           submissionId: latest?.id,
           snapshotCommit: latest?.snapshotCommit,
           cycleNumber: run?.cycleNumber ?? 0,
-          maxCycles: run?.maxCycles ?? 0,
+          emergencyCycleCeiling: run?.maxCycles,
         });
+      },
+      onTiming: (sample) => {
+        recordPhaseTiming(`supervisor.${sample.stage}.event_to_claim`, sample.eventToClaimMs);
+        recordPhaseTiming(`supervisor.${sample.stage}.total`, sample.totalMs);
+        if (sample.verificationMs !== undefined) recordPhaseTiming("supervisor.verification.duration", sample.verificationMs);
+        if (sample.evaluationMs !== undefined) recordPhaseTiming("supervisor.evaluation.duration", sample.evaluationMs);
+      },
+      getProgressSnapshot: (workSessionId, evaluation) => {
+        const session = workSessions.get(workSessionId);
+        const latest = session?.latestSubmission;
+        const packet = missionLedger.getPacket(workSessionId, latest?.id ? { submissionId: latest.id, snapshotCommit: latest.snapshotCommit, reviewEpoch: latest.reviewEpoch } : undefined);
+        const currentEvidence = packet.evidence.filter((entry) => !latest?.id || entry.submissionId === latest.id);
+        const failedEvidence = currentEvidence.filter((entry) => entry.status === "failed");
+        const failureSet = failedEvidence.map((entry) => {
+          const details = typeof entry.details === "object" && entry.details ? entry.details as Record<string, unknown> : {};
+          return { command: entry.command, failureSetSha256: details.failureSetSha256, outputSha256: details.outputSha256, status: entry.status };
+        });
+        const summary = latest?.summaryJson ? (() => { try { return JSON.parse(latest.summaryJson) as { files?: number }; } catch { return {}; } })() : {};
+        return {
+          blockingFindingCount: packet.findings.filter((finding) => finding.scope !== "out_of_scope" && ["blocker", "high"].includes(finding.severity) && !["verified_resolved", "waived"].includes(finding.status)).length,
+          failedCriterionCount: packet.criteria.filter((criterion) => criterion.priority === "required" && criterion.status === "failed").length,
+          passedCriterionCount: packet.criteria.filter((criterion) => criterion.status === "verified").length,
+          failingVerificationCount: failedEvidence.length,
+          verificationFailureFingerprint: failureSet.length ? createHash("sha256").update(JSON.stringify(failureSet)).digest("hex") : evaluation.failureSetSha256,
+          changedRelevantFiles: typeof summary.files === "number" ? summary.files : 0,
+          unresolvedRequiredActions: packet.workOrders[0]?.requiredActions.length ?? 0,
+          submissionId: latest?.id ?? "",
+          reviewEpoch: latest?.reviewEpoch ?? 0,
+        };
       },
       onCorrect: async (workSessionId, reasons) => {
         const mission = missionLedger.getMissionByWorkSession(workSessionId);
@@ -3534,13 +4132,14 @@ export function createServer(config = loadConfig()): RunningServer {
       // closing the rest of the generation.
     }
   };
-  const finalizeClose = () => {
+  const finalizeClose = async (): Promise<void> => {
     if (closed) return;
     closed = true;
     dispatcher?.stop();
     supervisorRuntime?.stop();
     supervisorRuns.close();
     mcpAdmission.close();
+    mcpWaiterAdmission.close();
     clearInterval(mcpSessionReaper);
     clearInterval(mcpMemorySampler);
     clearInterval(mcpSessionChurnTimer);
@@ -3551,13 +4150,14 @@ export function createServer(config = loadConfig()): RunningServer {
       state.closing = true;
       recordMcpSessionEnd(state, "server_shutdown", shutdownAt);
     }
-    for (const transport of transports.values()) void transport.close().catch(() => {});
+    await Promise.all([...transports.values()].map(closeTransport));
     transports.clear();
     mcpSessions.clear();
+    await shutdownMissionVerifiers();
     eventStore.close();
     continuationManager.close();
     dispatchOutbox.close();
-    processSessions.shutdown();
+    await processSessions.shutdown();
     oauthProvider?.close();
     workspaceStore.close?.();
     workSessions?.close?.();
@@ -3577,10 +4177,11 @@ export function createServer(config = loadConfig()): RunningServer {
         // are woken before the Node HTTP server waits for connection closure.
         shuttingDown = true;
         mcpAdmission.close();
+        mcpWaiterAdmission.close();
         const activeTransports = [...transports.values()];
         for (const state of mcpSessions.values()) state.closing = true;
         await Promise.all(activeTransports.map(closeTransport));
-        finalizeClose();
+        await finalizeClose();
       })();
       return draining;
     },
@@ -3643,7 +4244,7 @@ if (await isMainModule()) {
   });
   httpServer.once("error", (error) => {
     removeRuntimeIdentity(config.stateDir, runtimeIdentity.instanceId);
-    close();
+    void close();
     console.error(`kontrol failed to listen on ${config.host}:${config.port}: ${error instanceof Error ? error.message : String(error)}`);
     process.exitCode = 1;
   });
@@ -3670,12 +4271,12 @@ if (await isMainModule()) {
           finish();
         });
       });
-      close();
+      await close();
       removeRuntimeIdentity(config.stateDir, runtimeIdentity.instanceId);
       process.exit(0);
     } catch (error) {
       console.error(`kontrol graceful shutdown failed: ${error instanceof Error ? error.message : String(error)}`);
-      close();
+      await close();
       removeRuntimeIdentity(config.stateDir, runtimeIdentity.instanceId);
       process.exit(1);
     }
