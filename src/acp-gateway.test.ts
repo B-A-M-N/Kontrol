@@ -67,7 +67,7 @@ try {
     const port = await listen(server, "127.0.0.1");
     const result = await dispatchToPeer({
       agentUrl: `http://127.0.0.1:${port}`,
-      sharedSecret: "secret",
+      adapterSecret: "secret",
       body: { agent_name: "local", input: [] },
     });
     assert.equal(result.status, 202);
@@ -195,6 +195,7 @@ try {
       workSessions,
       agentRegistry,
       "operator-secret",
+      "operator-secret",
       undefined,
       undefined,
       undefined,
@@ -248,7 +249,7 @@ try {
           agentRegistry,
           workspaces: { getWorkspace: () => ({ id: "ws-terminal", root: "/tmp", mode: "checkout" }) } as any,
           workSessions,
-          sharedSecret: "secret",
+          adapterSecret: "secret",
         },
         {
           agentUrl: "http://127.0.0.1:9",
@@ -314,7 +315,7 @@ try {
         agentRegistry,
         workspaces: { getWorkspace: () => ({ id: "ws-race", root: "/tmp", mode: "checkout" }) } as any,
         workSessions,
-        sharedSecret: "secret",
+        adapterSecret: "secret",
       },
       {
         agentUrl: `http://127.0.0.1:${delayedPort}`,

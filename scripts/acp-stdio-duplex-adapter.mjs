@@ -17,11 +17,13 @@ import { createServer } from "node:http";
 import { randomUUID } from "node:crypto";
 import { isAbsolute } from "node:path";
 import { realpath, stat } from "node:fs/promises";
+import { clearAgentIdentity, identityHeaders, loadAgentIdentity, saveAgentIdentity } from "./lib/acp-agent-identity.mjs";
+import { readJsonBody } from "./lib/adapter-http.mjs";
 
 const KONTROL_ACP_URL = process.env.KONTROL_ACP_URL || "http://127.0.0.1:7676/acp";
 const AGENT_SECRET = process.env.KONTROL_ACP_AGENT_SECRET;
 const ADAPTER_SECRET = process.env.KONTROL_ACP_ADAPTER_SECRET;
-const ADAPTER_HOST = process.env.HOST || "127.0.0.1";
+const ADAPTER_HOST = process.env.ACP_STDIO_ADAPTER_HOST || "127.0.0.1";
 const ADAPTER_PORT = Number(process.env.ACP_STDIO_ADAPTER_PORT || process.env.ACP_ADAPTER_PORT || "9921");
 const AGENT_NAME = process.env.ACP_STDIO_AGENT_NAME || "stdio-duplex-agent";
 const AGENT_DESCRIPTION = process.env.ACP_STDIO_AGENT_DESCRIPTION || "Generic stdio ACP duplex adapter";
@@ -47,7 +49,7 @@ if (!AGENT_COMMAND) {
 }
 
 const active = new Map();
-let agentId = null;
+let agentIdentity = null;
 
 await registerAgentWithRetry();
 setInterval(() => heartbeat().catch((err) => console.warn("[stdio-duplex] heartbeat:", err.message)), 55_000);
@@ -77,6 +79,7 @@ async function registerAgentWithRetry() {
 }
 
 async function registerAgent() {
+  let identity = agentIdentity || await loadAgentIdentity(AGENT_NAME);
   const capabilities = [
     "native-acp",
     "stdio-json-rpc",
@@ -87,7 +90,7 @@ async function registerAgent() {
   ];
   const res = await fetch(`${KONTROL_ACP_URL}/agents/register`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", authorization: `Bearer ${AGENT_SECRET}` },
+    headers: { "Content-Type": "application/json", authorization: `Bearer ${AGENT_SECRET}`, ...identityHeaders(identity) },
     body: JSON.stringify({
       name: AGENT_NAME,
       url: `http://${ADAPTER_HOST}:${ADAPTER_PORT}`,
@@ -97,19 +100,32 @@ async function registerAgent() {
       ttlSeconds: 90,
     }),
   });
-  if (!res.ok) throw new Error(`registration failed ${res.status}: ${await res.text()}`);
+  if (!res.ok) {
+    if (res.status === 404 && identity) {
+      await clearAgentIdentity(AGENT_NAME);
+      agentIdentity = null;
+      return registerAgent();
+    }
+    throw new Error(`registration failed ${res.status}: ${await res.text()}`);
+  }
   const json = await res.json();
-  agentId = json.id;
-  console.log(`[stdio-duplex] registered ${AGENT_NAME} (id=${agentId})`);
+  const credential = typeof json.agentCredential === "string" ? json.agentCredential : identity?.agentCredential;
+  if (typeof json.id !== "string" || !credential) throw new Error("registration response did not include a usable agent identity");
+  agentIdentity = { agentId: json.id, agentCredential: credential };
+  await saveAgentIdentity(AGENT_NAME, agentIdentity);
+  console.log(`[stdio-duplex] registered ${AGENT_NAME} (id=${agentIdentity.agentId})`);
 }
 
 async function heartbeat() {
-  if (!agentId) return;
-  const res = await fetch(`${KONTROL_ACP_URL}/agents/${agentId}/heartbeat`, {
+  if (!agentIdentity) return;
+  const res = await fetch(`${KONTROL_ACP_URL}/agents/${agentIdentity.agentId}/heartbeat`, {
     method: "POST",
-    headers: { authorization: `Bearer ${AGENT_SECRET}` },
+    headers: { authorization: `Bearer ${AGENT_SECRET}`, ...identityHeaders(agentIdentity) },
   });
-  if (res.status === 404) await registerAgentWithRetry();
+  if (res.status === 404) {
+    agentIdentity = null;
+    await registerAgentWithRetry();
+  }
 }
 
 async function handle(req, res) {
@@ -137,7 +153,7 @@ async function handle(req, res) {
   if (req.method !== "POST" || url !== "/runs") return writeJson(res, 404, { error: { code: "not_found" } });
   if (!authorized(req)) return writeJson(res, 401, { error: { code: "unauthorized" } });
 
-  const body = await readJson(req);
+  const body = await readJsonBody(req);
   if (body.smoke_test) {
     return writeJson(res, 202, { run_id: "stdio-duplex-smoke", smoke_test: true, duplex: true, accepted: true });
   }
@@ -148,6 +164,7 @@ async function handle(req, res) {
     devRunId: body.parent_run_id || body.run_id,
     workSessionId: body.session_id,
     workspaceSessionId: body.workspace_session_id,
+    agentId: body.agent_id,
     workspaceRoot,
     task: extractTask(body.input),
     child: null,
@@ -254,7 +271,7 @@ function createKontrolHttpHandler(run) {
 async function createKontrolApproval(run, payload) {
   const res = await fetch(`${KONTROL_ACP_URL}/runs/${run.devRunId}/events`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", authorization: `Bearer ${AGENT_SECRET}` },
+    headers: { "Content-Type": "application/json", authorization: `Bearer ${AGENT_SECRET}`, ...identityHeaders(agentIdentity) },
     body: JSON.stringify({
       type: "permission.requested",
       remote_run_id: run.remoteRunId,
@@ -269,7 +286,7 @@ async function createKontrolApproval(run, payload) {
 async function waitForApprovalDecision(run, approvalId, signal) {
   while (!signal.aborted && active.has(run.remoteRunId)) {
     const res = await fetch(`${KONTROL_ACP_URL}/approvals/${approvalId}/decision`, {
-      headers: { authorization: `Bearer ${AGENT_SECRET}` },
+      headers: { authorization: `Bearer ${AGENT_SECRET}`, ...identityHeaders(agentIdentity) },
     }).catch(() => undefined);
     if (!res?.ok) {
       await sleep(2000);
@@ -334,7 +351,7 @@ function cancelRun(run, reason) {
 async function reportEvent(run, type, errorMessage) {
   await fetch(`${KONTROL_ACP_URL}/runs/${run.devRunId}/events`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", authorization: `Bearer ${AGENT_SECRET}` },
+    headers: { "Content-Type": "application/json", authorization: `Bearer ${AGENT_SECRET}`, ...identityHeaders(agentIdentity) },
     body: JSON.stringify({
       type,
       remote_run_id: run.remoteRunId,
@@ -347,7 +364,7 @@ async function reportEvent(run, type, errorMessage) {
 function reportStructured(run, type, payload) {
   void fetch(`${KONTROL_ACP_URL}/runs/${run.devRunId}/events`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", authorization: `Bearer ${AGENT_SECRET}` },
+    headers: { "Content-Type": "application/json", authorization: `Bearer ${AGENT_SECRET}`, ...identityHeaders(agentIdentity) },
     body: JSON.stringify({
       type,
       remote_run_id: run.remoteRunId,
@@ -359,12 +376,6 @@ function reportStructured(run, type, payload) {
 
 function authorized(req) {
   return (req.headers.authorization || "") === `Bearer ${ADAPTER_SECRET}`;
-}
-
-async function readJson(req) {
-  const chunks = [];
-  for await (const chunk of req) chunks.push(chunk);
-  return chunks.length ? JSON.parse(Buffer.concat(chunks).toString()) : {};
 }
 
 function safeEnv() {

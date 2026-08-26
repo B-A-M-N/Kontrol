@@ -26,7 +26,7 @@ Most MCP file-server bridges stop at "read/write/edit." Kontrol adds three layer
 
 **Policy Mode** — Per-tool and per-path approval rules. A dangerous command can require a one-time approval, or you can approve it for an entire workspace session. Read-only inspection stays fast; destructive ops pause for human judgment.
 
-Underneath it all is **transactional workflow state with an append-only event log**: submissions, feedback, approvals, continuations, runs, and policy decisions are persisted in SQLite, and the event stream wakes WebUI watchers and blocked agents.
+Underneath it all is **transactional workflow state with an append-only event log**: submissions, feedback, approvals, continuations, runs, and policy decisions are persisted in SQLite, and the event stream wakes WebUI watchers and blocked agents. High-volume agent output/thought telemetry is buffered for transport efficiency and may be compacted after retention; lifecycle and review events remain the durable workflow record.
 
 ## Installation
 
@@ -104,10 +104,12 @@ The default local endpoint:
 http://127.0.0.1:7676/mcp
 ```
 
-`GET /healthz` reports process liveness and the embedded build identity.
+`GET /healthz` reports only process liveness. It intentionally does not expose
+process, build, or workflow details.
 `GET /core-readyz` checks KONTROL's own database, MCP handler,
-workspace/review/ACP initialization, and runtime build identity while adapters
-are still starting. `GET /readyz` is strict operational readiness: it also
+workspace/review/ACP initialization, and internal runtime build consistency
+while adapters are still starting; its public payload contains only boolean
+check status. `GET /readyz` is strict operational readiness: it also
 requires live configured worker agents. The launcher additionally performs an
 actual MCP initialize, agent discovery, workspace open, file read, and bash
 round trip before declaring the stack ready.
@@ -138,6 +140,38 @@ Register the server in the tunnel client with **No Authentication**, pointing at
 tunnel-client run \
   --mcp.server-url "http://127.0.0.1:7676/mcp"
 ```
+
+For stable long-running process priority, install the optional per-user
+systemd unit and start the installed server through it. The unit launches the
+validated `dist/cli.js serve` product, sets `Nice=0`, and restarts that server
+on failure. The full checkout orchestration path remains available through
+`./start-all.sh` for development and integration work:
+
+```bash
+scripts/kontrol-user-service.sh install
+scripts/kontrol-user-service.sh start
+```
+
+Use `scripts/kontrol-user-service.sh status` or `logs` for service-level
+diagnostics. Direct `./start-all.sh` remains available for foreground/development
+use.
+
+### Supported lifecycle paths (P1 #27)
+
+KONTROL defines exactly one authoritative path per context:
+
+| Context | Path | Notes |
+|---|---|---|
+| Production / install | `scripts/kontrol-user-service.sh` (systemd user unit) | Owns restart/priority policy; the unit launches the validated build |
+| Development / integration | `./start-all.sh` (tmux sessions + component supervisor) | Full preflight gate; atomic build generation with rollback |
+| Test / release | `npm run typecheck && npm run test && npm run build` | The release gate CI and `kontrol-user-service.sh install` rely on |
+
+The systemd unit is the supported way to keep the installed server running
+across reboots/sessions. `kontrol serve` remains the underlying process it
+launches — it is not itself a production lifecycle manager. Startup
+preflight depth is controlled by `KONTROL_STARTUP_PROFILE` (see
+docs/configuration.md): `release` runs the complete gate including the
+dirty-checkout guard; `dev-fast` skips the test suite for iteration.
 
 The launcher uses `KONTROL_TUNNEL_PROFILE` (default
 `sample_mcp_with_dcr`). If that profile points at a retired or stale tunnel,
@@ -213,8 +247,11 @@ KONTROL_POLICY_TOOL_BASH=ask KONTROL_POLICY_TOOL_WRITE=allow
 # shell assignment syntax)
 KONTROL_POLICY_PATH_RULES='[{"pattern":"/etc/ssh/**","mode":"deny"}]'
 
-# Default: ask for anything not explicitly allowed
-KONTROL_POLICY_MODE=ask
+# Default trust posture: ALLOW (read-only operations are frictionless; shell
+# and mutating tools are controlled by their own tool rules). Set to `ask`
+# for a stricter posture where anything not explicitly allowed requires a
+# human decision.
+KONTROL_POLICY_MODE=allow
 ```
 
 Modes:

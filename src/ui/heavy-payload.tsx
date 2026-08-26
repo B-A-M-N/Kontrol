@@ -5,6 +5,7 @@ import type { FileStreamOptions } from "@pierre/diffs";
 import { PatchDiff } from "@pierre/diffs/react";
 import {
   isEditTool,
+  isPatchTool,
   isReadTool,
   isWriteTool,
   payloadText,
@@ -56,7 +57,7 @@ function HeavyPayload({
     return <StatusLine message={errorMessage} tone="error" />;
   }
 
-  if (isEditTool(card.tool) || isWriteTool(card.tool)) {
+  if (isEditTool(card.tool) || isWriteTool(card.tool) || isPatchTool(card.tool)) {
     const patch = card.payload?.patch || card.payload?.diff;
     if (!patch) return <StatusLine message="Diff payload is not available." />;
 

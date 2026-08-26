@@ -108,7 +108,7 @@ const config: BridgeConfig = {
   continuationManager,
   reviewWorkflow,
   knownAgents: [],
-  sharedSecret: "test-secret",
+  adapterSecret: "test-secret",
   principalRole: "client",
   resumeAgent: async () => {},
 };
@@ -302,6 +302,19 @@ try {
     const late = await callWorker("submit_for_review", { sessionId });
     assert.ok(late.isError, "duplicate submit rejected");
     assert.equal(commitCalled, false, "checkpoint NOT advanced on failed submit");
+
+    const housekeepingSession = createGatedSession();
+    const originalCommitReviewed = config.reviewCheckpoints.commitReviewed;
+    (config.reviewCheckpoints as any).commitReviewed = async () => { throw new Error("checkpoint storage unavailable"); };
+    try {
+      const housekeeping = await callWorker("submit_for_review", { sessionId: housekeepingSession });
+      assert.ok(!housekeeping.isError, "durable submission remains successful when checkpoint housekeeping fails");
+      assert.equal(housekeeping.structuredContent.status, "awaiting_review");
+      assert.match(housekeeping.structuredContent.housekeepingWarnings?.[0] ?? "", /checkpoint_commit/);
+      assert.equal(workSessions.get(housekeepingSession)!.status, "awaiting_review");
+    } finally {
+      (config.reviewCheckpoints as any).commitReviewed = originalCommitReviewed;
+    }
   }
 
   // ── Test 8: changes_requested / reject allowed on changed workspace ──

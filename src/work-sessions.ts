@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { eq, and, desc, gte, or, sql } from "drizzle-orm";
+import { eq, and, desc, gte, inArray, or, sql } from "drizzle-orm";
 import { openDatabase, type DatabaseHandle } from "./db/client.js";
 import {
   workSessions,
@@ -18,6 +18,7 @@ import {
 
 export type WorkSessionStatus =
   | "in_progress"
+  | "cancelling"
   | "drafting"
   | "awaiting_review"
   | "in_review"
@@ -51,6 +52,43 @@ export interface WorkSession {
   /** P1 #7: lifecycle classification for UI grouping. */
   lifecycle: WorkSessionLifecycle;
   runtimeState: WorkSessionRuntimeState;
+}
+
+/** Compact workspace-level projection used by the WebUI session picker. */
+export interface WorkspaceSessionSurfaceEntry {
+  sessionId: string;
+  workspaceSessionId: string;
+  status: string;
+  lifecycle: WorkSessionLifecycle;
+  runtimeState: WorkSessionRuntimeState;
+  title?: string;
+  submittedBy: string;
+  updatedAt: string;
+  runId?: string;
+  hasMission: boolean;
+  missionStatus?: string;
+  missionCycleNumber?: number;
+  missionMaxCycles?: number;
+  lastSeq: number;
+  submissionCount: number;
+  unresolvedMessageCount: number;
+  pendingApprovalCount: number;
+  latestSubmission?: {
+    submissionId: string;
+    submissionNumber: number;
+    status: string;
+    additions: number;
+    removals: number;
+    diffSha256?: string;
+    reviewEpoch?: number;
+  };
+  latestFeedback?: {
+    id: string;
+    submissionId?: string;
+    verdict: string;
+    comments?: string;
+    reviewerId?: string;
+  };
 }
 
 /** P1 #7: lifecycle classification distinguishing live work from stale/orphaned sessions. */
@@ -124,6 +162,11 @@ export interface WorkspaceLease {
   expiresAt: string;
 }
 
+export interface WorkspaceSessionSurfaceCursor {
+  updatedAt: string;
+  sessionId: string;
+}
+
 export type WorkspaceLeaseResult =
   | { acquired: true; lease: WorkspaceLease }
   | { acquired: false; conflictingWorkSessionId: string; workspaceSessionId: string; expiresAt: string };
@@ -186,6 +229,7 @@ export interface WorkSessionManager {
   getSubmissions(workSessionId: string): WorkSessionSubmission[];
   getLatestSubmission(workSessionId: string): WorkSessionSubmission | undefined;
   getLatestFeedback(workSessionId: string): WorkSessionFeedback | undefined;
+  countFeedback(workSessionId: string): number;
   markFeedbackConsumed(workSessionId: string, feedbackId: string): void;
   getLatestFeedbackAfter(workSessionId: string, afterFeedbackId?: string): WorkSessionFeedback | undefined;
   listPendingReviews(workspaceSessionId?: string, limit?: number): WorkSession[];
@@ -198,6 +242,14 @@ export interface WorkSessionManager {
   countPendingReviews(): number;
   /** P1 #23: List all work sessions (including terminal) for maintenance. */
   listAllWorkSessions(workspaceSessionId?: string, limit?: number): WorkSession[];
+  /** Compact projection variants used by bridge discovery without N+1 enrichment. */
+  getWorkspaceSessionSurface(
+    workspaceSessionId?: string,
+    limit?: number,
+    filter?: "all" | "pending_review" | "live",
+    after?: WorkspaceSessionSurfaceCursor,
+  ): WorkspaceSessionSurfaceEntry[];
+  getWorkspaceEventCursor(workspaceSessionId?: string): number;
   /** P2 #10: Active-session projection with all needed fields in one query. */
   listActiveWorkSessionsProjection(workspaceSessionId?: string): Array<{
     sessionId: string;
@@ -208,6 +260,13 @@ export interface WorkSessionManager {
     updatedAt: string;
     submissionCount: number;
   }>;
+  /**
+   * P1 #18: bounded cursor page of session IDs eligible for telemetry
+   * compaction (terminal sessions, or parked/stale reviews). Returns only
+   * IDs — no full projection hydration — so the five-minute maintenance
+   * loop never sweeps unbounded sessions at once.
+   */
+  listSessionIdsNeedingCompaction(afterSessionId?: string, limit?: number): string[];
   close(): void;
 }
 
@@ -413,55 +472,65 @@ class SqliteWorkSessionManager implements WorkSessionManager {
     message?: string;
     summaryJson?: string;
   }): WorkSessionSubmission {
-    const session = this.get(input.workSessionId);
-    if (!session) throw new Error(`Work session not found: ${input.workSessionId}`);
-
-    const submissions = this.getSubmissions(input.workSessionId);
-    const submissionNumber = submissions.length + 1;
-    const reviewEpoch = session.reviewEpoch + 1;
     const diffSha256 = input.diffSha256 ?? sha256(input.diff ?? "");
     const now = new Date().toISOString();
+    const submissionId = `wssub_${randomUUID()}`;
 
-    const submission: WorkSessionSubmission = {
-      id: `wssub_${randomUUID()}`,
+    const createSubmission = this.database.sqlite.transaction(() => {
+      const session = this.database.sqlite
+        .prepare("select review_epoch, status from work_sessions where id = ?")
+        .get(input.workSessionId) as { review_epoch: number; status: string } | undefined;
+      if (!session) throw new Error(`Work session not found: ${input.workSessionId}`);
+      if (!["in_progress", "changes_requested", "resuming"].includes(session.status)) {
+        throw new Error(`Work session ${input.workSessionId} is ${session.status}; cannot submit for review.`);
+      }
+
+      // Allocate under the same immediate transaction that advances the
+      // session epoch. A second writer cannot observe the same max/count and
+      // turn a normal concurrency race into a raw unique-index error.
+      const latest = this.database.sqlite
+        .prepare("select coalesce(max(submission_number), 0) as submission_number from work_session_submissions where work_session_id = ?")
+        .get(input.workSessionId) as { submission_number: number };
+      const submissionNumber = Number(latest.submission_number) + 1;
+      const reviewEpoch = Number(session.review_epoch) + 1;
+      this.database.sqlite.prepare(`
+        insert into work_session_submissions
+          (id, work_session_id, submission_number, diff, diff_sha256, snapshot_commit, review_epoch, message, summary_json, status, created_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+      `).run(
+        submissionId,
+        input.workSessionId,
+        submissionNumber,
+        input.diff ?? null,
+        diffSha256,
+        input.snapshotCommit ?? null,
+        reviewEpoch,
+        input.message ?? null,
+        input.summaryJson ?? null,
+        now,
+      );
+      const updated = this.database.sqlite.prepare(`
+        update work_sessions
+           set status = 'awaiting_review', runtime_state = 'parked', runtime_classified_at = ?, review_epoch = ?, updated_at = ?
+         where id = ? and review_epoch = ? and status in ('in_progress', 'changes_requested', 'resuming')
+      `).run(now, reviewEpoch, now, input.workSessionId, session.review_epoch);
+      if (updated.changes !== 1) throw new Error("submission changed concurrently");
+      return { submissionNumber, reviewEpoch };
+    }).immediate();
+
+    return {
+      id: submissionId,
       workSessionId: input.workSessionId,
-      submissionNumber,
+      submissionNumber: createSubmission.submissionNumber,
       diff: input.diff,
       diffSha256,
       snapshotCommit: input.snapshotCommit,
-      reviewEpoch,
+      reviewEpoch: createSubmission.reviewEpoch,
       message: input.message,
       summaryJson: input.summaryJson,
       status: "pending",
       createdAt: now,
     };
-
-    this.database.db.transaction(() => {
-      this.database.db
-        .insert(workSessionSubmissions)
-        .values({
-          id: submission.id,
-          workSessionId: submission.workSessionId,
-          submissionNumber: submission.submissionNumber,
-          diff: submission.diff ?? null,
-          diffSha256: submission.diffSha256 ?? null,
-          snapshotCommit: submission.snapshotCommit ?? null,
-          reviewEpoch: submission.reviewEpoch,
-          message: submission.message ?? null,
-          summaryJson: submission.summaryJson ?? null,
-          status: submission.status,
-          createdAt: submission.createdAt,
-        })
-        .run();
-
-      this.database.db
-        .update(workSessions)
-        .set({ status: "awaiting_review", runtimeState: "parked", runtimeClassifiedAt: now, reviewEpoch, updatedAt: now })
-        .where(eq(workSessions.id, input.workSessionId))
-        .run();
-    });
-
-    return submission;
   }
 
   submitFeedback(input: {
@@ -498,6 +567,16 @@ class SqliteWorkSessionManager implements WorkSessionManager {
           : "changes_requested";
 
     this.database.db.transaction(() => {
+      const submission = this.database.db
+        .select({ workSessionId: workSessionSubmissions.workSessionId })
+        .from(workSessionSubmissions)
+        .where(eq(workSessionSubmissions.id, input.submissionId))
+        .get();
+      if (!submission) throw new Error(`Submission not found: ${input.submissionId}`);
+      if (submission.workSessionId !== input.workSessionId) {
+        throw new Error("Submission does not belong to work session");
+      }
+
       this.database.db
         .insert(workSessionFeedback)
         .values({
@@ -661,6 +740,13 @@ class SqliteWorkSessionManager implements WorkSessionManager {
     return row ? rowToFeedback(row) : undefined;
   }
 
+  countFeedback(workSessionId: string): number {
+    const row = this.database.sqlite
+      .prepare("select count(*) as count from work_session_feedback where work_session_id = ?")
+      .get(workSessionId) as { count?: number } | undefined;
+    return Number(row?.count ?? 0);
+  }
+
   markFeedbackConsumed(workSessionId: string, feedbackId: string): void {
     const now = new Date().toISOString();
     this.database.db
@@ -710,7 +796,9 @@ class SqliteWorkSessionManager implements WorkSessionManager {
   }
 
   listPendingReviews(workspaceSessionId?: string, limit = 20): WorkSession[] {
-    const statusFilter = sql`${workSessions.status} IN ('awaiting_review', 'review_in_progress')`;
+    const statusFilter = sql`${workSessions.status} IN ('awaiting_review', 'review_in_progress')
+      and ${workSessions.runtimeState} <> 'stale'
+      and datetime(${workSessions.updatedAt}) >= datetime('now', '-30 days')`;
     const projectId = workspaceSessionId ? this.projectIdForWorkspace(workspaceSessionId) : undefined;
     const condition = workspaceSessionId
       ? and(statusFilter, projectId ? eq(workSessions.projectId, projectId) : eq(workSessions.workspaceSessionId, workspaceSessionId))
@@ -787,6 +875,123 @@ class SqliteWorkSessionManager implements WorkSessionManager {
     return rows.map((row) => this.enrichSession(row));
   }
 
+  getWorkspaceSessionSurface(
+    workspaceSessionId?: string,
+    limit = 50,
+    filter: "all" | "pending_review" | "live" = "all",
+    after?: WorkspaceSessionSurfaceCursor,
+  ): WorkspaceSessionSurfaceEntry[] {
+    const boundedLimit = Math.max(1, Math.min(200, Math.trunc(limit)));
+    const projectId = workspaceSessionId ? this.projectIdForWorkspace(workspaceSessionId) : undefined;
+    const scopeSql = workspaceSessionId
+      ? projectId ? "ws.project_id = ?" : "ws.workspace_session_id = ?"
+      : "1 = 1";
+    const scopeParam = workspaceSessionId ? (projectId ?? workspaceSessionId) : undefined;
+    const rows = this.database.sqlite.prepare(`
+      select
+        ws.id as session_id,
+        ws.workspace_session_id,
+        ws.status,
+        ws.runtime_state,
+        ws.title,
+        ws.submitted_by,
+        ws.updated_at,
+        (select ar.run_id from acp_runs ar where ar.work_session_id = ws.id order by ar.created_at desc limit 1) as run_id,
+        (select 1 from mission_contracts mc where mc.work_session_id = ws.id limit 1) as has_mission,
+        (select sr.status from supervisor_runs sr where sr.work_session_id = ws.id limit 1) as mission_status,
+        (select sr.cycle_number from supervisor_runs sr where sr.work_session_id = ws.id limit 1) as mission_cycle_number,
+        (select sr.max_cycles from supervisor_runs sr where sr.work_session_id = ws.id limit 1) as mission_max_cycles,
+        (select coalesce(max(el.seq), 0) from event_log el where el.session_id = ws.id) as last_seq,
+        (select count(*) from work_session_submissions s where s.work_session_id = ws.id) as submission_count,
+        (select count(*) from agent_messages am where am.work_session_id = ws.id and am.status = 'open') as unresolved_message_count,
+        (select count(*) from approval_requests ap where ap.work_session_id = ws.id and ap.status = 'pending') as pending_approval_count,
+        (select s.id from work_session_submissions s where s.work_session_id = ws.id order by s.submission_number desc limit 1) as latest_submission_id,
+        (select s.submission_number from work_session_submissions s where s.work_session_id = ws.id order by s.submission_number desc limit 1) as latest_submission_number,
+        (select s.status from work_session_submissions s where s.work_session_id = ws.id order by s.submission_number desc limit 1) as latest_submission_status,
+        (select coalesce(s.diff_sha256, '') from work_session_submissions s where s.work_session_id = ws.id order by s.submission_number desc limit 1) as latest_submission_diff_sha256,
+        (select s.review_epoch from work_session_submissions s where s.work_session_id = ws.id order by s.submission_number desc limit 1) as latest_submission_review_epoch,
+        (select coalesce(json_extract(s.summary_json, '$.additions'), 0) from work_session_submissions s where s.work_session_id = ws.id order by s.submission_number desc limit 1) as latest_submission_additions,
+        (select coalesce(json_extract(s.summary_json, '$.removals'), 0) from work_session_submissions s where s.work_session_id = ws.id order by s.submission_number desc limit 1) as latest_submission_removals,
+        (select f.id from work_session_feedback f where f.work_session_id = ws.id order by f.created_at desc limit 1) as latest_feedback_id,
+        (select f.submission_id from work_session_feedback f where f.work_session_id = ws.id order by f.created_at desc limit 1) as latest_feedback_submission_id,
+        (select f.verdict from work_session_feedback f where f.work_session_id = ws.id order by f.created_at desc limit 1) as latest_feedback_verdict,
+        (select f.comments from work_session_feedback f where f.work_session_id = ws.id order by f.created_at desc limit 1) as latest_feedback_comments,
+        (select f.reviewer_id from work_session_feedback f where f.work_session_id = ws.id order by f.created_at desc limit 1) as latest_feedback_reviewer_id
+      from work_sessions ws
+      where ${scopeSql}
+        ${after ? "and (ws.updated_at < ? or (ws.updated_at = ? and ws.id < ?))" : ""}
+        and ${filter === "pending_review"
+          ? "ws.status in ('awaiting_review', 'review_in_progress') and ws.runtime_state <> 'stale' and datetime(ws.updated_at) >= datetime('now', '-30 days')"
+          : filter === "live"
+            ? "(ws.runtime_state = 'running' or (ws.runtime_state = 'pending' and ws.status in ('in_progress', 'drafting', 'resuming') and datetime(ws.updated_at) >= datetime('now', '-1 hour')))"
+            : "(ws.runtime_state in ('running', 'pending', 'detached', 'stale', 'orphaned') or ws.status in ('awaiting_review', 'review_in_progress', 'changes_requested')) and not (ws.status in ('awaiting_review', 'review_in_progress') and datetime(ws.updated_at) < datetime('now', '-30 days'))"}
+      order by ws.updated_at desc, ws.id desc
+      limit ?
+    `).all(...(
+      scopeParam
+        ? [scopeParam, ...(after ? [after.updatedAt, after.updatedAt, after.sessionId] : []), boundedLimit]
+        : [...(after ? [after.updatedAt, after.updatedAt, after.sessionId] : []), boundedLimit]
+    )) as Array<Record<string, unknown>>;
+
+    return rows.map((row) => {
+      const status = String(row.status);
+      const runtimeState = String(row.runtime_state) as WorkSessionRuntimeState;
+      const latestSubmissionId = typeof row.latest_submission_id === "string" ? row.latest_submission_id : undefined;
+      const latestFeedbackId = typeof row.latest_feedback_id === "string" ? row.latest_feedback_id : undefined;
+      const latestFeedbackSubmissionId = typeof row.latest_feedback_submission_id === "string" ? row.latest_feedback_submission_id : undefined;
+      return {
+        sessionId: String(row.session_id),
+        workspaceSessionId: String(row.workspace_session_id),
+        status,
+        lifecycle: lifecycleForRuntimeState(status as WorkSessionStatus, runtimeState),
+        runtimeState,
+        title: typeof row.title === "string" ? row.title : undefined,
+        submittedBy: String(row.submitted_by),
+        updatedAt: String(row.updated_at),
+        runId: typeof row.run_id === "string" ? row.run_id : undefined,
+        hasMission: row.has_mission === 1,
+        missionStatus: typeof row.mission_status === "string" ? row.mission_status : undefined,
+        missionCycleNumber: typeof row.mission_cycle_number === "number" ? row.mission_cycle_number : undefined,
+        missionMaxCycles: typeof row.mission_max_cycles === "number" ? row.mission_max_cycles : undefined,
+        lastSeq: Number(row.last_seq ?? 0),
+        submissionCount: Number(row.submission_count ?? 0),
+        unresolvedMessageCount: Number(row.unresolved_message_count ?? 0),
+        pendingApprovalCount: Number(row.pending_approval_count ?? 0),
+        latestSubmission: latestSubmissionId ? {
+          submissionId: latestSubmissionId,
+          submissionNumber: Number(row.latest_submission_number ?? 0),
+          status: String(row.latest_submission_status ?? "pending"),
+          additions: Number(row.latest_submission_additions ?? 0),
+          removals: Number(row.latest_submission_removals ?? 0),
+          diffSha256: typeof row.latest_submission_diff_sha256 === "string" && row.latest_submission_diff_sha256 ? row.latest_submission_diff_sha256 : undefined,
+          reviewEpoch: typeof row.latest_submission_review_epoch === "number" ? row.latest_submission_review_epoch : undefined,
+        } : undefined,
+        latestFeedback: latestFeedbackId ? {
+          id: latestFeedbackId,
+          submissionId: latestFeedbackSubmissionId,
+          verdict: String(row.latest_feedback_verdict ?? ""),
+          comments: typeof row.latest_feedback_comments === "string" ? row.latest_feedback_comments : undefined,
+          reviewerId: typeof row.latest_feedback_reviewer_id === "string" ? row.latest_feedback_reviewer_id : undefined,
+        } : undefined,
+      } satisfies WorkspaceSessionSurfaceEntry;
+    });
+  }
+
+  getWorkspaceEventCursor(workspaceSessionId?: string): number {
+    if (!workspaceSessionId) {
+      const row = this.database.sqlite.prepare("select coalesce(max(seq), 0) as seq from event_log").get() as { seq?: number } | undefined;
+      return Number(row?.seq ?? 0);
+    }
+    const projectId = this.projectIdForWorkspace(workspaceSessionId);
+    const row = this.database.sqlite.prepare(`
+      select coalesce(max(el.seq), 0) as seq
+      from event_log el
+      where el.workspace_session_id = ?
+         or el.workspace_session_id in (select id from workspace_sessions where project_id = ?)
+    `).get(workspaceSessionId, projectId ?? workspaceSessionId) as { seq?: number } | undefined;
+    return Number(row?.seq ?? 0);
+  }
+
   countActiveWorkSessions(): number {
     const result = this.database.db
       .select({ count: sql<number>`count(*)` })
@@ -803,7 +1008,9 @@ class SqliteWorkSessionManager implements WorkSessionManager {
     const result = this.database.db
       .select({ count: sql<number>`count(*)` })
       .from(workSessions)
-      .where(sql`${workSessions.status} IN ('awaiting_review', 'review_in_progress')`)
+      .where(sql`${workSessions.status} IN ('awaiting_review', 'review_in_progress')
+        and ${workSessions.runtimeState} <> 'stale'
+        and datetime(${workSessions.updatedAt}) >= datetime('now', '-30 days')`)
       .get();
     return result?.count ?? 0;
   }
@@ -852,6 +1059,35 @@ class SqliteWorkSessionManager implements WorkSessionManager {
       updatedAt: row.updatedAt,
       submissionCount: row.submissionCount ?? 0,
     }));
+  }
+
+  /**
+   * P1 #18: bounded cursor page of session IDs eligible for telemetry
+   * compaction — terminal sessions, or parked/stale review sessions. Only
+   * IDs are returned so maintenance never hydrates full projections.
+   */
+  listSessionIdsNeedingCompaction(afterSessionId?: string, limit = 500): string[] {
+    const boundedLimit = Math.max(1, Math.min(2_000, Math.trunc(limit)));
+    const terminalStatuses = ["approved", "rejected", "cancelled", "failed", "failed_protocol"];
+    const compactParked = and(
+      sql`${workSessions.runtimeState} IN ('parked', 'stale')`,
+      sql`${workSessions.status} IN ('awaiting_review', 'review_in_progress')`,
+    );
+    const condition = afterSessionId
+      ? and(
+          or(inArray(workSessions.status, terminalStatuses), compactParked!),
+          sql`${workSessions.id} > ${afterSessionId}`,
+        )
+      : or(inArray(workSessions.status, terminalStatuses), compactParked!);
+
+    const rows = this.database.db
+      .select({ id: workSessions.id })
+      .from(workSessions)
+      .where(condition)
+      .orderBy(workSessions.id)
+      .limit(boundedLimit)
+      .all();
+    return rows.map((row) => row.id);
   }
 
   reconcileRuntimeStates(): { reconciled: number; markedStale: number } {
@@ -939,14 +1175,18 @@ class SqliteWorkSessionManager implements WorkSessionManager {
     run: { status: string; lastHeartbeatAt?: string | null; workerLeaseUntil?: string | null; finishedAt?: string | null } | undefined,
   ): WorkSessionRuntimeState {
     if (isTerminalStatus(status)) return "archived";
-    if (status === "awaiting_review" || status === "review_in_progress") return "parked";
+    const ageMs = Date.now() - Date.parse(updatedAt);
+    if (status === "awaiting_review" || status === "review_in_progress") {
+      // A parked review remains durable and recoverable, but month-old review
+      // work must not consume the active control-plane surface forever.
+      return ageMs > 30 * 24 * 60 * 60 * 1000 ? "stale" : "parked";
+    }
     const runActive = Boolean(run && !run.finishedAt && ["created", "in-progress", "running", "working", "awaiting"].includes(run.status));
     const heartbeat = run?.lastHeartbeatAt ? Date.parse(run.lastHeartbeatAt) : 0;
     const lease = run?.workerLeaseUntil ? Date.parse(run.workerLeaseUntil) : 0;
     const recentHeartbeat = heartbeat > 0 && Date.now() - heartbeat <= 2 * 60_000;
     const validLease = lease > Date.now();
     if (runActive && (recentHeartbeat || validLease)) return "running";
-    const ageMs = Date.now() - Date.parse(updatedAt);
     if (ageMs > STALE_THRESHOLD_MS) return "stale";
     return "detached";
   }

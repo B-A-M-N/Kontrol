@@ -62,6 +62,8 @@ export interface ReviewCheckpointManager {
     root: string;
     baselineCommit: string;
   }): Promise<ReviewChangesResult>;
+  /** Cheap exact-tree binding check for verifiers; does not build a diff. */
+  assertTreeMatchesCommit(input: { workspaceId: string; root: string; baselineCommit: string }): Promise<boolean>;
   /**
    * Commit the review checkpoint to an exact previously-captured snapshot.
    * Advances baselineRef to `snapshotCommit` WITHOUT recomputing the working
@@ -199,6 +201,14 @@ export function createReviewCheckpointManager(): ReviewCheckpointManager {
       };
     },
 
+    async assertTreeMatchesCommit({ workspaceId, root, baselineCommit }) {
+      const state = await ensureInitialized(workspaceId, root);
+      if (!state?.gitRoot) throw new Error(state?.diagnostic ?? "show_changes requires a Git workspace in this version.");
+      const expectedTree = (await git(state.gitRoot, ["rev-parse", "--verify", `${baselineCommit}^{tree}`])).stdout.trim();
+      const currentTree = await createWorkingTreeTree(state.gitRoot, state.workspaceRelativePath ?? ".");
+      return currentTree === expectedTree;
+    },
+
     async commitReviewed({ workspaceId, root, snapshotCommit, workSessionId }) {
       const state = await ensureInitialized(workspaceId, root);
       if (!state?.gitRoot) {
@@ -262,6 +272,20 @@ async function ensureRef(gitRoot: string, ref: string, fallbackRef: string): Pro
 }
 
 async function createWorkingTreeSnapshot(gitRoot: string, workspaceRelativePath = "."): Promise<string> {
+  const tree = await createWorkingTreeTree(gitRoot, workspaceRelativePath);
+  const parent = (await git(gitRoot, ["rev-parse", "--verify", "HEAD^{commit}"])).stdout.trim();
+  const tempDir = await mkdtemp(join(tmpdir(), "kontrol-review-index-"));
+  const indexPath = join(tempDir, "index");
+  const env = checkpointEnv(indexPath);
+
+  try {
+    return (await git(gitRoot, ["commit-tree", tree, "-p", parent, "-m", "Kontrol review snapshot"], { env })).stdout.trim();
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+}
+
+async function createWorkingTreeTree(gitRoot: string, workspaceRelativePath = "."): Promise<string> {
   const tempDir = await mkdtemp(join(tmpdir(), "kontrol-review-index-"));
   const indexPath = join(tempDir, "index");
   const env = checkpointEnv(indexPath);
@@ -269,9 +293,7 @@ async function createWorkingTreeSnapshot(gitRoot: string, workspaceRelativePath 
   try {
     await git(gitRoot, ["read-tree", "HEAD"], { env });
     await git(gitRoot, ["add", "-A", "--", workspaceRelativePath], { env });
-    const tree = (await git(gitRoot, ["write-tree"], { env })).stdout.trim();
-    const parent = (await git(gitRoot, ["rev-parse", "--verify", "HEAD^{commit}"])).stdout.trim();
-    return (await git(gitRoot, ["commit-tree", tree, "-p", parent, "-m", "Kontrol review snapshot"], { env })).stdout.trim();
+    return (await git(gitRoot, ["write-tree"], { env })).stdout.trim();
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { createRequire } from "node:module";
 import { spawnSync } from "node:child_process";
-import { existsSync, statSync, statfsSync } from "node:fs";
+import { existsSync, rmSync, statSync, statfsSync, writeFileSync } from "node:fs";
 import { stdin as input, stdout as output } from "node:process";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -95,7 +95,22 @@ async function ensureConfigured(): Promise<void> {
   // it has no owner credential to persist, so requiring ~/.kontrol files here
   // incorrectly opens the interactive setup wizard before the server can bind.
   if (process.env.KONTROL_AUTH_MODE === "tunnel" && process.env.KONTROL_ALLOWED_ROOTS?.trim()) return;
-  if (process.env.KONTROL_OAUTH_OWNER_TOKEN) return;
+  // P0 #3: environment-only startup requires BOTH a credential and an
+  // EXPLICIT allowed-roots configuration. An owner token alone must not
+  // silently expose whatever directory the process happened to start in —
+  // parseAllowedRoots() would otherwise fall back to process.cwd().
+  if (process.env.KONTROL_OAUTH_OWNER_TOKEN && process.env.KONTROL_ALLOWED_ROOTS?.trim()) return;
+  if (process.env.KONTROL_OAUTH_OWNER_TOKEN && !process.env.KONTROL_ALLOWED_ROOTS?.trim()) {
+    throw new Error(
+      [
+        "KONTROL_OAUTH_OWNER_TOKEN is set but KONTROL_ALLOWED_ROOTS is not.",
+        "",
+        "Kontrol fails closed here rather than exposing the current working",
+        "directory as the filesystem boundary. Set KONTROL_ALLOWED_ROOTS to an",
+        "explicit comma-separated list of directories, or run `kontrol init`.",
+      ].join("\n"),
+    );
+  }
 
   if (!input.isTTY || !output.isTTY) {
     throw new Error(
@@ -238,6 +253,14 @@ async function serve(): Promise<void> {
         : "auth: Owner password approval required",
     );
     console.log(`logging: ${config.logging.level} ${config.logging.format}`);
+    // P0 #2: make the trust posture explicit at startup so a permissive
+    // default is never silently inherited.
+    const policyPosture = config.policy.defaultMode === "ask"
+      ? "ask (everything not explicitly allowed requires approval)"
+      : config.policy.defaultMode === "deny"
+        ? "deny (everything not explicitly allowed is blocked)"
+        : "allow (read-only frictionless; gate shell via KONTROL_POLICY_TOOL_BASH=ask)";
+    console.log(`policy: ${policyPosture}`);
     console.log(`build identity: id=${buildMeta.buildId ?? "dev"} commit=${String(buildMeta.gitSha ?? "unknown").slice(0, 12)} dirty=${String(buildMeta.gitDirty ?? "unknown")}`);
   });
   httpServer.once("error", (error) => {
@@ -305,6 +328,58 @@ async function runDoctor(): Promise<void> {
     const localHost = config.host === "0.0.0.0" || config.host === "::" ? "127.0.0.1" : config.host;
     doctorResult("Auth mode", "PASS", `${config.authMode}; listen=${config.host}:${config.port}; tunnelExpected=${config.authMode === "tunnel"}`);
     doctorResult("Allowed roots", "PASS", config.allowedRoots.join(", "));
+    // P1 #30: verify each configured root actually exists and is a directory.
+    const missingRoots = config.allowedRoots.filter((root) => !existsSync(root));
+    doctorResult("Root paths exist", missingRoots.length === 0 ? "PASS" : "FAIL", missingRoots.length === 0 ? "all configured roots present" : `missing: ${missingRoots.join(", ")}`);
+    // P1 #30: worktree root must be writable for managed worktrees.
+    try {
+      const worktreeProbe = resolve(config.worktreeRoot, `.kontrol-write-probe-${process.pid}`);
+      writeFileSync(worktreeProbe, "");
+      rmSync(worktreeProbe, { force: true });
+      doctorResult("Worktree root writable", "PASS", config.worktreeRoot);
+    } catch (error) {
+      doctorResult("Worktree root writable", "FAIL", `${config.worktreeRoot} (${error instanceof Error ? error.message : String(error)})`);
+    }
+    // P1 #30: policy posture surfaced without printing rules content.
+    const bashPolicyMode = config.policy.toolRules.bash ?? config.policy.defaultMode;
+    doctorResult(
+      "Policy mode",
+      config.policy.defaultMode === "allow" ? "WARN" : "PASS",
+      config.policy.defaultMode === "allow"
+        ? "allow (permissive default; consider KONTROL_POLICY_TOOL_BASH=ask)"
+        : config.policy.defaultMode,
+    );
+    if (config.policy.pathRules.length > 0) {
+      doctorResult(
+        "Shell/path policy",
+        bashPolicyMode === "allow" ? "WARN" : "PASS",
+        bashPolicyMode === "allow"
+          ? "configured path rules cover structured file tools only; shell is allowed (set KONTROL_POLICY_TOOL_BASH=ask or deny, or use an external sandbox)"
+          : `structured path rules plus separately gated shell (${bashPolicyMode})`,
+      );
+    }
+    // P1 #30: ACP secret-role completeness — presence only, never values.
+    if (config.acpEnabled) {
+      const secretRoles = [
+        ["agent", config.acpAgentSecret],
+        ["reviewer", config.acpReviewerSecret],
+        ["adapter", config.acpAdapterSecret],
+      ] as const;
+      const missingSecrets = secretRoles.filter(([, value]) => !value).map(([role]) => role);
+      const legacyOnly = !config.acpSharedSecret ? false : secretRoles.every(([, value]) => !value);
+      doctorResult(
+        "ACP secrets",
+        missingSecrets.length === 0 && !legacyOnly ? "PASS" : legacyOnly ? "WARN" : "WARN",
+        missingSecrets.length === 0
+          ? legacyOnly ? "legacy shared secret only; split into agent/reviewer/adapter roles" : "all role secrets present"
+          : `missing: ${missingSecrets.join(", ")}${config.acpSharedSecret ? "; legacy shared secret also set (broad operator authority)" : ""}`,
+      );
+      // P1 #30: Bubblewrap is required only when sandboxed verification is on.
+      if (process.env.KONTROL_VERIFY_SANDBOX === "true") {
+        const bwrap = process.env.KONTROL_BWRAP ?? "/usr/bin/bwrap";
+        doctorResult("Bubblewrap sandbox", existsSync(bwrap) ? "PASS" : "FAIL", bwrap);
+      }
+    }
     doctorResult("Allowed hosts", config.allowedHosts.includes("*") ? "WARN" : "PASS", config.allowedHosts.join(", "));
     doctorResult("Tunnel bind", config.authMode === "tunnel" && !isLoopbackHostForDoctor(config.host) ? "FAIL" : "PASS", config.host);
 

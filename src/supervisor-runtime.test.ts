@@ -7,10 +7,15 @@ import { createDispatchOutbox } from "./dispatch-outbox.js";
 import { createEventStore } from "./event-log.js";
 import { parseVerificationCommand } from "./mission-verifier.js";
 import { createSupervisorRuns } from "./supervisor-runs.js";
-import { createSupervisorRuntime } from "./supervisor-runtime.js";
+import { createSupervisorRuntime, deterministicFailureFingerprint } from "./supervisor-runtime.js";
 
 const root = mkdtempSync(join(tmpdir(), "kontrol-supervisor-runtime-test-"));
 try {
+  assert.equal(
+    deterministicFailureFingerprint({ decision: "correction_pending", reasons: ["  b  ", "a\nvalue", "b"] }),
+    deterministicFailureFingerprint({ decision: "correction_pending", reasons: ["a value", "b"] }),
+    "failure fingerprints normalize ordering, duplicate reasons, and whitespace",
+  );
   const db = openDatabase(root);
   const createdAt = new Date().toISOString();
   db.sqlite.prepare("insert into workspace_sessions (id, root, status, mode, managed, created_at, last_used_at) values (?, ?, ?, ?, ?, ?, ?)")
@@ -104,6 +109,66 @@ try {
   approvalRuntime.stop();
   assert.equal(approvals, 1);
   assert.equal(runs.getByWorkSession("work_approval")?.status, "completed");
+
+  // A hung verifier must consume only its work-session slot. Unrelated
+  // sessions should use the remaining pool capacity and continue draining.
+  const poolSessions = ["pool_a", "pool_b", "pool_c"];
+  for (const workSessionId of poolSessions) {
+    const missionId = `mission_${workSessionId}`;
+    db.sqlite.prepare("insert into work_sessions (id, workspace_session_id, status, completion_policy, review_epoch, submitted_by, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?)")
+      .run(workSessionId, "ws_supervisor", "in_progress", "webui_approval_required", 0, "test", createdAt, createdAt);
+    db.sqlite.prepare("insert into mission_contracts (id, work_session_id, workspace_session_id, objective, desired_outcome, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?)")
+      .run(missionId, workSessionId, "ws_supervisor", "test", "test", createdAt, createdAt);
+    const poolRun = runs.create({ missionId, workSessionId, workspaceSessionId: "ws_supervisor", autonomyMode: "verify_only" });
+    assert.ok(runs.transition({ id: poolRun.id, expectedStatus: "created", expectedRevision: poolRun.revision, nextStatus: "worker_active" }));
+  }
+  const previousMaxInflight = process.env.KONTROL_SUPERVISOR_MAX_INFLIGHT;
+  process.env.KONTROL_SUPERVISOR_MAX_INFLIGHT = "2";
+  let releaseA!: () => void;
+  let releaseB!: () => void;
+  let releaseC!: () => void;
+  const gates = {
+    pool_a: new Promise<void>((resolve) => { releaseA = resolve; }),
+    pool_b: new Promise<void>((resolve) => { releaseB = resolve; }),
+    pool_c: new Promise<void>((resolve) => { releaseC = resolve; }),
+  };
+  const activePool = new Set<string>();
+  let maxObserved = 0;
+  const poolRuntime = createSupervisorRuntime({
+    outbox, events, runs,
+    onVerify: async (workSessionId) => {
+      activePool.add(workSessionId);
+      maxObserved = Math.max(maxObserved, activePool.size);
+      await gates[workSessionId as keyof typeof gates];
+      activePool.delete(workSessionId);
+    },
+    onEvaluate: async () => ({ decision: "awaiting_human", reasons: [] }),
+    onCorrect: async () => {}, onApprove: async () => {},
+    currentSubmission: (workSessionId) => poolSessions.includes(workSessionId) ? ({ id: `sub_${workSessionId}`, snapshotCommit: `snap_${workSessionId}` }) : undefined,
+    currentSessionStatus: () => "in_progress",
+    currentApproval: () => ({ allowed: false, reasons: [] }),
+  });
+  poolRuntime.start();
+  poolRuntime.wake("pool_a");
+  poolRuntime.wake("pool_b");
+  poolRuntime.wake("pool_c");
+  const waitFor = async (predicate: () => boolean) => {
+    for (let attempt = 0; attempt < 100 && !predicate(); attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(predicate(), true, "supervisor pool did not reach the expected state");
+  };
+  await waitFor(() => activePool.size === 2);
+  assert.equal(activePool.has("pool_c"), false, "pool saturation should queue the third session");
+  releaseB();
+  await waitFor(() => activePool.has("pool_c"));
+  assert.equal(activePool.has("pool_a"), true, "a hung verifier must not be cancelled by unrelated work");
+  releaseA();
+  releaseC();
+  await waitFor(() => activePool.size === 0);
+  poolRuntime.stop();
+  if (previousMaxInflight === undefined) delete process.env.KONTROL_SUPERVISOR_MAX_INFLIGHT;
+  else process.env.KONTROL_SUPERVISOR_MAX_INFLIGHT = previousMaxInflight;
+  assert.equal(maxObserved, 2, "supervisor pool should honor its configured bound");
+  assert.deepEqual(poolSessions.map((id) => runs.getByWorkSession(id)?.status), ["awaiting_human", "awaiting_human", "awaiting_human"]);
 
   db.sqlite.prepare("insert into work_sessions (id, workspace_session_id, status, completion_policy, review_epoch, submitted_by, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?)")
     .run("work_blocked", "ws_supervisor", "in_progress", "webui_approval_required", 0, "test", createdAt, createdAt);

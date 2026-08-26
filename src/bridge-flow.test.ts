@@ -141,6 +141,7 @@ const reviewWorkflow = createReviewWorkflowService({
 const policyEngine = createPolicyEngine({ defaultMode: "allow", toolRules: {}, pathRules: [] });
 
 const config: BridgeConfig = {
+  db,
   workspaces,
   workSessions,
   reviewCheckpoints,
@@ -149,11 +150,12 @@ const config: BridgeConfig = {
   continuationManager,
   dispatchOutbox,
   reviewWorkflow,
+  approvalRequests,
   missionLedger,
   supervisorRuns,
   onSupervisorResume: () => { supervisorWakeCalls += 1; },
   knownAgents: [],
-  sharedSecret: "test-secret",
+  adapterSecret: "test-secret",
   liveWaiters: liveWaiters as any,
   principalRole: "client",
   resumeAgent: async () => {
@@ -196,6 +198,7 @@ try {
       workspaces,
       workSessions,
       agentRegistry,
+      "shared-secret",
       "shared-secret",
       eventStore,
       continuationManager,
@@ -524,6 +527,7 @@ try {
     assert.ok(busy.isError, "second modifying dispatch in same checkout is rejected");
     assert.match(String(busy.content[0]?.text ?? ""), /already controlled/i, "busy checkout message names the conflict");
     await callReviewer("cancel_work_session", { sessionId: r.structuredContent.workSessionId });
+    reviewWorkflow.finalizeCancellation({ sessionId: r.structuredContent.workSessionId, reason: "test adapter stopped" });
 
     const legacySessionId = workSessions.create({
       workspaceSessionId: WS,
@@ -535,11 +539,13 @@ try {
     assert.equal(legacy.structuredContent.workSessionId, legacySessionId);
     assert.equal(receivedRuns.at(-1)?.workspace_root, "/tmp", "legacy alias dispatch still supplies workspace_root");
     await callReviewer("cancel_work_session", { sessionId: legacySessionId });
+    reviewWorkflow.finalizeCancellation({ sessionId: legacySessionId, reason: "test adapter stopped" });
 
     const publicAlias = await callReviewer("submit_to_coding_agent", { task: "public workspace alias", workspaceId: WS });
     assert.ok(!publicAlias.isError, "public workspaceId alias dispatches");
     assert.equal(publicAlias.structuredContent.workspaceSessionId, WS);
     await callReviewer("cancel_work_session", { sessionId: publicAlias.structuredContent.workSessionId });
+    reviewWorkflow.finalizeCancellation({ sessionId: publicAlias.structuredContent.workSessionId, reason: "test adapter stopped" });
 
     const mimo = await callReviewer("submit_to_coding_agent", {
       task: "do a MIMO thing",
@@ -550,6 +556,7 @@ try {
     assert.equal(agentRegistry.getRun(mimo.structuredContent.runId)!.agentName, "mimo-code");
     assert.equal(receivedRuns.at(-1)?.agent_name, "mimo-code", "initial dispatch uses selected agent name");
     await callReviewer("cancel_work_session", { sessionId: mimo.structuredContent.workSessionId });
+    reviewWorkflow.finalizeCancellation({ sessionId: mimo.structuredContent.workSessionId, reason: "test adapter stopped" });
 
     const unsafeUrl = await callReviewer("call_acp_agent", {
       agentName: "cli-coding-agent",
@@ -567,6 +574,7 @@ try {
     assert.ok(!generic.isError, "call_acp_agent routes through registered agent with workspace");
     assert.equal(receivedRuns.at(-1)?.workspace_root, "/tmp", "call_acp_agent supplies workspace_root");
     await callReviewer("cancel_work_session", { sessionId: generic.structuredContent.workSessionId });
+    reviewWorkflow.finalizeCancellation({ sessionId: generic.structuredContent.workSessionId, reason: "test adapter stopped" });
   }
 
   // ── Scenario 4b: gated sessions enforce action guard + exact artifact approval ──
@@ -580,6 +588,27 @@ try {
     const submitted = await callWorker("submit_for_review", { sessionId });
     assert.ok(!submitted.isError, "gated submit succeeds");
     assert.equal(workSessions.get(sessionId)!.status, "awaiting_review");
+    const pendingApproval = approvalRequests.create({
+      kind: "agent_permission",
+      workspaceSessionId: WS,
+      workSessionId: sessionId,
+      title: "Allow the reviewed agent action",
+      description: "The worker needs permission to continue.",
+      options: [{ id: "allow", label: "Allow", effect: "approve", scope: "work_session" }],
+    });
+    const snapshot = await callReviewer("get_work_session_snapshot", { sessionId });
+    assert.ok(!snapshot.isError, "work-session snapshot rehydrates");
+    assert.equal(snapshot.structuredContent.latestSubmission.submissionId, submitted.structuredContent.submissionId);
+    assert.equal(snapshot.structuredContent.latestSubmission.diffSha256, submitted.structuredContent.diffSha256);
+    assert.equal(snapshot.structuredContent.latestSubmission.reviewEpoch, submitted.structuredContent.reviewEpoch);
+    assert.equal(snapshot.structuredContent.pendingApprovals.length, 1, "snapshot includes pending approval for this work session");
+    assert.equal(snapshot.structuredContent.pendingApprovals[0].approvalId, pendingApproval.approvalId);
+    assert.equal(snapshot.structuredContent.pendingApprovals[0].title, pendingApproval.title);
+    assert.equal(snapshot.structuredContent.pendingApprovals[0].options[0].id, "allow");
+    const surface = await callReviewer("get_workspace_session_surface", { workspaceId: WS });
+    assert.ok(!surface.isError, "workspace session surface reads through the shared snapshot path");
+    assert.ok(surface.structuredContent.sessions.some((entry: { sessionId: string }) => entry.sessionId === sessionId));
+    approvalRequests.resolve(pendingApproval.approvalId, { status: "approved", reviewerId: "snapshot-test" });
     const missingSubmission = await callReviewer("get_review_submission", {
       sessionId,
       submissionId: "wssub_does_not_exist",
@@ -675,6 +704,26 @@ try {
     });
     assert.ok(!resolved.isError, "generic approval resolves through shared approval tool");
     assert.equal(approvalRequests.get(request.approvalId)?.status, "approved");
+
+    const changesRequest = approvalRequests.create({
+      kind: "agent_permission",
+      workspaceSessionId: WS,
+      workSessionId: "wsess-generic-approval",
+      title: "Request a safer alternative",
+      options: [{ id: "request_changes", label: "Request changes", effect: "changes_requested" }],
+    });
+    const invalidDecision = await callReviewer("provide_policy_approval", {
+      approvalId: changesRequest.approvalId,
+      decision: "approve",
+    });
+    assert.ok(invalidDecision.isError, "generic approval rejects an option ID it did not offer");
+    assert.equal(approvalRequests.get(changesRequest.approvalId)?.status, "pending", "invalid generic decision leaves the request pending");
+    const changes = await callReviewer("provide_policy_approval", {
+      approvalId: changesRequest.approvalId,
+      decision: "request_changes",
+    });
+    assert.ok(!changes.isError, "changes_requested generic approval resolves through shared approval tool");
+    assert.equal(approvalRequests.get(changesRequest.approvalId)?.status, "denied", "changes_requested uses a denied gate outcome while preserving its effect");
   }
 
   // ── Scenario 7: continuation affinity stays with the original MIMO agent ──

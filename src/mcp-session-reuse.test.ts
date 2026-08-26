@@ -115,6 +115,11 @@ try {
   }, reusable.sessionId, "review-a");
   assert.equal(secondCall.response.status, 200);
 
+  const firstToolList = await rpc("tools/list", {}, reusable.sessionId, "review-a");
+  assert.equal(firstToolList.response.status, 200);
+  assert.ok(Array.isArray(firstToolList.payload?.result?.tools));
+  assert.ok(firstToolList.payload.result.tools.length > 0);
+
   const before = await diagnostics();
   const beforeReuse = before.mcpSessionMetrics.reuse;
   const labels = before.mcpSessionMetrics.sessions.map((session: any) => session.sessionLabel);
@@ -133,6 +138,8 @@ try {
   assert.equal(new Set(ephemeral.map(({ sessionId }) => sessionId)).size, 20);
   const twentyFirst = await openSession("review-cap-21");
   assert.ok(twentyFirst.sessionId);
+  const secondToolList = await rpc("tools/list", {}, twentyFirst.sessionId, "review-cap-21");
+  assert.equal(secondToolList.response.status, 200);
   const capSnapshot = await diagnostics();
   const capReuse = capSnapshot.mcpSessionMetrics.reuse;
   const capSingleToolSessions = capReuse.perClient.reduce((sum: number, client: any) => sum + client.currentSingleToolSessions, 0);
@@ -140,6 +147,11 @@ try {
   assert.ok(capSingleToolSessions + capReuse.singleToolSessions >= 20);
   assert.ok(capReuse.sessionsExpired >= 1, "cap admission did not reclaim an idle ephemeral session");
   assert.ok(capSnapshot.totalMcpSessions <= 20, "per-client cap was exceeded instead of reclaiming an idle session");
+  assert.ok(capSnapshot.mcpSessionMetrics.toolListDescriptorCache.hits >= 1, "static tools/list descriptor cache was not reused");
+  const timing = capSnapshot.mcpSessionMetrics.timing;
+  assert.ok(timing.initialization.totalMs.p95 < 1_000, `MCP initialization regression exceeded 1s p95: ${JSON.stringify(timing.initialization)}`);
+  assert.ok(timing.phaseTimings["mcp.tool_registration"], "tool-registration timing is exposed");
+  assert.ok(timing.phaseTimings["mcp.response"], "response timing is exposed");
 
   await new Promise((resolve) => setTimeout(resolve, 5300));
   const after = await diagnostics();

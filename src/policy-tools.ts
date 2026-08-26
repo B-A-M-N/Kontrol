@@ -77,7 +77,9 @@ function genericApprovalToCard(a: ApprovalRequest) {
 function listAllApprovals(config: PolicyToolConfig, workspaceId?: string) {
   return [
     ...config.policyEngine.getPendingApprovals(workspaceId).map(policyApprovalToCard),
-    ...(config.approvalRequests?.listPending(workspaceId).map(genericApprovalToCard) ?? []),
+    ...(config.approvalRequests?.listPending(workspaceId)
+      .filter((request) => request.kind !== "tool")
+      .map(genericApprovalToCard) ?? []),
   ];
 }
 
@@ -220,7 +222,30 @@ export function registerPolicyTools(
         const generic = config.approvalRequests?.get(approvalId);
         if (generic?.status === "pending") {
           const option = generic.options.find((candidate) => candidate.id === decision);
-          const approve = option?.effect === "approve" || decision === "approve" || decision === "approve_session";
+          if (!option) {
+            return {
+              content: [{ type: "text" as const, text: `Decision "${decision}" is not one of the options for approval ${approvalId}.` }],
+              isError: true,
+            };
+          }
+          if (option && option.effect === "changes_requested") {
+            const resolved = config.approvalRequests?.resolve(approvalId, {
+              status: "denied",
+              optionId: decision,
+              effect: option.effect,
+              reason: reason ?? "Changes requested",
+            });
+            config.eventStore.appendEvent({
+              type: "approval.resolved",
+              sessionId: generic.workSessionId ?? generic.workspaceSessionId,
+              payload: { approvalId, kind: generic.kind, decision: "changes_requested", optionId: decision, effect: option.effect, status: resolved?.status ?? "denied", reason },
+            });
+            return {
+              content: [{ type: "text" as const, text: `Decision recorded: ${decision} for approval ${approvalId}.` }],
+              structuredContent: { status: "recorded", approvalId },
+            };
+          }
+          const approve = option.effect === "approve";
           const resolved = config.approvalRequests?.resolve(approvalId, {
             status: approve ? "approved" : "denied",
             optionId: decision,
@@ -257,6 +282,11 @@ export function registerPolicyTools(
       }
 
       // Resolve the blocked tool call's waiter via event
+      config.policyEngine.resolvePending(
+        approvalId,
+        decision === "deny" ? "denied" : "approved",
+        reason,
+      );
       config.eventStore.appendEvent({
         type: "policy.approval.provided",
         sessionId: match.workSessionId ?? match.workspaceId,

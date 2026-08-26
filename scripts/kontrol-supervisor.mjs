@@ -111,9 +111,8 @@ async function probe(url) {
   }
 }
 
-async function allHealthy(component, urls) {
-  const results = [];
-  for (const url of urls) results.push({ url, ...(await probe(url)) });
+export async function allHealthy(component, urls, probeFn = probe) {
+  const results = await Promise.all(urls.map(async (url) => ({ url, ...(await probeFn(url)) })));
   return { ok: results.every((result) => result.ok), results };
 }
 
@@ -161,7 +160,15 @@ function buildComponents({ kontrolUrl, tunnelUrl, agents, crushPort, hermesPort,
       command: `set -a; source .env; set +a; exec env HERMES_ACP_ADAPTER_PORT=${Number(hermesPort)} node scripts/acp-hermes-native-adapter.mjs`,
     };
   }
-  void agents;
+  for (const agent of agents) {
+    const name = `agent:${agent.name}`;
+    components[name] = {
+      tracker: new FailureTracker(name),
+      urls: [`${String(agent.url).replace(/\/$/, "")}/health`],
+      session: undefined,
+      command: undefined,
+    };
+  }
   return components;
 }
 
@@ -208,7 +215,14 @@ async function main() {
     try {
       if (name === "operational") {
         const failedAdapter = ["crush", "hermes"].find((dependency) => components[dependency]?.tracker.consecutiveFailures > 0);
-        await restart(failedAdapter ?? "kontrol", failedAdapter ? `operational readiness traced to ${failedAdapter}` : reason);
+        if (failedAdapter) {
+          await restart(failedAdapter, `operational readiness traced to ${failedAdapter}`);
+        } else if (components.kontrol.tracker.consecutiveFailures > 0) {
+          await restart("kontrol", reason);
+        }
+        // If every dependency is healthy, an aggregate readiness failure is
+        // not evidence that the core process should be restarted. Preserve the
+        // degraded status for diagnosis instead of creating a restart storm.
         return;
       }
       await restart(name, reason);
@@ -228,29 +242,48 @@ async function main() {
   async function tick() {
     const results = {};
     let healthy = true;
-    for (const [name, component] of Object.entries(components)) {
+    const probeComponent = async ([name, component]) => {
       const result = await allHealthy(name, component.urls);
       component.tracker.record(result);
       results[name] = result;
       if (!result.ok) healthy = false;
-      if (!result.ok && component.tracker.consecutiveFailures >= FAILURE_THRESHOLD) {
+    };
+
+    // Probe worker/tunnel/core dependencies first and in parallel. Aggregate
+    // /readyz is evaluated only after those concrete failure identities are
+    // recorded, so it cannot cause a core restart merely because a worker is
+    // down or because aggregate readiness is lagging one supervisor tick.
+    const dependencyEntries = Object.entries(components).filter(([name]) => name !== "operational");
+    await Promise.all(dependencyEntries.map(probeComponent));
+    if (components.operational) await probeComponent(["operational", components.operational]);
+
+    // Probe results are complete before any recovery starts. This preserves
+    // the exact dependency identity for /readyz failures and prevents one
+    // parallel probe from clearing a sibling's failure state mid-recovery.
+    const recoveryOrder = [
+      ...Object.keys(components).filter((name) => name !== "operational"),
+      ...(components.operational ? ["operational"] : []),
+    ];
+    for (const name of recoveryOrder) {
+      const component = components[name];
+      const result = results[name];
+      if (!component || !result || result.ok || component.tracker.consecutiveFailures < FAILURE_THRESHOLD) continue;
+      try {
+        await recover(name, `${FAILURE_THRESHOLD} consecutive failed probes`);
+        component.tracker.consecutiveFailures = 0;
+      } catch (error) {
+        component.tracker.noteRestartFailure();
+        component.tracker.lastExternalProbeResult = {
+          ...result,
+          recoveryError: error instanceof Error ? error.message : String(error),
+        };
+      }
+      if (component.tracker.restartFailures >= ESCALATION_RESTART_THRESHOLD && name !== "kontrol" && name !== "operational") {
         try {
-          await recover(name, `${FAILURE_THRESHOLD} consecutive failed probes`);
-          component.tracker.consecutiveFailures = 0;
+          await recover("kontrol", `${name} restart threshold exceeded`);
         } catch (error) {
-          component.tracker.noteRestartFailure();
-          component.tracker.lastExternalProbeResult = {
-            ...result,
-            recoveryError: error instanceof Error ? error.message : String(error),
-          };
-        }
-        if (component.tracker.restartFailures >= ESCALATION_RESTART_THRESHOLD && name !== "kontrol" && name !== "operational") {
-          try {
-            await recover("kontrol", `${name} restart threshold exceeded`);
-          } catch (error) {
-            components.kontrol.tracker.noteRestartFailure();
-            components.kontrol.tracker.lastExternalProbeResult = { ok: false, recoveryError: error instanceof Error ? error.message : String(error) };
-          }
+          components.kontrol.tracker.noteRestartFailure();
+          components.kontrol.tracker.lastExternalProbeResult = { ok: false, recoveryError: error instanceof Error ? error.message : String(error) };
         }
       }
     }
@@ -265,7 +298,7 @@ async function main() {
     await tick();
     if (!stopping) await new Promise((resolvePromise) => setTimeout(resolvePromise, intervalMs));
   }
-  writeStatus(status("stopped"));
+  writeStatus(statusFile, status("stopped"));
 }
 
 const isMain = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));

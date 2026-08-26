@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, asc, eq, inArray, lt, lte, or } from "drizzle-orm";
+import { and, asc, eq, inArray, lt, lte, notInArray, or } from "drizzle-orm";
 import { openDatabase, type DatabaseHandle } from "./db/client.js";
 import { dispatchOutbox, type DispatchOutboxRow } from "./db/schema.js";
 
@@ -34,7 +34,7 @@ export interface DispatchOutbox {
   }): DispatchOutboxEvent;
 
   /** Atomically claim the next available event for this worker. CAS on status. */
-  claimNext(workerId: string, leaseMs: number, eventTypes?: string[]): DispatchOutboxEvent | null;
+  claimNext(workerId: string, leaseMs: number, eventTypes?: string[], excludeAggregateIds?: string[]): DispatchOutboxEvent | null;
 
   /** Reap expired claims back to pending. Returns count requeued. */
   reapExpiredClaims(leaseMs: number): number;
@@ -107,14 +107,19 @@ export function createDispatchOutbox(
     };
   }
 
-  function claimNext(workerId: string, leaseMs: number, eventTypes?: string[]): DispatchOutboxEvent | null {
+  function claimNext(workerId: string, leaseMs: number, eventTypes?: string[], excludeAggregateIds?: string[]): DispatchOutboxEvent | null {
     const now = new Date().toISOString();
     const claimExpiresAt = new Date(Date.now() + leaseMs).toISOString();
 
     const candidate = database.db
       .select()
       .from(dispatchOutbox)
-      .where(and(eq(dispatchOutbox.status, "pending"), lte(dispatchOutbox.availableAt, now), ...(eventTypes?.length ? [inArray(dispatchOutbox.eventType, eventTypes)] : [])))
+      .where(and(
+        eq(dispatchOutbox.status, "pending"),
+        lte(dispatchOutbox.availableAt, now),
+        ...(eventTypes?.length ? [inArray(dispatchOutbox.eventType, eventTypes)] : []),
+        ...(excludeAggregateIds?.length ? [notInArray(dispatchOutbox.aggregateId, excludeAggregateIds)] : []),
+      ))
       .orderBy(asc(dispatchOutbox.availableAt))
       .limit(1)
       .get();

@@ -26,8 +26,7 @@ import {
   type ToolResultCard,
 } from "./card-types.js";
 import { getPatchDisplayParts } from "./patch-display.js";
-import type { ReviewSubmissionDTO } from "../review-submission.js";
-import "./workspace-app.css";
+import type { ReviewFile } from "../review-submission.js";
 
 interface ToolDisplay {
   icon: string;
@@ -56,16 +55,35 @@ interface AgentActivityEvent {
   id: string;
   type: string;
   sessionId: string;
+  workspaceSessionId?: string;
   payload: Record<string, unknown>;
   createdAt: string;
 }
 
-type ReviewSubmissionView = ReviewSubmissionDTO;
+type ReviewSubmissionView = {
+  submissionId: string;
+  sessionId: string;
+  submissionNumber: number;
+  reviewEpoch?: number;
+  status: string;
+  diffSha256?: string;
+  patch: string;
+  files: ReviewFile[];
+  fileCount: number;
+  additions: number;
+  removals: number;
+  message?: string;
+  createdAt?: string;
+};
 
 interface PolicyApprovalView {
   approvalId: string;
   workspaceId?: string;
   workSessionId?: string;
+  kind?: string;
+  title?: string;
+  description?: string;
+  risk?: string;
   tool: string;
   path?: string;
   command?: string;
@@ -84,13 +102,16 @@ interface PolicyApprovalView {
 interface AgentMessageView {
   messageId: string;
   kind: string;
+  author?: string;
   title?: string;
   body?: string;
   status: string;
+  runId?: string;
+  createdAt?: string;
 }
 
 interface MissionPacketView {
-  supervisor?: { id: string; status: string; resumeStatus?: string | null; revision: number; cycleNumber: number; maxCycles: number; autonomyMode: string; approvalMode: string; repeatedFailureCount?: number; deadlineAt?: string; lastError?: string };
+  supervisor?: { id: string; status: string; resumeStatus?: string | null; revision: number; cycleNumber: number; maxCycles: number; autonomyMode: string; approvalMode: string; repeatedFailureCount?: number; repeatedFailureFingerprintLimit?: number; stagnantCycleCount?: number; progressJson?: string | null; stallReason?: string | null; updatedAt?: string; deadlineAt?: string; lastError?: string };
   mission?: { id: string; objective: string; desiredOutcome?: string; correctionRounds?: number; maxCorrectionRounds?: number };
   criteria: Array<{ id: string; description: string; priority: string; status: string; verificationType?: string; verificationCommand?: string; dependsOnCriterionIds?: string[] }>;
   findings: Array<{ id: string; description: string; severity: string; scope: string; status: string; requiredAction?: string }>;
@@ -106,8 +127,16 @@ interface WorkSessionViewState {
   workspaceSessionId: string;
   workSessionId: string;
   runId: string;
+  title?: string;
+  submittedBy?: string;
   status: string;
+  updatedAt?: string;
+  lifecycle?: string;
+  runtimeState?: string;
+  unresolvedMessageCount: number;
+  pendingApprovalCount: number;
   lastSeq: number;
+  lastHeartbeatAt?: string;
   activity: AgentActivityEvent[];
   submissions: Map<string, ReviewSubmissionView>;
   policyApprovals: Map<string, PolicyApprovalView>;
@@ -117,8 +146,44 @@ interface WorkSessionViewState {
   feedbackStateBySubmission: Map<string, FeedbackState>;
   feedbackErrorBySubmission: Map<string, string>;
   feedbackMessage?: string;
+  latestFeedback?: { id: string; submissionId?: string; verdict: string; comments?: string; reviewerId?: string };
+  notice?: {
+    tone: "error" | "warning" | "success" | "info";
+    message: string;
+    action?: { label: string; run: () => void };
+  };
   mission?: MissionPacketView;
   missionLoading?: boolean;
+  missionError?: string;
+}
+
+interface WorkspaceSurfaceSession {
+  sessionId: string;
+  workspaceSessionId: string;
+  status: string;
+  title?: string;
+  submittedBy?: string;
+  runId?: string;
+  lastSeq: number;
+  updatedAt: string;
+  lifecycle: string;
+  runtimeState: string;
+  hasMission: boolean;
+  missionStatus?: string;
+  missionCycleNumber?: number;
+  missionMaxCycles?: number;
+  unresolvedMessageCount: number;
+  pendingApprovalCount: number;
+  latestSubmission?: {
+    submissionId: string;
+    submissionNumber: number;
+    status: string;
+    additions: number;
+    removals: number;
+    diffSha256?: string;
+    reviewEpoch?: number;
+  };
+  latestFeedback?: { id: string; submissionId?: string; verdict: string; comments?: string; reviewerId?: string };
 }
 
 let app: App | null = null;
@@ -129,8 +194,10 @@ let hostContext: HostContext | undefined;
 // Durable UI state.
 let activeWorkspaceId: string | null = null;
 const workSessionViews = new Map<string, WorkSessionViewState>();
+const snapshotHydrations = new Map<string, Promise<void>>();
 let selectedWorkSessionId: string | null = null;
 let lastToolCard: ToolResultCard | null = null;
+let rehydrationQueued = false;
 
 // View-local UI state (replaced the previous globals).
 let expanded = false;
@@ -138,23 +205,74 @@ let reviewFilesExpanded = false;
 let errorMessage: string | null = null;
 let currentPayload: MountedPayload | null = null;
 let currentPayloadContainer: HTMLElement | null = null;
+let currentPayloadCard: ToolResultCard | null = null;
+let currentPayloadKind: "heavy" | "review" | null = null;
+let currentPayloadKey: string | null = null;
+let payloadLoadingKey: string | null = null;
+let payloadLoadGeneration = 0;
+let renderedSurfaceKey: string | null = null;
 let agentBar: HTMLElement | null = null;
 
-// Generation-controlled watcher: incrementing this cancels any in-flight
-// await_work_session_events loop (no 2.5s poll timer — we block on the host
-// tool until the next event or a connection-liveness timeout).
-// Per-session watcher generations so starting a second run cancels only the
-// watcher for the same work session, not all watchers.
-const watcherGenerations = new Map<string, number>();
-let watcherGenerationCounter = 0;
+interface WorkSessionDom {
+  workSessionId: string;
+  main: HTMLElement;
+  sessionSwitcher: HTMLElement;
+  section: HTMLElement;
+  titleStatus: HTMLElement;
+  statusBadge: HTMLElement;
+  meta: HTMLElement;
+  notice: HTMLElement;
+  mission: HTMLElement;
+  messages: HTMLElement;
+  messageKey?: string;
+  activity: HTMLUListElement;
+  activitySeqs: Set<number>;
+  approvals: HTMLElement;
+  review: HTMLElement;
+  reviewTitle: HTMLElement;
+  reviewPayload: HTMLElement;
+  reviewFeedback: HTMLElement;
+  reviewFeedbackKey?: string;
+}
 
-const maybeAppRoot = document.querySelector<HTMLElement>("#app");
-if (!maybeAppRoot) {
+interface LegacyReviewDom {
+  key: string;
+  main: HTMLElement;
+  body: HTMLElement;
+  actions: HTMLElement;
+  feedback: HTMLElement;
+  feedbackKey?: string;
+}
+
+let currentWorkSessionDom: WorkSessionDom | null = null;
+let currentLegacyReviewDom: LegacyReviewDom | null = null;
+
+let renderQueued = false;
+
+function scheduleRender(): void {
+  if (renderQueued) return;
+  renderQueued = true;
+  const flush = () => {
+    renderQueued = false;
+    renderNow();
+  };
+  if (typeof requestAnimationFrame === "function") requestAnimationFrame(flush);
+  else setTimeout(flush, 0);
+}
+
+// One generation-controlled workspace watcher multiplexes all sessions. A
+// parked review therefore does not reserve its own long-poll connection.
+let workspaceWatcherGeneration = 0;
+let workspaceEventCursor = 0;
+
+const uiTestMode = Boolean((globalThis as { __KONTROL_UI_TEST_MODE__?: boolean }).__KONTROL_UI_TEST_MODE__);
+const maybeAppRoot = typeof document === "undefined" ? null : document.querySelector<HTMLElement>("#app");
+if (!maybeAppRoot && !uiTestMode) {
   throw new Error("Missing #app root element.");
 }
-const appRoot = maybeAppRoot;
+const appRoot = maybeAppRoot ?? document.createElement("div");
 
-void boot();
+if (!uiTestMode) void boot();
 
 async function boot(): Promise<void> {
   render();
@@ -185,6 +303,10 @@ async function boot(): Promise<void> {
     // open_workspace carries the currently opened workspace ID.
     if (tool === "open_workspace" && structured.workspaceId) {
       const newWorkspaceId = structured.workspaceId;
+      if (activeWorkspaceId !== newWorkspaceId) {
+        workspaceWatcherGeneration += 1;
+        workspaceEventCursor = 0;
+      }
       activeWorkspaceId = newWorkspaceId;
       // P0 #3: When workspace becomes known, trigger rehydration.
       void rehydrateActiveSessions();
@@ -198,18 +320,24 @@ async function boot(): Promise<void> {
         (structured as { summary?: { sessionId?: string } }).summary?.sessionId;
 
       if (wsId) {
+        const workspaceSessionId = (structured as { workspaceSessionId?: string }).workspaceSessionId;
+        if (workspaceSessionId && activeWorkspaceId !== workspaceSessionId) {
+          activeWorkspaceId = workspaceSessionId;
+          workspaceWatcherGeneration += 1;
+          workspaceEventCursor = 0;
+          void rehydrateActiveSessions();
+        }
         ensureWorkSessionView(
           wsId,
-          (structured as { workspaceSessionId?: string }).workspaceSessionId ?? activeWorkspaceId ?? "",
+          workspaceSessionId ?? activeWorkspaceId ?? "",
           (structured as { runId?: string }).runId ?? "",
         );
-        selectedWorkSessionId = wsId;
+        selectWorkSession(wsId);
         lastToolCard = null;
         expanded = false;
         reviewFilesExpanded = false;
         errorMessage = null;
-        void watchWorkSession(wsId);
-        render();
+        scheduleRender();
         return;
       }
     }
@@ -232,8 +360,10 @@ async function boot(): Promise<void> {
 
   app.onteardown = async () => {
     connected = false;
-    watcherGenerations.clear();
+    workspaceWatcherGeneration += 1;
     unmountPayload();
+    currentLegacyReviewDom = null;
+    currentWorkSessionDom = null;
     agentBar = null;
     app = null;
     return {};
@@ -259,7 +389,7 @@ async function boot(): Promise<void> {
 }
 
 /**
- * On connect/reconnect, ask the server for live workers and pending reviews,
+ * On connect/reconnect, ask the server for one compact workspace projection,
  * then rebuild each view from its durable snapshot and tail cursor. Stale and
  * detached history is not silently presented as current work.
  */
@@ -273,114 +403,240 @@ async function rehydrateActiveSessions(): Promise<void> {
   if (!workspaceId) return;
 
   try {
-    const [liveResult, reviewResult] = await Promise.all([
-      app.callServerTool({
-        name: "list_active_work_sessions",
-        arguments: { workspaceId },
-      }),
-      app.callServerTool({
-        name: "list_pending_reviews",
-        arguments: { workspaceId },
-      }),
-    ]);
-    const liveContent = getStructuredContent<{
-      sessions: Array<{
-        sessionId: string;
-        workspaceSessionId: string;
-        status: string;
-        runId?: string;
-        lastSeq: number;
-        hasMission: boolean;
-      }>;
-    }>(liveResult);
-    const reviewContent = getStructuredContent<{
-      sessions: Array<{
-        sessionId: string;
-        workspaceSessionId: string;
-        status: string;
-        title?: string;
-        submittedBy: string;
-        submissionCount: number;
-        updatedAt: string;
-      }>;
-    }>(reviewResult);
-    const sessions = [
-      ...(liveContent?.sessions ?? []),
-      ...(reviewContent?.sessions ?? []).map((session) => ({
-        ...session,
-        runId: undefined,
-        lastSeq: 0,
-        hasMission: false,
-      })),
-    ];
-    if (!sessions.length) return;
+    const pagedSessions = new Map<string, WorkspaceSurfaceSession>();
+    let surfaceLastSeq = 0;
+    const loadSurface = async (filter: "all" | "pending_review" | "live", pageSize: number, maxPages: number): Promise<void> => {
+      let afterUpdatedAt: string | undefined;
+      let afterSessionId: string | undefined;
+      for (let page = 0; page < maxPages; page += 1) {
+        const surfaceResult = await callServerToolChecked({
+          name: "get_workspace_session_surface",
+          arguments: {
+            workspaceId,
+            filter,
+            limit: pageSize,
+            ...(afterUpdatedAt && afterSessionId ? { afterUpdatedAt, afterSessionId } : {}),
+          },
+        });
+        const surfaceContent = getStructuredContent<{ lastSeq?: number; sessions: WorkspaceSurfaceSession[] }>(surfaceResult);
+        surfaceLastSeq = Math.max(surfaceLastSeq, surfaceContent?.lastSeq ?? 0);
+        const pageSessions = surfaceContent?.sessions ?? [];
+        for (const session of pageSessions) pagedSessions.set(session.sessionId, session);
+        if (pageSessions.length < pageSize) break;
+        const last = pageSessions[pageSessions.length - 1];
+        if (!last || (last.updatedAt === afterUpdatedAt && last.sessionId === afterSessionId)) break;
+        afterUpdatedAt = last.updatedAt;
+        afterSessionId = last.sessionId;
+      }
+    };
+    // Hydrate the live control-plane surface completely, but keep detached
+    // history bounded to the visible recent window. Older history is an
+    // explicit load-more concern, not startup work.
+    // P1 #33: live/pending hydration is capped at a realistic ceiling
+    // (500 sessions each) so a reconnect after long downtime cannot rebuild
+    // tens of thousands of views; the cap is far above any real concurrent
+    // control-plane surface and exposes "older available" via truncation.
+    const HYDRATION_MAX_SESSIONS = 500;
+    await loadSurface("live", 50, HYDRATION_MAX_SESSIONS / 50);
+    await loadSurface("pending_review", 50, HYDRATION_MAX_SESSIONS / 50);
+    await loadSurface("all", 25, 1);
+    const sessions = [...pagedSessions.values()].sort(
+      (a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt),
+    );
+    workspaceEventCursor = Math.max(workspaceEventCursor, surfaceLastSeq);
 
     for (const s of sessions) {
-      // Don't clobber a session already being watched in this connection.
-      if (watcherGenerations.has(s.sessionId)) continue;
-
-      // P0 #1: Fetch the server-side snapshot instead of replaying from seq 0.
-      const snapResult = await app.callServerTool({
-        name: "get_work_session_snapshot",
-        arguments: { sessionId: s.sessionId },
-      });
-      const snap = getStructuredContent<{
-        sessionId: string;
-        workspaceSessionId: string;
-        status: string;
-        runId?: string;
-        lastSeq: number;
-        hasMission: boolean;
-        latestSubmission?: { submissionId: string; submissionNumber: number; status: string; additions: number; removals: number };
-        latestFeedback?: { id: string; verdict: string };
-        missionSummary?: { objective?: string; status?: string; cycleNumber?: number; maxCycles?: number };
-      }>(snapResult);
-
       const view = ensureWorkSessionView(s.sessionId, s.workspaceSessionId, s.runId ?? "");
       view.status = s.status;
-      if (snap) {
-        view.status = snap.status;
-        if (snap.latestSubmission) {
-          view.activeSubmissionId = snap.latestSubmission.submissionId;
-          view.submissions.set(snap.latestSubmission.submissionId, {
-            submissionId: snap.latestSubmission.submissionId,
-            sessionId: s.sessionId,
-            submissionNumber: snap.latestSubmission.submissionNumber,
-            reviewEpoch: 0,
-            status: snap.latestSubmission.status,
-            files: [],
-            patch: "",
-            fileCount: 0,
-            additions: snap.latestSubmission.additions,
-            removals: snap.latestSubmission.removals,
-          });
-          // P0 #7: Fetch the actual review diff for the active submission
-          void fetchReviewDiff(s.sessionId, snap.latestSubmission.submissionId);
-        }
-        if (snap.hasMission && snap.missionSummary) {
-          // P0 #8: Don't fabricate fake mission state. Show loading and fetch real packet.
-          view.missionLoading = true;
-          void refreshMission(view);
-        }
+      view.title = s.title;
+      view.submittedBy = s.submittedBy;
+      view.updatedAt = s.updatedAt;
+      view.lifecycle = s.lifecycle;
+      view.runtimeState = s.runtimeState;
+      view.unresolvedMessageCount = s.unresolvedMessageCount;
+      view.pendingApprovalCount = s.pendingApprovalCount;
+      view.lastSeq = s.lastSeq;
+      view.latestFeedback = s.latestFeedback;
+      if (s.latestSubmission) {
+        view.activeSubmissionId = s.latestSubmission.submissionId;
+        view.submissions.set(s.latestSubmission.submissionId, {
+          submissionId: s.latestSubmission.submissionId,
+          sessionId: s.sessionId,
+          submissionNumber: s.latestSubmission.submissionNumber,
+          reviewEpoch: s.latestSubmission.reviewEpoch,
+          diffSha256: s.latestSubmission.diffSha256,
+          status: s.latestSubmission.status,
+          files: [],
+          patch: "",
+          fileCount: 0,
+          additions: s.latestSubmission.additions,
+          removals: s.latestSubmission.removals,
+        });
       }
-      // P0 #1: Start watcher from the snapshot's lastSeq — no event log replay.
-      void watchWorkSession(s.sessionId, snap?.lastSeq ?? s.lastSeq ?? 0);
     }
     // If nothing is selected yet, surface the most recently updated session.
-    if (!selectedWorkSessionId && sessions[0]) {
+    // If the previous selection disappeared, choose the newest remaining one.
+    if (sessions.length && (!selectedWorkSessionId || !workSessionViews.has(selectedWorkSessionId))) {
       selectedWorkSessionId = sessions[0].sessionId;
     }
-    render();
-  } catch {
-    // Recovery is best-effort: a failure here must not block the WebUI from
-    // connecting. Reactive tool cards still populate sessions as they arrive.
+    const selected = selectedWorkSessionId ? workSessionViews.get(selectedWorkSessionId) : undefined;
+    if (selected) await hydrateWorkSessionSnapshot(selected);
+    workspaceWatcherGeneration += 1;
+    void watchWorkspaceEvents(workspaceId, workspaceEventCursor, workspaceWatcherGeneration);
+    scheduleRender();
+  } catch (error) {
+    const selected = selectedWorkSessionId ? workSessionViews.get(selectedWorkSessionId) : undefined;
+    if (selected) {
+      selected.notice = {
+        tone: "warning",
+        message: `Session recovery is incomplete: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    } else {
+      errorMessage = `Session recovery is incomplete: ${error instanceof Error ? error.message : String(error)}`;
+    }
+    scheduleRender();
+  }
+}
+
+function queueSessionRehydration(): void {
+  if (rehydrationQueued || !activeWorkspaceId || !app) return;
+  rehydrationQueued = true;
+  void rehydrateActiveSessions().finally(() => {
+    rehydrationQueued = false;
+  });
+}
+
+async function hydrateWorkSessionSnapshot(view: WorkSessionViewState): Promise<void> {
+  if (!app) return;
+  const existing = snapshotHydrations.get(view.workSessionId);
+  if (existing) return existing;
+
+  const hydration = (async () => {
+    const hydrationStartSeq = view.lastSeq;
+    view.missionLoading = true;
+    view.missionError = undefined;
+    scheduleRender();
+    const snapResult = await callServerToolChecked({
+      name: "get_work_session_snapshot",
+      arguments: { sessionId: view.workSessionId },
+    });
+    const snap = getStructuredContent<{
+      sessionId: string;
+      workspaceSessionId: string;
+      status: string;
+      runId?: string;
+      lastSeq: number;
+      hasMission: boolean;
+      latestSubmission?: { submissionId: string; submissionNumber: number; status: string; additions: number; removals: number; diffSha256?: string; reviewEpoch?: number };
+      latestFeedback?: { id: string; submissionId?: string; verdict: string; comments?: string; reviewerId?: string };
+      missionSummary?: { objective?: string; status?: string; cycleNumber?: number; maxCycles?: number };
+      pendingApprovals?: Array<{
+        approvalId: string;
+        kind?: string;
+        title?: string;
+        description?: string;
+        risk?: string;
+        tool?: string;
+        path?: string;
+        command?: string;
+        options?: PolicyApprovalView["options"];
+      }>;
+      agentMessages?: Array<{ messageId: string; kind: string; author?: string; title?: string; body?: string; status?: string; runId?: string; createdAt?: string }>;
+    }>(snapResult);
+    if (!snap) return;
+
+    const snapshotIsCurrent = snap.lastSeq >= hydrationStartSeq && snap.lastSeq >= view.lastSeq;
+    if (snapshotIsCurrent) {
+      view.status = snap.status;
+      view.runId = snap.runId ?? view.runId;
+    }
+    // A delayed snapshot must never rewind a cursor advanced by the live
+    // watcher. Mutable snapshot fields are likewise stale when its boundary
+    // is older than an event already reduced into this view.
+    view.lastSeq = Math.max(view.lastSeq, snap.lastSeq);
+    if (!snapshotIsCurrent) return;
+    view.latestFeedback = snap.latestFeedback;
+    if (snap.latestFeedback?.submissionId) {
+      view.feedbackStateBySubmission.set(snap.latestFeedback.submissionId, "submitted");
+    }
+    view.policyApprovals.clear();
+    for (const approval of snap.pendingApprovals ?? []) {
+      view.policyApprovals.set(approval.approvalId, {
+        approvalId: approval.approvalId,
+        kind: approval.kind,
+        title: approval.title,
+        description: approval.description,
+        risk: approval.risk,
+        tool: approval.tool ?? "tool",
+        path: approval.path,
+        command: approval.command,
+        options: approval.options,
+        workSessionId: view.workSessionId,
+      });
+    }
+    view.pendingApprovalCount = view.policyApprovals.size;
+    view.openMessages.clear();
+    for (const message of snap.agentMessages ?? []) {
+      if (message.status && message.status !== "open") continue;
+      if (message.kind !== "clarification_request" && message.kind !== "blocker") continue;
+      view.openMessages.set(message.messageId, {
+        messageId: message.messageId,
+        kind: message.kind,
+        author: message.author,
+        title: message.title,
+        body: message.body,
+        status: message.status ?? "open",
+        runId: message.runId,
+        createdAt: message.createdAt,
+      });
+    }
+    view.unresolvedMessageCount = view.openMessages.size;
+    if (snap.latestSubmission) {
+      view.activeSubmissionId = snap.latestSubmission.submissionId;
+      const existingSubmission = view.submissions.get(snap.latestSubmission.submissionId);
+      view.submissions.set(snap.latestSubmission.submissionId, {
+        ...existingSubmission,
+        submissionId: snap.latestSubmission.submissionId,
+        sessionId: view.workSessionId,
+        submissionNumber: snap.latestSubmission.submissionNumber,
+        reviewEpoch: snap.latestSubmission.reviewEpoch,
+        diffSha256: snap.latestSubmission.diffSha256,
+        status: snap.latestSubmission.status,
+        files: existingSubmission?.files ?? [],
+        patch: existingSubmission?.patch ?? "",
+        fileCount: existingSubmission?.fileCount ?? 0,
+        additions: snap.latestSubmission.additions,
+        removals: snap.latestSubmission.removals,
+      });
+      if (!existingSubmission?.patch) void fetchReviewDiff(view.workSessionId, snap.latestSubmission.submissionId);
+    }
+    if (snap.hasMission) {
+      view.missionLoading = true;
+      void refreshMission(view);
+    } else {
+      view.missionLoading = false;
+      view.mission = undefined;
+      view.missionError = undefined;
+    }
+    scheduleRender();
+  })().catch((error) => {
+    view.missionLoading = false;
+    view.missionError = error instanceof Error ? error.message : String(error);
+    scheduleRender();
+    throw error;
+  });
+  snapshotHydrations.set(view.workSessionId, hydration);
+  try {
+    await hydration;
+  } finally {
+    snapshotHydrations.delete(view.workSessionId);
   }
 }
 
 async function fetchReviewDiff(sessionId: string, submissionId: string): Promise<void> {
   if (!app) return;
   try {
-    const result = await app.callServerTool({
+    const result = await callServerToolChecked({
       name: "get_review_submission",
       arguments: { sessionId, submissionId },
     });
@@ -390,8 +646,26 @@ async function fetchReviewDiff(sessionId: string, submissionId: string): Promise
       additions: number;
       removals: number;
       files: ReviewSubmissionView["files"];
-    }>(result);
-    if (!content?.patch) return;
+        }>(result);
+    if (!content?.patch) {
+      const view = workSessionViews.get(sessionId);
+      if (view) {
+        view.notice = {
+          tone: "warning",
+          message: "Review details could not be loaded.",
+          action: {
+            label: "Retry",
+            run: () => {
+              view.notice = { tone: "info", message: "Retrying review details…" };
+              scheduleRender();
+              void fetchReviewDiff(sessionId, submissionId);
+            },
+          },
+        };
+        scheduleRender();
+      }
+      return;
+    }
     const view = workSessionViews.get(sessionId);
     if (view && content) {
       const sub = view.submissions.get(submissionId);
@@ -403,15 +677,30 @@ async function fetchReviewDiff(sessionId: string, submissionId: string): Promise
         render();
       }
     }
-  } catch {
-    // Submission may not exist yet
+  } catch (error) {
+    const view = workSessionViews.get(sessionId);
+    if (view) {
+      view.notice = {
+        tone: "error",
+        message: `Review details could not be loaded: ${error instanceof Error ? error.message : String(error)}`,
+        action: {
+          label: "Retry",
+          run: () => {
+            view.notice = { tone: "info", message: "Retrying review details…" };
+            scheduleRender();
+            void fetchReviewDiff(sessionId, submissionId);
+          },
+        },
+      };
+      scheduleRender();
+    }
   }
 }
 
 async function refreshMission(view: WorkSessionViewState): Promise<void> {
   if (!app) return;
   try {
-    const result = await app.callServerTool({
+    const result = await callServerToolChecked({
       name: "inspect_supervised_work",
       arguments: { workSessionId: view.workSessionId },
     });
@@ -419,11 +708,17 @@ async function refreshMission(view: WorkSessionViewState): Promise<void> {
     if (content?.packet?.mission) {
       view.mission = content.packet;
       view.missionLoading = false;
-      render();
+      view.missionError = undefined;
+      scheduleRender();
+    } else {
+      view.missionLoading = false;
+      view.missionError = "No supervision packet was returned.";
+      scheduleRender();
     }
-  } catch {
-    // Ordinary work sessions have no mission contract. Keep their existing UI.
+  } catch (error) {
     view.missionLoading = false;
+    view.missionError = error instanceof Error ? error.message : String(error);
+    scheduleRender();
   }
 }
 
@@ -436,6 +731,8 @@ function ensureWorkSessionView(workSessionId: string, workspaceSessionId: string
       runId,
       status: "in_progress",
       lastSeq: 0,
+      unresolvedMessageCount: 0,
+      pendingApprovalCount: 0,
       activity: [],
       submissions: new Map(),
       policyApprovals: new Map(),
@@ -465,7 +762,10 @@ function applyHostContext(): void {
 }
 
 function render(): void {
-  unmountPayload();
+  scheduleRender();
+}
+
+function renderNow(): void {
 
   if (connectionError) {
     renderEmpty(connectionError, "error");
@@ -488,6 +788,7 @@ function render(): void {
   }
 
   const card = lastToolCard;
+  ensureSurface(`tool:${card.tool}`);
   const display = getToolDisplay(card);
   if (card.tool === "open_approval_center") {
     renderApprovalCenterCard(card, display);
@@ -548,10 +849,18 @@ function render(): void {
 }
 
 function renderEmpty(message: string, tone: "muted" | "error" = "muted"): void {
+  ensureSurface(`empty:${tone}:${message}`);
   const main = element("main", { className: "shell" });
   main.append(element("section", { className: `empty ${tone}`, text: message }));
   appRoot.replaceChildren(main);
   maybeAppendAgentBar();
+}
+
+function ensureSurface(key: string): void {
+  if (renderedSurfaceKey === key) return;
+  unmountPayload();
+  currentWorkSessionDom = null;
+  renderedSurfaceKey = key;
 }
 
 function renderSummaryBadge(card: ToolResultCard): HTMLElement {
@@ -570,6 +879,7 @@ function renderSummaryBadge(card: ToolResultCard): HTMLElement {
 }
 
 function unmountPayload(): void {
+  payloadLoadGeneration += 1;
   if (currentPayload) {
     try {
       currentPayload.unmount();
@@ -581,113 +891,405 @@ function unmountPayload(): void {
   if (currentPayloadContainer) {
     currentPayloadContainer.replaceChildren();
   }
+  currentPayloadContainer = null;
+  currentPayloadCard = null;
+  currentPayloadKind = null;
+  currentPayloadKey = null;
+  payloadLoadingKey = null;
 }
 
-function renderPayloadIfNeeded(): void {
+function renderPayloadIfNeeded(
+  payloadCard?: ToolResultCard | null,
+  visibleFileCount?: number,
+): void {
   const target = currentPayloadContainer;
   if (!target) return;
-  target.replaceChildren();
-  const card = lastToolCard;
+  const card = payloadCard === undefined ? currentPayloadCard ?? lastToolCard : payloadCard;
   if (!card) return;
+  currentPayloadCard = card;
 
-  if (isReviewTool(card.tool)) {
-    const patch = card.payload?.patch;
-    if (patch) {
-      const pre = element("pre", { className: "review-patch" });
-      pre.textContent = patch;
-      target.append(pre);
-    } else if (card.files?.length) {
-      const ul = element("ul", { className: "review-filelist" });
-      for (const f of card.files) {
-        ul.append(element("li", { text: `${f.path ?? f.previousPath ?? "file"}${f.operation ? ` (${f.operation})` : ""}` }));
-      }
-      target.append(ul);
-    }
+  const kind = isReviewTool(card.tool) ? "review" : "heavy";
+  // The renderer identity is the selected card/submission, not its mutable
+  // payload. Content and theme updates must flow through update(); remounting
+  // Pierre on every output fragment loses scroll position and focus.
+  const identity = isReviewTool(card.tool)
+    ? String(card.summary?.submissionId ?? card.workSessionId ?? card.path ?? card.tool)
+    : String(card.path ?? card.workSessionId ?? card.tool);
+  const key = `${kind}:${card.tool}:${identity}`;
+  if (currentPayloadContainer === target && currentPayload && currentPayloadKind === kind && currentPayloadKey === key) {
+    currentPayload.update({ card, hostContext, errorMessage, visibleFileCount });
     return;
   }
 
-  const text = card.payload?.patch ?? payloadText(card.payload);
-  if (text) {
-    const pre = element("pre", { className: "tool-payload" });
-    pre.textContent = text;
-    target.append(pre);
+  if (currentPayloadContainer === target && !currentPayload && payloadLoadingKey === key) return;
+
+  if (currentPayloadContainer !== target || currentPayloadKind !== kind || currentPayloadKey !== key) {
+    if (currentPayload) {
+      try { currentPayload.unmount(); } catch { /* ignore renderer teardown failures */ }
+      currentPayload = null;
+    }
+    currentPayloadContainer = target;
+    currentPayloadKind = kind;
+    currentPayloadKey = key;
+    payloadLoadingKey = key;
+    target.replaceChildren(element("div", { className: "status muted", text: "Loading rich payload…" }));
+    const generation = ++payloadLoadGeneration;
+    const options = { card, hostContext, errorMessage, visibleFileCount };
+    void (kind === "review"
+      ? import("./review-payload.js").then(({ mountReviewPayload }) => mountReviewPayload(target, options))
+      : import("./heavy-payload.js").then(({ mountHeavyPayload }) => mountHeavyPayload(target, options)))
+      .then((mounted) => {
+        if (generation !== payloadLoadGeneration || currentPayloadContainer !== target || currentPayloadKey !== key) {
+          try { mounted.unmount(); } catch { /* ignore stale renderer teardown failures */ }
+          return;
+        }
+        currentPayload = mounted;
+        payloadLoadingKey = null;
+        // Host theme or card payload may have changed while the lazy module was
+        // loading. Apply the newest values without another mount.
+        mounted.update({ card: currentPayloadCard ?? card, hostContext, errorMessage, visibleFileCount });
+      })
+      .catch((error) => {
+        if (generation !== payloadLoadGeneration || currentPayloadContainer !== target || currentPayloadKey !== key) return;
+        currentPayload = null;
+        payloadLoadingKey = null;
+        target.replaceChildren(element("pre", {
+          className: "text-payload fallback",
+          text: payloadText(card.payload) || card.payload?.patch || `Rich renderer failed: ${error instanceof Error ? error.message : String(error)}`,
+        }));
+      });
   }
 }
 
 // ── Composed work-session view ───────────────────────
 
 function renderWorkSessionView(view: WorkSessionViewState): void {
-  const main = element("main", { className: "shell" });
-  const section = element("section", { className: "tool-card agent" });
+  ensureSurface(`session:${view.workSessionId}`);
+  const dom = currentWorkSessionDom ?? createWorkSessionDom(view.workSessionId);
+  currentWorkSessionDom = dom;
 
-  // Run header.
+  dom.titleStatus.textContent = view.title ?? view.status;
+  dom.statusBadge.textContent = view.status;
+  dom.meta.replaceChildren();
+  if (view.workspaceSessionId) dom.meta.append(element("span", { className: "agent-meta-row", text: `workspace: ${view.workspaceSessionId}` }));
+  if (view.workSessionId) dom.meta.append(element("span", { className: "agent-meta-row", text: `session: ${view.workSessionId}` }));
+  if (view.runId) dom.meta.append(element("span", { className: "agent-meta-row", text: `run: ${view.runId}` }));
+  if (view.lifecycle) dom.meta.append(element("span", { className: "agent-meta-row", text: `lifecycle: ${view.lifecycle}` }));
+  if (view.lastHeartbeatAt) {
+    const ageSeconds = Math.max(0, Math.round((Date.now() - Date.parse(view.lastHeartbeatAt)) / 1000));
+    dom.meta.append(element("span", { className: "agent-meta-row heartbeat-status", text: `● Agent connected · ${ageSeconds}s ago` }));
+  }
+
+  renderSessionSwitcher(dom.sessionSwitcher);
+  renderSessionNotice(dom.notice, view);
+  const missionKey = `${view.missionLoading ? "loading" : "ready"}:${view.missionError ?? ""}:${view.mission ? JSON.stringify(view.mission) : "none"}`;
+  if (dom.mission.dataset.stateKey !== missionKey) {
+    dom.mission.replaceChildren();
+    if (view.missionLoading) {
+      dom.mission.append(element("div", { className: "status muted", text: "Loading supervision state…" }));
+    } else if (view.mission) {
+      dom.mission.append(renderMissionPanel(view));
+    } else if (view.missionError) {
+      dom.mission.append(element("div", { className: "status error", text: `Supervision state could not be loaded: ${view.missionError}` }));
+    }
+    dom.mission.dataset.stateKey = missionKey;
+  }
+
+  renderOpenMessages(dom.messages, view);
+  renderActivityIncrementally(dom, view);
+  dom.approvals.replaceChildren();
+  if (view.policyApprovals.size > 0) {
+    dom.approvals.append(element("div", { className: "agent-activity-header", text: "Policy approvals" }));
+    const approvals = element("div", { className: "approval-list" });
+    for (const approval of view.policyApprovals.values()) approvals.append(renderPolicyApproval(view, approval));
+    dom.approvals.append(approvals);
+  }
+
+  const submission = view.activeSubmissionId ? view.submissions.get(view.activeSubmissionId) : undefined;
+  if (submission) {
+    dom.review.hidden = false;
+    dom.reviewTitle.textContent = `Review submission #${submission.submissionNumber}`;
+    const submissionCard = reviewCardFromSubmission(submission, view.workSessionId);
+    if (submission.patch) {
+      dom.reviewPayload.removeAttribute("data-loading-key");
+      currentPayloadContainer = dom.reviewPayload;
+      renderPayloadIfNeeded(submissionCard);
+    } else {
+      const loadingKey = `loading:${submission.submissionId}`;
+      if (dom.reviewPayload.dataset.loadingKey !== loadingKey) {
+        if (currentPayloadContainer === dom.reviewPayload && currentPayload) unmountPayload();
+        dom.reviewPayload.replaceChildren(element("div", { className: "status muted", text: "Loading review details…" }));
+        dom.reviewPayload.dataset.loadingKey = loadingKey;
+      }
+      currentPayloadContainer = dom.reviewPayload;
+    }
+    const fbState = view.feedbackStateBySubmission.get(submission.submissionId) ?? "idle";
+    const feedbackKey = `${submission.submissionId}:${fbState}:${view.feedbackErrorBySubmission.get(submission.submissionId) ?? ""}:${view.mission ? "mission" : "review"}`;
+    if (dom.reviewFeedbackKey !== feedbackKey) {
+      dom.reviewFeedback.replaceChildren(
+        fbState === "submitted"
+          ? renderFeedbackSubmitted(view)
+          : renderFeedbackFormForSubmission(view, submission),
+      );
+      dom.reviewFeedbackKey = feedbackKey;
+    }
+  } else {
+    dom.review.hidden = false;
+    dom.reviewTitle.textContent = "Review status";
+    if (currentPayloadContainer === dom.reviewPayload) unmountPayload();
+    currentPayloadContainer = dom.reviewPayload;
+    dom.reviewPayload.replaceChildren();
+    dom.reviewPayload.removeAttribute("data-loading-key");
+    if (view.status === "awaiting_review") dom.reviewPayload.append(element("div", { className: "empty muted", text: "Awaiting review submission…" }));
+    else dom.review.hidden = true;
+    dom.reviewFeedback.replaceChildren();
+    dom.reviewFeedbackKey = undefined;
+  }
+
+  if (!dom.main.isConnected) {
+    appRoot.replaceChildren(dom.main);
+  }
+  maybeAppendAgentBar();
+}
+
+function createWorkSessionDom(workSessionId: string): WorkSessionDom {
+  const main = element("main", { className: "shell workspace-surface" });
+  const sessionSwitcher = element("nav", { className: "session-switcher", ariaLabel: "Work sessions" });
+  const section = element("section", { className: "tool-card agent" });
   const header = element("div", { className: "review-header" });
   const icon = element("span", { className: "tool-icon", ariaHidden: "true" });
   icon.innerHTML = agentIcon();
   const titleGroup = element("div", { className: "review-title-group" });
-  titleGroup.append(
-    element("span", { className: "tool-title", text: "Coding Agent Run" }),
-    element("span", { className: "tool-label", text: view.status, title: view.status }),
-  );
-  header.append(icon, titleGroup, element("span", { className: "tool-badge", text: view.status }));
-  section.append(header);
-
+  const titleStatus = element("span", { className: "tool-label" });
+  titleGroup.append(element("span", { className: "tool-title", text: "Coding Agent Run" }), titleStatus);
+  const statusBadge = element("span", { className: "tool-badge" });
+  header.append(icon, titleGroup, statusBadge);
   const meta = element("div", { className: "agent-meta" });
-  if (view.workspaceSessionId) meta.append(element("span", { className: "agent-meta-row", text: `workspace: ${view.workspaceSessionId}` }));
-  if (view.workSessionId) meta.append(element("span", { className: "agent-meta-row", text: `session: ${view.workSessionId}` }));
-  if (view.runId) meta.append(element("span", { className: "agent-meta-row", text: `run: ${view.runId}` }));
-  section.append(meta);
-
-  if (view.mission) section.append(renderMissionPanel(view));
-
-  // Activity timeline.
+  const notice = element("div", { className: "session-notice", hidden: true });
+  const mission = element("div", { className: "mission-slot" });
+  const messages = element("div", { className: "message-slot" });
   const activityHeader = element("div", { className: "agent-activity-header", text: "Agent activity" });
-  section.append(activityHeader);
   const activity = element("ul", { className: "agent-activity" });
-  if (view.activity.length === 0) {
-    activity.append(element("li", { className: "agent-event muted", text: "No activity yet." }));
-  }
-  for (const e of view.activity.slice(-50)) {
-    const label = eventLabel(e);
-    const title = String(e.payload?.outputSummary ?? e.payload?.text ?? e.payload?.description ?? "");
-    activity.append(element("li", { className: e.payload?.success === false ? "agent-event failed" : "agent-event", text: label, title }));
-  }
-  section.append(activity);
+  const approvals = element("div", { className: "approval-slot" });
+  const review = element("section", { className: "session-review" });
+  const reviewTitle = element("div", { className: "agent-activity-header" });
+  const reviewPayload = element("div", { className: "review-payload" });
+  const reviewFeedback = element("div", { className: "review-feedback" });
+  review.append(reviewTitle, reviewPayload, reviewFeedback);
+  section.append(header, meta, notice, mission, messages, activityHeader, activity, approvals, review);
+  main.append(sessionSwitcher, section);
+  return {
+    workSessionId,
+    main,
+    sessionSwitcher,
+    section,
+    titleStatus,
+    statusBadge,
+    meta,
+    notice,
+    mission,
+    messages,
+    activity,
+    activitySeqs: new Set(),
+    approvals,
+    review,
+    reviewTitle,
+    reviewPayload,
+    reviewFeedback,
+  };
+}
 
-  if (view.policyApprovals.size > 0) {
-    section.append(element("div", { className: "agent-activity-header", text: "Policy approvals" }));
-    const approvals = element("div", { className: "approval-list" });
-    for (const approval of view.policyApprovals.values()) {
-      approvals.append(renderPolicyApproval(view, approval));
+function renderSessionSwitcher(container: HTMLElement): void {
+  container.replaceChildren();
+  const sessions = [...workSessionViews.values()]
+    .filter((view) => view.workSessionId !== "__approval_center__")
+    .sort((a, b) => {
+      const at = Date.parse(a.updatedAt ?? "") || 0;
+      const bt = Date.parse(b.updatedAt ?? "") || 0;
+      return bt - at || b.lastSeq - a.lastSeq;
+    });
+  if (sessions.length < 2) return;
+  for (const view of sessions) {
+    const label = view.title ?? view.status;
+    const category = sessionCategory(view);
+    const updatedAt = view.updatedAt ? relativeSessionAge(view.updatedAt) : "";
+    const button = element("button", {
+      className: `session-switcher-item${view.workSessionId === selectedWorkSessionId ? " selected" : ""}`,
+      type: "button",
+      text: `${category} · ${label} · ${view.submittedBy ?? "agent"}${updatedAt ? ` · ${updatedAt}` : ""}`,
+      ariaPressed: String(view.workSessionId === selectedWorkSessionId),
+      title: `${view.workSessionId}${view.submittedBy ? ` · ${view.submittedBy}` : ""}`,
+    });
+    button.addEventListener("click", () => selectWorkSession(view.workSessionId));
+    container.append(button);
+  }
+}
+
+function sessionCategory(view: WorkSessionViewState): string {
+  if (view.openMessages.size > 0 || view.unresolvedMessageCount > 0 || view.policyApprovals.size > 0 || view.pendingApprovalCount > 0) {
+    return "Needs input";
+  }
+  if (["awaiting_review", "review_in_progress", "changes_requested"].includes(view.status)) {
+    return "Needs review";
+  }
+  if (["stale", "archived"].includes(view.runtimeState ?? "") || ["approved", "rejected", "cancelled", "failed", "failed_protocol"].includes(view.status)) {
+    return "Historical";
+  }
+  return "Running";
+}
+
+function relativeSessionAge(value: string): string {
+  const ageMs = Math.max(0, Date.now() - Date.parse(value));
+  if (!Number.isFinite(ageMs)) return "";
+  if (ageMs < 60_000) return `${Math.max(1, Math.round(ageMs / 1000))}s ago`;
+  if (ageMs < 60 * 60_000) return `${Math.round(ageMs / 60_000)}m ago`;
+  return `${Math.round(ageMs / (60 * 60_000))}h ago`;
+}
+
+function selectWorkSession(workSessionId: string): void {
+  if (!workSessionViews.has(workSessionId)) return;
+  selectedWorkSessionId = workSessionId;
+  const view = workSessionViews.get(workSessionId)!;
+  void hydrateWorkSessionSnapshot(view)
+    .then(() => scheduleRender())
+    .catch((error) => {
+      view.notice = { tone: "warning", message: `Session details could not be loaded: ${error instanceof Error ? error.message : String(error)}` };
+      scheduleRender();
+    });
+  scheduleRender();
+}
+
+function renderSessionNotice(container: HTMLElement, view: WorkSessionViewState): void {
+  const notice = view.notice ?? (view.feedbackMessage
+    ? {
+      tone: /failed|error|interrupted|could not/i.test(view.feedbackMessage) ? "error" as const : "info" as const,
+      message: view.feedbackMessage,
     }
-    section.append(approvals);
+    : undefined);
+  if (!notice) {
+    container.hidden = true;
+    container.replaceChildren();
+    return;
   }
-
-  // Current review submission (if any).
-  const submission = view.activeSubmissionId ? view.submissions.get(view.activeSubmissionId) : undefined;
-  if (submission) {
-    const subHeader = element("div", { className: "agent-activity-header", text: `Review submission #${submission.submissionNumber}` });
-    section.append(subHeader);
-
-    if (submission.patch) {
-      const pre = element("pre", { className: "review-patch" });
-      pre.textContent = submission.patch;
-      section.append(pre);
-    }
-
-    const fbState = view.feedbackStateBySubmission.get(submission.submissionId) ?? "idle";
-    if (fbState === "submitted") {
-      section.append(renderFeedbackSubmitted(view));
-    } else {
-      section.append(renderFeedbackFormForSubmission(view, submission));
-    }
-  } else if (view.status === "awaiting_review") {
-    section.append(element("div", { className: "empty muted", text: "Awaiting review submission…" }));
+  container.hidden = false;
+  container.className = `session-notice ${notice.tone}`;
+  container.replaceChildren(element("span", { text: notice.message }));
+  if (notice.action) {
+    const action = element("button", { className: "notice-action", type: "button", text: notice.action.label });
+    action.addEventListener("click", notice.action.run);
+    container.append(action);
   }
+}
 
-  main.append(section);
-  appRoot.replaceChildren(main);
-  maybeAppendAgentBar();
+function renderOpenMessages(container: HTMLElement, view: WorkSessionViewState): void {
+  const stateKey = [...view.openMessages.values()]
+    .map((message) => `${message.messageId}:${message.status}:${message.title ?? ""}:${message.body ?? ""}`)
+    .join("|");
+  if (container.dataset.stateKey === stateKey) return;
+  container.replaceChildren();
+  container.dataset.stateKey = stateKey;
+  if (view.openMessages.size === 0) return;
+  container.append(element("div", { className: "message-heading", text: "Needs your input" }));
+  for (const message of view.openMessages.values()) {
+    const card = element("article", { className: "agent-message blocker" });
+    card.append(
+      element("div", { className: "message-kind", text: message.kind.replace(/_/g, " ") }),
+      element("div", { className: "message-title", text: message.title ?? "Agent request" }),
+      element("div", { className: "message-body", text: message.body ?? "No details provided." }),
+      element("div", { className: "message-meta", text: `${message.author ?? "agent"}${message.runId ? ` · ${message.runId}` : ""}${message.createdAt ? ` · ${new Date(message.createdAt).toLocaleString()}` : ""}` }),
+    );
+    const reply = document.createElement("textarea");
+    reply.className = "message-reply";
+    reply.rows = 2;
+    reply.placeholder = "Reply to the agent…";
+    const resolve = element("button", { className: "feedback-btn approve", type: "button", text: "Reply / Resolve" });
+    resolve.addEventListener("click", () => {
+      if (!app) return;
+      resolve.disabled = true;
+      void callServerToolChecked({
+        name: "resolve_agent_message",
+        arguments: { sessionId: view.workSessionId, messageId: message.messageId, reply: reply.value.trim() || undefined },
+      }).then(() => {
+        view.openMessages.delete(message.messageId);
+        view.unresolvedMessageCount = view.openMessages.size;
+        view.notice = { tone: "success", message: "Reply sent to the agent." };
+        scheduleRender();
+      }).catch((error) => {
+        resolve.disabled = false;
+        view.notice = { tone: "error", message: `Could not resolve agent request: ${error instanceof Error ? error.message : String(error)}` };
+        scheduleRender();
+      });
+    });
+    card.append(reply, resolve);
+    container.append(card);
+  }
+}
+
+function renderActivityIncrementally(dom: WorkSessionDom, view: WorkSessionViewState): void {
+  const visible = view.activity.slice(-50);
+  const visibleSeqs = new Set(visible.map((event) => event.seq));
+  const existingBySeq = new Map<number, HTMLElement>();
+  for (const child of [...dom.activity.children]) {
+    const seq = Number((child as HTMLElement).dataset.eventSeq);
+    if (Number.isFinite(seq)) existingBySeq.set(seq, child as HTMLElement);
+  }
+  for (const child of [...dom.activity.children]) {
+    const seq = Number((child as HTMLElement).dataset.eventSeq);
+    if (Number.isFinite(seq) && !visibleSeqs.has(seq)) child.remove();
+  }
+  if (visible.length === 0) {
+    if (!dom.activity.querySelector(".activity-empty")) dom.activity.append(element("li", { className: "agent-event muted activity-empty", text: "No activity yet." }));
+    return;
+  }
+  dom.activity.querySelector(".activity-empty")?.remove();
+  for (const event of visible) {
+    const existing = existingBySeq.get(event.seq);
+    if (existing) {
+      // Adjacent output/thought events are coalesced into the original event
+      // sequence. Refresh that row in place so the coalesced text is visible
+      // without replacing the surrounding activity DOM.
+      existing.className = event.payload?.success === false ? "agent-event failed" : "agent-event";
+      existing.textContent = eventLabel(event);
+      existing.title = String(event.payload?.outputSummary ?? event.payload?.text ?? event.payload?.description ?? "");
+      continue;
+    }
+    if (dom.activitySeqs.has(event.seq)) continue;
+    const item = element("li", {
+      className: event.payload?.success === false ? "agent-event failed" : "agent-event",
+      text: eventLabel(event),
+      title: String(event.payload?.outputSummary ?? event.payload?.text ?? event.payload?.description ?? ""),
+    });
+    item.dataset.eventSeq = String(event.seq);
+    dom.activity.append(item);
+    dom.activitySeqs.add(event.seq);
+  }
+  for (const seq of [...dom.activitySeqs]) if (!visibleSeqs.has(seq)) dom.activitySeqs.delete(seq);
+}
+
+function reviewCardFromSubmission(submission: ReviewSubmissionView, sessionId: string): ToolResultCard {
+  return {
+    tool: "submit_for_review",
+    workSessionId: sessionId,
+    summary: {
+      submissionId: submission.submissionId,
+      submissionNumber: submission.submissionNumber,
+      reviewEpoch: submission.reviewEpoch,
+      diffSha256: submission.diffSha256,
+      additions: submission.additions,
+      removals: submission.removals,
+    },
+    files: submission.files.map((file) => ({
+      path: file.path,
+      previousPath: file.previousPath,
+      operation: file.operation === "add" || file.operation === "update" || file.operation === "delete" || file.operation === "move"
+        ? file.operation
+        : undefined,
+      type: file.type,
+      additions: file.additions,
+      removals: file.removals,
+    })),
+    payload: { patch: submission.patch },
+  };
 }
 
 function renderMissionPanel(view: WorkSessionViewState): HTMLElement {
@@ -698,15 +1300,29 @@ function renderMissionPanel(view: WorkSessionViewState): HTMLElement {
   if (packet.supervisor) {
     const run = packet.supervisor;
     panel.append(element("div", { className: "approval-detail", text: `Supervisor: ${run.status} · cycle ${run.cycleNumber}/${run.maxCycles} · ${run.autonomyMode} · ${run.approvalMode}${run.repeatedFailureCount ? ` · repeated failure ${run.repeatedFailureCount}` : ""}` }));
+    let progress: { blockingFindingCount?: number; failedCriterionCount?: number; passedCriterionCount?: number; failingVerificationCount?: number; unresolvedRequiredActions?: number } | undefined;
+    if (run.progressJson) {
+      try { progress = JSON.parse(run.progressJson) as typeof progress; } catch { /* tolerate an older/corrupt projection */ }
+    }
+    if (progress) {
+      const requiredTotal = (progress.failedCriterionCount ?? 0) + (progress.passedCriterionCount ?? 0);
+      const criteriaText = requiredTotal > 0 ? `${progress.passedCriterionCount ?? 0}/${requiredTotal} criteria passing` : "criteria pending";
+      const repeatedText = run.repeatedFailureFingerprintLimit
+        ? ` · repeated failure ${run.repeatedFailureCount ?? 0}/${run.repeatedFailureFingerprintLimit}`
+        : "";
+      panel.append(element("div", { className: "approval-detail", text: `Convergence: ${progress.blockingFindingCount ?? 0} blockers · ${criteriaText} · ${progress.failingVerificationCount ?? 0} verification failures · ${progress.unresolvedRequiredActions ?? 0} required actions${repeatedText}` }));
+    }
+    if (run.stallReason) panel.append(element("div", { className: "feedback-error", text: `Supervision paused: ${run.stallReason}` }));
+    if (run.updatedAt) panel.append(element("div", { className: "approval-detail", text: `Last supervisor progress: ${new Date(run.updatedAt).toLocaleString()}` }));
     if (run.deadlineAt) panel.append(element("div", { className: "approval-detail", text: `Autonomous deadline: ${new Date(run.deadlineAt).toLocaleString()}` }));
     if (run.lastError) panel.append(element("div", { className: "feedback-error", text: `Supervisor error: ${run.lastError}` }));
     const control = element("button", { className: "feedback-btn changes", type: "button", text: run.status === "paused" ? "Resume supervisor" : "Pause supervisor" });
     control.addEventListener("click", () => {
       if (!app) return;
       control.setAttribute("disabled", "true");
-      void app.callServerTool({ name: run.status === "paused" ? "resume_supervisor_run" : "pause_supervisor_run", arguments: { workSessionId: view.workSessionId, expectedRevision: run.revision } })
+      void callServerToolChecked({ name: run.status === "paused" ? "resume_supervisor_run" : "pause_supervisor_run", arguments: { workSessionId: view.workSessionId, expectedRevision: run.revision } })
         .then(() => refreshMission(view))
-        .catch((error) => { view.feedbackMessage = `Supervisor control failed: ${error instanceof Error ? error.message : String(error)}`; render(); });
+        .catch((error) => { view.notice = { tone: "error", message: `Supervisor control failed: ${error instanceof Error ? error.message : String(error)}` }; scheduleRender(); });
     });
     panel.append(control);
     if (run.status === "awaiting_human") {
@@ -714,9 +1330,9 @@ function renderMissionPanel(view: WorkSessionViewState): HTMLElement {
       redrive.addEventListener("click", () => {
         if (!app) return;
         redrive.setAttribute("disabled", "true");
-        void app.callServerTool({ name: "redrive_supervisor_run", arguments: { workSessionId: view.workSessionId, expectedRevision: run.revision } })
+        void callServerToolChecked({ name: "redrive_supervisor_run", arguments: { workSessionId: view.workSessionId, expectedRevision: run.revision } })
           .then(() => refreshMission(view))
-          .catch((error) => { view.feedbackMessage = `Supervisor redrive failed: ${error instanceof Error ? error.message : String(error)}`; render(); });
+          .catch((error) => { view.notice = { tone: "error", message: `Supervisor redrive failed: ${error instanceof Error ? error.message : String(error)}` }; scheduleRender(); });
       });
       panel.append(redrive);
     }
@@ -744,9 +1360,9 @@ function renderMissionPanel(view: WorkSessionViewState): HTMLElement {
     verify.addEventListener("click", () => {
       if (!app) return;
       verify.setAttribute("disabled", "true");
-      void app.callServerTool({ name: "run_mission_verification", arguments: { workSessionId: view.workSessionId } })
+      void callServerToolChecked({ name: "run_mission_verification", arguments: { workSessionId: view.workSessionId } })
         .then(() => refreshMission(view))
-        .catch((error) => { view.feedbackMessage = `Verification failed: ${error instanceof Error ? error.message : String(error)}`; render(); });
+        .catch((error) => { view.notice = { tone: "error", message: `Verification failed: ${error instanceof Error ? error.message : String(error)}` }; scheduleRender(); });
     });
     panel.append(verify);
   }
@@ -774,7 +1390,7 @@ function renderMissionCorrectionForm(view: WorkSessionViewState): HTMLElement {
     const comments = instructions.value.trim();
     if (!comments || !app) return;
     submit.setAttribute("disabled", "true");
-    void app.callServerTool({
+    void callServerToolChecked({
       name: "continue_supervised_work",
       arguments: {
         workSessionId: view.workSessionId,
@@ -792,11 +1408,11 @@ function renderMissionCorrectionForm(view: WorkSessionViewState): HTMLElement {
     }).then((result) => {
       const content = getStructuredContent<{ packet?: MissionPacketView }>(result);
       if (content?.packet) view.mission = content.packet;
-      view.feedbackMessage = "Correction round queued.";
-      render();
+      view.notice = { tone: "success", message: "Correction round queued." };
+      scheduleRender();
     }).catch((error) => {
-      view.feedbackMessage = `Correction dispatch failed: ${error instanceof Error ? error.message : String(error)}`;
-      render();
+      view.notice = { tone: "error", message: `Correction dispatch failed: ${error instanceof Error ? error.message : String(error)}` };
+      scheduleRender();
     });
   });
   form.append(submit);
@@ -806,9 +1422,8 @@ function renderMissionCorrectionForm(view: WorkSessionViewState): HTMLElement {
 function eventLabel(e: AgentActivityEvent): string {
   switch (e.type) {
     case "agent.run.started": return "run started";
-    case "agent.run.heartbeat": return "heartbeat";
-    case "agent.run.output_delta": return String(e.payload?.text ?? "output").slice(0, 160);
-    case "agent.run.thought_delta": return `thought: ${String(e.payload?.text ?? "").slice(0, 120)}`;
+    case "agent.run.output_delta": return String(e.payload?.text ?? "output").slice(-160);
+    case "agent.run.thought_delta": return `thought: ${String(e.payload?.text ?? "").slice(-120)}`;
     case "agent.tool.started": return `→ ${String(e.payload?.tool ?? "tool")}`;
     case "agent.tool.completed": return `✓ ${String(e.payload?.tool ?? "tool")}${e.payload?.path ? " · " + e.payload.path : ""}`;
     case "agent.tool.failed": return `✗ ${String(e.payload?.tool ?? "tool")}${e.payload?.path ? " · " + e.payload.path : ""}`;
@@ -821,6 +1436,7 @@ function eventLabel(e: AgentActivityEvent): string {
     case "agent.run.approved": return "approved";
     case "agent.run.rejected": return "rejected";
     case "agent.run.failed": return "failed";
+    case "agent.run.cancellation_requested": return "cancellation requested";
     case "agent.run.cancelled": return "cancelled";
     case "continuation.created": return "continuation queued";
     case "continuation.delivered": return "continuation delivered";
@@ -841,47 +1457,53 @@ function eventLabel(e: AgentActivityEvent): string {
 
 // ── Event-driven watcher (replaces the 2.5s poll) ──
 
-async function watchWorkSession(sessionId: string, initialSeq = 0): Promise<void> {
+async function watchWorkspaceEvents(workspaceId: string, initialSeq: number, generation: number): Promise<void> {
   let cursor = initialSeq;
-  const myGen = ++watcherGenerationCounter;
-  watcherGenerations.set(sessionId, myGen);
-
-  while (app && watcherGenerations.get(sessionId) === myGen) {
+  // P1 #34: bounded exponential backoff with jitter. Resets after any
+  // successful response so steady-state polling latency is unaffected.
+  let retryDelayMs = 1_000;
+  const MAX_RETRY_DELAY_MS = 30_000;
+  while (app && workspaceWatcherGeneration === generation && activeWorkspaceId === workspaceId) {
     try {
-      const result = await app.callServerTool({
-        name: "await_work_session_events",
-        arguments: { sessionId, afterSeq: cursor, timeoutMs: 55000 },
+      const result = await callServerToolChecked({
+        name: "await_workspace_events",
+        arguments: { workspaceId, afterSeq: cursor, timeoutMs: 55000 },
       });
-
-      if (watcherGenerations.get(sessionId) !== myGen) return;
-
+      if (workspaceWatcherGeneration !== generation || activeWorkspaceId !== workspaceId) return;
+      retryDelayMs = 1_000;
       const content = getStructuredContent<{
         events: AgentActivityEvent[];
         nextSeq: number;
-        terminal: boolean;
       }>(result);
-
       if (!content) continue;
-
       for (const event of content.events) {
-        reduceWorkSessionEvent(sessionId, event);
+        if (!workSessionViews.has(event.sessionId)) {
+          // Correlation is enough to create a lightweight view immediately;
+          // reduce the triggering event before the full snapshot arrives.
+          ensureWorkSessionView(event.sessionId, event.workspaceSessionId ?? workspaceId, "");
+          reduceWorkSessionEvent(event.sessionId, event);
+          queueSessionRehydration();
+          continue;
+        }
+        reduceWorkSessionEvent(event.sessionId, event);
       }
       cursor = Math.max(cursor, content.nextSeq);
-      render();
-      if (content.terminal) return;
+      workspaceEventCursor = cursor;
+      scheduleRender();
     } catch (error) {
-      if (watcherGenerations.get(sessionId) !== myGen) return;
-
-      const view = workSessionViews.get(sessionId);
-      if (view) {
-        view.feedbackMessage = `Activity connection interrupted: ${
-          error instanceof Error ? error.message : String(error)
-        }`;
+      if (workspaceWatcherGeneration !== generation) return;
+      const selected = selectedWorkSessionId ? workSessionViews.get(selectedWorkSessionId) : undefined;
+      if (selected) {
+        selected.notice = {
+          tone: "warning",
+          message: `Workspace activity connection interrupted: ${error instanceof Error ? error.message : String(error)}`,
+        };
       }
-      render();
-
-      // Transport failure: reconnect after a brief delay (not polling)
-      await new Promise((r) => setTimeout(r, 1000));
+      scheduleRender();
+      // P1 #34: exponential backoff with jitter instead of a flat 1s retry.
+      const jitter = Math.floor(Math.random() * 250);
+      await new Promise((resolve) => setTimeout(resolve, retryDelayMs + jitter));
+      retryDelayMs = Math.min(MAX_RETRY_DELAY_MS, retryDelayMs * 2);
     }
   }
 }
@@ -893,9 +1515,29 @@ function reduceWorkSessionEvent(sessionId: string, event: AgentActivityEvent): v
   // idempotent. Never duplicate an already-applied durable event if a host
   // retries a tool call or returns an overlapping page.
   if (event.seq > 0 && event.seq <= view.lastSeq) return;
-  view.activity.push(event);
-  if (view.activity.length > 200) view.activity.shift();
   view.lastSeq = Math.max(view.lastSeq, event.seq);
+  view.updatedAt = event.createdAt;
+
+  // Heartbeats are connection health, not user activity. Keep the timestamp
+  // available to the status surface without filling the primary timeline.
+  if (event.type === "agent.run.heartbeat") {
+    view.lastHeartbeatAt = event.createdAt;
+    return;
+  }
+
+  // Coalesce adjacent transcript fragments so a fast agent does not turn each
+  // 250ms flush into a separate visible activity row.
+  const previous = view.activity.at(-1);
+  if (previous && previous.type === event.type && (event.type === "agent.run.output_delta" || event.type === "agent.run.thought_delta")) {
+    previous.payload = {
+      ...previous.payload,
+      text: `${String(previous.payload?.text ?? "")}${String(event.payload?.text ?? "")}`.slice(-4000),
+    };
+    previous.createdAt = event.createdAt;
+  } else {
+    view.activity.push(event);
+    if (view.activity.length > 200) view.activity.shift();
+  }
 
   if (event.type === "review.submitted") {
     const submissionId = String(event.payload?.submissionId ?? "");
@@ -904,8 +1546,7 @@ function reduceWorkSessionEvent(sessionId: string, event: AgentActivityEvent): v
     // Auto-fetch the full submission card from the agent's submit_for_review
     // invocation (which occurred in CRUSH's MCP connection, not this iframe).
     if (submissionId && app) {
-      void app
-        .callServerTool({ name: "get_review_submission", arguments: { sessionId, submissionId } })
+      void callServerToolChecked({ name: "get_review_submission", arguments: { sessionId, submissionId } })
         .then((res) => {
           const sc = getStructuredContent<{
             submissionId: string;
@@ -927,7 +1568,9 @@ function reduceWorkSessionEvent(sessionId: string, event: AgentActivityEvent): v
             submissionId,
             sessionId,
             submissionNumber: Number(event.payload?.submissionNumber ?? sc.submissionNumber ?? 0),
-            reviewEpoch: Number(card?.summary?.reviewEpoch ?? sc.reviewEpoch ?? 0),
+            reviewEpoch: typeof card?.summary?.reviewEpoch === "number"
+              ? card.summary.reviewEpoch
+              : typeof sc.reviewEpoch === "number" ? sc.reviewEpoch : undefined,
             status: sc.status,
             files: sc.files ?? card?.files ?? [],
             patch: sc.patch ?? card?.payload?.patch ?? "",
@@ -935,7 +1578,9 @@ function reduceWorkSessionEvent(sessionId: string, event: AgentActivityEvent): v
             additions: card?.summary?.additions ?? sc.additions ?? 0,
             removals: card?.summary?.removals ?? sc.removals ?? 0,
             message: card?.summary?.message,
-            diffSha256: String(card?.summary?.diffSha256 ?? sc.diffSha256 ?? ""),
+            diffSha256: typeof card?.summary?.diffSha256 === "string"
+              ? card.summary.diffSha256
+              : typeof sc.diffSha256 === "string" ? sc.diffSha256 : undefined,
           });
           view2.activeSubmissionId = submissionId;
           render();
@@ -944,9 +1589,15 @@ function reduceWorkSessionEvent(sessionId: string, event: AgentActivityEvent): v
           // P1 #11: surface the failure to load submission details rather than
           // silently leaving a blank card (which would mask a worker/transport
           // failure).
-          errorMessage =
-            "Failed to load submission details: " +
-            (err instanceof Error ? err.message : String(err));
+          const failedView = workSessionViews.get(sessionId);
+          if (failedView) {
+            failedView.notice = {
+              tone: "error",
+              message: "Failed to load submission details: " + (err instanceof Error ? err.message : String(err)),
+            };
+          } else {
+            errorMessage = "Failed to load submission details: " + (err instanceof Error ? err.message : String(err));
+          }
           render();
         });
     }
@@ -972,6 +1623,8 @@ function reduceWorkSessionEvent(sessionId: string, event: AgentActivityEvent): v
     view.status = "approved";
   } else if (event.type === "agent.run.rejected") {
     view.status = "rejected";
+  } else if (event.type === "agent.run.cancellation_requested") {
+    view.status = "cancelling";
   } else if (event.type === "agent.run.failed" || event.type === "agent.run.cancelled") {
     view.status = event.type === "agent.run.failed" ? "failed" : "cancelled";
   } else if (event.type === "policy.approval_requested" || event.type === "approval.requested") {
@@ -988,32 +1641,43 @@ function reduceWorkSessionEvent(sessionId: string, event: AgentActivityEvent): v
         matchedPattern: typeof event.payload?.matchedPattern === "string" ? event.payload.matchedPattern : undefined,
         options: parsePolicyApprovalOptions(event.payload?.options),
       });
+      view.pendingApprovalCount = view.policyApprovals.size;
     }
   } else if (event.type === "policy.approval.provided" || event.type === "approval.resolved") {
     const approvalId = String(event.payload?.approvalId ?? "");
-    if (approvalId) view.policyApprovals.delete(approvalId);
+    if (approvalId) {
+      view.policyApprovals.delete(approvalId);
+      view.pendingApprovalCount = view.policyApprovals.size;
+    }
   } else if (event.type === "agent.message.posted") {
     const messageId = String(event.payload?.messageId ?? "");
     const kind = String(event.payload?.kind ?? "note");
     // Only gating kinds (questions/blockers) go into the open-messages tray;
     // findings/artifacts/notes remain in the activity feed as records.
-    if (messageId && String(event.payload?.status ?? "") === "open") {
+    if (messageId && String(event.payload?.status ?? "") === "open" && (kind === "clarification_request" || kind === "blocker")) {
       view.openMessages.set(messageId, {
         messageId,
         kind,
+        author: typeof event.payload?.author === "string" ? event.payload.author : undefined,
         title: typeof event.payload?.title === "string" ? event.payload.title : undefined,
         body: typeof event.payload?.body === "string" ? event.payload.body : undefined,
         status: "open",
+        runId: typeof event.payload?.runId === "string" ? event.payload.runId : undefined,
+        createdAt: typeof event.payload?.createdAt === "string" ? event.payload.createdAt : event.createdAt,
       });
+      view.unresolvedMessageCount = view.openMessages.size;
     }
   } else if (event.type === "agent.message.resolved") {
     const messageId = String(event.payload?.messageId ?? "");
-    if (messageId) view.openMessages.delete(messageId);
+    if (messageId) {
+      view.openMessages.delete(messageId);
+      view.unresolvedMessageCount = view.openMessages.size;
+    }
   } else if (event.type === "session.handoff") {
     // Run identity and durable state are unchanged; only the agent handling the
     // next resume differs, so we just surface a notice.
     const toAgent = String(event.payload?.toAgent ?? "");
-    view.feedbackMessage = `Session handed off to ${toAgent || "another agent"}.`;
+    view.notice = { tone: "info", message: `Session handed off to ${toAgent || "another agent"}.` };
   }
 }
 
@@ -1022,31 +1686,32 @@ function reduceWorkSessionEvent(sessionId: string, event: AgentActivityEvent): v
 function renderAgentSubmitBar(): HTMLElement {
   if (!agentBar) {
     agentBar = element("div", { className: "agent-submit-bar" });
-    agentBar.style.cssText =
-      "position:sticky;bottom:0;display:flex;gap:6px;padding:8px 10px;background:var(--surface,#111827);border-top:1px solid var(--border,#1f2937)";
 
     const input = document.createElement("input");
     input.className = "agent-submit-input";
     input.placeholder = "Send a task to the coding agent…";
     input.setAttribute("aria-label", "Task for coding agent");
-    input.style.cssText =
-      "flex:1;min-width:0;padding:6px 8px;border-radius:6px;border:1px solid var(--border,#1f2937);background:#0b1220;color:inherit;font:inherit";
 
     const btn = element("button", { className: "agent-submit-btn", type: "button", text: "Send" });
-    btn.style.cssText =
-      "padding:6px 12px;border-radius:6px;border:0;background:#2563eb;color:#fff;font:inherit;cursor:pointer";
+    const status = element("div", { className: "agent-submit-status", role: "status", ariaLive: "polite" });
+
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        btn.click();
+      }
+    });
 
     btn.addEventListener("click", () => {
       const task = input.value.trim();
       if (!task || !app) return;
       if (!activeWorkspaceId) {
-        input.value = "";
-        input.placeholder = "Open a workspace before dispatching a coding agent.";
+        status.textContent = "Open a workspace before dispatching a coding agent.";
         return;
       }
+      status.textContent = "Dispatching…";
       btn.setAttribute("disabled", "true");
-      void app
-        .callServerTool({
+      void callServerToolChecked({
           name: "submit_to_coding_agent",
           arguments: { task, workspaceSessionId: activeWorkspaceId },
         })
@@ -1062,7 +1727,7 @@ function renderAgentSubmitBar(): HTMLElement {
           }>(result);
 
           if (!dispatch?.workSessionId) {
-            input.value = dispatch?.error ?? "Coding-agent dispatch returned no workSessionId.";
+            status.textContent = dispatch?.error ?? "Coding-agent dispatch returned no workSessionId.";
             return;
           }
 
@@ -1078,16 +1743,16 @@ function renderAgentSubmitBar(): HTMLElement {
           reviewFilesExpanded = false;
           errorMessage = null;
           input.value = "";
-          render();
-          void watchWorkSession(dispatch.workSessionId, view.lastSeq);
+          status.textContent = "Agent is working.";
+          selectWorkSession(dispatch.workSessionId);
         })
         .catch((err) => {
-          input.value = String(err instanceof Error ? err.message : err);
+          status.textContent = `Dispatch failed: ${err instanceof Error ? err.message : String(err)}`;
         })
         .finally(() => btn.removeAttribute("disabled"));
     });
 
-    agentBar.append(input, btn);
+    agentBar.append(input, btn, status);
   }
   return agentBar;
 }
@@ -1099,29 +1764,36 @@ function maybeAppendAgentBar(): void {
 // ── Legacy review card (non-work-session review surfaces) ──
 
 function renderReviewCard(card: ToolResultCard, display: ToolDisplay): void {
-  unmountPayload();
+  const surfaceKey = `review:${card.tool}:${String(card.summary?.submissionId ?? card.summary?.sessionId ?? "")}`;
+  ensureSurface(surfaceKey);
 
   const files = card.files ?? [];
   const summary = card.summary ?? {};
   const visibleFiles = reviewFilesExpanded ? files : files.slice(0, 3);
   const hiddenCount = Math.max(0, files.length - visibleFiles.length);
-  const main = element("main", { className: "shell" });
-  const section = element("section", { className: "tool-card review" });
-  const header = element("div", { className: "review-header" });
-  const icon = element("span", { className: "tool-icon", ariaHidden: "true" });
-  icon.innerHTML = display.icon;
-  const titleGroup = element("div", { className: "review-title-group" });
+  let dom = currentLegacyReviewDom;
+  if (!dom || dom.key !== surfaceKey) {
+    const main = element("main", { className: "shell" });
+    const section = element("section", { className: "tool-card review" });
+    const header = element("div", { className: "review-header" });
+    const icon = element("span", { className: "tool-icon", ariaHidden: "true" });
+    icon.innerHTML = display.icon;
+    const titleGroup = element("div", { className: "review-title-group" });
+    titleGroup.append(
+      element("span", { className: "tool-title", text: display.title }),
+      element("span", { className: "tool-label", text: display.label, title: display.label }),
+    );
+    header.append(icon, titleGroup, renderSummaryBadge(card));
+    const body = element("div", { className: "review-summary" });
+    const actions = element("div", { className: "review-actions" });
+    const feedback = element("div", { className: "review-feedback" });
+    section.append(header, body, actions, feedback);
+    main.append(section);
+    dom = { key: surfaceKey, main, body, actions, feedback };
+    currentLegacyReviewDom = dom;
+  }
 
-  titleGroup.append(
-    element("span", { className: "tool-title", text: display.title }),
-    element("span", { className: "tool-label", text: display.label, title: display.label }),
-  );
-  header.append(icon, titleGroup, renderSummaryBadge(card));
-
-  const body = element("div", { className: "review-summary" });
-  currentPayloadContainer = body;
-
-  const actions = element("div", { className: "review-actions" });
+  dom.actions.replaceChildren();
   if (hiddenCount > 0) {
     const showMore = element("button", {
       className: "review-action",
@@ -1132,28 +1804,33 @@ function renderReviewCard(card: ToolResultCard, display: ToolDisplay): void {
       reviewFilesExpanded = true;
       render();
     });
-    actions.append(showMore);
+    dom.actions.append(showMore);
   }
 
-  section.append(header, body);
-  if (actions.childElementCount > 0) {
-    section.append(actions);
+  const legacyKey = legacyReviewKey(card);
+  const legacyState = legacyFeedbackState.get(legacyKey);
+  const feedbackKey = `${legacyKey}:${legacyState?.submitted ? "submitted" : "form"}:${legacyState?.submitting ? "submitting" : "idle"}:${legacyState?.error ?? ""}`;
+  if (dom.feedbackKey !== feedbackKey) {
+    dom.feedback.replaceChildren();
+    if (card.tool === "submit_for_review" && !legacyState?.submitted && typeof card.summary?.sessionId === "string") {
+      dom.feedback.append(renderFeedbackFormForSession(card.summary.sessionId, card));
+    } else if (card.tool === "submit_for_review" && legacyState?.submitted) {
+      dom.feedback.append(renderFeedbackSubmittedGlobal());
+    }
+    dom.feedbackKey = feedbackKey;
   }
 
-  if (card.tool === "submit_for_review" && !feedbackSubmittedGlobal && typeof card.summary?.sessionId === "string") {
-    section.append(renderFeedbackFormForSession(card.summary.sessionId, card));
-  } else if (card.tool === "submit_for_review" && feedbackSubmittedGlobal) {
-    section.append(renderFeedbackSubmittedGlobal());
-  }
-
-  main.append(section);
-  appRoot.replaceChildren(main);
-  renderPayloadIfNeeded();
+  currentPayloadContainer = dom.body;
+  if (!dom.main.isConnected) appRoot.replaceChildren(dom.main);
+  renderPayloadIfNeeded(card, visibleFiles.length);
+  maybeAppendAgentBar();
 }
 
-let feedbackSubmittedGlobal = false;
-let feedbackSubmittingGlobal = false;
-let feedbackErrorGlobal: string | null = null;
+const legacyFeedbackState = new Map<string, { submitted: boolean; submitting: boolean; error?: string }>();
+
+function legacyReviewKey(card: ToolResultCard): string {
+  return String(card.summary?.submissionId ?? `${card.summary?.sessionId ?? "unknown"}:${card.tool}`);
+}
 
 function renderFeedbackFormForSession(sessionId: string, card: ToolResultCard): HTMLElement {
   const container = element("div", { className: "feedback-form" });
@@ -1163,8 +1840,9 @@ function renderFeedbackFormForSession(sessionId: string, card: ToolResultCard): 
   textarea.placeholder = "Tell the agent what to fix, or leave blank for a clean approve/reject.";
   textarea.rows = 3;
 
-  if (feedbackErrorGlobal) {
-    container.append(element("div", { className: "feedback-error", text: feedbackErrorGlobal }));
+  const state = legacyFeedbackState.get(legacyReviewKey(card)) ?? { submitted: false, submitting: false };
+  if (state.error) {
+    container.append(element("div", { className: "feedback-error", text: state.error }));
   }
 
   const buttonRow = element("div", { className: "feedback-buttons" });
@@ -1173,7 +1851,7 @@ function renderFeedbackFormForSession(sessionId: string, card: ToolResultCard): 
     const btn = element("button", { className: `feedback-btn ${cls}`, type: "button", text });
     // P1 #11: disable verdict buttons while a submission is in flight so the
     // reviewer cannot double-submit or fire overlapping feedback calls.
-    if (feedbackSubmittingGlobal) btn.disabled = true;
+    if (state.submitting) btn.disabled = true;
     btn.addEventListener("click", () => {
       submitFeedbackForSession(sessionId, card, verdict, textarea.value.trim() || undefined);
     });
@@ -1192,11 +1870,11 @@ function renderFeedbackFormForSession(sessionId: string, card: ToolResultCard): 
 
 async function submitFeedbackForSession(sessionId: string, card: ToolResultCard, verdict: string, comments?: string): Promise<void> {
   if (!sessionId || !app) return;
-  feedbackSubmittingGlobal = true;
-  feedbackErrorGlobal = null;
-  render();
+  const key = legacyReviewKey(card);
+  legacyFeedbackState.set(key, { submitted: false, submitting: true });
+  scheduleRender();
   try {
-    await app.callServerTool({
+    await callServerToolChecked({
       name: "provide_review_feedback",
       arguments: {
         sessionId,
@@ -1207,16 +1885,17 @@ async function submitFeedbackForSession(sessionId: string, card: ToolResultCard,
         comments,
       },
     });
-    feedbackSubmittedGlobal = true;
-    feedbackSubmittingGlobal = false;
-    render();
+    legacyFeedbackState.set(key, { submitted: true, submitting: false });
+    scheduleRender();
   } catch (err) {
     // P1 #11: surface the transport / worker execution failure instead of
     // swallowing it — the reviewer needs to know the feedback did not land.
-    feedbackSubmittingGlobal = false;
-    feedbackErrorGlobal =
-      "Failed to submit feedback: " + (err instanceof Error ? err.message : String(err));
-    render();
+    legacyFeedbackState.set(key, {
+      submitted: false,
+      submitting: false,
+      error: "Failed to submit feedback: " + (err instanceof Error ? err.message : String(err)),
+    });
+    scheduleRender();
   }
 }
 
@@ -1225,7 +1904,7 @@ function renderFeedbackSubmittedGlobal(): HTMLElement {
 }
 
 function renderApprovalCenterCard(card: ToolResultCard, display: ToolDisplay): void {
-  unmountPayload();
+  ensureSurface("approval-center");
   const main = element("main", { className: "shell" });
   const section = element("section", { className: "tool-card agent" });
   const header = element("div", { className: "review-header" });
@@ -1313,7 +1992,7 @@ async function submitFeedbackForSubmission(view: WorkSessionViewState, submissio
   render();
   try {
     if (verdict === "approve" && view.mission) {
-      const result = await app.callServerTool({
+      const result = await callServerToolChecked({
         name: "approve_supervised_work",
         arguments: { workSessionId: view.workSessionId, comments },
       });
@@ -1323,7 +2002,7 @@ async function submitFeedbackForSubmission(view: WorkSessionViewState, submissio
       }
       if (approval.packet) view.mission = approval.packet;
     } else {
-      await app.callServerTool({
+      await callServerToolChecked({
         name: "provide_review_feedback",
         arguments: {
           sessionId: view.workSessionId,
@@ -1355,10 +2034,10 @@ function renderFeedbackSubmitted(view: WorkSessionViewState): HTMLElement {
 
 function renderPolicyApproval(view: WorkSessionViewState, approval: PolicyApprovalView): HTMLElement {
   const item = element("div", { className: "approval-card" });
-  const title = element("div", { className: "approval-title", text: approval.tool });
+  const title = element("div", { className: "approval-title", text: approval.title ?? approval.tool });
   const detail = element("div", {
     className: "approval-detail",
-    text: approval.command ?? approval.path ?? approval.matchedPattern ?? approval.approvalKey ?? approval.approvalId,
+    text: approval.description ?? approval.command ?? approval.path ?? approval.matchedPattern ?? approval.approvalKey ?? approval.approvalId,
   });
   const buttons = element("div", { className: "feedback-buttons" });
   const options = approval.options?.length
@@ -1396,7 +2075,7 @@ async function submitPolicyApproval(
   }
   render();
   try {
-    await app.callServerTool({
+    await callServerToolChecked({
       name: "provide_policy_approval",
       arguments: { approvalId, decision },
     });
@@ -1560,6 +2239,20 @@ function toolNameFromMeta(result: CallToolResult): ToolName | undefined {
   return isToolName(tool) ? tool : undefined;
 }
 
+type ServerToolRequest = Parameters<App["callServerTool"]>[0];
+
+async function callServerToolChecked(request: ServerToolRequest): Promise<CallToolResult> {
+  if (!app) throw new Error("The MCP host connection is unavailable.");
+  const result = await app.callServerTool(request);
+  if (!result.isError) return result;
+  const message = result.content
+    .filter((block): block is { type: "text"; text: string } => block.type === "text")
+    .map((block) => block.text)
+    .join("\n")
+    .trim();
+  throw new Error(message || "The server rejected the tool call.");
+}
+
 function cardFromMeta(result: CallToolResult): Partial<ToolResultCard> | undefined {
   const meta = result._meta as Record<string, unknown> | undefined;
   const metaCard = meta?.card;
@@ -1579,6 +2272,11 @@ function element<K extends keyof HTMLElementTagNameMap>(
     title?: string;
     ariaHidden?: string;
     ariaExpanded?: string;
+    ariaLabel?: string;
+    ariaPressed?: string;
+    ariaLive?: string;
+    role?: string;
+    hidden?: boolean;
     disabled?: boolean;
   } = {},
 ): HTMLElementTagNameMap[K] {
@@ -1589,6 +2287,11 @@ function element<K extends keyof HTMLElementTagNameMap>(
   if (options.title !== undefined) node.title = options.title;
   if (options.ariaHidden !== undefined) node.setAttribute("aria-hidden", options.ariaHidden);
   if (options.ariaExpanded !== undefined) node.setAttribute("aria-expanded", options.ariaExpanded);
+  if (options.ariaLabel !== undefined) node.setAttribute("aria-label", options.ariaLabel);
+  if (options.ariaPressed !== undefined) node.setAttribute("aria-pressed", options.ariaPressed);
+  if (options.ariaLive !== undefined) node.setAttribute("aria-live", options.ariaLive);
+  if (options.role !== undefined) node.setAttribute("role", options.role);
+  if (options.hidden !== undefined) node.hidden = options.hidden;
   if (options.disabled !== undefined && "disabled" in node) {
     (node as HTMLButtonElement).disabled = options.disabled;
   }
@@ -1632,3 +2335,12 @@ function agentIcon(): string {
 function reviewIcon(): string {
   return iconSvg('<path d="M5 4h14v16H5z" /><path d="M8 8h8" /><path d="M8 12h5" /><path d="M8 16h7" />');
 }
+
+// Kept behind an explicit global test switch so jsdom can exercise the same
+// incremental workspace surface without opening an MCP transport. Production
+// boot remains side-effectful only in the browser entrypoint above.
+export const __workspaceAppTest = {
+  ensureWorkSessionView,
+  renderWorkSessionView,
+  reduceWorkSessionEvent,
+};

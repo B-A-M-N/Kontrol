@@ -1,4 +1,10 @@
-import type { AgentRegistryManager, PersistentAcpRun, AgentInfo } from "./acp-registry.js";
+import {
+  serializeFinalAcpResult,
+  truncateUtf8Tail,
+  type AgentRegistryManager,
+  type PersistentAcpRun,
+  type AgentInfo,
+} from "./acp-registry.js";
 import type { WorkspaceRegistry } from "./workspaces.js";
 import type { WorkSessionManager } from "./work-sessions.js";
 import {
@@ -39,12 +45,12 @@ export interface PeerDispatchResult {
 
 export async function dispatchToPeer(params: {
   agentUrl: string;
-  sharedSecret?: string;
+  adapterSecret?: string;
   body: Record<string, unknown>;
   timeoutMs?: number;
 }): Promise<PeerDispatchResult> {
   const headers: Record<string, string> = { "Content-Type": "application/json" };
-  Object.assign(headers, authHeadersForAgent(params.agentUrl, params.sharedSecret));
+  Object.assign(headers, authHeadersForAgent(params.agentUrl, params.adapterSecret));
 
   const response = await fetch(params.agentUrl.replace(/\/+$/, "") + "/runs", {
     method: "POST",
@@ -126,7 +132,7 @@ export interface HealthyAgentSelection {
  */
 export async function selectHealthyAgent(
   peers: AgentInfo[],
-  opts: { name?: string; role?: string; sharedSecret?: string },
+  opts: { name?: string; role?: string; adapterSecret?: string },
 ): Promise<HealthyAgentSelection> {
   const candidates = peers.filter((a) => {
     if (opts.name && a.name !== opts.name) return false;
@@ -135,7 +141,7 @@ export async function selectHealthyAgent(
   });
   const deadUrls: string[] = [];
   for (const peer of candidates) {
-    const probe = await probeAgent(peer.url, opts.sharedSecret);
+    const probe = await probeAgent(peer.url, opts.adapterSecret);
     if (probe.healthy) return { agent: peer, deadUrls };
     deadUrls.push(`${peer.url} (${probe.error ? probe.error : "HTTP " + probe.status})`);
   }
@@ -159,7 +165,8 @@ export interface GatewayConfig {
   agentRegistry: AgentRegistryManager;
   workspaces: WorkspaceRegistry;
   workSessions: WorkSessionManager;
-  sharedSecret?: string;
+  /** P0 #9: outbound adapter credential (KONTROL_ACP_ADAPTER_SECRET). */
+  adapterSecret?: string;
 }
 
 export interface AgentCallResult {
@@ -192,13 +199,13 @@ export async function cancelRemoteRun(
   const selection = await selectHealthyAgent(config.agentRegistry.listAlive(), {
     name: run.agentName,
     role: "agent",
-    sharedSecret: config.sharedSecret,
+    adapterSecret: config.adapterSecret,
   });
   if (!selection.agent) {
     return { acknowledged: false, error: `No healthy registered adapter for ${run.agentName}` };
   }
 
-  return cancelRemoteRunById(selection.agent.url, config.sharedSecret, run.remoteRunId);
+  return cancelRemoteRunById(selection.agent.url, config.adapterSecret, run.remoteRunId);
 }
 
 export async function cancelRemoteRunById(
@@ -236,6 +243,7 @@ export async function callRemoteAgent(
   params: {
     agentUrl: string;
     agentName: string;
+    agentId?: string;
     task: string;
     webhookUrl?: string;
     workspaceSessionId?: string;
@@ -273,6 +281,7 @@ export async function callRemoteAgent(
   } else {
     run = config.agentRegistry.createRun({
       agentName: params.agentName,
+      agentId: params.agentId,
       workspaceSessionId: params.workspaceSessionId,
       workSessionId: params.workSessionId,
       inputPreview: params.task.slice(0, 500),
@@ -305,6 +314,7 @@ export async function callRemoteAgent(
       workspace_root: workspace?.root,
       session_id: params.workSessionId,
       parent_run_id: run.runId,
+      agent_id: run.agentId,
       continuation_id: params.continuationId,
     };
 
@@ -316,7 +326,7 @@ export async function callRemoteAgent(
 
     const dispatched = await dispatchToPeer({
       agentUrl: params.agentUrl,
-      sharedSecret: config.sharedSecret,
+      adapterSecret: config.adapterSecret,
       body,
       timeoutMs: DEFAULT_ACP_TIMEOUT,
     });
@@ -344,7 +354,7 @@ export async function callRemoteAgent(
         TERMINAL_WORK_SESSION_STATUSES.has(currentSession.status);
 
       if (!runStillDispatchable || sessionTerminal) {
-        await cancelRemoteRunById(params.agentUrl, config.sharedSecret, remoteRunId);
+        await cancelRemoteRunById(params.agentUrl, config.adapterSecret, remoteRunId);
         const status = currentRun?.status ?? (sessionTerminal ? currentSession?.status : "failed") ?? "failed";
         return {
           runId: run.runId,
@@ -374,7 +384,7 @@ export async function callRemoteAgent(
           },
         );
         if (!updated) {
-          await cancelRemoteRunById(params.agentUrl, config.sharedSecret, remoteRunId);
+          await cancelRemoteRunById(params.agentUrl, config.adapterSecret, remoteRunId);
           const latest = config.agentRegistry.getRun(run.runId);
           return {
             runId: run.runId,
@@ -459,7 +469,7 @@ export async function callRemoteAgent(
     config.agentRegistry.updateRun(run.runId, {
       status,
       outputPreview: outputText.slice(0, 2000),
-      outputJson: JSON.stringify(result).slice(0, 10_000),
+      outputJson: serializeFinalAcpResult(result, outputText),
       errorMessage,
       finishedAt: new Date().toISOString(),
     });

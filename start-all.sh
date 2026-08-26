@@ -103,6 +103,33 @@ if ! npm run --silent typecheck; then
   echo "ERROR: typecheck failed. Aborting." >&2
   exit 1
 fi
+
+# P2 #28: startup profiles. KONTROL_STARTUP_PROFILE selects how much preflight
+# runs: dev-fast (typecheck+build, no full test suite), normal (typecheck +
+# full unit suite + build), release (everything plus the dirty-checkout guard,
+# i.e. KONTROL_RELEASE_MODE=true). Legacy env vars still honored.
+STARTUP_PROFILE="${KONTROL_STARTUP_PROFILE:-}"
+if [[ -z "$STARTUP_PROFILE" ]]; then
+  if [[ "${KONTROL_RELEASE_MODE:-false}" == "true" ]]; then STARTUP_PROFILE="release";
+  elif [[ "${KONTROL_SKIP_PREFLIGHT_TESTS:-false}" == "true" || "${KONTROL_USE_EXISTING_DIST:-false}" == "true" ]]; then STARTUP_PROFILE="dev-fast";
+  else STARTUP_PROFILE="normal"; fi
+fi
+case "$STARTUP_PROFILE" in
+  release|normal|dev-fast) ;;
+  *) echo "ERROR: unknown KONTROL_STARTUP_PROFILE '$STARTUP_PROFILE' (expected release|normal|dev-fast)." >&2; exit 1 ;;
+esac
+echo "[*] Startup profile: $STARTUP_PROFILE"
+
+if [[ "$STARTUP_PROFILE" == "release" ]]; then
+  # The profile is the authoritative release selector. Set the legacy guard
+  # variable too so the dirty-check below cannot be bypassed by selecting the
+  # profile instead of the older environment flag.
+  export KONTROL_RELEASE_MODE=true
+  export KONTROL_SKIP_PREFLIGHT_TESTS=false
+elif [[ "$STARTUP_PROFILE" == "dev-fast" ]]; then
+  export KONTROL_SKIP_PREFLIGHT_TESTS=true
+fi
+
 if [[ "${KONTROL_SKIP_PREFLIGHT_TESTS:-false}" == "true" ]]; then
   echo "[*] Skipping test suite because KONTROL_SKIP_PREFLIGHT_TESTS=true."
 else
@@ -139,6 +166,35 @@ echo "[*] Preflight + build passed."
 # --- Graceful stop: signal, wait, escalate (P1 #42: only our own sessions) ---
 echo "[*] Stopping any stale processes (graceful first)..."
 STALE_SESSIONS=("kontrol-adapter" "kontrol-adapter-crush" "kontrol-adapter-hermes" "kontrol-server" "kontrol-tunnel" "kontrol-supervisor")
+
+stop_owned_sessions() {
+  local session
+  for session in "${STALE_SESSIONS[@]}"; do
+    if tmux has-session -t "$session" 2>/dev/null; then
+      tmux send-keys -t "$session" C-c 2>/dev/null || true
+    fi
+  done
+  sleep 2
+  for session in "${STALE_SESSIONS[@]}"; do
+    if tmux has-session -t "$session" 2>/dev/null; then
+      tmux kill-session -t "$session" 2>/dev/null || true
+    fi
+  done
+}
+
+# A systemd unit owns this launcher, so SIGTERM must stop the tmux sessions it
+# created before the unit exits. This keeps service stop/restart deterministic
+# even when the tmux server is not a direct child of the launcher shell.
+systemd_shutdown() {
+  echo "[*] systemd stop requested; stopping owned Kontrol sessions..."
+  stop_owned_sessions
+  exit 0
+}
+
+if [[ "${KONTROL_SYSTEMD_SERVICE:-false}" == "true" ]]; then
+  trap systemd_shutdown TERM INT
+fi
+
 for s in "${STALE_SESSIONS[@]}"; do
   if tmux has-session -t "$s" 2>/dev/null; then
     tmux send-keys -t "$s" C-c 2>/dev/null || true
@@ -295,7 +351,7 @@ smoke_adapter() {
     local response
     response=$(curl -s --max-time 5 -X POST "http://127.0.0.1:${port}/runs" \
       -H "Content-Type: application/json" \
-      -H "Authorization: Bearer ${KONTROL_ACP_ADAPTER_SECRET:-}" \
+      -H "Authorization: Bearer ${KONTROL_ACP_ADAPTER_SECRET:-}" \\
       --data "$body" 2>/dev/null || echo "")
     if echo "$response" | grep -q '"smoke_test":true'; then ok=1; break; fi
     echo -n "."
@@ -435,7 +491,12 @@ SUPERVISOR_ARGS=(
 if [[ -n "${REQUIRED_AGENT_CONFIG:-}" ]]; then
   SUPERVISOR_ARGS+=(--agents "$REQUIRED_AGENT_CONFIG")
 fi
-tmux new-session -d -s kontrol-supervisor -c "$DESKTOP_PWD" "set -a && source .env && set +a && exec node '$DESKTOP_PWD/scripts/kontrol-supervisor.mjs' ${SUPERVISOR_ARGS[*]}"
+SUPERVISOR_ARGV_ESCAPED=()
+for supervisor_arg in "${SUPERVISOR_ARGS[@]}"; do
+  printf -v supervisor_arg_quoted '%q' "$supervisor_arg"
+  SUPERVISOR_ARGV_ESCAPED+=("$supervisor_arg_quoted")
+done
+tmux new-session -d -s kontrol-supervisor -c "$DESKTOP_PWD" "set -a && source .env && set +a && exec node scripts/kontrol-supervisor.mjs ${SUPERVISOR_ARGV_ESCAPED[*]}"
 LAUNCHED_SESSIONS+=("kontrol-supervisor")
 echo -n "[*] Waiting for component supervisor"
 SUPERVISOR_READY=0
@@ -468,4 +529,15 @@ if [[ "$START_HERMES_ADAPTER" == "true" || "$START_HERMES_ADAPTER" == "auto" ]];
 fi
 echo "  Tunnel:   http://127.0.0.1:8080/ui"
 echo "  Logs:     tmux attach -t kontrol-server | kontrol-adapter-crush | kontrol-adapter-hermes | kontrol-tunnel"
+
+if [[ "${KONTROL_SYSTEMD_SERVICE:-false}" == "true" ]]; then
+  # Keep Type=simple tied to the component supervisor. If it exits, the unit
+  # fails and systemd can restart the complete stack through this launcher.
+  echo "[*] systemd foreground mode: supervising tmux component lifecycle"
+  while tmux has-session -t kontrol-supervisor 2>/dev/null; do
+    sleep 5
+  done
+  echo "ERROR: component supervisor exited; systemd will restart the stack." >&2
+  exit 1
+fi
 echo "  Stop:     bash stop-all.sh"

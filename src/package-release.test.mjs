@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
+import { createServer as createNetServer } from "node:net";
 import {
   existsSync,
   mkdirSync,
@@ -39,12 +40,73 @@ try {
   assert.ok(existsSync(join(pkg, "dist/server.js")), "packed package is missing dist/server.js");
   assert.ok(existsSync(join(pkg, "dist/cli.js")), "packed package is missing dist/cli.js");
   assert.ok(existsSync(join(pkg, "dist/acp-worker-token.mjs")), "packed package is missing dist/acp-worker-token.mjs");
+  assert.ok(existsSync(join(pkg, "scripts/kontrol-user-service.sh")), "packed package is missing the generated systemd service installer");
   assert.equal(
     existsSync(join(pkg, "scripts/kontrol-acp-crush-adapter.service")),
     false,
     "fixed-path systemd units must not ship until service install generation exists",
   );
   assertUserFacingBranding(pkg);
+
+  // Verify the artifact as an installed product, not only as an extracted
+  // tarball. This catches missing runtime files and package-relative imports
+  // that the checkout's node_modules symlink would otherwise hide.
+  const installPrefix = join(tmp, "clean-prefix");
+  execFileSync("npm", [
+    "install",
+    "--prefix",
+    installPrefix,
+    "--no-audit",
+    "--no-fund",
+    "--package-lock=false",
+    tarball,
+  ], {
+    cwd: tmp,
+    env: {
+      ...process.env,
+      npm_config_cache: join(tmp, "npm-cache-install"),
+      npm_config_update_notifier: "false",
+    },
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const installedPkg = join(installPrefix, "node_modules", "@b-a-m-n", "kontrol");
+  const installedCli = join(installedPkg, "dist", "cli.js");
+  assert.ok(existsSync(installedCli), "clean install is missing dist/cli.js");
+  const installedVersion = execFileSync("node", [installedCli, "--version"], {
+    cwd: installPrefix,
+    encoding: "utf8",
+  }).trim();
+  assert.equal(installedVersion, packedPackageJson.version, "installed CLI reports the package version");
+
+  const servicePort = await unusedTcpPort();
+  const serviceState = join(tmp, "installed-state");
+  const service = spawn("node", [installedCli, "serve"], {
+    cwd: installPrefix,
+    env: {
+      ...process.env,
+      HOST: "127.0.0.1",
+      PORT: String(servicePort),
+      KONTROL_AUTH_MODE: "tunnel",
+      KONTROL_ALLOWED_ROOTS: installPrefix,
+      KONTROL_ALLOWED_HOSTS: "127.0.0.1,localhost",
+      KONTROL_PUBLIC_BASE_URL: `http://127.0.0.1:${servicePort}`,
+      KONTROL_STATE_DIR: serviceState,
+      KONTROL_WORKTREE_ROOT: join(tmp, "installed-worktrees"),
+      KONTROL_ACP_ENABLED: "false",
+      KONTROL_LOG_FORMAT: "pretty",
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let serviceStderr = "";
+  service.stderr?.on("data", (chunk) => { serviceStderr += String(chunk); });
+  try {
+    await waitForHttp(`http://127.0.0.1:${servicePort}/healthz`, service, () => serviceStderr);
+    assert.equal(service.exitCode, null, "installed server remains alive after binding");
+  } finally {
+    if (service.exitCode === null) service.kill("SIGTERM");
+    await waitForChild(service);
+  }
 
   const rootNodeModules = join(root, "node_modules");
   if (existsSync(rootNodeModules)) {
@@ -158,4 +220,40 @@ function extractTgz(tarball, destination) {
 
 function readFileSyncBuffer(path) {
   return readFileSync(path);
+}
+
+async function unusedTcpPort() {
+  const probe = createNetServer();
+  await new Promise((resolve, reject) => {
+    probe.once("error", reject);
+    probe.listen(0, "127.0.0.1", resolve);
+  });
+  const address = probe.address();
+  const port = typeof address === "object" && address ? address.port : 0;
+  await new Promise((resolve) => probe.close(resolve));
+  assert.ok(port > 0, "failed to allocate a test port");
+  return port;
+}
+
+async function waitForHttp(url, child, stderr) {
+  let lastError = "";
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (child.exitCode !== null) {
+      throw new Error(`installed server exited before readiness (${child.exitCode}): ${stderr()}`);
+    }
+    try {
+      const response = await fetch(url);
+      if (response.ok) return;
+      lastError = `HTTP ${response.status}`;
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error(`installed server did not become ready: ${lastError}; stderr=${stderr()}`);
+}
+
+async function waitForChild(child) {
+  if (child.exitCode !== null) return;
+  await new Promise((resolve) => child.once("close", resolve));
 }

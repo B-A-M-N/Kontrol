@@ -57,6 +57,21 @@ const environment = await manager.start({
 assert.equal(environment.running, false);
 assert.match(environment.output, /1,dumb,cat,cat,cat,1/);
 
+const previousSecret = process.env.KONTROL_ACP_WORKER_SECRET;
+process.env.KONTROL_ACP_WORKER_SECRET = "must-not-cross-process-boundary";
+try {
+  const stripped = await manager.start({
+    workspaceId: "workspace-a",
+    cwd: process.cwd(),
+    command: `${node} -e "console.log(process.env.KONTROL_ACP_WORKER_SECRET ?? 'missing')"`,
+    yieldTimeMs: 2_000,
+  });
+  assert.match(stripped.output, /missing/);
+} finally {
+  if (previousSecret === undefined) delete process.env.KONTROL_ACP_WORKER_SECRET;
+  else process.env.KONTROL_ACP_WORKER_SECRET = previousSecret;
+}
+
 const background = await manager.start({
   workspaceId: "workspace-a",
   cwd: process.cwd(),
@@ -65,7 +80,7 @@ const background = await manager.start({
 });
 assert.equal(background.running, true);
 assert.ok(background.sessionId);
-assert.equal(typeof background.sessionId, "number");
+assert.equal(typeof background.sessionId, "string");
 
 await assert.rejects(
   manager.write({
@@ -93,7 +108,7 @@ const interactive = await manager.start({
 });
 assert.equal(interactive.running, true);
 assert.ok(interactive.sessionId);
-assert.equal(typeof interactive.sessionId, "number");
+assert.equal(typeof interactive.sessionId, "string");
 
 const inputResult = await manager.write({
   workspaceId: "workspace-a",
@@ -212,5 +227,63 @@ try {
     assert.match(resizedPty.output, /columns:120/);
   }
 } finally {
-  manager.shutdown();
+  await manager.shutdown();
 }
+
+// Transport ownership and bounded lifecycle: a disconnected owner can clean
+// up all of its live children, and new owners cannot exceed the global pool.
+const bounded = new ProcessSessionManager({
+  maxRunningProcesses: 1,
+  maxRunningProcessesPerOwner: 1,
+  idleTimeoutMs: 10_000,
+  maxRuntimeMs: 10_000,
+  reaperIntervalMs: 25,
+});
+try {
+  const owned = await bounded.start({
+    workspaceId: "workspace-owned",
+    ownerId: "transport-owned",
+    cwd: process.cwd(),
+    command: `${node} -e "setInterval(() => {}, 1000)"`,
+    yieldTimeMs: 10,
+  });
+  assert.equal(owned.running, true);
+  assert.equal(bounded.getMetrics().running, 1);
+  await assert.rejects(
+    bounded.start({
+      workspaceId: "workspace-other",
+      ownerId: "transport-other",
+      cwd: process.cwd(),
+      command: `${node} -e "setInterval(() => {}, 1000)"`,
+      yieldTimeMs: 10,
+    }),
+    /Process session limit reached/,
+  );
+  await bounded.terminateByOwner("transport-owned");
+  assert.equal(bounded.getMetrics().running, 0);
+} finally {
+  await bounded.shutdown();
+}
+
+const reaped = new ProcessSessionManager({
+  maxRunningProcesses: 2,
+  maxRunningProcessesPerOwner: 2,
+  idleTimeoutMs: 40,
+  maxRuntimeMs: 10_000,
+  reaperIntervalMs: 10,
+});
+try {
+  await reaped.start({
+    workspaceId: "workspace-reaped",
+    ownerId: "transport-reaped",
+    cwd: process.cwd(),
+    command: `${node} -e "setInterval(() => {}, 1000)"`,
+    yieldTimeMs: 5,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.equal(reaped.getMetrics().running, 0, "idle process sessions are reaped");
+} finally {
+  await reaped.shutdown();
+}
+
+console.log("process-sessions.test.ts: all assertions passed");

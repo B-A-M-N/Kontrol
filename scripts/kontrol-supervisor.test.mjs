@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { FailureTracker, parseAgentSpecs } from "./kontrol-supervisor.mjs";
+import { allHealthy, FailureTracker, parseAgentSpecs } from "./kontrol-supervisor.mjs";
 
 const specs = parseAgentSpecs("cli-coding-agent=http://127.0.0.1:9877,hermes-agent=http://127.0.0.1:9911");
 assert.deepEqual(specs, [
@@ -16,5 +16,14 @@ assert.equal(tracker.consecutiveFailures, 0);
 assert.equal(tracker.lastHealthyAt, "2026-08-18T00:00:02.000Z");
 tracker.noteRestart("three consecutive failures");
 assert.equal(tracker.restartCount, 1);
+
+const probeStartedAt = performance.now();
+const health = await allHealthy("test", ["a", "b", "c"], async (url) => {
+  await new Promise((resolve) => setTimeout(resolve, 35));
+  return { ok: url !== "b", status: url === "b" ? 503 : 200 };
+});
+assert.ok(performance.now() - probeStartedAt < 90, "independent supervisor probes run concurrently");
+assert.equal(health.ok, false);
+assert.deepEqual(health.results.map((result) => result.status), [200, 503, 200]);
 
 console.log("kontrol-supervisor.test.mjs: all assertions passed");

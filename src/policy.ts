@@ -29,6 +29,20 @@ export type PolicyMode = "allow" | "deny" | "ask";
 export type PolicySource = "path" | "tool" | "default";
 export type ApprovalScope = "once" | "work_session" | "workspace";
 
+/**
+ * A path after workspace resolution. Keep both spellings so policy rules can
+ * be written portably (`src/server.ts`) or for an explicitly protected host
+ * location (`/srv/kontrol/workspaces/project/src/server.ts`). Callers that
+ * perform filesystem actions must populate this from the canonical resolved
+ * path, never directly from user input.
+ */
+export interface PolicyPath {
+  relativePath: string;
+  absolutePath: string;
+}
+
+export type PolicyInputPath = string | PolicyPath;
+
 export interface PolicyRule {
   type: "tool" | "path";
   pattern: string;
@@ -81,7 +95,7 @@ export interface GrantStore {
 }
 
 export interface PolicyEngine {
-  evaluate(tool: string, path: string | undefined, workspaceId: string): PolicyDecision;
+  evaluate(tool: string, path: PolicyInputPath | undefined, workspaceId: string): PolicyDecision;
   isApproved(principalId: string, key: string, ctx: ScopeContext): boolean;
   recordApproval(
     principalId: string,
@@ -92,6 +106,7 @@ export interface PolicyEngine {
   ): void;
   getPendingApprovals(workspaceId?: string): ToolApprovalRequest[];
   clearPending(approvalId: string): void;
+  resolvePending(approvalId: string, status: "approved" | "denied" | "expired" | "cancelled", reason?: string): void;
   addPending(request: ToolApprovalRequest): void;
 }
 
@@ -111,6 +126,24 @@ const CANONICAL_TOOLS = new Set([
   "bash",
   "apply_patch",
 ]);
+
+/**
+ * Single canonical tool-normalization map for POLICY purposes. Every surface
+ * that evaluates policy (MCP, ACP bridge, process sessions) must funnel its
+ * tool name through `canonicalTool` so aliases cannot bypass a bash rule:
+ *   - kontrol-shell / exec_command are shell execution -> "bash"
+ *   - mutating write_stdin (nonempty input) is handled by callers passing
+ *     "bash" explicitly; poll-only write_stdin stays read-only.
+ */
+export const CANONICAL_TOOL_ALIASES: Record<string, string> = {
+  "kontrol-shell": "bash",
+  "kontrol-read": "read",
+  "kontrol-write": "write",
+  "kontrol-edit": "edit",
+  "kontrol-grep": "grep",
+  "kontrol-glob": "glob",
+  exec_command: "bash",
+};
 
 export function parseMode(value: string | undefined): PolicyMode | undefined {
   if (!value) return undefined;
@@ -190,10 +223,14 @@ function globMatch(path: string, pattern: string): boolean {
 }
 
 function canonicalTool(tool: string): string {
-  return CANONICAL_TOOLS.has(tool) ? tool : tool;
+  return CANONICAL_TOOL_ALIASES[tool] ?? tool;
 }
 
-export function createPolicyEngine(config: PolicyConfig, grantStore?: GrantStore): PolicyEngine {
+export function createPolicyEngine(
+  config: PolicyConfig,
+  grantStore?: GrantStore,
+  approvalRequests?: ApprovalRequestManager,
+): PolicyEngine {
   // (principalId|scope|scopeId|approvalKey) -> true
   const sessionApprovals = new Map<string, boolean>();
   const pendingApprovals = new Map<string, ToolApprovalRequest>();
@@ -213,22 +250,32 @@ export function createPolicyEngine(config: PolicyConfig, grantStore?: GrantStore
 
   function evaluate(
     tool: string,
-    path: string | undefined,
+    path: PolicyInputPath | undefined,
     _workspaceId: string,
   ): PolicyDecision {
     const canon = canonicalTool(tool);
 
-    // Path rules first (most specific).
+    // Path rules first. A path can be matched in either its workspace-relative
+    // or canonical absolute form. Resolve the most-specific matching rule
+    // rather than trusting configuration order; ties retain declaration order
+    // for deterministic operator control.
     if (path) {
-      for (const rule of config.pathRules) {
-        if (globMatch(path, rule.pattern)) {
-          return {
-            mode: rule.mode,
-            approvalKey: `path:${rule.pattern}`,
-            source: "path",
-            matchedPattern: rule.pattern,
-          };
+      const candidates = pathCandidates(path);
+      let best: { index: number; specificity: number; pattern: string; mode: PolicyMode } | undefined;
+      for (const [index, rule] of config.pathRules.entries()) {
+        if (!candidates.some((candidate) => globMatch(candidate, rule.pattern))) continue;
+        const specificity = pathRuleSpecificity(rule.pattern);
+        if (!best || specificity > best.specificity) {
+          best = { index, specificity, pattern: rule.pattern, mode: rule.mode };
         }
+      }
+      if (best) {
+        return {
+          mode: best.mode,
+          approvalKey: `path:${best.pattern}`,
+          source: "path",
+          matchedPattern: best.pattern,
+        };
       }
     }
 
@@ -289,16 +336,59 @@ export function createPolicyEngine(config: PolicyConfig, grantStore?: GrantStore
   }
 
   function getPendingApprovals(workspaceId?: string): ToolApprovalRequest[] {
+    if (approvalRequests) {
+      return approvalRequests
+        .listPending(workspaceId)
+        .filter((request) => request.kind === "tool")
+        .map((request) => ({
+          id: request.approvalId,
+          principalId: request.principalId ?? "",
+          workspaceId: request.workspaceSessionId,
+          workSessionId: request.workSessionId,
+          tool: request.tool ?? "",
+          path: request.path,
+          command: request.command,
+          requestedAt: request.createdAt,
+        }));
+    }
     const all = Array.from(pendingApprovals.values());
     return workspaceId ? all.filter((r) => r.workspaceId === workspaceId) : all;
   }
 
   function clearPending(approvalId: string): void {
     pendingApprovals.delete(approvalId);
+    if (approvalRequests) approvalRequests.resolve(approvalId, { status: "cancelled", reason: "policy waiter closed" });
+  }
+
+  function resolvePending(
+    approvalId: string,
+    status: "approved" | "denied" | "expired" | "cancelled",
+    reason?: string,
+  ): void {
+    pendingApprovals.delete(approvalId);
+    if (approvalRequests) approvalRequests.resolve(approvalId, { status, reason });
   }
 
   function addPending(request: ToolApprovalRequest): void {
     pendingApprovals.set(request.id, request);
+    if (approvalRequests) {
+      approvalRequests.create({
+        approvalId: request.id,
+        kind: "tool",
+        workspaceSessionId: request.workspaceId,
+        workSessionId: request.workSessionId,
+        principalId: request.principalId,
+        title: `Approve ${request.tool}`,
+        tool: request.tool,
+        path: request.path,
+        command: request.command,
+        options: [
+          { id: "approve", label: "Approve Once", effect: "approve", scope: "once" },
+          { id: "approve_session", label: "Approve Session", effect: "approve", scope: "work_session" },
+          { id: "deny", label: "Deny", effect: "deny" },
+        ],
+      });
+    }
   }
 
   return {
@@ -307,6 +397,23 @@ export function createPolicyEngine(config: PolicyConfig, grantStore?: GrantStore
     recordApproval,
     getPendingApprovals,
     clearPending,
+    resolvePending,
     addPending,
   };
 }
+
+function pathCandidates(path: PolicyInputPath): string[] {
+  if (typeof path === "string") return [normalizePolicyPath(path)];
+  return [normalizePolicyPath(path.relativePath), normalizePolicyPath(path.absolutePath)];
+}
+
+function normalizePolicyPath(path: string): string {
+  return path.replaceAll("\\", "/").replace(/^\.\//, "");
+}
+
+function pathRuleSpecificity(pattern: string): number {
+  // Literal characters carry more specificity than wildcard characters. This
+  // makes `src/private/**` win over `src/**`, independent of declaration order.
+  return pattern.replace(/[?*]/g, "").length;
+}
+import type { ApprovalRequestManager } from "./approval-requests.js";

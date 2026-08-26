@@ -4,15 +4,22 @@ import { Router } from "express";
 import type { Request, Response } from "express";
 import type { WorkspaceRegistry } from "./workspaces.js";
 import type { WorkSessionManager } from "./work-sessions.js";
-import type { AgentRegistryManager, AgentInfo } from "./acp-registry.js";
+import {
+  serializeFinalAcpResult,
+  truncateUtf8Tail,
+  AgentRegistrationError,
+  type AgentRegistryManager,
+  type AgentInfo,
+} from "./acp-registry.js";
 import type { EventStore } from "./event-log.js";
 import type { ContinuationManager } from "./continuation.js";
 import type { ReviewCheckpointManager } from "./review-checkpoints.js";
 import type { ReviewWorkflowService } from "./review-workflow.js";
-import { cancelRemoteRun, dispatchToPeer, executeKontrolTool, selectHealthyAgent } from "./acp-gateway.js";
+import { cancelRemoteRun, dispatchToPeer, executeKontrolTool, isLoopbackAgentUrl, selectHealthyAgent } from "./acp-gateway.js";
 import { createPolicyEnforcer, type PolicyEnforcer, type PolicyInvocation, ACP_TOOL_POLICY_NAMES, type PrincipalRole } from "./policy-enforcement.js";
 import type { ApprovalRequestManager, ApprovalOption } from "./approval-requests.js";
 import { authorizeWorkSessionAction } from "./work-session-action-guard.js";
+import * as z from "zod/v4";
 
 /**
  * Long-poll window for a blocking agent permission request. This is NOT a
@@ -48,11 +55,48 @@ const MUTATING_LOCAL_AGENTS = new Set([
   "kontrol-submit-work-to-webui",
 ]);
 
+const acpRunRequestSchema = z.object({
+  agent_name: z.string().min(1),
+  input: z.array(z.object({
+    parts: z.array(z.object({ content: z.string().optional() }).passthrough()).optional(),
+  }).passthrough()).min(1),
+  mode: z.enum(["sync", "async", "stream"]).optional(),
+  session_id: z.string().min(1).optional(),
+  work_session_id: z.string().min(1).optional(),
+  workspace_id: z.string().min(1).optional(),
+  workspace_session_id: z.string().min(1).optional(),
+  webhook_url: z.string().min(1).optional(),
+}).passthrough();
+
+const agentRegistrationSchema = z.object({
+  name: z.string().min(1).max(200),
+  url: z.string().url(),
+  description: z.string().max(2_000).optional(),
+  publicKey: z.string().max(10_000).optional(),
+  capabilities: z.array(z.string().max(200)).max(100).optional(),
+  tags: z.array(z.string().max(100)).max(100).optional(),
+  ttlSeconds: z.number().int().min(10).max(31_536_000).optional(),
+  role: z.string().max(100).optional(),
+}).passthrough();
+
+const acpRunEventSchema = z.object({
+  remote_run_id: z.string().min(1).optional(),
+  work_session_id: z.string().min(1).optional(),
+  agent_id: z.string().min(1).optional(),
+  // P0 #7: adapters echo the dispatch attempt number. Events from a
+  // superseded attempt (an earlier continuation of the same logical run) are
+  // rejected so a late event from attempt N cannot mutate attempt N+1.
+  attempt_number: z.number().int().positive().optional(),
+  type: z.string().min(1),
+  payload: z.record(z.string(), z.unknown()).optional(),
+}).passthrough();
+
 export function createAcpServer(
   workspaces: WorkspaceRegistry,
   workSessions: WorkSessionManager,
   agentRegistry: AgentRegistryManager,
   sharedSecret?: string,
+  adapterSecret?: string,
   eventStore?: EventStore,
   continuationManager?: ContinuationManager,
   reviewCheckpoints?: ReviewCheckpointManager,
@@ -82,19 +126,35 @@ export function createAcpServer(
     return undefined;
   }
 
-  function authGate(req: Request, res: Response, allowedRoles: AcpRole[] = ["agent", "reviewer", "operator"]): boolean {
+  function authGate(req: Request, res: Response, allowedRoles: AcpRole[] = ["agent", "reviewer", "operator"]): AcpRole | undefined {
     if (!sharedSecret && !agentSecret && !reviewerSecret) {
       res.status(401).json({ error: { code: "unauthorized", message: "ACP is disabled: no shared secret configured" } });
-      return false;
+      return undefined;
     }
     const role = authenticateAcpRequest(req);
-    if (role && allowedRoles.includes(role)) return true;
+    if (role && allowedRoles.includes(role)) return role;
     if (role) {
       res.status(403).json({ error: { code: "forbidden", message: `ACP role ${role} is not allowed for this operation` } });
-      return false;
+      return undefined;
     }
     res.status(401).json({ error: { code: "unauthorized", message: "Missing or invalid authorization" } });
-    return false;
+    return undefined;
+  }
+
+  function requireAgentOwnership(
+    req: Request,
+    res: Response,
+    role: AcpRole,
+    expectedAgentId: string | undefined,
+  ): boolean {
+    if (role !== "agent") return true;
+    const presentedAgentId = req.header("x-kontrol-agent-id");
+    const presentedCredential = req.header("x-kontrol-agent-credential");
+    if (!expectedAgentId || presentedAgentId !== expectedAgentId || !agentRegistry.verifyAgentCredential(expectedAgentId, presentedCredential)) {
+      res.status(403).json({ error: { code: "forbidden", message: "Valid per-agent credential is required for this resource" } });
+      return false;
+    }
+    return true;
   }
 
   function emitSse(runId: string, event: string, data: unknown): void {
@@ -295,26 +355,93 @@ export function createAcpServer(
   // ── Agent Registration ──────────────────────────────
 
   router.post("/agents/register", (req, res) => {
-    if (!authGate(req, res, ["agent", "operator"])) return;
-    const { name, url, description, publicKey, capabilities, tags, ttlSeconds, role } = req.body;
-    if (!name || !url) {
-      res.status(400).json({ error: { code: "invalid_input", message: "name and url are required" } });
+    const role = authGate(req, res, ["agent", "operator"]);
+    if (!role) return;
+    const parsed = agentRegistrationSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: { code: "invalid_input", message: "Invalid agent registration", issues: parsed.error.issues } });
       return;
     }
+    const { name, url, description, publicKey, capabilities, tags, ttlSeconds, role: registeredRole } = parsed.data;
     // An agent secret must NOT allow self-registration as "client" or "reviewer".
     // Those roles are reserved for the WebUI / reviewer, which uses the reviewer secret.
-    if (role === "client" || role === "reviewer") {
+    if (registeredRole === "client" || registeredRole === "reviewer") {
       res.status(403).json({ error: { code: "forbidden", message: "Agent secret cannot register as client or reviewer" } });
       return;
     }
-    const agent = agentRegistry.register({ name, url, description, publicKey, capabilities, tags, ttlSeconds });
-    res.status(201).json(agent);
+    // P1 #10: the MVP local-agent path only accepts loopback endpoints.
+    // Kontrol would otherwise probe and dispatch to an arbitrary URL,
+    // turning agent registration into a generic internal-network fetcher.
+    // Remote peers require an explicit host allowlist (future work).
+    if (!isLoopbackAgentUrl(url)) {
+      res.status(400).json({ error: { code: "invalid_input", message: "ACP agent registrations must use a loopback URL (127.0.0.1, localhost, ::1). Remote peers are not supported in this release." } });
+      return;
+    }
+    try {
+      const agent = agentRegistry.register({
+        name,
+        url,
+        description,
+        publicKey,
+        capabilities,
+        tags,
+        ttlSeconds,
+        agentId: req.header("x-kontrol-agent-id") ?? undefined,
+        agentCredential: req.header("x-kontrol-agent-credential") ?? undefined,
+      });
+      res.status(201).json(agent);
+    } catch (error) {
+      if (error instanceof AgentRegistrationError) {
+        res.status(error.status).json({ error: { code: error.code, message: error.message } });
+        return;
+      }
+      throw error;
+    }
   });
 
   router.post("/agents/:id/heartbeat", (req, res) => {
-    if (!authGate(req, res, ["agent", "operator"])) return;
-    agentRegistry.heartbeat(req.params.id);
+    const role = authGate(req, res, ["agent", "operator"]);
+    if (!role) return;
+    if (!requireAgentOwnership(req, res, role, req.params.id)) return;
+    const credential = role === "agent" ? req.header("x-kontrol-agent-credential") ?? undefined : undefined;
+    if (!agentRegistry.heartbeat(req.params.id, credential)) {
+      res.status(404).json({ error: { code: "not_found", message: `Unknown agent: ${req.params.id}` } });
+      return;
+    }
     res.json({ ok: true });
+  });
+
+  router.post("/agents/:id/credential/rotate", (req, res) => {
+    const role = authGate(req, res, ["agent", "operator"]);
+    if (!role) return;
+    const presentedCredential = req.header("x-kontrol-agent-credential") ?? undefined;
+    try {
+      const agentCredential = agentRegistry.rotateAgentCredential(req.params.id, presentedCredential, role === "operator");
+      // This is the only response that contains the new raw credential. It is
+      // never persisted in the registry or written to logs.
+      res.json({ agentId: req.params.id, agentCredential });
+    } catch (error) {
+      if (error instanceof AgentRegistrationError) {
+        res.status(error.status).json({ error: { code: error.code, message: error.message } });
+        return;
+      }
+      throw error;
+    }
+  });
+
+  router.delete("/agents/:id/credential", (req, res) => {
+    const role = authGate(req, res, ["agent", "operator"]);
+    if (!role) return;
+    try {
+      agentRegistry.revokeAgentCredential(req.params.id, req.header("x-kontrol-agent-credential") ?? undefined, role === "operator");
+      res.status(204).end();
+    } catch (error) {
+      if (error instanceof AgentRegistrationError) {
+        res.status(error.status).json({ error: { code: error.code, message: error.message } });
+        return;
+      }
+      throw error;
+    }
   });
 
   router.delete("/agents/:id", (req, res) => {
@@ -328,28 +455,19 @@ export function createAcpServer(
   router.post("/runs", async (req: Request, res: Response) => {
     if (!authGate(req, res, ["reviewer", "operator"])) return;
 
-    const { agent_name, input, mode, session_id, work_session_id, workspace_id, workspace_session_id, webhook_url } = req.body as {
-      agent_name?: string;
-      input?: Array<{ parts?: Array<{ content?: string }> }>;
-      mode?: string;
-      session_id?: string;
-      work_session_id?: string;
-      workspace_id?: string;
-      workspace_session_id?: string;
-      webhook_url?: string;
-    };
-
-    if (!agent_name || !input?.length) {
-      res.status(400).json({ error: { code: "invalid_input", message: "agent_name and input are required" } });
+    const parsed = acpRunRequestSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: { code: "invalid_input", message: "Invalid ACP run request", issues: parsed.error.issues } });
       return;
     }
+    const { agent_name, input, mode, session_id, work_session_id, workspace_id, workspace_session_id, webhook_url } = parsed.data;
 
     const agent = agentMap.get(agent_name);
     if (!agent) {
       const selection = await selectHealthyAgent(agentRegistry.listAlive(), {
         name: agent_name,
         role: "agent",
-        sharedSecret,
+        adapterSecret: adapterSecret ?? sharedSecret,
       });
       if (!selection.agent) {
         const dead = selection.deadUrls.length
@@ -379,12 +497,12 @@ export function createAcpServer(
         return;
       }
 
-      const run = agentRegistry.createRun({ agentName: agent_name, workspaceSessionId: session.workspaceSessionId, workSessionId: session.id, inputPreview: taskText.slice(0, 500), webhookUrl: webhook_url, status: "running" });
+      const run = agentRegistry.createRun({ agentName: agent_name, agentId: peer.id, workspaceSessionId: session.workspaceSessionId, workSessionId: session.id, inputPreview: taskText.slice(0, 500), webhookUrl: webhook_url, status: "running" });
 
       try {
         const peerResp = await dispatchToPeer({
           agentUrl: peer.url,
-          sharedSecret,
+          adapterSecret: adapterSecret ?? sharedSecret,
           body: {
             agent_name,
             mode: mode ?? "async",
@@ -394,6 +512,7 @@ export function createAcpServer(
             workspace_session_id: session.workspaceSessionId,
             workspace_root: workspaceRoot,
             parent_run_id: run.runId,
+            agent_id: peer.id,
             webhook_url,
           },
           timeoutMs: 120_000,
@@ -407,7 +526,7 @@ export function createAcpServer(
         agentRegistry.updateRun(run.runId, {
           status: peerResp.status === 202 || peerResult.accepted === true ? "running" : "completed",
           remoteRunId,
-          outputJson: JSON.stringify(peerResult).slice(0, 10_000),
+          outputJson: serializeFinalAcpResult(peerResult),
           finishedAt: peerResp.status === 202 || peerResult.accepted === true ? undefined : new Date().toISOString(),
         });
         res.status(peerResp.status === 202 || mode === "async" ? 202 : 200).json({ ...peerResult, kontrol_run_id: run.runId, session_id: session.id });
@@ -764,9 +883,10 @@ export function createAcpServer(
     }
     const workSessionId = run.workSessionId;
     // Resolve the correlated work session and delegate to the authoritative
-    // workflow so the session transitions to `cancelled` and emits exactly one
-    // canonical agent.run.cancelled terminal event (P2 #2).
-    let remoteCancellation: unknown = undefined;
+    // workflow. Cancellation first enters `cancelling`; the checkout lease and
+    // logical run remain fenced until the worker reports that it actually
+    // stopped.
+    let remoteCancellation: Awaited<ReturnType<typeof cancelRemoteRun>> | undefined;
     if (workSessionId && reviewWorkflow) {
       try {
         await reviewWorkflow.cancelSession({ sessionId: workSessionId, reason: "cancelled via ACP" });
@@ -779,21 +899,25 @@ export function createAcpServer(
         }
       }
     } else {
-      agentRegistry.updateRun(run.runId, { status: "cancelled", finishedAt: new Date().toISOString() });
+      agentRegistry.updateRun(run.runId, { status: "cancelling" });
       if (workSessionId) {
         eventStore?.appendEvent({
-          type: "agent.run.cancelled",
+          type: "agent.run.cancellation_requested",
           sessionId: workSessionId,
           payload: { runId: run.runId, reason: "cancelled via ACP" },
         });
       }
     }
     remoteCancellation = await cancelRemoteRun(
-      { agentRegistry, workspaces, workSessions, sharedSecret },
+      { agentRegistry, workspaces, workSessions, adapterSecret: adapterSecret ?? sharedSecret },
       run,
     );
-    emitSse(run.runId, "run.cancelled", { run_id: run.runId, status: "cancelled" });
-    res.status(202).json({ run_id: run.runId, status: "cancelled", remote_cancellation: remoteCancellation, output: [], created_at: run.createdAt, finished_at: new Date().toISOString() });
+    if (workSessionId && reviewWorkflow && (!run.remoteRunId || (!remoteCancellation.acknowledged && remoteCancellation.status === 404))) {
+      await reviewWorkflow.finalizeCancellation({ sessionId: workSessionId, reason: "no live worker remained" });
+    }
+    const finalRun = agentRegistry.getRun(run.runId);
+    emitSse(run.runId, "run.cancelled", { run_id: run.runId, status: finalRun?.status ?? "cancelling" });
+    res.status(202).json({ run_id: run.runId, status: finalRun?.status ?? "cancelling", remote_cancellation: remoteCancellation, output: [], created_at: run.createdAt, finished_at: finalRun?.finishedAt });
   });
 
   // ── Adapter → Kontrol lifecycle events ──────────────
@@ -966,25 +1090,60 @@ export function createAcpServer(
   }
 
   router.post("/runs/:run_id/events", async (req, res) => {
-    if (!authGate(req, res, ["agent", "operator"])) return;
+    const role = authGate(req, res, ["agent", "operator"]);
+    if (!role) return;
 
     const run = agentRegistry.getRun(req.params.run_id);
     if (!run) { res.status(404).json({ error: { code: "not_found", message: "Run not found" } }); return; }
 
-    const body = req.body as {
-      remote_run_id?: string;
-      work_session_id?: string;
-      type?: string;
-      payload?: Record<string, unknown>;
-    };
+    const parsedEvent = acpRunEventSchema.safeParse(req.body);
+    if (!parsedEvent.success) {
+      res.status(400).json({ error: { code: "invalid_input", message: "Invalid ACP lifecycle event", issues: parsedEvent.error.issues } });
+      return;
+    }
+    const body = parsedEvent.data;
 
     if (!body.type || (!ADAPTER_EVENT_TYPE_TO_RUN[body.type] && !APPROVAL_EVENT_TYPES.has(body.type))) {
       res.status(400).json({ error: { code: "invalid_input", message: "unknown or missing event type" } });
       return;
     }
     // The adapter must report the same work session the run was created for.
-    if (body.work_session_id && run.workSessionId && body.work_session_id !== run.workSessionId) {
+    if (run.workSessionId && body.work_session_id !== run.workSessionId) {
       res.status(409).json({ error: { code: "conflict", message: "work_session_id does not match run" } });
+      return;
+    }
+    if (role === "agent") {
+      // Agent ownership is header-bound; accepting the body copy here would
+      // let a caller choose which registered identity it claims to be.
+      if (!requireAgentOwnership(req, res, role, run.agentId)) return;
+      if (body.agent_id && body.agent_id !== run.agentId) {
+        res.status(403).json({ error: { code: "forbidden", message: "agent_id does not match the bound run" } });
+        return;
+      }
+    }
+
+    // P0 #7: bind lifecycle events to the exact dispatch attempt. An event
+    // from a superseded attempt is recorded diagnostically and idempotently
+    // acked — it must never mutate the current attempt's state.
+    if (body.attempt_number !== undefined && run.attemptNumber !== undefined && body.attempt_number !== run.attemptNumber) {
+      eventStore?.appendEvent({
+        type: "agent.event.stale_attempt",
+        sessionId: run.workSessionId ?? run.workspaceSessionId ?? "",
+        payload: {
+          runId: run.runId,
+          eventAttempt: body.attempt_number,
+          currentAttempt: run.attemptNumber,
+          eventType: body.type,
+          remoteRunId: body.remote_run_id,
+        },
+      }, { publish: false });
+      res.status(202).json({ run_id: run.runId, status: run.status, ignored: true, stale_attempt: true });
+      return;
+    }
+
+    // P0 #7: remote_run_id is immutable once attached to the current attempt.
+    if (body.remote_run_id && run.remoteRunId && body.remote_run_id !== run.remoteRunId) {
+      res.status(409).json({ error: { code: "conflict", message: `remote_run_id does not match the attached execution attempt (${run.remoteRunId})` } });
       return;
     }
 
@@ -1029,7 +1188,7 @@ export function createAcpServer(
         workspaceSessionId,
         workSessionId: sessionId,
         runId: run.runId,
-        agentId: run.agentName,
+        agentId: run.agentId ?? run.agentName,
         title: stringPayload(payload.title) ?? stringPayload(payload.tool) ?? "Agent approval requested",
         description: stringPayload(payload.description) ?? stringPayload(payload.message),
         risk: stringPayload(payload.risk),
@@ -1078,10 +1237,24 @@ export function createAcpServer(
       return;
     }
 
+    // P0 #8: terminal logical-run states are MONOTONIC. Once a run reaches
+    // approved/rejected/cancelled/failed/failed_protocol, no later lifecycle
+    // event may move it to another terminal state (a late `failed` must not
+    // overwrite an `approved` run). Exact duplicate terminal delivery is an
+    // idempotent ack; any other late terminal event is recorded and ignored.
     const terminalRunStatus = new Set(["approved", "rejected", "cancelled", "failed", "failed_protocol"]);
-    if (terminalRunStatus.has(run.status) && body.type !== "completed" && body.type !== "failed") {
-      // Harmless duplicate terminal delivery — ignore but ack.
-      res.status(202).json({ run_id: run.runId, status: run.status, ignored: true });
+    const duplicateDelivery = body.type === "completed" && run.status === "approved";
+    if (terminalRunStatus.has(run.status)) {
+      if (duplicateDelivery) {
+        res.status(202).json({ run_id: run.runId, status: run.status, ignored: true, duplicate: true });
+        return;
+      }
+      eventStore?.appendEvent({
+        type: "agent.event.after_terminal",
+        sessionId: run.workSessionId ?? run.workspaceSessionId ?? "",
+        payload: { runId: run.runId, runStatus: run.status, eventType: body.type },
+      }, { publish: false });
+      res.status(202).json({ run_id: run.runId, status: run.status, ignored: true, terminal_monotonic: true });
       return;
     }
 
@@ -1098,6 +1271,17 @@ export function createAcpServer(
       workerLeaseUntil: body.type === "started" || body.type === "heartbeat"
         ? new Date(Date.now() + 30_000).toISOString()
         : run.workerLeaseUntil,
+      ...(body.type === "completed" || body.type === "failed" || body.type === "cancelled"
+        ? (() => {
+            const finalOutput = stringPayload(body.payload?.final_output);
+            return finalOutput === undefined
+              ? {}
+              : {
+                  outputPreview: finalOutput.slice(0, 2000),
+                  outputJson: serializeFinalAcpResult({}, finalOutput),
+                };
+          })()
+        : {}),
     });
 
     // Renew the CHECKOUT lease from the same worker heartbeat. The worker lease
@@ -1141,7 +1325,7 @@ export function createAcpServer(
     } else if (body.type === "cancelled") {
       const session = sessionId ? workSessions.get(sessionId) : undefined;
       if (session && !TERMINAL_SESSION_STATUSES.has(session.status) && reviewWorkflow) {
-        await reviewWorkflow.cancelSession({ sessionId: session.id, reason: stringPayload(body.payload?.message) ?? "worker cancelled" });
+        await reviewWorkflow.finalizeCancellation({ sessionId: session.id, reason: stringPayload(body.payload?.message) ?? "worker cancelled" });
       } else {
         agentRegistry.updateRun(run.runId, { status: "cancelled", finishedAt: now, workerLeaseUntil: null });
       }
@@ -1183,7 +1367,14 @@ export function createAcpServer(
       }
     }
 
-    res.status(202).json({ run_id: run.runId, status: run.status, accepted: true });
+    const finalRun = agentRegistry.getRun(run.runId);
+    const finalSession = finalRun?.workSessionId ? workSessions.get(finalRun.workSessionId) : undefined;
+    res.status(202).json({
+      run_id: run.runId,
+      status: finalRun?.status ?? run.status,
+      work_session_status: finalSession?.status,
+      accepted: true,
+    });
   });
 
   // GET /session/{session_id}
@@ -1205,7 +1396,7 @@ export function createAcpServer(
       createdAt: session.createdAt,
       updatedAt: session.updatedAt,
       submissionCount: submissions.length,
-      feedbackCount: submissions.filter((s) => s.feedback).length,
+      feedbackCount: workSessions.countFeedback(session.id),
       latestSubmission: session.latestSubmission,
       latestFeedback: session.latestFeedback,
       recentToolEvents: toolEvents.slice(0, 10),
@@ -1214,12 +1405,14 @@ export function createAcpServer(
   });
 
   router.get("/approvals/:approval_id", (req, res) => {
-    if (!authGate(req, res, ["agent", "reviewer", "operator"])) return;
+    const role = authGate(req, res, ["agent", "reviewer", "operator"]);
+    if (!role) return;
     const approval = approvalRequests?.get(req.params.approval_id);
     if (!approval) {
       res.status(404).json({ error: { code: "not_found", message: "Approval request not found" } });
       return;
     }
+    if (!requireAgentOwnership(req, res, role, approval.agentId)) return;
     res.json(approvalToEventPayload(approval));
   });
 
@@ -1230,7 +1423,8 @@ export function createAcpServer(
   // simply re-parks — the human may be away for hours, exactly like the CLI
   // coding agents. A resolved approval returns its decision immediately.
   router.get("/approvals/:approval_id/decision", async (req, res) => {
-    if (!authGate(req, res, ["agent", "operator"])) return;
+    const role = authGate(req, res, ["agent", "operator"]);
+    if (!role) return;
     if (!approvalRequests) {
       res.status(500).json({ error: { code: "server_error", message: "Approval request store unavailable" } });
       return;
@@ -1240,6 +1434,7 @@ export function createAcpServer(
       res.status(404).json({ error: { code: "not_found", message: "Approval request not found" } });
       return;
     }
+    if (!requireAgentOwnership(req, res, role, approval.agentId)) return;
 
     const decisionFor = (a: NonNullable<ReturnType<ApprovalRequestManager["get"]>>) => {
       const resolution = a.resolution ?? {};

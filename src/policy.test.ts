@@ -9,12 +9,14 @@ import { createSqliteGrantStore } from "./policy-grants.js";
 import { createEventStore } from "./event-log.js";
 import { createWorkSessionManager } from "./work-sessions.js";
 import { createPolicyEnforcer } from "./policy-enforcement.js";
+import { createApprovalRequestManager } from "./approval-requests.js";
 
 const root = mkdtempSync(join(tmpdir(), "kontrol-policy-test-"));
 const db = openDatabase(root);
 const eventStore = createEventStore(db);
 const workSessions = createWorkSessionManager(db);
 const grantStore = createSqliteGrantStore(db);
+const approvalRequests = createApprovalRequestManager(db);
 
 const WS = "ws-test";
 
@@ -98,11 +100,54 @@ assert.equal(d2.mode, "ask");
 assert.equal(d2.approvalKey, "tool:write");
 assert.equal(d2.source, "tool");
 
+// Path rules match both canonical spellings and the most-specific rule wins,
+// regardless of declaration order.
+const specificPolicy = createPolicyEngine({
+  defaultMode: "allow",
+  toolRules: {},
+  pathRules: [
+    { pattern: "src/**", mode: "deny" },
+    { pattern: "src/private/**", mode: "allow" },
+  ],
+});
+const specificDecision = specificPolicy.evaluate("write", {
+  relativePath: "src/private/credentials.ts",
+  absolutePath: "/workspace/src/private/credentials.ts",
+}, WS);
+assert.equal(specificDecision.mode, "allow");
+assert.equal(specificDecision.approvalKey, "path:src/private/**");
+
 const policyDefault = createPolicyEngine({ defaultMode: "ask", toolRules: {}, pathRules: [] });
 const d3 = policyDefault.evaluate("write", "unmatched.ts", WS);
 assert.equal(d3.mode, "ask");
 assert.equal(d3.approvalKey, "default:write");
 assert.equal(d3.source, "default");
+
+// ── Test 3b: policy asks survive a manager/engine restart ──
+
+const durablePolicy = createPolicyEngine(
+  { defaultMode: "ask", toolRules: { write: "ask" }, pathRules: [] },
+  undefined,
+  approvalRequests,
+);
+durablePolicy.addPending({
+  id: "pol_durable_restart",
+  principalId: "principal-durable",
+  workspaceId: WS,
+  workSessionId: "wsess-durable",
+  tool: "write",
+  path: "durable.txt",
+  requestedAt: new Date().toISOString(),
+});
+const approvalManagerAfterRestart = createApprovalRequestManager(db);
+const restartedPolicy = createPolicyEngine(
+  { defaultMode: "ask", toolRules: { write: "ask" }, pathRules: [] },
+  undefined,
+  approvalManagerAfterRestart,
+);
+assert.equal(restartedPolicy.getPendingApprovals(WS)[0]?.id, "pol_durable_restart");
+restartedPolicy.resolvePending("pol_durable_restart", "approved", "test restart recovery");
+assert.equal(approvalManagerAfterRestart.get("pol_durable_restart")?.status, "approved");
 
 // ── Test 3: isApproved uses canonical keys ──
 
@@ -200,6 +245,65 @@ for (const pending of pendingReplays) {
 }
 assert.deepEqual((await Promise.all([firstReplay, secondReplay])).map((result) => result.allowed), [true, true]);
 
+// ── Test 9: approval emitted in the append/wait gap is not lost ──
+
+const racePolicy = createPolicyEngine({ defaultMode: "ask", toolRules: { write: "ask" }, pathRules: [] });
+const raceEnforcer = createPolicyEnforcer(racePolicy, eventStore, { timeoutMs: 250 });
+const originalDurableWait = eventStore.waitForMatchingEventAfter;
+let injectedRaceApproval = false;
+(eventStore as any).waitForMatchingEventAfter = async (
+  sessionId: string,
+  afterSeq: number,
+  predicate: (event: any) => boolean,
+  timeoutMs: number,
+) => {
+  if (!injectedRaceApproval) {
+    injectedRaceApproval = true;
+    const request = racePolicy.getPendingApprovals("ws-race")[0];
+    assert.ok(request);
+    eventStore.appendEvent({
+      type: "policy.approval.provided",
+      sessionId,
+      payload: { approvalId: request.id, decision: "approve", scope: "once" },
+    });
+  }
+  return originalDurableWait(sessionId, afterSeq, predicate, timeoutMs);
+};
+try {
+  const raceResult = await raceEnforcer.enforce({
+    principalId: "race-principal",
+    principalRole: "client",
+    workspaceId: "ws-race",
+    tool: "write",
+    path: "race.txt",
+  });
+  assert.equal(raceResult.allowed, true, "durable reread catches an approval emitted before waiter setup");
+  assert.equal(raceResult.outcome, "approved");
+} finally {
+  (eventStore as any).waitForMatchingEventAfter = originalDurableWait;
+}
+
 db.close();
+
+// ── P0 #1 regression: shell aliases must produce IDENTICAL decisions ──
+// default=allow + bash=deny: exec_command/kontrol-shell evaluate to bash.
+{
+  const denyBash = createPolicyEngine({ defaultMode: "allow", toolRules: { bash: "deny" }, pathRules: [] });
+  for (const alias of ["bash", "exec_command", "kontrol-shell"]) {
+    const decision = denyBash.evaluate(alias, undefined, WS);
+    assert.equal(decision.mode, "deny", `alias ${alias} must be gated by the bash rule`);
+    assert.equal(decision.approvalKey, "tool:bash", `alias ${alias} must use the canonical bash approval key`);
+  }
+  // default=allow + bash=ask: same canonical key so one approval covers all aliases.
+  const askBash = createPolicyEngine({ defaultMode: "allow", toolRules: { bash: "ask" }, pathRules: [] });
+  const viaBash = askBash.evaluate("bash", undefined, WS);
+  const viaExec = askBash.evaluate("exec_command", undefined, WS);
+  const viaShell = askBash.evaluate("kontrol-shell", undefined, WS);
+  assert.equal(viaBash.mode, "ask");
+  assert.equal(viaExec.mode, "ask", "exec_command inherits the bash ask rule");
+  assert.equal(viaShell.mode, "ask", "kontrol-shell inherits the bash ask rule");
+  assert.equal(viaBash.approvalKey, viaExec.approvalKey);
+  assert.equal(viaBash.approvalKey, viaShell.approvalKey);
+}
 
 console.log("policy.test.ts: all assertions passed");

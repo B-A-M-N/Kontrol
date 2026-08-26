@@ -39,7 +39,6 @@ try {
     submissionId: "sub-old",
     snapshotCommit: "snap-old",
     status: "passed",
-    source: "reviewer_manual_attestation",
     command: "npm test",
     details: { exitCode: 0 },
   }]);
@@ -47,12 +46,11 @@ try {
   assert.equal(approval.allowed, false);
   assert.match(approval.reasons.join("\n"), /no current non-agent evidence/);
 
-  ledger.recordEvidence(mission.id, [{
+  ledger.recordAgentEvidence(mission.id, [{
     criterionId: "crit-tests",
     submissionId: "sub-current",
     snapshotCommit: "snap-current",
     status: "passed",
-    source: "agent_claim",
     command: "npm test",
     details: { claimed: true },
   }]);
@@ -64,7 +62,6 @@ try {
     submissionId: "sub-current",
     snapshotCommit: "snap-current",
     status: "passed",
-    source: "reviewer_manual_attestation",
     command: "npm test",
     reviewEpoch: 1,
     details: { exitCode: 0 },
@@ -77,7 +74,6 @@ try {
     snapshotCommit: "snap-current",
     reviewEpoch: 2,
     status: "passed",
-    source: "reviewer_manual_attestation",
     command: "npm test",
     details: { exitCode: 0 },
   }]);
@@ -140,10 +136,79 @@ try {
   const oosApproval = ledger.canApprove(loopSession.id);
   assert.ok(!oosApproval.reasons.some((r) => r.includes(oos.id)), "out_of_scope finding must not block");
 
+  const [deduped] = ledger.addFindings(loopMission.id, [{
+    description: "Parser crashes on null input",
+    requiredAction: "handle null input",
+    severity: "high",
+    evidence: [{ path: "src/parser.ts", line: 12 }],
+  }]);
+  const duplicate = ledger.addFindings(loopMission.id, [{
+    description: " parser   crashes on NULL input ",
+    requiredAction: "handle null input",
+    severity: "blocker",
+    evidence: [{ path: "src/parser.ts", line: 18 }],
+  }]);
+  assert.equal(duplicate.length, 0, "semantically identical open findings should not create another row");
+  const merged = ledger.getPacket(loopSession.id).findings.find((finding) => finding.id === deduped.id);
+  assert.equal(merged?.severity, "blocker", "duplicate evidence can raise severity");
+  assert.equal(merged?.evidence.length, 2, "duplicate finding evidence is merged onto the canonical row");
+  const advisory = ledger.addFindings(loopMission.id, [{
+    description: "Consider documenting parser inputs",
+    requiredAction: "document parser inputs",
+    severity: "high",
+    disposition: "advisory",
+  }]);
+  assert.ok(advisory[0]);
+  assert.ok(!ledger.canApprove(loopSession.id).reasons.some((r) => r.includes(advisory[0].id)), "advisory findings do not block approval");
+
   // A round with no new blocking findings has converged — no extension.
   const converged = ledger.evaluateLoopExtension(loopSession.id, { newFindingIds: [] });
   assert.equal(converged.extend, false);
   assert.match(converged.reason, /converged/);
+
+  // P2 #34/#35: review-coverage contract. A mission declaring coverage lenses
+  // blocks approval until a completion report records every lens as covered;
+  // uncertainty is persisted alongside for honest review termination.
+  const covSession = workSessions.create({
+    workspaceSessionId: "workspace-1",
+    submittedBy: "webui",
+    title: "coverage test",
+    completionPolicy: "webui_approval_required",
+  });
+  const covMission = ledger.createMission({
+    workSessionId: covSession.id,
+    workspaceSessionId: "workspace-1",
+    objective: "Audit the repo",
+    acceptanceCriteria: [{ id: "cov-crit", description: "Audit complete", priority: "required", verificationType: "manual_review" }],
+    reviewCoverage: ["security", "correctness"],
+  });
+  ledger.recordReviewCoverage(covMission.id, {
+    submissionId: "sub_cov",
+    snapshotCommit: "snap_cov",
+    reviewCoverage: ["security"],
+    uncertainty: [{ area: "performance", level: "not inspected" }],
+  });
+  const partial = ledger.canApprove(covSession.id, { submissionId: "sub_cov", snapshotCommit: "snap_cov" });
+  assert.ok(partial.reasons.some((r) => r.includes("correctness")), "missing coverage lens must block approval");
+  assert.ok(!partial.reasons.some((r) => r.includes("security")), "covered lens must not block");
+  ledger.recordReviewCoverage(covMission.id, {
+    submissionId: "sub_cov",
+    snapshotCommit: "snap_cov",
+    reviewCoverage: ["correctness"],
+  });
+  const covered = ledger.canApprove(covSession.id, { submissionId: "sub_cov", snapshotCommit: "snap_cov" });
+  assert.ok(!covered.reasons.some((r) => r.includes("Review coverage is incomplete")), "all lenses covered → no coverage reason");
+
+  // P1 #14: both orderings produce identical approval semantics — a later
+  // verification report must MERGE prior coverage, not displace it.
+  ledger.recordCompletionReport(covMission.id, {
+    submissionId: "sub_cov",
+    snapshotCommit: "snap_cov",
+    status: "passed",
+    results: [{ command: "npm test", status: "passed" }],
+  });
+  const afterVerify = ledger.canApprove(covSession.id, { submissionId: "sub_cov", snapshotCommit: "snap_cov" });
+  assert.ok(!afterVerify.reasons.some((r) => r.includes("Review coverage is incomplete")), "verification report must preserve earlier reviewer coverage");
 
   // A new blocking in-scope finding extends the loop (round 1).
   const [blk1] = ledger.addFindings(loopMission.id, [

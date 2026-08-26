@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq, sql } from "drizzle-orm";
 import { openDatabase, type DatabaseHandle } from "./db/client.js";
 import { approvalRequests, type ApprovalRequestRow } from "./db/schema.js";
 
@@ -20,6 +20,7 @@ export interface ApprovalRequest {
   workSessionId?: string;
   runId?: string;
   agentId?: string;
+  principalId?: string;
   title: string;
   description?: string;
   risk?: string;
@@ -35,11 +36,14 @@ export interface ApprovalRequest {
 }
 
 export interface CreateApprovalRequestInput {
+  /** Optional caller-supplied ID used when a legacy waiter already published it. */
+  approvalId?: string;
   kind: ApprovalKind;
   workspaceSessionId: string;
   workSessionId?: string;
   runId?: string;
   agentId?: string;
+  principalId?: string;
   title: string;
   description?: string;
   risk?: string;
@@ -54,7 +58,9 @@ export interface ApprovalRequestManager {
   create(input: CreateApprovalRequestInput): ApprovalRequest;
   get(id: string): ApprovalRequest | undefined;
   listPending(workspaceSessionId?: string): ApprovalRequest[];
-  resolve(id: string, input: { status: ApprovalStatus; optionId?: string; reason?: string; reviewerId?: string }): ApprovalRequest | undefined;
+  /** Atomically move expired pending requests to expired. */
+  expirePending(now?: string): ApprovalRequest[];
+  resolve(id: string, input: { status: ApprovalStatus; optionId?: string; effect?: ApprovalOption["effect"]; reason?: string; reviewerId?: string }): ApprovalRequest | undefined;
   close(): void;
 }
 
@@ -67,12 +73,13 @@ export function createApprovalRequestManager(
   function create(input: CreateApprovalRequestInput): ApprovalRequest {
     const now = new Date().toISOString();
     const request: ApprovalRequest = {
-      approvalId: `apr_${randomUUID()}`,
+      approvalId: input.approvalId ?? `apr_${randomUUID()}`,
       kind: input.kind,
       workspaceSessionId: input.workspaceSessionId,
       workSessionId: input.workSessionId,
       runId: input.runId,
       agentId: input.agentId,
+      principalId: input.principalId,
       title: input.title,
       description: input.description,
       risk: input.risk,
@@ -92,6 +99,7 @@ export function createApprovalRequestManager(
       workSessionId: request.workSessionId ?? null,
       runId: request.runId ?? null,
       agentId: request.agentId ?? null,
+      principalId: request.principalId ?? null,
       title: request.title,
       description: request.description ?? null,
       risk: request.risk ?? null,
@@ -110,11 +118,13 @@ export function createApprovalRequestManager(
   }
 
   function get(id: string): ApprovalRequest | undefined {
+    expirePending();
     const row = database.db.select().from(approvalRequests).where(eq(approvalRequests.id, id)).get();
     return row ? rowToApproval(row) : undefined;
   }
 
   function listPending(workspaceSessionId?: string): ApprovalRequest[] {
+    expirePending();
     const where = workspaceSessionId
       ? and(eq(approvalRequests.status, "pending"), eq(approvalRequests.workspaceSessionId, workspaceSessionId))
       : eq(approvalRequests.status, "pending");
@@ -129,24 +139,69 @@ export function createApprovalRequestManager(
 
   function resolve(
     id: string,
-    input: { status: ApprovalStatus; optionId?: string; reason?: string; reviewerId?: string },
+    input: { status: ApprovalStatus; optionId?: string; effect?: ApprovalOption["effect"]; reason?: string; reviewerId?: string },
   ): ApprovalRequest | undefined {
+    if (!["approved", "denied", "expired", "cancelled"].includes(input.status)) {
+      throw new Error(`Invalid approval resolution status: ${input.status}`);
+    }
     const existing = get(id);
     if (!existing || existing.status !== "pending") return existing;
+    if (input.effect && !input.optionId) {
+      throw new Error("Approval effect requires a selected option");
+    }
+    if (input.optionId) {
+      const option = existing.options.find((candidate) => candidate.id === input.optionId);
+      if (!option) throw new Error(`Unknown approval option: ${input.optionId}`);
+      if (input.status === "approved" && option.effect !== "approve") {
+        throw new Error(`Approved resolution requires an approve option, not ${option.effect}`);
+      }
+      if (input.status === "denied" && !["deny", "changes_requested"].includes(option.effect)) {
+        throw new Error(`Denied resolution requires a deny or changes_requested option, not ${option.effect}`);
+      }
+      if (["expired", "cancelled"].includes(input.status)) {
+        throw new Error(`${input.status} resolutions cannot select an approval option`);
+      }
+      const expectedEffect = input.effect ?? (input.status === "approved" ? "approve" : input.status === "denied" ? "deny" : undefined);
+      if (expectedEffect && option.effect !== expectedEffect) {
+        throw new Error(`Approval option ${input.optionId} has effect ${option.effect}, not ${expectedEffect}`);
+      }
+    }
     const now = new Date().toISOString();
     const resolution = {
       optionId: input.optionId,
+      effect: input.effect,
       reason: input.reason,
       reviewerId: input.reviewerId,
     };
-    database.db.update(approvalRequests)
+    const updated = database.db.update(approvalRequests)
       .set({ status: input.status, resolvedAt: now, resolutionJson: JSON.stringify(resolution) })
-      .where(eq(approvalRequests.id, id))
+      .where(and(eq(approvalRequests.id, id), eq(approvalRequests.status, "pending")))
       .run();
+    if (updated.changes === 0) return get(id);
     return get(id);
   }
 
-  return { create, get, listPending, resolve, close: () => { /* P1 #11: DB owned by server */ } };
+  function expirePending(now = new Date().toISOString()): ApprovalRequest[] {
+    database.db.update(approvalRequests)
+      .set({ status: "expired", resolvedAt: now, resolutionJson: JSON.stringify({ reason: "approval timed out" }) })
+      .where(and(
+        eq(approvalRequests.status, "pending"),
+        // NULL expiry means no expiry. ISO-8601 UTC strings sort naturally.
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-argument
+        // Drizzle's SQL fragment is used because nullable comparison is not
+        // expressible with the narrow generated column type.
+        sql`${approvalRequests.expiresAt} is not null and ${approvalRequests.expiresAt} <= ${now}`,
+      ))
+      .run();
+    return database.db
+      .select()
+      .from(approvalRequests)
+      .where(and(eq(approvalRequests.status, "expired"), eq(approvalRequests.resolvedAt, now)))
+      .all()
+      .map(rowToApproval);
+  }
+
+  return { create, get, listPending, expirePending, resolve, close: () => { /* P1 #11: DB owned by server */ } };
 }
 
 function defaultOptions(): ApprovalOption[] {
@@ -164,6 +219,7 @@ function rowToApproval(row: ApprovalRequestRow): ApprovalRequest {
     workSessionId: row.workSessionId ?? undefined,
     runId: row.runId ?? undefined,
     agentId: row.agentId ?? undefined,
+    principalId: row.principalId ?? undefined,
     title: row.title,
     description: row.description ?? undefined,
     risk: row.risk ?? undefined,
