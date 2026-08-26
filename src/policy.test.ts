@@ -195,6 +195,33 @@ assert.equal(policy.isApproved("principal-2", "tool:write", { workspaceId: WS, w
 policy.recordApproval("principal-2", "tool:write", "workspace", { workspaceId: WS, workSessionId: "wsess-C" });
 assert.equal(policy.isApproved("principal-2", "tool:write", { workspaceId: WS, workSessionId: "wsess-D" }), true);
 
+// ── P1.12: workspace grants are strictly scoped to one workspace ──
+// A workspace grant in WS must NOT cross over into a different workspace,
+// even for the same principal and same approval key. The P1.10 durable
+// workspace grant is intentionally narrow; if this ever regressed, a
+// reviewer granting trust in workspace A would silently unlock privileged
+// operations in workspace B.
+policy.recordApproval("principal-boundary", "tool:write", "workspace", {
+  workspaceId: WS,
+  workSessionId: "wsess-boundary-A",
+});
+assert.equal(policy.isApproved("principal-boundary", "tool:write", {
+  workspaceId: WS, workSessionId: "wsess-boundary-A",
+}), true, "workspace grant applies inside its own workspace");
+assert.equal(policy.isApproved("principal-boundary", "tool:write", {
+  workspaceId: WS, workSessionId: "wsess-boundary-B",
+}), true, "workspace grant covers any work session within the workspace");
+assert.equal(policy.isApproved("principal-boundary", "tool:write", {
+  workspaceId: `${WS}-other`, workSessionId: "wsess-boundary-A",
+}), false, "workspace grant does NOT cross into a different workspace");
+assert.equal(policy.isApproved("principal-boundary", "tool:write", {
+  workspaceId: "ws-arbitrary", workSessionId: "wsess-boundary-A",
+}), false, "workspace grant does NOT cross into an unrelated workspace");
+const boundaryGrant = grantStore.listEffective().find((g) => g.principalId === "principal-boundary");
+assert.ok(boundaryGrant);
+assert.equal(boundaryGrant.scope, "workspace");
+assert.equal(boundaryGrant.scopeId, WS, "grant scopeId is the granting workspace");
+
 // Work-session grants require an actual session and can be revoked without
 // restarting the policy engine. IDs are intentionally opaque so re-approval
 // after revocation cannot collide with a historical row.
@@ -445,6 +472,44 @@ db.close();
   assert.equal(viaShell.mode, "ask", "kontrol-shell inherits the bash ask rule");
   assert.equal(viaBash.approvalKey, viaExec.approvalKey);
   assert.equal(viaBash.approvalKey, viaShell.approvalKey);
+}
+
+// ── P1.11: denial must NEVER be weakened into an approval ──
+// If policy evaluates to deny, the enforcer must return allowed=false
+// without consulting any approval state — even when the caller already
+// holds a workspace grant for the same key. The new live-vs-durable
+// separation must not silently promote a denied decision into an
+// approval-worthy wait.
+{
+  const strictPolicy = createPolicyEngine({ defaultMode: "allow", toolRules: { bash: "deny" }, pathRules: [] });
+  const strictEnforcer = createPolicyEnforcer(strictPolicy, eventStore, { timeoutMs: 100 });
+  // Even with a pre-existing workspace grant, a freshly evaluated deny must
+  // short-circuit before the wait path is even considered.
+  strictPolicy.recordApproval("strict-principal", "tool:bash", "workspace", { workspaceId: WS });
+  const denial = await strictEnforcer.enforce({
+    principalId: "strict-principal",
+    principalRole: "client",
+    workspaceId: WS,
+    tool: "bash",
+  });
+  assert.equal(denial.allowed, false, "denial never waits");
+  assert.equal(denial.decision.mode, "deny", "decision.mode stays deny under the new live-vs-durable split");
+  assert.equal(denial.outcome, undefined, "denial has no PolicyWaitOutcome (it never reached the wait)");
+
+  // Path-rule deny is similarly immune to grants.
+  const pathPolicy = createPolicyEngine(
+    { defaultMode: "allow", toolRules: {}, pathRules: [{ pattern: "/etc/**", mode: "deny" }] },
+  );
+  const pathEnforcer = createPolicyEnforcer(pathPolicy, eventStore, { timeoutMs: 100 });
+  const pathDenial = await pathEnforcer.enforce({
+    principalId: "strict-principal",
+    principalRole: "client",
+    workspaceId: WS,
+    tool: "write",
+    path: "/etc/shadow",
+  });
+  assert.equal(pathDenial.allowed, false);
+  assert.equal(pathDenial.decision.mode, "deny");
 }
 
 console.log("policy.test.ts: all assertions passed");

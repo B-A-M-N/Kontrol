@@ -3127,10 +3127,13 @@ export function createServer(config = loadConfig()): RunningServer {
       // P1 #18: compact telemetry via bounded ID pages of compaction-eligible
       // sessions (terminal, or parked/stale reviews) instead of hydrating up
       // to 10,000 full projections every cycle. Loop until a short page
-      // confirms the eligible set is exhausted.
+      // confirms the eligible set is exhausted. P1.16: cap the iteration
+      // count so a pathological backlog cannot starve the event loop; the
+      // remaining pages are picked up on the next maintenance tick.
       const COMPACT_PAGE_SIZE = 500;
+      const COMPACT_MAX_PAGES_PER_CYCLE = 4;
       let afterSessionId: string | undefined;
-      for (;;) {
+      for (let pageIndex = 0; pageIndex < COMPACT_MAX_PAGES_PER_CYCLE; pageIndex++) {
         const page = workSessions.listSessionIdsNeedingCompaction(afterSessionId, COMPACT_PAGE_SIZE);
         if (page.length === 0) break;
         for (const sessionId of page) {
