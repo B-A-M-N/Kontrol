@@ -26,6 +26,13 @@ import {
   type ToolResultCard,
 } from "./card-types.js";
 import { getPatchDisplayParts } from "./patch-display.js";
+import {
+  approvalAttentionDecision,
+  initialApprovalAttentionState,
+  selectionChanged,
+  workspaceTransitioned,
+  type ApprovalAttentionState,
+} from "./approval-attention.js";
 import type { ReviewFile } from "../review-submission.js";
 
 interface ToolDisplay {
@@ -89,6 +96,14 @@ interface PolicyApprovalView {
   command?: string;
   approvalKey?: string;
   matchedPattern?: string;
+  origin?: "direct_mcp" | "work_session";
+  conversationId?: string;
+  orphanedAt?: string;
+  reattachDeadline?: string;
+  liveWaiterCount?: number;
+  requestedAt?: string;
+  createdAt?: string;
+  expiresAt?: string;
   options?: Array<{
     id: string;
     label: string;
@@ -112,6 +127,14 @@ interface PendingApprovalRecord {
   path?: string;
   command?: string;
   options?: PolicyApprovalView["options"];
+  origin?: PolicyApprovalView["origin"];
+  conversationId?: string;
+  orphanedAt?: string;
+  reattachDeadline?: string;
+  liveWaiterCount?: number;
+  requestedAt?: string;
+  createdAt?: string;
+  expiresAt?: string;
 }
 
 interface AgentMessageView {
@@ -204,6 +227,10 @@ interface WorkspaceSurfaceSession {
 let app: App | null = null;
 let connected = false;
 let connectionError: string | null = null;
+type ConnectionState = "CONNECTING" | "CONNECTED" | "DEGRADED" | "RECONNECTING" | "DISCONNECTED";
+let connectionState: ConnectionState = "CONNECTING";
+let reconnectPromise: Promise<void> | null = null;
+let bootPromise: Promise<void> | null = null;
 let hostContext: HostContext | undefined;
 
 // Durable UI state.
@@ -211,9 +238,23 @@ let activeWorkspaceId: string | null = null;
 const workSessionViews = new Map<string, WorkSessionViewState>();
 const snapshotHydrations = new Map<string, Promise<void>>();
 let selectedWorkSessionId: string | null = null;
+// P0.3: the surface the reviewer was on before a direct approval pulled them
+// into the approval center; restored once every center approval resolves.
+// Decision logic lives in approval-attention.ts; pendingApprovalReturnSessionId
+// mirrors approvalAttention for the render paths.
+let pendingApprovalReturnSessionId: string | null = null;
+let approvalAttention: ApprovalAttentionState = initialApprovalAttentionState;
+// Approvals whose "new" attention decision already ran; the workspace event
+// stream can redeliver the same row after reconnect and must not re-yank.
+const approvalAttentionDelivered = new Set<string>();
+// P1: approval-recovery control-plane health. Rehydration stays resilient,
+// but the exact failure mode must stay visible instead of silently swallowed.
+type ApprovalRecoveryState = "healthy" | "degraded" | "forbidden" | "disconnected";
+let approvalRecoveryState: ApprovalRecoveryState = "healthy";
 let lastToolCard: ToolResultCard | null = null;
 let rehydrationPromise: Promise<void> | null = null;
 let rehydrationRequested = false;
+let lastSuccessfulHydrationAt: string | null = null;
 
 // View-local UI state (replaced the previous globals).
 let expanded = false;
@@ -282,21 +323,42 @@ let workspaceWatcherGeneration = 0;
 let workspaceEventCursor = 0;
 
 const uiTestMode = Boolean((globalThis as { __KONTROL_UI_TEST_MODE__?: boolean }).__KONTROL_UI_TEST_MODE__);
+const APPROVAL_CENTER_PREFIX = "__approval_center__:";
+// P0.4: the approval center is workspace-scoped. One global pseudo-session
+// would let workspace A's direct approvals render under workspace B after a
+// reconnect re-tagged the shared view's workspaceSessionId.
+function approvalCenterId(workspaceId: string | null | undefined): string {
+  return `${APPROVAL_CENTER_PREFIX}${workspaceId ?? ""}`;
+}
+function isApprovalCenterId(workSessionId: string | null | undefined): boolean {
+  return typeof workSessionId === "string" && workSessionId.startsWith(APPROVAL_CENTER_PREFIX);
+}
 const maybeAppRoot = typeof document === "undefined" ? null : document.querySelector<HTMLElement>("#app");
 if (!maybeAppRoot && !uiTestMode) {
   throw new Error("Missing #app root element.");
 }
 const appRoot = maybeAppRoot ?? document.createElement("div");
 
+type UiTestAppFactory = () => App;
+const uiTestAppFactory = (globalThis as {
+  __KONTROL_UI_TEST_APP_FACTORY__?: UiTestAppFactory;
+}).__KONTROL_UI_TEST_APP_FACTORY__;
+
 if (!uiTestMode) void boot();
 
 async function boot(): Promise<void> {
+  if (bootPromise) return bootPromise;
+  bootPromise = bootInternal().finally(() => { bootPromise = null; });
+  return bootPromise;
+}
+
+async function bootInternal(): Promise<void> {
   render();
 
-  app = new App(
-    { name: "kontrol-tool-cards", version: "0.4.0" },
-    {},
-  );
+  app = uiTestAppFactory?.() ?? new App(
+      { name: "kontrol-tool-cards", version: "0.4.0" },
+      {},
+    );
 
   app.ontoolresult = (result) => {
     const structuredContent = getStructuredContent<Partial<ToolResultCard>>(result);
@@ -318,14 +380,7 @@ async function boot(): Promise<void> {
 
     // open_workspace carries the currently opened workspace ID.
     if (tool === "open_workspace" && structured.workspaceId) {
-      const newWorkspaceId = structured.workspaceId;
-      if (activeWorkspaceId !== newWorkspaceId) {
-        workspaceWatcherGeneration += 1;
-        workspaceEventCursor = 0;
-      }
-      activeWorkspaceId = newWorkspaceId;
-      // P0 #3: When workspace becomes known, trigger rehydration.
-      queueSessionRehydration();
+      activateWorkspace(structured.workspaceId);
     }
 
     // Agent run (submit_to_coding_agent) and review (submit_for_review) cards
@@ -338,10 +393,7 @@ async function boot(): Promise<void> {
       if (wsId) {
         const workspaceSessionId = (structured as { workspaceSessionId?: string }).workspaceSessionId;
         if (workspaceSessionId && activeWorkspaceId !== workspaceSessionId) {
-          activeWorkspaceId = workspaceSessionId;
-          workspaceWatcherGeneration += 1;
-          workspaceEventCursor = 0;
-          queueSessionRehydration();
+          activateWorkspace(workspaceSessionId);
         }
         ensureWorkSessionView(
           wsId,
@@ -376,6 +428,7 @@ async function boot(): Promise<void> {
 
   app.onteardown = async () => {
     connected = false;
+    connectionState = "DISCONNECTED";
     workspaceWatcherGeneration += 1;
     unmountPayload();
     currentLegacyReviewDom = null;
@@ -385,23 +438,53 @@ async function boot(): Promise<void> {
     return {};
   };
 
-  try {
-    await app.connect();
-    const initialContext = app.getHostContext();
-    if (initialContext) hostContext = initialContext;
-    applyHostContext();
-    connected = true;
-    // Rehydrate any sessions that were already live before this WebUI (re)loaded.
-    // Without this, sessions only appear reactively when a fresh tool card
-    // arrives — so a reload silently drops in-flight and awaiting-review work.
-    queueSessionRehydration();
-  } catch (connectError) {
-    connectionError = connectError instanceof Error
-      ? connectError.message
-      : String(connectError);
-  }
-
+  await connectWithRetry();
   render();
+}
+
+async function connectWithRetry(reason?: unknown): Promise<void> {
+  let retryDelayMs = 1_000;
+  while (app && !connected) {
+    connectionState = retryDelayMs === 1_000 && !reason ? "CONNECTING" : "RECONNECTING";
+    render();
+    try {
+      await app.connect();
+      const initialContext = app.getHostContext();
+      if (initialContext) hostContext = initialContext;
+      applyHostContext();
+      connected = true;
+      connectionState = "CONNECTED";
+      connectionError = null;
+      // Rehydrate any sessions that were already live before this WebUI
+      // (re)loaded. The same path is used after a transport reconnect.
+      queueSessionRehydration();
+      return;
+    } catch (connectErrorValue) {
+      connectionState = "RECONNECTING";
+      connectionError = connectErrorValue instanceof Error
+        ? connectErrorValue.message
+        : String(connectErrorValue);
+      render();
+      const jitter = Math.floor(Math.random() * Math.min(500, retryDelayMs / 2));
+      await new Promise((resolve) => setTimeout(resolve, retryDelayMs + jitter));
+      retryDelayMs = Math.min(30_000, retryDelayMs * 2);
+      reason = undefined;
+    }
+  }
+  throw new Error("The MCP host connection is unavailable.");
+}
+
+async function reconnectApp(reason: unknown): Promise<void> {
+  if (reconnectPromise) return reconnectPromise;
+  reconnectPromise = (async () => {
+    if (!app) throw new Error("The MCP host connection is unavailable.");
+    connected = false;
+    workspaceWatcherGeneration += 1;
+    await connectWithRetry(reason);
+  })().finally(() => {
+    reconnectPromise = null;
+  });
+  return reconnectPromise;
 }
 
 /**
@@ -493,13 +576,23 @@ async function rehydrateActiveSessions(): Promise<void> {
     }
     // If nothing is selected yet, surface the most recently updated session.
     // If the previous selection disappeared, choose the newest remaining one.
-    if (sessions.length && (!selectedWorkSessionId || !workSessionViews.has(selectedWorkSessionId))) {
+    // P0.5: a selection belonging to another workspace (or another
+    // workspace's approval center) is not a valid fallback either.
+    if (sessions.length
+      && (!selectedWorkSessionId
+        || !workSessionViews.has(selectedWorkSessionId)
+        || workSessionViews.get(selectedWorkSessionId)?.workspaceSessionId !== workspaceId
+        || isApprovalCenterId(selectedWorkSessionId))) {
       selectedWorkSessionId = sessions[0].sessionId;
     }
 
     // Pending tool approvals are durable, but direct client calls do not
     // belong to a work-session snapshot. Rehydrate them explicitly so a UI
     // reconnect cannot miss the live approval event and strand the caller.
+    // P0: the server listing is the authoritative pending set. A server-side
+    // resolution whose response event died on the transport (e.g. Approve
+    // committed, response lost, callServerToolChecked correctly refusing to
+    // re-mutate) must remove the stale local card, not resurrect it.
     const directApprovals: PendingApprovalRecord[] = [];
     try {
       const approvalResult = await callServerToolChecked({
@@ -507,27 +600,37 @@ async function rehydrateActiveSessions(): Promise<void> {
         arguments: { workspaceId },
       });
       if (!app || activeWorkspaceId !== workspaceId) return;
+      approvalRecoveryState = "healthy";
       const pending = getStructuredContent<{ approvals?: PendingApprovalRecord[] }>(approvalResult)?.approvals ?? [];
+      const serverApprovalIds = new Set(pending.map((approval) => approval.approvalId));
+      reconcileAuthoritativeApprovals(pending, serverApprovalIds, workspaceId);
       for (const approval of pending) {
         const target = approval.workSessionId
           ? ensureWorkSessionView(approval.workSessionId, approval.workspaceSessionId ?? workspaceId, "")
-          : undefined;
+          : ensureWorkSessionView(approvalCenterId(workspaceId), workspaceId, "");
         if (target) mergePendingApproval(target, approval, workspaceId);
         else directApprovals.push(approval);
       }
-    } catch {
+    } catch (approvalError) {
       // Approval visibility must not prevent the rest of the workspace from
-      // rehydrating. The live watcher remains the fallback for new requests.
+      // rehydrating. The live watcher remains the fallback for new requests,
+      // but P1: the exact recovery failure is surfaced as control-plane
+      // state instead of being silently discarded.
+      const message = approvalError instanceof Error ? approvalError.message : String(approvalError);
+      approvalRecoveryState = /forbidden|reviewer authority|requires reviewer/i.test(message)
+        ? "forbidden"
+        : connected
+          ? "degraded"
+          : "disconnected";
     }
     if (directApprovals.length > 0) {
-      const selected = selectedWorkSessionId ? workSessionViews.get(selectedWorkSessionId) : undefined;
-      const target = selected ?? ensureWorkSessionView("__approval_center__", workspaceId, "");
+      const target = ensureWorkSessionView(approvalCenterId(workspaceId), workspaceId, "");
       for (const approval of directApprovals) mergePendingApproval(target, approval, workspaceId);
-      if (!selected) selectedWorkSessionId = target.workSessionId;
     }
     const selected = selectedWorkSessionId ? workSessionViews.get(selectedWorkSessionId) : undefined;
-    if (selected && selected.workSessionId !== "__approval_center__") await hydrateWorkSessionSnapshot(selected);
+    if (selected && !isApprovalCenterId(selected.workSessionId)) await hydrateWorkSessionSnapshot(selected);
     if (!app || activeWorkspaceId !== workspaceId) return;
+    lastSuccessfulHydrationAt = new Date().toISOString();
     workspaceWatcherGeneration += 1;
     void watchWorkspaceEvents(workspaceId, workspaceEventCursor, workspaceWatcherGeneration);
     scheduleRender();
@@ -546,6 +649,7 @@ async function rehydrateActiveSessions(): Promise<void> {
       errorMessage = `Session recovery is incomplete: ${error instanceof Error ? error.message : String(error)}`;
     }
     scheduleRender();
+    throw error;
   }
 }
 
@@ -559,14 +663,111 @@ function queueSessionRehydration(): void {
     // guaranteeing that only one snapshot/cursor handoff owns the watcher at
     // a time. If the workspace changes during a run, the next iteration uses
     // the new workspace instead of letting stale results win the race.
+    let retryDelayMs = 1_000;
     while (rehydrationRequested && activeWorkspaceId && app) {
       rehydrationRequested = false;
-      await rehydrateActiveSessions();
+      try {
+        await rehydrateActiveSessions();
+        retryDelayMs = 1_000;
+      } catch (error) {
+        if (!app || !activeWorkspaceId) return;
+        rehydrationRequested = true;
+        connectionState = connected ? "DEGRADED" : "RECONNECTING";
+        connectionError = error instanceof Error ? error.message : String(error);
+        render();
+        const jitter = Math.floor(Math.random() * Math.min(500, retryDelayMs / 2));
+        await new Promise((resolve) => setTimeout(resolve, retryDelayMs + jitter));
+        retryDelayMs = Math.min(30_000, retryDelayMs * 2);
+      }
     }
   })().finally(() => {
     rehydrationPromise = null;
     if (rehydrationRequested) queueSessionRehydration();
   });
+}
+
+/**
+ * P0: reconcile every mutable approval projection for this workspace against
+ * the authoritative server pending set. Approvals that the server no longer
+ * reports (resolved while the response transport was down) are removed;
+ * those still pending are refreshed in place. Old-workspace centers are left
+ * untouched — only the rehydrated workspace is reconciled.
+ */
+function reconcileAuthoritativeApprovals(
+  pending: PendingApprovalRecord[],
+  serverApprovalIds: Set<string>,
+  workspaceId: string,
+): void {
+  const center = workSessionViews.get(approvalCenterId(workspaceId));
+  if (center) {
+    for (const approvalId of [...center.policyApprovals.keys()]) {
+      if (!serverApprovalIds.has(approvalId)) {
+        center.policyApprovals.delete(approvalId);
+        // An approval the server no longer lists can never be "new" again;
+        // drop its attention-delivery record so the set cannot grow unboundedly.
+        approvalAttentionDelivered.delete(approvalId);
+      }
+    }
+    center.pendingApprovalCount = center.policyApprovals.size;
+  }
+  for (const view of workSessionViews.values()) {
+    if (isApprovalCenterId(view.workSessionId) && view !== center) continue;
+    if (view.workspaceSessionId !== workspaceId) continue;
+    let changed = false;
+    for (const approvalId of [...view.policyApprovals.keys()]) {
+      if (!serverApprovalIds.has(approvalId)) {
+        view.policyApprovals.delete(approvalId);
+        changed = true;
+      }
+    }
+    if (changed) view.pendingApprovalCount = view.policyApprovals.size;
+    view.pendingApprovalCount = Math.max(view.pendingApprovalCount, pending.filter(
+      (approval) => approval.workSessionId === view.workSessionId,
+    ).length);
+  }
+}
+
+/**
+ * Make a workspace the active projection target: drop selections that belong
+ * to another workspace, and restart the event watcher generation so the
+ * durable cursor is rebuilt for the new workspace.
+ */
+function activateWorkspace(newWorkspaceId: string): void {
+  if (activeWorkspaceId !== newWorkspaceId) {
+    activeWorkspaceId = newWorkspaceId;
+    // P0.5 isolation invariant: a workspace transition must start on the
+    // new workspace's own surface. Old-workspace state is kept internally
+    // for a fast return but can never render under the new selection.
+    invalidateSelectionForWorkspaceTransition();
+    workspaceWatcherGeneration += 1;
+    workspaceEventCursor = 0;
+  }
+  // P0 #3: When workspace becomes known, trigger rehydration.
+  queueSessionRehydration();
+}
+
+/**
+ * P0.5 isolation invariant: on a workspace transition, drop the selection if
+ * it belongs to another workspace (including another workspace's approval
+ * center). Rehydration selects the newest session of the new workspace.
+ * Old-workspace state stays in memory for a fast return but is unselectable
+ * while another workspace is active.
+ */
+function invalidateSelectionForWorkspaceTransition(): void {
+  approvalAttention = workspaceTransitioned(approvalAttention);
+  pendingApprovalReturnSessionId = approvalAttention.returnSessionId;
+  if (!selectedWorkSessionId) return;
+  if (isApprovalCenterId(selectedWorkSessionId)) {
+    selectedWorkSessionId = null;
+    return;
+  }
+  const view = workSessionViews.get(selectedWorkSessionId);
+  if (!view || view.workspaceSessionId !== activeWorkspaceId) selectedWorkSessionId = null;
+}
+
+function reviewerInputHasFocus(): boolean {
+  const active = document.activeElement;
+  return active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement;
 }
 
 async function hydrateWorkSessionSnapshot(view: WorkSessionViewState): Promise<void> {
@@ -603,6 +804,14 @@ async function hydrateWorkSessionSnapshot(view: WorkSessionViewState): Promise<v
         path?: string;
         command?: string;
         options?: PolicyApprovalView["options"];
+        origin?: PolicyApprovalView["origin"];
+        conversationId?: string;
+        orphanedAt?: string;
+        reattachDeadline?: string;
+        liveWaiterCount?: number;
+        requestedAt?: string;
+        createdAt?: string;
+        expiresAt?: string;
       }>;
       agentMessages?: Array<{ messageId: string; kind: string; author?: string; title?: string; body?: string; status?: string; runId?: string; createdAt?: string }>;
     }>(snapResult);
@@ -634,6 +843,14 @@ async function hydrateWorkSessionSnapshot(view: WorkSessionViewState): Promise<v
         path: approval.path,
         command: approval.command,
         options: approval.options,
+        origin: approval.origin,
+        conversationId: approval.conversationId,
+        orphanedAt: approval.orphanedAt,
+        reattachDeadline: approval.reattachDeadline,
+        liveWaiterCount: approval.liveWaiterCount,
+        requestedAt: approval.requestedAt,
+        createdAt: approval.createdAt,
+        expiresAt: approval.expiresAt,
         workSessionId: view.workSessionId,
       });
     }
@@ -824,6 +1041,14 @@ function mergePendingApproval(view: WorkSessionViewState, approval: PendingAppro
     path: approval.path,
     command: approval.command,
     options: approval.options,
+    origin: approval.origin,
+    conversationId: approval.conversationId,
+    orphanedAt: approval.orphanedAt,
+    reattachDeadline: approval.reattachDeadline,
+    liveWaiterCount: approval.liveWaiterCount,
+    requestedAt: approval.requestedAt,
+    createdAt: approval.createdAt,
+    expiresAt: approval.expiresAt,
   });
   view.pendingApprovalCount = view.policyApprovals.size;
 }
@@ -847,22 +1072,29 @@ function render(): void {
 
 function renderNow(): void {
 
-  if (connectionError) {
-    renderEmpty(connectionError, "error");
+  if (connectionError && connectionState === "DISCONNECTED") {
+    renderConnectionError(connectionError);
     return;
   }
   if (!connected) {
-    renderEmpty("Connecting to host...");
+    renderEmpty(connectionState === "RECONNECTING" ? `Reconnecting to host… ${connectionError ?? ""}` : "Connecting to host...");
     return;
   }
 
   const view = selectedWorkSessionId ? workSessionViews.get(selectedWorkSessionId) : undefined;
-  if (view) {
+  // P0.5 isolation invariant: a selection from another workspace must never
+  // render here, even if its view is still resident for a fast return.
+  if (view && (view.workspaceSessionId === activeWorkspaceId || (isApprovalCenterId(view.workSessionId) && view.workSessionId === approvalCenterId(activeWorkspaceId)))) {
+    if (isApprovalCenterId(view.workSessionId)) {
+      renderApprovalCenterView(view);
+      return;
+    }
     renderWorkSessionView(view);
     return;
   }
 
   if (!lastToolCard) {
+    if (renderWorkspaceApprovalGate()) return;
     renderEmpty(errorMessage ?? "Waiting for a tool result.", errorMessage ? "error" : "muted");
     return;
   }
@@ -934,6 +1166,105 @@ function renderEmpty(message: string, tone: "muted" | "error" = "muted"): void {
   main.append(element("section", { className: `empty ${tone}`, text: message }));
   appRoot.replaceChildren(main);
   maybeAppendAgentBar();
+}
+
+function renderConnectionError(message: string): void {
+  ensureSurface(`connection-error:${message}`);
+  const main = element("main", { className: "shell" });
+  const section = element("section", { className: "empty error" });
+  section.append(element("div", { text: message }));
+  const retry = element("button", { className: "notice-action", type: "button", text: "Reconnect" });
+  retry.addEventListener("click", () => {
+    retry.disabled = true;
+    if (app) {
+      void reconnectApp(message).catch(() => undefined);
+    } else {
+      void boot().catch(() => undefined);
+    }
+  });
+  section.append(retry);
+  main.append(section);
+  appRoot.replaceChildren(main);
+  maybeAppendAgentBar();
+}
+
+function renderApprovalCenterView(view: WorkSessionViewState): void {
+  // P0.5: only the active workspace's approval center can render. A center
+  // selected under another workspace falls back to the gated empty surface
+  // instead of leaking that workspace's direct approvals.
+  if (view.workSessionId !== approvalCenterId(activeWorkspaceId)) {
+    if (renderWorkspaceApprovalGate()) return;
+    renderEmpty(errorMessage ?? "Waiting for a tool result.", errorMessage ? "error" : "muted");
+    return;
+  }
+  ensureSurface("approval-center");
+  const main = element("main", { className: "shell" });
+  const section = element("section", { className: "tool-card agent" });
+  section.append(
+    element("div", { className: "tool-title", text: "Workspace approvals" }),
+    element("div", { className: "tool-label", text: `${view.policyApprovals.size} pending direct MCP operation(s)` }),
+  );
+  if (view.policyApprovals.size === 0 && approvalRecoveryState === "healthy") {
+    section.append(element("div", { className: "empty muted", text: "No pending approvals." }));
+  } else if (view.policyApprovals.size === 0) {
+    section.append(element("div", { className: "empty muted", text: "No pending approvals." }));
+    section.append(renderApprovalRecoveryIndicator());
+  } else {
+    const list = element("div", { className: "approval-list" });
+    for (const approval of view.policyApprovals.values()) list.append(renderPolicyApproval(view, approval));
+    section.append(list);
+    if (approvalRecoveryState !== "healthy") section.append(renderApprovalRecoveryIndicator());
+  }
+  main.append(section);
+  appRoot.replaceChildren(main);
+  maybeAppendAgentBar();
+}
+
+/** P1: explicit approval-recovery health indicator with a manual retry. */
+function renderApprovalRecoveryIndicator(): HTMLElement {
+  const indicator = element("div", { className: "session-notice warning", role: "status" });
+  const message = approvalRecoveryState === "forbidden"
+    ? "Reviewer authorization failed: approval recovery is unavailable."
+    : approvalRecoveryState === "disconnected"
+      ? "Approval recovery unavailable: the host connection is down."
+      : "Approval recovery unavailable: pending approvals may be stale.";
+  indicator.append(element("span", { text: message }));
+  const retry = element("button", { className: "notice-action", type: "button", text: "Retry" });
+  retry.addEventListener("click", () => {
+    approvalRecoveryState = "healthy";
+    queueSessionRehydration();
+    scheduleRender();
+  });
+  indicator.append(retry);
+  return indicator;
+}
+
+/**
+ * P0.3: prominent "Needs approval" banner shown in every current Kontrol
+ * surface while a direct approval for the active workspace is pending but
+ * not currently displayed. Returns true when the banner was rendered into a
+ * standalone gated surface.
+ */
+function renderWorkspaceApprovalGate(): boolean {
+  const center = activeWorkspaceId ? workSessionViews.get(approvalCenterId(activeWorkspaceId)) : undefined;
+  if (!activeWorkspaceId || !center || center.policyApprovals.size === 0) return false;
+  const main = element("main", { className: "shell" });
+  const section = element("section", { className: "session-notice warning approval-gate", role: "alert" });
+  const review = element("button", {
+    className: "notice-action approval-gate-action",
+    type: "button",
+    text: `Needs approval — ${center.policyApprovals.size} pending operation${center.policyApprovals.size === 1 ? "" : "s"}`,
+    ariaLabel: "Open workspace approvals",
+  });
+  review.addEventListener("click", () => selectWorkSession(center.workSessionId));
+  section.append(
+    element("span", { className: "approval-gate-message", text: "A direct MCP operation is blocked and waiting for your decision." }),
+    review,
+  );
+  main.append(section);
+  appRoot.replaceChildren(main);
+  maybeAppendAgentBar();
+  return true;
 }
 
 function ensureSurface(key: string): void {
@@ -1048,7 +1379,7 @@ function renderWorkSessionView(view: WorkSessionViewState): void {
   const dom = currentWorkSessionDom ?? createWorkSessionDom(view.workSessionId);
   currentWorkSessionDom = dom;
 
-  dom.titleStatus.textContent = view.workSessionId === "__approval_center__"
+  dom.titleStatus.textContent = isApprovalCenterId(view.workSessionId)
     ? "Approval Center"
     : view.title ?? view.status;
   dom.statusBadge.textContent = view.status;
@@ -1061,9 +1392,19 @@ function renderWorkSessionView(view: WorkSessionViewState): void {
     const ageSeconds = Math.max(0, Math.round((Date.now() - Date.parse(view.lastHeartbeatAt)) / 1000));
     dom.meta.append(element("span", { className: "agent-meta-row heartbeat-status", text: `● Agent connected · ${ageSeconds}s ago` }));
   }
+  if (lastSuccessfulHydrationAt) {
+    dom.meta.append(element("span", {
+      className: "agent-meta-row",
+      text: `state synced · ${new Date(lastSuccessfulHydrationAt).toLocaleTimeString()}`,
+    }));
+  }
 
   renderSessionSwitcher(dom.sessionSwitcher);
   renderSessionNotice(dom.notice, view);
+  // P0.3: a direct approval must be discoverable on every current surface.
+  // When the reviewer's focus is inside an input/textarea, focus is preserved
+  // and the high-priority banner carries the action instead.
+  renderSessionApprovalGateBanner(dom, view);
   const missionKey = `${view.missionLoading ? "loading" : "ready"}:${view.missionError ?? ""}:${view.mission ? JSON.stringify(view.mission) : "none"}`;
   if (dom.mission.dataset.stateKey !== missionKey) {
     dom.mission.replaceChildren();
@@ -1183,14 +1524,28 @@ function createWorkSessionDom(workSessionId: string): WorkSessionDom {
 
 function renderSessionSwitcher(container: HTMLElement): void {
   container.replaceChildren();
+  // P0.4/P0.5: the approval center and every session button are workspace-
+  // scoped. Only views of the active workspace are offered for selection.
+  const approvalCenter = activeWorkspaceId ? workSessionViews.get(approvalCenterId(activeWorkspaceId)) : undefined;
   const sessions = [...workSessionViews.values()]
-    .filter((view) => view.workSessionId !== "__approval_center__")
+    .filter((view) => !isApprovalCenterId(view.workSessionId))
+    .filter((view) => view.workspaceSessionId === activeWorkspaceId)
     .sort((a, b) => {
       const at = Date.parse(a.updatedAt ?? "") || 0;
       const bt = Date.parse(b.updatedAt ?? "") || 0;
       return bt - at || b.lastSeq - a.lastSeq;
     });
-  if (sessions.length < 2) return;
+  if (approvalCenter && approvalCenter.policyApprovals.size > 0) {
+    const button = element("button", {
+      className: `session-switcher-item${selectedWorkSessionId === approvalCenter.workSessionId ? " selected" : ""}`,
+      type: "button",
+      text: `Workspace approvals · ${approvalCenter.policyApprovals.size}`,
+      ariaPressed: String(selectedWorkSessionId === approvalCenter.workSessionId),
+    });
+    button.addEventListener("click", () => selectWorkSession(approvalCenter.workSessionId));
+    container.append(button);
+  }
+  if (sessions.length < 2 && !approvalCenter?.policyApprovals.size) return;
   for (const view of sessions) {
     const label = view.title ?? view.status;
     const category = sessionCategory(view);
@@ -1228,9 +1583,54 @@ function relativeSessionAge(value: string): string {
   return `${Math.round(ageMs / (60 * 60_000))}h ago`;
 }
 
+/** P0.3: prominent in-surface "Needs approval" banner for direct approvals. */
+function renderSessionApprovalGateBanner(dom: WorkSessionDom, view: WorkSessionViewState): void {
+  const center = activeWorkspaceId ? workSessionViews.get(approvalCenterId(activeWorkspaceId)) : undefined;
+  const banner = dom.section.querySelector<HTMLElement>(":scope > .approval-gate");
+  if (!center || center.policyApprovals.size === 0) {
+    banner?.remove();
+    return;
+  }
+  // The banner must not cover the selected work session's own approvals.
+  if (view.policyApprovals.size > 0) {
+    banner?.remove();
+    return;
+  }
+  if (banner && banner.dataset.approvalCount === String(center.policyApprovals.size)) return;
+  banner?.remove();
+  const gate = element("div", { className: "session-notice warning approval-gate", role: "alert" });
+  gate.dataset.approvalCount = String(center.policyApprovals.size);
+  const review = element("button", {
+    className: "notice-action approval-gate-action",
+    type: "button",
+    text: `Needs approval — ${center.policyApprovals.size} pending operation${center.policyApprovals.size === 1 ? "" : "s"}`,
+    ariaLabel: "Open workspace approvals",
+  });
+  review.addEventListener("click", () => selectWorkSession(center.workSessionId));
+  gate.append(
+    element("span", { className: "approval-gate-message", text: "A direct MCP operation is blocked and waiting for your decision." }),
+    review,
+  );
+  dom.section.prepend(gate);
+}
+
 function selectWorkSession(workSessionId: string): void {
   if (!workSessionViews.has(workSessionId)) return;
+  // P0.5: another workspace's views (including its approval center) are
+  // never selectable while a different workspace is active.
+  const target = workSessionViews.get(workSessionId)!;
+  if (isApprovalCenterId(workSessionId) ? workSessionId !== approvalCenterId(activeWorkspaceId) : target.workspaceSessionId !== activeWorkspaceId) {
+    return;
+  }
+  // A reviewer-driven selection out of the approval center cancels the
+  // pending auto-return; only an automatic switch owns the return slot.
+  approvalAttention = selectionChanged(approvalAttention, workSessionId, isApprovalCenterId);
+  pendingApprovalReturnSessionId = approvalAttention.returnSessionId;
   selectedWorkSessionId = workSessionId;
+  if (isApprovalCenterId(workSessionId)) {
+    render();
+    return;
+  }
   const view = workSessionViews.get(workSessionId)!;
   void hydrateWorkSessionSnapshot(view)
     .then(() => scheduleRender())
@@ -1239,6 +1639,65 @@ function selectWorkSession(workSessionId: string): void {
       scheduleRender();
     });
   scheduleRender();
+}
+
+/**
+ * P0.3: surface a NEW direct approval without destroying active reviewer
+ * input. When a reviewer is typing, focus is retained and the
+ * always-rendered "Needs approval" banner carries the action; otherwise the
+ * workspace approval center is selected automatically and the previous
+ * non-approval surface is remembered so it can be restored when the last
+ * pending approval resolves. Decision logic lives in approval-attention.ts.
+ */
+function surfaceNewDirectApproval(workspaceId: string, approvalId: string): void {
+  const centerId = approvalCenterId(workspaceId);
+  if (!workSessionViews.has(centerId)) return;
+  const center = workSessionViews.get(centerId)!;
+  // Duplicate watcher delivery of one approval would otherwise re-yank the
+  // reviewer; the reducer's seq guard dedupes the row, and a row count above
+  // one means this delivery is a replay of an earlier approval, not a NEW one.
+  if (!approvalAttentionDelivered.has(approvalId)) {
+    approvalAttentionDelivered.add(approvalId);
+    const decision = approvalAttentionDecision(
+      approvalAttention,
+      {
+        isNewApproval: true,
+        isApprovalResolved: false,
+        pendingApprovalCount: center.policyApprovals.size,
+        selectedSessionId: selectedWorkSessionId,
+        reviewerInputHasFocus: reviewerInputHasFocus(),
+      },
+      centerId,
+    );
+    approvalAttention = decision.next;
+    pendingApprovalReturnSessionId = approvalAttention.returnSessionId;
+    if (decision.selectSessionId) selectWorkSession(decision.selectSessionId);
+  }
+}
+
+/**
+ * P0.3: restore the pre-approval surface once the last pending approval of
+ * the active workspace resolves, but only when the reviewer is still looking
+ * at the approval center we auto-switched to — a reviewer who navigated
+ * elsewhere has already made their choice about where to be.
+ */
+function maybeRestoreAfterApprovalResolved(workspaceId: string, approvalId?: string): void {
+  if (approvalId) approvalAttentionDelivered.delete(approvalId);
+  const center = workSessionViews.get(approvalCenterId(workspaceId));
+  const decision = approvalAttentionDecision(
+    approvalAttention,
+    {
+      isNewApproval: false,
+      isApprovalResolved: true,
+      pendingApprovalCount: center?.policyApprovals.size ?? 0,
+      selectedSessionId: selectedWorkSessionId,
+      reviewerInputHasFocus: false,
+    },
+    approvalCenterId(workspaceId),
+  );
+  approvalAttention = decision.next;
+  pendingApprovalReturnSessionId = approvalAttention.returnSessionId;
+  if (decision.selectSessionId) selectWorkSession(decision.selectSessionId);
 }
 
 function renderSessionNotice(container: HTMLElement, view: WorkSessionViewState): void {
@@ -1539,6 +1998,23 @@ function eventLabel(e: AgentActivityEvent): string {
 
 // ── Event-driven watcher (replaces the 2.5s poll) ──
 
+function workspaceEventTargetSessionId(event: AgentActivityEvent): string {
+  const isApprovalEvent = event.type === "policy.approval_requested"
+    || event.type === "approval.requested"
+    || event.type === "policy.approval.provided"
+    || event.type === "approval.resolved";
+  const eventWorkSessionId = typeof event.payload?.workSessionId === "string"
+    ? event.payload.workSessionId
+    : undefined;
+  // Direct approvals have no work-session authority. Keep them in the
+  // workspace-scoped approval center (P0.4) even when another work session is
+  // selected; fall back to the watcher's workspace since the event itself
+  // only carries its own workspaceSessionId.
+  if (eventWorkSessionId) return eventWorkSessionId;
+  if (isApprovalEvent) return approvalCenterId(event.workspaceSessionId ?? activeWorkspaceId ?? "");
+  return event.sessionId;
+}
+
 async function watchWorkspaceEvents(workspaceId: string, initialSeq: number, generation: number): Promise<void> {
   let cursor = initialSeq;
   // P1 #34: bounded exponential backoff with jitter. Resets after any
@@ -1559,24 +2035,29 @@ async function watchWorkspaceEvents(workspaceId: string, initialSeq: number, gen
       }>(result);
       if (!content) continue;
       for (const event of content.events) {
-        const isApprovalEvent = event.type === "policy.approval_requested"
-          || event.type === "approval.requested"
-          || event.type === "policy.approval.provided"
-          || event.type === "approval.resolved";
-        const eventWorkSessionId = typeof event.payload?.workSessionId === "string"
-          ? event.payload.workSessionId
-          : undefined;
-        const targetSessionId = eventWorkSessionId
-          ?? (isApprovalEvent && selectedWorkSessionId ? selectedWorkSessionId : event.sessionId);
+        const targetSessionId = workspaceEventTargetSessionId(event);
         if (!workSessionViews.has(targetSessionId)) {
           // Correlation is enough to create a lightweight view immediately;
           // reduce the triggering event before the full snapshot arrives.
           ensureWorkSessionView(targetSessionId, event.workspaceSessionId ?? workspaceId, "");
           reduceWorkSessionEvent(targetSessionId, event);
+          // P0.3: a brand-new direct approval must surface immediately — the
+          // lightweight view was just created for it.
+          if (event.type === "policy.approval_requested" && targetSessionId === approvalCenterId(workspaceId)) {
+            surfaceNewDirectApproval(workspaceId, String(event.payload?.approvalId ?? ""));
+          }
           queueSessionRehydration();
           continue;
         }
         reduceWorkSessionEvent(targetSessionId, event);
+        // P0.3: a new approval arrives (auto-switch), or the last one
+        // resolves (restore the pre-approval surface).
+        if (event.type === "policy.approval_requested" && targetSessionId === approvalCenterId(workspaceId)) {
+          surfaceNewDirectApproval(workspaceId, String(event.payload?.approvalId ?? ""));
+        } else if ((event.type === "policy.approval.provided" || event.type === "approval.resolved")
+          && targetSessionId === approvalCenterId(workspaceId)) {
+          maybeRestoreAfterApprovalResolved(workspaceId, String(event.payload?.approvalId ?? "") || undefined);
+        }
       }
       cursor = Math.max(cursor, content.nextSeq);
       workspaceEventCursor = cursor;
@@ -1730,6 +2211,10 @@ function reduceWorkSessionEvent(sessionId: string, event: AgentActivityEvent): v
         command: typeof event.payload?.command === "string" ? event.payload.command : undefined,
         approvalKey: typeof event.payload?.approvalKey === "string" ? event.payload.approvalKey : undefined,
         matchedPattern: typeof event.payload?.matchedPattern === "string" ? event.payload.matchedPattern : undefined,
+        origin: event.payload?.origin === "work_session" ? "work_session" : "direct_mcp",
+        conversationId: typeof event.payload?.conversationId === "string" ? event.payload.conversationId : undefined,
+        requestedAt: typeof event.payload?.requestedAt === "string" ? event.payload.requestedAt : event.createdAt,
+        expiresAt: typeof event.payload?.expiresAt === "string" ? event.payload.expiresAt : undefined,
         options: parsePolicyApprovalOptions(event.payload?.options),
       });
       view.pendingApprovalCount = view.policyApprovals.size;
@@ -2021,10 +2506,22 @@ function renderApprovalCenterCard(card: ToolResultCard, display: ToolDisplay): v
       list.append(renderPolicyApproval(tempView, {
         approvalId: String(approval.id ?? ""),
         workspaceId: typeof approval.workspaceId === "string" ? approval.workspaceId : undefined,
+        kind: typeof approval.kind === "string" ? approval.kind : undefined,
         workSessionId: typeof approval.workSessionId === "string" ? approval.workSessionId : undefined,
+        title: typeof approval.title === "string" ? approval.title : undefined,
+        description: typeof approval.description === "string" ? approval.description : undefined,
+        risk: typeof approval.risk === "string" ? approval.risk : undefined,
         tool: String(approval.tool ?? "tool"),
         path: typeof approval.path === "string" ? approval.path : undefined,
         command: typeof approval.command === "string" ? approval.command : undefined,
+        origin: approval.origin === "direct_mcp" || approval.origin === "work_session" ? approval.origin : undefined,
+        conversationId: typeof approval.conversationId === "string" ? approval.conversationId : undefined,
+        orphanedAt: typeof approval.orphanedAt === "string" ? approval.orphanedAt : undefined,
+        reattachDeadline: typeof approval.reattachDeadline === "string" ? approval.reattachDeadline : undefined,
+        liveWaiterCount: typeof approval.liveWaiterCount === "number" ? approval.liveWaiterCount : undefined,
+        requestedAt: typeof approval.requestedAt === "string" ? approval.requestedAt : undefined,
+        createdAt: typeof approval.createdAt === "string" ? approval.createdAt : undefined,
+        expiresAt: typeof approval.expiresAt === "string" ? approval.expiresAt : undefined,
         options: parsePolicyApprovalOptions(approval.options),
       }));
     }
@@ -2126,6 +2623,24 @@ function renderFeedbackSubmitted(view: WorkSessionViewState): HTMLElement {
 function renderPolicyApproval(view: WorkSessionViewState, approval: PolicyApprovalView): HTMLElement {
   const item = element("div", { className: "approval-card" });
   const title = element("div", { className: "approval-title", text: approval.title ?? approval.tool });
+  const workspace = approval.workspaceId ?? activeWorkspaceId ?? view.workspaceSessionId;
+  const source = approval.origin === "work_session"
+    ? `Work session${approval.workSessionId ? ` · ${approval.workSessionId}` : ""}`
+    : `Direct MCP${approval.conversationId ? ` · ${approval.conversationId}` : ""}`;
+  const lifecycle = approval.orphanedAt
+    ? ` · orphaned ${new Date(approval.orphanedAt).toLocaleString()}${approval.reattachDeadline ? ` · reattach until ${new Date(approval.reattachDeadline).toLocaleString()}` : ""}`
+    : approval.liveWaiterCount !== undefined
+      ? ` · ${approval.liveWaiterCount} live waiter${approval.liveWaiterCount === 1 ? "" : "s"}`
+      : "";
+  const requestedAt = approval.requestedAt ?? approval.createdAt;
+  const requestedMs = requestedAt ? Date.parse(requestedAt) : Number.NaN;
+  const age = Number.isFinite(requestedMs)
+    ? ` · age ${formatElapsed(Math.max(0, Date.now() - requestedMs))}`
+    : "";
+  const metadata = element("div", {
+    className: "approval-meta",
+    text: `${source} · workspace ${workspace ?? "unknown"} · ${approval.tool}${approval.risk ? ` · risk ${approval.risk}` : ""}${age}${lifecycle}`,
+  });
   const detail = element("div", {
     className: "approval-detail",
     text: approval.description ?? approval.command ?? approval.path ?? approval.matchedPattern ?? approval.approvalKey ?? approval.approvalId,
@@ -2149,7 +2664,7 @@ function renderPolicyApproval(view: WorkSessionViewState, approval: PolicyApprov
     return btn;
   };
   buttons.append(...options.map(makeButton));
-  item.append(title, detail, buttons);
+  item.append(title, metadata, detail, buttons);
   if (approval.error) item.append(element("div", { className: "feedback-error", text: approval.error }));
   return item;
 }
@@ -2333,9 +2848,59 @@ function toolNameFromMeta(result: CallToolResult): ToolName | undefined {
 
 type ServerToolRequest = Parameters<App["callServerTool"]>[0];
 
-async function callServerToolChecked(request: ServerToolRequest): Promise<CallToolResult> {
+type ServerToolRetryMode = "safe" | "reconcile" | "never";
+interface ServerToolCallOptions { retry?: ServerToolRetryMode }
+
+const SAFE_RETRY_TOOLS = new Set([
+  "get_workspace_session_surface",
+  "list_pending_approvals",
+  "get_work_session_snapshot",
+  "get_review_submission",
+  "inspect_supervised_work",
+  "await_workspace_events",
+]);
+
+const RECONCILE_ONLY_TOOLS = new Set([
+  "resolve_agent_message",
+  "redrive_supervisor_run",
+  "run_mission_verification",
+  "continue_supervised_work",
+  "submit_to_coding_agent",
+  "pause_supervisor_run",
+  "resume_supervisor_run",
+  "provide_review_feedback",
+  "approve_supervised_work",
+  "provide_policy_approval",
+]);
+
+const NEVER_RETRY_TOOLS = new Set([
+  "cancel_work_session",
+]);
+
+function retryModeForServerTool(name: string, explicit?: ServerToolRetryMode): ServerToolRetryMode {
+  if (explicit) return explicit;
+  if (SAFE_RETRY_TOOLS.has(name)) return "safe";
+  if (RECONCILE_ONLY_TOOLS.has(name)) return "reconcile";
+  if (NEVER_RETRY_TOOLS.has(name)) return "never";
+  return "never";
+}
+
+async function callServerToolChecked(request: ServerToolRequest, options: ServerToolCallOptions = {}): Promise<CallToolResult> {
   if (!app) throw new Error("The MCP host connection is unavailable.");
-  const result = await app.callServerTool(request);
+  let result: CallToolResult;
+  try {
+    result = await app.callServerTool(request);
+  } catch (transportError) {
+    // A transient host/tunnel failure should get one deterministic reconnect
+    // and rehydration attempt before the caller sees a permanent error.
+    await reconnectApp(transportError);
+    if (!app) throw transportError;
+    const retryMode = retryModeForServerTool(String(request.name), options.retry);
+    if (retryMode !== "safe") {
+      throw new Error(`Transport failed during ${String(request.name)}; connection was restored and state rehydrated. Verify the operation before retrying.`);
+    }
+    result = await app.callServerTool(request);
+  }
   if (!result.isError) return result;
   const message = result.content
     .filter((block): block is { type: "text"; text: string } => block.type === "text")
@@ -2353,6 +2918,15 @@ function cardFromMeta(result: CallToolResult): Partial<ToolResultCard> | undefin
 
 function getStructuredContent<T>(result: CallToolResult): T | undefined {
   return result.structuredContent as T | undefined;
+}
+
+function formatElapsed(milliseconds: number): string {
+  if (milliseconds < 1_000) return "<1s";
+  const seconds = Math.floor(milliseconds / 1_000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
 }
 
 function element<K extends keyof HTMLElementTagNameMap>(
@@ -2435,4 +3009,17 @@ export const __workspaceAppTest = {
   ensureWorkSessionView,
   renderWorkSessionView,
   reduceWorkSessionEvent,
+  workspaceEventTargetSessionId,
+  boot,
+  callServerToolChecked,
+  getConnectionState: () => connectionState,
+  getLastSuccessfulHydrationAt: () => lastSuccessfulHydrationAt,
+  getWorkSessionView: (sessionId: string) => workSessionViews.get(sessionId),
+  getActiveWorkspaceId: () => activeWorkspaceId,
+  getSelectedWorkSessionId: () => selectedWorkSessionId,
+  activateWorkspace,
+  surfaceNewDirectApproval,
+  surfaceNewDirectApprovalResolved: (workspaceId: string) => maybeRestoreAfterApprovalResolved(workspaceId),
+  selectWorkSession,
+  reconcileAuthoritativeApprovals,
 };
