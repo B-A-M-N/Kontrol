@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, existsSync, readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, existsSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -53,6 +54,9 @@ assert.throws(
     KONTROL_OAUTH_OWNER_TOKEN: undefined,
     KONTROL_AUTH_MODE: "tunnel",
     HOST: "127.0.0.1",
+    // The ask baseline needs reviewer authority in tunnel mode (startup
+    // gate); this minimal deployment asserts it through the tunnel secret.
+    KONTROL_TUNNEL_REVIEWER_SECRET: "auth-tunnel-reviewer-secret-long-enough",
   };
   const cfg = loadConfig(noOauthEnv);
   assert.equal(cfg.authMode, "tunnel");
@@ -69,8 +73,25 @@ assert.equal(loadConfig({ ...baseEnv, KONTROL_TUNNEL_TOKEN: "short" }).authMode,
 
 // --- the inlined review WebUI is a single self-contained file ---
 {
-  const htmlPath = fileURLToPath(new URL("../dist/ui/workspace-app.html", import.meta.url));
-  assert.equal(existsSync(htmlPath), true, "dist/ui/workspace-app.html must exist (run `npm run build:app`)");
+  let uiRoot = fileURLToPath(new URL("../dist", import.meta.url));
+  let temporaryUiRoot: string | undefined;
+  const existingHtmlPath = join(uiRoot, "ui/workspace-app.html");
+  const existingHtml = existsSync(existingHtmlPath) ? readFileSync(existingHtmlPath, "utf8") : "";
+  if (!existingHtml.includes('<main id="app"')) {
+    // The runtime suite intentionally builds UI candidates in an isolated
+    // temporary tree and the launcher tests may remove the mutable dist
+    // projection. Keep this security test self-contained instead of relying
+    // on whichever prior test happened to leave dist/ behind.
+    temporaryUiRoot = mkdtempSync(join(tmpdir(), "kontrol-auth-ui-"));
+    execFileSync("npm", ["run", "--silent", "build:app"], {
+      cwd: fileURLToPath(new URL("..", import.meta.url)),
+      env: { ...process.env, KONTROL_BUILD_OUTPUT_DIR: temporaryUiRoot },
+      stdio: "ignore",
+    });
+    uiRoot = temporaryUiRoot;
+  }
+  const htmlPath = join(uiRoot, "ui/workspace-app.html");
+  assert.equal(existsSync(htmlPath), true, "built UI candidate must contain workspace-app.html");
   const html = readFileSync(htmlPath, "utf8");
   assert.equal(html.includes('<main id="app"'), true, "expected the diff card markup");
   assert.equal(
@@ -83,6 +104,7 @@ assert.equal(loadConfig({ ...baseEnv, KONTROL_TUNNEL_TOKEN: "short" }).authMode,
     false,
     "WebUI must inline its CSS (no external ./assets link tag)",
   );
+  if (temporaryUiRoot) rmSync(temporaryUiRoot, { recursive: true, force: true });
 }
 
 // --- tunnel mode never installs a second Kontrol bearer gate ---

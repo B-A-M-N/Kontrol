@@ -15,6 +15,9 @@ const config = loadConfig({
   KONTROL_WORKTREE_ROOT: worktreeRoot,
   KONTROL_AUTH_MODE: "tunnel",
   KONTROL_ACP_ENABLED: "false",
+  // This suite exercises transport/session plumbing, not the approval
+  // boundary; the ask baseline would also trip the tunnel reviewer gate.
+  KONTROL_POLICY_MODE: "allow",
   KONTROL_LOG_LEVEL: "error",
   KONTROL_LOG_REQUESTS: "0",
   // Leave enough setup grace for the first notification, while keeping the
@@ -92,12 +95,29 @@ async function closeSession(sessionId: string): Promise<void> {
   assert.ok([200, 202, 204].includes(response.status), `DELETE returned HTTP ${response.status}`);
 }
 
+async function closeSessionIfPresent(sessionId: string): Promise<void> {
+  const response = await fetch(url, {
+    method: "DELETE",
+    headers: { "mcp-session-id": sessionId },
+  });
+  assert.ok([200, 202, 204, 404].includes(response.status), `DELETE returned HTTP ${response.status}`);
+}
+
 async function diagnostics(): Promise<any> {
   const response = await fetch(new URL("/diagnostics", url), {
     headers: { "x-kontrol-diagnostics": "session-reuse-test-secret" },
   });
   assert.equal(response.status, 200);
   return await response.json() as any;
+}
+
+async function waitFor(predicate: () => Promise<boolean>, timeoutMs = 2_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.fail("timed out waiting for MCP continuity state");
 }
 
 try {
@@ -127,26 +147,110 @@ try {
   assert.ok(labels.some((label: string) => label.startsWith("conversation:review-a/mcp:")));
   assert.ok(beforeReuse.perClient.some((client: any) => client.currentMultiToolSessions >= 1));
 
+  // A transport loss does not require the host to reuse an expired MCP
+  // session ID. A fresh initialize with the same trusted conversation gets a
+  // new isolated transport while the server-side continuity index records the
+  // predecessor and reconnect.
+  const reconnectBefore = await openSession("reconnect-a");
+  await closeSession(reconnectBefore.sessionId);
+  await waitFor(async () => (await diagnostics()).mcpSessionMetrics.logicalContinuity.records.some(
+    (record: any) => record.identity === "conversation:reconnect-a" && record.detachedTransportCount >= 1,
+  ));
+  const reconnectAfter = await openSession("reconnect-a");
+  assert.notEqual(reconnectAfter.sessionId, reconnectBefore.sessionId);
+  const durableReadAfterReconnect = await rpc("tools/call", {
+    name: "read",
+    arguments: { workspaceId: reconnectBefore.workspaceId, path: "missing-after-reconnect.txt" },
+  }, reconnectAfter.sessionId, "reconnect-a");
+  assert.equal(durableReadAfterReconnect.response.status, 200, "a fresh MCP initialize must retain access to the explicit durable workspace ID");
+  assert.notEqual(durableReadAfterReconnect.payload?.error?.code, -32001, JSON.stringify(durableReadAfterReconnect.payload));
+  const continuitySnapshot = await diagnostics();
+  const continuityRecord = continuitySnapshot.mcpSessionMetrics.logicalContinuity.records.find(
+    (record: any) => record.identity === "conversation:reconnect-a",
+  );
+  assert.equal(continuityRecord?.source, "conversation");
+  assert.ok((continuityRecord?.reconnectCount ?? 0) >= 1);
+  assert.equal(continuityRecord?.activeTransportCount, 1);
+  await closeSession(reconnectAfter.sessionId);
+
+  // Meaningful application traffic keeps one MCP transport reusable past both
+  // the one-tool and reusable idle cutoffs. The reaper must not mistake age
+  // for idleness or create a replacement transport behind the caller's back.
+  const sustained = await openSession("sustained-a");
+  const sustainedSecondTool = await rpc("tools/call", {
+    name: "open_workspace",
+    arguments: { path: root, mode: "checkout" },
+  }, sustained.sessionId, "sustained-a");
+  assert.equal(sustainedSecondTool.response.status, 200);
+  const sustainedCreated = (await diagnostics()).mcpSessionMetrics.created;
+  for (let index = 0; index < 3; index++) {
+    await new Promise((resolve) => setTimeout(resolve, 4_000));
+    const sustainedRead = await rpc("tools/list", {}, sustained.sessionId, "sustained-a");
+    assert.equal(sustainedRead.response.status, 200, `same transport failed on sustained reuse ${index}`);
+  }
+  const sustainedSnapshot = await diagnostics();
+  assert.equal(sustainedSnapshot.mcpSessionMetrics.created, sustainedCreated, "reaper must not replace an actively reused transport");
+  assert.ok(sustainedSnapshot.mcpSessionMetrics.sessions.some(
+    (session: any) => session.sessionLabel.endsWith(`/mcp:${sustained.sessionId.slice(0, 8)}`),
+  ));
+  await closeSession(sustained.sessionId);
+
+  // Exercise an actual long-lived transport socket loss, not only an orderly
+  // MCP DELETE. Closing the SSE body must detach the disposable transport so
+  // a fresh initialize can be recognized as a reconnect.
+  const socketSession = await openSession("socket-loss-a");
+  const sse = await fetch(url, {
+    headers: { accept: "text/event-stream", "mcp-session-id": socketSession.sessionId },
+  });
+  assert.equal(sse.status, 200);
+  await sse.body?.cancel();
+  await waitFor(async () => (await diagnostics()).mcpSessionMetrics.logicalContinuity.records.some(
+    (record: any) => record.identity === "conversation:socket-loss-a" && record.detachedTransportCount >= 1,
+  ));
+  const socketReconnect = await openSession("socket-loss-a");
+  assert.notEqual(socketReconnect.sessionId, socketSession.sessionId);
+  await closeSession(socketReconnect.sessionId);
+
+  // An active SSE response remains protected even after the reusable idle TTL;
+  // once it closes, genuine idleness becomes eligible for the normal reaper.
+  const sseProtected = await openSession("sse-ttl-a");
+  const protectedStream = await fetch(url, {
+    headers: { accept: "text/event-stream", "mcp-session-id": sseProtected.sessionId },
+  });
+  assert.equal(protectedStream.status, 200);
+  await new Promise((resolve) => setTimeout(resolve, 11_000));
+  const protectedSnapshot = await diagnostics();
+  const protectedLabel = (session: any) => session.sessionLabel.endsWith(`/mcp:${sseProtected.sessionId.slice(0, 8)}`);
+  assert.ok(protectedSnapshot.mcpSessionMetrics.sessions.some(protectedLabel), "active SSE must not be reaped past its idle TTL");
+  await protectedStream.body?.cancel();
+  await waitFor(async () => !(await diagnostics()).mcpSessionMetrics.sessions.some(protectedLabel), 3_000);
+
   // Remove the reusable fixture, then reproduce the live one-session-per-tool
-  // pattern sequentially. The 21st initialization must reclaim the oldest
-  // idle one-tool transport instead of returning a per-client-cap 503.
-  await closeSession(reusable.sessionId);
+  // pattern without a trustworthy instance/conversation header. The 21st
+  // initialization must not evict an unrelated transport merely because all
+  // share the generic clientInfo name/version fallback.
+  await closeSessionIfPresent(reusable.sessionId);
   const ephemeral = [];
   for (let index = 0; index < 20; index++) {
-    ephemeral.push(await openSession(index % 2 === 0 ? "review-b" : "review-c"));
+    ephemeral.push(await openSession());
   }
   assert.equal(new Set(ephemeral.map(({ sessionId }) => sessionId)).size, 20);
-  const twentyFirst = await openSession("review-cap-21");
+  const twentyFirst = await openSession();
   assert.ok(twentyFirst.sessionId);
-  const secondToolList = await rpc("tools/list", {}, twentyFirst.sessionId, "review-cap-21");
+  const secondToolList = await rpc("tools/list", {}, twentyFirst.sessionId);
   assert.equal(secondToolList.response.status, 200);
   const capSnapshot = await diagnostics();
   const capReuse = capSnapshot.mcpSessionMetrics.reuse;
   const capSingleToolSessions = capReuse.perClient.reduce((sum: number, client: any) => sum + client.currentSingleToolSessions, 0);
-  assert.ok(capSnapshot.mcpSessionMetrics.sessions.some((session: any) => session.sessionLabel.startsWith("conversation:review-b/mcp:")));
+  assert.ok(capSnapshot.mcpSessionMetrics.sessions.some((session: any) => session.identitySource === "client_info_fallback"));
+  assert.ok(capSnapshot.mcpSessionMetrics.logicalContinuity.records.every(
+    (record: any) => record.source !== "client_info_fallback",
+  ), "generic clientInfo fallback must not create logical continuity records");
   assert.ok(capSingleToolSessions + capReuse.singleToolSessions >= 20);
-  assert.ok(capReuse.sessionsExpired >= 1, "cap admission did not reclaim an idle ephemeral session");
-  assert.ok(capSnapshot.totalMcpSessions <= 20, "per-client cap was exceeded instead of reclaiming an idle session");
+  // A global LRU/memory bound may still reclaim one session, but the generic
+  // fallback must not be treated as a single trustworthy client owner for
+  // the aggressive per-client eviction policy.
+  assert.ok(capSnapshot.totalMcpSessions <= config.mcpSessionHardCap);
   assert.ok(capSnapshot.mcpSessionMetrics.toolListDescriptorCache.hits >= 1, "static tools/list descriptor cache was not reused");
   const timing = capSnapshot.mcpSessionMetrics.timing;
   assert.ok(timing.initialization.totalMs.p95 < 1_000, `MCP initialization regression exceeded 1s p95: ${JSON.stringify(timing.initialization)}`);

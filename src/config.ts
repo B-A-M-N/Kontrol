@@ -4,8 +4,9 @@ import { expandHomePath } from "./roots.js";
 import type { LoggingConfig, LogFormat, LogLevel } from "./logger.js";
 import type { OAuthConfig } from "./oauth-provider.js";
 import type { PolicyConfig } from "./policy.js";
-import { loadPolicyConfig } from "./policy.js";
+import { loadPolicyConfig, policyCanAsk } from "./policy.js";
 import { loadKontrolFiles } from "./user-config.js";
+import { DEFAULT_DIRECT_APPROVAL_REATTACH_GRACE_MS } from "./policy-approval-defaults.js";
 
 export type ToolMode = "minimal" | "full" | "codex";
 export type WidgetMode = "off" | "changes" | "full";
@@ -80,14 +81,26 @@ export interface ServerConfig {
   mcpAdmissionTimeoutMs: number;
   /** Maximum execution time for ordinary, non-waiter MCP requests. */
   mcpExecutionTimeoutMs: number;
+  /** Periodic maintenance scheduling and wall-clock budget. */
+  maintenanceIntervalMs: number;
+  maintenanceBudgetMs: number;
+  /** Diagnostic integrity scheduling and worker deadline. */
+  integrityIntervalMs: number;
+  integrityDeadlineMs: number;
   /** @deprecated use mcpAdmissionTimeoutMs. */
   mcpRequestDeadlineMs: number;
   /** Default blocking policy-approval lifetime. */
   policyApprovalTimeoutMs: number;
+  /** Human decision window for a direct (non-blocking) tool approval. */
+  policyDirectApprovalTtlMs: number;
+  /** Grace period for reconnecting a direct MCP approval after its caller disappears. */
+  policyDirectApprovalReattachGraceMs: number;
   mcpUnusedSessionIdleMs: number;
   mcpEphemeralSessionIdleMs: number;
   mcpReusableSessionIdleMs: number;
   mcpSessionReaperIntervalMs: number;
+  /** Retention for trusted logical-client continuity after transport loss. */
+  mcpLogicalContinuityRetentionMs: number;
   mcpSessionMaxPerClient: number;
   mcpSessionSoftCap: number;
   mcpSessionHardCap: number;
@@ -398,6 +411,24 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     );
   }
 
+  const policy = loadPolicyConfig(env);
+  // Direct policy approvals exist independently from ACP. In tunnel mode the
+  // only reviewer authority is the secret-backed tunnel assertion, so an
+  // ask-capable policy without one can mint approval cards that no surface is
+  // authorized to resolve — the model would block forever. Fail at startup
+  // with the concrete fix, not at the first blocked tool call. This
+  // requirement is independent of ACP: KONTROL_ACP_ENABLED=false changes
+  // nothing about who can resolve an approval.
+  const tunnelReviewerSecret = env.KONTROL_TUNNEL_REVIEWER_SECRET ?? env.KONTROL_ACP_REVIEWER_SECRET;
+  if (authMode === "tunnel" && policyCanAsk(policy) && !tunnelReviewerSecret) {
+    throw new Error(
+      "KONTROL_AUTH_MODE=tunnel with an ask-capable policy requires a reviewer credential. " +
+        "Set KONTROL_TUNNEL_REVIEWER_SECRET (or the legacy KONTROL_ACP_REVIEWER_SECRET) so the tunnel can assert reviewer authority, " +
+        "or set the policy to a non-interactive posture (KONTROL_POLICY_MODE=allow) if no approval decisions are wanted. " +
+        "Without it, ask-gated tools create approvals that no reviewer surface can open or resolve.",
+    );
+  }
+
   const derivedAllowedHosts = [
     "localhost",
     "127.0.0.1",
@@ -421,7 +452,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     // Tunnel mode has no bearer gate at the local hop. The tunnel-client
     // therefore carries an explicit reviewer assertion. A dedicated secret is
     // preferred; the ACP reviewer secret is the migration fallback.
-    tunnelReviewerSecret: env.KONTROL_TUNNEL_REVIEWER_SECRET ?? env.KONTROL_ACP_REVIEWER_SECRET,
+    tunnelReviewerSecret,
     toolMode: parseToolMode(env),
     widgets: parseWidgetMode(env.KONTROL_WIDGETS),
     stateDir: resolve(expandHomePath(env.KONTROL_STATE_DIR ?? files.config.stateDir ?? defaultStateDir())),
@@ -440,7 +471,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     // P0 #9: outbound adapter credential; falls back to the legacy shared
     // secret only for backward compatibility.
     acpAdapterSecret: env.KONTROL_ACP_ADAPTER_SECRET ?? env.KONTROL_ACP_SHARED_SECRET,
-    policy: loadPolicyConfig(env),
+    policy,
     // P1 #50: Diagnostics secret — required for /diagnostics when set
     diagnosticsSecret: env.KONTROL_DIAGNOSTICS_SECRET,
     supervisorMaxInflight: parsePositiveInteger(env.KONTROL_SUPERVISOR_MAX_INFLIGHT, 4, "KONTROL_SUPERVISOR_MAX_INFLIGHT"),
@@ -473,6 +504,26 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
       30 * 60_000,
       "KONTROL_MCP_EXECUTION_TIMEOUT_MS",
     ),
+    maintenanceIntervalMs: parsePositiveInteger(
+      env.KONTROL_MAINTENANCE_INTERVAL_MS,
+      5 * 60_000,
+      "KONTROL_MAINTENANCE_INTERVAL_MS",
+    ),
+    maintenanceBudgetMs: parsePositiveInteger(
+      env.KONTROL_MAINTENANCE_BUDGET_MS,
+      250,
+      "KONTROL_MAINTENANCE_BUDGET_MS",
+    ),
+    integrityIntervalMs: parsePositiveInteger(
+      env.KONTROL_INTEGRITY_INTERVAL_MS,
+      30 * 60_000,
+      "KONTROL_INTEGRITY_INTERVAL_MS",
+    ),
+    integrityDeadlineMs: parsePositiveInteger(
+      env.KONTROL_INTEGRITY_DEADLINE_MS,
+      10_000,
+      "KONTROL_INTEGRITY_DEADLINE_MS",
+    ),
     // Approval calls are intentionally blocking. This is a stale-request
     // backstop, not a normal conversational timeout; the WebUI can still
     // approve a request many hours after it was created.
@@ -480,6 +531,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
       env.KONTROL_POLICY_APPROVAL_TIMEOUT_MS,
       24 * 60 * 60_000,
       "KONTROL_POLICY_APPROVAL_TIMEOUT_MS",
+    ),
+    policyDirectApprovalReattachGraceMs: parsePositiveInteger(
+      env.KONTROL_POLICY_DIRECT_REATTACH_GRACE_MS,
+      DEFAULT_DIRECT_APPROVAL_REATTACH_GRACE_MS,
+      "KONTROL_POLICY_DIRECT_REATTACH_GRACE_MS",
+    ),
+    policyDirectApprovalTtlMs: parsePositiveInteger(
+      env.KONTROL_POLICY_DIRECT_APPROVAL_TTL_MS,
+      10 * 60_000,
+      "KONTROL_POLICY_DIRECT_APPROVAL_TTL_MS",
     ),
     // Keep the old field for callers compiled against the previous config
     // contract, but make the new name authoritative internally.
@@ -504,6 +565,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     mcpEphemeralSessionIdleMs: parsePositiveInteger(env.KONTROL_MCP_EPHEMERAL_SESSION_IDLE_MS, 24 * 60 * 60_000, "KONTROL_MCP_EPHEMERAL_SESSION_IDLE_MS"),
     mcpReusableSessionIdleMs: parsePositiveInteger(env.KONTROL_MCP_REUSABLE_SESSION_IDLE_MS, 24 * 60 * 60_000, "KONTROL_MCP_REUSABLE_SESSION_IDLE_MS"),
     mcpSessionReaperIntervalMs: parsePositiveInteger(env.KONTROL_MCP_SESSION_REAPER_INTERVAL_MS, 15_000, "KONTROL_MCP_SESSION_REAPER_INTERVAL_MS"),
+    mcpLogicalContinuityRetentionMs: parsePositiveInteger(env.KONTROL_MCP_LOGICAL_CONTINUITY_RETENTION_MS, 72 * 60 * 60_000, "KONTROL_MCP_LOGICAL_CONTINUITY_RETENTION_MS"),
     mcpSessionMaxPerClient: parsePositiveInteger(env.KONTROL_MCP_SESSION_MAX_PER_CLIENT, 20, "KONTROL_MCP_SESSION_MAX_PER_CLIENT"),
     mcpSessionSoftCap: parsePositiveInteger(env.KONTROL_MCP_SESSION_SOFT_CAP, 150, "KONTROL_MCP_SESSION_SOFT_CAP"),
     mcpSessionHardCap: parsePositiveInteger(env.KONTROL_MCP_SESSION_HARD_CAP, 200, "KONTROL_MCP_SESSION_HARD_CAP"),
