@@ -128,7 +128,7 @@ if (probeBash) {
 // the secure baseline). Without reviewer credentials configured, an
 // ask-capable policy fails here instead of at the first blocked tool call.
 const reviewerReadiness = await fetch(readyUrl, { signal: AbortSignal.timeout(3_000) });
-const askCapable = jsonOrText(await reviewerReadiness.text()).approvalInteractive === true;
+const askCapable = jsonOrText(reviewerReadiness).approvalInteractive === true;
 if (askCapable) {
   const reviewerToken =
     process.env.KONTROL_TUNNEL_REVIEWER_SECRET ?? process.env.KONTROL_ACP_REVIEWER_SECRET;
