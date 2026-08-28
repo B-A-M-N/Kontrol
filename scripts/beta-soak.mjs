@@ -5,8 +5,8 @@
 // enough counters to distinguish a clean run from an interrupted or partially
 // reachable run. Every MCP transport opened by the soak is closed; continuity
 // is exercised by opening a fresh transport on each iteration.
-import { mkdirSync, renameSync, writeFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
@@ -18,7 +18,7 @@ function option(name, fallback) {
 
 const hours = Number(option("--hours"));
 if (!Number.isFinite(hours) || hours <= 0) {
-  throw new Error("Usage: beta-soak.mjs --hours HOURS [--url URL] [--interval-ms MS] [--report PATH] [--conversation ID] [--workspace-path PATH] [--build-id BUILD_ID] [--diagnostics-secret SECRET] [--tunnel-url URL]");
+  throw new Error("Usage: beta-soak.mjs --hours HOURS [--url URL] [--interval-ms MS] [--report PATH] [--conversation ID] [--workspace-path PATH] [--build-id BUILD_ID] [--diagnostics-secret SECRET] [--tunnel-url URL] [--reviewer-secret SECRET] [--approval-cadence N]");
 }
 const baseUrl = String(option("--url", "http://127.0.0.1:7676")).replace(/\/$/, "");
 const intervalMs = Math.max(250, Number(option("--interval-ms", "5000")));
@@ -31,8 +31,18 @@ const tunnelUrl = String(option("--tunnel-url", process.env.KONTROL_BETA_TUNNEL_
 const expectedBuildId = option("--build-id", process.env.KONTROL_BETA_BUILD_ID);
 const skipDiagnostics = process.argv.includes("--skip-diagnostics");
 const skipTunnel = process.argv.includes("--skip-tunnel");
+// P1: approval-continuity qualification. ChatGPT and similar tunnel
+// connectors do not send conversation headers, so their sessions resolve to
+// client_info_fallback by design. Continuity for that traffic is carried by
+// the explicit approvalResumeId token, not by conversation correlation — so
+// the soak proves the resume path end to end instead of asserting zero
+// fallback sessions. The reviewer secret authorizes the decision session
+// only; the agent session stays unprivileged.
+const reviewerSecret = option("--reviewer-secret", process.env.KONTROL_TUNNEL_REVIEWER_SECRET ?? process.env.KONTROL_ACP_REVIEWER_SECRET);
+const approvalCadence = Math.max(1, Number(option("--approval-cadence", "10")));
 const deadline = Date.now() + hours * 60 * 60_000;
 let stopping = false;
+let rpcCounter = 0;
 
 const report = {
   kind: "kontrol-beta-wall-clock-soak",
@@ -51,6 +61,8 @@ const report = {
   latencyMs: [],
   transportDrops: 0,
   reconnects: 0,
+  approvalResumes: 0,
+  approvalResumeFailures: 0,
   tunnelChecks: 0,
   tunnelFailures: 0,
   tunnelLastError: undefined,
@@ -190,18 +202,32 @@ function parseRpc(text) {
   return JSON.parse(data || text);
 }
 
-async function rpc(method, params, sessionId) {
+async function rpc(method, params, sessionId, opts = {}) {
   const response = await request("/mcp", {
     method: "POST",
     headers: {
       "content-type": "application/json",
       accept: "application/json, text/event-stream",
-      "x-kontrol-conversation-id": conversationId,
+      // The reviewer decision session presents the secret-backed assertion;
+      // agent/resume sessions stay unprivileged and header-free so their
+      // identity degrades to client_info_fallback exactly like tunnel
+      // connector traffic.
+      ...(opts.reviewer ? { "x-kontrol-reviewer-token": reviewerSecret } : {}),
       ...(sessionId ? { "mcp-session-id": sessionId } : {}),
     },
-    body: JSON.stringify({ jsonrpc: "2.0", id: `${process.pid}-${report.iterations}`, method, params }),
+    // JSON-RPC notifications carry NO id. A notification method sent with an
+    // id is a REQUEST by the JSON-RPC framing rules, and the server answers
+    // "Method not found" — which would fail every iteration here.
+    body: JSON.stringify(method.startsWith("notifications/")
+      ? { jsonrpc: "2.0", method, params }
+      : { jsonrpc: "2.0", id: `${process.pid}-${report.iterations}-${rpcCounter++}`, method, params }),
   });
-  const payload = parseRpc(await response.text());
+  const text = await response.text();
+  if (!text.trim()) {
+    // 202 Accepted: a notification was consumed; nothing to parse.
+    return { payload: undefined, sessionId: response.headers.get("mcp-session-id") ?? sessionId };
+  }
+  const payload = parseRpc(text);
   if (payload.error) {
     const error = new Error(payload.error.message ?? `JSON-RPC ${payload.error.code ?? "error"}`);
     error.status = response.status;
@@ -244,6 +270,128 @@ async function checkTunnel() {
     report.tunnelFailures++;
     report.tunnelLastError = error instanceof Error ? error.message : String(error);
     throw error;
+  }
+}
+
+// P1: approval-continuity qualification. Walk the full production lifecycle
+// of a direct MCP approval WITHOUT any trusted conversation header — the
+// shape ChatGPT/tunnel traffic actually has:
+//   1. an unprivileged agent session runs an ask-gated command and receives
+//      approval_required with a durable approvalId
+//   2. a reviewer-authoritized session lists pending approvals and approves
+//      that operation once
+//   3. the agent session RETRIES with approvalResumeId and the retried call
+//      must EXECUTE (consuming the human decision instead of re-prompting)
+// The retry deliberately runs on a FRESH transport whose session id differs
+// from the original, proving the opaque resume token carries continuity
+// across a transport replacement with fallback client identity.
+async function exerciseApprovalResume() {
+  if (!workspacePath) throw new Error("approval-resume qualification requires --workspace-path");
+  if (!reviewerSecret) throw new Error("approval-resume qualification requires --reviewer-secret (or KONTROL_TUNNEL_REVIEWER_SECRET / KONTROL_ACP_REVIEWER_SECRET)");
+
+  const command = `printf kontrol-soak-resume-${report.iterations}`;
+  // A disposable per-iteration directory guarantees a workspace where NO
+  // durable grant can pre-approve the gated command: an "Approve for
+  // workspace" decision from any earlier traffic would otherwise silently
+  // let bash run and the exercise would prove nothing.
+  const exerciseRoot = join(workspacePath, ".kontrol-soak-approval");
+  const exerciseDir = join(exerciseRoot, `it-${report.iterations}`);
+  mkdirSync(exerciseDir, { recursive: true });
+  writeFileSync(join(exerciseDir, "marker.txt"), `${command}\n`);
+  const openArguments = { path: exerciseDir, mode: "checkout" };
+
+  // 1. Agent session: approval_required card.
+  const agentInit = await rpc("initialize", {
+    protocolVersion: "2025-06-18",
+    capabilities: {},
+    clientInfo: { name: "kontrol-beta-soak-agent", version: "1" },
+  });
+  const agentSessionId = agentInit.sessionId;
+  if (!agentSessionId) throw new Error("approval-resume agent initialize did not return mcp-session-id");
+  let reviewerSessionId;
+  try {
+    await rpc("notifications/initialized", {}, agentSessionId);
+    const opened = await rpc("tools/call", {
+      name: "open_workspace",
+      arguments: openArguments,
+    }, agentSessionId);
+    const workspaceId = opened.payload?.result?.structuredContent?.workspaceId;
+    if (!workspaceId) throw new Error(`approval-resume open_workspace returned no workspaceId: ${JSON.stringify(opened.payload)}`);
+
+    const gated = await rpc("tools/call", {
+      name: "bash",
+      arguments: { workspaceId, command },
+    }, agentSessionId);
+    const card = gated.payload?.result?.structuredContent;
+    if (card?.status !== "approval_required" || typeof card?.approvalId !== "string") {
+      throw new Error(`approval-resume expected approval_required, got: ${JSON.stringify(card)}`);
+    }
+    const approvalId = card.approvalId;
+
+    // 2. Reviewer session: list + approve once.
+    const reviewerInit = await rpc("initialize", {
+      protocolVersion: "2025-06-18",
+      capabilities: {},
+      clientInfo: { name: "kontrol-beta-soak-reviewer", version: "1" },
+    }, undefined, { reviewer: true });
+    reviewerSessionId = reviewerInit.sessionId;
+    if (!reviewerSessionId) throw new Error("approval-resume reviewer initialize did not return mcp-session-id");
+    await rpc("notifications/initialized", {}, reviewerSessionId, { reviewer: true });
+    const listing = await rpc("tools/call", {
+      name: "list_pending_approvals",
+      arguments: { workspaceId },
+    }, reviewerSessionId, { reviewer: true });
+    const approvals = listing.payload?.result?.structuredContent?.approvals ?? [];
+    if (!approvals.some((entry) => entry.approvalId === approvalId)) {
+      throw new Error(`approval-resume approval ${approvalId} missing from reviewer listing: ${JSON.stringify(approvals)}`);
+    }
+    const decision = await rpc("tools/call", {
+      name: "provide_policy_approval",
+      arguments: { approvalId, decision: "approve", reason: "kontrol-beta-soak resume qualification" },
+    }, reviewerSessionId, { reviewer: true });
+    if (decision.payload?.result?.isError === true) {
+      throw new Error(`approval-resume approve failed: ${JSON.stringify(decision.payload)}`);
+    }
+
+    // 3. Fresh agent transport: retry with the echoed resume token.
+    const resumeInit = await rpc("initialize", {
+      protocolVersion: "2025-06-18",
+      capabilities: {},
+      clientInfo: { name: "kontrol-beta-soak-agent", version: "1" },
+    });
+    const resumeSessionId = resumeInit.sessionId;
+    if (!resumeSessionId) throw new Error("approval-resume retry initialize did not return mcp-session-id");
+    try {
+      await rpc("notifications/initialized", {}, resumeSessionId);
+      const reopened = await rpc("tools/call", {
+        name: "open_workspace",
+        arguments: openArguments,
+      }, resumeSessionId);
+      const resumeWorkspaceId = reopened.payload?.result?.structuredContent?.workspaceId;
+      if (!resumeWorkspaceId) throw new Error("approval-resume retry open_workspace returned no workspaceId");
+      const retried = await rpc("tools/call", {
+        name: "bash",
+        arguments: { workspaceId: resumeWorkspaceId, command, approvalResumeId: approvalId },
+      }, resumeSessionId);
+      const resultText = (retried.payload?.result?.content ?? [])
+        .map((chunk) => chunk.text ?? "")
+        .join("");
+      if (retried.payload?.result?.isError === true
+        || retried.payload?.result?.structuredContent?.status === "approval_required"
+        || !resultText.includes(`kontrol-soak-resume-${report.iterations}`)) {
+        throw new Error(`approval-resume retry did not execute the approved operation: ${JSON.stringify(retried.payload)}`);
+      }
+      report.approvalResumes++;
+    } finally {
+      try { await closeSession(resumeSessionId); } catch { /* counted by iteration cleanup */ }
+    }
+  } catch (error) {
+    report.approvalResumeFailures++;
+    throw error;
+  } finally {
+    try { await closeSession(agentSessionId); } catch { /* counted by iteration cleanup */ }
+    try { await closeSession(reviewerSessionId); } catch { /* reviewer cleanup */ }
+    try { rmSync(exerciseDir, { recursive: true, force: true }); } catch { /* disposable scratch */ }
   }
 }
 
@@ -293,6 +441,12 @@ async function iteration() {
       report.reconnects++;
       await rpc("notifications/initialized", {}, sessionId);
       await rpc("tools/list", {}, sessionId);
+    }
+    // P1: on its own cadence, prove the approval resume path end to end —
+    // the only continuity mechanism available to header-less tunnel
+    // connector traffic.
+    if (report.iterations % approvalCadence === 0) {
+      await exerciseApprovalResume();
     }
     await collectSnapshot();
     report.successes++;
@@ -376,15 +530,17 @@ if (startedSnapshot && finishedSnapshot) {
       && (finishedSnapshot.gitDirty === undefined || Number(finishedSnapshot.gitDirty) === 0),
     continuityBounded: finishedSnapshot.sessions.logicalContinuity
       <= startedSnapshot.sessions.logicalContinuity + 1,
-    // P1: real connector traffic must carry trusted conversation correlation.
-    // Every session the soak created should resolve to a trusted identity
-    // source; a client_info_fallback session here means approval continuity
-    // degraded to an untrusted fingerprint and one-shot approvals could
-    // re-prompt after a transport replacement.
-    approvalContinuityCapable: Number(
-      finishedSnapshot.sessions.identitySources?.client_info_fallback ?? 0,
-    ) === 0
-      && Number(finishedSnapshot.sessions.current ?? 0) > 0,
+    // P1: approval continuity must work for header-less tunnel connector
+    // traffic, whose sessions resolve to client_info_fallback by design.
+    // The qualification is therefore the exercised resume path — every
+    // cadence iteration drove approval_required → reviewer decision →
+    // approvalResumeId retry on a fresh transport and the retry EXECUTED —
+    // plus no residual approval rows or waiters, so nothing was left
+    // stranded by the exercise.
+    approvalContinuityCapable: report.approvalResumes > 0
+      && report.approvalResumeFailures === 0
+      && finishedSnapshot.sessions.pendingApprovalRows === 0
+      && finishedSnapshot.sessions.activePolicyWaiters === 0,
   };
 }
 report.status = stopping ? "interrupted" : (report.failures === 0 ? "passed" : "failed");
