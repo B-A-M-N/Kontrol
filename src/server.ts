@@ -770,6 +770,21 @@ function resultOutputSchema(extra: z.ZodRawShape = {}): z.ZodRawShape {
   };
 }
 
+/**
+ * Explicit opaque operation-resume identity (audit P1). A caller whose tool
+ * call returned approval_required retries with the SAME arguments plus this
+ * field set to the approvalId it was shown. The server verifies the echoed
+ * operation content against the durable approval row before honoring the
+ * original human decision, so a reconnect that lost its conversation
+ * correlation can still consume "Approve Once" instead of prompting again.
+ */
+const approvalResumeIdSchema = z
+  .string()
+  .optional()
+  .describe(
+    "Opaque resume token: the approvalId returned in a prior approval_required result. Retry the identical tool call with this field set to consume the human's original decision.",
+  );
+
 const workspaceSkillOutputSchema = z.object({
   name: z.string(),
   description: z.string(),
@@ -912,12 +927,13 @@ function policyFailureResponse(
   structuredContent?: Record<string, unknown>;
 } {
   if (result.approvalRequired && result.approvalId) {
-    const message = `Approval required. Approve ${result.approvalId} in the Kontrol review UI, then retry this tool call.`;
+    const message = `Approval required. Approve ${result.approvalId} in the Kontrol review UI, then retry this exact tool call with approvalResumeId set to ${result.approvalId}. The retry consumes the human decision without prompting again.`;
     const card: Record<string, unknown> = {
       tool: context.tool,
       workspaceId: context.workspaceId,
       status: "approval_required",
       approvalId: result.approvalId,
+      resumeArgument: "approvalResumeId",
       retryable: true,
       summary: {
         status: "approval_required",
@@ -975,6 +991,7 @@ async function enforceToolPolicy(
   path: PolicyInvocation["path"],
   command: string | undefined,
   paths?: PolicyInvocation["paths"],
+  approvalResumeId?: string,
 ): Promise<{ allowed: boolean; approvalRequired?: boolean; approvalId?: string }> {
   if (workSessions && workSessionId) {
     const sessionDecision = authorizeWorkSessionAction(workSessions, {
@@ -1006,6 +1023,11 @@ async function enforceToolPolicy(
     blockingApproval: Boolean(workSessionId),
     conversationId: currentMcpRequestContext()?.conversationId,
     approvalCorrelationId: currentMcpRequestContext()?.approvalCorrelationId,
+    // Explicit opaque operation-resume identity: when a retrying caller
+    // echoes the approvalId from its approval_required card, verified
+    // content adopts the original durable operation instead of prompting
+    // again under a new reconnect fingerprint.
+    approvalResumeId,
   });
   return result;
 }
@@ -1179,6 +1201,7 @@ function registerCodexProcessTools(
       inputSchema: {
         workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
         cmd: z.string().min(1).describe("Shell command to execute."),
+        approvalResumeId: approvalResumeIdSchema,
         tty: z
           .boolean()
           .optional()
@@ -1208,7 +1231,7 @@ function registerCodexProcessTools(
       ...toolWidgetDescriptorMeta(config, "shell"),
       annotations: SHELL_TOOL_ANNOTATIONS,
     },
-    async ({ workspaceId, cmd, tty, columns, rows, workingDirectory, yieldTimeMs, maxOutputTokens }) => {
+    async ({ workspaceId, cmd, approvalResumeId, tty, columns, rows, workingDirectory, yieldTimeMs, maxOutputTokens }) => {
       const startedAt = performance.now();
       const workspace = workspaces.getWorkspace(workspaceId);
       const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
@@ -1229,6 +1252,8 @@ function registerCodexProcessTools(
           "bash",
           policyPath,
           cmd,
+          undefined,
+          approvalResumeId,
         );
         if (!approved.allowed) {
           return policyFailureResponse(approved, `Tool "exec_command" denied by policy. Command: ${cmd}`, {
@@ -1284,6 +1309,7 @@ function registerCodexProcessTools(
         workspaceId: z.string().describe("Workspace identifier used to start the process."),
         sessionId: z.string().describe("Opaque process session identifier returned by exec_command."),
         chars: z.string().optional().describe("Characters to write. Omit or pass an empty string to poll."),
+        approvalResumeId: approvalResumeIdSchema,
         columns: z.number().int().min(1).max(1_000).optional().describe("Resize a PTY to this width."),
         rows: z.number().int().min(1).max(1_000).optional().describe("Resize a PTY to this height."),
         yieldTimeMs: z
@@ -1305,7 +1331,7 @@ function registerCodexProcessTools(
       ...toolWidgetDescriptorMeta(config, "shell"),
       annotations: SHELL_TOOL_ANNOTATIONS,
     },
-    async ({ workspaceId, sessionId, chars, columns, rows, yieldTimeMs, maxOutputTokens }) => {
+    async ({ workspaceId, sessionId, chars, approvalResumeId, columns, rows, yieldTimeMs, maxOutputTokens }) => {
       const startedAt = performance.now();
       workspaces.getWorkspace(workspaceId);
       const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
@@ -1329,6 +1355,8 @@ function registerCodexProcessTools(
           "bash",
           undefined,
           chars,
+          undefined,
+          approvalResumeId,
         );
         if (!approved.allowed) {
           return policyFailureResponse(approved, `Tool "write_stdin" denied by policy: cannot send input to a gated process.`, {
@@ -1755,6 +1783,7 @@ function createMcpServer(
           .positive()
           .optional()
           .describe("Maximum number of lines to read."),
+        approvalResumeId: approvalResumeIdSchema,
       },
       outputSchema: resultOutputSchema(),
       ...toolWidgetDescriptorMeta(config, "read"),
@@ -1862,6 +1891,7 @@ function createMcpServer(
           .string()
           .describe("File path to write, relative to the workspace root."),
         content: z.string().describe("Complete new file content."),
+        approvalResumeId: approvalResumeIdSchema,
       },
       outputSchema: resultOutputSchema(),
       ...toolWidgetDescriptorMeta(config, "write"),
@@ -1974,10 +2004,8 @@ function createMcpServer(
             }),
           )
           .min(1),
+        approvalResumeId: approvalResumeIdSchema,
       },
-      outputSchema: resultOutputSchema({
-        status: z.literal("applied"),
-      }),
       ...toolWidgetDescriptorMeta(config, "edit"),
       annotations: EDIT_TOOL_ANNOTATIONS,
     },
@@ -2081,6 +2109,7 @@ function createMcpServer(
           patch: z
             .string()
             .describe("Patch text enclosed by *** Begin Patch and *** End Patch markers."),
+          approvalResumeId: approvalResumeIdSchema,
         },
         outputSchema: resultOutputSchema({
           additions: z.number(),
@@ -2096,7 +2125,7 @@ function createMcpServer(
         ...toolWidgetDescriptorMeta(config, "edit"),
         annotations: EDIT_TOOL_ANNOTATIONS,
       },
-      async ({ workspaceId, patch }) => {
+      async ({ workspaceId, patch, approvalResumeId }) => {
         const startedAt = performance.now();
         const workspace = workspaces.getWorkspace(workspaceId);
         const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
@@ -2122,6 +2151,7 @@ function createMcpServer(
             undefined,
             undefined,
             policyPaths,
+            approvalResumeId,
           );
           if (!approved.allowed) {
             return policyFailureResponse(approved, `Tool "apply_patch" denied by policy.`, {
@@ -2263,6 +2293,7 @@ function createMcpServer(
             .string()
             .describe("Workspace identifier returned by open_workspace."),
           pattern: z.string().describe("Search pattern."),
+          approvalResumeId: approvalResumeIdSchema,
           path: z
             .string()
             .optional()
@@ -2362,6 +2393,7 @@ function createMcpServer(
             .string()
             .describe("Workspace identifier returned by open_workspace."),
           pattern: z.string().describe("File glob pattern."),
+          approvalResumeId: approvalResumeIdSchema,
           path: z
             .string()
             .optional()
@@ -2462,6 +2494,7 @@ function createMcpServer(
             .describe(
               "Directory path to list, relative to the workspace root.",
             ),
+          approvalResumeId: approvalResumeIdSchema,
         },
         outputSchema: resultOutputSchema(),
         ...toolWidgetDescriptorMeta(config, "directory"),
@@ -2568,6 +2601,7 @@ function createMcpServer(
           .max(300)
           .optional()
           .describe("Timeout in seconds. Defaults to 30, max 300."),
+        approvalResumeId: approvalResumeIdSchema,
       },
       outputSchema: resultOutputSchema(),
       ...toolWidgetDescriptorMeta(config, "shell"),
@@ -2595,6 +2629,8 @@ function createMcpServer(
           toolNames.shell,
           policyPath,
           input.command,
+          undefined,
+          input.approvalResumeId,
         );
         if (!approved.allowed) {
           return policyFailureResponse(approved, `Tool "${toolNames.shell}" denied by policy. Command: ${input.command}`, {

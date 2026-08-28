@@ -319,6 +319,8 @@ Modes:
 
 When a direct MCP call requires approval, Kontrol returns a durable, retryable approval card immediately so a tunnel or host reconnect cannot strand the HTTP request. The WebUI decision is then used by a retry of the same operation. Controlled ACP/work-session calls may retain blocking semantics. "Approve for work session" caches the decision for the rest of the work session so repeat operations don't re-prompt; "Approve for workspace" caches until the workspace closes; "Approve once" does not cache.
 
+Retries carry an explicit opaque resume identity: the card's `approvalId` echoed back as the optional `approvalResumeId` argument on the identical tool call. A reconnect that lost its conversation correlation still consumes the human's original decision instead of prompting again — "Approve once" stays one-shot, and a resume token only bridges when the retried operation's content matches the durable row exactly, so a known id can never authorize a different operation.
+
 ## Mental Model
 
 Kontrol is a **durable review mailbox and policy authority**, not just a file server.

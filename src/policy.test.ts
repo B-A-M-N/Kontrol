@@ -591,4 +591,98 @@ db.close();
   assert.equal(pathDenial.decision.mode, "deny");
 }
 
+// ── Explicit opaque operation-resume identity (audit P1) ──
+// A direct MCP retry that echoes the approvalId from its approval_required
+// card must consume the human's original decision even when the reconnect
+// changed the conversation/session correlation. Content verification binds
+// the token to the operation: a mismatching retry fingerprints as fresh.
+{
+  const resumeDb = openDatabase(mkdtempSync(join(tmpdir(), "kontrol-resume-")));
+  const resumeApprovals = createApprovalRequestManager(resumeDb);
+  const resumeEventStore = createEventStore(mkdtempSync(join(tmpdir(), "kontrol-resume-events-")));
+  const resumePolicy = createPolicyEngine(
+    { defaultMode: "ask", toolRules: { bash: "ask" }, pathRules: [] },
+    undefined,
+    resumeApprovals,
+  );
+  const resumeEnforcer = createPolicyEnforcer(resumePolicy, resumeEventStore, { timeoutMs: 1_000 });
+
+  const base = {
+    principalId: "resume-principal",
+    principalRole: "client" as const,
+    workspaceId: WS,
+    tool: "bash",
+    command: "printf resume-target",
+    // Direct MCP surface: approval_required returns immediately with a
+    // durable card; nothing parks a live waiter.
+    blockingApproval: false as const,
+  };
+
+  // Step 1: initial call returns approval_required and a durable row.
+  const r1 = await resumeEnforcer.enforce({ ...base, mcpSessionId: "transport-1", conversationId: "conv-1" });
+  assert.equal(r1.allowed, false);
+  assert.equal(r1.approvalRequired, true);
+  const originalApprovalId = r1.approvalId!;
+  assert.ok(originalApprovalId.startsWith("pol_"));
+
+  // Step 2: reviewer approves once. The row resolves but stays consumable.
+  resumePolicy.resolvePending(originalApprovalId, "approved", "reviewer decided", { scope: "once", optionId: "approve" });
+
+  // Step 3: the host reconnects WITHOUT the conversation header and retries
+  // with approvalResumeId + identical content. It must consume the original
+  // decision instead of prompting again.
+  const r2 = await resumeEnforcer.enforce({
+    ...base,
+    mcpSessionId: "transport-2",
+    approvalResumeId: originalApprovalId,
+  });
+  assert.equal(r2.allowed, true, `resume with matching content must consume the original approval: ${JSON.stringify(r2)}`);
+  assert.equal(r2.outcome, "approved");
+
+  // Step 4: the one-shot approval is consumed — a third call re-prompts.
+  const r3 = await resumeEnforcer.enforce({
+    ...base,
+    mcpSessionId: "transport-2",
+    approvalResumeId: originalApprovalId,
+  });
+  assert.equal(r3.allowed, false, "one-shot approval must not be reusable across resumed retries");
+  assert.equal(r3.approvalRequired, true);
+
+  // Step 5: content verification — the SAME valid id presented with
+  // different content must NOT adopt the original operation's identity.
+  const tampered = await resumeEnforcer.enforce({
+    ...base,
+    command: "rm -rf /elsewhere",
+    mcpSessionId: "transport-3",
+    approvalResumeId: originalApprovalId,
+  });
+  assert.equal(tampered.allowed, false, "resume with different command must never adopt the original identity");
+  assert.equal(tampered.approvalRequired, true, "tampered resume fingerprints as a fresh operation and re-prompts");
+  assert.notEqual(tampered.approvalId, originalApprovalId, "tampered resume must create its own durable row");
+
+  // Step 6: a resumed operation with matching content but a never-seen id
+  // also prompts fresh (unknown tokens grant nothing).
+  const unknown = await resumeEnforcer.enforce({
+    ...base,
+    mcpSessionId: "transport-3",
+    approvalResumeId: "pol_does-not-exist",
+  });
+  assert.equal(unknown.allowed, false);
+  assert.equal(unknown.approvalRequired, true);
+
+  // Step 7: a PENDING row is resumable pre-approval — a reconnecting host
+  // reattaches to the original card instead of creating a duplicate.
+  const pendingFirst = await resumeEnforcer.enforce({ ...base, command: "printf resume-second", mcpSessionId: "transport-4" });
+  assert.equal(pendingFirst.approvalRequired, true);
+  const pendingResume = await resumeEnforcer.enforce({
+    ...base,
+    command: "printf resume-second",
+    mcpSessionId: "transport-5",
+    approvalResumeId: pendingFirst.approvalId!,
+  });
+  assert.equal(pendingResume.approvalRequired, true);
+  assert.equal(pendingResume.approvalId, pendingFirst.approvalId, "pending resume reattaches to the SAME durable card");
+  resumeDb.close();
+}
+
 console.log("policy.test.ts: all assertions passed");

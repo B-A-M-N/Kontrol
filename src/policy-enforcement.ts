@@ -26,6 +26,12 @@ export interface PolicyInvocation {
   blockingApproval?: boolean;
   /** Trusted upstream correlation, when supplied by the MCP host. */
   conversationId?: string;
+  /** Explicit opaque operation-resume identity. A caller retrying an
+   *  approval_required result echoes the approvalId it was shown plus the
+   *  operation content; matching content adopts the original durable
+   *  operation identity even when the conversation/session correlation
+   *  changed across a reconnect. */
+  approvalResumeId?: string;
   /** Stable trusted client/conversation identity. Generic clientInfo fallback
    *  is deliberately excluded so unrelated transports cannot coalesce. */
   approvalCorrelationId?: string;
@@ -218,7 +224,26 @@ export function createPolicyEnforcer(
         path: PolicyInputPath | undefined,
       ): Promise<{ allowed: boolean; decision: PolicyDecision; outcome?: PolicyWaitOutcome; approvalRequired?: boolean; approvalId?: string }> {
         const approvalKey = decision.approvalKey!;
-        const rowKey = approvalRowKey(inv, approvalKey);
+        // Explicit resume identity wins over the fingerprint: the caller
+        // echoes the approvalId from its approval_required card. Content is
+        // verified against the durable row before the original identity is
+        // adopted. A mismatch fails OPEN to a fresh fingerprint — nothing is
+        // consumed and no foreign identity is adopted, so the retry simply
+        // prompts as a new operation. Never fail closed here: a stale id
+        // (expired row, policy config changed, work-session rebind) is an
+        // availability problem, not an authorization grant.
+        const resumedKey = inv.approvalResumeId
+          ? policy.resumeOperation(inv.approvalResumeId, {
+              principalId: inv.principalId,
+              workspaceId: inv.workspaceId,
+              workSessionId: inv.workSessionId,
+              tool: canonical,
+              approvalKey,
+              path: policyPathLabel(path),
+              command: inv.command,
+            })
+          : undefined;
+        const rowKey = resumedKey ?? approvalRowKey(inv, approvalKey);
 
         // P0.4 dedup: the durable operation fingerprint intentionally ignores
         // transient transport/request IDs, so a retry from a new MCP session

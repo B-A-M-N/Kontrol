@@ -19,7 +19,11 @@ import { join } from "node:path";
 import { createServer } from "./server.js";
 import { loadConfig } from "./config.js";
 
-const root = mkdtempSync(join(tmpdir(), "kontrol-policy-ask-root-"));
+// The resume-identity block opens a SECOND workspace; a shared parent root
+// lets one KONTROL_ALLOWED_ROOTS entry cover both.
+const rootParent = mkdtempSync(join(tmpdir(), "kontrol-policy-ask-parent-"));
+const root = mkdtempSync(join(rootParent, "primary-ws"));
+const resumeRoot = mkdtempSync(join(rootParent, "resume-ws"));
 const stateDir = mkdtempSync(join(tmpdir(), "kontrol-policy-ask-state-"));
 const worktreeRoot = mkdtempSync(join(tmpdir(), "kontrol-policy-ask-worktrees-"));
 const configDir = mkdtempSync(join(tmpdir(), "kontrol-policy-ask-config-"));
@@ -28,7 +32,7 @@ writeFileSync(join(root, "marker.txt"), "ask-mode-marker\n");
 const reviewerToken = "ask-mode-reviewer-token-that-is-long-enough";
 const config = loadConfig({
   KONTROL_CONFIG_DIR: configDir,
-  KONTROL_ALLOWED_ROOTS: root,
+  KONTROL_ALLOWED_ROOTS: rootParent,
   KONTROL_STATE_DIR: stateDir,
   KONTROL_WORKTREE_ROOT: worktreeRoot,
   KONTROL_AUTH_MODE: "tunnel",
@@ -90,11 +94,11 @@ async function rpc(
   };
 }
 
-async function openWorkspace(): Promise<{ sessionId: string; workspaceId: string }> {
+async function openWorkspace(label = "ask-mode-test-client", path = root): Promise<{ sessionId: string; workspaceId: string }> {
   const initialized = await rpc("initialize", {
     protocolVersion: "2025-06-18",
     capabilities: {},
-    clientInfo: { name: "ask-mode-test-client", version: "1.0.0" },
+    clientInfo: { name: label, version: "1.0.0" },
   });
   assert.equal(initialized.response.status, 200);
   const sessionId = initialized.sessionId;
@@ -103,7 +107,7 @@ async function openWorkspace(): Promise<{ sessionId: string; workspaceId: string
   assert.ok([200, 202].includes(notification.response.status));
   const opened = await rpc("tools/call", {
     name: "open_workspace",
-    arguments: { path: root, mode: "checkout" },
+    arguments: { path, mode: "checkout" },
   }, { sessionId });
   assert.equal(opened.response.status, 200, JSON.stringify(opened.payload));
   const workspaceId = opened.payload?.result?.structuredContent?.workspaceId
@@ -295,6 +299,92 @@ try {
   // stream, so that any disconnect downstream (proxy timeout, tunnel drop,
   // browser refresh) cancels the waiter. The diagnostics show the count
   // reaches 0 after the lifecycle above — no zombie waiters.
+
+  // ── P1: explicit opaque operation-resume identity ─────────────────────────
+  // A second workspace keeps this isolated from the workspace grant recorded
+  // above (grants never cross workspaceIds). Here the host reconnects WITHOUT
+  // the x-kontrol-conversation-id header, so the operation fingerprint would
+  // normally change and the human's original "Approve Once" would be lost —
+  // the exact gap the resume identity exists to close.
+  {
+    // A dedicated root guarantees a distinct workspaceId — opening the same
+    // path returns the durable existing workspace, which would inherit the
+    // earlier workspace grant and bypass the prompt this block must see.
+    writeFileSync(join(resumeRoot, "marker.txt"), "resume-marker\n");
+    const resumeWs = await openWorkspace("ask-mode-resume-client", resumeRoot);
+    const resumeSessionId = resumeWs.sessionId;
+    const resumeWorkspaceId = resumeWs.workspaceId;
+
+    const resumeFirst = await rpc("tools/call", {
+      name: "bash",
+      arguments: { workspaceId: resumeWorkspaceId, command: "printf resume-runs" },
+    }, { sessionId: resumeSessionId });
+    assert.equal(resumeFirst.response.status, 200, JSON.stringify(resumeFirst.payload));
+    assert.equal(resumeFirst.payload?.result?.structuredContent?.status, "approval_required");
+    const resumeApprovalId = resumeFirst.payload?.result?.structuredContent?.approvalId;
+    assert.ok(typeof resumeApprovalId === "string" && resumeApprovalId.startsWith("pol_"));
+
+    // Reviewer approves ONCE before the reconnect.
+    const resumeApprove = await rpc("tools/call", {
+      name: "provide_policy_approval",
+      arguments: { approvalId: resumeApprovalId, decision: "approve", reason: "resume-once" },
+    }, { sessionId: reviewerSessionId, reviewer: true });
+    assert.notEqual(resumeApprove.payload?.result?.isError, true, "resume approve-once must succeed");
+
+    // Reconnect WITHOUT the conversation header and retry with the echoed
+    // approvalResumeId. Without the resume token this retry would fingerprint
+    // as a brand-new operation and prompt again despite the human decision.
+    const resumeReconnectInit = await rpc("initialize", {
+      protocolVersion: "2025-06-18",
+      capabilities: {},
+      clientInfo: { name: "ask-mode-resume-reconnect", version: "1.0.0" },
+    });
+    assert.equal(resumeReconnectInit.response.status, 200);
+    const resumeReconnectSessionId = resumeReconnectInit.sessionId!;
+    await rpc("notifications/initialized", {}, { sessionId: resumeReconnectSessionId });
+    const resumeRetry = await rpc("tools/call", {
+      name: "bash",
+      arguments: {
+        workspaceId: resumeWorkspaceId,
+        command: "printf resume-runs",
+        approvalResumeId: resumeApprovalId,
+      },
+    }, { sessionId: resumeReconnectSessionId });
+    assert.equal(resumeRetry.response.status, 200, JSON.stringify(resumeRetry.payload));
+    assert.notEqual(resumeRetry.payload?.result?.isError, true,
+      `resumed retry must consume the original approval without re-prompting: ${JSON.stringify(resumeRetry.payload)}`);
+    const resumeText = (resumeRetry.payload?.result?.content ?? [])
+      .map((chunk: any) => chunk.text ?? "")
+      .join("");
+    assert.ok(resumeText.includes("resume-runs"), `resumed retry executed: ${resumeText}`);
+
+    // The one-shot result is consumed: a second resumed retry prompts again.
+    const resumeSecond = await rpc("tools/call", {
+      name: "bash",
+      arguments: {
+        workspaceId: resumeWorkspaceId,
+        command: "printf resume-runs",
+        approvalResumeId: resumeApprovalId,
+      },
+    }, { sessionId: resumeReconnectSessionId });
+    assert.equal(resumeSecond.payload?.result?.structuredContent?.status, "approval_required",
+      "one-shot approval must not survive a second resumed retry");
+
+    // Content binding: the SAME id with a DIFFERENT command never adopts the
+    // original decision — it prompts as its own fresh operation.
+    const resumeTamper = await rpc("tools/call", {
+      name: "bash",
+      arguments: {
+        workspaceId: resumeWorkspaceId,
+        command: "printf tampered-operation",
+        approvalResumeId: resumeApprovalId,
+      },
+    }, { sessionId: resumeReconnectSessionId });
+    assert.equal(resumeTamper.payload?.result?.structuredContent?.status, "approval_required",
+      "tampered resume content must re-prompt");
+    assert.notEqual(resumeTamper.payload?.result?.structuredContent?.approvalId, resumeApprovalId,
+      "tampered resume must create its own durable row");
+  }
 
   console.log("policy-ask-lifecycle.test.ts: all assertions passed");
 } finally {
