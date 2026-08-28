@@ -15,6 +15,11 @@ try {
   const loaded = readRuntimeIdentity(stateDir);
   assert.deepEqual(loaded, created);
   assert.equal(isRuntimeIdentityLive(created), true, "the identity must match the live process start token");
+  assert.throws(
+    () => createRuntimeIdentity(stateDir, { gitSha: "other", buildId: "other" }, "competing server"),
+    /existing generation still owns the runtime/,
+    "a competing generation cannot overwrite a live identity",
+  );
   assert.equal(removeRuntimeIdentity(stateDir, "wrong-instance"), false, "a different instance cannot remove the identity");
   assert.equal(removeRuntimeIdentity(stateDir, created.instanceId), true);
   assert.equal(readRuntimeIdentity(stateDir), undefined);

@@ -8,6 +8,11 @@ export interface BuildIdentity {
   gitDirty?: number;
   buildTimestamp?: string;
   schemaHash?: string;
+  schemaVersion?: number;
+  minReadableSchemaVersion?: number;
+  maxReadableSchemaVersion?: number;
+  schemaCompatibility?: string;
+  releaseFormatVersion?: number;
   buildId?: string;
   nodeVersion?: string;
 }
@@ -24,6 +29,12 @@ export interface RuntimeIdentity {
   command: string;
   /** Launcher generation this server belongs to. */
   generationId?: string;
+  /** Exact artifact directory used by this running process. */
+  artifactPath?: string;
+}
+
+export interface RuntimeIdentityOptions {
+  artifactPath?: string;
 }
 
 export function runtimeIdentityPath(stateDir: string): string {
@@ -59,12 +70,12 @@ export function readBuildIdentity(path: string): BuildIdentity {
   }
 }
 
-export function createRuntimeIdentity(
-  stateDir: string,
+export function createRuntimeIdentityRecord(
   build: BuildIdentity,
   command = process.argv.join(" "),
+  options: RuntimeIdentityOptions = {},
 ): RuntimeIdentity {
-  const identity: RuntimeIdentity = {
+  return {
     pid: process.pid,
     processStartTime: processStartToken(process.pid),
     instanceId: `srv_${randomUUID()}`,
@@ -77,11 +88,31 @@ export function createRuntimeIdentity(
     ...(process.env.KONTROL_LAUNCH_GENERATION_ID
       ? { generationId: process.env.KONTROL_LAUNCH_GENERATION_ID }
       : {}),
+    ...(options.artifactPath || process.env.KONTROL_ARTIFACT_PATH
+      ? { artifactPath: options.artifactPath ?? process.env.KONTROL_ARTIFACT_PATH }
+      : {}),
   };
+}
+
+export function writeRuntimeIdentity(stateDir: string, identity: RuntimeIdentity): void {
   const path = runtimeIdentityPath(stateDir);
+  const existing = readRuntimeIdentity(stateDir);
+  if (existing && existing.instanceId !== identity.instanceId && isRuntimeIdentityLive(existing)) {
+    throw new Error(`Cannot replace live Kontrol server identity ${existing.instanceId}; the existing generation still owns the runtime.`);
+  }
   const temporary = `${path}.${identity.instanceId}.tmp`;
   writeFileSync(temporary, `${JSON.stringify(identity, null, 2)}\n`, { mode: 0o600 });
   renameSync(temporary, path);
+}
+
+export function createRuntimeIdentity(
+  stateDir: string,
+  build: BuildIdentity,
+  command = process.argv.join(" "),
+  options: RuntimeIdentityOptions = {},
+): RuntimeIdentity {
+  const identity = createRuntimeIdentityRecord(build, command, options);
+  writeRuntimeIdentity(stateDir, identity);
   return identity;
 }
 

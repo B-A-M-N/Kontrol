@@ -81,7 +81,8 @@ interface ProcessSession {
   exitPromise: Promise<void>;
   resolveExit: () => void;
   cleanupTimer?: NodeJS.Timeout;
-  lastActivityAt: number;
+  lastClientActivityAt: number;
+  lastProcessActivityAt: number;
 }
 
 export interface ProcessSessionManagerOptions {
@@ -280,7 +281,7 @@ export class ProcessSessionManager {
 
   async write(input: WriteStdinInput): Promise<ProcessSnapshot> {
     const session = this.getOwnedSession(input.workspaceId, input.sessionId, input.ownerId, input.workSessionId);
-    session.lastActivityAt = Date.now();
+    session.lastClientActivityAt = Date.now();
     const chars = input.chars ?? "";
     const interactionRequested =
       chars.length > 0 || input.columns !== undefined || input.rows !== undefined;
@@ -380,7 +381,7 @@ export class ProcessSessionManager {
     const now = Date.now();
     for (const session of this.sessions.values()) {
       if (!session.running) continue;
-      const idle = now - session.lastActivityAt >= this.idleTimeoutMs;
+      const idle = now - Math.max(session.lastClientActivityAt, session.lastProcessActivityAt) >= this.idleTimeoutMs;
       const overRuntime = now - session.startedAt >= this.maxRuntimeMs;
       if (idle || overRuntime) {
         session.process?.kill("SIGTERM");
@@ -438,7 +439,8 @@ export class ProcessSessionManager {
       running: true,
       exitPromise,
       resolveExit,
-      lastActivityAt: Date.now(),
+      lastClientActivityAt: Date.now(),
+      lastProcessActivityAt: Date.now(),
     };
   }
 
@@ -512,6 +514,7 @@ export class ProcessSessionManager {
   }
 
   private append(session: ProcessSession, output: string): void {
+    if (output) session.lastProcessActivityAt = Date.now();
     session.buffer.append(output);
   }
 

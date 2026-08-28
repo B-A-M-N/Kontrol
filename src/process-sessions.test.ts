@@ -265,6 +265,51 @@ try {
   await bounded.shutdown();
 }
 
+// A trusted continuity owner is intentionally independent of one MCP
+// transport. Replacing the transport must not kill the interactive process,
+// while a different trusted identity still cannot attach to it.
+const continuity = new ProcessSessionManager({
+  maxRunningProcesses: 1,
+  maxRunningProcessesPerOwner: 1,
+  idleTimeoutMs: 10_000,
+  maxRuntimeMs: 10_000,
+  reaperIntervalMs: 25,
+});
+try {
+  const trusted = await continuity.start({
+    workspaceId: "workspace-continuity",
+    ownerId: "logical-client:conversation-alpha",
+    cwd: process.cwd(),
+    command: `${node} -e "process.stdin.once('data', data => { console.log('continued:' + data.toString().trim()); process.exit(0); })"`,
+    yieldTimeMs: 5,
+  });
+  assert.equal(trusted.running, true);
+  assert.ok(trusted.sessionId);
+  await continuity.terminateByOwner("transport-old");
+  assert.equal(continuity.getMetrics().running, 1, "transport cleanup must not terminate a continuity-owned process");
+  await assert.rejects(
+    continuity.write({
+      workspaceId: "workspace-continuity",
+      sessionId: trusted.sessionId,
+      ownerId: "logical-client:conversation-other",
+      chars: "nope\n",
+      yieldTimeMs: 1,
+    }),
+    /owned by another client/,
+  );
+  const continued = await continuity.write({
+    workspaceId: "workspace-continuity",
+    sessionId: trusted.sessionId,
+    ownerId: "logical-client:conversation-alpha",
+    chars: "hello\n",
+    yieldTimeMs: 2_000,
+  });
+  assert.equal(continued.running, false);
+  assert.match(continued.output, /continued:hello/);
+} finally {
+  await continuity.shutdown();
+}
+
 const reaped = new ProcessSessionManager({
   maxRunningProcesses: 2,
   maxRunningProcessesPerOwner: 2,
@@ -284,6 +329,33 @@ try {
   assert.equal(reaped.getMetrics().running, 0, "idle process sessions are reaped");
 } finally {
   await reaped.shutdown();
+}
+
+const noisyReaped = new ProcessSessionManager({
+  maxRunningProcesses: 1,
+  maxRunningProcessesPerOwner: 1,
+  idleTimeoutMs: 40,
+  maxRuntimeMs: 10_000,
+  reaperIntervalMs: 10,
+});
+try {
+  const noisy = await noisyReaped.start({
+    workspaceId: "workspace-noisy",
+    ownerId: "transport-noisy",
+    cwd: process.cwd(),
+    // Emit from the shell immediately, then keep producing output. The
+    // immediate built-in output makes the 40ms test timeout deterministic even
+    // when starting a child interpreter takes longer than the idle interval.
+    command: "while true; do printf 'still-active\\n'; sleep 0.005; done",
+    yieldTimeMs: 100,
+  });
+  assert.equal(noisy.running, true);
+  assert.ok(noisy.sessionId);
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  assert.equal(noisyReaped.getMetrics().running, 1, "process output counts as activity for idle reaping");
+  await noisyReaped.terminateByOwner("transport-noisy");
+} finally {
+  await noisyReaped.shutdown();
 }
 
 console.log("process-sessions.test.ts: all assertions passed");
