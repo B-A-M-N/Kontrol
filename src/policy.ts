@@ -89,6 +89,25 @@ export interface ToolApprovalRequest {
 /** State of a live waiter attached to a durable approval row. */
 export type LiveWaiterState = "live" | "dead";
 
+/**
+ * Content a retrying caller must re-present to resume an operation by its
+ * opaque approval id. Every field is compared against the durable approval
+ * row, so a valid id presented with different content never adopts the
+ * original operation's identity — the token binds to the operation, not to
+ * whoever happens to know it. `tool` and `path` arrive already normalized
+ * (canonical policy tool name, policy path label) because the canonical
+ * maps live on the enforcement side of the import boundary.
+ */
+export interface OperationResumeContent {
+  principalId: string;
+  workspaceId: string;
+  workSessionId?: string;
+  tool: string;
+  approvalKey: string;
+  path?: string;
+  command?: string;
+}
+
 export interface PolicyDecision {
   mode: PolicyMode;
   approvalKey?: string;
@@ -171,6 +190,10 @@ export interface PolicyEngine {
   countLiveWaiters(approvalId: string): number;
   /** Consume a resolved one-shot operation approval exactly once. */
   consumeApprovedOperation(waiterKey: string): boolean;
+  /** Recover the durable waiterKey of an explicit resume operation. The
+   *  caller must present content that exactly matches the durable row; a
+   *  mismatching token+content pair never adopts the original identity. */
+  resumeOperation(approvalId: string, content: OperationResumeContent): string | undefined;
   /** Revoke all durable and in-memory grants for an exact scope. */
   revokeScope(scope: ApprovalScope, scopeId: string): void;
   /** List effective durable grants for reviewer diagnostics/tools. */
@@ -656,6 +679,29 @@ export function createPolicyEngine(
     return false;
   }
 
+  /**
+   * Explicit operation-resume identity: the retrying caller echoes the
+   * approval id from its approval_required card plus the operation content.
+   * Every content field must match the durable row exactly; otherwise the
+   * resume is rejected and the retry fingerprints as a fresh operation.
+   * The row's own waiterKey is the authoritative identity — this function
+   * only recovers it, it never grants anything.
+   */
+  function resumeOperation(approvalId: string, content: OperationResumeContent): string | undefined {
+    const durable = approvalRequests?.get(approvalId)
+      ?? Array.from(pendingApprovals.values()).find((request) => request.id === approvalId);
+    if (!durable) return undefined;
+    const durableWorkspaceId = "workspaceSessionId" in durable ? durable.workspaceSessionId : durable.workspaceId;
+    if (durable.principalId !== content.principalId) return undefined;
+    if (durableWorkspaceId !== content.workspaceId) return undefined;
+    if ((durable.workSessionId ?? undefined) !== (content.workSessionId ?? undefined)) return undefined;
+    if ((durable.tool ?? "") !== content.tool) return undefined;
+    if (durable.approvalKey !== content.approvalKey) return undefined;
+    if ((durable.path ?? undefined) !== (content.path ?? undefined)) return undefined;
+    if ((durable.command ?? undefined) !== (content.command ?? undefined)) return undefined;
+    return durable.waiterKey ?? undefined;
+  }
+
   function addPending(request: ToolApprovalRequest): void {
     pendingApprovals.set(request.id, request);
     if (request.liveWaiterId) {
@@ -730,6 +776,7 @@ export function createPolicyEngine(
     getLiveWaiterState,
     countLiveWaiters,
     consumeApprovedOperation,
+    resumeOperation,
     clearPending,
     resolvePending,
     addPending,
