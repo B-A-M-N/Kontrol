@@ -143,13 +143,47 @@ kontrol up
 the checkout's `.env`, so configure that file before launching. Use
 `kontrol serve` when only the MCP server is needed.
 
-For a restart from a checkout, use `./restart-kontrol.sh`. The launcher keeps
-readiness false until the replacement build, local MCP path, registered
-adapters, agent URLs, and tunnel readiness all pass. Failed startup stops only
+For a restart from a checkout, use `./restart-kontrol.sh`. It prepares and
+validates an immutable candidate while the current generation remains serving,
+then performs a readiness-gated handoff. Failed activation stops only
 Kontrol-owned sessions started by that invocation and restores the previous
-`dist/` generation when one is available. Once ready, a persistent supervisor
+immutable release when one is available. Once ready, a persistent supervisor
 continues probing KONTROL, adapters, and the tunnel and applies thresholded
 component recovery.
+
+Before a stable-beta deployment, run the canonical release gate from a clean
+checkout:
+
+```bash
+npm run gate:beta:code
+```
+
+Then run the real soak against the exact candidate build reported by
+`beta-code-qualification.json`, followed by the final evidence join:
+
+```bash
+npm run soak:beta -- --hours 12 --build-id CANDIDATE_BUILD_ID --diagnostics-secret "$KONTROL_DIAGNOSTICS_SECRET" --tunnel-url http://127.0.0.1:8080
+npm run gate:beta:final
+```
+
+Inspect `beta-code-qualification.json`, `beta-soak.json`,
+`beta-qualification.json`, and `beta-fault-matrix.json` before deployment.
+The final gate requires clean end-state evidence, matching candidate/source
+identity, and a passing soak; local accelerated checks do not substitute for
+the multi-hour real-stack soak required for a persistent installation.
+
+For the required real wall-clock soak, choose the duration explicitly (12
+hours is the minimum enforced by the canonical stable-beta gate) and inspect
+its metrics report when it finishes:
+
+```bash
+npm run soak:beta -- --hours 12 --url http://127.0.0.1:7676 --build-id CANDIDATE_BUILD_ID --diagnostics-secret "$KONTROL_DIAGNOSTICS_SECRET" --tunnel-url http://127.0.0.1:8080
+```
+
+Use `--workspace-path` (and `--read-path` when the workspace lacks
+`AGENTS.md`) for an allowed read on every fresh MCP transport. Stop the runner
+only when the intended soak window is complete; an interrupted run is recorded
+as non-passing.
 
 The local liveness endpoint is `GET /healthz`; startup infrastructure
 readiness is `GET /core-readyz`; strict operational readiness is `GET /readyz`.

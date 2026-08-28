@@ -2,6 +2,11 @@ node_modules/
 dist/
 dist.previous/
 releases/
+# Atomic builds use symlinks for these names; ignore the links as well as
+# ordinary generated directories.
+/dist
+/dist.previous
+.kontrol-package-dist.json
 *.log
 
 .env
@@ -26,3 +31,7 @@ scripts/test-*.mjs
 .kontrol-build-*
 .kontrol-dist-backup-*
 .claude/settings.local.json
+beta-qualification.json
+beta-code-qualification.json
+beta-fault-matrix.json
+beta-soak.json

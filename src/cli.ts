@@ -1,14 +1,14 @@
 #!/usr/bin/env node
 import { createRequire } from "node:module";
 import { spawnSync } from "node:child_process";
-import { existsSync, rmSync, statSync, statfsSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, statSync, statfsSync, writeFileSync } from "node:fs";
 import { stdin as input, stdout as output } from "node:process";
-import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join, resolve } from "node:path";
 import * as prompts from "@clack/prompts";
 import { getShellConfig } from "@earendil-works/pi-coding-agent";
 import { satisfies } from "semver";
 import { loadConfig } from "./config.js";
+import { isRuntimeIdentityLive, readBuildIdentity, readRuntimeIdentity } from "./runtime-identity.js";
 import {
   generateOwnerToken,
   loadKontrolFiles,
@@ -17,13 +17,6 @@ import {
   type KontrolUserConfig,
 } from "./user-config.js";
 import { expandHomePath } from "./roots.js";
-import {
-  createRuntimeIdentity,
-  isRuntimeIdentityLive,
-  readBuildIdentity,
-  readRuntimeIdentity,
-  removeRuntimeIdentity,
-} from "./runtime-identity.js";
 
 type Command = "serve" | "up" | "init" | "doctor" | "config" | "help" | "version";
 const require = createRequire(import.meta.url);
@@ -240,84 +233,8 @@ async function serve(): Promise<void> {
     );
   }
 
-  const { createServer } = await import("./server.js");
-  const config = loadConfig();
-  const { app, close, drain } = createServer(config);
-  const buildMeta = readBuildIdentity(resolve(dirname(fileURLToPath(import.meta.url)), "build-meta.json"));
-  const runtimeIdentity = createRuntimeIdentity(config.stateDir, buildMeta);
-  const httpServer = app.listen(config.port, config.host, () => {
-    // Report the immutable artifact identity produced by the atomic build.
-    // Reading Git here would describe the checkout, not necessarily the code
-    // that is actually serving requests.
-    console.log(`kontrol listening on http://${config.host}:${config.port}/mcp`);
-    console.log(`public base url: ${config.publicBaseUrl}`);
-    console.log(`allowed roots: ${config.allowedRoots.join(", ")}`);
-    console.log(`allowed hosts: ${config.allowedHosts.join(", ")}`);
-    if (config.allowedHosts.includes("*")) {
-      console.warn("warning: Host header allowlist is disabled because KONTROL_ALLOWED_HOSTS=*");
-    }
-    console.log(
-      config.authMode === "tunnel"
-        ? "auth: tunnel mode (loopback only; OAuth disabled on /mcp; ChatGPT connects with No Authentication)"
-        : "auth: Owner password approval required",
-    );
-    console.log(`logging: ${config.logging.level} ${config.logging.format}`);
-    // P0 #2: make the trust posture explicit at startup so a permissive
-    // default is never silently inherited.
-    const policyPosture = config.policy.defaultMode === "ask"
-      ? "ask (everything not explicitly allowed requires approval)"
-      : config.policy.defaultMode === "deny"
-        ? "deny (everything not explicitly allowed is blocked)"
-        : "allow (read-only frictionless; gate shell via KONTROL_POLICY_TOOL_BASH=ask)";
-    console.log(`policy: ${policyPosture}`);
-    console.log(`build identity: id=${buildMeta.buildId ?? "dev"} commit=${String(buildMeta.gitSha ?? "unknown").slice(0, 12)} dirty=${String(buildMeta.gitDirty ?? "unknown")}`);
-  });
-  httpServer.once("error", (error) => {
-    // Do not leave a live-looking identity behind when binding fails (for
-    // example, a stale second `start-all.sh` invocation on the same port).
-    removeRuntimeIdentity(config.stateDir, runtimeIdentity.instanceId);
-    close();
-    console.error(`kontrol failed to listen on ${config.host}:${config.port}: ${error instanceof Error ? error.message : String(error)}`);
-    process.exitCode = 1;
-  });
-
-  let shuttingDown = false;
-  let shutdownStarted = false;
-  const shutdown = async () => {
-    if (shutdownStarted) return;
-    shutdownStarted = true;
-    if (shuttingDown) return;
-    shuttingDown = true;
-    try {
-      await drain();
-      await new Promise<void>((resolve) => {
-        let settled = false;
-        const finish = () => {
-          if (settled) return;
-          settled = true;
-          resolve();
-        };
-        const deadline = setTimeout(() => {
-          httpServer.closeAllConnections?.();
-          finish();
-        }, 5_000);
-        httpServer.close(() => {
-          clearTimeout(deadline);
-          finish();
-        });
-      });
-      close();
-      removeRuntimeIdentity(config.stateDir, runtimeIdentity.instanceId);
-      process.exit(0);
-    } catch (error) {
-      console.error(`kontrol graceful shutdown failed: ${error instanceof Error ? error.message : String(error)}`);
-      close();
-      removeRuntimeIdentity(config.stateDir, runtimeIdentity.instanceId);
-      process.exit(1);
-    }
-  };
-  process.once("SIGINT", shutdown);
-  process.once("SIGTERM", shutdown);
+  const { runServer } = await import("./server.js");
+  await runServer(loadConfig());
 }
 
 async function runDoctor(): Promise<void> {
@@ -436,6 +353,23 @@ async function runDoctor(): Promise<void> {
       if (identity.buildSha !== (buildMeta.gitSha ?? "unknown")) {
         doctorResult("Running/source identity", "FAIL", `running=${identity.buildSha} current-build=${buildMeta.gitSha ?? "unknown"}`);
       }
+    }
+    try {
+      const generation = JSON.parse(readFileSync(join(config.stateDir, "generation.json"), "utf8")) as {
+        status?: string;
+        requestedBuildId?: string | null;
+        activeBuildId?: string | null;
+        rollback?: boolean;
+        failedBuildId?: string | null;
+        reason?: string | null;
+      };
+      doctorResult(
+        "Deployment generation",
+        generation.rollback ? "WARN" : "PASS",
+        `status=${generation.status ?? "unknown"} requested=${generation.requestedBuildId ?? "unknown"} active=${generation.activeBuildId ?? "unknown"}${generation.rollback ? ` failed=${generation.failedBuildId ?? "unknown"} reason=${generation.reason ?? "unknown"}` : ""}`,
+      );
+    } catch {
+      doctorResult("Deployment generation", "WARN", "generation.json not present");
     }
 
     if (existsSync(resolve(process.cwd(), "tsconfig.json"))) {
@@ -612,7 +546,17 @@ function printHelp(): void {
 }
 
 function printVersion(): void {
-  const packageJson = require("../package.json") as { version?: unknown };
+  try {
+    const buildMeta = JSON.parse(readFileSync(new URL("./build-meta.json", import.meta.url), "utf8")) as { version?: unknown };
+    if (typeof buildMeta.version === "string") {
+      console.log(buildMeta.version);
+      return;
+    }
+  } catch {
+    // Source-mode tsx does not have a local build-meta.json; use the checkout
+    // manifest as its development fallback.
+  }
+  const packageJson = require(resolve(process.cwd(), "package.json")) as { version?: unknown };
   if (typeof packageJson.version !== "string") {
     throw new Error("Unable to read Kontrol package version.");
   }

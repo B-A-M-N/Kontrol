@@ -72,6 +72,41 @@ The checkout also provides `./restart-kontrol.sh`, which runs the same
 transactional launcher. It builds and verifies the replacement generation
 before stopping old owned processes and rolls back if a readiness stage fails.
 
+For the complete stable-beta release gate, run:
+
+```bash
+npm run gate:beta
+```
+
+The canonical gate requires a matching wall-clock soak receipt. For a staged
+release review, run the code gate, soak the exact candidate, then join the
+receipts:
+
+```bash
+npm run gate:beta:code
+npm run soak:beta -- --hours 12 --build-id CANDIDATE_BUILD_ID --diagnostics-secret "$KONTROL_DIAGNOSTICS_SECRET" --tunnel-url http://127.0.0.1:8080
+npm run gate:beta:final
+```
+
+`gate:beta:code` writes `beta-code-qualification.json`; the final gate writes
+`beta-qualification.json` only when the code receipt, candidate identity,
+clean checkout, and soak snapshots all match. `gate:beta` runs the full code
+gate and also requires the soak receipt in one invocation. `--allow-dirty` is
+only for collecting local feedback; a dirty checkout can never qualify.
+
+Run that explicit wall-clock soak with a duration appropriate to the release
+(12 hours is the minimum enforced by the canonical stable-beta gate):
+
+```bash
+npm run soak:beta -- --hours 12 --url http://127.0.0.1:7676 --build-id CANDIDATE_BUILD_ID --diagnostics-secret "$KONTROL_DIAGNOSTICS_SECRET" --tunnel-url http://127.0.0.1:8080
+```
+
+Add `--workspace-path` and, when needed, `--read-path` to include an allowed
+workspace read in each fresh MCP transport. The runner records latency,
+reconnect, transient, stale-route, diagnostic, supervisor, tunnel, integrity,
+and leak metrics in `beta-soak.json`. It exits nonzero if the soak is
+interrupted, observes a failed iteration, or its final assertions fail.
+
 Routine development startup defaults to the fast preflight (syntax/typecheck
 plus a fresh atomic build) so reconnecting does not rerun the entire test
 suite. Set `KONTROL_STARTUP_PROFILE=normal` for the full test gate, or
@@ -144,16 +179,29 @@ tunnel-client run \
   --mcp.server-url "http://127.0.0.1:7676/mcp"
 ```
 
-For stable long-running process priority, install the optional per-user
-systemd unit and start the installed server through it. The unit launches the
-validated `dist/cli.js serve` product, sets `Nice=0`, and restarts that server
-on failure. The full checkout orchestration path remains available through
-`./start-all.sh` for development and integration work:
+Tunnel recovery is deliberately scoped: a live tunnel daemon that reports a
+temporary control-plane throttle, authentication failure, or upstream outage
+is shown as degraded and is not churned. A local stale-registration response
+gets a bounded restart of the same configured tunnel profile/ID. If the
+external connector has already lost its route, reconnect it with a fresh MCP
+`initialize`; the old `mcp-session-id` is disposable and is never treated as
+the recovery authority.
+
+For stable long-running process priority, install the per-user systemd core
+unit and start the installed MCP core through it. The unit launches the
+validated `dist/cli.js serve` product, sets `Nice=0`, applies a bounded restart
+budget, and reads one explicit environment file. It does not start adapters or
+the tunnel; use the checkout orchestration path for the full development stack:
 
 ```bash
 scripts/kontrol-user-service.sh install
 scripts/kontrol-user-service.sh start
 ```
+
+`restart` restarts the immutable release already installed in the unit. Use
+`scripts/kontrol-user-service.sh upgrade` to select the current `dist/` release,
+reload the unit, verify core readiness, and restore the previous unit if the
+candidate fails to start.
 
 Use `scripts/kontrol-user-service.sh status` or `logs` for service-level
 diagnostics. Direct `./start-all.sh` remains available for foreground/development
@@ -165,11 +213,14 @@ KONTROL defines exactly one authoritative path per context:
 
 | Context | Path | Notes |
 |---|---|---|
-| Production / install on Linux | `scripts/kontrol-user-service.sh` (systemd user unit) | Owns restart/priority policy; the unit launches the validated build |
+| Production / install on Linux | `scripts/kontrol-user-service.sh` (`kontrol-core.service`) | Owns restart/priority policy for the MCP core |
 | Development / integration | `./start-all.sh` (tmux sessions + component supervisor) | Fast validated preflight by default; atomic build generation with rollback |
 | Test / release | `npm run typecheck && npm run test && npm run build` | The release gate CI and `kontrol-user-service.sh install` rely on |
 
-The systemd unit is the supported production lifecycle on Linux. macOS and
+The systemd core unit is the supported production lifecycle for the MCP core
+on Linux. Its default environment file is
+`~/.config/kontrol/environment` (override with `KONTROL_USER_ENV_FILE`). The
+full adapter/tunnel stack remains the checkout launcher path. macOS and
 Windows support development and integration runs, but Kontrol does not ship a
 production launchd or Windows Service manager. `kontrol serve` remains the underlying process it
 launches — it is not itself a production lifecycle manager. Startup
@@ -264,9 +315,9 @@ Modes:
 |--------|-------------------------------------------------------|
 | allow  | Tool or path is always permitted                      |
 | deny   | Tool or path is always blocked                        |
-| ask    | Blocks the call until a human approves or denies it   |
+| ask    | Returns a retryable approval card for direct MCP calls; work-session calls may wait |
 
-When a call requires approval, the agent's tool invocation blocks (long-poll) until a human decides. "Approve for work session" caches the decision for the rest of the work session so repeat operations don't re-prompt; "Approve for workspace" caches until the workspace closes; "Approve once" does not cache.
+When a direct MCP call requires approval, Kontrol returns a durable, retryable approval card immediately so a tunnel or host reconnect cannot strand the HTTP request. The WebUI decision is then used by a retry of the same operation. Controlled ACP/work-session calls may retain blocking semantics. "Approve for work session" caches the decision for the rest of the work session so repeat operations don't re-prompt; "Approve for workspace" caches until the workspace closes; "Approve once" does not cache.
 
 ## Mental Model
 

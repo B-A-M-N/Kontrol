@@ -52,16 +52,24 @@ kontrol config set publicBaseUrl https://kontrol.example.com
 | `KONTROL_MCP_MAX_WAITER_QUEUE` | Maximum queued parked waiters. Defaults to `64`. |
 | `KONTROL_MCP_ADMISSION_TIMEOUT_MS` | Maximum time a request waits for an admission slot. Defaults to `120000`. `KONTROL_MCP_REQUEST_DEADLINE_MS` remains a legacy alias. |
 | `KONTROL_MCP_EXECUTION_TIMEOUT_MS` | Maximum execution time for ordinary MCP calls. Defaults to `1800000` (30 minutes). Long-poll waiters and approval-gated calls are exempt and use their own lifecycle. |
-| `KONTROL_POLICY_APPROVAL_TIMEOUT_MS` | Stale-card backstop for blocking policy approvals. Defaults to `86400000` (24 hours); it is not a normal request timeout. |
+| `KONTROL_MAINTENANCE_INTERVAL_MS` | Periodic maintenance interval. Defaults to `300000` (5 minutes). |
+| `KONTROL_MAINTENANCE_BUDGET_MS` | Wall-clock budget for one maintenance slice. Defaults to `250`; unfinished work resumes on a later tick. |
+| `KONTROL_INTEGRITY_INTERVAL_MS` | Interval for the off-loop SQLite integrity diagnostic. Defaults to `1800000` (30 minutes). |
+| `KONTROL_INTEGRITY_DEADLINE_MS` | Worker deadline for one integrity diagnostic. Defaults to `10000`; timeout is diagnostic degradation only. |
+| `KONTROL_POLICY_APPROVAL_TIMEOUT_MS` | Stale-card backstop for blocking work-session policy approvals. Defaults to `86400000` (24 hours). Direct MCP approvals are pending human decisions with their own shorter TTL. |
+| `KONTROL_POLICY_DIRECT_APPROVAL_TTL_MS` | Human decision window for a direct (non-blocking) MCP approval. Defaults to `600000` (10 minutes); expiry is the only automatic cancellation path. |
+| `KONTROL_POLICY_DIRECT_REATTACH_GRACE_MS` | Diagnostic reattachment window opened when a direct approval's live caller detaches mid-flight. Defaults to `300000` (5 minutes); an elapsed window marks the card as an abandoned operation in diagnostics but never cancels it. |
 | `KONTROL_MCP_UNUSED_SESSION_IDLE_MS` | Idle TTL for initialized sessions with no tool calls. Defaults to `600000` (10 minutes), allowing model-side setup time. |
 | `KONTROL_MCP_EPHEMERAL_SESSION_IDLE_MS` | Grace TTL for non-worker sessions with exactly one tool call. Defaults to `86400000` (24 hours); one completed tool call does not mean the model is finished. |
 | `KONTROL_MCP_REUSABLE_SESSION_IDLE_MS` | Idle TTL for reusable or multi-tool sessions. Defaults to `86400000` (24 hours). |
 | `KONTROL_MCP_SESSION_REAPER_INTERVAL_MS` | Session reaper interval. Defaults to `15000`. |
+| `KONTROL_MCP_LOGICAL_CONTINUITY_RETENTION_MS` | Retention for trusted logical-client metadata after a transport disconnect. Defaults to `259200000` (72 hours); this never reuses a transport or replays a request. |
 | `KONTROL_MCP_SESSION_MAX_PER_CLIENT` | Per-logical-client session cap. Defaults to `20`. |
 | `KONTROL_MCP_SESSION_SOFT_CAP` | Global session soft cap for LRU pressure cleanup. Defaults to `150`. |
 | `KONTROL_MCP_SESSION_HARD_CAP` | Global session admission hard cap. Defaults to `200`. |
 | `KONTROL_WORKTREE_ROOT` | Directory for managed Git worktrees. Defaults to `~/.kontrol/worktrees`. |
 | `KONTROL_STATE_DIR` | Directory for SQLite state. Defaults to `~/.local/share/kontrol`. |
+| `KONTROL_ENV_FILE` | Environment file used by `start-all.sh` and supervised component restarts. Defaults to the checkout `.env`; set explicitly for isolated launcher environments. |
 | `KONTROL_SUPERVISOR_INTERVAL_MS` | Probe interval for the managed component supervisor. Defaults to `5000`. |
 | `KONTROL_OPERATIONAL_UAT` | Set `true` to run the disposable real-agent startup UAT. Defaults to `false`. |
 | `KONTROL_VERIFY_SANDBOX` | Set `1` to require fail-closed Bubblewrap sandboxing for unattended mission verification. Defaults to trusted allowlisted execution. |
@@ -79,12 +87,27 @@ kontrol config set publicBaseUrl https://kontrol.example.com
 | `KONTROL_RELEASE_MODE` | Set `true` to refuse dirty source trees unless `KONTROL_ALLOW_DIRTY_RELEASE=true`. |
 | `KONTROL_HARPOON_INCLUDE_LOOPBACK` | Passed to tunnel-client; defaults to `false` so Harpoon does not auto-register KONTROL's local HTTP OAuth metadata URLs. |
 
+Tunnel readiness is classified separately from tunnel process liveness. Local
+`/healthz` loss is restartable; transient control-plane responses such as 429,
+5xx, timeout, or upstream-unavailable states remain degraded without restarting
+the healthy core. A local `/readyz` 404 or explicit stale-registration detail
+permits one bounded tunnel-only reconciliation restart using the same profile and
+tunnel ID. A 401/403 is an authentication/configuration failure and is not
+retried as process recovery. A connector route that has already gone stale must
+perform a fresh MCP `initialize` after the route is repaired.
+
 For a stable scheduler boundary, use `scripts/kontrol-user-service.sh install`
-and `start` to run the installed `dist/cli.js serve` product under a per-user
-systemd unit. The unit sets `Nice=0`, `CPUWeight=100`, `Restart=on-failure`, and
-`KillMode=control-group`. It owns the server process only; adapters and tunnels
-remain separate components. The checkout launcher `start-all.sh` is reserved
-for development/integration orchestration.
+and `start` to run the installed `dist/cli.js serve` product under the
+`kontrol-core.service` per-user systemd unit. The unit sets `Nice=0`,
+`CPUWeight=100`, `Restart=on-failure`, `KillMode=control-group`, and bounded
+systemd restart limits. It reads `~/.config/kontrol/environment` by default
+(override with `KONTROL_USER_ENV_FILE`) and owns the MCP core only; adapters and
+tunnels remain separate components. The checkout launcher `start-all.sh` owns
+the full development/integration stack. Both paths use the same runtime lock,
+so a competing launcher is rejected rather than binding over a live process.
+For this unit, `restart` restarts the installed immutable release; `upgrade`
+selects the latest immutable build candidate (falling back to `dist/`),
+verifies readiness, and restores the prior unit if activation fails.
 
 MCP transports are isolated by their `mcp-session-id`. The logical client label
 (for example `mcp:openai-mcp@1.0.0`) is aggregate telemetry only and is never a
@@ -105,9 +128,10 @@ adapters register. `GET /readyz` is the fail-closed operational check: it also
 requires every configured worker agent to be alive at its expected URL and
 returns HTTP 503 while any required check is unavailable.
 
-Readiness uses a cheap database probe and a cached integrity result. The full
-SQLite `quick_check` runs in background maintenance rather than blocking every
-readiness request. The managed checkout launcher starts a persistent supervisor
+Readiness uses a cheap database probe and does not depend on the integrity
+diagnostic. The full SQLite `quick_check` runs single-flight in a worker with a
+deadline, retaining the last completed result for diagnostics rather than
+blocking the serving event loop or making core readiness fail. The managed checkout launcher starts a persistent supervisor
 after readiness; its state is written to
 `$KONTROL_STATE_DIR/supervisor-status.json` and includes failure counts,
 restart counts, and the last external probe result.
@@ -126,7 +150,16 @@ finite execution only, while `activeLongPolls`, `activeSseStreams`, and
 capacity rejections by tool and weight, and the `waiterAdmission` object reports
 the independent parked-wait budget. `mcpSessionMetrics.workspaceAppResources`
 counts current hashed, OpenAI compatibility, legacy Kontrol, and DevDesktop
-migration resource hits.
+migration resource hits. `mcpSessionMetrics.logicalContinuity` reports the
+bounded server-side metadata retained for trusted OAuth, client-instance, and
+explicit conversation identities after transport loss. A reconnect always
+creates a fresh MCP transport/session and does not replay requests or merge
+transport state; generic `clientInfo.name/version` fallback identities are not
+entered in this index. Session diagnostics expose separate transport and
+application activity clocks so keep-alive/SSE traffic cannot silently extend
+application idle policy.
+Long-lived MCP SSE responses also receive a 20-second SSE comment heartbeat;
+these comments are transport keep-alives and do not count as application work.
 
 The managed tunnel launcher keeps OAuth protected-resource discovery enabled but
 disables Harpoon loopback auto-registration by default. Set

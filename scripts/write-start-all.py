@@ -14,7 +14,8 @@ launcher = Path(__file__).resolve().parents[1] / "start-all.sh"
 text = launcher.read_text()
 required = (
     "trap on_exit EXIT",
-    "node dist/cli.js serve",
+    "exec node ${SERVER_ARTIFACT} serve",
+    "ACTIVE_ARTIFACT_PATH",
     "/healthz",
     "/readyz",
     "probe-kontrol-readiness.mjs",
