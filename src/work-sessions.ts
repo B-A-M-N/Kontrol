@@ -170,6 +170,13 @@ export interface WorkspaceSessionSurfaceCursor {
   sessionId: string;
 }
 
+export interface RuntimeReconciliationPage {
+  reconciled: number;
+  markedStale: number;
+  nextAfterId?: string;
+  hasMore: boolean;
+}
+
 export type WorkspaceLeaseResult =
   | { acquired: true; lease: WorkspaceLease }
   | { acquired: false; conflictingWorkSessionId: string; workspaceSessionId: string; expiresAt: string };
@@ -241,7 +248,8 @@ export interface WorkSessionManager {
   listLiveWorkSessions(workspaceSessionId?: string, limit?: number): WorkSession[];
   listRecoverableWorkSessions(workspaceSessionId?: string, limit?: number): WorkSession[];
   listStaleWorkSessions(workspaceSessionId?: string, limit?: number): WorkSession[];
-  reconcileRuntimeStates(): { reconciled: number; markedStale: number };
+  /** Reconcile one bounded page of runtime state. */
+  reconcileRuntimeStates(afterSessionId?: string, limit?: number): RuntimeReconciliationPage;
   countActiveWorkSessions(): number;
   countPendingReviews(): number;
   /** P1 #23: List all work sessions (including terminal) for maintenance. */
@@ -1107,22 +1115,101 @@ class SqliteWorkSessionManager implements WorkSessionManager {
     return rows.map((row) => row.id);
   }
 
-  reconcileRuntimeStates(): { reconciled: number; markedStale: number } {
-    const rows = this.database.db.select().from(workSessions).all();
+  reconcileRuntimeStates(afterSessionId?: string, limit = 100): RuntimeReconciliationPage {
+    const boundedLimit = Math.max(1, Math.min(500, Math.trunc(limit)));
+    // Fetch the page and each session's latest run in one bounded SQLite
+    // statement. The previous implementation performed one latest-run query
+    // per session before yielding, making the nominal maintenance page an
+    // uninterruptible N+1 synchronous burst on the serving thread. Select the
+    // session page first so the window function does not rank the entire ACP
+    // run history for every maintenance page.
+    const rows = this.database.sqlite.prepare(`
+      with session_page as (
+        select id, status, updated_at, runtime_state
+        from work_sessions
+        where (? is null or id > ?)
+        order by id
+        limit ?
+      ), ranked_runs as (
+        select
+          ar.work_session_id,
+          ar.status,
+          ar.last_heartbeat_at,
+          ar.worker_lease_until,
+          ar.finished_at,
+          row_number() over (
+            partition by ar.work_session_id
+            order by ar.created_at desc, ar.run_id desc
+          ) as run_rank
+        from acp_runs ar
+        inner join session_page sp on sp.id = ar.work_session_id
+      )
+      select
+        sp.id,
+        sp.status,
+        sp.updated_at,
+        sp.runtime_state,
+        rr.status as latest_status,
+        rr.last_heartbeat_at as latest_last_heartbeat_at,
+        rr.worker_lease_until as latest_worker_lease_until,
+        rr.finished_at as latest_finished_at
+      from session_page sp
+      left join ranked_runs rr
+        on rr.work_session_id = sp.id
+       and rr.run_rank = 1
+      order by sp.id
+    `).all(afterSessionId ?? null, afterSessionId ?? null, boundedLimit) as Array<{
+      id: string;
+      status: string;
+      updated_at: string;
+      runtime_state: string | null;
+      latest_status?: string | null;
+      latest_last_heartbeat_at?: string | null;
+      latest_worker_lease_until?: string | null;
+      latest_finished_at?: string | null;
+    }>;
     let reconciled = 0;
     let markedStale = 0;
     const now = new Date().toISOString();
+    const updates: Array<{ id: string; state: WorkSessionRuntimeState }> = [];
     for (const row of rows) {
-      const next = this.runtimeStateFor(row.status as WorkSessionStatus, row.updatedAt, this.latestRunForSession(row.id));
-      if (row.runtimeState === next) continue;
-      this.database.db.update(workSessions)
-        .set({ runtimeState: next, runtimeClassifiedAt: now })
-        .where(eq(workSessions.id, row.id))
-        .run();
+      const latestRun = row.latest_status == null
+        ? undefined
+        : {
+            status: row.latest_status,
+            lastHeartbeatAt: row.latest_last_heartbeat_at,
+            workerLeaseUntil: row.latest_worker_lease_until,
+            finishedAt: row.latest_finished_at,
+          };
+      const next = this.runtimeStateFor(row.status as WorkSessionStatus, row.updated_at, latestRun);
+      if (row.runtime_state === next) continue;
+      updates.push({ id: row.id, state: next });
       reconciled++;
       if (next === "stale" || next === "orphaned") markedStale++;
     }
-    return { reconciled, markedStale };
+    // Keep the page's write phase to one SQLite statement as well. A page is
+    // deliberately bounded, but issuing one synchronous UPDATE per row would
+    // still make the maintenance budget's yield boundary misleading under a
+    // large reconciliation backlog.
+    if (updates.length > 0) {
+      const stateCases = updates.map(() => "when ? then ?").join(" ");
+      const ids = updates.map(() => "?").join(", ");
+      const parameters: unknown[] = [];
+      for (const update of updates) parameters.push(update.id, update.state);
+      parameters.push(now, ...updates.map((update) => update.id));
+      this.database.sqlite.prepare(`
+        update work_sessions
+        set runtime_state = case id ${stateCases} else runtime_state end,
+            runtime_classified_at = ?
+        where id in (${ids})
+      `).run(...parameters);
+    }
+    return {
+      reconciled,
+      markedStale,
+      nextAfterId: rows.length > 0 ? rows[rows.length - 1]!.id : undefined,
+      hasMore: rows.length === boundedLimit,
+    };
   }
 
   // P2 #56: Only close the DB handle if this manager opened it
