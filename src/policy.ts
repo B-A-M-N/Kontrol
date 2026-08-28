@@ -27,6 +27,7 @@
 
 import { randomUUID } from "node:crypto";
 import type { ApprovalOption, ApprovalRequestManager } from "./approval-requests.js";
+import { DEFAULT_DIRECT_APPROVAL_REATTACH_GRACE_MS } from "./policy-approval-defaults.js";
 
 export type PolicyMode = "allow" | "deny" | "ask";
 export type PolicySource = "path" | "tool" | "default";
@@ -59,6 +60,8 @@ export interface ToolApprovalRequest {
   principalId: string;
   workspaceId: string;
   workSessionId?: string;
+  runId?: string;
+  agentId?: string;
   approvalKey?: string;
   mcpSessionId?: string;
   mcpRequestId?: string;
@@ -66,10 +69,15 @@ export interface ToolApprovalRequest {
   /**
    * Identity of the CURRENTLY ATTACHED live waiter. When this matches an
    * active MCP request, the durable approval row is "live". When it becomes
-   * undefined (caller disconnected), only a fresh live invocation with the
-   * matching (mcpSessionId, mcpRequestId) may reattach.
+   * undefined (caller disconnected), a fresh invocation with the same durable
+   * operation fingerprint may reattach; transient MCP session/request IDs are
+   * retained only as live-waiter metadata.
    */
   liveWaiterId?: string;
+  origin?: "direct_mcp" | "work_session";
+  conversationId?: string;
+  orphanedAt?: string;
+  reattachDeadline?: string;
   options?: ApprovalOption[];
   tool: string;
   path?: string;
@@ -132,12 +140,17 @@ export interface PolicyEngine {
     approvalKey: string,
     ctx: ScopeContext,
   ): ToolApprovalRequest | undefined;
-  /** P0.4 dedup key: only invocations with the EXACT same (mcpSessionId,
-   *  mcpRequestId, approvalKey, ctx) reuse one durable row. Different MCP
-   *  requests each get their own row. */
+  /** P0.4 dedup key: reconnecting transports reuse the durable operation
+   *  fingerprint stored in waiterKey; transient MCP session/request IDs are
+   *  live-waiter metadata, not durable operation identity. */
   findPendingByKey(rowKey: string): ToolApprovalRequest | undefined;
   clearPending(approvalId: string): void;
-  resolvePending(approvalId: string, status: "approved" | "denied" | "expired" | "cancelled", reason?: string): void;
+  resolvePending(
+    approvalId: string,
+    status: "approved" | "denied" | "expired" | "cancelled",
+    reason?: string,
+    resolution?: { scope?: ApprovalScope; optionId?: string },
+  ): void;
   addPending(request: ToolApprovalRequest): void;
   /** Mark the live waiter for a durable approval row as detached. The
    *  durable card remains available for a future live invocation with the
@@ -147,6 +160,8 @@ export interface PolicyEngine {
    *  Called when a reconnecting invocation with the same row key reuses
    *  the row created by a previous live invocation that has since gone. */
   reattachLiveWaiter(approvalId: string, liveWaiterId: string): void;
+  /** Extend a direct MCP operation's short reconnect grace period. */
+  touchPending(approvalId: string): void;
   /** Resolve the current liveness state for a live waiter. Used by the
    *  enforcer to decide whether a resolved approval should wake the
    *  in-flight invocation or be ignored because the caller is gone. */
@@ -154,6 +169,8 @@ export interface PolicyEngine {
   /** Count live waiters attached to a durable approval row. Used by
    *  diagnostics to distinguish "durable cards" from "live waiters". */
   countLiveWaiters(approvalId: string): number;
+  /** Consume a resolved one-shot operation approval exactly once. */
+  consumeApprovedOperation(waiterKey: string): boolean;
   /** Revoke all durable and in-memory grants for an exact scope. */
   revokeScope(scope: ApprovalScope, scopeId: string): void;
   /** List effective durable grants for reviewer diagnostics/tools. */
@@ -285,6 +302,21 @@ export function loadPolicyConfig(env: NodeJS.ProcessEnv): PolicyConfig {
 }
 
 /**
+ * Whether any effective policy rule can produce an `ask` outcome and
+ * therefore an interactive human approval. Direct approvals exist
+ * independently from ACP: an ask-capable deployment without a reviewer
+ * credential can generate approval cards that no surface is authorized to
+ * resolve — a deadlocked configuration. Callers gate startup on this so the
+ * failure surfaces as a concrete configuration error, never as a runtime
+ * approval nobody can decide.
+ */
+export function policyCanAsk(config: PolicyConfig): boolean {
+  if (config.defaultMode === "ask") return true;
+  if (Object.values(config.toolRules).some((mode) => mode === "ask")) return true;
+  return config.pathRules.some((rule) => rule.mode === "ask");
+}
+
+/**
  * Minimal glob matcher supporting `*` (any chars except `/`), `**` (any chars
  * including `/`), and `?` (single char). Dev-space subsets Node's built-in
  * minimatch behavior without adding a dependency.
@@ -309,6 +341,7 @@ export function createPolicyEngine(
   config: PolicyConfig,
   grantStore?: GrantStore,
   approvalRequests?: ApprovalRequestManager,
+  options: { directReattachGraceMs?: number } = {},
 ): PolicyEngine {
   // (principalId|scope|scopeId|approvalKey) -> true
   const sessionApprovals = new Map<string, boolean>();
@@ -318,6 +351,7 @@ export function createPolicyEngine(
   // "is anyone actually waiting right now?" — used by diagnostics and the
   // enforcer to detect a caller_gone outcome.
   const liveWaitersByApproval = new Map<string, Set<string>>();
+  const inMemoryOneShotApprovals = new Set<string>();
 
   // Seed memory cache from durable grants so restarts keep effective approvals.
   if (grantStore) {
@@ -413,11 +447,17 @@ export function createPolicyEngine(
             principalId: request.principalId ?? "",
             workspaceId: request.workspaceSessionId,
             workSessionId: request.workSessionId,
+            runId: request.runId,
+            agentId: request.agentId,
             approvalKey: request.approvalKey,
             mcpSessionId: request.mcpSessionId,
             mcpRequestId: request.mcpRequestId,
             waiterKey: request.waiterKey,
             liveWaiterId: undefined,
+            origin: request.origin,
+            conversationId: request.conversationId,
+            orphanedAt: request.orphanedAt,
+            reattachDeadline: request.reattachDeadline,
             options: request.options,
             tool: request.tool ?? "",
             path: request.path,
@@ -445,11 +485,17 @@ export function createPolicyEngine(
             principalId: request.principalId ?? "",
             workspaceId: request.workspaceSessionId,
             workSessionId: request.workSessionId,
+            runId: request.runId,
+            agentId: request.agentId,
             approvalKey: request.approvalKey,
             mcpSessionId: request.mcpSessionId,
             mcpRequestId: request.mcpRequestId,
             waiterKey: request.waiterKey,
             liveWaiterId: undefined,
+            origin: request.origin,
+            conversationId: request.conversationId,
+            orphanedAt: request.orphanedAt,
+            reattachDeadline: request.reattachDeadline,
             options: request.options,
             tool: request.tool ?? "",
             path: request.path,
@@ -465,6 +511,7 @@ export function createPolicyEngine(
     if (!set) return;
     set.delete(liveWaiterId);
     if (set.size === 0) liveWaitersByApproval.delete(approvalId);
+    approvalRequests?.detachLiveWaiter(approvalId, liveWaiterId);
   }
 
   function reattachLiveWaiter(approvalId: string, liveWaiterId: string): void {
@@ -474,6 +521,20 @@ export function createPolicyEngine(
       liveWaitersByApproval.set(approvalId, set);
     }
     set.add(liveWaiterId);
+    approvalRequests?.reattachLiveWaiter(approvalId, liveWaiterId);
+  }
+
+  function touchPending(approvalId: string): void {
+    // A matching direct retry is evidence the operation is still owned by a
+    // live host, so refresh its bounded reattachment window. This is a
+    // liveness touch, not an orphan event: the row keeps pending_human_approval
+    // semantics and its human approval TTL is unchanged.
+    const pending = pendingApprovals.get(approvalId);
+    if (pending && !pending.workSessionId && pending.origin !== "work_session") {
+      const now = new Date().toISOString();
+      pending.reattachDeadline = new Date(Date.parse(now) + (options.directReattachGraceMs ?? DEFAULT_DIRECT_APPROVAL_REATTACH_GRACE_MS)).toISOString();
+    }
+    approvalRequests?.touchDirectApproval(approvalId);
   }
 
   function getLiveWaiterState(approvalId: string, liveWaiterId: string): LiveWaiterState | undefined {
@@ -529,11 +590,17 @@ export function createPolicyEngine(
           principalId: request.principalId ?? "",
           workspaceId: request.workspaceSessionId,
           workSessionId: request.workSessionId,
+          runId: request.runId,
+          agentId: request.agentId,
           approvalKey: request.approvalKey,
           mcpSessionId: request.mcpSessionId,
           mcpRequestId: request.mcpRequestId,
           waiterKey: request.waiterKey,
           liveWaiterId: request.liveWaiterId,
+          origin: request.origin,
+          conversationId: request.conversationId,
+          orphanedAt: request.orphanedAt,
+          reattachDeadline: request.reattachDeadline,
           tool: request.tool ?? "",
           path: request.path,
           command: request.command,
@@ -555,13 +622,38 @@ export function createPolicyEngine(
     approvalId: string,
     status: "approved" | "denied" | "expired" | "cancelled",
     reason?: string,
+    resolution: { scope?: ApprovalScope; optionId?: string } = {},
   ): void {
+    const pending = pendingApprovals.get(approvalId);
+    const durable = approvalRequests?.get(approvalId);
+    const waiterKey = pending?.waiterKey ?? durable?.waiterKey;
+    if (status === "approved" && resolution.scope === "once" && waiterKey && !approvalRequests) {
+      inMemoryOneShotApprovals.add(waiterKey);
+    }
     pendingApprovals.delete(approvalId);
-    // Live waiters do NOT outlive the durable row once the reviewer decides.
-    // Otherwise a stale live entry would let an obsolete waiter claim the
-    // resolved approval on a future attach attempt.
-    liveWaitersByApproval.delete(approvalId);
-    if (approvalRequests) approvalRequests.resolve(approvalId, { status, reason });
+    // Remove the operation from the pending lookup, but retain the attached
+    // live-waiter set until each waiter observes the decision and detaches in
+    // the enforcer's finally block. Otherwise getLiveWaiterState() would
+    // misclassify a healthy blocked worker as caller_gone immediately after a
+    // reviewer resolves its approval.
+    if (approvalRequests) approvalRequests.resolve(approvalId, {
+      status,
+      reason,
+      optionId: resolution.optionId,
+      effect: resolution.optionId
+        ? status === "approved" ? "approve" : status === "denied" ? "deny" : undefined
+        : undefined,
+      scope: resolution.scope,
+    });
+  }
+
+  function consumeApprovedOperation(waiterKey: string): boolean {
+    if (approvalRequests?.consumeApprovedOperation(waiterKey)) return true;
+    if (!approvalRequests && inMemoryOneShotApprovals.has(waiterKey)) {
+      inMemoryOneShotApprovals.delete(waiterKey);
+      return true;
+    }
+    return false;
   }
 
   function addPending(request: ToolApprovalRequest): void {
@@ -580,12 +672,18 @@ export function createPolicyEngine(
         kind: "tool",
         workspaceSessionId: request.workspaceId,
         workSessionId: request.workSessionId,
+        runId: request.runId,
+        agentId: request.agentId,
         approvalKey: request.approvalKey,
         mcpSessionId: request.mcpSessionId,
         mcpRequestId: request.mcpRequestId,
         waiterKey: request.waiterKey,
         liveWaiterId: request.liveWaiterId,
         principalId: request.principalId,
+        origin: request.origin,
+        conversationId: request.conversationId,
+        orphanedAt: request.orphanedAt,
+        reattachDeadline: request.reattachDeadline,
         title: `Approve ${request.tool}`,
         tool: request.tool,
         path: request.path,
@@ -628,8 +726,10 @@ export function createPolicyEngine(
     findPendingByKey,
     detachLiveWaiter,
     reattachLiveWaiter,
+    touchPending,
     getLiveWaiterState,
     countLiveWaiters,
+    consumeApprovedOperation,
     clearPending,
     resolvePending,
     addPending,

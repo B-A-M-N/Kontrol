@@ -30,7 +30,72 @@ function workspaceAppModelAndAppMeta() {
   return workspaceAppToolMeta();
 }
 
+const approvalOptionSchema = z.object({
+  id: z.string(),
+  label: z.string(),
+  effect: z.enum(["approve", "deny", "changes_requested"]),
+  scope: z.enum(["once", "work_session", "workspace"]).optional(),
+});
+
+/**
+ * Lifecycle classification for a pending approval. A direct MCP approval
+ * returns `approval_required` immediately, so ZERO live waiters is its normal
+ * shape — it is still awaiting a human decision, not orphaned. Only a direct
+ * operation whose reattachment window has actually elapsed (no retry arrived
+ * in time) is an abandoned operation.
+ */
+export type ApprovalLifecycleState =
+  | "pending_human_approval"
+  | "detached_live_waiter"
+  | "abandoned_operation";
+
+function approvalLifecycleState(approval: {
+  workSessionId?: string;
+  origin?: "direct_mcp" | "work_session";
+  liveWaiterCount: number;
+  reattachDeadline?: string;
+}): ApprovalLifecycleState {
+  const nowIso = new Date().toISOString();
+  const blocking = approval.origin === "work_session" || Boolean(approval.workSessionId);
+  if (blocking) {
+    // Work-session approvals park their caller; a missing live waiter there
+    // genuinely means the waiting invocation detached.
+    return approval.liveWaiterCount > 0 ? "pending_human_approval" : "detached_live_waiter";
+  }
+  if (approval.reattachDeadline && approval.reattachDeadline <= nowIso) return "abandoned_operation";
+  return "pending_human_approval";
+}
+
+/** Canonical approval-card contract shared by list/open tools and the UI. */
+export const approvalCardSchema = z.object({
+  id: z.string(),
+  approvalId: z.string(),
+  kind: z.string(),
+  workspaceId: z.string(),
+  workspaceSessionId: z.string(),
+  workSessionId: z.string().optional(),
+  runId: z.string().optional(),
+  agentId: z.string().optional(),
+  tool: z.string(),
+  title: z.string(),
+  description: z.string().optional(),
+  risk: z.string().optional(),
+  path: z.string().optional(),
+  command: z.string().optional(),
+  origin: z.enum(["direct_mcp", "work_session"]).optional(),
+  conversationId: z.string().optional(),
+  orphanedAt: z.string().optional(),
+  reattachDeadline: z.string().optional(),
+  liveWaiterCount: z.number(),
+  state: z.enum(["pending_human_approval", "detached_live_waiter", "abandoned_operation"]),
+  requestedAt: z.string(),
+  createdAt: z.string(),
+  expiresAt: z.string().optional(),
+  options: z.array(approvalOptionSchema),
+});
+
 function policyApprovalToCard(a: ReturnType<PolicyEngine["getPendingApprovals"]>[number]) {
+  const liveWaiterCount = a.liveWaiterId ? 1 : 0;
   return {
     id: a.id,
     approvalId: a.id,
@@ -38,10 +103,23 @@ function policyApprovalToCard(a: ReturnType<PolicyEngine["getPendingApprovals"]>
     workspaceId: a.workspaceId,
     workspaceSessionId: a.workspaceId,
     workSessionId: a.workSessionId,
+    runId: a.runId,
+    agentId: a.agentId,
     tool: a.tool,
     title: `Approve ${a.tool}`,
     path: a.path,
     command: a.command,
+    origin: a.origin,
+    conversationId: a.conversationId,
+    orphanedAt: a.orphanedAt,
+    reattachDeadline: a.reattachDeadline,
+    liveWaiterCount,
+    state: approvalLifecycleState({
+      workSessionId: a.workSessionId,
+      origin: a.origin,
+      liveWaiterCount,
+      reattachDeadline: a.reattachDeadline,
+    }),
     requestedAt: a.requestedAt,
     createdAt: a.requestedAt,
     expiresAt: a.expiresAt,
@@ -50,6 +128,7 @@ function policyApprovalToCard(a: ReturnType<PolicyEngine["getPendingApprovals"]>
 }
 
 function genericApprovalToCard(a: ApprovalRequest) {
+  const liveWaiterCount = a.liveWaiterCount ?? 0;
   return {
     id: a.approvalId,
     approvalId: a.approvalId,
@@ -65,6 +144,17 @@ function genericApprovalToCard(a: ApprovalRequest) {
     risk: a.risk,
     path: a.path,
     command: a.command,
+    origin: a.origin,
+    conversationId: a.conversationId,
+    orphanedAt: a.orphanedAt,
+    reattachDeadline: a.reattachDeadline,
+    liveWaiterCount,
+    state: approvalLifecycleState({
+      workSessionId: a.workSessionId,
+      origin: a.origin,
+      liveWaiterCount,
+      reattachDeadline: a.reattachDeadline,
+    }),
     requestedAt: a.createdAt,
     createdAt: a.createdAt,
     expiresAt: a.expiresAt,
@@ -107,15 +197,7 @@ export function registerPolicyTools(
         workspaceId: z.string().optional().describe("Filter by workspace session ID."),
       },
       outputSchema: {
-        approvals: z.array(z.object({
-          id: z.string(),
-          workspaceId: z.string(),
-          workSessionId: z.string().optional(),
-          tool: z.string(),
-          path: z.string().optional(),
-          command: z.string().optional(),
-          requestedAt: z.string(),
-        })),
+        approvals: z.array(approvalCardSchema),
         count: z.number(),
       },
       _meta: approvalCenterMeta,
@@ -153,15 +235,7 @@ export function registerPolicyTools(
         workspaceId: z.string().optional().describe("Filter by workspace session ID."),
       },
       outputSchema: {
-        approvals: z.array(z.object({
-          id: z.string(),
-          workspaceId: z.string(),
-          workSessionId: z.string().optional(),
-          tool: z.string(),
-          path: z.string().optional(),
-          command: z.string().optional(),
-          requestedAt: z.string(),
-        })),
+        approvals: z.array(approvalCardSchema),
         count: z.number(),
       },
       _meta: approvalCenterMeta,
@@ -307,6 +381,7 @@ export function registerPolicyTools(
         approvalId,
         decision === "deny" ? "denied" : "approved",
         reason,
+        { scope: approvalScope, optionId: decision },
       );
       config.eventStore.appendEvent({
         type: "policy.approval.provided",

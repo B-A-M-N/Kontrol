@@ -3,12 +3,12 @@
 // Walks the same path the production WebUI exercises:
 //   1. worker (default principalRole) opens an MCP session over the wire
 //   2. worker invokes `bash` against a workspace whose defaultMode is "ask"
-//   3. request blocks; a durable approval card is published
+//   3. request returns a durable retryable approval card
 //   4. reviewer sees the card via list_pending_approvals (reviewer header)
-//   5. reviewer provides a workspace-scoped approval
+//   5. reviewer provides a one-shot approval
 //   6. the parked bash invocation unblocks and runs
-//   7. a second bash invocation in the same workspace reuses the workspace grant
-//      without re-prompting (proves the grant was recorded durably)
+//   7. a fresh operation receives a workspace-scoped approval and survives a
+//      reconnect without prompting again
 //
 // All assertions exercise the public MCP surface — no internal hooks.
 
@@ -74,6 +74,7 @@ async function rpc(
     "content-type": "application/json",
     accept: "application/json, text/event-stream",
     ...(opts.sessionId ? { "mcp-session-id": opts.sessionId } : {}),
+    ...(!opts.reviewer ? { "x-kontrol-conversation-id": "ask-mode-conversation" } : {}),
   };
   if (opts.reviewer) headers["x-kontrol-reviewer-token"] = reviewerToken;
   const response = await fetch(url, {
@@ -170,73 +171,60 @@ try {
   const reviewerSessionId = await openReviewerSession();
   assert.ok(workspaceId.length > 0, "workspaceId returned from open_workspace");
 
-  // First bash invocation should park — policy=ask -> approval card appears.
-  // We don't await it on the wire because the test driver must observe the
-  // approval card first; the MCP transport delivers the unblock as an SSE
-  // notification on the dedicated stream. We open a stream.
-  const sseController = new AbortController();
-  const ssePromise = fetch(url, {
-    method: "GET",
-    headers: { accept: "text/event-stream", "mcp-session-id": sessionId },
-    signal: sseController.signal,
-  }).then((response) => {
-    assert.equal(response.status, 200, "SSE stream must open");
-    return response.body!.getReader();
-  });
-  const reader = await ssePromise;
-
-  const bashPromise = rpc("tools/call", {
+  // Direct MCP policy prompts are durable, non-blocking operations. The first
+  // call returns the retry card immediately; a new transport can attach to
+  // the same operation before a reviewer decides.
+  const firstBash = await rpc("tools/call", {
     name: "bash",
     arguments: { workspaceId, command: "printf ask-mode-runs" },
   }, { sessionId });
-  // Yield once so the request reaches the policy wait.
-  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.equal(firstBash.response.status, 200, JSON.stringify(firstBash.payload));
+  assert.equal(firstBash.payload?.result?.structuredContent?.status, "approval_required", JSON.stringify(firstBash.payload));
+  assert.equal(firstBash.payload?.result?.structuredContent?.retryable, true, JSON.stringify(firstBash.payload));
 
   // Reviewer should see a durable approval card with the canonical options.
   const approvalId = await waitForMatchingApproval(reviewerSessionId, workspaceId);
   assert.ok(approvalId.startsWith("pol_"), `approval id is server-generated: ${approvalId}`);
 
-  // Sanity-check: live waiter count is 1; weight-3 bash is parked (released).
-  const midterm = await diagnostics();
-  const sessionMetric = midterm.mcpSessionMetrics?.perSession?.[sessionId]
-    ?? midterm.mcpSessionMetrics?.activePolicyWaitersBySession?.[sessionId];
-  if (midterm.mcpSessionMetrics?.activePolicyWaiters !== undefined) {
-    assert.ok(midterm.mcpSessionMetrics.activePolicyWaiters >= 1, "at least one policy waiter is parked");
-  }
+  // Simulate the original HTTP transport disappearing and the host retrying
+  // on a fresh MCP session while approval is still pending. The durable
+  // operation fingerprint must prevent a duplicate approval row.
+  const reconnectInit = await rpc("initialize", {
+    protocolVersion: "2025-06-18",
+    capabilities: {},
+    clientInfo: { name: "ask-mode-reconnect", version: "1.0.0" },
+  });
+  assert.equal(reconnectInit.response.status, 200);
+  const reconnectSessionId = reconnectInit.sessionId!;
+  assert.ok(reconnectSessionId, "reconnect initialize did not return mcp-session-id");
+  await rpc("notifications/initialized", {}, { sessionId: reconnectSessionId });
+  const retryBeforeApproval = await rpc("tools/call", {
+    name: "bash",
+    arguments: { workspaceId, command: "printf ask-mode-runs" },
+  }, { sessionId: reconnectSessionId });
+  assert.equal(retryBeforeApproval.response.status, 200, JSON.stringify(retryBeforeApproval.payload));
+  assert.equal(retryBeforeApproval.payload?.result?.structuredContent?.status, "approval_required");
+  assert.equal(retryBeforeApproval.payload?.result?.structuredContent?.approvalId, approvalId);
+  const pendingAfterRetry = await rpc("tools/call", {
+    name: "list_pending_approvals",
+    arguments: { workspaceId },
+  }, { sessionId: reviewerSessionId, reviewer: true });
+  assert.equal(pendingAfterRetry.payload?.result?.structuredContent?.count, 1, "retry must not create a duplicate card");
 
-  // Reviewer approves with workspace scope — durable grant for the workspace.
+  // Reviewer approves this durable operation once. The subsequent retry must
+  // consume the resolved operation result exactly once.
   const approveResult = await rpc("tools/call", {
     name: "provide_policy_approval",
-    arguments: { approvalId, decision: "approve_workspace", reason: "trusted for this workspace" },
+    arguments: { approvalId, decision: "approve", reason: "approved for this operation" },
   }, { sessionId: reviewerSessionId, reviewer: true });
   assert.equal(approveResult.response.status, 200, JSON.stringify(approveResult.payload));
-  assert.notEqual(approveResult.payload?.result?.isError, true, "approve_workspace must succeed");
+  assert.notEqual(approveResult.payload?.result?.isError, true, "approve once must succeed");
 
-  // The parked bash invocation unblocks once the reviewer approves. The SSE
-  // stream is also open, so the response may arrive there; we wait on both.
-  const bashResponse = await Promise.race([
-    bashPromise,
-    waitFor(async () => {
-      const { value, done } = await reader.read();
-      if (done) return null;
-      const chunk = typeof value === "string" ? value : new TextDecoder().decode(value);
-      const lines = chunk.split(/\r?\n/).filter((l) => l.startsWith("data:")).map((l) => l.slice(5).trim());
-      for (const line of lines) {
-        if (!line) continue;
-        try {
-          const parsed = JSON.parse(line);
-          if (parsed?.id !== undefined && parsed.id === nextId) return parsed;
-        } catch {
-          // Ignore SSE noise.
-        }
-      }
-      return null;
-    }, 8000, "bash response"),
-  ]);
-  // If bashPromise won the race, both shapes reach the same assertion below.
-  const finalBash = "response" in bashResponse && bashResponse.response instanceof Response
-    ? bashResponse
-    : await bashPromise;
+  // The retry executes after the reviewer approves the durable operation.
+  const finalBash = await rpc("tools/call", {
+    name: "bash",
+    arguments: { workspaceId, command: "printf ask-mode-runs" },
+  }, { sessionId: reconnectSessionId });
   assert.equal(finalBash.response.status, 200, JSON.stringify(finalBash.payload));
   assert.notEqual(finalBash.payload?.result?.isError, true, `bash invocation should have run after approval: ${JSON.stringify(finalBash.payload)}`);
   // The bash command writes "ask-mode-runs" — verify the actual command output
@@ -246,9 +234,20 @@ try {
     .join("");
   assert.ok(outputText.includes("ask-mode-runs"), `bash output proves execution ran: ${outputText}`);
 
-  // The workspace grant is durable: a second bash call in the SAME workspace
-  // must run without prompting. (Same MCP session keeps the same workspaceId.)
-  // No new approval card should be emitted for the second invocation.
+  // A different operation still needs a decision, proving that the one-shot
+  // result above did not accidentally become a broad workspace grant.
+  const secondBashPending = await rpc("tools/call", {
+    name: "bash",
+    arguments: { workspaceId, command: "printf second-run" },
+  }, { sessionId });
+  assert.equal(secondBashPending.response.status, 200, JSON.stringify(secondBashPending.payload));
+  assert.equal(secondBashPending.payload?.result?.structuredContent?.status, "approval_required", JSON.stringify(secondBashPending.payload));
+  const workspaceApprovalId = await waitForMatchingApproval(reviewerSessionId, workspaceId);
+  const workspaceApproval = await rpc("tools/call", {
+    name: "provide_policy_approval",
+    arguments: { approvalId: workspaceApprovalId, decision: "approve_workspace", reason: "trusted for this workspace" },
+  }, { sessionId: reviewerSessionId, reviewer: true });
+  assert.notEqual(workspaceApproval.payload?.result?.isError, true, "approve workspace must succeed");
   const secondBash = await rpc("tools/call", {
     name: "bash",
     arguments: { workspaceId, command: "printf second-run" },
@@ -260,9 +259,6 @@ try {
     .join("");
   assert.ok(secondText.includes("second-run"), `second bash output proves the workspace grant fired: ${secondText}`);
 
-  sseController.abort();
-  await reader.cancel().catch(() => {});
-
   // ── P0.6: proxy-timeout / reconnect regression ────────────────────────────
   // A scripted upstream proxy that closed the socket (e.g. tunnel timed out
   // and the call resumed on a new TCP connection) used to leave the parked
@@ -270,16 +266,6 @@ try {
   // waiter detaches, but the durable card stays. The workspace grant
   // recorded above must remain effective for a fresh MCP session opened
   // against the same workspace.
-  const reconnectInit = await rpc("initialize", {
-    protocolVersion: "2025-06-18",
-    capabilities: {},
-    clientInfo: { name: "ask-mode-reconnect", version: "1.0.0" },
-  });
-  assert.equal(reconnectInit.response.status, 200);
-  const reconnectSessionId = reconnectInit.sessionId!;
-  assert.ok(reconnectSessionId, "reconnect initialize did not return mcp-session-id");
-  await rpc("notifications/initialized", {}, { sessionId: reconnectSessionId });
-
   // The reconnecting session is in the same workspace; the workspace grant
   // recorded above must let this invocation through without a new approval
   // card. If the durable grant were lost on reconnect this would block.

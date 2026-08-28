@@ -1,7 +1,7 @@
 // P1.17 — accelerated longevity / UAT gate.
 //
-// Where `policy-ask-lifecycle.test.ts` proves the happy path (park -> approve
-// -> unblock -> durable grant survives reconnect), this suite proves the
+// Where `policy-ask-lifecycle.test.ts` proves the direct-MCP path (return an
+// approval card -> disconnect -> dedupe -> retry after approval), this suite proves the
 // CONTROL PLANE doesn't drift over time:
 //
 //   * Sustained traffic. A single long-lived MCP session drives a mixed
@@ -26,9 +26,8 @@
 //       3. a malformed `provide_policy_approval` payload (rejected, no leak)
 //
 //   * End-of-suite liveness. Final diagnostics must show zero live waiters,
-//     zero pending approval rows, zero execution weight, and exactly one
-//     `policyWaiterResumes` (the seed approval; reconnects must reuse the
-//     existing grant via `isApproved` rather than re-entering the wait).
+//     zero pending approval rows, zero execution weight, and no policy waiter
+//     resumes. Direct MCP approvals are retryable and do not park an HTTP call.
 //
 // Each assertion exercises the public MCP surface — no internal hooks.
 // Total runtime is bounded to keep CI cheap while still catching weight
@@ -109,6 +108,7 @@ async function rpc(
     "content-type": "application/json",
     accept: "application/json, text/event-stream",
     ...(opts.sessionId ? { "mcp-session-id": opts.sessionId } : {}),
+    ...(!opts.reviewer ? { "x-kontrol-conversation-id": "longevity-conversation" } : {}),
   };
   if (opts.reviewer) headers["x-kontrol-reviewer-token"] = reviewerToken;
   const response = await fetch(url, {
@@ -152,6 +152,14 @@ async function openReviewerSession(): Promise<string> {
   return sessionId;
 }
 
+async function closeSession(sessionId: string): Promise<void> {
+  const response = await fetch(url, {
+    method: "DELETE",
+    headers: { "mcp-session-id": sessionId },
+  });
+  assert.ok([200, 202, 204].includes(response.status), `DELETE returned HTTP ${response.status}`);
+}
+
 async function diagnostics(): Promise<any> {
   const response = await fetch(diagUrl, {
     headers: { "x-kontrol-diagnostics": "longevity-test-secret" },
@@ -192,7 +200,11 @@ function assertNoDrift(diag: any, label: string): void {
 }
 
 try {
-  // ── Phase 0: open workspace + seed workspace grant ───────────────────────
+  // ── Phase 0: disconnect-before-approval churn ─────────────────────────────
+  // A direct MCP approval must survive the originating transport disappearing,
+  // and an identical retry on a new transport must attach to the same durable
+  // operation rather than create another card. Repeat this with fresh
+  // operations to catch approval-row churn and orphan cleanup regressions.
   const seedSessionId = await openWorkerSession();
   const opened = await rpc("tools/call", {
     name: "open_workspace",
@@ -206,19 +218,66 @@ try {
 
   const reviewerSessionId = await openReviewerSession();
 
-  // First bash call parks; reviewer approves with workspace scope.
-  const seedBash = rpc("tools/call", {
+  for (let churnRound = 0; churnRound < 3; churnRound++) {
+    const command = `printf approval-churn-${churnRound}`;
+    const firstSessionId = await openWorkerSession();
+    const first = await rpc("tools/call", {
+      name: "bash",
+      arguments: { workspaceId, command },
+    }, { sessionId: firstSessionId });
+    assert.equal(first.response.status, 200, JSON.stringify(first.payload));
+    assert.equal(first.payload?.result?.structuredContent?.status, "approval_required", JSON.stringify(first.payload));
+    const approvalId = await waitForMatchingApproval(reviewerSessionId, workspaceId);
+    await closeSession(firstSessionId);
+
+    const retrySessionId = await openWorkerSession();
+    const retry = await rpc("tools/call", {
+      name: "bash",
+      arguments: { workspaceId, command },
+    }, { sessionId: retrySessionId });
+    assert.equal(retry.response.status, 200, JSON.stringify(retry.payload));
+    assert.equal(retry.payload?.result?.structuredContent?.status, "approval_required", JSON.stringify(retry.payload));
+    assert.equal(retry.payload?.result?.structuredContent?.approvalId, approvalId,
+      "new MCP transport must reattach to the existing approval operation");
+    await closeSession(retrySessionId);
+
+    const approve = await rpc("tools/call", {
+      name: "provide_policy_approval",
+      arguments: { approvalId, decision: "approve", reason: `churn round ${churnRound}` },
+    }, { sessionId: reviewerSessionId, reviewer: true });
+    assert.equal(approve.response.status, 200, JSON.stringify(approve.payload));
+
+    const executeSessionId = await openWorkerSession();
+    const executed = await rpc("tools/call", {
+      name: "bash",
+      arguments: { workspaceId, command },
+    }, { sessionId: executeSessionId });
+    assert.equal(executed.response.status, 200, JSON.stringify(executed.payload));
+    assert.notEqual(executed.payload?.result?.isError, true, `churn ${churnRound} retry must execute`);
+    const executedText = (executed.payload?.result?.content ?? []).map((c: any) => c.text ?? "").join("");
+    assert.ok(executedText.includes(`approval-churn-${churnRound}`), `churn ${churnRound} output: ${executedText}`);
+    await closeSession(executeSessionId);
+  }
+
+  // ── Phase 1: seed a durable workspace grant ──────────────────────────────
+  // Direct MCP calls return immediately while the reviewer decides. The
+  // subsequent retry proves a workspace grant still works for sustained use.
+  const seedBash = await rpc("tools/call", {
     name: "bash",
     arguments: { workspaceId, command: "printf seeded" },
   }, { sessionId: seedSessionId });
-  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.equal(seedBash.response.status, 200, JSON.stringify(seedBash.payload));
+  assert.equal(seedBash.payload?.result?.structuredContent?.status, "approval_required", JSON.stringify(seedBash.payload));
   const seedApprovalId = await waitForMatchingApproval(reviewerSessionId, workspaceId);
   const seedApprove = await rpc("tools/call", {
     name: "provide_policy_approval",
     arguments: { approvalId: seedApprovalId, decision: "approve_workspace", reason: "longevity seed" },
   }, { sessionId: reviewerSessionId, reviewer: true });
   assert.equal(seedApprove.response.status, 200, JSON.stringify(seedApprove.payload));
-  const seedResult = await seedBash;
+  const seedResult = await rpc("tools/call", {
+    name: "bash",
+    arguments: { workspaceId, command: "printf seeded" },
+  }, { sessionId: seedSessionId });
   assert.equal(seedResult.response.status, 200, JSON.stringify(seedResult.payload));
   assert.notEqual(seedResult.payload?.result?.isError, true, "seed bash must run after workspace grant");
   const seedText = (seedResult.payload?.result?.content ?? []).map((c: any) => c.text ?? "").join("");
@@ -227,7 +286,7 @@ try {
   const initialDiag = await diagnostics();
   assertNoDrift(initialDiag, "after-seed");
 
-  // ── Phase 1: sustained traffic on a long-lived MCP session ───────────────
+  // ── Phase 2: sustained traffic on a long-lived MCP session ───────────────
   // Drive a mixed workload of bash/write/read. bash reuses the workspace
   // grant from Phase 0, so it must NOT re-prompt; write/read need no approval.
   const sustainedSessionId = seedSessionId; // reuse — long-lived is the point
@@ -271,7 +330,7 @@ try {
     assertNoDrift(midDiag, `batch ${batch}`);
   }
 
-  // ── Phase 2: reconnect churn over a single workspace grant ───────────────
+  // ── Phase 3: reconnect churn over a single workspace grant ───────────────
   // The durable grant must remain effective across N fresh MCP sessions,
   // each of which closes its previous transport. bash must run without
   // prompting in every new session.
@@ -304,7 +363,7 @@ try {
     assertNoDrift(churnDiag, `reconnect-${round}`);
   }
 
-  // ── Phase 3: drift injection (graceful failure paths) ─────────────────────
+  // ── Phase 4: drift injection (graceful failure paths) ─────────────────────
   // Each drift vector must be rejected or 404'd without leaking live waiters,
   // durable rows, or admission weight.
 
@@ -350,20 +409,17 @@ try {
   const afterMalformed = await diagnostics();
   assertNoDrift(afterMalformed, "after-malformed-approval");
 
-  // ── Phase 4: final liveness snapshot ─────────────────────────────────────
+  // ── Phase 5: final liveness snapshot ─────────────────────────────────────
   // Long-lived, post-drift: nothing should have accumulated beyond what the
-  // seed approval legitimately consumed. The seed approval is exactly one
-  // resume; reconnects re-attach via the durable row, so they do NOT bump
-  // policyWaiterResumes (they reuse the existing grant via isApproved).
+  // direct operations legitimately consumed. All approvals were retryable and
+  // therefore none should have created a long-lived live policy waiter.
   const finalDiag = await diagnostics();
   assertNoDrift(finalDiag, "final");
   assert.equal(finalDiag.mcpSessionMetrics?.policyWaiters?.policyWaiterDisconnects ?? 0, 0,
     "no disconnect counter activity during the drift phases");
-  // Resumes must be >=1 (the seed) but bounded — reconnects and drift
-  // injections must NOT have caused additional resumes.
+  // Reconnects and drift injections must not create policy waiter resumes.
   const finalResumes = finalDiag.mcpSessionMetrics?.policyWaiters?.policyWaiterResumes ?? 0;
-  assert.ok(finalResumes >= 1 && finalResumes <= 1,
-    `policyWaiterResumes must be exactly 1 (the seed); got ${finalResumes}`);
+  assert.equal(finalResumes, 0, `policyWaiterResumes must remain zero for direct MCP approvals; got ${finalResumes}`);
 
   console.log("policy-longevity.test.ts: all assertions passed");
 } finally {

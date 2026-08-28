@@ -26,8 +26,10 @@ try {
     values (?, ?, ?, ?, 1, 'running', 0, ?, ?, ?)
   `).run("run_current", "test-agent", secondWorkspace.id, current.id, now, new Date(Date.now() + 60_000).toISOString(), now);
 
+  const boundedPage = workSessions.reconcileRuntimeStates(undefined, 1);
+  assert.ok(boundedPage.hasMore, "runtime reconciliation must expose more work instead of sweeping every session");
   const reconciliation = workSessions.reconcileRuntimeStates();
-  assert.ok(reconciliation.markedStale >= 1, "old detached work must be classified stale");
+  assert.ok(boundedPage.markedStale + reconciliation.markedStale >= 1, "old detached work must be classified stale");
   assert.deepEqual(workSessions.listLiveWorkSessions(secondWorkspace.id).map((session) => session.id), [current.id]);
   assert.ok(workSessions.listStaleWorkSessions(secondWorkspace.id).some((session) => session.id === old.id), "historical stale work must remain recoverable");
   assert.ok(workSessions.listByWorkspace(secondWorkspace.id).some((session) => session.id === old.id), "project-scoped history must include old workspace instances");
