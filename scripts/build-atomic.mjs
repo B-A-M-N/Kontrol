@@ -82,6 +82,12 @@ try {
   const releasePath = join(releasesDir, buildId);
   mkdirSync(releasesDir, { recursive: true });
   if (existsSync(releasePath)) {
+    // Identical executable bytes: keep the existing candidate tree, but the
+    // freshly generated build-meta.json is authoritative. An earlier build of
+    // the same bytes from a dirty tree would otherwise keep reporting its
+    // stale gitSha/gitDirty forever (build-meta.json is excluded from the
+    // byte hash precisely so this refresh is safe).
+    copyFileSync(join(tempDist, "build-meta.json"), join(releasePath, "build-meta.json"));
     rmSync(tempDist, { recursive: true, force: true });
   } else {
     renameSync(tempDist, releasePath);
