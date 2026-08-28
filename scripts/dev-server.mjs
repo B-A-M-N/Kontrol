@@ -1,17 +1,76 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { readdirSync, statSync, watch } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { homedir } from "node:os";
 
 const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const watchRoots = ["src"].map((entry) => join(repoRoot, entry));
 const restartDelayMs = 750;
 const crashDelayMs = 1500;
+const maxCrashDelayMs = 30_000;
+
+function resolveRuntimeConfig() {
+  const result = spawnSync(process.execPath, ["--import", "tsx", "--input-type=module", "-e", [
+    'import { loadConfig } from "./src/config.ts";',
+    'const config = loadConfig();',
+    'process.stdout.write(JSON.stringify({ stateDir: config.stateDir, port: config.port }));',
+  ].join(" ")], {
+    cwd: repoRoot,
+    // kontrol-env-exception: this local watcher resolves its own config before
+    // spawning the local server; no remote/project content is executed here.
+    env: process.env,
+    encoding: "utf8",
+  });
+  if (result.status !== 0) throw new Error((result.stderr || "could not load Kontrol config").trim());
+  return JSON.parse(result.stdout);
+}
+
+function runtimeLockCommand(command, args) {
+  return spawnSync(process.execPath, ["--import", "tsx", join(repoRoot, "src/runtime-lock.ts"), command, ...args], {
+    cwd: repoRoot,
+    // kontrol-env-exception: this local watcher invokes its own runtime-lock
+    // helper; the child receives no project-controlled input.
+    env: process.env,
+    encoding: "utf8",
+  });
+}
+
+const runtimeConfig = resolveRuntimeConfig();
+const runtimeStateDir = process.env.KONTROL_STATE_DIR || runtimeConfig.stateDir || join(homedir(), ".local", "share", "kontrol");
+const generationId = `dev-${Date.now()}-${process.pid}`;
+const lockResult = runtimeLockCommand("acquire", [
+  "--state-dir", runtimeStateDir,
+  "--launcher", "dev-watch",
+  "--launcher-pid", String(process.pid),
+  "--generation-id", generationId,
+  "--build-id", "dev",
+  "--artifact-path", join(repoRoot, "src"),
+  "--port", String(runtimeConfig.port ?? 7676),
+]);
+if (lockResult.status !== 0) {
+  throw new Error((lockResult.stderr || lockResult.stdout || "Kontrol runtime lock acquisition failed").trim());
+}
+const runtimeLockToken = lockResult.stdout.trim();
+const childEnvironment = {
+  ...process.env,
+  KONTROL_LAUNCHER: "dev-watch",
+  KONTROL_LAUNCH_GENERATION_ID: generationId,
+  KONTROL_RUNTIME_LOCK_TOKEN: runtimeLockToken,
+  KONTROL_ARTIFACT_PATH: join(repoRoot, "src"),
+};
 
 let child;
 let restartTimer;
 let stoppingForRestart = false;
 let shuttingDown = false;
+let crashBackoffMs = crashDelayMs;
+let childStartedAt = 0;
+
+function releaseRuntimeLock() {
+  if (!runtimeLockToken) return;
+  runtimeLockCommand("release", ["--state-dir", runtimeStateDir, "--token", runtimeLockToken]);
+}
 
 function log(message) {
   console.error(`[kontrol:dev] ${message}`);
@@ -19,11 +78,12 @@ function log(message) {
 
 function start() {
   stoppingForRestart = false;
+  childStartedAt = Date.now();
   child = spawn("npx", ["tsx", "src/cli.ts", "serve"], {
     cwd: repoRoot,
     // kontrol-env-exception: local dev server runs the developer's own
     // checkout on their machine; not a remote control-plane spawn path.
-    env: process.env,
+    env: childEnvironment,
     stdio: "inherit",
   });
 
@@ -32,8 +92,11 @@ function start() {
     if (shuttingDown) return;
     if (stoppingForRestart) return;
 
-    log(`server exited (${signal ?? code ?? "unknown"}); restarting in ${crashDelayMs}ms`);
-    scheduleRestart(crashDelayMs);
+    if (Date.now() - childStartedAt >= 10_000) crashBackoffMs = crashDelayMs;
+    const delay = crashBackoffMs;
+    crashBackoffMs = Math.min(maxCrashDelayMs, crashBackoffMs * 2);
+    log(`server exited (${signal ?? code ?? "unknown"}); restarting in ${delay}ms`);
+    scheduleRestart(delay);
   });
 }
 
@@ -103,11 +166,20 @@ function watchDirectory(root) {
 function shutdown() {
   shuttingDown = true;
   clearTimeout(restartTimer);
-  if (!child) return process.exit(0);
+  if (!child) {
+    releaseRuntimeLock();
+    return process.exit(0);
+  }
 
-  child.once("exit", () => process.exit(0));
+  child.once("exit", () => {
+    releaseRuntimeLock();
+    process.exit(0);
+  });
   child.kill("SIGTERM");
-  setTimeout(() => process.exit(1), 3000).unref();
+  setTimeout(() => {
+    releaseRuntimeLock();
+    process.exit(1);
+  }, 3000).unref();
 }
 
 for (const signal of ["SIGINT", "SIGTERM"]) {
@@ -118,5 +190,5 @@ for (const root of watchRoots) {
   watchDirectory(root);
 }
 
-log("watching src; server restarts on changes and after crashes");
+log(`watching src; generation ${generationId}; server restarts on changes and after crashes`);
 start();

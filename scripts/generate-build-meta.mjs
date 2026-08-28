@@ -57,23 +57,52 @@ function getSchemaHash() {
   }
 }
 
+function getSchemaVersion() {
+  try {
+    const migrationFile = join(root, "src/db/migrations.ts");
+    const source = readFileSync(migrationFile, "utf8");
+    const versions = [...source.matchAll(/\{\s*version:\s*(\d+)\s*,/g)]
+      .map((match) => Number(match[1]))
+      .filter((version) => Number.isInteger(version));
+    return versions.length > 0 ? Math.max(...versions) : 0;
+  } catch {
+    return Number(process.env.SCHEMA_VERSION) || 0;
+  }
+}
+
+const schemaVersion = getSchemaVersion();
+const releaseFormatVersion = Number(process.env.KONTROL_RELEASE_FORMAT_VERSION || 1);
+
 const buildMeta = {
   version: getPackageVersion(),
   gitSha: getGitSha(),
   gitDirty: getGitDirty(),
   buildTimestamp: new Date().toISOString(),
   schemaHash: getSchemaHash(),
+  // Older schemas are upgraded in place by the migration chain. Future
+  // schemas are rejected fail-closed, so these bounds describe what this
+  // artifact can actually open rather than promising downgrade support.
+  schemaVersion,
+  minReadableSchemaVersion: 0,
+  maxReadableSchemaVersion: schemaVersion,
+  schemaCompatibility: "upgrade-in-place; downgrade-via-versioned-backup",
+  releaseFormatVersion,
   nodeVersion: process.version,
 };
-// The build ID is deterministic for a source/build generation.  Do not use
-// the timestamp alone: a launcher must be able to prove that the process it
-// reached is the artifact it just built.
-buildMeta.buildId = createHash("sha256")
+// build-atomic.mjs supplies the ID after the final candidate bytes are known.
+// Keep the fallback for direct tooling/tests, but never emit a preliminary ID
+// during an atomic build.
+buildMeta.buildId = process.env.KONTROL_BUILD_ID || createHash("sha256")
   .update(JSON.stringify({
     version: buildMeta.version,
     gitSha: buildMeta.gitSha,
     gitDirty: buildMeta.gitDirty,
     schemaHash: buildMeta.schemaHash,
+    schemaVersion: buildMeta.schemaVersion,
+    minReadableSchemaVersion: buildMeta.minReadableSchemaVersion,
+    maxReadableSchemaVersion: buildMeta.maxReadableSchemaVersion,
+    schemaCompatibility: buildMeta.schemaCompatibility,
+    releaseFormatVersion: buildMeta.releaseFormatVersion,
   }))
   .digest("hex")
   .slice(0, 16);
