@@ -93,14 +93,25 @@ assert.equal(loadConfig(baseEnv).mcpUnusedSessionIdleMs, 600_000);
 assert.equal(loadConfig(baseEnv).mcpEphemeralSessionIdleMs, 86_400_000);
 assert.equal(loadConfig(baseEnv).mcpReusableSessionIdleMs, 86_400_000);
 assert.equal(loadConfig(baseEnv).mcpSessionReaperIntervalMs, 15_000);
+assert.equal(loadConfig(baseEnv).mcpLogicalContinuityRetentionMs, 259_200_000);
 assert.equal(loadConfig(baseEnv).mcpSessionMaxPerClient, 20);
 assert.equal(loadConfig(baseEnv).mcpSessionSoftCap, 150);
 assert.equal(loadConfig(baseEnv).mcpSessionHardCap, 200);
 assert.equal(loadConfig({ ...baseEnv, KONTROL_MCP_EPHEMERAL_SESSION_IDLE_MS: "1234" }).mcpEphemeralSessionIdleMs, 1234);
 assert.equal(loadConfig(baseEnv).mcpAdmissionTimeoutMs, 120_000);
 assert.equal(loadConfig(baseEnv).mcpExecutionTimeoutMs, 30 * 60_000);
+assert.equal(loadConfig(baseEnv).maintenanceIntervalMs, 5 * 60_000);
+assert.equal(loadConfig(baseEnv).maintenanceBudgetMs, 250);
+assert.equal(loadConfig(baseEnv).integrityIntervalMs, 30 * 60_000);
+assert.equal(loadConfig(baseEnv).integrityDeadlineMs, 10_000);
 assert.equal(loadConfig(baseEnv).policyApprovalTimeoutMs, 24 * 60 * 60_000);
+assert.equal(loadConfig(baseEnv).policyDirectApprovalReattachGraceMs, 5 * 60_000);
 assert.equal(loadConfig({ ...baseEnv, KONTROL_MCP_ADMISSION_TIMEOUT_MS: "4321", KONTROL_MCP_EXECUTION_TIMEOUT_MS: "8765", KONTROL_POLICY_APPROVAL_TIMEOUT_MS: "9999" }).mcpAdmissionTimeoutMs, 4321);
+assert.equal(loadConfig({ ...baseEnv, KONTROL_MAINTENANCE_INTERVAL_MS: "41", KONTROL_MAINTENANCE_BUDGET_MS: "17", KONTROL_INTEGRITY_INTERVAL_MS: "43", KONTROL_INTEGRITY_DEADLINE_MS: "19" }).maintenanceIntervalMs, 41);
+assert.equal(loadConfig({ ...baseEnv, KONTROL_MAINTENANCE_INTERVAL_MS: "41", KONTROL_MAINTENANCE_BUDGET_MS: "17", KONTROL_INTEGRITY_INTERVAL_MS: "43", KONTROL_INTEGRITY_DEADLINE_MS: "19" }).maintenanceBudgetMs, 17);
+assert.equal(loadConfig({ ...baseEnv, KONTROL_MAINTENANCE_INTERVAL_MS: "41", KONTROL_MAINTENANCE_BUDGET_MS: "17", KONTROL_INTEGRITY_INTERVAL_MS: "43", KONTROL_INTEGRITY_DEADLINE_MS: "19" }).integrityIntervalMs, 43);
+assert.equal(loadConfig({ ...baseEnv, KONTROL_MAINTENANCE_INTERVAL_MS: "41", KONTROL_MAINTENANCE_BUDGET_MS: "17", KONTROL_INTEGRITY_INTERVAL_MS: "43", KONTROL_INTEGRITY_DEADLINE_MS: "19" }).integrityDeadlineMs, 19);
+assert.equal(loadConfig({ ...baseEnv, KONTROL_POLICY_DIRECT_REATTACH_GRACE_MS: "23" }).policyDirectApprovalReattachGraceMs, 23);
 assert.equal(loadConfig({ ...baseEnv, KONTROL_MCP_ADMISSION_TIMEOUT_MS: "4321" }).mcpRequestDeadlineMs, 4321);
 assert.equal(loadConfig({ ...baseEnv, KONTROL_SKILLS: "0" }).skillsEnabled, false);
 assert.equal(loadConfig({ ...baseEnv, KONTROL_SKILLS: "1" }).skillsEnabled, true);
@@ -254,3 +265,69 @@ assert.deepEqual(fileConfig.allowedHosts, [
   "::1",
   "kontrol.example.com",
 ]);
+
+// P0 — tunnel mode must not start an ask-capable policy without a reviewer
+// credential. Direct approvals exist independently from ACP; without reviewer
+// authority the deployment can mint approval cards that no surface can
+// resolve, deadlocking every ask-gated tool call.
+const tunnelEnv = {
+  KONTROL_CONFIG_DIR: mkdtempSync(join(tmpdir(), "kontrol-tunnel-gate-config-")),
+  KONTROL_ALLOWED_ROOTS: process.cwd(),
+  KONTROL_AUTH_MODE: "tunnel",
+  KONTROL_ACP_ENABLED: "false",
+};
+const reviewerSecret = "tunnel-gate-reviewer-secret-long-enough";
+
+// Ask-capable without reviewer secret: deadlocked configuration, must fail.
+assert.throws(
+  () => loadConfig({ ...tunnelEnv }),
+  /ask-capable policy requires a reviewer credential/,
+  "tunnel + baseline ask policy without reviewer secret must fail startup",
+);
+assert.throws(
+  () => loadConfig({ ...tunnelEnv, KONTROL_POLICY_MODE: "ask" }),
+  /ask-capable policy requires a reviewer credential/,
+  "tunnel + explicit ask mode without reviewer secret must fail startup",
+);
+assert.throws(
+  () => loadConfig({ ...tunnelEnv, KONTROL_POLICY_MODE: "allow", KONTROL_POLICY_TOOL_BASH: "ask" }),
+  /ask-capable policy requires a reviewer credential/,
+  "tunnel + per-tool ask without reviewer secret must fail startup",
+);
+assert.throws(
+  () => loadConfig({
+    ...tunnelEnv,
+    KONTROL_POLICY_MODE: "allow",
+    KONTROL_POLICY_PATH_RULES: JSON.stringify([{ pattern: "/etc/**", mode: "ask" }]),
+  }),
+  /ask-capable policy requires a reviewer credential/,
+  "tunnel + ask path rule without reviewer secret must fail startup",
+);
+
+// Non-interactive postures stay valid without a reviewer secret: no approval
+// decisions can be produced, so there is nothing to deadlock.
+assert.doesNotThrow(
+  () => loadConfig({ ...tunnelEnv, KONTROL_POLICY_MODE: "allow" }),
+  "tunnel + allow policy needs no reviewer credential",
+);
+assert.doesNotThrow(
+  () => loadConfig({ ...tunnelEnv, KONTROL_POLICY_MODE: "deny" }),
+  "tunnel + deny policy needs no reviewer credential",
+);
+
+// Any reviewer credential source satisfies the gate.
+assert.doesNotThrow(
+  () => loadConfig({ ...tunnelEnv, KONTROL_TUNNEL_REVIEWER_SECRET: reviewerSecret }),
+  "dedicated tunnel reviewer secret satisfies the ask gate",
+);
+assert.doesNotThrow(
+  () => loadConfig({ ...tunnelEnv, KONTROL_ACP_REVIEWER_SECRET: reviewerSecret }),
+  "legacy ACP reviewer secret satisfies the ask gate",
+);
+
+// Non-tunnel auth modes provide reviewer authority through their own
+// mechanisms (OAuth scopes / ACP credentials) and are not gated here.
+assert.doesNotThrow(
+  () => loadConfig({ ...baseEnv }),
+  "oauth mode is not subject to the tunnel reviewer gate",
+);

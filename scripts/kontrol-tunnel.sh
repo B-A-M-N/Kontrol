@@ -5,14 +5,16 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" && pwd)"
 DESKTOP_PWD="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 cd -- "$DESKTOP_PWD"
 
-[[ -f .env ]] || {
-  echo "ERROR: expected .env in $DESKTOP_PWD" >&2
+ENV_FILE="${KONTROL_ENV_FILE:-$DESKTOP_PWD/.env}"
+[[ -f "$ENV_FILE" ]] || {
+  echo "ERROR: expected environment file at $ENV_FILE" >&2
   exit 1
 }
 
 set -a
-source .env
+source "$ENV_FILE"
 set +a
+export KONTROL_ENV_FILE="$ENV_FILE"
 
 if [[ -n "${KONTROL_TUNNEL_FORWARD_HEADERS:-}" ]]; then
   echo "ERROR: KONTROL_TUNNEL_FORWARD_HEADERS is unsupported; tunnel mode must not add a second MCP auth gate." >&2
@@ -33,6 +35,36 @@ fi
 if [[ -z "${KONTROL_TUNNEL_REVIEWER_SECRET:-}" && -n "${KONTROL_ACP_REVIEWER_SECRET:-}" ]]; then
   export KONTROL_TUNNEL_REVIEWER_SECRET="$KONTROL_ACP_REVIEWER_SECRET"
 fi
+
+# Mirror the server's startup gate (src/config.ts): an ask-capable policy
+# without a reviewer assertion creates approvals that no surface can resolve.
+function policy_can_ask() {
+  local mode="${KONTROL_POLICY_MODE:-allow}"
+  [[ "$mode" == "ask" ]] && return 0
+  # Per-tool rules arrive as KONTROL_POLICY_TOOL_<name>=<mode> environment
+  # entries. Bash cannot expand indeterminate names with parameter expansion,
+  # so iterate matching variable names with compgen.
+  local name
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    if [[ "${!name:-allow}" == "ask" ]]; then return 0; fi
+  done < <(compgen -e | grep '^KONTROL_POLICY_TOOL_')
+  if [[ -n "${KONTROL_POLICY_PATH_RULES:-}" ]]; then
+    if printf '%s' "$KONTROL_POLICY_PATH_RULES" | grep -q '"mode"[[:space:]]*:[[:space:]]*"ask"'; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
+if [[ -z "${KONTROL_TUNNEL_REVIEWER_SECRET:-}" ]] && policy_can_ask; then
+  echo "ERROR: KONTROL_AUTH_MODE=tunnel with an ask-capable policy requires a reviewer credential." >&2
+  echo "       Set KONTROL_TUNNEL_REVIEWER_SECRET (or KONTROL_ACP_REVIEWER_SECRET), or use a" >&2
+  echo "       non-interactive policy posture (KONTROL_POLICY_MODE=allow). Ask-gated tools" >&2
+  echo "       would otherwise create approvals that no reviewer surface can open or resolve." >&2
+  exit 1
+fi
+
 if [[ -n "${KONTROL_TUNNEL_REVIEWER_SECRET:-}" ]]; then
   TUNNEL_ARGS+=(--mcp.extra-headers "X-Kontrol-Tunnel-Reviewer: env:KONTROL_TUNNEL_REVIEWER_SECRET")
 fi

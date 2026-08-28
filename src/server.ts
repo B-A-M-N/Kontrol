@@ -2,7 +2,9 @@ import { execSync } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
+import type { Socket } from "node:net";
 import os from "node:os";
+import { Worker } from "node:worker_threads";
 import { join, dirname, relative, resolve, sep } from "node:path";
 import { realpath } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
@@ -57,9 +59,9 @@ import { createSupervisorRuntime } from "./supervisor-runtime.js";
 import { shutdownMissionVerifiers, verifyMissionSubmission } from "./mission-verifier.js";
 import { evaluateSupervisorMission } from "./supervisor-evaluator.js";
 import { createReviewWorkflowService, type ReviewWorkflowService } from "./review-workflow.js";
-import { openDatabase, type DatabaseHandle } from "./db/client.js";
+import { databasePath, openDatabase, type DatabaseHandle } from "./db/client.js";
 import { LATEST_SCHEMA_VERSION } from "./db/migrations.js";
-import { createPolicyEngine, type PolicyConfig, type PolicyEngine, type ApprovalScope } from "./policy.js";
+import { createPolicyEngine, policyCanAsk, type PolicyConfig, type PolicyEngine, type ApprovalScope } from "./policy.js";
 import { createSqliteGrantStore } from "./policy-grants.js";
 import { registerPolicyTools } from "./policy-tools.js";
 import { createPolicyEnforcer, type PolicyInvocation, type PolicyEnforcer, type PolicyWaitContext, type PolicyWaitOutcome, ACP_TOOL_POLICY_NAMES, type PrincipalRole } from "./policy-enforcement.js";
@@ -69,8 +71,10 @@ import { createApprovalRequestManager } from "./approval-requests.js";
 import { createMissionLedger } from "./mission-ledger.js";
 import { createAgentMessageManager } from "./agent-messages.js";
 import { DEVDESKTOP_WORKSPACE_APP_URI, LEGACY_WORKSPACE_APP_URI, OPENAI_WORKSPACE_APP_URI, WORKSPACE_APP_BUILD_ID, WORKSPACE_APP_HTML, WORKSPACE_APP_URI, workspaceAppResourceKind, workspaceAppResourceMeta, workspaceAppToolMeta } from "./workspace-app-resource.js";
-import { createRuntimeIdentity, readBuildIdentity, readRuntimeIdentity, removeRuntimeIdentity } from "./runtime-identity.js";
+import { createRuntimeIdentityRecord, readBuildIdentity, readRuntimeIdentity, removeRuntimeIdentity, writeRuntimeIdentity } from "./runtime-identity.js";
+import { acquireRuntimeLock, assertRuntimeLock, releaseRuntimeLock, runtimeLockPath, type RuntimeLockHandle } from "./runtime-lock.js";
 import { mcpSessionIdleReason, mcpSessionIdleTtl } from "./mcp-session-policy.js";
+import { LogicalContinuityIndex } from "./mcp-logical-continuity.js";
 import { installCachedToolList, toolListCacheDiagnostics } from "./mcp-tool-list-cache.js";
 import { isPathInsideRoot } from "./roots.js";
 
@@ -79,10 +83,15 @@ let cachedPackageVersion: string | undefined;
 function readPackageVersion(): string {
   if (cachedPackageVersion) return cachedPackageVersion;
   try {
-    const manifest = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version?: string };
-    cachedPackageVersion = typeof manifest.version === "string" && manifest.version ? manifest.version : "0.0.0";
+    const buildMeta = JSON.parse(readFileSync(new URL("./build-meta.json", import.meta.url), "utf8")) as { version?: string };
+    cachedPackageVersion = typeof buildMeta.version === "string" && buildMeta.version ? buildMeta.version : "0.0.0";
   } catch {
-    cachedPackageVersion = "0.0.0";
+    try {
+      const manifest = JSON.parse(readFileSync(join(process.cwd(), "package.json"), "utf8")) as { version?: string };
+      cachedPackageVersion = typeof manifest.version === "string" && manifest.version ? manifest.version : "0.0.0";
+    } catch {
+      cachedPackageVersion = "0.0.0";
+    }
   }
   return cachedPackageVersion;
 }
@@ -144,6 +153,8 @@ interface McpRequestContext {
   signal: AbortSignal;
   mcpSessionId?: string;
   mcpRequestId?: string;
+  conversationId?: string;
+  approvalCorrelationId?: string;
   onPolicyWaitStart?: (context: PolicyWaitContext) => void | Promise<void>;
   onPolicyWaitEnd?: (context: PolicyWaitContext & { outcome: PolicyWaitOutcome }) => void | Promise<void>;
 }
@@ -162,11 +173,16 @@ interface McpSessionState {
   sessionId: string;
   sessionLabel: string;
   logicalClientId: string;
+  identitySource: "instance_header" | "conversation" | "oauth" | "client_info_fallback";
   authenticatedRole: "worker" | "reviewer" | "client";
   authSource: "oauth" | "reviewer_token" | "worker_token" | "tunnel_reviewer" | "anonymous";
   conversationId?: string;
+  approvalCorrelationId?: string;
   createdAt: number;
-  lastActivityAt: number;
+  /** Any request/stream activity, including protocol heartbeats and SSE. */
+  lastTransportActivityAt: number;
+  /** Meaningful MCP application traffic used by idle policy. */
+  lastApplicationActivityAt: number;
   inFlightRequests: number;
   requestCount: number;
   notificationCount: number;
@@ -328,15 +344,34 @@ interface DiffStats {
   removals: number;
 }
 
-function logicalClientId(req: Request): string {
-  if (req.auth?.clientId) return `oauth:${req.auth.clientId}`;
+function logicalClientIdentity(req: Request): { id: string; source: McpSessionState["identitySource"] } {
+  // Reconnectable interactive ownership partitions an ALREADY-AUTHENTICATED
+  // principal by conversation. A conversation value never broadens
+  // authorization: it only narrows which transports share one logical owner,
+  // so two conversations of the same client cannot touch each other's direct
+  // processes or reattach to each other's pending approvals.
+  const suppliedConversation = conversationId(req);
+  if (req.auth?.clientId) {
+    return suppliedConversation
+      ? { id: `oauth:${req.auth.clientId}|conversation:${suppliedConversation}`, source: "oauth" }
+      : { id: `oauth:${req.auth.clientId}`, source: "oauth" };
+  }
   const supplied = req.header("x-kontrol-client-instance")?.trim();
-  if (supplied) return `instance:${supplied.slice(0, 200)}`;
+  if (supplied) {
+    return suppliedConversation
+      ? { id: `instance:${supplied.slice(0, 200)}|conversation:${suppliedConversation}`, source: "instance_header" }
+      : { id: `instance:${supplied.slice(0, 200)}`, source: "instance_header" };
+  }
+  if (suppliedConversation) return { id: `conversation:${suppliedConversation}`, source: "conversation" };
   const clientInfo = (req.body as { params?: { clientInfo?: { name?: unknown; version?: unknown } } } | undefined)
     ?.params?.clientInfo;
   const name = typeof clientInfo?.name === "string" ? clientInfo.name : "unknown";
   const version = typeof clientInfo?.version === "string" ? clientInfo.version : "unknown";
-  return `mcp:${name.slice(0, 100)}@${version.slice(0, 100)}`;
+  return { id: `mcp:${name.slice(0, 100)}@${version.slice(0, 100)}`, source: "client_info_fallback" };
+}
+
+function logicalClientId(req: Request): string {
+  return logicalClientIdentity(req).id;
 }
 
 // MCP does not standardize a conversation identifier. If a trusted
@@ -617,10 +652,43 @@ function shouldAttachWidget(mode: WidgetMode, kind: ToolWidgetKind): boolean {
   }
 }
 
+/**
+ * A tool whose effective policy can produce an `ask` outcome may return a
+ * blocked result that carries an interactive approval card. Those results must
+ * reach the Workspace App even in `changes` mode: a card the host cannot
+ * render because the tool descriptor never advertised the app is a
+ * dead-end approval. `off` stays off — an operator who disabled widgets has
+ * no interactive surface to attach one to.
+ */
+function toolCanRequireInteractiveApproval(policy: PolicyConfig, kind: ToolWidgetKind): boolean {
+  const canonicalToolsByKind: Partial<Record<ToolWidgetKind, string[]>> = {
+    // exec_command and a mutating write_stdin are gated under the canonical
+    // "bash" policy key (P0 #1), so the shell widget follows bash's rule.
+    shell: ["bash"],
+    read: ["read"],
+    write: ["write"],
+    edit: ["edit", "apply_patch"],
+    search: ["grep", "glob"],
+    directory: ["ls"],
+  };
+  const tools = canonicalToolsByKind[kind];
+  if (!tools) return false;
+  if (tools.some((tool) => (policy.toolRules[tool] ?? policy.defaultMode) === "ask")) return true;
+  // Path rules can place a read/ls (and any path-scoped tool) in ask; the
+  // pattern cannot be resolved per-descriptor, so any path rule with mode
+  // "ask" makes every path-scoped tool potentially interactive.
+  return policy.pathRules.some((rule) => rule.mode === "ask");
+}
+
 function toolWidgetDescriptorMeta(
   config: ServerConfig,
   kind: ToolWidgetKind,
 ): ToolWidgetDescriptorMeta {
+  if (config.widgets === "changes" && toolCanRequireInteractiveApproval(config.policy, kind)) {
+    return {
+      _meta: workspaceAppToolMeta(["model"]) as unknown as ToolDefinitionMeta,
+    };
+  }
   if (!shouldAttachWidget(config.widgets, kind)) return { _meta: {} };
 
   return {
@@ -695,6 +763,9 @@ function resultOutputSchema(extra: z.ZodRawShape = {}): z.ZodRawShape {
       .describe(
         "Model-readable result text for follow-up reasoning and plain MCP hosts.",
       ),
+    status: z.string().optional(),
+    approvalId: z.string().optional(),
+    retryable: z.boolean().optional(),
     ...extra,
   };
 }
@@ -819,9 +890,77 @@ function contentLineCount(content: string): number {
 }
 
 /**
+ * P0.2: a policy-blocked result must remain renderable by the Workspace App.
+ * The MCP `_meta.tool`/`_meta.card` envelope is the only contract the app can
+ * use (see toolNameFromMeta()/isToolResultCard() in workspace-app.tsx), and it
+ * is attached even when isError is true because the UI renders both blocked
+ * and approval-pending cards from the same payload.
+ */
+function policyFailureResponse(
+  result: { allowed: boolean; approvalRequired?: boolean; approvalId?: string },
+  deniedMessage: string,
+  context: {
+    tool: "exec_command" | "write_stdin" | "read" | "write" | "edit" | "apply_patch" | "grep" | "glob" | "ls" | "bash";
+    workspaceId: string;
+    path?: string;
+    command?: string;
+  },
+): {
+  content: Array<{ type: "text"; text: string }>;
+  isError: boolean;
+  _meta: { tool: string; card: Record<string, unknown> };
+  structuredContent?: Record<string, unknown>;
+} {
+  if (result.approvalRequired && result.approvalId) {
+    const message = `Approval required. Approve ${result.approvalId} in the Kontrol review UI, then retry this tool call.`;
+    const card: Record<string, unknown> = {
+      tool: context.tool,
+      workspaceId: context.workspaceId,
+      status: "approval_required",
+      approvalId: result.approvalId,
+      retryable: true,
+      summary: {
+        status: "approval_required",
+        approvalId: result.approvalId,
+        command: context.command,
+      },
+      payload: { content: [{ type: "text", text: message }] },
+    };
+    if (context.path !== undefined) card.path = context.path;
+    if (context.command !== undefined) card.command = context.command;
+    return {
+      content: [{ type: "text", text: message }],
+      isError: false,
+      _meta: { tool: context.tool, card },
+      structuredContent: {
+        result: message,
+        status: "approval_required",
+        approvalId: result.approvalId,
+        retryable: true,
+      },
+    };
+  }
+  const card: Record<string, unknown> = {
+    tool: context.tool,
+    workspaceId: context.workspaceId,
+    status: "policy_denied",
+    summary: { status: "policy_denied", command: context.command },
+    payload: { content: [{ type: "text", text: deniedMessage }] },
+  };
+  if (context.path !== undefined) card.path = context.path;
+  if (context.command !== undefined) card.command = context.command;
+  return {
+    content: [{ type: "text", text: deniedMessage }],
+    isError: true,
+    _meta: { tool: context.tool, card },
+    structuredContent: { result: deniedMessage },
+  };
+}
+
+/**
  * Policy enforcement for tool calls.
- * Returns true if the call should proceed, false if denied.
- * For "ask" mode, blocks until human approval is provided before returning.
+ * Returns the policy outcome. Direct MCP calls return approval_required
+ * immediately; controlled ACP invocations may retain blocking semantics.
  *
  * Uses the shared enforcer so MCP and ACP share one code path, and records
  * approvals under the CANONICAL policy key (never a reconstructed key).
@@ -836,7 +975,7 @@ async function enforceToolPolicy(
   path: PolicyInvocation["path"],
   command: string | undefined,
   paths?: PolicyInvocation["paths"],
-): Promise<boolean> {
+): Promise<{ allowed: boolean; approvalRequired?: boolean; approvalId?: string }> {
   if (workSessions && workSessionId) {
     const sessionDecision = authorizeWorkSessionAction(workSessions, {
       workSessionId,
@@ -844,9 +983,9 @@ async function enforceToolPolicy(
       path: typeof path === "string" ? path : path?.relativePath,
       command,
     });
-    if (!sessionDecision.allowed) return false;
+    if (!sessionDecision.allowed) return { allowed: false };
   }
-  const { allowed } = await enforcer.enforce({
+  const result = await enforcer.enforce({
     principalId: workSessionId ?? workspaceId,
     principalRole: workSessionId ? "worker" : "client",
     workspaceId,
@@ -861,8 +1000,14 @@ async function enforceToolPolicy(
     mcpRequestId: currentMcpRequestContext()?.mcpRequestId,
     onPolicyWaitStart: currentMcpRequestContext()?.onPolicyWaitStart,
     onPolicyWaitEnd: currentMcpRequestContext()?.onPolicyWaitEnd,
+    // A direct MCP operation has no durable worker lifecycle to hold open, so
+    // return approval_required immediately. Calls bound to a work session are
+    // controlled worker operations and retain ACP-style blocking semantics.
+    blockingApproval: Boolean(workSessionId),
+    conversationId: currentMcpRequestContext()?.conversationId,
+    approvalCorrelationId: currentMcpRequestContext()?.approvalCorrelationId,
   });
-  return allowed;
+  return result;
 }
 
 /**
@@ -923,7 +1068,11 @@ function newFilePatch(path: string, content: string): string {
 
 
 function uiBuildDirectory(): string {
-  return fileURLToPath(new URL("../dist/ui", import.meta.url));
+  const moduleDirectory = dirname(fileURLToPath(import.meta.url));
+  const localDirectory = join(moduleDirectory, "ui");
+  return statSync(localDirectory, { throwIfNoEntry: false })?.isDirectory()
+    ? localDirectory
+    : join(process.cwd(), "dist", "ui");
 }
 
 function setAssetHeaders(res: Response): void {
@@ -1081,17 +1230,19 @@ function registerCodexProcessTools(
           policyPath,
           cmd,
         );
-        if (!approved) {
-          return {
-            content: [{ type: "text" as const, text: `Tool "exec_command" denied by policy. Command: ${cmd}` }],
-            isError: true,
-          };
+        if (!approved.allowed) {
+          return policyFailureResponse(approved, `Tool "exec_command" denied by policy. Command: ${cmd}`, {
+            tool: "exec_command",
+            workspaceId,
+            path: typeof policyPath === "string" ? policyPath : policyPath?.relativePath,
+            command: cmd,
+          });
         }
       }
 
       const snapshot = await processSessions.start({
         workspaceId,
-        ownerId: connectionContext?.mcpSessionId,
+        ownerId: processSessionOwnerId(connectionContext),
         workSessionId: connectionContext?.workSessionId,
         command: cmd,
         cwd,
@@ -1179,18 +1330,19 @@ function registerCodexProcessTools(
           undefined,
           chars,
         );
-        if (!approved) {
-          return {
-            content: [{ type: "text" as const, text: `Tool "write_stdin" denied by policy: cannot send input to a gated process.` }],
-            isError: true,
-          };
+        if (!approved.allowed) {
+          return policyFailureResponse(approved, `Tool "write_stdin" denied by policy: cannot send input to a gated process.`, {
+            tool: "write_stdin",
+            workspaceId,
+            command: chars,
+          });
         }
       }
 
       const snapshot = await processSessions.write({
         workspaceId,
         sessionId,
-        ownerId: connectionContext?.mcpSessionId,
+        ownerId: processSessionOwnerId(connectionContext),
         workSessionId: connectionContext?.workSessionId,
         chars,
         columns,
@@ -1245,6 +1397,19 @@ interface ConnectionContext {
   mcpSessionLabel?: string;
   /** Optional upstream conversation correlation; not an authorization key. */
   conversationId?: string;
+  /** Stable trusted identity used only for reconnecting one approval operation. */
+  approvalCorrelationId?: string;
+}
+
+/**
+ * Direct process sessions normally belong to the transport that opened them,
+ * but a trusted reconnect identity or durable work session can outlive one
+ * MCP transport. Generic clientInfo fallback remains deliberately ephemeral.
+ */
+function processSessionOwnerId(context?: ConnectionContext): string | undefined {
+  if (context?.workSessionId) return `work-session:${context.workSessionId}`;
+  if (context?.approvalCorrelationId) return `logical-client:${context.approvalCorrelationId}`;
+  return context?.mcpSessionId;
 }
 
 function createMcpServer(
@@ -1614,11 +1779,12 @@ function createMcpServer(
           canonicalPolicyPath(workspace.root, input.path, readPath.absolutePath),
           undefined,
         );
-        if (!approved) {
-          return {
-            content: [{ type: "text" as const, text: `Tool "${toolNames.read}" denied by policy. Path: ${input.path}` }],
-            isError: true,
-          };
+        if (!approved.allowed) {
+          return policyFailureResponse(approved, `Tool "${toolNames.read}" denied by policy. Path: ${input.path}`, {
+            tool: toolNames.read,
+            workspaceId,
+            path: input.path,
+          });
         }
       }
       const newlyApplicable = readPath.skillRead
@@ -1721,11 +1887,12 @@ function createMcpServer(
           policyPath,
           undefined,
         );
-        if (!approved) {
-          return {
-            content: [{ type: "text" as const, text: `Tool "${toolNames.write}" denied by policy. Path: ${input.path}` }],
-            isError: true,
-          };
+        if (!approved.allowed) {
+          return policyFailureResponse(approved, `Tool "${toolNames.write}" denied by policy. Path: ${input.path}`, {
+            tool: toolNames.write,
+            workspaceId,
+            path: input.path,
+          });
         }
       }
 
@@ -1834,11 +2001,12 @@ function createMcpServer(
           policyPath,
           undefined,
         );
-        if (!approved) {
-          return {
-            content: [{ type: "text" as const, text: `Tool "${toolNames.edit}" denied by policy. Path: ${input.path}` }],
-            isError: true,
-          };
+        if (!approved.allowed) {
+          return policyFailureResponse(approved, `Tool "${toolNames.edit}" denied by policy. Path: ${input.path}`, {
+            tool: toolNames.edit,
+            workspaceId,
+            path: input.path,
+          });
         }
       }
 
@@ -1955,11 +2123,12 @@ function createMcpServer(
             undefined,
             policyPaths,
           );
-          if (!approved) {
-            return {
-              content: [{ type: "text" as const, text: `Tool "apply_patch" denied by policy.` }],
-              isError: true,
-            };
+          if (!approved.allowed) {
+            return policyFailureResponse(approved, `Tool "apply_patch" denied by policy.`, {
+              tool: "apply_patch",
+              workspaceId,
+              path: affectedPaths[0],
+            });
           }
         }
 
@@ -2127,11 +2296,12 @@ function createMcpServer(
             policyPath,
             undefined,
           );
-          if (!approved) {
-            return {
-              content: [{ type: "text" as const, text: `Tool "${toolNames.grep}" denied by policy.` }],
-              isError: true,
-            };
+          if (!approved.allowed) {
+            return policyFailureResponse(approved, `Tool "${toolNames.grep}" denied by policy.`, {
+              tool: toolNames.grep,
+              workspaceId,
+              path: input.path,
+            });
           }
         }
         if (input.path) await workspaces.loadApplicableInstructions(workspace, input.path);
@@ -2222,11 +2392,12 @@ function createMcpServer(
             policyPath,
             undefined,
           );
-          if (!approved) {
-            return {
-              content: [{ type: "text" as const, text: `Tool "${toolNames.glob}" denied by policy.` }],
-              isError: true,
-            };
+          if (!approved.allowed) {
+            return policyFailureResponse(approved, `Tool "${toolNames.glob}" denied by policy.`, {
+              tool: toolNames.glob,
+              workspaceId,
+              path: input.path,
+            });
           }
         }
         if (input.path) await workspaces.loadApplicableInstructions(workspace, input.path);
@@ -2316,11 +2487,12 @@ function createMcpServer(
             policyPath,
             undefined,
           );
-          if (!approved) {
-            return {
-              content: [{ type: "text" as const, text: `Tool "${toolNames.ls}" denied by policy. Path: ${input.path}` }],
-              isError: true,
-            };
+          if (!approved.allowed) {
+            return policyFailureResponse(approved, `Tool "${toolNames.ls}" denied by policy. Path: ${input.path}`, {
+              tool: toolNames.ls,
+              workspaceId,
+              path: input.path,
+            });
           }
         }
         await workspaces.loadApplicableInstructions(workspace, input.path);
@@ -2424,11 +2596,13 @@ function createMcpServer(
           policyPath,
           input.command,
         );
-        if (!approved) {
-          return {
-            content: [{ type: "text" as const, text: `Tool "${toolNames.shell}" denied by policy. Command: ${input.command}` }],
-            isError: true,
-          };
+        if (!approved.allowed) {
+          return policyFailureResponse(approved, `Tool "${toolNames.shell}" denied by policy. Command: ${input.command}`, {
+            tool: toolNames.shell,
+            workspaceId,
+            path: typeof policyPath === "string" ? policyPath : policyPath?.relativePath,
+            command: input.command,
+          });
         }
       }
 
@@ -2585,6 +2759,57 @@ export function createServer(config = loadConfig()): RunningServer {
   const buildMeta = readBuildIdentity(join(dirname(fileURLToPath(import.meta.url)), "build-meta.json"));
   const transports = new Map<string, Transport>();
   const mcpSessions = new Map<string, McpSessionState>();
+  // MCP session IDs are transport-scoped and intentionally disposable. This
+  // bounded in-memory index retains only trusted identity continuity metadata
+  // across a socket loss; it never authorizes, replays, or reuses a transport.
+  const logicalContinuity = new LogicalContinuityIndex({
+    retentionMs: config.mcpLogicalContinuityRetentionMs,
+    onExpire: (identity) => {
+      // Trusted direct process sessions outlive an individual transport, but
+      // must not outlive the continuity record that authorizes reattachment.
+      // Work-session-owned processes use a different owner namespace and are
+      // intentionally unaffected by this cleanup.
+      void processSessions.terminateByOwner(`logical-client:${identity}`).catch((error) => {
+        logEvent(config.logging, "warn", "logical_continuity_process_cleanup_failed", {
+          logicalClientId: identity,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    },
+  });
+  // A host may reuse one keep-alive socket for hundreds of MCP requests. Keep
+  // one close listener per socket, rather than one listener per request, so
+  // transport disconnect cancellation cannot grow EventEmitter listeners.
+  const socketAbortRegistries = new WeakMap<Socket, {
+    controllers: Set<AbortController>;
+    onClose: () => void;
+  }>();
+  const trackSocketAbort = (socket: Socket, controller: AbortController): (() => void) => {
+    let registry = socketAbortRegistries.get(socket);
+    if (!registry) {
+      registry = {
+        controllers: new Set<AbortController>(),
+        onClose: () => {
+          for (const activeController of registry!.controllers) activeController.abort();
+          registry!.controllers.clear();
+          socketAbortRegistries.delete(socket);
+        },
+      };
+      socketAbortRegistries.set(socket, registry);
+      socket.once("close", registry.onClose);
+    }
+    registry.controllers.add(controller);
+    let removed = false;
+    return () => {
+      if (removed) return;
+      removed = true;
+      registry!.controllers.delete(controller);
+      if (registry!.controllers.size === 0) {
+        socket.off("close", registry!.onClose);
+        socketAbortRegistries.delete(socket);
+      }
+    };
+  };
   const mcpPolicyWaiters = new Map<string, McpPolicyWaiter>();
   let policyWaiterDisconnects = 0;
   let policyWaiterResumes = 0;
@@ -2689,13 +2914,29 @@ export function createServer(config = loadConfig()): RunningServer {
     }
     const pendingPolicyApprovals = approvalRequests.listPending().filter((request) => request.kind === "tool");
     const liveApprovalIds = new Set([...mcpPolicyWaiters.values()].map((waiter) => waiter.approvalId));
+    const nowIso = new Date().toISOString();
+    // Zero live waiters is the NORMAL shape of a direct MCP approval: the call
+    // already returned approval_required and only a human decision is pending.
+    // Count a row as orphaned only when its own lifecycle window says so —
+    // a work-session approval lost its parked waiter, or a direct operation's
+    // reattachment grace has actually elapsed.
+    const pendingHumanApproval = pendingPolicyApprovals.filter((approval) => approval.origin === "work_session"
+      ? liveApprovalIds.has(approval.approvalId)
+      : !(approval.reattachDeadline && approval.reattachDeadline <= nowIso)).length;
     return {
       activePolicyWaiters: mcpPolicyWaiters.size,
       policyWaitersByWorkspace: mapNumberCounts(byWorkspace),
       policyWaitersByMcpSession: mapNumberCounts(bySession),
       oldestPolicyWaitMs: Number.isFinite(oldestStartedAt) ? Math.max(0, Date.now() - oldestStartedAt) : 0,
       pendingApprovalRows: pendingPolicyApprovals.length,
-      orphanedPendingApprovals: pendingPolicyApprovals.filter((approval) => !liveApprovalIds.has(approval.approvalId)).length,
+      pendingHumanApproval,
+      detachedLiveWaiters: pendingPolicyApprovals.filter((approval) => approval.origin === "work_session"
+        && !liveApprovalIds.has(approval.approvalId)).length,
+      abandonedOperations: pendingPolicyApprovals.filter((approval) => approval.origin !== "work_session"
+        && Boolean(approval.reattachDeadline && approval.reattachDeadline <= nowIso)).length,
+      orphanedPendingApprovals: pendingPolicyApprovals.filter((approval) => approval.origin === "work_session"
+        ? !liveApprovalIds.has(approval.approvalId)
+        : Boolean(approval.reattachDeadline && approval.reattachDeadline <= nowIso)).length,
       suspendedExecutionRequests: mcpPolicyWaiters.size,
       policyWaiterDisconnects,
       policyWaiterResumes,
@@ -2895,7 +3136,7 @@ export function createServer(config = loadConfig()): RunningServer {
         if (state.toolCallCount === 0) currentZeroToolSessions++;
         else if (state.toolCallCount === 1) currentSingleToolSessions++;
         else currentMultiToolSessions++;
-        oldestIdleMs = Math.max(oldestIdleMs, now - state.lastActivityAt);
+        oldestIdleMs = Math.max(oldestIdleMs, now - state.lastApplicationActivityAt);
       }
       return {
         client,
@@ -2978,9 +3219,99 @@ export function createServer(config = loadConfig()): RunningServer {
     return { level: "low" as const, effectiveHardCap: config.mcpSessionHardCap, effectiveSoftCap: config.mcpSessionSoftCap };
   }
 
+  const mcpSessionHasActiveResponsibility = (state: McpSessionState): boolean => (
+    state.inFlightRequests > 0
+    || state.activeLongPollCount > 0
+    || state.activeSseStreams > 0
+    || state.activePolicyWaiters > 0
+    || state.closing
+    || state.closed
+  );
+
+  /**
+   * Single cleanup primitive for a terminated MCP transport. Both the normal
+   * close callback and the reaper must run the same steps — waiter
+   * cancellation, continuity detach, direct process ownership cleanup, metric
+   * recording, and map deletion — or a transport whose `sessionId` property is
+   * unavailable at close time leaks a session record until its TTL. Callers
+   * that hold the transport pass `transport` so it can be closed after the
+   * maps are updated.
+   */
+  const finalizeMcpSession = (
+    sessionId: string,
+    reason: "client_closed" | "server_shutdown" | "expired",
+    options: { transport?: Transport; evictionReason?: string; at?: number } = {},
+  ): boolean => {
+    const now = options.at ?? Date.now();
+    const state = mcpSessions.get(sessionId);
+    if (!state) {
+      transports.delete(sessionId);
+      return false;
+    }
+    if (reason === "expired" && mcpSessionHasActiveResponsibility(state)) return false;
+    state.closing = true;
+    transports.delete(sessionId);
+    recordMcpSessionEnd(state, reason, now);
+    if (state.identitySource !== "client_info_fallback") {
+      logicalContinuity.detach(state.logicalClientId, state.sessionId, now);
+    }
+    cancelMcpPolicyWaitersForSession(sessionId, reason === "expired" ? "session_expired" : "transport_closed");
+    mcpSessions.delete(sessionId);
+    // Direct ephemeral commands belong to the transport and die with it.
+    // Work-session commands belong to the durable work session and survive a
+    // transient MCP reconnect/eviction. The close callback may run after the
+    // maps are deleted, so ownership cleanup must not depend on it.
+    if (!state.durableWorkerSession) {
+      void processSessions.terminateByOwner(sessionId).catch((error) => {
+        logEvent(config.logging, "warn", "mcp_session_process_cleanup_failed", {
+          sessionIdPrefix: sessionIdPrefix(sessionId),
+          reason: reason === "expired" ? "session_expired" : "transport_closed",
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    }
+    if (reason === "expired") {
+      mcpSessionMetrics.evicted++;
+      void options.transport?.close().catch(() => {});
+      logEvent(config.logging, "info", "mcp_session_expired", {
+        sessionIdPrefix: sessionIdPrefix(sessionId),
+        logicalClientId: state.logicalClientId,
+        ageMs: now - state.createdAt,
+        idleMs: now - state.lastApplicationActivityAt,
+        requestCount: state.requestCount,
+        notificationCount: state.notificationCount,
+        toolCallCount: state.toolCallCount,
+        resourceReadCount: state.resourceReadCount,
+        lastRpcMethod: state.lastRpcMethod,
+        lastToolName: state.lastToolName,
+        reason: options.evictionReason ?? "bounded",
+        sessionLabel: state.sessionLabel,
+        conversationId: state.conversationId,
+      });
+      return true;
+    }
+    logEvent(config.logging, "info", "mcp_session_closed", {
+      sessionIdPrefix: sessionIdPrefix(sessionId),
+      logicalClientId: state.logicalClientId,
+      sessionLabel: state.sessionLabel,
+      conversationId: state.conversationId,
+      ageMs: now - state.createdAt,
+      idleMs: now - state.lastApplicationActivityAt,
+      requestCount: state.requestCount,
+      notificationCount: state.notificationCount,
+      toolCallCount: state.toolCallCount,
+      resourceReadCount: state.resourceReadCount,
+      lastRpcMethod: state.lastRpcMethod,
+      lastToolName: state.lastToolName,
+      closeReason: reason,
+    });
+    return true;
+  };
+
   const reapIdleMcpSessions = (forceClientId?: string) => {
     const pressure = getMemoryPressureState();
     const now = Date.now();
+    logicalContinuity.sweep(now);
     // Phase 1: evict sessions with active requests (never evict in-flight)
     // Phase 2: evict provisional one-tool sessions after their model-turn
     // grace window. One completed tool is not treated as immediate completion.
@@ -2996,43 +3327,46 @@ export function createServer(config = loadConfig()): RunningServer {
     const clientCounts = new Map<string, number>();
 
     for (const [id, state] of mcpSessions) {
-      const idle = now - state.lastActivityAt;
+      const idle = now - state.lastApplicationActivityAt;
       const ttl = mcpSessionIdleTtl(state, config);
 
-      if (state.inFlightRequests > 0 || state.activeLongPollCount > 0 || state.activeSseStreams > 0 || state.activePolicyWaiters > 0 || state.closing || state.closed) continue;
+      if (mcpSessionHasActiveResponsibility(state)) continue;
 
       if (idle >= ttl) {
         queueEviction(id, mcpSessionIdleReason(state));
-      } else {
+      } else if (state.identitySource !== "client_info_fallback") {
+        // Generic clientInfo name/version labels are not a trustworthy client
+        // boundary. They participate only in the global LRU/memory bound, not
+        // in the per-client lifetime cap.
         clientCounts.set(state.logicalClientId, (clientCounts.get(state.logicalClientId) ?? 0) + 1);
       }
     }
 
     // Admission at the per-client cap must not become a 503 wall when the
-    // client has accumulated idle, non-worker one-tool transports. Reclaim
-    // the oldest safe provisional sessions first, even if their ordinary TTL
-    // has not elapsed yet. Active requests, long polls, and worker-bound
-    // transports remain protected.
+    // client has accumulated idle transports. Reclaim exactly the number of
+    // sessions the new connection needs: zero-tool first, then one-tool, then
+    // the oldest idle reusable non-worker transports. Active requests, SSE
+    // streams, long polls, policy waiters, and worker-bound transports remain
+    // protected. Without the multi-tool tier a client that had already filled
+    // its quota with healthy reusable sessions could never connect again
+    // until the 24h reusable TTL elapsed.
     if (forceClientId) {
       const currentClientCount = [...mcpSessions.values()].filter((state) => state.logicalClientId === forceClientId).length;
       const alreadyQueued = [...evictionReasons.keys()].filter((id) => mcpSessions.get(id)?.logicalClientId === forceClientId).length;
       const needed = Math.max(0, currentClientCount - config.mcpSessionMaxPerClient + 1 - alreadyQueued);
       if (needed > 0) {
-        const candidates = [...mcpSessions.values()]
+        const eligible = [...mcpSessions.values()]
           .filter((state) => (
             state.logicalClientId === forceClientId
-            && state.toolCallCount <= 1
             && !state.durableWorkerSession
-            && state.inFlightRequests === 0
-            && state.activeLongPollCount === 0
-            && state.activeSseStreams === 0
-            && state.activePolicyWaiters === 0
-            && !state.closing
-            && !state.closed
+            && !mcpSessionHasActiveResponsibility(state)
             && !evictionReasons.has(state.sessionId)
-          ))
-          .sort((a, b) => a.lastActivityAt - b.lastActivityAt);
-        for (const state of candidates.slice(0, needed)) {
+          ));
+        const byIdle = (a: McpSessionState, b: McpSessionState) => a.lastApplicationActivityAt - b.lastApplicationActivityAt;
+        const zeroTool = eligible.filter((state) => state.toolCallCount === 0).sort(byIdle);
+        const oneTool = eligible.filter((state) => state.toolCallCount === 1).sort(byIdle);
+        const reusable = eligible.filter((state) => state.toolCallCount > 1).sort(byIdle);
+        for (const state of [...zeroTool, ...oneTool, ...reusable].slice(0, needed)) {
           queueEviction(state.sessionId, "per_client_limit");
         }
       }
@@ -3041,7 +3375,8 @@ export function createServer(config = loadConfig()): RunningServer {
     // Per-client limit: evict oldest idle sessions beyond limit
     for (const [id, state] of mcpSessions) {
       if (toEvict.includes(id)) continue;
-      if (state.inFlightRequests > 0 || state.activeLongPollCount > 0 || state.activeSseStreams > 0 || state.activePolicyWaiters > 0 || state.closing || state.closed) continue;
+      if (state.identitySource === "client_info_fallback") continue;
+      if (mcpSessionHasActiveResponsibility(state)) continue;
       const count = clientCounts.get(state.logicalClientId) ?? 0;
       if (count > config.mcpSessionMaxPerClient) {
         queueEviction(id, "per_client_limit");
@@ -3052,13 +3387,13 @@ export function createServer(config = loadConfig()): RunningServer {
     // Adaptive soft cap: evict true LRU idle sessions before the hard cap.
     const softExcess = mcpSessions.size - toEvict.length - pressure.effectiveSoftCap;
     if (softExcess > 0) {
-      const candidates: Array<{ id: string; lastActivityAt: number }> = [];
+      const candidates: Array<{ id: string; lastApplicationActivityAt: number }> = [];
       for (const [id, state] of mcpSessions) {
         if (toEvict.includes(id)) continue;
-        if (state.inFlightRequests > 0 || state.activeLongPollCount > 0 || state.activeSseStreams > 0 || state.activePolicyWaiters > 0 || state.closing || state.closed) continue;
-        candidates.push({ id, lastActivityAt: state.lastActivityAt });
+        if (mcpSessionHasActiveResponsibility(state)) continue;
+        candidates.push({ id, lastApplicationActivityAt: state.lastApplicationActivityAt });
       }
-      candidates.sort((a, b) => a.lastActivityAt - b.lastActivityAt);
+      candidates.sort((a, b) => a.lastApplicationActivityAt - b.lastApplicationActivityAt);
       for (let i = 0; i < Math.min(softExcess, candidates.length); i++) {
         queueEviction(candidates[i].id, "soft_cap_lru");
       }
@@ -3066,30 +3401,12 @@ export function createServer(config = loadConfig()): RunningServer {
 
     for (const id of toEvict) {
       const transport = transports.get(id);
-      const state = mcpSessions.get(id);
-      if (state) {
-        state.closing = true;
-        recordMcpSessionEnd(state, "expired", now);
-      }
-      cancelMcpPolicyWaitersForSession(id, "session_expired");
-      mcpSessions.delete(id);
-      transports.delete(id);
-      mcpSessionMetrics.evicted++;
-      void transport?.close().catch(() => {});
-      logEvent(config.logging, "info", "mcp_session_expired", {
-        sessionIdPrefix: sessionIdPrefix(id),
-        logicalClientId: state?.logicalClientId,
-        ageMs: now - (state?.createdAt ?? now),
-        idleMs: now - (state?.lastActivityAt ?? now),
-        requestCount: state?.requestCount ?? 0,
-        notificationCount: state?.notificationCount ?? 0,
-        toolCallCount: state?.toolCallCount ?? 0,
-        resourceReadCount: state?.resourceReadCount ?? 0,
-        lastRpcMethod: state?.lastRpcMethod,
-        lastToolName: state?.lastToolName,
-        reason: evictionReasons.get(id) ?? "bounded",
-        sessionLabel: state?.sessionLabel,
-        conversationId: state?.conversationId,
+      // Recheck inside finalizeMcpSession: no active request/stream/waiter may
+      // be reaped on eligibility evidence gathered before this pass.
+      finalizeMcpSession(id, "expired", {
+        transport,
+        evictionReason: evictionReasons.get(id),
+        at: now,
       });
     }
   };
@@ -3105,51 +3422,141 @@ export function createServer(config = loadConfig()): RunningServer {
   };
 
   // P1 #23: Periodic maintenance loop — event compaction, stale approval
-  // reconciliation, and DB checkpoint. Runs every 5 minutes.
-  const MAINTENANCE_INTERVAL_MS = 5 * 60_000;
-  const maintenanceTimer = setInterval(() => {
-    try {
-      workSessions.reconcileRuntimeStates();
-      const expiredApprovals = approvalRequests.expirePending();
-      for (const approval of expiredApprovals) {
-        const session = approval.workSessionId ? workSessions.get(approval.workSessionId) : undefined;
-        if (!session) continue;
-        try {
-          eventStore.appendEvent({
-            type: "recovery.approval.expired",
-            sessionId: session.id,
-            payload: { approvalId: approval.approvalId, reason: "approval timed out during maintenance" },
-          }, { publish: false });
-        } catch (error) {
-          reportMaintenanceFailure("approval_expiry_event", error, { approvalId: approval.approvalId, sessionId: session.id });
-        }
+  // reconciliation, and DB checkpoint. Runs every 5 minutes. Compaction is
+  // deliberately chunked and yielded between sessions: a large historical
+  // telemetry backlog must not monopolize the serving isolate.
+  const MAINTENANCE_INTERVAL_MS = config.maintenanceIntervalMs;
+  const MAINTENANCE_BUDGET_MS = config.maintenanceBudgetMs;
+  const MAINTENANCE_PAGE_SIZE = 100;
+  const COMPACT_PAGE_SIZE = 500;
+  const COMPACT_BATCH_SIZE = 250;
+  let maintenanceStopped = false;
+  let maintenanceRunning = false;
+  let runtimeReconciliationCursor: string | undefined;
+  let compactionCursor: string | undefined;
+  const maintenanceStats: {
+    running: boolean;
+    backlog: boolean;
+    cycles: number;
+    lastStartedAt?: string;
+    lastCompletedAt?: string;
+    lastDurationMs: number;
+    maxDurationMs: number;
+    compactedRows: number;
+    lastError?: string;
+  } = {
+    running: false,
+    backlog: false,
+    cycles: 0,
+    lastDurationMs: 0,
+    maxDurationMs: 0,
+    compactedRows: 0,
+  };
+
+  const runMaintenanceCycle = (): void => {
+    if (maintenanceStopped || maintenanceRunning) return;
+    maintenanceRunning = true;
+    maintenanceStats.running = true;
+    maintenanceStats.cycles++;
+    maintenanceStats.lastStartedAt = new Date().toISOString();
+    maintenanceStats.lastError = undefined;
+    const startedAt = performance.now();
+    let page: string[] = [];
+    let pageIndex = 0;
+    let runtimeReconciliationDone = false;
+    let approvalExpiryDone = false;
+
+    const finish = (backlog: boolean): void => {
+      const durationMs = Math.round(performance.now() - startedAt);
+      maintenanceStats.running = false;
+      maintenanceStats.backlog = backlog;
+      maintenanceStats.lastDurationMs = durationMs;
+      maintenanceStats.maxDurationMs = Math.max(maintenanceStats.maxDurationMs, durationMs);
+      maintenanceStats.lastCompletedAt = new Date().toISOString();
+      maintenanceRunning = false;
+    };
+
+    const step = (): void => {
+      if (maintenanceStopped) {
+        finish(false);
+        return;
       }
-      // P1 #18: compact telemetry via bounded ID pages of compaction-eligible
-      // sessions (terminal, or parked/stale reviews) instead of hydrating up
-      // to 10,000 full projections every cycle. Loop until a short page
-      // confirms the eligible set is exhausted. P1.16: cap the iteration
-      // count so a pathological backlog cannot starve the event loop; the
-      // remaining pages are picked up on the next maintenance tick.
-      const COMPACT_PAGE_SIZE = 500;
-      const COMPACT_MAX_PAGES_PER_CYCLE = 4;
-      let afterSessionId: string | undefined;
-      for (let pageIndex = 0; pageIndex < COMPACT_MAX_PAGES_PER_CYCLE; pageIndex++) {
-        const page = workSessions.listSessionIdsNeedingCompaction(afterSessionId, COMPACT_PAGE_SIZE);
-        if (page.length === 0) break;
-        for (const sessionId of page) {
-          try {
-            eventStore.compactSessionEvents(sessionId, { retentionDays: 7 });
-          } catch (error) {
-            reportMaintenanceFailure("event_compaction", error, { sessionId });
+      // Every expensive operation is a bounded batch. Stop the cycle at the
+      // wall-clock budget and leave the cursor for the next maintenance tick.
+      if (performance.now() - startedAt >= MAINTENANCE_BUDGET_MS) {
+        finish(true);
+        return;
+      }
+      try {
+        // Every maintenance class advances in bounded pages. A page is still
+        // synchronous SQLite work, but it cannot turn a large historical
+        // database into an unbounded serving-thread sweep.
+        if (!runtimeReconciliationDone) {
+          const runtimePage = workSessions.reconcileRuntimeStates(runtimeReconciliationCursor, MAINTENANCE_PAGE_SIZE);
+          runtimeReconciliationCursor = runtimePage.hasMore ? runtimePage.nextAfterId : undefined;
+          runtimeReconciliationDone = !runtimePage.hasMore;
+          setImmediate(step);
+          return;
+        }
+
+        if (!approvalExpiryDone) {
+          const expiredApprovals = approvalRequests.expirePending(undefined, MAINTENANCE_PAGE_SIZE);
+          for (const approval of expiredApprovals) {
+            const session = approval.workSessionId ? workSessions.get(approval.workSessionId) : undefined;
+            if (!session) continue;
+            try {
+              eventStore.appendEvent({
+                type: "recovery.approval.expired",
+                sessionId: session.id,
+                payload: { approvalId: approval.approvalId, reason: "approval timed out during maintenance" },
+              }, { publish: false });
+            } catch (error) {
+              reportMaintenanceFailure("approval_expiry_event", error, { approvalId: approval.approvalId, sessionId: session.id });
+            }
+          }
+          // An exactly full page may have another page behind it. Ask again on
+          // the next yielded step; the second empty page closes the scan.
+          approvalExpiryDone = expiredApprovals.length < MAINTENANCE_PAGE_SIZE;
+          setImmediate(step);
+          return;
+        }
+
+        if (pageIndex >= page.length) {
+          page = workSessions.listSessionIdsNeedingCompaction(compactionCursor, COMPACT_PAGE_SIZE);
+          pageIndex = 0;
+          if (page.length === 0) {
+            // A complete pass starts over on the next cycle; an interrupted
+            // pass retains its cursor across cycles so it cannot repeatedly
+            // rescan the same prefix after a budget expiry.
+            compactionCursor = undefined;
+            finish(false);
+            return;
           }
         }
-        if (page.length < COMPACT_PAGE_SIZE) break;
-        afterSessionId = page[page.length - 1];
+
+        const sessionId = page[pageIndex];
+        const removed = eventStore.compactSessionEvents(sessionId, {
+          retentionDays: 7,
+          maxRows: COMPACT_BATCH_SIZE,
+        });
+        maintenanceStats.compactedRows += removed;
+        // Keep the cursor on this session while a bounded batch indicates
+        // more historical telemetry remains. This avoids skipping rows while
+        // still yielding to the HTTP server after every transaction.
+        if (removed < COMPACT_BATCH_SIZE) {
+          compactionCursor = sessionId;
+          pageIndex++;
+        }
+      } catch (error) {
+        maintenanceStats.lastError = error instanceof Error ? error.message : String(error);
+        reportMaintenanceFailure("maintenance_cycle", error);
+        pageIndex++;
       }
-    } catch (error) {
-      reportMaintenanceFailure("maintenance_cycle", error);
-    }
-  }, MAINTENANCE_INTERVAL_MS);
+      setImmediate(step);
+    };
+    step();
+  };
+  const maintenanceTimer = setInterval(runMaintenanceCycle, MAINTENANCE_INTERVAL_MS);
   maintenanceTimer.unref?.();
   const oauthEnabled = config.authMode === "oauth";
   let oauthProvider: SingleUserOAuthProvider | null = null;
@@ -3201,7 +3608,10 @@ export function createServer(config = loadConfig()): RunningServer {
   const continuationManager = createContinuationManager(db);
   const dispatchOutbox = createDispatchOutbox(db);
   const supervisorRuns = createSupervisorRuns(db);
-  const approvalRequests = createApprovalRequestManager(db);
+  const approvalRequests = createApprovalRequestManager(db, {
+    directReattachGraceMs: config.policyDirectApprovalReattachGraceMs,
+    directToolApprovalTtlMs: config.policyDirectApprovalTtlMs,
+  });
   const missionLedger = createMissionLedger(db);
   const agentMessages = createAgentMessageManager(db);
   const startupRecovery = {
@@ -3213,94 +3623,207 @@ export function createServer(config = loadConfig()): RunningServer {
     reconciledWorkSessions: 0,
     markedStaleWorkSessions: 0,
   };
+  let startupRecoveryStopped = false;
   const databaseIntegrity = {
     ok: false,
+    status: "pending" as "pending" | "healthy" | "degraded",
     checkedAt: undefined as string | undefined,
     detail: "integrity check pending",
     durationMs: 0,
+    timedOut: false,
   };
-  const refreshDatabaseIntegrity = () => {
+  const INTEGRITY_INTERVAL_MS = config.integrityIntervalMs;
+  const INTEGRITY_DEADLINE_MS = config.integrityDeadlineMs;
+  let integrityWorker: Worker | undefined;
+  // Keep the single-flight guard set until a timed-out worker has actually
+  // terminated. Clearing only the worker reference in the timeout callback
+  // would let a short test interval (or an unusually fast maintenance timer)
+  // overlap a still-running diagnostic worker.
+  let integrityScanActive = false;
+  const refreshDatabaseIntegrity = (): void => {
+    // A slow read-only scan is diagnostic work. Never queue a second scan or
+    // execute it in the serving isolate while the previous one is running.
+    if (integrityScanActive) return;
     const startedAt = performance.now();
+    const workerModule = import.meta.url.endsWith(".ts")
+      ? "./database-integrity-worker.ts"
+      : "./database-integrity-worker.js";
+    let worker: Worker;
     try {
-      const result = db.sqlite.prepare("PRAGMA quick_check").get() as { quick_check?: string } | undefined;
-      databaseIntegrity.durationMs = Math.round(performance.now() - startedAt);
-      databaseIntegrity.ok = result?.quick_check === "ok";
-      databaseIntegrity.detail = String(result?.quick_check ?? "quick_check returned no result");
-      databaseIntegrity.checkedAt = new Date().toISOString();
+      worker = new Worker(new URL(workerModule, import.meta.url), {
+        workerData: {
+          databasePath: databasePath(config.stateDir),
+          delayMs: Number(process.env.KONTROL_INTEGRITY_TEST_DELAY_MS ?? 0),
+        },
+      });
     } catch (error) {
-      databaseIntegrity.durationMs = Math.round(performance.now() - startedAt);
+      // Worker construction can fail synchronously (for example when a
+      // packaged worker artifact is missing or the runtime rejects its
+      // module options). Integrity is diagnostic work: record the degraded
+      // result and keep server construction/serving independent of it.
       databaseIntegrity.ok = false;
+      databaseIntegrity.status = "degraded";
       databaseIntegrity.detail = error instanceof Error ? error.message : String(error);
+      databaseIntegrity.durationMs = Math.round(performance.now() - startedAt);
       databaseIntegrity.checkedAt = new Date().toISOString();
+      databaseIntegrity.timedOut = false;
+      console.warn(`[kontrol] database integrity diagnostic unavailable: ${databaseIntegrity.detail}`);
+      return;
     }
-    // P1 #19: a scan approaching its own refresh interval means the DB has
-    // outgrown the cadence — back the timer off instead of pinning the main
-    // thread every five minutes.
-    if (databaseIntegrity.durationMs > INTEGRITY_INTERVAL_MS / 2) {
-      console.warn(`[kontrol] quick_check took ${databaseIntegrity.durationMs}ms; consider moving integrity scans to an explicit diagnostic operation`);
-    }
+    integrityScanActive = true;
+    integrityWorker = worker;
+    const releaseScan = (): void => {
+      if (integrityWorker === worker) integrityWorker = undefined;
+      integrityScanActive = false;
+    };
+    let settled = false;
+    const finish = (result: { ok: boolean; detail: string; durationMs?: number; timedOut?: boolean }): void => {
+      if (settled) return;
+      settled = true;
+      databaseIntegrity.ok = result.ok;
+      databaseIntegrity.status = result.ok ? "healthy" : "degraded";
+      databaseIntegrity.detail = result.detail;
+      databaseIntegrity.durationMs = result.durationMs ?? Math.round(performance.now() - startedAt);
+      databaseIntegrity.checkedAt = new Date().toISOString();
+      databaseIntegrity.timedOut = result.timedOut === true;
+      if (!result.ok) {
+        console.warn(`[kontrol] database integrity diagnostic degraded: ${result.detail}`);
+      }
+    };
+    const deadline = setTimeout(() => {
+      finish({
+        ok: false,
+        detail: `quick_check exceeded ${INTEGRITY_DEADLINE_MS}ms diagnostic deadline`,
+        durationMs: INTEGRITY_DEADLINE_MS,
+        timedOut: true,
+      });
+      void worker.terminate().finally(releaseScan);
+    }, INTEGRITY_DEADLINE_MS);
+    deadline.unref?.();
+    worker.once("message", (result: { ok?: boolean; detail?: string; durationMs?: number }) => {
+      clearTimeout(deadline);
+      finish({
+        ok: result.ok === true,
+        detail: result.detail ?? "quick_check returned no result",
+        durationMs: result.durationMs,
+      });
+    });
+    worker.once("error", (error) => {
+      clearTimeout(deadline);
+      finish({ ok: false, detail: error instanceof Error ? error.message : String(error) });
+      void worker.terminate().finally(releaseScan);
+    });
+    worker.once("exit", (code) => {
+      clearTimeout(deadline);
+      if (!settled) finish({ ok: false, detail: `integrity worker exited without a result (code ${code})` });
+      releaseScan();
+    });
   };
-  // Integrity scans are valuable, but must not run synchronously on every
-  // readiness request. Run once at startup and refresh at low frequency.
-  const INTEGRITY_INTERVAL_MS = 30 * 60_000;
+  // Start asynchronously after construction. The initial server bind and all
+  // liveness/readiness routes remain available while this diagnostic runs.
   refreshDatabaseIntegrity();
   const databaseIntegrityTimer = setInterval(refreshDatabaseIntegrity, INTEGRITY_INTERVAL_MS);
   databaseIntegrityTimer.unref?.();
   const terminalWorkSessionStatuses = new Set(["approved", "rejected", "cancelled", "failed", "failed_protocol"]);
+  // P1: a direct MCP approval is a PENDING HUMAN DECISION, not an orphan. It
+  // parks no live waiter, so it consumes no execution resources and stays
+  // decidable until its normal approval TTL — expirePending (startup and
+  // maintenance) is the only automatic cancellation path. The reattach
+  // deadline remains a diagnostic classification (abandoned_operation), never
+  // a cancellation trigger.
   // Expire pending approvals once during startup as well as during the normal
   // maintenance loop. This keeps expiry correct across long idle periods and
   // makes the recovery count reflect actual rows changed at startup.
-  for (const approval of approvalRequests.expirePending()) {
-    const session = approval.workSessionId ? workSessions.get(approval.workSessionId) : undefined;
-    startupRecovery.expiredApprovals++;
-    if (session) {
-      eventStore.appendEvent({
-        type: "recovery.approval.expired",
-        sessionId: session.id,
-        payload: { approvalId: approval.approvalId, reason: "approval expired during startup reconciliation" },
-      }, { publish: false });
+  const expireStartupApprovalPage = (): void => {
+    if (startupRecoveryStopped) return;
+    const expired = approvalRequests.expirePending(undefined, 100);
+    for (const approval of expired) {
+      const session = approval.workSessionId ? workSessions.get(approval.workSessionId) : undefined;
+      startupRecovery.expiredApprovals++;
+      if (session) {
+        eventStore.appendEvent({
+          type: "recovery.approval.expired",
+          sessionId: session.id,
+          payload: { approvalId: approval.approvalId, reason: "approval expired during startup reconciliation" },
+        }, { publish: false });
+      }
     }
-  }
+    if (expired.length === 100) setImmediate(expireStartupApprovalPage);
+  };
+  expireStartupApprovalPage();
   // Durable rows survive a process restart; live transports and in-memory
   // worker maps do not. Reconcile only objects whose durable references make
   // their liveness unambiguous, and record each repair in the session event
   // log so recovery is inspectable rather than silently mutating state.
-  for (const approval of approvalRequests.listPending()) {
-    const session = approval.workSessionId ? workSessions.get(approval.workSessionId) : undefined;
-    const orphaned = Boolean(approval.workSessionId && (!session || terminalWorkSessionStatuses.has(session.status)));
-    if (!orphaned) continue;
-    const status = "cancelled";
-    approvalRequests.resolve(approval.approvalId, { status, reason: "startup_reconciliation: referenced work session is terminal or missing", reviewerId: "kontrol-startup" });
-    startupRecovery.cancelledApprovals++;
-    if (session) {
-      eventStore.appendEvent({
-        type: "recovery.approval.reconciled",
-        sessionId: session.id,
-        payload: { approvalId: approval.approvalId, status, reason: "startup_reconciliation" },
-      }, { publish: false });
+  const reconcileWorkSessionApprovalPage = (before?: { createdAt: string; id: string }): void => {
+    if (startupRecoveryStopped) return;
+    const page = approvalRequests.listPendingPage(undefined, 100, before, "work_session");
+    for (const approval of page.requests) {
+      const session = approval.workSessionId ? workSessions.get(approval.workSessionId) : undefined;
+      const orphaned = Boolean(approval.workSessionId && (!session || terminalWorkSessionStatuses.has(session.status)));
+      if (!orphaned) continue;
+      const status = "cancelled" as const;
+      approvalRequests.resolve(approval.approvalId, { status, reason: "startup_reconciliation: referenced work session is terminal or missing", reviewerId: "kontrol-startup" });
+      startupRecovery.cancelledApprovals++;
+      if (session) {
+        eventStore.appendEvent({
+          type: "recovery.approval.reconciled",
+          sessionId: session.id,
+          payload: { approvalId: approval.approvalId, status, reason: "startup_reconciliation" },
+        }, { publish: false });
+      }
     }
-  }
-  const continuationRows = db.sqlite.prepare(`
-    select c.id, c.session_id as sessionId, c.status, ws.status as workSessionStatus
-    from continuations c
-    left join work_sessions ws on ws.id = c.session_id
-    where c.status in ('pending', 'claimed')
-  `).all() as Array<{ id: string; sessionId: string; status: string; workSessionStatus?: string | null }>;
-  for (const continuation of continuationRows) {
-    if (continuation.workSessionStatus && !terminalWorkSessionStatuses.has(continuation.workSessionStatus)) continue;
-    if (!continuationManager.supersede(continuation.id, "startup_reconciliation: referenced work session is terminal or missing")) continue;
-    startupRecovery.supersededContinuations++;
-    if (continuation.workSessionStatus) {
-      eventStore.appendEvent({
-        type: "recovery.continuation.superseded",
-        sessionId: continuation.sessionId,
-        payload: { continuationId: continuation.id, reason: "startup_reconciliation" },
-      }, { publish: false });
+    if (page.hasMore) setImmediate(() => reconcileWorkSessionApprovalPage(page.nextBefore));
+  };
+  reconcileWorkSessionApprovalPage();
+  // Recovery is deliberately paged. The old unrestricted join could block
+  // startup on a pathological continuation history, while only repairing the
+  // first page would leave terminal references behind forever. Reconcile one
+  // bounded page synchronously, then yield the remainder after the server can
+  // serve requests.
+  const reconcileContinuationPage = (afterId?: string): void => {
+    if (startupRecoveryStopped) return;
+    const continuationRows = db.sqlite.prepare(`
+      select c.id, c.session_id as sessionId, c.status, ws.status as workSessionStatus
+      from continuations c
+      left join work_sessions ws on ws.id = c.session_id
+      where c.status in ('pending', 'claimed')
+        and (? is null or c.id > ?)
+      order by c.id
+      limit ?
+    `).all(afterId ?? null, afterId ?? null, 100) as Array<{ id: string; sessionId: string; status: string; workSessionStatus?: string | null }>;
+    for (const continuation of continuationRows) {
+      if (continuation.workSessionStatus && !terminalWorkSessionStatuses.has(continuation.workSessionStatus)) continue;
+      if (!continuationManager.supersede(continuation.id, "startup_reconciliation: referenced work session is terminal or missing")) continue;
+      startupRecovery.supersededContinuations++;
+      if (continuation.workSessionStatus) {
+        eventStore.appendEvent({
+          type: "recovery.continuation.superseded",
+          sessionId: continuation.sessionId,
+          payload: { continuationId: continuation.id, reason: "startup_reconciliation" },
+        }, { publish: false });
+      }
     }
-  }
-  const runtimeReconciliation = workSessions.reconcileRuntimeStates();
-  startupRecovery.reconciledWorkSessions = runtimeReconciliation.reconciled;
-  startupRecovery.markedStaleWorkSessions = runtimeReconciliation.markedStale;
+    if (continuationRows.length === 100) {
+      const nextAfterId = continuationRows[continuationRows.length - 1]?.id;
+      if (nextAfterId) setImmediate(() => reconcileContinuationPage(nextAfterId));
+    }
+  };
+  reconcileContinuationPage();
+  // Runtime reconciliation is also paged during startup. Keep the first page
+  // bounded, then yield between every subsequent page instead of deferring an
+  // arbitrarily large remainder to the next five-minute maintenance tick.
+  const reconcileRuntimeStatePage = (afterId?: string): void => {
+    if (startupRecoveryStopped) return;
+    const page = workSessions.reconcileRuntimeStates(afterId, 100);
+    runtimeReconciliationCursor = page.hasMore ? page.nextAfterId : undefined;
+    startupRecovery.reconciledWorkSessions += page.reconciled;
+    startupRecovery.markedStaleWorkSessions += page.markedStale;
+    if (page.hasMore && page.nextAfterId) {
+      setImmediate(() => reconcileRuntimeStatePage(page.nextAfterId));
+    }
+  };
+  reconcileRuntimeStatePage();
   startupRecovery.releasedSupervisorLeases = supervisorRuns.releaseExpiredClaims();
   const reviewWorkflow = createReviewWorkflowService({
     workSessions,
@@ -3337,16 +3860,35 @@ export function createServer(config = loadConfig()): RunningServer {
     has(id: string) { return (liveWaitersMap.get(id)?.size ?? 0) > 0; },
   };
   const grantStore = createSqliteGrantStore(db);
-  const policyEngine = createPolicyEngine(config.policy, grantStore, approvalRequests);
+  const policyEngine = createPolicyEngine(config.policy, grantStore, approvalRequests, {
+    directReattachGraceMs: config.policyDirectApprovalReattachGraceMs,
+  });
   revokeWorkSessionGrants = (workSessionId) => policyEngine.revokeScope("work_session", workSessionId);
   // Reconcile grants created by an older process that terminated before its
   // lifecycle callback ran. Workspace grants intentionally survive restart;
-  // work-session grants never survive the terminal boundary.
-  for (const session of workSessions.listAllWorkSessions()) {
-    if (terminalWorkSessionStatuses.has(session.status)) policyEngine.revokeScope("work_session", session.id);
-  }
+  // work-session grants never survive the terminal boundary. Select only IDs
+  // and page the history so startup does not hydrate a bounded projection and
+  // silently miss older terminal sessions.
+  const reconcileTerminalGrantPage = (afterId?: string): void => {
+    if (startupRecoveryStopped) return;
+    const terminalIds = db.sqlite.prepare(`
+      select id
+      from work_sessions
+      where status in ('approved', 'rejected', 'cancelled', 'failed', 'failed_protocol')
+        and (? is null or id > ?)
+      order by id
+      limit ?
+    `).all(afterId ?? null, afterId ?? null, 100) as Array<{ id: string }>;
+    for (const session of terminalIds) policyEngine.revokeScope("work_session", session.id);
+    if (terminalIds.length === 100) {
+      const nextAfterId = terminalIds[terminalIds.length - 1]?.id;
+      if (nextAfterId) setImmediate(() => reconcileTerminalGrantPage(nextAfterId));
+    }
+  };
+  reconcileTerminalGrantPage();
   const policyEnforcer = createPolicyEnforcer(policyEngine, eventStore, {
     timeoutMs: config.policyApprovalTimeoutMs,
+    directApprovalTtlMs: config.policyDirectApprovalTtlMs,
   });
 
   // P1 #7: pass the parsed trusted-proxy spec straight to Express. A hop
@@ -3488,13 +4030,9 @@ export function createServer(config = loadConfig()): RunningServer {
       checks.database = { ok: false, detail: error instanceof Error ? error.message : String(error) };
       checks.schema = { ok: false, detail: "schema query failed" };
     }
-    const integrityAgeMs = databaseIntegrity.checkedAt ? Date.now() - Date.parse(databaseIntegrity.checkedAt) : Number.POSITIVE_INFINITY;
-    checks.databaseIntegrity = {
-      // P1 #19: freshness budget tracks the (now lower-frequency) 30-minute
-      // integrity cadence rather than the old five-minute one.
-      ok: databaseIntegrity.ok && integrityAgeMs <= 45 * 60_000,
-      detail: `${databaseIntegrity.detail}; ageMs=${Number.isFinite(integrityAgeMs) ? integrityAgeMs : "unknown"}; durationMs=${databaseIntegrity.durationMs}`,
-    };
+    // Full integrity scans are intentionally absent from readiness. They run
+    // in a separate worker and are exposed through authenticated diagnostics;
+    // a stale/slow diagnostic must not make a serving core fail closed.
     checks.mcpHandler = { ok: true, detail: `HTTP handler is serving ${includeAgents ? "/readyz" : "/core-readyz"}` };
     const executionAdmission = mcpAdmission.getStats();
     checks.mcpExecutionAdmission = {
@@ -3509,8 +4047,26 @@ export function createServer(config = loadConfig()): RunningServer {
     checks.workspaceRegistry = { ok: Boolean(workspaces && workspaceStore), detail: "workspace registry initialized" };
     checks.reviewSubsystem = { ok: Boolean(reviewWorkflow && workSessions && eventStore), detail: "review managers initialized" };
     checks.acpBridge = { ok: !config.acpEnabled || Boolean(dispatcher), detail: config.acpEnabled ? "dispatcher initialized" : "ACP disabled" };
+    // Configuration-level proof that ask-capable policies have a reviewer
+    // credential source. loadConfig already rejects tunnel+ask-without-secret,
+    // so this can only fail for non-tunnel modes whose credential wiring is
+    // broken at runtime; report it as a first-class readiness check either way
+    // so an operator sees the approval boundary's posture without reading
+    // startup logs.
+    const askCapable = policyCanAsk(config.policy);
+    checks.approvalReviewerConfig = {
+      ok: !askCapable || config.authMode !== "tunnel" || Boolean(config.tunnelReviewerSecret),
+      detail: askCapable
+        ? `policy can produce approvals; reviewer credential configured (authMode=${config.authMode})`
+        : "policy cannot produce approvals; reviewer credential not required",
+    };
     checks.build = {
-      ok: Boolean(buildMeta.buildId) && Boolean(runtime) && runtime?.buildId === buildMeta.buildId,
+      // Source-mode `tsx src/cli.ts serve` has no embedded build-meta.json;
+      // its explicit `dev` identity is still valid. Release artifacts must
+      // continue to match their immutable embedded build ID exactly.
+      ok: Boolean(runtime) && (!buildMeta.buildId
+        ? runtime?.buildId === "dev"
+        : runtime?.buildId === buildMeta.buildId),
       detail: `expected=${buildMeta.buildId ?? "missing"} live=${runtime?.buildId ?? "missing"}`,
     };
 
@@ -3558,6 +4114,10 @@ export function createServer(config = loadConfig()): RunningServer {
       ok: ready,
       ready,
       name: "kontrol",
+      // Non-sensitive policy posture so probes can decide whether the
+      // reviewer path is part of the readiness contract without guessing
+      // from environment variables.
+      approvalInteractive: policyCanAsk(config.policy),
       checks: publicChecks,
     });
   }
@@ -3657,6 +4217,13 @@ export function createServer(config = loadConfig()): RunningServer {
           return undefined;
         }
       })();
+      const generationRecord = (() => {
+        try {
+          return JSON.parse(readFileSync(join(config.stateDir, "generation.json"), "utf8")) as Record<string, unknown>;
+        } catch {
+          return undefined;
+        }
+      })();
       const mcpMetrics = {
         created: mcpSessionMetrics.created,
         evicted: mcpSessionMetrics.evicted,
@@ -3689,6 +4256,7 @@ export function createServer(config = loadConfig()): RunningServer {
           ephemeralSessionIdleMs: config.mcpEphemeralSessionIdleMs,
           reusableSessionIdleMs: config.mcpReusableSessionIdleMs,
           sessionReaperIntervalMs: config.mcpSessionReaperIntervalMs,
+          logicalContinuityRetentionMs: config.mcpLogicalContinuityRetentionMs,
           sessionMaxPerClient: config.mcpSessionMaxPerClient,
           sessionSoftCap: config.mcpSessionSoftCap,
           sessionHardCap: config.mcpSessionHardCap,
@@ -3696,17 +4264,21 @@ export function createServer(config = loadConfig()): RunningServer {
         // Each entry is a separate transport/context. The aggregate logical
         // client label is deliberately not used as an ownership key.
         sessions: [...mcpSessions.values()]
-          .sort((a, b) => a.lastActivityAt - b.lastActivityAt)
+          .sort((a, b) => a.lastApplicationActivityAt - b.lastApplicationActivityAt)
           .map((state) => ({
             sessionIdPrefix: sessionIdPrefix(state.sessionId),
             sessionLabel: state.sessionLabel,
             logicalClientId: state.logicalClientId,
+            identitySource: state.identitySource,
             authenticatedRole: state.authenticatedRole,
             authSource: state.authSource,
             conversationId: state.conversationId,
             createdAt: new Date(state.createdAt).toISOString(),
+            lastTransportActivityAt: new Date(state.lastTransportActivityAt).toISOString(),
+            lastApplicationActivityAt: new Date(state.lastApplicationActivityAt).toISOString(),
             ageMs: Date.now() - state.createdAt,
-            idleMs: Date.now() - state.lastActivityAt,
+            idleMs: Date.now() - state.lastApplicationActivityAt,
+            transportIdleMs: Date.now() - state.lastTransportActivityAt,
             requestCount: state.requestCount,
             notificationCount: state.notificationCount,
             toolCallCount: state.toolCallCount,
@@ -3723,6 +4295,18 @@ export function createServer(config = loadConfig()): RunningServer {
           acc[s.logicalClientId] = (acc[s.logicalClientId] || 0) + 1;
           return acc;
         }, {} as Record<string, number>)).map(([client, count]) => ({ client, count })),
+        // P1: approval continuity qualification needs to see whether real
+        // connector traffic relies on the untrusted clientInfo fallback, which
+        // cannot reattach a one-shot approval retry after a transport
+        // replacement. Aggregate per identity source, not per session.
+        identitySources: [...mcpSessions.values()].reduce((acc, s) => {
+          acc[s.identitySource] = (acc[s.identitySource] ?? 0) + 1;
+          return acc;
+        }, {} as Record<string, number>),
+        logicalContinuity: {
+          count: logicalContinuity.size(),
+          records: logicalContinuity.snapshot(),
+        },
       };
 
       // P1 #51: Report embedded build metadata (immutable artifact identity)
@@ -3749,10 +4333,13 @@ export function createServer(config = loadConfig()): RunningServer {
         activeWorkSessions,
         pendingReviews,
         activeAcps,
+        processSessions: processSessions.getMetrics(),
         totalMcpSessions,
         mcpSessionMetrics: mcpMetrics,
         startupRecovery,
         databaseIntegrity,
+        maintenance: { ...maintenanceStats },
+        generation: generationRecord,
         supervisor: supervisorStatus,
         heapUsed: memUsage.heapUsed,
         heapTotal: memUsage.heapTotal,
@@ -3811,9 +4398,32 @@ export function createServer(config = loadConfig()): RunningServer {
         ? "waiter"
         : "execution";
     let handlerStartedAt = 0;
+    let transport: Transport | undefined;
+    let sessionState: McpSessionState | undefined;
+    let transportCloseRequested = false;
+    let sseHeartbeatTimer: NodeJS.Timeout | undefined;
     const requestAbort = new AbortController();
+    requestAbort.signal.addEventListener("abort", () => {
+      // A socket can close before Node emits the response's `close` event.
+      // The abort signal is the common path for both cases, so detach the
+      // disposable transport here as soon as an incomplete request is lost.
+      if (!res.writableFinished && transport?.sessionId && !transportCloseRequested) {
+        transportCloseRequested = true;
+        void transport.close().catch(() => undefined);
+      }
+    }, { once: true });
     const abortIfDisconnected = () => {
       if (!res.writableFinished) requestAbort.abort();
+    };
+    const removeSocketAbort = req.socket ? trackSocketAbort(req.socket, requestAbort) : undefined;
+    let requestListenersCleaned = false;
+    const cleanupRequestListeners = () => {
+      if (requestListenersCleaned) return;
+      requestListenersCleaned = true;
+      req.off("aborted", abortIfDisconnected);
+      res.off("close", onResponseClose);
+      res.off("finish", onResponseFinish);
+      removeSocketAbort?.();
     };
     // P0.2: catch BOTH the request-level abort (req.once aborted) AND the
     // underlying socket close. The latter fires earlier when a tunnel proxy
@@ -3823,13 +4433,27 @@ export function createServer(config = loadConfig()): RunningServer {
     // every downstream caller (admission queue, policy enforcer, event-log
     // waiters) and they all no-op on a duplicated abort.
     req.once("aborted", abortIfDisconnected);
-    res.once("close", abortIfDisconnected);
-    req.socket?.once("close", abortIfDisconnected);
-    res.once("finish", () => {
+    const onResponseClose = () => {
+      const wasAlreadyAborted = requestAbort.signal.aborted;
+      abortIfDisconnected();
+      // A response that closes before completion is a lost transport request.
+      // Close the disposable MCP transport as well, but keep durable work and
+      // logical continuity metadata alive for a fresh initialize. Guard the
+      // reentrant close generated by the SDK's own cleanup path.
+      if (!wasAlreadyAborted && !res.writableFinished && transport?.sessionId && !transportCloseRequested) {
+        transportCloseRequested = true;
+        void transport.close().catch(() => undefined);
+      }
+      cleanupRequestListeners();
+    };
+    const onResponseFinish = () => {
       const finishedAt = performance.now();
       recordPhaseTiming("mcp.response", finishedAt - requestStartedAt);
       if (handlerStartedAt > 0) recordPhaseTiming("mcp.serialization", finishedAt - handlerStartedAt);
-    });
+      cleanupRequestListeners();
+    };
+    res.once("close", onResponseClose);
+    res.once("finish", onResponseFinish);
 
     const restoreSessionExecutionCount = (): void => {
       if (!sessionId || sessionRequestClass !== "execution" || sessionExecutionCounted) return;
@@ -3974,60 +4598,63 @@ export function createServer(config = loadConfig()): RunningServer {
     });
 
     try {
-      let transport: Transport | undefined;
-
       if (sessionId) {
         transport = transports.get(sessionId);
         if (!transport) {
           sendJsonRpcError(res, 404, -32000, "Unknown MCP session");
           return;
         }
-        const state = mcpSessions.get(sessionId);
-        if (config.authMode === "oauth" && state && state.logicalClientId !== logicalClientId(req)) {
+        sessionState = mcpSessions.get(sessionId);
+        if (config.authMode === "oauth" && sessionState && sessionState.logicalClientId !== logicalClientId(req)) {
           logEvent(config.logging, "warn", "mcp_session_client_mismatch", {
             requestId,
             sessionIdPrefix: sessionIdPrefix(sessionId),
-            expectedClientId: state.logicalClientId,
+            expectedClientId: sessionState.logicalClientId,
             actualClientId: logicalClientId(req),
           });
           sendJsonRpcError(res, 403, -32001, "MCP session belongs to another client");
           return;
         }
         const requestedConversationId = conversationId(req);
-        if (state?.conversationId && requestedConversationId && state.conversationId !== requestedConversationId) {
+        if (sessionState?.conversationId && requestedConversationId && sessionState.conversationId !== requestedConversationId) {
           logEvent(config.logging, "warn", "mcp_session_conversation_mismatch", {
             requestId,
             sessionIdPrefix: sessionIdPrefix(sessionId),
-            sessionLabel: state.sessionLabel,
-            expectedConversationId: state.conversationId,
+            sessionLabel: sessionState.sessionLabel,
+            expectedConversationId: sessionState.conversationId,
             actualConversationId: requestedConversationId,
           });
           sendJsonRpcError(res, 403, -32001, "MCP session belongs to another conversation");
           return;
         }
-        if (state) {
-          state.lastActivityAt = Date.now();
+        if (sessionState) {
+          const activityAt = Date.now();
+          sessionState.lastTransportActivityAt = activityAt;
+          if (!requestIsSseStream) sessionState.lastApplicationActivityAt = activityAt;
+          if (sessionState.identitySource !== "client_info_fallback") {
+            logicalContinuity.touch(sessionState.logicalClientId, sessionState.sessionId, activityAt);
+          }
           sessionRequestClass = requestIsSseStream ? "stream" : requestIsWaiter ? "waiter" : "execution";
-          if (sessionRequestClass === "stream") state.activeSseStreams++;
-          else if (sessionRequestClass === "waiter") state.activeLongPollCount++;
+          if (sessionRequestClass === "stream") sessionState.activeSseStreams++;
+          else if (sessionRequestClass === "waiter") sessionState.activeLongPollCount++;
           else {
-            state.inFlightRequests++;
+            sessionState.inFlightRequests++;
             sessionExecutionCounted = true;
           }
-          state.requestCount++;
+          sessionState.requestCount++;
           const rpcMethod = (req.body as { method?: string })?.method;
-          state.lastRpcMethod = rpcMethod;
+          sessionState.lastRpcMethod = rpcMethod;
           if (rpcMethod?.startsWith("notifications/")) {
-            state.notificationCount++;
+            sessionState.notificationCount++;
           }
           if (rpcMethod === "resources/read") {
-            state.resourceReadCount++;
+            sessionState.resourceReadCount++;
           }
           if (rpcMethod === "tools/call") {
-            state.toolCallCount++;
+            sessionState.toolCallCount++;
             recordMcpWindowEvent("tool");
             const toolName = (req.body as { params?: { name?: string } })?.params?.name;
-            state.lastToolName = toolName;
+            sessionState.lastToolName = toolName;
           }
         }
 
@@ -4037,7 +4664,14 @@ export function createServer(config = loadConfig()): RunningServer {
         // transport's per-session resource registry only contains the hash
         // from the build that created it.
         if (requestRpcMethod === "resources/read" && workspaceAppResourceKind((req.body as { params?: { uri?: unknown } })?.params?.uri)) {
-          if (state) state.lastActivityAt = Date.now();
+          if (sessionState) {
+            const activityAt = Date.now();
+            sessionState.lastTransportActivityAt = activityAt;
+            sessionState.lastApplicationActivityAt = activityAt;
+            if (sessionState.identitySource !== "client_info_fallback") {
+              logicalContinuity.touch(sessionState.logicalClientId, sessionState.sessionId, activityAt);
+            }
+          }
           serveWorkspaceAppResource(
             res,
             requestId,
@@ -4048,7 +4682,8 @@ export function createServer(config = loadConfig()): RunningServer {
         }
       } else if (initializeRequest) {
         // P1 #31: Admission pressure control — enforce caps at session creation
-        const clientId = logicalClientId(req);
+        const clientIdentity = logicalClientIdentity(req);
+        const clientId = clientIdentity.id;
         const pressure = getMemoryPressureState();
         if (mcpSessions.size >= pressure.effectiveSoftCap) {
           reapIdleMcpSessions();
@@ -4071,30 +4706,41 @@ export function createServer(config = loadConfig()): RunningServer {
             });
           }
         }
-        // Per-client limit at admission
-        let clientSessionCount = [...mcpSessions.values()].filter((s) => s.logicalClientId === clientId).length;
-        if (clientSessionCount >= config.mcpSessionMaxPerClient) {
-          reapIdleMcpSessions(clientId);
-          clientSessionCount = [...mcpSessions.values()].filter((s) => s.logicalClientId === clientId).length;
-        }
-        if (clientSessionCount >= config.mcpSessionMaxPerClient) {
-          logEvent(config.logging, "warn", "mcp_session_rejected", {
-            requestId,
-            reason: "per_client_limit_reached",
-            clientId,
-            current: clientSessionCount,
-            maxPerClient: config.mcpSessionMaxPerClient,
-          });
-          return res.status(503).json({
-            jsonrpc: "2.0",
-            id: (req.body as { id?: unknown })?.id ?? null,
-            error: { code: -32000, message: "Too many sessions for this client. Close some and retry." },
-          });
+        // A generic clientInfo name/version is not a trustworthy owner: many
+        // independent host transports can share it. Use only an instance,
+        // conversation, or authenticated OAuth identity for aggressive caps.
+        if (clientIdentity.source !== "client_info_fallback") {
+          let clientSessionCount = [...mcpSessions.values()].filter((s) => s.logicalClientId === clientId).length;
+          if (clientSessionCount >= config.mcpSessionMaxPerClient) {
+            reapIdleMcpSessions(clientId);
+            clientSessionCount = [...mcpSessions.values()].filter((s) => s.logicalClientId === clientId).length;
+          }
+          if (clientSessionCount >= config.mcpSessionMaxPerClient) {
+            logEvent(config.logging, "warn", "mcp_session_rejected", {
+              requestId,
+              reason: "per_client_limit_reached",
+              clientId,
+              identitySource: clientIdentity.source,
+              current: clientSessionCount,
+              maxPerClient: config.mcpSessionMaxPerClient,
+            });
+            return res.status(503).json({
+              jsonrpc: "2.0",
+              id: (req.body as { id?: unknown })?.id ?? null,
+              error: { code: -32000, message: "Too many sessions for this client. Close some and retry." },
+            });
+          }
         }
         const sessionInitializedAt = performance.now();
+        // The SDK is not required to expose its assigned session ID through
+        // `transport.sessionId` (it is legitimately unset at close time for
+        // some close paths). The callback-bound ID is authoritative for
+        // cleanup; the transport property is only a fallback.
+        let boundSessionId: string | undefined;
         transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
           onsessioninitialized: (newSessionId) => {
+            boundSessionId = newSessionId;
             if (transport) {
               transports.set(newSessionId, transport);
               const requestConversationId = conversationId(req);
@@ -4102,11 +4748,14 @@ export function createServer(config = loadConfig()): RunningServer {
                 sessionId: newSessionId,
                 sessionLabel: mcpSessionLabel(clientId, newSessionId, requestConversationId),
                 logicalClientId: clientId,
+                identitySource: clientIdentity.source,
                 authenticatedRole: connectionContext.authenticatedRole ?? "client",
                 authSource: connectionContext.authSource ?? "anonymous",
                 conversationId: requestConversationId,
+                approvalCorrelationId: clientIdentity.source === "client_info_fallback" ? undefined : clientId,
                 createdAt: Date.now(),
-                lastActivityAt: Date.now(),
+                lastTransportActivityAt: Date.now(),
+                lastApplicationActivityAt: Date.now(),
                 inFlightRequests: 0,
                 requestCount: 1,
                 notificationCount: 0,
@@ -4121,7 +4770,36 @@ export function createServer(config = loadConfig()): RunningServer {
                 durableWorkerSession: false,
                 lastRpcMethod: "initialize",
               });
+              let continuityAttachment: ReturnType<LogicalContinuityIndex["attach"]> | undefined;
+              if (clientIdentity.source !== "client_info_fallback") {
+                continuityAttachment = logicalContinuity.attach({
+                  identity: clientId,
+                  source: clientIdentity.source,
+                  transportId: newSessionId,
+                });
+              }
+              // Bind the per-transport tool context at the same point that the
+              // session record is created. The SDK does not need to expose its
+              // assigned session ID through transport.sessionId for callbacks
+              // to be safe; tool ownership must never fall back to the
+              // workspace merely because that property is not populated yet.
+              connectionContext.mcpSessionId = newSessionId;
+              connectionContext.mcpSessionLabel = mcpSessions.get(newSessionId)?.sessionLabel;
+              connectionContext.conversationId = mcpSessions.get(newSessionId)?.conversationId;
+              connectionContext.approvalCorrelationId = mcpSessions.get(newSessionId)?.approvalCorrelationId;
               recordMcpSessionCreated(clientId);
+              if (continuityAttachment?.reconnect) {
+                logEvent(config.logging, "info", "mcp_logical_continuity_reconnected", {
+                  requestId,
+                  sessionIdPrefix: sessionIdPrefix(newSessionId),
+                  predecessorSessionIdPrefix: continuityAttachment.predecessorTransportId
+                    ? sessionIdPrefix(continuityAttachment.predecessorTransportId)
+                    : undefined,
+                  logicalClientId: clientId,
+                  identitySource: clientIdentity.source,
+                  activeTransportCount: continuityAttachment.activeTransportCount,
+                });
+              }
             }
             logEvent(config.logging, "info", "mcp_session_created", {
               requestId,
@@ -4135,36 +4813,10 @@ export function createServer(config = loadConfig()): RunningServer {
         });
 
         transport.onclose = () => {
-          const closedSessionId = transport?.sessionId;
+          const closedSessionId = boundSessionId ?? transport?.sessionId;
           if (closedSessionId) {
-            transports.delete(closedSessionId);
-            cancelMcpPolicyWaitersForSession(closedSessionId, "transport_closed");
             const state = mcpSessions.get(closedSessionId);
-            if (state) {
-              recordMcpSessionEnd(state, state.closing ? "server_shutdown" : "client_closed");
-            }
-            mcpSessions.delete(closedSessionId);
-            void processSessions.terminateByOwner(closedSessionId).catch((error) => {
-              logEvent(config.logging, "warn", "mcp_session_process_cleanup_failed", {
-                sessionIdPrefix: sessionIdPrefix(closedSessionId),
-                error: error instanceof Error ? error.message : String(error),
-              });
-            });
-            logEvent(config.logging, "info", "mcp_session_closed", {
-              sessionIdPrefix: sessionIdPrefix(closedSessionId),
-              logicalClientId: state?.logicalClientId,
-              sessionLabel: state?.sessionLabel,
-              conversationId: state?.conversationId,
-              ageMs: state ? Date.now() - state.createdAt : undefined,
-              idleMs: state ? Date.now() - state.lastActivityAt : undefined,
-              requestCount: state?.requestCount,
-              notificationCount: state?.notificationCount,
-              toolCallCount: state?.toolCallCount,
-              resourceReadCount: state?.resourceReadCount,
-              lastRpcMethod: state?.lastRpcMethod,
-              lastToolName: state?.lastToolName,
-              closeReason: state?.closing ? "server_shutdown" : "client_closed",
-            });
+            finalizeMcpSession(closedSessionId, state?.closing ? "server_shutdown" : "client_closed");
           }
         };
 
@@ -4274,12 +4926,14 @@ export function createServer(config = loadConfig()): RunningServer {
         const serverCreateMs = performance.now() - serverCreateStarted;
         const transportConnectStarted = performance.now();
         await server.connect(transport);
-        const state = transport.sessionId ? mcpSessions.get(transport.sessionId) : undefined;
+        const state = (sessionId ? mcpSessions.get(sessionId) : undefined)
+          ?? (transport.sessionId ? mcpSessions.get(transport.sessionId) : undefined);
         if (state) {
           state.durableWorkerSession = connectionContext.authenticatedRole === "worker" || Boolean(connectionContext.workSessionId);
           connectionContext.mcpSessionId = state.sessionId;
           connectionContext.mcpSessionLabel = state.sessionLabel;
           connectionContext.conversationId = state.conversationId;
+          connectionContext.approvalCorrelationId = state.approvalCorrelationId;
         }
         const transportConnectMs = performance.now() - transportConnectStarted;
         const initializationTotalMs = performance.now() - sessionInitializedAt;
@@ -4294,8 +4948,8 @@ export function createServer(config = loadConfig()): RunningServer {
         logEvent(config.logging, "info", "mcp_session_initialized", {
           requestId,
           sessionIdPrefix: sessionIdPrefix(transport.sessionId),
-          sessionLabel: state?.sessionLabel,
-          conversationId: state?.conversationId,
+          sessionLabel: sessionState?.sessionLabel,
+          conversationId: sessionState?.conversationId,
           serverCreateMs: Math.round(serverCreateMs),
           transportConnectMs: Math.round(transportConnectMs),
           totalMs: Math.round(initializationTotalMs),
@@ -4354,11 +5008,33 @@ export function createServer(config = loadConfig()): RunningServer {
         res.setHeader("x-kontrol-admission-wait-ms", String(Math.round(admissionWaitMs)));
       }
 
+      if (requestIsSseStream && typeof res.write === "function") {
+        // Keep long-lived SSE connections visible through idle proxies. This
+        // is an SSE comment, not an MCP application event, and deliberately
+        // does not advance the application-activity clock.
+        sseHeartbeatTimer = setInterval(() => {
+          if (res.writableEnded || res.destroyed) {
+            clearInterval(sseHeartbeatTimer);
+            sseHeartbeatTimer = undefined;
+            return;
+          }
+          try {
+            res.write(": kontrol-heartbeat\\n\\n");
+          } catch {
+            clearInterval(sseHeartbeatTimer);
+            sseHeartbeatTimer = undefined;
+          }
+        }, 20_000);
+        sseHeartbeatTimer.unref?.();
+      }
+
       handlerStartedAt = performance.now();
       await mcpRequestContext.run({
         signal: requestAbort.signal,
         mcpSessionId: sessionId,
         mcpRequestId: requestId,
+        conversationId: sessionState?.conversationId,
+        approvalCorrelationId: sessionState?.approvalCorrelationId,
         onPolicyWaitStart,
         onPolicyWaitEnd,
       }, async () => {
@@ -4415,6 +5091,10 @@ export function createServer(config = loadConfig()): RunningServer {
         );
       }
     } finally {
+      if (sseHeartbeatTimer) {
+        clearInterval(sseHeartbeatTimer);
+        sseHeartbeatTimer = undefined;
+      }
       removePolicyWaiter();
       admissionRelease?.();
       admissionRelease = undefined;
@@ -4425,7 +5105,12 @@ export function createServer(config = loadConfig()): RunningServer {
           if (sessionRequestClass === "stream" && state.activeSseStreams > 0) state.activeSseStreams--;
           else if (sessionRequestClass === "waiter" && state.activeLongPollCount > 0) state.activeLongPollCount--;
           else if (sessionRequestClass === "execution" && sessionExecutionCounted && state.inFlightRequests > 0) state.inFlightRequests--;
-          state.lastActivityAt = Date.now();
+          const activityAt = Date.now();
+          state.lastTransportActivityAt = activityAt;
+          if (sessionRequestClass !== "stream") state.lastApplicationActivityAt = activityAt;
+          if (state.identitySource !== "client_info_fallback") {
+            logicalContinuity.touch(state.logicalClientId, state.sessionId, activityAt);
+          }
         }
       }
     }
@@ -4609,6 +5294,8 @@ export function createServer(config = loadConfig()): RunningServer {
   const finalizeClose = async (): Promise<void> => {
     if (closed) return;
     closed = true;
+    startupRecoveryStopped = true;
+    maintenanceStopped = true;
     dispatcher?.stop();
     supervisorRuntime?.stop();
     supervisorRuns.close();
@@ -4637,6 +5324,20 @@ export function createServer(config = loadConfig()): RunningServer {
     workspaceStore.close?.();
     workSessions?.close?.();
     agentRegistry.close();
+    if (integrityWorker) {
+      const worker = integrityWorker;
+      integrityWorker = undefined;
+      integrityScanActive = false;
+      worker.removeAllListeners();
+      // A failed bind must not wait indefinitely for a diagnostic worker that
+      // is still loading a packaged/tsx module. Stop waiting after a short
+      // cleanup bound and unref the worker so the failed server can exit.
+      worker.unref?.();
+      await Promise.race([
+        worker.terminate().catch(() => undefined),
+        new Promise<void>((resolve) => setTimeout(resolve, 500)),
+      ]);
+    }
     try { db.close(); } catch { /* ignore */ }
   };
   return {
@@ -4671,12 +5372,33 @@ async function isMainModule(): Promise<boolean> {
   return modulePath === entrypointPath;
 }
 
-if (await isMainModule()) {
-  const { app, config, close, drain } = createServer();
-  const runtimeIdentity = createRuntimeIdentity(
-    config.stateDir,
-    readBuildIdentity(join(dirname(fileURLToPath(import.meta.url)), "build-meta.json")),
+export async function runServer(config = loadConfig()): Promise<void> {
+  const buildMeta = readBuildIdentity(join(dirname(fileURLToPath(import.meta.url)), "build-meta.json"));
+  const inheritedLockToken = process.env.KONTROL_RUNTIME_LOCK_TOKEN;
+  const runtimeLock: RuntimeLockHandle = inheritedLockToken
+    ? { path: runtimeLockPath(config.stateDir), record: assertRuntimeLock(config.stateDir, inheritedLockToken) }
+    : await acquireRuntimeLock(config.stateDir, {
+      launcher: (process.env.KONTROL_LAUNCHER as "systemd" | "dev-watch" | "serve" | undefined) ?? "serve",
+      generationId: process.env.KONTROL_LAUNCH_GENERATION_ID,
+      buildId: buildMeta.buildId,
+      artifactPath: dirname(fileURLToPath(import.meta.url)),
+      port: config.port,
+    });
+  const ownsRuntimeLock = !inheritedLockToken;
+  let serverResources: ReturnType<typeof createServer>;
+  try {
+    serverResources = createServer(config);
+  } catch (error) {
+    if (ownsRuntimeLock) await releaseRuntimeLock(runtimeLock);
+    throw error;
+  }
+  const { app, close, drain } = serverResources;
+  const runtimeIdentity = createRuntimeIdentityRecord(
+    buildMeta,
+    process.argv.join(" "),
+    { artifactPath: dirname(fileURLToPath(import.meta.url)) },
   );
+  let runtimeIdentityWritten = false;
   const httpServer = app.listen(config.port, config.host, () => {
     // P2 / P1 #51: Log build info at startup for dirty-deployment visibility.
     // Prefer the embedded build meta (artifact identity); fall back to git working tree.
@@ -4717,12 +5439,45 @@ if (await isMainModule()) {
     // P2: Build info for dirty-deployment visibility
     console.log(`build commit: ${commit.slice(0, 8)} dirty: ${dirty ? `YES (${dirtyFileCount} files)` : "no"} built: ${new Date().toISOString()}`);
   });
-  httpServer.once("error", (error) => {
-    removeRuntimeIdentity(config.stateDir, runtimeIdentity.instanceId);
-    void close();
-    console.error(`kontrol failed to listen on ${config.host}:${config.port}: ${error instanceof Error ? error.message : String(error)}`);
-    process.exitCode = 1;
+  await new Promise<void>((resolve, reject) => {
+    const onListening = () => {
+      httpServer.off("error", onError);
+      resolve();
+    };
+    const onError = (error: Error) => {
+      httpServer.off("listening", onListening);
+      reject(error);
+    };
+    httpServer.once("listening", onListening);
+    httpServer.once("error", onError);
+  }).catch(async (error) => {
+    // Express leaves the HTTP server object allocated when the bind emits an
+    // error. Close that object before tearing down the application resources;
+    // otherwise a failed competing launch can retain a listener/timer long
+    // enough to look like a hung process and obscure the real EADDRINUSE.
+    try {
+      if (httpServer.listening) {
+        await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+      } else {
+        httpServer.closeAllConnections?.();
+      }
+    } catch {
+      // The socket never became ours or was already closed; resource cleanup
+      // below remains authoritative.
+    }
+    await close();
+    if (ownsRuntimeLock) await releaseRuntimeLock(runtimeLock);
+    throw new Error(`kontrol failed to listen on ${config.host}:${config.port}: ${error instanceof Error ? error.message : String(error)}`);
   });
+  try {
+    writeRuntimeIdentity(config.stateDir, runtimeIdentity);
+    runtimeIdentityWritten = true;
+  } catch (error) {
+    await close();
+    await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+    if (ownsRuntimeLock) await releaseRuntimeLock(runtimeLock);
+    throw new Error(`kontrol could not publish runtime identity: ${error instanceof Error ? error.message : String(error)}`);
+  }
 
   let shutdownStarted = false;
   const shutdown = async () => {
@@ -4747,15 +5502,24 @@ if (await isMainModule()) {
         });
       });
       await close();
-      removeRuntimeIdentity(config.stateDir, runtimeIdentity.instanceId);
+      if (runtimeIdentityWritten) removeRuntimeIdentity(config.stateDir, runtimeIdentity.instanceId);
+      if (ownsRuntimeLock) await releaseRuntimeLock(runtimeLock);
       process.exit(0);
     } catch (error) {
       console.error(`kontrol graceful shutdown failed: ${error instanceof Error ? error.message : String(error)}`);
       await close();
-      removeRuntimeIdentity(config.stateDir, runtimeIdentity.instanceId);
+      if (runtimeIdentityWritten) removeRuntimeIdentity(config.stateDir, runtimeIdentity.instanceId);
+      if (ownsRuntimeLock) await releaseRuntimeLock(runtimeLock);
       process.exit(1);
     }
   };
   process.once("SIGINT", shutdown);
   process.once("SIGTERM", shutdown);
+}
+
+if (await isMainModule()) {
+  await runServer().catch((error) => {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 1;
+  });
 }

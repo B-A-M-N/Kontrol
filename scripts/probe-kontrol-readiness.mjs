@@ -119,6 +119,64 @@ if (probeBash) {
   assert.ok(typeof bash?.result === "string" || JSON.stringify(bash).includes(workspace), "bash did not execute in the opened workspace");
 }
 
+// P1: prove the REVIEWER path, not just the worker path. An ask-capable
+// deployment whose WebUI transport cannot open the approval center is a
+// deadlocked control plane — the model blocks on approvals no surface can
+// resolve. The readiness contract therefore requires a separate
+// reviewer-authoritized MCP session to operate the approval center whenever
+// the effective policy can produce approvals (any `ask` posture, including
+// the secure baseline). Without reviewer credentials configured, an
+// ask-capable policy fails here instead of at the first blocked tool call.
+const reviewerReadiness = await fetch(readyUrl, { signal: AbortSignal.timeout(3_000) });
+const askCapable = jsonOrText(await reviewerReadiness.text()).approvalInteractive === true;
+if (askCapable) {
+  const reviewerToken =
+    process.env.KONTROL_TUNNEL_REVIEWER_SECRET ?? process.env.KONTROL_ACP_REVIEWER_SECRET;
+  assert.ok(reviewerToken, "ask-capable policy requires KONTROL_TUNNEL_REVIEWER_SECRET (or KONTROL_ACP_REVIEWER_SECRET) for the reviewer readiness path");
+
+  let reviewerSessionId;
+  let reviewerRequestId = 0;
+  const reviewerRpc = async (method, params, { withSession = true } = {}) => {
+    const headers = {
+      "content-type": "application/json",
+      accept: "application/json, text/event-stream",
+      "x-kontrol-reviewer-token": reviewerToken,
+    };
+    if (token) headers.authorization = `Bearer ${token}`;
+    if (withSession && reviewerSessionId) headers["mcp-session-id"] = reviewerSessionId;
+    const response = await fetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ jsonrpc: "2.0", id: ++reviewerRequestId, method, params }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    const payload = decode(await response.text());
+    if (method === "initialize") {
+      reviewerSessionId = response.headers.get("mcp-session-id") ?? reviewerSessionId;
+    }
+    assert.equal(response.status, 200, `reviewer ${method} returned HTTP ${response.status}: ${JSON.stringify(payload)}`);
+    assert.ok(!payload.error, `reviewer ${method}: ${payload.error?.message ?? "JSON-RPC error"}`);
+    return payload.result;
+  };
+
+  await reviewerRpc("initialize", {
+    protocolVersion: "2025-06-18",
+    capabilities: {},
+    clientInfo: { name: "kontrol-readiness-reviewer-probe", version: "1" },
+  }, { withSession: false });
+  assert.ok(reviewerSessionId, "reviewer initialize did not provide an MCP session id");
+  await reviewerRpc("notifications/initialized", {}, {});
+  const approvalCenter = await reviewerRpc("tools/call", { name: "open_approval_center", arguments: {} });
+  assert.notEqual(approvalCenter?.isError, true,
+    `open_approval_center failed with reviewer authority: ${JSON.stringify(approvalCenter)}`);
+
+  await fetch(url, {
+    method: "DELETE",
+    headers: { ...(token ? { authorization: `Bearer ${token}` } : {}), "mcp-session-id": reviewerSessionId },
+    signal: AbortSignal.timeout(3_000),
+  }).catch(() => {});
+}
+
 if (sessionId) {
   await fetch(url, {
     method: "DELETE",
