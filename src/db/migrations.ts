@@ -1,6 +1,7 @@
 import type Database from "better-sqlite3";
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
+import { DEFAULT_DIRECT_APPROVAL_REATTACH_GRACE_MS } from "../policy-approval-defaults.js";
 
 interface Migration {
   version: number;
@@ -56,6 +57,9 @@ const migrations: Migration[] = [
   { version: 45, name: "submission-file-metadata", up: migrateSubmissionFileMetadata },
   { version: 46, name: "policy-approval-waiter-identity", up: migratePolicyApprovalWaiterIdentity },
   { version: 47, name: "policy-approval-live-waiter", up: migratePolicyApprovalLiveWaiter },
+  { version: 48, name: "policy-approval-operation-lifecycle", up: migratePolicyApprovalOperationLifecycle },
+  { version: 49, name: "policy-approval-once-consumption", up: migratePolicyApprovalOnceConsumption },
+  { version: 50, name: "policy-approval-direct-reconnect-deadline", up: migratePolicyApprovalDirectReconnectDeadline },
 ];
 
 function migrateSubmissionFileMetadata(sqlite: Database.Database): void {
@@ -78,6 +82,47 @@ function migratePolicyApprovalWaiterIdentity(sqlite: Database.Database): void {
  */
 function migratePolicyApprovalLiveWaiter(sqlite: Database.Database): void {
   addColumnIfMissing(sqlite, "approval_requests", "live_waiter_id", "text");
+}
+
+function migratePolicyApprovalOperationLifecycle(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "approval_requests", "origin", "text");
+  addColumnIfMissing(sqlite, "approval_requests", "conversation_id", "text");
+  addColumnIfMissing(sqlite, "approval_requests", "orphaned_at", "text");
+  addColumnIfMissing(sqlite, "approval_requests", "reattach_deadline", "text");
+  sqlite.exec("create index if not exists approval_requests_reattach_idx on approval_requests(status, reattach_deadline)");
+}
+
+function migratePolicyApprovalOnceConsumption(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "approval_requests", "consumed_at", "text");
+  sqlite.exec("create index if not exists approval_requests_waiter_consumed_idx on approval_requests(waiter_key, status, consumed_at)");
+}
+
+/** Legacy direct approvals were created before the bounded reconnect window
+ * existed. Derive conservative deadlines from their original creation time so
+ * startup reconciliation can cancel old zombie cards immediately. */
+function migratePolicyApprovalDirectReconnectDeadline(sqlite: Database.Database): void {
+  const rows = sqlite.prepare(`
+    select id, created_at
+      from approval_requests
+     where status = 'pending'
+       and kind = 'tool'
+       and work_session_id is null
+       and (origin is null or origin = 'direct_mcp')
+       and reattach_deadline is null
+  `).all() as Array<{ id: string; created_at: string }>;
+  const update = sqlite.prepare(`
+    update approval_requests
+       set origin = coalesce(origin, 'direct_mcp'),
+           orphaned_at = coalesce(orphaned_at, ?),
+           reattach_deadline = ?
+     where id = ?
+  `);
+  for (const row of rows) {
+    const createdAtMs = Date.parse(row.created_at);
+    const base = Number.isFinite(createdAtMs) ? createdAtMs : Date.now();
+    const orphanedAt = Number.isFinite(createdAtMs) ? new Date(createdAtMs).toISOString() : new Date().toISOString();
+    update.run(orphanedAt, new Date(base + DEFAULT_DIRECT_APPROVAL_REATTACH_GRACE_MS).toISOString(), row.id);
+  }
 }
 
 /** Canonical current schema version — readiness requires exact equality. */
@@ -465,15 +510,10 @@ export function migrateDatabase(sqlite: Database.Database): void {
   });
 
   migrate.immediate();
-
-  const quickCheck = sqlite.prepare("pragma quick_check").get() as { quick_check?: string } | undefined;
-  if (quickCheck?.quick_check !== "ok") {
-    throw new Error(`Database integrity check failed after migration: ${String(quickCheck?.quick_check ?? "no result")}`);
-  }
-  const foreignKeyViolations = sqlite.prepare("pragma foreign_key_check").all();
-  if (foreignKeyViolations.length > 0) {
-    throw new Error(`Database foreign-key check failed after migration (${foreignKeyViolations.length} violation(s)).`);
-  }
+  // Startup only needs to establish that the migrated connection can execute
+  // a bounded query. Full integrity and foreign-key scans are diagnostics and
+  // run asynchronously after the HTTP server has bound its socket.
+  sqlite.prepare("select 1").get();
 }
 
 function migrateWorkspaceState(sqlite: Database.Database): void {

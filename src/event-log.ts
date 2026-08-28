@@ -76,7 +76,7 @@ export interface EventStore {
   * review events, state changes) while dramatically reducing row count.
   * Returns the number of rows removed.
   */
- compactSessionEvents(sessionId: string, opts?: { retentionDays?: number }): number;
+ compactSessionEvents(sessionId: string, opts?: { retentionDays?: number; maxRows?: number }): number;
 
  /**
   * Block until one or more events arrive after `afterSeq`. Resolves with the
@@ -702,8 +702,9 @@ export function createEventStore(
    * Preserves all workflow events (tool lifecycle, review, state changes, etc.)
    * and drops/replaces output_delta and thought_delta with a summary row.
    */
-  function compactSessionEvents(sessionId: string, opts: { retentionDays?: number } = {}): number {
+  function compactSessionEvents(sessionId: string, opts: { retentionDays?: number; maxRows?: number } = {}): number {
     const retentionDays = opts.retentionDays ?? 7;
+    const maxRows = Math.max(1, Math.min(500, Math.trunc(opts.maxRows ?? 500)));
     const cutoff = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000).toISOString();
     flushTelemetryForSession(sessionId);
 
@@ -714,11 +715,16 @@ export function createEventStore(
       const deleteResult = database.sqlite
         .prepare(
           `delete from event_log
-           where session_id = ?
-           and type in ('agent.run.output_delta', 'agent.run.thought_delta')
-           and created_at < ?`,
+           where seq in (
+             select seq from event_log
+              where session_id = ?
+                and type in ('agent.run.output_delta', 'agent.run.thought_delta')
+                and created_at < ?
+              order by seq
+              limit ?
+           )`,
         )
-        .run(sessionId, cutoff);
+        .run(sessionId, cutoff, maxRows);
 
       if (deleteResult.changes > 0) {
         insertEvent({

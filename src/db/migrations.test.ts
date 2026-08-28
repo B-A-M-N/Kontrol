@@ -71,10 +71,19 @@ try {
 
   const upgraded = openDatabase(backupRoot);
   upgraded.close();
-  assert.ok(
-    existsSync(`${path}.pre-migration-v${LATEST_SCHEMA_VERSION - 1}-to-v${LATEST_SCHEMA_VERSION}.bak`),
-    "schema upgrades retain a versioned recoverable database backup",
-  );
+  const backupPath = `${path}.pre-migration-v${LATEST_SCHEMA_VERSION - 1}-to-v${LATEST_SCHEMA_VERSION}.bak`;
+  assert.ok(existsSync(backupPath), "schema upgrades retain a versioned recoverable database backup");
+  const backup = new Database(backupPath, { readonly: true });
+  try {
+    const backupVersion = backup.prepare("select max(version) as version from kontrol_schema_migrations").get() as { version: number };
+    assert.equal(
+      backupVersion.version,
+      LATEST_SCHEMA_VERSION - 1,
+      "the rollback copy remains at the pre-upgrade schema version",
+    );
+  } finally {
+    backup.close();
+  }
 } finally {
   rmSync(backupRoot, { recursive: true, force: true });
 }

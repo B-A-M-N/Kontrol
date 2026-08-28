@@ -86,6 +86,11 @@ async function testDatabaseConfiguration(stateDir: string): Promise<void> {
       { version: 43, name: "mission-review-coverage-uncertainty" },
       { version: 44, name: "agent-per-agent-credential" },
       { version: 45, name: "submission-file-metadata" },
+      { version: 46, name: "policy-approval-waiter-identity" },
+      { version: 47, name: "policy-approval-live-waiter" },
+      { version: 48, name: "policy-approval-operation-lifecycle" },
+      { version: 49, name: "policy-approval-once-consumption" },
+      { version: 50, name: "policy-approval-direct-reconnect-deadline" },
     ]);
   } finally {
     database.close();

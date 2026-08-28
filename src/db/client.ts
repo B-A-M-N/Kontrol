@@ -4,6 +4,7 @@ import Database from "better-sqlite3";
 import { drizzle } from "drizzle-orm/better-sqlite3";
 import * as schema from "./schema.js";
 import { LATEST_SCHEMA_VERSION, migrateDatabase } from "./migrations.js";
+import { captureMigrationBackup, markMigrationCompleted, markMigrationFailed } from "./deployment-backup.js";
 
 export type SqliteDatabase = Database.Database;
 export type AppDatabase = ReturnType<typeof createDrizzleDatabase>;
@@ -29,8 +30,23 @@ export function openDatabase(stateDir: string): DatabaseHandle {
   sqlite.pragma("synchronous = NORMAL");
   sqlite.pragma("busy_timeout = 5000");
   sqlite.pragma("foreign_keys = ON");
-  backupBeforeMigration(sqlite, path, existedBeforeOpen);
-  migrateDatabase(sqlite);
+  const candidateSchemaVersion = Number(process.env.KONTROL_EXPECTED_SCHEMA_VERSION ?? LATEST_SCHEMA_VERSION);
+  const deploymentId = process.env.KONTROL_DEPLOYMENT_ID?.trim() || undefined;
+  backupBeforeMigration(
+    sqlite,
+    path,
+    existedBeforeOpen,
+    stateDir,
+    deploymentId,
+    Number.isInteger(candidateSchemaVersion) ? candidateSchemaVersion : LATEST_SCHEMA_VERSION,
+  );
+  try {
+    migrateDatabase(sqlite);
+    markMigrationCompleted(stateDir, deploymentId, LATEST_SCHEMA_VERSION);
+  } catch (error) {
+    markMigrationFailed(stateDir, deploymentId);
+    throw error;
+  }
 
   return {
     sqlite,
@@ -45,8 +61,18 @@ export function openDatabase(stateDir: string): DatabaseHandle {
  * application managers have been created yet. The versioned name prevents a
  * later upgrade from overwriting the copy needed to diagnose an earlier one.
  */
-function backupBeforeMigration(sqlite: SqliteDatabase, path: string, existedBeforeOpen: boolean): void {
-  if (!existedBeforeOpen) return;
+function backupBeforeMigration(
+  sqlite: SqliteDatabase,
+  path: string,
+  existedBeforeOpen: boolean,
+  stateDir: string,
+  deploymentId: string | undefined,
+  candidateSchemaVersion: number,
+): void {
+  if (!existedBeforeOpen) {
+    captureMigrationBackup(sqlite, path, stateDir, deploymentId, candidateSchemaVersion);
+    return;
+  }
 
   let currentVersion = 0;
   try {
@@ -56,13 +82,18 @@ function backupBeforeMigration(sqlite: SqliteDatabase, path: string, existedBefo
     // A database without the migration table is a pre-migration database; the
     // first migration will establish the schema and is still worth backing up.
   }
-  if (!Number.isFinite(currentVersion) || currentVersion >= LATEST_SCHEMA_VERSION) return;
+  if (!Number.isFinite(currentVersion) || currentVersion >= LATEST_SCHEMA_VERSION) {
+    captureMigrationBackup(sqlite, path, stateDir, deploymentId, candidateSchemaVersion);
+    return;
+  }
 
   const backupPath = `${path}.pre-migration-v${Math.max(0, Math.trunc(currentVersion))}-to-v${LATEST_SCHEMA_VERSION}.bak`;
-  if (existsSync(backupPath)) return;
-  sqlite.pragma("wal_checkpoint(TRUNCATE)");
-  copyFileSync(path, backupPath);
-  chmodSync(backupPath, 0o600);
+  if (!existsSync(backupPath)) {
+    sqlite.pragma("wal_checkpoint(TRUNCATE)");
+    copyFileSync(path, backupPath);
+    chmodSync(backupPath, 0o600);
+  }
+  captureMigrationBackup(sqlite, path, stateDir, deploymentId, candidateSchemaVersion);
 }
 
 function createDrizzleDatabase(sqlite: SqliteDatabase) {

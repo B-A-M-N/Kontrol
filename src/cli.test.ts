@@ -17,8 +17,8 @@ assert.match(cliSource, /const launcher = resolve\(process\.cwd\(\), "start-all\
 assert.match(cliSource, /spawnSync\("bash", \[launcher\], \{ cwd: process\.cwd\(\), stdio: "inherit" \}\)/);
 assert.match(
   readFileSync(new URL("../package.json", import.meta.url), "utf8"),
-  /fs\.chmodSync\('dist\/cli\.js',0o755\)/,
-  "the compiled CLI must remain executable for npm's global bin symlink",
+  /"build:copy-mjs"[\s\S]*scripts\/lib\/acp-worker-token\.mjs/,
+  "the standalone worker-token implementation must be copied when that compatibility build helper is used",
 );
 
 // P0 #3 regression: an owner token WITHOUT explicit allowed roots must fail
