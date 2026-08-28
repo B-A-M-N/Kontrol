@@ -1,12 +1,21 @@
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const LEGACY_WORKSPACE_APP_URI = "ui://kontrol/workspace-app.html";
 // The OpenAI tunnel can replay cards created while this project was named
 // DevDesktop. Retain this exact URI until those cached cards age out.
 export const DEVDESKTOP_WORKSPACE_APP_URI = "ui://devdesktop/workspace-app.html";
-export const WORKSPACE_APP_HTML = readFileSync(fileURLToPath(new URL("../dist/ui/workspace-app.html", import.meta.url)), "utf8");
+const moduleDirectory = dirname(fileURLToPath(import.meta.url));
+const localWorkspaceApp = join(moduleDirectory, "ui", "workspace-app.html");
+const sourceWorkspaceApp = join(process.cwd(), "dist", "ui", "workspace-app.html");
+// Compiled immutable releases carry their UI beside this module. Source-mode
+// tsx runs retain the checkout dist/ fallback used by the development server.
+export const WORKSPACE_APP_HTML = readFileSync(
+  existsSync(localWorkspaceApp) ? localWorkspaceApp : sourceWorkspaceApp,
+  "utf8",
+);
 export const WORKSPACE_APP_BUILD_ID = createHash("sha256").update(WORKSPACE_APP_HTML).digest("hex").slice(0, 12);
 export const WORKSPACE_APP_URI = `ui://kontrol/workspace-app-${WORKSPACE_APP_BUILD_ID}.html`;
 // ChatGPT hosts that still use the legacy OpenAI template key require the
