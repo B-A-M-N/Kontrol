@@ -96,9 +96,10 @@ try {
     KONTROL_ACP_ENABLED: "false",
     KONTROL_LOG_FORMAT: "pretty",
     // This suite verifies execution plumbing, not the approval boundary.
-    // The secure baseline gates bash behind `ask`; promote it explicitly so
-    // an unattended smoke test can exercise shell execution.
-    KONTROL_POLICY_TOOL_BASH: "allow",
+    // The secure baseline gates every mutation behind `ask`, which would
+    // also trip the tunnel reviewer gate; adopt an explicit non-interactive
+    // posture so an unattended smoke test can exercise shell execution.
+    KONTROL_POLICY_MODE: "allow",
   };
   const doctorOutput = execFileSync("node", [installedCli, "doctor"], {
     cwd: installPrefix,
