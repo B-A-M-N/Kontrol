@@ -380,6 +380,7 @@ const reattachInvocation = {
   path: "same-file.txt",
   mcpSessionId: "mcp-reattach-session",
   mcpRequestId: "mcp-reattach-request-1",
+  approvalCorrelationId: "trusted-conversation-reattach",
 };
 const firstAttempt = reattachEnforcer.enforce(reattachInvocation);
 await new Promise((resolve) => setTimeout(resolve, 0));
@@ -392,10 +393,13 @@ reattachPolicy.detachLiveWaiter(firstRow.id, "mcp-reattach-request-1");
 assert.equal(reattachPolicy.countLiveWaiters(firstRow.id), 0, "detach removes the live waiter but preserves the durable row");
 assert.equal(reattachPolicy.getPendingApprovals().length, 1, "durable row survives the dead live waiter");
 
-// A reconnecting invocation with the SAME (mcpSessionId, mcpRequestId) reuses
-// the durable row; the liveWaiterId is recomputed from mcpRequestId, which
-// means the test uses the SAME mcpRequestId so the row key matches.
-const retryInvocation = { ...reattachInvocation };
+// A reconnecting invocation with the same durable operation fingerprint reuses
+// the durable row even when transient MCP IDs change.
+const retryInvocation = {
+  ...reattachInvocation,
+  mcpSessionId: "mcp-reattach-session-2",
+  mcpRequestId: "mcp-reattach-request-2",
+};
 const secondAttempt = reattachEnforcer.enforce(retryInvocation);
 await new Promise((resolve) => setTimeout(resolve, 0));
 const allPending = reattachPolicy.getPendingApprovals();
@@ -404,14 +408,38 @@ const reusedRow = allPending[0];
 assert.equal(reusedRow.id, firstRow.id, "durable approvalId is reused for the reconnecting live invocation");
 assert.equal(reattachPolicy.countLiveWaiters(reusedRow.id), 1, "retry attached a fresh live waiter to the existing row");
 
-// Reviewer decides once — both invocations observe the same durable resolution.
+// Reviewer decides once. The disconnected original waiter remains cancelled;
+// only the reattached live invocation observes the durable resolution.
 eventStore.appendEvent({
   type: "policy.approval.provided",
   sessionId: WS,
   payload: { approvalId: reusedRow.id, decision: "approve", scope: "workspace" },
 });
-assert.equal((await Promise.all([firstAttempt, secondAttempt])).every((r) => r.allowed), true, "single reviewer decision resolves both the dead first attempt and the live retry");
+const reattachResults = await Promise.all([firstAttempt, secondAttempt]);
+assert.equal(reattachResults[0]?.outcome, "caller_gone", "dead original waiter remains cancelled");
+assert.equal(reattachResults[1]?.allowed, true, "single reviewer decision resolves the live retry");
 assert.equal(reattachPolicy.getPendingApprovals().length, 0, "durable row cleared after the resolution");
+
+// Without a trusted upstream identity, a new MCP transport is a different
+// operation even when its payload is byte-for-byte identical. Generic
+// clientInfo name/version must never merge unrelated conversations.
+const isolatedPolicy = createPolicyEngine({ defaultMode: "ask", toolRules: { write: "ask" }, pathRules: [] });
+const isolatedEnforcer = createPolicyEnforcer(isolatedPolicy, eventStore, { timeoutMs: 1_000 });
+const isolatedOne = isolatedEnforcer.enforce({
+  principalId: "isolated-client", principalRole: "client", workspaceId: WS,
+  tool: "write", path: "isolated.txt", mcpSessionId: "isolated-session-a", mcpRequestId: "isolated-request-a",
+});
+const isolatedTwo = isolatedEnforcer.enforce({
+  principalId: "isolated-client", principalRole: "client", workspaceId: WS,
+  tool: "write", path: "isolated.txt", mcpSessionId: "isolated-session-b", mcpRequestId: "isolated-request-b",
+});
+await new Promise((resolve) => setTimeout(resolve, 0));
+const isolatedPending = isolatedPolicy.getPendingApprovals();
+assert.equal(isolatedPending.length, 2, "untrusted cross-session retries remain isolated");
+for (const pending of isolatedPending) {
+  eventStore.appendEvent({ type: "policy.approval.provided", sessionId: WS, payload: { approvalId: pending.id, decision: "approve", scope: "once" } });
+}
+assert.deepEqual((await Promise.all([isolatedOne, isolatedTwo])).map((result) => result.allowed), [true, true]);
 
 // ── P1.10: authoritative approval options are carried in the event payload ──
 // Rehydrating clients (e.g. via list_pending_approvals) must reconcile

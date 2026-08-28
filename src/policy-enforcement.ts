@@ -1,8 +1,7 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { PolicyEngine, PolicyDecision, ApprovalScope, PolicyInputPath } from "./policy.js";
 import { CANONICAL_TOOL_ALIASES } from "./policy.js";
 import type { EventStore } from "./event-log.js";
-import type { ApprovalOption } from "./approval-requests.js";
 
 export type PrincipalRole = "reviewer" | "worker" | "client";
 
@@ -23,11 +22,17 @@ export interface PolicyInvocation {
   onPolicyWaitStart?: (context: PolicyWaitContext) => void | Promise<void>;
   /** Resume the request's execution lease after the approval decision. */
   onPolicyWaitEnd?: (context: PolicyWaitContext & { outcome: PolicyWaitOutcome }) => void | Promise<void>;
+  /** Direct MCP calls return an approval card immediately; ACP remains blocking. */
+  blockingApproval?: boolean;
+  /** Trusted upstream correlation, when supplied by the MCP host. */
+  conversationId?: string;
+  /** Stable trusted client/conversation identity. Generic clientInfo fallback
+   *  is deliberately excluded so unrelated transports cannot coalesce. */
+  approvalCorrelationId?: string;
   /**
-   * Identity of the originating MCP request. Two invocations with the same
-   * (mcpSessionId, mcpRequestId) are the SAME live call retrying — they must
-   * dedupe to one approval row. Invocations with different ids are independent
-   * and each get their own waiter/approval, even for identical work.
+   * Identity of the originating live invocation. These IDs are retained for
+   * cancellation/telemetry; durable approval deduplication uses the canonical
+   * operation fingerprint in waiterKey so reconnects can reattach.
    */
   mcpSessionId?: string;
   mcpRequestId?: string;
@@ -52,6 +57,7 @@ export interface PolicyWaitContext {
   mcpSessionId?: string;
   mcpRequestId?: string;
   coalesced: boolean;
+  conversationId?: string;
 }
 
 /**
@@ -83,6 +89,10 @@ export interface PolicyApprovalEventPayload {
   approvalKey: string;
   approvalKeyType: PolicyDecision["source"];
   matchedPattern?: string;
+  origin?: "direct_mcp" | "work_session";
+  conversationId?: string;
+  requestedAt?: string;
+  expiresAt?: string;
   /**
    * Authoritative server-created approval options. Rehydrating clients (e.g.
    * via list_pending_approvals) must always reconcile with these, never
@@ -104,7 +114,8 @@ export interface PolicyEnforcer {
    *   - { allowed: false, decision }            if deny
    *   - { allowed: false, decision, blocked }   if ask & waiting on a human
    *
-   * When `ask`, emits `policy.approval_requested` and blocks on
+   * When `ask`, emits `policy.approval_requested`. Direct MCP calls return a
+   * retryable approval card; controlled work-session calls can block on
    * `policy.approval.provided` for up to `timeoutMs`. The approval decision's
    * scope is recorded via `recordApproval` using the canonical approval key.
    *
@@ -113,41 +124,60 @@ export interface PolicyEnforcer {
    * when the outcome is `approved`. The policy enforcer never holds execution
    * capacity for the blocked request — it only holds the in-memory waiter.
    *
-   * Live-vs-durable separation (P0.3/P0.4): each invocation gets its own
-   * approval row, identified by `(mcpSessionId, mcpRequestId, approvalKey)`.
-   * Cancelling the originating signal only releases the LIVE waiter; the
-   * durable approval row remains available so a later live retry can attach
-   * to it and resume under the eventual reviewer decision.
+   * Direct MCP calls return a durable operation card immediately and do not
+   * hold the HTTP request open. ACP/work-session calls may retain blocking
+   * semantics. Cancelling a blocking waiter releases only the live waiter;
+   * the durable operation remains available during its bounded grace period.
    */
   enforce(inv: PolicyInvocation): Promise<{
     allowed: boolean;
     decision: PolicyDecision;
     outcome?: PolicyWaitOutcome;
+    approvalRequired?: boolean;
+    approvalId?: string;
   }>;
 }
 
 /**
  * Build the stable identity of the durable approval row for an invocation.
- * Two invocations with the same (mcpSessionId, mcpRequestId, approvalKey)
- * are the SAME live call retrying — they MUST reuse one durable row, not
- * each create their own. Invocations with different MCP identities remain
- * independent even for identical work.
+ * Reconnects may change MCP request IDs, so the durable operation fingerprint
+ * never uses a request ID. A trusted upstream identity (OAuth client,
+ * instance, or conversation) may bridge a reconnect; without one, the MCP
+ * session remains the narrowest safe retry boundary for isolated transports.
  */
 function approvalRowKey(inv: PolicyInvocation, approvalKey: string): string {
-  const session = inv.mcpSessionId ?? "";
-  const request = inv.mcpRequestId ?? "";
-  return `${session}|${request}|${inv.principalId}|${inv.workspaceId}|${inv.workSessionId ?? ""}|${approvalKey}`;
+  const operation = JSON.stringify({
+    principalId: inv.principalId,
+    workspaceId: inv.workspaceId,
+    workSessionId: inv.workSessionId ?? "",
+    correlation: inv.approvalCorrelationId
+      ? `trusted:${inv.approvalCorrelationId}`
+      : `session:${inv.mcpSessionId ?? inv.mcpRequestId ?? "none"}`,
+    conversationId: inv.conversationId ?? "",
+    tool: canonicalToolName(inv.tool),
+    approvalKey,
+    path: policyPathLabel(inv.path),
+    paths: inv.paths?.map(policyPathLabel),
+    command: inv.command ?? "",
+  });
+  const fingerprint = createHash("sha256").update(operation).digest("hex");
+  return inv.mcpSessionId || inv.mcpRequestId
+    ? `operation:${fingerprint}`
+    : `legacy:${fingerprint}:${randomUUID()}`;
 }
 
 export function createPolicyEnforcer(
   policy: PolicyEngine,
   eventStore: EventStore,
-  opts: { timeoutMs?: number } = {},
+  opts: { timeoutMs?: number; directApprovalTtlMs?: number } = {},
 ): PolicyEnforcer {
   // Blocking approvals are intentionally long-lived. The server supplies a
   // deployment backstop, while the originating request signal cancels a
-  // waiter when its caller actually disconnects.
+  // waiter when its caller actually disconnects. A direct (non-blocking)
+  // approval is decidable for its own human TTL, supplied by the same config
+  // the durable approval store uses so both sides agree.
   const timeoutMs = opts.timeoutMs ?? 24 * 60 * 60_000;
+  const directApprovalTtlMs = opts.directApprovalTtlMs ?? 10 * 60_000;
 
   return {
     async enforce(inv: PolicyInvocation): Promise<{ allowed: boolean; decision: PolicyDecision; outcome?: PolicyWaitOutcome }> {
@@ -186,14 +216,17 @@ export function createPolicyEnforcer(
       async function waitForApproval(
         decision: PolicyDecision,
         path: PolicyInputPath | undefined,
-      ): Promise<{ allowed: boolean; decision: PolicyDecision; outcome?: PolicyWaitOutcome }> {
+      ): Promise<{ allowed: boolean; decision: PolicyDecision; outcome?: PolicyWaitOutcome; approvalRequired?: boolean; approvalId?: string }> {
         const approvalKey = decision.approvalKey!;
         const rowKey = approvalRowKey(inv, approvalKey);
 
-        // P0.4 dedup: only the SAME live invocation (matching mcpSessionId +
-        // mcpRequestId) reuses the durable approval row. Concurrent identical
-        // calls from different MCP sessions each get their own row.
+        // P0.4 dedup: the durable operation fingerprint intentionally ignores
+        // transient transport/request IDs, so a retry from a new MCP session
+        // finds the same pending or approved operation.
         const existing = policy.findPendingByKey(rowKey);
+        if (!existing && policy.consumeApprovedOperation(rowKey)) {
+          return { allowed: true, decision, outcome: "approved" };
+        }
         const approvalId = existing?.id ?? `pol_${randomUUID()}`;
         const isCoalesced = Boolean(existing);
         const liveWaiterId = inv.mcpRequestId ?? `synthetic_${randomUUID()}`;
@@ -212,7 +245,15 @@ export function createPolicyEnforcer(
           mcpSessionId: inv.mcpSessionId,
           mcpRequestId: inv.mcpRequestId,
           coalesced: isCoalesced,
+          conversationId: inv.conversationId,
         };
+
+        const blocking = inv.blockingApproval !== false;
+
+        // A matching direct retry is evidence that the operation is still
+        // owned by a live host. Refresh only its short reattachment grace;
+        // the human approval TTL remains unchanged.
+        if (existing && !blocking) policy.touchPending(existing.id);
 
         // P0.1: signal the caller to release execution weight BEFORE we
         // commit any durable state, so an aborted request never leaves an
@@ -220,11 +261,15 @@ export function createPolicyEnforcer(
         if (inv.signal?.aborted) {
           return { allowed: false, decision, outcome: "cancelled" };
         }
-        await inv.onPolicyWaitStart?.(waitContext);
+        if (blocking) await inv.onPolicyWaitStart?.(waitContext);
 
         let requestAfterSeq = 0;
         if (!existing) {
-          const options: ApprovalOption[] = [
+          const requestedAt = new Date().toISOString();
+          const expiresAt = Number.isFinite(timeoutMs)
+            ? new Date(Date.now() + (inv.blockingApproval === false ? Math.min(timeoutMs, directApprovalTtlMs) : timeoutMs)).toISOString()
+            : undefined;
+          const options: PolicyApprovalEventPayload["options"] = [
             { id: "approve", label: "Approve Once", effect: "approve", scope: "once" },
             ...(inv.workSessionId ? [{ id: "approve_session", label: "Approve Session", effect: "approve" as const, scope: "work_session" as const }] : []),
             { id: "approve_workspace", label: "Approve Workspace", effect: "approve", scope: "workspace" },
@@ -235,19 +280,20 @@ export function createPolicyEnforcer(
             principalId: inv.principalId,
             workspaceId: inv.workspaceId,
             workSessionId: inv.workSessionId,
+            runId: inv.runId,
             approvalKey,
             mcpSessionId: inv.mcpSessionId,
             mcpRequestId: inv.mcpRequestId,
             waiterKey: rowKey,
-            liveWaiterId,
+            liveWaiterId: blocking ? liveWaiterId : undefined,
+            origin: inv.workSessionId ? "work_session" : "direct_mcp",
+            conversationId: inv.conversationId,
+            requestedAt,
+            expiresAt,
             options,
             tool: canonical,
             path: policyPath,
             command: inv.command,
-            requestedAt: new Date().toISOString(),
-            expiresAt: Number.isFinite(timeoutMs)
-              ? new Date(Date.now() + timeoutMs).toISOString()
-              : undefined,
           });
 
           const payload: PolicyApprovalEventPayload = {
@@ -262,6 +308,10 @@ export function createPolicyEnforcer(
             approvalKey,
             approvalKeyType: decision.source,
             matchedPattern: decision.matchedPattern,
+            origin: inv.workSessionId ? "work_session" : "direct_mcp",
+            conversationId: inv.conversationId,
+            requestedAt,
+            expiresAt,
             options,
           };
           requestAfterSeq = eventStore.appendEvent({
@@ -269,12 +319,16 @@ export function createPolicyEnforcer(
             sessionId: inv.workSessionId ?? inv.workspaceId,
             payload: payload as unknown as Record<string, unknown>,
           }).seq;
-        } else {
+        } else if (blocking) {
           // Re-attach path: refresh the liveWaiterId for an existing row so
           // a stale approval can resume under the new live invocation only.
           const session = (inv.workSessionId ?? inv.workspaceId);
           requestAfterSeq = eventStore.getLatestEvent(session)?.seq ?? 0;
           policy.reattachLiveWaiter(approvalId, liveWaiterId);
+        }
+
+        if (!blocking) {
+          return { allowed: false, decision, approvalRequired: true, approvalId };
         }
 
         let lifecycleEnded = false;
@@ -332,7 +386,7 @@ export function createPolicyEnforcer(
           const myLiveState = policy.getLiveWaiterState(approvalId, liveWaiterId);
 
           if (decision2 !== "approve") {
-            policy.resolvePending(approvalId, "denied", String(event.payload.reason ?? "denied by reviewer"));
+            policy.resolvePending(approvalId, "denied", String(event.payload.reason ?? "denied by reviewer"), { scope });
             if (myLiveState === "dead") {
               await endLifecycle("caller_gone");
               return { allowed: false, decision, outcome: "caller_gone" };
@@ -350,24 +404,22 @@ export function createPolicyEnforcer(
               workSessionId: inv.workSessionId,
             });
           }
-          policy.resolvePending(approvalId, "approved", String(event.payload.reason ?? "approved by reviewer"));
+          policy.resolvePending(approvalId, "approved", String(event.payload.reason ?? "approved by reviewer"), { scope });
 
           if (myLiveState === "dead") {
             // The grant is recorded; the dead invocation must not resume.
             await endLifecycle("caller_gone");
             return { allowed: false, decision, outcome: "caller_gone" };
           }
+          if (scope === "once") policy.consumeApprovedOperation(rowKey);
           await endLifecycle("approved");
           return { allowed: true, decision, outcome: "approved" };
         } finally {
-          // P0.3: a successful resolution already cleared the durable row
-          // via resolvePending. A failed wait (caller_gone) leaves the
-          // durable row intact for a future live reattach. We must NOT
-          // unconditionally clearPending — that would orphan the durable
-          // card right when a reconnection was about to use it.
-          if (inv.signal?.aborted) {
-            policy.detachLiveWaiter(approvalId, liveWaiterId);
-          }
+          // P0.3: a successful resolution clears the pending lookup while
+          // this finally block releases only this live waiter. A failed wait
+          // leaves the durable row intact for a future reattach, and detach is
+          // idempotent for both paths.
+          policy.detachLiveWaiter(approvalId, liveWaiterId);
         }
       }
     },
