@@ -337,6 +337,10 @@ export const approvalRequests = sqliteTable("approval_requests", {
   mcpRequestId: text("mcp_request_id"),
   waiterKey: text("waiter_key"),
   liveWaiterId: text("live_waiter_id"),
+  origin: text("origin"),
+  conversationId: text("conversation_id"),
+  orphanedAt: text("orphaned_at"),
+  reattachDeadline: text("reattach_deadline"),
   title: text("title").notNull(),
   description: text("description"),
   risk: text("risk"),
@@ -349,11 +353,13 @@ export const approvalRequests = sqliteTable("approval_requests", {
   expiresAt: text("expires_at"),
   resolvedAt: text("resolved_at"),
   resolutionJson: text("resolution_json"),
+  consumedAt: text("consumed_at"),
 }, (table) => [
   index("approval_requests_workspace_status_idx").on(table.workspaceSessionId, table.status, table.createdAt),
   index("approval_requests_work_session_status_idx").on(table.workSessionId, table.status, table.createdAt),
   index("approval_requests_run_idx").on(table.runId, table.createdAt),
   index("approval_requests_status_expiry_idx").on(table.status, table.expiresAt),
+  index("approval_requests_waiter_consumed_idx").on(table.waiterKey, table.status, table.consumedAt),
 ]);
 
 export type ApprovalRequestRow = typeof approvalRequests.$inferSelect;

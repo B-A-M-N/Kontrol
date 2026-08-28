@@ -118,6 +118,31 @@ console.log("migration-fixtures: previous-release upgrade with data survival pas
 }
 console.log("migration-fixtures: interrupted-migration resume passed");
 
+// ── Fixture B2: legacy direct approval rows get a bounded reconnect window ─
+{
+  const sqlite = newSqlite();
+  try {
+    migrateUpTo(sqlite, 49);
+    sqlite.prepare(`
+      insert into approval_requests
+        (id, kind, workspace_session_id, title, options_json, status, created_at)
+      values (?, 'tool', ?, 'legacy shell', '[]', 'pending', ?)
+    `).run("legacy-direct", "legacy-workspace", "2020-01-01T00:00:00.000Z");
+    migrateDatabase(sqlite);
+    const row = sqlite.prepare("select origin, orphaned_at, reattach_deadline from approval_requests where id = ?").get("legacy-direct") as {
+      origin: string;
+      orphaned_at: string;
+      reattach_deadline: string;
+    };
+    assert.equal(row.origin, "direct_mcp");
+    assert.equal(row.orphaned_at, "2020-01-01T00:00:00.000Z");
+    assert.equal(row.reattach_deadline, "2020-01-01T00:05:00.000Z");
+  } finally {
+    sqlite.close();
+  }
+}
+console.log("migration-fixtures: legacy approval reconciliation passed");
+
 // ── Fixture C: dirty WAL sidecars do not block startup ───────────────────────
 {
   const stateDir = mkdtempSync(join(tmpdir(), "kontrol-mig-wal-"));
