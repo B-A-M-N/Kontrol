@@ -511,6 +511,9 @@ export function createAcpServer(
       }
       const peer = selection.agent;
       const taskText = extractTaskText(input);
+      if (!taskText.trim()) {
+        return res.status(400).json({ error: { code: "invalid_task", message: "ACP task must be non-empty" } });
+      }
       const context = resolveRunContext(res, {
         workspace_id,
         workspace_session_id,
@@ -571,6 +574,9 @@ export function createAcpServer(
     // ── Local agent execution ──
 
     const taskText = extractTaskText(input);
+    if (!taskText.trim()) {
+      return res.status(400).json({ error: { code: "invalid_task", message: "ACP task must be non-empty" } });
+    }
     const context = resolveRunContext(res, {
       workspace_id,
       workspace_session_id,
@@ -660,21 +666,20 @@ export function createAcpServer(
 
         // Delegate the state transition to the authoritative workflow service.
         const submitted = reviewWorkflow
-          ? reviewWorkflow.submitForReview({ workSessionId: session.id, diff: review.patch, message: taskText || review.result, summaryJson: JSON.stringify(review.summary), files: review.summary.files, changedFiles: review.files, additions: review.summary.additions, removals: review.summary.removals, snapshotCommit: review.snapshotCommit })
+          ? reviewWorkflow.submitForReview({ workSessionId: session.id, diff: review.patch, message: taskText || review.result, summaryJson: JSON.stringify(review.summary), files: review.summary.files, changedFiles: review.files, additions: review.summary.additions, removals: review.summary.removals, snapshotKind: review.snapshotKind, snapshotRef: review.snapshotRef, snapshotCommit: review.snapshotCommit })
           : (() => {
-              const s = workSessions.submitForReview({ workSessionId: session.id, diff: review.patch, message: taskText || review.result, summaryJson: JSON.stringify(review.summary), files: review.files, snapshotCommit: review.snapshotCommit });
+              const s = workSessions.submitForReview({ workSessionId: session.id, diff: review.patch, message: taskText || review.result, summaryJson: JSON.stringify(review.summary), files: review.files, snapshotKind: review.snapshotKind, snapshotRef: review.snapshotRef, snapshotCommit: review.snapshotCommit });
               return { submissionId: s.id, submissionNumber: s.submissionNumber, diffSha256: s.diffSha256, reviewEpoch: s.reviewEpoch };
             })();
 
         // Advance the review baseline to the EXACT captured snapshot only after
         // the submission was persisted, so a crash cannot strand the diff.
         if (reviewWorkflow) {
-          await reviewCheckpoints.commitReviewed({
-            workspaceId: session.workspaceSessionId,
-            root: wsRoot,
-            workSessionId: session.id,
-            snapshotCommit: review.snapshotCommit,
-          });
+          if (review.snapshot && typeof reviewCheckpoints.commitReviewedSnapshot === "function") {
+            await reviewCheckpoints.commitReviewedSnapshot({ workspaceId: session.workspaceSessionId, root: wsRoot, workSessionId: session.id, snapshot: review.snapshot });
+          } else {
+            await reviewCheckpoints.commitReviewed({ workspaceId: session.workspaceSessionId, root: wsRoot, workSessionId: session.id, snapshotCommit: review.snapshotCommit });
+          }
         }
 
         agentRegistry.updateRun(run.runId, { status: "awaiting", finishedAt: new Date().toISOString() });
@@ -683,7 +688,7 @@ export function createAcpServer(
           tool: "submit_for_review",
           workspaceId: session.workspaceSessionId,
           status: "awaiting_review",
-          summary: { ...review.summary, submissionId: submitted.submissionId, sessionId: session.id, submissionNumber: submitted.submissionNumber, message: taskText || review.result, diffSha256: submitted.diffSha256, reviewEpoch: submitted.reviewEpoch },
+          summary: { ...review.summary, submissionId: submitted.submissionId, sessionId: session.id, submissionNumber: submitted.submissionNumber, message: taskText || review.result, diffSha256: submitted.diffSha256, reviewEpoch: submitted.reviewEpoch, snapshotKind: review.snapshotKind, snapshotRef: review.snapshotRef },
           files: review.files,
           payload: { patch: review.patch },
         };
@@ -1018,6 +1023,8 @@ export function createAcpServer(
       workSessionId,
       diff: review.patch,
       diffSha256: createHash("sha256").update(review.patch).digest("hex"),
+      snapshotKind: review.snapshotKind,
+      snapshotRef: review.snapshotRef,
       snapshotCommit: review.snapshotCommit,
       message: review.result,
       summaryJson: JSON.stringify(review.summary),
@@ -1038,12 +1045,11 @@ export function createAcpServer(
     ) {
       workSessions.updateStatus(workSessionId, "awaiting_review");
     }
-    await reviewCheckpoints.commitReviewed({
-      workspaceId: session.workspaceSessionId,
-      root,
-      workSessionId,
-      snapshotCommit: review.snapshotCommit,
-    });
+    if (review.snapshot && typeof reviewCheckpoints.commitReviewedSnapshot === "function") {
+      await reviewCheckpoints.commitReviewedSnapshot({ workspaceId: session.workspaceSessionId, root, workSessionId, snapshot: review.snapshot });
+    } else {
+      await reviewCheckpoints.commitReviewed({ workspaceId: session.workspaceSessionId, root, workSessionId, snapshotCommit: review.snapshotCommit });
+    }
     agentRegistry.updateRun(runId, {
       status: "awaiting_review",
       finishedAt: new Date().toISOString(),

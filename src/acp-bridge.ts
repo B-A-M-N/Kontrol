@@ -24,6 +24,7 @@ import type { ServerConfig } from "./config.js";
 import { loadSkillIndex } from "./skills.js";
 import type { DatabaseHandle } from "./db/client.js";
 import type { ReviewSubmissionDTO } from "./review-submission.js";
+import { mutationPrincipalId, runWithMutationReceipt, type MutationReceiptStore } from "./mutation-receipts.js";
 
 function workspaceAppModelAndAppMeta() {
   return workspaceAppToolMeta();
@@ -79,11 +80,14 @@ export interface BridgeConfig {
   serverConfig?: ServerConfig;
   /**
    * The role of the caller presenting this MCP connection. The WebUI connects
-   * as a reviewer/client; the coding agent connects as a worker. Role checks
+   * as a WebUI reviewer or ordinary MCP client; the coding agent connects as a worker. Role checks
    * on reviewer-only and worker-only tools are enforced server-side so a worker
    * cannot, e.g., self-approve a review or invoke submit_to_coding_agent.
    */
   principalRole?: PrincipalRole;
+  /** Stable authenticated principal used to scope durable UI mutation IDs. */
+  principalId?: string;
+  mutationReceipts?: MutationReceiptStore;
   /** Continuation ID authenticated on this connection, when a dispatched worker reconnects. */
   connectionContinuationId?: string;
   /** Bound work session ID authenticated on this connection, when a dispatched worker reconnects. */
@@ -108,6 +112,26 @@ export interface BridgeConfig {
   beforeContinuationDispatch?: (continuation: Continuation, sessionId: string) => Promise<void>;
   /** Rolling server diagnostics for expensive bridge phases. */
   onPhaseTiming?: (phase: string, durationMs: number) => void;
+}
+
+function registerMutationAppTool(
+  server: McpServer,
+  name: string,
+  definition: unknown,
+  config: BridgeConfig,
+  handler: (input: any) => Promise<unknown> | unknown,
+): void {
+  registerAppTool(server, name as any, definition as any, (async (input: any) => {
+    const { clientMutationId, ...request } = input as { clientMutationId?: string } & Record<string, unknown>;
+    return runWithMutationReceipt({
+      store: config.mutationReceipts,
+      principalId: mutationPrincipalId(config.principalId, config.principalRole),
+      operation: name,
+      clientMutationId,
+      request,
+      execute: () => handler(input),
+    });
+  }) as any);
 }
 
 export interface LiveWaiterRegistry {
@@ -684,7 +708,7 @@ export function registerBridgeTools(
 
   // ── Session Management ──────────────────────────────
 
-  registerAppTool(
+  registerMutationAppTool(
     server,
     "start_work_session",
     {
@@ -694,11 +718,13 @@ export function registerBridgeTools(
         workspaceId: z.string().describe("Workspace identifier from open_workspace."),
         title: z.string().optional().describe("Optional title for this session."),
         completionPolicy: z.enum(["agent_completion", "webui_approval_required"]).optional().describe("Completion policy. Use webui_approval_required for Ralph/WebUI-reviewed work."),
+        clientMutationId: z.string().min(1).max(200).optional(),
       },
       outputSchema: { sessionId: z.string(), status: z.string() },
       _meta: workspaceAppModelAndAppMeta(),
-      annotations: { readOnlyHint: true },
+      annotations: { readOnlyHint: false },
     },
+    config,
     async ({ workspaceId, title, completionPolicy }) => {
       try {
         config.workspaces.getWorkspace(workspaceId);
@@ -714,23 +740,25 @@ export function registerBridgeTools(
     },
   );
 
-  // ── Submit for Review (with real diff) ──────────────
+  // ── Submit for Review (with backend-neutral checkpoint) ──────────────
 
-  registerAppTool(
+  registerMutationAppTool(
     server,
     "submit_for_review",
     {
       title: "Submit for review",
-      description: "Capture the real git diff via review checkpoints and submit for human review. The WebUI displays the diff with feedback controls. After calling this, call await_review_feedback IMMEDIATELY to block for the verdict — do NOT poll. check_review_status is a recovery-only fallback if await_review_feedback times out.",
+      description: "Capture workspace changes against the session checkpoint and submit the backend-neutral snapshot identity plus structured file metadata for human review. Git is optional; the presentation patch is not a path protocol. After calling this, call await_review_feedback immediately; do not poll except as recovery.",
       inputSchema: {
         sessionId: z.string().describe("Work session ID from start_work_session."),
         message: z.string().optional().describe("Note to the reviewer."),
         continuationId: z.string().optional().describe("Continuation ID returned by await_review_feedback; completed only after this submission is persisted."),
+        clientMutationId: z.string().min(1).max(200).optional(),
       },
-      outputSchema: { submissionId: z.string(), status: z.string(), files: z.number(), additions: z.number(), removals: z.number(), diffSha256: z.string().optional(), reviewEpoch: z.number(), housekeepingWarnings: z.array(z.string()).optional() },
+      outputSchema: { submissionId: z.string(), status: z.string(), files: z.number(), additions: z.number(), removals: z.number(), diffSha256: z.string().optional(), reviewEpoch: z.number(), snapshotKind: z.enum(["git", "filesystem"]).optional(), snapshotRef: z.string().optional(), housekeepingWarnings: z.array(z.string()).optional() },
       _meta: workspaceAppModelAndAppMeta(),
       annotations: { readOnlyHint: false },
     },
+    config,
     async ({ sessionId, message, continuationId }) => {
       // ROLE CHECK: submit_for_review is for the worker (coding agent) or an
       // ordinary client, NOT a reviewer approving work.
@@ -796,6 +824,8 @@ export function registerBridgeTools(
           changedFiles: review.files,
           additions: review.summary.additions,
           removals: review.summary.removals,
+          snapshotKind: review.snapshotKind,
+          snapshotRef: review.snapshotRef,
           snapshotCommit: review.snapshotCommit,
         });
 
@@ -818,12 +848,21 @@ export function registerBridgeTools(
         // follow-up housekeeping and must not turn a successful submission
         // into a misleading tool error if it fails.
         try {
-          await config.reviewCheckpoints.commitReviewed({
-            workspaceId: session.workspaceSessionId,
-            root: ws.root,
-            workSessionId: session.id,
-            snapshotCommit: review.snapshotCommit,
-          });
+          if (review.snapshot && typeof config.reviewCheckpoints.commitReviewedSnapshot === "function") {
+            await config.reviewCheckpoints.commitReviewedSnapshot({
+              workspaceId: session.workspaceSessionId,
+              root: ws.root,
+              workSessionId: session.id,
+              snapshot: review.snapshot,
+            });
+          } else {
+            await config.reviewCheckpoints.commitReviewed({
+              workspaceId: session.workspaceSessionId,
+              root: ws.root,
+              workSessionId: session.id,
+              snapshotCommit: review.snapshotCommit,
+            });
+          }
         } catch (error) {
           recordHousekeepingFailure("checkpoint_commit", error);
         }
@@ -832,7 +871,7 @@ export function registerBridgeTools(
           const completedContinuationId = continuationId ?? config.connectionContinuationId;
           if (completedContinuationId) {
             const continuation = config.continuationManager.get(completedContinuationId);
-            if (continuation?.sessionId === sessionId) {
+            if (continuation && continuation.sessionId === sessionId) {
               config.continuationManager.markCompleted(completedContinuationId);
               config.workSessions.markFeedbackConsumed(sessionId, continuation.reviewId);
             }
@@ -866,8 +905,10 @@ export function registerBridgeTools(
             sessionId,
             submissionNumber: submission.submissionNumber,
             reviewEpoch: submitted.reviewEpoch,
-            status: "awaiting_review",
-            diffSha256: submitted.diffSha256,
+          status: "awaiting_review",
+          snapshotKind: review.snapshotKind,
+          snapshotRef: review.snapshotRef,
+          diffSha256: submitted.diffSha256,
             patch: review.patch,
             files: review.files,
             fileCount: review.summary.files,
@@ -953,13 +994,15 @@ export function registerBridgeTools(
 
       const summary = submission.summaryJson ? (JSON.parse(submission.summaryJson) as Record<string, unknown>) : {};
       const patch = submission.diff ?? "";
-      const files = parsePatchFiles(patch);
+      const files = submission.files ?? parsePatchFiles(patch);
       const dto: ReviewSubmissionDTO = {
         submissionId: submission.id,
         sessionId,
         submissionNumber: submission.submissionNumber,
         reviewEpoch: submission.reviewEpoch,
         status: submission.status,
+        snapshotKind: submission.snapshotKind,
+        snapshotRef: submission.snapshotRef,
         diffSha256: submission.diffSha256,
         patch,
         files,
@@ -1141,17 +1184,17 @@ export function registerBridgeTools(
         : [];
     const missionPacket = config.missionLedger?.getPacket(workSessionId);
     let cumulativeDiff: unknown = latestSubmission
-      ? { deferred: detail !== "full", knownSnapshotCommit: latestSubmission.snapshotCommit, knownDiffSha256: latestSubmission.diffSha256 }
+      ? { deferred: detail !== "full", knownSnapshotKind: latestSubmission.snapshotKind, knownSnapshotRef: latestSubmission.snapshotRef, knownSnapshotCommit: latestSubmission.snapshotCommit, knownDiffSha256: latestSubmission.diffSha256 }
       : undefined;
     try {
       if (session && detail === "full") {
         const workspace = config.workspaces.getWorkspace(session.workspaceSessionId);
         const mission = config.missionLedger?.getMissionByWorkSession(workSessionId);
-        const cumulative = mission?.baselineCommit
-          ? await config.reviewCheckpoints.reviewChangesAgainstCommit({
+        const cumulative = mission?.baselineRef && typeof config.reviewCheckpoints.reviewChangesAgainstSnapshot === "function"
+          ? await config.reviewCheckpoints.reviewChangesAgainstSnapshot({
               workspaceId: session.workspaceSessionId,
               root: workspace.root,
-              baselineCommit: mission.baselineCommit,
+              baseline: { kind: mission.baselineKind ?? "git", ref: mission.baselineRef, createdAt: mission.createdAt },
             })
           : await config.reviewCheckpoints.reviewChanges({
               workspaceId: session.workspaceSessionId,
@@ -1163,6 +1206,8 @@ export function registerBridgeTools(
           summary: cumulative.summary,
           files: cumulative.files,
           diffSha256: createHash("sha256").update(cumulative.patch).digest("hex"),
+          snapshotKind: cumulative.snapshotKind,
+          snapshotRef: cumulative.snapshotRef,
           snapshotCommit: cumulative.snapshotCommit,
         };
       }
@@ -1179,6 +1224,8 @@ export function registerBridgeTools(
         ? {
             id: latestSubmission.id,
             number: latestSubmission.submissionNumber,
+            snapshotKind: latestSubmission.snapshotKind,
+            snapshotRef: latestSubmission.snapshotRef,
             snapshotCommit: latestSubmission.snapshotCommit,
             diffSha256: latestSubmission.diffSha256,
             reviewEpoch: latestSubmission.reviewEpoch,
@@ -1202,15 +1249,15 @@ export function registerBridgeTools(
     };
   }
 
-  registerAppTool(
+  registerMutationAppTool(
     server,
     "begin_supervised_work",
     {
       title: "Begin supervised work",
-      description: "Create a durable mission contract, dispatch a coding agent, and return a model-visible supervisor packet. The mission, not the worker's self-report, controls completion.",
+      description: "Start bounded supervised delegation only when the reviewer explicitly needs a worker. Preflight a currently dispatchable registered agent before creating any mission, lease, or work-session state; ordinary review and diagnosis stay in the direct workspace. The reviewer/WebUI remains the completion authority.",
       inputSchema: {
         workspaceSessionId: z.string(),
-        objective: z.string(),
+        objective: z.string().trim().min(1),
         desiredOutcome: z.string().optional(),
         constraints: z.array(z.unknown()).optional(),
         nonGoals: z.array(z.string()).optional(),
@@ -1224,22 +1271,41 @@ export function registerBridgeTools(
         approvalMode: z.enum(["human_required", "policy_auto", "fully_automatic"]).optional(),
         workOrder: workOrderSchema.optional(),
         agentName: z.string().optional(),
+        clientMutationId: z.string().min(1).max(200).optional(),
       },
       outputSchema: { workSessionId: z.string(), runId: z.string(), status: z.string(), packet: z.unknown() },
       _meta: workspaceAppModelAndAppMeta(),
       annotations: { readOnlyHint: false },
     },
-    async ({ workspaceSessionId, objective, desiredOutcome, constraints, nonGoals, acceptanceCriteria, supervisorInstructions, maxCorrectionRounds, maxWallTimeMinutes, finalVerification, reviewCoverage, autonomyMode, approvalMode, workOrder, agentName }) => {
+    config,
+    async ({ workspaceSessionId, objective, desiredOutcome, constraints, nonGoals, acceptanceCriteria, supervisorInstructions, maxCorrectionRounds, maxWallTimeMinutes, finalVerification, reviewCoverage, autonomyMode, approvalMode, workOrder, agentName }: any) => {
       if (!isReviewer(config.principalRole)) return forbidden(config.principalRole, "begin_supervised_work");
       if (!config.missionLedger) return { content: [{ type: "text" as const, text: "Mission ledger unavailable." }], isError: true };
-      const requiredCount = (acceptanceCriteria ?? []).filter((c) => (c.priority ?? "required") === "required").length;
+      const requiredCount = (acceptanceCriteria ?? []).filter((c: any) => (c.priority ?? "required") === "required").length;
       if (requiredCount === 0) {
         return { content: [{ type: "text" as const, text: "Supervised missions require at least one required acceptance criterion." }], isError: true };
       }
       const workspace = config.workspaces.getWorkspace(workspaceSessionId);
+      const selectedAgentName = agentName ?? "cli-coding-agent";
+      const preflight = await selectHealthyAgent(config.agentRegistry.listAlive(), {
+        name: selectedAgentName,
+        role: "agent",
+        adapterSecret: config.adapterSecret,
+      });
+      if (!preflight.agent) {
+        return {
+          content: [{ type: "text" as const, text: `No healthy dispatchable ACP agent named ${selectedAgentName}; no mission, work session, or workspace lease was created. Continue in the direct workspace or retry after a healthy agent is available.` }],
+          isError: true,
+        };
+      }
       let baselineCommit: string | undefined;
+      let baselineKind: "git" | "filesystem" | undefined;
+      let baselineRef: string | undefined;
       try {
-        baselineCommit = (await config.reviewCheckpoints.reviewChanges({ workspaceId: workspaceSessionId, root: workspace.root, since: "workspace_open", markReviewed: false })).snapshotCommit;
+        const baseline = await config.reviewCheckpoints.reviewChanges({ workspaceId: workspaceSessionId, root: workspace.root, since: "workspace_open", markReviewed: false });
+        baselineCommit = baseline.snapshotCommit;
+        baselineKind = baseline.snapshotKind;
+        baselineRef = baseline.snapshotRef;
       } catch {
         baselineCommit = undefined;
       }
@@ -1269,6 +1335,8 @@ export function registerBridgeTools(
           maxCorrectionRounds,
           finalVerification,
           reviewCoverage,
+          baselineKind,
+          baselineRef,
           baselineCommit,
         });
         // Mission correction rounds are an evidence/convergence policy. They
@@ -1342,17 +1410,18 @@ export function registerBridgeTools(
     },
   );
 
-  registerAppTool(
+  registerMutationAppTool(
     server,
     "run_mission_verification",
     {
       title: "Run mission verification",
       description: "Run declared criterion verification commands only when the current workspace matches the submitted snapshot, then record server-generated evidence.",
-      inputSchema: { workSessionId: z.string(), criterionIds: z.array(z.string()).optional(), verificationScope: z.enum(["focused", "affected", "full"]).optional().describe("focused runs selected criteria, affected runs criteria whose declared areas intersect the submitted diff, and full runs all eligible criteria."), verificationPhase: z.enum(["progressive", "final"]).optional().describe("progressive runs normal correction checks; final explicitly unlocks finalOnly criteria and final integration checks."), },
+      inputSchema: { workSessionId: z.string(), criterionIds: z.array(z.string()).optional(), verificationScope: z.enum(["focused", "affected", "full"]).optional().describe("focused runs selected criteria, affected runs criteria whose declared areas intersect the submitted diff, and full runs all eligible criteria."), verificationPhase: z.enum(["progressive", "final"]).optional().describe("progressive runs normal correction checks; final explicitly unlocks finalOnly criteria and final integration checks."), clientMutationId: z.string().min(1).max(200).optional(), },
       outputSchema: { packet: z.unknown(), results: z.array(z.unknown()) },
       _meta: workspaceAppModelAndAppMeta(),
       annotations: { readOnlyHint: false },
     },
+    config,
     async ({ workSessionId, criterionIds, verificationScope, verificationPhase }) => {
       if (!isReviewer(config.principalRole)) return forbidden(config.principalRole, "run_mission_verification");
       if (!config.missionLedger) return { content: [{ type: "text" as const, text: "Mission ledger unavailable." }], isError: true };
@@ -1364,17 +1433,18 @@ export function registerBridgeTools(
     },
   );
 
-  registerAppTool(
+  registerMutationAppTool(
     server,
     "pause_supervisor_run",
     {
       title: "Pause autonomous supervision",
       description: "Durably pause new supervisor actions without cancelling the mission or deleting its recovery state.",
-      inputSchema: { workSessionId: z.string(), expectedRevision: z.number().int().positive() },
+      inputSchema: { workSessionId: z.string(), expectedRevision: z.number().int().positive(), clientMutationId: z.string().min(1).max(200).optional() },
       outputSchema: { packet: z.unknown() },
       _meta: workspaceAppModelAndAppMeta(),
       annotations: { readOnlyHint: false },
     },
+    config,
     async ({ workSessionId, expectedRevision }) => {
       if (!isReviewer(config.principalRole)) return forbidden(config.principalRole, "pause_supervisor_run");
       const current = config.supervisorRuns?.getByWorkSession(workSessionId);
@@ -1385,17 +1455,18 @@ export function registerBridgeTools(
     },
   );
 
-  registerAppTool(
+  registerMutationAppTool(
     server,
     "resume_supervisor_run",
     {
       title: "Resume autonomous supervision",
       description: "Resume a paused supervisor run from its exact prior durable state.",
-      inputSchema: { workSessionId: z.string(), expectedRevision: z.number().int().positive() },
+      inputSchema: { workSessionId: z.string(), expectedRevision: z.number().int().positive(), clientMutationId: z.string().min(1).max(200).optional() },
       outputSchema: { packet: z.unknown() },
       _meta: workspaceAppModelAndAppMeta(),
       annotations: { readOnlyHint: false },
     },
+    config,
     async ({ workSessionId, expectedRevision }) => {
       if (!isReviewer(config.principalRole)) return forbidden(config.principalRole, "resume_supervisor_run");
       const current = config.supervisorRuns?.getByWorkSession(workSessionId);
@@ -1411,17 +1482,18 @@ export function registerBridgeTools(
     },
   );
 
-  registerAppTool(
+  registerMutationAppTool(
     server,
     "redrive_supervisor_run",
     {
       title: "Redrive stalled supervisor run",
       description: "Requeue a dead-lettered supervisor action after reviewer intervention, preserving its durable audit trail.",
-      inputSchema: { workSessionId: z.string(), expectedRevision: z.number().int().positive() },
+      inputSchema: { workSessionId: z.string(), expectedRevision: z.number().int().positive(), clientMutationId: z.string().min(1).max(200).optional() },
       outputSchema: { redriven: z.number(), packet: z.unknown() },
       _meta: workspaceAppModelAndAppMeta(),
       annotations: { readOnlyHint: false },
     },
+    config,
     async ({ workSessionId, expectedRevision }) => {
       if (!isReviewer(config.principalRole)) return forbidden(config.principalRole, "redrive_supervisor_run");
       const outbox = config.dispatchOutbox;
@@ -1442,7 +1514,7 @@ export function registerBridgeTools(
     },
   );
 
-  registerAppTool(
+  registerMutationAppTool(
     server,
     "continue_supervised_work",
     {
@@ -1450,24 +1522,28 @@ export function registerBridgeTools(
       description: "Persist supervisor findings/criterion updates, create a bounded work order, request changes, and return the next supervisor packet.",
       inputSchema: {
         workSessionId: z.string(),
-        comments: z.string(),
+        comments: z.string().trim().min(1),
         findings: z.array(findingSchema).optional(),
         criterionUpdates: z.array(criterionUpdateSchema.omit({ status: true }).extend({ status: z.enum(["unverified", "partially_verified", "failed"]) })).optional(),
         findingUpdates: z.array(findingUpdateSchema).optional(),
         evidence: z.array(z.object({
           criterionId: z.string().optional(),
           submissionId: z.string().optional(),
+          snapshotKind: z.enum(["git", "filesystem"]).optional(),
+          snapshotRef: z.string().optional(),
           snapshotCommit: z.string().optional(),
           command: z.string().optional(),
           status: z.enum(["passed", "failed", "inconclusive"]),
           details: z.unknown().optional(),
         })).optional(),
         workOrder: workOrderSchema,
+        clientMutationId: z.string().min(1).max(200).optional(),
       },
       outputSchema: { status: z.string(), continuationId: z.string().optional(), extension: z.unknown().optional(), packet: z.unknown() },
       _meta: workspaceAppModelAndAppMeta(),
       annotations: { readOnlyHint: false },
     },
+    config,
     async ({ workSessionId, comments, findings, criterionUpdates, findingUpdates, evidence, workOrder }) => {
       if (!isReviewer(config.principalRole)) return forbidden(config.principalRole, "continue_supervised_work");
       if (!config.missionLedger) return { content: [{ type: "text" as const, text: "Mission ledger unavailable." }], isError: true };
@@ -1480,19 +1556,23 @@ export function registerBridgeTools(
       if (criterionUpdates?.length) config.missionLedger.updateCriterionStatus(mission.id, criterionUpdates);
       if (findingUpdates?.length) config.missionLedger.updateFindingStatus(mission.id, findingUpdates);
       if (evidence?.length) {
-        config.missionLedger.recordReviewerEvidence(mission.id, evidence.map((entry) => ({
+        config.missionLedger.recordReviewerEvidence(mission.id, evidence.map((entry: { submissionId?: string; snapshotKind?: "git" | "filesystem"; snapshotRef?: string; snapshotCommit?: string; criterionId?: string; command?: string; status: "passed" | "failed" | "inconclusive"; details?: unknown }) => ({
           ...entry,
           submissionId: entry.submissionId ?? latest.id,
-          snapshotCommit: entry.snapshotCommit ?? latest.snapshotCommit,
+          snapshotKind: entry.snapshotKind ?? latest.snapshotKind,
+          snapshotRef: entry.snapshotRef ?? latest.snapshotRef ?? latest.snapshotCommit,
+          snapshotCommit: entry.snapshotRef ?? entry.snapshotCommit ?? latest.snapshotRef ?? latest.snapshotCommit,
         })));
       }
 
       // P2 #34/#35: persist which review lenses this pass covered and any
       // explicit uncertainty so completion can end on coverage, not a timer.
-      if (workOrder.reviewCoverage?.length || workOrder.uncertainty?.length) {
+      if ((workOrder.reviewCoverage?.length || workOrder.uncertainty?.length) && (latest.snapshotRef ?? latest.snapshotCommit)) {
         config.missionLedger.recordReviewCoverage(mission.id, {
           submissionId: latest.id,
-          snapshotCommit: latest.snapshotCommit!,
+          snapshotKind: latest.snapshotKind,
+          snapshotRef: latest.snapshotRef ?? latest.snapshotCommit,
+          snapshotCommit: latest.snapshotRef ?? latest.snapshotCommit!,
           reviewCoverage: workOrder.reviewCoverage,
           uncertainty: workOrder.uncertainty,
         });
@@ -1502,8 +1582,8 @@ export function registerBridgeTools(
       // extends (bounded by a progress-aware ceiling); a non-converging runaway
       // is stopped and handed back to a human rather than auto-looping forever.
       const resolvedFindingIds = (findingUpdates ?? [])
-        .filter((u) => u.status === "verified_resolved" || u.status === "waived")
-        .map((u) => u.id);
+        .filter((u: { status: string }) => u.status === "verified_resolved" || u.status === "waived")
+        .map((u: { id: string }) => u.id);
       const extension = config.missionLedger.evaluateLoopExtension(workSessionId, {
         newFindingIds: createdFindings.map((f) => f.id),
         resolvedFindingIds,
@@ -1544,7 +1624,7 @@ export function registerBridgeTools(
     },
   );
 
-  registerAppTool(
+  registerMutationAppTool(
     server,
     "approve_supervised_work",
     {
@@ -1557,6 +1637,8 @@ export function registerBridgeTools(
         evidence: z.array(z.object({
           criterionId: z.string().optional(),
           submissionId: z.string().optional(),
+          snapshotKind: z.enum(["git", "filesystem"]).optional(),
+          snapshotRef: z.string().optional(),
           snapshotCommit: z.string().optional(),
           command: z.string().optional(),
           status: z.enum(["passed", "failed", "inconclusive"]),
@@ -1565,11 +1647,13 @@ export function registerBridgeTools(
         comments: z.string().optional(),
         reviewCoverage: z.array(z.string()).optional().describe("Review lenses covered by this approval pass; recorded before the gate evaluates coverage."),
         uncertainty: z.array(z.unknown()).optional().describe("Explicit residual-uncertainty entries recorded with the completion report."),
+        clientMutationId: z.string().min(1).max(200).optional(),
       },
       outputSchema: { status: z.string(), approved: z.boolean(), reasons: z.array(z.string()), packet: z.unknown() },
       _meta: workspaceAppModelAndAppMeta(),
       annotations: { readOnlyHint: false },
     },
+    config,
     async ({ workSessionId, criterionUpdates, findingUpdates, evidence, comments, reviewCoverage, uncertainty }) => {
       if (!isReviewer(config.principalRole)) return forbidden(config.principalRole, "approve_supervised_work");
       if (!config.missionLedger) return { content: [{ type: "text" as const, text: "Mission ledger unavailable." }], isError: true };
@@ -1581,23 +1665,27 @@ export function registerBridgeTools(
       if (criterionUpdates?.length) config.missionLedger.updateCriterionStatus(mission.id, criterionUpdates);
       if (findingUpdates?.length) config.missionLedger.updateFindingStatus(mission.id, findingUpdates);
       if (evidence?.length) {
-        config.missionLedger.recordReviewerEvidence(mission.id, evidence.map((entry) => ({
+        config.missionLedger.recordReviewerEvidence(mission.id, evidence.map((entry: { submissionId?: string; snapshotKind?: "git" | "filesystem"; snapshotRef?: string; snapshotCommit?: string; criterionId?: string; command?: string; status: "passed" | "failed" | "inconclusive"; details?: unknown }) => ({
           ...entry,
           submissionId: entry.submissionId ?? latest.id,
-          snapshotCommit: entry.snapshotCommit ?? latest.snapshotCommit,
+          snapshotKind: entry.snapshotKind ?? latest.snapshotKind,
+          snapshotRef: entry.snapshotRef ?? latest.snapshotRef ?? latest.snapshotCommit,
+          snapshotCommit: entry.snapshotRef ?? entry.snapshotCommit ?? latest.snapshotRef ?? latest.snapshotCommit,
         })));
       }
       // P2 #34/#35: coverage/uncertainty recorded on the approval attempt so
       // the gate sees exactly which lenses this reviewer visited.
-      if ((reviewCoverage?.length || uncertainty?.length) && latest.snapshotCommit) {
+      if ((reviewCoverage?.length || uncertainty?.length) && (latest.snapshotRef ?? latest.snapshotCommit)) {
         config.missionLedger.recordReviewCoverage(mission.id, {
           submissionId: latest.id,
-          snapshotCommit: latest.snapshotCommit,
+          snapshotKind: latest.snapshotKind,
+          snapshotRef: latest.snapshotRef ?? latest.snapshotCommit,
+          snapshotCommit: latest.snapshotRef ?? latest.snapshotCommit!,
           reviewCoverage,
           uncertainty,
         });
       }
-      const approval = config.missionLedger.canApprove(workSessionId, { submissionId: latest.id, snapshotCommit: latest.snapshotCommit, reviewEpoch: latest.reviewEpoch });
+      const approval = config.missionLedger.canApprove(workSessionId, { submissionId: latest.id, snapshotKind: latest.snapshotKind, snapshotRef: latest.snapshotRef ?? latest.snapshotCommit, snapshotCommit: latest.snapshotRef ?? latest.snapshotCommit, reviewEpoch: latest.reviewEpoch });
       if (!approval.allowed) {
         return {
           content: [{ type: "text" as const, text: `Approval blocked: ${approval.reasons.join("; ")}` }],
@@ -1613,7 +1701,7 @@ export function registerBridgeTools(
         verdict: "approve",
         comments,
         reviewerId: "webui",
-        completionReportSha256: config.missionLedger.getCompletionReportHash(workSessionId, { submissionId: latest.id, snapshotCommit: latest.snapshotCommit, reviewEpoch: latest.reviewEpoch }),
+          completionReportSha256: config.missionLedger.getCompletionReportHash(workSessionId, { submissionId: latest.id, snapshotKind: latest.snapshotKind, snapshotRef: latest.snapshotRef ?? latest.snapshotCommit, snapshotCommit: latest.snapshotRef ?? latest.snapshotCommit, reviewEpoch: latest.reviewEpoch }),
       });
       const supervisor = config.supervisorRuns?.getByWorkSession(workSessionId);
       if (supervisor) config.supervisorRuns?.transition({ id: supervisor.id, expectedStatus: supervisor.status, expectedRevision: supervisor.revision, nextStatus: "completed" });
@@ -1624,14 +1712,15 @@ export function registerBridgeTools(
     },
   );
 
-  registerAppTool(
+  registerMutationAppTool(
     server,
     "submit_to_coding_agent",
     {
       title: "Submit task to coding agent",
-      description: "Submit a task or instruction from the WebUI to the CLI coding agent over ACP. The coding agent executes and returns its result. (Nelson Wiggum Loop: WebUI → agent.)",
+      description: "Optional reviewer-directed delegation from the WebUI to a currently dispatchable registered coding agent. Use direct workspace tools first for review, diagnosis, and code changes; delegation is bounded and the WebUI remains the reviewer.",
       inputSchema: {
-        task: z.string().describe("Instruction or task for the coding agent."),
+        task: z.string().trim().min(1).describe("Bounded instruction or task for the coding agent."),
+        dispatchIntent: z.enum(["optional_assist", "required_delegate"]).optional().describe("Optional assistance falls back to direct workspace work when unavailable; required_delegate returns an error instead."),
         workspaceId: z.string().optional().describe("Workspace ID from open_workspace. Preferred public name; aliases workspaceSessionId."),
         workspaceSessionId: z.string().optional().describe("Workspace session ID (legacy/internal alias for workspaceId)."),
         workSessionId: z.string().optional().describe("Optional existing work session ID. If omitted, Kontrol creates one before dispatch so the agent can reuse it for submit_for_review correlation."),
@@ -1652,22 +1741,27 @@ export function registerBridgeTools(
           approvalMode: z.enum(["human_required", "policy_auto", "fully_automatic"]).optional(),
           workOrder: workOrderSchema.optional(),
         }).optional().describe("Optional durable mission contract. When present, WebUI approval is mission-gated rather than only snapshot-gated."),
+        clientMutationId: z.string().min(1).max(200).optional(),
       },
       outputSchema: {
-        runId: z.string(),
+        runId: z.string().optional(),
         remoteRunId: z.string().optional(),
         workSessionId: z.string(),
         workspaceSessionId: z.string(),
         status: z.string(),
-        output: z.string(),
+        output: z.string().optional(),
         error: z.string().optional(),
+        retryable: z.boolean().optional(),
+        fallback: z.string().optional(),
+        reason: z.string().optional(),
       },
       _meta: workspaceAppModelAndAppMeta(),
       annotations: { readOnlyHint: false },
     },
-    async ({ task, workspaceId, workspaceSessionId, workSessionId, sessionId, agentName, completionPolicy, missionContract }) => {
+    config,
+    async ({ task, dispatchIntent = "optional_assist", workspaceId, workspaceSessionId, workSessionId, sessionId, agentName, completionPolicy, missionContract }) => {
       // ROLE CHECK: submit_to_coding_agent (Nelson Wiggum Loop: WebUI → agent)
-      // is reviewer/client only. A worker (coding agent) must not be able to
+      // is reviewer or ordinary client only. A worker (coding agent) must not be able to
       // spawn further coding agents or self-delegate.
       if (!isReviewer(config.principalRole)) {
         return forbidden(config.principalRole, "submit_to_coding_agent");
@@ -1685,7 +1779,7 @@ export function registerBridgeTools(
 
       const selectedAgentName = agentName ?? "cli-coding-agent";
       if (missionContract) {
-        const requiredCount = (missionContract.acceptanceCriteria ?? []).filter((c) => (c.priority ?? "required") === "required").length;
+        const requiredCount = (missionContract.acceptanceCriteria ?? []).filter((c: { priority?: string }) => (c.priority ?? "required") === "required").length;
         if (requiredCount === 0) {
           return { content: [{ type: "text" as const, text: "Mission contract requires at least one required acceptance criterion." }], isError: true };
         }
@@ -1703,15 +1797,14 @@ export function registerBridgeTools(
         const dead = selection.deadUrls.length
           ? ` Dead/ unhealthy endpoints found: ${selection.deadUrls.join("; ")}.`
           : "";
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `No healthy ACP agent named ${selectedAgentName} (role=agent) is registered.${dead} Register a working ACP HTTP endpoint via POST /acp/agents/register.`,
-            },
-          ],
-          isError: true,
-        };
+        const reason = `No healthy dispatchable ACP agent named ${selectedAgentName} (role=agent) is registered.${dead}`;
+        if (dispatchIntent === "optional_assist") {
+          return {
+            content: [{ type: "text" as const, text: `${reason} Continue in the direct workspace; no alternate ACP route was attempted.` }],
+            structuredContent: { status: "unavailable", retryable: false, fallback: "direct_workspace", reason },
+          };
+        }
+        return { content: [{ type: "text" as const, text: reason }], isError: true };
       }
       const peer = selection.agent;
 
@@ -1798,8 +1891,13 @@ export function registerBridgeTools(
         if (missionContract && config.missionLedger) {
           const workspace = config.workspaces.getWorkspace(workspaceSessionId);
           let baselineCommit: string | undefined;
+          let baselineKind: "git" | "filesystem" | undefined;
+          let baselineRef: string | undefined;
           try {
-            baselineCommit = (await config.reviewCheckpoints.reviewChanges({ workspaceId: workspaceSessionId, root: workspace.root, since: "workspace_open", markReviewed: false })).snapshotCommit;
+            const baseline = await config.reviewCheckpoints.reviewChanges({ workspaceId: workspaceSessionId, root: workspace.root, since: "workspace_open", markReviewed: false });
+            baselineCommit = baseline.snapshotCommit;
+            baselineKind = baseline.snapshotKind;
+            baselineRef = baseline.snapshotRef;
           } catch {
             baselineCommit = undefined;
           }
@@ -1814,6 +1912,8 @@ export function registerBridgeTools(
             supervisorInstructions: missionContract.supervisorInstructions,
             maxCorrectionRounds: missionContract.maxCorrectionRounds,
             finalVerification: missionContract.finalVerification,
+            baselineKind,
+            baselineRef,
             baselineCommit,
           });
           supervisorRun = config.supervisorRuns?.create({
@@ -1876,7 +1976,7 @@ export function registerBridgeTools(
 
   // ── Provide Review Feedback ────────────────────────
 
-  registerAppTool(
+  registerMutationAppTool(
     server,
     "provide_review_feedback",
     {
@@ -1892,17 +1992,25 @@ export function registerBridgeTools(
         requiredActions: z.array(z.string()).optional().describe("Specific actions the agent must take before resubmitting."),
         allowedNextActions: z.array(z.string()).optional().describe("Actions the agent is permitted to take next (e.g. edit_files, run_commands, resubmit)."),
         reviewerId: z.string().optional().describe("Identifier of the reviewer."),
+        clientMutationId: z.string().min(1).max(200).optional(),
       },
       outputSchema: { status: z.string(), verdict: z.string() },
       _meta: workspaceAppModelAndAppMeta(),
       annotations: { readOnlyHint: false },
     },
+    config,
     async ({ sessionId, verdict, comments, requiredActions, allowedNextActions, reviewerId, submissionId, diffSha256, reviewEpoch }) => {
       // ROLE CHECK: provide_review_feedback is reviewer-only (or an ordinary
       // client). A worker (coding agent) must never be able to review/approve
       // its own submitted work.
       if (!isReviewer(config.principalRole)) {
         return forbidden(config.principalRole, "provide_review_feedback");
+      }
+      if (verdict === "changes_requested" && !comments?.trim()) {
+        return {
+          content: [{ type: "text" as const, text: "Request Changes requires nonempty instructions for the agent." }],
+          isError: true,
+        };
       }
 
       const session = config.workSessions.get(sessionId);
@@ -2438,7 +2546,7 @@ export function registerBridgeTools(
 
   // ── Mark Continuation Consumed ──────────────────────
 
-  registerAppTool(
+  registerMutationAppTool(
     server,
     "mark_continuation_consumed",
     {
@@ -2446,11 +2554,13 @@ export function registerBridgeTools(
       description: "Mark a continuation as consumed after acting on it. Prevents the same feedback from being applied twice.",
       inputSchema: {
         continuationId: z.string().describe("Continuation ID to mark as consumed."),
+        clientMutationId: z.string().min(1).max(200).optional(),
       },
       outputSchema: { status: z.string() },
       _meta: {},
       annotations: { readOnlyHint: false },
     },
+    config,
     async ({ continuationId }) => {
       const continuation = config.continuationManager.get(continuationId);
       if (!continuation) {
@@ -2637,7 +2747,7 @@ export function registerBridgeTools(
 
   // ── Agent → WebUI messages / artifacts (item 6) ────
 
-  registerAppTool(
+  registerMutationAppTool(
     server,
     "post_agent_message",
     {
@@ -2649,11 +2759,13 @@ export function registerBridgeTools(
         title: z.string().optional().describe("Short headline."),
         body: z.string().optional().describe("Message text / question / description."),
         data: z.record(z.string(), z.unknown()).optional().describe("Structured payload: artifact ref, finding evidence, or answer options."),
+        clientMutationId: z.string().min(1).max(200).optional(),
       },
       outputSchema: { messageId: z.string(), status: z.string(), kind: z.string() },
       _meta: workspaceAppModelAndAppMeta(),
       annotations: { readOnlyHint: false },
     },
+    config,
     async ({ sessionId, kind, title, body, data }) => {
       if (!isWorkerOrClient(config.principalRole)) {
         return forbidden(config.principalRole, "post_agent_message");
@@ -2667,28 +2779,36 @@ export function registerBridgeTools(
       if (bind) return bind;
 
       const run = config.agentRegistry.getRunByWorkSessionId(sessionId);
-      const message = config.agentMessages.post({
-        workSessionId: sessionId,
-        runId: run?.runId,
-        kind: kind as (typeof AGENT_MESSAGE_KINDS)[number],
-        author: config.principalRole === "worker" ? "worker" : "agent",
-        title,
-        body,
-        data,
-      });
-      // Durable wakeup so the WebUI watcher renders it without polling.
-      config.eventStore.appendEvent({
-        type: "agent.message.posted",
-        sessionId,
-        payload: {
-          messageId: message.id,
-          kind: message.kind,
-          title: message.title,
-          body: message.body,
-          status: message.status,
+      const commit = () => {
+        const message = config.agentMessages!.post({
+          workSessionId: sessionId,
           runId: run?.runId,
-        },
-      });
+          kind: kind as (typeof AGENT_MESSAGE_KINDS)[number],
+          author: config.principalRole === "worker" ? "worker" : "agent",
+          title,
+          body,
+          data,
+        });
+        // The event is inserted in the same SQLite transaction as the message;
+        // publish only after commit so a live WebUI can never observe a
+        // projection event whose durable message row rolled back.
+        const event = config.eventStore.appendEvent({
+          type: "agent.message.posted",
+          sessionId,
+          payload: {
+            messageId: message.id,
+            kind: message.kind,
+            title: message.title,
+            body: message.body,
+            status: message.status,
+            runId: run?.runId,
+          },
+        }, { publish: false });
+        return { message, event };
+      };
+      const committed = config.db ? config.db.sqlite.transaction(commit)() : commit();
+      config.eventStore.publishEvents([committed.event]);
+      const message = committed.message;
       return {
         content: [{ type: "text" as const, text: `Posted ${message.kind} (${message.id}).` }],
         structuredContent: { messageId: message.id, status: message.status, kind: message.kind },
@@ -2744,7 +2864,7 @@ export function registerBridgeTools(
     },
   );
 
-  registerAppTool(
+  registerMutationAppTool(
     server,
     "resolve_agent_message",
     {
@@ -2754,11 +2874,13 @@ export function registerBridgeTools(
         sessionId: z.string().describe("Work session ID."),
         messageId: z.string().describe("The agent message to resolve."),
         reply: z.string().optional().describe("Answer / resolution text sent back to the worker."),
+        clientMutationId: z.string().min(1).max(200).optional(),
       },
       outputSchema: { messageId: z.string(), status: z.string() },
       _meta: {},
       annotations: { readOnlyHint: false },
     },
+    config,
     async ({ sessionId, messageId, reply }) => {
       if (!isReviewer(config.principalRole)) {
         return forbidden(config.principalRole, "resolve_agent_message");
@@ -2770,12 +2892,18 @@ export function registerBridgeTools(
       if (!existing || existing.workSessionId !== sessionId) {
         return { content: [{ type: "text" as const, text: "Message not found for this session." }], isError: true };
       }
-      const resolved = config.agentMessages.resolve(messageId);
-      config.eventStore.appendEvent({
-        type: "agent.message.resolved",
-        sessionId,
-        payload: { messageId, reply, replyToKind: existing.kind },
-      });
+      const commit = () => {
+        const resolved = config.agentMessages!.resolve(messageId);
+        const event = config.eventStore.appendEvent({
+          type: "agent.message.resolved",
+          sessionId,
+          payload: { messageId, reply, replyToKind: existing.kind },
+        }, { publish: false });
+        return { resolved, event };
+      };
+      const committed = config.db ? config.db.sqlite.transaction(commit)() : commit();
+      config.eventStore.publishEvents([committed.event]);
+      const resolved = committed.resolved;
       return {
         content: [{ type: "text" as const, text: `Resolved ${messageId}.` }],
         structuredContent: { messageId, status: resolved?.status ?? "resolved" },
@@ -2793,7 +2921,7 @@ export function registerBridgeTools(
     "get_work_session_snapshot",
     {
       title: "Get work session snapshot",
-      description: "Return a compact projection of a work session's current state (status, workspace, latest submission/feedback, mission summary, last event seq) so the WebUI can hydrate without replaying the event log. The client should then call await_work_session_events with afterSeq = snapshot.lastSeq to receive only new activity.",
+      description: "Return a compact projection of a work session's current state (status, workspace, latest submission/feedback, mission summary, last event seq) so the WebUI reviewer can hydrate without replaying the event log. The caller should then call await_work_session_events with afterSeq = snapshot.lastSeq to receive only new activity.",
       inputSchema: {
         sessionId: z.string().describe("Work session ID to snapshot."),
       },
@@ -2804,6 +2932,7 @@ export function registerBridgeTools(
         title: z.string().optional(),
         submittedBy: z.string(),
         runId: z.string().optional(),
+        lastHeartbeatAt: z.string().optional(),
         submissionCount: z.number(),
         lastSeq: z.number(),
         updatedAt: z.string(),
@@ -2823,6 +2952,16 @@ export function registerBridgeTools(
           comments: z.string().optional(),
           reviewerId: z.string().optional(),
         }).optional(),
+        recentActivity: z.array(z.object({
+          id: z.string(),
+          seq: z.number(),
+          durable: z.boolean().optional(),
+          type: z.string(),
+          sessionId: z.string(),
+          workspaceSessionId: z.string().optional(),
+          payload: z.record(z.string(), z.unknown()),
+          createdAt: z.string(),
+        })).optional(),
         hasMission: z.boolean(),
         missionSummary: z.object({
           objective: z.string().optional(),
@@ -2903,6 +3042,12 @@ export function registerBridgeTools(
       // Get the last event seq for this session so the client can resume from there.
       const lastEvent = config.eventStore.getLatestEvent(sessionId);
       const lastSeq = lastEvent?.seq ?? 0;
+      // Keep a bounded, durable activity tail in the snapshot. The live
+      // watcher starts strictly after lastSeq, so reconnecting restores the
+      // visible timeline without replaying or duplicating this tail.
+      const recentActivity = lastSeq > 0
+        ? config.eventStore.getEventsAfter(sessionId, Math.max(0, lastSeq - 50), 50)
+        : [];
 
       // P0 #6: Expand snapshot to include pending approvals and agent messages
       const pendingApprovals = config.approvalRequests
@@ -2948,6 +3093,7 @@ export function registerBridgeTools(
           title: session.title,
           submittedBy: session.submittedBy,
           runId: run?.runId,
+          lastHeartbeatAt: run?.lastHeartbeatAt ?? undefined,
           submissionCount: config.workSessions.getSubmissions(sessionId).length,
           lastSeq,
           updatedAt: session.updatedAt,
@@ -2967,6 +3113,7 @@ export function registerBridgeTools(
             comments: latestFeedback.comments ?? undefined,
             reviewerId: latestFeedback.reviewerId ?? undefined,
           } : undefined,
+          recentActivity,
           hasMission,
           missionSummary,
           // P0 #6: Include pending approvals and agent messages for full recovery
@@ -3000,7 +3147,7 @@ export function registerBridgeTools(
       inputSchema: {
         workspaceId: z.string().describe("Workspace ID to scope the session surface."),
         limit: z.number().int().min(1).max(200).optional().default(50),
-        filter: z.enum(["all", "pending_review", "live"]).optional().default("all"),
+        filter: z.enum(["all", "pending_review", "stale_pending_review", "live"]).optional().default("all"),
         afterUpdatedAt: z.string().optional().describe("Return sessions strictly older than this updatedAt cursor."),
         afterSessionId: z.string().optional().describe("Tie-breaker for afterUpdatedAt; use the last sessionId from the previous page."),
       },
@@ -3016,6 +3163,7 @@ export function registerBridgeTools(
           submittedBy: z.string(),
           updatedAt: z.string(),
           runId: z.string().optional(),
+          lastHeartbeatAt: z.string().optional(),
           hasMission: z.boolean(),
           missionStatus: z.string().optional(),
           missionCycleNumber: z.number().optional(),
@@ -3210,21 +3358,23 @@ export function registerBridgeTools(
 
   // ── Session Handoff between agents (item 7) ────────
 
-  registerAppTool(
+  registerMutationAppTool(
     server,
     "handoff_work_session",
     {
       title: "Hand off work session to another agent",
-      description: "Reassign an in-flight work session to a different registered CLI agent (e.g. hand investigation from CRUSH to Hermes, or route a review to a dedicated reviewer agent). The session, workspace, mission, submissions, and review history are preserved; only the agent that will handle the NEXT resume changes. The handoff takes effect on the next continuation dispatch — a currently-parked worker is not force-killed unless you also cancel it.",
+      description: "Reassign an in-flight work session to a different registered coding agent for the next bounded continuation. The session, workspace, mission, submissions, and review history are preserved; the WebUI remains the reviewer and completion authority. A currently parked worker is not force-killed unless you also cancel it.",
       inputSchema: {
         sessionId: z.string().describe("Work session ID to hand off."),
         toAgent: z.string().describe("Name of the target registered agent (role=agent)."),
         reason: z.string().optional().describe("Why the session is being handed off (recorded)."),
+        clientMutationId: z.string().min(1).max(200).optional(),
       },
       outputSchema: { sessionId: z.string(), fromAgent: z.string().optional(), toAgent: z.string(), status: z.string() },
       _meta: {},
       annotations: { readOnlyHint: false },
     },
+    config,
     async ({ sessionId, toAgent, reason }) => {
       if (!isReviewer(config.principalRole)) {
         return forbidden(config.principalRole, "handoff_work_session");
@@ -3281,7 +3431,7 @@ export function registerBridgeTools(
 
   // ── Cancel Work Session ────────────────────────────
 
-  registerAppTool(
+  registerMutationAppTool(
     server,
     "cancel_work_session",
     {
@@ -3289,11 +3439,13 @@ export function registerBridgeTools(
       description: "Abandon a work session. Transitions status to cancelled, wakes blocked waiters, supersedes pending continuations, and requests remote worker cancellation.",
       inputSchema: {
         sessionId: z.string().describe("Work session ID to cancel."),
+        clientMutationId: z.string().min(1).max(200).optional(),
       },
       outputSchema: { status: z.string(), sessionId: z.string(), remoteCancellation: z.unknown().optional() },
       _meta: {},
       annotations: { readOnlyHint: false },
     },
+    config,
     async ({ sessionId }) => {
       if (config.principalRole !== "reviewer" && config.principalRole !== "worker") {
         return forbidden(config.principalRole, "cancel_work_session");
@@ -3323,27 +3475,40 @@ export function registerBridgeTools(
 
   // ── Call ACP Agent (gateway) ────────────────────────
 
-  registerAppTool(
+  registerMutationAppTool(
     server,
     "call_acp_agent",
     {
       title: "Call ACP agent",
-      description: "Route a task to a registered ACP-compatible agent. Requires workspace correlation so the adapter can run in the correct workspace.",
+      description: "Optional reviewer-directed delegation to a currently dispatchable registered ACP agent. Use direct workspace tools first for review, diagnosis, and edits; this bounded path requires workspace correlation and never transfers reviewer authority.",
       inputSchema: {
         agentName: z.string().describe("Name of the target ACP agent."),
-        task: z.string().describe("Task description for the remote agent."),
+        task: z.string().trim().min(1).describe("Bounded task description for the remote agent."),
+        dispatchIntent: z.enum(["optional_assist", "required_delegate"]).optional().describe("Use optional_assist when delegation is helpful but direct workspace work is an acceptable fallback; required_delegate preserves an error when no healthy agent is available."),
         workspaceId: z.string().optional().describe("Workspace ID from open_workspace. Preferred public name; aliases workspaceSessionId."),
         workspaceSessionId: z.string().optional().describe("Workspace session ID (legacy/internal alias for workspaceId)."),
         workSessionId: z.string().optional().describe("Optional existing work session ID."),
         sessionId: z.string().optional().describe("Legacy alias for workSessionId."),
         agentUrl: z.string().optional().describe("Deprecated and rejected. Agents must be selected from the trusted registry."),
         webhookUrl: z.string().optional().describe("Deprecated and rejected. Agent progress is tracked through Kontrol events."),
+        clientMutationId: z.string().min(1).max(200).optional(),
       },
-      outputSchema: { runId: z.string(), workSessionId: z.string().optional(), workspaceSessionId: z.string().optional(), status: z.string(), output: z.string(), error: z.string().optional() },
+      outputSchema: {
+        runId: z.string().optional(),
+        workSessionId: z.string().optional(),
+        workspaceSessionId: z.string().optional(),
+        status: z.string(),
+        output: z.string().optional(),
+        error: z.string().optional(),
+        retryable: z.boolean().optional(),
+        fallback: z.string().optional(),
+        reason: z.string().optional(),
+      },
       _meta: {},
       annotations: { readOnlyHint: false },
     },
-    async ({ agentName, task, workspaceId, workspaceSessionId, workSessionId, sessionId, agentUrl, webhookUrl }) => {
+    config,
+    async ({ agentName, task, dispatchIntent = "required_delegate", workspaceId, workspaceSessionId, workSessionId, sessionId, agentUrl, webhookUrl }) => {
       if (!isReviewer(config.principalRole)) {
         return forbidden(config.principalRole, "call_acp_agent");
       }
@@ -3362,7 +3527,16 @@ export function registerBridgeTools(
         role: "agent",
         adapterSecret: config.adapterSecret,
       });
-      if (!selection.agent) return { content: [{ type: "text" as const, text: `No healthy registered ACP agent named "${agentName}".` }], isError: true };
+      if (!selection.agent) {
+        const reason = `No healthy dispatchable registered ACP agent named "${agentName}".`;
+        if (dispatchIntent === "optional_assist") {
+          return {
+            content: [{ type: "text" as const, text: `${reason} Continue in the direct workspace; no alternate ACP route was attempted.` }],
+            structuredContent: { status: "unavailable", retryable: false, fallback: "direct_workspace", reason },
+          };
+        }
+        return { content: [{ type: "text" as const, text: reason }], isError: true };
+      }
       const createdWorkSession = !workSessionId;
       const wsId = workSessionId ?? config.workSessions.create({
         workspaceSessionId,
@@ -3422,9 +3596,24 @@ export function registerBridgeTools(
     "discover_agents",
     {
       title: "Discover agents",
-      description: "List all registered peer agents in the registry. Returns alive agents that can be called via call_acp_agent.",
+      description: "Inspect every registered peer and probe its protocol readiness. Clearly separates dispatchable agents from unavailable, dead, non-agent, or unsupported-transport entries; only alive role=agent peers with a successful HTTP ACP probe are dispatchable.",
       inputSchema: {},
-      outputSchema: { agents: z.array(z.object({ name: z.string(), url: z.string(), alive: z.boolean(), capabilities: z.array(z.string()) })) },
+      outputSchema: {
+        agents: z.array(z.object({
+          name: z.string(),
+          url: z.string(),
+          role: z.string(),
+          alive: z.boolean(),
+          healthy: z.boolean(),
+          dispatchable: z.boolean(),
+          probeStatus: z.number().int(),
+          probeNote: z.string().optional(),
+          capabilities: z.array(z.string()),
+          checkedAt: z.string(),
+        })),
+        available: z.array(z.string()),
+        unavailable: z.array(z.string()),
+      },
       _meta: {},
       annotations: { readOnlyHint: true },
     },
@@ -3433,105 +3622,48 @@ export function registerBridgeTools(
         return forbidden(config.principalRole, "discover_agents");
       }
       const all = config.agentRegistry.listAll();
-      const alive = all.filter((a) => a.alive);
-      // Probe each alive peer for protocol readiness so a stale/gRPC-only endpoint
-      // is reported as unhealthy rather than merely "alive".
+      // Probe every entry so the result is an auditable all-agent inventory.
       const health = await Promise.all(
-        alive.map(async (a) => {
-          if (!/^https?:\/\//.test(a.url)) {
-            return { a, probe: { healthy: true, status: 0, note: "n/a (non-http endpoint)" } as const };
-          }
-          return { a, probe: await probeAgent(a.url, config.adapterSecret) };
+        all.map(async (a) => {
+          const probe = a.alive
+            ? await probeAgent(a.url, config.adapterSecret)
+            : { healthy: false, status: 0, note: "agent heartbeat is not alive" };
+          return { a, probe, checkedAt: new Date().toISOString() };
         }),
       );
-      const text = alive.length > 0
-        ? `Discovered ${alive.length} agent(s):\n${health.map(({ a, probe }) => `  ${a.name} → ${a.url} [${probe.note ? probe.note : probe.healthy ? "healthy" : "UNHEALTHY: " + (probe.error ?? "HTTP " + probe.status)}] (${a.capabilities.join(", ") || "no capabilities"})`).join("\n")}`
-        : "No agents discovered. Register agents via the ACP /agents/register endpoint or configure knownAgents.";
+      const available = health.filter(({ a, probe }) => a.alive && a.role === "agent" && probe.healthy).map(({ a }) => a.name);
+      const unavailable = health.filter(({ a, probe }) => !(a.alive && a.role === "agent" && probe.healthy)).map(({ a }) => a.name);
+      const text = health.length > 0
+        ? `Dispatchable agents: ${available.length ? available.join(", ") : "none"}. Unavailable: ${unavailable.length ? unavailable.join(", ") : "none"}. Continue directly in the workspace when no dispatchable agent is available.`
+        : "No registered agents. Continue directly in the workspace; no alternate ACP route is available.";
 
       return {
         content: [{ type: "text" as const, text }],
         structuredContent: {
-          agents: all.map((a) => {
-            const h = health.find((x) => x.a.id === a.id)?.probe;
-            return { name: a.name, url: a.url, alive: a.alive, healthy: h?.healthy, capabilities: a.capabilities };
-          }),
+          agents: health.map(({ a, probe, checkedAt }) => ({
+            name: a.name,
+            url: a.url,
+            role: a.role,
+            alive: a.alive,
+            healthy: probe.healthy,
+            dispatchable: a.alive && a.role === "agent" && probe.healthy,
+            probeStatus: probe.status,
+            probeNote: probe.note ?? probe.error,
+            capabilities: a.capabilities,
+            checkedAt,
+          })),
+          available,
+          unavailable,
         },
       };
     },
   );
 
-  // ── Dynamic tools for configured known agents ───────
-
-  for (const agent of config.knownAgents) {
-    const safeName = agent.name.replace(/[^a-zA-Z0-9_]/g, "_");
-    registerAppTool(
-      server,
-      `route_to_${safeName}`,
-      {
-        title: `Route to ${agent.name}`,
-        description: `Route a task to configured agent "${agent.name}" at ${agent.url}.${agent.description ? ` ${agent.description}` : ""}`,
-        inputSchema: {
-          task: z.string().describe("Task description."),
-          workspaceId: z.string().optional().describe("Workspace ID from open_workspace. Preferred public name; aliases workspaceSessionId."),
-          workspaceSessionId: z.string().optional().describe("Workspace session ID (legacy/internal alias for workspaceId)."),
-          workSessionId: z.string().optional().describe("Optional existing work session ID."),
-          sessionId: z.string().optional().describe("Legacy alias for workSessionId."),
-        },
-        outputSchema: { runId: z.string(), workSessionId: z.string().optional(), workspaceSessionId: z.string().optional(), status: z.string(), output: z.string() },
-        _meta: {},
-        annotations: { readOnlyHint: false },
-      },
-      async ({ task, workspaceId, workspaceSessionId, workSessionId, sessionId }) => {
-        if (!isReviewer(config.principalRole)) {
-          return forbidden(config.principalRole, `route_to_${safeName}`);
-        }
-        const resolved = resolveDelegationContext(config, { workspaceId, workspaceSessionId, workSessionId, sessionId });
-        if (resolved.error || !resolved.workspaceSessionId) {
-          return { content: [{ type: "text" as const, text: resolved.error ?? "Unknown workspace." }], isError: true };
-        }
-        const resolvedWorkspaceSessionId = resolved.workspaceSessionId;
-        const createdWorkSession = !resolved.workSessionId;
-        const resolvedWorkSessionId = resolved.workSessionId ?? config.workSessions.create({
-          workspaceSessionId: resolvedWorkspaceSessionId,
-          submittedBy: "webui",
-          title: task.slice(0, 80),
-          completionPolicy: "webui_approval_required",
-        }).id;
-        const leaseError = await acquireCheckoutModifyLease(config, resolvedWorkspaceSessionId, resolvedWorkSessionId);
-        if (leaseError) {
-          if (!resolved.workSessionId) config.workSessions.updateStatus(resolvedWorkSessionId, "cancelled");
-          return leaseError;
-        }
-        try {
-          const result = await callRemoteAgent(
-            { agentRegistry: config.agentRegistry, workspaces: config.workspaces, workSessions: config.workSessions, adapterSecret: config.adapterSecret },
-            {
-              agentUrl: agent.url,
-              agentName: agent.name,
-              task: `${task}\n\n${workSessionInstructions(resolvedWorkSessionId, config.agentRegistry.listAlive().find((candidate) => candidate.name === agent.name))}`,
-              workspaceSessionId: resolvedWorkspaceSessionId,
-              workSessionId: resolvedWorkSessionId,
-              workspaceLeaseNonce: checkoutLeaseNonce(config, resolvedWorkSessionId),
-              mode: "async",
-              fireAndForget: true,
-            },
-          );
-          if (result.status === "failed") {
-            if (createdWorkSession) config.workSessions.updateStatus(resolvedWorkSessionId, "failed");
-            config.workSessions.releaseWorkspaceLeasesForSession(resolvedWorkSessionId);
-            config.eventStore.appendEvent({ type: "agent.dispatch.failed", sessionId: resolvedWorkSessionId, payload: { runId: result.runId, reason: result.error ?? "ACP dispatch failed" } });
-            return { content: [{ type: "text" as const, text: `${agent.name}: failed\n${result.error ?? "ACP dispatch failed"}` }], structuredContent: { runId: result.runId, workSessionId: resolvedWorkSessionId, workspaceSessionId: resolvedWorkspaceSessionId, status: result.status, output: result.output, error: result.error }, isError: true };
-          }
-          return { content: [{ type: "text" as const, text: `${agent.name}: ${result.status}\n${result.output.slice(0, 5000)}` }], structuredContent: { runId: result.runId, workSessionId: resolvedWorkSessionId, workspaceSessionId: resolvedWorkspaceSessionId, status: result.status, output: result.output } };
-        } catch (error) {
-          if (createdWorkSession) config.workSessions.updateStatus(resolvedWorkSessionId, "failed");
-          config.workSessions.releaseWorkspaceLeasesForSession(resolvedWorkSessionId);
-          config.eventStore.appendEvent({ type: "agent.dispatch.failed", sessionId: resolvedWorkSessionId, payload: { reason: error instanceof Error ? error.message : String(error) } });
-          return { content: [{ type: "text" as const, text: `Failed: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
-        }
-      },
-    );
-  }
+  // Initial delegation has one model-facing path: discover_agents followed by
+  // submit_to_coding_agent/call_acp_agent. Configured URL-specific route tools
+  // were intentionally removed because they bypassed health selection and
+  // made an unavailable peer look dispatchable. Continuation redelivery and
+  // explicit handoff remain separate durable paths.
 
   // NOTE: the continuation dispatcher is started explicitly by the server
   // (via startContinuationDispatcher) so it can be omitted in tests.

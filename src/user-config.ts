@@ -1,12 +1,18 @@
 import { randomBytes } from "node:crypto";
 import {
+  chmodSync,
+  closeSync,
   existsSync,
+  fsyncSync,
   mkdirSync,
+  openSync,
   readFileSync,
+  renameSync,
+  rmSync,
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { expandHomePath } from "./roots.js";
 
 export interface KontrolUserConfig {
@@ -71,7 +77,7 @@ export function writeKontrolConfig(
   env: NodeJS.ProcessEnv = process.env,
 ): string {
   const filePath = kontrolConfigPath(env);
-  mkdirSync(kontrolConfigDir(env), { recursive: true });
+  ensureConfigDirectory(kontrolConfigDir(env));
   writeJsonFile(filePath, config, 0o600);
   return filePath;
 }
@@ -81,7 +87,7 @@ export function writeKontrolAuth(
   env: NodeJS.ProcessEnv = process.env,
 ): string {
   const filePath = kontrolAuthPath(env);
-  mkdirSync(kontrolConfigDir(env), { recursive: true });
+  ensureConfigDirectory(kontrolConfigDir(env));
   writeJsonFile(filePath, auth, 0o600);
   return filePath;
 }
@@ -100,5 +106,28 @@ function readJsonFile<T>(filePath: string): T {
 }
 
 function writeJsonFile(filePath: string, value: unknown, mode: number): void {
-  writeFileSync(filePath, JSON.stringify(value, null, 2) + "\n", { mode });
+  const directory = dirname(filePath);
+  const temporaryPath = join(directory, `.${basename(filePath)}.tmp-${process.pid}-${randomBytes(6).toString("hex")}`);
+  const contents = JSON.stringify(value, null, 2) + "\n";
+  let descriptor: number | undefined;
+  try {
+    descriptor = openSync(temporaryPath, "wx", mode);
+    writeFileSync(descriptor, contents, { encoding: "utf8" });
+    fsyncSync(descriptor);
+    closeSync(descriptor);
+    descriptor = undefined;
+    chmodSync(temporaryPath, mode);
+    renameSync(temporaryPath, filePath);
+    // The mode passed to open/write does not tighten an existing destination.
+    chmodSync(filePath, mode);
+  } catch (error) {
+    if (descriptor !== undefined) closeSync(descriptor);
+    rmSync(temporaryPath, { force: true });
+    throw error;
+  }
+}
+
+function ensureConfigDirectory(directory: string): void {
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  chmodSync(directory, 0o700);
 }

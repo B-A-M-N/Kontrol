@@ -42,6 +42,10 @@ try {
   });
   assert.deepEqual(authHeadersForAgent("http://0.0.0.0:9877", "secret"), {});
   assert.deepEqual(authHeadersForAgent("https://agent.example.test", "secret"), {});
+  const unsupportedProbe = await probeAgent("stdio://agent");
+  assert.equal(unsupportedProbe.healthy, false, "non-HTTP ACP transports are not dispatchable by the HTTP gateway");
+  assert.equal(unsupportedProbe.status, 0);
+  assert.match(unsupportedProbe.note ?? "", /unsupported probe transport/);
 
   {
     let postAuth: string | undefined;

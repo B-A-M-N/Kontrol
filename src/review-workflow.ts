@@ -7,7 +7,7 @@ import type { EventStoreEvent } from "./event-log.js";
 import type { ContinuationManager, CreateContinuationInput } from "./continuation.js";
 import type { AgentRegistryManager } from "./acp-registry.js";
 import type { WorkspaceRegistry } from "./workspaces.js";
-import type { ReviewCheckpointManager, ReviewFile } from "./review-checkpoints.js";
+import type { ReviewCheckpointManager, ReviewFile, WorkspaceSnapshot, WorkspaceSnapshotKind } from "./review-checkpoints.js";
 import type { MissionLedger } from "./mission-ledger.js";
 import type { DispatchOutbox } from "./dispatch-outbox.js";
 
@@ -49,7 +49,9 @@ export interface SubmitForReviewInput {
   additions?: number;
   removals?: number;
   diffSha256?: string;
-  /** Exact working-tree snapshot commit the diff was captured against. */
+  snapshotKind?: WorkspaceSnapshotKind;
+  snapshotRef?: string;
+  /** @deprecated Legacy Git projection retained for old clients. */
   snapshotCommit?: string;
 }
 
@@ -203,6 +205,8 @@ export function createReviewWorkflowService(
         summaryJson: input.summaryJson,
         files: input.changedFiles,
         diffSha256: input.diffSha256,
+        snapshotKind: input.snapshotKind,
+        snapshotRef: input.snapshotRef,
         snapshotCommit: input.snapshotCommit,
       });
 
@@ -302,6 +306,11 @@ export function createReviewWorkflowService(
     // Scoped to approval only: a reviewer must still be able to reject or
     // request changes on a stale/changed workspace.
     if (session.completionPolicy === "webui_approval_required" && input.verdict === "approve") {
+      const pendingSnapshot: WorkspaceSnapshot | undefined = currentPending.snapshotKind && currentPending.snapshotRef
+        ? { kind: currentPending.snapshotKind, ref: currentPending.snapshotRef, createdAt: currentPending.createdAt }
+        : currentPending.snapshotCommit
+          ? { kind: "git", ref: currentPending.snapshotCommit, createdAt: currentPending.createdAt }
+          : undefined;
       const missionApproval = missionLedger?.canApprove(input.sessionId, {
         submissionId: currentPending.id,
         snapshotCommit: currentPending.snapshotCommit,
@@ -335,19 +344,25 @@ export function createReviewWorkflowService(
       // for a new `workspace_open` snapshot can produce a different commit ID
       // even when the tree is byte-for-byte identical.  Compare the live tree
       // with the submitted snapshot directly instead.
-      if (!currentPending.snapshotCommit) {
+      if (!pendingSnapshot) {
         throw new WorkflowError(
           `Submission ${input.submissionId} has no bound workspace snapshot.`,
           "stale_submission",
           409,
         );
       }
-      const current = await reviewCheckpoints.reviewChangesAgainstCommit({
-        workspaceId: session.workspaceSessionId,
-        root: ws.root,
-        baselineCommit: currentPending.snapshotCommit,
-      });
-      if (current.summary.files !== 0) {
+      const currentMatches = typeof reviewCheckpoints.assertSnapshotMatches === "function"
+        ? await reviewCheckpoints.assertSnapshotMatches({
+            workspaceId: session.workspaceSessionId,
+            root: ws.root,
+            expected: pendingSnapshot,
+          })
+        : (await reviewCheckpoints.reviewChangesAgainstCommit({
+            workspaceId: session.workspaceSessionId,
+            root: ws.root,
+            baselineCommit: pendingSnapshot.ref,
+          })).summary.files === 0;
+      if (!currentMatches) {
         throw new WorkflowError(
           `Workspace snapshot changed since submission ${input.submissionId}; cannot approve a stale submission. Submit a fresh review.`,
           "stale_submission",

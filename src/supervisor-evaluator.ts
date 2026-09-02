@@ -1,7 +1,7 @@
 import type { MissionLedger } from "./mission-ledger.js";
 
 export type SupervisorDecision = "approval_pending" | "correction_pending" | "awaiting_human";
-export function evaluateSupervisorMission(ledger: MissionLedger, workSessionId: string, context: { submissionId?: string; snapshotCommit?: string; cycleNumber: number; maxCycles?: number; emergencyCycleCeiling?: number }) {
+export function evaluateSupervisorMission(ledger: MissionLedger, workSessionId: string, context: { submissionId?: string; snapshotKind?: "git" | "filesystem"; snapshotRef?: string; snapshotCommit?: string; cycleNumber: number; maxCycles?: number; emergencyCycleCeiling?: number }) {
   const packet = ledger.getPacket(workSessionId, context);
   const approval = ledger.canApprove(workSessionId, context);
   const failed = packet.criteria.filter((criterion) => criterion.priority === "required" && criterion.status === "failed");

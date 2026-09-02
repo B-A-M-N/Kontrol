@@ -16,6 +16,8 @@ export interface ReviewSubmissionDTO {
   reviewEpoch: number;
   status: string;
   diffSha256?: string;
+  snapshotKind?: "git" | "filesystem";
+  snapshotRef?: string;
   patch: string;
   files: ReviewFile[];
   fileCount: number;

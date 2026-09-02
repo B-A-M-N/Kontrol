@@ -213,6 +213,16 @@ read_json_text_field() {
 }
 
 capture_database_deployment_state() {
+  # A new state directory has no pre-existing data to protect. Avoid starting
+  # the TypeScript/native SQLite helper just to return an all-zero inspection;
+  # the candidate server will create and migrate the database authoritatively.
+  if [[ ! -f "$KONTROL_STATE_DIR/kontrol.sqlite" ]]; then
+    DATABASE_ORIGINAL_SCHEMA_VERSION="0"
+    DATABASE_CANDIDATE_SCHEMA_VERSION="${DATABASE_CANDIDATE_SCHEMA_VERSION:-0}"
+    DATABASE_BACKUP_PATH=""
+    DATABASE_ROLLBACK_RESTORE_REQUIRED="false"
+    return 0
+  fi
   local inspection
   inspection="$(node --import tsx src/db/deployment-backup.ts inspect \
     --state-dir "$KONTROL_STATE_DIR" \
@@ -228,6 +238,10 @@ capture_database_deployment_state() {
 }
 
 load_database_migration_state() {
+  # Only a schema-changing deployment creates this journal. Most starts have
+  # no migration state, so avoid a cold tsx/native SQLite subprocess on the
+  # ordinary path while retaining the exact journal-driven recovery path.
+  [[ -f "$DATABASE_MIGRATION_RECORD_PATH" ]] || return 0
   local migration_state
   migration_state="$(node --import tsx src/db/deployment-backup.ts status \
     --state-dir "$KONTROL_STATE_DIR" \
@@ -633,11 +647,23 @@ if [[ "${KONTROL_ACP_ENABLED:-true}" == "false" ]]; then
 fi
 # Bash is secure-by-default and may require a human approval. A boot-time
 # readiness probe cannot satisfy an interactive approval, so exercise the
-# shell path only when the effective bash policy explicitly allows it. A
-# per-tool rule overrides the global mode; with neither configured, the secure
-# baseline is `ask`.
-EFFECTIVE_BASH_POLICY="${KONTROL_POLICY_TOOL_BASH:-${KONTROL_POLICY_MODE:-ask}}"
-if [[ "${EFFECTIVE_BASH_POLICY,,}" == "allow" ]]; then
+# shell path only when the effective bash policy explicitly allows it. Ask
+# capability is computed by the same policy loader used by the server and
+# tunnel launcher; this checkout fallback executes the source CLI only when
+# its immutable dist projection is stale.
+if [[ -n "${KONTROL_POLICY_CLI_PATH:-}" ]]; then
+  POLICY_COMMAND=(node "$KONTROL_POLICY_CLI_PATH")
+elif [[ -f "$DESKTOP_PWD/dist/cli.js" && -f "$DESKTOP_PWD/dist/build-meta.json" ]] \
+  && node "$DESKTOP_PWD/dist/cli.js" config effective-policy --json >/dev/null 2>&1; then
+  POLICY_COMMAND=(node "$DESKTOP_PWD/dist/cli.js")
+else
+  POLICY_COMMAND=(node --import tsx "$DESKTOP_PWD/src/cli.ts")
+fi
+if ! EFFECTIVE_POLICY_JSON="$("${POLICY_COMMAND[@]}" config effective-policy --json)"; then
+  echo "ERROR: effective policy could not be loaded; aborting startup." >&2
+  return 1
+fi
+if node -e 'const fs=require("node:fs"); const value=JSON.parse(fs.readFileSync(0,"utf8")); const mode=value.toolRules?.bash ?? value.defaultMode; process.exit(mode === "allow" ? 0 : 1)' <<<"$EFFECTIVE_POLICY_JSON"; then
   PROBE_FLAGS+=(--probe-bash)
 fi
 if ! node scripts/probe-kontrol-readiness.mjs \

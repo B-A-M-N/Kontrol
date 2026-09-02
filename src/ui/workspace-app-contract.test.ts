@@ -12,7 +12,8 @@ assert.match(source, /requestAnimationFrame/, "event-driven renders must be fram
 assert.match(source, /await_workspace_events/, "the WebUI must use one workspace event watcher");
 assert.match(source, /list_pending_approvals/, "the WebUI must rehydrate approvals missed during reconnect");
 assert.match(source, /__approval_center__/, "direct workspace approvals need a visible fallback surface");
-assert.match(source, /approve_workspace/, "the WebUI must offer a workspace-level approval scope (P1.9)");
+assert.match(source, /option\.scope === "workspace"/, "the WebUI must honor a server-supplied workspace-level approval scope (P1.9)");
+assert.match(source, /The server did not provide a reusable scope/, "the WebUI must not invent missing policy scope semantics");
 assert.match(source, /reviewEpoch: s\.latestSubmission\.reviewEpoch/, "rehydration must preserve the canonical review epoch");
 assert.doesNotMatch(source, /reviewEpoch: Number\(card\?\.summary\?\.reviewEpoch \?\? sc\.reviewEpoch \?\? 0\)/, "review identity must not fabricate epoch zero");
 assert.doesNotMatch(source, /diffSha256: String\(card\?\.summary\?\.diffSha256 \?\? sc\.diffSha256 \?\? ""\)/, "review identity must not fabricate an empty diff hash");

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
+import { createRequire } from "node:module";
 import { createServer as createNetServer } from "node:net";
 import {
   existsSync,
@@ -14,6 +15,7 @@ import {
 } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { tmpdir } from "node:os";
 import { gunzipSync } from "node:zlib";
 
@@ -41,7 +43,12 @@ try {
   assert.ok(existsSync(join(pkg, "dist/server.js")), "packed package is missing dist/server.js");
   assert.ok(existsSync(join(pkg, "dist/cli.js")), "packed package is missing dist/cli.js");
   assert.ok(existsSync(join(pkg, "dist/acp-worker-token.mjs")), "packed package is missing dist/acp-worker-token.mjs");
-  assert.ok(existsSync(join(pkg, "scripts/kontrol-user-service.sh")), "packed package is missing the generated systemd service installer");
+  assert.ok(existsSync(join(pkg, "dist/service.js")), "packed package is missing compiled service lifecycle code");
+  assert.equal(
+    existsSync(join(pkg, "scripts/kontrol-user-service.sh")),
+    false,
+    "checkout-only service wrappers must not be required by the installed package",
+  );
   assert.equal(
     existsSync(join(pkg, "scripts/kontrol-acp-crush-adapter.service")),
     false,
@@ -81,10 +88,22 @@ try {
   }).trim();
   assert.equal(installedVersion, packedPackageJson.version, "installed CLI reports the package version");
 
+  const servicePreview = JSON.parse(execFileSync("node", [installedCli, "service", "unit", "--json"], {
+    cwd: installPrefix,
+    env: {
+      ...serviceEnvForInstall(tmp, installPrefix),
+      KONTROL_STATE_DIR: join(tmp, "service-preview-state"),
+    },
+    encoding: "utf8",
+  }));
+  assert.equal(servicePreview.build.buildId, JSON.parse(readFileSync(join(installedPkg, "dist/build-meta.json"), "utf8")).buildId);
+  assert.match(servicePreview.unit, new RegExp(`ExecStart=/usr/bin/env node ".*dist/cli\\.js" serve`));
+  assert.doesNotMatch(servicePreview.unit, /tsx|src\/config|kontrol-user-service\.sh/);
+
   const servicePort = await unusedTcpPort();
   const serviceState = join(tmp, "installed-state");
   const serviceEnv = {
-    ...process.env,
+    ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("KONTROL_POLICY_"))),
     HOST: "127.0.0.1",
     PORT: String(servicePort),
     KONTROL_AUTH_MODE: "tunnel",
@@ -95,11 +114,10 @@ try {
     KONTROL_WORKTREE_ROOT: join(tmp, "installed-worktrees"),
     KONTROL_ACP_ENABLED: "false",
     KONTROL_LOG_FORMAT: "pretty",
-    // This suite verifies execution plumbing, not the approval boundary.
-    // The secure baseline gates every mutation behind `ask`, which would
-    // also trip the tunnel reviewer gate; adopt an explicit non-interactive
-    // posture so an unattended smoke test can exercise shell execution.
-    KONTROL_POLICY_MODE: "allow",
+    // Exercise the real zero-configuration secure baseline: structured
+    // read-only discovery is frictionless, while arbitrary shell and file
+    // mutation return approval_required without executing.
+    KONTROL_TUNNEL_REVIEWER_SECRET: "package-release-reviewer-secret-long-enough",
   };
   const doctorOutput = execFileSync("node", [installedCli, "doctor"], {
     cwd: installPrefix,
@@ -132,9 +150,20 @@ try {
     assert.ok(sessionId, "MCP initialize returns a session identity");
     await postMcp(mcpUrl, { jsonrpc: "2.0", method: "notifications/initialized", params: {} }, sessionId);
 
-    const opened = await postMcp(mcpUrl, {
+    const listed = await postMcp(mcpUrl, {
       jsonrpc: "2.0",
       id: 2,
+      method: "tools/list",
+      params: {},
+    }, sessionId);
+    const toolNames = (listed.body?.result?.tools ?? []).map((tool) => tool.name);
+    for (const name of ["read", "grep", "glob", "ls"]) {
+      assert.ok(toolNames.includes(name), `installed default tool surface includes structured ${name}; got ${JSON.stringify(toolNames)}`);
+    }
+
+    const opened = await postMcp(mcpUrl, {
+      jsonrpc: "2.0",
+      id: 3,
       method: "tools/call",
       params: { name: "open_workspace", arguments: { path: installPrefix } },
     }, sessionId);
@@ -144,26 +173,79 @@ try {
 
     const read = await postMcp(mcpUrl, {
       jsonrpc: "2.0",
-      id: 3,
+      id: 4,
       method: "tools/call",
       params: { name: "read", arguments: { workspaceId, path: "package.json", limit: 5 } },
     }, sessionId);
     assert.equal(read.response.status, 200, "installed read call succeeds");
     assert.match(JSON.stringify(read.body), /@b-a-m-n\/kontrol/, "installed read returns package contents");
 
+    const grep = await postMcp(mcpUrl, {
+      jsonrpc: "2.0",
+      id: 5,
+      method: "tools/call",
+      params: { name: "grep", arguments: { workspaceId, pattern: "@b-a-m-n", path: "package.json" } },
+    }, sessionId);
+    assert.equal(grep.response.status, 200, "installed grep call succeeds without approval");
+    assert.match(JSON.stringify(grep.body), /@b-a-m-n\/kontrol/, "installed grep returns repository matches");
+
+    const glob = await postMcp(mcpUrl, {
+      jsonrpc: "2.0",
+      id: 6,
+      method: "tools/call",
+      params: { name: "glob", arguments: { workspaceId, pattern: "**/*.json" } },
+    }, sessionId);
+    assert.equal(glob.response.status, 200, "installed glob call succeeds without approval");
+    assert.doesNotMatch(JSON.stringify(glob.body), /approval_required/, "installed glob does not enter the approval boundary");
+
+    const ls = await postMcp(mcpUrl, {
+      jsonrpc: "2.0",
+      id: 7,
+      method: "tools/call",
+      params: { name: "ls", arguments: { workspaceId, path: "." } },
+    }, sessionId);
+    assert.equal(ls.response.status, 200, "installed ls call succeeds without approval");
+    assert.match(JSON.stringify(ls.body), /package\.json/, "installed ls returns directory entries");
+
     const bash = await postMcp(mcpUrl, {
       jsonrpc: "2.0",
-      id: 4,
+      id: 8,
       method: "tools/call",
       params: { name: "bash", arguments: { workspaceId, command: "pwd" } },
     }, sessionId);
-    assert.equal(bash.response.status, 200, "installed bash call succeeds");
-    assert.match(JSON.stringify(bash.body), /clean-prefix/, "installed bash executes in the opened workspace");
+    assert.equal(bash.response.status, 200, "installed bash returns the approval boundary");
+    assert.equal(bash.body?.result?.structuredContent?.status, "approval_required", "installed bash is gated by the secure baseline");
+
+    const write = await postMcp(mcpUrl, {
+      jsonrpc: "2.0",
+      id: 9,
+      method: "tools/call",
+      params: { name: "write", arguments: { workspaceId, path: "should-not-be-written.txt", content: "blocked" } },
+    }, sessionId);
+    assert.equal(write.response.status, 200, "installed write returns the approval boundary");
+    assert.equal(write.body?.result?.structuredContent?.status, "approval_required", "installed write is gated by the secure baseline");
+    assert.equal(existsSync(join(installPrefix, "should-not-be-written.txt")), false, "gated write does not execute");
+
+    const edit = await postMcp(mcpUrl, {
+      jsonrpc: "2.0",
+      id: 10,
+      method: "tools/call",
+      params: { name: "edit", arguments: { workspaceId, path: "package.json", edits: [{ oldText: "never-match", newText: "blocked" }] } },
+    }, sessionId);
+    assert.equal(edit.response.status, 200, "installed edit returns the approval boundary");
+    assert.equal(edit.body?.result?.structuredContent?.status, "approval_required", "installed edit is gated by the secure baseline");
   } finally {
     if (service.exitCode === null) service.kill("SIGTERM");
     await waitForChild(service);
-    assert.equal(service.exitCode, 0, "installed server exits cleanly on SIGTERM");
+    assert.equal(
+      service.exitCode,
+      0,
+      `installed server exits cleanly on SIGTERM (exit=${service.exitCode}, signal=${service.signalCode}, stderr=${serviceStderr})`,
+    );
   }
+
+  await exerciseInstalledCodexMutationBoundary(installedCli, installPrefix, serviceEnv, tmp);
+  await exerciseInstalledServiceLifecycle(installedPkg, tmp);
 
   // Review #9: shipped-adapter validation must run against the CLEAN
   // installation only. The checkout's node_modules used to be symlinked in
@@ -230,6 +312,146 @@ try {
   rmSync(tmp, { recursive: true, force: true });
 }
 
+async function exerciseInstalledCodexMutationBoundary(installedCli, installPrefix, baseEnv, tmpRoot) {
+  const port = await unusedTcpPort();
+  const stateDir = join(tmpRoot, "installed-codex-state");
+  const env = {
+    ...baseEnv,
+    PORT: String(port),
+    KONTROL_STATE_DIR: stateDir,
+    KONTROL_TOOL_MODE: "codex",
+  };
+  const child = spawn("node", [installedCli, "serve"], {
+    cwd: installPrefix,
+    env,
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+  let stderr = "";
+  child.stderr?.on("data", (chunk) => { stderr += String(chunk); });
+  try {
+    await waitForHttp(`http://127.0.0.1:${port}/healthz`, child, () => stderr);
+    const url = `http://127.0.0.1:${port}/mcp`;
+    let id = 1;
+    const initialized = await postMcp(url, {
+      jsonrpc: "2.0",
+      id: id++,
+      method: "initialize",
+      params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "package-codex-boundary", version: "1" } },
+    });
+    const sessionId = initialized.response.headers.get("mcp-session-id");
+    assert.ok(sessionId, "codex-mode installed MCP initialize returns a session identity");
+    await postMcp(url, { jsonrpc: "2.0", method: "notifications/initialized", params: {} }, sessionId);
+    const listed = await postMcp(url, { jsonrpc: "2.0", id: id++, method: "tools/list", params: {} }, sessionId);
+    assert.ok((listed.body?.result?.tools ?? []).some((tool) => tool.name === "apply_patch"), "codex-mode installed surface includes apply_patch");
+    const opened = await postMcp(url, {
+      jsonrpc: "2.0",
+      id: id++,
+      method: "tools/call",
+      params: { name: "open_workspace", arguments: { path: installPrefix } },
+    }, sessionId);
+    const workspaceId = opened.body?.result?.structuredContent?.workspaceId;
+    assert.equal(typeof workspaceId, "string", "codex-mode open_workspace returns a workspace ID");
+    const patch = await postMcp(url, {
+      jsonrpc: "2.0",
+      id: id++,
+      method: "tools/call",
+      params: {
+        name: "apply_patch",
+        arguments: {
+          workspaceId,
+          patch: "*** Begin Patch\n*** Add File: should-not-be-patched.txt\n+blocked\n*** End Patch",
+        },
+      },
+    }, sessionId);
+    assert.equal(patch.response.status, 200, "codex-mode apply_patch returns the approval boundary");
+    assert.equal(patch.body?.result?.structuredContent?.status, "approval_required", `codex-mode apply_patch is gated by the secure baseline: ${JSON.stringify(patch.body)}`);
+    assert.equal(existsSync(join(installPrefix, "should-not-be-patched.txt")), false, "gated apply_patch does not execute");
+  } finally {
+    if (child.exitCode === null) child.kill("SIGTERM");
+    await waitForChild(child);
+    assert.equal(child.exitCode, 0, `codex-mode installed server exits cleanly (stderr=${stderr})`);
+  }
+}
+
+async function exerciseInstalledServiceLifecycle(installedPkg, tmpRoot) {
+  const serviceModule = await import(pathToFileURL(join(installedPkg, "dist", "service.js")).href);
+  const databaseModule = await import(pathToFileURL(join(installedPkg, "dist", "db", "client.js")).href);
+  const backupModule = await import(pathToFileURL(join(installedPkg, "dist", "db", "deployment-backup.js")).href);
+  const migrationsModule = await import(pathToFileURL(join(installedPkg, "dist", "db", "migrations.js")).href);
+  const installedRequire = createRequire(pathToFileURL(join(installedPkg, "package.json")));
+  const Database = installedRequire("better-sqlite3");
+  const rootDir = join(tmpRoot, "installed-service-lifecycle");
+  const candidate = join(rootDir, "candidate");
+  mkdirSync(candidate, { recursive: true });
+  const baseMeta = JSON.parse(readFileSync(join(installedPkg, "dist", "build-meta.json"), "utf8"));
+  const candidateMeta = {
+    ...baseMeta,
+    buildId: `${baseMeta.buildId}-candidate`,
+    contentSha256: "b".repeat(16),
+    schemaVersion: Number(baseMeta.schemaVersion) + 1,
+    maxReadableSchemaVersion: Number(baseMeta.maxReadableSchemaVersion) + 1,
+  };
+  writeFileSync(join(candidate, "cli.js"), "#!/usr/bin/env node\n");
+  writeFileSync(join(candidate, "build-meta.json"), JSON.stringify(candidateMeta));
+
+  const env = {
+    ...serviceEnvForInstall(tmpRoot, rootDir),
+    KONTROL_STATE_DIR: join(rootDir, "database state"),
+    KONTROL_USER_SERVICE_NAME: "kontrol-package-fixture.service",
+  };
+  const paths = serviceModule.servicePaths(env);
+  const calls = [];
+  const dependencies = {
+    currentArtifactPath: () => join(installedPkg, "dist"),
+    requireSystemd: () => undefined,
+    systemctl: (servicePaths, args) => {
+      calls.push(args.join(" "));
+      if (args[0] !== "start") return;
+      const installed = JSON.parse(readFileSync(servicePaths.statePath, "utf8"));
+      if (installed.buildId !== candidateMeta.buildId) return;
+      const sqlite = new Database(databaseModule.databasePath(servicePaths.stateDir));
+      try {
+        backupModule.captureMigrationBackup(sqlite, databaseModule.databasePath(servicePaths.stateDir), servicePaths.stateDir, installed.deploymentId, candidateMeta.schemaVersion);
+        sqlite.exec("create table installed_candidate_only (id text primary key not null)");
+        sqlite.prepare("insert into kontrol_schema_migrations (version, name, applied_at) values (?, ?, ?)").run(
+          candidateMeta.schemaVersion,
+          "installed_package_fixture_migration",
+          new Date().toISOString(),
+        );
+      } finally {
+        sqlite.close();
+      }
+    },
+    waitForReady: async (_servicePaths, expected) => {
+      if (expected.buildId === candidateMeta.buildId) throw new Error("installed candidate failed readiness");
+    },
+  };
+
+  await serviceModule.runServiceCommand(["install"], env, dependencies);
+  const initial = databaseModule.openDatabase(paths.stateDir);
+  initial.close();
+  await assert.rejects(
+    () => serviceModule.runServiceCommand(["upgrade"], env, { ...dependencies, currentArtifactPath: () => candidate }),
+    /Candidate .* failed readiness; previous build .* and database were restored/,
+  );
+  const restoredState = JSON.parse(readFileSync(paths.statePath, "utf8"));
+  assert.equal(restoredState.buildId, baseMeta.buildId, "installed service rollback restores the previous artifact");
+  const sqlite = new Database(databaseModule.databasePath(paths.stateDir), { readonly: true });
+  try {
+    const schema = sqlite.prepare("select max(version) as version from kontrol_schema_migrations").get();
+    assert.equal(schema.version, migrationsModule.LATEST_SCHEMA_VERSION, "installed service rollback restores the prior schema");
+    assert.throws(() => sqlite.prepare("select * from installed_candidate_only").get(), /no such table/);
+  } finally {
+    sqlite.close();
+  }
+  assert.deepEqual(calls.filter((call) => call.startsWith("start") || call.startsWith("stop")).slice(-4), [
+    "stop kontrol-package-fixture.service",
+    "start kontrol-package-fixture.service",
+    "stop kontrol-package-fixture.service",
+    "start kontrol-package-fixture.service",
+  ]);
+}
+
 function assertUserFacingBranding(pkg) {
   const checkedFiles = listFiles(pkg).filter((file) =>
     [
@@ -267,6 +489,16 @@ function assertUserFacingBranding(pkg) {
       `${file} uses lowercase bamn GitHub owner; use B-A-M-N`,
     );
   }
+}
+
+function serviceEnvForInstall(tmpRoot, installPrefix) {
+  return {
+    ...process.env,
+    XDG_CONFIG_HOME: join(tmpRoot, "service-config-home"),
+    XDG_DATA_HOME: join(tmpRoot, "service-data-home"),
+    KONTROL_SERVICE_DATA_DIR: join(tmpRoot, "service-data"),
+    KONTROL_ALLOWED_ROOTS: installPrefix,
+  };
 }
 
 function removeAllowedAttribution(file, text) {
@@ -345,8 +577,8 @@ async function waitForHttp(url, child, stderr) {
 }
 
 async function waitForChild(child) {
-  if (child.exitCode !== null) return;
-  await new Promise((resolve) => child.once("close", resolve));
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  await new Promise((resolve) => child.once("exit", resolve));
 }
 
 async function postMcp(url, body, sessionId) {

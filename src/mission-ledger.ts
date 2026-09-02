@@ -16,6 +16,7 @@ import {
   type MissionWorkOrderRow,
   type MissionCompletionReportRow,
 } from "./db/schema.js";
+import type { WorkspaceSnapshotKind } from "./review-checkpoints.js";
 
 export type CriterionStatus = "unverified" | "partially_verified" | "verified" | "failed";
 export type FindingStatus = "open" | "claimed_resolved" | "verified_resolved" | "waived";
@@ -85,6 +86,9 @@ export interface MissionContractInput {
   acceptanceCriteria?: MissionCriterionInput[];
   userLockedFields?: string[];
   supervisorInstructions?: string;
+  baselineKind?: WorkspaceSnapshotKind;
+  baselineRef?: string;
+  /** @deprecated Legacy Git projection. */
   baselineCommit?: string;
   /** Backstop ceiling on auto-extended correction rounds. Default 5. */
   maxCorrectionRounds?: number;
@@ -101,6 +105,8 @@ export interface ApprovalPredicate {
 
 export interface CurrentApprovalContext {
   submissionId?: string;
+  snapshotKind?: WorkspaceSnapshotKind;
+  snapshotRef?: string;
   snapshotCommit?: string;
   /** Review generation the evidence and approval decision belong to. */
   reviewEpoch?: number;
@@ -110,6 +116,8 @@ export interface MissionEvidenceInput {
   criterionId?: string;
   submissionId?: string;
   reviewEpoch?: number;
+  snapshotKind?: WorkspaceSnapshotKind;
+  snapshotRef?: string;
   snapshotCommit?: string;
   leaseNonce?: string;
   command?: string;
@@ -141,8 +149,8 @@ export interface MissionLedger {
   recordVerifierEvidence(missionId: string, entries: MissionEvidenceInput[]): void;
   recordRuntimeProbeEvidence(missionId: string, entries: MissionEvidenceInput[]): void;
   recordAgentEvidence(missionId: string, entries: MissionEvidenceInput[]): void;
-  recordCompletionReport(missionId: string, input: { submissionId: string; snapshotCommit: string; status: "passed" | "failed"; results: unknown; reviewCoverage?: string[]; uncertainty?: unknown[] }): void;
-  recordReviewCoverage(missionId: string, input: { submissionId: string; snapshotCommit: string; reviewCoverage?: string[]; uncertainty?: unknown[] }): void;
+  recordCompletionReport(missionId: string, input: { submissionId: string; snapshotKind?: WorkspaceSnapshotKind; snapshotRef?: string; snapshotCommit: string; status: "passed" | "failed"; results: unknown; reviewCoverage?: string[]; uncertainty?: unknown[] }): void;
+  recordReviewCoverage(missionId: string, input: { submissionId: string; snapshotKind?: WorkspaceSnapshotKind; snapshotRef?: string; snapshotCommit: string; reviewCoverage?: string[]; uncertainty?: unknown[] }): void;
   getCompletionReportHash(workSessionId: string, context: CurrentApprovalContext): string | undefined;
   getPacket(workSessionId: string, approvalContext?: CurrentApprovalContext): MissionReviewPacket;
   canApprove(workSessionId: string, context?: CurrentApprovalContext): ApprovalPredicate;
@@ -215,6 +223,8 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
         nonGoalsJson: JSON.stringify(input.nonGoals ?? []),
         userLockedFieldsJson: JSON.stringify(input.userLockedFields ?? ["objective", "desiredOutcome", "constraints", "nonGoals"]),
         supervisorInstructions: input.supervisorInstructions ?? null,
+        baselineKind: input.baselineKind ?? (input.baselineCommit ? "git" : null),
+        baselineRef: input.baselineRef ?? input.baselineCommit ?? null,
         baselineCommit: input.baselineCommit ?? null,
         correctionRounds: 0,
         maxCorrectionRounds: input.maxCorrectionRounds ?? 5,
@@ -401,6 +411,8 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
         criterionId: entry.criterionId ?? null,
         submissionId: entry.submissionId ?? null,
         reviewEpoch: entry.reviewEpoch ?? null,
+        snapshotKind: entry.snapshotKind ?? (entry.snapshotCommit?.startsWith("fs:") ? "filesystem" : entry.snapshotCommit ? "git" : null),
+        snapshotRef: entry.snapshotRef ?? entry.snapshotCommit ?? null,
         snapshotCommit: entry.snapshotCommit ?? null,
         leaseNonce: entry.leaseNonce ?? null,
         actorPrincipal: entry.actorPrincipal ?? null,
@@ -462,6 +474,8 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
   function getCurrentApprovalContext(workSessionId: string): CurrentApprovalContext {
     const row = database.db.select({
       submissionId: workSessionSubmissions.id,
+      snapshotKind: workSessionSubmissions.snapshotKind,
+      snapshotRef: workSessionSubmissions.snapshotRef,
       snapshotCommit: workSessionSubmissions.snapshotCommit,
       reviewEpoch: workSessionSubmissions.reviewEpoch,
     }).from(workSessionSubmissions)
@@ -470,7 +484,7 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
       .limit(1)
       .get();
     return row?.submissionId
-      ? { submissionId: row.submissionId, snapshotCommit: row.snapshotCommit ?? undefined, reviewEpoch: row.reviewEpoch }
+      ? { submissionId: row.submissionId, snapshotKind: row.snapshotKind as WorkspaceSnapshotKind | undefined, snapshotRef: row.snapshotRef ?? row.snapshotCommit ?? undefined, snapshotCommit: row.snapshotRef ?? row.snapshotCommit ?? undefined, reviewEpoch: row.reviewEpoch }
       : {};
   }
 
@@ -556,7 +570,7 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
     return { allowed: reasons.length === 0, reasons };
   }
 
-  function recordCompletionReport(missionId: string, input: { submissionId: string; snapshotCommit: string; status: "passed" | "failed"; results: unknown; reviewCoverage?: string[]; uncertainty?: unknown[] }): void {
+  function recordCompletionReport(missionId: string, input: { submissionId: string; snapshotKind?: WorkspaceSnapshotKind; snapshotRef?: string; snapshotCommit: string; status: "passed" | "failed"; results: unknown; reviewCoverage?: string[]; uncertainty?: unknown[] }): void {
     const resultsJson = JSON.stringify(input.results);
     // P1 #14: keep one authoritative report per
     // {missionId, submissionId, snapshotCommit}. If reviewer coverage was
@@ -565,7 +579,7 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
     const prior = database.db.select().from(missionCompletionReports).where(and(
       eq(missionCompletionReports.missionId, missionId),
       eq(missionCompletionReports.submissionId, input.submissionId),
-      eq(missionCompletionReports.snapshotCommit, input.snapshotCommit),
+      eq(missionCompletionReports.snapshotCommit, input.snapshotRef ?? input.snapshotCommit),
     )).orderBy(desc(missionCompletionReports.createdAt)).get();
     const mergeInto = (current: string[], incoming?: string[]) => [...new Set([...current, ...(incoming ?? [])])];
     if (prior) {
@@ -579,11 +593,13 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
       }).where(eq(missionCompletionReports.id, prior.id)).run();
       return;
     }
-    database.db.insert(missionCompletionReports).values({
+      database.db.insert(missionCompletionReports).values({
       id: `report_${randomUUID()}`,
       missionId,
-      submissionId: input.submissionId,
-      snapshotCommit: input.snapshotCommit,
+        submissionId: input.submissionId,
+        snapshotCommit: input.snapshotCommit,
+        snapshotKind: input.snapshotKind ?? (input.snapshotCommit.startsWith("fs:") ? "filesystem" : "git"),
+        snapshotRef: input.snapshotRef ?? input.snapshotCommit,
       status: input.status,
       resultsJson,
       reviewCoverageJson: JSON.stringify(input.reviewCoverage ?? []),
@@ -594,13 +610,13 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
   }
 
   /** P2 #34/#35: Record which review lenses a reviewer covered and what remains uncertain. */
-  function recordReviewCoverage(missionId: string, input: { submissionId: string; snapshotCommit: string; reviewCoverage?: string[]; uncertainty?: unknown[] }): void {
+  function recordReviewCoverage(missionId: string, input: { submissionId: string; snapshotKind?: WorkspaceSnapshotKind; snapshotRef?: string; snapshotCommit: string; reviewCoverage?: string[]; uncertainty?: unknown[] }): void {
     const mission = database.db.select().from(missionContracts).where(eq(missionContracts.id, missionId)).get();
     if (!mission) throw new Error(`No mission contract ${missionId}.`);
     const existing = database.db.select().from(missionCompletionReports).where(and(
       eq(missionCompletionReports.missionId, missionId),
       eq(missionCompletionReports.submissionId, input.submissionId),
-      eq(missionCompletionReports.snapshotCommit, input.snapshotCommit),
+      eq(missionCompletionReports.snapshotCommit, input.snapshotRef ?? input.snapshotCommit),
     )).orderBy(desc(missionCompletionReports.createdAt)).get();
     const mergeInto = (current: string[], incoming: string[]) => [...new Set([...current, ...incoming])];
     if (existing) {
@@ -622,6 +638,8 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
       missionId,
       submissionId: input.submissionId,
       snapshotCommit: input.snapshotCommit,
+      snapshotKind: input.snapshotKind ?? (input.snapshotCommit.startsWith("fs:") ? "filesystem" : "git"),
+      snapshotRef: input.snapshotRef ?? input.snapshotCommit,
       status: "failed",
       resultsJson: JSON.stringify([]),
       reviewCoverageJson: JSON.stringify(input.reviewCoverage ?? []),
@@ -775,6 +793,8 @@ function rowToMission(row: MissionContractRow) {
     nonGoals: parseJson(row.nonGoalsJson, []),
     userLockedFields: parseJson(row.userLockedFieldsJson, []),
     supervisorInstructions: row.supervisorInstructions ?? undefined,
+    baselineKind: row.baselineKind as WorkspaceSnapshotKind | undefined ?? (row.baselineCommit ? "git" : undefined),
+    baselineRef: row.baselineRef ?? row.baselineCommit ?? undefined,
     baselineCommit: row.baselineCommit ?? undefined,
     correctionRounds: row.correctionRounds ?? 0,
     maxCorrectionRounds: row.maxCorrectionRounds ?? 5,
@@ -931,6 +951,8 @@ function rowToEvidence(row: MissionEvidenceRow) {
     criterionId: row.criterionId ?? undefined,
     submissionId: row.submissionId ?? undefined,
     reviewEpoch: row.reviewEpoch ?? undefined,
+    snapshotKind: row.snapshotKind as WorkspaceSnapshotKind | undefined ?? (row.snapshotCommit?.startsWith("fs:") ? "filesystem" : row.snapshotCommit ? "git" : undefined),
+    snapshotRef: row.snapshotRef ?? row.snapshotCommit ?? undefined,
     snapshotCommit: row.snapshotCommit ?? undefined,
     leaseNonce: row.leaseNonce ?? undefined,
     actorPrincipal: row.actorPrincipal ?? undefined,
@@ -947,6 +969,8 @@ function rowToCompletionReport(row: MissionCompletionReportRow) {
     id: row.id,
     missionId: row.missionId,
     submissionId: row.submissionId,
+    snapshotKind: row.snapshotKind as WorkspaceSnapshotKind | undefined ?? (row.snapshotCommit.startsWith("fs:") ? "filesystem" : "git"),
+    snapshotRef: row.snapshotRef ?? row.snapshotCommit,
     snapshotCommit: row.snapshotCommit,
     status: row.status,
     results: parseJson(row.resultsJson, []),

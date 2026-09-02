@@ -1,18 +1,17 @@
 ---
 name: nelson-wiggum-loop
-description: WebUI-side review rendezvous for Kontrol ACP — the WebUI submits work to the CLI coding agent, the agent works and submits back, and the loop only completes when the WebUI signs off "A-okay". The mirror of ralphie-muntz-loop. Use when wiring the review WebUI, the submit_to_coding_agent tool, or the agent↔WebUI completion gate.
-version: 0.1.0
+description: Reviewer-side Kontrol review rendezvous. Use for direct WebUI review or explicitly delegated bounded worker assistance.
+version: 0.2.0
 ---
 
 # Nelson Wiggum Loop
 
 > "A-okay!" — Nelson Wiggum, the only voice that ends the loop.
 
-The WebUI-side counterpart to `ralphie-muntz-loop`. The CLI coding agent is the
-**ACP agent** (the worker). The WebUI is the **ACP client / reviewer** (Nelson
-Wiggum). The WebUI can push work *to* the agent; the agent pushes work *back* for
-review; and — critically — **the loop is not complete until the WebUI signs off
-"A-okay"** via `provide_review_feedback` with verdict `approve`.
+The WebUI-side counterpart to `ralphie-muntz-loop`. The active WebUI model is
+the reviewer, orchestrator, and inspector. The CLI coding agent is an optional
+bounded worker. The loop is not complete until the WebUI signs off "A-okay"
+via `provide_review_feedback` with verdict `approve`.
 
 **No polling. No busy loops. The WebUI's "A-okay" is the single completion criterion.**
 
@@ -23,9 +22,9 @@ The agent registry makes the split explicit:
 | Name | Role | Meaning |
 |------|------|---------|
 | `cli-coding-agent` | `agent` | The worker. Registers itself at runtime via `POST /acp/agents/register`. Executes tasks, submits work for review. |
-| `webui` | `client` | The reviewer. Seeded by Kontrol as a well-known `role: "client"` entry. Submits tasks to the agent; is the only signer of "A-okay". |
+| `webui` | `reviewer` | The reviewer. Seeded by Kontrol as a well-known reviewer entry and the only signer of "A-okay". |
 
-Kontrol is the **broker** that hosts both the WebUI's client tool
+Kontrol is the **broker** that hosts the WebUI's reviewer tool
 (`submit_to_coding_agent`) and the WebUI-facing ACP agent
 (`kontrol-submit-work-to-webui`).
 
@@ -64,7 +63,7 @@ WebUI (Nelson)                    Kontrol Server                 CLI Coding Agen
 
 | Tool | Purpose |
 |------|---------|
-| `submit_for_review` | (MCP) Capture git diff, submit for human review. |
+| `submit_for_review` | (MCP) Capture a backend-neutral workspace checkpoint and submit structured metadata plus presentation diff for human review. |
 | `kontrol-submit-work-to-webui` | (ACP) The coding agent submits completed work to the WebUI for review. Ralphie Muntz terminus. |
 
 ### The Completion Gate (WebUI sign-off)
@@ -78,12 +77,14 @@ WebUI (Nelson)                    Kontrol Server                 CLI Coding Agen
 
 When the WebUI is the active surface in a work session:
 
-1. The human can type a task into the "Send a task to the coding agent" bar → calls `submit_to_coding_agent`.
-2. When a `submit_for_review` / `kontrol-submit-work-to-webui` card arrives, render the diff and the feedback form.
-3. The human reviews. The available verdicts are `approve`, `changes_requested`, `reject`.
-4. **`approve` is the "A-okay"** — it is the sole signal that the loop is complete. Only emit it when the work is genuinely acceptable.
-5. `changes_requested` returns control to the agent with comments; the loop continues.
-6. `reject` ends the session; the agent must stop modifying files.
+1. Review, diagnosis, architecture, and code-edit work starts directly in the opened workspace.
+2. When bounded worker assistance is explicitly requested, call `discover_agents` first and dispatch only a currently `dispatchable` healthy `role: "agent"` peer. If optional assistance is unavailable, continue directly without an alternate ACP route.
+3. The human can type a bounded task into the "Send a task to the coding agent" bar → calls `submit_to_coding_agent`.
+4. When a `submit_for_review` / `kontrol-submit-work-to-webui` card arrives, render the checkpoint diff and the feedback form.
+5. The human reviews. The available verdicts are `approve`, `changes_requested`, `reject`.
+6. **`approve` is the "A-okay"** — it is the sole signal that the loop is complete. Only emit it when the exact submitted snapshot is acceptable.
+7. `changes_requested` returns control to the worker with nonempty comments; the loop continues.
+8. `reject` ends the session; the worker must stop modifying files.
 
 ## Completion Criterion
 
@@ -120,7 +121,7 @@ drafting
 │                  MCP Bridge                      │
 │                                                  │
 │  submit_to_coding_agent()                        │
-│    → agentRegistry.ensure("cli-coding-agent")    │
+│    → discover_agents → selectHealthyAgent         │
 │    → callRemoteAgent(agentUrl, task)             │
 │    → returns agent output to WebUI               │
 │                                                  │
@@ -137,8 +138,8 @@ drafting
 └─────────────────────────────────────────────────┘
 ```
 
-The registry (`agent_registry` table, `role` column) records both participants:
-`cli-coding-agent` (role `agent`) and `webui` (role `client`).
+The registry (`agent_registry` table, `role` column) records workers and the
+reviewer. Initial delegation only uses a healthy HTTP-probed `role: "agent"`.
 
 ## When to Use This Skill
 

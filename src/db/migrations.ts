@@ -60,7 +60,41 @@ const migrations: Migration[] = [
   { version: 48, name: "policy-approval-operation-lifecycle", up: migratePolicyApprovalOperationLifecycle },
   { version: 49, name: "policy-approval-once-consumption", up: migratePolicyApprovalOnceConsumption },
   { version: 50, name: "policy-approval-direct-reconnect-deadline", up: migratePolicyApprovalDirectReconnectDeadline },
+  { version: 51, name: "work-session-stable-chronology", up: migrateWorkSessionStableChronology },
+  { version: 52, name: "client-mutation-receipts", up: migrateClientMutationReceipts },
+  { version: 53, name: "backend-neutral-snapshot-identities", up: migrateBackendNeutralSnapshotIdentities },
 ];
+
+function migrateClientMutationReceipts(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table if not exists client_mutation_receipts (
+      principal_id text not null,
+      operation text not null,
+      client_mutation_id text not null,
+      request_hash text not null,
+      status text not null default 'pending',
+      result_json text,
+      created_at text not null,
+      updated_at text not null,
+      primary key (principal_id, operation, client_mutation_id)
+    );
+    create index if not exists client_mutation_receipts_updated_idx
+      on client_mutation_receipts(updated_at);
+  `);
+}
+
+function migrateBackendNeutralSnapshotIdentities(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "work_session_submissions", "snapshot_kind", "text");
+  addColumnIfMissing(sqlite, "work_session_submissions", "snapshot_ref", "text");
+  addColumnIfMissing(sqlite, "mission_contracts", "baseline_kind", "text");
+  addColumnIfMissing(sqlite, "mission_contracts", "baseline_ref", "text");
+  addColumnIfMissing(sqlite, "mission_evidence", "snapshot_kind", "text");
+  addColumnIfMissing(sqlite, "mission_evidence", "snapshot_ref", "text");
+  addColumnIfMissing(sqlite, "mission_completion_reports", "snapshot_kind", "text");
+  addColumnIfMissing(sqlite, "mission_completion_reports", "snapshot_ref", "text");
+  addColumnIfMissing(sqlite, "supervisor_runs", "last_snapshot_kind", "text");
+  addColumnIfMissing(sqlite, "supervisor_runs", "last_snapshot_ref", "text");
+}
 
 function migrateSubmissionFileMetadata(sqlite: Database.Database): void {
   addColumnIfMissing(sqlite, "work_session_submissions", "files_json", "text");
@@ -903,6 +937,17 @@ function migrateContinuationClaim(sqlite: Database.Database): void {
 
 function migrateWorkSessionConsumedFeedback(sqlite: Database.Database): void {
   addColumnIfMissing(sqlite, "work_sessions", "last_consumed_feedback_id", "text");
+}
+
+function migrateWorkSessionStableChronology(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "work_sessions", "last_consumed_review_epoch", "integer not null default 0");
+  sqlite.exec(`
+    create index if not exists work_session_tool_events_session_created_id_idx
+      on work_session_tool_events(work_session_id, created_at desc, id desc);
+
+    create index if not exists work_session_feedback_session_submission_idx
+      on work_session_feedback(work_session_id, submission_id);
+  `);
 }
 
 function migrateAcpRunsWorkflow(sqlite: Database.Database): void {

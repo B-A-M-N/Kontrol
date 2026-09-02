@@ -89,6 +89,13 @@ export interface AgentProbeResult {
 }
 
 export async function probeAgent(url: string, sharedSecret?: string): Promise<AgentProbeResult> {
+  if (!/^https?:\/\//i.test(url)) {
+    return {
+      healthy: false,
+      status: 0,
+      note: "unsupported probe transport; only HTTP ACP adapters are dispatchable",
+    };
+  }
   const headers = authHeadersForAgent(url, sharedSecret);
   const baseUrl = url.replace(/\/+$/, "");
   try {

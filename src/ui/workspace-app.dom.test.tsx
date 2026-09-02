@@ -196,7 +196,7 @@ const fakeApp = {
   },
 };
 (globalThis as { __KONTROL_UI_TEST_APP_FACTORY__?: () => never }).__KONTROL_UI_TEST_APP_FACTORY__ = () => fakeApp as never;
-const { __workspaceAppTest } = await import("./workspace-app.js");
+const { __workspaceAppTest, AmbiguousMutationError } = await import("./workspace-app.js");
 const session = __workspaceAppTest.ensureWorkSessionView("session-dom", "workspace-dom", "run-dom");
 session.title = "DOM lifecycle";
 session.status = "in_progress";
@@ -235,7 +235,7 @@ __workspaceAppTest.activateWorkspace("workspace-dom");
 await settle();
 __workspaceAppTest.renderWorkSessionView(session);
 const sessionButtons = [...document.querySelectorAll<HTMLButtonElement>(".session-switcher-item")];
-assert.equal(sessionButtons.length, 2, "multiple recovered sessions render a switcher");
+assert.equal(sessionButtons.length, 3, "multiple recovered sessions render a switcher and historical-review disclosure");
 sessionButtons.find((button) => button.textContent?.includes("Second session"))?.click();
 __workspaceAppTest.renderWorkSessionView(secondSession);
 assert.ok(document.querySelector(".session-switcher-item.selected")?.textContent?.includes("Second session"), "session switcher selects another work session");
@@ -320,7 +320,7 @@ await assert.rejects(
     name: "provide_review_feedback",
     arguments: { sessionId: "session-reconnect", submissionId: "submission-1", comments: "ambiguous" },
   }),
-  /Verify the operation before retrying/,
+  (error) => error instanceof AmbiguousMutationError && error.operation === "provide_review_feedback",
   "ambiguous mutations are not blindly replayed after reconnect",
 );
 assert.equal(fakeMutationCalls, 1, "ambiguous mutation is sent only once");

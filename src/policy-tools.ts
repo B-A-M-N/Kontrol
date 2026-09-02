@@ -7,6 +7,7 @@ import type { ApprovalScope } from "./policy.js";
 import type { PrincipalRole } from "./policy-enforcement.js";
 import type { ApprovalRequestManager, ApprovalRequest } from "./approval-requests.js";
 import { workspaceAppToolMeta } from "./workspace-app-resource.js";
+import { mutationPrincipalId, runWithMutationReceipt, type MutationReceiptStore } from "./mutation-receipts.js";
 
 interface PolicyToolConfig {
   eventStore: EventStore;
@@ -20,6 +21,8 @@ interface PolicyToolConfig {
    * authority.
    */
   principalRole?: PrincipalRole;
+  principalId?: string;
+  mutationReceipts?: MutationReceiptStore;
 }
 
 function isReviewer(role?: PrincipalRole): boolean {
@@ -28,6 +31,26 @@ function isReviewer(role?: PrincipalRole): boolean {
 
 function workspaceAppModelAndAppMeta() {
   return workspaceAppToolMeta();
+}
+
+function registerMutationPolicyTool(
+  server: McpServer,
+  name: string,
+  definition: unknown,
+  config: PolicyToolConfig,
+  handler: (input: any) => Promise<unknown> | unknown,
+): void {
+  registerAppTool(server, name as any, definition as any, (async (input: any) => {
+    const { clientMutationId, ...request } = input as { clientMutationId?: string } & Record<string, unknown>;
+    return runWithMutationReceipt({
+      store: config.mutationReceipts,
+      principalId: mutationPrincipalId(config.principalId, config.principalRole),
+      operation: name,
+      clientMutationId,
+      request,
+      execute: () => handler(input),
+    });
+  }) as any);
 }
 
 const approvalOptionSchema = z.object({
@@ -260,7 +283,7 @@ export function registerPolicyTools(
     },
   );
 
-  registerAppTool(
+  registerMutationPolicyTool(
     server,
     "provide_policy_approval",
     {
@@ -271,11 +294,13 @@ export function registerPolicyTools(
         decision: z.string().describe("Approval decision or generic approval option ID."),
         scope: z.enum(["once", "work_session", "workspace"]).optional().describe("How long the approval should apply. Defaults to once."),
         reason: z.string().optional().describe("Optional reason for the decision."),
+        clientMutationId: z.string().min(1).max(200).optional(),
       },
       outputSchema: { status: z.string(), approvalId: z.string() },
       _meta: workspaceAppModelAndAppMeta(),
       annotations: { readOnlyHint: false, destructiveHint: false },
     },
+    config,
     async ({ approvalId, decision, scope, reason }) => {
       // SERVER-SIDE ROLE CHECK: reviewer-only tool. The worker (coding agent)
       // must not be able to self-approve its own blocked tool calls.
@@ -426,7 +451,7 @@ export function registerPolicyTools(
     },
   );
 
-  registerAppTool(
+  registerMutationPolicyTool(
     server,
     "revoke_policy_grants",
     {
@@ -435,11 +460,13 @@ export function registerPolicyTools(
       inputSchema: {
         scope: z.enum(["work_session", "workspace"]),
         scopeId: z.string().min(1),
+        clientMutationId: z.string().min(1).max(200).optional(),
       },
       outputSchema: { status: z.string(), scope: z.string(), scopeId: z.string() },
       _meta: workspaceAppModelAndAppMeta(),
       annotations: { readOnlyHint: false, destructiveHint: true },
     },
+    config,
     async ({ scope, scopeId }) => {
       if (!isReviewer(config.principalRole)) {
         return { content: [{ type: "text" as const, text: "Forbidden: revoke_policy_grants requires reviewer authority." }], isError: true };

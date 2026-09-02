@@ -44,20 +44,44 @@ try {
     values (?, ?, ?, 'active', 'checkout', 'false', ?, ?)
   `).run("workspace-1", "project-1", "/tmp/project-1", now, now);
   database.sqlite.prepare(`
+    insert into workspace_sessions (id, project_id, root, status, mode, managed, created_at, last_used_at)
+    values (?, ?, ?, 'active', 'checkout', 'false', ?, ?)
+  `).run("workspace-2", "project-1", "/tmp/project-1", now, now);
+  database.sqlite.prepare(`
     insert into work_sessions (id, project_id, workspace_session_id, status, runtime_state, completion_policy, review_epoch, submitted_by, created_at, updated_at)
     values (?, ?, ?, 'in_progress', 'running', 'agent_completion', 1, 'test', ?, ?)
   `).run("session-ws-1", "project-1", "workspace-1", now, now);
   events.appendEvent({ type: "agent.tool.completed", sessionId: "session-ws-1", payload: { tool: "read" } });
   const cursor = events.getWorkspaceEventsAfter("workspace-1", 0);
   assert.equal(cursor.length, 1, "workspace stream includes events for its work sessions");
+  assert.equal(
+    events.getWorkspaceEventsAfter("workspace-2", 0).length,
+    1,
+    "workspace stream resolves a workspace session to its project scope",
+  );
   const nextSeq = cursor[cursor.length - 1].seq;
-  const pending = events.waitForWorkspaceEventsAfter("workspace-1", nextSeq, 1_000);
+  const pending = events.waitForWorkspaceEventsAfter("workspace-2", nextSeq, 1_000);
   setTimeout(() => {
     events.appendEvent({ type: "review.submitted", sessionId: "session-ws-1", payload: { submissionId: "submission-1" } });
   }, 5);
   const arrived = await pending;
   assert.equal(arrived.length, 1, "workspace waiter wakes for a later session event");
   assert.equal(arrived[0].type, "review.submitted");
+
+  let secondSubscriberCalls = 0;
+  const unsubscribeThrowing = events.subscribe("session-ws-1", () => {
+    throw new Error("observer failure");
+  });
+  const unsubscribeHealthy = events.subscribe("session-ws-1", () => {
+    secondSubscriberCalls += 1;
+  });
+  assert.doesNotThrow(() => {
+    events.appendEvent({ type: "review.feedback", sessionId: "session-ws-1", payload: { verdict: "approve" } });
+  }, "a subscriber failure must not turn a committed append into an API failure");
+  assert.equal(secondSubscriberCalls, 1, "a failing subscriber must not starve later subscribers");
+  assert.equal(events.getLatestEvent("session-ws-1", "review.feedback")?.payload.verdict, "approve");
+  unsubscribeThrowing();
+  unsubscribeHealthy();
 } finally {
   events.close();
   database.close();

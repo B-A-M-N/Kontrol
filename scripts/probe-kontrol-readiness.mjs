@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // End-to-end readiness probe for the local KONTROL control plane.
 // This intentionally exercises the same boundary that Devdesktop uses:
-// initialize -> discover_agents -> open_workspace -> read -> bash.
+// initialize -> tools/list -> discover_agents -> open_workspace -> structured read-only tools.
 import assert from "node:assert/strict";
 import { resolve } from "node:path";
 
@@ -100,6 +100,12 @@ await rpc("initialize", {
 }, { withSession: false });
 assert.ok(sessionId, "initialize did not provide an MCP session id");
 
+const listedTools = await rpc("tools/list", {});
+const publicToolNames = new Set((listedTools?.tools ?? []).map((tool) => tool.name));
+for (const requiredTool of ["read", "grep", "glob", "ls"]) {
+  assert.ok(publicToolNames.has(requiredTool), `public MCP tools/list is missing ${requiredTool}`);
+}
+
 const discovered = skipDiscover ? { agents: [] } : await callTool("discover_agents", {});
 const agents = discovered?.agents ?? [];
 for (const expected of agentSpecs) {
@@ -114,6 +120,12 @@ const opened = await callTool("open_workspace", { path: workspace, mode: "checko
 assert.ok(opened?.workspaceId, "open_workspace did not return workspaceId");
 const read = await callTool("read", { workspaceId: opened.workspaceId, path: "package.json", limit: 5 });
 assert.ok(typeof read?.result === "string" || JSON.stringify(read).includes("@b-a-m-n/kontrol"), "read did not return the fixture file");
+const grep = await callTool("grep", { workspaceId: opened.workspaceId, pattern: "@b-a-m-n/kontrol", path: "package.json" });
+assert.ok(typeof grep?.result === "string" || JSON.stringify(grep).includes("@b-a-m-n/kontrol"), "grep did not inspect the fixture file");
+const glob = await callTool("glob", { workspaceId: opened.workspaceId, pattern: "package.json" });
+assert.ok(typeof glob?.result === "string" || JSON.stringify(glob).includes("package.json"), "glob did not discover the fixture file");
+const ls = await callTool("ls", { workspaceId: opened.workspaceId, path: "." });
+assert.ok(typeof ls?.result === "string" || JSON.stringify(ls).includes("package.json"), "ls did not list the workspace");
 if (probeBash) {
   const bash = await callTool("bash", { workspaceId: opened.workspaceId, command: "pwd", timeout: 10 });
   assert.ok(typeof bash?.result === "string" || JSON.stringify(bash).includes(workspace), "bash did not execute in the opened workspace");

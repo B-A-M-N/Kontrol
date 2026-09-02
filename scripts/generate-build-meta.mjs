@@ -77,7 +77,12 @@ const buildMeta = {
   version: getPackageVersion(),
   gitSha: getGitSha(),
   gitDirty: getGitDirty(),
-  buildTimestamp: new Date().toISOString(),
+  buildTimestamp: process.env.KONTROL_BUILD_TIMESTAMP || new Date().toISOString(),
+  // contentSha256 identifies the executable/UI tree independently of source
+  // provenance. Atomic builds use a separate buildId for the exact immutable
+  // release, so metadata from a different source snapshot can never be
+  // silently reused for identical output bytes.
+  contentSha256: process.env.KONTROL_CONTENT_SHA256 || undefined,
   schemaHash: getSchemaHash(),
   // Older schemas are upgraded in place by the migration chain. Future
   // schemas are rejected fail-closed, so these bounds describe what this

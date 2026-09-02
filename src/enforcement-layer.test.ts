@@ -185,6 +185,7 @@ try {
       diffSha256: sub2.structuredContent.diffSha256,
       reviewEpoch: sub2.structuredContent.reviewEpoch,
       verdict: "changes_requested",
+      comments: "Fix the reviewed issue before resubmitting.",
     });
     assert.ok(!fb.isError, "changes_requested succeeds with no allowedNextActions");
     const session = workSessions.get(sessionId)!;
@@ -328,6 +329,7 @@ try {
       diffSha256: sub.structuredContent.diffSha256,
       reviewEpoch: sub.structuredContent.reviewEpoch,
       verdict: "changes_requested",
+      comments: "Please address the reviewed issue before resubmitting.",
     });
     assert.ok(!changes.isError, "changes_requested allowed on drifted workspace (drift check is approve-only)");
     assert.equal(workSessions.get(sessionId)!.status, "changes_requested");
@@ -344,6 +346,7 @@ try {
       diffSha256: sub9.structuredContent.diffSha256,
       reviewEpoch: sub9.structuredContent.reviewEpoch,
       verdict: "changes_requested",
+      comments: "Please address the reviewed issue before resubmitting.",
       allowedNextActions: ["edit_files", "run_commands"], // no "resubmit"
     });
     const decision = authorizeWorkSessionAction(workSessions, { workSessionId: sessionId, tool: "submit_for_review" });

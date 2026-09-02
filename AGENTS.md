@@ -29,6 +29,21 @@ ACP review workflow:
 
 - Reviewer tools and worker tools are separate. Workers must never approve their
   own work or operate on a work session they are not bound to.
+- Reviewer and delegation routing: the active WebUI model is the primary
+  reviewer, orchestrator, and inspector. Review, audit, diagnosis, architecture,
+  and code-edit work starts directly in the opened workspace. ACP workers are
+  optional bounded assistance only; call `discover_agents` before delegation,
+  dispatch only a currently dispatchable healthy `role: agent` peer, and when
+  optional assistance is unavailable return to direct workspace work without
+  trying an alternate ACP path. A normal review must not enter supervised work.
+  Ordinary non-Git directories are valid checkout workspaces; Git is required
+  only for managed worktrees.
+- Review checkpoints are backend-neutral: Git workspaces use immutable Git
+  snapshots, while ordinary directories use content-addressed filesystem
+  snapshots without initializing or mutating Git. Submissions, approval, and
+  verification bind to `snapshotKind` plus `snapshotRef`; any patch is only a
+  bounded presentation of that exact snapshot. Structured read-only `read`,
+  `grep`, `glob`, and `ls` remain public even in codex tool mode.
 - `submit_to_coding_agent` and supervised mission tools create durable work
   sessions. A worker submits changes with `submit_for_review`, then blocks on
   `await_review_feedback`.
@@ -146,6 +161,9 @@ Current implementation contracts:
   identity is a canonical operation fingerprint, not transient MCP session or
   request IDs. Direct orphan cards have a bounded reattachment grace period;
   live waiters are separate and cleaned up on disconnect or resolution.
+- Approval-required MCP responses remain valid against the gated tool's
+  declared output schema, including tool-specific preview fields such as
+  `apply_patch` additions, removals, and files.
 - The Linux systemd deployment is named `kontrol-core.service` and owns the
   MCP core only. `start-all.sh` is the full development/integration launcher;
   these paths share the runtime lock and cannot own one generation together.
@@ -160,11 +178,27 @@ Current implementation contracts:
   `dist.previous`, or the committed generation. A candidate must pass static
   release-local import validation (including absolute/file-URL and repository
   layout escapes) plus an isolated load/boot/MCP smoke before activation.
+  `build-meta.json` keeps the executable-tree `contentSha256` separate from
+  the immutable build ID, which also binds source provenance and build time;
+  stale metadata cannot be reused for a new release identity.
   `generation.json` owns active, previous, and last-known-good artifacts; those
   pointers rotate only after readiness is proven.
 - Periodic and startup reconciliation is bounded by pages/cursors so runtime
   state, approval expiry, direct-approval orphan cleanup, and telemetry work
   cannot become an unbounded synchronous serving-thread sweep.
+- Workspace event reads and subscriptions resolve workspace sessions through the
+  same project scope, and review/tool cursors use stable timestamp-plus-ID
+  ordering. Older pending reviews are discoverable through an explicit stale
+  history filter rather than silently disappearing from the active surface.
+- `changes_requested` review feedback requires nonempty agent instructions.
+  Durable bridge and policy mutations accept an optional authenticated
+  principal-scoped `clientMutationId`; canonical request receipts replay
+  completed outcomes and fail closed on conflicting, pending, corrupt, or
+  unfinalizable reuse. Receipt maintenance is bounded and retains pending rows
+  for reconciliation.
+- `npm run test:ui` includes a real Chromium pass over the built single-file
+  Workspace UI, covering responsive layout, focus-visible controls, host theme
+  tokens, and live-versus-stale session status presentation.
 - For the systemd core unit, `restart` means restart the installed immutable
   release; `upgrade` selects the latest immutable build candidate (falling
   back to the checkout `dist/` projection), verifies readiness, and restores

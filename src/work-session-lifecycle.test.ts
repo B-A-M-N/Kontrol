@@ -65,6 +65,51 @@ try {
     /cannot submit for review/,
     "a second submit must be rejected after the first transaction advances the status",
   );
+
+  const chronologySession = workSessions.create({ workspaceSessionId: secondWorkspace.id, submittedBy: "chronology-test" });
+  const sameTimestamp = "2025-01-01T00:00:00.000Z";
+  for (const id of ["tool-1", "tool-2", "tool-3"]) {
+    database.sqlite.prepare(`
+      insert into work_session_tool_events
+        (id, work_session_id, workspace_session_id, tool, input_json, success, elapsed_ms, created_at)
+      values (?, ?, ?, 'read', '{}', 1, 1, ?)
+    `).run(id, chronologySession.id, secondWorkspace.id, sameTimestamp);
+  }
+  const toolPageOne = workSessions.listToolEvents(chronologySession.id, undefined, 2);
+  const toolPageTwo = workSessions.listToolEvents(chronologySession.id, toolPageOne[toolPageOne.length - 1]!.id, 2);
+  assert.deepEqual(
+    [...toolPageOne, ...toolPageTwo].map((event) => event.id),
+    ["tool-3", "tool-2", "tool-1"],
+    "same-millisecond tool events paginate by created_at and id without skips or duplicates",
+  );
+
+  const feedbackSession = workSessions.create({ workspaceSessionId: secondWorkspace.id, submittedBy: "feedback-chronology-test" });
+  for (let number = 1; number <= 3; number += 1) {
+    const submissionId = `chronology-submission-${number}`;
+    database.sqlite.prepare(`
+      insert into work_session_submissions
+        (id, work_session_id, submission_number, diff, diff_sha256, review_epoch, status, created_at)
+      values (?, ?, ?, '', '', ?, 'reviewed', ?)
+    `).run(submissionId, feedbackSession.id, number, number, sameTimestamp);
+    database.sqlite.prepare(`
+      insert into work_session_feedback
+        (id, work_session_id, submission_id, verdict, comments, created_at)
+      values (?, ?, ?, 'changes_requested', ?, ?)
+    `).run(`chronology-feedback-${number}`, feedbackSession.id, submissionId, `feedback-${number}`, sameTimestamp);
+  }
+  assert.equal(workSessions.getLatestFeedback(feedbackSession.id)?.id, "chronology-feedback-3", "latest feedback follows submission chronology");
+  assert.equal(
+    workSessions.getLatestFeedbackAfter(feedbackSession.id, "chronology-feedback-1")?.id,
+    "chronology-feedback-3",
+    "feedback after an anchor follows submission chronology rather than timestamps",
+  );
+  workSessions.markFeedbackConsumed(feedbackSession.id, "chronology-feedback-2");
+  workSessions.markFeedbackConsumed(feedbackSession.id, "chronology-feedback-1");
+  const consumed = database.sqlite.prepare(
+    "select last_consumed_feedback_id, last_consumed_review_epoch from work_sessions where id = ?",
+  ).get(feedbackSession.id) as { last_consumed_feedback_id: string; last_consumed_review_epoch: number };
+  assert.equal(consumed.last_consumed_feedback_id, "chronology-feedback-2", "consumed feedback anchor cannot regress");
+  assert.equal(consumed.last_consumed_review_epoch, 2, "consumed feedback epoch remains monotonic");
 } finally {
   workSessions.close();
   store.close();

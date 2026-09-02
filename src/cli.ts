@@ -3,11 +3,14 @@ import { createRequire } from "node:module";
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, rmSync, statSync, statfsSync, writeFileSync } from "node:fs";
 import { stdin as input, stdout as output } from "node:process";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import * as prompts from "@clack/prompts";
 import { getShellConfig } from "@earendil-works/pi-coding-agent";
 import { satisfies } from "semver";
 import { loadConfig } from "./config.js";
+import { loadPolicyConfig, policyCanAsk } from "./policy.js";
+import { runServiceCommand } from "./service.js";
 import { isRuntimeIdentityLive, readBuildIdentity, readRuntimeIdentity } from "./runtime-identity.js";
 import {
   generateOwnerToken,
@@ -18,9 +21,9 @@ import {
 } from "./user-config.js";
 import { expandHomePath } from "./roots.js";
 
-type Command = "serve" | "up" | "init" | "doctor" | "config" | "help" | "version";
+type Command = "serve" | "up" | "init" | "doctor" | "config" | "service" | "help" | "version";
 const require = createRequire(import.meta.url);
-const SUPPORTED_NODE_RANGE = ">=22.19 <27";
+const SUPPORTED_NODE_RANGE = ">=22.19 <23 || >=24 <25 || >=26 <27";
 
 async function main(argv: string[]): Promise<void> {
   assertSupportedNode();
@@ -45,6 +48,9 @@ async function main(argv: string[]): Promise<void> {
     case "config":
       runConfigCommand(args);
       return;
+    case "service":
+      await runServiceCommand(args);
+      return;
     case "help":
       printHelp();
       return;
@@ -56,7 +62,7 @@ async function main(argv: string[]): Promise<void> {
 
 function normalizeCommand(command: string | undefined): Command {
   if (!command || command === "serve" || command === "start") return "serve";
-  if (command === "up" || command === "init" || command === "doctor" || command === "config") return command;
+  if (command === "up" || command === "init" || command === "doctor" || command === "config" || command === "service") return command;
   if (command === "help" || command === "--help" || command === "-h") return "help";
   if (command === "version" || command === "--version" || command === "-v") return "version";
   throw new Error(`Unknown command: ${command}`);
@@ -242,6 +248,26 @@ async function runDoctor(): Promise<void> {
   console.log(`Config dir: ${files.dir}`);
   console.log(`Config file: ${files.configExists ? files.configPath : "missing"}`);
   console.log(`Auth file: ${files.authExists ? files.authPath : "missing"}`);
+  if (process.platform !== "win32" && files.authExists) {
+    try {
+      const mode = statSync(files.authPath).mode & 0o777;
+      doctorResult(
+        "Auth permissions",
+        (mode & 0o077) === 0 ? "PASS" : "WARN",
+        `mode=${mode.toString(8)}${(mode & 0o077) === 0 ? "" : "; auth.json is readable by group/others — rewrite it with `kontrol init --force`"}`,
+      );
+    } catch (error) {
+      doctorResult("Auth permissions", "UNAVAILABLE", error instanceof Error ? error.message : String(error));
+    }
+  }
+  const persistedRoots = files.config.allowedRoots;
+  if (files.configExists && (!Array.isArray(persistedRoots) || persistedRoots.every((root) => !root.trim()))) {
+    doctorResult(
+      "Legacy allowed roots",
+      "FAIL",
+      "config.json has no explicit allowedRoots; the old implicit current-directory fallback is disabled. Run `kontrol init --force` or add allowedRoots explicitly.",
+    );
+  }
   doctorResult("Node/runtime", nodeVersionStatus(), satisfies(process.versions.node, SUPPORTED_NODE_RANGE) ? "" : `current=${process.version}`);
   doctorResult("Node ABI", "PASS", process.versions.modules);
   doctorResult("Platform", "PASS", `${process.platform} ${process.arch}`);
@@ -315,7 +341,13 @@ async function runDoctor(): Promise<void> {
     doctorResult("Allowed hosts", config.allowedHosts.includes("*") ? "WARN" : "PASS", config.allowedHosts.join(", "));
     doctorResult("Tunnel bind", config.authMode === "tunnel" && !isLoopbackHostForDoctor(config.host) ? "FAIL" : "PASS", config.host);
 
-    const distDir = resolve(process.cwd(), "dist");
+    // In a package install the immutable runtime is next to this compiled
+    // module, not under the caller's working directory. Source checkouts keep
+    // the cwd fallback for the development projection.
+    const moduleDir = dirname(fileURLToPath(import.meta.url));
+    const distDir = existsSync(join(moduleDir, "build-meta.json"))
+      ? moduleDir
+      : resolve(process.cwd(), "dist");
     const requiredArtifacts = ["cli.js", "server.js", "acp-duplex.js", "build-meta.json", "ui/workspace-app.html"];
     const missingArtifacts = requiredArtifacts.filter((file) => !existsSync(resolve(distDir, file)));
     doctorResult("Build artifacts", missingArtifacts.length === 0 ? "PASS" : "FAIL", missingArtifacts.length === 0 ? distDir : `missing ${missingArtifacts.join(", ")}`);
@@ -498,6 +530,12 @@ function inspectDoctorDatabase(stateDir: string): Record<string, { status: "PASS
 
 function runConfigCommand(args: string[]): void {
   const [subcommand, key, ...rest] = args;
+  if (subcommand === "effective-policy") {
+    if (key !== undefined && key !== "--json") throw new Error("Usage: kontrol config effective-policy --json");
+    const policy = loadPolicyConfig(process.env);
+    console.log(JSON.stringify({ ...policy, canAsk: policyCanAsk(policy) }));
+    return;
+  }
   const files = loadKontrolFiles();
 
   if (!subcommand || subcommand === "get") {
@@ -537,6 +575,8 @@ function printHelp(): void {
       "  kontrol doctor          Show config, runtime, and native dependency status",
       "  kontrol config get      Print persisted config",
       "  kontrol config set publicBaseUrl <url|null>",
+      "  kontrol config effective-policy --json",
+      "  kontrol service install|start|stop|restart|upgrade|status|logs|uninstall",
       "  kontrol -v, --version   Print the installed version",
       "",
       "For temporary tunnels:",

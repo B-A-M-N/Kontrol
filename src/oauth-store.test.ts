@@ -91,6 +91,9 @@ async function testDatabaseConfiguration(stateDir: string): Promise<void> {
       { version: 48, name: "policy-approval-operation-lifecycle" },
       { version: 49, name: "policy-approval-once-consumption" },
       { version: 50, name: "policy-approval-direct-reconnect-deadline" },
+      { version: 51, name: "work-session-stable-chronology" },
+      { version: 52, name: "client-mutation-receipts" },
+      { version: 53, name: "backend-neutral-snapshot-identities" },
     ]);
   } finally {
     database.close();

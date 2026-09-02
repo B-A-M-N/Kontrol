@@ -120,7 +120,10 @@ function parsePort(value: string | number | undefined): number {
 function parseAllowedRoots(value: string | string[] | undefined): string[] {
   if (Array.isArray(value)) {
     const roots = value.map((entry) => entry.trim()).filter(Boolean);
-    return (roots.length > 0 ? roots : [process.cwd()]).map((root) => resolve(expandHomePath(root)));
+    if (roots.length === 0) {
+      throw new Error("KONTROL_ALLOWED_ROOTS must contain at least one explicit directory; refusing an implicit process.cwd() filesystem boundary");
+    }
+    return roots.map((root) => resolve(expandHomePath(root)));
   }
 
   const rawRoots =
@@ -129,8 +132,10 @@ function parseAllowedRoots(value: string | string[] | undefined): string[] {
       .map((entry) => entry.trim())
       .filter(Boolean) ?? [];
 
-  const roots = rawRoots.length > 0 ? rawRoots : [process.cwd()];
-  return roots.map((root) => resolve(expandHomePath(root)));
+  if (rawRoots.length === 0) {
+    throw new Error("KONTROL_ALLOWED_ROOTS must contain at least one explicit directory; refusing an implicit process.cwd() filesystem boundary");
+  }
+  return rawRoots.map((root) => resolve(expandHomePath(root)));
 }
 
 function parseAllowedHosts(value: string | string[] | undefined, derivedHosts: string[]): string[] {

@@ -80,7 +80,7 @@ A good continuation includes:
   ],
   "workOrder": {
     "objectiveForThisTurn": "Render approval blockers and evidence binding for the latest submission.",
-    "requiredActions": ["Add blocker panel", "Show submissionId and snapshotCommit for evidence", "Add regression coverage"],
+    "requiredActions": ["Add blocker panel", "Show submissionId and snapshotKind/snapshotRef for evidence", "Add regression coverage"],
     "prohibitedActions": ["Do not bypass approve_supervised_work"],
     "requiredVerification": ["npm run typecheck", "npm test"]
   }

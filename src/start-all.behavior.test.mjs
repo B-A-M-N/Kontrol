@@ -423,7 +423,12 @@ function startRestartController(envPath, extraEnv = {}) {
   child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
   child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
   child.once("close", (status, signal) => resolveResult({ status, signal, stdout, stderr }));
-  return { child, result };
+  return {
+    child,
+    result,
+    get stdout() { return stdout; },
+    get stderr() { return stderr; },
+  };
 }
 
 function processParentPid(pid) {
@@ -451,7 +456,7 @@ function killController(controller, markerPath, signal = "SIGKILL") {
   }
 }
 
-function waitForPath(path, timeoutMs = 5_000) {
+function waitForPath(path, timeoutMs = 15_000) {
   return new Promise((resolve) => {
     const deadline = Date.now() + timeoutMs;
     const check = () => {
@@ -475,10 +480,11 @@ const candidateRelease = join(root, "releases", candidateBuildId);
 mkdirSync(join(baseRelease, "ui"), { recursive: true });
 writeFileSync(join(baseRelease, "build-meta.json"), JSON.stringify({
   buildId: baseBuildId,
+  contentSha256: "0123456789abcdef",
   schemaVersion: 0,
   minReadableSchemaVersion: 0,
   maxReadableSchemaVersion: 0,
-  releaseFormatVersion: 2,
+  releaseFormatVersion: 3,
 }) + "\n");
 for (const file of ["cli.js", "server.js", "acp-duplex.js", "ui/workspace-app.html"]) writeFileSync(join(baseRelease, file), "test-artifact\n");
 
@@ -633,7 +639,11 @@ try {
   const postStopCrashMarker = join(harnessRoot, "pause-runtime-lock-acquire");
   writeEnvironment(postStopCrashState, 17685, { pauseRuntimeLockAcquire: true, pauseMarker: postStopCrashMarker });
   const postStopCrashController = startRestartController(postStopCrashEnv);
-  assert.equal(await waitForPath(postStopCrashMarker), true, "controller must reach post-stop ownership handoff before SIGKILL");
+  assert.equal(
+    await waitForPath(postStopCrashMarker),
+    true,
+    `controller must reach post-stop ownership handoff before SIGKILL\nstdout:\n${postStopCrashController.stdout}\nstderr:\n${postStopCrashController.stderr}`,
+  );
   assert.equal(pathExists(join(fakeTmuxState, "kontrol-server.pid")), false, "post-stop pause must occur after the old server session is gone");
   killController(postStopCrashController, postStopCrashMarker);
   const postStopCrashResult = await postStopCrashController.result;

@@ -126,10 +126,18 @@ The experimental Codex-style surface is enabled with
 - `exec_command`
 - `write_stdin`
 
-In this mode, `write`, `edit`, `bash`, `grep`, `glob`, and `ls` are not
-registered. `exec_command` returns a process session ID when a command is still
-running after its yield window. Use `write_stdin` to poll it, send input, resize
-a PTY, or send Ctrl-C. Set `tty: true` only for commands that need a terminal.
+Review and code-edit requests are handled directly through the opened workspace
+by the WebUI model. ACP delegation is optional bounded assistance: discover
+agents first, dispatch only a currently healthy dispatchable worker, and use the
+direct workspace as the fallback when assistance is unavailable. The WebUI
+remains the reviewer and approval authority. Ordinary non-Git directories are
+valid checkout workspaces; managed worktrees are the Git-only mode.
+
+In this mode, the structured read-only tools `read`, `grep`, `glob`, and `ls`
+remain available for inspection. `exec_command` returns a process session ID
+when a command is still running after its yield window. Use `write_stdin` to
+poll it, send input, resize a PTY, or send Ctrl-C. Set `tty: true` only for
+commands that need a terminal.
 
 ## Show Changes
 

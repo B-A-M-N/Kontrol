@@ -36,28 +36,27 @@ if [[ -z "${KONTROL_TUNNEL_REVIEWER_SECRET:-}" && -n "${KONTROL_ACP_REVIEWER_SEC
   export KONTROL_TUNNEL_REVIEWER_SECRET="$KONTROL_ACP_REVIEWER_SECRET"
 fi
 
-# Mirror the server's startup gate (src/config.ts): an ask-capable policy
-# without a reviewer assertion creates approvals that no surface can resolve.
-function policy_can_ask() {
-  local mode="${KONTROL_POLICY_MODE:-allow}"
-  [[ "$mode" == "ask" ]] && return 0
-  # Per-tool rules arrive as KONTROL_POLICY_TOOL_<name>=<mode> environment
-  # entries. Bash cannot expand indeterminate names with parameter expansion,
-  # so iterate matching variable names with compgen.
-  local name
-  while IFS= read -r name; do
-    [[ -n "$name" ]] || continue
-    if [[ "${!name:-allow}" == "ask" ]]; then return 0; fi
-  done < <(compgen -e | grep '^KONTROL_POLICY_TOOL_')
-  if [[ -n "${KONTROL_POLICY_PATH_RULES:-}" ]]; then
-    if printf '%s' "$KONTROL_POLICY_PATH_RULES" | grep -q '"mode"[[:space:]]*:[[:space:]]*"ask"'; then
-      return 0
-    fi
-  fi
-  return 1
-}
-
-if [[ -z "${KONTROL_TUNNEL_REVIEWER_SECRET:-}" ]] && policy_can_ask; then
+# Ask-capability is computed by the same compiled policy loader used by the
+# server. This keeps secure-baseline defaults, aliases, and strict malformed
+# value handling identical across both startup paths.
+if [[ -n "${KONTROL_POLICY_CLI_PATH:-}" ]]; then
+  POLICY_COMMAND=(node "$KONTROL_POLICY_CLI_PATH")
+elif [[ -f "${DESKTOP_PWD}/dist/cli.js" && -f "${DESKTOP_PWD}/dist/build-meta.json" ]] \
+  && node "${DESKTOP_PWD}/dist/cli.js" config effective-policy --json >/dev/null 2>&1; then
+  POLICY_COMMAND=(node "${DESKTOP_PWD}/dist/cli.js")
+elif [[ -f "${DESKTOP_PWD}/src/cli.ts" && -x "${DESKTOP_PWD}/node_modules/.bin/tsx" ]]; then
+  # Source checkout fallback: execute the same CLI implementation through
+  # tsx when the checkout's immutable dist projection is stale or absent.
+  POLICY_COMMAND=(node --import tsx "${DESKTOP_PWD}/src/cli.ts")
+else
+  echo "ERROR: Kontrol CLI is unavailable; run npm run build first." >&2
+  exit 1
+fi
+if ! EFFECTIVE_POLICY_JSON="$("${POLICY_COMMAND[@]}" config effective-policy --json)"; then
+  echo "ERROR: effective policy could not be loaded; refusing to start the tunnel." >&2
+  exit 1
+fi
+if [[ -z "${KONTROL_TUNNEL_REVIEWER_SECRET:-}" ]] && ! node -e 'const fs=require("node:fs"); const value=JSON.parse(fs.readFileSync(0,"utf8")); process.exit(value.canAsk ? 0 : 1)' <<<"$EFFECTIVE_POLICY_JSON"; then
   echo "ERROR: KONTROL_AUTH_MODE=tunnel with an ask-capable policy requires a reviewer credential." >&2
   echo "       Set KONTROL_TUNNEL_REVIEWER_SECRET (or KONTROL_ACP_REVIEWER_SECRET), or use a" >&2
   echo "       non-interactive policy posture (KONTROL_POLICY_MODE=allow). Ask-gated tools" >&2

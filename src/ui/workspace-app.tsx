@@ -60,6 +60,7 @@ interface MountedPayload {
 interface AgentActivityEvent {
   seq: number;
   id: string;
+  durable?: boolean;
   type: string;
   sessionId: string;
   workspaceSessionId?: string;
@@ -110,7 +111,7 @@ interface PolicyApprovalView {
     effect: "approve" | "deny" | "changes_requested";
     scope?: "once" | "work_session" | "workspace";
   }>;
-  uiState?: "idle" | "submitting" | "resolved" | "error";
+  uiState?: "idle" | "submitting" | "resolved" | "error" | "outcome_unknown";
   error?: string;
 }
 
@@ -159,7 +160,7 @@ interface MissionPacketView {
   approval: { allowed: boolean; reasons: string[] };
 }
 
-type FeedbackState = "idle" | "submitting" | "submitted" | "error";
+type FeedbackState = "idle" | "submitting" | "submitted" | "error" | "outcome_unknown";
 
 interface WorkSessionViewState {
   workspaceSessionId: string;
@@ -169,12 +170,12 @@ interface WorkSessionViewState {
   submittedBy?: string;
   status: string;
   updatedAt?: string;
+  lastHeartbeatAt?: string;
   lifecycle?: string;
   runtimeState?: string;
   unresolvedMessageCount: number;
   pendingApprovalCount: number;
   lastSeq: number;
-  lastHeartbeatAt?: string;
   activity: AgentActivityEvent[];
   submissions: Map<string, ReviewSubmissionView>;
   policyApprovals: Map<string, PolicyApprovalView>;
@@ -204,6 +205,7 @@ interface WorkspaceSurfaceSession {
   runId?: string;
   lastSeq: number;
   updatedAt: string;
+  lastHeartbeatAt?: string;
   lifecycle: string;
   runtimeState: string;
   hasMission: boolean;
@@ -247,6 +249,11 @@ let approvalAttention: ApprovalAttentionState = initialApprovalAttentionState;
 // Approvals whose "new" attention decision already ran; the workspace event
 // stream can redeliver the same row after reconnect and must not re-yank.
 const approvalAttentionDelivered = new Set<string>();
+const workspaceApprovalConfirmations = new Set<string>();
+// A message mutation that lost its response is intentionally not made
+// clickable again until the authoritative session projection has been
+// refreshed. This keeps a transport retry from becoming a second mutation.
+const messageMutationOutcomeUnknown = new Set<string>();
 // P1: approval-recovery control-plane health. Rehydration stays resilient,
 // but the exact failure mode must stay visible instead of silently swallowed.
 type ApprovalRecoveryState = "healthy" | "degraded" | "forbidden" | "disconnected";
@@ -255,6 +262,7 @@ let lastToolCard: ToolResultCard | null = null;
 let rehydrationPromise: Promise<void> | null = null;
 let rehydrationRequested = false;
 let lastSuccessfulHydrationAt: string | null = null;
+let historicalPendingReviewsLoaded = false;
 
 // View-local UI state (replaced the previous globals).
 let expanded = false;
@@ -305,6 +313,50 @@ let currentWorkSessionDom: WorkSessionDom | null = null;
 let currentLegacyReviewDom: LegacyReviewDom | null = null;
 
 let renderQueued = false;
+
+interface FocusSnapshot {
+  key: string;
+  selectionStart?: number | null;
+  selectionEnd?: number | null;
+}
+
+function captureFocusSnapshot(): FocusSnapshot | undefined {
+  const active = document.activeElement;
+  if (!(active instanceof HTMLElement) || !appRoot.contains(active)) return undefined;
+  const key = active.dataset.focusKey;
+  if (!key) return undefined;
+  const selectable = active as HTMLInputElement | HTMLTextAreaElement;
+  return {
+    key,
+    selectionStart: "selectionStart" in selectable ? selectable.selectionStart : undefined,
+    selectionEnd: "selectionEnd" in selectable ? selectable.selectionEnd : undefined,
+  };
+}
+
+function restoreFocusSnapshot(snapshot: FocusSnapshot | undefined): void {
+  if (!snapshot) return;
+  const target = [...appRoot.querySelectorAll<HTMLElement>("[data-focus-key]")]
+    .find((candidate) => candidate.dataset.focusKey === snapshot.key);
+  if (!target || target.hasAttribute("disabled")) return;
+  target.focus({ preventScroll: true });
+  const selectable = target as HTMLInputElement | HTMLTextAreaElement;
+  if (snapshot.selectionStart !== undefined && "setSelectionRange" in selectable) {
+    try { selectable.setSelectionRange(snapshot.selectionStart ?? 0, snapshot.selectionEnd ?? snapshot.selectionStart ?? 0); } catch { /* non-text controls */ }
+  }
+}
+
+let heartbeatRefreshTimer: ReturnType<typeof setInterval> | undefined;
+
+function syncHeartbeatRefreshTimer(): void {
+  const view = selectedWorkSessionId ? workSessionViews.get(selectedWorkSessionId) : undefined;
+  if (view?.lastHeartbeatAt && !heartbeatRefreshTimer) {
+    heartbeatRefreshTimer = setInterval(() => scheduleRender(), 5_000);
+    heartbeatRefreshTimer.unref?.();
+  } else if (!view?.lastHeartbeatAt && heartbeatRefreshTimer) {
+    clearInterval(heartbeatRefreshTimer);
+    heartbeatRefreshTimer = undefined;
+  }
+}
 
 function scheduleRender(): void {
   if (renderQueued) return;
@@ -551,6 +603,7 @@ async function rehydrateActiveSessions(): Promise<void> {
       view.title = s.title;
       view.submittedBy = s.submittedBy;
       view.updatedAt = s.updatedAt;
+      view.lastHeartbeatAt = s.lastHeartbeatAt;
       view.lifecycle = s.lifecycle;
       view.runtimeState = s.runtimeState;
       view.unresolvedMessageCount = s.unresolvedMessageCount;
@@ -558,8 +611,7 @@ async function rehydrateActiveSessions(): Promise<void> {
       view.lastSeq = s.lastSeq;
       view.latestFeedback = s.latestFeedback;
       if (s.latestSubmission) {
-        view.activeSubmissionId = s.latestSubmission.submissionId;
-        view.submissions.set(s.latestSubmission.submissionId, {
+        const surfaceSubmission: ReviewSubmissionView = {
           submissionId: s.latestSubmission.submissionId,
           sessionId: s.sessionId,
           submissionNumber: s.latestSubmission.submissionNumber,
@@ -571,16 +623,18 @@ async function rehydrateActiveSessions(): Promise<void> {
           fileCount: 0,
           additions: s.latestSubmission.additions,
           removals: s.latestSubmission.removals,
-        });
+        };
+        noteSubmission(view, surfaceSubmission);
       }
     }
     // If nothing is selected yet, surface the most recently updated session.
     // If the previous selection disappeared, choose the newest remaining one.
     // P0.5: a selection belonging to another workspace (or another
     // workspace's approval center) is not a valid fallback either.
+    const recoveredSessionIds = new Set(sessions.map((session) => session.sessionId));
     if (sessions.length
       && (!selectedWorkSessionId
-        || !workSessionViews.has(selectedWorkSessionId)
+        || !recoveredSessionIds.has(selectedWorkSessionId)
         || workSessionViews.get(selectedWorkSessionId)?.workspaceSessionId !== workspaceId
         || isApprovalCenterId(selectedWorkSessionId))) {
       selectedWorkSessionId = sessions[0].sessionId;
@@ -735,6 +789,7 @@ function reconcileAuthoritativeApprovals(
 function activateWorkspace(newWorkspaceId: string): void {
   if (activeWorkspaceId !== newWorkspaceId) {
     activeWorkspaceId = newWorkspaceId;
+    historicalPendingReviewsLoaded = false;
     // P0.5 isolation invariant: a workspace transition must start on the
     // new workspace's own surface. Old-workspace state is kept internally
     // for a fast return but can never render under the new selection.
@@ -789,7 +844,9 @@ async function hydrateWorkSessionSnapshot(view: WorkSessionViewState): Promise<v
       workspaceSessionId: string;
       status: string;
       runId?: string;
+      lastHeartbeatAt?: string;
       lastSeq: number;
+      recentActivity?: AgentActivityEvent[];
       hasMission: boolean;
       latestSubmission?: { submissionId: string; submissionNumber: number; status: string; additions: number; removals: number; diffSha256?: string; reviewEpoch?: number };
       latestFeedback?: { id: string; submissionId?: string; verdict: string; comments?: string; reviewerId?: string };
@@ -821,6 +878,10 @@ async function hydrateWorkSessionSnapshot(view: WorkSessionViewState): Promise<v
     if (snapshotIsCurrent) {
       view.status = snap.status;
       view.runId = snap.runId ?? view.runId;
+      view.lastHeartbeatAt = snap.lastHeartbeatAt;
+      if (snap.recentActivity) {
+        view.activity = snap.recentActivity.slice(-200);
+      }
     }
     // A delayed snapshot must never rewind a cursor advanced by the live
     // watcher. Mutable snapshot fields are likewise stale when its boundary
@@ -855,6 +916,7 @@ async function hydrateWorkSessionSnapshot(view: WorkSessionViewState): Promise<v
       });
     }
     view.pendingApprovalCount = view.policyApprovals.size;
+    const previousOpenMessageIds = new Set(view.openMessages.keys());
     view.openMessages.clear();
     for (const message of snap.agentMessages ?? []) {
       if (message.status && message.status !== "open") continue;
@@ -871,10 +933,12 @@ async function hydrateWorkSessionSnapshot(view: WorkSessionViewState): Promise<v
       });
     }
     view.unresolvedMessageCount = view.openMessages.size;
+    for (const messageId of previousOpenMessageIds) {
+      if (!view.openMessages.has(messageId)) messageMutationOutcomeUnknown.delete(messageId);
+    }
     if (snap.latestSubmission) {
-      view.activeSubmissionId = snap.latestSubmission.submissionId;
       const existingSubmission = view.submissions.get(snap.latestSubmission.submissionId);
-      view.submissions.set(snap.latestSubmission.submissionId, {
+      noteSubmission(view, {
         ...existingSubmission,
         submissionId: snap.latestSubmission.submissionId,
         sessionId: view.workSessionId,
@@ -1028,6 +1092,20 @@ function ensureWorkSessionView(workSessionId: string, workspaceSessionId: string
   return view;
 }
 
+/** Keep submission selection monotonic across overlapping event, snapshot, and
+ * detail-fetch responses. Review epoch is the primary authority; submission
+ * number breaks ties within an epoch. */
+function noteSubmission(view: WorkSessionViewState, submission: ReviewSubmissionView): void {
+  const existing = view.submissions.get(submission.submissionId);
+  if (!existing || compareSubmissionAuthority(submission, existing) >= 0) {
+    view.submissions.set(submission.submissionId, submission);
+  }
+  const active = view.activeSubmissionId ? view.submissions.get(view.activeSubmissionId) : undefined;
+  if (!active || compareSubmissionAuthority(submission, active) >= 0) {
+    view.activeSubmissionId = submission.submissionId;
+  }
+}
+
 function mergePendingApproval(view: WorkSessionViewState, approval: PendingApprovalRecord, fallbackWorkspaceId: string): void {
   view.policyApprovals.set(approval.approvalId, {
     approvalId: approval.approvalId,
@@ -1070,26 +1148,101 @@ function render(): void {
   scheduleRender();
 }
 
+function uiMutationsAllowed(): boolean {
+  // A reconnect is not complete when the MCP socket is back: the durable
+  // workspace/session projection must be refreshed first. Keep every mutation
+  // disabled during that handoff so a user cannot race an authoritative
+  // reconciliation with a second click.
+  return connected && connectionState === "CONNECTED" && Boolean(app) && !rehydrationPromise;
+}
+
+function newClientMutationId(): string {
+  const randomUUID = globalThis.crypto?.randomUUID?.();
+  return `ui_${randomUUID ?? `${Date.now()}_${Math.random().toString(16).slice(2)}`}`;
+}
+
+function humanizeStatus(status: string): string {
+  const labels: Record<string, string> = {
+    in_progress: "Working",
+    awaiting_review: "Awaiting review",
+    review_in_progress: "In review",
+    changes_requested: "Changes requested",
+    continuation_queued: "Resume queued",
+    awaiting_resume: "Awaiting resume",
+    resuming: "Resuming",
+    approved: "Approved",
+    rejected: "Rejected",
+    cancelled: "Cancelled",
+    cancelling: "Cancelling",
+    failed: "Failed",
+    failed_protocol: "Protocol failure",
+    stale: "Historical",
+    archived: "Archived",
+  };
+  return labels[status] ?? status.replace(/[_-]+/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function isLiveAgentSession(view: WorkSessionViewState): boolean {
+  // A recent heartbeat alone is not proof that a worker still owns the live
+  // lease. Review, queued, and parked states are intentionally reported as a
+  // last heartbeat even when their underlying process has not exited yet.
+  const activeStatuses = new Set(["in_progress", "resuming"]);
+  const activeLifecycles = new Set(["running", "in_progress", "resuming"]);
+  const heartbeatAge = view.lastHeartbeatAt ? Date.now() - Date.parse(view.lastHeartbeatAt) : Number.POSITIVE_INFINITY;
+  return activeStatuses.has(view.status)
+    && (!view.lifecycle || activeLifecycles.has(view.lifecycle))
+    && view.runtimeState === "running"
+    && Number.isFinite(heartbeatAge)
+    && heartbeatAge >= 0
+    && heartbeatAge <= 45_000;
+}
+
+function compareSubmissionAuthority(
+  left: Pick<ReviewSubmissionView, "submissionNumber" | "reviewEpoch">,
+  right: Pick<ReviewSubmissionView, "submissionNumber" | "reviewEpoch">,
+): number {
+  if (left.reviewEpoch !== undefined && right.reviewEpoch !== undefined) {
+    return left.reviewEpoch - right.reviewEpoch || left.submissionNumber - right.submissionNumber;
+  }
+  return left.submissionNumber - right.submissionNumber
+    || (left.reviewEpoch === undefined ? 0 : 1) - (right.reviewEpoch === undefined ? 0 : 1);
+}
+
 function renderNow(): void {
-
-  if (connectionError && connectionState === "DISCONNECTED") {
-    renderConnectionError(connectionError);
-    return;
+  const focus = captureFocusSnapshot();
+  try {
+    renderNowInternal();
+  } finally {
+    restoreFocusSnapshot(focus);
+    syncHeartbeatRefreshTimer();
   }
-  if (!connected) {
-    renderEmpty(connectionState === "RECONNECTING" ? `Reconnecting to host… ${connectionError ?? ""}` : "Connecting to host...");
-    return;
-  }
+}
 
+function renderNowInternal(): void {
   const view = selectedWorkSessionId ? workSessionViews.get(selectedWorkSessionId) : undefined;
   // P0.5 isolation invariant: a selection from another workspace must never
   // render here, even if its view is still resident for a fast return.
-  if (view && (view.workspaceSessionId === activeWorkspaceId || (isApprovalCenterId(view.workSessionId) && view.workSessionId === approvalCenterId(activeWorkspaceId)))) {
+  const selectedViewIsCurrentWorkspace = view && (view.workspaceSessionId === activeWorkspaceId
+    || (isApprovalCenterId(view.workSessionId) && view.workSessionId === approvalCenterId(activeWorkspaceId)));
+  // Preserve the last authoritative projection while a transport reconnects.
+  // The projection is read-only until the connection is healthy again; wiping
+  // it here made a short tunnel flap look like data loss and encouraged users
+  // to repeat mutations whose outcome was still unknown.
+  if (selectedViewIsCurrentWorkspace) {
     if (isApprovalCenterId(view.workSessionId)) {
       renderApprovalCenterView(view);
       return;
     }
     renderWorkSessionView(view);
+    return;
+  }
+
+  if (!connected) {
+    if (connectionError && connectionState === "DISCONNECTED") {
+      renderConnectionError(connectionError);
+    } else {
+      renderEmpty(connectionState === "RECONNECTING" ? `Reconnecting to host… ${connectionError ?? ""}` : "Connecting to host...");
+    }
     return;
   }
 
@@ -1103,7 +1256,7 @@ function renderNow(): void {
   ensureSurface(`tool:${card.tool}`);
   const display = getToolDisplay(card);
   if (card.tool === "open_approval_center") {
-    renderApprovalCenterCard(card, display);
+    renderApprovalCenterCard(card);
     return;
   }
   if (isReviewTool(card.tool)) {
@@ -1381,22 +1534,46 @@ function renderWorkSessionView(view: WorkSessionViewState): void {
 
   dom.titleStatus.textContent = isApprovalCenterId(view.workSessionId)
     ? "Approval Center"
-    : view.title ?? view.status;
-  dom.statusBadge.textContent = view.status;
+    : view.title ?? "Coding agent task";
+  dom.statusBadge.textContent = humanizeStatus(view.status);
   dom.meta.replaceChildren();
-  if (view.workspaceSessionId) dom.meta.append(element("span", { className: "agent-meta-row", text: `workspace: ${view.workspaceSessionId}` }));
-  if (view.workSessionId) dom.meta.append(element("span", { className: "agent-meta-row", text: `session: ${view.workSessionId}` }));
-  if (view.runId) dom.meta.append(element("span", { className: "agent-meta-row", text: `run: ${view.runId}` }));
-  if (view.lifecycle) dom.meta.append(element("span", { className: "agent-meta-row", text: `lifecycle: ${view.lifecycle}` }));
+  const primaryMeta = element("div", {
+    className: "agent-meta-primary",
+    text: `${humanizeStatus(view.lifecycle ?? view.status)}${view.updatedAt ? ` · updated ${relativeSessionAge(view.updatedAt)}` : ""}`,
+  });
+  dom.meta.append(primaryMeta);
   if (view.lastHeartbeatAt) {
     const ageSeconds = Math.max(0, Math.round((Date.now() - Date.parse(view.lastHeartbeatAt)) / 1000));
-    dom.meta.append(element("span", { className: "agent-meta-row heartbeat-status", text: `● Agent connected · ${ageSeconds}s ago` }));
+    dom.meta.append(element("span", {
+      className: `agent-meta-row heartbeat-status${isLiveAgentSession(view) ? " live" : " stale"}`,
+      text: isLiveAgentSession(view) ? `● Agent connected · heartbeat ${ageSeconds}s ago` : `Last heartbeat · ${ageSeconds}s ago`,
+    }));
+  } else {
+    dom.meta.append(element("span", {
+      className: "agent-meta-row heartbeat-status stale",
+      text: "Agent heartbeat unavailable",
+    }));
   }
+      const details = element("details", { className: "agent-details" });
+  details.append(element("summary", { text: "Session details" }));
+  if (view.workspaceSessionId) details.append(element("span", { className: "agent-meta-row", text: `workspace session: ${view.workspaceSessionId}` }));
+  if (view.workSessionId) details.append(element("span", { className: "agent-meta-row", text: `work session: ${view.workSessionId}` }));
+  if (view.runId) details.append(element("span", { className: "agent-meta-row", text: `run: ${view.runId}` }));
+  if (view.lifecycle) details.append(element("span", { className: "agent-meta-row", text: `lifecycle: ${humanizeStatus(view.lifecycle)}` }));
+  dom.meta.append(details);
   if (lastSuccessfulHydrationAt) {
     dom.meta.append(element("span", {
       className: "agent-meta-row",
       text: `state synced · ${new Date(lastSuccessfulHydrationAt).toLocaleTimeString()}`,
     }));
+  }
+  if (!connected) {
+    dom.section.querySelector(":scope > .connection-banner")?.remove();
+    const banner = element("div", { className: "session-notice warning connection-banner", role: "status" });
+    banner.append(element("span", { text: connectionState === "RECONNECTING" ? "Connection interrupted. Showing last known state while reconnecting." : "Host connection is unavailable. Mutations are paused." }));
+    dom.section.prepend(banner);
+  } else {
+    dom.section.querySelector(":scope > .connection-banner")?.remove();
   }
 
   renderSessionSwitcher(dom.sessionSwitcher);
@@ -1542,12 +1719,25 @@ function renderSessionSwitcher(container: HTMLElement): void {
       text: `Workspace approvals · ${approvalCenter.policyApprovals.size}`,
       ariaPressed: String(selectedWorkSessionId === approvalCenter.workSessionId),
     });
+    button.dataset.focusKey = `session:${approvalCenter.workSessionId}`;
     button.addEventListener("click", () => selectWorkSession(approvalCenter.workSessionId));
     container.append(button);
   }
+  if (activeWorkspaceId && !historicalPendingReviewsLoaded) {
+    const history = element("button", {
+      className: "session-switcher-item history-action",
+      type: "button",
+      text: "Load older pending reviews",
+      ariaLabel: "Load older pending reviews",
+      disabled: !uiMutationsAllowed(),
+    });
+    history.dataset.focusKey = "session-history";
+    history.addEventListener("click", () => { void loadHistoricalPendingReviews(); });
+    container.append(history);
+  }
   if (sessions.length < 2 && !approvalCenter?.policyApprovals.size) return;
   for (const view of sessions) {
-    const label = view.title ?? view.status;
+    const label = view.title ?? humanizeStatus(view.status);
     const category = sessionCategory(view);
     const updatedAt = view.updatedAt ? relativeSessionAge(view.updatedAt) : "";
     const button = element("button", {
@@ -1557,22 +1747,71 @@ function renderSessionSwitcher(container: HTMLElement): void {
       ariaPressed: String(view.workSessionId === selectedWorkSessionId),
       title: `${view.workSessionId}${view.submittedBy ? ` · ${view.submittedBy}` : ""}`,
     });
+    button.dataset.focusKey = `session:${view.workSessionId}`;
     button.addEventListener("click", () => selectWorkSession(view.workSessionId));
     container.append(button);
   }
+}
+
+async function loadHistoricalPendingReviews(): Promise<void> {
+  const workspaceId = activeWorkspaceId;
+  if (!workspaceId || !uiMutationsAllowed()) return;
+  try {
+    const result = await callServerToolChecked({
+      name: "get_workspace_session_surface",
+      arguments: { workspaceId, filter: "stale_pending_review", limit: 100 },
+    });
+    const surface = getStructuredContent<{ sessions?: WorkspaceSurfaceSession[] }>(result)?.sessions ?? [];
+    for (const s of surface) {
+      const view = ensureWorkSessionView(s.sessionId, s.workspaceSessionId, s.runId ?? "");
+      view.status = s.status;
+      view.title = s.title;
+      view.submittedBy = s.submittedBy;
+      view.updatedAt = s.updatedAt;
+      view.lastHeartbeatAt = s.lastHeartbeatAt;
+      view.lifecycle = s.lifecycle;
+      view.runtimeState = s.runtimeState;
+      view.unresolvedMessageCount = s.unresolvedMessageCount;
+      view.pendingApprovalCount = s.pendingApprovalCount;
+      view.lastSeq = Math.max(view.lastSeq, s.lastSeq);
+      view.latestFeedback = s.latestFeedback;
+      if (s.latestSubmission) {
+        noteSubmission(view, {
+          submissionId: s.latestSubmission.submissionId,
+          sessionId: s.sessionId,
+          submissionNumber: s.latestSubmission.submissionNumber,
+          reviewEpoch: s.latestSubmission.reviewEpoch,
+          diffSha256: s.latestSubmission.diffSha256,
+          status: s.latestSubmission.status,
+          files: [],
+          patch: "",
+          fileCount: 0,
+          additions: s.latestSubmission.additions,
+          removals: s.latestSubmission.removals,
+        });
+      }
+    }
+    historicalPendingReviewsLoaded = true;
+    lastSuccessfulHydrationAt = new Date().toISOString();
+  } catch (error) {
+    errorMessage = `Older reviews could not be loaded: ${error instanceof Error ? error.message : String(error)}`;
+  }
+  scheduleRender();
 }
 
 function sessionCategory(view: WorkSessionViewState): string {
   if (view.openMessages.size > 0 || view.unresolvedMessageCount > 0 || view.policyApprovals.size > 0 || view.pendingApprovalCount > 0) {
     return "Needs input";
   }
-  if (["awaiting_review", "review_in_progress", "changes_requested"].includes(view.status)) {
+  if (["awaiting_review", "review_in_progress", "changes_requested"].includes(view.status)
+    || ["awaiting_review", "review_in_progress", "changes_requested"].includes(view.lifecycle ?? "")) {
     return "Needs review";
   }
-  if (["stale", "archived"].includes(view.runtimeState ?? "") || ["approved", "rejected", "cancelled", "failed", "failed_protocol"].includes(view.status)) {
+  if (["stale", "archived", "detached", "orphaned", "parked"].includes(view.runtimeState ?? "")
+    || ["approved", "rejected", "cancelled", "failed", "failed_protocol"].includes(view.status)) {
     return "Historical";
   }
-  return "Running";
+  return humanizeStatus(view.status);
 }
 
 function relativeSessionAge(value: string): string {
@@ -1724,7 +1963,7 @@ function renderSessionNotice(container: HTMLElement, view: WorkSessionViewState)
 
 function renderOpenMessages(container: HTMLElement, view: WorkSessionViewState): void {
   const stateKey = [...view.openMessages.values()]
-    .map((message) => `${message.messageId}:${message.status}:${message.title ?? ""}:${message.body ?? ""}`)
+    .map((message) => `${message.messageId}:${message.status}:${message.title ?? ""}:${message.body ?? ""}:${messageMutationOutcomeUnknown.has(message.messageId) ? "unknown" : "ready"}`)
     .join("|");
   if (container.dataset.stateKey === stateKey) return;
   container.replaceChildren();
@@ -1741,29 +1980,69 @@ function renderOpenMessages(container: HTMLElement, view: WorkSessionViewState):
     );
     const reply = document.createElement("textarea");
     reply.className = "message-reply";
+    reply.id = stableDomId(`message-reply-${message.messageId}`);
+    reply.dataset.focusKey = `message-reply:${message.messageId}`;
     reply.rows = 2;
     reply.placeholder = "Reply to the agent…";
-    const resolve = element("button", { className: "feedback-btn approve", type: "button", text: "Reply / Resolve" });
+    const replyLabel = element("label", { className: "feedback-label", text: "Reply to agent", htmlFor: reply.id });
+    const messageUnknown = messageMutationOutcomeUnknown.has(message.messageId);
+    const resolve = element("button", {
+      className: "feedback-btn approve",
+      type: "button",
+      text: "Reply / Resolve",
+      disabled: messageUnknown || !uiMutationsAllowed(),
+    });
     resolve.addEventListener("click", () => {
       if (!app) return;
       resolve.disabled = true;
       void callServerToolChecked({
         name: "resolve_agent_message",
-        arguments: { sessionId: view.workSessionId, messageId: message.messageId, reply: reply.value.trim() || undefined },
+        arguments: { sessionId: view.workSessionId, messageId: message.messageId, reply: reply.value.trim() || undefined, clientMutationId: newClientMutationId() },
       }).then(() => {
         view.openMessages.delete(message.messageId);
         view.unresolvedMessageCount = view.openMessages.size;
         view.notice = { tone: "success", message: "Reply sent to the agent." };
         scheduleRender();
       }).catch((error) => {
-        resolve.disabled = false;
-        view.notice = { tone: "error", message: `Could not resolve agent request: ${error instanceof Error ? error.message : String(error)}` };
+        if (error instanceof AmbiguousMutationError) {
+          messageMutationOutcomeUnknown.add(message.messageId);
+          view.notice = { tone: "warning", message: "Agent reply outcome is unknown. Refresh the session before trying again." };
+        } else {
+          resolve.disabled = false;
+          view.notice = { tone: "error", message: `Could not resolve agent request: ${error instanceof Error ? error.message : String(error)}` };
+        }
         scheduleRender();
       });
     });
-    card.append(reply, resolve);
+    card.append(replyLabel, reply, resolve);
+    if (messageUnknown) {
+      const refresh = element("button", {
+        className: "notice-action",
+        type: "button",
+        text: "Refresh session state",
+        disabled: !uiMutationsAllowed(),
+      });
+      refresh.addEventListener("click", () => { void reconcileMessageOutcome(view, message.messageId); });
+      card.append(element("div", { className: "feedback-error", text: "Reply outcome is unknown after a connection interruption. Refresh authoritative session state before trying again." }), refresh);
+    }
     container.append(card);
   }
+}
+
+async function reconcileMessageOutcome(view: WorkSessionViewState, messageId: string): Promise<void> {
+  if (!app || !uiMutationsAllowed()) return;
+  try {
+    await hydrateWorkSessionSnapshot(view);
+    if (!view.openMessages.has(messageId)) {
+      messageMutationOutcomeUnknown.delete(messageId);
+      view.notice = { tone: "success", message: "The agent reply was committed." };
+    } else {
+      view.notice = { tone: "warning", message: "The agent request is still open. No reply was committed; keep it paused until you are ready." };
+    }
+  } catch (error) {
+    view.notice = { tone: "warning", message: `Reply outcome still needs reconciliation: ${error instanceof Error ? error.message : String(error)}` };
+  }
+  render();
 }
 
 function renderActivityIncrementally(dom: WorkSessionDom, view: WorkSessionViewState): void {
@@ -1840,7 +2119,7 @@ function renderMissionPanel(view: WorkSessionViewState): HTMLElement {
   panel.append(element("div", { className: "approval-detail", text: packet.mission?.objective ?? "Mission contract" }));
   if (packet.supervisor) {
     const run = packet.supervisor;
-    panel.append(element("div", { className: "approval-detail", text: `Supervisor: ${run.status} · cycle ${run.cycleNumber}/${run.maxCycles} · ${run.autonomyMode} · ${run.approvalMode}${run.repeatedFailureCount ? ` · repeated failure ${run.repeatedFailureCount}` : ""}` }));
+    panel.append(element("div", { className: "approval-detail", text: `Supervisor: ${humanizeStatus(run.status)} · cycle ${run.cycleNumber}/${run.maxCycles} · ${humanizeStatus(run.autonomyMode)} · ${humanizeStatus(run.approvalMode)}${run.repeatedFailureCount ? ` · repeated failure ${run.repeatedFailureCount}` : ""}` }));
     let progress: { blockingFindingCount?: number; failedCriterionCount?: number; passedCriterionCount?: number; failingVerificationCount?: number; unresolvedRequiredActions?: number } | undefined;
     if (run.progressJson) {
       try { progress = JSON.parse(run.progressJson) as typeof progress; } catch { /* tolerate an older/corrupt projection */ }
@@ -1861,7 +2140,7 @@ function renderMissionPanel(view: WorkSessionViewState): HTMLElement {
     control.addEventListener("click", () => {
       if (!app) return;
       control.setAttribute("disabled", "true");
-      void callServerToolChecked({ name: run.status === "paused" ? "resume_supervisor_run" : "pause_supervisor_run", arguments: { workSessionId: view.workSessionId, expectedRevision: run.revision } })
+      void callServerToolChecked({ name: run.status === "paused" ? "resume_supervisor_run" : "pause_supervisor_run", arguments: { workSessionId: view.workSessionId, expectedRevision: run.revision, clientMutationId: newClientMutationId() } })
         .then(() => refreshMission(view))
         .catch((error) => { view.notice = { tone: "error", message: `Supervisor control failed: ${error instanceof Error ? error.message : String(error)}` }; scheduleRender(); });
     });
@@ -1871,14 +2150,14 @@ function renderMissionPanel(view: WorkSessionViewState): HTMLElement {
       redrive.addEventListener("click", () => {
         if (!app) return;
         redrive.setAttribute("disabled", "true");
-        void callServerToolChecked({ name: "redrive_supervisor_run", arguments: { workSessionId: view.workSessionId, expectedRevision: run.revision } })
+        void callServerToolChecked({ name: "redrive_supervisor_run", arguments: { workSessionId: view.workSessionId, expectedRevision: run.revision, clientMutationId: newClientMutationId() } })
           .then(() => refreshMission(view))
           .catch((error) => { view.notice = { tone: "error", message: `Supervisor redrive failed: ${error instanceof Error ? error.message : String(error)}` }; scheduleRender(); });
       });
       panel.append(redrive);
     }
   }
-  const progress = packet.criteria.map((criterion) => `${criterion.status === "verified" ? "✓" : "○"} ${criterion.description} — ${criterion.status}${criterion.dependsOnCriterionIds?.length ? ` · depends on ${criterion.dependsOnCriterionIds.join(", ")}` : ""}`);
+  const progress = packet.criteria.map((criterion) => `${criterion.status === "verified" ? "✓" : "○"} ${criterion.description} — ${humanizeStatus(criterion.status)}${criterion.dependsOnCriterionIds?.length ? ` · depends on ${criterion.dependsOnCriterionIds.join(", ")}` : ""}`);
   for (const item of progress) panel.append(element("div", { className: "approval-detail", text: item }));
   const blockers = packet.approval.reasons;
   if (blockers.length) {
@@ -1888,7 +2167,7 @@ function renderMissionPanel(view: WorkSessionViewState): HTMLElement {
   }
   const openFindings = packet.findings.filter((finding) => !["verified_resolved", "waived"].includes(finding.status));
   for (const finding of openFindings) {
-    panel.append(element("div", { className: "approval-detail", text: `${finding.severity} ${finding.scope}: ${finding.description}` }));
+    panel.append(element("div", { className: "approval-detail", text: `${humanizeStatus(finding.severity)} · ${humanizeStatus(finding.scope)}: ${finding.description}` }));
   }
   for (const report of packet.completionReports ?? []) {
     panel.append(element("div", { className: report.status === "passed" ? "approval-detail" : "feedback-error", text: `Final integration: ${report.status} · report ${report.reportSha256.slice(0, 12)}` }));
@@ -1901,7 +2180,7 @@ function renderMissionPanel(view: WorkSessionViewState): HTMLElement {
     verify.addEventListener("click", () => {
       if (!app) return;
       verify.setAttribute("disabled", "true");
-      void callServerToolChecked({ name: "run_mission_verification", arguments: { workSessionId: view.workSessionId } })
+      void callServerToolChecked({ name: "run_mission_verification", arguments: { workSessionId: view.workSessionId, clientMutationId: newClientMutationId() } })
         .then(() => refreshMission(view))
         .catch((error) => { view.notice = { tone: "error", message: `Verification failed: ${error instanceof Error ? error.message : String(error)}` }; scheduleRender(); });
     });
@@ -1914,13 +2193,19 @@ function renderMissionPanel(view: WorkSessionViewState): HTMLElement {
 function renderMissionCorrectionForm(view: WorkSessionViewState): HTMLElement {
   const packet = view.mission!;
   const form = element("div", { className: "feedback-form" });
-  form.append(element("label", { className: "feedback-label", text: "Next bounded work order" }));
+  const instructionsId = stableDomId(`mission-instructions-${view.workSessionId}`);
+  const findingId = stableDomId(`mission-finding-${view.workSessionId}`);
+  form.append(element("label", { className: "feedback-label", text: "Next bounded work order", htmlFor: instructionsId }));
   const instructions = document.createElement("textarea");
   instructions.className = "feedback-textarea";
+  instructions.id = instructionsId;
+  instructions.dataset.focusKey = `mission-instructions:${view.workSessionId}`;
   instructions.rows = 3;
   instructions.placeholder = "State the exact corrective work and required verification.";
   const finding = document.createElement("textarea");
   finding.className = "feedback-textarea";
+  finding.id = findingId;
+  finding.dataset.focusKey = `mission-finding:${view.workSessionId}`;
   finding.rows = 2;
   finding.placeholder = "Optional new blocking finding (recorded durably).";
   form.append(instructions, finding);
@@ -1945,6 +2230,7 @@ function renderMissionCorrectionForm(view: WorkSessionViewState): HTMLElement {
           requiredActions: [comments],
           requiredVerification: selectedCriteria.map((criterion) => criterion.verificationCommand).filter(Boolean),
         },
+        clientMutationId: newClientMutationId(),
       },
     }).then((result) => {
       const content = getStructuredContent<{ packet?: MissionPacketView }>(result);
@@ -2088,7 +2374,6 @@ function reduceWorkSessionEvent(sessionId: string, event: AgentActivityEvent): v
   // retries a tool call or returns an overlapping page.
   if (event.seq > 0 && event.seq <= view.lastSeq) return;
   view.lastSeq = Math.max(view.lastSeq, event.seq);
-  view.updatedAt = event.createdAt;
 
   // Heartbeats are connection health, not user activity. Keep the timestamp
   // available to the status surface without filling the primary timeline.
@@ -2096,6 +2381,7 @@ function reduceWorkSessionEvent(sessionId: string, event: AgentActivityEvent): v
     view.lastHeartbeatAt = event.createdAt;
     return;
   }
+  view.updatedAt = event.createdAt;
 
   // Coalesce adjacent transcript fragments so a fast agent does not turn each
   // 250ms flush into a separate visible activity row.
@@ -2118,6 +2404,22 @@ function reduceWorkSessionEvent(sessionId: string, event: AgentActivityEvent): v
     // Auto-fetch the full submission card from the agent's submit_for_review
     // invocation (which occurred in CRUSH's MCP connection, not this iframe).
     if (submissionId && app) {
+      // Install an immediate placeholder so a newer review cannot be hidden
+      // behind a slow detail fetch. The async response below is still guarded
+      // by the same (reviewEpoch, submissionNumber) authority tuple.
+      noteSubmission(view, {
+        submissionId,
+        sessionId,
+        submissionNumber: Number(event.payload?.submissionNumber ?? 0),
+        reviewEpoch: typeof event.payload?.reviewEpoch === "number" ? event.payload.reviewEpoch : undefined,
+        status: "pending",
+        files: [],
+        patch: "",
+        fileCount: 0,
+        additions: Number(event.payload?.additions ?? 0),
+        removals: Number(event.payload?.removals ?? 0),
+        diffSha256: typeof event.payload?.diffSha256 === "string" ? event.payload.diffSha256 : undefined,
+      });
       void callServerToolChecked({ name: "get_review_submission", arguments: { sessionId, submissionId } })
         .then((res) => {
           const sc = getStructuredContent<{
@@ -2136,7 +2438,7 @@ function reduceWorkSessionEvent(sessionId: string, event: AgentActivityEvent): v
           const card = (res as { _meta?: { card?: { summary?: ReviewSubmissionView; files?: ReviewSubmissionView["files"]; payload?: { patch: string } } } })._meta?.card;
           const view2 = workSessionViews.get(sessionId);
           if (!view2) return;
-          view2.submissions.set(submissionId, {
+          const fetchedSubmission: ReviewSubmissionView = {
             submissionId,
             sessionId,
             submissionNumber: Number(event.payload?.submissionNumber ?? sc.submissionNumber ?? 0),
@@ -2153,8 +2455,8 @@ function reduceWorkSessionEvent(sessionId: string, event: AgentActivityEvent): v
             diffSha256: typeof card?.summary?.diffSha256 === "string"
               ? card.summary.diffSha256
               : typeof sc.diffSha256 === "string" ? sc.diffSha256 : undefined,
-          });
-          view2.activeSubmissionId = submissionId;
+          };
+          noteSubmission(view2, fetchedSubmission);
           render();
         })
         .catch((err) => {
@@ -2247,6 +2549,7 @@ function reduceWorkSessionEvent(sessionId: string, event: AgentActivityEvent): v
     const messageId = String(event.payload?.messageId ?? "");
     if (messageId) {
       view.openMessages.delete(messageId);
+      messageMutationOutcomeUnknown.delete(messageId);
       view.unresolvedMessageCount = view.openMessages.size;
     }
   } else if (event.type === "session.handoff") {
@@ -2270,6 +2573,28 @@ function renderAgentSubmitBar(): HTMLElement {
 
     const btn = element("button", { className: "agent-submit-btn", type: "button", text: "Send" });
     const status = element("div", { className: "agent-submit-status", role: "status", ariaLive: "polite" });
+    const refresh = element("button", { className: "notice-action", type: "button", text: "Refresh state", hidden: true });
+    let dispatchOutcomeUnknown = false;
+
+    refresh.addEventListener("click", () => {
+      refresh.disabled = true;
+      void reconnectApp("refreshing dispatch outcome")
+        .then(async () => {
+          queueSessionRehydration();
+          if (rehydrationPromise) await rehydrationPromise;
+        })
+        .then(() => {
+          dispatchOutcomeUnknown = false;
+          btn.disabled = false;
+          refresh.hidden = true;
+          refresh.disabled = false;
+          status.textContent = "State refreshed. Confirm the session before sending the task again.";
+        })
+        .catch((error) => {
+          refresh.disabled = false;
+          status.textContent = `State refresh did not complete: ${error instanceof Error ? error.message : String(error)}. Keep the dispatch paused.`;
+        });
+    });
 
     input.addEventListener("keydown", (event) => {
       if (event.key === "Enter") {
@@ -2289,7 +2614,7 @@ function renderAgentSubmitBar(): HTMLElement {
       btn.setAttribute("disabled", "true");
       void callServerToolChecked({
           name: "submit_to_coding_agent",
-          arguments: { task, workspaceSessionId: activeWorkspaceId },
+          arguments: { task, workspaceSessionId: activeWorkspaceId, clientMutationId: newClientMutationId() },
         })
         .then((result) => {
           const dispatch = getStructuredContent<{
@@ -2323,12 +2648,18 @@ function renderAgentSubmitBar(): HTMLElement {
           selectWorkSession(dispatch.workSessionId);
         })
         .catch((err) => {
-          status.textContent = `Dispatch failed: ${err instanceof Error ? err.message : String(err)}`;
+          if (err instanceof AmbiguousMutationError) {
+            dispatchOutcomeUnknown = true;
+            status.textContent = "Dispatch outcome unknown after a connection interruption. Refresh state before retrying.";
+            refresh.hidden = false;
+          } else {
+            status.textContent = `Dispatch failed: ${err instanceof Error ? err.message : String(err)}`;
+          }
         })
-        .finally(() => btn.removeAttribute("disabled"));
+        .finally(() => { if (!dispatchOutcomeUnknown) btn.removeAttribute("disabled"); });
     });
 
-    agentBar.append(input, btn, status);
+    agentBar.append(input, btn, status, refresh);
   }
   return agentBar;
 }
@@ -2385,7 +2716,7 @@ function renderReviewCard(card: ToolResultCard, display: ToolDisplay): void {
 
   const legacyKey = legacyReviewKey(card);
   const legacyState = legacyFeedbackState.get(legacyKey);
-  const feedbackKey = `${legacyKey}:${legacyState?.submitted ? "submitted" : "form"}:${legacyState?.submitting ? "submitting" : "idle"}:${legacyState?.error ?? ""}`;
+  const feedbackKey = `${legacyKey}:${legacyState?.submitted ? "submitted" : "form"}:${legacyState?.submitting ? "submitting" : legacyState?.outcomeUnknown ? "outcome_unknown" : "idle"}:${legacyState?.error ?? ""}`;
   if (dom.feedbackKey !== feedbackKey) {
     dom.feedback.replaceChildren();
     if (card.tool === "submit_for_review" && !legacyState?.submitted && typeof card.summary?.sessionId === "string") {
@@ -2402,7 +2733,7 @@ function renderReviewCard(card: ToolResultCard, display: ToolDisplay): void {
   maybeAppendAgentBar();
 }
 
-const legacyFeedbackState = new Map<string, { submitted: boolean; submitting: boolean; error?: string }>();
+const legacyFeedbackState = new Map<string, { submitted: boolean; submitting: boolean; outcomeUnknown?: boolean; error?: string }>();
 
 function legacyReviewKey(card: ToolResultCard): string {
   return String(card.summary?.submissionId ?? `${card.summary?.sessionId ?? "unknown"}:${card.tool}`);
@@ -2410,15 +2741,23 @@ function legacyReviewKey(card: ToolResultCard): string {
 
 function renderFeedbackFormForSession(sessionId: string, card: ToolResultCard): HTMLElement {
   const container = element("div", { className: "feedback-form" });
-  const label = element("label", { className: "feedback-label", text: "Review feedback" });
+  const textareaId = stableDomId(`legacy-feedback-${legacyReviewKey(card)}`);
+  const label = element("label", { className: "feedback-label", text: "Review feedback", htmlFor: textareaId });
   const textarea = document.createElement("textarea");
   textarea.className = "feedback-textarea";
+  textarea.id = textareaId;
+  textarea.dataset.focusKey = `legacy-feedback:${legacyReviewKey(card)}`;
   textarea.placeholder = "Tell the agent what to fix, or leave blank for a clean approve/reject.";
   textarea.rows = 3;
 
   const state = legacyFeedbackState.get(legacyReviewKey(card)) ?? { submitted: false, submitting: false };
   if (state.error) {
     container.append(element("div", { className: "feedback-error", text: state.error }));
+  }
+  if (state.outcomeUnknown) {
+    const refresh = element("button", { className: "notice-action", type: "button", text: "Refresh review status", disabled: state.submitting || !uiMutationsAllowed() });
+    refresh.addEventListener("click", () => { void reconcileLegacyFeedbackOutcome(sessionId, card); });
+    container.append(element("div", { className: "feedback-error", text: "Feedback outcome is unknown after a connection interruption. Refresh before trying again." }), refresh);
   }
 
   const buttonRow = element("div", { className: "feedback-buttons" });
@@ -2427,7 +2766,7 @@ function renderFeedbackFormForSession(sessionId: string, card: ToolResultCard): 
     const btn = element("button", { className: `feedback-btn ${cls}`, type: "button", text });
     // P1 #11: disable verdict buttons while a submission is in flight so the
     // reviewer cannot double-submit or fire overlapping feedback calls.
-    if (state.submitting) btn.disabled = true;
+    if (state.submitting || state.outcomeUnknown || !uiMutationsAllowed()) btn.disabled = true;
     btn.addEventListener("click", () => {
       submitFeedbackForSession(sessionId, card, verdict, textarea.value.trim() || undefined);
     });
@@ -2446,6 +2785,11 @@ function renderFeedbackFormForSession(sessionId: string, card: ToolResultCard): 
 
 async function submitFeedbackForSession(sessionId: string, card: ToolResultCard, verdict: string, comments?: string): Promise<void> {
   if (!sessionId || !app) return;
+  if (verdict === "changes_requested" && !comments?.trim()) {
+    legacyFeedbackState.set(legacyReviewKey(card), { submitted: false, submitting: false, error: "Request Changes requires concrete instructions for the agent." });
+    scheduleRender();
+    return;
+  }
   const key = legacyReviewKey(card);
   legacyFeedbackState.set(key, { submitted: false, submitting: true });
   scheduleRender();
@@ -2459,6 +2803,7 @@ async function submitFeedbackForSession(sessionId: string, card: ToolResultCard,
         reviewEpoch: typeof card.summary?.reviewEpoch === "number" ? card.summary.reviewEpoch : undefined,
         verdict,
         comments,
+        clientMutationId: newClientMutationId(),
       },
     });
     legacyFeedbackState.set(key, { submitted: true, submitting: false });
@@ -2469,75 +2814,103 @@ async function submitFeedbackForSession(sessionId: string, card: ToolResultCard,
     legacyFeedbackState.set(key, {
       submitted: false,
       submitting: false,
-      error: "Failed to submit feedback: " + (err instanceof Error ? err.message : String(err)),
+      outcomeUnknown: err instanceof AmbiguousMutationError,
+      error: err instanceof AmbiguousMutationError
+        ? "Feedback outcome is unknown after a connection interruption. Refresh authoritative review state before trying again."
+        : "Failed to submit feedback: " + (err instanceof Error ? err.message : String(err)),
     });
     scheduleRender();
   }
+}
+
+async function reconcileLegacyFeedbackOutcome(sessionId: string, card: ToolResultCard): Promise<void> {
+  const key = legacyReviewKey(card);
+  const current = legacyFeedbackState.get(key) ?? { submitted: false, submitting: false, outcomeUnknown: true };
+  legacyFeedbackState.set(key, { ...current, submitting: true });
+  render();
+  try {
+    const view = ensureWorkSessionView(sessionId, activeWorkspaceId ?? "", "");
+    await hydrateWorkSessionSnapshot(view);
+    const expectedSubmissionId = typeof card.summary?.submissionId === "string" ? card.summary.submissionId : undefined;
+    if (expectedSubmissionId && view.latestFeedback?.submissionId === expectedSubmissionId) {
+      legacyFeedbackState.set(key, { submitted: true, submitting: false });
+    } else {
+      legacyFeedbackState.set(key, {
+        submitted: false,
+        submitting: false,
+        outcomeUnknown: true,
+        error: "Authoritative review state does not confirm this feedback yet. Keep the action paused and refresh again later.",
+      });
+    }
+  } catch (error) {
+    legacyFeedbackState.set(key, {
+      submitted: false,
+      submitting: false,
+      outcomeUnknown: true,
+      error: `Review reconciliation did not complete: ${error instanceof Error ? error.message : String(error)}`,
+    });
+  }
+  render();
 }
 
 function renderFeedbackSubmittedGlobal(): HTMLElement {
   return element("div", { className: "feedback-submitted", text: "Feedback submitted. The waiting agent has been notified." });
 }
 
-function renderApprovalCenterCard(card: ToolResultCard, display: ToolDisplay): void {
-  ensureSurface("approval-center");
-  const main = element("main", { className: "shell" });
-  const section = element("section", { className: "tool-card agent" });
-  const header = element("div", { className: "review-header" });
-  const icon = element("span", { className: "tool-icon", ariaHidden: "true" });
-  icon.innerHTML = display.icon;
-  const titleGroup = element("div", { className: "review-title-group" });
-  titleGroup.append(
-    element("span", { className: "tool-title", text: "Approval Center" }),
-    element("span", { className: "tool-label", text: `${String(card.summary?.count ?? 0)} pending` }),
-  );
-  header.append(icon, titleGroup, renderSummaryBadge(card));
-  section.append(header);
-
+function renderApprovalCenterCard(card: ToolResultCard): void {
   const approvals = Array.isArray(card.summary?.approvals)
     ? card.summary.approvals as Array<Record<string, unknown>>
     : [];
-  if (approvals.length === 0) {
-    section.append(element("div", { className: "empty muted", text: "No pending approvals." }));
-  } else {
-    const list = element("div", { className: "approval-list" });
-    const tempView = ensureWorkSessionView("__approval_center__", "", "");
-    for (const approval of approvals) {
-      list.append(renderPolicyApproval(tempView, {
-        approvalId: String(approval.id ?? ""),
-        workspaceId: typeof approval.workspaceId === "string" ? approval.workspaceId : undefined,
-        kind: typeof approval.kind === "string" ? approval.kind : undefined,
-        workSessionId: typeof approval.workSessionId === "string" ? approval.workSessionId : undefined,
-        title: typeof approval.title === "string" ? approval.title : undefined,
-        description: typeof approval.description === "string" ? approval.description : undefined,
-        risk: typeof approval.risk === "string" ? approval.risk : undefined,
-        tool: String(approval.tool ?? "tool"),
-        path: typeof approval.path === "string" ? approval.path : undefined,
-        command: typeof approval.command === "string" ? approval.command : undefined,
-        origin: approval.origin === "direct_mcp" || approval.origin === "work_session" ? approval.origin : undefined,
-        conversationId: typeof approval.conversationId === "string" ? approval.conversationId : undefined,
-        orphanedAt: typeof approval.orphanedAt === "string" ? approval.orphanedAt : undefined,
-        reattachDeadline: typeof approval.reattachDeadline === "string" ? approval.reattachDeadline : undefined,
-        liveWaiterCount: typeof approval.liveWaiterCount === "number" ? approval.liveWaiterCount : undefined,
-        requestedAt: typeof approval.requestedAt === "string" ? approval.requestedAt : undefined,
-        createdAt: typeof approval.createdAt === "string" ? approval.createdAt : undefined,
-        expiresAt: typeof approval.expiresAt === "string" ? approval.expiresAt : undefined,
-        options: parsePolicyApprovalOptions(approval.options),
-      }));
-    }
-    section.append(list);
+  const inferredWorkspaceId = activeWorkspaceId
+    ?? (typeof approvals[0]?.workspaceId === "string" ? approvals[0].workspaceId : undefined)
+    ?? (typeof approvals[0]?.workspaceSessionId === "string" ? approvals[0].workspaceSessionId : undefined);
+  if (!inferredWorkspaceId) {
+    renderEmpty("Approval center requires a workspace context.", "error");
+    return;
   }
-  main.append(section);
-  appRoot.replaceChildren(main);
+  if (activeWorkspaceId !== inferredWorkspaceId) activateWorkspace(inferredWorkspaceId);
+  const center = ensureWorkSessionView(approvalCenterId(inferredWorkspaceId), inferredWorkspaceId, "");
+  center.policyApprovals.clear();
+  for (const approval of approvals) {
+    mergePendingApproval(center, {
+      approvalId: String(approval.id ?? approval.approvalId ?? ""),
+      workspaceId: typeof approval.workspaceId === "string" ? approval.workspaceId : inferredWorkspaceId,
+      workspaceSessionId: typeof approval.workspaceSessionId === "string" ? approval.workspaceSessionId : inferredWorkspaceId,
+      workSessionId: typeof approval.workSessionId === "string" ? approval.workSessionId : undefined,
+      kind: typeof approval.kind === "string" ? approval.kind : undefined,
+      title: typeof approval.title === "string" ? approval.title : undefined,
+      description: typeof approval.description === "string" ? approval.description : undefined,
+      risk: typeof approval.risk === "string" ? approval.risk : undefined,
+      tool: typeof approval.tool === "string" ? approval.tool : undefined,
+      path: typeof approval.path === "string" ? approval.path : undefined,
+      command: typeof approval.command === "string" ? approval.command : undefined,
+      origin: approval.origin === "direct_mcp" || approval.origin === "work_session" ? approval.origin : undefined,
+      conversationId: typeof approval.conversationId === "string" ? approval.conversationId : undefined,
+      orphanedAt: typeof approval.orphanedAt === "string" ? approval.orphanedAt : undefined,
+      reattachDeadline: typeof approval.reattachDeadline === "string" ? approval.reattachDeadline : undefined,
+      liveWaiterCount: typeof approval.liveWaiterCount === "number" ? approval.liveWaiterCount : undefined,
+      requestedAt: typeof approval.requestedAt === "string" ? approval.requestedAt : undefined,
+      createdAt: typeof approval.createdAt === "string" ? approval.createdAt : undefined,
+      expiresAt: typeof approval.expiresAt === "string" ? approval.expiresAt : undefined,
+      options: parsePolicyApprovalOptions(approval.options),
+    }, inferredWorkspaceId);
+  }
+  center.pendingApprovalCount = center.policyApprovals.size;
+  selectedWorkSessionId = center.workSessionId;
+  lastToolCard = null;
+  scheduleRender();
 }
 
 // ── Work-session feedback form ────────────────────────
 
 function renderFeedbackFormForSubmission(view: WorkSessionViewState, submission: ReviewSubmissionView): HTMLElement {
   const container = element("div", { className: "feedback-form" });
-  const label = element("label", { className: "feedback-label", text: "Review feedback" });
+  const textareaId = stableDomId(`feedback-${submission.submissionId}`);
+  const label = element("label", { className: "feedback-label", text: "Review feedback", htmlFor: textareaId });
   const textarea = document.createElement("textarea");
   textarea.className = "feedback-textarea";
+  textarea.id = textareaId;
+  textarea.dataset.focusKey = `feedback:${submission.submissionId}`;
   textarea.placeholder = "Tell the agent what to fix, or leave blank for a clean approve/reject.";
   textarea.rows = 3;
 
@@ -2545,9 +2918,16 @@ function renderFeedbackFormForSubmission(view: WorkSessionViewState, submission:
   const state = view.feedbackStateBySubmission.get(submissionId);
   const isSubmitting = state === "submitting";
   const isError = state === "error";
+  const outcomeUnknown = state === "outcome_unknown";
 
   if (isError && view.feedbackErrorBySubmission.get(submissionId)) {
     container.append(element("div", { className: "feedback-error", text: view.feedbackErrorBySubmission.get(submissionId) ?? "" }));
+  }
+  if (outcomeUnknown) {
+    container.append(element("div", { className: "feedback-error", text: "Feedback outcome is unknown after a connection interruption. Refresh authoritative session state before trying again." }));
+    const refresh = element("button", { className: "notice-action", type: "button", text: "Refresh session state", disabled: !uiMutationsAllowed() });
+    refresh.addEventListener("click", () => { void reconcileFeedbackOutcome(view, submissionId); });
+    container.append(refresh);
   }
 
   const buttonRow = element("div", { className: "feedback-buttons" });
@@ -2555,7 +2935,7 @@ function renderFeedbackFormForSubmission(view: WorkSessionViewState, submission:
   const makeButton = (verdict: string, text: string, cls: string): HTMLButtonElement => {
     const btn = element("button", { className: `feedback-btn ${cls}`, type: "button", text });
     // P1 #11: disable verdict buttons while a submission is in flight.
-    if (isSubmitting) btn.disabled = true;
+    if (isSubmitting || outcomeUnknown || !uiMutationsAllowed()) btn.disabled = true;
     btn.addEventListener("click", () => {
       submitFeedbackForSubmission(view, submission, verdict, textarea.value.trim() || undefined);
     });
@@ -2575,6 +2955,12 @@ function renderFeedbackFormForSubmission(view: WorkSessionViewState, submission:
 async function submitFeedbackForSubmission(view: WorkSessionViewState, submission: ReviewSubmissionView, verdict: string, comments?: string): Promise<void> {
   if (!app) return;
   const submissionId = submission.submissionId;
+  if (verdict === "changes_requested" && !comments?.trim()) {
+    view.feedbackStateBySubmission.set(submissionId, "error");
+    view.feedbackErrorBySubmission.set(submissionId, "Request Changes requires concrete instructions for the agent.");
+    render();
+    return;
+  }
   view.feedbackStateBySubmission.set(submissionId, "submitting");
   view.feedbackErrorBySubmission.delete(submissionId);
   render();
@@ -2582,7 +2968,7 @@ async function submitFeedbackForSubmission(view: WorkSessionViewState, submissio
     if (verdict === "approve" && view.mission) {
       const result = await callServerToolChecked({
         name: "approve_supervised_work",
-        arguments: { workSessionId: view.workSessionId, comments },
+        arguments: { workSessionId: view.workSessionId, comments, clientMutationId: newClientMutationId() },
       });
       const approval = getStructuredContent<{ approved?: boolean; reasons?: string[]; packet?: MissionPacketView }>(result);
       if (!approval?.approved) {
@@ -2599,6 +2985,7 @@ async function submitFeedbackForSubmission(view: WorkSessionViewState, submissio
           reviewEpoch: submission.reviewEpoch,
           verdict,
           comments,
+          clientMutationId: newClientMutationId(),
         },
       });
     }
@@ -2607,11 +2994,29 @@ async function submitFeedbackForSubmission(view: WorkSessionViewState, submissio
   } catch (err) {
     // P1 #11: surface the transport / worker execution failure instead of
     // leaving the reviewer blind.
-    view.feedbackStateBySubmission.set(submissionId, "error");
+    view.feedbackStateBySubmission.set(submissionId, err instanceof AmbiguousMutationError ? "outcome_unknown" : "error");
     view.feedbackErrorBySubmission.set(
       submissionId,
       "Failed to submit feedback: " + (err instanceof Error ? err.message : String(err)),
     );
+  }
+  render();
+}
+
+async function reconcileFeedbackOutcome(view: WorkSessionViewState, submissionId: string): Promise<void> {
+  if (!app || !uiMutationsAllowed()) return;
+  try {
+    await hydrateWorkSessionSnapshot(view);
+    if (view.latestFeedback?.submissionId === submissionId) {
+      view.feedbackStateBySubmission.set(submissionId, "submitted");
+      view.feedbackErrorBySubmission.delete(submissionId);
+    } else {
+      view.feedbackStateBySubmission.set(submissionId, "outcome_unknown");
+      view.feedbackErrorBySubmission.set(submissionId, "The session is refreshed, but this feedback outcome is still not authoritative. Do not submit again until the review state is confirmed.");
+    }
+  } catch (error) {
+    view.feedbackStateBySubmission.set(submissionId, "outcome_unknown");
+    view.feedbackErrorBySubmission.set(submissionId, `Review state refresh failed: ${error instanceof Error ? error.message : String(error)}`);
   }
   render();
 }
@@ -2637,34 +3042,97 @@ function renderPolicyApproval(view: WorkSessionViewState, approval: PolicyApprov
   const age = Number.isFinite(requestedMs)
     ? ` · age ${formatElapsed(Math.max(0, Date.now() - requestedMs))}`
     : "";
+  const expiresMs = approval.expiresAt ? Date.parse(approval.expiresAt) : Number.NaN;
+  const expired = Number.isFinite(expiresMs) && expiresMs <= Date.now();
+  const reattachDeadlineMs = approval.reattachDeadline ? Date.parse(approval.reattachDeadline) : Number.NaN;
+  const reattachExpired = Boolean(approval.orphanedAt) && Number.isFinite(reattachDeadlineMs) && reattachDeadlineMs <= Date.now();
+  const expiry = Number.isFinite(expiresMs)
+    ? expired ? " · expired" : ` · expires ${new Date(expiresMs).toLocaleString()}`
+    : "";
   const metadata = element("div", {
     className: "approval-meta",
-    text: `${source} · workspace ${workspace ?? "unknown"} · ${approval.tool}${approval.risk ? ` · risk ${approval.risk}` : ""}${age}${lifecycle}`,
+    text: `${source} · workspace ${workspace ?? "unknown"} · ${approval.tool}${approval.risk ? ` · risk ${approval.risk}` : ""}${age}${expiry}${lifecycle}`,
   });
   const detail = element("div", {
     className: "approval-detail",
     text: approval.description ?? approval.command ?? approval.path ?? approval.matchedPattern ?? approval.approvalKey ?? approval.approvalId,
   });
   const buttons = element("div", { className: "feedback-buttons" });
-  const options = approval.options?.length
-    ? approval.options
-    : [
-      { id: "approve", label: "Approve Once", effect: "approve" as const, scope: "once" as const },
-      { id: "approve_session", label: "Approve Session", effect: "approve" as const, scope: "work_session" as const },
-      { id: "approve_workspace", label: "Approve Workspace", effect: "approve" as const, scope: "workspace" as const },
-      { id: "deny", label: "Deny", effect: "deny" as const },
-  ];
+  if (expired || reattachExpired) {
+    item.append(title, metadata, detail, element("div", {
+      className: "feedback-error",
+      text: expired
+        ? "This approval has expired and is no longer actionable. Refresh the workspace state."
+        : "This detached approval can no longer be reattached. Refresh the workspace state.",
+    }));
+    return item;
+  }
+  const suppliedOptions = approval.options;
+  const invalidOptions = suppliedOptions?.some((option) => option.scope === "work_session" && !approval.workSessionId) ?? false;
+  if (!suppliedOptions?.length || invalidOptions) {
+    item.append(element("div", {
+      className: "feedback-error",
+      text: invalidOptions
+        ? "Approval options are inconsistent with the bound work session. No action is available until the server refreshes this request."
+        : "Approval options were not supplied by the server. No action is available (fail-closed).",
+    }));
+    if (approval.error) item.append(element("div", { className: "feedback-error", text: approval.error }));
+    return item;
+  }
+  const options = suppliedOptions.filter((option) => option.scope !== "work_session" || Boolean(approval.workSessionId));
+  if (options.length === 0) {
+    item.append(element("div", { className: "feedback-error", text: "No valid approval option is available for this request." }));
+    return item;
+  }
   const makeButton = (option: NonNullable<PolicyApprovalView["options"]>[number]): HTMLButtonElement => {
     const cls = option.effect === "deny" ? "reject" : option.effect === "changes_requested" ? "changes" : "approve";
-    const btn = element("button", { className: `feedback-btn ${cls}`, type: "button", text: option.label });
-    if (approval.uiState === "submitting") btn.setAttribute("disabled", "true");
+    const confirmationKey = `${approval.approvalId}:${option.id}`;
+    const needsConfirmation = option.scope === "workspace" && !workspaceApprovalConfirmations.has(confirmationKey);
+    const btn = element("button", {
+      className: `feedback-btn ${cls}${option.scope === "workspace" ? " broad-scope" : ""}`,
+      type: "button",
+      text: needsConfirmation ? `Confirm ${option.label}` : option.label,
+      disabled: !uiMutationsAllowed() || approval.uiState === "submitting" || approval.uiState === "outcome_unknown",
+    });
+    btn.dataset.focusKey = `approval:${approval.approvalId}:${option.id}`;
+    const scopeDescription = option.scope === "workspace"
+      ? "Applies to matching operations across this workspace."
+      : option.scope === "work_session"
+        ? "Applies only to this work session."
+        : option.scope === "once"
+          ? "Applies to this operation only."
+          : "The server did not provide a reusable scope for this action; its consequence is server-defined.";
+    buttons.append(element("span", { className: "approval-option-help", text: scopeDescription }));
     btn.addEventListener("click", () => {
+      if (option.scope === "workspace" && !workspaceApprovalConfirmations.has(confirmationKey)) {
+        workspaceApprovalConfirmations.add(confirmationKey);
+        render();
+        return;
+      }
       void submitPolicyApproval(view, approval.approvalId, option.id);
     });
     return btn;
   };
-  buttons.append(...options.map(makeButton));
+  // Keep consequence descriptions adjacent to their controls so a broad grant
+  // cannot be mistaken for an approve-once action.
+  const optionRows = options.map((option) => {
+    const row = element("div", { className: "approval-option" });
+    const before = buttons.children.length;
+    const button = makeButton(option);
+    const help = buttons.lastElementChild;
+    if (help) buttons.removeChild(help);
+    row.append(button);
+    if (help) row.append(help);
+    void before;
+    return row;
+  });
+  buttons.append(...optionRows);
   item.append(title, metadata, detail, buttons);
+  if (approval.uiState === "outcome_unknown") {
+    const refresh = element("button", { className: "notice-action", type: "button", text: "Refresh approval status", disabled: !uiMutationsAllowed() });
+    refresh.addEventListener("click", () => { void reconcilePolicyApproval(view, approval.approvalId); });
+    item.append(element("div", { className: "feedback-error", text: "Approval outcome is unknown after a connection interruption. Refresh the authoritative pending state before trying again." }), refresh);
+  }
   if (approval.error) item.append(element("div", { className: "feedback-error", text: approval.error }));
   return item;
 }
@@ -2684,7 +3152,7 @@ async function submitPolicyApproval(
   try {
     await callServerToolChecked({
       name: "provide_policy_approval",
-      arguments: { approvalId, decision },
+      arguments: { approvalId, decision, clientMutationId: newClientMutationId() },
     });
     const latest = view.policyApprovals.get(approvalId);
     if (latest) latest.uiState = "resolved";
@@ -2692,9 +3160,38 @@ async function submitPolicyApproval(
   } catch (err) {
     const latest = view.policyApprovals.get(approvalId);
     if (latest) {
-      latest.uiState = "error";
-      latest.error = "Failed to submit approval: " + (err instanceof Error ? err.message : String(err));
+      latest.uiState = err instanceof AmbiguousMutationError ? "outcome_unknown" : "error";
+      latest.error = err instanceof AmbiguousMutationError
+        ? "Approval outcome is unknown after a connection interruption. Refresh authoritative approval state before trying again."
+        : "Failed to submit approval: " + (err instanceof Error ? err.message : String(err));
     }
+  }
+  render();
+}
+
+async function reconcilePolicyApproval(view: WorkSessionViewState, approvalId: string): Promise<void> {
+  if (!app || !uiMutationsAllowed()) return;
+  try {
+    const result = await callServerToolChecked({
+      name: "list_pending_approvals",
+      arguments: { workspaceId: view.workspaceSessionId },
+    });
+    const pending = getStructuredContent<{ approvals?: PendingApprovalRecord[] }>(result)?.approvals ?? [];
+    const current = pending.find((entry) => entry.approvalId === approvalId);
+    if (!current) {
+      view.policyApprovals.delete(approvalId);
+      view.pendingApprovalCount = view.policyApprovals.size;
+    } else {
+      mergePendingApproval(view, current, view.workspaceSessionId);
+      const refreshed = view.policyApprovals.get(approvalId);
+      if (refreshed) {
+        refreshed.uiState = "idle";
+        refreshed.error = undefined;
+      }
+    }
+  } catch (error) {
+    const current = view.policyApprovals.get(approvalId);
+    if (current) current.error = `Approval status refresh failed: ${error instanceof Error ? error.message : String(error)}`;
   }
   render();
 }
@@ -2848,6 +3345,17 @@ function toolNameFromMeta(result: CallToolResult): ToolName | undefined {
 
 type ServerToolRequest = Parameters<App["callServerTool"]>[0];
 
+export class AmbiguousMutationError extends Error {
+  readonly operation: string;
+
+  constructor(operation: string, cause?: unknown) {
+    super(`The ${operation} mutation may have committed, but its response was lost. Refresh authoritative state before retrying.`);
+    this.name = "AmbiguousMutationError";
+    this.operation = operation;
+    if (cause !== undefined) this.cause = cause;
+  }
+}
+
 type ServerToolRetryMode = "safe" | "reconcile" | "never";
 interface ServerToolCallOptions { retry?: ServerToolRetryMode }
 
@@ -2893,11 +3401,19 @@ async function callServerToolChecked(request: ServerToolRequest, options: Server
   } catch (transportError) {
     // A transient host/tunnel failure should get one deterministic reconnect
     // and rehydration attempt before the caller sees a permanent error.
-    await reconnectApp(transportError);
-    if (!app) throw transportError;
     const retryMode = retryModeForServerTool(String(request.name), options.retry);
+    try {
+      await reconnectApp(transportError);
+    } catch (reconnectError) {
+      if (retryMode !== "safe") throw new AmbiguousMutationError(String(request.name), reconnectError);
+      throw reconnectError;
+    }
+    if (!app) {
+      if (retryMode !== "safe") throw new AmbiguousMutationError(String(request.name), transportError);
+      throw transportError;
+    }
     if (retryMode !== "safe") {
-      throw new Error(`Transport failed during ${String(request.name)}; connection was restored and state rehydrated. Verify the operation before retrying.`);
+      throw new AmbiguousMutationError(String(request.name), transportError);
     }
     result = await app.callServerTool(request);
   }
@@ -2941,6 +3457,8 @@ function element<K extends keyof HTMLElementTagNameMap>(
     ariaLabel?: string;
     ariaPressed?: string;
     ariaLive?: string;
+    htmlFor?: string;
+    dataFocusKey?: string;
     role?: string;
     hidden?: boolean;
     disabled?: boolean;
@@ -2956,12 +3474,18 @@ function element<K extends keyof HTMLElementTagNameMap>(
   if (options.ariaLabel !== undefined) node.setAttribute("aria-label", options.ariaLabel);
   if (options.ariaPressed !== undefined) node.setAttribute("aria-pressed", options.ariaPressed);
   if (options.ariaLive !== undefined) node.setAttribute("aria-live", options.ariaLive);
+  if (options.htmlFor !== undefined && "htmlFor" in node) (node as HTMLLabelElement).htmlFor = options.htmlFor;
+  if (options.dataFocusKey !== undefined) node.dataset.focusKey = options.dataFocusKey;
   if (options.role !== undefined) node.setAttribute("role", options.role);
   if (options.hidden !== undefined) node.hidden = options.hidden;
   if (options.disabled !== undefined && "disabled" in node) {
     (node as HTMLButtonElement).disabled = options.disabled;
   }
   return node;
+}
+
+function stableDomId(value: string): string {
+  return value.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 180);
 }
 
 function iconSvg(children: string): string {

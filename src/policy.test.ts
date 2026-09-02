@@ -50,14 +50,28 @@ assert.throws(
   () => loadPolicyConfig({ ...baseEnv, KONTROL_POLICY_MODE: "asks" }),
   /KONTROL_POLICY_MODE must be one of allow\|deny\|ask/,
 );
-assert.doesNotThrow(
+assert.throws(
   () => loadPolicyConfig({ ...baseEnv, KONTROL_POLICY_TOOL_WRITE: "asks" }),
-  "invalid tool mode is ignored, not thrown",
+  /must be exactly one of allow\|ask\|deny/,
+  "invalid tool mode fails closed",
 );
-const cfgWithBadTool = loadPolicyConfig({ ...baseEnv, KONTROL_POLICY_TOOL_WRITE: "asks" });
-// An invalid explicit tool rule is ignored, so the secure-baseline `ask`
-// applies to the mutating tool rather than silently allowing it.
-assert.equal(cfgWithBadTool.toolRules.write, "ask", "invalid tool mode ignored; secure baseline applies");
+assert.throws(
+  () => loadPolicyConfig({ ...baseEnv, KONTROL_POLICY_TOOL_BSAH: "allow" }),
+  /Unknown policy tool.*KONTROL_POLICY_TOOL_BSAH/,
+  "unknown tool names fail closed",
+);
+assert.throws(
+  () => loadPolicyConfig({ ...baseEnv, KONTROL_POLICY_TOOL_BASH: "ALLOW" }),
+  /must be exactly one of allow\|ask\|deny/,
+  "per-tool modes are case-sensitive",
+);
+assert.equal(loadPolicyConfig({ ...baseEnv, KONTROL_POLICY_TOOL_EXEC_COMMAND: "deny" }).toolRules.bash, "deny");
+assert.equal(loadPolicyConfig({ ...baseEnv, KONTROL_POLICY_TOOL_KONTROL_SHELL: "ask" }).toolRules.bash, "ask");
+assert.throws(
+  () => loadPolicyConfig({ ...baseEnv, KONTROL_POLICY_FOO: "allow" }),
+  /Unknown policy configuration key/,
+  "unknown policy keys fail closed",
+);
 
 const cfg = loadPolicyConfig(baseEnv);
 assert.equal(cfg.defaultMode, "allow");
@@ -65,7 +79,7 @@ assert.equal(cfg.defaultMode, "allow");
 // Secure-by-default baseline: a zero-policy environment must NOT silently
 // grant arbitrary shell/write authority — mutating tools gate behind `ask`
 // while read-only inspection stays frictionless.
-const zeroPolicy = loadPolicyConfig({ ...baseEnv, KONTROL_POLICY_TOOL_BASH: "" });
+const zeroPolicy = loadPolicyConfig(baseEnv);
 assert.equal(zeroPolicy.toolRules.bash, "ask", "bash must default to ask");
 assert.equal(zeroPolicy.toolRules.write, "ask", "write must default to ask");
 assert.equal(zeroPolicy.toolRules.edit, "ask", "edit must default to ask");

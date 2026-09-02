@@ -360,7 +360,7 @@ try {
       inputPreview: "original cli dispatch",
       status: "running",
     });
-    await callReviewer("provide_review_feedback", { sessionId, verdict: "changes_requested" });
+    await callReviewer("provide_review_feedback", { sessionId, verdict: "changes_requested", comments: "Please address the reviewed issue before resubmitting." });
     assert.equal(
       dispatchOutbox.listPending().filter((event) => event.aggregateId === continuationManager.listForSession(sessionId)[0]?.id).length,
       1,
@@ -391,7 +391,7 @@ try {
       inputPreview: "cancellable dispatch",
       status: "running",
     });
-    await callReviewer("provide_review_feedback", { sessionId, verdict: "changes_requested" });
+    await callReviewer("provide_review_feedback", { sessionId, verdict: "changes_requested", comments: "Please address the reviewed issue before resubmitting." });
     const pending = continuationManager.listForSession(sessionId).find((c) => c.status === "pending");
     assert.ok(pending, "changes_requested creates a pending continuation");
 
@@ -415,7 +415,7 @@ try {
       inputPreview: "race dispatch",
       status: "running",
     });
-    await callReviewer("provide_review_feedback", { sessionId, verdict: "changes_requested" });
+    await callReviewer("provide_review_feedback", { sessionId, verdict: "changes_requested", comments: "Please address the reviewed issue before resubmitting." });
     const pending = continuationManager.listForSession(sessionId).find((c) => c.status === "pending");
     assert.ok(pending, "changes_requested creates pending continuation for race test");
 
@@ -463,7 +463,7 @@ try {
   {
     const sessionId = createSession();
     await callWorker("submit_for_review", { sessionId });
-    await callReviewer("provide_review_feedback", { sessionId, verdict: "changes_requested" });
+    await callReviewer("provide_review_feedback", { sessionId, verdict: "changes_requested", comments: "Please address the reviewed issue before resubmitting." });
     const continuation = continuationManager.listForSession(sessionId).find((c) => c.status === "pending");
     assert.ok(continuation, "changes_requested creates a pending continuation for dead-letter test");
 
@@ -494,7 +494,7 @@ try {
   {
     const sessionId = createSession();
     await callWorker("submit_for_review", { sessionId });
-    await callReviewer("provide_review_feedback", { sessionId, verdict: "changes_requested" });
+    await callReviewer("provide_review_feedback", { sessionId, verdict: "changes_requested", comments: "Please address the reviewed issue before resubmitting." });
     const w = callWorker("await_review_feedback", { sessionId, timeoutMs: 100 });
     const fr = await w;
     assert.equal(fr.structuredContent.status, "feedback_ready");
@@ -737,7 +737,7 @@ try {
       inputPreview: "original mimo dispatch",
       status: "running",
     });
-    await callReviewer("provide_review_feedback", { sessionId, verdict: "changes_requested" });
+    await callReviewer("provide_review_feedback", { sessionId, verdict: "changes_requested", comments: "Please address the reviewed issue before resubmitting." });
 
     const before = receivedRuns.length;
     await runContinuationTick({ ...config, resumeAgent: undefined });
@@ -750,7 +750,7 @@ try {
   {
     const sessionId = createSession();
     await callWorker("submit_for_review", { sessionId });
-    await callReviewer("provide_review_feedback", { sessionId, verdict: "changes_requested" });
+    await callReviewer("provide_review_feedback", { sessionId, verdict: "changes_requested", comments: "Please address the reviewed issue before resubmitting." });
 
     const before = receivedRuns.length;
     await runContinuationTick({ ...config, resumeAgent: undefined });
@@ -774,7 +774,7 @@ try {
     // has subscribed). The race-free wait must still observe it.
     const waiterP = callWorker("await_review_feedback", { sessionId, timeoutMs: 5000 });
     await new Promise((r) => setTimeout(r, 20));
-    await callReviewer("provide_review_feedback", { sessionId, verdict: "changes_requested" });
+    await callReviewer("provide_review_feedback", { sessionId, verdict: "changes_requested", comments: "Please address the reviewed issue before resubmitting." });
     const res = await waiterP;
     assert.equal(res.structuredContent.status, "feedback_ready", "live waiter catches feedback published after subscribe");
     assert.equal(res.structuredContent.feedback.verdict, "changes_requested");
@@ -803,7 +803,7 @@ try {
       inputPreview: "scenario 10 dispatch",
       status: "running",
     });
-    await callReviewer("provide_review_feedback", { sessionId, verdict: "changes_requested" });
+    await callReviewer("provide_review_feedback", { sessionId, verdict: "changes_requested", comments: "Please address the reviewed issue before resubmitting." });
     const before = resumeCalls;
     await runContinuationTick(config);
     assert.equal(resumeCalls, before + 1, "dispatcher redrives after worker.waiter.closed (dead agent)");
@@ -816,7 +816,7 @@ try {
     await callWorker("submit_for_review", { sessionId: sessionA });
     await callWorker("submit_for_review", { sessionId: sessionB });
     // Give A a changes_requested so the worker may resubmit on its own session.
-    await callReviewer("provide_review_feedback", { sessionId: sessionA, verdict: "changes_requested" });
+    await callReviewer("provide_review_feedback", { sessionId: sessionA, verdict: "changes_requested", comments: "Please address the reviewed issue before resubmitting." });
     const contA = continuationManager.listForSession(sessionA).find((c) => c.status === "pending")!;
     assert.ok(contA, "continuation for A exists");
 
@@ -846,7 +846,7 @@ try {
     const sessionB = createSession();
     await callWorker("submit_for_review", { sessionId: sessionA });
     await callWorker("submit_for_review", { sessionId: sessionB });
-    await callReviewer("provide_review_feedback", { sessionId: sessionB, verdict: "changes_requested" });
+    await callReviewer("provide_review_feedback", { sessionId: sessionB, verdict: "changes_requested", comments: "Please address the reviewed issue before resubmitting." });
     const contB = continuationManager.listForSession(sessionB).find((c) => c.status === "pending")!;
     assert.ok(contB, "continuation for B exists");
 
@@ -939,19 +939,19 @@ try {
     const fbIds: string[] = [];
     // Round 1
     await callWorker("submit_for_review", { sessionId });
-    await callReviewer("provide_review_feedback", { sessionId, verdict: "changes_requested" });
+    await callReviewer("provide_review_feedback", { sessionId, verdict: "changes_requested", comments: "Please address the reviewed issue before resubmitting." });
     const r1 = await callWorker("await_review_feedback", { sessionId, timeoutMs: 100 });
     assert.equal(r1.structuredContent.status, "feedback_ready");
     fbIds.push(r1.structuredContent.feedback.id);
     await callWorker("submit_for_review", { sessionId, continuationId: r1.structuredContent.feedback.continuationId });
     // Round 2
-    await callReviewer("provide_review_feedback", { sessionId, verdict: "changes_requested" });
+    await callReviewer("provide_review_feedback", { sessionId, verdict: "changes_requested", comments: "Please address the reviewed issue before resubmitting." });
     const r2 = await callWorker("await_review_feedback", { sessionId, timeoutMs: 100 });
     assert.equal(r2.structuredContent.status, "feedback_ready");
     fbIds.push(r2.structuredContent.feedback.id);
     await callWorker("submit_for_review", { sessionId, continuationId: r2.structuredContent.feedback.continuationId });
     // Round 3 — must return the THIRD feedback, never the first-cycle one.
-    await callReviewer("provide_review_feedback", { sessionId, verdict: "changes_requested" });
+    await callReviewer("provide_review_feedback", { sessionId, verdict: "changes_requested", comments: "Please address the reviewed issue before resubmitting." });
     const r3 = await callWorker("await_review_feedback", { sessionId, timeoutMs: 100 });
     assert.equal(r3.structuredContent.status, "feedback_ready", "third round returns feedback");
     assert.notEqual(r3.structuredContent.feedback.id, fbIds[0], "third round must NOT replay first-cycle feedback");

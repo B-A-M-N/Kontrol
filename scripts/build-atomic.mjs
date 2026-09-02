@@ -9,10 +9,8 @@ const tempDist = mkdtempSync(join(root, ".kontrol-build-"));
 const releasesDir = join(root, "releases");
 // Bump when the release metadata/loader contract changes in a way that must
 // invalidate an older immutable directory. build-meta.json is excluded from
-// the byte hash because it carries the final build ID, so this stable marker
-// prevents an old artifact with the same executable bytes from being reused
-// after a metadata contract change.
-const RELEASE_FORMAT_VERSION = 2;
+// the content hash because it carries the final build identity.
+const RELEASE_FORMAT_VERSION = 3;
 const resultPath = process.env.KONTROL_BUILD_RESULT_PATH
   ? resolve(root, process.env.KONTROL_BUILD_RESULT_PATH)
   : join(root, ".kontrol-build-result.json");
@@ -25,6 +23,42 @@ function run(command, args, environment = {}) {
     // kontrol-env-exception: build tooling spawns the project's own vite/tsc on
     // trusted build inputs (not repository content); needs PATH/npm lifecycle.
     env: { ...process.env, KONTROL_BUILD_OUTPUT_DIR: tempDist, ...environment },
+    stdio: "inherit",
+  });
+}
+
+function hashTree(directory, artifactHash, relativeDirectory = "") {
+  for (const entry of readdirSync(directory).sort()) {
+    const absolute = join(directory, entry);
+    const relative = join(relativeDirectory, entry);
+    if (relative === "build-meta.json") continue;
+    const stats = statSync(absolute);
+    if (stats.isDirectory()) hashTree(absolute, artifactHash, relative);
+    else artifactHash.update(relative).update(readFileSync(absolute));
+  }
+}
+
+function artifactHashFor(directory) {
+  const artifactHash = createHash("sha256");
+  artifactHash.update(`kontrol-release-format:${RELEASE_FORMAT_VERSION}\n`);
+  hashTree(directory, artifactHash);
+  return artifactHash.digest("hex").slice(0, 16);
+}
+
+function validateExistingReleaseMatchesBuildId(releasePath, buildId, contentSha256) {
+  const metadata = JSON.parse(readFileSync(join(releasePath, "build-meta.json"), "utf8"));
+  if (metadata.buildId !== buildId) {
+    throw new Error(`Existing release ${releasePath} has build ID ${metadata.buildId ?? "missing"}, expected ${buildId}`);
+  }
+  if (metadata.contentSha256 !== contentSha256) {
+    throw new Error(`Existing release ${releasePath} content identity ${metadata.contentSha256 ?? "missing"} does not match ${contentSha256}`);
+  }
+  const actualHash = artifactHashFor(releasePath);
+  if (actualHash !== contentSha256) {
+    throw new Error(`Existing release ${releasePath} executable hash ${actualHash} does not match content identity ${contentSha256}`);
+  }
+  execFileSync(process.execPath, [join(root, "scripts/validate-release.mjs"), releasePath], {
+    cwd: root,
     stdio: "inherit",
   });
 }
@@ -49,32 +83,41 @@ try {
     }
   }
 
-  // The build ID is derived from the final executable/UI bytes. Metadata is
-  // deliberately excluded because it contains a timestamp and records this
-  // already-computed ID. This gives one authoritative ID for one candidate.
-  const artifactHash = createHash("sha256");
-  artifactHash.update(`kontrol-release-format:${RELEASE_FORMAT_VERSION}\n`);
-  function hashTree(directory, relativeDirectory = "") {
-    for (const entry of readdirSync(directory).sort()) {
-      const absolute = join(directory, entry);
-      const relative = join(relativeDirectory, entry);
-      if (relative === "build-meta.json") continue;
-      const stats = statSync(absolute);
-      if (stats.isDirectory()) hashTree(absolute, relative);
-      else artifactHash.update(relative).update(readFileSync(absolute));
-    }
-  }
-  hashTree(tempDist);
-  const buildId = artifactHash.digest("hex").slice(0, 16);
+  // The executable/UI content identity is stable, but the immutable release
+  // identity also includes source provenance and the build instant. This
+  // prevents a byte-identical rebuild from reusing a release directory whose
+  // build metadata came from another checkout state.
+  const contentSha256 = artifactHashFor(tempDist);
+  const buildTimestamp = new Date().toISOString();
   run(process.execPath, ["scripts/generate-build-meta.mjs"], {
-    KONTROL_BUILD_ID: buildId,
+    KONTROL_BUILD_ID: contentSha256,
+    KONTROL_CONTENT_SHA256: contentSha256,
+    KONTROL_BUILD_TIMESTAMP: buildTimestamp,
     KONTROL_RELEASE_FORMAT_VERSION: String(RELEASE_FORMAT_VERSION),
   });
 
   const metaPath = join(tempDist, "build-meta.json");
+  const provisionalMeta = JSON.parse(readFileSync(metaPath, "utf8"));
+  const buildId = createHash("sha256")
+    .update(JSON.stringify({
+      contentSha256,
+      gitSha: provisionalMeta.gitSha ?? "unknown",
+      gitDirty: Number(provisionalMeta.gitDirty ?? 0),
+      buildTimestamp,
+      releaseFormatVersion: RELEASE_FORMAT_VERSION,
+    }))
+    .digest("hex")
+    .slice(0, 16);
+  run(process.execPath, ["scripts/generate-build-meta.mjs"], {
+    KONTROL_BUILD_ID: buildId,
+    KONTROL_CONTENT_SHA256: contentSha256,
+    KONTROL_BUILD_TIMESTAMP: buildTimestamp,
+    KONTROL_RELEASE_FORMAT_VERSION: String(RELEASE_FORMAT_VERSION),
+  });
+
   const buildMeta = JSON.parse(readFileSync(metaPath, "utf8"));
-  if (buildMeta.buildId !== buildId) {
-    throw new Error(`Build metadata identity mismatch: expected ${buildId}, got ${buildMeta.buildId ?? "missing"}`);
+  if (buildMeta.buildId !== buildId || buildMeta.contentSha256 !== contentSha256) {
+    throw new Error(`Build metadata identity mismatch: expected release ${buildId} / content ${contentSha256}, got ${buildMeta.buildId ?? "missing"} / ${buildMeta.contentSha256 ?? "missing"}`);
   }
 
   run(process.execPath, ["scripts/validate-release.mjs", tempDist]);
@@ -82,12 +125,10 @@ try {
   const releasePath = join(releasesDir, buildId);
   mkdirSync(releasesDir, { recursive: true });
   if (existsSync(releasePath)) {
-    // Identical executable bytes: keep the existing candidate tree, but the
-    // freshly generated build-meta.json is authoritative. An earlier build of
-    // the same bytes from a dirty tree would otherwise keep reporting its
-    // stale gitSha/gitDirty forever (build-meta.json is excluded from the
-    // byte hash precisely so this refresh is safe).
-    copyFileSync(join(tempDist, "build-meta.json"), join(releasePath, "build-meta.json"));
+    // A release directory is immutable after publication. A repeated build
+    // may reuse it only after proving both its metadata and executable tree
+    // still correspond to the content-addressed build ID.
+    validateExistingReleaseMatchesBuildId(releasePath, buildId, contentSha256);
     rmSync(tempDist, { recursive: true, force: true });
   } else {
     renameSync(tempDist, releasePath);
@@ -95,8 +136,12 @@ try {
 
   const result = {
     buildId,
+    contentSha256,
     artifactPath: releasePath,
     preparedAt: new Date().toISOString(),
+    sourceGitSha: buildMeta.gitSha ?? "unknown",
+    sourceDirty: Number(buildMeta.gitDirty ?? 0) > 0,
+    sourceDirtyFileCount: Number(buildMeta.gitDirty ?? 0),
   };
   mkdirSync(resolve(resultPath, ".."), { recursive: true, mode: 0o700 });
   const temporaryResultPath = `${resultPath}.tmp-${process.pid}`;

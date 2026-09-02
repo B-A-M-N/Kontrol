@@ -44,6 +44,7 @@ import {
 import { SingleUserOAuthProvider } from "./oauth-provider.js";
 import { ProcessSessionManager, type ProcessSnapshot } from "./process-sessions.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
+import { getGitEligibility } from "./git.js";
 import { formatPathForPrompt } from "./skills.js";
 import { createWorkspaceStore } from "./workspace-store.js";
 import { formatAgentsPath, WorkspaceRegistry } from "./workspaces.js";
@@ -70,6 +71,7 @@ import { verifyWorkerToken, type WorkerTokenClaims } from "./acp-worker-token.mj
 import { createApprovalRequestManager } from "./approval-requests.js";
 import { createMissionLedger } from "./mission-ledger.js";
 import { createAgentMessageManager } from "./agent-messages.js";
+import { createMutationReceiptStore, type MutationReceiptStore } from "./mutation-receipts.js";
 import { DEVDESKTOP_WORKSPACE_APP_URI, LEGACY_WORKSPACE_APP_URI, OPENAI_WORKSPACE_APP_URI, WORKSPACE_APP_BUILD_ID, WORKSPACE_APP_HTML, WORKSPACE_APP_URI, workspaceAppResourceKind, workspaceAppResourceMeta, workspaceAppToolMeta } from "./workspace-app-resource.js";
 import { createRuntimeIdentityRecord, readBuildIdentity, readRuntimeIdentity, removeRuntimeIdentity, writeRuntimeIdentity } from "./runtime-identity.js";
 import { acquireRuntimeLock, assertRuntimeLock, releaseRuntimeLock, runtimeLockPath, type RuntimeLockHandle } from "./runtime-lock.js";
@@ -732,12 +734,10 @@ function serverInstructions(config: ServerConfig): string {
       : "";
 
   if (config.toolMode === "codex") {
-    return `Use Kontrol as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree and reuse its workspaceId. Use ${toolNames.read} for direct file reads, apply_patch for all file modifications, exec_command for inspection, tests, builds, and other commands, and write_stdin to poll or interact with running processes. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.${showChangesInstruction}`;
+    return `Use Kontrol as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree and reuse its workspaceId. Prefer ${toolNames.read}, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} for direct structured inspection; use apply_patch for modifications, exec_command for tests/builds/other commands, and write_stdin to poll running processes. Review, diagnosis, architecture, and code-edit requests go directly through the workspace first. Delegate only when the reviewer explicitly asks for bounded worker assistance: call discover_agents, dispatch only a currently dispatchable healthy role=agent peer, and if optional assistance is unavailable continue directly without trying an alternate ACP route. The WebUI reviewer remains the approval authority. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.${showChangesInstruction}`;
   }
 
-  const inspection = config.toolMode !== "full"
-    ? `In minimal tool mode, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} are disabled; use ${toolNames.shell} with command-line tools such as grep, rg, find, ls, and tree for search and directory inspection. `
-    : `Prefer ${toolNames.read}, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} for file inspection. `;
+  const inspection = `Prefer ${toolNames.read}, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} for file inspection. `;
 
   const skills = config.skillsEnabled
     ? `When ${toolNames.openWorkspace} returns available skills and a task matches a skill, use ${toolNames.read} to read that skill's path before proceeding. Skill paths may be outside the workspace, but ${toolNames.read} only permits advertised SKILL.md files and files under already-loaded skill directories. `
@@ -745,7 +745,7 @@ function serverInstructions(config: ServerConfig): string {
 
   const agentsMd = `Follow instructions returned by ${toolNames.openWorkspace}. Kontrol loads additional AGENTS.md/CLAUDE.md files lazily from the ancestors of each requested path and returns newly applicable instructions with that tool call. `;
 
-  return `Use Kontrol as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree to obtain a workspaceId. Reuse that same workspaceId for all later file, search, edit, write, show-changes, and shell tools in that folder; do not call ${toolNames.openWorkspace} again unless switching folders/worktrees, changing checkout/worktree mode, the workspaceId is rejected as unknown, or the user explicitly asks to reopen. ${agentsMd}${skills}${inspection}Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not create or modify files with ${toolNames.shell}; avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or any command whose purpose is to write project files.${showChangesInstruction}`;
+  return `Use Kontrol as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree to obtain a workspaceId. Reuse that same workspaceId for all later file, search, edit, write, show-changes, and shell tools in that folder; do not call ${toolNames.openWorkspace} again unless switching folders/worktrees, changing checkout/worktree mode, the workspaceId is rejected as unknown, or the user explicitly asks to reopen. ${agentsMd}${skills}${inspection}Review, diagnosis, architecture, and code-edit requests go directly through the workspace first. Delegate only when the reviewer explicitly asks for bounded worker assistance: call discover_agents before optional dispatch, select only a currently dispatchable healthy role=agent peer, and if optional assistance is unavailable continue directly without trying an alternate ACP route. The WebUI reviewer remains the approval authority. Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not create or modify files with ${toolNames.shell}; avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or any command whose purpose is to write project files.${showChangesInstruction}`;
 }
 
 function cachedServerInstructions(config: ServerConfig): string {
@@ -953,6 +953,7 @@ function policyFailureResponse(
         status: "approval_required",
         approvalId: result.approvalId,
         retryable: true,
+        ...(context.tool === "apply_patch" ? { additions: 0, removals: 0, files: [] } : {}),
       },
     };
   }
@@ -1413,6 +1414,8 @@ interface ConnectionContext {
    */
   authenticatedRole?: "worker" | "reviewer" | "client";
   authSource?: "oauth" | "reviewer_token" | "worker_token" | "tunnel_reviewer" | "anonymous";
+  /** Authenticated principal for durable client mutation identities. */
+  authenticatedPrincipalId?: string;
   workspaceSessionId?: string;
   workSessionId?: string;
   runId?: string;
@@ -1461,6 +1464,7 @@ function createMcpServer(
   supervisorRuns?: ReturnType<typeof createSupervisorRuns>,
   onSupervisorResume?: (workSessionId: string) => void,
   db?: DatabaseHandle,
+  mutationReceipts?: MutationReceiptStore,
   onWorkspaceAppResource?: (uri: string) => void,
   onPhaseTiming?: (phase: string, durationMs: number) => void,
 ): McpServer {
@@ -1481,6 +1485,8 @@ function createMcpServer(
   );
   onPhaseTiming?.("mcp.server_construction", performance.now() - serverConstructionStartedAt);
   const toolRegistrationStartedAt = performance.now();
+  const mutationPrincipalId = connectionContext?.authenticatedPrincipalId
+    || `${connectionContext?.authSource ?? "anonymous"}:${connectionContext?.authenticatedRole ?? "client"}`;
 
   function trackToolEvent(
     workspaceId: string,
@@ -1617,7 +1623,7 @@ function createMcpServer(
     {
       title: "Open workspace",
       description:
-        "Open a local project directory as a coding workspace. Call this once per project folder or worktree before reading, editing, searching, writing, showing changes, or running commands. Reuse the returned workspaceId for later calls in the same folder; do not call open_workspace again unless switching folders/worktrees, changing checkout/worktree mode, the workspaceId is rejected as unknown, or the user explicitly asks to reopen. By default this opens the actual checkout; set mode=\"worktree\" when the user asks for an isolated or parallel coding session. Returns a workspaceId, loaded root project instructions, and nested instruction file paths the model should read before working in those directories.",
+        "Open a local project directory as a coding workspace. Call this once per project folder or worktree before reading, editing, searching, writing, showing changes, or running commands. Reuse the returned workspaceId for later calls in the same folder; do not call open_workspace again unless switching folders/worktrees, changing checkout/worktree mode, the workspaceId is rejected as unknown, or the user explicitly asks to reopen. By default this opens the actual checkout; set mode=\"worktree\" when the user asks for an isolated or parallel coding session. Ordinary non-Git directories are valid checkout workspaces and use filesystem change tracking; only managed worktrees require Git. Review and code-edit work stays direct in the workspace; optional ACP delegation follows discover_agents and healthy-agent checks. Returns the workspace capabilities and project instructions.",
       inputSchema: {
         path: z
           .string()
@@ -1640,6 +1646,16 @@ function createMcpServer(
         root: z.string(),
         mode: z.enum(["checkout", "worktree"]),
         sourceRoot: z.string().optional(),
+        workspaceKind: z.enum(["checkout", "worktree"]),
+        versionControl: z.enum(["git", "none", "unknown"]),
+        checkpointBackend: z.enum(["git", "filesystem", "unavailable"]),
+        capabilities: z.object({
+          read: z.boolean(),
+          search: z.boolean(),
+          edit: z.boolean(),
+          changeTracking: z.boolean(),
+          managedWorktree: z.boolean(),
+        }),
         worktree: z
           .object({
             path: z.string(),
@@ -1657,11 +1673,19 @@ function createMcpServer(
         instruction: z.string(),
       },
       ...toolWidgetDescriptorMeta(config, "workspace"),
-      annotations: { readOnlyHint: true },
+      // checkout opening initializes workspace/checkpoint state, and
+      // mode="worktree" creates a managed Git worktree. This combined
+      // operation therefore has a real side effect even when the default
+      // checkout path only reads project files.
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
     },
     async ({ path, mode, baseRef }) => {
       const startedAt = performance.now();
       const { workspace, agentsFiles, availableAgentsFiles } = await workspaces.openWorkspace({ path, mode, baseRef });
+      const gitEligibility = await getGitEligibility(workspace.root);
+      const workspaceKind = workspace.mode;
+      const versionControl = gitEligibility.ok ? "git" : "none";
+      const checkpointBackend = gitEligibility.ok ? "git" : "filesystem";
       if (config.widgets === "changes") {
         void reviewCheckpoints.initializeWorkspace({
           workspaceId: workspace.id,
@@ -1683,8 +1707,8 @@ function createMcpServer(
         path: formatAgentsPath(file.path, workspace.root),
       }));
       const instruction = config.skillsEnabled
-        ? "Use this workspaceId in all subsequent tool calls for this project. Do not call open_workspace again for this same folder unless this workspaceId stops working, the user asks to reopen, or you switch to a different folder/worktree. Follow loaded agentsFiles instructions. Nested instructions are loaded automatically when later tools enter their directory. When a task matches an available skill in skills, read its path before proceeding. For skills not listed here, use the search_skills tool to discover global skills by keyword."
-        : "Use this workspaceId in all subsequent tool calls for this project. Do not call open_workspace again for this same folder unless this workspaceId stops working, the user asks to reopen, or you switch to a different folder/worktree. Follow loaded agentsFiles instructions. Nested instructions are loaded automatically when later tools enter their directory.";
+        ? "Use this workspaceId in all subsequent tool calls for this project. Do not call open_workspace again for this same folder unless this workspaceId stops working, the user asks to reopen, or you switch to a different folder/worktree. Follow loaded agentsFiles instructions. Nested instructions are loaded automatically when later tools enter their directory. Review, diagnosis, architecture, and code-edit requests go directly through this workspace first. Delegate only when the reviewer explicitly asks for bounded assistance: call discover_agents, use only a currently dispatchable healthy role=agent peer, and if optional assistance is unavailable continue directly without an alternate ACP route. The WebUI reviewer remains the approval authority. When a task matches an available skill in skills, read its path before proceeding. For skills not listed here, use the search_skills tool to discover global skills by keyword."
+        : "Use this workspaceId in all subsequent tool calls for this project. Do not call open_workspace again for this same folder unless this workspaceId stops working, the user asks to reopen, or you switch to a different folder/worktree. Follow loaded agentsFiles instructions. Nested instructions are loaded automatically when later tools enter their directory. Review, diagnosis, architecture, and code-edit requests go directly through this workspace first. Delegate only when the reviewer explicitly asks for bounded assistance: call discover_agents, use only a currently dispatchable healthy role=agent peer, and if optional assistance is unavailable continue directly without an alternate ACP route. The WebUI reviewer remains the approval authority.";
       const resultContent: ToolContent[] = [
         {
           type: "text" as const,
@@ -1692,6 +1716,7 @@ function createMcpServer(
             `Opened workspace ${workspace.id}`,
             `Root: ${workspace.root}`,
             `Mode: ${workspace.mode}`,
+            `Version control: ${versionControl}; checkpoint backend: ${checkpointBackend}`,
             loadedAgentsFiles.length > 0
               ? `Loaded project instructions: ${loadedAgentsFiles.map((file) => file.path).join(", ")}`
               : undefined,
@@ -1733,6 +1758,16 @@ function createMcpServer(
           workspaceId: workspace.id,
           root: workspace.root,
           mode: workspace.mode,
+          workspaceKind,
+          versionControl,
+          checkpointBackend,
+          capabilities: {
+            read: true,
+            search: true,
+            edit: true,
+            changeTracking: true,
+            managedWorktree: workspace.mode === "worktree",
+          },
           sourceRoot: workspace.sourceRoot,
           worktree: workspace.worktree,
           agentsFiles: loadedAgentsFiles,
@@ -2218,7 +2253,7 @@ function createMcpServer(
       {
         title: "Show changes",
         description:
-          "Show aggregate file changes for an open workspace. After the final successful edit, write, or apply_patch call in the current turn, call this exactly once for that workspace before your final response so the user can inspect the combined diff for the turn. Do not call it after every individual change, and do not skip it because prior file-change tools already displayed per-tool diffs.",
+          "Show aggregate changes for an open workspace using its available checkpoint backend. Git is optional: ordinary directories use content-addressed filesystem snapshots. After the final successful edit, write, or apply_patch call in the current turn, call this exactly once before the final response so the user can inspect the combined change set.",
         inputSchema: {
           workspaceId: z
             .string()
@@ -2232,9 +2267,15 @@ function createMcpServer(
             .optional()
             .describe("Defaults to true. When true, advances the last shown checkpoint to the current workspace state."),
         },
-        outputSchema: resultOutputSchema(),
+        outputSchema: resultOutputSchema({
+          snapshotKind: z.enum(["git", "filesystem"]).optional(),
+          snapshotRef: z.string().optional(),
+        }),
         ...toolWidgetDescriptorMeta(config, "show_changes"),
-        annotations: { readOnlyHint: true },
+        // The default markReviewed=true advances the workspace checkpoint.
+        // Keep the existing end-of-turn acknowledgement behavior, but do not
+        // advertise this state-changing operation as read-only to MCP hosts.
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
       },
       async ({ workspaceId, since, markReviewed }) => {
         const startedAt = performance.now();
@@ -2274,13 +2315,18 @@ function createMcpServer(
           },
           structuredContent: {
             result: contentText(content),
+            snapshotKind: review.snapshotKind,
+            snapshotRef: review.snapshotRef,
           },
         };
       },
     );
   }
 
-  if (config.toolMode === "full") {
+  // Structured read-only discovery is part of the public surface in every
+  // tool mode. Codex mode adds process-oriented tools but does not hide these
+  // stable inspection primitives.
+  {
     registerAppTool(
       server,
       toolNames.grep,
@@ -2577,9 +2623,7 @@ function createMcpServer(
     toolNames.shell,
     {
       title: "Bash",
-      description: config.toolMode !== "full"
-        ? `Run a shell command inside an open workspace. Use only for tests, builds, git inspection, package scripts, search, file discovery, and directory inspection. In minimal tool mode, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} are disabled; use command-line tools such as grep, rg, find, ls, and tree for those read-only inspection actions. Do not use ${toolNames.shell} to create or modify files. Do not use shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or generated scripts to write project files; use ${toolNames.edit} for targeted changes and ${toolNames.write} for new files or full rewrites. Prefer ${toolNames.read} for direct file reads. Call open_workspace first and pass workspaceId. This is powerful local execution and should only be exposed behind strong authentication.`
-        : `Run a shell command inside an open workspace. Use only for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not use ${toolNames.shell} to create or modify files. Do not use shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or generated scripts to write project files; use ${toolNames.edit} for targeted changes and ${toolNames.write} for new files or full rewrites. Prefer ${toolNames.read}, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} for file inspection. Call open_workspace first and pass workspaceId. This is powerful local execution and should only be exposed behind strong authentication.`,
+      description: `Run a shell command inside an open workspace. Use only for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Prefer ${toolNames.read}, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} for repository inspection; do not use shell parsing to replace those structured read-only tools. Do not use ${toolNames.shell} to create or modify files. Do not use shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or generated scripts to write project files; use ${toolNames.edit} for targeted changes and ${toolNames.write} for new files or full rewrites. Call open_workspace first and pass workspaceId. This is powerful local execution and should only be exposed behind strong authentication.`,
       inputSchema: {
         workspaceId: z
           .string()
@@ -2704,7 +2748,14 @@ function createMcpServer(
   // stdio bridge, which hides these tools). Mark the caller as a reviewer so
   // provide_policy_approval is permitted here.
   if (policyEngine && eventStore) {
-    registerPolicyTools(server, { eventStore, policyEngine, approvalRequests, principalRole: connectionContext?.authenticatedRole ?? "client" });
+    registerPolicyTools(server, {
+      eventStore,
+      policyEngine,
+      approvalRequests,
+      principalRole: connectionContext?.authenticatedRole ?? "client",
+      principalId: mutationPrincipalId,
+      mutationReceipts,
+    });
   }
 
   if (workSessions && config.acpEnabled && eventStore && reviewWorkflow && liveWaiters) {
@@ -2736,6 +2787,8 @@ function createMcpServer(
       // twice — and crucially, a caller cannot gain worker rights by sending an
       // unsigned X-Kontrol-Work-Session header (P0 #3).
       principalRole: connectionContext?.authenticatedRole ?? "client",
+      principalId: mutationPrincipalId,
+      mutationReceipts,
       connectionContinuationId: connectionContext?.continuationId,
       connectionWorkSessionId: connectionContext?.workSessionId,
       connectionWorkspaceLeaseNonce: connectionContext?.workspaceLeaseNonce,
@@ -3479,6 +3532,7 @@ export function createServer(config = loadConfig()): RunningServer {
     lastDurationMs: number;
     maxDurationMs: number;
     compactedRows: number;
+    pendingMutationReceipts: number;
     lastError?: string;
   } = {
     running: false,
@@ -3487,6 +3541,7 @@ export function createServer(config = loadConfig()): RunningServer {
     lastDurationMs: 0,
     maxDurationMs: 0,
     compactedRows: 0,
+    pendingMutationReceipts: 0,
   };
 
   const runMaintenanceCycle = (): void => {
@@ -3501,6 +3556,7 @@ export function createServer(config = loadConfig()): RunningServer {
     let pageIndex = 0;
     let runtimeReconciliationDone = false;
     let approvalExpiryDone = false;
+    let mutationReceiptReconciliationDone = false;
 
     const finish = (backlog: boolean): void => {
       const durationMs = Math.round(performance.now() - startedAt);
@@ -3555,6 +3611,21 @@ export function createServer(config = loadConfig()): RunningServer {
           approvalExpiryDone = expiredApprovals.length < MAINTENANCE_PAGE_SIZE;
           setImmediate(step);
           return;
+        }
+
+        if (!mutationReceiptReconciliationDone) {
+          const receiptMaintenance = mutationReceipts.reconcile({ limit: MAINTENANCE_PAGE_SIZE });
+          maintenanceStats.pendingMutationReceipts = receiptMaintenance.pendingSample.length
+            + (receiptMaintenance.pendingHasMore ? MAINTENANCE_PAGE_SIZE : 0);
+          // Pending rows are an inspection result, not a deletion cursor:
+          // they remain until an operator reconciles the authoritative
+          // mutation outcome. Only completed-row pruning determines whether
+          // another bounded page is needed.
+          mutationReceiptReconciliationDone = receiptMaintenance.deletedCompleted < MAINTENANCE_PAGE_SIZE;
+          if (!mutationReceiptReconciliationDone) {
+            setImmediate(step);
+            return;
+          }
         }
 
         if (pageIndex >= page.length) {
@@ -3613,9 +3684,12 @@ export function createServer(config = loadConfig()): RunningServer {
   // ONE shared DB handle for every manager + the review workflow service, so the
   // workflow can commit state + event log in a SINGLE transaction (P1 #15).
   const db: DatabaseHandle = openDatabase(config.stateDir);
+  const mutationReceipts = createMutationReceiptStore(db);
   const workspaceStore = createWorkspaceStore(db);
   const workspaces = new WorkspaceRegistry(config, workspaceStore);
-  const reviewCheckpoints = createReviewCheckpointManager();
+  const reviewCheckpoints = createReviewCheckpointManager({
+    snapshotStoreRoot: join(config.stateDir, "workspace-snapshots"),
+  });
   const processSessions = new ProcessSessionManager({
     childEnvironmentAllowlist: config.childEnvironmentAllowlist,
     // P1 #14: operator-tunable resource controls; manager applies defaults
@@ -3635,7 +3709,7 @@ export function createServer(config = loadConfig()): RunningServer {
   agentRegistry.ensure({
     name: "webui",
     url: "ui://kontrol/workspace-app.html",
-    description: "Kontrol review WebUI — the ACP client that submits work to the coding agent and signs off (Nelson Wiggum Loop).",
+    description: "Kontrol review WebUI — the reviewer surface that may explicitly submit bounded work to a coding agent and signs off (Nelson Wiggum Loop).",
     role: "reviewer",
     tags: ["webui", "reviewer"],
     ttlSeconds: 60 * 60 * 24 * 365,
@@ -4911,6 +4985,15 @@ export function createServer(config = loadConfig()): RunningServer {
                 : oauthEnabled
                   ? "oauth"
                   : "anonymous",
+          authenticatedPrincipalId: verifiedClaims
+            ? `worker-work-session:${verifiedClaims.workSessionId}`
+            : req.auth?.clientId
+              ? `oauth-client:${req.auth.clientId}`
+              : verifiedReviewer
+                ? "reviewer-token"
+                : verifiedTunnelReviewer
+                  ? "tunnel-reviewer"
+                  : undefined,
           workspaceSessionId:
             verifiedClaims?.workspaceSessionId
             || (req.header("x-kontrol-workspace-session") ?? undefined),
@@ -4951,6 +5034,7 @@ export function createServer(config = loadConfig()): RunningServer {
           supervisorRuns,
           (workSessionId) => supervisorRuntime?.wake(workSessionId),
           db,
+          mutationReceipts,
           (uri) => {
             if (uri === WORKSPACE_APP_URI) workspaceAppResourceMetrics.currentHashed++;
             else if (uri === OPENAI_WORKSPACE_APP_URI) workspaceAppResourceMetrics.openAiCompatibility++;
@@ -5220,7 +5304,9 @@ export function createServer(config = loadConfig()): RunningServer {
         const latest = workSessions.get(workSessionId)?.latestSubmission;
         return evaluateSupervisorMission(missionLedger, workSessionId, {
           submissionId: latest?.id,
-          snapshotCommit: latest?.snapshotCommit,
+          snapshotKind: latest?.snapshotKind,
+          snapshotRef: latest?.snapshotRef ?? latest?.snapshotCommit,
+          snapshotCommit: latest?.snapshotRef ?? latest?.snapshotCommit,
           cycleNumber: run?.cycleNumber ?? 0,
           emergencyCycleCeiling: run?.maxCycles,
         });
@@ -5234,7 +5320,7 @@ export function createServer(config = loadConfig()): RunningServer {
       getProgressSnapshot: (workSessionId, evaluation) => {
         const session = workSessions.get(workSessionId);
         const latest = session?.latestSubmission;
-        const packet = missionLedger.getPacket(workSessionId, latest?.id ? { submissionId: latest.id, snapshotCommit: latest.snapshotCommit, reviewEpoch: latest.reviewEpoch } : undefined);
+        const packet = missionLedger.getPacket(workSessionId, latest?.id ? { submissionId: latest.id, snapshotKind: latest.snapshotKind, snapshotRef: latest.snapshotRef ?? latest.snapshotCommit, snapshotCommit: latest.snapshotRef ?? latest.snapshotCommit, reviewEpoch: latest.reviewEpoch } : undefined);
         const currentEvidence = packet.evidence.filter((entry) => !latest?.id || entry.submissionId === latest.id);
         const failedEvidence = currentEvidence.filter((entry) => entry.status === "failed");
         const failureSet = failedEvidence.map((entry) => {
@@ -5286,18 +5372,18 @@ export function createServer(config = loadConfig()): RunningServer {
         const session = workSessions.get(workSessionId);
         if (session?.status !== "awaiting_review") return undefined;
         const submission = session.latestSubmission;
-        return submission?.id ? { id: submission.id, snapshotCommit: submission.snapshotCommit, reviewEpoch: submission.reviewEpoch } : undefined;
+        return submission?.id ? { id: submission.id, snapshotKind: submission.snapshotKind, snapshotRef: submission.snapshotRef ?? submission.snapshotCommit, snapshotCommit: submission.snapshotRef ?? submission.snapshotCommit, reviewEpoch: submission.reviewEpoch } : undefined;
       },
       currentSessionStatus: (workSessionId) => workSessions.get(workSessionId)?.status,
       currentApproval: (workSessionId) => {
         const latest = workSessions.get(workSessionId)?.latestSubmission;
-        return missionLedger.canApprove(workSessionId, latest?.id ? { submissionId: latest.id, snapshotCommit: latest.snapshotCommit, reviewEpoch: latest.reviewEpoch } : {});
+        return missionLedger.canApprove(workSessionId, latest?.id ? { submissionId: latest.id, snapshotKind: latest.snapshotKind, snapshotRef: latest.snapshotRef ?? latest.snapshotCommit, snapshotCommit: latest.snapshotRef ?? latest.snapshotCommit, reviewEpoch: latest.reviewEpoch } : {});
       },
       onApprove: async (workSessionId) => {
         const session = workSessions.get(workSessionId);
         const latest = session?.latestSubmission;
         if (!session || !latest?.id) throw new Error("Cannot automatically approve without a current submission.");
-        const approval = missionLedger.canApprove(workSessionId, { submissionId: latest.id, snapshotCommit: latest.snapshotCommit, reviewEpoch: latest.reviewEpoch });
+        const approval = missionLedger.canApprove(workSessionId, { submissionId: latest.id, snapshotKind: latest.snapshotKind, snapshotRef: latest.snapshotRef ?? latest.snapshotCommit, snapshotCommit: latest.snapshotRef ?? latest.snapshotCommit, reviewEpoch: latest.reviewEpoch });
         if (!approval.allowed) throw new Error(`Automatic approval blocked: ${approval.reasons.join("; ")}`);
         await reviewWorkflow.provideFeedback({
           sessionId: workSessionId,
@@ -5307,7 +5393,7 @@ export function createServer(config = loadConfig()): RunningServer {
           verdict: "approve",
           comments: "Automatically approved after current trusted mission verification.",
           reviewerId: "supervisor-runtime",
-          completionReportSha256: missionLedger.getCompletionReportHash(workSessionId, { submissionId: latest.id, snapshotCommit: latest.snapshotCommit, reviewEpoch: latest.reviewEpoch }),
+          completionReportSha256: missionLedger.getCompletionReportHash(workSessionId, { submissionId: latest.id, snapshotKind: latest.snapshotKind, snapshotRef: latest.snapshotRef ?? latest.snapshotCommit, snapshotCommit: latest.snapshotRef ?? latest.snapshotCommit, reviewEpoch: latest.reviewEpoch }),
         });
       },
     });
@@ -5432,7 +5518,10 @@ export async function runServer(config = loadConfig()): Promise<void> {
   const runtimeIdentity = createRuntimeIdentityRecord(
     buildMeta,
     process.argv.join(" "),
-    { artifactPath: dirname(fileURLToPath(import.meta.url)) },
+    {
+      artifactPath: dirname(fileURLToPath(import.meta.url)),
+      generationId: runtimeLock.record.generationId,
+    },
   );
   let runtimeIdentityWritten = false;
   const httpServer = app.listen(config.port, config.host, () => {
