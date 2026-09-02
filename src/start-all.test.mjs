@@ -47,6 +47,11 @@ assert.match(script, /-c "\$DESKTOP_PWD"/);
 assert.match(script, /KONTROL_SERVER_LOG/);
 assert.match(script, /EFFECTIVE_STATE_DIR=.*loadConfig\(\)\.stateDir/);
 assert.match(script, /export KONTROL_STATE_DIR="\$EFFECTIVE_STATE_DIR"/);
+assert.ok(
+  script.indexOf('export KONTROL_STATE_DIR="$EFFECTIVE_STATE_DIR"') <
+    script.indexOf('DATABASE_MIGRATION_RECORD_PATH="$KONTROL_STATE_DIR/'),
+  "migration journal path must be derived only after the resolved state directory is exported",
+);
 assert.match(script, /KONTROL_ENV_FILE/);
 assert.match(script, /server exited before readiness/);
 assert.match(script, /Kontrol server log:/);
