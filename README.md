@@ -20,7 +20,7 @@ You run it on your machine, expose it through a tunnel you control, and decide w
 
 Most MCP file-server bridges stop at "read/write/edit." Kontrol adds three layers on top:
 
-**Ralphie Muntz Loop** — Agents submit work for human review. The review surface (WebUI or any MCP client) shows the diff. Human approves, requests changes, or rejects. The agent continues from durable feedback state — even if the agent process died and restarted.
+**Ralphie Muntz Loop** — Agents submit work for human review. The WebUI reviewer (or another authorized MCP reviewer) shows the backend-neutral checkpoint diff. Human approves, requests changes, or rejects. The agent continues from durable feedback state — even if the agent process died and restarted.
 
 **Continuation Outbox** — Every review decision generates a structured continuation packet with verdict, required actions, and resumption instructions. The packet crosses from the review surface to the next agent turn, so work continues without losing context.
 
@@ -30,20 +30,14 @@ Underneath it all is **transactional workflow state with an append-only event lo
 
 ## Installation
 
-Kontrol requires Node `>=22.19 <27`.
+Kontrol requires Node 22.19+, 24.x, or 26.x.
 
-The npm package name is reserved for `@b-a-m-n/kontrol`, but the public package is not published yet. Install from GitHub for now:
+For an installed product, use the public package:
 
 ```bash
-npm install -g git+ssh://git@github.com/B-A-M-N/Kontrol.git
+npm install -g @b-a-m-n/kontrol@1.0.4
 kontrol init
 kontrol serve
-```
-
-If you do not use SSH keys with GitHub, use the HTTPS URL:
-
-```bash
-npm install -g git+https://github.com/B-A-M-N/Kontrol.git
 ```
 
 For source development, clone the repo and link the CLI locally:
@@ -68,8 +62,8 @@ kontrol up
 `kontrol up` uses the checkout's `.env` and performs the same preflight and
 readiness checks as `start-all.sh`.
 
-The checkout also provides `./restart-kontrol.sh`, which runs the same
-transactional launcher. It builds and verifies the replacement generation
+The checkout also provides `./restart-kontrol.sh` for development/integration
+generations. It builds and verifies the replacement generation
 before stopping old owned processes and rolls back if a readiness stage fails.
 
 For the complete stable-beta release gate, run:
@@ -187,25 +181,24 @@ external connector has already lost its route, reconnect it with a fresh MCP
 `initialize`; the old `mcp-session-id` is disposable and is never treated as
 the recovery authority.
 
-For stable long-running process priority, install the per-user systemd core
-unit and start the installed MCP core through it. The unit launches the
-validated `dist/cli.js serve` product, sets `Nice=0`, applies a bounded restart
-budget, and reads one explicit environment file. It does not start adapters or
-the tunnel; use the checkout orchestration path for the full development stack:
+For stable long-running process priority on Linux, install the per-user
+systemd core unit from the compiled CLI. The unit launches an immutable,
+validated release, sets `Nice=0`, applies a bounded restart budget, and reads
+one explicit environment file. It does not start adapters or the tunnel; use
+the checkout orchestration path for the full development stack:
 
 ```bash
-scripts/kontrol-user-service.sh install
-scripts/kontrol-user-service.sh start
+kontrol service install
+kontrol service start
 ```
 
-`restart` restarts the immutable release already installed in the unit. Use
-`scripts/kontrol-user-service.sh upgrade` to select the current `dist/` release,
-reload the unit, verify core readiness, and restore the previous unit if the
-candidate fails to start.
+`kontrol service restart` restarts the immutable release already installed in
+the unit. Use `kontrol service upgrade` to select the current build candidate,
+reload the unit, verify core readiness, and restore the previous unit and
+validated database backup if the candidate fails to start.
 
-Use `scripts/kontrol-user-service.sh status` or `logs` for service-level
-diagnostics. Direct `./start-all.sh` remains available for foreground/development
-use.
+Use `kontrol service status` or `logs` for service-level diagnostics. Direct
+`./start-all.sh` remains available for foreground/development use.
 
 ### Supported lifecycle paths (P1 #27)
 
@@ -213,17 +206,18 @@ KONTROL defines exactly one authoritative path per context:
 
 | Context | Path | Notes |
 |---|---|---|
-| Production / install on Linux | `scripts/kontrol-user-service.sh` (`kontrol-core.service`) | Owns restart/priority policy for the MCP core |
+| Production / install on Linux | `kontrol service ...` (`kontrol-core.service`) | Owns restart/priority policy for the MCP core |
 | Development / integration | `./start-all.sh` (tmux sessions + component supervisor) | Fast validated preflight by default; atomic build generation with rollback |
-| Test / release | `npm run typecheck && npm run test && npm run build` | The release gate CI and `kontrol-user-service.sh install` rely on |
+| Test / release | `npm run typecheck && npm run test && npm run build` | The release gate CI and `kontrol service install` rely on |
 
 The systemd core unit is the supported production lifecycle for the MCP core
 on Linux. Its default environment file is
 `~/.config/kontrol/environment` (override with `KONTROL_USER_ENV_FILE`). The
 full adapter/tunnel stack remains the checkout launcher path. macOS and
 Windows support development and integration runs, but Kontrol does not ship a
-production launchd or Windows Service manager. `kontrol serve` remains the underlying process it
-launches — it is not itself a production lifecycle manager. Startup
+production launchd or Windows Service manager. `kontrol serve` remains the
+underlying process it launches — it is not itself a production lifecycle
+manager. Startup
 preflight depth is controlled by `KONTROL_STARTUP_PROFILE` (see
 docs/configuration.md): `release` runs the complete gate including the
 dirty-checkout guard; `dev-fast` skips the test suite for iteration.
@@ -265,7 +259,7 @@ The review loop is event-driven and provider-agnostic:
 ```
 Agent submits work → Kontrol captures diff, emits ReviewRequested
      ↓
-Human reviews diff in WebUI / any MCP client
+Human reviewer inspects checkpoint in WebUI / authorized MCP reviewer
      ↓
 Human approves, requests changes, or rejects
      ↓

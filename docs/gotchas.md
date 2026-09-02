@@ -4,10 +4,10 @@ This page collects the setup issues users are most likely to hit.
 
 ## `kontrol` Command Not Found
 
-Install from GitHub:
+Install the package:
 
 ```bash
-npm install -g git+ssh://git@github.com/B-A-M-N/Kontrol.git
+npm install -g @b-a-m-n/kontrol@1.0.4
 ```
 
 Then confirm npm's global bin directory is on `PATH` and run:
@@ -19,7 +19,7 @@ kontrol serve
 
 ## Unsupported Node Version
 
-Kontrol requires Node `>=22.19 <27`.
+Kontrol requires Node 22.19+, 24.x, or 26.x.
 
 Check:
 

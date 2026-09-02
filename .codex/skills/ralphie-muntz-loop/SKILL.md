@@ -20,7 +20,7 @@ CLI Agent                          Kontrol Server                    WebUI (Huma
     ├─ start_work_session ──────────────►│                                │
     ├─ [do work: edit, write, shell]     │                                │
     ├─ submit_for_review ───────────────►│                                │
-    │   (git diff captured)             ├─ status: awaiting_review        │
+    │   (workspace checkpoint captured) ├─ status: awaiting_review        │
     │                                    │                                │
     ├─ await_review_feedback ───────────►│  ← MCP call BLOCKS here        │
     │   (agent is parked)               │    (Promise, not polling)       │
@@ -52,7 +52,7 @@ CLI Agent                          Kontrol Server                    WebUI (Huma
 | Tool | Purpose |
 |------|---------|
 | `start_work_session` | Create a session, begin tracking tool calls |
-| `submit_for_review` | Capture git diff, submit for human review |
+| `submit_for_review` | Capture the backend-neutral workspace checkpoint and submit it for human review |
 | `await_review_feedback` | **Block until feedback arrives** (with timeout) |
 | `get_work_session` | Read current session state and history |
 

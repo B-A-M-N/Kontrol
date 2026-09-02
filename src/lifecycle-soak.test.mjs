@@ -283,15 +283,20 @@ try {
   competitor.stdout.on("data", (chunk) => { competitorOutput += chunk; });
   competitor.stderr.on("data", (chunk) => { competitorOutput += chunk; });
   const competitorExit = once(competitor, "exit");
-  const competitorExited = await Promise.race([
-    competitorExit.then(() => true),
-    delay(10000).then(() => false),
+  const competitorOutcome = await Promise.race([
+    competitorExit.then(([code, signal]) => ({ code, signal, timedOut: false })),
+    // A full aggregate run can have several cold tsx children competing for
+    // CPU at once. Keep a bounded startup budget, but do not turn that
+    // contention into an opaque null exitCode assertion.
+    delay(30000).then(() => ({ code: null, signal: null, timedOut: true })),
   ]);
-  if (!competitorExited) {
+  if (competitorOutcome.timedOut) {
     competitor.kill("SIGKILL");
     await competitorExit;
+    assert.fail(`competing launch did not report its bind failure within 30s: ${competitorOutput}`);
   }
-  assert.equal(competitor.exitCode, 1, `competing launch unexpectedly succeeded: ${competitorOutput}`);
+  assert.equal(competitorOutcome.signal, null, `competing launch did not exit normally: ${competitorOutput}`);
+  assert.equal(competitorOutcome.code, 1, `competing launch unexpectedly succeeded: ${competitorOutput}`);
   assert.match(competitorOutput, /EADDRINUSE/);
   assert.equal(readFileSync(join(stateDir, "server.identity.json"), "utf8"), firstIdentity,
     "failed second bind must leave the live server identity untouched");

@@ -209,6 +209,10 @@ async function handle(req, res) {
   if (body.smoke_test) {
     return writeJson(res, 202, { run_id: "hermes-native-smoke", smoke_test: true, native: true, accepted: true });
   }
+  const task = extractTask(body.input);
+  if (!task.trim()) {
+    return writeJson(res, 400, { error: { code: "invalid_task", message: "ACP task must be non-empty" } });
+  }
 
   const workspaceRoot = await validateWorkspaceRoot(body.workspace_root);
   const run = {
@@ -217,7 +221,7 @@ async function handle(req, res) {
     workSessionId: body.session_id,
     workspaceSessionId: body.workspace_session_id,
     agentId: body.agent_id,
-    task: extractTask(body.input),
+    task,
     workspaceRoot,
     workspaceLeaseNonce: body.workspace_lease_nonce,
     startedAt: Date.now(),

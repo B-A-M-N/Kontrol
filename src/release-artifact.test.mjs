@@ -21,10 +21,11 @@ function writeRequiredFiles(artifact) {
   mkdirSync(join(artifact, "ui"), { recursive: true });
   writeFileSync(join(artifact, "build-meta.json"), JSON.stringify({
     buildId: "fixture",
+    contentSha256: "0123456789abcdef",
     schemaVersion: 50,
     minReadableSchemaVersion: 0,
     maxReadableSchemaVersion: 50,
-    releaseFormatVersion: 2,
+    releaseFormatVersion: 3,
   }) + "\n");
   for (const file of ["cli.js", "server.js", "acp-duplex.js", "acp-worker-token.mjs"]) {
     writeFileSync(join(artifact, file), "export {};\n");
@@ -92,7 +93,8 @@ try {
   assert.equal(metadata.schemaVersion, metadata.maxReadableSchemaVersion);
   assert.equal(metadata.minReadableSchemaVersion, 0);
   assert.equal(metadata.schemaCompatibility, "upgrade-in-place; downgrade-via-versioned-backup");
-  assert.equal(metadata.releaseFormatVersion, 2);
+  assert.equal(metadata.releaseFormatVersion, 3);
+  assert.match(metadata.contentSha256, /^[a-f0-9]{16}$/);
 
   // Exercise the exact release probe used by start-all.sh. Static required-file
   // checks alone would not catch a relocated module whose import resolves

@@ -43,6 +43,14 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Install Playwright Chromium (Linux)
+        if: runner.os == 'Linux'
+        run: npx playwright install --with-deps chromium
+
+      - name: Install Playwright Chromium (macOS/Windows)
+        if: runner.os != 'Linux'
+        run: npx playwright install chromium
+
       - name: Typecheck
         run: npm run typecheck
 
@@ -60,7 +68,7 @@ jobs:
         run: npm run build
 
       - name: Doctor
-        run: node dist/cli.js doctor
+        run: node scripts/doctor-build.mjs
 
   # P1 #12: stable-release UAT. End-to-end exercise of the INSTALLED product
   # (packed tarball, empty state dir, deterministic fakes — no model/API deps).

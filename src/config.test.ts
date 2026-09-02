@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "./config.js";
+import { writeKontrolAuth, writeKontrolConfig } from "./user-config.js";
 
 const emptyConfigDir = mkdtempSync(join(tmpdir(), "kontrol-empty-config-test-"));
 const baseEnv = {
@@ -265,6 +266,40 @@ assert.deepEqual(fileConfig.allowedHosts, [
   "::1",
   "kontrol.example.com",
 ]);
+
+// The filesystem boundary must always be explicit. Missing, empty, and
+// whitespace-only values must not turn the process working directory into an
+// implicit allowed root, including when a persisted config is present.
+const rootsRequiredEnv = {
+  KONTROL_CONFIG_DIR: mkdtempSync(join(tmpdir(), "kontrol-roots-required-")),
+  KONTROL_OAUTH_OWNER_TOKEN: "roots-required-owner-token-long-enough",
+};
+for (const roots of [undefined, "", "   "]) {
+  assert.throws(
+    () => loadConfig({ ...rootsRequiredEnv, ...(roots === undefined ? {} : { KONTROL_ALLOWED_ROOTS: roots }) }),
+    /KONTROL_ALLOWED_ROOTS must contain at least one explicit directory/,
+    `roots value ${String(roots)} must fail closed`,
+  );
+}
+const persistedEmptyRootsDir = mkdtempSync(join(tmpdir(), "kontrol-persisted-empty-roots-"));
+writeFileSync(join(persistedEmptyRootsDir, "config.json"), JSON.stringify({ allowedRoots: [] }));
+writeFileSync(join(persistedEmptyRootsDir, "auth.json"), JSON.stringify({ ownerToken: "persisted-roots-owner-token-long-enough" }));
+assert.throws(
+  () => loadConfig({ KONTROL_CONFIG_DIR: persistedEmptyRootsDir }),
+  /KONTROL_ALLOWED_ROOTS must contain at least one explicit directory/,
+  "persisted empty roots must fail closed",
+);
+
+// Rewriting an existing exposed auth file must tighten its mode, not merely
+// pass mode=0600 to a write call that leaves the old inode permissions intact.
+const secureConfigDir = mkdtempSync(join(tmpdir(), "kontrol-user-config-secure-"));
+const secureConfigEnv = { KONTROL_CONFIG_DIR: secureConfigDir };
+writeKontrolConfig({ allowedRoots: [process.cwd()] }, secureConfigEnv);
+writeKontrolAuth({ ownerToken: "secure-auth-owner-token-long-enough" }, secureConfigEnv);
+chmodSync(join(secureConfigDir, "auth.json"), 0o644);
+writeKontrolAuth({ ownerToken: "rewritten-auth-owner-token-long-enough" }, secureConfigEnv);
+assert.equal(statSync(secureConfigDir).mode & 0o777, 0o700, "config directory is owner-only");
+assert.equal(statSync(join(secureConfigDir, "auth.json")).mode & 0o777, 0o600, "auth rewrite tightens file permissions");
 
 // P0 — tunnel mode must not start an ask-capable policy without a reviewer
 // credential. Direct approvals exist independently from ACP; without reviewer

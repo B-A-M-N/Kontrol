@@ -16,6 +16,7 @@ import {
   type WorkSessionToolEventRow,
 } from "./db/schema.js";
 import type { ReviewFile } from "./review-checkpoints.js";
+import type { WorkspaceSnapshotKind } from "./review-checkpoints.js";
 
 export type WorkSessionStatus =
   | "in_progress"
@@ -46,6 +47,7 @@ export interface WorkSession {
   submittedBy: string;
   title?: string;
   lastConsumedFeedbackId?: string;
+  lastConsumedReviewEpoch: number;
   createdAt: string;
   updatedAt: string;
   latestSubmission?: WorkSessionSubmission;
@@ -66,6 +68,7 @@ export interface WorkspaceSessionSurfaceEntry {
   submittedBy: string;
   updatedAt: string;
   runId?: string;
+  lastHeartbeatAt?: string;
   hasMission: boolean;
   missionStatus?: string;
   missionCycleNumber?: number;
@@ -110,7 +113,10 @@ export interface WorkSessionSubmission {
   submissionNumber: number;
   diff?: string;
   diffSha256?: string;
-  /** Exact working-tree snapshot commit the diff was captured against. */
+  /** Explicit backend-neutral checkpoint identity. */
+  snapshotKind?: WorkspaceSnapshotKind;
+  snapshotRef?: string;
+  /** @deprecated Legacy Git projection retained for old database rows. */
   snapshotCommit?: string;
   reviewEpoch: number;
   message?: string;
@@ -206,6 +212,8 @@ export interface WorkSessionManager {
     diff?: string;
     diffSha256?: string;
     snapshotCommit?: string;
+    snapshotKind?: WorkspaceSnapshotKind;
+    snapshotRef?: string;
     message?: string;
     summaryJson?: string;
     files?: ReviewFile[];
@@ -258,7 +266,7 @@ export interface WorkSessionManager {
   getWorkspaceSessionSurface(
     workspaceSessionId?: string,
     limit?: number,
-    filter?: "all" | "pending_review" | "live",
+    filter?: "all" | "pending_review" | "stale_pending_review" | "live",
     after?: WorkspaceSessionSurfaceCursor,
   ): WorkspaceSessionSurfaceEntry[];
   getWorkspaceEventCursor(workspaceSessionId?: string): number;
@@ -320,6 +328,7 @@ class SqliteWorkSessionManager implements WorkSessionManager {
       reviewEpoch: 0,
       submittedBy: input.submittedBy,
       title: input.title,
+      lastConsumedReviewEpoch: 0,
       createdAt: now,
       updatedAt: now,
       lifecycle: "pending",
@@ -340,6 +349,7 @@ class SqliteWorkSessionManager implements WorkSessionManager {
         submittedBy: session.submittedBy,
         title: session.title ?? null,
         lastConsumedFeedbackId: null,
+        lastConsumedReviewEpoch: 0,
         createdAt: session.createdAt,
         updatedAt: session.updatedAt,
       })
@@ -491,6 +501,8 @@ class SqliteWorkSessionManager implements WorkSessionManager {
     diff?: string;
     diffSha256?: string;
     snapshotCommit?: string;
+    snapshotKind?: WorkspaceSnapshotKind;
+    snapshotRef?: string;
     message?: string;
     summaryJson?: string;
     files?: ReviewFile[];
@@ -518,8 +530,8 @@ class SqliteWorkSessionManager implements WorkSessionManager {
       const reviewEpoch = Number(session.review_epoch) + 1;
       this.database.sqlite.prepare(`
         insert into work_session_submissions
-          (id, work_session_id, submission_number, diff, diff_sha256, files_json, snapshot_commit, review_epoch, message, summary_json, status, created_at)
-        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+          (id, work_session_id, submission_number, diff, diff_sha256, files_json, snapshot_commit, snapshot_kind, snapshot_ref, review_epoch, message, summary_json, status, created_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
       `).run(
         submissionId,
         input.workSessionId,
@@ -528,6 +540,8 @@ class SqliteWorkSessionManager implements WorkSessionManager {
         diffSha256,
         input.files ? JSON.stringify(input.files) : null,
         input.snapshotCommit ?? null,
+        input.snapshotKind ?? (input.snapshotCommit ? "git" : null),
+        input.snapshotRef ?? input.snapshotCommit ?? null,
         reviewEpoch,
         input.message ?? null,
         input.summaryJson ?? null,
@@ -548,6 +562,8 @@ class SqliteWorkSessionManager implements WorkSessionManager {
       submissionNumber: createSubmission.submissionNumber,
       diff: input.diff,
       diffSha256,
+      snapshotKind: input.snapshotKind ?? (input.snapshotCommit ? "git" : undefined),
+      snapshotRef: input.snapshotRef ?? input.snapshotCommit,
       snapshotCommit: input.snapshotCommit,
       reviewEpoch: createSubmission.reviewEpoch,
       message: input.message,
@@ -690,7 +706,7 @@ class SqliteWorkSessionManager implements WorkSessionManager {
       .select()
       .from(workSessionToolEvents)
       .where(eq(workSessionToolEvents.workSessionId, workSessionId))
-      .orderBy(desc(workSessionToolEvents.createdAt))
+      .orderBy(desc(workSessionToolEvents.createdAt), desc(workSessionToolEvents.id))
       .limit(limit)
       .all();
     return rows.map(rowToToolEvent);
@@ -703,7 +719,10 @@ class SqliteWorkSessionManager implements WorkSessionManager {
       const anchor = this.database.db
         .select()
         .from(workSessionToolEvents)
-        .where(eq(workSessionToolEvents.id, afterId))
+        .where(and(
+          eq(workSessionToolEvents.id, afterId),
+          baseCondition,
+        ))
         .get();
       if (!anchor) return [];
       const rows = this.database.db
@@ -711,9 +730,15 @@ class SqliteWorkSessionManager implements WorkSessionManager {
         .from(workSessionToolEvents)
         .where(and(
           baseCondition,
-          sql`${workSessionToolEvents.createdAt} < ${anchor.createdAt}`,
+          sql`(
+            ${workSessionToolEvents.createdAt} < ${anchor.createdAt}
+            or (
+              ${workSessionToolEvents.createdAt} = ${anchor.createdAt}
+              and ${workSessionToolEvents.id} < ${anchor.id}
+            )
+          )`,
         ))
-        .orderBy(desc(workSessionToolEvents.createdAt))
+        .orderBy(desc(workSessionToolEvents.createdAt), desc(workSessionToolEvents.id))
         .limit(limit)
         .all();
       return rows.map(rowToToolEvent);
@@ -722,7 +747,7 @@ class SqliteWorkSessionManager implements WorkSessionManager {
       .select()
       .from(workSessionToolEvents)
       .where(baseCondition)
-      .orderBy(desc(workSessionToolEvents.createdAt))
+      .orderBy(desc(workSessionToolEvents.createdAt), desc(workSessionToolEvents.id))
       .limit(limit)
       .all();
     return rows.map(rowToToolEvent);
@@ -756,13 +781,14 @@ class SqliteWorkSessionManager implements WorkSessionManager {
 
   getLatestFeedback(workSessionId: string): WorkSessionFeedback | undefined {
     const row = this.database.db
-      .select()
+      .select({ feedback: workSessionFeedback })
       .from(workSessionFeedback)
+      .innerJoin(workSessionSubmissions, eq(workSessionSubmissions.id, workSessionFeedback.submissionId))
       .where(eq(workSessionFeedback.workSessionId, workSessionId))
-      .orderBy(desc(workSessionFeedback.createdAt))
+      .orderBy(desc(workSessionSubmissions.submissionNumber), desc(workSessionSubmissions.reviewEpoch), desc(workSessionFeedback.id))
       .limit(1)
       .get();
-    return row ? rowToFeedback(row) : undefined;
+    return row ? rowToFeedback(row.feedback) : undefined;
   }
 
   countFeedback(workSessionId: string): number {
@@ -774,50 +800,63 @@ class SqliteWorkSessionManager implements WorkSessionManager {
 
   markFeedbackConsumed(workSessionId: string, feedbackId: string): void {
     const now = new Date().toISOString();
-    this.database.db
-      .update(workSessions)
-      .set({ lastConsumedFeedbackId: feedbackId, updatedAt: now })
-      .where(eq(workSessions.id, workSessionId))
-      .run();
+    const feedback = this.database.sqlite.prepare(`
+      select f.id, s.review_epoch
+        from work_session_feedback f
+        inner join work_session_submissions s on s.id = f.submission_id
+       where f.id = ? and f.work_session_id = ?
+    `).get(feedbackId, workSessionId) as { id: string; review_epoch: number } | undefined;
+    if (!feedback) return;
+    this.database.sqlite.prepare(`
+      update work_sessions
+         set last_consumed_feedback_id = ?,
+             last_consumed_review_epoch = ?,
+             updated_at = ?
+       where id = ?
+         and last_consumed_review_epoch < ?
+    `).run(feedback.id, feedback.review_epoch, now, workSessionId, feedback.review_epoch);
   }
 
   getLatestFeedbackAfter(workSessionId: string, afterFeedbackId?: string): WorkSessionFeedback | undefined {
     if (afterFeedbackId) {
       const anchor = this.database.db
-        .select()
+        .select({ feedback: workSessionFeedback, submissionNumber: workSessionSubmissions.submissionNumber })
         .from(workSessionFeedback)
+        .innerJoin(workSessionSubmissions, eq(workSessionSubmissions.id, workSessionFeedback.submissionId))
         .where(eq(workSessionFeedback.id, afterFeedbackId))
         .get();
-      if (!anchor) {
+      if (!anchor || anchor.feedback.workSessionId !== workSessionId) {
         // P2 #55: Anchor not found — fall back to latest feedback
         return this.getLatestFeedback(workSessionId);
       }
 
       const row = this.database.db
-        .select()
+        .select({ feedback: workSessionFeedback })
         .from(workSessionFeedback)
+        .innerJoin(workSessionSubmissions, eq(workSessionSubmissions.id, workSessionFeedback.submissionId))
         .where(
           and(
             eq(workSessionFeedback.workSessionId, workSessionId),
-            sql`${workSessionFeedback.createdAt} > ${anchor.createdAt}`,
+            sql`${workSessionSubmissions.submissionNumber} > ${anchor.submissionNumber}`,
           ),
         )
-        .orderBy(desc(workSessionFeedback.createdAt))
+        .orderBy(desc(workSessionSubmissions.submissionNumber), desc(workSessionSubmissions.reviewEpoch), desc(workSessionFeedback.id))
         .limit(1)
         .get();
 
-      return row ? rowToFeedback(row) : undefined;
+      return row ? rowToFeedback(row.feedback) : undefined;
     }
 
     const row = this.database.db
-      .select()
+      .select({ feedback: workSessionFeedback })
       .from(workSessionFeedback)
+      .innerJoin(workSessionSubmissions, eq(workSessionSubmissions.id, workSessionFeedback.submissionId))
       .where(eq(workSessionFeedback.workSessionId, workSessionId))
-      .orderBy(desc(workSessionFeedback.createdAt))
+      .orderBy(desc(workSessionSubmissions.submissionNumber), desc(workSessionSubmissions.reviewEpoch), desc(workSessionFeedback.id))
       .limit(1)
       .get();
 
-    return row ? rowToFeedback(row) : undefined;
+    return row ? rowToFeedback(row.feedback) : undefined;
   }
 
   listPendingReviews(workspaceSessionId?: string, limit = 20): WorkSession[] {
@@ -903,7 +942,7 @@ class SqliteWorkSessionManager implements WorkSessionManager {
   getWorkspaceSessionSurface(
     workspaceSessionId?: string,
     limit = 50,
-    filter: "all" | "pending_review" | "live" = "all",
+    filter: "all" | "pending_review" | "stale_pending_review" | "live" = "all",
     after?: WorkspaceSessionSurfaceCursor,
   ): WorkspaceSessionSurfaceEntry[] {
     const boundedLimit = Math.max(1, Math.min(200, Math.trunc(limit)));
@@ -921,7 +960,8 @@ class SqliteWorkSessionManager implements WorkSessionManager {
         ws.title,
         ws.submitted_by,
         ws.updated_at,
-        (select ar.run_id from acp_runs ar where ar.work_session_id = ws.id order by ar.created_at desc limit 1) as run_id,
+        (select ar.run_id from acp_runs ar where ar.work_session_id = ws.id order by ar.created_at desc, ar.run_id desc limit 1) as run_id,
+        (select ar.last_heartbeat_at from acp_runs ar where ar.work_session_id = ws.id order by ar.created_at desc, ar.run_id desc limit 1) as last_heartbeat_at,
         (select 1 from mission_contracts mc where mc.work_session_id = ws.id limit 1) as has_mission,
         (select sr.status from supervisor_runs sr where sr.work_session_id = ws.id limit 1) as mission_status,
         (select sr.cycle_number from supervisor_runs sr where sr.work_session_id = ws.id limit 1) as mission_cycle_number,
@@ -937,16 +977,18 @@ class SqliteWorkSessionManager implements WorkSessionManager {
         (select s.review_epoch from work_session_submissions s where s.work_session_id = ws.id order by s.submission_number desc limit 1) as latest_submission_review_epoch,
         (select coalesce(json_extract(s.summary_json, '$.additions'), 0) from work_session_submissions s where s.work_session_id = ws.id order by s.submission_number desc limit 1) as latest_submission_additions,
         (select coalesce(json_extract(s.summary_json, '$.removals'), 0) from work_session_submissions s where s.work_session_id = ws.id order by s.submission_number desc limit 1) as latest_submission_removals,
-        (select f.id from work_session_feedback f where f.work_session_id = ws.id order by f.created_at desc limit 1) as latest_feedback_id,
-        (select f.submission_id from work_session_feedback f where f.work_session_id = ws.id order by f.created_at desc limit 1) as latest_feedback_submission_id,
-        (select f.verdict from work_session_feedback f where f.work_session_id = ws.id order by f.created_at desc limit 1) as latest_feedback_verdict,
-        (select f.comments from work_session_feedback f where f.work_session_id = ws.id order by f.created_at desc limit 1) as latest_feedback_comments,
-        (select f.reviewer_id from work_session_feedback f where f.work_session_id = ws.id order by f.created_at desc limit 1) as latest_feedback_reviewer_id
+        (select f.id from work_session_feedback f join work_session_submissions s on s.id = f.submission_id where f.work_session_id = ws.id order by s.submission_number desc, s.review_epoch desc, f.id desc limit 1) as latest_feedback_id,
+        (select f.submission_id from work_session_feedback f join work_session_submissions s on s.id = f.submission_id where f.work_session_id = ws.id order by s.submission_number desc, s.review_epoch desc, f.id desc limit 1) as latest_feedback_submission_id,
+        (select f.verdict from work_session_feedback f join work_session_submissions s on s.id = f.submission_id where f.work_session_id = ws.id order by s.submission_number desc, s.review_epoch desc, f.id desc limit 1) as latest_feedback_verdict,
+        (select f.comments from work_session_feedback f join work_session_submissions s on s.id = f.submission_id where f.work_session_id = ws.id order by s.submission_number desc, s.review_epoch desc, f.id desc limit 1) as latest_feedback_comments,
+        (select f.reviewer_id from work_session_feedback f join work_session_submissions s on s.id = f.submission_id where f.work_session_id = ws.id order by s.submission_number desc, s.review_epoch desc, f.id desc limit 1) as latest_feedback_reviewer_id
       from work_sessions ws
       where ${scopeSql}
         ${after ? "and (ws.updated_at < ? or (ws.updated_at = ? and ws.id < ?))" : ""}
         and ${filter === "pending_review"
           ? "ws.status in ('awaiting_review', 'review_in_progress') and ws.runtime_state <> 'stale' and datetime(ws.updated_at) >= datetime('now', '-30 days')"
+          : filter === "stale_pending_review"
+            ? "ws.status in ('awaiting_review', 'review_in_progress') and datetime(ws.updated_at) < datetime('now', '-30 days')"
           : filter === "live"
             ? "(ws.runtime_state = 'running' or (ws.runtime_state = 'pending' and ws.status in ('in_progress', 'drafting', 'resuming') and datetime(ws.updated_at) >= datetime('now', '-1 hour')))"
             : "(ws.runtime_state in ('running', 'pending', 'detached', 'stale', 'orphaned') or ws.status in ('awaiting_review', 'review_in_progress', 'changes_requested')) and not (ws.status in ('awaiting_review', 'review_in_progress') and datetime(ws.updated_at) < datetime('now', '-30 days'))"}
@@ -974,6 +1016,7 @@ class SqliteWorkSessionManager implements WorkSessionManager {
         submittedBy: String(row.submitted_by),
         updatedAt: String(row.updated_at),
         runId: typeof row.run_id === "string" ? row.run_id : undefined,
+        lastHeartbeatAt: typeof row.last_heartbeat_at === "string" ? row.last_heartbeat_at : undefined,
         hasMission: row.has_mission === 1,
         missionStatus: typeof row.mission_status === "string" ? row.mission_status : undefined,
         missionCycleNumber: typeof row.mission_cycle_number === "number" ? row.mission_cycle_number : undefined,
@@ -1237,6 +1280,7 @@ class SqliteWorkSessionManager implements WorkSessionManager {
       submittedBy: row.submittedBy,
       title: row.title ?? undefined,
       lastConsumedFeedbackId: row.lastConsumedFeedbackId ?? undefined,
+      lastConsumedReviewEpoch: row.lastConsumedReviewEpoch ?? 0,
       createdAt: row.createdAt,
       updatedAt: row.updatedAt,
       latestSubmission,
@@ -1355,6 +1399,8 @@ function rowToSubmission(row: WorkSessionSubmissionRow): WorkSessionSubmission {
     submissionNumber: row.submissionNumber ?? 1,
     diff: row.diff ?? undefined,
     diffSha256: row.diffSha256 ?? undefined,
+    snapshotKind: (row.snapshotKind as "git" | "filesystem" | null | undefined) ?? (row.snapshotCommit ? "git" : undefined),
+    snapshotRef: row.snapshotRef ?? row.snapshotCommit ?? undefined,
     snapshotCommit: row.snapshotCommit ?? undefined,
     reviewEpoch: row.reviewEpoch ?? 1,
     message: row.message ?? undefined,

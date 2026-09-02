@@ -9,12 +9,18 @@
   box-sizing: border-box;
 }
 
+:where(button, input, textarea, summary):focus-visible {
+  outline: 2px solid var(--color-accent, var(--color-accent-primary, #2563eb));
+  outline-offset: 2px;
+}
+
 html,
 body {
   margin: 0;
   background: transparent;
   min-height: 100%;
-  overflow: auto;
+  overflow-x: hidden;
+  overflow-y: auto;
 }
 
 .shell {
@@ -51,6 +57,7 @@ body {
   font-size: var(--font-text-sm-size, 12px);
   text-overflow: ellipsis;
   white-space: nowrap;
+  min-height: 44px;
 }
 
 .session-switcher-item.selected {
@@ -294,11 +301,12 @@ body {
   border: 1px solid var(--color-border-primary, #3a3a40);
   border-radius: 7px;
   font-size: var(--font-text-sm-size, 13px);
+  flex-wrap: wrap;
 }
 
-.session-notice.error { color: var(--color-danger-text, #ee7676); }
-.session-notice.warning { color: var(--color-warning-text, #f5c451); }
-.session-notice.success { color: var(--color-success-text, #6fda83); }
+.session-notice.error { color: var(--color-danger, var(--color-text-primary, #ee7676)); }
+.session-notice.warning { color: var(--color-warning, var(--color-text-primary, #f5c451)); }
+.session-notice.success { color: var(--color-success, var(--color-text-primary, #6fda83)); }
 .session-notice.info { color: var(--color-text-secondary, #d6d6dc); }
 
 .notice-action {
@@ -311,6 +319,13 @@ body {
   cursor: pointer;
   font: inherit;
   font-size: var(--font-text-sm-size, 12px);
+}
+
+.notice-action:disabled,
+.feedback-btn:disabled,
+.agent-submit-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.58;
 }
 
 .message-slot {
@@ -522,7 +537,6 @@ body {
 }
 
 .feedback-textarea:focus {
-  outline: none;
   border-color: color-mix(in srgb, var(--color-text-secondary, #d6d6dc) 60%, transparent);
 }
 
@@ -533,7 +547,7 @@ body {
 }
 
 .feedback-btn {
-  min-height: 30px;
+  min-height: 36px;
   padding: 0 14px;
   border: 1px solid color-mix(in srgb, var(--color-border-primary, #3a3a40) 80%, transparent);
   border-radius: 7px;
@@ -551,30 +565,30 @@ body {
 }
 
 .feedback-btn.approve {
-  border-color: color-mix(in srgb, var(--color-success-text, #6fda83) 44%, var(--color-border-primary, #3a3a40));
-  color: var(--color-success-text, #6fda83);
+  border-color: color-mix(in srgb, var(--color-success, #6fda83) 44%, var(--color-border-primary, #3a3a40));
+  color: var(--color-success, #6fda83);
 }
 
 .feedback-btn.approve:hover {
-  background: color-mix(in srgb, var(--color-success-text, #6fda83) 12%, transparent);
+  background: color-mix(in srgb, var(--color-success, #6fda83) 12%, transparent);
 }
 
 .feedback-btn.changes {
-  border-color: color-mix(in srgb, var(--color-warning-text, #f5c451) 44%, var(--color-border-primary, #3a3a40));
-  color: var(--color-warning-text, #f5c451);
+  border-color: color-mix(in srgb, var(--color-warning, #f5c451) 44%, var(--color-border-primary, #3a3a40));
+  color: var(--color-warning, #f5c451);
 }
 
 .feedback-btn.changes:hover {
-  background: color-mix(in srgb, var(--color-warning-text, #f5c451) 12%, transparent);
+  background: color-mix(in srgb, var(--color-warning, #f5c451) 12%, transparent);
 }
 
 .feedback-btn.reject {
-  border-color: color-mix(in srgb, var(--color-danger-text, #ee7676) 44%, var(--color-border-primary, #3a3a40));
-  color: var(--color-danger-text, #ee7676);
+  border-color: color-mix(in srgb, var(--color-danger, #ee7676) 44%, var(--color-border-primary, #3a3a40));
+  color: var(--color-danger, #ee7676);
 }
 
 .feedback-btn.reject:hover {
-  background: color-mix(in srgb, var(--color-danger-text, #ee7676) 12%, transparent);
+  background: color-mix(in srgb, var(--color-danger, #ee7676) 12%, transparent);
 }
 
 .feedback-submitted {
@@ -623,7 +637,7 @@ body {
 }
 
 .tool-card.agent {
-  border-left: 3px solid #7c3aed;
+  border-left: 3px solid var(--color-accent-primary, #7c3aed);
 }
 
 .agent-meta {
@@ -633,12 +647,34 @@ body {
   margin-bottom: 8px;
 }
 
+.agent-meta-primary {
+  color: var(--color-text-primary, #f5f5f6);
+  font-size: var(--font-text-sm-size, 13px);
+  font-weight: 600;
+}
+
+.agent-details {
+  display: grid;
+  gap: 3px;
+  color: var(--color-text-secondary, #9ca3af);
+  font-size: var(--font-text-sm-size, 12px);
+}
+
+.agent-details summary {
+  width: fit-content;
+  cursor: pointer;
+  color: var(--color-text-secondary, #9ca3af);
+}
+
 .agent-meta-row {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 11px;
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: var(--font-text-sm-size, 11px);
   color: var(--color-text-secondary, #9ca3af);
   word-break: break-all;
 }
+
+.heartbeat-status.live { color: var(--color-success-text, #6fda83); }
+.heartbeat-status.stale { color: var(--color-text-tertiary, #a3a3aa); }
 
 .agent-activity-header {
   font-size: 12px;
@@ -665,10 +701,10 @@ body {
 }
 
 .approval-card {
-  border: 1px solid var(--border, #2d3748);
+  border: 1px solid var(--color-border-primary, #2d3748);
   border-radius: 8px;
   padding: 10px;
-  background: var(--surface-subtle, rgba(255, 255, 255, 0.04));
+  background: color-mix(in srgb, var(--color-background-secondary, #28282d) 84%, transparent);
 }
 
 .approval-title {
@@ -677,25 +713,27 @@ body {
 }
 
 .approval-detail {
-  color: var(--muted, #9ca3af);
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 12px;
+  color: var(--color-text-secondary, #9ca3af);
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: var(--font-text-sm-size, 12px);
   overflow-wrap: anywhere;
   margin-bottom: 8px;
 }
 
 .agent-event {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 11px;
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: var(--font-text-sm-size, 11px);
   color: var(--color-text-primary, #f5f5f6);
   padding: 3px 6px;
   border-radius: 4px;
-  background: var(--surface-hover, #1f2937);
+  background: var(--color-background-tertiary, #1f2937);
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .agent-event.failed {
-  color: #fca5a5;
-  background: rgba(239, 68, 68, 0.12);
+  color: var(--color-danger, #fca5a5);
+  background: color-mix(in srgb, var(--color-danger, #ef4444) 12%, transparent);
 }
 
 .approval-slot {
@@ -742,4 +780,44 @@ body {
   min-height: 1.2em;
   color: var(--color-text-secondary, #b6b6bd);
   font-size: var(--font-text-sm-size, 12px);
+}
+
+.approval-option {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.approval-option-help {
+  color: var(--color-text-tertiary, #a3a3aa);
+  font-size: var(--font-text-sm-size, 11px);
+}
+
+.connection-banner {
+  margin-bottom: 10px;
+}
+
+@media (max-width: 520px) {
+  .feedback-buttons {
+    align-items: stretch;
+    flex-wrap: wrap;
+  }
+
+  .feedback-btn,
+  .notice-action,
+  .agent-submit-btn {
+    min-height: 44px;
+  }
+
+  .feedback-btn {
+    flex: 1 1 100%;
+  }
+
+  .agent-submit-bar {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .agent-submit-btn {
+    width: 100%;
+  }
 }

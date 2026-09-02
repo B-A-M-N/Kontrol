@@ -22,7 +22,14 @@ export interface ToolListCacheMetrics {
   unavailableReason?: string;
 }
 
-const metricsByServer = new Map<McpServer, ToolListCacheMetrics>();
+// The map is keyed by a per-session McpServer instance. A strong map here
+// would pin the entire server — and with it every registered tool's zod
+// schema universe — for the process lifetime, which is a multi-megabyte leak
+// per MCP session. Weak-keyed storage lets a closed session's server be
+// collected; the metrics it observed are summarized into the cumulative
+// totals below before that happens.
+const metricsByServer = new WeakMap<McpServer, ToolListCacheMetrics>();
+const cumulativeMetrics: ToolListCacheMetrics = { hits: 0, misses: 0 };
 
 function metricsFor(server: McpServer): ToolListCacheMetrics {
   let m = metricsByServer.get(server);
@@ -33,17 +40,26 @@ function metricsFor(server: McpServer): ToolListCacheMetrics {
   return m;
 }
 
+/** Fold one instance's counters into the cumulative totals. */
+function foldMetrics(metrics: ToolListCacheMetrics, event?: "hit" | "miss"): void {
+  if (event === "hit") cumulativeMetrics.hits += 1;
+  if (event === "miss") cumulativeMetrics.misses += 1;
+  if (metrics.unavailableReason && !cumulativeMetrics.unavailableReason) {
+    cumulativeMetrics.unavailableReason = metrics.unavailableReason;
+  }
+}
+
 /** Diagnostics view of cache health, including any unavailability reason. */
 export function toolListCacheDiagnostics(): Array<{ metrics: ToolListCacheMetrics }> {
-  // Aggregate across per-server instances: a fresh MCP session installs a new
-  // cached handler, but the descriptor cache itself is shared, so hits/misses
-  // are meaningful only summed across instances.
-  const total: ToolListCacheMetrics = { hits: 0, misses: 0 };
-  for (const m of metricsByServer.values()) {
-    total.hits += m.hits;
-    total.misses += m.misses;
-    if (!total.unavailableReason && m.unavailableReason) total.unavailableReason = m.unavailableReason;
-  }
+  // A WeakMap cannot be iterated, so per-instance counters are folded into
+  // the cumulative totals at their mutation sites (see foldMetrics callers).
+  // A collected server therefore never takes counts with it: every hit,
+  // miss, and unavailability reason is folded the moment it is observed.
+  const total: ToolListCacheMetrics = {
+    hits: cumulativeMetrics.hits,
+    misses: cumulativeMetrics.misses,
+    ...(cumulativeMetrics.unavailableReason ? { unavailableReason: cumulativeMetrics.unavailableReason } : {}),
+  };
   return [{ metrics: total }];
 }
 
@@ -66,11 +82,13 @@ export function installCachedToolList(
   };
   if (!protocol || typeof protocol.setRequestHandler !== "function" || !(protocol._requestHandlers instanceof Map)) {
     metrics.unavailableReason = "SDK internals changed: _requestHandlers/setRequestHandler not found";
+    foldMetrics(metrics);
     return false;
   }
   const original = protocol._requestHandlers.get("tools/list");
   if (!original) {
     metrics.unavailableReason = "no tools/list handler registered before cache install";
+    foldMetrics(metrics);
     return false;
   }
 
@@ -78,9 +96,19 @@ export function installCachedToolList(
     let cached = cache.get(cacheKey);
     if (!cached) {
       metrics.misses++;
-      cached = Promise.resolve(original(request, extra));
+      foldMetrics(metrics, "miss");
+      // Do not retain a transient failure as the descriptor forever. The
+      // identity check prevents a late rejection from deleting a newer retry.
+      const pending = Promise.resolve(original(request, extra));
+      cached = pending.catch((error) => {
+        if (cache.get(cacheKey) === cached) cache.delete(cacheKey);
+        throw error;
+      });
       cache.set(cacheKey, cached);
-    } else metrics.hits++;
+    } else {
+      metrics.hits++;
+      foldMetrics(metrics, "hit");
+    }
     return await cached;
   });
   return true;

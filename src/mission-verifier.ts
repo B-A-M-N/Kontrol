@@ -8,7 +8,7 @@ import { git } from "./git.js";
 import type { MissionLedger } from "./mission-ledger.js";
 import type { WorkSessionManager } from "./work-sessions.js";
 import type { WorkspaceRegistry } from "./workspaces.js";
-import type { ReviewCheckpointManager } from "./review-checkpoints.js";
+import type { ReviewCheckpointManager, WorkspaceSnapshot } from "./review-checkpoints.js";
 
 const ALLOWED_EXECUTABLES = new Set(["npm", "pytest", "cargo", "go", "make", "vitest", "jest", "tsc", "ruff"]);
 
@@ -300,10 +300,22 @@ interface VerificationWorkspace {
  * are never their working directory.
  */
 async function createVerificationWorkspace(
+  workspaceId: string,
   workspaceRoot: string,
-  snapshotCommit: string,
+  snapshot: WorkspaceSnapshot,
   checkpoints: ReviewCheckpointManager,
 ): Promise<VerificationWorkspace> {
+  if (snapshot.kind === "filesystem") {
+    const parent = await mkdtemp(join(dirname(workspaceRoot), ".kontrol-verifier-"));
+    const checkout = join(parent, "snapshot");
+    try {
+      await checkpoints.materializeSnapshot({ workspaceId, root: workspaceRoot, snapshot, destination: checkout });
+      return { root: checkout, cleanup: async () => rm(parent, { recursive: true, force: true }) };
+    } catch (error) {
+      await rm(parent, { recursive: true, force: true });
+      throw new VerificationBindingError(`Verification requires an immutable filesystem snapshot: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
   // Lightweight test doubles do not expose the exact-tree binding API. The
   // production manager always does; retaining this fallback keeps command-unit
   // tests focused on verifier semantics rather than Git fixture setup.
@@ -322,10 +334,10 @@ async function createVerificationWorkspace(
     const checkout = join(parent, "snapshot");
     let added = false;
     try {
-      await git(gitRoot, ["worktree", "add", "--detach", checkout, snapshotCommit]);
+      await git(gitRoot, ["worktree", "add", "--detach", checkout, snapshot.ref]);
       added = true;
       const actualCommit = (await git(checkout, ["rev-parse", "HEAD"])).stdout.trim();
-      if (actualCommit !== snapshotCommit) throw new Error("materialized verification worktree does not match the submitted snapshot");
+      if (actualCommit !== snapshot.ref) throw new Error("materialized verification worktree does not match the submitted snapshot");
       const root = relativeWorkspace ? resolve(checkout, relativeWorkspace) : checkout;
       return {
         root,
@@ -386,7 +398,10 @@ export async function verifyMissionSubmission(input: {
   const mission = input.missionLedger.getMissionByWorkSession(input.workSessionId);
   const session = input.workSessions.get(input.workSessionId);
   const latest = session?.latestSubmission;
-  if (!mission || !session || !latest?.id || !latest.snapshotCommit) throw new Error("A submitted mission snapshot is required.");
+  const snapshotKind = latest?.snapshotKind ?? (latest?.snapshotCommit?.startsWith("fs:") ? "filesystem" : latest?.snapshotCommit ? "git" : undefined);
+  const snapshotRef = latest?.snapshotRef ?? latest?.snapshotCommit;
+  if (!mission || !session || !latest?.id || !snapshotKind || !snapshotRef) throw new Error("A submitted mission snapshot is required.");
+  const submittedSnapshot: WorkspaceSnapshot = { kind: snapshotKind, ref: snapshotRef, createdAt: latest.createdAt };
   if (input.submissionId && input.submissionId !== latest.id) {
     throw new VerificationBindingError("Verification blocked: current submission changed before verification started.");
   }
@@ -424,9 +439,11 @@ export async function verifyMissionSubmission(input: {
       }
     }
 
-    const matches = input.reviewCheckpoints.assertTreeMatchesCommit
-      ? await input.reviewCheckpoints.assertTreeMatchesCommit({ workspaceId: session.workspaceSessionId, root: workspace.root, baselineCommit: latest.snapshotCommit! })
-      : (await input.reviewCheckpoints.reviewChangesAgainstCommit({ workspaceId: session.workspaceSessionId, root: workspace.root, baselineCommit: latest.snapshotCommit! })).summary.files === 0;
+    const matches = input.reviewCheckpoints.assertSnapshotMatches
+      ? await input.reviewCheckpoints.assertSnapshotMatches({ workspaceId: session.workspaceSessionId, root: workspace.root, expected: submittedSnapshot })
+      : input.reviewCheckpoints.assertTreeMatchesCommit
+        ? await input.reviewCheckpoints.assertTreeMatchesCommit({ workspaceId: session.workspaceSessionId, root: workspace.root, baselineCommit: snapshotRef })
+        : (await input.reviewCheckpoints.reviewChangesAgainstCommit({ workspaceId: session.workspaceSessionId, root: workspace.root, baselineCommit: snapshotRef })).summary.files === 0;
     if (!matches) {
       throw new VerificationBindingError("Verification blocked: workspace no longer matches the submitted snapshot.");
     }
@@ -472,10 +489,10 @@ export async function verifyMissionSubmission(input: {
     && (!selectedWithDependencies || selectedWithDependencies.has(criterion.id))
     && scopeAllows(criterion)
     && (!criterion.finalOnly || finalPhase || explicitlySelected?.has(criterion.id)));
-  const verificationWorkspace = await createVerificationWorkspace(workspace.root, latest.snapshotCommit, input.reviewCheckpoints);
+  const verificationWorkspace = await createVerificationWorkspace(session.workspaceSessionId, workspace.root, submittedSnapshot, input.reviewCheckpoints);
   try {
   const results: VerificationResult[] = [];
-  const pendingEvidence: Array<{ criterionId: string; submissionId: string; reviewEpoch: number; snapshotCommit: string; leaseNonce?: string; command: string; status: "passed" | "failed" | "inconclusive"; source: "server_test_runner"; details: Record<string, unknown> }> = [];
+  const pendingEvidence: Array<{ criterionId: string; submissionId: string; reviewEpoch: number; snapshotKind: "git" | "filesystem"; snapshotRef: string; snapshotCommit: string; leaseNonce?: string; command: string; status: "passed" | "failed" | "inconclusive"; source: "server_test_runner"; details: Record<string, unknown> }> = [];
   let bindingLost = false;
   const sandboxEnabled = sandboxRequested({ sandbox: input.sandbox });
   const environment = buildChildEnvironment({ sandbox: sandboxEnabled });
@@ -496,7 +513,7 @@ export async function verifyMissionSubmission(input: {
   const recordResult = (criterion: typeof criteria[number], result: Omit<VerificationResult, "criterionId" | "command">): VerificationResult => {
     const command = criterion.verificationCommand!;
     const full = { criterionId: criterion.id, command, ...result };
-    pendingEvidence.push({ criterionId: criterion.id, submissionId: latest.id, reviewEpoch: latest.reviewEpoch ?? 0, snapshotCommit: latest.snapshotCommit!, leaseNonce: boundLeaseNonce, command, source: "server_test_runner", status: result.status, details: { exitCode: result.exitCode, signal: result.signal, durationMs: result.durationMs, deadlineAtMs, outputTail: result.outputTail, outputSha256: result.outputSha256, failureSetSha256: result.failureSetSha256, cacheKey: verificationCacheKey(command, criterion.commandVersion ?? DEFAULT_COMMAND_VERSION, environment), provenance: result.source } });
+    pendingEvidence.push({ criterionId: criterion.id, submissionId: latest.id, reviewEpoch: latest.reviewEpoch ?? 0, snapshotKind, snapshotRef, snapshotCommit: snapshotRef, leaseNonce: boundLeaseNonce, command, source: "server_test_runner", status: result.status, details: { exitCode: result.exitCode, signal: result.signal, durationMs: result.durationMs, deadlineAtMs, outputTail: result.outputTail, outputSha256: result.outputSha256, failureSetSha256: result.failureSetSha256, cacheKey: verificationCacheKey(command, criterion.commandVersion ?? DEFAULT_COMMAND_VERSION, environment), provenance: result.source } });
     results.push(full);
     statuses.set(criterion.id, result.status);
     return full;
@@ -613,7 +630,9 @@ export async function verifyMissionSubmission(input: {
     }
     input.missionLedger.recordCompletionReport(mission.id, {
       submissionId: latest.id,
-      snapshotCommit: latest.snapshotCommit,
+      snapshotKind,
+      snapshotRef,
+      snapshotCommit: snapshotRef,
       status: finalResults.every((result) => result.status === "passed") ? "passed" : "failed",
       results: finalResults,
     });

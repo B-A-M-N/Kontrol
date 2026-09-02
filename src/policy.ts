@@ -235,6 +235,14 @@ const CANONICAL_TOOLS = new Set([
   "apply_patch",
 ]);
 
+const KNOWN_POLICY_CONFIGURATION_KEYS = new Set([
+  "KONTROL_POLICY_MODE",
+  "KONTROL_POLICY_PATH_RULES",
+  "KONTROL_POLICY_APPROVAL_TIMEOUT_MS",
+  "KONTROL_POLICY_DIRECT_APPROVAL_TTL_MS",
+  "KONTROL_POLICY_DIRECT_REATTACH_GRACE_MS",
+]);
+
 /**
  * Single canonical tool-normalization map for POLICY purposes. Every surface
  * that evaluates policy (MCP, ACP bridge, process sessions) must funnel its
@@ -288,16 +296,27 @@ export function loadPolicyConfig(env: NodeJS.ProcessEnv): PolicyConfig {
   }
 
   for (const [key, value] of Object.entries(env)) {
-    if (!value) continue;
     if (key.startsWith("KONTROL_POLICY_TOOL_")) {
-      const tool = key.replace("KONTROL_POLICY_TOOL_", "").toLowerCase();
-      const mode = parseMode(value);
-      if (mode) toolRules[tool] = mode;
+      const suffix = key.slice("KONTROL_POLICY_TOOL_".length);
+      const candidates = [suffix.toLowerCase(), suffix.toLowerCase().replaceAll("_", "-")];
+      const tool = candidates.map(canonicalTool).find((candidate) => CANONICAL_TOOLS.has(candidate));
+      if (!tool) {
+        throw new Error(
+          `Unknown policy tool in ${key}. Supported tools/aliases: ${Array.from(CANONICAL_TOOLS).join(", ")}, exec_command, kontrol-shell, kontrol-read, kontrol-write, kontrol-edit, kontrol-grep, kontrol-glob.`,
+        );
+      }
+      // Configuration values are intentionally case-sensitive. A typo such as
+      // "asks" or "ALLOW" must fail closed instead of silently falling back
+      // to the global mode or secure baseline.
+      if (value !== "allow" && value !== "ask" && value !== "deny") {
+        throw new Error(`${key} must be exactly one of allow|ask|deny (got "${value ?? ""}")`);
+      }
+      toolRules[tool] = value;
+      continue;
     }
-    // NOTE: per-rule env vars like KONTROL_POLICY_PATH_<glob>=... are no
-    // longer supported (they are not valid shell assignment syntax). Use
-    // KONTROL_POLICY_PATH_RULES instead. Unknown KONTROL_POLICY_PATH_*
-    // keys are intentionally ignored.
+    if (key.startsWith("KONTROL_POLICY_") && !KNOWN_POLICY_CONFIGURATION_KEYS.has(key)) {
+      throw new Error(`Unknown policy configuration key: ${key}`);
+    }
   }
 
   // Secure baseline: mutating tools gate behind `ask` unless the operator has

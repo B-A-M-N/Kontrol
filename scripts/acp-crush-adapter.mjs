@@ -48,6 +48,7 @@ const CRUSH_BIN = process.env.CRUSH_BIN || "crush";
 // a bad root is rejected (P0 #6), it is not redirected to another repo.
 const AGENT_CWD = process.env.AGENT_CWD || process.cwd();
 export const REGISTERED_AGENT_NAME = "cli-coding-agent";
+export const SMOKE_LIFECYCLE_EVENTS = ["started", "completed"];
 const HEARTBEAT_INTERVAL_MS = 55_000;
 // Per-run heartbeat to Kontrol while a worker is active. Keeps the worker
 // lease (workerLeaseUntil) alive so the durable Ralphie form survives a
@@ -250,6 +251,10 @@ async function handleRunRequest(req, res, body) {
   const dispatchKey = continuationId ? `${devRunId}:${continuationId}` : undefined;
   const smokeTest = body.smoke_test === true || body?.metadata?.kontrol_smoke_test === true;
 
+  if (!smokeTest && !task.trim()) {
+    return writeJson(res, 400, { error: { code: "invalid_task", message: "ACP task must be non-empty" } });
+  }
+
   console.log(`[/runs] dispatch runId=${devRunId} ws=${workspaceSessionId} wss=${workSessionId} taskBytes=${Buffer.byteLength(task, "utf8")}`);
 
   if (dispatchKey) {
@@ -291,6 +296,7 @@ async function handleRunRequest(req, res, body) {
     sendChain: Promise.resolve(),
     outputBuffers: new Map(),
     outputTimers: new Map(),
+    syntheticSmoke: false,
   };
 
   if (smokeTest) {
@@ -303,7 +309,12 @@ async function handleRunRequest(req, res, body) {
     }
     run.remoteRunId = "smoke_" + randomUUID().slice(0, 8);
     run.stdout = "KONTROL_ADAPTER_SMOKE_OK";
-    run.finalized = true; // P1 #14: smoke never reports lifecycle events
+    // A smoke request exercises the same lifecycle reporting path as a real
+    // dispatch. It is synthetic, so it is not put into the terminal spool and
+    // has no retry backoff when the supplied parent run is only a probe id.
+    run.syntheticSmoke = true;
+    for (const lifecycle of SMOKE_LIFECYCLE_EVENTS) await reportEvent(run, lifecycle);
+    run.finalized = true;
     console.log(`[run ${run.remoteRunId}] synthetic smoke accepted cwd=${run.workspaceRoot} bin=${resolveAgentBin()}`);
     return writeJson(res, 202, {
       run_id: run.remoteRunId,
@@ -751,7 +762,7 @@ async function reportEvent(run, type, errorMessage, details) {
 }
 
 function enqueueRunEvent(run, event, terminal = false) {
-  const durableTerminal = terminal
+  const durableTerminal = terminal && !run.syntheticSmoke
     ? spoolTerminalEvent(run.devRunId, event)
     : Promise.resolve();
   const delivery = run.sendChain
@@ -764,7 +775,7 @@ function enqueueRunEvent(run, event, terminal = false) {
           headers: { "Content-Type": "application/json", authorization: `Bearer ${AGENT_SECRET}`, ...identityHeaders(agentIdentity) },
           body: JSON.stringify(event),
         }),
-        terminal ? { retries: 3, backoff: 2000 } : { retries: 0, backoff: 0 },
+        terminal && !run.syntheticSmoke ? { retries: 3, backoff: 2000 } : { retries: 0, backoff: 0 },
       );
       if (!success) {
         console.error(`[run ${run.remoteRunId}] failed to report ${event.type}`);

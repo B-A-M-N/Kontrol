@@ -37,6 +37,11 @@ interface TelemetryBuffer {
   publish: boolean;
 }
 
+interface WorkspaceEventScope {
+  workspaceSessionId: string;
+  projectId: string;
+}
+
 export type EventPredicate = (event: EventStoreEvent) => boolean;
 
 export type EventStoreTimingCallback = (phase: string, durationMs: number) => void;
@@ -175,6 +180,22 @@ export function createEventStore(
     if (!workspaceSessionId) return undefined;
     const row = database.sqlite.prepare("select project_id from workspace_sessions where id = ?").get(workspaceSessionId) as { project_id?: string | null } | undefined;
     return row?.project_id ?? undefined;
+  }
+
+  function resolveWorkspaceEventScope(workspaceOrProjectId: string): WorkspaceEventScope {
+    const workspace = database.sqlite
+      .prepare("select id, project_id from workspace_sessions where id = ?")
+      .get(workspaceOrProjectId) as { id: string; project_id?: string | null } | undefined;
+    if (workspace) {
+      return {
+        workspaceSessionId: workspace.id,
+        projectId: workspace.project_id ?? workspace.id,
+      };
+    }
+    return {
+      workspaceSessionId: workspaceOrProjectId,
+      projectId: workspaceOrProjectId,
+    };
   }
 
   function insertEvent(input: {
@@ -381,6 +402,7 @@ export function createEventStore(
   }
 
   function getWorkspaceEventsAfter(workspaceId: string, afterSeq: number, limit = 500): EventStoreEvent[] {
+    const scope = resolveWorkspaceEventScope(workspaceId);
     const rows = database.sqlite
       .prepare(
         `select el.id, el.seq, el.type, el.session_id, el.workspace_session_id, el.payload, el.created_at
@@ -392,7 +414,7 @@ export function createEventStore(
          order by el.seq
          limit ?`,
       )
-      .all(workspaceId, workspaceId, afterSeq, limit) as Array<{
+      .all(scope.workspaceSessionId, scope.projectId, afterSeq, limit) as Array<{
       id: string;
       seq: number;
       type: string;
@@ -588,9 +610,21 @@ export function createEventStore(
   }
 
   function publish(event: EventStoreEvent): void {
+    const invokeSubscriber = (callback: Subscriber, scope: string): void => {
+      try {
+        callback(event);
+      } catch (error) {
+        try {
+          console.error(`[kontrol] event subscriber failed (${scope})`, error);
+        } catch {
+          // Diagnostics must never make a committed event look unsuccessful.
+        }
+      }
+    };
+
     const set = subscribers.get(event.sessionId);
     if (set && set.size > 0) {
-      for (const callback of set) callback(event);
+      for (const callback of set) invokeSubscriber(callback, `session:${event.sessionId}`);
     }
     const workspaceKeys = [event.workspaceSessionId, event.workspaceProjectId].filter((key): key is string => Boolean(key));
     const notified = new Set<Subscriber>();
@@ -598,11 +632,11 @@ export function createEventStore(
       for (const callback of workspaceSubscribers.get(key) ?? []) {
         if (notified.has(callback)) continue;
         notified.add(callback);
-        callback(event);
+        invokeSubscriber(callback, `workspace:${key}`);
       }
     }
     for (const callback of globalSubscribers) {
-      callback(event);
+      invokeSubscriber(callback, "global");
     }
   }
 
@@ -658,14 +692,8 @@ export function createEventStore(
   }
 
   function subscribeWorkspace(workspaceId: string, callback: Subscriber): () => void {
-    const keys = new Set<string>([workspaceId]);
-    const workspace = database.sqlite.prepare("select id, project_id from workspace_sessions where id = ?").get(workspaceId) as { id: string; project_id?: string | null } | undefined;
-    if (workspace?.project_id) keys.add(workspace.project_id);
-    const project = database.sqlite.prepare("select project_id from workspace_sessions where id = ?").get(workspaceId) as { project_id?: string | null } | undefined;
-    if (!project?.project_id) {
-      const byProject = database.sqlite.prepare("select project_id from workspace_sessions where project_id = ? limit 1").get(workspaceId) as { project_id?: string | null } | undefined;
-      if (byProject?.project_id) keys.add(byProject.project_id);
-    }
+    const scope = resolveWorkspaceEventScope(workspaceId);
+    const keys = new Set<string>([scope.workspaceSessionId, scope.projectId]);
     for (const key of keys) {
       if (!workspaceSubscribers.has(key)) workspaceSubscribers.set(key, new Set());
       workspaceSubscribers.get(key)!.add(callback);

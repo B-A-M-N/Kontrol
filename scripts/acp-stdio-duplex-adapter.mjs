@@ -157,6 +157,10 @@ async function handle(req, res) {
   if (body.smoke_test) {
     return writeJson(res, 202, { run_id: "stdio-duplex-smoke", smoke_test: true, duplex: true, accepted: true });
   }
+  const task = extractTask(body.input);
+  if (!task.trim()) {
+    return writeJson(res, 400, { error: { code: "invalid_task", message: "ACP task must be non-empty" } });
+  }
 
   const workspaceRoot = await validateWorkspaceRoot(body.workspace_root);
   const run = {
@@ -166,7 +170,7 @@ async function handle(req, res) {
     workspaceSessionId: body.workspace_session_id,
     agentId: body.agent_id,
     workspaceRoot,
-    task: extractTask(body.input),
+    task,
     child: null,
     conn: null,
     finalized: false,

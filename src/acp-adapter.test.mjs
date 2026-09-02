@@ -63,6 +63,9 @@ try {
         "output tail limit is measured in UTF-8 bytes",
       );
     });
+    await t("synthetic smoke has started and completed lifecycle stages", () => {
+      assert.deepEqual(mod.SMOKE_LIFECYCLE_EVENTS, ["started", "completed"]);
+    });
   }
 
   // ── Fail-closed workspace root validation (P0 #6) ──

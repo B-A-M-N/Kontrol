@@ -71,8 +71,11 @@ export function validateRelease(artifactPath) {
   if (missing.length > 0) throw new Error(`release is missing required files: ${missing.join(", ")}`);
 
   const metadata = JSON.parse(readFileSync(resolve(root, "build-meta.json"), "utf8"));
-  if (typeof metadata.buildId !== "string" || metadata.buildId.length === 0) {
+  if (typeof metadata.buildId !== "string" || !/^[A-Za-z0-9._-]+$/.test(metadata.buildId)) {
     throw new Error("release build-meta.json has no buildId");
+  }
+  if (typeof metadata.contentSha256 !== "string" || !/^[a-f0-9]{16,64}$/.test(metadata.contentSha256)) {
+    throw new Error("release build-meta.json has no contentSha256");
   }
   for (const field of ["schemaVersion", "minReadableSchemaVersion", "maxReadableSchemaVersion", "releaseFormatVersion"]) {
     if (!Number.isInteger(metadata[field]) || metadata[field] < 0) {

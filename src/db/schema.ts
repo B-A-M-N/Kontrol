@@ -70,6 +70,22 @@ export const oauthRefreshTokens = sqliteTable("oauth_refresh_tokens", {
   resource: text("resource"),
 });
 
+/** Durable client-side mutation identity. A response loss must never cause a
+ * reconnecting WebUI to execute the same logical mutation twice. */
+export const clientMutationReceipts = sqliteTable("client_mutation_receipts", {
+  principalId: text("principal_id").notNull(),
+  operation: text("operation").notNull(),
+  clientMutationId: text("client_mutation_id").notNull(),
+  requestHash: text("request_hash").notNull(),
+  status: text("status").notNull().default("pending"),
+  resultJson: text("result_json"),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+}, (table) => [
+  primaryKey({ columns: [table.principalId, table.operation, table.clientMutationId] }),
+  index("client_mutation_receipts_updated_idx").on(table.updatedAt),
+]);
+
 export type WorkspaceSessionRow = typeof workspaceSessions.$inferSelect;
 export type NewWorkspaceSessionRow = typeof workspaceSessions.$inferInsert;
 export type LoadedAgentFileRow = typeof loadedAgentFiles.$inferSelect;
@@ -89,6 +105,7 @@ export const workSessions = sqliteTable("work_sessions", {
   submittedBy: text("submitted_by").notNull(),
   title: text("title"),
   lastConsumedFeedbackId: text("last_consumed_feedback_id"),
+  lastConsumedReviewEpoch: integer("last_consumed_review_epoch").notNull().default(0),
   createdAt: text("created_at").notNull(),
   updatedAt: text("updated_at").notNull(),
 }, (table) => [
@@ -109,8 +126,10 @@ export const workSessionSubmissions = sqliteTable("work_session_submissions", {
   /** Exact working-tree snapshot commit the diff was captured against. Bound to
    * the submission so approval can require the workspace to still equal this
    * tree (fixes stale-approval after a concurrent submission in the same
-   * workspace). */
+   * workspace). Legacy compatibility only; new rows use snapshotKind/ref. */
   snapshotCommit: text("snapshot_commit"),
+  snapshotKind: text("snapshot_kind"),
+  snapshotRef: text("snapshot_ref"),
   reviewEpoch: integer("review_epoch").notNull().default(1),
   message: text("message"),
   summaryJson: text("summary_json"),
@@ -156,7 +175,7 @@ export const workSessionToolEvents = sqliteTable("work_session_tool_events", {
   elapsedMs: integer("elapsed_ms").notNull().default(0),
   createdAt: text("created_at").notNull(),
 }, (table) => [
-  index("wste_work_session_idx").on(table.workSessionId, table.createdAt),
+  index("wste_work_session_idx").on(table.workSessionId, table.createdAt, table.id),
 ]);
 
 export type WorkSessionRow = typeof workSessions.$inferSelect;
@@ -405,6 +424,8 @@ export const missionContracts = sqliteTable("mission_contracts", {
   userLockedFieldsJson: text("user_locked_fields_json").notNull().default("[]"),
   supervisorInstructions: text("supervisor_instructions"),
   baselineCommit: text("baseline_commit"),
+  baselineKind: text("baseline_kind"),
+  baselineRef: text("baseline_ref"),
   correctionRounds: integer("correction_rounds").notNull().default(0),
   maxCorrectionRounds: integer("max_correction_rounds").notNull().default(5),
   finalVerificationJson: text("final_verification_json").notNull().default("[]"),
@@ -428,7 +449,7 @@ export const supervisorRuns = sqliteTable("supervisor_runs", {
   stagnantCycleCount: integer("stagnant_cycle_count").notNull().default(0),
   progressJson: text("progress_json"), stallReason: text("stall_reason"),
   ownerInstanceId: text("owner_instance_id"), leaseNonce: text("lease_nonce"), leaseExpiresAt: text("lease_expires_at"), heartbeatAt: text("heartbeat_at"),
-  lastProcessedEventSeq: integer("last_processed_event_seq").notNull().default(0), lastSubmissionId: text("last_submission_id"), lastSnapshotCommit: text("last_snapshot_commit"),
+  lastProcessedEventSeq: integer("last_processed_event_seq").notNull().default(0), lastSubmissionId: text("last_submission_id"), lastSnapshotCommit: text("last_snapshot_commit"), lastSnapshotKind: text("last_snapshot_kind"), lastSnapshotRef: text("last_snapshot_ref"),
   nextActionAt: text("next_action_at"), failureCount: integer("failure_count").notNull().default(0), lastError: text("last_error"),
   lastFailureFingerprint: text("last_failure_fingerprint"), repeatedFailureCount: integer("repeated_failure_count").notNull().default(0),
   deadlineAt: text("deadline_at"),
@@ -452,6 +473,8 @@ export const missionCompletionReports = sqliteTable("mission_completion_reports"
   missionId: text("mission_id").notNull().references(() => missionContracts.id, { onDelete: "cascade" }),
   submissionId: text("submission_id").notNull(),
   snapshotCommit: text("snapshot_commit").notNull(),
+  snapshotKind: text("snapshot_kind"),
+  snapshotRef: text("snapshot_ref"),
   status: text("status").notNull(),
   resultsJson: text("results_json").notNull(),
   reviewCoverageJson: text("review_coverage_json").notNull().default("[]"),
@@ -532,6 +555,8 @@ export const missionEvidence = sqliteTable("mission_evidence", {
   submissionId: text("submission_id"),
   reviewEpoch: integer("review_epoch"),
   snapshotCommit: text("snapshot_commit"),
+  snapshotKind: text("snapshot_kind"),
+  snapshotRef: text("snapshot_ref"),
   leaseNonce: text("lease_nonce"),
   actorPrincipal: text("actor_principal"),
   command: text("command"),

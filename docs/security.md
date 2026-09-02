@@ -67,15 +67,19 @@ URL. Use `KONTROL_ALLOWED_HOSTS=*` only for intentional local debugging.
 
 ## Tunnels
 
-Kontrol does not manage tunnels. Your tunnel or reverse proxy should point to:
+Kontrol core does not provision or own third-party tunnel infrastructure. A
+configured tunnel or reverse proxy should point to:
 
 ```text
 http://127.0.0.1:7676
 ```
 
-Prefer adding Cloudflare Access, Tailscale identity controls, or equivalent
-protection in front of public tunnels. Kontrol OAuth still protects the MCP
-endpoint, but the tunnel URL should not be treated as a secret.
+The checkout integration launcher can supervise an already-configured tunnel
+client when explicitly enabled; that is separate from the production
+`kontrol-core.service`, which owns only the MCP core. Prefer adding Cloudflare
+Access, Tailscale identity controls, or equivalent protection in front of
+public tunnels. Kontrol OAuth still protects the MCP endpoint, but the tunnel
+URL should not be treated as a secret.
 
 ## Shell Access
 

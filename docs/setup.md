@@ -5,7 +5,7 @@ projects through Kontrol.
 
 ## Requirements
 
-- Node `>=22.19 <27`
+- Node 22.19+, 24.x, or 26.x
 - npm
 - Git
 - Bash, including Git Bash or WSL on Windows
@@ -16,17 +16,10 @@ ngrok, Pinggy, Tailscale Funnel, or your own HTTPS reverse proxy.
 
 ## Install And Configure
 
-Install the CLI from GitHub, then run setup:
+Install the CLI package, then run setup:
 
 ```bash
-npm install -g git+ssh://git@github.com/B-A-M-N/Kontrol.git
-kontrol init
-```
-
-Without GitHub SSH keys:
-
-```bash
-npm install -g git+https://github.com/B-A-M-N/Kontrol.git
+npm install -g @b-a-m-n/kontrol@1.0.4
 kontrol init
 ```
 

@@ -15,20 +15,27 @@ function run(cmd, args) {
   // kontrol-env-exception: test runner spawning the project's own tests on
   // trusted sources; needs PATH/npm resolution, not a control-plane spawn.
   const result = spawnSync(cmd, args, { stdio: "inherit", env: process.env });
-  if (result.status !== 0) process.exit(result.status ?? 1);
+  if (result.error) throw result.error;
+  if (result.status !== 0) throw new Error(`${cmd} ${args.join(" ")} failed with status ${result.status ?? "unknown"}`);
 }
 
-run("npx", ["tsx", "src/ui/card-types.test.ts"]);
-run("npx", ["tsx", "src/ui/patch-display.test.ts"]);
-run("npx", ["tsx", "src/ui/approval-attention.dom.test.ts"]);
-run("npx", ["tsx", "src/ui/workspace-app.dom.test.tsx"]);
+try {
+  run("npx", ["tsx", "src/ui/card-types.test.ts"]);
+  run("npx", ["tsx", "src/ui/patch-display.test.ts"]);
+  run("npx", ["tsx", "src/ui/approval-attention.dom.test.ts"]);
+  run("npx", ["tsx", "src/ui/workspace-app.dom.test.tsx"]);
 
-// Size test builds + enforces byte budgets (missing artifact = failure).
-run(process.execPath, ["src/ui/workspace-app-size.test.mjs"]);
+  // Size test builds + enforces byte budgets (missing artifact = failure).
+  run(process.execPath, ["src/ui/workspace-app-size.test.mjs"]);
 
-// Contract test runs with the candidate exported so built-artifact
-// assertions execute.
-run("npx", ["tsx", "src/ui/workspace-app-contract.test.ts"]);
+  // Contract test runs with the candidate exported so built-artifact
+  // assertions execute.
+  run("npx", ["tsx", "src/ui/workspace-app-contract.test.ts"]);
 
-// Cleanup after all consumers are done.
-rmSync(candidateDir, { recursive: true, force: true });
+  // Real Chromium gate: verify the same built single-file artifact in a browser
+  // engine, including mobile layout, focus styling, and host theme variables.
+  run(process.execPath, ["scripts/workspace-app-browser.test.mjs"]);
+} finally {
+  // Keep cleanup reliable when any individual suite fails.
+  rmSync(candidateDir, { recursive: true, force: true });
+}

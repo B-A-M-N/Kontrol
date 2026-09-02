@@ -96,18 +96,21 @@ tunnel ID. A 401/403 is an authentication/configuration failure and is not
 retried as process recovery. A connector route that has already gone stale must
 perform a fresh MCP `initialize` after the route is repaired.
 
-For a stable scheduler boundary, use `scripts/kontrol-user-service.sh install`
-and `start` to run the installed `dist/cli.js serve` product under the
+For a stable scheduler boundary, use `kontrol service install` and `start` to
+run the installed immutable release under the
 `kontrol-core.service` per-user systemd unit. The unit sets `Nice=0`,
 `CPUWeight=100`, `Restart=on-failure`, `KillMode=control-group`, and bounded
 systemd restart limits. It reads `~/.config/kontrol/environment` by default
 (override with `KONTROL_USER_ENV_FILE`) and owns the MCP core only; adapters and
-tunnels remain separate components. The checkout launcher `start-all.sh` owns
+tunnels remain separate components. The checkout compatibility wrapper
+`scripts/kontrol-user-service.sh` delegates to the same compiled command but is
+not required by an installed package. The checkout launcher `start-all.sh` owns
 the full development/integration stack. Both paths use the same runtime lock,
 so a competing launcher is rejected rather than binding over a live process.
 For this unit, `restart` restarts the installed immutable release; `upgrade`
 selects the latest immutable build candidate (falling back to `dist/`),
-verifies readiness, and restores the prior unit if activation fails.
+verifies readiness, and restores the prior unit and validated database backup if
+activation fails.
 
 MCP transports are isolated by their `mcp-session-id`. The logical client label
 (for example `mcp:openai-mcp@1.0.0`) is aggregate telemetry only and is never a
@@ -185,6 +188,15 @@ explicit non-durable receipts before commit, then coalesced when flushed. A
 retention job may compact old telemetry into a checkpoint without rewriting
 workflow events.
 
+SQLite uses WAL mode with `synchronous=NORMAL`. This gives crash-consistent
+transactions and recovery from an interrupted process, but it does not promise
+that the newest acknowledged transaction survives sudden OS or storage power
+loss when the underlying storage does not honor flushes. Persistent-runtime
+qualification therefore requires reliable storage or power-loss protection;
+`NORMAL` must not be described as power-loss proof. A deployment that requires
+the stronger SQLite power-loss boundary must deliberately select
+`synchronous=FULL`, accept its performance cost, and requalify the runtime.
+
 ## OAuth
 
 Kontrol uses a single-user OAuth approval flow.
@@ -257,9 +269,9 @@ localhost fetches.
 
 | Value | Behavior |
 | --- | --- |
-| `minimal` | Default. Exposes `open_workspace`, `read`, `write`, `edit`, and `bash`. Clients use `bash` with tools such as `rg`, `find`, and `ls` for inspection. |
-| `full` | Exposes the minimal tools plus dedicated `grep`, `glob`, and `ls` tools. |
-| `codex` | Experimental. Exposes `open_workspace`, `read`, `apply_patch`, `exec_command`, and `write_stdin`. Existing mutation and shell tools are hidden. |
+| `minimal` | Default. Exposes `open_workspace`, `read`, structured read-only discovery (`grep`, `glob`, `ls`), `write`, `edit`, and `bash`. Structured discovery does not require shell approval; arbitrary `bash` remains policy-gated. |
+| `full` | Compatibility alias for the same core tool surface as `minimal`. |
+| `codex` | Experimental. Exposes `open_workspace`, structured read-only `read`/`grep`/`glob`/`ls`, `apply_patch`, `exec_command`, and `write_stdin`. The legacy `write`, `edit`, and `bash` tools remain hidden. |
 
 `KONTROL_MINIMAL_TOOLS` remains a backward-compatible alias when
 `KONTROL_TOOL_MODE` is unset: `1` selects `minimal` and `0` selects `full`.

@@ -138,7 +138,7 @@ try {
   // ── 3: launch the installed server ────────────────────────────────────────
   const servicePort = await unusedTcpPort();
   const serviceEnv = {
-    ...process.env,
+    ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("KONTROL_POLICY_"))),
     HOST: "127.0.0.1",
     PORT: String(servicePort),
     KONTROL_AUTH_MODE: "tunnel",
@@ -150,6 +150,7 @@ try {
     KONTROL_ACP_ENABLED: "true",
     KONTROL_ACP_SHARED_SECRET: "uat-shared-secret-0000000000000000000000",
     KONTROL_POLICY_TOOL_BASH: "ask",
+    KONTROL_TUNNEL_REVIEWER_SECRET: "release-uat-reviewer-secret-long-enough",
     KONTROL_LOG_FORMAT: "pretty",
   };
   log("launch", `starting installed server on :${servicePort}`);
@@ -212,6 +213,14 @@ try {
   assert.match(readText, /release uat fixture/, "read returned file contents");
   log("read", "file contents round-tripped");
 
+  const grepResult = await tool("grep", { workspaceId, pattern: "release uat", path: "hello.txt" });
+  assert.match(JSON.stringify(grepResult), /release uat fixture/, "grep returned file matches");
+  const globResult = await tool("glob", { workspaceId, pattern: "*.txt" });
+  assert.match(JSON.stringify(globResult), /hello\.txt/, "glob returned matching paths");
+  const lsResult = await tool("ls", { workspaceId, path: "." });
+  assert.match(JSON.stringify(lsResult), /hello\.txt/, "ls returned directory entries");
+  log("read-only-tools", "grep, glob, and ls completed without approval");
+
   // Secure baseline: bash must be gated behind ask even for an authenticated
   // MCP caller with no approver present.
   const bashResult = await tool("bash", { workspaceId, command: "pwd" });
@@ -220,6 +229,13 @@ try {
     /denied by policy|approval|requires? approval/i.test(bashText) || bashResult.isError === true,
     "bash must be gated under the default secure baseline",
   );
+  for (const [name, args] of [
+    ["write", { workspaceId, path: "blocked.txt", content: "must not write" }],
+    ["edit", { workspaceId, path: "hello.txt", edits: [{ oldText: "release uat fixture", newText: "must not edit" }] }],
+  ]) {
+    const result = await tool(name, args);
+    assert.equal(result.structuredContent?.status, "approval_required", `${name} must be gated under the default secure baseline`);
+  }
   log("mutation-boundary", "bash gated behind approval as expected");
 
   // ── 8: resource/UI serving ────────────────────────────────────────────────

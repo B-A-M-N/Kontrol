@@ -35,6 +35,7 @@ export interface RuntimeIdentity {
 
 export interface RuntimeIdentityOptions {
   artifactPath?: string;
+  generationId?: string;
 }
 
 export function runtimeIdentityPath(stateDir: string): string {
@@ -85,8 +86,8 @@ export function createRuntimeIdentityRecord(
     ...(build.buildTimestamp ? { buildTimestamp: build.buildTimestamp } : {}),
     startedAt: new Date().toISOString(),
     command: command.slice(0, 2_000),
-    ...(process.env.KONTROL_LAUNCH_GENERATION_ID
-      ? { generationId: process.env.KONTROL_LAUNCH_GENERATION_ID }
+    ...(options.generationId || process.env.KONTROL_LAUNCH_GENERATION_ID
+      ? { generationId: options.generationId ?? process.env.KONTROL_LAUNCH_GENERATION_ID }
       : {}),
     ...(options.artifactPath || process.env.KONTROL_ARTIFACT_PATH
       ? { artifactPath: options.artifactPath ?? process.env.KONTROL_ARTIFACT_PATH }
