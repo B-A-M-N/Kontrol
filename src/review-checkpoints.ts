@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import { join, relative, resolve, dirname, sep } from "node:path";
 import { git, getGitEligibility, safeWorkspaceRefSegment } from "./git.js";
+import { FilesystemSnapshotStore, type FilesystemSnapshotLimits } from "./filesystem-snapshot-store.js";
 
 export type ReviewSince = "last_shown" | "last_review" | "workspace_open" | "work_session";
 
@@ -109,15 +110,46 @@ export interface ReviewCheckpointManager {
    */
   commitReviewed(input: { workspaceId: string; root: string; snapshotCommit: string; workSessionId?: string }): Promise<void>;
   commitReviewedSnapshot(input: { workspaceId: string; root: string; snapshot: WorkspaceSnapshot; workSessionId?: string }): Promise<void>;
+  /**
+   * Awaits the workspace's initial filesystem baseline (or git refs) before any
+   * mutation-capable operation proceeds. Resolves immediately once the workspace
+   * is ready (or ineligible for filesystem capture). Used as a central mutation
+   * preflight so mutations cannot race the initial baseline.
+   */
+  awaitWorkspaceReady(input: { workspaceId: string; root: string }): Promise<void>;
+  /** Graceful shutdown: stop accepting new captures, drain active ones. */
+  drain(): Promise<void>;
+  /** Raw store surface for maintenance/CLI (GC, stats, reconciliation). */
+  getSnapshotStore(): FilesystemSnapshotStore;
+  /** Drop a terminal work-session's baseline pin so GC can reclaim it. */
+  releaseWorkSessionBaseline(input: { workspaceId: string; workSessionId: string }): Promise<void>;
 }
 
 const REVIEW_REF_PREFIX = "refs/kontrol/review";
 
-export function createReviewCheckpointManager(options: { snapshotStoreRoot?: string } = {}): ReviewCheckpointManager {
+export function createReviewCheckpointManager(options: {
+  snapshotStoreRoot?: string;
+  snapshotLimits?: FilesystemSnapshotLimits;
+  fsStore?: FilesystemSnapshotStore;
+} = {}): ReviewCheckpointManager {
   const states = new Map<string, WorkspaceReviewStateWithInit>();
-  const filesystemStore = new FilesystemCheckpointBackend({
-    storeRoot: options.snapshotStoreRoot ?? join(tmpdir(), "kontrol-workspace-snapshots"),
-  });
+  // Created lazily on first filesystem use so tests that never capture an
+  // ordinary directory don't touch a store at all. The facade exposes the
+  // review-policy surface (capture/diff/compare/materialize); raw store
+  // operations (GC, stats, reconciliation) go through `.store`.
+  let fsBackend: FilesystemCheckpointBackend | undefined;
+  const getFsBackend = (): FilesystemCheckpointBackend => {
+    if (!fsBackend) {
+      fsBackend = new FilesystemCheckpointBackend({
+        storeRoot: options.snapshotStoreRoot ?? join(tmpdir(), "kontrol-workspace-snapshots"),
+        store: options.fsStore,
+        limits: options.snapshotLimits,
+      });
+    }
+    return fsBackend;
+  };
+  // Alias used by review-change paths that need the raw store.
+  const getFsStore = (): FilesystemSnapshotStore => getFsBackend().store;
 
   /**
    * P1 #15: Retryable initialization. Track state explicitly.
@@ -151,13 +183,26 @@ export function createReviewCheckpointManager(options: { snapshotStoreRoot?: str
     try {
       const eligibility = await getGitEligibility(root);
       if (!eligibility.ok || !eligibility.gitRoot) {
-        state.backend = filesystemStore;
-        const open = await filesystemStore.capture(root);
-        const persisted = await filesystemStore.loadBaselines(workspaceId);
-        state.filesystemBaselines = persisted && persisted.root === resolve(root)
-          ? { open: persisted.open, presentation: persisted.presentation, legacy: persisted.legacy, sessions: new Map(Object.entries(persisted.sessions)) }
-          : { open, presentation: open, legacy: open, sessions: new Map() };
-        await filesystemStore.saveBaselines(workspaceId, root, state.filesystemBaselines);
+        const store = getFsStore();
+        state.backend = getFsBackend();
+        // P0 #2: Load the persisted baseline FIRST. Only capture a fresh tree
+        // when there is no valid persisted baseline for this root. The old code
+        // captured unconditionally, so every restart wrote another unreferenced
+        // full-tree snapshot before checking whether a baseline existed.
+        const persisted = await store.loadBaselines(workspaceId);
+        if (persisted && persisted.root === resolve(root) && await store.validateSnapshot(persisted.open)) {
+          state.filesystemBaselines = {
+            open: persisted.open,
+            presentation: persisted.presentation,
+            legacy: persisted.legacy,
+            sessions: new Map(Object.entries(persisted.sessions)),
+          };
+        } else {
+          await store.runStartupReconciliation();
+          const open = await store.capture(root);
+          state.filesystemBaselines = { open, presentation: open, legacy: open, sessions: new Map() };
+          await store.saveBaselines(workspaceId, root, state.filesystemBaselines);
+        }
         state.diagnostic = undefined;
         resolveInit();
         return state;
@@ -212,7 +257,7 @@ export function createReviewCheckpointManager(options: { snapshotStoreRoot?: str
           } else {
             baselines.presentation = current;
           }
-          await filesystemStore.saveBaselines(workspaceId, state.root, baselines);
+          await getFsStore().saveBaselines(workspaceId, state.root, baselines);
         }
         return formatReviewResult(diff, current, since === "workspace_open" ? "workspace open" : "last shown changes");
       }
@@ -327,7 +372,7 @@ export function createReviewCheckpointManager(options: { snapshotStoreRoot?: str
         const baselines = state.filesystemBaselines!;
         if (workSessionId) baselines.sessions.set(workSessionId, snapshot);
         else baselines.presentation = snapshot;
-        await filesystemStore.saveBaselines(workspaceId, state.root, baselines);
+        await getFsStore().saveBaselines(workspaceId, state.root, baselines);
         return;
       }
       if (!state?.gitRoot) {
@@ -337,15 +382,34 @@ export function createReviewCheckpointManager(options: { snapshotStoreRoot?: str
       // may have changed between capture and persistence).
       await git(state.gitRoot, ["update-ref", sessionBaselineRef(workspaceId, workSessionId), snapshot.ref]);
     },
+
+    async awaitWorkspaceReady({ workspaceId, root }) {
+      const state = await ensureInitialized(workspaceId, root);
+      // `ensureInitialized` already awaited the initialization promise; if the
+      // state is permanently ineligible (not a git repo and not capturable),
+      // there is nothing more to wait for.
+      if (state.backend?.kind !== "filesystem") return;
+      // Filesystem workspaces are ready once their baselines are saved.
+      if (state.filesystemBaselines) return;
+      await state.initialization;
+    },
+
+    async drain() {
+      await getFsStore().close();
+    },
+
+    getSnapshotStore() {
+      return getFsStore();
+    },
+
+    async releaseWorkSessionBaseline({ workspaceId, workSessionId }) {
+      await getFsStore().releaseWorkSessionBaseline(workspaceId, workSessionId);
+    },
   };
 }
 
 function gitSnapshot(ref: string): WorkspaceSnapshot {
   return { kind: "git", ref, createdAt: new Date().toISOString() };
-}
-
-function filesystemSnapshot(ref: string, createdAt = new Date().toISOString()): WorkspaceSnapshot {
-  return { kind: "filesystem", ref, createdAt };
 }
 
 interface FilesystemManifestEntry {
@@ -373,33 +437,20 @@ const MAX_FS_TEXT_BYTES = 128 * 1024;
  */
 export class FilesystemCheckpointBackend implements CheckpointBackend {
   readonly kind = "filesystem" as const;
-  private readonly storeRoot: string;
+  /** The transactional store backing this backend. */
+  readonly store: FilesystemSnapshotStore;
 
-  constructor(options: { storeRoot?: string } = {}) {
-    this.storeRoot = resolve(options.storeRoot ?? join(tmpdir(), "kontrol-workspace-snapshots"));
+  constructor(options: { storeRoot?: string; store?: FilesystemSnapshotStore; limits?: FilesystemSnapshotLimits } = {}) {
+    this.store = options.store ?? new FilesystemSnapshotStore({ storeRoot: options.storeRoot, limits: options.limits });
   }
 
-  async capture(root: string): Promise<WorkspaceSnapshot> {
-    await mkdir(join(this.storeRoot, "manifests"), { recursive: true, mode: 0o700 });
-    await mkdir(join(this.storeRoot, "blobs"), { recursive: true, mode: 0o700 });
-    const entries: FilesystemManifestEntry[] = [];
-    await this.walk(resolve(root), resolve(root), entries);
-    entries.sort((a, b) => a.path.localeCompare(b.path));
-    const manifest: FilesystemManifest = { version: 1, entries };
-    const serialized = JSON.stringify(manifest);
-    const ref = FS_REF_PREFIX + createHash("sha256").update(serialized).digest("hex");
-    const manifestPath = this.manifestPath(ref);
-    try {
-      await writeFile(manifestPath, serialized, { encoding: "utf8", flag: "wx", mode: 0o600 });
-    } catch (error) {
-      if (!(error && typeof error === "object" && "code" in error && error.code === "EEXIST")) throw error;
-    }
-    return filesystemSnapshot(ref);
+  async capture(root: string, context?: { workSessionStatus?: string; createdAt?: string }): Promise<WorkspaceSnapshot> {
+    return this.store.capture(root, context);
   }
 
   async diff(_root: string, baseline: WorkspaceSnapshot, current: WorkspaceSnapshot): Promise<Pick<ReviewChangesResult, "summary" | "files" | "patch">> {
-    const before = await this.readManifest(baseline);
-    const after = await this.readManifest(current);
+    const before = await this.store.readManifest(baseline);
+    const after = await this.store.readManifest(current);
     const beforeByPath = new Map(before.entries.map((entry) => [entry.path, entry]));
     const afterByPath = new Map(after.entries.map((entry) => [entry.path, entry]));
     const paths = [...new Set([...beforeByPath.keys(), ...afterByPath.keys()])].sort();
@@ -410,8 +461,8 @@ export class FilesystemCheckpointBackend implements CheckpointBackend {
       const oldEntry = beforeByPath.get(path);
       const newEntry = afterByPath.get(path);
       if (oldEntry && newEntry && entriesEqual(oldEntry, newEntry)) continue;
-      const oldBytes = oldEntry?.type === "file" ? await this.readBlob(oldEntry.sha256) : undefined;
-      const newBytes = newEntry?.type === "file" ? await this.readBlob(newEntry.sha256) : undefined;
+      const oldBytes = oldEntry?.type === "file" ? await this.store.readBlobBuffer(oldEntry.sha256) : undefined;
+      const newBytes = newEntry?.type === "file" ? await this.store.readBlobBuffer(newEntry.sha256) : undefined;
       const additions = newBytes ? countLines(newBytes) : 0;
       const removals = oldBytes ? countLines(oldBytes) : 0;
       files.push({ path, type: !oldEntry ? "new" : !newEntry ? "deleted" : "change", additions, removals });
@@ -429,12 +480,19 @@ export class FilesystemCheckpointBackend implements CheckpointBackend {
 
   async compare(root: string, expected: WorkspaceSnapshot): Promise<boolean> {
     if (expected.kind !== "filesystem") return false;
-    const current = await this.capture(root);
-    return current.ref === expected.ref;
+    // Bound the comparison: capture the current tree and compare manifests
+    // directly. Reuses the store's transactional capture so nothing is
+    // leaked if the comparison is interrupted.
+    try {
+      const current = await this.store.capture(root);
+      return current.ref === expected.ref;
+    } catch {
+      return false;
+    }
   }
 
   async materialize(snapshot: WorkspaceSnapshot, destination: string): Promise<void> {
-    const manifest = await this.readManifest(snapshot);
+    const manifest = await this.store.readManifest(snapshot);
     const targetRoot = resolve(destination);
     await mkdir(targetRoot, { recursive: true, mode: 0o700 });
     for (const entry of manifest.entries) {
@@ -443,78 +501,32 @@ export class FilesystemCheckpointBackend implements CheckpointBackend {
       if (entry.type === "symlink") {
         await symlink(entry.target ?? "", output);
       } else {
-        await writeFile(output, await this.readBlob(entry.sha256), { mode: entry.executable ? 0o755 : 0o644 });
+        // Stream the blob out rather than forcing it through a whole-file Buffer.
+        const buffer = await this.store.readBlobBuffer(entry.sha256);
+        await writeFile(output, buffer, { mode: entry.executable ? 0o755 : 0o644 });
       }
     }
   }
 
   async loadBaselines(workspaceId: string): Promise<{ root: string; open: WorkspaceSnapshot; presentation: WorkspaceSnapshot; legacy: WorkspaceSnapshot; sessions: Record<string, WorkspaceSnapshot> } | undefined> {
-    try {
-      const value = JSON.parse(await readFileAsync(this.baselinePath(workspaceId), "utf8")) as { root?: string; open?: WorkspaceSnapshot; presentation?: WorkspaceSnapshot; legacy?: WorkspaceSnapshot; sessions?: Record<string, WorkspaceSnapshot> };
-      if (!value.root || !value.open || !value.presentation || !value.legacy || !value.sessions) return undefined;
-      return { root: value.root, open: value.open, presentation: value.presentation, legacy: value.legacy, sessions: value.sessions };
-    } catch {
-      return undefined;
-    }
+    return this.store.loadBaselines(workspaceId);
   }
 
   async saveBaselines(workspaceId: string, root: string, baselines: { open: WorkspaceSnapshot; presentation: WorkspaceSnapshot; legacy: WorkspaceSnapshot; sessions: Map<string, WorkspaceSnapshot> }): Promise<void> {
-    await mkdir(join(this.storeRoot, "baselines"), { recursive: true, mode: 0o700 });
-    const sessions = Object.fromEntries([...baselines.sessions.entries()].sort(([left], [right]) => left.localeCompare(right)));
-    await writeFile(this.baselinePath(workspaceId), JSON.stringify({ root: resolve(root), open: baselines.open, presentation: baselines.presentation, legacy: baselines.legacy, sessions }), { encoding: "utf8", mode: 0o600 });
+    return this.store.saveBaselines(workspaceId, root, baselines);
   }
 
-  private manifestPath(ref: string): string {
-    if (!ref.startsWith(FS_REF_PREFIX)) throw new Error(`Invalid filesystem snapshot ref: ${ref}`);
-    return join(this.storeRoot, "manifests", `${ref.slice(FS_REF_PREFIX.length)}.json`);
+  /** Delegate to the transactional store; the commitReviewedSnapshot path uses this. */
+  async validateSnapshot(snapshot: WorkspaceSnapshot): Promise<boolean> {
+    return this.store.validateSnapshot(snapshot);
   }
 
-  private baselinePath(workspaceId: string): string {
-    return join(this.storeRoot, "baselines", `${safeWorkspaceRefSegment(workspaceId)}.json`);
+  async releaseWorkSessionBaseline(workspaceId: string, workSessionId: string): Promise<void> {
+    return this.store.releaseWorkSessionBaseline(workspaceId, workSessionId);
   }
 
-  private blobPath(hash: string): string {
-    if (!/^[a-f0-9]{64}$/.test(hash)) throw new Error(`Invalid filesystem blob hash: ${hash}`);
-    return join(this.storeRoot, "blobs", hash);
-  }
-
-  private async readManifest(snapshot: WorkspaceSnapshot): Promise<FilesystemManifest> {
-    if (snapshot.kind !== "filesystem") throw new Error("Expected a filesystem snapshot.");
-    const manifest = JSON.parse(await readFileAsync(this.manifestPath(snapshot.ref), "utf8")) as FilesystemManifest;
-    if (manifest.version !== 1 || !Array.isArray(manifest.entries)) throw new Error("Invalid filesystem snapshot manifest.");
-    return manifest;
-  }
-
-  private async readBlob(hash: string): Promise<Buffer> {
-    return readFileAsync(this.blobPath(hash));
-  }
-
-  private async walk(root: string, current: string, entries: FilesystemManifestEntry[]): Promise<void> {
-    const children = (await readdir(current)).sort((a, b) => a.localeCompare(b));
-    for (const child of children) {
-      const absolute = join(current, child);
-      const relativePath = relative(root, absolute).split(sep).join("/");
-      const info = await lstat(absolute);
-      if (info.isDirectory()) {
-        await this.walk(root, absolute, entries);
-        continue;
-      }
-      if (info.isSymbolicLink()) {
-        const target = await readlink(absolute);
-        entries.push({ path: relativePath, type: "symlink", target, sha256: hashBytes(Buffer.from(target)), size: Buffer.byteLength(target), executable: (info.mode & 0o111) !== 0 });
-        continue;
-      }
-      if (!info.isFile()) continue;
-      const content = await readFileAsync(absolute);
-      const sha256 = hashBytes(content);
-      const blob = this.blobPath(sha256);
-      try {
-        await writeFile(blob, content, { flag: "wx", mode: 0o600 });
-      } catch (error) {
-        if (!(error && typeof error === "object" && "code" in error && error.code === "EEXIST")) throw error;
-      }
-      entries.push({ path: relativePath, type: "file", sha256, size: content.byteLength, executable: (info.mode & 0o111) !== 0 });
-    }
+  async pruneSessionBaselines(workspaceId: string, nonterminalIds: Set<string>): Promise<{ dropped: number }> {
+    return this.store.pruneSessionBaselines(workspaceId, nonterminalIds);
   }
 }
 

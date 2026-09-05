@@ -104,6 +104,8 @@ export interface ServerConfig {
   mcpSessionMaxPerClient: number;
   mcpSessionSoftCap: number;
   mcpSessionHardCap: number;
+  /** Filesystem snapshot admission + retention limits (P0/P1 storage hardness). */
+  fsSnapshot: FilesystemSnapshotConfig;
 }
 
 function parsePort(value: string | number | undefined): number {
@@ -160,6 +162,57 @@ function normalizeAllowedHosts(rawHosts: string[], derivedHosts: string[]): stri
 
 function parseBoolean(value: string | undefined): boolean {
   return ["1", "true", "yes", "on"].includes(value?.toLowerCase() ?? "");
+}
+
+/** Filesystem snapshot admission + retention limits. All optional except the
+ * store watermarks; an unset admission limit is unbounded. */
+export interface FilesystemSnapshotConfig {
+  /** Maximum files captured in a single tree snapshot. Unset = unbounded. */
+  maxFiles?: number;
+  /** Maximum logical bytes captured in a single tree snapshot. Unset = unbounded. */
+  maxBytes?: number;
+  /** Maximum bytes read for any single file during capture. Unset = unbounded. */
+  maxFileBytes?: number;
+  /** Store high-water mark; GC is attempted above it and new captures fail closed above it. */
+  highWaterBytes?: number;
+  /** Store low-water mark; captures resume once the store drops to/below it. */
+  lowWaterBytes?: number;
+  /** Retention (ms) for terminal-session unpinned snapshots before GC. */
+  retentionMs?: number;
+  /** Number of most-recent terminal snapshots per workspace to retain after TTL. */
+  retainPerWorkspace?: number;
+  /** Orphan grace (ms): very new unpinned objects are never reaped within this window. */
+  orphanGraceMs?: number;
+}
+
+const DEFAULT_FS_SNAPSHOT_HIGH_WATER_BYTES = 40 * 1024 * 1024 * 1024;
+const DEFAULT_FS_SNAPSHOT_LOW_WATER_BYTES = 25 * 1024 * 1024 * 1024;
+const DEFAULT_FS_SNAPSHOT_RETENTION_MS = 30 * 24 * 60 * 60_000;
+const DEFAULT_FS_SNAPSHOT_RETAIN_PER_WORKSPACE = 10;
+const DEFAULT_FS_SNAPSHOT_ORPHAN_GRACE_MS = 5 * 60_000;
+
+function parseFsSnapshotConfig(env: NodeJS.ProcessEnv): FilesystemSnapshotConfig {
+  const parsed: FilesystemSnapshotConfig = {
+    maxFiles: parseOptionalPositiveInteger(env.KONTROL_FS_SNAPSHOT_MAX_FILES, "KONTROL_FS_SNAPSHOT_MAX_FILES"),
+    maxBytes: parseOptionalPositiveInteger(env.KONTROL_FS_SNAPSHOT_MAX_BYTES, "KONTROL_FS_SNAPSHOT_MAX_BYTES"),
+    maxFileBytes: parseOptionalPositiveInteger(env.KONTROL_FS_SNAPSHOT_MAX_FILE_BYTES, "KONTROL_FS_SNAPSHOT_MAX_FILE_BYTES"),
+    highWaterBytes: parseOptionalPositiveInteger(env.KONTROL_FS_SNAPSHOT_STORE_HIGH_WATER_BYTES, "KONTROL_FS_SNAPSHOT_STORE_HIGH_WATER_BYTES")
+      ?? DEFAULT_FS_SNAPSHOT_HIGH_WATER_BYTES,
+    lowWaterBytes: parseOptionalPositiveInteger(env.KONTROL_FS_SNAPSHOT_STORE_LOW_WATER_BYTES, "KONTROL_FS_SNAPSHOT_STORE_LOW_WATER_BYTES")
+      ?? DEFAULT_FS_SNAPSHOT_LOW_WATER_BYTES,
+    retentionMs: parseOptionalPositiveInteger(env.KONTROL_FS_SNAPSHOT_RETENTION_MS, "KONTROL_FS_SNAPSHOT_RETENTION_MS")
+      ?? DEFAULT_FS_SNAPSHOT_RETENTION_MS,
+    retainPerWorkspace: parseOptionalPositiveInteger(env.KONTROL_FS_SNAPSHOT_RETAIN_PER_WORKSPACE, "KONTROL_FS_SNAPSHOT_RETAIN_PER_WORKSPACE")
+      ?? DEFAULT_FS_SNAPSHOT_RETAIN_PER_WORKSPACE,
+    orphanGraceMs: parseOptionalPositiveInteger(env.KONTROL_FS_SNAPSHOT_ORPHAN_GRACE_MS, "KONTROL_FS_SNAPSHOT_ORPHAN_GRACE_MS")
+      ?? DEFAULT_FS_SNAPSHOT_ORPHAN_GRACE_MS,
+  };
+  if (parsed.lowWaterBytes !== undefined && parsed.highWaterBytes !== undefined && parsed.lowWaterBytes > parsed.highWaterBytes) {
+    throw new Error(
+      `KONTROL_FS_SNAPSHOT_STORE_LOW_WATER_BYTES=${parsed.lowWaterBytes} must not exceed KONTROL_FS_SNAPSHOT_STORE_HIGH_WATER_BYTES=${parsed.highWaterBytes}.`,
+    );
+  }
+  return parsed;
 }
 
 function parseToolMode(env: NodeJS.ProcessEnv): ToolMode {
@@ -574,6 +627,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     mcpSessionMaxPerClient: parsePositiveInteger(env.KONTROL_MCP_SESSION_MAX_PER_CLIENT, 20, "KONTROL_MCP_SESSION_MAX_PER_CLIENT"),
     mcpSessionSoftCap: parsePositiveInteger(env.KONTROL_MCP_SESSION_SOFT_CAP, 150, "KONTROL_MCP_SESSION_SOFT_CAP"),
     mcpSessionHardCap: parsePositiveInteger(env.KONTROL_MCP_SESSION_HARD_CAP, 200, "KONTROL_MCP_SESSION_HARD_CAP"),
+    fsSnapshot: parseFsSnapshotConfig(env),
   };
   const mcpConfig = config;
 

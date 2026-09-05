@@ -366,3 +366,44 @@ assert.doesNotThrow(
   () => loadConfig({ ...baseEnv }),
   "oauth mode is not subject to the tunnel reviewer gate",
 );
+
+// Filesystem snapshot admission + retention knobs (P0/P1 storage hardness).
+const fsConfig = loadConfig(baseEnv).fsSnapshot;
+assert.equal(fsConfig.highWaterBytes, 40 * 1024 * 1024 * 1024, "default high-water mark");
+assert.equal(fsConfig.lowWaterBytes, 25 * 1024 * 1024 * 1024, "default low-water mark");
+assert.equal(fsConfig.retentionMs, 30 * 24 * 60 * 60_000, "default terminal retention");
+assert.equal(fsConfig.orphanGraceMs, 5 * 60_000, "default orphan grace");
+assert.equal(fsConfig.maxFiles, undefined);
+assert.equal(fsConfig.retainPerWorkspace, 10);
+
+const fsCustom = loadConfig({
+  ...baseEnv,
+  KONTROL_FS_SNAPSHOT_MAX_FILES: "500",
+  KONTROL_FS_SNAPSHOT_MAX_BYTES: "1073741824",
+  KONTROL_FS_SNAPSHOT_MAX_FILE_BYTES: "52428800",
+  KONTROL_FS_SNAPSHOT_STORE_HIGH_WATER_BYTES: "8589934592",
+  KONTROL_FS_SNAPSHOT_STORE_LOW_WATER_BYTES: "5368709120",
+  KONTROL_FS_SNAPSHOT_RETENTION_MS: "86400000",
+  KONTROL_FS_SNAPSHOT_RETAIN_PER_WORKSPACE: "3",
+  KONTROL_FS_SNAPSHOT_ORPHAN_GRACE_MS: "1000",
+}).fsSnapshot;
+assert.deepEqual(fsCustom, {
+  maxFiles: 500,
+  maxBytes: 1073741824,
+  maxFileBytes: 52428800,
+  highWaterBytes: 8589934592,
+  lowWaterBytes: 5368709120,
+  retentionMs: 86400000,
+  retainPerWorkspace: 3,
+  orphanGraceMs: 1000,
+});
+
+// Low water must not exceed high water.
+assert.throws(
+  () => loadConfig({
+    ...baseEnv,
+    KONTROL_FS_SNAPSHOT_STORE_HIGH_WATER_BYTES: "1000",
+    KONTROL_FS_SNAPSHOT_STORE_LOW_WATER_BYTES: "2000",
+  }),
+  /LOW_WATER_BYTES/,
+);

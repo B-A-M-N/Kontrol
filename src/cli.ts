@@ -9,6 +9,7 @@ import * as prompts from "@clack/prompts";
 import { getShellConfig } from "@earendil-works/pi-coding-agent";
 import { satisfies } from "semver";
 import { loadConfig } from "./config.js";
+import { FilesystemSnapshotStore } from "./filesystem-snapshot-store.js";
 import { loadPolicyConfig, policyCanAsk } from "./policy.js";
 import { runServiceCommand } from "./service.js";
 import { isRuntimeIdentityLive, readBuildIdentity, readRuntimeIdentity } from "./runtime-identity.js";
@@ -21,7 +22,7 @@ import {
 } from "./user-config.js";
 import { expandHomePath } from "./roots.js";
 
-type Command = "serve" | "up" | "init" | "doctor" | "config" | "service" | "help" | "version";
+type Command = "serve" | "up" | "init" | "doctor" | "config" | "service" | "snapshots" | "help" | "version";
 const require = createRequire(import.meta.url);
 const SUPPORTED_NODE_RANGE = ">=22.19 <23 || >=24 <25 || >=26 <27";
 
@@ -51,6 +52,9 @@ async function main(argv: string[]): Promise<void> {
     case "service":
       await runServiceCommand(args);
       return;
+    case "snapshots":
+      await runSnapshotsCommand(args);
+      return;
     case "help":
       printHelp();
       return;
@@ -62,10 +66,82 @@ async function main(argv: string[]): Promise<void> {
 
 function normalizeCommand(command: string | undefined): Command {
   if (!command || command === "serve" || command === "start") return "serve";
-  if (command === "up" || command === "init" || command === "doctor" || command === "config" || command === "service") return command;
+  if (command === "up" || command === "init" || command === "doctor" || command === "config" || command === "service" || command === "snapshots") return command;
   if (command === "help" || command === "--help" || command === "-h") return "help";
   if (command === "version" || command === "--version" || command === "-v") return "version";
   throw new Error(`Unknown command: ${command}`);
+}
+
+function runSnapshotsCommand(args: string[]): Promise<void> {
+  const sub = args[0] ?? "stats";
+  if (sub === "stats") return snapshotsStats();
+  if (sub === "gc") return snapshotsGc({ dryRun: args.includes("--dry-run") });
+  throw new Error(`Unknown snapshots subcommand: ${sub} (expected "stats" or "gc")`);
+}
+
+function fsSnapshotStoreFromConfig(): FilesystemSnapshotStore {
+  const config = loadConfig();
+  return new FilesystemSnapshotStore({
+    storeRoot: join(config.stateDir, "workspace-snapshots"),
+    limits: config.fsSnapshot,
+  });
+}
+
+function formatBytes(value: number): string {
+  if (value >= 1024 * 1024 * 1024) return `${(value / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+  if (value >= 1024 * 1024) return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+  if (value >= 1024) return `${(value / 1024).toFixed(1)} KB`;
+  return `${value} B`;
+}
+
+async function snapshotsStats(): Promise<void> {
+  const store = fsSnapshotStoreFromConfig();
+  const stats = await store.storeStats();
+  const reachable = await store.estimateReachableBytes();
+  const orphanBlobs = Math.max(0, stats.blobs - reachable.blobs);
+  const orphanBytes = Math.max(0, stats.blobBytes - reachable.bytes);
+  const incomplete = await store.countIncompleteTransactionsPublic();
+  const storeRoot = store.storePath;
+  console.log(`Store: ${storeRoot}`);
+  console.log("");
+  console.log(`Manifests:            ${stats.manifests}`);
+  console.log(`Blobs:            ${stats.blobs}`);
+  console.log(`Store bytes:      ${formatBytes(stats.blobBytes)}`);
+  console.log("");
+  console.log(`Reachable blobs:  ${reachable.blobs}`);
+  console.log(`Reachable bytes:  ${formatBytes(reachable.bytes)}`);
+  console.log("");
+  console.log(`Orphan blobs:     ${orphanBlobs}`);
+  console.log(`Reclaimable:      ${formatBytes(orphanBytes)}`);
+  console.log("");
+  console.log(`Incomplete transactions: ${incomplete}`);
+  console.log(`Last GC: ${stats.lastGcCompletedAt ? new Date(stats.lastGcCompletedAt).toISOString() : "never"}`);
+  if (stats.corruptionCount > 0) console.log(`Corrupt objects:    ${stats.corruptionCount}`);
+}
+
+async function snapshotsGc(options: { dryRun: boolean }): Promise<void> {
+  const store = fsSnapshotStoreFromConfig();
+  console.log(`Collecting snapshot garbage (${options.dryRun ? "dry run — no deletions" : "live"}) from ${store.storePath}...`);
+  // Run the production collector to completion, bounded in slices, exactly as
+  // automatic maintenance does — never a bespoke CLI-only algorithm.
+  let hasMore = true;
+  let totalReclaimed = 0;
+  let totalBytes = 0;
+  while (hasMore) {
+    const { result, hasMore: more } = await store.gcSlice({
+      budgetMs: 2000,
+      pageSize: 500,
+      dryRun: options.dryRun,
+    });
+    totalReclaimed += result.blobsReclaimed;
+    totalBytes += result.bytesReclaimed;
+    hasMore = more;
+  }
+  if (options.dryRun) {
+    console.log(`Dry run would reclaim ${totalReclaimed} blobs (${formatBytes(totalBytes)}).`);
+  } else {
+    console.log(`GC reclaimed ${totalReclaimed} blobs (${formatBytes(totalBytes)}).`);
+  }
 }
 
 function runUp(args: string[]): void {
@@ -307,6 +383,29 @@ async function runDoctor(): Promise<void> {
       "PASS",
       `maxRunning=${config.processMaxRunning ?? "64 (default)"} perOwner=${config.processMaxRunningPerOwner ?? "8 (default)"} idleTimeoutMs=${config.processIdleTimeoutMs ?? "900000 (default)"}`,
     );
+    // P0 #2: snapshot store health — orphan ratio, high water, transactions.
+    try {
+      const store = new FilesystemSnapshotStore({ storeRoot: join(config.stateDir, "workspace-snapshots"), limits: config.fsSnapshot });
+      const stats = await store.storeStats();
+      const reachable = await store.estimateReachableBytes();
+      const orphan = Math.max(0, stats.blobs - reachable.blobs);
+      const orphanRatio = stats.blobs > 0 ? orphan / stats.blobs : 0;
+      const highWater = config.fsSnapshot.highWaterBytes;
+      const incomplete = await store.countIncompleteTransactionsPublic();
+      const problems: string[] = [];
+      if (orphanRatio > 0.3) problems.push(`orphan ratio ${(orphanRatio * 100).toFixed(0)}%`);
+      if (highWater && stats.blobBytes > highWater) problems.push("store over high-water mark");
+      if (incomplete > 0) problems.push(`${incomplete} incomplete capture transactions`);
+      doctorResult(
+        "Snapshot store",
+        problems.length === 0 ? "PASS" : "WARN",
+        problems.length === 0
+          ? `${stats.blobs} blobs, ${stats.manifests} manifests, ${formatBytes(stats.blobBytes)}, ${orphan} orphan blobs`
+          : `${problems.join("; ")} (${stats.blobs} blobs, ${stats.manifests} manifests). Run \`kontrol snapshots gc\` / \`kontrol snapshots stats\`.`,
+      );
+    } catch (error) {
+      doctorResult("Snapshot store", "UNAVAILABLE", error instanceof Error ? error.message : String(error));
+    }
     if (config.policy.pathRules.length > 0) {
       doctorResult(
         "Shell/path policy",
