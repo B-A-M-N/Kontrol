@@ -81,6 +81,14 @@ kontrol config set publicBaseUrl https://kontrol.example.com
 | `KONTROL_PROCESS_MAX_RUNTIME_MS` | unset (default 3600000) | Absolute runtime ceiling per process session |
 | `KONTROL_PROCESS_BUFFER_CHARACTERS` | unset (default 1000000) | Output buffer character limit per session |
 | `KONTROL_PROCESS_REAPER_INTERVAL_MS` | unset (manager default) | How often the session reaper sweeps |
+| `KONTROL_FS_SNAPSHOT_MAX_FILES` | unset (unbounded) | Maximum number of files captured in a single filesystem snapshot. Exceeding it aborts the capture transaction cleanly (no leaked blobs). |
+| `KONTROL_FS_SNAPSHOT_MAX_BYTES` | unset (unbounded) | Maximum logical bytes captured in a single filesystem snapshot. Exceeding it aborts the capture transaction cleanly. |
+| `KONTROL_FS_SNAPSHOT_MAX_FILE_BYTES` | unset (unbounded) | Maximum bytes read for a single file during capture; files larger than this abort the capture rather than ballooning heap. |
+| `KONTROL_FS_SNAPSHOT_STORE_HIGH_WATER_BYTES` | `42949672960` (40 GiB) | Store high-water mark. Above it, GC is attempted and new filesystem snapshots fail closed until the store drains below the low-water mark. |
+| `KONTROL_FS_SNAPSHOT_STORE_LOW_WATER_BYTES` | `26843545600` (25 GiB) | Store low-water mark; new captures resume once the store reaches/below it. Must not exceed the high-water mark. |
+| `KONTROL_FS_SNAPSHOT_RETENTION_MS` | `2592000000` (30 days) | Retention for unpinned terminal-session snapshots before reachability GC reclaims them. |
+| `KONTROL_FS_SNAPSHOT_RETAIN_PER_WORKSPACE` | `10` | Number of most-recent terminal snapshots per workspace retained after the retention TTL. |
+| `KONTROL_FS_SNAPSHOT_ORPHAN_GRACE_MS` | `300000` (5 minutes) | Orphan grace window: very new unpinned objects are never reaped within this window, protecting blobs being handed into the review workflow. |
 | `KONTROL_VERIFY_TOOLCHAIN_PATHS` | Comma-separated approved host files/directories mounted read-only into Bubblewrap verification. Use this for nvm/venv/cargo toolchains; an empty value means only the system mounts are available. |
 | `KONTROL_WEBHOOKS` | Set `1` to enable outbound ACP webhooks. Disabled by default. |
 | `KONTROL_WEBHOOK_ALLOWED_HOSTS` | Comma-separated exact webhook destination hostnames. `*` is an explicit opt-in to arbitrary HTTP/HTTPS destinations. |

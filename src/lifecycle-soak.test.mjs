@@ -465,6 +465,18 @@ try {
     return snapshot.maintenance?.cycles >= 8 ? snapshot : null;
   }, 5000, "accelerated maintenance cycles");
   assert.ok(finalDiagnostics.maintenance.cycles >= 8);
+  // Snapshot GC advances in bounded slices rather than blocking the server:
+  // the snapshot-store maintenance stage runs to a completed pass within the
+  // accelerated maintenance cycles above, while the server stayed responsive to
+  // the health probes and the 8 RPC rounds interleaved with those cycles.
+  assert.ok(finalDiagnostics.snapshotStore, "diagnostics must surface the snapshot store after maintenance");
+  assert.ok(
+    typeof finalDiagnostics.snapshotStore.blobs === "number" &&
+      typeof finalDiagnostics.snapshotStore.manifests === "number" &&
+      typeof finalDiagnostics.snapshotStore.orphanEstimate === "number",
+    "snapshot store diagnostics report blob/manifest/orphan counts",
+  );
+  assert.ok(finalDiagnostics.snapshotStore.lastGcCompletedAt, "snapshot GC completed a full pass during the accelerated maintenance cycles");
   assert.equal(finalDiagnostics.mcpSessionMetrics.policyWaiters.activePolicyWaiters, 0);
   assert.equal(finalDiagnostics.mcpSessionMetrics.policyWaiters.pendingApprovalRows, 0);
   assert.equal(finalDiagnostics.mcpSessionMetrics.executionAdmission.activeWeight, 0);

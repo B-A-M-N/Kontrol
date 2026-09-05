@@ -44,6 +44,7 @@ import {
 import { SingleUserOAuthProvider } from "./oauth-provider.js";
 import { ProcessSessionManager, type ProcessSnapshot } from "./process-sessions.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
+import { FilesystemSnapshotStore } from "./filesystem-snapshot-store.js";
 import { getGitEligibility } from "./git.js";
 import { formatPathForPrompt } from "./skills.js";
 import { createWorkspaceStore } from "./workspace-store.js";
@@ -1191,6 +1192,7 @@ function registerCodexProcessTools(
   policyEnforcer?: import("./policy-enforcement.js").PolicyEnforcer,
   policyEngine?: PolicyEngine,
   connectionContext?: ConnectionContext,
+  prepareForMutation?: (workspaceId: string) => Promise<void>,
 ): void {
   registerAppTool(
     server,
@@ -1234,6 +1236,7 @@ function registerCodexProcessTools(
     },
     async ({ workspaceId, cmd, approvalResumeId, tty, columns, rows, workingDirectory, yieldTimeMs, maxOutputTokens }) => {
       const startedAt = performance.now();
+      await prepareForMutation?.(workspaceId);
       const workspace = workspaces.getWorkspace(workspaceId);
       const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
       if (bindingErr) return bindingErr;
@@ -1334,6 +1337,10 @@ function registerCodexProcessTools(
     },
     async ({ workspaceId, sessionId, chars, approvalResumeId, columns, rows, yieldTimeMs, maxOutputTokens }) => {
       const startedAt = performance.now();
+      const hasInput = Boolean(chars && chars.length > 0);
+      // Writing input to a process can mutate the workspace via that process;
+      // gate it behind the baseline like exec_command. Outline-free poll stays fast.
+      if (hasInput) await prepareForMutation?.(workspaceId);
       workspaces.getWorkspace(workspaceId);
       const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
       if (bindingErr) return bindingErr;
@@ -1342,7 +1349,6 @@ function registerCodexProcessTools(
       // run_commands action and must be gated. A poll-only write_stdin (no
       // chars / empty string) cannot alter process state, so it stays a
       // read/wait operation and is not gated.
-      const hasInput = Boolean(chars && chars.length > 0);
       if (hasInput && policyEnforcer && policyEngine) {
         const approved = await enforceToolPolicy(
           workSessions,
@@ -1546,6 +1552,27 @@ function createMcpServer(
       // P1 #25: session tracking is non-critical and must never fail the
       // user's tool call, but persistent audit degradation must be visible.
       recordDegradedAudit("work_session_tool_event", error);
+    }
+  }
+
+  // P0 #3: Centralized mutation preflight. Every mutation-capable tool (write,
+  // edit, apply_patch, exec_command/bash, write_stdin) awaits the workspace's
+  // initial filesystem baseline through this single choke point, so a mutation
+  // can never race the background baseline capture and escape the review
+  // boundary. Reads may proceed immediately.
+  async function prepareForMutation(workspaceId: string): Promise<void> {
+    if (!config.widgets || config.widgets === "off") return;
+    const workspace = workspaces.getWorkspace(workspaceId);
+    try {
+      await reviewCheckpoints.awaitWorkspaceReady({ workspaceId, root: workspace.root });
+    } catch (error) {
+      // A permanently-ineligible workspace (no git, capture failure) must not
+      // silently block mutations; log and let the mutation proceed, since there
+      // is no baseline to race. Real readiness errors surface at open_workspace.
+      logEvent(config.logging, "warn", "checkpoint_ready_barrier_failed", {
+        workspaceId,
+        detail: error instanceof Error ? error.message : String(error),
+      });
     }
   }
 
@@ -1934,6 +1961,7 @@ function createMcpServer(
     },
     async ({ workspaceId, ...input }) => {
       const startedAt = performance.now();
+      await prepareForMutation(workspaceId);
       const workspace = workspaces.getWorkspace(workspaceId);
       const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
       if (bindingErr) return bindingErr;
@@ -2046,6 +2074,7 @@ function createMcpServer(
     },
     async ({ workspaceId, ...input }) => {
       const startedAt = performance.now();
+      await prepareForMutation(workspaceId);
       const workspace = workspaces.getWorkspace(workspaceId);
       const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
       if (bindingErr) return bindingErr;
@@ -2162,6 +2191,7 @@ function createMcpServer(
       },
       async ({ workspaceId, patch, approvalResumeId }) => {
         const startedAt = performance.now();
+        await prepareForMutation(workspaceId);
         const workspace = workspaces.getWorkspace(workspaceId);
         const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
         if (bindingErr) return bindingErr;
@@ -2739,7 +2769,7 @@ function createMcpServer(
   }
 
   if (config.toolMode === "codex") {
-    registerCodexProcessTools(server, config, workspaces, processSessions, workSessions, policyEnforcer, policyEngine, connectionContext);
+    registerCodexProcessTools(server, config, workspaces, processSessions, workSessions, policyEnforcer, policyEngine, connectionContext, prepareForMutation);
   }
 
   // Policy approval tools — available whenever policy engine is configured.
@@ -3544,6 +3574,88 @@ export function createServer(config = loadConfig()): RunningServer {
     pendingMutationReceipts: 0,
   };
 
+  // P0 #2: Durable filesystem snapshot roots held in SQLite. A submitted
+  // snapshot may no longer be a current baseline yet still be required for
+  // approval or immutable mission verification — so GC must root from these
+  // tables, not just from the manifest directory.
+  const collectFsSnapshotDbRoots = (): Array<{ ref: string; terminal?: boolean }> => {
+    if (!db) return [];
+    const roots: Array<{ ref: string; terminal?: boolean }> = [];
+    try {
+      const sqlite = db.sqlite;
+      // work_session_submissions, terminal by owning work_session.status.
+      const submissions = sqlite.prepare(
+        "select wss.snapshot_ref as ref, ws.status as status from work_session_submissions wss left join work_sessions ws on ws.id = wss.work_session_id where wss.snapshot_kind = 'filesystem' and wss.snapshot_ref is not null",
+      ).all() as Array<{ ref?: string; status?: string }>;
+      for (const row of submissions) {
+        if (row.ref) roots.push({ ref: row.ref, terminal: row.status ? terminalWorkSessionStatuses.has(row.status) : undefined });
+      }
+      // mission_evidence, mission_completion_reports: always strong pins.
+      for (const table of ["mission_evidence", "mission_completion_reports"]) {
+        const rows = sqlite.prepare(
+          `select snapshot_ref as ref from ${table} where snapshot_kind = 'filesystem' and snapshot_ref is not null`,
+        ).all() as Array<{ ref?: string }>;
+        for (const row of rows) if (row.ref) roots.push({ ref: row.ref });
+      }
+      // supervisor_runs.last_snapshot_ref.
+      const runs = sqlite.prepare(
+        "select last_snapshot_ref as ref from supervisor_runs where last_snapshot_kind = 'filesystem' and last_snapshot_ref is not null",
+      ).all() as Array<{ ref?: string }>;
+      for (const row of runs) if (row.ref) roots.push({ ref: row.ref });
+    } catch (error) {
+      // A failed DB query must never abort maintenance: report and return an
+      // empty root set so only the manifest/baseline roots are honored.
+      reportMaintenanceFailure("snapshot_gc_db_roots", error);
+    }
+    return roots;
+  };
+
+  const snapshotGcSlice = async (
+    store: FilesystemSnapshotStore,
+    budgetMs: number,
+    pageSize: number,
+  ): Promise<{ result?: unknown; hasMore?: boolean; error?: string }> => {
+    try {
+      const { result, hasMore } = await store.gcSlice({
+        budgetMs,
+        pageSize,
+        listDbSnapshots: collectFsSnapshotDbRoots,
+        dryRun: false,
+      });
+      return { result, hasMore };
+    } catch (error) {
+      return { error: error instanceof Error ? error.message : String(error) };
+    }
+  };
+
+  // P1: Drop workspace-session baseline pins whose key is no longer a
+  // nonterminal work session (terminal or gone). This is what lets GC actually
+  // reclaim the blobs those stale pins were rooting.
+  const pruneStaleSessionBaselines = async (): Promise<void> => {
+    if (!db) return;
+    const store = reviewCheckpoints.getSnapshotStore();
+    try {
+      const rows = db.sqlite.prepare(
+        "select ws.id as work_session_id, ws.status as status, ws.workspace_session_id as wsid from work_sessions ws",
+      ).all() as Array<{ work_session_id: string; status: string; wsid: string }>;
+      const nonterminalByWorkspace = new Map<string, Set<string>>();
+      for (const row of rows) {
+        if (row.status && terminalWorkSessionStatuses.has(row.status)) continue;
+        let set = nonterminalByWorkspace.get(row.wsid);
+        if (!set) {
+          set = new Set();
+          nonterminalByWorkspace.set(row.wsid, set);
+        }
+        set.add(row.work_session_id);
+      }
+      for (const [workspaceId, nonterminal] of nonterminalByWorkspace) {
+        await store.pruneSessionBaselines(workspaceId, nonterminal);
+      }
+    } catch (error) {
+      reportMaintenanceFailure("snapshot_gc_prune_pins", error);
+    }
+  };
+
   const runMaintenanceCycle = (): void => {
     if (maintenanceStopped || maintenanceRunning) return;
     maintenanceRunning = true;
@@ -3557,6 +3669,7 @@ export function createServer(config = loadConfig()): RunningServer {
     let runtimeReconciliationDone = false;
     let approvalExpiryDone = false;
     let mutationReceiptReconciliationDone = false;
+    let snapshotGcDone = false;
 
     const finish = (backlog: boolean): void => {
       const durationMs = Math.round(performance.now() - startedAt);
@@ -3568,7 +3681,7 @@ export function createServer(config = loadConfig()): RunningServer {
       maintenanceRunning = false;
     };
 
-    const step = (): void => {
+    const step = async (): Promise<void> => {
       if (maintenanceStopped) {
         finish(false);
         return;
@@ -3626,6 +3739,31 @@ export function createServer(config = loadConfig()): RunningServer {
             setImmediate(step);
             return;
           }
+        }
+
+        if (!snapshotGcDone) {
+          // P0 #2: Filesystem snapshot reachability GC, bounded by the same
+          // wall-clock budget as the other maintenance classes. One gcSlice is
+          // advanced per yielded step; if it reports more work, the next cycle
+          // resumes (never monopolizing the serving thread).
+          const store = reviewCheckpoints.getSnapshotStore();
+          const slice = await snapshotGcSlice(store, MAINTENANCE_BUDGET_MS, MAINTENANCE_PAGE_SIZE);
+          if (slice.error) {
+            maintenanceStats.lastError = slice.error;
+            reportMaintenanceFailure("snapshot_gc", slice.error);
+            // Advance past the failing GC class so a corrupt store cannot wedge
+            // all future maintenance; it is retried next cycle.
+            snapshotGcDone = true;
+            setImmediate(step);
+            return;
+          }
+          const wasDone = snapshotGcDone;
+          snapshotGcDone = !slice.hasMore;
+          // Once a full GC pass completes, drop stale session baseline pins so
+          // the blobs they rooted become reclaimable.
+          if (!wasDone && snapshotGcDone) await pruneStaleSessionBaselines();
+          setImmediate(step);
+          return;
         }
 
         if (pageIndex >= page.length) {
@@ -4256,7 +4394,37 @@ export function createServer(config = loadConfig()): RunningServer {
   // P1 #23 / P1 #50: Protect /diagnostics — loopback-only AND require an
   // explicit admin credential. Disabled diagnostics are not an accidental
   // unauthenticated information endpoint.
-  app.get("/diagnostics", (req, res) => {
+  // P0 #2: Snapshot store telemetry for /diagnostics. This bug reached 40 GB
+  // because there was no signal that the store was expanding; surface counts,
+  // bytes and GC progress so a runaway store is visible.
+  const snapshotStoreDiagnostics = async (): Promise<Record<string, unknown>> => {
+    try {
+      const store = reviewCheckpoints.getSnapshotStore();
+      const stats = await store.storeStats();
+      const movable = Number(stats.blobBytes) || 0;
+      const reachable = await store.estimateReachableBytes(collectFsSnapshotDbRoots);
+      return {
+        blobs: stats.blobs,
+        blobBytes: stats.blobBytes,
+        manifests: stats.manifests,
+        retainedManifests: reachable.manifests,
+        reachableBlobs: reachable.blobs,
+        reachableBytes: reachable.bytes,
+        orphanEstimate: Math.max(0, stats.blobs - reachable.blobs),
+        orphanBytesEstimate: Math.max(0, movable - reachable.bytes),
+        stagingBytes: stats.stagingBytes,
+        activeCaptures: stats.activeCaptures,
+        lastGcStartedAt: stats.lastGcStartedAt,
+        lastGcCompletedAt: stats.lastGcCompletedAt,
+        lastGcReclaimedBlobs: stats.lastGcReclaimedBlobs,
+        lastGcReclaimedBytes: stats.lastGcReclaimedBytes,
+      };
+    } catch (error) {
+      return { error: error instanceof Error ? error.message : String(error) };
+    }
+  };
+
+  app.get("/diagnostics", async (req, res) => {
     const ip = requestIp(req, config.logging.trustProxy) || "";
     if (ip && !ip.startsWith("127.") && !ip.startsWith("::1") && ip !== "::ffff:127.0.0.1") {
       return res.status(403).json({ ok: false, error: "Forbidden: diagnostics is loopback-only" });
@@ -4449,6 +4617,7 @@ export function createServer(config = loadConfig()): RunningServer {
         startupRecovery,
         databaseIntegrity,
         maintenance: { ...maintenanceStats },
+        snapshotStore: await snapshotStoreDiagnostics(),
         generation: generationRecord,
         supervisor: supervisorStatus,
         heapUsed: memUsage.heapUsed,
@@ -5418,6 +5587,10 @@ export function createServer(config = loadConfig()): RunningServer {
     closed = true;
     startupRecoveryStopped = true;
     maintenanceStopped = true;
+    // P0 #4: Drain in-flight filesystem capture transactions before exit. A
+    // graceful stop finishes active publishes and clears their staging; a hard
+    // kill is covered by the durable transaction journal on next startup.
+    await reviewCheckpoints.drain().catch(() => undefined);
     dispatcher?.stop();
     supervisorRuntime?.stop();
     supervisorRuns.close();
