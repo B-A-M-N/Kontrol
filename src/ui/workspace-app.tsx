@@ -35,6 +35,28 @@ import {
 } from "./approval-attention.js";
 import type { ReviewFile } from "../review-submission.js";
 import {
+  type AgentActivityEvent,
+  type AgentMessageView,
+  type FeedbackState,
+  type MissionPacketView,
+  type PolicyApprovalView,
+  type PendingApprovalRecord,
+  type ReviewSubmissionView,
+  type WorkSessionViewState,
+} from "./session-view-types.js";
+// P1.4: the view-state types moved to session-view-types.ts; re-exported so
+// existing `from "./workspace-app.js"` importers keep working.
+export type {
+  AgentActivityEvent,
+  AgentMessageView,
+  FeedbackState,
+  MissionPacketView,
+  PolicyApprovalView,
+  PendingApprovalRecord,
+  ReviewSubmissionView,
+  WorkSessionViewState,
+} from "./session-view-types.js";
+import {
   agentIcon,
   checkCircleIcon,
   editIcon,
@@ -62,6 +84,13 @@ import { formatElapsed, humanizeStatus } from "./ui-format.js";
 import { approvalCenterId, isApprovalCenterId } from "./approval-center.js";
 import { relativeSessionAge, sessionCategory } from "./session-view-helpers.js";
 import {
+  compareSubmissionAuthority,
+  ensureWorkSessionView,
+  mergePendingApproval,
+  noteSubmission,
+  workSessionViews,
+} from "./session-views.js";
+import {
   AmbiguousMutationError,
   cardFromMeta,
   callServerToolChecked,
@@ -83,145 +112,6 @@ interface MountedPayload {
 // A run is a long-lived workflow, not a succession of unrelated single cards.
 // Each delegated task owns a WorkSessionViewState that composes the run header,
 // the live activity timeline, and the current review submission + feedback.
-
-interface AgentActivityEvent {
-  seq: number;
-  id: string;
-  durable?: boolean;
-  type: string;
-  sessionId: string;
-  workspaceSessionId?: string;
-  payload: Record<string, unknown>;
-  createdAt: string;
-}
-
-type ReviewSubmissionView = {
-  submissionId: string;
-  sessionId: string;
-  submissionNumber: number;
-  reviewEpoch?: number;
-  status: string;
-  diffSha256?: string;
-  patch: string;
-  files: ReviewFile[];
-  fileCount: number;
-  additions: number;
-  removals: number;
-  message?: string;
-  createdAt?: string;
-};
-
-interface PolicyApprovalView {
-  approvalId: string;
-  workspaceId?: string;
-  workSessionId?: string;
-  kind?: string;
-  title?: string;
-  description?: string;
-  risk?: string;
-  tool: string;
-  path?: string;
-  command?: string;
-  approvalKey?: string;
-  matchedPattern?: string;
-  origin?: "direct_mcp" | "work_session";
-  conversationId?: string;
-  orphanedAt?: string;
-  reattachDeadline?: string;
-  liveWaiterCount?: number;
-  requestedAt?: string;
-  createdAt?: string;
-  expiresAt?: string;
-  options?: Array<{
-    id: string;
-    label: string;
-    effect: "approve" | "deny" | "changes_requested";
-    scope?: "once" | "work_session" | "workspace";
-  }>;
-  uiState?: "idle" | "submitting" | "resolved" | "error" | "outcome_unknown";
-  error?: string;
-}
-
-interface PendingApprovalRecord {
-  approvalId: string;
-  workspaceId?: string;
-  workspaceSessionId?: string;
-  workSessionId?: string;
-  kind?: string;
-  title?: string;
-  description?: string;
-  risk?: string;
-  tool?: string;
-  path?: string;
-  command?: string;
-  options?: PolicyApprovalView["options"];
-  origin?: PolicyApprovalView["origin"];
-  conversationId?: string;
-  orphanedAt?: string;
-  reattachDeadline?: string;
-  liveWaiterCount?: number;
-  requestedAt?: string;
-  createdAt?: string;
-  expiresAt?: string;
-}
-
-interface AgentMessageView {
-  messageId: string;
-  kind: string;
-  author?: string;
-  title?: string;
-  body?: string;
-  status: string;
-  runId?: string;
-  createdAt?: string;
-}
-
-interface MissionPacketView {
-  supervisor?: { id: string; status: string; resumeStatus?: string | null; revision: number; cycleNumber: number; maxCycles: number; autonomyMode: string; approvalMode: string; repeatedFailureCount?: number; repeatedFailureFingerprintLimit?: number; stagnantCycleCount?: number; progressJson?: string | null; stallReason?: string | null; updatedAt?: string; deadlineAt?: string; lastError?: string };
-  mission?: { id: string; objective: string; desiredOutcome?: string; correctionRounds?: number; maxCorrectionRounds?: number };
-  criteria: Array<{ id: string; description: string; priority: string; status: string; verificationType?: string; verificationCommand?: string; dependsOnCriterionIds?: string[] }>;
-  findings: Array<{ id: string; description: string; severity: string; scope: string; status: string; requiredAction?: string }>;
-  workOrders: Array<{ id: string; objectiveForThisTurn: string; status: string }>;
-  evidence: Array<{ id: string; criterionId?: string; status: string; source?: string; command?: string }>;
-  completionReports?: Array<{ id: string; status: string; reportSha256: string; createdAt: string }>;
-  approval: { allowed: boolean; reasons: string[] };
-}
-
-type FeedbackState = "idle" | "submitting" | "submitted" | "error" | "outcome_unknown";
-
-export interface WorkSessionViewState {
-  workspaceSessionId: string;
-  workSessionId: string;
-  runId: string;
-  title?: string;
-  submittedBy?: string;
-  status: string;
-  updatedAt?: string;
-  lastHeartbeatAt?: string;
-  lifecycle?: string;
-  runtimeState?: string;
-  unresolvedMessageCount: number;
-  pendingApprovalCount: number;
-  lastSeq: number;
-  activity: AgentActivityEvent[];
-  submissions: Map<string, ReviewSubmissionView>;
-  policyApprovals: Map<string, PolicyApprovalView>;
-  /** Open agent→WebUI questions/blockers awaiting a reviewer reply. */
-  openMessages: Map<string, AgentMessageView>;
-  activeSubmissionId?: string;
-  feedbackStateBySubmission: Map<string, FeedbackState>;
-  feedbackErrorBySubmission: Map<string, string>;
-  feedbackMessage?: string;
-  latestFeedback?: { id: string; submissionId?: string; verdict: string; comments?: string; reviewerId?: string };
-  notice?: {
-    tone: "error" | "warning" | "success" | "info";
-    message: string;
-    action?: { label: string; run: () => void };
-  };
-  mission?: MissionPacketView;
-  missionLoading?: boolean;
-  missionError?: string;
-}
 
 interface WorkspaceSurfaceSession {
   sessionId: string;
@@ -264,7 +154,6 @@ let hostContext: HostContext | undefined;
 
 // Durable UI state.
 let activeWorkspaceId: string | null = null;
-const workSessionViews = new Map<string, WorkSessionViewState>();
 const snapshotHydrations = new Map<string, Promise<void>>();
 let selectedWorkSessionId: string | null = null;
 // P0.3: the surface the reviewer was on before a direct approval pulled them
@@ -1130,71 +1019,6 @@ async function refreshMission(view: WorkSessionViewState): Promise<void> {
   }
 }
 
-function ensureWorkSessionView(workSessionId: string, workspaceSessionId: string, runId: string): WorkSessionViewState {
-  let view = workSessionViews.get(workSessionId);
-  if (!view) {
-    view = {
-      workspaceSessionId,
-      workSessionId,
-      runId,
-      status: "in_progress",
-      lastSeq: 0,
-      unresolvedMessageCount: 0,
-      pendingApprovalCount: 0,
-      activity: [],
-      submissions: new Map(),
-      policyApprovals: new Map(),
-      openMessages: new Map(),
-      feedbackStateBySubmission: new Map(),
-      feedbackErrorBySubmission: new Map(),
-    };
-    workSessionViews.set(workSessionId, view);
-  } else {
-    if (workspaceSessionId) view.workspaceSessionId = workspaceSessionId;
-    if (runId) view.runId = runId;
-  }
-  return view;
-}
-
-/** Keep submission selection monotonic across overlapping event, snapshot, and
- * detail-fetch responses. Review epoch is the primary authority; submission
- * number breaks ties within an epoch. */
-function noteSubmission(view: WorkSessionViewState, submission: ReviewSubmissionView): void {
-  const existing = view.submissions.get(submission.submissionId);
-  if (!existing || compareSubmissionAuthority(submission, existing) >= 0) {
-    view.submissions.set(submission.submissionId, submission);
-  }
-  const active = view.activeSubmissionId ? view.submissions.get(view.activeSubmissionId) : undefined;
-  if (!active || compareSubmissionAuthority(submission, active) >= 0) {
-    view.activeSubmissionId = submission.submissionId;
-  }
-}
-
-function mergePendingApproval(view: WorkSessionViewState, approval: PendingApprovalRecord, fallbackWorkspaceId: string): void {
-  view.policyApprovals.set(approval.approvalId, {
-    approvalId: approval.approvalId,
-    workspaceId: approval.workspaceId ?? approval.workspaceSessionId ?? fallbackWorkspaceId,
-    workSessionId: approval.workSessionId,
-    kind: approval.kind,
-    title: approval.title,
-    description: approval.description,
-    risk: approval.risk,
-    tool: approval.tool ?? "tool",
-    path: approval.path,
-    command: approval.command,
-    options: approval.options,
-    origin: approval.origin,
-    conversationId: approval.conversationId,
-    orphanedAt: approval.orphanedAt,
-    reattachDeadline: approval.reattachDeadline,
-    liveWaiterCount: approval.liveWaiterCount,
-    requestedAt: approval.requestedAt,
-    createdAt: approval.createdAt,
-    expiresAt: approval.expiresAt,
-  });
-  view.pendingApprovalCount = view.policyApprovals.size;
-}
-
 function applyHostContext(): void {
   if (hostContext?.theme) applyDocumentTheme(hostContext.theme);
   if (hostContext?.styles?.variables) {
@@ -1238,17 +1062,6 @@ function isLiveAgentSession(view: WorkSessionViewState): boolean {
     && Number.isFinite(heartbeatAge)
     && heartbeatAge >= 0
     && heartbeatAge <= 45_000;
-}
-
-function compareSubmissionAuthority(
-  left: Pick<ReviewSubmissionView, "submissionNumber" | "reviewEpoch">,
-  right: Pick<ReviewSubmissionView, "submissionNumber" | "reviewEpoch">,
-): number {
-  if (left.reviewEpoch !== undefined && right.reviewEpoch !== undefined) {
-    return left.reviewEpoch - right.reviewEpoch || left.submissionNumber - right.submissionNumber;
-  }
-  return left.submissionNumber - right.submissionNumber
-    || (left.reviewEpoch === undefined ? 0 : 1) - (right.reviewEpoch === undefined ? 0 : 1);
 }
 
 function renderNow(): void {
