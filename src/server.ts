@@ -469,7 +469,6 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
   // P2: Warn about low reuse using a rolling rate, not only a raw creation
   // count. A client creating one session per tool call is operationally
   // different from a healthy reusable session that happens to be busy.
-  let dbSizeBytes = 0;
   const mcpSessionChurnTimer = setInterval(() => {
     const window = sessionWindowMetrics(60_000);
     if (window.sessionsCreated > 10 || (window.toolCalls > 0 && window.sessionsPerToolCall >= 0.75)) {
