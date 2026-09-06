@@ -61,6 +61,13 @@ import {
 import { formatElapsed, humanizeStatus } from "./ui-format.js";
 import { approvalCenterId, isApprovalCenterId } from "./approval-center.js";
 import { relativeSessionAge, sessionCategory } from "./session-view-helpers.js";
+import {
+  AmbiguousMutationError,
+  cardFromMeta,
+  callServerToolChecked,
+  getStructuredContent,
+  setServerToolHost,
+} from "./server-tool-call.js";
 
 interface MountedPayload {
   update(options: {
@@ -416,6 +423,11 @@ async function boot(): Promise<void> {
 
 async function bootInternal(): Promise<void> {
   render();
+
+  setServerToolHost({
+    getApp: () => app,
+    reconnect: (reason) => reconnectApp(reason),
+  });
 
   app = uiTestAppFactory?.() ?? new App(
       { name: "kontrol-tool-cards", version: "0.4.0" },
@@ -3244,98 +3256,10 @@ function setPayloadLoading(container: HTMLElement, loading: boolean): void {
   if (button) button.setAttribute("aria-busy", String(loading));
 }
 
-type ServerToolRequest = Parameters<App["callServerTool"]>[0];
-
-export class AmbiguousMutationError extends Error {
-  readonly operation: string;
-
-  constructor(operation: string, cause?: unknown) {
-    super(`The ${operation} mutation may have committed, but its response was lost. Refresh authoritative state before retrying.`);
-    this.name = "AmbiguousMutationError";
-    this.operation = operation;
-    if (cause !== undefined) this.cause = cause;
-  }
-}
-
-type ServerToolRetryMode = "safe" | "reconcile" | "never";
-interface ServerToolCallOptions { retry?: ServerToolRetryMode }
-
-const SAFE_RETRY_TOOLS = new Set([
-  "get_workspace_session_surface",
-  "list_pending_approvals",
-  "get_work_session_snapshot",
-  "get_review_submission",
-  "inspect_supervised_work",
-  "await_workspace_events",
-]);
-
-const RECONCILE_ONLY_TOOLS = new Set([
-  "resolve_agent_message",
-  "redrive_supervisor_run",
-  "run_mission_verification",
-  "continue_supervised_work",
-  "submit_to_coding_agent",
-  "pause_supervisor_run",
-  "resume_supervisor_run",
-  "provide_review_feedback",
-  "approve_supervised_work",
-  "provide_policy_approval",
-]);
-
-const NEVER_RETRY_TOOLS = new Set([
-  "cancel_work_session",
-]);
-
-function retryModeForServerTool(name: string, explicit?: ServerToolRetryMode): ServerToolRetryMode {
-  if (explicit) return explicit;
-  if (SAFE_RETRY_TOOLS.has(name)) return "safe";
-  if (RECONCILE_ONLY_TOOLS.has(name)) return "reconcile";
-  if (NEVER_RETRY_TOOLS.has(name)) return "never";
-  return "never";
-}
-
-async function callServerToolChecked(request: ServerToolRequest, options: ServerToolCallOptions = {}): Promise<CallToolResult> {
-  if (!app) throw new Error("The MCP host connection is unavailable.");
-  let result: CallToolResult;
-  try {
-    result = await app.callServerTool(request);
-  } catch (transportError) {
-    // A transient host/tunnel failure should get one deterministic reconnect
-    // and rehydration attempt before the caller sees a permanent error.
-    const retryMode = retryModeForServerTool(String(request.name), options.retry);
-    try {
-      await reconnectApp(transportError);
-    } catch (reconnectError) {
-      if (retryMode !== "safe") throw new AmbiguousMutationError(String(request.name), reconnectError);
-      throw reconnectError;
-    }
-    if (!app) {
-      if (retryMode !== "safe") throw new AmbiguousMutationError(String(request.name), transportError);
-      throw transportError;
-    }
-    if (retryMode !== "safe") {
-      throw new AmbiguousMutationError(String(request.name), transportError);
-    }
-    result = await app.callServerTool(request);
-  }
-  if (!result.isError) return result;
-  const message = result.content
-    .filter((block): block is { type: "text"; text: string } => block.type === "text")
-    .map((block) => block.text)
-    .join("\n")
-    .trim();
-  throw new Error(message || "The server rejected the tool call.");
-}
-
-function cardFromMeta(result: CallToolResult): Partial<ToolResultCard> | undefined {
-  const meta = result._meta as Record<string, unknown> | undefined;
-  const metaCard = meta?.card;
-  return metaCard && typeof metaCard === "object" ? metaCard : undefined;
-}
-
-function getStructuredContent<T>(result: CallToolResult): T | undefined {
-  return result.structuredContent as T | undefined;
-}
+// P1.4: AmbiguousMutationError moved to server-tool-call.ts; re-exported so
+// the established `import("./workspace-app.js")` test/client surface keeps
+// working unchanged.
+export { AmbiguousMutationError } from "./server-tool-call.js";
 
 // Kept behind an explicit global test switch so jsdom can exercise the same
 // incremental workspace surface without opening an MCP transport. Production
