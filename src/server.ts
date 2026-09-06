@@ -103,473 +103,57 @@ import { isPathInsideRoot } from "./roots.js";
  * 2. cgroup memory limit (container ceiling), when readable
  * 3. total system memory
  */
-function resolveMcpMemoryBudget(explicitBytes?: number): number {
-  // P0.3: explicit config override first; no ambient process.env read here.
-  if (explicitBytes !== undefined && explicitBytes > 0) return explicitBytes;
-  try {
-    const cgroupLimit = Number(readFileSync("/sys/fs/cgroup/memory.max", "utf8").trim());
-    if (Number.isFinite(cgroupLimit) && cgroupLimit > 0) return cgroupLimit;
-  } catch {
-    // Not a cgroup-v2 container — fall through to total memory.
-  }
-  try {
-    return os.totalmem();
-  } catch {
-    return 2_000_000_000;
-  }
-}
+import {
+  handleMcpRequestWithDeadline,
+  McpAdmission,
+  McpAdmissionUnavailableError,
+  mcpAdmissionWeight,
+  McpExecutionTimeoutError,
+  mcpRequestHasExecutionDeadline,
+} from "./server/mcp-admission.js";
+import {
+  ACP_HTTP_BODY_LIMIT_BYTES,
+  MCP_HTTP_BODY_LIMIT_BYTES,
+} from "./server/mcp-session-state.js";
+import {
+  authenticatedAcpBodyGate,
+  conversationId,
+  logicalClientId,
+  logicalClientIdentity,
+  mcpSessionLabel,
+  rejectOversizedBody,
+  resolveMcpMemoryBudget,
+  sendJsonRpcError,
+  setAssetHeaders,
+  type McpPolicyWaiter,
+  type McpSessionClientMetrics,
+  type McpSessionMetrics,
+  type McpSessionState,
+  type McpSessionWindowKind,
+  type McpTimingSample,
+  type PhaseTimingSample,
+  type RunningServer,
+  uiBuildDirectory,
+  type WorkspaceAppResourceMetrics,
+} from "./server/mcp-session-state.js";
+// P1.2 decomposition: admission classes/weights/queue live in
+// src/server/mcp-admission.ts; session-state types, identity derivation, and
+// body gates live in src/server/mcp-session-state.ts. Re-export the public
+// names so existing importers of ./server.js keep working unchanged.
+export {
+  ACP_HTTP_BODY_LIMIT_BYTES,
+  authenticatedAcpBodyGate,
+  MCP_HTTP_BODY_LIMIT_BYTES,
+  rejectOversizedBody,
+  sendJsonRpcError,
+} from "./server/mcp-session-state.js";
+export {
+  McpAdmission,
+  McpAdmissionUnavailableError,
+  McpExecutionTimeoutError,
+} from "./server/mcp-admission.js";
+export { type RunningServer } from "./server/mcp-session-state.js";
 
-
-interface McpSessionState {
-  sessionId: string;
-  sessionLabel: string;
-  logicalClientId: string;
-  identitySource: "instance_header" | "conversation" | "oauth" | "client_info_fallback";
-  authenticatedRole: "worker" | "reviewer" | "client";
-  authSource: "oauth" | "reviewer_token" | "worker_token" | "tunnel_reviewer" | "anonymous";
-  conversationId?: string;
-  approvalCorrelationId?: string;
-  createdAt: number;
-  /** Any request/stream activity, including protocol heartbeats and SSE. */
-  lastTransportActivityAt: number;
-  /** Meaningful MCP application traffic used by idle policy. */
-  lastApplicationActivityAt: number;
-  inFlightRequests: number;
-  requestCount: number;
-  notificationCount: number;
-  toolCallCount: number;
-  resourceReadCount: number;
-  activeLongPollCount: number;
-  activeSseStreams: number;
-  activePolicyWaiters: number;
-  closing: boolean;
-  closed: boolean;
-  endRecorded: boolean;
-  durableWorkerSession: boolean;
-  lastRpcMethod?: string;
-  lastToolName?: string;
-}
-
-interface McpPolicyWaiter {
-  id: string;
-  approvalId: string;
-  waiterKey: string;
-  principalId: string;
-  workspaceId: string;
-  workSessionId?: string;
-  tool: string;
-  mcpSessionId?: string;
-  mcpRequestId?: string;
-  startedAt: number;
-  signal: AbortSignal;
-  cancel: () => void;
-}
-
-type McpSessionWindowKind = "created" | "closed" | "expired" | "tool";
-
-interface McpSessionClientMetrics {
-  sessionsCreated: number;
-  currentSessions: number;
-  sessionsClosed: number;
-  sessionsExpired: number;
-  zeroToolSessions: number;
-  singleToolSessions: number;
-  multiToolSessions: number;
-  totalToolCalls: number;
-  totalLifetimeMs: number;
-  oldestIdleMs: number;
-}
-
-interface McpSessionMetrics {
-  created: number;
-  evicted: number;
-  closed: number;
-  expired: number;
-  inFlight: number;
-  clients: Map<string, McpSessionClientMetrics>;
-  windowEvents: Array<{ at: number; kind: McpSessionWindowKind }>;
-  completedToolCounts: number[];
-}
-
-interface McpTimingSample {
-  at: number;
-  admissionClass: "execution" | "waiter" | "stream";
-  admissionWaitMs: number;
-  serverCreateMs: number;
-  transportConnectMs: number;
-  handlerMs: number;
-  totalMs: number;
-}
-
-interface PhaseTimingSample {
-  at: number;
-  phase: string;
-  durationMs: number;
-}
-
-interface WorkspaceAppResourceMetrics {
-  currentHashed: number;
-  openAiCompatibility: number;
-  legacyKontrol: number;
-  devDesktopMigration: number;
-  servedTotal: number;
-  lastDurationMs: number;
-  maxDurationMs: number;
-}
-
-
-/** Explicit route-level HTTP body caps. These are deliberately finite: MCP
- * writes/patches need more than Express's default 100 KB, while ACP events
- * must remain smaller than the final-result protocol budget plus envelope. */
-export const MCP_HTTP_BODY_LIMIT_BYTES = 8 * 1024 * 1024;
-export const ACP_HTTP_BODY_LIMIT_BYTES = 4 * 1024 * 1024;
-
-function rejectOversizedBody(limitBytes: number, protocol: "mcp" | "acp") {
-  return (req: Request, res: Response, next: NextFunction): void => {
-    const rawLength = req.header("content-length");
-    const contentLength = rawLength === undefined ? undefined : Number(rawLength);
-    if (contentLength !== undefined && (!Number.isSafeInteger(contentLength) || contentLength < 0)) {
-      if (protocol === "mcp") sendJsonRpcError(res, 400, -32700, "Invalid Content-Length");
-      else res.status(400).json({ error: { code: "invalid_request", message: "Invalid Content-Length" } });
-      return;
-    }
-    if (contentLength !== undefined && contentLength > limitBytes) {
-      res.setHeader("Connection", "close");
-      if (protocol === "mcp") sendJsonRpcError(res, 413, -32013, `Request body exceeds ${limitBytes} bytes`);
-      else res.status(413).json({ error: { code: "request_too_large", message: `Request body exceeds ${limitBytes} bytes` } });
-      return;
-    }
-    next();
-  };
-}
-
-function authenticatedAcpBodyGate(config: ServerConfig) {
-  return (req: Request, res: Response, next: NextFunction): void => {
-    const presented = req.headers.authorization ?? "";
-    // Timing-safe comparison for every configured role secret. First-match
-    // wins, so secrets must be distinct (enforced by config validation).
-    const matches =
-      (config.acpAgentSecret && constantTimeStringEqual(presented, `Bearer ${config.acpAgentSecret}`)) ||
-      (config.acpReviewerSecret && constantTimeStringEqual(presented, `Bearer ${config.acpReviewerSecret}`)) ||
-      (config.acpSharedSecret && constantTimeStringEqual(presented, `Bearer ${config.acpSharedSecret}`));
-    if (!matches) {
-      res.status(401).json({ error: { code: "unauthorized", message: "Missing or invalid authorization" } });
-      return;
-    }
-    next();
-  };
-}
-
-interface RunningServer {
-  app: Express;
-  config: ServerConfig;
-  dispatcher?: ContinuationDispatcher;
-  close(): Promise<void>;
-  drain(): Promise<void>;
-}
-
-
-function logicalClientIdentity(req: Request): { id: string; source: McpSessionState["identitySource"] } {
-  // Reconnectable interactive ownership partitions an ALREADY-AUTHENTICATED
-  // principal by conversation. A conversation value never broadens
-  // authorization: it only narrows which transports share one logical owner,
-  // so two conversations of the same client cannot touch each other's direct
-  // processes or reattach to each other's pending approvals.
-  const suppliedConversation = conversationId(req);
-  if (req.auth?.clientId) {
-    return suppliedConversation
-      ? { id: `oauth:${req.auth.clientId}|conversation:${suppliedConversation}`, source: "oauth" }
-      : { id: `oauth:${req.auth.clientId}`, source: "oauth" };
-  }
-  const supplied = req.header("x-kontrol-client-instance")?.trim();
-  if (supplied) {
-    return suppliedConversation
-      ? { id: `instance:${supplied.slice(0, 200)}|conversation:${suppliedConversation}`, source: "instance_header" }
-      : { id: `instance:${supplied.slice(0, 200)}`, source: "instance_header" };
-  }
-  if (suppliedConversation) return { id: `conversation:${suppliedConversation}`, source: "conversation" };
-  const clientInfo = (req.body as { params?: { clientInfo?: { name?: unknown; version?: unknown } } } | undefined)
-    ?.params?.clientInfo;
-  const name = typeof clientInfo?.name === "string" ? clientInfo.name : "unknown";
-  const version = typeof clientInfo?.version === "string" ? clientInfo.version : "unknown";
-  return { id: `mcp:${name.slice(0, 100)}@${version.slice(0, 100)}`, source: "client_info_fallback" };
-}
-
-function logicalClientId(req: Request): string {
-  return logicalClientIdentity(req).id;
-}
-
-// MCP does not standardize a conversation identifier. If a trusted
-// deployment forwards one, retain it for diagnostics/labeling only. Never use
-// this value to pool transports or grant access; the MCP session ID remains the
-// isolation boundary.
-function conversationId(req: Request): string | undefined {
-  const value = req.header("x-kontrol-conversation-id")?.trim()
-    || req.header("x-openai-conversation-id")?.trim();
-  return value ? value.slice(0, 200) : undefined;
-}
-
-function mcpSessionLabel(logicalClientIdValue: string, sessionId: string, conversationIdValue?: string): string {
-  const owner = conversationIdValue ? `conversation:${conversationIdValue}` : logicalClientIdValue;
-  return `${owner}/mcp:${sessionIdPrefix(sessionId)}`;
-}
-
-interface McpAdmissionWaiter {
-  key: string;
-  weight: number;
-  resolve: (release: (() => void) | null) => void;
-  timer?: NodeJS.Timeout;
-  signal?: AbortSignal;
-  onAbort?: () => void;
-  settled: boolean;
-}
-
-function mcpAdmissionWeight(rpcMethod: string | undefined, toolName: string | undefined): number {
-  if (rpcMethod !== "tools/call") return 1;
-  if (toolName === "show_changes" || toolName === "run_mission_verification") return 4;
-  if (toolName === "grep" || toolName === "glob" || toolName === "find" || toolName === "list_pending_reviews") return 2;
-  if (toolName === "bash" || toolName === "exec_command" || toolName === "write_stdin" || toolName === "write" || toolName === "edit" || toolName === "apply_patch") return 3;
-  return 1;
-}
-
-// These calls either own their own process/mission lifecycle or deliberately
-// park until a human/event arrives. A generic HTTP execution deadline would
-// strand the operation while its durable state still says it is running.
-const MCP_UNBOUNDED_TOOL_NAMES = new Set([
-  "await_review_feedback",
-  "await_work_session_events",
-  "await_work_session_terminal",
-  "await_workspace_events",
-  "bash",
-  "exec_command",
-  "write_stdin",
-  "write",
-  "edit",
-  "apply_patch",
-  "submit_to_coding_agent",
-  "call_acp_agent",
-  "begin_supervised_work",
-  "run_mission_verification",
-  "provide_policy_approval",
-]);
-
-function mcpRequestHasExecutionDeadline(rpcMethod: string | undefined, toolName: string | undefined): boolean {
-  return rpcMethod !== "tools/call" || !MCP_UNBOUNDED_TOOL_NAMES.has(toolName ?? "");
-}
-
-class McpExecutionTimeoutError extends Error {
-  constructor(public readonly timeoutMs: number) {
-    super(`MCP request exceeded the ${timeoutMs}ms execution deadline`);
-    this.name = "McpExecutionTimeoutError";
-  }
-}
-
-class McpAdmissionUnavailableError extends Error {
-  constructor() {
-    super("MCP execution capacity was unavailable after policy approval");
-    this.name = "McpAdmissionUnavailableError";
-  }
-}
-
-async function handleMcpRequestWithDeadline(
-  transport: Transport,
-  req: Request,
-  res: Response,
-  body: unknown,
-  timeoutMs: number,
-): Promise<void> {
-  const handler = transport.handleRequest(req, res, body);
-  // The MCP SDK does not expose cancellation for an in-flight handler. Keep
-  // its rejection observed, then close the transport on timeout so the caller
-  // can reconnect instead of leaving a dead HTTP request and retained session.
-  void handler.catch(() => undefined);
-  let timer: NodeJS.Timeout | undefined;
-  try {
-    await Promise.race([
-      handler,
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new McpExecutionTimeoutError(timeoutMs)), timeoutMs);
-      }),
-    ]);
-  } catch (error) {
-    if (error instanceof McpExecutionTimeoutError) {
-      try {
-        await Promise.race([
-          Promise.resolve(transport.close()),
-          new Promise<void>((resolve) => setTimeout(resolve, 1_000)),
-        ]);
-      } catch {
-        // The transport is already considered unusable after a deadline.
-      }
-    }
-    throw error;
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
-}
-
-/**
- * Bounded request admission for the MCP HTTP hop. Session caps protect the
- * transport map; this queue protects the process from an unbounded number of
- * expensive tool calls and long polls running at once.
- */
-export class McpAdmission {
-  private active = 0;
-  private activeWeight = 0;
-  private readonly activeByKey = new Map<string, number>();
-  private readonly queue: McpAdmissionWaiter[] = [];
-  private closed = false;
-
-  constructor(
-    private readonly maxInflight: number,
-    private readonly maxInflightPerKey: number,
-    private readonly maxQueue: number,
-  ) {
-    if (!Number.isInteger(maxInflight) || maxInflight < 1) throw new Error("maxInflight must be positive");
-    if (!Number.isInteger(maxInflightPerKey) || maxInflightPerKey < 1) throw new Error("maxInflightPerKey must be positive");
-    if (!Number.isInteger(maxQueue) || maxQueue < 0) throw new Error("maxQueue must be non-negative");
-  }
-
-  getStats(): { active: number; activeWeight: number; availableWeight: number; queued: number; maxInflight: number; maxInflightPerKey: number; maxQueue: number } {
-    return {
-      active: this.active,
-      activeWeight: this.activeWeight,
-      availableWeight: Math.max(0, this.maxInflight - this.activeWeight),
-      queued: this.queue.length,
-      maxInflight: this.maxInflight,
-      maxInflightPerKey: this.maxInflightPerKey,
-      maxQueue: this.maxQueue,
-    };
-  }
-
-  acquire(key: string, waitDeadlineMs: number, weight = 1, signal?: AbortSignal): Promise<(() => void) | null> {
-    if (this.closed) return Promise.resolve(null);
-    if (!Number.isInteger(weight) || weight < 1 || weight > this.maxInflight || weight > this.maxInflightPerKey) return Promise.resolve(null);
-    if (signal?.aborted) return Promise.resolve(null);
-    if (this.canAdmit(key, weight)) return Promise.resolve(this.grant(key, weight));
-    if (this.queue.length >= this.maxQueue) return Promise.resolve(null);
-
-    return new Promise((resolve) => {
-      const waiter: McpAdmissionWaiter = {
-        key,
-        weight,
-        resolve,
-        signal,
-        settled: false,
-      };
-      const settle = (release: (() => void) | null) => {
-        if (waiter.settled) return;
-        waiter.settled = true;
-        if (waiter.timer) clearTimeout(waiter.timer);
-        if (waiter.signal && waiter.onAbort) waiter.signal.removeEventListener("abort", waiter.onAbort);
-        resolve(release);
-      };
-      const removeAndCancel = () => {
-        const index = this.queue.indexOf(waiter);
-        if (index >= 0) this.queue.splice(index, 1);
-        settle(null);
-      };
-      waiter.onAbort = removeAndCancel;
-      waiter.timer = setTimeout(() => {
-          removeAndCancel();
-        }, Math.max(1, waitDeadlineMs));
-      if (signal) {
-        signal.addEventListener("abort", waiter.onAbort, { once: true });
-        if (signal.aborted) {
-          removeAndCancel();
-          return;
-        }
-      }
-      if (this.closed) {
-        removeAndCancel();
-        return;
-      }
-      this.queue.push(waiter);
-    });
-  }
-
-  close(): void {
-    this.closed = true;
-    while (this.queue.length > 0) {
-      const waiter = this.queue.shift()!;
-      if (waiter.settled) continue;
-      waiter.settled = true;
-      if (waiter.timer) clearTimeout(waiter.timer);
-      if (waiter.signal && waiter.onAbort) waiter.signal.removeEventListener("abort", waiter.onAbort);
-      waiter.resolve(null);
-    }
-  }
-
-  private canAdmit(key: string, weight: number): boolean {
-    return this.activeWeight + weight <= this.maxInflight && (this.activeByKey.get(key) ?? 0) + weight <= this.maxInflightPerKey;
-  }
-
-  private grant(key: string, weight: number): () => void {
-    this.active++;
-    this.activeWeight += weight;
-    this.activeByKey.set(key, (this.activeByKey.get(key) ?? 0) + weight);
-    let released = false;
-    return () => {
-      if (released) return;
-      released = true;
-      this.active = Math.max(0, this.active - 1);
-      this.activeWeight = Math.max(0, this.activeWeight - weight);
-      const count = (this.activeByKey.get(key) ?? weight) - weight;
-      if (count > 0) this.activeByKey.set(key, count);
-      else this.activeByKey.delete(key);
-      this.drain();
-    };
-  }
-
-  private drain(): void {
-    if (this.closed) return;
-    for (let i = 0; i < this.queue.length; i++) {
-      const waiter = this.queue[i];
-      if (waiter.settled) {
-        this.queue.splice(i, 1);
-        i--;
-        continue;
-      }
-      if (!this.canAdmit(waiter.key, waiter.weight)) continue;
-      this.queue.splice(i, 1);
-      i--;
-      waiter.settled = true;
-      if (waiter.timer) clearTimeout(waiter.timer);
-      if (waiter.signal && waiter.onAbort) waiter.signal.removeEventListener("abort", waiter.onAbort);
-      waiter.resolve(this.grant(waiter.key, waiter.weight));
-    }
-  }
-}
-
-
-function sendJsonRpcError(
-  res: Response,
-  status: number,
-  code: number,
-  message: string,
-): void {
-  res.status(status).json({
-    jsonrpc: "2.0",
-    error: { code, message },
-    id: null,
-  });
-}
-
-
-function uiBuildDirectory(): string {
-  const moduleDirectory = dirname(fileURLToPath(import.meta.url));
-  const localDirectory = join(moduleDirectory, "ui");
-  return statSync(localDirectory, { throwIfNoEntry: false })?.isDirectory()
-    ? localDirectory
-    : join(process.cwd(), "dist", "ui");
-}
-
-function setAssetHeaders(res: Response): void {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Range");
-  res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
-}
 
 export function createServer(config = loadConfig(), deploymentContext: DeploymentContext = resolveDeploymentContext()): RunningServer {
   // P0.3: module-level defaults are injected from parsed config, never read
