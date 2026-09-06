@@ -43,16 +43,16 @@ interface ActiveVerifier {
 const activeVerifiers = new Map<ChildProcess, ActiveVerifier>();
 
 function sandboxRequested(input?: { sandbox?: boolean }): boolean {
-  // P1 #22: injected flag first; env fallback for standalone callers.
-  if (input?.sandbox !== undefined) return input.sandbox;
-  return process.env.KONTROL_VERIFY_SANDBOX === "1" || process.env.KONTROL_VERIFY_SANDBOX === "true";
+  // P1 #22/P0.3: injected flag only. Callers pass the config-parsed value;
+  // no ambient process.env fallback inside implementation code.
+  return input?.sandbox === true;
 }
 
-function sandboxExecutable(): string {
+function sandboxExecutable(configuredPath?: string): string {
   if (process.platform !== "linux") {
     throw new Error("Verification sandbox requested, but this host has no supported sandbox primitive.");
   }
-  for (const candidate of [process.env.KONTROL_BWRAP, "/usr/bin/bwrap", "/bin/bwrap"]) {
+  for (const candidate of [configuredPath, "/usr/bin/bwrap", "/bin/bwrap"]) {
     if (candidate && existsSync(candidate)) return candidate;
   }
   throw new Error("Verification sandbox requested, but bubblewrap is unavailable; refusing unsandboxed execution.");
@@ -64,8 +64,9 @@ function sandboxArguments(
   cwd: string,
   environment: Record<string, string>,
   toolchainPaths: string[] = [],
+  sandboxExecutablePath?: string,
 ): { command: string; args: string[] } {
-  const bwrap = sandboxExecutable();
+  const bwrap = sandboxExecutable(sandboxExecutablePath);
   const envArgs = Object.entries(environment).flatMap(([key, value]) => ["--setenv", key, value]);
   return {
     command: bwrap,
@@ -157,12 +158,6 @@ function parseDetails(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null ? value as Record<string, unknown> : {};
 }
 
-function parsePositiveInteger(value: string | undefined, fallback: number): number {
-  if (!value) return fallback;
-  const parsed = Number(value);
-  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
-}
-
 function pathMatchesAffectedArea(path: string, area: string): boolean {
   const normalizedPath = path.replace(/^\.\//, "");
   const normalizedArea = area.trim().replace(/^\.\//, "").replace(/^a\//, "").replace(/^b\//, "");
@@ -180,6 +175,7 @@ export async function runVerificationCommand(
   sandbox?: boolean,
   childEnvironmentAllowlist?: string[],
   toolchainPaths?: string[],
+  sandboxExecutablePath?: string,
 ): Promise<Omit<VerificationResult, "criterionId" | "command">> {
   const { executable, args } = parseVerificationCommand(command);
   const startedAt = Date.now();
@@ -200,7 +196,7 @@ export async function runVerificationCommand(
   const sandboxEnabled = sandboxRequested({ sandbox });
   const environment = buildChildEnvironment({ sandbox: sandboxEnabled, additionalKeys: childEnvironmentAllowlist });
   const launch = sandboxEnabled
-    ? sandboxArguments(executable, args, cwd, environment, toolchainPaths)
+    ? sandboxArguments(executable, args, cwd, environment, toolchainPaths, sandboxExecutablePath)
     : { command: executable, args };
   return new Promise((resolve) => {
     const child = spawn(launch.command, launch.args, {
@@ -385,6 +381,8 @@ export async function verifyMissionSubmission(input: {
   sandbox?: boolean;
   childEnvironmentAllowlist?: string[];
   verifyToolchainPaths?: string[];
+  /** P0.3: config-parsed bubblewrap path; no ambient env reads here. */
+  sandboxExecutablePath?: string;
   /** Submission identity captured by the caller before dispatching verification. */
   submissionId?: string;
   reviewEpoch?: number;
@@ -496,8 +494,8 @@ export async function verifyMissionSubmission(input: {
   let bindingLost = false;
   const sandboxEnabled = sandboxRequested({ sandbox: input.sandbox });
   const environment = buildChildEnvironment({ sandbox: sandboxEnabled });
-  // P1 #22: injected configuration; env fallback for standalone callers.
-  const maxVerificationInflight = input.maxInflight ?? parsePositiveInteger(process.env.KONTROL_VERIFY_MAX_INFLIGHT, 3);
+  // P1 #22/P0.3: injected configuration only; no ambient process.env fallback.
+  const maxVerificationInflight = input.maxInflight ?? 3;
   const statuses = new Map<string, VerificationResult["status"]>();
   const remaining = new Map(criteria.map((criterion) => [criterion.id, criterion]));
   const packetCriterionById = new Map(packet.criteria.map((criterion) => [criterion.id, criterion]));
@@ -548,7 +546,7 @@ export async function verifyMissionSubmission(input: {
           source: "reused_exact_snapshot",
         };
       } else {
-        result = await runVerificationCommand(command, verificationWorkspace.root, 300_000, deadlineAtMs, sandboxEnabled, input.childEnvironmentAllowlist, input.verifyToolchainPaths);
+        result = await runVerificationCommand(command, verificationWorkspace.root, 300_000, deadlineAtMs, sandboxEnabled, input.childEnvironmentAllowlist, input.verifyToolchainPaths, input.sandboxExecutablePath);
       }
       await assertBinding();
       return recordResult(criterion, result);
@@ -614,7 +612,7 @@ export async function verifyMissionSubmission(input: {
             source: "reused_exact_snapshot",
           };
         } else {
-          result = await runVerificationCommand(command, verificationWorkspace.root, 300_000, deadlineAtMs, sandboxEnabled, input.childEnvironmentAllowlist, input.verifyToolchainPaths);
+          result = await runVerificationCommand(command, verificationWorkspace.root, 300_000, deadlineAtMs, sandboxEnabled, input.childEnvironmentAllowlist, input.verifyToolchainPaths, input.sandboxExecutablePath);
         }
         await assertBinding();
       }

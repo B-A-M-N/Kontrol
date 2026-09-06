@@ -122,8 +122,7 @@ try {
     const poolRun = runs.create({ missionId, workSessionId, workspaceSessionId: "ws_supervisor", autonomyMode: "verify_only" });
     assert.ok(runs.transition({ id: poolRun.id, expectedStatus: "created", expectedRevision: poolRun.revision, nextStatus: "worker_active" }));
   }
-  const previousMaxInflight = process.env.KONTROL_SUPERVISOR_MAX_INFLIGHT;
-  process.env.KONTROL_SUPERVISOR_MAX_INFLIGHT = "2";
+  // P0.3: the bound is injected explicitly — no ambient env authority.
   let releaseA!: () => void;
   let releaseB!: () => void;
   let releaseC!: () => void;
@@ -136,6 +135,7 @@ try {
   let maxObserved = 0;
   const poolRuntime = createSupervisorRuntime({
     outbox, events, runs,
+    maxInflight: 2,
     onVerify: async (workSessionId) => {
       activePool.add(workSessionId);
       maxObserved = Math.max(maxObserved, activePool.size);
@@ -165,8 +165,6 @@ try {
   releaseC();
   await waitFor(() => activePool.size === 0);
   poolRuntime.stop();
-  if (previousMaxInflight === undefined) delete process.env.KONTROL_SUPERVISOR_MAX_INFLIGHT;
-  else process.env.KONTROL_SUPERVISOR_MAX_INFLIGHT = previousMaxInflight;
   assert.equal(maxObserved, 2, "supervisor pool should honor its configured bound");
   assert.deepEqual(poolSessions.map((id) => runs.getByWorkSession(id)?.status), ["awaiting_human", "awaiting_human", "awaiting_human"]);
 

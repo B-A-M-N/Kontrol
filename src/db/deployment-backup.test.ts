@@ -33,13 +33,14 @@ function createPreMigrationDatabase(stateDir: string, version: number) {
 // B-only table represents work performed after migration but before readiness.
 const actual = mkdtempSync(join(tmpdir(), "kontrol-db-actual-ab-"));
 const actualDeploymentId = "actual-ab-deployment";
-const previousExpectedSchema = process.env.KONTROL_EXPECTED_SCHEMA_VERSION;
-const previousDeploymentId = process.env.KONTROL_DEPLOYMENT_ID;
 try {
   createPreMigrationDatabase(actual, LATEST_SCHEMA_VERSION - 1);
-  process.env.KONTROL_EXPECTED_SCHEMA_VERSION = String(LATEST_SCHEMA_VERSION);
-  process.env.KONTROL_DEPLOYMENT_ID = actualDeploymentId;
-  const candidate = openDatabase(actual);
+  // P0.3: deployment identity is passed explicitly — the DB layer no longer
+  // consumes ambient environment authority.
+  const candidate = openDatabase(actual, {
+    deploymentId: actualDeploymentId,
+    expectedSchemaVersion: LATEST_SCHEMA_VERSION,
+  });
   candidate.sqlite.exec("create table candidate_only_after_migration (id text primary key not null)");
   candidate.close();
   const journal = readDeploymentMigrationRecord(actual, actualDeploymentId);
@@ -69,10 +70,6 @@ try {
     recoveredA.close();
   }
 } finally {
-  if (previousExpectedSchema === undefined) delete process.env.KONTROL_EXPECTED_SCHEMA_VERSION;
-  else process.env.KONTROL_EXPECTED_SCHEMA_VERSION = previousExpectedSchema;
-  if (previousDeploymentId === undefined) delete process.env.KONTROL_DEPLOYMENT_ID;
-  else process.env.KONTROL_DEPLOYMENT_ID = previousDeploymentId;
   rmSync(actual, { recursive: true, force: true });
 }
 console.log("deployment-backup: real A(schema 49) -> B(schema 50) migration rollback passed");

@@ -16,6 +16,7 @@ import {
   type WriteToolInput,
   type AgentToolResult,
 } from "@earendil-works/pi-coding-agent";
+import { buildChildEnvironment } from "./process-environment.js";
 import { resolveAllowedPath, resolveAllowedPathCanonical } from "./roots.js";
 
 type McpContent = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
@@ -29,6 +30,12 @@ interface ToolContext {
   cwd: string;
   root: string;
   readRoots?: string[];
+  /**
+   * Extra environment variable names a workspace may pass through to child
+   * processes.  Sensitive keys are filtered unconditionally by
+   * `buildChildEnvironment`, so this can only widen, never deepen, access.
+   */
+  childEnvironmentAllowlist?: string[];
 }
 
 function toMcpContent(result: AgentToolResult<unknown>): McpContent[] {
@@ -119,7 +126,16 @@ export async function listDirectoryTool(input: LsToolInput, context: ToolContext
 }
 
 export async function runShellTool(input: BashToolInput, context: ToolContext): Promise<ToolResponse> {
-  const tool = createBashTool(context.cwd);
+  // Shell output is project-controlled, so it must never observe the server
+  // environment wholesale — replace it with the sanitized child environment.
+  // The hook ignores Pi's inherited `env` entirely rather than trusting it.
+  const shellEnvironment = buildChildEnvironment({
+    additionalKeys: context.childEnvironmentAllowlist,
+  });
+  const tool = createBashTool(context.cwd, {
+    exposeSessionEnvironment: false,
+    spawnHook: ({ command, cwd }) => ({ command, cwd, env: shellEnvironment }),
+  });
   const timeout = input.timeout === undefined ? 30 : Math.min(input.timeout, 300);
 
   return runTool((params) => tool.execute("run_shell", params), {

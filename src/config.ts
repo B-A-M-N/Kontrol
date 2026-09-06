@@ -58,7 +58,28 @@ export interface ServerConfig {
   supervisorMaxInflight: number;
   verifyMaxInflight: number;
   verifySandbox: boolean;
+  /** P0.3: explicit MCP memory budget override in bytes (optional). */
+  mcpMemoryBudgetBytes?: number;
+  /** P0.3: database integrity monitor self-test delay (test hook, ms). */
+  integrityTestDelayMs?: number;
+  /** P0.3: ACP dispatch handshake window in ms (optional override). */
+  acpDispatchTimeoutMs?: number;
+  /** P0.3: explicit bubblewrap path; never read from process.env in depth. */
+  verifySandboxExecutable?: string;
   childEnvironmentAllowlist: string[];
+  /**
+   * P0.3: launcher-provided build identity, parsed once here at the config
+   * boundary. Deep implementation code reads this field instead of touching
+   * process.env.
+   */
+  expectedBuildId?: string;
+  /**
+   * P0.5: explicit operator escape hatch. When true, mutations proceed even
+   * when the review checkpoint backend is unavailable (untracked mutations).
+   * Default false — fail closed. Automatic fallback is never acceptable for
+   * a review-safe boundary; this must be set deliberately by the operator.
+   */
+  allowUntrackedMutation: boolean;
   /** P1 #14: process-session resource controls (all optional, validated). */
   processMaxRunning?: number;
   processMaxRunningPerOwner?: number;
@@ -535,7 +556,27 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     supervisorMaxInflight: parsePositiveInteger(env.KONTROL_SUPERVISOR_MAX_INFLIGHT, 4, "KONTROL_SUPERVISOR_MAX_INFLIGHT"),
     verifyMaxInflight: parsePositiveInteger(env.KONTROL_VERIFY_MAX_INFLIGHT, 3, "KONTROL_VERIFY_MAX_INFLIGHT"),
     verifySandbox: env.KONTROL_VERIFY_SANDBOX === "1" || env.KONTROL_VERIFY_SANDBOX === "true",
+    // P0.3: deployment-identity-adjacent numeric knobs parsed once here.
+    mcpMemoryBudgetBytes: (() => {
+      const value = Number(env.KONTROL_MCP_MEMORY_BUDGET_BYTES);
+      return Number.isFinite(value) && value > 0 ? value : undefined;
+    })(),
+    integrityTestDelayMs: (() => {
+      const value = Number(env.KONTROL_INTEGRITY_TEST_DELAY_MS);
+      return Number.isFinite(value) && value > 0 ? value : undefined;
+    })(),
+    acpDispatchTimeoutMs: (() => {
+      const value = Number(env.KONTROL_ACP_DISPATCH_TIMEOUT_MS);
+      return Number.isSafeInteger(value) && value > 0 ? value : undefined;
+    })(),
+    // P0.3: parsed at the config boundary only.
+    verifySandboxExecutable: env.KONTROL_BWRAP?.trim() || undefined,
     childEnvironmentAllowlist: parseEnvironmentAllowlist(env.KONTROL_CHILD_ENV_ALLOWLIST),
+    // P0.3: parsed once at the config boundary; never re-read downstream.
+    expectedBuildId: env.KONTROL_BUILD_ID?.trim() || undefined,
+    // P0.5: fail closed by default; only an explicit operator opt-in permits
+    // untracked mutation when the checkpoint backend is unavailable.
+    allowUntrackedMutation: parseBoolean(env.KONTROL_ALLOW_UNTRACKED_MUTATION),
     // P1 #14: process-session resource controls, parsed/validated centrally.
     processMaxRunning: parseOptionalPositiveInteger(env.KONTROL_PROCESS_MAX_RUNNING, "KONTROL_PROCESS_MAX_RUNNING"),
     processMaxRunningPerOwner: parseOptionalPositiveInteger(env.KONTROL_PROCESS_MAX_RUNNING_PER_OWNER, "KONTROL_PROCESS_MAX_RUNNING_PER_OWNER"),

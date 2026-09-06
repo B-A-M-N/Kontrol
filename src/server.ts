@@ -69,6 +69,7 @@ import { registerBridgeTools, createContinuationDispatcher, type ContinuationDis
 import { createEventStore } from "./event-log.js";
 import { createContinuationManager } from "./continuation.js";
 import { createDispatchOutbox } from "./dispatch-outbox.js";
+import { setDefaultAcpTimeout } from "./acp-gateway.js";
 import { createSupervisorRuns } from "./supervisor-runs.js";
 import { createSupervisorRuntime } from "./supervisor-runtime.js";
 import { shutdownMissionVerifiers, verifyMissionSubmission } from "./mission-verifier.js";
@@ -89,6 +90,7 @@ import { createMutationReceiptStore, type MutationReceiptStore } from "./mutatio
 import { DEVDESKTOP_WORKSPACE_APP_URI, LEGACY_WORKSPACE_APP_URI, OPENAI_WORKSPACE_APP_URI, WORKSPACE_APP_BUILD_ID, WORKSPACE_APP_HTML, WORKSPACE_APP_URI, workspaceAppResourceKind, workspaceAppResourceMeta, workspaceAppToolMeta } from "./workspace-app-resource.js";
 import { createRuntimeIdentityRecord, readBuildIdentity, readRuntimeIdentity, removeRuntimeIdentity, writeRuntimeIdentity } from "./runtime-identity.js";
 import { acquireRuntimeLock, assertRuntimeLock, releaseRuntimeLock, runtimeLockPath, type RuntimeLockHandle } from "./runtime-lock.js";
+import { resolveDeploymentContext, type DeploymentContext } from "./runtime-context.js";
 import { mcpSessionIdleReason, mcpSessionIdleTtl } from "./mcp-session-policy.js";
 import { LogicalContinuityIndex } from "./mcp-logical-continuity.js";
 import { installCachedToolList, toolListCacheDiagnostics } from "./mcp-tool-list-cache.js";
@@ -101,9 +103,9 @@ import { isPathInsideRoot } from "./roots.js";
  * 2. cgroup memory limit (container ceiling), when readable
  * 3. total system memory
  */
-function resolveMcpMemoryBudget(): number {
-  const explicit = Number(process.env.KONTROL_MCP_MEMORY_BUDGET_BYTES);
-  if (Number.isFinite(explicit) && explicit > 0) return explicit;
+function resolveMcpMemoryBudget(explicitBytes?: number): number {
+  // P0.3: explicit config override first; no ambient process.env read here.
+  if (explicitBytes !== undefined && explicitBytes > 0) return explicitBytes;
   try {
     const cgroupLimit = Number(readFileSync("/sys/fs/cgroup/memory.max", "utf8").trim());
     if (Number.isFinite(cgroupLimit) && cgroupLimit > 0) return cgroupLimit;
@@ -569,7 +571,10 @@ function setAssetHeaders(res: Response): void {
   res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
 }
 
-export function createServer(config = loadConfig()): RunningServer {
+export function createServer(config = loadConfig(), deploymentContext: DeploymentContext = resolveDeploymentContext()): RunningServer {
+  // P0.3: module-level defaults are injected from parsed config, never read
+  // from process.env at import time.
+  setDefaultAcpTimeout(config.acpDispatchTimeoutMs);
   // P0 #9: the ACP surface requires at least one role credential. The legacy
   // shared secret is compatibility-only: when it is the sole credential (or
   // when it doubles as the operator ingress), warn — it carries broad
@@ -1055,7 +1060,7 @@ export function createServer(config = loadConfig()): RunningServer {
     // P1 #24: configurable deployment budget instead of a magic 2 GB. Prefer
     // an explicit KONTROL_MCP_MEMORY_BUDGET_BYTES; otherwise use a fraction
     // of the container/host ceiling when cgroup limits expose one.
-    const rssLimit = resolveMcpMemoryBudget();
+    const rssLimit = resolveMcpMemoryBudget(config.mcpMemoryBudgetBytes);
     if (totalRss > rssLimit * 0.8) {
       return { level: "high" as const, effectiveHardCap: Math.min(config.mcpSessionHardCap, 100), effectiveSoftCap: Math.min(config.mcpSessionSoftCap, 75) };
     }
@@ -1278,7 +1283,12 @@ export function createServer(config = loadConfig()): RunningServer {
   }
   // ONE shared DB handle for every manager + the review workflow service, so the
   // workflow can commit state + event log in a SINGLE transaction (P1 #15).
-  const db: DatabaseHandle = openDatabase(config.stateDir);
+  // P0.3: deployment identity flows from the entrypoint-resolved context via
+  // config — the DB layer never reads process.env.
+  const db: DatabaseHandle = openDatabase(config.stateDir, {
+    deploymentId: deploymentContext.deploymentId,
+    expectedSchemaVersion: deploymentContext.expectedSchemaVersion,
+  });
   const mutationReceipts = createMutationReceiptStore(db);
   const workspaceStore = createWorkspaceStore(db);
   const workspaces = new WorkspaceRegistry(config, workspaceStore);
@@ -1974,7 +1984,9 @@ export function createServer(config = loadConfig()): RunningServer {
       res.json({
         ok: true,
         name: "kontrol",
-        build: buildMeta ?? process.env.KONTROL_BUILD_ID ?? "dev",
+        // P0.3: build identity comes from the resolved deployment context,
+        // never from an ambient process.env read inside a route handler.
+        build: buildMeta ?? config.expectedBuildId ?? "dev",
         buildMeta,
         schema: schemaVersion,
         schemaExpected: LATEST_SCHEMA_VERSION,
@@ -2828,6 +2840,9 @@ export function createServer(config = loadConfig()): RunningServer {
       outbox: dispatchOutbox,
       events: eventStore,
       runs: supervisorRuns,
+      // P0.3: config-injected; the env fallback inside supervisor-runtime is
+      // then dead for server paths.
+      maxInflight: config.supervisorMaxInflight,
       onVerify: async (workSessionId, deadlineAt, submission) => {
         await verifyMissionSubmission({
           workSessionId,
@@ -2835,6 +2850,7 @@ export function createServer(config = loadConfig()): RunningServer {
           sandbox: config.verifySandbox,
           childEnvironmentAllowlist: config.childEnvironmentAllowlist,
           verifyToolchainPaths: config.verifyToolchainPaths,
+          sandboxExecutablePath: config.verifySandboxExecutable,
           missionLedger,
           workSessions,
           workspaces,
@@ -3029,13 +3045,17 @@ async function isMainModule(): Promise<boolean> {
 }
 
 export async function runServer(config = loadConfig()): Promise<void> {
+  // P0.3: deployment/runtime authority is resolved ONCE here, at the process
+  // entrypoint, and passed explicitly downstream. Implementation code no
+  // longer reads these fields from process.env.
+  const deploymentContext = resolveDeploymentContext();
   const buildMeta = readBuildIdentity(join(dirname(fileURLToPath(import.meta.url)), "build-meta.json"));
   const inheritedLockToken = process.env.KONTROL_RUNTIME_LOCK_TOKEN;
   const runtimeLock: RuntimeLockHandle = inheritedLockToken
     ? { path: runtimeLockPath(config.stateDir), record: assertRuntimeLock(config.stateDir, inheritedLockToken) }
     : await acquireRuntimeLock(config.stateDir, {
-      launcher: (process.env.KONTROL_LAUNCHER as "systemd" | "dev-watch" | "serve" | undefined) ?? "serve",
-      generationId: process.env.KONTROL_LAUNCH_GENERATION_ID,
+      launcher: deploymentContext.launcher ?? "serve",
+      generationId: deploymentContext.launchGenerationId,
       buildId: buildMeta.buildId,
       artifactPath: dirname(fileURLToPath(import.meta.url)),
       port: config.port,
@@ -3043,7 +3063,7 @@ export async function runServer(config = loadConfig()): Promise<void> {
   const ownsRuntimeLock = !inheritedLockToken;
   let serverResources: ReturnType<typeof createServer>;
   try {
-    serverResources = createServer(config);
+    serverResources = createServer(config, deploymentContext);
   } catch (error) {
     if (ownsRuntimeLock) await releaseRuntimeLock(runtimeLock);
     throw error;
