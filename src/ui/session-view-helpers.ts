@@ -27,3 +27,18 @@ export function relativeSessionAge(value: string): string {
   if (ageMs < 60 * 60_000) return `${Math.round(ageMs / 60_000)}m ago`;
   return `${Math.round(ageMs / (60 * 60_000))}h ago`;
 }
+
+export function isLiveAgentSession(view: WorkSessionViewState): boolean {
+  // A recent heartbeat alone is not proof that a worker still owns the live
+  // lease. Review, queued, and parked states are intentionally reported as a
+  // last heartbeat even when their underlying process has not exited yet.
+  const activeStatuses = new Set(["in_progress", "resuming"]);
+  const activeLifecycles = new Set(["running", "in_progress", "resuming"]);
+  const heartbeatAge = view.lastHeartbeatAt ? Date.now() - Date.parse(view.lastHeartbeatAt) : Number.POSITIVE_INFINITY;
+  return activeStatuses.has(view.status)
+    && (!view.lifecycle || activeLifecycles.has(view.lifecycle))
+    && view.runtimeState === "running"
+    && Number.isFinite(heartbeatAge)
+    && heartbeatAge >= 0
+    && heartbeatAge <= 45_000;
+}

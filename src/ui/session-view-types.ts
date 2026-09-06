@@ -173,3 +173,34 @@ export interface WorkspaceSurfaceSession {
   };
   latestFeedback?: { id: string; submissionId?: string; verdict: string; comments?: string; reviewerId?: string };
 }
+
+export interface WorkSessionDom {
+  workSessionId: string;
+  main: HTMLElement;
+  sessionSwitcher: HTMLElement;
+  section: HTMLElement;
+  titleStatus: HTMLElement;
+  statusBadge: HTMLElement;
+  meta: HTMLElement;
+  notice: HTMLElement;
+  mission: HTMLElement;
+  messages: HTMLElement;
+  messageKey?: string;
+  activity: HTMLUListElement;
+  activitySeqs: Set<number>;
+  approvals: HTMLElement;
+  review: HTMLElement;
+  reviewTitle: HTMLElement;
+  reviewPayload: HTMLElement;
+  reviewFeedback: HTMLElement;
+  reviewFeedbackKey?: string;
+}
+
+export interface LegacyReviewDom {
+  key: string;
+  main: HTMLElement;
+  body: HTMLElement;
+  actions: HTMLElement;
+  feedback: HTMLElement;
+  feedbackKey?: string;
+}
