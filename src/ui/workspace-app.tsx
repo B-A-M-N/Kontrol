@@ -98,6 +98,13 @@ import {
   unmountPayload,
 } from "./payload-mount.js";
 import {
+  connectWithRetry,
+  reconnectApp,
+  renderApprovalCenterView,
+  renderWorkspaceApprovalGate,
+  setLifecycleHost,
+} from "./connection-lifecycle.js";
+import {
   maybeAppendAgentBar,
   maybeRestoreAfterApprovalResolved,
   renderChevron,
@@ -282,7 +289,35 @@ const uiTestAppFactory = (globalThis as {
   __KONTROL_UI_TEST_APP_FACTORY__?: UiTestAppFactory;
 }).__KONTROL_UI_TEST_APP_FACTORY__;
 
-// Host bindings are installed at module scope, not inside boot(): the
+setLifecycleHost({
+    app: () => app,
+    isConnected: () => connected,
+    connectApp: async () => {
+      if (!app) throw new Error("The MCP host connection is unavailable.");
+      await app.connect();
+    },
+    getHostContext: () => hostContext,
+    setHostContext: (v) => { hostContext = v as HostContext | undefined; },
+    applyHostContext,
+    setConnected: (v) => { connected = v; },
+    connectionState: () => connectionState,
+    setConnectionState: (v) => { connectionState = v as ConnectionState; },
+    getConnectionError: () => connectionError,
+    setConnectionError: (v) => { connectionError = v; },
+    bumpWorkspaceWatcherGeneration: () => { workspaceWatcherGeneration += 1; },
+    getActiveWorkspaceId: () => activeWorkspaceId,
+    approvalRecoveryState: () => approvalRecoveryState,
+    setApprovalRecoveryState: (v) => { approvalRecoveryState = v; },
+    queueSessionRehydration,
+    scheduleRender: () => scheduleRender(),
+    selectWorkSession,
+    replaceSurfaceChildren: (...children) => { appRoot.replaceChildren(...children); },
+    maybeAppendAgentBar,
+    renderEmpty,
+    getErrorMessage: () => errorMessage,
+  });
+
+  // Host bindings are installed at module scope, not inside boot(): the
 // DOM test harness (and any uiTestMode embedder) drives render/reducer paths
 // directly without booting a transport.
   setServerToolHost({
@@ -557,56 +592,6 @@ async function bootInternal(): Promise<void> {
   render();
 }
 
-async function connectWithRetry(reason?: unknown): Promise<void> {
-  let retryDelayMs = 1_000;
-  while (app && !connected) {
-    connectionState = retryDelayMs === 1_000 && !reason ? "CONNECTING" : "RECONNECTING";
-    render();
-    try {
-      await app.connect();
-      const initialContext = app.getHostContext();
-      if (initialContext) hostContext = initialContext;
-      applyHostContext();
-      connected = true;
-      connectionState = "CONNECTED";
-      connectionError = null;
-      // Rehydrate any sessions that were already live before this WebUI
-      // (re)loaded. The same path is used after a transport reconnect.
-      queueSessionRehydration();
-      return;
-    } catch (connectErrorValue) {
-      connectionState = "RECONNECTING";
-      connectionError = connectErrorValue instanceof Error
-        ? connectErrorValue.message
-        : String(connectErrorValue);
-      render();
-      const jitter = Math.floor(Math.random() * Math.min(500, retryDelayMs / 2));
-      await new Promise((resolve) => setTimeout(resolve, retryDelayMs + jitter));
-      retryDelayMs = Math.min(30_000, retryDelayMs * 2);
-      reason = undefined;
-    }
-  }
-  throw new Error("The MCP host connection is unavailable.");
-}
-
-async function reconnectApp(reason: unknown): Promise<void> {
-  if (reconnectPromise) return reconnectPromise;
-  reconnectPromise = (async () => {
-    if (!app) throw new Error("The MCP host connection is unavailable.");
-    connected = false;
-    workspaceWatcherGeneration += 1;
-    await connectWithRetry(reason);
-  })().finally(() => {
-    reconnectPromise = null;
-  });
-  return reconnectPromise;
-}
-
-/**
- * Make a workspace the active projection target: drop selections that belong
- * to another workspace, and restart the event watcher generation so the
- * durable cursor is rebuilt for the new workspace.
- */
 function activateWorkspace(newWorkspaceId: string): void {
   if (activeWorkspaceId !== newWorkspaceId) {
     activeWorkspaceId = newWorkspaceId;
@@ -809,92 +794,12 @@ function renderConnectionError(message: string): void {
   maybeAppendAgentBar();
 }
 
-function renderApprovalCenterView(view: WorkSessionViewState): void {
-  // P0.5: only the active workspace's approval center can render. A center
-  // selected under another workspace falls back to the gated empty surface
-  // instead of leaking that workspace's direct approvals.
-  if (view.workSessionId !== approvalCenterId(activeWorkspaceId)) {
-    if (renderWorkspaceApprovalGate()) return;
-    renderEmpty(errorMessage ?? "Waiting for a tool result.", errorMessage ? "error" : "muted");
-    return;
-  }
-  ensureSurface("approval-center");
-  const main = element("main", { className: "shell" });
-  const section = element("section", { className: "tool-card agent" });
-  section.append(
-    element("div", { className: "tool-title", text: "Workspace approvals" }),
-    element("div", { className: "tool-label", text: `${view.policyApprovals.size} pending direct MCP operation(s)` }),
-  );
-  if (view.policyApprovals.size === 0 && approvalRecoveryState === "healthy") {
-    section.append(element("div", { className: "empty muted", text: "No pending approvals." }));
-  } else if (view.policyApprovals.size === 0) {
-    section.append(element("div", { className: "empty muted", text: "No pending approvals." }));
-    section.append(renderApprovalRecoveryIndicator());
-  } else {
-    const list = element("div", { className: "approval-list" });
-    for (const approval of view.policyApprovals.values()) list.append(renderPolicyApproval(view, approval));
-    section.append(list);
-    if (approvalRecoveryState !== "healthy") section.append(renderApprovalRecoveryIndicator());
-  }
-  main.append(section);
-  appRoot.replaceChildren(main);
-  maybeAppendAgentBar();
-}
-
-/** P1: explicit approval-recovery health indicator with a manual retry. */
-function renderApprovalRecoveryIndicator(): HTMLElement {
-  const indicator = element("div", { className: "session-notice warning", role: "status" });
-  const message = approvalRecoveryState === "forbidden"
-    ? "Reviewer authorization failed: approval recovery is unavailable."
-    : approvalRecoveryState === "disconnected"
-      ? "Approval recovery unavailable: the host connection is down."
-      : "Approval recovery unavailable: pending approvals may be stale.";
-  indicator.append(element("span", { text: message }));
-  const retry = element("button", { className: "notice-action", type: "button", text: "Retry" });
-  retry.addEventListener("click", () => {
-    approvalRecoveryState = "healthy";
-    queueSessionRehydration();
-    scheduleRender();
-  });
-  indicator.append(retry);
-  return indicator;
-}
-
-/**
- * P0.3: prominent "Needs approval" banner shown in every current Kontrol
- * surface while a direct approval for the active workspace is pending but
- * not currently displayed. Returns true when the banner was rendered into a
- * standalone gated surface.
- */
-function renderWorkspaceApprovalGate(): boolean {
-  const center = activeWorkspaceId ? workSessionViews.get(approvalCenterId(activeWorkspaceId)) : undefined;
-  if (!activeWorkspaceId || !center || center.policyApprovals.size === 0) return false;
-  const main = element("main", { className: "shell" });
-  const section = element("section", { className: "session-notice warning approval-gate", role: "alert" });
-  const review = element("button", {
-    className: "notice-action approval-gate-action",
-    type: "button",
-    text: `Needs approval — ${center.policyApprovals.size} pending operation${center.policyApprovals.size === 1 ? "" : "s"}`,
-    ariaLabel: "Open workspace approvals",
-  });
-  review.addEventListener("click", () => selectWorkSession(center.workSessionId));
-  section.append(
-    element("span", { className: "approval-gate-message", text: "A direct MCP operation is blocked and waiting for your decision." }),
-    review,
-  );
-  main.append(section);
-  appRoot.replaceChildren(main);
-  maybeAppendAgentBar();
-  return true;
-}
-
-// ── Composed work-session view ───────────────────────
-
-export { AmbiguousMutationError } from "./server-tool-call.js";
 
 // Kept behind an explicit global test switch so jsdom can exercise the same
 // incremental workspace surface without opening an MCP transport. Production
 // boot remains side-effectful only in the browser entrypoint above.
+export { AmbiguousMutationError } from "./server-tool-call.js";
+
 export const __workspaceAppTest = {
   ensureWorkSessionView,
   renderWorkSessionView,
