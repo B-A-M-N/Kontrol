@@ -47,6 +47,7 @@ import { FilesystemSnapshotStore } from "./filesystem-snapshot-store.js";
 import { createMaintenanceCoordinator } from "./runtime/maintenance.js";
 import { createDatabaseIntegrityMonitor } from "./runtime/database-integrity.js";
 import { createStartupReconciliation } from "./server/startup-recovery.js";
+import { createShutdownController } from "./server/shutdown.js";
 import {
   constantTimeStringEqual,
   createMcpServer,
@@ -908,78 +909,39 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     supervisorRuntime.start();
   }
 
-  let closed = false;
-  let draining: Promise<void> | undefined;
-  const closeTransport = async (transport: Transport): Promise<void> => {
-    try {
-      await Promise.race([
-        Promise.resolve(transport.close()),
-        new Promise<void>((resolve) => setTimeout(resolve, 2_000)),
-      ]);
-    } catch {
-      // A transport that rejects during drain is already unusable; continue
-      // closing the rest of the generation.
-    }
-  };
-  const finalizeClose = async (): Promise<void> => {
-    if (closed) return;
-    closed = true;
-    startupReconciliation.stop();
-    maintenance.stop();
-    // P0 #4: Drain in-flight filesystem capture transactions before exit. A
-    // graceful stop finishes active publishes and clears their staging; a hard
-    // kill is covered by the durable transaction journal on next startup.
-    await reviewCheckpoints.drain().catch(() => undefined);
-    dispatcher?.stop();
-    supervisorRuntime?.stop();
-    supervisorRuns.close();
-    mcpAdmission.close();
-    mcpWaiterAdmission.close();
-    clearInterval(sessionLifecycle.reaper);
-    clearInterval(sessionLifecycle.memorySampler);
-    clearInterval(mcpSessionChurnTimer);
-    const shutdownAt = Date.now();
-    for (const state of mcpSessions.values()) {
-      state.closing = true;
-      recordMcpSessionEnd(state, "server_shutdown", shutdownAt);
-    }
-    await Promise.all([...transports.values()].map(closeTransport));
-    transports.clear();
-    mcpSessions.clear();
-    await shutdownMissionVerifiers();
-    eventStore.close();
-    continuationManager.close();
-    dispatchOutbox.close();
-    await processSessions.shutdown();
-    await agentRegistry.drain?.();
-    oauthProvider?.close();
-    workspaceStore.close?.();
-    workSessions?.close?.();
-    agentRegistry.close();
-    await integrity.stop();
-    try { db.close(); } catch { /* ignore */ }
-  };
+  const shutdown = createShutdownController({
+    config,
+    db,
+    transports,
+    mcpSessions,
+    sessionLifecycle,
+    mcpAdmission,
+    mcpWaiterAdmission,
+    startupReconciliation,
+    maintenance,
+    reviewCheckpoints,
+    dispatcher,
+    supervisorRuntime,
+    supervisorRuns,
+    mcpSessionChurnTimer,
+    shuttingDown: { get value() { return shuttingDown; }, set value(v: boolean) { shuttingDown = v; } },
+    oauthProvider,
+    workspaceStore,
+    workSessions,
+    agentRegistry,
+    eventStore,
+    continuationManager,
+    dispatchOutbox,
+    processSessions,
+    shutdownMissionVerifiers,
+    integrity,
+  });
   return {
     app,
     config,
     dispatcher,
-    close: finalizeClose,
-    drain: async () => {
-      if (closed) return;
-      if (draining) return draining;
-      draining = (async () => {
-        // Reject new MCP admission first, then close transports so long polls
-        // are woken before the Node HTTP server waits for connection closure.
-        shuttingDown = true;
-        mcpAdmission.close();
-        mcpWaiterAdmission.close();
-        const activeTransports = [...transports.values()];
-        for (const state of mcpSessions.values()) state.closing = true;
-        await Promise.all(activeTransports.map(closeTransport));
-        await finalizeClose();
-      })();
-      return draining;
-    },
+    close: shutdown.close,
+    drain: shutdown.drain,
   };
 }
 
