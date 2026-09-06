@@ -12,11 +12,12 @@ import {
   serializeFinalAcpResult,
   type AgentRegistryManager,
 } from "../../acp-registry.js";
-import { cancelRemoteRun, DEFAULT_ACP_TIMEOUT, dispatchToPeer, executeKontrolTool, selectHealthyAgent } from "../../acp-gateway.js";
+import { cancelRemoteRun, getAcpTimeout, dispatchToPeer, executeKontrolTool, selectHealthyAgent } from "../../acp-gateway.js";
 import { validateWebhookUrl } from "../../webhook-policy.js";
 import { acpRunRequestSchema } from "./schemas.js";
 import { ACP_TOOL_POLICY_NAMES } from "../../policy-enforcement.js";
 import { authorizeWorkSessionAction } from "../../work-session-action-guard.js";
+import { redactValue, redactedPreview } from "../../redaction.js";
 import type { AcpContext, AcpRole } from "./context.js";
 import { MUTATING_LOCAL_AGENTS } from "./context.js";
 import type { makeAuth } from "./auth.js";
@@ -115,7 +116,7 @@ export function registerRunRoutes(
             workspace_lease_nonce: workspaceLeaseNonce,
             webhook_url,
           },
-          timeoutMs: DEFAULT_ACP_TIMEOUT,
+          timeoutMs: getAcpTimeout(),
         });
         const peerResult = peerResp.body;
         const remoteRunId = typeof peerResult.remote_run_id === "string"
@@ -324,9 +325,10 @@ export function registerRunRoutes(
       }
 
       const output = await executeKontrolTool(agent_name, taskText, wsCtx.cwd, wsCtx.root);
-      agentRegistry.updateRun(run.runId, { status: "completed", outputPreview: output.slice(0, 2000), finishedAt: new Date().toISOString() });
+      // P0.6: durable previews flow through the shared sanitizer.
+      agentRegistry.updateRun(run.runId, { status: "completed", outputPreview: redactedPreview(output, 2000), finishedAt: new Date().toISOString() });
 
-      workSessions.logToolEvent({ workSessionId: session.id, workspaceSessionId: session.workspaceSessionId, tool: agent_name, inputJson: taskText, outputSummary: output.slice(0, 500), success: true, elapsedMs: 0 });
+      workSessions.logToolEvent({ workSessionId: session.id, workspaceSessionId: session.workspaceSessionId, tool: agent_name, inputJson: JSON.stringify(redactValue(taskText)), outputSummary: redactedPreview(output, 500), success: true, elapsedMs: 0 });
 
       if (webhook_url) agentRegistry.enqueueWebhook(run.runId, webhook_url, { agent_name, run_id: run.runId, status: "completed", output: [{ role: "agent", parts: [{ content_type: "text/plain", content: output }] }] });
 

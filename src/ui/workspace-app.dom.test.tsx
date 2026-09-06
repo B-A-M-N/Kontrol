@@ -143,6 +143,10 @@ let fakeSurfaceFailures = 0;
 let fakeEventDelivered = false;
 let fakeMutationCalls = 0;
 const fakeToolCalls: string[] = [];
+// Durable pending approvals, keyed by workspace — the fake server is
+// authoritative, matching production: a policy-blocked request is persisted
+// before the approval_required response is returned.
+const fakePendingApprovals = new Map<string, Array<Record<string, unknown>>>();
 const fakeApp = {
   ontoolresult: undefined as ((result: unknown) => void) | undefined,
   onhostcontextchanged: undefined as ((context: unknown) => void) | undefined,
@@ -153,7 +157,7 @@ const fakeApp = {
   getHostContext() {
     return undefined;
   },
-  async callServerTool(request: { name?: string }) {
+  async callServerTool(request: { name?: string; arguments?: Record<string, unknown> }) {
     const name = String(request.name ?? "");
     fakeToolCalls.push(name);
     if (name === "get_workspace_session_surface") {
@@ -164,7 +168,8 @@ const fakeApp = {
       return { isError: false, content: [], structuredContent: { lastSeq: 5, sessions: [] } };
     }
     if (name === "list_pending_approvals") {
-      return { isError: false, content: [], structuredContent: { approvals: [] } };
+      const workspaceId = String((request.arguments as { workspaceId?: string } | undefined)?.workspaceId ?? "");
+      return { isError: false, content: [], structuredContent: { approvals: fakePendingApprovals.get(workspaceId) ?? [] } };
     }
     if (name === "await_workspace_events") {
       if (!fakeEventDelivered) {
@@ -506,6 +511,133 @@ assert.ok(fakeConnectCount >= 3, "mutation transport failure also reconnects the
 await fakeApp.onteardown?.();
 assert.equal(__workspaceAppTest.getConnectionState(), "DISCONNECTED", "app teardown marks the host disconnected");
 (globalThis as { __KONTROL_UI_TEST_APP_FACTORY__?: () => never }).__KONTROL_UI_TEST_APP_FACTORY__ = undefined;
+
+// APPROVAL-01 — fresh-iframe bootstrap: a newly mounted Workspace App whose
+// FIRST tool result is an approval_required card (no prior open_workspace)
+// must activate the workspace, create/surface the approval center, render
+// actionable controls, and call list_pending_approvals. This is the exact
+// dead-end where the request reached the server, was persisted, expired, and
+// the reviewer never saw it.
+{
+  // Fresh module state = fresh iframe. The factory and connect log are reset
+  // too so assertions measure only this scenario.
+  fakeToolCalls.length = 0;
+  // The approval the model received was persisted server-side before the
+  // response was returned — mirror that authoritative durable state.
+  fakePendingApprovals.set("workspace-fresh", [{
+    approvalId: "approval-fresh-1",
+    workspaceId: "workspace-fresh",
+    workspaceSessionId: "workspace-fresh",
+    tool: "bash",
+    origin: "direct_mcp",
+  }]);
+  fakePendingApprovals.set("workspace-second", [{
+    approvalId: "approval-fresh-2",
+    workspaceId: "workspace-second",
+    workspaceSessionId: "workspace-second",
+    tool: "bash",
+    origin: "direct_mcp",
+  }]);
+  (globalThis as { __KONTROL_UI_TEST_APP_FACTORY__?: () => never }).__KONTROL_UI_TEST_APP_FACTORY__ = () => fakeApp as never;
+  const freshApp = await import(`./workspace-app.js?fresh-approval=${Date.now()}`);
+  const fresh = (freshApp as typeof import("./workspace-app.js")).__workspaceAppTest;
+  await fresh.boot();
+  assert.equal(fresh.getActiveWorkspaceId(), null, "a fresh iframe has no active workspace before any result");
+  fakeEventDelivered = true; // keep the event watcher parked; no replay needed
+
+  fakeApp.ontoolresult?.({
+    _meta: {
+      tool: "bash",
+      card: {
+        tool: "bash",
+        workspaceId: "workspace-fresh",
+        status: "approval_required",
+        approvalId: "approval-fresh-1",
+        resumeArgument: "approvalResumeId",
+        retryable: true,
+        summary: { status: "approval_required", approvalId: "approval-fresh-1", command: "env" },
+        payload: { content: [{ type: "text", text: "Approval required." }] },
+      },
+    },
+    structuredContent: {
+      result: "Approval required. Approve approval-fresh-1 in the Kontrol review UI, then retry this exact tool call with approvalResumeId set to approval-fresh-1.",
+      status: "approval_required",
+      approvalId: "approval-fresh-1",
+      retryable: true,
+    },
+    content: [{ type: "text", text: "Approval required." }],
+  });
+  await settle();
+  await settle();
+
+  assert.equal(
+    fresh.getActiveWorkspaceId(),
+    "workspace-fresh",
+    "an approval_required result alone activates its workspace",
+  );
+  const freshCenter = fresh.getWorkSessionView("__approval_center__:workspace-fresh");
+  assert.ok(freshCenter, "the workspace approval center is created from the result alone");
+  assert.ok(
+    freshCenter?.policyApprovals.has("approval-fresh-1"),
+    "the approval from the result is merged into the center without waiting for replay",
+  );
+  assert.equal(freshCenter?.pendingApprovalCount, 1, "the pending count reflects the merged approval");
+  assert.equal(
+    fresh.getSelectedWorkSessionId(),
+    "__approval_center__:workspace-fresh",
+    "the approval center is auto-selected so the reviewer sees it",
+  );
+  assert.ok(
+    fakeToolCalls.includes("list_pending_approvals"),
+    "rehydration lists pending approvals for the activated workspace",
+  );
+  assert.ok(
+    document.body.textContent?.includes("Workspace approvals"),
+    "the approval center surface renders",
+  );
+  assert.ok(
+    document.querySelector(".approval-list") || document.body.textContent?.includes("Approve"),
+    "Approve/Deny controls render on the surfaced center",
+  );
+
+  // Switching to a second, completely separate workspace must not inherit the
+  // first workspace's approval, and back again restores it.
+  fakeApp.ontoolresult?.({
+    _meta: {
+      tool: "bash",
+      card: {
+        tool: "bash",
+        workspaceId: "workspace-second",
+        status: "approval_required",
+        approvalId: "approval-fresh-2",
+        resumeArgument: "approvalResumeId",
+        retryable: true,
+        summary: { status: "approval_required", approvalId: "approval-fresh-2", command: "env" },
+        payload: { content: [{ type: "text", text: "Approval required." }] },
+      },
+    },
+    structuredContent: {
+      result: "Approval required. Approve approval-fresh-2 in the Kontrol review UI.",
+      status: "approval_required",
+      approvalId: "approval-fresh-2",
+      retryable: true,
+    },
+    content: [{ type: "text", text: "Approval required." }],
+  });
+  await settle();
+  await settle();
+  assert.equal(fresh.getActiveWorkspaceId(), "workspace-second", "the second result activates the second workspace");
+  const secondCenter = fresh.getWorkSessionView("__approval_center__:workspace-second");
+  assert.ok(secondCenter?.policyApprovals.has("approval-fresh-2"), "the second workspace's own approval is merged");
+  assert.equal(
+    secondCenter?.policyApprovals.has("approval-fresh-1"),
+    false,
+    "the second workspace's center must not inherit the first workspace's approval",
+  );
+
+  await fakeApp.onteardown?.();
+  (globalThis as { __KONTROL_UI_TEST_APP_FACTORY__?: () => never }).__KONTROL_UI_TEST_APP_FACTORY__ = undefined;
+}
 
 
 console.log("workspace-app DOM: rich renderer mount/update/unmount passed");

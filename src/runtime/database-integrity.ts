@@ -50,7 +50,8 @@ export function createDatabaseIntegrityMonitor(config: ServerConfig) {
       worker = new Worker(new URL(workerModule, import.meta.url), {
         workerData: {
           databasePath: databasePath(config.stateDir),
-          delayMs: Number(process.env.KONTROL_INTEGRITY_TEST_DELAY_MS ?? 0),
+          // P0.3: config-injected test hook, not an ambient env read.
+          delayMs: config.integrityTestDelayMs ?? 0,
         },
       });
     } catch (error) {

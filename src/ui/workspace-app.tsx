@@ -435,6 +435,48 @@ async function bootInternal(): Promise<void> {
       activateWorkspace(structured.workspaceId);
     }
 
+    // P0.2: any tool result that carries a workspace ID bootstraps workspace
+    // context — not just open_workspace. A freshly (re)mounted tool-card
+    // iframe can otherwise receive a valid approval_required bash/write/edit
+    // result while activeWorkspaceId is still null, and without an active
+    // workspace the app never starts rehydration, pending-approval listing,
+    // or the event watcher: the model sees "approval required" while the
+    // reviewer sees nothing. The invariant is that an approval result alone
+    // must be sufficient to surface the approval UI.
+    const resultWorkspaceId = structured.workspaceId;
+    if (
+      typeof resultWorkspaceId === "string" &&
+      resultWorkspaceId.length > 0 &&
+      activeWorkspaceId !== resultWorkspaceId
+    ) {
+      activateWorkspace(resultWorkspaceId);
+    }
+
+    // P0.2: merge a policy-blocked approval_required result into the workspace
+    // approval center immediately, using the data already on the card, rather
+    // than waiting for watcher event replay or the next rehydration to
+    // reconcile with list_pending_approvals.
+    if (structured.status === "approval_required" && resultWorkspaceId) {
+      const approvalId = (structured as { approvalId?: string }).approvalId;
+      if (typeof approvalId === "string" && approvalId.length > 0) {
+        const centerId = approvalCenterId(resultWorkspaceId);
+        const center = ensureWorkSessionView(centerId, resultWorkspaceId, "");
+        mergePendingApproval(center, {
+          approvalId,
+          workspaceId: resultWorkspaceId,
+          workspaceSessionId: resultWorkspaceId,
+          kind: (structured as { kind?: string }).kind,
+          title: (structured as { title?: string }).title,
+          tool: tool,
+          path: structured.path,
+          command: (structured as { command?: string }).command,
+          origin: "direct_mcp",
+        }, resultWorkspaceId);
+        surfaceNewDirectApproval(resultWorkspaceId, approvalId);
+        scheduleRender();
+      }
+    }
+
     // Agent run (submit_to_coding_agent) and review (submit_for_review) cards
     // drive the work-session view model.
     if (tool === "submit_to_coding_agent" || isReviewTool(tool)) {

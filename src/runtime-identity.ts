@@ -86,12 +86,10 @@ export function createRuntimeIdentityRecord(
     ...(build.buildTimestamp ? { buildTimestamp: build.buildTimestamp } : {}),
     startedAt: new Date().toISOString(),
     command: command.slice(0, 2_000),
-    ...(options.generationId || process.env.KONTROL_LAUNCH_GENERATION_ID
-      ? { generationId: options.generationId ?? process.env.KONTROL_LAUNCH_GENERATION_ID }
-      : {}),
-    ...(options.artifactPath || process.env.KONTROL_ARTIFACT_PATH
-      ? { artifactPath: options.artifactPath ?? process.env.KONTROL_ARTIFACT_PATH }
-      : {}),
+    // P0.3: generation/artifact identity arrives via explicit options
+    // (entrypoint-resolved DeploymentContext); no ambient process.env reads.
+    ...(options.generationId ? { generationId: options.generationId } : {}),
+    ...(options.artifactPath ? { artifactPath: options.artifactPath } : {}),
   };
 }
 

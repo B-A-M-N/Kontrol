@@ -218,6 +218,12 @@ export function createReviewCheckpointManager(options: {
       state.diagnostic = undefined;
       state.backend = new GitCheckpointBackend();
     } catch (error) {
+      // P0.5: a failed initialization must leave NO backend behind. The
+      // filesystem backend object is assigned before baseline capture, so an
+      // exception here previously left state.backend set and getSnapshotInfo
+      // reported a "working" backend whose baseline never existed.
+      state.backend = undefined;
+      state.filesystemBaselines = undefined;
       state.diagnostic = error instanceof Error ? error.message : String(error);
     } finally {
       resolveInit();

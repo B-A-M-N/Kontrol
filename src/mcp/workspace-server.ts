@@ -27,6 +27,7 @@ import {
 import type { ServerConfig, WidgetMode } from "../config.js";
 import type { createWorkSessionManager } from "../work-sessions.js";
 import { logEvent, commandPreview, requestIp } from "../logger.js";
+import { redactValue, redactedPreview, shellTelemetrySync } from "../redaction.js";
 import {
   editFileTool,
   findFilesTool,
@@ -390,7 +391,9 @@ function logToolCall(config: ServerConfig, fields: ToolLogFields): void {
   const { command, ...safeFields } = fields;
   logEvent(config.logging, fields.success ? "info" : "warn", "tool_call", {
     ...safeFields,
-    commandPreview: config.logging.shellCommands && command ? commandPreview(command) : undefined,
+    // P0.6: the console preview is redacted through the shared sanitizer —
+    // command text can contain pasted credentials just like tool output.
+    commandPreview: config.logging.shellCommands && command ? redactedPreview(command) : undefined,
   });
 }
 
@@ -404,7 +407,7 @@ function contentText(content: ToolContent[]): string {
 }
 
 function toolErrorPreview(content: ToolContent[]): string | undefined {
-  const text = contentText(content).replace(/\s+/g, " ").trim();
+  const text = redactedPreview(contentText(content).replace(/\s+/g, " ").trim());
   if (!text) return undefined;
   return text.length > 240 ? `${text.slice(0, 237)}...` : text;
 }
@@ -446,13 +449,73 @@ function contentLineCount(content: string): number {
 }
 
 /**
+ * P0.5: thrown by prepareForMutation when no usable checkpoint backend exists.
+ * Tool handlers catch it and return a distinct, machine-readable
+ * checkpoint_unavailable result rather than executing an untracked mutation.
+ */
+export class WorkspaceMutationBlockedError extends Error {
+  readonly workspaceId: string;
+  readonly code = "checkpoint_unavailable";
+  constructor(workspaceId: string, message: string) {
+    super(message);
+    this.name = "WorkspaceMutationBlockedError";
+    this.workspaceId = workspaceId;
+  }
+}
+
+export function isWorkspaceMutationBlockedError(error: unknown): error is WorkspaceMutationBlockedError {
+  return error instanceof WorkspaceMutationBlockedError;
+}
+
+/**
+ * P0.5: a checkpoint-blocked mutation returns the same renderable card
+ * envelope as a policy denial so the model sees a distinct, machine-readable
+ * checkpoint_unavailable status instead of a generic transport error.
+ */
+function checkpointUnavailableResponse(error: WorkspaceMutationBlockedError, tool: string) {
+  const message = `${error.message} (Set KONTROL_ALLOW_UNTRACKED_MUTATION=1 to explicitly run without review tracking — not recommended.)`;
+  return {
+    content: [{ type: "text" as const, text: message }],
+    isError: true,
+    _meta: {
+      tool,
+      card: {
+        tool,
+        workspaceId: error.workspaceId,
+        status: "checkpoint_unavailable",
+        summary: { status: "checkpoint_unavailable" },
+        payload: { content: [{ type: "text", text: message }] },
+      },
+    },
+    structuredContent: { result: message, status: "checkpoint_unavailable", retryable: false },
+  };
+}
+
+/**
+ * P0.5: uniform mutation barrier. Runs prepareForMutation and converts a
+ * fail-closed block into a checkpoint_unavailable tool response.
+ */
+async function runMutationBarrier(
+  prepare: ((workspaceId: string) => Promise<void>) | undefined,
+  workspaceId: string,
+  tool: string,
+): Promise<ReturnType<typeof checkpointUnavailableResponse> | null> {
+  try {
+    await prepare?.(workspaceId);
+    return null;
+  } catch (error) {
+    if (isWorkspaceMutationBlockedError(error)) return checkpointUnavailableResponse(error, tool);
+    throw error;
+  }
+}
+
+/**
  * P0.2: a policy-blocked result must remain renderable by the Workspace App.
  * The MCP `_meta.tool`/`_meta.card` envelope is the only contract the app can
  * use (see toolNameFromMeta()/isToolResultCard() in workspace-app.tsx), and it
  * is attached even when isError is true because the UI renders both blocked
  * and approval-pending cards from the same payload.
- */
-function policyFailureResponse(
+ */function policyFailureResponse(
   result: { allowed: boolean; approvalRequired?: boolean; approvalId?: string },
   deniedMessage: string,
   context: {
@@ -760,7 +823,8 @@ function registerCodexProcessTools(
     },
     async ({ workspaceId, cmd, approvalResumeId, tty, columns, rows, workingDirectory, yieldTimeMs, maxOutputTokens }) => {
       const startedAt = performance.now();
-      await prepareForMutation?.(workspaceId);
+      const blocked = await runMutationBarrier(prepareForMutation, workspaceId, "exec_command");
+      if (blocked) return blocked;
       const workspace = workspaces.getWorkspace(workspaceId);
       const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
       if (bindingErr) return bindingErr;
@@ -864,7 +928,10 @@ function registerCodexProcessTools(
       const hasInput = Boolean(chars && chars.length > 0);
       // Writing input to a process can mutate the workspace via that process;
       // gate it behind the baseline like exec_command. Outline-free poll stays fast.
-      if (hasInput) await prepareForMutation?.(workspaceId);
+      if (hasInput) {
+        const blocked = await runMutationBarrier(prepareForMutation, workspaceId, "write_stdin");
+        if (blocked) return blocked;
+      }
       workspaces.getWorkspace(workspaceId);
       const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
       if (bindingErr) return bindingErr;
@@ -1042,12 +1109,26 @@ export function createMcpServer(
         throw new Error("Work session does not belong to this workspace");
       }
 
+      // P0.6: durable telemetry is redacted at this single choke point —
+      // input JSON, output summaries, and event-log payloads all flow
+      // through the shared sanitizer so a command like `env` or
+      // `echo "$SOME_SECRET"` cannot persist credentials.
+      const redactedInput = redactValue(input) as Record<string, unknown>;
+      const outputSummary = redactedPreview(contentText(result.content), 2000);
+      // P0.6 storage model: shell inputs keep hash + redacted preview only.
+      const shellTelemetryInput = tool === toolNames.shell
+        ? shellTelemetrySync(String(input.command ?? ""), 160)
+        : undefined;
+      const persistedInput = shellTelemetryInput
+        ? { commandHash: shellTelemetryInput.commandHash, commandPreview: shellTelemetryInput.commandPreview, commandLength: shellTelemetryInput.commandLength }
+        : redactedInput;
+
       workSessions.logToolEvent({
         workSessionId,
         workspaceSessionId: workspaceId,
         tool,
-        inputJson: JSON.stringify(input),
-        outputSummary: contentText(result.content).slice(0, 2000),
+        inputJson: JSON.stringify(persistedInput),
+        outputSummary,
         path: typeof input.path === "string" ? input.path : undefined,
         success: !result.isError,
         elapsedMs: Math.round(performance.now() - startedAt),
@@ -1066,8 +1147,8 @@ export function createMcpServer(
           conversationId: connectionContext?.conversationId,
           tool,
           path: typeof input.path === "string" ? input.path : undefined,
-          input,
-          outputSummary: contentText(result.content).slice(0, 2000),
+          input: persistedInput,
+          outputSummary,
           success: !result.isError,
           elapsedMs: Math.round(performance.now() - startedAt),
         },
@@ -1080,24 +1161,46 @@ export function createMcpServer(
   }
 
   // P0 #3: Centralized mutation preflight. Every mutation-capable tool (write,
-  // edit, apply_patch, exec_command/bash, write_stdin) awaits the workspace's
+  // edit, apply_patch, bash, exec_command, write_stdin) awaits the workspace's
   // initial filesystem baseline through this single choke point, so a mutation
   // can never race the background baseline capture and escape the review
   // boundary. Reads may proceed immediately.
+  // P0.5: readiness is fail-closed. If no usable checkpoint backend could be
+  // established, mutation is refused with a distinct error instead of
+  // silently proceeding untracked. The only override is the explicit
+  // operator escape hatch KONTROL_ALLOW_UNTRACKED_MUTATION (default off) —
+  // automatic fallback is never acceptable for a review-safe boundary.
   async function prepareForMutation(workspaceId: string): Promise<void> {
     if (!config.widgets || config.widgets === "off") return;
     const workspace = workspaces.getWorkspace(workspaceId);
     try {
       await reviewCheckpoints.awaitWorkspaceReady({ workspaceId, root: workspace.root });
     } catch (error) {
-      // A permanently-ineligible workspace (no git, capture failure) must not
-      // silently block mutations; log and let the mutation proceed, since there
-      // is no baseline to race. Real readiness errors surface at open_workspace.
-      logEvent(config.logging, "warn", "checkpoint_ready_barrier_failed", {
+      if (config.allowUntrackedMutation === true) {
+        logEvent(config.logging, "warn", "checkpoint_ready_barrier_failed_untracked_allowed", {
+          workspaceId,
+          detail: error instanceof Error ? error.message : String(error),
+        });
+        return;
+      }
+      throw new WorkspaceMutationBlockedError(
         workspaceId,
-        detail: error instanceof Error ? error.message : String(error),
-      });
+        `Workspace mutation is disabled because the review baseline could not be established: ${error instanceof Error ? error.message : String(error)}`,
+      );
     }
+    const snapshotInfo = await reviewCheckpoints.getSnapshotInfo({ workspaceId, root: workspace.root });
+    if (snapshotInfo.available) return;
+    if (config.allowUntrackedMutation === true) {
+      logEvent(config.logging, "warn", "checkpoint_backend_unavailable_untracked_allowed", {
+        workspaceId,
+        detail: snapshotInfo.diagnostic ?? "checkpoint backend unavailable",
+      });
+      return;
+    }
+    throw new WorkspaceMutationBlockedError(
+      workspaceId,
+      `Workspace mutation is disabled because the review baseline could not be established: ${snapshotInfo.diagnostic ?? "no usable checkpoint backend"}`,
+    );
   }
 
   registerAppResource(
@@ -1236,13 +1339,16 @@ export function createMcpServer(
       const gitEligibility = await getGitEligibility(workspace.root);
       const workspaceKind = workspace.mode;
       const versionControl = gitEligibility.ok ? "git" : "none";
-      const checkpointBackend = gitEligibility.ok ? "git" : "filesystem";
-      if (config.widgets === "changes") {
-        void reviewCheckpoints.initializeWorkspace({
-          workspaceId: workspace.id,
-          root: workspace.root,
-        });
-      }
+      // P0.5: capability reporting is authoritative, not inferred. Ask the
+      // checkpoint manager whether initialization actually produced a usable
+      // backend instead of predicting one from git eligibility — a failed
+      // capture must be reported as "unavailable", never as a working backend.
+      const snapshotInfo = await reviewCheckpoints.getSnapshotInfo({
+        workspaceId: workspace.id,
+        root: workspace.root,
+      });
+      const checkpointBackend = snapshotInfo.available ? snapshotInfo.kind : "unavailable";
+      const changeTracking = snapshotInfo.available;
       const visibleSkills = workspace.skills
         .filter((skill) => !skill.disableModelInvocation)
         .map((skill) => ({
@@ -1316,7 +1422,7 @@ export function createMcpServer(
             read: true,
             search: true,
             edit: true,
-            changeTracking: true,
+            changeTracking,
             managedWorktree: workspace.mode === "worktree",
           },
           sourceRoot: workspace.sourceRoot,
@@ -1485,7 +1591,8 @@ export function createMcpServer(
     },
     async ({ workspaceId, ...input }) => {
       const startedAt = performance.now();
-      await prepareForMutation(workspaceId);
+      const blocked = await runMutationBarrier(prepareForMutation, workspaceId, toolNames.write);
+      if (blocked) return blocked;
       const workspace = workspaces.getWorkspace(workspaceId);
       const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
       if (bindingErr) return bindingErr;
@@ -1598,7 +1705,8 @@ export function createMcpServer(
     },
     async ({ workspaceId, ...input }) => {
       const startedAt = performance.now();
-      await prepareForMutation(workspaceId);
+      const blocked = await runMutationBarrier(prepareForMutation, workspaceId, toolNames.write);
+      if (blocked) return blocked;
       const workspace = workspaces.getWorkspace(workspaceId);
       const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
       if (bindingErr) return bindingErr;
@@ -1715,7 +1823,8 @@ export function createMcpServer(
       },
       async ({ workspaceId, patch, approvalResumeId }) => {
         const startedAt = performance.now();
-        await prepareForMutation(workspaceId);
+        const blocked = await runMutationBarrier(prepareForMutation, workspaceId, "apply_patch");
+        if (blocked) return blocked;
         const workspace = workspaces.getWorkspace(workspaceId);
         const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
         if (bindingErr) return bindingErr;
@@ -2207,6 +2316,12 @@ export function createMcpServer(
     },
     async ({ workspaceId, workingDirectory, ...input }) => {
       const startedAt = performance.now();
+      // REVIEW-01: shell is mutation-capable regardless of the command
+      // string — a textual "read-only" classification is not a security
+      // boundary. It crosses the same checkpoint-readiness barrier as
+      // write/edit/apply_patch/exec_command.
+      const blocked = await runMutationBarrier(prepareForMutation, workspaceId, toolNames.shell);
+      if (blocked) return blocked;
       const workspace = workspaces.getWorkspace(workspaceId);
       const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
       if (bindingErr) return bindingErr;
@@ -2244,6 +2359,7 @@ export function createMcpServer(
       const response = await runShellTool(input, {
         cwd,
         root: workspace.root,
+        childEnvironmentAllowlist: config.childEnvironmentAllowlist,
       });
 
       if (response.isError) {

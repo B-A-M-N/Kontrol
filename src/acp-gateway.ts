@@ -22,10 +22,17 @@ import {
 // cap. The run itself remains supervised independently after the 202 response.
 // Keep the window tunable for slow local model startup without changing the
 // independent run/watchdog limits.
-const configuredAcpTimeout = Number(process.env.KONTROL_ACP_DISPATCH_TIMEOUT_MS);
-export const DEFAULT_ACP_TIMEOUT = Number.isSafeInteger(configuredAcpTimeout) && configuredAcpTimeout > 0
-  ? configuredAcpTimeout
-  : 5 * 60_000;
+// P0.3: the value is resolved by loadConfig (acpDispatchTimeoutMs) and
+// injected via setDefaultAcpTimeout at server assembly — no ambient
+// process.env read at module load. Per-call timeoutMs still wins.
+export const DEFAULT_ACP_TIMEOUT_FALLBACK_MS = 5 * 60_000;
+let defaultAcpTimeoutMs = DEFAULT_ACP_TIMEOUT_FALLBACK_MS;
+export function setDefaultAcpTimeout(ms: number | undefined): void {
+  defaultAcpTimeoutMs = ms !== undefined && Number.isSafeInteger(ms) && ms > 0 ? ms : DEFAULT_ACP_TIMEOUT_FALLBACK_MS;
+}
+export function getAcpTimeout(): number {
+  return defaultAcpTimeoutMs;
+}
 
 export function isLoopbackAgentUrl(url: string): boolean {
   try {
@@ -64,7 +71,7 @@ export async function dispatchToPeer(params: {
     method: "POST",
     headers,
     body: JSON.stringify(params.body),
-    signal: AbortSignal.timeout(params.timeoutMs ?? DEFAULT_ACP_TIMEOUT),
+    signal: AbortSignal.timeout(params.timeoutMs ?? getAcpTimeout()),
   });
   const text = await response.text().catch(() => "");
   let parsed: Record<string, unknown> = {};
@@ -346,7 +353,7 @@ export async function callRemoteAgent(
       agentUrl: params.agentUrl,
       adapterSecret: config.adapterSecret,
       body,
-      timeoutMs: DEFAULT_ACP_TIMEOUT,
+      timeoutMs: getAcpTimeout(),
     });
 
     const result = dispatched.body as {

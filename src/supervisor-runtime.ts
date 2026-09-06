@@ -101,9 +101,9 @@ export function createSupervisorRuntime(input: {
   let timer: ReturnType<typeof setTimeout> | undefined;
   let unsubscribe: (() => void) | undefined;
   let stopped = true;
-  // P1 #22: use injected configuration; env parsing remains only as a
-  // fallback for direct callers (tests, standalone scripts).
-  const maxInflight = input.maxInflight ?? parsePositiveInteger(process.env.KONTROL_SUPERVISOR_MAX_INFLIGHT, 4);
+  // P1 #22/P0.3: injected configuration only. Callers pass the config-parsed
+  // value; no ambient process.env fallback inside implementation code.
+  const maxInflight = input.maxInflight ?? 4;
   const inflightByWorkSession = new Map<string, Promise<void>>();
 
   const schedule = () => {
@@ -413,8 +413,3 @@ export function createSupervisorRuntime(input: {
   };
 }
 
-function parsePositiveInteger(value: string | undefined, fallback: number): number {
-  if (!value) return fallback;
-  const parsed = Number(value);
-  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
-}

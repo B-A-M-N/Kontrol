@@ -5,6 +5,7 @@ import { drizzle } from "drizzle-orm/better-sqlite3";
 import * as schema from "./schema.js";
 import { LATEST_SCHEMA_VERSION, migrateDatabase } from "./migrations.js";
 import { captureMigrationBackup, markMigrationCompleted, markMigrationFailed } from "./deployment-backup.js";
+import type { DeploymentContext } from "../runtime-context.js";
 
 export type SqliteDatabase = Database.Database;
 export type AppDatabase = ReturnType<typeof createDrizzleDatabase>;
@@ -19,7 +20,12 @@ export function databasePath(stateDir: string): string {
   return join(stateDir, "kontrol.sqlite");
 }
 
-export function openDatabase(stateDir: string): DatabaseHandle {
+/**
+ * P0.3: deployment identity arrives via an explicit DeploymentContext, never
+ * read from process.env deep inside the DB layer. Callers that predate the
+ * context (tests, CLI utilities without a deployment) may omit it.
+ */
+export function openDatabase(stateDir: string, deploymentContext: DeploymentContext = {}): DatabaseHandle {
   mkdirSync(stateDir, { recursive: true, mode: 0o700 });
   chmodSync(stateDir, 0o700);
   const path = databasePath(stateDir);
@@ -30,8 +36,8 @@ export function openDatabase(stateDir: string): DatabaseHandle {
   sqlite.pragma("synchronous = NORMAL");
   sqlite.pragma("busy_timeout = 5000");
   sqlite.pragma("foreign_keys = ON");
-  const candidateSchemaVersion = Number(process.env.KONTROL_EXPECTED_SCHEMA_VERSION ?? LATEST_SCHEMA_VERSION);
-  const deploymentId = process.env.KONTROL_DEPLOYMENT_ID?.trim() || undefined;
+  const candidateSchemaVersion = deploymentContext.expectedSchemaVersion ?? LATEST_SCHEMA_VERSION;
+  const deploymentId = deploymentContext.deploymentId;
   backupBeforeMigration(
     sqlite,
     path,
