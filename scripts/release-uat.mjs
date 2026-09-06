@@ -30,6 +30,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
+import { testHarnessEnvironment } from "./lib/tool-environment.mjs";
 import { join, resolve } from "node:path";
 
 const root = resolve(import.meta.dirname ?? ".", "..");
@@ -122,9 +123,9 @@ try {
       join(tmp, tarballPath),
     ], {
       cwd: tmp,
-      // kontrol-env-exception: UAT test harness installing into an isolated
-      // temp prefix; needs PATH/npm registry access, not a control-plane spawn.
-      env: { ...process.env, npm_config_cache: join(tmp, "npm-cache") },
+      // P1.10: UAT harness installs into an isolated temp prefix with the
+      // explicit tool allowlist, not a control-plane environment.
+      env: testHarnessEnvironment(process.env, { overrides: { npm_config_cache: join(tmp, "npm-cache") } }),
       stdio: "pipe",
     });
     installedCli = join(installPrefix, "node_modules", "@b-a-m-n", "kontrol", "dist", "cli.js");

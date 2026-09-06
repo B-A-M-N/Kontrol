@@ -88,3 +88,66 @@ export function buildChildEnvironment(options: {
 }
 
 export const ordinaryEnvironmentKeys = [...ORDINARY_ENVIRONMENT_KEYS];
+
+/**
+ * P1.10: named builders for the trusted-tooling spawn sites that previously
+ * used wholesale process-env spreads. Each caller declares its purpose, and the
+ * builder applies an explicit allowlist so launcher authority
+ * (KONTROL_DEPLOYMENT_ID, runtime/deployment lock tokens, launch generation,
+ * reviewer/tunnel credentials) cannot ride into unrelated children even when
+ * the parent process legitimately holds it.
+ */
+
+// Keys trusted build/dev tooling may need beyond the ordinary set: package
+// manager identity, node module resolution, and proxy configuration.
+const TOOL_ENVIRONMENT_KEYS = new Set([
+  "NODE_PATH",
+  "NODE_OPTIONS",
+  "npm_config_registry",
+  "npm_config_strict_ssl",
+  "npm_config_cache",
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "NO_PROXY",
+  "http_proxy",
+  "https_proxy",
+  "no_proxy",
+  "PLAYWRIGHT_BROWSERS_PATH",
+  "KONTROL_BROWSER_PATH",
+  "KONTROL_BROWSER_NO_SANDBOX",
+]);
+
+export function buildToolEnvironment(options: {
+  source?: NodeJS.ProcessEnv;
+  additionalKeys?: Iterable<string>;
+} = {}): Record<string, string> {
+  return buildChildEnvironment({ ...options, additionalKeys: [...TOOL_ENVIRONMENT_KEYS, ...(options.additionalKeys ?? [])] });
+}
+
+// Test harnesses get the tool set plus the explicit test hooks the suites
+// set; launcher authority stays excluded. Suites that intentionally inject
+// KONTROL_* values pass them as additionalKeys.
+export function testHarnessEnvironment(options: {
+  source?: NodeJS.ProcessEnv;
+  additionalKeys?: Iterable<string>;
+} = {}): Record<string, string> {
+  return buildToolEnvironment(options);
+}
+
+// Release probes talk to a running deployment over HTTP; they need no
+// launcher authority in the child environment at all, only the tool set.
+export function releaseProbeEnvironment(options: {
+  source?: NodeJS.ProcessEnv;
+  additionalKeys?: Iterable<string>;
+} = {}): Record<string, string> {
+  return buildToolEnvironment(options);
+}
+
+// Workspace command execution: the audited surface used by the MCP shell
+// tooling. Same allowlist contract as buildChildEnvironment's callers.
+export function workspaceCommandEnvironment(options: {
+  source?: NodeJS.ProcessEnv;
+  additionalKeys?: Iterable<string>;
+} = {}): Record<string, string> {
+  return buildChildEnvironment(options);
+}

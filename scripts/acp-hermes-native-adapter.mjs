@@ -14,6 +14,7 @@ import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { realpath, stat } from "node:fs/promises";
 import { clearAgentIdentity, identityHeaders, loadAgentIdentity, saveAgentIdentity } from "./lib/acp-agent-identity.mjs";
 import { readJsonBody, truncateUtf8Tail, writeAdapterError } from "./lib/adapter-http.mjs";
+import { buildToolEnvironment } from "./lib/tool-environment.mjs";
 import { adapterStatePath, atomicWriteJson, processStartToken, readJsonOr, reconcileOwnedProcesses, terminateProcessGroup } from "./lib/managed-agent-process.mjs";
 
 const KONTROL_ACP_URL = process.env.KONTROL_ACP_URL || "http://127.0.0.1:7676/acp";
@@ -45,11 +46,14 @@ if (!AGENT_SECRET || !ADAPTER_SECRET) {
 
 const check = spawnSync(HERMES_BIN, ["acp", "--check"], {
   encoding: "utf8",
-  env: {
-    ...process.env,
-    HERMES_AGENT_ROOT,
-    PYTHONPATH: withHermesPythonPath(process.env.PYTHONPATH),
-  },
+  // P1.10: explicit allowlist; hermes children get the toolchain plus the
+  // hermes root/python path, never launcher authority.
+  env: buildToolEnvironment(process.env, {
+    overrides: {
+      HERMES_AGENT_ROOT,
+      PYTHONPATH: withHermesPythonPath(process.env.PYTHONPATH),
+    },
+  }),
 });
 if (check.status !== 0) {
   console.error("[hermes-native] hermes acp --check failed; refusing to register hermes-agent");
@@ -844,11 +848,13 @@ function resolveHermesPython() {
   for (const candidate of candidates) {
     const result = spawnSync(candidate, ["-c", "import acp; import acp_adapter.client; assert hasattr(acp, 'connect_to_agent'); assert hasattr(acp, 'Client')"], {
       encoding: "utf8",
-      env: {
-        ...process.env,
-        HERMES_AGENT_ROOT,
-        PYTHONPATH: withHermesPythonPath(process.env.PYTHONPATH),
-      },
+      // P1.10: explicit allowlist (see the --check spawn above).
+      env: buildToolEnvironment(process.env, {
+        overrides: {
+          HERMES_AGENT_ROOT,
+          PYTHONPATH: withHermesPythonPath(process.env.PYTHONPATH),
+        },
+      }),
     });
     if (result.status === 0) {
       console.log(`[hermes-native] using Python: ${candidate}`);

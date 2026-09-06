@@ -297,6 +297,27 @@ function acquireBehaviorLock() {
         rmSync(harnessRoot, { recursive: true, force: true });
         throw new Error(`start-all.behavior.test.mjs is already running (pid ${existing.pid})`);
       }
+      // P1.9: a dead owner may have been killed mid-run with the repository
+      // dist projection swapped and its backups inside a harness temp dir
+      // that no longer exists. Surface that loudly instead of silently
+      // continuing on a swapped checkout — the restore needs the backup.
+      if (existing?.distSwapped) {
+        const distPath = join(root, "dist");
+        const previousPath = join(root, "dist.previous");
+        const swapped = [];
+        for (const [path, label] of [[distPath, "dist"], [previousPath, "dist.previous"]]) {
+          try {
+            if (lstatSync(path).isSymbolicLink()) swapped.push(label);
+          } catch { /* absent is fine */ }
+        }
+        if (swapped.length > 0) {
+          throw new Error(
+            `start-all.behavior.test.mjs: a previous interrupted run (pid ${existing.pid}) left ${swapped.join(" and ")} `
+            + "pointing at a temporary test release. Restore it manually (git checkout is not enough for a symlink; "
+            + "rebuild with npm run build or remove the link) and delete " + behaviorLockPath + " to continue.",
+          );
+        }
+      }
       const reclaimPath = `${behaviorLockPath}.reclaim-${process.pid}`;
       try {
         renameSync(behaviorLockPath, reclaimPath);
@@ -320,6 +341,66 @@ function stopFakeSessions() {
 }
 
 const behaviorLock = acquireBehaviorLock();
+
+// P1.9: an interrupted run (SIGINT/SIGTERM/SIGHUP) must not leave the
+// repository dist projection swapped or test-owned launchers running. The
+// natural unwinds through the finally block below; the signal handlers route
+// every termination path through the same idempotent restore.
+let harnessRestored = false;
+function restoreHarness() {
+  if (harnessRestored) return;
+  harnessRestored = true;
+  stopFakeSessions();
+  for (const signal of ["SIGTERM", "SIGKILL"]) {
+    for (const lockPath of runtimeLockPathsSeen) {
+      try {
+        const lock = JSON.parse(readFileSync(lockPath, "utf8"));
+        const pid = Number(lock.launcherPid);
+        if (Number.isInteger(pid) && pid > 1) {
+          try { process.kill(-pid, signal); } catch { /* group or process already gone */ }
+          try { process.kill(pid, signal); } catch { /* already gone */ }
+        }
+      } catch { /* lock unreadable or already removed */ }
+    }
+  }
+  for (const path of [join(root, "dist"), join(root, "dist.previous")]) {
+    removeGeneratedArtifact(path, path.endsWith("dist") ? originalDistBackup : originalPreviousBackup);
+  }
+  for (const entry of readdirSync(root)) {
+    if (entry.startsWith("dist.failed-")) {
+      const path = join(root, entry);
+      if (linkSnapshot(path)) removeLink(path);
+    }
+  }
+  rmSync(baseRelease, { recursive: true, force: true });
+  rmSync(candidateRelease, { recursive: true, force: true });
+  if (originalDist?.kind === "link") symlinkSync(originalDist.target, join(root, "dist"));
+  if (originalDist?.kind === "non-link") cpSync(originalDistBackup, join(root, "dist"), { recursive: true });
+  if (originalPrevious?.kind === "link") symlinkSync(originalPrevious.target, join(root, "dist.previous"));
+  if (originalPrevious?.kind === "non-link") cpSync(originalPreviousBackup, join(root, "dist.previous"), { recursive: true });
+  if (!originalDist) removeLink(join(root, "dist"));
+  if (!originalPrevious) removeLink(join(root, "dist.previous"));
+  rmSync(harnessRoot, { recursive: true, force: true });
+  try {
+    const currentLock = JSON.parse(readFileSync(behaviorLockPath, "utf8"));
+    if (currentLock.pid === behaviorLock.pid && currentLock.startToken === behaviorLock.startToken) {
+      rmSync(behaviorLockPath, { force: true });
+    }
+  } catch { /* lock was reclaimed after an interrupted test */ }
+}
+
+// Runtime locks observed during the run, so a signal mid-run can still stop
+// test-owned supervisors even before the corresponding assert-time kill runs.
+const runtimeLockPathsSeen = new Set();
+function noteRuntimeLockPath(stateDir) {
+  runtimeLockPathsSeen.add(join(stateDir, "runtime.lock"));
+}
+
+for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+  process.on(signal, () => {
+    try { restoreHarness(); } finally { process.exit(1); }
+  });
+}
 
 function writeEnvironment(stateDir, port, options) {
   const opts = options || {};
@@ -359,7 +440,15 @@ function writeEnvironment(stateDir, port, options) {
   return envPath;
 }
 
+function readEnvironmentStateDir(envPath) {
+  for (const line of readFileSync(envPath, "utf8").split("\n")) {
+    if (line.startsWith("KONTROL_STATE_DIR=")) return line.slice("KONTROL_STATE_DIR=".length);
+  }
+  return harnessRoot;
+}
+
 function runLauncher(envPath, extraEnv = {}) {
+  noteRuntimeLockPath(readEnvironmentStateDir(envPath));
   return spawnSync("bash", ["start-all.sh"], {
     cwd: root,
     detached: true,
@@ -379,6 +468,7 @@ function runLauncher(envPath, extraEnv = {}) {
 }
 
 function runRestart(envPath, extraEnv = {}) {
+  noteRuntimeLockPath(readEnvironmentStateDir(envPath));
   return spawnSync("bash", ["restart-kontrol.sh"], {
     cwd: root,
     encoding: "utf8",
@@ -401,6 +491,7 @@ function runRestartAsync(envPath, extraEnv = {}) {
 }
 
 function startRestartController(envPath, extraEnv = {}) {
+  noteRuntimeLockPath(readEnvironmentStateDir(envPath));
   let resolveResult;
   const result = new Promise((resolve) => { resolveResult = resolve; });
   const child = spawn("bash", ["restart-kontrol.sh"], {
@@ -500,6 +591,9 @@ try {
     rmSync(join(root, "dist.previous"), { recursive: true, force: true });
   }
   symlinkSync(baseRelease, join(root, "dist"));
+  // P1.9: publish the swap into the behavior lock so an interrupted run's
+  // successor can detect a swapped checkout (see acquireBehaviorLock).
+  writeFileSync(behaviorLockPath, `${JSON.stringify({ ...behaviorLock, distSwapped: true })}\n`, { mode: 0o600 });
 
   const successfulState = mkdtempSync(join(harnessRoot, "state-success-"));
   const successfulEnv = writeEnvironment(successfulState, 17676, { useExistingDist: true });
@@ -826,29 +920,5 @@ try {
   assert.equal(readlinkSync(join(root, "dist")), baseRelease);
   console.log("start-all.behavior.test.mjs: startup, lock handoff, conflict, crash recovery, rollback, and failed rollback passed");
 } finally {
-  stopFakeSessions();
-  for (const path of [join(root, "dist"), join(root, "dist.previous")]) {
-    removeGeneratedArtifact(path, path.endsWith("dist") ? originalDistBackup : originalPreviousBackup);
-  }
-  for (const entry of readdirSync(root)) {
-    if (entry.startsWith("dist.failed-")) {
-      const path = join(root, entry);
-      if (linkSnapshot(path)) removeLink(path);
-    }
-  }
-  rmSync(baseRelease, { recursive: true, force: true });
-  rmSync(candidateRelease, { recursive: true, force: true });
-  if (originalDist?.kind === "link") symlinkSync(originalDist.target, join(root, "dist"));
-  if (originalDist?.kind === "non-link") cpSync(originalDistBackup, join(root, "dist"), { recursive: true });
-  if (originalPrevious?.kind === "link") symlinkSync(originalPrevious.target, join(root, "dist.previous"));
-  if (originalPrevious?.kind === "non-link") cpSync(originalPreviousBackup, join(root, "dist.previous"), { recursive: true });
-  if (!originalDist) removeLink(join(root, "dist"));
-  if (!originalPrevious) removeLink(join(root, "dist.previous"));
-  rmSync(harnessRoot, { recursive: true, force: true });
-  try {
-    const currentLock = JSON.parse(readFileSync(behaviorLockPath, "utf8"));
-    if (currentLock.pid === behaviorLock.pid && currentLock.startToken === behaviorLock.startToken) {
-      rmSync(behaviorLockPath, { force: true });
-    }
-  } catch { /* lock was reclaimed after an interrupted test */ }
+  restoreHarness();
 }

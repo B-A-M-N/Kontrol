@@ -3,6 +3,7 @@ import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { buildToolEnvironment } from "./lib/tool-environment.mjs";
 
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const tempDist = mkdtempSync(join(root, ".kontrol-build-"));
@@ -20,9 +21,9 @@ rmSync(resultPath, { force: true });
 function run(command, args, environment = {}) {
   execFileSync(command, args, {
     cwd: root,
-    // kontrol-env-exception: build tooling spawns the project's own vite/tsc on
-    // trusted build inputs (not repository content); needs PATH/npm lifecycle.
-    env: { ...process.env, KONTROL_BUILD_OUTPUT_DIR: tempDist, ...environment },
+    // P1.10: explicit allowlist so an ambient launcher environment (deploy
+    // id, lock tokens) cannot ride into the build toolchain.
+    env: buildToolEnvironment(process.env, { overrides: { KONTROL_BUILD_OUTPUT_DIR: tempDist, ...environment } }),
     stdio: "inherit",
   });
 }
