@@ -7,6 +7,7 @@
  *  - resolveDeploymentContext parses once, tolerating garbage.
  */
 import assert from "node:assert/strict";
+import { brandDeploymentId } from "./branded.js";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -76,7 +77,7 @@ import { resolveDeploymentContext, stripLauncherAuthority, launcherAuthorityKeys
 
   // An explicitly passed context is honored.
   const stateDir2 = mkdtempSync(join(tmpdir(), "kontrol-runtime-context-test2-"));
-  const handle2 = openDatabase(stateDir2, { deploymentId: "explicit-dep", expectedSchemaVersion: undefined });
+  const handle2 = openDatabase(stateDir2, { deploymentId: brandDeploymentId("explicit-dep"), expectedSchemaVersion: undefined });
   handle2.close();
 }
 

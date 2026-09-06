@@ -5,6 +5,7 @@
  * (P1.3); the createMcpServer closures become an explicit dependency object.
  */
 import * as z from "zod/v4";
+import { brandWorkSessionId, brandWorkspaceId } from "../../branded.js";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { ServerConfig } from "../../config.js";
@@ -299,8 +300,8 @@ export function registerWorkspaceTools(
         const approved = await enforceToolPolicy(
           workSessions,
           policyEnforcer,
-          workspaceId,
-          connectionContext?.workSessionId,
+          brandWorkspaceId(workspaceId),
+          connectionContext?.workSessionId ? brandWorkSessionId(connectionContext.workSessionId) : undefined,
           connectionContext?.runId,
           toolNames.read,
           canonicalPolicyPath(workspace.root, input.path, readPath.absolutePath),
@@ -410,8 +411,8 @@ export function registerWorkspaceTools(
         const approved = await enforceToolPolicy(
           workSessions,
           policyEnforcer,
-          workspaceId,
-          connectionContext?.workSessionId,
+          brandWorkspaceId(workspaceId),
+          connectionContext?.workSessionId ? brandWorkSessionId(connectionContext.workSessionId) : undefined,
           connectionContext?.runId,
           toolNames.write,
           policyPath,
@@ -524,8 +525,8 @@ export function registerWorkspaceTools(
         const approved = await enforceToolPolicy(
           workSessions,
           policyEnforcer,
-          workspaceId,
-          connectionContext?.workSessionId,
+          brandWorkspaceId(workspaceId),
+          connectionContext?.workSessionId ? brandWorkSessionId(connectionContext.workSessionId) : undefined,
           connectionContext?.runId,
           toolNames.edit,
           policyPath,
@@ -648,8 +649,8 @@ export function registerWorkspaceTools(
           const approved = await enforceToolPolicy(
             workSessions,
             policyEnforcer,
-            workspaceId,
-            connectionContext?.workSessionId,
+            brandWorkspaceId(workspaceId),
+            connectionContext?.workSessionId ? brandWorkSessionId(connectionContext.workSessionId) : undefined,
             connectionContext?.runId,
             "apply_patch",
             undefined,
@@ -835,8 +836,8 @@ export function registerWorkspaceTools(
           const approved = await enforceToolPolicy(
             workSessions,
             policyEnforcer,
-            workspaceId,
-            connectionContext?.workSessionId,
+            brandWorkspaceId(workspaceId),
+            connectionContext?.workSessionId ? brandWorkSessionId(connectionContext.workSessionId) : undefined,
             connectionContext?.runId,
             toolNames.grep,
             policyPath,
@@ -932,8 +933,8 @@ export function registerWorkspaceTools(
           const approved = await enforceToolPolicy(
             workSessions,
             policyEnforcer,
-            workspaceId,
-            connectionContext?.workSessionId,
+            brandWorkspaceId(workspaceId),
+            connectionContext?.workSessionId ? brandWorkSessionId(connectionContext.workSessionId) : undefined,
             connectionContext?.runId,
             toolNames.glob,
             policyPath,
@@ -1028,8 +1029,8 @@ export function registerWorkspaceTools(
           const approved = await enforceToolPolicy(
             workSessions,
             policyEnforcer,
-            workspaceId,
-            connectionContext?.workSessionId,
+            brandWorkspaceId(workspaceId),
+            connectionContext?.workSessionId ? brandWorkSessionId(connectionContext.workSessionId) : undefined,
             connectionContext?.runId,
             toolNames.ls,
             policyPath,
@@ -1142,8 +1143,8 @@ export function registerWorkspaceTools(
         const approved = await enforceToolPolicy(
           workSessions,
           policyEnforcer,
-          workspaceId,
-          connectionContext?.workSessionId,
+          brandWorkspaceId(workspaceId),
+          connectionContext?.workSessionId ? brandWorkSessionId(connectionContext.workSessionId) : undefined,
           connectionContext?.runId,
           toolNames.shell,
           policyPath,

@@ -8,6 +8,7 @@
  * with event-routes live in review-barrier.ts.
  */
 import type { Request, Response, Router } from "express";
+import { brandWorkSessionId, brandWorkspaceId } from "../../branded.js";
 import {
   serializeFinalAcpResult,
   type AgentRegistryManager,
@@ -310,8 +311,8 @@ export function registerRunRoutes(
         const { allowed } = await policyEnforcer.enforce({
           principalId: session.id,
           principalRole: "worker",
-          workspaceId: session.workspaceSessionId,
-          workSessionId: session.id,
+          workspaceId: brandWorkspaceId(session.workspaceSessionId),
+          workSessionId: brandWorkSessionId(session.id),
           runId: run.runId,
           tool: canonicalTool,
           path: wsCtx.cwd, // working dir for shell tools
