@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -224,7 +224,20 @@ async function runCli(): Promise<void> {
   throw new Error("Usage: deployment-lock {acquire|check|release} --state-dir PATH");
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))) {
+// Compare canonical paths: a symlinked checkout (worktrees, fixture mirrors)
+// presents argv[1] under the symlink path while import.meta.url is the real
+// one, and a plain resolve() equality would silently skip the CLI.
+function isCliEntrypoint(argv1: string, moduleUrl: string): boolean {
+  const plain = resolve(argv1) === resolve(fileURLToPath(moduleUrl));
+  if (plain) return true;
+  try {
+    return realpathSync(argv1) === realpathSync(fileURLToPath(moduleUrl));
+  } catch {
+    return false;
+  }
+}
+
+if (process.argv[1] && isCliEntrypoint(process.argv[1], import.meta.url)) {
   runCli().catch((error) => {
     console.error(error instanceof Error ? error.message : String(error));
     process.exitCode = 1;
