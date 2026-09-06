@@ -396,7 +396,14 @@ assert.deepEqual(fsCustom, {
   retentionMs: 86400000,
   retainPerWorkspace: 3,
   orphanGraceMs: 1000,
+  excludedDirectories: [],
 });
+
+// P1.6: operator exclusion extensions parse from a comma-separated list.
+assert.deepEqual(
+  loadConfig({ ...baseEnv, KONTROL_FS_SNAPSHOT_EXCLUDED_DIRS: "vendor-custom,generated-tree" }).fsSnapshot.excludedDirectories,
+  ["vendor-custom", "generated-tree"],
+);
 
 // Low water must not exceed high water.
 assert.throws(
