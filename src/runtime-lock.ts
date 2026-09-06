@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { dirname, resolve, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -300,7 +300,23 @@ async function runCli(): Promise<void> {
   throw new Error("Usage: runtime-lock {acquire|release|check|update} --state-dir PATH");
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))) {
+// The resolve() comparison cannot run the CLI when the module is reached
+// through a symlinked checkout (git worktrees, fixture mirrors): argv[1]
+// resolves to the symlink path while import.meta.url is the real one, and
+// the command exits 0 without doing anything. Compare canonical paths so a
+// symlinked checkout behaves like a direct one. Realpath may fail on a
+// yet-to-be-created path; fall back to the plain resolution.
+function isCliEntrypoint(argv1: string, moduleUrl: string): boolean {
+  const plain = resolve(argv1) === resolve(fileURLToPath(moduleUrl));
+  if (plain) return true;
+  try {
+    return realpathSync(argv1) === realpathSync(fileURLToPath(moduleUrl));
+  } catch {
+    return false;
+  }
+}
+
+if (process.argv[1] && isCliEntrypoint(process.argv[1], import.meta.url)) {
   runCli().catch((error) => {
     console.error(error instanceof Error ? error.message : String(error));
     process.exitCode = 1;

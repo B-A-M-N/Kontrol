@@ -4,7 +4,6 @@
 // rollback, and lock handoff rather than source-text shape.
 import assert from "node:assert/strict";
 import {
-  cpSync,
   chmodSync,
   lstatSync,
   mkdirSync,
@@ -18,13 +17,43 @@ import {
   writeFileSync,
   rmSync,
 } from "node:fs";
+import { createHash } from "node:crypto";
+import { realpathSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
-const root = resolve(new URL("..", import.meta.url).pathname);
+const realCheckoutRoot = resolve(new URL("..", import.meta.url).pathname);
 const harnessRoot = mkdtempSync(join(tmpdir(), "kontrol-launcher-behavior-"));
-const behaviorLockPath = join(tmpdir(), "kontrol-start-all-behavior.lock");
+// The launcher derives DESKTOP_PWD from its own location and swaps the dist
+// projection inside it. Rather than mutating the REAL checkout (which races
+// any concurrent suite reading dist/ui/workspace-app.html), every launcher
+// run executes inside a fixture checkout: a temp directory that symlinks all
+// real checkout entries except dist, dist.previous, and releases/, which the
+// fixture owns. The real checkout is never written.
+const root = join(harnessRoot, "checkout");
+mkdirSync(root, { recursive: true });
+for (const entry of readdirSync(realCheckoutRoot, { withFileTypes: true })) {
+  if (["dist", "dist.previous", "releases", ".kontrol-build-result.json"].includes(entry.name)) continue;
+  if (entry.name.startsWith(".kontrol-build-")) continue;
+  symlinkSync(join(realCheckoutRoot, entry.name), join(root, entry.name));
+}
+// P1: the lock was machine-global (/tmp/kontrol-start-all-behavior.lock), so
+// two independent checkouts — parallel agents, worktrees, self-hosted CI —
+// blocked each other's suites. Scope it by UID + canonical checkout root so
+// the same checkout still serializes (each run drives launcher lifecycle
+// scenarios against shared fake-session state) while different checkouts
+// never contend. NOTE: with the fixture checkout the launcher no longer
+// touches the real one, so concurrent runs in the SAME checkout are also
+// safe; the lock remains as cheap insurance for the shared fake-bin state.
+const behaviorLockPath = (() => {
+  const uid = typeof process.getuid === "function" ? process.getuid() : "unknown";
+  const realRoot = (() => {
+    try { return realpathSync(realCheckoutRoot); } catch { return realCheckoutRoot; }
+  })();
+  const scope = createHash("sha256").update(realRoot).digest("hex").slice(0, 12);
+  return join(tmpdir(), `kontrol-start-all-behavior-${uid}-${scope}.lock`);
+})();
 const fakeBin = join(harnessRoot, "bin");
 const fakeTmuxState = join(harnessRoot, "tmux");
 mkdirSync(fakeBin, { recursive: true });
@@ -283,8 +312,17 @@ function liveRuntimeOwner(lock) {
   }
 }
 
-function acquireBehaviorLock() {
+const sleep = (ms) => new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
+
+// P1: wait briefly for a live owner instead of failing immediately — a
+// parallel suite finishing seconds later should not abort this run. The wait
+// is bounded; on timeout the error carries the owner pid for diagnosis.
+const BEHAVIOR_LOCK_WAIT_MS = Number(process.env.KONTROL_BEHAVIOR_LOCK_WAIT_MS ?? 30_000);
+
+async function acquireBehaviorLock() {
   const lock = { pid: process.pid, startToken: processStartToken(process.pid) };
+  const waitStartedAt = Date.now();
+  let lastLiveOwnerPid;
   for (;;) {
     try {
       writeFileSync(behaviorLockPath, `${JSON.stringify(lock)}\n`, { flag: "wx", mode: 0o600 });
@@ -294,30 +332,20 @@ function acquireBehaviorLock() {
       let existing;
       try { existing = JSON.parse(readFileSync(behaviorLockPath, "utf8")); } catch { /* stale or partial test lock */ }
       if (liveOwner(existing)) {
-        rmSync(harnessRoot, { recursive: true, force: true });
-        throw new Error(`start-all.behavior.test.mjs is already running (pid ${existing.pid})`);
-      }
-      // P1.9: a dead owner may have been killed mid-run with the repository
-      // dist projection swapped and its backups inside a harness temp dir
-      // that no longer exists. Surface that loudly instead of silently
-      // continuing on a swapped checkout — the restore needs the backup.
-      if (existing?.distSwapped) {
-        const distPath = join(root, "dist");
-        const previousPath = join(root, "dist.previous");
-        const swapped = [];
-        for (const [path, label] of [[distPath, "dist"], [previousPath, "dist.previous"]]) {
-          try {
-            if (lstatSync(path).isSymbolicLink()) swapped.push(label);
-          } catch { /* absent is fine */ }
-        }
-        if (swapped.length > 0) {
+        lastLiveOwnerPid = existing?.pid;
+        if (Date.now() - waitStartedAt >= BEHAVIOR_LOCK_WAIT_MS) {
+          rmSync(harnessRoot, { recursive: true, force: true });
           throw new Error(
-            `start-all.behavior.test.mjs: a previous interrupted run (pid ${existing.pid}) left ${swapped.join(" and ")} `
-            + "pointing at a temporary test release. Restore it manually (git checkout is not enough for a symlink; "
-            + "rebuild with npm run build or remove the link) and delete " + behaviorLockPath + " to continue.",
+            `start-all.behavior.test.mjs is already running in this checkout (pid ${existing.pid}, `
+            + `waited ${Math.round((Date.now() - waitStartedAt) / 1000)}s for the scoped lock ${behaviorLockPath})`,
           );
         }
+        await sleep(500);
+        continue;
       }
+      // P1.9: a dead owner's leftover lock is reclaimed below. With the
+      // fixture checkout there is no real-checkout dist state to rescue —
+      // the fixture temp dir simply dies with the run.
       const reclaimPath = `${behaviorLockPath}.reclaim-${process.pid}`;
       try {
         renameSync(behaviorLockPath, reclaimPath);
@@ -340,7 +368,7 @@ function stopFakeSessions() {
   }
 }
 
-const behaviorLock = acquireBehaviorLock();
+const behaviorLock = await acquireBehaviorLock();
 
 // P1.9: an interrupted run (SIGINT/SIGTERM/SIGHUP) must not leave the
 // repository dist projection swapped or test-owned launchers running. The
@@ -364,7 +392,7 @@ function restoreHarness() {
     }
   }
   for (const path of [join(root, "dist"), join(root, "dist.previous")]) {
-    removeGeneratedArtifact(path, path.endsWith("dist") ? originalDistBackup : originalPreviousBackup);
+    removeGeneratedArtifact(path, undefined);
   }
   for (const entry of readdirSync(root)) {
     if (entry.startsWith("dist.failed-")) {
@@ -374,12 +402,6 @@ function restoreHarness() {
   }
   rmSync(baseRelease, { recursive: true, force: true });
   rmSync(candidateRelease, { recursive: true, force: true });
-  if (originalDist?.kind === "link") symlinkSync(originalDist.target, join(root, "dist"));
-  if (originalDist?.kind === "non-link") cpSync(originalDistBackup, join(root, "dist"), { recursive: true });
-  if (originalPrevious?.kind === "link") symlinkSync(originalPrevious.target, join(root, "dist.previous"));
-  if (originalPrevious?.kind === "non-link") cpSync(originalPreviousBackup, join(root, "dist.previous"), { recursive: true });
-  if (!originalDist) removeLink(join(root, "dist"));
-  if (!originalPrevious) removeLink(join(root, "dist.previous"));
   rmSync(harnessRoot, { recursive: true, force: true });
   try {
     const currentLock = JSON.parse(readFileSync(behaviorLockPath, "utf8"));
@@ -559,10 +581,6 @@ function waitForPath(path, timeoutMs = 15_000) {
   });
 }
 
-const originalDist = linkSnapshot(join(root, "dist"));
-const originalPrevious = linkSnapshot(join(root, "dist.previous"));
-const originalDistBackup = join(harnessRoot, "original-dist");
-const originalPreviousBackup = join(harnessRoot, "original-dist-previous");
 
 const baseBuildId = "kontrol-test-base-" + process.pid;
 const candidateBuildId = "kontrol-test-candidate-" + process.pid;
@@ -580,20 +598,7 @@ writeFileSync(join(baseRelease, "build-meta.json"), JSON.stringify({
 for (const file of ["cli.js", "server.js", "acp-duplex.js", "ui/workspace-app.html"]) writeFileSync(join(baseRelease, file), "test-artifact\n");
 
 try {
-  if (originalDist?.kind === "link") removeLink(join(root, "dist"));
-  if (originalDist?.kind === "non-link") {
-    cpSync(join(root, "dist"), originalDistBackup, { recursive: true });
-    rmSync(join(root, "dist"), { recursive: true, force: true });
-  }
-  if (originalPrevious?.kind === "link") removeLink(join(root, "dist.previous"));
-  if (originalPrevious?.kind === "non-link") {
-    cpSync(join(root, "dist.previous"), originalPreviousBackup, { recursive: true });
-    rmSync(join(root, "dist.previous"), { recursive: true, force: true });
-  }
   symlinkSync(baseRelease, join(root, "dist"));
-  // P1.9: publish the swap into the behavior lock so an interrupted run's
-  // successor can detect a swapped checkout (see acquireBehaviorLock).
-  writeFileSync(behaviorLockPath, `${JSON.stringify({ ...behaviorLock, distSwapped: true })}\n`, { mode: 0o600 });
 
   const successfulState = mkdtempSync(join(harnessRoot, "state-success-"));
   const successfulEnv = writeEnvironment(successfulState, 17676, { useExistingDist: true });
@@ -758,7 +763,7 @@ try {
   stopFakeSessions();
 
   removeLink(join(root, "dist"));
-  removeGeneratedArtifact(join(root, "dist.previous"), originalPreviousBackup);
+  removeGeneratedArtifact(join(root, "dist.previous"), undefined);
   symlinkSync(baseRelease, join(root, "dist"));
 
   // Exercise the complete restart handoff: A remains healthy during
@@ -849,7 +854,7 @@ try {
   stopFakeSessions();
 
   removeLink(join(root, "dist"));
-  removeGeneratedArtifact(join(root, "dist.previous"), originalPreviousBackup);
+  removeGeneratedArtifact(join(root, "dist.previous"), undefined);
   symlinkSync(baseRelease, join(root, "dist"));
   const rollbackState = mkdtempSync(join(harnessRoot, "state-rollback-"));
   const rollbackEnv = writeEnvironment(rollbackState, 17677, { useExistingDist: false, failBuildId: candidateBuildId });
@@ -906,7 +911,7 @@ try {
   stopFakeSessions();
 
   removeLink(join(root, "dist"));
-  removeGeneratedArtifact(join(root, "dist.previous"), originalPreviousBackup);
+  removeGeneratedArtifact(join(root, "dist.previous"), undefined);
   symlinkSync(baseRelease, join(root, "dist"));
   const failedRollbackState = mkdtempSync(join(harnessRoot, "state-rollback-failed-"));
   const failedRollbackEnv = writeEnvironment(failedRollbackState, 17678, { useExistingDist: false, failAll: true });
