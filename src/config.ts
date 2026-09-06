@@ -229,9 +229,11 @@ function parseFsSnapshotConfig(env: NodeJS.ProcessEnv): FilesystemSnapshotConfig
       ?? DEFAULT_FS_SNAPSHOT_RETAIN_PER_WORKSPACE,
     orphanGraceMs: parseOptionalPositiveInteger(env.KONTROL_FS_SNAPSHOT_ORPHAN_GRACE_MS, "KONTROL_FS_SNAPSHOT_ORPHAN_GRACE_MS")
       ?? DEFAULT_FS_SNAPSHOT_ORPHAN_GRACE_MS,
-    // P1.6: operator-extended capture exclusions (comma-separated names).
-    // These ADD to the default generated/cache exclusions.
-    excludedDirectories: parseEnvironmentAllowlist(env.KONTROL_FS_SNAPSHOT_EXCLUDED_DIRS),
+    // P1.6: operator-extended capture exclusions (comma-separated directory
+    // names). These ADD to the default generated/cache exclusions. Directory
+    // names may contain hyphens/dots, so this is a plain string list — not
+    // the environment-variable allowlist parser.
+    excludedDirectories: parseStringList(env.KONTROL_FS_SNAPSHOT_EXCLUDED_DIRS, []),
   };
   if (parsed.lowWaterBytes !== undefined && parsed.highWaterBytes !== undefined && parsed.lowWaterBytes > parsed.highWaterBytes) {
     throw new Error(
