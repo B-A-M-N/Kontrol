@@ -49,6 +49,7 @@ const assertions = {
   sourceIdentityConsistent: true,
   continuityBounded: true,
   approvalContinuityCapable: true,
+  conversationContinuityProven: true,
 };
 const soak = {
   status: "passed",
