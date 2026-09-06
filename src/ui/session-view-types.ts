@@ -143,3 +143,33 @@ export interface WorkSessionViewState {
   missionLoading?: boolean;
   missionError?: string;
 }
+
+export interface WorkspaceSurfaceSession {
+  sessionId: string;
+  workspaceSessionId: string;
+  status: string;
+  title?: string;
+  submittedBy?: string;
+  runId?: string;
+  lastSeq: number;
+  updatedAt: string;
+  lastHeartbeatAt?: string;
+  lifecycle: string;
+  runtimeState: string;
+  hasMission: boolean;
+  missionStatus?: string;
+  missionCycleNumber?: number;
+  missionMaxCycles?: number;
+  unresolvedMessageCount: number;
+  pendingApprovalCount: number;
+  latestSubmission?: {
+    submissionId: string;
+    submissionNumber: number;
+    status: string;
+    additions: number;
+    removals: number;
+    diffSha256?: string;
+    reviewEpoch?: number;
+  };
+  latestFeedback?: { id: string; submissionId?: string; verdict: string; comments?: string; reviewerId?: string };
+}
