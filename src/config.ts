@@ -204,6 +204,8 @@ export interface FilesystemSnapshotConfig {
   retainPerWorkspace?: number;
   /** Orphan grace (ms): very new unpinned objects are never reaped within this window. */
   orphanGraceMs?: number;
+  /** P1.6: additional directory names excluded from snapshot capture. */
+  excludedDirectories: string[];
 }
 
 const DEFAULT_FS_SNAPSHOT_HIGH_WATER_BYTES = 40 * 1024 * 1024 * 1024;
@@ -227,6 +229,9 @@ function parseFsSnapshotConfig(env: NodeJS.ProcessEnv): FilesystemSnapshotConfig
       ?? DEFAULT_FS_SNAPSHOT_RETAIN_PER_WORKSPACE,
     orphanGraceMs: parseOptionalPositiveInteger(env.KONTROL_FS_SNAPSHOT_ORPHAN_GRACE_MS, "KONTROL_FS_SNAPSHOT_ORPHAN_GRACE_MS")
       ?? DEFAULT_FS_SNAPSHOT_ORPHAN_GRACE_MS,
+    // P1.6: operator-extended capture exclusions (comma-separated names).
+    // These ADD to the default generated/cache exclusions.
+    excludedDirectories: parseEnvironmentAllowlist(env.KONTROL_FS_SNAPSHOT_EXCLUDED_DIRS),
   };
   if (parsed.lowWaterBytes !== undefined && parsed.highWaterBytes !== undefined && parsed.lowWaterBytes > parsed.highWaterBytes) {
     throw new Error(

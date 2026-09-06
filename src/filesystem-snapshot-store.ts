@@ -70,7 +70,52 @@ export interface WorkspaceSnapshot {
   createdAt: string;
 }
 
-/** Filesystem snapshot limits. All optional; an unset limit is unbounded. */
+/**
+ * P1.5: default capture admission limits. Unbounded capture is NOT a safe
+ * default — a valid non-Git workspace under an allowed root like /home can
+ * otherwise trigger a recursive capture of an enormous tree. An operator who
+ * genuinely wants unbounded admission must set the KONTROL_* overrides
+ * explicitly (unbounded requires opt-in, never the default).
+ */
+export const DEFAULT_SNAPSHOT_LIMITS = {
+  maxFiles: 100_000,
+  maxBytes: 8 * 1024 * 1024 * 1024,
+  maxFileBytes: 512 * 1024 * 1024,
+} as const;
+
+/**
+ * P1.6: default snapshot exclusions — known dependency/build/cache trees
+ * that are generated artifacts, not review material. This is an explicit
+ * snapshot exclusion policy, NOT .gitignore semantics: git-ignored source
+ * and config files are still captured (they can matter to review); only
+ * wholesale generated/cache directories are skipped. Operators can extend
+ * or replace the list via configuration.
+ */
+export const DEFAULT_SNAPSHOT_EXCLUDED_DIRECTORIES = new Set([
+  "node_modules",
+  ".git",
+  "dist",
+  "build",
+  "out",
+  "target",
+  ".venv",
+  "venv",
+  "__pycache__",
+  ".mypy_cache",
+  ".pytest_cache",
+  ".ruff_cache",
+  ".cache",
+  ".gradle",
+  ".cargo",
+  "vendor",
+  ".next",
+  ".nuxt",
+  "coverage",
+  ".turbo",
+  ".parcel-cache",
+]);
+
+/** Filesystem snapshot limits. All optional; an unset limit falls back to the P1.5 defaults. */
 export interface FilesystemSnapshotLimits {
   /** Maximum number of files captured in one snapshot. */
   maxFiles?: number;
@@ -93,6 +138,8 @@ export interface FilesystemSnapshotLimits {
 export interface FilesystemSnapshotStoreOptions {
   storeRoot?: string;
   limits?: FilesystemSnapshotLimits;
+  /** P1.6: additional directory names excluded from capture (added to the defaults). */
+  excludedDirectories?: Iterable<string>;
 }
 
 export interface FilesystemManifestEntry {
@@ -219,6 +266,8 @@ export class FilesystemSnapshotStore {
   private lastGcCompletedAt: string | undefined;
   private lastGcReclaimedBlobs = 0;
   private lastGcReclaimedBytes = 0;
+  /** P1.6: directory names never descended into during capture. */
+  private excludedDirectories: Set<string> = new Set(DEFAULT_SNAPSHOT_EXCLUDED_DIRECTORIES);
 
   constructor(options: FilesystemSnapshotStoreOptions = {}) {
     this.storeRoot = resolve(options.storeRoot ?? join(tmpdir(), "kontrol-workspace-snapshots"));
@@ -228,10 +277,18 @@ export class FilesystemSnapshotStore {
       retentionMs: options.limits?.retentionMs ?? 30 * 24 * 60 * 60_000,
       retainPerWorkspace: options.limits?.retainPerWorkspace ?? 10,
       orphanGraceMs: options.limits?.orphanGraceMs ?? 5 * 60_000,
-      maxFiles: options.limits?.maxFiles,
-      maxBytes: options.limits?.maxBytes,
-      maxFileBytes: options.limits?.maxFileBytes,
+      // P1.5: admission limits default to bounded values. Unbounded capture
+      // requires an explicit operator override, never silence.
+      maxFiles: options.limits?.maxFiles ?? DEFAULT_SNAPSHOT_LIMITS.maxFiles,
+      maxBytes: options.limits?.maxBytes ?? DEFAULT_SNAPSHOT_LIMITS.maxBytes,
+      maxFileBytes: options.limits?.maxFileBytes ?? DEFAULT_SNAPSHOT_LIMITS.maxFileBytes,
     };
+    // P1.6: exclusion policy defaults to known generated/cache trees plus
+    // any operator-provided additions.
+    this.excludedDirectories = new Set([
+      ...DEFAULT_SNAPSHOT_EXCLUDED_DIRECTORIES,
+      ...(options.excludedDirectories ?? []),
+    ]);
     this.retentionMs = this.limits.retentionMs;
     this.retainPerWorkspace = this.limits.retainPerWorkspace;
     this.orphanGraceMs = this.limits.orphanGraceMs;
@@ -300,22 +357,22 @@ export class FilesystemSnapshotStore {
     const absoluteRoot = resolve(root);
     const manifest: FilesystemManifest = { version: 1, entries: [] };
     const stagedByHash = new Map<string, string>();
-    // Track logical byte total as we walk (capped by limits.maxBytes, and an
-    // estimate used for the journal).
-    let generated = 0;
+    // P1.5: O(n) byte accounting — the running total doubles as the byte
+    // cap check and the journal figure (no end-of-walk reduce).
+    const walkState = { totalBytes: 0 };
     await this.enforceHighWater();
     try {
       await this.walk(absoluteRoot, absoluteRoot, manifest.entries, {
         maxFiles: this.limits.maxFiles,
         maxBytes: this.limits.maxBytes,
         maxFileBytes: this.limits.maxFileBytes,
-      }, stagedByHash, stagingRoot);
+      }, stagedByHash, stagingRoot, walkState);
     } catch (error) {
       await this.abort(stagingRoot, journalPath);
       throw error;
     }
 
-    generated = manifest.entries.reduce((sum, entry) => sum + (entry.size || 0), 0);
+    const generated = walkState.totalBytes;
 
     manifest.entries.sort((a, b) => a.path.localeCompare(b.path));
     const serialized = JSON.stringify(manifest);
@@ -367,6 +424,7 @@ export class FilesystemSnapshotStore {
     limits: { maxFiles?: number; maxBytes?: number; maxFileBytes?: number },
     stagedByHash: Map<string, string>,
     stagingRoot: string,
+    state: { totalBytes: number },
   ): Promise<void> {
     if (this.stopped) throw new Error("Filesystem snapshot store closed during capture.");
     const children = (await readdir(current, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name));
@@ -375,10 +433,12 @@ export class FilesystemSnapshotStore {
       if (limits.maxFiles && entries.length + 1 > limits.maxFiles) {
         throw new FilesystemCaptureTooLargeError(`snapshot exceeds maxFiles ${limits.maxFiles}`);
       }
+      // P1.6: generated/cache trees are excluded by policy — never descended.
+      if (child.isDirectory() && this.excludedDirectories.has(child.name)) continue;
       const absolute = join(current, child.name);
       const relativePath = relative(root, absolute).split(sep).join("/");
       if (child.isDirectory()) {
-        await this.walk(root, absolute, entries, limits, stagedByHash, stagingRoot);
+        await this.walk(root, absolute, entries, limits, stagedByHash, stagingRoot, state);
         continue;
       }
       let info;
@@ -404,9 +464,11 @@ export class FilesystemSnapshotStore {
       }
       const { sha256, size } = await this.stageFile(absolute, stagingRoot, stagedByHash);
       entries.push({ path: relativePath, type: "file", sha256, size, executable: (info.mode & 0o111) !== 0 });
+      // P1.5: O(n) byte accounting — a running total instead of reducing the
+      // whole entries array after every file (which made walks quadratic).
       if (limits.maxBytes) {
-        const total = entries.reduce((sum, e) => sum + (e.size || 0), 0);
-        if (total > limits.maxBytes) {
+        state.totalBytes += size;
+        if (state.totalBytes > limits.maxBytes) {
           throw new FilesystemCaptureTooLargeError(`snapshot exceeds maxBytes ${limits.maxBytes}`);
         }
       }

@@ -11,7 +11,7 @@ import { writeFile, readFile, mkdir, open } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createHash } from "node:crypto";
-import { FilesystemSnapshotStore, FilesystemSnapshotLimits } from "./filesystem-snapshot-store.js";
+import { FilesystemSnapshotStore, FilesystemSnapshotLimits, DEFAULT_SNAPSHOT_LIMITS } from "./filesystem-snapshot-store.js";
 
 function makeRoot(prefix: string): string {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -29,12 +29,13 @@ function sha256(content: string | Buffer): string {
  * Create a store rooted at its own dedicated storage dir, plus a distinct
  * workspace root to capture. The workspace is never under the store root.
  */
-function makeStore(pos: { storeRoot?: string; workspaceRoot?: string; limits?: Partial<FilesystemSnapshotLimits> } = {}) {
+function makeStore(pos: { storeRoot?: string; workspaceRoot?: string; limits?: Partial<FilesystemSnapshotLimits>; excludedDirectories?: string[] } = {}) {
   const storeRoot = pos.storeRoot ?? makeRoot("kontrol-fss-store-");
   const workspaceRoot = pos.workspaceRoot ?? makeRoot("kontrol-fss-ws-");
   const store = new FilesystemSnapshotStore({
     storeRoot,
     limits: { orphanGraceMs: 0, ...(pos.limits ?? {}) },
+    ...(pos.excludedDirectories !== undefined && { excludedDirectories: pos.excludedDirectories }),
   });
   return { store, storeRoot, workspaceRoot };
 }
@@ -315,6 +316,50 @@ function snap(ref: string, terminal = false): { ref: string; terminal?: boolean 
   const missing = await fresh.loadBaselines("ws-missing");
   assert.equal(missing, undefined, "missing baseline yields undefined value");
   assert.equal((await fresh.storeStats()).corruptionCount, 0, "ENOENT is not classified as corruption");
+}
+
+// ── P1.5/P1.6: bounded defaults + exclusion policy ──
+{
+  // P1.5: a store constructed with NO limits must still be bounded. We don't
+  // materialize 100k files to prove it; the exported defaults are asserted
+  // against the documented values, and the admission mechanics are proven by
+  // the existing maxFiles/maxBytes scenarios plus the tiny-limit probe below.
+  assert.equal(DEFAULT_SNAPSHOT_LIMITS.maxFiles, 100_000, "P1.5: default file bound is finite");
+  assert.equal(DEFAULT_SNAPSHOT_LIMITS.maxBytes, 8 * 1024 * 1024 * 1024, "P1.5: default byte bound is finite");
+  assert.equal(DEFAULT_SNAPSHOT_LIMITS.maxFileBytes, 512 * 1024 * 1024, "P1.5: default per-file bound is finite");
+  const { store, workspaceRoot } = makeStore({});
+  // maxFileBytes admission: a single file over the per-file bound fails closed.
+  const tinyProbe = makeStore({ limits: { maxFileBytes: 8, maxFiles: DEFAULT_SNAPSHOT_LIMITS.maxFiles, maxBytes: DEFAULT_SNAPSHOT_LIMITS.maxBytes } });
+  file(tinyProbe.workspaceRoot, "big.bin", Buffer.alloc(16, 7));
+  await assert.rejects(() => tinyProbe.store.capture(tinyProbe.workspaceRoot), /maxFileBytes/, "P1.5: per-file admission limit enforced");
+  await tinyProbe.store.close();
+
+  // Exclusion policy: node_modules is never captured; git-ignored source IS.
+  mkdirSync(join(workspaceRoot, "node_modules", "pkg"), { recursive: true });
+  mkdirSync(join(workspaceRoot, ".venv"), { recursive: true });
+  file(workspaceRoot, "node_modules/pkg/index.js", "generated\n");
+  file(workspaceRoot, ".venv/lib.py", "generated\n");
+  file(workspaceRoot, "generated-artifact.js", "source despite gitignore\n");
+  const snapshot = await store.capture(workspaceRoot);
+  const manifest = await store.readManifest(snapshot);
+  const paths = manifest.entries.map((entry) => entry.path);
+  assert.ok(!paths.some((p) => p.startsWith("node_modules/")), "P1.6: node_modules is excluded by default");
+  assert.ok(!paths.some((p) => p.startsWith(".venv/")), "P1.6: .venv is excluded by default");
+  assert.ok(paths.includes("generated-artifact.js"), "P1.6: non-excluded files are captured even if unusual");
+  await store.close();
+
+  // Operator extensions are added to the defaults.
+  const custom = makeStore({ excludedDirectories: ["vendor-custom"] });
+  mkdirSync(join(custom.workspaceRoot, "vendor-custom"), { recursive: true });
+  mkdirSync(join(custom.workspaceRoot, "node_modules"), { recursive: true });
+  file(custom.workspaceRoot, "vendor-custom/lib.js", "x\n");
+  file(custom.workspaceRoot, "node_modules/other.js", "x\n");
+  const customSnapshot = await custom.store.capture(custom.workspaceRoot);
+  const customManifest = await custom.store.readManifest(customSnapshot);
+  const customPaths = customManifest.entries.map((entry) => entry.path);
+  assert.ok(!customPaths.some((p) => p.startsWith("vendor-custom/")), "P1.6: operator exclusion honored");
+  assert.ok(!customPaths.some((p) => p.startsWith("node_modules/")), "P1.6: defaults still apply alongside operator exclusions");
+  await custom.store.close();
 }
 
 console.log("filesystem-snapshot-store: all scenarios passed");

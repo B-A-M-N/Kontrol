@@ -1294,6 +1294,15 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
   const workspaces = new WorkspaceRegistry(config, workspaceStore);
   const reviewCheckpoints = createReviewCheckpointManager({
     snapshotStoreRoot: join(config.stateDir, "workspace-snapshots"),
+    snapshotLimits: {
+      // P1.5: operator overrides for capture admission; unset values fall
+      // back to the store's bounded defaults (never unbounded).
+      ...(config.fsSnapshot.maxFiles !== undefined && { maxFiles: config.fsSnapshot.maxFiles }),
+      ...(config.fsSnapshot.maxBytes !== undefined && { maxBytes: config.fsSnapshot.maxBytes }),
+      ...(config.fsSnapshot.maxFileBytes !== undefined && { maxFileBytes: config.fsSnapshot.maxFileBytes }),
+    },
+    // P1.6: operator-extended exclusion list, added to the defaults.
+    excludedDirectories: config.fsSnapshot.excludedDirectories,
   });
   const processSessions = new ProcessSessionManager({
     childEnvironmentAllowlist: config.childEnvironmentAllowlist,
