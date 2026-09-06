@@ -103,6 +103,7 @@ import { isPathInsideRoot } from "./roots.js";
  * 2. cgroup memory limit (container ceiling), when readable
  * 3. total system memory
  */
+import { createPolicyWaiterRegistry } from "./server/policy-waiters.js";
 import {
   handleMcpRequestWithDeadline,
   McpAdmission,
@@ -245,11 +246,8 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
       }
     };
   };
-  const mcpPolicyWaiters = new Map<string, McpPolicyWaiter>();
-  let policyWaiterDisconnects = 0;
-  let policyWaiterResumes = 0;
-  let lastPolicyWaiterDisconnectAt: number | undefined;
-  let lastPolicyWaiterResumeAt: number | undefined;
+  const policyWaiters = createPolicyWaiterRegistry();
+  const mcpPolicyWaiters = policyWaiters.waiters;
   let shuttingDown = false;
   const mcpAdmission = new McpAdmission(
     config.mcpMaxInflight,
@@ -323,61 +321,6 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
       byClient.set(state.logicalClientId, (byClient.get(state.logicalClientId) ?? 0) + state.activeSseStreams);
     }
     return { active, byClient: mapNumberCounts(byClient) };
-  }
-
-  function cancelMcpPolicyWaitersForSession(sessionId: string, _reason: string, requestId?: string): number {
-    let cancelled = 0;
-    for (const waiter of mcpPolicyWaiters.values()) {
-      if (waiter.mcpSessionId !== sessionId) continue;
-      if (requestId && waiter.mcpRequestId !== requestId) continue;
-      if (waiter.signal.aborted) continue;
-      waiter.cancel();
-      cancelled++;
-    }
-    return cancelled;
-  }
-
-  function policyWaiterDiagnostics() {
-    const byWorkspace = new Map<string, number>();
-    const bySession = new Map<string, number>();
-    let oldestStartedAt = Number.POSITIVE_INFINITY;
-    for (const waiter of mcpPolicyWaiters.values()) {
-      byWorkspace.set(waiter.workspaceId, (byWorkspace.get(waiter.workspaceId) ?? 0) + 1);
-      const sessionKey = waiter.mcpSessionId ?? "none";
-      bySession.set(sessionKey, (bySession.get(sessionKey) ?? 0) + 1);
-      oldestStartedAt = Math.min(oldestStartedAt, waiter.startedAt);
-    }
-    const pendingPolicyApprovals = approvalRequests.listPending().filter((request) => request.kind === "tool");
-    const liveApprovalIds = new Set([...mcpPolicyWaiters.values()].map((waiter) => waiter.approvalId));
-    const nowIso = new Date().toISOString();
-    // Zero live waiters is the NORMAL shape of a direct MCP approval: the call
-    // already returned approval_required and only a human decision is pending.
-    // Count a row as orphaned only when its own lifecycle window says so —
-    // a work-session approval lost its parked waiter, or a direct operation's
-    // reattachment grace has actually elapsed.
-    const pendingHumanApproval = pendingPolicyApprovals.filter((approval) => approval.origin === "work_session"
-      ? liveApprovalIds.has(approval.approvalId)
-      : !(approval.reattachDeadline && approval.reattachDeadline <= nowIso)).length;
-    return {
-      activePolicyWaiters: mcpPolicyWaiters.size,
-      policyWaitersByWorkspace: mapNumberCounts(byWorkspace),
-      policyWaitersByMcpSession: mapNumberCounts(bySession),
-      oldestPolicyWaitMs: Number.isFinite(oldestStartedAt) ? Math.max(0, Date.now() - oldestStartedAt) : 0,
-      pendingApprovalRows: pendingPolicyApprovals.length,
-      pendingHumanApproval,
-      detachedLiveWaiters: pendingPolicyApprovals.filter((approval) => approval.origin === "work_session"
-        && !liveApprovalIds.has(approval.approvalId)).length,
-      abandonedOperations: pendingPolicyApprovals.filter((approval) => approval.origin !== "work_session"
-        && Boolean(approval.reattachDeadline && approval.reattachDeadline <= nowIso)).length,
-      orphanedPendingApprovals: pendingPolicyApprovals.filter((approval) => approval.origin === "work_session"
-        ? !liveApprovalIds.has(approval.approvalId)
-        : Boolean(approval.reattachDeadline && approval.reattachDeadline <= nowIso)).length,
-      suspendedExecutionRequests: mcpPolicyWaiters.size,
-      policyWaiterDisconnects,
-      policyWaiterResumes,
-      lastPolicyWaiterDisconnectAt: lastPolicyWaiterDisconnectAt ? new Date(lastPolicyWaiterDisconnectAt).toISOString() : undefined,
-      lastPolicyWaiterResumeAt: lastPolicyWaiterResumeAt ? new Date(lastPolicyWaiterResumeAt).toISOString() : undefined,
-    };
   }
 
   function serveWorkspaceAppResource(
@@ -690,7 +633,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     if (state.identitySource !== "client_info_fallback") {
       logicalContinuity.detach(state.logicalClientId, state.sessionId, now);
     }
-    cancelMcpPolicyWaitersForSession(sessionId, reason === "expired" ? "session_expired" : "transport_closed");
+    policyWaiters.cancelForSession(sessionId, reason === "expired" ? "session_expired" : "transport_closed");
     mcpSessions.delete(sessionId);
     // Direct ephemeral commands belong to the transport and die with it.
     // Work-session commands belong to the durable work session and survive a
@@ -1490,7 +1433,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
         activePolicyWaiters: [...mcpSessions.values()].reduce((sum, s) => sum + s.activePolicyWaiters, 0),
         activeSseStreams: sse.active,
         activeSseStreamsByClient: sse.byClient,
-        policyWaiters: policyWaiterDiagnostics(),
+        policyWaiters: policyWaiters.diagnostics(() => approvalRequests.listPending()),
         admission: {
           execution: executionAdmission,
           waiter: waiterAdmission,
@@ -1762,8 +1705,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     const onPolicyWaitEnd = async (context: PolicyWaitContext & { outcome: PolicyWaitOutcome }): Promise<void> => {
       const waiter = removePolicyWaiter();
       if (context.outcome === "cancelled" && requestAbort.signal.aborted) {
-        policyWaiterDisconnects++;
-        lastPolicyWaiterDisconnectAt = Date.now();
+        policyWaiters.recordDisconnect();
       }
       if (context.outcome !== "approved") {
         restoreSessionExecutionCount();
@@ -1783,8 +1725,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
       }
       admissionRelease = acquired;
       restoreSessionExecutionCount();
-      policyWaiterResumes++;
-      lastPolicyWaiterResumeAt = Date.now();
+      policyWaiters.recordResume();
       if (waiter) {
         logEvent(config.logging, "debug", "mcp_policy_waiter_resumed", {
           requestId,
