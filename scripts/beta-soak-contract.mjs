@@ -20,6 +20,10 @@ export const REQUIRED_BETA_SOAK_ASSERTIONS = Object.freeze([
   "sourceIdentityConsistent",
   "continuityBounded",
   "approvalContinuityCapable",
+  // P1: the trusted-conversation continuity workload must actually run and
+  // recover durable state across transport replacement — not merely re-run
+  // tools/list on a fresh transport.
+  "conversationContinuityProven",
 ]);
 
 export function validateBetaSoakAssertions(assertions) {

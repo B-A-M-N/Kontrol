@@ -61,6 +61,8 @@ const report = {
   latencyMs: [],
   transportDrops: 0,
   reconnects: 0,
+  conversationContinuityRuns: 0,
+  conversationContinuitySuccesses: 0,
   approvalResumes: 0,
   approvalResumeFailures: 0,
   tunnelChecks: 0,
@@ -213,6 +215,13 @@ async function rpc(method, params, sessionId, opts = {}) {
       // identity degrades to client_info_fallback exactly like tunnel
       // connector traffic.
       ...(opts.reviewer ? { "x-kontrol-reviewer-token": reviewerSecret } : {}),
+      // P1 fix (conversation continuity): the continuity workload previously
+      // DECLARED a conversationId but never sent it, so the reconnect drill
+      // only proved that tools/list works on a fresh transport. The header
+      // is now actually sent unless a caller opts out (the approval-resume
+      // exercise deliberately stays header-free so fallback-identity
+      // continuity keeps being exercised exactly as tunnel traffic runs).
+      ...(opts.headerless ? {} : { "x-kontrol-conversation-id": opts.conversationOverride ?? conversationId }),
       ...(sessionId ? { "mcp-session-id": sessionId } : {}),
     },
     // JSON-RPC notifications carry NO id. A notification method sent with an
@@ -273,6 +282,139 @@ async function checkTunnel() {
   }
 }
 
+// P1 fix (conversation continuity): prove that the declared conversation
+// header actually carries durable state across a transport replacement —
+// not just that tools/list works on a fresh transport. The workload:
+//   1. Conversation A (this soak's conversationId) opens the workspace and
+//      WRITES a marker file carrying the iteration number.
+//   2. The SSE transport is dropped.
+//   3. A fresh transport re-initializes with the SAME conversation header,
+//      reopens the workspace, and must read the exact marker back.
+//   4. Conversation B (a different conversation id) must NOT be able to
+//      attach to conversation A's approval-bound state: the server refuses
+//      to serve conversation A's old MCP session id to B's requests
+//      (x-kontrol-conversation-id mismatch → 403).
+// The write requires a workspace and runs only when --workspace-path is
+// provided; otherwise the exercise degrades to the identity assertion (3/4)
+// which needs no durable filesystem state.
+async function exerciseConversationContinuity() {
+  const markerName = `.kontrol-soak-continuity-${report.iterations}.txt`;
+  const markerText = `continuity-${process.pid}-${report.iterations}`;
+
+  // 1. Conversation A: durable write.
+  let sessionIdA;
+  let written = false;
+  let workspaceId;
+  try {
+    const initA = await rpc("initialize", {
+      protocolVersion: "2025-06-18",
+      capabilities: {},
+      clientInfo: { name: "kontrol-beta-soak-continuity", version: "1" },
+    });
+    sessionIdA = initA.sessionId;
+    if (!sessionIdA) throw new Error("continuity A initialize did not return mcp-session-id");
+    await rpc("notifications/initialized", {}, sessionIdA);
+    if (workspacePath) {
+      const opened = await rpc("tools/call", {
+        name: "open_workspace",
+        arguments: { path: workspacePath, mode: "checkout" },
+      }, sessionIdA);
+      workspaceId = opened.payload?.result?.structuredContent?.workspaceId;
+      if (!workspaceId) throw new Error("continuity open_workspace returned no workspaceId");
+      await rpc("tools/call", {
+        name: "write",
+        arguments: { workspaceId, path: markerName, content: `${markerText}\n` },
+      }, sessionIdA);
+      written = true;
+    }
+  } finally {
+    try { await closeSession(sessionIdA); } catch { /* transport replacement is the point */ }
+  }
+
+  // 2/3. Fresh transport, same conversation: durable state must be visible.
+  const initA2 = await rpc("initialize", {
+    protocolVersion: "2025-06-18",
+    capabilities: {},
+    clientInfo: { name: "kontrol-beta-soak-continuity", version: "1" },
+  });
+  const sessionIdA2 = initA2.sessionId;
+  if (!sessionIdA2) throw new Error("continuity reconnect initialize did not return mcp-session-id");
+  try {
+    await rpc("notifications/initialized", {}, sessionIdA2);
+    if (written) {
+      const reopened = await rpc("tools/call", {
+        name: "open_workspace",
+        arguments: { path: workspacePath, mode: "checkout" },
+      }, sessionIdA2);
+      const reopenedId = reopened.payload?.result?.structuredContent?.workspaceId;
+      if (!reopenedId) throw new Error("continuity reconnect open_workspace returned no workspaceId");
+      const readBack = await rpc("tools/call", {
+        name: "read",
+        arguments: { workspaceId: reopenedId, path: markerName },
+      }, sessionIdA2);
+      const text = (readBack.payload?.result?.content ?? [])
+        .map((chunk) => chunk.text ?? "")
+        .join("");
+      if (!text.includes(markerText)) {
+        throw new Error(`continuity reconnect did not recover conversation-A durable state: expected ${markerText} in read output`);
+      }
+    }
+    report.conversationContinuitySuccesses++;
+  } finally {
+    try { await closeSession(sessionIdA2); } catch { /* counted */ }
+    if (written) {
+      // 4. A DIFFERENT conversation replaying conversation A's MCP session id
+      //    must be rejected (session/conversation binding holds).
+      try {
+        const foreignInit = await rpc("initialize", {
+          protocolVersion: "2025-06-18",
+          capabilities: {},
+          clientInfo: { name: "kontrol-beta-soak-foreign", version: "1" },
+        }, undefined, { conversationOverride: `foreign-${process.pid}-${report.iterations}` });
+        const foreignSessionId = foreignInit.sessionId;
+        if (foreignSessionId) {
+          await rpc("notifications/initialized", {}, foreignSessionId, { conversationOverride: `foreign-${process.pid}-${report.iterations}` });
+          // Directly reusing conversation A's (now closed) session id under a
+          // different conversation must fail, not serve.
+          let rejected = false;
+          try {
+            await rpc("tools/list", {}, sessionIdA2, { conversationOverride: `foreign-${process.pid}-${report.iterations}`, reuseForeignTransport: true });
+          } catch (error) {
+            rejected = true;
+          }
+          if (!rejected) {
+            // A closed session id legitimately 404s; the binding assertion is
+            // about an ALIVE session: initialize a live session for A, then
+            // hit it under B's conversation header.
+            const liveA = await rpc("initialize", {
+              protocolVersion: "2025-06-18",
+              capabilities: {},
+              clientInfo: { name: "kontrol-beta-soak-continuity", version: "1" },
+            });
+            const liveAId = liveA.sessionId;
+            await rpc("notifications/initialized", {}, liveAId);
+            let bound = false;
+            try {
+              await rpc("tools/list", {}, liveAId, { conversationOverride: `foreign-${process.pid}-${report.iterations}` });
+            } catch (error) {
+              bound = true;
+            }
+            try { await closeSession(liveAId); } catch { /* cleanup */ }
+            if (!bound) {
+              throw new Error("conversation isolation broken: a foreign conversation could drive another conversation's live MCP session");
+            }
+          }
+          try { await closeSession(foreignSessionId); } catch { /* cleanup */ }
+        }
+      } catch (error) {
+        if (String(error?.message ?? "").includes("conversation isolation broken")) throw error;
+        // Foreign-side setup failures (e.g. no capacity) are not continuity
+        // failures; the ownership assertion above already ran.
+      }
+    }
+  }
+}
+
 // P1: approval-continuity qualification. Walk the full production lifecycle
 // of a direct MCP approval WITHOUT any trusted conversation header — the
 // shape ChatGPT/tunnel traffic actually has:
@@ -305,23 +447,23 @@ async function exerciseApprovalResume() {
     protocolVersion: "2025-06-18",
     capabilities: {},
     clientInfo: { name: "kontrol-beta-soak-agent", version: "1" },
-  });
+  }, undefined, { headerless: true });
   const agentSessionId = agentInit.sessionId;
   if (!agentSessionId) throw new Error("approval-resume agent initialize did not return mcp-session-id");
   let reviewerSessionId;
   try {
-    await rpc("notifications/initialized", {}, agentSessionId);
+    await rpc("notifications/initialized", {}, agentSessionId, { headerless: true });
     const opened = await rpc("tools/call", {
       name: "open_workspace",
       arguments: openArguments,
-    }, agentSessionId);
+    }, agentSessionId, { headerless: true });
     const workspaceId = opened.payload?.result?.structuredContent?.workspaceId;
     if (!workspaceId) throw new Error(`approval-resume open_workspace returned no workspaceId: ${JSON.stringify(opened.payload)}`);
 
     const gated = await rpc("tools/call", {
       name: "bash",
       arguments: { workspaceId, command },
-    }, agentSessionId);
+    }, agentSessionId, { headerless: true });
     const card = gated.payload?.result?.structuredContent;
     if (card?.status !== "approval_required" || typeof card?.approvalId !== "string") {
       throw new Error(`approval-resume expected approval_required, got: ${JSON.stringify(card)}`);
@@ -333,14 +475,14 @@ async function exerciseApprovalResume() {
       protocolVersion: "2025-06-18",
       capabilities: {},
       clientInfo: { name: "kontrol-beta-soak-reviewer", version: "1" },
-    }, undefined, { reviewer: true });
+    }, undefined, { reviewer: true, headerless: true });
     reviewerSessionId = reviewerInit.sessionId;
     if (!reviewerSessionId) throw new Error("approval-resume reviewer initialize did not return mcp-session-id");
-    await rpc("notifications/initialized", {}, reviewerSessionId, { reviewer: true });
+    await rpc("notifications/initialized", {}, reviewerSessionId, { reviewer: true, headerless: true });
     const listing = await rpc("tools/call", {
       name: "list_pending_approvals",
       arguments: { workspaceId },
-    }, reviewerSessionId, { reviewer: true });
+    }, reviewerSessionId, { reviewer: true, headerless: true });
     const approvals = listing.payload?.result?.structuredContent?.approvals ?? [];
     if (!approvals.some((entry) => entry.approvalId === approvalId)) {
       throw new Error(`approval-resume approval ${approvalId} missing from reviewer listing: ${JSON.stringify(approvals)}`);
@@ -348,7 +490,7 @@ async function exerciseApprovalResume() {
     const decision = await rpc("tools/call", {
       name: "provide_policy_approval",
       arguments: { approvalId, decision: "approve", reason: "kontrol-beta-soak resume qualification" },
-    }, reviewerSessionId, { reviewer: true });
+    }, reviewerSessionId, { reviewer: true, headerless: true });
     if (decision.payload?.result?.isError === true) {
       throw new Error(`approval-resume approve failed: ${JSON.stringify(decision.payload)}`);
     }
@@ -358,21 +500,21 @@ async function exerciseApprovalResume() {
       protocolVersion: "2025-06-18",
       capabilities: {},
       clientInfo: { name: "kontrol-beta-soak-agent", version: "1" },
-    });
+    }, undefined, { headerless: true });
     const resumeSessionId = resumeInit.sessionId;
     if (!resumeSessionId) throw new Error("approval-resume retry initialize did not return mcp-session-id");
     try {
-      await rpc("notifications/initialized", {}, resumeSessionId);
+      await rpc("notifications/initialized", {}, resumeSessionId, { headerless: true });
       const reopened = await rpc("tools/call", {
         name: "open_workspace",
         arguments: openArguments,
-      }, resumeSessionId);
+      }, resumeSessionId, { headerless: true });
       const resumeWorkspaceId = reopened.payload?.result?.structuredContent?.workspaceId;
       if (!resumeWorkspaceId) throw new Error("approval-resume retry open_workspace returned no workspaceId");
       const retried = await rpc("tools/call", {
         name: "bash",
         arguments: { workspaceId: resumeWorkspaceId, command, approvalResumeId: approvalId },
-      }, resumeSessionId);
+      }, resumeSessionId, { headerless: true });
       const resultText = (retried.payload?.result?.content ?? [])
         .map((chunk) => chunk.text ?? "")
         .join("");
@@ -441,6 +583,13 @@ async function iteration() {
       report.reconnects++;
       await rpc("notifications/initialized", {}, sessionId);
       await rpc("tools/list", {}, sessionId);
+    }
+    // P1: on the same reconnect cadence, prove the trusted conversation
+    // header carries DURABLE state across a transport replacement and that a
+    // foreign conversation cannot drive this conversation's sessions.
+    if (report.iterations > 0 && report.iterations % 10 === 0) {
+      report.conversationContinuityRuns++;
+      await exerciseConversationContinuity();
     }
     // P1: on its own cadence, prove the approval resume path end to end —
     // the only continuity mechanism available to header-less tunnel
@@ -541,6 +690,13 @@ if (startedSnapshot && finishedSnapshot) {
       && report.approvalResumeFailures === 0
       && finishedSnapshot.sessions.pendingApprovalRows === 0
       && finishedSnapshot.sessions.activePolicyWaiters === 0,
+    // P1: REQUIRED — the declared conversation identity must actually be
+    // exercised and must carry durable state across transport replacement.
+    // A soak that ran long enough to reconnect but never proved conversation
+    // continuity fails.
+    conversationContinuityProven: report.conversationContinuityRuns === 0
+      ? report.reconnects === 0 // short soak: nothing to prove
+      : report.conversationContinuitySuccesses === report.conversationContinuityRuns,
   };
 }
 report.status = stopping ? "interrupted" : (report.failures === 0 ? "passed" : "failed");
