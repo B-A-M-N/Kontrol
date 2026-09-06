@@ -5,7 +5,7 @@ import { join } from "node:path";
 // P1.4: the app is decomposed across sibling modules; contract assertions
 // below that name extracted literals scan the module cluster, not only the
 // composition entrypoint.
-const uiModuleSources = ["workspace-app.tsx", "ui-dom.ts", "ui-format.ts", "approval-center.ts", "session-view-helpers.ts", "tool-display.ts", "session-views.ts", "session-view-types.ts", "server-tool-call.ts", "review-feedback.ts", "mission-panel.ts", "workspace-event-reducer.ts", "session-hydration.ts", "payload-mount.ts"]
+const uiModuleSources = ["workspace-app.tsx", "ui-dom.ts", "ui-format.ts", "approval-center.ts", "session-view-helpers.ts", "tool-display.ts", "session-views.ts", "session-view-types.ts", "server-tool-call.ts", "review-feedback.ts", "mission-panel.ts", "workspace-event-reducer.ts", "session-hydration.ts", "payload-mount.ts", "session-surface.ts"]
   .map((name) => readFileSync(new URL(`./${name}`, import.meta.url), "utf8"))
   .join("\n");
 const source = readFileSync(new URL("./workspace-app.tsx", import.meta.url), "utf8");
@@ -23,13 +23,16 @@ assert.match(uiModuleSources, /The server did not provide a reusable scope/, "th
 assert.match(uiModuleSources, /reviewEpoch: s\.latestSubmission\.reviewEpoch/, "rehydration must preserve the canonical review epoch");
 assert.doesNotMatch(source, /reviewEpoch: Number\(card\?\.summary\?\.reviewEpoch \?\? sc\.reviewEpoch \?\? 0\)/, "review identity must not fabricate epoch zero");
 assert.doesNotMatch(source, /diffSha256: String\(card\?\.summary\?\.diffSha256 \?\? sc\.diffSha256 \?\? ""\)/, "review identity must not fabricate an empty diff hash");
-assert.match(source, /Needs your input/, "open agent messages must have a visible high-priority surface");
+assert.match(uiModuleSources, /Needs your input/, "open agent messages must have a visible high-priority surface");
 assert.match(uiModuleSources, /Rich renderer failed/, "plain text is only a rich-renderer failure fallback");
 
-const workSessionStart = source.indexOf("function renderWorkSessionView");
-const workSessionEnd = source.indexOf("function createWorkSessionDom");
+// P1.4: renderWorkSessionView lives in session-surface.ts; the structural
+// claim is unchanged — the composed session view must not rebuild the whole DOM.
+const surfaceSource = readFileSync(new URL("./session-surface.ts", import.meta.url), "utf8");
+const workSessionStart = surfaceSource.indexOf("export function renderWorkSessionView");
+const workSessionEnd = surfaceSource.indexOf("export function createWorkSessionDom");
 assert.ok(workSessionStart >= 0 && workSessionEnd > workSessionStart);
-assert.doesNotMatch(source.slice(workSessionStart, workSessionEnd), /appRoot\.replaceChildren\(main\)/, "work-session telemetry must not rebuild the whole DOM");
+assert.doesNotMatch(surfaceSource.slice(workSessionStart, workSessionEnd), /appRoot\.replaceChildren\(main\)/, "work-session telemetry must not rebuild the whole DOM");
 
 const documentRules = css.slice(css.indexOf("html,"), css.indexOf(".shell"));
 assert.doesNotMatch(documentRules, /overflow:\s*hidden/, "the document must be allowed to scroll");
