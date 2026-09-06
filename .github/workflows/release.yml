@@ -1,0 +1,89 @@
+name: Release
+
+# Publishes an npm release ONLY from an exact, qualified immutable candidate.
+#
+# The non-negotiable rule (public-beta audit P2): the 12-hour soak qualifies a
+# specific candidate — never rebuild after qualification. This workflow
+# therefore refuses to run the toolchain at all: it verifies that
+# beta-qualification.json says qualified=true for the candidate whose buildId
+# and source SHA match this checkout, stages the package from that immutable
+# candidate directory (scripts/package-stage.mjs --skip-build), and publishes
+# with npm provenance. Any identity mismatch aborts before a credential is
+# even loaded.
+#
+# Trigger: workflow_dispatch with the candidate buildId, run from the commit
+# the candidate was built from.
+
+on:
+  workflow_dispatch:
+    inputs:
+      buildId:
+        description: "Immutable candidate buildId (releases/<buildId>) from the qualified beta-qualification.json"
+        required: true
+      dry-run:
+        description: "Stage and verify the package without publishing"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify-qualification:
+    name: Verify qualification receipt matches the candidate
+    runs-on: ubuntu-latest
+    outputs:
+      buildId: ${{ steps.candidate.outputs.buildId }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Setup Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22.19.0
+
+      - name: Verify final qualification receipt
+        id: candidate
+        env:
+          KONTROL_RELEASE_BUILD_ID: ${{ inputs.buildId }}
+        run: node scripts/release-verify.mjs
+
+  publish:
+    name: Publish qualified candidate to npm
+    runs-on: ubuntu-latest
+    needs: verify-qualification
+    permissions:
+      contents: read
+      # npm provenance requires id-token: the workflow's OIDC token is
+      # exchanged by the registry to attest the build provenance.
+      id-token: write
+    environment: npm-publish
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Setup Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22.19.0
+          registry-url: https://registry.npmjs.org
+
+      # Re-verify inside the publishing job too: the publishing job must not
+      # depend on the trustworthiness of a prior job's conclusion alone.
+      - name: Re-verify final qualification receipt
+        env:
+          KONTROL_RELEASE_BUILD_ID: ${{ inputs.buildId }}
+        run: node scripts/release-verify.mjs
+
+      - name: Stage package from the qualified immutable candidate
+        env:
+          KONTROL_RELEASE_BUILD_ID: ${{ inputs.buildId }}
+        run: node scripts/package-stage.mjs --skip-build --publish-verify-only
+
+      - name: Publish
+        if: ${{ inputs.dry-run != true }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          KONTROL_RELEASE_BUILD_ID: ${{ inputs.buildId }}
+        run: node scripts/package-stage.mjs --skip-build --publish
