@@ -142,7 +142,33 @@ try {
               },
             };
           case "list_pending_approvals":
-            return { isError: false, content: [], structuredContent: { approvals: [] } };
+            // Consistent with the snapshot's pendingApprovals: production
+            // draws both from the same approval store, and the UI treats this
+            // listing as authoritative (an inconsistent fixture made the
+            // reconcile delete the snapshot-sourced card depending on which
+            // response landed last — a latent ordering flake).
+            return {
+              isError: false,
+              content: [],
+              structuredContent: {
+                approvals: [{
+                  approvalId: "approval-browser",
+                  title: "Approve bash",
+                  description: "A browser test approval",
+                  tool: "bash",
+                  origin: "work_session",
+                  workSessionId: sessionId,
+                  liveWaiterCount: 1,
+                  state: "pending_human_approval",
+                  requestedAt: nowValue,
+                  createdAt: nowValue,
+                  options: [
+                    { id: "allow_once", label: "Allow once", effect: "approve", scope: "once" },
+                    { id: "deny", label: "Deny", effect: "deny" },
+                  ],
+                }],
+              },
+            };
           case "inspect_supervised_work":
             return { isError: false, content: [], structuredContent: { packet: {} } };
           case "await_workspace_events":
