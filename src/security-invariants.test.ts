@@ -89,7 +89,13 @@ import { openDatabase } from "./db/client.js";
 // new mutation tool that does not cross runMutationBarrier fails here.
 {
   const { readFileSync } = await import("node:fs");
-  const source = readFileSync(new URL("./mcp/workspace-server.ts", import.meta.url), "utf8");
+  // P1.3 decomposition: the workspace tool registrations live in
+  // src/mcp/tools/*.ts; scan every workspace-tool module for barrier crossings.
+  const { readdirSync } = await import("node:fs");
+  const toolSources = ["./mcp/tools/workspace.ts", "./mcp/tools/process.ts"]
+    .map((rel) => readFileSync(new URL(rel, import.meta.url), "utf8"))
+    .join("\n");
+  const source = toolSources;
   const mutationTools = ["toolNames.write", "toolNames.edit", "toolNames.shell", "\"apply_patch\"", "\"exec_command\""];
 
   // Every mutation-capable handler must cross runMutationBarrier. Count the
