@@ -143,6 +143,7 @@ import {
   type WorkspaceAppResourceMetrics,
 } from "./server/mcp-session-state.js";
 import { deriveAuth } from "./server/auth.js";
+import { createHttpApp, mountWorkspaceAppAssets } from "./server/app.js";
 import { createWorkspaceAppResourceServer } from "./server/workspace-resource-route.js";
 // P1.2 decomposition: admission classes/weights/queue live in
 // src/server/mcp-admission.ts; session-state types, identity derivation, and
@@ -185,20 +186,6 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     );
   }
 
-  const allowedHosts = config.allowedHosts.includes("*")
-    ? undefined
-    : Array.from(new Set([config.host, ...config.allowedHosts]));
-  // Build the app locally so route-level body parsers remain under Kontrol's
-  // control. The SDK helper installs an unconditional express.json() parser
-  // with its ~100 KB default before callers can add a larger MCP/ACP limit.
-  const app = express();
-  if (allowedHosts) {
-    app.use(hostHeaderValidation(allowedHosts));
-  } else if (["127.0.0.1", "localhost", "::1"].includes(config.host)) {
-    app.use(localhostHostValidation());
-  } else if (config.host === "0.0.0.0" || config.host === "::") {
-    console.warn(`[kontrol] Server is binding to ${config.host} without DNS rebinding protection.`);
-  }
   const buildMeta = readBuildIdentity(join(dirname(fileURLToPath(import.meta.url)), "build-meta.json"));
   const transports = new Map<string, Transport>();
   const mcpSessions = new Map<string, McpSessionState>();
@@ -278,6 +265,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
   const workspaceAppResources = createWorkspaceAppResourceServer(config, workspaceAppResourceMetrics);
   const serveWorkspaceAppResource = workspaceAppResources.serve;
   const { oauthEnabled, oauthProvider, bearerAuth, resourceServerUrl } = deriveAuth(config);
+  const { app } = createHttpApp({ config, oauthProvider, resourceServerUrl, bearerAuth });
   // ONE shared DB handle for every manager + the review workflow service, so the
   // workflow can commit state + event log in a SINGLE transaction (P1 #15).
   // P0.3: deployment identity flows from the entrypoint-resolved context via
@@ -469,103 +457,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
   // P1 #7: pass the parsed trusted-proxy spec straight to Express. A hop
   // count ("1") or "loopback" scopes forwarded-header trust precisely;
   // undefined leaves Express's default (no proxy trusted).
-  if (config.logging.trustProxy) {
-    app.set(
-      "trust proxy",
-      config.logging.trustProxy === "true" ? true : config.logging.trustProxy,
-    );
-  }
-
-  app.use((req, res, next) => {
-    const requestId = randomUUID();
-    const startedAt = performance.now();
-    res.locals.requestId = requestId;
-
-    res.on("finish", () => {
-      const path = requestPath(req);
-      if (!config.logging.requests) return;
-      if (!config.logging.assets && path.startsWith("/mcp-app-assets")) return;
-
-      logEvent(config.logging, "info", "http_request", {
-        requestId,
-        method: req.method,
-        path,
-        status: res.statusCode,
-        durationMs: Math.round(performance.now() - startedAt),
-        rpcMethod: typeof req.body?.method === "string" ? req.body.method : undefined,
-        resourceUri: req.body?.method === "resources/read" && typeof req.body?.params?.uri === "string"
-          ? req.body.params.uri
-          : undefined,
-        ...requestLogFields(req, config),
-      });
-    });
-
-    next();
-  });
-
-  if (oauthProvider) {
-    app.use(
-      mcpAuthRouter({
-        provider: oauthProvider,
-        issuerUrl: new URL(config.publicBaseUrl),
-        baseUrl: new URL(config.publicBaseUrl),
-        resourceServerUrl,
-        scopesSupported: config.oauth.scopes,
-        resourceName: "Kontrol",
-      }),
-    );
-  } else if (config.authMode === "tunnel") {
-    // Tunnel mode has no OAuth gate on /mcp, but the OpenAI tunnel-client
-    // probes these discovery paths during readiness. Serve static metadata so
-    // discovery succeeds and the tunnel reports ready; we do NOT actually
-    // authenticate on /mcp (access is the loopback + tunnel boundary).
-    const mcpResource = new URL("/mcp", config.publicBaseUrl).href;
-    const metadata = {
-      resource: mcpResource,
-      authorization_servers: [],
-      bearer_methods_supported: ["header"],
-      scopes_supported: config.oauth.scopes,
-      resource_documentation: "https://github.com/B-A-M-N/Kontrol",
-    };
-    const discovery = (_req: Request, res: Response) => {
-      res.setHeader("Access-Control-Allow-Origin", "*");
-      res.json(metadata);
-    };
-    app.get("/.well-known/oauth-protected-resource", discovery);
-    app.get("/.well-known/oauth-protected-resource/mcp", discovery);
-    app.get("/.well-known/oauth-authorization-server", (_req, res) => {
-      res.setHeader("Access-Control-Allow-Origin", "*");
-      res.status(404).json({ error: { code: "not_found", message: "OAuth disabled in tunnel mode" } });
-    });
-  }
-
-  // Authenticate protected requests before consuming their bodies, then parse
-  // each protocol with its own explicit finite limit. This keeps a large
-  // unauthenticated request from spending parser memory and avoids the SDK's
-  // unconditional ~100 KB parser.
-  if (bearerAuth) {
-    app.use("/mcp", (req, res, next) => bearerAuth!(req, res, next));
-  }
-  if (config.acpEnabled) {
-    app.use(
-      "/acp",
-      authenticatedAcpBodyGate(config),
-      rejectOversizedBody(ACP_HTTP_BODY_LIMIT_BYTES, "acp"),
-      express.json({ limit: ACP_HTTP_BODY_LIMIT_BYTES }),
-    );
-  }
-  app.use(
-    "/mcp",
-    rejectOversizedBody(MCP_HTTP_BODY_LIMIT_BYTES, "mcp"),
-    express.json({ limit: MCP_HTTP_BODY_LIMIT_BYTES }),
-  );
-
-  app.options("/mcp-app-assets/{*asset}", workspaceAppResources.assetRoutes[0]);
-
-  app.use(
-    "/mcp-app-assets",
-    workspaceAppResources.assetRoutes[1],
-  );
+  mountWorkspaceAppAssets(app);
   app.get("/healthz", (_req, res) => healthz(res));
 
   // Core readiness is used while KONTROL is starting before adapters register.
