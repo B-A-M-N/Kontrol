@@ -5,7 +5,7 @@ import { join } from "node:path";
 // P1.4: the app is decomposed across sibling modules; contract assertions
 // below that name extracted literals scan the module cluster, not only the
 // composition entrypoint.
-const uiModuleSources = ["workspace-app.tsx", "ui-dom.ts", "ui-format.ts", "approval-center.ts", "session-view-helpers.ts", "tool-display.ts"]
+const uiModuleSources = ["workspace-app.tsx", "ui-dom.ts", "ui-format.ts", "approval-center.ts", "session-view-helpers.ts", "tool-display.ts", "session-views.ts", "session-view-types.ts", "server-tool-call.ts", "review-feedback.ts"]
   .map((name) => readFileSync(new URL(`./${name}`, import.meta.url), "utf8"))
   .join("\n");
 const source = readFileSync(new URL("./workspace-app.tsx", import.meta.url), "utf8");
@@ -18,8 +18,8 @@ assert.match(source, /requestAnimationFrame/, "event-driven renders must be fram
 assert.match(source, /await_workspace_events/, "the WebUI must use one workspace event watcher");
 assert.match(source, /list_pending_approvals/, "the WebUI must rehydrate approvals missed during reconnect");
 assert.match(uiModuleSources, /__approval_center__/, "direct workspace approvals need a visible fallback surface");
-assert.match(source, /option\.scope === "workspace"/, "the WebUI must honor a server-supplied workspace-level approval scope (P1.9)");
-assert.match(source, /The server did not provide a reusable scope/, "the WebUI must not invent missing policy scope semantics");
+assert.match(uiModuleSources, /option\.scope === "workspace"/, "the WebUI must honor a server-supplied workspace-level approval scope (P1.9)");
+assert.match(uiModuleSources, /The server did not provide a reusable scope/, "the WebUI must not invent missing policy scope semantics");
 assert.match(source, /reviewEpoch: s\.latestSubmission\.reviewEpoch/, "rehydration must preserve the canonical review epoch");
 assert.doesNotMatch(source, /reviewEpoch: Number\(card\?\.summary\?\.reviewEpoch \?\? sc\.reviewEpoch \?\? 0\)/, "review identity must not fabricate epoch zero");
 assert.doesNotMatch(source, /diffSha256: String\(card\?\.summary\?\.diffSha256 \?\? sc\.diffSha256 \?\? ""\)/, "review identity must not fabricate an empty diff hash");
