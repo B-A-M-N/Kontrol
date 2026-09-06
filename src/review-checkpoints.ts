@@ -130,6 +130,8 @@ const REVIEW_REF_PREFIX = "refs/kontrol/review";
 export function createReviewCheckpointManager(options: {
   snapshotStoreRoot?: string;
   snapshotLimits?: FilesystemSnapshotLimits;
+  /** P1.6: additional excluded directory names (added to the defaults). */
+  excludedDirectories?: Iterable<string>;
   fsStore?: FilesystemSnapshotStore;
 } = {}): ReviewCheckpointManager {
   const states = new Map<string, WorkspaceReviewStateWithInit>();
@@ -144,6 +146,7 @@ export function createReviewCheckpointManager(options: {
         storeRoot: options.snapshotStoreRoot ?? join(tmpdir(), "kontrol-workspace-snapshots"),
         store: options.fsStore,
         limits: options.snapshotLimits,
+        excludedDirectories: options.excludedDirectories,
       });
     }
     return fsBackend;
@@ -446,8 +449,8 @@ export class FilesystemCheckpointBackend implements CheckpointBackend {
   /** The transactional store backing this backend. */
   readonly store: FilesystemSnapshotStore;
 
-  constructor(options: { storeRoot?: string; store?: FilesystemSnapshotStore; limits?: FilesystemSnapshotLimits } = {}) {
-    this.store = options.store ?? new FilesystemSnapshotStore({ storeRoot: options.storeRoot, limits: options.limits });
+  constructor(options: { storeRoot?: string; store?: FilesystemSnapshotStore; limits?: FilesystemSnapshotLimits; excludedDirectories?: Iterable<string> } = {}) {
+    this.store = options.store ?? new FilesystemSnapshotStore({ storeRoot: options.storeRoot, limits: options.limits, excludedDirectories: options.excludedDirectories });
   }
 
   async capture(root: string, context?: { workSessionStatus?: string; createdAt?: string }): Promise<WorkspaceSnapshot> {
