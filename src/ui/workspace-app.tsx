@@ -296,7 +296,7 @@ setLifecycleHost({
       if (!app) throw new Error("The MCP host connection is unavailable.");
       await app.connect();
     },
-    getHostContext: () => hostContext,
+    getHostContext: () => app?.getHostContext(),
     setHostContext: (v) => { hostContext = v as HostContext | undefined; },
     applyHostContext,
     setConnected: (v) => { connected = v; },
