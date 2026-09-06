@@ -1,6 +1,6 @@
 import { execSync } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
 import type { Socket } from "node:net";
 import os from "node:os";
@@ -48,6 +48,7 @@ import { createMaintenanceCoordinator } from "./runtime/maintenance.js";
 import { createDatabaseIntegrityMonitor } from "./runtime/database-integrity.js";
 import { createStartupReconciliation } from "./server/startup-recovery.js";
 import { createShutdownController } from "./server/shutdown.js";
+import { createAcpRuntime } from "./server/acp-runtime.js";
 import {
   constantTimeStringEqual,
   createMcpServer,
@@ -67,15 +68,13 @@ import { formatAgentsPath, WorkspaceRegistry } from "./workspaces.js";
 import { createWorkSessionManager, type WorkSessionManager } from "./work-sessions.js";
 import { createAgentRegistryManager } from "./acp-registry.js";
 import { createAcpServer } from "./acp-server.js";
-import { registerBridgeTools, createContinuationDispatcher, type ContinuationDispatcher, type LiveWaiterRegistry, type BridgeConfig } from "./acp-bridge.js";
+import { type ContinuationDispatcher, type LiveWaiterRegistry } from "./acp-bridge.js";
 import { createEventStore } from "./event-log.js";
 import { createContinuationManager } from "./continuation.js";
 import { createDispatchOutbox } from "./dispatch-outbox.js";
 import { setDefaultAcpTimeout } from "./acp-gateway.js";
 import { createSupervisorRuns } from "./supervisor-runs.js";
-import { createSupervisorRuntime } from "./supervisor-runtime.js";
-import { shutdownMissionVerifiers, verifyMissionSubmission } from "./mission-verifier.js";
-import { evaluateSupervisorMission } from "./supervisor-evaluator.js";
+import { shutdownMissionVerifiers } from "./mission-verifier.js";
 import { createReviewWorkflowService, type ReviewWorkflowService } from "./review-workflow.js";
 import { databasePath, openDatabase, type DatabaseHandle } from "./db/client.js";
 import { LATEST_SCHEMA_VERSION } from "./db/migrations.js";
@@ -759,154 +758,17 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     next(error);
   });
 
-  // Singleton continuation dispatcher — owned by the Kontrol process, not by an
-  // individual MCP client connection. Shares the SAME liveWaiters instance used
-  // by every createMcpServer so a parked agent suppresses duplicate dispatch.
   let dispatcher: ContinuationDispatcher | undefined;
-  let supervisorRuntime: ReturnType<typeof createSupervisorRuntime> | undefined;
+  let supervisorRuntime: import("./supervisor-runtime.js").SupervisorRuntime | undefined;
   if (config.acpEnabled) {
-    const bridgeBase: BridgeConfig = {
-      workspaces,
-      workSessions,
-      reviewCheckpoints,
-      agentRegistry,
-      eventStore,
-      continuationManager,
-      dispatchOutbox,
+    const acp = createAcpRuntime({
+      config,
+      bridge: { workspaces, workSessions, reviewCheckpoints, agentRegistry, eventStore, continuationManager, dispatchOutbox, missionLedger, supervisorRuns, agentMessages, liveWaiters },
       reviewWorkflow,
-      missionLedger,
-      supervisorRuns,
-      onSupervisorResume: (workSessionId) => supervisorRuntime?.wake(workSessionId),
-      agentMessages,
-      knownAgents: config.acpKnownAgents,
-      adapterSecret: config.acpAdapterSecret,
-      liveWaiters,
-    };
-    dispatcher = createContinuationDispatcher(bridgeBase);
-    dispatcher.start();
-    supervisorRuntime = createSupervisorRuntime({
-      outbox: dispatchOutbox,
-      events: eventStore,
-      runs: supervisorRuns,
-      // P0.3: config-injected; the env fallback inside supervisor-runtime is
-      // then dead for server paths.
-      maxInflight: config.supervisorMaxInflight,
-      onVerify: async (workSessionId, deadlineAt, submission) => {
-        await verifyMissionSubmission({
-          workSessionId,
-          maxInflight: config.verifyMaxInflight,
-          sandbox: config.verifySandbox,
-          childEnvironmentAllowlist: config.childEnvironmentAllowlist,
-          verifyToolchainPaths: config.verifyToolchainPaths,
-          sandboxExecutablePath: config.verifySandboxExecutable,
-          missionLedger,
-          workSessions,
-          workspaces,
-          reviewCheckpoints,
-          deadlineAtMs: deadlineAt ? Date.parse(deadlineAt) : undefined,
-          submissionId: submission?.id,
-          reviewEpoch: submission?.reviewEpoch,
-        });
-      },
-      onEvaluate: async (workSessionId) => {
-        const run = supervisorRuns.getByWorkSession(workSessionId);
-        const latest = workSessions.get(workSessionId)?.latestSubmission;
-        return evaluateSupervisorMission(missionLedger, workSessionId, {
-          submissionId: latest?.id,
-          snapshotKind: latest?.snapshotKind,
-          snapshotRef: latest?.snapshotRef ?? latest?.snapshotCommit,
-          snapshotCommit: latest?.snapshotRef ?? latest?.snapshotCommit,
-          cycleNumber: run?.cycleNumber ?? 0,
-          emergencyCycleCeiling: run?.maxCycles,
-        });
-      },
-      onTiming: (sample) => {
-        recordPhaseTiming(`supervisor.${sample.stage}.event_to_claim`, sample.eventToClaimMs);
-        recordPhaseTiming(`supervisor.${sample.stage}.total`, sample.totalMs);
-        if (sample.verificationMs !== undefined) recordPhaseTiming("supervisor.verification.duration", sample.verificationMs);
-        if (sample.evaluationMs !== undefined) recordPhaseTiming("supervisor.evaluation.duration", sample.evaluationMs);
-      },
-      getProgressSnapshot: (workSessionId, evaluation) => {
-        const session = workSessions.get(workSessionId);
-        const latest = session?.latestSubmission;
-        const packet = missionLedger.getPacket(workSessionId, latest?.id ? { submissionId: latest.id, snapshotKind: latest.snapshotKind, snapshotRef: latest.snapshotRef ?? latest.snapshotCommit, snapshotCommit: latest.snapshotRef ?? latest.snapshotCommit, reviewEpoch: latest.reviewEpoch } : undefined);
-        const currentEvidence = packet.evidence.filter((entry) => !latest?.id || entry.submissionId === latest.id);
-        const failedEvidence = currentEvidence.filter((entry) => entry.status === "failed");
-        const failureSet = failedEvidence.map((entry) => {
-          const details = typeof entry.details === "object" && entry.details ? entry.details as Record<string, unknown> : {};
-          return { command: entry.command, failureSetSha256: details.failureSetSha256, outputSha256: details.outputSha256, status: entry.status };
-        });
-        const summary = latest?.summaryJson ? (() => { try { return JSON.parse(latest.summaryJson) as { files?: number }; } catch { return {}; } })() : {};
-        return {
-          blockingFindingCount: packet.findings.filter((finding) => finding.scope !== "out_of_scope" && ["blocker", "high"].includes(finding.severity) && !["verified_resolved", "waived"].includes(finding.status)).length,
-          failedCriterionCount: packet.criteria.filter((criterion) => criterion.priority === "required" && criterion.status === "failed").length,
-          passedCriterionCount: packet.criteria.filter((criterion) => criterion.status === "verified").length,
-          failingVerificationCount: failedEvidence.length,
-          verificationFailureFingerprint: failureSet.length ? createHash("sha256").update(JSON.stringify(failureSet)).digest("hex") : evaluation.failureSetSha256,
-          changedRelevantFiles: typeof summary.files === "number" ? summary.files : 0,
-          unresolvedRequiredActions: packet.workOrders[0]?.requiredActions.length ?? 0,
-          submissionId: latest?.id ?? "",
-          reviewEpoch: latest?.reviewEpoch ?? 0,
-        };
-      },
-      onCorrect: async (workSessionId, reasons) => {
-        const mission = missionLedger.getMissionByWorkSession(workSessionId);
-        const session = workSessions.get(workSessionId);
-        const latest = session?.latestSubmission;
-        if (!mission || !latest?.id || !session) throw new Error("Cannot create a correction without a current mission submission.");
-        const packet = missionLedger.getPacket(workSessionId);
-        const failedCriteria = packet.criteria.filter((criterion) => criterion.priority === "required" && criterion.status !== "verified");
-        const openFindings = packet.findings.filter((finding) => finding.scope !== "out_of_scope" && ["blocker", "high"].includes(finding.severity) && !["verified_resolved", "waived"].includes(finding.status));
-        const workOrder = missionLedger.createWorkOrder(mission.id, workSessionId, {
-          objectiveForThisTurn: "Resolve the current failed mission verification and resubmit the exact workspace snapshot for review.",
-          acceptanceCriterionIds: failedCriteria.map((criterion) => criterion.id),
-          requiredFindingIds: openFindings.map((finding) => finding.id),
-          requiredActions: reasons,
-          prohibitedActions: mission.userLockedFields.map((field) => `Do not alter user-locked mission field: ${field}`),
-          requiredVerification: failedCriteria.map((criterion) => criterion.verificationCommand).filter(Boolean),
-          expectedDeliverables: ["A corrected submission with verification-ready workspace state."],
-        });
-        await reviewWorkflow.provideFeedback({
-          sessionId: workSessionId,
-          submissionId: latest.id,
-          diffSha256: latest.diffSha256,
-          reviewEpoch: latest.reviewEpoch,
-          verdict: "changes_requested",
-          comments: `Automatic verification requires correction:\n${reasons.join("\n")}`,
-          requiredActions: workOrder.requiredActions,
-          reviewerId: "supervisor-runtime",
-        });
-      },
-      currentSubmission: (workSessionId) => {
-        const session = workSessions.get(workSessionId);
-        if (session?.status !== "awaiting_review") return undefined;
-        const submission = session.latestSubmission;
-        return submission?.id ? { id: submission.id, snapshotKind: submission.snapshotKind, snapshotRef: submission.snapshotRef ?? submission.snapshotCommit, snapshotCommit: submission.snapshotRef ?? submission.snapshotCommit, reviewEpoch: submission.reviewEpoch } : undefined;
-      },
-      currentSessionStatus: (workSessionId) => workSessions.get(workSessionId)?.status,
-      currentApproval: (workSessionId) => {
-        const latest = workSessions.get(workSessionId)?.latestSubmission;
-        return missionLedger.canApprove(workSessionId, latest?.id ? { submissionId: latest.id, snapshotKind: latest.snapshotKind, snapshotRef: latest.snapshotRef ?? latest.snapshotCommit, snapshotCommit: latest.snapshotRef ?? latest.snapshotCommit, reviewEpoch: latest.reviewEpoch } : {});
-      },
-      onApprove: async (workSessionId) => {
-        const session = workSessions.get(workSessionId);
-        const latest = session?.latestSubmission;
-        if (!session || !latest?.id) throw new Error("Cannot automatically approve without a current submission.");
-        const approval = missionLedger.canApprove(workSessionId, { submissionId: latest.id, snapshotKind: latest.snapshotKind, snapshotRef: latest.snapshotRef ?? latest.snapshotCommit, snapshotCommit: latest.snapshotRef ?? latest.snapshotCommit, reviewEpoch: latest.reviewEpoch });
-        if (!approval.allowed) throw new Error(`Automatic approval blocked: ${approval.reasons.join("; ")}`);
-        await reviewWorkflow.provideFeedback({
-          sessionId: workSessionId,
-          submissionId: latest.id,
-          diffSha256: latest.diffSha256,
-          reviewEpoch: latest.reviewEpoch,
-          verdict: "approve",
-          comments: "Automatically approved after current trusted mission verification.",
-          reviewerId: "supervisor-runtime",
-          completionReportSha256: missionLedger.getCompletionReportHash(workSessionId, { submissionId: latest.id, snapshotKind: latest.snapshotKind, snapshotRef: latest.snapshotRef ?? latest.snapshotCommit, snapshotCommit: latest.snapshotRef ?? latest.snapshotCommit, reviewEpoch: latest.reviewEpoch }),
-        });
-      },
+      recordPhaseTiming,
     });
-    supervisorRuntime.start();
+    dispatcher = acp.dispatcher;
+    supervisorRuntime = acp.supervisorRuntime;
   }
 
   const shutdown = createShutdownController({
