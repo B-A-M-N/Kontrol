@@ -105,6 +105,7 @@ import { isPathInsideRoot } from "./roots.js";
  */
 import { createPolicyWaiterRegistry } from "./server/policy-waiters.js";
 import { createMcpSessionLifecycle } from "./server/mcp-session-lifecycle.js";
+import { healthz, readinessChecks, sendReadiness } from "./server/readiness.js";
 import {
   handleMcpRequestWithDeadline,
   McpAdmission,
@@ -391,6 +392,24 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
   const mcpSessionMetrics = sessionLifecycle.metrics;
   const mcpCapacityRejectionsByTool = sessionLifecycle.capacityRejectionsByTool;
   const mcpCapacityRejectionsByWeight = sessionLifecycle.capacityRejectionsByWeight;
+
+  const readinessDeps = {
+    config,
+    databaseProbe: () => {
+      const databaseProbe = db.sqlite.prepare("select 1 as ok").get() as { ok?: number } | undefined;
+      if (databaseProbe?.ok !== 1) throw new Error("database probe failed");
+    },
+    schemaVersion: () => {
+      const schema = db.sqlite.prepare("select max(version) as v from kontrol_schema_migrations").get() as { v?: number } | undefined;
+      return Number(schema?.v ?? 0);
+    },
+    executionAdmissionStats: () => mcpAdmission.getStats(),
+    workspaceRegistryInitialized: () => Boolean(workspaces && workspaceStore),
+    reviewSubsystemInitialized: () => Boolean(reviewWorkflow && workSessions && eventStore),
+    acpDispatcherInitialized: () => Boolean(dispatcher),
+    buildId: () => buildMeta.buildId,
+    listAliveAgents: () => agentRegistry.listAlive(),
+  };
   let revokeWorkSessionGrants: ((workSessionId: string) => void) | undefined;
   const workSessions = createWorkSessionManager(db, { onTerminal: (workSessionId) => revokeWorkSessionGrants?.(workSessionId) });
   const agentRegistry = createAgentRegistryManager(db, { enabled: config.webhookEnabled, allowedHosts: config.webhookAllowedHosts });
@@ -718,134 +737,13 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
       setHeaders: setAssetHeaders,
     }),
   );
-
-  app.get("/healthz", (_req, res) => {
-    // Keep unauthenticated liveness deliberately minimal. Build/runtime
-    // identity, process details, session counts, and workflow diagnostics
-    // belong behind readiness/diagnostics controls.
-    res.setHeader("Cache-Control", "no-store");
-    res.json({
-      ok: true,
-      name: "kontrol",
-    });
-  });
-
-  function readinessChecks(req: Request, includeAgents: boolean): Record<string, { ok: boolean; detail?: string; agents?: unknown[] }> {
-    const checks: Record<string, { ok: boolean; detail?: string; agents?: unknown[] }> = {};
-    const runtime = readRuntimeIdentity(config.stateDir);
-    let schemaVersion = 0;
-    try {
-      const databaseProbe = db.sqlite.prepare("select 1 as ok").get() as { ok?: number } | undefined;
-      checks.database = { ok: databaseProbe?.ok === 1, detail: databaseProbe?.ok === 1 ? "select 1 ok" : "database probe failed" };
-      const schema = db.sqlite.prepare("select max(version) as v from kontrol_schema_migrations").get() as { v?: number } | undefined;
-      schemaVersion = Number(schema?.v ?? 0);
-      // P1 #17: readiness requires the EXACT current schema, not just a
-      // migrated-at-some-point database. A partial/older schema must fail.
-      checks.schema = {
-        ok: schemaVersion === LATEST_SCHEMA_VERSION,
-        detail: `version=${schemaVersion} expected=${LATEST_SCHEMA_VERSION}`,
-      };
-    } catch (error) {
-      checks.database = { ok: false, detail: error instanceof Error ? error.message : String(error) };
-      checks.schema = { ok: false, detail: "schema query failed" };
-    }
-    // Full integrity scans are intentionally absent from readiness. They run
-    // in a separate worker and are exposed through authenticated diagnostics;
-    // a stale/slow diagnostic must not make a serving core fail closed.
-    checks.mcpHandler = { ok: true, detail: `HTTP handler is serving ${includeAgents ? "/readyz" : "/core-readyz"}` };
-    const executionAdmission = mcpAdmission.getStats();
-    checks.mcpExecutionAdmission = {
-      // Busy execution is healthy and must not make readiness flap. This
-      // check only detects an impossible accounting state that would strand
-      // capacity (negative counters or weight beyond the configured budget).
-      ok: executionAdmission.active >= 0
-        && executionAdmission.activeWeight >= 0
-        && executionAdmission.activeWeight <= executionAdmission.maxInflight,
-      detail: `active=${executionAdmission.active}; activeWeight=${executionAdmission.activeWeight}; availableWeight=${executionAdmission.availableWeight}; queued=${executionAdmission.queued}`,
-    };
-    checks.workspaceRegistry = { ok: Boolean(workspaces && workspaceStore), detail: "workspace registry initialized" };
-    checks.reviewSubsystem = { ok: Boolean(reviewWorkflow && workSessions && eventStore), detail: "review managers initialized" };
-    checks.acpBridge = { ok: !config.acpEnabled || Boolean(dispatcher), detail: config.acpEnabled ? "dispatcher initialized" : "ACP disabled" };
-    // Configuration-level proof that ask-capable policies have a reviewer
-    // credential source. loadConfig already rejects tunnel+ask-without-secret,
-    // so this can only fail for non-tunnel modes whose credential wiring is
-    // broken at runtime; report it as a first-class readiness check either way
-    // so an operator sees the approval boundary's posture without reading
-    // startup logs.
-    const askCapable = policyCanAsk(config.policy);
-    checks.approvalReviewerConfig = {
-      ok: !askCapable || config.authMode !== "tunnel" || Boolean(config.tunnelReviewerSecret),
-      detail: askCapable
-        ? `policy can produce approvals; reviewer credential configured (authMode=${config.authMode})`
-        : "policy cannot produce approvals; reviewer credential not required",
-    };
-    checks.build = {
-      // Source-mode `tsx src/cli.ts serve` has no embedded build-meta.json;
-      // its explicit `dev` identity is still valid. Release artifacts must
-      // continue to match their immutable embedded build ID exactly.
-      ok: Boolean(runtime) && (!buildMeta.buildId
-        ? runtime?.buildId === "dev"
-        : runtime?.buildId === buildMeta.buildId),
-      detail: `expected=${buildMeta.buildId ?? "missing"} live=${runtime?.buildId ?? "missing"}`,
-    };
-
-    if (!includeAgents) {
-      checks.agents = { ok: true, detail: "agent checks deferred to strict /readyz" };
-      return checks;
-    }
-
-    // P1 #16: public readiness is deterministic from server configuration
-    // alone. Query-string agent selection was removed — arbitrary "check
-    // these agents" requests could replace the configured requirement set.
-    // Diagnostics/doctor tooling covers ad-hoc agent checks instead.
-    const configuredAgents = config.acpKnownAgents;
-    const aliveAgents = agentRegistry.listAlive();
-    // P1 #12 review note: an empty configured list with zero registered
-    // workers is a legitimate deployment posture ("no ACP workers wanted"),
-    // not a readiness failure. Strict /readyz only fails when the operator
-    // has *configured* required agents that are absent/unhealthy.
-    const agentResults = configuredAgents.map((required) => {
-      const found = aliveAgents.find((agent) => agent.name === required.name);
-      const urlMatches = !required.url || found?.url === required.url;
-      return {
-        name: required.name,
-        expectedUrl: required.url,
-        registeredUrl: found?.url,
-        alive: Boolean(found?.alive),
-        healthy: Boolean(found?.alive) && urlMatches,
-      };
-    });
-    checks.agents = {
-      ok: agentResults.every((agent) => agent.healthy),
-      detail: configuredAgents.length > 0
-        ? "required agents checked"
-        : "no agents configured; deployments without ACP workers are ready",
-      agents: agentResults,
-    };
-    return checks;
-  }
-
-  function sendReadiness(res: Response, checks: Record<string, { ok: boolean; detail?: string; agents?: unknown[] }>): void {
-    const ready = Object.values(checks).every((check) => check.ok);
-    const publicChecks = Object.fromEntries(Object.entries(checks).map(([name, check]) => [name, { ok: check.ok }]));
-    res.setHeader("Cache-Control", "no-store");
-    res.status(ready ? 200 : 503).json({
-      ok: ready,
-      ready,
-      name: "kontrol",
-      // Non-sensitive policy posture so probes can decide whether the
-      // reviewer path is part of the readiness contract without guessing
-      // from environment variables.
-      approvalInteractive: policyCanAsk(config.policy),
-      checks: publicChecks,
-    });
-  }
+  app.get("/healthz", (_req, res) => healthz(res));
 
   // Core readiness is used while KONTROL is starting before adapters register.
-  app.get("/core-readyz", (_req, res) => sendReadiness(res, readinessChecks(_req, false)));
+  app.get("/core-readyz", (_req, res) => sendReadiness(res, readinessChecks(readinessDeps, _req, false), policyCanAsk(config.policy)));
   // Strict readiness is the operational contract used by the tunnel and the
   // persistent supervisor. It must fail when a required worker disappears.
-  app.get("/readyz", (req, res) => sendReadiness(res, readinessChecks(req, true)));
+  app.get("/readyz", (req, res) => sendReadiness(res, readinessChecks(readinessDeps, req, true), policyCanAsk(config.policy)));
 
   // P2: Warn about low reuse using a rolling rate, not only a raw creation
   // count. A client creating one session per tool call is operationally
