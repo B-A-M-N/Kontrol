@@ -10,6 +10,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { validateBetaSoakAssertions } from "./beta-soak-contract.mjs";
+import { testHarnessEnvironment } from "./lib/tool-environment.mjs";
 
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const codeOnly = process.argv.includes("--code-only");
@@ -82,9 +83,9 @@ function runPhase(id, command, args, environment = {}) {
   const started = Date.now();
   const result = spawnSync(command, args, {
     cwd: root,
-    // kontrol-env-exception: the gate launches repository-owned test/build
-    // commands under the operator's selected toolchain and records results.
-    env: { ...process.env, KONTROL_BETA_GATE: "1", ...environment },
+    // P1.10: explicit allowlist; launcher authority never reaches gate
+    // children. Phases pass their own test-hook keys via `environment`.
+    env: testHarnessEnvironment(process.env, { overrides: { KONTROL_BETA_GATE: "1", ...environment } }),
     stdio: "inherit",
   });
   phase.status = result.status === 0 && result.signal === null ? "passed" : "failed";

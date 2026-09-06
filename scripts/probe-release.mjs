@@ -6,6 +6,7 @@ import { join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { tmpdir } from "node:os";
 import { validateRelease } from "./validate-release.mjs";
+import { buildToolEnvironment, releaseProbeEnvironment } from "./lib/tool-environment.mjs";
 
 function unusedTcpPort() {
   return new Promise((resolvePromise, reject) => {
@@ -39,9 +40,9 @@ function loadSmoke(artifactPath) {
       `await import(${JSON.stringify(modulePath)});`,
     ], {
       cwd: artifactPath,
-      // kontrol-env-exception: module-load smoke only imports the local release
-      // and explicitly clears the runtime lock before spawning it.
-      env: { ...process.env, KONTROL_RUNTIME_LOCK_TOKEN: "" },
+      // P1.10: module-load smoke imports the local release with the runtime
+      // lock explicitly cleared, not inherited.
+      env: releaseProbeEnvironment(process.env, { overrides: { KONTROL_RUNTIME_LOCK_TOKEN: "" } }),
       encoding: "utf8",
     });
     if (result.status !== 0) {
@@ -51,9 +52,9 @@ function loadSmoke(artifactPath) {
 
   const help = spawnSync(process.execPath, [join(artifactPath, "cli.js"), "--help"], {
     cwd: artifactPath,
-    // kontrol-env-exception: --help is a local release import smoke; the
-    // runtime lock is explicitly cleared and no project-controlled command is run.
-    env: { ...process.env, KONTROL_RUNTIME_LOCK_TOKEN: "" },
+    // P1.10: local release import smoke; the runtime lock is explicitly
+    // cleared and no project-controlled command is run.
+    env: releaseProbeEnvironment(process.env, { overrides: { KONTROL_RUNTIME_LOCK_TOKEN: "" } }),
     encoding: "utf8",
   });
   if (help.status !== 0) throw new Error(`cli --help failed:\n${help.stderr || help.stdout}`);
@@ -81,9 +82,11 @@ async function waitFor(url, child, timeoutMs = 15_000) {
 async function bootSmoke(artifactPath, buildId) {
   const smokeRoot = mkdtempSync(join(tmpdir(), "kontrol-release-smoke-"));
   const port = await unusedTcpPort();
-  const env = {
-    ...process.env,
-    HOST: "127.0.0.1",
+  const env = buildToolEnvironment(process.env, {
+    // The boot smoke IS a launcher: it deliberately establishes this
+    // release's runtime identity. Everything else inherits the tool allowlist.
+    overrides: {
+      HOST: "127.0.0.1",
     PORT: String(port),
     KONTROL_AUTH_MODE: "tunnel",
     KONTROL_ALLOWED_ROOTS: smokeRoot,
@@ -101,7 +104,8 @@ async function bootSmoke(artifactPath, buildId) {
     KONTROL_LAUNCHER: "release-smoke",
     KONTROL_LAUNCH_GENERATION_ID: `release-smoke-${process.pid}-${Date.now()}`,
     KONTROL_RUNTIME_LOCK_TOKEN: "",
-  };
+    },
+  });
   const child = spawn(process.execPath, [join(artifactPath, "cli.js"), "serve"], {
     cwd: artifactPath,
     env,

@@ -3,6 +3,7 @@ import { readdirSync, statSync, watch } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
+import { buildToolEnvironment } from "./lib/tool-environment.mjs";
 
 const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const watchRoots = ["src"].map((entry) => join(repoRoot, entry));
@@ -17,9 +18,9 @@ function resolveRuntimeConfig() {
     'process.stdout.write(JSON.stringify({ stateDir: config.stateDir, port: config.port }));',
   ].join(" ")], {
     cwd: repoRoot,
-    // kontrol-env-exception: this local watcher resolves its own config before
-    // spawning the local server; no remote/project content is executed here.
-    env: process.env,
+    // P1.10: this local watcher resolves its own config before spawning the
+    // local server; the child gets the tool allowlist.
+    env: buildToolEnvironment(process.env),
     encoding: "utf8",
   });
   if (result.status !== 0) throw new Error((result.stderr || "could not load Kontrol config").trim());
@@ -29,9 +30,9 @@ function resolveRuntimeConfig() {
 function runtimeLockCommand(command, args) {
   return spawnSync(process.execPath, ["--import", "tsx", join(repoRoot, "src/runtime-lock.ts"), command, ...args], {
     cwd: repoRoot,
-    // kontrol-env-exception: this local watcher invokes its own runtime-lock
-    // helper; the child receives no project-controlled input.
-    env: process.env,
+    // P1.10: this local watcher invokes its own runtime-lock helper; the
+    // child receives the tool allowlist, not a control-plane environment.
+    env: buildToolEnvironment(process.env),
     encoding: "utf8",
   });
 }
@@ -52,13 +53,17 @@ if (lockResult.status !== 0) {
   throw new Error((lockResult.stderr || lockResult.stdout || "Kontrol runtime lock acquisition failed").trim());
 }
 const runtimeLockToken = lockResult.stdout.trim();
-const childEnvironment = {
-  ...process.env,
-  KONTROL_LAUNCHER: "dev-watch",
-  KONTROL_LAUNCH_GENERATION_ID: generationId,
-  KONTROL_RUNTIME_LOCK_TOKEN: runtimeLockToken,
-  KONTROL_ARTIFACT_PATH: join(repoRoot, "src"),
-};
+// P1.10: dev-watch IS a launcher for its child, so it deliberately
+// establishes the runtime identity below; every other variable comes from
+// the explicit tool allowlist, not wholesale process.env inheritance.
+const childEnvironment = buildToolEnvironment(process.env, {
+  overrides: {
+    KONTROL_LAUNCHER: "dev-watch",
+    KONTROL_LAUNCH_GENERATION_ID: generationId,
+    KONTROL_RUNTIME_LOCK_TOKEN: runtimeLockToken,
+    KONTROL_ARTIFACT_PATH: join(repoRoot, "src"),
+  },
+});
 
 let child;
 let restartTimer;

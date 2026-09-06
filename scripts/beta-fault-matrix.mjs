@@ -8,6 +8,7 @@ import { spawnSync } from "node:child_process";
 import { mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { testHarnessEnvironment } from "./lib/tool-environment.mjs";
 
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const reportPath = resolve(process.env.KONTROL_BETA_FAULT_REPORT ?? join(root, "beta-fault-matrix.json"));
@@ -42,9 +43,9 @@ for (const testCase of cases) {
   console.log(`[beta-fault-matrix] START ${testCase.id}`);
   const result = spawnSync(testCase.command, testCase.args, {
     cwd: root,
-    // kontrol-env-exception: the matrix launches repository-owned isolated
-    // tests; preserving the caller's toolchain environment is intentional.
-    env: { ...process.env, KONTROL_BETA_FAULT_MATRIX: "1" },
+    // P1.10: explicit allowlist; the matrix's isolated tests get the
+    // toolchain, not the launcher environment.
+    env: testHarnessEnvironment(process.env, { overrides: { KONTROL_BETA_FAULT_MATRIX: "1" } }),
     stdio: "inherit",
     encoding: "utf8",
   });
