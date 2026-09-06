@@ -22,6 +22,7 @@ export interface DiagnosticsDeps {
   readonly mcpSessions: Map<string, McpSessionState>;
   readonly mcpAdmission: McpAdmission;
   readonly mcpWaiterAdmission: McpAdmission;
+  readonly mcpResourceAdmission: McpAdmission;
   readonly sessionLifecycle: McpSessionLifecycle;
   readonly policyWaiters: McpPolicyWaiterRegistry;
   readonly workspaceAppResourceMetrics: WorkspaceAppResourceMetrics;
@@ -40,7 +41,7 @@ export interface DiagnosticsDeps {
 }
 
 export async function handleDiagnostics(deps: DiagnosticsDeps, req: Request, res: Response): Promise<unknown> {
-  const { config, mcpSessions, mcpAdmission, mcpWaiterAdmission, sessionLifecycle } = deps;
+  const { config, mcpSessions, mcpAdmission, mcpWaiterAdmission, mcpResourceAdmission, sessionLifecycle } = deps;
   const ip = requestIp(req, config.logging.trustProxy) || "";
   if (ip && !ip.startsWith("127.") && !ip.startsWith("::1") && ip !== "::ffff:127.0.0.1") {
     return res.status(403).json({ ok: false, error: "Forbidden: diagnostics is loopback-only" });
@@ -100,6 +101,7 @@ export async function handleDiagnostics(deps: DiagnosticsDeps, req: Request, res
     const totalMcpSessions = mcpSessions?.size ?? 0;
     const executionAdmission = mcpAdmission.getStats();
     const waiterAdmission = mcpWaiterAdmission.getStats();
+    const resourceAdmission = mcpResourceAdmission.getStats();
     const sse = sessionLifecycle.mcpSseDiagnostics();
 
     // P0 #2: Comprehensive session/heap metrics
@@ -131,6 +133,7 @@ export async function handleDiagnostics(deps: DiagnosticsDeps, req: Request, res
       admission: {
         execution: executionAdmission,
         waiter: waiterAdmission,
+        resource: resourceAdmission,
       },
         executionAdmission: {
           ...executionAdmission,

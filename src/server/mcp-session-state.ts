@@ -123,6 +123,14 @@ export interface WorkspaceAppResourceMetrics {
   servedTotal: number;
   lastDurationMs: number;
   maxDurationMs: number;
+  /** P0 resource admission: reads rejected because the resource pool or its
+   * per-client cap was exhausted. */
+  admissionRejections: number;
+  /** Currently in-flight admitted resource reads (peak-sampled max). */
+  active: number;
+  maxActive: number;
+  /** P1 perf: actual wire bytes of the last served resource (post-encoding). */
+  lastWireBytes: number;
 }
 
 /** Explicit route-level HTTP body caps. These are deliberately finite: MCP

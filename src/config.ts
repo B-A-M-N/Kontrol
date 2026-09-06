@@ -98,6 +98,15 @@ export interface ServerConfig {
   mcpMaxWaiters: number;
   mcpMaxWaitersPerSession: number;
   mcpMaxWaiterQueue: number;
+  /**
+   * Independent cap for Workspace App resource reads. Deliberately not shared
+   * with execution admission: a ~10 MB serialization workload must never be
+   * able to starve coding tool calls, and coding traffic must not be able to
+   * evict resource reads either.
+   */
+  mcpMaxResourceReads: number;
+  mcpMaxResourceReadsPerClient: number;
+  mcpMaxResourceReadQueue: number;
   /** Maximum time a request may wait for an admission slot. */
   mcpAdmissionTimeoutMs: number;
   /** Maximum execution time for ordinary, non-waiter MCP requests. */
@@ -600,6 +609,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     mcpMaxWaiters: parsePositiveInteger(env.KONTROL_MCP_MAX_WAITERS, 64, "KONTROL_MCP_MAX_WAITERS"),
     mcpMaxWaitersPerSession: parsePositiveInteger(env.KONTROL_MCP_MAX_WAITERS_PER_SESSION, 2, "KONTROL_MCP_MAX_WAITERS_PER_SESSION"),
     mcpMaxWaiterQueue: parsePositiveInteger(env.KONTROL_MCP_MAX_WAITER_QUEUE, 64, "KONTROL_MCP_MAX_WAITER_QUEUE"),
+    mcpMaxResourceReads: parsePositiveInteger(env.KONTROL_MCP_MAX_RESOURCE_READS, 2, "KONTROL_MCP_MAX_RESOURCE_READS"),
+    mcpMaxResourceReadsPerClient: parsePositiveInteger(env.KONTROL_MCP_MAX_RESOURCE_READS_PER_CLIENT, 1, "KONTROL_MCP_MAX_RESOURCE_READS_PER_CLIENT"),
+    mcpMaxResourceReadQueue: parsePositiveInteger(env.KONTROL_MCP_MAX_RESOURCE_READ_QUEUE, 16, "KONTROL_MCP_MAX_RESOURCE_READ_QUEUE"),
     mcpAdmissionTimeoutMs: parsePositiveInteger(
       env.KONTROL_MCP_ADMISSION_TIMEOUT_MS ?? env.KONTROL_MCP_REQUEST_DEADLINE_MS,
       120_000,

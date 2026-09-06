@@ -253,6 +253,15 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     config.mcpMaxWaitersPerSession,
     config.mcpMaxWaiterQueue,
   );
+  // P0 resource admission: dedicated, deliberately small pool for Workspace
+  // App resource reads (~10 MB serializations). Independent of execution and
+  // waiter pools in both directions — resource traffic must not starve coding
+  // work, and coding traffic must not be able to evict resource reads.
+  const mcpResourceAdmission = new McpAdmission(
+    config.mcpMaxResourceReads,
+    config.mcpMaxResourceReadsPerClient,
+    config.mcpMaxResourceReadQueue,
+  );
   const workspaceAppResourceMetrics: WorkspaceAppResourceMetrics = {
     currentHashed: 0,
     openAiCompatibility: 0,
@@ -261,8 +270,12 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     servedTotal: 0,
     lastDurationMs: 0,
     maxDurationMs: 0,
+    admissionRejections: 0,
+    active: 0,
+    maxActive: 0,
+    lastWireBytes: 0,
   };
-  const workspaceAppResources = createWorkspaceAppResourceServer(config, workspaceAppResourceMetrics);
+  const workspaceAppResources = createWorkspaceAppResourceServer(config, workspaceAppResourceMetrics, mcpResourceAdmission);
   const serveWorkspaceAppResource = workspaceAppResources.serve;
   const { oauthEnabled, oauthProvider, bearerAuth, resourceServerUrl } = deriveAuth(config);
   const { app } = createHttpApp({ config, oauthProvider, resourceServerUrl, bearerAuth });
@@ -525,6 +538,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     policyWaiters,
     mcpAdmission,
     mcpWaiterAdmission,
+    mcpResourceAdmission,
     sessionLifecycle,
     workspaceAppResourceMetrics,
     trackSocketAbort,
@@ -588,6 +602,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     mcpSessions,
     mcpAdmission,
     mcpWaiterAdmission,
+    mcpResourceAdmission,
     sessionLifecycle,
     policyWaiters,
     workspaceAppResourceMetrics,
@@ -670,6 +685,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     sessionLifecycle,
     mcpAdmission,
     mcpWaiterAdmission,
+    mcpResourceAdmission,
     startupReconciliation,
     maintenance,
     reviewCheckpoints,

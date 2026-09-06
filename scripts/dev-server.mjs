@@ -1,8 +1,8 @@
 import { spawn, spawnSync } from "node:child_process";
-import { readdirSync, statSync, watch } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, statSync, watch } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { buildToolEnvironment } from "./lib/tool-environment.mjs";
 
 const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
@@ -10,6 +10,30 @@ const watchRoots = ["src"].map((entry) => join(repoRoot, entry));
 const restartDelayMs = 750;
 const crashDelayMs = 1500;
 const maxCrashDelayMs = 30_000;
+
+// P0 source-mode resolution: the server must serve a BUILT, self-contained
+// Workspace App, never the Vite input template under src/ui. Build the UI
+// once into a dedicated development directory up front, point the runtime at
+// the exact artifact via KONTROL_WORKSPACE_APP_HTML_PATH, and rebuild on UI
+// source changes (the change also restarts the server, which reloads the
+// artifact from disk).
+const devUiDir = process.env.KONTROL_DEV_UI_DIR || join(tmpdir(), `kontrol-dev-ui-${process.pid}`);
+const devUiArtifact = join(devUiDir, "workspace-app.html");
+
+function buildDevUi() {
+  mkdirSync(devUiDir, { recursive: true });
+  const result = spawnSync("npx", ["vite", "build"], {
+    cwd: repoRoot,
+    env: buildToolEnvironment(process.env, { overrides: { KONTROL_BUILD_OUTPUT_DIR: devUiDir } }),
+    stdio: "inherit",
+  });
+  if (result.status !== 0 || !existsSync(devUiArtifact)) {
+    throw new Error(`development UI build failed (status ${result.status ?? "unknown"}); cannot start dev server`);
+  }
+  console.error(`[kontrol:dev] workspace app artifact: ${devUiArtifact}`);
+}
+
+buildDevUi();
 
 function resolveRuntimeConfig() {
   const result = spawnSync(process.execPath, ["--import", "tsx", "--input-type=module", "-e", [
@@ -62,6 +86,7 @@ const childEnvironment = buildToolEnvironment(process.env, {
     KONTROL_LAUNCH_GENERATION_ID: generationId,
     KONTROL_RUNTIME_LOCK_TOKEN: runtimeLockToken,
     KONTROL_ARTIFACT_PATH: join(repoRoot, "src"),
+    KONTROL_WORKSPACE_APP_HTML_PATH: devUiArtifact,
   },
 });
 
@@ -191,8 +216,38 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
   process.on(signal, shutdown);
 }
 
+// Rebuild the UI when src/ui changes. Defined before the watchers below so
+// the watcher callbacks can reference it; the server restart (already
+// scheduled by the watcher) reloads the new artifact on boot.
+let uiRebuildQueued = false;
+function scheduleUiRebuild() {
+  if (uiRebuildQueued) return;
+  uiRebuildQueued = true;
+  setTimeout(() => {
+    uiRebuildQueued = false;
+    if (shuttingDown) return;
+    try {
+      buildDevUi();
+      log("workspace app artifact rebuilt");
+    } catch (error) {
+      log(`workspace app artifact rebuild failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }, restartDelayMs).unref();
+}
+
+// The UI build input lives under src/ui, which the src watcher already
+// covers; a UI source change restarts the server AND refreshes the artifact
+// so the restarted server reads the freshly built HTML.
+function watchDirectoryWithUiRebuild(rootDirectory) {
+  const inner = watchDirectory(rootDirectory);
+  // The directory watcher above already schedules a server restart for every
+  // change; hook a second watcher on src/ui solely to rebuild the artifact.
+  const uiWatcher = watch(join(rootDirectory, "ui"), () => scheduleUiRebuild());
+  return [...inner, uiWatcher];
+}
+
 for (const root of watchRoots) {
-  watchDirectory(root);
+  watchDirectoryWithUiRebuild(root);
 }
 
 log(`watching src; generation ${generationId}; server restarts on changes and after crashes`);
