@@ -44,7 +44,7 @@ async function main(argv: string[]): Promise<void> {
       await runInit({ force: args.includes("--force") });
       return;
     case "doctor":
-      await runDoctor();
+      await runDoctor({ strict: args.includes("--strict") });
       return;
     case "config":
       runConfigCommand(args);
@@ -319,7 +319,7 @@ async function serve(): Promise<void> {
   await runServer(loadConfig());
 }
 
-async function runDoctor(): Promise<void> {
+async function runDoctor(options: { strict?: boolean } = {}): Promise<void> {
   const files = loadKontrolFiles();
   console.log(`Config dir: ${files.dir}`);
   console.log(`Config file: ${files.configExists ? files.configPath : "missing"}`);
@@ -344,7 +344,11 @@ async function runDoctor(): Promise<void> {
       "config.json has no explicit allowedRoots; the old implicit current-directory fallback is disabled. Run `kontrol init --force` or add allowedRoots explicitly.",
     );
   }
-  doctorResult("Node/runtime", nodeVersionStatus(), satisfies(process.versions.node, SUPPORTED_NODE_RANGE) ? "" : `current=${process.version}`);
+  doctorResult(
+    "Node/runtime",
+    satisfies(process.versions.node, SUPPORTED_NODE_RANGE) ? "PASS" : "FAIL",
+    nodeVersionStatus(),
+  );
   doctorResult("Node ABI", "PASS", process.versions.modules);
   doctorResult("Platform", "PASS", `${process.platform} ${process.arch}`);
   doctorResult("Git", checkGitAvailable().startsWith("unavailable") ? "UNAVAILABLE" : "PASS", checkGitAvailable());
@@ -359,12 +363,24 @@ async function runDoctor(): Promise<void> {
     // P1 #30: verify each configured root actually exists and is a directory.
     const missingRoots = config.allowedRoots.filter((root) => !existsSync(root));
     doctorResult("Root paths exist", missingRoots.length === 0 ? "PASS" : "FAIL", missingRoots.length === 0 ? "all configured roots present" : `missing: ${missingRoots.join(", ")}`);
-    // P1 #30: worktree root must be writable for managed worktrees.
+    // P1 #30: worktree root must be writable for managed worktrees. The root
+    // itself is created on first managed worktree (git-worktrees.ts), so a
+    // missing directory on a fresh install is not a failure as long as its
+    // parent can host it — probe the parent read-only in that case.
     try {
-      const worktreeProbe = resolve(config.worktreeRoot, `.kontrol-write-probe-${process.pid}`);
-      writeFileSync(worktreeProbe, "");
-      rmSync(worktreeProbe, { force: true });
-      doctorResult("Worktree root writable", "PASS", config.worktreeRoot);
+      if (existsSync(config.worktreeRoot)) {
+        const worktreeProbe = resolve(config.worktreeRoot, `.kontrol-write-probe-${process.pid}`);
+        writeFileSync(worktreeProbe, "");
+        rmSync(worktreeProbe, { force: true });
+        doctorResult("Worktree root writable", "PASS", config.worktreeRoot);
+      } else {
+        const parent = dirname(config.worktreeRoot);
+        doctorResult(
+          "Worktree root writable",
+          existsSync(parent) && statSync(parent).isDirectory() ? "PASS" : "FAIL",
+          `${config.worktreeRoot} (not yet created; parent ${existsSync(parent) && statSync(parent).isDirectory() ? "present, created on first managed worktree" : "missing"})`,
+        );
+      }
     } catch (error) {
       doctorResult("Worktree root writable", "FAIL", `${config.worktreeRoot} (${error instanceof Error ? error.message : String(error)})`);
     }
@@ -463,7 +479,20 @@ async function runDoctor(): Promise<void> {
     } else {
       doctorResult("Source/build dirty state", "PASS", `dirty=${buildMeta.gitDirty ?? sourceDirty ?? "unknown"}`);
     }
-    doctorResult("State directory", existsSync(config.stateDir) ? "PASS" : "FAIL", config.stateDir);
+    // The state directory is created (mode 0700) on first database open
+    // (db/client.ts), so a missing directory on a fresh install is not a
+    // failure — only an uncreatable location is.
+    if (existsSync(config.stateDir)) {
+      doctorResult("State directory", "PASS", config.stateDir);
+    } else {
+      const stateParent = dirname(config.stateDir);
+      const parentOk = existsSync(stateParent) && statSync(stateParent).isDirectory();
+      doctorResult(
+        "State directory",
+        parentOk ? "PASS" : "FAIL",
+        `${config.stateDir} (not yet created; parent ${parentOk ? "present, created on first database open" : "missing"})`,
+      );
+    }
     if (existsSync(config.stateDir)) {
       try {
         const mode = statSync(config.stateDir).mode & 0o777;
@@ -541,10 +570,46 @@ async function runDoctor(): Promise<void> {
   } catch (error) {
     doctorResult("Config", "FAIL", error instanceof Error ? error.message : String(error));
   }
+
+  // P0: deployment automation keys off the exit code, so any FAIL must fail
+  // the command. WARN is informational by default; --strict treats it as a
+  // failure too (UNAVAILABLE always stays 0).
+  const failed = doctorResults.some((result) => result.status === "FAIL")
+    || (options.strict === true && doctorResults.some((result) => result.status === "WARN"));
+  const counts = {
+    pass: doctorResults.filter((r) => r.status === "PASS").length,
+    warn: doctorResults.filter((r) => r.status === "WARN").length,
+    fail: doctorResults.filter((r) => r.status === "FAIL").length,
+    unavailable: doctorResults.filter((r) => r.status === "UNAVAILABLE").length,
+  };
+  console.log(`Doctor summary: ${counts.pass} pass, ${counts.warn} warn, ${counts.fail} fail, ${counts.unavailable} unavailable${failed ? "" : options.strict && counts.warn > 0 ? " (strict)" : ""}`);
+  if (failed) process.exitCode = 1;
 }
 
-function doctorResult(label: string, status: "PASS" | "WARN" | "FAIL" | "UNAVAILABLE" | string, detail: string): void {
-  console.log(`[${status}] ${label}${detail ? `: ${detail}` : ""}`);
+type DoctorStatus = "PASS" | "WARN" | "FAIL" | "UNAVAILABLE";
+
+interface DoctorResult {
+  label: string;
+  status: DoctorStatus;
+  detail: string;
+}
+
+/** Central record of every doctor probe. P0: doctor must be usable by
+ * deployment automation, so the exit code reflects the worst result — any
+ * FAIL exits 1. With --strict, WARN also fails (UNAVAILABLE stays 0: it
+ * reports a probe that could not run, not a broken deployment). */
+const doctorResults: DoctorResult[] = [];
+
+function doctorResult(label: string, status: DoctorStatus, detail: string): void {
+  const normalized: DoctorStatus = (["PASS", "WARN", "FAIL", "UNAVAILABLE"] as const).includes(status as DoctorStatus)
+    ? (status as DoctorStatus)
+    : "FAIL";
+  if (normalized !== status) {
+    detail = detail ? `${status}: ${detail}` : String(status);
+  }
+  const result: DoctorResult = { label, status: normalized, detail };
+  doctorResults.push(result);
+  console.log(`[${result.status}] ${label}${detail ? `: ${detail}` : ""}`);
 }
 
 function isLoopbackHostForDoctor(host: string): boolean {
@@ -672,6 +737,7 @@ function printHelp(): void {
       "  kontrol up              Start the full local stack from a Kontrol checkout",
       "  kontrol init            Create or update ~/.kontrol/config.json and auth.json",
       "  kontrol doctor          Show config, runtime, and native dependency status",
+      "  kontrol doctor --strict Treat warnings as failures in the exit code",
       "  kontrol config get      Print persisted config",
       "  kontrol config set publicBaseUrl <url|null>",
       "  kontrol config effective-policy --json",
