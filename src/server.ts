@@ -141,6 +141,8 @@ import {
   uiBuildDirectory,
   type WorkspaceAppResourceMetrics,
 } from "./server/mcp-session-state.js";
+import { deriveAuth } from "./server/auth.js";
+import { createWorkspaceAppResourceServer } from "./server/workspace-resource-route.js";
 // P1.2 decomposition: admission classes/weights/queue live in
 // src/server/mcp-admission.ts; session-state types, identity derivation, and
 // body gates live in src/server/mcp-session-state.ts. Re-export the public
@@ -272,64 +274,9 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     lastDurationMs: 0,
     maxDurationMs: 0,
   };
-  function serveWorkspaceAppResource(
-    res: Response,
-    requestId: string | undefined,
-    body: { id?: unknown; params?: { uri?: unknown } },
-    sessionless: boolean,
-  ): boolean {
-    const resourceStartedAt = performance.now();
-    const uri = typeof body.params?.uri === "string" ? body.params.uri : undefined;
-    const kind = workspaceAppResourceKind(uri);
-    if (!kind) return false;
-
-    if (kind === "current") workspaceAppResourceMetrics.currentHashed++;
-    else if (kind === "openai") workspaceAppResourceMetrics.openAiCompatibility++;
-    else if (kind === "legacy") workspaceAppResourceMetrics.legacyKontrol++;
-    else if (kind === "devdesktop") workspaceAppResourceMetrics.devDesktopMigration++;
-
-    const isCurrent = kind === "current";
-    const content: { uri: string; mimeType: string; text: string; _meta?: Record<string, unknown> } = {
-      uri: uri ?? WORKSPACE_APP_URI,
-      mimeType: isCurrent ? RESOURCE_MIME_TYPE : "text/html+skybridge",
-      text: WORKSPACE_APP_HTML,
-      ...(isCurrent ? { _meta: workspaceAppResourceMeta() } : {}),
-    };
-    res.json({
-      jsonrpc: "2.0",
-      id: body.id ?? null,
-      result: { contents: [content] },
-    });
-
-    const totalMs = Math.round(performance.now() - resourceStartedAt);
-    workspaceAppResourceMetrics.servedTotal++;
-    workspaceAppResourceMetrics.lastDurationMs = totalMs;
-    if (totalMs > workspaceAppResourceMetrics.maxDurationMs) workspaceAppResourceMetrics.maxDurationMs = totalMs;
-    logEvent(config.logging, "info", "workspace_app_resource_served", {
-      requestId,
-      sessionless,
-      resourceFastPath: true,
-      resourceUri: uri,
-      totalMs,
-    });
-    return true;
-  }
-  const oauthEnabled = config.authMode === "oauth";
-  let oauthProvider: SingleUserOAuthProvider | null = null;
-  let bearerAuth:
-    | ((req: Request, res: Response, next: (error?: unknown) => void) => void)
-    | undefined;
-  let resourceServerUrl: URL | undefined;
-  if (oauthEnabled) {
-    const mcpUrl = new URL("/mcp", config.publicBaseUrl);
-    resourceServerUrl = resourceUrlFromServerUrl(mcpUrl);
-    oauthProvider = new SingleUserOAuthProvider(config.oauth, mcpUrl, config.stateDir);
-    bearerAuth = requireBearerAuth({
-      verifier: oauthProvider,
-      requiredScopes: [config.oauth.scopes[0] ?? "kontrol"],
-      resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(resourceServerUrl),
-    });
-  }
+  const workspaceAppResources = createWorkspaceAppResourceServer(config, workspaceAppResourceMetrics);
+  const serveWorkspaceAppResource = workspaceAppResources.serve;
+  const { oauthEnabled, oauthProvider, bearerAuth, resourceServerUrl } = deriveAuth(config);
   // ONE shared DB handle for every manager + the review workflow service, so the
   // workflow can commit state + event log in a SINGLE transaction (P1 #15).
   // P0.3: deployment identity flows from the entrypoint-resolved context via
@@ -725,19 +672,11 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     express.json({ limit: MCP_HTTP_BODY_LIMIT_BYTES }),
   );
 
-  app.options("/mcp-app-assets/{*asset}", (_req, res) => {
-    setAssetHeaders(res);
-    res.sendStatus(204);
-  });
+  app.options("/mcp-app-assets/{*asset}", workspaceAppResources.assetRoutes[0]);
 
   app.use(
     "/mcp-app-assets",
-    express.static(uiBuildDirectory(), {
-      immutable: true,
-      maxAge: "1y",
-      fallthrough: false,
-      setHeaders: setAssetHeaders,
-    }),
+    workspaceAppResources.assetRoutes[1],
   );
   app.get("/healthz", (_req, res) => healthz(res));
 
