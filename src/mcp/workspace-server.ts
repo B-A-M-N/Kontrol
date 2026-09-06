@@ -75,700 +75,97 @@ import { installCachedToolList } from "../mcp-tool-list-cache.js";
 import { isPathInsideRoot } from "../roots.js";
 import { registerPolicyTools } from "../policy-tools.js";
 import { registerBridgeTools } from "../acp-bridge.js";
+// P1.3 decomposition: shared helpers live in focused modules. The names are
+// re-exported below so existing importers of ./mcp/workspace-server.js keep
+// working unchanged.
+import {
+  cachedServerInstructions,
+  toolNames,
+} from "./tool-names.js";
+import {
+  approvalResumeIdSchema,
+  EDIT_TOOL_ANNOTATIONS,
+  resultOutputSchema,
+  reviewFileOutputSchema,
+  reviewSummaryOutputSchema,
+  SHELL_TOOL_ANNOTATIONS,
+  workspaceAgentsFileOutputSchema,
+  workspaceAvailableAgentsFileOutputSchema,
+  workspaceSkillOutputSchema,
+  WRITE_TOOL_ANNOTATIONS,
+} from "./tool-schemas.js";
+import { toolWidgetDescriptorMeta } from "./tool-context.js";
+import {
+  isWorkspaceMutationBlockedError,
+  runMutationBarrier,
+  WorkspaceMutationBlockedError,
+} from "./mutation-barrier.js";
+import {
+  constantTimeStringEqual,
+  degradedAuditSnapshot,
+  logToolCall,
+  readPackageVersion,
+  recordDegradedAudit,
+  requestLogFields,
+} from "./tool-logging.js";
+import {
+  contentLineCount,
+  contentText,
+  countDiffStats,
+  logFailedToolResponse,
+  newFilePatch,
+  textBlock,
+  textSummary,
+  type ToolContent,
+  type DiffStats,
+} from "./tool-result.js";
+import {
+  canonicalPolicyPath,
+  enforceToolPolicy,
+  policyFailureResponse,
+} from "./tool-policy.js";
+import { mcpRequestContext, type McpRequestContext } from "./request-context.js";
+import {
+  assertWorkerWorkspaceBinding,
+  processOutputSchema,
+  processToolResponse,
+} from "./process-tool-response.js";
+import {
+  processSessionOwnerId,
+  type ConnectionContext,
+} from "./connection-context.js";
 
-/** P1 #26: single source of runtime version identity — the package manifest. */
-let cachedPackageVersion: string | undefined;
-export function readPackageVersion(): string {
-  if (cachedPackageVersion) return cachedPackageVersion;
-  try {
-    const buildMeta = JSON.parse(readFileSync(new URL("../build-meta.json", import.meta.url), "utf8")) as { version?: string };
-    cachedPackageVersion = typeof buildMeta.version === "string" && buildMeta.version ? buildMeta.version : "0.0.0";
-  } catch {
-    try {
-      const manifest = JSON.parse(readFileSync(join(process.cwd(), "package.json"), "utf8")) as { version?: string };
-      cachedPackageVersion = typeof manifest.version === "string" && manifest.version ? manifest.version : "0.0.0";
-    } catch {
-      cachedPackageVersion = "0.0.0";
-    }
-  }
-  return cachedPackageVersion;
-}
-
-/**
- * P1 #25: audit-event writes are best-effort (they must never fail user
- * work), but silent degradation is unacceptable. Track a counter per scope,
- * warn rate-limited, and expose the counters under authenticated
- * diagnostics so persistent failures surface.
- */
-const degradedAuditCounters = new Map<string, { count: number; lastWarnedAt: number; lastError?: string }>();
-const DEGRADED_AUDIT_WARN_INTERVAL_MS = 60_000;
-
-function recordDegradedAudit(scope: string, error: unknown): void {
-  const entry = degradedAuditCounters.get(scope) ?? { count: 0, lastWarnedAt: 0 };
-  entry.count += 1;
-  entry.lastError = error instanceof Error ? error.message : String(error);
-  const now = Date.now();
-  if (now - entry.lastWarnedAt >= DEGRADED_AUDIT_WARN_INTERVAL_MS) {
-    entry.lastWarnedAt = now;
-    console.warn(`[kontrol] degraded audit telemetry (${scope}): ${entry.count} write failure(s); last error: ${entry.lastError}`);
-  }
-  degradedAuditCounters.set(scope, entry);
-}
-
-export function degradedAuditSnapshot(): Record<string, { count: number; lastError?: string }> {
-  const snapshot: Record<string, { count: number; lastError?: string }> = {};
-  for (const [scope, entry] of degradedAuditCounters) {
-    snapshot[scope] = { count: entry.count, lastError: entry.lastError };
-  }
-  return snapshot;
-}
-
-export type Transport = StreamableHTTPServerTransport;
-
-export interface McpRequestContext {
-  signal: AbortSignal;
-  mcpSessionId?: string;
-  mcpRequestId?: string;
-  conversationId?: string;
-  approvalCorrelationId?: string;
-  onPolicyWaitStart?: (context: PolicyWaitContext) => void | Promise<void>;
-  onPolicyWaitEnd?: (context: PolicyWaitContext & { outcome: PolicyWaitOutcome }) => void | Promise<void>;
-}
-
-export const mcpRequestContext = new AsyncLocalStorage<McpRequestContext>();
-
-function currentMcpRequestSignal(): AbortSignal | undefined {
-  return mcpRequestContext.getStore()?.signal;
-}
-
-function currentMcpRequestContext(): McpRequestContext | undefined {
-  return mcpRequestContext.getStore();
-}
-
-const WRITE_TOOL_ANNOTATIONS = {
-  readOnlyHint: false,
-  destructiveHint: true,
-  idempotentHint: false,
-  openWorldHint: false,
-};
-const EDIT_TOOL_ANNOTATIONS = {
-  readOnlyHint: false,
-  destructiveHint: true,
-  idempotentHint: false,
-  openWorldHint: false,
-};
-const SHELL_TOOL_ANNOTATIONS = {
-  readOnlyHint: false,
-  destructiveHint: true,
-  idempotentHint: false,
-  openWorldHint: true,
-};
-
-type ToolContent =
-  | { type: "text"; text: string }
-  | { type: "image"; data: string; mimeType: string };
-
-interface DiffStats {
-  additions: number;
-  removals: number;
-}
-
-type ToolWidgetKind =
-  | "workspace"
-  | "read"
-  | "write"
-  | "edit"
-  | "search"
-  | "directory"
-  | "shell"
-  | "show_changes";
-
-interface ToolDefinitionMeta extends Record<string, unknown> {
-  ui: {
-    resourceUri: string;
-    visibility: ["model"];
-  };
-}
-
-type EmptyToolDefinitionMeta = Record<string, unknown> & {
-  "ui/resourceUri"?: string;
-};
-
-interface ToolWidgetDescriptorMeta {
-  _meta: ToolDefinitionMeta | EmptyToolDefinitionMeta;
-}
-
-function shouldAttachWidget(mode: WidgetMode, kind: ToolWidgetKind): boolean {
-  switch (mode) {
-    case "off":
-      return false;
-    case "changes":
-      return kind === "workspace" || kind === "show_changes";
-    case "full":
-      return true;
-  }
-}
-
-/**
- * A tool whose effective policy can produce an `ask` outcome may return a
- * blocked result that carries an interactive approval card. Those results must
- * reach the Workspace App even in `changes` mode: a card the host cannot
- * render because the tool descriptor never advertised the app is a
- * dead-end approval. `off` stays off — an operator who disabled widgets has
- * no interactive surface to attach one to.
- */
-function toolCanRequireInteractiveApproval(policy: PolicyConfig, kind: ToolWidgetKind): boolean {
-  const canonicalToolsByKind: Partial<Record<ToolWidgetKind, string[]>> = {
-    // exec_command and a mutating write_stdin are gated under the canonical
-    // "bash" policy key (P0 #1), so the shell widget follows bash's rule.
-    shell: ["bash"],
-    read: ["read"],
-    write: ["write"],
-    edit: ["edit", "apply_patch"],
-    search: ["grep", "glob"],
-    directory: ["ls"],
-  };
-  const tools = canonicalToolsByKind[kind];
-  if (!tools) return false;
-  if (tools.some((tool) => (policy.toolRules[tool] ?? policy.defaultMode) === "ask")) return true;
-  // Path rules can place a read/ls (and any path-scoped tool) in ask; the
-  // pattern cannot be resolved per-descriptor, so any path rule with mode
-  // "ask" makes every path-scoped tool potentially interactive.
-  return policy.pathRules.some((rule) => rule.mode === "ask");
-}
-
-function toolWidgetDescriptorMeta(
-  config: ServerConfig,
-  kind: ToolWidgetKind,
-): ToolWidgetDescriptorMeta {
-  if (config.widgets === "changes" && toolCanRequireInteractiveApproval(config.policy, kind)) {
-    return {
-      _meta: workspaceAppToolMeta(["model"]) as unknown as ToolDefinitionMeta,
-    };
-  }
-  if (!shouldAttachWidget(config.widgets, kind)) return { _meta: {} };
-
-  return {
-    _meta: workspaceAppToolMeta(["model"]) as unknown as ToolDefinitionMeta,
-  };
-}
-
-const toolNames = {
-  openWorkspace: "open_workspace",
-  read: "read",
-  write: "write",
-  edit: "edit",
-  grep: "grep",
-  glob: "glob",
-  ls: "ls",
-  shell: "bash",
-} as const;
-
-const serverInstructionCache = new Map<string, string>();
+// Public re-exports: ./mcp/workspace-server.js remains the import surface.
+export { constantTimeStringEqual, degradedAuditSnapshot, requestLogFields, readPackageVersion } from "./tool-logging.js";
+export { mcpRequestContext, type McpRequestContext } from "./request-context.js";
+export { type Transport } from "./transport.js";
+export {
+  WorkspaceMutationBlockedError,
+  isWorkspaceMutationBlockedError,
+} from "./mutation-barrier.js";
+export { type ConnectionContext, processSessionOwnerId } from "./connection-context.js";
 
 // P1 #42: SDK internal-hook usage is isolated in mcp-tool-list-cache.ts.
 const toolListDescriptorCache = new Map<string, Promise<unknown>>();
 let toolListDescriptorCacheActive = false;
 
-interface ToolLogFields {
-  tool: string;
-  workspaceId?: string;
-  path?: string;
-  workingDirectory?: string;
-  command?: string;
-  commandLength?: number;
-  success: boolean;
-  durationMs: number;
-  error?: string;
-}
+export type { DiffStats, ToolContent } from "./tool-result.js";
+export { toolNames } from "./tool-names.js";
+export {
+  approvalResumeIdSchema,
+  resultOutputSchema,
+} from "./tool-schemas.js";
+export { toolWidgetDescriptorMeta } from "./tool-context.js";
 
-function serverInstructions(config: ServerConfig): string {
-  const showChangesInstruction =
-    config.widgets === "changes"
-      ? " If you successfully create, edit, overwrite, delete, move, or apply patches to files in a turn, call show_changes exactly once for that workspace after the final related file change and before your final response so the user can inspect the aggregate diff for that turn. Do not call it after every individual change; do not skip it because individual file-change tools already returned diffs."
-      : "";
 
-  if (config.toolMode === "codex") {
-    return `Use Kontrol as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree and reuse its workspaceId. Prefer ${toolNames.read}, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} for direct structured inspection; use apply_patch for modifications, exec_command for tests/builds/other commands, and write_stdin to poll running processes. Review, diagnosis, architecture, and code-edit requests go directly through the workspace first. Delegate only when the reviewer explicitly asks for bounded worker assistance: call discover_agents, dispatch only a currently dispatchable healthy role=agent peer, and if optional assistance is unavailable continue directly without trying an alternate ACP route. The WebUI reviewer remains the approval authority. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.${showChangesInstruction}`;
-  }
 
-  const inspection = `Prefer ${toolNames.read}, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} for file inspection. `;
 
-  const skills = config.skillsEnabled
-    ? `When ${toolNames.openWorkspace} returns available skills and a task matches a skill, use ${toolNames.read} to read that skill's path before proceeding. Skill paths may be outside the workspace, but ${toolNames.read} only permits advertised SKILL.md files and files under already-loaded skill directories. `
-    : "";
 
-  const agentsMd = `Follow instructions returned by ${toolNames.openWorkspace}. Kontrol loads additional AGENTS.md/CLAUDE.md files lazily from the ancestors of each requested path and returns newly applicable instructions with that tool call. `;
 
-  return `Use Kontrol as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree to obtain a workspaceId. Reuse that same workspaceId for all later file, search, edit, write, show-changes, and shell tools in that folder; do not call ${toolNames.openWorkspace} again unless switching folders/worktrees, changing checkout/worktree mode, the workspaceId is rejected as unknown, or the user explicitly asks to reopen. ${agentsMd}${skills}${inspection}Review, diagnosis, architecture, and code-edit requests go directly through the workspace first. Delegate only when the reviewer explicitly asks for bounded worker assistance: call discover_agents before optional dispatch, select only a currently dispatchable healthy role=agent peer, and if optional assistance is unavailable continue directly without trying an alternate ACP route. The WebUI reviewer remains the approval authority. Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not create or modify files with ${toolNames.shell}; avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or any command whose purpose is to write project files.${showChangesInstruction}`;
-}
 
-function cachedServerInstructions(config: ServerConfig): string {
-  const key = `${config.toolMode}|${config.widgets}|${config.skillsEnabled ? "skills" : "no-skills"}`;
-  const cached = serverInstructionCache.get(key);
-  if (cached) return cached;
-  const instructions = serverInstructions(config);
-  serverInstructionCache.set(key, instructions);
-  return instructions;
-}
-function resultOutputSchema(extra: z.ZodRawShape = {}): z.ZodRawShape {
-  return {
-    result: z
-      .string()
-      .describe(
-        "Model-readable result text for follow-up reasoning and plain MCP hosts.",
-      ),
-    status: z.string().optional(),
-    approvalId: z.string().optional(),
-    retryable: z.boolean().optional(),
-    ...extra,
-  };
-}
 
-/**
- * Explicit opaque operation-resume identity (audit P1). A caller whose tool
- * call returned approval_required retries with the SAME arguments plus this
- * field set to the approvalId it was shown. The server verifies the echoed
- * operation content against the durable approval row before honoring the
- * original human decision, so a reconnect that lost its conversation
- * correlation can still consume "Approve Once" instead of prompting again.
- */
-const approvalResumeIdSchema = z
-  .string()
-  .optional()
-  .describe(
-    "Opaque resume token: the approvalId returned in a prior approval_required result. Retry the identical tool call with this field set to consume the human's original decision.",
-  );
 
-const workspaceSkillOutputSchema = z.object({
-  name: z.string(),
-  description: z.string(),
-  path: z.string(),
-});
 
-const workspaceAgentsFileOutputSchema = z.object({
-  path: z.string(),
-  content: z.string(),
-});
-
-const workspaceAvailableAgentsFileOutputSchema = z.object({
-  path: z.string(),
-});
-
-const reviewFileOutputSchema = z.object({
-  path: z.string(),
-  previousPath: z.string().optional(),
-  type: z.enum(["change", "rename-pure", "rename-changed", "new", "deleted"]),
-  additions: z.number(),
-  removals: z.number(),
-});
-
-const reviewSummaryOutputSchema = z.object({
-  files: z.number(),
-  additions: z.number(),
-  removals: z.number(),
-});
-
-export function requestLogFields(req: Request, config: ServerConfig): Record<string, unknown> {
-  return {
-    ip: requestIp(req, config.logging.trustProxy),
-    host: req.header("host"),
-    userAgent: req.header("user-agent"),
-    origin: req.header("origin"),
-    referer: req.header("referer"),
-    contentLength: req.header("content-length"),
-  };
-}
-
-export function constantTimeStringEqual(actual: string | undefined, expected: string | undefined): boolean {
-  if (!actual || !expected || actual.length !== expected.length) return false;
-  return timingSafeEqual(Buffer.from(actual), Buffer.from(expected));
-}
-
-function logToolCall(config: ServerConfig, fields: ToolLogFields): void {
-  if (!config.logging.toolCalls) return;
-
-  const { command, ...safeFields } = fields;
-  logEvent(config.logging, fields.success ? "info" : "warn", "tool_call", {
-    ...safeFields,
-    // P0.6: the console preview is redacted through the shared sanitizer —
-    // command text can contain pasted credentials just like tool output.
-    commandPreview: config.logging.shellCommands && command ? redactedPreview(command) : undefined,
-  });
-}
-
-function contentText(content: ToolContent[]): string {
-  return content
-    .filter(
-      (item): item is { type: "text"; text: string } => item.type === "text",
-    )
-    .map((item) => item.text)
-    .join("\n");
-}
-
-function toolErrorPreview(content: ToolContent[]): string | undefined {
-  const text = redactedPreview(contentText(content).replace(/\s+/g, " ").trim());
-  if (!text) return undefined;
-  return text.length > 240 ? `${text.slice(0, 237)}...` : text;
-}
-
-function logFailedToolResponse(
-  config: ServerConfig,
-  fields: Omit<ToolLogFields, "success" | "durationMs" | "error">,
-  content: ToolContent[],
-  startedAt: number,
-): void {
-  logToolCall(config, {
-    ...fields,
-    success: false,
-    durationMs: Math.round(performance.now() - startedAt),
-    error: toolErrorPreview(content),
-  });
-}
-
-function textBlock(text: string): ToolContent {
-  return { type: "text", text };
-}
-
-function textSummary(content: ToolContent[]): {
-  lines: number;
-  characters: number;
-} {
-  const text = contentText(content);
-  return {
-    lines: text.length === 0 ? 0 : text.split("\n").length,
-    characters: text.length,
-  };
-}
-
-function contentLineCount(content: string): number {
-  if (content.length === 0) return 0;
-  return content.endsWith("\n")
-    ? content.slice(0, -1).split("\n").length
-    : content.split("\n").length;
-}
-
-/**
- * P0.5: thrown by prepareForMutation when no usable checkpoint backend exists.
- * Tool handlers catch it and return a distinct, machine-readable
- * checkpoint_unavailable result rather than executing an untracked mutation.
- */
-export class WorkspaceMutationBlockedError extends Error {
-  readonly workspaceId: string;
-  readonly code = "checkpoint_unavailable";
-  constructor(workspaceId: string, message: string) {
-    super(message);
-    this.name = "WorkspaceMutationBlockedError";
-    this.workspaceId = workspaceId;
-  }
-}
-
-export function isWorkspaceMutationBlockedError(error: unknown): error is WorkspaceMutationBlockedError {
-  return error instanceof WorkspaceMutationBlockedError;
-}
-
-/**
- * P0.5: a checkpoint-blocked mutation returns the same renderable card
- * envelope as a policy denial so the model sees a distinct, machine-readable
- * checkpoint_unavailable status instead of a generic transport error.
- */
-function checkpointUnavailableResponse(error: WorkspaceMutationBlockedError, tool: string) {
-  const message = `${error.message} (Set KONTROL_ALLOW_UNTRACKED_MUTATION=1 to explicitly run without review tracking — not recommended.)`;
-  return {
-    content: [{ type: "text" as const, text: message }],
-    isError: true,
-    _meta: {
-      tool,
-      card: {
-        tool,
-        workspaceId: error.workspaceId,
-        status: "checkpoint_unavailable",
-        summary: { status: "checkpoint_unavailable" },
-        payload: { content: [{ type: "text", text: message }] },
-      },
-    },
-    structuredContent: { result: message, status: "checkpoint_unavailable", retryable: false },
-  };
-}
-
-/**
- * P0.5: uniform mutation barrier. Runs prepareForMutation and converts a
- * fail-closed block into a checkpoint_unavailable tool response.
- */
-async function runMutationBarrier(
-  prepare: ((workspaceId: string) => Promise<void>) | undefined,
-  workspaceId: string,
-  tool: string,
-): Promise<ReturnType<typeof checkpointUnavailableResponse> | null> {
-  try {
-    await prepare?.(workspaceId);
-    return null;
-  } catch (error) {
-    if (isWorkspaceMutationBlockedError(error)) return checkpointUnavailableResponse(error, tool);
-    throw error;
-  }
-}
-
-/**
- * P0.2: a policy-blocked result must remain renderable by the Workspace App.
- * The MCP `_meta.tool`/`_meta.card` envelope is the only contract the app can
- * use (see toolNameFromMeta()/isToolResultCard() in workspace-app.tsx), and it
- * is attached even when isError is true because the UI renders both blocked
- * and approval-pending cards from the same payload.
- */function policyFailureResponse(
-  result: { allowed: boolean; approvalRequired?: boolean; approvalId?: string },
-  deniedMessage: string,
-  context: {
-    tool: "exec_command" | "write_stdin" | "read" | "write" | "edit" | "apply_patch" | "grep" | "glob" | "ls" | "bash";
-    workspaceId: string;
-    path?: string;
-    command?: string;
-  },
-): {
-  content: Array<{ type: "text"; text: string }>;
-  isError: boolean;
-  _meta: { tool: string; card: Record<string, unknown> };
-  structuredContent?: Record<string, unknown>;
-} {
-  if (result.approvalRequired && result.approvalId) {
-    const message = `Approval required. Approve ${result.approvalId} in the Kontrol review UI, then retry this exact tool call with approvalResumeId set to ${result.approvalId}. The retry consumes the human decision without prompting again.`;
-    const card: Record<string, unknown> = {
-      tool: context.tool,
-      workspaceId: context.workspaceId,
-      status: "approval_required",
-      approvalId: result.approvalId,
-      resumeArgument: "approvalResumeId",
-      retryable: true,
-      summary: {
-        status: "approval_required",
-        approvalId: result.approvalId,
-        command: context.command,
-      },
-      payload: { content: [{ type: "text", text: message }] },
-    };
-    if (context.path !== undefined) card.path = context.path;
-    if (context.command !== undefined) card.command = context.command;
-    return {
-      content: [{ type: "text", text: message }],
-      isError: false,
-      _meta: { tool: context.tool, card },
-      structuredContent: {
-        result: message,
-        status: "approval_required",
-        approvalId: result.approvalId,
-        retryable: true,
-        ...(context.tool === "apply_patch" ? { additions: 0, removals: 0, files: [] } : {}),
-      },
-    };
-  }
-  const card: Record<string, unknown> = {
-    tool: context.tool,
-    workspaceId: context.workspaceId,
-    status: "policy_denied",
-    summary: { status: "policy_denied", command: context.command },
-    payload: { content: [{ type: "text", text: deniedMessage }] },
-  };
-  if (context.path !== undefined) card.path = context.path;
-  if (context.command !== undefined) card.command = context.command;
-  return {
-    content: [{ type: "text", text: deniedMessage }],
-    isError: true,
-    _meta: { tool: context.tool, card },
-    structuredContent: { result: deniedMessage },
-  };
-}
-
-/**
- * Policy enforcement for tool calls.
- * Returns the policy outcome. Direct MCP calls return approval_required
- * immediately; controlled ACP invocations may retain blocking semantics.
- *
- * Uses the shared enforcer so MCP and ACP share one code path, and records
- * approvals under the CANONICAL policy key (never a reconstructed key).
- */
-async function enforceToolPolicy(
-  workSessions: ReturnType<typeof createWorkSessionManager> | undefined,
-  enforcer: PolicyEnforcer,
-  workspaceId: string,
-  workSessionId: string | undefined,
-  runId: string | undefined,
-  tool: string,
-  path: PolicyInvocation["path"],
-  command: string | undefined,
-  paths?: PolicyInvocation["paths"],
-  approvalResumeId?: string,
-): Promise<{ allowed: boolean; approvalRequired?: boolean; approvalId?: string }> {
-  if (workSessions && workSessionId) {
-    const sessionDecision = authorizeWorkSessionAction(workSessions, {
-      workSessionId,
-      tool,
-      path: typeof path === "string" ? path : path?.relativePath,
-      command,
-    });
-    if (!sessionDecision.allowed) return { allowed: false };
-  }
-  const result = await enforcer.enforce({
-    principalId: workSessionId ?? workspaceId,
-    principalRole: workSessionId ? "worker" : "client",
-    workspaceId,
-    workSessionId,
-    runId,
-    tool,
-    path,
-    paths,
-    command,
-    signal: currentMcpRequestSignal(),
-    mcpSessionId: currentMcpRequestContext()?.mcpSessionId,
-    mcpRequestId: currentMcpRequestContext()?.mcpRequestId,
-    onPolicyWaitStart: currentMcpRequestContext()?.onPolicyWaitStart,
-    onPolicyWaitEnd: currentMcpRequestContext()?.onPolicyWaitEnd,
-    // A direct MCP operation has no durable worker lifecycle to hold open, so
-    // return approval_required immediately. Calls bound to a work session are
-    // controlled worker operations and retain ACP-style blocking semantics.
-    blockingApproval: Boolean(workSessionId),
-    conversationId: currentMcpRequestContext()?.conversationId,
-    approvalCorrelationId: currentMcpRequestContext()?.approvalCorrelationId,
-    // Explicit opaque operation-resume identity: when a retrying caller
-    // echoes the approvalId from its approval_required card, verified
-    // content adopts the original durable operation instead of prompting
-    // again under a new reconnect fingerprint.
-    approvalResumeId,
-  });
-  return result;
-}
-
-/**
- * Build the only path representation that may enter policy evaluation from an
- * MCP filesystem action. The lexical user path is retained only as the
- * relative display form; the absolute form has already passed workspace
- * resolution and symlink checks.
- */
-function canonicalPolicyPath(
-  workspaceRoot: string,
-  inputPath: string | undefined,
-  resolvedPath?: string,
-): NonNullable<PolicyInvocation["path"]> {
-  const absolutePath = resolve(resolvedPath ?? workspaceRoot, resolvedPath ? "." : (inputPath ?? "."));
-  const relativePath = isPathInsideRoot(absolutePath, workspaceRoot)
-    ? (relative(workspaceRoot, absolutePath).split(sep).join("/") || ".")
-    : (inputPath ?? absolutePath).replaceAll("\\", "/");
-  return { relativePath, absolutePath };
-}
-
-function countDiffStats(diff: string | undefined): DiffStats {
-  if (!diff) return { additions: 0, removals: 0 };
-
-  let additions = 0;
-  let removals = 0;
-
-  for (const line of diff.split("\n")) {
-    if (line.startsWith("+") && !line.startsWith("+++")) additions++;
-    if (line.startsWith("-") && !line.startsWith("---")) removals++;
-  }
-
-  return { additions, removals };
-}
-
-function newFilePatch(path: string, content: string): string {
-  const lines =
-    content.length === 0
-      ? []
-      : content.endsWith("\n")
-        ? content.slice(0, -1).split("\n")
-        : content.split("\n");
-  const hunkLength = lines.length;
-  const hunkRange = hunkLength === 0 ? "+0,0" : `+1,${hunkLength}`;
-  const body = lines.map((line) => `+${line}`).join("\n");
-
-  return [
-    `diff --git a/${path} b/${path}`,
-    "new file mode 100644",
-    "index 0000000..0000000",
-    "--- /dev/null",
-    `+++ b/${path}`,
-    `@@ -0,0 ${hunkRange} @@`,
-    body,
-  ]
-    .filter((line) => line.length > 0)
-    .join("\n");
-}
-
-function processResult(snapshot: ProcessSnapshot): string {
-  const status = snapshot.running
-    ? `Process running with session ID ${snapshot.sessionId}.`
-    : snapshot.signal
-      ? `Process exited after signal ${snapshot.signal}.`
-      : `Process exited with code ${snapshot.exitCode ?? "unknown"}.`;
-  return snapshot.output ? `${snapshot.output.replace(/\n$/, "")}\n${status}` : status;
-}
-
-function processOutputSchema(): z.ZodRawShape {
-  return resultOutputSchema({
-    sessionId: z.string().optional(),
-    running: z.boolean(),
-    exitCode: z.number().int().optional(),
-    signal: z.string().optional(),
-    wallTimeMs: z.number().nonnegative(),
-    outputTruncated: z.boolean(),
-  });
-}
-
-function processToolResponse(
-  tool: "exec_command" | "write_stdin",
-  workspaceId: string,
-  snapshot: ProcessSnapshot,
-  summary: Record<string, unknown>,
-) {
-  const result = processResult(snapshot);
-  const content = [textBlock(result)];
-  const outputSummary = textSummary(snapshot.output ? [textBlock(snapshot.output)] : []);
-  return {
-    content,
-    _meta: {
-      tool,
-      card: {
-        workspaceId,
-        summary: { ...summary, ...outputSummary },
-        payload: { content },
-      },
-    },
-    structuredContent: {
-      result,
-      sessionId: snapshot.sessionId,
-      running: snapshot.running,
-      exitCode: snapshot.exitCode,
-      signal: snapshot.signal,
-      wallTimeMs: snapshot.wallTimeMs,
-      outputTruncated: snapshot.outputTruncated,
-    },
-  };
-}
-
-/**
- * P0 #6: a dispatched worker is cryptographically bound to exactly one signed
- * work session, which lives inside exactly one workspace. It must never operate
- * on a different workspace — cross-workspace worker access defeats the
- * correlation/credential contract. Enforced only when the connection is a
- * verified worker with a bound session; ordinary clients and reviewers are
- * unrestricted here (their tools are role-gated separately).
- */
-function assertWorkerWorkspaceBinding(
-  connectionContext: ConnectionContext | undefined,
-  workSessions: WorkSessionManager | undefined,
-  workspaceId: string,
-): { content: Array<{ type: "text"; text: string }>; isError: true } | null {
-  if (connectionContext?.authenticatedRole === "worker" && connectionContext.workSessionId && workSessions) {
-    const session = workSessions.get(connectionContext.workSessionId);
-    const allowed = session?.workspaceSessionId;
-    if (allowed && workspaceId !== allowed) {
-      return {
-        content: [{ type: "text" as const, text: "Forbidden: worker is bound to a different workspace than the requested one." }],
-        isError: true,
-      };
-    }
-  }
-  return null;
-}
 
 function registerCodexProcessTools(
   server: McpServer,
@@ -995,50 +392,6 @@ function registerCodexProcessTools(
   );
 }
 
-/**
- * Work-session attribution envelope bound to a single MCP connection. Tool
- * activity is attributed to the work session named here, NOT to the workspace's
- * mutable "currently active" session. This prevents concurrent CRUSH processes
- * sharing a workspace from overwriting each other's attribution.
- */
-export interface ConnectionContext {
-  /**
-   * The role authenticated for this connection. A successfully-verified signed
-   * worker token yields "worker"; otherwise the connection is treated as a
-   * reviewer/client. AUTHORIZATION MUST derive from this field — never from the
-   * unsigned attribution headers (P0 #3). The unsigned headers below are for
-   * logging/attribution only and grant no privileges.
-   */
-  authenticatedRole?: "worker" | "reviewer" | "client";
-  authSource?: "oauth" | "reviewer_token" | "worker_token" | "tunnel_reviewer" | "anonymous";
-  /** Authenticated principal for durable client mutation identities. */
-  authenticatedPrincipalId?: string;
-  workspaceSessionId?: string;
-  workSessionId?: string;
-  runId?: string;
-  continuationId?: string;
-  /** Checkout lease nonce issued for the bound worker work session. */
-  workspaceLeaseNonce?: string;
-  /** Transport identity, never shared across MCP sessions. */
-  mcpSessionId?: string;
-  /** Human-readable diagnostic label for this isolated transport. */
-  mcpSessionLabel?: string;
-  /** Optional upstream conversation correlation; not an authorization key. */
-  conversationId?: string;
-  /** Stable trusted identity used only for reconnecting one approval operation. */
-  approvalCorrelationId?: string;
-}
-
-/**
- * Direct process sessions normally belong to the transport that opened them,
- * but a trusted reconnect identity or durable work session can outlive one
- * MCP transport. Generic clientInfo fallback remains deliberately ephemeral.
- */
-function processSessionOwnerId(context?: ConnectionContext): string | undefined {
-  if (context?.workSessionId) return `work-session:${context.workSessionId}`;
-  if (context?.approvalCorrelationId) return `logical-client:${context.approvalCorrelationId}`;
-  return context?.mcpSessionId;
-}
 
 export function createMcpServer(
   config: ServerConfig,
