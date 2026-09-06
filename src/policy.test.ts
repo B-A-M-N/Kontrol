@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { brandWorkSessionId, brandWorkspaceId } from "./branded.js";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -19,6 +20,7 @@ const grantStore = createSqliteGrantStore(db);
 const approvalRequests = createApprovalRequestManager(db);
 
 const WS = "ws-test";
+const WS_ID = brandWorkspaceId(WS);
 
 function seedWorkspace(dir: string, id: string): void {
   const sqlite = new Database(databasePath(dir));
@@ -173,8 +175,8 @@ const durablePolicy = createPolicyEngine(
 durablePolicy.addPending({
   id: "pol_durable_restart",
   principalId: "principal-durable",
-  workspaceId: WS,
-  workSessionId: "wsess-durable",
+  workspaceId: WS_ID,
+  workSessionId: brandWorkSessionId("wsess-durable"),
   tool: "write",
   path: "durable.txt",
   requestedAt: new Date().toISOString(),
@@ -195,19 +197,19 @@ assert.equal(approvalManagerAfterRestart.get("pol_durable_restart")?.status, "ap
 
 // ── Test 3: isApproved uses canonical keys ──
 
-policy.recordApproval("principal-1", "path:src/**", "work_session", { workspaceId: WS, workSessionId: "wsess-1" });
-const approved = policy.isApproved("principal-1", "path:src/**", { workspaceId: WS, workSessionId: "wsess-1" });
+policy.recordApproval("principal-1", "path:src/**", "work_session", { workspaceId: WS_ID, workSessionId: brandWorkSessionId("wsess-1") });
+const approved = policy.isApproved("principal-1", "path:src/**", { workspaceId: WS_ID, workSessionId: brandWorkSessionId("wsess-1") });
 assert.equal(approved, true, "same principal+scope+key is approved");
 
-const approved2 = policy.isApproved("principal-1", "path:src/**", { workspaceId: WS, workSessionId: "wsess-2" });
+const approved2 = policy.isApproved("principal-1", "path:src/**", { workspaceId: WS_ID, workSessionId: brandWorkSessionId("wsess-2") });
 assert.equal(approved2, false, "work_session approval does not leak to another work session");
 
 // ── Test 4: scopes are isolated ──
 
-policy.recordApproval("principal-2", "tool:write", "work_session", { workspaceId: WS, workSessionId: "wsess-A" });
-assert.equal(policy.isApproved("principal-2", "tool:write", { workspaceId: WS, workSessionId: "wsess-B" }), false);
-policy.recordApproval("principal-2", "tool:write", "workspace", { workspaceId: WS, workSessionId: "wsess-C" });
-assert.equal(policy.isApproved("principal-2", "tool:write", { workspaceId: WS, workSessionId: "wsess-D" }), true);
+policy.recordApproval("principal-2", "tool:write", "work_session", { workspaceId: WS_ID, workSessionId: brandWorkSessionId("wsess-A") });
+assert.equal(policy.isApproved("principal-2", "tool:write", { workspaceId: WS_ID, workSessionId: brandWorkSessionId("wsess-B") }), false);
+policy.recordApproval("principal-2", "tool:write", "workspace", { workspaceId: WS_ID, workSessionId: brandWorkSessionId("wsess-C") });
+assert.equal(policy.isApproved("principal-2", "tool:write", { workspaceId: WS_ID, workSessionId: brandWorkSessionId("wsess-D") }), true);
 
 // ── P1.12: workspace grants are strictly scoped to one workspace ──
 // A workspace grant in WS must NOT cross over into a different workspace,
@@ -216,20 +218,20 @@ assert.equal(policy.isApproved("principal-2", "tool:write", { workspaceId: WS, w
 // reviewer granting trust in workspace A would silently unlock privileged
 // operations in workspace B.
 policy.recordApproval("principal-boundary", "tool:write", "workspace", {
-  workspaceId: WS,
-  workSessionId: "wsess-boundary-A",
+  workspaceId: WS_ID,
+  workSessionId: brandWorkSessionId("wsess-boundary-A"),
 });
 assert.equal(policy.isApproved("principal-boundary", "tool:write", {
-  workspaceId: WS, workSessionId: "wsess-boundary-A",
+  workspaceId: WS_ID, workSessionId: brandWorkSessionId("wsess-boundary-A"),
 }), true, "workspace grant applies inside its own workspace");
 assert.equal(policy.isApproved("principal-boundary", "tool:write", {
-  workspaceId: WS, workSessionId: "wsess-boundary-B",
+  workspaceId: WS_ID, workSessionId: brandWorkSessionId("wsess-boundary-B"),
 }), true, "workspace grant covers any work session within the workspace");
 assert.equal(policy.isApproved("principal-boundary", "tool:write", {
-  workspaceId: `${WS}-other`, workSessionId: "wsess-boundary-A",
+  workspaceId: brandWorkspaceId(`${WS}-other`), workSessionId: brandWorkSessionId("wsess-boundary-A"),
 }), false, "workspace grant does NOT cross into a different workspace");
 assert.equal(policy.isApproved("principal-boundary", "tool:write", {
-  workspaceId: "ws-arbitrary", workSessionId: "wsess-boundary-A",
+  workspaceId: brandWorkspaceId("ws-arbitrary"), workSessionId: brandWorkSessionId("wsess-boundary-A"),
 }), false, "workspace grant does NOT cross into an unrelated workspace");
 const boundaryGrant = grantStore.listEffective().find((g) => g.principalId === "principal-boundary");
 assert.ok(boundaryGrant);
@@ -239,14 +241,14 @@ assert.equal(boundaryGrant.scopeId, WS, "grant scopeId is the granting workspace
 // Work-session grants require an actual session and can be revoked without
 // restarting the policy engine. IDs are intentionally opaque so re-approval
 // after revocation cannot collide with a historical row.
-policy.recordApproval("principal-revoke", "tool:write", "work_session", { workspaceId: WS });
-assert.equal(policy.isApproved("principal-revoke", "tool:write", { workspaceId: WS, workSessionId: "missing" }), false);
-policy.recordApproval("principal-revoke", "tool:write", "work_session", { workspaceId: WS, workSessionId: "wsess-revoke" });
+policy.recordApproval("principal-revoke", "tool:write", "work_session", { workspaceId: WS_ID });
+assert.equal(policy.isApproved("principal-revoke", "tool:write", { workspaceId: WS_ID, workSessionId: brandWorkSessionId("missing") }), false);
+policy.recordApproval("principal-revoke", "tool:write", "work_session", { workspaceId: WS_ID, workSessionId: brandWorkSessionId("wsess-revoke") });
 const firstGrant = grantStore.listEffective().find((g) => g.principalId === "principal-revoke");
 assert.ok(firstGrant);
 policy.revokeScope("work_session", "wsess-revoke");
-assert.equal(policy.isApproved("principal-revoke", "tool:write", { workspaceId: WS, workSessionId: "wsess-revoke" }), false);
-policy.recordApproval("principal-revoke", "tool:write", "work_session", { workspaceId: WS, workSessionId: "wsess-revoke" });
+assert.equal(policy.isApproved("principal-revoke", "tool:write", { workspaceId: WS_ID, workSessionId: brandWorkSessionId("wsess-revoke") }), false);
+policy.recordApproval("principal-revoke", "tool:write", "work_session", { workspaceId: WS_ID, workSessionId: brandWorkSessionId("wsess-revoke") });
 const secondGrant = grantStore.listEffective().find((g) => g.principalId === "principal-revoke");
 assert.ok(secondGrant);
 assert.notEqual(firstGrant.id, secondGrant.id);
@@ -262,15 +264,15 @@ const policy2 = createPolicyEngine(
   { defaultMode: "ask", toolRules: { write: "ask" }, pathRules: [] },
   grantStore2,
 );
-assert.equal(policy2.isApproved("principal-1", "path:src/**", { workspaceId: WS, workSessionId: "wsess-1" }), true);
+assert.equal(policy2.isApproved("principal-1", "path:src/**", { workspaceId: WS_ID, workSessionId: brandWorkSessionId("wsess-1") }), true);
 db2.close();
 
 // ── Test 6: approve_once does not cache ──
 
 const policy3 = createPolicyEngine({ defaultMode: "ask", toolRules: {}, pathRules: [] });
-assert.equal(policy3.isApproved("p", "tool:read", { workspaceId: WS }), false);
-policy3.recordApproval("p", "tool:read", "once", { workspaceId: WS });
-assert.equal(policy3.isApproved("p", "tool:read", { workspaceId: WS }), false);
+assert.equal(policy3.isApproved("p", "tool:read", { workspaceId: WS_ID }), false);
+policy3.recordApproval("p", "tool:read", "once", { workspaceId: WS_ID });
+assert.equal(policy3.isApproved("p", "tool:read", { workspaceId: WS_ID }), false);
 
 // ── Test 7: policy enforcer integration ──
 
@@ -281,8 +283,8 @@ const enforcer = createPolicyEnforcer(enforcerPolicy, eventStore, { timeoutMs: 1
 const r1 = await enforcer.enforce({
   principalId: "test-principal",
   principalRole: "worker",
-  workspaceId: WS,
-  workSessionId: "wsess-1",
+  workspaceId: WS_ID,
+  workSessionId: brandWorkSessionId("wsess-1"),
   runId: "run-1",
   tool: "write",
   path: "x.txt",
@@ -291,14 +293,14 @@ assert.equal(r1.allowed, false);
 assert.equal(r1.decision.mode, "ask");
 
 // Manually record the approval on the policy engine (simulating reviewer decision)
-enforcerPolicy.recordApproval("test-principal", r1.decision.approvalKey!, "work_session", { workspaceId: WS, workSessionId: "wsess-1" });
+enforcerPolicy.recordApproval("test-principal", r1.decision.approvalKey!, "work_session", { workspaceId: WS_ID, workSessionId: brandWorkSessionId("wsess-1") });
 
 // Second call: should be allowed now
 const r2 = await enforcer.enforce({
   principalId: "test-principal",
   principalRole: "worker",
-  workspaceId: WS,
-  workSessionId: "wsess-1",
+  workspaceId: WS_ID,
+  workSessionId: brandWorkSessionId("wsess-1"),
   runId: "run-1",
   tool: "write",
   path: "x.txt",
@@ -321,7 +323,7 @@ try {
   await longWaitEnforcer.enforce({
     principalId: "long-lived-principal",
     principalRole: "client",
-    workspaceId: WS,
+    workspaceId: WS_ID,
     tool: "write",
     path: "long-lived.txt",
   });
@@ -340,7 +342,7 @@ const cancellation = new AbortController();
 const cancellationResult = cancellationEnforcer.enforce({
   principalId: "disconnecting-principal",
   principalRole: "client",
-  workspaceId: WS,
+  workspaceId: WS_ID,
   tool: "write",
   path: "disconnecting.txt",
   mcpSessionId: "mcp-cancel-session",
@@ -363,7 +365,7 @@ const duplicateEnforcer = createPolicyEnforcer(duplicatePolicy, eventStore, { ti
 const duplicateInvocation = {
   principalId: "reconnecting-client",
   principalRole: "client" as const,
-  workspaceId: WS,
+  workspaceId: WS_ID,
   tool: "write",
   path: "same-file.txt",
   command: undefined,
@@ -389,7 +391,7 @@ const reattachEnforcer = createPolicyEnforcer(reattachPolicy, eventStore, { time
 const reattachInvocation = {
   principalId: "reconnecting-client",
   principalRole: "client" as const,
-  workspaceId: WS,
+  workspaceId: WS_ID,
   tool: "write",
   path: "same-file.txt",
   mcpSessionId: "mcp-reattach-session",
@@ -440,11 +442,11 @@ assert.equal(reattachPolicy.getPendingApprovals().length, 0, "durable row cleare
 const isolatedPolicy = createPolicyEngine({ defaultMode: "ask", toolRules: { write: "ask" }, pathRules: [] });
 const isolatedEnforcer = createPolicyEnforcer(isolatedPolicy, eventStore, { timeoutMs: 1_000 });
 const isolatedOne = isolatedEnforcer.enforce({
-  principalId: "isolated-client", principalRole: "client", workspaceId: WS,
+  principalId: "isolated-client", principalRole: "client", workspaceId: WS_ID,
   tool: "write", path: "isolated.txt", mcpSessionId: "isolated-session-a", mcpRequestId: "isolated-request-a",
 });
 const isolatedTwo = isolatedEnforcer.enforce({
-  principalId: "isolated-client", principalRole: "client", workspaceId: WS,
+  principalId: "isolated-client", principalRole: "client", workspaceId: WS_ID,
   tool: "write", path: "isolated.txt", mcpSessionId: "isolated-session-b", mcpRequestId: "isolated-request-b",
 });
 await new Promise((resolve) => setTimeout(resolve, 0));
@@ -476,8 +478,8 @@ assert.deepEqual((await Promise.all([isolatedOne, isolatedTwo])).map((result) =>
     const eventRequest = eventOptionsEnforcer.enforce({
       principalId: "event-options-principal",
       principalRole: "worker",
-      workspaceId: WS,
-      workSessionId: "wsess-event-options",
+      workspaceId: WS_ID,
+      workSessionId: brandWorkSessionId("wsess-event-options"),
       tool: "write",
       path: "event-options.txt",
     });
@@ -534,7 +536,7 @@ try {
   const raceResult = await raceEnforcer.enforce({
     principalId: "race-principal",
     principalRole: "client",
-    workspaceId: "ws-race",
+    workspaceId: brandWorkspaceId("ws-race"),
     tool: "write",
     path: "race.txt",
   });
@@ -578,11 +580,11 @@ db.close();
   const strictEnforcer = createPolicyEnforcer(strictPolicy, eventStore, { timeoutMs: 100 });
   // Even with a pre-existing workspace grant, a freshly evaluated deny must
   // short-circuit before the wait path is even considered.
-  strictPolicy.recordApproval("strict-principal", "tool:bash", "workspace", { workspaceId: WS });
+  strictPolicy.recordApproval("strict-principal", "tool:bash", "workspace", { workspaceId: WS_ID });
   const denial = await strictEnforcer.enforce({
     principalId: "strict-principal",
     principalRole: "client",
-    workspaceId: WS,
+    workspaceId: WS_ID,
     tool: "bash",
   });
   assert.equal(denial.allowed, false, "denial never waits");
@@ -597,7 +599,7 @@ db.close();
   const pathDenial = await pathEnforcer.enforce({
     principalId: "strict-principal",
     principalRole: "client",
-    workspaceId: WS,
+    workspaceId: WS_ID,
     tool: "write",
     path: "/etc/shadow",
   });
@@ -624,7 +626,7 @@ db.close();
   const base = {
     principalId: "resume-principal",
     principalRole: "client" as const,
-    workspaceId: WS,
+    workspaceId: WS_ID,
     tool: "bash",
     command: "printf resume-target",
     // Direct MCP surface: approval_required returns immediately with a

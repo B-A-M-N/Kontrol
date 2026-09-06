@@ -3,6 +3,7 @@
  * from src/mcp/workspace-server.ts (P1.3).
  */
 import * as z from "zod/v4";
+import { brandWorkSessionId, brandWorkspaceId } from "../../branded.js";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { ServerConfig } from "../../config.js";
@@ -91,8 +92,8 @@ export function registerCodexProcessTools(
         const approved = await enforceToolPolicy(
           workSessions,
           policyEnforcer,
-          workspaceId,
-          connectionContext?.workSessionId,
+          brandWorkspaceId(workspaceId),
+          connectionContext?.workSessionId ? brandWorkSessionId(connectionContext.workSessionId) : undefined,
           connectionContext?.runId,
           // P0 #1: canonical policy name — exec_command is gated as "bash".
           "bash",
@@ -198,8 +199,8 @@ export function registerCodexProcessTools(
         const approved = await enforceToolPolicy(
           workSessions,
           policyEnforcer,
-          workspaceId,
-          connectionContext?.workSessionId,
+          brandWorkspaceId(workspaceId),
+          connectionContext?.workSessionId ? brandWorkSessionId(connectionContext.workSessionId) : undefined,
           connectionContext?.runId,
           // P0 #1: a mutating write_stdin is a run_commands action. Pass the
           // CANONICAL policy name ("bash") so it is gated by exactly the same

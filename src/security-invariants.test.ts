@@ -18,6 +18,7 @@
  * RELEASE-01  Launcher/deployment authority is explicit context, not ambient state.
  */
 import assert from "node:assert/strict";
+import { brandWorkspaceId, type WorkSessionId } from "./branded.js";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -133,21 +134,21 @@ import { openDatabase } from "./db/client.js";
     KONTROL_POLICY_MODE: "ask",
     KONTROL_STATE_DIR: stateDir,
   }));
-  const ctx = { workspaceId: "ws-A", workSessionId: undefined as string | undefined };
+  const ctx = { workspaceId: brandWorkspaceId("ws-A"), workSessionId: undefined as WorkSessionId | undefined };
   policy.recordApproval("p1", "bash:echo-hi", "workspace", ctx, "reviewer");
-  assert.equal(policy.isApproved("p1", "bash:echo-hi", { workspaceId: "ws-A" }), true, "APPROVAL: recorded approval matches its own scope");
+  assert.equal(policy.isApproved("p1", "bash:echo-hi", { workspaceId: brandWorkspaceId("ws-A") }), true, "APPROVAL: recorded approval matches its own scope");
   assert.equal(
-    policy.isApproved("p1", "bash:echo-hi", { workspaceId: "ws-B" }),
+    policy.isApproved("p1", "bash:echo-hi", { workspaceId: brandWorkspaceId("ws-B") }),
     false,
     "APPROVAL-02: an approval for workspace A is not valid in workspace B",
   );
   assert.equal(
-    policy.isApproved("p1", "bash:rm-rf", { workspaceId: "ws-A" }),
+    policy.isApproved("p1", "bash:rm-rf", { workspaceId: brandWorkspaceId("ws-A") }),
     false,
     "APPROVAL-03: an approval cannot be consumed by altered tool arguments (different key)",
   );
   assert.equal(
-    policy.isApproved("p2", "bash:echo-hi", { workspaceId: "ws-A" }),
+    policy.isApproved("p2", "bash:echo-hi", { workspaceId: brandWorkspaceId("ws-A") }),
     false,
     "APPROVAL-03: an approval is not consumable by a different principal",
   );

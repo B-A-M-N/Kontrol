@@ -1,4 +1,5 @@
 import { randomUUID, createHash, timingSafeEqual } from "node:crypto";
+import { brandRunId, brandWorkSessionId, brandWorkspaceId, type RunId, type WorkSessionId, type WorkspaceId } from "./branded.js";
 import { eq, and, lt, desc, sql } from "drizzle-orm";
 import { openDatabase, type DatabaseHandle } from "./db/client.js";
 import { validateWebhookUrl, type WebhookPolicy } from "./webhook-policy.js";
@@ -154,11 +155,11 @@ export interface AgentInfo {
 }
 
 export interface PersistentAcpRun {
-  runId: string;
+  runId: RunId;
   agentName: string;
   agentId?: string;
-  workspaceSessionId?: string;
-  workSessionId?: string;
+  workspaceSessionId?: WorkspaceId;
+  workSessionId?: WorkSessionId;
   /** Adapter-side execution-attempt identifier (e.g. crush_local_*). */
   remoteRunId?: string;
   /** Attempt number within the same logical run (continuations bump this). */
@@ -520,11 +521,11 @@ class SqliteAgentRegistryManager implements AgentRegistryManager {
     const now = new Date().toISOString();
     const runId = `acp_run_${randomUUID()}`;
     const run: PersistentAcpRun = {
-      runId,
+      runId: brandRunId(runId),
       agentName: input.agentName,
       agentId: input.agentId,
-      workspaceSessionId: input.workspaceSessionId,
-      workSessionId: input.workSessionId,
+      workspaceSessionId: input.workspaceSessionId ? brandWorkspaceId(input.workspaceSessionId) : undefined,
+      workSessionId: input.workSessionId ? brandWorkSessionId(input.workSessionId) : undefined,
       remoteRunId: input.remoteRunId,
       attemptNumber: input.attemptNumber ?? 1,
       status: input.status ?? "created",
@@ -838,11 +839,11 @@ function rowToAgentInfo(row: AgentRegistryRow): AgentInfo {
 
 function rowToPersistentRun(row: AcpRunRow): PersistentAcpRun {
   return {
-    runId: row.runId,
+    runId: brandRunId(row.runId),
     agentName: row.agentName,
     agentId: row.agentId ?? undefined,
-    workspaceSessionId: row.workspaceSessionId ?? undefined,
-    workSessionId: row.workSessionId ?? undefined,
+    workspaceSessionId: row.workspaceSessionId ? brandWorkspaceId(row.workspaceSessionId) : undefined,
+    workSessionId: row.workSessionId ? brandWorkSessionId(row.workSessionId) : undefined,
     remoteRunId: row.remoteRunId ?? undefined,
     attemptNumber: row.attemptNumber ?? 1,
     status: row.status,

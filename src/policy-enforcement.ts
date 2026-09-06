@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import type { WorkSessionId, WorkspaceId } from "./branded.js";
 import type { PolicyEngine, PolicyDecision, ApprovalScope, PolicyInputPath } from "./policy.js";
 import { CANONICAL_TOOL_ALIASES } from "./policy.js";
 import type { EventStore } from "./event-log.js";
@@ -8,8 +9,8 @@ export type PrincipalRole = "reviewer" | "worker" | "client";
 export interface PolicyInvocation {
   principalId: string;
   principalRole: PrincipalRole;
-  workspaceId: string;
-  workSessionId?: string;
+  workspaceId: WorkspaceId;
+  workSessionId?: WorkSessionId;
   runId?: string;
   tool: string;
   path?: PolicyInputPath;

@@ -6,6 +6,7 @@
  * explicit module functions.
  */
 import { relative, resolve, sep } from "node:path";
+import type { WorkSessionId, WorkspaceId } from "../branded.js";
 import type { PolicyInvocation } from "../policy-enforcement.js";
 import { isPathInsideRoot } from "../roots.js";
 import { authorizeWorkSessionAction } from "../work-session-action-guard.js";
@@ -93,8 +94,8 @@ export function policyFailureResponse(
 export async function enforceToolPolicy(
   workSessions: ReturnType<typeof import("../work-sessions.js").createWorkSessionManager> | undefined,
   enforcer: import("../policy-enforcement.js").PolicyEnforcer,
-  workspaceId: string,
-  workSessionId: string | undefined,
+  workspaceId: WorkspaceId,
+  workSessionId: WorkSessionId | undefined,
   runId: string | undefined,
   tool: string,
   path: PolicyInvocation["path"],

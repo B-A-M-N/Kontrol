@@ -13,6 +13,17 @@
  * working tree is project-controlled, and before starting unrelated test
  * harnesses. Not relying on each test remembering to unset variables.
  */
+import {
+  brandArtifactPath,
+  brandBuildId,
+  brandDeploymentId,
+  brandLaunchGenerationId,
+  type ArtifactPath,
+  type BuildId,
+  type DeploymentId,
+  type LaunchGenerationId,
+} from "./branded.js";
+
 const LAUNCHER_AUTHORITY_KEYS = [
   "KONTROL_DEPLOYMENT_ID",
   "KONTROL_EXPECTED_SCHEMA_VERSION",
@@ -25,11 +36,11 @@ const LAUNCHER_AUTHORITY_KEYS = [
 ] as const;
 
 export interface DeploymentContext {
-  deploymentId?: string;
+  deploymentId?: DeploymentId;
   expectedSchemaVersion?: number;
-  expectedBuildId?: string;
-  launchGenerationId?: string;
-  artifactPath?: string;
+  expectedBuildId?: BuildId;
+  launchGenerationId?: LaunchGenerationId;
+  artifactPath?: ArtifactPath;
   launcher?: "systemd" | "dev-watch" | "serve";
 }
 
@@ -42,14 +53,16 @@ export function resolveDeploymentContext(source: NodeJS.ProcessEnv = process.env
   const parsedSchemaVersion = rawSchemaVersion === undefined ? undefined : Number(rawSchemaVersion);
   const launcher = source.KONTROL_LAUNCHER;
   return {
-    deploymentId: source.KONTROL_DEPLOYMENT_ID?.trim() || undefined,
+    deploymentId: source.KONTROL_DEPLOYMENT_ID?.trim() ? brandDeploymentId(source.KONTROL_DEPLOYMENT_ID.trim()) : undefined,
     expectedSchemaVersion:
       parsedSchemaVersion !== undefined && Number.isInteger(parsedSchemaVersion)
         ? parsedSchemaVersion
         : undefined,
-    expectedBuildId: source.KONTROL_BUILD_ID?.trim() || undefined,
-    launchGenerationId: source.KONTROL_LAUNCH_GENERATION_ID?.trim() || undefined,
-    artifactPath: source.KONTROL_ARTIFACT_PATH?.trim() || undefined,
+    expectedBuildId: source.KONTROL_BUILD_ID?.trim() ? brandBuildId(source.KONTROL_BUILD_ID.trim()) : undefined,
+    launchGenerationId: source.KONTROL_LAUNCH_GENERATION_ID?.trim()
+      ? brandLaunchGenerationId(source.KONTROL_LAUNCH_GENERATION_ID.trim())
+      : undefined,
+    artifactPath: source.KONTROL_ARTIFACT_PATH?.trim() ? brandArtifactPath(source.KONTROL_ARTIFACT_PATH.trim()) : undefined,
     launcher:
       launcher === "systemd" || launcher === "dev-watch" || launcher === "serve"
         ? launcher

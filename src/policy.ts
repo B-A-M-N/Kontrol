@@ -26,6 +26,7 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { brandWorkSessionId, brandWorkspaceId, type WorkSessionId, type WorkspaceId } from "./branded.js";
 import type { ApprovalOption, ApprovalRequestManager } from "./approval-requests.js";
 import { DEFAULT_DIRECT_APPROVAL_REATTACH_GRACE_MS } from "./policy-approval-defaults.js";
 
@@ -58,8 +59,11 @@ export interface PolicyRule {
 export interface ToolApprovalRequest {
   id: string;
   principalId: string;
-  workspaceId: string;
-  workSessionId?: string;
+  // P1.11: the opened-workspace instance identity (durable rows name it
+  // workspace_session_id); brands make cross-assigning it to a work session
+  // a compile error at the authorization boundary.
+  workspaceId: WorkspaceId;
+  workSessionId?: WorkSessionId;
   runId?: string;
   agentId?: string;
   approvalKey?: string;
@@ -100,8 +104,8 @@ export type LiveWaiterState = "live" | "dead";
  */
 export interface OperationResumeContent {
   principalId: string;
-  workspaceId: string;
-  workSessionId?: string;
+  workspaceId: WorkspaceId;
+  workSessionId?: WorkSessionId;
   tool: string;
   approvalKey: string;
   path?: string;
@@ -116,8 +120,8 @@ export interface PolicyDecision {
 }
 
 export interface ScopeContext {
-  workspaceId: string;
-  workSessionId?: string;
+  workspaceId: WorkspaceId;
+  workSessionId?: WorkSessionId;
 }
 
 export interface GrantRecord {
@@ -487,8 +491,8 @@ export function createPolicyEngine(
           .map((request) => ({
             id: request.approvalId,
             principalId: request.principalId ?? "",
-            workspaceId: request.workspaceSessionId,
-            workSessionId: request.workSessionId,
+            workspaceId: brandWorkspaceId(request.workspaceSessionId),
+            workSessionId: request.workSessionId ? brandWorkSessionId(request.workSessionId) : undefined,
             runId: request.runId,
             agentId: request.agentId,
             approvalKey: request.approvalKey,
@@ -525,8 +529,8 @@ export function createPolicyEngine(
           .map((request) => ({
             id: request.approvalId,
             principalId: request.principalId ?? "",
-            workspaceId: request.workspaceSessionId,
-            workSessionId: request.workSessionId,
+            workspaceId: brandWorkspaceId(request.workspaceSessionId),
+            workSessionId: request.workSessionId ? brandWorkSessionId(request.workSessionId) : undefined,
             runId: request.runId,
             agentId: request.agentId,
             approvalKey: request.approvalKey,
@@ -630,8 +634,8 @@ export function createPolicyEngine(
         .map((request) => ({
           id: request.approvalId,
           principalId: request.principalId ?? "",
-          workspaceId: request.workspaceSessionId,
-          workSessionId: request.workSessionId,
+          workspaceId: brandWorkspaceId(request.workspaceSessionId),
+          workSessionId: request.workSessionId ? brandWorkSessionId(request.workSessionId) : undefined,
           runId: request.runId,
           agentId: request.agentId,
           approvalKey: request.approvalKey,

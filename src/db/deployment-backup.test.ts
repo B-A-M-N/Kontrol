@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { brandDeploymentId } from "../branded.js";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -32,7 +33,7 @@ function createPreMigrationDatabase(stateDir: string, version: number) {
 // upgrades it to schema 50 and records the exact pre-migration image. A later
 // B-only table represents work performed after migration but before readiness.
 const actual = mkdtempSync(join(tmpdir(), "kontrol-db-actual-ab-"));
-const actualDeploymentId = "actual-ab-deployment";
+const actualDeploymentId = brandDeploymentId("actual-ab-deployment");
 try {
   createPreMigrationDatabase(actual, LATEST_SCHEMA_VERSION - 1);
   // P0.3: deployment identity is passed explicitly — the DB layer no longer
