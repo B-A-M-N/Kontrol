@@ -85,6 +85,16 @@ import { formatElapsed, humanizeStatus } from "./ui-format.js";
 import { approvalCenterId, isApprovalCenterId } from "./approval-center.js";
 import { relativeSessionAge, sessionCategory } from "./session-view-helpers.js";
 import {
+  currentPayloadContainerElement,
+  hasMountedPayload,
+  setPayloadContainer,
+  ensureSurface,
+  renderPayloadIfNeeded,
+  renderSummaryBadge,
+  setPayloadMountHost,
+  unmountPayload,
+} from "./payload-mount.js";
+import {
   fetchReviewDiff,
   hydrateWorkSessionSnapshot,
   loadHistoricalPendingReviews,
@@ -133,16 +143,6 @@ import {
   setServerToolHost,
 } from "./server-tool-call.js";
 
-interface MountedPayload {
-  update(options: {
-    card: ToolResultCard;
-    hostContext?: HostContext;
-    errorMessage?: string | null;
-    visibleFileCount?: number;
-  }): void;
-  unmount(): void;
-}
-
 // ── Work-session view model ───────────────────────────
 // A run is a long-lived workflow, not a succession of unrelated single cards.
 // Each delegated task owns a WorkSessionViewState that composes the run header,
@@ -189,14 +189,6 @@ let historicalPendingReviewsLoaded = false;
 let expanded = false;
 let reviewFilesExpanded = false;
 let errorMessage: string | null = null;
-let currentPayload: MountedPayload | null = null;
-let currentPayloadContainer: HTMLElement | null = null;
-let currentPayloadCard: ToolResultCard | null = null;
-let currentPayloadKind: "heavy" | "review" | null = null;
-let currentPayloadKey: string | null = null;
-let payloadLoadingKey: string | null = null;
-let payloadLoadGeneration = 0;
-let renderedSurfaceKey: string | null = null;
 let agentBar: HTMLElement | null = null;
 
 interface WorkSessionDom {
@@ -231,6 +223,7 @@ interface LegacyReviewDom {
 }
 
 let currentWorkSessionDom: WorkSessionDom | null = null;
+let renderedSurfaceKey: string | null = null;
 let currentLegacyReviewDom: LegacyReviewDom | null = null;
 
 let renderQueued = false;
@@ -321,6 +314,15 @@ async function bootInternal(): Promise<void> {
   setServerToolHost({
     getApp: () => app,
     reconnect: (reason) => reconnectApp(reason),
+  });
+
+  setPayloadMountHost({
+    getLastToolCard: () => lastToolCard,
+    getHostContext: () => hostContext,
+    getErrorMessage: () => errorMessage,
+    renderedSurfaceKey: () => renderedSurfaceKey,
+    setRenderedSurfaceKey: (v) => { renderedSurfaceKey = v; },
+    setCurrentWorkSessionDom: (v) => { currentWorkSessionDom = v as WorkSessionDom | null; },
   });
 
   setHydrationHost({
@@ -750,7 +752,7 @@ function renderNowInternal(): void {
 
   if (expanded) {
     const body = element("div", { className: "tool-body" });
-    currentPayloadContainer = body;
+    setPayloadContainer(body);
     section.append(body);
   }
 
@@ -867,111 +869,6 @@ function renderWorkspaceApprovalGate(): boolean {
   return true;
 }
 
-function ensureSurface(key: string): void {
-  if (renderedSurfaceKey === key) return;
-  unmountPayload();
-  currentWorkSessionDom = null;
-  renderedSurfaceKey = key;
-}
-
-function renderSummaryBadge(card: ToolResultCard): HTMLElement {
-  const badge = element("span", { className: "tool-badge", ariaHidden: "true" });
-  if (isReviewTool(card.tool)) {
-    const files = summaryNumber(card.summary, "files") ?? card.files?.length ?? 0;
-    badge.textContent = files > 0 ? `${files} file${files === 1 ? "" : "s"}` : "review";
-  } else if (card.summary?.status) {
-    badge.textContent = String(card.summary.status);
-  } else if (card.path) {
-    badge.textContent = card.path.split("/").pop() ?? card.path;
-  } else {
-    badge.textContent = card.tool;
-  }
-  return badge;
-}
-
-function unmountPayload(): void {
-  payloadLoadGeneration += 1;
-  if (currentPayload) {
-    try {
-      currentPayload.unmount();
-    } catch {
-      /* ignore */
-    }
-    currentPayload = null;
-  }
-  if (currentPayloadContainer) {
-    currentPayloadContainer.replaceChildren();
-  }
-  currentPayloadContainer = null;
-  currentPayloadCard = null;
-  currentPayloadKind = null;
-  currentPayloadKey = null;
-  payloadLoadingKey = null;
-}
-
-function renderPayloadIfNeeded(
-  payloadCard?: ToolResultCard | null,
-  visibleFileCount?: number,
-): void {
-  const target = currentPayloadContainer;
-  if (!target) return;
-  const card = payloadCard === undefined ? currentPayloadCard ?? lastToolCard : payloadCard;
-  if (!card) return;
-  currentPayloadCard = card;
-
-  const kind = isReviewTool(card.tool) ? "review" : "heavy";
-  // The renderer identity is the selected card/submission, not its mutable
-  // payload. Content and theme updates must flow through update(); remounting
-  // Pierre on every output fragment loses scroll position and focus.
-  const identity = isReviewTool(card.tool)
-    ? String(card.summary?.submissionId ?? card.workSessionId ?? card.path ?? card.tool)
-    : String(card.path ?? card.workSessionId ?? card.tool);
-  const key = `${kind}:${card.tool}:${identity}`;
-  if (currentPayloadContainer === target && currentPayload && currentPayloadKind === kind && currentPayloadKey === key) {
-    currentPayload.update({ card, hostContext, errorMessage, visibleFileCount });
-    return;
-  }
-
-  if (currentPayloadContainer === target && !currentPayload && payloadLoadingKey === key) return;
-
-  if (currentPayloadContainer !== target || currentPayloadKind !== kind || currentPayloadKey !== key) {
-    if (currentPayload) {
-      try { currentPayload.unmount(); } catch { /* ignore renderer teardown failures */ }
-      currentPayload = null;
-    }
-    currentPayloadContainer = target;
-    currentPayloadKind = kind;
-    currentPayloadKey = key;
-    payloadLoadingKey = key;
-    target.replaceChildren(element("div", { className: "status muted", text: "Loading rich payload…" }));
-    const generation = ++payloadLoadGeneration;
-    const options = { card, hostContext, errorMessage, visibleFileCount };
-    void (kind === "review"
-      ? import("./review-payload.js").then(({ mountReviewPayload }) => mountReviewPayload(target, options))
-      : import("./heavy-payload.js").then(({ mountHeavyPayload }) => mountHeavyPayload(target, options)))
-      .then((mounted) => {
-        if (generation !== payloadLoadGeneration || currentPayloadContainer !== target || currentPayloadKey !== key) {
-          try { mounted.unmount(); } catch { /* ignore stale renderer teardown failures */ }
-          return;
-        }
-        currentPayload = mounted;
-        payloadLoadingKey = null;
-        // Host theme or card payload may have changed while the lazy module was
-        // loading. Apply the newest values without another mount.
-        mounted.update({ card: currentPayloadCard ?? card, hostContext, errorMessage, visibleFileCount });
-      })
-      .catch((error) => {
-        if (generation !== payloadLoadGeneration || currentPayloadContainer !== target || currentPayloadKey !== key) return;
-        currentPayload = null;
-        payloadLoadingKey = null;
-        target.replaceChildren(element("pre", {
-          className: "text-payload fallback",
-          text: payloadText(card.payload) || card.payload?.patch || `Rich renderer failed: ${error instanceof Error ? error.message : String(error)}`,
-        }));
-      });
-  }
-}
-
 // ── Composed work-session view ───────────────────────
 
 function renderWorkSessionView(view: WorkSessionViewState): void {
@@ -1059,16 +956,16 @@ function renderWorkSessionView(view: WorkSessionViewState): void {
     const submissionCard = reviewCardFromSubmission(submission, view.workSessionId);
     if (submission.patch) {
       dom.reviewPayload.removeAttribute("data-loading-key");
-      currentPayloadContainer = dom.reviewPayload;
+      setPayloadContainer(dom.reviewPayload);
       renderPayloadIfNeeded(submissionCard);
     } else {
       const loadingKey = `loading:${submission.submissionId}`;
       if (dom.reviewPayload.dataset.loadingKey !== loadingKey) {
-        if (currentPayloadContainer === dom.reviewPayload && currentPayload) unmountPayload();
+        if (currentPayloadContainerElement() === dom.reviewPayload && hasMountedPayload()) unmountPayload();
         dom.reviewPayload.replaceChildren(element("div", { className: "status muted", text: "Loading review details…" }));
         dom.reviewPayload.dataset.loadingKey = loadingKey;
       }
-      currentPayloadContainer = dom.reviewPayload;
+      setPayloadContainer(dom.reviewPayload);
     }
     const fbState = view.feedbackStateBySubmission.get(submission.submissionId) ?? "idle";
     const feedbackKey = `${submission.submissionId}:${fbState}:${view.feedbackErrorBySubmission.get(submission.submissionId) ?? ""}:${view.mission ? "mission" : "review"}`;
@@ -1083,8 +980,8 @@ function renderWorkSessionView(view: WorkSessionViewState): void {
   } else {
     dom.review.hidden = false;
     dom.reviewTitle.textContent = "Review status";
-    if (currentPayloadContainer === dom.reviewPayload) unmountPayload();
-    currentPayloadContainer = dom.reviewPayload;
+    if (currentPayloadContainerElement() === dom.reviewPayload) unmountPayload();
+    setPayloadContainer(dom.reviewPayload);
     dom.reviewPayload.replaceChildren();
     dom.reviewPayload.removeAttribute("data-loading-key");
     if (view.status === "awaiting_review") dom.reviewPayload.append(element("div", { className: "empty muted", text: "Awaiting review submission…" }));
@@ -1629,7 +1526,7 @@ function renderReviewCard(card: ToolResultCard, display: ToolDisplay): void {
     dom.feedbackKey = feedbackKey;
   }
 
-  currentPayloadContainer = dom.body;
+  setPayloadContainer(dom.body);
   if (!dom.main.isConnected) appRoot.replaceChildren(dom.main);
   renderPayloadIfNeeded(card, visibleFiles.length);
   maybeAppendAgentBar();

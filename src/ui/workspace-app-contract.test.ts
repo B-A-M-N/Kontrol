@@ -5,15 +5,15 @@ import { join } from "node:path";
 // P1.4: the app is decomposed across sibling modules; contract assertions
 // below that name extracted literals scan the module cluster, not only the
 // composition entrypoint.
-const uiModuleSources = ["workspace-app.tsx", "ui-dom.ts", "ui-format.ts", "approval-center.ts", "session-view-helpers.ts", "tool-display.ts", "session-views.ts", "session-view-types.ts", "server-tool-call.ts", "review-feedback.ts", "mission-panel.ts", "workspace-event-reducer.ts", "session-hydration.ts"]
+const uiModuleSources = ["workspace-app.tsx", "ui-dom.ts", "ui-format.ts", "approval-center.ts", "session-view-helpers.ts", "tool-display.ts", "session-views.ts", "session-view-types.ts", "server-tool-call.ts", "review-feedback.ts", "mission-panel.ts", "workspace-event-reducer.ts", "session-hydration.ts", "payload-mount.ts"]
   .map((name) => readFileSync(new URL(`./${name}`, import.meta.url), "utf8"))
   .join("\n");
 const source = readFileSync(new URL("./workspace-app.tsx", import.meta.url), "utf8");
 const css = readFileSync(new URL("./workspace-app.css", import.meta.url), "utf8");
 
-assert.match(source, /import\("\.\/heavy-payload\.js"\)/, "heavy payload renderer must remain dynamically connected");
-assert.match(source, /import\("\.\/review-payload\.js"\)/, "review payload renderer must remain dynamically connected");
-assert.match(source, /currentPayload\.update\(/, "mounted payloads must update in place");
+assert.match(uiModuleSources, /import\("\.\/heavy-payload\.js"\)/, "heavy payload renderer must remain dynamically connected");
+assert.match(uiModuleSources, /import\("\.\/review-payload\.js"\)/, "review payload renderer must remain dynamically connected");
+assert.match(uiModuleSources, /currentPayload\.update\(/, "mounted payloads must update in place");
 assert.match(source, /requestAnimationFrame/, "event-driven renders must be frame-batched");
 assert.match(uiModuleSources, /await_workspace_events/, "the WebUI must use one workspace event watcher");
 assert.match(uiModuleSources, /list_pending_approvals/, "the WebUI must rehydrate approvals missed during reconnect");
@@ -24,7 +24,7 @@ assert.match(uiModuleSources, /reviewEpoch: s\.latestSubmission\.reviewEpoch/, "
 assert.doesNotMatch(source, /reviewEpoch: Number\(card\?\.summary\?\.reviewEpoch \?\? sc\.reviewEpoch \?\? 0\)/, "review identity must not fabricate epoch zero");
 assert.doesNotMatch(source, /diffSha256: String\(card\?\.summary\?\.diffSha256 \?\? sc\.diffSha256 \?\? ""\)/, "review identity must not fabricate an empty diff hash");
 assert.match(source, /Needs your input/, "open agent messages must have a visible high-priority surface");
-assert.match(source, /Rich renderer failed/, "plain text is only a rich-renderer failure fallback");
+assert.match(uiModuleSources, /Rich renderer failed/, "plain text is only a rich-renderer failure fallback");
 
 const workSessionStart = source.indexOf("function renderWorkSessionView");
 const workSessionEnd = source.indexOf("function createWorkSessionDom");
