@@ -23,15 +23,20 @@ const root = process.cwd();
 const tmp = mkdtempSync(join(tmpdir(), "kontrol-package-"));
 
 try {
-  console.log("[package-release] packing release artifact...");
-  execFileSync("npm", ["pack", "--pack-destination", tmp], {
+  // P1: packaging must come from the staged packer, which builds the
+  // immutable candidate and packs a temp copy of the package tree. A plain
+  // `npm pack` here would tar up the checkout's dist/ projection, which may
+  // be stale, absent, or a controller-managed symlink (the exact
+  // crash-vulnerability this flow replaced).
+  console.log("[package-release] staging + packing release artifact...");
+  execFileSync("node", [join(root, "scripts", "package-stage.mjs"), "--pack-destination", tmp], {
     cwd: root,
     env: { ...process.env, npm_config_cache: join(tmp, "npm-cache") },
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
   });
   const packedFilename = readdirSync(tmp).find((name) => name.endsWith(".tgz"));
-  assert.ok(packedFilename, "npm pack did not create a tarball");
+  assert.ok(packedFilename, "staged pack did not create a tarball");
 
   const tarball = join(tmp, packedFilename);
   extractTgz(tarball, tmp);
