@@ -20,6 +20,7 @@ export interface ShutdownDeps {
   readonly sessionLifecycle: McpSessionLifecycle;
   readonly mcpAdmission: McpAdmission;
   readonly mcpWaiterAdmission: McpAdmission;
+  readonly mcpResourceAdmission: McpAdmission;
   readonly startupReconciliation: { stop(): void };
   readonly maintenance: { stop(): void };
   readonly reviewCheckpoints: { drain(): Promise<unknown> };
@@ -52,6 +53,7 @@ export function createShutdownController(deps: ShutdownDeps): Pick<RunningServer
     sessionLifecycle,
     mcpAdmission,
     mcpWaiterAdmission,
+    mcpResourceAdmission,
     startupReconciliation,
     maintenance,
   } = deps;
@@ -83,6 +85,7 @@ export function createShutdownController(deps: ShutdownDeps): Pick<RunningServer
     deps.supervisorRuns.close();
     mcpAdmission.close();
     mcpWaiterAdmission.close();
+    mcpResourceAdmission.close();
     clearInterval(sessionLifecycle.reaper);
     clearInterval(sessionLifecycle.memorySampler);
     clearInterval(deps.mcpSessionChurnTimer);
@@ -118,6 +121,7 @@ export function createShutdownController(deps: ShutdownDeps): Pick<RunningServer
         deps.shuttingDown.value = true;
         mcpAdmission.close();
         mcpWaiterAdmission.close();
+        mcpResourceAdmission.close();
         const activeTransports = [...transports.values()];
         for (const state of mcpSessions.values()) state.closing = true;
         await Promise.all(activeTransports.map(closeTransport));

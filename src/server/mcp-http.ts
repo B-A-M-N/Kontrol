@@ -62,6 +62,7 @@ export interface McpHttpDeps {
   readonly policyWaiters: McpPolicyWaiterRegistry;
   readonly mcpAdmission: McpAdmission;
   readonly mcpWaiterAdmission: McpAdmission;
+  readonly mcpResourceAdmission: McpAdmission;
   readonly sessionLifecycle: McpSessionLifecycle;
   readonly workspaceAppResourceMetrics: { currentHashed: number; openAiCompatibility: number; legacyKontrol: number; devDesktopMigration: number };
   trackSocketAbort(socket: Socket, controller: AbortController): () => void;
@@ -69,7 +70,7 @@ export interface McpHttpDeps {
   resourceServerUrl(): URL | undefined;
   oauthEnabled(): boolean;
   shuttingDown(): boolean;
-  serveWorkspaceAppResource(res: Response, requestId: string | undefined, body: { id?: unknown; params?: { uri?: unknown } }, sessionless: boolean): boolean;
+  serveWorkspaceAppResource(res: Response, requestId: string | undefined, body: { id?: unknown; params?: { uri?: unknown } }, sessionless: boolean, clientKey: string, abortSignal: AbortSignal | undefined, acceptEncoding?: string | undefined): Promise<boolean>;
   createServerForSession(connectionContext: ConnectionContext): { connect(transport: Transport): Promise<void> };
   supervisorWake(workSessionId: string): void;
   mutationReceipts: MutationReceiptStore;
@@ -101,6 +102,7 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
     policyWaiters,
     mcpAdmission,
     mcpWaiterAdmission,
+    mcpResourceAdmission,
     sessionLifecycle,
     workspaceAppResourceMetrics,
     trackSocketAbort,
@@ -436,11 +438,16 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
               logicalContinuity.touch(sessionState.logicalClientId, sessionState.sessionId, activityAt);
             }
           }
-          serveWorkspaceAppResource(
+          // P0 resource admission: bounded even on the session fast path —
+          // the ~10 MB serialization must never run outside admission control.
+          await serveWorkspaceAppResource(
             res,
             requestId,
             req.body as { id?: unknown; params?: { uri?: unknown } },
             false,
+            sessionId ?? logicalClientId(req),
+            requestAbort.signal,
+            req.header("accept-encoding"),
           );
           return;
         }
@@ -737,12 +744,16 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
         // bearer/tunnel authentication above has already succeeded, so serve
         // this one protocol method statelessly rather than constructing the
         // complete file/shell/ACP/policy tool universe just to return a static
-        // HTML document.
-        serveWorkspaceAppResource(
+        // HTML document. P0: still bounded — the stateless path acquires the
+        // same resource admission permit under the client identity key.
+        await serveWorkspaceAppResource(
           res,
           requestId,
           req.body as { id?: unknown; params?: { uri?: unknown } },
           true,
+          logicalClientId(req),
+          requestAbort.signal,
+          req.header("accept-encoding"),
         );
         return;
       } else {

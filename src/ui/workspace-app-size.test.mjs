@@ -45,7 +45,7 @@ try {
     `Workspace App gzip size ${gzipped.length} bytes exceeds budget ${MAX_GZIP_BYTES} bytes (${(gzipped.length / 1024 / 1024).toFixed(2)} MB). The tunnel transfers gzip; this is the user-facing cost.`,
   );
 
-  console.log(`workspace-app-size.test.mjs: within budget (raw ${(raw.length / 1024 / 1024).toFixed(2)} MB / gzip ${(gzipped.length / 1024 / 1024).toFixed(2)} MB)`);
+  console.log(`workspace-app-size.test.mjs: within budget (raw ${(raw.length / 1024 / 1024).toFixed(2)} MB / gzip ${(gzipped.length / 1024 / 1024).toFixed(2)} MB). Wire delivery of the gzip envelope (content-encoding + actual bytes on the socket) is regression-tested in src/workspace-resource-admission.test.ts case 7.`);
 } finally {
   if (!process.env.KONTROL_UI_TEST_CANDIDATE_DIR) {
     rmSync(candidateDir, { recursive: true, force: true });
