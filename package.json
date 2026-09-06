@@ -75,7 +75,13 @@
     "soak:beta": "node scripts/beta-soak.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
-  "keywords": ["mcp", "acp", "coding-agent", "workspace", "review"],
+  "keywords": [
+    "mcp",
+    "acp",
+    "coding-agent",
+    "workspace",
+    "review"
+  ],
   "author": "B-A-M-N",
   "license": "MIT",
   "dependencies": {
@@ -110,10 +116,9 @@
     "vite-plugin-singlefile": "^2.3.3"
   },
   "overrides": {
-    "protobufjs": "7.6.4",
-    "ws": "8.21.0",
-    "undici": "8.10.0",
-    "brace-expansion": "5.0.9"
+    "express": {
+      "qs": "^6.16.0"
+    }
   },
   "optionalDependencies": {
     "node-pty": "^1.1.0"
