@@ -18,7 +18,8 @@ assert.match(source, /requestAnimationFrame/, "event-driven renders must be fram
 assert.match(uiModuleSources, /await_workspace_events/, "the WebUI must use one workspace event watcher");
 assert.match(uiModuleSources, /list_pending_approvals/, "the WebUI must rehydrate approvals missed during reconnect");
 assert.match(uiModuleSources, /list_policy_grants/, "the WebUI must surface durable policy grants");
-assert.match(uiModuleSources, /revoke_policy_grants/, "the WebUI must provide grant revocation controls");
+assert.match(uiModuleSources, /revoke_policy_grant\b/, "the WebUI must provide exact-grant revocation controls");
+assert.match(uiModuleSources, /grantId: grant\.id/, "row-level revocation must carry the exact grant id, never a scope");
 assert.match(uiModuleSources, /Current permissions/, "the approval center must label current permissions");
 assert.match(uiModuleSources, /Running ·/, "the WebUI must expose live process elapsed status");
 assert.match(uiModuleSources, /poll_process/, "the WebUI must recognize durable process polling cards");
