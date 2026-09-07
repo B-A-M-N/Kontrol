@@ -184,8 +184,11 @@ the recovery authority.
 For stable long-running process priority on Linux, install the per-user
 systemd core unit from the compiled CLI. The unit launches an immutable,
 validated release, sets `Nice=0`, applies a bounded restart budget, and reads
-one explicit environment file. It does not start adapters or the tunnel; use
-the checkout orchestration path for the full development stack:
+one explicit environment file. With no `serviceComponents` configured it
+starts only the MCP core; adapters and the tunnel can be brought into the same
+production lifecycle via `serviceComponents` in `~/.kontrol/config.json` (see
+docs/configuration.md), or left on the checkout orchestration path for the
+full development stack:
 
 ```bash
 kontrol service install
@@ -206,7 +209,7 @@ KONTROL defines exactly one authoritative path per context:
 
 | Context | Path | Notes |
 |---|---|---|
-| Production / install on Linux | `kontrol service ...` (`kontrol-core.service`) | Owns restart/priority policy for the MCP core |
+| Production / install on Linux | `kontrol service ...` (`kontrol-core.service` + optional `kontrol.target` with adapter/tunnel units) | Owns restart/priority policy for the MCP core and configured components |
 | Development / integration | `./start-all.sh` (tmux sessions + component supervisor) | Fast validated preflight by default; atomic build generation with rollback |
 | Test / release | `npm run typecheck && npm run test && npm run build` | The release gate CI and `kontrol service install` rely on |
 

@@ -75,8 +75,10 @@ http://127.0.0.1:7676
 ```
 
 The checkout integration launcher can supervise an already-configured tunnel
-client when explicitly enabled; that is separate from the production
-`kontrol-core.service`, which owns only the MCP core. Prefer adding Cloudflare
+client when explicitly enabled. In production the tunnel can run as its own
+`kontrol-tunnel.service` user unit beside the core (see `serviceComponents` in
+docs/configuration.md); with no components configured, `kontrol-core.service`
+owns only the MCP core. Prefer adding Cloudflare
 Access, Tailscale identity controls, or equivalent protection in front of
 public tunnels. Kontrol OAuth still protects the MCP endpoint, but the tunnel
 URL should not be treated as a secret.

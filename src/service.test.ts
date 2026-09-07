@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
@@ -7,6 +7,7 @@ import { databasePath, openDatabase } from "./db/client.js";
 import { captureMigrationBackup } from "./db/deployment-backup.js";
 import { LATEST_SCHEMA_VERSION } from "./db/migrations.js";
 import { readServiceBuild, renderUserServiceUnit, runServiceCommand, servicePaths } from "./service.js";
+import { writeKontrolConfig } from "./user-config.js";
 
 const root = mkdtempSync(join(tmpdir(), "kontrol-service-test-"));
 const artifact = join(root, "release with spaces");
@@ -145,6 +146,85 @@ try {
   assert.ok(migrationRecord.restoredAt, "migration rollback remains inspectable");
 } finally {
   rmSync(lifecycleRoot, { recursive: true, force: true });
+}
+
+// --- P1.9: auxiliary component units + kontrol.target ---
+{
+  const componentRoot = mkdtempSync(join(tmpdir(), "kontrol-service-components-"));
+  try {
+    const configHome = join(componentRoot, "config home");
+    const env = {
+      ...process.env,
+      XDG_CONFIG_HOME: configHome,
+      KONTROL_SERVICE_DATA_DIR: join(componentRoot, "service data"),
+      KONTROL_STATE_DIR: join(componentRoot, "database state"),
+      KONTROL_USER_SERVICE_NAME: "kontrol-fixture.service",
+      KONTROL_CONFIG_DIR: join(componentRoot, "kontrol config"),
+    };
+    writeKontrolConfig({
+      serviceComponents: [
+        { name: "hermes", kind: "adapter", command: ["node", "@ARTIFACT/../scripts/acp-hermes-native-adapter.mjs"], port: 9911 },
+        { name: "tunnel", kind: "tunnel", command: ["tunnel-client", "run", "--profile", "sample_mcp_with_dcr"] },
+      ],
+    }, env);
+
+    const calls: string[] = [];
+    const dependencies = {
+      currentArtifactPath: () => artifact,
+      requireSystemd: () => undefined,
+      systemctl: (_paths: ReturnType<typeof servicePaths>, args: string[]) => { calls.push(args.join(" ")); },
+      waitForReady: async () => undefined,
+    };
+    await runServiceCommand(["install"], env, dependencies);
+
+    const unitDir = join(configHome, "systemd", "user");
+    const hermesUnit = readFileSync(join(unitDir, "kontrol-hermes.service"), "utf8");
+    assert.match(hermesUnit, /Description=Kontrol ACP adapter \(hermes\)/);
+    assert.match(hermesUnit, /PartOf=kontrol\.target/);
+    assert.match(hermesUnit, /After=kontrol-core\.service/);
+    assert.match(hermesUnit, /Restart=on-failure/);
+    assert.match(hermesUnit, /WantedBy=kontrol\.target/);
+    assert.match(hermesUnit, new RegExp(`ExecStart=/usr/bin/env node .*releases.*build-test-1.*scripts/acp-hermes-native-adapter\\.mjs`));
+    const tunnelUnit = readFileSync(join(unitDir, "kontrol-tunnel.service"), "utf8");
+    assert.match(tunnelUnit, /Description=Kontrol Secure MCP Tunnel \(tunnel\)/);
+    assert.match(tunnelUnit, /ExecStart=\/usr\/bin\/env tunnel-client run --profile sample_mcp_with_dcr/);
+    const targetUnit = readFileSync(join(unitDir, "kontrol.target"), "utf8");
+    assert.match(targetUnit, /Wants=kontrol-core\.service/);
+    assert.match(targetUnit, /WantedBy=default\.target/);
+
+    // Install's daemon-reload happens once after the whole unit set lands.
+    assert.ok(calls.some((call) => call === "daemon-reload"), "daemon-reload after component install");
+
+    // Status reports the target and each configured component.
+    calls.length = 0;
+    await runServiceCommand(["status"], env, { ...dependencies, requireSystemd: () => undefined });
+    assert.ok(calls.some((call) => call.includes("kontrol.target") && call.includes("kontrol-hermes.service") && call.includes("kontrol-tunnel.service")), `status calls: ${calls.join(" | ")}`);
+
+    // Removing a component from the configuration deletes its unit at install.
+    writeKontrolConfig({
+      serviceComponents: [
+        { name: "tunnel", kind: "tunnel", command: ["tunnel-client", "run"] },
+      ],
+    }, env);
+    await runServiceCommand(["install"], env, dependencies);
+    assert.equal(existsSync(join(unitDir, "kontrol-hermes.service")), false, "removed component unit is deleted");
+    assert.ok(existsSync(join(unitDir, "kontrol-tunnel.service")), "remaining component unit survives");
+
+    // Invalid component configuration fails install closed.
+    writeKontrolConfig({ serviceComponents: [{ name: "bad name!", kind: "adapter", command: ["agent"] }] }, env);
+    await assert.rejects(() => runServiceCommand(["install"], env, dependencies), /Invalid service component name/);
+    writeKontrolConfig({ serviceComponents: [{ name: "shell", kind: "adapter", command: ["bash", "-c", "boom"] }] }, env);
+    await assert.rejects(() => runServiceCommand(["install"], env, dependencies), /plain executable name/);
+
+    // Uninstall removes component units and the target.
+    writeKontrolConfig({ serviceComponents: [{ name: "tunnel", kind: "tunnel", command: ["tunnel-client", "run"] }] }, env);
+    await runServiceCommand(["install"], env, dependencies);
+    await runServiceCommand(["uninstall"], env, dependencies);
+    assert.equal(existsSync(join(unitDir, "kontrol-tunnel.service")), false, "component unit removed on uninstall");
+    assert.equal(existsSync(join(unitDir, "kontrol.target")), false, "target removed on uninstall");
+  } finally {
+    rmSync(componentRoot, { recursive: true, force: true });
+  }
 }
 
 console.log("service.test.ts: all assertions passed");

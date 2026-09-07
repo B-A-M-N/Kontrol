@@ -13,7 +13,7 @@ import { spawnSync } from "node:child_process";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { loadKontrolFiles } from "./user-config.js";
+import { loadKontrolFiles, type KontrolServiceComponent } from "./user-config.js";
 import { acquireDeploymentLock, releaseDeploymentLock, type DeploymentLockHandle } from "./deployment-lock.js";
 import { restoreDeploymentDatabaseBackup } from "./db/deployment-backup.js";
 
@@ -199,6 +199,107 @@ function systemdQuote(value: string): string {
   return `"${value.replaceAll("\\", "\\\\").replaceAll("\"", "\\\"").replaceAll("\t", "\\t")}"`;
 }
 
+// ── P1.9: auxiliary component units + kontrol.target ────
+// The core unit owns only the MCP core. When the operator configures adapters
+// or the tunnel via config.json `serviceComponents`, `kontrol service install`
+// also emits one unit per component (kontrol-<name>.service) and a
+// kontrol.target that groups them, each with an independent restart policy and
+// journal identity. With no components configured the documented core-only
+// production scope is unchanged.
+
+/** Deterministic systemd unit name for an auxiliary component. */
+export function componentServiceName(name: string): string {
+  if (!/^[a-z0-9][a-z0-9-]{0,38}$/.test(name)) {
+    throw new Error(`Invalid service component name: ${JSON.stringify(name)}. Use lowercase letters, digits, and dashes (max 39 chars).`);
+  }
+  return `kontrol-${name}.service`;
+}
+
+function validateServiceComponents(components: unknown): KontrolServiceComponent[] {
+  if (components === undefined) return [];
+  if (!Array.isArray(components)) throw new Error("serviceComponents must be an array.");
+  const seen = new Set<string>();
+  return components.map((raw) => {
+    if (!raw || typeof raw !== "object") throw new Error("serviceComponents entries must be objects.");
+    const entry = raw as Partial<KontrolServiceComponent>;
+    if (entry.kind !== "adapter" && entry.kind !== "tunnel") {
+      throw new Error(`serviceComponents[].kind must be "adapter" or "tunnel".`);
+    }
+    const name = entry.name;
+    componentServiceName(name ?? "");
+    if (seen.has(name!)) throw new Error(`Duplicate service component name: ${name}`);
+    seen.add(name!);
+    if (!Array.isArray(entry.command) || entry.command.length === 0 || entry.command.some((part) => typeof part !== "string" || !part)) {
+      throw new Error(`serviceComponents[${name}].command must be a nonempty array of argv strings.`);
+    }
+    if (entry.command[0].includes("/") || entry.command[0] === "sudo" || entry.command[0] === "sh" || entry.command[0] === "bash") {
+      throw new Error(`serviceComponents[${name}].command must start with a plain executable name resolved from PATH (no shell wrappers, no absolute paths).`);
+    }
+    if (entry.port !== undefined && (!Number.isInteger(entry.port) || entry.port < 1 || entry.port > 65535)) {
+      throw new Error(`serviceComponents[${name}].port must be a TCP port number.`);
+    }
+    return { name: name!, kind: entry.kind, command: entry.command, ...(entry.port !== undefined ? { port: entry.port } : {}) };
+  });
+}
+
+/** Read the operator-configured auxiliary components (validated). */
+export function readServiceComponents(env: NodeJS.ProcessEnv = process.env): KontrolServiceComponent[] {
+  const files = loadKontrolFiles(env);
+  return validateServiceComponents(files.config.serviceComponents);
+}
+
+export function renderComponentServiceUnit(options: {
+  serviceName: string;
+  description: string;
+  command: string[];
+  artifactPath: string;
+  buildId: string;
+  environmentFile: string;
+  workingDirectory: string;
+}): string {
+  const execArgs = options.command.map((part) => {
+    // "@ARTIFACT" (as its own argv element or a prefix) stands in for the
+    // installed immutable release directory.
+    const substituted = part.replaceAll("@ARTIFACT", options.artifactPath);
+    return /[\s"]/.test(substituted) ? systemdQuote(substituted) : substituted;
+  }).join(" ");
+  return [
+    "[Unit]",
+    `Description=${options.description}`,
+    "PartOf=kontrol.target",
+    "After=kontrol-core.service",
+    "StartLimitIntervalSec=60",
+    "StartLimitBurst=5",
+    "",
+    "[Service]",
+    "Type=simple",
+    `WorkingDirectory=${systemdQuote(options.workingDirectory)}`,
+    `EnvironmentFile=-${systemdQuote(options.environmentFile)}`,
+    `Environment=${systemdQuote(`KONTROL_LAUNCHER=systemd`)}`,
+    `Environment=${systemdQuote(`KONTROL_EXPECTED_BUILD_ID=${options.buildId}`)}`,
+    `ExecStart=/usr/bin/env ${execArgs}`,
+    "Restart=on-failure",
+    "RestartSec=5",
+    "KillMode=control-group",
+    "",
+    "[Install]",
+    "WantedBy=kontrol.target",
+    "",
+  ].join("\n");
+}
+
+export function renderKontrolTargetUnit(): string {
+  return [
+    "[Unit]",
+    "Description=Kontrol control plane (core + configured adapters/tunnel)",
+    "Wants=kontrol-core.service",
+    "",
+    "[Install]",
+    "WantedBy=default.target",
+    "",
+  ].join("\n");
+}
+
 export function renderUserServiceUnit(options: {
   serviceName: string;
   artifactPath: string;
@@ -242,7 +343,7 @@ export function renderUserServiceUnit(options: {
   ].join("\n");
 }
 
-function writeUnit(paths: ServicePaths, state: InstalledServiceState): void {
+function writeUnit(paths: ServicePaths, state: InstalledServiceState, components: KontrolServiceComponent[] = []): void {
   writeJsonAtomic(paths.statePath, state);
   const unit = renderUserServiceUnit({
     ...state,
@@ -257,6 +358,46 @@ function writeUnit(paths: ServicePaths, state: InstalledServiceState): void {
     renameSync(temporary, paths.unitPath);
   } finally {
     rmSync(temporary, { force: true });
+  }
+  // P1.9: auxiliary component units + the grouping target. Units removed from
+  // the configuration are deleted so the installed unit set matches exactly.
+  const configRoot = dirname(paths.unitPath);
+  mkdirSync(configRoot, { recursive: true, mode: 0o700 });
+  const activeNames = new Set<string>([paths.serviceName]);
+  for (const component of components) {
+    const name = componentServiceName(component.name);
+    activeNames.add(name);
+    const unitText = renderComponentServiceUnit({
+      serviceName: name,
+      description: component.kind === "tunnel"
+        ? `Kontrol Secure MCP Tunnel (${component.name})`
+        : `Kontrol ACP adapter (${component.name})`,
+      command: component.command,
+      artifactPath: state.artifactPath,
+      buildId: state.buildId,
+      environmentFile: paths.environmentFile,
+      workingDirectory: paths.dataRoot,
+    });
+    const componentTemp = `${join(configRoot, name)}.tmp-${process.pid}-${randomUUID()}`;
+    try {
+      writeFileSync(componentTemp, unitText, { mode: 0o644 });
+      renameSync(componentTemp, join(configRoot, name));
+    } finally {
+      rmSync(componentTemp, { force: true });
+    }
+  }
+  const targetText = renderKontrolTargetUnit();
+  const targetTemp = `${join(configRoot, "kontrol.target")}.tmp-${process.pid}-${randomUUID()}`;
+  try {
+    writeFileSync(targetTemp, targetText, { mode: 0o644 });
+    renameSync(targetTemp, join(configRoot, "kontrol.target"));
+  } finally {
+    rmSync(targetTemp, { force: true });
+  }
+  for (const entry of readdirSync(configRoot)) {
+    if (!/^kontrol-.+\.service$/.test(entry)) continue;
+    if (activeNames.has(entry)) continue;
+    rmSync(join(configRoot, entry), { force: true });
   }
 }
 
@@ -308,14 +449,15 @@ function makeRecord(deploymentId: string, operation: DeploymentRecord["operation
   return { deploymentId, operation, stage: "prepare", ...(previous ? { previous } : {}), ...(candidate ? { candidate } : {}), updatedAt: new Date().toISOString() };
 }
 
-async function install(paths: ServicePaths, dependencies: ServiceCommandDependencies): Promise<void> {
+async function install(paths: ServicePaths, dependencies: ServiceCommandDependencies, env: NodeJS.ProcessEnv = process.env): Promise<void> {
   requireSystemd(dependencies);
   await withDeploymentLock(paths, "install", async (_lock, deploymentId) => {
     const current = copyRelease(paths, readServiceBuild(dependencies.currentArtifactPath?.() ?? compiledArtifactPath()));
     const state = { ...current, deploymentId };
+    const components = readServiceComponents(env);
     const record = makeRecord(deploymentId, "install", undefined, state);
     writeDeploymentRecord(paths, record);
-    writeUnit(paths, state);
+    writeUnit(paths, state, components);
     systemctl(paths, ["daemon-reload"], dependencies);
     updateDeploymentRecord(paths, record, { stage: "commit" });
   });
@@ -336,7 +478,7 @@ async function activate(paths: ServicePaths, operation: "start" | "stop" | "rest
   });
 }
 
-async function upgrade(paths: ServicePaths, dependencies: ServiceCommandDependencies): Promise<void> {
+async function upgrade(paths: ServicePaths, dependencies: ServiceCommandDependencies, env: NodeJS.ProcessEnv = process.env): Promise<void> {
   requireSystemd(dependencies);
   const previous = readInstalledState(paths);
   if (!previous) throw new Error(`No installed Kontrol service at ${paths.statePath}; run \`kontrol service install\` first.`);
@@ -345,7 +487,7 @@ async function upgrade(paths: ServicePaths, dependencies: ServiceCommandDependen
     let record = makeRecord(deploymentId, "upgrade", previous, candidate);
     writeDeploymentRecord(paths, record);
     record = updateDeploymentRecord(paths, record, { stage: "prepared" });
-    writeUnit(paths, candidate);
+    writeUnit(paths, candidate, readServiceComponents(env));
     systemctl(paths, ["daemon-reload"], dependencies);
     try {
       record = updateDeploymentRecord(paths, record, { stage: "stop" });
@@ -369,7 +511,7 @@ async function upgrade(paths: ServicePaths, dependencies: ServiceCommandDependen
           expectedOriginalSchemaVersion: previous.schemaVersion,
         });
         record = updateDeploymentRecord(paths, record, { databaseRestore });
-        writeUnit(paths, previous);
+        writeUnit(paths, previous, readServiceComponents(env));
         systemctl(paths, ["daemon-reload"], dependencies);
         systemctl(paths, ["start", paths.serviceName], dependencies);
         await (dependencies.waitForReady?.(paths, previous) ?? waitForReady(paths, previous));
@@ -391,6 +533,18 @@ async function uninstall(paths: ServicePaths, dependencies: ServiceCommandDepend
     writeDeploymentRecord(paths, record);
     try { systemctl(paths, ["disable", "--now", paths.serviceName], dependencies); } catch { /* already stopped/disabled */ }
     rmSync(paths.unitPath, { force: true });
+    // P1.9: drop the component units and the grouping target as well.
+    try {
+      systemctl(paths, ["stop", "kontrol.target"], dependencies);
+    } catch { /* target may not exist */ }
+    const configRoot = dirname(paths.unitPath);
+    try {
+      for (const entry of readdirSync(configRoot)) {
+        if (entry === "kontrol.target" || /^kontrol-.+\.service$/.test(entry)) {
+          rmSync(join(configRoot, entry), { force: true });
+        }
+      }
+    } catch { /* config root may not exist */ }
     rmSync(paths.statePath, { force: true });
     systemctl(paths, ["daemon-reload"], dependencies);
     updateDeploymentRecord(paths, record, { stage: "commit" });
@@ -408,19 +562,63 @@ export async function runServiceCommand(args: string[], env: NodeJS.ProcessEnv =
       deploymentId: `systemd-preview-${build.buildId}`,
       installedAt: new Date().toISOString(),
     };
+    const components = readServiceComponents(env);
     const unit = renderUserServiceUnit({ ...state, stateDir: paths.stateDir, environmentFile: paths.environmentFile, workingDirectory: paths.dataRoot });
-    if (args.includes("--json")) console.log(JSON.stringify({ paths, build, unit }));
-    else process.stdout.write(unit);
+    if (args.includes("--json")) {
+      console.log(JSON.stringify({
+        paths,
+        build,
+        unit,
+        target: renderKontrolTargetUnit(),
+        components: components.map((component) => ({
+          name: component.name,
+          kind: component.kind,
+          unit: componentServiceName(component.name),
+          unitText: renderComponentServiceUnit({
+            serviceName: componentServiceName(component.name),
+            description: component.kind === "tunnel" ? `Kontrol Secure MCP Tunnel (${component.name})` : `Kontrol ACP adapter (${component.name})`,
+            command: component.command,
+            artifactPath: state.artifactPath,
+            buildId: state.buildId,
+            environmentFile: paths.environmentFile,
+            workingDirectory: paths.dataRoot,
+          }),
+        })),
+      }));
+    } else {
+      process.stdout.write(unit);
+      for (const component of components) {
+        process.stdout.write(renderComponentServiceUnit({
+          serviceName: componentServiceName(component.name),
+          description: component.kind === "tunnel" ? `Kontrol Secure MCP Tunnel (${component.name})` : `Kontrol ACP adapter (${component.name})`,
+          command: component.command,
+          artifactPath: state.artifactPath,
+          buildId: state.buildId,
+          environmentFile: paths.environmentFile,
+          workingDirectory: paths.dataRoot,
+        }));
+      }
+      process.stdout.write(renderKontrolTargetUnit());
+    }
     return;
   }
   if (args.length > 1) throw new Error(`Usage: kontrol service ${command ?? "install|start|stop|restart|upgrade|status|logs|uninstall"}`);
-  if (command === "install") return install(paths, dependencies);
+  if (command === "install") return install(paths, dependencies, env);
   if (command === "start") return activate(paths, "start", dependencies);
   if (command === "stop") return activate(paths, "stop", dependencies);
   if (command === "restart") return activate(paths, "restart", dependencies);
-  if (command === "upgrade") return upgrade(paths, dependencies);
+  if (command === "upgrade") return upgrade(paths, dependencies, env);
   if (command === "uninstall") return uninstall(paths, dependencies);
-  if (command === "status") { requireSystemd(dependencies); systemctl(paths, ["--no-pager", "status", paths.serviceName], dependencies); return; }
+  if (command === "status") {
+    requireSystemd(dependencies);
+    systemctl(paths, ["--no-pager", "status", paths.serviceName], dependencies);
+    // P1.9: configured auxiliary units are part of the production surface.
+    const components = readServiceComponents(env);
+    if (components.length > 0) {
+      systemctl(paths, ["--no-pager", "status", "kontrol.target", ...components.map((c) => componentServiceName(c.name))], dependencies);
+    }
+    return;
+  }
   if (command === "logs") {
     requireSystemd(dependencies);
     const result = spawnSync("journalctl", ["--user", "--no-pager", "-f", "-u", paths.serviceName], { stdio: "inherit" });
