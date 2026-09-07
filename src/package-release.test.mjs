@@ -170,9 +170,11 @@ try {
     stdio: ["ignore", "pipe", "pipe"],
   });
   let serviceStderr = "";
+  let serviceStdout = "";
   service.stderr?.on("data", (chunk) => { serviceStderr += String(chunk); });
+  service.stdout?.on("data", (chunk) => { serviceStdout += String(chunk); });
   try {
-    await waitForHttp(`http://127.0.0.1:${servicePort}/healthz`, service, () => serviceStderr);
+    await waitForHttp(`http://127.0.0.1:${servicePort}/healthz`, service, () => `${serviceStdout}\n${serviceStderr}`);
     assert.equal(service.exitCode, null, "installed server remains alive after binding");
 
     const mcpUrl = `http://127.0.0.1:${servicePort}/mcp`;
@@ -364,9 +366,11 @@ async function exerciseInstalledCodexMutationBoundary(installedCli, installPrefi
     stdio: ["ignore", "ignore", "pipe"],
   });
   let stderr = "";
+  let stdout = "";
   child.stderr?.on("data", (chunk) => { stderr += String(chunk); });
+  child.stdout?.on("data", (chunk) => { stdout += String(chunk); });
   try {
-    await waitForHttp(`http://127.0.0.1:${port}/healthz`, child, () => stderr);
+    await waitForHttp(`http://127.0.0.1:${port}/healthz`, child, () => `${stdout}\n${stderr}`);
     const url = `http://127.0.0.1:${port}/mcp`;
     let id = 1;
     const initialized = await postMcp(url, {
@@ -595,22 +599,36 @@ async function unusedTcpPort() {
   return port;
 }
 
-async function waitForHttp(url, child, stderr) {
+async function waitForHttp(url, child, diagnostics) {
+  // P1 #7: release UAT startup boundary. A cold installed server becomes
+  // healthy in ~3s; the old 100x50ms = 5s budget was timing-sensitive and
+  // produced spurious "fetch failed" release failures. 30s is a realistic
+  // hard deadline, and measured startup time is recorded so performance
+  // regressions stay observable rather than hidden behind the larger window.
+  const startedAt = Date.now();
+  const deadlineMs = 30_000;
   let lastError = "";
-  for (let attempt = 0; attempt < 100; attempt += 1) {
+  while (Date.now() - startedAt < deadlineMs) {
     if (child.exitCode !== null) {
-      throw new Error(`installed server exited before readiness (${child.exitCode}): ${stderr()}`);
+      throw new Error(`installed server exited before readiness (${child.exitCode}): ${diagnostics()}`);
     }
     try {
       const response = await fetch(url);
-      if (response.ok) return;
+      if (response.ok) {
+        const startupMs = Date.now() - startedAt;
+        console.log(`[package-release] server ready in ${startupMs}ms`);
+        if (startupMs > 10_000) {
+          console.warn(`[package-release] WARNING: server startup took ${startupMs}ms (objective: <10s)`);
+        }
+        return;
+      }
       lastError = `HTTP ${response.status}`;
     } catch (error) {
       lastError = error instanceof Error ? error.message : String(error);
     }
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
-  throw new Error(`installed server did not become ready: ${lastError}; stderr=${stderr()}`);
+  throw new Error(`installed server did not become ready within ${deadlineMs}ms: ${lastError}; server output:\n${diagnostics()}`);
 }
 
 async function waitForChild(child) {
