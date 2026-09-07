@@ -156,6 +156,60 @@ try {
   }
   assert.equal(finished, true, "poll_process must observe child completion");
   assert.equal(readFileSync(marker, "utf8"), "run\n", "lost-response retry must not launch a second child");
+
+  // ── Lost poll_process response (P1 #9): the response to a cursor read is
+  // dropped in transit; retrying the SAME afterCursor must return the same
+  // logical output — the drain-based poll made it unrecoverable. ──
+  // 12s lifetime: long enough that the bash call's bounded yield (max 10s)
+  // detaches and returns a session, short enough that the exit-observation
+  // loop below sees completion quickly.
+  const emitter = `${node} -e 'process.stdout.write("POLL-RETRY-ABC"); setTimeout(() => process.exit(0), 12000)'`;
+  const launched = await rpc("tools/call", {
+    name: "bash",
+    arguments: { workspaceId: reconnected.workspaceId, command: emitter, timeout: 60, clientMutationId: "minimal-process-emitter" },
+  }, { sessionId: reconnected.sessionId, conversationId });
+  assert.equal(launched.response.status, 200, JSON.stringify(launched.payload));
+  const emitterSessionId = launched.payload?.result?.structuredContent?.sessionId;
+  assert.equal(typeof emitterSessionId, "string", JSON.stringify(launched.payload));
+  const emitterCursor = launched.payload?.result?.structuredContent?.outputCursor;
+  assert.equal(typeof emitterCursor, "number", "launch snapshot carries the output cursor");
+
+  // The process is still running (12s lifetime): cursor reads must be
+  // byte-identical across retries.
+  const pollArgs = { workspaceId: reconnected.workspaceId, sessionId: emitterSessionId, afterCursor: 0, yieldTimeMs: 200 };
+  const pollA = await rpc("tools/call", { name: "poll_process", arguments: { ...pollArgs } },
+    { sessionId: reconnected.sessionId, conversationId });
+  assert.equal(pollA.response.status, 200, JSON.stringify(pollA.payload));
+  assert.equal(pollA.payload?.result?.structuredContent?.running, true, "emitter is observed running");
+  const outputA = pollA.payload?.result?.structuredContent?.result;
+  const cursorA = pollA.payload?.result?.structuredContent?.outputCursor;
+  assert.match(outputA, /POLL-RETRY-ABC/, `cursor poll sees the retained output: ${JSON.stringify(pollA.payload)}`);
+
+  // Simulated lost poll response: nothing is sent to the server; the caller
+  // simply retries the identical poll at the same cursor.
+  const pollRetry = await rpc("tools/call", { name: "poll_process", arguments: { ...pollArgs } },
+    { sessionId: reconnected.sessionId, conversationId });
+  assert.equal(pollRetry.response.status, 200, JSON.stringify(pollRetry.payload));
+  assert.equal(pollRetry.payload?.result?.structuredContent?.result, outputA,
+    "lost poll response must be recoverable at the same cursor");
+  assert.equal(pollRetry.payload?.result?.structuredContent?.outputCursor, cursorA,
+    "cursor read must not advance the shared stream");
+
+  // The emitter exits on its own; its final state must remain observable at
+  // the same cursor (second observer / late retry after exit).
+  let lateObserver: Awaited<ReturnType<typeof rpc>> | undefined;
+  for (let attempt = 0; attempt < 24; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    lateObserver = await rpc("tools/call", { name: "poll_process", arguments: { ...pollArgs } },
+      { sessionId: reconnected.sessionId, conversationId });
+    assert.equal(lateObserver.response.status, 200, JSON.stringify(lateObserver.payload));
+    if (lateObserver.payload?.result?.structuredContent?.running === false) break;
+  }
+  assert.equal(lateObserver?.payload?.result?.structuredContent?.running, false,
+    "final exit state is preserved for the observer");
+  assert.match(lateObserver?.payload?.result?.structuredContent?.result, /POLL-RETRY-ABC/,
+    "post-exit cursor read must see preserved output");
+
   console.log("mcp-minimal-process.test.ts: all assertions passed");
 } finally {
   await running.drain();

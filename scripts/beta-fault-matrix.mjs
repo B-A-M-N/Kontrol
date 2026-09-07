@@ -17,6 +17,11 @@ const cases = [
   { id: "release-closure-and-boot", area: "deployment", command: process.execPath, args: ["src/release-artifact.test.mjs"] },
   { id: "schema-changing-database-rollback", area: "deployment", command: "npx", args: ["--no-install", "tsx", "src/db/deployment-backup.test.ts"] },
   { id: "mcp-process-continuity", area: "mcp", command: "npx", args: ["--no-install", "tsx", "src/mcp-process-continuity.test.ts"] },
+  // P1 #9: mandatory transport-resilience evidence — lost launch response,
+  // trusted reconnect, retry-same-clientMutationId (exactly one child), lost
+  // poll response, retry-same-cursor (identical output), preserved final
+  // state after exit.
+  { id: "mcp-lost-launch-and-poll-recovery", area: "processes", command: "npx", args: ["--no-install", "tsx", "src/mcp-minimal-process.test.ts"] },
   { id: "mcp-session-reaper-and-sse", area: "mcp", command: "npx", args: ["--no-install", "tsx", "src/mcp-session-reuse.test.ts"] },
   { id: "process-session-lifecycle", area: "processes", command: "npx", args: ["--no-install", "tsx", "src/process-sessions.test.ts"] },
   { id: "approval-disconnect-reconnect", area: "approvals", command: "npx", args: ["--no-install", "tsx", "src/policy-ask-lifecycle.test.ts"] },
