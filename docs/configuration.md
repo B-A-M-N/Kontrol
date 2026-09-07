@@ -36,7 +36,7 @@ kontrol config set publicBaseUrl https://kontrol.example.com
 | `KONTROL_PUBLIC_BASE_URL` | Public origin for the server, without `/mcp`. |
 | `KONTROL_ALLOWED_HOSTS` | Optional Host header allowlist override. |
 | `KONTROL_OAUTH_OWNER_TOKEN` | Owner password for OAuth approval. Must be at least 16 characters. |
-| `KONTROL_AUTH_MODE` | MCP auth mode: `oauth` (default) or `tunnel`. |
+| `KONTROL_AUTH_MODE` | MCP auth mode: `oauth` (default) or `tunnel`. Overrides the `authMode` field written by `kontrol init`. |
 | `KONTROL_TUNNEL_TOKEN` | Legacy compatibility variable. Ignored in tunnel mode; do not forward it as an MCP header. Authentication belongs to the Secure MCP Tunnel. |
 | `KONTROL_TUNNEL_REVIEWER_SECRET` | Secret injected by `scripts/kontrol-tunnel.sh` into MCP target requests to establish WebUI reviewer authority in tunnel mode. Defaults to `KONTROL_ACP_REVIEWER_SECRET`; keep it private. |
 | `KONTROL_TUNNEL_PROFILE` | tunnel-client profile name used by the managed launcher. Defaults to `sample_mcp_with_dcr`. |

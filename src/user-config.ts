@@ -21,6 +21,10 @@ export interface KontrolUserConfig {
   allowedRoots?: string[];
   publicBaseUrl?: string | null;
   allowedHosts?: string[];
+  /** Auth/transport mode chosen by `kontrol init`: "oauth" (default) for
+   * public/reverse-proxy deployments, "tunnel" for the OpenAI Secure MCP
+   * Tunnel. The environment variable KONTROL_AUTH_MODE overrides this. */
+  authMode?: "oauth" | "tunnel";
   stateDir?: string;
   worktreeRoot?: string;
   agentDir?: string;
@@ -29,6 +33,10 @@ export interface KontrolUserConfig {
 
 export interface KontrolAuthConfig {
   ownerToken?: string;
+  /** Tunnel-mode reviewer assertion secret (0600 auth.json), injected by the
+   * managed tunnel as X-Kontrol-Tunnel-Reviewer. KONTROL_TUNNEL_REVIEWER_SECRET
+   * or KONTROL_ACP_REVIEWER_SECRET in the environment take precedence. */
+  tunnelReviewerSecret?: string;
 }
 
 export interface KontrolFiles {

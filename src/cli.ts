@@ -20,6 +20,7 @@ import {
   loadKontrolFiles,
   writeKontrolAuth,
   writeKontrolConfig,
+  type KontrolAuthConfig,
   type KontrolUserConfig,
 } from "./user-config.js";
 import { expandHomePath } from "./roots.js";
@@ -223,6 +224,27 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
   try {
     prompts.intro("Kontrol setup");
 
+    // ── Auth/transport mode: an explicit setup choice, not an env-only
+    // afterthought. OAuth = public/reverse-proxy deployments with Kontrol's
+    // own OAuth owner gate; tunnel = loopback-only OpenAI Secure MCP Tunnel
+    // (no local bearer gate; reviewer authority via a secret).
+    const authMode = (await selectPrompt({
+      message: "How will MCP clients reach this Kontrol server?",
+      options: [
+        {
+          value: "oauth" as const,
+          label: "Public URL (OAuth)",
+          hint: "Reachable over the internet via a reverse proxy or public tunnel; ChatGPT/Claude authenticate with the OAuth owner password.",
+        },
+        {
+          value: "tunnel" as const,
+          label: "OpenAI Secure MCP Tunnel",
+          hint: "Loopback-only; the OpenAI tunnel owns access control. ChatGPT connects with No Authentication.",
+        },
+      ],
+      initialValue: files.config.authMode ?? "oauth",
+    })) as KontrolUserConfig["authMode"];
+
     const defaultRoots = files.config.allowedRoots?.join(", ") || process.cwd();
     const rootsAnswer = await textPrompt({
       message: `Where are your projects located? Press Enter to use ${defaultRoots}`,
@@ -244,37 +266,88 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
     });
     const port = Number(portAnswer);
 
-    prompts.note(
-      [
-        "Kontrol needs a public base URL so ChatGPT or Claude can reach this MCP server.",
-        "Create a tunnel or reverse proxy with Cloudflare Tunnel, ngrok, Pinggy, Tailscale Funnel, or your own HTTPS proxy.",
-        "Paste the public origin here, without /mcp.",
-        "",
-        "Example: https://your-tunnel-host.example.com",
-      ].join("\n"),
-      "Public URL required",
-    );
-    const publicBaseUrl = normalizePublicBaseUrl(await textPrompt({
-      message: files.config.publicBaseUrl
-        ? `What is the public base URL? Press Enter to keep ${files.config.publicBaseUrl}`
-        : "What is the public base URL?",
-      placeholder: files.config.publicBaseUrl ?? "https://your-tunnel-host.example.com",
-      defaultValue: files.config.publicBaseUrl ?? "",
-      validate: validateRequiredPublicBaseUrl,
-    }));
+    let publicBaseUrl: string | null = null;
+    let tunnelReviewerSecret: string | undefined;
+    if (authMode === "oauth") {
+      prompts.note(
+        [
+          "Kontrol needs a public base URL so ChatGPT or Claude can reach this MCP server.",
+          "Create a tunnel or reverse proxy with Cloudflare Tunnel, ngrok, Pinggy, Tailscale Funnel, or your own HTTPS proxy.",
+          "Paste the public origin here, without /mcp.",
+          "",
+          "Example: https://your-tunnel-host.example.com",
+        ].join("\n"),
+        "Public URL required",
+      );
+      publicBaseUrl = normalizePublicBaseUrl(await textPrompt({
+        message: files.config.publicBaseUrl
+          ? `What is the public base URL? Press Enter to keep ${files.config.publicBaseUrl}`
+          : "What is the public base URL?",
+        placeholder: files.config.publicBaseUrl ?? "https://your-tunnel-host.example.com",
+        defaultValue: files.config.publicBaseUrl ?? "",
+        validate: validateRequiredPublicBaseUrl,
+      }));
+    } else {
+      prompts.note(
+        [
+          "Tunnel mode binds a LOOPBACK address only; the OpenAI Secure MCP Tunnel",
+          "owns access control (register the server with No Authentication).",
+          "",
+          "Review/approval tools need a reviewer assertion the tunnel injects into",
+          "MCP requests. Provide a long random secret (32+ chars); it is stored in",
+          "auth.json (0600) and sent to the tunnel as",
+          "X-Kontrol-Tunnel-Reviewer. Example generation:",
+          "  openssl rand -base64 32",
+        ].join("\n"),
+        "Tunnel mode requires a reviewer secret",
+      );
+      tunnelReviewerSecret = await textPrompt({
+        message: "Reviewer assertion secret for tunnel approvals",
+        placeholder: "paste the output of: openssl rand -base64 32",
+        defaultValue: files.auth.tunnelReviewerSecret ?? "",
+        validate: (value) => {
+          const trimmed = value?.trim() ?? "";
+          if (!trimmed) return "Enter the reviewer secret (generate one with: openssl rand -base64 32).";
+          if (trimmed.length < 32) return "The reviewer secret must be at least 32 characters.";
+          return undefined;
+        },
+      }) || files.auth.tunnelReviewerSecret;
+      if (!tunnelReviewerSecret || tunnelReviewerSecret.length < 32) {
+        throw new Error("Tunnel mode requires a reviewer secret of at least 32 characters.");
+      }
+    }
 
     const config: KontrolUserConfig = {
       host: files.config.host ?? "127.0.0.1",
       port,
       allowedRoots,
+      authMode,
       publicBaseUrl,
     };
-    const auth = {
+    const auth: KontrolAuthConfig = {
       ownerToken: files.auth.ownerToken ?? generateOwnerToken(),
+      ...(tunnelReviewerSecret ? { tunnelReviewerSecret } : {}),
     };
 
+    // Validate the RESULTING configuration before finishing: the written
+    // files must load into a ServerConfig without the failure modes init
+    // would otherwise leave for first startup (loopback violation in tunnel
+    // mode, short secrets, bad URLs).
     const configPath = writeKontrolConfig(config);
     const authPath = writeKontrolAuth(auth);
+    try {
+      // kontrol-env-exception: in-process loadConfig() parameter, not a child
+      // process spawn — no environment is inherited by any subprocess here.
+      loadConfig({ ...process.env, KONTROL_AUTH_MODE: undefined, KONTROL_TUNNEL_REVIEWER_SECRET: undefined, KONTROL_ACP_REVIEWER_SECRET: undefined });
+    } catch (error) {
+      // Roll the just-written files back so a failed validation does not
+      // leave a broken config behind.
+      rmSync(configPath, { force: true });
+      rmSync(authPath, { force: true });
+      throw new Error(
+        `The generated configuration failed validation: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
 
     prompts.note(
       [
@@ -286,20 +359,27 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
     );
 
     const lines = [
+      `Mode: ${authMode === "tunnel" ? "OpenAI Secure MCP Tunnel (loopback-only)" : "Public URL (OAuth)"}`,
       `Config: ${configPath}`,
       `Auth: ${authPath}`,
       `Local MCP URL: http://${config.host}:${config.port}/mcp`,
       ...(publicBaseUrl ? [`Public MCP URL: ${publicBaseUrl}/mcp`] : []),
+      ...(authMode === "tunnel"
+        ? ["Tunnel: register with No Authentication, target the local MCP URL above.",
+           "Start the tunnel with scripts/kontrol-tunnel.sh run (see docs/configuration.md)."]
+        : []),
     ];
     prompts.note(lines.join("\n"), "Kontrol configured");
-    prompts.note(
-      [
-        `Owner password: ${auth.ownerToken}`,
-        "Use this when ChatGPT or Claude asks you to approve Kontrol access.",
-        `Stored at: ${authPath}`,
-      ].join("\n"),
-      "Owner password",
-    );
+    if (authMode === "oauth") {
+      prompts.note(
+        [
+          `Owner password: ${auth.ownerToken}`,
+          "Use this when ChatGPT or Claude asks you to approve Kontrol access.",
+          `Stored at: ${authPath}`,
+        ].join("\n"),
+        "Owner password",
+      );
+    }
     prompts.outro("Run `kontrol serve` to start the MCP server.");
   } catch (error) {
     if (error instanceof SetupCancelledError) {
@@ -814,6 +894,26 @@ async function textPrompt(options: TextPromptOptions): Promise<string> {
   if (prompts.isCancel(result)) throw new SetupCancelledError();
   const value = String(result).trim();
   return value || options.defaultValue;
+}
+
+type SelectPromptOptions<T extends string> = {
+  message: string;
+  options: Array<{ value: T; label: string; hint?: string }>;
+  initialValue?: T;
+};
+
+async function selectPrompt(options: SelectPromptOptions<string>): Promise<string> {
+  const result = await prompts.select({
+    message: options.message,
+    options: options.options.map((entry) => ({
+      value: entry.value,
+      label: entry.label,
+      ...(entry.hint !== undefined ? { hint: entry.hint } : {}),
+    })),
+    initialValue: options.initialValue,
+  });
+  if (prompts.isCancel(result)) throw new SetupCancelledError();
+  return result as string;
 }
 
 function validatePort(value: string | undefined): string | undefined {

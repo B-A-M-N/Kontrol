@@ -498,7 +498,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
   const publicBaseUrl = parsePublicBaseUrl(
     env.KONTROL_PUBLIC_BASE_URL ?? files.config.publicBaseUrl ?? localPublicBaseUrl(host, port),
   );
-  const authMode = parseAuthMode(env.KONTROL_AUTH_MODE);
+  const authMode = parseAuthMode(env.KONTROL_AUTH_MODE ?? files.config.authMode);
 
   if (authMode === "tunnel" && !isLoopbackHost(host)) {
     throw new Error(
@@ -514,7 +514,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
   // with the concrete fix, not at the first blocked tool call. This
   // requirement is independent of ACP: KONTROL_ACP_ENABLED=false changes
   // nothing about who can resolve an approval.
-  const tunnelReviewerSecret = env.KONTROL_TUNNEL_REVIEWER_SECRET ?? env.KONTROL_ACP_REVIEWER_SECRET;
+  const tunnelReviewerSecret = env.KONTROL_TUNNEL_REVIEWER_SECRET ?? env.KONTROL_ACP_REVIEWER_SECRET ?? files.auth.tunnelReviewerSecret;
   if (authMode === "tunnel" && policyCanAsk(policy) && !tunnelReviewerSecret) {
     throw new Error(
       "KONTROL_AUTH_MODE=tunnel with an ask-capable policy requires a reviewer credential. " +
