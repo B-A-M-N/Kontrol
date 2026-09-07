@@ -7,7 +7,7 @@
 import { approvalCenterId } from "./approval-center.js";
 import { element } from "./ui-dom.js";
 import { workSessionViews } from "./session-views.js";
-import { renderPolicyApproval } from "./review-feedback.js";
+import { renderPolicyApproval, renderPolicyGrants } from "./review-feedback.js";
 import { queueSessionRehydration } from "./session-hydration.js";
 import { ensureSurface } from "./payload-mount.js";
 import type { WorkSessionViewState } from "./session-view-types.js";
@@ -118,6 +118,7 @@ export function renderApprovalCenterView(view: WorkSessionViewState): void {
     section.append(list);
     if (host.approvalRecoveryState() !== "healthy") section.append(renderApprovalRecoveryIndicator());
   }
+  section.append(renderPolicyGrants(view));
   main.append(section);
   host.replaceSurfaceChildren(main);
   host.maybeAppendAgentBar();
@@ -169,4 +170,3 @@ export function renderWorkspaceApprovalGate(): boolean {
   host.maybeAppendAgentBar();
   return true;
 }
-

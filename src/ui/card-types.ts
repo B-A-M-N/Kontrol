@@ -13,6 +13,7 @@ export type ToolName =
   | "glob"
   | "ls"
   | "bash"
+  | "poll_process"
   | "submit_for_review"
   | "submit_to_coding_agent"
   | "open_approval_center";
@@ -93,6 +94,7 @@ export function isToolName(value: unknown): value is ToolName {
     value === "glob" ||
     value === "ls" ||
     value === "bash" ||
+    value === "poll_process" ||
     value === "submit_for_review" ||
     value === "submit_to_coding_agent" ||
     value === "open_approval_center"
@@ -120,7 +122,7 @@ export function isSearchTool(tool: ToolName): boolean {
 }
 
 export function isShellTool(tool: ToolName): boolean {
-  return tool === "bash" || tool === "exec_command" || tool === "write_stdin";
+  return tool === "bash" || tool === "poll_process" || tool === "exec_command" || tool === "write_stdin";
 }
 
 export function isReviewTool(tool: ToolName): boolean {

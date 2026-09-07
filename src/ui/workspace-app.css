@@ -707,6 +707,30 @@ body {
   background: color-mix(in srgb, var(--color-background-secondary, #28282d) 84%, transparent);
 }
 
+.policy-grants {
+  border-top: 1px solid var(--color-border-primary, #2d3748);
+  margin-top: 14px;
+  padding-top: 12px;
+}
+
+.policy-grants-description {
+  color: var(--color-text-secondary, #9ca3af);
+  font-size: var(--font-text-sm-size, 12px);
+  margin: 4px 0 8px;
+}
+
+.policy-grant-list {
+  display: grid;
+  gap: 8px;
+}
+
+.policy-grant-card {
+  border: 1px solid var(--color-border-primary, #2d3748);
+  border-radius: 8px;
+  padding: 10px;
+  background: color-mix(in srgb, var(--color-background-secondary, #28282d) 84%, transparent);
+}
+
 .approval-title {
   font-weight: 600;
   margin-bottom: 4px;

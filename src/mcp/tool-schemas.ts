@@ -34,6 +34,13 @@ export const approvalResumeIdSchema = z
     "Opaque resume token: the approvalId returned in a prior approval_required result. Retry the identical tool call with this field set to consume the human's original decision.",
   );
 
+export const clientMutationIdSchema = z
+  .string()
+  .min(1)
+  .max(200)
+  .optional()
+  .describe("Stable caller-provided operation identity used to make a retried command launch idempotent.");
+
 export const workspaceSkillOutputSchema = z.object({
   name: z.string(),
   description: z.string(),

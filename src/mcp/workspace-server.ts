@@ -42,7 +42,7 @@ import { createToolEnvelope } from "./tool-envelope.js";
 import { readPackageVersion } from "./tool-logging.js";
 import { registerWorkspaceAppResources } from "./tools/resources.js";
 import { registerWorkspaceTools } from "./tools/workspace.js";
-import { registerCodexProcessTools } from "./tools/process.js";
+import { registerCodexProcessTools, registerProcessPollingTool } from "./tools/process.js";
 import type { ConnectionContext } from "./connection-context.js";
 
 // Public re-exports: ./mcp/workspace-server.js remains the import surface.
@@ -126,7 +126,12 @@ export function createMcpServer(
     workSessions,
     trackToolEvent,
     prepareForMutation,
+    processSessions,
   });
+
+  // Process polling is available in every tool mode. This is the recovery
+  // surface for a minimal-mode bash call whose original HTTP request ended.
+  registerProcessPollingTool(server, config, workspaces, processSessions, workSessions, connectionContext);
 
   if (config.toolMode === "codex") {
     registerCodexProcessTools(server, config, workspaces, processSessions, workSessions, policyEnforcer, policyEngine, connectionContext, prepareForMutation);

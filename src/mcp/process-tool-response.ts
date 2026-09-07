@@ -22,16 +22,19 @@ export function processResult(snapshot: ProcessSnapshot): string {
 export function processOutputSchema(): z.ZodRawShape {
   return resultOutputSchema({
     sessionId: z.string().optional(),
-    running: z.boolean(),
+    command: z.string().optional(),
+    // Approval-required responses use the gated tool's shared result schema
+    // and intentionally do not contain process lifecycle fields yet.
+    running: z.boolean().optional(),
     exitCode: z.number().int().optional(),
     signal: z.string().optional(),
-    wallTimeMs: z.number().nonnegative(),
-    outputTruncated: z.boolean(),
+    wallTimeMs: z.number().nonnegative().optional(),
+    outputTruncated: z.boolean().optional(),
   });
 }
 
 export function processToolResponse(
-  tool: "exec_command" | "write_stdin",
+  tool: "exec_command" | "write_stdin" | "bash" | "poll_process",
   workspaceId: string,
   snapshot: ProcessSnapshot,
   summary: Record<string, unknown>,
@@ -45,13 +48,14 @@ export function processToolResponse(
       tool,
       card: {
         workspaceId,
-        summary: { ...summary, ...outputSummary },
+        summary: { command: snapshot.command, ...summary, ...outputSummary },
         payload: { content },
       },
     },
     structuredContent: {
       result,
       sessionId: snapshot.sessionId,
+      command: snapshot.command,
       running: snapshot.running,
       exitCode: snapshot.exitCode,
       signal: snapshot.signal,

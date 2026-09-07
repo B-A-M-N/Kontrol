@@ -48,6 +48,35 @@ assert.equal(foreground.exitCode, 0);
 assert.match(foreground.output, /foreground/);
 assert.equal(foreground.sessionId, undefined);
 
+const idempotentLaunch = await manager.start({
+  workspaceId: "workspace-a",
+  ownerId: "logical-client:test",
+  cwd: process.cwd(),
+  command: `${node} -e "console.log('launched-once')"`,
+  clientMutationId: "launch-once",
+  yieldTimeMs: 2_000,
+});
+const idempotentRetry = await manager.start({
+  workspaceId: "workspace-a",
+  ownerId: "logical-client:test",
+  cwd: process.cwd(),
+  command: `${node} -e "console.log('launched-once')"`,
+  clientMutationId: "launch-once",
+  yieldTimeMs: 2_000,
+});
+assert.deepEqual(idempotentRetry, idempotentLaunch, "exact command retries reuse the original launch result");
+await assert.rejects(
+  manager.start({
+    workspaceId: "workspace-a",
+    ownerId: "logical-client:test",
+    cwd: process.cwd(),
+    command: `${node} -e "console.log('different-command')"`,
+    clientMutationId: "launch-once",
+    yieldTimeMs: 2_000,
+  }),
+  /different command launch/,
+);
+
 const environment = await manager.start({
   workspaceId: "workspace-a",
   cwd: process.cwd(),

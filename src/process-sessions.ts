@@ -12,6 +12,7 @@ const DEFAULT_INTERACTIVE_YIELD_MS = 1_000;
 const DEFAULT_POLL_YIELD_MS = 5_000;
 const MAX_COMMAND_YIELD_MS = 30_000;
 const MAX_POLL_YIELD_MS = 110_000;
+const MAX_COMMAND_TIMEOUT_MS = 300_000;
 const DEFAULT_MAX_OUTPUT_TOKENS = 10_000;
 const DEFAULT_BUFFER_CHARACTERS = 1_000_000;
 const COMPLETED_SESSION_TTL_MS = 5 * 60 * 1_000;
@@ -35,6 +36,10 @@ export interface StartCommandInput {
   rows?: number;
   yieldTimeMs?: number;
   maxOutputTokens?: number;
+  /** Optional per-command child lifetime; this never extends the MCP request. */
+  timeoutMs?: number;
+  /** Stable caller identity for exact launch retries. Scoped to ownerId. */
+  clientMutationId?: string;
 }
 
 export interface WriteStdinInput {
@@ -51,6 +56,7 @@ export interface WriteStdinInput {
 
 export interface ProcessSnapshot {
   sessionId?: string;
+  command: string;
   output: string;
   outputTruncated: boolean;
   running: boolean;
@@ -70,6 +76,7 @@ interface ProcessSession {
   workspaceId: string;
   ownerId: string;
   workSessionId?: string;
+  command: string;
   process?: ManagedProcess;
   startedAt: number;
   columns: number;
@@ -83,6 +90,15 @@ interface ProcessSession {
   cleanupTimer?: NodeJS.Timeout;
   lastClientActivityAt: number;
   lastProcessActivityAt: number;
+  timeoutTimer?: NodeJS.Timeout;
+  launchKey?: string;
+}
+
+interface LaunchRecord {
+  fingerprint: string;
+  sessionId: string;
+  finalSnapshot?: ProcessSnapshot;
+  cleanupTimer?: NodeJS.Timeout;
 }
 
 export interface ProcessSessionManagerOptions {
@@ -236,6 +252,7 @@ function truncateOutput(output: string, maxCharacters: number): { output: string
 
 export class ProcessSessionManager {
   private readonly sessions = new Map<string, ProcessSession>();
+  private readonly launches = new Map<string, LaunchRecord>();
   private readonly maxBufferCharacters: number;
   private readonly completedSessionTtlMs: number;
   private readonly maxRunningProcesses: number;
@@ -259,15 +276,47 @@ export class ProcessSessionManager {
   }
 
   async start(input: StartCommandInput): Promise<ProcessSnapshot> {
+    const launchKey = this.launchKey(input);
+    const launchFingerprint = this.launchFingerprint(input);
+    if (launchKey) {
+      const existing = this.launches.get(launchKey);
+      if (existing) {
+        if (existing.fingerprint !== launchFingerprint) {
+          throw new Error(`Client mutation ID ${input.clientMutationId} was already used for a different command launch.`);
+        }
+        const existingSession = this.sessions.get(existing.sessionId);
+        if (!existingSession) {
+          if (existing.finalSnapshot) return { ...existing.finalSnapshot };
+          throw new Error(`Command launch ${input.clientMutationId} is already in progress; retry after reconciliation.`);
+        }
+        const yieldTimeMs = boundedInteger(input.yieldTimeMs, DEFAULT_EXEC_YIELD_MS, MAX_COMMAND_YIELD_MS);
+        await this.waitForExit(existingSession, yieldTimeMs);
+        const snapshot = this.consume(existingSession, input.maxOutputTokens);
+        if (!existingSession.running) this.removeSession(existingSession.id);
+        return snapshot;
+      }
+    }
     this.assertCapacity(input.ownerId ?? `workspace:${input.workspaceId}`);
     const session = this.createSession(input);
+    session.launchKey = launchKey;
     this.sessions.set(session.id, session);
+    if (launchKey) this.launches.set(launchKey, { fingerprint: launchFingerprint, sessionId: session.id });
 
     try {
       if (input.tty && process.platform !== "win32") await this.startPty(session, input);
       else this.startPipe(session, input);
+      const timeoutMs = boundedInteger(input.timeoutMs, 0, MAX_COMMAND_TIMEOUT_MS);
+      if (timeoutMs > 0) {
+        session.timeoutTimer = setTimeout(() => {
+          if (!session.running) return;
+          session.process?.kill("SIGTERM");
+          void this.escalateIfRunning(session);
+        }, timeoutMs);
+        session.timeoutTimer.unref?.();
+      }
     } catch (error) {
       this.sessions.delete(session.id);
+      if (launchKey) this.launches.delete(launchKey);
       throw error;
     }
 
@@ -344,6 +393,7 @@ export class ProcessSessionManager {
     const running = [...this.sessions.values()].filter((session) => session.running);
     for (const session of running) {
       if (session.cleanupTimer) clearTimeout(session.cleanupTimer);
+      if (session.timeoutTimer) clearTimeout(session.timeoutTimer);
       if (session.running) session.process?.kill("SIGTERM");
     }
     const timeout = new Promise<void>((resolve) => {
@@ -364,6 +414,10 @@ export class ProcessSessionManager {
     }
     await this.waitForSessions(running, Math.min(timeoutMs, 500));
     this.sessions.clear();
+    for (const launch of this.launches.values()) {
+      if (launch.cleanupTimer) clearTimeout(launch.cleanupTimer);
+    }
+    this.launches.clear();
   }
 
   private assertCapacity(ownerId: string): void {
@@ -432,6 +486,7 @@ export class ProcessSessionManager {
       workspaceId: input.workspaceId,
       ownerId: input.ownerId ?? `workspace:${input.workspaceId}`,
       workSessionId: input.workSessionId,
+      command: input.command,
       startedAt: Date.now(),
       columns: terminalSize(input.columns, DEFAULT_COLUMNS),
       rows: terminalSize(input.rows, DEFAULT_ROWS),
@@ -503,6 +558,10 @@ export class ProcessSessionManager {
   private finish(session: ProcessSession, exitCode?: number, signal?: string): void {
     if (!session.running) return;
     session.running = false;
+    if (session.timeoutTimer) {
+      clearTimeout(session.timeoutTimer);
+      session.timeoutTimer = undefined;
+    }
     session.exitCode = exitCode;
     session.signal = signal;
     session.resolveExit();
@@ -511,6 +570,13 @@ export class ProcessSessionManager {
       this.completedSessionTtlMs,
     );
     session.cleanupTimer.unref();
+    if (session.launchKey) {
+      const launch = this.launches.get(session.launchKey);
+      if (launch) {
+        launch.cleanupTimer = setTimeout(() => this.launches.delete(session.launchKey!), this.completedSessionTtlMs);
+        launch.cleanupTimer.unref();
+      }
+    }
   }
 
   private append(session: ProcessSession, output: string): void {
@@ -523,8 +589,9 @@ export class ProcessSessionManager {
     const maxCharacters = Math.max(256, limit * 4);
     const buffered = session.buffer.drain(maxCharacters);
 
-    return {
+    const snapshot = {
       sessionId: session.running ? session.id : undefined,
+      command: session.command,
       output: buffered.output,
       outputTruncated: buffered.truncated,
       running: session.running,
@@ -532,6 +599,29 @@ export class ProcessSessionManager {
       signal: session.signal,
       wallTimeMs: Date.now() - session.startedAt,
     };
+    if (!snapshot.running && session.launchKey) {
+      const launch = this.launches.get(session.launchKey);
+      if (launch) launch.finalSnapshot = { ...snapshot };
+    }
+    return snapshot;
+  }
+
+  private launchKey(input: StartCommandInput): string | undefined {
+    if (!input.clientMutationId) return undefined;
+    return `${input.ownerId ?? `workspace:${input.workspaceId}`}\u0000${input.clientMutationId}`;
+  }
+
+  private launchFingerprint(input: StartCommandInput): string {
+    return JSON.stringify({
+      workspaceId: input.workspaceId,
+      workSessionId: input.workSessionId ?? null,
+      command: input.command,
+      cwd: input.cwd,
+      tty: Boolean(input.tty),
+      columns: input.columns ?? null,
+      rows: input.rows ?? null,
+      timeoutMs: input.timeoutMs ?? null,
+    });
   }
 
   private getOwnedSession(workspaceId: string, sessionId: string, ownerId?: string, workSessionId?: string): ProcessSession {

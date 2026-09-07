@@ -89,6 +89,19 @@ export interface PendingApprovalRecord {
   expiresAt?: string;
 }
 
+export interface PolicyGrantView {
+  id: string;
+  principalId: string;
+  scope: "work_session" | "workspace";
+  scopeId: string;
+  approvalKey: string;
+  createdAt: string;
+  expiresAt?: string;
+  reviewerId?: string;
+  uiState?: "idle" | "revoking" | "error";
+  error?: string;
+}
+
 export interface AgentMessageView {
   messageId: string;
   kind: string;
@@ -130,6 +143,9 @@ export interface WorkSessionViewState {
   activity: AgentActivityEvent[];
   submissions: Map<string, ReviewSubmissionView>;
   policyApprovals: Map<string, PolicyApprovalView>;
+  policyGrants: Map<string, PolicyGrantView>;
+  policyGrantsLoaded: boolean;
+  policyGrantsError?: string;
   /** Open agent→WebUI questions/blockers awaiting a reviewer reply. */
   openMessages: Map<string, AgentMessageView>;
   activeSubmissionId?: string;

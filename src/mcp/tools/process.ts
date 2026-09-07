@@ -1,5 +1,5 @@
 /**
- * Codex-mode process tools (exec_command / write_stdin). Extracted verbatim
+ * Process tools (exec_command / write_stdin / poll_process). Extracted
  * from src/mcp/workspace-server.ts (P1.3).
  */
 import * as z from "zod/v4";
@@ -12,7 +12,7 @@ import type { PolicyEnforcer } from "../../policy-enforcement.js";
 import type { ProcessSessionManager } from "../../process-sessions.js";
 import type { createWorkSessionManager } from "../../work-sessions.js";
 import type { WorkspaceRegistry } from "../../workspaces.js";
-import { approvalResumeIdSchema, SHELL_TOOL_ANNOTATIONS } from "../tool-schemas.js";
+import { approvalResumeIdSchema, clientMutationIdSchema, SHELL_TOOL_ANNOTATIONS } from "../tool-schemas.js";
 import { toolWidgetDescriptorMeta } from "../tool-context.js";
 import { canonicalPolicyPath, enforceToolPolicy, policyFailureResponse } from "../tool-policy.js";
 import { logToolCall } from "../tool-logging.js";
@@ -42,11 +42,12 @@ export function registerCodexProcessTools(
     {
       title: "Execute command",
       description:
-        "Run a command inside an open workspace. Returns its result when it exits during the yield window, otherwise returns a sessionId for write_stdin. Use this for file inspection, tests, builds, package scripts, and long-running processes. Call open_workspace first and pass workspaceId.",
+        "Run a command inside an open workspace. Returns its result when it exits during the bounded yield window, otherwise returns a sessionId for poll_process; use write_stdin only when the process needs input. Use this for file inspection, tests, builds, package scripts, and long-running processes. Call open_workspace first and pass workspaceId.",
       inputSchema: {
         workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
         cmd: z.string().min(1).describe("Shell command to execute."),
         approvalResumeId: approvalResumeIdSchema,
+        clientMutationId: clientMutationIdSchema,
         tty: z
           .boolean()
           .optional()
@@ -76,7 +77,7 @@ export function registerCodexProcessTools(
       ...toolWidgetDescriptorMeta(config, "shell"),
       annotations: SHELL_TOOL_ANNOTATIONS,
     },
-    async ({ workspaceId, cmd, approvalResumeId, tty, columns, rows, workingDirectory, yieldTimeMs, maxOutputTokens }) => {
+    async ({ workspaceId, cmd, approvalResumeId, clientMutationId, tty, columns, rows, workingDirectory, yieldTimeMs, maxOutputTokens }) => {
       const startedAt = performance.now();
       const blocked = await runMutationBarrier(prepareForMutation, workspaceId, "exec_command");
       if (blocked) return blocked;
@@ -112,18 +113,28 @@ export function registerCodexProcessTools(
         }
       }
 
-      const snapshot = await processSessions.start({
-        workspaceId,
-        ownerId: processSessionOwnerId(connectionContext),
-        workSessionId: connectionContext?.workSessionId,
-        command: cmd,
-        cwd,
-        tty,
-        columns,
-        rows,
-        yieldTimeMs,
-        maxOutputTokens,
-      });
+      const response = await (async () => {
+        const snapshot = await processSessions.start({
+          workspaceId,
+          ownerId: processSessionOwnerId(connectionContext),
+          workSessionId: connectionContext?.workSessionId,
+          command: cmd,
+          cwd,
+          tty,
+          columns,
+          rows,
+          yieldTimeMs,
+          maxOutputTokens,
+          clientMutationId,
+        });
+        return processToolResponse("exec_command", workspaceId, snapshot, {
+          command: cmd,
+          workingDirectory: workingDirectory ?? ".",
+          running: snapshot.running,
+          exitCode: snapshot.exitCode,
+          wallTimeMs: snapshot.wallTimeMs,
+        });
+      })();
 
       logToolCall(config, {
         tool: "exec_command",
@@ -135,13 +146,7 @@ export function registerCodexProcessTools(
         durationMs: Math.round(performance.now() - startedAt),
       });
 
-      return processToolResponse("exec_command", workspaceId, snapshot, {
-        command: cmd,
-        workingDirectory: workingDirectory ?? ".",
-        running: snapshot.running,
-        exitCode: snapshot.exitCode,
-        wallTimeMs: snapshot.wallTimeMs,
-      });
+      return response;
     },
   );
 
@@ -242,6 +247,57 @@ export function registerCodexProcessTools(
       return processToolResponse("write_stdin", workspaceId, snapshot, {
         sessionId,
         charactersWritten: chars?.length ?? 0,
+        running: snapshot.running,
+        exitCode: snapshot.exitCode,
+        wallTimeMs: snapshot.wallTimeMs,
+      });
+    },
+  );
+}
+
+/**
+ * Minimal/full mode process polling. It deliberately has no input-writing
+ * path, so callers can recover a detached `bash` process without reopening a
+ * command-sized HTTP request.
+ */
+export function registerProcessPollingTool(
+  server: McpServer,
+  config: ServerConfig,
+  workspaces: WorkspaceRegistry,
+  processSessions: ProcessSessionManager,
+  workSessions?: ReturnType<typeof createWorkSessionManager>,
+  connectionContext?: ConnectionContext,
+): void {
+  registerAppTool(
+    server,
+    "poll_process",
+    {
+      title: "Poll process",
+      description: "Retrieve new output and completion state for a process returned by bash. This tool never writes process input.",
+      inputSchema: {
+        workspaceId: z.string().describe("Workspace identifier used to start the process."),
+        sessionId: z.string().describe("Opaque process session identifier returned by bash."),
+        yieldTimeMs: z.number().int().min(0).max(30_000).optional().describe("Milliseconds to wait for output or completion. Defaults to 5000."),
+        maxOutputTokens: z.number().int().positive().max(100_000).optional().describe("Approximate output token budget. Defaults to 10000."),
+      },
+      outputSchema: processOutputSchema(),
+      ...toolWidgetDescriptorMeta(config, "shell"),
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ workspaceId, sessionId, yieldTimeMs, maxOutputTokens }) => {
+      workspaces.getWorkspace(workspaceId);
+      const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
+      if (bindingErr) return bindingErr;
+      const snapshot = await processSessions.write({
+        workspaceId,
+        sessionId,
+        ownerId: processSessionOwnerId(connectionContext),
+        workSessionId: connectionContext?.workSessionId,
+        yieldTimeMs,
+        maxOutputTokens,
+      });
+      return processToolResponse("poll_process", workspaceId, snapshot, {
+        sessionId,
         running: snapshot.running,
         exitCode: snapshot.exitCode,
         wallTimeMs: snapshot.wallTimeMs,

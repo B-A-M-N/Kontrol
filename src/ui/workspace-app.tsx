@@ -40,6 +40,7 @@ import {
   type FeedbackState,
   type MissionPacketView,
   type PolicyApprovalView,
+  type PolicyGrantView,
   type PendingApprovalRecord,
   type ReviewSubmissionView,
   type WorkSessionViewState,
@@ -52,6 +53,7 @@ export type {
   FeedbackState,
   MissionPacketView,
   PolicyApprovalView,
+  PolicyGrantView,
   PendingApprovalRecord,
   ReviewSubmissionView,
   WorkspaceSurfaceSession,
@@ -564,7 +566,7 @@ async function bootInternal(): Promise<void> {
     // work-session selection; session recovery and supervision should remain
     // anchored even when unrelated tool cards arrive.
     lastToolCard = { ...structured, tool };
-    expanded = false;
+    expanded = isShellTool(tool) && structured.summary?.running === true;
     reviewFilesExpanded = false;
     errorMessage = null;
     render();

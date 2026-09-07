@@ -103,6 +103,8 @@ export function getToolDisplay(card: ToolResultCard): ToolDisplay {
       return { icon: listIcon(), title: "List Directory", label, tone: "directory" };
     case "bash":
       return { icon: terminalIcon(), title: "Bash", label, tone: "shell" };
+    case "poll_process":
+      return { icon: terminalIcon(), title: "Process Session", label, tone: "shell" };
     case "exec_command":
       return { icon: terminalIcon(), title: "Exec Command", label, tone: "shell" };
     case "write_stdin":

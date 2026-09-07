@@ -19,6 +19,7 @@ import type {
   MissionPacketView,
   PendingApprovalRecord,
   PolicyApprovalView,
+  PolicyGrantView,
   ReviewSubmissionView,
   WorkspaceSurfaceSession,
   WorkSessionViewState,
@@ -214,6 +215,28 @@ export async function rehydrateActiveSessions(): Promise<void> {
     if (directApprovals.length > 0) {
       const target = ensureWorkSessionView(approvalCenterId(workspaceId), workspaceId, "");
       for (const approval of directApprovals) mergePendingApproval(target, approval, workspaceId);
+    }
+    // Workspace-scoped grants are durable across restart, so they must be
+    // rehydrated beside pending approvals instead of remaining invisible in
+    // the approval center.
+    const grantCenter = ensureWorkSessionView(approvalCenterId(workspaceId), workspaceId, "");
+    try {
+      const grantResult = await callServerToolChecked({
+        name: "list_policy_grants",
+        arguments: { scope: "workspace", scopeId: workspaceId },
+      });
+      const grants = getStructuredContent<{ grants?: PolicyGrantView[] }>(grantResult)?.grants ?? [];
+      grantCenter.policyGrants.clear();
+      for (const grant of grants) {
+        if (grant && typeof grant.id === "string" && typeof grant.scopeId === "string") {
+          grantCenter.policyGrants.set(grant.id, { ...grant, uiState: "idle", error: undefined });
+        }
+      }
+      grantCenter.policyGrantsLoaded = true;
+      grantCenter.policyGrantsError = undefined;
+    } catch (grantError) {
+      grantCenter.policyGrantsLoaded = true;
+      grantCenter.policyGrantsError = grantError instanceof Error ? grantError.message : String(grantError);
     }
     const selectionNow = host.getSelectedWorkSessionId();
     const selected = selectionNow ? workSessionViews.get(selectionNow) : undefined;
@@ -669,4 +692,3 @@ export async function watchWorkspaceEvents(workspaceId: string, initialSeq: numb
     }
   }
 }
-

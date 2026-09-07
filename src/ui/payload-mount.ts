@@ -7,12 +7,14 @@
  */
 import {
   isReviewTool,
+  isShellTool,
   payloadText,
   summaryNumber,
   type HostContext,
   type ToolResultCard,
 } from "./card-types.js";
 import { element } from "./ui-dom.js";
+import { formatElapsed } from "./ui-format.js";
 
 export interface PayloadMountHost {
   getLastToolCard(): ToolResultCard | null;
@@ -75,6 +77,14 @@ export function renderSummaryBadge(card: ToolResultCard): HTMLElement {
   if (isReviewTool(card.tool)) {
     const files = summaryNumber(card.summary, "files") ?? card.files?.length ?? 0;
     badge.textContent = files > 0 ? `${files} file${files === 1 ? "" : "s"}` : "review";
+  } else if (isShellTool(card.tool) && typeof card.summary?.running === "boolean") {
+    const elapsed = formatElapsed(summaryNumber(card.summary, "wallTimeMs") ?? 0);
+    if (card.summary.running) {
+      badge.textContent = `Running · ${elapsed}`;
+    } else {
+      const exitCode = summaryNumber(card.summary, "exitCode");
+      badge.textContent = exitCode === undefined ? "Exited" : `Exited · ${exitCode}`;
+    }
   } else if (card.summary?.status) {
     badge.textContent = String(card.summary.status);
   } else if (card.path) {
@@ -167,4 +177,3 @@ export function renderPayloadIfNeeded(
       });
   }
 }
-

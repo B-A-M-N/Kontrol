@@ -17,9 +17,9 @@ import {
   grepFilesTool,
   listDirectoryTool,
   readFileTool,
-  runShellTool,
   writeFileTool,
 } from "../../pi-tools.js";
+import type { ProcessSessionManager } from "../../process-sessions.js";
 import { applyPatch, parsePatch } from "../../apply-patch.js";
 import { getGitEligibility } from "../../git.js";
 import { formatPathForPrompt } from "../../skills.js";
@@ -28,6 +28,7 @@ import type { createReviewCheckpointManager } from "../../review-checkpoints.js"
 import type { createWorkSessionManager } from "../../work-sessions.js";
 import {
   approvalResumeIdSchema,
+  clientMutationIdSchema,
   EDIT_TOOL_ANNOTATIONS,
   resultOutputSchema,
   reviewFileOutputSchema,
@@ -57,9 +58,9 @@ import {
 } from "../tool-result.js";
 import { logToolCall } from "../tool-logging.js";
 import { runMutationBarrier } from "../mutation-barrier.js";
-import { assertWorkerWorkspaceBinding } from "../process-tool-response.js";
+import { assertWorkerWorkspaceBinding, processOutputSchema, processToolResponse } from "../process-tool-response.js";
 import type { ToolEnvelope } from "../tool-envelope.js";
-import type { ConnectionContext } from "../connection-context.js";
+import { processSessionOwnerId, type ConnectionContext } from "../connection-context.js";
 
 export interface WorkspaceToolsDeps {
   readonly config: ServerConfig;
@@ -71,13 +72,14 @@ export interface WorkspaceToolsDeps {
   readonly workSessions?: ReturnType<typeof createWorkSessionManager>;
   readonly trackToolEvent: ToolEnvelope["trackToolEvent"];
   readonly prepareForMutation: (workspaceId: string) => Promise<void>;
+  readonly processSessions: ProcessSessionManager;
 }
 
 export function registerWorkspaceTools(
   server: McpServer,
   deps: WorkspaceToolsDeps,
 ): void {
-  const { config, workspaces, reviewCheckpoints, policyEngine, policyEnforcer, connectionContext, workSessions, trackToolEvent, prepareForMutation } = deps;
+  const { config, workspaces, reviewCheckpoints, policyEngine, policyEnforcer, connectionContext, workSessions, trackToolEvent, prepareForMutation, processSessions } = deps;
   registerAppTool(
     server,
     "open_workspace",
@@ -1109,7 +1111,7 @@ export function registerWorkspaceTools(
     toolNames.shell,
     {
       title: "Bash",
-      description: `Run a shell command inside an open workspace. Use only for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Prefer ${toolNames.read}, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} for repository inspection; do not use shell parsing to replace those structured read-only tools. Do not use ${toolNames.shell} to create or modify files. Do not use shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or generated scripts to write project files; use ${toolNames.edit} for targeted changes and ${toolNames.write} for new files or full rewrites. Call open_workspace first and pass workspaceId. This is powerful local execution and should only be exposed behind strong authentication.`,
+      description: `Run a shell command inside an open workspace. The request waits only for a bounded yield; a still-running child returns a sessionId and must be observed with ${toolNames.pollProcess}. Use only for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Prefer ${toolNames.read}, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} for repository inspection; do not use shell parsing to replace those structured read-only tools. Do not use ${toolNames.shell} to create or modify files. Do not use shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or generated scripts to write project files; use ${toolNames.edit} for targeted changes and ${toolNames.write} for new files or full rewrites. Call open_workspace first and pass workspaceId. This is powerful local execution and should only be exposed behind strong authentication.`,
       inputSchema: {
         workspaceId: z
           .string()
@@ -1132,8 +1134,9 @@ export function registerWorkspaceTools(
           .optional()
           .describe("Timeout in seconds. Defaults to 30, max 300."),
         approvalResumeId: approvalResumeIdSchema,
+        clientMutationId: clientMutationIdSchema,
       },
-      outputSchema: resultOutputSchema(),
+      outputSchema: processOutputSchema(),
       ...toolWidgetDescriptorMeta(config, "shell"),
       annotations: SHELL_TOOL_ANNOTATIONS,
     },
@@ -1179,11 +1182,33 @@ export function registerWorkspaceTools(
       }
 
       if (workingDirectory) await workspaces.loadApplicableInstructions(workspace, workingDirectory);
-      const response = await runShellTool(input, {
-        cwd,
-        root: workspace.root,
-        childEnvironmentAllowlist: config.childEnvironmentAllowlist,
-      });
+      const timeoutSeconds = input.timeout ?? 30;
+      // A command's child lifetime is independent from the MCP request. The
+      // bounded yield returns a process handle; poll_process owns later
+      // observation after a gateway or connector drops the original request.
+      const response: any = await (async () => {
+        try {
+          const snapshot = await processSessions.start({
+            workspaceId,
+            ownerId: processSessionOwnerId(connectionContext),
+            workSessionId: connectionContext?.workSessionId,
+            command: input.command,
+            cwd,
+            timeoutMs: timeoutSeconds * 1_000,
+            yieldTimeMs: Math.min(timeoutSeconds * 1_000, 10_000),
+            clientMutationId: input.clientMutationId,
+          });
+          return processToolResponse("bash", workspaceId, snapshot, {
+            command: input.command,
+            workingDirectory: workingDirectory ?? ".",
+            running: snapshot.running,
+            exitCode: snapshot.exitCode,
+            wallTimeMs: snapshot.wallTimeMs,
+          });
+        } catch (error) {
+          return { content: [textBlock(error instanceof Error ? error.message : String(error))], isError: true };
+        }
+      })();
 
       if (response.isError) {
         logFailedToolResponse(config, {
@@ -1215,16 +1240,15 @@ export function registerWorkspaceTools(
       return {
         ...response,
         _meta: {
+          ...(response._meta ?? {}),
           tool: toolNames.shell,
           card: {
+            ...(response._meta?.card ?? {}),
             workspaceId,
             path: workingDirectory,
             summary,
             payload: { content: response.content },
           },
-        },
-        structuredContent: {
-          result: contentText(response.content),
         },
       };
     },

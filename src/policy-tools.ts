@@ -437,7 +437,7 @@ export function registerPolicyTools(
         scopeId: z.string().min(1).optional(),
       },
       outputSchema: { grants: z.array(z.object({
-        id: z.string(), principalId: z.string(), scope: z.string(), scopeId: z.string(), approvalKey: z.string(), createdAt: z.string(), reviewerId: z.string().optional(),
+        id: z.string(), principalId: z.string(), scope: z.string(), scopeId: z.string(), approvalKey: z.string(), createdAt: z.string(), expiresAt: z.string().optional(), reviewerId: z.string().optional(),
       })) },
       _meta: workspaceAppModelAndAppMeta(),
       annotations: { readOnlyHint: true, destructiveHint: false },

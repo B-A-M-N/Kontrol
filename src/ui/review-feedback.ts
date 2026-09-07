@@ -20,6 +20,7 @@ import { ensureWorkSessionView, mergePendingApproval, workSessionViews } from ".
 import type {
   MissionPacketView,
   PolicyApprovalView,
+  PolicyGrantView,
   PendingApprovalRecord,
   ReviewSubmissionView,
   WorkSessionViewState,
@@ -512,6 +513,79 @@ export function renderPolicyApproval(view: WorkSessionViewState, approval: Polic
   }
   if (approval.error) item.append(element("div", { className: "feedback-error", text: approval.error }));
   return item;
+}
+
+export function renderPolicyGrants(view: WorkSessionViewState): HTMLElement {
+  const section = element("section", { className: "policy-grants" });
+  section.append(
+    element("div", { className: "agent-activity-header", text: "Current permissions" }),
+    element("div", {
+      className: "policy-grants-description",
+      text: "Durable workspace grants remain active until revoked.",
+    }),
+  );
+
+  if (!view.policyGrantsLoaded) {
+    section.append(element("div", { className: "empty muted", text: "Checking current permissions…" }));
+    return section;
+  }
+  if (view.policyGrantsError) {
+    section.append(element("div", { className: "feedback-error", text: `Permissions could not be loaded: ${view.policyGrantsError}` }));
+  }
+  if (view.policyGrants.size === 0) {
+    section.append(element("div", { className: "empty muted", text: "No active workspace grants." }));
+    return section;
+  }
+
+  const list = element("div", { className: "policy-grant-list" });
+  for (const grant of view.policyGrants.values()) {
+    const row = element("article", { className: "policy-grant-card" });
+    const scopeLabel = grant.scope === "workspace" ? "Workspace" : "Work session";
+    const expiry = grant.expiresAt ? ` · expires ${new Date(grant.expiresAt).toLocaleString()}` : "";
+    row.append(
+      element("div", { className: "approval-title", text: `${scopeLabel} permission` }),
+      element("div", { className: "approval-meta", text: `${grant.approvalKey} · ${grant.scopeId}${expiry}` }),
+      element("div", { className: "approval-detail", text: `Granted ${new Date(grant.createdAt).toLocaleString()}${grant.reviewerId ? ` by ${grant.reviewerId}` : ""}` }),
+    );
+    if (grant.error) row.append(element("div", { className: "feedback-error", text: grant.error }));
+    const revoke = element("button", {
+      className: "feedback-btn reject",
+      type: "button",
+      text: grant.uiState === "revoking" ? "Revoking…" : "Revoke",
+      disabled: !host.uiMutationsAllowed() || grant.uiState === "revoking",
+    });
+    revoke.addEventListener("click", () => { void revokePolicyGrant(view, grant); });
+    row.append(revoke);
+    list.append(row);
+  }
+  section.append(list);
+  return section;
+}
+
+async function revokePolicyGrant(view: WorkSessionViewState, grant: PolicyGrantView): Promise<void> {
+  if (!host.getApp() || !host.uiMutationsAllowed()) return;
+  grant.uiState = "revoking";
+  grant.error = undefined;
+  host.render();
+  try {
+    await callServerToolChecked({
+      name: "revoke_policy_grants",
+      arguments: {
+        scope: grant.scope,
+        scopeId: grant.scopeId,
+        clientMutationId: host.newClientMutationId(),
+      },
+    });
+    for (const [id, candidate] of view.policyGrants) {
+      if (candidate.scope === grant.scope && candidate.scopeId === grant.scopeId) view.policyGrants.delete(id);
+    }
+  } catch (error) {
+    grant.uiState = "error";
+    grant.error = error instanceof AmbiguousMutationError
+      ? "Revocation outcome is unknown after a connection interruption. Refresh permissions before trying again."
+      : `Revocation failed: ${error instanceof Error ? error.message : String(error)}`;
+  }
+  host.render();
 }
 
 export async function submitPolicyApproval(

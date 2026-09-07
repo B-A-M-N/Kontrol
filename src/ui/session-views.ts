@@ -27,6 +27,8 @@ export function ensureWorkSessionView(workSessionId: string, workspaceSessionId:
       activity: [],
       submissions: new Map(),
       policyApprovals: new Map(),
+      policyGrants: new Map(),
+      policyGrantsLoaded: false,
       openMessages: new Map(),
       feedbackStateBySubmission: new Map(),
       feedbackErrorBySubmission: new Map(),

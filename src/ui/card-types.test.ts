@@ -7,7 +7,7 @@ import {
   isToolName,
 } from "./card-types.js";
 
-for (const tool of ["apply_patch", "exec_command", "write_stdin"]) {
+for (const tool of ["apply_patch", "exec_command", "write_stdin", "poll_process"]) {
   assert.equal(isToolName(tool), true, `${tool} should be a recognized card tool`);
 }
 
@@ -15,6 +15,7 @@ assert.equal(isPatchTool("apply_patch"), true);
 assert.equal(isEditTool("apply_patch"), false);
 assert.equal(isShellTool("exec_command"), true);
 assert.equal(isShellTool("write_stdin"), true);
+assert.equal(isShellTool("poll_process"), true);
 assert.equal(isEditTool("exec_command"), false);
 assert.equal(isShellTool("apply_patch"), false);
 

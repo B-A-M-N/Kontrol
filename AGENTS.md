@@ -124,6 +124,18 @@ Current implementation contracts:
   revoked at terminal session state (including startup reconciliation), while
   workspace grants survive restart until explicitly revoked. A session grant
   is never offered without a concrete work-session ID.
+- Ordinary `bash` in minimal/full tool modes starts through
+  `ProcessSessionManager` with a bounded request yield and an independent child
+  timeout; a still-running command returns a process session for the read-only
+  `poll_process` tool. Exact owner-scoped launches may include
+  `clientMutationId`; the process manager keeps the launch fingerprint and
+  existing session/result for bounded retry recovery, rejecting reuse with
+  different command content.
+- The Workspace App process card keeps the command visible while a session is
+  running, shows `Running · <elapsed>`, and exposes the latest polled output.
+- The Workspace App approval center visibly lists effective workspace policy
+  grants and provides reviewer-only revocation controls; refreshing the active
+  workspace rehydrates that grant list from `list_policy_grants`.
 - ACP outbound webhooks are disabled by default and require an explicit enable
   flag plus an exact host allowlist (or an explicit `*` policy). Delivery
   maintenance is single-flight and drained before server database shutdown.

@@ -52,6 +52,20 @@ Object.defineProperty(dom.window.document, "fonts", {
 
 const { mountHeavyPayload } = await import("./heavy-payload.js");
 const { mountReviewPayload } = await import("./review-payload.js");
+const { renderSummaryBadge } = await import("./payload-mount.js");
+const { getToolDisplay } = await import("./tool-display.js");
+
+const runningProcessCard: ToolResultCard = {
+  tool: "bash",
+  summary: {
+    command: "npm run test:integration",
+    running: true,
+    wallTimeMs: 42_000,
+  },
+  payload: { content: [{ type: "text", text: "latest output\n" }] },
+};
+assert.equal(getToolDisplay(runningProcessCard).label, "npm run test:integration", "running process cards keep the command label");
+assert.equal(renderSummaryBadge(runningProcessCard).textContent, "Running · 42s", "running process cards show elapsed status");
 
 function settle(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 25));

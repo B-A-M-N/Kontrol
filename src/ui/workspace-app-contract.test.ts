@@ -17,6 +17,11 @@ assert.match(uiModuleSources, /currentPayload\.update\(/, "mounted payloads must
 assert.match(source, /requestAnimationFrame/, "event-driven renders must be frame-batched");
 assert.match(uiModuleSources, /await_workspace_events/, "the WebUI must use one workspace event watcher");
 assert.match(uiModuleSources, /list_pending_approvals/, "the WebUI must rehydrate approvals missed during reconnect");
+assert.match(uiModuleSources, /list_policy_grants/, "the WebUI must surface durable policy grants");
+assert.match(uiModuleSources, /revoke_policy_grants/, "the WebUI must provide grant revocation controls");
+assert.match(uiModuleSources, /Current permissions/, "the approval center must label current permissions");
+assert.match(uiModuleSources, /Running ·/, "the WebUI must expose live process elapsed status");
+assert.match(uiModuleSources, /poll_process/, "the WebUI must recognize durable process polling cards");
 assert.match(uiModuleSources, /__approval_center__/, "direct workspace approvals need a visible fallback surface");
 assert.match(uiModuleSources, /option\.scope === "workspace"/, "the WebUI must honor a server-supplied workspace-level approval scope (P1.9)");
 assert.match(uiModuleSources, /The server did not provide a reusable scope/, "the WebUI must not invent missing policy scope semantics");
