@@ -8,6 +8,15 @@ export interface ReviewFile {
   removals: number;
 }
 
+/** P1 (audit): checkpoint-coverage record as surfaced to clients. Present and
+ * nonempty exactly when this submission's diff cannot represent every
+ * structured mutation the work session made. */
+export interface ReviewCoverageDTO {
+  backend: "git" | "filesystem";
+  uncoveredPaths: string[];
+  reasons: string[];
+}
+
 export interface ReviewSubmissionDTO {
   [key: string]: unknown;
   submissionId: string;
@@ -25,4 +34,6 @@ export interface ReviewSubmissionDTO {
   removals: number;
   message?: string;
   createdAt?: string;
+  /** P1 (audit): present ONLY when the submission's coverage is incomplete. */
+  coverage?: ReviewCoverageDTO;
 }

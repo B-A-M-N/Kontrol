@@ -41,7 +41,7 @@ export function makeReviewBarrier(ctx: AcpContext) {
       workSessionId,
       markReviewed: false,
     });
-    const submitted = reviewWorkflow.submitForReview({
+    const submitted = await reviewWorkflow.submitForReview({
       workSessionId,
       diff: review.patch,
       diffSha256: createHash("sha256").update(review.patch).digest("hex"),

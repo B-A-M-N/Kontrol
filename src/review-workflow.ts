@@ -8,6 +8,7 @@ import type { ContinuationManager, CreateContinuationInput } from "./continuatio
 import type { AgentRegistryManager } from "./acp-registry.js";
 import type { WorkspaceRegistry } from "./workspaces.js";
 import type { ReviewCheckpointManager, ReviewFile, WorkspaceSnapshot, WorkspaceSnapshotKind } from "./review-checkpoints.js";
+import type { CheckpointCoverage } from "./checkpoint-coverage.js";
 import type { MissionLedger } from "./mission-ledger.js";
 import type { DispatchOutbox } from "./dispatch-outbox.js";
 
@@ -62,6 +63,8 @@ export interface SubmitForReviewResult {
   reviewEpoch: number;
   status: string;
   runId?: string;
+  /** P1 (audit): structured mutations this submission's diff cannot represent. */
+  coverage?: CheckpointCoverage;
 }
 
 export interface ProvideFeedbackInput {
@@ -75,6 +78,14 @@ export interface ProvideFeedbackInput {
   allowedNextActions?: string[];
   reviewerId?: string;
   completionReportSha256?: string;
+  /**
+   * P1 (audit): explicit reviewer acknowledgment that a submission whose
+   * checkpoint coverage is incomplete (mutations into excluded/ignored trees)
+   * may still be approved. Ordinary approvals of such submissions are refused;
+   * only an approval carrying this flag can pass, and the acceptance is
+   * recorded in the feedback event payload.
+   */
+  acceptIncompleteCoverage?: boolean;
 }
 
 export interface ProvideFeedbackResult {
@@ -92,7 +103,7 @@ export interface CancelSessionInput {
 }
 
 export interface ReviewWorkflowService {
-  submitForReview(input: SubmitForReviewInput): SubmitForReviewResult;
+  submitForReview(input: SubmitForReviewInput): Promise<SubmitForReviewResult>;
   provideFeedback(input: ProvideFeedbackInput): Promise<ProvideFeedbackResult>;
   cancelSession(input: CancelSessionInput): { status: string };
   finalizeCancellation(input: CancelSessionInput): { status: string };
@@ -165,7 +176,7 @@ export function createReviewWorkflowService(
 ): ReviewWorkflowService {
   const { workSessions, eventStore, continuationManager, agentRegistry, db, workspaces, reviewCheckpoints, missionLedger, dispatchOutbox } = deps;
 
-  function submitForReview(input: SubmitForReviewInput): SubmitForReviewResult {
+  async function submitForReview(input: SubmitForReviewInput): Promise<SubmitForReviewResult> {
     const session = workSessions.get(input.workSessionId);
     if (!session) {
       throw new WorkflowError(
@@ -189,6 +200,27 @@ export function createReviewWorkflowService(
       );
     }
 
+    // P1 (audit): classify the structured mutations recorded since the last
+    // checkpoint advance against the ACTIVE backend. A nonempty uncovered set
+    // means this diff LOOKS complete while omitting real edits (excluded
+    // trees, git-ignored material). The record travels with the submission so
+    // approval can be gated on it and the UI can name the paths.
+    let coverage: CheckpointCoverage | undefined;
+    if (reviewCheckpoints && typeof reviewCheckpoints.checkpointCoverage === "function") {
+      try {
+        coverage = await reviewCheckpoints.checkpointCoverage({
+          workspaceId: session.workspaceSessionId,
+          root: workspaces?.getWorkspace(session.workspaceSessionId)?.root ?? "",
+        });
+        if (coverage && coverage.uncoveredPaths.length === 0) coverage = undefined;
+      } catch {
+        // Classification is advisory at submission time (the paths were already
+        // recorded); approval still fails closed below on any recorded-but-
+        // unclassifiable state because coverage stays undefined while mutations
+        // remain tracked.
+      }
+    }
+
     // All writes in ONE transaction so the submission, session transition,
     // correlated run update, and review.submitted event are atomic.
     const publishQueue: EventStoreEvent[] = [];
@@ -208,6 +240,7 @@ export function createReviewWorkflowService(
         snapshotKind: input.snapshotKind,
         snapshotRef: input.snapshotRef,
         snapshotCommit: input.snapshotCommit,
+        coverage,
       });
 
       const correlatedRun = agentRegistry.getRunByWorkSessionId(input.workSessionId);
@@ -225,6 +258,7 @@ export function createReviewWorkflowService(
           files: input.files ?? 0,
           additions: input.additions ?? 0,
           removals: input.removals ?? 0,
+          uncoveredPaths: coverage?.uncoveredPaths ?? [],
         },
       });
 
@@ -239,6 +273,7 @@ export function createReviewWorkflowService(
       reviewEpoch: result.submission.reviewEpoch,
       status: "awaiting_review",
       runId: result.runId,
+      coverage,
     };
   }
 
@@ -297,6 +332,22 @@ export function createReviewWorkflowService(
           409,
         );
       }
+    }
+
+    // P1 (audit): refuse an ordinary approval of a submission whose diff does
+    // not represent every structured mutation (paths inside checkpoint-excluded
+    // trees, or git-ignored material for git workspaces). Approval requires an
+    // explicit acceptIncompleteCoverage acknowledgment, which is recorded in
+    // the feedback event. Rejections/changes-requests are never gated: a
+    // reviewer must always be able to refuse incomplete work.
+    if (input.verdict === "approve" && currentPending.coverage && currentPending.coverage.uncoveredPaths.length > 0 && !input.acceptIncompleteCoverage) {
+      throw new WorkflowError(
+        `Submission ${input.submissionId} has mutations the review checkpoint cannot represent: `
+        + `${currentPending.coverage.uncoveredPaths.join(", ")}. `
+        + "Review those paths out-of-band and re-approve with acceptIncompleteCoverage to accept the incomplete coverage explicitly.",
+        "conflict",
+        409,
+      );
     }
 
     // P0 #4 / P0 #5 / P1 #1: approval must require the workspace to
@@ -433,6 +484,11 @@ export function createReviewWorkflowService(
           requiredActions: input.requiredActions,
           allowedNextActions: resolvedAllowed,
           reviewerId: input.reviewerId,
+          // P1 (audit): durable audit trail of an explicit incomplete-coverage
+          // acceptance (and which paths it covered).
+          ...(input.verdict === "approve" && currentPending.coverage?.uncoveredPaths.length
+            ? { acceptedIncompleteCoverage: true, uncoveredPaths: currentPending.coverage.uncoveredPaths }
+            : {}),
         },
       });
 

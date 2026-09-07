@@ -5,6 +5,12 @@ import { createHash } from "node:crypto";
 import { join, relative, resolve, dirname, sep } from "node:path";
 import { git, getGitEligibility, safeWorkspaceRefSegment } from "./git.js";
 import { FilesystemSnapshotStore, type FilesystemSnapshotLimits } from "./filesystem-snapshot-store.js";
+import {
+  classifyFilesystemCoverage,
+  classifyGitCoverage,
+  workspaceRelativePath,
+  type CheckpointCoverage,
+} from "./checkpoint-coverage.js";
 
 export type ReviewSince = "last_shown" | "last_review" | "workspace_open" | "work_session";
 
@@ -76,6 +82,11 @@ interface WorkspaceReviewState {
  */
 interface WorkspaceReviewStateWithInit extends WorkspaceReviewState {
   initialization: Promise<void>;
+  /** P1 (audit): structured-mutation paths recorded since the last
+   * checkpoint advance. Classified against the active backend at submission
+   * time so a review diff that silently omits excluded/ignored material can
+   * be flagged instead of looking complete. */
+  mutatedPaths: Map<string, string>;
 }
 
 export interface ReviewCheckpointManager {
@@ -119,6 +130,22 @@ export interface ReviewCheckpointManager {
   awaitWorkspaceReady(input: { workspaceId: string; root: string }): Promise<void>;
   /** Graceful shutdown: stop accepting new captures, drain active ones. */
   drain(): Promise<void>;
+  /**
+   * P1 (audit): record the workspace-relative paths a structured mutation
+   * (write/edit/apply_patch) actually touched, so a submission can state
+   * which of them the checkpoint cannot represent. Paths are retained until
+   * `clearRecordedMutations` (called when a checkpoint advances).
+   */
+  recordMutations(input: { workspaceId: string; root: string; paths: string[] }): Promise<void>;
+  /**
+   * Classify every recorded mutation path against the ACTIVE checkpoint
+   * backend and return the coverage record for the submission. Empty
+   * uncoveredPaths = the checkpoint fully represents every structured
+   * mutation.
+   */
+  checkpointCoverage(input: { workspaceId: string; root: string }): Promise<CheckpointCoverage>;
+  /** Drop the recorded mutation paths (checkpoint advanced / session closed). */
+  clearRecordedMutations(input: { workspaceId: string }): Promise<void>;
   /** Raw store surface for maintenance/CLI (GC, stats, reconciliation). */
   getSnapshotStore(): FilesystemSnapshotStore;
   /** Drop a terminal work-session's baseline pin so GC can reclaim it. */
@@ -180,7 +207,7 @@ export function createReviewCheckpointManager(options: {
     let resolveInit!: () => void;
     const initPromise = new Promise<void>((resolve) => { resolveInit = resolve; });
     const refs = reviewRefs(workspaceId);
-    const state: WorkspaceReviewStateWithInit = { root, ...refs, initialization: initPromise };
+    const state: WorkspaceReviewStateWithInit = { root, ...refs, initialization: initPromise, mutatedPaths: new Map() };
     states.set(workspaceId, state);
 
     try {
@@ -267,6 +294,10 @@ export function createReviewCheckpointManager(options: {
             baselines.presentation = current;
           }
           await getFsStore().saveBaselines(workspaceId, state.root, baselines);
+          // The checkpoint advanced past everything captured here; the
+          // recorded structured mutations are now represented (or omitted)
+          // by the advanced baseline, so coverage tracking restarts clean.
+          state.mutatedPaths.clear();
         }
         return formatReviewResult(diff, current, since === "workspace_open" ? "workspace open" : "last shown changes");
       }
@@ -291,6 +322,9 @@ export function createReviewCheckpointManager(options: {
 
       if (markReviewed) {
         await git(state.gitRoot, ["update-ref", checkpointRefForMark(state, workspaceId, since, workSessionId), current]);
+        // Checkpoint advanced (see the filesystem branch): restart coverage
+        // tracking clean.
+        state.mutatedPaths.clear();
       }
 
       return {
@@ -382,6 +416,8 @@ export function createReviewCheckpointManager(options: {
         if (workSessionId) baselines.sessions.set(workSessionId, snapshot);
         else baselines.presentation = snapshot;
         await getFsStore().saveBaselines(workspaceId, state.root, baselines);
+        // The reviewed snapshot is committed; coverage tracking restarts.
+        state.mutatedPaths.clear();
         return;
       }
       if (!state?.gitRoot) {
@@ -390,6 +426,8 @@ export function createReviewCheckpointManager(options: {
       // Advance baseline to the EXACT captured snapshot (no recompute — the tree
       // may have changed between capture and persistence).
       await git(state.gitRoot, ["update-ref", sessionBaselineRef(workspaceId, workSessionId), snapshot.ref]);
+      // The reviewed snapshot is committed; coverage tracking restarts.
+      state.mutatedPaths.clear();
     },
 
     async awaitWorkspaceReady({ workspaceId, root }) {
@@ -413,6 +451,57 @@ export function createReviewCheckpointManager(options: {
 
     async releaseWorkSessionBaseline({ workspaceId, workSessionId }) {
       await getFsStore().releaseWorkSessionBaseline(workspaceId, workSessionId);
+    },
+
+    async recordMutations({ workspaceId, root, paths }) {
+      // The workspace may legitimately receive mutations before its first
+      // checkpoint operation (initializeWorkspace only runs lazily), so await
+      // initialization instead of silently dropping the record.
+      const state = await ensureInitialized(workspaceId, root);
+      for (const path of paths) {
+        const rel = workspaceRelativePath(root, path);
+        // Undefined = path escapes the workspace root; that is a policy/
+        // confinement failure handled by the mutation tools, not a coverage
+        // entry — recording it here would make every review look incomplete.
+        if (rel) state.mutatedPaths.set(rel, rel);
+      }
+    },
+
+    async checkpointCoverage({ workspaceId, root }): Promise<CheckpointCoverage> {
+      const state = await ensureInitialized(workspaceId, root);
+      const paths = [...state.mutatedPaths.keys()];
+      if (paths.length === 0) {
+        return { uncoveredPaths: [], reasons: [], backend: state.backend?.kind ?? "filesystem" };
+      }
+      if (state.backend?.kind === "git" && state.gitRoot) {
+        // Cheap per-path ignore probe via git's own machinery.
+        // `check-ignore -q` exits 0 when the path IS ignored and 1 when it is
+        // not; the git() helper throws on non-zero, so exit code 1 means "not
+        // ignored". Any other failure conservatively counts as ignored (a
+        // false positive merely marks a path for explicit reviewer attention;
+        // a false negative would hide it).
+        const isIgnored = async (path: string): Promise<boolean> => {
+          try {
+            await git(state.gitRoot!, ["check-ignore", "-q", "--", join(state.workspaceRelativePath ?? ".", path)]);
+            return true;
+          } catch (error) {
+            return (error as { code?: unknown } | undefined)?.code !== 1;
+          }
+        };
+        // classifyGitCoverage consumes a sync predicate; resolve the async
+        // probes up front so the classifier itself stays pure.
+        const ignoredPaths = new Set<string>();
+        for (const path of paths) {
+          if (await isIgnored(path)) ignoredPaths.add(path);
+        }
+        return classifyGitCoverage(paths, (path) => ignoredPaths.has(path), options.excludedDirectories);
+      }
+      return classifyFilesystemCoverage(paths, options.excludedDirectories);
+    },
+
+    async clearRecordedMutations({ workspaceId }) {
+      const state = states.get(workspaceId);
+      if (state) state.mutatedPaths.clear();
     },
   };
 }

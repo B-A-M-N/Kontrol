@@ -64,7 +64,17 @@ const migrations: Migration[] = [
   { version: 52, name: "client-mutation-receipts", up: migrateClientMutationReceipts },
   { version: 53, name: "backend-neutral-snapshot-identities", up: migrateBackendNeutralSnapshotIdentities },
   { version: 54, name: "work-session-terminal-at", up: migrateWorkSessionTerminalAt },
+  { version: 55, name: "submission-checkpoint-coverage", up: migrateSubmissionCheckpointCoverage },
 ];
+
+// P1 (audit): checkpoint coverage blind spots. A structured mutation into a
+// location the review checkpoint cannot represent (excluded/generated trees,
+// git-ignored material) must travel with the submission so the reviewer sees
+// exactly which paths are outside checkpoint coverage and an ordinary
+// approval is refused until they explicitly accept that condition.
+function migrateSubmissionCheckpointCoverage(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "work_session_submissions", "coverage_json", "text");
+}
 
 function migrateClientMutationReceipts(sqlite: Database.Database): void {
   sqlite.exec(`

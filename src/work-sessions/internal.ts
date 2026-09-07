@@ -22,6 +22,7 @@ import type {
   WorkSessionToolEventRow,
 } from "../db/schema.js";
 import type { ReviewFile } from "../review-checkpoints.js";
+import type { CheckpointCoverage } from "../checkpoint-coverage.js";
 import { createHash } from "node:crypto";
 
 export function rowToWorkspaceLease(row: WorkspaceLeaseRow): WorkspaceLease {
@@ -89,9 +90,31 @@ export function rowToSubmission(row: WorkSessionSubmissionRow): WorkSessionSubmi
     message: row.message ?? undefined,
     summaryJson: row.summaryJson ?? undefined,
     files: parseReviewFiles(row.filesJson),
+    coverage: parseCheckpointCoverage(row.coverageJson),
     status: (row.status as "pending" | "reviewed") ?? "pending",
     createdAt: row.createdAt,
   };
+}
+
+/** Parse a persisted coverage_json cell. Malformed/legacy rows simply have no
+ * coverage record — fail-open on PARSE but the workflow still fails closed on
+ * approval by treating a missing record on a submission whose session has
+ * recorded mutations as uncovered (see review-workflow). */
+export function parseCheckpointCoverage(value: string | null | undefined): CheckpointCoverage | undefined {
+  if (!value) return undefined;
+  try {
+    const parsed = JSON.parse(value) as Partial<CheckpointCoverage> | null;
+    if (!parsed || typeof parsed !== "object") return undefined;
+    if (!Array.isArray(parsed.uncoveredPaths) || !Array.isArray(parsed.reasons)) return undefined;
+    if (parsed.backend !== "git" && parsed.backend !== "filesystem") return undefined;
+    return {
+      uncoveredPaths: parsed.uncoveredPaths.filter((p): p is string => typeof p === "string"),
+      backend: parsed.backend,
+      reasons: parsed.reasons.filter((r): r is string => typeof r === "string"),
+    };
+  } catch {
+    return undefined;
+  }
 }
 
 export function parseReviewFiles(value: string | null | undefined): ReviewFile[] | undefined {

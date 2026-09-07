@@ -234,7 +234,7 @@ export function registerRunRoutes(
 
         // Delegate the state transition to the authoritative workflow service.
         const submitted = reviewWorkflow
-          ? reviewWorkflow.submitForReview({ workSessionId: session.id, diff: review.patch, message: taskText || review.result, summaryJson: JSON.stringify(review.summary), files: review.summary.files, changedFiles: review.files, additions: review.summary.additions, removals: review.summary.removals, snapshotKind: review.snapshotKind, snapshotRef: review.snapshotRef, snapshotCommit: review.snapshotCommit })
+          ? await reviewWorkflow.submitForReview({ workSessionId: session.id, diff: review.patch, message: taskText || review.result, summaryJson: JSON.stringify(review.summary), files: review.summary.files, changedFiles: review.files, additions: review.summary.additions, removals: review.summary.removals, snapshotKind: review.snapshotKind, snapshotRef: review.snapshotRef, snapshotCommit: review.snapshotCommit })
           : (() => {
               const s = workSessions.submitForReview({ workSessionId: session.id, diff: review.patch, message: taskText || review.result, summaryJson: JSON.stringify(review.summary), files: review.files, snapshotKind: review.snapshotKind, snapshotRef: review.snapshotRef, snapshotCommit: review.snapshotCommit });
               return { submissionId: s.id, submissionNumber: s.submissionNumber, diffSha256: s.diffSha256, reviewEpoch: s.reviewEpoch };
