@@ -12,6 +12,41 @@ assert.match(
   /KONTROL_AUTH_MODE === "tunnel" && process\.env\.KONTROL_ALLOWED_ROOTS\?\.trim\(\)/,
   "tunnel mode with environment-provided roots must not enter interactive setup",
 );
+
+// P1 (audit): `kontrol init` must make auth/transport mode an explicit setup
+// choice, generate the mode-specific credential (OAuth owner password vs
+// tunnel reviewer secret), and validate the RESULTING configuration before
+// finishing.
+assert.match(
+  cliSource,
+  /How will MCP clients reach this Kontrol server\?/,
+  "init must ask how clients reach the server (OAuth public URL vs Secure MCP Tunnel)",
+);
+assert.match(
+  cliSource,
+  /OpenAI Secure MCP Tunnel/,
+  "init must offer the Secure MCP Tunnel as a first-class option",
+);
+assert.match(
+  cliSource,
+  /authMode,/,
+  "init must persist the chosen auth mode into config.json",
+);
+assert.match(
+  cliSource,
+  /tunnelReviewerSecret/,
+  "tunnel-mode init must collect and persist the reviewer assertion secret",
+);
+assert.match(
+  cliSource,
+  /generated configuration failed validation/,
+  "init must validate the resulting configuration before finishing (and roll back on failure)",
+);
+assert.match(
+  readFileSync(new URL("./user-config.ts", import.meta.url), "utf8"),
+  /authMode\?: "oauth" \| "tunnel"/,
+  "user config schema carries the auth mode",
+);
 assert.match(cliSource, /case "up":\s+runUp\(args\);/);
 assert.match(cliSource, /const launcher = resolve\(process\.cwd\(\), "start-all\.sh"\);/);
 assert.match(cliSource, /spawnSync\("bash", \[launcher\], \{ cwd: process\.cwd\(\), stdio: "inherit" \}\)/);

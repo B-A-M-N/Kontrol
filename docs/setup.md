@@ -25,6 +25,27 @@ kontrol init
 
 The setup flow asks one question at a time.
 
+### Connection Mode
+
+The first setup question is how MCP clients will reach this server:
+
+- **Public URL (OAuth)** — the default. Kontrol is reachable over the internet
+  through a reverse proxy or public tunnel, and clients authenticate with the
+  OAuth Owner password. Setup asks for the public base URL.
+- **OpenAI Secure MCP Tunnel** — loopback-only. Kontrol binds `127.0.0.1` (or
+  another loopback address) with no local bearer gate; the OpenAI tunnel owns
+  access control, and ChatGPT connects with "No Authentication". Setup asks
+  for a reviewer assertion secret (32+ characters, `openssl rand -base64 32`)
+  stored in `auth.json`; the managed tunnel forwards it as
+  `X-Kontrol-Tunnel-Reviewer` so review/approval tools have reviewer
+  authority. Start the tunnel with `scripts/kontrol-tunnel.sh run` — see
+  [Configuration](configuration.md#tunnel-mode-openai-secure-mcp-tunnel).
+
+The chosen mode is written to `config.json` as `authMode`; the environment
+variable `KONTROL_AUTH_MODE` overrides it per-invocation. Setup validates the
+complete generated configuration before finishing and rolls the files back if
+validation fails.
+
 ### Project Roots
 
 Choose the folders ChatGPT is allowed to open through Kontrol. Keep this
