@@ -139,6 +139,10 @@ export function reduceWorkSessionEvent(sessionId: string, event: AgentActivityEv
             diffSha256: typeof card?.summary?.diffSha256 === "string"
               ? card.summary.diffSha256
               : typeof sc.diffSha256 === "string" ? sc.diffSha256 : undefined,
+            coverage: card?.summary?.coverage
+              ?? (typeof (sc as { coverage?: ReviewSubmissionView["coverage"] }).coverage === "object"
+                ? (sc as { coverage?: ReviewSubmissionView["coverage"] }).coverage
+                : undefined),
           };
           noteSubmission(view2, fetchedSubmission);
           host.render();

@@ -29,7 +29,7 @@ export function registerReviewTools(server: McpServer, config: BridgeConfig): vo
         continuationId: z.string().optional().describe("Continuation ID returned by await_review_feedback; completed only after this submission is persisted."),
         clientMutationId: z.string().min(1).max(200).optional(),
       },
-      outputSchema: { submissionId: z.string(), status: z.string(), files: z.number(), additions: z.number(), removals: z.number(), diffSha256: z.string().optional(), reviewEpoch: z.number(), snapshotKind: z.enum(["git", "filesystem"]).optional(), snapshotRef: z.string().optional(), housekeepingWarnings: z.array(z.string()).optional() },
+      outputSchema: { submissionId: z.string(), status: z.string(), files: z.number(), additions: z.number(), removals: z.number(), diffSha256: z.string().optional(), reviewEpoch: z.number(), snapshotKind: z.enum(["git", "filesystem"]).optional(), snapshotRef: z.string().optional(), housekeepingWarnings: z.array(z.string()).optional(), coverage: z.object({ backend: z.enum(["git", "filesystem"]), uncoveredPaths: z.array(z.string()), reasons: z.array(z.string()) }).optional() },
       _meta: workspaceAppModelAndAppMeta(),
       annotations: { readOnlyHint: false },
     },
@@ -90,7 +90,7 @@ export function registerReviewTools(server: McpServer, config: BridgeConfig): vo
         // Delegate the state transition to the authoritative workflow service
         // (validates status, transitions to awaiting_review, updates the correlated
         // run, and emits review.submitted atomically).
-        const submitted = config.reviewWorkflow.submitForReview({
+        const submitted = await config.reviewWorkflow.submitForReview({
           workSessionId: sessionId,
           diff: review.patch,
           message: message ?? review.result,
@@ -191,6 +191,9 @@ export function registerReviewTools(server: McpServer, config: BridgeConfig): vo
             removals: review.summary.removals,
             message: message ?? review.result,
             housekeepingWarnings,
+            coverage: submitted.coverage
+              ? { backend: submitted.coverage.backend, uncoveredPaths: submitted.coverage.uncoveredPaths, reasons: submitted.coverage.reasons }
+              : undefined,
           } satisfies ReviewSubmissionDTO,
           _meta: {
             tool: "submit_for_review",
@@ -198,7 +201,7 @@ export function registerReviewTools(server: McpServer, config: BridgeConfig): vo
               tool: "submit_for_review",
               workspaceId: session.workspaceSessionId,
               status: "awaiting_review",
-              summary: { ...review.summary, submissionId: submission.id, sessionId, submissionNumber: submission.submissionNumber, runId: correlatedRun?.runId, message: message ?? review.result, diffSha256: submitted.diffSha256, reviewEpoch: submitted.reviewEpoch },
+              summary: { ...review.summary, submissionId: submission.id, sessionId, submissionNumber: submission.submissionNumber, runId: correlatedRun?.runId, message: message ?? review.result, diffSha256: submitted.diffSha256, reviewEpoch: submitted.reviewEpoch, coverage: submitted.coverage ? { backend: submitted.coverage.backend, uncoveredPaths: submitted.coverage.uncoveredPaths, reasons: submitted.coverage.reasons } : undefined },
               files: review.files,
               payload: { patch: review.patch },
             },
@@ -233,6 +236,7 @@ export function registerReviewTools(server: McpServer, config: BridgeConfig): vo
         additions: z.number(),
         removals: z.number(),
         message: z.string().optional(),
+        coverage: z.object({ backend: z.enum(["git", "filesystem"]), uncoveredPaths: z.array(z.string()), reasons: z.array(z.string()) }).optional(),
       },
       _meta: workspaceAppModelAndAppMeta(),
       annotations: { readOnlyHint: true },
@@ -285,6 +289,9 @@ export function registerReviewTools(server: McpServer, config: BridgeConfig): vo
         additions: Number(summary.additions ?? 0),
         removals: Number(summary.removals ?? 0),
         message: submission.message,
+        coverage: submission.coverage && submission.coverage.uncoveredPaths.length > 0
+          ? { backend: submission.coverage.backend, uncoveredPaths: submission.coverage.uncoveredPaths, reasons: submission.coverage.reasons }
+          : undefined,
       };
 
       return {
@@ -335,6 +342,7 @@ export function registerReviewTools(server: McpServer, config: BridgeConfig): vo
         requiredActions: z.array(z.string()).optional().describe("Specific actions the agent must take before resubmitting."),
         allowedNextActions: z.array(z.string()).optional().describe("Actions the agent is permitted to take next (e.g. edit_files, run_commands, resubmit)."),
         reviewerId: z.string().optional().describe("Identifier of the reviewer."),
+        acceptIncompleteCoverage: z.boolean().optional().describe("Explicit reviewer acknowledgment that mutations the review checkpoint cannot represent (paths inside excluded/ignored trees, listed in the submission's coverage warning) were reviewed out-of-band. Required to approve a submission flagged with incomplete checkpoint coverage."),
         clientMutationId: z.string().min(1).max(200).optional(),
       },
       outputSchema: { status: z.string(), verdict: z.string() },
@@ -342,7 +350,7 @@ export function registerReviewTools(server: McpServer, config: BridgeConfig): vo
       annotations: { readOnlyHint: false },
     },
     config,
-    async ({ sessionId, verdict, comments, requiredActions, allowedNextActions, reviewerId, submissionId, diffSha256, reviewEpoch }) => {
+    async ({ sessionId, verdict, comments, requiredActions, allowedNextActions, reviewerId, submissionId, diffSha256, reviewEpoch, acceptIncompleteCoverage }) => {
       // ROLE CHECK: provide_review_feedback is reviewer-only (or an ordinary
       // client). A worker (coding agent) must never be able to review/approve
       // its own submitted work.
@@ -389,6 +397,7 @@ export function registerReviewTools(server: McpServer, config: BridgeConfig): vo
           requiredActions,
           allowedNextActions,
           reviewerId,
+          acceptIncompleteCoverage,
         });
 
         // The continuation.created event is emitted inside the workflow transaction

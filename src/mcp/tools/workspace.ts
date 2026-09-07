@@ -442,6 +442,10 @@ export function registerWorkspaceTools(
         return response;
       }
 
+      // P1 (audit): record the structured mutation path so the next review
+      // submission can state whether the checkpoint represents it.
+      await reviewCheckpoints.recordMutations({ workspaceId, root: workspace.root, paths: [input.path] });
+
       const patch = newFilePatch(input.path, input.content);
       const stats = countDiffStats(patch);
       const summary = {
@@ -555,6 +559,10 @@ export function registerWorkspaceTools(
         }, response.content, startedAt);
         return response;
       }
+
+      // P1 (audit): record the structured mutation path so the next review
+      // submission can state whether the checkpoint represents it.
+      await reviewCheckpoints.recordMutations({ workspaceId, root: workspace.root, paths: [input.path] });
 
       const stats = countDiffStats(
         response.details?.patch ?? response.details?.diff,
@@ -675,6 +683,14 @@ export function registerWorkspaceTools(
           if (action.moveTo) await workspaces.loadApplicableInstructions(workspace, action.moveTo);
         }
         const applied = await applyPatch(workspace.root, patch);
+        // P1 (audit): record every path the patch touched (including move
+        // destinations) so the next review submission can state whether the
+        // checkpoint represents it.
+        await reviewCheckpoints.recordMutations({
+          workspaceId,
+          root: workspace.root,
+          paths: applied.files.map((file) => file.previousPath ?? file.path),
+        });
         const paths = applied.files.map((file) => file.path).join(", ");
         const result = `Applied patch to ${applied.files.length} file(s): ${paths}`;
         const content = [textBlock(result)];

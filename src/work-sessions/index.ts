@@ -24,6 +24,7 @@ import type {
   SubmissionVerdict,
 } from "./types.js";
 import type { ReviewFile, WorkspaceSnapshotKind } from "../review-checkpoints.js";
+import type { CheckpointCoverage } from "../checkpoint-coverage.js";
 import { createWorkSessionStore } from "./session-store.js";
 import { createWorkspaceLeaseStore } from "./lease-store.js";
 import { createReviewSubmissionStore } from "./review-store.js";
@@ -63,6 +64,7 @@ export interface WorkSessionManager {
     message?: string;
     summaryJson?: string;
     files?: ReviewFile[];
+    coverage?: CheckpointCoverage;
   }): WorkSessionSubmission;
   submitFeedback(input: {
     workSessionId: string;

@@ -6,6 +6,7 @@
  * external consumers keep importing them from "../work-sessions.js".
  */
 import type { ReviewFile, WorkspaceSnapshotKind } from "../review-checkpoints.js";
+import type { CheckpointCoverage } from "../checkpoint-coverage.js";
 
 export type WorkSessionStatus =
   | "in_progress"
@@ -118,6 +119,11 @@ export interface WorkSessionSubmission {
   /** Aggregate diff stats from the review checkpoint. */
   additions?: number;
   removals?: number;
+  /** P1 (audit): structured mutations the active checkpoint backend cannot
+   * represent in this submission's diff (excluded/ignored trees). Nonempty
+   * means the review is INCOMPLETE and ordinary approval must be refused
+   * until the reviewer explicitly accepts the condition. */
+  coverage?: CheckpointCoverage;
 }
 
 export interface WorkSessionFeedback {

@@ -22,6 +22,7 @@ import type {
   WorkSessionSubmission,
 } from "./types.js";
 import type { WorkspaceSnapshotKind, ReviewFile } from "../review-checkpoints.js";
+import type { CheckpointCoverage } from "../checkpoint-coverage.js";
 import { isTerminalStatus, rowToSubmission, rowToFeedback, sha256 } from "./internal.js";
 
 /** Latest submission for a session (also used by the session store hydration). */
@@ -66,6 +67,8 @@ export function createReviewSubmissionStore(db: DatabaseHandle, deps: {
       message?: string;
       summaryJson?: string;
       files?: ReviewFile[];
+      /** P1 (audit): checkpoint-coverage record for this submission. */
+      coverage?: CheckpointCoverage;
     }): WorkSessionSubmission {
       const diffSha256 = input.diffSha256 ?? sha256(input.diff ?? "");
       const now = new Date().toISOString();
@@ -90,8 +93,8 @@ export function createReviewSubmissionStore(db: DatabaseHandle, deps: {
         const reviewEpoch = Number(session.review_epoch) + 1;
         db.sqlite.prepare(`
           insert into work_session_submissions
-            (id, work_session_id, submission_number, diff, diff_sha256, files_json, snapshot_commit, snapshot_kind, snapshot_ref, review_epoch, message, summary_json, status, created_at)
-          values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+            (id, work_session_id, submission_number, diff, diff_sha256, files_json, snapshot_commit, snapshot_kind, snapshot_ref, review_epoch, message, summary_json, coverage_json, status, created_at)
+          values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
         `).run(
           submissionId,
           input.workSessionId,
@@ -105,6 +108,7 @@ export function createReviewSubmissionStore(db: DatabaseHandle, deps: {
           reviewEpoch,
           input.message ?? null,
           input.summaryJson ?? null,
+          input.coverage ? JSON.stringify(input.coverage) : null,
           now,
         );
         const updated = db.sqlite.prepare(`
@@ -129,6 +133,7 @@ export function createReviewSubmissionStore(db: DatabaseHandle, deps: {
         message: input.message,
         summaryJson: input.summaryJson,
         files: input.files,
+        coverage: input.coverage,
         status: "pending",
         createdAt: now,
       };

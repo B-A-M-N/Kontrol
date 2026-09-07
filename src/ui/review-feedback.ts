@@ -259,9 +259,36 @@ export function renderFeedbackFormForSubmission(view: WorkSessionViewState, subm
   const isSubmitting = state === "submitting";
   const isError = state === "error";
   const outcomeUnknown = state === "outcome_unknown";
+  // P1 (audit): an incomplete-coverage submission cannot be ordinarily
+  // approved. The reviewer must check the explicit acknowledgment, which is
+  // then sent as acceptIncompleteCoverage (the server independently refuses an
+  // approval without it — the checkbox only unlocks the attempt).
+  const hasIncompleteCoverage = Boolean(submission.coverage && submission.coverage.uncoveredPaths.length > 0);
+  const acceptCoverageId = stableDomId(`accept-coverage-${submission.submissionId}`);
+  const acceptCoverage = document.createElement("input");
+  acceptCoverage.type = "checkbox";
+  acceptCoverage.id = acceptCoverageId;
+  acceptCoverage.className = "coverage-accept-checkbox";
+  const coverageWarning = element("div", { className: "feedback-error coverage-warning" });
+  if (hasIncompleteCoverage) {
+    coverageWarning.append(
+      element("div", {
+        text: `⚠ Incomplete checkpoint coverage: this diff does not represent mutations in ${submission.coverage!.uncoveredPaths.join(", ")}. `
+          + `Review these paths out-of-band before approving (${submission.coverage!.reasons.join("; ")}).`,
+      }),
+    );
+  }
+  const acceptLabel = element("label", { className: "coverage-accept-label", htmlFor: acceptCoverageId });
+  const acceptText = element("span", {
+    text: "I reviewed the listed paths out-of-band and accept the incomplete checkpoint coverage.",
+  });
+  acceptLabel.append(acceptCoverage, acceptText);
 
   if (isError && view.feedbackErrorBySubmission.get(submissionId)) {
     container.append(element("div", { className: "feedback-error", text: view.feedbackErrorBySubmission.get(submissionId) ?? "" }));
+  }
+  if (hasIncompleteCoverage) {
+    container.append(coverageWarning, acceptLabel);
   }
   if (outcomeUnknown) {
     container.append(element("div", { className: "feedback-error", text: "Feedback outcome is unknown after a connection interruption. Refresh authoritative session state before trying again." }));
@@ -276,8 +303,15 @@ export function renderFeedbackFormForSubmission(view: WorkSessionViewState, subm
     const btn = element("button", { className: `feedback-btn ${cls}`, type: "button", text });
     // P1 #11: disable verdict buttons while a submission is in flight.
     if (isSubmitting || outcomeUnknown || !host.uiMutationsAllowed()) btn.disabled = true;
+    if (verdict === "approve" && hasIncompleteCoverage) {
+      // Locked until the explicit acknowledgment is checked; re-render on toggle.
+      btn.disabled = true;
+      acceptCoverage.addEventListener("change", () => {
+        btn.disabled = !acceptCoverage.checked || isSubmitting || outcomeUnknown || !host.uiMutationsAllowed();
+      });
+    }
     btn.addEventListener("click", () => {
-      submitFeedbackForSubmission(view, submission, verdict, textarea.value.trim() || undefined);
+      submitFeedbackForSubmission(view, submission, verdict, textarea.value.trim() || undefined, verdict === "approve" && hasIncompleteCoverage ? acceptCoverage.checked : false);
     });
     return btn;
   };
@@ -292,7 +326,7 @@ export function renderFeedbackFormForSubmission(view: WorkSessionViewState, subm
   return container;
 }
 
-export async function submitFeedbackForSubmission(view: WorkSessionViewState, submission: ReviewSubmissionView, verdict: string, comments?: string): Promise<void> {
+export async function submitFeedbackForSubmission(view: WorkSessionViewState, submission: ReviewSubmissionView, verdict: string, comments?: string, acceptIncompleteCoverage = false): Promise<void> {
   if (!host.getApp()) return;
   const submissionId = submission.submissionId;
   if (verdict === "changes_requested" && !comments?.trim()) {
@@ -325,6 +359,9 @@ export async function submitFeedbackForSubmission(view: WorkSessionViewState, su
           reviewEpoch: submission.reviewEpoch,
           verdict,
           comments,
+          // P1 (audit): only ever true when the reviewer explicitly checked the
+          // incomplete-coverage acknowledgment for a flagged submission.
+          ...(verdict === "approve" && submission.coverage?.uncoveredPaths.length ? { acceptIncompleteCoverage } : {}),
           clientMutationId: host.newClientMutationId(),
         },
       });

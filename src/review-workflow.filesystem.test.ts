@@ -27,7 +27,7 @@ const session = workSessions.create({ workspaceSessionId: "ws-fs-review", submit
 const baseline = await checkpoints.reviewChanges({ workspaceId: "ws-fs-review", root, since: "workspace_open", markReviewed: false });
 writeFileSync(join(root, "tracked.txt"), "submitted\n");
 const submittedSnapshot = await checkpoints.reviewChangesAgainstSnapshot({ workspaceId: "ws-fs-review", root, baseline: baseline.snapshot });
-const submission = workflow.submitForReview({
+const submission = await workflow.submitForReview({
   workSessionId: session.id,
   diff: submittedSnapshot.patch,
   changedFiles: submittedSnapshot.files,

@@ -477,6 +477,7 @@ export async function fetchReviewDiff(sessionId: string, submissionId: string): 
       additions: number;
       removals: number;
       files: ReviewSubmissionView["files"];
+      coverage?: ReviewSubmissionView["coverage"];
         }>(result);
     if (!content?.patch) {
       const view = workSessionViews.get(sessionId);
@@ -505,6 +506,7 @@ export async function fetchReviewDiff(sessionId: string, submissionId: string): 
         sub.additions = content.additions;
         sub.removals = content.removals;
         sub.files = content.files ?? [];
+        sub.coverage = content.coverage;
         host.render();
       }
     }

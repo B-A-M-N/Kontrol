@@ -30,6 +30,9 @@ export type ReviewSubmissionView = {
   removals: number;
   message?: string;
   createdAt?: string;
+  /** P1 (audit): present only when the diff cannot represent every structured
+   * mutation — the UI must name these paths and gate ordinary approval. */
+  coverage?: { backend: "git" | "filesystem"; uncoveredPaths: string[]; reasons: string[] };
 };
 
 export interface PolicyApprovalView {
