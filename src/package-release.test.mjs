@@ -93,6 +93,38 @@ try {
   }).trim();
   assert.equal(installedVersion, packedPackageJson.version, "installed CLI reports the package version");
 
+  // P0 (published dependency closure): the staged manifest must be pinned to
+  // the exact versions in the candidate's qualification fingerprint, and the
+  // clean install must resolve exactly that closure — @b-a-m-n/kontrol@X
+  // identifies one runtime, not whatever a caret range resolves to later.
+  const candidateMeta = JSON.parse(readFileSync(join(pkg, "dist", "build-meta.json"), "utf8"));
+  assert.ok(candidateMeta.dependencies && typeof candidateMeta.dependencies === "object",
+    "candidate build identity carries a dependency fingerprint");
+  for (const [name, exact] of Object.entries(candidateMeta.dependencies)) {
+    assert.equal(
+      packedPackageJson.dependencies?.[name],
+      exact,
+      `staged manifest must pin ${name} to the qualified exact version ${exact}`,
+    );
+    assert.doesNotMatch(String(packedPackageJson.dependencies?.[name]), /^[\^~]/, `no range specifiers in the published closure (${name})`);
+  }
+  {
+    const lock = JSON.parse(readFileSync(join(installPrefix, "node_modules", "@b-a-m-n", "kontrol", "package.json"), "utf8"));
+    for (const [name, exact] of Object.entries(candidateMeta.dependencies)) {
+      const installedVersionForDep = (() => {
+        try {
+          return JSON.parse(readFileSync(join(installPrefix, "node_modules", name, "package.json"), "utf8")).version;
+        } catch {
+          return undefined; // optional/native dep not installed in this env
+        }
+      })();
+      if (installedVersionForDep !== undefined) {
+        assert.equal(installedVersionForDep, exact, `installed ${name} must be the qualified version (${exact}, got ${installedVersionForDep})`);
+      }
+    }
+    void lock;
+  }
+
   const servicePreview = JSON.parse(execFileSync("node", [installedCli, "service", "unit", "--json"], {
     cwd: installPrefix,
     env: {
