@@ -208,6 +208,8 @@ export function createReviewSubmissionStore(db: DatabaseHandle, deps: {
             runtimeState: isTerminalStatus(nextStatus) ? "archived" : "detached",
             runtimeClassifiedAt: now,
             updatedAt: now,
+            // P0: terminal_at is set once and never overwritten.
+            ...(isTerminalStatus(nextStatus) ? { terminalAt: now } : {}),
           })
           .where(eq(workSessions.id, input.workSessionId))
           .run();

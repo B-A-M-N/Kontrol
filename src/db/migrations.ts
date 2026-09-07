@@ -63,6 +63,7 @@ const migrations: Migration[] = [
   { version: 51, name: "work-session-stable-chronology", up: migrateWorkSessionStableChronology },
   { version: 52, name: "client-mutation-receipts", up: migrateClientMutationReceipts },
   { version: 53, name: "backend-neutral-snapshot-identities", up: migrateBackendNeutralSnapshotIdentities },
+  { version: 54, name: "work-session-terminal-at", up: migrateWorkSessionTerminalAt },
 ];
 
 function migrateClientMutationReceipts(sqlite: Database.Database): void {
@@ -1190,6 +1191,22 @@ function migrateWorkSessionCompletionPolicy(sqlite: Database.Database): void {
 function migrateWorkSessionSnapshotBinding(sqlite: Database.Database): void {
   addColumnIfMissing(sqlite, "work_session_submissions", "snapshot_commit", "text");
   sqlite.exec(`update agent_registry set role = 'reviewer' where name = 'webui'`);
+}
+
+// P0: terminal snapshot retention must age from the actual terminal moment,
+// not from `updated_at` (mutable after terminal) or the snapshot manifest's
+// filesystem mtime (which is capture time, so a 35-day session would look
+// 35 days expired the day it terminates). Backfill existing terminal rows
+// from updated_at: for rows already terminal at migration time that is the
+// best available terminal timestamp, and it only lengthens retention.
+function migrateWorkSessionTerminalAt(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "work_sessions", "terminal_at", "text");
+  sqlite.exec(`
+    update work_sessions
+       set terminal_at = updated_at
+     where terminal_at is null
+       and status in ('approved', 'rejected', 'cancelled', 'failed', 'failed_protocol')
+  `);
 }
 
 function addColumnIfMissing(
