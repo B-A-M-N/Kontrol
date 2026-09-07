@@ -110,8 +110,7 @@ run the installed immutable release under the
 `kontrol-core.service` per-user systemd unit. The unit sets `Nice=0`,
 `CPUWeight=100`, `Restart=on-failure`, `KillMode=control-group`, and bounded
 systemd restart limits. It reads `~/.config/kontrol/environment` by default
-(override with `KONTROL_USER_ENV_FILE`) and owns the MCP core only; adapters and
-tunnels remain separate components. The checkout compatibility wrapper
+(override with `KONTROL_USER_ENV_FILE`). The checkout compatibility wrapper
 `scripts/kontrol-user-service.sh` delegates to the same compiled command but is
 not required by an installed package. The checkout launcher `start-all.sh` owns
 the full development/integration stack. Both paths use the same runtime lock,
@@ -120,6 +119,35 @@ For this unit, `restart` restarts the installed immutable release; `upgrade`
 selects the latest immutable build candidate (falling back to `dist/`),
 verifies readiness, and restores the prior unit and validated database backup if
 activation fails.
+
+### Production lifecycle for adapters and the tunnel (P1.9)
+
+By default the production systemd scope is the MCP core only. To bring
+configured ACP adapters and the Secure MCP Tunnel into the same production
+lifecycle, list them in `~/.kontrol/config.json` under `serviceComponents`.
+`kontrol service install` then additionally writes one unit per component
+(`kontrol-<name>.service`) plus a `kontrol.target` group, each with an
+independent `Restart=on-failure` policy, bounded restart limits, and its own
+journal identity:
+
+```json
+{
+  "serviceComponents": [
+    { "name": "hermes", "kind": "adapter",
+      "command": ["node", "@ARTIFACT/../scripts/acp-hermes-native-adapter.mjs"] },
+    { "name": "tunnel", "kind": "tunnel",
+      "command": ["tunnel-client", "run", "--profile", "sample_mcp_with_dcr"] }
+  ]
+}
+```
+
+Component rules: `name` is lowercase letters/digits/dashes (max 39 chars) and
+becomes the unit name; `command` argv entries resolve from PATH (no shells, no
+absolute paths in argv[0]); the token `@ARTIFACT` expands to the installed
+immutable release directory at install time. `kontrol service status` reports
+the target and each component, and `uninstall` removes the component units and
+the target. Components stop with the target (`PartOf=kontrol.target`); the core
+unit keeps its own independent restart policy.
 
 MCP transports are isolated by their `mcp-session-id`. The logical client label
 (for example `mcp:openai-mcp@1.0.0`) is aggregate telemetry only and is never a

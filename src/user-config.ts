@@ -15,6 +15,17 @@ import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { expandHomePath } from "./roots.js";
 
+/** P1.9: an auxiliary production component managed beside the core unit.
+ * `adapter` components wrap a local ACP adapter entrypoint; `tunnel` runs the
+ * Secure MCP Tunnel client. Command argv entries equal "@ARTIFACT" are
+ * substituted with the installed immutable release path at install time. */
+export interface KontrolServiceComponent {
+  name: string;
+  kind: "adapter" | "tunnel";
+  command: string[];
+  port?: number;
+}
+
 export interface KontrolUserConfig {
   host?: string;
   port?: number;
@@ -29,6 +40,10 @@ export interface KontrolUserConfig {
   worktreeRoot?: string;
   agentDir?: string;
   acpKnownAgents?: Array<{ name: string; url: string; description?: string }>;
+  /** P1.9: auxiliary production components installed as their own systemd
+   * user units beside kontrol-core.service (plus kontrol.target). Empty or
+   * omitted keeps the documented core-only production scope. */
+  serviceComponents?: KontrolServiceComponent[];
 }
 
 export interface KontrolAuthConfig {
