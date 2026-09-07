@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { InvalidGrantError, InvalidTokenError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
 import { databasePath, openDatabase } from "./db/client.js";
 import { SingleUserOAuthProvider } from "./oauth-provider.js";
-import { SqliteOAuthClientsStore, SqliteOAuthStore } from "./oauth-store.js";
+import { DCR_UNUSED_GRACE_SECONDS, MAX_OAUTH_CLIENTS, SqliteOAuthClientsStore, SqliteOAuthStore } from "./oauth-store.js";
 
 const root = await mkdtemp(join(tmpdir(), "kontrol-oauth-test-"));
 const oauthConfig = {
@@ -95,6 +95,7 @@ async function testDatabaseConfiguration(stateDir: string): Promise<void> {
       { version: 52, name: "client-mutation-receipts" },
       { version: 53, name: "backend-neutral-snapshot-identities" },
       { version: 54, name: "work-session-terminal-at" },
+      { version: 55, name: "submission-checkpoint-coverage" },
     ]);
   } finally {
     database.close();
@@ -298,3 +299,73 @@ async function testProviderRestartRotationAndRevocation(stateDir: string): Promi
 function hashToken(token: string): string {
   return createHash("sha256").update(token).digest("base64url");
 }
+
+// ── P1 (audit): hard DCR store ceiling + bounded pre-registration cleanup ──
+{
+  const ceilingRoot = await mkdtemp(join(tmpdir(), "kontrol-oauth-ceiling-"));
+  const store = new SqliteOAuthStore(ceilingRoot);
+  try {
+    const base = { redirect_uris: [redirectUri], client_name: "ceiling" };
+
+    // Fill the store to the ceiling with unused registrations.
+    for (let i = 0; i < MAX_OAUTH_CLIENTS; i++) {
+      store.registerClient({ ...base, client_name: `c${i}` } as never, ["chatgpt.com"]);
+    }
+
+    // Beyond the ceiling: rejected, not unbounded SQLite growth.
+    assert.throws(
+      () => store.registerClient(base as never, ["chatgpt.com"]),
+      /registration limit reached/,
+      "registration beyond the ceiling must be rejected",
+    );
+
+    // Existing clients keep working under pressure.
+    assert.ok(store.getClient("kontrol-does-not-exist") === undefined, "lookups still function after a ceiling rejection");
+
+    // Pre-registration cleanup reclaims UNUSED entries past the grace; backdate
+    // all unused clients and confirm one more registration succeeds and the
+    // count stays bounded.
+    const db = openDatabase(ceilingRoot);
+    const old = Math.floor(Date.now() / 1000) - DCR_UNUSED_GRACE_SECONDS - 60;
+    db.sqlite.prepare("update oauth_clients set issued_at = ?").run(old);
+    const reclaimed = store.registerClient({ ...base, client_name: "post-cleanup" } as never, ["chatgpt.com"]);
+    assert.ok(reclaimed.client_id, "post-cleanup registration succeeds");
+    const count = db.sqlite.prepare("select count(*) as count from oauth_clients").get() as { count: number };
+    assert.ok(Number(count.count) <= MAX_OAUTH_CLIENTS, `store stays at/below the ceiling after cleanup (${count.count})`);
+    db.close();
+
+    // A client IN TOKEN USE is never reclaimed by the grace sweep.
+    const usedRoot = await mkdtemp(join(tmpdir(), "kontrol-oauth-ceiling-used-"));
+    const store2 = new SqliteOAuthStore(usedRoot);
+    try {
+      const inUse = store2.registerClient({ ...base, client_name: "in-use" } as never, ["chatgpt.com"]);
+      store2.saveAccessToken("used-access-hash", { clientId: inUse.client_id, scopes: ["kontrol"], expiresAt: Math.floor(Date.now() / 1000) + 3600 });
+      const db2 = openDatabase(usedRoot);
+      const oldTs = Math.floor(Date.now() / 1000) - DCR_UNUSED_GRACE_SECONDS - 60;
+      db2.sqlite.prepare("update oauth_clients set issued_at = ?").run(oldTs);
+      // Fill to the hard total ceiling; the in-use client must never be
+      // removed by the sweep even at full pressure.
+      let filled = 0;
+      for (let i = 0; i < MAX_OAUTH_CLIENTS; i++) {
+        try {
+          store2.registerClient({ ...base, client_name: `filler${i}` } as never, ["chatgpt.com"]);
+          filled++;
+        } catch {
+          break; // ceiling reached
+        }
+      }
+      assert.ok(filled >= MAX_OAUTH_CLIENTS - 1, `fill reached the ceiling (${filled} registered)`);
+      const dbCount = db2.sqlite.prepare("select count(*) as count from oauth_clients").get() as { count: number };
+      assert.ok(Number(dbCount.count) <= MAX_OAUTH_CLIENTS, `store never exceeds the ceiling (${dbCount.count})`);
+      assert.ok(store2.getClient(inUse.client_id), "in-use client survives the pre-registration sweep");
+      db2.close();
+    } finally {
+      store2.close();
+    }
+    void usedRoot;
+  } finally {
+    store.close();
+  }
+  await rm(ceilingRoot, { recursive: true, force: true });
+}
+console.log("oauth-store.test.ts: DCR ceiling passed");
