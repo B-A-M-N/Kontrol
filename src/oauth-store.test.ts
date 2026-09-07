@@ -94,6 +94,7 @@ async function testDatabaseConfiguration(stateDir: string): Promise<void> {
       { version: 51, name: "work-session-stable-chronology" },
       { version: 52, name: "client-mutation-receipts" },
       { version: 53, name: "backend-neutral-snapshot-identities" },
+      { version: 54, name: "work-session-terminal-at" },
     ]);
   } finally {
     database.close();

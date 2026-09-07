@@ -62,6 +62,102 @@ function makeConfig(overrides: Partial<OAuthConfig> = {}): OAuthConfig {
 }
 console.log("oauth-provider guard tests: rate limiting passed");
 
+// ── P0: per-key and global failure thresholds are INDEPENDENT ───────────────
+// Regression: recordFailure used to apply the per-key threshold (5) to the
+// global tracker too, so five bad passwords against ONE key globally denied
+// new Owner authorizations — the global ceiling (50) was checked only after
+// the global lock had already been installed at 5. The five cases below are
+// the audit's required matrix; each runs on a fresh provider so the global
+// tracker's cumulative count is exact.
+{
+  const now = 5_000_000;
+  const makeProvider = () => new SingleUserOAuthProvider(makeConfig(), new URL("http://127.0.0.1:7676"), root);
+  const distinctKeys = (prefix: string, n: number) => Array.from({ length: n }, (_, i) => `${prefix}|10.9.9.${i % 250}:${i}`);
+
+  // Case 1: 4 failures on one key — no lock anywhere.
+  {
+    const provider = makeProvider();
+    try {
+      const k = "client-e|10.1.1.1:1";
+      for (let i = 0; i < AUTH_MAX_FAILURES - 1; i++) provider.recordFailure(k, now);
+      assert.equal(provider.isLockedOut(k, now), false, "4 failures must NOT lock the key");
+      assert.equal(provider.isLockedOut("unrelated|2.2.2.2:2", now), false, "4 failures must not affect other keys");
+      assert.equal(provider.globalFailureCount, AUTH_MAX_FAILURES - 1, "global tracker below its ceiling");
+    } finally {
+      provider.close();
+    }
+  }
+
+  // Case 2: 5 distinct keys, one failure each — global stays open.
+  {
+    const provider = makeProvider();
+    try {
+      for (const k of distinctKeys("client-d2", 5)) provider.recordFailure(k, now + 1);
+      assert.equal(
+        provider.isLockedOut("brand-new|3.3.3.3:3", now + 1),
+        false,
+        "5 distinct-key failures must NOT install a global lock",
+      );
+      assert.equal(provider.globalFailureCount, 5, "global tracker counts each distinct failure once");
+    } finally {
+      provider.close();
+    }
+  }
+
+  // Case 3: 49 distinct keys, one failure each — global still open.
+  {
+    const provider = makeProvider();
+    try {
+      for (const k of distinctKeys("client-d3", AUTH_GLOBAL_MAX_FAILURES - 1)) provider.recordFailure(k, now + 2);
+      assert.equal(
+        provider.isLockedOut("still-open|4.4.4.4:4", now + 2),
+        false,
+        "49 distinct-key failures must leave the global tracker open",
+      );
+      assert.equal(provider.globalFailureCount, AUTH_GLOBAL_MAX_FAILURES - 1, "one below the global ceiling");
+    } finally {
+      provider.close();
+    }
+  }
+
+  // Case 4: 50th distinct failure — global lock installed, everything denied.
+  {
+    const provider = makeProvider();
+    try {
+      for (const k of distinctKeys("client-d4", AUTH_GLOBAL_MAX_FAILURES)) provider.recordFailure(k, now + 3);
+      assert.equal(provider.globalFailureCount, AUTH_GLOBAL_MAX_FAILURES, "global tracker reached its ceiling");
+      assert.equal(
+        provider.isLockedOut("any-key|anywhere", now + 3),
+        true,
+        "50 distinct-key failures lock globally",
+      );
+      assert.ok(provider.retryAfterSeconds("any-key|anywhere", now + 3) > 0, "Retry-After reported for the global lock");
+    } finally {
+      provider.close();
+    }
+  }
+
+  // Case 5: 5 failures against a single key lock ONLY that key — the exact
+  // production scenario the old bug turned into a five-minute global outage.
+  {
+    const provider = makeProvider();
+    try {
+      const victim = "client-g|10.6.6.6:6";
+      for (let i = 0; i < AUTH_MAX_FAILURES; i++) provider.recordFailure(victim, now + 4);
+      assert.equal(provider.isLockedOut(victim, now + 4), true, "5 failures on one key lock that key");
+      assert.equal(
+        provider.isLockedOut("other-key|10.7.7.7:7", now + 4),
+        false,
+        "5 single-key failures must NOT lock unrelated keys",
+      );
+      assert.equal(provider.isLockedOut("third-key|10.11.11.11:11", now + 4), false, "global tracker remains open");
+    } finally {
+      provider.close();
+    }
+  }
+}
+console.log("oauth-provider guard tests: independent threshold matrix passed");
+
 // ── Code expiry purge + outstanding-code cap ────────────────────────────────
 {
   const provider = new SingleUserOAuthProvider(makeConfig(), new URL("http://127.0.0.1:7676"), root);
