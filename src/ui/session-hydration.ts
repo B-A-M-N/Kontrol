@@ -218,14 +218,33 @@ export async function rehydrateActiveSessions(): Promise<void> {
     }
     // Workspace-scoped grants are durable across restart, so they must be
     // rehydrated beside pending approvals instead of remaining invisible in
-    // the approval center.
+    // the approval center. Work-session grants in this workspace are ALSO
+    // effective authority and belong in the same reviewer surface (grouped
+    // separately by renderPolicyGrants). Work-session grant scopeIds are
+    // work-session ids, so list unfiltered and map them to this workspace
+    // through the hydrated session views.
     const grantCenter = ensureWorkSessionView(approvalCenterId(workspaceId), workspaceId, "");
     try {
-      const grantResult = await callServerToolChecked({
-        name: "list_policy_grants",
-        arguments: { scope: "workspace", scopeId: workspaceId },
-      });
-      const grants = getStructuredContent<{ grants?: PolicyGrantView[] }>(grantResult)?.grants ?? [];
+      const [workspaceGrantResult, allWorkSessionGrants] = await Promise.all([
+        callServerToolChecked({
+          name: "list_policy_grants",
+          arguments: { scope: "workspace", scopeId: workspaceId },
+        }),
+        callServerToolChecked({
+          name: "list_policy_grants",
+          arguments: { scope: "work_session" },
+        }).catch(() => undefined as undefined),
+      ]);
+      const workSessionIdsInWorkspace = new Set(
+        [...workSessionViews.values()]
+          .filter((sessionView) => sessionView.workspaceSessionId === workspaceId)
+          .map((sessionView) => sessionView.workSessionId),
+      );
+      const grants = [
+        ...getStructuredContent<{ grants?: PolicyGrantView[] }>(workspaceGrantResult)?.grants ?? [],
+        ...(allWorkSessionGrants ? getStructuredContent<{ grants?: PolicyGrantView[] }>(allWorkSessionGrants)?.grants ?? [] : [])
+          .filter((grant) => workSessionIdsInWorkspace.has(grant.scopeId)),
+      ];
       grantCenter.policyGrants.clear();
       for (const grant of grants) {
         if (grant && typeof grant.id === "string" && typeof grant.scopeId === "string") {

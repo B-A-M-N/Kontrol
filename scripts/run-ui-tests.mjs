@@ -23,6 +23,7 @@ try {
   run("npx", ["tsx", "src/ui/card-types.test.ts"]);
   run("npx", ["tsx", "src/ui/patch-display.test.ts"]);
   run("npx", ["tsx", "src/ui/approval-attention.dom.test.ts"]);
+  run("npx", ["tsx", "src/ui/policy-grant-revoke.dom.test.tsx"]);
   run("npx", ["tsx", "src/ui/workspace-app.dom.test.tsx"]);
 
   // Size test builds + enforces byte budgets (missing artifact = failure).

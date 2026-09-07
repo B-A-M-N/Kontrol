@@ -453,10 +453,52 @@ export function registerPolicyTools(
 
   registerMutationPolicyTool(
     server,
+    "revoke_policy_grant",
+    {
+      title: "Revoke policy grant",
+      description:
+        "Revoke EXACTLY ONE durable policy approval by its grant id (the id returned by list_policy_grants). "
+        + "Other grants in the same scope are untouched. To revoke every grant in a scope at once, use "
+        + "revoke_policy_grants instead. Reviewer-only.",
+      inputSchema: {
+        grantId: z.string().min(1).describe("Exact grant id from list_policy_grants."),
+        clientMutationId: z.string().min(1).max(200).optional(),
+      },
+      outputSchema: { status: z.string(), grantId: z.string() },
+      _meta: workspaceAppModelAndAppMeta(),
+      annotations: { readOnlyHint: false, destructiveHint: true },
+    },
+    config,
+    async ({ grantId }) => {
+      if (!isReviewer(config.principalRole)) {
+        return { content: [{ type: "text" as const, text: "Forbidden: revoke_policy_grant requires reviewer authority." }], isError: true };
+      }
+      const grant = config.policyEngine.listGrants().find((candidate) => candidate.id === grantId);
+      if (!grant) {
+        return { content: [{ type: "text" as const, text: `Unknown or already-revoked policy grant: ${grantId}.` }], isError: true };
+      }
+      config.policyEngine.revokeGrant(grantId);
+      config.eventStore.appendEvent({
+        type: "policy.grants.revoked",
+        sessionId: grant.scopeId,
+        payload: { scope: grant.scope, scopeId: grant.scopeId, grantId, principalId: grant.principalId, exact: true },
+      });
+      return {
+        content: [{ type: "text" as const, text: `Revoked policy grant ${grantId} (${grant.scope}:${grant.scopeId}).` }],
+        structuredContent: { status: "revoked", grantId },
+      };
+    },
+  );
+
+  registerMutationPolicyTool(
+    server,
     "revoke_policy_grants",
     {
-      title: "Revoke policy grants",
-      description: "Revoke all durable policy approvals for an exact work session or workspace scope. Reviewer-only.",
+      title: "Revoke policy grants (bulk)",
+      description:
+        "BULK: revoke ALL durable policy approvals for an exact work session or workspace scope — every grant, "
+        + "every principal, every approval key in that scope. For a single grant, use revoke_policy_grant with "
+        + "the grant id. Reviewer-only.",
       inputSchema: {
         scope: z.enum(["work_session", "workspace"]),
         scopeId: z.string().min(1),
@@ -475,7 +517,7 @@ export function registerPolicyTools(
       config.eventStore.appendEvent({
         type: "policy.grants.revoked",
         sessionId: scopeId,
-        payload: { scope, scopeId },
+        payload: { scope, scopeId, bulk: true },
       });
       return { content: [{ type: "text" as const, text: `Revoked ${scope} policy grants for ${scopeId}.` }], structuredContent: { status: "revoked", scope, scopeId } };
     },

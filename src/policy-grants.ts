@@ -81,6 +81,19 @@ export function createSqliteGrantStore(
         .run();
     },
 
+    revokeGrant(grantId: string): void {
+      database.db
+        .update(policyApprovalGrants)
+        .set({ revokedAt: new Date().toISOString() })
+        .where(
+          and(
+            eq(policyApprovalGrants.id, grantId),
+            isNull(policyApprovalGrants.revokedAt),
+          ),
+        )
+        .run();
+    },
+
     listEffective(): GrantRecord[] {
       const now = new Date().toISOString();
       const rows = database.db

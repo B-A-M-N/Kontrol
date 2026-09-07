@@ -267,6 +267,40 @@ const policy2 = createPolicyEngine(
 assert.equal(policy2.isApproved("principal-1", "path:src/**", { workspaceId: WS_ID, workSessionId: brandWorkSessionId("wsess-1") }), true);
 db2.close();
 
+// ── Exact-grant revocation: one id, siblings untouched ──
+
+policy.recordApproval("principal-exact-a", "tool:exact-a", "work_session", { workspaceId: WS_ID, workSessionId: brandWorkSessionId("wsess-exact") });
+policy.recordApproval("principal-exact-b", "tool:exact-b", "work_session", { workspaceId: WS_ID, workSessionId: brandWorkSessionId("wsess-exact") });
+policy.recordApproval("principal-exact-w", "tool:exact-w", "workspace", { workspaceId: WS_ID, workSessionId: brandWorkSessionId("wsess-exact") });
+const grantA = grantStore.listEffective().find((g) => g.principalId === "principal-exact-a" && g.scope === "work_session");
+const grantB = grantStore.listEffective().find((g) => g.principalId === "principal-exact-b" && g.scope === "work_session");
+const grantW = grantStore.listEffective().find((g) => g.principalId === "principal-exact-w" && g.scope === "workspace");
+assert.ok(grantA && grantB && grantW);
+
+policy.revokeGrant(grantA.id);
+assert.equal(grantStore.listEffective().some((g) => g.id === grantA.id), false, "exact revoke removes the targeted grant");
+assert.ok(grantStore.listEffective().some((g) => g.id === grantB.id), "exact revoke leaves a sibling work-session grant");
+assert.ok(grantStore.listEffective().some((g) => g.id === grantW.id), "exact revoke leaves a workspace grant");
+assert.equal(
+  policy.isApproved("principal-exact-a", "tool:exact-a", { workspaceId: WS_ID, workSessionId: brandWorkSessionId("wsess-exact") }),
+  false,
+  "the revoked approval key no longer approves (in-memory twin evicted)",
+);
+assert.equal(
+  policy.isApproved("principal-exact-b", "tool:exact-b", { workspaceId: WS_ID, workSessionId: brandWorkSessionId("wsess-exact") }),
+  true,
+  "sibling work-session grant still approves",
+);
+assert.equal(
+  policy.isApproved("principal-exact-w", "tool:exact-w", { workspaceId: WS_ID, workSessionId: brandWorkSessionId("wsess-exact") }),
+  true,
+  "workspace grant still approves",
+);
+
+// Revoking an unknown id is a no-op, never an error.
+policy.revokeGrant("grant-does-not-exist");
+assert.ok(grantStore.listEffective().some((g) => g.id === grantB.id), "unknown-id revoke touches nothing");
+
 // ── Test 6: approve_once does not cache ──
 
 const policy3 = createPolicyEngine({ defaultMode: "ask", toolRules: {}, pathRules: [] });

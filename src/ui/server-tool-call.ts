@@ -45,6 +45,9 @@ const RECONCILE_ONLY_TOOLS = new Set([
   "provide_review_feedback",
   "approve_supervised_work",
   "provide_policy_approval",
+  // A revocation may have committed before its response was lost: the
+  // reviewer must refresh authoritative grants, never blind-retry.
+  "revoke_policy_grant",
 ]);
 
 const NEVER_RETRY_TOOLS = new Set([

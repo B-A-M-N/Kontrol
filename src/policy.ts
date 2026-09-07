@@ -140,6 +140,8 @@ export interface GrantRecord {
 export interface GrantStore {
   insert(grant: GrantRecord): void;
   revokeForScope(scope: ApprovalScope, scopeId: string): void;
+  /** Revoke exactly one grant by its durable id. Unknown ids are a no-op. */
+  revokeGrant(grantId: string): void;
   /** All currently-effective (non-revoked, non-expired) grants. */
   listEffective(): GrantRecord[];
 }
@@ -200,6 +202,10 @@ export interface PolicyEngine {
   resumeOperation(approvalId: string, content: OperationResumeContent): string | undefined;
   /** Revoke all durable and in-memory grants for an exact scope. */
   revokeScope(scope: ApprovalScope, scopeId: string): void;
+  /** Revoke exactly one durable grant by id, and its in-memory session
+   *  approval twin. This is the row-level revoke the reviewer UI performs;
+   *  revokeScope stays the explicit bulk operation. */
+  revokeGrant(grantId: string): void;
   /** List effective durable grants for reviewer diagnostics/tools. */
   listGrants(scope?: ApprovalScope, scopeId?: string): GrantRecord[];
 }
@@ -781,6 +787,15 @@ export function createPolicyEngine(
     grantStore?.revokeForScope(scope, scopeId);
   }
 
+  function revokeGrant(grantId: string): void {
+    const grant = grantStore?.listEffective().find((candidate) => candidate.id === grantId);
+    grantStore?.revokeGrant(grantId);
+    if (grant) {
+      const key = [grant.principalId, grant.scope, grant.scopeId, grant.approvalKey].join("|");
+      sessionApprovals.delete(key);
+    }
+  }
+
   function listGrants(scope?: ApprovalScope, scopeId?: string): GrantRecord[] {
     const grants = grantStore?.listEffective() ?? [];
     return grants.filter((grant) => (!scope || grant.scope === scope) && (!scopeId || grant.scopeId === scopeId));
@@ -804,6 +819,7 @@ export function createPolicyEngine(
     resolvePending,
     addPending,
     revokeScope,
+    revokeGrant,
     listGrants,
   };
 }
