@@ -73,6 +73,34 @@ function getSchemaVersion() {
 const schemaVersion = getSchemaVersion();
 const releaseFormatVersion = Number(process.env.KONTROL_RELEASE_FORMAT_VERSION || 1);
 
+// P0 (published dependency closure): record the EXACT resolved versions of the
+// runtime dependencies this candidate was built and qualified against, from
+// the lockfile of the build environment. The packaging stage pins the
+// published package.json to these exact versions, so installing
+// @b-a-m-n/kontrol@X later resolves the same dependency closure the 12-hour
+// soak qualified — a caret range in the published manifest would qualify one
+// closure and ship another.
+function resolvedRuntimeDependencies() {
+  let lock;
+  try {
+    lock = JSON.parse(readFileSync(join(root, "package-lock.json"), "utf8"));
+  } catch {
+    return undefined; // no lockfile (never true for a real build)
+  }
+  const declared = JSON.parse(readFileSync(join(root, "package.json"), "utf8")).dependencies ?? {};
+  const resolved = {};
+  const missing = [];
+  for (const name of Object.keys(declared).sort()) {
+    const entry = lock.packages?.[`node_modules/${name}`];
+    if (entry?.version) resolved[name] = entry.version;
+    else missing.push(name);
+  }
+  if (missing.length > 0) {
+    throw new Error(`package-lock.json is missing resolved versions for runtime dependencies: ${missing.join(", ")}. Run npm install.`);
+  }
+  return resolved;
+}
+
 const buildMeta = {
   version: getPackageVersion(),
   gitSha: getGitSha(),
@@ -93,6 +121,8 @@ const buildMeta = {
   schemaCompatibility: "upgrade-in-place; downgrade-via-versioned-backup",
   releaseFormatVersion,
   nodeVersion: process.version,
+  // Exact runtime-dependency closure of the qualification environment (P0).
+  dependencies: resolvedRuntimeDependencies(),
 };
 // build-atomic.mjs supplies the ID after the final candidate bytes are known.
 // Keep the fallback for direct tooling/tests, but never emit a preliminary ID

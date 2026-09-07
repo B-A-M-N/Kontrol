@@ -32,6 +32,14 @@ const publish = process.argv.includes("--publish");
 const verifyOnly = process.argv.includes("--publish-verify-only");
 const skipBuild = process.argv.includes("--skip-build");
 const destination = option("--pack-destination");
+// P0 (release transport): an explicit, already-validated candidate directory.
+// The release workflow passes the extracted qualification-bundle candidate so
+// publish never depends on a checkout-local build-result file (which a fresh
+// runner cannot possess — the candidate comes from the durable bundle store).
+const explicitCandidate = option("--candidate") ? resolve(root, option("--candidate")) : undefined;
+if (explicitCandidate && !skipBuild) {
+  throw new Error("--candidate is incompatible with a build: pass --skip-build --candidate <qualified-candidate-dir>");
+}
 
 // Release coupling: when invoked under a release buildId, the staged
 // candidate must BE that candidate. A rebuild is never acceptable (the
@@ -57,26 +65,46 @@ function run(command, args, options = {}) {
   return result.stdout;
 }
 
-// 1. Build the immutable candidate (or reuse a just-produced build result).
-if (!skipBuild) {
-  run("npm", ["run", "build"]);
-}
-if (!existsSync(buildResultPath)) {
-  throw new Error(`no build result at ${buildResultPath}; run \`npm run build\` first (or drop --skip-build)`);
-}
-const buildResult = JSON.parse(readFileSync(buildResultPath, "utf8"));
-const candidatePath = resolve(root, buildResult.artifactPath);
-if (!existsSync(join(candidatePath, "cli.js"))) {
-  throw new Error(`build result artifact ${candidatePath} has no cli.js`);
-}
-if (releaseBuildId && buildResult.buildId !== releaseBuildId) {
-  throw new Error(
-    `release buildId ${releaseBuildId} does not match the build result candidate ${buildResult.buildId}. `
-    + "Never publish a rebuilt candidate: run the release workflow for the exact soak-qualified buildId.",
-  );
-}
-if (releaseBuildId && !candidatePath.includes(releaseBuildId)) {
-  throw new Error(`candidate artifact path ${candidatePath} does not contain release buildId ${releaseBuildId}`);
+// 1. Build the immutable candidate (or reuse a just-produced build result, or
+// accept an explicitly validated candidate from the qualification bundle).
+let buildResult;
+let candidatePath;
+if (explicitCandidate) {
+  candidatePath = explicitCandidate;
+  // Minimal identity probe; the full validation ran in release-bundle verify.
+  const metadataPath = join(candidatePath, "build-meta.json");
+  if (!existsSync(metadataPath)) {
+    throw new Error(`explicit candidate ${candidatePath} has no build-meta.json`);
+  }
+  const metadata = JSON.parse(readFileSync(metadataPath, "utf8"));
+  buildResult = { buildId: metadata.buildId, artifactPath: candidatePath };
+  if (releaseBuildId && buildResult.buildId !== releaseBuildId) {
+    throw new Error(
+      `release buildId ${releaseBuildId} does not match the explicit candidate ${buildResult.buildId}. `
+      + "Publish the exact soak-qualified buildId.",
+    );
+  }
+} else {
+  if (!skipBuild) {
+    run("npm", ["run", "build"]);
+  }
+  if (!existsSync(buildResultPath)) {
+    throw new Error(`no build result at ${buildResultPath}; run \`npm run build\` first (or drop --skip-build)`);
+  }
+  buildResult = JSON.parse(readFileSync(buildResultPath, "utf8"));
+  candidatePath = resolve(root, buildResult.artifactPath);
+  if (!existsSync(join(candidatePath, "cli.js"))) {
+    throw new Error(`build result artifact ${candidatePath} has no cli.js`);
+  }
+  if (releaseBuildId && buildResult.buildId !== releaseBuildId) {
+    throw new Error(
+      `release buildId ${releaseBuildId} does not match the build result candidate ${buildResult.buildId}. `
+      + "Never publish a rebuilt candidate: run the release workflow for the exact soak-qualified buildId.",
+    );
+  }
+  if (releaseBuildId && !candidatePath.includes(releaseBuildId)) {
+    throw new Error(`candidate artifact path ${candidatePath} does not contain release buildId ${releaseBuildId}`);
+  }
 }
 
 // 2. Stage the complete package tree in a temp directory.
@@ -111,6 +139,43 @@ const stagedPackageJson = { ...packageJson };
 delete stagedPackageJson.scripts.prepack;
 delete stagedPackageJson.scripts.postpack;
 delete stagedPackageJson.scripts.prepublishOnly;
+
+// P0 (published dependency closure): pin the published dependencies to the
+// EXACT versions recorded in the candidate's build identity — the closure the
+// soak actually qualified. A caret range would let a later `npm install`
+// resolve newer dependency releases than anything the 12-hour soak exercised,
+// so @b-a-m-n/kontrol@X would no longer identify the qualified runtime.
+const buildIdentity = JSON.parse(readFileSync(join(candidatePath, "build-meta.json"), "utf8"));
+if (buildIdentity.dependencies && typeof buildIdentity.dependencies === "object") {
+  const declared = stagedPackageJson.dependencies ?? {};
+  const unpinned = [];
+  for (const [name, exact] of Object.entries(buildIdentity.dependencies)) {
+    if (typeof exact !== "string" || !exact) {
+      throw new Error(`candidate dependency fingerprint has no usable version for ${name}`);
+    }
+    if (!(name in declared)) {
+      throw new Error(`candidate was qualified against ${name}@${exact}, which the package manifest no longer declares`);
+    }
+    declared[name] = exact;
+  }
+  for (const name of Object.keys(declared)) {
+    if (!(name in buildIdentity.dependencies)) {
+      unpinned.push(name);
+    }
+  }
+  if (unpinned.length > 0) {
+    throw new Error(
+      `package manifest declares runtime dependencies absent from the candidate's qualification fingerprint: ${unpinned.join(", ")}. `
+      + "The published closure must be exactly the qualified closure.",
+    );
+  }
+  stagedPackageJson.dependencies = Object.fromEntries(Object.entries(declared).sort(([a], [b]) => a.localeCompare(b)));
+} else {
+  throw new Error(
+    "candidate build identity has no dependency fingerprint (rebuild with the current scripts/generate-build-meta.mjs). "
+    + "Publishing without an exact dependency closure would let installers resolve an unqualified dependency set.",
+  );
+}
 writeFileSync(join(stagedPkg, "package.json"), `${JSON.stringify(stagedPackageJson, null, 2)}\n`);
 
 if (verifyOnly) {
