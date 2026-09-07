@@ -30,6 +30,12 @@ export function processOutputSchema(): z.ZodRawShape {
     signal: z.string().optional(),
     wallTimeMs: z.number().nonnegative().optional(),
     outputTruncated: z.boolean().optional(),
+    // Cursor-based nondestructive output reads (P0): the snapshot's monotonic
+    // stream position and the oldest position still retained. A retry of a
+    // lost poll at the same cursor returns the same logical output until
+    // retention evicts it.
+    outputCursor: z.number().int().nonnegative().optional(),
+    oldestAvailableCursor: z.number().int().nonnegative().optional(),
   });
 }
 
@@ -61,6 +67,8 @@ export function processToolResponse(
       signal: snapshot.signal,
       wallTimeMs: snapshot.wallTimeMs,
       outputTruncated: snapshot.outputTruncated,
+      outputCursor: snapshot.outputCursor,
+      oldestAvailableCursor: snapshot.oldestAvailableCursor,
     },
   };
 }

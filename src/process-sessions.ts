@@ -52,6 +52,13 @@ export interface WriteStdinInput {
   rows?: number;
   yieldTimeMs?: number;
   maxOutputTokens?: number;
+  /**
+   * Read output strictly after this cursor WITHOUT advancing the session's
+   * read pointer. A retry of the same afterCursor returns the same logical
+   * output (until retention evicts it), which makes lost poll responses
+   * recoverable — the transport-resilience contract (P0).
+   */
+  afterCursor?: number;
 }
 
 export interface ProcessSnapshot {
@@ -63,6 +70,10 @@ export interface ProcessSnapshot {
   exitCode?: number;
   signal?: string;
   wallTimeMs: number;
+  /** Monotonic output-stream cursor this snapshot read up to. */
+  outputCursor: number;
+  /** Oldest cursor still retained; earlier ranges have been evicted. */
+  oldestAvailableCursor: number;
 }
 
 interface ManagedProcess {
@@ -81,7 +92,9 @@ interface ProcessSession {
   startedAt: number;
   columns: number;
   rows: number;
-  buffer: HeadTailBuffer;
+  buffer: OutputLog;
+  /** Reader position for the destructive-free default read (session consumer). */
+  readCursor: number;
   running: boolean;
   exitCode?: number;
   signal?: string;
@@ -250,6 +263,107 @@ function truncateOutput(output: string, maxCharacters: number): { output: string
   };
 }
 
+/**
+ * Bounded, monotonically indexed output log (P0: nondestructive polling).
+ *
+ * Appends are assigned consecutive character cursors. Reads NEVER destroy
+ * data: a read at a given cursor returns the same bytes until the chunk is
+ * evicted by the retention bound. This is what makes poll_process retry-safe
+ * (a lost response can be re-read at the same cursor) and allows multiple
+ * observers to follow one process independently.
+ */
+export class OutputLog {
+  /** Chunks of retained output; each carries its start cursor. */
+  private chunks: Array<{ startCursor: number; text: string }> = [];
+  private retainedCharacters = 0;
+  private writeCursor = 0;
+
+  constructor(private readonly maxCharacters: number) {
+    if (!Number.isInteger(maxCharacters) || maxCharacters < 1) {
+      throw new Error("Output log limit must be a positive integer.");
+    }
+  }
+
+  append(output: string): number {
+    if (!output) return this.writeCursor;
+    this.chunks.push({ startCursor: this.writeCursor, text: output });
+    this.retainedCharacters += codePointLength(output);
+    this.writeCursor += codePointLength(output);
+    this.evict();
+    return this.writeCursor;
+  }
+
+  get cursor(): number {
+    return this.writeCursor;
+  }
+
+  hasOutput(): boolean {
+    return this.retainedCharacters > 0;
+  }
+
+  /** Oldest cursor still retained; earlier ranges were evicted. */
+  get oldestCursor(): number {
+    return this.chunks.length > 0 ? this.chunks[0].startCursor : this.writeCursor;
+  }
+
+  /**
+   * Read up to maxCharacters starting strictly after afterCursor. Returns
+   * cursorLapsed=true when the requested range was already evicted (the
+   * caller fell behind retention and MUST be told, never silently given a
+   * hole).
+   */
+  read(afterCursor: number, maxCharacters: number): {
+    output: string;
+    nextCursor: number;
+    oldestAvailableCursor: number;
+    cursorLapsed: boolean;
+    truncated: boolean;
+  } {
+    if (!Number.isInteger(maxCharacters) || maxCharacters < 1) {
+      throw new Error("Output limit must be a positive integer.");
+    }
+    if (!Number.isInteger(afterCursor) || afterCursor < 0) {
+      throw new Error("afterCursor must be a non-negative integer.");
+    }
+
+    const oldestAvailableCursor = this.oldestCursor;
+    const cursorLapsed = afterCursor < oldestAvailableCursor;
+    const effectiveStart = Math.max(afterCursor, oldestAvailableCursor);
+
+    // Assemble retained text from effectiveStart onward.
+    let assembled = "";
+    for (const chunk of this.chunks) {
+      const chunkEnd = chunk.startCursor + codePointLength(chunk.text);
+      if (chunkEnd <= effectiveStart) continue;
+      const offset = Math.max(0, effectiveStart - chunk.startCursor);
+      assembled += sliceCodePoints(chunk.text, offset);
+    }
+
+    const availableCharacters = this.writeCursor - effectiveStart;
+    const truncatedByLimit = codePointLength(assembled) > maxCharacters;
+    const clipped = truncatedByLimit
+      ? takeHead(assembled, maxCharacters)
+      : assembled;
+    const output = truncateOutput(clipped, maxCharacters);
+
+    return {
+      output: output.output,
+      nextCursor: effectiveStart + codePointLength(clipped),
+      oldestAvailableCursor,
+      cursorLapsed: cursorLapsed || availableCharacters > codePointLength(assembled),
+      truncated: output.truncated || truncatedByLimit || cursorLapsed,
+    };
+  }
+
+  private evict(): void {
+    while (this.retainedCharacters > this.maxCharacters && this.chunks.length > 1) {
+      const dropped = this.chunks.shift()!;
+      this.retainedCharacters -= codePointLength(dropped.text);
+    }
+    // A single oversized chunk is retained as-is; reads bound what they return.
+  }
+}
+
 export class ProcessSessionManager {
   private readonly sessions = new Map<string, ProcessSession>();
   private readonly launches = new Map<string, LaunchRecord>();
@@ -351,15 +465,21 @@ export class ProcessSessionManager {
     const writableChars = chars.replaceAll("\u0003", "");
     if (writableChars && session.running) session.process?.write(writableChars);
 
-    if ((interactionRequested || !session.buffer.hasOutput()) && session.running) {
+    // Cursor reads are pure observations: only wait when the requested range
+    // has not been produced yet AND the process is still running.
+    const awaitingNewOutput =
+      input.afterCursor !== undefined && session.running && session.buffer.cursor <= input.afterCursor;
+    if ((interactionRequested || awaitingNewOutput || (!input.afterCursor && !session.buffer.hasOutput())) && session.running) {
       const fallback = interactionRequested ? DEFAULT_INTERACTIVE_YIELD_MS : DEFAULT_POLL_YIELD_MS;
       const maximum = interactionRequested ? MAX_COMMAND_YIELD_MS : MAX_POLL_YIELD_MS;
       const yieldTimeMs = boundedInteger(input.yieldTimeMs, fallback, maximum);
       await this.waitForExit(session, yieldTimeMs);
     }
 
-    const snapshot = this.consume(session, input.maxOutputTokens);
-    if (!session.running) this.removeSession(session.id);
+    const snapshot = this.consume(session, input.maxOutputTokens, input.afterCursor);
+    // Explicit-cursor reads are observations; they never retire a completed
+    // session, so a later observer can still read the final output.
+    if (!session.running && input.afterCursor === undefined) this.removeSession(session.id);
     return snapshot;
   }
 
@@ -490,7 +610,8 @@ export class ProcessSessionManager {
       startedAt: Date.now(),
       columns: terminalSize(input.columns, DEFAULT_COLUMNS),
       rows: terminalSize(input.rows, DEFAULT_ROWS),
-      buffer: new HeadTailBuffer(this.maxBufferCharacters),
+      buffer: new OutputLog(this.maxBufferCharacters),
+      readCursor: 0,
       running: true,
       exitPromise,
       resolveExit,
@@ -584,24 +705,36 @@ export class ProcessSessionManager {
     session.buffer.append(output);
   }
 
-  private consume(session: ProcessSession, maxOutputTokens?: number): ProcessSnapshot {
+  /**
+   * P0 (nondestructive polling): read NEW output since the session's last
+   * read without destroying the log. A repeated read at the same position
+   * (lost response, retried poll) returns the same bytes until retention
+   * evicts them. `write()` with afterCursor delegates here with an explicit
+   * cursor and never moves the session's own read pointer.
+   */
+  private consume(session: ProcessSession, maxOutputTokens?: number, afterCursor?: number): ProcessSnapshot {
     const limit = boundedInteger(maxOutputTokens, DEFAULT_MAX_OUTPUT_TOKENS, 100_000);
     const maxCharacters = Math.max(256, limit * 4);
-    const buffered = session.buffer.drain(maxCharacters);
+    const useExplicitCursor = afterCursor !== undefined;
+    const from = useExplicitCursor ? afterCursor : session.readCursor;
+    const read = session.buffer.read(from, maxCharacters);
+    if (!useExplicitCursor) session.readCursor = read.nextCursor;
 
     const snapshot = {
       sessionId: session.running ? session.id : undefined,
       command: session.command,
-      output: buffered.output,
-      outputTruncated: buffered.truncated,
+      output: read.output,
+      outputTruncated: read.truncated,
       running: session.running,
       exitCode: session.exitCode,
       signal: session.signal,
       wallTimeMs: Date.now() - session.startedAt,
+      outputCursor: read.nextCursor,
+      oldestAvailableCursor: read.oldestAvailableCursor,
     };
     if (!snapshot.running && session.launchKey) {
       const launch = this.launches.get(session.launchKey);
-      if (launch) launch.finalSnapshot = { ...snapshot };
+      if (launch && !useExplicitCursor) launch.finalSnapshot = { ...snapshot };
     }
     return snapshot;
   }

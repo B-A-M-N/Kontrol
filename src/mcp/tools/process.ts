@@ -273,18 +273,34 @@ export function registerProcessPollingTool(
     "poll_process",
     {
       title: "Poll process",
-      description: "Retrieve new output and completion state for a process returned by bash. This tool never writes process input.",
+      description:
+        "Retrieve output and completion state for a process returned by bash. This tool never writes process input "
+        + "and never consumes output: pass afterCursor (the outputCursor from your previous poll) to read only new "
+        + "output; a retried identical poll at the same cursor returns the same output until retention evicts it "
+        + "(oldestAvailableCursor reports eviction). Omitting afterCursor advances the session's shared read pointer.",
       inputSchema: {
         workspaceId: z.string().describe("Workspace identifier used to start the process."),
         sessionId: z.string().describe("Opaque process session identifier returned by bash."),
+        afterCursor: z
+          .number()
+          .int()
+          .nonnegative()
+          .optional()
+          .describe(
+            "Read output strictly after this cursor without advancing the shared read pointer. "
+            + "Pass the outputCursor from your previous poll; a retry at the same cursor is idempotent.",
+          ),
         yieldTimeMs: z.number().int().min(0).max(30_000).optional().describe("Milliseconds to wait for output or completion. Defaults to 5000."),
         maxOutputTokens: z.number().int().positive().max(100_000).optional().describe("Approximate output token budget. Defaults to 10000."),
       },
       outputSchema: processOutputSchema(),
       ...toolWidgetDescriptorMeta(config, "shell"),
-      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      // Idempotent ONLY on the cursor path: the same afterCursor re-read is
+      // retry-safe. A no-cursor poll advances the shared read pointer, so it
+      // is a read-once operation, not an idempotent one.
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     },
-    async ({ workspaceId, sessionId, yieldTimeMs, maxOutputTokens }) => {
+    async ({ workspaceId, sessionId, afterCursor, yieldTimeMs, maxOutputTokens }) => {
       workspaces.getWorkspace(workspaceId);
       const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
       if (bindingErr) return bindingErr;
@@ -293,6 +309,7 @@ export function registerProcessPollingTool(
         sessionId,
         ownerId: processSessionOwnerId(connectionContext),
         workSessionId: connectionContext?.workSessionId,
+        afterCursor,
         yieldTimeMs,
         maxOutputTokens,
       });
@@ -301,6 +318,9 @@ export function registerProcessPollingTool(
         running: snapshot.running,
         exitCode: snapshot.exitCode,
         wallTimeMs: snapshot.wallTimeMs,
+        outputCursor: snapshot.outputCursor,
+        oldestAvailableCursor: snapshot.oldestAvailableCursor,
+        outputTruncated: snapshot.outputTruncated,
       });
     },
   );

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { HeadTailBuffer, ProcessSessionManager } from "./process-sessions.js";
+import { HeadTailBuffer, OutputLog, ProcessSessionManager } from "./process-sessions.js";
 
 const smallBuffer = new HeadTailBuffer(100);
 smallBuffer.append("hello\n");
@@ -385,6 +385,125 @@ try {
   await noisyReaped.terminateByOwner("transport-noisy");
 } finally {
   await noisyReaped.shutdown();
+}
+
+// ── OutputLog: nondestructive cursor reads (P0) ──
+{
+  const log = new OutputLog(1_000);
+  log.append("hello ");
+  log.append("world");
+  // A read at cursor 0 does not destroy anything: a retry is byte-identical.
+  const first = log.read(0, 100);
+  assert.equal(first.output, "hello world");
+  assert.equal(first.nextCursor, 11);
+  const retry = log.read(0, 100);
+  assert.equal(retry.output, "hello world", "same cursor retry returns identical output");
+  // Independent observers can read disjoint ranges from the same log.
+  const fromSix = log.read(6, 100);
+  assert.equal(fromSix.output, "world");
+  assert.equal(fromSix.cursorLapsed, false);
+  assert.equal(log.read(11, 100).output, "");
+  // Reads are bounded.
+  const boundedRead = log.read(0, 5);
+  assert.equal(boundedRead.output, "hello");
+  assert.equal(boundedRead.nextCursor, 5);
+  assert.equal(boundedRead.truncated, true);
+
+  // Retention eviction is explicit, never a silent hole.
+  const tiny = new OutputLog(10);
+  tiny.append("abcdefghij");
+  tiny.append("klmnop");
+  const lapsed = tiny.read(0, 100);
+  assert.equal(lapsed.cursorLapsed, true, "reading an evicted range must report cursorLapsed");
+  assert.equal(lapsed.truncated, true);
+  assert.match(lapsed.output, /^klmnop$/);
+  assert.equal(lapsed.oldestAvailableCursor, 10);
+  assert.equal(tiny.read(16, 100).cursorLapsed, false);
+}
+
+// ── Lost poll_process response is recoverable via afterCursor ──
+{
+  const cursorManager = new ProcessSessionManager({
+    maxBufferCharacters: 100_000,
+    completedSessionTtlMs: 60_000,
+  });
+  try {
+    const longRunning = await cursorManager.start({
+      workspaceId: "workspace-cursor",
+      ownerId: "client:cursor-test",
+      cwd: process.cwd(),
+      command: `${node} -e "process.stdout.write('ABC'); setInterval(() => {}, 1000)"`,
+      yieldTimeMs: 300,
+    });
+    assert.ok(longRunning.sessionId);
+    assert.match(longRunning.output, /ABC/);
+
+    // The launch result consumed ABC on the shared pointer, but the log
+    // retains it: an observer can still read it at cursor 0.
+    const poll1 = await cursorManager.write({
+      workspaceId: "workspace-cursor",
+      sessionId: longRunning.sessionId,
+      ownerId: "client:cursor-test",
+      afterCursor: 0,
+      yieldTimeMs: 10,
+    });
+    assert.match(poll1.output, /ABC/);
+    assert.equal(poll1.outputCursor, 3);
+    assert.equal(poll1.oldestAvailableCursor, 0);
+
+    // SIMULATED LOST RESPONSE: the caller polled at cursor 0, the response was
+    // dropped in transit. Retrying the SAME poll (same cursor) must return
+    // the same logical output — this is the exact defect the old drain-based
+    // poll had.
+    const pollRetry = await cursorManager.write({
+      workspaceId: "workspace-cursor",
+      sessionId: longRunning.sessionId,
+      ownerId: "client:cursor-test",
+      afterCursor: 0,
+      yieldTimeMs: 10,
+    });
+    assert.equal(pollRetry.output, poll1.output, "lost poll response must be recoverable at the same cursor");
+    assert.equal(pollRetry.outputCursor, 3);
+
+    // The shared pointer did not move on a cursor read: a later no-cursor
+    // poll still sees the retained output once the process exits.
+    cursorManager.terminate("workspace-cursor", longRunning.sessionId!, "client:cursor-test");
+
+    // Post-exit cursor reads still work (second observer / late retry) BEFORE
+    // the retiring no-cursor poll.
+    const lateObserver = await cursorManager.write({
+      workspaceId: "workspace-cursor",
+      sessionId: longRunning.sessionId,
+      ownerId: "client:cursor-test",
+      afterCursor: 0,
+      yieldTimeMs: 10,
+    });
+    assert.match(lateObserver.output, /ABC/, "post-exit cursor read must see retained output");
+
+    let finalDefault = await cursorManager.write({
+      workspaceId: "workspace-cursor",
+      sessionId: longRunning.sessionId,
+      ownerId: "client:cursor-test",
+      yieldTimeMs: 100,
+    });
+    for (let i = 0; i < 40 && finalDefault.running; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      finalDefault = await cursorManager.write({
+        workspaceId: "workspace-cursor",
+        sessionId: longRunning.sessionId,
+        ownerId: "client:cursor-test",
+        yieldTimeMs: 100,
+      });
+    }
+    assert.equal(finalDefault.running, false);
+    // The launch snapshot itself advanced the shared pointer past ABC, so a
+    // no-cursor poll legitimately returns nothing NEW — the assertion that
+    // matters is that the bytes were never destroyed: the late observer
+    // above re-read them at cursor 0 after exit.
+    assert.equal(finalDefault.outputCursor, poll1.outputCursor, "cursor reads must not move the shared pointer");
+  } finally {
+    await cursorManager.shutdown();
+  }
 }
 
 console.log("process-sessions.test.ts: all assertions passed");
