@@ -9,8 +9,10 @@ import * as prompts from "@clack/prompts";
 import { getShellConfig } from "@earendil-works/pi-coding-agent";
 import { satisfies } from "semver";
 import { loadConfig } from "./config.js";
+import { databasePath, openDatabase } from "./db/client.js";
 import { FilesystemSnapshotStore } from "./filesystem-snapshot-store.js";
 import { loadPolicyConfig, policyCanAsk } from "./policy.js";
+import { collectDurableSnapshotRoots } from "./runtime/snapshot-roots.js";
 import { runServiceCommand } from "./service.js";
 import { isRuntimeIdentityLive, readBuildIdentity, readRuntimeIdentity } from "./runtime-identity.js";
 import {
@@ -81,9 +83,16 @@ function runSnapshotsCommand(args: string[]): Promise<void> {
 
 function fsSnapshotStoreFromConfig(): FilesystemSnapshotStore {
   const config = loadConfig();
+  // P0 GC safety: the store's durable-root provider is the SAME production
+  // collector maintenance and the server use. `kontrol snapshots gc` can
+  // never run against an implicit empty root set, and stats/doctor report
+  // reachability from the same roots. A fresh install without a database
+  // legitimately has zero DB roots.
+  const db = existsSync(databasePath(config.stateDir)) ? openDatabase(config.stateDir) : undefined;
   return new FilesystemSnapshotStore({
     storeRoot: join(config.stateDir, "workspace-snapshots"),
     limits: config.fsSnapshot,
+    durableRoots: () => collectDurableSnapshotRoots(db),
   });
 }
 
@@ -401,7 +410,14 @@ async function runDoctor(options: { strict?: boolean } = {}): Promise<void> {
     );
     // P0 #2: snapshot store health — orphan ratio, high water, transactions.
     try {
-      const store = new FilesystemSnapshotStore({ storeRoot: join(config.stateDir, "workspace-snapshots"), limits: config.fsSnapshot });
+      // Same durable-root collector as GC/maintenance so the doctor's orphan
+      // ratio reflects the real reachability, not baseline-only roots.
+      const doctorDb = existsSync(databasePath(config.stateDir)) ? openDatabase(config.stateDir) : undefined;
+      const store = new FilesystemSnapshotStore({
+        storeRoot: join(config.stateDir, "workspace-snapshots"),
+        limits: config.fsSnapshot,
+        durableRoots: () => collectDurableSnapshotRoots(doctorDb),
+      });
       const stats = await store.storeStats();
       const reachable = await store.estimateReachableBytes();
       const orphan = Math.max(0, stats.blobs - reachable.blobs);

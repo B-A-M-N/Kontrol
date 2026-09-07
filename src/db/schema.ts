@@ -108,6 +108,10 @@ export const workSessions = sqliteTable("work_sessions", {
   lastConsumedReviewEpoch: integer("last_consumed_review_epoch").notNull().default(0),
   createdAt: text("created_at").notNull(),
   updatedAt: text("updated_at").notNull(),
+  /** Immutable moment the session reached a terminal status. Drives snapshot
+   * retention (GC ages terminal snapshots from this, never from updated_at or
+   * manifest mtime). Backfilled from updated_at for pre-existing rows. */
+  terminalAt: text("terminal_at"),
 }, (table) => [
   index("work_sessions_workspace_idx").on(table.workspaceSessionId, table.updatedAt),
   index("work_sessions_status_idx").on(table.status, table.updatedAt),

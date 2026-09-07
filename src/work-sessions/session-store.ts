@@ -165,7 +165,15 @@ export function createWorkSessionStore(deps: WorkSessionStoreDeps) {
             : "pending";
       db.db
         .update(workSessions)
-        .set({ status, runtimeState, runtimeClassifiedAt: now, updatedAt: now })
+        .set({
+          status,
+          runtimeState,
+          runtimeClassifiedAt: now,
+          updatedAt: now,
+          // P0: terminal_at is set once and never overwritten — retention ages
+          // from the real terminal moment.
+          ...(isTerminalStatus(status) ? { terminalAt: now } : {}),
+        })
         .where(eq(workSessions.id, id))
         .run();
       if (isTerminalStatus(status)) {

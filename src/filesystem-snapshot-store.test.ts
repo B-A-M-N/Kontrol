@@ -170,7 +170,7 @@ function snap(ref: string, terminal = false): { ref: string; terminal?: boolean 
   const before = await store.storeStats();
   assert.ok(before.blobs >= 2, "at least keep + garbage blobs");
   // Run GC to completion (loop slices).
-  await gcToCompletion(store);
+  await gcToCompletion(store, () => []); // no DB in these scenarios: an explicit empty root set
   assert.equal(existsSync(store.manifestPath(unpinRef)), false, "unpinned manifest reclaimed");
   assert.equal(existsSync(store.manifestPath(pinRef)), true, "pinned manifest retained");
   const after = await store.storeStats();
@@ -193,7 +193,7 @@ function snap(ref: string, terminal = false): { ref: string; terminal?: boolean 
   await store.saveBaselines("ws-shared-b", rootB, { open: wsB, presentation: wsB, legacy: wsB, sessions: new Map() });
   const sharedHash = sha256(shared);
   assert.equal(existsSync(store.blobPath(sharedHash)), true, "shared blob present");
-  await gcToCompletion(store);
+  await gcToCompletion(store, () => []); // no DB in these scenarios: an explicit empty root set
   assert.equal(existsSync(store.blobPath(sharedHash)), true, "shared blob survives GC while referenced by any retained manifest");
   const reach = await store.estimateReachableBytes();
   assert.equal(reach.blobs, 1, "one reachable unique blob (the shared one)");
@@ -212,27 +212,155 @@ function snap(ref: string, terminal = false): { ref: string; terminal?: boolean 
   const { store: s2, workspaceRoot: r2 } = makeStore();
   file(r2, "unpinned.txt", "unpinned-content\n");
   const orphan = await s2.capture(r2);
-  await gcToCompletion(s2);
+  await gcToCompletion(s2, () => []); // no DB in this scenario: an explicit empty root set
   assert.equal(existsSync(s2.manifestPath(orphan.ref)), false, "unpinned manifest reclaimed when no DB root");
 }
 
-// --- 10. Terminal retention: terminal snapshots expire per configured retention ---
+// --- 10. Terminal retention: terminal snapshots expire per configured retention.
+// P1.7: deterministic — retention aging is driven by explicit terminalAt values
+// passed to the root provider, never by racing a 10ms window against wall-clock
+// capture I/O. (The manifest-mtime fallback for pre-terminal_at rows is
+// scenario 10b below.)
 {
   const storeRoot = makeRoot("kontrol-fss-retention-");
-  const store = new FilesystemSnapshotStore({ storeRoot, limits: { orphanGraceMs: 0, retentionMs: 10, retainPerWorkspace: 0 } });
+  const store = new FilesystemSnapshotStore({ storeRoot, limits: { orphanGraceMs: 0, retentionMs: 30_000, retainPerWorkspace: 0 } });
   const workspaceRoot = makeRoot("kontrol-fss-retention-root-");
   file(workspaceRoot, "term.txt", "terminal-content\n");
   const terminalSnap = await store.capture(workspaceRoot);
   const termRef = terminalSnap.ref;
-  // Terminal DB root but mtime is fresh (< retentionMs 10) -> retained.
-  await gcToCompletion(store, () => [snap(termRef, true)]);
+  // Terminal 1s ago with a 30s retention window -> retained, regardless of how
+  // long capture I/O took (the old 10ms-window form of this test was flaky).
+  await gcToCompletion(store, () => [{ ref: termRef, terminal: true, terminalAt: new Date(Date.now() - 1_000).toISOString() }]);
   assert.equal(existsSync(store.manifestPath(termRef)), true, "fresh terminal snapshot retained within retention window");
-  // Age the manifest so it is older than retentionMs.
+  // Terminal 60s ago -> retention (30s) expired even though the manifest mtime
+  // is seconds old: aging is from the terminal moment, not filesystem times.
+  await gcToCompletion(store, () => [{ ref: termRef, terminal: true, terminalAt: new Date(Date.now() - 60_000).toISOString() }]);
+  assert.equal(existsSync(store.manifestPath(termRef)), false, "expired terminal snapshot reclaimed after retention");
+}
+
+// --- 10b. Terminal retention mtime fallback (pre-terminal_at rows): a
+// terminal DB root without a terminalAt ages from the manifest mtime, which is
+// the documented best-effort behavior for legacy rows.
+{
+  const storeRoot = makeRoot("kontrol-fss-retention-legacy-");
+  const store = new FilesystemSnapshotStore({ storeRoot, limits: { orphanGraceMs: 0, retentionMs: 30_000, retainPerWorkspace: 0 } });
+  const workspaceRoot = makeRoot("kontrol-fss-retention-legacy-root-");
+  file(workspaceRoot, "term.txt", "legacy-terminal-content\n");
+  const terminalSnap = await store.capture(workspaceRoot);
+  const termRef = terminalSnap.ref;
   const mp = store.manifestPath(termRef);
+  // Fresh manifest, no terminalAt: treated as freshly terminal -> retained.
+  await gcToCompletion(store, () => [{ ref: termRef, terminal: true }]);
+  assert.equal(existsSync(mp), true, "legacy terminal snapshot (no terminalAt) retained while manifest is fresh");
+  // Age the manifest beyond retention: the mtime fallback expires it.
   const now = Date.now();
   utimesSync(mp, new Date(now - 60_000), new Date(now - 60_000));
-  await gcToCompletion(store, () => [snap(termRef, true)]);
-  assert.equal(existsSync(mp), false, "expired terminal snapshot reclaimed after retention");
+  await gcToCompletion(store, () => [{ ref: termRef, terminal: true }]);
+  assert.equal(existsSync(mp), false, "legacy terminal snapshot expires via mtime fallback");
+}
+
+// --- P0: high-water emergency GC preserves a DB-only submission ---
+// Drive the store over its high-water mark with a submission snapshot that is
+// NOT a baseline and is referenced only through the store's durableRoots
+// provider. The emergency slice must reclaim the unpinned garbage but never
+// the DB-referenced submission — and capture must still be refused afterwards
+// while the store remains over the mark (fail closed).
+{
+  const storeRoot = makeRoot("kontrol-fss-hw-");
+  const workspaceRoot = makeRoot("kontrol-fss-hw-ws-");
+  const store = new FilesystemSnapshotStore({
+    storeRoot,
+    limits: { orphanGraceMs: 0, highWaterBytes: 80_000, retainPerWorkspace: 0 },
+    durableRoots: undefined,
+  });
+  file(workspaceRoot, "submitted.txt", "submitted-content\n");
+  const submitted = await store.capture(workspaceRoot);
+  const subRef = submitted.ref;
+  // Take the store decisively over the 80KiB high-water mark with unpinned
+  // garbage (no provider at construction: the submission would be garbage
+  // without the call-site roots under test).
+  const store2 = new FilesystemSnapshotStore({
+    storeRoot,
+    limits: { orphanGraceMs: 0, highWaterBytes: 80_000, retainPerWorkspace: 0 },
+    durableRoots: () => [{ ref: subRef, terminal: false }],
+  });
+  for (let i = 0; i < 2; i++) {
+    const ws = makeRoot("kontrol-fss-hw-garbage-");
+    // Unique content per capture: CAS dedup must not collapse the garbage.
+    file(ws, `garbage-${i}.bin`, Buffer.alloc(64 * 1024, 7 + i));
+    await store2.capture(ws);
+  }
+  assert.ok(await store2.overHighWater(), "store is over the high-water mark");
+  // Capture must trigger the emergency GC slice; the DB-rooted submission
+  // must survive it even though it is not a baseline.
+  file(workspaceRoot, "more.txt", "post-brake-content\n");
+  await store2.capture(workspaceRoot);
+  assert.equal(existsSync(store2.manifestPath(subRef)), true, "high-water emergency GC preserved the DB-only submission");
+  const statsAfter = await store2.storeStats();
+  assert.ok(statsAfter.blobs < 8, `emergency GC reclaimed the unpinned garbage (blobs=${statsAfter.blobs})`);
+  await store2.close();
+  await store.close();
+}
+
+// --- P0: production store contract — destructive GC without any durable-root
+// provider is impossible; a THROWING provider (DB unreadable) reclaims nothing.
+{
+  const storeRoot = makeRoot("kontrol-fss-failclosed-");
+  const workspaceRoot = makeRoot("kontrol-fss-failclosed-ws-");
+  const store = new FilesystemSnapshotStore({ storeRoot });
+  file(workspaceRoot, "a.txt", "content-a\n");
+  file(workspaceRoot, "b.txt", "content-b\n");
+  const s1 = await store.capture(workspaceRoot);
+  const s2 = await store.capture(workspaceRoot); // s1 now unpinned
+  const statsBefore = await store.storeStats();
+
+  // 1. No provider at all: destructive gcSlice must refuse to run.
+  await assert.rejects(
+    () => store.gcSlice({ budgetMs: 1000, pageSize: 100, dryRun: false }),
+    /durable-root provider/,
+    "destructive GC without a durable-root provider must fail closed",
+  );
+  // dryRun is read-only: it may fall back to baseline-only roots.
+  const dry = await store.gcSlice({ budgetMs: 1000, pageSize: 100, dryRun: true });
+  assert.equal(dry.result.blobsReclaimed, 0, "dryRun never deletes");
+
+  // 2. A provider that THROWS (SQLite unreadable) must abort the slice before
+  // any deletion: nothing live can be distinguished from nothing at all, so
+  // the only safe action is to reclaim nothing.
+  const throwing = new FilesystemSnapshotStore({
+    storeRoot,
+    durableRoots: () => {
+      throw new Error("sqlite: database disk image is malformed");
+    },
+  });
+  await assert.rejects(
+    () => gcToCompletion(throwing),
+    /malformed/,
+    "a throwing durable-root provider must abort the GC slice",
+  );
+  const statsAfter = await store.storeStats();
+  assert.equal(statsAfter.blobs, statsBefore.blobs, "zero blobs reclaimed when root enumeration failed");
+  assert.equal(statsAfter.manifests, statsBefore.manifests, "zero manifests reclaimed when root enumeration failed");
+  assert.equal(existsSync(store.manifestPath(s1.ref)) || existsSync(store.manifestPath(s2.ref)), true, "captures still present after failed enumeration");
+  await store.close();
+}
+
+// --- P0: high-water brake fails closed without a durable-root provider ---
+// Over the mark with no provider anywhere: the emergency slice must throw
+// (treated as GC failure) and capture must be refused — never an implicit
+// empty root set deciding everything is garbage.
+{
+  const storeRoot = makeRoot("kontrol-fss-hw-nop-");
+  const ws = makeRoot("kontrol-fss-hw-nop-ws-");
+  const store = new FilesystemSnapshotStore({ storeRoot, limits: { orphanGraceMs: 0, highWaterBytes: 512, retainPerWorkspace: 0 } });
+  file(ws, "big.bin", Buffer.alloc(8 * 1024, 3));
+  const first = await store.capture(ws);
+  assert.ok(await store.overHighWater(), "store over high-water");
+  // Every subsequent capture must be refused: the brake cannot run a
+  // provider-less destructive GC, so it fails closed.
+  await assert.rejects(() => store.capture(ws), /high-water/, "capture refused while over high-water without a root provider");
+  assert.equal(existsSync(store.manifestPath(first.ref)), true, "nothing deleted by the failed brake");
+  await store.close();
 }
 
 // --- 11. Mutation-before-baseline (manager level) handled in review-checkpoints.filesystem.test.ts ---
@@ -292,7 +420,7 @@ function snap(ref: string, terminal = false): { ref: string; terminal?: boolean 
   const m = await store.readManifest(snap2);
   const extraHash = m.entries.find((e) => e.path === "extra.txt")!.sha256;
   assert.equal(existsSync(store.blobPath(extraHash)), true, "extra blob published");
-  await gcToCompletion(store);
+  await gcToCompletion(store, () => []); // no DB in these scenarios: an explicit empty root set
   // Both pinned snapshots' manifests and blobs must survive.
   assert.equal(existsSync(store.manifestPath(pinned.ref)), true);
   assert.equal(existsSync(store.manifestPath(snap2.ref)), true);

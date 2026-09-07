@@ -14,6 +14,7 @@ import type { ServerConfig } from "../config.js";
 import type { DatabaseHandle } from "../db/client.js";
 import type { FilesystemSnapshotStore } from "../filesystem-snapshot-store.js";
 import type { ReviewCheckpointManager } from "../review-checkpoints.js";
+import { collectDurableSnapshotRoots, type DurableSnapshotRoot } from "./snapshot-roots.js";
 
 /** Canonical terminal work-session statuses (shared with server.ts). */
 export const terminalWorkSessionStatuses = new Set(["approved", "rejected", "cancelled", "failed", "failed_protocol"]);
@@ -71,6 +72,11 @@ export function createMaintenanceCoordinator(deps: MaintenanceDeps) {
     compactedRows: number;
     pendingMutationReceipts: number;
     lastError?: string;
+    /** P0: set when durable snapshot-root enumeration failed. Snapshot GC is
+     * skipped entirely while degraded — reclaiming with a partial root set
+     * could delete DB-referenced submissions. */
+    snapshotRootsDegraded?: boolean;
+    snapshotRootsLastError?: string;
   } = {
     running: false,
     backlog: false,
@@ -85,37 +91,13 @@ export function createMaintenanceCoordinator(deps: MaintenanceDeps) {
   // snapshot may no longer be a current baseline yet still be required for
   // approval or immutable mission verification — so GC must root from these
   // tables, not just from the manifest directory.
-  const collectFsSnapshotDbRoots = (): Array<{ ref: string; terminal?: boolean }> => {
-    if (!db) return [];
-    const roots: Array<{ ref: string; terminal?: boolean }> = [];
-    try {
-      const sqlite = db.sqlite;
-      // work_session_submissions, terminal by owning work_session.status.
-      const submissions = sqlite.prepare(
-        "select wss.snapshot_ref as ref, ws.status as status from work_session_submissions wss left join work_sessions ws on ws.id = wss.work_session_id where wss.snapshot_kind = 'filesystem' and wss.snapshot_ref is not null",
-      ).all() as Array<{ ref?: string; status?: string }>;
-      for (const row of submissions) {
-        if (row.ref) roots.push({ ref: row.ref, terminal: row.status ? terminalWorkSessionStatuses.has(row.status) : undefined });
-      }
-      // mission_evidence, mission_completion_reports: always strong pins.
-      for (const table of ["mission_evidence", "mission_completion_reports"]) {
-        const rows = sqlite.prepare(
-          `select snapshot_ref as ref from ${table} where snapshot_kind = 'filesystem' and snapshot_ref is not null`,
-        ).all() as Array<{ ref?: string }>;
-        for (const row of rows) if (row.ref) roots.push({ ref: row.ref });
-      }
-      // supervisor_runs.last_snapshot_ref.
-      const runs = sqlite.prepare(
-        "select last_snapshot_ref as ref from supervisor_runs where last_snapshot_kind = 'filesystem' and last_snapshot_ref is not null",
-      ).all() as Array<{ ref?: string }>;
-      for (const row of runs) if (row.ref) roots.push({ ref: row.ref });
-    } catch (error) {
-      // A failed DB query must never abort maintenance: report and return an
-      // empty root set so only the manifest/baseline roots are honored.
-      reportMaintenanceFailure("snapshot_gc_db_roots", error);
-    }
-    return roots;
-  };
+  //
+  // P0 fail-closed: the shared collector (runtime/snapshot-roots.ts) THROWS
+  // when the durable root set cannot be enumerated. A maintenance caller that
+  // swallowed that error and passed an empty root set to GC would turn "I
+  // could not determine what data is live" into "nothing in SQLite is live".
+  // The GC slice is skipped while degraded; the next cycle retries.
+  const collectFsSnapshotDbRoots = (): DurableSnapshotRoot[] => collectDurableSnapshotRoots(db);
 
   const snapshotGcSlice = async (
     store: FilesystemSnapshotStore,
@@ -254,6 +236,23 @@ export function createMaintenanceCoordinator(deps: MaintenanceDeps) {
           // advanced per yielded step; if it reports more work, the next cycle
           // resumes (never monopolizing the serving thread).
           const store = reviewCheckpoints.getSnapshotStore();
+          // P0 fail-closed: probe the durable root set BEFORE any GC slice.
+          // An enumeration failure marks maintenance degraded and skips GC
+          // entirely (reclaim nothing); the next cycle retries.
+          try {
+            collectFsSnapshotDbRoots();
+            maintenanceStats.snapshotRootsDegraded = false;
+            maintenanceStats.snapshotRootsLastError = undefined;
+          } catch (error) {
+            const detail = error instanceof Error ? error.message : String(error);
+            maintenanceStats.snapshotRootsDegraded = true;
+            maintenanceStats.snapshotRootsLastError = detail;
+            maintenanceStats.lastError = detail;
+            reportMaintenanceFailure("snapshot_gc_db_roots", error);
+            snapshotGcDone = true;
+            setImmediate(step);
+            return;
+          }
           const slice = await snapshotGcSlice(store, MAINTENANCE_BUDGET_MS, MAINTENANCE_PAGE_SIZE);
           if (slice.error) {
             maintenanceStats.lastError = slice.error;

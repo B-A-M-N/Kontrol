@@ -140,6 +140,12 @@ export interface FilesystemSnapshotStoreOptions {
   limits?: FilesystemSnapshotLimits;
   /** P1.6: additional directory names excluded from capture (added to the defaults). */
   excludedDirectories?: Iterable<string>;
+  /** P0 GC safety: production provider for durable SQLite snapshot roots.
+   * Must throw on enumeration failure (see runtime/snapshot-roots.ts).
+   * Without it the store refuses DESTRUCTIVE GC (`gcSlice` with dryRun
+   * unset/false and high-water emergency GC) rather than guessing what is
+   * live. Read-only estimates keep accepting an explicit provider too. */
+  durableRoots?: () => Array<{ ref: string; terminal?: boolean; terminalAt?: string }>;
 }
 
 export interface FilesystemManifestEntry {
@@ -268,6 +274,8 @@ export class FilesystemSnapshotStore {
   private lastGcReclaimedBytes = 0;
   /** P1.6: directory names never descended into during capture. */
   private excludedDirectories: Set<string> = new Set(DEFAULT_SNAPSHOT_EXCLUDED_DIRECTORIES);
+  /** P0 GC safety: production durable-root provider (see options doc). */
+  private readonly durableRoots?: () => Array<{ ref: string; terminal?: boolean; terminalAt?: string }>;
 
   constructor(options: FilesystemSnapshotStoreOptions = {}) {
     this.storeRoot = resolve(options.storeRoot ?? join(tmpdir(), "kontrol-workspace-snapshots"));
@@ -292,6 +300,23 @@ export class FilesystemSnapshotStore {
     this.retentionMs = this.limits.retentionMs;
     this.retainPerWorkspace = this.limits.retainPerWorkspace;
     this.orphanGraceMs = this.limits.orphanGraceMs;
+    this.durableRoots = options.durableRoots;
+  }
+
+  /**
+   * Resolve the durable DB-root provider for a GC/estimate call. The
+   * call-site argument wins; the constructor-injected production provider is
+   * the fallback. Destructive collection REQUIRES a provider — see gcSlice.
+   */
+  private rootsProvider(explicit?: () => Array<{ ref: string; terminal?: boolean; terminalAt?: string }>): () => Array<{ ref: string; terminal?: boolean; terminalAt?: string }> {
+    const provider = explicit ?? this.durableRoots;
+    if (!provider) {
+      throw new Error(
+        "Destructive snapshot GC requires a durable-root provider (call-site listDbSnapshots or the store's durableRoots option). "
+        + "Guessing an empty root set can delete snapshots the database still references.",
+      );
+    }
+    return provider;
   }
 
   get storePath(): string {
@@ -400,12 +425,23 @@ export class FilesystemSnapshotStore {
 
   /** Emergency brake: refuse new captures when the store is over its high-water
    * mark and a bounded GC attempt did not bring it back under. Guards against
-   * filling the host disk. */
+   * filling the host disk. P0: the emergency slice uses the same durable-root
+   * provider as every other destructive collection — a brake that could
+   * delete DB-referenced submissions is worse than a full disk. */
   private async enforceHighWater(): Promise<void> {
     if (!(await this.overHighWater())) return;
-    // Attempt one bounded GC slice first (respects orphan grace).
+    // Attempt bounded GC slices until the sweep completes (a single slice only
+    // advances one phase — the mark phase deletes nothing). A missing or
+    // failing durable-root provider makes this throw, which the capture path
+    // treats exactly like every other GC failure: fail closed, refuse new
+    // captures. Bounded by a wall-clock deadline so a huge store cannot wedge
+    // the serving thread.
+    const deadline = performance.now() + 5_000;
     try {
-      await this.gcSlice({ budgetMs: 1000, pageSize: 500, dryRun: false });
+      let hasMore = true;
+      while (hasMore && performance.now() < deadline) {
+        ({ hasMore } = await this.gcSlice({ budgetMs: 1000, pageSize: 500, dryRun: false }));
+      }
     } catch {
       /* GC failure surfaces via maintenance; continue to fail closed below */
     }
@@ -688,7 +724,6 @@ export class FilesystemSnapshotStore {
     }
   }
 
-  async captureStreamingTestRoot(_root: string): Promise<void> { /* no-op placeholder */ }
 
   /** Load persisted baselines; distinguishes missing vs corrupt. */
   async loadBaselines(workspaceId: string): Promise<{ root: string; open: WorkspaceSnapshot; presentation: WorkspaceSnapshot; legacy: WorkspaceSnapshot; sessions: Record<string, WorkspaceSnapshot> } | undefined> {
@@ -826,15 +861,17 @@ export class FilesystemSnapshotStore {
    * whether the owning work session is terminal (for retention) or still
    * nonterminal (always pinned).
    */
-  private async collectRoots(listDbSnapshots?: () => Array<{ ref: string; terminal?: boolean }>): Promise<{
+  private async collectRoots(listDbSnapshots?: () => Array<{ ref: string; terminal?: boolean; terminalAt?: string }>): Promise<{
     /** Strong pins: never expire during the collection. */
     strong: Set<string>;
-    /** Retention-tracked terminal refs (expire after retentionMs; the newest
-     * `retainPerWorkspace` of them survive beyond the TTL). */
-    terminal: Array<{ ref: string; refMtimeMs: number }>;
+    /** Retention-tracked terminal refs (expire retentionMs after the session
+     * went terminal; the newest `retainPerWorkspace` survive beyond the TTL).
+     * ageAtMs is the authoritative terminal moment — work_sessions.terminal_at
+     * when known, else the manifest mtime as a best-effort fallback. */
+    terminal: Array<{ ref: string; refMtimeMs: number; ageAtMs: number }>;
   }> {
     const strong = new Set<string>();
-    const terminal: Array<{ ref: string; refMtimeMs: number }> = [];
+    const terminal: Array<{ ref: string; refMtimeMs: number; ageAtMs: number }> = [];
     // 1. Persisted baselines: open/presentation/legacy + session pins are
     //    strong pins (they are the live top-of-workspace refs).
     const baselineDir = join(this.storeRoot, "baselines");
@@ -866,13 +903,20 @@ export class FilesystemSnapshotStore {
       }
     }
     // 2. Durable DB roots: nonterminal refs are strong pins; terminal refs are
-    //    retention-tracked (age from the manifest file's mtime).
+    //    retention-tracked, aged from work_sessions.terminal_at (P0). The
+    //    manifest mtime is only a fallback for rows predating terminal_at —
+    //    mtime measures capture time, so aging from it would expire a snapshot
+    //    belonging to a 35-day session the day the session terminates.
     if (listDbSnapshots) {
       for (const snap of listDbSnapshots()) {
         if (!snap || !snap.ref) continue;
         if (snap.terminal) {
           const refMtimeMs = await this.manifestMtimeMs(snap.ref);
-          if (refMtimeMs !== undefined) terminal.push({ ref: snap.ref, refMtimeMs });
+          if (refMtimeMs !== undefined) {
+            const terminalAtMs = snap.terminalAt !== undefined ? Date.parse(snap.terminalAt) : Number.NaN;
+            const ageAtMs = Number.isFinite(terminalAtMs) ? terminalAtMs : refMtimeMs;
+            terminal.push({ ref: snap.ref, refMtimeMs, ageAtMs });
+          }
           // A terminal ref whose manifest was already collected simply isn't a
           // live ref anymore; nothing to pin.
         } else {
@@ -904,12 +948,19 @@ export class FilesystemSnapshotStore {
   async gcSlice(options: {
     budgetMs: number;
     pageSize?: number;
-    listDbSnapshots?: () => Array<{ ref: string; terminal?: boolean }>;
+    /** Durable SQLite snapshot roots. REQUIRED (call-site or the store's
+     * durableRoots option): a destructive collection must never run against
+     * an unvalidated (implicitly empty) root set. The provider must throw on
+     * enumeration failure — never return [] to mean "could not read". */
+    listDbSnapshots?: () => Array<{ ref: string; terminal?: boolean; terminalAt?: string }>;
     dryRun?: boolean;
   }): Promise<{ result: GcSliceResult; hasMore: boolean }> {
     const startedAt = performance.now();
     const pageSize = options.pageSize ?? 200;
     const nowMs = Date.now();
+    const listDbSnapshots = options.dryRun
+      ? options.listDbSnapshots ?? this.durableRoots
+      : this.rootsProvider(options.listDbSnapshots);
     const result: GcSliceResult = {
       manifestsRetained: 0,
       manifestsExpired: 0,
@@ -921,12 +972,13 @@ export class FilesystemSnapshotStore {
 
     // ----- phase 0: roots + retained manifests + mark blobs -----
     if (this.gcState.phase === 0) {
-      const { strong, terminal } = await this.collectRoots(options.listDbSnapshots);
+      const { strong, terminal } = await this.collectRoots(listDbSnapshots);
       const retained = new Set<string>();
       // Retain the newest `retainPerWorkspace` terminal refs beyond their TTL so
       // operators keep a bounded recent tail even after retention expires.
+      // Newest by terminal age (ageAtMs), not manifest mtime (P0).
       const protectedAfterTtl = new Set([...terminal]
-        .sort((a, b) => b.refMtimeMs - a.refMtimeMs)
+        .sort((a, b) => b.ageAtMs - a.ageAtMs)
         .slice(0, this.retainPerWorkspace)
         .map((t) => t.ref));
       const expired: string[] = [];
@@ -934,9 +986,10 @@ export class FilesystemSnapshotStore {
         const ref = FS_REF_PREFIX + f.replace(/\.json$/, "");
         // A manifest that still exists is retained if it is a strong pin,
         // within its retention window (terminal), or fresh (orphan grace).
+        // Retention ages from the terminal moment, not the manifest mtime.
         const isStrong = strong.has(ref);
         const terminalRef = terminal.find((t) => t.ref === ref);
-        const withinRetention = terminalRef !== undefined && nowMs - terminalRef.refMtimeMs < this.retentionMs;
+        const withinRetention = terminalRef !== undefined && nowMs - terminalRef.ageAtMs < this.retentionMs;
         if (isStrong || withinRetention || protectedAfterTtl.has(ref)) {
           retained.add(ref);
         } else {
@@ -1195,18 +1248,23 @@ export class FilesystemSnapshotStore {
    * baselines plus the optional DB root collector (same production roots GC
    * uses). This does not delete anything.
    */
-  async estimateReachableBytes(listDbSnapshots?: () => Array<{ ref: string; terminal?: boolean }>): Promise<{
+  async estimateReachableBytes(listDbSnapshots?: () => Array<{ ref: string; terminal?: boolean; terminalAt?: string }>): Promise<{
     blobs: number;
     bytes: number;
     manifests: number;
   }> {
-    const { strong, terminal } = await this.collectRoots(listDbSnapshots);
+    // Read-only estimate: an explicit call-site provider wins; otherwise fall
+    // back to the constructor-injected production provider when present. If
+    // neither exists the estimate covers baseline roots only — reporting a
+    // higher orphan estimate is safe, unlike GC.
+    const { strong, terminal } = await this.collectRoots(listDbSnapshots ?? this.durableRoots);
     const now = Date.now();
     const roots = new Set(strong);
     for (const t of terminal) {
       // Count terminal refs as reachable within their retention window and the
-      // bounded recent tail, mirroring gcSlice's retention logic.
-      if (now - t.refMtimeMs < this.retentionMs || [...terminal].sort((a, b) => b.refMtimeMs - a.refMtimeMs).slice(0, this.retainPerWorkspace).some((x) => x.ref === t.ref)) {
+      // bounded recent tail, mirroring gcSlice's retention logic (aged from the
+      // terminal moment, not manifest mtime — P0).
+      if (now - t.ageAtMs < this.retentionMs || [...terminal].sort((a, b) => b.ageAtMs - a.ageAtMs).slice(0, this.retainPerWorkspace).some((x) => x.ref === t.ref)) {
         roots.add(t.ref);
       }
     }
