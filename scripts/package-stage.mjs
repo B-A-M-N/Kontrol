@@ -20,6 +20,7 @@ import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { buildToolEnvironment } from "./lib/tool-environment.mjs";
+import { ReleaseVerificationError, verifyQualifiedRelease } from "./lib/release-verify.mjs";
 
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 
@@ -39,6 +40,32 @@ const destination = option("--pack-destination");
 const explicitCandidate = option("--candidate") ? resolve(root, option("--candidate")) : undefined;
 if (explicitCandidate && !skipBuild) {
   throw new Error("--candidate is incompatible with a build: pass --skip-build --candidate <qualified-candidate-dir>");
+}
+
+// P0 (fail-closed publication): publishing is only possible for an EXACT
+// qualified candidate. The 12-hour soak qualifies one immutable artifact; a
+// fresh build has never been soaked, so the "build if necessary" branch is
+// removed from the publish path entirely. Publication requires:
+//   --publish --skip-build --candidate <qualified-candidate-dir>
+//   KONTROL_RELEASE_BUILD_ID=<qualified buildId>
+// and the full release-verify gate (combined qualified receipt, receipt
+// buildId == requested buildId, receipt SHA == HEAD, candidate buildId ==
+// requested, candidate SHA == HEAD, release-local validation, clean checkout)
+// runs before npm publish is invoked.
+if (publish || verifyOnly) {
+  if (!skipBuild) {
+    throw new Error(
+      "publication never builds: a freshly built candidate has not undergone qualification. "
+      + "Publish only an exact qualified candidate: "
+      + "--publish --skip-build --candidate <qualified-candidate-dir> with KONTROL_RELEASE_BUILD_ID set.",
+    );
+  }
+  if (!explicitCandidate) {
+    throw new Error(
+      "publication requires an explicit qualified candidate: "
+      + "--publish --skip-build --candidate <qualified-candidate-dir> with KONTROL_RELEASE_BUILD_ID set.",
+    );
+  }
 }
 
 // Release coupling: when invoked under a release buildId, the staged
@@ -107,7 +134,35 @@ if (explicitCandidate) {
   }
 }
 
-// 2. Stage the complete package tree in a temp directory.
+// 2. Fail-closed publication gate. Nothing reaches npm publish without the
+// full release-verify check of the EXACT candidate about to be staged:
+// combined qualified receipt, matching buildId, matching source SHA,
+// release-local validation, clean checkout. The staged tarball is packed from
+// this candidate, so verifying it here verifies what ships.
+if (publish) {
+  try {
+    const verified = verifyQualifiedRelease({
+      root,
+      buildId: releaseBuildId ?? buildResult.buildId,
+      receiptPath: process.env.KONTROL_BETA_RECEIPT ? resolve(root, process.env.KONTROL_BETA_RECEIPT) : undefined,
+    });
+    if (resolve(verified.candidatePath) !== resolve(candidatePath)) {
+      throw new Error(
+        `verified candidate ${verified.candidatePath} is not the staged candidate ${candidatePath}. `
+        + "Publish only the exact soak-qualified artifact.",
+      );
+    }
+    console.log(`[package-stage] publication gate passed: candidate ${verified.buildId} from ${verified.head.slice(0, 12)} is qualified`);
+  } catch (error) {
+    if (error instanceof ReleaseVerificationError) {
+      console.error(`[package-stage] PUBLICATION REFUSED: ${error.message}`);
+      process.exit(1);
+    }
+    throw error;
+  }
+}
+
+// 3. Stage the complete package tree in a temp directory.
 const packageJson = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
 const staging = mkdtempSync(join(tmpdir(), "kontrol-package-stage-"));
 const stagedPkg = join(staging, "package");
@@ -183,7 +238,7 @@ if (verifyOnly) {
   process.exit(0);
 }
 
-// 3. Pack or publish INSIDE the staged tree.
+// 4. Pack or publish INSIDE the staged tree.
 const packArgs = publish
   ? ["publish", "--access", String(stagedPackageJson.publishConfig?.access ?? "public")]
   : ["pack"];
