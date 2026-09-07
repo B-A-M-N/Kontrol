@@ -36,6 +36,9 @@ export function processOutputSchema(): z.ZodRawShape {
     // retention evicts it.
     outputCursor: z.number().int().nonnegative().optional(),
     oldestAvailableCursor: z.number().int().nonnegative().optional(),
+    // Epoch ms when the child launched. A running card advances elapsed time
+    // locally from this instead of freezing at the snapshot's wallTimeMs.
+    startedAtEpochMs: z.number().int().nonnegative().optional(),
   });
 }
 
@@ -69,6 +72,7 @@ export function processToolResponse(
       outputTruncated: snapshot.outputTruncated,
       outputCursor: snapshot.outputCursor,
       oldestAvailableCursor: snapshot.oldestAvailableCursor,
+      startedAtEpochMs: snapshot.startedAtEpochMs,
     },
   };
 }

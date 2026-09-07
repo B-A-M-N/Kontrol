@@ -72,18 +72,45 @@ export function ensureSurface(key: string): void {
   host.setRenderedSurfaceKey(key);
 }
 
+// Live running-process badges: each running badge gets a 1s local interval so
+// a card never sits frozen at its snapshot wallTimeMs while the child keeps
+// running (P1 #6). Timers are registered centrally and stopped when the
+// payload surface is torn down — a detached badge must not tick forever.
+const liveBadgeTimers = new Set<() => void>();
+
+function stopAllLiveBadges(): void {
+  for (const stop of liveBadgeTimers) stop();
+  liveBadgeTimers.clear();
+}
+
+function startLiveBadge(badge: HTMLElement, startedAtEpochMs: number): void {
+  const render = () => {
+    const elapsedMs = Math.max(0, Date.now() - startedAtEpochMs);
+    badge.textContent = `Running · ${formatElapsed(elapsedMs)}`;
+  };
+  render();
+  const timer = setInterval(render, 1_000);
+  const stop = () => clearInterval(timer);
+  liveBadgeTimers.add(stop);
+}
+
 export function renderSummaryBadge(card: ToolResultCard): HTMLElement {
   const badge = element("span", { className: "tool-badge", ariaHidden: "true" });
   if (isReviewTool(card.tool)) {
     const files = summaryNumber(card.summary, "files") ?? card.files?.length ?? 0;
     badge.textContent = files > 0 ? `${files} file${files === 1 ? "" : "s"}` : "review";
   } else if (isShellTool(card.tool) && typeof card.summary?.running === "boolean") {
-    const elapsed = formatElapsed(summaryNumber(card.summary, "wallTimeMs") ?? 0);
-    if (card.summary.running) {
-      badge.textContent = `Running · ${elapsed}`;
+    const startedAtEpochMs = summaryNumber(card.summary, "startedAtEpochMs");
+    if (card.summary.running && startedAtEpochMs !== undefined) {
+      startLiveBadge(badge, startedAtEpochMs);
     } else {
-      const exitCode = summaryNumber(card.summary, "exitCode");
-      badge.textContent = exitCode === undefined ? "Exited" : `Exited · ${exitCode}`;
+      const elapsed = formatElapsed(summaryNumber(card.summary, "wallTimeMs") ?? 0);
+      if (card.summary.running) {
+        badge.textContent = `Running · ${elapsed}`;
+      } else {
+        const exitCode = summaryNumber(card.summary, "exitCode");
+        badge.textContent = exitCode === undefined ? "Exited" : `Exited · ${exitCode}`;
+      }
     }
   } else if (card.summary?.status) {
     badge.textContent = String(card.summary.status);
@@ -97,6 +124,7 @@ export function renderSummaryBadge(card: ToolResultCard): HTMLElement {
 
 export function unmountPayload(): void {
   generation += 1;
+  stopAllLiveBadges();
   if (currentPayload) {
     try {
       currentPayload.unmount();

@@ -52,7 +52,7 @@ Object.defineProperty(dom.window.document, "fonts", {
 
 const { mountHeavyPayload } = await import("./heavy-payload.js");
 const { mountReviewPayload } = await import("./review-payload.js");
-const { renderSummaryBadge } = await import("./payload-mount.js");
+const { renderSummaryBadge, unmountPayload } = await import("./payload-mount.js");
 const { getToolDisplay } = await import("./tool-display.js");
 
 const runningProcessCard: ToolResultCard = {
@@ -66,6 +66,29 @@ const runningProcessCard: ToolResultCard = {
 };
 assert.equal(getToolDisplay(runningProcessCard).label, "npm run test:integration", "running process cards keep the command label");
 assert.equal(renderSummaryBadge(runningProcessCard).textContent, "Running · 42s", "running process cards show elapsed status");
+
+// P1 #6: a badge with startedAtEpochMs advances locally — the elapsed time
+// must move without any new snapshot, and the interval must be stopped by
+// unmountPayload.
+const liveBadgeCard: ToolResultCard = {
+  tool: "bash",
+  summary: {
+    command: "sleep 30",
+    running: true,
+    wallTimeMs: 1_000,
+    startedAtEpochMs: Date.now() - 1_000,
+  },
+  payload: { content: [{ type: "text", text: "" }] },
+};
+const liveBadge = renderSummaryBadge(liveBadgeCard);
+const firstReading = liveBadge.textContent;
+await new Promise((resolve) => setTimeout(resolve, 1_200));
+const secondReading = liveBadge.textContent;
+assert.notEqual(firstReading, secondReading, "live process badge advances locally between snapshots");
+assert.match(secondReading ?? "", /^Running · /, "live badge keeps the running format");
+unmountPayload();
+await new Promise((resolve) => setTimeout(resolve, 1_200));
+assert.equal(liveBadge.textContent, secondReading, "unmountPayload stops the live badge timer");
 
 function settle(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 25));

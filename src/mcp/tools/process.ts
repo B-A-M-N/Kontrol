@@ -133,6 +133,7 @@ export function registerCodexProcessTools(
           running: snapshot.running,
           exitCode: snapshot.exitCode,
           wallTimeMs: snapshot.wallTimeMs,
+        startedAtEpochMs: snapshot.startedAtEpochMs,
         });
       })();
 
@@ -250,6 +251,7 @@ export function registerCodexProcessTools(
         running: snapshot.running,
         exitCode: snapshot.exitCode,
         wallTimeMs: snapshot.wallTimeMs,
+        startedAtEpochMs: snapshot.startedAtEpochMs,
       });
     },
   );
@@ -318,6 +320,7 @@ export function registerProcessPollingTool(
         running: snapshot.running,
         exitCode: snapshot.exitCode,
         wallTimeMs: snapshot.wallTimeMs,
+        startedAtEpochMs: snapshot.startedAtEpochMs,
         outputCursor: snapshot.outputCursor,
         oldestAvailableCursor: snapshot.oldestAvailableCursor,
         outputTruncated: snapshot.outputTruncated,

@@ -19,7 +19,7 @@ import {
   readFileTool,
   writeFileTool,
 } from "../../pi-tools.js";
-import type { ProcessSessionManager } from "../../process-sessions.js";
+import { DEFAULT_MAX_RUNTIME_MS, type ProcessSessionManager } from "../../process-sessions.js";
 import { applyPatch, parsePatch } from "../../apply-patch.js";
 import { getGitEligibility } from "../../git.js";
 import { formatPathForPrompt } from "../../skills.js";
@@ -1130,9 +1130,12 @@ export function registerWorkspaceTools(
         timeout: z
           .number()
           .positive()
-          .max(300)
+          .max(Math.ceil((config.processMaxRuntimeMs ?? DEFAULT_MAX_RUNTIME_MS) / 1_000))
           .optional()
-          .describe("Timeout in seconds. Defaults to 30, max 300."),
+          .describe(
+            "Timeout in seconds: the child is terminated (SIGTERM, then SIGKILL) if still running. "
+            + `Defaults to 30; the ceiling is the configured process runtime limit (${Math.ceil((config.processMaxRuntimeMs ?? DEFAULT_MAX_RUNTIME_MS) / 1_000)}s).`,
+          ),
         approvalResumeId: approvalResumeIdSchema,
         clientMutationId: clientMutationIdSchema,
       },
@@ -1204,6 +1207,7 @@ export function registerWorkspaceTools(
             running: snapshot.running,
             exitCode: snapshot.exitCode,
             wallTimeMs: snapshot.wallTimeMs,
+            startedAtEpochMs: snapshot.startedAtEpochMs,
           });
         } catch (error) {
           return { content: [textBlock(error instanceof Error ? error.message : String(error))], isError: true };

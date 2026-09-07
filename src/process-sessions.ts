@@ -3,7 +3,10 @@ import { spawn } from "node:child_process";
 import { resolveShellCommand, terminateProcessTree } from "./process-platform.js";
 import { buildChildEnvironment } from "./process-environment.js";
 
-const DEFAULT_EXEC_YIELD_MS = 10_000;
+// P1: detachment exists to return control (and a live process card) to the
+// reviewer quickly; a 10s request hold is long enough to trip intermediary
+// timeouts and makes the UI feel absent on short long-running operations.
+const DEFAULT_EXEC_YIELD_MS = 2_000;
 // A stdin write commonly wakes a shell/child before the child performs its
 // final output and exit. 250 ms is too short under ordinary machine load and
 // causes callers to receive a misleading still-running snapshot. Callers that
@@ -12,14 +15,13 @@ const DEFAULT_INTERACTIVE_YIELD_MS = 1_000;
 const DEFAULT_POLL_YIELD_MS = 5_000;
 const MAX_COMMAND_YIELD_MS = 30_000;
 const MAX_POLL_YIELD_MS = 110_000;
-const MAX_COMMAND_TIMEOUT_MS = 300_000;
 const DEFAULT_MAX_OUTPUT_TOKENS = 10_000;
 const DEFAULT_BUFFER_CHARACTERS = 1_000_000;
 const COMPLETED_SESSION_TTL_MS = 5 * 60 * 1_000;
 const DEFAULT_MAX_RUNNING_PROCESSES = 64;
 const DEFAULT_MAX_RUNNING_PROCESSES_PER_OWNER = 8;
 const DEFAULT_IDLE_TIMEOUT_MS = 15 * 60 * 1_000;
-const DEFAULT_MAX_RUNTIME_MS = 60 * 60 * 1_000;
+export const DEFAULT_MAX_RUNTIME_MS = 60 * 60 * 1_000;
 const DEFAULT_REAPER_INTERVAL_MS = 30_000;
 const DEFAULT_COLUMNS = 80;
 const DEFAULT_ROWS = 24;
@@ -36,7 +38,9 @@ export interface StartCommandInput {
   rows?: number;
   yieldTimeMs?: number;
   maxOutputTokens?: number;
-  /** Optional per-command child lifetime; this never extends the MCP request. */
+  /** Optional per-command child lifetime; this never extends the MCP request.
+   *  Bounded by the manager's configured max runtime (processMaxRuntimeMs),
+   *  not a hard-coded constant. */
   timeoutMs?: number;
   /** Stable caller identity for exact launch retries. Scoped to ownerId. */
   clientMutationId?: string;
@@ -74,6 +78,9 @@ export interface ProcessSnapshot {
   outputCursor: number;
   /** Oldest cursor still retained; earlier ranges have been evicted. */
   oldestAvailableCursor: number;
+  /** Epoch ms when the child was launched; lets a UI advance elapsed time
+   *  locally between polls (P1: live process-card elapsed). */
+  startedAtEpochMs: number;
 }
 
 interface ManagedProcess {
@@ -419,7 +426,11 @@ export class ProcessSessionManager {
     try {
       if (input.tty && process.platform !== "win32") await this.startPty(session, input);
       else this.startPipe(session, input);
-      const timeoutMs = boundedInteger(input.timeoutMs, 0, MAX_COMMAND_TIMEOUT_MS);
+      // P1: a user-supplied child lifetime is bounded by the SAME configured
+      // process-runtime ceiling the reaper enforces (processMaxRuntimeMs) —
+      // never by a hard-coded constant. An explicit timeout can only shorten
+      // (or, up to the ceiling, extend) the manager's own max-runtime kill.
+      const timeoutMs = boundedInteger(input.timeoutMs, 0, this.maxRuntimeMs);
       if (timeoutMs > 0) {
         session.timeoutTimer = setTimeout(() => {
           if (!session.running) return;
@@ -731,6 +742,7 @@ export class ProcessSessionManager {
       wallTimeMs: Date.now() - session.startedAt,
       outputCursor: read.nextCursor,
       oldestAvailableCursor: read.oldestAvailableCursor,
+      startedAtEpochMs: session.startedAt,
     };
     if (!snapshot.running && session.launchKey) {
       const launch = this.launches.get(session.launchKey);

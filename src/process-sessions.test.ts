@@ -506,4 +506,54 @@ try {
   }
 }
 
+// ── Per-command lifetime derives from the configured runtime ceiling (P1) ──
+{
+  const lifetimeManager = new ProcessSessionManager({
+    maxBufferCharacters: 10_000,
+    // A 400ms configured ceiling: an explicit timeout above the old 300s
+    // hard cap must be accepted here because the ceiling allows it, while
+    // the ceiling still kills runaway children.
+    maxRuntimeMs: 400,
+    reaperIntervalMs: 25,
+  });
+  try {
+    // timeoutMs far beyond the removed 300_000 hard constant: accepted.
+    const longTimeout = await lifetimeManager.start({
+      workspaceId: "workspace-lifetime",
+      ownerId: "owner-lifetime",
+      cwd: process.cwd(),
+      command: `${node} -e "setTimeout(() => { console.log('alive'); process.exit(0); }, 150)"`,
+      timeoutMs: 3_600_000,
+      yieldTimeMs: 10,
+    });
+    // The reaper's maxRuntimeMs (400ms) terminates the child regardless of
+    // the generous explicit timeout — lifetime policy stays authoritative.
+    let lifetimeSnapshot = longTimeout;
+    for (let i = 0; i < 40 && lifetimeSnapshot.running; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      lifetimeSnapshot = await lifetimeManager.write({
+        workspaceId: "workspace-lifetime",
+        sessionId: longTimeout.sessionId!,
+        ownerId: "owner-lifetime",
+        yieldTimeMs: 50,
+      });
+    }
+    assert.equal(lifetimeSnapshot.running, false, "configured ceiling kills a child despite a longer explicit timeout");
+    // Negative timeout is rejected, as before.
+    await assert.rejects(
+      lifetimeManager.start({
+        workspaceId: "workspace-lifetime",
+        ownerId: "owner-lifetime",
+        cwd: process.cwd(),
+        command: "true",
+        timeoutMs: -1,
+        yieldTimeMs: 10,
+      }),
+      /non-negative/,
+    );
+  } finally {
+    await lifetimeManager.shutdown();
+  }
+}
+
 console.log("process-sessions.test.ts: all assertions passed");
