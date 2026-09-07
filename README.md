@@ -339,6 +339,7 @@ For a normal session:
 - [Coding Workflow](https://github.com/B-A-M-N/Kontrol/blob/main/docs/chatgpt-coding-workflow.md)
 - [Configuration Reference](https://github.com/B-A-M-N/Kontrol/blob/main/docs/configuration.md)
 - [Security Model](https://github.com/B-A-M-N/Kontrol/blob/main/docs/security.md)
+- [Release Contract](https://github.com/B-A-M-N/Kontrol/blob/main/docs/release.md)
 - [Troubleshooting](https://github.com/B-A-M-N/Kontrol/blob/main/docs/gotchas.md)
 
 ## Platform Support
