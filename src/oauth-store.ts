@@ -9,6 +9,17 @@ import { openDatabase, type DatabaseHandle } from "./db/client.js";
  * tokens) are compacted by the periodic maintenance sweep.
  */
 export const CLIENT_RETENTION_SECONDS = 30 * 24 * 60 * 60;
+/**
+ * P1 (audit): hard ceiling on dynamic client registrations. The store never
+ * holds more than this many clients: registrations in active token use always
+ * count first, and new registrations beyond the remaining headroom are
+ * rejected (existing clients keep working). A short unused-grace sweep before
+ * every registration reclaims abandoned entries under sustained pressure.
+ */
+export const MAX_OAUTH_CLIENTS = 200;
+/** Unused dynamic registrations younger than this are not yet compacted by
+ * the pre-registration sweep (protects a client mid-authorization). */
+export const DCR_UNUSED_GRACE_SECONDS = 24 * 60 * 60;
 
 export interface PersistedAccessTokenRecord {
   clientId: string;
@@ -78,7 +89,28 @@ export class SqliteOAuthStore {
       throw new InvalidRequestError("Client redirect_uri is not allowed for this Kontrol server");
     }
 
+    // P1 (audit): the MCP SDK's per-IP DCR rate limit does not provide a
+    // durable storage invariant against distributed or long-running abuse —
+    // unused registrations otherwise survive CLIENT_RETENTION_SECONDS and
+    // SQLite growth stays purely time-based. Before every registration:
+    // first compact unused clients past a short grace, then enforce a hard
+    // ceiling. Sustained pressure above the ceiling rejects NEW registrations
+    // (existing clients keep working) instead of letting the store grow.
     const now = Math.floor(Date.now() / 1000);
+    this.database.sqlite.prepare(`
+      delete from oauth_clients
+       where issued_at < ?
+         and client_id not in (select distinct client_id from oauth_access_tokens)
+         and client_id not in (select distinct client_id from oauth_refresh_tokens)
+    `).run(now - DCR_UNUSED_GRACE_SECONDS);
+
+    const total = this.database.sqlite.prepare("select count(*) as count from oauth_clients").get() as { count: number };
+    if (Number(total.count) >= MAX_OAUTH_CLIENTS) {
+      throw new InvalidRequestError(
+        `OAuth client registration limit reached (${MAX_OAUTH_CLIENTS}); existing clients keep working. Contact the operator.`,
+      );
+    }
+
     const registered: OAuthClientInformationFull = {
       ...client,
       client_id: `kontrol-${randomUUID()}`,
