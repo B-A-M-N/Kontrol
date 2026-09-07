@@ -50,6 +50,17 @@ function newFailureTracker(): FailureTracker {
   return { count: 0, firstFailureAtMs: 0, lockedUntilMs: 0 };
 }
 
+/** Advance a tracker's sliding window with one failure. The lockout decision
+ * itself belongs to the caller (per-key and global thresholds differ). */
+function advanceFailureWindow(t: FailureTracker, nowMs: number): void {
+  if (t.count === 0 || nowMs - t.firstFailureAtMs > AUTH_LOCKOUT_MS) {
+    t.firstFailureAtMs = nowMs;
+    t.count = 1;
+  } else {
+    t.count++;
+  }
+}
+
 function randomToken(): string {
   return randomBytes(32).toString("base64url");
 }
@@ -178,22 +189,30 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     return tracker.lockedUntilMs > nowMs || tracker.count >= AUTH_MAX_FAILURES;
   }
 
+  /** Failures observed globally since the last window reset (diagnostics and
+   * tests: the global tracker is private by design). */
+  get globalFailureCount(): number {
+    return this.globalFailures.count;
+  }
+
   recordFailure(key: string, nowMs = Date.now()): void {
-    for (const tracker of [this.failures.get(key), this.globalFailures]) {
-      const t = tracker ?? newFailureTracker();
-      if (!tracker) this.failures.set(key, t);
-      if (t.count === 0 || nowMs - t.firstFailureAtMs > AUTH_LOCKOUT_MS) {
-        t.firstFailureAtMs = nowMs;
-        t.count = 1;
-      } else {
-        t.count++;
-      }
-      if (t.count >= AUTH_MAX_FAILURES) {
-        t.lockedUntilMs = nowMs + AUTH_LOCKOUT_MS;
-      }
+    // Per-key tracker: locks at AUTH_MAX_FAILURES.
+    let tracker = this.failures.get(key);
+    if (!tracker) {
+      tracker = newFailureTracker();
+      this.failures.set(key, tracker);
     }
-    if (this.globalFailures.count >= AUTH_GLOBAL_MAX_FAILURES) {
-      this.globalFailures.lockedUntilMs = nowMs + AUTH_LOCKOUT_MS;
+    advanceFailureWindow(tracker, nowMs);
+    if (tracker.count >= AUTH_MAX_FAILURES) {
+      tracker.lockedUntilMs = nowMs + AUTH_LOCKOUT_MS;
+    }
+    // Global tracker: independent window and its own threshold — the global
+    // ceiling exists to stop distributed brute force, not to punish five
+    // failures against one key (which the per-key tracker already locks).
+    const global = this.globalFailures;
+    advanceFailureWindow(global, nowMs);
+    if (global.count >= AUTH_GLOBAL_MAX_FAILURES) {
+      global.lockedUntilMs = nowMs + AUTH_LOCKOUT_MS;
     }
   }
 
