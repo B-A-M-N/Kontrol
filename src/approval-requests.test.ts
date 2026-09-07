@@ -60,7 +60,10 @@ try {
   const database = openDatabase(root);
   const workspaceStore = new SqliteWorkspaceStore(database);
   const workspace = workspaceStore.createSession({ id: "ws-approval-lifecycle", root: "/tmp/approval-lifecycle" });
-  const SHORT_TTL_MS = 80;
+  // The reattachment grace must be comfortably inside the human TTL so gate
+  // load cannot collapse the ordering the assertions depend on: the window is
+  // a diagnostic (survivable), the TTL is the real cancellation path.
+  const SHORT_TTL_MS = 5_000;
   const GRACE_MS = 40;
   const approvals = createApprovalRequestManager(database, {
     directToolApprovalTtlMs: SHORT_TTL_MS,
@@ -100,7 +103,7 @@ try {
       "the reattachment window must never cancel a pending human decision");
 
     // The human TTL is what ends an undecided direct approval.
-    await new Promise((resolve) => setTimeout(resolve, SHORT_TTL_MS));
+    await new Promise((resolve) => setTimeout(resolve, SHORT_TTL_MS + 100));
     const expiredList = approvals.expirePending();
     assert.ok(expiredList.some((approval) => approval.approvalId === direct.approvalId),
       "the human TTL (expirePending) must be the automatic cancellation path");
