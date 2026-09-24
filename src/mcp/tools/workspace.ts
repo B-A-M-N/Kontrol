@@ -6,6 +6,7 @@
  */
 import * as z from "zod/v4";
 import { createHash } from "node:crypto";
+import { relative } from "node:path";
 import { brandWorkSessionId, brandWorkspaceId } from "../../branded.js";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -22,7 +23,7 @@ import {
 } from "../../pi-tools.js";
 import { DEFAULT_MAX_RUNTIME_MS, type ProcessSessionManager } from "../../process-sessions.js";
 import { applyPatch, parsePatch } from "../../apply-patch.js";
-import { getGitEligibility } from "../../git.js";
+import { getGitEligibility, git } from "../../git.js";
 import { formatPathForPrompt } from "../../skills.js";
 import { formatAgentsPath, type WorkspaceRegistry } from "../../workspaces.js";
 import type { createReviewCheckpointManager } from "../../review-checkpoints.js";
@@ -100,6 +101,17 @@ function instructionsRequiredResponse(
     _meta: { tool, card: { workspaceId, path, status: "instructions_required", summary: { instructionContentHash: hash, files: files.length }, payload: { content: instructionContent(files, root) } } },
     structuredContent: { tool, status: "instructions_required", instructionsRequired: true, instructionContentHash: hash, result: contentText([...instructionContent(files, root), textBlock(content)]) },
   };
+}
+
+function boundedGitText(value: string, limit = 256_000): string {
+  return value.length <= limit ? value : `${value.slice(0, limit)}\n[truncated]`;
+}
+
+function gitPathArg(workspaces: WorkspaceRegistry, workspace: ReturnType<WorkspaceRegistry["getWorkspace"]>, path?: string): string[] {
+  if (path === undefined || path === "") return [];
+  const resolved = workspaces.resolvePath(workspace, path);
+  const relativePath = workspace.root === resolved ? "." : relative(workspace.root, resolved);
+  return ["--", relativePath || "."];
 }
 
 export function registerWorkspaceTools(
@@ -1251,6 +1263,61 @@ export function registerWorkspaceTools(
       },
     );
   }
+
+  const registerGitInspection = (
+    name: typeof toolNames.gitStatus | typeof toolNames.gitLog | typeof toolNames.gitDiff | typeof toolNames.gitShow,
+    title: string,
+    description: string,
+    inputSchema: Record<string, z.ZodTypeAny>,
+    run: (workspaceRoot: string, path: string | undefined, input: Record<string, unknown>) => Promise<string>,
+  ) => {
+    registerAppTool(server, registeredTool(name), {
+      title,
+      description,
+      inputSchema: {
+        workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
+        path: z.string().optional().describe("Optional path relative to the workspace root."),
+        ...inputSchema,
+      },
+      outputSchema: resultOutputSchema(),
+      _meta: {},
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    }, async ({ workspaceId, path: requestedPath, ...input }) => {
+      const startedAt = performance.now();
+      const workspace = workspaces.getWorkspace(workspaceId);
+      const pathArgs = gitPathArg(workspaces, workspace, requestedPath);
+      const output = await run(workspace.root, pathArgs.length ? requestedPath : undefined, input as Record<string, unknown>);
+      const content = [textBlock(boundedGitText(output))];
+      logToolCall(config, { tool: name, workspaceId, path: requestedPath, success: true, durationMs: Math.round(performance.now() - startedAt) });
+      trackToolEvent(workspaceId, name, { path: requestedPath, ...input }, { content, isError: false }, startedAt);
+      return { content, structuredContent: { tool: name, result: boundedGitText(output) }, _meta: { tool: name, card: { workspaceId, path: requestedPath, payload: { content } } } };
+    });
+  };
+
+  registerGitInspection(toolNames.gitStatus, "Git status", "Read-only short Git status for an open workspace; never requires shell approval.", {}, async (root, path) => {
+    const result = await git(root, ["status", "--short", "--branch", "--untracked-files=all", ...(path ? ["--", path] : [])], { maxBuffer: 262_144, timeoutMs: 15_000 });
+    return result.stdout || "(clean)";
+  });
+  registerGitInspection(toolNames.gitLog, "Git log", "Read-only bounded Git history for an open workspace.", { limit: z.number().int().min(1).max(100).optional() }, async (root, path, input) => {
+    const limit = Number(input.limit ?? 20);
+    const result = await git(root, ["log", `--max-count=${limit}`, "--date=iso-strict", "--format=%H%x09%ad%x09%an%x09%s", ...(path ? ["--", path] : [])], { maxBuffer: 262_144, timeoutMs: 15_000 });
+    return result.stdout || "(no commits)";
+  });
+  registerGitInspection(toolNames.gitDiff, "Git diff", "Read-only unified diff for an open workspace. Use git show for committed file content.", { staged: z.boolean().optional() }, async (root, path, input) => {
+    const args = ["diff", "--no-ext-diff", "--unified=3"];
+    if (input.staged === true) args.push("--cached");
+    if (path) args.push("--", path);
+    const result = await git(root, args, { maxBuffer: 262_144, timeoutMs: 15_000 });
+    return result.stdout || "(no diff)";
+  });
+  registerGitInspection(toolNames.gitShow, "Git show", "Read-only bounded Git object or file view for an open workspace.", { revision: z.string().regex(/^[A-Za-z0-9._/~^@{}-]+$/).default("HEAD") }, async (root, path, input) => {
+    const revision = String(input.revision ?? "HEAD");
+    const args = ["show", "--no-ext-diff", "--no-textconv", "--format=fuller", revision];
+    if (path) args.push("--", path);
+    else args.push("--no-patch", "--stat");
+    const result = await git(root, args, { maxBuffer: 262_144, timeoutMs: 15_000 });
+    return result.stdout || "(empty object)";
+  });
 
   if (config.toolMode !== "codex") {
   registerAppTool(

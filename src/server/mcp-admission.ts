@@ -19,7 +19,7 @@ export interface McpAdmissionWaiter {
 export function mcpAdmissionWeight(rpcMethod: string | undefined, toolName: string | undefined): number {
   if (rpcMethod !== "tools/call") return 1;
   if (toolName === "show_changes" || toolName === "run_mission_verification") return 4;
-  if (toolName === "grep" || toolName === "glob" || toolName === "find" || toolName === "list_pending_reviews") return 2;
+  if (toolName === "grep" || toolName === "glob" || toolName === "find" || toolName === "list_pending_reviews" || (toolName !== undefined && toolName.startsWith("git_"))) return 2;
   if (toolName === "bash" || toolName === "exec_command" || toolName === "write_stdin" || toolName === "write" || toolName === "edit" || toolName === "apply_patch") return 3;
   return 1;
 }

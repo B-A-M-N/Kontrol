@@ -38,7 +38,7 @@ try {
 
 assert.throws(
   () => assertRequiredInspectionTools(new Set([REQUIRED_INSPECTION_TOOLS[0]])),
-  /missing required inspection tool\(s\): grep, glob, ls/,
+  /missing required inspection tool\(s\): grep, glob, ls, git_status, git_log, git_diff, git_show/,
   "the contract assertion must fail closed when a required tool is omitted",
 );
 
@@ -93,7 +93,7 @@ try {
         `${mode} MCP initialize must advertise the runtime tool-surface version`);
       const listed = await client.listTools();
       const names = new Set(listed.tools.map((tool) => tool.name));
-      for (const name of ["read", "grep", "glob", "ls"]) {
+      for (const name of ["read", "grep", "glob", "ls", "git_status", "git_log", "git_diff", "git_show"]) {
         assert.ok(names.has(name), `${mode} must expose required inspection tool ${name}`);
       }
       for (const name of expectation.present) {
@@ -107,7 +107,7 @@ try {
         arguments: { path: workspaceRoot, mode: "checkout" },
       });
       const openedSurface = (opened.structuredContent as { toolSurface?: { version?: string; requiredInspectionTools?: string[] }; instruction?: string } | undefined);
-      assert.deepEqual(openedSurface?.toolSurface?.requiredInspectionTools, ["read", "grep", "glob", "ls"],
+      assert.deepEqual(openedSurface?.toolSurface?.requiredInspectionTools, ["read", "grep", "glob", "ls", "git_status", "git_log", "git_diff", "git_show"],
         `${mode} open_workspace must return the required inspection surface`);
       assert.equal(typeof openedSurface?.toolSurface?.version, "string",
         `${mode} open_workspace must return the MCP surface version`);
@@ -124,3 +124,50 @@ try {
 }
 
 console.log("mcp-tool-surface-contract.test.ts: all assertions passed");
+
+const gitRoot = process.cwd();
+{
+  await createMcpServerForGitFixture();
+}
+
+async function createMcpServerForGitFixture(): Promise<void> {
+  const config = loadConfig({
+    KONTROL_CONFIG_DIR: join(gitRoot, ".kontrol-test-config-git-tools"),
+    KONTROL_ALLOWED_ROOTS: gitRoot,
+    KONTROL_STATE_DIR: join(gitRoot, ".kontrol-test-state-git-tools"),
+    KONTROL_WORKTREE_ROOT: join(gitRoot, ".kontrol-test-worktrees-git-tools"),
+    KONTROL_AUTH_MODE: "tunnel",
+    KONTROL_TUNNEL_REVIEWER_SECRET: "fixture-reviewer-secret",
+    KONTROL_ACP_ENABLED: "false",
+    KONTROL_POLICY_MODE: "ask",
+    KONTROL_LOG_LEVEL: "error",
+    KONTROL_WIDGETS: "off",
+    KONTROL_TOOL_MODE: "full",
+  });
+  const workspaces = new WorkspaceRegistry(config);
+  const checkpoints = createReviewCheckpointManager({ snapshotStoreRoot: join(gitRoot, ".kontrol-test-snapshots-git-tools") });
+  const processes = new ProcessSessionManager({ childEnvironmentAllowlist: [] });
+  const server = createMcpServer(config, workspaces, checkpoints, processes);
+  const client = new Client({ name: "git-tools-test", version: "1.0.0" });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+  try {
+    const opened = await client.callTool({ name: "open_workspace", arguments: { path: gitRoot, mode: "checkout" } });
+    const workspaceId = (opened.structuredContent as { workspaceId: string }).workspaceId;
+    for (const [name, args] of [
+      ["git_status", {}], ["git_log", { limit: 5 }],
+      ["git_diff", {}], ["git_show", { revision: "HEAD" }],
+    ] as const) {
+      const result = await client.callTool({ name, arguments: { workspaceId, ...args } });
+      assert.notEqual(result.isError, true, `${name} should not fail`);
+      assert.notEqual((result.structuredContent as { status?: string }).status, "approval_required", `${name} must not prompt`);
+    }
+  } finally {
+    await client.close();
+    await server.close();
+    await checkpoints.drain();
+    rmSync(join(gitRoot, ".kontrol-test-config-git-tools"), { recursive: true, force: true });
+    rmSync(join(gitRoot, ".kontrol-test-state-git-tools"), { recursive: true, force: true });
+    rmSync(join(gitRoot, ".kontrol-test-snapshots-git-tools"), { recursive: true, force: true });
+  }
+}
