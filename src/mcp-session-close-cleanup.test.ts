@@ -1,18 +1,9 @@
-// P1 — transport close cleanup must use the callback-bound session ID.
+// P1 — transport close cleanup must use the callback-bound session ID, while
+// individual HTTP/SSE response loss must not close the shared MCP transport.
 //
-// `onsessioninitialized` captured the assigned session ID when the transport
-// was created, but `transport.onclose` re-read `transport?.sessionId`, which
-// the SDK is not required to expose at close time. When it is unavailable the
-// close callback silently skipped waiter cancellation, continuity detach,
-// process ownership cleanup, metric recording, and both map deletions, so the
-// session record leaked until its 24h TTL. Cleanup is centralized in one
-// finalizeMcpSession(sessionId, reason) primitive used by both the normal
-// close path and the reaper, and the close path prefers the callback-bound ID.
-//
-// The observable contract from the outside: after a transport closes, its
-// session disappears from the diagnostics session list (map cleanup ran) and
-// its logical continuity record shows the detach, even when the transport's
-// own sessionId property is no longer populated.
+// Explicit DELETE, shutdown, and expiry terminate a session through the
+// callback-bound ID. A client closing one GET SSE response only ends that
+// request; subsequent POSTs and reconnects on the same session remain valid.
 
 import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
@@ -125,27 +116,55 @@ try {
     (record: any) => record.identity === "conversation:close-orderly" && record.activeTransportCount === 0,
   ), "close must detach logical continuity for the closed transport");
 
-  // A raw socket loss (SSE body cancelled) exercises the same cleanup path
-  // without an orderly DELETE, which is the shape that most often left the
-  // transport's own sessionId property unavailable.
+  // Closing one GET SSE response is not session termination. The shared MCP
+  // transport remains usable for other concurrent requests and reconnects.
   const socketLoss = await openSession("close-socket-loss");
   const stream = await fetch(url, {
     headers: { accept: "text/event-stream", "mcp-session-id": socketLoss },
   });
   assert.equal(stream.status, 200);
   await stream.body?.cancel();
-  await waitFor(async () => !hasSession(await diagnostics(), socketLoss),
-    4_000, "socket-loss close to clean up the session record");
+  await waitFor(async () => (await diagnostics()).mcpSessionMetrics.activeSseStreams === 0,
+    4_000, "socket-loss stream accounting to settle");
   const afterSocketLoss = await diagnostics();
-  assert.ok(!hasSession(afterSocketLoss, socketLoss),
-    `socket-loss close must clean up via the callback-bound ID; sessions: ${JSON.stringify(afterSocketLoss.mcpSessionMetrics?.sessions?.map((s: any) => s.sessionLabel))}`);
-  assert.ok((afterSocketLoss.mcpSessionMetrics?.logicalContinuity?.records ?? []).some(
-    (record: any) => record.identity === "conversation:close-socket-loss" && record.activeTransportCount === 0,
-  ), "socket-loss close must detach logical continuity");
+  assert.ok(hasSession(afterSocketLoss, socketLoss), "SSE disconnect must not remove the MCP session");
+  const afterDisconnect = await rpc("tools/list", {}, socketLoss, "close-socket-loss");
+  assert.equal(afterDisconnect.response.status, 200, "tools/list must succeed after an SSE disconnect");
+  assert.ok(afterDisconnect.payload?.result?.tools, "tools/list must return the session tool catalog");
 
-  // A closed transport is genuinely gone: further requests are unknown-session.
-  const stale = await rpc("tools/list", {}, socketLoss, "close-socket-loss");
-  assert.equal(stale.response.status, 404, "a cleaned-up session must not still resolve requests");
+  // A stream disconnect while a POST is executing must not destroy the
+  // transport underneath that request. The command completes and the same
+  // session can still service a later call.
+  const concurrentSession = await openSession("close-concurrent-post");
+  const concurrentWorkspace = await rpc("tools/call", {
+    name: "open_workspace",
+    arguments: { path: root, mode: "checkout" },
+  }, concurrentSession);
+  assert.equal(concurrentWorkspace.response.status, 200, JSON.stringify(concurrentWorkspace.payload));
+  const concurrentWorkspaceId = (concurrentWorkspace.payload?.result?.structuredContent ?? concurrentWorkspace.payload?.result)?.workspaceId;
+  assert.equal(typeof concurrentWorkspaceId, "string");
+  const concurrentStream = await fetch(url, {
+    headers: { accept: "text/event-stream", "mcp-session-id": concurrentSession },
+  });
+  assert.equal(concurrentStream.status, 200);
+  const pendingPost = rpc("tools/call", {
+    name: "bash",
+    arguments: { workspaceId: concurrentWorkspaceId, command: "sleep 1; printf concurrent-post-ok", timeout: 5 },
+  }, concurrentSession);
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  await concurrentStream.body?.cancel();
+  const completedPost = await pendingPost;
+  assert.equal(completedPost.response.status, 200, JSON.stringify(completedPost.payload));
+  assert.notEqual(completedPost.payload?.result?.isError, true, JSON.stringify(completedPost.payload));
+  const afterConcurrent = await rpc("tools/list", {}, concurrentSession, "close-concurrent-post");
+  assert.equal(afterConcurrent.response.status, 200, "concurrent POST must leave the session usable");
+
+  // Explicit DELETE remains the terminal session-close path.
+  for (const sessionId of [socketLoss, concurrentSession]) {
+    const deleted = await fetch(url, { method: "DELETE", headers: { "mcp-session-id": sessionId } });
+    assert.ok([200, 202, 204].includes(deleted.status), `DELETE returned ${deleted.status}`);
+    await waitFor(async () => !hasSession(await diagnostics(), sessionId), 4_000, "explicit session close");
+  }
 
   console.log("mcp-session-close-cleanup.test.ts: all assertions passed");
 } finally {

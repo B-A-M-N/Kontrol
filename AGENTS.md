@@ -15,6 +15,11 @@ primitives such as read, edit, write, grep, find, ls, and bash. Kontrol wraps
 those primitives behind a remote Streamable HTTP MCP interface, suitable for use
 through a Cloudflare Tunnel.
 
+Workspace records identify the shared project/root and checkpoint state;
+conversation-sensitive instruction discovery, skill activation, active
+work-session attribution, and UI selection belong to the owning MCP session
+context. A shared workspace ID must not cross that boundary.
+
 The model-facing workflow is workspace based. MCP clients should call
 `open_workspace` once per local project directory or worktree, then reuse the
 returned `workspaceId` for subsequent tool calls in that same folder. Do not
@@ -195,6 +200,12 @@ Current implementation contracts:
   stale metadata cannot be reused for a new release identity.
   `generation.json` owns active, previous, and last-known-good artifacts; those
   pointers rotate only after readiness is proven.
+- The MCP tool surface has a mandatory structured inspection contract:
+  `read`, `grep`, `glob`, and `ls` are registered and verified in every tool
+  mode. The server version includes the immutable artifact content identity;
+  `open_workspace`, authenticated diagnostics, and `generation.json` expose
+  the surface identity, and clients with a stale catalog must establish a
+  fresh MCP initialize rather than substitute shell inspection.
 - Periodic and startup reconciliation is bounded by pages/cursors so runtime
   state, approval expiry, direct-approval orphan cleanup, and telemetry work
   cannot become an unbounded synchronous serving-thread sweep.
@@ -252,7 +263,9 @@ MCP context isolation:
 - Track transport activity separately from meaningful application activity;
   keep-alive/SSE activity must not extend application idle policy. Never reap
   active requests, streams, long polls, policy waiters, or durable work-session
-  responsibilities. Generic direct process ownership may end with its
+  responsibilities. A single GET SSE response ending only releases that
+  stream; it must not close the shared MCP transport or invalidate concurrent
+  requests. Generic direct process ownership may end with its
   transport; trusted logical continuity can own interactive direct processes,
   and durable work-session ownership survives transport reconnect. When trusted
   continuity expires or is pressure-evicted, its logical direct process owner
@@ -260,3 +273,14 @@ MCP context isolation:
 - Link workspaces, reviews, continuations, and missions through their explicit
   durable IDs. Do not infer that separate MCP transports represent the same
   conversation, even when they access the same project concurrently.
+- Workspace event cursors advance across every inspected workspace event,
+  including events filtered out by conversation ownership. Conversation-scoped
+  reviewers receive only their own work-session surface; ownerless reviewers
+  retain the explicit global recovery surface. Real HTTP reviewer connections
+  must resolve a live transport identity; event waiters cancel their
+  subscriptions when the request aborts.
+- Unsupported widget resource hashes are rejected. The retained static widget
+  cache is bounded by entries and bytes and is reported in diagnostics.
+- `write`, `edit`, and `apply_patch` return `instructions_required` with the
+  full nested instruction contents and content hash before any mutation when
+  governing instructions have not been acknowledged by that transport.

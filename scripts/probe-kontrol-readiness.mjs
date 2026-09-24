@@ -3,6 +3,7 @@
 // This intentionally exercises the same boundary that Devdesktop uses:
 // initialize -> tools/list -> discover_agents -> open_workspace -> structured read-only tools.
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 const args = process.argv.slice(2);
@@ -15,6 +16,8 @@ const url = flag("--url", "http://127.0.0.1:7676/mcp");
 const workspace = resolve(flag("--workspace", process.cwd()));
 const skipDiscover = args.includes("--skip-discover");
 const probeBash = args.includes("--probe-bash");
+const buildMetaPath = flag("--build-meta", undefined);
+const expectedMcpVersion = flag("--expected-mcp-version", undefined);
 const agentSpecs = args
   .map((value, index) => value === "--agent" ? args[index + 1] : undefined)
   .filter(Boolean)
@@ -23,7 +26,15 @@ const agentSpecs = args
     if (separator < 1 || separator === value.length - 1) throw new Error(`Invalid --agent ${value}; expected name=url`);
     return { name: value.slice(0, separator), url: value.slice(separator + 1) };
   });
-if (!url || !workspace) throw new Error("usage: probe-kontrol-readiness.mjs --url URL --workspace PATH [--agent name=url]");
+if (!url || !workspace) throw new Error("usage: probe-kontrol-readiness.mjs --url URL --workspace PATH [--agent name=url] [--build-meta PATH]");
+
+let immutableServerVersion = expectedMcpVersion;
+if (!immutableServerVersion && buildMetaPath) {
+  const buildMeta = JSON.parse(readFileSync(resolve(buildMetaPath), "utf8"));
+  if (typeof buildMeta.version === "string" && typeof buildMeta.contentSha256 === "string") {
+    immutableServerVersion = `${buildMeta.version}+${buildMeta.contentSha256}`;
+  }
+}
 
 const token = process.env.KONTROL_TUNNEL_TOKEN;
 const reviewerToken = process.env.KONTROL_ACP_REVIEWER_SECRET;
@@ -93,18 +104,32 @@ const readyBody = await jsonOrText(readyResponse);
 assert.equal(readyResponse.status, 200, `readyz returned HTTP ${readyResponse.status}: ${JSON.stringify(readyBody)}`);
 assert.ok(readyBody.ready === true || readyBody.text === "ready", "KONTROL/tunnel is not ready");
 
-await rpc("initialize", {
+const initialized = await rpc("initialize", {
   protocolVersion: "2025-06-18",
   capabilities: {},
   clientInfo: { name: "kontrol-readiness-probe", version: "1" },
 }, { withSession: false });
 assert.ok(sessionId, "initialize did not provide an MCP session id");
+if (immutableServerVersion) {
+  assert.equal(initialized?.serverInfo?.version, immutableServerVersion,
+    `initialize server version does not match immutable build metadata: ${JSON.stringify(initialized?.serverInfo)}`);
+}
 
 const listedTools = await rpc("tools/list", {});
-const publicToolNames = new Set((listedTools?.tools ?? []).map((tool) => tool.name));
-for (const requiredTool of ["read", "grep", "glob", "ls"]) {
+const toolsByName = new Map((listedTools?.tools ?? []).map((tool) => [tool.name, tool]));
+const publicToolNames = new Set(toolsByName.keys());
+for (const requiredTool of ["read", "grep", "glob", "ls", "poll_process"]) {
   assert.ok(publicToolNames.has(requiredTool), `public MCP tools/list is missing ${requiredTool}`);
+  if (requiredTool !== "poll_process") {
+    assert.equal(toolsByName.get(requiredTool)?.annotations?.readOnlyHint, true,
+      `${requiredTool} must be advertised as read-only`);
+  }
 }
+assert.doesNotMatch(
+  toolsByName.get("bash")?.description ?? "",
+  /minimal tool mode.*disabled/i,
+  "bash must not advertise the obsolete minimal-mode search-tool restriction",
+);
 
 const discovered = skipDiscover ? { agents: [] } : await callTool("discover_agents", {});
 const agents = discovered?.agents ?? [];
@@ -118,13 +143,25 @@ for (const expected of agentSpecs) {
 
 const opened = await callTool("open_workspace", { path: workspace, mode: "checkout" });
 assert.ok(opened?.workspaceId, "open_workspace did not return workspaceId");
+assert.deepEqual(opened?.toolSurface?.requiredInspectionTools, ["read", "grep", "glob", "ls"],
+  "open_workspace must return the canonical required inspection surface");
+assert.match(opened?.instruction ?? "", /client catalog is stale.*fresh MCP tool surface/i,
+  "open_workspace must explain how to handle a stale client catalog");
+function assertNoApprovalRequired(name, result) {
+  assert.notEqual(result?.status, "approval_required",
+    `${name} must not return approval_required under the read-only readiness path: ${JSON.stringify(result)}`);
+}
 const read = await callTool("read", { workspaceId: opened.workspaceId, path: "package.json", limit: 5 });
+assertNoApprovalRequired("read", read);
 assert.ok(typeof read?.result === "string" || JSON.stringify(read).includes("@b-a-m-n/kontrol"), "read did not return the fixture file");
 const grep = await callTool("grep", { workspaceId: opened.workspaceId, pattern: "@b-a-m-n/kontrol", path: "package.json" });
+assertNoApprovalRequired("grep", grep);
 assert.ok(typeof grep?.result === "string" || JSON.stringify(grep).includes("@b-a-m-n/kontrol"), "grep did not inspect the fixture file");
 const glob = await callTool("glob", { workspaceId: opened.workspaceId, pattern: "package.json" });
+assertNoApprovalRequired("glob", glob);
 assert.ok(typeof glob?.result === "string" || JSON.stringify(glob).includes("package.json"), "glob did not discover the fixture file");
 const ls = await callTool("ls", { workspaceId: opened.workspaceId, path: "." });
+assertNoApprovalRequired("ls", ls);
 assert.ok(typeof ls?.result === "string" || JSON.stringify(ls).includes("package.json"), "ls did not list the workspace");
 if (probeBash) {
   const bash = await callTool("bash", { workspaceId: opened.workspaceId, command: "pwd", timeout: 10 });

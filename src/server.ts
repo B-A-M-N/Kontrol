@@ -274,6 +274,12 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     active: 0,
     maxActive: 0,
     lastWireBytes: 0,
+    lastEventLoopDelayMs: 0,
+    maxEventLoopDelayMs: 0,
+    cacheEntries: 0,
+    cacheBytes: 0,
+    maxCacheEntries: 0,
+    maxCacheBytes: 0,
   };
   const workspaceAppResources = createWorkspaceAppResourceServer(config, workspaceAppResourceMetrics, mcpResourceAdmission);
   const serveWorkspaceAppResource = workspaceAppResources.serve;
@@ -322,6 +328,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     logicalContinuity,
     processSessions,
     workspaceAppResourceMetrics,
+    clearWorkspaceSessionState: (sessionId) => workspaces.clearSessionState(sessionId),
   });
   const {
     recordMcpTiming,

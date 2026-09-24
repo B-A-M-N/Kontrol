@@ -51,6 +51,9 @@ kontrol config set publicBaseUrl https://kontrol.example.com
 | `KONTROL_MCP_MAX_WAITERS_PER_SESSION` | Maximum parked waiters from one MCP session. Defaults to `2`. |
 | `KONTROL_MCP_MAX_WAITER_QUEUE` | Maximum queued parked waiters. Defaults to `64`. |
 | `KONTROL_MCP_ADMISSION_TIMEOUT_MS` | Maximum time a request waits for an admission slot. Defaults to `120000`. `KONTROL_MCP_REQUEST_DEADLINE_MS` remains a legacy alias. |
+| `KONTROL_MCP_SESSION_RECLAIM_GRACE_MS` | Minimum absence before a recently present browser transport can be reclaimed at the per-client cap. Defaults to `300000`. |
+| `KONTROL_MCP_SSE_HEARTBEAT_MS` | Interval for standalone MCP SSE keep-alive comments. Defaults to `20000`. |
+| `KONTROL_LAUNCH_GENERATION_ID` | Launcher-owned immutable generation identity included in disconnect diagnostics. |
 | `KONTROL_MCP_EXECUTION_TIMEOUT_MS` | Maximum execution time for ordinary MCP calls. Defaults to `1800000` (30 minutes). Long-poll waiters and approval-gated calls are exempt and use their own lifecycle. |
 | `KONTROL_MAINTENANCE_INTERVAL_MS` | Periodic maintenance interval. Defaults to `300000` (5 minutes). |
 | `KONTROL_MAINTENANCE_BUDGET_MS` | Wall-clock budget for one maintenance slice. Defaults to `250`; unfinished work resumes on a later tick. |
@@ -207,16 +210,29 @@ disables Harpoon loopback auto-registration by default. Set
 requires private loopback targets and the corresponding HTTPS configuration is
 available.
 
+For a running local origin or Secure MCP Tunnel endpoint, run
+`npm run probe:tunnel -- --url URL --workspace PATH --cycles 3 --build-meta PATH`
+to exercise repeated initialize → GET SSE → concurrent tool call → SSE
+disconnect → follow-up tool call cycles and require `read`, `grep`, `glob`,
+`ls`, and `poll_process` in the connection-facing catalog. Supply
+`--diagnostics-secret SECRET` to assert active-SSE accounting and retained
+session identity after each disconnect.
+
 The checkout launcher calls `scripts/probe-kontrol-readiness.mjs` after the
-adapters register. That probe performs a real MCP initialize, discovers the
-registered agents, opens the configured workspace, and reads `package.json`.
-It also runs `pwd` only when bash is explicitly configured with
+adapters register. That probe performs a real MCP initialize and `tools/list`,
+requires the invariant structured inspection surface (`read`, `grep`, `glob`,
+and `ls`) with `readOnlyHint: true`, discovers the registered agents, opens the
+configured workspace, and exercises each structured inspection call against
+`package.json`. It also runs `pwd` only when bash is explicitly configured with
 `KONTROL_POLICY_MODE=allow` or `KONTROL_POLICY_TOOL_BASH=allow`; the secure
 default requires human approval, which cannot be satisfied by a boot-time
 probe. Pass `--probe-bash` when invoking the probe directly under an equivalent
-explicit allow policy. Build identity remains an internal readiness check;
-unauthenticated liveness and readiness responses expose only boolean status
-fields.
+explicit allow policy. The MCP server advertises a surface version derived
+from immutable `build-meta.json` content identity; authenticated diagnostics
+and `open_workspace` expose that version and the required inspection list so a
+stale connector catalog can be diagnosed and refreshed. Build identity remains
+an internal readiness check; unauthenticated liveness and readiness responses
+expose only boolean status fields.
 
 Workflow durability is split deliberately: lifecycle, review, approval,
 continuation, and policy events are append-only audit records. High-volume
@@ -326,8 +342,8 @@ sessions.
 
 | Value | Behavior |
 | --- | --- |
-| `full` | Default. Widget UI is attached to exposed workspace, file, edit, and shell tools. |
-| `changes` | Enables the aggregate `show_changes` tool and attaches widget UI to `open_workspace` and `show_changes`. |
+| `full` | Attaches widget UI to exposed workspace, file, edit, and shell tools. |
+| `changes` | Default. Enables the aggregate `show_changes` tool and attaches widget UI to `open_workspace` and `show_changes`. |
 | `off` | Disables widget UI. |
 
 ## Skills

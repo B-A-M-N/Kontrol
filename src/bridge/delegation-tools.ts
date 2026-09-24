@@ -10,7 +10,7 @@ import type { BridgeConfig } from "./context.js";
 import { callRemoteAgent, selectHealthyAgent } from "../acp-gateway.js";
 import { registerMutationAppTool } from "./app-tool.js";
 import { missionCriterionSchema, workOrderSchema } from "./context.js";
-import { acquireCheckoutModifyLease, checkoutLeaseNonce, forbidden, isReviewer, renderMissionPrompt, resolveDelegationContext, workSessionInstructions, workspaceAppModelAndAppMeta } from "./shared.js";
+import { acquireCheckoutModifyLease, checkoutLeaseNonce, forbidden, isReviewer, liveOwnerContextId, requireWorkSessionRead, renderMissionPrompt, resolveDelegationContext, workSessionInstructions, workspaceAppModelAndAppMeta } from "./shared.js";
 import { z } from "zod/v4";
 
 export function registerDelegationTools(server: McpServer, config: BridgeConfig): void {
@@ -121,6 +121,7 @@ export function registerDelegationTools(server: McpServer, config: BridgeConfig)
           submittedBy: "webui",
           title: task.slice(0, 80),
           completionPolicy: completionPolicy ?? "webui_approval_required",
+          ownerContextId: liveOwnerContextId(config) ?? config.principalId,
         });
         wsId = created.id;
         createdSessionForDispatch = true;
@@ -132,6 +133,8 @@ export function registerDelegationTools(server: McpServer, config: BridgeConfig)
         if (!existing) {
           return { content: [{ type: "text" as const, text: `Unknown work session: ${wsId}.` }], isError: true };
         }
+        const access = requireWorkSessionRead(config, existing.id);
+        if (access) return access;
         if (existing.workspaceSessionId !== workspaceSessionId) {
           return {
             content: [{ type: "text" as const, text: `Work session ${wsId} belongs to a different workspace (${existing.workspaceSessionId}), not ${workspaceSessionId}.` }],

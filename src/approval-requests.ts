@@ -19,6 +19,7 @@ export interface ApprovalRequest {
   kind: ApprovalKind;
   workspaceSessionId: string;
   workSessionId?: string;
+  ownerContextId?: string;
   runId?: string;
   agentId?: string;
   principalId?: string;
@@ -57,6 +58,7 @@ export interface CreateApprovalRequestInput {
   kind: ApprovalKind;
   workspaceSessionId: string;
   workSessionId?: string;
+  ownerContextId?: string;
   runId?: string;
   agentId?: string;
   principalId?: string;
@@ -129,6 +131,7 @@ export function createApprovalRequestManager(
       kind: input.kind,
       workspaceSessionId: input.workspaceSessionId,
       workSessionId: input.workSessionId,
+      ownerContextId: input.ownerContextId,
       runId: input.runId,
       agentId: input.agentId,
       principalId: input.principalId,
@@ -170,6 +173,7 @@ export function createApprovalRequestManager(
       kind: request.kind,
       workspaceSessionId: request.workspaceSessionId,
       workSessionId: request.workSessionId ?? null,
+      ownerContextId: request.ownerContextId ?? null,
       runId: request.runId ?? null,
       agentId: request.agentId ?? null,
       principalId: request.principalId ?? null,
@@ -419,6 +423,7 @@ function rowToApproval(row: ApprovalRequestRow): ApprovalRequest {
     kind: row.kind as ApprovalKind,
     workspaceSessionId: row.workspaceSessionId,
     workSessionId: row.workSessionId ?? undefined,
+    ownerContextId: row.ownerContextId ?? undefined,
     runId: row.runId ?? undefined,
     agentId: row.agentId ?? undefined,
     principalId: row.principalId ?? undefined,

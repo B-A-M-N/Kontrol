@@ -195,15 +195,20 @@ try {
   ));
   await closeSession(sustained.sessionId);
 
-  // Exercise an actual long-lived transport socket loss, not only an orderly
-  // MCP DELETE. Closing the SSE body must detach the disposable transport so
-  // a fresh initialize can be recognized as a reconnect.
+  // Closing one GET SSE response must not detach or finalize the shared
+  // transport. A fresh request must still use the same session ID; explicit
+  // DELETE is the terminal continuity path.
   const socketSession = await openSession("socket-loss-a");
   const sse = await fetch(url, {
     headers: { accept: "text/event-stream", "mcp-session-id": socketSession.sessionId },
   });
   assert.equal(sse.status, 200);
   await sse.body?.cancel();
+  await waitFor(async () => (await diagnostics()).mcpSessionMetrics.activeSseStreams === 0);
+  const socketReuse = await rpc("tools/list", {}, socketSession.sessionId, "socket-loss-a");
+  assert.equal(socketReuse.response.status, 200, "SSE disconnect must leave the shared session reusable");
+  assert.equal(socketReuse.sessionId, socketSession.sessionId);
+  await closeSession(socketSession.sessionId);
   await waitFor(async () => (await diagnostics()).mcpSessionMetrics.logicalContinuity.records.some(
     (record: any) => record.identity === "conversation:socket-loss-a" && record.detachedTransportCount >= 1,
   ));

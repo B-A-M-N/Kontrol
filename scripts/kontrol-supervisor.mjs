@@ -395,12 +395,15 @@ export function createRecoveryEngine({
       await restartAndWait(name, reason);
       if (name === "kontrol") {
         for (const dependency of ["crush", "hermes", "tunnel"]) {
-          // A dependency whose own circuit is open is already known to need
-          // operator intervention. Do not turn that downstream condition into
-          // a second failed core recovery; leave its state visible and let the
-          // recovered core serve degraded readiness while it remains isolated.
-          if (components[dependency] && components[dependency].tracker.state !== "circuit_open") {
-            await restartAndWait(dependency, `dependency chain after ${name} recovery`);
+          const component = components[dependency];
+          if (!component || component.tracker.state === "circuit_open") continue;
+          // Core recovery must not restart healthy dependencies. Re-probe
+          // each one after the core is ready, preserving tunnel registration
+          // and adapter readiness classification, and only consume a restart
+          // when that fresh result independently meets the failure policy.
+          const dependencyResult = await probeComponent([dependency, component], false);
+          if (shouldRecoverComponent(component, dependencyResult)) {
+            await restartAndWait(dependency, `dependency health failure after ${name} recovery`);
           }
         }
       }

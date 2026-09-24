@@ -12,7 +12,7 @@ import type { EventPredicate, EventStoreEvent } from "../event-log.js";
 import type { ReviewSubmissionDTO } from "../review-submission.js";
 import { authorizeWorkSessionAction } from "../work-session-action-guard.js";
 import { registerMutationAppTool } from "./app-tool.js";
-import { assertWorkerSessionBinding, defaultLiveWaiters, forbidden, isReviewer, isWorkerOrClient, parsePatchFiles, requireWorkSessionRead, workspaceAppModelAndAppMeta } from "./shared.js";
+import { assertWorkerSessionBinding, defaultLiveWaiters, forbidden, isReviewer, isWorkerOrClient, liveOwnerContextId, parsePatchFiles, requireWorkSessionMutation, requireWorkSessionRead, workspaceAppModelAndAppMeta } from "./shared.js";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
 import { z } from "zod/v4";
 
@@ -357,6 +357,8 @@ export function registerReviewTools(server: McpServer, config: BridgeConfig): vo
       if (!isReviewer(config.principalRole)) {
         return forbidden(config.principalRole, "provide_review_feedback");
       }
+      const access = requireWorkSessionMutation(config, sessionId);
+      if (access) return access;
       if (verdict === "changes_requested" && !comments?.trim()) {
         return {
           content: [{ type: "text" as const, text: "Request Changes requires nonempty instructions for the agent." }],
@@ -630,7 +632,9 @@ export function registerReviewTools(server: McpServer, config: BridgeConfig): vo
       if (!isReviewer(config.principalRole)) {
         return forbidden(config.principalRole, "list_pending_reviews");
       }
-      const surface = config.workSessions.getWorkspaceSessionSurface(workspaceId, 20, "pending_review");
+      const owner = liveOwnerContextId(config);
+      if (config.connectionContext && !owner) return forbidden(config.principalRole, "list_pending_reviews");
+      const surface = config.workSessions.getWorkspaceSessionSurface(workspaceId, 20, "pending_review", undefined, owner);
       const text = surface.length === 0
         ? "No sessions awaiting review."
         : `${surface.length} session(s) awaiting review:\n${surface.map((s) => {

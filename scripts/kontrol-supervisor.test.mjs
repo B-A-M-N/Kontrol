@@ -170,4 +170,42 @@ await coreWithBlockedDependency.recover("kontrol", "core liveness failure");
 assert.deepEqual(recoveryOrder, ["restart:kontrol", "probe:kontrol"], "core recovery skips a circuit-open dependency");
 assert.equal(blockedDependency.tracker.state, "circuit_open");
 
+// Core recovery must not cascade into healthy dependencies. Each dependency
+// gets a fresh post-recovery probe, but only a restartable failed result may
+// consume its restart budget.
+const healthyCore = {
+  tracker: new FailureTracker("kontrol"),
+  session: "kontrol-server",
+  command: "core-command",
+};
+const healthyAdapter = {
+  tracker: new FailureTracker("crush"),
+  session: "crush-session",
+  command: "crush-command",
+};
+const healthyTunnel = {
+  tracker: new FailureTracker("tunnel"),
+  session: "kontrol-tunnel",
+  command: "tunnel-command",
+};
+healthyCore.tracker.consecutiveFailures = 3;
+const healthyDependencyOrder = [];
+const healthyDependencyRecovery = createRecoveryEngine({
+  components: { kontrol: healthyCore, crush: healthyAdapter, tunnel: healthyTunnel },
+  probeComponent: async ([name]) => {
+    healthyDependencyOrder.push(`probe:${name}`);
+    return { ok: true, degraded: false, status: 200 };
+  },
+  restart: async (name) => { healthyDependencyOrder.push(`restart:${name}`); },
+  sleepFn: async () => {},
+  restartBackoffBaseMs: 0,
+});
+await healthyDependencyRecovery.recover("kontrol", "core liveness failure");
+assert.deepEqual(healthyDependencyOrder, [
+  "restart:kontrol",
+  "probe:kontrol",
+  "probe:crush",
+  "probe:tunnel",
+], "core recovery probes healthy dependencies without restarting them");
+
 console.log("kontrol-supervisor.test.mjs: all assertions passed");

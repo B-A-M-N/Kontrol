@@ -5,6 +5,7 @@
  * (P1.3); the createMcpServer closures become an explicit dependency object.
  */
 import * as z from "zod/v4";
+import { createHash } from "node:crypto";
 import { brandWorkSessionId, brandWorkspaceId } from "../../branded.js";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -39,7 +40,7 @@ import {
   workspaceSkillOutputSchema,
   WRITE_TOOL_ANNOTATIONS,
 } from "../tool-schemas.js";
-import { toolNames } from "../tool-names.js";
+import { readMcpToolSurface, REQUIRED_INSPECTION_TOOLS, toolNames } from "../tool-names.js";
 import { toolWidgetDescriptorMeta } from "../tool-context.js";
 import {
   canonicalPolicyPath,
@@ -75,14 +76,45 @@ export interface WorkspaceToolsDeps {
   readonly processSessions: ProcessSessionManager;
 }
 
+function instructionContent(files: Array<{ path: string; content: string }>, root: string): ToolContent[] {
+  return files.map((file) => textBlock(`Instruction loaded from ${formatAgentsPath(file.path, root)}:\n${file.content}`));
+}
+
+function hashInstructionContent(files: Array<{ path: string; content: string }>): string {
+  return createHash("sha256")
+    .update(files.map((file) => `${file.path}\0${file.content}`).sort().join("\n"))
+    .digest("hex");
+}
+
+function instructionsRequiredResponse(
+  tool: string,
+  files: Array<{ path: string; content: string }>,
+  root: string,
+  workspaceId: string,
+  path: string | undefined,
+  content: string,
+) {
+  const hash = hashInstructionContent(files);
+  return {
+    content: [...instructionContent(files, root), textBlock(content)],
+    _meta: { tool, card: { workspaceId, path, status: "instructions_required", summary: { instructionContentHash: hash, files: files.length }, payload: { content: instructionContent(files, root) } } },
+    structuredContent: { tool, status: "instructions_required", instructionsRequired: true, instructionContentHash: hash, result: contentText([...instructionContent(files, root), textBlock(content)]) },
+  };
+}
+
 export function registerWorkspaceTools(
   server: McpServer,
   deps: WorkspaceToolsDeps,
-): void {
+): ReadonlySet<string> {
   const { config, workspaces, reviewCheckpoints, policyEngine, policyEnforcer, connectionContext, workSessions, trackToolEvent, prepareForMutation, processSessions } = deps;
+  const registeredToolNames = new Set<string>();
+  const registeredTool = (name: string): string => {
+    registeredToolNames.add(name);
+    return name;
+  };
   registerAppTool(
     server,
-    "open_workspace",
+    registeredTool("open_workspace"),
     {
       title: "Open workspace",
       description:
@@ -105,6 +137,7 @@ export function registerWorkspaceTools(
           .describe("Git ref to base a worktree on. Only used with mode=\"worktree\". Defaults to HEAD."),
       },
       outputSchema: {
+        tool: z.literal(toolNames.openWorkspace),
         workspaceId: z.string(),
         root: z.string(),
         mode: z.enum(["checkout", "worktree"]),
@@ -118,6 +151,10 @@ export function registerWorkspaceTools(
           edit: z.boolean(),
           changeTracking: z.boolean(),
           managedWorktree: z.boolean(),
+        }),
+        toolSurface: z.object({
+          version: z.string(),
+          requiredInspectionTools: z.array(z.enum(REQUIRED_INSPECTION_TOOLS)),
         }),
         worktree: z
           .object({
@@ -144,7 +181,7 @@ export function registerWorkspaceTools(
     },
     async ({ path, mode, baseRef }) => {
       const startedAt = performance.now();
-      const { workspace, agentsFiles, availableAgentsFiles } = await workspaces.openWorkspace({ path, mode, baseRef });
+      const { workspace, agentsFiles, availableAgentsFiles } = await workspaces.openWorkspace({ path, mode, baseRef }, connectionContext?.mcpSessionId);
       const gitEligibility = await getGitEligibility(workspace.root);
       const workspaceKind = workspace.mode;
       const versionControl = gitEligibility.ok ? "git" : "none";
@@ -165,6 +202,7 @@ export function registerWorkspaceTools(
           description: skill.description,
           path: formatPathForPrompt(skill.filePath),
         }));
+      const toolSurface = readMcpToolSurface();
       const loadedAgentsFiles = agentsFiles.map((file) => ({
         path: formatAgentsPath(file.path, workspace.root),
         content: file.content,
@@ -172,9 +210,10 @@ export function registerWorkspaceTools(
       const availableAgentsFileOutputs = availableAgentsFiles.map((file) => ({
         path: formatAgentsPath(file.path, workspace.root),
       }));
-      const instruction = config.skillsEnabled
+      const baseInstruction = config.skillsEnabled
         ? "Use this workspaceId in all subsequent tool calls for this project. Do not call open_workspace again for this same folder unless this workspaceId stops working, the user asks to reopen, or you switch to a different folder/worktree. Follow loaded agentsFiles instructions. Nested instructions are loaded automatically when later tools enter their directory. Review, diagnosis, architecture, and code-edit requests go directly through this workspace first. Delegate only when the reviewer explicitly asks for bounded assistance: call discover_agents, use only a currently dispatchable healthy role=agent peer, and if optional assistance is unavailable continue directly without an alternate ACP route. The WebUI reviewer remains the approval authority. When a task matches an available skill in skills, read its path before proceeding. For skills not listed here, use the search_skills tool to discover global skills by keyword."
         : "Use this workspaceId in all subsequent tool calls for this project. Do not call open_workspace again for this same folder unless this workspaceId stops working, the user asks to reopen, or you switch to a different folder/worktree. Follow loaded agentsFiles instructions. Nested instructions are loaded automatically when later tools enter their directory. Review, diagnosis, architecture, and code-edit requests go directly through this workspace first. Delegate only when the reviewer explicitly asks for bounded assistance: call discover_agents, use only a currently dispatchable healthy role=agent peer, and if optional assistance is unavailable continue directly without an alternate ACP route. The WebUI reviewer remains the approval authority.";
+      const instruction = `${baseInstruction} This workspace requires ${toolSurface.requiredInspectionTools.join(", ")} for structured inspection. If the client tool catalog does not expose all four, do not substitute bash/find. The client catalog is stale and must establish a fresh MCP tool surface.`;
       const resultContent: ToolContent[] = [
         {
           type: "text" as const,
@@ -183,6 +222,7 @@ export function registerWorkspaceTools(
             `Root: ${workspace.root}`,
             `Mode: ${workspace.mode}`,
             `Version control: ${versionControl}; checkpoint backend: ${checkpointBackend}`,
+            `MCP tool surface: ${toolSurface.version}; required structured inspection: ${toolSurface.requiredInspectionTools.join(", ")}`,
             loadedAgentsFiles.length > 0
               ? `Loaded project instructions: ${loadedAgentsFiles.map((file) => file.path).join(", ")}`
               : undefined,
@@ -221,6 +261,7 @@ export function registerWorkspaceTools(
           },
         },
         structuredContent: {
+          tool: toolNames.openWorkspace,
           workspaceId: workspace.id,
           root: workspace.root,
           mode: workspace.mode,
@@ -234,6 +275,7 @@ export function registerWorkspaceTools(
             changeTracking,
             managedWorktree: workspace.mode === "worktree",
           },
+          toolSurface,
           sourceRoot: workspace.sourceRoot,
           worktree: workspace.worktree,
           agentsFiles: loadedAgentsFiles,
@@ -246,9 +288,61 @@ export function registerWorkspaceTools(
     },
   );
 
+  if (config.widgets !== "off") {
+    registerAppTool(
+      server,
+      registeredTool(toolNames.showWorkspaceUi),
+      {
+        title: "Show workspace UI",
+        description: "Open the interactive Kontrol workspace surface for an already-open workspace. Use this on demand when the user asks to inspect the workspace, approvals, activity, or review UI; routine file operations do not need to mount a widget.",
+        inputSchema: {
+          workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
+        },
+        outputSchema: {
+          tool: z.literal(toolNames.showWorkspaceUi),
+          workspaceId: z.string(),
+          root: z.string(),
+          mode: z.enum(["checkout", "worktree"]),
+          instruction: z.string(),
+        },
+        ...toolWidgetDescriptorMeta(config, "workspace"),
+        annotations: { readOnlyHint: true, idempotentHint: true },
+      },
+      async ({ workspaceId }) => {
+        const startedAt = performance.now();
+        const workspace = workspaces.getWorkspace(workspaceId);
+        const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
+        if (bindingErr) return bindingErr;
+        const result = {
+          tool: toolNames.showWorkspaceUi,
+          workspaceId: workspace.id,
+          root: workspace.root,
+          mode: workspace.mode,
+          instruction: "The interactive workspace surface is now available for this workspace.",
+        };
+        logToolCall(config, {
+          tool: toolNames.showWorkspaceUi,
+          workspaceId,
+          path: workspace.root,
+          success: true,
+          durationMs: Math.round(performance.now() - startedAt),
+        });
+        trackToolEvent(workspaceId, toolNames.showWorkspaceUi, {}, { content: [textBlock(result.instruction)] }, startedAt);
+        return {
+          content: [textBlock(result.instruction)],
+          _meta: {
+            tool: toolNames.showWorkspaceUi,
+            card: result,
+          },
+          structuredContent: result,
+        };
+      },
+    );
+  }
+
   registerAppTool(
     server,
-    toolNames.read,
+    registeredTool(toolNames.read),
     {
       title: "Read file",
       description:
@@ -297,7 +391,7 @@ export function registerWorkspaceTools(
         const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
         if (bindingErr) return bindingErr;
       }
-      const readPath = workspaces.resolveReadPath(workspace, input.path);
+      const readPath = workspaces.resolveReadPath(workspace, input.path, connectionContext?.mcpSessionId);
       if (policyEnforcer && policyEngine) {
         const approved = await enforceToolPolicy(
           workSessions,
@@ -319,7 +413,7 @@ export function registerWorkspaceTools(
       }
       const newlyApplicable = readPath.skillRead
         ? []
-        : await workspaces.loadApplicableInstructions(workspace, input.path);
+        : await workspaces.loadApplicableInstructions(workspace, input.path, connectionContext?.mcpSessionId);
       const response = await readFileTool(
         { ...input, path: readPath.absolutePath },
         {
@@ -337,13 +431,13 @@ export function registerWorkspaceTools(
         }, response.content, startedAt);
         return response;
       }
-      workspaces.markReadPathLoaded(workspace, readPath);
+      workspaces.markReadPathLoaded(workspace, readPath, connectionContext?.mcpSessionId);
+      workspaces.acknowledgeApplicableInstructions(workspace, newlyApplicable, connectionContext?.mcpSessionId);
 
-      const instructionNotice = newlyApplicable.length > 0
-        ? textBlock(`Newly applicable instructions loaded: ${newlyApplicable.map((file) => formatAgentsPath(file.path, workspace.root)).join(", ")}`)
-        : undefined;
-      const responseContent = instructionNotice ? [instructionNotice, ...response.content] : response.content;
-      const responseForOutput = instructionNotice ? { ...response, content: responseContent } : response;
+      const responseContent = newlyApplicable.length > 0
+        ? [...instructionContent(newlyApplicable, workspace.root), ...response.content]
+        : response.content;
+      const responseForOutput = { ...response, content: responseContent };
       const summary = {
         ...textSummary(responseContent),
         offset: input.offset ?? 1,
@@ -370,6 +464,7 @@ export function registerWorkspaceTools(
           },
         },
         structuredContent: {
+          tool: toolNames.read,
           result: contentText(responseContent),
         },
       };
@@ -379,7 +474,7 @@ export function registerWorkspaceTools(
   if (config.toolMode !== "codex") {
   registerAppTool(
     server,
-    toolNames.write,
+    registeredTool(toolNames.write),
     {
       title: "Write file",
       description:
@@ -393,8 +488,12 @@ export function registerWorkspaceTools(
           .describe("File path to write, relative to the workspace root."),
         content: z.string().describe("Complete new file content."),
         approvalResumeId: approvalResumeIdSchema,
+        instructionContentHash: z.string().optional().describe("On a retry after instructions_required, must match the returned instruction hash."),
       },
-      outputSchema: resultOutputSchema(),
+      outputSchema: resultOutputSchema({
+        instructionsRequired: z.boolean().optional(),
+        instructionContentHash: z.string().optional(),
+      }),
       ...toolWidgetDescriptorMeta(config, "write"),
       annotations: WRITE_TOOL_ANNOTATIONS,
     },
@@ -407,6 +506,11 @@ export function registerWorkspaceTools(
       if (bindingErr) return bindingErr;
       const resolvedPath = workspaces.resolvePath(workspace, input.path);
       const policyPath = canonicalPolicyPath(workspace.root, input.path, resolvedPath);
+
+      const newlyApplicable = await workspaces.loadApplicableInstructions(workspace, input.path, connectionContext?.mcpSessionId);
+      if (newlyApplicable.length > 0 && input.instructionContentHash !== hashInstructionContent(newlyApplicable)) {
+        return instructionsRequiredResponse(toolNames.write, newlyApplicable, workspace.root, workspaceId, input.path, `Read and acknowledge the returned instructions, then retry write with instructionContentHash="${hashInstructionContent(newlyApplicable)}". No file was changed.`);
+      }
 
       // Policy enforcement for file writes
       if (policyEnforcer && policyEngine) {
@@ -429,7 +533,6 @@ export function registerWorkspaceTools(
         }
       }
 
-      await workspaces.loadApplicableInstructions(workspace, input.path);
       const response = await writeFileTool(input, {
         cwd: workspace.root,
         root: workspace.root,
@@ -462,10 +565,14 @@ export function registerWorkspaceTools(
         success: true,
         durationMs: Math.round(performance.now() - startedAt),
       });
-      trackToolEvent(workspaceId, toolNames.write, input, response, startedAt);
+      workspaces.acknowledgeApplicableInstructions(workspace, newlyApplicable, connectionContext?.mcpSessionId);
+      const responseWithInstructions = newlyApplicable.length > 0
+        ? { ...response, content: [...instructionContent(newlyApplicable, workspace.root), ...response.content] }
+        : response;
+      trackToolEvent(workspaceId, toolNames.write, input, responseWithInstructions, startedAt);
 
       return {
-        ...response,
+        ...responseWithInstructions,
         _meta: {
           tool: toolNames.write,
           card: {
@@ -473,13 +580,14 @@ export function registerWorkspaceTools(
             path: input.path,
             summary,
             payload: {
-              content: response.content,
+              content: responseWithInstructions.content,
               patch,
             },
           },
         },
         structuredContent: {
-          result: contentText(response.content),
+          tool: toolNames.write,
+          result: contentText(responseWithInstructions.content),
         },
       };
     },
@@ -487,7 +595,7 @@ export function registerWorkspaceTools(
 
   registerAppTool(
     server,
-    toolNames.edit,
+    registeredTool(toolNames.edit),
     {
       title: "Edit file",
       description:
@@ -512,7 +620,12 @@ export function registerWorkspaceTools(
           )
           .min(1),
         approvalResumeId: approvalResumeIdSchema,
+        instructionContentHash: z.string().optional().describe("On a retry after instructions_required, must match the returned instruction hash."),
       },
+      outputSchema: resultOutputSchema({
+        instructionsRequired: z.boolean().optional(),
+        instructionContentHash: z.string().optional(),
+      }),
       ...toolWidgetDescriptorMeta(config, "edit"),
       annotations: EDIT_TOOL_ANNOTATIONS,
     },
@@ -525,6 +638,11 @@ export function registerWorkspaceTools(
       if (bindingErr) return bindingErr;
       const resolvedPath = workspaces.resolvePath(workspace, input.path);
       const policyPath = canonicalPolicyPath(workspace.root, input.path, resolvedPath);
+
+      const newlyApplicable = await workspaces.loadApplicableInstructions(workspace, input.path, connectionContext?.mcpSessionId);
+      if (newlyApplicable.length > 0 && input.instructionContentHash !== hashInstructionContent(newlyApplicable)) {
+        return instructionsRequiredResponse(toolNames.edit, newlyApplicable, workspace.root, workspaceId, input.path, `Read and acknowledge the returned instructions, then retry edit with instructionContentHash="${hashInstructionContent(newlyApplicable)}". No file was changed.`);
+      }
 
       // Policy enforcement for file edits
       if (policyEnforcer && policyEngine) {
@@ -547,7 +665,6 @@ export function registerWorkspaceTools(
         }
       }
 
-      await workspaces.loadApplicableInstructions(workspace, input.path);
       const response = await editFileTool(input, {
         cwd: workspace.root,
         root: workspace.root,
@@ -574,7 +691,8 @@ export function registerWorkspaceTools(
         editCount: input.edits.length,
       };
       const editResultText = `Edited ${input.path} (+${stats.additions} -${stats.removals}).`;
-      const editContent = [textBlock(editResultText)];
+      const editContent = [...instructionContent(newlyApplicable, workspace.root), textBlock(editResultText)];
+      workspaces.acknowledgeApplicableInstructions(workspace, newlyApplicable, connectionContext?.mcpSessionId);
       logToolCall(config, {
         tool: toolNames.edit,
         workspaceId,
@@ -599,6 +717,7 @@ export function registerWorkspaceTools(
           },
         },
         structuredContent: {
+          tool: toolNames.edit,
           status: "applied",
           result: contentText(editContent),
         },
@@ -610,7 +729,7 @@ export function registerWorkspaceTools(
   if (config.toolMode === "codex") {
     registerAppTool(
       server,
-      "apply_patch",
+      registeredTool("apply_patch"),
       {
         title: "Apply patch",
         description:
@@ -623,8 +742,11 @@ export function registerWorkspaceTools(
             .string()
             .describe("Patch text enclosed by *** Begin Patch and *** End Patch markers."),
           approvalResumeId: approvalResumeIdSchema,
+          instructionContentHash: z.string().optional().describe("On a retry after instructions_required, must match the returned instruction hash."),
         },
         outputSchema: resultOutputSchema({
+          instructionsRequired: z.boolean().optional(),
+          instructionContentHash: z.string().optional(),
           additions: z.number(),
           removals: z.number(),
           files: z.array(
@@ -638,7 +760,7 @@ export function registerWorkspaceTools(
         ...toolWidgetDescriptorMeta(config, "edit"),
         annotations: EDIT_TOOL_ANNOTATIONS,
       },
-      async ({ workspaceId, patch, approvalResumeId }) => {
+      async ({ workspaceId, patch, approvalResumeId, instructionContentHash }) => {
         const startedAt = performance.now();
         const blocked = await runMutationBarrier(prepareForMutation, workspaceId, "apply_patch");
         if (blocked) return blocked;
@@ -652,6 +774,17 @@ export function registerWorkspaceTools(
           path,
           workspaces.resolvePath(workspace, path),
         ));
+
+        const newlyApplicable = [];
+        for (const action of actions) {
+          newlyApplicable.push(...await workspaces.loadApplicableInstructions(workspace, action.path, connectionContext?.mcpSessionId));
+          if (action.moveTo) newlyApplicable.push(...await workspaces.loadApplicableInstructions(workspace, action.moveTo, connectionContext?.mcpSessionId));
+        }
+        const uniqueInstructions = [...new Map(newlyApplicable.map((file) => [file.path, file])).values()];
+        const expectedInstructionHash = hashInstructionContent(uniqueInstructions);
+        if (uniqueInstructions.length > 0 && instructionContentHash !== expectedInstructionHash) {
+          return instructionsRequiredResponse("apply_patch", uniqueInstructions, workspace.root, workspaceId, affectedPaths[0], `Read and acknowledge the returned instructions, then retry apply_patch with instructionContentHash="${expectedInstructionHash}". No files were changed.`);
+        }
 
         // Policy enforcement (P0 #3): Codex apply_patch is an edit_files action
         // and must be gated exactly like the ordinary `write`/`edit` tools.
@@ -680,10 +813,6 @@ export function registerWorkspaceTools(
         // Load instructions for every path named by the patch before any file
         // is changed. parsePatch is validation-only; applyPatch revalidates all
         // confined destinations immediately before staging/rename.
-        for (const action of actions) {
-          await workspaces.loadApplicableInstructions(workspace, action.path);
-          if (action.moveTo) await workspaces.loadApplicableInstructions(workspace, action.moveTo);
-        }
         const applied = await applyPatch(workspace.root, patch);
         // P1 (audit): record every path the patch touched (including move
         // destinations) so the next review submission can state whether the
@@ -695,7 +824,8 @@ export function registerWorkspaceTools(
         });
         const paths = applied.files.map((file) => file.path).join(", ");
         const result = `Applied patch to ${applied.files.length} file(s): ${paths}`;
-        const content = [textBlock(result)];
+        workspaces.acknowledgeApplicableInstructions(workspace, newlyApplicable, connectionContext?.mcpSessionId);
+        const content = [...instructionContent(newlyApplicable, workspace.root), textBlock(result)];
         const displayPath = applied.files.length === 1
           ? applied.files[0]?.path
           : `${applied.files.length} files`;
@@ -724,6 +854,7 @@ export function registerWorkspaceTools(
             },
           },
           structuredContent: {
+            tool: "apply_patch",
             result,
             additions: applied.additions,
             removals: applied.removals,
@@ -734,10 +865,10 @@ export function registerWorkspaceTools(
     );
   }
 
-  if (config.widgets === "changes") {
+  if (config.widgets === "changes" || config.widgets === "full") {
     registerAppTool(
       server,
-      "show_changes",
+      registeredTool("show_changes"),
       {
         title: "Show changes",
         description:
@@ -802,6 +933,7 @@ export function registerWorkspaceTools(
             },
           },
           structuredContent: {
+            tool: "show_changes",
             result: contentText(content),
             snapshotKind: review.snapshotKind,
             snapshotRef: review.snapshotRef,
@@ -817,7 +949,7 @@ export function registerWorkspaceTools(
   {
     registerAppTool(
       server,
-      toolNames.grep,
+      registeredTool(toolNames.grep),
       {
         title: "Grep",
         description:
@@ -869,7 +1001,7 @@ export function registerWorkspaceTools(
             });
           }
         }
-        if (input.path) await workspaces.loadApplicableInstructions(workspace, input.path);
+        const newlyApplicable = input.path ? await workspaces.loadApplicableInstructions(workspace, input.path, connectionContext?.mcpSessionId) : [];
         const response = await grepFilesTool(input, {
           cwd: workspace.root,
           root: workspace.root,
@@ -884,10 +1016,14 @@ export function registerWorkspaceTools(
           return response;
         }
 
+        workspaces.acknowledgeApplicableInstructions(workspace, newlyApplicable, connectionContext?.mcpSessionId);
+        const responseWithInstructions = newlyApplicable.length > 0
+          ? { ...response, content: [...instructionContent(newlyApplicable, workspace.root), ...response.content] }
+          : response;
         const summary = {
           pattern: input.pattern,
           scope: input.path ?? ".",
-          ...textSummary(response.content),
+          ...textSummary(responseWithInstructions.content),
         };
         logToolCall(config, {
           tool: toolNames.grep,
@@ -898,18 +1034,19 @@ export function registerWorkspaceTools(
         });
 
         return {
-          ...response,
+          ...responseWithInstructions,
           _meta: {
             tool: toolNames.grep,
             card: {
               workspaceId,
               path: input.path,
               summary,
-              payload: { content: response.content },
+              payload: { content: responseWithInstructions.content },
             },
           },
           structuredContent: {
-            result: contentText(response.content),
+            tool: toolNames.grep,
+            result: contentText(responseWithInstructions.content),
           },
         };
       },
@@ -917,7 +1054,7 @@ export function registerWorkspaceTools(
 
     registerAppTool(
       server,
-      toolNames.glob,
+      registeredTool(toolNames.glob),
       {
         title: "Glob",
         description:
@@ -966,7 +1103,7 @@ export function registerWorkspaceTools(
             });
           }
         }
-        if (input.path) await workspaces.loadApplicableInstructions(workspace, input.path);
+        const newlyApplicable = input.path ? await workspaces.loadApplicableInstructions(workspace, input.path, connectionContext?.mcpSessionId) : [];
         const response = await findFilesTool(input, {
           cwd: workspace.root,
           root: workspace.root,
@@ -980,11 +1117,15 @@ export function registerWorkspaceTools(
           }, response.content, startedAt);
           return response;
         }
+        workspaces.acknowledgeApplicableInstructions(workspace, newlyApplicable, connectionContext?.mcpSessionId);
+        const responseWithInstructions = newlyApplicable.length > 0
+          ? { ...response, content: [...instructionContent(newlyApplicable, workspace.root), ...response.content] }
+          : response;
 
         const summary = {
           pattern: input.pattern,
           scope: input.path ?? ".",
-          ...textSummary(response.content),
+          ...textSummary(responseWithInstructions.content),
         };
         logToolCall(config, {
           tool: toolNames.glob,
@@ -995,18 +1136,19 @@ export function registerWorkspaceTools(
         });
 
         return {
-          ...response,
+          ...responseWithInstructions,
           _meta: {
             tool: toolNames.glob,
             card: {
               workspaceId,
               path: input.path,
               summary,
-              payload: { content: response.content },
+              payload: { content: responseWithInstructions.content },
             },
           },
           structuredContent: {
-            result: contentText(response.content),
+            tool: toolNames.glob,
+            result: contentText(responseWithInstructions.content),
           },
         };
       },
@@ -1014,7 +1156,7 @@ export function registerWorkspaceTools(
 
     registerAppTool(
       server,
-      toolNames.ls,
+      registeredTool(toolNames.ls),
       {
         title: "Ls",
         description:
@@ -1062,7 +1204,7 @@ export function registerWorkspaceTools(
             });
           }
         }
-        await workspaces.loadApplicableInstructions(workspace, input.path);
+        const newlyApplicable = await workspaces.loadApplicableInstructions(workspace, input.path, connectionContext?.mcpSessionId);
         const response = await listDirectoryTool(input, {
           cwd: workspace.root,
           root: workspace.root,
@@ -1077,7 +1219,11 @@ export function registerWorkspaceTools(
           return response;
         }
 
-        const summary = textSummary(response.content);
+        workspaces.acknowledgeApplicableInstructions(workspace, newlyApplicable, connectionContext?.mcpSessionId);
+        const responseWithInstructions = newlyApplicable.length > 0
+          ? { ...response, content: [...instructionContent(newlyApplicable, workspace.root), ...response.content] }
+          : response;
+        const summary = textSummary(responseWithInstructions.content);
         logToolCall(config, {
           tool: toolNames.ls,
           workspaceId,
@@ -1087,18 +1233,19 @@ export function registerWorkspaceTools(
         });
 
         return {
-          ...response,
+          ...responseWithInstructions,
           _meta: {
             tool: toolNames.ls,
             card: {
               workspaceId,
               path: input.path,
               summary,
-              payload: { content: response.content },
+              payload: { content: responseWithInstructions.content },
             },
           },
           structuredContent: {
-            result: contentText(response.content),
+            tool: toolNames.ls,
+            result: contentText(responseWithInstructions.content),
           },
         };
       },
@@ -1108,7 +1255,7 @@ export function registerWorkspaceTools(
   if (config.toolMode !== "codex") {
   registerAppTool(
     server,
-    toolNames.shell,
+    registeredTool(toolNames.shell),
     {
       title: "Bash",
       description: `Run a shell command inside an open workspace. The request waits only for a bounded yield; a still-running child returns a sessionId and must be observed with ${toolNames.pollProcess}. Use only for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Prefer ${toolNames.read}, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} for repository inspection; do not use shell parsing to replace those structured read-only tools. Do not use ${toolNames.shell} to create or modify files. Do not use shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or generated scripts to write project files; use ${toolNames.edit} for targeted changes and ${toolNames.write} for new files or full rewrites. Call open_workspace first and pass workspaceId. This is powerful local execution and should only be exposed behind strong authentication.`,
@@ -1184,7 +1331,9 @@ export function registerWorkspaceTools(
         }
       }
 
-      if (workingDirectory) await workspaces.loadApplicableInstructions(workspace, workingDirectory);
+      const newlyApplicable = workingDirectory
+        ? await workspaces.loadApplicableInstructions(workspace, workingDirectory, connectionContext?.mcpSessionId)
+        : [];
       const timeoutSeconds = input.timeout ?? 30;
       // A command's child lifetime is independent from the MCP request. The
       // bounded yield returns a process handle; poll_process owns later
@@ -1225,10 +1374,14 @@ export function registerWorkspaceTools(
         return response;
       }
 
+      workspaces.acknowledgeApplicableInstructions(workspace, newlyApplicable, connectionContext?.mcpSessionId);
+      const responseWithInstructions = newlyApplicable.length > 0
+        ? { ...response, content: [...instructionContent(newlyApplicable, workspace.root), ...response.content] }
+        : response;
       const summary = {
         command: input.command,
         workingDirectory: workingDirectory ?? ".",
-        ...textSummary(response.content),
+        ...textSummary(responseWithInstructions.content),
       };
       logToolCall(config, {
         tool: toolNames.shell,
@@ -1242,16 +1395,16 @@ export function registerWorkspaceTools(
       trackToolEvent(workspaceId, toolNames.shell, input, response, startedAt);
 
       return {
-        ...response,
+        ...responseWithInstructions,
         _meta: {
-          ...(response._meta ?? {}),
+          ...(responseWithInstructions._meta ?? {}),
           tool: toolNames.shell,
           card: {
             ...(response._meta?.card ?? {}),
             workspaceId,
             path: workingDirectory,
             summary,
-            payload: { content: response.content },
+            payload: { content: responseWithInstructions.content },
           },
         },
       };
@@ -1259,4 +1412,5 @@ export function registerWorkspaceTools(
   );
   }
 
+  return registeredToolNames;
 }

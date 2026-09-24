@@ -62,6 +62,7 @@ export function processToolResponse(
       },
     },
     structuredContent: {
+      tool,
       result,
       sessionId: snapshot.sessionId,
       command: snapshot.command,

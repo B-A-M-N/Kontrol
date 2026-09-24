@@ -7,6 +7,7 @@
  */
 import { mutationPrincipalId, runWithMutationReceipt } from "../mutation-receipts.js";
 import type { BridgeConfig } from "./context.js";
+import { liveOwnerContextId } from "./shared.js";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 
@@ -21,7 +22,7 @@ export function registerMutationAppTool(
     const { clientMutationId, ...request } = input as { clientMutationId?: string } & Record<string, unknown>;
     return runWithMutationReceipt({
       store: config.mutationReceipts,
-      principalId: mutationPrincipalId(config.principalId, config.principalRole),
+      principalId: [mutationPrincipalId(config.principalId, config.principalRole), liveOwnerContextId(config)].filter(Boolean).join("|owner:"),
       operation: name,
       clientMutationId,
       request,

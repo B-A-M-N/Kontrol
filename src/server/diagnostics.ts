@@ -16,6 +16,7 @@ import type { McpSessionState, WorkspaceAppResourceMetrics } from "./mcp-session
 import type { McpAdmission } from "./mcp-admission.js";
 import type { Request, Response } from "express";
 import { toolListCacheDiagnostics } from "../mcp-tool-list-cache.js";
+import { readMcpToolSurface } from "../mcp/tool-names.js";
 
 export interface DiagnosticsDeps {
   readonly config: ServerConfig;
@@ -148,6 +149,7 @@ export async function handleDiagnostics(deps: DiagnosticsDeps, req: Request, res
       memoryPressure: sessionLifecycle.getMemoryPressureState(),
       memoryEstimate: sessionLifecycle.estimateMcpSessionMemoryCost(),
       reuse: sessionLifecycle.mcpSessionReuseMetrics(),
+      terminationReasons: sessionLifecycle.mcpSessionTerminationMetrics(),
       policy: {
         unusedSessionIdleMs: config.mcpUnusedSessionIdleMs,
         ephemeralSessionIdleMs: config.mcpEphemeralSessionIdleMs,
@@ -155,6 +157,7 @@ export async function handleDiagnostics(deps: DiagnosticsDeps, req: Request, res
         sessionReaperIntervalMs: config.mcpSessionReaperIntervalMs,
         logicalContinuityRetentionMs: config.mcpLogicalContinuityRetentionMs,
         sessionMaxPerClient: config.mcpSessionMaxPerClient,
+        sessionReclaimGraceMs: config.mcpSessionReclaimGraceMs,
         sessionSoftCap: config.mcpSessionSoftCap,
         sessionHardCap: config.mcpSessionHardCap,
       },
@@ -213,6 +216,7 @@ export async function handleDiagnostics(deps: DiagnosticsDeps, req: Request, res
       const metaPath = join(dirname(fileURLToPath(import.meta.url)), "build-meta.json");
       buildMeta = JSON.parse(readFileSync(metaPath, "utf8"));
     } catch { /* ignore */ }
+    const mcpToolSurface = readMcpToolSurface();
 
     return res.json({
       ok: true,
@@ -221,6 +225,7 @@ export async function handleDiagnostics(deps: DiagnosticsDeps, req: Request, res
       // never from an ambient process.env read inside a route handler.
       build: buildMeta ?? config.expectedBuildId ?? "dev",
       buildMeta,
+      mcpToolSurface,
       schema: schemaVersion,
       schemaExpected: LATEST_SCHEMA_VERSION,
       degradedAudit: deps.degradedAuditSnapshot(),

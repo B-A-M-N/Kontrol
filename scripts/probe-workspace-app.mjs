@@ -48,20 +48,44 @@ await rpc("initialize", {
 assert.ok(sessionId, "initialize did not provide an MCP session id");
 
 const listed = await rpc("resources/list", {});
-const resource = listed.resources?.find((item) => (
-  typeof item?.uri === "string"
-  && /^ui:\/\/kontrol\/workspace-app-[a-f0-9]{12}\.html$/.test(item.uri)
-));
-assert.ok(resource, "resources/list did not advertise the hashed Kontrol workspace app");
-assert.equal(resource.mimeType, "text/html;profile=mcp-app");
+const resources = (listed.resources ?? []).filter((item) => typeof item?.uri === "string" && item.uri.startsWith("ui://kontrol/"));
+const modern = resources.find((item) => /^ui:\/\/kontrol\/workspace-app-[a-f0-9]{12}\.html$/.test(item.uri));
+assert.ok(modern, "resources/list did not advertise the hashed modern Kontrol workspace app");
+assert.equal(modern.mimeType, "text/html;profile=mcp-app");
+const compatibility = resources.filter((item) => item.uri !== modern.uri);
+assert.ok(compatibility.length >= 2, "resources/list did not advertise cached-card compatibility URIs");
+for (const resource of resources) {
+  const read = await rpc("resources/read", { uri: resource.uri });
+  const content = read.contents?.[0];
+  assert.equal(content?.uri, resource.uri);
+  assert.equal(typeof content?.mimeType, "string");
+  assert.equal(typeof content?.text, "string");
+  assert.ok(content.text.includes('<main id="app"'), `${resource.uri} is missing the app root`);
+  assert.ok(content.text.length > 1_000, `${resource.uri} is unexpectedly small`);
+  assert.doesNotMatch(JSON.stringify(content._meta ?? {}), /(?:127\.0\.0\.1|localhost|http:\/\/)/i, `${resource.uri} metadata exposes an invalid loopback CSP domain`);
+}
 
-const read = await rpc("resources/read", { uri: resource.uri });
-const content = read.contents?.[0];
-assert.equal(content?.uri, resource.uri);
-assert.equal(content?.mimeType, "text/html;profile=mcp-app");
-assert.equal(typeof content?.text, "string");
-assert.ok(content.text.includes('<main id="app"'), "workspace app HTML is missing its app root");
-assert.ok(content.text.length > 1_000, "workspace app HTML is unexpectedly small");
-assert.doesNotMatch(JSON.stringify(content._meta ?? {}), /(?:127\.0\.0\.1|localhost|http:\/\/)/i, "workspace app metadata exposes an invalid loopback CSP domain");
+const tools = await rpc("tools/list", {});
+const openTool = tools.tools?.find((tool) => tool.name === "open_workspace");
+assert.ok(openTool?._meta?.ui?.resourceUri, "open_workspace must advertise the standard modern Workspace App resource");
+assert.equal(openTool._meta["openai/outputTemplate"], undefined,
+  "new tool registrations must advertise only the standard MCP Apps resource");
+const opened = await rpc("tools/call", { name: "open_workspace", arguments: { path: process.cwd(), mode: "checkout" } });
+const openedContent = opened.structuredContent ?? opened;
+assert.equal(typeof openedContent.workspaceId, "string", "open_workspace must return a workspace card payload");
+assert.ok(openedContent.root, "open_workspace card must carry its workspace root");
+assert.ok(opened._meta?.tool === "open_workspace" || opened._meta?.card?.tool === "open_workspace" || openedContent.tool === "open_workspace",
+  "open_workspace must provide a tool discriminator for widget result delivery");
+const showUi = await rpc("tools/call", { name: "show_workspace_ui", arguments: { workspaceId: openedContent.workspaceId } });
+const showUiContent = showUi.structuredContent ?? showUi;
+assert.equal(showUiContent.tool, "show_workspace_ui", "show_workspace_ui must return a validated tool discriminator");
+assert.equal(showUi._meta?.tool, "show_workspace_ui", "show_workspace_ui must also carry the validated host metadata discriminator");
+assert.equal(showUiContent.workspaceId, openedContent.workspaceId, "show_workspace_ui must retain the selected workspace");
+assert.ok(showUiContent.root, "show_workspace_ui must return the workspace root");
+let modernBytes = 0;
+for (const resource of resources) {
+  const read = await rpc("resources/read", { uri: resource.uri });
+  if (resource.uri === modern.uri) modernBytes = Buffer.byteLength(read.contents?.[0]?.text ?? "", "utf8");
+}
 
-console.log(JSON.stringify({ ok: true, uri: resource.uri, bytes: Buffer.byteLength(content.text, "utf8") }));
+console.log(JSON.stringify({ ok: true, modernUri: modern.uri, compatibilityUris: compatibility.map((item) => item.uri), workspaceId: openedContent.workspaceId, showWorkspaceUi: showUiContent.tool, modernBytes }));

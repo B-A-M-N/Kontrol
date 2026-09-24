@@ -246,4 +246,18 @@ function stageSourceCheckoutLayout(withDistArtifact, artifactHtml = SELF_CONTAIN
   }
 }
 
+// Structural validation must reject incomplete resources, not merely Vite templates.
+{
+  const { isSelfContainedWorkspaceAppHtml } = await import(join(repoRoot, "src", "workspace-app-resource.ts"));
+  assert.equal(isSelfContainedWorkspaceAppHtml(SELF_CONTAINED_HTML), true);
+  assert.equal(isSelfContainedWorkspaceAppHtml("<html><body><main id=\"app\"></main><script>1</script></body></html>"), false);
+  assert.equal(isSelfContainedWorkspaceAppHtml("<html><head><title>Kontrol Diff</title></head><body><main id=\"app\"></main></body></html>"), false);
+  assert.equal(isSelfContainedWorkspaceAppHtml("<html><head><title>Kontrol Diff</title><style>x</style></head><body><main></main><script>1</script></body></html>"), false);
+  assert.equal(isSelfContainedWorkspaceAppHtml("<html><head><title>Kontrol Diff</title><style>x</style></head><body><main id=\"app\"></main><script src=\"./app.js\"></script></body></html>"), false);
+  assert.equal(isSelfContainedWorkspaceAppHtml("<html><head><title>Kontrol Diff</title><style>x</style></head><body><main id=\"app\"></main><script>1</script><img src=\"/logo.png\"></body></html>"), false,
+    "single-file validation must reject external image resources as well as the known Vite template");
+  assert.equal(isSelfContainedWorkspaceAppHtml("<html><head><title>Kontrol Diff</title><style>x</style></head><body><main id=\"app\"></main><script>1</script><link rel=\"preload\" href=\"/app.js\"></body></html>"), false,
+    "single-file validation must reject external preload resources");
+}
+
 console.log("workspace-app-resource.test.mjs: source-mode resolution regression suite passed");

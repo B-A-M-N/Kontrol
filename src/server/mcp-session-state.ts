@@ -34,6 +34,8 @@ export interface McpSessionState {
   logicalClientId: string;
   identitySource: "instance_header" | "conversation" | "oauth" | "client_info_fallback";
   authenticatedRole: "worker" | "reviewer" | "client";
+  /** Stable authenticated principal used to namespace durable owner identity. */
+  authenticatedPrincipalId?: string;
   authSource: "oauth" | "reviewer_token" | "worker_token" | "tunnel_reviewer" | "anonymous";
   conversationId?: string;
   approvalCorrelationId?: string;
@@ -56,6 +58,8 @@ export interface McpSessionState {
   durableWorkerSession: boolean;
   lastRpcMethod?: string;
   lastToolName?: string;
+  /** Durable reason for the last transport termination decision. */
+  terminationReason?: string;
 }
 
 export interface McpPolicyWaiter {
@@ -97,6 +101,7 @@ export interface McpSessionMetrics {
   clients: Map<string, McpSessionClientMetrics>;
   windowEvents: Array<{ at: number; kind: McpSessionWindowKind }>;
   completedToolCounts: number[];
+  terminationReasons: Map<string, number>;
 }
 
 export interface McpTimingSample {
@@ -131,6 +136,14 @@ export interface WorkspaceAppResourceMetrics {
   maxActive: number;
   /** P1 perf: actual wire bytes of the last served resource (post-encoding). */
   lastWireBytes: number;
+  /** Event-loop delay samples around widget resource delivery. */
+  lastEventLoopDelayMs: number;
+  maxEventLoopDelayMs: number;
+  /** Bounded static resource cache accounting. */
+  cacheEntries: number;
+  cacheBytes: number;
+  maxCacheEntries: number;
+  maxCacheBytes: number;
 }
 
 /** Explicit route-level HTTP body caps. These are deliberately finite: MCP

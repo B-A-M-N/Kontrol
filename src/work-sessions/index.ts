@@ -40,6 +40,7 @@ export interface WorkSessionManager {
     submittedBy: string;
     title?: string;
     completionPolicy?: CompletionPolicy;
+    ownerContextId?: string;
   }): WorkSession;
   get(id: string): WorkSession | undefined;
   listByWorkspace(workspaceSessionId: string, limit?: number): WorkSession[];
@@ -116,6 +117,7 @@ export interface WorkSessionManager {
     limit?: number,
     filter?: "all" | "pending_review" | "stale_pending_review" | "live",
     after?: WorkspaceSessionSurfaceCursor,
+    ownerContextId?: string,
   ): WorkspaceSessionSurfaceEntry[];
   getWorkspaceEventCursor(workspaceSessionId?: string): number;
   /** P2 #10: Active-session projection with all needed fields in one query. */
@@ -196,8 +198,8 @@ export function createWorkSessionManager(
     reconcileRuntimeStates: (afterSessionId, limit) => reconcileRuntimeStates(database, afterSessionId, limit),
     countActiveWorkSessions: () => queries.countActiveWorkSessions(),
     countPendingReviews: () => queries.countPendingReviews(),
-    getWorkspaceSessionSurface: (workspaceSessionId, limit, filter, after) =>
-      queries.getWorkspaceSessionSurface(workspaceSessionId, limit, filter, after),
+    getWorkspaceSessionSurface: (workspaceSessionId, limit, filter, after, ownerContextId) =>
+      queries.getWorkspaceSessionSurface(workspaceSessionId, limit, filter, after, ownerContextId),
     getWorkspaceEventCursor: (workspaceSessionId) => queries.getWorkspaceEventCursor(workspaceSessionId),
     listActiveWorkSessionsProjection: (workspaceSessionId) => queries.listActiveWorkSessionsProjection(workspaceSessionId),
     listSessionIdsNeedingCompaction: (afterSessionId, limit) => queries.listSessionIdsNeedingCompaction(afterSessionId, limit),

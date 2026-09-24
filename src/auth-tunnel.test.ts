@@ -226,12 +226,9 @@ assert.equal(loadConfig({ ...baseEnv, KONTROL_TUNNEL_TOKEN: "short" }).authMode,
       },
       body: JSON.stringify({ jsonrpc: "2.0", id: 6, method: "resources/read", params: { uri: staleResourceUri } }),
     });
-    assert.equal(staleResourceRead.status, 200, "stale template hashes must work on an existing session");
-    const stalePayload = parseJsonRpcResponse(await staleResourceRead.text()) as { result?: { contents?: unknown[] } };
-    const staleResource = stalePayload.result?.contents?.[0] as { uri?: string; mimeType?: string; text?: string } | undefined;
-    assert.equal(staleResource?.uri, staleResourceUri);
-    assert.equal(staleResource?.mimeType, "text/html;profile=mcp-app");
-    assert.equal(typeof staleResource?.text, "string");
+    const stalePayload = parseJsonRpcResponse(await staleResourceRead.text()) as { error?: { message?: string } };
+    assert.ok(stalePayload.error, "unsupported historical template hashes must return an MCP resource error");
+    assert.match(stalePayload.error?.message ?? "", /unknown resource|resource/i);
 
     const openAiResourceRead = await fetch("http://127.0.0.1:7691/mcp", {
       method: "POST",
@@ -244,6 +241,8 @@ assert.equal(loadConfig({ ...baseEnv, KONTROL_TUNNEL_TOKEN: "short" }).authMode,
     assert.equal(openAiResource?.uri, OPENAI_WORKSPACE_APP_URI);
     assert.equal(openAiResource?.mimeType, "text/html+skybridge");
     assert.equal(typeof openAiResource?.text, "string");
+    // Compatibility resources remain readable for cached cards, but new tool
+    // metadata must use only the standard MCP Apps resource URI.
 
     const legacyResourceRead = await fetch("http://127.0.0.1:7691/mcp", {
       method: "POST",

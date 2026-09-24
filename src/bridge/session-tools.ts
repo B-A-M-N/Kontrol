@@ -10,7 +10,7 @@ import type { BridgeConfig } from "./context.js";
 import { cancelRemoteRun, selectHealthyAgent } from "../acp-gateway.js";
 import { TERMINAL_STATUSES } from "../review-workflow.js";
 import { registerMutationAppTool } from "./app-tool.js";
-import { assertWorkerSessionBinding, forbidden, isReviewer, requireWorkSessionRead, workspaceAppModelAndAppMeta } from "./shared.js";
+import { assertWorkerSessionBinding, forbidden, isReviewer, liveConnectionIdentity, liveOwnerContextId, requireWorkSessionMutation, requireWorkSessionRead, workspaceAppModelAndAppMeta } from "./shared.js";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
 import { z } from "zod/v4";
 
@@ -35,8 +35,8 @@ export function registerSessionTools(server: McpServer, config: BridgeConfig): v
     async ({ workspaceId, title, completionPolicy }) => {
       try {
         config.workspaces.getWorkspace(workspaceId);
-        const session = config.workSessions.create({ workspaceSessionId: workspaceId, submittedBy: "cli", title, completionPolicy });
-        config.workspaces.setActiveSession(workspaceId, session.id);
+        const session = config.workSessions.create({ workspaceSessionId: workspaceId, submittedBy: "cli", title, completionPolicy, ownerContextId: liveOwnerContextId(config) ?? config.principalId });
+        config.workspaces.setActiveSession(workspaceId, session.id, liveConnectionIdentity(config).mcpSessionId);
         return {
           content: [{ type: "text" as const, text: `Session ${session.id} active. Tool calls will be logged. Use submit_for_review when ready.` }],
           structuredContent: { sessionId: session.id, status: "in_progress" },
@@ -431,6 +431,11 @@ export function registerSessionTools(server: McpServer, config: BridgeConfig): v
       }
       const startedAt = performance.now();
       try {
+        // Conversation-scoped reviewers receive only their own work-session
+        // projection. An ownerless reviewer intentionally retains the global
+        // review surface for operational recovery.
+        const owner = liveOwnerContextId(config);
+        if (config.connectionContext && !owner) return forbidden(config.principalRole, "get_workspace_session_surface");
         const readSurface = () => ({
           lastSeq: config.workSessions.getWorkspaceEventCursor(workspaceId),
           sessions: config.workSessions.getWorkspaceSessionSurface(
@@ -438,6 +443,7 @@ export function registerSessionTools(server: McpServer, config: BridgeConfig): v
             limit,
             filter,
             afterUpdatedAt && afterSessionId ? { updatedAt: afterUpdatedAt, sessionId: afterSessionId } : undefined,
+            owner,
           ),
         });
         const surface = config.db
@@ -488,7 +494,9 @@ export function registerSessionTools(server: McpServer, config: BridgeConfig): v
       if (!isReviewer(config.principalRole)) {
         return forbidden(config.principalRole, "list_active_work_sessions");
       }
-      const surface = config.workSessions.getWorkspaceSessionSurface(workspaceId, 50, "live");
+      const owner = liveOwnerContextId(config);
+      if (config.connectionContext && !owner) return forbidden(config.principalRole, "list_active_work_sessions");
+      const surface = config.workSessions.getWorkspaceSessionSurface(workspaceId, 50, "live", undefined, owner);
       const mapped = surface.map((s) => {
         return {
           sessionId: s.sessionId,
@@ -540,6 +548,8 @@ export function registerSessionTools(server: McpServer, config: BridgeConfig): v
       if (!isReviewer(config.principalRole)) {
         return forbidden(config.principalRole, "handoff_work_session");
       }
+      const access = requireWorkSessionMutation(config, sessionId);
+      if (access) return access;
       const session = config.workSessions.get(sessionId);
       if (!session) return { content: [{ type: "text" as const, text: "Session not found." }], isError: true };
       if (TERMINAL_STATUSES.has(session.status)) {
@@ -609,6 +619,8 @@ export function registerSessionTools(server: McpServer, config: BridgeConfig): v
       if (config.principalRole !== "reviewer" && config.principalRole !== "worker") {
         return forbidden(config.principalRole, "cancel_work_session");
       }
+      const access = requireWorkSessionMutation(config, sessionId);
+      if (access) return access;
       const session = config.workSessions.get(sessionId);
       if (!session) return { content: [{ type: "text" as const, text: "Session not found." }], isError: true };
       const bind = assertWorkerSessionBinding(config, sessionId);

@@ -35,6 +35,7 @@ export interface WorkSession {
   completionPolicy: CompletionPolicy;
   reviewEpoch: number;
   submittedBy: string;
+  ownerContextId?: string;
   title?: string;
   lastConsumedFeedbackId?: string;
   lastConsumedReviewEpoch: number;

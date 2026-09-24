@@ -141,13 +141,12 @@ commands that need a terminal.
 
 ## Show Changes
 
-By default, `KONTROL_WIDGETS=full`.
+By default, `KONTROL_WIDGETS=changes`.
 
-In that mode, Kontrol attaches widget UI to the exposed workspace, file, edit,
-and shell tools. The aggregate `show_changes` tool is not exposed by default.
-
-Use `KONTROL_WIDGETS=off` to disable widget UI, or `KONTROL_WIDGETS=changes`
-to expose the aggregate show-changes flow.
+In that mode, Kontrol attaches widget UI to `open_workspace` and exposes the
+aggregate `show_changes` tool. Use `KONTROL_WIDGETS=full` when routine file,
+edit, and shell tools should also expose widget cards, or `KONTROL_WIDGETS=off`
+to disable widget UI.
 
 ## Shell Use
 

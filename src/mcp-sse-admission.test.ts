@@ -26,6 +26,7 @@ const config = loadConfig({
   KONTROL_MCP_MAX_QUEUE: "1",
   KONTROL_MCP_ADMISSION_TIMEOUT_MS: "50",
   KONTROL_MCP_SESSION_REAPER_INTERVAL_MS: "1000",
+  KONTROL_MCP_SSE_HEARTBEAT_MS: "10",
   KONTROL_DIAGNOSTICS_SECRET: "sse-admission-test-secret",
 });
 
@@ -106,6 +107,9 @@ async function openSse(sessionId: string): Promise<SseStream> {
 async function closeSse(sessionId: string, stream: SseStream): Promise<void> {
   stream.controller.abort();
   await stream.response.body?.cancel().catch(() => {});
+  // Reconnect churn creates fresh transports; explicitly terminate those
+  // sessions so the test exercises stream loss without accumulating the
+  // intentionally retained session records.
   await fetch(url, { method: "DELETE", headers: { "mcp-session-id": sessionId } }).catch(() => {});
 }
 
@@ -137,9 +141,32 @@ try {
     sessions.push(session);
   }
 
+  // Verify the heartbeat is a real SSE comment at the byte level. A literal
+  // backslash-n sequence sends bytes but cannot delimit an SSE event.
+  const heartbeatReader = sessions[0].stream!.response.body?.getReader();
+  assert.ok(heartbeatReader, "standalone SSE response must expose a readable stream");
+  const heartbeatChunk = await Promise.race([
+    heartbeatReader!.read(),
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error("timed out waiting for SSE heartbeat")), 1_000)),
+  ]);
+  assert.equal(heartbeatChunk.done, false, "heartbeat stream must remain open after the keep-alive");
+  const heartbeatText = new TextDecoder().decode(heartbeatChunk.value);
+  assert.match(heartbeatText, /^: kontrol-heartbeat\n\n/, "heartbeat must contain actual SSE newline delimiters");
+  assert.doesNotMatch(heartbeatText, /\\n/, "heartbeat must not contain escaped backslash-n bytes");
+  heartbeatReader!.releaseLock();
+  // A subsequent SSE-delimited MCP response remains parseable after the
+  // comment heartbeat; this catches a framing change that would poison the
+  // next event even though the keep-alive bytes themselves were sent.
+  const subsequentEvent = await rpc("tools/list", {}, sessions[0].sessionId);
+  assert.equal(subsequentEvent.response.status, 200, JSON.stringify(subsequentEvent.payload));
+  assert.ok(subsequentEvent.payload?.result?.tools, "subsequent SSE event must parse into a tool catalog");
+  await sessions[0].stream!.response.body?.cancel().catch(() => {});
+  sessions[0].stream = undefined;
+
+  await waitFor(async () => (await diagnostics()).mcpSessionMetrics.activeSseStreams === 2);
   let snapshot = await diagnostics();
-  assert.equal(snapshot.mcpSessionMetrics.activeSseStreams, 3);
-  assert.deepEqual(snapshot.mcpSessionMetrics.activeSseStreamsByClient, { "mcp:mcp:sse-admission-test@1.0.0": 3 });
+  assert.equal(snapshot.mcpSessionMetrics.activeSseStreams, 2);
+  assert.deepEqual(snapshot.mcpSessionMetrics.activeSseStreamsByClient, { "mcp:mcp:sse-admission-test@1.0.0": 2 });
   assert.equal(snapshot.mcpSessionMetrics.inFlight, 0, "persistent SSE must not count as finite in-flight execution");
   assert.equal(snapshot.mcpSessionMetrics.executionAdmission.activeWeight, 0, "persistent SSE must not consume execution weight");
   assert.equal(snapshot.mcpSessionMetrics.executionAdmission.availableWeight, 4);
@@ -159,12 +186,12 @@ try {
   assert.notEqual(bash.payload?.result?.isError, true, `weighted shell execution failed while SSE streams were open: ${JSON.stringify(bash.payload)}`);
 
   snapshot = await diagnostics();
-  assert.equal(snapshot.mcpSessionMetrics.activeSseStreams, 3);
+  assert.equal(snapshot.mcpSessionMetrics.activeSseStreams, 2);
   assert.equal(snapshot.mcpSessionMetrics.executionAdmission.activeWeight, 0);
   assert.equal(snapshot.mcpSessionMetrics.executionAdmission.capacityRejectionsByTool.bash ?? 0, 0);
 
   for (const session of sessions) {
-    await closeSse(session.sessionId, session.stream!);
+    if (session.stream) await closeSse(session.sessionId, session.stream);
     session.stream = undefined;
   }
   await waitFor(async () => (await diagnostics()).mcpSessionMetrics.activeSseStreams === 0);

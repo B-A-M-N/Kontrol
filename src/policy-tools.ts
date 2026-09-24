@@ -6,13 +6,16 @@ import type { PolicyEngine } from "./policy.js";
 import type { ApprovalScope } from "./policy.js";
 import type { PrincipalRole } from "./policy-enforcement.js";
 import type { ApprovalRequestManager, ApprovalRequest } from "./approval-requests.js";
+import type { WorkSessionManager } from "./work-sessions.js";
 import { workspaceAppToolMeta } from "./workspace-app-resource.js";
 import { mutationPrincipalId, runWithMutationReceipt, type MutationReceiptStore } from "./mutation-receipts.js";
+import { mcpOwnerContextId } from "./mcp/owner-context.js";
 
 interface PolicyToolConfig {
   eventStore: EventStore;
   policyEngine: PolicyEngine;
   approvalRequests?: ApprovalRequestManager;
+  workSessions?: WorkSessionManager;
   /**
    * The role of the caller presenting this MCP connection. Reviewer-only tools
    * (provide_policy_approval) are rejected unless the caller is a reviewer.
@@ -22,11 +25,30 @@ interface PolicyToolConfig {
    */
   principalRole?: PrincipalRole;
   principalId?: string;
+  ownerContextId?: string;
+  connectionContext?: import("./mcp/connection-context.js").ConnectionContext;
   mutationReceipts?: MutationReceiptStore;
 }
 
 function isReviewer(role?: PrincipalRole): boolean {
   return role === "reviewer";
+}
+
+function liveOwner(config: PolicyToolConfig): string | undefined {
+  return mcpOwnerContextId(config.connectionContext ?? {}) ?? config.ownerContextId;
+}
+
+function missingOwnerResponse() {
+  return { content: [{ type: "text" as const, text: "Forbidden: this reviewer connection has no live transport identity." }], isError: true as const };
+}
+
+function grantOwnedBy(config: PolicyToolConfig, grant: { principalId: string; scope: string; scopeId: string }): boolean {
+  const owner = liveOwner(config);
+  if (!owner) return true;
+  if (grant.principalId === owner) return true;
+  return grant.scope === "work_session"
+    ? config.workSessions?.get(grant.scopeId)?.ownerContextId === owner
+    : false;
 }
 
 function workspaceAppModelAndAppMeta() {
@@ -44,7 +66,7 @@ function registerMutationPolicyTool(
     const { clientMutationId, ...request } = input as { clientMutationId?: string } & Record<string, unknown>;
     return runWithMutationReceipt({
       store: config.mutationReceipts,
-      principalId: mutationPrincipalId(config.principalId, config.principalRole),
+      principalId: [mutationPrincipalId(config.principalId, config.principalRole), liveOwner(config)].filter(Boolean).join("|owner:"),
       operation: name,
       clientMutationId,
       request,
@@ -107,6 +129,7 @@ export const approvalCardSchema = z.object({
   command: z.string().optional(),
   origin: z.enum(["direct_mcp", "work_session"]).optional(),
   conversationId: z.string().optional(),
+  ownerContextId: z.string().optional(),
   orphanedAt: z.string().optional(),
   reattachDeadline: z.string().optional(),
   liveWaiterCount: z.number(),
@@ -134,6 +157,7 @@ function policyApprovalToCard(a: ReturnType<PolicyEngine["getPendingApprovals"]>
     command: a.command,
     origin: a.origin,
     conversationId: a.conversationId,
+    ownerContextId: a.ownerContextId,
     orphanedAt: a.orphanedAt,
     reattachDeadline: a.reattachDeadline,
     liveWaiterCount,
@@ -169,6 +193,7 @@ function genericApprovalToCard(a: ApprovalRequest) {
     command: a.command,
     origin: a.origin,
     conversationId: a.conversationId,
+    ownerContextId: a.ownerContextId,
     orphanedAt: a.orphanedAt,
     reattachDeadline: a.reattachDeadline,
     liveWaiterCount,
@@ -186,12 +211,17 @@ function genericApprovalToCard(a: ApprovalRequest) {
 }
 
 function listAllApprovals(config: PolicyToolConfig, workspaceId?: string) {
-  return [
+  const owner = liveOwner(config);
+  const all = [
     ...config.policyEngine.getPendingApprovals(workspaceId).map(policyApprovalToCard),
     ...(config.approvalRequests?.listPending(workspaceId)
       .filter((request) => request.kind !== "tool")
       .map(genericApprovalToCard) ?? []),
   ];
+  return owner ? all.filter((approval) => {
+    const candidate = approval as { conversationId?: string; ownerContextId?: string };
+    return candidate.ownerContextId === owner || candidate.conversationId === owner;
+  }) : all;
 }
 
 /**
@@ -233,6 +263,7 @@ export function registerPolicyTools(
           isError: true,
         };
       }
+      if (config.connectionContext && !liveOwner(config)) return missingOwnerResponse();
       const approvals = listAllApprovals(config, workspaceId);
       return {
         content: [{ type: "text" as const, text: `${approvals.length} pending approval(s).` }],
@@ -271,6 +302,7 @@ export function registerPolicyTools(
           isError: true,
         };
       }
+      if (config.connectionContext && !liveOwner(config)) return missingOwnerResponse();
       const pending = listAllApprovals(config, workspaceId);
 
       return {
@@ -318,6 +350,9 @@ export function registerPolicyTools(
       if (!match) {
         const generic = config.approvalRequests?.get(approvalId);
         if (generic?.status === "pending") {
+          if (liveOwner(config) && generic.ownerContextId && generic.ownerContextId !== liveOwner(config)) {
+            return { content: [{ type: "text" as const, text: "Forbidden: approval belongs to another conversation." }], isError: true };
+          }
           const option = generic.options.find((candidate) => candidate.id === decision);
           if (!option) {
             return {
@@ -335,7 +370,7 @@ export function registerPolicyTools(
             config.eventStore.appendEvent({
               type: "approval.resolved",
               sessionId: generic.workSessionId ?? generic.workspaceSessionId,
-              payload: { approvalId, kind: generic.kind, decision: "changes_requested", optionId: decision, effect: option.effect, status: resolved?.status ?? "denied", reason },
+              payload: { approvalId, kind: generic.kind, decision: "changes_requested", optionId: decision, effect: option.effect, status: resolved?.status ?? "denied", reason, ownerContextId: liveOwner(config) },
             });
             return {
               content: [{ type: "text" as const, text: `Decision recorded: ${decision} for approval ${approvalId}.` }],
@@ -370,6 +405,9 @@ export function registerPolicyTools(
           content: [{ type: "text" as const, text: `Approval "${approvalId}" not found.` }],
           isError: true,
         };
+      }
+      if (liveOwner(config) && match.ownerContextId && match.ownerContextId !== liveOwner(config)) {
+        return { content: [{ type: "text" as const, text: "Forbidden: approval belongs to another conversation." }], isError: true };
       }
       if (decision !== "approve" && decision !== "approve_session" && decision !== "approve_workspace" && decision !== "deny") {
         return {
@@ -416,6 +454,7 @@ export function registerPolicyTools(
           decision: decision === "deny" ? "deny" : "approve",
           scope: approvalScope,
           reason,
+          ownerContextId: liveOwner(config),
         },
       });
 
@@ -446,7 +485,8 @@ export function registerPolicyTools(
       if (!isReviewer(config.principalRole)) {
         return { content: [{ type: "text" as const, text: "Forbidden: list_policy_grants requires reviewer authority." }], isError: true };
       }
-      const grants = config.policyEngine.listGrants(scope as ApprovalScope | undefined, scopeId);
+      const grants = config.policyEngine.listGrants(scope as ApprovalScope | undefined, scopeId)
+        .filter((grant) => grantOwnedBy(config, grant));
       return { content: [{ type: "text" as const, text: `${grants.length} effective policy grant(s).` }], structuredContent: { grants } };
     },
   );
@@ -474,6 +514,9 @@ export function registerPolicyTools(
         return { content: [{ type: "text" as const, text: "Forbidden: revoke_policy_grant requires reviewer authority." }], isError: true };
       }
       const grant = config.policyEngine.listGrants().find((candidate) => candidate.id === grantId);
+      if (liveOwner(config) && grant && !grantOwnedBy(config, grant)) {
+        return { content: [{ type: "text" as const, text: "Forbidden: policy grant belongs to another conversation." }], isError: true };
+      }
       if (!grant) {
         return { content: [{ type: "text" as const, text: `Unknown or already-revoked policy grant: ${grantId}.` }], isError: true };
       }
@@ -481,7 +524,7 @@ export function registerPolicyTools(
       config.eventStore.appendEvent({
         type: "policy.grants.revoked",
         sessionId: grant.scopeId,
-        payload: { scope: grant.scope, scopeId: grant.scopeId, grantId, principalId: grant.principalId, exact: true },
+        payload: { scope: grant.scope, scopeId: grant.scopeId, grantId, principalId: grant.principalId, ownerContextId: liveOwner(config), exact: true },
       });
       return {
         content: [{ type: "text" as const, text: `Revoked policy grant ${grantId} (${grant.scope}:${grant.scopeId}).` }],
@@ -513,11 +556,14 @@ export function registerPolicyTools(
       if (!isReviewer(config.principalRole)) {
         return { content: [{ type: "text" as const, text: "Forbidden: revoke_policy_grants requires reviewer authority." }], isError: true };
       }
+      if (liveOwner(config) && config.policyEngine.listGrants(scope as ApprovalScope, scopeId).some((grant) => !grantOwnedBy(config, grant))) {
+        return { content: [{ type: "text" as const, text: "Forbidden: scope contains grants from another conversation." }], isError: true };
+      }
       config.policyEngine.revokeScope(scope as ApprovalScope, scopeId);
       config.eventStore.appendEvent({
         type: "policy.grants.revoked",
         sessionId: scopeId,
-        payload: { scope, scopeId, bulk: true },
+        payload: { scope, scopeId, bulk: true, ownerContextId: liveOwner(config) },
       });
       return { content: [{ type: "text" as const, text: `Revoked ${scope} policy grants for ${scopeId}.` }], structuredContent: { status: "revoked", scope, scopeId } };
     },

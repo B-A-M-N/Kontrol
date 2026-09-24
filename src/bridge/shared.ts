@@ -12,6 +12,7 @@ import type { PrincipalRole } from "../policy-enforcement.js";
 import { workspaceAppToolMeta } from "../workspace-app-resource.js";
 import type { BridgeConfig } from "./context.js";
 import { realpath } from "node:fs/promises";
+import { mcpOwnerContextId } from "../mcp/owner-context.js";
 
 export interface LiveWaiterRegistry {
   add(sessionId: string): string;
@@ -78,6 +79,23 @@ export const defaultLiveWaiters: LiveWaiterRegistry = (() => {
 
 export function isReviewer(role?: PrincipalRole): boolean {
   return role === "reviewer";
+}
+
+export function liveConnectionIdentity(config: BridgeConfig): {
+  mcpSessionId?: string;
+  conversationId?: string;
+  principalId?: string;
+} {
+  return {
+    mcpSessionId: config.connectionContext?.mcpSessionId ?? config.connectionMcpSessionId,
+    conversationId: config.connectionContext?.conversationId ?? config.connectionConversationId,
+    principalId: config.connectionContext?.authenticatedPrincipalId ?? config.principalId,
+  };
+}
+
+export function liveOwnerContextId(config: BridgeConfig): string | undefined {
+  const identity = liveConnectionIdentity(config);
+  return mcpOwnerContextId(identity);
 }
 
 export function isWorkerOrClient(role?: PrincipalRole): boolean {
@@ -165,9 +183,33 @@ export function assertWorkerSessionBinding(config: BridgeConfig, sessionId: stri
   return null;
 }
 
+export function requireWorkSessionMutation(config: BridgeConfig, sessionId: string) {
+  const access = requireWorkSessionRead(config, sessionId);
+  if (access) return access;
+  const bind = assertWorkerSessionBinding(config, sessionId);
+  if (bind) return bind;
+  if (config.connectionContext && !liveOwnerContextId(config)) {
+    return forbidden(config.principalRole, "missing transport identity");
+  }
+  return null;
+}
+
 export function requireWorkSessionRead(config: BridgeConfig, sessionId: string) {
+  if (config.principalRole === "worker" && (config.connectionWorkSessionId === sessionId || !config.connectionWorkSessionId)) return null;
+  const session = config.workSessions.get(sessionId);
+  const owner = liveOwnerContextId(config);
+  if (session?.ownerContextId && owner && session.ownerContextId !== owner) {
+    return forbidden(config.principalRole, "cross-conversation work-session read");
+  }
+  // A real HTTP reviewer without transport identity is never an implicit global
+  // administrator. Direct unit harnesses may opt into the legacy global view
+  // by omitting connectionContext entirely.
+  if (config.connectionContext && !owner) {
+    return forbidden(config.principalRole, "missing transport identity");
+  }
+  // An ownerless reviewer is the explicit global reviewer surface. An owner
+  // scoped reviewer is still constrained to its conversation.
   if (isReviewer(config.principalRole)) return null;
-  if (config.principalRole === "worker" && config.connectionWorkSessionId === sessionId) return null;
   return forbidden(config.principalRole, "work-session read");
 }
 

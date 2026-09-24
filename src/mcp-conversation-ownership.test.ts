@@ -9,13 +9,17 @@
 // All assertions exercise the public MCP surface — no internal hooks.
 
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "./server.js";
 import { loadConfig } from "./config.js";
 
 const root = mkdtempSync(join(tmpdir(), "kontrol-conversation-ownership-root-"));
+mkdirSync(join(root, "nested"), { recursive: true });
+writeFileSync(join(root, "AGENTS.md"), "root instructions\n");
+writeFileSync(join(root, "nested", "AGENTS.md"), "nested instructions\n");
+writeFileSync(join(root, "nested", "file.txt"), "hello\n");
 const stateDir = mkdtempSync(join(tmpdir(), "kontrol-conversation-ownership-state-"));
 const worktreeRoot = mkdtempSync(join(tmpdir(), "kontrol-conversation-ownership-worktrees-"));
 const config = loadConfig({
@@ -146,6 +150,77 @@ try {
   assert.equal(denied.payload?.result?.isError, true,
     `conversation B must not write to conversation A's process: ${JSON.stringify(denied.payload)}`);
   assert.match(resultText(denied.payload), /owned by another client|Unknown process session/);
+
+  // A generic clientInfo-only transport has no trusted conversation identity
+  // and must not be eligible for cross-transport continuity reattachment.
+  const noConversation = await (async () => {
+    const initialized = await rpc("initialize", {
+      protocolVersion: "2025-06-18",
+      capabilities: {},
+      clientInfo: { name: "conversation-ownership-client", version: "1.0.0" },
+    });
+    assert.equal(initialized.response.status, 200, JSON.stringify(initialized.payload));
+    const sessionId = initialized.sessionId;
+    assert.ok(sessionId);
+    const notification = await fetch(url, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+        "x-kontrol-client-instance": instanceId,
+        "mcp-session-id": sessionId,
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized", params: {} }),
+    });
+    assert.ok([200, 202].includes(notification.status));
+    return sessionId;
+  })();
+  const noConversationDiagnostics = await diagnostics();
+  const noConversationRecord = noConversationDiagnostics.mcpSessionMetrics.logicalContinuity.records.find(
+    (record: any) => record.identity === `instance:${instanceId}`,
+  );
+  assert.equal(noConversationRecord, undefined, "no trusted conversation must not enter continuity reattachment");
+  const noConversationDelete = await fetch(url, { method: "DELETE", headers: { "x-kontrol-client-instance": instanceId, "mcp-session-id": noConversation } });
+  assert.ok([200, 202, 204].includes(noConversationDelete.status));
+
+  // Two real HTTP transports with no conversation header must still receive
+  // independent instruction snapshots; the live MCP session ID is the fallback
+  // owner identity, not the shared workspace record.
+  const headerlessA = await (async () => {
+    const initialized = await rpc("initialize", {
+      protocolVersion: "2025-06-18",
+      capabilities: {},
+      clientInfo: { name: "headerless-a", version: "1.0.0" },
+    });
+    const sessionId = initialized.sessionId;
+    assert.ok(sessionId);
+    await rpc("notifications/initialized", {}, { sessionId });
+    const opened = await rpc("tools/call", { name: "open_workspace", arguments: { path: root, mode: "checkout" } }, { sessionId });
+    const workspaceId = opened.payload?.result?.structuredContent?.workspaceId;
+    assert.equal(typeof workspaceId, "string");
+    return { sessionId, workspaceId };
+  })();
+  const headerlessB = await (async () => {
+    const initialized = await rpc("initialize", {
+      protocolVersion: "2025-06-18",
+      capabilities: {},
+      clientInfo: { name: "headerless-b", version: "1.0.0" },
+    });
+    const sessionId = initialized.sessionId;
+    assert.ok(sessionId);
+    await rpc("notifications/initialized", {}, { sessionId });
+    const opened = await rpc("tools/call", { name: "open_workspace", arguments: { path: root, mode: "checkout" } }, { sessionId });
+    const workspaceId = opened.payload?.result?.structuredContent?.workspaceId;
+    assert.equal(typeof workspaceId, "string");
+    return { sessionId, workspaceId };
+  })();
+  const headerlessReadA = await rpc("tools/call", { name: "read", arguments: { workspaceId: headerlessA.workspaceId, path: "nested/file.txt" } }, { sessionId: headerlessA.sessionId });
+  const headerlessReadB = await rpc("tools/call", { name: "read", arguments: { workspaceId: headerlessB.workspaceId, path: "nested/file.txt" } }, { sessionId: headerlessB.sessionId });
+  assert.match(resultText(headerlessReadA.payload), /nested instructions/, "headerless transport A receives nested instructions");
+  assert.match(resultText(headerlessReadB.payload), /nested instructions/, "headerless transport B receives nested instructions");
+  assert.notEqual(headerlessA.sessionId, headerlessB.sessionId, "headerless transports remain distinct");
+  await fetch(url, { method: "DELETE", headers: { "mcp-session-id": headerlessA.sessionId } });
+  await fetch(url, { method: "DELETE", headers: { "mcp-session-id": headerlessB.sessionId } });
 
   // A fresh transport for the SAME conversation retains ownership.
   const conversationAFresh = await openSession("ownership-conversation-a");

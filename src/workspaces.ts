@@ -44,11 +44,17 @@ export interface Workspace {
   worktree?: WorkspaceWorktree;
   skills: LoadedSkills["skills"];
   skillDiagnostics: LoadedSkills["diagnostics"];
+}
+
+/** Conversation-sensitive state is owned by one MCP transport, not the shared project record. */
+export interface WorkspaceSessionState {
   activatedSkillDirs: Set<string>;
-  /** Instructions loaded for this workspace, keyed by canonical file path. */
+  /** Instructions loaded by this transport, keyed by canonical file path. */
   loadedAgentsFiles: Map<string, LoadedAgentsFile>;
   currentWorkSessionId?: string;
 }
+
+const DEFAULT_WORKSPACE_SESSION_ID = "default";
 
 export interface WorkspaceContext {
   workspace: Workspace;
@@ -72,21 +78,22 @@ export class WorkspaceRegistry {
   private readonly workspaces = new Map<string, Workspace>();
   /** P0 #5: canonical root → workspace ID, so the same repo reuses its identity. */
   private readonly canonicalRootToId = new Map<string, string>();
+  private readonly sessionStates = new Map<string, Map<string, WorkspaceSessionState>>();
 
   constructor(
     private readonly config: ServerConfig,
     private readonly store?: WorkspaceStore,
   ) {}
 
-  async openWorkspace(input: string | OpenWorkspaceInput): Promise<WorkspaceContext> {
+  async openWorkspace(input: string | OpenWorkspaceInput, sessionId = DEFAULT_WORKSPACE_SESSION_ID): Promise<WorkspaceContext> {
     const options = typeof input === "string" ? { path: input } : input;
     const mode = options.mode ?? "checkout";
 
     if (mode === "worktree") {
-      return this.openWorktreeWorkspace(options.path, options.baseRef);
+      return this.openWorktreeWorkspace(options.path, options.baseRef, sessionId);
     }
 
-    return this.openCheckoutWorkspace(options.path);
+    return this.openCheckoutWorkspace(options.path, sessionId);
   }
 
   getWorkspace(workspaceId: string): Workspace {
@@ -120,14 +127,29 @@ export class WorkspaceRegistry {
             }
           : undefined,
       ...this.loadSkillsForWorkspace(root),
-      activatedSkillDirs: new Set(),
-      loadedAgentsFiles: new Map(),
     };
-    for (const file of this.loadInitialAgentsFiles(root)) restoredWorkspace.loadedAgentsFiles.set(file.path, file);
     this.store?.touchSession(workspaceId);
     this.workspaces.set(restoredWorkspace.id, restoredWorkspace);
 
     return restoredWorkspace;
+  }
+
+  private getOrCreateSessionState(workspace: Workspace, sessionId: string): WorkspaceSessionState {
+    let byWorkspace = this.sessionStates.get(sessionId);
+    if (!byWorkspace) {
+      byWorkspace = new Map();
+      this.sessionStates.set(sessionId, byWorkspace);
+    }
+    let state = byWorkspace.get(workspace.id);
+    if (!state) {
+      state = {
+        activatedSkillDirs: new Set(),
+        loadedAgentsFiles: new Map(),
+      };
+      for (const file of this.loadInitialAgentsFiles(workspace.root)) state.loadedAgentsFiles.set(file.path, file);
+      byWorkspace.set(workspace.id, state);
+    }
+    return state;
   }
 
   resolvePath(workspace: Workspace, inputPath: string): string {
@@ -140,7 +162,7 @@ export class WorkspaceRegistry {
     return absolutePath;
   }
 
-  resolveReadPath(workspace: Workspace, inputPath: string): WorkspaceReadPath {
+  resolveReadPath(workspace: Workspace, inputPath: string, sessionId = DEFAULT_WORKSPACE_SESSION_ID): WorkspaceReadPath {
     try {
       return {
         absolutePath: this.resolvePath(workspace, inputPath),
@@ -149,7 +171,7 @@ export class WorkspaceRegistry {
     } catch (workspaceError) {
       const skillRead = resolveSkillReadPath(
         workspace.skills,
-        workspace.activatedSkillDirs,
+        this.getOrCreateSessionState(workspace, sessionId).activatedSkillDirs,
         inputPath,
       );
       if (!skillRead) throw workspaceError;
@@ -167,7 +189,7 @@ export class WorkspaceRegistry {
    * walks ancestors from the workspace root to the target directory; it never
    * scans descendants looking for AGENTS.md/CLAUDE.md files.
    */
-  async loadApplicableInstructions(workspace: Workspace, inputPath: string): Promise<LoadedAgentsFile[]> {
+  async loadApplicableInstructions(workspace: Workspace, inputPath: string, sessionId = DEFAULT_WORKSPACE_SESSION_ID): Promise<LoadedAgentsFile[]> {
     const resolved = await resolveAllowedPathCanonical(inputPath, workspace.root, [workspace.root]);
     let directory = resolved;
     try {
@@ -187,15 +209,15 @@ export class WorkspaceRegistry {
       current = parent;
     }
 
+    const sessionState = this.getOrCreateSessionState(workspace, sessionId);
     const newlyLoaded: LoadedAgentsFile[] = [];
     for (const ancestor of ancestors) {
       for (const filename of ["AGENTS.md", "CLAUDE.md"]) {
         const filePath = resolve(ancestor, filename);
-        if (workspace.loadedAgentsFiles.has(filePath)) continue;
+        if (sessionState.loadedAgentsFiles.has(filePath)) continue;
         try {
           const content = await readFile(filePath, "utf8");
           const file = { path: filePath, content };
-          workspace.loadedAgentsFiles.set(filePath, file);
           newlyLoaded.push(file);
           break;
         } catch {
@@ -207,20 +229,44 @@ export class WorkspaceRegistry {
     return newlyLoaded;
   }
 
-  getLoadedAgentsFiles(workspace: Workspace): LoadedAgentsFile[] {
-    return [...workspace.loadedAgentsFiles.values()];
+  /** Mark discovered instructions as delivered only after the owning tool succeeds. */
+  acknowledgeApplicableInstructions(
+    workspace: Workspace,
+    files: LoadedAgentsFile[],
+    sessionId = DEFAULT_WORKSPACE_SESSION_ID,
+  ): void {
+    if (files.length === 0) return;
+    const state = this.getOrCreateSessionState(workspace, sessionId);
+    for (const file of files) state.loadedAgentsFiles.set(file.path, file);
   }
 
-  setActiveSession(workspaceId: string, sessionId: string | undefined): void {
+  getLoadedAgentsFiles(workspace: Workspace, sessionId = DEFAULT_WORKSPACE_SESSION_ID): LoadedAgentsFile[] {
+    return [...this.getOrCreateSessionState(workspace, sessionId).loadedAgentsFiles.values()];
+  }
+
+  setActiveSession(workspaceId: string, sessionId: string | undefined, mcpSessionId = DEFAULT_WORKSPACE_SESSION_ID): void {
     const workspace = this.workspaces.get(workspaceId);
     if (!workspace) throw new Error(`Unknown workspaceId: ${workspaceId}. Call open_workspace first.`);
-    workspace.currentWorkSessionId = sessionId;
+    this.getOrCreateSessionState(workspace, mcpSessionId).currentWorkSessionId = sessionId;
   }
 
-  markReadPathLoaded(workspace: Workspace, readPath: WorkspaceReadPath): void {
+  getCurrentWorkSessionId(workspaceId: string, mcpSessionId = DEFAULT_WORKSPACE_SESSION_ID): string | undefined {
+    const workspace = this.workspaces.get(workspaceId);
+    return workspace ? this.getOrCreateSessionState(workspace, mcpSessionId).currentWorkSessionId : undefined;
+  }
+
+  markReadPathLoaded(workspace: Workspace, readPath: WorkspaceReadPath, sessionId = DEFAULT_WORKSPACE_SESSION_ID): void {
     if (readPath.skillRead?.isSkillFile) {
-      markSkillActivated(workspace.activatedSkillDirs, readPath.skillRead.skill);
+      markSkillActivated(this.getOrCreateSessionState(workspace, sessionId).activatedSkillDirs, readPath.skillRead.skill);
     }
+  }
+
+  getSessionState(workspace: Workspace, sessionId = DEFAULT_WORKSPACE_SESSION_ID): WorkspaceSessionState {
+    return this.getOrCreateSessionState(workspace, sessionId);
+  }
+
+  clearSessionState(sessionId: string): void {
+    this.sessionStates.delete(sessionId);
   }
 
   resolveWorkingDirectory(workspace: Workspace, workingDirectory: string | undefined): string {
@@ -228,7 +274,7 @@ export class WorkspaceRegistry {
     return assertAllowedPath(directory, [workspace.root]);
   }
 
-  private async openCheckoutWorkspace(path: string): Promise<WorkspaceContext> {
+  private async openCheckoutWorkspace(path: string, sessionId = DEFAULT_WORKSPACE_SESSION_ID): Promise<WorkspaceContext> {
     const root = assertAllowedPath(path, this.config.allowedRoots);
 
     // P0 #6: checkout mode must never create the requested project directory.
@@ -261,17 +307,17 @@ export class WorkspaceRegistry {
       const existing = this.workspaces.get(existingId);
       if (existing) {
         this.store?.touchSession(existingId);
-        const agentsFiles = this.loadInitialAgentsFiles(existing.root);
-        const availableAgentsFiles = await this.findAvailableAgentsFiles(existing.root, agentsFiles);
-        return { workspace: existing, agentsFiles, availableAgentsFiles };
+        const state = this.getOrCreateSessionState(existing, sessionId);
+        const availableAgentsFiles = await this.findAvailableAgentsFiles(existing.root, [...state.loadedAgentsFiles.values()]);
+        return { workspace: existing, agentsFiles: [...state.loadedAgentsFiles.values()], availableAgentsFiles };
       }
       // Stale in-memory entry but DB record exists — restore it.
       const session = this.store?.getSession(existingId);
       if (session) {
         const restored = await this.restoreWorkspaceFromSession(session);
-        const agentsFiles = this.loadInitialAgentsFiles(restored.root);
-        const availableAgentsFiles = await this.findAvailableAgentsFiles(restored.root, agentsFiles);
-        return { workspace: restored, agentsFiles, availableAgentsFiles };
+        const state = this.getOrCreateSessionState(restored, sessionId);
+        const availableAgentsFiles = await this.findAvailableAgentsFiles(restored.root, [...state.loadedAgentsFiles.values()]);
+        return { workspace: restored, agentsFiles: [...state.loadedAgentsFiles.values()], availableAgentsFiles };
       }
     }
 
@@ -280,16 +326,16 @@ export class WorkspaceRegistry {
       const dbExisting = this.store.getLatestByCanonicalRoot(canonicalKey, "checkout");
       if (dbExisting) {
         const restored = await this.restoreWorkspaceFromSession(dbExisting);
-        const agentsFiles = this.loadInitialAgentsFiles(restored.root);
-        const availableAgentsFiles = await this.findAvailableAgentsFiles(restored.root, agentsFiles);
-        return { workspace: restored, agentsFiles, availableAgentsFiles };
+        const state = this.getOrCreateSessionState(restored, sessionId);
+        const availableAgentsFiles = await this.findAvailableAgentsFiles(restored.root, [...state.loadedAgentsFiles.values()]);
+        return { workspace: restored, agentsFiles: [...state.loadedAgentsFiles.values()], availableAgentsFiles };
       }
     }
 
-    return this.createWorkspaceContext({ root: resolvedRoot, mode: "checkout" });
+    return this.createWorkspaceContext({ root: resolvedRoot, mode: "checkout" }, sessionId);
   }
 
-  private async openWorktreeWorkspace(path: string, baseRef: string | undefined): Promise<WorkspaceContext> {
+  private async openWorktreeWorkspace(path: string, baseRef: string | undefined, sessionId = DEFAULT_WORKSPACE_SESSION_ID): Promise<WorkspaceContext> {
     const worktree = await createManagedWorktree({
       sourcePath: path,
       baseRef,
@@ -301,7 +347,7 @@ export class WorkspaceRegistry {
       mode: "worktree",
       sourceRoot: worktree.sourceRoot,
       worktree,
-    });
+    }, sessionId);
   }
 
   private async restoreWorkspaceFromSession(session: {
@@ -332,10 +378,7 @@ export class WorkspaceRegistry {
             }
           : undefined,
       ...this.loadSkillsForWorkspace(session.root),
-      activatedSkillDirs: new Set(),
-      loadedAgentsFiles: new Map(),
     };
-    for (const file of this.loadInitialAgentsFiles(session.root)) workspace.loadedAgentsFiles.set(file.path, file);
     this.workspaces.set(workspace.id, workspace);
     const canonicalKey = session.root;
     this.canonicalRootToId.set(canonicalKey, workspace.id);
@@ -347,7 +390,7 @@ export class WorkspaceRegistry {
     mode: WorkspaceMode;
     sourceRoot?: string;
     worktree?: WorkspaceWorktree;
-  }): Promise<WorkspaceContext> {
+  }, sessionId = DEFAULT_WORKSPACE_SESSION_ID): Promise<WorkspaceContext> {
     const workspace: Workspace = {
       id: `ws_${randomUUID()}`,
       root: input.root,
@@ -355,8 +398,6 @@ export class WorkspaceRegistry {
       sourceRoot: input.sourceRoot,
       worktree: input.worktree,
       ...this.loadSkillsForWorkspace(input.root),
-      activatedSkillDirs: new Set(),
-      loadedAgentsFiles: new Map(),
     };
 
     this.store?.createSession({
@@ -374,13 +415,12 @@ export class WorkspaceRegistry {
     // P0 #5: register canonical root mapping.
     this.canonicalRootToId.set(input.root, workspace.id);
 
-    const agentsFiles = this.loadInitialAgentsFiles(workspace.root);
-    for (const file of agentsFiles) workspace.loadedAgentsFiles.set(file.path, file);
+    const sessionState = this.getOrCreateSessionState(workspace, sessionId);
     // Nested instruction discovery is lazy and path-scoped. Keep this field in
     // the protocol for compatibility, but never recursively enumerate a repo.
     const availableAgentsFiles: AvailableAgentsFile[] = [];
 
-    return { workspace, agentsFiles, availableAgentsFiles };
+    return { workspace, agentsFiles: [...sessionState.loadedAgentsFiles.values()], availableAgentsFiles };
   }
 
   private loadSkillsForWorkspace(root: string): Pick<Workspace, "skills" | "skillDiagnostics"> {

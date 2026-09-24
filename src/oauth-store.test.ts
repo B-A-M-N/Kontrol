@@ -96,6 +96,8 @@ async function testDatabaseConfiguration(stateDir: string): Promise<void> {
       { version: 53, name: "backend-neutral-snapshot-identities" },
       { version: 54, name: "work-session-terminal-at" },
       { version: 55, name: "submission-checkpoint-coverage" },
+      { version: 56, name: "work-session-owner-context" },
+      { version: 57, name: "approval-owner-context" },
     ]);
   } finally {
     database.close();

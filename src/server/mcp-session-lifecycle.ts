@@ -29,6 +29,7 @@ export interface McpSessionLifecycleDeps {
   readonly logicalContinuity: LogicalContinuityIndex;
   readonly processSessions: ProcessSessionManager;
   readonly workspaceAppResourceMetrics: WorkspaceAppResourceMetrics;
+  clearWorkspaceSessionState(sessionId: string): void;
 }
 
 export interface McpSessionLifecycle {
@@ -50,6 +51,7 @@ export interface McpSessionLifecycle {
   recordMcpSessionCreated(logicalClientId: string, at?: number): void;
   recordMcpWindowEvent(kind: McpSessionWindowKind, at?: number): void;
   mcpSessionReuseMetrics(): Record<string, unknown>;
+  mcpSessionTerminationMetrics(): Record<string, number>;
   estimateMcpSessionMemoryCost(): { bytesPerSession: number; peakRss: number; peakCount: number };
   trackMcpSessionMemory(): void;
   getMemoryPressureState(): { level: "low" | "moderate" | "high"; effectiveHardCap: number; effectiveSoftCap: number };
@@ -76,7 +78,7 @@ function buildSessionWindowMetrics(events: Array<{ at: number; kind: McpSessionW
 }
 
 export function createMcpSessionLifecycle(deps: McpSessionLifecycleDeps): McpSessionLifecycle {
-  const { config, mcpSessions, transports, logicalContinuity, processSessions, workspaceAppResourceMetrics } = deps;
+  const { config, mcpSessions, transports, logicalContinuity, processSessions, workspaceAppResourceMetrics, clearWorkspaceSessionState } = deps;
   const mcpSessionMetrics: McpSessionMetrics = {
     created: 0,
     evicted: 0,
@@ -86,6 +88,7 @@ export function createMcpSessionLifecycle(deps: McpSessionLifecycleDeps): McpSes
     clients: new Map(),
     windowEvents: [],
     completedToolCounts: [],
+    terminationReasons: new Map(),
   };
   const mcpTimingSamples: McpTimingSample[] = [];
   const phaseTimingSamples: PhaseTimingSample[] = [];
@@ -230,6 +233,11 @@ export function createMcpSessionLifecycle(deps: McpSessionLifecycleDeps): McpSes
     else metrics.multiToolSessions++;
     mcpSessionMetrics.completedToolCounts.push(state.toolCallCount);
     if (mcpSessionMetrics.completedToolCounts.length > 10_000) mcpSessionMetrics.completedToolCounts.shift();
+    const terminationReason = state.terminationReason ?? reason;
+    mcpSessionMetrics.terminationReasons.set(
+      terminationReason,
+      (mcpSessionMetrics.terminationReasons.get(terminationReason) ?? 0) + 1,
+    );
     if (reason === "expired") {
       mcpSessionMetrics.expired++;
       metrics.sessionsExpired++;
@@ -311,6 +319,10 @@ export function createMcpSessionLifecycle(deps: McpSessionLifecycleDeps): McpSes
     };
   }
 
+  function mcpSessionTerminationMetrics(): Record<string, number> {
+    return Object.fromEntries(mcpSessionMetrics.terminationReasons.entries());
+  }
+
   // P1 #33: Memory pressure tracking for adaptive caps
   const mcpSessionBaseRss = process.memoryUsage().rss;
   let mcpSessionPeakRss = mcpSessionBaseRss;
@@ -381,6 +393,8 @@ export function createMcpSessionLifecycle(deps: McpSessionLifecycleDeps): McpSes
       return false;
     }
     if (reason === "expired" && mcpSessionHasActiveResponsibility(state)) return false;
+    state.terminationReason = options.evictionReason ?? reason;
+    clearWorkspaceSessionState(sessionId);
     state.closing = true;
     transports.delete(sessionId);
     recordMcpSessionEnd(state, reason, now);
@@ -417,6 +431,7 @@ export function createMcpSessionLifecycle(deps: McpSessionLifecycleDeps): McpSes
         lastRpcMethod: state.lastRpcMethod,
         lastToolName: state.lastToolName,
         reason: options.evictionReason ?? "bounded",
+        terminationReason: options.evictionReason ?? "idle_expiry",
         sessionLabel: state.sessionLabel,
         conversationId: state.conversationId,
       });
@@ -436,6 +451,7 @@ export function createMcpSessionLifecycle(deps: McpSessionLifecycleDeps): McpSes
       lastRpcMethod: state.lastRpcMethod,
       lastToolName: state.lastToolName,
       closeReason: reason,
+      terminationReason: state.terminationReason ?? reason,
     });
     return true;
   };
@@ -492,6 +508,7 @@ export function createMcpSessionLifecycle(deps: McpSessionLifecycleDeps): McpSes
             state.logicalClientId === forceClientId
             && !state.durableWorkerSession
             && !mcpSessionHasActiveResponsibility(state)
+            && (now - state.lastTransportActivityAt) >= config.mcpSessionReclaimGraceMs
             && !evictionReasons.has(state.sessionId)
           ));
         const byIdle = (a: McpSessionState, b: McpSessionState) => a.lastApplicationActivityAt - b.lastApplicationActivityAt;
@@ -509,6 +526,7 @@ export function createMcpSessionLifecycle(deps: McpSessionLifecycleDeps): McpSes
       if (toEvict.includes(id)) continue;
       if (state.identitySource === "client_info_fallback") continue;
       if (mcpSessionHasActiveResponsibility(state)) continue;
+      if ((now - state.lastTransportActivityAt) < config.mcpSessionReclaimGraceMs) continue;
       const count = clientCounts.get(state.logicalClientId) ?? 0;
       if (count > config.mcpSessionMaxPerClient) {
         queueEviction(id, "per_client_limit");
@@ -523,6 +541,7 @@ export function createMcpSessionLifecycle(deps: McpSessionLifecycleDeps): McpSes
       for (const [id, state] of mcpSessions) {
         if (toEvict.includes(id)) continue;
         if (mcpSessionHasActiveResponsibility(state)) continue;
+        if ((now - state.lastTransportActivityAt) < config.mcpSessionReclaimGraceMs) continue;
         candidates.push({ id, lastApplicationActivityAt: state.lastApplicationActivityAt });
       }
       candidates.sort((a, b) => a.lastApplicationActivityAt - b.lastApplicationActivityAt);
@@ -567,6 +586,7 @@ export function createMcpSessionLifecycle(deps: McpSessionLifecycleDeps): McpSes
     recordMcpSessionCreated,
     recordMcpWindowEvent,
     mcpSessionReuseMetrics,
+    mcpSessionTerminationMetrics,
     estimateMcpSessionMemoryCost,
     trackMcpSessionMemory,
     getMemoryPressureState,

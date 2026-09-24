@@ -11,8 +11,35 @@ import type { ServerConfig } from "../config.js";
 import { logEvent, requestIp } from "../logger.js";
 import { redactedPreview } from "../redaction.js";
 
-/** P1 #26: single source of runtime version identity — the package manifest. */
+/** P1 #26: package version remains the CLI/npm identity. */
 let cachedPackageVersion: string | undefined;
+
+export interface BuildMetaVersionIdentity {
+  version?: unknown;
+  contentSha256?: unknown;
+}
+
+/**
+ * Derive the MCP server identity from the executable tree identity. A package
+ * version alone is not enough to distinguish materially different tool
+ * catalogs served by different immutable releases.
+ */
+export function mcpServerVersionFromBuildMeta(meta: BuildMetaVersionIdentity): string | undefined {
+  if (typeof meta.version !== "string" || meta.version.length === 0) return undefined;
+  if (typeof meta.contentSha256 === "string" && /^[a-f0-9]{16,64}$/.test(meta.contentSha256)) {
+    return `${meta.version}+${meta.contentSha256}`;
+  }
+  return meta.version;
+}
+
+export function readMcpServerVersionFromBuildMeta(path: URL | string): string | undefined {
+  try {
+    const meta = JSON.parse(readFileSync(path, "utf8")) as BuildMetaVersionIdentity;
+    return mcpServerVersionFromBuildMeta(meta);
+  } catch {
+    return undefined;
+  }
+}
 
 export function readPackageVersion(): string {
   if (cachedPackageVersion) return cachedPackageVersion;
@@ -28,6 +55,21 @@ export function readPackageVersion(): string {
     }
   }
   return cachedPackageVersion;
+}
+
+let cachedMcpServerVersion: string | undefined;
+
+/**
+ * Read the immutable artifact metadata beside the compiled module. Source
+ * checkout/dev runs fall back to the package version because they have no
+ * release-local build-meta.json.
+ */
+export function readMcpServerVersion(): string {
+  if (cachedMcpServerVersion) return cachedMcpServerVersion;
+  cachedMcpServerVersion = readMcpServerVersionFromBuildMeta(
+    new URL("../build-meta.json", import.meta.url),
+  ) ?? readPackageVersion();
+  return cachedMcpServerVersion;
 }
 
 /**

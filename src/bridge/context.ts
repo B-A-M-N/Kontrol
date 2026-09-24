@@ -65,6 +65,12 @@ export interface BridgeConfig {
   connectionContinuationId?: string;
   /** Bound work session ID authenticated on this connection, when a dispatched worker reconnects. */
   connectionWorkSessionId?: string;
+  /** Live per-connection context; never snapshot it at registration time. */
+  connectionContext?: import("../mcp/connection-context.js").ConnectionContext;
+  /** Transport identity used to scope workspace conversation state. */
+  connectionMcpSessionId?: string;
+  /** Trusted conversation identity used to scope durable work-session reads. */
+  connectionConversationId?: string;
   /** Checkout lease nonce authenticated on this worker connection. */
   connectionWorkspaceLeaseNonce?: string;
   /**

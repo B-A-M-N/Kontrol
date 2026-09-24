@@ -73,6 +73,8 @@ export interface ServerConfig {
    * process.env.
    */
   expectedBuildId?: string;
+  /** Launcher-owned immutable generation identity for diagnostics. */
+  launchGenerationId?: string;
   /**
    * P0.5: explicit operator escape hatch. When true, mutations proceed even
    * when the review checkpoint backend is unavailable (untracked mutations).
@@ -109,6 +111,10 @@ export interface ServerConfig {
   mcpMaxResourceReadQueue: number;
   /** Maximum time a request may wait for an admission slot. */
   mcpAdmissionTimeoutMs: number;
+  /** Grace period protecting recently present browser transports from cap reclaim. */
+  mcpSessionReclaimGraceMs: number;
+  /** Interval for standalone MCP SSE keep-alive comments. */
+  mcpSseHeartbeatMs: number;
   /** Maximum execution time for ordinary, non-waiter MCP requests. */
   mcpExecutionTimeoutMs: number;
   /** Periodic maintenance scheduling and wall-clock budget. */
@@ -590,6 +596,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     childEnvironmentAllowlist: parseEnvironmentAllowlist(env.KONTROL_CHILD_ENV_ALLOWLIST),
     // P0.3: parsed once at the config boundary; never re-read downstream.
     expectedBuildId: env.KONTROL_BUILD_ID?.trim() || undefined,
+    launchGenerationId: env.KONTROL_LAUNCH_GENERATION_ID?.trim() || undefined,
     // P0.5: fail closed by default; only an explicit operator opt-in permits
     // untracked mutation when the checkpoint backend is unavailable.
     allowUntrackedMutation: parseBoolean(env.KONTROL_ALLOW_UNTRACKED_MUTATION),
@@ -612,6 +619,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     mcpMaxResourceReads: parsePositiveInteger(env.KONTROL_MCP_MAX_RESOURCE_READS, 2, "KONTROL_MCP_MAX_RESOURCE_READS"),
     mcpMaxResourceReadsPerClient: parsePositiveInteger(env.KONTROL_MCP_MAX_RESOURCE_READS_PER_CLIENT, 1, "KONTROL_MCP_MAX_RESOURCE_READS_PER_CLIENT"),
     mcpMaxResourceReadQueue: parsePositiveInteger(env.KONTROL_MCP_MAX_RESOURCE_READ_QUEUE, 16, "KONTROL_MCP_MAX_RESOURCE_READ_QUEUE"),
+    mcpSseHeartbeatMs: parsePositiveInteger(env.KONTROL_MCP_SSE_HEARTBEAT_MS, 20_000, "KONTROL_MCP_SSE_HEARTBEAT_MS"),
+    mcpSessionReclaimGraceMs: parsePositiveInteger(env.KONTROL_MCP_SESSION_RECLAIM_GRACE_MS, 5 * 60_000, "KONTROL_MCP_SESSION_RECLAIM_GRACE_MS"),
     mcpAdmissionTimeoutMs: parsePositiveInteger(
       env.KONTROL_MCP_ADMISSION_TIMEOUT_MS ?? env.KONTROL_MCP_REQUEST_DEADLINE_MS,
       120_000,

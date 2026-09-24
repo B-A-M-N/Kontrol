@@ -103,6 +103,8 @@ export const workSessions = sqliteTable("work_sessions", {
   completionPolicy: text("completion_policy").notNull().default("agent_completion"),
   reviewEpoch: integer("review_epoch").notNull().default(0),
   submittedBy: text("submitted_by").notNull(),
+  /** Trusted conversation/transport owner that created this durable session. */
+  ownerContextId: text("owner_context_id"),
   title: text("title"),
   lastConsumedFeedbackId: text("last_consumed_feedback_id"),
   lastConsumedReviewEpoch: integer("last_consumed_review_epoch").notNull().default(0),
@@ -356,6 +358,7 @@ export const approvalRequests = sqliteTable("approval_requests", {
   kind: text("kind").notNull(),
   workspaceSessionId: text("workspace_session_id").notNull(),
   workSessionId: text("work_session_id"),
+  ownerContextId: text("owner_context_id"),
   runId: text("run_id"),
   agentId: text("agent_id"),
   principalId: text("principal_id"),

@@ -75,6 +75,7 @@ PREVIOUS_BUILD_ID=""
 PREVIOUS_ARTIFACT_PATH=""
 COMMITTED_PREVIOUS_BUILD_ID=""
 COMMITTED_PREVIOUS_ARTIFACT_PATH=""
+COMMITTED_MCP_TOOL_SURFACE_VERSION=""
 LAST_KNOWN_GOOD_BUILD_ID=""
 LAST_KNOWN_GOOD_ARTIFACT_PATH=""
 DATABASE_ORIGINAL_SCHEMA_VERSION=""
@@ -86,6 +87,7 @@ DATABASE_RESTORED_AT=""
 DATABASE_FAILED_PATH=""
 ARTIFACT_SCHEMA_VERSION=""
 ARTIFACT_MAX_READABLE_SCHEMA_VERSION=""
+MCP_TOOL_SURFACE_VERSION=""
 COMMITTED_GENERATION_PRESENT=0
 LAUNCH_GENERATION_ID="gen-$(date +%s)-$$"
 RUNTIME_LOCK_TOKEN="${KONTROL_RUNTIME_LOCK_TOKEN:-}"
@@ -121,10 +123,14 @@ write_generation_record() {
   local status="$1" requested_build_id="$2" active_build_id="$3" rollback="$4" failed_build_id="$5" reason="$6" artifact_path="$7"
   local previous_build_id="${8:-${PREVIOUS_BUILD_ID:-}}" previous_artifact_path="${9:-${PREVIOUS_ARTIFACT_PATH:-}}"
   local last_good_build_id="${10:-${LAST_KNOWN_GOOD_BUILD_ID:-}}" last_good_artifact_path="${11:-${LAST_KNOWN_GOOD_ARTIFACT_PATH:-}}"
+  local mcp_surface_version="${12:-}"
+  if [[ -z "$mcp_surface_version" && -n "$artifact_path" ]]; then
+    mcp_surface_version="$(read_mcp_tool_surface_version "$artifact_path" || true)"
+  fi
   node --input-type=module -e '
     import { mkdirSync, renameSync, writeFileSync } from "node:fs";
     import { dirname } from "node:path";
-    const [path, status, requested, active, rollback, failed, reason, artifact, previous, previousArtifact, lastGood, lastGoodArtifact] = process.argv.slice(1);
+    const [path, status, requested, active, rollback, failed, reason, artifact, previous, previousArtifact, lastGood, lastGoodArtifact, mcpSurface] = process.argv.slice(1);
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     const record = {
       status,
@@ -139,12 +145,13 @@ write_generation_record() {
       previousArtifactPath: previousArtifact || null,
       lastKnownGoodBuildId: lastGood || null,
       lastKnownGoodArtifactPath: lastGoodArtifact || null,
+      mcpToolSurfaceVersion: mcpSurface || null,
       updatedAt: new Date().toISOString(),
     };
     const temporary = `${path}.tmp-${process.pid}`;
     writeFileSync(temporary, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
     renameSync(temporary, path);
-  ' "$GENERATION_RECORD" "$status" "$requested_build_id" "$active_build_id" "$rollback" "$failed_build_id" "$reason" "$artifact_path" "$previous_build_id" "$previous_artifact_path" "$last_good_build_id" "$last_good_artifact_path"
+  ' "$GENERATION_RECORD" "$status" "$requested_build_id" "$active_build_id" "$rollback" "$failed_build_id" "$reason" "$artifact_path" "$previous_build_id" "$previous_artifact_path" "$last_good_build_id" "$last_good_artifact_path" "$mcp_surface_version"
 }
 
 write_candidate_record() {
@@ -205,6 +212,21 @@ write_deployment_record() {
 read_json_field() {
   local path="$1" field="$2"
   node -e 'try { const value = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"))[process.argv[2]]; if (value !== undefined && value !== null) process.stdout.write(String(value)); } catch {}' "$path" "$field"
+}
+
+read_mcp_tool_surface_version() {
+  local artifact_path="$1"
+  node --input-type=module -e '
+    import { readFileSync } from "node:fs";
+    try {
+      const meta = JSON.parse(readFileSync(`${process.argv[1]}/build-meta.json`, "utf8"));
+      if (typeof meta.version !== "string" || meta.version.length === 0) process.exit(0);
+      const hash = typeof meta.contentSha256 === "string" && /^[a-f0-9]{16,64}$/.test(meta.contentSha256)
+        ? `+${meta.contentSha256}`
+        : "";
+      process.stdout.write(`${meta.version}${hash}`);
+    } catch {}
+  ' "$artifact_path"
 }
 
 read_json_text_field() {
@@ -333,18 +355,23 @@ resolve_dist_artifact() {
 
 load_committed_generation() {
   if [[ -f "$GENERATION_RECORD" ]]; then
-    local committed_artifact committed_build previous_build previous_artifact last_good_build last_good_artifact
+    local committed_artifact committed_build previous_build previous_artifact last_good_build last_good_artifact committed_surface
     committed_artifact="$(read_json_field "$GENERATION_RECORD" artifactPath)"
     committed_build="$(read_json_field "$GENERATION_RECORD" activeBuildId)"
     previous_build="$(read_json_field "$GENERATION_RECORD" previousBuildId)"
     previous_artifact="$(read_json_field "$GENERATION_RECORD" previousArtifactPath)"
     last_good_build="$(read_json_field "$GENERATION_RECORD" lastKnownGoodBuildId)"
     last_good_artifact="$(read_json_field "$GENERATION_RECORD" lastKnownGoodArtifactPath)"
+    committed_surface="$(read_json_field "$GENERATION_RECORD" mcpToolSurfaceVersion)"
     if [[ -n "$committed_artifact" ]] && resolve_artifact_path "$committed_artifact" >/dev/null 2>&1; then
       COMMITTED_GENERATION_PRESENT=1
       PREVIOUS_BUILD_ID="$ARTIFACT_BUILD_ID"
       PREVIOUS_ARTIFACT_PATH="$ACTIVE_ARTIFACT_PATH"
+      if [[ -z "$committed_surface" ]]; then
+        committed_surface="$(read_mcp_tool_surface_version "$ACTIVE_ARTIFACT_PATH" || true)"
+      fi
     fi
+    COMMITTED_MCP_TOOL_SURFACE_VERSION="$committed_surface"
     COMMITTED_PREVIOUS_BUILD_ID="$previous_build"
     COMMITTED_PREVIOUS_ARTIFACT_PATH="$previous_artifact"
     LAST_KNOWN_GOOD_BUILD_ID="${last_good_build:-$committed_build}"
@@ -389,6 +416,10 @@ resolve_artifact_path "$CANDIDATE_ARTIFACT_PATH" || return 1
 if [[ "$EXPECTED_BUILD_ID" != "$ARTIFACT_BUILD_ID" ]]; then
   echo "ERROR: candidate build metadata changed while selecting the immutable artifact." >&2
   return 1
+fi
+MCP_TOOL_SURFACE_VERSION="$(read_mcp_tool_surface_version "$ACTIVE_ARTIFACT_PATH" || true)"
+if [[ -n "${COMMITTED_MCP_TOOL_SURFACE_VERSION:-}" && -n "$MCP_TOOL_SURFACE_VERSION" && "$COMMITTED_MCP_TOOL_SURFACE_VERSION" != "$MCP_TOOL_SURFACE_VERSION" ]]; then
+  echo "[*] MCP tool surface old=${COMMITTED_MCP_TOOL_SURFACE_VERSION} new=${MCP_TOOL_SURFACE_VERSION}; fresh client initialize required"
 fi
 EXPECTED_SCHEMA_VERSION="${ARTIFACT_SCHEMA_VERSION:-${DATABASE_ORIGINAL_SCHEMA_VERSION:-0}}"
 if [[ ! "$EXPECTED_SCHEMA_VERSION" =~ ^[0-9]+$ ]]; then

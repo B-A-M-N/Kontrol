@@ -7,6 +7,7 @@ import * as z from "zod/v4";
 
 export function resultOutputSchema(extra: z.ZodRawShape = {}): z.ZodRawShape {
   return {
+    tool: z.string().optional().describe("Stable tool discriminator for widget result delivery."),
     result: z
       .string()
       .describe(

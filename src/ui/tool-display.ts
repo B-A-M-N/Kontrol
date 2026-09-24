@@ -86,6 +86,7 @@ export function getToolDisplay(card: ToolResultCard): ToolDisplay {
   const label = getToolLabel(card);
   switch (card.tool) {
     case "open_workspace":
+    case "show_workspace_ui":
       return { icon: folderIcon(), title: "Workspace", label, tone: "workspace" };
     case "read":
       return { icon: fileIcon(), title: "Read File", label, tone: "read" };
@@ -140,4 +141,24 @@ export function toolNameFromMeta(result: CallToolResult): ToolName | undefined {
   const meta = result._meta as Record<string, unknown> | undefined;
   const tool = meta?.tool;
   return isToolName(tool) ? tool : undefined;
+}
+
+/**
+ * Resolve a card's tool discriminator through the result envelope.
+ *
+ * `_meta.tool` is the preferred host-provided discriminator, but it is not
+ * guaranteed to survive every connector. Structured content and the card
+ * envelope are independent, schema-checked fallbacks; unrelated objects are
+ * never rendered as a tool card merely because they are present.
+ */
+export function toolNameFromResult(
+  result: CallToolResult,
+  structuredContent: unknown,
+  card?: { tool?: unknown },
+): ToolName | undefined {
+  return toolNameFromMeta(result)
+    ?? (isToolName((structuredContent as { tool?: unknown } | undefined)?.tool)
+      ? (structuredContent as { tool: ToolName }).tool
+      : undefined)
+    ?? (isToolName(card?.tool) ? card.tool : undefined);
 }

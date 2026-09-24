@@ -94,6 +94,7 @@ export interface EventStore {
     sessionId: string,
     afterSeq: number,
     timeoutMs: number,
+    signal?: AbortSignal,
  ): Promise<EventStoreEvent[]>;
 
  /** Event-driven workspace/project waiter; one waiter can multiplex many sessions. */
@@ -101,6 +102,7 @@ export interface EventStore {
    workspaceId: string,
    afterSeq: number,
    timeoutMs: number,
+   signal?: AbortSignal,
  ): Promise<EventStoreEvent[]>;
 
   getLatestEvent(sessionId: string, type?: string): EventStoreEvent | undefined;
@@ -441,6 +443,7 @@ export function createEventStore(
     sessionId: string,
     afterSeq: number,
     timeoutMs: number,
+    signal?: AbortSignal,
   ): Promise<EventStoreEvent[]> {
     return new Promise((resolve) => {
       let resolved = false;
@@ -453,8 +456,16 @@ export function createEventStore(
         resolved = true;
         if (timeout) clearTimeout(timeout);
         if (unsubscribe) unsubscribe();
+        signal?.removeEventListener("abort", abort);
         resolve(events);
       };
+      const abort = () => finish([]);
+
+      if (signal?.aborted) {
+        finish([]);
+        return;
+      }
+      signal?.addEventListener("abort", abort, { once: true });
 
       // Subscribe FIRST so a concurrently-published event cannot be lost between
       // the query below and the subscription.
@@ -478,6 +489,7 @@ export function createEventStore(
     workspaceId: string,
     afterSeq: number,
     timeoutMs: number,
+    signal?: AbortSignal,
   ): Promise<EventStoreEvent[]> {
     return new Promise((resolve) => {
       let resolved = false;
@@ -489,8 +501,16 @@ export function createEventStore(
         resolved = true;
         if (timeout) clearTimeout(timeout);
         unsubscribe?.();
+        signal?.removeEventListener("abort", abort);
         resolve(events);
       };
+      const abort = () => finish([]);
+
+      if (signal?.aborted) {
+        finish([]);
+        return;
+      }
+      signal?.addEventListener("abort", abort, { once: true });
 
       // Subscribe only to the relevant workspace/project before querying so a
       // concurrent event cannot be missed without waking unrelated waiters.

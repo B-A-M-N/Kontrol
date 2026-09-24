@@ -82,6 +82,12 @@ async function main() {
     currentHashed: 0, openAiCompatibility: 0, legacyKontrol: 0, devDesktopMigration: 0,
     servedTotal: 0, lastDurationMs: 0, maxDurationMs: 0,
     admissionRejections: 0, active: 0, maxActive: 0, lastWireBytes: 0,
+    lastEventLoopDelayMs: 0,
+    maxEventLoopDelayMs: 0,
+    cacheEntries: 0,
+    cacheBytes: 0,
+    maxCacheEntries: 0,
+    maxCacheBytes: 0,
   };
   // Deliberately tiny: 2 concurrent, 1 per client, queue 4.
   const pool = new McpAdmission(2, 1, 4);

@@ -7,9 +7,10 @@
  */
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { BridgeConfig } from "./context.js";
-import { forbidden, isReviewer, requireWorkSessionRead, workspaceAppModelAndAppMeta } from "./shared.js";
+import { forbidden, isReviewer, liveOwnerContextId, requireWorkSessionRead, workspaceAppModelAndAppMeta } from "./shared.js";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
 import { z } from "zod/v4";
+import { currentMcpRequestSignal } from "../mcp/request-context.js";
 
 export function registerEventTools(server: McpServer, config: BridgeConfig): void {
 const TERMINAL_RUN_EVENTS = new Set([
@@ -56,7 +57,7 @@ const TERMINAL_RUN_EVENTS = new Set([
         return { content: [{ type: "text" as const, text: "Session not found." }], isError: true };
       }
       const waitStartedAt = performance.now();
-      const events = await config.eventStore.waitForEventsAfter(sessionId, afterSeq, timeoutMs);
+      const events = await config.eventStore.waitForEventsAfter(sessionId, afterSeq, timeoutMs, currentMcpRequestSignal());
       config.onPhaseTiming?.("event.session_wait", performance.now() - waitStartedAt);
       const terminal = events.some((e) =>
         TERMINAL_RUN_EVENTS.has(e.type) &&
@@ -98,6 +99,8 @@ const TERMINAL_RUN_EVENTS = new Set([
       annotations: { readOnlyHint: true },
     },
     async ({ sessionId, afterSeq, timeoutMs }) => {
+      const access = requireWorkSessionRead(config, sessionId);
+      if (access) return access;
       const session = config.workSessions.get(sessionId);
       if (!session) return { content: [{ type: "text" as const, text: "Session not found." }], isError: true };
       const waitStartedAt = performance.now();
@@ -171,8 +174,23 @@ const TERMINAL_RUN_EVENTS = new Set([
         // A project alias may not be present in the in-memory registry; the
         // event-store query below validates it by returning an empty stream.
       }
-      const events = await config.eventStore.waitForWorkspaceEventsAfter(workspaceId, afterSeq, timeoutMs);
-      const nextSeq = events.length ? events[events.length - 1].seq : afterSeq;
+      const owner = liveOwnerContextId(config);
+      // The cursor is over the inspected workspace stream, not the filtered
+      // response. Advancing only past visible events makes foreign-owner
+      // events refetched forever on the next poll.
+      const rawEvents = await config.eventStore.waitForWorkspaceEventsAfter(workspaceId, afterSeq, timeoutMs, currentMcpRequestSignal());
+      const events = rawEvents.filter((event) => {
+        if (!owner) return true;
+        const session = event.sessionId ? config.workSessions.get(event.sessionId) : undefined;
+        const payloadOwner = typeof event.payload.ownerContextId === "string" ? event.payload.ownerContextId : undefined;
+        if (payloadOwner) return payloadOwner === owner;
+        if (session?.ownerContextId) return session.ownerContextId === owner;
+        // Unknown provenance is not safe to expose to a conversation-scoped
+        // reviewer. The ownerless global reviewer above is the only surface
+        // allowed to inspect unscoped legacy events.
+        return false;
+      });
+      const nextSeq = rawEvents.length ? rawEvents[rawEvents.length - 1].seq : afterSeq;
       return {
         content: [{ type: "text" as const, text: `${events.length} workspace event(s) after seq ${afterSeq}.` }],
         structuredContent: {

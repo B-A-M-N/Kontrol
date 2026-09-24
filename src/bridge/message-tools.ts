@@ -9,7 +9,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { BridgeConfig } from "./context.js";
 import { AGENT_MESSAGE_KINDS } from "../agent-messages.js";
 import { registerMutationAppTool } from "./app-tool.js";
-import { assertWorkerSessionBinding, forbidden, isReviewer, isWorkerOrClient, requireWorkSessionRead, workspaceAppModelAndAppMeta } from "./shared.js";
+import { assertWorkerSessionBinding, forbidden, isReviewer, isWorkerOrClient, requireWorkSessionMutation, requireWorkSessionRead, workspaceAppModelAndAppMeta } from "./shared.js";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
 import { z } from "zod/v4";
 
@@ -152,6 +152,8 @@ export function registerMessageTools(server: McpServer, config: BridgeConfig): v
       if (!isReviewer(config.principalRole)) {
         return forbidden(config.principalRole, "resolve_agent_message");
       }
+      const access = requireWorkSessionMutation(config, sessionId);
+      if (access) return access;
       if (!config.agentMessages) {
         return { content: [{ type: "text" as const, text: "Agent-message store unavailable." }], isError: true };
       }

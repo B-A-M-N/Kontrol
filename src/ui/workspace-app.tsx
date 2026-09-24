@@ -81,7 +81,7 @@ import {
   formatAgentsFilesForPayload,
   getToolDisplay,
   getToolLabel,
-  toolNameFromMeta,
+  toolNameFromResult,
   workspacePayloadText,
   type ToolDisplay,
 } from "./tool-display.js";
@@ -476,7 +476,7 @@ async function bootInternal(): Promise<void> {
     const structured = metaCard
       ? { ...structuredContent, ...metaCard }
       : structuredContent;
-    const tool = toolNameFromMeta(result);
+    const tool = toolNameFromResult(result, structuredContent, metaCard);
 
     if (!tool || !isToolResultCard(structured)) {
       lastToolCard = null;

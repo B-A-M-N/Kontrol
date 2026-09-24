@@ -68,6 +68,11 @@ try {
   assert.equal(arrived.length, 1, "workspace waiter wakes for a later session event");
   assert.equal(arrived[0].type, "review.submitted");
 
+  const abortController = new AbortController();
+  const aborted = events.waitForWorkspaceEventsAfter("workspace-2", arrived[0].seq, 10_000, abortController.signal);
+  abortController.abort();
+  assert.deepEqual(await aborted, [], "aborting a workspace waiter settles immediately with no events");
+
   let secondSubscriberCalls = 0;
   const unsubscribeThrowing = events.subscribe("session-ws-1", () => {
     throw new Error("observer failure");

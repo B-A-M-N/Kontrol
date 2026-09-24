@@ -15,6 +15,16 @@ try {
       .some((column) => column.name === "files_json"),
     "submission file metadata column is present after migration",
   );
+  assert.ok(
+    (sqlite.prepare("pragma table_info(work_sessions)").all() as Array<{ name: string }>)
+      .some((column) => column.name === "owner_context_id"),
+    "work session owner context column is present after migration",
+  );
+  assert.ok(
+    (sqlite.prepare("pragma table_info(approval_requests)").all() as Array<{ name: string }>)
+      .some((column) => column.name === "owner_context_id"),
+    "approval owner context column is present after migration",
+  );
 
   sqlite.exec("drop index if exists agent_registry_name_unique");
   sqlite.prepare(`

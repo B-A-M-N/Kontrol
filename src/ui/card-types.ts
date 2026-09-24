@@ -2,6 +2,7 @@ import type { App } from "@modelcontextprotocol/ext-apps";
 
 export type ToolName =
   | "open_workspace"
+  | "show_workspace_ui"
   | "show_changes"
   | "apply_patch"
   | "exec_command"
@@ -83,6 +84,7 @@ export interface ToolPayload {
 export function isToolName(value: unknown): value is ToolName {
   return (
     value === "open_workspace" ||
+    value === "show_workspace_ui" ||
     value === "show_changes" ||
     value === "apply_patch" ||
     value === "exec_command" ||

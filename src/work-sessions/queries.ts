@@ -115,6 +115,7 @@ export function createWorkSessionQueries(db: DatabaseHandle, deps: {
       limit = 50,
       filter: "all" | "pending_review" | "stale_pending_review" | "live" = "all",
       after?: WorkspaceSessionSurfaceCursor,
+      ownerContextId?: string,
     ): WorkspaceSessionSurfaceEntry[] {
       const boundedLimit = Math.max(1, Math.min(200, Math.trunc(limit)));
       const projectId = workspaceSessionId ? projectIdForWorkspace(workspaceSessionId) : undefined;
@@ -155,6 +156,7 @@ export function createWorkSessionQueries(db: DatabaseHandle, deps: {
           (select f.reviewer_id from work_session_feedback f join work_session_submissions s on s.id = f.submission_id where f.work_session_id = ws.id order by s.submission_number desc, s.review_epoch desc, f.id desc limit 1) as latest_feedback_reviewer_id
         from work_sessions ws
         where ${scopeSql}
+          ${ownerContextId ? "and ws.owner_context_id = ?" : ""}
           ${after ? "and (ws.updated_at < ? or (ws.updated_at = ? and ws.id < ?))" : ""}
           and ${filter === "pending_review"
             ? "ws.status in ('awaiting_review', 'review_in_progress') and ws.runtime_state <> 'stale' and datetime(ws.updated_at) >= datetime('now', '-30 days')"
@@ -167,8 +169,8 @@ export function createWorkSessionQueries(db: DatabaseHandle, deps: {
         limit ?
       `).all(...(
         scopeParam
-          ? [scopeParam, ...(after ? [after.updatedAt, after.updatedAt, after.sessionId] : []), boundedLimit]
-          : [...(after ? [after.updatedAt, after.updatedAt, after.sessionId] : []), boundedLimit]
+          ? [scopeParam, ...(ownerContextId ? [ownerContextId] : []), ...(after ? [after.updatedAt, after.updatedAt, after.sessionId] : []), boundedLimit]
+          : [...(ownerContextId ? [ownerContextId] : []), ...(after ? [after.updatedAt, after.updatedAt, after.sessionId] : []), boundedLimit]
       )) as Array<Record<string, unknown>>;
 
       return rows.map((row) => {

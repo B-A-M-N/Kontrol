@@ -123,9 +123,19 @@ function resolveWorkspaceAppArtifact(): { html: string; source: WorkspaceAppArti
  * Kontrol app bootstrap marker.
  */
 export function isSelfContainedWorkspaceAppHtml(html: string): boolean {
-  return !html.includes(`src="./workspace-app.tsx"`)
-    && !html.includes(`href="./workspace-app.css"`)
-    && html.includes("<script");
+  if (html.includes(`src="./workspace-app.tsx"`) || html.includes(`href="./workspace-app.css"`)) return false;
+  if (!/<main\b[^>]*\bid=["']app["']/i.test(html)) return false;
+  if (!/<title>\s*Kontrol Diff\s*<\/title>/i.test(html)) return false;
+  if (!/<style\b[^>]*>[\s\S]*?<\/style>/i.test(html)) return false;
+  if (!/<script\b[^>]*>[\s\S]*?<\/script>/i.test(html)) return false;
+  if (/<script\b[^>]*\bsrc=["'][^"']+["']/i.test(html)) return false;
+  if (/<link\b[^>]*\bhref=["'][^"']+\.css(?:["'?#])/i.test(html)) return false;
+  // A single-file MCP App must not depend on any external script, style,
+  // image, font, or nested-frame URL. The host may enforce a strict CSP, so
+  // proving the built artifact has no external resource tags is stronger than
+  // checking only the known Vite template filenames.
+  if (/<(?:script|link|img|source|iframe|video|audio)\b[^>]*\b(?:src|href|srcset|poster)\s*=\s*["'][^"']+["']/i.test(html)) return false;
+  return true;
 }
 
 const resolved = resolveWorkspaceAppArtifact();
@@ -135,15 +145,15 @@ export const WORKSPACE_APP_BUILD_ID = createHash("sha256").update(WORKSPACE_APP_
 export const WORKSPACE_APP_URI = `ui://kontrol/workspace-app-${WORKSPACE_APP_BUILD_ID}.html`;
 // ChatGPT hosts that still use the legacy OpenAI template key require the
 // Skybridge MIME type. Keep this separate from the standards-based MCP App
-// resource above so each host receives the representation it understands.
+// resource above so each host receives the representation it understands. New
+// tool metadata advertises only WORKSPACE_APP_URI; this URI remains available
+// for cached legacy cards and diagnostics.
 export const OPENAI_WORKSPACE_APP_URI = `ui://kontrol/workspace-app-${WORKSPACE_APP_BUILD_ID}.skybridge.html`;
 
-// Hosts can cache the template URI independently of the MCP connection. A
-// rebuild therefore must continue serving previously generated hashes; the
-// HTML is the same compatibility resource from the host's perspective.
-const HISTORICAL_WORKSPACE_APP_URI = /^ui:\/\/kontrol\/workspace-app-[a-f0-9]{12}\.html$/;
-const HISTORICAL_OPENAI_WORKSPACE_APP_URI = /^ui:\/\/kontrol\/workspace-app-[a-f0-9]{12}\.skybridge\.html$/;
-
+// Compatibility URIs are explicit retained resources only. Arbitrary
+// historical hashes are rejected rather than being treated as aliases for the
+// current bundle; each retained URI must map to an actually registered
+// resource.
 export type WorkspaceAppResourceKind = "current" | "openai" | "legacy" | "devdesktop";
 
 /**
@@ -168,8 +178,8 @@ const workspaceAppToolMetadata = new Map<string, Readonly<Record<string, unknown
 
 export function workspaceAppResourceKind(value: unknown): WorkspaceAppResourceKind | undefined {
   if (typeof value !== "string") return undefined;
-  if (value === WORKSPACE_APP_URI || HISTORICAL_WORKSPACE_APP_URI.test(value)) return "current";
-  if (value === OPENAI_WORKSPACE_APP_URI || HISTORICAL_OPENAI_WORKSPACE_APP_URI.test(value)) return "openai";
+  if (value === WORKSPACE_APP_URI) return "current";
+  if (value === OPENAI_WORKSPACE_APP_URI) return "openai";
   if (value === LEGACY_WORKSPACE_APP_URI) return "legacy";
   if (value === DEVDESKTOP_WORKSPACE_APP_URI) return "devdesktop";
   return undefined;
@@ -185,8 +195,7 @@ export function workspaceAppToolMeta(visibility: readonly ("model" | "app")[] = 
   if (cached) return cached;
   const metadata = Object.freeze({
     ui: Object.freeze({ resourceUri: WORKSPACE_APP_URI, visibility: [...visibility] }),
-    "openai/outputTemplate": OPENAI_WORKSPACE_APP_URI,
-    "openai/widgetAccessible": true,
+    ...(visibility.includes("app") ? { "openai/widgetAccessible": true } : {}),
   });
   workspaceAppToolMetadata.set(key, metadata);
   return metadata;

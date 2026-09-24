@@ -64,6 +64,7 @@ export interface ToolApprovalRequest {
   // a compile error at the authorization boundary.
   workspaceId: WorkspaceId;
   workSessionId?: WorkSessionId;
+  ownerContextId?: string;
   runId?: string;
   agentId?: string;
   approvalKey?: string;
@@ -106,6 +107,7 @@ export interface OperationResumeContent {
   principalId: string;
   workspaceId: WorkspaceId;
   workSessionId?: WorkSessionId;
+  ownerContextId?: string;
   tool: string;
   approvalKey: string;
   path?: string;
@@ -642,6 +644,7 @@ export function createPolicyEngine(
           principalId: request.principalId ?? "",
           workspaceId: brandWorkspaceId(request.workspaceSessionId),
           workSessionId: request.workSessionId ? brandWorkSessionId(request.workSessionId) : undefined,
+          ownerContextId: request.ownerContextId,
           runId: request.runId,
           agentId: request.agentId,
           approvalKey: request.approvalKey,
@@ -724,6 +727,7 @@ export function createPolicyEngine(
     if (durable.principalId !== content.principalId) return undefined;
     if (durableWorkspaceId !== content.workspaceId) return undefined;
     if ((durable.workSessionId ?? undefined) !== (content.workSessionId ?? undefined)) return undefined;
+    if ((durable.ownerContextId ?? undefined) !== (content.ownerContextId ?? undefined)) return undefined;
     if ((durable.tool ?? "") !== content.tool) return undefined;
     if (durable.approvalKey !== content.approvalKey) return undefined;
     if ((durable.path ?? undefined) !== (content.path ?? undefined)) return undefined;
@@ -747,6 +751,7 @@ export function createPolicyEngine(
         kind: "tool",
         workspaceSessionId: request.workspaceId,
         workSessionId: request.workSessionId,
+        ownerContextId: request.ownerContextId,
         runId: request.runId,
         agentId: request.agentId,
         approvalKey: request.approvalKey,

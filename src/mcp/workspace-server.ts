@@ -37,16 +37,19 @@ import { registerBridgeTools } from "../acp-bridge.js";
 import {
   cachedServerInstructions,
   toolNames,
+  assertRequiredInspectionTools,
+  readMcpToolSurface,
 } from "./tool-names.js";
 import { createToolEnvelope } from "./tool-envelope.js";
-import { readPackageVersion } from "./tool-logging.js";
+import { readMcpServerVersion } from "./tool-logging.js";
 import { registerWorkspaceAppResources } from "./tools/resources.js";
 import { registerWorkspaceTools } from "./tools/workspace.js";
 import { registerCodexProcessTools, registerProcessPollingTool } from "./tools/process.js";
 import type { ConnectionContext } from "./connection-context.js";
+import { mcpOwnerContextId } from "./owner-context.js";
 
 // Public re-exports: ./mcp/workspace-server.js remains the import surface.
-export { constantTimeStringEqual, degradedAuditSnapshot, requestLogFields, readPackageVersion } from "./tool-logging.js";
+export { constantTimeStringEqual, degradedAuditSnapshot, requestLogFields, readMcpServerVersion, readPackageVersion } from "./tool-logging.js";
 export { mcpRequestContext, type McpRequestContext } from "./request-context.js";
 export { type Transport } from "./transport.js";
 export {
@@ -93,13 +96,14 @@ export function createMcpServer(
   onPhaseTiming?: (phase: string, durationMs: number) => void,
 ): McpServer {
   const serverConstructionStartedAt = performance.now();
+  const mcpToolSurface = readMcpToolSurface();
   const server = new McpServer(
     {
       name: "kontrol",
       title: "Kontrol",
-      // P1 #26: runtime version derives from the package manifest so the MCP
-      // surface can never advertise an independent hardcoded version.
-      version: readPackageVersion(),
+      // The MCP identity includes the immutable executable-tree fingerprint so
+      // clients cannot treat materially different tool catalogs as identical.
+      version: mcpToolSurface.version,
       description:
         "Secure local coding workspace for MCP clients. Provides workspace-scoped file, search, edit, write, and shell tools.",
     },
@@ -116,7 +120,7 @@ export function createMcpServer(
 
   registerWorkspaceAppResources(server, config, onWorkspaceAppResource);
 
-  registerWorkspaceTools(server, {
+  const workspaceToolNames = registerWorkspaceTools(server, {
     config,
     workspaces,
     reviewCheckpoints,
@@ -147,8 +151,11 @@ export function createMcpServer(
       eventStore,
       policyEngine,
       approvalRequests,
+      workSessions,
       principalRole: connectionContext?.authenticatedRole ?? "client",
       principalId: mutationPrincipalId,
+      connectionContext,
+      ownerContextId: mcpOwnerContextId(connectionContext ?? {}),
       mutationReceipts,
     });
   }
@@ -183,9 +190,12 @@ export function createMcpServer(
       // unsigned X-Kontrol-Work-Session header (P0 #3).
       principalRole: connectionContext?.authenticatedRole ?? "client",
       principalId: mutationPrincipalId,
+      connectionContext,
       mutationReceipts,
       connectionContinuationId: connectionContext?.continuationId,
       connectionWorkSessionId: connectionContext?.workSessionId,
+      connectionMcpSessionId: connectionContext?.mcpSessionId,
+      connectionConversationId: connectionContext?.conversationId,
       connectionWorkspaceLeaseNonce: connectionContext?.workspaceLeaseNonce,
       liveWaiters,
       onPhaseTiming,
@@ -195,13 +205,14 @@ export function createMcpServer(
 
   toolListDescriptorCacheActive = installCachedToolList(
     server,
-    `${config.toolMode}|${config.widgets}|${config.skillsEnabled ? "skills" : "no-skills"}|${config.acpEnabled ? "acp" : "no-acp"}|${policyEngine ? "policy" : "no-policy"}`,
+    `${config.toolMode}|${config.widgets}|${config.skillsEnabled ? "skills" : "no-skills"}|${config.acpEnabled ? "acp" : "no-acp"}|${policyEngine ? "policy" : "no-policy"}|surface:${mcpToolSurface.version}`,
     toolListDescriptorCache,
     ListToolsRequestSchema,
   );
   if (!toolListDescriptorCacheActive) {
     console.warn("[kontrol] tools/list descriptor cache unavailable (SDK internals changed); serving uncached");
   }
+  assertRequiredInspectionTools(workspaceToolNames);
   onPhaseTiming?.("mcp.tool_registration", performance.now() - toolRegistrationStartedAt);
 
   return server;

@@ -78,6 +78,7 @@ export function createWorkSessionStore(deps: WorkSessionStoreDeps) {
       completionPolicy: (row.completionPolicy as CompletionPolicy | undefined) ?? "agent_completion",
       reviewEpoch: row.reviewEpoch ?? 0,
       submittedBy: row.submittedBy,
+      ownerContextId: row.ownerContextId ?? undefined,
       title: row.title ?? undefined,
       lastConsumedFeedbackId: row.lastConsumedFeedbackId ?? undefined,
       lastConsumedReviewEpoch: row.lastConsumedReviewEpoch ?? 0,
@@ -94,7 +95,7 @@ export function createWorkSessionStore(deps: WorkSessionStoreDeps) {
     /** Hydrate a raw row into the enriched WorkSession projection. */
     enrichSession,
 
-    create(input: { workspaceSessionId: string; submittedBy: string; title?: string; completionPolicy?: CompletionPolicy }): WorkSession {
+    create(input: { workspaceSessionId: string; submittedBy: string; title?: string; completionPolicy?: CompletionPolicy; ownerContextId?: string }): WorkSession {
       const now = new Date().toISOString();
       const projectId = projectIdForWorkspace(input.workspaceSessionId);
       const session: WorkSession = {
@@ -105,6 +106,7 @@ export function createWorkSessionStore(deps: WorkSessionStoreDeps) {
         completionPolicy: input.completionPolicy ?? "agent_completion",
         reviewEpoch: 0,
         submittedBy: input.submittedBy,
+        ownerContextId: input.ownerContextId,
         title: input.title,
         lastConsumedReviewEpoch: 0,
         createdAt: now,
@@ -125,6 +127,7 @@ export function createWorkSessionStore(deps: WorkSessionStoreDeps) {
           completionPolicy: session.completionPolicy,
           reviewEpoch: session.reviewEpoch,
           submittedBy: session.submittedBy,
+          ownerContextId: session.ownerContextId ?? null,
           title: session.title ?? null,
           lastConsumedFeedbackId: null,
           lastConsumedReviewEpoch: 0,

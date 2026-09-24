@@ -336,6 +336,22 @@ fakeApp.ontoolresult?.({
 await settle();
 await settle();
 assert.equal(__workspaceAppTest.getConnectionState(), "CONNECTED", "app host reaches connected state");
+fakeApp.ontoolresult?.({
+  _meta: {},
+  structuredContent: { tool: "read", path: "src/example.ts", result: "fallback result" },
+  content: [{ type: "text", text: "fallback result" }],
+});
+await settle();
+assert.match(document.querySelector(".tool-title")?.textContent ?? "", /Read File/,
+  "structuredContent.tool is accepted when _meta.tool is absent");
+fakeApp.ontoolresult?.({
+  _meta: { tool: "show_workspace_ui" },
+  structuredContent: { tool: "show_workspace_ui", workspaceId: "workspace-ui-open", root: "/workspace", mode: "checkout", instruction: "Workspace UI ready" },
+  content: [{ type: "text", text: "Workspace UI ready" }],
+});
+await settle();
+assert.match(document.querySelector(".tool-title")?.textContent ?? "", /Workspace/,
+  "show_workspace_ui renders the workspace surface card");
 assert.ok(__workspaceAppTest.getLastSuccessfulHydrationAt(), "workspace state is hydrated after open_workspace");
 assert.equal(
   __workspaceAppTest.getWorkSessionView("session-reconnect")?.lastSeq,

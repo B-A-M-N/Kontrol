@@ -10,6 +10,7 @@ export interface McpRequestContext {
   mcpSessionId?: string;
   mcpRequestId?: string;
   conversationId?: string;
+  principalId?: string;
   approvalCorrelationId?: string;
   onPolicyWaitStart?: (context: PolicyWaitContext) => void | Promise<void>;
   onPolicyWaitEnd?: (context: PolicyWaitContext & { outcome: PolicyWaitOutcome }) => void | Promise<void>;

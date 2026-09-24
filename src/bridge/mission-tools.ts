@@ -11,7 +11,7 @@ import { selectHealthyAgent } from "../acp-gateway.js";
 import { verifyMissionSubmission } from "../mission-verifier.js";
 import { registerMutationAppTool } from "./app-tool.js";
 import { criterionUpdateSchema, dispatchAgentTask, findingSchema, findingUpdateSchema, missionCriterionSchema, supervisorPacket, workOrderSchema } from "./context.js";
-import { acquireCheckoutModifyLease, forbidden, isReviewer, renderMissionPrompt, workspaceAppModelAndAppMeta } from "./shared.js";
+import { acquireCheckoutModifyLease, forbidden, isReviewer, liveOwnerContextId, requireWorkSessionMutation, requireWorkSessionRead, renderMissionPrompt, workspaceAppModelAndAppMeta } from "./shared.js";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
 import { z } from "zod/v4";
 
@@ -81,6 +81,7 @@ export function registerMissionTools(server: McpServer, config: BridgeConfig): v
         submittedBy: "webui",
         title: objective.slice(0, 80),
         completionPolicy: "webui_approval_required",
+        ownerContextId: liveOwnerContextId(config) ?? config.principalId,
       });
       const leaseError = await acquireCheckoutModifyLease(config, workspaceSessionId, created.id);
       if (leaseError) {
@@ -191,6 +192,8 @@ export function registerMissionTools(server: McpServer, config: BridgeConfig): v
     config,
     async ({ workSessionId, criterionIds, verificationScope, verificationPhase }) => {
       if (!isReviewer(config.principalRole)) return forbidden(config.principalRole, "run_mission_verification");
+      const access = requireWorkSessionMutation(config, workSessionId);
+      if (access) return access;
       if (!config.missionLedger) return { content: [{ type: "text" as const, text: "Mission ledger unavailable." }], isError: true };
       let results;
       const currentSubmission = config.workSessions.get(workSessionId)?.latestSubmission;
@@ -232,6 +235,8 @@ export function registerMissionTools(server: McpServer, config: BridgeConfig): v
     config,
     async ({ workSessionId, comments, findings, criterionUpdates, findingUpdates, evidence, workOrder }) => {
       if (!isReviewer(config.principalRole)) return forbidden(config.principalRole, "continue_supervised_work");
+      const access = requireWorkSessionMutation(config, workSessionId);
+      if (access) return access;
       if (!config.missionLedger) return { content: [{ type: "text" as const, text: "Mission ledger unavailable." }], isError: true };
       const mission = config.missionLedger.getMissionByWorkSession(workSessionId);
       if (!mission) return { content: [{ type: "text" as const, text: "No mission contract for this work session." }], isError: true };
@@ -342,6 +347,8 @@ export function registerMissionTools(server: McpServer, config: BridgeConfig): v
     config,
     async ({ workSessionId, criterionUpdates, findingUpdates, evidence, comments, reviewCoverage, uncertainty }) => {
       if (!isReviewer(config.principalRole)) return forbidden(config.principalRole, "approve_supervised_work");
+      const access = requireWorkSessionMutation(config, workSessionId);
+      if (access) return access;
       if (!config.missionLedger) return { content: [{ type: "text" as const, text: "Mission ledger unavailable." }], isError: true };
       const mission = config.missionLedger.getMissionByWorkSession(workSessionId);
       if (!mission) return { content: [{ type: "text" as const, text: "No mission contract for this work session." }], isError: true };

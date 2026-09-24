@@ -227,11 +227,23 @@ try {
   registerBridgeTools(workerServer as any, { ...config, principalRole: "worker" });
   const reviewerServer = fakeServer();
   registerBridgeTools(reviewerServer as any, { ...config, principalRole: "reviewer" });
+  const reviewerOwnerAServer = fakeServer();
+  registerBridgeTools(reviewerOwnerAServer as any, { ...config, principalRole: "reviewer", connectionConversationId: "owner-a" });
+  const reviewerOwnerBServer = fakeServer();
+  registerBridgeTools(reviewerOwnerBServer as any, { ...config, principalRole: "reviewer", connectionConversationId: "owner-b" });
+  const reviewerTransportAServer = fakeServer();
+  registerBridgeTools(reviewerTransportAServer as any, { ...config, principalRole: "reviewer", connectionMcpSessionId: "transport-a" });
+  const reviewerTransportBServer = fakeServer();
+  registerBridgeTools(reviewerTransportBServer as any, { ...config, principalRole: "reviewer", connectionMcpSessionId: "transport-b" });
   const clientServer = fakeServer();
   registerBridgeTools(clientServer as any, { ...config, principalRole: "client" });
   registerPolicyTools(reviewerServer as any, { eventStore, policyEngine, approvalRequests, principalRole: "reviewer" });
   const callWorker = (name: string, args: any) => workerServer.handlers.get(name)!(args);
   const callReviewer = (name: string, args: any) => reviewerServer.handlers.get(name)!(args);
+  const callOwnerA = (name: string, args: any) => reviewerOwnerAServer.handlers.get(name)!(args);
+  const callOwnerB = (name: string, args: any) => reviewerOwnerBServer.handlers.get(name)!(args);
+  const callTransportA = (name: string, args: any) => reviewerTransportAServer.handlers.get(name)!(args);
+  const callTransportB = (name: string, args: any) => reviewerTransportBServer.handlers.get(name)!(args);
   const callClient = (name: string, args: any) => clientServer.handlers.get(name)!(args);
 
   // ── App visibility contract: every iframe-called tool grants app visibility ──
@@ -575,6 +587,58 @@ try {
     assert.equal(receivedRuns.at(-1)?.workspace_root, "/tmp", "call_acp_agent supplies workspace_root");
     await callReviewer("cancel_work_session", { sessionId: generic.structuredContent.workSessionId });
     reviewWorkflow.finalizeCancellation({ sessionId: generic.structuredContent.workSessionId, reason: "test adapter stopped" });
+  }
+
+  // ── Conversation isolation: foreign sessions stay out of the WebUI surface and cursor ──
+  {
+    const ownedSession = workSessions.create({
+      workspaceSessionId: WS,
+      submittedBy: "mcp",
+      title: "owner-a-only",
+      ownerContextId: "conversation:owner-a",
+    });
+    const beforeOwnerAEvent = workSessions.getWorkspaceEventCursor(WS);
+    eventStore.appendEvent({
+      type: "review.submitted",
+      sessionId: ownedSession.id,
+      workspaceSessionId: WS,
+      payload: { sessionId: ownedSession.id },
+    }, { publish: true });
+
+    const ownerASurface = await callOwnerA("get_workspace_session_surface", { workspaceId: WS });
+    const ownerBSurface = await callOwnerB("get_workspace_session_surface", { workspaceId: WS });
+    assert.ok(ownerASurface.structuredContent.sessions.some((entry: { sessionId: string }) => entry.sessionId === ownedSession.id), "owner A sees its own workspace session");
+    assert.ok(!ownerBSurface.structuredContent.sessions.some((entry: { sessionId: string }) => entry.sessionId === ownedSession.id), "owner B cannot see owner A's workspace session");
+    const globalSurface = await callReviewer("get_workspace_session_surface", { workspaceId: WS });
+    assert.ok(globalSurface.structuredContent.sessions.some((entry: { sessionId: string }) => entry.sessionId === ownedSession.id), "ownerless reviewer retains the global review surface");
+
+    const transportOwnedSession = workSessions.create({
+      workspaceSessionId: WS,
+      submittedBy: "mcp",
+      title: "transport-a-only",
+      ownerContextId: "transport:transport-a",
+    });
+    const transportASurface = await callTransportA("get_workspace_session_surface", { workspaceId: WS });
+    const transportBSurface = await callTransportB("get_workspace_session_surface", { workspaceId: WS });
+    assert.ok(transportASurface.structuredContent.sessions.some((entry: { sessionId: string }) => entry.sessionId === transportOwnedSession.id), "transport A sees its own workspace session");
+    assert.ok(!transportBSurface.structuredContent.sessions.some((entry: { sessionId: string }) => entry.sessionId === transportOwnedSession.id), "transport B cannot see transport A's workspace session");
+
+    const ownerBEvents = await callOwnerB("await_workspace_events", { workspaceId: WS, afterSeq: beforeOwnerAEvent, timeoutMs: 1000 });
+    assert.equal(ownerBEvents.structuredContent.events.length, 0, "owner B receives no owner A event");
+    assert.ok(ownerBEvents.structuredContent.nextSeq > 0, "owner B cursor advances past filtered owner A events");
+    const ownerBNextEvents = await callOwnerB("await_workspace_events", { workspaceId: WS, afterSeq: ownerBEvents.structuredContent.nextSeq, timeoutMs: 1000 });
+    assert.equal(ownerBNextEvents.structuredContent.events.length, 0, "filtered foreign event is not refetched at the next cursor");
+
+    // Known IDs must not bypass conversation ownership for reviewer mutations.
+    const crossReview = await callOwnerB("provide_review_feedback", { sessionId: ownedSession.id, verdict: "approve" });
+    assert.ok(crossReview.isError, "owner B cannot provide feedback for owner A's session");
+    const crossHandoff = await callOwnerB("handoff_work_session", { sessionId: ownedSession.id, toAgent: "cli-coding-agent" });
+    assert.ok(crossHandoff.isError, "owner B cannot hand off owner A's session");
+    const crossCancel = await callOwnerB("cancel_work_session", { sessionId: ownedSession.id });
+    assert.ok(crossCancel.isError, "owner B cannot cancel owner A's session");
+    const crossMissionPause = await callOwnerB("pause_supervisor_run", { sessionId: ownedSession.id, expectedRevision: 1 });
+    assert.ok(crossMissionPause.isError, "owner B cannot pause owner A's supervisor run");
+    assert.equal(workSessions.get(ownedSession.id)?.status, "in_progress", "cross-owner reviewer calls do not mutate the target");
   }
 
   // ── Scenario 4b: gated sessions enforce action guard + exact artifact approval ──

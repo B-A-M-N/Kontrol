@@ -9,7 +9,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { BridgeConfig } from "./context.js";
 import { registerMutationAppTool } from "./app-tool.js";
 import { supervisorPacket } from "./context.js";
-import { forbidden, isReviewer, workspaceAppModelAndAppMeta } from "./shared.js";
+import { forbidden, isReviewer, requireWorkSessionMutation, workspaceAppModelAndAppMeta } from "./shared.js";
 import { z } from "zod/v4";
 
 export function registerSupervisorTools(server: McpServer, config: BridgeConfig): void {
@@ -27,6 +27,8 @@ export function registerSupervisorTools(server: McpServer, config: BridgeConfig)
     config,
     async ({ workSessionId, expectedRevision }) => {
       if (!isReviewer(config.principalRole)) return forbidden(config.principalRole, "pause_supervisor_run");
+      const access = requireWorkSessionMutation(config, workSessionId);
+      if (access) return access;
       const current = config.supervisorRuns?.getByWorkSession(workSessionId);
       const paused = current && config.supervisorRuns?.pause(current.id, expectedRevision);
       if (!paused) return { content: [{ type: "text" as const, text: "Supervisor run was not found or changed concurrently." }], isError: true };
@@ -49,6 +51,8 @@ export function registerSupervisorTools(server: McpServer, config: BridgeConfig)
     config,
     async ({ workSessionId, expectedRevision }) => {
       if (!isReviewer(config.principalRole)) return forbidden(config.principalRole, "resume_supervisor_run");
+      const access = requireWorkSessionMutation(config, workSessionId);
+      if (access) return access;
       const current = config.supervisorRuns?.getByWorkSession(workSessionId);
       const resumed = current && config.supervisorRuns?.resume(current.id, expectedRevision);
       if (!resumed) return { content: [{ type: "text" as const, text: "Supervisor run was not paused or changed concurrently." }], isError: true };
@@ -76,6 +80,8 @@ export function registerSupervisorTools(server: McpServer, config: BridgeConfig)
     config,
     async ({ workSessionId, expectedRevision }) => {
       if (!isReviewer(config.principalRole)) return forbidden(config.principalRole, "redrive_supervisor_run");
+      const access = requireWorkSessionMutation(config, workSessionId);
+      if (access) return access;
       const outbox = config.dispatchOutbox;
       if (!outbox) return { content: [{ type: "text" as const, text: "Dispatch outbox is unavailable." }], isError: true };
       const run = config.supervisorRuns?.getByWorkSession(workSessionId);

@@ -11,7 +11,9 @@
  * can starve the other) and release it on response finish/close or client
  * abort, whichever fires first.
  */
-import { gzipSync } from "node:zlib";
+import { gzip } from "node:zlib";
+import { promisify } from "node:util";
+import { monitorEventLoopDelay } from "node:perf_hooks";
 import type { Request, RequestHandler, Response } from "express";
 import express from "express";
 import type { ServerConfig } from "../config.js";
@@ -29,6 +31,58 @@ import {
 } from "../workspace-app-resource.js";
 import { uiBuildDirectory, setAssetHeaders, type WorkspaceAppResourceMetrics } from "./mcp-session-state.js";
 
+const gzipAsync = promisify(gzip);
+const workspaceAppEventLoopDelay = monitorEventLoopDelay({ resolution: 10 });
+workspaceAppEventLoopDelay.enable();
+const MAX_WORKSPACE_APP_CACHE_ENTRIES = 4;
+const MAX_WORKSPACE_APP_CACHE_BYTES = 64 * 1024 * 1024;
+const workspaceAppContentJson = new Map<string, { json: string; bytes: number }>();
+let workspaceAppContentJsonBytes = 0;
+let workspaceAppContentJsonMetrics: WorkspaceAppResourceMetrics | undefined;
+function cachedWorkspaceAppContentJson(kind: string, uri: string): string {
+  const key = `${kind}:${uri}`;
+  const existing = workspaceAppContentJson.get(key);
+  if (existing) return existing.json;
+  const isCurrent = kind === "current";
+  const content = {
+    uri,
+    mimeType: isCurrent ? RESOURCE_MIME_TYPE : "text/html+skybridge",
+    text: WORKSPACE_APP_HTML,
+    ...(isCurrent ? { _meta: workspaceAppResourceMeta() } : {}),
+  };
+  const json = JSON.stringify(content);
+  if (workspaceAppContentJson.size >= MAX_WORKSPACE_APP_CACHE_ENTRIES) {
+    const oldest = workspaceAppContentJson.keys().next().value as string | undefined;
+    if (oldest) {
+      const removed = workspaceAppContentJson.get(oldest);
+      workspaceAppContentJson.delete(oldest);
+      workspaceAppContentJsonBytes -= removed?.bytes ?? 0;
+    }
+  }
+  const bytes = Buffer.byteLength(json, "utf8");
+  if (bytes <= MAX_WORKSPACE_APP_CACHE_BYTES) {
+    workspaceAppContentJson.set(key, { json, bytes });
+    workspaceAppContentJsonBytes += bytes;
+  }
+  if (workspaceAppContentJsonMetrics) {
+    workspaceAppContentJsonMetrics.cacheEntries = workspaceAppContentJson.size;
+    workspaceAppContentJsonMetrics.cacheBytes = workspaceAppContentJsonBytes;
+    workspaceAppContentJsonMetrics.maxCacheEntries = Math.max(workspaceAppContentJsonMetrics.maxCacheEntries, workspaceAppContentJson.size);
+    workspaceAppContentJsonMetrics.maxCacheBytes = Math.max(workspaceAppContentJsonMetrics.maxCacheBytes, workspaceAppContentJsonBytes);
+  }
+  return json;
+}
+
+// Serialize the static 10 MB content once at server-module startup. The
+// dynamic JSON-RPC envelope is still built per request, but no request pays a
+// synchronous stringify cost for the widget body.
+for (const [kind, uri] of [
+  ["current", WORKSPACE_APP_URI],
+  ["openai", OPENAI_WORKSPACE_APP_URI],
+  ["legacy", LEGACY_WORKSPACE_APP_URI],
+  ["devdesktop", DEVDESKTOP_WORKSPACE_APP_URI],
+] as const) cachedWorkspaceAppContentJson(kind, uri);
+
 export function createWorkspaceAppResourceServer(
   config: ServerConfig,
   metrics: WorkspaceAppResourceMetrics,
@@ -37,13 +91,13 @@ export function createWorkspaceAppResourceServer(
   serve: (res: Response, requestId: string | undefined, body: { id?: unknown; params?: { uri?: unknown } }, sessionless: boolean, clientKey: string, abortSignal: AbortSignal | undefined, acceptEncoding?: string | undefined) => Promise<boolean>;
   assetRoutes: RequestHandler[];
 } {
-  // P1 perf: the artifact is ~10 MB raw / ~1.8 MB gzipped. The previous
-  // implementation always called res.json(), so the ACTUAL wire transfer was
-  // the raw size — the "1.82 MiB user-facing cost" implied by local gzipSync
-  // measurements was never delivered on the wire. The envelope is compressed
-  // per request (never cached whole): the JSON-RPC id and the echoed resource
-  // uri vary per request, and a cached deflate stream would replay the first
-  // requester's id/uri to everyone behind it.
+  workspaceAppContentJsonMetrics = metrics;
+  metrics.cacheEntries = workspaceAppContentJson.size;
+  metrics.cacheBytes = workspaceAppContentJsonBytes;
+  // P1 perf: the artifact is ~10 MB raw / ~1.8 MB gzipped. The static content
+  // JSON is serialized once at module load; only the small JSON-RPC envelope
+  // varies per request. Compression is asynchronous so a second tab cannot
+  // monopolize the event loop while mounting the widget.
   function acceptsGzip(acceptEncoding: string | undefined): boolean {
     if (!acceptEncoding) return false;
     return acceptEncoding.split(",").some((part) => {
@@ -102,40 +156,58 @@ export function createWorkspaceAppResourceServer(
     metrics.active++;
     if (metrics.active > metrics.maxActive) metrics.maxActive = metrics.active;
 
-    // Release exactly once on the first of finish/close/abort. The permit is
-    // held only for the serialization window, never across a keep-alive.
+    // Hold the resource permit until the compression work itself has settled.
+    // A disconnected caller must not release the permit while gzip is still
+    // consuming CPU/memory, otherwise reconnect churn can exceed the pool.
     let released = false;
+    let responseDone = false;
+    let compressionDone = false;
+    let aborted = false;
     const releaseOnce = () => {
-      if (released) return;
+      if (released || !responseDone || !compressionDone) return;
       released = true;
       metrics.active = Math.max(0, metrics.active - 1);
       permit();
-      res.off("finish", releaseOnce);
-      res.off("close", releaseOnce);
+      res.off("finish", markResponseDone);
+      res.off("close", markResponseDone);
     };
-    res.once("finish", releaseOnce);
-    res.once("close", releaseOnce);
+    const markResponseDone = () => {
+      if (responseDone) return;
+      responseDone = true;
+      releaseOnce();
+    };
+    res.once("finish", markResponseDone);
+    res.once("close", markResponseDone);
     if (abortSignal) {
-      if (abortSignal.aborted) releaseOnce();
-      else abortSignal.addEventListener("abort", releaseOnce, { once: true });
+      const onAbort = () => {
+        aborted = true;
+        responseDone = true;
+        if (compressionDone) releaseOnce();
+      };
+      if (abortSignal.aborted) onAbort();
+      else abortSignal.addEventListener("abort", onAbort, { once: true });
     }
 
-    const isCurrent = kind === "current";
-    const content: { uri: string; mimeType: string; text: string; _meta?: Record<string, unknown> } = {
-      uri: uri ?? WORKSPACE_APP_URI,
-      mimeType: isCurrent ? RESOURCE_MIME_TYPE : "text/html+skybridge",
-      text: WORKSPACE_APP_HTML,
-      ...(isCurrent ? { _meta: workspaceAppResourceMeta() } : {}),
-    };
-    const envelope = {
-      jsonrpc: "2.0" as const,
-      id: body.id ?? null,
-      result: { contents: [content] },
-    };
+    const resolvedUri = uri ?? WORKSPACE_APP_URI;
+    // Cache the static 10 MB content serialization. Only the small JSON-RPC
+    // envelope varies per request, and compression is async so two tabs cannot
+    // monopolize the event loop with synchronous gzip work.
+    const contentJson = cachedWorkspaceAppContentJson(kind, resolvedUri);
+    const envelopeJson = `{"jsonrpc":"2.0","id":${JSON.stringify(body.id ?? null)},"result":{"contents":[${contentJson}]}}`;
 
+    if (aborted || res.destroyed) {
+      compressionDone = true;
+      releaseOnce();
+      return true;
+    }
     let wireBytes: number;
     if (acceptsGzip(acceptEncoding)) {
-      const gzipped = gzipSync(Buffer.from(JSON.stringify(envelope), "utf8"));
+      const gzipped = await gzipAsync(Buffer.from(envelopeJson, "utf8"));
+      compressionDone = true;
+      if (aborted || res.destroyed) {
+        releaseOnce();
+        return true;
+      }
       wireBytes = gzipped.length;
       res.setHeader("content-type", "application/json");
       res.setHeader("content-encoding", "gzip");
@@ -143,7 +215,12 @@ export function createWorkspaceAppResourceServer(
       res.setHeader("vary", "accept-encoding");
       res.end(gzipped);
     } else {
-      const raw = Buffer.from(JSON.stringify(envelope), "utf8");
+      const raw = Buffer.from(envelopeJson, "utf8");
+      compressionDone = true;
+      if (aborted || res.destroyed) {
+        releaseOnce();
+        return true;
+      }
       wireBytes = raw.length;
       res.setHeader("content-type", "application/json");
       res.setHeader("content-length", String(wireBytes));
@@ -151,6 +228,11 @@ export function createWorkspaceAppResourceServer(
     }
 
     const totalMs = Math.round(performance.now() - resourceStartedAt);
+    const eventLoopDelayMs = Number.isFinite(workspaceAppEventLoopDelay.mean)
+      ? workspaceAppEventLoopDelay.mean / 1e6
+      : 0;
+    metrics.lastEventLoopDelayMs = eventLoopDelayMs;
+    metrics.maxEventLoopDelayMs = Math.max(metrics.maxEventLoopDelayMs, eventLoopDelayMs);
     metrics.servedTotal++;
     metrics.lastDurationMs = totalMs;
     if (totalMs > metrics.maxDurationMs) metrics.maxDurationMs = totalMs;
@@ -163,6 +245,7 @@ export function createWorkspaceAppResourceServer(
       wireBytes,
       contentEncoding: acceptsGzip(acceptEncoding) ? "gzip" : "identity",
       totalMs,
+      eventLoopDelayMs,
     });
     return true;
   }

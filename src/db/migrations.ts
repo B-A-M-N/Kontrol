@@ -65,6 +65,8 @@ const migrations: Migration[] = [
   { version: 53, name: "backend-neutral-snapshot-identities", up: migrateBackendNeutralSnapshotIdentities },
   { version: 54, name: "work-session-terminal-at", up: migrateWorkSessionTerminalAt },
   { version: 55, name: "submission-checkpoint-coverage", up: migrateSubmissionCheckpointCoverage },
+  { version: 56, name: "work-session-owner-context", up: migrateWorkSessionOwnerContext },
+  { version: 57, name: "approval-owner-context", up: migrateApprovalOwnerContext },
 ];
 
 // P1 (audit): checkpoint coverage blind spots. A structured mutation into a
@@ -1217,6 +1219,16 @@ function migrateWorkSessionTerminalAt(sqlite: Database.Database): void {
      where terminal_at is null
        and status in ('approved', 'rejected', 'cancelled', 'failed', 'failed_protocol')
   `);
+}
+
+function migrateApprovalOwnerContext(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "approval_requests", "owner_context_id", "text");
+  sqlite.exec("create index if not exists approval_requests_owner_context_idx on approval_requests(owner_context_id, status, created_at)");
+}
+
+function migrateWorkSessionOwnerContext(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "work_sessions", "owner_context_id", "text");
+  sqlite.exec("create index if not exists work_sessions_owner_context_idx on work_sessions(owner_context_id, updated_at)");
 }
 
 function addColumnIfMissing(

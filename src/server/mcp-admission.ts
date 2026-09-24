@@ -72,8 +72,8 @@ export async function handleMcpRequestWithDeadline(
 ): Promise<void> {
   const handler = transport.handleRequest(req, res, body);
   // The MCP SDK does not expose cancellation for an in-flight handler. Keep
-  // its rejection observed, then close the transport on timeout so the caller
-  // can reconnect instead of leaving a dead HTTP request and retained session.
+  // its rejection observed, but do not close the shared transport: one timed
+  // request must not invalidate unrelated requests on the same MCP session.
   void handler.catch(() => undefined);
   let timer: NodeJS.Timeout | undefined;
   try {
@@ -85,14 +85,9 @@ export async function handleMcpRequestWithDeadline(
     ]);
   } catch (error) {
     if (error instanceof McpExecutionTimeoutError) {
-      try {
-        await Promise.race([
-          Promise.resolve(transport.close()),
-          new Promise<void>((resolve) => setTimeout(resolve, 1_000)),
-        ]);
-      } catch {
-        // The transport is already considered unusable after a deadline.
-      }
+      // The transport is multiplexed. The request/response is abandoned, but
+      // the session remains available for a fresh caller. The HTTP layer owns
+      // the error response; this helper only enforces the bounded deadline.
     }
     throw error;
   } finally {

@@ -52,10 +52,12 @@ export function createToolEnvelope(deps: ToolEnvelopeDeps): ToolEnvelope {
     if (!workSessions || !config.acpEnabled || !eventStore) return;
     try {
       // Attribution is part of the execution envelope: prefer the work session
-      // bound to THIS MCP connection, falling back to the workspace's "currently
-      // active" session only for non-delegated (direct) tool calls.
+      // bound to THIS MCP connection, falling back to the per-transport active
+      // session for non-delegated (direct) tool calls. The shared project record
+      // never acts as an attribution fallback.
       const workSessionId =
-        connectionContext?.workSessionId ?? workspaces.getWorkspace(workspaceId).currentWorkSessionId;
+        connectionContext?.workSessionId
+          ?? workspaces.getCurrentWorkSessionId(workspaceId, connectionContext?.mcpSessionId);
       if (!workSessionId) return;
 
       const session = workSessions.get(workSessionId);

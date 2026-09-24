@@ -11,6 +11,7 @@ export interface PolicyInvocation {
   principalRole: PrincipalRole;
   workspaceId: WorkspaceId;
   workSessionId?: WorkSessionId;
+  ownerContextId?: string;
   runId?: string;
   tool: string;
   path?: PolicyInputPath;
@@ -98,6 +99,7 @@ export interface PolicyApprovalEventPayload {
   matchedPattern?: string;
   origin?: "direct_mcp" | "work_session";
   conversationId?: string;
+  ownerContextId?: string;
   requestedAt?: string;
   expiresAt?: string;
   /**
@@ -238,6 +240,7 @@ export function createPolicyEnforcer(
               principalId: inv.principalId,
               workspaceId: inv.workspaceId,
               workSessionId: inv.workSessionId,
+              ownerContextId: inv.ownerContextId,
               tool: canonical,
               approvalKey,
               path: policyPathLabel(path),
@@ -314,6 +317,7 @@ export function createPolicyEnforcer(
             liveWaiterId: blocking ? liveWaiterId : undefined,
             origin: inv.workSessionId ? "work_session" : "direct_mcp",
             conversationId: inv.conversationId,
+            ownerContextId: inv.ownerContextId,
             requestedAt,
             expiresAt,
             options,
@@ -336,6 +340,7 @@ export function createPolicyEnforcer(
             matchedPattern: decision.matchedPattern,
             origin: inv.workSessionId ? "work_session" : "direct_mcp",
             conversationId: inv.conversationId,
+            ownerContextId: inv.ownerContextId,
             requestedAt,
             expiresAt,
             options,

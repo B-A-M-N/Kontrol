@@ -48,7 +48,11 @@ try {
   assert.ok(Date.now() - largeStart < 2_000, "workspace open remains bounded with a 10,000-directory fixture");
   const newlyLoaded = await registry.loadApplicableInstructions(workspace, "nested/file.txt");
   assert.deepEqual(newlyLoaded.map((file) => file.path), [join(root, "nested", "AGENTS.md")]);
-  assert.deepEqual(await registry.loadApplicableInstructions(workspace, "nested/file.txt"), [], "nested instructions are cached");
+  assert.deepEqual(await registry.loadApplicableInstructions(workspace, "nested/file.txt"), newlyLoaded,
+    "instruction discovery remains unacknowledged until the owning operation succeeds");
+  registry.acknowledgeApplicableInstructions(workspace, newlyLoaded);
+  assert.deepEqual(await registry.loadApplicableInstructions(workspace, "nested/file.txt"), [],
+    "acknowledged nested instructions are cached");
 
   const missingWorkspaceRoot = join(root, "missing", "workspace");
   await assert.rejects(

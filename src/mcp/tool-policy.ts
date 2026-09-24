@@ -12,6 +12,16 @@ import { isPathInsideRoot } from "../roots.js";
 import { authorizeWorkSessionAction } from "../work-session-action-guard.js";
 import type { WorkSessionManager } from "../work-sessions.js";
 import { mcpRequestContext } from "./request-context.js";
+import { mcpOwnerContextId } from "./owner-context.js";
+
+function directPolicyPrincipal(workspaceId: string): string {
+  const context = mcpRequestContext.getStore();
+  return mcpOwnerContextId({
+    conversationId: context?.conversationId,
+    mcpSessionId: context?.mcpSessionId,
+    principalId: context?.principalId,
+  }) ?? workspaceId;
+}
 
 /**
  * P0.2: a policy-blocked result must remain renderable by the Workspace App.
@@ -113,10 +123,13 @@ export async function enforceToolPolicy(
     if (!sessionDecision.allowed) return { allowed: false };
   }
   const result = await enforcer.enforce({
-    principalId: workSessionId ?? workspaceId,
+    principalId: workSessionId ?? directPolicyPrincipal(workspaceId),
     principalRole: workSessionId ? "worker" : "client",
     workspaceId,
     workSessionId,
+    ownerContextId: workSessionId
+      ? workSessions?.get(workSessionId)?.ownerContextId
+      : directPolicyPrincipal(workspaceId),
     runId,
     tool,
     path,
