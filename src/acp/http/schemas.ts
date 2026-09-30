@@ -38,5 +38,7 @@ export const acpRunEventSchema = z.object({
   // rejected so a late event from attempt N cannot mutate attempt N+1.
   attempt_number: z.number().int().positive().optional(),
   type: z.string().min(1),
+  event_id: z.string().min(1).optional().describe("Stable adapter event identity for retry deduplication."),
+  event_sequence: z.number().int().positive().optional().describe("Adapter-local ordering for replay."),
   payload: z.record(z.string(), z.unknown()).optional(),
 });

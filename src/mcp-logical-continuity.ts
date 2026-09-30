@@ -173,6 +173,12 @@ export class LogicalContinuityIndex {
     return this.entries.size;
   }
 
+  /** Return whether trusted continuity metadata exists for an identity. */
+  has(identity: string, at = Date.now()): boolean {
+    this.sweep(at);
+    return this.entries.has(identity);
+  }
+
   snapshot(at = Date.now()): LogicalContinuityRecord[] {
     this.sweep(at);
     return [...this.entries.values()]

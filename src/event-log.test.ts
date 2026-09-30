@@ -22,6 +22,8 @@ try {
   }
 
   assert.equal(events.getEventsForSession("session-1").length, 0, "fragments are buffered, not inserted one per row");
+  events.appendEvent({ id: "adapter-event-1", type: "agent.run.output_delta", sessionId: "session-1", payload: { channel: "message", text: "duplicate " } });
+  events.appendEvent({ id: "adapter-event-1", type: "agent.run.output_delta", sessionId: "session-1", payload: { channel: "message", text: "duplicate " } });
   events.appendEvent({ type: "agent.run.started", sessionId: "session-1", payload: {} });
 
   const durable = events.getEventsForSession("session-1");
@@ -29,8 +31,9 @@ try {
   assert.equal(durable[0].type, "agent.run.output_delta");
   assert.equal(durable[0].durable, true);
   assert.equal(durable[0].payload.coalesced, true);
-  assert.equal(durable[0].payload.count, 100);
-  assert.equal(durable[0].payload.text, Array.from({ length: 100 }, (_, i) => `${i} `).join(""));
+  assert.equal(durable[0].payload.count, 101);
+  assert.equal(events.getEventById("adapter-event-1")?.id, "adapter-event-1", "stable adapter event ids support exact retry deduplication");
+  assert.equal(durable[0].payload.text, `${Array.from({ length: 100 }, (_, i) => `${i} `).join("")}duplicate `);
   assert.equal("segments" in durable[0].payload, false, "coalesced telemetry does not duplicate text in segments");
   assert.equal(durable[1].type, "agent.run.started");
   assert.ok(durable[1].seq > durable[0].seq);

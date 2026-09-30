@@ -69,8 +69,22 @@ export async function handleMcpRequestWithDeadline(
   res: Response,
   body: unknown,
   timeoutMs: number,
+  onHandlerSettled?: () => void,
+  onDeadline?: () => void,
+  onExpiredHandlerSettled?: (outcome: "completed" | "failed", error?: unknown) => void,
 ): Promise<void> {
   const handler = transport.handleRequest(req, res, body);
+  let deadlineExpired = false;
+  void handler.then(
+    () => {
+      if (deadlineExpired) onExpiredHandlerSettled?.("completed");
+      onHandlerSettled?.();
+    },
+    (error: unknown) => {
+      if (deadlineExpired) onExpiredHandlerSettled?.("failed", error);
+      onHandlerSettled?.();
+    },
+  ).catch(() => undefined);
   // The MCP SDK does not expose cancellation for an in-flight handler. Keep
   // its rejection observed, but do not close the shared transport: one timed
   // request must not invalidate unrelated requests on the same MCP session.
@@ -80,7 +94,11 @@ export async function handleMcpRequestWithDeadline(
     await Promise.race([
       handler,
       new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new McpExecutionTimeoutError(timeoutMs)), timeoutMs);
+        timer = setTimeout(() => {
+          deadlineExpired = true;
+          try { onDeadline?.(); } catch { /* diagnostics must not change timeout behavior */ }
+          reject(new McpExecutionTimeoutError(timeoutMs));
+        }, timeoutMs);
       }),
     ]);
   } catch (error) {

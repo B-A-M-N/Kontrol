@@ -1,18 +1,20 @@
 // Final stable-beta qualification gate.
 //
-// This is intentionally a small evidence joiner. The expensive code gate and
-// the real wall-clock soak run independently; this command qualifies only
-// when both receipts describe the same candidate and the checkout is still
-// clean and unchanged at the final decision point.
+// This is intentionally a small evidence joiner. The expensive code gate,
+// wall-clock soak, and fresh external host-catalog probe run independently;
+// this command qualifies only when all evidence describes the same candidate
+// and the checkout is still clean and unchanged at the final decision point.
 import { execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { validateBetaSoakAssertions } from "./beta-soak-contract.mjs";
+import { validateBetaExternalCatalogReceipt } from "./beta-external-catalog-contract.mjs";
 
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const codeReceiptPath = resolve(process.env.KONTROL_BETA_CODE_RECEIPT ?? join(root, "beta-code-qualification.json"));
 const soakReportPath = resolve(process.env.KONTROL_BETA_SOAK_REPORT ?? join(root, "beta-soak.json"));
+const externalCatalogReceiptPath = resolve(process.env.KONTROL_BETA_EXTERNAL_CATALOG_RECEIPT ?? join(root, "beta-external-catalog.json"));
 const receiptPath = resolve(process.env.KONTROL_BETA_RECEIPT ?? join(root, "beta-qualification.json"));
 const STABLE_BETA_MIN_SOAK_HOURS = 12;
 const configuredMinimumSoakHours = Number(process.env.KONTROL_BETA_MIN_SOAK_HOURS ?? STABLE_BETA_MIN_SOAK_HOURS);
@@ -56,8 +58,10 @@ function writeReceipt(receipt) {
 
 const codeResult = readJson(codeReceiptPath);
 const soakResult = readJson(soakReportPath);
+const externalCatalogResult = readJson(externalCatalogReceiptPath);
 const code = codeResult.value;
 const soak = soakResult.value;
+const externalCatalog = externalCatalogResult.value;
 const finalGitSha = gitSha();
 const finalDirtyPaths = gitStatus();
 const candidate = code?.candidate;
@@ -112,9 +116,20 @@ const soakIdentity = Boolean(
 const soakAssertionsPass = Boolean(
   soakAssertionCheck.valid,
 );
+const expectedMcpVersion = typeof candidateMetadata?.version === "string"
+  && typeof candidateMetadata?.contentSha256 === "string"
+  ? `${candidateMetadata.version}+${candidateMetadata.contentSha256}`
+  : undefined;
+const externalCatalogCheck = validateBetaExternalCatalogReceipt(externalCatalog, {
+  candidateBuildId,
+  expectedMcpVersion,
+  soak,
+});
+const externalCatalogFresh = externalCatalogCheck.valid;
 
 const receipt = {
   kind: "kontrol-beta-qualification",
+  stage: "combined",
   status: "failed",
   qualified: false,
   createdAt: new Date().toISOString(),
@@ -129,6 +144,7 @@ const receipt = {
   inputs: {
     codeReceiptPath,
     soakReportPath,
+    externalCatalogReceiptPath,
   },
   candidate: candidate ? {
     buildId: candidateBuildId,
@@ -153,6 +169,22 @@ const receipt = {
     identity: soakIdentity,
     assertionsPass: soakAssertionsPass,
   } : { error: soakResult.error, identity: false, assertionsPass: false },
+  externalCatalog: externalCatalog ? {
+    status: externalCatalog.status,
+    path: externalCatalogReceiptPath,
+    expectedBuildId: externalCatalog.expectedBuildId,
+    expectedMcpVersion: externalCatalog.expectedMcpVersion,
+    serverInfoVersion: externalCatalog.serverInfoVersion,
+    hostCatalogVersion: externalCatalog.hostCatalogVersion,
+    hostCatalogCapturedAt: externalCatalog.hostCatalogCapturedAt,
+    startedAt: externalCatalog.startedAt,
+    finishedAt: externalCatalog.finishedAt,
+    url: externalCatalog.url,
+    catalogParity: externalCatalog.catalogParity === true,
+    freshHostExchange: externalCatalog.freshHostExchange === true,
+    ...externalCatalogCheck,
+    freshForDeployedCandidate: externalCatalogFresh,
+  } : { path: externalCatalogReceiptPath, error: externalCatalogResult.error, freshForDeployedCandidate: false },
   checks: {
     codeReceiptPresent: Boolean(code),
     codeQualified: code?.codeQualified === true,
@@ -162,6 +194,7 @@ const receipt = {
     soakDuration,
     soakIdentity,
     soakAssertionsPass,
+    externalCatalogFresh,
   },
 };
 receipt.qualified = Object.values(receipt.checks).every(Boolean);

@@ -206,6 +206,12 @@ Current implementation contracts:
   `open_workspace`, authenticated diagnostics, and `generation.json` expose
   the surface identity, and clients with a stale catalog must establish a
   fresh MCP initialize rather than substitute shell inspection.
+- `read` returns a SHA-256 version of the complete file bytes. `write` and
+  `edit` accept an optional `expectedContentSha256`, while Codex
+  `apply_patch` accepts `expectedContentSha256ByPath`; supplied preconditions
+  are checked under a process-wide, path-keyed mutation coordinator immediately
+  before mutation, so overlapping same-version edits serialize and a
+  `file_version_conflict` response leaves all files unchanged.
 - Periodic and startup reconciliation is bounded by pages/cursors so runtime
   state, approval expiry, direct-approval orphan cleanup, and telemetry work
   cannot become an unbounded synchronous serving-thread sweep.
@@ -221,18 +227,86 @@ Current implementation contracts:
   for reconciliation.
 - `npm run test:ui` includes a real Chromium pass over the built single-file
   Workspace UI, covering responsive layout, focus-visible controls, host theme
-  tokens, and live-versus-stale session status presentation.
+  tokens, and live-versus-stale session status presentation. The agent submit
+  bar is one persistent per-app instance with a multiline draft; Ctrl/Cmd+Enter
+  submits, reference-only ChatGPT placeholders remain visible with a warning,
+  and Copy Raw uses original payload text with a manual textarea fallback when
+  the host denies clipboard-write permission. `KONTROL_UI_SCREENSHOT_DIR`
+  opt-in captures deterministic Chromium evidence for before/current visual
+  comparison without expanding the test's workspace authority.
+- Workspace App event waits default to 18 seconds so the watcher remains below
+  common intermediary idle limits; reconnect retries recreate the host `App`
+  transport while preserving the durable UI projection and draft state.
+  Reconnect ownership is single-flight and teardown-cancellable; diagnostics
+  classify response closure, DELETE, stale-session 404, admission exhaustion,
+  idle eviction, stalled SSE, transport closure, watcher completion/abort, and
+  trusted reconnect attempt/success with generation and duration buckets.
+- Worker-bound MCP transports are protected by the associated nonterminal,
+  actively owned work session rather than by an unbounded TTL. Detached or
+  terminal worker sessions become reclaimable after their normal grace period.
+- `kontrol-supervisor.mjs` contains probe/status exceptions, opens a
+  cooldown-backed per-component circuit after repeated failed recovery, and
+  publishes generation/PID/start-token identity. `start-all.sh` validates that
+  identity before transferring runtime-lock ownership.
+- When `KONTROL_MCP_CANARY_URL` or `KONTROL_PUBLIC_BASE_URL` is configured,
+  the supervisor independently runs a lower-frequency fresh MCP initialize,
+  tools/list, and lightweight read canary. Canary failures are recorded in
+  `supervisor-status.json` and diagnostics without restarting healthy local
+  components. Credentialed probes use `KONTROL_MCP_CANARY_AUTH_FILE`, passed
+  as a path to the scrubbed probe child; the secret is never placed in the
+  supervisor command line or inherited child environment.
+- Authenticated `mcpSessionMetrics.operationDiagnostics` is a bounded,
+  body-free request correlation surface. It records operation/request IDs,
+  generation and session prefix, method/tool, timing, HTTP status, locally
+  written response bytes, close classification, admission/execution timing,
+  and connection/resource counters; it never records auth headers, arguments,
+  or response bodies. Responses echo safe request correlation IDs and include
+  Kontrol operation/request IDs. Local response bytes do not establish
+  intermediary delivery or ChatGPT acceptance. External interruption reports
+  should correlate a browser HAR, Kontrol diagnostics/logs, and tunnel delivery
+  logs with `scripts/analyze-mcp-stream-failure.mjs`, which keeps exact-ID
+  matches separate from timestamp proximity.
+- `scripts/probe-mcp-tunnel.mjs --dual` validates both fresh catalogs, uses
+  reviewer authority for Workspace App event watchers when supplied, exercises
+  an 18-second empty watcher heartbeat, reads actual repeated SSE heartbeat
+  bytes, and applies concurrent Workspace App resource load. Its HTTP request
+  deadline must exceed the watcher interval. Catalog extraction accepts one
+  authoritative `tools/list` result and rejects ambiguous envelopes rather
+  than merging arrays. A qualification capture has `capturedAt`, `captureId`,
+  `initialize`, and the matching `toolsList`; the receipt labels the host
+  exchange operator-supplied and Kontrol's live server exchange
+  machine-verified. Qualification requires the deployed HTTPS intermediary,
+  at least two heartbeat bytes per session, two observed drain recoveries, and
+  concurrent resource reads; localhost idle-proxy runs cannot create receipts.
+  Pass `--host-catalog-file` to fail closed on missing/extra invocable tools
+  and stale `serverInfo.version`.
+  The default receipt path is `beta-external-catalog.json`; override it with
+  `KONTROL_BETA_EXTERNAL_CATALOG_RECEIPT` when running the final gate.
+  `beta-gate:final` requires its fresh parity receipt to target the soak origin,
+  match the candidate's immutable MCP version, be captured during the soak, and
+  be probed again after the soak ends with streaming evidence present.
+- `npm run probe:idle-proxy` is a localhost-only intermediary harness for the
+  25-second idle-response acceptance scenario; it does not substitute for the
+  real tunnel or ChatGPT host. Run the dual probe through it with the 18-second
+  watcher interval before external qualification.
+- MCP shutdown is one shared retry-safe close operation: each subsystem phase
+  is bounded, later phases still run after an earlier failure, and repeated
+  `close()` calls observe the same completion result.
 - For the systemd core unit, `restart` means restart the installed immutable
   release; `upgrade` selects the latest immutable build candidate (falling
   back to the checkout `dist/` projection), verifies readiness, and restores
   the previous unit if activation fails.
 - `npm run gate:beta:code` is the code/evidence stage and writes an ignored
   `beta-code-qualification.json`; `npm run soak:beta -- --hours 12
-  --build-id BUILD_ID` must then exercise that exact deployed build with
-  diagnostics and tunnel monitoring; the receipt must contain the complete
-  required assertion set; `npm run gate:beta:final` joins the receipts into
+  --workspace-path WORKSPACE --build-id BUILD_ID` must then exercise that exact
+  deployed build with diagnostics, tunnel monitoring, hourly paired Workspace
+  App resource reads, resource-admission recovery, and expired-handler
+  accounting; the receipt must contain the complete required assertion set.
+  A fresh host catalog probe must also match that
+  build after the soak; `npm run gate:beta:final` joins all evidence into
   `beta-qualification.json`. `npm run gate:beta` is the one-shot equivalent
-  that runs the code stage and requires an existing matching soak receipt.
+  that runs the code stage and requires matching soak and external catalog
+  receipts.
   The canonical gate enforces a 12-hour minimum (an environment override may
   only require longer). End-state SHA/cleanliness and candidate identity must
   still match. `--allow-dirty` is an evidence-collection override only: a

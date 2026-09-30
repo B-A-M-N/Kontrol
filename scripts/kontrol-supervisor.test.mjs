@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { adapterHealthReady, allHealthy, classifyTunnelFailure, classifyTunnelProbeFailure, createRecoveryEngine, FailureTracker, parseAgentSpecs, processIsLive, shouldRecoverComponent } from "./kontrol-supervisor.mjs";
+import { EventEmitter } from "node:events";
+import { adapterHealthReady, allHealthy, classifyTunnelFailure, classifyTunnelProbeFailure, createMcpCanaryRunner, createRecoveryEngine, FailureTracker, parseAgentSpecs, processIsLive, runSupervisorMonitoringLoop, shouldRecoverComponent } from "./kontrol-supervisor.mjs";
 
 assert.equal(processIsLive(process.pid), true, "the current supervisor test process must be live");
 assert.equal(processIsLive(999_999_999), false, "a nonexistent PID must not be treated as live");
@@ -89,6 +90,70 @@ assert.equal(shouldRecoverComponent(readinessOnly, { ok: true, degraded: true })
 assert.equal(shouldRecoverComponent(readinessOnly, { ok: false, status: 0 }), true, "repeated liveness failure is restartable");
 readinessOnly.tracker.state = "circuit_open";
 assert.equal(shouldRecoverComponent(readinessOnly, { ok: false, status: 0 }), false, "circuit-open components are not churned");
+
+const cooledCircuit = new FailureTracker("cooled", { circuitCooldownMs: 10 });
+cooledCircuit.openCircuit(100);
+assert.equal(cooledCircuit.canAttemptRecovery(105), false, "circuit cooldown fences recovery attempts");
+assert.equal(cooledCircuit.canAttemptRecovery(110), true, "circuit enters a single half-open recovery window after cooldown");
+assert.equal(cooledCircuit.state, "half_open");
+cooledCircuit.record({ ok: true, status: 200 }, 111);
+assert.equal(cooledCircuit.state, "healthy", "a successful half-open probe closes the circuit");
+
+let canaryNow = 0;
+let canaryLaunches = 0;
+const canary = createMcpCanaryRunner({
+  url: "https://mcp.example.test",
+  workspacePath: "/tmp/workspace",
+  intervalMs: 1_000,
+  timeoutMs: 100,
+  now: () => canaryNow,
+  spawnFn: () => {
+    canaryLaunches += 1;
+    const child = new EventEmitter();
+    queueMicrotask(() => child.emit("close", 0, null));
+    return child;
+  },
+});
+assert.equal(await canary.runIfDue(), true, "the external MCP canary runs immediately when enabled");
+assert.equal(canaryLaunches, 1);
+assert.equal(canary.snapshot().lastOk, true);
+canaryNow = 500;
+assert.equal(await canary.runIfDue(), false, "the canary interval suppresses duplicate probes");
+canaryNow = 1_000;
+assert.equal(await canary.runIfDue(), true, "the canary runs again after its bounded interval");
+assert.equal(canary.snapshot().totalRuns, 2);
+
+let credentialedCanaryArgs;
+const credentialedCanary = createMcpCanaryRunner({
+  url: "https://mcp.example.test",
+  workspacePath: "/tmp/workspace",
+  authorizationFile: "/tmp/kontrol-canary.authorization",
+  spawnFn: (_command, args) => {
+    credentialedCanaryArgs = args;
+    const child = new EventEmitter();
+    queueMicrotask(() => child.emit("close", 0, null));
+    return child;
+  },
+});
+assert.equal(await credentialedCanary.runIfDue(), true, "a configured canary authorization file is passed to the probe");
+const authorizationFileIndex = credentialedCanaryArgs.indexOf("--authorization-file");
+assert.ok(authorizationFileIndex >= 0);
+assert.equal(credentialedCanaryArgs[authorizationFileIndex + 1], "/tmp/kontrol-canary.authorization");
+
+const failedCanary = createMcpCanaryRunner({
+  url: "https://mcp.example.test",
+  workspacePath: "/tmp/workspace",
+  intervalMs: 1_000,
+  timeoutMs: 100,
+  spawnFn: () => {
+    const child = new EventEmitter();
+    queueMicrotask(() => child.emit("close", 7, null));
+    return child;
+  },
+});
+assert.equal(await failedCanary.runIfDue(), false, "canary failure is recorded without throwing into component recovery");
+assert.equal(failedCanary.snapshot().lastOk, false);
+assert.equal(failedCanary.snapshot().totalFailures, 1);
 
 // Exercise the actual recovery state machine with injected process/probe
 // boundaries. A successful tmux launch is not enough: the restart is only
@@ -207,5 +272,51 @@ assert.deepEqual(healthyDependencyOrder, [
   "probe:crush",
   "probe:tunnel",
 ], "core recovery probes healthy dependencies without restarting them");
+
+// The real monitoring loop must contain a rejected probe/tick and an
+// unwritable status file without silently disappearing. It continues to the
+// next bounded cycle, then releases ownership on an explicit stop.
+let injectedTickCount = 0;
+let injectedSleeps = 0;
+const monitoringErrors = [];
+let monitoringReleased = false;
+const recoverableMonitor = runSupervisorMonitoringLoop({
+  intervalMs: 0,
+  assertOwnership: () => {},
+  writeStarting: () => { throw new Error("injected unwritable status"); },
+  writeDegraded: () => { throw new Error("injected unwritable degraded status"); },
+  tick: async ({ stop }) => {
+    injectedTickCount += 1;
+    if (injectedTickCount === 1) throw new Error("injected rejected probe");
+    stop();
+  },
+  sleepFn: async () => { injectedSleeps += 1; },
+  releaseOwnership: () => { monitoringReleased = true; },
+  onError: (message) => monitoringErrors.push(message),
+});
+const recoverableResult = await recoverableMonitor.promise;
+assert.equal(recoverableResult.terminalState, "stopped", "recoverable monitoring faults must not kill the supervisor");
+assert.equal(injectedTickCount, 2, "the loop must continue after an unexpected tick exception");
+assert.ok(injectedSleeps >= 1, "a failed monitoring cycle must use bounded backoff");
+assert.equal(monitoringReleased, true, "a stopped monitoring loop must release ownership");
+assert.ok(monitoringErrors.some((message) => message.includes("injected rejected probe")));
+assert.ok(monitoringErrors.some((message) => message.includes("status write failed")));
+
+// Runtime-lock/ownership loss is different: it must publish a fatal state,
+// stop recovery, and release only through the guarded ownership callback.
+let fatalStatus;
+let fatalReleased = false;
+const fatalMonitor = runSupervisorMonitoringLoop({
+  intervalMs: 0,
+  assertOwnership: () => { throw new Error("injected ownership loss"); },
+  tick: async () => {},
+  writeFatal: (error) => { fatalStatus = error; },
+  releaseOwnership: () => { fatalReleased = true; },
+  onError: () => {},
+});
+const fatalResult = await fatalMonitor.promise;
+assert.equal(fatalResult.terminalState, "fatal");
+assert.equal(fatalStatus, "injected ownership loss");
+assert.equal(fatalReleased, true, "fatal monitoring must still release through the owner guard");
 
 console.log("kontrol-supervisor.test.mjs: all assertions passed");

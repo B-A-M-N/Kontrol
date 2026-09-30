@@ -15,7 +15,7 @@ function stubConfig(): ServerConfig {
   return {
     logging: { level: "error", format: "text", file: undefined },
     // The queue deadline must comfortably exceed the synchronous cost of
-    // stringifying + gzipping the ~10 MB artifact inside the first admitted
+    // stringifying + gzipping the large artifact inside the first admitted
     // serve: that work blocks the event loop, and a short deadline would time
     // out queued waiters before the test can observe them waiting.
     mcpAdmissionTimeoutMs: 10_000,
@@ -26,7 +26,12 @@ class StubResponse extends EventEmitter {
   statusCode = 200;
   headersSent = false;
   writableFinished = false;
+  destroyed = false;
   body: unknown;
+  jsonCalls = 0;
+  endCalls = 0;
+  destroyCalls = 0;
+  destroyError: Error | undefined;
   /** When true, json() defers completion until release() is called, so the
    * in-flight admission window can be observed deterministically. */
   holdOpen = false;
@@ -42,6 +47,7 @@ class StubResponse extends EventEmitter {
     return this.headers[name.toLowerCase()];
   }
   json(value: unknown): void {
+    this.jsonCalls++;
     this.headersSent = true;
     this.body = value;
     if (this.holdOpen) return;
@@ -61,10 +67,18 @@ class StubResponse extends EventEmitter {
     this.emit("finish");
   }
   end(value?: unknown): void {
+    this.endCalls++;
     if (value !== undefined && this.body === undefined) this.body = value;
     if (this.holdOpen) return;
     this.writableFinished = true;
     this.emit("finish");
+  }
+  destroy(): this {
+    this.destroyCalls++;
+    if (this.destroyError) throw this.destroyError;
+    this.destroyed = true;
+    this.emit("close");
+    return this;
   }
 }
 
@@ -79,9 +93,11 @@ async function drain(queue: number = 0): Promise<void> {
 async function main() {
   const config = stubConfig();
   const metrics = {
-    currentHashed: 0, openAiCompatibility: 0, legacyKontrol: 0, devDesktopMigration: 0,
+    currentHashed: 0, previousHashed: 0, staleHashMisses: 0,
+    openAiCompatibility: 0, legacyKontrol: 0, devDesktopMigration: 0,
     servedTotal: 0, lastDurationMs: 0, maxDurationMs: 0,
-    admissionRejections: 0, active: 0, maxActive: 0, lastWireBytes: 0,
+    admissionRejections: 0, serializationFailures: 0, compressionFailures: 0, transmissionFailures: 0,
+    active: 0, maxActive: 0, lastWireBytes: 0,
     lastEventLoopDelayMs: 0,
     maxEventLoopDelayMs: 0,
     cacheEntries: 0,
@@ -199,9 +215,36 @@ async function main() {
     assert.equal(res.writableFinished, false);
   }
 
+  // 6a. A syntactically valid but unretained content hash gets a bounded
+  //     protocol error and is counted as a stale-resource miss. It must never
+  //     fall through to the current app HTML.
+  {
+    const currentHashedBeforeStaleRead = metrics.currentHashed;
+    const res = new StubResponse();
+    const served = await serve(
+      res as unknown as Response,
+      "stale-resource",
+      { id: 10, params: { uri: "ui://kontrol/workspace-app-000000000000.html" } },
+      false,
+      "client-stale",
+      undefined,
+      undefined,
+      { sessionId: "session-stale-test", generationId: "generation-stale-test" },
+    );
+    assert.equal(served, true, "unknown hashed app resources must be handled by the resource route");
+    assert.equal(res.statusCode, 200, "unknown resources use a JSON-RPC resource error envelope");
+    assert.deepEqual(res.body, {
+      jsonrpc: "2.0",
+      id: 10,
+      error: { code: -32002, message: "The requested Workspace App build is no longer retained." },
+    });
+    assert.equal(metrics.staleHashMisses, 1);
+    assert.equal(metrics.currentHashed, currentHashedBeforeStaleRead, "a stale hash must not be aliased to the current app");
+  }
+
   // 7. Wire delivery: an Accept-Encoding: gzip client receives the gzipped
   //    envelope, and lastWireBytes records the ACTUAL transferred size — not
-  //    the raw ~10 MB serialization that res.json() used to ship.
+  //    the raw multi-megabyte serialization that res.json() used to ship.
   {
     const gzipRes = new StubResponse();
     const identityRes = new StubResponse();
@@ -220,7 +263,7 @@ async function main() {
     assert.ok(gzipBytes && identityBytes, "both responses must declare content-length");
     assert.ok(Number(gzipBytes) < Number(identityBytes), `wire gzip size ${gzipBytes} must be smaller than raw ${identityBytes}`);
     assert.equal(metrics.lastWireBytes, Number(identityBytes), "lastWireBytes must track the most recent wire transfer");
-    assert.ok(Number(gzipBytes) < 2_500_000, `gzipped wire size ${gzipBytes} should stay near the ~1.8 MiB envelope, not the raw artifact`);
+    assert.ok(Number(gzipBytes) < 2_500_000, `gzipped wire size ${gzipBytes} should remain far below the raw artifact`);
     assert.equal(pool.getStats().active, 0, "permits released after both transfers");
 
     // Regression: each response must echo ITS OWN request id and uri. The
@@ -238,6 +281,220 @@ async function main() {
     assert.equal(gzipParsed.result.contents[0].uri, WORKSPACE_APP_URI);
     assert.equal(identityParsed.id, 2, "identity envelope must carry its own requesting id");
     assert.equal(identityParsed.result.contents[0].uri, WORKSPACE_APP_URI);
+  }
+
+  // 8. Serialization and compression failures each produce one protocol-valid
+  //    JSON-RPC error, release their permit, and remove the abort listener.
+  for (const failureStage of ["serialization", "compression"] as const) {
+    const failureMetrics = { ...metrics, active: 0, maxActive: 0, admissionRejections: 0,
+      serializationFailures: 0, compressionFailures: 0, transmissionFailures: 0 };
+    const failurePool = new McpAdmission(1, 1, 1);
+    const originalError = new Error(`${failureStage} fault`);
+    const adapters = failureStage === "serialization"
+      ? { serializeContentJson: () => { throw originalError; } }
+      : { compress: async () => { throw originalError; } };
+    const { serve: serveFailure } = createWorkspaceAppResourceServer(config, failureMetrics, failurePool, adapters);
+    const abortListeners = new Set<EventListenerOrEventListenerObject>();
+    const signal = {
+      aborted: false,
+      addEventListener: (_type: string, listener: EventListenerOrEventListenerObject) => abortListeners.add(listener),
+      removeEventListener: (_type: string, listener: EventListenerOrEventListenerObject) => abortListeners.delete(listener),
+    } as unknown as AbortSignal;
+    const res = new StubResponse();
+    const served = await serveFailure(
+      res as unknown as Response,
+      `failure-${failureStage}`,
+      resourceBody(80),
+      false,
+      `client-failure-${failureStage}`,
+      signal,
+      failureStage === "compression" ? "gzip" : undefined,
+    );
+    await drain();
+    assert.equal(served, true);
+    assert.equal(res.statusCode, 500);
+    assert.equal(res.jsonCalls, 1, "failure path must send exactly one response");
+    assert.equal(res.endCalls, 0, "failure path must not also send a success body");
+    const failureBody = res.body as { jsonrpc: string; id: number; error: { code: number } };
+    assert.equal(failureBody.jsonrpc, "2.0");
+    assert.equal(failureBody.id, 80);
+    assert.equal(failureBody.error.code, -32603);
+    assert.equal(failurePool.getStats().active, 0, "failed preparation must release the permit");
+    assert.equal(failureMetrics.active, 0);
+    assert.equal(failureMetrics.admissionRejections, 0, "processing failures are not admission rejections");
+    if (failureStage === "serialization") assert.equal(failureMetrics.serializationFailures, 1);
+    else assert.equal(failureMetrics.compressionFailures, 1);
+    assert.equal(abortListeners.size, 0, "final cleanup must remove the request abort listener");
+  }
+
+  // 9. Aborting while gzip is still running must not return resource capacity
+  //    until that CPU work settles. Once it settles, cleanup releases exactly
+  //    once and removes the abort listener without writing a late response.
+  {
+    const pendingMetrics = { ...metrics, active: 0, maxActive: 0, admissionRejections: 0,
+      serializationFailures: 0, compressionFailures: 0, transmissionFailures: 0 };
+    const pendingPool = new McpAdmission(1, 1, 1);
+    let markCompressionStarted!: () => void;
+    const compressionStarted = new Promise<void>((resolve) => { markCompressionStarted = resolve; });
+    let resolveCompression!: (value: Buffer) => void;
+    const compression = new Promise<Buffer>((resolve) => { resolveCompression = resolve; });
+    const { serve: servePendingCompression } = createWorkspaceAppResourceServer(
+      config,
+      pendingMetrics,
+      pendingPool,
+      { compress: async () => { markCompressionStarted(); return await compression; } },
+    );
+    const abortListeners = new Set<EventListenerOrEventListenerObject>();
+    const signal = {
+      aborted: false,
+      addEventListener: (_type: string, listener: EventListenerOrEventListenerObject) => abortListeners.add(listener),
+      removeEventListener: (_type: string, listener: EventListenerOrEventListenerObject) => abortListeners.delete(listener),
+    } as unknown as AbortSignal;
+    const abort = () => {
+      (signal as unknown as { aborted: boolean }).aborted = true;
+      for (const listener of [...abortListeners]) {
+        if (typeof listener === "function") listener(new Event("abort"));
+        else listener.handleEvent(new Event("abort"));
+      }
+    };
+    const res = new StubResponse();
+    const pending = servePendingCompression(
+      res as unknown as Response,
+      "abort-during-compression",
+      resourceBody(81),
+      false,
+      "client-abort-during-compression",
+      signal,
+      "gzip",
+    );
+    await compressionStarted;
+    assert.equal(pendingPool.getStats().active, 1, "compression owns its resource permit");
+    abort();
+    assert.equal(pendingPool.getStats().active, 1, "abort cannot release capacity while compression is unfinished");
+    resolveCompression(Buffer.from("compressed"));
+    await pending;
+    await drain();
+    assert.equal(pendingPool.getStats().active, 0, "capacity returns after compression settles");
+    assert.equal(pendingMetrics.active, 0);
+    assert.equal(res.jsonCalls, 0, "aborted requests must not receive a late failure response");
+    assert.equal(res.endCalls, 0, "aborted requests must not receive a late success response");
+    assert.equal(abortListeners.size, 0, "abort listener is removed after compression settles");
+  }
+
+  // 10. A response transmission exception is classified separately from
+  //     preparation/admission failures. If no bytes were committed, the
+  //     original failed send is followed by exactly one protocol error.
+  {
+    const transmissionMetrics = { ...metrics, active: 0, maxActive: 0, admissionRejections: 0,
+      serializationFailures: 0, compressionFailures: 0, transmissionFailures: 0 };
+    const transmissionPool = new McpAdmission(1, 1, 1);
+    const originalError = new Error("transmission fault");
+    const { serve: serveTransmissionFailure } = createWorkspaceAppResourceServer(
+      config,
+      transmissionMetrics,
+      transmissionPool,
+    );
+    const res = new StubResponse();
+    const originalEnd = res.end.bind(res);
+    let failFirstTransmission = true;
+    let transmissionAttempts = 0;
+    res.end = (value?: unknown) => {
+      transmissionAttempts++;
+      if (failFirstTransmission) {
+        failFirstTransmission = false;
+        throw originalError;
+      }
+      originalEnd(value);
+    };
+    const served = await serveTransmissionFailure(
+      res as unknown as Response,
+      "transmission-failure",
+      resourceBody(82),
+      false,
+      "client-transmission-failure",
+      undefined,
+    );
+    await drain();
+    assert.equal(served, true);
+    assert.equal(res.statusCode, 500);
+    assert.equal(res.jsonCalls, 1, "a pre-commit transmission failure gets one JSON-RPC error response");
+    assert.equal(transmissionAttempts, 1, "the failed success transmission is attempted only once");
+    const failureBody = res.body as { jsonrpc: string; id: number; error: { code: number } };
+    assert.equal(failureBody.jsonrpc, "2.0");
+    assert.equal(failureBody.id, 82);
+    assert.equal(failureBody.error.code, -32603);
+    assert.equal(transmissionMetrics.transmissionFailures, 1);
+    assert.equal(transmissionMetrics.serializationFailures, 0);
+    assert.equal(transmissionMetrics.compressionFailures, 0);
+    assert.equal(transmissionMetrics.admissionRejections, 0);
+    assert.equal(transmissionPool.getStats().active, 0);
+    assert.equal(transmissionMetrics.active, 0);
+  }
+
+  // 11. If a transmission fails after headers have been committed, a new
+  //     JSON-RPC envelope cannot be appended safely. Destroy the partial
+  //     response; its close event must release capacity without a second body.
+  {
+    const transmissionMetrics = { ...metrics, active: 0, maxActive: 0, admissionRejections: 0,
+      serializationFailures: 0, compressionFailures: 0, transmissionFailures: 0 };
+    const transmissionPool = new McpAdmission(1, 1, 1);
+    const originalError = new Error("post-header transmission fault");
+    const { serve: serveTransmissionFailure } = createWorkspaceAppResourceServer(
+      config,
+      transmissionMetrics,
+      transmissionPool,
+    );
+    const res = new StubResponse();
+    res.end = (value?: unknown) => {
+      res.headersSent = true;
+      throw originalError;
+    };
+    const served = await serveTransmissionFailure(
+      res as unknown as Response,
+      "transmission-failure-after-headers",
+      resourceBody(83),
+      false,
+      "client-transmission-failure-after-headers",
+      undefined,
+    );
+    await drain();
+    assert.equal(served, true);
+    assert.equal(res.jsonCalls, 0, "a second JSON-RPC envelope cannot follow committed response bytes");
+    assert.equal(res.destroyCalls, 1, "an incomplete committed response must be destroyed");
+    assert.equal(res.destroyed, true);
+    assert.equal(transmissionMetrics.transmissionFailures, 1);
+    assert.equal(transmissionPool.getStats().active, 0, "destroying the response returns admission capacity");
+    assert.equal(transmissionMetrics.active, 0);
+  }
+
+  // 12. A secondary destroy exception is logged but cannot strand the
+  //     resource permit after this handler has abandoned the partial result.
+  {
+    const failureMetrics = { ...metrics, active: 0, maxActive: 0, admissionRejections: 0,
+      serializationFailures: 0, compressionFailures: 0, transmissionFailures: 0 };
+    const failurePool = new McpAdmission(1, 1, 1);
+    const { serve: serveFailure } = createWorkspaceAppResourceServer(config, failureMetrics, failurePool);
+    const res = new StubResponse();
+    res.destroyError = new Error("socket destroy fault");
+    res.end = () => {
+      res.headersSent = true;
+      throw new Error("committed transmit fault");
+    };
+    const served = await serveFailure(
+      res as unknown as Response,
+      "transmission-destroy-failure",
+      resourceBody(84),
+      false,
+      "client-transmission-destroy-failure",
+      undefined,
+    );
+    await drain();
+    assert.equal(served, true);
+    assert.equal(res.destroyCalls, 1);
+    assert.equal(res.jsonCalls, 0);
+    assert.equal(failureMetrics.transmissionFailures, 1);
+    assert.equal(failurePool.getStats().active, 0, "secondary socket cleanup failure cannot retain resource capacity");
+    assert.equal(failureMetrics.active, 0);
   }
 
   console.log("workspace-resource-admission.test.ts: resource admission bounds + permit-leak regression suite passed");

@@ -61,6 +61,7 @@ import type {
   WorkSessionDom,
 } from "./session-view-types.js";
 import type { ToolDisplay } from "./tool-display.js";
+import { analyzeClipboardReference, containsChatGptReferenceMarker } from "./clipboard-parsing.js";
 
 export interface SessionSurfaceHost {
   getApp(): App | null;
@@ -136,8 +137,6 @@ const unsetSurfaceHost: SessionSurfaceHost = new Proxy({} as SessionSurfaceHost,
 
 let host: SessionSurfaceHost = unsetSurfaceHost;
 
-// The agent submit bar is rebuilt per surface attachment; module-owned cache.
-let agentBar: HTMLElement | null = null;
 export function setSessionSurfaceHost(next: SessionSurfaceHost): void {
   host = next;
 }
@@ -634,109 +633,158 @@ export function renderActivityIncrementally(dom: WorkSessionDom, view: WorkSessi
 }
 
 export function renderAgentSubmitBar(): HTMLElement {
-  {
-    agentBar = element("div", { className: "agent-submit-bar" });
+  const existing = host.getAgentBar();
+  if (existing) return existing;
 
-    const input = document.createElement("input");
-    input.className = "agent-submit-input";
-    input.placeholder = "Send a task to the coding agent…";
-    input.setAttribute("aria-label", "Task for coding agent");
+  const bar = element("div", { className: "agent-submit-bar" });
+  bar.dataset.agentSubmitBar = "true";
+  const input = document.createElement("textarea");
+  input.className = "agent-submit-input";
+  input.rows = 2;
+  input.placeholder = "Send a task to the coding agent…";
+  input.setAttribute("aria-label", "Task for coding agent");
+  input.dataset.focusKey = "agent-submit-input";
 
-    const btn = element("button", { className: "agent-submit-btn", type: "button", text: "Send" });
-    const status = element("div", { className: "agent-submit-status", role: "status", ariaLive: "polite" });
-    const refresh = element("button", { className: "notice-action", type: "button", text: "Refresh state", hidden: true });
-    let dispatchOutcomeUnknown = false;
+  const btn = element("button", { className: "agent-submit-btn", type: "button", text: "Send" });
+  const status = element("div", { className: "agent-submit-status", role: "status", ariaLive: "polite" });
+  const referenceWarning = element("div", { className: "agent-submit-reference-warning", role: "alert", hidden: true });
+  const refresh = element("button", { className: "notice-action", type: "button", text: "Refresh state", hidden: true });
+  let dispatchOutcomeUnknown = false;
+  let unresolvedReferencePayload = false;
+  let recoveredReferencePayload = false;
 
-    refresh.addEventListener("click", () => {
-      refresh.disabled = true;
-      void host.reconnect("refreshing dispatch outcome")
-        .then(async () => {
-          host.queueSessionRehydration();
-          if (host.rehydrationPromise()) await host.rehydrationPromise();
-        })
-        .then(() => {
-          dispatchOutcomeUnknown = false;
-          btn.disabled = false;
-          refresh.hidden = true;
-          refresh.disabled = false;
-          status.textContent = "State refreshed. Confirm the session before sending the task again.";
-        })
-        .catch((error) => {
-          refresh.disabled = false;
-          status.textContent = `State refresh did not complete: ${error instanceof Error ? error.message : String(error)}. Keep the dispatch paused.`;
-        });
-    });
+  const resizeInput = (): void => {
+    input.style.height = "auto";
+    input.style.height = `${Math.max(input.scrollHeight, 48)}px`;
+    const value = input.value.trim();
+    unresolvedReferencePayload = !recoveredReferencePayload && containsChatGptReferenceMarker(value);
+    const referenceOnly = unresolvedReferencePayload && value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).every((line) => /^::chatgpt-content-reference\b/i.test(line));
+    referenceWarning.hidden = !unresolvedReferencePayload;
+    referenceWarning.textContent = unresolvedReferencePayload
+      ? referenceOnly
+        ? "This paste contains only ChatGPT reference placeholders; the original message is missing. Paste plain text or the Markdown report instead."
+        : "This task contains an unresolved ChatGPT reference placeholder. Paste the original content before sending."
+      : "";
+    btn.disabled = dispatchOutcomeUnknown || unresolvedReferencePayload || value.length === 0;
+  };
 
-    input.addEventListener("keydown", (event) => {
-      if (event.key === "Enter") {
-        event.preventDefault();
-        btn.click();
-      }
-    });
+  refresh.addEventListener("click", () => {
+    refresh.disabled = true;
+    void host.reconnect("refreshing dispatch outcome")
+      .then(async () => {
+        host.queueSessionRehydration();
+        if (host.rehydrationPromise()) await host.rehydrationPromise();
+      })
+      .then(() => {
+        dispatchOutcomeUnknown = false;
+        btn.disabled = false;
+        refresh.hidden = true;
+        refresh.disabled = false;
+        status.textContent = "State refreshed. Confirm the session before sending the task again.";
+      })
+      .catch((error) => {
+        refresh.disabled = false;
+        status.textContent = `State refresh did not complete: ${error instanceof Error ? error.message : String(error)}. Keep the dispatch paused.`;
+      });
+  });
 
-    btn.addEventListener("click", () => {
-      const task = input.value.trim();
-      if (!task || !host.getApp()) return;
-      if (!host.getActiveWorkspaceId()) {
-        status.textContent = "Open a workspace before dispatching a coding agent.";
-        return;
-      }
-      status.textContent = "Dispatching…";
-      btn.setAttribute("disabled", "true");
-      void host.callServerToolChecked({
-          name: "submit_to_coding_agent",
-          arguments: { task, workspaceSessionId: host.getActiveWorkspaceId(), clientMutationId: host.newClientMutationId() },
-        })
-        .then((result) => {
-          const dispatch = getStructuredContent<{
-            runId: string;
-            remoteRunId?: string;
-            workSessionId: string;
-            workspaceSessionId: string;
-            status: string;
-            output: string;
-            error?: string;
-          }>(result);
+  input.addEventListener("input", () => {
+    // A user edit invalidates the trust decision made for the last paste.
+    recoveredReferencePayload = false;
+    resizeInput();
+  });
+  input.addEventListener("paste", (event) => {
+    const plainText = event.clipboardData?.getData("text/plain") ?? "";
+    const htmlText = event.clipboardData?.getData("text/html") ?? "";
+    const analysis = analyzeClipboardReference(plainText, htmlText);
+    if (!analysis.hasReferenceMarkers) return;
+    event.preventDefault();
+    const start = input.selectionStart ?? input.value.length;
+    const end = input.selectionEnd ?? start;
+    input.setRangeText(analysis.text, start, end, "end");
+    recoveredReferencePayload = analysis.recoveredFromHtml;
+    unresolvedReferencePayload = analysis.unresolved;
+    resizeInput();
+  });
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+      event.preventDefault();
+      btn.click();
+    }
+  });
 
-          if (!dispatch?.workSessionId) {
-            status.textContent = dispatch?.error ?? "Coding-agent dispatch returned no workSessionId.";
-            return;
-          }
+  btn.addEventListener("click", () => {
+    const task = input.value.trim();
+    if (!task || !host.getApp()) return;
+    if (unresolvedReferencePayload || containsChatGptReferenceMarker(task)) {
+      resizeInput();
+      status.textContent = "Resolve the ChatGPT reference placeholder before sending this task.";
+      return;
+    }
+    if (!host.getActiveWorkspaceId()) {
+      status.textContent = "Open a workspace before dispatching a coding agent.";
+      return;
+    }
+    status.textContent = "Dispatching…";
+    btn.setAttribute("disabled", "true");
+    void host.callServerToolChecked({
+        name: "submit_to_coding_agent",
+        arguments: { task, workspaceSessionId: host.getActiveWorkspaceId(), clientMutationId: host.newClientMutationId() },
+      })
+      .then((result) => {
+        const dispatch = getStructuredContent<{
+          runId: string;
+          remoteRunId?: string;
+          workSessionId: string;
+          workspaceSessionId: string;
+          status: string;
+          output: string;
+          error?: string;
+        }>(result);
 
-          const view = ensureWorkSessionView(
-            dispatch.workSessionId,
-            dispatch.workspaceSessionId,
-            dispatch.runId,
-          );
-          view.status = dispatch.status;
-          host.setSelectedWorkSessionId(dispatch.workSessionId);
-          host.setLastToolCard(null);
-          host.setExpanded(false);
-          host.setReviewFilesExpanded(false);
-          host.setErrorMessage(null);
-          input.value = "";
-          status.textContent = "Agent is working.";
-          selectWorkSession(dispatch.workSessionId);
-        })
-        .catch((err) => {
-          if (err instanceof AmbiguousMutationError) {
-            dispatchOutcomeUnknown = true;
-            status.textContent = "Dispatch outcome unknown after a connection interruption. Refresh state before retrying.";
-            refresh.hidden = false;
-          } else {
-            status.textContent = `Dispatch failed: ${err instanceof Error ? err.message : String(err)}`;
-          }
-        })
-        .finally(() => { if (!dispatchOutcomeUnknown) btn.removeAttribute("disabled"); });
-    });
+        if (!dispatch?.workSessionId) {
+          status.textContent = dispatch?.error ?? "Coding-agent dispatch returned no workSessionId.";
+          return;
+        }
 
-    agentBar.append(input, btn, status, refresh);
-  }
-  return agentBar;
+        const view = ensureWorkSessionView(
+          dispatch.workSessionId,
+          dispatch.workspaceSessionId,
+          dispatch.runId,
+        );
+        view.status = dispatch.status;
+        host.setSelectedWorkSessionId(dispatch.workSessionId);
+        host.setLastToolCard(null);
+        host.setExpanded(false);
+        host.setReviewFilesExpanded(false);
+        host.setErrorMessage(null);
+        input.value = "";
+        resizeInput();
+        status.textContent = "Agent is working.";
+        selectWorkSession(dispatch.workSessionId);
+      })
+      .catch((err) => {
+        if (err instanceof AmbiguousMutationError) {
+          dispatchOutcomeUnknown = true;
+          status.textContent = "Dispatch outcome unknown after a connection interruption. Refresh state before retrying.";
+          refresh.hidden = false;
+        } else {
+          status.textContent = `Dispatch failed: ${err instanceof Error ? err.message : String(err)}`;
+        }
+      })
+      .finally(() => { if (!dispatchOutcomeUnknown) resizeInput(); });
+  });
+
+  resizeInput();
+  bar.append(input, btn, status, referenceWarning, refresh);
+  host.setAgentBar(bar);
+  return bar;
 }
 
 export function maybeAppendAgentBar(): void {
-  if (host.connected()) host.appendSurface(renderAgentSubmitBar());
+  if (!host.connected()) return;
+  const bar = renderAgentSubmitBar();
+  if (!host.surfaceContains(bar)) host.appendSurface(bar);
 }
 
 // ── Legacy review card (non-work-session review surfaces) ──

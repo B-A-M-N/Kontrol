@@ -13,6 +13,7 @@ import {
   type HostContext,
   type ToolResultCard,
 } from "./card-types.js";
+import { RawPayloadActions } from "./raw-payload.js";
 
 type ThemeType = "light" | "dark";
 
@@ -65,24 +66,30 @@ function HeavyPayload({
     const patch = card.payload?.patch || card.payload?.diff;
     if (!patch) return <StatusLine message="Diff payload is not available." />;
 
-    return <DiffPayload patch={patch} themeType={themeType} />;
+    return (
+      <>
+        <RawPayloadActions text={patch} />
+        <DiffPayload patch={patch} themeType={themeType} />
+      </>
+    );
   }
 
   const text = payloadText(card.payload);
   if (!text) return <StatusLine message="No details available." />;
 
-  if (isReadTool(card.tool)) {
-    return (
-      <FilePayload
-        path={card.path ?? "file"}
-        text={text}
-        startLine={summaryNumber(card.summary, "offset") ?? 1}
-        themeType={themeType}
-      />
-    );
-  }
-
-  return <pre className={`text-payload ${card.tool}`}>{text}</pre>;
+  return (
+    <>
+      <RawPayloadActions text={text} />
+      {isReadTool(card.tool) ? (
+        <FilePayload
+          path={card.path ?? "file"}
+          text={text}
+          startLine={summaryNumber(card.summary, "offset") ?? 1}
+          themeType={themeType}
+        />
+      ) : <pre className={`text-payload ${card.tool}`}>{text}</pre>}
+    </>
+  );
 }
 
 function FilePayload({

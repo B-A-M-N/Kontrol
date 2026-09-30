@@ -145,6 +145,21 @@ await act(async () => {
 assert.ok(patchContainer.querySelector(".pierre-diff"), "apply_patch cards use the rich diff renderer");
 await act(async () => { patchPayload.unmount(); });
 
+const rawContainer = document.createElement("div");
+document.body.append(rawContainer);
+let rawPayload: ReturnType<typeof mountHeavyPayload>;
+await act(async () => {
+  rawPayload = mountHeavyPayload(rawContainer, { card: { tool: "bash", payload: { content: [{ type: "text", text: "original raw output" }] } } });
+  await settle();
+});
+const copyRaw = rawContainer.querySelector<HTMLButtonElement>(".raw-payload-actions button");
+assert.ok(copyRaw, "raw payload exposes a Copy Raw action");
+Object.defineProperty(navigator, "clipboard", { configurable: true, value: undefined });
+await act(async () => { copyRaw?.click(); await settle(); });
+assert.ok(rawContainer.querySelector(".raw-payload-fallback"), "denied clipboard access exposes selectable original text");
+assert.equal(rawContainer.querySelector<HTMLTextAreaElement>(".raw-payload-fallback")?.value, "original raw output", "fallback contains the original payload, not rendered text");
+await act(async () => { rawPayload.unmount(); });
+
 const reviewContainer = document.createElement("div");
 document.body.append(reviewContainer);
 let reviewPayload: ReturnType<typeof mountReviewPayload>;
@@ -155,6 +170,10 @@ await act(async () => {
   });
   await settle();
 });
+assert.ok(reviewContainer.querySelector(".raw-payload-actions button"), "review cards expose Copy Raw from the original patch");
+const reviewCopy = reviewContainer.querySelector<HTMLButtonElement>(".raw-payload-actions button");
+await act(async () => { reviewCopy?.click(); await settle(); });
+assert.equal(reviewContainer.querySelector<HTMLTextAreaElement>(".raw-payload-fallback")?.value, patch, "review fallback exposes the exact patch text");
 const fileHeader = reviewContainer.querySelector<HTMLButtonElement>(".review-diff-file-header");
 assert.ok(fileHeader, "review cards render a per-file diff selector");
 const reviewFiles = reviewContainer.querySelector(".review-diff-files");
@@ -178,6 +197,7 @@ assert.equal(reviewContainer.childElementCount, 0, "review renderer unmount is c
 let fakeConnectCount = 0;
 let fakeSurfaceFailures = 0;
 let fakeEventDelivered = false;
+let fakeReplayDelivered = false;
 let fakeMutationCalls = 0;
 const fakeToolCalls: string[] = [];
 // Durable pending approvals, keyed by workspace — the fake server is
@@ -196,6 +216,7 @@ const fakeApp = {
   },
   async callServerTool(request: { name?: string; arguments?: Record<string, unknown> }) {
     const name = String(request.name ?? "");
+    const workspaceId = String((request.arguments as { workspaceId?: string } | undefined)?.workspaceId ?? "");
     fakeToolCalls.push(name);
     if (name === "get_workspace_session_surface") {
       if (fakeSurfaceFailures > 0) {
@@ -209,6 +230,13 @@ const fakeApp = {
       return { isError: false, content: [], structuredContent: { approvals: fakePendingApprovals.get(workspaceId) ?? [] } };
     }
     if (name === "await_workspace_events") {
+      if (workspaceId === "workspace-fresh") {
+        return { isError: false, content: [], structuredContent: { events: [], nextSeq: Number((request.arguments as { afterSeq?: number } | undefined)?.afterSeq ?? 0) } };
+      }
+      if (workspaceId === "workspace-dom" && !fakeReplayDelivered) {
+        fakeReplayDelivered = true;
+        return { isError: false, content: [], structuredContent: { events: [{ seq: 102, id: "replayed-event-102", type: "agent.run.output_delta", sessionId: "session-dom", workspaceSessionId: "workspace-dom", payload: { text: "replayed once" }, createdAt: new Date().toISOString() }], nextSeq: 102 } };
+      }
       if (!fakeEventDelivered) {
         fakeEventDelivered = true;
         return {
@@ -353,6 +381,34 @@ await settle();
 assert.match(document.querySelector(".tool-title")?.textContent ?? "", /Workspace/,
   "show_workspace_ui renders the workspace surface card");
 assert.ok(__workspaceAppTest.getLastSuccessfulHydrationAt(), "workspace state is hydrated after open_workspace");
+__workspaceAppTest.activateWorkspace("workspace-dom");
+__workspaceAppTest.renderWorkSessionView(__workspaceAppTest.ensureWorkSessionView("session-dom", "workspace-dom", "run-dom"));
+const agentBars = document.querySelectorAll(".agent-submit-bar");
+assert.equal(agentBars.length, 1, "renders create one persistent agent submit bar");
+const agentInput = document.querySelector<HTMLTextAreaElement>(".agent-submit-input");
+assert.ok(agentInput, "the agent task editor is multiline");
+agentInput.value = "line one\nline two";
+agentInput.dispatchEvent(new dom.window.Event("input", { bubbles: true }));
+agentInput.focus();
+agentInput.setSelectionRange(3, 7);
+const callsBeforeEditorKeys = fakeToolCalls.length;
+agentInput.dispatchEvent(new dom.window.KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+assert.equal(fakeToolCalls.length, callsBeforeEditorKeys, "plain Enter inserts a newline without submitting");
+__workspaceAppTest.renderWorkSessionView(__workspaceAppTest.ensureWorkSessionView("session-dom", "workspace-dom", "run-dom"));
+assert.equal(document.querySelectorAll(".agent-submit-bar").length, 1, "telemetry renders do not duplicate the agent submit bar");
+assert.equal(document.querySelector<HTMLTextAreaElement>(".agent-submit-input")?.value, "line one\nline two", "draft persists across renders");
+assert.equal(document.activeElement, agentInput, "agent editor focus persists across renders");
+assert.equal(document.querySelector<HTMLTextAreaElement>(".agent-submit-input")?.selectionStart, 3, "agent editor selection persists across renders");
+agentInput.dispatchEvent(new dom.window.KeyboardEvent("keydown", { key: "Enter", ctrlKey: true, bubbles: true, cancelable: true }));
+await settle();
+assert.ok(fakeToolCalls.includes("submit_to_coding_agent"), "Ctrl+Enter submits the multiline agent task");
+agentInput.value = "::chatgpt-content-reference::";
+agentInput.dispatchEvent(new dom.window.Event("input", { bubbles: true }));
+assert.equal(document.querySelector<HTMLElement>(".agent-submit-reference-warning")?.hidden, false, "reference-only input is warned without being removed");
+assert.equal(document.querySelector<HTMLTextAreaElement>(".agent-submit-input")?.value, "::chatgpt-content-reference::", "reference-only warning keeps the pasted content visible");
+await settle();
+const replayedActivity = document.querySelectorAll(".agent-event").length;
+assert.equal(__workspaceAppTest.getWorkSessionView("session-dom")?.lastSeq, 102, "snapshot replay materializes a committed event during pagination");
 assert.equal(
   __workspaceAppTest.getWorkSessionView("session-reconnect")?.lastSeq,
   6,
@@ -575,6 +631,7 @@ assert.equal(__workspaceAppTest.getConnectionState(), "DISCONNECTED", "app teard
   // Fresh module state = fresh iframe. The factory and connect log are reset
   // too so assertions measure only this scenario.
   fakeToolCalls.length = 0;
+  fakeReplayDelivered = false;
   // The approval the model received was persisted server-side before the
   // response was returned — mirror that authoritative durable state.
   fakePendingApprovals.set("workspace-fresh", [{

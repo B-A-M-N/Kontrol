@@ -10,6 +10,20 @@ import { defineConfig } from "vite";
 export default defineConfig({
   root: resolve(__dirname, "src/ui"),
   plugins: [react(), viteSingleFile()],
+  // @pierre/diffs defaults to Shiki's JavaScript regex engine. Its optional
+  // Oniguruma branch imports an embedded ~8 MB WASM payload even though the
+  // Workspace App never selects it. Keep the app's default engine and replace
+  // that unused branch with an explicit runtime failure if a future caller
+  // tries to opt into WASM.
+  resolve: {
+    alias: [{
+      find: /^shiki$/,
+      replacement: resolve(__dirname, "src/ui/shiki-workspace-adapter.js"),
+    }, {
+      find: /^shiki\/wasm$/,
+      replacement: resolve(__dirname, "src/ui/shiki-wasm-unavailable.ts"),
+    }],
+  },
   base: "./",
   build: {
     outDir: join(

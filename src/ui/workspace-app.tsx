@@ -100,7 +100,8 @@ import {
   unmountPayload,
 } from "./payload-mount.js";
 import {
-  connectWithRetry,
+  connectBootstrapWithRetry,
+  cancelReconnect,
   reconnectApp,
   renderApprovalCenterView,
   renderWorkspaceApprovalGate,
@@ -177,6 +178,7 @@ type ConnectionState = "CONNECTING" | "CONNECTED" | "DEGRADED" | "RECONNECTING" 
 let connectionState: ConnectionState = "CONNECTING";
 let reconnectPromise: Promise<void> | null = null;
 let bootPromise: Promise<void> | null = null;
+let bootstrapStage = "module-load";
 let hostContext: HostContext | undefined;
 
 // Durable UI state.
@@ -300,6 +302,22 @@ setLifecycleHost({
     },
     getHostContext: () => app?.getHostContext(),
     setHostContext: (v) => { hostContext = v as HostContext | undefined; },
+    recreateApp: async () => {
+      const previous = app as (App & { close?: () => Promise<void> }) | null;
+      const toolResultHandler = previous?.ontoolresult;
+      const hostContextHandler = previous?.onhostcontextchanged;
+      const teardownHandler = previous?.onteardown;
+      try { await previous?.close?.(); } catch { /* the failed transport is already being replaced */ }
+      const replacement = (uiTestAppFactory?.() ?? new App(
+        { name: "kontrol-tool-cards", version: "0.4.0" },
+        {},
+      )) as App;
+      installAppErrorHandler(replacement);
+      replacement.ontoolresult = toolResultHandler;
+      replacement.onhostcontextchanged = hostContextHandler;
+      replacement.onteardown = teardownHandler;
+      app = replacement;
+    },
     applyHostContext,
     setConnected: (v) => { connected = v; },
     connectionState: () => connectionState,
@@ -454,7 +472,7 @@ setLifecycleHost({
     setLastToolCard: (v) => { lastToolCard = v; },
   });
 
-if (!uiTestMode) void boot();
+if (!uiTestMode) void boot().catch(reportBootstrapFailure);
 
 async function boot(): Promise<void> {
   if (bootPromise) return bootPromise;
@@ -465,10 +483,12 @@ async function boot(): Promise<void> {
 async function bootInternal(): Promise<void> {
   render();
 
+  bootstrapStage = "app-create";
   app = uiTestAppFactory?.() ?? new App(
       { name: "kontrol-tool-cards", version: "0.4.0" },
       {},
     );
+  installAppErrorHandler(app);
 
   app.ontoolresult = (result) => {
     const structuredContent = getStructuredContent<Partial<ToolResultCard>>(result);
@@ -579,19 +599,64 @@ async function bootInternal(): Promise<void> {
   };
 
   app.onteardown = async () => {
+    cancelReconnect();
     connected = false;
     connectionState = "DISCONNECTED";
     workspaceWatcherGeneration += 1;
-    unmountPayload();
-    currentLegacyReviewDom = null;
-    currentWorkSessionDom = null;
-    agentBar = null;
+    // Preserve the last authoritative projection, draft, selection, and
+    // review state while a replacement App/transport is negotiated. The
+    // replacement connection rehydrates before mutations are enabled.
     app = null;
     return {};
   };
 
-  await connectWithRetry();
+  bootstrapStage = "app-connect";
+  await connectBootstrapWithRetry();
+  bootstrapStage = "connected";
   render();
+}
+
+function formatBootstrapDiagnostic(stage: string, error: unknown): string {
+  const errorName = error instanceof Error ? error.name : "UnknownError";
+  const errorMessage = error instanceof Error ? error.message : String(error);
+  const documentBuildId = typeof document === "undefined" ? undefined : document.documentElement?.dataset.kontrolBuildId;
+  const buildId = (globalThis as { __KONTROL_WORKSPACE_APP_BUILD_ID__?: string }).__KONTROL_WORKSPACE_APP_BUILD_ID__
+    ?? documentBuildId
+    ?? "unavailable";
+  return [
+    "Workspace App could not connect to the MCP host.",
+    `Stage: ${stage}`,
+    `Error: ${errorName}: ${errorMessage}`,
+    "App version: 0.4.0",
+    `Build: ${buildId}`,
+    `Time: ${new Date().toISOString()}`,
+  ].join("\n");
+}
+
+function reportBootstrapFailure(error: unknown): void {
+  connected = false;
+  connectionState = "DISCONNECTED";
+  connectionError = formatBootstrapDiagnostic(bootstrapStage, error);
+  errorMessage = connectionError;
+  renderConnectionError(connectionError);
+}
+
+function installAppErrorHandler(target: App): void {
+  // The ext-apps runtime exposes this callback, while the checked-in SDK
+  // declaration currently omits it. Keep the narrow cast local to the bridge.
+  (target as App & { onerror?: (error: unknown) => void }).onerror = (error) => {
+    const message = formatBootstrapDiagnostic(connected ? "host-transport" : bootstrapStage, error);
+    connectionError = message;
+    if (!connected) {
+      connectionState = "DISCONNECTED";
+      errorMessage = message;
+      renderConnectionError(message);
+      return;
+    }
+    connectionState = "DEGRADED";
+    render();
+    void reconnectApp(error).catch(() => undefined);
+  };
 }
 
 function activateWorkspace(newWorkspaceId: string): void {

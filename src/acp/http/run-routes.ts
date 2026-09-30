@@ -78,6 +78,9 @@ export function registerRunRoutes(
         return;
       }
       const peer = selection.agent;
+      if (mode === "stream") {
+        return res.status(400).json({ error: { code: "unsupported_stream", message: "Remote ACP streaming is not supported; use async or sync mode and observe /runs/{run_id}." } });
+      }
       const taskText = extractTaskText(input);
       if (!taskText.trim()) {
         return res.status(400).json({ error: { code: "invalid_task", message: "ACP task must be non-empty" } });
@@ -169,7 +172,7 @@ export function registerRunRoutes(
 
       if (mode === "stream") {
         res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
-        sseSubscribe(run.runId, req, res);
+        sseSubscribe(run.runId, req, res, typeof req.query.afterId === "string" ? req.query.afterId : undefined);
         res.write(`event: run.awaiting\ndata: ${JSON.stringify({ agent_name, run_id: run.runId, session_id: session.id, status: "awaiting", output: [], created_at: run.createdAt })}\n\n`);
         return;
       }

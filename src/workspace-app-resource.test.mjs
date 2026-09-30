@@ -4,6 +4,7 @@
 // source checkout. This suite exercises the resolver's decision rules against
 // on-disk fixture trees with real tsx imports of the module under test.
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, writeFileSync, rmSync, copyFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -207,8 +208,8 @@ function stageSourceCheckoutLayout(withDistArtifact, artifactHtml = SELF_CONTAIN
 // 8. The repository's own in-repo resolution (this checkout): under tsx, the
 //    module must either resolve a built artifact or fail — it must NEVER
 //    return the src/ui template body. This is the exact production bug shape.
-//    Only derived facts are printed: the real artifact is ~10 MB and would
-//    exceed the child exec maxBuffer.
+//    Only derived facts are printed: the self-contained app artifact is large
+//    enough to exceed the child exec maxBuffer.
 {
   if (existsSync(join(repoRoot, "dist", "ui", "workspace-app.html"))) {
     const script = [

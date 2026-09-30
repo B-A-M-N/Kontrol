@@ -2,7 +2,7 @@
 // loads the same single-file artifact in Chromium so CSS, layout, focus, and
 // host-theme behavior are exercised by a real browser engine.
 import assert from "node:assert/strict";
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { chromium } from "playwright";
@@ -25,6 +25,18 @@ const browser = await chromium.launch({
 });
 try {
   const page = await browser.newPage({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 1 });
+  const screenshotDir = process.env.KONTROL_UI_SCREENSHOT_DIR
+    ? resolve(process.env.KONTROL_UI_SCREENSHOT_DIR)
+    : undefined;
+  const screenshotLabel = process.env.KONTROL_UI_SCREENSHOT_LABEL || "current";
+  if (screenshotDir) mkdirSync(screenshotDir, { recursive: true });
+  async function capture(name) {
+    if (!screenshotDir) return;
+    await page.screenshot({
+      path: join(screenshotDir, `${screenshotLabel}-${name}.png`),
+      fullPage: true,
+    });
+  }
   const browserDiagnostics = [];
   page.on("pageerror", (error) => browserDiagnostics.push(`pageerror: ${error.message}`));
   page.on("console", (message) => {
@@ -39,6 +51,8 @@ try {
       onhostcontextchanged: undefined,
       onteardown: undefined,
       async connect() {
+        window.__KONTROL_TEST_APP__ = this;
+        this.__workspaceId = workspaceId;
         this.ontoolresult?.({
           _meta: { tool: "open_workspace" },
           structuredContent: { workspaceId: workspaceId },
@@ -188,11 +202,39 @@ try {
     throw new Error(`${error instanceof Error ? error.message : String(error)}\n${browserDiagnostics.join("\n")}`);
   }
   await page.locator(".review-feedback").waitFor({ state: "attached", timeout: 5_000 });
+  await capture("initial-review-approval");
 
   assert.equal(await page.locator(".agent-meta-primary").textContent().then((text) => text?.includes("Awaiting review")), true, "primary session state is humanized");
   assert.match(await page.locator(".heartbeat-status").textContent() || "", /^Last heartbeat · \d+s ago$/, "parked review does not claim a live agent");
   assert.equal(await page.locator(".approval-card .feedback-btn").count(), 2, "browser surface uses only server-supplied approval options");
   assert.equal(await page.locator(".feedback-btn").count() > 0, true, "review controls render in Chromium");
+
+  const agentBars = page.locator(".agent-submit-bar");
+  assert.equal(await agentBars.count(), 1, "Chromium renders one persistent agent submit bar");
+  const agentInput = page.locator(".agent-submit-input");
+  assert.equal(await agentInput.evaluate((node) => node.tagName), "TEXTAREA", "agent input is a multiline textarea in Chromium");
+  await agentInput.fill("line one\nline two");
+  await agentInput.evaluate((node) => {
+    node.focus();
+    node.setSelectionRange(3, 7);
+    node.dispatchEvent(new Event("input", { bubbles: true }));
+    window.__KONTROL_TEST_APP__.ontoolresult?.({
+      _meta: { tool: "open_workspace" },
+      structuredContent: { workspaceId: window.__KONTROL_TEST_APP__.__workspaceId },
+      content: [],
+    });
+  });
+  await page.waitForTimeout(50);
+  assert.equal(await agentBars.count(), 1, "telemetry rerenders do not duplicate the agent submit bar in Chromium");
+  assert.equal(await agentInput.inputValue(), "line one\nline two", "multiline draft persists across Chromium rerenders");
+  assert.equal(await agentInput.evaluate((node) => node === document.activeElement), true, "agent textarea focus persists in Chromium");
+  await agentInput.fill("::chatgpt-content-reference::");
+  await agentInput.dispatchEvent("input");
+  assert.equal(await page.locator(".agent-submit-reference-warning").isVisible(), true, "reference-only paste remains visible with a warning in Chromium");
+  assert.equal(await page.locator(".agent-submit-btn").isDisabled(), true, "unresolved reference-only content disables Send in Chromium");
+  await agentInput.press("Control+Enter");
+  assert.notEqual(await page.locator(".agent-submit-status").textContent(), "Dispatching…", "Ctrl+Enter cannot dispatch unresolved reference-only content");
+  await capture("reference-warning");
 
   const touchTargets = await page.locator(".feedback-btn").evaluateAll((buttons) => buttons.map((button) => {
     const rect = button.getBoundingClientRect();
@@ -230,8 +272,9 @@ try {
   await page.locator(".feedback-textarea").focus();
   const focusStyle = await page.locator(".feedback-textarea").evaluate((node) => getComputedStyle(node).outlineStyle);
   assert.notEqual(focusStyle, "none", "keyboard focus remains visible");
+  await capture("focused-review");
 
-  console.log("workspace-app browser: Chromium render, responsive controls, focus, theme, and status assertions passed");
+  console.log(`workspace-app browser: Chromium render, responsive controls, focus, theme, and status assertions passed${screenshotDir ? `; screenshots=${screenshotDir}` : ""}`);
 } finally {
   await browser.close();
 }

@@ -22,6 +22,7 @@ if (!Number.isFinite(hours) || hours <= 0) {
 }
 const baseUrl = String(option("--url", "http://127.0.0.1:7676")).replace(/\/$/, "");
 const intervalMs = Math.max(250, Number(option("--interval-ms", "5000")));
+const resourceReadCadence = Number(option("--resource-read-cadence", String(Math.max(1, Math.floor(60 * 60_000 / intervalMs)))));
 const reportPath = resolve(String(option("--report", `${root}/beta-soak.json`)));
 const conversationId = String(option("--conversation", `beta-soak-${process.pid}`));
 const workspacePath = option("--workspace-path");
@@ -40,6 +41,9 @@ const skipTunnel = process.argv.includes("--skip-tunnel");
 // only; the agent session stays unprivileged.
 const reviewerSecret = option("--reviewer-secret", process.env.KONTROL_TUNNEL_REVIEWER_SECRET ?? process.env.KONTROL_ACP_REVIEWER_SECRET);
 const approvalCadence = Math.max(1, Number(option("--approval-cadence", "10")));
+if (!Number.isInteger(resourceReadCadence) || resourceReadCadence < 1) {
+  throw new Error("--resource-read-cadence must be a positive integer");
+}
 const deadline = Date.now() + hours * 60 * 60_000;
 let stopping = false;
 let rpcCounter = 0;
@@ -54,6 +58,8 @@ const report = {
   expectedBuildId,
   status: "running",
   iterations: 0,
+  workspaceAppResourceReads: 0,
+  workspaceAppResourceReadExercises: 0,
   successes: 0,
   failures: 0,
   transientFailures: 0,
@@ -160,6 +166,22 @@ function summarizeDiagnostics(value) {
       // real connector traffic actually resolved to.
       identitySources: value.mcpSessionMetrics?.identitySources ?? {},
     },
+    resourceAdmission: value.mcpSessionMetrics?.admission?.resource ? {
+      active: Number(value.mcpSessionMetrics.admission.resource.active ?? 0),
+      queued: Number(value.mcpSessionMetrics.admission.resource.queued ?? 0),
+      maxInflight: Number(value.mcpSessionMetrics.admission.resource.maxInflight ?? 0),
+      availableWeight: Number(value.mcpSessionMetrics.admission.resource.availableWeight ?? 0),
+    } : undefined,
+    workspaceAppResources: value.mcpSessionMetrics?.workspaceAppResources ? {
+      active: Number(value.mcpSessionMetrics.workspaceAppResources.active ?? 0),
+      maxActive: Number(value.mcpSessionMetrics.workspaceAppResources.maxActive ?? 0),
+      servedTotal: Number(value.mcpSessionMetrics.workspaceAppResources.servedTotal ?? 0),
+      admissionRejections: Number(value.mcpSessionMetrics.workspaceAppResources.admissionRejections ?? 0),
+      serializationFailures: Number(value.mcpSessionMetrics.workspaceAppResources.serializationFailures ?? 0),
+      compressionFailures: Number(value.mcpSessionMetrics.workspaceAppResources.compressionFailures ?? 0),
+      transmissionFailures: Number(value.mcpSessionMetrics.workspaceAppResources.transmissionFailures ?? 0),
+    } : undefined,
+    expiredHandlers: value.mcpSessionMetrics?.executionAdmission?.expiredOperations,
     processSessions: value.processSessions ? {
       running: Number(value.processSessions.running ?? 0),
       total: Number(value.processSessions.total ?? 0),
@@ -186,6 +208,17 @@ async function collectSnapshot() {
     report.monitoring.max = report.monitoring.max ?? {};
     for (const key of ["current", "logicalContinuity", "activePolicyWaiters", "pendingApprovalRows", "orphanedPendingApprovals"]) {
       report.monitoring.max[`sessions.${key}`] = Math.max(report.monitoring.max[`sessions.${key}`] ?? 0, summary.sessions[key]);
+    }
+    for (const key of ["active", "queued", "maxInflight"]) {
+      if (summary.resourceAdmission) {
+        report.monitoring.max[`resourceAdmission.${key}`] = Math.max(report.monitoring.max[`resourceAdmission.${key}`] ?? 0, summary.resourceAdmission[key]);
+      }
+    }
+    if (summary.workspaceAppResources) {
+      report.monitoring.max["workspaceAppResources.maxActive"] = Math.max(
+        report.monitoring.max["workspaceAppResources.maxActive"] ?? 0,
+        summary.workspaceAppResources.maxActive,
+      );
     }
     if (summary.supervisor) {
       for (const key of ["totalRestartCount", "totalRestartFailures", "coreRestarts", "tunnelRestarts", "adapterRestarts"]) {
@@ -565,6 +598,25 @@ async function iteration() {
         name: "read",
         arguments: { workspaceId, path: readPath },
       }, sessionId);
+      if (report.iterations % resourceReadCadence === 0) {
+        const listedResources = await rpc("resources/list", {}, sessionId);
+        const workspaceAppResource = (listedResources.payload?.result?.resources ?? [])
+          .find((resource) => typeof resource.uri === "string" && resource.mimeType === "text/html;profile=mcp-app");
+        if (!workspaceAppResource?.uri) throw new Error("resources/list returned no Workspace App resource");
+        for (let read = 0; read < 2; read++) {
+          const resourceRead = await rpc("resources/read", { uri: workspaceAppResource.uri }, sessionId);
+          if (resourceRead.payload?.error) throw new Error("Workspace App resource read failed during soak");
+          report.workspaceAppResourceReads++;
+        }
+        report.workspaceAppResourceReadExercises++;
+        const resourceSnapshot = await collectSnapshot();
+        if (resourceSnapshot
+          && (resourceSnapshot.resourceAdmission?.active !== 0
+            || resourceSnapshot.resourceAdmission?.queued !== 0
+            || resourceSnapshot.workspaceAppResources?.active !== 0)) {
+          throw new Error("Workspace App resource admission did not recover after its soak load");
+        }
+      }
     }
     // Every tenth iteration deliberately drops the live SSE transport before
     // opening a fresh MCP transport with the same trusted conversation. This
@@ -679,6 +731,36 @@ if (startedSnapshot && finishedSnapshot) {
       && (finishedSnapshot.gitDirty === undefined || Number(finishedSnapshot.gitDirty) === 0),
     continuityBounded: finishedSnapshot.sessions.logicalContinuity
       <= startedSnapshot.sessions.logicalContinuity + 1,
+    resourceAdmissionRecovered: Boolean(
+      report.workspaceAppResourceReads > 0
+      && finishedSnapshot.resourceAdmission
+      && finishedSnapshot.workspaceAppResources
+      && finishedSnapshot.resourceAdmission.active === 0
+      && finishedSnapshot.resourceAdmission.queued === 0
+      && finishedSnapshot.workspaceAppResources.active === 0
+      && finishedSnapshot.workspaceAppResources.maxActive <= finishedSnapshot.resourceAdmission.maxInflight
+      && finishedSnapshot.workspaceAppResources.servedTotal - startedSnapshot.workspaceAppResources?.servedTotal
+        >= report.workspaceAppResourceReads,
+    ),
+    expiredHandlerAccounting: Boolean(
+      startedSnapshot.expiredHandlers
+      && finishedSnapshot.expiredHandlers
+      && startedSnapshot.expiredHandlers.activeCount === startedSnapshot.expiredHandlers.active?.length
+      && finishedSnapshot.expiredHandlers.activeCount === finishedSnapshot.expiredHandlers.active?.length
+      && finishedSnapshot.expiredHandlers.activeCount === 0
+      && startedSnapshot.expiredHandlers.totalExpired
+        === startedSnapshot.expiredHandlers.totalTerminated + startedSnapshot.expiredHandlers.activeCount
+      && finishedSnapshot.expiredHandlers.totalExpired
+        === finishedSnapshot.expiredHandlers.totalTerminated + finishedSnapshot.expiredHandlers.activeCount
+      && [...finishedSnapshot.expiredHandlers.recentTerminated].every((operation) =>
+        typeof operation.operationId === "string"
+        && typeof operation.toolName === "string"
+        && typeof operation.ownerHash === "string"
+        && typeof operation.startedAt === "string"
+        && typeof operation.expiredAt === "string"
+        && typeof operation.terminatedAt === "string"
+        && ["completed", "failed"].includes(operation.outcome)),
+    ),
     // P1: approval continuity must work for header-less tunnel connector
     // traffic, whose sessions resolve to client_info_fallback by design.
     // The qualification is therefore the exercised resume path — every

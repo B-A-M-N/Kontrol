@@ -10,6 +10,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { validateBetaSoakAssertions } from "./beta-soak-contract.mjs";
+import { validateBetaExternalCatalogReceipt } from "./beta-external-catalog-contract.mjs";
 import { testHarnessEnvironment } from "./lib/tool-environment.mjs";
 
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
@@ -21,6 +22,7 @@ const receiptPath = resolve(
 );
 const faultReportPath = resolve(process.env.KONTROL_BETA_FAULT_REPORT ?? join(root, "beta-fault-matrix.json"));
 const soakReportPath = resolve(process.env.KONTROL_BETA_SOAK_REPORT ?? join(root, "beta-soak.json"));
+const externalCatalogReceiptPath = resolve(process.env.KONTROL_BETA_EXTERNAL_CATALOG_RECEIPT ?? join(root, "beta-external-catalog.json"));
 const STABLE_BETA_MIN_SOAK_HOURS = 12;
 const configuredMinimumSoakHours = Number(process.env.KONTROL_BETA_MIN_SOAK_HOURS ?? STABLE_BETA_MIN_SOAK_HOURS);
 // The environment may require a longer soak, but it must never weaken the
@@ -267,11 +269,43 @@ if (!codeOnly) {
     ...soakCheck,
     finishedAt: new Date().toISOString(),
   });
+
+  let externalCatalog;
+  try {
+    externalCatalog = JSON.parse(readFileSync(externalCatalogReceiptPath, "utf8"));
+  } catch (error) {
+    receipt.externalCatalog = {
+      path: externalCatalogReceiptPath,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+  const candidateMetadata = receipt.candidate?.metadata;
+  const expectedMcpVersion = typeof candidateMetadata?.version === "string"
+    && typeof candidateMetadata?.contentSha256 === "string"
+    ? `${candidateMetadata.version}+${candidateMetadata.contentSha256}`
+    : undefined;
+  const externalCatalogCheck = validateBetaExternalCatalogReceipt(externalCatalog, {
+    candidateBuildId: receipt.candidate?.buildId,
+    expectedMcpVersion,
+    soak,
+  });
+  receipt.externalCatalog = {
+    path: externalCatalogReceiptPath,
+    ...receipt.externalCatalog,
+    ...externalCatalogCheck,
+  };
+  receipt.phases.push({
+    id: "external-host-catalog-evidence",
+    command: `read ${externalCatalogReceiptPath}`,
+    status: externalCatalogCheck.valid ? "passed" : "failed",
+    ...externalCatalogCheck,
+    finishedAt: new Date().toISOString(),
+  });
 }
 
 receipt.finishedAt = new Date().toISOString();
 const hardFailures = receipt.phases.filter((phase) => phase.status === "failed" || phase.status === "skipped");
-const codeFailures = hardFailures.filter((phase) => phase.id !== "wall-clock-soak-evidence");
+const codeFailures = hardFailures.filter((phase) => phase.id !== "wall-clock-soak-evidence" && phase.id !== "external-host-catalog-evidence");
 receipt.codeQualified = cleanPass
   && codeFailures.length === 0
   && candidateIdentityPass
@@ -280,12 +314,25 @@ receipt.codeQualified = cleanPass
   && receipt.source.cleanAtEnd;
 const soakQualified = codeOnly
   ? true
-  : receipt.phases.find((phase) => phase.id === "wall-clock-soak-evidence")?.status === "passed";
+  : receipt.phases.find((phase) => phase.id === "wall-clock-soak-evidence")?.status === "passed"
+    && receipt.phases.find((phase) => phase.id === "external-host-catalog-evidence")?.status === "passed";
 receipt.qualified = receipt.codeQualified && soakQualified;
 receipt.status = receipt.qualified ? "qualified" : (codeOnly ? "code_failed" : "failed");
+if (!codeOnly) {
+  receipt.checks = {
+    ...(receipt.checks ?? {}),
+    externalCatalogFresh: receipt.externalCatalog?.valid === true,
+  };
+}
 receipt.policy.cleanCheckout = cleanPass && receipt.source.cleanAtEnd;
 receipt.policy.soakRequired = !codeOnly;
+receipt.policy.externalCatalogRequired = !codeOnly;
 persist();
-console.log(`\n[beta-gate] ${receipt.qualified ? "QUALIFIED" : (receipt.codeQualified ? "CODE QUALIFIED; SOAK REQUIRED" : "NOT QUALIFIED")}`);
+const resultLabel = receipt.qualified
+  ? "QUALIFIED"
+  : receipt.codeQualified
+    ? (codeOnly ? "CODE QUALIFIED; DEPLOYMENT EVIDENCE REQUIRED" : "CODE QUALIFIED; SOAK OR EXTERNAL CATALOG EVIDENCE REQUIRED")
+    : "NOT QUALIFIED";
+console.log(`\n[beta-gate] ${resultLabel}`);
 console.log(`[beta-gate] receipt=${receiptPath}`);
 if (!receipt.qualified) process.exitCode = 1;

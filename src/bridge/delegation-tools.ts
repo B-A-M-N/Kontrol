@@ -85,6 +85,13 @@ export function registerDelegationTools(server: McpServer, config: BridgeConfig)
         if (requiredCount === 0) {
           return { content: [{ type: "text" as const, text: "Mission contract requires at least one required acceptance criterion." }], isError: true };
         }
+        // This prerequisite must be checked before creating a work session or
+        // acquiring its checkout lease. A missing ledger is a control-plane
+        // configuration failure, not a dispatch failure, and must not strand
+        // either durable resource.
+        if (!config.missionLedger) {
+          return { content: [{ type: "text" as const, text: "Mission contract supplied, but mission ledger is unavailable." }], isError: true };
+        }
       }
 
       // Failover: among agents with the selected name (role=agent), pick the first
@@ -160,10 +167,6 @@ export function registerDelegationTools(server: McpServer, config: BridgeConfig)
       if (leaseError) {
         if (createdSessionForDispatch) config.workSessions.updateStatus(wsId, "cancelled");
         return leaseError;
-      }
-
-      if (missionContract && !config.missionLedger) {
-        return { content: [{ type: "text" as const, text: "Mission contract supplied, but mission ledger is unavailable." }], isError: true };
       }
 
       let supervisorRun: ReturnType<NonNullable<typeof config.supervisorRuns>["create"]> | undefined;

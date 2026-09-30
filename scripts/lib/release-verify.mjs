@@ -6,7 +6,8 @@
 //
 // verifyQualifiedRelease() checks, in order, failing closed at the first
 // mismatch (throwing with a release-specific error):
-//   1. A qualification receipt exists, is stage=combined, qualified=true.
+//   1. A qualification receipt exists, is stage=combined, qualified=true, and
+//      includes fresh external-host catalog parity for the candidate.
 //   2. The receipt's candidate buildId equals the requested buildId.
 //   3. The receipt's candidate sourceGitSha equals the checkout HEAD.
 //   4. The candidate directory (receipt artifactPath or releases/<buildId>/)
@@ -53,6 +54,9 @@ export function readReceipt(receiptPath) {
   }
   if (receipt.stage !== "combined") {
     fail(`qualification receipt stage is ${receipt.stage ?? "missing"}, expected "combined" (a code-only receipt never authorizes publication)`);
+  }
+  if (receipt.checks?.externalCatalogFresh !== true) {
+    fail("qualification receipt has no fresh external-host catalog parity for the deployed candidate");
   }
   return receipt;
 }

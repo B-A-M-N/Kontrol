@@ -12,6 +12,11 @@ import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
 import { z } from "zod/v4";
 import { currentMcpRequestSignal } from "../mcp/request-context.js";
 
+// Keep the normal Workspace App heartbeat below common intermediary idle
+// limits. Callers may request a shorter bounded wait, but the default must not
+// leave a POST response silent long enough for a tunnel or host proxy to reap it.
+export const DEFAULT_WORKSPACE_EVENT_WAIT_MS = 18_000;
+
 export function registerEventTools(server: McpServer, config: BridgeConfig): void {
 const TERMINAL_RUN_EVENTS = new Set([
   "agent.run.approved",
@@ -143,7 +148,7 @@ const TERMINAL_RUN_EVENTS = new Set([
       inputSchema: {
         workspaceId: z.string().describe("Workspace or project identifier from open_workspace."),
         afterSeq: z.number().int().min(0).default(0).describe("Return events strictly after this global event sequence."),
-        timeoutMs: z.number().int().min(1000).max(120_000).default(55_000).describe("Max wait in ms before returning."),
+        timeoutMs: z.number().int().min(1000).max(120_000).default(DEFAULT_WORKSPACE_EVENT_WAIT_MS).describe("Max wait in ms before returning."),
       },
       outputSchema: {
         events: z.array(z.object({

@@ -167,7 +167,11 @@ writeExecutable(join(fakeBin, "tmux"), [
   "      status_file=\"$(printf '%s\\n' \"$last\" | sed -n 's/.*--status-file \\([^ ]*\\).*/\\1/p')\"",
   "      if [ -n \"$status_file\" ]; then",
   "        mkdir -p \"$(dirname \"$status_file\")\"",
-  "        printf '%s\\n' '{\"state\": \"healthy\"}' > \"$status_file\"",
+  "        generation_id=\"$(printf '%s\\n' \"$last\" | sed -n 's/.*--generation-id \\([^ ]*\\).*/\\1/p')\"",
+  "        expected_build=\"$(printf '%s\\n' \"$last\" | sed -n 's/.*--expected-build-id \\([^ ]*\\).*/\\1/p')\"",
+  "        start_token=\"proc:$(awk '{print $22}' \"/proc/$child_pid/stat\")\"",
+  "        updated_at=\"$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)\"",
+  "        printf '{\"state\":\"healthy\",\"pid\":%s,\"processStartToken\":\"%s\",\"generationId\":\"%s\",\"expectedBuildId\":\"%s\",\"updatedAt\":\"%s\"}\\n' \"$child_pid\" \"$start_token\" \"$generation_id\" \"$expected_build\" \"$updated_at\" > \"$status_file\"",
   "      fi",
   "    fi",
   "    ;;",
@@ -752,7 +756,7 @@ try {
   assert.equal(pathExists(join(postStopCrashState, "deployment.lock")), true, "post-stop controller death must leave a reclaimable deployment record");
   writeEnvironment(postStopCrashState, 17685, { failBuildId: candidateBuildId });
   const postStopCrashRecovery = runRestart(postStopCrashEnv);
-  assert.equal(postStopCrashRecovery.status, 0, "a later controller must restore A after post-stop controller death:\n" + postStopCrashRecovery.stdout + "\n" + postStopCrashRecovery.stderr);
+  assert.notEqual(postStopCrashRecovery.status, 0, "a later controller must restore A while reporting the interrupted deployment as failed:\n" + postStopCrashRecovery.stdout + "\n" + postStopCrashRecovery.stderr);
   const postStopCrashGeneration = JSON.parse(readFileSync(join(postStopCrashState, "generation.json"), "utf8"));
   assert.equal(postStopCrashGeneration.status, "rolled_back");
   assert.equal(postStopCrashGeneration.activeBuildId, baseBuildId);
@@ -774,9 +778,9 @@ try {
   const handoffStart = runLauncher(handoffEnv);
   assert.equal(handoffStart.status, 0, "handoff baseline generation failed:\n" + handoffStart.stdout + "\n" + handoffStart.stderr);
   const handoffRestart = runRestart(handoffEnv);
-  assert.equal(handoffRestart.status, 0, "failed candidate activation should roll back to A:\n" + handoffRestart.stdout + "\n" + handoffRestart.stderr);
+  assert.notEqual(handoffRestart.status, 0, "failed candidate activation should roll back to A:\n" + handoffRestart.stdout + "\n" + handoffRestart.stderr);
   const handoffGeneration = JSON.parse(readFileSync(join(handoffState, "generation.json"), "utf8"));
-  assert.equal(handoffGeneration.status, "rolled_back");
+  assert.equal(handoffGeneration.status, "rolled_back", "handoff generation:\n" + handoffRestart.stdout + "\n" + handoffRestart.stderr);
   assert.equal(handoffGeneration.requestedBuildId, candidateBuildId);
   assert.equal(handoffGeneration.activeBuildId, baseBuildId);
   assert.equal(handoffGeneration.lastKnownGoodBuildId, baseBuildId);
@@ -787,7 +791,7 @@ try {
   // the committed A record; the failed B candidate must never become the
   // last-known-good pointer merely because it was prepared twice.
   const handoffRestartAgain = runRestart(handoffEnv);
-  assert.equal(handoffRestartAgain.status, 0, "repeated failed candidate activation should roll back to A:\n" + handoffRestartAgain.stdout + "\n" + handoffRestartAgain.stderr);
+  assert.notEqual(handoffRestartAgain.status, 0, "repeated failed candidate activation should roll back to A:\n" + handoffRestartAgain.stdout + "\n" + handoffRestartAgain.stderr);
   const repeatedHandoffGeneration = JSON.parse(readFileSync(join(handoffState, "generation.json"), "utf8"));
   assert.equal(repeatedHandoffGeneration.status, "rolled_back");
   assert.equal(repeatedHandoffGeneration.requestedBuildId, candidateBuildId);
@@ -815,7 +819,7 @@ try {
   if (!/injected runtime ownership acquisition failure/.test(gapRestart.stdout + "\n" + gapRestart.stderr)) {
     throw new Error("post-stop failure injection did not fire:\n" + gapRestart.stdout + "\n" + gapRestart.stderr);
   }
-  assert.equal(gapRestart.status, 0, "post-stop lock failure must recover the previous generation:\n" + gapRestart.stdout + "\n" + gapRestart.stderr);
+  assert.notEqual(gapRestart.status, 0, "post-stop lock failure must recover the previous generation:\n" + gapRestart.stdout + "\n" + gapRestart.stderr);
   const gapGeneration = JSON.parse(readFileSync(join(gapState, "generation.json"), "utf8"));
   assert.equal(gapGeneration.status, "rolled_back", `post-stop recovery lost rollback provenance: ${JSON.stringify(gapGeneration)}\n${gapRestart.stdout}\n${gapRestart.stderr}`);
   assert.equal(gapGeneration.activeBuildId, baseBuildId);
@@ -843,7 +847,7 @@ try {
   writeFileSync(deploymentGapMarker, "fail once\n");
   const deploymentGapRestart = runRestart(deploymentGapEnv);
   assert.match(deploymentGapRestart.stdout + "\n" + deploymentGapRestart.stderr, /injected deployment ownership check failure/);
-  assert.equal(deploymentGapRestart.status, 0, "post-stop deployment-lock failure must recover the previous generation:\n" + deploymentGapRestart.stdout + "\n" + deploymentGapRestart.stderr);
+  assert.equal(deploymentGapRestart.status, 0, "a pure deployment-lock recovery restores service without a failed candidate activation:\n" + deploymentGapRestart.stdout + "\n" + deploymentGapRestart.stderr);
   const deploymentGapGeneration = JSON.parse(readFileSync(join(deploymentGapState, "generation.json"), "utf8"));
   assert.equal(deploymentGapGeneration.status, "rolled_back");
   assert.equal(deploymentGapGeneration.activeBuildId, baseBuildId);
@@ -859,7 +863,7 @@ try {
   const rollbackState = mkdtempSync(join(harnessRoot, "state-rollback-"));
   const rollbackEnv = writeEnvironment(rollbackState, 17677, { useExistingDist: false, failBuildId: candidateBuildId });
   const rollback = runLauncher(rollbackEnv);
-  assert.equal(rollback.status, 0, "candidate rollback failed:\n" + rollback.stdout + "\n" + rollback.stderr);
+  assert.notEqual(rollback.status, 0, "candidate rollback failed:\n" + rollback.stdout + "\n" + rollback.stderr);
   assert.match(rollback.stdout + "\n" + rollback.stderr, /KONTROL READY — ROLLED BACK/);
   const rollbackGeneration = JSON.parse(readFileSync(join(rollbackState, "generation.json"), "utf8"));
   assert.equal(rollbackGeneration.status, "rolled_back");
@@ -896,7 +900,7 @@ try {
   assert.equal(outerRecoveryStart.status, 0, "outer-recovery baseline generation failed:\n" + outerRecoveryStart.stdout + "\n" + outerRecoveryStart.stderr);
   writeFileSync(outerRecoveryMarker, "2\n");
   const outerRecoveryRestart = runRestart(outerRecoveryEnv);
-  assert.equal(outerRecoveryRestart.status, 0, "outer emergency recovery should restore A:\n" + outerRecoveryRestart.stdout + "\n" + outerRecoveryRestart.stderr);
+  assert.equal(outerRecoveryRestart.status, 0, "outer emergency recovery should restore A as an independent recovery operation:\n" + outerRecoveryRestart.stdout + "\n" + outerRecoveryRestart.stderr);
   assert.match(outerRecoveryRestart.stdout + "\n" + outerRecoveryRestart.stderr, /injected kontrol-server launch failure/);
   assert.match(outerRecoveryRestart.stdout + "\n" + outerRecoveryRestart.stderr, /exact previous-generation recovery/);
   const outerRecoveryGeneration = JSON.parse(readFileSync(join(outerRecoveryState, "generation.json"), "utf8"));

@@ -297,6 +297,8 @@ async function handleRunRequest(req, res, body) {
     outputBuffers: new Map(),
     outputTimers: new Map(),
     syntheticSmoke: false,
+    eventSequence: 0,
+    deliveryQueue: [],
   };
 
   if (smokeTest) {
@@ -761,25 +763,35 @@ async function reportEvent(run, type, errorMessage, details) {
   }, terminal);
 }
 
+export function createAdapterEvent(run, type, payload) {
+  return {
+    event_id: `${run.remoteRunId}:${++run.eventSequence}`,
+    event_sequence: run.eventSequence,
+    type,
+    remote_run_id: run.remoteRunId,
+    work_session_id: run.workSessionId,
+    payload,
+  };
+}
+
 function enqueueRunEvent(run, event, terminal = false) {
+  event.event_sequence ??= ++run.eventSequence;
+  event.event_id ??= `${run.remoteRunId}:${event.event_sequence}`;
   const durableTerminal = terminal && !run.syntheticSmoke
     ? spoolTerminalEvent(run.devRunId, event)
-    : Promise.resolve();
+    : (!terminal && !run.syntheticSmoke ? spoolRunEvent(run.devRunId, event) : Promise.resolve());
   const delivery = run.sendChain
     .catch(() => undefined)
     .then(async () => {
       await durableTerminal;
-      const success = await withRetry(() =>
-        fetch(`${KONTROL_ACP_URL}/runs/${run.devRunId}/events`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json", authorization: `Bearer ${AGENT_SECRET}`, ...identityHeaders(agentIdentity) },
-          body: JSON.stringify(event),
-        }),
-        terminal && !run.syntheticSmoke ? { retries: 3, backoff: 2000 } : { retries: 0, backoff: 0 },
-      );
+      const success = await deliverEvent(run.devRunId, event);
       if (!success) {
         console.error(`[run ${run.remoteRunId}] failed to report ${event.type}`);
         return false;
+      }
+      if (!terminal && !run.syntheticSmoke) {
+        pendingEventSpool.delete(event.event_id);
+        void saveEventSpool().catch((error) => console.warn(`[adapter] failed to persist event spool cleanup: ${error.message}`));
       }
       if (terminal) {
         pendingTerminalSpool.delete(run.devRunId);
@@ -799,6 +811,10 @@ function enqueueRunEvent(run, event, terminal = false) {
 const SPOOL_PATH = process.env.KONTROL_CRUSH_TERMINAL_SPOOL
   || process.env.KONTROL_ACP_TERMINAL_SPOOL
   || adapterStatePath("crush", "terminal-spool.json");
+const EVENT_SPOOL_PATH = process.env.KONTROL_CRUSH_EVENT_SPOOL
+  || adapterStatePath("crush", "event-spool.json");
+const EVENT_SPOOL_MAX_EVENTS = 512;
+const pendingEventSpool = new Map();
 const SPOOL_MAX_EVENTS = 100;
 const pendingTerminalSpool = new Map();
 
@@ -814,32 +830,61 @@ async function saveTerminalSpool() {
   await atomicWriteJson(SPOOL_PATH, entries);
 }
 
+function loadEventSpool() {
+  try {
+    const parsed = JSON.parse(readFileSync(EVENT_SPOOL_PATH, "utf8"));
+    if (Array.isArray(parsed)) for (const event of parsed) {
+      if (event?.event_id && event?.runId) pendingEventSpool.set(event.event_id, event);
+    }
+  } catch { /* empty or unreadable spool starts fresh */ }
+}
+
+async function saveEventSpool() {
+  await atomicWriteJson(EVENT_SPOOL_PATH, [...pendingEventSpool.values()].slice(-EVENT_SPOOL_MAX_EVENTS));
+}
+
+function spoolRunEvent(runId, event) {
+  pendingEventSpool.set(event.event_id, { ...event, runId, spooledAt: Date.now() });
+  return saveEventSpool();
+}
+
+async function deliverEvent(runId, event) {
+  return withRetry(() => fetch(`${KONTROL_ACP_URL}/runs/${runId}/events`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", authorization: `Bearer ${AGENT_SECRET}`, ...identityHeaders(agentIdentity) },
+    body: JSON.stringify(event),
+  }), { retries: 3, backoff: 250 });
+}
+
+async function flushEventSpools() {
+  const entries = [...pendingEventSpool.values()].sort((a, b) => a.event_sequence - b.event_sequence);
+  for (const entry of entries) {
+    if (await deliverEvent(entry.runId, entry)) {
+      pendingEventSpool.delete(entry.event_id);
+      await saveEventSpool();
+    }
+  }
+  // Terminal delivery is a strict last boundary. If telemetry is still
+  // pending for a run, leave its terminal event spooled for the next cycle.
+  for (const [runId, entry] of [...pendingTerminalSpool]) {
+    if ([...pendingEventSpool.values()].some((event) => event.runId === runId)) continue;
+    if (await deliverEvent(runId, entry.payload)) {
+      pendingTerminalSpool.delete(runId);
+      await saveTerminalSpool();
+    }
+  }
+}
+
 function spoolTerminalEvent(runId, payload) {
   pendingTerminalSpool.set(runId, { runId, payload, spooledAt: Date.now() });
   console.warn(`[run ${runId}] terminal event spooled for redrive (${pendingTerminalSpool.size} pending)`);
   return saveTerminalSpool();
 }
 
-async function flushTerminalSpool() {
-  if (pendingTerminalSpool.size === 0) return;
-  for (const [runId, entry] of [...pendingTerminalSpool]) {
-    try {
-      const res = await fetch(`${KONTROL_ACP_URL}/runs/${entry.runId}/events`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", authorization: `Bearer ${AGENT_SECRET}`, ...identityHeaders(agentIdentity) },
-        body: JSON.stringify(entry.payload),
-      });
-      if (res.ok || res.status === 404 /* run already reconciled */) {
-        pendingTerminalSpool.delete(runId);
-        await saveTerminalSpool();
-        console.log(`[spool] delivered spooled terminal event for ${entry.runId}`);
-      }
-    } catch { /* server still down; retry next cycle */ }
-  }
-}
 
 loadTerminalSpool();
-setInterval(() => void flushTerminalSpool(), 30_000).unref?.();
+loadEventSpool();
+setInterval(() => void flushEventSpools(), 10_000).unref?.();
 
 function reportOutputDelta(run, text, channel = "stdout") {
   if (!text || run.finalized) return Promise.resolve(false);
@@ -907,7 +952,7 @@ async function shutdown() {
   shuttingDown = true;
   console.log("[adapter] shutting down...");
   await Promise.all([...activeProcesses.values()].map(({ run }) => terminateRun(run, "adapter shutdown", "cancelled")));
-  await flushTerminalSpool();
+  await flushEventSpools();
   process.exit(0);
 }
 

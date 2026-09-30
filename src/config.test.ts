@@ -13,6 +13,9 @@ const baseEnv = {
 };
 
 assert.equal(loadConfig(baseEnv).widgets, "changes");
+assert.equal(loadConfig(baseEnv).workspaceAppSmokeEnabled, false, "diagnostic app tooling stays hidden by default");
+assert.equal(loadConfig({ ...baseEnv, KONTROL_DEV_WORKSPACE_APP_SMOKE: "1" }).workspaceAppSmokeEnabled, true);
+assert.equal(loadConfig({ ...baseEnv, KONTROL_DEV_WORKSPACE_APP_SMOKE: "true" }).workspaceAppSmokeEnabled, false);
 assert.equal(loadConfig({ ...baseEnv, KONTROL_WIDGETS: "changes" }).widgets, "changes");
 assert.equal(loadConfig({ ...baseEnv, KONTROL_WIDGETS: "full" }).widgets, "full");
 assert.equal(loadConfig({ ...baseEnv, KONTROL_WIDGETS: "off" }).widgets, "off");

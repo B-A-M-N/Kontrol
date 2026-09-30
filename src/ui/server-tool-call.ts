@@ -89,14 +89,15 @@ export async function callServerToolChecked(request: ServerToolRequest, options:
       if (retryMode !== "safe") throw new AmbiguousMutationError(String(request.name), reconnectError);
       throw reconnectError;
     }
-    if (!app) {
+    const reconnectedApp = host.getApp();
+    if (!reconnectedApp) {
       if (retryMode !== "safe") throw new AmbiguousMutationError(String(request.name), transportError);
       throw transportError;
     }
     if (retryMode !== "safe") {
       throw new AmbiguousMutationError(String(request.name), transportError);
     }
-    result = await app.callServerTool(request);
+    result = await reconnectedApp.callServerTool(request);
   }
   if (!result.isError) return result;
   const message = result.content

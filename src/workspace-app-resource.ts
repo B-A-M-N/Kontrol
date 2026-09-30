@@ -1,9 +1,10 @@
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const LEGACY_WORKSPACE_APP_URI = "ui://kontrol/workspace-app.html";
+export const WORKSPACE_APP_SMOKE_URI = "ui://kontrol/workspace-app-smoke-v1.html";
 // The OpenAI tunnel can replay cards created while this project was named
 // DevDesktop. Retain this exact URI until those cached cards age out.
 export const DEVDESKTOP_WORKSPACE_APP_URI = "ui://devdesktop/workspace-app.html";
@@ -154,7 +155,17 @@ export const OPENAI_WORKSPACE_APP_URI = `ui://kontrol/workspace-app-${WORKSPACE_
 // historical hashes are rejected rather than being treated as aliases for the
 // current bundle; each retained URI must map to an actually registered
 // resource.
-export type WorkspaceAppResourceKind = "current" | "openai" | "legacy" | "devdesktop";
+export type WorkspaceAppResourceKind = "current" | "previous" | "openai" | "legacy" | "devdesktop";
+
+export interface WorkspaceAppResourceEntry {
+  readonly uri: string;
+  readonly html: string;
+  readonly mimeType: string;
+  readonly kind: WorkspaceAppResourceKind;
+  readonly buildId: string;
+  readonly generationId?: string;
+  readonly metadata?: Readonly<Record<string, unknown>>;
+}
 
 /**
  * P1 #35: measured sunset plan for compatibility resource URIs. Each legacy
@@ -173,16 +184,159 @@ export type WorkspaceAppResourceKind = "current" | "openai" | "legacy" | "devdes
  *   - DEVDESKTOP_WORKSPACE_APP_URI: retained (tunnel card cache aging out)
  */
 
-const workspaceAppResourceMetadata = Object.freeze({ ui: Object.freeze({ prefersBorder: true }) });
+const workspaceAppResourceMetadata = Object.freeze({
+  ui: Object.freeze({
+    prefersBorder: true,
+    permissions: Object.freeze({ clipboardWrite: Object.freeze({}) }),
+  }),
+});
 const workspaceAppToolMetadata = new Map<string, Readonly<Record<string, unknown>>>();
+const workspaceAppCallableMetadata = Object.freeze({
+  ui: Object.freeze({ visibility: Object.freeze(["app"]) }),
+  "openai/widgetAccessible": true,
+});
+const workspaceAppResourceRegistry = new Map<string, WorkspaceAppResourceEntry>();
+const MCP_APP_RESOURCE_MIME_TYPE = "text/html;profile=mcp-app";
+const LEGACY_APP_RESOURCE_MIME_TYPE = "text/html+skybridge";
+const MAX_RETAINED_PREVIOUS_WORKSPACE_APPS = 2;
+
+function resetWorkspaceAppResourceRegistry(): void {
+  workspaceAppResourceRegistry.clear();
+  workspaceAppResourceRegistry.set(WORKSPACE_APP_URI, Object.freeze({
+    uri: WORKSPACE_APP_URI,
+    html: WORKSPACE_APP_HTML,
+    mimeType: MCP_APP_RESOURCE_MIME_TYPE,
+    kind: "current",
+    buildId: WORKSPACE_APP_BUILD_ID,
+    metadata: workspaceAppResourceMetadata,
+  }));
+  for (const [uri, kind] of [
+    [OPENAI_WORKSPACE_APP_URI, "openai"],
+    [LEGACY_WORKSPACE_APP_URI, "legacy"],
+    [DEVDESKTOP_WORKSPACE_APP_URI, "devdesktop"],
+  ] as const) {
+    workspaceAppResourceRegistry.set(uri, Object.freeze({
+      uri,
+      html: WORKSPACE_APP_HTML,
+      mimeType: LEGACY_APP_RESOURCE_MIME_TYPE,
+      kind,
+      buildId: WORKSPACE_APP_BUILD_ID,
+    }));
+  }
+}
+
+function releaseRootForCurrentArtifact(): string | undefined {
+  let directory = dirname(WORKSPACE_APP_ARTIFACT_SOURCE.path);
+  for (let depth = 0; depth < 8; depth += 1) {
+    if (basename(directory) === "releases") return directory;
+    const parent = dirname(directory);
+    if (parent === directory) return undefined;
+    directory = parent;
+  }
+  return undefined;
+}
+
+interface PreviousArtifactReference {
+  value: string;
+}
+
+/** generation.json is a stable Kontrol-owned record; read only its documented
+ * immutable-release pointers. Generic recursive key discovery could mistake
+ * a candidate/deployment record for the serving generation and retain the
+ * wrong HTML behind an otherwise valid old content hash. */
+function previousArtifactReferences(value: unknown): PreviousArtifactReference[] {
+  if (typeof value !== "object" || value === null) return [];
+  const generation = value as Record<string, unknown>;
+  const references = [
+    generation.previousArtifactPath,
+    generation.lastKnownGoodArtifactPath,
+    generation.previousBuildId,
+    generation.lastKnownGoodBuildId,
+  ];
+  return references
+    .filter((entry): entry is string => typeof entry === "string" && entry.length > 0)
+    .map((entry) => ({ value: entry }));
+}
+
+function resolvePreviousHtmlPaths(value: unknown, releaseRoot: string): string[] {
+  const values = typeof value === "string" ? [value] : [];
+  const htmlPaths: string[] = [];
+  for (const raw of values) {
+    const rawPath = /^[a-f0-9]{12,64}$/i.test(raw)
+      ? join(releaseRoot, raw)
+      : isAbsolute(raw) ? resolve(raw) : resolve(releaseRoot, raw);
+    for (const candidate of [rawPath, join(rawPath, "ui", "workspace-app.html"), join(rawPath, "workspace-app.html")]) {
+      try {
+        const real = realpathSync(candidate);
+        const releaseRootReal = realpathSync(releaseRoot);
+        if (!real.startsWith(`${releaseRootReal}${sep}`) || !statSync(real).isFile()) continue;
+        if (basename(real) !== "workspace-app.html") continue;
+        if (statSync(real).size > 20 * 1024 * 1024) continue;
+        htmlPaths.push(real);
+      } catch {
+        // A stale generation pointer may name an already-pruned artifact.
+      }
+    }
+  }
+  return [...new Set(htmlPaths)];
+}
+
+/**
+ * Load the current generation's bounded previous-artifact set. The HTTP
+ * fastpath and MCP resources/list share this exact registry, so a hashed URI
+ * can never silently resolve to another build's HTML.
+ */
+export function configureWorkspaceAppResourceRegistry(stateDir?: string): void {
+  resetWorkspaceAppResourceRegistry();
+  if (!stateDir) return;
+  const releaseRoot = releaseRootForCurrentArtifact();
+  if (!releaseRoot) return;
+  let generation: unknown;
+  try {
+    generation = JSON.parse(readFileSync(join(stateDir, "generation.json"), "utf8"));
+  } catch {
+    return;
+  }
+  const retained = new Set<string>();
+  for (const reference of previousArtifactReferences(generation)) {
+    for (const htmlPath of resolvePreviousHtmlPaths(reference.value, releaseRoot)) {
+      let html: string;
+      try { html = readFileSync(htmlPath, "utf8"); } catch { continue; }
+      if (!isSelfContainedWorkspaceAppHtml(html)) continue;
+      const buildId = createHash("sha256").update(html).digest("hex").slice(0, 12);
+      if (buildId === WORKSPACE_APP_BUILD_ID) continue;
+      const uri = `ui://kontrol/workspace-app-${buildId}.html`;
+      if (retained.has(uri)) continue;
+      retained.add(uri);
+      workspaceAppResourceRegistry.set(uri, Object.freeze({
+        uri,
+        html,
+        mimeType: MCP_APP_RESOURCE_MIME_TYPE,
+        kind: "previous",
+        buildId,
+        metadata: workspaceAppResourceMetadata,
+      }));
+      if (retained.size >= MAX_RETAINED_PREVIOUS_WORKSPACE_APPS) return;
+    }
+  }
+}
+
+resetWorkspaceAppResourceRegistry();
+
+export function workspaceAppResourceEntries(): WorkspaceAppResourceEntry[] {
+  return [...workspaceAppResourceRegistry.values()];
+}
+
+export function workspaceAppResource(value: unknown): WorkspaceAppResourceEntry | undefined {
+  return typeof value === "string" ? workspaceAppResourceRegistry.get(value) : undefined;
+}
+
+export function isWorkspaceAppHashedUri(value: unknown): value is string {
+  return typeof value === "string" && /^ui:\/\/kontrol\/workspace-app-[a-f0-9]{12}\.html$/i.test(value);
+}
 
 export function workspaceAppResourceKind(value: unknown): WorkspaceAppResourceKind | undefined {
-  if (typeof value !== "string") return undefined;
-  if (value === WORKSPACE_APP_URI) return "current";
-  if (value === OPENAI_WORKSPACE_APP_URI) return "openai";
-  if (value === LEGACY_WORKSPACE_APP_URI) return "legacy";
-  if (value === DEVDESKTOP_WORKSPACE_APP_URI) return "devdesktop";
-  return undefined;
+  return workspaceAppResource(value)?.kind;
 }
 
 export function isWorkspaceAppUri(value: unknown): boolean {
@@ -199,6 +353,16 @@ export function workspaceAppToolMeta(visibility: readonly ("model" | "app")[] = 
   });
   workspaceAppToolMetadata.set(key, metadata);
   return metadata;
+}
+
+/** Metadata for intentional model-invoked render tools. */
+export function workspaceAppRenderToolMeta() {
+  return workspaceAppToolMeta(["model"]);
+}
+
+/** Metadata for tools the Workspace App may call without mounting the app as their renderer. */
+export function workspaceAppCallableToolMeta() {
+  return workspaceAppCallableMetadata;
 }
 
 export function workspaceAppResourceMeta() {

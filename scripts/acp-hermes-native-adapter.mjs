@@ -33,6 +33,9 @@ const OWNED_PROCESSES_PATH = process.env.KONTROL_HERMES_OWNED_PROCESSES
   || adapterStatePath("hermes", "owned-processes.json");
 const TERMINAL_SPOOL_PATH = process.env.KONTROL_HERMES_TERMINAL_SPOOL
   || adapterStatePath("hermes", "terminal-spool.json");
+const EVENT_SPOOL_PATH = process.env.KONTROL_HERMES_EVENT_SPOOL
+  || adapterStatePath("hermes", "event-spool.json");
+const EVENT_SPOOL_MAX_EVENTS = 512;
 
 if (process.argv.includes("--validate-imports")) {
   console.log("[hermes-native] import validation ok");
@@ -66,6 +69,7 @@ let degraded = PYTHON_BIN === null;
 const active = new Map();
 const ownedProcesses = new Map();
 const pendingTerminalSpool = new Map();
+const pendingEventSpool = new Map();
 let agentIdentity = null;
 const adapterGenerationId = process.env.KONTROL_LAUNCH_GENERATION_ID || "unknown";
 let reconciliationComplete = false;
@@ -76,6 +80,9 @@ orphanProcessesTerminated = reconciliation.terminated;
 reconciliationComplete = true;
 for (const entry of await readJsonOr(TERMINAL_SPOOL_PATH, [])) {
   if (entry?.runId && entry.payload) pendingTerminalSpool.set(entry.runId, entry);
+}
+for (const entry of await readJsonOr(EVENT_SPOOL_PATH, [])) {
+  if (entry?.event_id && entry?.runId) pendingEventSpool.set(entry.event_id, entry);
 }
 
 if (degraded) {
@@ -110,7 +117,7 @@ async function shutdown() {
   shuttingDown = true;
   httpServer.close();
   await Promise.all([...active.values()].map((run) => terminateRun(run, "adapter shutdown", "cancelled")));
-  await flushTerminalSpool();
+  await flushEventSpools();
   process.exit(0);
 }
 
@@ -240,6 +247,7 @@ async function handle(req, res) {
     sawAgentMessage: false,
     sendChain: Promise.resolve(),
     deliveryErrors: [],
+    eventSequence: 0,
     terminalOutcome: null,
     finalOutput: "",
   };
@@ -641,26 +649,46 @@ async function saveTerminalSpool() {
   await atomicWriteJson(TERMINAL_SPOOL_PATH, [...pendingTerminalSpool.values()].slice(-100));
 }
 
+async function saveEventSpool() {
+  await atomicWriteJson(EVENT_SPOOL_PATH, [...pendingEventSpool.values()].slice(-EVENT_SPOOL_MAX_EVENTS));
+}
+
 function spoolTerminalEvent(runId, event) {
   pendingTerminalSpool.set(runId, { runId, payload: event, spooledAt: Date.now() });
   return saveTerminalSpool();
 }
 
-async function flushTerminalSpool() {
+function spoolRunEvent(runId, event) {
+  pendingEventSpool.set(event.event_id, { ...event, runId, spooledAt: Date.now() });
+  return saveEventSpool();
+}
+
+async function deliverEvent(runId, event) {
+  return withRetry(() => fetch(`${KONTROL_ACP_URL}/runs/${runId}/events`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", authorization: `Bearer ${AGENT_SECRET}`, ...identityHeaders(agentIdentity) },
+    body: JSON.stringify(event),
+  }), { retries: 3, backoff: 250 });
+}
+
+async function flushEventSpools() {
+  const entries = [...pendingEventSpool.values()].sort((a, b) => a.event_sequence - b.event_sequence);
+  for (const entry of entries) {
+    if (await deliverEvent(entry.runId, entry)) {
+      pendingEventSpool.delete(entry.event_id);
+      await saveEventSpool();
+    }
+  }
   for (const [runId, entry] of [...pendingTerminalSpool]) {
-    const delivered = await withRetry(() => fetch(`${KONTROL_ACP_URL}/runs/${entry.runId}/events`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", authorization: `Bearer ${AGENT_SECRET}`, ...identityHeaders(agentIdentity) },
-      body: JSON.stringify(entry.payload),
-    }), { retries: 0, backoff: 0 });
-    if (delivered) {
+    if ([...pendingEventSpool.values()].some((event) => event.runId === runId)) continue;
+    if (await deliverEvent(runId, entry.payload)) {
       pendingTerminalSpool.delete(runId);
       await saveTerminalSpool();
     }
   }
 }
 
-setInterval(() => void flushTerminalSpool(), 30_000).unref?.();
+setInterval(() => void flushEventSpools(), 10_000).unref?.();
 
 // P0 #3: Coalesce high-volume telemetry (output_delta, thought_delta) into
 // batched POSTs. Hermes can emit thousands of individual token/thought events
@@ -745,6 +773,8 @@ function enqueueRunEvent(run, type, payload, { allowFinalizing = false, terminal
     return Promise.resolve(false);
   }
   const event = {
+    event_id: `${run.remoteRunId}:${++run.eventSequence}`,
+    event_sequence: run.eventSequence,
     type,
     remote_run_id: run.remoteRunId,
     work_session_id: run.workSessionId,
@@ -754,18 +784,17 @@ function enqueueRunEvent(run, type, payload, { allowFinalizing = false, terminal
   // Kontrol restart recoverable even if the adapter process also goes down.
   const durableTerminal = terminal
     ? spoolTerminalEvent(run.devRunId, event)
-    : Promise.resolve();
+    : spoolRunEvent(run.devRunId, event);
   const delivery = run.sendChain
     .catch((error) => recordDeliveryError(run, error))
     .then(async () => {
       await durableTerminal;
-      const acknowledged = await withRetry(() => fetch(`${KONTROL_ACP_URL}/runs/${run.devRunId}/events`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", authorization: `Bearer ${AGENT_SECRET}`, ...identityHeaders(agentIdentity) },
-        body: JSON.stringify(event),
-      }), terminal ? { retries: 3, backoff: 2000 } : { retries: 0, backoff: 0 });
+      const acknowledged = await deliverEvent(run.devRunId, event);
       if (!acknowledged) throw new Error(`event delivery failed: ${type}`);
-      if (terminal) {
+      if (!terminal) {
+        pendingEventSpool.delete(event.event_id);
+        await saveEventSpool();
+      } else {
         pendingTerminalSpool.delete(run.devRunId);
         await saveTerminalSpool();
       }
@@ -777,6 +806,17 @@ function enqueueRunEvent(run, type, payload, { allowFinalizing = false, terminal
     });
   run.sendChain = delivery;
   return run.sendChain;
+}
+
+export function createAdapterEvent(run, type, payload) {
+  return {
+    event_id: `${run.remoteRunId}:${++run.eventSequence}`,
+    event_sequence: run.eventSequence,
+    type,
+    remote_run_id: run.remoteRunId,
+    work_session_id: run.workSessionId,
+    payload,
+  };
 }
 
 function recordDeliveryError(run, error) {

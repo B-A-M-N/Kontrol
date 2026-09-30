@@ -116,6 +116,14 @@ export function registerEventRoutes(
       return;
     }
 
+    if (body.event_id && eventStore) {
+      const existing = eventStore.getEventById(body.event_id);
+      if (existing) {
+        res.status(202).json({ run_id: run.runId, status: run.status, accepted: true, duplicate: true, event_id: body.event_id });
+        return;
+      }
+    }
+
     const now = new Date().toISOString();
     if (APPROVAL_EVENT_TYPES.has(body.type)) {
       if (!approvalRequests) {
@@ -169,6 +177,7 @@ export function registerEventRoutes(
       });
       approvalIdRef.id = request.approvalId;
       eventStore?.appendEvent({
+        id: body.event_id,
         type: "approval.requested",
         sessionId: eventSessionId,
         payload: approvalToEventPayload(request),
@@ -278,12 +287,14 @@ export function registerEventRoutes(
       !TERMINAL_SESSION_STATUSES.has(session.status);
     if (sessionId && eventStore && !awaitingReviewCrash && !workflowHandledCancellation) {
       eventStore.appendEvent({
+        id: body.event_id,
         type: gatedCompletedTurn ? "worker.turn.completed" : ADAPTER_EVENT_TYPE_TO_RUN[body.type],
         sessionId,
         payload: {
           runId: run.runId,
           remoteRunId: body.remote_run_id ?? run.remoteRunId,
           workSessionId: sessionId,
+          ...(body.event_id ? { eventId: body.event_id } : {}),
           ...(body.payload ?? {}),
         },
       });

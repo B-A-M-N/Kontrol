@@ -7,7 +7,10 @@ import type { ApprovalScope } from "./policy.js";
 import type { PrincipalRole } from "./policy-enforcement.js";
 import type { ApprovalRequestManager, ApprovalRequest } from "./approval-requests.js";
 import type { WorkSessionManager } from "./work-sessions.js";
-import { workspaceAppToolMeta } from "./workspace-app-resource.js";
+import {
+  workspaceAppCallableToolMeta,
+  workspaceAppRenderToolMeta,
+} from "./workspace-app-resource.js";
 import { mutationPrincipalId, runWithMutationReceipt, type MutationReceiptStore } from "./mutation-receipts.js";
 import { mcpOwnerContextId } from "./mcp/owner-context.js";
 
@@ -35,6 +38,13 @@ function isReviewer(role?: PrincipalRole): boolean {
 }
 
 function liveOwner(config: PolicyToolConfig): string | undefined {
+  // A reviewer transport without an explicit conversation header is the
+  // global approval surface. Its disposable MCP transport identity must not
+  // hide cards created by another conversation. Conversation-scoped reviewer
+  // connections remain isolated through the durable conversation owner.
+  if (config.connectionContext && !config.connectionContext.conversationId?.trim()) {
+    return undefined;
+  }
   return mcpOwnerContextId(config.connectionContext ?? {}) ?? config.ownerContextId;
 }
 
@@ -51,8 +61,8 @@ function grantOwnedBy(config: PolicyToolConfig, grant: { principalId: string; sc
     : false;
 }
 
-function workspaceAppModelAndAppMeta() {
-  return workspaceAppToolMeta();
+function workspaceAppCallableMeta() {
+  return workspaceAppCallableToolMeta();
 }
 
 function registerMutationPolicyTool(
@@ -238,7 +248,7 @@ export function registerPolicyTools(
   server: McpServer,
   config: PolicyToolConfig,
 ): void {
-  const approvalCenterMeta = workspaceAppModelAndAppMeta();
+  const approvalCenterMeta = workspaceAppRenderToolMeta();
 
   registerAppTool(
     server,
@@ -263,7 +273,7 @@ export function registerPolicyTools(
           isError: true,
         };
       }
-      if (config.connectionContext && !liveOwner(config)) return missingOwnerResponse();
+      if (config.connectionContext && !config.connectionContext.mcpSessionId?.trim()) return missingOwnerResponse();
       const approvals = listAllApprovals(config, workspaceId);
       return {
         content: [{ type: "text" as const, text: `${approvals.length} pending approval(s).` }],
@@ -292,7 +302,7 @@ export function registerPolicyTools(
         approvals: z.array(approvalCardSchema),
         count: z.number(),
       },
-      _meta: approvalCenterMeta,
+      _meta: workspaceAppCallableMeta(),
       annotations: { readOnlyHint: true, destructiveHint: false },
     },
     async ({ workspaceId }) => {
@@ -302,7 +312,7 @@ export function registerPolicyTools(
           isError: true,
         };
       }
-      if (config.connectionContext && !liveOwner(config)) return missingOwnerResponse();
+      if (config.connectionContext && !config.connectionContext.mcpSessionId?.trim()) return missingOwnerResponse();
       const pending = listAllApprovals(config, workspaceId);
 
       return {
@@ -329,7 +339,7 @@ export function registerPolicyTools(
         clientMutationId: z.string().min(1).max(200).optional(),
       },
       outputSchema: { status: z.string(), approvalId: z.string() },
-      _meta: workspaceAppModelAndAppMeta(),
+      _meta: workspaceAppCallableMeta(),
       annotations: { readOnlyHint: false, destructiveHint: false },
     },
     config,
@@ -478,7 +488,7 @@ export function registerPolicyTools(
       outputSchema: { grants: z.array(z.object({
         id: z.string(), principalId: z.string(), scope: z.string(), scopeId: z.string(), approvalKey: z.string(), createdAt: z.string(), expiresAt: z.string().optional(), reviewerId: z.string().optional(),
       })) },
-      _meta: workspaceAppModelAndAppMeta(),
+      _meta: workspaceAppCallableMeta(),
       annotations: { readOnlyHint: true, destructiveHint: false },
     },
     async ({ scope, scopeId }) => {
@@ -505,7 +515,7 @@ export function registerPolicyTools(
         clientMutationId: z.string().min(1).max(200).optional(),
       },
       outputSchema: { status: z.string(), grantId: z.string() },
-      _meta: workspaceAppModelAndAppMeta(),
+      _meta: workspaceAppCallableMeta(),
       annotations: { readOnlyHint: false, destructiveHint: true },
     },
     config,
@@ -548,7 +558,7 @@ export function registerPolicyTools(
         clientMutationId: z.string().min(1).max(200).optional(),
       },
       outputSchema: { status: z.string(), scope: z.string(), scopeId: z.string() },
-      _meta: workspaceAppModelAndAppMeta(),
+      _meta: workspaceAppCallableMeta(),
       annotations: { readOnlyHint: false, destructiveHint: true },
     },
     config,

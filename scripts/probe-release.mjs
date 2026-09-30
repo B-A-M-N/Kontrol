@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -79,9 +79,63 @@ async function waitFor(url, child, timeoutMs = 15_000) {
   throw new Error(`timed out waiting for ${url}: ${lastError}\n${child.stderrText}`);
 }
 
+async function probeCandidateSurface(baseUrl, workspace, requiredInspectionTools) {
+  let requestId = 0;
+  let sessionId;
+  const rpc = async (method, params, { withSession = true } = {}) => {
+    const response = await fetch(`${baseUrl}/mcp`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+        ...(sessionId && withSession ? { "mcp-session-id": sessionId } : {}),
+        "x-kontrol-reviewer-token": "release-probe-reviewer",
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", id: ++requestId, method, params }),
+      signal: AbortSignal.timeout(5_000),
+    });
+    const text = await response.text();
+    const data = text.trim().split(/\r?\n/).filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trim()).join("\n");
+    const payload = JSON.parse(data || text);
+    if (method === "initialize") sessionId = response.headers.get("mcp-session-id") ?? sessionId;
+    assert.equal(response.status, 200, `${method} returned HTTP ${response.status}: ${text}`);
+    assert.ok(!payload.error, `${method}: ${payload.error?.message ?? "JSON-RPC error"}`);
+    return payload.result;
+  };
+  const initialized = await rpc("initialize", {
+    protocolVersion: "2025-06-18",
+    capabilities: {},
+    clientInfo: { name: "release-surface-probe", version: "1" },
+  }, { withSession: false });
+  assert.ok(sessionId, "candidate initialize did not return an MCP session id");
+  const listed = await rpc("tools/list", {});
+  const names = new Set((listed.tools ?? []).map((tool) => tool.name));
+  for (const required of requiredInspectionTools) {
+    assert.ok(names.has(required), `candidate tools/list is missing required inspection tool ${required}`);
+  }
+  const opened = await rpc("tools/call", { name: "open_workspace", arguments: { path: workspace, mode: "checkout" } });
+  const surface = opened.structuredContent ?? opened;
+  assert.ok(surface.workspaceId, "candidate open_workspace did not return workspaceId");
+  assert.deepEqual(surface.toolSurface?.requiredInspectionTools, requiredInspectionTools, "candidate open_workspace inspection contract mismatch");
+  for (const name of requiredInspectionTools) {
+    const result = await rpc("tools/call", { name, arguments: { workspaceId: surface.workspaceId } });
+    const value = result.structuredContent ?? result;
+    assert.notEqual(value.status, "approval_required", `${name} required policy approval during isolated release probe`);
+  }
+  if (initialized?.serverInfo?.version) {
+    assert.equal(typeof initialized.serverInfo.version, "string", "candidate initialize must publish a server version");
+  }
+  await fetch(`${baseUrl}/mcp`, { method: "DELETE", headers: { "mcp-session-id": sessionId } }).catch(() => {});
+}
+
 async function bootSmoke(artifactPath, buildId) {
   const smokeRoot = mkdtempSync(join(tmpdir(), "kontrol-release-smoke-"));
   const port = await unusedTcpPort();
+  writeFileSync(join(smokeRoot, "README.md"), "# release probe fixture\n");
+  for (const args of [["init"], ["config", "user.email", "release-probe@example.invalid"], ["config", "user.name", "Release Probe"], ["add", "README.md"], ["commit", "-m", "release probe fixture"]]) {
+    const result = spawnSync("git", args, { cwd: smokeRoot, encoding: "utf8" });
+    if (result.status !== 0) throw new Error(`git fixture setup failed: ${result.stderr || result.stdout}`);
+  }
   const env = buildToolEnvironment(process.env, {
     // The boot smoke IS a launcher: it deliberately establishes this
     // release's runtime identity. Everything else inherits the tool allowlist.
@@ -99,6 +153,7 @@ async function bootSmoke(artifactPath, buildId) {
     // boundary; the ask baseline would trip the tunnel reviewer gate.
     KONTROL_POLICY_MODE: "allow",
     KONTROL_TUNNEL_DOCTOR: "false",
+    KONTROL_ACP_REVIEWER_SECRET: "release-probe-reviewer",
     KONTROL_EXPECTED_BUILD_ID: buildId,
     KONTROL_ARTIFACT_PATH: artifactPath,
     KONTROL_LAUNCHER: "release-smoke",
@@ -133,6 +188,8 @@ async function bootSmoke(artifactPath, buildId) {
       signal: AbortSignal.timeout(3_000),
     });
     assert.equal(response.status, 200, `candidate MCP initialize returned HTTP ${response.status}`);
+    const toolNamesModule = await import(pathToFileURL(join(artifactPath, "mcp", "tool-names.js")).href);
+    await probeCandidateSurface(`http://127.0.0.1:${port}`, smokeRoot, [...toolNamesModule.REQUIRED_INSPECTION_TOOLS]);
   } finally {
     if (child.exitCode === null) child.kill("SIGTERM");
     await new Promise((resolvePromise) => {

@@ -14,6 +14,8 @@ import type { McpSessionLifecycle } from "./mcp-session-lifecycle.js";
 import type { McpPolicyWaiterRegistry } from "./policy-waiters.js";
 import type { McpSessionState, WorkspaceAppResourceMetrics } from "./mcp-session-state.js";
 import type { McpAdmission } from "./mcp-admission.js";
+import type { ExpiredMcpOperationTracker } from "./mcp-expired-operations.js";
+import type { McpOperationDiagnostics } from "./mcp-operation-diagnostics.js";
 import type { Request, Response } from "express";
 import { toolListCacheDiagnostics } from "../mcp-tool-list-cache.js";
 import { readMcpToolSurface } from "../mcp/tool-names.js";
@@ -24,9 +26,28 @@ export interface DiagnosticsDeps {
   readonly mcpAdmission: McpAdmission;
   readonly mcpWaiterAdmission: McpAdmission;
   readonly mcpResourceAdmission: McpAdmission;
+  readonly expiredMcpOperations: ExpiredMcpOperationTracker;
+  readonly operationDiagnostics: McpOperationDiagnostics;
   readonly sessionLifecycle: McpSessionLifecycle;
   readonly policyWaiters: McpPolicyWaiterRegistry;
   readonly workspaceAppResourceMetrics: WorkspaceAppResourceMetrics;
+  readonly mcpConnectionMetrics: {
+    unknownSessionRequests: number;
+    freshInitializations: number;
+    reconnectAttempts: number;
+    reconnects: number;
+    watcherRequests: number;
+    watcherCompletions: number;
+    watcherAborts: number;
+    responseChannelClosures: number;
+    explicitDeletes: number;
+    admissionExhaustions: number;
+    stalledSseWriters: number;
+    transportClosures: number;
+    events: Record<string, number>;
+    byGeneration: Record<string, Record<string, number>>;
+    byTransport: Record<string, Record<string, number>>;
+  };
   readonly logicalContinuity: { size(): number; snapshot(): unknown };
   readonly startupRecovery: Record<string, unknown>;
   readonly databaseIntegrity: unknown;
@@ -136,8 +157,9 @@ export async function handleDiagnostics(deps: DiagnosticsDeps, req: Request, res
         waiter: waiterAdmission,
         resource: resourceAdmission,
       },
-        executionAdmission: {
+      executionAdmission: {
           ...executionAdmission,
+          expiredOperations: deps.expiredMcpOperations.snapshot(),
           capacityRejectionsByTool: sessionLifecycle.mapNumberCounts(sessionLifecycle.capacityRejectionsByTool),
           capacityRejectionsByWeight: sessionLifecycle.mapNumberCounts(sessionLifecycle.capacityRejectionsByWeight),
           lastRejection: sessionLifecycle.lastCapacityRejection(),
@@ -150,6 +172,8 @@ export async function handleDiagnostics(deps: DiagnosticsDeps, req: Request, res
       memoryEstimate: sessionLifecycle.estimateMcpSessionMemoryCost(),
       reuse: sessionLifecycle.mcpSessionReuseMetrics(),
       terminationReasons: sessionLifecycle.mcpSessionTerminationMetrics(),
+      connectionRecovery: { ...deps.mcpConnectionMetrics },
+      operationDiagnostics: deps.operationDiagnostics.snapshot(),
       policy: {
         unusedSessionIdleMs: config.mcpUnusedSessionIdleMs,
         ephemeralSessionIdleMs: config.mcpEphemeralSessionIdleMs,

@@ -33,6 +33,8 @@ import { callServerToolChecked, getStructuredContent } from "./server-tool-call.
 import type { App } from "@modelcontextprotocol/ext-apps";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 
+export const WORKSPACE_EVENT_WAIT_MS = 18_000;
+
 export interface HydrationHost {
   getApp(): App | null;
   scheduleRender(): void;
@@ -89,7 +91,15 @@ export async function rehydrateActiveSessions(): Promise<void> {
 
   try {
     const pagedSessions = new Map<string, WorkspaceSurfaceSession>();
-    let surfaceLastSeq = 0;
+    // Establish one authoritative watermark before paginating. A later page
+    // must never advance the cursor merely because it was read later; events
+    // committed after this boundary are replayed below by sequence.
+    let snapshotWatermark: number | undefined;
+    const boundaryResult = await callServerToolChecked({
+      name: "get_workspace_session_surface",
+      arguments: { workspaceId, filter: "all", limit: 1 },
+    });
+    snapshotWatermark = getStructuredContent<{ lastSeq?: number }>(boundaryResult)?.lastSeq ?? 0;
     const loadSurface = async (filter: "all" | "pending_review" | "live", pageSize: number, maxPages: number): Promise<void> => {
       let afterUpdatedAt: string | undefined;
       let afterSessionId: string | undefined;
@@ -104,7 +114,7 @@ export async function rehydrateActiveSessions(): Promise<void> {
           },
         });
         const surfaceContent = getStructuredContent<{ lastSeq?: number; sessions: WorkspaceSurfaceSession[] }>(surfaceResult);
-        surfaceLastSeq = Math.max(surfaceLastSeq, surfaceContent?.lastSeq ?? 0);
+        if (snapshotWatermark === undefined) snapshotWatermark = surfaceContent?.lastSeq ?? 0;
         const pageSessions = surfaceContent?.sessions ?? [];
         for (const session of pageSessions) pagedSessions.set(session.sessionId, session);
         if (pageSessions.length < pageSize) break;
@@ -126,10 +136,32 @@ export async function rehydrateActiveSessions(): Promise<void> {
     await loadSurface("pending_review", 50, HYDRATION_MAX_SESSIONS / 50);
     await loadSurface("all", 25, 1);
     if (!host.getApp() || host.getActiveWorkspaceId() !== workspaceId) return;
+    const replayWatermark = snapshotWatermark ?? 0;
+    let replaySeq = replayWatermark;
+    {
+      // The event waiter subscribes before querying, so an event committed
+      // during the page walk is returned even when it was not in any page.
+      const replayResult = await callServerToolChecked({
+        name: "await_workspace_events",
+        arguments: { workspaceId, afterSeq: replayWatermark, timeoutMs: 1_000 },
+      });
+      if (!host.getApp() || host.getActiveWorkspaceId() !== workspaceId) return;
+      const replay = getStructuredContent<{ events?: AgentActivityEvent[]; nextSeq?: number }>(replayResult);
+      for (const event of replay?.events ?? []) {
+        if (event.seq <= replayWatermark || event.seq <= replaySeq) continue;
+        replaySeq = event.seq;
+        const target = workspaceEventTargetSessionId(event);
+        if (!workSessionViews.has(target)) ensureWorkSessionView(target, event.workspaceSessionId ?? workspaceId, "");
+        reduceWorkSessionEvent(target, event);
+      }
+    }
+    if (!host.getApp() || host.getActiveWorkspaceId() !== workspaceId) return;
     const sessions = [...pagedSessions.values()].sort(
       (a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt),
     );
-    host.setWorkspaceEventCursor(Math.max(host.workspaceEventCursor(), surfaceLastSeq));
+    // The cursor is the fixed boundary plus only explicitly replayed events;
+    // page-response cursors never advance it by themselves.
+    host.setWorkspaceEventCursor(Math.max(host.workspaceEventCursor(), replaySeq));
 
     for (const s of sessions) {
       const view = ensureWorkSessionView(s.sessionId, s.workspaceSessionId, s.runId ?? "");
@@ -142,7 +174,7 @@ export async function rehydrateActiveSessions(): Promise<void> {
       view.runtimeState = s.runtimeState;
       view.unresolvedMessageCount = s.unresolvedMessageCount;
       view.pendingApprovalCount = s.pendingApprovalCount;
-      view.lastSeq = s.lastSeq;
+      view.lastSeq = Math.max(view.lastSeq, s.lastSeq);
       view.latestFeedback = s.latestFeedback;
       if (s.latestSubmission) {
         const surfaceSubmission: ReviewSubmissionView = {
@@ -656,7 +688,7 @@ export async function watchWorkspaceEvents(workspaceId: string, initialSeq: numb
     try {
       const result = await callServerToolChecked({
         name: "await_workspace_events",
-        arguments: { workspaceId, afterSeq: cursor, timeoutMs: 55000 },
+        arguments: { workspaceId, afterSeq: cursor, timeoutMs: WORKSPACE_EVENT_WAIT_MS },
       });
       if (host.workspaceWatcherGeneration() !== generation || host.getActiveWorkspaceId() !== workspaceId) return;
       retryDelayMs = 1_000;

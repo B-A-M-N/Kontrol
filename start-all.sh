@@ -697,7 +697,7 @@ fi
 if node -e 'const fs=require("node:fs"); const value=JSON.parse(fs.readFileSync(0,"utf8")); const mode=value.toolRules?.bash ?? value.defaultMode; process.exit(mode === "allow" ? 0 : 1)' <<<"$EFFECTIVE_POLICY_JSON"; then
   PROBE_FLAGS+=(--probe-bash)
 fi
-if ! node scripts/probe-kontrol-readiness.mjs \
+if ! node --import tsx scripts/probe-kontrol-readiness.mjs \
   --url "http://${DEV_HOST}:${DEV_PORT}/mcp" \
   --workspace "$PWD" \
   "${PROBE_FLAGS[@]}" \
@@ -762,6 +762,7 @@ fi
 
 echo "[*] Starting persistent component supervisor ..."
 SUPERVISOR_STATUS_FILE="${KONTROL_STATE_DIR:-$DESKTOP_PWD/.kontrol-state}/supervisor-status.json"
+SUPERVISOR_STARTUP_EPOCH_MS="$(date +%s%3N)"
 SUPERVISOR_ARGS=(
   --root "$DESKTOP_PWD"
   --kontrol-url "http://${DEV_HOST}:${DEV_PORT}"
@@ -776,6 +777,11 @@ SUPERVISOR_ARGS=(
   --start-crush "$START_CRUSH_ADAPTER"
   --start-hermes "$([[ "$START_HERMES_ADAPTER" != "false" ]] && echo true || echo false)"
   --runtime-lock-token "$RUNTIME_LOCK_TOKEN"
+  --mcp-canary-url "${KONTROL_MCP_CANARY_URL:-${KONTROL_PUBLIC_BASE_URL:-}}"
+  --mcp-canary-workspace "$DESKTOP_PWD"
+  --mcp-canary-read-path "${KONTROL_MCP_CANARY_READ_PATH:-AGENTS.md}"
+  --mcp-canary-authorization-file "${KONTROL_MCP_CANARY_AUTH_FILE:-}"
+  --mcp-canary-expected-version "$MCP_TOOL_SURFACE_VERSION"
 )
 if [[ -n "${REQUIRED_AGENT_CONFIG:-}" ]]; then
   SUPERVISOR_ARGS+=(--agents "$REQUIRED_AGENT_CONFIG")
@@ -790,9 +796,39 @@ LAUNCHED_SESSIONS+=("kontrol-supervisor")
 echo -n "[*] Waiting for component supervisor"
 SUPERVISOR_READY=0
 for _ in $(seq 1 20); do
-  if [[ -s "$SUPERVISOR_STATUS_FILE" ]] && grep -q '"state": "healthy"' "$SUPERVISOR_STATUS_FILE"; then
-    SUPERVISOR_READY=1
-    break
+  if [[ -s "$SUPERVISOR_STATUS_FILE" ]] && tmux has-session -t kontrol-supervisor 2>/dev/null; then
+    if node -e '
+      const fs = require("node:fs");
+      const [path, expectedGeneration, expectedBuild, startupMs] = process.argv.slice(1);
+      try {
+        const status = JSON.parse(fs.readFileSync(path, "utf8"));
+        const pid = Number(status.pid);
+        const linuxIdentity = process.platform === "linux";
+        let live = false;
+        let liveToken = "";
+        if (linuxIdentity) {
+          const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+          const close = stat.lastIndexOf(")");
+          const fields = close >= 0 ? stat.slice(close + 2).trim().split(/\s+/) : [];
+          liveToken = fields[19] ? `proc:${fields[19]}` : "";
+          live = Boolean(liveToken);
+        } else {
+          process.kill(pid, 0);
+          live = true;
+        }
+        const updatedAt = Date.parse(status.updatedAt || "");
+        const valid = status.state === "healthy"
+          && status.generationId === expectedGeneration
+          && (!expectedBuild || status.expectedBuildId === expectedBuild)
+          && Number.isInteger(pid) && pid > 1 && live
+          && (!linuxIdentity || (status.processStartToken === liveToken && status.processStartToken))
+          && Number.isFinite(updatedAt) && updatedAt >= Number(startupMs);
+        process.exit(valid ? 0 : 1);
+      } catch { process.exit(1); }
+    ' "$SUPERVISOR_STATUS_FILE" "$LAUNCH_GENERATION_ID" "$EXPECTED_BUILD_ID" "$SUPERVISOR_STARTUP_EPOCH_MS"; then
+      SUPERVISOR_READY=1
+      break
+    fi
   fi
   echo -n "."
   sleep 1
@@ -810,6 +846,25 @@ fi
 SUPERVISOR_PID="$(tmux list-panes -t kontrol-supervisor -F '#{pane_pid}' 2>/dev/null | head -n 1 || true)"
 if [[ ! "$SUPERVISOR_PID" =~ ^[0-9]+$ ]]; then
   echo "ERROR: could not identify the persistent supervisor process for lock handoff." >&2
+  return 1
+fi
+if ! node -e '
+  const fs = require("node:fs");
+  const [path, panePid] = process.argv.slice(1);
+  try {
+    const status = JSON.parse(fs.readFileSync(path, "utf8"));
+    if (Number(status.pid) !== Number(panePid)) process.exit(1);
+    if (process.platform !== "linux") {
+      process.kill(Number(panePid), 0);
+      process.exit(0);
+    }
+    const stat = fs.readFileSync(`/proc/${Number(panePid)}/stat`, "utf8");
+    const close = stat.lastIndexOf(")");
+    const fields = close >= 0 ? stat.slice(close + 2).trim().split(/\s+/) : [];
+    process.exit(status.processStartToken === (fields[19] ? `proc:${fields[19]}` : "") ? 0 : 1);
+  } catch { process.exit(1); }
+' "$SUPERVISOR_STATUS_FILE" "$SUPERVISOR_PID"; then
+  echo "ERROR: supervisor status is not owned by the live tmux supervisor process." >&2
   return 1
 fi
 node --import tsx src/runtime-lock.ts update \
@@ -1019,7 +1074,10 @@ on_exit() {
   fi
   if [[ "$STARTUP_COMMITTED" != "1" && "$DEPLOYMENT_LOCK_VALIDATED" == "1" && ("$CANDIDATE_ACTIVATION_ATTEMPTED" == "1" || "${#LAUNCHED_SESSIONS[@]}" -gt 0 || "$RUNTIME_LOCK_OWNED" == "1") ]]; then
     rollback
-    if [[ "$ROLLBACK_SUCCEEDED" == "1" ]]; then status=0; fi
+    if [[ "$ROLLBACK_SUCCEEDED" == "1" ]]; then
+      write_deployment_record "committed" "requested candidate failed; previous generation restored" "rolled_back" || true
+      status=1
+    fi
   fi
   if [[ "$status" != "0" && "$STARTUP_COMMITTED" != "1" ]]; then
     write_deployment_record "failed" "deployment exited without a committed healthy generation" "failed" || true

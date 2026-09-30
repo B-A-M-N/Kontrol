@@ -1,0 +1,11 @@
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+const hub = readFileSync("src/acp/http/sse-hub.ts", "utf8");
+const routes = readFileSync("src/acp/http/run-routes.ts", "utf8");
+const events = readFileSync("src/acp/http/event-routes.ts", "utf8");
+assert.match(hub, /res\.once\("close", remove\)/, "SSE cleanup is response-close based");
+assert.doesNotMatch(hub, /req\.on\("close"/, "request close cannot remove an open response stream");
+assert.match(hub, /afterId/, "SSE supports cursor replay");
+assert.match(routes, /unsupported_stream/, "remote streaming is explicitly rejected instead of returning JSON");
+assert.match(events, /getEventById\(body\.event_id\)/, "adapter retry delivery is deduplicated server-side");
+console.log("acp-streaming-contract.test.ts: all assertions passed");

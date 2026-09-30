@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "./server.js";
 import { loadConfig } from "./config.js";
+import { startMcpSseHeartbeat, type McpSseHeartbeatResponse } from "./server/mcp-sse-heartbeat.js";
 import { WORKSPACE_APP_URI } from "./workspace-app-resource.js";
 
 const root = mkdtempSync(join(tmpdir(), "kontrol-mcp-sse-admission-root-"));
@@ -130,6 +132,44 @@ async function waitFor(predicate: () => Promise<boolean>, timeoutMs = 2000): Pro
   assert.fail("timed out waiting for MCP SSE state to settle");
 }
 
+class RepeatedBackpressureResponse extends EventEmitter implements McpSseHeartbeatResponse {
+  readonly destroyed = false;
+  readonly writableEnded = false;
+  writes = 0;
+
+  write(_chunk: string): boolean {
+    this.writes++;
+    return this.writes >= 3;
+  }
+}
+
+async function waitForHeartbeatState(predicate: () => boolean): Promise<void> {
+  const deadline = Date.now() + 1_000;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+  assert.fail("timed out waiting for repeated SSE backpressure recovery");
+}
+
+const backpressureResponse = new RepeatedBackpressureResponse();
+let heartbeatStalls = 0;
+let heartbeatDrains = 0;
+const stopTestHeartbeat = startMcpSseHeartbeat(
+  backpressureResponse,
+  2,
+  () => heartbeatStalls++,
+  () => heartbeatDrains++,
+);
+await waitForHeartbeatState(() => heartbeatStalls === 1);
+backpressureResponse.emit("drain");
+await waitForHeartbeatState(() => heartbeatStalls === 2);
+backpressureResponse.emit("drain");
+await waitForHeartbeatState(() => backpressureResponse.writes >= 3);
+assert.equal(heartbeatDrains, 2, "the same SSE response must recover from repeated drain events");
+stopTestHeartbeat();
+assert.equal(backpressureResponse.listenerCount("drain"), 0, "stopping the heartbeat removes its drain listener");
+
 const sessions: SseSession[] = [];
 try {
   // Three persistent SSE transports consume three slots in the old design.
@@ -171,6 +211,18 @@ try {
   assert.equal(snapshot.mcpSessionMetrics.executionAdmission.activeWeight, 0, "persistent SSE must not consume execution weight");
   assert.equal(snapshot.mcpSessionMetrics.executionAdmission.availableWeight, 4);
 
+  const concurrentResourceReads = await Promise.all([
+    rpc("resources/read", { uri: WORKSPACE_APP_URI }, sessions[0].sessionId),
+    rpc("resources/read", { uri: WORKSPACE_APP_URI }, sessions[0].sessionId),
+  ]);
+  assert.ok(
+    concurrentResourceReads.every((result) => result.response.status === 200 || result.response.status === 503),
+    JSON.stringify(concurrentResourceReads.map((result) => ({ status: result.response.status, error: result.payload?.error }))),
+  );
+  assert.ok(concurrentResourceReads.some((result) => result.response.status === 200), "at least one concurrent resource read must complete");
+  snapshot = await diagnostics();
+  assert.equal(snapshot.mcpSessionMetrics.inFlight, 0, "concurrent Workspace App resource reads must release session execution counts");
+
   const read = await rpc("tools/call", {
     name: "read",
     arguments: { workspaceId: sessions[0].workspaceId, path: "marker.txt" },
@@ -189,6 +241,24 @@ try {
   assert.equal(snapshot.mcpSessionMetrics.activeSseStreams, 2);
   assert.equal(snapshot.mcpSessionMetrics.executionAdmission.activeWeight, 0);
   assert.equal(snapshot.mcpSessionMetrics.executionAdmission.capacityRejectionsByTool.bash ?? 0, 0);
+
+  const slowBash = rpc("tools/call", {
+    name: "bash",
+    arguments: { workspaceId: sessions[0].workspaceId, command: "sleep 0.5; printf admission-ok", timeout: 5 },
+  }, sessions[0].sessionId);
+  await waitFor(async () => (await diagnostics()).mcpSessionMetrics.executionAdmission.activeWeight === 3);
+  const rejectedBash = await rpc("tools/call", {
+    name: "bash",
+    arguments: { workspaceId: sessions[0].workspaceId, command: "printf should-not-run", timeout: 5 },
+  }, sessions[0].sessionId);
+  assert.equal(rejectedBash.response.status, 503, "a request denied by execution admission should return capacity exhaustion");
+  snapshot = await diagnostics();
+  assert.equal(snapshot.mcpSessionMetrics.inFlight, 1, "admission rejection must release its session count while the admitted request remains active");
+  const slowBashResult = await slowBash;
+  assert.equal(slowBashResult.response.status, 200, JSON.stringify(slowBashResult.payload));
+  await waitFor(async () => (await diagnostics()).mcpSessionMetrics.inFlight === 0);
+  snapshot = await diagnostics();
+  assert.equal(snapshot.mcpSessionMetrics.executionAdmission.capacityRejectionsByTool.bash ?? 0, 1);
 
   for (const session of sessions) {
     if (session.stream) await closeSse(session.sessionId, session.stream);
@@ -216,6 +286,7 @@ try {
       snapshot = await diagnostics();
       assert.equal(snapshot.mcpSessionMetrics.executionAdmission.availableWeight, 4, `execution capacity drifted at churn ${index}`);
       assert.equal(snapshot.mcpSessionMetrics.executionAdmission.activeWeight, 0, `execution permit leaked at churn ${index}`);
+      assert.equal(snapshot.mcpSessionMetrics.inFlight, 0, `session execution accounting drifted at churn ${index}`);
     }
   }
 
@@ -225,6 +296,7 @@ try {
   assert.equal(snapshot.mcpSessionMetrics.executionAdmission.availableWeight, 4);
   assert.equal(snapshot.mcpSessionMetrics.admission.execution.activeWeight, 0);
   assert.equal(snapshot.mcpSessionMetrics.admission.execution.availableWeight, 4);
+  assert.equal(snapshot.mcpSessionMetrics.inFlight, 0, "resource and tool churn must leave no phantom in-flight requests");
   console.log("mcp-sse-admission.test.ts: all assertions passed");
 } finally {
   for (const session of sessions) {

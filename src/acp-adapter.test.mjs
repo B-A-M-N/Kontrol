@@ -66,6 +66,14 @@ try {
     await t("synthetic smoke has started and completed lifecycle stages", () => {
       assert.deepEqual(mod.SMOKE_LIFECYCLE_EVENTS, ["started", "completed"]);
     });
+    await t("adapter events carry stable sequence identities", () => {
+      const run = { remoteRunId: "crush-test", eventSequence: 0 };
+      const first = mod.createAdapterEvent(run, "output_delta", { text: "a" });
+      const second = mod.createAdapterEvent(run, "output_delta", { text: "b" });
+      assert.equal(first.event_id, "crush-test:1");
+      assert.equal(second.event_id, "crush-test:2");
+      assert.equal(first.event_sequence < second.event_sequence, true);
+    });
   }
 
   // ── Fail-closed workspace root validation (P0 #6) ──

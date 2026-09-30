@@ -61,13 +61,19 @@ enforces it mechanically inside the publish path:
 4. **12-hour wall-clock soak against that exact `buildId`** —
    `npm run soak:beta -- --hours 12 --build-id <buildId> ...`. Never rebuild
    between soak and publish: the soak qualifies one immutable artifact.
-5. **Final joined receipt** — `npm run gate:beta:final` writes
+5. **Fresh external catalog probe** — capture one host-side `initialize` and
+   `tools/list` exchange after deploying the candidate, then run
+   `scripts/probe-mcp-tunnel.mjs` with `--host-catalog-file`,
+   `--expected-mcp-version`, `--expected-build-id`, and `--result-file` after
+   the soak ends. The probe opens a fresh server transport and fails on stale
+   versions or any missing/extra invocable tool.
+6. **Final joined receipt** — `npm run gate:beta:final` writes
    `beta-qualification.json` with `stage=combined, qualified=true` only when
-   code receipt, soak receipt, candidate identity, and clean checkout all
-   match.
-6. **Release verification** — `npm run release:verify` (receipt ↔ buildId ↔
+   code receipt, soak receipt, external catalog receipt, candidate identity,
+   and clean checkout all match.
+7. **Release verification** — `npm run release:verify` (receipt ↔ buildId ↔
    source SHA ↔ artifact, release-local import validation, clean checkout).
-7. **Staged package UAT** — the packed tarball installed into a clean prefix
+8. **Staged package UAT** — the packed tarball installed into a clean prefix
    and exercised end-to-end (`npm run test:package`,
    `scripts/release-uat.mjs`).
 
@@ -79,17 +85,26 @@ git status --porcelain   # must be empty
 npm run gate:beta:code
 
 # 3–4. deploy the EXACT immutable buildId and soak it
-npm run soak:beta -- --hours 12 --build-id <buildId> \
+npm run soak:beta -- --hours 12 --url "$KONTROL_PUBLIC_BASE_URL" --workspace-path "$PWD" --build-id <buildId> \
   --diagnostics-secret "$KONTROL_DIAGNOSTICS_SECRET" \
   --tunnel-url http://127.0.0.1:8080
 
-# 5. join the receipts
+# 5. capture a fresh host catalog after soak completion, then probe the same URL
+npm run probe:tunnel -- --url "$KONTROL_PUBLIC_BASE_URL" --workspace "$PWD" --dual --cycles 1 \
+  --watcher-timeout-ms 18000 --heartbeat-count 2 --minimum-drain-events 2 \
+  --resource-load-reads 2 --diagnostics-secret "$KONTROL_DIAGNOSTICS_SECRET" \
+  --host-catalog-file external-tools-list.json \
+  --expected-mcp-version VERSION_PLUS_CONTENT_SHA \
+  --expected-build-id <buildId> \
+  --result-file beta-external-catalog.json
+
+# 6. join the receipts
 npm run gate:beta:final
 
-# 6. verify the qualified candidate
+# 7. verify the qualified candidate
 npm run release:verify
 
-# 7. publish the exact qualified artifact (never rebuilds)
+# 8. publish the exact qualified artifact (never rebuilds)
 KONTROL_QUALIFIED_CANDIDATE=releases/<buildId> \
 KONTROL_RELEASE_BUILD_ID=<buildId> \
 npm run release:publish

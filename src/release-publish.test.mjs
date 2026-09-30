@@ -128,6 +128,7 @@ function receipt(head, overrides = {}) {
     stage: "combined",
     status: "qualified",
     qualified: true,
+    checks: { externalCatalogFresh: true },
     createdAt: new Date().toISOString(),
     candidate: {
       buildId: BUILD_ID,
@@ -197,6 +198,18 @@ writeFileSync(join(clean.root, "beta-qualification.json"), `${JSON.stringify(rec
     publishRun(root, ["--publish", "--skip-build", "--candidate", join("releases", BUILD_ID)]),
     "unqualified receipt",
     /not qualified/,
+  );
+}
+
+// ── 2b. legacy or stale host-catalog receipt ──
+{
+  const { root } = makeCheckout("missing-external-catalog");
+  writeCandidate(root, BUILD_ID, HEAD);
+  writeFileSync(join(root, "beta-qualification.json"), `${JSON.stringify(receipt(HEAD, { checks: {} }))}\n`);
+  assertRefused(
+    publishRun(root, ["--publish", "--skip-build", "--candidate", join("releases", BUILD_ID)]),
+    "missing external catalog evidence",
+    /fresh external-host catalog parity/,
   );
 }
 

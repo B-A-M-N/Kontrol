@@ -109,6 +109,8 @@ import { createMcpSessionLifecycle } from "./server/mcp-session-lifecycle.js";
 import { healthz, readinessChecks, sendReadiness } from "./server/readiness.js";
 import { handleDiagnostics } from "./server/diagnostics.js";
 import { handleMcpHttpRequest, type McpHttpDeps } from "./server/mcp-http.js";
+import { ExpiredMcpOperationTracker } from "./server/mcp-expired-operations.js";
+import { McpOperationDiagnostics } from "./server/mcp-operation-diagnostics.js";
 import {
   handleMcpRequestWithDeadline,
   McpAdmission,
@@ -254,7 +256,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     config.mcpMaxWaiterQueue,
   );
   // P0 resource admission: dedicated, deliberately small pool for Workspace
-  // App resource reads (~10 MB serializations). Independent of execution and
+  // App resource reads (multi-megabyte serializations). Independent of execution and
   // waiter pools in both directions — resource traffic must not starve coding
   // work, and coding traffic must not be able to evict resource reads.
   const mcpResourceAdmission = new McpAdmission(
@@ -262,8 +264,12 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     config.mcpMaxResourceReadsPerClient,
     config.mcpMaxResourceReadQueue,
   );
+  const expiredMcpOperations = new ExpiredMcpOperationTracker();
+  const operationDiagnostics = new McpOperationDiagnostics();
   const workspaceAppResourceMetrics: WorkspaceAppResourceMetrics = {
     currentHashed: 0,
+    previousHashed: 0,
+    staleHashMisses: 0,
     openAiCompatibility: 0,
     legacyKontrol: 0,
     devDesktopMigration: 0,
@@ -271,6 +277,9 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     lastDurationMs: 0,
     maxDurationMs: 0,
     admissionRejections: 0,
+    serializationFailures: 0,
+    compressionFailures: 0,
+    transmissionFailures: 0,
     active: 0,
     maxActive: 0,
     lastWireBytes: 0,
@@ -328,6 +337,11 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     logicalContinuity,
     processSessions,
     workspaceAppResourceMetrics,
+    isDurableWorkerSessionActive: (state) => {
+      if (!state.durableWorkerSession || !state.workSessionId) return state.durableWorkerSession;
+      const workSession = workSessions.get(state.workSessionId);
+      return workSession?.lifecycle === "active_worker" || workSession?.status === "resuming";
+    },
     clearWorkspaceSessionState: (sessionId) => workspaces.clearSessionState(sessionId),
   });
   const {
@@ -535,6 +549,53 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
   const supervisorWake = (workSessionId: string): void => {
     supervisorRuntime?.wake(workSessionId);
   };
+  const mcpConnectionMetrics = {
+    unknownSessionRequests: 0,
+    freshInitializations: 0,
+    reconnectAttempts: 0,
+    reconnects: 0,
+    watcherRequests: 0,
+    watcherCompletions: 0,
+    watcherAborts: 0,
+    responseChannelClosures: 0,
+    explicitDeletes: 0,
+    admissionExhaustions: 0,
+    stalledSseWriters: 0,
+    transportClosures: 0,
+    events: {} as Record<string, number>,
+    byGeneration: {} as Record<string, Record<string, number>>,
+    byTransport: {} as Record<string, Record<string, number>>,
+  };
+  const recordMcpConnectionEvent = (event: { kind: string; sessionId?: string; requestKind?: string; durationMs?: number }): void => {
+    const kind = event.kind;
+    mcpConnectionMetrics.events[kind] = (mcpConnectionMetrics.events[kind] ?? 0) + 1;
+    const generation = config.launchGenerationId || "unknown-generation";
+    const transport = event.sessionId ? (sessionIdPrefix(event.sessionId) ?? "sessionless") : "sessionless";
+    const increment = (groups: Record<string, Record<string, number>>, key: string): void => {
+      if (!groups[key] && Object.keys(groups).length >= 200) delete groups[Object.keys(groups)[0]];
+      const bucket = groups[key] ?? (groups[key] = {});
+      bucket[kind] = (bucket[kind] ?? 0) + 1;
+      if (event.requestKind) {
+        const requestKey = `${kind}:${event.requestKind}`;
+        bucket[requestKey] = (bucket[requestKey] ?? 0) + 1;
+      }
+      if (event.durationMs !== undefined) {
+        const durationKey = `${kind}:durationMsTotal`;
+        bucket[durationKey] = (bucket[durationKey] ?? 0) + Math.max(0, event.durationMs);
+      }
+    };
+    increment(mcpConnectionMetrics.byGeneration, generation);
+    increment(mcpConnectionMetrics.byTransport, transport);
+    if (kind === "watcher_started") mcpConnectionMetrics.watcherRequests++;
+    if (kind === "reconnect_attempt") mcpConnectionMetrics.reconnectAttempts++;
+    if (kind === "watcher_completed") mcpConnectionMetrics.watcherCompletions++;
+    if (kind === "watcher_aborted") mcpConnectionMetrics.watcherAborts++;
+    if (kind === "response_channel_closed") mcpConnectionMetrics.responseChannelClosures++;
+    if (kind === "explicit_delete") mcpConnectionMetrics.explicitDeletes++;
+    if (kind === "admission_exhaustion") mcpConnectionMetrics.admissionExhaustions++;
+    if (kind === "sse_writer_stalled") mcpConnectionMetrics.stalledSseWriters++;
+    if (kind === "transport_closed") mcpConnectionMetrics.transportClosures++;
+  };
 
   const mcpHttpDeps = {
     config,
@@ -546,8 +607,23 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     mcpAdmission,
     mcpWaiterAdmission,
     mcpResourceAdmission,
+    expiredMcpOperations,
+    operationDiagnostics,
     sessionLifecycle,
     workspaceAppResourceMetrics,
+    recordUnknownSessionRequest: (sessionId: string) => {
+      mcpConnectionMetrics.unknownSessionRequests++;
+      recordMcpConnectionEvent({ kind: "unknown_session_404", sessionId, requestKind: "stale_transport" });
+    },
+    recordFreshInitialization: (reconnected: boolean, durationMs?: number) => {
+      mcpConnectionMetrics.freshInitializations++;
+      recordMcpConnectionEvent({ kind: "fresh_initialization", requestKind: "initialize", durationMs });
+      if (reconnected) {
+        mcpConnectionMetrics.reconnects++;
+        recordMcpConnectionEvent({ kind: "reconnect_success", requestKind: "initialize", durationMs });
+      }
+    },
+    recordMcpConnectionEvent,
     trackSocketAbort,
     bearerAuth: () => bearerAuth,
     resourceServerUrl: () => resourceServerUrl,
@@ -610,9 +686,12 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     mcpAdmission,
     mcpWaiterAdmission,
     mcpResourceAdmission,
+    expiredMcpOperations,
+    operationDiagnostics,
     sessionLifecycle,
     policyWaiters,
     workspaceAppResourceMetrics,
+    mcpConnectionMetrics,
     logicalContinuity,
     startupRecovery,
     databaseIntegrity,

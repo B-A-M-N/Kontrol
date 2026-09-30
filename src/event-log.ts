@@ -32,6 +32,7 @@ interface TelemetryBuffer {
   sessionId: string;
   type: string;
   items: Array<Record<string, unknown>>;
+  eventIds: Set<string>;
   bytes: number;
   timer?: ReturnType<typeof setTimeout>;
   publish: boolean;
@@ -48,6 +49,7 @@ export type EventStoreTimingCallback = (phase: string, durationMs: number) => vo
 
 export interface EventStore {
  appendEvent(input: {
+   id?: string;
    type: string;
    sessionId: string;
    workspaceSessionId?: string;
@@ -57,6 +59,9 @@ export interface EventStore {
  publishEvents(events: EventStoreEvent[]): void;
 
  getEventsForSession(sessionId: string): EventStoreEvent[];
+
+ /** Exact adapter event lookup for idempotent retry handling. */
+ getEventById(eventId: string): EventStoreEvent | undefined;
 
  /**
   * Durable events strictly after a given seq. Used by the blocking
@@ -201,6 +206,7 @@ export function createEventStore(
   }
 
   function insertEvent(input: {
+    id?: string;
     type: string;
     sessionId: string;
     workspaceSessionId?: string;
@@ -209,15 +215,21 @@ export function createEventStore(
   }): EventStoreEvent {
     const startedAt = performance.now();
     const now = new Date().toISOString();
-    const id = randomUUID();
+    const id = input.id ?? randomUUID();
     const correlation = resolveWorkspaceCorrelation(input.sessionId, input.workspaceSessionId);
 
-    database.sqlite
-      .prepare(
-        `insert into event_log (id, type, session_id, workspace_session_id, payload, created_at)
-         values (?, ?, ?, ?, ?, ?)`,
-      )
-      .run(id, input.type, input.sessionId, correlation.workspaceSessionId ?? null, JSON.stringify(input.payload), now);
+    try {
+      database.sqlite
+        .prepare(
+          `insert into event_log (id, type, session_id, workspace_session_id, payload, created_at)
+           values (?, ?, ?, ?, ?, ?)`,
+        )
+        .run(id, input.type, input.sessionId, correlation.workspaceSessionId ?? null, JSON.stringify(input.payload), now);
+    } catch (error) {
+      const existing = getEventById(id);
+      if (existing) return existing;
+      throw error;
+    }
 
     const seq = (database.sqlite.prepare("select last_insert_rowid() as seq").get() as { seq: number }).seq;
     const event: EventStoreEvent = {
@@ -259,6 +271,7 @@ export function createEventStore(
       .map((item) => typeof item.channel === "string" ? item.channel : undefined)
       .filter((channel): channel is string => Boolean(channel)))];
     insertEvent({
+      id: buffer.eventIds.size === 1 ? [...buffer.eventIds][0] : undefined,
       type: buffer.type,
       sessionId: buffer.sessionId,
       publish: buffer.publish,
@@ -279,24 +292,34 @@ export function createEventStore(
   }
 
   function queueTelemetry(input: {
+    id?: string;
     type: string;
     sessionId: string;
     payload: Record<string, unknown>;
     publish: boolean;
   }): EventStoreEvent {
     const key = `${input.sessionId}\0${input.type}`;
+    if (input.id) {
+      const existing = getEventById(input.id);
+      if (existing) return existing;
+    }
     let buffer = telemetryBuffers.get(key);
     if (!buffer) {
       buffer = {
         sessionId: input.sessionId,
         type: input.type,
         items: [],
+        eventIds: new Set<string>(),
         bytes: 0,
         publish: input.publish,
       };
       telemetryBuffers.set(key, buffer);
     }
-    buffer.items.push(input.payload);
+    if (input.id && buffer.eventIds.has(input.id)) {
+      return { id: input.id, seq: 0, durable: false, receipt: true, type: input.type, sessionId: input.sessionId, payload: input.payload, createdAt: new Date().toISOString() };
+    }
+    buffer.items.push({ ...input.payload, ...(input.id ? { eventId: input.id } : {}) });
+    if (input.id) buffer.eventIds.add(input.id);
     buffer.bytes += Buffer.byteLength(JSON.stringify(input.payload), "utf8");
     buffer.publish ||= input.publish;
     if (buffer.bytes >= TELEMETRY_MAX_BYTES) {
@@ -321,6 +344,7 @@ export function createEventStore(
   }
 
   function appendEvent(input: {
+    id?: string;
     type: string;
     sessionId: string;
     payload: Record<string, unknown>;
@@ -338,6 +362,24 @@ export function createEventStore(
       ...input,
       publish: opts.publish !== false,
     });
+  }
+
+  function getEventById(eventId: string): EventStoreEvent | undefined {
+    const row = database.sqlite
+      .prepare("select id, seq, type, session_id, workspace_session_id, payload, created_at from event_log where id = ? or json_extract(payload, '$.eventId') = ? limit 1")
+      .get(eventId, eventId) as { id: string; seq: number; type: string; session_id: string; workspace_session_id?: string | null; payload: string; created_at: string } | undefined;
+    if (!row) return undefined;
+    return {
+      id: row.id,
+      seq: row.seq,
+      durable: true,
+      type: row.type,
+      sessionId: row.session_id,
+      workspaceSessionId: row.workspace_session_id ?? undefined,
+      workspaceProjectId: projectIdForWorkspaceSession(row.workspace_session_id ?? undefined),
+      payload: JSON.parse(row.payload) as Record<string, unknown>,
+      createdAt: row.created_at,
+    };
   }
 
   function getEventsForSession(sessionId: string): EventStoreEvent[] {
@@ -810,6 +852,7 @@ export function createEventStore(
       for (const event of events) publish(event);
     },
     getEventsForSession,
+    getEventById,
     getEventsAfter,
     getWorkspaceEventsAfter,
     countEventsByType,

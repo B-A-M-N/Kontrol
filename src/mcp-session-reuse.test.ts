@@ -268,6 +268,52 @@ try {
   assert.equal(afterReuse.perClient.reduce((sum: number, client: any) => sum + client.currentSingleToolSessions, 0), 0);
   assert.ok(afterReuse.sessionsExpired >= 20, `expected ephemeral sessions to expire: ${JSON.stringify(afterReuse)}`);
 
+  // An expired transport is a recoverable protocol event, not a reason to
+  // restart the core. The obsolete ID must be rejected, then a fresh
+  // initialize must be able to reuse the durable workspace identity.
+  const unknownBefore = after.mcpSessionMetrics.connectionRecovery?.unknownSessionRequests ?? 0;
+  const expiredTransport = ephemeral[0];
+  const staleRequest = await rpc("tools/list", {}, expiredTransport.sessionId);
+  assert.equal(staleRequest.response.status, 404, "an expired MCP transport must reject its obsolete session ID");
+  const afterUnknown = await diagnostics();
+  assert.ok(
+    (afterUnknown.mcpSessionMetrics.connectionRecovery?.unknownSessionRequests ?? 0) > unknownBefore,
+    "unknown-session recovery must be visible in diagnostics",
+  );
+  assert.ok(
+    (afterUnknown.mcpSessionMetrics.connectionRecovery?.events?.unknown_session_404 ?? 0) >= 1,
+    "unknown-session recovery event must be categorized",
+  );
+  const freshAfterExpiry = await openSession("expired-reconnect");
+  assert.notEqual(freshAfterExpiry.sessionId, expiredTransport.sessionId);
+  const readAfterExpiry = await rpc("tools/call", {
+    name: "read",
+    arguments: { workspaceId: expiredTransport.workspaceId, path: "missing-after-expiry.txt" },
+  }, freshAfterExpiry.sessionId, "expired-reconnect");
+  assert.equal(readAfterExpiry.response.status, 200, "fresh initialization must recover workspace use after transport expiry");
+  const watcherAfterExpiry = await rpc("tools/call", {
+    name: "await_workspace_events",
+    arguments: { workspaceId: expiredTransport.workspaceId, afterSeq: 0, timeoutMs: 1_000 },
+  }, freshAfterExpiry.sessionId, "expired-reconnect");
+  assert.equal(watcherAfterExpiry.response.status, 200, "workspace watcher must return through the fresh transport");
+  const watcherMetrics = (await diagnostics()).mcpSessionMetrics.connectionRecovery;
+  assert.ok(watcherMetrics.watcherRequests >= 1, "watcher starts must be visible in diagnostics");
+  assert.ok(watcherMetrics.watcherCompletions >= 1, "watcher completions must be visible in diagnostics");
+  await closeSession(freshAfterExpiry.sessionId);
+
+  const continuityConversation = "session-reuse-continuity";
+  const continuityFirst = await openSession(continuityConversation);
+  await closeSession(continuityFirst.sessionId);
+  const continuitySecond = await openSession(continuityConversation);
+  const afterContinuity = await diagnostics();
+  const connectionRecovery = afterContinuity.mcpSessionMetrics.connectionRecovery;
+  assert.ok(connectionRecovery.reconnectAttempts >= 1, "trusted reconnect attempts must be visible");
+  assert.ok(connectionRecovery.reconnects >= 1, "trusted reconnect success must be visible");
+  assert.ok(connectionRecovery.events.reconnect_success >= 1, "reconnect success must be categorized");
+  assert.ok(connectionRecovery.byGeneration, "connection events must be grouped by generation");
+  assert.ok(Object.values(connectionRecovery.byGeneration).some((bucket: any) => bucket.reconnect_success >= 1));
+  await closeSession(continuitySecond.sessionId);
+
   console.log("mcp-session-reuse.test.ts: all assertions passed");
 } finally {
   await running.drain();

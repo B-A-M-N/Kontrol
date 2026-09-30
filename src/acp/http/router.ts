@@ -21,7 +21,7 @@ import { registerEventRoutes } from "./event-routes.js";
 import { registerReviewRoutes } from "./review-routes.js";
 
 export function createAcpRouter(
-  deps: Omit<AcpContext, "effectiveWebhookPolicy" | "sseClients" | "agentMap">,
+  deps: Omit<AcpContext, "effectiveWebhookPolicy" | "sseClients" | "sseHistory" | "agentMap">,
   webhookPolicy?: WebhookPolicy,
 ): Router {
   const router = Router();
@@ -29,6 +29,7 @@ export function createAcpRouter(
     ...deps,
     effectiveWebhookPolicy: webhookPolicy ?? { enabled: false, allowedHosts: [] },
     sseClients: new Map(),
+    sseHistory: new Map(),
     agentMap: new Map(ACP_AGENTS.map((a) => [a.name, a])),
   };
 

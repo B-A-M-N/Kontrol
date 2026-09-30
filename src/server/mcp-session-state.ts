@@ -39,6 +39,8 @@ export interface McpSessionState {
   authSource: "oauth" | "reviewer_token" | "worker_token" | "tunnel_reviewer" | "anonymous";
   conversationId?: string;
   approvalCorrelationId?: string;
+  /** Durable work session that authenticated this worker transport, if any. */
+  workSessionId?: string;
   createdAt: number;
   /** Any request/stream activity, including protocol heartbeats and SSE. */
   lastTransportActivityAt: number;
@@ -122,6 +124,8 @@ export interface PhaseTimingSample {
 
 export interface WorkspaceAppResourceMetrics {
   currentHashed: number;
+  previousHashed: number;
+  staleHashMisses: number;
   openAiCompatibility: number;
   legacyKontrol: number;
   devDesktopMigration: number;
@@ -131,6 +135,10 @@ export interface WorkspaceAppResourceMetrics {
   /** P0 resource admission: reads rejected because the resource pool or its
    * per-client cap was exhausted. */
   admissionRejections: number;
+  /** Resource preparation failures, separate from admission rejection. */
+  serializationFailures: number;
+  compressionFailures: number;
+  transmissionFailures: number;
   /** Currently in-flight admitted resource reads (peak-sampled max). */
   active: number;
   maxActive: number;

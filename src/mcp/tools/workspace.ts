@@ -42,7 +42,10 @@ import {
   WRITE_TOOL_ANNOTATIONS,
 } from "../tool-schemas.js";
 import { readMcpToolSurface, REQUIRED_INSPECTION_TOOLS, toolNames } from "../tool-names.js";
-import { toolWidgetDescriptorMeta } from "../tool-context.js";
+import {
+  toolWidgetDescriptorMeta,
+  workspaceAppRenderToolDescriptorMeta,
+} from "../tool-context.js";
 import {
   canonicalPolicyPath,
   enforceToolPolicy,
@@ -63,6 +66,7 @@ import { runMutationBarrier } from "../mutation-barrier.js";
 import { assertWorkerWorkspaceBinding, processOutputSchema, processToolResponse } from "../process-tool-response.js";
 import type { ToolEnvelope } from "../tool-envelope.js";
 import { processSessionOwnerId, type ConnectionContext } from "../connection-context.js";
+import { MISSING_FILE_VERSION, readFileVersion, withFileMutationLock } from "../../mutation-version.js";
 
 export interface WorkspaceToolsDeps {
   readonly config: ServerConfig;
@@ -106,6 +110,91 @@ function instructionsRequiredResponse(
 function boundedGitText(value: string, limit = 256_000): string {
   return value.length <= limit ? value : `${value.slice(0, limit)}\n[truncated]`;
 }
+
+function fileVersionConflictResponse(
+  tool: string,
+  workspaceId: string,
+  path: string,
+  expected: string,
+  actual: string,
+) {
+  const message = actual === MISSING_FILE_VERSION
+    ? `File version conflict for ${path}: the file is missing, but the mutation expected version ${expected}. No files were changed.`
+    : `File version conflict for ${path}: expected ${expected}, found ${actual}. Re-read the file and retry with its current contentSha256. No files were changed.`;
+  return {
+    content: [textBlock(message)],
+    isError: true,
+    _meta: {
+      tool,
+      card: {
+        tool,
+        workspaceId,
+        path,
+        status: "file_version_conflict",
+        summary: { status: "file_version_conflict", expectedContentSha256: expected, actualContentSha256: actual },
+        payload: { content: [textBlock(message)] },
+      },
+    },
+    structuredContent: {
+      tool,
+      status: "file_version_conflict",
+      retryable: false,
+      path,
+      expectedContentSha256: expected,
+      actualContentSha256: actual,
+      result: message,
+    },
+  };
+}
+
+function fileVersionPreconditionRequiredResponse(
+  tool: string,
+  workspaceId: string,
+  paths: string[],
+) {
+  const message = `Guarded ${tool} requires contentSha256 for every affected path: ${paths.join(", ")}. No files were changed.`;
+  return {
+    content: [textBlock(message)],
+    isError: true,
+    _meta: {
+      tool,
+      card: {
+        tool,
+        workspaceId,
+        path: paths[0],
+        status: "file_version_precondition_required",
+        summary: { status: "file_version_precondition_required", paths },
+        payload: { content: [textBlock(message)] },
+      },
+    },
+    structuredContent: {
+      tool,
+      status: "file_version_precondition_required",
+      retryable: false,
+      paths,
+      result: message,
+    },
+  };
+}
+
+async function checkFileVersion(
+  tool: string,
+  workspaceId: string,
+  path: string,
+  expected: string | undefined,
+) {
+  if (expected === undefined) return null;
+  const actual = await readFileVersion(path);
+  return actual === expected ? null : fileVersionConflictResponse(tool, workspaceId, path, expected, actual);
+}
+
+type FileVersionConflict = ReturnType<typeof fileVersionConflictResponse>;
+type LockedToolMutation<T> =
+  | { versionConflict: FileVersionConflict }
+  | { response: T; contentSha256: string | undefined };
+type LockedPatchMutation =
+  | { versionConflict: FileVersionConflict }
+  | { applied: Awaited<ReturnType<typeof applyPatch>> };
 
 function gitPathArg(workspaces: WorkspaceRegistry, workspace: ReturnType<WorkspaceRegistry["getWorkspace"]>, path?: string): string[] {
   if (path === undefined || path === "") return [];
@@ -310,14 +399,14 @@ export function registerWorkspaceTools(
         inputSchema: {
           workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
         },
-        outputSchema: {
-          tool: z.literal(toolNames.showWorkspaceUi),
+      outputSchema: {
+        tool: z.literal(toolNames.showWorkspaceUi),
           workspaceId: z.string(),
           root: z.string(),
           mode: z.enum(["checkout", "worktree"]),
           instruction: z.string(),
         },
-        ...toolWidgetDescriptorMeta(config, "workspace"),
+        ...workspaceAppRenderToolDescriptorMeta(),
         annotations: { readOnlyHint: true, idempotentHint: true },
       },
       async ({ workspaceId }) => {
@@ -392,7 +481,9 @@ export function registerWorkspaceTools(
           .describe("Maximum number of lines to read."),
         approvalResumeId: approvalResumeIdSchema,
       },
-      outputSchema: resultOutputSchema(),
+      outputSchema: resultOutputSchema({
+        contentSha256: z.string().optional().describe("SHA-256 of the complete file bytes at read time; pass it as expectedContentSha256 to guard a later mutation."),
+      }),
       ...toolWidgetDescriptorMeta(config, "read"),
       annotations: { readOnlyHint: true },
     },
@@ -414,6 +505,8 @@ export function registerWorkspaceTools(
           toolNames.read,
           canonicalPolicyPath(workspace.root, input.path, readPath.absolutePath),
           undefined,
+          undefined,
+          input.approvalResumeId,
         );
         if (!approved.allowed) {
           return policyFailureResponse(approved, `Tool "${toolNames.read}" denied by policy. Path: ${input.path}`, {
@@ -450,6 +543,7 @@ export function registerWorkspaceTools(
         ? [...instructionContent(newlyApplicable, workspace.root), ...response.content]
         : response.content;
       const responseForOutput = { ...response, content: responseContent };
+      const contentSha256 = await readFileVersion(readPath.absolutePath);
       const summary = {
         ...textSummary(responseContent),
         offset: input.offset ?? 1,
@@ -478,6 +572,7 @@ export function registerWorkspaceTools(
         structuredContent: {
           tool: toolNames.read,
           result: contentText(responseContent),
+          contentSha256,
         },
       };
     },
@@ -499,17 +594,23 @@ export function registerWorkspaceTools(
           .string()
           .describe("File path to write, relative to the workspace root."),
         content: z.string().describe("Complete new file content."),
+        expectedContentSha256: z
+          .string()
+          .regex(/^(missing|[a-f0-9]{64})$/)
+          .optional()
+          .describe("Optional optimistic precondition from read.contentSha256. Use missing when the file was absent. The write is rejected if the current version differs."),
         approvalResumeId: approvalResumeIdSchema,
         instructionContentHash: z.string().optional().describe("On a retry after instructions_required, must match the returned instruction hash."),
       },
       outputSchema: resultOutputSchema({
         instructionsRequired: z.boolean().optional(),
         instructionContentHash: z.string().optional(),
+        contentSha256: z.string().optional(),
       }),
       ...toolWidgetDescriptorMeta(config, "write"),
       annotations: WRITE_TOOL_ANNOTATIONS,
     },
-    async ({ workspaceId, ...input }) => {
+    async ({ workspaceId, expectedContentSha256, ...input }) => {
       const startedAt = performance.now();
       const blocked = await runMutationBarrier(prepareForMutation, workspaceId, toolNames.write);
       if (blocked) return blocked;
@@ -532,10 +633,12 @@ export function registerWorkspaceTools(
           brandWorkspaceId(workspaceId),
           connectionContext?.workSessionId ? brandWorkSessionId(connectionContext.workSessionId) : undefined,
           connectionContext?.runId,
-          toolNames.write,
-          policyPath,
-          undefined,
-        );
+            toolNames.write,
+            policyPath,
+            undefined,
+            undefined,
+            input.approvalResumeId,
+          );
         if (!approved.allowed) {
           return policyFailureResponse(approved, `Tool "${toolNames.write}" denied by policy. Path: ${input.path}`, {
             tool: toolNames.write,
@@ -545,10 +648,23 @@ export function registerWorkspaceTools(
         }
       }
 
-      const response = await writeFileTool(input, {
-        cwd: workspace.root,
-        root: workspace.root,
+      const mutation = await withFileMutationLock<LockedToolMutation<Awaited<ReturnType<typeof writeFileTool>>>>([resolvedPath], async (): Promise<LockedToolMutation<Awaited<ReturnType<typeof writeFileTool>>>> => {
+        const versionConflict = await checkFileVersion(
+          toolNames.write,
+          workspaceId,
+          resolvedPath,
+          expectedContentSha256,
+        );
+        if (versionConflict) return { versionConflict } as const;
+        const response = await writeFileTool(input, {
+          cwd: workspace.root,
+          root: workspace.root,
+        });
+        if (response.isError) return { response, contentSha256: undefined } as const;
+        return { response, contentSha256: await readFileVersion(resolvedPath) } as const;
       });
+      if ("versionConflict" in mutation) return mutation.versionConflict;
+      const response = mutation.response;
 
       if (response.isError) {
         logFailedToolResponse(config, {
@@ -581,6 +697,7 @@ export function registerWorkspaceTools(
       const responseWithInstructions = newlyApplicable.length > 0
         ? { ...response, content: [...instructionContent(newlyApplicable, workspace.root), ...response.content] }
         : response;
+      const contentSha256 = mutation.contentSha256;
       trackToolEvent(workspaceId, toolNames.write, input, responseWithInstructions, startedAt);
 
       return {
@@ -590,7 +707,7 @@ export function registerWorkspaceTools(
           card: {
             workspaceId,
             path: input.path,
-            summary,
+            summary: { ...summary, contentSha256 },
             payload: {
               content: responseWithInstructions.content,
               patch,
@@ -600,6 +717,7 @@ export function registerWorkspaceTools(
         structuredContent: {
           tool: toolNames.write,
           result: contentText(responseWithInstructions.content),
+          contentSha256,
         },
       };
     },
@@ -631,17 +749,23 @@ export function registerWorkspaceTools(
             }),
           )
           .min(1),
+        expectedContentSha256: z
+          .string()
+          .regex(/^(missing|[a-f0-9]{64})$/)
+          .optional()
+          .describe("Optional optimistic precondition from read.contentSha256. The edit is rejected if the current file version differs."),
         approvalResumeId: approvalResumeIdSchema,
         instructionContentHash: z.string().optional().describe("On a retry after instructions_required, must match the returned instruction hash."),
       },
       outputSchema: resultOutputSchema({
         instructionsRequired: z.boolean().optional(),
         instructionContentHash: z.string().optional(),
+        contentSha256: z.string().optional(),
       }),
       ...toolWidgetDescriptorMeta(config, "edit"),
       annotations: EDIT_TOOL_ANNOTATIONS,
     },
-    async ({ workspaceId, ...input }) => {
+    async ({ workspaceId, expectedContentSha256, ...input }) => {
       const startedAt = performance.now();
       const blocked = await runMutationBarrier(prepareForMutation, workspaceId, toolNames.write);
       if (blocked) return blocked;
@@ -664,10 +788,12 @@ export function registerWorkspaceTools(
           brandWorkspaceId(workspaceId),
           connectionContext?.workSessionId ? brandWorkSessionId(connectionContext.workSessionId) : undefined,
           connectionContext?.runId,
-          toolNames.edit,
-          policyPath,
-          undefined,
-        );
+            toolNames.edit,
+            policyPath,
+            undefined,
+            undefined,
+            input.approvalResumeId,
+          );
         if (!approved.allowed) {
           return policyFailureResponse(approved, `Tool "${toolNames.edit}" denied by policy. Path: ${input.path}`, {
             tool: toolNames.edit,
@@ -677,10 +803,23 @@ export function registerWorkspaceTools(
         }
       }
 
-      const response = await editFileTool(input, {
-        cwd: workspace.root,
-        root: workspace.root,
+      const mutation = await withFileMutationLock<LockedToolMutation<Awaited<ReturnType<typeof editFileTool>>>>([resolvedPath], async (): Promise<LockedToolMutation<Awaited<ReturnType<typeof editFileTool>>>> => {
+        const versionConflict = await checkFileVersion(
+          toolNames.edit,
+          workspaceId,
+          resolvedPath,
+          expectedContentSha256,
+        );
+        if (versionConflict) return { versionConflict } as const;
+        const response = await editFileTool(input, {
+          cwd: workspace.root,
+          root: workspace.root,
+        });
+        if (response.isError) return { response, contentSha256: undefined } as const;
+        return { response, contentSha256: await readFileVersion(resolvedPath) } as const;
       });
+      if ("versionConflict" in mutation) return mutation.versionConflict;
+      const response = mutation.response;
 
       if (response.isError) {
         logFailedToolResponse(config, {
@@ -704,6 +843,7 @@ export function registerWorkspaceTools(
       };
       const editResultText = `Edited ${input.path} (+${stats.additions} -${stats.removals}).`;
       const editContent = [...instructionContent(newlyApplicable, workspace.root), textBlock(editResultText)];
+      const contentSha256 = mutation.contentSha256;
       workspaces.acknowledgeApplicableInstructions(workspace, newlyApplicable, connectionContext?.mcpSessionId);
       logToolCall(config, {
         tool: toolNames.edit,
@@ -721,7 +861,7 @@ export function registerWorkspaceTools(
           card: {
             workspaceId,
             path: input.path,
-            summary,
+            summary: { ...summary, contentSha256 },
             payload: {
               diff: response.details?.diff,
               patch: response.details?.patch,
@@ -732,6 +872,7 @@ export function registerWorkspaceTools(
           tool: toolNames.edit,
           status: "applied",
           result: contentText(editContent),
+          contentSha256,
         },
       };
     },
@@ -753,12 +894,17 @@ export function registerWorkspaceTools(
           patch: z
             .string()
             .describe("Patch text enclosed by *** Begin Patch and *** End Patch markers."),
+          expectedContentSha256ByPath: z
+            .record(z.string(), z.string().regex(/^(missing|[a-f0-9]{64})$/))
+            .optional()
+            .describe("Optional optimistic preconditions keyed by every patch path. Values come from read.contentSha256; use missing for paths that were absent. If supplied, every affected source and destination path must be included."),
           approvalResumeId: approvalResumeIdSchema,
           instructionContentHash: z.string().optional().describe("On a retry after instructions_required, must match the returned instruction hash."),
         },
         outputSchema: resultOutputSchema({
           instructionsRequired: z.boolean().optional(),
           instructionContentHash: z.string().optional(),
+          contentSha256ByPath: z.record(z.string(), z.string()).optional(),
           additions: z.number(),
           removals: z.number(),
           files: z.array(
@@ -772,7 +918,7 @@ export function registerWorkspaceTools(
         ...toolWidgetDescriptorMeta(config, "edit"),
         annotations: EDIT_TOOL_ANNOTATIONS,
       },
-      async ({ workspaceId, patch, approvalResumeId, instructionContentHash }) => {
+      async ({ workspaceId, patch, expectedContentSha256ByPath, approvalResumeId, instructionContentHash }) => {
         const startedAt = performance.now();
         const blocked = await runMutationBarrier(prepareForMutation, workspaceId, "apply_patch");
         if (blocked) return blocked;
@@ -780,7 +926,7 @@ export function registerWorkspaceTools(
         const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
         if (bindingErr) return bindingErr;
         const actions = parsePatch(patch) as Array<{ path: string; moveTo?: string }>;
-        const affectedPaths = actions.flatMap((action) => [action.path, action.moveTo].filter((path): path is string => Boolean(path)));
+        const affectedPaths = [...new Set(actions.flatMap((action) => [action.path, action.moveTo].filter((path): path is string => Boolean(path))))];
         const policyPaths = affectedPaths.map((path) => canonicalPolicyPath(
           workspace.root,
           path,
@@ -822,10 +968,35 @@ export function registerWorkspaceTools(
           }
         }
 
+        if (expectedContentSha256ByPath) {
+          const missingPreconditions = affectedPaths.filter((path) => expectedContentSha256ByPath[path] === undefined);
+          if (missingPreconditions.length > 0) {
+            return fileVersionPreconditionRequiredResponse("apply_patch", workspaceId, missingPreconditions);
+          }
+        }
+
         // Load instructions for every path named by the patch before any file
         // is changed. parsePatch is validation-only; applyPatch revalidates all
         // confined destinations immediately before staging/rename.
-        const applied = await applyPatch(workspace.root, patch);
+        const mutation = await withFileMutationLock<LockedPatchMutation>(
+          affectedPaths.map((path) => workspaces.resolvePath(workspace, path)),
+          async (): Promise<LockedPatchMutation> => {
+            if (expectedContentSha256ByPath) {
+              for (const path of affectedPaths) {
+                const versionConflict = await checkFileVersion(
+                  "apply_patch",
+                  workspaceId,
+                  workspaces.resolvePath(workspace, path),
+                  expectedContentSha256ByPath[path],
+                );
+                if (versionConflict) return { versionConflict } as const;
+              }
+            }
+            return { applied: await applyPatch(workspace.root, patch) } as const;
+          },
+        );
+        if ("versionConflict" in mutation) return mutation.versionConflict;
+        const applied = mutation.applied;
         // P1 (audit): record every path the patch touched (including move
         // destinations) so the next review submission can state whether the
         // checkpoint represents it.
@@ -838,6 +1009,9 @@ export function registerWorkspaceTools(
         const result = `Applied patch to ${applied.files.length} file(s): ${paths}`;
         workspaces.acknowledgeApplicableInstructions(workspace, newlyApplicable, connectionContext?.mcpSessionId);
         const content = [...instructionContent(newlyApplicable, workspace.root), textBlock(result)];
+        const contentSha256ByPath = Object.fromEntries(await Promise.all(
+          affectedPaths.map(async (path) => [path, await readFileVersion(workspaces.resolvePath(workspace, path))] as const),
+        ));
         const displayPath = applied.files.length === 1
           ? applied.files[0]?.path
           : `${applied.files.length} files`;
@@ -862,7 +1036,7 @@ export function registerWorkspaceTools(
                 additions: applied.additions,
                 removals: applied.removals,
               },
-              payload: { patch: applied.patch },
+              payload: { patch: applied.patch, contentSha256ByPath },
             },
           },
           structuredContent: {
@@ -871,6 +1045,7 @@ export function registerWorkspaceTools(
             additions: applied.additions,
             removals: applied.removals,
             files: applied.files,
+            contentSha256ByPath,
           },
         };
       },
@@ -898,11 +1073,11 @@ export function registerWorkspaceTools(
             .optional()
             .describe("Defaults to true. When true, advances the last shown checkpoint to the current workspace state."),
         },
-        outputSchema: resultOutputSchema({
+      outputSchema: resultOutputSchema({
           snapshotKind: z.enum(["git", "filesystem"]).optional(),
           snapshotRef: z.string().optional(),
         }),
-        ...toolWidgetDescriptorMeta(config, "show_changes"),
+        ...workspaceAppRenderToolDescriptorMeta(),
         // The default markReviewed=true advances the workspace checkpoint.
         // Keep the existing end-of-turn acknowledgement behavior, but do not
         // advertise this state-changing operation as read-only to MCP hosts.
@@ -1004,6 +1179,8 @@ export function registerWorkspaceTools(
             toolNames.grep,
             policyPath,
             undefined,
+            undefined,
+            input.approvalResumeId,
           );
           if (!approved.allowed) {
             return policyFailureResponse(approved, `Tool "${toolNames.grep}" denied by policy.`, {
@@ -1106,6 +1283,8 @@ export function registerWorkspaceTools(
             toolNames.glob,
             policyPath,
             undefined,
+            undefined,
+            input.approvalResumeId,
           );
           if (!approved.allowed) {
             return policyFailureResponse(approved, `Tool "${toolNames.glob}" denied by policy.`, {
@@ -1207,6 +1386,8 @@ export function registerWorkspaceTools(
             toolNames.ls,
             policyPath,
             undefined,
+            undefined,
+            input.approvalResumeId,
           );
           if (!approved.allowed) {
             return policyFailureResponse(approved, `Tool "${toolNames.ls}" denied by policy. Path: ${input.path}`, {

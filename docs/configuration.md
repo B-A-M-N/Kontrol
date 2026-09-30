@@ -34,6 +34,9 @@ kontrol config set publicBaseUrl https://kontrol.example.com
 | `PORT` | Local port. Defaults to `7676`. |
 | `KONTROL_ALLOWED_ROOTS` | Comma-separated local roots that workspaces may open. |
 | `KONTROL_PUBLIC_BASE_URL` | Public origin for the server, without `/mcp`. |
+| `KONTROL_MCP_CANARY_URL` | Optional external MCP origin for the supervisor’s fresh initialize/tools/list/read canary. Falls back to `KONTROL_PUBLIC_BASE_URL`. |
+| `KONTROL_MCP_CANARY_AUTH_FILE` | Optional mode-0600 file containing the canary `Authorization` header value; the secret is read only by the scrubbed probe child. |
+| `KONTROL_MCP_CANARY_READ_PATH` | Workspace-relative path used by the external canary’s lightweight read. Defaults to `AGENTS.md`. |
 | `KONTROL_ALLOWED_HOSTS` | Optional Host header allowlist override. |
 | `KONTROL_OAUTH_OWNER_TOKEN` | Owner password for OAuth approval. Must be at least 16 characters. |
 | `KONTROL_AUTH_MODE` | MCP auth mode: `oauth` (default) or `tunnel`. Overrides the `authMode` field written by `kontrol init`. |
@@ -203,6 +206,19 @@ application activity clocks so keep-alive/SSE traffic cannot silently extend
 application idle policy.
 Long-lived MCP SSE responses also receive a 20-second SSE comment heartbeat;
 these comments are transport keep-alives and do not count as application work.
+`mcpSessionMetrics.operationDiagnostics` keeps bounded active and recent
+body-free request records with operation/request IDs, generation and session
+prefix, method/tool, start/finish times, HTTP status, locally written response
+bytes, close classification, admission wait, execution duration, and connection
+and resource-admission counters. Responses carry `x-kontrol-operation-id` and
+`x-kontrol-request-id`; a supplied `cf-ray`, `x-kontrol-correlation-id`, or
+`x-request-id` is echoed as the correlation ID. These records contain no
+authorization headers, tool arguments, or response content. Locally written
+bytes do not prove delivery through an intermediary or acceptance by ChatGPT.
+For an external interruption report, correlate a browser HAR, authenticated
+diagnostics snapshot, Kontrol JSON logs, and intermediary delivery logs with
+`scripts/analyze-mcp-stream-failure.mjs`; exact external IDs are distinguished
+from timestamp-only matches.
 
 The managed tunnel launcher keeps OAuth protected-resource discovery enabled but
 disables Harpoon loopback auto-registration by default. Set
@@ -214,9 +230,32 @@ For a running local origin or Secure MCP Tunnel endpoint, run
 `npm run probe:tunnel -- --url URL --workspace PATH --cycles 3 --build-meta PATH`
 to exercise repeated initialize → GET SSE → concurrent tool call → SSE
 disconnect → follow-up tool call cycles and require `read`, `grep`, `glob`,
-`ls`, and `poll_process` in the connection-facing catalog. Supply
+`ls`, `git_status`, `git_log`, `git_diff`, `git_show`, and `poll_process` in
+the connection-facing catalog. Supply
 `--diagnostics-secret SECRET` to assert active-SSE accounting and retained
-session identity after each disconnect.
+session identity after each disconnect. To compare the fresh server catalog
+with an external host's invocable-tool snapshot, pass
+`--host-catalog-file PATH`; parity-only checks accept a raw `tools/list` result,
+an object with `tools`, or an array of tool names/descriptors. The parser
+rejects envelopes with more than one authoritative catalog instead of merging
+their tool names. Qualification requires an envelope with `capturedAt`, an
+operator-assigned `captureId`, and `initialize` plus its matching
+`toolsList` response. The receipt marks this host capture as operator-supplied
+and separately marks Kontrol's fresh live server probe as machine-verified.
+Qualification also requires `--dual`, two heartbeat bytes per session, at
+least two drain recoveries, concurrent resource reads, and the deployed HTTPS
+tunnel endpoint; a local idle-proxy run cannot create a qualification receipt.
+Pass `--expected-build-id BUILD_ID --result-file beta-external-catalog.json`.
+The final gate rejects a catalog captured before the candidate soak, a probe
+that ran before the soak ended, or missing streaming evidence.
+
+For bounded visual qualification, set `KONTROL_UI_SCREENSHOT_DIR` when running
+`npm run test:ui`; the Chromium gate writes deterministic
+`initial-review-approval`, `reference-warning`, and `focused-review` PNGs at
+the mobile viewport. Set `KONTROL_UI_SCREENSHOT_LABEL=before` or `current` and
+run the same gate against two immutable candidate directories for a like-for-
+like comparison. The capture is opt-in and does not grant additional
+workspace permissions.
 
 The checkout launcher calls `scripts/probe-kontrol-readiness.mjs` after the
 adapters register. That probe performs a real MCP initialize and `tools/list`,
@@ -342,9 +381,14 @@ sessions.
 
 | Value | Behavior |
 | --- | --- |
-| `full` | Attaches widget UI to exposed workspace, file, edit, and shell tools. |
-| `changes` | Default. Enables the aggregate `show_changes` tool and attaches widget UI to `open_workspace` and `show_changes`. |
-| `off` | Disables widget UI. |
+| `full` | Marks supported operations callable from the Workspace App and exposes explicit render tools. |
+| `changes` | Default. Enables aggregate `show_changes` and app-callable metadata where operations can surface approvals. |
+| `off` | Omits app-callable metadata from ordinary workspace operations; explicit review render tools remain available. |
+
+`open_workspace` returns workspace data only. Call `show_workspace_ui` or
+`open_approval_center` when the host should render the Workspace App. A small
+connection diagnostic is available only when
+`KONTROL_DEV_WORKSPACE_APP_SMOKE=1`; `npm run build:app` builds its resource.
 
 ## Skills
 

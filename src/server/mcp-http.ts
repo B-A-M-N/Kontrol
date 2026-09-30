@@ -4,7 +4,7 @@
  * verbatim from src/server.ts (P1.2); createServer closures become an
  * explicit dependency object destructured at function entry.
  */
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { Socket } from "node:net";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
@@ -28,8 +28,11 @@ import {
   type McpSessionState,
 } from "./mcp-session-state.js";
 import type { McpSessionLifecycle } from "./mcp-session-lifecycle.js";
+import type { ExpiredMcpOperationTracker } from "./mcp-expired-operations.js";
+import type { McpOperationDiagnostics } from "./mcp-operation-diagnostics.js";
 import type { McpPolicyWaiterRegistry } from "./policy-waiters.js";
 import type { LogicalContinuityIndex } from "../mcp-logical-continuity.js";
+import { startMcpSseHeartbeat } from "./mcp-sse-heartbeat.js";
 import { logEvent, requestPath, sessionIdPrefix } from "../logger.js";
 import { verifyWorkerToken, type WorkerTokenClaims } from "../acp-worker-token.mjs";
 import {
@@ -46,12 +49,31 @@ import {
   LEGACY_WORKSPACE_APP_URI,
   OPENAI_WORKSPACE_APP_URI,
   WORKSPACE_APP_URI,
+  isWorkspaceAppHashedUri,
   workspaceAppResourceKind,
 } from "../workspace-app-resource.js";
 import type { DatabaseHandle } from "../db/client.js";
 import type { MutationReceiptStore } from "../mutation-receipts.js";
 import type { LiveWaiterRegistry } from "../acp-bridge.js";
 import type { Request, Response } from "express";
+
+function externalCorrelation(req: Request): string | undefined {
+  for (const name of ["cf-ray", "x-kontrol-correlation-id", "x-request-id"]) {
+    const value = req.header(name)?.trim();
+    if (value && value.length <= 128 && /^[A-Za-z0-9._:/-]+$/.test(value)) return value;
+  }
+  return undefined;
+}
+
+function responseChunkBytes(chunk: unknown, encoding: unknown): number {
+  if (typeof chunk === "string") {
+    try { return Buffer.byteLength(chunk, typeof encoding === "string" ? encoding as BufferEncoding : "utf8"); }
+    catch { return Buffer.byteLength(chunk, "utf8"); }
+  }
+  if (ArrayBuffer.isView(chunk)) return chunk.byteLength;
+  if (chunk instanceof ArrayBuffer) return chunk.byteLength;
+  return 0;
+}
 
 export interface McpHttpDeps {
   readonly config: ServerConfig;
@@ -63,14 +85,19 @@ export interface McpHttpDeps {
   readonly mcpAdmission: McpAdmission;
   readonly mcpWaiterAdmission: McpAdmission;
   readonly mcpResourceAdmission: McpAdmission;
+  readonly expiredMcpOperations: ExpiredMcpOperationTracker;
+  readonly operationDiagnostics: McpOperationDiagnostics;
   readonly sessionLifecycle: McpSessionLifecycle;
-  readonly workspaceAppResourceMetrics: { currentHashed: number; openAiCompatibility: number; legacyKontrol: number; devDesktopMigration: number };
+  readonly recordUnknownSessionRequest?: (sessionId: string) => void;
+  readonly recordFreshInitialization?: (reconnected: boolean, durationMs?: number) => void;
+  readonly recordMcpConnectionEvent?: (event: { kind: string; sessionId?: string; requestKind?: string; durationMs?: number }) => void;
+  readonly workspaceAppResourceMetrics: { currentHashed: number; previousHashed: number; staleHashMisses: number; openAiCompatibility: number; legacyKontrol: number; devDesktopMigration: number };
   trackSocketAbort(socket: Socket, controller: AbortController): () => void;
   bearerAuth(): ((req: Request, res: Response, next: (error?: unknown) => void) => void) | undefined;
   resourceServerUrl(): URL | undefined;
   oauthEnabled(): boolean;
   shuttingDown(): boolean;
-  serveWorkspaceAppResource(res: Response, requestId: string | undefined, body: { id?: unknown; params?: { uri?: unknown } }, sessionless: boolean, clientKey: string, abortSignal: AbortSignal | undefined, acceptEncoding?: string | undefined): Promise<boolean>;
+  serveWorkspaceAppResource(res: Response, requestId: string | undefined, body: { id?: unknown; params?: { uri?: unknown } }, sessionless: boolean, clientKey: string, abortSignal: AbortSignal | undefined, acceptEncoding?: string | undefined, context?: { sessionId?: string; generationId?: string }): Promise<boolean>;
   createServerForSession(connectionContext: ConnectionContext): { connect(transport: Transport): Promise<void> };
   supervisorWake(workSessionId: string): void;
   mutationReceipts: MutationReceiptStore;
@@ -103,6 +130,8 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
     mcpAdmission,
     mcpWaiterAdmission,
     mcpResourceAdmission,
+    expiredMcpOperations,
+    operationDiagnostics,
     sessionLifecycle,
     workspaceAppResourceMetrics,
     trackSocketAbort,
@@ -142,7 +171,8 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
     finalizeMcpSession,
     reapIdleMcpSessions,
   } = sessionLifecycle;
-    const requestStartedAt = performance.now();
+  const requestStartedAt = performance.now();
+  const requestStartedAtMs = Date.now();
     const requestId = res.locals.requestId as string | undefined;
     const sessionId = req.header("mcp-session-id");
     const initializeRequest = req.method === "POST" && isInitializeRequest(req.body);
@@ -165,22 +195,122 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
       : requestIsWaiter
         ? "waiter"
         : "execution";
+    const operationId = randomUUID();
+    const externalCorrelationId = externalCorrelation(req);
+    operationDiagnostics.begin({
+      operationId,
+      requestId,
+      externalCorrelationId,
+      generationId: config.launchGenerationId,
+      sessionIdPrefix: sessionIdPrefix(sessionId),
+      method: req.method,
+      rpcMethod: requestRpcMethod,
+      toolName: requestToolName,
+      startedAtMs: requestStartedAtMs,
+      admissionClass,
+    });
+    res.setHeader("x-kontrol-operation-id", operationId);
+    res.setHeader("x-kontrol-request-id", requestId ?? operationId);
+    if (externalCorrelationId) res.setHeader("x-kontrol-correlation-id", externalCorrelationId);
     let handlerStartedAt = 0;
+    let handlerSettled = false;
+    let responseBytes = 0;
+    let responseCloseClassification: string | undefined;
+    let requestErrorClass: string | undefined;
     let transport: Transport | undefined;
     let sessionState: McpSessionState | undefined;
-    let sseHeartbeatTimer: NodeJS.Timeout | undefined;
-    let sseWriterStalled = false;
-    const onSseDrain = () => {
-      if (sseWriterStalled) {
-        sseWriterStalled = false;
-        logEvent(config.logging, "info", "mcp_sse_writer_drained", {
-          requestId,
-          sessionIdPrefix: sessionIdPrefix(sessionId),
-        });
+    let stopSseHeartbeat: (() => void) | undefined;
+    const requestAbort = new AbortController();
+    const instrumentedResponse = res as unknown as {
+      write: (...args: unknown[]) => unknown;
+      end: (...args: unknown[]) => unknown;
+    };
+    const originalWrite = res.write.bind(res);
+    const originalEnd = res.end.bind(res);
+    let responseWritersRestored = false;
+    const restoreResponseWriters = () => {
+      if (responseWritersRestored) return;
+      responseWritersRestored = true;
+      instrumentedResponse.write = originalWrite as unknown as (...args: unknown[]) => unknown;
+      instrumentedResponse.end = originalEnd as unknown as (...args: unknown[]) => unknown;
+    };
+    instrumentedResponse.write = (...args: unknown[]) => {
+      const bytes = !res.writableEnded && !res.destroyed ? responseChunkBytes(args[0], args[1]) : 0;
+      try {
+        const result = Reflect.apply(originalWrite, res, args);
+        responseBytes += bytes;
+        return result;
+      } catch (error) {
+        throw error;
       }
     };
-    res.once("drain", onSseDrain);
-    const requestAbort = new AbortController();
+    instrumentedResponse.end = (...args: unknown[]) => {
+      const bytes = !res.writableEnded && !res.destroyed ? responseChunkBytes(args[0], args[1]) : 0;
+      try {
+        const result = Reflect.apply(originalEnd, res, args);
+        responseBytes += bytes;
+        return result;
+      } catch (error) {
+        throw error;
+      }
+    };
+    let operationDiagnosticFinalized = false;
+    const finalizeOperationDiagnostic = () => {
+      if (operationDiagnosticFinalized) return;
+      operationDiagnosticFinalized = true;
+      const finishedAtMs = Date.now();
+      const completedResponseCloseClassification = responseCloseClassification
+        ?? (res.writableFinished ? "response_finished" : "response_incomplete");
+      const executionDurationMs = handlerStartedAt > 0
+        ? Math.max(0, Math.round(performance.now() - handlerStartedAt))
+        : 0;
+      const sessionInFlight = sessionId ? mcpSessions.get(sessionId)?.inFlightRequests : undefined;
+      const observedSession = sessionId ? mcpSessions.get(sessionId) : undefined;
+      const connectionMetrics = {
+        activeSseStreams: observedSession?.activeSseStreams ?? 0,
+        activeLongPolls: observedSession?.activeLongPollCount ?? 0,
+        activePolicyWaiters: observedSession?.activePolicyWaiters ?? 0,
+        inFlightRequests: observedSession?.inFlightRequests ?? 0,
+        transportClosed: observedSession?.closed ?? false,
+      };
+      const executionAdmission = mcpAdmission.getStats();
+      const resourceAdmission = mcpResourceAdmission.getStats();
+      operationDiagnostics.finish(operationId, {
+        finishedAtMs,
+        httpStatus: res.statusCode,
+        responseBytes,
+        responseCloseClassification: completedResponseCloseClassification,
+        admissionWaitMs: Math.max(0, Math.round(admissionWaitMs)),
+        executionDurationMs,
+        handlerStillRunning: !handlerSettled,
+        ...(requestErrorClass ? { errorClass: requestErrorClass } : {}),
+        executionAdmission,
+        resourceAdmission,
+        sessionInFlight,
+        connectionMetrics,
+      });
+      logEvent(config.logging, "debug", "mcp_operation_finished", {
+        operationId,
+        requestId,
+        externalCorrelationId,
+        generationId: config.launchGenerationId,
+        sessionIdPrefix: sessionIdPrefix(sessionId),
+        rpcMethod: requestRpcMethod,
+        toolName: requestToolName,
+        startedAt: new Date(requestStartedAtMs).toISOString(),
+        finishedAt: new Date(finishedAtMs).toISOString(),
+        httpStatus: res.statusCode,
+        responseBytes,
+        responseCloseClassification: completedResponseCloseClassification,
+        admissionWaitMs: Math.max(0, Math.round(admissionWaitMs)),
+        executionDurationMs,
+        handlerStillRunning: !handlerSettled,
+        executionAdmission,
+        resourceAdmission,
+        sessionInFlight,
+        connectionMetrics,
+      });
+    };
     // A lost HTTP response ends this request, not the shared MCP session.
     // In particular, a client may close the standalone GET SSE stream while
     // another POST is still executing on the same Streamable HTTP transport.
@@ -197,6 +327,7 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
       req.off("aborted", abortIfDisconnected);
       res.off("close", onResponseClose);
       res.off("finish", onResponseFinish);
+      restoreResponseWriters();
       removeSocketAbort?.();
     };
     // P0.2: catch BOTH the request-level abort (req.once aborted) AND the
@@ -213,6 +344,12 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
       // SDK owns individual SSE stream cancellation and session close() is
       // reserved for explicit DELETE, server shutdown, timeout, and expiry.
       if (!res.writableFinished) {
+        responseCloseClassification = "response_closed_before_finish";
+        deps.recordMcpConnectionEvent?.({
+          kind: requestIsWaiter ? "watcher_aborted" : "response_channel_closed",
+          sessionId,
+          requestKind: requestIsSseStream ? "sse_stream" : req.method === "POST" ? "post_response" : "http_response",
+        });
         const state = sessionId ? mcpSessions.get(sessionId) : undefined;
         logEvent(config.logging, "debug", "mcp_request_disconnected", {
           requestId,
@@ -228,14 +365,18 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
           terminationReason: "response_channel_closed",
         });
       }
+      stopSseHeartbeat?.();
+      stopSseHeartbeat = undefined;
       abortIfDisconnected();
       cleanupRequestListeners();
     };
     const onResponseFinish = () => {
+      responseCloseClassification ??= "response_finished";
       const finishedAt = performance.now();
       recordPhaseTiming("mcp.response", finishedAt - requestStartedAt);
       if (handlerStartedAt > 0) recordPhaseTiming("mcp.serialization", finishedAt - handlerStartedAt);
       if (req.method === "DELETE" && sessionId) {
+        deps.recordMcpConnectionEvent?.({ kind: "explicit_delete", sessionId, requestKind: "delete" });
         const state = mcpSessions.get(sessionId);
         logEvent(config.logging, "debug", "mcp_request_disconnected", {
           requestId,
@@ -249,6 +390,8 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
           terminationReason: "explicit_delete",
         });
       }
+      stopSseHeartbeat?.();
+      stopSseHeartbeat = undefined;
       cleanupRequestListeners();
     };
     res.once("close", onResponseClose);
@@ -332,6 +475,7 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
       }
     };
 
+    try {
     if (shuttingDown) {
       return res.status(503).json({
         jsonrpc: "2.0",
@@ -398,6 +542,14 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
       if (sessionId) {
         transport = transports.get(sessionId);
         if (!transport) {
+          deps.recordUnknownSessionRequest?.(sessionId);
+          logEvent(config.logging, "info", "mcp_unknown_session", {
+            requestId,
+            sessionIdPrefix: sessionIdPrefix(sessionId),
+            generationId: config.launchGenerationId,
+            buildId: config.expectedBuildId,
+            outcome: "fresh_initialize_required",
+          });
           sendJsonRpcError(res, 404, -32000, "Unknown MCP session");
           return;
         }
@@ -425,6 +577,9 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
           return;
         }
         if (sessionState) {
+          if (requestIsWaiter) {
+            deps.recordMcpConnectionEvent?.({ kind: "watcher_started", sessionId, requestKind: requestToolName });
+          }
           const activityAt = Date.now();
           sessionState.lastTransportActivityAt = activityAt;
           if (!requestIsSseStream) sessionState.lastApplicationActivityAt = activityAt;
@@ -460,7 +615,8 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
         // Serve recognized historical hashes on that transport too; the
         // transport's per-session resource registry only contains the hash
         // from the build that created it.
-        if (requestRpcMethod === "resources/read" && workspaceAppResourceKind((req.body as { params?: { uri?: unknown } })?.params?.uri)) {
+        const requestedResourceUri = (req.body as { params?: { uri?: unknown } })?.params?.uri;
+        if (requestRpcMethod === "resources/read" && (workspaceAppResourceKind(requestedResourceUri) || isWorkspaceAppHashedUri(requestedResourceUri))) {
           if (sessionState) {
             const activityAt = Date.now();
             sessionState.lastTransportActivityAt = activityAt;
@@ -470,22 +626,35 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
             }
           }
           // P0 resource admission: bounded even on the session fast path —
-          // the ~10 MB serialization must never run outside admission control.
-          await serveWorkspaceAppResource(
-            res,
-            requestId,
-            req.body as { id?: unknown; params?: { uri?: unknown } },
-            false,
-            sessionId ?? logicalClientId(req),
-            requestAbort.signal,
-            req.header("accept-encoding"),
-          );
+          // the large static serialization must never run outside admission control.
+          try {
+            await serveWorkspaceAppResource(
+              res,
+              requestId,
+              req.body as { id?: unknown; params?: { uri?: unknown } },
+              false,
+              sessionId ?? logicalClientId(req),
+              requestAbort.signal,
+              req.header("accept-encoding"),
+              { sessionId, generationId: config.launchGenerationId },
+            );
+          } finally {
+            handlerSettled = true;
+          }
           return;
         }
       } else if (initializeRequest) {
         // P1 #31: Admission pressure control — enforce caps at session creation
         const clientIdentity = logicalClientIdentity(req);
         const clientId = clientIdentity.id;
+        const requestConversationId = conversationId(req);
+        if (
+          requestConversationId
+          && clientIdentity.source !== "client_info_fallback"
+          && logicalContinuity.has(clientId)
+        ) {
+          deps.recordMcpConnectionEvent?.({ kind: "reconnect_attempt", requestKind: "initialize" });
+        }
         const pressure = getMemoryPressureState();
         if (mcpSessions.size >= pressure.effectiveSoftCap) {
           reapIdleMcpSessions();
@@ -545,7 +714,6 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
             boundSessionId = newSessionId;
             if (transport) {
               transports.set(newSessionId, transport);
-              const requestConversationId = conversationId(req);
               mcpSessions.set(newSessionId, {
                 sessionId: newSessionId,
                 sessionLabel: mcpSessionLabel(clientId, newSessionId, requestConversationId),
@@ -556,6 +724,7 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
                 authSource: connectionContext.authSource ?? "anonymous",
                 conversationId: requestConversationId,
                 approvalCorrelationId: clientIdentity.source === "client_info_fallback" ? undefined : clientId,
+                workSessionId: connectionContext.workSessionId,
                 createdAt: Date.now(),
                 lastTransportActivityAt: Date.now(),
                 lastApplicationActivityAt: Date.now(),
@@ -570,7 +739,8 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
                 closing: false,
                 closed: false,
                 endRecorded: false,
-                durableWorkerSession: false,
+                durableWorkerSession: connectionContext.authenticatedRole === "worker"
+                  || Boolean(connectionContext.workSessionId),
                 lastRpcMethod: "initialize",
               });
               let continuityAttachment: ReturnType<LogicalContinuityIndex["attach"]> | undefined;
@@ -592,6 +762,7 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
               connectionContext.approvalCorrelationId = mcpSessions.get(newSessionId)?.approvalCorrelationId;
               recordMcpSessionCreated(clientId);
               if (continuityAttachment?.reconnect) {
+                deps.recordFreshInitialization?.(true, Math.round(performance.now() - requestStartedAt));
                 logEvent(config.logging, "info", "mcp_logical_continuity_reconnected", {
                   requestId,
                   sessionIdPrefix: sessionIdPrefix(newSessionId),
@@ -602,6 +773,8 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
                   identitySource: clientIdentity.source,
                   activeTransportCount: continuityAttachment.activeTransportCount,
                 });
+              } else {
+                deps.recordFreshInitialization?.(false, Math.round(performance.now() - requestStartedAt));
               }
             }
             logEvent(config.logging, "info", "mcp_session_created", {
@@ -618,6 +791,7 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
         transport.onclose = () => {
           const closedSessionId = boundSessionId ?? transport?.sessionId;
           if (closedSessionId) {
+            deps.recordMcpConnectionEvent?.({ kind: "transport_closed", sessionId: closedSessionId, requestKind: "transport" });
             const state = mcpSessions.get(closedSessionId);
             logEvent(config.logging, "debug", "mcp_transport_closed", {
               sessionIdPrefix: sessionIdPrefix(closedSessionId),
@@ -739,6 +913,7 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
           mutationReceipts,
           (uri) => {
             if (uri === WORKSPACE_APP_URI) workspaceAppResourceMetrics.currentHashed++;
+            else if (workspaceAppResourceKind(uri) === "previous") workspaceAppResourceMetrics.previousHashed++;
             else if (uri === OPENAI_WORKSPACE_APP_URI) workspaceAppResourceMetrics.openAiCompatibility++;
             else if (uri === LEGACY_WORKSPACE_APP_URI) workspaceAppResourceMetrics.legacyKontrol++;
             else if (uri === DEVDESKTOP_WORKSPACE_APP_URI) workspaceAppResourceMetrics.devDesktopMigration++;
@@ -751,7 +926,6 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
         const state = (sessionId ? mcpSessions.get(sessionId) : undefined)
           ?? (transport.sessionId ? mcpSessions.get(transport.sessionId) : undefined);
         if (state) {
-          state.durableWorkerSession = connectionContext.authenticatedRole === "worker" || Boolean(connectionContext.workSessionId);
           connectionContext.mcpSessionId = state.sessionId;
           connectionContext.mcpSessionLabel = state.sessionLabel;
           connectionContext.conversationId = state.conversationId;
@@ -778,7 +952,8 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
         });
       } else if (
         requestRpcMethod === "resources/read" &&
-        workspaceAppResourceKind((req.body as { params?: { uri?: unknown } } | undefined)?.params?.uri)
+        (workspaceAppResourceKind((req.body as { params?: { uri?: unknown } } | undefined)?.params?.uri)
+          || isWorkspaceAppHashedUri((req.body as { params?: { uri?: unknown } } | undefined)?.params?.uri))
       ) {
         // The OpenAI tunnel fetches app resources on a separate, sessionless
         // channel after initialization. Resources are read-only and the outer
@@ -795,6 +970,7 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
           logicalClientId(req),
           requestAbort.signal,
           req.header("accept-encoding"),
+          { generationId: config.launchGenerationId },
         );
         return;
       } else {
@@ -807,14 +983,31 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
         admissionClass = requestIsWaiter ? "waiter" : "execution";
         const admissionWeight = requestIsWaiter ? 1 : mcpAdmissionWeight(requestRpcMethod, requestToolName);
         const admissionStartedAt = performance.now();
-        const acquiredAdmission = await admission.acquire(
-          sessionId ?? logicalClientId(req),
-          config.mcpAdmissionTimeoutMs,
-          admissionWeight,
-          requestAbort.signal,
-        );
+        let acquiredAdmission: (() => void) | null;
+        try {
+          acquiredAdmission = await admission.acquire(
+            sessionId ?? logicalClientId(req),
+            config.mcpAdmissionTimeoutMs,
+            admissionWeight,
+            requestAbort.signal,
+          );
+        } catch (error) {
+          handlerSettled = true;
+          throw error;
+        }
         admissionWaitMs = performance.now() - admissionStartedAt;
         if (!acquiredAdmission) {
+          responseCloseClassification = "admission_rejected";
+          handlerSettled = true;
+          deps.recordMcpConnectionEvent?.({ kind: "admission_exhaustion", sessionId, requestKind: admissionClass });
+          if (requestIsWaiter) {
+            deps.recordMcpConnectionEvent?.({
+              kind: "watcher_aborted",
+              sessionId,
+              requestKind: "admission_exhaustion",
+              durationMs: Math.round(performance.now() - requestStartedAt),
+            });
+          }
           if (!requestIsWaiter) recordMcpCapacityRejection(requestToolName, admissionWeight, requestId);
           logEvent(config.logging, "warn", "mcp_request_rejected", {
             requestId,
@@ -838,27 +1031,19 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
         // Keep long-lived SSE connections visible through idle proxies. This
         // is an SSE comment, not an MCP application event, and deliberately
         // does not advance the application-activity clock.
-        sseHeartbeatTimer = setInterval(() => {
-          if (res.writableEnded || res.destroyed) {
-            clearInterval(sseHeartbeatTimer);
-            sseHeartbeatTimer = undefined;
-            return;
-          }
-          if (sseWriterStalled) return;
-          try {
-            if (!res.write(": kontrol-heartbeat\n\n")) {
-              sseWriterStalled = true;
-              logEvent(config.logging, "warn", "mcp_sse_writer_stalled", {
-                requestId,
-                sessionIdPrefix: sessionIdPrefix(sessionId),
-              });
-            }
-          } catch {
-            clearInterval(sseHeartbeatTimer);
-            sseHeartbeatTimer = undefined;
-          }
-        }, config.mcpSseHeartbeatMs);
-        sseHeartbeatTimer.unref?.();
+        stopSseHeartbeat = startMcpSseHeartbeat(res, config.mcpSseHeartbeatMs, () => {
+          deps.recordMcpConnectionEvent?.({ kind: "sse_writer_stalled", sessionId, requestKind: "sse_stream" });
+          logEvent(config.logging, "warn", "mcp_sse_writer_stalled", {
+            requestId,
+            sessionIdPrefix: sessionIdPrefix(sessionId),
+          });
+        }, () => {
+          deps.recordMcpConnectionEvent?.({ kind: "sse_writer_drained", sessionId, requestKind: "sse_stream" });
+          logEvent(config.logging, "info", "mcp_sse_writer_drained", {
+            requestId,
+            sessionIdPrefix: sessionIdPrefix(sessionId),
+          });
+        });
       }
 
       handlerStartedAt = performance.now();
@@ -873,15 +1058,52 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
         onPolicyWaitEnd,
       }, async () => {
         if (!requestIsSseStream && mcpRequestHasExecutionDeadline(requestRpcMethod, requestToolName)) {
+          // Keep the timeout tracker and general operation diagnostics keyed
+          // by the same durable per-request correlation ID.
+          const expiredOperationId = operationId;
           await handleMcpRequestWithDeadline(
             transport!,
             req,
             res,
             req.body,
             config.mcpExecutionTimeoutMs,
+            () => {
+              handlerSettled = true;
+              admissionRelease?.();
+              admissionRelease = undefined;
+              if (sessionId && sessionRequestClass === "execution" && sessionExecutionCounted) {
+                const state = mcpSessions.get(sessionId);
+                if (state && state.inFlightRequests > 0) state.inFlightRequests--;
+                sessionExecutionCounted = false;
+              }
+            },
+            () => {
+              expiredMcpOperations.markExpired({
+                operationId: expiredOperationId,
+                requestId,
+                generationId: config.launchGenerationId,
+                sessionIdPrefix: sessionIdPrefix(sessionId),
+                rpcMethod: requestRpcMethod,
+                toolName: requestToolName,
+                ownerHash: createHash("sha256")
+                  .update(sessionState?.logicalClientId ?? sessionId ?? "unowned")
+                  .digest("hex")
+                  .slice(0, 16),
+                startedAtMs: requestStartedAtMs,
+                expiredAtMs: Date.now(),
+              });
+              // Signal tools and policy waits that support cancellation. This
+              // request-local abort never closes the shared MCP transport.
+              requestAbort.abort(new McpExecutionTimeoutError(config.mcpExecutionTimeoutMs));
+            },
+            (outcome, error) => {
+              expiredMcpOperations.markTerminated(expiredOperationId, outcome, error);
+            },
           );
         } else {
-          await transport!.handleRequest(req, res, req.body);
+          await transport!.handleRequest(req, res, req.body).finally(() => {
+            handlerSettled = true;
+          });
         }
       });
       const handlerMs = performance.now() - handlerStartedAt;
@@ -906,7 +1128,17 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
         status: res.statusCode,
       });
     } catch (error) {
+      requestErrorClass = error instanceof Error ? error.name : "UnknownError";
+      responseCloseClassification = error instanceof McpExecutionTimeoutError
+        ? "deadline_response"
+        : error instanceof McpAdmissionUnavailableError
+          ? "post_approval_admission_rejected"
+          : "request_error";
+      if (handlerStartedAt === 0 || !(error instanceof McpExecutionTimeoutError)) {
+        handlerSettled = true;
+      }
       logEvent(config.logging, "error", "mcp_request_error", {
+        operationId,
         requestId,
         error: error instanceof Error ? error.message : String(error),
         timedOut: error instanceof McpExecutionTimeoutError,
@@ -925,16 +1157,16 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
         );
       }
     } finally {
-      if (sseHeartbeatTimer) {
-        clearInterval(sseHeartbeatTimer);
-        sseHeartbeatTimer = undefined;
-      }
-      res.off("drain", onSseDrain);
+      stopSseHeartbeat?.();
+      stopSseHeartbeat = undefined;
       removePolicyWaiter();
-      admissionRelease?.();
-      admissionRelease = undefined;
-      // Decrement in-flight count after response completes or is aborted.
-      if (sessionId) {
+      if (handlerSettled) {
+        admissionRelease?.();
+        admissionRelease = undefined;
+      }
+      // A timed-out SDK handler remains the owner of its permit and in-flight
+      // count until the underlying operation actually terminates.
+      if (sessionId && handlerSettled) {
         const state = mcpSessions.get(sessionId);
         if (state && sessionRequestClass) {
           if (sessionRequestClass === "stream" && state.activeSseStreams > 0) state.activeSseStreams--;
@@ -948,5 +1180,17 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
           }
         }
       }
+      if (requestIsWaiter && handlerSettled) {
+        deps.recordMcpConnectionEvent?.({
+          kind: "watcher_completed",
+          sessionId,
+          requestKind: requestToolName,
+          durationMs: Math.round(performance.now() - requestStartedAt),
+        });
+      }
+      finalizeOperationDiagnostic();
+    }
+    } finally {
+      finalizeOperationDiagnostic();
     }
 }

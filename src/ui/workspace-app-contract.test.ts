@@ -5,7 +5,7 @@ import { join } from "node:path";
 // P1.4: the app is decomposed across sibling modules; contract assertions
 // below that name extracted literals scan the module cluster, not only the
 // composition entrypoint.
-const uiModuleSources = ["workspace-app.tsx", "ui-dom.ts", "ui-format.ts", "approval-center.ts", "session-view-helpers.ts", "tool-display.ts", "session-views.ts", "session-view-types.ts", "server-tool-call.ts", "review-feedback.ts", "mission-panel.ts", "workspace-event-reducer.ts", "session-hydration.ts", "payload-mount.ts", "session-surface.ts"]
+const uiModuleSources = ["workspace-app.tsx", "ui-dom.ts", "ui-format.ts", "approval-center.ts", "session-view-helpers.ts", "tool-display.ts", "session-views.ts", "session-view-types.ts", "server-tool-call.ts", "review-feedback.ts", "mission-panel.ts", "workspace-event-reducer.ts", "session-hydration.ts", "payload-mount.ts", "session-surface.ts", "raw-payload.tsx"]
   .map((name) => readFileSync(new URL(`./${name}`, import.meta.url), "utf8"))
   .join("\n");
 const source = readFileSync(new URL("./workspace-app.tsx", import.meta.url), "utf8");
@@ -31,6 +31,11 @@ assert.doesNotMatch(source, /reviewEpoch: Number\(card\?\.summary\?\.reviewEpoch
 assert.doesNotMatch(source, /diffSha256: String\(card\?\.summary\?\.diffSha256 \?\? sc\.diffSha256 \?\? ""\)/, "review identity must not fabricate an empty diff hash");
 assert.match(uiModuleSources, /Needs your input/, "open agent messages must have a visible high-priority surface");
 assert.match(uiModuleSources, /Rich renderer failed/, "plain text is only a rich-renderer failure fallback");
+assert.match(uiModuleSources, /Copy Raw/, "raw payload controls must use the original text");
+assert.match(uiModuleSources, /clipboard\.writeText/, "Copy Raw must request clipboard write access");
+assert.match(uiModuleSources, /raw-payload-fallback/, "Copy Raw must provide manual-copy fallback text");
+assert.match(uiModuleSources, /chatgpt-content-reference/, "agent input must warn on reference-only pastes");
+assert.match(uiModuleSources, /event\.ctrlKey \|\| event\.metaKey/, "agent input must submit with Ctrl/Cmd+Enter");
 
 // P1.4: renderWorkSessionView lives in session-surface.ts; the structural
 // claim is unchanged — the composed session view must not rebuild the whole DOM.

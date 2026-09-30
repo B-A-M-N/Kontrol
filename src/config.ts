@@ -32,6 +32,8 @@ export interface ServerConfig {
   publicBaseUrl: string;
   toolMode: ToolMode;
   widgets: WidgetMode;
+  /** Expose a tiny App SDK diagnostic resource/tool for host troubleshooting. */
+  workspaceAppSmokeEnabled: boolean;
   stateDir: string;
   worktreeRoot: string;
   skillsEnabled: boolean;
@@ -102,7 +104,7 @@ export interface ServerConfig {
   mcpMaxWaiterQueue: number;
   /**
    * Independent cap for Workspace App resource reads. Deliberately not shared
-   * with execution admission: a ~10 MB serialization workload must never be
+   * with execution admission: a large serialization workload must never be
    * able to starve coding tool calls, and coding traffic must not be able to
    * evict resource reads either.
    */
@@ -556,6 +558,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     tunnelReviewerSecret,
     toolMode: parseToolMode(env),
     widgets: parseWidgetMode(env.KONTROL_WIDGETS),
+    workspaceAppSmokeEnabled: env.KONTROL_DEV_WORKSPACE_APP_SMOKE === "1",
     stateDir: resolve(expandHomePath(env.KONTROL_STATE_DIR ?? files.config.stateDir ?? defaultStateDir())),
     worktreeRoot: resolve(expandHomePath(env.KONTROL_WORKTREE_ROOT ?? files.config.worktreeRoot ?? defaultWorktreeRoot())),
     skillsEnabled: env.KONTROL_SKILLS === undefined ? true : parseBoolean(env.KONTROL_SKILLS),

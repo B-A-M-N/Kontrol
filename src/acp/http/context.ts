@@ -73,6 +73,8 @@ export interface AcpContext {
   effectiveWebhookPolicy: WebhookPolicy;
   /** Run-id keyed connected SSE response streams (run event fan-out). */
   sseClients: Map<string, Set<Response>>;
+  /** Bounded run event history for cursor-based ACP SSE replay. */
+  sseHistory: Map<string, Array<{ id: string; event: string; data: unknown }>>;
   /** Local Kontrol tool agents exposed over the ACP surface. */
   agentMap: Map<string, { name: string; description: string }>;
 }

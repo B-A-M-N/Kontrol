@@ -3,6 +3,7 @@ import { createRoot } from "react-dom/client";
 import { parsePatchFiles, type FileDiffMetadata, type FileDiffOptions } from "@pierre/diffs";
 import { FileDiff } from "@pierre/diffs/react";
 import type { HostContext, ToolResultCard } from "./card-types.js";
+import { RawPayloadActions } from "./raw-payload.js";
 
 type ThemeType = "light" | "dark";
 
@@ -57,6 +58,7 @@ function ReviewPayload({
 
   return (
     <div className="review-diff">
+      <RawPayloadActions text={patch} />
       <div className="review-diff-files">
         {visibleFiles.map((fileDiff, index) => {
           const key = fileDiff.cacheKey ?? `${fileDiff.prevName ?? ""}->${fileDiff.name}-${index}`;

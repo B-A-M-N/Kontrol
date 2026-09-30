@@ -19,6 +19,8 @@ export const REQUIRED_BETA_SOAK_ASSERTIONS = Object.freeze([
   "buildIdentityConsistent",
   "sourceIdentityConsistent",
   "continuityBounded",
+  "resourceAdmissionRecovered",
+  "expiredHandlerAccounting",
   "approvalContinuityCapable",
   // P1: the trusted-conversation continuity workload must actually run and
   // recover durable state across transport replacement — not merely re-run

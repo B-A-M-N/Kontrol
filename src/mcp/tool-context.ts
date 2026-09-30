@@ -5,7 +5,10 @@
  */
 import type { ServerConfig, WidgetMode } from "../config.js";
 import type { PolicyConfig } from "../policy.js";
-import { workspaceAppToolMeta } from "../workspace-app-resource.js";
+import {
+  workspaceAppCallableToolMeta,
+  workspaceAppRenderToolMeta,
+} from "../workspace-app-resource.js";
 
 export type ToolWidgetKind =
   | "workspace"
@@ -17,19 +20,8 @@ export type ToolWidgetKind =
   | "shell"
   | "show_changes";
 
-interface ToolDefinitionMeta extends Record<string, unknown> {
-  ui: {
-    resourceUri: string;
-    visibility: ["model"];
-  };
-}
-
-type EmptyToolDefinitionMeta = Record<string, unknown> & {
-  "ui/resourceUri"?: string;
-};
-
 interface ToolWidgetDescriptorMeta {
-  _meta: ToolDefinitionMeta | EmptyToolDefinitionMeta;
+  _meta: Record<string, unknown>;
 }
 
 function shouldAttachWidget(mode: WidgetMode, kind: ToolWidgetKind): boolean {
@@ -75,14 +67,22 @@ export function toolWidgetDescriptorMeta(
   config: ServerConfig,
   kind: ToolWidgetKind,
 ): ToolWidgetDescriptorMeta {
+  // Opening a workspace is a data/bootstrap operation. The dedicated
+  // show_workspace_ui tool owns renderer selection for the workspace surface.
+  if (kind === "workspace") return { _meta: {} };
   if (config.widgets === "changes" && toolCanRequireInteractiveApproval(config.policy, kind)) {
     return {
-      _meta: workspaceAppToolMeta(["model"]) as unknown as ToolDefinitionMeta,
+      _meta: workspaceAppCallableToolMeta(),
     };
   }
   if (!shouldAttachWidget(config.widgets, kind)) return { _meta: {} };
 
   return {
-    _meta: workspaceAppToolMeta(["model"]) as unknown as ToolDefinitionMeta,
+    _meta: workspaceAppCallableToolMeta(),
   };
+}
+
+/** Only deliberate renderer entry points advertise the Workspace App resource. */
+export function workspaceAppRenderToolDescriptorMeta(): ToolWidgetDescriptorMeta {
+  return { _meta: workspaceAppRenderToolMeta() };
 }

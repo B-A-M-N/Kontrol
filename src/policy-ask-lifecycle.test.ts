@@ -39,6 +39,10 @@ const config = loadConfig({
   KONTROL_ACP_ENABLED: "false",
   // The whole point of this test: KONTROL_POLICY_MODE=ask, not allow.
   KONTROL_POLICY_MODE: "ask",
+  KONTROL_POLICY_TOOL_READ: "allow",
+  KONTROL_POLICY_PATH_RULES: JSON.stringify([
+    { pattern: "resume-read.txt", mode: "ask" },
+  ]),
   KONTROL_LOG_LEVEL: "error",
   KONTROL_LOG_REQUESTS: "0",
   KONTROL_OAUTH_OWNER_TOKEN: reviewerToken,
@@ -311,6 +315,8 @@ try {
     // path returns the durable existing workspace, which would inherit the
     // earlier workspace grant and bypass the prompt this block must see.
     writeFileSync(join(resumeRoot, "marker.txt"), "resume-marker\n");
+    writeFileSync(join(resumeRoot, "resume-edit.txt"), "before\n");
+    writeFileSync(join(resumeRoot, "resume-read.txt"), "resume-read-marker\n");
     const resumeWs = await openWorkspace("ask-mode-resume-client", resumeRoot);
     const resumeSessionId = resumeWs.sessionId;
     const resumeWorkspaceId = resumeWs.workspaceId;
@@ -357,6 +363,81 @@ try {
       .map((chunk: any) => chunk.text ?? "")
       .join("");
     assert.ok(resumeText.includes("resume-runs"), `resumed retry executed: ${resumeText}`);
+
+    // Structured mutation tools must forward the same opaque resume identity
+    // into policy enforcement. Without that forwarding, a reconnect retries
+    // as a new operation and prompts again even though the approval id is
+    // present in the request.
+    const resumeWriteArgs = {
+      workspaceId: resumeWorkspaceId,
+      path: "resume-write.txt",
+      content: "write-resumed\n",
+    };
+    const resumeWriteFirst = await rpc("tools/call", {
+      name: "write",
+      arguments: resumeWriteArgs,
+    }, { sessionId: resumeReconnectSessionId });
+    assert.equal(resumeWriteFirst.payload?.result?.structuredContent?.status, "approval_required");
+    const resumeWriteApprovalId = await waitForMatchingApproval(reviewerSessionId, resumeWorkspaceId);
+    const resumeWriteApprove = await rpc("tools/call", {
+      name: "provide_policy_approval",
+      arguments: { approvalId: resumeWriteApprovalId, decision: "approve", reason: "resume-write-once" },
+    }, { sessionId: reviewerSessionId, reviewer: true });
+    assert.notEqual(resumeWriteApprove.payload?.result?.isError, true);
+    const resumeWriteRetry = await rpc("tools/call", {
+      name: "write",
+      arguments: { ...resumeWriteArgs, approvalResumeId: resumeWriteApprovalId },
+    }, { sessionId: resumeReconnectSessionId });
+    assert.notEqual(resumeWriteRetry.payload?.result?.isError, true,
+      `write retry must consume the original approval: ${JSON.stringify(resumeWriteRetry.payload)}`);
+
+    const resumeEditArgs = {
+      workspaceId: resumeWorkspaceId,
+      path: "resume-edit.txt",
+      edits: [{ oldText: "before\n", newText: "after\n" }],
+    };
+    const resumeEditFirst = await rpc("tools/call", {
+      name: "edit",
+      arguments: resumeEditArgs,
+    }, { sessionId: resumeReconnectSessionId });
+    assert.equal(resumeEditFirst.payload?.result?.structuredContent?.status, "approval_required");
+    const resumeEditApprovalId = await waitForMatchingApproval(reviewerSessionId, resumeWorkspaceId);
+    const resumeEditApprove = await rpc("tools/call", {
+      name: "provide_policy_approval",
+      arguments: { approvalId: resumeEditApprovalId, decision: "approve", reason: "resume-edit-once" },
+    }, { sessionId: reviewerSessionId, reviewer: true });
+    assert.notEqual(resumeEditApprove.payload?.result?.isError, true);
+    const resumeEditRetry = await rpc("tools/call", {
+      name: "edit",
+      arguments: { ...resumeEditArgs, approvalResumeId: resumeEditApprovalId },
+    }, { sessionId: resumeReconnectSessionId });
+    assert.notEqual(resumeEditRetry.payload?.result?.isError, true,
+      `edit retry must consume the original approval: ${JSON.stringify(resumeEditRetry.payload)}`);
+
+    // Read-only tools can be placed behind a path ask rule. The public read
+    // handler must forward its resume ID or the approved path operation would
+    // prompt again after a reconnect.
+    const readPending = await rpc("tools/call", {
+      name: "read",
+      arguments: { workspaceId: resumeWorkspaceId, path: "resume-read.txt" },
+    }, { sessionId: resumeSessionId });
+    assert.equal(readPending.payload?.result?.structuredContent?.status, "approval_required",
+      `path-protected read should surface a retryable approval: ${JSON.stringify(readPending.payload)}`);
+    const readApprovalId = readPending.payload?.result?.structuredContent?.approvalId;
+    assert.ok(typeof readApprovalId === "string" && readApprovalId.startsWith("pol_"));
+    const approveRead = await rpc("tools/call", {
+      name: "provide_policy_approval",
+      arguments: { approvalId: readApprovalId, decision: "approve", reason: "resume-read-once" },
+    }, { sessionId: reviewerSessionId, reviewer: true });
+    assert.notEqual(approveRead.payload?.result?.isError, true, "path-protected read approval should resolve");
+    const readAfterResume = await rpc("tools/call", {
+      name: "read",
+      arguments: { workspaceId: resumeWorkspaceId, path: "resume-read.txt", approvalResumeId: readApprovalId },
+    }, { sessionId: resumeReconnectSessionId });
+    assert.notEqual(readAfterResume.payload?.result?.structuredContent?.status, "approval_required",
+      `read should consume the approved operation instead of prompting again: ${JSON.stringify(readAfterResume.payload)}`);
+    assert.ok(JSON.stringify(readAfterResume.payload?.result).includes("resume-read-marker"),
+      "resumed read should return the guarded file content");
 
     // The one-shot result is consumed: a second resumed retry prompts again.
     const resumeSecond = await rpc("tools/call", {

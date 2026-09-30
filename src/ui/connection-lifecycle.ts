@@ -27,6 +27,7 @@ export interface LifecycleHost {
   applyHostContext(): void;
   getHostContext(): unknown;
   setHostContext(v: unknown): void;
+  recreateApp(): Promise<void>;
   isConnected(): boolean;
   connectionState(): string;
   setConnectionState(v: string): void;
@@ -41,35 +42,109 @@ let host: LifecycleHost;
 
 // Reconnect de-dup: overlapping transport failures collapse into one retry.
 let reconnectPromise: Promise<void> | null = null;
+let reconnectGeneration = 0;
+const reconnectWaiters = new Set<() => void>();
 export function setLifecycleHost(next: LifecycleHost): void {
   host = next;
 }
 
+/** Cancel the current reconnect owner and wake any bounded retry backoff. */
+export function cancelReconnect(): void {
+  reconnectGeneration += 1;
+  for (const wake of reconnectWaiters) wake();
+  reconnectWaiters.clear();
+}
+
+async function waitForRetry(delayMs: number, generation: number): Promise<void> {
+  if (generation !== reconnectGeneration) return;
+  await new Promise<void>((resolve) => {
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      reconnectWaiters.delete(finish);
+      resolve();
+    };
+    reconnectWaiters.add(finish);
+    timer = setTimeout(finish, delayMs);
+    if (generation !== reconnectGeneration) finish();
+  });
+}
+
+function finishConnection(generation: number): boolean {
+  if (generation !== reconnectGeneration || !host.app()) return false;
+  const initialContext = host.getHostContext();
+  if (initialContext) host.setHostContext(initialContext);
+  host.applyHostContext();
+  host.setConnected(true);
+  host.setConnectionState("CONNECTED");
+  host.setConnectionError(null);
+  host.queueSessionRehydration();
+  return true;
+}
+
+/** Initial App startup gets one bounded retry and then shows a terminal error. */
+export async function connectBootstrapWithRetry(): Promise<void> {
+  const generation = reconnectGeneration;
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 2 && generation === reconnectGeneration; attempt += 1) {
+    if (!host.app()) break;
+    host.setConnectionState(attempt === 0 ? "CONNECTING" : "RECONNECTING");
+    host.scheduleRender();
+    try {
+      await host.connectApp();
+      if (finishConnection(generation)) return;
+      break;
+    } catch (error) {
+      lastError = error;
+      if (attempt === 0 && generation === reconnectGeneration && host.app()) {
+        try {
+          await host.recreateApp();
+        } catch (recreateError) {
+          lastError = recreateError;
+        }
+      }
+    }
+  }
+  const message = lastError instanceof Error ? lastError.message : String(lastError ?? "The MCP host connection is unavailable.");
+  host.setConnected(false);
+  host.setConnectionState("DISCONNECTED");
+  host.setConnectionError(message);
+  host.scheduleRender();
+  throw lastError instanceof Error ? lastError : new Error(message);
+}
+
 export async function connectWithRetry(reason?: unknown): Promise<void> {
+  const generation = reconnectGeneration;
   let retryDelayMs = 1_000;
-  while (host.app() && !host.isConnected()) {
+  while (generation === reconnectGeneration && host.app() && !host.isConnected()) {
     host.setConnectionState(retryDelayMs === 1_000 && !reason ? "CONNECTING" : "RECONNECTING");
     host.scheduleRender();
     try {
       await host.connectApp();
-      const initialContext = host.getHostContext();
-      if (initialContext) host.setHostContext(initialContext);
-      host.applyHostContext();
-      host.setConnected(true);
-      host.setConnectionState("CONNECTED");
-      host.setConnectionError(null);
-      // Rehydrate any sessions that were already live before this WebUI
-      // (re)loaded. The same path is used after a transport reconnect.
-      host.queueSessionRehydration();
-      return;
+      if (finishConnection(generation)) return;
+      break;
     } catch (connectErrorValue) {
+      if (generation !== reconnectGeneration || !host.app()) break;
+      // A failed host transport may leave the SDK App instance permanently
+      // bound to a closed message channel. Recreate the SDK object before the
+      // next bounded attempt; the host supplies all durable UI state through
+      // rehydration after the new handshake.
+      try {
+        await host.recreateApp();
+      } catch (recreateError) {
+        connectErrorValue = recreateError;
+      }
+      if (generation !== reconnectGeneration || !host.app()) break;
       host.setConnectionState("RECONNECTING");
       host.setConnectionError(connectErrorValue instanceof Error
         ? connectErrorValue.message
         : String(connectErrorValue));
       host.scheduleRender();
       const jitter = Math.floor(Math.random() * Math.min(500, retryDelayMs / 2));
-      await new Promise((resolve) => setTimeout(resolve, retryDelayMs + jitter));
+      await waitForRetry(retryDelayMs + jitter, generation);
       retryDelayMs = Math.min(30_000, retryDelayMs * 2);
       reason = undefined;
     }

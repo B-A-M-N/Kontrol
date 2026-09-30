@@ -9,6 +9,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { WORKSPACE_APP_BUNDLE_LIMITS } from "../../scripts/check-workspace-app-bundle.mjs";
 
 const repoRoot = join(fileURLToPath(new URL(".", import.meta.url)), "../..");
 
@@ -31,10 +32,10 @@ try {
   const raw = readFileSync(htmlPath);
   const gzipped = gzipSync(raw);
 
-  // Ceilings chosen just above the current artifact (~10.5 MB / ~1.91 MB):
-  // growth beyond these numbers requires an explicit ceiling bump in this file.
-  const MAX_RAW_BYTES = 11 * 1024 * 1024;
-  const MAX_GZIP_BYTES = 2 * 1024 * 1024;
+  // Keep the UI test aligned with the production bundle gate so neither path
+  // can silently reintroduce the oversized app artifact.
+  const MAX_RAW_BYTES = WORKSPACE_APP_BUNDLE_LIMITS.workspaceAppRawBytes;
+  const MAX_GZIP_BYTES = WORKSPACE_APP_BUNDLE_LIMITS.workspaceAppGzipBytes;
 
   assert.ok(
     raw.length <= MAX_RAW_BYTES,

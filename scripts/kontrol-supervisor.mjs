@@ -5,7 +5,7 @@
 import { existsSync, mkdirSync, renameSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { join, resolve } from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const DEFAULT_INTERVAL_MS = 5_000;
@@ -18,6 +18,40 @@ const TUNNEL_READINESS_TIMEOUT_MS = 10_000;
 const RECOVERY_TIMEOUT_MS = 60_000;
 const RESTART_BACKOFF_BASE_MS = 2_000;
 const RESTART_BUDGET = 5;
+const CIRCUIT_COOLDOWN_BASE_MS = 60_000;
+const MCP_CANARY_INTERVAL_MS = 60_000;
+const MCP_CANARY_TIMEOUT_MS = 15_000;
+const MCP_CANARY_ENVIRONMENT_KEYS = [
+  "PATH",
+  "HOME",
+  "USER",
+  "LOGNAME",
+  "SHELL",
+  "TMPDIR",
+  "TMP",
+  "TEMP",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  "TERM",
+  "COLORTERM",
+  "CI",
+  "NO_COLOR",
+  "NODE_PATH",
+  "NODE_OPTIONS",
+];
+
+function mcpCanaryEnvironment(source = process.env) {
+  const environment = {};
+  for (const key of MCP_CANARY_ENVIRONMENT_KEYS) {
+    const value = source[key];
+    if (value !== undefined) environment[key] = value;
+  }
+  environment.NO_COLOR = "1";
+  environment.TERM = "dumb";
+  environment.CI = "1";
+  return environment;
+}
 
 function readServerIdentity(stateDir) {
   try { return JSON.parse(readFileSync(join(stateDir, "server.identity.json"), "utf8")); }
@@ -37,7 +71,14 @@ export function processIsLive(pid) {
     process.kill(numericPid, 0);
     return true;
   } catch {
-    return false;
+    // macOS and Windows do not expose Linux's /proc state. The signal-0
+    // liveness check still provides the best portable ownership check there.
+    try {
+      process.kill(numericPid, 0);
+      return true;
+    } catch {
+      return false;
+    }
   }
 }
 
@@ -114,7 +155,7 @@ function releaseRuntimeLock(stateDir, token) {
 }
 
 export class FailureTracker {
-  constructor(name) {
+  constructor(name, { circuitCooldownMs = CIRCUIT_COOLDOWN_BASE_MS } = {}) {
     this.name = name;
     this.consecutiveFailures = 0;
     this.restartCount = 0;
@@ -126,10 +167,15 @@ export class FailureTracker {
     this.lastExternalProbeResult = undefined;
     this.state = "starting";
     this.restartWindowStartedAt = 0;
+    this.circuitCooldownMs = circuitCooldownMs;
+    this.circuitOpenCount = 0;
+    this.openedAt = undefined;
+    this.nextRetryAt = undefined;
   }
 
   record(result, now = new Date().toISOString()) {
     this.lastExternalProbeResult = result;
+    const nowMs = typeof now === "number" ? now : Date.parse(now);
     const healthy = result.ok && !result.degraded;
     // A failed external dependency probe is not automatically a local
     // process failure. Tunnel control-plane throttling/auth outages are
@@ -143,9 +189,12 @@ export class FailureTracker {
       this.restartFailures = 0;
       this.lastHealthyAt = now;
       this.state = "healthy";
+      this.openedAt = undefined;
+      this.nextRetryAt = undefined;
+      this.circuitOpenCount = 0;
       return;
     }
-    if (this.state === "circuit_open") return;
+    if (!this.maybeHalfOpen(Number.isFinite(nowMs) ? nowMs : Date.now())) return;
     if (restartableFailure) this.consecutiveFailures += 1;
     else this.consecutiveFailures = 0;
     this.state = "degraded";
@@ -166,7 +215,36 @@ export class FailureTracker {
   noteRestartFailure() {
     this.restartFailures += 1;
     this.totalRestartFailures += 1;
-    this.state = this.restartFailures >= ESCALATION_RESTART_THRESHOLD ? "circuit_open" : "failed";
+    if (this.restartFailures >= ESCALATION_RESTART_THRESHOLD) {
+      this.openCircuit();
+    } else {
+      this.state = "failed";
+    }
+  }
+
+  openCircuit(now = Date.now()) {
+    this.circuitOpenCount += 1;
+    this.openedAt = now;
+    this.nextRetryAt = now + Math.min(
+      15 * 60_000,
+      this.circuitCooldownMs * (2 ** Math.max(0, this.circuitOpenCount - 1)),
+    );
+    this.state = "circuit_open";
+  }
+
+  maybeHalfOpen(now = Date.now()) {
+    if (this.state !== "circuit_open") return true;
+    if (this.nextRetryAt === undefined || now < this.nextRetryAt) return false;
+    this.state = "half_open";
+    // One fenced attempt is allowed after the cooldown. Keep the normal
+    // failure threshold so a single failed probe cannot repeatedly re-enter
+    // recovery before the attempt is actually made.
+    this.consecutiveFailures = Math.max(this.consecutiveFailures, FAILURE_THRESHOLD);
+    return true;
+  }
+
+  canAttemptRecovery(now = Date.now()) {
+    return this.maybeHalfOpen(now) || this.state !== "circuit_open";
   }
 
   snapshot() {
@@ -180,6 +258,8 @@ export class FailureTracker {
       lastRestartReason: this.lastRestartReason,
       lastExternalProbeResult: this.lastExternalProbeResult,
       state: this.state,
+      openedAt: this.openedAt,
+      nextRetryAt: this.nextRetryAt,
     };
   }
 }
@@ -224,6 +304,113 @@ function launchCommand(root, command) {
 
 export function sleep(ms) {
   return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
+}
+
+/**
+ * A fresh-client MCP canary is deliberately independent from component
+ * liveness. It records whether the externally configured route can initialize,
+ * enumerate the current catalog, and perform one lightweight read; a failure
+ * is surfaced in supervisor status but never restarts the core or tunnel.
+ */
+export function createMcpCanaryRunner({
+  url,
+  workspacePath,
+  readPath = "AGENTS.md",
+  authorizationFile,
+  expectedVersion,
+  intervalMs = MCP_CANARY_INTERVAL_MS,
+  timeoutMs = MCP_CANARY_TIMEOUT_MS,
+  root = process.cwd(),
+  spawnFn = spawn,
+  now = () => Date.now(),
+} = {}) {
+  const enabled = typeof url === "string" && url.trim().length > 0;
+  const state = {
+    enabled,
+    running: false,
+    lastStartedAt: undefined,
+    lastCompletedAt: undefined,
+    lastOk: undefined,
+    lastError: undefined,
+    lastDurationMs: 0,
+    consecutiveFailures: 0,
+    totalRuns: 0,
+    totalFailures: 0,
+    nextRunAt: 0,
+  };
+
+  function snapshot() {
+    return {
+      enabled: state.enabled,
+      running: state.running,
+      lastStartedAt: state.lastStartedAt,
+      lastCompletedAt: state.lastCompletedAt,
+      lastOk: state.lastOk,
+      lastError: state.lastError,
+      lastDurationMs: state.lastDurationMs,
+      consecutiveFailures: state.consecutiveFailures,
+      totalRuns: state.totalRuns,
+      totalFailures: state.totalFailures,
+    };
+  }
+
+  async function runIfDue(at = now()) {
+    if (!enabled || state.running || at < state.nextRunAt) return false;
+    state.running = true;
+    state.lastStartedAt = new Date(at).toISOString();
+    state.totalRuns += 1;
+    state.nextRunAt = at + Math.max(1_000, intervalMs);
+    const started = at;
+    const args = [
+      join(root, "scripts/probe-mcp-tunnel.mjs"),
+      "--url", url,
+      "--workspace", workspacePath || root,
+      "--cycles", "1",
+      "--tool-name", "read",
+      "--read-path", readPath,
+    ];
+    if (authorizationFile) args.push("--authorization-file", authorizationFile);
+    if (expectedVersion) args.push("--expected-mcp-version", expectedVersion);
+    return await new Promise((resolvePromise) => {
+      let settled = false;
+      let timeout;
+      const finish = (ok, error) => {
+        if (settled) return;
+        settled = true;
+        if (timeout) clearTimeout(timeout);
+        state.running = false;
+        state.lastCompletedAt = new Date(now()).toISOString();
+        state.lastDurationMs = Math.max(0, now() - started);
+        state.lastOk = ok;
+        state.lastError = error;
+        if (ok) state.consecutiveFailures = 0;
+        else {
+          state.consecutiveFailures += 1;
+          state.totalFailures += 1;
+        }
+        resolvePromise(ok);
+      };
+      let child;
+      try {
+        child = spawnFn(process.execPath, args, {
+          cwd: root,
+          env: mcpCanaryEnvironment(),
+          stdio: ["ignore", "ignore", "ignore"],
+        });
+      } catch (error) {
+        finish(false, error instanceof Error ? error.message : String(error));
+        return;
+      }
+      timeout = setTimeout(() => {
+        finish(false, "timeout");
+        try { child.kill("SIGTERM"); } catch { /* already exited */ }
+      }, Math.max(1_000, timeoutMs));
+      child.once("error", (error) => finish(false, error instanceof Error ? error.message : String(error)));
+      child.once("close", (code, signal) => finish(code === 0, code === 0 ? undefined : `exit:${code ?? "unknown"}${signal ? `:${signal}` : ""}`));
+    });
+  }
+
+  return { runIfDue, snapshot };
 }
 
 function restartSession(name, root, command) {
@@ -318,7 +505,8 @@ export function classifyTunnelProbeFailure(result) {
 export function shouldRecoverComponent(component, result, failureThreshold = FAILURE_THRESHOLD) {
   if (!component || !result) return false;
   if (result.ok && !result.restartable) return false;
-  if (component.tracker.state === "circuit_open") return false;
+  if (!component.tracker.canAttemptRecovery()) return false;
+  if (component.tracker.state === "half_open") return true;
   return component.tracker.consecutiveFailures >= failureThreshold;
 }
 
@@ -357,14 +545,17 @@ export function createRecoveryEngine({
   async function restartAndWait(name, reason) {
     const component = components[name];
     if (!component || !component.session || !component.command) return;
-    if (component.tracker.state === "circuit_open") {
+    if (!component.tracker.canAttemptRecovery()) {
       throw new Error(`${name} restart circuit is open; manual intervention is required`);
     }
-    if (component.tracker.restartCount >= restartBudget) {
-      component.tracker.state = "circuit_open";
+    component.tracker.noteRestart(reason);
+    // noteRestart() owns rolling-window expiry. Check the budget only after it
+    // has had a chance to reset an old window, otherwise an exhausted budget
+    // remains open forever even after the 15-minute window has elapsed.
+    if (component.tracker.restartCount > restartBudget) {
+      component.tracker.openCircuit();
       throw new Error(`${name} restart budget exhausted (${restartBudget} restarts in the current window)`);
     }
-    component.tracker.noteRestart(reason);
     await sleepFn(Math.min(10_000, restartBackoffBaseMs * Math.max(0, component.tracker.restartCount - 1)));
     await restart(name, component);
     component.tracker.state = "waiting_ready";
@@ -484,6 +675,89 @@ function buildComponents({ kontrolUrl, tunnelUrl, agents, crushPort, hermesPort,
   return components;
 }
 
+/**
+ * Run the ownership-fenced monitoring loop. The production wiring supplies
+ * status persistence and tmux recovery; tests can inject each boundary to
+ * prove that a bad probe/tick/status write does not silently terminate the
+ * supervisor, while an ownership failure still becomes terminal.
+ */
+export function runSupervisorMonitoringLoop({
+  intervalMs = DEFAULT_INTERVAL_MS,
+  tick,
+  assertOwnership,
+  writeStarting,
+  writeDegraded,
+  writeFatal,
+  writeStopped,
+  releaseOwnership,
+  sleepFn = sleep,
+  onError = () => {},
+} = {}) {
+  if (typeof tick !== "function") throw new TypeError("supervisor tick is required");
+  if (typeof assertOwnership !== "function") throw new TypeError("supervisor ownership check is required");
+
+  let stopping = false;
+  let terminalState = "stopped";
+  let monitoringError;
+  let monitoringBackoffMs = 1_000;
+  const stop = () => { stopping = true; };
+  const reportError = (prefix, error) => {
+    const message = error instanceof Error ? error.message : String(error);
+    onError(`${prefix}: ${message}`);
+    return message;
+  };
+  const bestEffortStatus = async (writer, ...args) => {
+    if (typeof writer !== "function") return;
+    try {
+      await writer(...args);
+    } catch (error) {
+      monitoringError = reportError("status write failed", error);
+    }
+  };
+
+  const promise = (async () => {
+    try {
+      // A status path can be temporarily unavailable during startup. Keep the
+      // ownership loop alive so a later atomic write can publish readiness.
+      await bestEffortStatus(writeStarting);
+      while (!stopping) {
+        // Runtime-lock loss is the only irrecoverable monitoring condition.
+        assertOwnership();
+        try {
+          await tick({ stop });
+          monitoringError = undefined;
+          monitoringBackoffMs = 1_000;
+        } catch (error) {
+          monitoringError = reportError("monitoring tick failed", error);
+          await bestEffortStatus(writeDegraded, monitoringError);
+          await sleepFn(monitoringBackoffMs);
+          monitoringBackoffMs = Math.min(30_000, monitoringBackoffMs * 2);
+        }
+        if (!stopping) await sleepFn(intervalMs);
+      }
+    } catch (error) {
+      terminalState = "fatal";
+      monitoringError = error instanceof Error ? error.message : String(error);
+      onError(`ownership/monitoring failure: ${monitoringError}`);
+      await bestEffortStatus(writeFatal, monitoringError);
+    } finally {
+      if (terminalState === "stopped" && stopping) await bestEffortStatus(writeStopped);
+      try {
+        await releaseOwnership?.();
+      } catch (error) {
+        reportError("ownership release failed", error);
+      }
+    }
+    return { terminalState, monitoringError };
+  })();
+
+  return {
+    promise,
+    stop,
+    isStopping: () => stopping,
+  };
+}
+
 async function main() {
   const root = resolve(arg("--root", process.cwd()));
   const kontrolUrl = originFromUrl(arg("--kontrol-url", "http://127.0.0.1:7676"));
@@ -502,16 +776,31 @@ async function main() {
   const startCrush = arg("--start-crush", "false") === "true";
   const startHermes = arg("--start-hermes", "false") === "true";
   const intervalMs = Number(arg("--interval-ms", process.env.KONTROL_SUPERVISOR_INTERVAL_MS || DEFAULT_INTERVAL_MS));
+  const mcpCanaryUrl = arg("--mcp-canary-url", process.env.KONTROL_MCP_CANARY_URL || process.env.KONTROL_PUBLIC_BASE_URL || "");
+  const mcpCanaryWorkspace = arg("--mcp-canary-workspace", process.env.KONTROL_MCP_CANARY_WORKSPACE || root);
+  const mcpCanaryReadPath = arg("--mcp-canary-read-path", process.env.KONTROL_MCP_CANARY_READ_PATH || "AGENTS.md");
+  const mcpCanaryAuthorizationFile = arg("--mcp-canary-authorization-file", process.env.KONTROL_MCP_CANARY_AUTH_FILE || "");
+  const mcpCanaryExpectedVersion = arg("--mcp-canary-expected-version", process.env.KONTROL_MCP_CANARY_EXPECTED_VERSION || "");
+  const mcpCanary = createMcpCanaryRunner({
+    url: mcpCanaryUrl,
+    workspacePath: mcpCanaryWorkspace,
+    readPath: mcpCanaryReadPath,
+    authorizationFile: mcpCanaryAuthorizationFile || undefined,
+    expectedVersion: mcpCanaryExpectedVersion,
+    root,
+    intervalMs: Number(process.env.KONTROL_MCP_CANARY_INTERVAL_MS || MCP_CANARY_INTERVAL_MS),
+    timeoutMs: Number(process.env.KONTROL_MCP_CANARY_TIMEOUT_MS || MCP_CANARY_TIMEOUT_MS),
+  });
   const components = buildComponents({ kontrolUrl, tunnelUrl, agents, crushPort, hermesPort, startCrush, startHermes, generationId, expectedBuildId, artifactPath, runtimeLockToken });
   const startedAt = new Date().toISOString();
-  let stopping = false;
 
-  const status = (state, externalProbeResult) => ({
+  const status = (state, externalProbeResult, monitoringError) => ({
     ok: state === "healthy",
     state,
     pid: process.pid,
     startedAt,
     updatedAt: new Date().toISOString(),
+    processStartToken: processStartToken(process.pid),
     lastHealthyAt: Object.values(components).map(({ tracker }) => tracker.lastHealthyAt).filter(Boolean).sort().at(-1),
     consecutiveFailures: Object.values(components).reduce((sum, { tracker }) => sum + tracker.consecutiveFailures, 0),
     restartCount: Object.values(components).reduce((sum, { tracker }) => sum + tracker.restartCount, 0),
@@ -521,6 +810,8 @@ async function main() {
     lastExternalProbeResult: externalProbeResult,
     generationId,
     expectedBuildId: expectedBuildId || undefined,
+    mcpCanary: mcpCanary.snapshot(),
+    monitoringError: monitoringError || undefined,
     serverIdentity: readServerIdentity(stateDir),
     generation: (() => {
       try { return JSON.parse(readFileSync(join(stateDir, "generation.json"), "utf8")); }
@@ -643,19 +934,40 @@ async function main() {
       // dead. Keep the dependency degraded/circuit-open and avoid restarting
       // a healthy core, which only compounds the outage.
     }
+    // The canary has its own failure domain. It intentionally does not affect
+    // `healthy` or enter the component recovery engine: an external route or
+    // catalog problem must remain distinguishable from local process death.
+    await mcpCanary.runIfDue();
     const state = healthy ? "healthy" : recovery.isRecovering() ? "recovering" : "degraded";
     writeStatus(statusFile, status(state, results.tunnel));
   }
 
-  process.once("SIGINT", () => { stopping = true; recovery.setStopping(true); });
-  process.once("SIGTERM", () => { stopping = true; recovery.setStopping(true); });
-  writeStatus(statusFile, status("starting"));
-  while (!stopping) {
-    await tick();
-    if (!stopping) await new Promise((resolvePromise) => setTimeout(resolvePromise, intervalMs));
-  }
-  writeStatus(statusFile, status("stopped"));
-  releaseRuntimeLock(stateDir, runtimeLockToken);
+  let monitor;
+  const requestStop = () => {
+    monitor?.stop();
+    recovery.setStopping(true);
+  };
+  process.once("SIGINT", requestStop);
+  process.once("SIGTERM", requestStop);
+  monitor = runSupervisorMonitoringLoop({
+    intervalMs,
+    tick,
+    assertOwnership: () => assertRuntimeLock(stateDir, runtimeLockToken),
+    writeStarting: () => writeStatus(statusFile, status("starting")),
+    writeDegraded: (error) => writeStatus(statusFile, status("degraded", undefined, error)),
+    writeFatal: (error) => {
+      recovery.setStopping(true);
+      process.exitCode = 1;
+      writeStatus(statusFile, status("fatal", undefined, error));
+    },
+    writeStopped: () => writeStatus(statusFile, status("stopped")),
+    // releaseRuntimeLock re-checks the token and PID under its arbitration
+    // guard. It cannot erase a replacement generation's lock record.
+    releaseOwnership: () => releaseRuntimeLock(stateDir, runtimeLockToken),
+    onError: (message) => console.error(`[kontrol-supervisor] ${message}`),
+  });
+  const result = await monitor.promise;
+  if (result.terminalState === "fatal") process.exitCode = 1;
 }
 
 const isMain = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));

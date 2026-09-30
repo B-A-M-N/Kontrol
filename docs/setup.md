@@ -176,28 +176,95 @@ Then run the real soak against the exact candidate build reported by
 `beta-code-qualification.json`, followed by the final evidence join:
 
 ```bash
-npm run soak:beta -- --hours 12 --build-id CANDIDATE_BUILD_ID --diagnostics-secret "$KONTROL_DIAGNOSTICS_SECRET" --tunnel-url http://127.0.0.1:8080
+npm run soak:beta -- --hours 12 --url "$KONTROL_PUBLIC_BASE_URL" --workspace-path "$PWD" --build-id CANDIDATE_BUILD_ID --diagnostics-secret "$KONTROL_DIAGNOSTICS_SECRET" --tunnel-url http://127.0.0.1:8080
+npm run probe:tunnel -- --url "$KONTROL_PUBLIC_BASE_URL" --workspace "$PWD" --dual --cycles 1 \
+  --watcher-timeout-ms 18000 --heartbeat-count 2 --minimum-drain-events 2 \
+  --resource-load-reads 2 --diagnostics-secret "$KONTROL_DIAGNOSTICS_SECRET" \
+  --host-catalog-file external-tools-list.json \
+  --expected-mcp-version VERSION_PLUS_CONTENT_SHA \
+  --expected-build-id CANDIDATE_BUILD_ID \
+  --result-file beta-external-catalog.json
 npm run gate:beta:final
 ```
 
+Capture `external-tools-list.json` from the connected MCP host after the
+candidate deployment. It must be one envelope containing `capturedAt`, a
+`captureId`, the fresh `initialize` response, and the matching authoritative
+`tools/list` response. The host capture is operator-supplied evidence; the
+receipt labels it as such and does not claim Kontrol machine-verified the host
+exchange. The probe independently opens a fresh server transport, records its
+server version and catalog as machine-verified evidence, exercises two live
+SSE heartbeat cycles under concurrent Workspace App resource reads, and
+requires two observed drain recoveries. A localhost or idle-proxy run cannot
+write a qualification receipt. Capture the host snapshot during the candidate
+soak and run the probe after the soak ends.
+
+For a reported ChatGPT stream interruption, preserve the browser HAR, the
+authenticated diagnostics snapshot, Kontrol JSON logs, and any intermediary
+delivery logs. Compare them with:
+
+    node scripts/analyze-mcp-stream-failure.mjs --har chatgpt.har --kontrol-log kontrol.jsonl --diagnostics diagnostics.json --tunnel-log tunnel.jsonl --output stream-correlation.json
+
+The report separates exact external-ID matches from timestamp proximity. HAR
+cannot expose all ChatGPT server-side tool dispatch, and a Kontrol response
+finishing proves only local response-stream completion.
+
 Inspect `beta-code-qualification.json`, `beta-soak.json`,
-`beta-qualification.json`, and `beta-fault-matrix.json` before deployment.
+`beta-external-catalog.json`, `beta-qualification.json`, and
+`beta-fault-matrix.json` before deployment.
 The final gate requires clean end-state evidence, matching candidate/source
-identity, and a passing soak; local accelerated checks do not substitute for
-the multi-hour real-stack soak required for a persistent installation.
+identity, a passing soak, and a fresh external host catalog receipt for that
+same deployment. Local accelerated checks do not substitute for the
+multi-hour real-stack soak required for a persistent installation.
 
 For the required real wall-clock soak, choose the duration explicitly (12
 hours is the minimum enforced by the canonical stable-beta gate) and inspect
 its metrics report when it finishes:
 
 ```bash
-npm run soak:beta -- --hours 12 --url http://127.0.0.1:7676 --build-id CANDIDATE_BUILD_ID --diagnostics-secret "$KONTROL_DIAGNOSTICS_SECRET" --tunnel-url http://127.0.0.1:8080
+npm run soak:beta -- --hours 12 --url "$KONTROL_PUBLIC_BASE_URL" --workspace-path "$PWD" --build-id CANDIDATE_BUILD_ID --diagnostics-secret "$KONTROL_DIAGNOSTICS_SECRET" --tunnel-url http://127.0.0.1:8080
 ```
 
 Use `--workspace-path` (and `--read-path` when the workspace lacks
 `AGENTS.md`) for an allowed read on every fresh MCP transport. Stop the runner
 only when the intended soak window is complete; an interrupted run is recorded
 as non-passing.
+
+For the post-incident multi-day qualification, keep the exact deployed
+`buildId` fixed and repeat the same command with separate reports for at least
+26 hours (preferably 48 hours), followed by a 72-hour stability run before
+claiming multi-day reliability:
+
+```bash
+npm run soak:beta -- --hours 26 --url "$KONTROL_PUBLIC_BASE_URL" --workspace-path "$PWD" --report beta-soak-26h.json --build-id CANDIDATE_BUILD_ID \
+  --diagnostics-secret "$KONTROL_DIAGNOSTICS_SECRET" --tunnel-url "$KONTROL_BETA_TUNNEL_URL"
+npm run soak:beta -- --hours 72 --url "$KONTROL_PUBLIC_BASE_URL" --workspace-path "$PWD" --report beta-soak-72h.json --build-id CANDIDATE_BUILD_ID \
+  --diagnostics-secret "$KONTROL_DIAGNOSTICS_SECRET" --tunnel-url "$KONTROL_BETA_TUNNEL_URL"
+```
+
+During that qualification, place the dual-session probe behind the real
+intermediary and run at least an hour of 18-second watcher heartbeats. Supply
+the fresh external host `tools/list` snapshot so catalog drift fails closed:
+
+```bash
+# Terminal A: local reproduction of a 25-second idle-response intermediary.
+npm run probe:idle-proxy -- --target http://127.0.0.1:7676 \
+  --port 8787 --idle-timeout-ms 25000
+
+# Terminal B: use the proxy URL for the bounded one-hour dual-watcher run.
+npm run probe:tunnel -- --url "$KONTROL_PUBLIC_BASE_URL" --workspace "$PWD" \
+  --dual --cycles 120 --watcher-timeout-ms 18000 \
+  --host-catalog-file external-tools-list.json \
+  --expected-mcp-version VERSION_PLUS_CONTENT_SHA
+```
+
+For the local harness, replace `KONTROL_PUBLIC_BASE_URL` with
+`http://127.0.0.1:8787`. The real-tunnel run remains necessary because the
+harness verifies intermediary idle handling, not tunnel or host behavior.
+
+The 12-hour stable-beta receipt remains the publication gate. These longer
+runs are additional operational evidence for the reported multi-day failure;
+they do not turn an interrupted or locally simulated run into qualification.
 
 The local liveness endpoint is `GET /healthz`; startup infrastructure
 readiness is `GET /core-readyz`; strict operational readiness is `GET /readyz`.

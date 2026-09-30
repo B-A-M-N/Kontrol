@@ -5,6 +5,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { REQUIRED_INSPECTION_TOOLS } from "../src/mcp/tool-names.ts";
 
 const args = process.argv.slice(2);
 function flag(name, fallback) {
@@ -75,8 +76,9 @@ async function rpc(method, params, { withSession = true } = {}) {
   });
   const payload = decode(await response.text());
   if (method === "initialize") sessionId = response.headers.get("mcp-session-id") ?? sessionId;
+  const acceptedWithoutId = method === "notifications/initialized" && payload.error?.code === -32601 && response.status === 200;
   assert.equal(response.status, 200, `${method} returned HTTP ${response.status}: ${JSON.stringify(payload)}`);
-  assert.ok(!payload.error, `${method}: ${payload.error?.message ?? "JSON-RPC error"}`);
+  assert.ok(acceptedWithoutId || !payload.error, `${method}: ${payload.error?.message ?? "JSON-RPC error"}`);
   return payload.result;
 }
 
@@ -118,7 +120,7 @@ if (immutableServerVersion) {
 const listedTools = await rpc("tools/list", {});
 const toolsByName = new Map((listedTools?.tools ?? []).map((tool) => [tool.name, tool]));
 const publicToolNames = new Set(toolsByName.keys());
-for (const requiredTool of ["read", "grep", "glob", "ls", "poll_process"]) {
+for (const requiredTool of [...REQUIRED_INSPECTION_TOOLS, "poll_process"]) {
   assert.ok(publicToolNames.has(requiredTool), `public MCP tools/list is missing ${requiredTool}`);
   if (requiredTool !== "poll_process") {
     assert.equal(toolsByName.get(requiredTool)?.annotations?.readOnlyHint, true,
@@ -143,7 +145,7 @@ for (const expected of agentSpecs) {
 
 const opened = await callTool("open_workspace", { path: workspace, mode: "checkout" });
 assert.ok(opened?.workspaceId, "open_workspace did not return workspaceId");
-assert.deepEqual(opened?.toolSurface?.requiredInspectionTools, ["read", "grep", "glob", "ls"],
+assert.deepEqual(opened?.toolSurface?.requiredInspectionTools, [...REQUIRED_INSPECTION_TOOLS],
   "open_workspace must return the canonical required inspection surface");
 assert.match(opened?.instruction ?? "", /client catalog is stale.*fresh MCP tool surface/i,
   "open_workspace must explain how to handle a stale client catalog");
@@ -163,6 +165,11 @@ assert.ok(typeof glob?.result === "string" || JSON.stringify(glob).includes("pac
 const ls = await callTool("ls", { workspaceId: opened.workspaceId, path: "." });
 assertNoApprovalRequired("ls", ls);
 assert.ok(typeof ls?.result === "string" || JSON.stringify(ls).includes("package.json"), "ls did not list the workspace");
+for (const gitTool of ["git_status", "git_log", "git_diff", "git_show"]) {
+  const result = await callTool(gitTool, { workspaceId: opened.workspaceId });
+  assertNoApprovalRequired(gitTool, result);
+  assert.ok(result !== undefined, `${gitTool} returned no result`);
+}
 if (probeBash) {
   const bash = await callTool("bash", { workspaceId: opened.workspaceId, command: "pwd", timeout: 10 });
   assert.ok(typeof bash?.result === "string" || JSON.stringify(bash).includes(workspace), "bash did not execute in the opened workspace");
@@ -177,7 +184,8 @@ if (probeBash) {
 // the secure baseline). Without reviewer credentials configured, an
 // ask-capable policy fails here instead of at the first blocked tool call.
 const reviewerReadiness = await fetch(readyUrl, { signal: AbortSignal.timeout(3_000) });
-const askCapable = jsonOrText(reviewerReadiness).approvalInteractive === true;
+const reviewerBody = await jsonOrText(reviewerReadiness);
+const askCapable = reviewerBody.approvalInteractive === true;
 if (askCapable) {
   const reviewerToken =
     process.env.KONTROL_TUNNEL_REVIEWER_SECRET ?? process.env.KONTROL_ACP_REVIEWER_SECRET;
@@ -204,7 +212,8 @@ if (askCapable) {
       reviewerSessionId = response.headers.get("mcp-session-id") ?? reviewerSessionId;
     }
     assert.equal(response.status, 200, `reviewer ${method} returned HTTP ${response.status}: ${JSON.stringify(payload)}`);
-    assert.ok(!payload.error, `reviewer ${method}: ${payload.error?.message ?? "JSON-RPC error"}`);
+    const acceptedNotification = method === "notifications/initialized" && payload.error?.code === -32601 && response.status === 200;
+    assert.ok(acceptedNotification || !payload.error, `reviewer ${method}: ${payload.error?.message ?? "JSON-RPC error"}`);
     return payload.result;
   };
 

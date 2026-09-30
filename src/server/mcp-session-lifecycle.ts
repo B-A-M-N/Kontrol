@@ -29,6 +29,8 @@ export interface McpSessionLifecycleDeps {
   readonly logicalContinuity: LogicalContinuityIndex;
   readonly processSessions: ProcessSessionManager;
   readonly workspaceAppResourceMetrics: WorkspaceAppResourceMetrics;
+  /** Returns whether a worker-bound transport still owns live work. */
+  readonly isDurableWorkerSessionActive?: (state: McpSessionState) => boolean;
   clearWorkspaceSessionState(sessionId: string): void;
 }
 
@@ -79,6 +81,8 @@ function buildSessionWindowMetrics(events: Array<{ at: number; kind: McpSessionW
 
 export function createMcpSessionLifecycle(deps: McpSessionLifecycleDeps): McpSessionLifecycle {
   const { config, mcpSessions, transports, logicalContinuity, processSessions, workspaceAppResourceMetrics, clearWorkspaceSessionState } = deps;
+  const isDurableWorkerSessionActive = deps.isDurableWorkerSessionActive
+    ?? ((state: McpSessionState) => state.durableWorkerSession);
   const mcpSessionMetrics: McpSessionMetrics = {
     created: 0,
     evicted: 0,
@@ -368,6 +372,7 @@ export function createMcpSessionLifecycle(deps: McpSessionLifecycleDeps): McpSes
     || state.activeLongPollCount > 0
     || state.activeSseStreams > 0
     || state.activePolicyWaiters > 0
+    || isDurableWorkerSessionActive(state)
     || state.closing
     || state.closed
   );
@@ -506,7 +511,7 @@ export function createMcpSessionLifecycle(deps: McpSessionLifecycleDeps): McpSes
         const eligible = [...mcpSessions.values()]
           .filter((state) => (
             state.logicalClientId === forceClientId
-            && !state.durableWorkerSession
+            && !isDurableWorkerSessionActive(state)
             && !mcpSessionHasActiveResponsibility(state)
             && (now - state.lastTransportActivityAt) >= config.mcpSessionReclaimGraceMs
             && !evictionReasons.has(state.sessionId)
