@@ -67,9 +67,18 @@ for (const resource of resources) {
 
 const tools = await rpc("tools/list", {});
 const openTool = tools.tools?.find((tool) => tool.name === "open_workspace");
-assert.ok(openTool?._meta?.ui?.resourceUri, "open_workspace must advertise the standard modern Workspace App resource");
+assert.ok(openTool, "tools/list did not advertise open_workspace");
+assert.equal(openTool._meta?.ui?.resourceUri, undefined,
+  "open_workspace must remain data-only and leave renderer selection to show_workspace_ui");
 assert.equal(openTool._meta["openai/outputTemplate"], undefined,
-  "new tool registrations must advertise only the standard MCP Apps resource");
+  "open_workspace must not advertise a legacy output template");
+const showUiTool = tools.tools?.find((tool) => tool.name === "show_workspace_ui");
+assert.ok(showUiTool?._meta?.ui?.resourceUri,
+  "show_workspace_ui must advertise the standard modern Workspace App resource");
+assert.equal(showUiTool._meta.ui.resourceUri, modern.uri,
+  "show_workspace_ui must advertise the modern resource returned by resources/list");
+assert.equal(showUiTool._meta["openai/outputTemplate"], undefined,
+  "new renderer registrations must not advertise a legacy output template");
 const opened = await rpc("tools/call", { name: "open_workspace", arguments: { path: process.cwd(), mode: "checkout" } });
 const openedContent = opened.structuredContent ?? opened;
 assert.equal(typeof openedContent.workspaceId, "string", "open_workspace must return a workspace card payload");
