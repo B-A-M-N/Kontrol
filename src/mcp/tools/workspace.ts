@@ -55,6 +55,7 @@ import {
   contentLineCount,
   contentText,
   countDiffStats,
+  boundInspectionContent,
   logFailedToolResponse,
   newFilePatch,
   textBlock,
@@ -102,13 +103,54 @@ function instructionsRequiredResponse(
   const hash = hashInstructionContent(files);
   return {
     content: [...instructionContent(files, root), textBlock(content)],
-    _meta: { tool, card: { workspaceId, path, status: "instructions_required", summary: { instructionContentHash: hash, files: files.length }, payload: { content: instructionContent(files, root) } } },
+    _meta: { tool, card: { workspaceId, path, status: "instructions_required", summary: { instructionContentHash: hash, files: files.length } } },
     structuredContent: { tool, status: "instructions_required", instructionsRequired: true, instructionContentHash: hash, result: contentText([...instructionContent(files, root), textBlock(content)]) },
   };
 }
 
-function boundedGitText(value: string, limit = 256_000): string {
-  return value.length <= limit ? value : `${value.slice(0, limit)}\n[truncated]`;
+const MAX_READ_LINES = 600;
+const MAX_INSPECTION_ITEMS = 500;
+
+function inspectionTruncation(details: unknown): boolean {
+  if (!details || typeof details !== "object") return false;
+  const value = details as Record<string, unknown>;
+  const truncation = value.truncation && typeof value.truncation === "object"
+    ? value.truncation as Record<string, unknown>
+    : undefined;
+  return truncation?.truncated === true
+    || value.matchLimitReached !== undefined
+    || value.resultLimitReached !== undefined
+    || value.entryLimitReached !== undefined
+    || value.linesTruncated === true;
+}
+
+function inspectionMetadata(
+  content: ToolContent[],
+  details: unknown,
+  offset = 1,
+) {
+  const originalText = contentText(content);
+  const record = details && typeof details === "object" ? details as Record<string, unknown> : undefined;
+  const truncation = record?.truncation && typeof record.truncation === "object"
+    ? record.truncation as Record<string, unknown>
+    : undefined;
+  const notice = /(?:\n\n\[(?:Showing lines |\d+ more lines in file)|\[Truncated:|Some lines truncated)/m.test(originalText);
+  const sourceTruncated = inspectionTruncation(details) || notice;
+  const detailLines = typeof truncation?.outputLines === "number" ? truncation.outputLines : undefined;
+  const withoutNotice = originalText.replace(/\n\n\[(?:Showing lines [\s\S]*|\d+ more lines in file\.[\s\S]*)$/, "");
+  const returnedLines = detailLines ?? contentLineCount(withoutNotice);
+  const nextOffset = sourceTruncated ? offset + returnedLines : undefined;
+  const bounded = boundInspectionContent(content, { offset, nextOffset, sourceTruncated: sourceTruncated && !notice });
+  const effectiveReturnedLines = detailLines ?? bounded.returnedLines;
+  const effectiveNextOffset = sourceTruncated || bounded.truncated ? offset + effectiveReturnedLines : undefined;
+  return {
+    content: bounded.content,
+    truncated: sourceTruncated || bounded.truncated,
+    returnedLines: effectiveReturnedLines,
+    characters: bounded.characters,
+    bytes: bounded.bytes,
+    ...(effectiveNextOffset !== undefined ? { nextOffset: effectiveNextOffset } : {}),
+  };
 }
 
 function fileVersionConflictResponse(
@@ -132,7 +174,6 @@ function fileVersionConflictResponse(
         path,
         status: "file_version_conflict",
         summary: { status: "file_version_conflict", expectedContentSha256: expected, actualContentSha256: actual },
-        payload: { content: [textBlock(message)] },
       },
     },
     structuredContent: {
@@ -164,7 +205,6 @@ function fileVersionPreconditionRequiredResponse(
         path: paths[0],
         status: "file_version_precondition_required",
         summary: { status: "file_version_precondition_required", paths },
-        payload: { content: [textBlock(message)] },
       },
     },
     structuredContent: {
@@ -314,7 +354,7 @@ export function registerWorkspaceTools(
       const baseInstruction = config.skillsEnabled
         ? "Use this workspaceId in all subsequent tool calls for this project. Do not call open_workspace again for this same folder unless this workspaceId stops working, the user asks to reopen, or you switch to a different folder/worktree. Follow loaded agentsFiles instructions. Nested instructions are loaded automatically when later tools enter their directory. Review, diagnosis, architecture, and code-edit requests go directly through this workspace first. Delegate only when the reviewer explicitly asks for bounded assistance: call discover_agents, use only a currently dispatchable healthy role=agent peer, and if optional assistance is unavailable continue directly without an alternate ACP route. The WebUI reviewer remains the approval authority. When a task matches an available skill in skills, read its path before proceeding. For skills not listed here, use the search_skills tool to discover global skills by keyword."
         : "Use this workspaceId in all subsequent tool calls for this project. Do not call open_workspace again for this same folder unless this workspaceId stops working, the user asks to reopen, or you switch to a different folder/worktree. Follow loaded agentsFiles instructions. Nested instructions are loaded automatically when later tools enter their directory. Review, diagnosis, architecture, and code-edit requests go directly through this workspace first. Delegate only when the reviewer explicitly asks for bounded assistance: call discover_agents, use only a currently dispatchable healthy role=agent peer, and if optional assistance is unavailable continue directly without an alternate ACP route. The WebUI reviewer remains the approval authority.";
-      const instruction = `${baseInstruction} This workspace requires ${toolSurface.requiredInspectionTools.join(", ")} for structured inspection. If the client tool catalog does not expose all four, do not substitute bash/find. The client catalog is stale and must establish a fresh MCP tool surface.`;
+      const instruction = `${baseInstruction} The active Kontrol server exposes ${toolSurface.requiredInspectionTools.join(", ")} in tool surface ${toolSurface.version}. If this client's catalog omits any of them, refresh or initialize a fresh MCP connection; meanwhile continue with available bounded structured tools such as read. Do not substitute bash or find for structured inspection.`;
       const resultContent: ToolContent[] = [
         {
           type: "text" as const,
@@ -477,12 +517,19 @@ export function registerWorkspaceTools(
           .number()
           .int()
           .positive()
+          .max(MAX_READ_LINES)
           .optional()
-          .describe("Maximum number of lines to read."),
+          .describe(`Maximum number of lines to read (default ${MAX_READ_LINES}; hard maximum ${MAX_READ_LINES}). Continue with the returned nextOffset for larger files.`),
         approvalResumeId: approvalResumeIdSchema,
       },
       outputSchema: resultOutputSchema({
         contentSha256: z.string().optional().describe("SHA-256 of the complete file bytes at read time; pass it as expectedContentSha256 to guard a later mutation."),
+        offset: z.number().int().optional(),
+        returnedLines: z.number().int().optional(),
+        truncated: z.boolean().optional(),
+        nextOffset: z.number().int().optional(),
+        characters: z.number().int().optional(),
+        bytes: z.number().int().optional(),
       }),
       ...toolWidgetDescriptorMeta(config, "read"),
       annotations: { readOnlyHint: true },
@@ -520,7 +567,7 @@ export function registerWorkspaceTools(
         ? []
         : await workspaces.loadApplicableInstructions(workspace, input.path, connectionContext?.mcpSessionId);
       const response = await readFileTool(
-        { ...input, path: readPath.absolutePath },
+        { ...input, limit: Math.min(input.limit ?? MAX_READ_LINES, MAX_READ_LINES), path: readPath.absolutePath },
         {
           cwd: workspace.root,
           root: workspace.root,
@@ -542,12 +589,17 @@ export function registerWorkspaceTools(
       const responseContent = newlyApplicable.length > 0
         ? [...instructionContent(newlyApplicable, workspace.root), ...response.content]
         : response.content;
-      const responseForOutput = { ...response, content: responseContent };
+      const inspection = inspectionMetadata(responseContent, response.details, input.offset ?? 1);
+      const responseForOutput = { ...response, content: inspection.content };
       const contentSha256 = await readFileVersion(readPath.absolutePath);
       const summary = {
-        ...textSummary(responseContent),
+        ...textSummary(inspection.content),
         offset: input.offset ?? 1,
-        limited: input.limit !== undefined,
+        returnedLines: inspection.returnedLines,
+        truncated: inspection.truncated,
+        nextOffset: inspection.nextOffset,
+        characters: inspection.characters,
+        bytes: inspection.bytes,
       };
       logToolCall(config, {
         tool: toolNames.read,
@@ -566,13 +618,18 @@ export function registerWorkspaceTools(
             workspaceId,
             path: input.path,
             summary,
-            payload: { content: responseContent },
           },
         },
         structuredContent: {
           tool: toolNames.read,
-          result: contentText(responseContent),
+          result: contentText(inspection.content),
           contentSha256,
+          offset: input.offset ?? 1,
+          returnedLines: inspection.returnedLines,
+          truncated: inspection.truncated,
+          ...(inspection.nextOffset !== undefined ? { nextOffset: inspection.nextOffset } : {}),
+          characters: inspection.characters,
+          bytes: inspection.bytes,
         },
       };
     },
@@ -1154,8 +1211,13 @@ export function registerWorkspaceTools(
               "Optional path or glob scope relative to the workspace root.",
             ),
           include: z.string().optional().describe("Optional include glob."),
+          limit: z.number().int().min(1).max(MAX_INSPECTION_ITEMS).optional()
+            .describe(`Maximum matching locations (default 100; hard maximum ${MAX_INSPECTION_ITEMS}). Refine path or include when more results are needed.`),
         },
-        outputSchema: resultOutputSchema(),
+        outputSchema: resultOutputSchema({
+          truncated: z.boolean().optional(), returnedLines: z.number().int().optional(),
+          characters: z.number().int().optional(), bytes: z.number().int().optional(),
+        }),
         ...toolWidgetDescriptorMeta(config, "search"),
         annotations: { readOnlyHint: true },
       },
@@ -1191,7 +1253,7 @@ export function registerWorkspaceTools(
           }
         }
         const newlyApplicable = input.path ? await workspaces.loadApplicableInstructions(workspace, input.path, connectionContext?.mcpSessionId) : [];
-        const response = await grepFilesTool(input, {
+        const response = await grepFilesTool({ ...input, limit: Math.min(input.limit ?? 100, MAX_INSPECTION_ITEMS) }, {
           cwd: workspace.root,
           root: workspace.root,
         });
@@ -1209,10 +1271,15 @@ export function registerWorkspaceTools(
         const responseWithInstructions = newlyApplicable.length > 0
           ? { ...response, content: [...instructionContent(newlyApplicable, workspace.root), ...response.content] }
           : response;
+        const inspection = inspectionMetadata(responseWithInstructions.content, response.details);
         const summary = {
           pattern: input.pattern,
           scope: input.path ?? ".",
-          ...textSummary(responseWithInstructions.content),
+          ...textSummary(inspection.content),
+          truncated: inspection.truncated,
+          returnedLines: inspection.returnedLines,
+          characters: inspection.characters,
+          bytes: inspection.bytes,
         };
         logToolCall(config, {
           tool: toolNames.grep,
@@ -1224,18 +1291,22 @@ export function registerWorkspaceTools(
 
         return {
           ...responseWithInstructions,
+          content: inspection.content,
           _meta: {
             tool: toolNames.grep,
             card: {
               workspaceId,
               path: input.path,
               summary,
-              payload: { content: responseWithInstructions.content },
             },
           },
           structuredContent: {
             tool: toolNames.grep,
-            result: contentText(responseWithInstructions.content),
+            result: contentText(inspection.content),
+            truncated: inspection.truncated,
+            returnedLines: inspection.returnedLines,
+            characters: inspection.characters,
+            bytes: inspection.bytes,
           },
         };
       },
@@ -1254,12 +1325,17 @@ export function registerWorkspaceTools(
             .describe("Workspace identifier returned by open_workspace."),
           pattern: z.string().describe("File glob pattern."),
           approvalResumeId: approvalResumeIdSchema,
+          limit: z.number().int().min(1).max(MAX_INSPECTION_ITEMS).optional()
+            .describe(`Maximum matching paths (default 200; hard maximum ${MAX_INSPECTION_ITEMS}). Narrow the path or pattern to continue.`),
           path: z
             .string()
             .optional()
             .describe("Optional path scope relative to the workspace root."),
         },
-        outputSchema: resultOutputSchema(),
+        outputSchema: resultOutputSchema({
+          truncated: z.boolean().optional(), returnedLines: z.number().int().optional(),
+          characters: z.number().int().optional(), bytes: z.number().int().optional(),
+        }),
         ...toolWidgetDescriptorMeta(config, "search"),
         annotations: { readOnlyHint: true },
       },
@@ -1295,7 +1371,7 @@ export function registerWorkspaceTools(
           }
         }
         const newlyApplicable = input.path ? await workspaces.loadApplicableInstructions(workspace, input.path, connectionContext?.mcpSessionId) : [];
-        const response = await findFilesTool(input, {
+        const response = await findFilesTool({ ...input, limit: Math.min(input.limit ?? 200, MAX_INSPECTION_ITEMS) }, {
           cwd: workspace.root,
           root: workspace.root,
         });
@@ -1312,11 +1388,16 @@ export function registerWorkspaceTools(
         const responseWithInstructions = newlyApplicable.length > 0
           ? { ...response, content: [...instructionContent(newlyApplicable, workspace.root), ...response.content] }
           : response;
+        const inspection = inspectionMetadata(responseWithInstructions.content, response.details);
 
         const summary = {
           pattern: input.pattern,
           scope: input.path ?? ".",
-          ...textSummary(responseWithInstructions.content),
+          ...textSummary(inspection.content),
+          truncated: inspection.truncated,
+          returnedLines: inspection.returnedLines,
+          characters: inspection.characters,
+          bytes: inspection.bytes,
         };
         logToolCall(config, {
           tool: toolNames.glob,
@@ -1328,18 +1409,22 @@ export function registerWorkspaceTools(
 
         return {
           ...responseWithInstructions,
+          content: inspection.content,
           _meta: {
             tool: toolNames.glob,
             card: {
               workspaceId,
               path: input.path,
               summary,
-              payload: { content: responseWithInstructions.content },
             },
           },
           structuredContent: {
             tool: toolNames.glob,
-            result: contentText(responseWithInstructions.content),
+            result: contentText(inspection.content),
+            truncated: inspection.truncated,
+            returnedLines: inspection.returnedLines,
+            characters: inspection.characters,
+            bytes: inspection.bytes,
           },
         };
       },
@@ -1361,9 +1446,14 @@ export function registerWorkspaceTools(
             .describe(
               "Directory path to list, relative to the workspace root.",
             ),
+          limit: z.number().int().min(1).max(MAX_INSPECTION_ITEMS).optional()
+            .describe(`Maximum directory entries (default 500; hard maximum ${MAX_INSPECTION_ITEMS}). Narrow the path to continue.`),
           approvalResumeId: approvalResumeIdSchema,
         },
-        outputSchema: resultOutputSchema(),
+        outputSchema: resultOutputSchema({
+          truncated: z.boolean().optional(), returnedLines: z.number().int().optional(),
+          characters: z.number().int().optional(), bytes: z.number().int().optional(),
+        }),
         ...toolWidgetDescriptorMeta(config, "directory"),
         annotations: { readOnlyHint: true },
       },
@@ -1398,7 +1488,7 @@ export function registerWorkspaceTools(
           }
         }
         const newlyApplicable = await workspaces.loadApplicableInstructions(workspace, input.path, connectionContext?.mcpSessionId);
-        const response = await listDirectoryTool(input, {
+        const response = await listDirectoryTool({ ...input, limit: Math.min(input.limit ?? MAX_INSPECTION_ITEMS, MAX_INSPECTION_ITEMS) }, {
           cwd: workspace.root,
           root: workspace.root,
         });
@@ -1416,7 +1506,14 @@ export function registerWorkspaceTools(
         const responseWithInstructions = newlyApplicable.length > 0
           ? { ...response, content: [...instructionContent(newlyApplicable, workspace.root), ...response.content] }
           : response;
-        const summary = textSummary(responseWithInstructions.content);
+        const inspection = inspectionMetadata(responseWithInstructions.content, response.details);
+        const summary = {
+          ...textSummary(inspection.content),
+          truncated: inspection.truncated,
+          returnedLines: inspection.returnedLines,
+          characters: inspection.characters,
+          bytes: inspection.bytes,
+        };
         logToolCall(config, {
           tool: toolNames.ls,
           workspaceId,
@@ -1427,18 +1524,22 @@ export function registerWorkspaceTools(
 
         return {
           ...responseWithInstructions,
+          content: inspection.content,
           _meta: {
             tool: toolNames.ls,
             card: {
               workspaceId,
               path: input.path,
               summary,
-              payload: { content: responseWithInstructions.content },
             },
           },
           structuredContent: {
             tool: toolNames.ls,
-            result: contentText(responseWithInstructions.content),
+            result: contentText(inspection.content),
+            truncated: inspection.truncated,
+            returnedLines: inspection.returnedLines,
+            characters: inspection.characters,
+            bytes: inspection.bytes,
           },
         };
       },
@@ -1460,7 +1561,10 @@ export function registerWorkspaceTools(
         path: z.string().optional().describe("Optional path relative to the workspace root."),
         ...inputSchema,
       },
-      outputSchema: resultOutputSchema(),
+      outputSchema: resultOutputSchema({
+        truncated: z.boolean().optional(), returnedLines: z.number().int().optional(),
+        characters: z.number().int().optional(), bytes: z.number().int().optional(),
+      }),
       _meta: {},
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
     }, async ({ workspaceId, path: requestedPath, ...input }) => {
@@ -1468,10 +1572,22 @@ export function registerWorkspaceTools(
       const workspace = workspaces.getWorkspace(workspaceId);
       const pathArgs = gitPathArg(workspaces, workspace, requestedPath);
       const output = await run(workspace.root, pathArgs.length ? requestedPath : undefined, input as Record<string, unknown>);
-      const content = [textBlock(boundedGitText(output))];
+      const inspection = inspectionMetadata([textBlock(output)], undefined);
+      const content = inspection.content;
       logToolCall(config, { tool: name, workspaceId, path: requestedPath, success: true, durationMs: Math.round(performance.now() - startedAt) });
       trackToolEvent(workspaceId, name, { path: requestedPath, ...input }, { content, isError: false }, startedAt);
-      return { content, structuredContent: { tool: name, result: boundedGitText(output) }, _meta: { tool: name, card: { workspaceId, path: requestedPath, payload: { content } } } };
+      return {
+        content,
+        structuredContent: {
+          tool: name,
+          result: contentText(content),
+          truncated: inspection.truncated,
+          returnedLines: inspection.returnedLines,
+          characters: inspection.characters,
+          bytes: inspection.bytes,
+        },
+        _meta: { tool: name, card: { workspaceId, path: requestedPath, summary: { truncated: inspection.truncated, returnedLines: inspection.returnedLines, characters: inspection.characters, bytes: inspection.bytes } } },
+      };
     });
   };
 
@@ -1652,7 +1768,6 @@ export function registerWorkspaceTools(
             workspaceId,
             path: workingDirectory,
             summary,
-            payload: { content: responseWithInstructions.content },
           },
         },
       };

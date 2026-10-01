@@ -58,7 +58,6 @@ export function processToolResponse(
       card: {
         workspaceId,
         summary: { command: snapshot.command, ...summary, ...outputSummary },
-        payload: { content },
       },
     },
     structuredContent: {

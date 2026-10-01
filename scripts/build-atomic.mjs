@@ -11,7 +11,9 @@ const releasesDir = join(root, "releases");
 // Bump when the release metadata/loader contract changes in a way that must
 // invalidate an older immutable directory. build-meta.json is excluded from
 // the content hash because it carries the final build identity.
-const RELEASE_FORMAT_VERSION = 3;
+const RELEASE_FORMAT_VERSION = 4;
+const MAX_WORKSPACE_APP_HISTORY = 64;
+const MAX_WORKSPACE_APP_HISTORY_AGE_MS = 30 * 24 * 60 * 60 * 1_000;
 const resultPath = process.env.KONTROL_BUILD_RESULT_PATH
   ? resolve(root, process.env.KONTROL_BUILD_RESULT_PATH)
   : join(root, ".kontrol-build-result.json");
@@ -44,6 +46,74 @@ function artifactHashFor(directory) {
   artifactHash.update(`kontrol-release-format:${RELEASE_FORMAT_VERSION}\n`);
   hashTree(directory, artifactHash);
   return artifactHash.digest("hex").slice(0, 16);
+}
+
+function collectWorkspaceAppHistory() {
+  if (!existsSync(releasesDir)) return [];
+  const directories = readdirSync(releasesDir, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && /^[A-Za-z0-9._-]{1,128}$/.test(entry.name))
+    .map((entry) => ({ buildId: entry.name, path: join(releasesDir, entry.name) }));
+  const metadataByBuildId = new Map();
+  const historyHints = new Map();
+  for (const directory of directories) {
+    try {
+      const metadata = JSON.parse(readFileSync(join(directory.path, "build-meta.json"), "utf8"));
+      if (metadata.buildId !== directory.buildId) continue;
+      metadataByBuildId.set(directory.buildId, metadata);
+      if (Array.isArray(metadata.workspaceAppHistory)) {
+        for (const history of metadata.workspaceAppHistory) {
+          if (typeof history?.releaseBuildId !== "string"
+            || typeof history?.workspaceAppBuildId !== "string"
+            || !/^[A-Za-z0-9._-]{1,128}$/.test(history.releaseBuildId)
+            || !/^[a-f0-9]{12}$/i.test(history.workspaceAppBuildId)) continue;
+          if (!historyHints.has(history.releaseBuildId)) historyHints.set(history.releaseBuildId, history.workspaceAppBuildId.toLowerCase());
+        }
+      }
+    } catch {
+      // Ignore incomplete candidate directories and keep the immutable build
+      // process independent from abandoned temporary output.
+    }
+  }
+
+  const now = Date.now();
+  const candidates = directories.map((directory) => {
+    const metadata = metadataByBuildId.get(directory.buildId);
+    if (!metadata) return undefined;
+    let builtAt = Date.parse(metadata.buildTimestamp);
+    if (!Number.isFinite(builtAt)) {
+      try { builtAt = statSync(directory.path).mtimeMs; } catch { return undefined; }
+    }
+    if (builtAt > now + 5 * 60_000 || now - builtAt > MAX_WORKSPACE_APP_HISTORY_AGE_MS) return undefined;
+    return { ...directory, metadata, builtAt };
+  }).filter(Boolean).sort((a, b) => b.builtAt - a.builtAt).slice(0, MAX_WORKSPACE_APP_HISTORY);
+
+  const results = [];
+  const seenAppBuildIds = new Set();
+  for (const candidate of candidates) {
+    const htmlPath = join(candidate.path, "ui", "workspace-app.html");
+    let appBuildId = candidate.metadata.workspaceAppBuildId;
+    if (typeof appBuildId !== "string" || !/^[a-f0-9]{12}$/i.test(appBuildId)) {
+      appBuildId = historyHints.get(candidate.buildId);
+    }
+    if (typeof appBuildId !== "string" || !/^[a-f0-9]{12}$/i.test(appBuildId)) {
+      try {
+        const stats = statSync(htmlPath);
+        if (!stats.isFile() || stats.size > 20 * 1024 * 1024) continue;
+        appBuildId = createHash("sha256").update(readFileSync(htmlPath)).digest("hex").slice(0, 12);
+      } catch {
+        continue;
+      }
+    }
+    appBuildId = appBuildId.toLowerCase();
+    if (seenAppBuildIds.has(appBuildId)) continue;
+    seenAppBuildIds.add(appBuildId);
+    results.push({
+      releaseBuildId: candidate.buildId,
+      workspaceAppBuildId: appBuildId,
+      buildTimestamp: new Date(candidate.builtAt).toISOString(),
+    });
+  }
+  return results;
 }
 
 function validateExistingReleaseMatchesBuildId(releasePath, buildId, contentSha256) {
@@ -90,11 +160,13 @@ try {
   // build metadata came from another checkout state.
   const contentSha256 = artifactHashFor(tempDist);
   const buildTimestamp = new Date().toISOString();
+  const workspaceAppHistory = JSON.stringify(collectWorkspaceAppHistory());
   run(process.execPath, ["scripts/generate-build-meta.mjs"], {
     KONTROL_BUILD_ID: contentSha256,
     KONTROL_CONTENT_SHA256: contentSha256,
     KONTROL_BUILD_TIMESTAMP: buildTimestamp,
     KONTROL_RELEASE_FORMAT_VERSION: String(RELEASE_FORMAT_VERSION),
+    KONTROL_WORKSPACE_APP_HISTORY: workspaceAppHistory,
   });
 
   const metaPath = join(tempDist, "build-meta.json");
@@ -114,6 +186,7 @@ try {
     KONTROL_CONTENT_SHA256: contentSha256,
     KONTROL_BUILD_TIMESTAMP: buildTimestamp,
     KONTROL_RELEASE_FORMAT_VERSION: String(RELEASE_FORMAT_VERSION),
+    KONTROL_WORKSPACE_APP_HISTORY: workspaceAppHistory,
   });
 
   const buildMeta = JSON.parse(readFileSync(metaPath, "utf8"));

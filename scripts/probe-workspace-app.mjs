@@ -60,6 +60,10 @@ for (const resource of resources) {
   assert.equal(content?.uri, resource.uri);
   assert.equal(typeof content?.mimeType, "string");
   assert.equal(typeof content?.text, "string");
+  const expectedMimeType = /^ui:\/\/kontrol\/workspace-app-[a-f0-9]{12}\.html$/i.test(resource.uri)
+    ? "text/html;profile=mcp-app"
+    : "text/html+skybridge";
+  assert.equal(content.mimeType, expectedMimeType, `${resource.uri} has the wrong Workspace App MIME type`);
   assert.ok(content.text.includes('<main id="app"'), `${resource.uri} is missing the app root`);
   assert.ok(content.text.length > 1_000, `${resource.uri} is unexpectedly small`);
   assert.doesNotMatch(JSON.stringify(content._meta ?? {}), /(?:127\.0\.0\.1|localhost|http:\/\/)/i, `${resource.uri} metadata exposes an invalid loopback CSP domain`);
@@ -77,8 +81,11 @@ assert.ok(showUiTool?._meta?.ui?.resourceUri,
   "show_workspace_ui must advertise the standard modern Workspace App resource");
 assert.equal(showUiTool._meta.ui.resourceUri, modern.uri,
   "show_workspace_ui must advertise the modern resource returned by resources/list");
-assert.equal(showUiTool._meta["openai/outputTemplate"], undefined,
-  "new renderer registrations must not advertise a legacy output template");
+assert.equal(showUiTool._meta["openai/outputTemplate"], modern.uri.replace(/\.html$/, ".skybridge.html"),
+  "show_workspace_ui must advertise the matching content-hashed ChatGPT compatibility resource");
+assert.ok(resources.some((resource) => resource.uri === showUiTool._meta["openai/outputTemplate"]
+  && resource.mimeType === "text/html+skybridge"),
+"resources/list must include the exact compatibility URI advertised by show_workspace_ui");
 const opened = await rpc("tools/call", { name: "open_workspace", arguments: { path: process.cwd(), mode: "checkout" } });
 const openedContent = opened.structuredContent ?? opened;
 assert.equal(typeof openedContent.workspaceId, "string", "open_workspace must return a workspace card payload");

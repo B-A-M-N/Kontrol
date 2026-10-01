@@ -100,6 +100,8 @@ export async function connectBootstrapWithRetry(): Promise<void> {
     } catch (error) {
       lastError = error;
       if (attempt === 0 && generation === reconnectGeneration && host.app()) {
+        await waitForRetry(350, generation);
+        if (generation !== reconnectGeneration || !host.app()) break;
         try {
           await host.recreateApp();
         } catch (recreateError) {
@@ -108,6 +110,7 @@ export async function connectBootstrapWithRetry(): Promise<void> {
       }
     }
   }
+  if (generation !== reconnectGeneration) return;
   const message = lastError instanceof Error ? lastError.message : String(lastError ?? "The MCP host connection is unavailable.");
   host.setConnected(false);
   host.setConnectionState("DISCONNECTED");

@@ -39,12 +39,13 @@ const tunnelReviewer = tunnelReviewerFile
   ? readFileSync(resolve(tunnelReviewerFile), "utf8").trim()
   : process.env.KONTROL_MCP_TUNNEL_REVIEWER;
 const watcherTimeoutMs = Number(option("--watcher-timeout-ms", dualSession ? "18000" : "1000"));
-const heartbeatIntervalMs = Number(option("--heartbeat-interval-ms", process.env.KONTROL_MCP_SSE_HEARTBEAT_MS ?? "20000"));
+const heartbeatIntervalMs = Number(option("--heartbeat-interval-ms", process.env.KONTROL_MCP_SSE_HEARTBEAT_MS ?? "15000"));
 const heartbeatCount = Number(option("--heartbeat-count", dualSession ? "2" : "1"));
 const heartbeatTimeoutMs = Number(option("--heartbeat-timeout-ms", String(heartbeatIntervalMs * heartbeatCount + 5_000)));
+const postHeartbeatMs = Number(option("--post-heartbeat-ms", resultFilePath ? "45000" : "0"));
 const minimumDrainEvents = Number(option("--minimum-drain-events", "0"));
 const resourceLoadReads = Number(option("--resource-load-reads", dualSession ? "2" : "0"));
-const requestTimeoutMs = Math.max(10_000, watcherTimeoutMs + 5_000, heartbeatTimeoutMs + 5_000);
+const requestTimeoutMs = Math.max(10_000, watcherTimeoutMs + 5_000, heartbeatTimeoutMs + 5_000, postHeartbeatMs + 10_000);
 const probeStartedAt = new Date().toISOString();
 const url = `${target.replace(/\/$/, "")}/mcp`;
 const diagnosticsUrl = `${target.replace(/\/$/, "")}/diagnostics`;
@@ -62,6 +63,9 @@ if (!Number.isInteger(heartbeatCount) || heartbeatCount < 1 || heartbeatCount > 
 if (!Number.isInteger(heartbeatTimeoutMs) || heartbeatTimeoutMs < heartbeatIntervalMs * heartbeatCount) {
   throw new Error("--heartbeat-timeout-ms must cover all requested heartbeat intervals");
 }
+if (!Number.isInteger(postHeartbeatMs) || postHeartbeatMs < 0 || postHeartbeatMs > 120_000) {
+  throw new Error("--post-heartbeat-ms must be an integer between 0 and 120000");
+}
 if (!Number.isInteger(minimumDrainEvents) || minimumDrainEvents < 0) {
   throw new Error("--minimum-drain-events must be a non-negative integer");
 }
@@ -74,6 +78,7 @@ if (resultFilePath) {
   assert.ok(heartbeatCount >= 2, "external qualification receipts require repeated heartbeat bytes");
   assert.ok(resourceLoadReads >= 2, "external qualification receipts require concurrent resource-load reads");
   assert.ok(minimumDrainEvents >= 2, "external qualification receipts require at least two observed SSE drain recoveries");
+  assert.ok(postHeartbeatMs >= 45_000, "external qualification receipts require a 45-second POST SSE heartbeat probe");
   const targetUrl = new URL(target);
   assert.equal(targetUrl.protocol, "https:", "qualification receipts require the deployed HTTPS tunnel endpoint");
   assert.ok(!["localhost", "127.0.0.1", "::1"].includes(targetUrl.hostname),
@@ -119,10 +124,13 @@ const sessionVersions = new Map();
 const observedRequestCorrelations = [];
 const validatedWorkspaceAppResources = new Map();
 let deployedWorkspaceAppUri;
-let hostOpenWorkspaceUri;
+let deployedWorkspaceAppCompatibilityUri;
+let hostWorkspaceAppRenderer;
 let totalHeartbeatBytesObserved = 0;
 let totalDrainRecoveryEvents = 0;
 let totalResourceLoadReads = 0;
+let totalBoundedInspectionCalls = 0;
+let postHeartbeatEvidence;
 
 function assertCatalogParity(label, listed, sessionId) {
   const actual = extractCatalog(listed);
@@ -165,20 +173,56 @@ async function assertWorkspaceAppResources(listed, sessionId, label) {
       `${label} external qualification requires show_workspace_ui to advertise the deployed Workspace App resource`);
     return { candidateUri: undefined, resources: [] };
   }
+  const candidateCompatibilityUri = renderTool?.legacyOutputTemplate;
+  assert.equal(candidateCompatibilityUri, candidateUri.replace(/\.html$/, ".skybridge.html"),
+    `${label} show_workspace_ui must advertise the matching ChatGPT compatibility resource`);
   if (deployedWorkspaceAppUri) assert.equal(candidateUri, deployedWorkspaceAppUri, "fresh server catalogs disagree on the deployed Workspace App URI");
   deployedWorkspaceAppUri = candidateUri;
+  if (deployedWorkspaceAppCompatibilityUri) {
+    assert.equal(candidateCompatibilityUri, deployedWorkspaceAppCompatibilityUri, "fresh server catalogs disagree on the Workspace App compatibility URI");
+  }
+  deployedWorkspaceAppCompatibilityUri = candidateCompatibilityUri;
 
-  const serverOpenWorkspaceUri = actual.tools.find((tool) => tool.name === "open_workspace")?.resourceUri;
-  const capturedOpenWorkspaceUri = hostCatalog?.tools.find((tool) => tool.name === "open_workspace")?.resourceUri;
-  if (serverOpenWorkspaceUri) {
-    assert.equal(serverOpenWorkspaceUri, candidateUri,
-      "server open_workspace resource URI differs from the deployed Workspace App candidate");
+  const openWorkspaceTool = actual.tools.find((tool) => tool.name === "open_workspace");
+  assert.equal(openWorkspaceTool?.resourceUri, undefined, "open_workspace must remain data-only");
+  assert.equal(openWorkspaceTool?.legacyOutputTemplate, undefined, "open_workspace must not select a ChatGPT renderer");
+  const rendererTools = actual.tools.filter((tool) => tool.resourceUri !== undefined);
+  for (const tool of rendererTools) {
+    assert.equal(tool.resourceUri, candidateUri, `${label} ${tool.name} must use the current standard Workspace App URI`);
+    assert.equal(tool.legacyOutputTemplate, candidateCompatibilityUri,
+      `${label} ${tool.name} must use the matching hashed ChatGPT compatibility URI`);
   }
-  if (capturedOpenWorkspaceUri) {
-    assert.equal(capturedOpenWorkspaceUri, candidateUri,
-      `external host open_workspace resource URI ${capturedOpenWorkspaceUri} differs from deployed candidate ${candidateUri}`);
+  for (const name of ["start_work_session", "await_workspace_events", "list_pending_approvals"]) {
+    const tool = actual.tools.find((item) => item.name === name);
+    if (!tool) continue;
+    assert.equal(tool.resourceUri, undefined, `${label} ${name} is app-callable data and must not select a renderer`);
+    assert.equal(tool.legacyOutputTemplate, undefined, `${label} ${name} must not advertise a ChatGPT renderer`);
   }
-  hostOpenWorkspaceUri = capturedOpenWorkspaceUri;
+  for (const name of ["show_changes", "open_approval_center"]) {
+    const renderer = actual.tools.find((tool) => tool.name === name);
+    if (!renderer) continue;
+    assert.equal(renderer.resourceUri, candidateUri, `${label} ${name} must advertise the standard Workspace App URI`);
+    assert.equal(renderer.legacyOutputTemplate, candidateCompatibilityUri,
+      `${label} ${name} must advertise the matching compatibility URI`);
+  }
+  if (hostCatalog) {
+    const hostRenderer = hostCatalog.tools.find((tool) => tool.name === "show_workspace_ui");
+    assert.equal(hostRenderer?.resourceUri, candidateUri,
+      `external host show_workspace_ui URI ${hostRenderer?.resourceUri ?? "missing"} differs from the deployed candidate ${candidateUri}`);
+    assert.equal(hostRenderer?.legacyOutputTemplate, candidateCompatibilityUri,
+      `external host ChatGPT compatibility URI ${hostRenderer?.legacyOutputTemplate ?? "missing"} differs from the deployed candidate ${candidateCompatibilityUri}`);
+    for (const tool of hostCatalog.tools.filter((item) => item.resourceUri !== undefined)) {
+      assert.equal(tool.resourceUri, candidateUri, `external host ${tool.name} uses a stale standard renderer URI`);
+      assert.equal(tool.legacyOutputTemplate, candidateCompatibilityUri, `external host ${tool.name} uses a stale compatibility renderer URI`);
+    }
+    for (const name of ["start_work_session", "await_workspace_events", "list_pending_approvals"]) {
+      const tool = hostCatalog.tools.find((item) => item.name === name);
+      if (!tool) continue;
+      assert.equal(tool.resourceUri, undefined, `external host ${name} must not select a renderer for app-callable data`);
+      assert.equal(tool.legacyOutputTemplate, undefined, `external host ${name} must not advertise a ChatGPT renderer`);
+    }
+  }
+  hostWorkspaceAppRenderer = hostCatalog?.tools.find((tool) => tool.name === "show_workspace_ui");
 
   const resourcesResult = await rpc("resources/list", {}, sessionId);
   const listedResources = resourcesResult.payload?.result?.resources ?? [];
@@ -214,6 +258,7 @@ async function assertWorkspaceAppResources(listed, sessionId, label) {
 
 function writeProbeReceipt(cycles) {
   if (!resultFilePath) return;
+  assert.ok(postHeartbeatEvidence, "external qualification requires POST SSE heartbeat evidence");
   const document = hostCatalogDocument?.payload ?? hostCatalogDocument;
   const observed = observedCatalogs[0];
   assert.ok(observed, "no fresh server tools/list exchange was observed");
@@ -233,8 +278,13 @@ function writeProbeReceipt(cycles) {
     catalogParity: true,
     workspaceApp: {
       deployedResourceUri: deployedWorkspaceAppUri,
-      hostOpenWorkspaceResourceUri: hostOpenWorkspaceUri ?? null,
-      openWorkspaceUriMatchesCandidate: !hostOpenWorkspaceUri || hostOpenWorkspaceUri === deployedWorkspaceAppUri,
+      deployedCompatibilityUri: deployedWorkspaceAppCompatibilityUri,
+      hostRendererResourceUri: hostWorkspaceAppRenderer?.resourceUri ?? null,
+      hostRendererCompatibilityUri: hostWorkspaceAppRenderer?.legacyOutputTemplate ?? null,
+      hostRendererUrisMatchCandidate: !hostCatalog || (
+        hostWorkspaceAppRenderer?.resourceUri === deployedWorkspaceAppUri
+        && hostWorkspaceAppRenderer?.legacyOutputTemplate === deployedWorkspaceAppCompatibilityUri
+      ),
       resources: [...validatedWorkspaceAppResources.values()],
     },
     hostCapture: {
@@ -262,6 +312,8 @@ function writeProbeReceipt(cycles) {
     heartbeatBytesObserved: totalHeartbeatBytesObserved,
     drainRecoveryEvents: totalDrainRecoveryEvents,
     resourceLoadReads: totalResourceLoadReads,
+    boundedInspectionCalls: totalBoundedInspectionCalls,
+    postHeartbeat: postHeartbeatEvidence,
     startedAt: probeStartedAt,
     finishedAt,
     url: target,
@@ -353,6 +405,101 @@ async function call(name, arguments_, sessionId) {
   assert.notEqual(result.payload?.result?.isError, true,
     `${name} returned an MCP tool error: ${JSON.stringify(result.payload)}`);
   return result.payload?.result;
+}
+
+async function probePostHeartbeat(sessionId, workspaceId, afterSeq) {
+  const id = ++requestId;
+  const startedAt = Date.now();
+  const diagnosticsBefore = diagnosticsSecret ? await diagnostics() : undefined;
+  const stalledBefore = diagnosticEventCount(diagnosticsBefore, "sse_writer_stalled");
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      accept: "application/json, text/event-stream",
+      ...(authorization ? { authorization } : {}),
+      ...(tunnelReviewer ? { "x-kontrol-tunnel-reviewer": tunnelReviewer } : {}),
+      "mcp-session-id": sessionId,
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id,
+      method: "tools/call",
+      params: {
+        name: "await_workspace_events",
+        arguments: { workspaceId, afterSeq, timeoutMs: postHeartbeatMs },
+      },
+    }),
+    signal: AbortSignal.timeout(requestTimeoutMs),
+  });
+  const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
+  assert.equal(response.status, 200, `POST heartbeat call returned HTTP ${response.status}`);
+  assert.ok(contentType.includes("text/event-stream"),
+    `POST tools/call must stream as SSE; received ${contentType || "no content type"}`);
+  assert.equal(response.headers.get("x-accel-buffering"), "no", "POST SSE must disable intermediary buffering");
+  assert.match(response.headers.get("cache-control") ?? "", /no-cache/,
+    "POST SSE must disable intermediary caching");
+  assert.ok(response.body, "POST SSE response has no readable body");
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  const chunks = [];
+  let pending = "";
+  let heartbeatCount = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      pending += decoder.decode(value, { stream: true });
+      const heartbeatPattern = /: kontrol-heartbeat\r?\n\r?\n/g;
+      heartbeatCount += (pending.match(heartbeatPattern) ?? []).length;
+      pending = pending.replace(heartbeatPattern, "");
+      if (pending.length > 1_024) pending = pending.slice(-1_024);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const durationMs = Date.now() - startedAt;
+  const matched = matchJsonRpcResponse(parseSseEventChunks(chunks), id);
+  assert.ok(matched.response, `POST SSE ended without terminal JSON-RPC response ${id}`);
+  assert.ok(!matched.response.error, `POST heartbeat tool failed: ${matched.response.error?.message ?? "JSON-RPC error"}`);
+  assert.ok(heartbeatCount >= 2, `POST SSE carried only ${heartbeatCount} actual heartbeat comments`);
+  assert.ok(durationMs >= postHeartbeatMs - 5_000,
+    `45-second POST heartbeat call returned too early (${durationMs} ms)`);
+  const operationId = response.headers.get("x-kontrol-operation-id") ?? undefined;
+  postHeartbeatEvidence = {
+    method: "POST",
+    tool: "await_workspace_events",
+    requestedWaitMs: postHeartbeatMs,
+    durationMs,
+    heartbeatCount,
+    terminalResponseReceived: true,
+    contentType,
+    ...(operationId ? { operationId } : {}),
+  };
+  if (diagnosticsSecret) {
+    const snapshot = await diagnostics();
+    const operation = snapshot.mcpSessionMetrics?.operationDiagnostics?.recent?.find((item) => item.operationId === operationId);
+    assert.ok(operationId && operation, "authenticated diagnostics must expose the completed POST operation");
+    assert.ok(operation.heartbeatBytes > 0, "POST keepalive bytes must be counted separately in diagnostics");
+    assert.ok(operation.responseBytes > 0, "terminal JSON-RPC bytes must remain visible separately in diagnostics");
+    assert.equal(operation.responseCloseClassification, "response_finished",
+      "POST tool response must finish cleanly after its heartbeat comments");
+    assert.equal(operation.handlerStillRunning, false, "the POST handler must settle with the terminal result");
+    assert.equal(snapshot.mcpSessionMetrics?.activeLongPolls, 0, "POST event waiter must be released after completion");
+    const stalledAfter = diagnosticEventCount(snapshot, "sse_writer_stalled");
+    assert.equal(stalledAfter - stalledBefore, 0, "POST heartbeats must not stall the response writer");
+    postHeartbeatEvidence = {
+      ...postHeartbeatEvidence,
+      diagnosticsVerified: true,
+      heartbeatBytes: operation.heartbeatBytes,
+      responseBytes: operation.responseBytes,
+      responseCloseClassification: operation.responseCloseClassification,
+      handlerStillRunning: operation.handlerStillRunning,
+      stalledWriterEvents: stalledAfter - stalledBefore,
+    };
+  }
+  return postHeartbeatEvidence;
 }
 
 async function openSession(cycle) {
@@ -467,13 +614,19 @@ async function qualifyDualSession(cycle) {
     const widgetB = await rpc("resources/read", { uri: resourceB.uri }, b);
     assert.equal(widgetA.response.status, 200);
     assert.equal(widgetB.response.status, 200);
-    const [readA, grepA, readB, grepB] = await Promise.all([
+    const boundedInspections = await Promise.all([
       call("read", { workspaceId: workspaceA, path: "package.json" }, a),
+      call("read", { workspaceId: workspaceA, path: "AGENTS.md", limit: 80 }, a),
       call("grep", { workspaceId: workspaceA, pattern: "kontrol", path: "package.json" }, a),
-      call("read", { workspaceId: workspaceB, path: "package.json" }, b),
-      call("grep", { workspaceId: workspaceB, pattern: "kontrol", path: "package.json" }, b),
+      call("grep", { workspaceId: workspaceA, pattern: "scripts", path: "package.json", limit: 20 }, a),
+      call("glob", { workspaceId: workspaceA, pattern: "*.json", path: ".", limit: 20 }, a),
+      call("glob", { workspaceId: workspaceA, pattern: "src/**/*.ts", path: ".", limit: 20 }, a),
+      call("ls", { workspaceId: workspaceA, path: "src", limit: 100 }, a),
+      call("ls", { workspaceId: workspaceA, path: "scripts", limit: 100 }, a),
     ]);
-    assert.ok(readA && grepA && readB && grepB, "both tabs must complete interleaved reads/searches");
+    assert.equal(boundedInspections.length, 8, "eight concurrent bounded structured inspections must complete");
+    assert.ok(boundedInspections.every(Boolean), "all eight bounded structured inspections must complete");
+    totalBoundedInspectionCalls += boundedInspections.length;
     // Exercise the same bounded POST long-poll used by both Workspace App
     // tabs. Empty responses are normal heartbeats; one tab must not consume or
     // cancel the other tab's waiter.
@@ -489,6 +642,17 @@ async function qualifyDualSession(cycle) {
       call("await_workspace_events", { workspaceId: workspaceB, afterSeq: nextSeqB, timeoutMs: watcherTimeoutMs }, b),
     ]);
     assert.ok(idleEventsA && idleEventsB, "both tabs must survive an empty watcher heartbeat");
+    if (postHeartbeatMs > 0 && cycle === 0) {
+      const watermarkResult = await call("await_workspace_events", {
+        workspaceId: workspaceA,
+        afterSeq: nextSeqA,
+        timeoutMs: 1_000,
+      }, a);
+      const watermark = Number((watermarkResult?.structuredContent ?? watermarkResult)?.nextSeq);
+      assert.ok(Number.isSafeInteger(watermark) && watermark >= nextSeqA,
+        "could not establish a quiet workspace event cursor for the POST heartbeat probe");
+      await probePostHeartbeat(a, workspaceA, watermark);
+    }
     const diagnosticsBeforeStreams = await diagnostics();
     const drainEventsBefore = diagnosticEventCount(diagnosticsBeforeStreams, "sse_writer_drained");
     streamA = await openSse(a);
@@ -544,6 +708,8 @@ if (dualSession) {
   writeProbeReceipt(cycles);
   console.log(JSON.stringify({ ok: true, url, dualSession: true, cycles, heartbeatBytesObserved: totalHeartbeatBytesObserved,
     drainRecoveryEvents: totalDrainRecoveryEvents, resourceLoadReads: totalResourceLoadReads,
+    boundedInspectionCalls: totalBoundedInspectionCalls,
+    postHeartbeat: postHeartbeatEvidence ?? null,
     correlatedServerResponses: observedRequestCorrelations.filter((item) => item.operationId).length,
     requiredTools: [...REQUIRED_INSPECTION_TOOLS, "poll_process"] }));
   process.exit(0);

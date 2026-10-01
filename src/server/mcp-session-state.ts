@@ -60,6 +60,20 @@ export interface McpSessionState {
   durableWorkerSession: boolean;
   lastRpcMethod?: string;
   lastToolName?: string;
+  toolSurfaceVersion?: string;
+  catalogRefresh?: {
+    initializedPulseAttempted: boolean;
+    getStreamPulseAttempted: boolean;
+    toolListRefreshSent: boolean;
+    resourceListRefreshSent: boolean;
+    toolListRefreshAttempts: number;
+    resourceListRefreshAttempts: number;
+    toolListRefreshSuccesses: number;
+    resourceListRefreshSuccesses: number;
+    toolListRefreshFailures: number;
+    resourceListRefreshFailures: number;
+    lastAttemptAt?: string;
+  };
   /** Durable reason for the last transport termination decision. */
   terminationReason?: string;
 }

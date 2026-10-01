@@ -9,7 +9,7 @@ import { selectHealthyAgent } from "../acp-gateway.js";
 import type { AgentInfo } from "../acp-registry.js";
 import type { MissionReviewPacket } from "../mission-ledger.js";
 import type { PrincipalRole } from "../policy-enforcement.js";
-import { workspaceAppToolMeta } from "../workspace-app-resource.js";
+import { workspaceAppCallableToolMeta } from "../workspace-app-resource.js";
 import type { BridgeConfig } from "./context.js";
 import { realpath } from "node:fs/promises";
 import { mcpOwnerContextId } from "../mcp/owner-context.js";
@@ -27,7 +27,7 @@ export interface LiveWaiterRegistry {
 }
 
 export function workspaceAppModelAndAppMeta() {
-  return workspaceAppToolMeta();
+  return workspaceAppCallableToolMeta();
 }
 
 export function compactMissionPacket(packet: MissionReviewPacket): MissionReviewPacket {

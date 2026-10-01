@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { connectBootstrapWithRetry, setLifecycleHost, type LifecycleHost } from "./connection-lifecycle.js";
+import { cancelReconnect, connectBootstrapWithRetry, setLifecycleHost, type LifecycleHost } from "./connection-lifecycle.js";
 
 function makeHost(connectApp: () => Promise<void>) {
   let connected = false;
@@ -46,18 +46,32 @@ function makeHost(connectApp: () => Promise<void>) {
 }
 
 let attempts = 0;
+const attemptTimes: number[] = [];
 const succeedsOnRetry = makeHost(async () => {
   attempts += 1;
+  attemptTimes.push(Date.now());
   if (attempts === 1) throw new Error("temporary bootstrap failure");
 });
 setLifecycleHost(succeedsOnRetry.host);
 await connectBootstrapWithRetry();
 assert.equal(attempts, 2, "bootstrap gets one retry after its first failed connect");
+assert.ok(attemptTimes[1] - attemptTimes[0] >= 300, "the second bootstrap attempt waits for the host bridge to initialize");
 assert.equal(succeedsOnRetry.recreateCount, 1, "the failed SDK App is recreated before retry");
 assert.equal(succeedsOnRetry.connected, true);
 assert.equal(succeedsOnRetry.state, "CONNECTED");
 assert.equal(succeedsOnRetry.connectionError, null);
 assert.equal(succeedsOnRetry.rehydrationCount, 1);
+
+let cancelledAttempts = 0;
+const cancelledBootstrap = makeHost(async () => {
+  cancelledAttempts += 1;
+  throw new Error("host bridge is still starting");
+});
+setLifecycleHost(cancelledBootstrap.host);
+const cancelDuringBootstrapWait = setTimeout(() => cancelReconnect(), 40);
+await connectBootstrapWithRetry();
+clearTimeout(cancelDuringBootstrapWait);
+assert.equal(cancelledAttempts, 1, "teardown cancellation wakes the initial retry delay without a second connect");
 
 let failingAttempts = 0;
 const remainsFailed = makeHost(async () => {

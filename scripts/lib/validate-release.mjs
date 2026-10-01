@@ -5,6 +5,7 @@ import {
   readFileSync,
   realpathSync,
 } from "node:fs";
+import { createHash } from "node:crypto";
 import { basename, dirname, extname, isAbsolute, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -76,6 +77,27 @@ export function validateRelease(artifactPath) {
   }
   if (typeof metadata.contentSha256 !== "string" || !/^[a-f0-9]{16,64}$/.test(metadata.contentSha256)) {
     throw new Error("release build-meta.json has no contentSha256");
+  }
+  if (typeof metadata.workspaceAppBuildId !== "string" || !/^[a-f0-9]{12}$/.test(metadata.workspaceAppBuildId)) {
+    throw new Error("release build-meta.json has no valid workspaceAppBuildId");
+  }
+  const workspaceAppBytes = readFileSync(resolve(root, "ui/workspace-app.html"));
+  const actualWorkspaceAppBuildId = createHash("sha256").update(workspaceAppBytes).digest("hex").slice(0, 12);
+  if (actualWorkspaceAppBuildId !== metadata.workspaceAppBuildId) {
+    throw new Error("release workspaceAppBuildId does not match ui/workspace-app.html");
+  }
+  if (!Array.isArray(metadata.workspaceAppHistory) || metadata.workspaceAppHistory.length > 64) {
+    throw new Error("release build-meta.json has invalid workspaceAppHistory");
+  }
+  for (const entry of metadata.workspaceAppHistory) {
+    if (typeof entry?.releaseBuildId !== "string"
+      || !/^[A-Za-z0-9._-]{1,128}$/.test(entry.releaseBuildId)
+      || typeof entry?.workspaceAppBuildId !== "string"
+      || !/^[a-f0-9]{12}$/.test(entry.workspaceAppBuildId)
+      || typeof entry?.buildTimestamp !== "string"
+      || !Number.isFinite(Date.parse(entry.buildTimestamp))) {
+      throw new Error("release build-meta.json has an invalid workspaceAppHistory entry");
+    }
   }
   for (const field of ["schemaVersion", "minReadableSchemaVersion", "maxReadableSchemaVersion", "releaseFormatVersion"]) {
     if (!Number.isInteger(metadata[field]) || metadata[field] < 0) {

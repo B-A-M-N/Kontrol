@@ -10,6 +10,7 @@ import { mcpSessionIdleReason, mcpSessionIdleTtl } from "../mcp-session-policy.j
 import { logEvent, sessionIdPrefix } from "../logger.js";
 import type { ProcessSessionManager } from "../process-sessions.js";
 import type { Transport } from "../mcp/workspace-server.js";
+import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import {
   resolveMcpMemoryBudget,
   type McpSessionClientMetrics,
@@ -26,6 +27,7 @@ export interface McpSessionLifecycleDeps {
   cancelPolicyWaitersForSession(sessionId: string, requestId?: string): number;
   readonly mcpSessions: Map<string, McpSessionState>;
   readonly transports: Map<string, Transport>;
+  readonly mcpServers: Map<string, McpServer>;
   readonly logicalContinuity: LogicalContinuityIndex;
   readonly processSessions: ProcessSessionManager;
   readonly workspaceAppResourceMetrics: WorkspaceAppResourceMetrics;
@@ -80,7 +82,7 @@ function buildSessionWindowMetrics(events: Array<{ at: number; kind: McpSessionW
 }
 
 export function createMcpSessionLifecycle(deps: McpSessionLifecycleDeps): McpSessionLifecycle {
-  const { config, mcpSessions, transports, logicalContinuity, processSessions, workspaceAppResourceMetrics, clearWorkspaceSessionState } = deps;
+  const { config, mcpSessions, transports, mcpServers, logicalContinuity, processSessions, workspaceAppResourceMetrics, clearWorkspaceSessionState } = deps;
   const isDurableWorkerSessionActive = deps.isDurableWorkerSessionActive
     ?? ((state: McpSessionState) => state.durableWorkerSession);
   const mcpSessionMetrics: McpSessionMetrics = {
@@ -395,6 +397,7 @@ export function createMcpSessionLifecycle(deps: McpSessionLifecycleDeps): McpSes
     const state = mcpSessions.get(sessionId);
     if (!state) {
       transports.delete(sessionId);
+      mcpServers.delete(sessionId);
       return false;
     }
     if (reason === "expired" && mcpSessionHasActiveResponsibility(state)) return false;
@@ -402,6 +405,7 @@ export function createMcpSessionLifecycle(deps: McpSessionLifecycleDeps): McpSes
     clearWorkspaceSessionState(sessionId);
     state.closing = true;
     transports.delete(sessionId);
+    mcpServers.delete(sessionId);
     recordMcpSessionEnd(state, reason, now);
     if (state.identitySource !== "client_info_fallback") {
       logicalContinuity.detach(state.logicalClientId, state.sessionId, now);

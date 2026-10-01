@@ -12,6 +12,79 @@ export type ToolContent =
   | { type: "text"; text: string }
   | { type: "image"; data: string; mimeType: string };
 
+export const MAX_INSPECTION_RESULT_BYTES = 48_000;
+
+export interface BoundedInspectionContent {
+  content: ToolContent[];
+  truncated: boolean;
+  returnedLines: number;
+  characters: number;
+  bytes: number;
+}
+
+/** Bound text sent by structured inspection tools and keep a useful continuation point. */
+export function boundInspectionContent(
+  content: ToolContent[],
+  options: { maxBytes?: number; offset?: number; nextOffset?: number; sourceTruncated?: boolean } = {},
+): BoundedInspectionContent {
+  const maxBytes = Math.max(256, options.maxBytes ?? MAX_INSPECTION_RESULT_BYTES);
+  const textBlocks = content.filter((block): block is { type: "text"; text: string } => block.type === "text");
+  const text = contentText(textBlocks);
+  const textBytes = Buffer.byteLength(text, "utf8");
+  if (textBytes <= maxBytes && !options.sourceTruncated) {
+    return {
+      content,
+      truncated: false,
+      returnedLines: contentLineCount(text),
+      characters: text.length,
+      bytes: textBytes,
+    };
+  }
+
+  const sourceLimitMarker = "\n\n[The inspection tool limited this result. Narrow the path/pattern or continue with the reported read offset.]";
+  if (options.sourceTruncated && textBytes + Buffer.byteLength(sourceLimitMarker, "utf8") <= maxBytes) {
+    let markerAppended = false;
+    const withLimitNotice = content.map((block) => {
+      if (block.type !== "text") return block;
+      const next = !markerAppended ? { ...block, text: `${block.text}${sourceLimitMarker}` } : block;
+      markerAppended = true;
+      return next;
+    });
+    return {
+      content: withLimitNotice,
+      truncated: true,
+      returnedLines: contentLineCount(text),
+      characters: text.length + sourceLimitMarker.length,
+      bytes: textBytes + Buffer.byteLength(sourceLimitMarker, "utf8"),
+    };
+  }
+
+  const markerReserve = 192;
+  const budget = Math.max(1, maxBytes - markerReserve);
+  let end = 0;
+  let usedBytes = 0;
+  for (const character of text) {
+    const characterBytes = Buffer.byteLength(character, "utf8");
+    if (usedBytes + characterBytes > budget) break;
+    usedBytes += characterBytes;
+    end += character.length;
+  }
+  const newline = text.lastIndexOf("\n", end);
+  if (newline >= Math.floor(end * 0.5)) end = newline;
+  const kept = text.slice(0, end);
+  const returnedLines = contentLineCount(kept);
+  const nextOffset = options.nextOffset ?? ((options.offset ?? 1) + returnedLines);
+  const marker = `\n\n[Kontrol capped this inspection at ${returnedLines} returned lines and ${Buffer.byteLength(kept, "utf8")} bytes. Continue with offset=${nextOffset} for read, or narrow the search/list scope.]`;
+  const boundedText = `${kept}${marker}`;
+  return {
+    content: [textBlock(boundedText)],
+    truncated: true,
+    returnedLines,
+    characters: boundedText.length,
+    bytes: Buffer.byteLength(boundedText, "utf8"),
+  };
+}
+
 export interface DiffStats {
   additions: number;
   removals: number;

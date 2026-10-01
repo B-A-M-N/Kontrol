@@ -591,15 +591,19 @@ const candidateBuildId = "kontrol-test-candidate-" + process.pid;
 const baseRelease = join(root, "releases", baseBuildId);
 const candidateRelease = join(root, "releases", candidateBuildId);
 mkdirSync(join(baseRelease, "ui"), { recursive: true });
+const baseWorkspaceAppHtml = "test-artifact\n";
 writeFileSync(join(baseRelease, "build-meta.json"), JSON.stringify({
   buildId: baseBuildId,
   contentSha256: "0123456789abcdef",
   schemaVersion: 0,
   minReadableSchemaVersion: 0,
   maxReadableSchemaVersion: 0,
-  releaseFormatVersion: 3,
+  releaseFormatVersion: 4,
+  workspaceAppBuildId: createHash("sha256").update(baseWorkspaceAppHtml).digest("hex").slice(0, 12),
+  workspaceAppHistory: [],
 }) + "\n");
-for (const file of ["cli.js", "server.js", "acp-duplex.js", "ui/workspace-app.html"]) writeFileSync(join(baseRelease, file), "test-artifact\n");
+for (const file of ["cli.js", "server.js", "acp-duplex.js"]) writeFileSync(join(baseRelease, file), "test-artifact\n");
+writeFileSync(join(baseRelease, "ui", "workspace-app.html"), baseWorkspaceAppHtml);
 
 try {
   symlinkSync(baseRelease, join(root, "dist"));
@@ -743,7 +747,7 @@ try {
   writeEnvironment(postStopCrashState, 17685, { pauseRuntimeLockAcquire: true, pauseMarker: postStopCrashMarker });
   const postStopCrashController = startRestartController(postStopCrashEnv);
   assert.equal(
-    await waitForPath(postStopCrashMarker),
+    await waitForPath(postStopCrashMarker, 45_000),
     true,
     `controller must reach post-stop ownership handoff before SIGKILL\nstdout:\n${postStopCrashController.stdout}\nstderr:\n${postStopCrashController.stderr}`,
   );

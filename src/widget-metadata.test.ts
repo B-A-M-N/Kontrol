@@ -9,8 +9,13 @@ import { loadConfig } from "./config.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { ProcessSessionManager } from "./process-sessions.js";
 import { WorkspaceRegistry } from "./workspaces.js";
+import { workspaceAppModelAndAppMeta } from "./bridge/shared.js";
 
 const root = mkdtempSync(join(tmpdir(), "kontrol-widget-metadata-"));
+const bridgeCallableMeta = workspaceAppModelAndAppMeta() as { ui?: Record<string, unknown>; "openai/outputTemplate"?: string };
+assert.deepEqual(bridgeCallableMeta.ui?.visibility, ["app"], "bridge data tools remain callable from the Workspace App");
+assert.equal(bridgeCallableMeta.ui?.resourceUri, undefined, "bridge data tools must not select the Workspace App renderer");
+assert.equal(bridgeCallableMeta["openai/outputTemplate"], undefined, "bridge data tools must not advertise a ChatGPT renderer");
 try {
   mkdirSync(join(root, "src"), { recursive: true });
   for (const mode of ["changes", "full"] as const) {
@@ -57,25 +62,34 @@ try {
       assert.equal(opened._meta?.tool, "open_workspace", "open_workspace must carry the host metadata discriminator");
       const showUi = byName.get("show_workspace_ui");
       assert.ok(showUi, `${mode} mode must expose the on-demand workspace UI tool`);
-      const showUiMeta = showUi._meta as { ui?: { resourceUri?: string } } | undefined;
+      const appResources = await import("./workspace-app-resource.js");
+      const showUiMeta = showUi._meta as { ui?: { resourceUri?: string }; "openai/outputTemplate"?: string } | undefined;
       assert.ok(showUiMeta?.ui?.resourceUri, "show_workspace_ui must advertise the standard Workspace App resource");
+      assert.equal(showUiMeta?.["openai/outputTemplate"], appResources.OPENAI_WORKSPACE_APP_URI,
+        "show_workspace_ui must advertise the content-hashed ChatGPT compatibility resource");
       for (const name of ["read", "grep", "ls"]) {
-        const ui = byName.get(name)?._meta?.ui as { resourceUri?: string; visibility?: string[] } | undefined;
+        const toolMeta = byName.get(name)?._meta as Record<string, unknown> | undefined;
+        const ui = toolMeta?.ui as { resourceUri?: string; visibility?: string[] } | undefined;
         assert.equal(Boolean(ui), mode === "full", `${name} app-callable metadata must follow ${mode} mode`);
         assert.equal(ui?.resourceUri, undefined, `${name} must not advertise the Workspace App as its result renderer`);
+        assert.equal(toolMeta?.["openai/outputTemplate"], undefined, `${name} must not select a ChatGPT renderer`);
         if (mode === "full") assert.deepEqual(ui?.visibility, ["app"], `${name} must be callable from the app`);
       }
-      const showChangesUi = byName.get("show_changes")?._meta?.ui as { resourceUri?: string } | undefined;
+      const showChangesMeta = byName.get("show_changes")?._meta as Record<string, unknown> | undefined;
+      const showChangesUi = showChangesMeta?.ui as { resourceUri?: string } | undefined;
       assert.ok(showChangesUi?.resourceUri, "show_changes is a deliberate render entry point");
+      assert.equal(showChangesMeta?.["openai/outputTemplate"], appResources.OPENAI_WORKSPACE_APP_URI);
       assert.equal(byName.has("show_changes"), true, `${mode} mode must expose show_changes for explicit aggregate review`);
       if (mode === "full") {
-        const approvalCenterUi = byName.get("open_approval_center")?._meta?.ui as { resourceUri?: string; visibility?: string[] } | undefined;
+        const approvalCenterMeta = byName.get("open_approval_center")?._meta as Record<string, unknown> | undefined;
+        const approvalCenterUi = approvalCenterMeta?.ui as { resourceUri?: string; visibility?: string[] } | undefined;
         assert.ok(approvalCenterUi?.resourceUri, "open_approval_center is a deliberate render entry point");
+        assert.equal(approvalCenterMeta?.["openai/outputTemplate"], appResources.OPENAI_WORKSPACE_APP_URI);
         const pendingApprovalsUi = byName.get("list_pending_approvals")?._meta?.ui as { resourceUri?: string; visibility?: string[] } | undefined;
         assert.deepEqual(pendingApprovalsUi?.visibility, ["app"], "pending approval data remains callable from the app");
         assert.equal(pendingApprovalsUi?.resourceUri, undefined, "approval data must not select the app renderer");
       }
-      const workspaceAppResource = (await import("./workspace-app-resource.js")).workspaceAppResourceMeta();
+      const workspaceAppResource = appResources.workspaceAppResourceMeta();
       assert.deepEqual(workspaceAppResource.ui.permissions, { clipboardWrite: {} }, "Workspace App must request optional clipboard-write permission under _meta.ui without assuming it is granted");
       assert.equal("permissions" in workspaceAppResource, false, "resource metadata must not expose permissions at the root");
     } finally {

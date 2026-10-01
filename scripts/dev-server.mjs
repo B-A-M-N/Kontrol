@@ -18,7 +18,7 @@ const maxCrashDelayMs = 30_000;
 // source changes (the change also restarts the server, which reloads the
 // artifact from disk).
 const devUiDir = process.env.KONTROL_DEV_UI_DIR || join(tmpdir(), `kontrol-dev-ui-${process.pid}`);
-const devUiArtifact = join(devUiDir, "workspace-app.html");
+const devUiArtifact = join(devUiDir, "ui", "workspace-app.html");
 
 function buildDevUi() {
   mkdirSync(devUiDir, { recursive: true });

@@ -45,6 +45,7 @@ const lifecycle = createMcpSessionLifecycle({
   cancelPolicyWaitersForSession: () => 0,
   mcpSessions: sessions,
   transports: new Map(),
+  mcpServers: new Map(),
   logicalContinuity: new LogicalContinuityIndex(),
   processSessions: new ProcessSessionManager({ childEnvironmentAllowlist: [] }),
   workspaceAppResourceMetrics: {

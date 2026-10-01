@@ -493,9 +493,12 @@ async function bootInternal(): Promise<void> {
   app.ontoolresult = (result) => {
     const structuredContent = getStructuredContent<Partial<ToolResultCard>>(result);
     const metaCard = cardFromMeta(result);
-    const structured = metaCard
+    const card = metaCard
       ? { ...structuredContent, ...metaCard }
       : structuredContent;
+    const structured = card && !card.payload?.content?.length && result.content.length > 0
+      ? { ...card, payload: { ...card.payload, content: result.content } }
+      : card;
     const tool = toolNameFromResult(result, structuredContent, metaCard);
 
     if (!tool || !isToolResultCard(structured)) {
@@ -879,6 +882,7 @@ export const __workspaceAppTest = {
   getWorkSessionView: (sessionId: string) => workSessionViews.get(sessionId),
   getActiveWorkspaceId: () => activeWorkspaceId,
   getSelectedWorkSessionId: () => selectedWorkSessionId,
+  getLastToolCard: () => lastToolCard,
   activateWorkspace,
   surfaceNewDirectApproval,
   surfaceNewDirectApprovalResolved: (workspaceId: string) => maybeRestoreAfterApprovalResolved(workspaceId),

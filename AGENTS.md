@@ -201,11 +201,37 @@ Current implementation contracts:
   `generation.json` owns active, previous, and last-known-good artifacts; those
   pointers rotate only after readiness is proven.
 - The MCP tool surface has a mandatory structured inspection contract:
-  `read`, `grep`, `glob`, and `ls` are registered and verified in every tool
-  mode. The server version includes the immutable artifact content identity;
-  `open_workspace`, authenticated diagnostics, and `generation.json` expose
-  the surface identity, and clients with a stale catalog must establish a
-  fresh MCP initialize rather than substitute shell inspection.
+  `read`, `grep`, `glob`, `ls`, `git_status`, `git_log`, `git_diff`, and
+  `git_show` are registered and verified in every tool mode. The server
+  version includes the immutable artifact content identity; `open_workspace`,
+  authenticated diagnostics, and `generation.json` expose the surface
+  identity. A stale host catalog receives bounded list-changed notifications
+  after initialize and when a GET SSE stream is established; clients must
+  establish a fresh MCP initialize if their tool catalog remains stale.
+- Workspace App resources use content-hashed HTML identities. Retain up to 64
+  prior releases for 30 days as lazy immutable references; each historical
+  modern URI and `.skybridge.html` alias must return the exact bytes matching
+  its hash. Unknown hashes return bounded errors and never alias the current
+  app. `show_workspace_ui`, `show_changes`, and `open_approval_center` are
+  renderer entry points and advertise both `_meta.ui.resourceUri` and the
+  matching `openai/outputTemplate`; `open_workspace` and app-callable data
+  tools remain renderer-free.
+- Structured inspection results have a 48,000-byte text cap. `read` defaults
+  to and is capped at 600 lines, returns `offset`, `returnedLines`,
+  `truncated`, and `nextOffset` when applicable, and hashes the complete file
+  bytes. `grep`, `glob`, `ls`, and Git output use the shared byte bound and
+  report truncation. Ordinary tool cards do not copy result content into
+  `_meta`; the Workspace App renders `result.content` when a compact card has
+  no payload copy.
+- Interactive MCP requests and Workspace App resource reads wait at most
+  `KONTROL_MCP_INTERACTIVE_ADMISSION_TIMEOUT_MS` (default 8 seconds) for
+  admission, with a per-session queued-request cap of 16. Durable authenticated
+  workers retain the long admission timeout. Capacity rejections include
+  `Retry-After: 1`.
+- Every MCP `text/event-stream` response, including POST tool responses, sends
+  bounded SSE comment heartbeats every 15 seconds by default with proxy
+  buffering disabled. Operation diagnostics count `heartbeatBytes` separately
+  from JSON-RPC `responseBytes`.
 - `read` returns a SHA-256 version of the complete file bytes. `write` and
   `edit` accept an optional `expectedContentSha256`, while Codex
   `apply_patch` accepts `expectedContentSha256ByPath`; supplied preconditions
@@ -269,15 +295,20 @@ Current implementation contracts:
 - `scripts/probe-mcp-tunnel.mjs --dual` validates both fresh catalogs, uses
   reviewer authority for Workspace App event watchers when supplied, exercises
   an 18-second empty watcher heartbeat, reads actual repeated SSE heartbeat
-  bytes, and applies concurrent Workspace App resource load. Its HTTP request
-  deadline must exceed the watcher interval. Catalog extraction accepts one
+  bytes, completes eight concurrent bounded inspections, applies concurrent
+  Workspace App resource load, and can run a 45-second POST SSE tool call that
+  requires repeated heartbeat comments plus clean operation diagnostics. Its
+  HTTP request deadline must exceed the watcher interval and POST wait.
+  Catalog extraction accepts one
   authoritative `tools/list` result and rejects ambiguous envelopes rather
   than merging arrays. A qualification capture has `capturedAt`, `captureId`,
   `initialize`, and the matching `toolsList`; the receipt labels the host
   exchange operator-supplied and Kontrol's live server exchange
   machine-verified. Qualification requires the deployed HTTPS intermediary,
-  at least two heartbeat bytes per session, two observed drain recoveries, and
-  concurrent resource reads; localhost idle-proxy runs cannot create receipts.
+  at least two GET heartbeat bytes per session, two observed drain recoveries,
+  eight bounded inspections per cycle, a near-complete 45-second POST heartbeat
+  with separately counted diagnostics, and concurrent resource reads;
+  localhost idle-proxy runs cannot create receipts.
   Pass `--host-catalog-file` to fail closed on missing/extra invocable tools
   and stale `serverInfo.version`.
   The default receipt path is `beta-external-catalog.json`; override it with

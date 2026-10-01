@@ -47,15 +47,18 @@ function expectedWorkspaceAppMimeType(uri) {
 function validateWorkspaceAppEvidence(receipt) {
   const app = receipt?.workspaceApp;
   const deployedUri = app?.deployedResourceUri;
+  const deployedCompatibilityUri = app?.deployedCompatibilityUri;
   const canonicalUri = typeof deployedUri === "string"
     && /^ui:\/\/kontrol\/workspace-app-[a-f0-9]{12}\.html$/i.test(deployedUri);
-  const hostOpenUri = app?.hostOpenWorkspaceResourceUri;
-  const hostUriMatches = hostOpenUri === null || hostOpenUri === undefined || hostOpenUri === deployedUri;
+  const canonicalCompatibilityUri = typeof deployedCompatibilityUri === "string"
+    && /^ui:\/\/kontrol\/workspace-app-[a-f0-9]{12}\.skybridge\.html$/i.test(deployedCompatibilityUri);
+  const hostRendererUriMatches = app?.hostRendererResourceUri === deployedUri
+    && app?.hostRendererCompatibilityUri === deployedCompatibilityUri;
   const toolUris = [
     ...workspaceAppResourceUris(receipt?.serverToolMetadata),
     ...workspaceAppResourceUris(receipt?.hostToolMetadata),
   ];
-  const requiredUris = new Set([deployedUri, ...toolUris].filter((uri) => typeof uri === "string"));
+  const requiredUris = new Set([deployedUri, deployedCompatibilityUri, ...toolUris].filter((uri) => typeof uri === "string"));
   const resources = Array.isArray(app?.resources) ? app.resources : [];
   const byUri = new Map(resources.map((resource) => [resource?.uri, resource]));
   const resourceReadsValid = canonicalUri
@@ -72,14 +75,17 @@ function validateWorkspaceAppEvidence(receipt) {
   return {
     valid: Boolean(
       canonicalUri
-      && hostUriMatches
-      && app?.openWorkspaceUriMatchesCandidate === true
+      && canonicalCompatibilityUri
+      && hostRendererUriMatches
+      && app?.hostRendererUrisMatchCandidate === true
       && resourceReadsValid,
     ),
     canonicalUri,
-    hostUriMatches,
+    canonicalCompatibilityUri,
+    hostRendererUriMatches,
     resourceReadsValid: Boolean(resourceReadsValid),
     deployedUri,
+    deployedCompatibilityUri,
     requiredUris: [...requiredUris].sort(),
   };
 }
@@ -128,6 +134,32 @@ export function validateBetaExternalCatalogReceipt(receipt, { candidateBuildId, 
     && Number.isInteger(receipt?.resourceLoadReads)
     && receipt.resourceLoadReads >= receipt.cycles * 2,
   );
+  const postHeartbeat = receipt?.postHeartbeat;
+  const postHeartbeatEvidenceValid = Boolean(
+    postHeartbeat?.method === "POST"
+    && postHeartbeat?.tool === "await_workspace_events"
+    && Number.isInteger(postHeartbeat?.requestedWaitMs)
+    && postHeartbeat.requestedWaitMs >= 45_000
+    && Number.isInteger(postHeartbeat?.durationMs)
+    && postHeartbeat.durationMs >= postHeartbeat.requestedWaitMs - 5_000
+    && Number.isInteger(postHeartbeat?.heartbeatCount)
+    && postHeartbeat.heartbeatCount >= 2
+    && postHeartbeat.terminalResponseReceived === true
+    && typeof postHeartbeat.contentType === "string"
+    && postHeartbeat.contentType.includes("text/event-stream")
+    && postHeartbeat.diagnosticsVerified === true
+    && Number.isInteger(postHeartbeat.heartbeatBytes)
+    && postHeartbeat.heartbeatBytes > 0
+    && Number.isInteger(postHeartbeat.responseBytes)
+    && postHeartbeat.responseBytes > 0
+    && postHeartbeat.responseCloseClassification === "response_finished"
+    && postHeartbeat.handlerStillRunning === false
+    && postHeartbeat.stalledWriterEvents === 0,
+  );
+  const boundedInspectionEvidenceValid = Boolean(
+    Number.isInteger(receipt?.boundedInspectionCalls)
+    && receipt.boundedInspectionCalls >= receipt.cycles * 8,
+  );
   const timeOrderValid = Boolean(
     Number.isFinite(hostCatalogCapturedAtMs)
     && Number.isFinite(probeStartedAtMs)
@@ -164,6 +196,8 @@ export function validateBetaExternalCatalogReceipt(receipt, { candidateBuildId, 
     && sameCatalogTarget
     && workspaceAppCheck.valid
     && streamingEvidenceValid
+    && postHeartbeatEvidenceValid
+    && boundedInspectionEvidenceValid
     && timeOrderValid,
   );
   return {
@@ -175,6 +209,8 @@ export function validateBetaExternalCatalogReceipt(receipt, { candidateBuildId, 
     hostCaptureIsOperatorSupplied,
     liveServerProbeIsMachineVerified,
     streamingEvidenceValid,
+    postHeartbeatEvidenceValid,
+    boundedInspectionEvidenceValid,
     timeOrderValid,
     hostCatalogCapturedAt: receipt?.hostCatalogCapturedAt,
     startedAt: receipt?.startedAt,

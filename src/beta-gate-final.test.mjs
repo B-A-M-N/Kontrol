@@ -17,6 +17,7 @@ const buildId = "candidate-build";
 const contentSha256 = "b".repeat(64);
 const expectedMcpVersion = `1.0.4+${contentSha256}`;
 const workspaceAppUri = "ui://kontrol/workspace-app-abcdef123456.html";
+const workspaceAppCompatibilityUri = "ui://kontrol/workspace-app-abcdef123456.skybridge.html";
 const requiredTools = ["read", "grep", "glob", "ls", "git_status", "git_log", "git_diff", "git_show", "poll_process"];
 mkdirSync(fakeBin, { recursive: true });
 const fakeGit = join(fakeBin, "git");
@@ -84,19 +85,27 @@ const externalCatalog = {
   hostTools: requiredTools,
   serverToolMetadata: [
     { name: "open_workspace" },
-    { name: "show_workspace_ui", resourceUri: workspaceAppUri, visibility: ["model"] },
+    { name: "show_workspace_ui", resourceUri: workspaceAppUri, visibility: ["model"], legacyOutputTemplate: workspaceAppCompatibilityUri },
   ],
   hostToolMetadata: [
-    { name: "open_workspace", resourceUri: workspaceAppUri, visibility: ["model"] },
-    { name: "show_workspace_ui", resourceUri: workspaceAppUri, visibility: ["model"] },
+    { name: "open_workspace" },
+    { name: "show_workspace_ui", resourceUri: workspaceAppUri, visibility: ["model"], legacyOutputTemplate: workspaceAppCompatibilityUri },
   ],
   workspaceApp: {
     deployedResourceUri: workspaceAppUri,
-    hostOpenWorkspaceResourceUri: workspaceAppUri,
-    openWorkspaceUriMatchesCandidate: true,
+    deployedCompatibilityUri: workspaceAppCompatibilityUri,
+    hostRendererResourceUri: workspaceAppUri,
+    hostRendererCompatibilityUri: workspaceAppCompatibilityUri,
+    hostRendererUrisMatchCandidate: true,
     resources: [{
       uri: workspaceAppUri,
       mimeType: "text/html;profile=mcp-app",
+      htmlBytes: 1234,
+      listed: true,
+      read: true,
+    }, {
+      uri: workspaceAppCompatibilityUri,
+      mimeType: "text/html+skybridge",
       htmlBytes: 1234,
       listed: true,
       read: true,
@@ -124,6 +133,22 @@ const externalCatalog = {
   heartbeatBytesObserved: 4,
   drainRecoveryEvents: 2,
   resourceLoadReads: 2,
+  boundedInspectionCalls: 8,
+  postHeartbeat: {
+    method: "POST",
+    tool: "await_workspace_events",
+    requestedWaitMs: 45_000,
+    durationMs: 45_010,
+    heartbeatCount: 3,
+    terminalResponseReceived: true,
+    contentType: "text/event-stream; charset=utf-8",
+    diagnosticsVerified: true,
+    heartbeatBytes: 60,
+    responseBytes: 512,
+    responseCloseClassification: "response_finished",
+    handlerStillRunning: false,
+    stalledWriterEvents: 0,
+  },
   hostCatalogCapturedAt: "2026-08-27T12:04:00.000Z",
   startedAt: "2026-08-27T12:05:00.000Z",
   finishedAt: "2026-08-27T12:06:00.000Z",
@@ -153,16 +178,32 @@ assert.equal(validateBetaExternalCatalogReceipt({
 }).valid, false, "missing or extra external tools must be rejected");
 assert.equal(validateBetaExternalCatalogReceipt({
   ...externalCatalog,
+  postHeartbeat: { ...externalCatalog.postHeartbeat, heartbeatCount: 1 },
+}, {
+  candidateBuildId: buildId,
+  expectedMcpVersion,
+  soak,
+}).valid, false, "GET-only streaming evidence must not qualify without repeated POST SSE heartbeats");
+assert.equal(validateBetaExternalCatalogReceipt({
+  ...externalCatalog,
+  boundedInspectionCalls: 7,
+}, {
+  candidateBuildId: buildId,
+  expectedMcpVersion,
+  soak,
+}).valid, false, "the concurrent eight-call inspection evidence must be required");
+assert.equal(validateBetaExternalCatalogReceipt({
+  ...externalCatalog,
   workspaceApp: {
     ...externalCatalog.workspaceApp,
-    hostOpenWorkspaceResourceUri: "ui://kontrol/workspace-app-deadbeefcafe.html",
-    openWorkspaceUriMatchesCandidate: false,
+    hostRendererResourceUri: "ui://kontrol/workspace-app-deadbeefcafe.html",
+    hostRendererUrisMatchCandidate: false,
   },
 }, {
   candidateBuildId: buildId,
   expectedMcpVersion,
   soak,
-}).valid, false, "a host-captured open_workspace hash from another bundle must be rejected");
+}).valid, false, "a host-captured renderer hash from another bundle must be rejected");
 assert.equal(validateBetaExternalCatalogReceipt({
   ...externalCatalog,
   workspaceApp: {

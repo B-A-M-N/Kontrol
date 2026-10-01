@@ -372,6 +372,8 @@ fakeApp.ontoolresult?.({
 await settle();
 assert.match(document.querySelector(".tool-title")?.textContent ?? "", /Read File/,
   "structuredContent.tool is accepted when _meta.tool is absent");
+assert.equal(__workspaceAppTest.getLastToolCard()?.payload?.content?.[0]?.text, "fallback result",
+  "the Workspace App fills omitted metadata content from the MCP result content");
 fakeApp.ontoolresult?.({
   _meta: { tool: "show_workspace_ui" },
   structuredContent: { tool: "show_workspace_ui", workspaceId: "workspace-ui-open", root: "/workspace", mode: "checkout", instruction: "Workspace UI ready" },
@@ -666,7 +668,6 @@ assert.equal(__workspaceAppTest.getConnectionState(), "DISCONNECTED", "app teard
         resumeArgument: "approvalResumeId",
         retryable: true,
         summary: { status: "approval_required", approvalId: "approval-fresh-1", command: "env" },
-        payload: { content: [{ type: "text", text: "Approval required." }] },
       },
     },
     structuredContent: {
@@ -679,6 +680,9 @@ assert.equal(__workspaceAppTest.getConnectionState(), "DISCONNECTED", "app teard
   });
   await settle();
   await settle();
+
+  assert.equal(fresh.getLastToolCard()?.payload?.content?.[0]?.text, "Approval required.",
+    "approval cards also fall back to the result content when metadata omits a duplicate");
 
   assert.equal(
     fresh.getActiveWorkspaceId(),

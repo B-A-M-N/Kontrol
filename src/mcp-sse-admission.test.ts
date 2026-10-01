@@ -11,6 +11,9 @@ import { WORKSPACE_APP_URI } from "./workspace-app-resource.js";
 const root = mkdtempSync(join(tmpdir(), "kontrol-mcp-sse-admission-root-"));
 const stateDir = mkdtempSync(join(tmpdir(), "kontrol-mcp-sse-admission-state-"));
 const worktreeRoot = mkdtempSync(join(tmpdir(), "kontrol-mcp-sse-admission-worktrees-"));
+const reconnectChurnCycles = Number(process.env.KONTROL_SSE_TEST_CHURN ?? "256");
+assert.ok(Number.isInteger(reconnectChurnCycles) && reconnectChurnCycles > 0,
+  "KONTROL_SSE_TEST_CHURN must be a positive integer");
 writeFileSync(join(root, "marker.txt"), "sse-admission-ok\n");
 
 const config = loadConfig({
@@ -25,10 +28,12 @@ const config = loadConfig({
   KONTROL_LOG_REQUESTS: "0",
   KONTROL_MCP_MAX_INFLIGHT: "4",
   KONTROL_MCP_MAX_INFLIGHT_PER_SESSION: "4",
-  KONTROL_MCP_MAX_QUEUE: "1",
+  KONTROL_MCP_MAX_QUEUE: "16",
   KONTROL_MCP_ADMISSION_TIMEOUT_MS: "50",
+  KONTROL_MCP_INTERACTIVE_ADMISSION_TIMEOUT_MS: "2500",
   KONTROL_MCP_SESSION_REAPER_INTERVAL_MS: "1000",
   KONTROL_MCP_SSE_HEARTBEAT_MS: "10",
+  KONTROL_TUNNEL_REVIEWER_SECRET: "sse-admission-reviewer",
   KONTROL_DIAGNOSTICS_SECRET: "sse-admission-test-secret",
 });
 
@@ -57,6 +62,7 @@ async function rpc(method: string, params: Record<string, unknown>, sessionId?: 
     headers: {
       "content-type": "application/json",
       accept: "application/json, text/event-stream",
+      "x-kontrol-tunnel-reviewer": "sse-admission-reviewer",
       ...(sessionId ? { "mcp-session-id": sessionId } : {}),
     },
     body: JSON.stringify({ jsonrpc: "2.0", id: ++nextId, method, params }),
@@ -185,13 +191,19 @@ try {
   // backslash-n sequence sends bytes but cannot delimit an SSE event.
   const heartbeatReader = sessions[0].stream!.response.body?.getReader();
   assert.ok(heartbeatReader, "standalone SSE response must expose a readable stream");
-  const heartbeatChunk = await Promise.race([
-    heartbeatReader!.read(),
-    new Promise<never>((_, reject) => setTimeout(() => reject(new Error("timed out waiting for SSE heartbeat")), 1_000)),
-  ]);
-  assert.equal(heartbeatChunk.done, false, "heartbeat stream must remain open after the keep-alive");
-  const heartbeatText = new TextDecoder().decode(heartbeatChunk.value);
-  assert.match(heartbeatText, /^: kontrol-heartbeat\n\n/, "heartbeat must contain actual SSE newline delimiters");
+  let heartbeatText = "";
+  const heartbeatDeadline = Date.now() + 1_000;
+  while (!heartbeatText.includes(": kontrol-heartbeat\n\n") && Date.now() < heartbeatDeadline) {
+    const heartbeatChunk: ReadableStreamReadResult<Uint8Array> = await Promise.race([
+      heartbeatReader!.read(),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("timed out waiting for SSE heartbeat")), 1_000)),
+    ]);
+    assert.equal(heartbeatChunk.done, false, "heartbeat stream must remain open after the keep-alive");
+    heartbeatText += new TextDecoder().decode(heartbeatChunk.value);
+  }
+  assert.match(heartbeatText, /: kontrol-heartbeat\n\n/, "heartbeat must contain actual SSE newline delimiters");
+  assert.match(heartbeatText, /notifications\/tools\/list_changed/, "GET SSE establishment must deliver the catalog refresh pulse");
+  assert.match(heartbeatText, /notifications\/resources\/list_changed/, "GET SSE establishment must refresh resource metadata too");
   assert.doesNotMatch(heartbeatText, /\\n/, "heartbeat must not contain escaped backslash-n bytes");
   heartbeatReader!.releaseLock();
   // A subsequent SSE-delimited MCP response remains parseable after the
@@ -230,6 +242,61 @@ try {
   assert.equal(read.response.status, 200, JSON.stringify(read.payload));
   assert.notEqual(read.payload?.result?.isError, true, "read failed while SSE streams were open");
 
+  const concurrentInspections = await Promise.all(Array.from({ length: 8 }, () => rpc("tools/call", {
+    name: "read",
+    arguments: { workspaceId: sessions[0].workspaceId, path: "marker.txt", limit: 100 },
+  }, sessions[0].sessionId)));
+  assert.ok(concurrentInspections.every((result) => result.response.status === 200 && result.payload?.result?.isError !== true),
+    "eight bounded inspections must complete through the admission queue");
+  await waitFor(async () => {
+    const current = await diagnostics();
+    return current.mcpSessionMetrics.executionAdmission.activeWeight === 0
+      && current.mcpSessionMetrics.executionAdmission.queued === 0;
+  });
+
+  const postSseResponse = await fetch(url, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      accept: "application/json, text/event-stream",
+      "mcp-session-id": sessions[0].sessionId,
+      "x-kontrol-tunnel-reviewer": "sse-admission-reviewer",
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: ++nextId,
+      method: "tools/call",
+      params: {
+        name: "bash",
+        arguments: { workspaceId: sessions[0].workspaceId, command: "sleep 1; printf post-sse-ok", timeout: 5 },
+      },
+    }),
+  });
+  assert.equal(postSseResponse.status, 200, "a delayed POST tool response remains a successful stream");
+  assert.match(postSseResponse.headers.get("content-type") ?? "", /text\/event-stream/i);
+  assert.equal(postSseResponse.headers.get("x-accel-buffering"), "no");
+  assert.match(postSseResponse.headers.get("cache-control") ?? "", /no-cache, no-transform/i);
+  const postReader = postSseResponse.body?.getReader();
+  assert.ok(postReader, "POST SSE response must expose a stream body");
+  let postSseText = "";
+  for (;;) {
+    const chunk = await postReader!.read();
+    if (chunk.done) break;
+    postSseText += new TextDecoder().decode(chunk.value);
+  }
+  const postHeartbeatCount = (postSseText.match(/: kontrol-heartbeat\n\n/g) ?? []).length;
+  assert.ok(postHeartbeatCount >= 2, `a 1-second POST long poll must carry multiple response heartbeats (saw ${postHeartbeatCount})`);
+  const postData = postSseText.split(/\r?\n/).filter((line) => line.startsWith("data:")).map((line) => JSON.parse(line.slice(5).trim()));
+  assert.equal(postData.length, 1, "the POST SSE request must end in exactly one JSON-RPC result");
+  assert.notEqual(postData[0]?.result?.isError, true, "the terminal POST tool result must remain valid after heartbeat comments");
+  assert.match(JSON.stringify(postData[0]?.result), /post-sse-ok/, "terminal POST result content survives heartbeat comments");
+  snapshot = await diagnostics();
+  const postOperation = snapshot.mcpSessionMetrics.operationDiagnostics.recent.find(
+    (item: any) => item.toolName === "bash" && item.heartbeatBytes > 0,
+  );
+  assert.ok(postOperation?.heartbeatBytes > 0, "operation diagnostics count response heartbeats separately");
+  assert.ok(postOperation?.responseBytes > 0, "operation diagnostics retain terminal JSON-RPC response byte counts");
+
   const bash = await rpc("tools/call", {
     name: "bash",
     arguments: { workspaceId: sessions[0].workspaceId, command: "printf sse-admission-ok", timeout: 10 },
@@ -244,7 +311,7 @@ try {
 
   const slowBash = rpc("tools/call", {
     name: "bash",
-    arguments: { workspaceId: sessions[0].workspaceId, command: "sleep 0.5; printf admission-ok", timeout: 5 },
+    arguments: { workspaceId: sessions[0].workspaceId, command: "sleep 3; printf admission-ok", timeout: 5 },
   }, sessions[0].sessionId);
   await waitFor(async () => (await diagnostics()).mcpSessionMetrics.executionAdmission.activeWeight === 3);
   const rejectedBash = await rpc("tools/call", {
@@ -252,6 +319,7 @@ try {
     arguments: { workspaceId: sessions[0].workspaceId, command: "printf should-not-run", timeout: 5 },
   }, sessions[0].sessionId);
   assert.equal(rejectedBash.response.status, 503, "a request denied by execution admission should return capacity exhaustion");
+  assert.equal(rejectedBash.response.headers.get("retry-after"), "1", "capacity rejection gives clients an explicit retry delay");
   snapshot = await diagnostics();
   assert.equal(snapshot.mcpSessionMetrics.inFlight, 1, "admission rejection must release its session count while the admitted request remains active");
   const slowBashResult = await slowBash;
@@ -269,7 +337,7 @@ try {
   // Reconnect churn must not make execution capacity disappear. This models
   // the WebUI's initialize -> GET SSE -> resource/tool call -> disconnect
   // cycle rather than only proving one isolated transport.
-  for (let index = 0; index < 256; index++) {
+  for (let index = 0; index < reconnectChurnCycles; index++) {
     const session = await openSession();
     const stream = await openSse(session.sessionId);
     const resource = await rpc("resources/read", { uri: WORKSPACE_APP_URI }, session.sessionId);
@@ -282,6 +350,9 @@ try {
     assert.notEqual(tool.payload?.result?.isError, true, `tool call returned an error during churn at ${index}`);
     await closeSse(session.sessionId, stream);
     if (index % 32 === 31) {
+      if (process.env.KONTROL_SSE_TEST_PROGRESS === "1") {
+        console.log(`mcp-sse-admission.test.ts: completed ${index + 1}/${reconnectChurnCycles} reconnect cycles`);
+      }
       await waitFor(async () => (await diagnostics()).mcpSessionMetrics.activeSseStreams === 0);
       snapshot = await diagnostics();
       assert.equal(snapshot.mcpSessionMetrics.executionAdmission.availableWeight, 4, `execution capacity drifted at churn ${index}`);

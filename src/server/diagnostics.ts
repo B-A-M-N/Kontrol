@@ -214,6 +214,8 @@ export async function handleDiagnostics(deps: DiagnosticsDeps, req: Request, res
           durableWorkerSession: state.durableWorkerSession,
           lastRpcMethod: state.lastRpcMethod,
           lastToolName: state.lastToolName,
+          toolSurfaceVersion: state.toolSurfaceVersion,
+          catalogRefresh: state.catalogRefresh ? { ...state.catalogRefresh } : undefined,
         })),
       perClient: Object.entries([...mcpSessions.values()].reduce((acc, s) => {
         acc[s.logicalClientId] = (acc[s.logicalClientId] || 0) + 1;

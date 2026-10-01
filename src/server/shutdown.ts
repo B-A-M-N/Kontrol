@@ -6,6 +6,7 @@
  * dependency object.
  */
 import type { Transport } from "../mcp/workspace-server.js";
+import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { McpSessionState, RunningServer } from "./mcp-session-state.js";
 import type { McpAdmission } from "./mcp-admission.js";
 import type { McpSessionLifecycle } from "./mcp-session-lifecycle.js";
@@ -16,6 +17,7 @@ export interface ShutdownDeps {
   readonly config: ServerConfig;
   readonly db: DatabaseHandle;
   readonly transports: Map<string, Transport>;
+  readonly mcpServers: Map<string, McpServer>;
   readonly mcpSessions: Map<string, McpSessionState>;
   readonly sessionLifecycle: McpSessionLifecycle;
   readonly mcpAdmission: McpAdmission;
@@ -49,6 +51,7 @@ export interface ShutdownDeps {
 export function createShutdownController(deps: ShutdownDeps): Pick<RunningServer, "close" | "drain"> {
   const {
     transports,
+    mcpServers,
     mcpSessions,
     sessionLifecycle,
     mcpAdmission,
@@ -125,6 +128,7 @@ export function createShutdownController(deps: ShutdownDeps): Pick<RunningServer
       });
       await phase("mcp-transports", () => Promise.all([...transports.values()].map(closeTransport)));
       transports.clear();
+      mcpServers.clear();
       mcpSessions.clear();
       await phase("mission-verifiers", () => deps.shutdownMissionVerifiers());
       await phase("event-store", () => deps.eventStore.close());

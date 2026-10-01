@@ -27,6 +27,7 @@ import {
   WORKSPACE_APP_BUILD_ID,
   isWorkspaceAppHashedUri,
   workspaceAppResource,
+  workspaceAppResourceHtml,
   workspaceAppResourceKind,
 } from "../workspace-app-resource.js";
 import { uiBuildDirectory, setAssetHeaders, type WorkspaceAppResourceMetrics } from "./mcp-session-state.js";
@@ -46,10 +47,11 @@ function cachedWorkspaceAppContentJson(kind: string, uri: string): string {
   if (existing) return existing.json;
   const resource = workspaceAppResource(uri);
   if (!resource) throw new Error(`Workspace App resource registry has no entry for ${uri}`);
+  const html = workspaceAppResourceHtml(resource);
   const content = {
     uri,
     mimeType: resource.mimeType,
-    text: resource.html,
+    text: html,
     ...(resource.metadata ? { _meta: resource.metadata } : {}),
   };
   const json = JSON.stringify(content);
@@ -170,7 +172,7 @@ export function createWorkspaceAppResourceServer(
     // execution admission uses, so hosts can retry with backoff.
     const permit = await resourceAdmission.acquire(
       clientKey,
-      config.mcpAdmissionTimeoutMs,
+      config.mcpInteractiveAdmissionTimeoutMs,
       1,
       abortSignal,
     );
@@ -183,6 +185,7 @@ export function createWorkspaceAppResourceServer(
         reason: "resource_admission_exhausted",
         admission: resourceAdmission.getStats(),
       });
+      res.setHeader("Retry-After", "1");
       res.status(503).json({
         jsonrpc: "2.0",
         id: body.id ?? null,

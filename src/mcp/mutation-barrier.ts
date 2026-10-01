@@ -40,7 +40,6 @@ export function checkpointUnavailableResponse(error: WorkspaceMutationBlockedErr
         workspaceId: error.workspaceId,
         status: "checkpoint_unavailable",
         summary: { status: "checkpoint_unavailable" },
-        payload: { content: [{ type: "text", text: message }] },
       },
     },
     structuredContent: { result: message, status: "checkpoint_unavailable", retryable: false },

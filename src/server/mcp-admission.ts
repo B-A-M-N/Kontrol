@@ -122,6 +122,7 @@ export class McpAdmission {
   private active = 0;
   private activeWeight = 0;
   private readonly activeByKey = new Map<string, number>();
+  private readonly queuedByKey = new Map<string, number>();
   private readonly queue: McpAdmissionWaiter[] = [];
   private closed = false;
 
@@ -129,13 +130,15 @@ export class McpAdmission {
     private readonly maxInflight: number,
     private readonly maxInflightPerKey: number,
     private readonly maxQueue: number,
+    private readonly maxQueuePerKey = maxQueue,
   ) {
     if (!Number.isInteger(maxInflight) || maxInflight < 1) throw new Error("maxInflight must be positive");
     if (!Number.isInteger(maxInflightPerKey) || maxInflightPerKey < 1) throw new Error("maxInflightPerKey must be positive");
     if (!Number.isInteger(maxQueue) || maxQueue < 0) throw new Error("maxQueue must be non-negative");
+    if (!Number.isInteger(maxQueuePerKey) || maxQueuePerKey < 0) throw new Error("maxQueuePerKey must be non-negative");
   }
 
-  getStats(): { active: number; activeWeight: number; availableWeight: number; queued: number; maxInflight: number; maxInflightPerKey: number; maxQueue: number } {
+  getStats(): { active: number; activeWeight: number; availableWeight: number; queued: number; maxInflight: number; maxInflightPerKey: number; maxQueue: number; maxQueuePerKey: number } {
     return {
       active: this.active,
       activeWeight: this.activeWeight,
@@ -144,7 +147,12 @@ export class McpAdmission {
       maxInflight: this.maxInflight,
       maxInflightPerKey: this.maxInflightPerKey,
       maxQueue: this.maxQueue,
+      maxQueuePerKey: this.maxQueuePerKey,
     };
+  }
+
+  getQueuedForKey(key: string): number {
+    return this.queuedByKey.get(key) ?? 0;
   }
 
   acquire(key: string, waitDeadlineMs: number, weight = 1, signal?: AbortSignal): Promise<(() => void) | null> {
@@ -152,7 +160,7 @@ export class McpAdmission {
     if (!Number.isInteger(weight) || weight < 1 || weight > this.maxInflight || weight > this.maxInflightPerKey) return Promise.resolve(null);
     if (signal?.aborted) return Promise.resolve(null);
     if (this.canAdmit(key, weight)) return Promise.resolve(this.grant(key, weight));
-    if (this.queue.length >= this.maxQueue) return Promise.resolve(null);
+    if (this.queue.length >= this.maxQueue || (this.queuedByKey.get(key) ?? 0) >= this.maxQueuePerKey) return Promise.resolve(null);
 
     return new Promise((resolve) => {
       const waiter: McpAdmissionWaiter = {
@@ -170,8 +178,7 @@ export class McpAdmission {
         resolve(release);
       };
       const removeAndCancel = () => {
-        const index = this.queue.indexOf(waiter);
-        if (index >= 0) this.queue.splice(index, 1);
+        this.removeQueued(waiter);
         settle(null);
       };
       waiter.onAbort = removeAndCancel;
@@ -190,6 +197,7 @@ export class McpAdmission {
         return;
       }
       this.queue.push(waiter);
+      this.queuedByKey.set(key, (this.queuedByKey.get(key) ?? 0) + 1);
     });
   }
 
@@ -197,12 +205,26 @@ export class McpAdmission {
     this.closed = true;
     while (this.queue.length > 0) {
       const waiter = this.queue.shift()!;
+      this.decrementQueuedKey(waiter.key);
       if (waiter.settled) continue;
       waiter.settled = true;
       if (waiter.timer) clearTimeout(waiter.timer);
       if (waiter.signal && waiter.onAbort) waiter.signal.removeEventListener("abort", waiter.onAbort);
       waiter.resolve(null);
     }
+  }
+
+  private removeQueued(waiter: McpAdmissionWaiter): void {
+    const index = this.queue.indexOf(waiter);
+    if (index < 0) return;
+    this.queue.splice(index, 1);
+    this.decrementQueuedKey(waiter.key);
+  }
+
+  private decrementQueuedKey(key: string): void {
+    const count = (this.queuedByKey.get(key) ?? 1) - 1;
+    if (count > 0) this.queuedByKey.set(key, count);
+    else this.queuedByKey.delete(key);
   }
 
   private canAdmit(key: string, weight: number): boolean {
@@ -232,11 +254,13 @@ export class McpAdmission {
       const waiter = this.queue[i];
       if (waiter.settled) {
         this.queue.splice(i, 1);
+        this.decrementQueuedKey(waiter.key);
         i--;
         continue;
       }
       if (!this.canAdmit(waiter.key, waiter.weight)) continue;
       this.queue.splice(i, 1);
+      this.decrementQueuedKey(waiter.key);
       i--;
       waiter.settled = true;
       if (waiter.timer) clearTimeout(waiter.timer);

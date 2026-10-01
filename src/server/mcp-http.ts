@@ -7,6 +7,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { Socket } from "node:net";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { checkResourceAllowed } from "@modelcontextprotocol/sdk/shared/auth-utils.js";
 import type { ServerConfig } from "../config.js";
@@ -56,6 +57,7 @@ import type { DatabaseHandle } from "../db/client.js";
 import type { MutationReceiptStore } from "../mutation-receipts.js";
 import type { LiveWaiterRegistry } from "../acp-bridge.js";
 import type { Request, Response } from "express";
+import { readMcpToolSurface } from "../mcp/tool-names.js";
 
 function externalCorrelation(req: Request): string | undefined {
   for (const name of ["cf-ray", "x-kontrol-correlation-id", "x-request-id"]) {
@@ -79,6 +81,7 @@ export interface McpHttpDeps {
   readonly config: ServerConfig;
   readonly db: DatabaseHandle;
   readonly transports: Map<string, Transport>;
+  readonly mcpServers: Map<string, McpServer>;
   readonly mcpSessions: Map<string, McpSessionState>;
   readonly logicalContinuity: LogicalContinuityIndex;
   readonly policyWaiters: McpPolicyWaiterRegistry;
@@ -98,7 +101,7 @@ export interface McpHttpDeps {
   oauthEnabled(): boolean;
   shuttingDown(): boolean;
   serveWorkspaceAppResource(res: Response, requestId: string | undefined, body: { id?: unknown; params?: { uri?: unknown } }, sessionless: boolean, clientKey: string, abortSignal: AbortSignal | undefined, acceptEncoding?: string | undefined, context?: { sessionId?: string; generationId?: string }): Promise<boolean>;
-  createServerForSession(connectionContext: ConnectionContext): { connect(transport: Transport): Promise<void> };
+  createServerForSession(connectionContext: ConnectionContext): McpServer;
   supervisorWake(workSessionId: string): void;
   mutationReceipts: MutationReceiptStore;
   workspaces: import("../workspaces.js").WorkspaceRegistry;
@@ -119,11 +122,91 @@ export interface McpHttpDeps {
   supervisorRuns: import("../supervisor-runs.js").SupervisorRuns;
 }
 
+type CatalogRefreshPhase = "initialized" | "get_stream";
+
+function requestAdmissionTimeout(state: McpSessionState | undefined, config: ServerConfig): number {
+  return state?.durableWorkerSession ? config.mcpAdmissionTimeoutMs : config.mcpInteractiveAdmissionTimeoutMs;
+}
+
+function catalogRefreshStats(state: McpSessionState) {
+  return state.catalogRefresh ??= {
+    initializedPulseAttempted: false,
+    getStreamPulseAttempted: false,
+    toolListRefreshSent: false,
+    resourceListRefreshSent: false,
+    toolListRefreshAttempts: 0,
+    resourceListRefreshAttempts: 0,
+    toolListRefreshSuccesses: 0,
+    resourceListRefreshSuccesses: 0,
+    toolListRefreshFailures: 0,
+    resourceListRefreshFailures: 0,
+  };
+}
+
+async function sendCatalogRefreshPulse(
+  deps: McpHttpDeps,
+  sessionId: string,
+  phase: CatalogRefreshPhase,
+): Promise<void> {
+  const state = deps.mcpSessions.get(sessionId);
+  const server = deps.mcpServers.get(sessionId);
+  if (!state || !server || state.closing || state.closed) return;
+  const refresh = catalogRefreshStats(state);
+  if (phase === "initialized") {
+    if (refresh.initializedPulseAttempted) return;
+    refresh.initializedPulseAttempted = true;
+  } else {
+    if (refresh.getStreamPulseAttempted) return;
+    refresh.getStreamPulseAttempted = true;
+  }
+  refresh.lastAttemptAt = new Date().toISOString();
+
+  const sendOne = async (
+    method: "tools" | "resources",
+    send: () => Promise<void>,
+  ): Promise<void> => {
+    const attemptsKey = method === "tools" ? "toolListRefreshAttempts" : "resourceListRefreshAttempts";
+    const successesKey = method === "tools" ? "toolListRefreshSuccesses" : "resourceListRefreshSuccesses";
+    const failuresKey = method === "tools" ? "toolListRefreshFailures" : "resourceListRefreshFailures";
+    const sentKey = method === "tools" ? "toolListRefreshSent" : "resourceListRefreshSent";
+    refresh[attemptsKey] += 1;
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        send(),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error("list-changed notification send deadline exceeded")), 1_500);
+          timer.unref?.();
+        }),
+      ]);
+      refresh[successesKey] += 1;
+      refresh[sentKey] = true;
+    } catch (error) {
+      refresh[failuresKey] += 1;
+      logEvent(deps.config.logging, "warn", "mcp_catalog_refresh_failed", {
+        sessionIdPrefix: sessionIdPrefix(sessionId),
+        phase,
+        method,
+        surfaceVersion: state.toolSurfaceVersion,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
+
+  await Promise.all([
+    sendOne("tools", () => server.server.sendToolListChanged()),
+    sendOne("resources", () => server.server.sendResourceListChanged()),
+  ]);
+}
+
 export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res: Response): Promise<unknown> {
   const {
     config,
     db,
     transports,
+    mcpServers,
     mcpSessions,
     logicalContinuity,
     policyWaiters,
@@ -215,6 +298,7 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
     let handlerStartedAt = 0;
     let handlerSettled = false;
     let responseBytes = 0;
+    let heartbeatBytes = 0;
     let responseCloseClassification: string | undefined;
     let requestErrorClass: string | undefined;
     let transport: Transport | undefined;
@@ -224,27 +308,89 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
     const instrumentedResponse = res as unknown as {
       write: (...args: unknown[]) => unknown;
       end: (...args: unknown[]) => unknown;
+      setHeader: (...args: unknown[]) => unknown;
+      writeHead: (...args: unknown[]) => unknown;
     };
     const originalWrite = res.write.bind(res);
     const originalEnd = res.end.bind(res);
+    const originalSetHeader = res.setHeader.bind(res);
+    const originalWriteHead = res.writeHead.bind(res);
     let responseWritersRestored = false;
+    const prepareSseHeaders = () => {
+      if (res.headersSent) return;
+      originalSetHeader("X-Accel-Buffering", "no");
+      originalSetHeader("Cache-Control", "no-cache, no-transform");
+    };
+    const ensureSseHeartbeat = () => {
+      const contentType = res.getHeader("content-type")?.toString().toLowerCase() ?? "";
+      if (!contentType.includes("text/event-stream")) return;
+      prepareSseHeaders();
+      if (!stopSseHeartbeat) {
+        const requestKind = req.method === "GET" ? "sse_stream" : "post_response";
+        stopSseHeartbeat = startMcpSseHeartbeat(res, config.mcpSseHeartbeatMs, () => {
+          deps.recordMcpConnectionEvent?.({ kind: "sse_writer_stalled", sessionId, requestKind });
+          logEvent(config.logging, "warn", "mcp_sse_writer_stalled", {
+            requestId,
+            sessionIdPrefix: sessionIdPrefix(sessionId),
+            requestKind,
+          });
+        }, () => {
+          deps.recordMcpConnectionEvent?.({ kind: "sse_writer_drained", sessionId, requestKind });
+          logEvent(config.logging, "info", "mcp_sse_writer_drained", {
+            requestId,
+            sessionIdPrefix: sessionIdPrefix(sessionId),
+            requestKind,
+          });
+        }, (bytes) => {
+          heartbeatBytes += bytes;
+        });
+      }
+      if (req.method === "GET" && sessionId) void sendCatalogRefreshPulse(deps, sessionId, "get_stream");
+    };
     const restoreResponseWriters = () => {
       if (responseWritersRestored) return;
       responseWritersRestored = true;
       instrumentedResponse.write = originalWrite as unknown as (...args: unknown[]) => unknown;
       instrumentedResponse.end = originalEnd as unknown as (...args: unknown[]) => unknown;
+      instrumentedResponse.setHeader = originalSetHeader as unknown as (...args: unknown[]) => unknown;
+      instrumentedResponse.writeHead = originalWriteHead as unknown as (...args: unknown[]) => unknown;
     };
+    instrumentedResponse.setHeader = ((name: string, value: unknown, ...args: unknown[]) => {
+      const isSseContentType = name.toLowerCase() === "content-type"
+        && typeof value === "string"
+        && value.toLowerCase().includes("text/event-stream");
+      if (isSseContentType) prepareSseHeaders();
+      const result = Reflect.apply(originalSetHeader, res, [name, value, ...args]);
+      if (isSseContentType) ensureSseHeartbeat();
+      return result;
+    }) as unknown as (...args: unknown[]) => unknown;
+    instrumentedResponse.writeHead = ((statusCode: number, ...args: unknown[]) => {
+      const headers = args.find((arg) => arg && typeof arg === "object" && !Array.isArray(arg)) as Record<string, unknown> | undefined;
+      const contentType = headers?.["content-type"] ?? headers?.["Content-Type"] ?? res.getHeader("content-type");
+      if (typeof contentType === "string" && contentType.toLowerCase().includes("text/event-stream")) {
+        if (headers) {
+          headers["X-Accel-Buffering"] ??= "no";
+          headers["Cache-Control"] = "no-cache, no-transform";
+        } else prepareSseHeaders();
+      }
+      const result = Reflect.apply(originalWriteHead, res, [statusCode, ...args]);
+      ensureSseHeartbeat();
+      return result;
+    }) as unknown as (...args: unknown[]) => unknown;
     instrumentedResponse.write = (...args: unknown[]) => {
+      ensureSseHeartbeat();
       const bytes = !res.writableEnded && !res.destroyed ? responseChunkBytes(args[0], args[1]) : 0;
+      const isHeartbeat = args[0] === ": kontrol-heartbeat\n\n";
       try {
         const result = Reflect.apply(originalWrite, res, args);
-        responseBytes += bytes;
+        if (!isHeartbeat) responseBytes += bytes;
         return result;
       } catch (error) {
         throw error;
       }
     };
     instrumentedResponse.end = (...args: unknown[]) => {
+      ensureSseHeartbeat();
       const bytes = !res.writableEnded && !res.destroyed ? responseChunkBytes(args[0], args[1]) : 0;
       try {
         const result = Reflect.apply(originalEnd, res, args);
@@ -279,6 +425,7 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
         finishedAtMs,
         httpStatus: res.statusCode,
         responseBytes,
+        heartbeatBytes,
         responseCloseClassification: completedResponseCloseClassification,
         admissionWaitMs: Math.max(0, Math.round(admissionWaitMs)),
         executionDurationMs,
@@ -301,6 +448,7 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
         finishedAt: new Date(finishedAtMs).toISOString(),
         httpStatus: res.statusCode,
         responseBytes,
+        heartbeatBytes,
         responseCloseClassification: completedResponseCloseClassification,
         admissionWaitMs: Math.max(0, Math.round(admissionWaitMs)),
         executionDurationMs,
@@ -453,7 +601,7 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
       const admissionStartedAt = performance.now();
       const acquired = await mcpAdmission.acquire(
         sessionId ?? logicalClientId(req),
-        config.mcpAdmissionTimeoutMs,
+        requestAdmissionTimeout(sessionState ?? (sessionId ? mcpSessions.get(sessionId) : undefined), config),
         mcpAdmissionWeight(requestRpcMethod, requestToolName),
         requestAbort.signal,
       );
@@ -708,6 +856,7 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
         // some close paths). The callback-bound ID is authoritative for
         // cleanup; the transport property is only a fallback.
         let boundSessionId: string | undefined;
+        let sessionMcpServer: McpServer | undefined;
         transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
           onsessioninitialized: (newSessionId) => {
@@ -743,6 +892,10 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
                   || Boolean(connectionContext.workSessionId),
                 lastRpcMethod: "initialize",
               });
+              const createdState = mcpSessions.get(newSessionId)!;
+              createdState.toolSurfaceVersion = readMcpToolSurface().version;
+              catalogRefreshStats(createdState);
+              if (sessionMcpServer) mcpServers.set(newSessionId, sessionMcpServer);
               let continuityAttachment: ReturnType<LogicalContinuityIndex["attach"]> | undefined;
               if (requestConversationId && clientIdentity.source !== "client_info_fallback") {
                 continuityAttachment = logicalContinuity.attach({
@@ -920,6 +1073,18 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
           },
           recordPhaseTiming,
         );
+        sessionMcpServer = server;
+        const initializedHandler = server.server.oninitialized;
+        server.server.oninitialized = () => {
+          initializedHandler?.();
+          const initializedSessionId = transport?.sessionId ?? boundSessionId;
+          if (initializedSessionId) void sendCatalogRefreshPulse(deps, initializedSessionId, "initialized");
+        };
+        const initializedSessionState = boundSessionId ? mcpSessions.get(boundSessionId) : undefined;
+        if (initializedSessionState) {
+          initializedSessionState.toolSurfaceVersion = readMcpToolSurface().version;
+          mcpServers.set(boundSessionId!, server);
+        }
         const serverCreateMs = performance.now() - serverCreateStarted;
         const transportConnectStarted = performance.now();
         await server.connect(transport);
@@ -987,7 +1152,7 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
         try {
           acquiredAdmission = await admission.acquire(
             sessionId ?? logicalClientId(req),
-            config.mcpAdmissionTimeoutMs,
+            requestAdmissionTimeout(sessionState, config),
             admissionWeight,
             requestAbort.signal,
           );
@@ -1017,6 +1182,7 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
             admissionWaitMs: Math.round(admissionWaitMs),
             admission: admission.getStats(),
           });
+          res.setHeader("Retry-After", "1");
           return res.status(503).json({
             jsonrpc: "2.0",
             id: (req.body as { id?: unknown })?.id ?? null,
@@ -1025,25 +1191,6 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
         }
         admissionRelease = acquiredAdmission;
         res.setHeader("x-kontrol-admission-wait-ms", String(Math.round(admissionWaitMs)));
-      }
-
-      if (requestIsSseStream && typeof res.write === "function") {
-        // Keep long-lived SSE connections visible through idle proxies. This
-        // is an SSE comment, not an MCP application event, and deliberately
-        // does not advance the application-activity clock.
-        stopSseHeartbeat = startMcpSseHeartbeat(res, config.mcpSseHeartbeatMs, () => {
-          deps.recordMcpConnectionEvent?.({ kind: "sse_writer_stalled", sessionId, requestKind: "sse_stream" });
-          logEvent(config.logging, "warn", "mcp_sse_writer_stalled", {
-            requestId,
-            sessionIdPrefix: sessionIdPrefix(sessionId),
-          });
-        }, () => {
-          deps.recordMcpConnectionEvent?.({ kind: "sse_writer_drained", sessionId, requestKind: "sse_stream" });
-          logEvent(config.logging, "info", "mcp_sse_writer_drained", {
-            requestId,
-            sessionIdPrefix: sessionIdPrefix(sessionId),
-          });
-        });
       }
 
       handlerStartedAt = performance.now();
@@ -1145,6 +1292,7 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
         admissionUnavailable: error instanceof McpAdmissionUnavailableError,
       });
       if (!res.headersSent) {
+        if (error instanceof McpAdmissionUnavailableError) res.setHeader("Retry-After", "1");
         sendJsonRpcError(
           res,
           error instanceof McpExecutionTimeoutError ? 504 : error instanceof McpAdmissionUnavailableError ? 503 : 500,

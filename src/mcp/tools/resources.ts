@@ -17,6 +17,7 @@ import {
   WORKSPACE_APP_ARTIFACT_SOURCE,
   WORKSPACE_APP_SMOKE_URI,
   configureWorkspaceAppResourceRegistry,
+  workspaceAppResourceHtml,
   workspaceAppResourceEntries,
 } from "../../workspace-app-resource.js";
 
@@ -43,6 +44,7 @@ export function registerWorkspaceAppResources(
         : "Compatibility resource for existing Workspace App cards.";
     const metadata = artifact.metadata ?? {};
     const serve = async () => {
+      const html = workspaceAppResourceHtml(artifact);
       onWorkspaceAppResource?.(artifact.uri);
       logEvent(config.logging, "info", "workspace_app_resource_served", {
         uri: artifact.uri,
@@ -50,18 +52,18 @@ export function registerWorkspaceAppResources(
         generationId: artifact.generationId ?? config.launchGenerationId,
         resourceKind: artifact.kind,
         mimeType: artifact.mimeType,
-        bytes: Buffer.byteLength(artifact.html, "utf8"),
+        bytes: Buffer.byteLength(html, "utf8"),
       });
       return {
         contents: [{
           uri: artifact.uri,
           mimeType: artifact.mimeType,
-          text: artifact.html,
+          text: html,
           ...(Object.keys(metadata).length > 0 ? { _meta: metadata } : {}),
         }],
       };
     };
-    if (artifact.kind === "current" || artifact.kind === "previous") {
+    if (artifact.mimeType === RESOURCE_MIME_TYPE) {
       registerAppResource(server, name, artifact.uri, { description, _meta: metadata }, serve);
     } else {
       server.registerResource(name, artifact.uri, { mimeType: artifact.mimeType, description }, serve);

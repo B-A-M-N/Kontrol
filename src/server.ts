@@ -190,6 +190,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
 
   const buildMeta = readBuildIdentity(join(dirname(fileURLToPath(import.meta.url)), "build-meta.json"));
   const transports = new Map<string, Transport>();
+  const mcpServers = new Map<string, McpServer>();
   const mcpSessions = new Map<string, McpSessionState>();
   // MCP session IDs are transport-scoped and intentionally disposable. This
   // bounded in-memory index retains only trusted identity continuity metadata
@@ -249,11 +250,13 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     config.mcpMaxInflight,
     config.mcpMaxInflightPerSession,
     config.mcpMaxQueue,
+    config.mcpMaxQueuePerSession,
   );
   const mcpWaiterAdmission = new McpAdmission(
     config.mcpMaxWaiters,
     config.mcpMaxWaitersPerSession,
     config.mcpMaxWaiterQueue,
+    config.mcpMaxQueuePerSession,
   );
   // P0 resource admission: dedicated, deliberately small pool for Workspace
   // App resource reads (multi-megabyte serializations). Independent of execution and
@@ -263,6 +266,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     config.mcpMaxResourceReads,
     config.mcpMaxResourceReadsPerClient,
     config.mcpMaxResourceReadQueue,
+    config.mcpMaxQueuePerSession,
   );
   const expiredMcpOperations = new ExpiredMcpOperationTracker();
   const operationDiagnostics = new McpOperationDiagnostics();
@@ -334,6 +338,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     cancelPolicyWaitersForSession: (sessionId, requestId) => policyWaiters.cancelForSession(sessionId, requestId),
     mcpSessions,
     transports,
+    mcpServers,
     logicalContinuity,
     processSessions,
     workspaceAppResourceMetrics,
@@ -601,6 +606,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     config,
     db,
     transports,
+    mcpServers,
     mcpSessions,
     logicalContinuity,
     policyWaiters,
@@ -767,6 +773,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     config,
     db,
     transports,
+    mcpServers,
     mcpSessions,
     sessionLifecycle,
     mcpAdmission,

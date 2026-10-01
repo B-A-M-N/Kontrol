@@ -14,6 +14,7 @@ assert.deepEqual(admission.getStats(), {
   maxInflight: 1,
   maxInflightPerKey: 1,
   maxQueue: 1,
+  maxQueuePerKey: 1,
 });
 
 assert.equal(await admission.acquire("session-b", 100), null, "a full queue rejects immediately");
@@ -75,6 +76,31 @@ const initialLeases = await Promise.all(burst.slice(0, 32));
 assert.equal(initialLeases.filter((lease) => typeof lease === "function").length, 32, "the first burst is admitted as bounded leases");
 initialLeases.forEach((lease) => lease?.());
 burstAdmission.close();
+
+const perSessionQueue = new McpAdmission(1, 1, 8, 2);
+const perSessionLease = await perSessionQueue.acquire("busy-session", 1_000);
+assert.ok(perSessionLease);
+const perSessionWaiters = [
+  perSessionQueue.acquire("busy-session", 1_000),
+  perSessionQueue.acquire("busy-session", 1_000),
+];
+assert.equal(await perSessionQueue.acquire("busy-session", 1_000), null, "one session cannot exceed its queue allowance");
+const otherSessionWaiter = perSessionQueue.acquire("other-session", 1_000);
+assert.equal(perSessionQueue.getQueuedForKey("busy-session"), 2);
+assert.equal(perSessionQueue.getQueuedForKey("other-session"), 1);
+perSessionLease?.();
+const firstQueuedLease = await perSessionWaiters[0];
+assert.ok(firstQueuedLease, "the first queued entry drains");
+firstQueuedLease?.();
+const secondQueuedLease = await perSessionWaiters[1];
+assert.ok(secondQueuedLease, "per-session queue accounting drains to the next entry");
+secondQueuedLease?.();
+const otherSessionLease = await otherSessionWaiter;
+assert.ok(otherSessionLease, "another session still gets queue capacity");
+otherSessionLease?.();
+assert.equal(perSessionQueue.getQueuedForKey("busy-session"), 0);
+assert.equal(perSessionQueue.getQueuedForKey("other-session"), 0);
+perSessionQueue.close();
 
 // Long-poll waiters have an independent budget: parked review/event calls do
 // not consume execution permits needed by read/edit/bash traffic.

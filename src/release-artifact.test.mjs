@@ -12,6 +12,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { createHash } from "node:crypto";
 import { validateRelease } from "../scripts/validate-release.mjs";
 
 const repoRoot = process.cwd();
@@ -19,18 +20,21 @@ const fixtureRoot = mkdtempSync(join(tmpdir(), "kontrol-release-fixture-"));
 
 function writeRequiredFiles(artifact) {
   mkdirSync(join(artifact, "ui"), { recursive: true });
+  const workspaceAppHtml = "<!doctype html>\n";
   writeFileSync(join(artifact, "build-meta.json"), JSON.stringify({
     buildId: "fixture",
     contentSha256: "0123456789abcdef",
     schemaVersion: 50,
     minReadableSchemaVersion: 0,
     maxReadableSchemaVersion: 50,
-    releaseFormatVersion: 3,
+    releaseFormatVersion: 4,
+    workspaceAppBuildId: createHash("sha256").update(workspaceAppHtml).digest("hex").slice(0, 12),
+    workspaceAppHistory: [],
   }) + "\n");
   for (const file of ["cli.js", "server.js", "acp-duplex.js", "acp-worker-token.mjs"]) {
     writeFileSync(join(artifact, file), "export {};\n");
   }
-  writeFileSync(join(artifact, "ui", "workspace-app.html"), "<!doctype html>\n");
+  writeFileSync(join(artifact, "ui", "workspace-app.html"), workspaceAppHtml);
 }
 
 try {
@@ -93,7 +97,7 @@ try {
   assert.equal(metadata.schemaVersion, metadata.maxReadableSchemaVersion);
   assert.equal(metadata.minReadableSchemaVersion, 0);
   assert.equal(metadata.schemaCompatibility, "upgrade-in-place; downgrade-via-versioned-backup");
-  assert.equal(metadata.releaseFormatVersion, 3);
+  assert.equal(metadata.releaseFormatVersion, 4);
   assert.match(metadata.contentSha256, /^[a-f0-9]{16}$/);
 
   // Exercise the exact release probe used by start-all.sh. Static required-file

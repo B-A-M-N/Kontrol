@@ -50,12 +50,14 @@ kontrol config set publicBaseUrl https://kontrol.example.com
 | `KONTROL_MCP_MAX_INFLIGHT` | Global concurrent MCP request limit. Defaults to `32`. |
 | `KONTROL_MCP_MAX_INFLIGHT_PER_SESSION` | Per-session concurrent MCP request limit. Defaults to `8`. |
 | `KONTROL_MCP_MAX_QUEUE` | Maximum queued MCP requests waiting for admission. Defaults to `128`. |
+| `KONTROL_MCP_MAX_QUEUE_PER_SESSION` | Maximum queued requests from one transport/session across admission pools. Defaults to `16`. |
 | `KONTROL_MCP_MAX_WAITERS` | Independent concurrent budget for parked event/review/terminal waiters. Defaults to `64`. |
 | `KONTROL_MCP_MAX_WAITERS_PER_SESSION` | Maximum parked waiters from one MCP session. Defaults to `2`. |
 | `KONTROL_MCP_MAX_WAITER_QUEUE` | Maximum queued parked waiters. Defaults to `64`. |
 | `KONTROL_MCP_ADMISSION_TIMEOUT_MS` | Maximum time a request waits for an admission slot. Defaults to `120000`. `KONTROL_MCP_REQUEST_DEADLINE_MS` remains a legacy alias. |
+| `KONTROL_MCP_INTERACTIVE_ADMISSION_TIMEOUT_MS` | Queue wait limit for interactive clients and Workspace App resources. Defaults to `8000`; durable authenticated workers retain `KONTROL_MCP_ADMISSION_TIMEOUT_MS`. |
 | `KONTROL_MCP_SESSION_RECLAIM_GRACE_MS` | Minimum absence before a recently present browser transport can be reclaimed at the per-client cap. Defaults to `300000`. |
-| `KONTROL_MCP_SSE_HEARTBEAT_MS` | Interval for standalone MCP SSE keep-alive comments. Defaults to `20000`. |
+| `KONTROL_MCP_SSE_HEARTBEAT_MS` | Interval for MCP SSE response keep-alive comments on GET streams and POST responses. Defaults to `15000`. |
 | `KONTROL_LAUNCH_GENERATION_ID` | Launcher-owned immutable generation identity included in disconnect diagnostics. |
 | `KONTROL_MCP_EXECUTION_TIMEOUT_MS` | Maximum execution time for ordinary MCP calls. Defaults to `1800000` (30 minutes). Long-poll waiters and approval-gated calls are exempt and use their own lifecycle. |
 | `KONTROL_MAINTENANCE_INTERVAL_MS` | Periodic maintenance interval. Defaults to `300000` (5 minutes). |

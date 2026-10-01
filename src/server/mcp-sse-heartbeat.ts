@@ -12,6 +12,7 @@ export function startMcpSseHeartbeat(
   intervalMs: number,
   onStalled: () => void,
   onDrained: () => void,
+  onHeartbeat?: (bytes: number) => void,
 ): () => void {
   let stalled = false;
   let stopped = false;
@@ -38,7 +39,10 @@ export function startMcpSseHeartbeat(
     }
     if (stalled) return;
     try {
-      if (!response.write(": kontrol-heartbeat\n\n")) {
+      const chunk = ": kontrol-heartbeat\n\n";
+      const writable = response.write(chunk);
+      onHeartbeat?.(Buffer.byteLength(chunk, "utf8"));
+      if (!writable) {
         stalled = true;
         onStalled();
       }

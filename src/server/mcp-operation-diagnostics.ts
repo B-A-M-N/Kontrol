@@ -15,6 +15,7 @@ export interface McpOperationFinish {
   finishedAtMs: number;
   httpStatus: number;
   responseBytes: number;
+  heartbeatBytes?: number;
   responseCloseClassification: string;
   admissionWaitMs: number;
   executionDurationMs: number;

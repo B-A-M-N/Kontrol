@@ -98,6 +98,7 @@ export interface ServerConfig {
   mcpMaxInflight: number;
   mcpMaxInflightPerSession: number;
   mcpMaxQueue: number;
+  mcpMaxQueuePerSession: number;
   /** Independent cap for parked event/review/terminal waiters. */
   mcpMaxWaiters: number;
   mcpMaxWaitersPerSession: number;
@@ -113,6 +114,8 @@ export interface ServerConfig {
   mcpMaxResourceReadQueue: number;
   /** Maximum time a request may wait for an admission slot. */
   mcpAdmissionTimeoutMs: number;
+  /** Short queue deadline for interactive clients; durable workers use mcpAdmissionTimeoutMs. */
+  mcpInteractiveAdmissionTimeoutMs: number;
   /** Grace period protecting recently present browser transports from cap reclaim. */
   mcpSessionReclaimGraceMs: number;
   /** Interval for standalone MCP SSE keep-alive comments. */
@@ -616,18 +619,24 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     mcpMaxInflight: parsePositiveInteger(env.KONTROL_MCP_MAX_INFLIGHT, 32, "KONTROL_MCP_MAX_INFLIGHT"),
     mcpMaxInflightPerSession: parsePositiveInteger(env.KONTROL_MCP_MAX_INFLIGHT_PER_SESSION, 8, "KONTROL_MCP_MAX_INFLIGHT_PER_SESSION"),
     mcpMaxQueue: parsePositiveInteger(env.KONTROL_MCP_MAX_QUEUE, 128, "KONTROL_MCP_MAX_QUEUE"),
+    mcpMaxQueuePerSession: parsePositiveInteger(env.KONTROL_MCP_MAX_QUEUE_PER_SESSION, 16, "KONTROL_MCP_MAX_QUEUE_PER_SESSION"),
     mcpMaxWaiters: parsePositiveInteger(env.KONTROL_MCP_MAX_WAITERS, 64, "KONTROL_MCP_MAX_WAITERS"),
     mcpMaxWaitersPerSession: parsePositiveInteger(env.KONTROL_MCP_MAX_WAITERS_PER_SESSION, 2, "KONTROL_MCP_MAX_WAITERS_PER_SESSION"),
     mcpMaxWaiterQueue: parsePositiveInteger(env.KONTROL_MCP_MAX_WAITER_QUEUE, 64, "KONTROL_MCP_MAX_WAITER_QUEUE"),
     mcpMaxResourceReads: parsePositiveInteger(env.KONTROL_MCP_MAX_RESOURCE_READS, 2, "KONTROL_MCP_MAX_RESOURCE_READS"),
     mcpMaxResourceReadsPerClient: parsePositiveInteger(env.KONTROL_MCP_MAX_RESOURCE_READS_PER_CLIENT, 1, "KONTROL_MCP_MAX_RESOURCE_READS_PER_CLIENT"),
     mcpMaxResourceReadQueue: parsePositiveInteger(env.KONTROL_MCP_MAX_RESOURCE_READ_QUEUE, 16, "KONTROL_MCP_MAX_RESOURCE_READ_QUEUE"),
-    mcpSseHeartbeatMs: parsePositiveInteger(env.KONTROL_MCP_SSE_HEARTBEAT_MS, 20_000, "KONTROL_MCP_SSE_HEARTBEAT_MS"),
+    mcpSseHeartbeatMs: parsePositiveInteger(env.KONTROL_MCP_SSE_HEARTBEAT_MS, 15_000, "KONTROL_MCP_SSE_HEARTBEAT_MS"),
     mcpSessionReclaimGraceMs: parsePositiveInteger(env.KONTROL_MCP_SESSION_RECLAIM_GRACE_MS, 5 * 60_000, "KONTROL_MCP_SESSION_RECLAIM_GRACE_MS"),
     mcpAdmissionTimeoutMs: parsePositiveInteger(
       env.KONTROL_MCP_ADMISSION_TIMEOUT_MS ?? env.KONTROL_MCP_REQUEST_DEADLINE_MS,
       120_000,
       "KONTROL_MCP_ADMISSION_TIMEOUT_MS",
+    ),
+    mcpInteractiveAdmissionTimeoutMs: parsePositiveInteger(
+      env.KONTROL_MCP_INTERACTIVE_ADMISSION_TIMEOUT_MS,
+      8_000,
+      "KONTROL_MCP_INTERACTIVE_ADMISSION_TIMEOUT_MS",
     ),
     mcpExecutionTimeoutMs: parsePositiveInteger(
       env.KONTROL_MCP_EXECUTION_TIMEOUT_MS,

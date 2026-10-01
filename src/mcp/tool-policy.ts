@@ -59,7 +59,6 @@ export function policyFailureResponse(
         approvalId: result.approvalId,
         command: context.command,
       },
-      payload: { content: [{ type: "text", text: message }] },
     };
     if (context.path !== undefined) card.path = context.path;
     if (context.command !== undefined) card.command = context.command;
@@ -81,7 +80,6 @@ export function policyFailureResponse(
     workspaceId: context.workspaceId,
     status: "policy_denied",
     summary: { status: "policy_denied", command: context.command },
-    payload: { content: [{ type: "text", text: deniedMessage }] },
   };
   if (context.path !== undefined) card.path = context.path;
   if (context.command !== undefined) card.command = context.command;

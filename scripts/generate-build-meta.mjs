@@ -72,6 +72,33 @@ function getSchemaVersion() {
 
 const schemaVersion = getSchemaVersion();
 const releaseFormatVersion = Number(process.env.KONTROL_RELEASE_FORMAT_VERSION || 1);
+const workspaceAppPath = join(distDir, "ui", "workspace-app.html");
+if (!existsSync(workspaceAppPath)) {
+  throw new Error(`Cannot generate release metadata without ${workspaceAppPath}`);
+}
+const workspaceAppBuildId = createHash("sha256")
+  .update(readFileSync(workspaceAppPath))
+  .digest("hex")
+  .slice(0, 12);
+let workspaceAppHistory = [];
+try {
+  workspaceAppHistory = JSON.parse(process.env.KONTROL_WORKSPACE_APP_HISTORY ?? "[]");
+} catch {
+  throw new Error("KONTROL_WORKSPACE_APP_HISTORY must be a JSON array");
+}
+if (!Array.isArray(workspaceAppHistory) || workspaceAppHistory.length > 64) {
+  throw new Error("KONTROL_WORKSPACE_APP_HISTORY must contain at most 64 release entries");
+}
+for (const entry of workspaceAppHistory) {
+  if (typeof entry?.releaseBuildId !== "string"
+    || !/^[A-Za-z0-9._-]{1,128}$/.test(entry.releaseBuildId)
+    || typeof entry?.workspaceAppBuildId !== "string"
+    || !/^[a-f0-9]{12}$/i.test(entry.workspaceAppBuildId)
+    || typeof entry?.buildTimestamp !== "string"
+    || !Number.isFinite(Date.parse(entry.buildTimestamp))) {
+    throw new Error("KONTROL_WORKSPACE_APP_HISTORY contains an invalid release entry");
+  }
+}
 
 // P0 (published dependency closure): record the EXACT resolved versions of the
 // runtime dependencies this candidate was built and qualified against, from
@@ -120,6 +147,8 @@ const buildMeta = {
   maxReadableSchemaVersion: schemaVersion,
   schemaCompatibility: "upgrade-in-place; downgrade-via-versioned-backup",
   releaseFormatVersion,
+  workspaceAppBuildId,
+  workspaceAppHistory,
   nodeVersion: process.version,
   // Exact runtime-dependency closure of the qualification environment (P0).
   dependencies: resolvedRuntimeDependencies(),
