@@ -109,10 +109,39 @@ async function probeCandidateSurface(baseUrl, workspace, requiredInspectionTools
   }, { withSession: false });
   assert.ok(sessionId, "candidate initialize did not return an MCP session id");
   const listed = await rpc("tools/list", {});
-  const names = new Set((listed.tools ?? []).map((tool) => tool.name));
+  const tools = listed.tools ?? [];
+  const names = new Set(tools.map((tool) => tool.name));
   for (const required of requiredInspectionTools) {
     assert.ok(names.has(required), `candidate tools/list is missing required inspection tool ${required}`);
   }
+  const listedResources = await rpc("resources/list", {});
+  const appResources = (listedResources.resources ?? []).filter((resource) =>
+    typeof resource?.uri === "string" && resource.uri.startsWith("ui://kontrol/workspace-app-"));
+  const modernApp = appResources.find((resource) =>
+    /^ui:\/\/kontrol\/workspace-app-[a-f0-9]{12}\.html$/.test(resource.uri));
+  assert.ok(modernApp, "candidate resources/list is missing the hashed modern Workspace App resource");
+  const rendererTools = [
+    "show_workspace_ui",
+    "show_changes",
+    ...(names.has("open_approval_center") ? ["open_approval_center"] : []),
+  ];
+  for (const name of rendererTools) {
+    const renderer = tools.find((tool) => tool.name === name);
+    assert.ok(renderer, `candidate tools/list is missing renderer tool ${name}`);
+    assert.equal(renderer._meta?.ui?.resourceUri, modernApp.uri,
+      `candidate ${name} must advertise the standard modern Workspace App resource`);
+    const compatibilityUri = modernApp.uri.replace(/\.html$/, ".skybridge.html");
+    assert.equal(renderer._meta?.["openai/outputTemplate"], compatibilityUri,
+      `candidate ${name} must advertise the matching content-hashed ChatGPT compatibility resource`);
+    assert.ok(appResources.some((resource) => resource.uri === compatibilityUri),
+      `candidate resources/list is missing the compatibility resource advertised by ${name}`);
+  }
+  const openWorkspace = tools.find((tool) => tool.name === "open_workspace");
+  assert.ok(openWorkspace, "candidate tools/list is missing open_workspace");
+  assert.equal(openWorkspace._meta?.ui?.resourceUri, undefined,
+    "candidate open_workspace must remain data-only");
+  assert.equal(openWorkspace._meta?.["openai/outputTemplate"], undefined,
+    "candidate open_workspace must not advertise a ChatGPT renderer");
   const opened = await rpc("tools/call", { name: "open_workspace", arguments: { path: workspace, mode: "checkout" } });
   const surface = opened.structuredContent ?? opened;
   assert.ok(surface.workspaceId, "candidate open_workspace did not return workspaceId");

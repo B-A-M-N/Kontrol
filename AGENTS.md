@@ -189,7 +189,11 @@ Current implementation contracts:
   then activates it through readiness-gated handoff and rollback. An independent
   deployment lock serializes the complete prepare/stop/activate/rollback
   transaction; its `--prepare-only` and `--activate-existing` phases must not
-  be collapsed into a stop-then-build sequence.
+  be collapsed into a stop-then-build sequence. Candidate checks require the
+  complete current Workspace App renderer metadata; rollback readiness may
+  accept an older release without the ChatGPT `openai/outputTemplate` field
+  only when its hashed modern renderer and exact listed Skybridge resource
+  still serve correctly.
 - `scripts/build-atomic.mjs` produces only a release-local, independently
   loadable candidate and a build-result record; it never changes `dist/`,
   `dist.previous`, or the committed generation. A candidate must pass static

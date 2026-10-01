@@ -95,9 +95,21 @@ writeExecutable(join(fakeBin, "node"), [
   "  exit 92",
   "fi",
   "for arg in \"$@\"; do",
-  "  case \"$arg\" in",
-  "    scripts/probe-workspace-app.mjs|scripts/probe-kontrol-readiness.mjs|scripts/probe-release.mjs|scripts/validate-release.mjs) exit 0 ;;",
-  "  esac",
+  "  if [ \"$arg\" = \"scripts/probe-workspace-app.mjs\" ]; then",
+  "    if [ -n \"${FAKE_FAIL_APP_PROBE_BUILD_ID:-}\" ] && [ \"${KONTROL_EXPECTED_BUILD_ID:-}\" = \"$FAKE_FAIL_APP_PROBE_BUILD_ID\" ]; then",
+  "      echo 'injected renderer-contract failure on candidate' >&2",
+  "      exit 94",
+  "    fi",
+  "    if [ -n \"${FAKE_ROLLBACK_APP_PROBE_MARKER:-}\" ]; then",
+  "      for probe_arg in \"$@\"; do",
+  "        if [ \"$probe_arg\" = \"--allow-missing-chatgpt-template\" ]; then printf '%s\\n' \"$KONTROL_EXPECTED_BUILD_ID\" > \"$FAKE_ROLLBACK_APP_PROBE_MARKER\"; fi",
+  "      done",
+  "    fi",
+  "    exit 0",
+  "  fi",
+  "done",
+  "for arg in \"$@\"; do",
+  "  case \"$arg\" in scripts/probe-kontrol-readiness.mjs|scripts/probe-release.mjs|scripts/validate-release.mjs) exit 0 ;; esac",
   "done",
   "exec \"$REAL_NODE\" \"$@\"",
   "",
@@ -451,6 +463,8 @@ function writeEnvironment(stateDir, port, options) {
     "KONTROL_USE_EXISTING_DIST=" + (opts.useExistingDist ? "true" : "false"),
     "FAKE_CANDIDATE_BUILD_ID=" + candidateBuildId,
     "FAKE_FAIL_BUILD_ID=" + (opts.failBuildId || ""),
+    "FAKE_FAIL_APP_PROBE_BUILD_ID=" + (opts.failAppProbeBuildId || ""),
+    "FAKE_ROLLBACK_APP_PROBE_MARKER=" + (opts.rollbackAppProbeMarker || ""),
     "FAKE_FAIL_ALL=" + (opts.failAll ? "true" : "false"),
     "FAKE_FAIL_RUNTIME_LOCK_ACQUIRE_ONCE=" + (opts.failRuntimeLockAcquireOnce ? "true" : "false"),
     "FAKE_RUNTIME_LOCK_FAILURE_MARKER=" + (opts.runtimeLockFailureMarker || ""),
@@ -865,10 +879,17 @@ try {
   removeGeneratedArtifact(join(root, "dist.previous"), undefined);
   symlinkSync(baseRelease, join(root, "dist"));
   const rollbackState = mkdtempSync(join(harnessRoot, "state-rollback-"));
-  const rollbackEnv = writeEnvironment(rollbackState, 17677, { useExistingDist: false, failBuildId: candidateBuildId });
+  const rollbackAppProbeMarker = join(harnessRoot, "rollback-app-probe-compatibility-flag");
+  const rollbackEnv = writeEnvironment(rollbackState, 17677, {
+    useExistingDist: false,
+    failAppProbeBuildId: candidateBuildId,
+    rollbackAppProbeMarker,
+  });
   const rollback = runLauncher(rollbackEnv);
   assert.notEqual(rollback.status, 0, "candidate rollback failed:\n" + rollback.stdout + "\n" + rollback.stderr);
   assert.match(rollback.stdout + "\n" + rollback.stderr, /KONTROL READY — ROLLED BACK/);
+  assert.equal(readFileSync(rollbackAppProbeMarker, "utf8").trim(), baseBuildId,
+    "restored generation probe must permit a pre-alias renderer while candidate validation remains strict");
   const rollbackGeneration = JSON.parse(readFileSync(join(rollbackState, "generation.json"), "utf8"));
   assert.equal(rollbackGeneration.status, "rolled_back");
   assert.equal(rollbackGeneration.rollback, true);

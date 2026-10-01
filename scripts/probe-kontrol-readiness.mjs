@@ -147,8 +147,12 @@ const opened = await callTool("open_workspace", { path: workspace, mode: "checko
 assert.ok(opened?.workspaceId, "open_workspace did not return workspaceId");
 assert.deepEqual(opened?.toolSurface?.requiredInspectionTools, [...REQUIRED_INSPECTION_TOOLS],
   "open_workspace must return the canonical required inspection surface");
-assert.match(opened?.instruction ?? "", /client catalog is stale.*fresh MCP tool surface/i,
-  "open_workspace must explain how to handle a stale client catalog");
+assert.match(opened?.instruction ?? "", /active Kontrol server exposes .* in tool surface/i,
+  "open_workspace must identify the active server's tool surface");
+assert.match(opened?.instruction ?? "", /client's catalog omits any of them, refresh or initialize a fresh MCP connection/i,
+  "open_workspace must explain how to refresh a stale client catalog");
+assert.match(opened?.instruction ?? "", /meanwhile continue with available bounded structured tools such as read/i,
+  "open_workspace must let clients continue with safe structured tools while reconnecting");
 function assertNoApprovalRequired(name, result) {
   assert.notEqual(result?.status, "approval_required",
     `${name} must not return approval_required under the read-only readiness path: ${JSON.stringify(result)}`);

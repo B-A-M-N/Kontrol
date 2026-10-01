@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 const args = process.argv.slice(2);
 const urlIndex = args.indexOf("--url");
 const url = urlIndex >= 0 ? args[urlIndex + 1] : "http://127.0.0.1:7676/mcp";
+const allowMissingChatGptTemplate = args.includes("--allow-missing-chatgpt-template");
 if (!url) throw new Error("usage: probe-workspace-app.mjs [--url http://127.0.0.1:7676/mcp]");
 
 // Tunnel mode is intentionally unauthenticated at Kontrol's local /mcp hop.
@@ -81,11 +82,18 @@ assert.ok(showUiTool?._meta?.ui?.resourceUri,
   "show_workspace_ui must advertise the standard modern Workspace App resource");
 assert.equal(showUiTool._meta.ui.resourceUri, modern.uri,
   "show_workspace_ui must advertise the modern resource returned by resources/list");
-assert.equal(showUiTool._meta["openai/outputTemplate"], modern.uri.replace(/\.html$/, ".skybridge.html"),
-  "show_workspace_ui must advertise the matching content-hashed ChatGPT compatibility resource");
-assert.ok(resources.some((resource) => resource.uri === showUiTool._meta["openai/outputTemplate"]
+const expectedCompatibilityUri = modern.uri.replace(/\.html$/, ".skybridge.html");
+const advertisedCompatibilityUri = showUiTool._meta["openai/outputTemplate"];
+if (advertisedCompatibilityUri === undefined && allowMissingChatGptTemplate) {
+  console.warn("[workspace-app-probe] rollback target has no legacy ChatGPT outputTemplate; checking its modern renderer and compatibility resource instead");
+} else {
+  assert.equal(advertisedCompatibilityUri, expectedCompatibilityUri,
+    "show_workspace_ui must advertise the matching content-hashed ChatGPT compatibility resource");
+}
+const compatibilityUri = advertisedCompatibilityUri ?? expectedCompatibilityUri;
+assert.ok(resources.some((resource) => resource.uri === compatibilityUri
   && resource.mimeType === "text/html+skybridge"),
-"resources/list must include the exact compatibility URI advertised by show_workspace_ui");
+"resources/list must include the exact content-hashed compatibility URI for show_workspace_ui");
 const opened = await rpc("tools/call", { name: "open_workspace", arguments: { path: process.cwd(), mode: "checkout" } });
 const openedContent = opened.structuredContent ?? opened;
 assert.equal(typeof openedContent.workspaceId, "string", "open_workspace must return a workspace card payload");
@@ -104,4 +112,4 @@ for (const resource of resources) {
   if (resource.uri === modern.uri) modernBytes = Buffer.byteLength(read.contents?.[0]?.text ?? "", "utf8");
 }
 
-console.log(JSON.stringify({ ok: true, modernUri: modern.uri, compatibilityUris: compatibility.map((item) => item.uri), workspaceId: openedContent.workspaceId, showWorkspaceUi: showUiContent.tool, modernBytes }));
+console.log(JSON.stringify({ ok: true, modernUri: modern.uri, compatibilityUris: compatibility.map((item) => item.uri), legacyChatGptTemplateAdvertised: typeof advertisedCompatibilityUri === "string", workspaceId: openedContent.workspaceId, showWorkspaceUi: showUiContent.tool, modernBytes }));

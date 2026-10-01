@@ -111,8 +111,12 @@ try {
         `${mode} open_workspace must return the required inspection surface`);
       assert.equal(typeof openedSurface?.toolSurface?.version, "string",
         `${mode} open_workspace must return the MCP surface version`);
-      assert.match(openedSurface?.instruction ?? "", /client catalog is stale.*fresh MCP tool surface/i,
-        `${mode} open_workspace must explain stale catalog recovery`);
+      assert.match(openedSurface?.instruction ?? "", /active Kontrol server exposes .* in tool surface/i,
+        `${mode} open_workspace must identify the active server tool surface`);
+      assert.match(openedSurface?.instruction ?? "", /client's catalog omits any of them, refresh or initialize a fresh MCP connection/i,
+        `${mode} open_workspace must explain how to refresh a stale client catalog`);
+      assert.match(openedSurface?.instruction ?? "", /meanwhile continue with available bounded structured tools such as read/i,
+        `${mode} open_workspace must permit safe structured operations while reconnecting`);
     } finally {
       await client.close();
       await server.close();

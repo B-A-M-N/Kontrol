@@ -562,7 +562,14 @@ fi
 echo " kontrol ready."
 
 echo "[*] Probing MCP App template..."
-if ! node scripts/probe-workspace-app.mjs --url "http://${DEV_HOST}:${DEV_PORT}/mcp"; then
+WORKSPACE_APP_PROBE_ARGS=(--url "http://${DEV_HOST}:${DEV_PORT}/mcp")
+if [[ "${ROLLBACK_ACTIVE:-false}" == "true" ]]; then
+  # The previous immutable release may predate the ChatGPT outputTemplate
+  # alias. Its modern MCP App renderer and retained compatibility resource
+  # still need to serve correctly so rollback can restore the known-good core.
+  WORKSPACE_APP_PROBE_ARGS+=(--allow-missing-chatgpt-template)
+fi
+if ! node scripts/probe-workspace-app.mjs "${WORKSPACE_APP_PROBE_ARGS[@]}"; then
   echo "ERROR: MCP App template probe failed. Aborting." >&2
   return 1
 fi
