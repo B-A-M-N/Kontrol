@@ -70,6 +70,61 @@ try {
   assert.equal(tombstone.payload_json, null, "committed receipts retain the ID mapping but release fragment payload storage");
   assert.equal(events.flushTelemetryIngress("session-ingress"), 0);
 
+  const interleavedIngress = [
+    { id: "adapter-order-1", type: "agent.run.output_delta", payload: { channel: "message", text: "A" } },
+    { id: "adapter-order-2", type: "agent.run.thought_delta", payload: { channel: "thought", text: "B" } },
+    { id: "adapter-order-3", type: "agent.run.output_delta", payload: { channel: "message", text: "C" } },
+  ];
+  for (const event of interleavedIngress) {
+    events.appendTelemetryIngress({ ...event, sessionId: "session-interleaved" });
+  }
+  assert.equal(events.flushTelemetryIngress("session-interleaved"), 3);
+  const interleavedEvents = events.getEventsForSession("session-interleaved");
+  assert.deepEqual(
+    interleavedEvents.map((event) => [event.type, event.payload.text]),
+    [
+      ["agent.run.output_delta", "A"],
+      ["agent.run.thought_delta", "B"],
+      ["agent.run.output_delta", "C"],
+    ],
+    "coalescing preserves the original order of interleaved output and thought fragments",
+  );
+
+  events.appendTelemetryIngress({
+    id: "adapter-order-recent",
+    type: "agent.run.output_delta",
+    sessionId: "session-retention",
+    payload: { channel: "message", text: "recent" },
+  });
+  events.flushTelemetryIngress("session-retention");
+  events.appendTelemetryIngress({
+    id: "adapter-order-pending",
+    type: "agent.run.output_delta",
+    sessionId: "session-retention",
+    payload: { channel: "message", text: "pending" },
+  });
+  database.sqlite.prepare(`
+    update telemetry_ingress
+       set committed_at = '2000-01-01T00:00:00.000Z'
+     where event_id in ('adapter-event-1', 'adapter-event-2')
+  `).run();
+  const retentionCutoff = "2025-01-01T00:00:00.000Z";
+  assert.equal(events.pruneCommittedTelemetryIngress(retentionCutoff, 1), 1, "retention deletes no more than one committed receipt per bounded page");
+  assert.equal(
+    (database.sqlite.prepare("select count(*) as count from telemetry_ingress where status = 'committed' and committed_at < ?").get(retentionCutoff) as { count: number }).count,
+    1,
+    "one expired committed tombstone remains for the next page",
+  );
+  assert.equal(
+    (database.sqlite.prepare("select status from telemetry_ingress where event_id = 'adapter-order-pending'").get() as { status: string }).status,
+    "pending",
+    "pending ingress is retained regardless of age",
+  );
+  assert.ok(events.getEventById("adapter-order-recent"), "recent committed idempotency receipt remains available");
+  assert.equal(events.pruneCommittedTelemetryIngress(retentionCutoff, 1), 1, "a later page removes the next expired committed receipt");
+  assert.equal(events.pruneCommittedTelemetryIngress(retentionCutoff, 1), 0, "retention reports a drained page");
+  assert.equal(events.getEventById("adapter-event-1"), undefined, "expired adapter tombstones leave the idempotency horizon");
+
   const now = new Date().toISOString();
   database.sqlite.prepare(`
     insert into workspace_sessions (id, project_id, root, status, mode, managed, created_at, last_used_at)

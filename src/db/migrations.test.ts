@@ -36,6 +36,11 @@ try {
     "durable telemetry event-id receipts are present after migration",
   );
   assert.ok(
+    (sqlite.prepare("pragma index_list(telemetry_ingress)").all() as Array<{ name: string }>)
+      .some((index) => index.name === "telemetry_ingress_retention_idx"),
+    "committed telemetry tombstone retention uses a bounded lookup index",
+  );
+  assert.ok(
     (sqlite.prepare("pragma table_info(workspace_sessions)").all() as Array<{ name: string }>)
       .some((column) => column.name === "retired_at"),
     "managed worktree retirement timestamp is present after migration",

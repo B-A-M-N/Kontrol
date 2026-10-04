@@ -25,6 +25,7 @@ function makeRoot(prefix: string): string {
 const baseConfig = {
   maintenanceIntervalMs: 5, // drive cycles from wall-clock ticks
   maintenanceBudgetMs: 5_000,
+  telemetryIngressRetentionMs: 30 * 24 * 60 * 60_000,
   logging: { level: "error", format: "text" },
 } as never;
 
@@ -36,6 +37,7 @@ async function makeFixture() {
   const workspaceRoot = makeRoot("kontrol-maint-gc-ws-");
   const db = openDatabase(stateDir);
   const store = new FilesystemSnapshotStore({ storeRoot, limits: { orphanGraceMs: 0, retainPerWorkspace: 0 } });
+  const telemetryPruneLimits: number[] = [];
 
   writeFileSync(join(workspaceRoot, "submitted.txt"), "submitted-content\n");
   const submitted = await store.capture(workspaceRoot);
@@ -76,13 +78,17 @@ async function makeFixture() {
     eventStore: {
       appendEvent: () => undefined,
       compactSessionEvents: () => 0,
+      pruneCommittedTelemetryIngress: (_cutoff: string, limit: number) => {
+        telemetryPruneLimits.push(limit);
+        return 0;
+      },
     },
     mutationReceipts: { reconcile: () => ({ pendingSample: [] as never[], pendingHasMore: false, deletedCompleted: 0 }) },
     reviewCheckpoints: { getSnapshotStore: () => store },
   });
 
   return {
-    stateDir, store, db, stubDeps,
+    stateDir, store, db, stubDeps, telemetryPruneLimits,
     submittedRef: submitted.ref,
     sessionPinnedRef: sessionPinned.ref,
     garbageRef: garbage.ref,
@@ -128,6 +134,8 @@ async function makeFixture() {
 
   assert.equal(healthy.stats.snapshotRootsDegraded, false, "recovered cycle clears the degraded flag");
   assert.ok(managedWorktreeGcCalls > 0, "maintenance invokes the bounded managed-worktree cleanup hook");
+  assert.ok(fx.telemetryPruneLimits.length > 0, "maintenance invokes telemetry tombstone pruning");
+  assert.ok(fx.telemetryPruneLimits.every((limit) => limit === 500), "telemetry tombstone pruning uses a bounded page size");
   assert.equal(existsSync(fx.store.manifestPath(fx.garbageRef)), false, "healthy cycle reclaims unpinned garbage");
   assert.equal(existsSync(fx.store.manifestPath(fx.sessionPinnedRef)), true, "live session baseline remains pinned");
   assert.equal(existsSync(fx.store.manifestPath(fx.submittedRef)), true, "DB-rooted submission survives healthy GC");

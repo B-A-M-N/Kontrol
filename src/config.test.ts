@@ -109,6 +109,8 @@ assert.equal(loadConfig(baseEnv).mcpSseHeartbeatMs, 15_000);
 assert.equal(loadConfig(baseEnv).mcpExecutionTimeoutMs, 30 * 60_000);
 assert.equal(loadConfig(baseEnv).maintenanceIntervalMs, 5 * 60_000);
 assert.equal(loadConfig(baseEnv).maintenanceBudgetMs, 250);
+assert.equal(loadConfig(baseEnv).telemetryIngressRetentionMs, 30 * 24 * 60 * 60_000);
+assert.equal(loadConfig({ ...baseEnv, KONTROL_TELEMETRY_INGRESS_RETENTION_MS: "456" }).telemetryIngressRetentionMs, 456);
 assert.equal(loadConfig(baseEnv).managedWorktreeProjectLimit, 8);
 assert.equal(loadConfig(baseEnv).managedWorktreeGlobalLimit, 32);
 assert.equal(loadConfig(baseEnv).managedWorktreeRetentionMs, 7 * 24 * 60 * 60_000);

@@ -70,6 +70,7 @@ const migrations: Migration[] = [
   { version: 58, name: "approval-direct-operation-hash", up: migrateApprovalDirectOperationHash },
   { version: 59, name: "durable-telemetry-ingress", up: migrateDurableTelemetryIngress },
   { version: 60, name: "managed-worktree-retirement", up: migrateManagedWorktreeRetirement },
+  { version: 61, name: "telemetry-ingress-retention-index", up: migrateTelemetryIngressRetentionIndex },
 ];
 
 function migrateApprovalDirectOperationHash(sqlite: Database.Database): void {
@@ -107,6 +108,10 @@ function migrateManagedWorktreeRetirement(sqlite: Database.Database): void {
     create index if not exists workspace_managed_lifecycle_created_idx
       on workspace_sessions(mode, managed, status, created_at, id);
   `);
+}
+
+function migrateTelemetryIngressRetentionIndex(sqlite: Database.Database): void {
+  sqlite.exec("create index if not exists telemetry_ingress_retention_idx on telemetry_ingress(status, committed_at, sequence)");
 }
 
 // P1 (audit): checkpoint coverage blind spots. A structured mutation into a

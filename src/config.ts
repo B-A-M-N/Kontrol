@@ -128,6 +128,8 @@ export interface ServerConfig {
   /** Periodic maintenance scheduling and wall-clock budget. */
   maintenanceIntervalMs: number;
   maintenanceBudgetMs: number;
+  /** Idempotency tombstone retention for committed adapter telemetry receipts. */
+  telemetryIngressRetentionMs: number;
   /** Diagnostic integrity scheduling and worker deadline. */
   integrityIntervalMs: number;
   integrityDeadlineMs: number;
@@ -658,6 +660,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
       env.KONTROL_MAINTENANCE_BUDGET_MS,
       250,
       "KONTROL_MAINTENANCE_BUDGET_MS",
+    ),
+    telemetryIngressRetentionMs: parsePositiveInteger(
+      env.KONTROL_TELEMETRY_INGRESS_RETENTION_MS,
+      30 * 24 * 60 * 60_000,
+      "KONTROL_TELEMETRY_INGRESS_RETENTION_MS",
     ),
     integrityIntervalMs: parsePositiveInteger(
       env.KONTROL_INTEGRITY_INTERVAL_MS,

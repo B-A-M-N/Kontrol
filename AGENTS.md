@@ -245,6 +245,10 @@ Current implementation contracts:
 - Periodic and startup reconciliation is bounded by pages/cursors so runtime
   state, approval expiry, direct-approval orphan cleanup, and telemetry work
   cannot become an unbounded synchronous serving-thread sweep.
+- Durable telemetry ingress coalesces only contiguous compatible fragments.
+  Committed event-ID tombstones are pruned in bounded pages after
+  `KONTROL_TELEMETRY_INGRESS_RETENTION_MS` (30 days by default); pending
+  ingress is never pruned.
 - Workspace event reads and subscriptions resolve workspace sessions through the
   same project scope, and review/tool cursors use stable timestamp-plus-ID
   ordering. Older pending reviews are discoverable through an explicit stale

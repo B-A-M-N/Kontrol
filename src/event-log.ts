@@ -76,6 +76,9 @@ export interface EventStore {
  /** Materialize pending ingress rows into coalesced event-log events. */
  flushTelemetryIngress(sessionId?: string): number;
 
+ /** Prune at most `limit` committed ingress receipts older than `cutoff`. Pending receipts are never eligible. */
+ pruneCommittedTelemetryIngress(cutoff: string, limit: number): number;
+
  /**
   * Durable events strictly after a given seq. Used by the blocking
   * await_work_session_events tool to fetch what was missed since the last poll
@@ -385,14 +388,22 @@ export function createEventStore(
           }>;
       if (rows.length === 0) return 0;
 
-      const groups = new Map<string, typeof rows>();
+      // Preserve ingress chronology. Only adjacent rows with the same
+      // session/workspace/type may be coalesced; a Map keyed by type would
+      // move later output fragments ahead of interleaved thought events.
+      const groups: Array<Array<(typeof rows)[number]>> = [];
+      let activeKey: string | undefined;
       for (const row of rows) {
         const key = `${row.session_id}\0${row.workspace_session_id ?? ""}\0${row.type}`;
-        const group = groups.get(key) ?? [];
+        let group = groups[groups.length - 1];
+        if (!group || key !== activeKey) {
+          group = [];
+          groups.push(group);
+          activeKey = key;
+        }
         group.push(row);
-        groups.set(key, group);
       }
-      for (const group of groups.values()) {
+      for (const group of groups) {
         const first = group[0]!;
         const fragments = group.map((row) => row.payload_json ? JSON.parse(row.payload_json) as Record<string, unknown> : {});
         const channels = [...new Set(fragments
@@ -440,6 +451,25 @@ export function createEventStore(
       flushed += batch;
     } while (batch > 0);
     return flushed;
+  }
+
+  function pruneCommittedTelemetryIngress(cutoff: string, limit: number): number {
+    if (!Number.isSafeInteger(limit) || limit < 1) {
+      throw new RangeError("Telemetry ingress prune limit must be a positive safe integer");
+    }
+    const result = database.sqlite.prepare(`
+      delete from telemetry_ingress
+       where sequence in (
+         select sequence
+           from telemetry_ingress
+          where status = 'committed'
+            and committed_at is not null
+            and committed_at < ?
+          order by committed_at, sequence
+          limit ?
+       )
+    `).run(cutoff, limit);
+    return result.changes;
   }
 
   function flushTelemetry(key: string): void {
@@ -1101,6 +1131,7 @@ export function createEventStore(
     appendEvent,
     appendTelemetryIngress,
     flushTelemetryIngress,
+    pruneCommittedTelemetryIngress,
     publishEvents: (events) => {
       for (const event of events) publish(event);
     },

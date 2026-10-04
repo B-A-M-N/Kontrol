@@ -62,6 +62,7 @@ kontrol config set publicBaseUrl https://kontrol.example.com
 | `KONTROL_MCP_EXECUTION_TIMEOUT_MS` | Maximum execution time for ordinary MCP calls. Defaults to `1800000` (30 minutes). Long-poll waiters and approval-gated calls are exempt and use their own lifecycle. |
 | `KONTROL_MAINTENANCE_INTERVAL_MS` | Periodic maintenance interval. Defaults to `300000` (5 minutes). |
 | `KONTROL_MAINTENANCE_BUDGET_MS` | Wall-clock budget for one maintenance slice. Defaults to `250`; unfinished work resumes on a later tick. |
+| `KONTROL_TELEMETRY_INGRESS_RETENTION_MS` | Retention for committed adapter event-ID receipts used for retry deduplication. Defaults to `2592000000` (30 days); pending ingress is never pruned. Keep this longer than the maximum adapter retry window. |
 | `KONTROL_INTEGRITY_INTERVAL_MS` | Interval for the off-loop SQLite integrity diagnostic. Defaults to `1800000` (30 minutes). |
 | `KONTROL_INTEGRITY_DEADLINE_MS` | Worker deadline for one integrity diagnostic. Defaults to `10000`; timeout is diagnostic degradation only. |
 | `KONTROL_POLICY_APPROVAL_TIMEOUT_MS` | Stale-card backstop for blocking work-session policy approvals. Defaults to `86400000` (24 hours). Direct MCP approvals are pending human decisions with their own shorter TTL. |

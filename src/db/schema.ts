@@ -28,6 +28,7 @@ export const telemetryIngress = sqliteTable("telemetry_ingress", {
   index("telemetry_ingress_pending_idx").on(table.status, table.sequence),
   index("telemetry_ingress_session_idx").on(table.sessionId, table.status, table.sequence),
   index("telemetry_ingress_event_log_idx").on(table.eventLogId),
+  index("telemetry_ingress_retention_idx").on(table.status, table.committedAt, table.sequence),
 ]);
 
 export const workspaceProjects = sqliteTable("workspace_projects", {

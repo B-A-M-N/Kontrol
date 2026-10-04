@@ -33,6 +33,7 @@ export interface MaintenanceDeps {
   eventStore: {
     appendEvent(event: { type: string; sessionId: string; payload: Record<string, unknown> }, opts?: { publish?: boolean }): unknown;
     compactSessionEvents(sessionId: string, opts: { retentionDays: number; maxRows: number }): number;
+    pruneCommittedTelemetryIngress(cutoff: string, limit: number): number;
   };
   mutationReceipts: {
     reconcile(opts: { limit: number }): { pendingSample: unknown[]; pendingHasMore: boolean; deletedCompleted: number };
@@ -56,6 +57,7 @@ export function createMaintenanceCoordinator(deps: MaintenanceDeps) {
   const MAINTENANCE_INTERVAL_MS = config.maintenanceIntervalMs;
   const MAINTENANCE_BUDGET_MS = config.maintenanceBudgetMs;
   const MAINTENANCE_PAGE_SIZE = 100;
+  const TELEMETRY_INGRESS_PRUNE_PAGE_SIZE = 500;
   const COMPACT_PAGE_SIZE = 500;
   const COMPACT_BATCH_SIZE = 250;
   let maintenanceStopped = false;
@@ -71,6 +73,7 @@ export function createMaintenanceCoordinator(deps: MaintenanceDeps) {
     lastDurationMs: number;
     maxDurationMs: number;
     compactedRows: number;
+    telemetryIngressReceiptsPruned: number;
     pendingMutationReceipts: number;
     lastError?: string;
     /** P0: set when durable snapshot-root enumeration failed. Snapshot GC is
@@ -85,6 +88,7 @@ export function createMaintenanceCoordinator(deps: MaintenanceDeps) {
     lastDurationMs: 0,
     maxDurationMs: 0,
     compactedRows: 0,
+    telemetryIngressReceiptsPruned: 0,
     pendingMutationReceipts: 0,
   };
 
@@ -159,6 +163,7 @@ export function createMaintenanceCoordinator(deps: MaintenanceDeps) {
     let runtimeReconciliationDone = false;
     let approvalExpiryDone = false;
     let mutationReceiptReconciliationDone = false;
+    let telemetryIngressPruningDone = false;
     let snapshotGcDone = false;
     let managedWorktreeGcDone = !managedWorktreeGc;
 
@@ -227,6 +232,23 @@ export function createMaintenanceCoordinator(deps: MaintenanceDeps) {
           // another bounded page is needed.
           mutationReceiptReconciliationDone = receiptMaintenance.deletedCompleted < MAINTENANCE_PAGE_SIZE;
           if (!mutationReceiptReconciliationDone) {
+            setImmediate(step);
+            return;
+          }
+        }
+
+        if (!telemetryIngressPruningDone) {
+          try {
+            const cutoff = new Date(Date.now() - config.telemetryIngressRetentionMs).toISOString();
+            const pruned = eventStore.pruneCommittedTelemetryIngress(cutoff, TELEMETRY_INGRESS_PRUNE_PAGE_SIZE);
+            maintenanceStats.telemetryIngressReceiptsPruned += pruned;
+            telemetryIngressPruningDone = pruned < TELEMETRY_INGRESS_PRUNE_PAGE_SIZE;
+          } catch (error) {
+            maintenanceStats.lastError = error instanceof Error ? error.message : String(error);
+            reportMaintenanceFailure("telemetry_ingress_retention", error);
+            telemetryIngressPruningDone = true;
+          }
+          if (!telemetryIngressPruningDone) {
             setImmediate(step);
             return;
           }

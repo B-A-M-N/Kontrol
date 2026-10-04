@@ -101,6 +101,7 @@ async function testDatabaseConfiguration(stateDir: string): Promise<void> {
       { version: 58, name: "approval-direct-operation-hash" },
       { version: 59, name: "durable-telemetry-ingress" },
       { version: 60, name: "managed-worktree-retirement" },
+      { version: 61, name: "telemetry-ingress-retention-index" },
     ]);
   } finally {
     database.close();
