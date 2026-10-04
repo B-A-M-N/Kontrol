@@ -12,7 +12,7 @@ import type { Continuation } from "../continuation.js";
 import type { DispatchOutboxEvent } from "../dispatch-outbox.js";
 import { TERMINAL_STATUSES } from "../review-workflow.js";
 import type { BridgeConfig } from "./context.js";
-import { defaultLiveWaiters, renderMissionPrompt, resolveHealthyAgentUrl, workSessionInstructions } from "./shared.js";
+import { acquireCheckoutModifyLease, checkoutLeaseMetadata, defaultLiveWaiters, renderMissionPrompt, resolveHealthyAgentUrl, workSessionInstructions } from "./shared.js";
 import type { LiveWaiterRegistry } from "./shared.js";
 
 export interface ContinuationDispatcher {
@@ -57,6 +57,7 @@ export function createContinuationDispatcher(config: BridgeConfig): Continuation
     unsub = config.eventStore.subscribeAll((event) => {
       if (
         event.type === "continuation.created" ||
+        event.type === "continuation.redriven" ||
         event.type === "worker.waiter.closed" ||
         event.type === "worker.attempt.exited" ||
         event.type === "worker.attempt.failed"
@@ -94,6 +95,24 @@ export async function runContinuationTick(
       sessionId,
       payload: { continuationId, reason },
     });
+  };
+  const markContinuationDispatchFailed = (event: DispatchOutboxEvent | undefined, continuation: Continuation, reason: string) => {
+    if (!event || !config.dispatchOutbox) return;
+    config.dispatchOutbox.markFailed(event.id, reason, DEFAULT_CLAIM_LEASE_MS);
+    const current = config.dispatchOutbox.get(event.id);
+    if (current?.status === "dead_lettered") {
+      config.eventStore.appendEvent({
+        type: "continuation.dispatch_attention",
+        sessionId: continuation.sessionId,
+        payload: {
+          continuationId: continuation.id,
+          reviewEpoch: continuation.reviewEpoch,
+          outboxId: event.id,
+          failureCount: current.failureCount,
+          reason,
+        },
+      });
+    }
   };
 
   // Requeue continuations whose claim lease expired (e.g. a dispatcher crashed
@@ -157,9 +176,7 @@ export async function runContinuationTick(
             reason: "Original ACP run not found",
           },
         });
-        outboxEvent
-          ? config.dispatchOutbox?.markFailed(outboxEvent.id, "Original ACP run not found", DEFAULT_CLAIM_LEASE_MS)
-          : undefined;
+        markContinuationDispatchFailed(outboxEvent, claimed, "Original ACP run not found");
         return "failed";
       }
       const missionPacket = config.missionLedger?.getPacket(claimed.sessionId);
@@ -175,9 +192,9 @@ export async function runContinuationTick(
         // (the lease prevents it from being re-claimed too eagerly after a blip).
         config.continuationManager.release(dispatcherId, { id: claimed.id });
         outboxEvent
-          ? config.dispatchOutbox?.markFailed(outboxEvent.id, "No healthy agent available", DEFAULT_CLAIM_LEASE_MS)
+          ? config.dispatchOutbox?.release(outboxEvent.id, DEFAULT_CLAIM_LEASE_MS, "No healthy agent available")
           : undefined;
-        return "failed";
+        return "deferred";
       }
 
       try {
@@ -241,12 +258,18 @@ export async function runContinuationTick(
         });
         outboxEvent ? config.dispatchOutbox?.markCompleted(outboxEvent.id) : undefined;
         return "completed";
-      } catch {
-        // Dispatch failed — release so a later wakeup retries it.
+      } catch (error) {
+        // Availability failures release the logical outbox row with backoff;
+        // only genuine failures consume the dead-letter budget.
         config.continuationManager.release(dispatcherId, { id: claimed.id });
-        outboxEvent
-          ? config.dispatchOutbox?.markFailed(outboxEvent.id, "ACP continuation dispatch failed", DEFAULT_CLAIM_LEASE_MS)
-          : undefined;
+        const reason = error instanceof Error ? error.message : String(error);
+        if (isTemporaryDispatchUnavailability(reason)) {
+          outboxEvent
+            ? config.dispatchOutbox?.release(outboxEvent.id, DEFAULT_CLAIM_LEASE_MS, reason)
+            : undefined;
+          return "deferred";
+        }
+        markContinuationDispatchFailed(outboxEvent, claimed, reason || "ACP continuation dispatch failed");
         return "failed";
       }
   };
@@ -293,12 +316,20 @@ export async function runContinuationTick(
   }
 }
 
+function isTemporaryDispatchUnavailability(reason: string): boolean {
+  return /no healthy (?:dispatchable )?agent|workspace (?:root|checkout|lease).*(?:leased|unavailable|conflict)|temporarily unavailable|resource unavailable|ECONNREFUSED|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|socket hang up/i.test(reason);
+}
+
 export async function defaultResume(
   config: BridgeConfig,
   continuation: Continuation,
   session: { workspaceSessionId: string },
   agentName = "cli-coding-agent",
 ): Promise<AgentCallResult> {
+  const leaseConflict = await acquireCheckoutModifyLease(config, session.workspaceSessionId, continuation.sessionId);
+  if (leaseConflict) {
+    throw new Error(leaseConflict.content[0]?.text ?? "Unable to acquire the workspace lease for this continuation.");
+  }
   const run = config.agentRegistry.getRunByWorkSessionId(continuation.sessionId);
   const agent = config.agentRegistry.listAlive().find((candidate) => candidate.name === agentName);
   const missionPrompt = renderMissionPrompt(config, continuation.sessionId, continuation.promptText);
@@ -318,6 +349,7 @@ export async function defaultResume(
       workSessionId: continuation.sessionId,
       existingRunId: run?.runId,
       continuationId: continuation.id,
+      ...checkoutLeaseMetadata(config, continuation.sessionId),
       mode: "async",
       fireAndForget: true,
     },

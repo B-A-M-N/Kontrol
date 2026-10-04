@@ -337,9 +337,9 @@ try {
     }, { sessionId: reviewerSessionId, reviewer: true });
     assert.notEqual(resumeApprove.payload?.result?.isError, true, "resume approve-once must succeed");
 
-    // Reconnect WITHOUT the conversation header and retry with the echoed
-    // approvalResumeId. Without the resume token this retry would fingerprint
-    // as a brand-new operation and prompt again despite the human decision.
+    // A cached host may not know about approvalResumeId. This transport is
+    // fresh but belongs to the same trusted conversation owner, so the exact
+    // full-operation hash must recover the one-shot decision without a token.
     const resumeReconnectInit = await rpc("initialize", {
       protocolVersion: "2025-06-18",
       capabilities: {},
@@ -353,7 +353,6 @@ try {
       arguments: {
         workspaceId: resumeWorkspaceId,
         command: "printf resume-runs",
-        approvalResumeId: resumeApprovalId,
       },
     }, { sessionId: resumeReconnectSessionId });
     assert.equal(resumeRetry.response.status, 200, JSON.stringify(resumeRetry.payload));

@@ -10,7 +10,7 @@ import type { BridgeConfig } from "./context.js";
 import { callRemoteAgent, selectHealthyAgent } from "../acp-gateway.js";
 import { registerMutationAppTool } from "./app-tool.js";
 import { missionCriterionSchema, workOrderSchema } from "./context.js";
-import { acquireCheckoutModifyLease, checkoutLeaseNonce, forbidden, isReviewer, liveOwnerContextId, requireWorkSessionRead, renderMissionPrompt, resolveDelegationContext, workSessionInstructions, workspaceAppModelAndAppMeta } from "./shared.js";
+import { acquireCheckoutModifyLease, checkoutLeaseMetadata, forbidden, isReviewer, liveOwnerContextId, requireWorkSessionRead, renderMissionPrompt, resolveDelegationContext, workSessionInstructions, workspaceAppModelAndAppMeta } from "./shared.js";
 import { z } from "zod/v4";
 
 export function registerDelegationTools(server: McpServer, config: BridgeConfig): void {
@@ -252,7 +252,7 @@ export function registerDelegationTools(server: McpServer, config: BridgeConfig)
               : dispatchTask,
             workspaceSessionId: workspaceSessionId,
             workSessionId: wsId,
-            workspaceLeaseNonce: checkoutLeaseNonce(config, wsId),
+            ...checkoutLeaseMetadata(config, wsId),
             mode: "async",
             fireAndForget: true,
           },

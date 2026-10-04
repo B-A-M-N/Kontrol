@@ -25,6 +25,31 @@ try {
       .some((column) => column.name === "owner_context_id"),
     "approval owner context column is present after migration",
   );
+  assert.ok(
+    (sqlite.prepare("pragma table_info(approval_requests)").all() as Array<{ name: string }>)
+      .some((column) => column.name === "operation_hash"),
+    "canonical direct-operation hash column is present after migration",
+  );
+  assert.ok(
+    (sqlite.prepare("pragma table_info(telemetry_ingress)").all() as Array<{ name: string }>)
+      .some((column) => column.name === "event_id"),
+    "durable telemetry event-id receipts are present after migration",
+  );
+  assert.ok(
+    (sqlite.prepare("pragma table_info(workspace_sessions)").all() as Array<{ name: string }>)
+      .some((column) => column.name === "retired_at"),
+    "managed worktree retirement timestamp is present after migration",
+  );
+  assert.ok(
+    (sqlite.prepare("pragma index_list(workspace_sessions)").all() as Array<{ name: string }>)
+      .some((index) => index.name === "workspace_managed_lifecycle_created_idx"),
+    "managed worktree pagination has an indexed stable cursor",
+  );
+  assert.ok(
+    (sqlite.prepare("pragma index_list(policy_approval_grants)").all() as Array<{ name: string }>)
+      .some((index) => index.name === "policy_approval_grants_principal_idx"),
+    "effective policy grants retain their indexed composite identity",
+  );
 
   sqlite.exec("drop index if exists agent_registry_name_unique");
   sqlite.prepare(`

@@ -71,6 +71,7 @@ interface WorkspaceReviewState {
     presentation: WorkspaceSnapshot;
     legacy: WorkspaceSnapshot;
     sessions: Map<string, WorkspaceSnapshot>;
+    presentations: Map<string, WorkspaceSnapshot>;
   };
 }
 
@@ -86,7 +87,8 @@ interface WorkspaceReviewStateWithInit extends WorkspaceReviewState {
    * checkpoint advance. Classified against the active backend at submission
    * time so a review diff that silently omits excluded/ignored material can
    * be flagged instead of looking complete. */
-  mutatedPaths: Map<string, string>;
+  reviewMutationsByWorkSession: Map<string, Map<string, string>>;
+  unscopedReviewMutations: Map<string, string>;
 }
 
 export interface ReviewCheckpointManager {
@@ -98,6 +100,7 @@ export interface ReviewCheckpointManager {
     since?: ReviewSince;
     markReviewed?: boolean;
     workSessionId?: string;
+    presentationOwnerId?: string;
   }): Promise<ReviewChangesResult>;
   reviewChangesAgainstCommit(input: {
     workspaceId: string;
@@ -136,16 +139,16 @@ export interface ReviewCheckpointManager {
    * which of them the checkpoint cannot represent. Paths are retained until
    * `clearRecordedMutations` (called when a checkpoint advances).
    */
-  recordMutations(input: { workspaceId: string; root: string; paths: string[] }): Promise<void>;
+  recordMutations(input: { workspaceId: string; root: string; paths: string[]; workSessionId?: string }): Promise<void>;
   /**
    * Classify every recorded mutation path against the ACTIVE checkpoint
    * backend and return the coverage record for the submission. Empty
    * uncoveredPaths = the checkpoint fully represents every structured
    * mutation.
    */
-  checkpointCoverage(input: { workspaceId: string; root: string }): Promise<CheckpointCoverage>;
-  /** Drop the recorded mutation paths (checkpoint advanced / session closed). */
-  clearRecordedMutations(input: { workspaceId: string }): Promise<void>;
+  checkpointCoverage(input: { workspaceId: string; root: string; workSessionId?: string }): Promise<CheckpointCoverage>;
+  /** Drop one work-session ledger, or the direct/unscoped ledger when omitted. */
+  clearRecordedMutations(input: { workspaceId: string; workSessionId?: string }): Promise<void>;
   /** Raw store surface for maintenance/CLI (GC, stats, reconciliation). */
   getSnapshotStore(): FilesystemSnapshotStore;
   /** Drop a terminal work-session's baseline pin so GC can reclaim it. */
@@ -207,7 +210,13 @@ export function createReviewCheckpointManager(options: {
     let resolveInit!: () => void;
     const initPromise = new Promise<void>((resolve) => { resolveInit = resolve; });
     const refs = reviewRefs(workspaceId);
-    const state: WorkspaceReviewStateWithInit = { root, ...refs, initialization: initPromise, mutatedPaths: new Map() };
+    const state: WorkspaceReviewStateWithInit = {
+      root,
+      ...refs,
+      initialization: initPromise,
+      reviewMutationsByWorkSession: new Map(),
+      unscopedReviewMutations: new Map(),
+    };
     states.set(workspaceId, state);
 
     try {
@@ -226,11 +235,18 @@ export function createReviewCheckpointManager(options: {
             presentation: persisted.presentation,
             legacy: persisted.legacy,
             sessions: new Map(Object.entries(persisted.sessions)),
+            presentations: new Map(Object.entries(persisted.presentations ?? { default: persisted.presentation })),
           };
         } else {
           await store.runStartupReconciliation();
           const open = await store.capture(root);
-          state.filesystemBaselines = { open, presentation: open, legacy: open, sessions: new Map() };
+          state.filesystemBaselines = {
+            open,
+            presentation: open,
+            legacy: open,
+            sessions: new Map(),
+            presentations: new Map([["default", open]]),
+          };
           await store.saveBaselines(workspaceId, root, state.filesystemBaselines);
         }
         state.diagnostic = undefined;
@@ -275,8 +291,9 @@ export function createReviewCheckpointManager(options: {
       };
     },
 
-    async reviewChanges({ workspaceId, root, since = "last_shown", markReviewed = true, workSessionId }) {
+    async reviewChanges({ workspaceId, root, since = "last_shown", markReviewed = true, workSessionId, presentationOwnerId }) {
       const state = await ensureInitialized(workspaceId, root);
+      const presentationOwner = presentationOwnerId ?? "default";
 
       if (state.backend?.kind === "filesystem") {
         const baselines = state.filesystemBaselines!;
@@ -284,20 +301,17 @@ export function createReviewCheckpointManager(options: {
           ? baselines.open
           : since === "work_session" || since === "last_review"
             ? (workSessionId ? baselines.sessions.get(workSessionId) : undefined) ?? baselines.open
-            : baselines.presentation;
+            : baselines.presentations.get(presentationOwner) ?? (presentationOwner === "default" ? baselines.presentation : baselines.open);
         const current = await state.backend.capture(state.root);
         const diff = await state.backend.diff(state.root, baseline, current);
         if (markReviewed) {
           if (since === "work_session" || since === "last_review") {
             if (workSessionId) baselines.sessions.set(workSessionId, current);
           } else {
-            baselines.presentation = current;
+            baselines.presentations.set(presentationOwner, current);
+            if (presentationOwner === "default") baselines.presentation = current;
           }
           await getFsStore().saveBaselines(workspaceId, state.root, baselines);
-          // The checkpoint advanced past everything captured here; the
-          // recorded structured mutations are now represented (or omitted)
-          // by the advanced baseline, so coverage tracking restarts clean.
-          state.mutatedPaths.clear();
         }
         return formatReviewResult(diff, current, since === "workspace_open" ? "workspace open" : "last shown changes");
       }
@@ -306,7 +320,7 @@ export function createReviewCheckpointManager(options: {
         throw new Error(state?.diagnostic ?? "show_changes checkpoint backend unavailable.");
       }
 
-      const baselineRef = await resolveBaselineRef(state, workspaceId, since, workSessionId);
+      const baselineRef = await resolveBaselineRef(state, workspaceId, since, workSessionId, presentationOwner);
       const baseline = (await git(state.gitRoot, ["rev-parse", "--verify", `${baselineRef}^{commit}`])).stdout.trim();
       const scope = state.workspaceRelativePath ?? ".";
       const current = await createWorkingTreeSnapshot(state.gitRoot, scope);
@@ -321,10 +335,7 @@ export function createReviewCheckpointManager(options: {
       const summary = summarizeFiles(files);
 
       if (markReviewed) {
-        await git(state.gitRoot, ["update-ref", checkpointRefForMark(state, workspaceId, since, workSessionId), current]);
-        // Checkpoint advanced (see the filesystem branch): restart coverage
-        // tracking clean.
-        state.mutatedPaths.clear();
+        await git(state.gitRoot, ["update-ref", checkpointRefForMark(state, workspaceId, since, workSessionId, presentationOwner), current]);
       }
 
       return {
@@ -414,10 +425,12 @@ export function createReviewCheckpointManager(options: {
         if (state.backend?.kind !== "filesystem") throw new Error("Filesystem snapshot cannot be committed to a Git workspace.");
         const baselines = state.filesystemBaselines!;
         if (workSessionId) baselines.sessions.set(workSessionId, snapshot);
-        else baselines.presentation = snapshot;
+        else {
+          baselines.presentation = snapshot;
+          baselines.presentations.set("default", snapshot);
+        }
         await getFsStore().saveBaselines(workspaceId, state.root, baselines);
-        // The reviewed snapshot is committed; coverage tracking restarts.
-        state.mutatedPaths.clear();
+        clearMutationScope(state, workSessionId);
         return;
       }
       if (!state?.gitRoot) {
@@ -426,8 +439,7 @@ export function createReviewCheckpointManager(options: {
       // Advance baseline to the EXACT captured snapshot (no recompute — the tree
       // may have changed between capture and persistence).
       await git(state.gitRoot, ["update-ref", sessionBaselineRef(workspaceId, workSessionId), snapshot.ref]);
-      // The reviewed snapshot is committed; coverage tracking restarts.
-      state.mutatedPaths.clear();
+      clearMutationScope(state, workSessionId);
     },
 
     async awaitWorkspaceReady({ workspaceId, root }) {
@@ -453,23 +465,27 @@ export function createReviewCheckpointManager(options: {
       await getFsStore().releaseWorkSessionBaseline(workspaceId, workSessionId);
     },
 
-    async recordMutations({ workspaceId, root, paths }) {
+    async recordMutations({ workspaceId, root, paths, workSessionId }) {
       // The workspace may legitimately receive mutations before its first
       // checkpoint operation (initializeWorkspace only runs lazily), so await
       // initialization instead of silently dropping the record.
       const state = await ensureInitialized(workspaceId, root);
+      const ledger = workSessionId ? mutationLedgerForSession(state, workSessionId) : state.unscopedReviewMutations;
       for (const path of paths) {
         const rel = workspaceRelativePath(root, path);
         // Undefined = path escapes the workspace root; that is a policy/
         // confinement failure handled by the mutation tools, not a coverage
         // entry — recording it here would make every review look incomplete.
-        if (rel) state.mutatedPaths.set(rel, rel);
+        if (rel) ledger.set(rel, rel);
       }
     },
 
-    async checkpointCoverage({ workspaceId, root }): Promise<CheckpointCoverage> {
+    async checkpointCoverage({ workspaceId, root, workSessionId }): Promise<CheckpointCoverage> {
       const state = await ensureInitialized(workspaceId, root);
-      const paths = [...state.mutatedPaths.keys()];
+      const paths = [...new Set([
+        ...state.unscopedReviewMutations.keys(),
+        ...(workSessionId ? state.reviewMutationsByWorkSession.get(workSessionId)?.keys() ?? [] : []),
+      ])];
       if (paths.length === 0) {
         return { uncoveredPaths: [], reasons: [], backend: state.backend?.kind ?? "filesystem" };
       }
@@ -499,9 +515,9 @@ export function createReviewCheckpointManager(options: {
       return classifyFilesystemCoverage(paths, options.excludedDirectories);
     },
 
-    async clearRecordedMutations({ workspaceId }) {
+    async clearRecordedMutations({ workspaceId, workSessionId }) {
       const state = states.get(workspaceId);
-      if (state) state.mutatedPaths.clear();
+      if (state) clearMutationScope(state, workSessionId);
     },
   };
 }
@@ -606,11 +622,11 @@ export class FilesystemCheckpointBackend implements CheckpointBackend {
     }
   }
 
-  async loadBaselines(workspaceId: string): Promise<{ root: string; open: WorkspaceSnapshot; presentation: WorkspaceSnapshot; legacy: WorkspaceSnapshot; sessions: Record<string, WorkspaceSnapshot> } | undefined> {
+  async loadBaselines(workspaceId: string): Promise<{ root: string; open: WorkspaceSnapshot; presentation: WorkspaceSnapshot; legacy: WorkspaceSnapshot; sessions: Record<string, WorkspaceSnapshot>; presentations?: Record<string, WorkspaceSnapshot> } | undefined> {
     return this.store.loadBaselines(workspaceId);
   }
 
-  async saveBaselines(workspaceId: string, root: string, baselines: { open: WorkspaceSnapshot; presentation: WorkspaceSnapshot; legacy: WorkspaceSnapshot; sessions: Map<string, WorkspaceSnapshot> }): Promise<void> {
+  async saveBaselines(workspaceId: string, root: string, baselines: { open: WorkspaceSnapshot; presentation: WorkspaceSnapshot; legacy: WorkspaceSnapshot; sessions: Map<string, WorkspaceSnapshot>; presentations?: Map<string, WorkspaceSnapshot> }): Promise<void> {
     return this.store.saveBaselines(workspaceId, root, baselines);
   }
 
@@ -720,11 +736,19 @@ function reviewRefs(workspaceId: string): Pick<WorkspaceReviewState, "openRef" |
   };
 }
 
+function presentationRefForOwner(state: WorkspaceReviewState, workspaceId: string, ownerId: string): string {
+  if (ownerId === "default") return state.presentationRef;
+  const workspaceSegment = safeWorkspaceRefSegment(workspaceId);
+  const ownerSegment = createHash("sha256").update(ownerId).digest("hex").slice(0, 32);
+  return `refs/kontrol/presentation/${workspaceSegment}/owners/${ownerSegment}`;
+}
+
 async function resolveBaselineRef(
   state: WorkspaceReviewState,
   workspaceId: string,
   since: ReviewSince,
   workSessionId: string | undefined,
+  presentationOwnerId: string,
 ): Promise<string> {
   if (since === "workspace_open") return state.openRef;
   if (since === "work_session" || since === "last_review") {
@@ -732,7 +756,9 @@ async function resolveBaselineRef(
     await ensureRef(state.gitRoot!, ref, state.openRef);
     return ref;
   }
-  return state.presentationRef;
+  const ref = presentationRefForOwner(state, workspaceId, presentationOwnerId);
+  await ensureRef(state.gitRoot!, ref, state.openRef);
+  return ref;
 }
 
 function checkpointRefForMark(
@@ -740,9 +766,24 @@ function checkpointRefForMark(
   workspaceId: string,
   since: ReviewSince,
   workSessionId: string | undefined,
+  presentationOwnerId: string,
 ): string {
   if (since === "work_session" || since === "last_review") return sessionBaselineRef(workspaceId, workSessionId);
-  return state.presentationRef;
+  return presentationRefForOwner(state, workspaceId, presentationOwnerId);
+}
+
+function mutationLedgerForSession(state: WorkspaceReviewStateWithInit, workSessionId: string): Map<string, string> {
+  let ledger = state.reviewMutationsByWorkSession.get(workSessionId);
+  if (!ledger) {
+    ledger = new Map();
+    state.reviewMutationsByWorkSession.set(workSessionId, ledger);
+  }
+  return ledger;
+}
+
+function clearMutationScope(state: WorkspaceReviewStateWithInit, workSessionId: string | undefined): void {
+  if (workSessionId) state.reviewMutationsByWorkSession.delete(workSessionId);
+  else state.unscopedReviewMutations.clear();
 }
 
 function sessionBaselineRef(workspaceId: string, workSessionId: string | undefined): string {

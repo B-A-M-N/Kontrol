@@ -30,6 +30,7 @@ import { signWorkerToken, TOKEN_TTL_MS } from "./lib/acp-worker-token.mjs";
 import { clearAgentIdentity, identityHeaders, loadAgentIdentity, saveAgentIdentity } from "./lib/acp-agent-identity.mjs";
 import { readJsonBody, truncateUtf8Tail, writeAdapterError } from "./lib/adapter-http.mjs";
 import { adapterStatePath, atomicWriteJson, processStartToken, reconcileOwnedProcesses, terminateProcessGroup } from "./lib/managed-agent-process.mjs";
+import { applyWorkspaceLeaseRenewal, workspaceLeaseDeadline, workspaceLeaseDeadlineReached } from "./lib/workspace-lease.mjs";
 
 const KONTROL_ACP_URL = process.env.KONTROL_ACP_URL || "http://127.0.0.1:7676/acp";
 const AGENT_SECRET = process.env.KONTROL_ACP_AGENT_SECRET;
@@ -287,6 +288,9 @@ async function handleRunRequest(req, res, body) {
     mode,
     token,
     workspaceLeaseNonce: body.workspace_lease_nonce,
+    workspaceLeaseExpiresAt: body.workspace_lease_expires_at,
+    workspaceLeaseDeadlineAt: workspaceLeaseDeadline(body.workspace_lease_expires_at),
+    attemptNumber: body.attempt_number,
     startedAt: Date.now(),
     finalized: false,
     stdout: "",
@@ -325,6 +329,12 @@ async function handleRunRequest(req, res, body) {
       mode: mode || "async",
       smoke_test: true,
       agent_bin: resolveAgentBin(),
+    });
+  }
+
+  if (workSessionId && (!run.workspaceLeaseNonce || workspaceLeaseDeadlineReached(run))) {
+    return writeJson(res, 409, {
+      error: { code: "workspace_lease_lost", message: "A live workspace lease nonce and expiry are required before a worker can start." },
     });
   }
 
@@ -413,6 +423,11 @@ async function handleRunRequest(req, res, body) {
         }
       }
     }, RUN_HEARTBEAT_MS);
+    const leaseWatchdogTimer = setInterval(() => {
+      if (workspaceLeaseDeadlineReached(run) && !run.finalized && !run.terminating) {
+        void terminateRun(run, "workspace lease renewal deadline elapsed", "failed");
+      }
+    }, 1_000).unref?.();
     const stopHeartbeat = () => clearInterval(heartbeatTimer);
 
     child.on("spawn", () => {
@@ -423,6 +438,7 @@ async function handleRunRequest(req, res, body) {
     child.on("error", (err) => {
       console.error(`[run ${run.remoteRunId}] spawn error:`, err.message);
       stopHeartbeat();
+      clearInterval(leaseWatchdogTimer);
       if (workSessionId && activeBySession.get(workSessionId) === run) activeBySession.delete(workSessionId);
       ownedProcesses.delete(run.remoteRunId);
       void saveOwnedProcesses().catch((error) => console.warn(`[adapter] failed to persist child ownership cleanup: ${error.message}`));
@@ -431,6 +447,7 @@ async function handleRunRequest(req, res, body) {
 
     child.on("exit", (code, signal) => {
       stopHeartbeat();
+      clearInterval(leaseWatchdogTimer);
       activeProcesses.delete(child.pid);
       ownedProcesses.delete(run.remoteRunId);
       void saveOwnedProcesses().catch((error) => console.warn(`[adapter] failed to persist child ownership cleanup: ${error.message}`));
@@ -749,6 +766,8 @@ async function reportEvent(run, type, errorMessage, details) {
   return enqueueRunEvent(run, {
     remote_run_id: run.remoteRunId,
     work_session_id: run.workSessionId,
+    attempt_number: run.attemptNumber,
+    workspace_lease_nonce: run.workspaceLeaseNonce,
     type,
     payload: {
       status: type,
@@ -770,6 +789,8 @@ export function createAdapterEvent(run, type, payload) {
     type,
     remote_run_id: run.remoteRunId,
     work_session_id: run.workSessionId,
+    attempt_number: run.attemptNumber,
+    workspace_lease_nonce: run.workspaceLeaseNonce,
     payload,
   };
 }
@@ -784,8 +805,17 @@ function enqueueRunEvent(run, event, terminal = false) {
     .catch(() => undefined)
     .then(async () => {
       await durableTerminal;
-      const success = await deliverEvent(run.devRunId, event);
-      if (!success) {
+      const deliveryResult = await deliverEvent(run.devRunId, event, run);
+      if (deliveryResult.leaseLost) {
+        pendingEventSpool.delete(event.event_id);
+        if (terminal) pendingTerminalSpool.delete(run.devRunId);
+        await saveEventSpool();
+        await saveTerminalSpool();
+        scheduleLeaseLossTermination(run);
+        console.error(`[run ${run.remoteRunId}] Kontrol rejected its workspace lease`);
+        return false;
+      }
+      if (!deliveryResult.acknowledged) {
         console.error(`[run ${run.remoteRunId}] failed to report ${event.type}`);
         return false;
       }
@@ -848,29 +878,68 @@ function spoolRunEvent(runId, event) {
   return saveEventSpool();
 }
 
-async function deliverEvent(runId, event) {
-  return withRetry(() => fetch(`${KONTROL_ACP_URL}/runs/${runId}/events`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", authorization: `Bearer ${AGENT_SECRET}`, ...identityHeaders(agentIdentity) },
-    body: JSON.stringify(event),
-  }), { retries: 3, backoff: 250 });
+async function deliverEvent(runId, event, run) {
+  for (let attempt = 0; attempt <= 3; attempt += 1) {
+    try {
+      const response = await fetch(`${KONTROL_ACP_URL}/runs/${runId}/events`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", authorization: `Bearer ${AGENT_SECRET}`, ...identityHeaders(agentIdentity) },
+        body: JSON.stringify(event),
+      });
+      const body = await response.json().catch(() => ({}));
+      if (response.ok) {
+        if (
+          run?.workSessionId &&
+          (event.type === "started" || event.type === "heartbeat") &&
+          !applyWorkspaceLeaseRenewal(run, body)
+        ) return { acknowledged: false, leaseLost: true };
+        return { acknowledged: true, leaseLost: false };
+      }
+      if (response.status === 409 && body?.error?.code === "workspace_lease_lost") {
+        return { acknowledged: false, leaseLost: true };
+      }
+    } catch { /* retry transient delivery failures until the local deadline */ }
+    if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
+  }
+  return { acknowledged: false, leaseLost: false };
+}
+
+function scheduleLeaseLossTermination(run) {
+  if (run.leaseLossHandled || run.finalized || run.terminating) return;
+  run.leaseLossHandled = true;
+  // Let the ordered delivery settle before finalizeRun waits on the same queue.
+  setTimeout(() => {
+    if (!run.finalized && !run.terminating) {
+      void terminateRun(run, "Kontrol rejected or stopped acknowledging the workspace lease", "failed");
+    }
+  }, 0).unref?.();
 }
 
 async function flushEventSpools() {
   const entries = [...pendingEventSpool.values()].sort((a, b) => a.event_sequence - b.event_sequence);
   for (const entry of entries) {
-    if (await deliverEvent(entry.runId, entry)) {
+    const delivery = await deliverEvent(entry.runId, entry);
+    if (delivery.acknowledged || delivery.leaseLost) {
       pendingEventSpool.delete(entry.event_id);
       await saveEventSpool();
+      if (delivery.leaseLost) {
+        const activeRun = [...activeProcesses.values()].find(({ run }) => run.devRunId === entry.runId)?.run;
+        if (activeRun) scheduleLeaseLossTermination(activeRun);
+      }
     }
   }
   // Terminal delivery is a strict last boundary. If telemetry is still
   // pending for a run, leave its terminal event spooled for the next cycle.
   for (const [runId, entry] of [...pendingTerminalSpool]) {
     if ([...pendingEventSpool.values()].some((event) => event.runId === runId)) continue;
-    if (await deliverEvent(runId, entry.payload)) {
+    const delivery = await deliverEvent(runId, entry.payload);
+    if (delivery.acknowledged || delivery.leaseLost) {
       pendingTerminalSpool.delete(runId);
       await saveTerminalSpool();
+      if (delivery.leaseLost) {
+        const activeRun = [...activeProcesses.values()].find(({ run }) => run.devRunId === runId)?.run;
+        if (activeRun) scheduleLeaseLossTermination(activeRun);
+      }
     }
   }
 }

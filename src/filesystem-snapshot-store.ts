@@ -200,6 +200,7 @@ interface LoadBaselineResult {
     presentation: WorkspaceSnapshot;
     legacy: WorkspaceSnapshot;
     sessions: Record<string, WorkspaceSnapshot>;
+    presentations?: Record<string, WorkspaceSnapshot>;
   };
   corrupt?: boolean;
 }
@@ -726,7 +727,7 @@ export class FilesystemSnapshotStore {
 
 
   /** Load persisted baselines; distinguishes missing vs corrupt. */
-  async loadBaselines(workspaceId: string): Promise<{ root: string; open: WorkspaceSnapshot; presentation: WorkspaceSnapshot; legacy: WorkspaceSnapshot; sessions: Record<string, WorkspaceSnapshot> } | undefined> {
+  async loadBaselines(workspaceId: string): Promise<{ root: string; open: WorkspaceSnapshot; presentation: WorkspaceSnapshot; legacy: WorkspaceSnapshot; sessions: Record<string, WorkspaceSnapshot>; presentations?: Record<string, WorkspaceSnapshot> } | undefined> {
     const result = await this.loadBaselinesWithDiagnostic(workspaceId);
     return result.baselines;
   }
@@ -749,7 +750,7 @@ export class FilesystemSnapshotStore {
       await this.recordCorruption(`baseline:${workspaceId}`, "invalid JSON in baseline file");
       return { corrupt: true };
     }
-    const obj = value as { root?: string; open?: WorkspaceSnapshot; presentation?: WorkspaceSnapshot; legacy?: WorkspaceSnapshot; sessions?: Record<string, WorkspaceSnapshot> };
+    const obj = value as { root?: string; open?: WorkspaceSnapshot; presentation?: WorkspaceSnapshot; legacy?: WorkspaceSnapshot; sessions?: Record<string, WorkspaceSnapshot>; presentations?: Record<string, WorkspaceSnapshot> };
     if (!obj || typeof obj !== "object") {
       await this.recordCorruption(`baseline:${workspaceId}`, "baseline file is not an object");
       return { corrupt: true };
@@ -758,14 +759,20 @@ export class FilesystemSnapshotStore {
       await this.recordCorruption(`baseline:${workspaceId}`, "baseline file has an invalid structure");
       return { corrupt: true };
     }
-    return { baselines: { root: obj.root, open: obj.open, presentation: obj.presentation, legacy: obj.legacy, sessions: obj.sessions } };
+    if (obj.presentations !== undefined && (!obj.presentations || typeof obj.presentations !== "object" || Object.values(obj.presentations).some((snapshot) => !snapshot || snapshot.kind !== "filesystem"))) {
+      await this.recordCorruption(`baseline:${workspaceId}`, "baseline file has invalid presentation snapshots");
+      return { corrupt: true };
+    }
+    return { baselines: { root: obj.root, open: obj.open, presentation: obj.presentation, legacy: obj.legacy, sessions: obj.sessions, presentations: obj.presentations } };
   }
 
   /** Atomically persist baselines (tmp + fsync + rename). */
-  async saveBaselines(workspaceId: string, root: string, baselines: { open: WorkspaceSnapshot; presentation: WorkspaceSnapshot; legacy: WorkspaceSnapshot; sessions: Map<string, WorkspaceSnapshot> }): Promise<void> {
+  async saveBaselines(workspaceId: string, root: string, baselines: { open: WorkspaceSnapshot; presentation: WorkspaceSnapshot; legacy: WorkspaceSnapshot; sessions: Map<string, WorkspaceSnapshot>; presentations?: Map<string, WorkspaceSnapshot> }): Promise<void> {
     await mkdir(join(this.storeRoot, "baselines"), { recursive: true, mode: 0o700 });
     const sessions = Object.fromEntries([...baselines.sessions.entries()].sort(([left], [right]) => left.localeCompare(right)));
-    const serialized = JSON.stringify({ root: resolve(root), open: baselines.open, presentation: baselines.presentation, legacy: baselines.legacy, sessions });
+    const presentations = Object.fromEntries([...(baselines.presentations ?? new Map([["default", baselines.presentation]])).entries()].sort(([left], [right]) => left.localeCompare(right)));
+    const presentation = presentations.default ?? baselines.presentation;
+    const serialized = JSON.stringify({ root: resolve(root), open: baselines.open, presentation, legacy: baselines.legacy, sessions, presentations });
     const temp = await this.stageBytes(Buffer.from(serialized, "utf8"));
     const target = this.baselinePath(workspaceId);
     await rename(temp, target);
@@ -778,7 +785,7 @@ export class FilesystemSnapshotStore {
     if (!baselines) return;
     const sessions = new Map(Object.entries(baselines.sessions));
     sessions.delete(workSessionId);
-    await this.saveBaselines(workspaceId, baselines.root, { open: baselines.open, presentation: baselines.presentation, legacy: baselines.legacy, sessions });
+    await this.saveBaselines(workspaceId, baselines.root, { open: baselines.open, presentation: baselines.presentation, legacy: baselines.legacy, sessions, presentations: new Map(Object.entries(baselines.presentations ?? { default: baselines.presentation })) });
   }
 
   /** Atomically drop session pins whose keys are no longer nonterminal sessions. */
@@ -795,7 +802,7 @@ export class FilesystemSnapshotStore {
       }
     }
     if (dropped > 0) {
-      await this.saveBaselines(workspaceId, baselines.root, { open: baselines.open, presentation: baselines.presentation, legacy: baselines.legacy, sessions });
+      await this.saveBaselines(workspaceId, baselines.root, { open: baselines.open, presentation: baselines.presentation, legacy: baselines.legacy, sessions, presentations: new Map(Object.entries(baselines.presentations ?? { default: baselines.presentation })) });
     }
     return { dropped };
   }
@@ -890,10 +897,15 @@ export class FilesystemSnapshotStore {
       } catch {
         continue;
       }
-      const obj = parsed as { open?: WorkspaceSnapshot; presentation?: WorkspaceSnapshot; legacy?: WorkspaceSnapshot; sessions?: Record<string, WorkspaceSnapshot> };
+      const obj = parsed as { open?: WorkspaceSnapshot; presentation?: WorkspaceSnapshot; legacy?: WorkspaceSnapshot; sessions?: Record<string, WorkspaceSnapshot>; presentations?: Record<string, WorkspaceSnapshot> };
       for (const key of ["open", "presentation", "legacy"] as const) {
         const snap = obj[key];
         if (snap && snap.kind === "filesystem" && snap.ref) strong.add(snap.ref);
+      }
+      if (obj.presentations && typeof obj.presentations === "object") {
+        for (const snapshot of Object.values(obj.presentations)) {
+          if (snapshot && snapshot.kind === "filesystem" && snapshot.ref) strong.add(snapshot.ref);
+        }
       }
       if (obj.sessions && typeof obj.sessions === "object") {
         for (const sref of Object.values(obj.sessions)) {

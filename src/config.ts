@@ -36,6 +36,9 @@ export interface ServerConfig {
   workspaceAppSmokeEnabled: boolean;
   stateDir: string;
   worktreeRoot: string;
+  managedWorktreeProjectLimit: number;
+  managedWorktreeGlobalLimit: number;
+  managedWorktreeRetentionMs: number;
   skillsEnabled: boolean;
   skillPaths: string[];
   agentDir: string;
@@ -564,6 +567,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     workspaceAppSmokeEnabled: env.KONTROL_DEV_WORKSPACE_APP_SMOKE === "1",
     stateDir: resolve(expandHomePath(env.KONTROL_STATE_DIR ?? files.config.stateDir ?? defaultStateDir())),
     worktreeRoot: resolve(expandHomePath(env.KONTROL_WORKTREE_ROOT ?? files.config.worktreeRoot ?? defaultWorktreeRoot())),
+    managedWorktreeProjectLimit: parsePositiveInteger(env.KONTROL_MANAGED_WORKTREE_PROJECT_LIMIT, 8, "KONTROL_MANAGED_WORKTREE_PROJECT_LIMIT"),
+    managedWorktreeGlobalLimit: parsePositiveInteger(env.KONTROL_MANAGED_WORKTREE_GLOBAL_LIMIT, 32, "KONTROL_MANAGED_WORKTREE_GLOBAL_LIMIT"),
+    managedWorktreeRetentionMs: parsePositiveInteger(env.KONTROL_MANAGED_WORKTREE_RETENTION_MS, 7 * 24 * 60 * 60_000, "KONTROL_MANAGED_WORKTREE_RETENTION_MS"),
     skillsEnabled: env.KONTROL_SKILLS === undefined ? true : parseBoolean(env.KONTROL_SKILLS),
     skillPaths: parsePathList(env.KONTROL_SKILL_PATHS),
     agentDir: resolve(expandHomePath(env.KONTROL_AGENT_DIR ?? files.config.agentDir ?? defaultAgentDir())),

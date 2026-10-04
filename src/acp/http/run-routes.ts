@@ -99,7 +99,14 @@ export function registerRunRoutes(
         if (createdSession) workSessions.updateStatus(session.id, "cancelled");
         return;
       }
-      const workspaceLeaseNonce = workSessions.getWorkspaceLeaseForSession(session.id)?.leaseNonce;
+      const workspaceLease = workSessions.getWorkspaceLeaseForSession(session.id);
+      if (!workspaceLease || Date.parse(workspaceLease.expiresAt) <= Date.now()) {
+        if (createdSession) workSessions.updateStatus(session.id, "cancelled");
+        res.status(409).json({ error: { code: "workspace_lease_lost", message: "Workspace lease was not active at dispatch." } });
+        return;
+      }
+      const workspaceLeaseNonce = workspaceLease.leaseNonce;
+      const workspaceLeaseExpiresAt = workspaceLease.expiresAt;
 
       const run = agentRegistry.createRun({ agentName: agent_name, agentId: peer.id, workspaceSessionId: session.workspaceSessionId, workSessionId: session.id, inputPreview: taskText.slice(0, 500), webhookUrl: webhook_url, status: "running" });
 
@@ -117,7 +124,9 @@ export function registerRunRoutes(
             workspace_root: workspaceRoot,
             parent_run_id: run.runId,
             agent_id: peer.id,
+            attempt_number: run.attemptNumber ?? 1,
             workspace_lease_nonce: workspaceLeaseNonce,
+            workspace_lease_expires_at: workspaceLeaseExpiresAt,
             webhook_url,
           },
           timeoutMs: getAcpTimeout(),

@@ -94,14 +94,6 @@ export function makeRunSupport(ctx: AcpContext) {
     workspaceRoot: string,
     workSessionId: string,
   ): Promise<boolean> {
-    let workspaceMode = "checkout";
-    try {
-      workspaceMode = workspaces.getWorkspace(workspaceId).mode;
-    } catch {
-      workspaceMode = "checkout";
-    }
-    if (workspaceMode !== "checkout") return true;
-
     let canonicalRoot: string;
     try {
       canonicalRoot = await realpath(workspaceRoot);
@@ -115,6 +107,8 @@ export function makeRunSupport(ctx: AcpContext) {
       return false;
     }
 
+    // Every worker-owned filesystem root gets one mutation lease. Separate
+    // worktrees still run in parallel because their canonical roots differ.
     const lease = workSessions.acquireWorkspaceLease({
       canonicalRoot,
       workspaceSessionId: workspaceId,

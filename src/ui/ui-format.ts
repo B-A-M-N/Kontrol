@@ -9,6 +9,7 @@ export function humanizeStatus(status: string): string {
     review_in_progress: "In review",
     changes_requested: "Changes requested",
     continuation_queued: "Resume queued",
+    continuation_attention_required: "Resume needs attention",
     awaiting_resume: "Awaiting resume",
     resuming: "Resuming",
     approved: "Approved",

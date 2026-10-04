@@ -38,10 +38,11 @@ export interface MaintenanceDeps {
     reconcile(opts: { limit: number }): { pendingSample: unknown[]; pendingHasMore: boolean; deletedCompleted: number };
   };
   reviewCheckpoints: Pick<ReviewCheckpointManager, "getSnapshotStore">;
+  managedWorktreeGc?: () => Promise<{ removed: number; retained: number; failed: number }>;
 }
 
 export function createMaintenanceCoordinator(deps: MaintenanceDeps) {
-  const { config, db, workSessions, approvalRequests, eventStore, mutationReceipts, reviewCheckpoints } = deps;
+  const { config, db, workSessions, approvalRequests, eventStore, mutationReceipts, reviewCheckpoints, managedWorktreeGc } = deps;
   const reportMaintenanceFailure = (scope: string, error: unknown, fields: Record<string, unknown> = {}) => {
     const detail = error instanceof Error ? error.message : String(error);
     logEvent(config.logging, "error", "maintenance_failure", { scope, detail, ...fields });
@@ -129,12 +130,12 @@ export function createMaintenanceCoordinator(deps: MaintenanceDeps) {
       ).all() as Array<{ work_session_id: string; status: string; wsid: string }>;
       const nonterminalByWorkspace = new Map<string, Set<string>>();
       for (const row of rows) {
-        if (row.status && terminalWorkSessionStatuses.has(row.status)) continue;
         let set = nonterminalByWorkspace.get(row.wsid);
         if (!set) {
           set = new Set();
           nonterminalByWorkspace.set(row.wsid, set);
         }
+        if (row.status && terminalWorkSessionStatuses.has(row.status)) continue;
         set.add(row.work_session_id);
       }
       for (const [workspaceId, nonterminal] of nonterminalByWorkspace) {
@@ -159,6 +160,7 @@ export function createMaintenanceCoordinator(deps: MaintenanceDeps) {
     let approvalExpiryDone = false;
     let mutationReceiptReconciliationDone = false;
     let snapshotGcDone = false;
+    let managedWorktreeGcDone = !managedWorktreeGc;
 
     const finish = (backlog: boolean): void => {
       const durationMs = Math.round(performance.now() - startedAt);
@@ -268,6 +270,25 @@ export function createMaintenanceCoordinator(deps: MaintenanceDeps) {
           // Once a full GC pass completes, drop stale session baseline pins so
           // the blobs they rooted become reclaimable.
           if (!wasDone && snapshotGcDone) await pruneStaleSessionBaselines();
+          setImmediate(step);
+          return;
+        }
+
+        if (!managedWorktreeGcDone) {
+          // The registry examines at most one expired retired worktree per
+          // cycle. Dirty/divergent worktrees stay registered and visible.
+          managedWorktreeGcDone = true;
+          try {
+            const result = await managedWorktreeGc!();
+            if (result.failed > 0) {
+              const detail = `${result.failed} managed worktree cleanup operation(s) failed`;
+              maintenanceStats.lastError = detail;
+              reportMaintenanceFailure("managed_worktree_gc", detail, result);
+            }
+          } catch (error) {
+            maintenanceStats.lastError = error instanceof Error ? error.message : String(error);
+            reportMaintenanceFailure("managed_worktree_gc", error);
+          }
           setImmediate(step);
           return;
         }

@@ -85,7 +85,8 @@ assert.doesNotMatch(serviceSource, /node --import tsx|src\/config\.ts|read -r .*
 assert.doesNotMatch(serviceScript, /ExecStart=.*start-all\.sh/);
 assert.doesNotMatch(script, /mcp\.extra-headers.*Authorization/);
 assert.doesNotMatch(script, /mcp\.discovery-extra-headers.*Authorization/);
-assert.match(script, /node scripts\/probe-workspace-app\.mjs --url/);
+assert.match(script, /WORKSPACE_APP_PROBE_ARGS=\(--url/);
+assert.match(script, /node scripts\/probe-workspace-app\.mjs "\$\{WORKSPACE_APP_PROBE_ARGS\[@\]\}"/);
 const readinessProbe = readFileSync("scripts/probe-kontrol-readiness.mjs", "utf8");
 assert.match(readinessProbe, /await jsonOrText\(reviewerReadiness\)/, "reviewer readiness must await the async body");
 assert.match(readinessProbe, /REQUIRED_INSPECTION_TOOLS/, "readiness must use the canonical eight-tool registry");

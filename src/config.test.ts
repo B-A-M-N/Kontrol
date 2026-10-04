@@ -109,6 +109,18 @@ assert.equal(loadConfig(baseEnv).mcpSseHeartbeatMs, 15_000);
 assert.equal(loadConfig(baseEnv).mcpExecutionTimeoutMs, 30 * 60_000);
 assert.equal(loadConfig(baseEnv).maintenanceIntervalMs, 5 * 60_000);
 assert.equal(loadConfig(baseEnv).maintenanceBudgetMs, 250);
+assert.equal(loadConfig(baseEnv).managedWorktreeProjectLimit, 8);
+assert.equal(loadConfig(baseEnv).managedWorktreeGlobalLimit, 32);
+assert.equal(loadConfig(baseEnv).managedWorktreeRetentionMs, 7 * 24 * 60 * 60_000);
+const managedWorktreeConfig = loadConfig({
+  ...baseEnv,
+  KONTROL_MANAGED_WORKTREE_PROJECT_LIMIT: "3",
+  KONTROL_MANAGED_WORKTREE_GLOBAL_LIMIT: "12",
+  KONTROL_MANAGED_WORKTREE_RETENTION_MS: "456",
+});
+assert.equal(managedWorktreeConfig.managedWorktreeProjectLimit, 3);
+assert.equal(managedWorktreeConfig.managedWorktreeGlobalLimit, 12);
+assert.equal(managedWorktreeConfig.managedWorktreeRetentionMs, 456);
 assert.equal(loadConfig(baseEnv).integrityIntervalMs, 30 * 60_000);
 assert.equal(loadConfig(baseEnv).integrityDeadlineMs, 10_000);
 assert.equal(loadConfig(baseEnv).policyApprovalTimeoutMs, 24 * 60 * 60_000);

@@ -1,4 +1,4 @@
-import { eq, and, desc } from "drizzle-orm";
+import { eq, and, desc, lt, ne, or, sql } from "drizzle-orm";
 import { createHash } from "node:crypto";
 import { openDatabase, type DatabaseHandle } from "./db/client.js";
 import {
@@ -19,8 +19,34 @@ export interface WorkspaceSession {
   baseRef?: string;
   baseSha?: string;
   managed: boolean;
+  retiredAt?: string;
   createdAt: string;
   lastUsedAt: string;
+}
+
+export interface ManagedWorktreeCursor {
+  createdAt: string;
+  id: string;
+}
+
+export interface ManagedWorktreePage {
+  worktrees: WorkspaceSession[];
+  nextCursor?: ManagedWorktreeCursor;
+}
+
+interface RawWorkspaceSessionRow {
+  id: string;
+  project_id: string | null;
+  root: string;
+  status: string;
+  mode: string;
+  source_root: string | null;
+  base_ref: string | null;
+  base_sha: string | null;
+  managed: string;
+  retired_at: string | null;
+  created_at: string;
+  last_used_at: string;
 }
 
 export interface WorkspaceStore {
@@ -38,6 +64,12 @@ export interface WorkspaceStore {
   /** P0 #4: find most recent workspace for a canonical root (durability across restarts). */
   getLatestByCanonicalRoot(root: string, mode?: WorkspaceMode): WorkspaceSession | undefined;
   listByCanonicalRoot(root: string): WorkspaceSession[];
+  countManagedWorktrees(sourceRoot?: string): number;
+  listManagedWorktrees(input?: { includeRemoved?: boolean; limit?: number; before?: ManagedWorktreeCursor }): ManagedWorktreePage;
+  listExpiredRetiredManagedWorktrees(retiredBefore: string, after?: { retiredAt: string; id: string }, limit?: number): WorkspaceSession[];
+  retireManagedWorktree(id: string, runningProcesses?: number): { retired: boolean; blockers?: { workSessions: number; pendingReviews: number; pendingApprovals: number; runningProcesses?: number }; session?: WorkspaceSession };
+  canRemoveRetiredManagedWorktree(id: string): boolean;
+  markManagedWorktreeRemoved(id: string): boolean;
   getProjectIdForSession(id: string): string | undefined;
   close?(): void;
 }
@@ -96,6 +128,7 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
         baseRef: session.baseRef ?? null,
         baseSha: session.baseSha ?? null,
         managed: String(session.managed),
+        retiredAt: null,
         createdAt: session.createdAt,
         lastUsedAt: session.lastUsedAt,
       })
@@ -122,8 +155,8 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
       .where(eq(workspaceProjects.canonicalRoot, root))
       .get();
     const condition = project
-      ? (mode ? and(eq(workspaceSessions.projectId, project.id), eq(workspaceSessions.mode, mode)) : eq(workspaceSessions.projectId, project.id))
-      : (mode ? and(eq(workspaceSessions.root, root), eq(workspaceSessions.mode, mode)) : eq(workspaceSessions.root, root));
+      ? (mode ? and(eq(workspaceSessions.projectId, project.id), eq(workspaceSessions.mode, mode), eq(workspaceSessions.status, "active")) : and(eq(workspaceSessions.projectId, project.id), eq(workspaceSessions.status, "active")))
+      : (mode ? and(eq(workspaceSessions.root, root), eq(workspaceSessions.mode, mode), eq(workspaceSessions.status, "active")) : and(eq(workspaceSessions.root, root), eq(workspaceSessions.status, "active")));
     const row = this.database.db
       .select()
       .from(workspaceSessions)
@@ -147,6 +180,150 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
       .orderBy(desc(workspaceSessions.lastUsedAt))
       .all();
     return rows.map(rowToWorkspaceSession);
+  }
+
+  countManagedWorktrees(sourceRoot?: string): number {
+    const conditions = [eq(workspaceSessions.mode, "worktree"), eq(workspaceSessions.managed, "true")];
+    if (sourceRoot) {
+      const project = this.database.db.select({ id: workspaceProjects.id })
+        .from(workspaceProjects).where(eq(workspaceProjects.canonicalRoot, sourceRoot)).get();
+      if (!project) return 0;
+      conditions.push(eq(workspaceSessions.projectId, project.id));
+    }
+    const row = this.database.db.select({ count: sql<number>`count(*)` })
+      .from(workspaceSessions)
+      .where(and(...conditions, sql`${workspaceSessions.status} != 'removed'`))
+      .get();
+    return row?.count ?? 0;
+  }
+
+  listManagedWorktrees(input: { includeRemoved?: boolean; limit?: number; before?: ManagedWorktreeCursor } = {}): ManagedWorktreePage {
+    const limit = Math.max(1, Math.min(100, Math.trunc(input.limit ?? 32)));
+    const conditions = [eq(workspaceSessions.mode, "worktree"), eq(workspaceSessions.managed, "true")];
+    if (!input.includeRemoved) conditions.push(ne(workspaceSessions.status, "removed"));
+    if (input.before) {
+      conditions.push(or(
+        lt(workspaceSessions.createdAt, input.before.createdAt),
+        and(eq(workspaceSessions.createdAt, input.before.createdAt), lt(workspaceSessions.id, input.before.id)),
+      )!);
+    }
+    const rows = this.database.db.select().from(workspaceSessions).where(and(...conditions))
+      .orderBy(desc(workspaceSessions.createdAt), desc(workspaceSessions.id)).limit(limit + 1).all();
+    const hasMore = rows.length > limit;
+    const page = hasMore ? rows.slice(0, limit) : rows;
+    const last = page.at(-1);
+    return {
+      worktrees: page.map(rowToWorkspaceSession),
+      nextCursor: hasMore && last ? { createdAt: last.createdAt, id: last.id } : undefined,
+    };
+  }
+
+  listExpiredRetiredManagedWorktrees(retiredBefore: string, after?: { retiredAt: string; id: string }, limit = 1): WorkspaceSession[] {
+    const boundedLimit = Math.max(1, Math.min(16, Math.trunc(limit)));
+    const rows = after
+      ? this.database.sqlite.prepare(`
+          select * from workspace_sessions
+           where mode = 'worktree' and managed = 'true' and status = 'retired'
+             and retired_at is not null and retired_at <= ?
+             and (retired_at > ? or (retired_at = ? and id > ?))
+           order by retired_at asc, id asc limit ?
+        `).all(retiredBefore, after.retiredAt, after.retiredAt, after.id, boundedLimit) as RawWorkspaceSessionRow[]
+      : this.database.sqlite.prepare(`
+          select * from workspace_sessions
+           where mode = 'worktree' and managed = 'true' and status = 'retired'
+             and retired_at is not null and retired_at <= ?
+           order by retired_at asc, id asc limit ?
+        `).all(retiredBefore, boundedLimit) as RawWorkspaceSessionRow[];
+    return rows.map((row) => rowToWorkspaceSession({
+      id: row.id,
+      projectId: row.project_id,
+      root: row.root,
+      status: row.status,
+      mode: row.mode,
+      sourceRoot: row.source_root,
+      baseRef: row.base_ref,
+      baseSha: row.base_sha,
+      managed: row.managed,
+      retiredAt: row.retired_at,
+      createdAt: row.created_at,
+      lastUsedAt: row.last_used_at,
+    } as WorkspaceSessionRow));
+  }
+
+  retireManagedWorktree(id: string, runningProcesses = 0): { retired: boolean; blockers?: { workSessions: number; pendingReviews: number; pendingApprovals: number; runningProcesses?: number }; session?: WorkspaceSession } {
+    const now = new Date().toISOString();
+    const transaction = this.database.sqlite.transaction(() => {
+      const row = this.database.sqlite.prepare(`
+        select id, mode, managed, status, retired_at
+          from workspace_sessions
+         where id = ?
+      `).get(id) as { id: string; mode: string; managed: string; status: string; retired_at?: string | null } | undefined;
+      if (!row || row.mode !== "worktree" || row.managed !== "true") {
+        throw new Error(`Workspace ${id} is not a managed worktree`);
+      }
+      if (row.status !== "active") {
+        return { retired: false, session: this.getSession(id) };
+      }
+      const workSessions = (this.database.sqlite.prepare(`
+        select count(*) as count from work_sessions
+         where workspace_session_id = ?
+           and status not in ('approved', 'rejected', 'cancelled', 'failed', 'failed_protocol')
+      `).get(id) as { count: number }).count;
+      const pendingReviews = (this.database.sqlite.prepare(`
+        select count(*) as count
+          from work_session_submissions submissions
+          join work_sessions sessions on sessions.id = submissions.work_session_id
+         where sessions.workspace_session_id = ? and submissions.status = 'pending'
+      `).get(id) as { count: number }).count;
+      const pendingApprovals = (this.database.sqlite.prepare(`
+        select count(*) as count from approval_requests
+         where workspace_session_id = ? and status = 'pending'
+      `).get(id) as { count: number }).count;
+      const blockers = { workSessions, pendingReviews, pendingApprovals, ...(runningProcesses > 0 ? { runningProcesses } : {}) };
+      if (workSessions + pendingReviews + pendingApprovals + runningProcesses > 0) return { retired: false, blockers };
+      this.database.sqlite.prepare(`
+        update workspace_sessions set status = 'retired', retired_at = ?, last_used_at = ?
+         where id = ? and status = 'active'
+      `).run(now, now, id);
+      return { retired: true, session: this.getSession(id) };
+    });
+    return transaction.immediate();
+  }
+
+  markManagedWorktreeRemoved(id: string): boolean {
+    return this.database.sqlite.transaction(() => {
+      if (!this.canRemoveRetiredManagedWorktree(id)) return false;
+      const result = this.database.sqlite.prepare(`
+        update workspace_sessions set status = 'removed'
+         where id = ? and mode = 'worktree' and managed = 'true' and status = 'retired'
+      `).run(id);
+      return result.changes === 1;
+    }).immediate();
+  }
+
+  canRemoveRetiredManagedWorktree(id: string): boolean {
+    const session = this.getSession(id);
+    if (!session || session.mode !== "worktree" || !session.managed || session.status !== "retired") return false;
+    const workSessions = (this.database.sqlite.prepare(`
+      select count(*) as count from work_sessions
+       where workspace_session_id = ?
+         and status not in ('approved', 'rejected', 'cancelled', 'failed', 'failed_protocol')
+    `).get(id) as { count: number }).count;
+    const pendingReviews = (this.database.sqlite.prepare(`
+      select count(*) as count
+        from work_session_submissions submissions
+        join work_sessions sessions on sessions.id = submissions.work_session_id
+       where sessions.workspace_session_id = ? and submissions.status = 'pending'
+    `).get(id) as { count: number }).count;
+    const pendingApprovals = (this.database.sqlite.prepare(`
+      select count(*) as count from approval_requests
+       where workspace_session_id = ? and status = 'pending'
+    `).get(id) as { count: number }).count;
+    const otherActiveSession = (this.database.sqlite.prepare(`
+      select count(*) as count from workspace_sessions
+       where root = ? and id != ? and status = 'active'
+    `).get(session.root, id) as { count: number }).count;
+    return workSessions + pendingReviews + pendingApprovals + otherActiveSession === 0;
   }
 
   getProjectIdForSession(id: string): string | undefined {
@@ -228,6 +405,7 @@ function rowToWorkspaceSession(row: WorkspaceSessionRow): WorkspaceSession {
     baseRef: row.baseRef ?? undefined,
     baseSha: row.baseSha ?? undefined,
     managed: row.managed === "true",
+    retiredAt: row.retiredAt ?? undefined,
     createdAt: row.createdAt,
     lastUsedAt: row.lastUsedAt,
   };

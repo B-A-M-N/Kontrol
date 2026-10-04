@@ -11,8 +11,6 @@ const root = await mkdtemp(join(tmpdir(), "kontrol-review-checkpoints-test-"));
 
 try {
   await git(root, ["init"]);
-  await git(root, ["config", "user.email", "kontrol@example.com"]);
-  await git(root, ["config", "user.name", "Kontrol Test"]);
   await writeFile(join(root, "README.md"), "hello\n");
   await git(root, ["add", "README.md"]);
   await git(root, ["commit", "-m", "Initial commit"]);
@@ -58,6 +56,30 @@ try {
     markReviewed: true,
   });
   assert.equal(presentationOnly.summary.files, 1);
+
+  await writeFile(join(root, "README.md"), "hello\nworld\nshown but unsubmitted\nseparate transport baseline\n");
+  const ownerA = await manager.reviewChanges({
+    workspaceId: "ws_review",
+    root,
+    since: "last_shown",
+    markReviewed: true,
+    presentationOwnerId: "transport-tab-a",
+  });
+  const ownerB = await manager.reviewChanges({
+    workspaceId: "ws_review",
+    root,
+    since: "last_shown",
+    markReviewed: false,
+    presentationOwnerId: "transport-tab-b",
+  });
+  assert.equal(ownerA.summary.files, ownerB.summary.files,
+    "one Git transport's presentation baseline does not advance another's");
+  assert.equal((await manager.reviewChanges({
+    workspaceId: "ws_review",
+    root,
+    since: "last_shown",
+    presentationOwnerId: "transport-tab-a",
+  })).summary.files, 0, "the Git presentation owner sees its own advanced ref");
 
   const sessionReview = await manager.reviewChanges({
     workspaceId: "ws_review",

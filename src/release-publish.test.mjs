@@ -20,6 +20,7 @@
 // Plus one positive control: a fully qualified scenario passes the gate
 // (verify-only mode — never publishing to a real registry).
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { execFileSync, spawnSync } from "node:child_process";
 import {
   copyFileSync,
@@ -38,6 +39,11 @@ const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const tmp = mkdtempSync(join(tmpdir(), "kontrol-release-publish-"));
 const BUILD_ID = "aaaaaaaaaaaaaaaa";
 const OTHER_SHA = "ffffffffffffffffffffffffffffffffffffffff";
+const gitIdentity = {
+  name: execFileSync("git", ["config", "--get", "user.name"], { cwd: repoRoot, encoding: "utf8" }).trim(),
+  email: execFileSync("git", ["config", "--get", "user.email"], { cwd: repoRoot, encoding: "utf8" }).trim(),
+};
+if (!gitIdentity.name || !gitIdentity.email) throw new Error(`release-publish fixtures require configured Git identity in ${repoRoot}`);
 
 function runGit(cwd, ...args) {
   const options = typeof args[args.length - 1] === "object" ? args.pop() : {};
@@ -53,7 +59,8 @@ function writeCandidate(root, buildId, gitSha) {
   for (const entry of ["cli.js", "server.js", "acp-duplex.js", "acp-worker-token.mjs"]) {
     writeFileSync(join(candidate, entry), "// candidate stub\n");
   }
-  writeFileSync(join(candidate, "ui", "workspace-app.html"), "<!doctype html>\n");
+  const workspaceAppHtml = "<!doctype html>\n";
+  writeFileSync(join(candidate, "ui", "workspace-app.html"), workspaceAppHtml);
   const declared = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf8")).dependencies ?? {};
   const dependencies = Object.fromEntries(
     Object.entries(declared).map(([name, range]) => [name, range.replace(/^[~^>=\s]+/, "")]),
@@ -65,7 +72,9 @@ function writeCandidate(root, buildId, gitSha) {
     schemaVersion: 0,
     minReadableSchemaVersion: 0,
     maxReadableSchemaVersion: 0,
-    releaseFormatVersion: 1,
+    releaseFormatVersion: 4,
+    workspaceAppBuildId: createHash("sha256").update(workspaceAppHtml).digest("hex").slice(0, 12),
+    workspaceAppHistory: [],
     dependencies,
   }, null, 2)}\n`);
   return candidate;
@@ -104,8 +113,8 @@ function makeCheckout(name) {
     }
   }
   runGit(root, "init", "-q", "-b", "main");
-  runGit(root, "config", "user.email", "release-test@example.invalid");
-  runGit(root, "config", "user.name", "release-publish-test");
+  runGit(root, "config", "user.email", gitIdentity.email);
+  runGit(root, "config", "user.name", gitIdentity.name);
   writeFileSync(join(root, ".git", "info", "exclude"), "beta-qualification.json\nreleases/\n");
   runGit(root, "add", "-A");
   runGit(root, "commit", "-q", "-m", "fixture", {
@@ -113,10 +122,10 @@ function makeCheckout(name) {
       ...process.env,
       GIT_AUTHOR_DATE: "2026-01-01T00:00:00Z",
       GIT_COMMITTER_DATE: "2026-01-01T00:00:00Z",
-      GIT_AUTHOR_NAME: "fixture",
-      GIT_AUTHOR_EMAIL: "fixture@example.invalid",
-      GIT_COMMITTER_NAME: "fixture",
-      GIT_COMMITTER_EMAIL: "fixture@example.invalid",
+      GIT_AUTHOR_NAME: gitIdentity.name,
+      GIT_AUTHOR_EMAIL: gitIdentity.email,
+      GIT_COMMITTER_NAME: gitIdentity.name,
+      GIT_COMMITTER_EMAIL: gitIdentity.email,
     },
   });
   return { root, head: runGit(root, "rev-parse", "HEAD").trim() };

@@ -18,6 +18,9 @@ import {
 } from "./checkpoint-coverage.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
 
+const testGitName = execFileSync("git", ["config", "user.name"], { cwd: process.cwd(), encoding: "utf8" }).trim();
+const testGitEmail = execFileSync("git", ["config", "user.email"], { cwd: process.cwd(), encoding: "utf8" }).trim();
+
 // ── Pure classifier ──────────────────────────────────────
 
 // Only directory SEGMENTS count; a file merely NAMED like an excluded tree at
@@ -98,8 +101,8 @@ assert.match(gitCoverage.reasons[1], /git-ignored/);
   const root = mkdtempSync(join(tmpdir(), "kontrol-coverage-git-root-"));
   const run = (args: string[]) => execFileSync("git", args, { cwd: root });
   run(["init", "-q"]);
-  run(["config", "user.email", "test@kontrol.local"]);
-  run(["config", "user.name", "Kontrol Coverage Test"]);
+  run(["config", "user.email", testGitEmail]);
+  run(["config", "user.name", testGitName]);
   writeFileSync(join(root, ".gitignore"), "secret.txt\n");
   writeFileSync(join(root, "tracked.txt"), "hi\n");
   run(["add", "-A"]);

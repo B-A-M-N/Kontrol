@@ -19,6 +19,7 @@ function stubConfig(): ServerConfig {
     // serve: that work blocks the event loop, and a short deadline would time
     // out queued waiters before the test can observe them waiting.
     mcpAdmissionTimeoutMs: 10_000,
+    mcpInteractiveAdmissionTimeoutMs: 10_000,
   } as unknown as ServerConfig;
 }
 

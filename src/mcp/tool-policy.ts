@@ -34,7 +34,7 @@ export function policyFailureResponse(
   result: { allowed: boolean; approvalRequired?: boolean; approvalId?: string },
   deniedMessage: string,
   context: {
-    tool: "exec_command" | "write_stdin" | "read" | "write" | "edit" | "apply_patch" | "grep" | "glob" | "ls" | "bash";
+    tool: "exec_command" | "write_stdin" | "read" | "write" | "edit" | "apply_patch" | "grep" | "glob" | "ls" | "bash" | "git_status" | "git_log" | "git_diff" | "git_show";
     workspaceId: string;
     path?: string;
     command?: string;
@@ -110,6 +110,7 @@ export async function enforceToolPolicy(
   command: string | undefined,
   paths?: PolicyInvocation["paths"],
   approvalResumeId?: string,
+  operationContent?: unknown,
 ): Promise<{ allowed: boolean; approvalRequired?: boolean; approvalId?: string }> {
   if (workSessions && workSessionId) {
     const sessionDecision = authorizeWorkSessionAction(workSessions, {
@@ -127,12 +128,17 @@ export async function enforceToolPolicy(
     workSessionId,
     ownerContextId: workSessionId
       ? workSessions?.get(workSessionId)?.ownerContextId
-      : directPolicyPrincipal(workspaceId),
+      : mcpOwnerContextId({
+          conversationId: mcpRequestContext.getStore()?.conversationId,
+          mcpSessionId: mcpRequestContext.getStore()?.mcpSessionId,
+          principalId: mcpRequestContext.getStore()?.principalId,
+        }),
     runId,
     tool,
     path,
     paths,
     command,
+    operationContent,
     signal: mcpRequestContext.getStore()?.signal,
     mcpSessionId: mcpRequestContext.getStore()?.mcpSessionId,
     mcpRequestId: mcpRequestContext.getStore()?.mcpRequestId,

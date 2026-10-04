@@ -68,6 +68,7 @@ export interface ToolApprovalRequest {
   runId?: string;
   agentId?: string;
   approvalKey?: string;
+  operationHash?: string;
   mcpSessionId?: string;
   mcpRequestId?: string;
   waiterKey?: string;
@@ -112,6 +113,7 @@ export interface OperationResumeContent {
   approvalKey: string;
   path?: string;
   command?: string;
+  operationHash: string;
 }
 
 export interface PolicyDecision {
@@ -144,6 +146,10 @@ export interface GrantStore {
   revokeForScope(scope: ApprovalScope, scopeId: string): void;
   /** Revoke exactly one grant by its durable id. Unknown ids are a no-op. */
   revokeGrant(grantId: string): void;
+  /** Exact composite lookup; backed by the durable grant identity index. */
+  hasEffective(principalId: string, scope: ApprovalScope, scopeId: string, approvalKey: string): boolean;
+  /** Exact primary-key lookup for reviewer revocation/cache cleanup. */
+  getEffective(grantId: string): GrantRecord | undefined;
   /** All currently-effective (non-revoked, non-expired) grants. */
   listEffective(): GrantRecord[];
 }
@@ -198,6 +204,9 @@ export interface PolicyEngine {
   countLiveWaiters(approvalId: string): number;
   /** Consume a resolved one-shot operation approval exactly once. */
   consumeApprovedOperation(waiterKey: string): boolean;
+  /** Consume a direct one-shot approval only for the exact principal, owner,
+   * workspace, and complete operation. */
+  consumeApprovedDirectOperation(input: { principalId: string; workspaceId: WorkspaceId; ownerContextId: string; operationHash: string }): boolean;
   /** Recover the durable waiterKey of an explicit resume operation. The
    *  caller must present content that exactly matches the durable row; a
    *  mismatching token+content pair never adopts the original identity. */
@@ -397,7 +406,8 @@ export function createPolicyEngine(
   approvalRequests?: ApprovalRequestManager,
   options: { directReattachGraceMs?: number } = {},
 ): PolicyEngine {
-  // (principalId|scope|scopeId|approvalKey) -> true
+  // JSON tuple keys keep identity fields unambiguous even when values contain
+  // separators used by old ad hoc cache keys.
   const sessionApprovals = new Map<string, boolean>();
   const pendingApprovals = new Map<string, ToolApprovalRequest>();
   // approvalId -> set of currently attached LIVE waiter ids. A durable row
@@ -406,12 +416,14 @@ export function createPolicyEngine(
   // enforcer to detect a caller_gone outcome.
   const liveWaitersByApproval = new Map<string, Set<string>>();
   const inMemoryOneShotApprovals = new Set<string>();
+  const inMemoryDirectOneShotApprovals = new Set<string>();
 
-  // Seed memory cache from durable grants so restarts keep effective approvals.
-  if (grantStore) {
-    for (const g of grantStore.listEffective()) {
-      sessionApprovals.set(`${g.principalId}|${g.scope}|${g.scopeId}|${g.approvalKey}`, true);
-    }
+  function directOperationIdentity(input: { principalId: string; workspaceId: string; ownerContextId: string; operationHash: string }): string {
+    return JSON.stringify([input.principalId, input.workspaceId, input.ownerContextId, input.operationHash]);
+  }
+
+  function approvalIdentity(principalId: string, scope: ApprovalScope, scopeId: string, approvalKey: string): string {
+    return JSON.stringify([principalId, scope, scopeId, approvalKey]);
   }
 
   function scopeIdFor(scope: ApprovalScope, ctx: ScopeContext): string | undefined {
@@ -472,13 +484,11 @@ export function createPolicyEngine(
 
   function isApproved(principalId: string, key: string, ctx: ScopeContext): boolean {
     const wsId = ctx.workspaceId;
-    const wsKey = `${principalId}|workspace|${wsId}|${key}`;
-    if (sessionApprovals.get(wsKey) || grantStore?.listEffective().some((grant) =>
-      grant.principalId === principalId && grant.scope === "workspace" && grant.scopeId === wsId && grant.approvalKey === key)) return true;
+    const wsKey = approvalIdentity(principalId, "workspace", wsId, key);
+    if (grantStore ? grantStore.hasEffective(principalId, "workspace", wsId, key) : sessionApprovals.get(wsKey)) return true;
     if (ctx.workSessionId) {
-      const wsKey2 = `${principalId}|work_session|${ctx.workSessionId}|${key}`;
-      if (sessionApprovals.get(wsKey2) || grantStore?.listEffective().some((grant) =>
-        grant.principalId === principalId && grant.scope === "work_session" && grant.scopeId === ctx.workSessionId && grant.approvalKey === key)) return true;
+      const wsKey2 = approvalIdentity(principalId, "work_session", ctx.workSessionId, key);
+      if (grantStore ? grantStore.hasEffective(principalId, "work_session", ctx.workSessionId, key) : sessionApprovals.get(wsKey2)) return true;
     }
     return false;
   }
@@ -504,6 +514,7 @@ export function createPolicyEngine(
             runId: request.runId,
             agentId: request.agentId,
             approvalKey: request.approvalKey,
+            operationHash: request.operationHash,
             mcpSessionId: request.mcpSessionId,
             mcpRequestId: request.mcpRequestId,
             waiterKey: request.waiterKey,
@@ -542,6 +553,7 @@ export function createPolicyEngine(
             runId: request.runId,
             agentId: request.agentId,
             approvalKey: request.approvalKey,
+            operationHash: request.operationHash,
             mcpSessionId: request.mcpSessionId,
             mcpRequestId: request.mcpRequestId,
             waiterKey: request.waiterKey,
@@ -614,13 +626,9 @@ export function createPolicyEngine(
     // workspace ID but never readable as a work-session grant. Do not offer or
     // persist a grant with that ambiguous lifetime.
     if (!scopeId || (scope === "work_session" && !ctx.workSessionId)) return;
-    sessionApprovals.set(`${principalId}|${scope}|${scopeId}|${key}`, true);
+    sessionApprovals.set(approvalIdentity(principalId, scope, scopeId, key), true);
 
-    if (grantStore && !grantStore.listEffective().some((grant) =>
-      grant.principalId === principalId
-      && grant.scope === scope
-      && grant.scopeId === scopeId
-      && grant.approvalKey === key)) {
+    if (grantStore && !grantStore.hasEffective(principalId, scope, scopeId, key)) {
       const now = new Date().toISOString();
       grantStore.insert({
         id: `grant_${randomUUID()}`,
@@ -648,6 +656,7 @@ export function createPolicyEngine(
           runId: request.runId,
           agentId: request.agentId,
           approvalKey: request.approvalKey,
+          operationHash: request.operationHash,
           mcpSessionId: request.mcpSessionId,
           mcpRequestId: request.mcpRequestId,
           waiterKey: request.waiterKey,
@@ -685,6 +694,15 @@ export function createPolicyEngine(
     if (status === "approved" && resolution.scope === "once" && waiterKey && !approvalRequests) {
       inMemoryOneShotApprovals.add(waiterKey);
     }
+    if (status === "approved" && resolution.scope === "once" && !approvalRequests
+      && pending?.origin === "direct_mcp" && !pending.workSessionId && pending.ownerContextId && pending.operationHash) {
+      inMemoryDirectOneShotApprovals.add(directOperationIdentity({
+        principalId: pending.principalId,
+        workspaceId: pending.workspaceId,
+        ownerContextId: pending.ownerContextId,
+        operationHash: pending.operationHash,
+      }));
+    }
     pendingApprovals.delete(approvalId);
     // Remove the operation from the pending lookup, but retain the attached
     // live-waiter set until each waiter observes the decision and detaches in
@@ -711,6 +729,21 @@ export function createPolicyEngine(
     return false;
   }
 
+  function consumeApprovedDirectOperation(input: { principalId: string; workspaceId: WorkspaceId; ownerContextId: string; operationHash: string }): boolean {
+    if (approvalRequests?.consumeApprovedDirectOperation({
+      principalId: input.principalId,
+      workspaceSessionId: input.workspaceId,
+      ownerContextId: input.ownerContextId,
+      operationHash: input.operationHash,
+    })) return true;
+    const identity = directOperationIdentity(input);
+    if (!approvalRequests && inMemoryDirectOneShotApprovals.has(identity)) {
+      inMemoryDirectOneShotApprovals.delete(identity);
+      return true;
+    }
+    return false;
+  }
+
   /**
    * Explicit operation-resume identity: the retrying caller echoes the
    * approval id from its approval_required card plus the operation content.
@@ -732,6 +765,7 @@ export function createPolicyEngine(
     if (durable.approvalKey !== content.approvalKey) return undefined;
     if ((durable.path ?? undefined) !== (content.path ?? undefined)) return undefined;
     if ((durable.command ?? undefined) !== (content.command ?? undefined)) return undefined;
+    if (!durable.operationHash || durable.operationHash !== content.operationHash) return undefined;
     return durable.waiterKey ?? undefined;
   }
 
@@ -755,6 +789,7 @@ export function createPolicyEngine(
         runId: request.runId,
         agentId: request.agentId,
         approvalKey: request.approvalKey,
+        operationHash: request.operationHash,
         mcpSessionId: request.mcpSessionId,
         mcpRequestId: request.mcpRequestId,
         waiterKey: request.waiterKey,
@@ -785,7 +820,8 @@ export function createPolicyEngine(
 
   function revokeScope(scope: ApprovalScope, scopeId: string): void {
     for (const key of sessionApprovals.keys()) {
-      if (key.split("|", 3)[1] === scope && key.split("|", 3)[2] === scopeId) {
+      const identity = JSON.parse(key) as [string, ApprovalScope, string, string];
+      if (identity[1] === scope && identity[2] === scopeId) {
         sessionApprovals.delete(key);
       }
     }
@@ -793,10 +829,10 @@ export function createPolicyEngine(
   }
 
   function revokeGrant(grantId: string): void {
-    const grant = grantStore?.listEffective().find((candidate) => candidate.id === grantId);
+    const grant = grantStore?.getEffective(grantId);
     grantStore?.revokeGrant(grantId);
     if (grant) {
-      const key = [grant.principalId, grant.scope, grant.scopeId, grant.approvalKey].join("|");
+      const key = approvalIdentity(grant.principalId, grant.scope, grant.scopeId, grant.approvalKey);
       sessionApprovals.delete(key);
     }
   }
@@ -819,6 +855,7 @@ export function createPolicyEngine(
     getLiveWaiterState,
     countLiveWaiters,
     consumeApprovedOperation,
+    consumeApprovedDirectOperation,
     resumeOperation,
     clearPending,
     resolvePending,

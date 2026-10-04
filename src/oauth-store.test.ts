@@ -98,6 +98,9 @@ async function testDatabaseConfiguration(stateDir: string): Promise<void> {
       { version: 55, name: "submission-checkpoint-coverage" },
       { version: 56, name: "work-session-owner-context" },
       { version: 57, name: "approval-owner-context" },
+      { version: 58, name: "approval-direct-operation-hash" },
+      { version: 59, name: "durable-telemetry-ingress" },
+      { version: 60, name: "managed-worktree-retirement" },
     ]);
   } finally {
     database.close();

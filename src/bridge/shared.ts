@@ -215,7 +215,6 @@ export function requireWorkSessionRead(config: BridgeConfig, sessionId: string) 
 
 export async function acquireCheckoutModifyLease(config: BridgeConfig, workspaceSessionId: string, workSessionId: string) {
   const workspace = config.workspaces.getWorkspace(workspaceSessionId);
-  if (workspace.mode !== "checkout") return null;
   let canonicalRoot: string;
   try {
     canonicalRoot = await realpath(workspace.root);
@@ -234,7 +233,7 @@ export async function acquireCheckoutModifyLease(config: BridgeConfig, workspace
   return {
     content: [{
       type: "text" as const,
-      text: `Checkout is already controlled by work session ${lease.conflictingWorkSessionId}. Use an isolated worktree or cancel the existing session before dispatching another modifying worker.`,
+      text: `Workspace root is already controlled by work session ${lease.conflictingWorkSessionId}. Use a separate worktree or cancel the existing session before dispatching another modifying worker.`,
     }],
     structuredContent: {
       conflict: {
@@ -250,6 +249,16 @@ export async function acquireCheckoutModifyLease(config: BridgeConfig, workspace
 
 export function checkoutLeaseNonce(config: BridgeConfig, workSessionId: string): string | undefined {
   return config.workSessions.getWorkspaceLeaseForSession(workSessionId)?.leaseNonce;
+}
+
+export function checkoutLeaseMetadata(config: BridgeConfig, workSessionId: string): {
+  workspaceLeaseNonce?: string;
+  workspaceLeaseExpiresAt?: string;
+} {
+  const lease = config.workSessions.getWorkspaceLeaseForSession(workSessionId);
+  return lease
+    ? { workspaceLeaseNonce: lease.leaseNonce, workspaceLeaseExpiresAt: lease.expiresAt }
+    : {};
 }
 
 export function parsePatchFiles(patch: string): Array<{ path: string; operation: "add" | "update" | "delete"; additions: number; removals: number }> {

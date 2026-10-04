@@ -519,6 +519,15 @@ export class ProcessSessionManager {
     };
   }
 
+  /** Number of live child processes fenced to one persisted workspace. */
+  countRunningForWorkspace(workspaceId: string): number {
+    let count = 0;
+    for (const session of this.sessions.values()) {
+      if (session.running && session.workspaceId === workspaceId) count++;
+    }
+    return count;
+  }
+
   async shutdown(timeoutMs = 2_000): Promise<void> {
     clearInterval(this.reaperTimer);
     const running = [...this.sessions.values()].filter((session) => session.running);

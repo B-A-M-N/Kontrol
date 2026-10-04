@@ -106,6 +106,15 @@ export function registerEventRoutes(
           remoteRunId: body.remote_run_id,
         },
       }, { publish: false });
+      if (body.type === "started" || body.type === "heartbeat") {
+        res.status(409).json({
+          error: {
+            code: "workspace_lease_lost",
+            message: "This worker attempt no longer owns the active checkout lease.",
+          },
+        });
+        return;
+      }
       res.status(202).json({ run_id: run.runId, status: run.status, ignored: true, stale_attempt: true });
       return;
     }
@@ -114,6 +123,43 @@ export function registerEventRoutes(
     if (body.remote_run_id && run.remoteRunId && body.remote_run_id !== run.remoteRunId) {
       res.status(409).json({ error: { code: "conflict", message: `remote_run_id does not match the attached execution attempt (${run.remoteRunId})` } });
       return;
+    }
+
+    // Heartbeats are an acknowledged fencing protocol. The adapter must prove
+    // possession of the exact nonce issued for this dispatch; Kontrol must not
+    // look up and renew its own current token on the adapter's behalf.
+    let workspaceLeaseExpiresAt: string | undefined;
+    if ((body.type === "started" || body.type === "heartbeat") && run.workSessionId) {
+      if (!body.workspace_lease_nonce) {
+        res.status(409).json({
+          error: {
+            code: "workspace_lease_lost",
+            message: "Workspace lease renewal requires the fencing nonce issued to this worker attempt.",
+          },
+        });
+        return;
+      }
+      const renewed = workSessions.renewWorkspaceLeaseForSession(
+        run.workSessionId,
+        undefined,
+        body.workspace_lease_nonce,
+      );
+      const lease = workSessions.getWorkspaceLeaseForSession(run.workSessionId);
+      if (
+        renewed !== 1 ||
+        !lease ||
+        lease.leaseNonce !== body.workspace_lease_nonce ||
+        lease.workspaceSessionId !== run.workspaceSessionId
+      ) {
+        res.status(409).json({
+          error: {
+            code: "workspace_lease_lost",
+            message: "Workspace lease is missing, expired, or belongs to a newer worker attempt.",
+          },
+        });
+        return;
+      }
+      workspaceLeaseExpiresAt = lease.expiresAt;
     }
 
     if (body.event_id && eventStore) {
@@ -262,16 +308,6 @@ export function registerEventRoutes(
         : {}),
     });
 
-    // Renew the CHECKOUT lease from the same worker heartbeat. The worker lease
-    // above is short (30s) but the checkout (workspace) lease defaults to 1h and
-    // was previously renewed only at acquire time — so a worker on a long task
-    // would let its checkout lease lapse and another session could seize the
-    // checkout out from under it. Renewal is ownership-scoped and never seizes.
-    if ((body.type === "started" || body.type === "heartbeat") && sessionId) {
-      const lease = workSessions.getWorkspaceLeaseForSession(sessionId);
-      workSessions.renewWorkspaceLeaseForSession(sessionId, undefined, lease?.leaseNonce);
-    }
-
     // Defect #1: a worker CRASH while the review is still open must not emit the
     // terminal agent.run.failed — the WebUI would drop a resumable session. That
     // case is handled below with the non-terminal worker.attempt.failed event.
@@ -286,18 +322,32 @@ export function registerEventRoutes(
       session !== undefined &&
       !TERMINAL_SESSION_STATUSES.has(session.status);
     if (sessionId && eventStore && !awaitingReviewCrash && !workflowHandledCancellation) {
-      eventStore.appendEvent({
-        id: body.event_id,
-        type: gatedCompletedTurn ? "worker.turn.completed" : ADAPTER_EVENT_TYPE_TO_RUN[body.type],
-        sessionId,
-        payload: {
-          runId: run.runId,
-          remoteRunId: body.remote_run_id ?? run.remoteRunId,
-          workSessionId: sessionId,
-          ...(body.event_id ? { eventId: body.event_id } : {}),
-          ...(body.payload ?? {}),
-        },
-      });
+      const eventType = gatedCompletedTurn ? "worker.turn.completed" : ADAPTER_EVENT_TYPE_TO_RUN[body.type]!;
+      const eventPayload = {
+        runId: run.runId,
+        remoteRunId: body.remote_run_id ?? run.remoteRunId,
+        workSessionId: sessionId,
+        ...(body.event_id ? { eventId: body.event_id } : {}),
+        ...(body.payload ?? {}),
+      };
+      if (eventType === "agent.run.output_delta" || eventType === "agent.run.thought_delta") {
+        // This writes the event-id receipt and fragment to SQLite before the
+        // route can return 202. Coalescing into event_log happens asynchronously.
+        eventStore.appendTelemetryIngress({
+          id: body.event_id,
+          type: eventType,
+          sessionId,
+          workspaceSessionId: run.workspaceSessionId,
+          payload: eventPayload,
+        });
+      } else {
+        eventStore.appendEvent({
+          id: body.event_id,
+          type: eventType,
+          sessionId,
+          payload: eventPayload,
+        });
+      }
     }
 
     if (body.type === "completed") {
@@ -353,6 +403,7 @@ export function registerEventRoutes(
       run_id: run.runId,
       status: finalRun?.status ?? run.status,
       work_session_status: finalSession?.status,
+      ...(workspaceLeaseExpiresAt ? { workspace_lease_expires_at: workspaceLeaseExpiresAt } : {}),
       accepted: true,
     });
   });

@@ -87,6 +87,77 @@ export async function createManagedWorktree(input: {
   };
 }
 
+export async function resolveManagedWorktreeSourceRoot(sourcePath: string, config: ServerConfig): Promise<string> {
+  const allowedSourcePath = assertAllowedPath(sourcePath, config.allowedRoots);
+  return resolveGitRoot(allowedSourcePath, config.allowedRoots);
+}
+
+export interface ManagedWorktreeDisposition {
+  pathExists: boolean;
+  registered: boolean;
+  cleanToBase: boolean;
+  headSha?: string;
+  reason?: string;
+}
+
+/** Inspect only; dirty or divergent worktrees remain available for explicit disposition. */
+export async function inspectManagedWorktree(input: {
+  sourceRoot: string;
+  path: string;
+  baseSha: string;
+  config: ServerConfig;
+}): Promise<ManagedWorktreeDisposition> {
+  const managedRoot = await realpath(input.config.worktreeRoot).catch(() => resolve(input.config.worktreeRoot));
+  const candidatePath = resolve(input.path);
+  if (candidatePath === managedRoot || !isPathInsideRoot(candidatePath, managedRoot)) {
+    return { pathExists: false, registered: false, cleanToBase: false, reason: "path_outside_managed_root" };
+  }
+  const sourceRoot = await assertGitRootAllowed(input.sourceRoot, input.config.allowedRoots);
+  const pathExists = await stat(candidatePath).then((value) => value.isDirectory()).catch(() => false);
+  if (pathExists) {
+    const canonicalCandidatePath = await realpath(candidatePath);
+    if (!isPathInsideRoot(canonicalCandidatePath, managedRoot)) {
+      return { pathExists: false, registered: false, cleanToBase: false, reason: "path_outside_managed_root" };
+    }
+  }
+  const list = await controlPlaneGit(sourceRoot, ["worktree", "list", "--porcelain"], { maxBuffer: 10 * 1024 * 1024 });
+  const registeredPaths = list.stdout.split(/\r?\n/)
+    .filter((line) => line.startsWith("worktree "))
+    .map((line) => resolve(line.slice("worktree ".length)));
+  const registered = registeredPaths.includes(candidatePath);
+  if (!pathExists || !registered) {
+    return { pathExists, registered, cleanToBase: false, reason: !pathExists ? "worktree_path_missing" : "not_registered_with_source_repository" };
+  }
+  const [status, head] = await Promise.all([
+    controlPlaneGit(candidatePath, ["status", "--porcelain=v1"], { maxBuffer: 10 * 1024 * 1024 }),
+    controlPlaneGit(candidatePath, ["rev-parse", "HEAD"], { maxBuffer: 1024 * 1024 }),
+  ]);
+  const headSha = head.stdout.trim();
+  const cleanToBase = status.stdout.trim().length === 0 && headSha === input.baseSha;
+  return {
+    pathExists,
+    registered,
+    cleanToBase,
+    headSha,
+    reason: cleanToBase ? undefined : status.stdout.trim().length > 0 ? "working_tree_dirty" : "head_differs_from_creation_base",
+  };
+}
+
+/** Remove only a clean detached worktree that still points at its creation base. */
+export async function removeCleanManagedWorktree(input: {
+  sourceRoot: string;
+  path: string;
+  baseSha: string;
+  config: ServerConfig;
+}): Promise<void> {
+  const disposition = await inspectManagedWorktree(input);
+  if (!disposition.pathExists || !disposition.registered || !disposition.cleanToBase) {
+    throw new Error(`Managed worktree is not safe to remove: ${disposition.reason ?? "unknown disposition"}`);
+  }
+  const sourceRoot = await assertGitRootAllowed(input.sourceRoot, input.config.allowedRoots);
+  await controlPlaneGit(sourceRoot, ["worktree", "remove", resolve(input.path)], { maxBuffer: 10 * 1024 * 1024 });
+}
+
 async function resolveGitRoot(path: string, allowedRoots: string[]): Promise<string> {
   try {
     const output = await git(["rev-parse", "--show-toplevel"], path);

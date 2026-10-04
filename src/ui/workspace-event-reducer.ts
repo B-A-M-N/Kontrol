@@ -175,6 +175,12 @@ export function reduceWorkSessionEvent(sessionId: string, event: AgentActivityEv
     view.status = "continuation_queued";
   } else if (event.type === "continuation.delivered") {
     view.status = "resuming";
+  } else if (event.type === "continuation.dispatch_attention") {
+    view.status = "continuation_attention_required";
+    view.feedbackMessage = "Continuation dispatch needs reviewer attention. Inspect the work session and redrive after resolving the reported failure.";
+  } else if (event.type === "continuation.redriven") {
+    view.status = "continuation_queued";
+    view.feedbackMessage = "Continuation dispatch redriven by the reviewer.";
   } else if (event.type === "continuation.superseded") {
     view.status = "awaiting_resume";
   } else if (event.type === "worker.attempt.failed" || event.type === "worker.attempt.exited") {
@@ -249,5 +255,4 @@ export function reduceWorkSessionEvent(sessionId: string, event: AgentActivityEv
 }
 
 // ── Agent submit bar ─────────────────────────────────
-
 

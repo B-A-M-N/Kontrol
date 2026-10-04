@@ -67,7 +67,47 @@ const migrations: Migration[] = [
   { version: 55, name: "submission-checkpoint-coverage", up: migrateSubmissionCheckpointCoverage },
   { version: 56, name: "work-session-owner-context", up: migrateWorkSessionOwnerContext },
   { version: 57, name: "approval-owner-context", up: migrateApprovalOwnerContext },
+  { version: 58, name: "approval-direct-operation-hash", up: migrateApprovalDirectOperationHash },
+  { version: 59, name: "durable-telemetry-ingress", up: migrateDurableTelemetryIngress },
+  { version: 60, name: "managed-worktree-retirement", up: migrateManagedWorktreeRetirement },
 ];
+
+function migrateApprovalDirectOperationHash(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "approval_requests", "operation_hash", "text");
+  sqlite.exec("create index if not exists approval_requests_direct_operation_idx on approval_requests(principal_id, workspace_session_id, owner_context_id, operation_hash, status, consumed_at)");
+}
+
+function migrateDurableTelemetryIngress(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table if not exists telemetry_ingress (
+      sequence integer primary key autoincrement,
+      event_id text not null unique,
+      session_id text not null,
+      workspace_session_id text,
+      type text not null,
+      payload_json text,
+      payload_sha256 text not null,
+      publish integer not null default 1,
+      status text not null default 'pending',
+      event_log_id text,
+      received_at text not null,
+      committed_at text
+    );
+    create index if not exists telemetry_ingress_pending_idx on telemetry_ingress(status, sequence);
+    create index if not exists telemetry_ingress_session_idx on telemetry_ingress(session_id, status, sequence);
+    create index if not exists telemetry_ingress_event_log_idx on telemetry_ingress(event_log_id);
+  `);
+}
+
+function migrateManagedWorktreeRetirement(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "workspace_sessions", "retired_at", "text");
+  sqlite.exec(`
+    create index if not exists workspace_managed_lifecycle_idx
+      on workspace_sessions(mode, managed, status, retired_at);
+    create index if not exists workspace_managed_lifecycle_created_idx
+      on workspace_sessions(mode, managed, status, created_at, id);
+  `);
+}
 
 // P1 (audit): checkpoint coverage blind spots. A structured mutation into a
 // location the review checkpoint cannot represent (excluded/generated trees,

@@ -18,6 +18,8 @@ export interface PolicyInvocation {
   /** All affected paths for a multi-file action such as apply_patch. */
   paths?: PolicyInputPath[];
   command?: string;
+  /** Complete canonical tool arguments, used only to bind retry identity. */
+  operationContent?: unknown;
   /** Abort when the originating MCP/ACP request genuinely disappears. */
   signal?: AbortSignal;
   /** Suspend the request's execution lease while a human approval is pending. */
@@ -154,7 +156,34 @@ export interface PolicyEnforcer {
  * instance, or conversation) may bridge a reconnect; without one, the MCP
  * session remains the narrowest safe retry boundary for isolated transports.
  */
-function approvalRowKey(inv: PolicyInvocation, approvalKey: string): string {
+function canonicalOperationValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalOperationValue);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+      .filter(([key]) => !["approvalResumeId", "instructionContentHash", "clientMutationId"].includes(key))
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([key, entry]) => [key, canonicalOperationValue(entry)]));
+  }
+  return value;
+}
+
+function canonicalOperationHash(inv: PolicyInvocation, approvalKey: string, path: PolicyInputPath | undefined): string {
+  const operation = JSON.stringify({
+    principalId: inv.principalId,
+    workspaceId: inv.workspaceId,
+    workSessionId: inv.workSessionId ?? "",
+    ownerContextId: inv.ownerContextId ?? "",
+    tool: canonicalToolName(inv.tool),
+    approvalKey,
+    path: policyPathLabel(path) ?? "",
+    paths: inv.paths?.map(policyPathLabel) ?? [],
+    command: inv.command ?? "",
+    content: canonicalOperationValue(inv.operationContent ?? null),
+  });
+  return createHash("sha256").update(operation).digest("hex");
+}
+
+function approvalRowKey(inv: PolicyInvocation, approvalKey: string, operationHash: string): string {
   const operation = JSON.stringify({
     principalId: inv.principalId,
     workspaceId: inv.workspaceId,
@@ -168,6 +197,7 @@ function approvalRowKey(inv: PolicyInvocation, approvalKey: string): string {
     path: policyPathLabel(inv.path),
     paths: inv.paths?.map(policyPathLabel),
     command: inv.command ?? "",
+    operationHash,
   });
   const fingerprint = createHash("sha256").update(operation).digest("hex");
   return inv.mcpSessionId || inv.mcpRequestId
@@ -227,6 +257,7 @@ export function createPolicyEnforcer(
         path: PolicyInputPath | undefined,
       ): Promise<{ allowed: boolean; decision: PolicyDecision; outcome?: PolicyWaitOutcome; approvalRequired?: boolean; approvalId?: string }> {
         const approvalKey = decision.approvalKey!;
+        const operationHash = canonicalOperationHash(inv, approvalKey, path);
         // Explicit resume identity wins over the fingerprint: the caller
         // echoes the approvalId from its approval_required card. Content is
         // verified against the durable row before the original identity is
@@ -245,15 +276,26 @@ export function createPolicyEnforcer(
               approvalKey,
               path: policyPathLabel(path),
               command: inv.command,
+              operationHash,
             })
           : undefined;
-        const rowKey = resumedKey ?? approvalRowKey(inv, approvalKey);
+        const rowKey = resumedKey ?? approvalRowKey(inv, approvalKey, operationHash);
 
         // P0.4 dedup: the durable operation fingerprint intentionally ignores
         // transient transport/request IDs, so a retry from a new MCP session
         // finds the same pending or approved operation.
         const existing = policy.findPendingByKey(rowKey);
         if (!existing && policy.consumeApprovedOperation(rowKey)) {
+          return { allowed: true, decision, outcome: "approved" };
+        }
+        if (!existing && !inv.approvalResumeId && inv.blockingApproval === false
+          && !inv.workSessionId && inv.ownerContextId
+          && policy.consumeApprovedDirectOperation({
+            principalId: inv.principalId,
+            workspaceId: inv.workspaceId,
+            ownerContextId: inv.ownerContextId,
+            operationHash,
+          })) {
           return { allowed: true, decision, outcome: "approved" };
         }
         const approvalId = existing?.id ?? `pol_${randomUUID()}`;
@@ -311,6 +353,7 @@ export function createPolicyEnforcer(
             workSessionId: inv.workSessionId,
             runId: inv.runId,
             approvalKey,
+            operationHash,
             mcpSessionId: inv.mcpSessionId,
             mcpRequestId: inv.mcpRequestId,
             waiterKey: rowKey,

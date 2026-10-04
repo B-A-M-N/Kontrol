@@ -39,6 +39,7 @@ writeFileSync(join(root, "node_modules", "patched.js"), "hidden edit\n");
 await checkpoints.recordMutations({
   workspaceId: "ws-coverage-e2e",
   root,
+  workSessionId: session.id,
   paths: [join(root, "app.ts"), join(root, "node_modules", "patched.js")],
 });
 
@@ -50,11 +51,24 @@ const boundSnapshot = await checkpoints.reviewChanges({
   since: "workspace_open",
   markReviewed: false,
 });
+await checkpoints.reviewChanges({
+  workspaceId: "ws-coverage-e2e",
+  root,
+  since: "last_shown",
+  markReviewed: true,
+  presentationOwnerId: "reviewer-tab-a",
+});
 const submitted = await workflow.submitForReview({
   workSessionId: session.id,
   diff: "diff --git a/app.ts b/app.ts\n--- a/app.ts\n+++ b/app.ts\n@@ -1 +1 @@\n-export {}\n+export const x = 1;\n",
   snapshotKind: boundSnapshot.snapshotKind,
   snapshotRef: boundSnapshot.snapshotRef,
+});
+await checkpoints.commitReviewedSnapshot({
+  workspaceId: "ws-coverage-e2e",
+  root,
+  workSessionId: session.id,
+  snapshot: boundSnapshot.snapshot,
 });
 
 // The submission carries the coverage record naming ONLY the uncovered path.
@@ -114,7 +128,7 @@ assert.deepEqual(payload.uncoveredPaths, ["node_modules/patched.js"]);
 // Control: a fully-covered submission needs no acknowledgment.
 {
   const session2 = workSessions.create({ workspaceSessionId: "ws-coverage-e2e", submittedBy: "worker", completionPolicy: "webui_approval_required" });
-  await checkpoints.clearRecordedMutations({ workspaceId: "ws-coverage-e2e" });
+  await checkpoints.clearRecordedMutations({ workspaceId: "ws-coverage-e2e", workSessionId: session2.id });
   const clean = await workflow.submitForReview({
     workSessionId: session2.id,
     diff: "nothing",
@@ -137,7 +151,7 @@ assert.deepEqual(payload.uncoveredPaths, ["node_modules/patched.js"]);
 {
   const session3 = workSessions.create({ workspaceSessionId: "ws-coverage-e2e", submittedBy: "worker", completionPolicy: "webui_approval_required" });
   writeFileSync(join(root, "node_modules", "patched.js"), "hidden edit 2\n");
-  await checkpoints.recordMutations({ workspaceId: "ws-coverage-e2e", root, paths: [join(root, "node_modules", "patched.js")] });
+  await checkpoints.recordMutations({ workspaceId: "ws-coverage-e2e", root, workSessionId: session3.id, paths: [join(root, "node_modules", "patched.js")] });
   const flagged = await workflow.submitForReview({
     workSessionId: session3.id,
     diff: "x",

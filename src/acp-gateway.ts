@@ -278,6 +278,8 @@ export async function callRemoteAgent(
     continuationId?: string;
     /** Nonce of the checkout lease held by this work session. */
     workspaceLeaseNonce?: string;
+    /** Expiry of the checkout lease that the worker must renew before its local deadline. */
+    workspaceLeaseExpiresAt?: string;
   },
 ): Promise<AgentCallResult> {
   // Reuse the existing logical run across continuations so the UI keeps watching
@@ -340,7 +342,9 @@ export async function callRemoteAgent(
       parent_run_id: run.runId,
       agent_id: run.agentId,
       continuation_id: params.continuationId,
+      attempt_number: attemptNumber,
       workspace_lease_nonce: params.workspaceLeaseNonce,
+      workspace_lease_expires_at: params.workspaceLeaseExpiresAt,
     };
 
     if (params.webhookUrl) {

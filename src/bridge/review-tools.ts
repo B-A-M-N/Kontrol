@@ -657,4 +657,44 @@ export function registerReviewTools(server: McpServer, config: BridgeConfig): vo
       };
     },
   );
+
+  registerMutationAppTool(
+    server,
+    "redrive_continuation",
+    {
+      title: "Redrive stalled continuation",
+      description: "Retry a continuation whose durable dispatch outbox row was dead-lettered after repeated genuine failures. Temporary agent or workspace unavailability is retried automatically and does not need redrive.",
+      inputSchema: {
+        workSessionId: z.string(),
+        continuationId: z.string(),
+        clientMutationId: z.string().min(1).max(200).optional(),
+      },
+      outputSchema: { redriven: z.boolean(), continuationId: z.string(), status: z.string() },
+      _meta: workspaceAppModelAndAppMeta(),
+      annotations: { readOnlyHint: false },
+    },
+    config,
+    async ({ workSessionId, continuationId }) => {
+      if (!isReviewer(config.principalRole)) return forbidden(config.principalRole, "redrive_continuation");
+      const access = requireWorkSessionMutation(config, workSessionId);
+      if (access) return access;
+      const continuation = config.continuationManager.get(continuationId);
+      if (!continuation || continuation.sessionId !== workSessionId || continuation.status !== "pending" || continuation.verdict !== "changes_requested") {
+        return { content: [{ type: "text" as const, text: "Continuation is not a pending changes-requested continuation for this work session." }], isError: true };
+      }
+      const outbox = config.dispatchOutbox;
+      if (!outbox) return { content: [{ type: "text" as const, text: "Dispatch outbox is unavailable." }], isError: true };
+      const redriven = outbox.redriveDeadLetter("continuation.ready", continuation.id, continuation.reviewEpoch);
+      if (!redriven) return { content: [{ type: "text" as const, text: "No dead-lettered dispatch exists for this continuation." }], isError: true };
+      config.eventStore.appendEvent({
+        type: "continuation.redriven",
+        sessionId: workSessionId,
+        payload: { continuationId: continuation.id, reviewEpoch: continuation.reviewEpoch, outboxId: redriven.id },
+      });
+      return {
+        content: [{ type: "text" as const, text: "Continuation dispatch redriven." }],
+        structuredContent: { redriven: true, continuationId: continuation.id, status: "pending" },
+      };
+    },
+  );
 }

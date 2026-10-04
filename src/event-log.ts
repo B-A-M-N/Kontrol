@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { openDatabase, type DatabaseHandle } from "./db/client.js";
 
 /**
@@ -16,10 +16,11 @@ import { openDatabase, type DatabaseHandle } from "./db/client.js";
 export interface EventStoreEvent {
   id: string;
   seq: number;
-  /** True for a committed event; false marks a non-durable telemetry receipt. */
+  /** True for a committed event or a receipt committed to durable ingress. */
   durable: boolean;
-  /** Present only on the synchronous receipt returned for buffered telemetry. */
+  /** Present on an ingress receipt that has not yet been materialized in event_log. */
   receipt?: boolean;
+  ingressReceipt?: boolean;
   type: string;
   sessionId: string;
   workspaceSessionId?: string;
@@ -62,6 +63,18 @@ export interface EventStore {
 
  /** Exact adapter event lookup for idempotent retry handling. */
  getEventById(eventId: string): EventStoreEvent | undefined;
+
+ /** Durably persist an adapter telemetry fragment before acknowledging it. */
+ appendTelemetryIngress(input: {
+   id?: string;
+   type: string;
+   sessionId: string;
+   workspaceSessionId?: string;
+   payload: Record<string, unknown>;
+ }, opts?: { publish?: boolean }): { eventId: string; duplicate: boolean };
+
+ /** Materialize pending ingress rows into coalesced event-log events. */
+ flushTelemetryIngress(sessionId?: string): number;
 
  /**
   * Durable events strictly after a given seq. Used by the blocking
@@ -154,6 +167,9 @@ export function createEventStore(
   const telemetryBuffers = new Map<string, TelemetryBuffer>();
   const TELEMETRY_FLUSH_INTERVAL_MS = 250;
   const TELEMETRY_MAX_BYTES = 16 * 1024;
+  const TELEMETRY_INGRESS_BATCH_SIZE = 512;
+  let telemetryIngressTimer: ReturnType<typeof setTimeout> | undefined;
+  let telemetryIngressFlushRunning = false;
   const MAX_TRACKED_AGENT_SESSIONS = 2048;
   const lastAgentEventAt = new Map<string, number>();
 
@@ -167,6 +183,43 @@ export function createEventStore(
 
   function isHighVolumeTelemetry(type: string): boolean {
     return type === "agent.run.output_delta" || type === "agent.run.thought_delta";
+  }
+
+  function stableJson(value: unknown): string {
+    if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+    if (value && typeof value === "object") {
+      return `{${Object.entries(value as Record<string, unknown>)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([key, entry]) => `${JSON.stringify(key)}:${stableJson(entry)}`)
+        .join(",")}}`;
+    }
+    return JSON.stringify(value) ?? "null";
+  }
+
+  function telemetryPayloadHash(input: { type: string; sessionId: string; workspaceSessionId?: string; payload: Record<string, unknown> }): string {
+    return createHash("sha256").update(stableJson({
+      type: input.type,
+      sessionId: input.sessionId,
+      workspaceSessionId: input.workspaceSessionId ?? "",
+      payload: input.payload,
+    })).digest("hex");
+  }
+
+  function hasPendingTelemetryIngress(sessionId?: string): boolean {
+    const row = sessionId
+      ? database.sqlite.prepare("select 1 as found from telemetry_ingress where status = 'pending' and session_id = ? limit 1").get(sessionId)
+      : database.sqlite.prepare("select 1 as found from telemetry_ingress where status = 'pending' limit 1").get();
+    return Boolean(row);
+  }
+
+  function scheduleTelemetryIngressFlush(delayMs = TELEMETRY_FLUSH_INTERVAL_MS): void {
+    if (telemetryIngressTimer || telemetryIngressFlushRunning || !hasPendingTelemetryIngress()) return;
+    telemetryIngressTimer = setTimeout(() => {
+      telemetryIngressTimer = undefined;
+      flushTelemetryIngressBatch();
+      if (hasPendingTelemetryIngress()) scheduleTelemetryIngressFlush();
+    }, delayMs);
+    telemetryIngressTimer.unref?.();
   }
 
   function resolveWorkspaceCorrelation(
@@ -226,7 +279,7 @@ export function createEventStore(
         )
         .run(id, input.type, input.sessionId, correlation.workspaceSessionId ?? null, JSON.stringify(input.payload), now);
     } catch (error) {
-      const existing = getEventById(id);
+      const existing = getEventLogById(id);
       if (existing) return existing;
       throw error;
     }
@@ -256,6 +309,137 @@ export function createEventStore(
     }
     if (input.publish) publish(event);
     return event;
+  }
+
+  function appendTelemetryIngress(input: {
+    id?: string;
+    type: string;
+    sessionId: string;
+    workspaceSessionId?: string;
+    payload: Record<string, unknown>;
+  }, opts: { publish?: boolean } = {}): { eventId: string; duplicate: boolean } {
+    if (!isHighVolumeTelemetry(input.type)) {
+      throw new Error(`Telemetry ingress does not accept event type ${input.type}`);
+    }
+    const eventId = input.id ?? randomUUID();
+    const payloadJson = JSON.stringify(input.payload);
+    const payloadSha256 = telemetryPayloadHash(input);
+    const existing = database.sqlite.prepare(`
+      select session_id, workspace_session_id, type, payload_sha256
+        from telemetry_ingress
+       where event_id = ?
+    `).get(eventId) as { session_id: string; workspace_session_id?: string | null; type: string; payload_sha256: string } | undefined;
+    if (existing) {
+      if (existing.session_id !== input.sessionId
+        || (existing.workspace_session_id ?? undefined) !== input.workspaceSessionId
+        || existing.type !== input.type
+        || existing.payload_sha256 !== payloadSha256) {
+        throw new Error(`Adapter event id ${eventId} was reused with different telemetry content`);
+      }
+      return { eventId, duplicate: true };
+    }
+    database.sqlite.prepare(`
+      insert into telemetry_ingress
+        (event_id, session_id, workspace_session_id, type, payload_json, payload_sha256, publish, status, received_at)
+      values (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+    `).run(
+      eventId,
+      input.sessionId,
+      input.workspaceSessionId ?? null,
+      input.type,
+      payloadJson,
+      payloadSha256,
+      opts.publish === false ? 0 : 1,
+      new Date().toISOString(),
+    );
+    scheduleTelemetryIngressFlush();
+    return { eventId, duplicate: false };
+  }
+
+  function flushTelemetryIngressBatch(sessionId?: string): number {
+    if (telemetryIngressFlushRunning) return 0;
+    telemetryIngressFlushRunning = true;
+    try {
+      const rows = (sessionId
+        ? database.sqlite.prepare(`
+            select sequence, event_id, session_id, workspace_session_id, type, payload_json, publish
+              from telemetry_ingress
+             where status = 'pending' and session_id = ?
+             order by sequence
+             limit ?
+          `).all(sessionId, TELEMETRY_INGRESS_BATCH_SIZE)
+        : database.sqlite.prepare(`
+            select sequence, event_id, session_id, workspace_session_id, type, payload_json, publish
+              from telemetry_ingress
+             where status = 'pending'
+             order by sequence
+             limit ?
+          `).all(TELEMETRY_INGRESS_BATCH_SIZE)) as Array<{
+            sequence: number;
+            event_id: string;
+            session_id: string;
+            workspace_session_id?: string | null;
+            type: string;
+            payload_json?: string | null;
+            publish: number;
+          }>;
+      if (rows.length === 0) return 0;
+
+      const groups = new Map<string, typeof rows>();
+      for (const row of rows) {
+        const key = `${row.session_id}\0${row.workspace_session_id ?? ""}\0${row.type}`;
+        const group = groups.get(key) ?? [];
+        group.push(row);
+        groups.set(key, group);
+      }
+      for (const group of groups.values()) {
+        const first = group[0]!;
+        const fragments = group.map((row) => row.payload_json ? JSON.parse(row.payload_json) as Record<string, unknown> : {});
+        const channels = [...new Set(fragments
+          .map((fragment) => typeof fragment.channel === "string" ? fragment.channel : undefined)
+          .filter((channel): channel is string => Boolean(channel)))];
+        const payload = {
+          text: fragments.map((fragment) => typeof fragment.text === "string" ? fragment.text : "").join(""),
+          channel: channels[0] ?? (first.type === "agent.run.thought_delta" ? "thought" : "message"),
+          channels,
+          coalesced: true,
+          count: fragments.length,
+        };
+        const shouldPublish = group.some((row) => row.publish !== 0);
+        const transaction = database.sqlite.transaction(() => {
+          const event = insertEvent({
+            type: first.type,
+            sessionId: first.session_id,
+            workspaceSessionId: first.workspace_session_id ?? undefined,
+            payload,
+            publish: false,
+          });
+          const update = database.sqlite.prepare(`
+            update telemetry_ingress
+               set status = 'committed', event_log_id = ?, payload_json = null, committed_at = ?
+             where event_id = ? and status = 'pending'
+          `);
+          const committedAt = new Date().toISOString();
+          for (const row of group) update.run(event.id, committedAt, row.event_id);
+          return event;
+        });
+        const event = transaction();
+        if (shouldPublish) publish(event);
+      }
+      return rows.length;
+    } finally {
+      telemetryIngressFlushRunning = false;
+    }
+  }
+
+  function flushTelemetryIngress(sessionId?: string): number {
+    let flushed = 0;
+    let batch: number;
+    do {
+      batch = flushTelemetryIngressBatch(sessionId);
+      flushed += batch;
+    } while (batch > 0);
+    return flushed;
   }
 
   function flushTelemetry(key: string): void {
@@ -347,9 +531,25 @@ export function createEventStore(
     id?: string;
     type: string;
     sessionId: string;
+    workspaceSessionId?: string;
     payload: Record<string, unknown>;
   }, opts: { publish?: boolean } = {}): EventStoreEvent {
     if (isHighVolumeTelemetry(input.type)) {
+      if (input.id) {
+        appendTelemetryIngress(input, opts);
+        return {
+          id: input.id,
+          seq: 0,
+          durable: true,
+          receipt: true,
+          ingressReceipt: true,
+          type: input.type,
+          sessionId: input.sessionId,
+          workspaceSessionId: input.workspaceSessionId,
+          payload: input.payload,
+          createdAt: new Date().toISOString(),
+        };
+      }
       return queueTelemetry({
         ...input,
         publish: opts.publish !== false,
@@ -357,6 +557,7 @@ export function createEventStore(
     }
     // Keep durable sequence order meaningful: a workflow event that follows a
     // fragment must never overtake the buffered transcript preceding it.
+    flushTelemetryIngress(input.sessionId);
     flushTelemetryForSession(input.sessionId);
     return insertEvent({
       ...input,
@@ -364,10 +565,10 @@ export function createEventStore(
     });
   }
 
-  function getEventById(eventId: string): EventStoreEvent | undefined {
+  function getEventLogById(eventId: string): EventStoreEvent | undefined {
     const row = database.sqlite
-      .prepare("select id, seq, type, session_id, workspace_session_id, payload, created_at from event_log where id = ? or json_extract(payload, '$.eventId') = ? limit 1")
-      .get(eventId, eventId) as { id: string; seq: number; type: string; session_id: string; workspace_session_id?: string | null; payload: string; created_at: string } | undefined;
+      .prepare("select id, seq, type, session_id, workspace_session_id, payload, created_at from event_log where id = ? limit 1")
+      .get(eventId) as { id: string; seq: number; type: string; session_id: string; workspace_session_id?: string | null; payload: string; created_at: string } | undefined;
     if (!row) return undefined;
     return {
       id: row.id,
@@ -379,6 +580,49 @@ export function createEventStore(
       workspaceProjectId: projectIdForWorkspaceSession(row.workspace_session_id ?? undefined),
       payload: JSON.parse(row.payload) as Record<string, unknown>,
       createdAt: row.created_at,
+    };
+  }
+
+  function getEventById(eventId: string): EventStoreEvent | undefined {
+    const committed = getEventLogById(eventId);
+    if (committed) return committed;
+    const ingress = database.sqlite.prepare(`
+      select event_id, session_id, workspace_session_id, type, payload_json, status,
+             event_log_id, received_at
+        from telemetry_ingress
+       where event_id = ?
+       limit 1
+    `).get(eventId) as {
+      event_id: string;
+      session_id: string;
+      workspace_session_id?: string | null;
+      type: string;
+      payload_json?: string | null;
+      status: string;
+      event_log_id?: string | null;
+      received_at: string;
+    } | undefined;
+    if (!ingress) return undefined;
+    const materialized = ingress.event_log_id ? getEventLogById(ingress.event_log_id) : undefined;
+    if (materialized) {
+      return {
+        ...materialized,
+        id: ingress.event_id,
+        receipt: true,
+        ingressReceipt: true,
+      };
+    }
+    return {
+      id: ingress.event_id,
+      seq: 0,
+      durable: true,
+      receipt: true,
+      ingressReceipt: true,
+      type: ingress.type,
+      sessionId: ingress.session_id,
+      workspaceSessionId: ingress.workspace_session_id ?? undefined,
+      payload: ingress.payload_json ? JSON.parse(ingress.payload_json) as Record<string, unknown> : {},
+      createdAt: ingress.received_at,
     };
   }
 
@@ -838,6 +1082,9 @@ export function createEventStore(
   }
 
   function close(): void {
+    if (telemetryIngressTimer) clearTimeout(telemetryIngressTimer);
+    telemetryIngressTimer = undefined;
+    flushTelemetryIngress();
     for (const key of [...telemetryBuffers.keys()]) flushTelemetry(key);
     subscribers.clear();
     globalSubscribers.clear();
@@ -846,8 +1093,14 @@ export function createEventStore(
     // P1 #11: Don't close shared DB handle - server owns it
   }
 
+  // Reconcile crash-interrupted ingress rows before the store accumulates new
+  // traffic. Each timer turn is bounded; shutdown and ordering barriers drain.
+  scheduleTelemetryIngressFlush(0);
+
   return {
     appendEvent,
+    appendTelemetryIngress,
+    flushTelemetryIngress,
     publishEvents: (events) => {
       for (const event of events) publish(event);
     },

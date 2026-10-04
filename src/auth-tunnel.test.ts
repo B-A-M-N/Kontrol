@@ -228,7 +228,7 @@ assert.equal(loadConfig({ ...baseEnv, KONTROL_TUNNEL_TOKEN: "short" }).authMode,
     });
     const stalePayload = parseJsonRpcResponse(await staleResourceRead.text()) as { error?: { message?: string } };
     assert.ok(stalePayload.error, "unsupported historical template hashes must return an MCP resource error");
-    assert.match(stalePayload.error?.message ?? "", /unknown resource|resource/i);
+    assert.match(stalePayload.error?.message ?? "", /no longer retained|resource/i);
 
     const openAiResourceRead = await fetch("http://127.0.0.1:7691/mcp", {
       method: "POST",

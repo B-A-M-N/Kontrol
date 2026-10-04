@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import {
+  assertInputSchemaCompatibility,
   extractCatalog,
   extractServerInfoVersion,
   extractWorkspaceAppResourceUris,
@@ -39,6 +40,24 @@ assert.deepEqual(extractWorkspaceAppResourceUris(appCatalog), [
   "ui://kontrol/workspace-app.html",
 ]);
 assert.throws(() => extractCatalog({ tools: [{ name: "broken", _meta: { ui: { resourceUri: 4 } } }] }), /non-string _meta.ui.resourceUri/);
+
+const schemaCatalog = (includeResumeId = true, required = ["workspaceId", "command"]) => extractCatalog({ tools: [{
+  name: "bash",
+  inputSchema: {
+    type: "object",
+    properties: {
+      workspaceId: { type: "string" },
+      command: { type: "string" },
+      ...(includeResumeId ? { approvalResumeId: { type: "string" } } : {}),
+    },
+    required,
+  },
+}] });
+assert.equal(assertInputSchemaCompatibility(schemaCatalog().tools, schemaCatalog().tools), true);
+assert.throws(() => assertInputSchemaCompatibility(schemaCatalog().tools, schemaCatalog(false).tools), /missing approvalResumeId input for bash/,
+  "host catalogs missing approvalResumeId must fail even when tool names match");
+assert.throws(() => assertInputSchemaCompatibility(schemaCatalog().tools, schemaCatalog(true, ["workspaceId"]).tools), /input schema mismatch for bash/,
+  "host catalogs must preserve the server's required input fields");
 
 const hostEnvelope = {
   capturedAt: "2026-09-30T12:00:00.000Z",

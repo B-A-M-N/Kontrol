@@ -39,8 +39,30 @@ export function extractCatalog(value) {
     if (resourceUri !== undefined && typeof resourceUri !== "string") {
       throw new Error(`MCP tool ${names[index]} has a non-string _meta.ui.resourceUri`);
     }
+    const inputSchema = tool?.inputSchema;
+    if (inputSchema !== undefined && (!isObject(inputSchema) || Array.isArray(inputSchema))) {
+      throw new Error(`MCP tool ${names[index]} has a malformed inputSchema`);
+    }
+    const properties = inputSchema?.properties;
+    if (properties !== undefined && (!isObject(properties) || Array.isArray(properties))) {
+      throw new Error(`MCP tool ${names[index]} has malformed inputSchema.properties`);
+    }
+    const required = inputSchema?.required ?? [];
+    if (!Array.isArray(required) || required.some((field) => typeof field !== "string")) {
+      throw new Error(`MCP tool ${names[index]} has malformed inputSchema.required`);
+    }
     return {
       name: names[index],
+      ...(inputSchema !== undefined ? {
+        inputFields: {
+          properties: Object.keys(properties ?? {}).sort(),
+          required: [...required].sort(),
+          types: Object.fromEntries(Object.entries(properties ?? {}).map(([field, schema]) => [
+            field,
+            isObject(schema) && !Array.isArray(schema) ? schema.type ?? (schema.anyOf ? "anyOf" : schema.oneOf ? "oneOf" : undefined) : undefined,
+          ]).sort(([a], [b]) => String(a).localeCompare(String(b)))),
+        },
+      } : {}),
       ...(resourceUri !== undefined ? { resourceUri } : {}),
       ...(Array.isArray(ui?.visibility) ? { visibility: [...ui.visibility] } : {}),
       ...(typeof tool?._meta?.["openai/outputTemplate"] === "string"
@@ -54,6 +76,36 @@ export function extractCatalog(value) {
     version: extractServerInfoVersion(value),
     sourcePath: locations[0].path,
   };
+}
+
+/** Compare the model-visible names, required set, and basic types in each
+ * input schema. Catalog names alone cannot prove that a cached host can send
+ * a retry token or even supply the current required arguments. */
+export function assertInputSchemaCompatibility(serverTools, hostTools, label = "host") {
+  const hostByName = new Map((hostTools ?? []).map((tool) => [tool.name, tool]));
+  for (const serverTool of serverTools ?? []) {
+    const hostTool = hostByName.get(serverTool.name);
+    if (!hostTool) continue;
+    if (["bash", "exec_command", "write", "edit", "apply_patch", "read", "git_status", "git_log", "git_diff", "git_show"].includes(serverTool.name)
+      && (!serverTool.inputFields?.properties.includes("approvalResumeId")
+        || !hostTool.inputFields?.properties.includes("approvalResumeId"))) {
+      throw new Error(`${label} catalog is missing approvalResumeId input for ${serverTool.name}`);
+    }
+    if (!serverTool.inputFields || !hostTool.inputFields) {
+      if (serverTool.inputFields || hostTool.inputFields) {
+        throw new Error(`${label} catalog input schema missing for ${serverTool.name}`);
+      }
+      continue;
+    }
+    const expected = serverTool.inputFields;
+    const actual = hostTool.inputFields;
+    if (JSON.stringify(expected.properties) !== JSON.stringify(actual.properties)
+      || JSON.stringify(expected.required) !== JSON.stringify(actual.required)
+      || JSON.stringify(expected.types) !== JSON.stringify(actual.types)) {
+      throw new Error(`${label} catalog input schema mismatch for ${serverTool.name}; serverProperties=${expected.properties.join(",")}; hostProperties=${actual.properties.join(",")}; serverRequired=${expected.required.join(",")}; hostRequired=${actual.required.join(",")}`);
+    }
+  }
+  return true;
 }
 
 export function extractWorkspaceAppResourceUris(catalog) {

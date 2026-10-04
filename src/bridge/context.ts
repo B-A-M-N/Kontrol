@@ -22,7 +22,7 @@ import type { ReviewWorkflowService } from "../review-workflow.js";
 import type { SupervisorRuns } from "../supervisor-runs.js";
 import type { WorkSessionManager } from "../work-sessions.js";
 import type { WorkspaceRegistry } from "../workspaces.js";
-import { checkoutLeaseNonce, compactMissionPacket, workSessionInstructions } from "./shared.js";
+import { checkoutLeaseMetadata, compactMissionPacket, workSessionInstructions } from "./shared.js";
 import type { LiveWaiterRegistry } from "./shared.js";
 import { createHash } from "node:crypto";
 import { z } from "zod/v4";
@@ -186,7 +186,7 @@ export async function dispatchAgentTask(
         task,
         workspaceSessionId: input.workspaceSessionId,
         workSessionId: wsId,
-        workspaceLeaseNonce: checkoutLeaseNonce(config, wsId),
+        ...checkoutLeaseMetadata(config, wsId),
         mode: "async",
         fireAndForget: true,
       },

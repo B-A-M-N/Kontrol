@@ -40,6 +40,14 @@ async function makeFixture() {
   writeFileSync(join(workspaceRoot, "submitted.txt"), "submitted-content\n");
   const submitted = await store.capture(workspaceRoot);
   writeFileSync(join(workspaceRoot, "extra.txt"), "extra-content\n");
+  const sessionPinned = await store.capture(workspaceRoot);
+  await store.saveBaselines("wss_maint_gc", workspaceRoot, {
+    open: submitted,
+    presentation: submitted,
+    legacy: submitted,
+    sessions: new Map([["ws_maint_gc", sessionPinned]]),
+  });
+  writeFileSync(join(workspaceRoot, "unrooted.txt"), "unrooted-content\n");
   const garbage = await store.capture(workspaceRoot);
 
   // Root the submission in SQLite: workspace + nonterminal work session + a
@@ -76,6 +84,7 @@ async function makeFixture() {
   return {
     stateDir, store, db, stubDeps,
     submittedRef: submitted.ref,
+    sessionPinnedRef: sessionPinned.ref,
     garbageRef: garbage.ref,
     async cleanup() {
       await store.close();
@@ -98,22 +107,43 @@ async function makeFixture() {
   assert.equal(degraded.stats.snapshotRootsDegraded, true, "degraded flag set when root enumeration fails");
   assert.ok(degraded.stats.snapshotRootsLastError, "degraded error detail recorded");
   assert.equal(existsSync(fx.store.manifestPath(fx.garbageRef)), true, "fail-closed: garbage manifest NOT reclaimed while roots unknown");
+  assert.equal(existsSync(fx.store.manifestPath(fx.sessionPinnedRef)), true, "session baseline survives degraded GC");
   assert.equal(existsSync(fx.store.manifestPath(fx.submittedRef)), true, "submission manifest preserved");
   const statsDuringFailure = await fx.store.storeStats();
   const manifestsDuringFailure = statsDuringFailure.manifests;
-  assert.equal(manifestsDuringFailure, 2, "zero manifests removed across degraded cycles");
+  assert.equal(manifestsDuringFailure, 3, "zero manifests removed across degraded cycles");
 
   // --- Phase B: recovery — a healthy handle on the same store/DB ---
   const healthyDb = openDatabase(fx.stateDir);
-  const healthy = createMaintenanceCoordinator(fx.stubDeps(healthyDb));
+  let managedWorktreeGcCalls = 0;
+  const healthy = createMaintenanceCoordinator({
+    ...fx.stubDeps(healthyDb),
+    managedWorktreeGc: async () => {
+      managedWorktreeGcCalls++;
+      return { removed: 0, retained: 0, failed: 0 };
+    },
+  });
   await new Promise((resolve) => setTimeout(resolve, 120));
   healthy.stop();
 
   assert.equal(healthy.stats.snapshotRootsDegraded, false, "recovered cycle clears the degraded flag");
+  assert.ok(managedWorktreeGcCalls > 0, "maintenance invokes the bounded managed-worktree cleanup hook");
   assert.equal(existsSync(fx.store.manifestPath(fx.garbageRef)), false, "healthy cycle reclaims unpinned garbage");
+  assert.equal(existsSync(fx.store.manifestPath(fx.sessionPinnedRef)), true, "live session baseline remains pinned");
   assert.equal(existsSync(fx.store.manifestPath(fx.submittedRef)), true, "DB-rooted submission survives healthy GC");
   const statsAfter = await fx.store.storeStats();
-  assert.equal(statsAfter.manifests, 1, "exactly the DB-rooted manifest remains");
+  assert.equal(statsAfter.manifests, 2, "submission and live session baseline remain rooted");
+
+  // All rows remain visible for this workspace, but every session is now
+  // terminal. Maintenance must still call pruneSessionBaselines with an empty
+  // set so the stale session pin no longer blocks garbage collection.
+  healthyDb.sqlite.prepare("update work_sessions set status = 'approved' where id = ?").run("ws_maint_gc");
+  const terminal = createMaintenanceCoordinator(fx.stubDeps(healthyDb));
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  terminal.stop();
+  assert.equal(existsSync(fx.store.manifestPath(fx.sessionPinnedRef)), false, "all-terminal workspace session pins are pruned");
+  assert.equal(existsSync(fx.store.manifestPath(fx.submittedRef)), true, "durable submission stays rooted after terminal pin pruning");
+  assert.equal((await fx.store.storeStats()).manifests, 1);
 
   healthyDb.close();
   await fx.cleanup();

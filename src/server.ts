@@ -419,6 +419,9 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     eventStore,
     mutationReceipts,
     reviewCheckpoints,
+    managedWorktreeGc: () => workspaces.collectRetiredManagedWorktrees(
+      (workspaceId) => processSessions.countRunningForWorkspace(workspaceId),
+    ),
   });
   const maintenanceStats = maintenance.stats;
   const collectFsSnapshotDbRoots = maintenance.collectFsSnapshotDbRoots;

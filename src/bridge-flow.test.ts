@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createServer, type Server } from "node:http";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
@@ -22,6 +22,9 @@ import { registerPolicyTools } from "./policy-tools.js";
 import { authorizeWorkSessionAction } from "./work-session-action-guard.js";
 
 const root = await mkdtemp(join(tmpdir(), "kontrol-bridge-flow-"));
+const VERIFY_WS = "ws-verification-test";
+const verificationWorkspaceRoot = join(root, "verification-workspace");
+await mkdir(verificationWorkspaceRoot, { recursive: true });
 
 // A minimal MCP server that captures each registered tool handler.
 function fakeServer(): {
@@ -42,13 +45,11 @@ function fakeServer(): {
 }
 
 // Seed a workspace_sessions parent row so FK constraints pass.
-function seedWorkspace(dir: string, id: string): void {
+function seedWorkspace(dir: string, id: string, workspaceRoot = "/tmp"): void {
   const db = new Database(databasePath(dir));
   db.pragma("foreign_keys = OFF");
-  db.exec(
-    `insert into workspace_sessions (id, root, status, mode, managed, created_at, last_used_at) ` +
-    `values ('${id}', '/tmp', 'active', 'checkout', 'false', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')`,
-  );
+  db.prepare("insert into workspace_sessions (id, root, status, mode, managed, created_at, last_used_at) values (?, ?, 'active', 'checkout', 'false', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')")
+    .run(id, workspaceRoot);
   db.close();
 }
 
@@ -106,6 +107,7 @@ const agentRegistry = createAgentRegistryManager(db);
 const workspaces = {
   getWorkspace: (id: string) => {
     if (id === WS) return { id: WS, root: "/tmp", mode: "checkout" } as any;
+    if (id === VERIFY_WS) return { id: VERIFY_WS, root: verificationWorkspaceRoot, mode: "checkout" } as any;
     throw new Error(`Unknown workspace: ${id}`);
   },
   setActiveSession: () => {},
@@ -169,6 +171,7 @@ function createSession(): string {
 
 try {
   seedWorkspace(root, WS);
+  seedWorkspace(root, VERIFY_WS, verificationWorkspaceRoot);
 
   // Stand up a tiny healthy ACP agent endpoint so selectHealthyAgent() passes.
   httpServer = createServer(async (req, res) => {
@@ -392,6 +395,39 @@ try {
     );
   }
 
+  // ── Scenario 2a: temporary agent unavailability releases instead of dead-lettering ──
+  {
+    const sessionId = createSession();
+    await callWorker("submit_for_review", { sessionId });
+    agentRegistry.createRun({
+      agentName: "cli-coding-agent",
+      workspaceSessionId: WS,
+      workSessionId: sessionId,
+      inputPreview: "temporarily unavailable agent",
+      status: "running",
+    });
+    await callReviewer("provide_review_feedback", { sessionId, verdict: "changes_requested", comments: "Retry after the agent returns." });
+    const continuation = continuationManager.listForSession(sessionId).find((entry) => entry.status === "pending");
+    assert.ok(continuation);
+    const unavailableConfig = {
+      ...config,
+      agentRegistry: {
+        getRunByWorkSessionId: agentRegistry.getRunByWorkSessionId.bind(agentRegistry),
+        listAlive: () => [],
+      },
+    } as unknown as BridgeConfig;
+    await runContinuationTick(unavailableConfig);
+    const deferred = dispatchOutbox.listByAggregate(continuation.id)[0];
+    assert.equal(deferred.status, "pending", `agent unavailability leaves the continuation queued: ${JSON.stringify({ deferred, continuation: continuationManager.get(continuation.id) })}`);
+    assert.equal(deferred.failureCount, 0, "temporary unavailability does not consume genuine-failure budget");
+    assert.equal(continuationManager.get(continuation.id)?.status, "pending");
+
+    db.sqlite.prepare("update dispatch_outbox set available_at = ? where id = ?").run("2000-01-01T00:00:00.000Z", deferred.id);
+    const before = resumeCalls;
+    await runContinuationTick(config);
+    assert.equal(resumeCalls, before + 1, "the same logical continuation dispatches when an agent is healthy again");
+  }
+
   // ── Scenario 2b: cancellation supersedes pending continuations and prevents relaunch ──
   {
     const sessionId = createSession();
@@ -471,7 +507,7 @@ try {
     assert.equal(continuationManager.get(legacy.id)?.status, "dispatched");
   }
 
-  // ── Scenario 2e: dead-lettered outbox rows block automatic backfill until explicit redrive ──
+  // ── Scenario 2e: genuine dead letters emit attention and require reviewer redrive ──
   {
     const sessionId = createSession();
     await callWorker("submit_for_review", { sessionId });
@@ -490,6 +526,8 @@ try {
       .prepare("select status, attempt_count from dispatch_outbox where aggregate_id = ?")
       .get(continuation.id) as { status: string; attempt_count: number };
     assert.equal(deadLetter.status, "dead_lettered", "third failed dispatch dead-letters the outbox row");
+    assert.ok(eventStore.getEventsForSession(sessionId).some((event) => event.type === "continuation.dispatch_attention"),
+      "a genuine continuation dead letter emits a durable reviewer attention event");
 
     await runContinuationTick(config);
     const rowCount = db.sqlite
@@ -497,9 +535,17 @@ try {
       .get(continuation.id) as { count: number };
     assert.equal(rowCount.count, 1, "dead-lettered continuation is not automatically backfilled as a fresh outbox row");
 
-    const redriven = dispatchOutbox.redriveDeadLetter("continuation.ready", continuation.id, continuation.reviewEpoch);
-    assert.equal(redriven?.status, "pending", "explicit redrive resets the dead-lettered row");
-    assert.equal(redriven?.attemptCount, 0, "explicit redrive resets attempt count");
+    const reviewerRedrive = await callReviewer("redrive_continuation", {
+      workSessionId: sessionId,
+      continuationId: continuation.id,
+    });
+    assert.equal(reviewerRedrive.isError, undefined, "reviewer can redrive the failed continuation");
+    assert.equal(reviewerRedrive.structuredContent.redriven, true);
+    const redriven = dispatchOutbox.listByAggregate(continuation.id)[0];
+    assert.equal(redriven.status, "pending", "reviewer redrive resets the dead-lettered row");
+    assert.equal(redriven.attemptCount, 0, "reviewer redrive resets the claim counter");
+    assert.ok(eventStore.getEventsForSession(sessionId).some((event) => event.type === "continuation.redriven"),
+      "redrive is recorded as a durable workspace event");
   }
 
   // ── Scenario 3: stale feedback is not replayed ──
@@ -1027,16 +1073,16 @@ try {
 
   // ── Scenario: anti-runaway loop guard stops a non-converging correction loop ──
   {
-    const sessionId = createSession();
+    const sessionId = workSessions.create({ workspaceSessionId: VERIFY_WS, submittedBy: "webui" }).id;
     currentSnapshot = "verification-snapshot";
     missionLedger.createMission({
-      workSessionId: sessionId, workspaceSessionId: WS, objective: "Verify command",
+      workSessionId: sessionId, workspaceSessionId: VERIFY_WS, objective: "Verify command",
       acceptanceCriteria: [{ id: "verify-command", description: "command exits cleanly", verificationType: "test", verificationCommand: "npm --version" }],
       finalVerification: ["npm --version"],
     });
     await callWorker("submit_for_review", { sessionId });
     const verification = await callReviewer("run_mission_verification", { workSessionId: sessionId });
-    assert.equal(verification.isError, undefined, "reviewer may run declared verification");
+    assert.equal(verification.isError, undefined, `reviewer may run declared verification: ${JSON.stringify(verification)}`);
     assert.equal(verification.structuredContent.results[0].status, "passed");
     assert.equal(verification.structuredContent.results[1].status, "passed", "final integration command also passes");
     const packet = missionLedger.getPacket(sessionId);

@@ -90,16 +90,19 @@ export function assertWorkerWorkspaceBinding(
   workSessions: WorkSessionManager | undefined,
   workspaceId: string,
 ): { content: Array<{ type: "text"; text: string }>; isError: true } | null {
-  if (connectionContext?.authenticatedRole === "worker" && connectionContext.workSessionId && workSessions) {
-    const session = workSessions.get(connectionContext.workSessionId);
-    const allowed = session?.workspaceSessionId;
-    if (allowed && workspaceId !== allowed) {
-      return {
-        content: [{ type: "text" as const, text: "Forbidden: worker is bound to a different workspace than the requested one." }],
-        isError: true,
-      };
-    }
-  }
+  if (connectionContext?.authenticatedRole !== "worker") return null;
+  const denied = () => ({
+    content: [{ type: "text" as const, text: "Forbidden: worker is not bound to the requested workspace." }],
+    isError: true as const,
+  });
+  if (!connectionContext.workSessionId || !workSessions) return denied();
+  const session = workSessions.get(connectionContext.workSessionId);
+  const allowed = session?.workspaceSessionId;
+  if (
+    !allowed ||
+    workspaceId !== allowed ||
+    (connectionContext.workspaceSessionId !== undefined && connectionContext.workspaceSessionId !== allowed)
+  ) return denied();
   return null;
 }
 

@@ -90,7 +90,11 @@ export function createWorkspaceLeaseStore(db: DatabaseHandle) {
       return result.changes;
     },
 
-    renewWorkspaceLeaseForSession(workSessionId: string, ttlMs?: number, leaseNonce?: string): number {
+    renewWorkspaceLeaseForSession(workSessionId: string, ttlMs: number | undefined, leaseNonce: string): number {
+      // A session ID is attribution, not proof that the caller still owns the
+      // checkout. Renewal without the acquisition nonce would let a stale
+      // worker extend a lease after another owner rotated the fence.
+      if (!leaseNonce) return 0;
       const now = new Date();
       const nowIso = now.toISOString();
       const expiresAt = new Date(now.getTime() + (ttlMs ?? 60 * 60 * 1000)).toISOString();
@@ -100,10 +104,23 @@ export function createWorkspaceLeaseStore(db: DatabaseHandle) {
         .where(and(
           eq(workspaceLeases.workSessionId, workSessionId),
           gte(workspaceLeases.expiresAt, nowIso),
-          ...(leaseNonce ? [eq(workspaceLeases.leaseNonce, leaseNonce)] : []),
+          eq(workspaceLeases.leaseNonce, leaseNonce),
         ))
         .run();
       return result.changes;
+    },
+
+    getActiveWorkspaceLease(canonicalRoot: string): WorkspaceLease | undefined {
+      const nowIso = new Date().toISOString();
+      const lease = db.db
+        .select()
+        .from(workspaceLeases)
+        .where(and(
+          eq(workspaceLeases.canonicalRoot, canonicalRoot),
+          gte(workspaceLeases.expiresAt, nowIso),
+        ))
+        .get();
+      return lease ? rowToWorkspaceLease(lease) : undefined;
     },
 
     getWorkspaceLeaseForSession(workSessionId: string): WorkspaceLease | undefined {

@@ -7,12 +7,14 @@ import express from "express";
 import { openDatabase } from "./db/client.js";
 import { createAgentRegistryManager } from "./acp-registry.js";
 import { createAcpServer } from "./acp-server.js";
+import { createEventStore } from "./event-log.js";
 import { createWorkSessionManager } from "./work-sessions.js";
 
 const root = await mkdtemp(join(tmpdir(), "kontrol-acp-lifecycle-"));
 const database = openDatabase(root);
 const agents = createAgentRegistryManager(database);
 const workSessions = createWorkSessionManager(database);
+const eventStore = createEventStore(database);
 const peerRuns: Array<Record<string, unknown>> = [];
 const peer = createServer(async (req, res) => {
   if (req.method === "GET" && req.url === "/health") {
@@ -37,14 +39,14 @@ acpApp.use("/acp", createAcpServer(
   {
     getWorkspace: (id: string) => {
       if (id !== "ws-e2e") throw new Error(`Unknown workspace: ${id}`);
-      return { id, root, mode: "worktree" };
+      return { id, root, mode: "checkout" };
     },
   } as any,
   workSessions,
   agents,
   "operator-secret",
   "adapter-secret",
-  undefined,
+  eventStore,
   undefined,
   undefined,
   undefined,
@@ -98,11 +100,20 @@ try {
   assert.equal(peerRuns.length, 1);
   assert.equal(peerRuns[0]?.agent_id, agentId);
   assert.equal(peerRuns[0]?.workspace_session_id, "ws-e2e");
+  assert.equal(peerRuns[0]?.attempt_number, 1, "dispatch binds the adapter events to the current attempt");
+  assert.ok(peerRuns[0]?.workspace_lease_expires_at, "dispatch gives the adapter its initial lease deadline");
   const runId = dispatch.body.kontrol_run_id as string;
   const sessionId = dispatch.body.session_id as string;
   assert.ok(runId && sessionId);
 
-  const lifecycle = async (type: string, payload?: Record<string, unknown>) => jsonFetch(`/runs/${encodeURIComponent(runId)}/events`, {
+  const workspaceLeaseNonce = peerRuns[0]?.workspace_lease_nonce as string | undefined;
+  assert.ok(workspaceLeaseNonce, "dispatch gives the adapter its checkout fencing nonce");
+  const lifecycle = async (
+    type: string,
+    payload?: Record<string, unknown>,
+    leaseNonce?: string,
+    eventId?: string,
+  ) => jsonFetch(`/runs/${encodeURIComponent(runId)}/events`, {
     method: "POST",
     headers: {
       Authorization: "Bearer agent-secret",
@@ -114,15 +125,36 @@ try {
       type,
       remote_run_id: "remote-e2e-1",
       attempt_number: 1,
+      event_id: eventId,
       agent_id: agentId,
       work_session_id: sessionId,
+      workspace_lease_nonce: leaseNonce,
       payload,
     }),
   });
 
-  assert.equal((await lifecycle("started")).status, 202);
-  assert.equal((await lifecycle("output_delta", { text: "working" })).status, 202);
-  const completed = await lifecycle("completed", { final_output: "done ✅" });
+  const missingNonce = await lifecycle("heartbeat", undefined, undefined);
+  assert.equal(missingNonce.status, 409, "lease renewal without a fencing nonce is rejected");
+  assert.equal(missingNonce.body.error?.code, "workspace_lease_lost");
+  const started = await lifecycle("started", undefined, workspaceLeaseNonce);
+  assert.equal(started.status, 202);
+  assert.ok(started.body.workspace_lease_expires_at, "lease renewal acknowledgement carries its new expiry");
+  const heartbeatBeforeStaleAttempt = agents.getRun(runId)?.lastHeartbeatAt;
+  const staleNonce = await lifecycle("heartbeat", undefined, "stale-fencing-token");
+  assert.equal(staleNonce.status, 409, "a stale worker generation cannot renew the lease");
+  assert.equal(staleNonce.body.error?.code, "workspace_lease_lost");
+  assert.equal(agents.getRun(runId)?.lastHeartbeatAt, heartbeatBeforeStaleAttempt,
+    "rejected lease renewals do not update worker heartbeat state");
+  const outputEvent = await lifecycle("output_delta", { text: "working" }, workspaceLeaseNonce, "telemetry-output-1");
+  assert.equal(outputEvent.status, 202);
+  const ingressReceipt = database.sqlite.prepare("select status, payload_json from telemetry_ingress where event_id = ?")
+    .get("telemetry-output-1") as { status: string; payload_json?: string | null } | undefined;
+  assert.ok(ingressReceipt, "the adapter fragment receipt is committed before HTTP 202 is sent");
+  assert.equal(JSON.parse(ingressReceipt.payload_json!).text, "working");
+  const duplicateOutput = await lifecycle("output_delta", { text: "working" }, workspaceLeaseNonce, "telemetry-output-1");
+  assert.equal(duplicateOutput.status, 202);
+  assert.equal(duplicateOutput.body.duplicate, true, "event-id retries are recognized while coalescing is still pending");
+  const completed = await lifecycle("completed", { final_output: "done ✅" }, workspaceLeaseNonce);
   assert.equal(completed.status, 202);
   assert.equal(completed.body.status, "completed", "authenticated lifecycle completion updates the durable run");
   assert.equal(agents.getRun(runId)?.status, "completed");
@@ -134,6 +166,7 @@ try {
   await new Promise<void>((resolve) => server.close(() => resolve()));
   await new Promise<void>((resolve) => peer.close(() => resolve()));
   agents.close();
+  eventStore.close();
   workSessions.close();
   database.close();
   await rm(root, { recursive: true, force: true });

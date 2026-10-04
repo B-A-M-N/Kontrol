@@ -7,6 +7,7 @@
 import * as z from "zod/v4";
 import { createHash } from "node:crypto";
 import { relative } from "node:path";
+import { realpath } from "node:fs/promises";
 import { brandWorkSessionId, brandWorkspaceId } from "../../branded.js";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -68,6 +69,7 @@ import { assertWorkerWorkspaceBinding, processOutputSchema, processToolResponse 
 import type { ToolEnvelope } from "../tool-envelope.js";
 import { processSessionOwnerId, type ConnectionContext } from "../connection-context.js";
 import { MISSING_FILE_VERSION, readFileVersion, withFileMutationLock } from "../../mutation-version.js";
+import { assertAllowedPath, expandHomePath } from "../../roots.js";
 
 export interface WorkspaceToolsDeps {
   readonly config: ServerConfig;
@@ -322,7 +324,34 @@ export function registerWorkspaceTools(
     },
     async ({ path, mode, baseRef }) => {
       const startedAt = performance.now();
-      const { workspace, agentsFiles, availableAgentsFiles } = await workspaces.openWorkspace({ path, mode, baseRef }, connectionContext?.mcpSessionId);
+      let openedWorkspace;
+      if (connectionContext?.authenticatedRole === "worker") {
+        const session = connectionContext.workSessionId ? workSessions?.get(connectionContext.workSessionId) : undefined;
+        const workspaceSessionId = session?.workspaceSessionId;
+        if (!workspaceSessionId || workspaceSessionId !== connectionContext.workspaceSessionId) {
+          return { content: [textBlock("Forbidden: worker has no valid signed workspace binding.")], isError: true };
+        }
+        const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceSessionId);
+        if (bindingErr) return bindingErr;
+        if (mode === "worktree" || baseRef !== undefined) {
+          return { content: [textBlock("Forbidden: workers may only reopen their existing workspace; worktree creation is not available to workers.")], isError: true };
+        }
+        const workspace = workspaces.getWorkspace(workspaceSessionId);
+        let requestedRoot: string;
+        try {
+          requestedRoot = assertAllowedPath(expandHomePath(path), [workspace.root]);
+          requestedRoot = await realpath(requestedRoot);
+        } catch {
+          return { content: [textBlock("Forbidden: worker may only reopen its bound workspace.")], isError: true };
+        }
+        if (requestedRoot !== workspace.root) {
+          return { content: [textBlock("Forbidden: worker may only reopen its bound workspace.")], isError: true };
+        }
+        openedWorkspace = await workspaces.openExistingWorkspace(workspaceSessionId, connectionContext.mcpSessionId);
+      } else {
+        openedWorkspace = await workspaces.openWorkspace({ path, mode, baseRef }, connectionContext?.mcpSessionId);
+      }
+      const { workspace, agentsFiles, availableAgentsFiles } = openedWorkspace;
       const gitEligibility = await getGitEligibility(workspace.root);
       const workspaceKind = workspace.mode;
       const versionControl = gitEligibility.ok ? "git" : "none";
@@ -426,6 +455,100 @@ export function registerWorkspaceTools(
           instruction,
         },
       };
+    },
+  );
+
+  registerAppTool(
+    server,
+    registeredTool(toolNames.listManagedWorktrees),
+    {
+      title: "List managed worktrees",
+      description: "List managed worktrees, including retired entries and their clean, dirty, or divergent disposition. Dirty or divergent retired worktrees remain visible for explicit handling.",
+      inputSchema: {
+        before: z.object({ createdAt: z.string(), id: z.string() }).optional().describe("Cursor from the previous page."),
+      },
+      outputSchema: {
+        worktrees: z.array(z.object({
+          workspaceId: z.string(),
+          projectId: z.string().optional(),
+          sourceRoot: z.string().optional(),
+          path: z.string(),
+          baseSha: z.string().optional(),
+          status: z.string(),
+          retiredAt: z.string().optional(),
+          cleanToBase: z.boolean(),
+          dispositionRequired: z.boolean(),
+          dispositionReason: z.string().optional(),
+        })),
+        nextCursor: z.object({ createdAt: z.string(), id: z.string() }).optional(),
+      },
+      _meta: {},
+      annotations: { readOnlyHint: true, idempotentHint: true },
+    },
+    async ({ before }) => {
+      if (connectionContext?.authenticatedRole === "worker") {
+        return { content: [textBlock("Forbidden: workers cannot enumerate managed worktrees.")], isError: true };
+      }
+      try {
+        const page = await workspaces.listManagedWorktrees(before);
+        return {
+          content: [textBlock(JSON.stringify(page, null, 2))],
+          structuredContent: page,
+        };
+      } catch (error) {
+        return { content: [textBlock(error instanceof Error ? error.message : String(error))], isError: true };
+      }
+    },
+  );
+
+  registerAppTool(
+    server,
+    registeredTool(toolNames.retireManagedWorktree),
+    {
+      title: "Retire managed worktree",
+      description: "Retire an unused managed worktree. Refuses while work sessions, pending reviews or approvals, or running processes still use it. Physical cleanup happens after the configured retention period and only when the worktree is clean and still at its creation base.",
+      inputSchema: {
+        workspaceId: z.string().describe("Managed worktree workspace identifier."),
+      },
+      outputSchema: {
+        workspaceId: z.string(),
+        status: z.enum(["retired", "blocked", "already_retired"]),
+        blockers: z.object({
+          workSessions: z.number(),
+          pendingReviews: z.number(),
+          pendingApprovals: z.number(),
+          runningProcesses: z.number().optional(),
+        }).optional(),
+        retiredAt: z.string().optional(),
+      },
+      _meta: {},
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+    },
+    async ({ workspaceId }) => {
+      if (connectionContext?.authenticatedRole === "worker") {
+        return { content: [textBlock("Forbidden: workers cannot retire managed worktrees.")], isError: true };
+      }
+      try {
+        const runningProcesses = processSessions.countRunningForWorkspace(workspaceId);
+        const result = workspaces.retireManagedWorktree(workspaceId, runningProcesses);
+        const status = result.retired
+          ? "retired"
+          : result.session?.status === "retired" || result.session?.status === "removed"
+            ? "already_retired"
+            : "blocked";
+        const structuredContent = {
+          workspaceId,
+          status,
+          blockers: result.blockers,
+          retiredAt: result.session?.retiredAt,
+        };
+        return {
+          content: [textBlock(JSON.stringify(structuredContent, null, 2))],
+          structuredContent,
+        };
+      } catch (error) {
+        return { content: [textBlock(error instanceof Error ? error.message : String(error))], isError: true };
+      }
     },
   );
 
@@ -554,6 +677,7 @@ export function registerWorkspaceTools(
           undefined,
           undefined,
           input.approvalResumeId,
+          input,
         );
         if (!approved.allowed) {
           return policyFailureResponse(approved, `Tool "${toolNames.read}" denied by policy. Path: ${input.path}`, {
@@ -695,6 +819,7 @@ export function registerWorkspaceTools(
             undefined,
             undefined,
             input.approvalResumeId,
+            { expectedContentSha256, ...input },
           );
         if (!approved.allowed) {
           return policyFailureResponse(approved, `Tool "${toolNames.write}" denied by policy. Path: ${input.path}`, {
@@ -734,7 +859,7 @@ export function registerWorkspaceTools(
 
       // P1 (audit): record the structured mutation path so the next review
       // submission can state whether the checkpoint represents it.
-      await reviewCheckpoints.recordMutations({ workspaceId, root: workspace.root, paths: [input.path] });
+      await reviewCheckpoints.recordMutations({ workspaceId, root: workspace.root, workSessionId: connectionContext?.workSessionId, paths: [input.path] });
 
       const patch = newFilePatch(input.path, input.content);
       const stats = countDiffStats(patch);
@@ -850,6 +975,7 @@ export function registerWorkspaceTools(
             undefined,
             undefined,
             input.approvalResumeId,
+            { expectedContentSha256, ...input },
           );
         if (!approved.allowed) {
           return policyFailureResponse(approved, `Tool "${toolNames.edit}" denied by policy. Path: ${input.path}`, {
@@ -889,7 +1015,7 @@ export function registerWorkspaceTools(
 
       // P1 (audit): record the structured mutation path so the next review
       // submission can state whether the checkpoint represents it.
-      await reviewCheckpoints.recordMutations({ workspaceId, root: workspace.root, paths: [input.path] });
+      await reviewCheckpoints.recordMutations({ workspaceId, root: workspace.root, workSessionId: connectionContext?.workSessionId, paths: [input.path] });
 
       const stats = countDiffStats(
         response.details?.patch ?? response.details?.diff,
@@ -1015,6 +1141,7 @@ export function registerWorkspaceTools(
             undefined,
             policyPaths,
             approvalResumeId,
+            { patch, expectedContentSha256ByPath },
           );
           if (!approved.allowed) {
             return policyFailureResponse(approved, `Tool "apply_patch" denied by policy.`, {
@@ -1060,6 +1187,7 @@ export function registerWorkspaceTools(
         await reviewCheckpoints.recordMutations({
           workspaceId,
           root: workspace.root,
+          workSessionId: connectionContext?.workSessionId,
           paths: applied.files.map((file) => file.previousPath ?? file.path),
         });
         const paths = applied.files.map((file) => file.path).join(", ");
@@ -1152,6 +1280,7 @@ export function registerWorkspaceTools(
           root: workspace.root,
           since: since ?? "last_shown",
           markReviewed: markReviewed ?? true,
+          presentationOwnerId: processSessionOwnerId(connectionContext) ?? "default",
         });
 
         const content = [textBlock(review.result)];
@@ -1243,6 +1372,7 @@ export function registerWorkspaceTools(
             undefined,
             undefined,
             input.approvalResumeId,
+            input,
           );
           if (!approved.allowed) {
             return policyFailureResponse(approved, `Tool "${toolNames.grep}" denied by policy.`, {
@@ -1361,6 +1491,7 @@ export function registerWorkspaceTools(
             undefined,
             undefined,
             input.approvalResumeId,
+            input,
           );
           if (!approved.allowed) {
             return policyFailureResponse(approved, `Tool "${toolNames.glob}" denied by policy.`, {
@@ -1478,6 +1609,7 @@ export function registerWorkspaceTools(
             undefined,
             undefined,
             input.approvalResumeId,
+            input,
           );
           if (!approved.allowed) {
             return policyFailureResponse(approved, `Tool "${toolNames.ls}" denied by policy. Path: ${input.path}`, {
@@ -1560,6 +1692,7 @@ export function registerWorkspaceTools(
         workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
         path: z.string().optional().describe("Optional path relative to the workspace root."),
         ...inputSchema,
+        approvalResumeId: approvalResumeIdSchema,
       },
       outputSchema: resultOutputSchema({
         truncated: z.boolean().optional(), returnedLines: z.number().int().optional(),
@@ -1569,10 +1702,42 @@ export function registerWorkspaceTools(
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
     }, async ({ workspaceId, path: requestedPath, ...input }) => {
       const startedAt = performance.now();
+      const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
+      if (bindingErr) return bindingErr;
       const workspace = workspaces.getWorkspace(workspaceId);
       const pathArgs = gitPathArg(workspaces, workspace, requestedPath);
-      const output = await run(workspace.root, pathArgs.length ? requestedPath : undefined, input as Record<string, unknown>);
-      const inspection = inspectionMetadata([textBlock(output)], undefined);
+      const absolutePath = requestedPath !== undefined ? workspaces.resolvePath(workspace, requestedPath) : undefined;
+      if (policyEnforcer && policyEngine) {
+        const approved = await enforceToolPolicy(
+          workSessions,
+          policyEnforcer,
+          brandWorkspaceId(workspaceId),
+          connectionContext?.workSessionId ? brandWorkSessionId(connectionContext.workSessionId) : undefined,
+          connectionContext?.runId,
+          toolNames.read,
+          canonicalPolicyPath(workspace.root, requestedPath, absolutePath),
+          undefined,
+          undefined,
+          input.approvalResumeId as string | undefined,
+          { path: requestedPath, ...input },
+        );
+        if (!approved.allowed) {
+          return policyFailureResponse(approved, `Tool "${name}" denied by read policy. Path: ${requestedPath ?? "."}`, {
+            tool: name,
+            workspaceId,
+            path: requestedPath,
+          });
+        }
+      }
+      const newlyApplicable = requestedPath
+        ? await workspaces.loadApplicableInstructions(workspace, requestedPath, connectionContext?.mcpSessionId)
+        : [];
+      const output = await run(workspace.root, pathArgs.length ? pathArgs[pathArgs.length - 1] : undefined, input as Record<string, unknown>);
+      workspaces.acknowledgeApplicableInstructions(workspace, newlyApplicable, connectionContext?.mcpSessionId);
+      const responseContent = newlyApplicable.length > 0
+        ? [...instructionContent(newlyApplicable, workspace.root), textBlock(output)]
+        : [textBlock(output)];
+      const inspection = inspectionMetadata(responseContent, undefined);
       const content = inspection.content;
       logToolCall(config, { tool: name, workspaceId, path: requestedPath, success: true, durationMs: Math.round(performance.now() - startedAt) });
       trackToolEvent(workspaceId, name, { path: requestedPath, ...input }, { content, isError: false }, startedAt);
@@ -1684,6 +1849,7 @@ export function registerWorkspaceTools(
           input.command,
           undefined,
           input.approvalResumeId,
+          { workingDirectory, ...input },
         );
         if (!approved.allowed) {
           return policyFailureResponse(approved, `Tool "${toolNames.shell}" denied by policy. Command: ${input.command}`, {

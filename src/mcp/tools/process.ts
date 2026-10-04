@@ -102,6 +102,7 @@ export function registerCodexProcessTools(
           cmd,
           undefined,
           approvalResumeId,
+          { cmd, workingDirectory, tty, columns, rows, yieldTimeMs, maxOutputTokens, clientMutationId },
         );
         if (!approved.allowed) {
           return policyFailureResponse(approved, `Tool "exec_command" denied by policy. Command: ${cmd}`, {
@@ -216,6 +217,7 @@ export function registerCodexProcessTools(
           chars,
           undefined,
           approvalResumeId,
+          { sessionId, chars, columns, rows, yieldTimeMs, maxOutputTokens },
         );
         if (!approved.allowed) {
           return policyFailureResponse(approved, `Tool "write_stdin" denied by policy: cannot send input to a gated process.`, {

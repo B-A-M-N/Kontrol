@@ -72,7 +72,7 @@ export function toolWidgetDescriptorMeta(
   if (kind === "workspace") return { _meta: {} };
   if (config.widgets === "changes" && toolCanRequireInteractiveApproval(config.policy, kind)) {
     return {
-      _meta: workspaceAppCallableToolMeta(),
+      _meta: workspaceAppRenderToolMeta(),
     };
   }
   if (!shouldAttachWidget(config.widgets, kind)) return { _meta: {} };

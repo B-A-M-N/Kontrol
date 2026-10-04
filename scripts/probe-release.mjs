@@ -8,6 +8,21 @@ import { tmpdir } from "node:os";
 import { validateRelease } from "./validate-release.mjs";
 import { buildToolEnvironment, releaseProbeEnvironment } from "./lib/tool-environment.mjs";
 
+const repositoryRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
+
+function configuredGitIdentity() {
+  const value = (key) => {
+    const result = spawnSync("git", ["config", "--get", key], {
+      cwd: repositoryRoot,
+      encoding: "utf8",
+    });
+    const configured = result.status === 0 ? result.stdout.trim() : "";
+    if (!configured) throw new Error(`release probe requires configured Git ${key} in ${repositoryRoot}`);
+    return configured;
+  };
+  return { name: value("user.name"), email: value("user.email") };
+}
+
 function unusedTcpPort() {
   return new Promise((resolvePromise, reject) => {
     const server = createServer();
@@ -160,8 +175,9 @@ async function probeCandidateSurface(baseUrl, workspace, requiredInspectionTools
 async function bootSmoke(artifactPath, buildId) {
   const smokeRoot = mkdtempSync(join(tmpdir(), "kontrol-release-smoke-"));
   const port = await unusedTcpPort();
+  const identity = configuredGitIdentity();
   writeFileSync(join(smokeRoot, "README.md"), "# release probe fixture\n");
-  for (const args of [["init"], ["config", "user.email", "release-probe@example.invalid"], ["config", "user.name", "Release Probe"], ["add", "README.md"], ["commit", "-m", "release probe fixture"]]) {
+  for (const args of [["init"], ["config", "user.email", identity.email], ["config", "user.name", identity.name], ["add", "README.md"], ["commit", "-m", "release probe fixture"]]) {
     const result = spawnSync("git", args, { cwd: smokeRoot, encoding: "utf8" });
     if (result.status !== 0) throw new Error(`git fixture setup failed: ${result.stderr || result.stdout}`);
   }

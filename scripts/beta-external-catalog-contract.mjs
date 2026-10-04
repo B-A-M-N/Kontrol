@@ -17,6 +17,27 @@ function sortedUniqueNames(value) {
   return sorted;
 }
 
+function normalizedToolInputSchemas(value) {
+  if (!Array.isArray(value)) return undefined;
+  const entries = value.map((tool) => {
+    if (typeof tool?.name !== "string" || !tool.inputFields) return undefined;
+    const properties = sortedUniqueNames(tool.inputFields.properties);
+    const required = sortedUniqueNames(tool.inputFields.required);
+    if (!properties || !required || !tool.inputFields.types || typeof tool.inputFields.types !== "object") return undefined;
+    return [tool.name, { properties, required, types: tool.inputFields.types }];
+  });
+  if (entries.some((entry) => !entry)) return undefined;
+  const byName = new Map(entries);
+  if (byName.size !== entries.length) return undefined;
+  return Object.fromEntries([...byName.entries()].sort(([a], [b]) => a.localeCompare(b)));
+}
+
+function hasApprovalResumeInputs(schemas) {
+  const guarded = ["bash", "exec_command", "write", "edit", "apply_patch", "read", "git_status", "git_log", "git_diff", "git_show"];
+  return guarded.every((name) => !schemas || !Object.hasOwn(schemas, name)
+    || schemas[name].properties.includes("approvalResumeId"));
+}
+
 function normalizedOrigin(value) {
   return typeof value === "string" ? value.replace(/\/$/, "") : undefined;
 }
@@ -104,6 +125,14 @@ export function validateBetaExternalCatalogReceipt(receipt, { candidateBuildId, 
     && JSON.stringify(hostTools) === JSON.stringify(serverTools)
     && REQUIRED_BETA_EXTERNAL_TOOLS.every((name) => hostTools.includes(name)),
   );
+  const serverInputSchemas = normalizedToolInputSchemas(receipt?.serverToolMetadata);
+  const hostInputSchemas = normalizedToolInputSchemas(receipt?.hostToolMetadata);
+  const sameCatalogInputSchemas = Boolean(
+    serverInputSchemas
+    && hostInputSchemas
+    && JSON.stringify(serverInputSchemas) === JSON.stringify(hostInputSchemas)
+    && hasApprovalResumeInputs(serverInputSchemas),
+  );
   const sameCatalogTarget = Boolean(
     normalizedOrigin(receipt?.url)
     && normalizedOrigin(soak?.targetUrl)
@@ -186,6 +215,8 @@ export function validateBetaExternalCatalogReceipt(receipt, { candidateBuildId, 
     && Number.isInteger(receipt?.cycles)
     && receipt.cycles >= 1
     && receipt?.catalogParity === true
+    && receipt?.inputSchemaParity === true
+    && sameCatalogInputSchemas
     && receipt?.hostCatalogEvidenceSource === "operator_supplied"
     && receipt?.hostCatalogMachineVerified === false
     && hostCaptureIsOperatorSupplied
@@ -204,6 +235,7 @@ export function validateBetaExternalCatalogReceipt(receipt, { candidateBuildId, 
     valid,
     buildIdentityMatches,
     sameCatalogTools,
+    sameCatalogInputSchemas,
     sameCatalogTarget,
     workspaceApp: workspaceAppCheck,
     hostCaptureIsOperatorSupplied,

@@ -5,11 +5,17 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import assert from "node:assert/strict";
 import { loadConfig } from "./config.js";
+import { openDatabase } from "./db/client.js";
+import { createApprovalRequestManager } from "./approval-requests.js";
 import { GitWorktreeError } from "./git-worktrees.js";
+import { ProcessSessionManager } from "./process-sessions.js";
 import { SqliteWorkspaceStore } from "./workspace-store.js";
 import { WorkspaceRegistry } from "./workspaces.js";
+import { createWorkSessionManager } from "./work-sessions.js";
 
 const execFileAsync = promisify(execFile);
+const testGitName = (await execFileAsync("git", ["config", "user.name"], { cwd: process.cwd() })).stdout.trim();
+const testGitEmail = (await execFileAsync("git", ["config", "user.email"], { cwd: process.cwd() })).stdout.trim();
 const root = await mkdtemp(join(tmpdir(), "kontrol-workspace-test-"));
 
 try {
@@ -72,8 +78,8 @@ try {
   await writeFile(join(gitRoot, "AGENTS.md"), "git root instructions\n");
   await writeFile(join(gitRoot, "README.md"), "hello\n");
   await git(gitRoot, ["init"]);
-  await git(gitRoot, ["config", "user.email", "kontrol@example.com"]);
-  await git(gitRoot, ["config", "user.name", "Kontrol Test"]);
+  await git(gitRoot, ["config", "user.email", testGitEmail]);
+  await git(gitRoot, ["config", "user.name", testGitName]);
   await git(gitRoot, ["add", "."]);
   await git(gitRoot, ["commit", "-m", "Initial commit"]);
   await writeFile(join(gitRoot, "dirty.txt"), "not copied\n");
@@ -104,6 +110,116 @@ try {
     path: gitRoot,
     mode: "worktree",
   });
+
+  // Retirement refuses every live durable reference plus running processes.
+  // Once references are terminal it retires atomically and delays physical
+  // removal until retention elapses. Dirty retired worktrees remain visible.
+  const lifecycleDb = openDatabase(stateDir);
+  const lifecycleWorkSessions = createWorkSessionManager(lifecycleDb);
+  const lifecycleApprovals = createApprovalRequestManager(lifecycleDb);
+  const activeWorkSession = lifecycleWorkSessions.create({
+    workspaceSessionId: persistentWorktree.workspace.id,
+    submittedBy: "worktree-lifecycle-test",
+  });
+  const pendingSubmission = lifecycleWorkSessions.submitForReview({
+    workSessionId: activeWorkSession.id,
+    diff: "test diff",
+  });
+  const blockedByWorkSession = persistentRegistry.retireManagedWorktree(persistentWorktree.workspace.id, 0);
+  assert.equal(blockedByWorkSession.retired, false);
+  assert.equal(blockedByWorkSession.blockers?.workSessions, 1);
+  assert.equal(blockedByWorkSession.blockers?.pendingReviews, 1);
+
+  lifecycleWorkSessions.updateStatus(activeWorkSession.id, "approved");
+  const blockedByReview = persistentRegistry.retireManagedWorktree(persistentWorktree.workspace.id, 0);
+  assert.equal(blockedByReview.retired, false);
+  assert.equal(blockedByReview.blockers?.pendingReviews, 1, "a pending review stays a blocker even after its work session is terminal");
+
+  lifecycleDb.sqlite.prepare("update work_session_submissions set status = 'approved' where id = ?").run(pendingSubmission.id);
+  lifecycleDb.sqlite.prepare(`
+    insert into approval_requests (id, kind, workspace_session_id, title, options_json, status, created_at)
+    values ('approval-worktree-test', 'policy', ?, 'test approval', '[]', 'pending', ?)
+  `).run(persistentWorktree.workspace.id, new Date().toISOString());
+  const blockedByApproval = persistentRegistry.retireManagedWorktree(persistentWorktree.workspace.id, 0);
+  assert.equal(blockedByApproval.retired, false);
+  assert.equal(blockedByApproval.blockers?.pendingApprovals, 1);
+  lifecycleDb.sqlite.prepare("update approval_requests set status = 'approved' where id = 'approval-worktree-test'").run();
+
+  const processes = new ProcessSessionManager({ childEnvironmentAllowlist: [] });
+  try {
+    const processNode = JSON.stringify(process.execPath);
+    const running = await processes.start({
+      workspaceId: persistentWorktree.workspace.id,
+      cwd: persistentWorktree.workspace.root,
+      command: `${processNode} -e "setTimeout(() => {}, 30000)"`,
+      yieldTimeMs: 10,
+    });
+    assert.equal(running.running, true);
+    assert.equal(processes.countRunningForWorkspace(persistentWorktree.workspace.id), 1);
+    const blockedByProcess = persistentRegistry.retireManagedWorktree(
+      persistentWorktree.workspace.id,
+      processes.countRunningForWorkspace(persistentWorktree.workspace.id),
+    );
+    assert.equal(blockedByProcess.retired, false);
+    assert.equal(blockedByProcess.blockers?.runningProcesses, 1);
+  } finally {
+    await processes.shutdown();
+  }
+
+  const retired = persistentRegistry.retireManagedWorktree(persistentWorktree.workspace.id, 0);
+  assert.equal(retired.retired, true);
+  assert.equal(retired.session?.status, "retired");
+  assert.throws(() => persistentRegistry.getWorkspace(persistentWorktree.workspace.id), /retired/);
+  lifecycleDb.sqlite.prepare("update workspace_sessions set retired_at = ? where id = ?")
+    .run(new Date(Date.now() - 60_000).toISOString(), persistentWorktree.workspace.id);
+  const collectorConfig = loadConfig({
+    KONTROL_ALLOWED_ROOTS: root,
+    KONTROL_WORKTREE_ROOT: join(root, ".kontrol", "worktrees"),
+    KONTROL_AGENT_DIR: agentDir,
+    KONTROL_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+    KONTROL_MANAGED_WORKTREE_RETENTION_MS: "1",
+    PORT: "1",
+  });
+  const collector = new WorkspaceRegistry(collectorConfig, firstStore);
+  const retiredRow = lifecycleDb.sqlite.prepare("select mode, managed, status, retired_at from workspace_sessions where id = ?")
+    .get(persistentWorktree.workspace.id);
+  assert.equal(collectorConfig.managedWorktreeRetentionMs, 1);
+  const dueCandidates = firstStore.listExpiredRetiredManagedWorktrees(new Date().toISOString());
+  assert.equal(dueCandidates.length, 1, JSON.stringify(retiredRow));
+  assert.equal(dueCandidates[0].retiredAt, (retiredRow as { retired_at: string }).retired_at);
+  const cleanCollection = await collector.collectRetiredManagedWorktrees(() => 0);
+  assert.equal(cleanCollection.removed, 1, `expired clean worktree is garbage-collected (${JSON.stringify(cleanCollection)})`);
+  assert.equal(firstStore.getSession(persistentWorktree.workspace.id)?.status, "removed");
+  await assert.rejects(() => stat(persistentWorktree.workspace.root), { code: "ENOENT" });
+  assert.throws(
+    () => lifecycleWorkSessions.create({ workspaceSessionId: persistentWorktree.workspace.id, submittedBy: "late-session" }),
+    /is not active and cannot accept a new work session/,
+    "a retired or removed worktree cannot acquire new durable work sessions",
+  );
+  assert.throws(
+    () => lifecycleApprovals.create({
+      kind: "tool",
+      workspaceSessionId: persistentWorktree.workspace.id,
+      title: "late approval",
+    }),
+    /is not active and cannot accept a new approval request/,
+    "a retired or removed worktree cannot acquire a new approval request",
+  );
+
+  const dirtyWorktree = await persistentRegistry.openWorkspace({ path: gitRoot, mode: "worktree" });
+  await writeFile(join(dirtyWorktree.workspace.root, "README.md"), "uncommitted work must remain\n");
+  assert.equal(persistentRegistry.retireManagedWorktree(dirtyWorktree.workspace.id, 0).retired, true);
+  lifecycleDb.sqlite.prepare("update workspace_sessions set retired_at = ? where id = ?")
+    .run(new Date(Date.now() - 60_000).toISOString(), dirtyWorktree.workspace.id);
+  const dirtyCollection = await collector.collectRetiredManagedWorktrees(() => 0);
+  assert.equal(dirtyCollection.retained, 1, "dirty retired worktree remains in place");
+  const dirtyRecord = (await collector.listManagedWorktrees()).worktrees.find((entry) => entry.workspaceId === dirtyWorktree.workspace.id);
+  assert.equal(dirtyRecord?.dispositionRequired, true);
+  assert.equal(dirtyRecord?.dispositionReason, "working_tree_dirty");
+  assert.equal((await stat(dirtyWorktree.workspace.root)).isDirectory(), true);
+  assert.throws(() => persistentRegistry.getWorkspace(dirtyWorktree.workspace.id), /retired/);
+
+  lifecycleDb.close();
   firstStore.close();
 
   const secondStore = new SqliteWorkspaceStore(stateDir);
@@ -112,12 +228,51 @@ try {
   assert.equal(restoredWorkspace.root, root);
   assert.equal(restoredWorkspace.mode, "checkout");
 
-  const restoredWorktree = restoredRegistry.getWorkspace(persistentWorktree.workspace.id);
-  assert.equal(restoredWorktree.mode, "worktree");
-  assert.equal(restoredWorktree.sourceRoot, gitRoot);
-  assert.equal(restoredWorktree.root, persistentWorktree.workspace.root);
-  assert.equal(restoredWorktree.worktree?.managed, true);
+  assert.throws(() => restoredRegistry.getWorkspace(persistentWorktree.workspace.id), /removed/);
   secondStore.close();
+
+  // Project and global caps apply before creating another Git worktree.
+  const capRoot = join(root, "cap-project");
+  const capRoot2 = join(root, "cap-project-two");
+  const capRoot3 = join(root, "cap-project-three");
+  await Promise.all([capRoot, capRoot2, capRoot3].map(async (repo, index) => {
+    await mkdir(repo);
+    await writeFile(join(repo, "README.md"), `cap fixture ${index}\n`);
+    await git(repo, ["init"]);
+    await git(repo, ["config", "user.email", testGitEmail]);
+    await git(repo, ["config", "user.name", testGitName]);
+    await git(repo, ["add", "."]);
+    await git(repo, ["commit", "-m", "Initial commit"]);
+  }));
+  const capConfig = loadConfig({
+    KONTROL_ALLOWED_ROOTS: root,
+    KONTROL_WORKTREE_ROOT: join(root, ".capped-worktrees"),
+    KONTROL_AGENT_DIR: agentDir,
+    KONTROL_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+    KONTROL_MANAGED_WORKTREE_PROJECT_LIMIT: "1",
+    KONTROL_MANAGED_WORKTREE_GLOBAL_LIMIT: "2",
+    PORT: "1",
+  });
+  const capStore = new SqliteWorkspaceStore(join(root, ".cap-state"));
+  const capRegistry = new WorkspaceRegistry(capConfig, capStore);
+  await capRegistry.openWorkspace({ path: capRoot, mode: "worktree" });
+  await assert.rejects(
+    () => capRegistry.openWorkspace({ path: capRoot, mode: "worktree" }),
+    /project limit reached/,
+  );
+  await capRegistry.openWorkspace({ path: capRoot2, mode: "worktree" });
+  await assert.rejects(
+    () => capRegistry.openWorkspace({ path: capRoot3, mode: "worktree" }),
+    /global limit reached/,
+  );
+  const firstWorktreePage = capStore.listManagedWorktrees({ limit: 1 });
+  assert.equal(firstWorktreePage.worktrees.length, 1);
+  assert.ok(firstWorktreePage.nextCursor, "bounded managed-worktree listing exposes a continuation cursor");
+  const secondWorktreePage = capStore.listManagedWorktrees({ limit: 1, before: firstWorktreePage.nextCursor });
+  assert.equal(secondWorktreePage.worktrees.length, 1);
+  assert.notEqual(secondWorktreePage.worktrees[0].id, firstWorktreePage.worktrees[0].id);
+  assert.equal(secondWorktreePage.nextCursor, undefined);
+  capStore.close();
 
   if (platform() !== "win32") {
     const aliasRoot = join(root, "alias-root");

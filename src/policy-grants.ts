@@ -1,4 +1,4 @@
-import { eq, and, isNull } from "drizzle-orm";
+import { eq, and, gt, isNull, or } from "drizzle-orm";
 import { openDatabase, type DatabaseHandle } from "./db/client.js";
 import {
   policyApprovalGrants,
@@ -92,6 +92,37 @@ export function createSqliteGrantStore(
           ),
         )
         .run();
+    },
+
+    hasEffective(principalId: string, scope: GrantRecord["scope"], scopeId: string, approvalKey: string): boolean {
+      const now = new Date().toISOString();
+      return database.db
+        .select({ id: policyApprovalGrants.id })
+        .from(policyApprovalGrants)
+        .where(and(
+          eq(policyApprovalGrants.principalId, principalId),
+          eq(policyApprovalGrants.scope, scope),
+          eq(policyApprovalGrants.scopeId, scopeId),
+          eq(policyApprovalGrants.approvalKey, approvalKey),
+          isNull(policyApprovalGrants.revokedAt),
+          or(isNull(policyApprovalGrants.expiresAt), gt(policyApprovalGrants.expiresAt, now)),
+        ))
+        .limit(1)
+        .get() !== undefined;
+    },
+
+    getEffective(grantId: string): GrantRecord | undefined {
+      const now = new Date().toISOString();
+      const row = database.db
+        .select()
+        .from(policyApprovalGrants)
+        .where(and(
+          eq(policyApprovalGrants.id, grantId),
+          isNull(policyApprovalGrants.revokedAt),
+          or(isNull(policyApprovalGrants.expiresAt), gt(policyApprovalGrants.expiresAt, now)),
+        ))
+        .get();
+      return row ? rowToGrant(row) : undefined;
     },
 
     listEffective(): GrantRecord[] {

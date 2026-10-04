@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
-import { extractCatalog, extractServerInfoVersion, extractWorkspaceAppResourceUris, matchJsonRpcResponse, parseSseEventChunks } from "./lib/mcp-probe-protocol.mjs";
+import { assertInputSchemaCompatibility, extractCatalog, extractServerInfoVersion, extractWorkspaceAppResourceUris, matchJsonRpcResponse, parseSseEventChunks } from "./lib/mcp-probe-protocol.mjs";
 
 const args = process.argv.slice(2);
 function option(name, fallback) {
@@ -155,6 +155,7 @@ function assertCatalogParity(label, listed, sessionId) {
     assert.equal(hostCatalog.version, expectedVersion,
       `${label} external host catalog is missing or has a stale immutable MCP version`);
   }
+  assertInputSchemaCompatibility(actual.tools, hostCatalog.tools, label);
   observedCatalogs.push({
     label,
     serverInfoVersion: sessionId ? sessionVersions.get(sessionId) : undefined,
@@ -276,6 +277,7 @@ function writeProbeReceipt(cycles) {
     hostTools: [...hostCatalog.names].sort(),
     hostToolMetadata: hostCatalog.tools,
     catalogParity: true,
+    inputSchemaParity: true,
     workspaceApp: {
       deployedResourceUri: deployedWorkspaceAppUri,
       deployedCompatibilityUri: deployedWorkspaceAppCompatibilityUri,

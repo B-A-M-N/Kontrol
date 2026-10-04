@@ -16,8 +16,9 @@ import type { EventStore } from "../event-log.js";
 import { recordDegradedAudit } from "./tool-logging.js";
 import { contentText, type ToolContent } from "./tool-result.js";
 import { toolNames } from "./tool-names.js";
-import { WorkspaceMutationBlockedError } from "./mutation-barrier.js";
+import { WorkspaceMutationAuthorityError, WorkspaceMutationBlockedError } from "./mutation-barrier.js";
 import type { ConnectionContext } from "./connection-context.js";
+import { assertWorkerWorkspaceBinding } from "./process-tool-response.js";
 
 export interface ToolEnvelopeDeps {
   readonly config: ServerConfig;
@@ -119,19 +120,60 @@ export function createToolEnvelope(deps: ToolEnvelopeDeps): ToolEnvelope {
     }
   }
 
-  // P0 #3: Centralized mutation preflight. Every mutation-capable tool (write,
-  // edit, apply_patch, bash, exec_command, write_stdin) awaits the workspace's
-  // initial filesystem baseline through this single choke point, so a mutation
-  // can never race the background baseline capture and escape the review
-  // boundary. Reads may proceed immediately.
+  // Centralized mutation preflight. Every mutation-capable tool (write, edit,
+  // apply_patch, bash, exec_command, write_stdin) proves worker binding and
+  // checkout lease ownership here, before checkpoint initialization, policy
+  // waits, path resolution, or filesystem access.
   // P0.5: readiness is fail-closed. If no usable checkpoint backend could be
   // established, mutation is refused with a distinct error instead of
   // silently proceeding untracked. The only override is the explicit
   // operator escape hatch KONTROL_ALLOW_UNTRACKED_MUTATION (default off) —
   // automatic fallback is never acceptable for a review-safe boundary.
   async function prepareForMutation(workspaceId: string): Promise<void> {
-    if (!config.widgets || config.widgets === "off") return;
+    const bindingError = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
+    if (bindingError) {
+      throw new WorkspaceMutationAuthorityError(
+        workspaceId,
+        "workspace_binding_denied",
+        bindingError.content[0]?.text ?? "Forbidden: worker is not bound to the requested workspace.",
+        false,
+      );
+    }
+
     const workspace = workspaces.getWorkspace(workspaceId);
+    if (connectionContext?.authenticatedRole === "worker") {
+      const lease = workSessions?.getActiveWorkspaceLease(workspace.root);
+      if (
+        !connectionContext.workSessionId ||
+        !connectionContext.workspaceLeaseNonce ||
+        !lease ||
+        lease.workSessionId !== connectionContext.workSessionId ||
+        lease.workspaceSessionId !== workspaceId ||
+        lease.leaseNonce !== connectionContext.workspaceLeaseNonce
+      ) {
+        throw new WorkspaceMutationAuthorityError(
+          workspaceId,
+          "workspace_lease_lost",
+          "Workspace mutation refused because this worker no longer holds the current checkout lease.",
+          false,
+        );
+      }
+    } else {
+      const lease = workSessions?.getActiveWorkspaceLease(workspace.root);
+      if (lease) {
+        throw new WorkspaceMutationAuthorityError(
+          workspaceId,
+          "workspace_lease_conflict",
+          "Workspace mutation refused because a delegated work session currently holds the checkout lease.",
+          true,
+        );
+      }
+    }
+
+    // Lease and worker authority do not depend on the review widget setting.
+    // Widgets only control whether the additional checkpoint-readiness gate is
+    // enabled for this workspace.
+    if (!config.widgets || config.widgets === "off") return;
     try {
       await reviewCheckpoints.awaitWorkspaceReady({ workspaceId, root: workspace.root });
     } catch (error) {

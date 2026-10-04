@@ -26,6 +26,32 @@ writeFileSync(join(root, "added.txt"), "new\n");
 writeFileSync(join(root, "binary.bin"), Buffer.from([0, 1, 2, 3]));
 writeFileSync(join(root, "large.txt"), "x".repeat(200_000));
 
+const tabA = await manager.reviewChanges({
+  workspaceId,
+  root,
+  since: "last_shown",
+  markReviewed: true,
+  presentationOwnerId: "transport-tab-a",
+});
+const tabB = await manager.reviewChanges({
+  workspaceId,
+  root,
+  since: "last_shown",
+  markReviewed: false,
+  presentationOwnerId: "transport-tab-b",
+});
+assert.equal(tabA.summary.files, tabB.summary.files,
+  "one transport's last_shown checkpoint does not advance another transport's baseline");
+assert.equal((await manager.reviewChanges({
+  workspaceId,
+  root,
+  since: "last_shown",
+  presentationOwnerId: "transport-tab-a",
+})).summary.files, 0, "the owning transport sees its own advanced presentation baseline");
+const persistedPresentations = await manager.getSnapshotStore().loadBaselines(workspaceId);
+assert.ok(persistedPresentations?.presentations?.["transport-tab-a"], "filesystem presentation refs persist by owner");
+assert.ok(!persistedPresentations?.presentations?.["transport-tab-b"], "a read without markReviewed does not persist an advanced baseline");
+
 const sessionDiff = await manager.reviewChangesAgainstSnapshot({ workspaceId, root, baseline: baseline.snapshot });
 assert.deepEqual(sessionDiff.files.map((file) => file.path), ["added.txt", "binary.bin", "large.txt", "tracked.txt"]);
 assert.ok(sessionDiff.files.every((file) => file.type === "new" || file.type === "change"));

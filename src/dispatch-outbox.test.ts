@@ -112,6 +112,11 @@ try {
       ttlMs: 50,
     });
     assert.ok(acquired.acquired, "initial lease acquisition should succeed");
+    assert.equal(
+      workSessions.getActiveWorkspaceLease("/tmp/checkout-a")?.leaseNonce,
+      acquired.lease.leaseNonce,
+      "active lease lookup returns only the current root owner and fencing token",
+    );
     const originalExpiry = acquired.lease.expiresAt;
 
     // Re-acquisition rotates the fencing token. An old worker may no longer
@@ -127,12 +132,19 @@ try {
     assert.equal(workSessions.renewWorkspaceLeaseForSession(workspace.id, 60 * 60 * 1000, acquired.lease.leaseNonce), 0, "stale fencing token cannot renew");
     assert.equal(workSessions.renewWorkspaceLeaseForSession(workspace.id, 60 * 60 * 1000, reacquired.lease.leaseNonce), 1, "current fencing token renews");
 
-    // Renew from a "heartbeat" with a long TTL — expiry must move forward.
-    const renewed = workSessions.renewWorkspaceLeaseForSession(workspace.id, 60 * 60 * 1000);
-    assert.equal(renewed, 1, "renewal should touch exactly the one owned lease");
+    // Renewal without a fencing token is never ownership proof.
+    const renewWithoutNonce = workSessions.renewWorkspaceLeaseForSession as (
+      workSessionId: string,
+      ttlMs: number | undefined,
+      leaseNonce?: string,
+    ) => number;
+    const unfencedRenewal = renewWithoutNonce(workspace.id, 60 * 60 * 1000, undefined);
+    assert.equal(unfencedRenewal, 0, "renewal without the current nonce must fail closed");
+    const renewed = workSessions.renewWorkspaceLeaseForSession(workspace.id, 60 * 60 * 1000, reacquired.lease.leaseNonce);
+    assert.equal(renewed, 1, "renewal with the current nonce should touch exactly the one owned lease");
 
     // Renewal for a session that owns no lease is a harmless no-op.
-    const noneRenewed = workSessions.renewWorkspaceLeaseForSession("ws_session_nonexistent");
+    const noneRenewed = workSessions.renewWorkspaceLeaseForSession("ws_session_nonexistent", undefined, "missing-nonce");
     assert.equal(noneRenewed, 0, "renewing a session with no lease returns 0");
 
     // A second, unrelated session must NOT be able to seize the checkout now
@@ -156,6 +168,31 @@ try {
     }
 
     void originalExpiry;
+
+    // Expiry permits a new owner to take over, but the old worker's nonce
+    // cannot renew the new generation after takeover.
+    const expiring = workSessions.create({ workspaceSessionId: "ws_1", submittedBy: "expiry-test" });
+    const shortLease = workSessions.acquireWorkspaceLease({
+      canonicalRoot: "/tmp/checkout-expiry",
+      workspaceSessionId: "ws_1",
+      workSessionId: expiring.id,
+      ttlMs: 5,
+    });
+    assert.ok(shortLease.acquired);
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    assert.equal(workSessions.getActiveWorkspaceLease("/tmp/checkout-expiry"), undefined, "expired leases are not mutation authority");
+    const takeover = workSessions.acquireWorkspaceLease({
+      canonicalRoot: "/tmp/checkout-expiry",
+      workspaceSessionId: "ws_2",
+      workSessionId: other.id,
+      ttlMs: 60_000,
+    });
+    assert.ok(takeover.acquired, "a new work session can acquire an expired checkout");
+    assert.equal(
+      workSessions.renewWorkspaceLeaseForSession(expiring.id, 60_000, shortLease.lease.leaseNonce),
+      0,
+      "an expired worker cannot renew after another session takes over",
+    );
     db.close();
   }
 

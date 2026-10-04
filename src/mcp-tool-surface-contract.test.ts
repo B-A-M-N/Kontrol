@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -15,6 +16,8 @@ import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { loadConfig } from "./config.js";
 import { ProcessSessionManager } from "./process-sessions.js";
 import { WorkspaceRegistry } from "./workspaces.js";
+import { openDatabase } from "./db/client.js";
+import { createWorkSessionManager } from "./work-sessions.js";
 
 // Packaged candidates with the same npm version but different executable-tree
 // identities must advertise different MCP server versions.
@@ -96,6 +99,8 @@ try {
       for (const name of ["read", "grep", "glob", "ls", "git_status", "git_log", "git_diff", "git_show"]) {
         assert.ok(names.has(name), `${mode} must expose required inspection tool ${name}`);
       }
+      assert.ok(names.has("list_managed_worktrees"), `${mode} exposes managed worktree disposition listing`);
+      assert.ok(names.has("retire_managed_worktree"), `${mode} exposes guarded managed worktree retirement`);
       for (const name of expectation.present) {
         assert.ok(names.has(name), `${mode} must expose mode-specific tool ${name}`);
       }
@@ -117,6 +122,9 @@ try {
         `${mode} open_workspace must explain how to refresh a stale client catalog`);
       assert.match(openedSurface?.instruction ?? "", /meanwhile continue with available bounded structured tools such as read/i,
         `${mode} open_workspace must permit safe structured operations while reconnecting`);
+      const managed = await client.callTool({ name: "list_managed_worktrees", arguments: {} });
+      assert.notEqual(managed.isError, true, `${mode} managed worktree listing should be available`);
+      assert.deepEqual((managed.structuredContent as { worktrees?: unknown[] } | undefined)?.worktrees, []);
     } finally {
       await client.close();
       await server.close();
@@ -129,7 +137,241 @@ try {
 
 console.log("mcp-tool-surface-contract.test.ts: all assertions passed");
 
-const gitRoot = process.cwd();
+// Mutation authority is independent of checkpoint widgets. A direct client
+// cannot mutate a checkout while a delegated session holds its lease, while a
+// worker must present the live fencing nonce bound to that exact session.
+const leaseHarnessRoot = mkdtempSync(join(tmpdir(), "kontrol-lease-fence-"));
+const leaseWorkspaceRoot = join(leaseHarnessRoot, "workspace");
+const leaseStateDir = join(leaseHarnessRoot, "state");
+mkdirSync(leaseWorkspaceRoot, { recursive: true });
+mkdirSync(leaseStateDir, { recursive: true });
+const leaseConfig = loadConfig({
+  KONTROL_CONFIG_DIR: join(leaseHarnessRoot, "config"),
+  KONTROL_ALLOWED_ROOTS: leaseWorkspaceRoot,
+  KONTROL_STATE_DIR: leaseStateDir,
+  KONTROL_WORKTREE_ROOT: join(leaseHarnessRoot, "worktrees"),
+  KONTROL_AUTH_MODE: "tunnel",
+  KONTROL_ACP_ENABLED: "false",
+  KONTROL_POLICY_MODE: "allow",
+  KONTROL_LOG_LEVEL: "error",
+  KONTROL_WIDGETS: "off",
+  KONTROL_TOOL_MODE: "full",
+});
+const leaseWorkspaces = new WorkspaceRegistry(leaseConfig);
+const leaseCheckpoints = createReviewCheckpointManager({ snapshotStoreRoot: join(leaseHarnessRoot, "snapshots") });
+const leaseProcesses = new ProcessSessionManager({ childEnvironmentAllowlist: [] });
+const leaseDb = openDatabase(leaseStateDir);
+const leaseSessions = createWorkSessionManager(leaseDb);
+const makeLeaseClient = async (context?: {
+  authenticatedRole: "worker" | "reviewer" | "client";
+  workSessionId?: string;
+  workspaceSessionId?: string;
+  workspaceLeaseNonce?: string;
+  mcpSessionId?: string;
+}, policy?: { engine?: any; enforcer?: any }) => {
+  const server = createMcpServer(
+    leaseConfig,
+    leaseWorkspaces,
+    leaseCheckpoints,
+    leaseProcesses,
+    leaseSessions,
+    undefined, undefined, undefined, undefined,
+    policy?.engine, policy?.enforcer,
+    undefined, undefined,
+    context,
+  );
+  const client = new Client({ name: "lease-fence-test", version: "1.0.0" });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+  return { server, client };
+};
+let leaseClients: Array<{ server: ReturnType<typeof createMcpServer>; client: Client }> = [];
+try {
+  const direct = await makeLeaseClient({ authenticatedRole: "client", mcpSessionId: "lease-direct" });
+  leaseClients.push(direct);
+  const opened = await direct.client.callTool({
+    name: "open_workspace",
+    arguments: { path: leaseWorkspaceRoot, mode: "checkout" },
+  });
+  const workspaceId = (opened.structuredContent as { workspaceId: string }).workspaceId;
+  execFileSync("git", ["init", "-q", leaseWorkspaceRoot]);
+  const createdAt = new Date().toISOString();
+  // The test registry owns a separate SQLite handle; mirror the workspace row
+  // into the work-session fixture database, as the production composition
+  // shares one DatabaseHandle between these stores.
+  leaseDb.sqlite.prepare(
+    "insert into workspace_sessions (id, root, status, mode, managed, created_at, last_used_at) " +
+      "values (?, ?, 'active', 'checkout', 'false', ?, ?)",
+  ).run(workspaceId, leaseWorkspaceRoot, createdAt, createdAt);
+  const workSession = leaseSessions.create({ workspaceSessionId: workspaceId, submittedBy: "lease-fence-test" });
+  const acquired = leaseSessions.acquireWorkspaceLease({
+    canonicalRoot: leaseWorkspaceRoot,
+    workspaceSessionId: workspaceId,
+    workSessionId: workSession.id,
+    ttlMs: 60_000,
+  });
+  assert.ok(acquired.acquired, "test delegated session acquires its checkout lease");
+
+  const directWrite = await direct.client.callTool({
+    name: "write",
+    arguments: { workspaceId, path: "direct.txt", content: "must remain blocked" },
+  });
+  assert.equal((directWrite.structuredContent as { status?: string }).status, "workspace_lease_conflict",
+    "direct mutation is rejected while a delegated session owns the checkout");
+  assert.equal(existsSync(join(leaseWorkspaceRoot, "direct.txt")), false, "blocked direct mutation leaves the file unchanged");
+
+  const worker = await makeLeaseClient({
+    authenticatedRole: "worker",
+    workSessionId: workSession.id,
+    workspaceSessionId: workspaceId,
+    workspaceLeaseNonce: acquired.lease.leaseNonce,
+    mcpSessionId: "lease-worker-current",
+  });
+  leaseClients.push(worker);
+  const workerReopen = await worker.client.callTool({
+    name: "open_workspace",
+    arguments: { path: leaseWorkspaceRoot, mode: "checkout" },
+  });
+  assert.equal((workerReopen.structuredContent as { workspaceId?: string }).workspaceId, workspaceId,
+    "worker can reopen only the workspace identified by its signed session");
+  const workerWorktreeOpen = await worker.client.callTool({
+    name: "open_workspace",
+    arguments: { path: leaseWorkspaceRoot, mode: "worktree" },
+  });
+  assert.equal(workerWorktreeOpen.isError, true, "worker cannot create a managed worktree");
+  const otherRoot = join(leaseWorkspaceRoot, "other");
+  mkdirSync(otherRoot, { recursive: true });
+  const workerOtherOpen = await worker.client.callTool({
+    name: "open_workspace",
+    arguments: { path: otherRoot, mode: "checkout" },
+  });
+  assert.equal(workerOtherOpen.isError, true, "worker cannot open an arbitrary second workspace");
+  const otherOpened = await direct.client.callTool({
+    name: "open_workspace",
+    arguments: { path: otherRoot, mode: "checkout" },
+  });
+  const otherWorkspaceId = (otherOpened.structuredContent as { workspaceId: string }).workspaceId;
+  for (const name of ["git_status", "git_log", "git_diff", "git_show"]) {
+    const crossWorkspace = await worker.client.callTool({ name, arguments: { workspaceId: otherWorkspaceId } });
+    assert.equal(crossWorkspace.isError, true, `${name} rejects a workspace outside the signed worker binding`);
+  }
+  const workerWrite = await worker.client.callTool({
+    name: "write",
+    arguments: { workspaceId, path: "worker.txt", content: "current owner" },
+  });
+  assert.notEqual(workerWrite.isError, true, "worker with the current session and nonce can mutate its checkout");
+  assert.equal(existsSync(join(leaseWorkspaceRoot, "worker.txt")), true, "current lease owner mutation is applied");
+
+  const staleWorker = await makeLeaseClient({
+    authenticatedRole: "worker",
+    workSessionId: workSession.id,
+    workspaceSessionId: workspaceId,
+    workspaceLeaseNonce: "stale-fencing-token",
+    mcpSessionId: "lease-worker-stale",
+  });
+  leaseClients.push(staleWorker);
+  const staleWrite = await staleWorker.client.callTool({
+    name: "write",
+    arguments: { workspaceId, path: "stale.txt", content: "must remain blocked" },
+  });
+  assert.equal((staleWrite.structuredContent as { status?: string }).status, "workspace_lease_lost",
+    "a worker with a stale nonce is rejected even when its work-session binding is valid");
+  assert.equal(existsSync(join(leaseWorkspaceRoot, "stale.txt")), false, "stale worker mutation leaves the file unchanged");
+
+  const nestedRoot = join(leaseWorkspaceRoot, "nested");
+  mkdirSync(nestedRoot, { recursive: true });
+  writeFileSync(join(nestedRoot, "AGENTS.md"), "Nested access instruction marker.\n");
+  const deniedInvocations: any[] = [];
+  const denyPolicyClient = await makeLeaseClient(
+    { authenticatedRole: "client", mcpSessionId: "git-policy-deny" },
+    {
+      engine: {},
+      enforcer: { enforce: async (invocation: any) => {
+        deniedInvocations.push(invocation);
+        return { allowed: false, decision: { mode: "deny" } };
+      } },
+    },
+  );
+  leaseClients.push(denyPolicyClient);
+  for (const name of ["git_status", "git_log", "git_diff", "git_show"]) {
+    const denied = await denyPolicyClient.client.callTool({
+      name,
+      arguments: { workspaceId, ...(name === "git_status" ? { path: "nested" } : {}) },
+    });
+    assert.equal(denied.isError, true, `${name} obeys the canonical read policy`);
+  }
+  assert.deepEqual(deniedInvocations.map((entry) => entry.tool), ["read", "read", "read", "read"],
+    "all Git inspection tools are evaluated as canonical read operations");
+  assert.equal(deniedInvocations[0].path.absolutePath, nestedRoot,
+    "path-scoped Git policy receives the safely resolved workspace path");
+
+  const submission = leaseSessions.submitForReview({
+    workSessionId: workSession.id,
+    snapshotKind: "git",
+    snapshotRef: "test-snapshot",
+    snapshotCommit: "test-snapshot",
+    diff: "",
+  });
+  leaseSessions.submitFeedback({
+    workSessionId: workSession.id,
+    submissionId: submission.id,
+    verdict: "changes_requested",
+    comments: "Read the nested instructions before continuing.",
+    allowedNextActions: ["read_files"],
+  });
+  const allowedInvocations: any[] = [];
+  const readAllowedWorker = await makeLeaseClient(
+    {
+      authenticatedRole: "worker",
+      workSessionId: workSession.id,
+      workspaceSessionId: workspaceId,
+      workspaceLeaseNonce: acquired.lease.leaseNonce,
+      mcpSessionId: "lease-worker-read-allowed",
+    },
+    {
+      engine: {},
+      enforcer: { enforce: async (invocation: any) => {
+        allowedInvocations.push(invocation);
+        return { allowed: true, decision: { mode: "allow" } };
+      } },
+    },
+  );
+  leaseClients.push(readAllowedWorker);
+  const nestedGit = await readAllowedWorker.client.callTool({
+    name: "git_status",
+    arguments: { workspaceId, path: "nested" },
+  });
+  assert.notEqual(nestedGit.isError, true, "changes-requested read_files permission allows Git inspection");
+  assert.match(JSON.stringify(nestedGit.content), /Nested access instruction marker/,
+    "path-scoped Git inspection returns newly applicable nested instructions");
+  assert.equal(allowedInvocations[0].tool, "read", "Git inspection remains in the shared read policy class");
+} finally {
+  await Promise.all(leaseClients.map(async ({ client, server }) => {
+    await client.close();
+    await server.close();
+  }));
+  await leaseCheckpoints.drain();
+  leaseSessions.close();
+  leaseDb.close();
+  rmSync(leaseHarnessRoot, { recursive: true, force: true });
+}
+
+// Use a small isolated Git repository so git_diff exercises the tool's clean
+// response contract without depending on the size or dirty state of this test
+// runner's checkout.
+const gitHarnessRoot = mkdtempSync(join(tmpdir(), "kontrol-git-tools-"));
+const gitRoot = join(gitHarnessRoot, "repo");
+mkdirSync(gitRoot, { recursive: true });
+writeFileSync(join(gitRoot, "README.md"), "git inspection fixture\n");
+const gitFixtureIdentity = {
+  name: execFileSync("git", ["config", "user.name"], { cwd: process.cwd(), encoding: "utf8" }).trim(),
+  email: execFileSync("git", ["config", "user.email"], { cwd: process.cwd(), encoding: "utf8" }).trim(),
+};
+execFileSync("git", ["init", "-q"], { cwd: gitRoot });
+execFileSync("git", ["config", "user.name", gitFixtureIdentity.name], { cwd: gitRoot });
+execFileSync("git", ["config", "user.email", gitFixtureIdentity.email], { cwd: gitRoot });
+execFileSync("git", ["add", "README.md"], { cwd: gitRoot });
+execFileSync("git", ["commit", "-q", "-m", "init"], { cwd: gitRoot });
 {
   await createMcpServerForGitFixture();
 }
@@ -163,15 +405,13 @@ async function createMcpServerForGitFixture(): Promise<void> {
       ["git_diff", {}], ["git_show", { revision: "HEAD" }],
     ] as const) {
       const result = await client.callTool({ name, arguments: { workspaceId, ...args } });
-      assert.notEqual(result.isError, true, `${name} should not fail`);
+      assert.notEqual(result.isError, true, `${name} should not fail: ${JSON.stringify(result)}`);
       assert.notEqual((result.structuredContent as { status?: string }).status, "approval_required", `${name} must not prompt`);
     }
   } finally {
     await client.close();
     await server.close();
     await checkpoints.drain();
-    rmSync(join(gitRoot, ".kontrol-test-config-git-tools"), { recursive: true, force: true });
-    rmSync(join(gitRoot, ".kontrol-test-state-git-tools"), { recursive: true, force: true });
-    rmSync(join(gitRoot, ".kontrol-test-snapshots-git-tools"), { recursive: true, force: true });
+    rmSync(gitHarnessRoot, { recursive: true, force: true });
   }
 }

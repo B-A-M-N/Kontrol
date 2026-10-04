@@ -97,46 +97,54 @@ export function createWorkSessionStore(deps: WorkSessionStoreDeps) {
 
     create(input: { workspaceSessionId: string; submittedBy: string; title?: string; completionPolicy?: CompletionPolicy; ownerContextId?: string }): WorkSession {
       const now = new Date().toISOString();
-      const projectId = projectIdForWorkspace(input.workspaceSessionId);
-      const session: WorkSession = {
-        id: `wsess_${randomUUID()}`,
-        projectId,
-        workspaceSessionId: input.workspaceSessionId,
-        status: "in_progress",
-        completionPolicy: input.completionPolicy ?? "agent_completion",
-        reviewEpoch: 0,
-        submittedBy: input.submittedBy,
-        ownerContextId: input.ownerContextId,
-        title: input.title,
-        lastConsumedReviewEpoch: 0,
-        createdAt: now,
-        updatedAt: now,
-        lifecycle: "pending",
-        runtimeState: "pending",
-      };
-
-      db.db
-        .insert(workSessions)
-        .values({
-          id: session.id,
-          projectId: session.projectId ?? null,
-          workspaceSessionId: session.workspaceSessionId,
-          status: session.status,
-          runtimeState: session.runtimeState,
-          runtimeClassifiedAt: now,
-          completionPolicy: session.completionPolicy,
-          reviewEpoch: session.reviewEpoch,
-          submittedBy: session.submittedBy,
-          ownerContextId: session.ownerContextId ?? null,
-          title: session.title ?? null,
-          lastConsumedFeedbackId: null,
+      return db.sqlite.transaction(() => {
+        const workspace = db.sqlite.prepare("select status from workspace_sessions where id = ?")
+          .get(input.workspaceSessionId) as { status: string } | undefined;
+        if (!workspace || workspace.status !== "active") {
+          throw new Error(`Workspace ${input.workspaceSessionId} is not active and cannot accept a new work session.`);
+        }
+        const projectId = projectIdForWorkspace(input.workspaceSessionId);
+        const session: WorkSession = {
+          id: `wsess_${randomUUID()}`,
+          projectId,
+          workspaceSessionId: input.workspaceSessionId,
+          status: "in_progress",
+          completionPolicy: input.completionPolicy ?? "agent_completion",
+          reviewEpoch: 0,
+          submittedBy: input.submittedBy,
+          ownerContextId: input.ownerContextId,
+          title: input.title,
+          lastConsumedFeedbackId: undefined,
           lastConsumedReviewEpoch: 0,
-          createdAt: session.createdAt,
-          updatedAt: session.updatedAt,
-        })
-        .run();
+          createdAt: now,
+          updatedAt: now,
+          lifecycle: "pending",
+          runtimeState: "pending",
+        };
 
-      return session;
+        db.db
+          .insert(workSessions)
+          .values({
+            id: session.id,
+            projectId: session.projectId ?? null,
+            workspaceSessionId: session.workspaceSessionId,
+            status: session.status,
+            runtimeState: session.runtimeState,
+            runtimeClassifiedAt: now,
+            completionPolicy: session.completionPolicy,
+            reviewEpoch: session.reviewEpoch,
+            submittedBy: session.submittedBy,
+            ownerContextId: session.ownerContextId ?? null,
+            title: session.title ?? null,
+            lastConsumedFeedbackId: null,
+            lastConsumedReviewEpoch: 0,
+            createdAt: session.createdAt,
+            updatedAt: session.updatedAt,
+          })
+          .run();
+
+        return session;
+      }).immediate();
     },
 
     get(id: string): WorkSession | undefined {

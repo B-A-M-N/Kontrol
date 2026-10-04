@@ -10,7 +10,7 @@ import type { BridgeConfig } from "./context.js";
 import { callRemoteAgent, probeAgent, selectHealthyAgent } from "../acp-gateway.js";
 import { loadSkillIndex } from "../skills.js";
 import { registerMutationAppTool } from "./app-tool.js";
-import { acquireCheckoutModifyLease, checkoutLeaseNonce, forbidden, isReviewer, liveOwnerContextId, requireWorkSessionRead, resolveDelegationContext, workSessionInstructions } from "./shared.js";
+import { acquireCheckoutModifyLease, checkoutLeaseMetadata, forbidden, isReviewer, liveOwnerContextId, requireWorkSessionRead, resolveDelegationContext, workSessionInstructions } from "./shared.js";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
 import { z } from "zod/v4";
 
@@ -162,7 +162,7 @@ export function registerAgentTools(server: McpServer, config: BridgeConfig): voi
             task: `${task}\n\n${workSessionInstructions(wsId, selection.agent)}`,
             workspaceSessionId,
             workSessionId: wsId,
-            workspaceLeaseNonce: checkoutLeaseNonce(config, wsId),
+            ...checkoutLeaseMetadata(config, wsId),
             mode: "async",
             fireAndForget: true,
           },

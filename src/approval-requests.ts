@@ -24,6 +24,7 @@ export interface ApprovalRequest {
   agentId?: string;
   principalId?: string;
   approvalKey?: string;
+  operationHash?: string;
   mcpSessionId?: string;
   mcpRequestId?: string;
   waiterKey?: string;
@@ -63,6 +64,7 @@ export interface CreateApprovalRequestInput {
   agentId?: string;
   principalId?: string;
   approvalKey?: string;
+  operationHash?: string;
   mcpSessionId?: string;
   mcpRequestId?: string;
   waiterKey?: string;
@@ -104,6 +106,9 @@ export interface ApprovalRequestManager {
   touchDirectApproval(id: string, now?: string): void;
   /** Atomically consume a resolved one-shot operation approval. */
   consumeApprovedOperation(waiterKey: string): boolean;
+  /** Consume a direct one-shot approval bound to its exact owner, workspace,
+   * principal, and canonical full-operation hash. */
+  consumeApprovedDirectOperation(input: { principalId: string; workspaceSessionId: string; ownerContextId: string; operationHash: string }): boolean;
   close(): void;
 }
 
@@ -136,6 +141,7 @@ export function createApprovalRequestManager(
       agentId: input.agentId,
       principalId: input.principalId,
       approvalKey: input.approvalKey,
+      operationHash: input.operationHash,
       mcpSessionId: input.mcpSessionId,
       mcpRequestId: input.mcpRequestId,
       waiterKey: input.waiterKey,
@@ -168,38 +174,46 @@ export function createApprovalRequestManager(
         : undefined),
     };
 
-    database.db.insert(approvalRequests).values({
-      id: request.approvalId,
-      kind: request.kind,
-      workspaceSessionId: request.workspaceSessionId,
-      workSessionId: request.workSessionId ?? null,
-      ownerContextId: request.ownerContextId ?? null,
-      runId: request.runId ?? null,
-      agentId: request.agentId ?? null,
-      principalId: request.principalId ?? null,
-      approvalKey: request.approvalKey ?? null,
-      mcpSessionId: request.mcpSessionId ?? null,
-      mcpRequestId: request.mcpRequestId ?? null,
-      waiterKey: request.waiterKey ?? null,
-      liveWaiterId: request.liveWaiterId ?? null,
-      origin: request.origin ?? (request.workSessionId ? "work_session" : "direct_mcp"),
-      conversationId: request.conversationId ?? null,
-      orphanedAt: request.orphanedAt ?? null,
-      reattachDeadline: request.reattachDeadline ?? null,
-      title: request.title,
-      description: request.description ?? null,
-      risk: request.risk ?? null,
-      tool: request.tool ?? null,
-      command: request.command ?? null,
-      path: request.path ?? null,
-      optionsJson: JSON.stringify(request.options),
-      status: request.status,
-      createdAt: request.createdAt,
-      expiresAt: request.expiresAt ?? null,
-      resolvedAt: null,
-      resolutionJson: null,
-      consumedAt: null,
-    }).run();
+    database.sqlite.transaction(() => {
+      const workspace = database.sqlite.prepare("select status from workspace_sessions where id = ?")
+        .get(request.workspaceSessionId) as { status: string } | undefined;
+      if (workspace && workspace.status !== "active") {
+        throw new Error(`Workspace ${request.workspaceSessionId} is not active and cannot accept a new approval request.`);
+      }
+      database.db.insert(approvalRequests).values({
+        id: request.approvalId,
+        kind: request.kind,
+        workspaceSessionId: request.workspaceSessionId,
+        workSessionId: request.workSessionId ?? null,
+        ownerContextId: request.ownerContextId ?? null,
+        runId: request.runId ?? null,
+        agentId: request.agentId ?? null,
+        principalId: request.principalId ?? null,
+        approvalKey: request.approvalKey ?? null,
+        operationHash: request.operationHash ?? null,
+        mcpSessionId: request.mcpSessionId ?? null,
+        mcpRequestId: request.mcpRequestId ?? null,
+        waiterKey: request.waiterKey ?? null,
+        liveWaiterId: request.liveWaiterId ?? null,
+        origin: request.origin ?? (request.workSessionId ? "work_session" : "direct_mcp"),
+        conversationId: request.conversationId ?? null,
+        orphanedAt: request.orphanedAt ?? null,
+        reattachDeadline: request.reattachDeadline ?? null,
+        title: request.title,
+        description: request.description ?? null,
+        risk: request.risk ?? null,
+        tool: request.tool ?? null,
+        command: request.command ?? null,
+        path: request.path ?? null,
+        optionsJson: JSON.stringify(request.options),
+        status: request.status,
+        createdAt: request.createdAt,
+        expiresAt: request.expiresAt ?? null,
+        resolvedAt: null,
+        resolutionJson: null,
+        consumedAt: null,
+      }).run();
+    }).immediate();
 
     return request;
   }
@@ -407,7 +421,41 @@ export function createApprovalRequestManager(
     return false;
   }
 
-  return { create, get, listPending, listPendingPage, expirePending, resolve, detachLiveWaiter, reattachLiveWaiter, touchDirectApproval, consumeApprovedOperation, close: () => { /* P1 #11: DB owned by server */ } };
+  function consumeApprovedDirectOperation(input: { principalId: string; workspaceSessionId: string; ownerContextId: string; operationHash: string }): boolean {
+    const candidates = database.db
+      .select()
+      .from(approvalRequests)
+      .where(and(
+        eq(approvalRequests.principalId, input.principalId),
+        eq(approvalRequests.workspaceSessionId, input.workspaceSessionId),
+        eq(approvalRequests.ownerContextId, input.ownerContextId),
+        eq(approvalRequests.operationHash, input.operationHash),
+        eq(approvalRequests.origin, "direct_mcp"),
+        sql`${approvalRequests.workSessionId} is null`,
+        eq(approvalRequests.status, "approved"),
+        sql`${approvalRequests.consumedAt} is null`,
+      ))
+      .orderBy(desc(approvalRequests.resolvedAt))
+      .all();
+    for (const candidate of candidates) {
+      const resolution = candidate.resolutionJson
+        ? JSON.parse(candidate.resolutionJson) as { scope?: string }
+        : {};
+      if (resolution.scope !== "once") continue;
+      const updated = database.db.update(approvalRequests)
+        .set({ consumedAt: new Date().toISOString() })
+        .where(and(
+          eq(approvalRequests.id, candidate.id),
+          eq(approvalRequests.status, "approved"),
+          sql`${approvalRequests.consumedAt} is null`,
+        ))
+        .run();
+      if (updated.changes === 1) return true;
+    }
+    return false;
+  }
+
+  return { create, get, listPending, listPendingPage, expirePending, resolve, detachLiveWaiter, reattachLiveWaiter, touchDirectApproval, consumeApprovedOperation, consumeApprovedDirectOperation, close: () => { /* P1 #11: DB owned by server */ } };
 }
 
 function defaultOptions(): ApprovalOption[] {
@@ -428,6 +476,7 @@ function rowToApproval(row: ApprovalRequestRow): ApprovalRequest {
     agentId: row.agentId ?? undefined,
     principalId: row.principalId ?? undefined,
     approvalKey: row.approvalKey ?? undefined,
+    operationHash: row.operationHash ?? undefined,
     mcpSessionId: row.mcpSessionId ?? undefined,
     mcpRequestId: row.mcpRequestId ?? undefined,
     waiterKey: row.waiterKey ?? undefined,

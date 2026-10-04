@@ -53,7 +53,8 @@ export interface WorkSessionManager {
     ttlMs?: number;
   }): WorkspaceLeaseResult;
   releaseWorkspaceLeasesForSession(workSessionId: string): number;
-  renewWorkspaceLeaseForSession(workSessionId: string, ttlMs?: number, leaseNonce?: string): number;
+  renewWorkspaceLeaseForSession(workSessionId: string, ttlMs: number | undefined, leaseNonce: string): number;
+  getActiveWorkspaceLease(canonicalRoot: string): WorkspaceLease | undefined;
   getWorkspaceLeaseForSession(workSessionId: string): WorkspaceLease | undefined;
   submitForReview(input: {
     workSessionId: string;
@@ -176,6 +177,7 @@ export function createWorkSessionManager(
     releaseWorkspaceLeasesForSession: (workSessionId) => leases.releaseWorkspaceLeasesForSession(workSessionId),
     renewWorkspaceLeaseForSession: (workSessionId, ttlMs, leaseNonce) =>
       leases.renewWorkspaceLeaseForSession(workSessionId, ttlMs, leaseNonce),
+    getActiveWorkspaceLease: (canonicalRoot) => leases.getActiveWorkspaceLease(canonicalRoot),
     getWorkspaceLeaseForSession: (workSessionId) => leases.getWorkspaceLeaseForSession(workSessionId),
     submitForReview: (input) => reviews.submitForReview(input),
     submitFeedback: (input) => reviews.submitFeedback(input),

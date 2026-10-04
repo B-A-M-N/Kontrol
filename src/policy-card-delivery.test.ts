@@ -121,6 +121,11 @@ try {
     `changes-mode bash descriptor must carry the workspace app _meta; got ${JSON.stringify(bashTool._meta)}`,
   );
   assert.deepEqual(bashTool._meta?.ui?.visibility, ["model"]);
+  assert.equal(
+    bashTool._meta?.["openai/outputTemplate"],
+    bashTool._meta?.ui?.resourceUri?.replace(/\.html$/, ".skybridge.html"),
+    "approval-capable renderer descriptor must advertise the matching Skybridge alias",
+  );
   // A read-only tool whose effective policy is also ask carries it too.
   const readTool = byName.get("read");
   assert.ok(readTool, "read tool is registered");
@@ -145,8 +150,10 @@ try {
   assert.equal(card.status, "approval_required");
   assert.equal(card.approvalId, blocked.payload?.result?.structuredContent?.approvalId);
   assert.equal(typeof card.approvalId, "string");
-  assert.deepEqual(card.payload?.content, blocked.payload?.result?.content,
-    "card payload must mirror the model-facing content blocks");
+  assert.equal(card.payload?.content, undefined,
+    "compact approval cards must not duplicate model-facing content in metadata");
+  assert.ok(blocked.payload?.result?.content?.[0]?.text?.includes("Approval required."),
+    "the model-facing result content remains available for the app's compact-card fallback");
   assert.equal(typeof card.summary?.command, "string");
 
   // A blocked write carries the same envelope with its own canonical tool name.

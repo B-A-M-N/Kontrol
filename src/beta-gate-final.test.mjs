@@ -19,6 +19,29 @@ const expectedMcpVersion = `1.0.4+${contentSha256}`;
 const workspaceAppUri = "ui://kontrol/workspace-app-abcdef123456.html";
 const workspaceAppCompatibilityUri = "ui://kontrol/workspace-app-abcdef123456.skybridge.html";
 const requiredTools = ["read", "grep", "glob", "ls", "git_status", "git_log", "git_diff", "git_show", "poll_process"];
+const catalogTools = [...requiredTools, "open_workspace", "show_workspace_ui"];
+const inputProperties = {
+  read: ["workspaceId", "path", "approvalResumeId"],
+  grep: ["workspaceId", "pattern", "approvalResumeId"],
+  glob: ["workspaceId", "pattern", "approvalResumeId"],
+  ls: ["workspaceId", "path", "approvalResumeId"],
+  git_status: ["workspaceId", "path", "approvalResumeId"],
+  git_log: ["workspaceId", "path", "approvalResumeId"],
+  git_diff: ["workspaceId", "path", "approvalResumeId"],
+  git_show: ["workspaceId", "path", "approvalResumeId"],
+  poll_process: ["workspaceId", "sessionId"],
+  open_workspace: ["path", "mode", "baseRef"],
+  show_workspace_ui: ["workspaceId"],
+};
+const toolMetadata = catalogTools.map((name) => ({
+  name,
+  inputFields: {
+    properties: [...inputProperties[name]].sort(),
+    required: (name === "open_workspace" ? ["path"] : name === "poll_process" ? ["workspaceId", "sessionId"] : name === "show_workspace_ui" ? ["workspaceId"] : ["workspaceId"]).sort(),
+    types: Object.fromEntries(inputProperties[name].sort().map((field) => [field, field === "mode" ? "anyOf" : "string"]).sort(([a], [b]) => a.localeCompare(b))),
+  },
+  ...(name === "show_workspace_ui" ? { resourceUri: workspaceAppUri, visibility: ["model"], legacyOutputTemplate: workspaceAppCompatibilityUri } : {}),
+}));
 mkdirSync(fakeBin, { recursive: true });
 const fakeGit = join(fakeBin, "git");
 writeFileSync(fakeGit, "#!/bin/sh\ncase \"$1 $2\" in\n  'rev-parse HEAD') printf '%s\\n' '" + sha + "' ;;\n  'status --porcelain') ;;\n  *) exit 1 ;;\nesac\n");
@@ -81,16 +104,10 @@ const externalCatalog = {
   expectedMcpVersion,
   serverInfoVersion: expectedMcpVersion,
   hostCatalogVersion: expectedMcpVersion,
-  serverTools: requiredTools,
-  hostTools: requiredTools,
-  serverToolMetadata: [
-    { name: "open_workspace" },
-    { name: "show_workspace_ui", resourceUri: workspaceAppUri, visibility: ["model"], legacyOutputTemplate: workspaceAppCompatibilityUri },
-  ],
-  hostToolMetadata: [
-    { name: "open_workspace" },
-    { name: "show_workspace_ui", resourceUri: workspaceAppUri, visibility: ["model"], legacyOutputTemplate: workspaceAppCompatibilityUri },
-  ],
+  serverTools: catalogTools,
+  hostTools: catalogTools,
+  serverToolMetadata: toolMetadata,
+  hostToolMetadata: toolMetadata,
   workspaceApp: {
     deployedResourceUri: workspaceAppUri,
     deployedCompatibilityUri: workspaceAppCompatibilityUri,
@@ -112,6 +129,7 @@ const externalCatalog = {
     }],
   },
   catalogParity: true,
+  inputSchemaParity: true,
   hostCapture: {
     source: "operator_supplied",
     captureId: "capture-fixture-1",
@@ -176,6 +194,22 @@ assert.equal(validateBetaExternalCatalogReceipt({
   expectedMcpVersion,
   soak,
 }).valid, false, "missing or extra external tools must be rejected");
+const hostToolsWithoutResumeId = toolMetadata.map((tool) => tool.name === "read" ? {
+  ...tool,
+  inputFields: {
+    ...tool.inputFields,
+    properties: tool.inputFields.properties.filter((field) => field !== "approvalResumeId"),
+    types: Object.fromEntries(Object.entries(tool.inputFields.types).filter(([field]) => field !== "approvalResumeId")),
+  },
+} : tool);
+assert.equal(validateBetaExternalCatalogReceipt({
+  ...externalCatalog,
+  hostToolMetadata: hostToolsWithoutResumeId,
+}, {
+  candidateBuildId: buildId,
+  expectedMcpVersion,
+  soak,
+}).valid, false, "host schema dropping approvalResumeId must invalidate catalog evidence");
 assert.equal(validateBetaExternalCatalogReceipt({
   ...externalCatalog,
   postHeartbeat: { ...externalCatalog.postHeartbeat, heartbeatCount: 1 },

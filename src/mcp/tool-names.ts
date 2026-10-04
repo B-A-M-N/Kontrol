@@ -7,6 +7,8 @@ import { readMcpServerVersion } from "./tool-logging.js";
 
 export const toolNames = {
   openWorkspace: "open_workspace",
+  listManagedWorktrees: "list_managed_worktrees",
+  retireManagedWorktree: "retire_managed_worktree",
   showWorkspaceUi: "show_workspace_ui",
   read: "read",
   write: "write",

@@ -238,9 +238,20 @@ try {
 
   const touchTargets = await page.locator(".feedback-btn").evaluateAll((buttons) => buttons.map((button) => {
     const rect = button.getBoundingClientRect();
-    return { height: rect.height, width: rect.width };
+    const style = getComputedStyle(button);
+    return {
+      height: rect.height,
+      width: rect.width,
+      minHeight: style.minHeight,
+      display: style.display,
+      visibility: style.visibility,
+      mobileMediaMatches: window.matchMedia("(max-width: 520px)").matches,
+    };
   }));
-  assert.ok(touchTargets.every((target) => target.height >= 44), "mobile feedback controls meet the 44px touch target");
+  assert.ok(
+    touchTargets.every((target) => target.height >= 44),
+    `mobile feedback controls meet the 44px touch target; viewport=${await page.evaluate(() => window.innerWidth)}, targets=${JSON.stringify(touchTargets)}`,
+  );
 
   await page.waitForFunction(() => {
     const title = document.querySelector(".agent-meta-primary");

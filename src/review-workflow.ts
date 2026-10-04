@@ -211,6 +211,7 @@ export function createReviewWorkflowService(
         coverage = await reviewCheckpoints.checkpointCoverage({
           workspaceId: session.workspaceSessionId,
           root: workspaces?.getWorkspace(session.workspaceSessionId)?.root ?? "",
+          workSessionId: session.id,
         });
         if (coverage && coverage.uncoveredPaths.length === 0) coverage = undefined;
       } catch {

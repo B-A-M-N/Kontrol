@@ -8,6 +8,28 @@ import {
 } from "drizzle-orm/sqlite-core";
 import { sql } from "drizzle-orm";
 
+/** Durable per-fragment adapter receipts. The payload is nulled only after a
+ * coalesced event-log row commits; event_id and event_log_id remain as an
+ * idempotency tombstone/mapping. */
+export const telemetryIngress = sqliteTable("telemetry_ingress", {
+  sequence: integer("sequence").primaryKey({ autoIncrement: true }),
+  eventId: text("event_id").notNull().unique(),
+  sessionId: text("session_id").notNull(),
+  workspaceSessionId: text("workspace_session_id"),
+  type: text("type").notNull(),
+  payloadJson: text("payload_json"),
+  payloadSha256: text("payload_sha256").notNull(),
+  publish: integer("publish", { mode: "boolean" }).notNull().default(true),
+  status: text("status").notNull().default("pending"),
+  eventLogId: text("event_log_id"),
+  receivedAt: text("received_at").notNull(),
+  committedAt: text("committed_at"),
+}, (table) => [
+  index("telemetry_ingress_pending_idx").on(table.status, table.sequence),
+  index("telemetry_ingress_session_idx").on(table.sessionId, table.status, table.sequence),
+  index("telemetry_ingress_event_log_idx").on(table.eventLogId),
+]);
+
 export const workspaceProjects = sqliteTable("workspace_projects", {
   id: text("id").primaryKey(),
   canonicalRoot: text("canonical_root").notNull(),
@@ -27,6 +49,7 @@ export const workspaceSessions = sqliteTable("workspace_sessions", {
   baseRef: text("base_ref"),
   baseSha: text("base_sha"),
   managed: text("managed").notNull().default("false"),
+  retiredAt: text("retired_at"),
   createdAt: text("created_at").notNull(),
   lastUsedAt: text("last_used_at").notNull(),
 }, (table) => [
@@ -363,6 +386,7 @@ export const approvalRequests = sqliteTable("approval_requests", {
   agentId: text("agent_id"),
   principalId: text("principal_id"),
   approvalKey: text("approval_key"),
+  operationHash: text("operation_hash"),
   mcpSessionId: text("mcp_session_id"),
   mcpRequestId: text("mcp_request_id"),
   waiterKey: text("waiter_key"),
@@ -390,6 +414,7 @@ export const approvalRequests = sqliteTable("approval_requests", {
   index("approval_requests_run_idx").on(table.runId, table.createdAt),
   index("approval_requests_status_expiry_idx").on(table.status, table.expiresAt),
   index("approval_requests_waiter_consumed_idx").on(table.waiterKey, table.status, table.consumedAt),
+  index("approval_requests_direct_operation_idx").on(table.principalId, table.workspaceSessionId, table.ownerContextId, table.operationHash, table.status, table.consumedAt),
 ]);
 
 export type ApprovalRequestRow = typeof approvalRequests.$inferSelect;

@@ -233,6 +233,25 @@ assert.equal(policy.isApproved("principal-boundary", "tool:write", {
 assert.equal(policy.isApproved("principal-boundary", "tool:write", {
   workspaceId: brandWorkspaceId("ws-arbitrary"), workSessionId: brandWorkSessionId("wsess-boundary-A"),
 }), false, "workspace grant does NOT cross into an unrelated workspace");
+
+// Composite cache identities use structured tuples, so delimiter characters
+// in principal, workspace, or approval-key values cannot alias another grant.
+const delimiterWorkspace = brandWorkspaceId("ws|delimiter");
+policy.recordApproval("principal|delimiter", "tool|write", "workspace", { workspaceId: delimiterWorkspace });
+assert.equal(policy.isApproved("principal|delimiter", "tool|write", { workspaceId: delimiterWorkspace }), true);
+policy.revokeScope("workspace", "ws|delimiter");
+assert.equal(policy.isApproved("principal|delimiter", "tool|write", { workspaceId: delimiterWorkspace }), false);
+
+const grantLookupPlan = db.sqlite.prepare(`
+  explain query plan
+  select id from policy_approval_grants
+   where principal_id = ? and scope = ? and scope_id = ? and approval_key = ?
+     and revoked_at is null and (expires_at is null or expires_at > ?)
+   limit 1
+`).all("principal-1", "work_session", "wsess-1", "path:src/**", new Date().toISOString()) as Array<{ detail: string }>;
+assert.ok(grantLookupPlan.some((step) => step.detail.includes("policy_approval_grants_principal_idx")),
+  "exact effective-grant checks use the composite identity index");
+
 const boundaryGrant = grantStore.listEffective().find((g) => g.principalId === "principal-boundary");
 assert.ok(boundaryGrant);
 assert.equal(boundaryGrant.scope, "workspace");
