@@ -506,10 +506,14 @@ try {
   let recoveryOutput = "";
   serverChild.stdout.on("data", (chunk) => { recoveryOutput = (recoveryOutput + chunk).slice(-6000); });
   serverChild.stderr.on("data", (chunk) => { recoveryOutput = (recoveryOutput + chunk).slice(-6000); });
+  // The aggregate release gate starts many cold TypeScript children in
+  // sequence. Give crash recovery the same 30-second startup budget as the
+  // bind-race child above so transient host load does not create a false
+  // recovery failure.
   await waitFor(async () => {
     if (serverChild.exitCode !== null) throw new Error(`crash recovery server exited ${serverChild.exitCode}: ${recoveryOutput}`);
     return (await httpStatus("/healthz")) === 200 && (await httpStatus("/core-readyz")) === 200;
-  }, 15000, "post-crash server recovery");
+  }, 30000, "post-crash server recovery");
   const recoveredSession = await openSession("lifecycle-post-crash");
   const recoveredRead = await rpc("tools/call", {
     name: "read",

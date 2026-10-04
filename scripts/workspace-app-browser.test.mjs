@@ -236,7 +236,8 @@ try {
   assert.notEqual(await page.locator(".agent-submit-status").textContent(), "Dispatching…", "Ctrl+Enter cannot dispatch unresolved reference-only content");
   await capture("reference-warning");
 
-  const touchTargets = await page.locator(".feedback-btn").evaluateAll((buttons) => buttons.map((button) => {
+  const visibleFeedbackButtons = page.locator(".feedback-btn:visible");
+  const touchTargets = await visibleFeedbackButtons.evaluateAll((buttons) => buttons.map((button) => {
     const rect = button.getBoundingClientRect();
     const style = getComputedStyle(button);
     return {
@@ -248,6 +249,7 @@ try {
       mobileMediaMatches: window.matchMedia("(max-width: 520px)").matches,
     };
   }));
+  assert.ok(touchTargets.length >= 2, "visible reviewer controls render in Chromium");
   assert.ok(
     touchTargets.every((target) => target.height >= 44),
     `mobile feedback controls meet the 44px touch target; viewport=${await page.evaluate(() => window.innerWidth)}, targets=${JSON.stringify(touchTargets)}`,
