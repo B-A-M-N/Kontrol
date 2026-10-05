@@ -6,6 +6,7 @@ import { join } from "node:path";
 import {
   acquireRuntimeLock,
   assertRuntimeLock,
+  processIsLive,
   processStartToken,
   readRuntimeLock,
   releaseRuntimeLock,
@@ -15,6 +16,34 @@ import {
 
 const stateDir = await mkdtemp(join(tmpdir(), "kontrol-runtime-lock-"));
 try {
+  if (process.platform === "win32") {
+    const shell = spawn("bash", ["-c", "printf '%s\\n' \"$$\"; exec sleep 30"], {
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    try {
+      const shellPid = await new Promise<number>((resolve, reject) => {
+        let output = "";
+        const timeout = setTimeout(() => reject(new Error("Git Bash did not report its PID")), 5_000);
+        shell.stdout.setEncoding("utf8");
+        shell.stdout.on("data", (chunk: string) => {
+          output += chunk;
+          const match = output.match(/^(\d+)\r?\n/);
+          if (!match) return;
+          clearTimeout(timeout);
+          resolve(Number(match[1]));
+        });
+        shell.once("error", (error) => {
+          clearTimeout(timeout);
+          reject(error);
+        });
+      });
+      assert.equal(processIsLive(shellPid), true, "a live Git Bash $$ PID must be recognized by the runtime lock");
+    } finally {
+      shell.kill("SIGTERM");
+      await new Promise<void>((resolve) => shell.once("close", () => resolve()));
+    }
+  }
+
   const metadata = {
     launcher: "serve" as const,
     generationId: "generation-a",

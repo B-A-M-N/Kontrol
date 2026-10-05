@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, realpathSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { dirname, resolve, join } from "node:path";
@@ -64,7 +65,11 @@ export function processIsLive(pid: number): boolean {
     // made every process look dead on macOS and Windows, where /proc is absent.
     process.kill(pid, 0);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EPERM") return false;
+    if ((error as NodeJS.ErrnoException).code !== "EPERM") {
+      // Git Bash/MSYS PIDs can be visible to its POSIX process table while
+      // Node's Windows process.kill cannot address them as native PIDs.
+      if (process.platform !== "win32" || !isLiveWindowsPosixProcess(pid)) return false;
+    }
   }
 
   if (process.platform === "linux") {
@@ -80,6 +85,19 @@ export function processIsLive(pid: number): boolean {
     }
   }
   return true;
+}
+
+function isLiveWindowsPosixProcess(pid: number): boolean {
+  try {
+    const output = execFileSync("ps", ["-p", String(pid), "-o", "pid="], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      windowsHide: true,
+    });
+    return output.trim().split(/\s+/).includes(String(pid));
+  } catch {
+    return false;
+  }
 }
 
 export function readRuntimeLock(stateDir: string): RuntimeLockRecord | undefined {
