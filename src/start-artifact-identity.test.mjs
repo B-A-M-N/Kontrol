@@ -164,21 +164,13 @@ function resolveIn(checkout, options = {}) {
   rmSync(checkout, { recursive: true, force: true });
 }
 
-// 9. End to end through the real launcher: a stale dist makes `npm start`
-//    exit non-zero WITHOUT spawning a server (resolve-only probe).
+// 9. End to end through the real launcher: a dirty-built dist makes `npm
+//    start` refuse WITHOUT spawning a server (resolve-only probe).
 {
-  const checkout = stageCheckout({ withGit: false });
+  const checkout = stageCheckout();
   mkdirSync(join(checkout, "scripts"), { recursive: true });
   copyFileSync(join(repoRoot, "scripts", "start.mjs"), join(checkout, "scripts", "start.mjs"));
-  const gitDirectory = execFileSync("git", ["rev-parse", "--absolute-git-dir"], {
-    cwd: repoRoot,
-    encoding: "utf8",
-  }).trim().replaceAll("\\", "/");
-  const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoRoot, encoding: "utf8" }).trim();
-  writeFileSync(join(checkout, ".git"), `gitdir: ${gitDirectory}\n`);
-  const staleSha = "0".repeat(40);
-  assert.notEqual(head, staleSha);
-  stageDist(checkout, { buildId: "d063391stale0000", gitSha: staleSha, gitDirty: 0 });
+  stageDist(checkout, { buildId: "d063391dirty000", gitSha: "0".repeat(40), gitDirty: 1 });
   const { spawnSync } = await import("node:child_process");
   const result = spawnSync(
     process.execPath,
@@ -196,8 +188,8 @@ function resolveIn(checkout, options = {}) {
       timeout: 15_000,
     },
   );
-  assert.equal(result.status, 1, `stale dist must exit 1, got ${result.status}`);
-  assert.match(result.stderr ?? "", /stale projection/, "refusal must explain the stale artifact");
+  assert.equal(result.status, 1, `dirty-built dist must exit 1, got ${result.status}`);
+  assert.match(result.stderr ?? "", /dirty checkout/, "refusal must explain the dirty artifact");
   rmSync(checkout, { recursive: true, force: true });
 }
 

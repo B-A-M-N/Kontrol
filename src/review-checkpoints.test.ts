@@ -11,6 +11,8 @@ const root = await mkdtemp(join(tmpdir(), "kontrol-review-checkpoints-test-"));
 
 try {
   await git(root, ["init"]);
+  await git(root, ["config", "user.name", "Kontrol Test"]);
+  await git(root, ["config", "user.email", "kontrol-test@example.invalid"]);
   await writeFile(join(root, "README.md"), "hello\n");
   await git(root, ["add", "README.md"]);
   await git(root, ["commit", "-m", "Initial commit"]);

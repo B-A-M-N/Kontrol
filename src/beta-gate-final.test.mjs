@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { spawnSync } from "node:child_process";
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -8,12 +8,31 @@ import { validateBetaExternalCatalogReceipt } from "../scripts/beta-external-cat
 
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const fixture = mkdtempSync(join(tmpdir(), "kontrol-beta-final-"));
-const fakeBin = join(fixture, "bin");
+const checkout = join(fixture, "checkout");
+const fixtureScripts = join(checkout, "scripts");
 const codeReceiptPath = join(fixture, "beta-code.json");
 const soakReportPath = join(fixture, "beta-soak.json");
 const externalCatalogReceiptPath = join(fixture, "beta-external-catalog.json");
 const receiptPath = join(fixture, "beta-final.json");
-const sha = "a".repeat(40);
+mkdirSync(fixtureScripts, { recursive: true });
+for (const script of ["beta-gate-final.mjs", "beta-soak-contract.mjs", "beta-external-catalog-contract.mjs"]) {
+  copyFileSync(join(root, "scripts", script), join(fixtureScripts, script));
+}
+execFileSync("git", ["init", "--quiet"], { cwd: checkout });
+execFileSync("git", ["add", "scripts"], { cwd: checkout });
+const fixtureTree = execFileSync("git", ["write-tree"], { cwd: checkout, encoding: "utf8" }).trim();
+const sha = execFileSync("git", ["commit-tree", fixtureTree, "-m", "beta gate fixture"], {
+  cwd: checkout,
+  encoding: "utf8",
+  env: {
+    ...process.env,
+    GIT_AUTHOR_NAME: "Kontrol Test",
+    GIT_AUTHOR_EMAIL: "kontrol-test@example.invalid",
+    GIT_COMMITTER_NAME: "Kontrol Test",
+    GIT_COMMITTER_EMAIL: "kontrol-test@example.invalid",
+  },
+}).trim();
+execFileSync("git", ["update-ref", "HEAD", sha], { cwd: checkout });
 const buildId = "candidate-build";
 const contentSha256 = "b".repeat(64);
 const expectedMcpVersion = `1.0.4+${contentSha256}`;
@@ -43,11 +62,6 @@ const toolMetadata = catalogTools.map((name) => ({
   },
   ...(name === "show_workspace_ui" ? { resourceUri: workspaceAppUri, visibility: ["model"], legacyOutputTemplate: workspaceAppCompatibilityUri } : {}),
 }));
-mkdirSync(fakeBin, { recursive: true });
-const fakeGit = join(fakeBin, "git");
-writeFileSync(fakeGit, "#!/bin/sh\ncase \"$1 $2\" in\n  'rev-parse HEAD') printf '%s\\n' '" + sha + "' ;;\n  'status --porcelain') ;;\n  *) exit 1 ;;\nesac\n");
-chmodSync(fakeGit, 0o755);
-
 const code = {
   codeQualified: true,
   faultMatrix: { buildId, qualified: true, cases: [{ id: "supervised-mission-loop", passed: true }] },
@@ -283,11 +297,10 @@ assert.equal(validateBetaExternalCatalogReceipt({
 
 function runFinal(extraEnv = {}) {
   return spawnSync(process.execPath, ["scripts/beta-gate-final.mjs"], {
-    cwd: root,
+    cwd: checkout,
     encoding: "utf8",
     env: {
       ...process.env,
-      PATH: fakeBin + ":" + process.env.PATH,
       KONTROL_BETA_CODE_RECEIPT: codeReceiptPath,
       KONTROL_BETA_SOAK_REPORT: soakReportPath,
       KONTROL_BETA_EXTERNAL_CATALOG_RECEIPT: externalCatalogReceiptPath,

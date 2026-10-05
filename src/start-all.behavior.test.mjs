@@ -21,7 +21,7 @@ import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { delimiter, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const realCheckoutRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
@@ -497,7 +497,7 @@ function runLauncher(envPath, extraEnv = {}) {
     timeout: 120_000,
     env: {
       ...process.env,
-      PATH: fakeBin + ":" + process.env.PATH,
+      PATH: `${fakeBin}${delimiter}${process.env.PATH ?? ""}`,
       KONTROL_ENV_FILE: envPath,
       FAKE_REPO_ROOT: root,
       FAKE_TMUX_STATE: fakeTmuxState,
@@ -516,7 +516,7 @@ function runRestart(envPath, extraEnv = {}) {
     timeout: 120_000,
     env: {
       ...process.env,
-      PATH: fakeBin + ":" + process.env.PATH,
+      PATH: `${fakeBin}${delimiter}${process.env.PATH ?? ""}`,
       KONTROL_ENV_FILE: envPath,
       FAKE_REPO_ROOT: root,
       FAKE_TMUX_STATE: fakeTmuxState,
@@ -540,7 +540,7 @@ function startRestartController(envPath, extraEnv = {}) {
     detached: true,
     env: {
       ...process.env,
-      PATH: fakeBin + ":" + process.env.PATH,
+      PATH: `${fakeBin}${delimiter}${process.env.PATH ?? ""}`,
       KONTROL_ENV_FILE: envPath,
       FAKE_REPO_ROOT: root,
       FAKE_TMUX_STATE: fakeTmuxState,
