@@ -569,14 +569,24 @@ function startRestartController(envPath, extraEnv = {}) {
 }
 
 function processParentPid(pid) {
-  try {
-    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
-    const closingParen = stat.lastIndexOf(")");
-    const fields = closingParen >= 0 ? stat.slice(closingParen + 2).trim().split(/\s+/) : [];
-    return Number(fields[1]);
-  } catch {
-    return undefined;
+  if (process.platform === "linux") {
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      const closingParen = stat.lastIndexOf(")");
+      const fields = closingParen >= 0 ? stat.slice(closingParen + 2).trim().split(/\s+/) : [];
+      return Number(fields[1]);
+    } catch {
+      return undefined;
+    }
   }
+
+  if (process.platform === "darwin") {
+    const result = spawnSync("ps", ["-o", "ppid=", "-p", String(pid)], { encoding: "utf8" });
+    const parentPid = Number(result.stdout?.trim());
+    return result.status === 0 && Number.isInteger(parentPid) ? parentPid : undefined;
+  }
+
+  return undefined;
 }
 
 function killController(controller, markerPath, signal = "SIGKILL") {
