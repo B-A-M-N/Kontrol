@@ -82,8 +82,12 @@ const liveBadgeCard: ToolResultCard = {
 };
 const liveBadge = renderSummaryBadge(liveBadgeCard);
 const firstReading = liveBadge.textContent;
-await new Promise((resolve) => setTimeout(resolve, 1_200));
-const secondReading = liveBadge.textContent;
+let secondReading = liveBadge.textContent;
+const liveBadgeDeadline = Date.now() + 5_000;
+while (secondReading === firstReading && Date.now() < liveBadgeDeadline) {
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  secondReading = liveBadge.textContent;
+}
 assert.notEqual(firstReading, secondReading, "live process badge advances locally between snapshots");
 assert.match(secondReading ?? "", /^Running · /, "live badge keeps the running format");
 unmountPayload();

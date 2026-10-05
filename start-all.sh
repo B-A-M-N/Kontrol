@@ -769,7 +769,9 @@ fi
 
 echo "[*] Starting persistent component supervisor ..."
 SUPERVISOR_STATUS_FILE="${KONTROL_STATE_DIR:-$DESKTOP_PWD/.kontrol-state}/supervisor-status.json"
-SUPERVISOR_STARTUP_EPOCH_MS="$(date +%s%3N)"
+# BSD date lacks GNU's %N formatter; use the same Node runtime as the
+# launcher for a portable millisecond epoch used by supervisor freshness checks.
+SUPERVISOR_STARTUP_EPOCH_MS="$(node -e 'process.stdout.write(String(Date.now()))')"
 SUPERVISOR_ARGS=(
   --root "$DESKTOP_PWD"
   --kontrol-url "http://${DEV_HOST}:${DEV_PORT}"
