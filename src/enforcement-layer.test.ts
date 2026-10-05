@@ -403,5 +403,6 @@ try {
   eventStore.close();
   continuationManager.close();
   agentRegistry.close();
+  db.close();
   await rm(root, { recursive: true, force: true });
 }
