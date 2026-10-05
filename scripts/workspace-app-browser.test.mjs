@@ -39,6 +39,9 @@ try {
   }
   const browserDiagnostics = [];
   page.on("pageerror", (error) => browserDiagnostics.push(`pageerror: ${error.message}`));
+  page.on("requestfailed", (request) => browserDiagnostics.push(
+    `requestfailed: ${request.url()} (${request.failure()?.errorText ?? "unknown"})`,
+  ));
   page.on("console", (message) => {
     if (message.type() === "error" || message.type() === "warning") browserDiagnostics.push(`console.${message.type()}: ${message.text()}`);
   });
@@ -199,7 +202,22 @@ try {
   try {
     await page.locator(".workspace-surface").waitFor({ state: "attached", timeout: 5_000 });
   } catch (error) {
-    throw new Error(`${error instanceof Error ? error.message : String(error)}\n${browserDiagnostics.join("\n")}`);
+    const startupState = await page.evaluate(() => ({
+      url: location.href,
+      title: document.title,
+      readyState: document.readyState,
+      buildId: document.documentElement.dataset.kontrolBuildId ?? null,
+      testMode: (window).__KONTROL_UI_TEST_MODE__ ?? null,
+      testAppFactory: typeof (window).__KONTROL_UI_TEST_APP_FACTORY__,
+      testAppCreated: Boolean((window).__KONTROL_TEST_APP__),
+      appHtml: document.querySelector("#app")?.innerHTML.slice(0, 1_000) ?? null,
+      bodyText: document.body.innerText.slice(0, 1_000),
+    })).catch((diagnosticError) => ({ diagnosticError: String(diagnosticError) }));
+    throw new Error(
+      `${error instanceof Error ? error.message : String(error)}\n`
+      + `Startup state: ${JSON.stringify(startupState)}\n`
+      + browserDiagnostics.join("\n"),
+    );
   }
   await page.locator(".review-feedback").waitFor({ state: "attached", timeout: 5_000 });
   await capture("initial-review-approval");
