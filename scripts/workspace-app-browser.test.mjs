@@ -236,7 +236,7 @@ try {
   assert.notEqual(await page.locator(".agent-submit-status").textContent(), "Dispatching…", "Ctrl+Enter cannot dispatch unresolved reference-only content");
   await capture("reference-warning");
 
-  const visibleFeedbackButtons = page.locator(".feedback-btn:visible");
+  const visibleFeedbackButtons = page.locator(".review-feedback .feedback-btn:visible");
   const touchTargets = await visibleFeedbackButtons.evaluateAll((buttons) => buttons.map((button) => {
     const rect = button.getBoundingClientRect();
     const style = getComputedStyle(button);
