@@ -19,7 +19,9 @@ const candidateDir =
   process.env.KONTROL_UI_TEST_CANDIDATE_DIR ?? mkdtempSync(join(tmpdir(), "kontrol-ui-candidate-"));
 process.env.KONTROL_BUILD_OUTPUT_DIR = candidateDir;
 if (!existsSync(join(candidateDir, "ui", "workspace-app.html"))) {
-  execFileSync("npm", ["run", "build:app"], { cwd: repoRoot, stdio: "inherit" });
+  const npmExecPath = process.env.npm_execpath;
+  assert.ok(npmExecPath, "workspace-app-size.test.mjs must be invoked through npm");
+  execFileSync(process.execPath, [npmExecPath, "run", "build:app"], { cwd: repoRoot, stdio: "inherit" });
 }
 
 const htmlPath = join(candidateDir, "ui", "workspace-app.html");

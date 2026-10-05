@@ -16,6 +16,7 @@ const candidateDir = mkdtempSync(join(tmpdir(), "kontrol-ui-candidate-"));
 const childEnvironment = testHarnessEnvironment();
 childEnvironment.KONTROL_UI_TEST_CANDIDATE_DIR = candidateDir;
 for (const key of [
+  "npm_execpath",
   "KONTROL_UI_SCREENSHOT_DIR",
   "KONTROL_UI_SCREENSHOT_LABEL",
   "KONTROL_BROWSER_PATH",
