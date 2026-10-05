@@ -6,6 +6,13 @@
 
 const ORDINARY_ENVIRONMENT_KEYS = new Set([
   "PATH",
+  // Preserve Windows process-launch settings so nested tools can find the
+  // system shell and execute command shims inside the constrained env.
+  "ComSpec",
+  "SystemDrive",
+  "SystemRoot",
+  "windir",
+  "PATHEXT",
   "HOME",
   "USER",
   "LOGNAME",
@@ -40,6 +47,9 @@ const ORDINARY_ENVIRONMENT_KEYS = new Set([
   "JAVA_HOME",
   "VIRTUAL_ENV",
 ]);
+const ORDINARY_ENVIRONMENT_KEYS_CASE_INSENSITIVE = new Set(
+  [...ORDINARY_ENVIRONMENT_KEYS].map((key) => key.toLowerCase()),
+);
 
 /**
  * Return true for credential/control-plane namespaces even if a future caller
@@ -61,7 +71,10 @@ export function buildChildEnvironment(options: {
 
   for (const [key, value] of Object.entries(source)) {
     if (value === undefined || isControlPlaneEnvironmentKey(key)) continue;
-    if (ORDINARY_ENVIRONMENT_KEYS.has(key) || additionalKeys.has(key) || options.allowUserEnvironment === true) {
+    const isOrdinaryEnvironmentKey = ORDINARY_ENVIRONMENT_KEYS.has(key) || (
+      process.platform === "win32" && ORDINARY_ENVIRONMENT_KEYS_CASE_INSENSITIVE.has(key.toLowerCase())
+    );
+    if (isOrdinaryEnvironmentKey || additionalKeys.has(key) || options.allowUserEnvironment === true) {
       result[key] = value;
     }
   }
