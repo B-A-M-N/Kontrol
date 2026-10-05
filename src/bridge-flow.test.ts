@@ -20,11 +20,25 @@ import { createApprovalRequestManager } from "./approval-requests.js";
 import { createPolicyEngine } from "./policy.js";
 import { registerPolicyTools } from "./policy-tools.js";
 import { authorizeWorkSessionAction } from "./work-session-action-guard.js";
+import { compactMissionPacket, projectMissionExecutionContract, renderMissionPrompt } from "./bridge/shared.js";
 
 const root = await mkdtemp(join(tmpdir(), "kontrol-bridge-flow-"));
 const VERIFY_WS = "ws-verification-test";
 const verificationWorkspaceRoot = join(root, "verification-workspace");
 await mkdir(verificationWorkspaceRoot, { recursive: true });
+
+const staleCompactPacket = compactMissionPacket({
+  criteria: [{ id: "stale-verified", status: "verified" }],
+  findings: [],
+  workOrders: [],
+  evidence: [],
+  completionReports: [],
+  approval: { allowed: false, reasons: ["current-snapshot evidence is missing"] },
+  // Simulate an older/incomplete projection: persisted status alone cannot
+  // remove a criterion from the reviewer-visible packet.
+  criterionStates: undefined,
+} as any);
+assert.equal(staleCompactPacket.criteria.length, 1, "a persisted verified status cannot hide a criterion when effective state is absent");
 
 // A minimal MCP server that captures each registered tool handler.
 function fakeServer(): {
@@ -649,6 +663,27 @@ try {
         priority: "required" as const,
         verificationType: "test" as const,
         verificationCommand: "npm --version",
+        affectedAreas: ["src/**"],
+        dependsOnCriterionIds: ["entry-path-docs"],
+        verificationGroup: "core",
+        verificationScope: "focused" as const,
+        commandVersion: "test-toolchain-v1",
+      }, {
+        id: "entry-path-docs",
+        description: "Security assumptions are documented",
+        priority: "preferred" as const,
+        verificationType: "manual_review" as const,
+        affectedAreas: ["docs/**"],
+        verificationGroup: "docs",
+      }, {
+        id: "entry-path-runtime",
+        description: "The ready endpoint answers successfully",
+        priority: "preferred" as const,
+        verificationType: "runtime_behavior" as const,
+        runtimeProbe: { url: "http://127.0.0.1:8080/ready", method: "GET" as const, expectedStatus: 200, bodyIncludes: "ready" },
+        affectedAreas: ["src/server/**"],
+        verificationScope: "full" as const,
+        finalOnly: true,
       }],
       supervisorInstructions: "Supervisor-only review guidance",
       maxCorrectionRounds: 2,
@@ -676,6 +711,32 @@ try {
     const begunId = begun.structuredContent.workSessionId;
     const begunMission = missionLedger.getMissionByWorkSession(begunId)!;
     const begunPacket = missionLedger.getPacket(begunId);
+    const workerContract = projectMissionExecutionContract(begunPacket, "fallback objective");
+    assert.ok(workerContract, "a supervised mission produces a worker execution contract");
+    assert.equal("supervisorInstructions" in workerContract, false, "supervisor-only instructions are not exposed to the worker");
+    assert.deepEqual(workerContract.constraints, missionOptions.constraints);
+    assert.deepEqual(workerContract.nonGoals, missionOptions.nonGoals);
+    assert.deepEqual(workerContract.workOrder?.requiredActions, missionWorkOrder.requiredActions);
+    assert.deepEqual(workerContract.workOrder?.prohibitedActions, missionWorkOrder.prohibitedActions);
+    assert.deepEqual(workerContract.workOrder?.requiredVerification, missionWorkOrder.requiredVerification);
+    assert.deepEqual(workerContract.workOrder?.expectedDeliverables, missionWorkOrder.expectedDeliverables);
+    assert.deepEqual(workerContract.workOrder?.contextReferences, missionWorkOrder.contextReferences);
+    assert.deepEqual(workerContract.acceptanceCriteria.map((criterion) => criterion.description), [
+      "Declared verification passes",
+      "Security assumptions are documented",
+      "The ready endpoint answers successfully",
+    ]);
+    assert.deepEqual(workerContract.acceptanceCriteria[0]?.affectedAreas, ["src/**"]);
+    assert.deepEqual(workerContract.acceptanceCriteria[0]?.dependsOnCriterionIds, ["entry-path-docs"]);
+    assert.equal(workerContract.acceptanceCriteria[0]?.verificationGroup, "core");
+    assert.equal(workerContract.acceptanceCriteria[0]?.verificationScope, "focused");
+    assert.equal(workerContract.acceptanceCriteria[0]?.commandVersion, "test-toolchain-v1");
+    assert.deepEqual(workerContract.acceptanceCriteria[2]?.runtimeProbe, {
+      url: "http://127.0.0.1:8080/ready",
+      method: "GET",
+      expectedStatus: 200,
+      bodyIncludes: "ready",
+    });
     const begunSupervisor = supervisorRuns.getByWorkSession(begunId)!;
     assert.equal(agentRegistry.getRun(begun.structuredContent.runId)?.agentName, "codex");
     assert.equal(workSessions.get(begunId)?.completionPolicy, "webui_approval_required");
@@ -687,15 +748,60 @@ try {
     assert.equal(begunMission.baselineRef, currentSnapshot);
     assert.deepEqual(begunPacket.workOrders[0]?.requiredVerification, missionWorkOrder.requiredVerification);
     const begunPrompt = JSON.stringify(receivedRuns.at(-1));
-    for (const requiredContractField of ["keep the API stable", "do not rewrite unrelated modules", "npm --version", "preserve public compatibility"]) {
+    for (const requiredContractField of [
+      "Entry path parity mission",
+      "A correct and reviewed outcome",
+      "keep the API stable",
+      "do not rewrite unrelated modules",
+      "Declared verification passes",
+      "npm --version",
+      "test-toolchain-v1",
+      "depends on entry-path-docs",
+      "http://127.0.0.1:8080/ready",
+      "final-only",
+      "preserve public compatibility",
+      "change unrelated APIs",
+      "reviewable implementation",
+      "AGENTS.md",
+    ]) {
       assert.ok(begunPrompt.includes(requiredContractField), `dispatched mission prompt includes ${requiredContractField}`);
+    }
+    assert.ok(!begunPrompt.includes("Supervisor-only review guidance"), "supervisor-only instructions stay out of worker dispatch");
+    const [workerFinding] = missionLedger.addFindings(begunMission.id, [{
+      id: "worker-contract-finding",
+      severity: "high",
+      category: "security",
+      scope: "in_scope",
+      disposition: "blocking",
+      description: "The retry path drops the workspace fence",
+      requiredAction: "Keep the existing lease until the handoff is accepted",
+      requiredVerification: ["npm test -- lease"],
+    }]);
+    const correctionContract = projectMissionExecutionContract(missionLedger.getPacket(begunId), "fallback objective");
+    assert.deepEqual(correctionContract?.findings, [{
+      id: workerFinding.id,
+      scope: "in_scope",
+      disposition: "blocking",
+      severity: "high",
+      category: "security",
+      description: "The retry path drops the workspace fence",
+      requiredAction: "Keep the existing lease until the handoff is accepted",
+      requiredVerification: ["npm test -- lease"],
+    }]);
+    const correctionPrompt = renderMissionPrompt(config, begunId, "fallback objective");
+    for (const findingField of [workerFinding.id, "in_scope", "security", "Keep the existing lease until the handoff is accepted", "npm test -- lease"]) {
+      assert.ok(correctionPrompt.includes(findingField), `correction prompt includes finding field ${findingField}`);
     }
     await callReviewer("cancel_work_session", { sessionId: begunId });
     reviewWorkflow.finalizeCancellation({ sessionId: begunId, reason: "mission entry parity complete" });
 
     const delegatedMissionOptions = {
       ...missionOptions,
-      acceptanceCriteria: missionOptions.acceptanceCriteria.map((criterion) => ({ ...criterion, id: "delegated-entry-path-test" })),
+      acceptanceCriteria: missionOptions.acceptanceCriteria.map((criterion) => ({
+        ...criterion,
+        id: criterion.id.replace("entry-path", "delegated-entry-path"),
+        dependsOnCriterionIds: criterion.dependsOnCriterionIds?.map((id) => id.replace("entry-path", "delegated-entry-path")),
+      })),
     };
     const delegatedMission = await callOpenAIReviewer("submit_to_coding_agent", {
       task: "Entry path parity mission",
@@ -721,6 +827,7 @@ try {
       priority: criterion.priority,
       verificationType: criterion.verificationType,
       verificationCommand: criterion.verificationCommand,
+      runtimeProbe: criterion.runtimeProbe,
     }));
     assert.deepEqual(criterionProjection(delegatedPacket.criteria), criterionProjection(begunPacket.criteria));
     assert.equal(delegatedContract.baselineKind, begunMission.baselineKind);

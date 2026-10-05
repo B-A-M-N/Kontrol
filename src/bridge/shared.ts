@@ -32,8 +32,11 @@ export function workspaceAppModelAndAppMeta() {
 }
 
 export function compactMissionPacket(packet: MissionReviewPacket): MissionReviewPacket {
-  const effectiveStatus = new Map((packet.criterionStates ?? []).map((state) => [state.criterionId, state.status]));
-  const unresolvedCriteria = packet.criteria.filter((criterion) => (effectiveStatus.get(criterion.id) ?? criterion.status) !== "verified");
+  // Missing effective state is unresolved. A persisted criterion.status is
+  // only a hint and must never hide a requirement from the current review.
+  const criterionStates = packet.criterionStates ?? [];
+  const effectiveStatus = new Map(criterionStates.map((state) => [state.criterionId, state.status]));
+  const unresolvedCriteria = packet.criteria.filter((criterion) => effectiveStatus.get(criterion.id) !== "verified");
   const blockingFindings = packet.findings.filter((finding) =>
     finding.scope !== "out_of_scope" &&
     (finding.severity === "blocker" || finding.severity === "high") &&
@@ -48,12 +51,122 @@ export function compactMissionPacket(packet: MissionReviewPacket): MissionReview
   return {
     mission: packet.mission,
     criteria: unresolvedCriteria,
-    criterionStates: packet.criterionStates.filter((state) => unresolvedCriteria.some((criterion) => criterion.id === state.criterionId)),
+    criterionStates: criterionStates.filter((state) => unresolvedCriteria.some((criterion) => criterion.id === state.criterionId)),
     findings: blockingFindings,
     workOrders: packet.workOrders.slice(0, 1),
     evidence: [...latestEvidenceByCriterion.values()],
     completionReports: packet.completionReports.slice(0, 1),
     approval: packet.approval,
+  };
+}
+
+/**
+ * The single worker-facing projection of a durable mission. Keep supervisor
+ * policy out of this type: it is consumed by Kontrol's controller and is not
+ * an instruction for the implementing worker.
+ */
+export interface MissionExecutionContract {
+  objective: string;
+  desiredOutcome: string;
+  constraints: unknown[];
+  nonGoals: string[];
+  workOrder?: {
+    id: string;
+    objectiveForThisTurn: string;
+    requiredFindingIds: string[];
+    acceptanceCriterionIds: string[];
+    requiredActions: string[];
+    prohibitedActions: string[];
+    requiredVerification: string[];
+    expectedDeliverables: string[];
+    contextReferences: string[];
+  };
+  acceptanceCriteria: Array<{
+    id: string;
+    priority: string;
+    description: string;
+    verificationType: string;
+    verificationCommand?: string;
+    runtimeProbe?: {
+      url: string;
+      method?: string;
+      expectedStatus?: number;
+      bodyIncludes?: string;
+    };
+    affectedAreas: string[];
+    dependsOnCriterionIds: string[];
+    verificationGroup?: string;
+    verificationScope: string;
+    finalOnly: boolean;
+    mutatesWorkspace: boolean;
+    commandVersion?: string;
+    effectiveStatus: string;
+  }>;
+  findings: Array<{
+    id: string;
+    scope: string;
+    disposition: string;
+    severity: string;
+    category: string;
+    description: string;
+    requiredAction: string;
+    requiredVerification: string[];
+  }>;
+}
+
+export function projectMissionExecutionContract(
+  packet: MissionReviewPacket,
+  fallbackObjective: string,
+): MissionExecutionContract | undefined {
+  if (!packet.mission) return undefined;
+  const effectiveStatus = new Map(packet.criterionStates.map((state) => [state.criterionId, state.status]));
+  const workOrder = packet.workOrders[0];
+  return {
+    objective: packet.mission.objective || fallbackObjective,
+    desiredOutcome: packet.mission.desiredOutcome || fallbackObjective,
+    constraints: packet.mission.constraints,
+    nonGoals: packet.mission.nonGoals,
+    ...(workOrder ? {
+      workOrder: {
+        id: workOrder.id,
+        objectiveForThisTurn: workOrder.objectiveForThisTurn,
+        requiredFindingIds: workOrder.requiredFindingIds,
+        acceptanceCriterionIds: workOrder.acceptanceCriterionIds,
+        requiredActions: workOrder.requiredActions,
+        prohibitedActions: workOrder.prohibitedActions,
+        requiredVerification: workOrder.requiredVerification,
+        expectedDeliverables: workOrder.expectedDeliverables,
+        contextReferences: workOrder.contextReferences,
+      },
+    } : {}),
+    acceptanceCriteria: packet.criteria.map((criterion) => ({
+      id: criterion.id,
+      priority: criterion.priority,
+      description: criterion.description,
+      verificationType: criterion.verificationType,
+      verificationCommand: criterion.verificationCommand,
+      runtimeProbe: criterion.runtimeProbe,
+      affectedAreas: criterion.affectedAreas,
+      dependsOnCriterionIds: criterion.dependsOnCriterionIds,
+      verificationGroup: criterion.verificationGroup,
+      verificationScope: criterion.verificationScope,
+      finalOnly: criterion.finalOnly,
+      mutatesWorkspace: criterion.mutatesWorkspace,
+      commandVersion: criterion.commandVersion,
+      effectiveStatus: effectiveStatus.get(criterion.id) ?? "unverified",
+    })),
+    findings: packet.findings
+      .filter((finding) => ["open", "claimed_resolved"].includes(finding.status))
+      .map((finding) => ({
+        id: finding.id,
+        scope: finding.scope,
+        disposition: finding.disposition,
+        severity: finding.severity,
+        category: finding.category,
+        description: finding.description,
+        requiredAction: finding.requiredAction,
+        requiredVerification: finding.requiredVerification,
+      })),
   };
 }
 
@@ -309,17 +422,17 @@ export function parsePatchFiles(patch: string): Array<{ path: string; operation:
 
 export function renderMissionPrompt(config: BridgeConfig, workSessionId: string, fallbackObjective: string): string {
   const packet = config.missionLedger?.getPacket(workSessionId);
-  if (!packet?.mission) return "";
-  const mission = packet.mission;
-  const workOrder = packet.workOrders[0];
-  const openFindings = packet.findings.filter((f) => ["open", "claimed_resolved"].includes(f.status));
+  if (!packet) return "";
+  const contract = projectMissionExecutionContract(packet, fallbackObjective);
+  if (!contract) return "";
   const lines: string[] = [];
   lines.push("Kontrol supervised mission contract:");
-  lines.push(`Objective: ${mission.objective ?? fallbackObjective}`);
-  lines.push(`Desired outcome: ${mission.desiredOutcome ?? fallbackObjective}`);
-  if (mission.constraints.length) lines.push(`Constraints (must follow): ${JSON.stringify(mission.constraints)}`);
-  if (mission.nonGoals.length) lines.push(`Non-goals (do not implement): ${JSON.stringify(mission.nonGoals)}`);
-  if (workOrder) {
+  lines.push(`Objective: ${contract.objective}`);
+  lines.push(`Desired outcome: ${contract.desiredOutcome}`);
+  if (contract.constraints.length) lines.push(`Constraints (must follow): ${JSON.stringify(contract.constraints)}`);
+  if (contract.nonGoals.length) lines.push(`Non-goals (do not implement): ${JSON.stringify(contract.nonGoals)}`);
+  if (contract.workOrder) {
+    const workOrder = contract.workOrder;
     lines.push("");
     lines.push(`Current work order ${workOrder.id}: ${workOrder.objectiveForThisTurn}`);
     if (workOrder.requiredFindingIds.length) lines.push(`Required finding IDs: ${workOrder.requiredFindingIds.join(", ")}`);
@@ -330,18 +443,31 @@ export function renderMissionPrompt(config: BridgeConfig, workSessionId: string,
     if (workOrder.expectedDeliverables.length) lines.push(`Expected deliverables: ${workOrder.expectedDeliverables.join("; ")}`);
     if (workOrder.contextReferences.length) lines.push(`Context references: ${workOrder.contextReferences.join("; ")}`);
   }
-  if (packet.criteria.length) {
+  if (contract.acceptanceCriteria.length) {
     lines.push("");
     lines.push("Acceptance criteria:");
-    for (const criterion of packet.criteria) {
-      lines.push(`- ${criterion.id} (${criterion.priority}): ${criterion.description} [${criterion.status}; verification=${criterion.verificationType}${criterion.verificationCommand ? `; command=${criterion.verificationCommand}` : ""}]`);
+    for (const criterion of contract.acceptanceCriteria) {
+      const details = [
+        criterion.effectiveStatus,
+        `verification=${criterion.verificationType}`,
+        ...(criterion.verificationCommand ? [`command=${criterion.verificationCommand}`] : []),
+        ...(criterion.runtimeProbe ? [`runtime probe=${JSON.stringify(criterion.runtimeProbe)}`] : []),
+        `scope=${criterion.verificationScope}`,
+        ...(criterion.affectedAreas.length ? [`areas=${criterion.affectedAreas.join(", ")}`] : []),
+        ...(criterion.verificationGroup ? [`group=${criterion.verificationGroup}`] : []),
+        ...(criterion.dependsOnCriterionIds.length ? [`depends on ${criterion.dependsOnCriterionIds.join(", ")}`] : []),
+        ...(criterion.commandVersion ? [`command version=${criterion.commandVersion}`] : []),
+        ...(criterion.finalOnly ? ["final-only"] : []),
+        ...(criterion.mutatesWorkspace ? ["mutates workspace"] : []),
+      ];
+      lines.push(`- ${criterion.id} (${criterion.priority}): ${criterion.description} [${details.join("; ")}]`);
     }
   }
-  if (openFindings.length) {
+  if (contract.findings.length) {
     lines.push("");
     lines.push("Open findings to address:");
-    for (const finding of openFindings) {
-      lines.push(`- ${finding.id} (${finding.severity}): ${finding.description}`);
+    for (const finding of contract.findings) {
+      lines.push(`- ${finding.id} (${finding.severity}; ${finding.scope}; ${finding.disposition}; ${finding.category}): ${finding.description}`);
       lines.push(`  Required action: ${finding.requiredAction}`);
       if (finding.requiredVerification.length) lines.push(`  Required verification: ${JSON.stringify(finding.requiredVerification)}`);
     }
