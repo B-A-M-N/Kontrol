@@ -22,6 +22,15 @@ function makeRoot(prefix: string): string {
   return mkdtempSync(join(tmpdir(), prefix));
 }
 
+async function waitFor(check: () => boolean, timeoutMs = 5_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (check()) return true;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  return check();
+}
+
 const baseConfig = {
   maintenanceIntervalMs: 5, // drive cycles from wall-clock ticks
   maintenanceBudgetMs: 5_000,
@@ -147,9 +156,9 @@ async function makeFixture() {
   // set so the stale session pin no longer blocks garbage collection.
   healthyDb.sqlite.prepare("update work_sessions set status = 'approved' where id = ?").run("ws_maint_gc");
   const terminal = createMaintenanceCoordinator(fx.stubDeps(healthyDb));
-  await new Promise((resolve) => setTimeout(resolve, 120));
+  const sessionPinPruned = await waitFor(() => !existsSync(fx.store.manifestPath(fx.sessionPinnedRef)));
   terminal.stop();
-  assert.equal(existsSync(fx.store.manifestPath(fx.sessionPinnedRef)), false, "all-terminal workspace session pins are pruned");
+  assert.equal(sessionPinPruned, true, "all-terminal workspace session pins are pruned");
   assert.equal(existsSync(fx.store.manifestPath(fx.submittedRef)), true, "durable submission stays rooted after terminal pin pruning");
   assert.equal((await fx.store.storeStats()).manifests, 1);
 
