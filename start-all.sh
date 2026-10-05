@@ -707,8 +707,8 @@ fi
 if ! node --import tsx scripts/probe-kontrol-readiness.mjs \
   --url "http://${DEV_HOST}:${DEV_PORT}/mcp" \
   --workspace "$PWD" \
-  "${PROBE_FLAGS[@]}" \
-  "${EXPECTED_AGENT_ARGS[@]}"; then
+  "${PROBE_FLAGS[@]+"${PROBE_FLAGS[@]}"}" \
+  "${EXPECTED_AGENT_ARGS[@]+"${EXPECTED_AGENT_ARGS[@]}"}"; then
   echo "ERROR: KONTROL readiness round-trip failed. Aborting." >&2
   return 1
 fi

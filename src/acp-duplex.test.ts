@@ -120,6 +120,7 @@ try {
 
   eventStore.close();
   approvalRequests.close();
+  db.close();
   console.log("acp-duplex.test.ts: all assertions passed");
 } finally {
   rmSync(root, { recursive: true, force: true });
