@@ -14,6 +14,12 @@
 
 const ORDINARY_KEYS = new Set([
   "PATH",
+  // Preserve Windows process-launch settings for nested package scripts.
+  "ComSpec",
+  "SystemDrive",
+  "SystemRoot",
+  "windir",
+  "PATHEXT",
   "HOME",
   "USER",
   "LOGNAME",
@@ -78,12 +84,14 @@ export function isControlPlaneEnvironmentKey(key) {
 export function buildToolEnvironment(source = process.env, {
   extraKeys = [],
   overrides = {},
+  platform = process.platform,
 } = {}) {
   const allow = new Set([...ORDINARY_KEYS, ...extraKeys]);
+  const allowCaseInsensitive = new Set([...allow].map((key) => key.toLowerCase()));
   const result = {};
   for (const [key, value] of Object.entries(source)) {
     if (value === undefined || isControlPlaneEnvironmentKey(key)) continue;
-    if (allow.has(key)) result[key] = value;
+    if (allow.has(key) || (platform === "win32" && allowCaseInsensitive.has(key.toLowerCase()))) result[key] = value;
   }
   result.NO_COLOR = "1";
   result.TERM = "dumb";
