@@ -24,6 +24,7 @@ __pycache__/
 
 test-mcp*.mjs
 scripts/test-*.mjs
+!scripts/test-manifest.mjs
 
 # Generated runtime/test state — must never be shipped or captured in review snapshots
 .kontrol-uat/
