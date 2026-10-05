@@ -11,7 +11,8 @@ const windowsEnv = buildToolEnvironment({
   KONTROL_CHILD_ENV_ALLOWLIST: "must-not-cross",
 }, { platform: "win32" });
 
-assert.equal(windowsEnv.Path, "C:\\Windows\\System32;C:\\Program Files\\nodejs");
+assert.equal(windowsEnv.PATH, "C:\\Windows\\System32;C:\\Program Files\\nodejs");
+assert.equal(windowsEnv.Path, undefined, "Windows PATH aliases normalize to the canonical key for process lookup");
 assert.equal(windowsEnv.ComSpec, "C:\\Windows\\System32\\cmd.exe");
 assert.equal(windowsEnv.SystemDrive, "C:");
 assert.equal(windowsEnv.SystemRoot, "C:\\Windows");

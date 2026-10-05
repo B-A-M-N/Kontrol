@@ -363,7 +363,7 @@ try {
 const noisyReaped = new ProcessSessionManager({
   maxRunningProcesses: 1,
   maxRunningProcessesPerOwner: 1,
-  idleTimeoutMs: 40,
+  idleTimeoutMs: 1_000,
   maxRuntimeMs: 10_000,
   reaperIntervalMs: 10,
 });
@@ -372,15 +372,14 @@ try {
     workspaceId: "workspace-noisy",
     ownerId: "transport-noisy",
     cwd: process.cwd(),
-    // Emit from the shell immediately, then keep producing output. The
-    // immediate built-in output makes the 40ms test timeout deterministic even
-    // when starting a child interpreter takes longer than the idle interval.
-    command: "while true; do printf 'still-active\\n'; sleep 0.005; done",
-    yieldTimeMs: 100,
+    // Emit directly from Node so shell startup latency does not consume the
+    // idle budget; continued output must keep the session alive past it.
+    command: `${node} -e "process.stdout.write('still-active\\n'); setInterval(() => process.stdout.write('still-active\\n'), 10)"`,
+    yieldTimeMs: 500,
   });
   assert.equal(noisy.running, true);
   assert.ok(noisy.sessionId);
-  await new Promise((resolve) => setTimeout(resolve, 120));
+  await new Promise((resolve) => setTimeout(resolve, 1_200));
   assert.equal(noisyReaped.getMetrics().running, 1, "process output counts as activity for idle reaping");
   await noisyReaped.terminateByOwner("transport-noisy");
 } finally {

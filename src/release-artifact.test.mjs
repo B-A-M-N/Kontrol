@@ -96,7 +96,7 @@ try {
   execFileSync(process.execPath, [npmExecPath, "run", "build"], {
     cwd: repoRoot,
     env: { ...process.env, KONTROL_BUILD_RESULT_PATH: resultPath },
-    stdio: "ignore",
+    stdio: "inherit",
   });
   const afterDist = lstatIfPresent(distPath);
   assert.equal(afterDist !== undefined, originalDist !== undefined, "atomic build must preserve dist existence");

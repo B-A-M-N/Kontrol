@@ -30,6 +30,12 @@ function run(command, args, environment = {}) {
   });
 }
 
+function runNpm(args, environment = {}) {
+  const npmExecPath = process.env.npm_execpath;
+  if (!npmExecPath) throw new Error("build-atomic.mjs must be invoked through npm (npm_execpath is missing)");
+  run(process.execPath, [npmExecPath, ...args], environment);
+}
+
 function hashTree(directory, artifactHash, relativeDirectory = "") {
   for (const entry of readdirSync(directory).sort()) {
     const absolute = join(directory, entry);
@@ -138,8 +144,12 @@ try {
   // Every producer writes only to the isolated candidate tree. The live dist/
   // directory is untouched until all source, UI, metadata, and entrypoint
   // checks pass.
-  run("npm", ["run", "build:app"]);
-  run("npx", ["tsc", "-p", "tsconfig.build.json", "--outDir", tempDist]);
+  runNpm(["run", "build:app"]);
+  run(process.execPath, [
+    join(root, "node_modules", "typescript", "bin", "tsc"),
+    "-p", "tsconfig.build.json",
+    "--outDir", tempDist,
+  ]);
 
   // The source shim imports through the repository layout and cannot be moved
   // into an immutable release. Ship the implementation itself so every

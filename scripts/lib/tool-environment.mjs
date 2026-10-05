@@ -87,11 +87,12 @@ export function buildToolEnvironment(source = process.env, {
   platform = process.platform,
 } = {}) {
   const allow = new Set([...ORDINARY_KEYS, ...extraKeys]);
-  const allowCaseInsensitive = new Set([...allow].map((key) => key.toLowerCase()));
+  const windowsKeysByLowerCase = new Map([...allow].map((key) => [key.toLowerCase(), key]));
   const result = {};
   for (const [key, value] of Object.entries(source)) {
     if (value === undefined || isControlPlaneEnvironmentKey(key)) continue;
-    if (allow.has(key) || (platform === "win32" && allowCaseInsensitive.has(key.toLowerCase()))) result[key] = value;
+    const windowsKey = platform === "win32" ? windowsKeysByLowerCase.get(key.toLowerCase()) : undefined;
+    if (allow.has(key) || windowsKey) result[windowsKey ?? key] = value;
   }
   result.NO_COLOR = "1";
   result.TERM = "dumb";
