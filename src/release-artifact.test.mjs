@@ -105,7 +105,10 @@ try {
     if (originalDistTarget !== undefined) assert.equal(readlinkSync(distPath), originalDistTarget, "atomic build must not rotate dist");
   }
   const result = JSON.parse(readFileSync(resultPath, "utf8"));
-  assert.match(result.artifactPath, /releases\//);
+  assert.ok(
+    result.artifactPath.split(/[\\/]/).includes("releases"),
+    `atomic build artifact should live under a releases directory: ${result.artifactPath}`,
+  );
   assert.equal(existsSync(join(result.artifactPath, "acp-worker-token.mjs")), true);
   const metadata = JSON.parse(readFileSync(join(result.artifactPath, "build-meta.json"), "utf8"));
   assert.equal(metadata.schemaVersion, metadata.maxReadableSchemaVersion);
