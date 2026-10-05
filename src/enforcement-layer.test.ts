@@ -27,10 +27,10 @@ function fakeServer(): { registerTool: (n: string, _c: unknown, h: (a: any) => a
 function seedWorkspace(dir: string, id: string): void {
   const db = new Database(databasePath(dir));
   db.pragma("foreign_keys = OFF");
-  db.exec(
+  db.prepare(
     `insert into workspace_sessions (id, root, status, mode, managed, created_at, last_used_at) ` +
-    `values ('${id}', '/tmp', 'active', 'checkout', 'false', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')`,
-  );
+    `values (?, ?, 'active', 'checkout', 'false', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')`,
+  ).run(id, dir);
   db.close();
 }
 
@@ -56,8 +56,8 @@ const reviewWorkflow = createReviewWorkflowService({
   db,
   workspaces: {
     getWorkspace: (id: string) => {
-      if (id === WS) return { id: WS, root: "/tmp", mode: "checkout" } as any;
-      if (id === WS_OTHER) return { id: WS_OTHER, root: "/tmp", mode: "checkout" } as any;
+      if (id === WS) return { id: WS, root, mode: "checkout" } as any;
+      if (id === WS_OTHER) return { id: WS_OTHER, root, mode: "checkout" } as any;
       throw new Error(`Unknown workspace: ${id}`);
     },
   } as any,
@@ -84,8 +84,8 @@ const reviewWorkflow = createReviewWorkflowService({
 const config: BridgeConfig = {
   workspaces: {
     getWorkspace: (id: string) => {
-      if (id === WS) return { id: WS, root: "/tmp", mode: "checkout" } as any;
-      if (id === WS_OTHER) return { id: WS_OTHER, root: "/tmp", mode: "checkout" } as any;
+      if (id === WS) return { id: WS, root, mode: "checkout" } as any;
+      if (id === WS_OTHER) return { id: WS_OTHER, root, mode: "checkout" } as any;
       throw new Error(`Unknown workspace: ${id}`);
     },
     setActiveSession: () => {},
