@@ -91,7 +91,9 @@ try {
   const originalDist = lstatIfPresent(distPath);
   const originalDistTarget = originalDist?.isSymbolicLink() ? readlinkSync(distPath) : undefined;
   const resultPath = join(fixtureRoot, "build-result.json");
-  execFileSync("npm", ["run", "build"], {
+  const npmExecPath = process.env.npm_execpath;
+  assert.ok(npmExecPath, "release-artifact.test.mjs must be invoked through npm to build a release");
+  execFileSync(process.execPath, [npmExecPath, "run", "build"], {
     cwd: repoRoot,
     env: { ...process.env, KONTROL_BUILD_RESULT_PATH: resultPath },
     stdio: "ignore",

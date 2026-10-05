@@ -66,7 +66,10 @@ try {
   // that the checkout's node_modules symlink would otherwise hide.
   const installPrefix = join(tmp, "clean-prefix");
   console.log("[package-release] installing clean artifact (using the configured npm cache)...");
-  execFileSync("npm", [
+  const npmExecPath = process.env.npm_execpath;
+  assert.ok(npmExecPath, "package-release.test.mjs must be invoked through npm to install a release");
+  execFileSync(process.execPath, [
+    npmExecPath,
     "install",
     "--prefix",
     installPrefix,

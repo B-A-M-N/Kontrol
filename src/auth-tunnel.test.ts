@@ -83,7 +83,9 @@ assert.equal(loadConfig({ ...baseEnv, KONTROL_TUNNEL_TOKEN: "short" }).authMode,
     // projection. Keep this security test self-contained instead of relying
     // on whichever prior test happened to leave dist/ behind.
     temporaryUiRoot = mkdtempSync(join(tmpdir(), "kontrol-auth-ui-"));
-    execFileSync("npm", ["run", "--silent", "build:app"], {
+    const npmExecPath = process.env.npm_execpath;
+    assert.ok(npmExecPath, "auth-tunnel.test.ts must be invoked through npm to build the UI candidate");
+    execFileSync(process.execPath, [npmExecPath, "run", "--silent", "build:app"], {
       cwd: fileURLToPath(new URL("..", import.meta.url)),
       env: { ...process.env, KONTROL_BUILD_OUTPUT_DIR: temporaryUiRoot },
       stdio: "ignore",

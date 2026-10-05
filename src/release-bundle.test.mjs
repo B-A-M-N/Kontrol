@@ -67,7 +67,9 @@ for (const candidate of candidates) {
 if (!buildResult) {
   console.log("release-bundle: no valid local candidate available; building one");
   const resultPath = join(tmp, "build-result.json");
-  execFileSync("npm", ["run", "build"], {
+  const npmExecPath = process.env.npm_execpath;
+  assert.ok(npmExecPath, "release-bundle.test.mjs must be invoked through npm to build a release");
+  execFileSync(process.execPath, [npmExecPath, "run", "build"], {
     cwd: root,
     env: { ...process.env, KONTROL_BUILD_RESULT_PATH: resultPath },
     stdio: "inherit",
