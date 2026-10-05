@@ -303,7 +303,7 @@ restore_database_if_needed() {
     --state-dir "$KONTROL_STATE_DIR" \
     --deployment-id "$DEPLOYMENT_ID" \
     --max-readable-schema-version "$rollback_max" \
-    "${restore_args[@]}")" || {
+    "${restore_args[@]+"${restore_args[@]}"}")" || {
       echo "ERROR: database rollback could not verify/restore the deployment-bound backup." >&2
       return 1
     }
@@ -1014,7 +1014,7 @@ rollback() {
   echo "[!] Rolling back launched components..." >&2
   write_deployment_record "rolling_back" "candidate activation did not reach committed readiness" "" || true
   # Graceful shutdown first; escalate only after the grace period.
-  for s in "${LAUNCHED_SESSIONS[@]}"; do
+  for s in "${LAUNCHED_SESSIONS[@]+"${LAUNCHED_SESSIONS[@]}"}"; do
     [[ -z "$s" ]] && continue
     tmux send-keys -t "$s" C-c 2>/dev/null || true
   done
@@ -1024,7 +1024,7 @@ rollback() {
     tmux kill-session -t kontrol-supervisor 2>/dev/null || true
   fi
   sleep 2
-  for s in "${LAUNCHED_SESSIONS[@]}"; do
+  for s in "${LAUNCHED_SESSIONS[@]+"${LAUNCHED_SESSIONS[@]}"}"; do
     [[ -z "$s" ]] && continue
     if tmux has-session -t "$s" 2>/dev/null; then
       tmux kill-session -t "$s" 2>/dev/null || true
@@ -1087,7 +1087,7 @@ on_exit() {
     trap - EXIT
     exit "$status"
   fi
-  if [[ "$STARTUP_COMMITTED" != "1" && "$DEPLOYMENT_LOCK_VALIDATED" == "1" && ("$CANDIDATE_ACTIVATION_ATTEMPTED" == "1" || "${#LAUNCHED_SESSIONS[@]}" -gt 0 || "$RUNTIME_LOCK_OWNED" == "1") ]]; then
+  if [[ "$STARTUP_COMMITTED" != "1" && "$DEPLOYMENT_LOCK_VALIDATED" == "1" && ("$CANDIDATE_ACTIVATION_ATTEMPTED" == "1" || -n "${LAUNCHED_SESSIONS[*]-}" || "$RUNTIME_LOCK_OWNED" == "1") ]]; then
     rollback
     if [[ "$ROLLBACK_SUCCEEDED" == "1" ]]; then
       write_deployment_record "committed" "requested candidate failed; previous generation restored" "rolled_back" || true

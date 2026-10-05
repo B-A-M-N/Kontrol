@@ -99,7 +99,7 @@ on_exit() {
         KONTROL_ROLLBACK_REQUESTED_BUILD_ID="${PREPARED_CANDIDATE_BUILD_ID:-unknown}" \
         KONTROL_ROLLBACK_FAILED_BUILD_ID="${PREPARED_CANDIDATE_BUILD_ID:-unknown}" \
         KONTROL_ROLLBACK_REASON="candidate activation failed after the old generation was stopped" \
-        ./start-all.sh --activate-existing "${START_ARGS[@]}"; then
+        ./start-all.sh --activate-existing "${START_ARGS[@]+"${START_ARGS[@]}"}"; then
         status=0
       else
         echo "ERROR: exact previous generation could not be recovered: $PREVIOUS_ARTIFACT_PATH" >&2
