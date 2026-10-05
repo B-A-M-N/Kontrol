@@ -1,22 +1,44 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { createMcpServer } from "./mcp/workspace-server.js";
-import { loadConfig } from "./config.js";
-import { createReviewCheckpointManager } from "./review-checkpoints.js";
-import { ProcessSessionManager } from "./process-sessions.js";
-import { WorkspaceRegistry } from "./workspaces.js";
-import { workspaceAppModelAndAppMeta } from "./bridge/shared.js";
 
 const root = mkdtempSync(join(tmpdir(), "kontrol-widget-metadata-"));
-const bridgeCallableMeta = workspaceAppModelAndAppMeta() as { ui?: Record<string, unknown>; "openai/outputTemplate"?: string };
-assert.deepEqual(bridgeCallableMeta.ui?.visibility, ["app"], "bridge data tools remain callable from the Workspace App");
-assert.equal(bridgeCallableMeta.ui?.resourceUri, undefined, "bridge data tools must not select the Workspace App renderer");
-assert.equal(bridgeCallableMeta["openai/outputTemplate"], undefined, "bridge data tools must not advertise a ChatGPT renderer");
+const appArtifactPath = join(root, "workspace-app.html");
+const previousAppArtifactPath = process.env.KONTROL_WORKSPACE_APP_HTML_PATH;
+writeFileSync(appArtifactPath, [
+  "<!doctype html>",
+  '<html lang="en"><head><meta charset="UTF-8"><title>Kontrol Diff</title>',
+  "<style>#app{color:red}</style></head><body><main id=\"app\"></main>",
+  "<script>window.__KONTROL_WORKSPACE_APP_BOOTSTRAPPED=true;</script></body></html>",
+].join("\n"));
+// Several server modules resolve Workspace App metadata during import. Keep
+// this metadata-only test independent of the later production UI build.
+process.env.KONTROL_WORKSPACE_APP_HTML_PATH = appArtifactPath;
 try {
+  const [
+    { Client },
+    { InMemoryTransport },
+    { createMcpServer },
+    { loadConfig },
+    { createReviewCheckpointManager },
+    { ProcessSessionManager },
+    { WorkspaceRegistry },
+    { workspaceAppModelAndAppMeta },
+  ] = await Promise.all([
+    import("@modelcontextprotocol/sdk/client/index.js"),
+    import("@modelcontextprotocol/sdk/inMemory.js"),
+    import("./mcp/workspace-server.js"),
+    import("./config.js"),
+    import("./review-checkpoints.js"),
+    import("./process-sessions.js"),
+    import("./workspaces.js"),
+    import("./bridge/shared.js"),
+  ]);
+  const bridgeCallableMeta = workspaceAppModelAndAppMeta() as { ui?: Record<string, unknown>; "openai/outputTemplate"?: string };
+  assert.deepEqual(bridgeCallableMeta.ui?.visibility, ["app"], "bridge data tools remain callable from the Workspace App");
+  assert.equal(bridgeCallableMeta.ui?.resourceUri, undefined, "bridge data tools must not select the Workspace App renderer");
+  assert.equal(bridgeCallableMeta["openai/outputTemplate"], undefined, "bridge data tools must not advertise a ChatGPT renderer");
   mkdirSync(join(root, "src"), { recursive: true });
   for (const mode of ["changes", "full"] as const) {
     const config = loadConfig({
@@ -99,6 +121,8 @@ try {
     }
   }
 } finally {
+  if (previousAppArtifactPath === undefined) delete process.env.KONTROL_WORKSPACE_APP_HTML_PATH;
+  else process.env.KONTROL_WORKSPACE_APP_HTML_PATH = previousAppArtifactPath;
   rmSync(root, { recursive: true, force: true });
 }
 
