@@ -5,6 +5,7 @@
 import assert from "node:assert/strict";
 import {
   chmodSync,
+  existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -629,8 +630,13 @@ try {
   const successfulEnv = writeEnvironment(successfulState, 17676, { useExistingDist: true });
   const first = runLauncher(successfulEnv);
   assert.equal(first.status, 0, "successful fake generation failed:\n" + first.stdout + "\n" + first.stderr);
+  const runtimeLockPath = join(successfulState, "runtime.lock");
+  assert.ok(
+    existsSync(runtimeLockPath),
+    "successful fake generation did not retain runtime.lock:\n" + first.stdout + "\n" + first.stderr,
+  );
   const activeGeneration = JSON.parse(readFileSync(join(successfulState, "generation.json"), "utf8"));
-  const activeLock = JSON.parse(readFileSync(join(successfulState, "runtime.lock"), "utf8"));
+  const activeLock = JSON.parse(readFileSync(runtimeLockPath, "utf8"));
   assert.equal(activeGeneration.status, "active");
   assert.equal(activeGeneration.activeBuildId, baseBuildId);
   assert.equal(activeGeneration.artifactPath, baseRelease);

@@ -41,27 +41,30 @@ try {
   assert.equal(reconciled.terminated, 1, "live orphaned children are terminated before readiness");
   assert.equal(processAlive({ pid, processStartToken: processStartToken(pid) }), false, "orphaned child is gone");
 
-  // The detached leader can disappear before reconciliation while a child it
-  // spawned remains in the same process group. Reconciliation must inspect and
-  // terminate the group, not only the recorded leader PID.
-  const descendantPidPath = join(root, "descendant.pid");
-  const parent = spawn(process.execPath, ["-e", `const { spawn } = require("node:child_process"); const child = spawn(process.execPath, ["-e", "require('node:fs').writeFileSync(process.argv[1], String(process.pid)); setTimeout(() => {}, 60000)", ${JSON.stringify(descendantPidPath)}], { stdio: "ignore" }); child.unref();`], {
-    detached: true,
-    stdio: "ignore",
-  });
-  await once(parent, "spawn");
-  parent.unref();
-  const parentPid = parent.pid;
-  assert.ok(parentPid, "detached parent must have a PID");
-  for (let attempt = 0; attempt < 20; attempt++) {
-    try { await access(descendantPidPath); break; } catch { await new Promise((resolve) => setTimeout(resolve, 50)); }
+  if (process.platform !== "win32") {
+    // The detached leader can disappear before reconciliation while a child it
+    // spawned remains in the same process group. Reconciliation must inspect and
+    // terminate the group, not only the recorded leader PID. Windows has no
+    // POSIX process-group signalling, so this assertion applies to Unix hosts.
+    const descendantPidPath = join(root, "descendant.pid");
+    const parent = spawn(process.execPath, ["-e", `const { spawn } = require("node:child_process"); const child = spawn(process.execPath, ["-e", "require('node:fs').writeFileSync(process.argv[1], String(process.pid)); setTimeout(() => {}, 60000)", ${JSON.stringify(descendantPidPath)}], { stdio: "ignore" }); child.unref();`], {
+      detached: true,
+      stdio: "ignore",
+    });
+    await once(parent, "spawn");
+    parent.unref();
+    const parentPid = parent.pid;
+    assert.ok(parentPid, "detached parent must have a PID");
+    for (let attempt = 0; attempt < 20; attempt++) {
+      try { await access(descendantPidPath); break; } catch { await new Promise((resolve) => setTimeout(resolve, 50)); }
+    }
+    const descendantPid = Number(await readFile(descendantPidPath, "utf8"));
+    assert.ok(descendantPid > 1, "detached descendant must report its PID");
+    await atomicWriteJson(ownedPath, [{ pid: parentPid, processGroupId: parentPid, processStartToken: processStartToken(parentPid), remoteRunId: "orphan-with-descendant" }]);
+    const groupReconciled = await reconcileOwnedProcesses(ownedPath, "test");
+    assert.equal(groupReconciled.terminated, 1, "orphan process groups are terminated even after leader exit");
+    assert.equal(processAlive({ pid: descendantPid, processStartToken: processStartToken(descendantPid) }), false, "orphan descendants are gone");
   }
-  const descendantPid = Number(await readFile(descendantPidPath, "utf8"));
-  assert.ok(descendantPid > 1, "detached descendant must report its PID");
-  await atomicWriteJson(ownedPath, [{ pid: parentPid, processGroupId: parentPid, processStartToken: processStartToken(parentPid), remoteRunId: "orphan-with-descendant" }]);
-  const groupReconciled = await reconcileOwnedProcesses(ownedPath, "test");
-  assert.equal(groupReconciled.terminated, 1, "orphan process groups are terminated even after leader exit");
-  assert.equal(processAlive({ pid: descendantPid, processStartToken: processStartToken(descendantPid) }), false, "orphan descendants are gone");
 } finally {
   await rm(root, { recursive: true, force: true });
 }
