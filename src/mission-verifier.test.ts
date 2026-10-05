@@ -1,14 +1,16 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { delimiter, join } from "node:path";
+import { join } from "node:path";
 import { createVerificationExecutionContext, parseVerificationCommand, runRuntimeProbe, runVerificationCommand, verificationCacheKey, verifyMissionSubmission } from "./mission-verifier.js";
 
 const root = await mkdtemp(join(tmpdir(), "kontrol-mission-verifier-test-"));
 try {
   assert.deepEqual(parseVerificationCommand("npm test"), { executable: "npm", args: ["test"] });
   assert.throws(() => parseVerificationCommand("npm test; rm -rf /"), /not permitted/);
+  assert.throws(() => parseVerificationCommand("npm test %PATH%"), /not permitted/);
+  assert.throws(() => parseVerificationCommand('npm test "quoted"'), /not permitted/);
   assert.throws(() => parseVerificationCommand("sh test.sh"), /not allowlisted/);
 
   const originalCacheEnv = process.env.VERIFIER_CACHE_TEST_FLAG;
@@ -81,18 +83,21 @@ try {
   assert.equal(passing.exitCode, 0);
   assert.ok(passing.outputSha256.length === 64);
 
-  const originalPath = process.env.PATH;
   const originalSecret = process.env.KONTROL_ACP_WORKER_SECRET;
-  process.env.PATH = `${root}${delimiter}${originalPath ?? ""}`;
   process.env.KONTROL_ACP_WORKER_SECRET = "must-not-cross-verification-boundary";
-  await writeFile(join(root, "npm"), "#!/usr/bin/node\nconsole.log(process.env.KONTROL_ACP_WORKER_SECRET ?? 'missing')\n");
-  await chmod(join(root, "npm"), 0o755);
   try {
-    const stripped = await runVerificationCommand("npm probe", root);
-    assert.match(stripped.outputTail, /missing/);
+    const secretContext = await createVerificationExecutionContext({
+      sandbox: false,
+      childEnvironmentAllowlist: ["KONTROL_ACP_WORKER_SECRET"],
+    });
+    assert.equal(secretContext.environment.KONTROL_ACP_WORKER_SECRET, undefined,
+      "control-plane secrets remain excluded even when explicitly allowlisted");
+    const stripped = await runVerificationCommand(
+      "npm --version", root, 5_000, Date.now() + 5_000, false, ["KONTROL_ACP_WORKER_SECRET"],
+    );
+    assert.equal(stripped.status, "passed", "verification launches through the real allowlisted package manager");
+    assert.doesNotMatch(stripped.outputTail, /must-not-cross-verification-boundary/);
   } finally {
-    if (originalPath === undefined) delete process.env.PATH;
-    else process.env.PATH = originalPath;
     if (originalSecret === undefined) delete process.env.KONTROL_ACP_WORKER_SECRET;
     else process.env.KONTROL_ACP_WORKER_SECRET = originalSecret;
   }

@@ -24,7 +24,7 @@ const ALLOWED_EXECUTABLES = new Set(["npm", "pytest", "cargo", "go", "make", "vi
  * set KONTROL_VERIFY_SANDBOX=1. This is the "Security-constrained autonomous
  * verification" mode for unattended runs.
  */
-const UNSAFE_SHELL_SYNTAX = /[;&|><`$(){}\n\r]/;
+const UNSAFE_SHELL_SYNTAX = /[;&|><`$(){}%!'"^\n\r]/;
 const MAX_OUTPUT_BYTES = 20_000;
 const VERIFIER_POLICY_VERSION = "mission-verifier-v3";
 const DEFAULT_COMMAND_VERSION = "unspecified";
@@ -330,9 +330,14 @@ export async function runVerificationCommand(
     ? sandboxArguments(executable, args, cwd, environment, execution.toolchainPaths, execution.sandboxExecutablePath)
     : { command: executable, args };
   return new Promise((resolve) => {
+    // Windows toolchain entry points such as npm are .cmd files. They require
+    // cmd.exe, so the strict parser also rejects its metacharacters and quotes
+    // before this platform-specific shell launch. Unix verification remains a
+    // direct argv spawn with no shell.
+    const useWindowsShell = process.platform === "win32" && !sandboxEnabled;
     const child = spawn(launch.command, launch.args, {
       cwd,
-      shell: false,
+      shell: useWindowsShell,
       detached: process.platform !== "win32",
       stdio: ["ignore", "pipe", "pipe"],
       env: environment,

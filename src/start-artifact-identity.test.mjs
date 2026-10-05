@@ -8,7 +8,7 @@ import { execFileSync } from "node:child_process";
 import { copyFileSync, mkdirSync, mkdtempSync, realpathSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const repoRoot = join(fileURLToPath(new URL(".", import.meta.url)), "..");
 
@@ -49,7 +49,7 @@ function resolveIn(checkout, options = {}) {
   };
   const script = [
     "import { resolveStartArtifact } from",
-    `  ${JSON.stringify(join(repoRoot, "scripts", "start.mjs"))};`,
+    `  ${JSON.stringify(pathToFileURL(join(repoRoot, "scripts", "start.mjs")).href)};`,
     `process.stdout.write(JSON.stringify(resolveStartArtifact(${JSON.stringify(callOptions)})));`,
   ].join("\n");
   const env = { PATH: process.env.PATH, HOME: process.env.HOME };
@@ -174,7 +174,7 @@ function resolveIn(checkout, options = {}) {
   const { spawnSync } = await import("node:child_process");
   const result = spawnSync(
     process.execPath,
-    [join(checkout, "scripts", "start.mjs")],
+    [realpathSync(join(checkout, "scripts", "start.mjs"))],
     {
       cwd: checkout,
       encoding: "utf8",

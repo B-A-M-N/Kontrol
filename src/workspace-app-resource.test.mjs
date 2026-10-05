@@ -9,7 +9,7 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, writeFileSync, rmSync, copyFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const repoRoot = resolve(join(fileURLToPath(new URL(".", import.meta.url)), ".."));
 
@@ -40,7 +40,7 @@ const TSX_LOADER = join(repoRoot, "node_modules", "tsx", "dist", "loader.mjs");
 function resolveIn(cwd, env = {}) {
   const script = [
     "import { WORKSPACE_APP_HTML, WORKSPACE_APP_ARTIFACT_SOURCE } from",
-    `  ${JSON.stringify(join(repoRoot, "src", "workspace-app-resource.ts"))};`,
+    `  ${JSON.stringify(pathToFileURL(join(repoRoot, "src", "workspace-app-resource.ts")).href)};`,
     "process.stdout.write(JSON.stringify({",
     "  html: WORKSPACE_APP_HTML,",
     "  provenance: WORKSPACE_APP_ARTIFACT_SOURCE.provenance,",
@@ -58,7 +58,7 @@ function resolveIn(cwd, env = {}) {
 function expectResolutionFailure(cwd, env = {}) {
   const script = [
     "import { WORKSPACE_APP_HTML } from",
-    `  ${JSON.stringify(join(repoRoot, "src", "workspace-app-resource.ts"))};`,
+    `  ${JSON.stringify(pathToFileURL(join(repoRoot, "src", "workspace-app-resource.ts")).href)};`,
     "process.stdout.write(String(WORKSPACE_APP_HTML.length));",
   ].join("\n");
   try {
@@ -189,7 +189,7 @@ function stageSourceCheckoutLayout(withDistArtifact, artifactHtml = SELF_CONTAIN
     writeFileSync(join(release, "ui", "workspace-app.html"), `${SELF_CONTAINED_HTML}\n<!-- release -->`);
     const script = [
       "import { WORKSPACE_APP_HTML, WORKSPACE_APP_ARTIFACT_SOURCE } from",
-      `  ${JSON.stringify(join(release, "workspace-app-resource.ts"))};`,
+      `  ${JSON.stringify(pathToFileURL(join(release, "workspace-app-resource.ts")).href)};`,
       "process.stdout.write(JSON.stringify({ html: WORKSPACE_APP_HTML, provenance: WORKSPACE_APP_ARTIFACT_SOURCE.provenance }));",
     ].join("\n");
     const out = execFileSync(process.execPath, ["--import", TSX_LOADER, "--input-type=module", "-e", script], {
@@ -214,7 +214,7 @@ function stageSourceCheckoutLayout(withDistArtifact, artifactHtml = SELF_CONTAIN
   if (existsSync(join(repoRoot, "dist", "ui", "workspace-app.html"))) {
     const script = [
       "import { WORKSPACE_APP_HTML, WORKSPACE_APP_ARTIFACT_SOURCE } from",
-      `  ${JSON.stringify(join(repoRoot, "src", "workspace-app-resource.ts"))};`,
+      `  ${JSON.stringify(pathToFileURL(join(repoRoot, "src", "workspace-app-resource.ts")).href)};`,
       "process.stdout.write(JSON.stringify({",
       "  provenance: WORKSPACE_APP_ARTIFACT_SOURCE.provenance,",
       "  referencesTemplateScript: WORKSPACE_APP_HTML.includes('./workspace-app.tsx'),",

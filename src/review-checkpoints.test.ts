@@ -15,7 +15,9 @@ try {
   await git(root, ["config", "user.email", "kontrol-test@example.invalid"]);
   await writeFile(join(root, "README.md"), "hello\n");
   await git(root, ["add", "README.md"]);
-  await git(root, ["commit", "-m", "Initial commit"]);
+  const tree = await git(root, ["write-tree"]);
+  const commit = await git(root, ["commit-tree", tree, "-m", "Initial commit"]);
+  await git(root, ["update-ref", "HEAD", commit]);
 
   const manager = createReviewCheckpointManager();
   await manager.initializeWorkspace({ workspaceId: "ws_review", root });
@@ -123,6 +125,7 @@ try {
   await rm(root, { recursive: true, force: true });
 }
 
-async function git(cwd: string, args: string[]): Promise<void> {
-  await execFileAsync("git", args, { cwd });
+async function git(cwd: string, args: string[]): Promise<string> {
+  const { stdout } = await execFileAsync("git", args, { cwd, encoding: "utf8" });
+  return stdout.trim();
 }
