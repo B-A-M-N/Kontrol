@@ -57,7 +57,7 @@ export function processStartToken(pid: number): string {
   return `started:${new Date().toISOString()}`;
 }
 
-function processIsLive(pid: number): boolean {
+export function processIsLive(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 1) return false;
   try {
     // `kill(pid, 0)` is the portable existence check. Reading /proc first

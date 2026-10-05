@@ -6,7 +6,8 @@
  * reported as uncovered on both backends, and a plain mutation must not be.
  */
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { realpath } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { execFileSync } from "node:child_process";
@@ -55,8 +56,8 @@ assert.match(gitCoverage.reasons[1], /git-ignored/);
 // ── Manager integration (filesystem backend) ─────────────
 
 {
-  const state = realpathSync(mkdtempSync(join(tmpdir(), "kontrol-coverage-fs-")));
-  const root = realpathSync(mkdtempSync(join(tmpdir(), "kontrol-coverage-root-")));
+  const state = await realpath(mkdtempSync(join(tmpdir(), "kontrol-coverage-fs-")));
+  const root = await realpath(mkdtempSync(join(tmpdir(), "kontrol-coverage-root-")));
   writeFileSync(join(root, "app.ts"), "export {};\n");
   mkdirSync(join(root, "node_modules"), { recursive: true });
   writeFileSync(join(root, "node_modules", "hidden.txt"), "invisible to checkpoints\n");
@@ -97,8 +98,8 @@ assert.match(gitCoverage.reasons[1], /git-ignored/);
 // ── Manager integration (git backend: git-ignored material) ──
 
 {
-  const state = realpathSync(mkdtempSync(join(tmpdir(), "kontrol-coverage-git-")));
-  const root = realpathSync(mkdtempSync(join(tmpdir(), "kontrol-coverage-git-root-")));
+  const state = await realpath(mkdtempSync(join(tmpdir(), "kontrol-coverage-git-")));
+  const root = await realpath(mkdtempSync(join(tmpdir(), "kontrol-coverage-git-root-")));
   const run = (args: string[]) => execFileSync("git", args, { cwd: root });
   run(["init", "-q"]);
   run(["config", "user.email", testGitEmail]);

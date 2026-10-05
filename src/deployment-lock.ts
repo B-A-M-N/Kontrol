@@ -3,7 +3,7 @@ import { existsSync, readFileSync, realpathSync, renameSync, rmSync, unlinkSync,
 import { mkdir } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { processStartToken } from "./runtime-lock.js";
+import { processIsLive, processStartToken } from "./runtime-lock.js";
 
 /**
  * Serializes deployment controllers without owning the serving runtime.
@@ -30,21 +30,6 @@ export function deploymentLockPath(stateDir: string): string {
 
 function deploymentLockGuardPath(stateDir: string): string {
   return `${deploymentLockPath(stateDir)}.guard`;
-}
-
-function processIsLive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 1) return false;
-  try {
-    // kill(pid, 0) also succeeds for zombies. A zombie has exited and cannot
-    // own a deployment transaction, so treat it as stale for lock recovery.
-    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
-    const closingParen = stat.lastIndexOf(")");
-    if (closingParen >= 0 && stat.slice(closingParen + 2).trim().split(/\s+/)[0] === "Z") return false;
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 export function readDeploymentLock(stateDir: string): DeploymentLockRecord | undefined {
