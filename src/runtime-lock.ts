@@ -60,16 +60,26 @@ export function processStartToken(pid: number): string {
 function processIsLive(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 1) return false;
   try {
+    // `kill(pid, 0)` is the portable existence check. Reading /proc first
+    // made every process look dead on macOS and Windows, where /proc is absent.
+    process.kill(pid, 0);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EPERM") return false;
+  }
+
+  if (process.platform === "linux") {
     // kill(pid, 0) also succeeds for zombies. A zombie has exited and cannot
     // own a serving generation, so treat it as stale for lock recovery.
-    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
-    const closingParen = stat.lastIndexOf(")");
-    if (closingParen >= 0 && stat.slice(closingParen + 2).trim().split(/\s+/)[0] === "Z") return false;
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      const closingParen = stat.lastIndexOf(")");
+      if (closingParen >= 0 && stat.slice(closingParen + 2).trim().split(/\s+/)[0] === "Z") return false;
+    } catch {
+      // If /proc is unavailable but kill(pid, 0) succeeded, existence is still
+      // authoritative; Linux start-token comparison separately rejects PID reuse.
+    }
   }
+  return true;
 }
 
 export function readRuntimeLock(stateDir: string): RuntimeLockRecord | undefined {
