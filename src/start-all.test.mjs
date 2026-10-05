@@ -4,7 +4,8 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-const script = readFileSync("start-all.sh", "utf8");
+const readText = (path) => readFileSync(path, "utf8").replace(/\r\n/g, "\n");
+const script = readText("start-all.sh");
 
 assert.match(script, /CRUSH_CLI_BIN="\$\{CRUSH_BIN:-\$\{HOME\}\/Crush-ACP\/crush\}"/);
 assert.match(script, /\$CRUSH_CLI_BIN" run --help/);
@@ -30,7 +31,7 @@ assert.match(script, /core-readyz/);
 assert.match(script, /KONTROL_ACP_AGENTS/);
 assert.match(script, /kontrol-supervisor/);
 assert.match(script, /scripts\/kontrol-tunnel\.sh/);
-const tunnelScript = readFileSync("scripts/kontrol-tunnel.sh", "utf8");
+const tunnelScript = readText("scripts/kontrol-tunnel.sh");
 assert.match(tunnelScript, /KONTROL_TUNNEL_PROFILE/);
 assert.match(tunnelScript, /KONTROL_TUNNEL_ID/);
 assert.match(tunnelScript, /"--harpoon\.hosts-include-loopback=\$\{KONTROL_HARPOON_INCLUDE_LOOPBACK:-false\}"/);
