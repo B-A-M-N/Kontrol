@@ -18,7 +18,7 @@
 // Installed npm packages (no git checkout) keep running their packaged
 // dist/cli.js: the identity concern is a source-checkout problem.
 import { existsSync, lstatSync, readFileSync, readlinkSync, realpathSync } from "node:fs";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { pathToFileURL } from "node:url";
@@ -43,7 +43,6 @@ function gitHead() {
 }
 
 function execGit(args) {
-  const { execFileSync } = require("node:child_process");
   return execFileSync("git", args, { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 }
 

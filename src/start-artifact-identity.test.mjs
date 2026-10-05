@@ -5,7 +5,7 @@
 // case stages a fixture checkout and drives the real resolver.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -167,12 +167,22 @@ function resolveIn(checkout, options = {}) {
 // 9. End to end through the real launcher: a stale dist makes `npm start`
 //    exit non-zero WITHOUT spawning a server (resolve-only probe).
 {
-  const checkout = stageCheckout();
-  stageDist(checkout, { buildId: "d063391stale0000", gitSha: "d06339148a2786e789429a994e7d40f39682097c", gitDirty: 0 });
+  const checkout = stageCheckout({ withGit: false });
+  mkdirSync(join(checkout, "scripts"), { recursive: true });
+  copyFileSync(join(repoRoot, "scripts", "start.mjs"), join(checkout, "scripts", "start.mjs"));
+  const gitDirectory = execFileSync("git", ["rev-parse", "--absolute-git-dir"], {
+    cwd: repoRoot,
+    encoding: "utf8",
+  }).trim().replaceAll("\\", "/");
+  const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoRoot, encoding: "utf8" }).trim();
+  writeFileSync(join(checkout, ".git"), `gitdir: ${gitDirectory}\n`);
+  const staleSha = "0".repeat(40);
+  assert.notEqual(head, staleSha);
+  stageDist(checkout, { buildId: "d063391stale0000", gitSha: staleSha, gitDirty: 0 });
   const { spawnSync } = await import("node:child_process");
   const result = spawnSync(
     process.execPath,
-    [join(repoRoot, "scripts", "start.mjs")],
+    [join(checkout, "scripts", "start.mjs")],
     {
       cwd: checkout,
       encoding: "utf8",
@@ -187,10 +197,7 @@ function resolveIn(checkout, options = {}) {
     },
   );
   assert.equal(result.status, 1, `stale dist must exit 1, got ${result.status}`);
-  // Without a resolvable git HEAD the fixture cannot match SHA identity, so
-  // the launcher may refuse either as stale or as a dirty-built projection —
-  // both are identity refusals and both must be explained on stderr.
-  assert.match(result.stderr ?? "", /(stale projection|dirty checkout)/, "refusal must be explained on stderr");
+  assert.match(result.stderr ?? "", /stale projection/, "refusal must explain the stale artifact");
   rmSync(checkout, { recursive: true, force: true });
 }
 

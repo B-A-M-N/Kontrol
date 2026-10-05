@@ -290,6 +290,9 @@ Current implementation contracts:
   the host denies clipboard-write permission. `KONTROL_UI_SCREENSHOT_DIR`
   opt-in captures deterministic Chromium evidence for before/current visual
   comparison without expanding the test's workspace authority.
+- `npm run test:runtime` builds the Workspace App in a temporary artifact
+  directory and passes its exact path to child checks. It must not leave a
+  partial `dist/` projection in the checkout.
 - Workspace App event waits default to 18 seconds so the watcher remains below
   common intermediary idle limits; reconnect retries recreate the host `App`
   transport while preserving the durable UI projection and draft state.
