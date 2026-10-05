@@ -5,7 +5,7 @@
 // case stages a fixture checkout and drives the real resolver.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { copyFileSync, mkdirSync, mkdtempSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, realpathSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -70,7 +70,7 @@ function resolveIn(checkout, options = {}) {
   writeFileSync(join(checkout, ".kontrol-build-result.json"), `${JSON.stringify({ buildId: "aaaaaaaaaaaaaaaa", artifactPath: release })}\n`);
   const resolved = resolveIn(checkout);
   assert.equal(resolved.refusal, undefined, "build result path must resolve");
-  assert.equal(resolved.artifactPath, release);
+  assert.equal(resolved.artifactPath, realpathSync(release));
   assert.equal(resolved.buildId, "aaaaaaaaaaaaaaaa");
   rmSync(checkout, { recursive: true, force: true });
 }
@@ -150,7 +150,7 @@ function resolveIn(checkout, options = {}) {
   symlinkSync(release, join(checkout, "dist"), "dir");
   const resolved = resolveIn(checkout);
   assert.equal(resolved.refusal, undefined, "committed dist symlink must resolve");
-  assert.equal(resolved.artifactPath, release);
+  assert.equal(resolved.artifactPath, realpathSync(release));
   assert.equal(resolved.buildId, "2222222222222222");
   rmSync(checkout, { recursive: true, force: true });
 }

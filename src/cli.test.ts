@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+
+const repositoryRoot = fileURLToPath(new URL("..", import.meta.url));
 
 const packageJson = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
   version: string;
@@ -86,7 +89,7 @@ for (const flag of ["-v", "--version"]) {
   const { spawnSync } = await import("node:child_process");
   const runDoctor = (extraEnv: Record<string, string>, args: string[] = []) =>
     spawnSync(process.execPath, ["--import", "tsx", "src/cli.ts", "doctor", ...args], {
-      cwd: new URL("..", import.meta.url).pathname,
+      cwd: repositoryRoot,
       encoding: "utf8",
       env: {
         ...process.env,
@@ -214,7 +217,7 @@ for (const flag of ["-v", "--version"]) {
     console.log(snap.ref);
   `;
   const seed = spawnSync(process.execPath, ["--import", "tsx", "--eval", seedScript, "seed", storeRoot, wsRoot], {
-    cwd: new URL("..", import.meta.url).pathname,
+    cwd: repositoryRoot,
     encoding: "utf8",
   });
   assert.equal(seed.status, 0, `seeding capture must succeed; stderr: ${seed.stderr}`);
@@ -235,7 +238,7 @@ for (const flag of ["-v", "--version"]) {
     }
   `;
   const seedG = spawnSync(process.execPath, ["--import", "tsx", "--eval", seedGarbage, "seedg", storeRoot, garbageDir], {
-    cwd: new URL("..", import.meta.url).pathname,
+    cwd: repositoryRoot,
     encoding: "utf8",
   });
   assert.equal(seedG.status, 0, `garbage seeding must succeed; stderr: ${seedG.stderr}`);
@@ -265,14 +268,14 @@ for (const flag of ["-v", "--version"]) {
     db.close();
   `;
   const dbSeed = spawnSync(process.execPath, ["--import", "tsx", "--eval", dbScript, "dbseed", stateDir, subRef], {
-    cwd: new URL("..", import.meta.url).pathname,
+    cwd: repositoryRoot,
     encoding: "utf8",
   });
   assert.equal(dbSeed.status, 0, `db seeding must succeed; stderr: ${dbSeed.stderr}`);
 
   // 4. Run the real CLI GC (live, not dry-run) against this state dir.
   const gc = spawnSync(process.execPath, ["--import", "tsx", "src/cli.ts", "snapshots", "gc"], {
-    cwd: new URL("..", import.meta.url).pathname,
+    cwd: repositoryRoot,
     encoding: "utf8",
     env: {
       ...process.env,

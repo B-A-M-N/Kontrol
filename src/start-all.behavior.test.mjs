@@ -22,8 +22,9 @@ import { realpathSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
-const realCheckoutRoot = resolve(new URL("..", import.meta.url).pathname);
+const realCheckoutRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const harnessRoot = mkdtempSync(join(tmpdir(), "kontrol-launcher-behavior-"));
 // The launcher derives DESKTOP_PWD from its own location and swaps the dist
 // projection inside it. Rather than mutating the REAL checkout (which races

@@ -292,7 +292,8 @@ Current implementation contracts:
   comparison without expanding the test's workspace authority.
 - `npm run test:runtime` builds the Workspace App in a temporary artifact
   directory and passes its exact path to child checks. It must not leave a
-  partial `dist/` projection in the checkout.
+  partial `dist/` projection in the checkout. CI sets a local Git identity for
+  synthetic repository fixtures.
 - Workspace App event waits default to 18 seconds so the watcher remains below
   common intermediary idle limits; reconnect retries recreate the host `App`
   transport while preserving the durable UI projection and draft state.

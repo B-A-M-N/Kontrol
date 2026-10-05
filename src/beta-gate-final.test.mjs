@@ -3,9 +3,10 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync 
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { validateBetaExternalCatalogReceipt } from "../scripts/beta-external-catalog-contract.mjs";
 
-const root = resolve(new URL("..", import.meta.url).pathname);
+const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const fixture = mkdtempSync(join(tmpdir(), "kontrol-beta-final-"));
 const fakeBin = join(fixture, "bin");
 const codeReceiptPath = join(fixture, "beta-code.json");

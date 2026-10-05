@@ -51,6 +51,11 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Configure fixture Git identity
+        run: |
+          git config --local user.name "Kontrol CI"
+          git config --local user.email "kontrol-ci@example.invalid"
+
       - name: Install Playwright Chromium (Linux)
         if: runner.os == 'Linux'
         run: npx playwright install --with-deps chromium
@@ -117,6 +122,11 @@ jobs:
           cache: npm
 
       - run: npm ci
+
+      - name: Configure fixture Git identity
+        run: |
+          git config --local user.name "Kontrol CI"
+          git config --local user.email "kontrol-ci@example.invalid"
 
       # Build once so the UAT script's staged pack is fast and deterministic.
       - name: Build
