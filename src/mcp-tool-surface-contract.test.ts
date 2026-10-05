@@ -338,7 +338,7 @@ try {
     "a worker with a stale nonce is rejected even when its work-session binding is valid");
   assert.equal(existsSync(join(leaseWorkspaceRoot, "stale.txt")), false, "stale worker mutation leaves the file unchanged");
 
-  const nestedRoot = join(leaseWorkspaceRoot, "nested");
+  const nestedRoot = join(canonicalLeaseWorkspaceRoot, "nested");
   mkdirSync(nestedRoot, { recursive: true });
   writeFileSync(join(nestedRoot, "AGENTS.md"), "Nested access instruction marker.\n");
   const deniedInvocations: any[] = [];
@@ -362,7 +362,7 @@ try {
   }
   assert.deepEqual(deniedInvocations.map((entry) => entry.tool), ["read", "read", "read", "read"],
     "all Git inspection tools are evaluated as canonical read operations");
-  assert.equal(deniedInvocations[0].path.absolutePath, realpathSync(nestedRoot),
+  assert.equal(deniedInvocations[0].path.absolutePath, nestedRoot,
     "path-scoped Git policy receives the safely resolved workspace path");
 
   const submission = leaseSessions.submitForReview({
