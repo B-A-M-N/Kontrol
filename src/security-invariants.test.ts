@@ -21,7 +21,7 @@ import assert from "node:assert/strict";
 import { brandWorkspaceId, type WorkSessionId } from "./branded.js";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { buildChildEnvironment, isControlPlaneEnvironmentKey } from "./process-environment.js";
 import { launcherAuthorityKeys, stripLauncherAuthority } from "./runtime-context.js";
 import { authorizeWorkSessionAction } from "./work-session-action-guard.js";
@@ -193,7 +193,7 @@ import { openDatabase } from "./db/client.js";
       const full = join(dir, entry.name);
       if (entry.isDirectory()) { walk(full); continue; }
       if (!/\.tsx?$/.test(entry.name) || entry.name.includes(".test.")) continue;
-      const rel = full.slice(process.cwd().length + 1);
+      const rel = relative(process.cwd(), full).replaceAll("\\", "/");
       if (rel.startsWith("dist/")) continue;
       const text = readFileSync(full, "utf8");
       for (const authorityKey of ["KONTROL_DEPLOYMENT_ID", "KONTROL_EXPECTED_SCHEMA_VERSION", "KONTROL_RUNTIME_LOCK_TOKEN", "KONTROL_DEPLOYMENT_LOCK_TOKEN", "KONTROL_LAUNCH_GENERATION_ID", "KONTROL_ARTIFACT_PATH"]) {
