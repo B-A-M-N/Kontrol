@@ -724,6 +724,22 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
           sendJsonRpcError(res, 403, -32001, "MCP session belongs to another conversation");
           return;
         }
+        if (
+          config.mcpToolCatalogAckRequired === true
+          && requestRpcMethod === "tools/call"
+          && sessionState?.toolCatalogHandshake?.status !== "accepted"
+        ) {
+          logEvent(config.logging, "warn", "mcp_tool_catalog_call_rejected", {
+            requestId,
+            sessionIdPrefix: sessionIdPrefix(sessionId),
+            toolName: requestToolName,
+            handshakeStatus: sessionState?.toolCatalogHandshake?.status ?? "missing",
+          });
+          sendJsonRpcError(res, 200, -32012,
+            "Kontrol requires the client to acknowledge its registered tools/list catalog before calling tools. Follow the kontrol.dev/tool-catalog-ack-v1 capability.",
+            (req.body as { id?: unknown })?.id ?? null);
+          return;
+        }
         if (sessionState) {
           if (requestIsWaiter) {
             deps.recordMcpConnectionEvent?.({ kind: "watcher_started", sessionId, requestKind: requestToolName });
@@ -891,6 +907,7 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
                 durableWorkerSession: connectionContext.authenticatedRole === "worker"
                   || Boolean(connectionContext.workSessionId),
                 lastRpcMethod: "initialize",
+                toolCatalogHandshake: { status: "pending" },
               });
               const createdState = mcpSessions.get(newSessionId)!;
               createdState.toolSurfaceVersion = readMcpToolSurface().version;
@@ -1078,6 +1095,21 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
             else if (uri === DEVDESKTOP_WORKSPACE_APP_URI) workspaceAppResourceMetrics.devDesktopMigration++;
           },
           recordPhaseTiming,
+          (catalogSessionId, handshake) => {
+            if (!catalogSessionId) return;
+            const state = mcpSessions.get(catalogSessionId);
+            if (!state) return;
+            state.toolCatalogHandshake = { ...handshake };
+            logEvent(config.logging, handshake.status === "accepted" ? "info" : "warn", "mcp_tool_catalog_handshake", {
+              sessionIdPrefix: sessionIdPrefix(catalogSessionId),
+              status: handshake.status,
+              serverCatalogSha256: handshake.serverCatalogSha256,
+              hostCatalogSha256: handshake.hostCatalogSha256,
+              toolCount: handshake.toolCount,
+              acceptedAt: handshake.acceptedAt,
+              reason: handshake.reason,
+            });
+          },
         );
         sessionMcpServer = server;
         const initializedHandler = server.server.oninitialized;

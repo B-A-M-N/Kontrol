@@ -188,16 +188,18 @@ npm run gate:beta:final
 ```
 
 Capture `external-tools-list.json` from the connected MCP host after the
-candidate deployment. It must be one envelope containing `capturedAt`, a
-`captureId`, the fresh `initialize` response, and the matching authoritative
-`tools/list` response. The host capture is operator-supplied evidence; the
-receipt labels it as such and does not claim Kontrol machine-verified the host
-exchange. The probe independently opens a fresh server transport, records its
-server version and catalog as machine-verified evidence, exercises two live
-SSE heartbeat cycles under concurrent Workspace App resource reads, and
-requires two observed drain recoveries. A localhost or idle-proxy run cannot
-write a qualification receipt. Capture the host snapshot during the candidate
-soak and run the probe after the soak ends.
+candidate deployment. It must include `capturedAt`, `captureId`, the full
+`mcpSessionId`, the fresh `initialize` response, the matching server
+`toolsList`, the host's actual `registeredCatalog`, and its acknowledgement
+notification record. The probe correlates that same session with authenticated
+Kontrol diagnostics and requires matching server and host catalog fingerprints.
+The host capture remains operator-supplied; the receipt separately marks
+Kontrol's accepted acknowledgement and fresh live server probe as
+machine-verified. See `docs/mcp-tool-catalog-ack.md` for the wrapper contract.
+The probe also exercises two live SSE heartbeat cycles under concurrent
+Workspace App resource reads and requires two observed drain recoveries. A
+localhost or idle-proxy run cannot write a qualification receipt. Capture the
+host snapshot during the candidate soak and run the probe after the soak ends.
 
 For a reported ChatGPT stream interruption, preserve the browser HAR, the
 authenticated diagnostics snapshot, Kontrol JSON logs, and any intermediary

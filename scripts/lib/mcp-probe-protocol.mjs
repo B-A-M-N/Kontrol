@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 const CATALOG_WRAPPERS = ["payload", "result", "toolsList", "toolsListResult", "catalog"];
 const VERSION_WRAPPERS = ["payload", "result", "initialize", "initializeResult"];
 
@@ -73,8 +75,31 @@ export function extractCatalog(value) {
   return {
     names: new Set(names),
     tools,
+    rawTools: sourceTools,
     version: extractServerInfoVersion(value),
     sourcePath: locations[0].path,
+  };
+}
+
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (isObject(value)) {
+    return `{${Object.keys(value).filter((key) => value[key] !== undefined).sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
+/** Must match Kontrol's kontrol.dev/tool-catalog-ack-v1 digest algorithm. */
+export function fingerprintToolCatalog(tools) {
+  if (!Array.isArray(tools)) return undefined;
+  const descriptors = [...tools];
+  if (descriptors.some((tool) => !isObject(tool) || typeof tool.name !== "string")) return undefined;
+  descriptors.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+  if (new Set(descriptors.map((tool) => tool.name)).size !== descriptors.length) return undefined;
+  return {
+    sha256: createHash("sha256").update(canonicalJson(descriptors)).digest("hex"),
+    toolCount: descriptors.length,
   };
 }
 

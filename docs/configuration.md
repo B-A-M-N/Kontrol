@@ -76,6 +76,7 @@ kontrol config set publicBaseUrl https://kontrol.example.com
 | `KONTROL_MCP_SESSION_MAX_PER_CLIENT` | Per-logical-client session cap. Defaults to `20`. |
 | `KONTROL_MCP_SESSION_SOFT_CAP` | Global session soft cap for LRU pressure cleanup. Defaults to `150`. |
 | `KONTROL_MCP_SESSION_HARD_CAP` | Global session admission hard cap. Defaults to `200`. |
+| `KONTROL_MCP_REQUIRE_TOOL_CATALOG_ACK` | Require clients to acknowledge the exact registered `tools/list` catalog before `tools/call`. Defaults to `false`; see [MCP tool catalog acknowledgement](mcp-tool-catalog-ack.md). |
 | `KONTROL_WORKTREE_ROOT` | Directory for managed Git worktrees. Defaults to `~/.kontrol/worktrees`. |
 | `KONTROL_STATE_DIR` | Directory for SQLite state. Defaults to `~/.local/share/kontrol`. |
 | `KONTROL_ENV_FILE` | Environment file used by `start-all.sh` and supervised component restarts. Defaults to the checkout `.env`; set explicitly for isolated launcher environments. |
@@ -242,11 +243,15 @@ with an external host's invocable-tool snapshot, pass
 an object with `tools`, or an array of tool names/descriptors. The parser
 rejects envelopes with more than one authoritative catalog instead of merging
 their tool names. Qualification requires an envelope with `capturedAt`, an
-operator-assigned `captureId`, and `initialize` plus its matching
-`toolsList` response. The receipt marks this host capture as operator-supplied
-and separately marks Kontrol's fresh live server probe as machine-verified.
-Qualification also requires `--dual`, two heartbeat bytes per session, at
-least two drain recoveries, concurrent resource reads, and the deployed HTTPS
+operator-assigned `captureId`, the captured host `mcpSessionId`, `initialize`,
+the matching server `toolsList`, the host's separate `registeredCatalog`, and
+the acknowledgement notification it sent. The probe correlates that exact
+session with authenticated diagnostics and requires matching server and host
+fingerprints. See [MCP tool catalog acknowledgement](mcp-tool-catalog-ack.md)
+for the host wrapper contract. The host capture remains operator-supplied;
+Kontrol separately machine-verifies its own acknowledgement record and fresh
+live server probe. Qualification also requires `--dual`, two heartbeat bytes
+per session, at least two drain recoveries, concurrent resource reads, and the deployed HTTPS
 tunnel endpoint; a local idle-proxy run cannot create a qualification receipt.
 Pass `--expected-build-id BUILD_ID --result-file beta-external-catalog.json`.
 The final gate rejects a catalog captured before the candidate soak, a probe

@@ -3,7 +3,7 @@
  * telemetry. Extracted verbatim from src/server.ts (P1.2); the createServer
  * closures become an explicit dependency object.
  */
-import { timingSafeEqual } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -191,6 +191,7 @@ export async function handleDiagnostics(deps: DiagnosticsDeps, req: Request, res
         .sort((a, b) => a.lastApplicationActivityAt - b.lastApplicationActivityAt)
         .map((state) => ({
           sessionIdPrefix: sessionIdPrefix(state.sessionId),
+          sessionIdSha256: createHash("sha256").update(state.sessionId).digest("hex"),
           sessionLabel: state.sessionLabel,
           logicalClientId: state.logicalClientId,
           identitySource: state.identitySource,
@@ -215,6 +216,7 @@ export async function handleDiagnostics(deps: DiagnosticsDeps, req: Request, res
           lastRpcMethod: state.lastRpcMethod,
           lastToolName: state.lastToolName,
           toolSurfaceVersion: state.toolSurfaceVersion,
+          toolCatalogHandshake: state.toolCatalogHandshake ? { ...state.toolCatalogHandshake } : undefined,
           catalogRefresh: state.catalogRefresh ? { ...state.catalogRefresh } : undefined,
         })),
       perClient: Object.entries([...mcpSessions.values()].reduce((acc, s) => {

@@ -26,6 +26,9 @@ assert.equal(loadConfig({ ...baseEnv, KONTROL_TOOL_MODE: "codex" }).toolMode, "c
 assert.equal(loadConfig({ ...baseEnv, KONTROL_MINIMAL_TOOLS: "0" }).toolMode, "full");
 assert.equal(loadConfig({ ...baseEnv, KONTROL_MINIMAL_TOOLS: "1" }).toolMode, "minimal");
 assert.equal(loadConfig(baseEnv).skillsEnabled, true);
+assert.equal(loadConfig(baseEnv).mcpToolCatalogAckRequired, false, "host catalog acknowledgement stays opt-in during client rollout");
+assert.equal(loadConfig({ ...baseEnv, KONTROL_MCP_REQUIRE_TOOL_CATALOG_ACK: "1" }).mcpToolCatalogAckRequired, true,
+  "operators can require an exact host catalog acknowledgement before tool calls");
 assert.deepEqual(loadConfig(baseEnv).childEnvironmentAllowlist, []);
 assert.deepEqual(loadConfig({ ...baseEnv, KONTROL_CHILD_ENV_ALLOWLIST: "SSH_AUTH_SOCK,HTTP_PROXY,not-valid-name!" }).childEnvironmentAllowlist, ["SSH_AUTH_SOCK", "HTTP_PROXY"]);
 assert.deepEqual(loadConfig({ ...baseEnv, KONTROL_VERIFY_TOOLCHAIN_PATHS: "/opt/node,/opt/cargo" }).verifyToolchainPaths, ["/opt/node", "/opt/cargo"]);

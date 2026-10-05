@@ -12,6 +12,7 @@ import {
   readMcpServerVersionFromBuildMeta,
 } from "./mcp/tool-logging.js";
 import { assertRequiredInspectionTools, REQUIRED_INSPECTION_TOOLS } from "./mcp/tool-names.js";
+import { fingerprintToolCatalog, TOOL_CATALOG_ACK_CAPABILITY, TOOL_CATALOG_ACK_METHOD } from "./mcp/tool-catalog-handshake.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { loadConfig } from "./config.js";
 import { ProcessSessionManager } from "./process-sessions.js";
@@ -87,14 +88,50 @@ try {
     const workspaces = new WorkspaceRegistry(config);
     const checkpoints = createReviewCheckpointManager({ snapshotStoreRoot });
     const processSessions = new ProcessSessionManager({ childEnvironmentAllowlist: [] });
-    const server = createMcpServer(config, workspaces, checkpoints, processSessions);
-    const client = new Client({ name: `mcp-tool-surface-${mode}`, version: "1.0.0" });
+    let observedHandshake: { status: "accepted" | "rejected"; reason?: string; serverCatalogSha256?: string; hostCatalogSha256: string } | undefined;
+    const server = createServerWithHandshakeObserver(
+      config,
+      workspaces,
+      checkpoints,
+      processSessions,
+      { mcpSessionId: `tool-surface-${mode}` },
+      (_sessionId, result) => { observedHandshake = result; },
+    );
+    const client = new Client({ name: `mcp-tool-surface-${mode}`, version: "1.0.0" }, {
+      capabilities: { extensions: { [TOOL_CATALOG_ACK_CAPABILITY]: { contractVersion: 1 } } },
+    });
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
     try {
       assert.equal(client.getServerVersion()?.version, readMcpServerVersion(),
         `${mode} MCP initialize must advertise the runtime tool-surface version`);
+      assert.equal((client.getServerCapabilities()?.extensions?.[TOOL_CATALOG_ACK_CAPABILITY] as { contractVersion?: unknown } | undefined)?.contractVersion, 1,
+        `${mode} must advertise the tool-catalog acknowledgement extension`);
       const listed = await client.listTools();
+      const fingerprint = fingerprintToolCatalog({ tools: listed.tools });
+      assert.ok(fingerprint, `${mode} tools/list catalog must be fingerprintable`);
+      await client.notification({
+        method: TOOL_CATALOG_ACK_METHOD,
+        params: {
+          contractVersion: 1,
+          serverVersion: client.getServerVersion()!.version,
+          hostCatalogSha256: fingerprint.sha256,
+          hostToolCount: fingerprint.toolCount,
+        },
+      } as never);
+      assert.equal(observedHandshake?.status, "accepted", `${mode} exact host catalog acknowledgement should be accepted`);
+      assert.equal(observedHandshake?.serverCatalogSha256, fingerprint.sha256);
+      await client.notification({
+        method: TOOL_CATALOG_ACK_METHOD,
+        params: {
+          contractVersion: 1,
+          serverVersion: client.getServerVersion()!.version,
+          hostCatalogSha256: "0".repeat(64),
+          hostToolCount: fingerprint.toolCount,
+        },
+      } as never);
+      assert.equal(observedHandshake?.status, "rejected", `${mode} stale host catalog acknowledgement must be rejected`);
+      assert.equal(observedHandshake?.reason, "host_catalog_fingerprint_mismatch");
       const names = new Set(listed.tools.map((tool) => tool.name));
       for (const name of ["read", "grep", "glob", "ls", "git_status", "git_log", "git_diff", "git_show"]) {
         assert.ok(names.has(name), `${mode} must expose required inspection tool ${name}`);
@@ -136,6 +173,25 @@ try {
 }
 
 console.log("mcp-tool-surface-contract.test.ts: all assertions passed");
+
+function createServerWithHandshakeObserver(
+  config: ReturnType<typeof loadConfig>,
+  workspaces: WorkspaceRegistry,
+  checkpoints: ReturnType<typeof createReviewCheckpointManager>,
+  processSessions: ProcessSessionManager,
+  connectionContext: { mcpSessionId: string },
+  onHandshake: NonNullable<Parameters<typeof createMcpServer>[23]>,
+) {
+  return createMcpServer(
+    config, workspaces, checkpoints, processSessions,
+    undefined, undefined, undefined, undefined, undefined,
+    undefined, undefined, undefined, undefined,
+    connectionContext,
+    undefined, undefined, undefined, undefined, undefined,
+    undefined, undefined, undefined, undefined,
+    onHandshake,
+  );
+}
 
 // Mutation authority is independent of checkpoint widgets. A direct client
 // cannot mutate a checkout while a delegated session holds its lease, while a

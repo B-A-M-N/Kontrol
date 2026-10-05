@@ -29,6 +29,12 @@ import type { ReviewWorkflowService } from "../review-workflow.js";
 import type { LiveWaiterRegistry } from "../bridge/shared.js";
 import type { DatabaseHandle } from "../db/client.js";
 import { installCachedToolList } from "../mcp-tool-list-cache.js";
+import {
+  fingerprintToolCatalog,
+  TOOL_CATALOG_ACK_CAPABILITY,
+  ToolCatalogAcceptedNotificationSchema,
+  type ToolCatalogFingerprint,
+} from "./tool-catalog-handshake.js";
 import { registerPolicyTools } from "../policy-tools.js";
 import { registerBridgeTools } from "../acp-bridge.js";
 // P1.3 decomposition: shared helpers live in focused modules. The names are
@@ -94,6 +100,14 @@ export function createMcpServer(
   mutationReceipts?: MutationReceiptStore,
   onWorkspaceAppResource?: (uri: string) => void,
   onPhaseTiming?: (phase: string, durationMs: number) => void,
+  onToolCatalogHandshake?: (sessionId: string | undefined, result: {
+    status: "accepted" | "rejected";
+    serverCatalogSha256?: string;
+    hostCatalogSha256: string;
+    toolCount?: number;
+    acceptedAt: string;
+    reason?: string;
+  }) => void,
 ): McpServer {
   const serverConstructionStartedAt = performance.now();
   const mcpToolSurface = readMcpToolSurface();
@@ -111,6 +125,16 @@ export function createMcpServer(
       instructions: cachedServerInstructions(config),
     },
   );
+  server.server.registerCapabilities({
+    extensions: {
+      [TOOL_CATALOG_ACK_CAPABILITY]: {
+        contractVersion: 1,
+        notificationMethod: "notifications/experimental/kontrol/tool-catalog-accepted",
+        fingerprint: "sha256-canonical-json-v1",
+        required: config.mcpToolCatalogAckRequired === true,
+      },
+    },
+  });
   onPhaseTiming?.("mcp.server_construction", performance.now() - serverConstructionStartedAt);
   const toolRegistrationStartedAt = performance.now();
   const mutationPrincipalId = connectionContext?.authenticatedPrincipalId
@@ -203,15 +227,49 @@ export function createMcpServer(
     registerBridgeTools(server, bridgeConfig);
   }
 
+  let toolCatalogFingerprint: ToolCatalogFingerprint | undefined;
   toolListDescriptorCacheActive = installCachedToolList(
     server,
     `${config.toolMode}|${config.widgets}|${config.skillsEnabled ? "skills" : "no-skills"}|${config.acpEnabled ? "acp" : "no-acp"}|${policyEngine ? "policy" : "no-policy"}|surface:${mcpToolSurface.version}`,
     toolListDescriptorCache,
     ListToolsRequestSchema,
+    (descriptor) => {
+      toolCatalogFingerprint = fingerprintToolCatalog(descriptor);
+    },
   );
   if (!toolListDescriptorCacheActive) {
     console.warn("[kontrol] tools/list descriptor cache unavailable (SDK internals changed); serving uncached");
   }
+  server.server.setNotificationHandler(ToolCatalogAcceptedNotificationSchema, async (notification) => {
+    const expected = toolCatalogFingerprint;
+    const received = notification.params;
+    const acceptedAt = new Date().toISOString();
+    const clientExtension = server.server.getClientCapabilities()?.extensions?.[TOOL_CATALOG_ACK_CAPABILITY];
+    const clientSupportsExtension = Boolean(
+      clientExtension
+      && typeof clientExtension === "object"
+      && (clientExtension as { contractVersion?: unknown }).contractVersion === 1,
+    );
+    const reason = !expected
+      ? "tools_list_not_observed"
+      : !clientSupportsExtension
+        ? "client_capability_missing"
+      : received.serverVersion !== mcpToolSurface.version
+        ? "server_version_mismatch"
+        : received.hostCatalogSha256 !== expected.sha256
+          ? "host_catalog_fingerprint_mismatch"
+          : received.hostToolCount !== expected.toolCount
+            ? "host_catalog_tool_count_mismatch"
+            : undefined;
+    onToolCatalogHandshake?.(connectionContext?.mcpSessionId, {
+      status: reason ? "rejected" : "accepted",
+      serverCatalogSha256: expected?.sha256,
+      hostCatalogSha256: received.hostCatalogSha256,
+      toolCount: expected?.toolCount,
+      acceptedAt,
+      reason,
+    });
+  });
   assertRequiredInspectionTools(workspaceToolNames);
   onPhaseTiming?.("mcp.tool_registration", performance.now() - toolRegistrationStartedAt);
 

@@ -61,6 +61,14 @@ export interface McpSessionState {
   lastRpcMethod?: string;
   lastToolName?: string;
   toolSurfaceVersion?: string;
+  toolCatalogHandshake?: {
+    status: "pending" | "accepted" | "rejected";
+    serverCatalogSha256?: string;
+    hostCatalogSha256?: string;
+    toolCount?: number;
+    acceptedAt?: string;
+    reason?: string;
+  };
   catalogRefresh?: {
     initializedPulseAttempted: boolean;
     getStreamPulseAttempted: boolean;
@@ -268,11 +276,12 @@ export function sendJsonRpcError(
   status: number,
   code: number,
   message: string,
+  id: unknown = null,
 ): void {
   res.status(status).json({
     jsonrpc: "2.0",
     error: { code, message },
-    id: null,
+    id,
   });
 }
 

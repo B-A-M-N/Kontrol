@@ -147,6 +147,24 @@ export function validateBetaExternalCatalogReceipt(receipt, { candidateBuildId, 
     && typeof receipt.hostCapture.sha256 === "string"
     && /^[a-f0-9]{64}$/.test(receipt.hostCapture.sha256),
   );
+  const handshake = receipt?.hostCatalogHandshake;
+  const handshakeAcceptedAtMs = Date.parse(handshake?.acceptedAt ?? "");
+  const hostCatalogHandshakeMachineVerified = Boolean(
+    handshake?.source === "authenticated_server_diagnostics"
+    && handshake.machineVerified === true
+    && handshake.method === "notifications/experimental/kontrol/tool-catalog-accepted"
+    && handshake.contractVersion === 1
+    && /^[a-f0-9]{64}$/.test(handshake.sessionIdSha256 ?? "")
+    && handshake.sessionIdSha256 === receipt?.hostCapture?.sessionIdSha256
+    && /^[a-f0-9]{64}$/.test(handshake.hostCatalogSha256 ?? "")
+    && handshake.hostCatalogSha256 === handshake.serverCatalogSha256
+    && handshake.hostCatalogSha256 === handshake.clientCatalogSha256
+    && Number.isInteger(handshake.toolCount)
+    && handshake.toolCount === hostTools?.length
+    && Number.isFinite(handshakeAcceptedAtMs)
+    && handshakeAcceptedAtMs >= soakStartedAtMs
+    && handshakeAcceptedAtMs <= soakFinishedAtMs,
+  );
   const liveServerProbeIsMachineVerified = Boolean(
     receipt?.liveServerProbe?.source === "fresh_http_initialize_and_tools_list"
     && receipt.liveServerProbe.machineVerified === true
@@ -196,6 +214,7 @@ export function validateBetaExternalCatalogReceipt(receipt, { candidateBuildId, 
     && Number.isFinite(soakStartedAtMs)
     && Number.isFinite(soakFinishedAtMs)
     && hostCatalogCapturedAtMs >= soakStartedAtMs
+    && hostCatalogCapturedAtMs <= soakFinishedAtMs
     && hostCatalogCapturedAtMs <= probeStartedAtMs
     && probeStartedAtMs >= soakFinishedAtMs
     && probeFinishedAtMs >= probeStartedAtMs,
@@ -220,6 +239,7 @@ export function validateBetaExternalCatalogReceipt(receipt, { candidateBuildId, 
     && receipt?.hostCatalogEvidenceSource === "operator_supplied"
     && receipt?.hostCatalogMachineVerified === false
     && hostCaptureIsOperatorSupplied
+    && hostCatalogHandshakeMachineVerified
     && receipt?.liveServerProbeMachineVerified === true
     && liveServerProbeIsMachineVerified
     && buildIdentityMatches
@@ -239,6 +259,7 @@ export function validateBetaExternalCatalogReceipt(receipt, { candidateBuildId, 
     sameCatalogTarget,
     workspaceApp: workspaceAppCheck,
     hostCaptureIsOperatorSupplied,
+    hostCatalogHandshakeMachineVerified,
     liveServerProbeIsMachineVerified,
     streamingEvidenceValid,
     postHeartbeatEvidenceValid,

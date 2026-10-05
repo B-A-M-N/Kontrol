@@ -4,6 +4,7 @@ import {
   extractCatalog,
   extractServerInfoVersion,
   extractWorkspaceAppResourceUris,
+  fingerprintToolCatalog,
   matchJsonRpcResponse,
   parseSseEventChunks,
 } from "./lib/mcp-probe-protocol.mjs";
@@ -11,6 +12,19 @@ import {
 const completeTools = ["read", "grep", "glob", "ls", "git_status", "git_log", "git_diff", "git_show", "poll_process"];
 const rawList = { jsonrpc: "2.0", id: 4, result: { tools: completeTools.map((name) => ({ name })) } };
 assert.deepEqual([...extractCatalog(rawList).names].sort(), [...completeTools].sort());
+assert.equal(extractCatalog(rawList).rawTools.length, completeTools.length);
+const catalogFingerprint = fingerprintToolCatalog([
+  { name: "write", inputSchema: { type: "object", properties: { path: { type: "string" } } } },
+  { name: "read", inputSchema: { properties: { path: { type: "string" } }, type: "object" } },
+]);
+assert.deepEqual(catalogFingerprint, fingerprintToolCatalog([
+  { inputSchema: { type: "object", properties: { path: { type: "string" } } }, name: "read" },
+  { inputSchema: { properties: { path: { type: "string" } }, type: "object" }, name: "write" },
+]), "catalog fingerprints ignore object-key and tool-list ordering");
+assert.notEqual(catalogFingerprint.sha256, fingerprintToolCatalog([
+  { name: "read", inputSchema: { type: "object", properties: { path: { type: "string" }, approvalResumeId: { type: "string" } } } },
+  { name: "write", inputSchema: { type: "object", properties: { path: { type: "string" } } } },
+]).sha256, "catalog fingerprints include callable input-schema changes");
 
 const appCatalog = extractCatalog({ tools: [
   {

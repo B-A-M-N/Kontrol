@@ -61,8 +61,9 @@ enforces it mechanically inside the publish path:
 4. **12-hour wall-clock soak against that exact `buildId`** —
    `npm run soak:beta -- --hours 12 --build-id <buildId> ...`. Never rebuild
    between soak and publish: the soak qualifies one immutable artifact.
-5. **Fresh external catalog probe** — capture one host-side `initialize` and
-   `tools/list` exchange after deploying the candidate, then run
+5. **Fresh external catalog probe** — capture the host-side `initialize`,
+   server `tools/list`, the host's registered callable catalog, and its catalog
+   acknowledgement on one session during the candidate soak, then run
    `scripts/probe-mcp-tunnel.mjs` with `--host-catalog-file`,
    `--expected-mcp-version`, `--expected-build-id`, and `--result-file` after
    the soak ends. The probe opens a fresh server transport and fails on stale

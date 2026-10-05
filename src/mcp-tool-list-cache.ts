@@ -73,6 +73,7 @@ export function installCachedToolList(
   cacheKey: string,
   cache: Map<string, Promise<unknown>>,
   listToolsSchema: ZodType,
+  onDescriptor?: (descriptor: unknown) => void,
 ): boolean {
   const metrics = metricsFor(server);
   // Runtime shape check against the exact internals we depend on.
@@ -109,7 +110,9 @@ export function installCachedToolList(
       metrics.hits++;
       foldMetrics(metrics, "hit");
     }
-    return await cached;
+    const descriptor = await cached;
+    onDescriptor?.(descriptor);
+    return descriptor;
   });
   return true;
 }

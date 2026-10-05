@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
-import { assertInputSchemaCompatibility, extractCatalog, extractServerInfoVersion, extractWorkspaceAppResourceUris, matchJsonRpcResponse, parseSseEventChunks } from "./lib/mcp-probe-protocol.mjs";
+import { assertInputSchemaCompatibility, extractCatalog, extractServerInfoVersion, extractWorkspaceAppResourceUris, fingerprintToolCatalog, matchJsonRpcResponse, parseSseEventChunks } from "./lib/mcp-probe-protocol.mjs";
 
 const args = process.argv.slice(2);
 function option(name, fallback) {
@@ -95,11 +95,14 @@ if (!expectedVersion && buildMetaPath) {
 const hostCatalogDocument = hostCatalogPath
   ? JSON.parse(readFileSync(resolve(hostCatalogPath), "utf8"))
   : undefined;
+const hostCaptureEnvelope = hostCatalogDocument?.payload ?? hostCatalogDocument;
+const hostRegisteredCatalog = hostCaptureEnvelope?.registeredCatalog;
 const hostCatalog = hostCatalogDocument
-  ? extractCatalog(hostCatalogDocument)
+  ? extractCatalog(hostRegisteredCatalog ?? hostCatalogDocument)
   : undefined;
+const hostCatalogVersion = hostCatalogDocument ? extractServerInfoVersion(hostCatalogDocument) : undefined;
 if (resultFilePath) {
-  const document = hostCatalogDocument?.payload ?? hostCatalogDocument;
+  const document = hostCaptureEnvelope;
   assert.ok(hostCatalogPath, "--result-file requires --host-catalog-file");
   assert.ok(expectedVersion, "--result-file requires --expected-mcp-version or --build-meta");
   assert.ok(expectedBuildId, "--result-file requires --expected-build-id");
@@ -107,16 +110,32 @@ if (resultFilePath) {
     "--result-file requires a timestamped external host catalog envelope");
   assert.ok(typeof document?.captureId === "string" && document.captureId.length > 0,
     "--result-file requires an operator-supplied captureId identifying the external host connection");
+  assert.ok(typeof document?.mcpSessionId === "string" && document.mcpSessionId.length >= 16,
+    "--result-file requires the MCP session ID of the external host transport");
+  assert.ok(document?.registeredCatalog && Array.isArray(hostCatalog?.rawTools),
+    "--result-file requires registeredCatalog from the host's callable tool registry, in addition to toolsList");
+  assert.equal(document?.catalogAcknowledgement?.method, "notifications/experimental/kontrol/tool-catalog-accepted",
+    "--result-file requires the host's catalog acknowledgement notification record");
+  assert.equal(document?.catalogAcknowledgement?.contractVersion, 1,
+    "--result-file requires catalog acknowledgement contract version 1");
   assert.ok(document?.initialize && document?.toolsList,
     "--result-file requires initialize and toolsList from the same fresh external host connection");
   const capturedVersion = extractServerInfoVersion(document.initialize);
   assert.ok(capturedVersion,
     "--result-file requires serverInfo.version in the captured initialize response");
-  assert.equal(hostCatalog.version, capturedVersion,
+  assert.equal(hostCatalogVersion, capturedVersion,
     "initialize.serverInfo.version and toolsList must come from the same unambiguous host envelope");
   const explicitToolsList = extractCatalog(document.toolsList);
   assert.deepEqual([...explicitToolsList.names].sort(), [...hostCatalog.names].sort(),
     "the captured toolsList must be the one authoritative catalog in the host envelope");
+  const registeredFingerprint = fingerprintToolCatalog(hostCatalog.rawTools);
+  assert.ok(registeredFingerprint, "the host registered catalog must be hashable");
+  assert.equal(document.catalogAcknowledgement.hostCatalogSha256, registeredFingerprint.sha256,
+    "the host acknowledgement record must fingerprint the actual registered catalog");
+  assert.equal(document.catalogAcknowledgement.hostToolCount, registeredFingerprint.toolCount,
+    "the host acknowledgement record must include its registered tool count");
+  assert.equal(document.catalogAcknowledgement.serverVersion, capturedVersion,
+    "the host acknowledgement must target the same immutable server version as initialize");
 }
 
 const observedCatalogs = [];
@@ -144,21 +163,24 @@ function assertCatalogParity(label, listed, sessionId) {
   const missingFromHost = [...actual.names].filter((name) => !hostCatalog.names.has(name)).sort();
   if (missingCapturedByServer.length > 0 || missingFromHost.length > 0) {
     const liveVersion = sessionId ? sessionVersions.get(sessionId) : undefined;
-    const diagnosis = hostCatalog.version !== liveVersion
+    const diagnosis = hostCatalogVersion !== liveVersion
       ? "host_catalog_version_stale_or_from_another_generation"
       : missingFromHost.length > 0
         ? "host_exposes_subset_or_additional_tools"
         : "host_capture_contains_tools_missing_from_live_server";
-    throw new Error(`${label} catalog mismatch; diagnosis=${diagnosis}; missingFromServer=${missingCapturedByServer.join(",")}; missingFromHost=${missingFromHost.join(",")}; hostVersion=${hostCatalog.version}; liveVersion=${liveVersion}`);
+    throw new Error(`${label} catalog mismatch; diagnosis=${diagnosis}; missingFromServer=${missingCapturedByServer.join(",")}; missingFromHost=${missingFromHost.join(",")}; hostVersion=${hostCatalogVersion}; liveVersion=${liveVersion}`);
   }
   if (expectedVersion) {
-    assert.equal(hostCatalog.version, expectedVersion,
+    assert.equal(hostCatalogVersion, expectedVersion,
       `${label} external host catalog is missing or has a stale immutable MCP version`);
   }
   assertInputSchemaCompatibility(actual.tools, hostCatalog.tools, label);
+  const liveCatalogFingerprint = fingerprintToolCatalog(actual.rawTools);
+  assert.ok(liveCatalogFingerprint, `${label} live tools/list catalog must be fingerprintable`);
   observedCatalogs.push({
     label,
     serverInfoVersion: sessionId ? sessionVersions.get(sessionId) : undefined,
+    serverCatalogSha256: liveCatalogFingerprint.sha256,
     serverTools: [...actual.names].sort(),
     serverToolMetadata: actual.tools,
   });
@@ -257,12 +279,31 @@ async function assertWorkspaceAppResources(listed, sessionId, label) {
   return { candidateUri, resources: [...validatedWorkspaceAppResources.values()] };
 }
 
-function writeProbeReceipt(cycles) {
+async function writeProbeReceipt(cycles) {
   if (!resultFilePath) return;
   assert.ok(postHeartbeatEvidence, "external qualification requires POST SSE heartbeat evidence");
-  const document = hostCatalogDocument?.payload ?? hostCatalogDocument;
+  const document = hostCaptureEnvelope;
   const observed = observedCatalogs[0];
   assert.ok(observed, "no fresh server tools/list exchange was observed");
+  const registeredFingerprint = fingerprintToolCatalog(hostCatalog?.rawTools);
+  assert.ok(registeredFingerprint, "external host callable catalog fingerprint is missing");
+  const diagnosticSnapshot = await diagnostics();
+  assert.ok(diagnosticSnapshot, "external catalog qualification requires authenticated server diagnostics");
+  const sessionIdSha256 = createHash("sha256").update(document.mcpSessionId).digest("hex");
+  const hostSession = (diagnosticSnapshot?.mcpSessionMetrics?.sessions ?? [])
+    .find((candidate) => candidate.sessionIdSha256 === sessionIdSha256);
+  assert.ok(hostSession, "the captured external host session is not present in authenticated diagnostics");
+  const acceptedHandshake = hostSession.toolCatalogHandshake;
+  assert.equal(acceptedHandshake?.status, "accepted",
+    "Kontrol did not accept the catalog acknowledgement on the captured external host session");
+  assert.equal(acceptedHandshake.hostCatalogSha256, registeredFingerprint.sha256,
+    "Kontrol's accepted host catalog digest does not match the host's registered catalog");
+  assert.equal(acceptedHandshake.serverCatalogSha256, registeredFingerprint.sha256,
+    "the registered host catalog does not match Kontrol's exact tools/list descriptors");
+  assert.equal(acceptedHandshake.serverCatalogSha256, observed.serverCatalogSha256,
+    "the captured host handshake does not match the fresh live server catalog");
+  assert.equal(acceptedHandshake.toolCount, registeredFingerprint.toolCount,
+    "the accepted host catalog tool count does not match the captured callable catalog");
   const finishedAt = new Date().toISOString();
   const hostCatalogSha256 = createHash("sha256").update(JSON.stringify(hostCatalogDocument)).digest("hex");
   const receipt = {
@@ -271,7 +312,7 @@ function writeProbeReceipt(cycles) {
     expectedBuildId,
     expectedMcpVersion: expectedVersion,
     serverInfoVersion: observed.serverInfoVersion,
-    hostCatalogVersion: hostCatalog.version,
+    hostCatalogVersion,
     serverTools: observed.serverTools,
     serverToolMetadata: observed.serverToolMetadata,
     hostTools: [...hostCatalog.names].sort(),
@@ -294,6 +335,19 @@ function writeProbeReceipt(cycles) {
       captureId: document.captureId,
       machineVerified: false,
       sha256: hostCatalogSha256,
+      sessionIdSha256,
+    },
+    hostCatalogHandshake: {
+      source: "authenticated_server_diagnostics",
+      machineVerified: true,
+      method: "notifications/experimental/kontrol/tool-catalog-accepted",
+      contractVersion: 1,
+      sessionIdSha256,
+      hostCatalogSha256: acceptedHandshake.hostCatalogSha256,
+      serverCatalogSha256: acceptedHandshake.serverCatalogSha256,
+      clientCatalogSha256: registeredFingerprint.sha256,
+      toolCount: acceptedHandshake.toolCount,
+      acceptedAt: acceptedHandshake.acceptedAt,
     },
     liveServerProbe: {
       source: "fresh_http_initialize_and_tools_list",
@@ -756,7 +810,7 @@ for (let cycle = 0; cycle < cycles; cycle++) {
   }).catch(() => {});
 }
 
-writeProbeReceipt(cycles);
+await writeProbeReceipt(cycles);
 console.log(JSON.stringify({ ok: true, url, cycles,
   correlatedServerResponses: observedRequestCorrelations.filter((item) => item.operationId).length,
   requiredTools: [...REQUIRED_INSPECTION_TOOLS, "poll_process"] }));

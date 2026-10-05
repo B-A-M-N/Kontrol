@@ -150,6 +150,8 @@ export interface ServerConfig {
   mcpSessionMaxPerClient: number;
   mcpSessionSoftCap: number;
   mcpSessionHardCap: number;
+  /** Require an MCP client catalog acknowledgement before tools/call. */
+  mcpToolCatalogAckRequired?: boolean;
   /** Filesystem snapshot admission + retention limits (P0/P1 storage hardness). */
   fsSnapshot: FilesystemSnapshotConfig;
 }
@@ -721,6 +723,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     mcpSessionMaxPerClient: parsePositiveInteger(env.KONTROL_MCP_SESSION_MAX_PER_CLIENT, 20, "KONTROL_MCP_SESSION_MAX_PER_CLIENT"),
     mcpSessionSoftCap: parsePositiveInteger(env.KONTROL_MCP_SESSION_SOFT_CAP, 150, "KONTROL_MCP_SESSION_SOFT_CAP"),
     mcpSessionHardCap: parsePositiveInteger(env.KONTROL_MCP_SESSION_HARD_CAP, 200, "KONTROL_MCP_SESSION_HARD_CAP"),
+    mcpToolCatalogAckRequired: parseBoolean(env.KONTROL_MCP_REQUIRE_TOOL_CATALOG_ACK),
     fsSnapshot: parseFsSnapshotConfig(env),
   };
   const mcpConfig = config;

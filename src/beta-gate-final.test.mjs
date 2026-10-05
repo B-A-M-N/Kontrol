@@ -136,6 +136,19 @@ const externalCatalog = {
     captureId: "capture-fixture-1",
     machineVerified: false,
     sha256: "c".repeat(64),
+    sessionIdSha256: "d".repeat(64),
+  },
+  hostCatalogHandshake: {
+    source: "authenticated_server_diagnostics",
+    machineVerified: true,
+    method: "notifications/experimental/kontrol/tool-catalog-accepted",
+    contractVersion: 1,
+    sessionIdSha256: "d".repeat(64),
+    hostCatalogSha256: "e".repeat(64),
+    serverCatalogSha256: "e".repeat(64),
+    clientCatalogSha256: "e".repeat(64),
+    toolCount: catalogTools.length,
+    acceptedAt: "2026-08-27T11:58:00.000Z",
   },
   liveServerProbe: {
     source: "fresh_http_initialize_and_tools_list",
@@ -168,7 +181,7 @@ const externalCatalog = {
     handlerStillRunning: false,
     stalledWriterEvents: 0,
   },
-  hostCatalogCapturedAt: "2026-08-27T12:04:00.000Z",
+  hostCatalogCapturedAt: "2026-08-27T11:59:00.000Z",
   startedAt: "2026-08-27T12:05:00.000Z",
   finishedAt: "2026-08-27T12:06:00.000Z",
   url: "https://kontrol.example.trycloudflare.com",
@@ -179,6 +192,22 @@ assert.equal(validateBetaExternalCatalogReceipt(externalCatalog, {
   expectedMcpVersion,
   soak,
 }).valid, true, "fresh matching host and server catalogs should qualify");
+assert.equal(validateBetaExternalCatalogReceipt({
+  ...externalCatalog,
+  hostCatalogHandshake: undefined,
+}, {
+  candidateBuildId: buildId,
+  expectedMcpVersion,
+  soak,
+}).valid, false, "operator-supplied catalogs without a matching server-observed acknowledgement must not qualify");
+assert.equal(validateBetaExternalCatalogReceipt({
+  ...externalCatalog,
+  hostCatalogHandshake: { ...externalCatalog.hostCatalogHandshake, sessionIdSha256: "f".repeat(64) },
+}, {
+  candidateBuildId: buildId,
+  expectedMcpVersion,
+  soak,
+}).valid, false, "an acknowledgement from another MCP transport must not qualify the captured host catalog");
 assert.equal(validateBetaExternalCatalogReceipt({
   ...externalCatalog,
   hostCatalogCapturedAt: "2026-08-26T23:59:00.000Z",
