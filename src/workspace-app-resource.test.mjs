@@ -249,16 +249,30 @@ function stageSourceCheckoutLayout(withDistArtifact, artifactHtml = SELF_CONTAIN
 
 // Structural validation must reject incomplete resources, not merely Vite templates.
 {
-  const { isSelfContainedWorkspaceAppHtml } = await import(join(repoRoot, "src", "workspace-app-resource.ts"));
-  assert.equal(isSelfContainedWorkspaceAppHtml(SELF_CONTAINED_HTML), true);
-  assert.equal(isSelfContainedWorkspaceAppHtml("<html><body><main id=\"app\"></main><script>1</script></body></html>"), false);
-  assert.equal(isSelfContainedWorkspaceAppHtml("<html><head><title>Kontrol Diff</title></head><body><main id=\"app\"></main></body></html>"), false);
-  assert.equal(isSelfContainedWorkspaceAppHtml("<html><head><title>Kontrol Diff</title><style>x</style></head><body><main></main><script>1</script></body></html>"), false);
-  assert.equal(isSelfContainedWorkspaceAppHtml("<html><head><title>Kontrol Diff</title><style>x</style></head><body><main id=\"app\"></main><script src=\"./app.js\"></script></body></html>"), false);
-  assert.equal(isSelfContainedWorkspaceAppHtml("<html><head><title>Kontrol Diff</title><style>x</style></head><body><main id=\"app\"></main><script>1</script><img src=\"/logo.png\"></body></html>"), false,
-    "single-file validation must reject external image resources as well as the known Vite template");
-  assert.equal(isSelfContainedWorkspaceAppHtml("<html><head><title>Kontrol Diff</title><style>x</style></head><body><main id=\"app\"></main><script>1</script><link rel=\"preload\" href=\"/app.js\"></body></html>"), false,
-    "single-file validation must reject external preload resources");
+  // Importing the production module resolves its app artifact at module load.
+  // Give this pure validator check a tiny explicit fixture so CI can run the
+  // test before the later build step and without a pre-existing dist/ tree.
+  const validatorFixtureDir = mkdtempSync(join(tmpdir(), "kontrol-wa-validator-"));
+  const validatorFixturePath = join(validatorFixtureDir, "workspace-app.html");
+  const previousOverride = process.env.KONTROL_WORKSPACE_APP_HTML_PATH;
+  writeFileSync(validatorFixturePath, SELF_CONTAINED_HTML);
+  process.env.KONTROL_WORKSPACE_APP_HTML_PATH = validatorFixturePath;
+  try {
+    const { isSelfContainedWorkspaceAppHtml } = await import(join(repoRoot, "src", "workspace-app-resource.ts"));
+    assert.equal(isSelfContainedWorkspaceAppHtml(SELF_CONTAINED_HTML), true);
+    assert.equal(isSelfContainedWorkspaceAppHtml("<html><body><main id=\"app\"></main><script>1</script></body></html>"), false);
+    assert.equal(isSelfContainedWorkspaceAppHtml("<html><head><title>Kontrol Diff</title></head><body><main id=\"app\"></main></body></html>"), false);
+    assert.equal(isSelfContainedWorkspaceAppHtml("<html><head><title>Kontrol Diff</title><style>x</style></head><body><main></main><script>1</script></body></html>"), false);
+    assert.equal(isSelfContainedWorkspaceAppHtml("<html><head><title>Kontrol Diff</title><style>x</style></head><body><main id=\"app\"></main><script src=\"./app.js\"></script></body></html>"), false);
+    assert.equal(isSelfContainedWorkspaceAppHtml("<html><head><title>Kontrol Diff</title><style>x</style></head><body><main id=\"app\"></main><script>1</script><img src=\"/logo.png\"></body></html>"), false,
+      "single-file validation must reject external image resources as well as the known Vite template");
+    assert.equal(isSelfContainedWorkspaceAppHtml("<html><head><title>Kontrol Diff</title><style>x</style></head><body><main id=\"app\"></main><script>1</script><link rel=\"preload\" href=\"/app.js\"></body></html>"), false,
+      "single-file validation must reject external preload resources");
+  } finally {
+    if (previousOverride === undefined) delete process.env.KONTROL_WORKSPACE_APP_HTML_PATH;
+    else process.env.KONTROL_WORKSPACE_APP_HTML_PATH = previousOverride;
+    rmSync(validatorFixtureDir, { recursive: true, force: true });
+  }
 }
 
 console.log("workspace-app-resource.test.mjs: source-mode resolution regression suite passed");
