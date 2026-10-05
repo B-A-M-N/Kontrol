@@ -449,15 +449,19 @@ for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
 function writeEnvironment(stateDir, port, options) {
   const opts = options || {};
   const envPath = join(harnessRoot, "environment-" + port + ".env");
+  // start-all.sh sources this file as Bash. Native Windows backslashes are
+  // escape characters there, so keep fixture paths in the slash form that
+  // Bash and Node both accept on Windows.
+  const shellPath = (path) => process.platform === "win32" ? path.replaceAll("\\", "/") : path;
   writeFileSync(envPath, [
     "HOST=127.0.0.1",
     "PORT=" + port,
     "KONTROL_AUTH_MODE=tunnel",
-    "KONTROL_ALLOWED_ROOTS=" + root,
+    "KONTROL_ALLOWED_ROOTS=" + shellPath(root),
     "KONTROL_ALLOWED_HOSTS=127.0.0.1,localhost",
     "KONTROL_PUBLIC_BASE_URL=http://127.0.0.1:" + port,
-    "KONTROL_STATE_DIR=" + stateDir,
-    "KONTROL_WORKTREE_ROOT=" + join(harnessRoot, "worktrees-" + port),
+    "KONTROL_STATE_DIR=" + shellPath(stateDir),
+    "KONTROL_WORKTREE_ROOT=" + shellPath(join(harnessRoot, "worktrees-" + port)),
     "KONTROL_ACP_ENABLED=false",
     // Launcher behavior suite: boots exercise lifecycle plumbing, not the
     // approval boundary; the ask baseline would trip the tunnel reviewer gate.
