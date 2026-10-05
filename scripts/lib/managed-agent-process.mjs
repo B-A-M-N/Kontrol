@@ -1,7 +1,23 @@
-import { mkdir, open, readFile, rename } from "node:fs/promises";
+import { mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import { existsSync, readFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
+
+const atomicWriteQueues = new Map();
+
+async function withAtomicWriteLock(path, operation) {
+  const preceding = atomicWriteQueues.get(path) ?? Promise.resolve();
+  let release;
+  const current = new Promise((resolve) => { release = resolve; });
+  atomicWriteQueues.set(path, current);
+  await preceding.catch(() => {});
+  try {
+    return await operation();
+  } finally {
+    release();
+    if (atomicWriteQueues.get(path) === current) atomicWriteQueues.delete(path);
+  }
+}
 
 /**
  * Small shared lifecycle primitive for detached ACP children.
@@ -35,19 +51,26 @@ export function processAlive(record) {
 }
 
 export async function atomicWriteJson(path, value) {
-  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
-  // A per-write name prevents overlapping lifecycle callbacks from clobbering
-  // one another's temporary file. fsync makes the durable ownership/replay
-  // record survive a process crash, not merely an orderly shutdown.
-  const temporary = `${path}.tmp-${process.pid}-${randomUUID()}`;
-  const handle = await open(temporary, "w", 0o600);
-  try {
-    await handle.writeFile(`${JSON.stringify(value, null, 2)}\n`, "utf8");
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
-  await rename(temporary, path);
+  return withAtomicWriteLock(path, async () => {
+    await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+    // Unique temporary names plus per-path serialization keep concurrent
+    // lifecycle callbacks from colliding on Windows destination replacement.
+    // fsync makes the ownership/replay record durable before publication.
+    const temporary = `${path}.tmp-${process.pid}-${randomUUID()}`;
+    try {
+      const handle = await open(temporary, "w", 0o600);
+      try {
+        await handle.writeFile(`${JSON.stringify(value, null, 2)}\n`, "utf8");
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+      await rename(temporary, path);
+    } catch (error) {
+      await unlink(temporary).catch(() => {});
+      throw error;
+    }
+  });
 }
 
 export async function readJsonOr(path, fallback) {
