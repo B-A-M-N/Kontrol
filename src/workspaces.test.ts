@@ -16,7 +16,7 @@ import { createWorkSessionManager } from "./work-sessions.js";
 const execFileAsync = promisify(execFile);
 const testGitName = (await execFileAsync("git", ["config", "user.name"], { cwd: process.cwd() })).stdout.trim();
 const testGitEmail = (await execFileAsync("git", ["config", "user.email"], { cwd: process.cwd() })).stdout.trim();
-const root = await mkdtemp(join(tmpdir(), "kontrol-workspace-test-"));
+const root = await realpath(await mkdtemp(join(tmpdir(), "kontrol-workspace-test-")));
 
 try {
   const agentDir = join(root, ".pi", "agent");

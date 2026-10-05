@@ -1308,7 +1308,10 @@ export class FilesystemSnapshotStore {
   }
 
   private async fsyncFile(file: string): Promise<void> {
-    const fh = await open(file, "r");
+    // Windows requires a writable descriptor for FlushFileBuffers-backed
+    // FileHandle.sync(); these staged files are owned by this store and remain
+    // byte-for-byte unchanged while syncing.
+    const fh = await open(file, "r+");
     try {
       await fh.sync();
     } finally {
