@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 
 // P1.4: the app is decomposed across sibling modules; contract assertions
 // below that name extracted literals scan the module cluster, not only the
@@ -57,7 +58,7 @@ assert.match(css, /\.review-payload[\s\S]*overflow:\s*auto/, "review payloads mu
 // checkout can no longer silently bypass the built-artifact gate.
 const candidateDir = process.env.KONTROL_UI_TEST_CANDIDATE_DIR;
 const builtPath = candidateDir
-  ? new URL(`file://${encodeURI(join(candidateDir, "ui", "workspace-app.html"))}`)
+  ? pathToFileURL(join(candidateDir, "ui", "workspace-app.html"))
   : new URL("../../dist/ui/workspace-app.html", import.meta.url);
 if (existsSync(builtPath)) {
   const built = readFileSync(builtPath, "utf8");
