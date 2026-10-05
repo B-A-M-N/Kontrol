@@ -322,8 +322,10 @@ writeKontrolConfig({ allowedRoots: [process.cwd()] }, secureConfigEnv);
 writeKontrolAuth({ ownerToken: "secure-auth-owner-token-long-enough" }, secureConfigEnv);
 chmodSync(join(secureConfigDir, "auth.json"), 0o644);
 writeKontrolAuth({ ownerToken: "rewritten-auth-owner-token-long-enough" }, secureConfigEnv);
-assert.equal(statSync(secureConfigDir).mode & 0o777, 0o700, "config directory is owner-only");
-assert.equal(statSync(join(secureConfigDir, "auth.json")).mode & 0o777, 0o600, "auth rewrite tightens file permissions");
+if (process.platform !== "win32") {
+  assert.equal(statSync(secureConfigDir).mode & 0o777, 0o700, "config directory is owner-only");
+  assert.equal(statSync(join(secureConfigDir, "auth.json")).mode & 0o777, 0o600, "auth rewrite tightens file permissions");
+}
 
 // P0 — tunnel mode must not start an ask-capable policy without a reviewer
 // credential. Direct approvals exist independently from ACP; without reviewer
