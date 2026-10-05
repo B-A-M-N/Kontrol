@@ -398,7 +398,13 @@ update_dist_projection() {
   if [[ -L "$projection" || ! -e "$projection" ]]; then
     rm -f -- "$next_projection"
     ln -s -- "$target" "$next_projection"
-    mv -Tf -- "$next_projection" "$projection"
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+      # BSD mv uses -h to replace a symlink-to-directory itself instead of
+      # treating it as a directory target; GNU mv expresses that as -T.
+      mv -hf "$next_projection" "$projection"
+    else
+      mv -Tf -- "$next_projection" "$projection"
+    fi
     return 0
   fi
   echo "[!] dist/ is a regular directory; leaving the development projection unchanged (generation.json is authoritative)." >&2
@@ -769,9 +775,9 @@ fi
 
 echo "[*] Starting persistent component supervisor ..."
 SUPERVISOR_STATUS_FILE="${KONTROL_STATE_DIR:-$DESKTOP_PWD/.kontrol-state}/supervisor-status.json"
-# BSD date lacks GNU's %N formatter; use the same Node runtime as the
-# launcher for a portable millisecond epoch used by supervisor freshness checks.
-SUPERVISOR_STARTUP_EPOCH_MS="$(node -e 'process.stdout.write(String(Date.now()))')"
+# BSD date lacks GNU's %N formatter; seconds plus three zeroes gives a
+# portable millisecond threshold for the supervisor freshness check.
+SUPERVISOR_STARTUP_EPOCH_MS="$(date +%s)000"
 SUPERVISOR_ARGS=(
   --root "$DESKTOP_PWD"
   --kontrol-url "http://${DEV_HOST}:${DEV_PORT}"
