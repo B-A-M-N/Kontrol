@@ -258,7 +258,9 @@ function stageSourceCheckoutLayout(withDistArtifact, artifactHtml = SELF_CONTAIN
   writeFileSync(validatorFixturePath, SELF_CONTAINED_HTML);
   process.env.KONTROL_WORKSPACE_APP_HTML_PATH = validatorFixturePath;
   try {
-    const { isSelfContainedWorkspaceAppHtml } = await import(join(repoRoot, "src", "workspace-app-resource.ts"));
+    const { isSelfContainedWorkspaceAppHtml } = await import(
+      pathToFileURL(join(repoRoot, "src", "workspace-app-resource.ts")).href,
+    );
     assert.equal(isSelfContainedWorkspaceAppHtml(SELF_CONTAINED_HTML), true);
     assert.equal(isSelfContainedWorkspaceAppHtml("<html><body><main id=\"app\"></main><script>1</script></body></html>"), false);
     assert.equal(isSelfContainedWorkspaceAppHtml("<html><head><title>Kontrol Diff</title></head><body><main id=\"app\"></main></body></html>"), false);
