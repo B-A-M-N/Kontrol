@@ -311,7 +311,10 @@ try {
 
   const slowBash = rpc("tools/call", {
     name: "bash",
-    arguments: { workspaceId: sessions[0].workspaceId, command: "sleep 3; printf admission-ok", timeout: 5 },
+    // Keep the admission permit occupied well beyond the interactive queue
+    // deadline, including on slower CI hosts where the request setup itself
+    // can consume a meaningful part of the deadline.
+    arguments: { workspaceId: sessions[0].workspaceId, command: "sleep 10; printf admission-ok", timeout: 15 },
   }, sessions[0].sessionId);
   await waitFor(async () => (await diagnostics()).mcpSessionMetrics.executionAdmission.activeWeight === 3);
   const rejectedBash = await rpc("tools/call", {
