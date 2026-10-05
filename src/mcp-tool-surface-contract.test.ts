@@ -203,10 +203,11 @@ const leaseStateDir = join(leaseHarnessRoot, "state");
 mkdirSync(leaseWorkspacePath, { recursive: true });
 mkdirSync(leaseOtherWorkspaceRoot, { recursive: true });
 const leaseWorkspaceRoot = realpathSync(leaseWorkspacePath);
+const canonicalOtherWorkspaceRoot = realpathSync(leaseOtherWorkspaceRoot);
 mkdirSync(leaseStateDir, { recursive: true });
 const leaseConfig = loadConfig({
   KONTROL_CONFIG_DIR: join(leaseHarnessRoot, "config"),
-  KONTROL_ALLOWED_ROOTS: leaseHarnessRoot,
+  KONTROL_ALLOWED_ROOTS: [leaseWorkspaceRoot, canonicalOtherWorkspaceRoot].join(","),
   KONTROL_STATE_DIR: leaseStateDir,
   KONTROL_WORKTREE_ROOT: join(leaseHarnessRoot, "worktrees"),
   KONTROL_AUTH_MODE: "tunnel",
@@ -301,12 +302,12 @@ try {
   assert.equal(workerWorktreeOpen.isError, true, "worker cannot create a managed worktree");
   const workerOtherOpen = await worker.client.callTool({
     name: "open_workspace",
-    arguments: { path: leaseOtherWorkspaceRoot, mode: "checkout" },
+    arguments: { path: canonicalOtherWorkspaceRoot, mode: "checkout" },
   });
   assert.equal(workerOtherOpen.isError, true, "worker cannot open an arbitrary second workspace");
   const otherOpened = await direct.client.callTool({
     name: "open_workspace",
-    arguments: { path: leaseOtherWorkspaceRoot, mode: "checkout" },
+    arguments: { path: canonicalOtherWorkspaceRoot, mode: "checkout" },
   });
   const otherWorkspaceId = (otherOpened.structuredContent as { workspaceId?: string } | undefined)?.workspaceId;
   assert.ok(otherWorkspaceId, JSON.stringify(otherOpened));
@@ -361,7 +362,7 @@ try {
   }
   assert.deepEqual(deniedInvocations.map((entry) => entry.tool), ["read", "read", "read", "read"],
     "all Git inspection tools are evaluated as canonical read operations");
-  assert.equal(deniedInvocations[0].path.absolutePath, nestedRoot,
+  assert.equal(deniedInvocations[0].path.absolutePath, realpathSync(nestedRoot),
     "path-scoped Git policy receives the safely resolved workspace path");
 
   const submission = leaseSessions.submitForReview({
