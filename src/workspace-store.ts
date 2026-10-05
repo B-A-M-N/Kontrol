@@ -76,14 +76,15 @@ export interface WorkspaceStore {
 
 export class SqliteWorkspaceStore implements WorkspaceStore {
   private readonly database: DatabaseHandle;
+  private readonly ownsDatabase: boolean;
   /** P1 #8: in-memory cache of lastUsedAt to debounce SQLite writes. */
   private readonly lastUsedAtCache = new Map<string, number>();
   private flushInterval: ReturnType<typeof setInterval> | null = null;
   private static readonly FLUSH_INTERVAL_MS = 30_000;
 
   constructor(stateDirOrHandle: string | DatabaseHandle) {
-    this.database =
-      typeof stateDirOrHandle === "string" ? openDatabase(stateDirOrHandle) : stateDirOrHandle;
+    this.ownsDatabase = typeof stateDirOrHandle === "string";
+    this.database = typeof stateDirOrHandle === "string" ? openDatabase(stateDirOrHandle) : stateDirOrHandle;
     // P1 #8: periodically flush the lastUsedAt cache to SQLite so reads
     // during shutdown still see current values.
     this.flushInterval = setInterval(() => this.flushLastUsedAtCache(), SqliteWorkspaceStore.FLUSH_INTERVAL_MS);
@@ -379,14 +380,15 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
     }
   }
 
-  // P1 #11: Don't close shared DB handle - server owns it
   close(): void {
     if (this.flushInterval) {
       clearInterval(this.flushInterval);
       this.flushInterval = null;
     }
     this.flushLastUsedAtCache();
-    // Database is owned by the server, not by this manager
+    // A store constructed from a path owns its handle. A passed handle remains
+    // owned by the server/composition that supplied it.
+    if (this.ownsDatabase) this.database.close();
   }
 }
 
