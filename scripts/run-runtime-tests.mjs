@@ -23,11 +23,30 @@ const env = {
   KONTROL_WORKSPACE_APP_HTML_PATH: join(artifactDirectory, "ui", "workspace-app.html"),
 };
 
-function run(script) {
-  // This runner invokes only the repository's fixed npm test scripts.
-  const result = spawnSync(process.execPath, [npmExecPath, "run", script], {
+function compileRuntimeArtifact() {
+  const result = spawnSync(process.execPath, [
+    join(root, "node_modules", "typescript", "bin", "tsc"),
+    "-p", join(root, "tsconfig.build.json"),
+    "--outDir", artifactDirectory,
+  ], {
     cwd: root,
     env,
+    stdio: "inherit",
+  });
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    throw new Error(`temporary runtime artifact compile failed with status ${result.status ?? "unknown"}`);
+  }
+}
+
+function run(script) {
+  // This runner invokes only the repository's fixed npm test scripts.
+  if (script === "test:adapters") compileRuntimeArtifact();
+  const result = spawnSync(process.execPath, [npmExecPath, "run", script], {
+    cwd: root,
+    env: script === "test:adapters"
+      ? { ...env, KONTROL_ARTIFACT_PATH: artifactDirectory }
+      : env,
     stdio: "inherit",
   });
   if (result.error) throw result.error;

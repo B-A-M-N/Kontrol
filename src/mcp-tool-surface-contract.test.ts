@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -197,9 +197,10 @@ function createServerWithHandshakeObserver(
 // cannot mutate a checkout while a delegated session holds its lease, while a
 // worker must present the live fencing nonce bound to that exact session.
 const leaseHarnessRoot = mkdtempSync(join(tmpdir(), "kontrol-lease-fence-"));
-const leaseWorkspaceRoot = join(leaseHarnessRoot, "workspace");
+const leaseWorkspacePath = join(leaseHarnessRoot, "workspace");
 const leaseStateDir = join(leaseHarnessRoot, "state");
-mkdirSync(leaseWorkspaceRoot, { recursive: true });
+mkdirSync(leaseWorkspacePath, { recursive: true });
+const leaseWorkspaceRoot = realpathSync(leaseWorkspacePath);
 mkdirSync(leaseStateDir, { recursive: true });
 const leaseConfig = loadConfig({
   KONTROL_CONFIG_DIR: join(leaseHarnessRoot, "config"),

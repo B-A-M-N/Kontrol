@@ -15,8 +15,9 @@
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { randomUUID } from "node:crypto";
-import { isAbsolute } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 import { realpath, stat } from "node:fs/promises";
+import { pathToFileURL } from "node:url";
 import { clearAgentIdentity, identityHeaders, loadAgentIdentity, saveAgentIdentity } from "./lib/acp-agent-identity.mjs";
 import { readJsonBody } from "./lib/adapter-http.mjs";
 
@@ -33,7 +34,10 @@ const DISPATCH_METHOD = process.env.ACP_STDIO_DISPATCH_METHOD || "session/prompt
 
 const VALIDATE_IMPORTS = process.argv.includes("--validate-imports");
 
-const { createAcpDuplex } = await import(new URL("../dist/acp-duplex.js", import.meta.url));
+const acpDuplexModuleUrl = process.env.KONTROL_ARTIFACT_PATH
+  ? pathToFileURL(resolve(process.env.KONTROL_ARTIFACT_PATH, "acp-duplex.js"))
+  : new URL("../dist/acp-duplex.js", import.meta.url);
+const { createAcpDuplex } = await import(acpDuplexModuleUrl);
 if (VALIDATE_IMPORTS) {
   console.log("[stdio-duplex] import validation ok");
   process.exit(0);
