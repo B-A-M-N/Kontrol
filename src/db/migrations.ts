@@ -72,7 +72,34 @@ const migrations: Migration[] = [
   { version: 60, name: "managed-worktree-retirement", up: migrateManagedWorktreeRetirement },
   { version: 61, name: "telemetry-ingress-retention-index", up: migrateTelemetryIngressRetentionIndex },
   { version: 62, name: "mission-outcome-authority", up: migrateMissionOutcomeAuthority },
+  { version: 63, name: "canonical-snapshot-report-identity", up: migrateCanonicalSnapshotReportIdentity },
 ];
+
+function migrateCanonicalSnapshotReportIdentity(sqlite: Database.Database): void {
+  const pairs: Array<[table: string, kind: string, ref: string, legacy: string]> = [
+    ["work_session_submissions", "snapshot_kind", "snapshot_ref", "snapshot_commit"],
+    ["mission_evidence", "snapshot_kind", "snapshot_ref", "snapshot_commit"],
+    ["mission_completion_reports", "snapshot_kind", "snapshot_ref", "snapshot_commit"],
+    ["mission_contracts", "baseline_kind", "baseline_ref", "baseline_commit"],
+    ["supervisor_runs", "last_snapshot_kind", "last_snapshot_ref", "last_snapshot_commit"],
+  ];
+  for (const [table, kind, ref, legacy] of pairs) {
+    sqlite.exec(`
+      update ${table}
+         set ${ref} = coalesce(nullif(trim(${ref}), ''), nullif(trim(${legacy}), '')),
+             ${kind} = coalesce(nullif(trim(${kind}), ''), case
+               when coalesce(nullif(trim(${ref}), ''), nullif(trim(${legacy}), '')) like 'fs:%' then 'filesystem'
+               else 'git'
+             end)
+       where nullif(trim(${legacy}), '') is not null
+         and (nullif(trim(${ref}), '') is null or nullif(trim(${kind}), '') is null)
+    `);
+  }
+  sqlite.exec(`
+    create index if not exists mission_completion_reports_identity_idx
+      on mission_completion_reports(mission_id, submission_id, snapshot_kind, snapshot_ref, created_at desc)
+  `);
+}
 
 function migrateMissionOutcomeAuthority(sqlite: Database.Database): void {
   addColumnIfMissing(sqlite, "mission_contracts", "contract_fingerprint", "text");

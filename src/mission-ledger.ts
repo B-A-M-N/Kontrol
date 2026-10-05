@@ -169,8 +169,8 @@ export interface MissionLedger {
   recordVerifierEvidence(missionId: string, entries: MissionEvidenceInput[]): void;
   recordRuntimeProbeEvidence(missionId: string, entries: MissionEvidenceInput[]): void;
   recordAgentEvidence(missionId: string, entries: MissionEvidenceInput[]): void;
-  recordCompletionReport(missionId: string, input: { submissionId: string; snapshotKind?: WorkspaceSnapshotKind; snapshotRef?: string; snapshotCommit: string; status: "passed" | "failed"; results: unknown; reviewCoverage?: string[]; uncertainty?: unknown[] }): void;
-  recordReviewCoverage(missionId: string, input: { submissionId: string; snapshotKind?: WorkspaceSnapshotKind; snapshotRef?: string; snapshotCommit: string; reviewCoverage?: string[]; uncertainty?: unknown[] }): void;
+  recordCompletionReport(missionId: string, input: { submissionId: string; snapshotKind?: WorkspaceSnapshotKind; snapshotRef?: string; snapshotCommit?: string; status: "passed" | "failed"; results: unknown; reviewCoverage?: string[]; uncertainty?: unknown[] }): void;
+  recordReviewCoverage(missionId: string, input: { submissionId: string; snapshotKind?: WorkspaceSnapshotKind; snapshotRef?: string; snapshotCommit?: string; reviewCoverage?: string[]; uncertainty?: unknown[] }): void;
   getCompletionReportHash(workSessionId: string, context: CurrentApprovalContext): string | undefined;
   getPacket(workSessionId: string, approvalContext?: CurrentApprovalContext): MissionReviewPacket;
   canApprove(workSessionId: string, context?: CurrentApprovalContext): ApprovalPredicate;
@@ -608,7 +608,6 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
       submissionId: workSessionSubmissions.id,
       snapshotKind: workSessionSubmissions.snapshotKind,
       snapshotRef: workSessionSubmissions.snapshotRef,
-      snapshotCommit: workSessionSubmissions.snapshotCommit,
       reviewEpoch: workSessionSubmissions.reviewEpoch,
     }).from(workSessionSubmissions)
       .where(eq(workSessionSubmissions.workSessionId, workSessionId))
@@ -617,7 +616,7 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
       .get();
     const snapshot = row ? normalizeWorkspaceSnapshotIdentity(row) : undefined;
     return row?.submissionId
-      ? { submissionId: row.submissionId, snapshotKind: snapshot?.kind, snapshotRef: snapshot?.ref, snapshotCommit: snapshot?.ref, reviewEpoch: row.reviewEpoch }
+      ? { submissionId: row.submissionId, snapshotKind: snapshot?.kind, snapshotRef: snapshot?.ref, reviewEpoch: row.reviewEpoch }
       : {};
   }
 
@@ -625,6 +624,7 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
     const mission = getMissionByWorkSession(workSessionId);
     if (!mission) return { allowed: true, reasons: [] };
     const currentContext = normalizeCurrentApprovalContext(context ?? getCurrentApprovalContext(workSessionId));
+    const currentSnapshot = normalizeWorkspaceSnapshotIdentity(currentContext);
     const packet = getPacketWithoutApproval(mission.id);
     const reasons: string[] = [];
     const states = new Map(evaluateCriteria(workSessionId, currentContext).map((state) => [state.criterionId, state]));
@@ -643,17 +643,20 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
         reasons.push(`${finding.severity} finding ${finding.id} is ${finding.status}: ${finding.description}`);
       }
     }
+    const currentReport = currentContext.submissionId && currentSnapshot
+      ? database.db.select().from(missionCompletionReports).where(and(
+          eq(missionCompletionReports.missionId, mission.id),
+          eq(missionCompletionReports.submissionId, currentContext.submissionId),
+          eq(missionCompletionReports.snapshotKind, currentSnapshot.kind),
+          eq(missionCompletionReports.snapshotRef, currentSnapshot.ref),
+        )).orderBy(desc(missionCompletionReports.createdAt)).get()
+      : undefined;
     if (mission.finalVerification.length) {
-      const report = currentContext.submissionId && currentContext.snapshotCommit
-        ? database.db.select().from(missionCompletionReports).where(and(eq(missionCompletionReports.missionId, mission.id), eq(missionCompletionReports.submissionId, currentContext.submissionId), eq(missionCompletionReports.snapshotCommit, currentContext.snapshotCommit))).orderBy(desc(missionCompletionReports.createdAt)).get()
-        : undefined;
+      const report = currentReport;
       if (!report || report.status !== "passed") reasons.push("Mission-level final integration verification has not passed for the current submission.");
     }
     if (mission.reviewCoverage.length) {
-      const report = currentContext.submissionId && currentContext.snapshotCommit
-        ? database.db.select().from(missionCompletionReports).where(and(eq(missionCompletionReports.missionId, mission.id), eq(missionCompletionReports.submissionId, currentContext.submissionId), eq(missionCompletionReports.snapshotCommit, currentContext.snapshotCommit))).orderBy(desc(missionCompletionReports.createdAt)).get()
-        : undefined;
-      const covered = new Set(report ? parseJson<string[]>(report.reviewCoverageJson, []) : []);
+      const covered = new Set(currentReport ? parseJson<string[]>(currentReport.reviewCoverageJson, []) : []);
       const missing = mission.reviewCoverage.filter((area) => !covered.has(area));
       if (missing.length) reasons.push(`Review coverage is incomplete; missing: ${missing.join(", ")}.`);
     }
@@ -697,18 +700,19 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
     return criteria.map((criterion) => states.get(criterion.id)!);
   }
 
-  function recordCompletionReport(missionId: string, input: { submissionId: string; snapshotKind?: WorkspaceSnapshotKind; snapshotRef?: string; snapshotCommit: string; status: "passed" | "failed"; results: unknown; reviewCoverage?: string[]; uncertainty?: unknown[] }): void {
+  function recordCompletionReport(missionId: string, input: { submissionId: string; snapshotKind?: WorkspaceSnapshotKind; snapshotRef?: string; snapshotCommit?: string; status: "passed" | "failed"; results: unknown; reviewCoverage?: string[]; uncertainty?: unknown[] }): void {
     const snapshot = normalizeWorkspaceSnapshotIdentity(input);
     if (!snapshot) throw new Error("Completion report requires a snapshot identity.");
     const resultsJson = JSON.stringify(input.results);
     // P1 #14: keep one authoritative report per
-    // {missionId, submissionId, snapshotCommit}. If reviewer coverage was
+    // {missionId, submissionId, snapshotKind, snapshotRef}. If reviewer coverage was
     // recorded first, the verifier's report must MERGE it — otherwise the
     // newer row would displace covered lenses and block approval forever.
     const prior = database.db.select().from(missionCompletionReports).where(and(
       eq(missionCompletionReports.missionId, missionId),
       eq(missionCompletionReports.submissionId, input.submissionId),
-      eq(missionCompletionReports.snapshotCommit, snapshot.ref),
+      eq(missionCompletionReports.snapshotKind, snapshot.kind),
+      eq(missionCompletionReports.snapshotRef, snapshot.ref),
     )).orderBy(desc(missionCompletionReports.createdAt)).get();
     const mergeInto = (current: string[], incoming?: string[]) => [...new Set([...current, ...(incoming ?? [])])];
     if (prior) {
@@ -739,7 +743,7 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
   }
 
   /** P2 #34/#35: Record which review lenses a reviewer covered and what remains uncertain. */
-  function recordReviewCoverage(missionId: string, input: { submissionId: string; snapshotKind?: WorkspaceSnapshotKind; snapshotRef?: string; snapshotCommit: string; reviewCoverage?: string[]; uncertainty?: unknown[] }): void {
+  function recordReviewCoverage(missionId: string, input: { submissionId: string; snapshotKind?: WorkspaceSnapshotKind; snapshotRef?: string; snapshotCommit?: string; reviewCoverage?: string[]; uncertainty?: unknown[] }): void {
     const snapshot = normalizeWorkspaceSnapshotIdentity(input);
     if (!snapshot) throw new Error("Review coverage requires a snapshot identity.");
     const mission = database.db.select().from(missionContracts).where(eq(missionContracts.id, missionId)).get();
@@ -747,7 +751,8 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
     const existing = database.db.select().from(missionCompletionReports).where(and(
       eq(missionCompletionReports.missionId, missionId),
       eq(missionCompletionReports.submissionId, input.submissionId),
-      eq(missionCompletionReports.snapshotCommit, snapshot.ref),
+      eq(missionCompletionReports.snapshotKind, snapshot.kind),
+      eq(missionCompletionReports.snapshotRef, snapshot.ref),
     )).orderBy(desc(missionCompletionReports.createdAt)).get();
     const mergeInto = (current: string[], incoming: string[]) => [...new Set([...current, ...incoming])];
     if (existing) {
@@ -792,7 +797,13 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
       if (!submission || submission.reviewEpoch !== context.reviewEpoch) return undefined;
     }
     return database.db.select().from(missionCompletionReports)
-      .where(and(eq(missionCompletionReports.missionId, mission.id), eq(missionCompletionReports.submissionId, context.submissionId), eq(missionCompletionReports.snapshotCommit, snapshot.ref), eq(missionCompletionReports.status, "passed")))
+      .where(and(
+        eq(missionCompletionReports.missionId, mission.id),
+        eq(missionCompletionReports.submissionId, context.submissionId),
+        eq(missionCompletionReports.snapshotKind, snapshot.kind),
+        eq(missionCompletionReports.snapshotRef, snapshot.ref),
+        eq(missionCompletionReports.status, "passed"),
+      ))
       .orderBy(desc(missionCompletionReports.createdAt)).get()?.reportSha256;
   }
 
@@ -1254,9 +1265,10 @@ function rowToCompletionReport(row: MissionCompletionReportRow) {
 
 function normalizeCurrentApprovalContext(context: CurrentApprovalContext): CurrentApprovalContext {
   const snapshot = normalizeWorkspaceSnapshotIdentity(context);
-  return snapshot
-    ? { ...context, snapshotKind: snapshot.kind, snapshotRef: snapshot.ref, snapshotCommit: snapshot.ref }
-    : context;
+  if (!snapshot) return context;
+  const canonicalContext: CurrentApprovalContext = { ...context };
+  delete canonicalContext.snapshotCommit;
+  return { ...canonicalContext, snapshotKind: snapshot.kind, snapshotRef: snapshot.ref };
 }
 
 function parseJson<T>(value: string | null | undefined, fallback: T): T {

@@ -519,7 +519,10 @@ export const missionCompletionReports = sqliteTable("mission_completion_reports"
   uncertaintyJson: text("uncertainty_json").notNull().default("[]"),
   reportSha256: text("report_sha256").notNull(),
   createdAt: text("created_at").notNull(),
-}, (table) => [index("mission_completion_reports_current_idx").on(table.missionId, table.submissionId, table.snapshotCommit, table.createdAt)]);
+}, (table) => [
+  index("mission_completion_reports_current_idx").on(table.missionId, table.submissionId, table.snapshotCommit, table.createdAt),
+  index("mission_completion_reports_identity_idx").on(table.missionId, table.submissionId, table.snapshotKind, table.snapshotRef, table.createdAt),
+]);
 export type MissionCompletionReportRow = typeof missionCompletionReports.$inferSelect;
 
 export const missionAcceptanceCriteria = sqliteTable("mission_acceptance_criteria", {

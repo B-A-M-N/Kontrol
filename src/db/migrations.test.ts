@@ -55,6 +55,25 @@ try {
       .some((index) => index.name === "policy_approval_grants_principal_idx"),
     "effective policy grants retain their indexed composite identity",
   );
+  sqlite.pragma("foreign_keys = OFF");
+  sqlite.prepare(`
+    insert into mission_completion_reports
+      (id, mission_id, submission_id, snapshot_commit, status, results_json, report_sha256, created_at)
+    values (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run("legacy-filesystem-report", "legacy-mission", "legacy-submission", "fs:sha256:legacy", "passed", "[]", "legacy-hash", new Date().toISOString());
+  sqlite.pragma("foreign_keys = ON");
+  sqlite.prepare("delete from kontrol_schema_migrations where version = ?").run(LATEST_SCHEMA_VERSION);
+  migrateDatabase(sqlite);
+  assert.deepEqual(
+    sqlite.prepare("select snapshot_kind, snapshot_ref from mission_completion_reports where id = ?").get("legacy-filesystem-report"),
+    { snapshot_kind: "filesystem", snapshot_ref: "fs:sha256:legacy" },
+    "canonical snapshot kind/ref fields backfill from the legacy alias",
+  );
+  assert.ok(
+    (sqlite.prepare("pragma index_list(mission_completion_reports)").all() as Array<{ name: string }>)
+      .some((index) => index.name === "mission_completion_reports_identity_idx"),
+    "completion report lookups use the canonical snapshot identity index",
+  );
 
   sqlite.exec("drop index if exists agent_registry_name_unique");
   sqlite.prepare(`

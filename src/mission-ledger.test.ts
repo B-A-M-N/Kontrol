@@ -309,30 +309,33 @@ try {
   });
   ledger.recordReviewCoverage(covMission.id, {
     submissionId: "sub_cov",
-    snapshotCommit: "snap_cov",
+    snapshotKind: "git",
+    snapshotRef: "snap_cov",
     reviewCoverage: ["security"],
     uncertainty: [{ area: "performance", level: "not inspected" }],
   });
-  const partial = ledger.canApprove(covSession.id, { submissionId: "sub_cov", snapshotCommit: "snap_cov" });
+  const partial = ledger.canApprove(covSession.id, { submissionId: "sub_cov", snapshotKind: "git", snapshotRef: "snap_cov" });
   assert.ok(partial.reasons.some((r) => r.includes("correctness")), "missing coverage lens must block approval");
   assert.ok(!partial.reasons.some((r) => r.includes("security")), "covered lens must not block");
   ledger.recordReviewCoverage(covMission.id, {
     submissionId: "sub_cov",
-    snapshotCommit: "snap_cov",
+    snapshotKind: "git",
+    snapshotRef: "snap_cov",
     reviewCoverage: ["correctness"],
   });
-  const covered = ledger.canApprove(covSession.id, { submissionId: "sub_cov", snapshotCommit: "snap_cov" });
+  const covered = ledger.canApprove(covSession.id, { submissionId: "sub_cov", snapshotKind: "git", snapshotRef: "snap_cov" });
   assert.ok(!covered.reasons.some((r) => r.includes("Review coverage is incomplete")), "all lenses covered → no coverage reason");
 
   // P1 #14: both orderings produce identical approval semantics — a later
   // verification report must MERGE prior coverage, not displace it.
   ledger.recordCompletionReport(covMission.id, {
     submissionId: "sub_cov",
-    snapshotCommit: "snap_cov",
+    snapshotKind: "git",
+    snapshotRef: "snap_cov",
     status: "passed",
     results: [{ command: "npm test", status: "passed" }],
   });
-  const afterVerify = ledger.canApprove(covSession.id, { submissionId: "sub_cov", snapshotCommit: "snap_cov" });
+  const afterVerify = ledger.canApprove(covSession.id, { submissionId: "sub_cov", snapshotKind: "git", snapshotRef: "snap_cov" });
   assert.ok(!afterVerify.reasons.some((r) => r.includes("Review coverage is incomplete")), "verification report must preserve earlier reviewer coverage");
 
   // A new blocking in-scope finding extends the loop (round 1).
@@ -512,7 +515,9 @@ try {
   }]);
   restartLedger.resolveFinding(restartMission.id, restartFinding.id, correctedContext);
   restartLedger.recordCompletionReport(restartMission.id, {
-    ...correctedContext,
+    submissionId: correctedSubmission.id,
+    snapshotKind: "git",
+    snapshotRef: "restart-snapshot-b",
     status: "passed",
     results: [{ command: "npm --version", status: "passed" }],
   });
