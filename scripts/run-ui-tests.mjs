@@ -8,17 +8,27 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { testHarnessEnvironment } from "../src/process-environment.ts";
 
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const tsxCli = join(root, "node_modules", "tsx", "dist", "cli.mjs");
 const candidateDir = mkdtempSync(join(tmpdir(), "kontrol-ui-candidate-"));
-process.env.KONTROL_UI_TEST_CANDIDATE_DIR = candidateDir;
+const childEnvironment = testHarnessEnvironment();
+childEnvironment.KONTROL_UI_TEST_CANDIDATE_DIR = candidateDir;
+for (const key of [
+  "KONTROL_UI_SCREENSHOT_DIR",
+  "KONTROL_UI_SCREENSHOT_LABEL",
+  "KONTROL_BROWSER_PATH",
+  "KONTROL_BROWSER_NO_SANDBOX",
+]) {
+  if (process.env[key] !== undefined) childEnvironment[key] = process.env[key];
+}
 
 function runNode(args) {
   const result = spawnSync(process.execPath, args, {
     cwd: root,
     stdio: "inherit",
-    env: process.env,
+    env: childEnvironment,
   });
   if (result.error) throw result.error;
   if (result.status !== 0) throw new Error(`node ${args.join(" ")} failed with status ${result.status ?? "unknown"}`);
