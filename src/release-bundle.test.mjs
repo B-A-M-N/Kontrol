@@ -21,9 +21,10 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
+import { validateRelease } from "../scripts/validate-release.mjs";
 
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const tmp = mkdtempSync(join(tmpdir(), "kontrol-release-bundle-"));
@@ -43,12 +44,36 @@ function sha256(path) {
 // Fabricate a qualified combined receipt + candidate from the newest local
 // release (the bundle transport never requires the soak host's checkout).
 const releasesDir = join(root, "releases");
-const candidates = existsSync(releasesDir) ? readdirSync(releasesDir).sort() : [];
-if (candidates.length === 0) {
-  console.log("release-bundle: no local candidate available; building one");
-  execFileSync("npm", ["run", "build"], { cwd: root, stdio: "inherit" });
+const candidates = existsSync(releasesDir)
+  ? readdirSync(releasesDir, { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort().reverse()
+  : [];
+let buildResult;
+for (const candidate of candidates) {
+  const candidateSource = join(releasesDir, candidate);
+  try {
+    const metadata = JSON.parse(readFileSync(join(candidateSource, "build-meta.json"), "utf8"));
+    if (metadata.buildId !== candidate) continue;
+    validateRelease(candidateSource);
+    buildResult = {
+      buildId: metadata.buildId,
+      artifactPath: candidateSource,
+      sourceGitSha: metadata.gitSha,
+    };
+    break;
+  } catch {
+    // Ignore incomplete, stale, or invalid entries and try another immutable candidate.
+  }
 }
-const buildResult = JSON.parse(readFileSync(join(root, ".kontrol-build-result.json"), "utf8"));
+if (!buildResult) {
+  console.log("release-bundle: no valid local candidate available; building one");
+  const resultPath = join(tmp, "build-result.json");
+  execFileSync("npm", ["run", "build"], {
+    cwd: root,
+    env: { ...process.env, KONTROL_BUILD_RESULT_PATH: resultPath },
+    stdio: "inherit",
+  });
+  buildResult = JSON.parse(readFileSync(resultPath, "utf8"));
+}
 const buildId = buildResult.buildId;
 const candidateSource = resolve(root, buildResult.artifactPath);
 
@@ -64,7 +89,7 @@ writeFileSync(receiptPath, `${JSON.stringify({
   createdAt: new Date().toISOString(),
   candidate: {
     buildId,
-    artifactPath: buildResult.artifactPath,
+    artifactPath: relative(root, candidateSource),
     metadata,
   },
 }, null, 2)}\n`);

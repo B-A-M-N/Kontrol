@@ -198,13 +198,15 @@ function createServerWithHandshakeObserver(
 // worker must present the live fencing nonce bound to that exact session.
 const leaseHarnessRoot = mkdtempSync(join(tmpdir(), "kontrol-lease-fence-"));
 const leaseWorkspacePath = join(leaseHarnessRoot, "workspace");
+const leaseOtherWorkspaceRoot = join(leaseHarnessRoot, "other-workspace");
 const leaseStateDir = join(leaseHarnessRoot, "state");
 mkdirSync(leaseWorkspacePath, { recursive: true });
+mkdirSync(leaseOtherWorkspaceRoot, { recursive: true });
 const leaseWorkspaceRoot = realpathSync(leaseWorkspacePath);
 mkdirSync(leaseStateDir, { recursive: true });
 const leaseConfig = loadConfig({
   KONTROL_CONFIG_DIR: join(leaseHarnessRoot, "config"),
-  KONTROL_ALLOWED_ROOTS: leaseWorkspaceRoot,
+  KONTROL_ALLOWED_ROOTS: leaseHarnessRoot,
   KONTROL_STATE_DIR: leaseStateDir,
   KONTROL_WORKTREE_ROOT: join(leaseHarnessRoot, "worktrees"),
   KONTROL_AUTH_MODE: "tunnel",
@@ -297,18 +299,17 @@ try {
     arguments: { path: canonicalLeaseWorkspaceRoot, mode: "worktree" },
   });
   assert.equal(workerWorktreeOpen.isError, true, "worker cannot create a managed worktree");
-  const otherRoot = join(canonicalLeaseWorkspaceRoot, "other");
-  mkdirSync(otherRoot, { recursive: true });
   const workerOtherOpen = await worker.client.callTool({
     name: "open_workspace",
-    arguments: { path: otherRoot, mode: "checkout" },
+    arguments: { path: leaseOtherWorkspaceRoot, mode: "checkout" },
   });
   assert.equal(workerOtherOpen.isError, true, "worker cannot open an arbitrary second workspace");
   const otherOpened = await direct.client.callTool({
     name: "open_workspace",
-    arguments: { path: otherRoot, mode: "checkout" },
+    arguments: { path: leaseOtherWorkspaceRoot, mode: "checkout" },
   });
-  const otherWorkspaceId = (otherOpened.structuredContent as { workspaceId: string }).workspaceId;
+  const otherWorkspaceId = (otherOpened.structuredContent as { workspaceId?: string } | undefined)?.workspaceId;
+  assert.ok(otherWorkspaceId, JSON.stringify(otherOpened));
   for (const name of ["git_status", "git_log", "git_diff", "git_show"]) {
     const crossWorkspace = await worker.client.callTool({ name, arguments: { workspaceId: otherWorkspaceId } });
     assert.equal(crossWorkspace.isError, true, `${name} rejects a workspace outside the signed worker binding`);

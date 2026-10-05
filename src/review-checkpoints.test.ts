@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
 
 const execFileAsync = promisify(execFile);
-const root = await mkdtemp(join(tmpdir(), "kontrol-review-checkpoints-test-"));
+const root = await realpath(await mkdtemp(join(tmpdir(), "kontrol-review-checkpoints-test-")));
 
 try {
   await git(root, ["init"]);
