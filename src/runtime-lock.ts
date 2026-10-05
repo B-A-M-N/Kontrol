@@ -216,8 +216,17 @@ export async function acquireRuntimeLock(
 
 export function assertRuntimeLock(stateDir: string, lockToken: string): RuntimeLockRecord {
   const record = readRuntimeLock(stateDir);
-  if (!record || record.lockToken !== lockToken || !isRuntimeLockLive(record)) {
-    throw new Error("Kontrol runtime lock is missing, stale, or owned by another generation.");
+  const invalidLockPrefix = "Kontrol runtime lock is missing, stale, or owned by another generation";
+  if (!record) throw new Error(`${invalidLockPrefix} (no lock at ${runtimeLockPath(stateDir)}).`);
+  if (record.lockToken !== lockToken) throw new Error(`${invalidLockPrefix} (lock token mismatch).`);
+  if (!processIsLive(record.launcherPid)) {
+    throw new Error(`${invalidLockPrefix} (owner PID ${record.launcherPid} is not live).`);
+  }
+  if (
+    !record.launcherStartToken.startsWith("started:")
+    && processStartToken(record.launcherPid) !== record.launcherStartToken
+  ) {
+    throw new Error(`${invalidLockPrefix} (owner PID ${record.launcherPid} start token changed).`);
   }
   return record;
 }
