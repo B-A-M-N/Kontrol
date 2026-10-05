@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "./config.js";
 import { WorkspaceRegistry } from "./workspaces.js";
 
-const root = await mkdtemp(join(tmpdir(), "kontrol-workspace-session-isolation-"));
+const root = await realpath(await mkdtemp(join(tmpdir(), "kontrol-workspace-session-isolation-")));
 try {
   const nested = join(root, "nested");
   await mkdir(nested, { recursive: true });

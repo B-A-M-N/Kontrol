@@ -18,6 +18,15 @@ import { validateRelease } from "../scripts/validate-release.mjs";
 const repoRoot = process.cwd();
 const fixtureRoot = mkdtempSync(join(tmpdir(), "kontrol-release-fixture-"));
 
+function lstatIfPresent(path) {
+  try {
+    return lstatSync(path);
+  } catch (error) {
+    if (error?.code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
 function writeRequiredFiles(artifact) {
   mkdirSync(join(artifact, "ui"), { recursive: true });
   const workspaceAppHtml = "<!doctype html>\n";
@@ -79,17 +88,20 @@ try {
   // replace the active dist projection. This is the incident regression that
   // prevents a failed candidate from erasing the last-known-good generation.
   const distPath = join(repoRoot, "dist");
-  const originalDist = lstatSync(distPath);
-  const originalDistTarget = originalDist.isSymbolicLink() ? readlinkSync(distPath) : undefined;
+  const originalDist = lstatIfPresent(distPath);
+  const originalDistTarget = originalDist?.isSymbolicLink() ? readlinkSync(distPath) : undefined;
   const resultPath = join(fixtureRoot, "build-result.json");
   execFileSync("npm", ["run", "build"], {
     cwd: repoRoot,
     env: { ...process.env, KONTROL_BUILD_RESULT_PATH: resultPath },
     stdio: "ignore",
   });
-  const afterDist = lstatSync(distPath);
-  assert.equal(afterDist.isSymbolicLink(), originalDist.isSymbolicLink(), "atomic build must preserve dist node type");
-  if (originalDistTarget !== undefined) assert.equal(readlinkSync(distPath), originalDistTarget, "atomic build must not rotate dist");
+  const afterDist = lstatIfPresent(distPath);
+  assert.equal(afterDist !== undefined, originalDist !== undefined, "atomic build must preserve dist existence");
+  if (originalDist && afterDist) {
+    assert.equal(afterDist.isSymbolicLink(), originalDist.isSymbolicLink(), "atomic build must preserve dist node type");
+    if (originalDistTarget !== undefined) assert.equal(readlinkSync(distPath), originalDistTarget, "atomic build must not rotate dist");
+  }
   const result = JSON.parse(readFileSync(resultPath, "utf8"));
   assert.match(result.artifactPath, /releases\//);
   assert.equal(existsSync(join(result.artifactPath, "acp-worker-token.mjs")), true);

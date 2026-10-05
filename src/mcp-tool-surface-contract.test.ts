@@ -251,7 +251,8 @@ try {
     arguments: { path: leaseWorkspaceRoot, mode: "checkout" },
   });
   const workspaceId = (opened.structuredContent as { workspaceId: string }).workspaceId;
-  execFileSync("git", ["init", "-q", leaseWorkspaceRoot]);
+  const canonicalLeaseWorkspaceRoot = leaseWorkspaces.getWorkspace(workspaceId).root;
+  execFileSync("git", ["init", "-q", canonicalLeaseWorkspaceRoot]);
   const createdAt = new Date().toISOString();
   // The test registry owns a separate SQLite handle; mirror the workspace row
   // into the work-session fixture database, as the production composition
@@ -259,10 +260,10 @@ try {
   leaseDb.sqlite.prepare(
     "insert into workspace_sessions (id, root, status, mode, managed, created_at, last_used_at) " +
       "values (?, ?, 'active', 'checkout', 'false', ?, ?)",
-  ).run(workspaceId, leaseWorkspaceRoot, createdAt, createdAt);
+  ).run(workspaceId, canonicalLeaseWorkspaceRoot, createdAt, createdAt);
   const workSession = leaseSessions.create({ workspaceSessionId: workspaceId, submittedBy: "lease-fence-test" });
   const acquired = leaseSessions.acquireWorkspaceLease({
-    canonicalRoot: leaseWorkspaceRoot,
+    canonicalRoot: canonicalLeaseWorkspaceRoot,
     workspaceSessionId: workspaceId,
     workSessionId: workSession.id,
     ttlMs: 60_000,
@@ -275,7 +276,7 @@ try {
   });
   assert.equal((directWrite.structuredContent as { status?: string }).status, "workspace_lease_conflict",
     "direct mutation is rejected while a delegated session owns the checkout");
-  assert.equal(existsSync(join(leaseWorkspaceRoot, "direct.txt")), false, "blocked direct mutation leaves the file unchanged");
+  assert.equal(existsSync(join(canonicalLeaseWorkspaceRoot, "direct.txt")), false, "blocked direct mutation leaves the file unchanged");
 
   const worker = await makeLeaseClient({
     authenticatedRole: "worker",
@@ -287,16 +288,16 @@ try {
   leaseClients.push(worker);
   const workerReopen = await worker.client.callTool({
     name: "open_workspace",
-    arguments: { path: leaseWorkspaceRoot, mode: "checkout" },
+    arguments: { path: canonicalLeaseWorkspaceRoot, mode: "checkout" },
   });
   assert.equal((workerReopen.structuredContent as { workspaceId?: string }).workspaceId, workspaceId,
     "worker can reopen only the workspace identified by its signed session");
   const workerWorktreeOpen = await worker.client.callTool({
     name: "open_workspace",
-    arguments: { path: leaseWorkspaceRoot, mode: "worktree" },
+    arguments: { path: canonicalLeaseWorkspaceRoot, mode: "worktree" },
   });
   assert.equal(workerWorktreeOpen.isError, true, "worker cannot create a managed worktree");
-  const otherRoot = join(leaseWorkspaceRoot, "other");
+  const otherRoot = join(canonicalLeaseWorkspaceRoot, "other");
   mkdirSync(otherRoot, { recursive: true });
   const workerOtherOpen = await worker.client.callTool({
     name: "open_workspace",
