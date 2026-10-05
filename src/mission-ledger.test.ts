@@ -525,7 +525,9 @@ try {
     "fresh server evidence on the exact resubmission closes the durable mission after restart");
   restartDb.close();
 
+  workSessions.close();
   ledger.close();
+  db.close();
   console.log("mission-ledger.test.ts: all assertions passed");
 } finally {
   rmSync(root, { recursive: true, force: true });
