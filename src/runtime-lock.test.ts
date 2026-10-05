@@ -92,7 +92,11 @@ try {
       const current = readRuntimeLock(stateDir);
       assert.ok(current, "winner lock remains durable while its owner is alive");
       assert.ok(children.some((child) => child.child.pid === current.launcherPid), "lock PID belongs to a contender");
-      assert.equal(processStartToken(current.launcherPid), current.launcherStartToken, "winner start token is authoritative");
+      if (process.platform === "linux") {
+        assert.equal(processStartToken(current.launcherPid), current.launcherStartToken, "winner start token is authoritative");
+      } else {
+        assert.match(current.launcherStartToken, /^started:/, "non-Linux platforms use PID liveness without a /proc start token");
+      }
       const results = await Promise.all(children.map((child) => child.done));
       assert.equal(results.filter((result) => result.code === 0).length, 1, "exactly one real child wins stale takeover");
       assert.ok(readRuntimeLock(stateDir), "winner lock still exists after the winner exits");
