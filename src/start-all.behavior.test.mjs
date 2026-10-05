@@ -186,7 +186,9 @@ writeExecutable(join(fakeBin, "tmux"), [
   "        expected_build=\"$(printf '%s\\n' \"$last\" | sed -n 's/.*--expected-build-id \\([^ ]*\\).*/\\1/p')\"",
   "        start_token=\"started:fake\"",
   "        if [ -r \"/proc/$child_pid/stat\" ]; then start_token=\"proc:$(awk '{print $22}' \"/proc/$child_pid/stat\")\"; fi",
-  "        updated_at=\"$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)\"",
+  // BSD date does not support GNU's %N nanosecond formatter. Emit the same
+  // canonical timestamp shape as the real supervisor on every CI platform.
+  "        updated_at=\"$(node -e 'process.stdout.write(new Date().toISOString())')\"",
   "        printf '{\"state\":\"healthy\",\"pid\":%s,\"processStartToken\":\"%s\",\"generationId\":\"%s\",\"expectedBuildId\":\"%s\",\"updatedAt\":\"%s\"}\\n' \"$child_pid\" \"$start_token\" \"$generation_id\" \"$expected_build\" \"$updated_at\" > \"$status_file\"",
   "      fi",
   "    fi",
