@@ -17,6 +17,11 @@ import {
   type MissionCompletionReportRow,
 } from "./db/schema.js";
 import { normalizeWorkspaceSnapshotIdentity, type WorkspaceSnapshotKind } from "./review-checkpoints.js";
+import { fingerprintMissionContract, fingerprintStoredMissionContract, validateMissionCriterionContract } from "./mission/contract-authority.js";
+import { evaluateFindingResolutionEvidence, findCurrentCriterionEvidence, isEvidenceSourceAllowed } from "./mission/evidence-authority.js";
+import { assertFindingStatusTransition, fingerprintFinding, mergeFindingEvidence } from "./mission/finding-authority.js";
+import { evaluateCorrectionPolicy } from "./mission/correction-policy.js";
+import { evaluateEffectiveCriteria, evaluateMissionOutcome } from "./mission/outcome-evaluator.js";
 
 export type CriterionStatus = "unverified" | "partially_verified" | "verified" | "failed";
 export type FindingStatus = "open" | "claimed_resolved" | "verified_resolved" | "waived";
@@ -218,6 +223,7 @@ export interface LoopExtensionDecision {
   ceilingHit: boolean;
 }
 
+/** Persistence/query facade; mission decisions are delegated to src/mission authorities. */
 export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): MissionLedger {
   const database =
     typeof stateDirOrHandle === "string" ? openDatabase(stateDirOrHandle) : stateDirOrHandle;
@@ -243,13 +249,12 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
     if (requiredCriteria.length === 0) {
       throw new Error("Mission requires at least one required acceptance criterion.");
     }
-    validateCriterionGraph(criteria);
-    validateCriterionVerification(criteria);
-    const contractFingerprint = missionContractFingerprint(normalizedInput, criteria);
+    validateMissionCriterionContract(criteria);
+    const contractFingerprint = fingerprintMissionContract(normalizedInput, criteria);
     const existingRow = database.db.select().from(missionContracts).where(eq(missionContracts.workSessionId, input.workSessionId)).get();
     if (existingRow) {
       const existing = rowToMission(existingRow);
-      const existingFingerprint = existingRow.contractFingerprint ?? fingerprintStoredMission(existing, database.db.select().from(missionAcceptanceCriteria).where(eq(missionAcceptanceCriteria.missionId, existing.id)).orderBy(asc(missionAcceptanceCriteria.createdAt)).all().map(rowToCriterion));
+      const existingFingerprint = existingRow.contractFingerprint ?? fingerprintStoredMissionContract(existing, database.db.select().from(missionAcceptanceCriteria).where(eq(missionAcceptanceCriteria.missionId, existing.id)).orderBy(asc(missionAcceptanceCriteria.createdAt)).all().map(rowToCriterion));
       if (existingFingerprint !== contractFingerprint) {
         throw new Error(`Mission contract conflict for work session ${input.workSessionId}; create a new work session or use an explicit mission revision.`);
       }
@@ -328,7 +333,7 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
         const scope: FindingScope = finding.scope ?? (finding.introducedInSubmissionId ? "regression" : "in_scope");
         const severity = finding.severity ?? "medium";
         const disposition: FindingDisposition = finding.disposition ?? (scope === "out_of_scope" || !["blocker", "high"].includes(severity) ? "advisory" : "blocking");
-        const fingerprint = semanticFindingFingerprint({
+        const fingerprint = fingerprintFinding({
           category: finding.category ?? "correctness",
           scope,
           description: finding.description,
@@ -337,11 +342,11 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
         });
         const equivalent = existingRows.find((row) =>
           !["verified_resolved", "waived"].includes(row.status) &&
-          (row.fingerprint === fingerprint || (!row.fingerprint && semanticFindingFingerprint(row) === fingerprint)),
+          (row.fingerprint === fingerprint || (!row.fingerprint && fingerprintFinding(row) === fingerprint)),
         );
         if (equivalent) {
           const oldEvidence = parseJson<unknown[]>(equivalent.evidenceJson, []);
-          const mergedEvidence = mergeEvidence(oldEvidence, finding.evidence ?? []);
+          const mergedEvidence = mergeFindingEvidence(oldEvidence, finding.evidence ?? []);
           const severityRank = (value: string) => ["low", "medium", "high", "blocker"].indexOf(value);
           const mergedSeverity = severityRank(severity) > severityRank(equivalent.severity) ? severity : equivalent.severity;
           database.db.update(missionReviewFindings).set({
@@ -397,12 +402,7 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
   function updateFindingStatus(missionId: string, updates: Array<{ id: string; status: Exclude<FindingStatus, "verified_resolved">; waiverReason?: string; disposition?: FindingDisposition }>): void {
     const now = new Date().toISOString();
     for (const update of updates) {
-      if ((update as { status: string }).status === "verified_resolved") {
-        throw new Error(`Finding ${update.id} cannot be directly marked verified_resolved; use independent resolution evidence.`);
-      }
-      if (update.status === "waived" && !update.waiverReason?.trim()) {
-        throw new Error(`Waiving finding ${update.id} requires a waiverReason.`);
-      }
+      assertFindingStatusTransition(update as { id: string; status: FindingStatus; waiverReason?: string });
       const existing = database.db.select().from(missionReviewFindings)
         .where(and(eq(missionReviewFindings.id, update.id), eq(missionReviewFindings.missionId, missionId)))
         .get();
@@ -443,23 +443,16 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
     }
 
     const requiredCommands = parseJson<string[]>(finding.requiredVerificationJson, []);
-    const eligible = database.db.select().from(missionEvidence)
+    const evidence = database.db.select().from(missionEvidence)
       .where(and(eq(missionEvidence.missionId, missionId), eq(missionEvidence.findingId, findingId), eq(missionEvidence.status, "passed")))
       .orderBy(desc(missionEvidence.createdAt)).all()
-      .map(rowToEvidence)
-      .filter((entry) => {
-        const details = typeof entry.details === "object" && entry.details ? entry.details as Record<string, unknown> : {};
-        const source = details.source;
-        return entry.submissionId === context.submissionId
-          && entry.snapshotKind === snapshotKind
-          && entry.snapshotRef === snapshotRef
-          && entry.reviewEpoch === context.reviewEpoch
-          && (requiredCommands.length
-            ? (source === "server_test_runner" || source === "runtime_probe") && Boolean(entry.command && requiredCommands.includes(entry.command))
-            : source === "reviewer_manual_attestation");
-      });
-    const coveredCommands = new Set(eligible.map((entry) => entry.command).filter((command): command is string => Boolean(command)));
-    const missingCommands = requiredCommands.filter((command) => !coveredCommands.has(command));
+      .map(rowToEvidence);
+    const { eligible, missingCommands } = evaluateFindingResolutionEvidence(evidence, requiredCommands, {
+      submissionId: context.submissionId,
+      snapshotKind,
+      snapshotRef,
+      reviewEpoch: context.reviewEpoch,
+    });
     if (missingCommands.length) throw new Error(`Finding ${findingId} is missing current server verification: ${missingCommands.join(", ")}.`);
     if (!eligible.length) throw new Error(`Finding ${findingId} has no independent evidence for the current submitted snapshot.`);
     const evidenceIds = [...new Set(eligible.map((entry) => entry.id))];
@@ -521,7 +514,7 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
           .get();
         if (!criterion) throw new Error(`Criterion ${entry.criterionId} does not belong to mission ${missionId}.`);
         criterionType = criterion.verificationType;
-        if (source !== "agent_claim" && !criterionSourceAllowed(criterion.verificationType, source)) {
+        if (source !== "agent_claim" && !isEvidenceSourceAllowed(criterion.verificationType, source)) {
           throw new Error(`Evidence source ${source} cannot satisfy ${criterion.verificationType} criterion ${entry.criterionId}.`);
         }
       }
@@ -559,7 +552,7 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
       // status — a pass on snapshot A does not permanently verify the
       // criterion for snapshot B.
       if (entry.criterionId && entry.submissionId && snapshotRef) {
-        const newStatus = entry.status === "passed" && source !== "agent_claim" && criterionSourceAllowed(criterionType ?? "manual_review", source) ? "verified" : entry.status === "failed" ? "failed" : "unverified";
+        const newStatus = entry.status === "passed" && source !== "agent_claim" && isEvidenceSourceAllowed(criterionType ?? "manual_review", source) ? "verified" : entry.status === "failed" ? "failed" : "unverified";
         database.db.update(missionAcceptanceCriteria)
           .set({ status: newStatus, updatedAt: now })
           .where(and(eq(missionAcceptanceCriteria.id, entry.criterionId), eq(missionAcceptanceCriteria.missionId, missionId)))
@@ -626,23 +619,6 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
     const currentContext = normalizeCurrentApprovalContext(context ?? getCurrentApprovalContext(workSessionId));
     const currentSnapshot = normalizeWorkspaceSnapshotIdentity(currentContext);
     const packet = getPacketWithoutApproval(mission.id);
-    const reasons: string[] = [];
-    const states = new Map(evaluateCriteria(workSessionId, currentContext).map((state) => [state.criterionId, state]));
-    for (const criterion of packet.criteria) {
-      if (criterion.priority === "required") {
-        const state = states.get(criterion.id);
-        if (state?.status !== "verified") reasons.push(`Required criterion ${criterion.id} is effectively ${state?.status ?? "unverified"}: ${state?.staleReason ?? criterion.description}`);
-      }
-    }
-    for (const finding of packet.findings) {
-      // Out-of-scope findings are advisory only — they never block approval.
-      // This is the anti-runaway guard: a reviewer can surface a pre-existing
-      // issue for visibility without trapping the loop forever.
-      if (finding.scope === "out_of_scope") continue;
-      if (finding.disposition === "blocking" && !["verified_resolved", "waived"].includes(finding.status)) {
-        reasons.push(`${finding.severity} finding ${finding.id} is ${finding.status}: ${finding.description}`);
-      }
-    }
     const currentReport = currentContext.submissionId && currentSnapshot
       ? database.db.select().from(missionCompletionReports).where(and(
           eq(missionCompletionReports.missionId, mission.id),
@@ -651,16 +627,17 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
           eq(missionCompletionReports.snapshotRef, currentSnapshot.ref),
         )).orderBy(desc(missionCompletionReports.createdAt)).get()
       : undefined;
-    if (mission.finalVerification.length) {
-      const report = currentReport;
-      if (!report || report.status !== "passed") reasons.push("Mission-level final integration verification has not passed for the current submission.");
-    }
-    if (mission.reviewCoverage.length) {
-      const covered = new Set(currentReport ? parseJson<string[]>(currentReport.reviewCoverageJson, []) : []);
-      const missing = mission.reviewCoverage.filter((area) => !covered.has(area));
-      if (missing.length) reasons.push(`Review coverage is incomplete; missing: ${missing.join(", ")}.`);
-    }
-    return { allowed: reasons.length === 0, reasons };
+    return evaluateMissionOutcome({
+      criteria: packet.criteria,
+      criterionStates: evaluateCriteria(workSessionId, currentContext),
+      findings: packet.findings,
+      finalVerification: mission.finalVerification,
+      reviewCoverage: mission.reviewCoverage,
+      currentReport: currentReport ? {
+        status: currentReport.status,
+        reviewCoverage: parseJson<string[]>(currentReport.reviewCoverageJson, []),
+      } : undefined,
+    });
   }
 
   function evaluateCriteria(workSessionId: string, context?: CurrentApprovalContext): EffectiveCriterionState[] {
@@ -670,34 +647,11 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
     const criteria = database.db.select().from(missionAcceptanceCriteria)
       .where(eq(missionAcceptanceCriteria.missionId, mission.id))
       .orderBy(asc(missionAcceptanceCriteria.createdAt)).all().map(rowToCriterion);
-    const byId = new Map(criteria.map((criterion) => [criterion.id, criterion]));
-    const states = new Map<string, EffectiveCriterionState>();
-    const visiting = new Set<string>();
-    const evaluate = (criterionId: string): EffectiveCriterionState => {
-      const cached = states.get(criterionId);
-      if (cached) return cached;
-      const criterion = byId.get(criterionId);
-      if (!criterion) return { criterionId, status: "unverified", dependenciesSatisfied: false, staleReason: "criterion is missing" };
-      if (visiting.has(criterionId)) return { criterionId, status: "unverified", dependenciesSatisfied: false, staleReason: "dependency cycle detected" };
-      visiting.add(criterionId);
-      const dependencies = (criterion.dependsOnCriterionIds ?? []).map(evaluate);
-      const dependenciesSatisfied = dependencies.every((dependency) => dependency.status === "verified");
-      const evidence = latestCurrentEvidence(mission.id, criterion.id, currentContext);
-      const failedEvidence = latestCurrentEvidence(mission.id, criterion.id, currentContext, "failed");
-      const baseStatus: CriterionStatus = evidence ? "verified" : failedEvidence ? "failed" : "unverified";
-      const status: CriterionStatus = baseStatus === "verified" && dependenciesSatisfied ? "verified" : baseStatus === "verified" ? "unverified" : baseStatus;
-      const staleReason = !evidence && criterion.status !== "unverified" && !failedEvidence
-        ? `stored ${criterion.status} status has no qualifying evidence for current submission ${currentContext.submissionId ?? "(unknown)"}`
-        : baseStatus === "verified" && !dependenciesSatisfied
-          ? "one or more dependencies are not currently verified"
-          : undefined;
-      const state: EffectiveCriterionState = { criterionId, status, evidenceId: evidence?.id ?? failedEvidence?.id, dependenciesSatisfied, staleReason };
-      visiting.delete(criterionId);
-      states.set(criterionId, state);
-      return state;
-    };
-    for (const criterion of criteria) evaluate(criterion.id);
-    return criteria.map((criterion) => states.get(criterion.id)!);
+    return evaluateEffectiveCriteria(
+      criteria,
+      (criterion, status) => latestCurrentEvidence(mission.id, criterion.id, currentContext, status),
+      currentContext,
+    );
   }
 
   function recordCompletionReport(missionId: string, input: { submissionId: string; snapshotKind?: WorkspaceSnapshotKind; snapshotRef?: string; snapshotCommit?: string; status: "passed" | "failed"; results: unknown; reviewCoverage?: string[]; uncertainty?: unknown[] }): void {
@@ -820,46 +774,16 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
       .filter((f): f is MissionReviewFindingRow => !!f)
       .filter((f) => f.scope !== "out_of_scope" && f.disposition === "blocking");
 
-    // No new blocking work → the loop has converged. Nothing to extend; the
-    // approval predicate decides whether remaining open findings block.
-    if (newBlocking.length === 0) {
-      return {
-        extend: false,
-        round: mission.correctionRounds,
-        maxRounds: mission.maxCorrectionRounds,
-        reason: "Round surfaced no new blocking in-scope findings; loop has converged.",
-        ceilingHit: false,
-      };
+    const decision = evaluateCorrectionPolicy({
+      currentRound: mission.correctionRounds,
+      maxCorrectionRounds: mission.maxCorrectionRounds,
+      newBlockingCount: newBlocking.length,
+      round,
+    });
+    if (decision.extend) {
+      database.db.update(missionContracts).set({ correctionRounds: decision.round, updatedAt: new Date().toISOString() }).where(eq(missionContracts.id, mission.id)).run();
     }
-
-    const nextRound = mission.correctionRounds + 1;
-    const madeProgress = round.progress?.madeProgress
-      ?? (round.resolvedFindingIds?.length ?? 0) > 0;
-
-    // Progress-aware ceiling: if the round is actually resolving prior findings,
-    // grant a little headroom so genuinely-needed work is never cut off just for
-    // hitting a round number. Runaway (new findings but nothing ever resolved)
-    // gets no headroom and stops hard at the ceiling.
-    const effectiveMax = mission.maxCorrectionRounds + (madeProgress ? 2 : 0);
-
-    if (nextRound > effectiveMax) {
-      return {
-        extend: false,
-        round: mission.correctionRounds,
-        maxRounds: effectiveMax,
-        reason: `Correction ceiling reached (${mission.correctionRounds}/${effectiveMax}). New findings recorded but the loop will not auto-extend; a human must decide to continue or ship.`,
-        ceilingHit: true,
-      };
-    }
-
-    database.db.update(missionContracts).set({ correctionRounds: nextRound, updatedAt: new Date().toISOString() }).where(eq(missionContracts.id, mission.id)).run();
-    return {
-      extend: true,
-      round: nextRound,
-      maxRounds: effectiveMax,
-      reason: `Extending correction loop: ${newBlocking.length} new blocking in-scope finding(s), round ${nextRound}/${effectiveMax}${madeProgress ? " (progress: prior findings resolved)" : ""}.`,
-      ceilingHit: false,
-    };
+    return decision;
   }
 
   function latestCurrentEvidence(missionId: string, criterionId: string, context: CurrentApprovalContext, status: "passed" | "failed" = "passed") {
@@ -876,15 +800,11 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
       .orderBy(desc(missionEvidence.createdAt))
       .all()
       .map(rowToEvidence);
-    return rows.find((row) => {
-      const details = typeof row.details === "object" && row.details ? row.details as Record<string, unknown> : {};
-      return row.status === status &&
-        row.submissionId === context.submissionId &&
-        row.snapshotKind === snapshotKind &&
-        row.snapshotRef === snapshotRef &&
-        (context.reviewEpoch === undefined || row.reviewEpoch === context.reviewEpoch) &&
-        criterionSourceAllowed(criterion.verificationType, details.source as MissionEvidenceSource);
-    });
+    return findCurrentCriterionEvidence(rows, criterion.verificationType, {
+      ...context,
+      snapshotKind,
+      snapshotRef,
+    }, status);
   }
 
   function getPacketWithoutApproval(missionId: string) {
@@ -964,138 +884,6 @@ function rowToMission(row: MissionContractRow) {
   };
 }
 
-function validateCriterionGraph(criteria: MissionCriterionInput[]): void {
-  const ids = new Set<string>();
-  for (const criterion of criteria) {
-    if (criterion.id) {
-      if (ids.has(criterion.id)) throw new Error(`Duplicate mission criterion id: ${criterion.id}`);
-      ids.add(criterion.id);
-    }
-    if (criterion.dependsOnCriterionIds?.length && !criterion.id) throw new Error("A criterion with dependencies must have a stable id.");
-  }
-  for (const criterion of criteria) {
-    for (const dependency of criterion.dependsOnCriterionIds ?? []) {
-      if (!ids.has(dependency)) throw new Error(`Criterion ${criterion.id ?? "(generated)"} depends on unknown criterion ${dependency}.`);
-      if (dependency === criterion.id) throw new Error(`Criterion ${criterion.id} cannot depend on itself.`);
-    }
-  }
-  const visiting = new Set<string>();
-  const visited = new Set<string>();
-  const byId = new Map(criteria.filter((criterion): criterion is MissionCriterionInput & { id: string } => Boolean(criterion.id)).map((criterion) => [criterion.id, criterion]));
-  const walk = (id: string): void => {
-    if (visited.has(id)) return;
-    if (visiting.has(id)) throw new Error(`Mission criterion dependency cycle detected at ${id}.`);
-    visiting.add(id);
-    for (const dependency of byId.get(id)?.dependsOnCriterionIds ?? []) walk(dependency);
-    visiting.delete(id);
-    visited.add(id);
-  };
-  for (const id of byId.keys()) walk(id);
-}
-
-function validateCriterionVerification(criteria: MissionCriterionInput[]): void {
-  for (const criterion of criteria) {
-    const type = criterion.verificationType ?? (criterion.verificationCommand ? "test" : "manual_review");
-    if (type === "test" && !criterion.verificationCommand?.trim()) {
-      throw new Error(`Test criterion ${criterion.id ?? criterion.description} requires a verificationCommand.`);
-    }
-    if (type === "runtime_behavior" && !criterion.runtimeProbe) {
-      throw new Error(`Runtime behavior criterion ${criterion.id ?? criterion.description} requires a runtimeProbe.`);
-    }
-    if (type !== "test" && criterion.verificationCommand) {
-      throw new Error(`Criterion ${criterion.id ?? criterion.description} has a verificationCommand but verificationType is ${type}.`);
-    }
-    if (type !== "runtime_behavior" && criterion.runtimeProbe) {
-      throw new Error(`Criterion ${criterion.id ?? criterion.description} declares a runtimeProbe but is not runtime_behavior.`);
-    }
-  }
-}
-
-function missionContractFingerprint(input: MissionContractInput, criteria: MissionCriterionInput[]): string {
-  const baselineIdentity = normalizeWorkspaceSnapshotIdentity({
-    snapshotKind: input.baselineKind,
-    snapshotRef: input.baselineRef,
-    snapshotCommit: input.baselineCommit,
-  });
-  const normalizedCriteria = criteria.map((criterion) => ({
-    description: criterion.description,
-    priority: criterion.priority ?? "required",
-    verificationType: criterion.verificationType ?? (criterion.verificationCommand ? "test" : "manual_review"),
-    verificationCommand: criterion.verificationCommand ?? null,
-    runtimeProbe: criterion.runtimeProbe ?? null,
-    affectedAreas: criterion.affectedAreas ?? [],
-    dependsOnCriterionIds: criterion.dependsOnCriterionIds ?? [],
-    verificationGroup: criterion.verificationGroup ?? null,
-    verificationScope: criterion.verificationScope ?? "full",
-    finalOnly: criterion.finalOnly ?? false,
-    mutatesWorkspace: criterion.mutatesWorkspace ?? false,
-    commandVersion: criterion.commandVersion ?? null,
-  }));
-  const payload = {
-    workSessionId: input.workSessionId,
-    workspaceSessionId: input.workspaceSessionId,
-    objective: input.objective,
-    desiredOutcome: input.desiredOutcome ?? input.objective,
-    constraints: input.constraints ?? [],
-    nonGoals: input.nonGoals ?? [],
-    userLockedFields: input.userLockedFields ?? ["objective", "desiredOutcome", "constraints", "nonGoals"],
-    supervisorInstructions: input.supervisorInstructions ?? null,
-    baselineKind: baselineIdentity?.kind ?? null,
-    baselineRef: baselineIdentity?.ref ?? null,
-    maxCorrectionRounds: input.maxCorrectionRounds ?? 5,
-    finalVerification: input.finalVerification ?? [],
-    reviewCoverage: input.reviewCoverage ?? [],
-    acceptanceCriteria: normalizedCriteria.sort((left, right) =>
-      JSON.stringify(canonicalize(left)).localeCompare(JSON.stringify(canonicalize(right)))),
-  };
-  return sha256(JSON.stringify(canonicalize(payload)));
-}
-
-function fingerprintStoredMission(
-  mission: ReturnType<typeof rowToMission>,
-  criteria: Array<ReturnType<typeof rowToCriterion>>,
-): string {
-  return missionContractFingerprint({
-    workSessionId: mission.workSessionId,
-    workspaceSessionId: mission.workspaceSessionId,
-    objective: mission.objective,
-    desiredOutcome: mission.desiredOutcome,
-    constraints: mission.constraints,
-    nonGoals: mission.nonGoals,
-    userLockedFields: mission.userLockedFields,
-    supervisorInstructions: mission.supervisorInstructions,
-    baselineKind: mission.baselineKind,
-    baselineRef: mission.baselineRef,
-    maxCorrectionRounds: mission.maxCorrectionRounds,
-    finalVerification: mission.finalVerification,
-    reviewCoverage: mission.reviewCoverage,
-  }, criteria.map((criterion) => ({
-    description: criterion.description,
-    priority: criterion.priority as "required" | "preferred",
-    verificationType: criterion.verificationType as MissionCriterionInput["verificationType"],
-    verificationCommand: criterion.verificationCommand,
-    runtimeProbe: criterion.runtimeProbe,
-    affectedAreas: criterion.affectedAreas,
-    dependsOnCriterionIds: criterion.dependsOnCriterionIds,
-    verificationGroup: criterion.verificationGroup,
-    verificationScope: criterion.verificationScope as MissionCriterionInput["verificationScope"],
-    finalOnly: criterion.finalOnly,
-    mutatesWorkspace: criterion.mutatesWorkspace,
-    commandVersion: criterion.commandVersion,
-  })));
-}
-
-function canonicalize(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(canonicalize);
-  if (value && typeof value === "object") {
-    return Object.fromEntries(Object.entries(value as Record<string, unknown>)
-      .filter(([, child]) => child !== undefined)
-      .sort(([left], [right]) => left.localeCompare(right))
-      .map(([key, child]) => [key, canonicalize(child)]));
-  }
-  return value;
-}
-
 function rowToCriterion(row: MissionAcceptanceCriterionRow) {
   return {
     id: row.id,
@@ -1139,53 +927,6 @@ function rowToFinding(row: MissionReviewFindingRow) {
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };
-}
-
-function normalizeFindingText(value: string): string {
-  return value
-    .toLowerCase()
-    .replace(/\b(?:line|ln|at)\s*\d+\b/gi, "line")
-    .replace(/\b\d+(?::\d+)+\b/g, "position")
-    .replace(/[^a-z0-9_./ -]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function semanticFindingFingerprint(finding: {
-  category?: string | null;
-  scope?: string | null;
-  description: string;
-  requiredAction: string;
-  evidence?: unknown[] | string | null;
-}): string {
-  const rawEvidence = typeof finding.evidence === "string" ? parseJson<unknown[]>(finding.evidence, []) : finding.evidence ?? [];
-  const locations = rawEvidence.flatMap((entry) => {
-    if (!entry || typeof entry !== "object") return [];
-    const value = entry as Record<string, unknown>;
-    return [value.file, value.path, value.symbol]
-      .filter((part): part is string => typeof part === "string")
-      .map(normalizeFindingText);
-  }).sort();
-  return sha256(JSON.stringify({
-    category: normalizeFindingText(finding.category ?? "correctness"),
-    scope: normalizeFindingText(finding.scope ?? "in_scope"),
-    locations: [...new Set(locations)],
-    requiredAction: normalizeFindingText(finding.requiredAction),
-    description: normalizeFindingText(finding.description),
-  }));
-}
-
-function mergeEvidence(existing: unknown[], incoming: unknown[]): unknown[] {
-  const seen = new Set(existing.map((entry) => JSON.stringify(entry)));
-  const merged = [...existing];
-  for (const entry of incoming) {
-    const encoded = JSON.stringify(entry);
-    if (!seen.has(encoded)) {
-      seen.add(encoded);
-      merged.push(entry);
-    }
-  }
-  return merged;
 }
 
 function rowToWorkOrder(row: MissionWorkOrderRow) {
@@ -1232,15 +973,6 @@ function rowToEvidence(row: MissionEvidenceRow) {
     details: parseJson(row.detailsJson, {}),
     createdAt: row.createdAt,
   };
-}
-
-function criterionSourceAllowed(verificationType: string, source: MissionEvidenceSource): boolean {
-  if (verificationType === "test") return source === "server_test_runner";
-  if (verificationType === "runtime_behavior") return source === "runtime_probe";
-  if (["code_inspection", "security_review", "manual_review"].includes(verificationType)) {
-    return source === "reviewer_manual_attestation";
-  }
-  return false;
 }
 
 function rowToCompletionReport(row: MissionCompletionReportRow) {

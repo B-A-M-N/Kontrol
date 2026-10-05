@@ -167,6 +167,11 @@ Current implementation contracts:
   `verified_resolved` findings require independent evidence against the exact
   current submission. `snapshotKind` plus `snapshotRef` is canonical;
   `snapshotCommit` is accepted only as a matching compatibility alias.
+- Mission contract validation and identity, evidence qualification, finding
+  transitions, effective outcome evaluation, and correction-loop policy are
+  owned by `src/mission/` authority modules. `src/mission-ledger.ts` persists
+  records and assembles packets; callers must consume its effective projections
+  rather than infer completion from stored status fields.
 - Both supervised public entry paths use the same mission contract and
   reviewer-gated completion policy. Correction rounds are separate from the
   supervisor emergency cycle ceiling. Baseline capture is required before a
