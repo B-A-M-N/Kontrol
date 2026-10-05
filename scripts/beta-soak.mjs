@@ -5,9 +5,10 @@
 // enough counters to distinguish a clean run from an interrupted or partially
 // reachable run. Every MCP transport opened by the soak is closed; continuity
 // is exercised by opening a fresh transport on each iteration.
-import { mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { validateBetaFaultMatrix } from "./beta-soak-contract.mjs";
 
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 
@@ -30,6 +31,7 @@ const readPath = String(option("--read-path", "AGENTS.md"));
 const diagnosticsSecret = option("--diagnostics-secret", process.env.KONTROL_DIAGNOSTICS_SECRET);
 const tunnelUrl = String(option("--tunnel-url", process.env.KONTROL_BETA_TUNNEL_URL ?? "http://127.0.0.1:8080")).replace(/\/$/, "");
 const expectedBuildId = option("--build-id", process.env.KONTROL_BETA_BUILD_ID);
+const codeReceiptPath = resolve(process.env.KONTROL_BETA_CODE_RECEIPT ?? join(root, "beta-code-qualification.json"));
 const skipDiagnostics = process.argv.includes("--skip-diagnostics");
 const skipTunnel = process.argv.includes("--skip-tunnel");
 // P1: approval-continuity qualification. ChatGPT and similar tunnel
@@ -44,6 +46,28 @@ const approvalCadence = Math.max(1, Number(option("--approval-cadence", "10")));
 if (!Number.isInteger(resourceReadCadence) || resourceReadCadence < 1) {
   throw new Error("--resource-read-cadence must be a positive integer");
 }
+
+function readSupervisedMissionLoopQualification() {
+  try {
+    const codeReceipt = JSON.parse(readFileSync(codeReceiptPath, "utf8"));
+    const matrixCheck = validateBetaFaultMatrix(codeReceipt.faultMatrix, { candidateBuildId: expectedBuildId });
+    return {
+      qualified: codeReceipt.codeQualified === true
+        && codeReceipt.candidate?.buildId === expectedBuildId
+        && matrixCheck.valid,
+      codeReceiptPath,
+      codeBuildId: codeReceipt.candidate?.buildId,
+      missingCases: matrixCheck.missing,
+      buildMatches: matrixCheck.buildMatches,
+    };
+  } catch (error) {
+    return {
+      qualified: false,
+      codeReceiptPath,
+      reason: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
 const deadline = Date.now() + hours * 60 * 60_000;
 let stopping = false;
 let rpcCounter = 0;
@@ -56,6 +80,7 @@ const report = {
   intervalMs,
   conversationId,
   expectedBuildId,
+  supervisedMissionLoopQualification: readSupervisedMissionLoopQualification(),
   status: "running",
   iterations: 0,
   workspaceAppResourceReads: 0,
@@ -779,6 +804,7 @@ if (startedSnapshot && finishedSnapshot) {
     conversationContinuityProven: report.conversationContinuityRuns === 0
       ? report.reconnects === 0 // short soak: nothing to prove
       : report.conversationContinuitySuccesses === report.conversationContinuityRuns,
+    supervisedMissionLoopQualified: report.supervisedMissionLoopQualification.qualified === true,
   };
 }
 report.status = stopping ? "interrupted" : (report.failures === 0 ? "passed" : "failed");

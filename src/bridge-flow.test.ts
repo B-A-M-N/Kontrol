@@ -119,6 +119,8 @@ const reviewCheckpoints = {
     summary: reviewPatch ? { files: 1, additions: 1, removals: 1 } : { files: 0, additions: 0, removals: 0 },
       files: reviewPatch ? [{ path: "x.txt", operation: "update", additions: 1, removals: 1 }] : [],
       snapshotCommit: currentSnapshot,
+      snapshotKind: "git",
+      snapshotRef: currentSnapshot,
     }),
   reviewChangesAgainstCommit: async ({ baselineCommit }: { baselineCommit: string }) => ({
     patch: baselineCommit === currentSnapshot ? "" : reviewPatch || "diff --git a/x.txt b/x.txt\n",
@@ -192,6 +194,7 @@ try {
   agentUrl = `http://127.0.0.1:${port}`;
   agentRegistry.register({ name: "cli-coding-agent", url: agentUrl, role: "agent", ttlSeconds: 600 });
   agentRegistry.register({ name: "mimo-code", url: agentUrl, role: "agent", ttlSeconds: 600 });
+  agentRegistry.register({ name: "codex", url: agentUrl, role: "agent", capabilities: ["native:openai"], ttlSeconds: 600 });
 
   // ACP HTTP server so we can POST real adapter lifecycle events (defect #1/#4).
   const acpApp = express();
@@ -230,6 +233,12 @@ try {
   registerBridgeTools(workerServer as any, { ...config, principalRole: "worker" });
   const reviewerServer = fakeServer();
   registerBridgeTools(reviewerServer as any, { ...config, principalRole: "reviewer" });
+  const reviewerOpenAIServer = fakeServer();
+  registerBridgeTools(reviewerOpenAIServer as any, {
+    ...config,
+    principalRole: "reviewer",
+    connectionContext: { clientPlatformHint: "ChatGPT OpenAI" },
+  });
   const reviewerOwnerAServer = fakeServer();
   registerBridgeTools(reviewerOwnerAServer as any, { ...config, principalRole: "reviewer", connectionConversationId: "owner-a" });
   const reviewerOwnerBServer = fakeServer();
@@ -243,6 +252,7 @@ try {
   registerPolicyTools(reviewerServer as any, { eventStore, policyEngine, approvalRequests, principalRole: "reviewer" });
   const callWorker = (name: string, args: any) => workerServer.handlers.get(name)!(args);
   const callReviewer = (name: string, args: any) => reviewerServer.handlers.get(name)!(args);
+  const callOpenAIReviewer = (name: string, args: any) => reviewerOpenAIServer.handlers.get(name)!(args);
   const callOwnerA = (name: string, args: any) => reviewerOwnerAServer.handlers.get(name)!(args);
   const callOwnerB = (name: string, args: any) => reviewerOwnerBServer.handlers.get(name)!(args);
   const callTransportA = (name: string, args: any) => reviewerTransportAServer.handlers.get(name)!(args);
@@ -593,7 +603,7 @@ try {
       completionPolicy: "webui_approval_required",
     }).id;
     const legacy = await callReviewer("submit_to_coding_agent", { task: "legacy exposed schema", sessionId: legacySessionId });
-    assert.ok(!legacy.isError, "legacy sessionId alias resolves workspace from existing work session");
+    assert.ok(!legacy.isError, `legacy sessionId alias resolves workspace from existing work session: ${JSON.stringify(legacy)}`);
     assert.equal(legacy.structuredContent.workSessionId, legacySessionId);
     assert.equal(receivedRuns.at(-1)?.workspace_root, "/tmp", "legacy alias dispatch still supplies workspace_root");
     await callReviewer("cancel_work_session", { sessionId: legacySessionId });
@@ -615,6 +625,109 @@ try {
     assert.equal(receivedRuns.at(-1)?.agent_name, "mimo-code", "initial dispatch uses selected agent name");
     await callReviewer("cancel_work_session", { sessionId: mimo.structuredContent.workSessionId });
     reviewWorkflow.finalizeCancellation({ sessionId: mimo.structuredContent.workSessionId, reason: "test adapter stopped" });
+
+    const genericHarness = await callOpenAIReviewer("submit_to_coding_agent", {
+      task: "use the platform-native registered ACP harness",
+      workspaceSessionId: WS,
+    });
+    assert.ok(!genericHarness.isError, `omitted agentName selects a healthy registered ACP peer: ${JSON.stringify(genericHarness)}`);
+    assert.equal(agentRegistry.getRun(genericHarness.structuredContent.runId)!.agentName, "codex",
+      "ChatGPT/OpenAI requests prefer the registered Codex harness");
+    await callReviewer("cancel_work_session", { sessionId: genericHarness.structuredContent.workSessionId });
+    reviewWorkflow.finalizeCancellation({ sessionId: genericHarness.structuredContent.workSessionId, reason: "test adapter stopped" });
+
+    // Both public supervised entry points must apply the same mission and
+    // supervisor policy. The platform-native choice is a routing preference;
+    // the bounded, healthy registry remains the dispatch authority.
+    const missionOptions = {
+      desiredOutcome: "A correct and reviewed outcome",
+      constraints: ["keep the API stable"],
+      nonGoals: ["do not rewrite unrelated modules"],
+      acceptanceCriteria: [{
+        id: "entry-path-test",
+        description: "Declared verification passes",
+        priority: "required" as const,
+        verificationType: "test" as const,
+        verificationCommand: "npm --version",
+      }],
+      supervisorInstructions: "Supervisor-only review guidance",
+      maxCorrectionRounds: 2,
+      maxWallTimeMinutes: 3,
+      finalVerification: ["npm --version"],
+      reviewCoverage: ["correctness"],
+      autonomyMode: "verify_only" as const,
+      approvalMode: "human_required" as const,
+    };
+    const missionWorkOrder = {
+      objectiveForThisTurn: "Implement the declared outcome",
+      requiredActions: ["preserve public compatibility"],
+      prohibitedActions: ["change unrelated APIs"],
+      requiredVerification: ["npm --version"],
+      expectedDeliverables: ["reviewable implementation"],
+      contextReferences: ["AGENTS.md"],
+    };
+    const begun = await callOpenAIReviewer("begin_supervised_work", {
+      workspaceSessionId: WS,
+      objective: "Entry path parity mission",
+      ...missionOptions,
+      workOrder: missionWorkOrder,
+    });
+    assert.equal(begun.isError, undefined, `begin_supervised_work should dispatch: ${JSON.stringify(begun)}`);
+    const begunId = begun.structuredContent.workSessionId;
+    const begunMission = missionLedger.getMissionByWorkSession(begunId)!;
+    const begunPacket = missionLedger.getPacket(begunId);
+    const begunSupervisor = supervisorRuns.getByWorkSession(begunId)!;
+    assert.equal(agentRegistry.getRun(begun.structuredContent.runId)?.agentName, "codex");
+    assert.equal(workSessions.get(begunId)?.completionPolicy, "webui_approval_required");
+    assert.equal(begunSupervisor.maxCycles, 25, "mission correction rounds never replace the supervisor emergency cycle ceiling");
+    assert.equal(begunSupervisor.autonomyMode, missionOptions.autonomyMode);
+    assert.equal(begunSupervisor.approvalMode, missionOptions.approvalMode);
+    assert.deepEqual(begunMission.constraints, missionOptions.constraints);
+    assert.deepEqual(begunMission.nonGoals, missionOptions.nonGoals);
+    assert.equal(begunMission.baselineRef, currentSnapshot);
+    assert.deepEqual(begunPacket.workOrders[0]?.requiredVerification, missionWorkOrder.requiredVerification);
+    const begunPrompt = JSON.stringify(receivedRuns.at(-1));
+    for (const requiredContractField of ["keep the API stable", "do not rewrite unrelated modules", "npm --version", "preserve public compatibility"]) {
+      assert.ok(begunPrompt.includes(requiredContractField), `dispatched mission prompt includes ${requiredContractField}`);
+    }
+    await callReviewer("cancel_work_session", { sessionId: begunId });
+    reviewWorkflow.finalizeCancellation({ sessionId: begunId, reason: "mission entry parity complete" });
+
+    const delegatedMissionOptions = {
+      ...missionOptions,
+      acceptanceCriteria: missionOptions.acceptanceCriteria.map((criterion) => ({ ...criterion, id: "delegated-entry-path-test" })),
+    };
+    const delegatedMission = await callOpenAIReviewer("submit_to_coding_agent", {
+      task: "Entry path parity mission",
+      workspaceSessionId: WS,
+      completionPolicy: "agent_completion",
+      missionContract: { objective: "Entry path parity mission", ...delegatedMissionOptions, workOrder: missionWorkOrder },
+    });
+    assert.equal(delegatedMission.isError, undefined, `mission-bearing delegation should dispatch: ${JSON.stringify(delegatedMission)}`);
+    const delegatedId = delegatedMission.structuredContent.workSessionId;
+    const delegatedContract = missionLedger.getMissionByWorkSession(delegatedId)!;
+    const delegatedPacket = missionLedger.getPacket(delegatedId);
+    const delegatedSupervisor = supervisorRuns.getByWorkSession(delegatedId)!;
+    assert.equal(agentRegistry.getRun(delegatedMission.structuredContent.runId)?.agentName, "codex");
+    assert.equal(workSessions.get(delegatedId)?.completionPolicy, "webui_approval_required", "mission-bearing delegation forces reviewer approval");
+    assert.equal(delegatedSupervisor.maxCycles, 25, "the delegation entry path preserves the separate emergency cycle ceiling");
+    assert.equal(delegatedSupervisor.autonomyMode, begunSupervisor.autonomyMode);
+    assert.equal(delegatedSupervisor.approvalMode, begunSupervisor.approvalMode);
+    assert.equal(delegatedContract.objective, begunMission.objective);
+    assert.deepEqual(delegatedContract.constraints, begunMission.constraints);
+    assert.deepEqual(delegatedContract.nonGoals, begunMission.nonGoals);
+    const criterionProjection = (criteria: typeof begunPacket.criteria) => criteria.map((criterion) => ({
+      description: criterion.description,
+      priority: criterion.priority,
+      verificationType: criterion.verificationType,
+      verificationCommand: criterion.verificationCommand,
+    }));
+    assert.deepEqual(criterionProjection(delegatedPacket.criteria), criterionProjection(begunPacket.criteria));
+    assert.equal(delegatedContract.baselineKind, begunMission.baselineKind);
+    assert.equal(delegatedContract.baselineRef, begunMission.baselineRef);
+    assert.deepEqual(delegatedPacket.workOrders[0]?.requiredVerification, begunPacket.workOrders[0]?.requiredVerification);
+    await callReviewer("cancel_work_session", { sessionId: delegatedId });
+    reviewWorkflow.finalizeCancellation({ sessionId: delegatedId, reason: "mission entry parity complete" });
 
     const unsafeUrl = await callReviewer("call_acp_agent", {
       agentName: "cli-coding-agent",
@@ -1073,7 +1186,11 @@ try {
 
   // ── Scenario: anti-runaway loop guard stops a non-converging correction loop ──
   {
-    const sessionId = workSessions.create({ workspaceSessionId: VERIFY_WS, submittedBy: "webui" }).id;
+    const sessionId = workSessions.create({
+      workspaceSessionId: VERIFY_WS,
+      submittedBy: "webui",
+      completionPolicy: "webui_approval_required",
+    }).id;
     currentSnapshot = "verification-snapshot";
     missionLedger.createMission({
       workSessionId: sessionId, workspaceSessionId: VERIFY_WS, objective: "Verify command",
@@ -1092,6 +1209,14 @@ try {
     const latest = workSessions.get(sessionId)?.latestSubmission;
     assert.ok(latest?.id && latest.snapshotCommit);
     assert.equal(missionLedger.canApprove(sessionId, { submissionId: latest.id, snapshotCommit: latest.snapshotCommit }).allowed, true, "current final integration report enables approval");
+    currentSnapshot = "verification-workspace-mutated";
+    await assert.rejects(
+      () => callReviewer("approve_supervised_work", { workSessionId: sessionId }),
+      /Workspace snapshot changed since submission/,
+      "mission approval refuses a workspace that changed after the verified submission",
+    );
+    assert.equal(workSessions.get(sessionId)?.status, "awaiting_review", "stale mission approval leaves the exact submission pending");
+    currentSnapshot = "verification-snapshot";
     const approved = await callReviewer("approve_supervised_work", { workSessionId: sessionId });
     assert.equal(approved.isError, undefined, "approval accepts the current completion report");
     assert.equal(workSessions.get(sessionId)?.latestFeedback?.completionReportSha256, packet.completionReports[0]?.reportSha256, "approval feedback is bound to the exact completion report hash");
@@ -1106,7 +1231,7 @@ try {
       workSessionId: sessionId,
       workspaceSessionId: WS,
       objective: "Add feature Y",
-      acceptanceCriteria: [{ id: "y-crit", description: "Feature Y works", priority: "required", verificationType: "test" }],
+      acceptanceCriteria: [{ id: "y-crit", description: "Feature Y works", priority: "required", verificationType: "test", verificationCommand: "npm --version" }],
       maxCorrectionRounds: 1,
     });
     await callWorker("submit_for_review", { sessionId });
@@ -1130,8 +1255,15 @@ try {
       findings: [{ description: "also breaks on null", requiredAction: "handle null", severity: "blocker", scope: "in_scope" }],
       workOrder: wo,
     });
-    assert.equal(r2.structuredContent?.status, "ceiling_reached", "non-converging runaway hits the ceiling backstop");
+    assert.equal(r2.structuredContent?.status, "awaiting_human", "non-converging runaway stops automatic dispatch at the ceiling");
     assert.equal(r2.structuredContent?.extension?.ceilingHit, true);
+
+    const converged = await callReviewer("continue_supervised_work", {
+      workSessionId: sessionId,
+      comments: "Review the current result without adding another blocking issue.",
+      workOrder: wo,
+    });
+    assert.equal(converged.structuredContent?.status, "converged", "a converged loop cannot dispatch another correction round");
 
     // An out-of-scope finding must NOT gate approval on its own.
     const mid = missionLedger.getMissionByWorkSession(sessionId)!;

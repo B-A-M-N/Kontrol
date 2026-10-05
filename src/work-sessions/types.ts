@@ -160,7 +160,7 @@ export interface WorkspaceLease {
   workSessionId: string;
   leaseKind: "modify";
   ownerInstanceId: string;
-  /** Per-acquisition fencing token. A valid owner with an old nonce is stale. */
+  /** Owner-generation fencing token. Explicit takeover rotates it; renewal preserves it. */
   leaseNonce: string;
   acquiredAt: string;
   heartbeatAt: string;

@@ -4,16 +4,93 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { createMissionLedger } from "./mission-ledger.js";
+import { normalizeWorkspaceSnapshotIdentity } from "./review-checkpoints.js";
 import { createWorkSessionManager } from "./work-sessions.js";
 import { databasePath, openDatabase } from "./db/client.js";
 
 const root = mkdtempSync(join(tmpdir(), "kontrol-mission-ledger-test-"));
 
 try {
+  assert.deepEqual(normalizeWorkspaceSnapshotIdentity({ snapshotRef: "fs:sha256:abc", snapshotCommit: "fs:sha256:abc" }), {
+    kind: "filesystem",
+    ref: "fs:sha256:abc",
+  });
+  assert.throws(() => normalizeWorkspaceSnapshotIdentity({
+    snapshotKind: "git",
+    snapshotRef: "snapshot-modern",
+    snapshotCommit: "snapshot-legacy",
+  }), /Conflicting snapshotRef and legacy snapshotCommit/);
+  assert.throws(() => normalizeWorkspaceSnapshotIdentity({ snapshotKind: "git", snapshotRef: "fs:sha256:abc" }), /conflicts with snapshot reference/);
+  assert.throws(() => normalizeWorkspaceSnapshotIdentity({ snapshotKind: "git" }), /without a snapshot reference/);
+
   const db = openDatabase(root);
   seedWorkspace(root, "workspace-1");
   const workSessions = createWorkSessionManager(db);
   const ledger = createMissionLedger(db);
+  const invalidTestSession = workSessions.create({ workspaceSessionId: "workspace-1", submittedBy: "webui" });
+  assert.throws(() => ledger.createMission({
+    workSessionId: invalidTestSession.id,
+    workspaceSessionId: "workspace-1",
+    objective: "invalid test criterion",
+    acceptanceCriteria: [{ id: "missing-command", description: "needs a real test", verificationType: "test" }],
+  }), /requires a verificationCommand/);
+  const invalidRuntimeSession = workSessions.create({ workspaceSessionId: "workspace-1", submittedBy: "webui" });
+  assert.throws(() => ledger.createMission({
+    workSessionId: invalidRuntimeSession.id,
+    workspaceSessionId: "workspace-1",
+    objective: "invalid runtime criterion",
+    acceptanceCriteria: [{ id: "missing-probe", description: "needs a real probe", verificationType: "runtime_behavior" }],
+  }), /requires a runtimeProbe/);
+  const runtimeSession = workSessions.create({ workspaceSessionId: "workspace-1", submittedBy: "webui" });
+  const runtimeMission = ledger.createMission({
+    workSessionId: runtimeSession.id,
+    workspaceSessionId: "workspace-1",
+    objective: "verify a runtime behavior",
+    acceptanceCriteria: [{
+      id: "runtime-criterion",
+      description: "health endpoint responds",
+      verificationType: "runtime_behavior",
+      runtimeProbe: { url: "http://127.0.0.1:7676/healthz", expectedStatus: 200 },
+    }],
+  });
+  const runtimeSubmission = workSessions.submitForReview({
+    workSessionId: runtimeSession.id,
+    diff: "runtime probe target",
+    snapshotKind: "git",
+    snapshotRef: "runtime-snapshot",
+    snapshotCommit: "runtime-snapshot",
+  });
+  const runtimeContext = {
+    submissionId: runtimeSubmission.id,
+    snapshotKind: "git" as const,
+    snapshotRef: "runtime-snapshot",
+    snapshotCommit: "runtime-snapshot",
+    reviewEpoch: runtimeSubmission.reviewEpoch,
+  };
+  assert.throws(() => ledger.recordRuntimeProbeEvidence(runtimeMission.id, [{
+    criterionId: "runtime-criterion",
+    submissionId: runtimeSubmission.id,
+    reviewEpoch: runtimeSubmission.reviewEpoch,
+    snapshotKind: "git",
+    snapshotRef: "snapshot-modern",
+    snapshotCommit: "snapshot-legacy",
+    status: "passed",
+    command: "GET http://127.0.0.1:7676/healthz",
+  }]), /Conflicting snapshotRef and legacy snapshotCommit/);
+  assert.throws(() => ledger.recordReviewerEvidence(runtimeMission.id, [{
+    criterionId: "runtime-criterion",
+    ...runtimeContext,
+    status: "passed",
+  }]), /cannot satisfy runtime_behavior criterion/);
+  ledger.recordRuntimeProbeEvidence(runtimeMission.id, [{
+    criterionId: "runtime-criterion",
+    ...runtimeContext,
+    status: "passed",
+    command: "GET http://127.0.0.1:7676/healthz",
+    details: { statusCode: 200 },
+  }]);
+  assert.equal(ledger.canApprove(runtimeSession.id, runtimeContext).allowed, true,
+    "only a server runtime probe can satisfy runtime_behavior criteria");
   const session = workSessions.create({
     workspaceSessionId: "workspace-1",
     submittedBy: "webui",
@@ -25,60 +102,79 @@ try {
     workspaceSessionId: "workspace-1",
     objective: "Fix the bridge",
     acceptanceCriteria: [
-      { id: "crit-tests", description: "Regression tests pass", priority: "required", verificationType: "test" },
+      { id: "crit-tests", description: "Regression tests pass", priority: "required", verificationType: "test", verificationCommand: "npm test" },
       { id: "crit-docs", description: "Docs are coherent", priority: "preferred", verificationType: "manual_review" },
     ],
   });
+  assert.equal(ledger.createMission({
+    workSessionId: session.id,
+    workspaceSessionId: "workspace-1",
+    objective: "Fix the bridge",
+    acceptanceCriteria: [
+      { id: "crit-tests", description: "Regression tests pass", priority: "required", verificationType: "test", verificationCommand: "npm test" },
+      { id: "crit-docs", description: "Docs are coherent", priority: "preferred", verificationType: "manual_review" },
+    ],
+  }).id, mission.id, "identical mission creation is idempotent");
+  assert.throws(() => ledger.createMission({
+    workSessionId: session.id,
+    workspaceSessionId: "workspace-1",
+    objective: "Silently replace the original contract",
+    acceptanceCriteria: [{ id: "crit-tests", description: "Regression tests pass", priority: "required", verificationType: "test", verificationCommand: "npm test" }],
+  }), /Mission contract conflict/, "different mission intent cannot be silently ignored");
+
+  const firstSubmission = workSessions.submitForReview({
+    workSessionId: session.id,
+    diff: "diff --git a/src/bridge.ts b/src/bridge.ts",
+    snapshotKind: "git",
+    snapshotRef: "snap-current",
+    snapshotCommit: "snap-current",
+  });
+  const firstContext = { submissionId: firstSubmission.id, snapshotKind: "git" as const, snapshotRef: "snap-current", snapshotCommit: "snap-current", reviewEpoch: firstSubmission.reviewEpoch };
 
   let approval = ledger.canApprove(session.id);
   assert.equal(approval.allowed, false);
   assert.match(approval.reasons.join("\n"), /crit-tests/);
 
-  ledger.recordEvidence(mission.id, [{
+  assert.throws(() => ledger.recordReviewerEvidence(mission.id, [{
     criterionId: "crit-tests",
-    submissionId: "sub-old",
-    snapshotCommit: "snap-old",
+    ...firstContext,
     status: "passed",
     command: "npm test",
-    details: { exitCode: 0 },
-  }]);
-  approval = ledger.canApprove(session.id, { submissionId: "sub-current", snapshotCommit: "snap-current" });
-  assert.equal(approval.allowed, false);
-  assert.match(approval.reasons.join("\n"), /no current non-agent evidence/);
-
+    details: { exitCode: 0, reviewerClaim: true },
+  }]), /cannot satisfy test criterion/, "manual reviewer evidence cannot certify a test criterion");
   ledger.recordAgentEvidence(mission.id, [{
     criterionId: "crit-tests",
-    submissionId: "sub-current",
-    snapshotCommit: "snap-current",
+    ...firstContext,
     status: "passed",
     command: "npm test",
     details: { claimed: true },
   }]);
-  approval = ledger.canApprove(session.id, { submissionId: "sub-current", snapshotCommit: "snap-current" });
-  assert.equal(approval.allowed, false);
+  approval = ledger.canApprove(session.id, firstContext);
+  assert.equal(approval.allowed, false, "agent claims cannot satisfy an automated criterion");
 
-  ledger.recordEvidence(mission.id, [{
+  ledger.recordVerifierEvidence(mission.id, [{
     criterionId: "crit-tests",
-    submissionId: "sub-current",
-    snapshotCommit: "snap-current",
-    status: "passed",
-    command: "npm test",
-    reviewEpoch: 1,
-    details: { exitCode: 0 },
-  }]);
-  approval = ledger.canApprove(session.id, { submissionId: "sub-current", snapshotCommit: "snap-current", reviewEpoch: 2 });
-  assert.equal(approval.allowed, false, "evidence from an older review epoch cannot approve the current card");
-  ledger.recordEvidence(mission.id, [{
-    criterionId: "crit-tests",
-    submissionId: "sub-current",
-    snapshotCommit: "snap-current",
-    reviewEpoch: 2,
+    ...firstContext,
     status: "passed",
     command: "npm test",
     details: { exitCode: 0 },
   }]);
-  approval = ledger.canApprove(session.id, { submissionId: "sub-current", snapshotCommit: "snap-current", reviewEpoch: 2 });
+  approval = ledger.canApprove(session.id, firstContext);
   assert.equal(approval.allowed, true);
+
+  workSessions.updateStatus(session.id, "changes_requested");
+  const currentSubmission = workSessions.submitForReview({
+    workSessionId: session.id,
+    diff: "diff --git a/src/bridge.ts b/src/bridge.ts",
+    snapshotKind: "git",
+    snapshotRef: "snap-current",
+    snapshotCommit: "snap-current",
+  });
+  const currentContext = { submissionId: currentSubmission.id, snapshotKind: "git" as const, snapshotRef: "snap-current", snapshotCommit: "snap-current", reviewEpoch: currentSubmission.reviewEpoch };
+  approval = ledger.canApprove(session.id, currentContext);
+  assert.equal(approval.allowed, false, "evidence from the prior review epoch is stale");
+  ledger.recordVerifierEvidence(mission.id, [{ criterionId: "crit-tests", ...currentContext, status: "passed", command: "npm test", details: { exitCode: 0 } }]);
+  assert.equal(ledger.canApprove(session.id, currentContext).allowed, true);
 
   ledger.addFindings(mission.id, [{
     id: "find-security",
@@ -86,16 +182,45 @@ try {
     category: "security",
     description: "Permission request is one-way only",
     requiredAction: "Return the WebUI decision to the blocked agent",
+    requiredVerification: [],
   }]);
-  approval = ledger.canApprove(session.id, { submissionId: "sub-current", snapshotCommit: "snap-current" });
+  approval = ledger.canApprove(session.id, currentContext);
   assert.equal(approval.allowed, false);
   assert.match(approval.reasons.join("\n"), /find-security/);
 
-  ledger.updateFindingStatus(mission.id, [{ id: "find-security", status: "verified_resolved" }]);
+  assert.throws(() => (ledger.updateFindingStatus as any)(mission.id, [{ id: "find-security", status: "verified_resolved", resolutionSubmissionId: currentSubmission.id }]), /cannot be directly marked verified_resolved/);
+  ledger.updateFindingStatus(mission.id, [{ id: "find-security", status: "claimed_resolved" }]);
+  ledger.recordReviewerEvidence(mission.id, [{
+    findingId: "find-security",
+    ...firstContext,
+    status: "passed",
+    details: { reviewerIndependentlyConfirmed: true },
+  }]);
+  assert.throws(() => ledger.resolveFinding(mission.id, "find-security", currentContext), /no independent evidence for the current submitted snapshot/);
+  ledger.recordReviewerEvidence(mission.id, [{
+    findingId: "find-security",
+    ...currentContext,
+    status: "passed",
+    details: { reviewerIndependentlyConfirmed: true },
+  }]);
+  const [findingWithCommand] = ledger.addFindings(mission.id, [{
+    id: "find-test-required",
+    severity: "high",
+    description: "Automated finding requires a regression test",
+    requiredAction: "Fix the defect",
+    requiredVerification: ["npm test"],
+  }]);
+  ledger.updateFindingStatus(mission.id, [{ id: findingWithCommand.id, status: "claimed_resolved" }]);
+  assert.throws(() => ledger.recordReviewerEvidence(mission.id, [{ findingId: findingWithCommand.id, ...currentContext, status: "passed" }]), /cannot satisfy finding/);
+  ledger.recordVerifierEvidence(mission.id, [{ findingId: findingWithCommand.id, ...currentContext, status: "passed", command: "npm test", details: { exitCode: 0 } }]);
+  const resolution = ledger.resolveFinding(mission.id, "find-security", currentContext);
+  assert.ok(resolution.evidenceIds.length > 0);
+  ledger.resolveFinding(mission.id, findingWithCommand.id, currentContext);
   const packet = ledger.getPacket(session.id);
-  assert.equal(ledger.canApprove(session.id, { submissionId: "sub-current", snapshotCommit: "snap-current" }).allowed, true);
-  assert.equal(packet.evidence.length, 4);
-  assert.equal(packet.findings[0].status, "verified_resolved");
+  assert.equal(ledger.canApprove(session.id, currentContext).allowed, true);
+  assert.equal(packet.evidence.length, 6);
+  assert.equal(packet.findings.find((finding) => finding.id === "find-security")?.status, "verified_resolved");
+  assert.ok(packet.findings.find((finding) => finding.id === findingWithCommand.id)?.resolutionEvidenceIds.length);
 
   assert.throws(
     () => ledger.updateFindingStatus(mission.id, [{ id: "find-security", status: "waived" }]),
@@ -123,7 +248,7 @@ try {
     workSessionId: loopSession.id,
     workspaceSessionId: "workspace-1",
     objective: "Add feature X",
-    acceptanceCriteria: [{ id: "loop-crit", description: "Feature X works", priority: "required", verificationType: "test" }],
+    acceptanceCriteria: [{ id: "loop-crit", description: "Feature X works", priority: "required", verificationType: "test", verificationCommand: "npm test" }],
     maxCorrectionRounds: 2,
   });
 
@@ -244,7 +369,7 @@ try {
     workSessionId: progressSession.id,
     workspaceSessionId: "workspace-1",
     objective: "Iterate with progress",
-    acceptanceCriteria: [{ id: "p-crit", description: "works", priority: "required", verificationType: "test" }],
+    acceptanceCriteria: [{ id: "p-crit", description: "works", priority: "required", verificationType: "test", verificationCommand: "npm test" }],
     maxCorrectionRounds: 1,
   });
   const [pf1] = ledger.addFindings(progressMission.id, [{ description: "b1", requiredAction: "fix", severity: "blocker", scope: "in_scope" }]);
@@ -293,6 +418,107 @@ try {
       { id: "b", description: "b", priority: "required", dependsOnCriterionIds: ["a"] },
     ],
   }), /dependency cycle/);
+
+  // A restart between a failed first pass and correction resubmission must
+  // preserve the mission contract while keeping snapshot-A evidence stale.
+  const restartRoot = mkdtempSync(join(root, "mission-restart-"));
+  const restartBootstrapDb = openDatabase(restartRoot);
+  restartBootstrapDb.close();
+  seedWorkspace(restartRoot, "workspace-restart");
+  let restartDb = openDatabase(restartRoot);
+  let restartSessions = createWorkSessionManager(restartDb);
+  let restartLedger = createMissionLedger(restartDb);
+  const restartSession = restartSessions.create({
+    workspaceSessionId: "workspace-restart",
+    submittedBy: "webui",
+    completionPolicy: "webui_approval_required",
+  });
+  const restartMission = restartLedger.createMission({
+    workSessionId: restartSession.id,
+    workspaceSessionId: "workspace-restart",
+    objective: "Correct and verify after restart",
+    acceptanceCriteria: [{
+      id: "restart-test",
+      description: "Regression test passes on the submitted snapshot",
+      priority: "required",
+      verificationType: "test",
+      verificationCommand: "npm --version",
+    }],
+  });
+  const [restartFinding] = restartLedger.addFindings(restartMission.id, [{
+    id: "restart-finding",
+    description: "The initial submitted snapshot fails verification",
+    requiredAction: "Correct the implementation",
+    requiredVerification: ["npm --version"],
+    severity: "blocker",
+    scope: "in_scope",
+  }]);
+  const firstRestartSubmission = restartSessions.submitForReview({
+    workSessionId: restartSession.id,
+    diff: "first attempt",
+    snapshotKind: "git",
+    snapshotRef: "restart-snapshot-a",
+    snapshotCommit: "restart-snapshot-a",
+  });
+  const firstRestartContext = {
+    submissionId: firstRestartSubmission.id,
+    snapshotKind: "git" as const,
+    snapshotRef: "restart-snapshot-a",
+    snapshotCommit: "restart-snapshot-a",
+    reviewEpoch: firstRestartSubmission.reviewEpoch,
+  };
+  restartLedger.recordVerifierEvidence(restartMission.id, [{
+    criterionId: "restart-test",
+    findingId: restartFinding.id,
+    ...firstRestartContext,
+    command: "npm --version",
+    status: "failed",
+    details: { exitCode: 1 },
+  }]);
+  restartDb.close(); // Simulated process restart: only durable state survives.
+
+  restartDb = openDatabase(restartRoot);
+  restartSessions = createWorkSessionManager(restartDb);
+  restartLedger = createMissionLedger(restartDb);
+  assert.equal(restartLedger.getMissionByWorkSession(restartSession.id)?.objective, "Correct and verify after restart");
+  assert.equal(restartLedger.getPacket(restartSession.id).evidence[0]?.submissionId, firstRestartSubmission.id,
+    "failed verifier evidence survives the restart with its original submission binding");
+  restartSessions.updateStatus(restartSession.id, "changes_requested");
+  restartLedger.updateFindingStatus(restartMission.id, [{ id: restartFinding.id, status: "claimed_resolved" }]);
+  const correctedSubmission = restartSessions.submitForReview({
+    workSessionId: restartSession.id,
+    diff: "corrected attempt",
+    snapshotKind: "git",
+    snapshotRef: "restart-snapshot-b",
+    snapshotCommit: "restart-snapshot-b",
+  });
+  const correctedContext = {
+    submissionId: correctedSubmission.id,
+    snapshotKind: "git" as const,
+    snapshotRef: "restart-snapshot-b",
+    snapshotCommit: "restart-snapshot-b",
+    reviewEpoch: correctedSubmission.reviewEpoch,
+  };
+  assert.equal(restartLedger.evaluateCriteria(restartSession.id, correctedContext)[0]?.status, "unverified",
+    "snapshot-A failure or any earlier status cannot certify snapshot B");
+  assert.throws(() => restartLedger.resolveFinding(restartMission.id, restartFinding.id, correctedContext), /missing current server verification/);
+  restartLedger.recordVerifierEvidence(restartMission.id, [{
+    criterionId: "restart-test",
+    findingId: restartFinding.id,
+    ...correctedContext,
+    command: "npm --version",
+    status: "passed",
+    details: { exitCode: 0 },
+  }]);
+  restartLedger.resolveFinding(restartMission.id, restartFinding.id, correctedContext);
+  restartLedger.recordCompletionReport(restartMission.id, {
+    ...correctedContext,
+    status: "passed",
+    results: [{ command: "npm --version", status: "passed" }],
+  });
+  assert.equal(restartLedger.canApprove(restartSession.id, correctedContext).allowed, true,
+    "fresh server evidence on the exact resubmission closes the durable mission after restart");
+  restartDb.close();
 
   ledger.close();
   console.log("mission-ledger.test.ts: all assertions passed");

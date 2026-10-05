@@ -17,6 +17,14 @@ import { createSupervisorRuntime } from "../supervisor-runtime.js";
 import { verifyMissionSubmission } from "../mission-verifier.js";
 import { evaluateSupervisorMission } from "../supervisor-evaluator.js";
 import type { ServerConfig } from "../config.js";
+import { normalizeWorkspaceSnapshotIdentity } from "../review-checkpoints.js";
+
+function submissionSnapshotFields(submission?: { snapshotKind?: "git" | "filesystem"; snapshotRef?: string; snapshotCommit?: string }) {
+  const identity = submission ? normalizeWorkspaceSnapshotIdentity(submission) : undefined;
+  return identity
+    ? { snapshotKind: identity.kind, snapshotRef: identity.ref, snapshotCommit: identity.ref }
+    : {};
+}
 
 type SupervisorRuntime = ReturnType<typeof createSupervisorRuntime>;
 type DispatchOutbox = NonNullable<BridgeConfig["dispatchOutbox"]>;
@@ -104,9 +112,7 @@ export function createAcpRuntime(deps: AcpRuntimeDeps): AcpRuntimeHandles {
       const latest = workSessions.get(workSessionId)?.latestSubmission;
       return evaluateSupervisorMission(missionLedger, workSessionId, {
         submissionId: latest?.id,
-        snapshotKind: latest?.snapshotKind,
-        snapshotRef: latest?.snapshotRef ?? latest?.snapshotCommit,
-        snapshotCommit: latest?.snapshotRef ?? latest?.snapshotCommit,
+        ...submissionSnapshotFields(latest),
         cycleNumber: run?.cycleNumber ?? 0,
         emergencyCycleCeiling: run?.maxCycles,
       });
@@ -120,9 +126,10 @@ export function createAcpRuntime(deps: AcpRuntimeDeps): AcpRuntimeHandles {
     getProgressSnapshot: (workSessionId, evaluation) => {
       const session = workSessions.get(workSessionId);
       const latest = session?.latestSubmission;
-      const packet = missionLedger.getPacket(workSessionId, latest?.id ? { submissionId: latest.id, snapshotKind: latest.snapshotKind, snapshotRef: latest.snapshotRef ?? latest.snapshotCommit, snapshotCommit: latest.snapshotRef ?? latest.snapshotCommit, reviewEpoch: latest.reviewEpoch } : undefined);
+      const packet = missionLedger.getPacket(workSessionId, latest?.id ? { submissionId: latest.id, ...submissionSnapshotFields(latest), reviewEpoch: latest.reviewEpoch } : undefined);
       const currentEvidence = packet.evidence.filter((entry) => !latest?.id || entry.submissionId === latest.id);
       const failedEvidence = currentEvidence.filter((entry) => entry.status === "failed");
+      const effectiveStatus = new Map(packet.criterionStates.map((criterion) => [criterion.criterionId, criterion.status]));
       const failureSet = failedEvidence.map((entry) => {
         const details = typeof entry.details === "object" && entry.details ? entry.details as Record<string, unknown> : {};
         return { command: entry.command, failureSetSha256: details.failureSetSha256, outputSha256: details.outputSha256, status: entry.status };
@@ -130,8 +137,8 @@ export function createAcpRuntime(deps: AcpRuntimeDeps): AcpRuntimeHandles {
       const summary = latest?.summaryJson ? (() => { try { return JSON.parse(latest.summaryJson) as { files?: number }; } catch { return {}; } })() : {};
       return {
         blockingFindingCount: packet.findings.filter((finding) => finding.scope !== "out_of_scope" && ["blocker", "high"].includes(finding.severity) && !["verified_resolved", "waived"].includes(finding.status)).length,
-        failedCriterionCount: packet.criteria.filter((criterion) => criterion.priority === "required" && criterion.status === "failed").length,
-        passedCriterionCount: packet.criteria.filter((criterion) => criterion.status === "verified").length,
+        failedCriterionCount: packet.criteria.filter((criterion) => criterion.priority === "required" && effectiveStatus.get(criterion.id) === "failed").length,
+        passedCriterionCount: packet.criterionStates.filter((criterion) => criterion.status === "verified").length,
         failingVerificationCount: failedEvidence.length,
         verificationFailureFingerprint: failureSet.length ? createHash("sha256").update(JSON.stringify(failureSet)).digest("hex") : evaluation.failureSetSha256,
         changedRelevantFiles: typeof summary.files === "number" ? summary.files : 0,
@@ -146,7 +153,8 @@ export function createAcpRuntime(deps: AcpRuntimeDeps): AcpRuntimeHandles {
       const latest = session?.latestSubmission;
       if (!mission || !latest?.id || !session) throw new Error("Cannot create a correction without a current mission submission.");
       const packet = missionLedger.getPacket(workSessionId);
-      const failedCriteria = packet.criteria.filter((criterion) => criterion.priority === "required" && criterion.status !== "verified");
+      const effectiveStatus = new Map(packet.criterionStates.map((criterion) => [criterion.criterionId, criterion.status]));
+      const failedCriteria = packet.criteria.filter((criterion) => criterion.priority === "required" && effectiveStatus.get(criterion.id) !== "verified");
       const openFindings = packet.findings.filter((finding) => finding.scope !== "out_of_scope" && ["blocker", "high"].includes(finding.severity) && !["verified_resolved", "waived"].includes(finding.status));
       const workOrder = missionLedger.createWorkOrder(mission.id, workSessionId, {
         objectiveForThisTurn: "Resolve the current failed mission verification and resubmit the exact workspace snapshot for review.",
@@ -172,18 +180,18 @@ export function createAcpRuntime(deps: AcpRuntimeDeps): AcpRuntimeHandles {
       const session = workSessions.get(workSessionId);
       if (session?.status !== "awaiting_review") return undefined;
       const submission = session.latestSubmission;
-      return submission?.id ? { id: submission.id, snapshotKind: submission.snapshotKind, snapshotRef: submission.snapshotRef ?? submission.snapshotCommit, snapshotCommit: submission.snapshotRef ?? submission.snapshotCommit, reviewEpoch: submission.reviewEpoch } : undefined;
+      return submission?.id ? { id: submission.id, ...submissionSnapshotFields(submission), reviewEpoch: submission.reviewEpoch } : undefined;
     },
     currentSessionStatus: (workSessionId) => workSessions.get(workSessionId)?.status,
     currentApproval: (workSessionId) => {
       const latest = workSessions.get(workSessionId)?.latestSubmission;
-      return missionLedger.canApprove(workSessionId, latest?.id ? { submissionId: latest.id, snapshotKind: latest.snapshotKind, snapshotRef: latest.snapshotRef ?? latest.snapshotCommit, snapshotCommit: latest.snapshotRef ?? latest.snapshotCommit, reviewEpoch: latest.reviewEpoch } : {});
+      return missionLedger.canApprove(workSessionId, latest?.id ? { submissionId: latest.id, ...submissionSnapshotFields(latest), reviewEpoch: latest.reviewEpoch } : {});
     },
     onApprove: async (workSessionId) => {
       const session = workSessions.get(workSessionId);
       const latest = session?.latestSubmission;
       if (!session || !latest?.id) throw new Error("Cannot automatically approve without a current submission.");
-      const approval = missionLedger.canApprove(workSessionId, { submissionId: latest.id, snapshotKind: latest.snapshotKind, snapshotRef: latest.snapshotRef ?? latest.snapshotCommit, snapshotCommit: latest.snapshotRef ?? latest.snapshotCommit, reviewEpoch: latest.reviewEpoch });
+      const approval = missionLedger.canApprove(workSessionId, { submissionId: latest.id, ...submissionSnapshotFields(latest), reviewEpoch: latest.reviewEpoch });
       if (!approval.allowed) throw new Error(`Automatic approval blocked: ${approval.reasons.join("; ")}`);
       await reviewWorkflow.provideFeedback({
         sessionId: workSessionId,
@@ -193,7 +201,7 @@ export function createAcpRuntime(deps: AcpRuntimeDeps): AcpRuntimeHandles {
         verdict: "approve",
         comments: "Automatically approved after current trusted mission verification.",
         reviewerId: "supervisor-runtime",
-        completionReportSha256: missionLedger.getCompletionReportHash(workSessionId, { submissionId: latest.id, snapshotKind: latest.snapshotKind, snapshotRef: latest.snapshotRef ?? latest.snapshotCommit, snapshotCommit: latest.snapshotRef ?? latest.snapshotCommit, reviewEpoch: latest.reviewEpoch }),
+        completionReportSha256: missionLedger.getCompletionReportHash(workSessionId, { submissionId: latest.id, ...submissionSnapshotFields(latest), reviewEpoch: latest.reviewEpoch }),
       });
     },
   });

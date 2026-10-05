@@ -73,7 +73,11 @@ export function renderMissionPanel(view: WorkSessionViewState): HTMLElement {
       panel.append(redrive);
     }
   }
-  const progress = packet.criteria.map((criterion) => `${criterion.status === "verified" ? "✓" : "○"} ${criterion.description} — ${humanizeStatus(criterion.status)}${criterion.dependsOnCriterionIds?.length ? ` · depends on ${criterion.dependsOnCriterionIds.join(", ")}` : ""}`);
+  const effectiveStatus = new Map((packet.criterionStates ?? []).map((state) => [state.criterionId, state.status]));
+  const progress = packet.criteria.map((criterion) => {
+    const status = effectiveStatus.get(criterion.id) ?? criterion.status;
+    return `${status === "verified" ? "✓" : "○"} ${criterion.description} — ${humanizeStatus(status)}${criterion.dependsOnCriterionIds?.length ? ` · depends on ${criterion.dependsOnCriterionIds.join(", ")}` : ""}`;
+  });
   for (const item of progress) panel.append(element("div", { className: "approval-detail", text: item }));
   const blockers = packet.approval.reasons;
   if (blockers.length) {
@@ -91,7 +95,8 @@ export function renderMissionPanel(view: WorkSessionViewState): HTMLElement {
   const refresh = element("button", { className: "feedback-btn changes", type: "button", text: "Refresh mission" });
   refresh.addEventListener("click", () => { void host.refreshMission(view); });
   panel.append(refresh);
-  if (packet.criteria.some((criterion) => criterion.verificationCommand)) {
+  if (packet.criteria.some((criterion) => criterion.verificationCommand || criterion.runtimeProbe)
+    || packet.findings.some((finding) => finding.status === "claimed_resolved" && (finding.requiredVerification?.length ?? 0) > 0)) {
     const verify = element("button", { className: "feedback-btn approve", type: "button", text: "Run declared verification" });
     verify.addEventListener("click", () => {
       if (!host.getApp()) return;
@@ -126,7 +131,8 @@ export function renderMissionCorrectionForm(view: WorkSessionViewState): HTMLEle
   finding.rows = 2;
   finding.placeholder = "Optional new blocking finding (recorded durably).";
   form.append(instructions, finding);
-  const selectedCriteria = packet.criteria.filter((criterion) => criterion.priority === "required" && criterion.status !== "verified");
+  const effectiveStatus = new Map((packet.criterionStates ?? []).map((state) => [state.criterionId, state.status]));
+  const selectedCriteria = packet.criteria.filter((criterion) => criterion.priority === "required" && (effectiveStatus.get(criterion.id) ?? criterion.status) !== "verified");
   if (selectedCriteria.length) form.append(element("div", { className: "approval-detail", text: `Targets: ${selectedCriteria.map((criterion) => criterion.description).join("; ")}` }));
   const submit = element("button", { className: "feedback-btn changes", type: "button", text: "Dispatch correction round" });
   submit.addEventListener("click", () => {
@@ -145,7 +151,7 @@ export function renderMissionCorrectionForm(view: WorkSessionViewState): HTMLEle
           objectiveForThisTurn: comments,
           acceptanceCriterionIds: selectedCriteria.map((criterion) => criterion.id),
           requiredActions: [comments],
-          requiredVerification: selectedCriteria.map((criterion) => criterion.verificationCommand).filter(Boolean),
+          requiredVerification: selectedCriteria.flatMap((criterion) => criterion.verificationCommand ? [criterion.verificationCommand] : criterion.runtimeProbe ? [`${criterion.runtimeProbe.method ?? "GET"} ${criterion.runtimeProbe.url}`] : []),
         },
         clientMutationId: host.newClientMutationId(),
       },
@@ -201,5 +207,4 @@ export function eventLabel(e: AgentActivityEvent): string {
 }
 
 // ── Event-driven watcher (replaces the 2.5s poll) ──
-
 

@@ -51,7 +51,9 @@ export interface WorkSessionManager {
     workSessionId: string;
     ownerInstanceId?: string;
     ttlMs?: number;
+    takeover?: boolean;
   }): WorkspaceLeaseResult;
+  restoreWorkspaceLeaseForSession(previous: WorkspaceLease, expectedLeaseNonce: string): boolean;
   releaseWorkspaceLeasesForSession(workSessionId: string): number;
   renewWorkspaceLeaseForSession(workSessionId: string, ttlMs: number | undefined, leaseNonce: string): number;
   getActiveWorkspaceLease(canonicalRoot: string): WorkspaceLease | undefined;
@@ -174,6 +176,7 @@ export function createWorkSessionManager(
     listByWorkspace: (workspaceSessionId, limit) => sessions.listByWorkspace(workspaceSessionId, limit),
     updateStatus: (id, status) => sessions.updateStatus(id, status),
     acquireWorkspaceLease: (input) => leases.acquireWorkspaceLease(input),
+    restoreWorkspaceLeaseForSession: (previous, expectedLeaseNonce) => leases.restoreWorkspaceLeaseForSession(previous, expectedLeaseNonce),
     releaseWorkspaceLeasesForSession: (workSessionId) => leases.releaseWorkspaceLeasesForSession(workSessionId),
     renewWorkspaceLeaseForSession: (workSessionId, ttlMs, leaseNonce) =>
       leases.renewWorkspaceLeaseForSession(workSessionId, ttlMs, leaseNonce),

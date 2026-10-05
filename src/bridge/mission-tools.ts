@@ -10,10 +10,51 @@ import type { BridgeConfig } from "./context.js";
 import { selectHealthyAgent } from "../acp-gateway.js";
 import { verifyMissionSubmission } from "../mission-verifier.js";
 import { registerMutationAppTool } from "./app-tool.js";
-import { criterionUpdateSchema, dispatchAgentTask, findingSchema, findingUpdateSchema, missionCriterionSchema, supervisorPacket, workOrderSchema } from "./context.js";
-import { acquireCheckoutModifyLease, forbidden, isReviewer, liveOwnerContextId, requireWorkSessionMutation, requireWorkSessionRead, renderMissionPrompt, workspaceAppModelAndAppMeta } from "./shared.js";
+import { criterionUpdateSchema, dispatchAgentTask, findingSchema, findingUpdateSchema, supervisedMissionOptionsSchema, supervisorPacket, workOrderSchema } from "./context.js";
+import { acquireCheckoutModifyLease, captureMissionBaseline, forbidden, isReviewer, liveOwnerContextId, requireWorkSessionMutation, requireWorkSessionRead, renderMissionPrompt, workspaceAppModelAndAppMeta } from "./shared.js";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
 import { z } from "zod/v4";
+import { normalizeWorkspaceSnapshotIdentity } from "../review-checkpoints.js";
+
+function snapshotFields(input: { snapshotKind?: "git" | "filesystem"; snapshotRef?: string; snapshotCommit?: string }) {
+  const identity = normalizeWorkspaceSnapshotIdentity(input);
+  return identity
+    ? { snapshotKind: identity.kind, snapshotRef: identity.ref, snapshotCommit: identity.ref }
+    : {};
+}
+
+function evidenceSnapshotFields(
+  entry: { snapshotKind?: "git" | "filesystem"; snapshotRef?: string; snapshotCommit?: string },
+  latest: { snapshotKind?: "git" | "filesystem"; snapshotRef?: string; snapshotCommit?: string },
+) {
+  const identity = normalizeWorkspaceSnapshotIdentity(entry) ?? normalizeWorkspaceSnapshotIdentity(latest);
+  return identity
+    ? { snapshotKind: identity.kind, snapshotRef: identity.ref, snapshotCommit: identity.ref }
+    : {};
+}
+
+function tryResolveClaimedFindings(
+  config: BridgeConfig,
+  workSessionId: string,
+  missionId: string,
+  latest: { id: string; reviewEpoch?: number; snapshotKind?: "git" | "filesystem"; snapshotRef?: string; snapshotCommit?: string },
+): string[] {
+  if (!config.missionLedger) return [];
+  const packet = config.missionLedger.getPacket(workSessionId);
+  const errors: string[] = [];
+  for (const finding of packet.findings.filter((item) => item.status === "claimed_resolved")) {
+    try {
+      config.missionLedger.resolveFinding(missionId, finding.id, {
+        submissionId: latest.id,
+        reviewEpoch: latest.reviewEpoch,
+        ...snapshotFields(latest),
+      });
+    } catch (error) {
+      errors.push(`${finding.id}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  return errors;
+}
 
 export function registerMissionTools(server: McpServer, config: BridgeConfig): void {
   registerMutationAppTool(
@@ -21,23 +62,13 @@ export function registerMissionTools(server: McpServer, config: BridgeConfig): v
     "begin_supervised_work",
     {
       title: "Begin supervised work",
-      description: "Start bounded supervised delegation only when the reviewer explicitly needs a worker. Preflight a currently dispatchable registered agent before creating any mission, lease, or work-session state; ordinary review and diagnosis stay in the direct workspace. The reviewer/WebUI remains the completion authority.",
+      description: "Start bounded supervised delegation only when the reviewer explicitly needs a worker. Preflight the platform-native registered ACP harness when available (ChatGPT/OpenAI prefers Codex), otherwise another healthy registered agent, before creating mission state. A named agent overrides that preference. The reviewer/WebUI remains the completion authority.",
       inputSchema: {
         workspaceSessionId: z.string(),
         objective: z.string().trim().min(1),
-        desiredOutcome: z.string().optional(),
-        constraints: z.array(z.unknown()).optional(),
-        nonGoals: z.array(z.string()).optional(),
-        acceptanceCriteria: z.array(missionCriterionSchema).optional(),
-        supervisorInstructions: z.string().optional(),
-        maxCorrectionRounds: z.number().int().min(1).max(50).optional().describe("Backstop ceiling on auto-extended correction rounds when new blocking findings appear (default 5). Progress raises the effective ceiling; convergence ends the loop earlier."),
-        maxWallTimeMinutes: z.number().int().min(1).max(10_080).optional().describe("Wall-clock safety budget for autonomous supervision; defaults to 24 hours."),
-        finalVerification: z.array(z.string()).optional().describe("Mission-level integration commands that must pass against the final submitted snapshot."),
-        reviewCoverage: z.array(z.string()).optional().describe("Review lenses (e.g. architecture, security, correctness) the reviewer must explicitly cover before completion. Approval blocks while any lens lacks coverage evidence."),
-        autonomyMode: z.enum(["manual", "verify_only", "correction_auto", "full"]).optional(),
-        approvalMode: z.enum(["human_required", "policy_auto", "fully_automatic"]).optional(),
+        ...supervisedMissionOptionsSchema.shape,
         workOrder: workOrderSchema.optional(),
-        agentName: z.string().optional(),
+        agentName: z.string().optional().describe("Optional registered ACP agent name. Omit to prefer the platform-native registered harness, then any healthy role=agent adapter."),
         clientMutationId: z.string().min(1).max(200).optional(),
       },
       outputSchema: { workSessionId: z.string(), runId: z.string(), status: z.string(), packet: z.unknown() },
@@ -52,29 +83,27 @@ export function registerMissionTools(server: McpServer, config: BridgeConfig): v
       if (requiredCount === 0) {
         return { content: [{ type: "text" as const, text: "Supervised missions require at least one required acceptance criterion." }], isError: true };
       }
-      const workspace = config.workspaces.getWorkspace(workspaceSessionId);
-      const selectedAgentName = agentName ?? "cli-coding-agent";
       const preflight = await selectHealthyAgent(config.agentRegistry.listAlive(), {
-        name: selectedAgentName,
+        name: agentName,
         role: "agent",
         adapterSecret: config.adapterSecret,
+        clientPlatformHint: config.connectionContext?.clientPlatformHint,
       });
       if (!preflight.agent) {
         return {
-          content: [{ type: "text" as const, text: `No healthy dispatchable ACP agent named ${selectedAgentName}; no mission, work session, or workspace lease was created. Continue in the direct workspace or retry after a healthy agent is available.` }],
+          content: [{ type: "text" as const, text: `No healthy dispatchable ACP agent${agentName ? ` named ${agentName}` : ""}; no mission, work session, or workspace lease was created. Continue in the direct workspace or retry after a healthy agent is available.` }],
           isError: true,
         };
       }
-      let baselineCommit: string | undefined;
-      let baselineKind: "git" | "filesystem" | undefined;
-      let baselineRef: string | undefined;
+      const selectedAgentName = preflight.agent.name;
+      let baseline: Awaited<ReturnType<typeof captureMissionBaseline>>;
       try {
-        const baseline = await config.reviewCheckpoints.reviewChanges({ workspaceId: workspaceSessionId, root: workspace.root, since: "workspace_open", markReviewed: false });
-        baselineCommit = baseline.snapshotCommit;
-        baselineKind = baseline.snapshotKind;
-        baselineRef = baseline.snapshotRef;
-      } catch {
-        baselineCommit = undefined;
+        baseline = await captureMissionBaseline(config, workspaceSessionId);
+      } catch (error) {
+        return {
+          content: [{ type: "text" as const, text: `Cannot begin supervised work without a durable workspace baseline: ${error instanceof Error ? error.message : String(error)}` }],
+          isError: true,
+        };
       }
       const created = config.workSessions.create({
         workspaceSessionId,
@@ -103,9 +132,7 @@ export function registerMissionTools(server: McpServer, config: BridgeConfig): v
           maxCorrectionRounds,
           finalVerification,
           reviewCoverage,
-          baselineKind,
-          baselineRef,
-          baselineCommit,
+          ...baseline,
         });
         // Mission correction rounds are an evidence/convergence policy. They
         // are deliberately not copied into the supervisor's emergency cycle
@@ -117,7 +144,7 @@ export function registerMissionTools(server: McpServer, config: BridgeConfig): v
           task: prompt,
           workspaceSessionId,
           workSessionId: created.id,
-          agentName,
+          agentName: selectedAgentName,
           appendSessionInstructions: true,
         });
         if (dispatch.result.status === "failed") {
@@ -217,7 +244,9 @@ export function registerMissionTools(server: McpServer, config: BridgeConfig): v
         findingUpdates: z.array(findingUpdateSchema).optional(),
         evidence: z.array(z.object({
           criterionId: z.string().optional(),
+          findingId: z.string().optional(),
           submissionId: z.string().optional(),
+          reviewEpoch: z.number().int().optional(),
           snapshotKind: z.enum(["git", "filesystem"]).optional(),
           snapshotRef: z.string().optional(),
           snapshotCommit: z.string().optional(),
@@ -228,7 +257,7 @@ export function registerMissionTools(server: McpServer, config: BridgeConfig): v
         workOrder: workOrderSchema,
         clientMutationId: z.string().min(1).max(200).optional(),
       },
-      outputSchema: { status: z.string(), continuationId: z.string().optional(), extension: z.unknown().optional(), packet: z.unknown() },
+      outputSchema: { status: z.string(), continuationId: z.string().optional(), extension: z.unknown().optional(), findingResolutionErrors: z.array(z.string()).optional(), packet: z.unknown() },
       _meta: workspaceAppModelAndAppMeta(),
       annotations: { readOnlyHint: false },
     },
@@ -243,27 +272,28 @@ export function registerMissionTools(server: McpServer, config: BridgeConfig): v
       const session = config.workSessions.get(workSessionId);
       const latest = session?.latestSubmission;
       if (!latest?.id) return { content: [{ type: "text" as const, text: "No pending submission to continue from." }], isError: true };
+      const latestSnapshot = normalizeWorkspaceSnapshotIdentity(latest);
       const createdFindings = findings?.length ? config.missionLedger.addFindings(mission.id, findings) : [];
       if (criterionUpdates?.length) config.missionLedger.updateCriterionStatus(mission.id, criterionUpdates);
       if (findingUpdates?.length) config.missionLedger.updateFindingStatus(mission.id, findingUpdates);
       if (evidence?.length) {
-        config.missionLedger.recordReviewerEvidence(mission.id, evidence.map((entry: { submissionId?: string; snapshotKind?: "git" | "filesystem"; snapshotRef?: string; snapshotCommit?: string; criterionId?: string; command?: string; status: "passed" | "failed" | "inconclusive"; details?: unknown }) => ({
+        config.missionLedger.recordReviewerEvidence(mission.id, evidence.map((entry: { submissionId?: string; reviewEpoch?: number; snapshotKind?: "git" | "filesystem"; snapshotRef?: string; snapshotCommit?: string; criterionId?: string; findingId?: string; command?: string; status: "passed" | "failed" | "inconclusive"; details?: unknown }) => ({
           ...entry,
           submissionId: entry.submissionId ?? latest.id,
-          snapshotKind: entry.snapshotKind ?? latest.snapshotKind,
-          snapshotRef: entry.snapshotRef ?? latest.snapshotRef ?? latest.snapshotCommit,
-          snapshotCommit: entry.snapshotRef ?? entry.snapshotCommit ?? latest.snapshotRef ?? latest.snapshotCommit,
+          reviewEpoch: entry.reviewEpoch ?? latest.reviewEpoch,
+          ...evidenceSnapshotFields(entry, latest),
         })));
       }
+      const findingResolutionErrors = tryResolveClaimedFindings(config, workSessionId, mission.id, latest);
 
       // P2 #34/#35: persist which review lenses this pass covered and any
       // explicit uncertainty so completion can end on coverage, not a timer.
-      if ((workOrder.reviewCoverage?.length || workOrder.uncertainty?.length) && (latest.snapshotRef ?? latest.snapshotCommit)) {
+      if ((workOrder.reviewCoverage?.length || workOrder.uncertainty?.length) && latestSnapshot) {
         config.missionLedger.recordReviewCoverage(mission.id, {
           submissionId: latest.id,
-          snapshotKind: latest.snapshotKind,
-          snapshotRef: latest.snapshotRef ?? latest.snapshotCommit,
-          snapshotCommit: latest.snapshotRef ?? latest.snapshotCommit!,
+          snapshotKind: latestSnapshot.kind,
+          snapshotRef: latestSnapshot.ref,
+          snapshotCommit: latestSnapshot.ref,
           reviewCoverage: workOrder.reviewCoverage,
           uncertainty: workOrder.uncertainty,
         });
@@ -272,21 +302,22 @@ export function registerMissionTools(server: McpServer, config: BridgeConfig): v
       // making progress. A round that surfaced new blocking in-scope findings
       // extends (bounded by a progress-aware ceiling); a non-converging runaway
       // is stopped and handed back to a human rather than auto-looping forever.
-      const resolvedFindingIds = (findingUpdates ?? [])
-        .filter((u: { status: string }) => u.status === "verified_resolved" || u.status === "waived")
-        .map((u: { id: string }) => u.id);
+      const resolvedFindingIds = config.missionLedger.getPacket(workSessionId).findings
+        .filter((finding) => finding.status === "verified_resolved" || finding.status === "waived")
+        .map((finding) => finding.id);
       const extension = config.missionLedger.evaluateLoopExtension(workSessionId, {
         newFindingIds: createdFindings.map((f) => f.id),
         resolvedFindingIds,
       });
-      if (extension.ceilingHit) {
+      if (!extension.extend) {
         // The findings are already persisted (auditable), but we refuse to
-        // auto-dispatch another correction turn. A human decides: ship what
-        // exists, waive, or explicitly force another round.
+        // auto-dispatch another correction turn. A human decides whether the
+        // current work is approvable or whether to create a separately
+        // justified continuation.
         return {
-          content: [{ type: "text" as const, text: `Correction loop not extended: ${extension.reason}` }],
+          content: [{ type: "text" as const, text: `Correction loop stopped: ${extension.reason}` }],
           structuredContent: {
-            status: "ceiling_reached",
+            status: extension.ceilingHit ? "awaiting_human" : "converged",
             extension,
             packet: await supervisorPacket(config, workSessionId),
           },
@@ -305,10 +336,11 @@ export function registerMissionTools(server: McpServer, config: BridgeConfig): v
         reviewerId: "webui",
       });
       return {
-        content: [{ type: "text" as const, text: `Changes requested for ${workSessionId}; continuation queued.` }],
-        structuredContent: {
-          status: "running",
-          continuationId: result.continuationId,
+          content: [{ type: "text" as const, text: `Changes requested for ${workSessionId}; continuation queued.${findingResolutionErrors.length ? ` Finding resolution remains pending: ${findingResolutionErrors.join("; ")}` : ""}` }],
+          structuredContent: {
+            status: "running",
+            continuationId: result.continuationId,
+            ...(findingResolutionErrors.length ? { findingResolutionErrors } : {}),
           packet: await supervisorPacket(config, workSessionId),
         },
       };
@@ -327,7 +359,9 @@ export function registerMissionTools(server: McpServer, config: BridgeConfig): v
         findingUpdates: z.array(findingUpdateSchema).optional(),
         evidence: z.array(z.object({
           criterionId: z.string().optional(),
+          findingId: z.string().optional(),
           submissionId: z.string().optional(),
+          reviewEpoch: z.number().int().optional(),
           snapshotKind: z.enum(["git", "filesystem"]).optional(),
           snapshotRef: z.string().optional(),
           snapshotCommit: z.string().optional(),
@@ -355,34 +389,36 @@ export function registerMissionTools(server: McpServer, config: BridgeConfig): v
       const session = config.workSessions.get(workSessionId);
       const latest = session?.latestSubmission;
       if (!latest?.id) return { content: [{ type: "text" as const, text: "No pending submission to approve." }], isError: true };
+      const latestSnapshot = normalizeWorkspaceSnapshotIdentity(latest);
       if (criterionUpdates?.length) config.missionLedger.updateCriterionStatus(mission.id, criterionUpdates);
       if (findingUpdates?.length) config.missionLedger.updateFindingStatus(mission.id, findingUpdates);
       if (evidence?.length) {
-        config.missionLedger.recordReviewerEvidence(mission.id, evidence.map((entry: { submissionId?: string; snapshotKind?: "git" | "filesystem"; snapshotRef?: string; snapshotCommit?: string; criterionId?: string; command?: string; status: "passed" | "failed" | "inconclusive"; details?: unknown }) => ({
+        config.missionLedger.recordReviewerEvidence(mission.id, evidence.map((entry: { submissionId?: string; reviewEpoch?: number; snapshotKind?: "git" | "filesystem"; snapshotRef?: string; snapshotCommit?: string; criterionId?: string; findingId?: string; command?: string; status: "passed" | "failed" | "inconclusive"; details?: unknown }) => ({
           ...entry,
           submissionId: entry.submissionId ?? latest.id,
-          snapshotKind: entry.snapshotKind ?? latest.snapshotKind,
-          snapshotRef: entry.snapshotRef ?? latest.snapshotRef ?? latest.snapshotCommit,
-          snapshotCommit: entry.snapshotRef ?? entry.snapshotCommit ?? latest.snapshotRef ?? latest.snapshotCommit,
+          reviewEpoch: entry.reviewEpoch ?? latest.reviewEpoch,
+          ...evidenceSnapshotFields(entry, latest),
         })));
       }
+      const findingResolutionErrors = tryResolveClaimedFindings(config, workSessionId, mission.id, latest);
       // P2 #34/#35: coverage/uncertainty recorded on the approval attempt so
       // the gate sees exactly which lenses this reviewer visited.
-      if ((reviewCoverage?.length || uncertainty?.length) && (latest.snapshotRef ?? latest.snapshotCommit)) {
+      if ((reviewCoverage?.length || uncertainty?.length) && latestSnapshot) {
         config.missionLedger.recordReviewCoverage(mission.id, {
           submissionId: latest.id,
-          snapshotKind: latest.snapshotKind,
-          snapshotRef: latest.snapshotRef ?? latest.snapshotCommit,
-          snapshotCommit: latest.snapshotRef ?? latest.snapshotCommit!,
+          snapshotKind: latestSnapshot.kind,
+          snapshotRef: latestSnapshot.ref,
+          snapshotCommit: latestSnapshot.ref,
           reviewCoverage,
           uncertainty,
         });
       }
-      const approval = config.missionLedger.canApprove(workSessionId, { submissionId: latest.id, snapshotKind: latest.snapshotKind, snapshotRef: latest.snapshotRef ?? latest.snapshotCommit, snapshotCommit: latest.snapshotRef ?? latest.snapshotCommit, reviewEpoch: latest.reviewEpoch });
+      const approval = config.missionLedger.canApprove(workSessionId, { submissionId: latest.id, ...snapshotFields(latest), reviewEpoch: latest.reviewEpoch });
       if (!approval.allowed) {
+        const reasons = [...approval.reasons, ...findingResolutionErrors];
         return {
-          content: [{ type: "text" as const, text: `Approval blocked: ${approval.reasons.join("; ")}` }],
-          structuredContent: { status: "blocked", approved: false, reasons: approval.reasons, packet: await supervisorPacket(config, workSessionId) },
+          content: [{ type: "text" as const, text: `Approval blocked: ${reasons.join("; ")}` }],
+          structuredContent: { status: "blocked", approved: false, reasons, packet: await supervisorPacket(config, workSessionId) },
           isError: true,
         };
       }
@@ -394,7 +430,7 @@ export function registerMissionTools(server: McpServer, config: BridgeConfig): v
         verdict: "approve",
         comments,
         reviewerId: "webui",
-          completionReportSha256: config.missionLedger.getCompletionReportHash(workSessionId, { submissionId: latest.id, snapshotKind: latest.snapshotKind, snapshotRef: latest.snapshotRef ?? latest.snapshotCommit, snapshotCommit: latest.snapshotRef ?? latest.snapshotCommit, reviewEpoch: latest.reviewEpoch }),
+          completionReportSha256: config.missionLedger.getCompletionReportHash(workSessionId, { submissionId: latest.id, ...snapshotFields(latest), reviewEpoch: latest.reviewEpoch }),
       });
       const supervisor = config.supervisorRuns?.getByWorkSession(workSessionId);
       if (supervisor) config.supervisorRuns?.transition({ id: supervisor.id, expectedStatus: supervisor.status, expectedRevision: supervisor.revision, nextStatus: "completed" });

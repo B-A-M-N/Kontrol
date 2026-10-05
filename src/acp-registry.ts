@@ -107,6 +107,7 @@ export interface AgentRegistration {
   url: string;
   description?: string;
   publicKey?: string;
+  /** Advertised adapter features; `native:<platform>` marks a preferred native harness. */
   capabilities?: string[];
   tags?: string[];
   role?: "agent" | "client" | string;

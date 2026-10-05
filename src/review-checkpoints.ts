@@ -36,6 +36,34 @@ export interface WorkspaceSnapshot {
   createdAt: string;
 }
 
+export type WorkspaceSnapshotIdentity = Pick<WorkspaceSnapshot, "kind" | "ref">;
+
+/** Normalize snapshot identity at compatibility boundaries. The legacy
+ * snapshotCommit alias is accepted only when it agrees with snapshotRef. */
+export function normalizeWorkspaceSnapshotIdentity(input: {
+  snapshotKind?: WorkspaceSnapshotKind | string | null;
+  snapshotRef?: string | null;
+  snapshotCommit?: string | null;
+}): WorkspaceSnapshotIdentity | undefined {
+  const modernRef = input.snapshotRef?.trim() || undefined;
+  const legacyRef = input.snapshotCommit?.trim() || undefined;
+  if (modernRef && legacyRef && modernRef !== legacyRef) {
+    throw new Error("Conflicting snapshotRef and legacy snapshotCommit values.");
+  }
+  const ref = modernRef ?? legacyRef;
+  if (!ref) {
+    if (input.snapshotKind) throw new Error("Snapshot kind was supplied without a snapshot reference.");
+    return undefined;
+  }
+  const inferredKind: WorkspaceSnapshotKind = ref.startsWith("fs:") ? "filesystem" : "git";
+  const kind = input.snapshotKind ?? inferredKind;
+  if (kind !== "git" && kind !== "filesystem") throw new Error(`Unsupported snapshot kind: ${String(kind)}.`);
+  if ((kind === "filesystem") !== ref.startsWith("fs:")) {
+    throw new Error(`Snapshot kind ${kind} conflicts with snapshot reference ${ref}.`);
+  }
+  return { kind, ref };
+}
+
 export interface CheckpointBackend {
   readonly kind: WorkspaceSnapshotKind;
   capture(root: string): Promise<WorkspaceSnapshot>;

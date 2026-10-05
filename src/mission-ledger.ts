@@ -16,7 +16,7 @@ import {
   type MissionWorkOrderRow,
   type MissionCompletionReportRow,
 } from "./db/schema.js";
-import type { WorkspaceSnapshotKind } from "./review-checkpoints.js";
+import { normalizeWorkspaceSnapshotIdentity, type WorkspaceSnapshotKind } from "./review-checkpoints.js";
 
 export type CriterionStatus = "unverified" | "partially_verified" | "verified" | "failed";
 export type FindingStatus = "open" | "claimed_resolved" | "verified_resolved" | "waived";
@@ -34,6 +34,14 @@ export type FindingDisposition = "blocking" | "required_followup" | "advisory" |
  *                   could perpetually "find one more thing" and never converge.
  */
 export type FindingScope = "in_scope" | "regression" | "out_of_scope";
+export type MissionEvidenceSource = "server_test_runner" | "runtime_probe" | "reviewer_manual_attestation" | "agent_claim";
+
+export interface RuntimeProbeInput {
+  url: string;
+  method?: "GET" | "HEAD";
+  expectedStatus?: number;
+  bodyIncludes?: string;
+}
 
 export interface MissionCriterionInput {
   id?: string;
@@ -41,6 +49,7 @@ export interface MissionCriterionInput {
   priority?: "required" | "preferred";
   verificationType?: "test" | "code_inspection" | "runtime_behavior" | "security_review" | "manual_review";
   verificationCommand?: string;
+  runtimeProbe?: RuntimeProbeInput;
   affectedAreas?: string[];
   dependsOnCriterionIds?: string[];
   verificationGroup?: string;
@@ -60,8 +69,8 @@ export interface ReviewFindingInput {
   description: string;
   evidence?: unknown[];
   requiredAction: string;
-  requiredVerification?: unknown[];
-  status?: FindingStatus;
+  requiredVerification?: string[];
+  status?: Exclude<FindingStatus, "verified_resolved">;
 }
 
 export interface WorkOrderInput {
@@ -114,6 +123,7 @@ export interface CurrentApprovalContext {
 
 export interface MissionEvidenceInput {
   criterionId?: string;
+  findingId?: string;
   submissionId?: string;
   reviewEpoch?: number;
   snapshotKind?: WorkspaceSnapshotKind;
@@ -134,6 +144,15 @@ export interface MissionReviewPacket {
   evidence: Array<ReturnType<typeof rowToEvidence>>;
   completionReports: Array<ReturnType<typeof rowToCompletionReport>>;
   approval: ApprovalPredicate;
+  criterionStates: EffectiveCriterionState[];
+}
+
+export interface EffectiveCriterionState {
+  criterionId: string;
+  status: CriterionStatus;
+  evidenceId?: string;
+  staleReason?: string;
+  dependenciesSatisfied: boolean;
 }
 
 export interface MissionLedger {
@@ -141,7 +160,8 @@ export interface MissionLedger {
   getMissionByWorkSession(workSessionId: string): ReturnType<typeof rowToMission> | undefined;
   addFindings(missionId: string, findings: ReviewFindingInput[]): Array<ReturnType<typeof rowToFinding>>;
   updateCriterionStatus(missionId: string, updates: Array<{ id: string; status: Exclude<CriterionStatus, "verified"> }>): void;
-  updateFindingStatus(missionId: string, updates: Array<{ id: string; status: FindingStatus; waiverReason?: string; resolutionSubmissionId?: string; disposition?: FindingDisposition }>): void;
+  updateFindingStatus(missionId: string, updates: Array<{ id: string; status: Exclude<FindingStatus, "verified_resolved">; waiverReason?: string; disposition?: FindingDisposition }>): void;
+  resolveFinding(missionId: string, findingId: string, context: CurrentApprovalContext): { evidenceIds: string[] };
   createWorkOrder(missionId: string, workSessionId: string, input: WorkOrderInput): ReturnType<typeof rowToWorkOrder>;
   /** Legacy reviewer path: source is assigned by the server, never by input. */
   recordEvidence(missionId: string, entries: MissionEvidenceInput[]): void;
@@ -154,6 +174,7 @@ export interface MissionLedger {
   getCompletionReportHash(workSessionId: string, context: CurrentApprovalContext): string | undefined;
   getPacket(workSessionId: string, approvalContext?: CurrentApprovalContext): MissionReviewPacket;
   canApprove(workSessionId: string, context?: CurrentApprovalContext): ApprovalPredicate;
+  evaluateCriteria(workSessionId: string, context?: CurrentApprovalContext): EffectiveCriterionState[];
   /**
    * Decide whether a review round that surfaced new findings may EXTEND the
    * correction loop. Convergence-based, not a hard count: an extension is
@@ -203,13 +224,40 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
 
   function createMission(input: MissionContractInput) {
     const now = new Date().toISOString();
-    const requiredCriteria = (input.acceptanceCriteria ?? []).filter((c) => (c.priority ?? "required") === "required");
+    const baselineIdentity = normalizeWorkspaceSnapshotIdentity({
+      snapshotKind: input.baselineKind,
+      snapshotRef: input.baselineRef,
+      snapshotCommit: input.baselineCommit,
+    });
+    const normalizedInput: MissionContractInput = {
+      ...input,
+      baselineKind: baselineIdentity?.kind,
+      baselineRef: baselineIdentity?.ref,
+      baselineCommit: baselineIdentity?.ref,
+    };
+    const criteria = (input.acceptanceCriteria ?? []).map((criterion) => ({
+      ...criterion,
+      verificationType: criterion.verificationType ?? (criterion.verificationCommand ? "test" : "manual_review"),
+    }));
+    const requiredCriteria = criteria.filter((c) => (c.priority ?? "required") === "required");
     if (requiredCriteria.length === 0) {
       throw new Error("Mission requires at least one required acceptance criterion.");
     }
-    validateCriterionGraph(input.acceptanceCriteria ?? []);
-    const existing = getMissionByWorkSession(input.workSessionId);
-    if (existing) return existing;
+    validateCriterionGraph(criteria);
+    validateCriterionVerification(criteria);
+    const contractFingerprint = missionContractFingerprint(normalizedInput, criteria);
+    const existingRow = database.db.select().from(missionContracts).where(eq(missionContracts.workSessionId, input.workSessionId)).get();
+    if (existingRow) {
+      const existing = rowToMission(existingRow);
+      const existingFingerprint = existingRow.contractFingerprint ?? fingerprintStoredMission(existing, database.db.select().from(missionAcceptanceCriteria).where(eq(missionAcceptanceCriteria.missionId, existing.id)).orderBy(asc(missionAcceptanceCriteria.createdAt)).all().map(rowToCriterion));
+      if (existingFingerprint !== contractFingerprint) {
+        throw new Error(`Mission contract conflict for work session ${input.workSessionId}; create a new work session or use an explicit mission revision.`);
+      }
+      if (!existingRow.contractFingerprint) {
+        database.db.update(missionContracts).set({ contractFingerprint, updatedAt: now }).where(eq(missionContracts.id, existing.id)).run();
+      }
+      return existing;
+    }
     const missionId = `mission_${randomUUID()}`;
     database.db.transaction(() => {
       database.db.insert(missionContracts).values({
@@ -217,15 +265,16 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
         workSessionId: input.workSessionId,
         workspaceSessionId: input.workspaceSessionId,
         revision: 1,
+        contractFingerprint,
         objective: input.objective,
         desiredOutcome: input.desiredOutcome ?? input.objective,
         constraintsJson: JSON.stringify(input.constraints ?? []),
         nonGoalsJson: JSON.stringify(input.nonGoals ?? []),
         userLockedFieldsJson: JSON.stringify(input.userLockedFields ?? ["objective", "desiredOutcome", "constraints", "nonGoals"]),
         supervisorInstructions: input.supervisorInstructions ?? null,
-        baselineKind: input.baselineKind ?? (input.baselineCommit ? "git" : null),
-        baselineRef: input.baselineRef ?? input.baselineCommit ?? null,
-        baselineCommit: input.baselineCommit ?? null,
+        baselineKind: baselineIdentity?.kind ?? null,
+        baselineRef: baselineIdentity?.ref ?? null,
+        baselineCommit: baselineIdentity?.ref ?? null,
         correctionRounds: 0,
         maxCorrectionRounds: input.maxCorrectionRounds ?? 5,
         finalVerificationJson: JSON.stringify(input.finalVerification ?? []),
@@ -233,7 +282,7 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
         createdAt: now,
         updatedAt: now,
       }).run();
-      for (const criterion of input.acceptanceCriteria ?? []) {
+      for (const criterion of criteria) {
         database.db.insert(missionAcceptanceCriteria).values({
           id: criterion.id ?? `crit_${randomUUID()}`,
           missionId,
@@ -241,6 +290,7 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
           priority: criterion.priority ?? "required",
           verificationType: criterion.verificationType ?? "manual_review",
           verificationCommand: criterion.verificationCommand ?? null,
+          runtimeProbeJson: criterion.runtimeProbe ? JSON.stringify(criterion.runtimeProbe) : null,
           affectedAreasJson: JSON.stringify(criterion.affectedAreas ?? []),
           dependsOnJson: JSON.stringify(criterion.dependsOnCriterionIds ?? []),
           verificationGroup: criterion.verificationGroup ?? null,
@@ -268,6 +318,9 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
     database.sqlite.transaction(() => {
       const existingRows = database.db.select().from(missionReviewFindings).where(eq(missionReviewFindings.missionId, missionId)).all();
       for (const finding of findings) {
+        if (finding.requiredVerification?.some((command) => !command.trim())) {
+          throw new Error("Finding requiredVerification entries must be non-empty commands.");
+        }
         const id = finding.id ?? `find_${randomUUID()}`;
         // Default scope: a finding tied to a submission the agent produced is a
         // regression; otherwise callers should classify explicitly. We never
@@ -341,24 +394,84 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
     touchMission(missionId);
   }
 
-  function updateFindingStatus(missionId: string, updates: Array<{ id: string; status: FindingStatus; waiverReason?: string; resolutionSubmissionId?: string; disposition?: FindingDisposition }>): void {
+  function updateFindingStatus(missionId: string, updates: Array<{ id: string; status: Exclude<FindingStatus, "verified_resolved">; waiverReason?: string; disposition?: FindingDisposition }>): void {
     const now = new Date().toISOString();
     for (const update of updates) {
+      if ((update as { status: string }).status === "verified_resolved") {
+        throw new Error(`Finding ${update.id} cannot be directly marked verified_resolved; use independent resolution evidence.`);
+      }
       if (update.status === "waived" && !update.waiverReason?.trim()) {
         throw new Error(`Waiving finding ${update.id} requires a waiverReason.`);
       }
+      const existing = database.db.select().from(missionReviewFindings)
+        .where(and(eq(missionReviewFindings.id, update.id), eq(missionReviewFindings.missionId, missionId)))
+        .get();
+      if (!existing) throw new Error(`Finding ${update.id} does not belong to mission ${missionId}.`);
       database.db.update(missionReviewFindings)
         .set({
           status: update.status,
           ...(update.disposition ? { disposition: update.disposition } : {}),
           waiverReason: update.waiverReason ?? null,
-          resolutionSubmissionId: update.resolutionSubmissionId ?? null,
+          resolutionSubmissionId: null,
+          resolutionEvidenceJson: "[]",
           updatedAt: now,
         })
         .where(and(eq(missionReviewFindings.id, update.id), eq(missionReviewFindings.missionId, missionId)))
         .run();
     }
     touchMission(missionId);
+  }
+
+  function resolveFinding(missionId: string, findingId: string, context: CurrentApprovalContext): { evidenceIds: string[] } {
+    const finding = database.db.select().from(missionReviewFindings)
+      .where(and(eq(missionReviewFindings.id, findingId), eq(missionReviewFindings.missionId, missionId)))
+      .get();
+    if (!finding) throw new Error(`Finding ${findingId} does not belong to mission ${missionId}.`);
+    if (finding.status !== "claimed_resolved") throw new Error(`Finding ${findingId} must be claimed_resolved before verification.`);
+    const snapshot = normalizeWorkspaceSnapshotIdentity(context);
+    const snapshotRef = snapshot?.ref;
+    const snapshotKind = snapshot?.kind;
+    if (!context.submissionId || !snapshotKind || !snapshotRef || context.reviewEpoch === undefined) {
+      throw new Error(`Finding ${findingId} resolution requires submission, snapshot, and review-epoch identity.`);
+    }
+    const mission = database.db.select().from(missionContracts).where(eq(missionContracts.id, missionId)).get();
+    if (!mission) throw new Error(`Mission ${missionId} not found.`);
+    const latest = getCurrentApprovalContext(mission.workSessionId);
+    const latestRef = normalizeWorkspaceSnapshotIdentity(latest)?.ref;
+    if (latest.submissionId !== context.submissionId || latest.snapshotKind !== snapshotKind || latestRef !== snapshotRef || latest.reviewEpoch !== context.reviewEpoch) {
+      throw new Error(`Finding ${findingId} resolution context is not the current submitted snapshot.`);
+    }
+
+    const requiredCommands = parseJson<string[]>(finding.requiredVerificationJson, []);
+    const eligible = database.db.select().from(missionEvidence)
+      .where(and(eq(missionEvidence.missionId, missionId), eq(missionEvidence.findingId, findingId), eq(missionEvidence.status, "passed")))
+      .orderBy(desc(missionEvidence.createdAt)).all()
+      .map(rowToEvidence)
+      .filter((entry) => {
+        const details = typeof entry.details === "object" && entry.details ? entry.details as Record<string, unknown> : {};
+        const source = details.source;
+        return entry.submissionId === context.submissionId
+          && entry.snapshotKind === snapshotKind
+          && entry.snapshotRef === snapshotRef
+          && entry.reviewEpoch === context.reviewEpoch
+          && (requiredCommands.length
+            ? (source === "server_test_runner" || source === "runtime_probe") && Boolean(entry.command && requiredCommands.includes(entry.command))
+            : source === "reviewer_manual_attestation");
+      });
+    const coveredCommands = new Set(eligible.map((entry) => entry.command).filter((command): command is string => Boolean(command)));
+    const missingCommands = requiredCommands.filter((command) => !coveredCommands.has(command));
+    if (missingCommands.length) throw new Error(`Finding ${findingId} is missing current server verification: ${missingCommands.join(", ")}.`);
+    if (!eligible.length) throw new Error(`Finding ${findingId} has no independent evidence for the current submitted snapshot.`);
+    const evidenceIds = [...new Set(eligible.map((entry) => entry.id))];
+    database.db.update(missionReviewFindings).set({
+      status: "verified_resolved",
+      resolutionSubmissionId: context.submissionId,
+      resolutionEvidenceJson: JSON.stringify(evidenceIds),
+      waiverReason: null,
+      updatedAt: new Date().toISOString(),
+    }).where(and(eq(missionReviewFindings.id, findingId), eq(missionReviewFindings.missionId, missionId), eq(missionReviewFindings.status, "claimed_resolved"))).run();
+    touchMission(missionId);
+    return { evidenceIds };
   }
 
   function createWorkOrder(missionId: string, workSessionId: string, input: WorkOrderInput) {
@@ -394,26 +507,45 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
   function recordEvidenceWithSource(
     missionId: string,
     entries: MissionEvidenceInput[],
-    source: "server_test_runner" | "runtime_probe" | "reviewer_manual_attestation" | "agent_claim",
+    source: MissionEvidenceSource,
   ): void {
     const now = new Date().toISOString();
     for (const entry of entries) {
+      let criterionType: string | undefined;
+      const snapshot = normalizeWorkspaceSnapshotIdentity(entry);
+      const snapshotRef = snapshot?.ref;
+      const snapshotKind = snapshot?.kind;
       if (entry.criterionId) {
         const criterion = database.db.select().from(missionAcceptanceCriteria)
           .where(and(eq(missionAcceptanceCriteria.id, entry.criterionId), eq(missionAcceptanceCriteria.missionId, missionId)))
           .get();
         if (!criterion) throw new Error(`Criterion ${entry.criterionId} does not belong to mission ${missionId}.`);
+        criterionType = criterion.verificationType;
+        if (source !== "agent_claim" && !criterionSourceAllowed(criterion.verificationType, source)) {
+          throw new Error(`Evidence source ${source} cannot satisfy ${criterion.verificationType} criterion ${entry.criterionId}.`);
+        }
+      }
+      if (entry.findingId) {
+        const finding = database.db.select().from(missionReviewFindings)
+          .where(and(eq(missionReviewFindings.id, entry.findingId), eq(missionReviewFindings.missionId, missionId)))
+          .get();
+        if (!finding) throw new Error(`Finding ${entry.findingId} does not belong to mission ${missionId}.`);
+        const requiredCommands = parseJson<string[]>(finding.requiredVerificationJson, []);
+        if (source !== "agent_claim" && (requiredCommands.length ? !["server_test_runner", "runtime_probe"].includes(source) : source !== "reviewer_manual_attestation")) {
+          throw new Error(`Evidence source ${source} cannot satisfy finding ${entry.findingId}'s verification policy.`);
+        }
       }
       const details = { ...(typeof entry.details === "object" && entry.details ? entry.details as Record<string, unknown> : { value: entry.details }), source };
       database.db.insert(missionEvidence).values({
         id: `ev_${randomUUID()}`,
         missionId,
         criterionId: entry.criterionId ?? null,
+        findingId: entry.findingId ?? null,
         submissionId: entry.submissionId ?? null,
         reviewEpoch: entry.reviewEpoch ?? null,
-        snapshotKind: entry.snapshotKind ?? (entry.snapshotCommit?.startsWith("fs:") ? "filesystem" : entry.snapshotCommit ? "git" : null),
-        snapshotRef: entry.snapshotRef ?? entry.snapshotCommit ?? null,
-        snapshotCommit: entry.snapshotCommit ?? null,
+        snapshotKind: snapshotKind ?? null,
+        snapshotRef: snapshotRef ?? null,
+        snapshotCommit: snapshotRef ?? null,
         leaseNonce: entry.leaseNonce ?? null,
         actorPrincipal: entry.actorPrincipal ?? null,
         command: entry.command ?? null,
@@ -426,8 +558,8 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
       // A new piece of evidence for a new snapshot overwrites the previous
       // status — a pass on snapshot A does not permanently verify the
       // criterion for snapshot B.
-      if (entry.criterionId && entry.submissionId && entry.snapshotCommit) {
-        const newStatus = entry.status === "passed" && source !== "agent_claim" ? "verified" : entry.status === "failed" ? "failed" : "unverified";
+      if (entry.criterionId && entry.submissionId && snapshotRef) {
+        const newStatus = entry.status === "passed" && source !== "agent_claim" && criterionSourceAllowed(criterionType ?? "manual_review", source) ? "verified" : entry.status === "failed" ? "failed" : "unverified";
         database.db.update(missionAcceptanceCriteria)
           .set({ status: newStatus, updatedAt: now })
           .where(and(eq(missionAcceptanceCriteria.id, entry.criterionId), eq(missionAcceptanceCriteria.missionId, missionId)))
@@ -459,13 +591,13 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
 
   function getPacket(workSessionId: string, approvalContext?: CurrentApprovalContext): MissionReviewPacket {
     const mission = getMissionByWorkSession(workSessionId);
-    if (!mission) return { criteria: [], findings: [], workOrders: [], evidence: [], completionReports: [], approval: { allowed: true, reasons: [] } };
+    if (!mission) return { criteria: [], findings: [], workOrders: [], evidence: [], completionReports: [], approval: { allowed: true, reasons: [] }, criterionStates: [] };
     const criteria = database.db.select().from(missionAcceptanceCriteria).where(eq(missionAcceptanceCriteria.missionId, mission.id)).orderBy(asc(missionAcceptanceCriteria.createdAt)).all().map(rowToCriterion);
     const findings = database.db.select().from(missionReviewFindings).where(eq(missionReviewFindings.missionId, mission.id)).orderBy(asc(missionReviewFindings.createdAt)).all().map(rowToFinding);
     const workOrders = database.db.select().from(missionWorkOrders).where(eq(missionWorkOrders.missionId, mission.id)).orderBy(desc(missionWorkOrders.createdAt)).all().map(rowToWorkOrder);
     const evidence = database.db.select().from(missionEvidence).where(eq(missionEvidence.missionId, mission.id)).orderBy(desc(missionEvidence.createdAt)).all().map(rowToEvidence);
     const completionReports = database.db.select().from(missionCompletionReports).where(eq(missionCompletionReports.missionId, mission.id)).orderBy(desc(missionCompletionReports.createdAt)).all().map(rowToCompletionReport);
-    return { mission, criteria, findings, workOrders, evidence, completionReports, approval: canApprove(workSessionId, approvalContext) };
+    return { mission, criteria, findings, workOrders, evidence, completionReports, approval: canApprove(workSessionId, approvalContext), criterionStates: evaluateCriteria(workSessionId, approvalContext) };
   }
 
   // P1 #26: Derive the current approval context from the latest pending
@@ -483,67 +615,25 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
       .orderBy(desc(workSessionSubmissions.submissionNumber))
       .limit(1)
       .get();
+    const snapshot = row ? normalizeWorkspaceSnapshotIdentity(row) : undefined;
     return row?.submissionId
-      ? { submissionId: row.submissionId, snapshotKind: row.snapshotKind as WorkspaceSnapshotKind | undefined, snapshotRef: row.snapshotRef ?? row.snapshotCommit ?? undefined, snapshotCommit: row.snapshotRef ?? row.snapshotCommit ?? undefined, reviewEpoch: row.reviewEpoch }
+      ? { submissionId: row.submissionId, snapshotKind: snapshot?.kind, snapshotRef: snapshot?.ref, snapshotCommit: snapshot?.ref, reviewEpoch: row.reviewEpoch }
       : {};
   }
 
   function canApprove(workSessionId: string, context?: CurrentApprovalContext): ApprovalPredicate {
     const mission = getMissionByWorkSession(workSessionId);
     if (!mission) return { allowed: true, reasons: [] };
-    const currentContext = context ?? getCurrentApprovalContext(workSessionId);
+    const currentContext = normalizeCurrentApprovalContext(context ?? getCurrentApprovalContext(workSessionId));
     const packet = getPacketWithoutApproval(mission.id);
     const reasons: string[] = [];
-    const criteriaById = new Map(packet.criteria.map((c) => [c.id, c]));
-
-    // P1 #25: Effective criterion status — a criterion cannot be effectively
-    // verified unless all its dependencies are effectively verified.
-    const effectiveStatus = new Map<string, "verified" | "unverified">();
-    const dependencyCycles = new Set<string>();
-    const computeEffective = (criterionId: string, stack: Set<string>): "verified" | "unverified" => {
-      if (effectiveStatus.has(criterionId)) return effectiveStatus.get(criterionId)!;
-      if (stack.has(criterionId)) {
-        dependencyCycles.add(criterionId);
-        effectiveStatus.set(criterionId, "unverified");
-        return "unverified";
-      }
-      stack.add(criterionId);
-      const criterion = criteriaById.get(criterionId);
-      if (!criterion) {
-        stack.delete(criterionId);
-        effectiveStatus.set(criterionId, "unverified");
-        return "unverified";
-      }
-      const depsOk = (criterion.dependsOnCriterionIds ?? []).every((depId) => computeEffective(depId, stack) === "verified");
-      stack.delete(criterionId);
-      // Dependencies are current-snapshot claims too. Persisted `verified`
-      // status alone is not evidence that the dependency passed this review
-      // generation.
-      const selfOk = criterion.status === "verified"
-        && Boolean(latestCurrentEvidence(mission.id, criterion.id, currentContext));
-      const result = selfOk && depsOk ? "verified" : "unverified";
-      effectiveStatus.set(criterionId, result);
-      return result;
-    };
-
+    const states = new Map(evaluateCriteria(workSessionId, currentContext).map((state) => [state.criterionId, state]));
     for (const criterion of packet.criteria) {
       if (criterion.priority === "required") {
-        const eff = computeEffective(criterion.id, new Set());
-        if (eff !== "verified") {
-          if (criterion.status === "verified" && !latestCurrentEvidence(mission.id, criterion.id, currentContext)) {
-            reasons.push(`Required criterion ${criterion.id} has no current non-agent evidence for submission ${currentContext.submissionId ?? "(unknown)"}.`);
-          } else {
-            reasons.push(`Required criterion ${criterion.id} is ${criterion.status}: ${criterion.description}`);
-          }
-          continue;
-        }
-        const evidence = latestCurrentEvidence(mission.id, criterion.id, currentContext);
-        if (!evidence) {
-          reasons.push(`Required criterion ${criterion.id} has no current non-agent evidence for submission ${currentContext.submissionId ?? "(unknown)"}.`);
-        }
+        const state = states.get(criterion.id);
+        if (state?.status !== "verified") reasons.push(`Required criterion ${criterion.id} is effectively ${state?.status ?? "unverified"}: ${state?.staleReason ?? criterion.description}`);
       }
     }
-    for (const cycle of dependencyCycles) reasons.push(`Dependency cycle detected at criterion ${cycle}.`);
     for (const finding of packet.findings) {
       // Out-of-scope findings are advisory only — they never block approval.
       // This is the anti-runaway guard: a reviewer can surface a pre-existing
@@ -570,7 +660,46 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
     return { allowed: reasons.length === 0, reasons };
   }
 
+  function evaluateCriteria(workSessionId: string, context?: CurrentApprovalContext): EffectiveCriterionState[] {
+    const mission = getMissionByWorkSession(workSessionId);
+    if (!mission) return [];
+    const currentContext = normalizeCurrentApprovalContext(context ?? getCurrentApprovalContext(workSessionId));
+    const criteria = database.db.select().from(missionAcceptanceCriteria)
+      .where(eq(missionAcceptanceCriteria.missionId, mission.id))
+      .orderBy(asc(missionAcceptanceCriteria.createdAt)).all().map(rowToCriterion);
+    const byId = new Map(criteria.map((criterion) => [criterion.id, criterion]));
+    const states = new Map<string, EffectiveCriterionState>();
+    const visiting = new Set<string>();
+    const evaluate = (criterionId: string): EffectiveCriterionState => {
+      const cached = states.get(criterionId);
+      if (cached) return cached;
+      const criterion = byId.get(criterionId);
+      if (!criterion) return { criterionId, status: "unverified", dependenciesSatisfied: false, staleReason: "criterion is missing" };
+      if (visiting.has(criterionId)) return { criterionId, status: "unverified", dependenciesSatisfied: false, staleReason: "dependency cycle detected" };
+      visiting.add(criterionId);
+      const dependencies = (criterion.dependsOnCriterionIds ?? []).map(evaluate);
+      const dependenciesSatisfied = dependencies.every((dependency) => dependency.status === "verified");
+      const evidence = latestCurrentEvidence(mission.id, criterion.id, currentContext);
+      const failedEvidence = latestCurrentEvidence(mission.id, criterion.id, currentContext, "failed");
+      const baseStatus: CriterionStatus = evidence ? "verified" : failedEvidence ? "failed" : "unverified";
+      const status: CriterionStatus = baseStatus === "verified" && dependenciesSatisfied ? "verified" : baseStatus === "verified" ? "unverified" : baseStatus;
+      const staleReason = !evidence && criterion.status !== "unverified" && !failedEvidence
+        ? `stored ${criterion.status} status has no qualifying evidence for current submission ${currentContext.submissionId ?? "(unknown)"}`
+        : baseStatus === "verified" && !dependenciesSatisfied
+          ? "one or more dependencies are not currently verified"
+          : undefined;
+      const state: EffectiveCriterionState = { criterionId, status, evidenceId: evidence?.id ?? failedEvidence?.id, dependenciesSatisfied, staleReason };
+      visiting.delete(criterionId);
+      states.set(criterionId, state);
+      return state;
+    };
+    for (const criterion of criteria) evaluate(criterion.id);
+    return criteria.map((criterion) => states.get(criterion.id)!);
+  }
+
   function recordCompletionReport(missionId: string, input: { submissionId: string; snapshotKind?: WorkspaceSnapshotKind; snapshotRef?: string; snapshotCommit: string; status: "passed" | "failed"; results: unknown; reviewCoverage?: string[]; uncertainty?: unknown[] }): void {
+    const snapshot = normalizeWorkspaceSnapshotIdentity(input);
+    if (!snapshot) throw new Error("Completion report requires a snapshot identity.");
     const resultsJson = JSON.stringify(input.results);
     // P1 #14: keep one authoritative report per
     // {missionId, submissionId, snapshotCommit}. If reviewer coverage was
@@ -579,7 +708,7 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
     const prior = database.db.select().from(missionCompletionReports).where(and(
       eq(missionCompletionReports.missionId, missionId),
       eq(missionCompletionReports.submissionId, input.submissionId),
-      eq(missionCompletionReports.snapshotCommit, input.snapshotRef ?? input.snapshotCommit),
+      eq(missionCompletionReports.snapshotCommit, snapshot.ref),
     )).orderBy(desc(missionCompletionReports.createdAt)).get();
     const mergeInto = (current: string[], incoming?: string[]) => [...new Set([...current, ...(incoming ?? [])])];
     if (prior) {
@@ -597,9 +726,9 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
       id: `report_${randomUUID()}`,
       missionId,
         submissionId: input.submissionId,
-        snapshotCommit: input.snapshotCommit,
-        snapshotKind: input.snapshotKind ?? (input.snapshotCommit.startsWith("fs:") ? "filesystem" : "git"),
-        snapshotRef: input.snapshotRef ?? input.snapshotCommit,
+        snapshotCommit: snapshot.ref,
+        snapshotKind: snapshot.kind,
+        snapshotRef: snapshot.ref,
       status: input.status,
       resultsJson,
       reviewCoverageJson: JSON.stringify(input.reviewCoverage ?? []),
@@ -611,12 +740,14 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
 
   /** P2 #34/#35: Record which review lenses a reviewer covered and what remains uncertain. */
   function recordReviewCoverage(missionId: string, input: { submissionId: string; snapshotKind?: WorkspaceSnapshotKind; snapshotRef?: string; snapshotCommit: string; reviewCoverage?: string[]; uncertainty?: unknown[] }): void {
+    const snapshot = normalizeWorkspaceSnapshotIdentity(input);
+    if (!snapshot) throw new Error("Review coverage requires a snapshot identity.");
     const mission = database.db.select().from(missionContracts).where(eq(missionContracts.id, missionId)).get();
     if (!mission) throw new Error(`No mission contract ${missionId}.`);
     const existing = database.db.select().from(missionCompletionReports).where(and(
       eq(missionCompletionReports.missionId, missionId),
       eq(missionCompletionReports.submissionId, input.submissionId),
-      eq(missionCompletionReports.snapshotCommit, input.snapshotRef ?? input.snapshotCommit),
+      eq(missionCompletionReports.snapshotCommit, snapshot.ref),
     )).orderBy(desc(missionCompletionReports.createdAt)).get();
     const mergeInto = (current: string[], incoming: string[]) => [...new Set([...current, ...incoming])];
     if (existing) {
@@ -637,9 +768,9 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
       id: `report_${randomUUID()}`,
       missionId,
       submissionId: input.submissionId,
-      snapshotCommit: input.snapshotCommit,
-      snapshotKind: input.snapshotKind ?? (input.snapshotCommit.startsWith("fs:") ? "filesystem" : "git"),
-      snapshotRef: input.snapshotRef ?? input.snapshotCommit,
+      snapshotCommit: snapshot.ref,
+      snapshotKind: snapshot.kind,
+      snapshotRef: snapshot.ref,
       status: "failed",
       resultsJson: JSON.stringify([]),
       reviewCoverageJson: JSON.stringify(input.reviewCoverage ?? []),
@@ -650,8 +781,9 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
   }
 
   function getCompletionReportHash(workSessionId: string, context: CurrentApprovalContext): string | undefined {
+    const snapshot = normalizeWorkspaceSnapshotIdentity(context);
     const mission = getMissionByWorkSession(workSessionId);
-    if (!mission?.finalVerification.length || !context.submissionId || !context.snapshotCommit) return undefined;
+    if (!mission?.finalVerification.length || !context.submissionId || !snapshot) return undefined;
     if (context.reviewEpoch !== undefined) {
       const submission = database.db.select({ reviewEpoch: workSessionSubmissions.reviewEpoch })
         .from(workSessionSubmissions)
@@ -660,7 +792,7 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
       if (!submission || submission.reviewEpoch !== context.reviewEpoch) return undefined;
     }
     return database.db.select().from(missionCompletionReports)
-      .where(and(eq(missionCompletionReports.missionId, mission.id), eq(missionCompletionReports.submissionId, context.submissionId), eq(missionCompletionReports.snapshotCommit, context.snapshotCommit), eq(missionCompletionReports.status, "passed")))
+      .where(and(eq(missionCompletionReports.missionId, mission.id), eq(missionCompletionReports.submissionId, context.submissionId), eq(missionCompletionReports.snapshotCommit, snapshot.ref), eq(missionCompletionReports.status, "passed")))
       .orderBy(desc(missionCompletionReports.createdAt)).get()?.reportSha256;
   }
 
@@ -719,8 +851,15 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
     };
   }
 
-  function latestCurrentEvidence(missionId: string, criterionId: string, context: CurrentApprovalContext) {
-    if (!context.submissionId || !context.snapshotCommit) return undefined;
+  function latestCurrentEvidence(missionId: string, criterionId: string, context: CurrentApprovalContext, status: "passed" | "failed" = "passed") {
+    const snapshot = normalizeWorkspaceSnapshotIdentity(context);
+    const snapshotRef = snapshot?.ref;
+    const snapshotKind = snapshot?.kind;
+    if (!context.submissionId || !snapshotKind || !snapshotRef) return undefined;
+    const criterion = database.db.select().from(missionAcceptanceCriteria)
+      .where(and(eq(missionAcceptanceCriteria.id, criterionId), eq(missionAcceptanceCriteria.missionId, missionId)))
+      .get();
+    if (!criterion) return undefined;
     const rows = database.db.select().from(missionEvidence)
       .where(and(eq(missionEvidence.missionId, missionId), eq(missionEvidence.criterionId, criterionId)))
       .orderBy(desc(missionEvidence.createdAt))
@@ -728,11 +867,12 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
       .map(rowToEvidence);
     return rows.find((row) => {
       const details = typeof row.details === "object" && row.details ? row.details as Record<string, unknown> : {};
-      return row.status === "passed" &&
+      return row.status === status &&
         row.submissionId === context.submissionId &&
-        row.snapshotCommit === context.snapshotCommit &&
+        row.snapshotKind === snapshotKind &&
+        row.snapshotRef === snapshotRef &&
         (context.reviewEpoch === undefined || row.reviewEpoch === context.reviewEpoch) &&
-        details.source !== "agent_claim";
+        criterionSourceAllowed(criterion.verificationType, details.source as MissionEvidenceSource);
     });
   }
 
@@ -774,7 +914,9 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
     getCompletionReportHash,
     getPacket,
     canApprove,
+    evaluateCriteria,
     evaluateLoopExtension,
+    resolveFinding,
     setWorkOrderPreferredAgent,
     // P1 #11: DB owned by server
     close: () => { },
@@ -782,20 +924,26 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
 }
 
 function rowToMission(row: MissionContractRow) {
+  const baselineIdentity = normalizeWorkspaceSnapshotIdentity({
+    snapshotKind: row.baselineKind,
+    snapshotRef: row.baselineRef,
+    snapshotCommit: row.baselineCommit,
+  });
   return {
     id: row.id,
     workSessionId: row.workSessionId,
     workspaceSessionId: row.workspaceSessionId,
     revision: row.revision,
+    contractFingerprint: row.contractFingerprint ?? undefined,
     objective: row.objective,
     desiredOutcome: row.desiredOutcome,
     constraints: parseJson(row.constraintsJson, []),
     nonGoals: parseJson(row.nonGoalsJson, []),
     userLockedFields: parseJson(row.userLockedFieldsJson, []),
     supervisorInstructions: row.supervisorInstructions ?? undefined,
-    baselineKind: row.baselineKind as WorkspaceSnapshotKind | undefined ?? (row.baselineCommit ? "git" : undefined),
-    baselineRef: row.baselineRef ?? row.baselineCommit ?? undefined,
-    baselineCommit: row.baselineCommit ?? undefined,
+    baselineKind: baselineIdentity?.kind,
+    baselineRef: baselineIdentity?.ref,
+    baselineCommit: baselineIdentity?.ref,
     correctionRounds: row.correctionRounds ?? 0,
     maxCorrectionRounds: row.maxCorrectionRounds ?? 5,
     finalVerification: parseJson(row.finalVerificationJson, []),
@@ -834,6 +982,109 @@ function validateCriterionGraph(criteria: MissionCriterionInput[]): void {
   for (const id of byId.keys()) walk(id);
 }
 
+function validateCriterionVerification(criteria: MissionCriterionInput[]): void {
+  for (const criterion of criteria) {
+    const type = criterion.verificationType ?? (criterion.verificationCommand ? "test" : "manual_review");
+    if (type === "test" && !criterion.verificationCommand?.trim()) {
+      throw new Error(`Test criterion ${criterion.id ?? criterion.description} requires a verificationCommand.`);
+    }
+    if (type === "runtime_behavior" && !criterion.runtimeProbe) {
+      throw new Error(`Runtime behavior criterion ${criterion.id ?? criterion.description} requires a runtimeProbe.`);
+    }
+    if (type !== "test" && criterion.verificationCommand) {
+      throw new Error(`Criterion ${criterion.id ?? criterion.description} has a verificationCommand but verificationType is ${type}.`);
+    }
+    if (type !== "runtime_behavior" && criterion.runtimeProbe) {
+      throw new Error(`Criterion ${criterion.id ?? criterion.description} declares a runtimeProbe but is not runtime_behavior.`);
+    }
+  }
+}
+
+function missionContractFingerprint(input: MissionContractInput, criteria: MissionCriterionInput[]): string {
+  const baselineIdentity = normalizeWorkspaceSnapshotIdentity({
+    snapshotKind: input.baselineKind,
+    snapshotRef: input.baselineRef,
+    snapshotCommit: input.baselineCommit,
+  });
+  const normalizedCriteria = criteria.map((criterion) => ({
+    description: criterion.description,
+    priority: criterion.priority ?? "required",
+    verificationType: criterion.verificationType ?? (criterion.verificationCommand ? "test" : "manual_review"),
+    verificationCommand: criterion.verificationCommand ?? null,
+    runtimeProbe: criterion.runtimeProbe ?? null,
+    affectedAreas: criterion.affectedAreas ?? [],
+    dependsOnCriterionIds: criterion.dependsOnCriterionIds ?? [],
+    verificationGroup: criterion.verificationGroup ?? null,
+    verificationScope: criterion.verificationScope ?? "full",
+    finalOnly: criterion.finalOnly ?? false,
+    mutatesWorkspace: criterion.mutatesWorkspace ?? false,
+    commandVersion: criterion.commandVersion ?? null,
+  }));
+  const payload = {
+    workSessionId: input.workSessionId,
+    workspaceSessionId: input.workspaceSessionId,
+    objective: input.objective,
+    desiredOutcome: input.desiredOutcome ?? input.objective,
+    constraints: input.constraints ?? [],
+    nonGoals: input.nonGoals ?? [],
+    userLockedFields: input.userLockedFields ?? ["objective", "desiredOutcome", "constraints", "nonGoals"],
+    supervisorInstructions: input.supervisorInstructions ?? null,
+    baselineKind: baselineIdentity?.kind ?? null,
+    baselineRef: baselineIdentity?.ref ?? null,
+    maxCorrectionRounds: input.maxCorrectionRounds ?? 5,
+    finalVerification: input.finalVerification ?? [],
+    reviewCoverage: input.reviewCoverage ?? [],
+    acceptanceCriteria: normalizedCriteria.sort((left, right) =>
+      JSON.stringify(canonicalize(left)).localeCompare(JSON.stringify(canonicalize(right)))),
+  };
+  return sha256(JSON.stringify(canonicalize(payload)));
+}
+
+function fingerprintStoredMission(
+  mission: ReturnType<typeof rowToMission>,
+  criteria: Array<ReturnType<typeof rowToCriterion>>,
+): string {
+  return missionContractFingerprint({
+    workSessionId: mission.workSessionId,
+    workspaceSessionId: mission.workspaceSessionId,
+    objective: mission.objective,
+    desiredOutcome: mission.desiredOutcome,
+    constraints: mission.constraints,
+    nonGoals: mission.nonGoals,
+    userLockedFields: mission.userLockedFields,
+    supervisorInstructions: mission.supervisorInstructions,
+    baselineKind: mission.baselineKind,
+    baselineRef: mission.baselineRef,
+    maxCorrectionRounds: mission.maxCorrectionRounds,
+    finalVerification: mission.finalVerification,
+    reviewCoverage: mission.reviewCoverage,
+  }, criteria.map((criterion) => ({
+    description: criterion.description,
+    priority: criterion.priority as "required" | "preferred",
+    verificationType: criterion.verificationType as MissionCriterionInput["verificationType"],
+    verificationCommand: criterion.verificationCommand,
+    runtimeProbe: criterion.runtimeProbe,
+    affectedAreas: criterion.affectedAreas,
+    dependsOnCriterionIds: criterion.dependsOnCriterionIds,
+    verificationGroup: criterion.verificationGroup,
+    verificationScope: criterion.verificationScope as MissionCriterionInput["verificationScope"],
+    finalOnly: criterion.finalOnly,
+    mutatesWorkspace: criterion.mutatesWorkspace,
+    commandVersion: criterion.commandVersion,
+  })));
+}
+
+function canonicalize(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+      .filter(([, child]) => child !== undefined)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, child]) => [key, canonicalize(child)]));
+  }
+  return value;
+}
+
 function rowToCriterion(row: MissionAcceptanceCriterionRow) {
   return {
     id: row.id,
@@ -842,6 +1093,7 @@ function rowToCriterion(row: MissionAcceptanceCriterionRow) {
     priority: row.priority,
     verificationType: row.verificationType,
     verificationCommand: row.verificationCommand ?? undefined,
+    runtimeProbe: row.runtimeProbeJson ? parseJson<RuntimeProbeInput | undefined>(row.runtimeProbeJson, undefined) : undefined,
     affectedAreas: parseJson(row.affectedAreasJson, []),
     dependsOnCriterionIds: parseJson(row.dependsOnJson, []),
     verificationGroup: row.verificationGroup ?? undefined,
@@ -871,6 +1123,7 @@ function rowToFinding(row: MissionReviewFindingRow) {
     requiredVerification: parseJson(row.requiredVerificationJson, []),
     status: row.status,
     resolutionSubmissionId: row.resolutionSubmissionId ?? undefined,
+    resolutionEvidenceIds: parseJson<string[]>(row.resolutionEvidenceJson, []),
     waiverReason: row.waiverReason ?? undefined,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
@@ -945,15 +1198,21 @@ function rowToWorkOrder(row: MissionWorkOrderRow) {
 }
 
 function rowToEvidence(row: MissionEvidenceRow) {
+  const snapshot = normalizeWorkspaceSnapshotIdentity({
+    snapshotKind: row.snapshotKind,
+    snapshotRef: row.snapshotRef,
+    snapshotCommit: row.snapshotCommit,
+  });
   return {
     id: row.id,
     missionId: row.missionId,
     criterionId: row.criterionId ?? undefined,
+    findingId: row.findingId ?? undefined,
     submissionId: row.submissionId ?? undefined,
     reviewEpoch: row.reviewEpoch ?? undefined,
-    snapshotKind: row.snapshotKind as WorkspaceSnapshotKind | undefined ?? (row.snapshotCommit?.startsWith("fs:") ? "filesystem" : row.snapshotCommit ? "git" : undefined),
-    snapshotRef: row.snapshotRef ?? row.snapshotCommit ?? undefined,
-    snapshotCommit: row.snapshotCommit ?? undefined,
+    snapshotKind: snapshot?.kind,
+    snapshotRef: snapshot?.ref,
+    snapshotCommit: snapshot?.ref,
     leaseNonce: row.leaseNonce ?? undefined,
     actorPrincipal: row.actorPrincipal ?? undefined,
     command: row.command ?? undefined,
@@ -964,19 +1223,40 @@ function rowToEvidence(row: MissionEvidenceRow) {
   };
 }
 
+function criterionSourceAllowed(verificationType: string, source: MissionEvidenceSource): boolean {
+  if (verificationType === "test") return source === "server_test_runner";
+  if (verificationType === "runtime_behavior") return source === "runtime_probe";
+  if (["code_inspection", "security_review", "manual_review"].includes(verificationType)) {
+    return source === "reviewer_manual_attestation";
+  }
+  return false;
+}
+
 function rowToCompletionReport(row: MissionCompletionReportRow) {
+  const snapshot = normalizeWorkspaceSnapshotIdentity({
+    snapshotKind: row.snapshotKind,
+    snapshotRef: row.snapshotRef,
+    snapshotCommit: row.snapshotCommit,
+  });
   return {
     id: row.id,
     missionId: row.missionId,
     submissionId: row.submissionId,
-    snapshotKind: row.snapshotKind as WorkspaceSnapshotKind | undefined ?? (row.snapshotCommit.startsWith("fs:") ? "filesystem" : "git"),
-    snapshotRef: row.snapshotRef ?? row.snapshotCommit,
-    snapshotCommit: row.snapshotCommit,
+    snapshotKind: snapshot?.kind,
+    snapshotRef: snapshot?.ref,
+    snapshotCommit: snapshot?.ref,
     status: row.status,
     results: parseJson(row.resultsJson, []),
     reportSha256: row.reportSha256,
     createdAt: row.createdAt,
   };
+}
+
+function normalizeCurrentApprovalContext(context: CurrentApprovalContext): CurrentApprovalContext {
+  const snapshot = normalizeWorkspaceSnapshotIdentity(context);
+  return snapshot
+    ? { ...context, snapshotKind: snapshot.kind, snapshotRef: snapshot.ref, snapshotCommit: snapshot.ref }
+    : context;
 }
 
 function parseJson<T>(value: string | null | undefined, fallback: T): T {

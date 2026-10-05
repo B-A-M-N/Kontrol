@@ -1,14 +1,15 @@
 import { createHash } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdtemp, realpath, rm } from "node:fs/promises";
+import { mkdtemp, realpath, rm, stat } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
+import { isIP } from "node:net";
 import { buildChildEnvironment } from "./process-environment.js";
 import { git } from "./git.js";
 import type { MissionLedger } from "./mission-ledger.js";
 import type { WorkSessionManager } from "./work-sessions.js";
 import type { WorkspaceRegistry } from "./workspaces.js";
-import type { ReviewCheckpointManager, WorkspaceSnapshot } from "./review-checkpoints.js";
+import { normalizeWorkspaceSnapshotIdentity, type ReviewCheckpointManager, type WorkspaceSnapshot } from "./review-checkpoints.js";
 
 const ALLOWED_EXECUTABLES = new Set(["npm", "pytest", "cargo", "go", "make", "vitest", "jest", "tsc", "ruff"]);
 
@@ -25,7 +26,7 @@ const ALLOWED_EXECUTABLES = new Set(["npm", "pytest", "cargo", "go", "make", "vi
  */
 const UNSAFE_SHELL_SYNTAX = /[;&|><`$(){}\n\r]/;
 const MAX_OUTPUT_BYTES = 20_000;
-const VERIFIER_POLICY_VERSION = "mission-verifier-v2";
+const VERIFIER_POLICY_VERSION = "mission-verifier-v3";
 const DEFAULT_COMMAND_VERSION = "unspecified";
 const SANDBOX_RESOURCE_LIMITS = {
   cpuSeconds: "300",
@@ -145,17 +146,145 @@ function createFailureSetFingerprint(command: string, output: string, exitCode: 
   return createHash("sha256").update(JSON.stringify({ command, exitCode, signal, failureLines })).digest("hex");
 }
 
-function verificationCacheKey(command: string, commandVersion: string, environment: Record<string, string>): string {
+export interface VerificationExecutionContext {
+  sandbox: boolean;
+  environment: Record<string, string>;
+  toolchainPaths: string[];
+  sandboxExecutablePath?: string;
+  executionIdentity: {
+    sandboxExecutable: unknown;
+    toolchainPaths: unknown[];
+  };
+}
+
+async function pathExecutionIdentity(path: string | undefined): Promise<unknown> {
+  if (!path) return { configured: null, available: false };
+  try {
+    const resolved = await realpath(path);
+    const info = await stat(resolved);
+    return {
+      configured: path,
+      resolved,
+      device: String(info.dev),
+      inode: String(info.ino),
+      size: info.size,
+      modifiedAtMs: info.mtimeMs,
+      isFile: info.isFile(),
+      isDirectory: info.isDirectory(),
+    };
+  } catch {
+    return { configured: path, available: false };
+  }
+}
+
+export async function createVerificationExecutionContext(input: {
+  sandbox?: boolean;
+  childEnvironmentAllowlist?: string[];
+  verifyToolchainPaths?: string[];
+  sandboxExecutablePath?: string;
+}): Promise<VerificationExecutionContext> {
+  const sandbox = sandboxRequested({ sandbox: input.sandbox });
+  const environment = buildChildEnvironment({ sandbox, additionalKeys: input.childEnvironmentAllowlist });
+  const toolchainPaths = input.verifyToolchainPaths ?? [];
+  const sandboxPath = input.sandboxExecutablePath
+    ?? ["/usr/bin/bwrap", "/bin/bwrap"].find((candidate) => existsSync(candidate));
+  const [sandboxExecutable, ...toolchainPathIdentities] = await Promise.all([
+    pathExecutionIdentity(sandboxPath),
+    ...toolchainPaths.map((path) => pathExecutionIdentity(path)),
+  ]);
+  return {
+    sandbox,
+    environment,
+    toolchainPaths,
+    sandboxExecutablePath: sandboxPath,
+    executionIdentity: { sandboxExecutable, toolchainPaths: toolchainPathIdentities },
+  };
+}
+
+export function verificationCacheKey(command: string, commandVersion: string, context: VerificationExecutionContext): string {
   return createHash("sha256").update(JSON.stringify({
     command,
     commandVersion,
-    relevantEnvironment: environment,
+    relevantEnvironment: context.environment,
+    sandbox: context.sandbox,
+    executionIdentity: context.executionIdentity,
     verifierPolicyVersion: VERIFIER_POLICY_VERSION,
   })).digest("hex");
 }
 
 function parseDetails(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null ? value as Record<string, unknown> : {};
+}
+
+function runtimeProbeLabel(probe: NonNullable<import("./mission-ledger.js").MissionCriterionInput["runtimeProbe"]>): string {
+  return `${probe.method ?? "GET"} ${probe.url} (expect ${probe.expectedStatus ?? 200}${probe.bodyIncludes ? ` and body includes ${JSON.stringify(probe.bodyIncludes)}` : ""})`;
+}
+
+export async function runRuntimeProbe(
+  probe: NonNullable<import("./mission-ledger.js").MissionCriterionInput["runtimeProbe"]>,
+  deadlineAtMs: number,
+): Promise<Omit<VerificationResult, "criterionId" | "command">> {
+  const command = runtimeProbeLabel(probe);
+  let url: URL;
+  try { url = new URL(probe.url); }
+  catch { throw new Error("Runtime probe URL is invalid."); }
+  const hostname = url.hostname.replace(/^\[|\]$/g, "");
+  const loopback = hostname === "localhost" || hostname === "::1" || (isIP(hostname) === 4 && hostname.startsWith("127."));
+  if (url.protocol !== "http:" || !loopback || url.username || url.password || url.hash) {
+    throw new Error("Runtime probes are restricted to unauthenticated loopback HTTP URLs without redirects.");
+  }
+  const remainingMs = Math.min(10_000, deadlineAtMs - Date.now());
+  if (remainingMs <= 0) throw new Error("Runtime probe deadline reached before request started.");
+  const startedAt = Date.now();
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), remainingMs);
+  try {
+    const response = await fetch(url, { method: probe.method ?? "GET", redirect: "manual", signal: controller.signal });
+    let body = "";
+    if (response.body && (probe.method ?? "GET") !== "HEAD") {
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let size = 0;
+      while (size < MAX_OUTPUT_BYTES) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const chunk = value.subarray(0, Math.max(0, MAX_OUTPUT_BYTES - size));
+        size += chunk.byteLength;
+        body += decoder.decode(chunk, { stream: true });
+        if (size >= MAX_OUTPUT_BYTES) {
+          await reader.cancel();
+          break;
+        }
+      }
+    }
+    const statusMatches = response.status === (probe.expectedStatus ?? 200);
+    const bodyMatches = probe.bodyIncludes === undefined || body.includes(probe.bodyIncludes);
+    const outputTail = `HTTP ${response.status}; body=${body}`.slice(-MAX_OUTPUT_BYTES);
+    return {
+      status: statusMatches && bodyMatches ? "passed" : "failed",
+      exitCode: statusMatches && bodyMatches ? 0 : 1,
+      signal: null,
+      durationMs: Date.now() - startedAt,
+      outputTail,
+      outputSha256: createHash("sha256").update(outputTail).digest("hex"),
+      failureSetSha256: createFailureSetFingerprint(command, outputTail, statusMatches && bodyMatches ? 0 : 1, null),
+      source: "executed",
+    };
+  } catch (error) {
+    const outputTail = error instanceof Error ? error.message : String(error);
+    return {
+      status: "failed",
+      exitCode: null,
+      signal: controller.signal.aborted ? "timeout" : null,
+      durationMs: Date.now() - startedAt,
+      outputTail,
+      outputSha256: createHash("sha256").update(outputTail).digest("hex"),
+      failureSetSha256: createFailureSetFingerprint(command, outputTail, null, controller.signal.aborted ? "timeout" : null),
+      source: "executed",
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function pathMatchesAffectedArea(path: string, area: string): boolean {
@@ -176,6 +305,7 @@ export async function runVerificationCommand(
   childEnvironmentAllowlist?: string[],
   toolchainPaths?: string[],
   sandboxExecutablePath?: string,
+  executionContext?: VerificationExecutionContext,
 ): Promise<Omit<VerificationResult, "criterionId" | "command">> {
   const { executable, args } = parseVerificationCommand(command);
   const startedAt = Date.now();
@@ -193,10 +323,11 @@ export async function runVerificationCommand(
       source: "executed",
     };
   }
-  const sandboxEnabled = sandboxRequested({ sandbox });
-  const environment = buildChildEnvironment({ sandbox: sandboxEnabled, additionalKeys: childEnvironmentAllowlist });
+  const execution = executionContext ?? await createVerificationExecutionContext({ sandbox, childEnvironmentAllowlist, verifyToolchainPaths: toolchainPaths, sandboxExecutablePath });
+  const sandboxEnabled = execution.sandbox;
+  const environment = execution.environment;
   const launch = sandboxEnabled
-    ? sandboxArguments(executable, args, cwd, environment, toolchainPaths, sandboxExecutablePath)
+    ? sandboxArguments(executable, args, cwd, environment, execution.toolchainPaths, execution.sandboxExecutablePath)
     : { command: executable, args };
   return new Promise((resolve) => {
     const child = spawn(launch.command, launch.args, {
@@ -396,8 +527,9 @@ export async function verifyMissionSubmission(input: {
   const mission = input.missionLedger.getMissionByWorkSession(input.workSessionId);
   const session = input.workSessions.get(input.workSessionId);
   const latest = session?.latestSubmission;
-  const snapshotKind = latest?.snapshotKind ?? (latest?.snapshotCommit?.startsWith("fs:") ? "filesystem" : latest?.snapshotCommit ? "git" : undefined);
-  const snapshotRef = latest?.snapshotRef ?? latest?.snapshotCommit;
+  const snapshotIdentity = latest ? normalizeWorkspaceSnapshotIdentity(latest) : undefined;
+  const snapshotKind = snapshotIdentity?.kind;
+  const snapshotRef = snapshotIdentity?.ref;
   if (!mission || !session || !latest?.id || !snapshotKind || !snapshotRef) throw new Error("A submitted mission snapshot is required.");
   const submittedSnapshot: WorkspaceSnapshot = { kind: snapshotKind, ref: snapshotRef, createdAt: latest.createdAt };
   if (input.submissionId && input.submissionId !== latest.id) {
@@ -453,6 +585,12 @@ export async function verifyMissionSubmission(input: {
   // against the exact submitted snapshot instead.
   await assertBinding();
   const packet = input.missionLedger.getPacket(input.workSessionId);
+  const executionContext = await createVerificationExecutionContext({
+    sandbox: input.sandbox,
+    childEnvironmentAllowlist: input.childEnvironmentAllowlist,
+    verifyToolchainPaths: input.verifyToolchainPaths,
+    sandboxExecutablePath: input.sandboxExecutablePath,
+  });
   const explicitlySelected = input.criterionIds?.length ? new Set(input.criterionIds) : undefined;
   const requestedScope = input.verificationScope ?? (explicitlySelected ? "focused" : "full");
   const finalPhase = input.verificationPhase === "final";
@@ -483,52 +621,52 @@ export async function verifyMissionSubmission(input: {
       }
     }
   }
-  const criteria = packet.criteria.filter((criterion) => !!criterion.verificationCommand
+  const criteria = packet.criteria.filter((criterion) => ((criterion.verificationType === "test" && !!criterion.verificationCommand)
+    || (criterion.verificationType === "runtime_behavior" && !!criterion.runtimeProbe))
     && (!selectedWithDependencies || selectedWithDependencies.has(criterion.id))
     && scopeAllows(criterion)
     && (!criterion.finalOnly || finalPhase || explicitlySelected?.has(criterion.id)));
   const verificationWorkspace = await createVerificationWorkspace(session.workspaceSessionId, workspace.root, submittedSnapshot, input.reviewCheckpoints);
   try {
   const results: VerificationResult[] = [];
-  const pendingEvidence: Array<{ criterionId: string; submissionId: string; reviewEpoch: number; snapshotKind: "git" | "filesystem"; snapshotRef: string; snapshotCommit: string; leaseNonce?: string; command: string; status: "passed" | "failed" | "inconclusive"; source: "server_test_runner"; details: Record<string, unknown> }> = [];
+  const pendingEvidence: Array<{ criterionId?: string; findingId?: string; submissionId: string; reviewEpoch: number; snapshotKind: "git" | "filesystem"; snapshotRef: string; snapshotCommit: string; leaseNonce?: string; command: string; status: "passed" | "failed" | "inconclusive"; source: "server_test_runner" | "runtime_probe"; details: Record<string, unknown> }> = [];
   let bindingLost = false;
-  const sandboxEnabled = sandboxRequested({ sandbox: input.sandbox });
-  const environment = buildChildEnvironment({ sandbox: sandboxEnabled });
+  const sandboxEnabled = executionContext.sandbox;
   // P1 #22/P0.3: injected configuration only; no ambient process.env fallback.
   const maxVerificationInflight = input.maxInflight ?? 3;
   const statuses = new Map<string, VerificationResult["status"]>();
   const remaining = new Map(criteria.map((criterion) => [criterion.id, criterion]));
-  const packetCriterionById = new Map(packet.criteria.map((criterion) => [criterion.id, criterion]));
   const dependencyStatus = (dependencyId: string): VerificationResult["status"] | undefined => {
     const executed = statuses.get(dependencyId);
     if (executed) return executed;
-    const persisted = packetCriterionById.get(dependencyId);
+    const persisted = packet.criterionStates?.find((state) => state.criterionId === dependencyId);
     if (persisted?.status === "verified") return "passed";
     if (persisted?.status === "failed") return "failed";
     return undefined;
   };
 
   const recordResult = (criterion: typeof criteria[number], result: Omit<VerificationResult, "criterionId" | "command">): VerificationResult => {
-    const command = criterion.verificationCommand!;
+    const command = criterion.verificationCommand ?? runtimeProbeLabel(criterion.runtimeProbe!);
+    const source = criterion.verificationType === "runtime_behavior" ? "runtime_probe" as const : "server_test_runner" as const;
     const full = { criterionId: criterion.id, command, ...result };
-    pendingEvidence.push({ criterionId: criterion.id, submissionId: latest.id, reviewEpoch: latest.reviewEpoch ?? 0, snapshotKind, snapshotRef, snapshotCommit: snapshotRef, leaseNonce: boundLeaseNonce, command, source: "server_test_runner", status: result.status, details: { exitCode: result.exitCode, signal: result.signal, durationMs: result.durationMs, deadlineAtMs, outputTail: result.outputTail, outputSha256: result.outputSha256, failureSetSha256: result.failureSetSha256, cacheKey: verificationCacheKey(command, criterion.commandVersion ?? DEFAULT_COMMAND_VERSION, environment), provenance: result.source } });
+    pendingEvidence.push({ criterionId: criterion.id, submissionId: latest.id, reviewEpoch: latest.reviewEpoch ?? 0, snapshotKind, snapshotRef, snapshotCommit: snapshotRef, leaseNonce: boundLeaseNonce, command, source, status: result.status, details: { exitCode: result.exitCode, signal: result.signal, durationMs: result.durationMs, deadlineAtMs, outputTail: result.outputTail, outputSha256: result.outputSha256, failureSetSha256: result.failureSetSha256, cacheKey: verificationCacheKey(command, criterion.commandVersion ?? DEFAULT_COMMAND_VERSION, executionContext), provenance: result.source } });
     results.push(full);
     statuses.set(criterion.id, result.status);
     return full;
   };
 
   const runCriterion = async (criterion: typeof criteria[number]): Promise<VerificationResult> => {
-    const command = criterion.verificationCommand!;
+    const command = criterion.verificationCommand ?? runtimeProbeLabel(criterion.runtimeProbe!);
     try {
       await assertBinding();
-      const cacheKey = verificationCacheKey(command, criterion.commandVersion ?? DEFAULT_COMMAND_VERSION, environment);
+      const cacheKey = verificationCacheKey(command, criterion.commandVersion ?? DEFAULT_COMMAND_VERSION, executionContext);
       // "unspecified" is not a toolchain identity. Never reuse evidence across
       // verifier invocations unless the mission supplies a deterministic
       // command version (or an equivalent toolchain fingerprint).
-      const cached = criterion.commandVersion
+      const cached = criterion.verificationType === "test" && criterion.commandVersion
         ? packet.evidence.find((entry) => {
             const details = parseDetails(entry.details);
-            return entry.criterionId === criterion.id && entry.command === command && entry.submissionId === latest.id && entry.reviewEpoch === (latest.reviewEpoch ?? 0) && entry.snapshotCommit === latest.snapshotCommit && entry.status !== "inconclusive" && details.cacheKey === cacheKey;
+            return entry.criterionId === criterion.id && entry.command === command && entry.submissionId === latest.id && entry.reviewEpoch === (latest.reviewEpoch ?? 0) && entry.snapshotKind === snapshotKind && entry.snapshotRef === snapshotRef && entry.status !== "inconclusive" && details.cacheKey === cacheKey;
           })
         : undefined;
       let result: Omit<VerificationResult, "criterionId" | "command">;
@@ -546,7 +684,9 @@ export async function verifyMissionSubmission(input: {
           source: "reused_exact_snapshot",
         };
       } else {
-        result = await runVerificationCommand(command, verificationWorkspace.root, 300_000, deadlineAtMs, sandboxEnabled, input.childEnvironmentAllowlist, input.verifyToolchainPaths, input.sandboxExecutablePath);
+        result = criterion.verificationType === "runtime_behavior"
+          ? await runRuntimeProbe(criterion.runtimeProbe!, deadlineAtMs)
+          : await runVerificationCommand(command, verificationWorkspace.root, 300_000, deadlineAtMs, sandboxEnabled, input.childEnvironmentAllowlist, input.verifyToolchainPaths, input.sandboxExecutablePath, executionContext);
       }
       await assertBinding();
       return recordResult(criterion, result);
@@ -567,32 +707,95 @@ export async function verifyMissionSubmission(input: {
     for (const criterion of batch) remaining.delete(criterion.id);
     if (batch.some((criterion) => criterion.mutatesWorkspace)) {
       const criterion = batch.find((candidate) => candidate.mutatesWorkspace)!;
-      if ((criterion.dependsOnCriterionIds ?? []).some((dependency) => dependencyStatus(dependency) !== "passed")) recordResult(criterion, inconclusiveResult(criterion.id, criterion.verificationCommand!, "Verification skipped because a prerequisite criterion failed."));
+      if ((criterion.dependsOnCriterionIds ?? []).some((dependency) => dependencyStatus(dependency) !== "passed")) recordResult(criterion, inconclusiveResult(criterion.id, criterion.verificationCommand ?? runtimeProbeLabel(criterion.runtimeProbe!), "Verification skipped because a prerequisite criterion failed."));
       else await runCriterion(criterion);
     } else {
       await Promise.all(batch.map(async (criterion) => {
-        if ((criterion.dependsOnCriterionIds ?? []).some((dependency) => dependencyStatus(dependency) !== "passed")) recordResult(criterion, inconclusiveResult(criterion.id, criterion.verificationCommand!, "Verification skipped because a prerequisite criterion failed."));
+        if ((criterion.dependsOnCriterionIds ?? []).some((dependency) => dependencyStatus(dependency) !== "passed")) recordResult(criterion, inconclusiveResult(criterion.id, criterion.verificationCommand ?? runtimeProbeLabel(criterion.runtimeProbe!), "Verification skipped because a prerequisite criterion failed."));
         else await runCriterion(criterion);
       }));
     }
   }
+  const persistEvidence = (entries: typeof pendingEvidence, forceInconclusive = false): void => {
+    for (const source of ["server_test_runner", "runtime_probe"] as const) {
+      const selected = entries.filter((entry) => entry.source === source);
+      if (!selected.length) continue;
+      const normalized = selected.map(({ source: _source, ...entry }) => ({ ...entry, ...(forceInconclusive ? { status: "inconclusive" as const } : {}) }));
+      if (source === "runtime_probe") input.missionLedger.recordRuntimeProbeEvidence(mission.id, normalized);
+      else input.missionLedger.recordVerifierEvidence(mission.id, normalized);
+    }
+  };
   if (bindingLost) {
-    const entries = pendingEvidence.map(({ source: _source, ...entry }) => ({ ...entry, status: "inconclusive" as const }));
-    if (input.missionLedger.recordVerifierEvidence) input.missionLedger.recordVerifierEvidence(mission.id, entries);
-    else input.missionLedger.recordEvidence(mission.id, pendingEvidence.map((entry) => ({ ...entry, status: "inconclusive" as const })));
+    persistEvidence(pendingEvidence, true);
     return results.map((result) => result.status === "passed" ? { ...result, status: "inconclusive" as const } : result);
   }
-  const trustedEntries = pendingEvidence.map(({ source: _source, ...entry }) => entry);
-  if (input.missionLedger.recordVerifierEvidence) input.missionLedger.recordVerifierEvidence(mission.id, trustedEntries);
-  else input.missionLedger.recordEvidence(mission.id, pendingEvidence);
+  const findingEvidence: typeof pendingEvidence = [];
+  for (const finding of packet.findings.filter((item) => item.status === "claimed_resolved" && item.requiredVerification.length > 0)) {
+    for (const command of finding.requiredVerification) {
+      let result: Omit<VerificationResult, "criterionId" | "command">;
+      try {
+        await assertBinding();
+        result = await runVerificationCommand(command, verificationWorkspace.root, 300_000, deadlineAtMs, sandboxEnabled, input.childEnvironmentAllowlist, input.verifyToolchainPaths, input.sandboxExecutablePath, executionContext);
+        await assertBinding();
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (error instanceof VerificationBindingError) bindingLost = true;
+        result = {
+          status: "inconclusive",
+          exitCode: null,
+          signal: null,
+          durationMs: 0,
+          outputTail: message,
+          outputSha256: createHash("sha256").update(message).digest("hex"),
+          failureSetSha256: createFailureSetFingerprint(command, message, null, null),
+          source: "executed",
+        };
+      }
+      findingEvidence.push({
+        findingId: finding.id,
+        submissionId: latest.id,
+        reviewEpoch: latest.reviewEpoch ?? 0,
+        snapshotKind,
+        snapshotRef,
+        snapshotCommit: snapshotRef,
+        leaseNonce: boundLeaseNonce,
+        command,
+        status: result.status,
+        source: "server_test_runner",
+        details: {
+          exitCode: result.exitCode,
+          signal: result.signal,
+          durationMs: result.durationMs,
+          deadlineAtMs,
+          outputTail: result.outputTail,
+          outputSha256: result.outputSha256,
+          failureSetSha256: result.failureSetSha256,
+          provenance: result.source,
+        },
+      });
+      results.push({ criterionId: `finding:${finding.id}`, command, ...result });
+      if (bindingLost) break;
+    }
+    if (bindingLost) break;
+  }
+  persistEvidence([...pendingEvidence, ...findingEvidence], bindingLost);
+  if (bindingLost) {
+    return results.map((result) => result.status === "passed" ? { ...result, status: "inconclusive" as const } : result);
+  }
+  const currentContext = { submissionId: latest.id, snapshotKind, snapshotRef, snapshotCommit: snapshotRef, reviewEpoch: latest.reviewEpoch };
+  for (const finding of packet.findings.filter((item) => item.status === "claimed_resolved")) {
+    try { input.missionLedger.resolveFinding(mission.id, finding.id, currentContext); }
+    catch { /* The ledger leaves the finding claimed until every required evidence item exists. */ }
+  }
   // Final integration commands run only after every required criterion is
   // currently verified. Their report is independently bound to this snapshot.
   const refreshed = input.missionLedger.getPacket(input.workSessionId);
-  const requiredReady = refreshed.criteria.filter((criterion) => criterion.priority === "required").every((criterion) => criterion.status === "verified");
+  const effectiveStates = new Map((refreshed.criterionStates ?? []).map((state) => [state.criterionId, state.status]));
+  const requiredReady = refreshed.criteria.filter((criterion) => criterion.priority === "required").every((criterion) => effectiveStates.get(criterion.id) === "verified");
   if (requiredReady && mission.finalVerification.length) {
     const finalResults: Array<Omit<VerificationResult, "criterionId"> & { cacheKey: string }> = [];
     for (const command of mission.finalVerification) {
-      const cacheKey = verificationCacheKey(command, DEFAULT_COMMAND_VERSION, environment);
+      const cacheKey = verificationCacheKey(command, DEFAULT_COMMAND_VERSION, executionContext);
       let result: Omit<VerificationResult, "criterionId" | "command">;
       try {
         await assertBinding();
@@ -612,7 +815,7 @@ export async function verifyMissionSubmission(input: {
             source: "reused_exact_snapshot",
           };
         } else {
-          result = await runVerificationCommand(command, verificationWorkspace.root, 300_000, deadlineAtMs, sandboxEnabled, input.childEnvironmentAllowlist, input.verifyToolchainPaths, input.sandboxExecutablePath);
+          result = await runVerificationCommand(command, verificationWorkspace.root, 300_000, deadlineAtMs, sandboxEnabled, input.childEnvironmentAllowlist, input.verifyToolchainPaths, input.sandboxExecutablePath, executionContext);
         }
         await assertBinding();
       }

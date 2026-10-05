@@ -21,7 +21,7 @@ import type {
   WorkSessionStatus,
   WorkSessionSubmission,
 } from "./types.js";
-import type { WorkspaceSnapshotKind, ReviewFile } from "../review-checkpoints.js";
+import { normalizeWorkspaceSnapshotIdentity, type WorkspaceSnapshotKind, type ReviewFile } from "../review-checkpoints.js";
 import type { CheckpointCoverage } from "../checkpoint-coverage.js";
 import { isTerminalStatus, rowToSubmission, rowToFeedback, sha256 } from "./internal.js";
 
@@ -70,6 +70,7 @@ export function createReviewSubmissionStore(db: DatabaseHandle, deps: {
       /** P1 (audit): checkpoint-coverage record for this submission. */
       coverage?: CheckpointCoverage;
     }): WorkSessionSubmission {
+      const snapshot = normalizeWorkspaceSnapshotIdentity(input);
       const diffSha256 = input.diffSha256 ?? sha256(input.diff ?? "");
       const now = new Date().toISOString();
       const submissionId = `wssub_${randomUUID()}`;
@@ -102,9 +103,9 @@ export function createReviewSubmissionStore(db: DatabaseHandle, deps: {
           input.diff ?? null,
           diffSha256,
           input.files ? JSON.stringify(input.files) : null,
-          input.snapshotCommit ?? null,
-          input.snapshotKind ?? (input.snapshotCommit ? "git" : null),
-          input.snapshotRef ?? input.snapshotCommit ?? null,
+          snapshot?.ref ?? null,
+          snapshot?.kind ?? null,
+          snapshot?.ref ?? null,
           reviewEpoch,
           input.message ?? null,
           input.summaryJson ?? null,
@@ -126,9 +127,9 @@ export function createReviewSubmissionStore(db: DatabaseHandle, deps: {
         submissionNumber: createSubmission.submissionNumber,
         diff: input.diff,
         diffSha256,
-        snapshotKind: input.snapshotKind ?? (input.snapshotCommit ? "git" : undefined),
-        snapshotRef: input.snapshotRef ?? input.snapshotCommit,
-        snapshotCommit: input.snapshotCommit,
+        snapshotKind: snapshot?.kind,
+        snapshotRef: snapshot?.ref,
+        snapshotCommit: snapshot?.ref,
         reviewEpoch: createSubmission.reviewEpoch,
         message: input.message,
         summaryJson: input.summaryJson,

@@ -71,7 +71,17 @@ const migrations: Migration[] = [
   { version: 59, name: "durable-telemetry-ingress", up: migrateDurableTelemetryIngress },
   { version: 60, name: "managed-worktree-retirement", up: migrateManagedWorktreeRetirement },
   { version: 61, name: "telemetry-ingress-retention-index", up: migrateTelemetryIngressRetentionIndex },
+  { version: 62, name: "mission-outcome-authority", up: migrateMissionOutcomeAuthority },
 ];
+
+function migrateMissionOutcomeAuthority(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "mission_contracts", "contract_fingerprint", "text");
+  addColumnIfMissing(sqlite, "mission_acceptance_criteria", "runtime_probe_json", "text");
+  addColumnIfMissing(sqlite, "mission_review_findings", "resolution_evidence_json", "text not null default '[]'");
+  addColumnIfMissing(sqlite, "mission_evidence", "finding_id", "text");
+  sqlite.exec("create index if not exists mission_evidence_finding_idx on mission_evidence(finding_id, created_at)");
+  sqlite.exec("update mission_acceptance_criteria set verification_type = 'test' where verification_type = 'manual_review' and verification_command is not null");
+}
 
 function migrateApprovalDirectOperationHash(sqlite: Database.Database): void {
   addColumnIfMissing(sqlite, "approval_requests", "operation_hash", "text");

@@ -9,6 +9,7 @@ import { mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { testHarnessEnvironment } from "./lib/tool-environment.mjs";
+import { REQUIRED_BETA_FAULT_CASES } from "./beta-soak-contract.mjs";
 
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const reportPath = resolve(process.env.KONTROL_BETA_FAULT_REPORT ?? join(root, "beta-fault-matrix.json"));
@@ -25,6 +26,9 @@ const cases = [
   { id: "mcp-session-reaper-and-sse", area: "mcp", command: "npx", args: ["--no-install", "tsx", "src/mcp-session-reuse.test.ts"] },
   { id: "process-session-lifecycle", area: "processes", command: "npx", args: ["--no-install", "tsx", "src/process-sessions.test.ts"] },
   { id: "approval-disconnect-reconnect", area: "approvals", command: "npx", args: ["--no-install", "tsx", "src/policy-ask-lifecycle.test.ts"] },
+  // Both public mission entry paths, durable correction across restart,
+  // current-snapshot evidence, finding resolution, and exact approval.
+  { id: "supervised-mission-loop", area: "missions", command: process.execPath, args: ["scripts/supervised-mission-loop-qualification.mjs"] },
   { id: "accelerated-maintenance-integrity-soak", area: "maintenance", command: process.execPath, args: ["src/lifecycle-soak.test.mjs"] },
 ];
 
@@ -37,6 +41,7 @@ function writeReport(report) {
 
 const report = {
   kind: "kontrol-beta-fault-matrix",
+  buildId: process.env.KONTROL_BETA_BUILD_ID,
   startedAt: new Date().toISOString(),
   qualified: false,
   cases: [],
@@ -68,7 +73,8 @@ for (const testCase of cases) {
 }
 
 report.finishedAt = new Date().toISOString();
-report.qualified = report.cases.length === cases.length && report.cases.every((testCase) => testCase.passed);
+report.missingRequiredCases = REQUIRED_BETA_FAULT_CASES.filter((id) => !report.cases.some((testCase) => testCase.id === id && testCase.passed));
+report.qualified = report.missingRequiredCases.length === 0 && report.cases.length === cases.length && report.cases.every((testCase) => testCase.passed);
 writeReport(report);
 console.log(`[beta-fault-matrix] ${report.qualified ? "QUALIFIED" : "FAILED"}; report=${reportPath}`);
 if (!report.qualified) process.exitCode = 1;

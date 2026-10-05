@@ -21,7 +21,7 @@ import type {
   WorkSessionFeedbackRow,
   WorkSessionToolEventRow,
 } from "../db/schema.js";
-import type { ReviewFile } from "../review-checkpoints.js";
+import { normalizeWorkspaceSnapshotIdentity, type ReviewFile } from "../review-checkpoints.js";
 import type { CheckpointCoverage } from "../checkpoint-coverage.js";
 import { createHash } from "node:crypto";
 
@@ -77,15 +77,20 @@ export function classifyLifecycle(
 
 export const STALE_THRESHOLD_MS = 60 * 60 * 1000; // 1 hour
 export function rowToSubmission(row: WorkSessionSubmissionRow): WorkSessionSubmission {
+  const snapshot = normalizeWorkspaceSnapshotIdentity({
+    snapshotKind: row.snapshotKind,
+    snapshotRef: row.snapshotRef,
+    snapshotCommit: row.snapshotCommit,
+  });
   return {
     id: row.id,
     workSessionId: row.workSessionId,
     submissionNumber: row.submissionNumber ?? 1,
     diff: row.diff ?? undefined,
     diffSha256: row.diffSha256 ?? undefined,
-    snapshotKind: (row.snapshotKind as "git" | "filesystem" | null | undefined) ?? (row.snapshotCommit ? "git" : undefined),
-    snapshotRef: row.snapshotRef ?? row.snapshotCommit ?? undefined,
-    snapshotCommit: row.snapshotCommit ?? undefined,
+    snapshotKind: snapshot?.kind,
+    snapshotRef: snapshot?.ref,
+    snapshotCommit: snapshot?.ref,
     reviewEpoch: row.reviewEpoch ?? 1,
     message: row.message ?? undefined,
     summaryJson: row.summaryJson ?? undefined,

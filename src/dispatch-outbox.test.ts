@@ -109,7 +109,7 @@ try {
       canonicalRoot: "/tmp/checkout-a",
       workspaceSessionId: "ws_1",
       workSessionId: workspace.id,
-      ttlMs: 50,
+      ttlMs: 5_000,
     });
     assert.ok(acquired.acquired, "initial lease acquisition should succeed");
     assert.equal(
@@ -119,18 +119,29 @@ try {
     );
     const originalExpiry = acquired.lease.expiresAt;
 
-    // Re-acquisition rotates the fencing token. An old worker may no longer
-    // extend the lease after another owner generation has taken over.
+    // Ordinary same-session acquisition is renewal; only explicit takeover
+    // rotates the fencing token.
     const reacquired = workSessions.acquireWorkspaceLease({
       canonicalRoot: "/tmp/checkout-a",
       workspaceSessionId: "ws_1",
       workSessionId: workspace.id,
-      ttlMs: 50,
+      ttlMs: 5_000,
     });
     assert.ok(reacquired.acquired);
-    assert.notEqual(reacquired.lease.leaseNonce, acquired.lease.leaseNonce, "lease generations use distinct fencing tokens");
-    assert.equal(workSessions.renewWorkspaceLeaseForSession(workspace.id, 60 * 60 * 1000, acquired.lease.leaseNonce), 0, "stale fencing token cannot renew");
-    assert.equal(workSessions.renewWorkspaceLeaseForSession(workspace.id, 60 * 60 * 1000, reacquired.lease.leaseNonce), 1, "current fencing token renews");
+    assert.equal(reacquired.lease.leaseNonce, acquired.lease.leaseNonce, "ordinary same-session acquisition preserves ownership");
+    const explicitLeaseTakeover = workSessions.acquireWorkspaceLease({
+      canonicalRoot: "/tmp/checkout-a",
+      workspaceSessionId: "ws_1",
+      workSessionId: workspace.id,
+      ttlMs: 5_000,
+      takeover: true,
+    });
+    assert.ok(explicitLeaseTakeover.acquired);
+    assert.notEqual(explicitLeaseTakeover.lease.leaseNonce, acquired.lease.leaseNonce, "explicit takeover rotates the fencing token");
+    assert.equal(workSessions.renewWorkspaceLeaseForSession(workspace.id, 60 * 60 * 1000, acquired.lease.leaseNonce), 0, "stale fencing token cannot renew after takeover");
+    assert.equal(workSessions.renewWorkspaceLeaseForSession(workspace.id, 60 * 60 * 1000, explicitLeaseTakeover.lease.leaseNonce), 1, "current fencing token renews");
+    assert.equal(workSessions.restoreWorkspaceLeaseForSession(acquired.lease, explicitLeaseTakeover.lease.leaseNonce), true, "failed dispatch can restore the prior lease generation");
+    assert.equal(workSessions.getWorkspaceLeaseForSession(workspace.id)?.leaseNonce, acquired.lease.leaseNonce);
 
     // Renewal without a fencing token is never ownership proof.
     const renewWithoutNonce = workSessions.renewWorkspaceLeaseForSession as (
@@ -140,7 +151,7 @@ try {
     ) => number;
     const unfencedRenewal = renewWithoutNonce(workspace.id, 60 * 60 * 1000, undefined);
     assert.equal(unfencedRenewal, 0, "renewal without the current nonce must fail closed");
-    const renewed = workSessions.renewWorkspaceLeaseForSession(workspace.id, 60 * 60 * 1000, reacquired.lease.leaseNonce);
+    const renewed = workSessions.renewWorkspaceLeaseForSession(workspace.id, 60 * 60 * 1000, acquired.lease.leaseNonce);
     assert.equal(renewed, 1, "renewal with the current nonce should touch exactly the one owned lease");
 
     // Renewal for a session that owns no lease is a harmless no-op.

@@ -40,7 +40,11 @@ ACP review workflow:
   optional bounded assistance only; call `discover_agents` before delegation,
   dispatch only a currently dispatchable healthy `role: agent` peer, and when
   optional assistance is unavailable return to direct workspace work without
-  trying an alternate ACP path. A normal review must not enter supervised work.
+  trying an alternate ACP path. When the caller platform is identifiable,
+  prefer its healthy registered native harness (for example ChatGPT/OpenAI to
+  Codex); otherwise use any healthy registered ACP peer. `agentName` is an
+  explicit override. The platform hint affects routing only, never authority.
+  A normal review must not enter supervised work.
   Ordinary non-Git directories are valid checkout workspaces; Git is required
   only for managed worktrees.
 - Review checkpoints are backend-neutral: Git workspaces use immutable Git
@@ -156,6 +160,19 @@ Current implementation contracts:
   aware read-only checks with the bounded `KONTROL_VERIFY_MAX_INFLIGHT` pool,
   and may reuse evidence only when submission, snapshot, command version,
   environment, and verifier policy match.
+- Mission evidence is authoritative only when its server-assigned source
+  matches the criterion's verification type. Current criterion state is
+  derived from qualifying evidence bound to the active submission, normalized
+  snapshot identity, and review epoch; persisted status fields are hints only.
+  `verified_resolved` findings require independent evidence against the exact
+  current submission. `snapshotKind` plus `snapshotRef` is canonical;
+  `snapshotCommit` is accepted only as a matching compatibility alias.
+- Both supervised public entry paths use the same mission contract and
+  reviewer-gated completion policy. Correction rounds are separate from the
+  supervisor emergency cycle ceiling. Baseline capture is required before a
+  mission is created. Stable-beta qualification includes a
+  `supervised-mission-loop` fault case and requires that case's receipt for the
+  exact build in the soak assertion set.
 - Native Hermes supervision distinguishes idle control-plane silence from a
   known child operation or pending permission. `KONTROL_HERMES_MAX_RUN_SECONDS`
   remains the absolute safety ceiling, and `KONTROL_HERMES_DEADMAN_IDLE_MS`

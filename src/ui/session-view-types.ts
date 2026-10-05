@@ -116,8 +116,9 @@ export interface AgentMessageView {
 export interface MissionPacketView {
   supervisor?: { id: string; status: string; resumeStatus?: string | null; revision: number; cycleNumber: number; maxCycles: number; autonomyMode: string; approvalMode: string; repeatedFailureCount?: number; repeatedFailureFingerprintLimit?: number; stagnantCycleCount?: number; progressJson?: string | null; stallReason?: string | null; updatedAt?: string; deadlineAt?: string; lastError?: string };
   mission?: { id: string; objective: string; desiredOutcome?: string; correctionRounds?: number; maxCorrectionRounds?: number };
-  criteria: Array<{ id: string; description: string; priority: string; status: string; verificationType?: string; verificationCommand?: string; dependsOnCriterionIds?: string[] }>;
-  findings: Array<{ id: string; description: string; severity: string; scope: string; status: string; requiredAction?: string }>;
+  criteria: Array<{ id: string; description: string; priority: string; status: string; verificationType?: string; verificationCommand?: string; runtimeProbe?: { url: string; method?: string; expectedStatus?: number; bodyIncludes?: string }; dependsOnCriterionIds?: string[] }>;
+  criterionStates?: Array<{ criterionId: string; status: string; staleReason?: string; dependenciesSatisfied: boolean }>;
+  findings: Array<{ id: string; description: string; severity: string; scope: string; status: string; requiredAction?: string; requiredVerification?: string[] }>;
   workOrders: Array<{ id: string; objectiveForThisTurn: string; status: string }>;
   evidence: Array<{ id: string; criterionId?: string; status: string; source?: string; command?: string }>;
   completionReports?: Array<{ id: string; status: string; reportSha256: string; createdAt: string }>;

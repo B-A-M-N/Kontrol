@@ -8,7 +8,7 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { validateBetaSoakAssertions } from "./beta-soak-contract.mjs";
+import { validateBetaFaultMatrix, validateBetaSoakAssertions } from "./beta-soak-contract.mjs";
 import { validateBetaExternalCatalogReceipt } from "./beta-external-catalog-contract.mjs";
 
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
@@ -73,6 +73,7 @@ const soakStart = soak?.snapshots?.started;
 const soakFinish = soak?.snapshots?.finished;
 const soakAssertions = soak?.assertions;
 const soakAssertionCheck = validateBetaSoakAssertions(soakAssertions);
+const faultMatrixCheck = validateBetaFaultMatrix(code?.faultMatrix, { candidateBuildId });
 const soakStartedAtMs = Date.parse(soak?.startedAt ?? "");
 const soakFinishedAtMs = Date.parse(soak?.finishedAt ?? "");
 const soakDuration = Boolean(
@@ -188,7 +189,8 @@ const receipt = {
   checks: {
     codeReceiptPresent: Boolean(code),
     codeQualified: code?.codeQualified === true,
-    faultMatrixQualified: code?.faultMatrix?.qualified === true,
+    faultMatrixQualified: faultMatrixCheck.valid,
+    supervisedMissionLoopQualified: faultMatrixCheck.valid,
     candidateIdentity,
     sourceUnchanged,
     soakDuration,

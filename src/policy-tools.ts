@@ -441,6 +441,12 @@ export function registerPolicyTools(
         : decision === "approve_workspace"
           ? "workspace"
           : (scope ?? "once");
+      if (approvalScope === "workspace" && /^(?:transport|ephemeral-workspace):/.test(match.principalId)) {
+        return {
+          content: [{ type: "text" as const, text: "A durable workspace grant requires a stable authenticated principal. This request is transport-scoped; approve it once or authenticate with a stable principal." }],
+          isError: true,
+        };
+      }
       if (decision !== "deny" && match.approvalKey) {
         config.policyEngine.recordApproval(
           match.principalId,

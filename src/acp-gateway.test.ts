@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import express from "express";
 import Database from "better-sqlite3";
-import { authHeadersForAgent, callRemoteAgent, dispatchToPeer, probeAgent } from "./acp-gateway.js";
+import { authHeadersForAgent, callRemoteAgent, dispatchToPeer, probeAgent, selectHealthyAgent } from "./acp-gateway.js";
 import { createAcpServer } from "./acp-server.js";
 import { openDatabase, databasePath } from "./db/client.js";
 import { createAgentRegistryManager } from "./acp-registry.js";
@@ -46,6 +46,27 @@ try {
   assert.equal(unsupportedProbe.healthy, false, "non-HTTP ACP transports are not dispatchable by the HTTP gateway");
   assert.equal(unsupportedProbe.status, 0);
   assert.match(unsupportedProbe.note ?? "", /unsupported probe transport/);
+
+  {
+    const probeServer = createServer((req, res) => {
+      if (req.method === "GET" && req.url === "/health") res.writeHead(200).end("ok");
+      else res.writeHead(404).end();
+    });
+    servers.push(probeServer);
+    const port = await listen(probeServer, "127.0.0.1");
+    const url = `http://127.0.0.1:${port}`;
+    const candidates = [
+      { id: "generic-id", name: "registered-acp-harness", url, role: "agent", capabilities: ["acp"] },
+      { id: "codex-id", name: "codex", url, role: "agent", capabilities: ["native:openai"] },
+      { id: "reviewer-id", name: "reviewer-only", url, role: "reviewer", capabilities: ["native:openai"] },
+    ] as any;
+    const native = await selectHealthyAgent(candidates, { role: "agent", clientPlatformHint: "ChatGPT OpenAI" });
+    assert.equal(native.agent?.name, "codex", "ChatGPT/OpenAI prefers its registered native harness");
+    const fallback = await selectHealthyAgent([candidates[0], candidates[2]], { role: "agent", clientPlatformHint: "ChatGPT OpenAI" });
+    assert.equal(fallback.agent?.name, "registered-acp-harness", "any healthy registered ACP agent remains an eligible fallback");
+    const explicit = await selectHealthyAgent(candidates, { role: "agent", name: "registered-acp-harness", clientPlatformHint: "ChatGPT OpenAI" });
+    assert.equal(explicit.agent?.name, "registered-acp-harness", "an explicit registered harness choice overrides platform preference");
+  }
 
   {
     let postAuth: string | undefined;

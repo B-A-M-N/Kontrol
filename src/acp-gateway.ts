@@ -154,13 +154,23 @@ export interface HealthyAgentSelection {
  */
 export async function selectHealthyAgent(
   peers: AgentInfo[],
-  opts: { name?: string; role?: string; adapterSecret?: string },
+  opts: { name?: string; role?: string; adapterSecret?: string; clientPlatformHint?: string },
 ): Promise<HealthyAgentSelection> {
   const candidates = peers.filter((a) => {
     if (opts.name && a.name !== opts.name) return false;
     if (opts.role && a.role !== opts.role) return false;
     return true;
   });
+  const platform = normalizePlatformHint(opts.clientPlatformHint);
+  if (platform) {
+    const nativeName = ({ openai: "codex", anthropic: "claude", google: "gemini" } as Record<string, string>)[platform];
+    const capability = `native:${platform}`;
+    candidates.sort((a, b) => {
+      const score = (peer: AgentInfo) => Number(peer.capabilities.includes(capability)) * 2
+        + Number(nativeName !== undefined && peer.name.toLowerCase() === nativeName);
+      return score(b) - score(a);
+    });
+  }
   const deadUrls: string[] = [];
   for (const peer of candidates) {
     const probe = await probeAgent(peer.url, opts.adapterSecret);
@@ -168,6 +178,15 @@ export async function selectHealthyAgent(
     deadUrls.push(`${peer.url} (${probe.error ? probe.error : "HTTP " + probe.status})`);
   }
   return { deadUrls };
+}
+
+function normalizePlatformHint(value: string | undefined): string | undefined {
+  const hint = value?.trim().toLowerCase();
+  if (!hint) return undefined;
+  if (/openai|chatgpt|codex/.test(hint)) return "openai";
+  if (/anthropic|claude/.test(hint)) return "anthropic";
+  if (/google|gemini/.test(hint)) return "google";
+  return hint.replace(/[^a-z0-9_-]/g, "").slice(0, 64) || undefined;
 }
 
 // Correlation between a work session and its ACP run is persisted on the

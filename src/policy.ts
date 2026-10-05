@@ -536,8 +536,8 @@ export function createPolicyEngine(
 
   /**
    * P0.4 dedup by row key: the durable approval row is keyed by the full
-   * MCP-identity + principal + approvalKey. Two invocations with the same
-   * row key are the SAME live call retrying; different row keys always
+   * canonical operation fingerprint. Two invocations with the same row key
+   * are retries of the SAME exact operation; different row keys always
    * create independent rows. Returns the row currently in memory, or
    * looks it up in the durable approval store when one is configured.
    */
@@ -760,7 +760,7 @@ export function createPolicyEngine(
     if (durable.principalId !== content.principalId) return undefined;
     if (durableWorkspaceId !== content.workspaceId) return undefined;
     if ((durable.workSessionId ?? undefined) !== (content.workSessionId ?? undefined)) return undefined;
-    if ((durable.ownerContextId ?? undefined) !== (content.ownerContextId ?? undefined)) return undefined;
+    if (content.workSessionId && (durable.ownerContextId ?? undefined) !== (content.ownerContextId ?? undefined)) return undefined;
     if ((durable.tool ?? "") !== content.tool) return undefined;
     if (durable.approvalKey !== content.approvalKey) return undefined;
     if ((durable.path ?? undefined) !== (content.path ?? undefined)) return undefined;

@@ -9,8 +9,8 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { BridgeConfig } from "./context.js";
 import { callRemoteAgent, selectHealthyAgent } from "../acp-gateway.js";
 import { registerMutationAppTool } from "./app-tool.js";
-import { missionCriterionSchema, workOrderSchema } from "./context.js";
-import { acquireCheckoutModifyLease, checkoutLeaseMetadata, forbidden, isReviewer, liveOwnerContextId, requireWorkSessionRead, renderMissionPrompt, resolveDelegationContext, workSessionInstructions, workspaceAppModelAndAppMeta } from "./shared.js";
+import { supervisedMissionOptionsSchema, workOrderSchema } from "./context.js";
+import { acquireCheckoutModifyLease, captureMissionBaseline, checkoutLeaseMetadata, forbidden, isReviewer, liveOwnerContextId, requireWorkSessionRead, renderMissionPrompt, resolveDelegationContext, workSessionInstructions, workspaceAppModelAndAppMeta } from "./shared.js";
 import { z } from "zod/v4";
 
 export function registerDelegationTools(server: McpServer, config: BridgeConfig): void {
@@ -19,7 +19,7 @@ export function registerDelegationTools(server: McpServer, config: BridgeConfig)
     "submit_to_coding_agent",
     {
       title: "Submit task to coding agent",
-      description: "Optional reviewer-directed delegation from the WebUI to a currently dispatchable registered coding agent. Use direct workspace tools first for review, diagnosis, and code changes; delegation is bounded and the WebUI remains the reviewer.",
+      description: "Optional reviewer-directed delegation from the WebUI to a currently dispatchable registered ACP harness. If agentName is omitted, Kontrol prefers the native registered harness for the caller platform (ChatGPT/OpenAI prefers Codex), then falls back to any healthy role=agent HTTP ACP adapter. The platform hint affects routing only. The WebUI remains the reviewer.",
       inputSchema: {
         task: z.string().trim().min(1).describe("Bounded instruction or task for the coding agent."),
         dispatchIntent: z.enum(["optional_assist", "required_delegate"]).optional().describe("Optional assistance falls back to direct workspace work when unavailable; required_delegate returns an error instead."),
@@ -27,20 +27,10 @@ export function registerDelegationTools(server: McpServer, config: BridgeConfig)
         workspaceSessionId: z.string().optional().describe("Workspace session ID (legacy/internal alias for workspaceId)."),
         workSessionId: z.string().optional().describe("Optional existing work session ID. If omitted, Kontrol creates one before dispatch so the agent can reuse it for submit_for_review correlation."),
         sessionId: z.string().optional().describe("Legacy alias for workSessionId."),
-        agentName: z.string().optional().describe("Registered ACP agent name to dispatch to. Defaults to cli-coding-agent; use mimo-code or another registered agent name when available."),
+        agentName: z.string().optional().describe("Optional registered ACP agent name. Omit to prefer the platform-native registered harness, then any healthy role=agent ACP adapter."),
         completionPolicy: z.enum(["agent_completion", "webui_approval_required"]).optional().describe("Completion policy for newly-created work sessions. Defaults to webui_approval_required for reviewed WebUI dispatch."),
-        missionContract: z.object({
+        missionContract: supervisedMissionOptionsSchema.extend({
           objective: z.string(),
-          desiredOutcome: z.string().optional(),
-          constraints: z.array(z.unknown()).optional(),
-          nonGoals: z.array(z.string()).optional(),
-          acceptanceCriteria: z.array(missionCriterionSchema).optional(),
-          supervisorInstructions: z.string().optional(),
-          maxCorrectionRounds: z.number().int().min(1).max(100).optional(),
-          maxWallTimeMinutes: z.number().int().min(1).max(10_080).optional(),
-          finalVerification: z.array(z.string()).optional(),
-          autonomyMode: z.enum(["manual", "verify_only", "correction_auto", "full"]).optional(),
-          approvalMode: z.enum(["human_required", "policy_auto", "fully_automatic"]).optional(),
           workOrder: workOrderSchema.optional(),
         }).optional().describe("Optional durable mission contract. When present, WebUI approval is mission-gated rather than only snapshot-gated."),
         clientMutationId: z.string().min(1).max(200).optional(),
@@ -79,7 +69,6 @@ export function registerDelegationTools(server: McpServer, config: BridgeConfig)
       workspaceSessionId = resolved.workspaceSessionId;
       workSessionId = resolved.workSessionId;
 
-      const selectedAgentName = agentName ?? "cli-coding-agent";
       if (missionContract) {
         const requiredCount = (missionContract.acceptanceCriteria ?? []).filter((c: { priority?: string }) => (c.priority ?? "required") === "required").length;
         if (requiredCount === 0) {
@@ -94,19 +83,21 @@ export function registerDelegationTools(server: McpServer, config: BridgeConfig)
         }
       }
 
-      // Failover: among agents with the selected name (role=agent), pick the first
-      // that actually answers a protocol-readiness probe. Stale/non-HTTP endpoints
-      // are skipped in favor of a working ACP HTTP endpoint.
+      // If a name was requested, honor it. Otherwise select any currently
+      // dispatchable registered ACP harness; all candidates must pass the
+      // same protocol-readiness probe before durable session state is created.
       const selection = await selectHealthyAgent(config.agentRegistry.listAlive(), {
-        name: selectedAgentName,
+        name: agentName,
         role: "agent",
         adapterSecret: config.adapterSecret,
+        clientPlatformHint: config.connectionContext?.clientPlatformHint,
       });
       if (!selection.agent) {
         const dead = selection.deadUrls.length
           ? ` Dead/ unhealthy endpoints found: ${selection.deadUrls.join("; ")}.`
           : "";
-        const reason = `No healthy dispatchable ACP agent named ${selectedAgentName} (role=agent) is registered.${dead}`;
+        const requested = agentName ? ` named ${agentName}` : "";
+        const reason = `No healthy dispatchable ACP agent${requested} (role=agent) is registered.${dead}`;
         if (dispatchIntent === "optional_assist") {
           return {
             content: [{ type: "text" as const, text: `${reason} Continue in the direct workspace; no alternate ACP route was attempted.` }],
@@ -116,6 +107,19 @@ export function registerDelegationTools(server: McpServer, config: BridgeConfig)
         return { content: [{ type: "text" as const, text: reason }], isError: true };
       }
       const peer = selection.agent;
+      const selectedAgentName = peer.name;
+
+      let missionBaseline: Awaited<ReturnType<typeof captureMissionBaseline>> | undefined;
+      if (missionContract) {
+        try {
+          missionBaseline = await captureMissionBaseline(config, workspaceSessionId);
+        } catch (error) {
+          return {
+            content: [{ type: "text" as const, text: `Cannot dispatch a supervised mission without a durable workspace baseline: ${error instanceof Error ? error.message : String(error)}` }],
+            isError: true,
+          };
+        }
+      }
 
       // Kontrol owns work-session creation (Nelson Wiggum Loop): create the session
       // here and hand its ID to the CLI so the agent reuses it for submit_for_review
@@ -127,7 +131,7 @@ export function registerDelegationTools(server: McpServer, config: BridgeConfig)
           workspaceSessionId,
           submittedBy: "webui",
           title: task.slice(0, 80),
-          completionPolicy: completionPolicy ?? "webui_approval_required",
+          completionPolicy: missionContract ? "webui_approval_required" : completionPolicy ?? "webui_approval_required",
           ownerContextId: liveOwnerContextId(config) ?? config.principalId,
         });
         wsId = created.id;
@@ -148,10 +152,13 @@ export function registerDelegationTools(server: McpServer, config: BridgeConfig)
             isError: true,
           };
         }
-        const EXISTING_TERMINAL = new Set(["approved", "rejected", "cancelled", "failed", "failed_protocol"]);
-        if (EXISTING_TERMINAL.has(existing.status)) {
+        const latestRun = config.agentRegistry.getRunByWorkSessionId(wsId);
+        const freshUndispatchedSession = existing.status === "in_progress"
+          && !existing.latestSubmission
+          && !latestRun;
+        if (!freshUndispatchedSession && !["changes_requested", "resuming"].includes(existing.status)) {
           return {
-            content: [{ type: "text" as const, text: `Work session ${wsId} is ${existing.status}; it cannot be reused for a new dispatch.` }],
+            content: [{ type: "text" as const, text: `Work session ${wsId} is ${existing.status}; dispatch requires a fresh undispatched session or an explicit changes_requested/resuming handoff.` }],
             isError: true,
           };
         }
@@ -163,11 +170,14 @@ export function registerDelegationTools(server: McpServer, config: BridgeConfig)
         }
       }
 
-      const leaseError = await acquireCheckoutModifyLease(config, workspaceSessionId, wsId);
+      const previousLease = !createdSessionForDispatch ? config.workSessions.getWorkspaceLeaseForSession(wsId) : undefined;
+      const activePreviousLease = previousLease && Date.parse(previousLease.expiresAt) > Date.now() ? previousLease : undefined;
+      const leaseError = await acquireCheckoutModifyLease(config, workspaceSessionId, wsId, { takeover: !createdSessionForDispatch });
       if (leaseError) {
         if (createdSessionForDispatch) config.workSessions.updateStatus(wsId, "cancelled");
         return leaseError;
       }
+      const dispatchLease = config.workSessions.getWorkspaceLeaseForSession(wsId);
 
       let supervisorRun: ReturnType<NonNullable<typeof config.supervisorRuns>["create"]> | undefined;
       const rollbackDispatch = (reason: string, runId?: string) => {
@@ -176,6 +186,8 @@ export function registerDelegationTools(server: McpServer, config: BridgeConfig)
         // keeps its review/continuation state and can be retried safely.
         if (createdSessionForDispatch) {
           config.workSessions.updateStatus(wsId!, "failed");
+        } else if (activePreviousLease && dispatchLease) {
+          config.workSessions.restoreWorkspaceLeaseForSession(activePreviousLease, dispatchLease.leaseNonce);
         } else {
           config.workSessions.releaseWorkspaceLeasesForSession(wsId!);
         }
@@ -197,18 +209,6 @@ export function registerDelegationTools(server: McpServer, config: BridgeConfig)
       try {
         let dispatchTask = task;
         if (missionContract && config.missionLedger) {
-          const workspace = config.workspaces.getWorkspace(workspaceSessionId);
-          let baselineCommit: string | undefined;
-          let baselineKind: "git" | "filesystem" | undefined;
-          let baselineRef: string | undefined;
-          try {
-            const baseline = await config.reviewCheckpoints.reviewChanges({ workspaceId: workspaceSessionId, root: workspace.root, since: "workspace_open", markReviewed: false });
-            baselineCommit = baseline.snapshotCommit;
-            baselineKind = baseline.snapshotKind;
-            baselineRef = baseline.snapshotRef;
-          } catch {
-            baselineCommit = undefined;
-          }
           const mission = config.missionLedger.createMission({
             workSessionId: wsId,
             workspaceSessionId,
@@ -220,9 +220,8 @@ export function registerDelegationTools(server: McpServer, config: BridgeConfig)
             supervisorInstructions: missionContract.supervisorInstructions,
             maxCorrectionRounds: missionContract.maxCorrectionRounds,
             finalVerification: missionContract.finalVerification,
-            baselineKind,
-            baselineRef,
-            baselineCommit,
+            reviewCoverage: missionContract.reviewCoverage,
+            ...missionBaseline!,
           });
           supervisorRun = config.supervisorRuns?.create({
             missionId: mission.id,
@@ -230,7 +229,6 @@ export function registerDelegationTools(server: McpServer, config: BridgeConfig)
             workspaceSessionId,
             autonomyMode: missionContract.autonomyMode,
             approvalMode: missionContract.approvalMode,
-            maxCycles: missionContract.maxCorrectionRounds,
             maxWallTimeMs: missionContract.maxWallTimeMinutes ? missionContract.maxWallTimeMinutes * 60_000 : undefined,
           });
           config.missionLedger.createWorkOrder(mission.id, wsId, missionContract.workOrder ?? { objectiveForThisTurn: task });

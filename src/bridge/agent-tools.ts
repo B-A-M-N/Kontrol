@@ -196,7 +196,7 @@ export function registerAgentTools(server: McpServer, config: BridgeConfig): voi
     "discover_agents",
     {
       title: "Discover agents",
-      description: "Inspect every registered peer and probe its protocol readiness. Clearly separates dispatchable agents from unavailable, dead, non-agent, or unsupported-transport entries; only alive role=agent peers with a successful HTTP ACP probe are dispatchable.",
+      description: "Inspect every registered peer and probe its protocol readiness. Clearly separates dispatchable agents from unavailable, dead, non-agent, or unsupported-transport entries; only alive role=agent peers with a successful HTTP ACP probe are dispatchable. Unspecified delegation prefers the registered native harness for the caller platform (ChatGPT/OpenAI prefers Codex), then falls back to another healthy peer.",
       inputSchema: {},
       outputSchema: {
         agents: z.array(z.object({

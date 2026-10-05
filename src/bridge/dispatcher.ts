@@ -326,10 +326,13 @@ export async function defaultResume(
   session: { workspaceSessionId: string },
   agentName = "cli-coding-agent",
 ): Promise<AgentCallResult> {
-  const leaseConflict = await acquireCheckoutModifyLease(config, session.workspaceSessionId, continuation.sessionId);
+  const previousLease = config.workSessions.getWorkspaceLeaseForSession(continuation.sessionId);
+  const activePreviousLease = previousLease && Date.parse(previousLease.expiresAt) > Date.now() ? previousLease : undefined;
+  const leaseConflict = await acquireCheckoutModifyLease(config, session.workspaceSessionId, continuation.sessionId, { takeover: true });
   if (leaseConflict) {
     throw new Error(leaseConflict.content[0]?.text ?? "Unable to acquire the workspace lease for this continuation.");
   }
+  const takeoverLease = config.workSessions.getWorkspaceLeaseForSession(continuation.sessionId);
   const run = config.agentRegistry.getRunByWorkSessionId(continuation.sessionId);
   const agent = config.agentRegistry.listAlive().find((candidate) => candidate.name === agentName);
   const missionPrompt = renderMissionPrompt(config, continuation.sessionId, continuation.promptText);
@@ -338,9 +341,10 @@ export async function defaultResume(
     missionPrompt,
     `Continue from review feedback. ${workSessionInstructions(continuation.sessionId, agent)}`,
   ].filter(Boolean).join("\n\n");
-  return callRemoteAgent(
-    { agentRegistry: config.agentRegistry, workspaces: config.workspaces, workSessions: config.workSessions, adapterSecret: config.adapterSecret },
-    {
+  try {
+    const result = await callRemoteAgent(
+      { agentRegistry: config.agentRegistry, workspaces: config.workspaces, workSessions: config.workSessions, adapterSecret: config.adapterSecret },
+      {
       agentUrl: await resolveHealthyAgentUrl(config, agentName),
       agentName,
       agentId: agent?.id,
@@ -352,6 +356,16 @@ export async function defaultResume(
       ...checkoutLeaseMetadata(config, continuation.sessionId),
       mode: "async",
       fireAndForget: true,
-    },
-  );
+      },
+    );
+    if (result.status === "failed") {
+      if (activePreviousLease && takeoverLease) config.workSessions.restoreWorkspaceLeaseForSession(activePreviousLease, takeoverLease.leaseNonce);
+      else config.workSessions.releaseWorkspaceLeasesForSession(continuation.sessionId);
+    }
+    return result;
+  } catch (error) {
+    if (activePreviousLease && takeoverLease) config.workSessions.restoreWorkspaceLeaseForSession(activePreviousLease, takeoverLease.leaseNonce);
+    else config.workSessions.releaseWorkspaceLeasesForSession(continuation.sessionId);
+    throw error;
+  }
 }

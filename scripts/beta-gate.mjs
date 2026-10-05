@@ -9,7 +9,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, w
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
-import { validateBetaSoakAssertions } from "./beta-soak-contract.mjs";
+import { validateBetaFaultMatrix, validateBetaSoakAssertions } from "./beta-soak-contract.mjs";
 import { validateBetaExternalCatalogReceipt } from "./beta-external-catalog-contract.mjs";
 import { testHarnessEnvironment } from "./lib/tool-environment.mjs";
 
@@ -155,17 +155,21 @@ try {
 
 runPhase("fault-matrix", process.execPath, ["scripts/beta-fault-matrix.mjs"], {
   KONTROL_BETA_FAULT_REPORT: faultReportPath,
+  KONTROL_BETA_BUILD_ID: receipt.candidate?.buildId,
 });
 try {
   receipt.faultMatrix = JSON.parse(readFileSync(faultReportPath, "utf8"));
 } catch {
   receipt.faultMatrix = { status: "missing", path: faultReportPath };
 }
+receipt.faultMatrixCheck = validateBetaFaultMatrix(receipt.faultMatrix, { candidateBuildId: receipt.candidate?.buildId });
 receipt.phases.push({
   id: "fault-matrix-evidence",
   command: `read ${faultReportPath}`,
-  status: receipt.faultMatrix.qualified === true ? "passed" : "failed",
-  qualified: receipt.faultMatrix.qualified === true,
+  status: receipt.faultMatrixCheck.valid ? "passed" : "failed",
+  qualified: receipt.faultMatrixCheck.valid,
+  missingRequiredCases: receipt.faultMatrixCheck.missing,
+  buildMatches: receipt.faultMatrixCheck.buildMatches,
   finishedAt: new Date().toISOString(),
 });
 persist();

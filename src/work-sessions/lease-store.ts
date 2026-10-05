@@ -1,10 +1,10 @@
 /**
  * WorkspaceLeaseStore: checkout-modify lease acquire/renew/release
  *
- * Extracted verbatim from SqliteWorkSessionManager (P1 god-object
- * decomposition). The acquire transaction keeps its original boundary:
- * expired-lease sweep, conflict check, and fencing-nonce rotation all happen
- * inside ONE transaction. Shares the caller's DatabaseHandle.
+ * Extracted from SqliteWorkSessionManager (P1 god-object decomposition).
+ * Ordinary acquisition renews the same owner without changing its nonce;
+ * explicit same-session takeover rotates the fence transactionally. Shares
+ * the caller's DatabaseHandle.
  */
 import { randomUUID } from "node:crypto";
 import { eq, and, gte, sql } from "drizzle-orm";
@@ -21,6 +21,7 @@ export function createWorkspaceLeaseStore(db: DatabaseHandle) {
       workSessionId: string;
       ownerInstanceId?: string;
       ttlMs?: number;
+      takeover?: boolean;
     }): WorkspaceLeaseResult {
       const now = new Date();
       const nowIso = now.toISOString();
@@ -49,10 +50,13 @@ export function createWorkspaceLeaseStore(db: DatabaseHandle) {
         }
 
         if (existing) {
-          const leaseNonce = randomUUID();
           db.db
             .update(workspaceLeases)
-            .set({ heartbeatAt: nowIso, expiresAt, ownerInstanceId, leaseNonce })
+            .set({
+              heartbeatAt: nowIso,
+              expiresAt,
+              ...(input.takeover ? { ownerInstanceId, leaseNonce: randomUUID() } : {}),
+            })
             .where(eq(workspaceLeases.canonicalRoot, input.canonicalRoot))
             .run();
         } else {
@@ -81,6 +85,25 @@ export function createWorkspaceLeaseStore(db: DatabaseHandle) {
         if (!lease) throw new Error("Workspace lease acquisition failed");
         return { acquired: true as const, lease: rowToWorkspaceLease(lease) };
       });
+    },
+
+    restoreWorkspaceLeaseForSession(previous: WorkspaceLease, expectedLeaseNonce: string): boolean {
+      if (!expectedLeaseNonce || !previous.leaseNonce) return false;
+      const result = db.db.update(workspaceLeases)
+        .set({
+          ownerInstanceId: previous.ownerInstanceId,
+          leaseNonce: previous.leaseNonce,
+          acquiredAt: previous.acquiredAt,
+          heartbeatAt: previous.heartbeatAt,
+          expiresAt: previous.expiresAt,
+        })
+        .where(and(
+          eq(workspaceLeases.canonicalRoot, previous.canonicalRoot),
+          eq(workspaceLeases.workSessionId, previous.workSessionId),
+          eq(workspaceLeases.leaseNonce, expectedLeaseNonce),
+        ))
+        .run();
+      return result.changes > 0;
     },
 
     releaseWorkspaceLeasesForSession(workSessionId: string): number {

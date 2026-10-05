@@ -255,7 +255,12 @@ try {
     name: "provide_policy_approval",
     arguments: { approvalId: workspaceApprovalId, decision: "approve_workspace", reason: "trusted for this workspace" },
   }, { sessionId: reviewerSessionId, reviewer: true });
-  assert.notEqual(workspaceApproval.payload?.result?.isError, true, "approve workspace must succeed");
+  assert.equal(workspaceApproval.payload?.result?.isError, true, "unauthenticated transport identity cannot receive a durable workspace grant");
+  const secondOneShot = await rpc("tools/call", {
+    name: "provide_policy_approval",
+    arguments: { approvalId: workspaceApprovalId, decision: "approve", reason: "approve this exact command once" },
+  }, { sessionId: reviewerSessionId, reviewer: true });
+  assert.notEqual(secondOneShot.payload?.result?.isError, true, "approve once remains available without a stable principal");
   const secondBash = await rpc("tools/call", {
     name: "bash",
     arguments: { workspaceId, command: "printf second-run" },
@@ -271,20 +276,29 @@ try {
   // A scripted upstream proxy that closed the socket (e.g. tunnel timed out
   // and the call resumed on a new TCP connection) used to leave the parked
   // approval row waiting forever. With the req.socket close hook the live
-  // waiter detaches, but the durable card stays. The workspace grant
-  // recorded above must remain effective for a fresh MCP session opened
-  // against the same workspace.
-  // The reconnecting session is in the same workspace; the workspace grant
-  // recorded above must let this invocation through without a new approval
-  // card. If the durable grant were lost on reconnect this would block.
+  // waiter detaches, but exact operation identity remains durable. A new
+  // operation from the reconnecting transport still needs its own decision
+  // because no stable authenticated principal exists for a workspace grant.
   const reconnectBash = await rpc("tools/call", {
     name: "bash",
     arguments: { workspaceId, command: "printf post-reconnect" },
   }, { sessionId: reconnectSessionId });
   assert.equal(reconnectBash.response.status, 200, JSON.stringify(reconnectBash.payload));
-  assert.notEqual(reconnectBash.payload?.result?.isError, true,
-    `reconnect must reuse the workspace grant, not re-prompt: ${JSON.stringify(reconnectBash.payload)}`);
-  const reconnectText = (reconnectBash.payload?.result?.content ?? [])
+  assert.equal(reconnectBash.payload?.result?.structuredContent?.status, "approval_required",
+    `new reconnect operation must not inherit a durable grant: ${JSON.stringify(reconnectBash.payload)}`);
+  const reconnectApprovalId = await waitForMatchingApproval(reviewerSessionId, workspaceId);
+  const reconnectApproval = await rpc("tools/call", {
+    name: "provide_policy_approval",
+    arguments: { approvalId: reconnectApprovalId, decision: "approve", reason: "approve this exact reconnect command once" },
+  }, { sessionId: reviewerSessionId, reviewer: true });
+  assert.notEqual(reconnectApproval.payload?.result?.isError, true);
+  const finalReconnectBash = await rpc("tools/call", {
+    name: "bash",
+    arguments: { workspaceId, command: "printf post-reconnect" },
+  }, { sessionId: reconnectSessionId });
+  assert.notEqual(finalReconnectBash.payload?.result?.isError, true,
+    `exact operation retry must consume the durable one-shot decision: ${JSON.stringify(finalReconnectBash.payload)}`);
+  const reconnectText = (finalReconnectBash.payload?.result?.content ?? [])
     .map((chunk: any) => chunk.text ?? "")
     .join("");
   assert.ok(reconnectText.includes("post-reconnect"), `reconnect bash ran: ${reconnectText}`);

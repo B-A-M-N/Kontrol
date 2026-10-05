@@ -11,6 +11,7 @@ import type { MissionReviewPacket } from "../mission-ledger.js";
 import type { PrincipalRole } from "../policy-enforcement.js";
 import { workspaceAppCallableToolMeta } from "../workspace-app-resource.js";
 import type { BridgeConfig } from "./context.js";
+import type { WorkspaceSnapshotKind } from "../review-checkpoints.js";
 import { realpath } from "node:fs/promises";
 import { mcpOwnerContextId } from "../mcp/owner-context.js";
 
@@ -31,7 +32,8 @@ export function workspaceAppModelAndAppMeta() {
 }
 
 export function compactMissionPacket(packet: MissionReviewPacket): MissionReviewPacket {
-  const unresolvedCriteria = packet.criteria.filter((criterion) => criterion.status !== "verified");
+  const effectiveStatus = new Map((packet.criterionStates ?? []).map((state) => [state.criterionId, state.status]));
+  const unresolvedCriteria = packet.criteria.filter((criterion) => (effectiveStatus.get(criterion.id) ?? criterion.status) !== "verified");
   const blockingFindings = packet.findings.filter((finding) =>
     finding.scope !== "out_of_scope" &&
     (finding.severity === "blocker" || finding.severity === "high") &&
@@ -46,6 +48,7 @@ export function compactMissionPacket(packet: MissionReviewPacket): MissionReview
   return {
     mission: packet.mission,
     criteria: unresolvedCriteria,
+    criterionStates: packet.criterionStates.filter((state) => unresolvedCriteria.some((criterion) => criterion.id === state.criterionId)),
     findings: blockingFindings,
     workOrders: packet.workOrders.slice(0, 1),
     evidence: [...latestEvidenceByCriterion.values()],
@@ -96,6 +99,23 @@ export function liveConnectionIdentity(config: BridgeConfig): {
 export function liveOwnerContextId(config: BridgeConfig): string | undefined {
   const identity = liveConnectionIdentity(config);
   return mcpOwnerContextId(identity);
+}
+
+export async function captureMissionBaseline(
+  config: BridgeConfig,
+  workspaceSessionId: string,
+): Promise<{ baselineKind: WorkspaceSnapshotKind; baselineRef: string; baselineCommit: string }> {
+  const workspace = config.workspaces.getWorkspace(workspaceSessionId);
+  const baseline = await config.reviewCheckpoints.reviewChanges({
+    workspaceId: workspaceSessionId,
+    root: workspace.root,
+    since: "workspace_open",
+    markReviewed: false,
+  });
+  const kind = baseline.snapshot?.kind ?? baseline.snapshotKind;
+  const ref = baseline.snapshot?.ref ?? baseline.snapshotRef;
+  if (!kind || !ref) throw new Error("Mission baseline capture returned no normalized snapshot identity.");
+  return { baselineKind: kind, baselineRef: ref, baselineCommit: ref };
 }
 
 export function isWorkerOrClient(role?: PrincipalRole): boolean {
@@ -213,7 +233,7 @@ export function requireWorkSessionRead(config: BridgeConfig, sessionId: string) 
   return forbidden(config.principalRole, "work-session read");
 }
 
-export async function acquireCheckoutModifyLease(config: BridgeConfig, workspaceSessionId: string, workSessionId: string) {
+export async function acquireCheckoutModifyLease(config: BridgeConfig, workspaceSessionId: string, workSessionId: string, options: { takeover?: boolean } = {}) {
   const workspace = config.workspaces.getWorkspace(workspaceSessionId);
   let canonicalRoot: string;
   try {
@@ -228,6 +248,7 @@ export async function acquireCheckoutModifyLease(config: BridgeConfig, workspace
     canonicalRoot,
     workspaceSessionId,
     workSessionId,
+    takeover: options.takeover,
   });
   if (lease.acquired) return null;
   return {
@@ -291,12 +312,13 @@ export function renderMissionPrompt(config: BridgeConfig, workSessionId: string,
   if (!packet?.mission) return "";
   const mission = packet.mission;
   const workOrder = packet.workOrders[0];
-  const requiredCriteria = packet.criteria.filter((c) => c.priority === "required");
   const openFindings = packet.findings.filter((f) => ["open", "claimed_resolved"].includes(f.status));
   const lines: string[] = [];
   lines.push("Kontrol supervised mission contract:");
   lines.push(`Objective: ${mission.objective ?? fallbackObjective}`);
   lines.push(`Desired outcome: ${mission.desiredOutcome ?? fallbackObjective}`);
+  if (mission.constraints.length) lines.push(`Constraints (must follow): ${JSON.stringify(mission.constraints)}`);
+  if (mission.nonGoals.length) lines.push(`Non-goals (do not implement): ${JSON.stringify(mission.nonGoals)}`);
   if (workOrder) {
     lines.push("");
     lines.push(`Current work order ${workOrder.id}: ${workOrder.objectiveForThisTurn}`);
@@ -304,30 +326,41 @@ export function renderMissionPrompt(config: BridgeConfig, workSessionId: string,
     if (workOrder.acceptanceCriterionIds.length) lines.push(`Acceptance criterion IDs: ${workOrder.acceptanceCriterionIds.join(", ")}`);
     if (workOrder.requiredActions.length) lines.push(`Required actions: ${workOrder.requiredActions.join("; ")}`);
     if (workOrder.prohibitedActions.length) lines.push(`Prohibited actions: ${workOrder.prohibitedActions.join("; ")}`);
+    if (workOrder.requiredVerification.length) lines.push(`Required verification: ${JSON.stringify(workOrder.requiredVerification)}`);
     if (workOrder.expectedDeliverables.length) lines.push(`Expected deliverables: ${workOrder.expectedDeliverables.join("; ")}`);
     if (workOrder.contextReferences.length) lines.push(`Context references: ${workOrder.contextReferences.join("; ")}`);
   }
-  if (requiredCriteria.length) {
+  if (packet.criteria.length) {
     lines.push("");
-    lines.push("Required acceptance criteria:");
-    for (const criterion of requiredCriteria) lines.push(`- ${criterion.id}: ${criterion.description} [${criterion.status}]`);
+    lines.push("Acceptance criteria:");
+    for (const criterion of packet.criteria) {
+      lines.push(`- ${criterion.id} (${criterion.priority}): ${criterion.description} [${criterion.status}; verification=${criterion.verificationType}${criterion.verificationCommand ? `; command=${criterion.verificationCommand}` : ""}]`);
+    }
   }
   if (openFindings.length) {
     lines.push("");
     lines.push("Open findings to address:");
-    for (const finding of openFindings) lines.push(`- ${finding.id} (${finding.severity}): ${finding.requiredAction}`);
+    for (const finding of openFindings) {
+      lines.push(`- ${finding.id} (${finding.severity}): ${finding.description}`);
+      lines.push(`  Required action: ${finding.requiredAction}`);
+      if (finding.requiredVerification.length) lines.push(`  Required verification: ${JSON.stringify(finding.requiredVerification)}`);
+    }
   }
+  // supervisorInstructions intentionally remains supervisor-only. It is not a
+  // worker requirement and must not be confused with the user-authored mission
+  // contract or work-order instructions.
   lines.push("");
   lines.push("Submit evidence in your review summary. The WebUI supervisor decides mission completion; do not self-approve.");
   return lines.join("\n");
 }
 
-export async function resolveHealthyAgentUrl(config: BridgeConfig, agentName = "cli-coding-agent"): Promise<string> {
+export async function resolveHealthyAgentUrl(config: BridgeConfig, agentName?: string): Promise<string> {
   const selection = await selectHealthyAgent(config.agentRegistry.listAlive(), {
     name: agentName,
     role: "agent",
     adapterSecret: config.adapterSecret,
+    clientPlatformHint: config.connectionContext?.clientPlatformHint,
   });
-  if (!selection.agent) throw new Error(`No healthy ${agentName} available to resume`);
+  if (!selection.agent) throw new Error(`No healthy ${agentName ? `${agentName} ` : ""}ACP agent available to resume`);
   return selection.agent.url;
 }

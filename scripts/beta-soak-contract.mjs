@@ -26,7 +26,26 @@ export const REQUIRED_BETA_SOAK_ASSERTIONS = Object.freeze([
   // recover durable state across transport replacement — not merely re-run
   // tools/list on a fresh transport.
   "conversationContinuityProven",
+  // The soak is tied to a code-gate receipt that passed the mission outcome
+  // loop scenario for this exact immutable build.
+  "supervisedMissionLoopQualified",
 ]);
+
+export const REQUIRED_BETA_FAULT_CASES = Object.freeze([
+  "supervised-mission-loop",
+]);
+
+export function validateBetaFaultMatrix(matrix, options = {}) {
+  const missing = REQUIRED_BETA_FAULT_CASES.filter((id) =>
+    !Array.isArray(matrix?.cases) || !matrix.cases.some((testCase) => testCase?.id === id && testCase.passed === true),
+  );
+  const buildMatches = !options.candidateBuildId || matrix?.buildId === options.candidateBuildId;
+  return {
+    valid: matrix?.qualified === true && missing.length === 0 && buildMatches,
+    missing,
+    buildMatches,
+  };
+}
 
 export function validateBetaSoakAssertions(assertions) {
   if (!assertions || typeof assertions !== "object" || Array.isArray(assertions)) {

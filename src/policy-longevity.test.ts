@@ -40,6 +40,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "./server.js";
 import { loadConfig } from "./config.js";
+import { SingleUserOAuthProvider } from "./oauth-provider.js";
 
 // The longevity suite reuses keep-alive fetch sockets across hundreds of
 // tool calls; each call adds a `close` listener. Default Node limits
@@ -60,7 +61,10 @@ const config = loadConfig({
   KONTROL_ALLOWED_ROOTS: root,
   KONTROL_STATE_DIR: stateDir,
   KONTROL_WORKTREE_ROOT: worktreeRoot,
-  KONTROL_AUTH_MODE: "tunnel",
+  KONTROL_AUTH_MODE: "oauth",
+  // Keep the exercised caller unprivileged while giving it a stable OAuth
+  // principal so workspace-scope grants have the identity they require.
+  KONTROL_OAUTH_SCOPES: "kontrol:client",
   KONTROL_ACP_ENABLED: "false",
   // Default allow keeps read/write/edit flowing without approval prompts —
   // the longevity suite's purpose is to exercise the bash/ask path under
@@ -79,6 +83,33 @@ const config = loadConfig({
 assert.equal(config.policy.defaultMode, "allow", `policy.defaultMode must be allow; got ${JSON.stringify(config.policy)}`);
 assert.equal(config.policy.toolRules.bash, "ask",
   `bash must gate as ask; toolRules: ${JSON.stringify(config.policy.toolRules)}`);
+
+const oauthProvider = new SingleUserOAuthProvider(config.oauth, new URL("/mcp", config.publicBaseUrl), stateDir);
+const redirectUri = "http://localhost/oauth/callback";
+const oauthClient = await oauthProvider.clientsStore.registerClient?.({
+  redirect_uris: [redirectUri],
+  client_name: "Kontrol longevity test",
+});
+assert.ok(oauthClient);
+const authorizationCode = `longevity-${process.pid}`;
+oauthProvider["codes"].set(authorizationCode, {
+  clientId: oauthClient.client_id,
+  params: {
+    redirectUri,
+    codeChallenge: "longevity-test-challenge",
+    scopes: ["kontrol:client"],
+    resource: new URL("/mcp", config.publicBaseUrl),
+  },
+  expiresAtMs: Date.now() + 60_000,
+});
+const oauthTokens = await oauthProvider.exchangeAuthorizationCode(
+  oauthClient,
+  authorizationCode,
+  undefined,
+  redirectUri,
+  new URL("/mcp", config.publicBaseUrl),
+);
+oauthProvider.close();
 
 const running = createServer(config);
 const httpServer = running.app.listen(0, "127.0.0.1");
@@ -107,6 +138,7 @@ async function rpc(
   const headers: Record<string, string> = {
     "content-type": "application/json",
     accept: "application/json, text/event-stream",
+    authorization: `Bearer ${oauthTokens.access_token}`,
     ...(opts.sessionId ? { "mcp-session-id": opts.sessionId } : {}),
     ...(!opts.reviewer ? { "x-kontrol-conversation-id": "longevity-conversation" } : {}),
   };
@@ -155,7 +187,11 @@ async function openReviewerSession(): Promise<string> {
 async function closeSession(sessionId: string): Promise<void> {
   const response = await fetch(url, {
     method: "DELETE",
-    headers: { "mcp-session-id": sessionId },
+    headers: {
+      "mcp-session-id": sessionId,
+      authorization: `Bearer ${oauthTokens.access_token}`,
+      "x-kontrol-conversation-id": "longevity-conversation",
+    },
   });
   assert.ok([200, 202, 204].includes(response.status), `DELETE returned HTTP ${response.status}`);
 }

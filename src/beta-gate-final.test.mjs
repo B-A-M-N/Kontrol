@@ -49,7 +49,7 @@ chmodSync(fakeGit, 0o755);
 
 const code = {
   codeQualified: true,
-  faultMatrix: { qualified: true },
+  faultMatrix: { buildId, qualified: true, cases: [{ id: "supervised-mission-loop", passed: true }] },
   candidate: {
     buildId,
     artifactPath: "/immutable/releases/candidate-build",
@@ -82,6 +82,7 @@ const assertions = {
   expiredHandlerAccounting: true,
   approvalContinuityCapable: true,
   conversationContinuityProven: true,
+  supervisedMissionLoopQualified: true,
 };
 const soak = {
   status: "passed",
@@ -277,6 +278,15 @@ try {
   assert.equal(qualifiedReceipt.stage, "combined");
   assert.equal(qualifiedReceipt.checks.externalCatalogFresh, true);
   assert.equal(qualifiedReceipt.externalCatalog.workspaceApp.valid, true);
+
+  writeFileSync(codeReceiptPath, JSON.stringify({
+    ...code,
+    faultMatrix: { ...code.faultMatrix, cases: [] },
+  }));
+  const missingMissionLoop = runFinal();
+  assert.notEqual(missingMissionLoop.status, 0, "the code receipt must include the supervised mission loop fault case");
+  assert.equal(JSON.parse(readFileSync(receiptPath, "utf8")).checks.supervisedMissionLoopQualified, false);
+  writeFileSync(codeReceiptPath, JSON.stringify(code));
 
   writeFileSync(soakReportPath, JSON.stringify({ ...soak, expectedBuildId: "different-build" }));
   const rejected = runFinal();

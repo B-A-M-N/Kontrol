@@ -26,6 +26,8 @@ export interface ConnectionContext {
   mcpSessionLabel?: string;
   /** Optional upstream conversation correlation; not an authorization key. */
   conversationId?: string;
+  /** Untrusted MCP clientInfo.name hint used only to prefer a native ACP peer. */
+  clientPlatformHint?: string;
   /** Stable trusted identity used only for reconnecting one approval operation. */
   approvalCorrelationId?: string;
 }

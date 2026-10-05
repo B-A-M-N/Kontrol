@@ -16,11 +16,12 @@ import { mcpOwnerContextId } from "./owner-context.js";
 
 function directPolicyPrincipal(workspaceId: string): string {
   const context = mcpRequestContext.getStore();
-  return mcpOwnerContextId({
-    conversationId: context?.conversationId,
-    mcpSessionId: context?.mcpSessionId,
-    principalId: context?.principalId,
-  }) ?? workspaceId;
+  const authenticated = context?.principalId?.trim();
+  if (authenticated) return authenticated;
+  // Keep operation identity stable enough to reconnect exact approval cards,
+  // while policy-tools rejects durable grants for this unauthenticated
+  // workspace pseudoprincipal. Transport identity remains in ownerContextId.
+  return `ephemeral-workspace:${workspaceId}`;
 }
 
 /**

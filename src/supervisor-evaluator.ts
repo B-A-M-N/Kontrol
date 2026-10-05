@@ -4,13 +4,16 @@ export type SupervisorDecision = "approval_pending" | "correction_pending" | "aw
 export function evaluateSupervisorMission(ledger: MissionLedger, workSessionId: string, context: { submissionId?: string; snapshotKind?: "git" | "filesystem"; snapshotRef?: string; snapshotCommit?: string; cycleNumber: number; maxCycles?: number; emergencyCycleCeiling?: number }) {
   const packet = ledger.getPacket(workSessionId, context);
   const approval = ledger.canApprove(workSessionId, context);
-  const failed = packet.criteria.filter((criterion) => criterion.priority === "required" && criterion.status === "failed");
+  const effectiveStatus = new Map(packet.criterionStates.map((criterion) => [criterion.criterionId, criterion.status]));
+  const failed = packet.criteria.filter((criterion) => criterion.priority === "required" && effectiveStatus.get(criterion.id) === "failed");
   // Failed command verification is represented as trusted failed evidence; the
   // criterion remains unverified until a later submission passes. Treat a
   // declared command that is still unverified as an actionable correction, not
   // an ambiguous manual-review requirement that should stop unattended work.
   const commandVerificationPending = packet.criteria.filter(
-    (criterion) => criterion.priority === "required" && Boolean(criterion.verificationCommand) && criterion.status !== "verified",
+    (criterion) => criterion.priority === "required"
+      && (criterion.verificationType === "test" || criterion.verificationType === "runtime_behavior")
+      && effectiveStatus.get(criterion.id) !== "verified",
   );
   const actionable = packet.findings.filter((finding) => finding.scope !== "out_of_scope" && ["blocker", "high"].includes(finding.severity) && !["verified_resolved", "waived"].includes(finding.status));
   if (approval.allowed) return { decision: "approval_pending" as const, reasons: [] };

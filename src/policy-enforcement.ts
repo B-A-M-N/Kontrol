@@ -172,7 +172,11 @@ function canonicalOperationHash(inv: PolicyInvocation, approvalKey: string, path
     principalId: inv.principalId,
     workspaceId: inv.workspaceId,
     workSessionId: inv.workSessionId ?? "",
-    ownerContextId: inv.ownerContextId ?? "",
+    // Transport/conversation ownership is correlation, not authorization.
+    // Bind trusted correlation when available; work-session operations retain
+    // their explicit owner binding.
+    correlation: inv.approvalCorrelationId ?? "",
+    ownerContextId: inv.workSessionId ? inv.ownerContextId ?? "" : "",
     tool: canonicalToolName(inv.tool),
     approvalKey,
     path: policyPathLabel(path) ?? "",
@@ -183,26 +187,13 @@ function canonicalOperationHash(inv: PolicyInvocation, approvalKey: string, path
   return createHash("sha256").update(operation).digest("hex");
 }
 
-function approvalRowKey(inv: PolicyInvocation, approvalKey: string, operationHash: string): string {
-  const operation = JSON.stringify({
-    principalId: inv.principalId,
-    workspaceId: inv.workspaceId,
-    workSessionId: inv.workSessionId ?? "",
-    correlation: inv.approvalCorrelationId
-      ? `trusted:${inv.approvalCorrelationId}`
-      : `session:${inv.mcpSessionId ?? inv.mcpRequestId ?? "none"}`,
-    conversationId: inv.conversationId ?? "",
-    tool: canonicalToolName(inv.tool),
-    approvalKey,
-    path: policyPathLabel(inv.path),
-    paths: inv.paths?.map(policyPathLabel),
-    command: inv.command ?? "",
-    operationHash,
-  });
-  const fingerprint = createHash("sha256").update(operation).digest("hex");
+function approvalRowKey(inv: PolicyInvocation, _approvalKey: string, operationHash: string): string {
+  // operationHash already covers the canonical operation, workspace,
+  // principal, and trusted correlation. Never key durable approval identity
+  // on a disposable MCP session or request ID.
   return inv.mcpSessionId || inv.mcpRequestId
-    ? `operation:${fingerprint}`
-    : `legacy:${fingerprint}:${randomUUID()}`;
+    ? `operation:${operationHash}`
+    : `legacy:${operationHash}:${randomUUID()}`;
 }
 
 export function createPolicyEnforcer(
@@ -343,7 +334,9 @@ export function createPolicyEnforcer(
           const options: PolicyApprovalEventPayload["options"] = [
             { id: "approve", label: "Approve Once", effect: "approve", scope: "once" },
             ...(inv.workSessionId ? [{ id: "approve_session", label: "Approve Session", effect: "approve" as const, scope: "work_session" as const }] : []),
-            { id: "approve_workspace", label: "Approve Workspace", effect: "approve", scope: "workspace" },
+            ...(!inv.workSessionId && !/^(?:transport|ephemeral-workspace):/.test(inv.principalId)
+              ? [{ id: "approve_workspace", label: "Approve Workspace", effect: "approve" as const, scope: "workspace" as const }]
+              : []),
             { id: "deny", label: "Deny", effect: "deny" },
           ];
           policy.addPending({

@@ -94,12 +94,20 @@ export interface BridgeConfig {
 }
 
 
+const runtimeProbeSchema = z.object({
+  url: z.string().url(),
+  method: z.enum(["GET", "HEAD"]).optional(),
+  expectedStatus: z.number().int().min(100).max(599).optional(),
+  bodyIncludes: z.string().optional(),
+});
+
 export const missionCriterionSchema = z.object({
   id: z.string().optional(),
   description: z.string(),
   priority: z.enum(["required", "preferred"]).optional(),
   verificationType: z.enum(["test", "code_inspection", "runtime_behavior", "security_review", "manual_review"]).optional(),
   verificationCommand: z.string().optional(),
+  runtimeProbe: runtimeProbeSchema.optional().describe("Loopback HTTP probe executed by Kontrol for runtime_behavior criteria."),
   affectedAreas: z.array(z.string()).optional(),
   dependsOnCriterionIds: z.array(z.string()).optional().describe("Stable criterion IDs that must be satisfied before this requirement is considered complete."),
   verificationGroup: z.string().optional().describe("Independent verification group for bounded parallel scheduling."),
@@ -107,6 +115,34 @@ export const missionCriterionSchema = z.object({
   finalOnly: z.boolean().optional().describe("Run only during final verification."),
   mutatesWorkspace: z.boolean().optional().describe("Do not run concurrently with other verification commands."),
   commandVersion: z.string().optional().describe("Version/identity of the deterministic verifier command."),
+}).superRefine((criterion, context) => {
+  const verificationType = criterion.verificationType ?? (criterion.verificationCommand ? "test" : "manual_review");
+  if (verificationType === "test" && !criterion.verificationCommand?.trim()) {
+    context.addIssue({ code: "custom", path: ["verificationCommand"], message: "test criteria require a verificationCommand" });
+  }
+  if (verificationType === "runtime_behavior" && !criterion.runtimeProbe) {
+    context.addIssue({ code: "custom", path: ["runtimeProbe"], message: "runtime_behavior criteria require a runtimeProbe" });
+  }
+  if (verificationType !== "test" && criterion.verificationCommand) {
+    context.addIssue({ code: "custom", path: ["verificationCommand"], message: "verificationCommand is only supported for test criteria" });
+  }
+  if (verificationType !== "runtime_behavior" && criterion.runtimeProbe) {
+    context.addIssue({ code: "custom", path: ["runtimeProbe"], message: "runtimeProbe is only supported for runtime_behavior criteria" });
+  }
+});
+
+export const supervisedMissionOptionsSchema = z.object({
+  desiredOutcome: z.string().optional(),
+  constraints: z.array(z.unknown()).optional(),
+  nonGoals: z.array(z.string()).optional(),
+  acceptanceCriteria: z.array(missionCriterionSchema).optional(),
+  supervisorInstructions: z.string().optional(),
+  maxCorrectionRounds: z.number().int().min(1).max(50).optional(),
+  maxWallTimeMinutes: z.number().int().min(1).max(10_080).optional(),
+  finalVerification: z.array(z.string()).optional(),
+  reviewCoverage: z.array(z.string()).optional(),
+  autonomyMode: z.enum(["manual", "verify_only", "correction_auto", "full"]).optional(),
+  approvalMode: z.enum(["human_required", "policy_auto", "fully_automatic"]).optional(),
 });
 export const findingSchema = z.object({
   id: z.string().optional(),
@@ -118,8 +154,8 @@ export const findingSchema = z.object({
   description: z.string(),
   evidence: z.array(z.unknown()).optional(),
   requiredAction: z.string(),
-  requiredVerification: z.array(z.unknown()).optional(),
-  status: z.enum(["open", "claimed_resolved", "verified_resolved", "waived"]).optional(),
+  requiredVerification: z.array(z.string().trim().min(1)).optional(),
+  status: z.enum(["open", "claimed_resolved", "waived"]).optional(),
 });
 export const criterionUpdateSchema = z.object({
   id: z.string(),
@@ -127,9 +163,8 @@ export const criterionUpdateSchema = z.object({
 });
 export const findingUpdateSchema = z.object({
   id: z.string(),
-  status: z.enum(["open", "claimed_resolved", "verified_resolved", "waived"]),
+  status: z.enum(["open", "claimed_resolved", "waived"]),
   waiverReason: z.string().optional(),
-  resolutionSubmissionId: z.string().optional(),
   disposition: z.enum(["blocking", "required_followup", "advisory", "future_improvement"]).optional(),
 });
 export const workOrderSchema = z.object({
@@ -159,15 +194,16 @@ export async function dispatchAgentTask(
 ) {
   const startedAt = performance.now();
   try {
-    const selectedAgentName = input.agentName ?? "cli-coding-agent";
     const selection = await selectHealthyAgent(config.agentRegistry.listAlive(), {
-      name: selectedAgentName,
+      name: input.agentName,
       role: "agent",
       adapterSecret: config.adapterSecret,
+      clientPlatformHint: config.connectionContext?.clientPlatformHint,
     });
     if (!selection.agent) {
-      throw new Error(`No healthy ACP agent named ${selectedAgentName} (role=agent) is registered.`);
+      throw new Error(`No healthy ACP agent${input.agentName ? ` named ${input.agentName}` : ""} (role=agent) is registered.`);
     }
+    const selectedAgentName = selection.agent.name;
     const wsId = input.workSessionId;
     const task = input.appendSessionInstructions === false
       ? input.task

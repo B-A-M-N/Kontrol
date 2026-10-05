@@ -1039,6 +1039,12 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
             (verifiedClaims as (WorkerTokenClaims & { workspaceLeaseNonce?: string }) | undefined)?.workspaceLeaseNonce
             || (verifiedClaims ? req.header("x-kontrol-workspace-lease-nonce") ?? undefined : undefined),
           conversationId: conversationId(req),
+          // clientInfo is caller-controlled; this hint affects dispatch
+          // preference only and never establishes identity or authority.
+          clientPlatformHint: (() => {
+            const name = (req.body as { params?: { clientInfo?: { name?: unknown } } } | undefined)?.params?.clientInfo?.name;
+            return typeof name === "string" ? name.slice(0, 200) : undefined;
+          })(),
         };
 
         const serverCreateStarted = performance.now();
