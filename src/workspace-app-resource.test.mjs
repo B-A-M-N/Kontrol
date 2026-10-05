@@ -36,7 +36,7 @@ const VITE_TEMPLATE_HTML = [
 // Runs src/workspace-app-resource.ts under tsx in a working directory where
 // the candidate layout has been staged, and prints the module's exported
 // resolution facts (or its rejection) as JSON.
-const TSX_LOADER = join(repoRoot, "node_modules", "tsx", "dist", "loader.mjs");
+const TSX_LOADER = pathToFileURL(join(repoRoot, "node_modules", "tsx", "dist", "loader.mjs")).href;
 function resolveIn(cwd, env = {}) {
   const script = [
     "import { WORKSPACE_APP_HTML, WORKSPACE_APP_ARTIFACT_SOURCE } from",

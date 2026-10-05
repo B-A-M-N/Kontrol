@@ -56,7 +56,7 @@ function resolveIn(checkout, options = {}) {
   if (options.buildResultPath !== undefined) env.KONTROL_BUILD_RESULT_PATH = options.buildResultPath;
   const out = execFileSync(
     process.execPath,
-    ["--import", join(repoRoot, "node_modules", "tsx", "dist", "loader.mjs"), "--input-type=module", "-e", script],
+    ["--import", pathToFileURL(join(repoRoot, "node_modules", "tsx", "dist", "loader.mjs")).href, "--input-type=module", "-e", script],
     { cwd: checkout, env, encoding: "utf8" },
   );
   return JSON.parse(out.trim());
