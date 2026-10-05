@@ -173,11 +173,10 @@ writeExecutable(join(fakeBin, "tmux"), [
   "      if [ \"$old_state\" != \"Z\" ] && kill -0 \"$old_pid\" 2>/dev/null; then exit 1; fi",
   "      rm -f \"$file\"",
   "    fi",
-  // Use the wrapped Node binary so the simulated process launch works on
-  // macOS and Windows Git Bash as well as Linux (setsid is Linux-only).
-  "    node -e 'setInterval(() => {}, 300000)' </dev/null >/dev/null 2>&1 &",
-  "    child_pid=\"$!\"",
-  "    printf '%s\\n' \"$child_pid\" > \"$file\"",
+  // Detach through Node so the simulated process has the same lifetime as a
+  // tmux pane on macOS and Windows Git Bash, where setsid is unavailable.
+  "    node -e 'const { spawn } = require(\"node:child_process\"); const { writeFileSync } = require(\"node:fs\"); const child = spawn(process.execPath, [\"-e\", \"setInterval(() => {}, 300000)\"], { detached: true, stdio: \"ignore\" }); child.unref(); writeFileSync(process.argv[1], String(child.pid));' \"$file\"",
+  "    child_pid=\"$(cat \"$file\")\"",
   "    if [ \"$target\" = \"kontrol-supervisor\" ]; then",
   "      status_file=\"$(printf '%s\\n' \"$last\" | sed -n 's/.*--status-file \\([^ ]*\\).*/\\1/p')\"",
   "      if [ -n \"$status_file\" ]; then",

@@ -34,7 +34,7 @@ const unit = renderUserServiceUnit({
 assert.match(unit, /WorkingDirectory=".*working directory"/);
 assert.match(unit, /EnvironmentFile=-".*environment with spaces"/);
 assert.match(unit, /Environment="KONTROL_ARTIFACT_PATH=.*release with spaces"/);
-assert.match(unit, /ExecStart=\/usr\/bin\/env node ".*release with spaces\/cli\.js" serve/);
+assert.match(unit, /ExecStart=\/usr\/bin\/env node ".*release with spaces[\\/\\\\]cli\.js" serve/);
 assert.doesNotMatch(unit, /tsx|src\/config|kontrol-user-service\.sh/);
 
 const paths = servicePaths({
@@ -45,7 +45,7 @@ const paths = servicePaths({
 });
 assert.equal(paths.serviceName, "kontrol-test.service");
 assert.equal(paths.stateDir, join(root, "state override"));
-assert.match(paths.releasesRoot, /data home\/kontrol\/releases$/);
+assert.match(paths.releasesRoot, /data home[\\/\\\\]kontrol[\\/\\\\]releases$/);
 
 assert.throws(
   () => readServiceBuild(artifact.replace("release with spaces", "../bad")),
@@ -184,7 +184,7 @@ try {
     assert.match(hermesUnit, /After=kontrol-core\.service/);
     assert.match(hermesUnit, /Restart=on-failure/);
     assert.match(hermesUnit, /WantedBy=kontrol\.target/);
-    assert.match(hermesUnit, new RegExp(`ExecStart=/usr/bin/env node .*releases.*build-test-1.*scripts/acp-hermes-native-adapter\\.mjs`));
+    assert.match(hermesUnit, /ExecStart=\/usr\/bin\/env node .*releases.*build-test-1.*scripts[\\/\\\\]acp-hermes-native-adapter\.mjs/);
     const tunnelUnit = readFileSync(join(unitDir, "kontrol-tunnel.service"), "utf8");
     assert.match(tunnelUnit, /Description=Kontrol Secure MCP Tunnel \(tunnel\)/);
     assert.match(tunnelUnit, /ExecStart=\/usr\/bin\/env tunnel-client run --profile sample_mcp_with_dcr/);
