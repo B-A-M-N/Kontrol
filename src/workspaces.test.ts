@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { platform, tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -53,7 +53,7 @@ try {
   assert.deepEqual(largeOpen.availableAgentsFiles, [], "10,000 descendant directories do not trigger recursive instruction discovery");
   assert.ok(Date.now() - largeStart < 2_000, "workspace open remains bounded with a 10,000-directory fixture");
   const newlyLoaded = await registry.loadApplicableInstructions(workspace, "nested/file.txt");
-  assert.deepEqual(newlyLoaded.map((file) => file.path), [join(root, "nested", "AGENTS.md")]);
+  assert.deepEqual(newlyLoaded.map((file) => file.path), [await realpath(join(root, "nested", "AGENTS.md"))]);
   assert.deepEqual(await registry.loadApplicableInstructions(workspace, "nested/file.txt"), newlyLoaded,
     "instruction discovery remains unacknowledged until the owning operation succeeds");
   registry.acknowledgeApplicableInstructions(workspace, newlyLoaded);

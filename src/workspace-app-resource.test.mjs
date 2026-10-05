@@ -239,7 +239,9 @@ function stageSourceCheckoutLayout(withDistArtifact, artifactHtml = SELF_CONTAIN
 {
   const distArtifact = join(repoRoot, "dist", "ui", "workspace-app.html");
   if (existsSync(distArtifact)) {
-    const { isSelfContainedWorkspaceAppHtml } = await import(join(repoRoot, "src", "workspace-app-resource.ts"));
+    const { isSelfContainedWorkspaceAppHtml } = await import(
+      pathToFileURL(join(repoRoot, "src", "workspace-app-resource.ts")).href,
+    );
     const html = (await import("node:fs")).readFileSync(distArtifact, "utf8");
     assert.ok(isSelfContainedWorkspaceAppHtml(html), "the real dist artifact must pass the structural self-containment check");
   }

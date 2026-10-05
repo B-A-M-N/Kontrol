@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const script = readFileSync("start-all.sh", "utf8");
 
@@ -37,10 +39,27 @@ assert.match(tunnelScript, /mcp\.extra-headers/);
 assert.match(tunnelScript, /ENV_FILE="\$\{KONTROL_ENV_FILE:-\$DESKTOP_PWD\/\.env\}"/);
 assert.match(tunnelScript, /source "\$ENV_FILE"/);
 assert.match(script, /kontrol-tunnel\.sh" --doctor/);
-const effectiveTunnelArgs = execFileSync("bash", ["scripts/kontrol-tunnel.sh", "--print-effective-args"], {
-  encoding: "utf8",
-  env: { ...process.env, KONTROL_HARPOON_INCLUDE_LOOPBACK: "false" },
-}).trim().split(/\r?\n/);
+const tunnelTestDir = mkdtempSync(join(tmpdir(), "kontrol-start-all-tunnel-"));
+const tunnelTestEnvFile = join(tunnelTestDir, "empty.env");
+writeFileSync(tunnelTestEnvFile, "");
+let effectiveTunnelArgs;
+try {
+  effectiveTunnelArgs = execFileSync("bash", ["scripts/kontrol-tunnel.sh", "--print-effective-args"], {
+    encoding: "utf8",
+    env: {
+      PATH: process.env.PATH,
+      HOME: process.env.HOME,
+      KONTROL_ENV_FILE: tunnelTestEnvFile,
+      KONTROL_CONFIG_DIR: tunnelTestDir,
+      KONTROL_AUTH_MODE: "oauth",
+      KONTROL_HARPOON_INCLUDE_LOOPBACK: "false",
+      KONTROL_POLICY_MODE: "allow",
+      KONTROL_TUNNEL_REVIEWER_SECRET: "test-reviewer-secret",
+    },
+  }).trim().split(/\r?\n/);
+} finally {
+  rmSync(tunnelTestDir, { recursive: true, force: true });
+}
 assert.ok(effectiveTunnelArgs.includes("--harpoon.hosts-include-loopback=false"));
 assert.ok(!effectiveTunnelArgs.includes("--harpoon.hosts-include-loopback"));
 assert.match(script, /-c "\$DESKTOP_PWD"/);
