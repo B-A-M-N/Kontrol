@@ -9,7 +9,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, existsSync, utimesSync } from "node:fs";
 import { writeFile, readFile, mkdir, open } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { FilesystemSnapshotStore, FilesystemSnapshotLimits, DEFAULT_SNAPSHOT_LIMITS } from "./filesystem-snapshot-store.js";
 
@@ -129,7 +129,7 @@ function snap(ref: string, terminal = false): { ref: string; terminal?: boolean 
   // A truncated/corrupt manifest must be rejected by validateSnapshot.
   const bogusRef = "fs:sha256:" + "a".repeat(64);
   const bogusPath = store.manifestPath(bogusRef);
-  await mkdir(bogusPath.replace(/\/[^/]+$/, ""), { recursive: true });
+  await mkdir(dirname(bogusPath), { recursive: true });
   await writeFile(bogusPath, '{"version":1,"entries":');
   assert.equal(await store.validateSnapshot({ kind: "filesystem", ref: bogusRef, createdAt: new Date().toISOString() }), false, "truncated manifest invalid");
 }

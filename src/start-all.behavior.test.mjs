@@ -173,7 +173,9 @@ writeExecutable(join(fakeBin, "tmux"), [
   "      if [ \"$old_state\" != \"Z\" ] && kill -0 \"$old_pid\" 2>/dev/null; then exit 1; fi",
   "      rm -f \"$file\"",
   "    fi",
-  "    /usr/bin/setsid /usr/bin/sleep 300 </dev/null >/dev/null 2>&1 &",
+  // Use the wrapped Node binary so the simulated process launch works on
+  // macOS and Windows Git Bash as well as Linux (setsid is Linux-only).
+  "    node -e 'setInterval(() => {}, 300000)' </dev/null >/dev/null 2>&1 &",
   "    child_pid=\"$!\"",
   "    printf '%s\\n' \"$child_pid\" > \"$file\"",
   "    if [ \"$target\" = \"kontrol-supervisor\" ]; then",
