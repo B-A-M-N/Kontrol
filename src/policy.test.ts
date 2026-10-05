@@ -510,7 +510,7 @@ for (const pending of isolatedPending) {
 }
 assert.deepEqual((await Promise.all([isolatedOne, isolatedTwo])).map((result) => result.allowed), [true, true]);
 
-// ── P1.10: authoritative approval options are carried in the event payload ──
+// ── P1.10: authoritative session approval options are carried in the event payload ──
 // Rehydrating clients (e.g. via list_pending_approvals) must reconcile
 // against the server-authored options, never invent their own. The
 // policy.approval_requested event carries the canonical list.
@@ -547,15 +547,14 @@ assert.deepEqual((await Promise.all([isolatedOne, isolatedTwo])).map((result) =>
     await eventRequest;
     assert.ok(observedOptions, "policy.approval_requested was observed");
     const ids = observedOptions!.map((option) => option.id).sort();
-    assert.deepEqual(ids, ["approve", "approve_session", "approve_workspace", "deny"],
-      `event payload carries Approve Once / Approve Session / Approve Workspace / Deny: ${ids.join(",")}`);
+    assert.deepEqual(ids, ["approve", "approve_session", "deny"],
+      `session-bound event payload carries Approve Once / Approve Session / Deny: ${ids.join(",")}`);
     // Approve Session only appears when a work session is bound.
     const sessionOption = observedOptions!.find((option) => option.id === "approve_session");
     assert.ok(sessionOption, "approve_session present when workSessionId is bound");
     assert.equal(sessionOption?.scope, "work_session");
-    // Approve Workspace is the durable cross-session grant.
-    const workspaceOption = observedOptions!.find((option) => option.id === "approve_workspace");
-    assert.equal(workspaceOption?.scope, "workspace", "approve_workspace scoped to workspace");
+    assert.ok(!observedOptions!.some((option) => option.id === "approve_workspace"),
+      "session-bound worker operations do not offer a workspace-wide grant");
   } finally {
     unsubscribe();
   }
