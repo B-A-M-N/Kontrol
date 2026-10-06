@@ -730,9 +730,11 @@ writeFileSync(join(baseRelease, "build-meta.json"), JSON.stringify({
 for (const file of ["cli.js", "server.js", "acp-duplex.js"]) writeFileSync(join(baseRelease, file), "test-artifact\n");
 writeFileSync(join(baseRelease, "ui", "workspace-app.html"), baseWorkspaceAppHtml);
 // macOS exposes temporary directories through /var while realpath reports
-// their canonical /private/var location. Generation metadata stores canonical
-// artifact paths, so compare it with the same filesystem identity.
-const canonicalBaseRelease = realpathSync(baseRelease);
+// their canonical /private/var location. Git Bash can also serialize Windows
+// paths with forward slashes while Node returns backslashes. Compare normalized
+// filesystem paths for the same canonical artifact identity.
+const normalizeFilesystemPath = (path) => resolve(path);
+const canonicalBaseRelease = normalizeFilesystemPath(realpathSync(baseRelease));
 
 try {
   symlinkSync(baseRelease, join(root, "dist"));
@@ -750,10 +752,10 @@ try {
   const activeLock = JSON.parse(readFileSync(runtimeLockPath, "utf8"));
   assert.equal(activeGeneration.status, "active");
   assert.equal(activeGeneration.activeBuildId, baseBuildId);
-  assert.equal(activeGeneration.artifactPath, canonicalBaseRelease);
+  assert.equal(normalizeFilesystemPath(activeGeneration.artifactPath), canonicalBaseRelease);
   assert.equal(activeLock.launcher, "tmux-stack");
   assert.equal(activeLock.buildId, baseBuildId);
-  assert.equal(activeLock.artifactPath, canonicalBaseRelease);
+  assert.equal(normalizeFilesystemPath(activeLock.artifactPath), canonicalBaseRelease);
   const activeDeploymentName = readdirSync(successfulState).find((name) => name.startsWith("deployment.") && name.endsWith(".json"));
   assert.ok(activeDeploymentName, "successful activation must persist a deployment record");
   const activeDeployment = JSON.parse(readFileSync(join(successfulState, activeDeploymentName), "utf8"));
@@ -922,8 +924,8 @@ try {
   assert.equal(handoffGeneration.requestedBuildId, candidateBuildId);
   assert.equal(handoffGeneration.activeBuildId, baseBuildId);
   assert.equal(handoffGeneration.lastKnownGoodBuildId, baseBuildId);
-  assert.equal(handoffGeneration.lastKnownGoodArtifactPath, canonicalBaseRelease);
-  assert.equal(readlinkSync(join(root, "dist")), canonicalBaseRelease);
+  assert.equal(normalizeFilesystemPath(handoffGeneration.lastKnownGoodArtifactPath), canonicalBaseRelease);
+  assert.equal(normalizeFilesystemPath(readlinkSync(join(root, "dist"))), canonicalBaseRelease);
 
   // Rebuild the same failing candidate again. Rollback must continue to use
   // the committed A record; the failed B candidate must never become the
@@ -935,9 +937,9 @@ try {
   assert.equal(repeatedHandoffGeneration.requestedBuildId, candidateBuildId);
   assert.equal(repeatedHandoffGeneration.activeBuildId, baseBuildId);
   assert.equal(repeatedHandoffGeneration.lastKnownGoodBuildId, baseBuildId);
-  assert.equal(repeatedHandoffGeneration.lastKnownGoodArtifactPath, canonicalBaseRelease);
+  assert.equal(normalizeFilesystemPath(repeatedHandoffGeneration.lastKnownGoodArtifactPath), canonicalBaseRelease);
   assert.notEqual(repeatedHandoffGeneration.lastKnownGoodBuildId, candidateBuildId);
-  assert.equal(readlinkSync(join(root, "dist")), canonicalBaseRelease);
+  assert.equal(normalizeFilesystemPath(readlinkSync(join(root, "dist"))), canonicalBaseRelease);
   const repeatedHandoffLock = JSON.parse(readFileSync(join(handoffState, "runtime.lock"), "utf8"));
   process.kill(repeatedHandoffLock.launcherPid, "SIGTERM");
   stopFakeSessions();
@@ -1016,7 +1018,7 @@ try {
   assert.equal(rollbackGeneration.requestedBuildId, candidateBuildId);
   assert.equal(rollbackGeneration.failedBuildId, candidateBuildId);
   assert.equal(rollbackGeneration.activeBuildId, baseBuildId);
-  assert.equal(rollbackGeneration.artifactPath, canonicalBaseRelease);
+  assert.equal(normalizeFilesystemPath(rollbackGeneration.artifactPath), canonicalBaseRelease);
   const rollbackDeploymentName = readdirSync(rollbackState).find((name) => name.startsWith("deployment.") && name.endsWith(".json"));
   assert.ok(rollbackDeploymentName, "rollback must persist a deployment record");
   const rollbackDeployment = JSON.parse(readFileSync(join(rollbackState, rollbackDeploymentName), "utf8"));
@@ -1025,9 +1027,9 @@ try {
   assert.equal(rollbackDeployment.requestedBuildId, candidateBuildId);
   assert.equal(rollbackDeployment.failedBuildId, candidateBuildId);
   assert.equal(rollbackDeployment.lastKnownGoodBuildId, baseBuildId);
-  assert.equal(readlinkSync(join(root, "dist")), canonicalBaseRelease);
+  assert.equal(normalizeFilesystemPath(readlinkSync(join(root, "dist"))), canonicalBaseRelease);
   assert.ok(pathExists(candidateRelease), "failed candidate release must be retained for forensics");
-  assert.equal(readlinkSync(join(root, "dist")), canonicalBaseRelease, "failed candidate must not replace the active projection");
+  assert.equal(normalizeFilesystemPath(readlinkSync(join(root, "dist"))), canonicalBaseRelease, "failed candidate must not replace the active projection");
   const rollbackLock = JSON.parse(readFileSync(join(rollbackState, "runtime.lock"), "utf8"));
   process.kill(rollbackLock.launcherPid, "SIGTERM");
   stopFakeSessions();
@@ -1071,7 +1073,7 @@ try {
   assert.equal(failedGeneration.rollback, true);
   assert.equal(failedGeneration.failedBuildId, candidateBuildId);
   assert.equal(pathExists(join(failedRollbackState, "runtime.lock")), false, "failed controller must release its lock");
-  assert.equal(readlinkSync(join(root, "dist")), baseRelease);
+  assert.equal(normalizeFilesystemPath(readlinkSync(join(root, "dist"))), normalizeFilesystemPath(baseRelease));
   console.log("start-all.behavior.test.mjs: startup, lock handoff, conflict, crash recovery, rollback, and failed rollback passed");
 } finally {
   restoreHarness();
