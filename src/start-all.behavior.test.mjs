@@ -22,7 +22,7 @@ import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
-import { delimiter, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const realCheckoutRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
@@ -578,16 +578,26 @@ function readEnvironmentStateDir(envPath) {
   return harnessRoot;
 }
 
+// Windows PATH uses semicolons, while Git Bash searches a colon-separated
+// PATH. Prepend the shims after Bash starts so its own startup conversion has
+// already normalized the inherited Windows PATH.
+const runWithFakeBin = [
+  'fake_bin="$KONTROL_TEST_FAKE_BIN"',
+  'if [ "${OS:-}" = "Windows_NT" ]; then fake_bin="$(/usr/bin/cygpath -u "$fake_bin")"; fi',
+  'export PATH="$fake_bin:$PATH"',
+  'exec bash "$1"',
+].join("\n");
+
 function runLauncher(envPath, extraEnv = {}) {
   noteRuntimeLockPath(readEnvironmentStateDir(envPath));
-  return spawnSync("bash", ["start-all.sh"], {
+  return spawnSync("bash", ["-c", runWithFakeBin, "kontrol-launcher-test", "start-all.sh"], {
     cwd: root,
     detached: true,
     encoding: "utf8",
     timeout: 120_000,
     env: {
       ...process.env,
-      PATH: `${fakeBin}${delimiter}${process.env.PATH ?? ""}`,
+      KONTROL_TEST_FAKE_BIN: fakeBin,
       KONTROL_ENV_FILE: envPath,
       FAKE_REPO_ROOT: root,
       FAKE_TMUX_STATE: fakeTmuxState,
@@ -600,13 +610,13 @@ function runLauncher(envPath, extraEnv = {}) {
 
 function runRestart(envPath, extraEnv = {}) {
   noteRuntimeLockPath(readEnvironmentStateDir(envPath));
-  return spawnSync("bash", ["restart-kontrol.sh"], {
+  return spawnSync("bash", ["-c", runWithFakeBin, "kontrol-launcher-test", "restart-kontrol.sh"], {
     cwd: root,
     encoding: "utf8",
     timeout: 120_000,
     env: {
       ...process.env,
-      PATH: `${fakeBin}${delimiter}${process.env.PATH ?? ""}`,
+      KONTROL_TEST_FAKE_BIN: fakeBin,
       KONTROL_ENV_FILE: envPath,
       FAKE_REPO_ROOT: root,
       FAKE_TMUX_STATE: fakeTmuxState,
@@ -625,12 +635,12 @@ function startRestartController(envPath, extraEnv = {}) {
   noteRuntimeLockPath(readEnvironmentStateDir(envPath));
   let resolveResult;
   const result = new Promise((resolve) => { resolveResult = resolve; });
-  const child = spawn("bash", ["restart-kontrol.sh"], {
+  const child = spawn("bash", ["-c", runWithFakeBin, "kontrol-launcher-test", "restart-kontrol.sh"], {
     cwd: root,
     detached: true,
     env: {
       ...process.env,
-      PATH: `${fakeBin}${delimiter}${process.env.PATH ?? ""}`,
+      KONTROL_TEST_FAKE_BIN: fakeBin,
       KONTROL_ENV_FILE: envPath,
       FAKE_REPO_ROOT: root,
       FAKE_TMUX_STATE: fakeTmuxState,
