@@ -461,7 +461,9 @@ function restoreHarness() {
   rmSync(harnessRoot, {
     recursive: true,
     force: true,
-    ...(process.platform === "win32" ? { maxRetries: 12, retryDelay: 250 } : {}),
+    // taskkill returns before Windows has released every descendant's working
+    // directory handle, so allow the filesystem more time to observe exit.
+    ...(process.platform === "win32" ? { maxRetries: 60, retryDelay: 250 } : {}),
   });
   try {
     const currentLock = JSON.parse(readFileSync(behaviorLockPath, "utf8"));
