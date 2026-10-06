@@ -157,7 +157,10 @@ writeExecutable(join(fakeBin, "tmux"), [
   "pid_file() { printf '%s/%s.pid' \"$state\" \"$1\"; }",
   "fake_process_is_live() {",
   "  if [ \"${OS:-}\" = \"Windows_NT\" ]; then",
-  "    MSYS_NO_PATHCONV=1 tasklist /FI \"PID eq $1\" /FO CSV /NH 2>/dev/null | grep -E ',\"?$1\"?,' >/dev/null",
+  // The pidfile contains Node's native Windows PID, while Git Bash's kill
+  // builtin expects an MSYS PID. Query that native PID through Node directly
+  // so a just-launched fixture session is not mistaken for a dead process.
+  "    node -e 'try { process.kill(Number(process.argv[1]), 0); process.exit(0); } catch { process.exit(1); }' \"$1\" >/dev/null 2>&1",
   "  else",
   "    kill -0 \"$1\" 2>/dev/null",
   "  fi",
