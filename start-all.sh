@@ -398,13 +398,24 @@ update_dist_projection() {
   if [[ -L "$projection" || ! -e "$projection" ]]; then
     rm -f -- "$next_projection"
     ln -s -- "$target" "$next_projection"
-    if [[ "$(uname -s)" == "Darwin" ]]; then
-      # BSD mv uses -h to replace a symlink-to-directory itself instead of
-      # treating it as a directory target; GNU mv expresses that as -T.
-      mv -hf "$next_projection" "$projection"
-    else
-      mv -Tf -- "$next_projection" "$projection"
-    fi
+    case "$(uname -s)" in
+      Darwin*)
+        # BSD mv uses -h to replace a symlink-to-directory itself instead of
+        # treating it as a directory target; GNU mv expresses that as -T.
+        mv -hf "$next_projection" "$projection"
+        ;;
+      MINGW*|MSYS*|CYGWIN*)
+        # Git Bash mv follows directory symlinks when replacing the existing
+        # projection, even with -T. The immutable artifact path in
+        # generation.json and the supervisor remains authoritative during this
+        # brief projection swap.
+        rm -f -- "$projection"
+        mv -f -- "$next_projection" "$projection"
+        ;;
+      *)
+        mv -Tf -- "$next_projection" "$projection"
+        ;;
+    esac
     return 0
   fi
   echo "[!] dist/ is a regular directory; leaving the development projection unchanged (generation.json is authoritative)." >&2
