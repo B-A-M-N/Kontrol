@@ -98,6 +98,12 @@ function settle(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 25));
 }
 
+async function waitForAssertion(predicate: () => boolean, message: string, timeoutMs = 3_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate() && Date.now() < deadline) await settle();
+  assert.ok(predicate(), message);
+}
+
 function readCard(text: string): ToolResultCard {
   return {
     tool: "read",
@@ -414,6 +420,11 @@ assert.equal(document.querySelector<HTMLElement>(".agent-submit-reference-warnin
 assert.equal(document.querySelector<HTMLTextAreaElement>(".agent-submit-input")?.value, "::chatgpt-content-reference::", "reference-only warning keeps the pasted content visible");
 await settle();
 const replayedActivity = document.querySelectorAll(".agent-event").length;
+await waitForAssertion(
+  () => __workspaceAppTest.getWorkSessionView("session-dom")?.lastSeq === 102
+    && __workspaceAppTest.getWorkSessionView("session-reconnect")?.lastSeq === 6,
+  `workspace hydration replays the committed event and advances the durable event cursor; active=${__workspaceAppTest.getActiveWorkspaceId()} domSeq=${__workspaceAppTest.getWorkSessionView("session-dom")?.lastSeq} reconnectSeq=${__workspaceAppTest.getWorkSessionView("session-reconnect")?.lastSeq} awaitCalls=${fakeToolCalls.filter((name) => name === "await_workspace_events").length}`,
+);
 assert.equal(__workspaceAppTest.getWorkSessionView("session-dom")?.lastSeq, 102, "snapshot replay materializes a committed event during pagination");
 assert.equal(
   __workspaceAppTest.getWorkSessionView("session-reconnect")?.lastSeq,

@@ -17,6 +17,9 @@ const now = new Date().toISOString();
 const workspaceSessionId = "workspace-browser";
 const workSessionId = "session-browser";
 const submissionId = "submission-browser-5";
+// The built single-file app is several megabytes before gzip. Give slower
+// Windows runners enough time for Chromium startup and workspace hydration.
+const STARTUP_TIMEOUT_MS = 15_000;
 
 const browser = await chromium.launch({
   headless: true,
@@ -200,7 +203,7 @@ try {
 
   await page.goto(pathToFileURL(htmlPath).href, { waitUntil: "load" });
   try {
-    await page.locator(".workspace-surface").waitFor({ state: "attached", timeout: 5_000 });
+    await page.locator(".workspace-surface").waitFor({ state: "attached", timeout: STARTUP_TIMEOUT_MS });
   } catch (error) {
     const startupState = await page.evaluate(() => ({
       url: location.href,
@@ -219,7 +222,7 @@ try {
       + browserDiagnostics.join("\n"),
     );
   }
-  await page.locator(".review-feedback").waitFor({ state: "attached", timeout: 5_000 });
+  await page.locator(".review-feedback").waitFor({ state: "attached", timeout: STARTUP_TIMEOUT_MS });
   await capture("initial-review-approval");
 
   assert.equal(await page.locator(".agent-meta-primary").textContent().then((text) => text?.includes("Awaiting review")), true, "primary session state is humanized");
@@ -276,7 +279,7 @@ try {
   await page.waitForFunction(() => {
     const title = document.querySelector(".agent-meta-primary");
     return title !== null && getComputedStyle(title).color === "rgb(11, 22, 33)";
-  }, undefined, { timeout: 5_000 });
+  }, undefined, { timeout: STARTUP_TIMEOUT_MS });
   const themeState = await page.evaluate(() => {
     const title = document.querySelector(".agent-meta-primary");
     return {
