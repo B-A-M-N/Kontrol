@@ -425,14 +425,24 @@ function restoreHarness() {
   if (harnessRestored) return;
   harnessRestored = true;
   stopFakeSessions();
-  for (const signal of ["SIGTERM", "SIGKILL"]) {
+  for (const signal of (process.platform === "win32" ? ["SIGKILL"] : ["SIGTERM", "SIGKILL"])) {
     for (const lockPath of runtimeLockPathsSeen) {
       try {
         const lock = JSON.parse(readFileSync(lockPath, "utf8"));
         const pid = Number(lock.launcherPid);
         if (Number.isInteger(pid) && pid > 1) {
-          try { process.kill(-pid, signal); } catch { /* group or process already gone */ }
-          try { process.kill(pid, signal); } catch { /* already gone */ }
+          if (process.platform === "win32") {
+            // The launcher may have left a server or supervisor child whose
+            // working directory is the fixture checkout. Killing only the
+            // lock-owning PID leaves that child holding the directory open.
+            spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"], {
+              stdio: "ignore",
+              windowsHide: true,
+            });
+          } else {
+            try { process.kill(-pid, signal); } catch { /* group or process already gone */ }
+            try { process.kill(pid, signal); } catch { /* already gone */ }
+          }
         }
       } catch { /* lock unreadable or already removed */ }
     }
