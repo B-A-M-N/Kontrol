@@ -383,9 +383,19 @@ function stopFakeSessions() {
   for (const entry of readdirSync(fakeTmuxState)) {
     if (!entry.endsWith(".pid")) continue;
     const path = join(fakeTmuxState, entry);
+    let pid;
     try {
-      process.kill(Number(readFileSync(path, "utf8").trim()), "SIGTERM");
+      pid = Number(readFileSync(path, "utf8").trim());
+      process.kill(pid, "SIGTERM");
     } catch { /* already gone */ }
+    if (process.platform === "win32" && Number.isInteger(pid) && pid > 1) {
+      // The fake tmux sessions are detached, so ask Windows to terminate any
+      // descendants too before deleting their working checkout.
+      spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"], {
+        stdio: "ignore",
+        windowsHide: true,
+      });
+    }
     rmSync(path, { force: true });
   }
 }
@@ -424,7 +434,11 @@ function restoreHarness() {
   }
   rmSync(baseRelease, { recursive: true, force: true });
   rmSync(candidateRelease, { recursive: true, force: true });
-  rmSync(harnessRoot, { recursive: true, force: true });
+  rmSync(harnessRoot, {
+    recursive: true,
+    force: true,
+    ...(process.platform === "win32" ? { maxRetries: 12, retryDelay: 250 } : {}),
+  });
   try {
     const currentLock = JSON.parse(readFileSync(behaviorLockPath, "utf8"));
     if (currentLock.pid === behaviorLock.pid && currentLock.startToken === behaviorLock.startToken) {
