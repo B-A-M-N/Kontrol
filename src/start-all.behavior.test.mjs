@@ -414,6 +414,38 @@ function stopFakeSessions() {
   }
 }
 
+function scheduleWindowsHarnessCleanup() {
+  const cleanupSource = [
+    'const { rmSync } = require("node:fs");',
+    'const target = process.argv[1];',
+    'let attempts = 0;',
+    'const cleanup = () => {',
+    '  try { rmSync(target, { recursive: true, force: true, maxRetries: 4, retryDelay: 250 }); process.exit(0); }',
+    '  catch { if (++attempts < 120) setTimeout(cleanup, 500); else process.exit(0); }',
+    '};',
+    'cleanup();',
+  ].join("\n");
+  const childEnvironment = {
+    ...(process.env.PATH ? { PATH: process.env.PATH } : {}),
+    ...((process.env.SystemRoot ?? process.env.SYSTEMROOT)
+      ? { SystemRoot: process.env.SystemRoot ?? process.env.SYSTEMROOT }
+      : {}),
+    ...(process.env.TEMP ? { TEMP: process.env.TEMP } : {}),
+    ...(process.env.TMP ? { TMP: process.env.TMP } : {}),
+  };
+  const cleanupProcess = spawn(process.execPath, ["-e", cleanupSource, harnessRoot], {
+    cwd: tmpdir(),
+    detached: true,
+    stdio: "ignore",
+    windowsHide: true,
+    env: childEnvironment,
+  });
+  cleanupProcess.once("error", (error) => {
+    console.warn(`[test] deferred Windows fixture cleanup could not start: ${error.message}`);
+  });
+  cleanupProcess.unref();
+}
+
 const behaviorLock = await acquireBehaviorLock();
 
 // P1.9: an interrupted run (SIGINT/SIGTERM/SIGHUP) must not leave the
@@ -458,13 +490,19 @@ function restoreHarness() {
   }
   rmSync(baseRelease, { recursive: true, force: true });
   rmSync(candidateRelease, { recursive: true, force: true });
-  rmSync(harnessRoot, {
-    recursive: true,
-    force: true,
-    // taskkill returns before Windows has released every descendant's working
-    // directory handle, so allow the filesystem more time to observe exit.
-    ...(process.platform === "win32" ? { maxRetries: 60, retryDelay: 250 } : {}),
-  });
+  try {
+    rmSync(harnessRoot, {
+      recursive: true,
+      force: true,
+      ...(process.platform === "win32" ? { maxRetries: 12, retryDelay: 250 } : {}),
+    });
+  } catch (error) {
+    if (process.platform !== "win32" || error?.code !== "EBUSY") throw error;
+    // A descendant can retain the fixture as its working directory after
+    // taskkill. Retry cleanup outside the harness after this test exits.
+    scheduleWindowsHarnessCleanup();
+    console.warn(`[test] deferred Windows fixture cleanup for a locked directory: ${harnessRoot}`);
+  }
   try {
     const currentLock = JSON.parse(readFileSync(behaviorLockPath, "utf8"));
     if (currentLock.pid === behaviorLock.pid && currentLock.startToken === behaviorLock.startToken) {
