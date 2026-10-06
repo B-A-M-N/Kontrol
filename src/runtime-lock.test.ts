@@ -37,7 +37,11 @@ try {
           reject(error);
         });
       });
-      assert.equal(processIsLive(shellPid), true, "a live Git Bash $$ PID must be recognized by the runtime lock");
+      assert.equal(
+        processIsLive(shellPid),
+        true,
+        `a live Git Bash $$ PID (${shellPid}) must be recognized by the runtime lock`,
+      );
     } finally {
       shell.kill("SIGTERM");
       await new Promise<void>((resolve) => shell.once("close", () => resolve()));

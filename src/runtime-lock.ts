@@ -89,12 +89,12 @@ export function processIsLive(pid: number): boolean {
 
 function isLiveWindowsPosixProcess(pid: number): boolean {
   try {
-    const output = execFileSync("ps", ["-p", String(pid), "-o", "pid="], {
+    const output = execFileSync("ps", ["-p", String(pid)], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
       windowsHide: true,
     });
-    return output.trim().split(/\s+/).includes(String(pid));
+    return output.split(/\r?\n/).some((line) => line.match(/^\s*(\d+)\s/)?.[1] === String(pid));
   } catch {
     return false;
   }
