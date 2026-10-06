@@ -268,7 +268,14 @@ try {
       method: "tools/call",
       params: {
         name: "bash",
-        arguments: { workspaceId: sessions[0].workspaceId, command: "sleep 1; printf post-sse-ok", timeout: 5 },
+        // Use a Node timer so the delayed operation has the same duration on
+        // Windows and Unix shells, with enough margin to observe repeated
+        // heartbeats under a loaded CI runner.
+        arguments: {
+          workspaceId: sessions[0].workspaceId,
+          command: "node -e \"setTimeout(() => console.log('post-sse-ok'), 2000)\"",
+          timeout: 5,
+        },
       },
     }),
   });
@@ -285,7 +292,7 @@ try {
     postSseText += new TextDecoder().decode(chunk.value);
   }
   const postHeartbeatCount = (postSseText.match(/: kontrol-heartbeat\n\n/g) ?? []).length;
-  assert.ok(postHeartbeatCount >= 2, `a 1-second POST long poll must carry multiple response heartbeats (saw ${postHeartbeatCount})`);
+  assert.ok(postHeartbeatCount >= 2, `a delayed POST long poll must carry multiple response heartbeats (saw ${postHeartbeatCount})`);
   const postData = postSseText.split(/\r?\n/).filter((line) => line.startsWith("data:")).map((line) => JSON.parse(line.slice(5).trim()));
   assert.equal(postData.length, 1, "the POST SSE request must end in exactly one JSON-RPC result");
   assert.notEqual(postData[0]?.result?.isError, true, "the terminal POST tool result must remain valid after heartbeat comments");
