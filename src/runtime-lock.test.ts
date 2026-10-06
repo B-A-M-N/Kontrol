@@ -101,7 +101,9 @@ try {
         "--build-id", `build-${round}-${index}`,
         "--artifact-path", `/releases/child-${round}-${index}`,
         "--port", "7676",
-        "--hold-ms", "1500",
+        // Hold the winning lock long enough for all six tsx child processes
+        // to reach arbitration on slower CI runners before any stale takeover.
+        "--hold-ms", "10000",
       ], { cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"] });
       const firstResult = new Promise<{ pid: number; acquired: boolean }>((resolve) => {
         let settled = false;
