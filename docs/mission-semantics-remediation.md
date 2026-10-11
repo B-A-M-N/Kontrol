@@ -50,3 +50,11 @@ Clean candidate `0c9c6b34b4c1ccbe` (source `cec77fb`, schema v64, gitDirty 0). O
 - F11 boundary: path-valued flag arguments and Windows separator traversal rejected; benign adjacent-dot names preserved.
 - Full unit suite (42) green; clean candidate `cf37f9560fbe7be8` built from `cdaf4ab`.
 - Filesystem blocker persists (root read-only); activation/soak pending recovery.
+
+### Authoritative missionApproved (commit f7b67ba, candidate 0c4b1df96c2d0d82)
+
+evaluateLoopExtension now derives missionApproved from the ledger's own
+canApprove() result, not from caller input. A falsification test proves a
+caller asserting approval cannot converge a denied mission. Full unit suite
+(42) green; clean candidate built from f7b67ba. Root filesystem remains
+read-only; activation and soak still pending recovery.
