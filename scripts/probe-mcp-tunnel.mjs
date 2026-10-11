@@ -402,6 +402,13 @@ async function decodeResponse(response, expectedId) {
   }
   const text = await response.text();
   if (!text.trim()) return undefined;
+  const responseContentType = response.headers.get("content-type") ?? "";
+  if (responseContentType.includes("text/event-stream")) {
+    const events = parseSseEventChunks([new TextEncoder().encode(text)]);
+    const matched = matchJsonRpcResponse(events, expectedId);
+    assert.ok(matched.response, `SSE response body did not contain JSON-RPC response for request ID ${String(expectedId)}`);
+    return matched.response;
+  }
   const payload = JSON.parse(text);
   if (expectedId !== undefined) {
     assert.equal(payload?.id, expectedId, `JSON response ID does not match request ID ${expectedId}`);
