@@ -118,6 +118,16 @@ try {
   assert.throws(() => ledger.createMission({
     workSessionId: session.id,
     workspaceSessionId: "workspace-1",
+    objective: "Fix the bridge",
+    acceptanceCriteria: [
+      { id: "crit-tests-renamed", description: "Regression tests pass", priority: "required", verificationType: "test", verificationCommand: "npm test" },
+      { id: "crit-docs", description: "Docs are coherent", priority: "preferred", verificationType: "manual_review" },
+    ],
+  }), /Mission contract conflict/, "changing a criterion id changes the contract identity");
+
+  assert.throws(() => ledger.createMission({
+    workSessionId: session.id,
+    workspaceSessionId: "workspace-1",
     objective: "Silently replace the original contract",
     acceptanceCriteria: [{ id: "crit-tests", description: "Regression tests pass", priority: "required", verificationType: "test", verificationCommand: "npm test" }],
   }), /Mission contract conflict/, "different mission intent cannot be silently ignored");

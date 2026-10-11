@@ -213,6 +213,19 @@ try {
   await assert.rejects(staleHarness.run(), /workspace no longer matches/);
   assert.equal(staleHarness.evidence.length, 0, "stale snapshot blocks command execution and evidence recording");
 
+  // Focused verification expands the explicit selection to transitive
+  // dependencies: selecting the dependent runs both, and a failing dependency
+  // prevents the dependent from running.
+  const dependencyHarness = harness({
+    criteria: [
+      { id: "base", description: "base", verificationCommand: "npm --version" },
+      { id: "dependent", description: "dependent", verificationCommand: "npm --version", dependsOnCriterionIds: ["base"] },
+    ],
+  });
+  const dependencyResults = await dependencyHarness.run(["dependent"]);
+  assert.deepEqual(dependencyResults.map((result) => result.criterionId), ["base", "dependent"],
+    "focused selection includes the transitive dependency before the dependent criterion");
+
   // A verified_resolved finding whose resolution belongs to an older submission
   // is reverified on the current snapshot, not silently accepted as still valid.
   const staleFindingHarness = harness({
