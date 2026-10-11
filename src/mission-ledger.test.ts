@@ -237,6 +237,72 @@ try {
     /requires at least one required acceptance criterion/,
   );
 
+  // --- F01: a later failure supersedes an earlier passing result -----------
+  const f01Session = workSessions.create({
+    workspaceSessionId: "workspace-1",
+    submittedBy: "webui",
+    title: "F01 superseding evidence",
+    completionPolicy: "webui_approval_required",
+  });
+  const f01Mission = ledger.createMission({
+    workSessionId: f01Session.id,
+    workspaceSessionId: "workspace-1",
+    objective: "Superseding verification must block approval",
+    acceptanceCriteria: [{ id: "f01-crit", description: "behavior passes", priority: "required", verificationType: "test", verificationCommand: "npm test" }],
+  });
+  const f01Submission = workSessions.submitForReview({
+    workSessionId: f01Session.id,
+    diff: "F01",
+    snapshotKind: "git",
+    snapshotRef: "f01-snap",
+    snapshotCommit: "f01-snap",
+  });
+  const f01Context = { submissionId: f01Submission.id, snapshotKind: "git" as const, snapshotRef: "f01-snap", snapshotCommit: "f01-snap", reviewEpoch: f01Submission.reviewEpoch };
+  ledger.recordVerifierEvidence(f01Mission.id, [{ criterionId: "f01-crit", ...f01Context, command: "npm test", status: "passed", details: { exitCode: 0 } }]);
+  assert.equal(ledger.canApprove(f01Session.id, f01Context).allowed, true);
+  ledger.recordVerifierEvidence(f01Mission.id, [{ criterionId: "f01-crit", ...f01Context, command: "npm test", status: "failed", details: { exitCode: 1 } }]);
+  const f01Blocked = ledger.canApprove(f01Session.id, f01Context);
+  assert.equal(f01Blocked.allowed, false, "a later failed attempt must supersede an earlier pass");
+  assert.match(f01Blocked.reasons.join("\n"), /f01-crit/);
+  ledger.recordVerifierEvidence(f01Mission.id, [{ criterionId: "f01-crit", ...f01Context, command: "npm test", status: "passed", details: { exitCode: 0 } }]);
+  assert.equal(ledger.canApprove(f01Session.id, f01Context).allowed, true, "a new passing attempt after a failure restores verification");
+
+  // --- F02: verified_resolved findings require renewal on a new submission --
+  const f02Session = workSessions.create({
+    workspaceSessionId: "workspace-1",
+    submittedBy: "webui",
+    title: "F02 stale resolution",
+    completionPolicy: "webui_approval_required",
+  });
+  const f02Mission = ledger.createMission({
+    workSessionId: f02Session.id,
+    workspaceSessionId: "workspace-1",
+    objective: "Resolved findings must stay resolved only for their submission",
+    acceptanceCriteria: [{ id: "f02-crit", description: "works", priority: "required", verificationType: "test", verificationCommand: "npm test" }],
+  });
+  const [f02Finding] = ledger.addFindings(f02Mission.id, [{ id: "f02-finding", description: "defect", requiredAction: "fix", requiredVerification: ["npm test"], severity: "blocker", scope: "in_scope" }]);
+  const f02aSubmission = workSessions.submitForReview({ workSessionId: f02Session.id, diff: "A", snapshotKind: "git", snapshotRef: "f02-a", snapshotCommit: "f02-a" });
+  const f02aContext = { submissionId: f02aSubmission.id, snapshotKind: "git" as const, snapshotRef: "f02-a", snapshotCommit: "f02-a", reviewEpoch: f02aSubmission.reviewEpoch };
+  ledger.recordVerifierEvidence(f02Mission.id, [
+    { criterionId: "f02-crit", ...f02aContext, command: "npm test", status: "passed", details: { exitCode: 0 } },
+    { findingId: "f02-finding", ...f02aContext, command: "npm test", status: "passed", details: { exitCode: 0 } },
+  ]);
+  ledger.updateFindingStatus(f02Mission.id, [{ id: "f02-finding", status: "claimed_resolved" }]);
+  ledger.resolveFinding(f02Mission.id, "f02-finding", f02aContext);
+  assert.equal(ledger.canApprove(f02Session.id, f02aContext).allowed, true);
+
+  workSessions.updateStatus(f02Session.id, "changes_requested");
+  const f02bSubmission = workSessions.submitForReview({ workSessionId: f02Session.id, diff: "B", snapshotKind: "git", snapshotRef: "f02-b", snapshotCommit: "f02-b" });
+  const f02bContext = { submissionId: f02bSubmission.id, snapshotKind: "git" as const, snapshotRef: "f02-b", snapshotCommit: "f02-b", reviewEpoch: f02bSubmission.reviewEpoch };
+  ledger.recordVerifierEvidence(f02Mission.id, [{ criterionId: "f02-crit", ...f02bContext, command: "npm test", status: "passed", details: { exitCode: 0 } }]);
+  const f02Stale = ledger.canApprove(f02Session.id, f02bContext);
+  assert.equal(f02Stale.allowed, false, "a resolution verified for submission A cannot approve submission B");
+  assert.match(f02Stale.reasons.join("\n"), /f02-finding/);
+  ledger.recordVerifierEvidence(f02Mission.id, [{ findingId: "f02-finding", ...f02bContext, command: "npm test", status: "passed", details: { exitCode: 0 } }]);
+  ledger.updateFindingStatus(f02Mission.id, [{ id: "f02-finding", status: "claimed_resolved" }]);
+  ledger.resolveFinding(f02Mission.id, "f02-finding", f02bContext);
+  assert.equal(ledger.canApprove(f02Session.id, f02bContext).allowed, true, "renewed resolution evidence for submission B restores approval");
+
   // --- Anti-runaway loop guard -------------------------------------------
   const loopSession = workSessions.create({
     workspaceSessionId: "workspace-1",
@@ -286,10 +352,14 @@ try {
   assert.ok(advisory[0]);
   assert.ok(!ledger.canApprove(loopSession.id).reasons.some((r) => r.includes(advisory[0].id)), "advisory findings do not block approval");
 
-  // A round with no new blocking findings has converged — no extension.
-  const converged = ledger.evaluateLoopExtension(loopSession.id, { newFindingIds: [] });
+  // A round with no new blocking findings and a satisfied approval predicate
+  // has converged; unresolved requirements instead escalate to a human.
+  const converged = ledger.evaluateLoopExtension(loopSession.id, { newFindingIds: [], missionApproved: true });
   assert.equal(converged.extend, false);
   assert.match(converged.reason, /converged/);
+  const unresolved = ledger.evaluateLoopExtension(loopSession.id, { newFindingIds: [], missionApproved: false });
+  assert.equal(unresolved.extend, false);
+  assert.match(unresolved.reason, /unresolved mission requirements/);
 
   // P2 #34/#35: review-coverage contract. A mission declaring coverage lenses
   // blocks approval until a completion report records every lens as covered;

@@ -3,6 +3,7 @@ import type { LoopExtensionDecision } from "../mission-ledger.js";
 interface CorrectionRoundInput {
   newFindingIds: string[];
   resolvedFindingIds?: string[];
+  missionApproved?: boolean;
   progress?: {
     blockingFindingCount?: number;
     failedCriterionCount?: number;
@@ -19,6 +20,18 @@ export function evaluateCorrectionPolicy(input: {
   newBlockingCount: number;
   round: CorrectionRoundInput;
 }): LoopExtensionDecision {
+  // No new blocking findings can mean convergence or unresolved work. If the
+  // approval predicate is not satisfied, unresolved requirements remain and
+  // the loop must escalate rather than declare convergence.
+  if (input.newBlockingCount === 0 && input.round.missionApproved !== true) {
+    return {
+      extend: false,
+      round: input.currentRound,
+      maxRounds: input.maxCorrectionRounds,
+      reason: "No new blocking findings and unresolved mission requirements remain; escalation to a human is required.",
+      ceilingHit: false,
+    };
+  }
   if (input.newBlockingCount === 0) {
     return {
       extend: false,

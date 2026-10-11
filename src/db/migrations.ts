@@ -73,7 +73,30 @@ const migrations: Migration[] = [
   { version: 61, name: "telemetry-ingress-retention-index", up: migrateTelemetryIngressRetentionIndex },
   { version: 62, name: "mission-outcome-authority", up: migrateMissionOutcomeAuthority },
   { version: 63, name: "canonical-snapshot-report-identity", up: migrateCanonicalSnapshotReportIdentity },
+  { version: 64, name: "mission-evidence-attempt-ordering", up: migrateMissionEvidenceAttemptOrdering },
 ];
+
+// v64: verification attempts need durable monotonic ordering because ISO
+// timestamps can collide. Backfill attempts within each evidence scope from
+// chronological order; newer records then receive an explicit attempt number
+// assigned by the ledger before insertion.
+function migrateMissionEvidenceAttemptOrdering(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "mission_evidence", "attempt", "integer");
+  sqlite.exec(`
+    with scoped as (
+      select rowid, row_number() over (
+        partition by mission_id, coalesce(criterion_id, finding_id, '(mission)')
+        order by created_at, rowid
+      ) as attempt
+      from mission_evidence
+      where attempt is null
+    )
+    update mission_evidence
+       set attempt = (select attempt from scoped where scoped.rowid = mission_evidence.rowid)
+     where attempt is null;
+  `);
+  sqlite.exec("create index if not exists mission_evidence_attempt_idx on mission_evidence(mission_id, criterion_id, finding_id, attempt)");
+}
 
 function migrateCanonicalSnapshotReportIdentity(sqlite: Database.Database): void {
   const pairs: Array<[table: string, kind: string, ref: string, legacy: string]> = [

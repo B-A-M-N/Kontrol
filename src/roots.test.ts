@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { assertAllowedPath, expandHomePath, resolveAllowedPath } from "./roots.js";
+import { assertAllowedPath, expandHomePath, isPathInsideRoot, resolveAllowedPath } from "./roots.js";
 
 const home = homedir();
 
@@ -24,6 +24,11 @@ assert.equal(
   resolveAllowedPath("~/file.txt", "/workspace", ["/workspace"]),
   resolve("/workspace", "~/file.txt"),
 );
+
+assert.equal(isPathInsideRoot("/workspace/..cache", "/workspace"), true, "a child named ..cache is inside the root");
+assert.equal(isPathInsideRoot("/workspace/..", "/workspace"), false, "an exact parent component escapes");
+assert.equal(isPathInsideRoot("/workspace/sub/..foo", "/workspace"), true, "a nested child named ..foo is inside");
+assert.equal(isPathInsideRoot("/outside/file", "/workspace"), false, "unrelated absolute path escapes");
 
 if (process.platform === "win32") {
   assert.throws(

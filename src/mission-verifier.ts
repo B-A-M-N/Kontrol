@@ -128,7 +128,9 @@ export function parseVerificationCommand(command: string): { executable: string;
   if (!executable || !ALLOWED_EXECUTABLES.has(executable)) {
     throw new Error(`Verification executable ${JSON.stringify(executable)} is not allowlisted.`);
   }
-  if (args.some((arg) => arg.includes("..") || arg.startsWith("/"))) {
+  // Reject path traversal components, not benign names that merely contain
+  // two adjacent dots (for example `src/foo..test.ts`).
+  if (args.some((arg) => arg.split("/").includes("..") || arg.startsWith("/"))) {
     throw new Error("Verification arguments may not escape the workspace.");
   }
   return { executable, args };
@@ -604,12 +606,8 @@ export async function verifyMissionSubmission(input: {
   // containing paths. Missing metadata on legacy submissions is conservative:
   // affected-area filters cannot skip checks.
   const changedPaths = latest.files?.flatMap((file) => [file.path, file.previousPath].filter((path): path is string => Boolean(path))) ?? [];
-  const scopeAllows = (criterion: typeof packet.criteria[number]): boolean => {
-    if (requestedScope === "full") return true;
-    if (requestedScope === "focused") return Boolean(explicitlySelected?.has(criterion.id));
-    if ((criterion.affectedAreas ?? []).length === 0 || changedPaths.length === 0) return true;
-    return criterion.affectedAreas!.some((area) => changedPaths.some((path) => pathMatchesAffectedArea(path, area)));
-  };
+  // Focused verification expands the explicit selection to its transitive
+  // dependencies first; the expanded set is the authoritative selection.
   const selectedWithDependencies = explicitlySelected ? new Set(explicitlySelected) : undefined;
   if (selectedWithDependencies) {
     let changed = true;
@@ -626,6 +624,12 @@ export async function verifyMissionSubmission(input: {
       }
     }
   }
+  const scopeAllows = (criterion: typeof packet.criteria[number]): boolean => {
+    if (requestedScope === "full") return true;
+    if (requestedScope === "focused") return Boolean(selectedWithDependencies?.has(criterion.id));
+    if ((criterion.affectedAreas ?? []).length === 0 || changedPaths.length === 0) return true;
+    return criterion.affectedAreas!.some((area) => changedPaths.some((path) => pathMatchesAffectedArea(path, area)));
+  };
   const criteria = packet.criteria.filter((criterion) => ((criterion.verificationType === "test" && !!criterion.verificationCommand)
     || (criterion.verificationType === "runtime_behavior" && !!criterion.runtimeProbe))
     && (!selectedWithDependencies || selectedWithDependencies.has(criterion.id))
@@ -735,7 +739,11 @@ export async function verifyMissionSubmission(input: {
     return results.map((result) => result.status === "passed" ? { ...result, status: "inconclusive" as const } : result);
   }
   const findingEvidence: typeof pendingEvidence = [];
-  for (const finding of packet.findings.filter((item) => item.status === "claimed_resolved" && item.requiredVerification.length > 0)) {
+  const staleResolution = (finding: typeof packet.findings[number]): boolean =>
+    finding.status === "verified_resolved" && (!latest.id || finding.resolutionSubmissionId !== latest.id);
+  const needsFindingVerification = (finding: typeof packet.findings[number]): boolean =>
+    (finding.status === "claimed_resolved" || staleResolution(finding)) && finding.requiredVerification.length > 0;
+  for (const finding of packet.findings.filter(needsFindingVerification)) {
     for (const command of finding.requiredVerification) {
       let result: Omit<VerificationResult, "criterionId" | "command">;
       try {
@@ -788,7 +796,7 @@ export async function verifyMissionSubmission(input: {
     return results.map((result) => result.status === "passed" ? { ...result, status: "inconclusive" as const } : result);
   }
   const currentContext = { submissionId: latest.id, snapshotKind, snapshotRef, snapshotCommit: snapshotRef, reviewEpoch: latest.reviewEpoch };
-  for (const finding of packet.findings.filter((item) => item.status === "claimed_resolved")) {
+  for (const finding of packet.findings.filter((item) => item.status === "claimed_resolved" || staleResolution(item))) {
     try { input.missionLedger.resolveFinding(mission.id, finding.id, currentContext); }
     catch { /* The ledger leaves the finding claimed until every required evidence item exists. */ }
   }

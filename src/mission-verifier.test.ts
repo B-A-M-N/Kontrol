@@ -12,6 +12,9 @@ try {
   assert.throws(() => parseVerificationCommand("npm test %PATH%"), /not permitted/);
   assert.throws(() => parseVerificationCommand('npm test "quoted"'), /not permitted/);
   assert.throws(() => parseVerificationCommand("sh test.sh"), /not allowlisted/);
+  const dotsName = parseVerificationCommand("npm run foo..bar");
+  assert.deepEqual(dotsName.args, ["run", "foo..bar"], "benign file names containing adjacent dots are allowed");
+  assert.throws(() => parseVerificationCommand("npm test ../escape"), /may not escape/);
 
   const originalCacheEnv = process.env.VERIFIER_CACHE_TEST_FLAG;
   try {

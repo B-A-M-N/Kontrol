@@ -104,6 +104,7 @@ async function testDatabaseConfiguration(stateDir: string): Promise<void> {
       { version: 61, name: "telemetry-ingress-retention-index" },
       { version: 62, name: "mission-outcome-authority" },
       { version: 63, name: "canonical-snapshot-report-identity" },
+      { version: 64, name: "mission-evidence-attempt-ordering" },
     ]);
   } finally {
     database.close();

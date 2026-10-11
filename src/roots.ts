@@ -24,12 +24,12 @@ export function isPathInsideRoot(path: string, root: string): boolean {
   const resolvedRoot = resolve(expandHomePath(root));
   const relationship = relative(resolvedRoot, resolvedPath);
 
+  // Reject exact parent traversal components only. A child named `..cache`
+  // is a legitimate relative path and must not be falsely rejected.
+  const components = relationship.split(sep).filter(Boolean);
   return (
     relationship === "" ||
-    (!isAbsolute(relationship) &&
-      !relationship.startsWith("..") &&
-      relationship !== ".." &&
-      !relationship.includes(`..${sep}`))
+    (!isAbsolute(relationship) && !components.includes(".."))
   );
 }
 

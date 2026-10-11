@@ -17,6 +17,7 @@ export interface OutcomeFinding {
   severity: string;
   status: string;
   description: string;
+  resolutionSubmissionId?: string;
 }
 
 export interface OutcomeReport {
@@ -26,7 +27,7 @@ export interface OutcomeReport {
 
 export function evaluateEffectiveCriteria(
   criteria: OutcomeCriterion[],
-  evidenceFor: (criterion: OutcomeCriterion, status: "passed" | "failed") => EvidenceRecord | undefined,
+  effectiveEvidenceFor: (criterion: OutcomeCriterion) => EvidenceRecord | undefined,
   context: CurrentApprovalContext,
 ): EffectiveCriterionState[] {
   const byId = new Map(criteria.map((criterion) => [criterion.id, criterion]));
@@ -41,16 +42,23 @@ export function evaluateEffectiveCriteria(
     visiting.add(criterionId);
     const dependencies = (criterion.dependsOnCriterionIds ?? []).map(evaluate);
     const dependenciesSatisfied = dependencies.every((dependency) => dependency.status === "verified");
-    const evidence = evidenceFor(criterion, "passed");
-    const failedEvidence = evidenceFor(criterion, "failed");
-    const baseStatus: CriterionStatus = evidence ? "verified" : failedEvidence ? "failed" : "unverified";
+    // One authoritative attempt selects the criterion state. A later failed or
+    // inconclusive observation supersedes an earlier passing result.
+    const evidence = effectiveEvidenceFor(criterion);
+    const baseStatus: CriterionStatus = evidence?.status === "passed"
+      ? "verified"
+      : evidence?.status === "failed"
+        ? "failed"
+        : "unverified";
     const status: CriterionStatus = baseStatus === "verified" && dependenciesSatisfied ? "verified" : baseStatus === "verified" ? "unverified" : baseStatus;
-    const staleReason = !evidence && criterion.status !== "unverified" && !failedEvidence
+    const staleReason = !evidence && criterion.status !== "unverified"
       ? `stored ${criterion.status} status has no qualifying evidence for current submission ${context.submissionId ?? "(unknown)"}`
       : baseStatus === "verified" && !dependenciesSatisfied
         ? "one or more dependencies are not currently verified"
-        : undefined;
-    const state: EffectiveCriterionState = { criterionId, status, evidenceId: evidence?.id ?? failedEvidence?.id, dependenciesSatisfied, staleReason };
+        : evidence?.status === "inconclusive"
+          ? "latest verification attempt was inconclusive"
+          : undefined;
+    const state: EffectiveCriterionState = { criterionId, status, evidenceId: evidence?.id, dependenciesSatisfied, staleReason };
     visiting.delete(criterionId);
     states.set(criterionId, state);
     return state;
@@ -66,6 +74,7 @@ export function evaluateMissionOutcome(input: {
   finalVerification: string[];
   reviewCoverage: string[];
   currentReport?: OutcomeReport;
+  currentSubmissionId?: string;
 }): { allowed: boolean; reasons: string[] } {
   const reasons: string[] = [];
   const states = new Map(input.criterionStates.map((state) => [state.criterionId, state]));
@@ -77,9 +86,19 @@ export function evaluateMissionOutcome(input: {
   }
   for (const finding of input.findings) {
     if (finding.scope === "out_of_scope") continue;
-    if (finding.disposition === "blocking" && !["verified_resolved", "waived"].includes(finding.status)) {
-      reasons.push(`${finding.severity} finding ${finding.id} is ${finding.status}: ${finding.description}`);
+    if (finding.disposition !== "blocking") continue;
+    if (finding.status === "waived") continue;
+    if (finding.status === "verified_resolved") {
+      // A verified resolution is contextual. If its evidence was recorded for a
+      // different submission/snapshot/epoch than the current approval context,
+      // it must be reverified before the current submission can approve.
+      if (finding.resolutionSubmissionId && input.currentSubmissionId && finding.resolutionSubmissionId !== input.currentSubmissionId) {
+        reasons.push(`Finding ${finding.id} was resolved for submission ${finding.resolutionSubmissionId}, but the current submission is ${input.currentSubmissionId}; renewed verification is required.`);
+        continue;
+      }
+      continue;
     }
+    reasons.push(`${finding.severity} finding ${finding.id} is ${finding.status}: ${finding.description}`);
   }
   if (input.finalVerification.length && input.currentReport?.status !== "passed") {
     reasons.push("Mission-level final integration verification has not passed for the current submission.");

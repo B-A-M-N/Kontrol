@@ -62,7 +62,9 @@ try {
     values (?, ?, ?, ?, ?, ?, ?, ?)
   `).run("legacy-filesystem-report", "legacy-mission", "legacy-submission", "fs:sha256:legacy", "passed", "[]", "legacy-hash", new Date().toISOString());
   sqlite.pragma("foreign_keys = ON");
-  sqlite.prepare("delete from kontrol_schema_migrations where version = ?").run(LATEST_SCHEMA_VERSION);
+  // Re-run the canonical snapshot identity migration explicitly; newer
+  // migrations may exist without changing this backfill assertion.
+  sqlite.prepare("delete from kontrol_schema_migrations where version = ?").run(63);
   migrateDatabase(sqlite);
   assert.deepEqual(
     sqlite.prepare("select snapshot_kind, snapshot_ref from mission_completion_reports where id = ?").get("legacy-filesystem-report"),

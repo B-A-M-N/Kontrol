@@ -40,7 +40,10 @@ export function compactMissionPacket(packet: MissionReviewPacket): MissionReview
   const blockingFindings = packet.findings.filter((finding) =>
     finding.scope !== "out_of_scope" &&
     (finding.severity === "blocker" || finding.severity === "high") &&
-    !["verified_resolved", "waived"].includes(finding.status),
+    (["open", "claimed_resolved"].includes(finding.status) ||
+      // A stale verified_resolved finding blocks approval for the current
+      // submission and must remain visible until fresh resolution evidence.
+      (finding.status === "verified_resolved" && !!finding.resolutionSubmissionId && finding.resolutionSubmissionId !== packet.currentSubmissionId)),
   );
   const latestEvidenceByCriterion = new Map<string, MissionReviewPacket["evidence"][number]>();
   for (const evidence of packet.evidence) {
@@ -156,7 +159,8 @@ export function projectMissionExecutionContract(
       effectiveStatus: effectiveStatus.get(criterion.id) ?? "unverified",
     })),
     findings: packet.findings
-      .filter((finding) => ["open", "claimed_resolved"].includes(finding.status))
+      .filter((finding) => ["open", "claimed_resolved"].includes(finding.status) ||
+        (finding.status === "verified_resolved" && !!finding.resolutionSubmissionId && finding.resolutionSubmissionId !== packet.currentSubmissionId))
       .map((finding) => ({
         id: finding.id,
         scope: finding.scope,

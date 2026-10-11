@@ -7,6 +7,10 @@ export interface EvidenceRecord {
   reviewEpoch?: number;
   snapshotKind?: string;
   snapshotRef?: string;
+  criterionId?: string;
+  findingId?: string;
+  attempt?: number;
+  createdAt?: string;
   command?: string;
   details?: unknown;
 }
@@ -18,6 +22,54 @@ export function isEvidenceSourceAllowed(verificationType: string, source: Missio
     return source === "reviewer_manual_attestation";
   }
   return false;
+}
+
+export interface EvidenceScopeContext {
+  submissionId?: string;
+  snapshotKind?: string;
+  snapshotRef?: string;
+  reviewEpoch?: number;
+}
+
+/**
+ * Select the one authoritative result for a criterion or finding at the exact
+ * current submission/snapshot/review epoch. Ordering is by durable attempt
+ * first, then ISO timestamp and row id for legacy records whose attempt was
+ * not populated. A later failure or inconclusive result supersedes an earlier
+ * passing result; an earlier record can never certify the current context.
+ */
+export function selectEffectiveEvidenceResult(
+  evidence: EvidenceRecord[],
+  scope: { criterionId?: string; findingId?: string },
+  context: EvidenceScopeContext,
+): EvidenceRecord | undefined {
+  if (!context.submissionId || !context.snapshotKind || !context.snapshotRef) return undefined;
+  const scopeId = scope.criterionId ?? scope.findingId;
+  if (!scopeId) return undefined;
+  const scopeKey = scope.criterionId ? "criterionId" : "findingId";
+  return evidence
+    .filter((entry) => {
+      const details = typeof entry.details === "object" && entry.details ? entry.details as Record<string, unknown> : {};
+      return entry[scopeKey] === scopeId
+        && entry.submissionId === context.submissionId
+        && entry.snapshotKind === context.snapshotKind
+        && entry.snapshotRef === context.snapshotRef
+        && (context.reviewEpoch === undefined || entry.reviewEpoch === context.reviewEpoch)
+        && Boolean(details.source);
+    })
+    .sort((left, right) => {
+      const attemptDelta = evidenceAttempt(left) - evidenceAttempt(right);
+      if (attemptDelta !== 0) return attemptDelta;
+      const timeDelta = (left.createdAt ?? "").localeCompare(right.createdAt ?? "");
+      if (timeDelta !== 0) return timeDelta;
+      return left.id.localeCompare(right.id);
+    })
+    .at(-1);
+}
+
+function evidenceAttempt(entry: EvidenceRecord): number {
+  const attempt = entry.attempt;
+  return typeof attempt === "number" ? attempt : -1;
 }
 
 export function findCurrentCriterionEvidence(

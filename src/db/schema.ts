@@ -605,6 +605,7 @@ export const missionEvidence = sqliteTable("mission_evidence", {
   actorPrincipal: text("actor_principal"),
   command: text("command"),
   outputDigest: text("output_digest"),
+  attempt: integer("attempt"),
   status: text("status").notNull().default("inconclusive"),
   detailsJson: text("details_json").notNull().default("{}"),
   createdAt: text("created_at").notNull(),

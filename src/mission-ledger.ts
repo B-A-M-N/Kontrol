@@ -18,7 +18,7 @@ import {
 } from "./db/schema.js";
 import { normalizeWorkspaceSnapshotIdentity, type WorkspaceSnapshotKind } from "./review-checkpoints.js";
 import { fingerprintMissionContract, fingerprintStoredMissionContract, validateMissionCriterionContract } from "./mission/contract-authority.js";
-import { evaluateFindingResolutionEvidence, findCurrentCriterionEvidence, isEvidenceSourceAllowed } from "./mission/evidence-authority.js";
+import { evaluateFindingResolutionEvidence, isEvidenceSourceAllowed, selectEffectiveEvidenceResult } from "./mission/evidence-authority.js";
 import { assertFindingStatusTransition, fingerprintFinding, mergeFindingEvidence } from "./mission/finding-authority.js";
 import { evaluateCorrectionPolicy } from "./mission/correction-policy.js";
 import { evaluateEffectiveCriteria, evaluateMissionOutcome } from "./mission/outcome-evaluator.js";
@@ -150,6 +150,8 @@ export interface MissionReviewPacket {
   completionReports: Array<ReturnType<typeof rowToCompletionReport>>;
   approval: ApprovalPredicate;
   criterionStates: EffectiveCriterionState[];
+  /** Latest submission identity used to derive criterion/finding freshness. */
+  currentSubmissionId?: string;
 }
 
 export interface EffectiveCriterionState {
@@ -203,6 +205,8 @@ export interface NewRoundInput {
   newFindingIds: string[];
   /** Findings resolved (verified_resolved/waived) since the last round. */
   resolvedFindingIds?: string[];
+  /** True when the mission approval predicate currently allows completion. */
+  missionApproved?: boolean;
   /** Optional deterministic progress vector from the verifier/supervisor. */
   progress?: {
     blockingFindingCount?: number;
@@ -427,7 +431,14 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
       .where(and(eq(missionReviewFindings.id, findingId), eq(missionReviewFindings.missionId, missionId)))
       .get();
     if (!finding) throw new Error(`Finding ${findingId} does not belong to mission ${missionId}.`);
-    if (finding.status !== "claimed_resolved") throw new Error(`Finding ${findingId} must be claimed_resolved before verification.`);
+    // Fresh resolutions and stale verified_resolved findings (whose stored
+    // resolution points at an older submission) both require new evidence.
+    const resolutionStale = finding.status === "verified_resolved"
+      && Boolean(finding.resolutionSubmissionId)
+      && finding.resolutionSubmissionId !== context.submissionId;
+    if (finding.status !== "claimed_resolved" && !resolutionStale) {
+      throw new Error(`Finding ${findingId} must be claimed_resolved or have a stale resolution before reverification.`);
+    }
     const snapshot = normalizeWorkspaceSnapshotIdentity(context);
     const snapshotRef = snapshot?.ref;
     const snapshotKind = snapshot?.kind;
@@ -462,7 +473,13 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
       resolutionEvidenceJson: JSON.stringify(evidenceIds),
       waiverReason: null,
       updatedAt: new Date().toISOString(),
-    }).where(and(eq(missionReviewFindings.id, findingId), eq(missionReviewFindings.missionId, missionId), eq(missionReviewFindings.status, "claimed_resolved"))).run();
+    }).where(and(
+      eq(missionReviewFindings.id, findingId),
+      eq(missionReviewFindings.missionId, missionId),
+      finding.status === "claimed_resolved"
+        ? eq(missionReviewFindings.status, "claimed_resolved")
+        : and(eq(missionReviewFindings.status, "verified_resolved"), eq(missionReviewFindings.resolutionSubmissionId, finding.resolutionSubmissionId!)),
+    )).run();
     touchMission(missionId);
     return { evidenceIds };
   }
@@ -529,6 +546,15 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
         }
       }
       const details = { ...(typeof entry.details === "object" && entry.details ? entry.details as Record<string, unknown> : { value: entry.details }), source };
+      const scopeId = entry.criterionId ?? entry.findingId;
+      const attempt = scopeId
+        ? ((database.sqlite.prepare(`
+            select coalesce(max(attempt), 0) as next
+            from mission_evidence
+            where mission_id = ?
+              and (criterion_id = ? or finding_id = ?)
+          `).get(missionId, scopeId, scopeId) as { next?: number }).next ?? 0) + 1
+        : null;
       database.db.insert(missionEvidence).values({
         id: `ev_${randomUUID()}`,
         missionId,
@@ -543,6 +569,7 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
         actorPrincipal: entry.actorPrincipal ?? null,
         command: entry.command ?? null,
         outputDigest: sha256(JSON.stringify(details)),
+        attempt,
         status: entry.status,
         detailsJson: JSON.stringify(details),
         createdAt: now,
@@ -590,7 +617,8 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
     const workOrders = database.db.select().from(missionWorkOrders).where(eq(missionWorkOrders.missionId, mission.id)).orderBy(desc(missionWorkOrders.createdAt)).all().map(rowToWorkOrder);
     const evidence = database.db.select().from(missionEvidence).where(eq(missionEvidence.missionId, mission.id)).orderBy(desc(missionEvidence.createdAt)).all().map(rowToEvidence);
     const completionReports = database.db.select().from(missionCompletionReports).where(eq(missionCompletionReports.missionId, mission.id)).orderBy(desc(missionCompletionReports.createdAt)).all().map(rowToCompletionReport);
-    return { mission, criteria, findings, workOrders, evidence, completionReports, approval: canApprove(workSessionId, approvalContext), criterionStates: evaluateCriteria(workSessionId, approvalContext) };
+    const currentContext = normalizeCurrentApprovalContext(approvalContext ?? getCurrentApprovalContext(workSessionId));
+    return { mission, criteria, findings, workOrders, evidence, completionReports, approval: canApprove(workSessionId, currentContext), criterionStates: evaluateCriteria(workSessionId, currentContext), currentSubmissionId: currentContext.submissionId };
   }
 
   // P1 #26: Derive the current approval context from the latest pending
@@ -633,6 +661,7 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
       findings: packet.findings,
       finalVerification: mission.finalVerification,
       reviewCoverage: mission.reviewCoverage,
+      currentSubmissionId: currentContext.submissionId,
       currentReport: currentReport ? {
         status: currentReport.status,
         reviewCoverage: parseJson<string[]>(currentReport.reviewCoverageJson, []),
@@ -649,7 +678,7 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
       .orderBy(asc(missionAcceptanceCriteria.createdAt)).all().map(rowToCriterion);
     return evaluateEffectiveCriteria(
       criteria,
-      (criterion, status) => latestCurrentEvidence(mission.id, criterion.id, currentContext, status),
+      (criterion) => latestCurrentEvidence(mission.id, criterion.id, currentContext),
       currentContext,
     );
   }
@@ -786,7 +815,7 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
     return decision;
   }
 
-  function latestCurrentEvidence(missionId: string, criterionId: string, context: CurrentApprovalContext, status: "passed" | "failed" = "passed") {
+  function latestCurrentEvidence(missionId: string, criterionId: string, context: CurrentApprovalContext) {
     const snapshot = normalizeWorkspaceSnapshotIdentity(context);
     const snapshotRef = snapshot?.ref;
     const snapshotKind = snapshot?.kind;
@@ -797,14 +826,20 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
     if (!criterion) return undefined;
     const rows = database.db.select().from(missionEvidence)
       .where(and(eq(missionEvidence.missionId, missionId), eq(missionEvidence.criterionId, criterionId)))
-      .orderBy(desc(missionEvidence.createdAt))
+      .orderBy(asc(missionEvidence.attempt), asc(missionEvidence.createdAt))
       .all()
       .map(rowToEvidence);
-    return findCurrentCriterionEvidence(rows, criterion.verificationType, {
+    const effective = selectEffectiveEvidenceResult(rows, { criterionId }, {
       ...context,
       snapshotKind,
       snapshotRef,
-    }, status);
+    });
+    if (!effective) return undefined;
+    // Legacy compatibility: reject a source that cannot satisfy the criterion.
+    const details = typeof effective.details === "object" && effective.details ? effective.details as Record<string, unknown> : {};
+    return isEvidenceSourceAllowed(criterion.verificationType, details.source as import("./mission-ledger.js").MissionEvidenceSource)
+      ? effective
+      : undefined;
   }
 
   function getPacketWithoutApproval(missionId: string) {
@@ -969,6 +1004,7 @@ function rowToEvidence(row: MissionEvidenceRow) {
     actorPrincipal: row.actorPrincipal ?? undefined,
     command: row.command ?? undefined,
     outputDigest: row.outputDigest ?? undefined,
+    attempt: row.attempt ?? undefined,
     status: row.status,
     details: parseJson(row.detailsJson, {}),
     createdAt: row.createdAt,

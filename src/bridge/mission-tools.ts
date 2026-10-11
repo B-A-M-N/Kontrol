@@ -224,7 +224,13 @@ export function registerMissionTools(server: McpServer, config: BridgeConfig): v
       if (!config.missionLedger) return { content: [{ type: "text" as const, text: "Mission ledger unavailable." }], isError: true };
       let results;
       const currentSubmission = config.workSessions.get(workSessionId)?.latestSubmission;
-      try { results = await verifyMissionSubmission({ workSessionId, missionLedger: config.missionLedger, workSessions: config.workSessions, workspaces: config.workspaces, reviewCheckpoints: config.reviewCheckpoints, criterionIds, verificationScope, verificationPhase, submissionId: currentSubmission?.id, reviewEpoch: currentSubmission?.reviewEpoch }); }
+      const verificationOptions = config.serverConfig ? {
+        sandbox: config.serverConfig.verifySandbox,
+        childEnvironmentAllowlist: config.serverConfig.childEnvironmentAllowlist,
+        verifyToolchainPaths: config.serverConfig.verifyToolchainPaths,
+        sandboxExecutablePath: config.serverConfig.verifySandboxExecutable,
+      } : {};
+      try { results = await verifyMissionSubmission({ workSessionId, missionLedger: config.missionLedger, workSessions: config.workSessions, workspaces: config.workspaces, reviewCheckpoints: config.reviewCheckpoints, criterionIds, verificationScope, verificationPhase, submissionId: currentSubmission?.id, reviewEpoch: currentSubmission?.reviewEpoch, ...verificationOptions }); }
       catch (error) { return { content: [{ type: "text" as const, text: error instanceof Error ? error.message : String(error) }], isError: true }; }
       return { content: [{ type: "text" as const, text: `Recorded ${results.length} verification result(s).` }], structuredContent: { results, packet: await supervisorPacket(config, workSessionId) } };
     },
@@ -305,9 +311,15 @@ export function registerMissionTools(server: McpServer, config: BridgeConfig): v
       const resolvedFindingIds = config.missionLedger.getPacket(workSessionId).findings
         .filter((finding) => finding.status === "verified_resolved" || finding.status === "waived")
         .map((finding) => finding.id);
+      const approval = config.missionLedger.canApprove(workSessionId, {
+        submissionId: latest.id,
+        ...snapshotFields(latest),
+        reviewEpoch: latest.reviewEpoch,
+      });
       const extension = config.missionLedger.evaluateLoopExtension(workSessionId, {
         newFindingIds: createdFindings.map((f) => f.id),
         resolvedFindingIds,
+        missionApproved: approval.allowed,
       });
       if (!extension.extend) {
         // The findings are already persisted (auditable), but we refuse to

@@ -85,6 +85,9 @@ export function fingerprintMissionContract(input: MissionContractInput, criteria
     snapshotCommit: input.baselineCommit,
   });
   const normalizedCriteria = criteria.map((criterion) => ({
+    // Criterion IDs participate in identity: dependencies, evidence, work
+    // orders, and verification all address criteria by these stable IDs.
+    id: criterion.id ?? null,
     description: criterion.description,
     priority: criterion.priority ?? "required",
     verificationType: criterion.verificationType ?? (criterion.verificationCommand ? "test" : "manual_review"),
