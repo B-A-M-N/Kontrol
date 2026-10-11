@@ -26,3 +26,7 @@
 - `npm run build` — immutable candidate `53fd2d5aa891fce1` built from clean `db430e8` (gitDirty: 0), schema v64
 - `node src/beta-gate-final.test.mjs` — candidate, soak, and fresh external catalog qualification passed
 - Independent falsification matrix now covers: evidence ordering (pass→fail, fail→pass), stale finding renewal (submission A→B), sandbox parity wiring, correction escalation vs convergence, dependency expansion (`["base","dependent"]`), criterion-id fingerprint conflict, path containment (`..cache` allowed, `..` rejected), and outcome-evidence strength gate
+
+### Deployment status (October 11, 2026)
+
+Candidate `7e00b709a84108c7` (clean source `1b6fe9f`, schema v64) passed preflight, build validation, and isolated boot smoke via `restart-kontrol.sh --prepare-only`. Activation could not complete because the host root filesystem remounted read-only (ext4 `errors=remount-ro`), making `/home/bamn/.local/share/kontrol` unwritable. The safe operator action is an offline `fsck` at reboot; the two-phase restart can then be rerun and the prepared candidate activated. All source-level remediation work remains committed and the checkout is clean.
