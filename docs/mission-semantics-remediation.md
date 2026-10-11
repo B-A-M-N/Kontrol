@@ -23,5 +23,6 @@
 - `npm run test:unit` — 42 suites, zero assertion errors
 - `npm run test:integration` — 15 suites including lifecycle soak, all passed
 - `npx tsc --noEmit` — clean
-- `npm run build` — immutable candidate `c97f59b097f8821a` built, schema v64
+- `npm run build` — immutable candidate `53fd2d5aa891fce1` built from clean `db430e8` (gitDirty: 0), schema v64
 - `node src/beta-gate-final.test.mjs` — candidate, soak, and fresh external catalog qualification passed
+- Independent falsification matrix now covers: evidence ordering (pass→fail, fail→pass), stale finding renewal (submission A→B), sandbox parity wiring, correction escalation vs convergence, dependency expansion (`["base","dependent"]`), criterion-id fingerprint conflict, path containment (`..cache` allowed, `..` rejected), and outcome-evidence strength gate
