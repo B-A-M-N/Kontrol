@@ -16,6 +16,7 @@ export interface StoredMissionContract {
   maxCorrectionRounds: number;
   finalVerification: string[];
   reviewCoverage: string[];
+  outcomeEvidence?: "implementation_verified" | "integration_verified" | "outcome_verified" | "operationally_stable";
 }
 
 export interface StoredMissionCriterion {
@@ -139,6 +140,7 @@ export function fingerprintStoredMissionContract(
     maxCorrectionRounds: mission.maxCorrectionRounds,
     finalVerification: mission.finalVerification,
     reviewCoverage: mission.reviewCoverage,
+    outcomeEvidence: mission.outcomeEvidence,
   }, criteria.map((criterion) => ({
     description: criterion.description,
     priority: criterion.priority as MissionCriterionInput["priority"],

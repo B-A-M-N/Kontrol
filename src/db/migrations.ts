@@ -80,7 +80,10 @@ const migrations: Migration[] = [
 // timestamps can collide. Backfill attempts within each evidence scope from
 // chronological order; newer records then receive an explicit attempt number
 // assigned by the ledger before insertion.
+// v64: outcome evidence strength is part of the durable contract so a mission
+// cannot silently lower its required independent evidence level after creation.
 function migrateMissionEvidenceAttemptOrdering(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "mission_contracts", "outcome_evidence", "text");
   addColumnIfMissing(sqlite, "mission_evidence", "attempt", "integer");
   sqlite.exec(`
     with scoped as (

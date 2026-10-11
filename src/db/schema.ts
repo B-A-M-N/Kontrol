@@ -468,6 +468,7 @@ export const missionContracts = sqliteTable("mission_contracts", {
   maxCorrectionRounds: integer("max_correction_rounds").notNull().default(5),
   finalVerificationJson: text("final_verification_json").notNull().default("[]"),
   reviewCoverageJson: text("review_coverage_json").notNull().default("[]"),
+  outcomeEvidence: text("outcome_evidence"),
   createdAt: text("created_at").notNull(),
   updatedAt: text("updated_at").notNull(),
 }, (table) => [

@@ -110,6 +110,8 @@ export interface MissionContractInput {
   finalVerification?: string[];
   /** Review lenses that must be explicitly covered before completion. */
   reviewCoverage?: string[];
+  /** Minimum independent evidence strength required for completion. */
+  outcomeEvidence?: "implementation_verified" | "integration_verified" | "outcome_verified" | "operationally_stable";
 }
 
 export interface ApprovalPredicate {
@@ -288,6 +290,7 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
         maxCorrectionRounds: input.maxCorrectionRounds ?? 5,
         finalVerificationJson: JSON.stringify(input.finalVerification ?? []),
         reviewCoverageJson: JSON.stringify(input.reviewCoverage ?? []),
+        outcomeEvidence: input.outcomeEvidence ?? "implementation_verified",
         createdAt: now,
         updatedAt: now,
       }).run();
@@ -661,6 +664,7 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
       findings: packet.findings,
       finalVerification: mission.finalVerification,
       reviewCoverage: mission.reviewCoverage,
+      outcomeEvidence: mission.outcomeEvidence,
       currentSubmissionId: currentContext.submissionId,
       currentReport: currentReport ? {
         status: currentReport.status,
@@ -914,6 +918,7 @@ function rowToMission(row: MissionContractRow) {
     maxCorrectionRounds: row.maxCorrectionRounds ?? 5,
     finalVerification: parseJson(row.finalVerificationJson, []),
     reviewCoverage: parseJson<string[]>(row.reviewCoverageJson, []),
+    outcomeEvidence: (row.outcomeEvidence ?? "implementation_verified") as MissionContractInput["outcomeEvidence"],
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };

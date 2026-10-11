@@ -303,6 +303,29 @@ try {
   ledger.resolveFinding(f02Mission.id, "f02-finding", f02bContext);
   assert.equal(ledger.canApprove(f02Session.id, f02bContext).allowed, true, "renewed resolution evidence for submission B restores approval");
 
+  // --- F08: stronger outcome evidence requires a passing final report ------
+  const f08Session = workSessions.create({
+    workspaceSessionId: "workspace-1",
+    submittedBy: "webui",
+    title: "F08 outcome evidence",
+    completionPolicy: "webui_approval_required",
+  });
+  const f08Mission = ledger.createMission({
+    workSessionId: f08Session.id,
+    workspaceSessionId: "workspace-1",
+    objective: "Require integration-level independent evidence",
+    acceptanceCriteria: [{ id: "f08-crit", description: "works", priority: "required", verificationType: "manual_review" }],
+    outcomeEvidence: "integration_verified",
+  });
+  const f08Submission = workSessions.submitForReview({ workSessionId: f08Session.id, diff: "A", snapshotKind: "git", snapshotRef: "f08-a", snapshotCommit: "f08-a" });
+  const f08Context = { submissionId: f08Submission.id, snapshotKind: "git" as const, snapshotRef: "f08-a", snapshotCommit: "f08-a", reviewEpoch: f08Submission.reviewEpoch };
+  ledger.recordReviewerEvidence(f08Mission.id, [{ criterionId: "f08-crit", ...f08Context, status: "passed", details: { reviewerIndependentlyConfirmed: true } }]);
+  const f08Blocked = ledger.canApprove(f08Session.id, f08Context);
+  assert.equal(f08Blocked.allowed, false, "integration_verified outcome evidence requires a passing final report");
+  assert.match(f08Blocked.reasons.join("\n"), /integration_verified/);
+  ledger.recordCompletionReport(f08Mission.id, { submissionId: f08Submission.id, snapshotKind: "git", snapshotRef: "f08-a", status: "passed", results: [] });
+  assert.equal(ledger.canApprove(f08Session.id, f08Context).allowed, true, "a passing final report satisfies integration evidence");
+
   // --- Anti-runaway loop guard -------------------------------------------
   const loopSession = workSessions.create({
     workspaceSessionId: "workspace-1",

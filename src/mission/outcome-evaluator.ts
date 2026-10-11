@@ -67,17 +67,34 @@ export function evaluateEffectiveCriteria(
   return criteria.map((criterion) => states.get(criterion.id)!);
 }
 
+const OUTCOME_EVIDENCE_RANK = {
+  implementation_verified: 0,
+  integration_verified: 1,
+  outcome_verified: 2,
+  operationally_stable: 3,
+} as const;
+
+export type OutcomeEvidenceLevel = keyof typeof OUTCOME_EVIDENCE_RANK;
+
 export function evaluateMissionOutcome(input: {
   criteria: OutcomeCriterion[];
   criterionStates: EffectiveCriterionState[];
   findings: OutcomeFinding[];
   finalVerification: string[];
   reviewCoverage: string[];
+  outcomeEvidence?: OutcomeEvidenceLevel;
   currentReport?: OutcomeReport;
   currentSubmissionId?: string;
 }): { allowed: boolean; reasons: string[] } {
   const reasons: string[] = [];
   const states = new Map(input.criterionStates.map((state) => [state.criterionId, state]));
+  // Evidence-strength gate: missions demanding stronger independent evidence
+  // require a passing final integration report at the corresponding level.
+  const requiredStrength = input.outcomeEvidence ?? "implementation_verified";
+  const requiredRank = OUTCOME_EVIDENCE_RANK[requiredStrength];
+  if (requiredRank >= OUTCOME_EVIDENCE_RANK.integration_verified && input.currentReport?.status !== "passed") {
+    reasons.push(`Mission requires ${requiredStrength} evidence; a passing final integration report is mandatory for the current submission.`);
+  }
   for (const criterion of input.criteria) {
     if (criterion.priority === "required") {
       const state = states.get(criterion.id);
