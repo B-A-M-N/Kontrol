@@ -355,6 +355,32 @@ export function createReviewWorkflowService(
       );
     }
 
+    // R06: authoritative review-route enforcement. When a route governs this
+    // work session, feedback must be bound to the exact, currently-claimed
+    // handoff for the targeted submission. The MCP tool handler applies the
+    // same check, but this is the single canonical chokepoint (also reached by
+    // the ACP HTTP transport and the mission tools), so no path can bypass it.
+    // A trusted internal supervisor action (reviewerId "supervisor-runtime") is
+    // exempt; autonomous corrections are authorized under the mission/autonomy
+    // policy, not by claiming a reviewer context.
+    if (reviewRoutes && input.reviewerId !== "supervisor-runtime") {
+      const route = reviewRoutes.getRouteBySession(input.sessionId);
+      if (route?.status === "active") {
+        const submissions = workSessions.getSubmissions(input.sessionId);
+        const target = submissions.find((candidate: { id?: string }) => candidate.id === input.submissionId)
+          ?? submissions[submissions.length - 1];
+        const handoff = target?.id ? reviewRoutes.getHandoffBySubmission(input.sessionId, target.id, target.reviewEpoch) : undefined;
+        const claimedHandoff = handoff && handoff.status === "claimed";
+        if (!claimedHandoff) {
+          throw new WorkflowError(
+            "Review routing conflict: this submission has no claimed review handoff.",
+            "conflict",
+            409,
+          );
+        }
+      }
+    }
+
     // Validate submission exists and is the current pending one
     // Validate submission BEFORE mutating anything
     const submissions = workSessions.getSubmissions(input.sessionId);

@@ -213,6 +213,15 @@ export function liveConnectionIdentity(config: BridgeConfig): {
   };
 }
 
+/**
+ * The single normalization of a reviewer's durable owner-context identity.
+ * Handoff claims and feedback-gate comparisons MUST use the same value, or a
+ * claim made under one fallback can never satisfy the other's check.
+ */
+export function reviewOwnerContextId(config: BridgeConfig): string {
+  return liveOwnerContextId(config) ?? config.principalId ?? "unknown-owner";
+}
+
 export function liveOwnerContextId(config: BridgeConfig): string | undefined {
   const identity = liveConnectionIdentity(config);
   return mcpOwnerContextId(identity);

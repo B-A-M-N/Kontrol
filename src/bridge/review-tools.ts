@@ -12,7 +12,7 @@ import type { EventPredicate, EventStoreEvent } from "../event-log.js";
 import type { ReviewSubmissionDTO } from "../review-submission.js";
 import { authorizeWorkSessionAction } from "../work-session-action-guard.js";
 import { registerMutationAppTool } from "./app-tool.js";
-import { assertWorkerSessionBinding, defaultLiveWaiters, forbidden, isReviewer, isWorkerOrClient, liveOwnerContextId, parsePatchFiles, requireWorkSessionMutation, requireWorkSessionRead, workspaceAppModelAndAppMeta } from "./shared.js";
+import { assertWorkerSessionBinding, defaultLiveWaiters, forbidden, isReviewer, isWorkerOrClient, liveOwnerContextId, reviewOwnerContextId, parsePatchFiles, requireWorkSessionMutation, requireWorkSessionRead, workspaceAppModelAndAppMeta } from "./shared.js";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
 import { z } from "zod/v4";
 
@@ -398,7 +398,7 @@ export function registerReviewTools(server: McpServer, config: BridgeConfig): vo
             const submission = config.workSessions.getSubmissions(sessionId)
               .find((candidate: { id?: string }) => candidate.id === targetSubmissionId);
             const handoff = submission && config.reviewRoutes.getHandoffBySubmission(sessionId, submission.id, submission.reviewEpoch);
-            if (!handoff || handoff.status !== "claimed" || handoff.claimedByOwnerContextId !== (liveOwnerContextId(config) ?? config.principalId)) {
+            if (!handoff || handoff.status !== "claimed" || handoff.claimedByOwnerContextId !== reviewOwnerContextId(config)) {
               return {
                 content: [{ type: "text" as const, text: "Review routing conflict: this reviewer context has not claimed the current handoff." }],
                 isError: true,

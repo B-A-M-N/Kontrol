@@ -9,7 +9,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { BridgeConfig } from "./context.js";
 import { registerMutationAppTool } from "./app-tool.js";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
-import { forbidden, isReviewer, liveOwnerContextId, requireWorkSessionMutation } from "./shared.js";
+import { forbidden, isReviewer, liveOwnerContextId, reviewOwnerContextId, requireWorkSessionMutation } from "./shared.js";
 import { z } from "zod/v4";
 
 export function registerHandoffTools(server: McpServer, config: BridgeConfig): void {
@@ -50,7 +50,7 @@ export function registerHandoffTools(server: McpServer, config: BridgeConfig): v
         const route = routes.configure({
           workSessionId,
           ownerPrincipalId: config.principalId ?? `role:${config.principalRole ?? "reviewer"}`,
-          ownerContextId: liveOwnerContextId(config) ?? config.principalId ?? "unknown-owner",
+          ownerContextId: reviewOwnerContextId(config),
           enabled,
           mode,
           maxReviewRounds,
@@ -107,7 +107,7 @@ export function registerHandoffTools(server: McpServer, config: BridgeConfig): v
           handoffId,
           expectedRevision,
           principalId: config.principalId ?? `role:${config.principalRole ?? "reviewer"}`,
-          ownerContextId: liveOwnerContextId(config) ?? config.principalId ?? "unknown-owner",
+          ownerContextId: reviewOwnerContextId(config),
           destinationConversationId,
         });
         config.eventStore.appendEvent({
@@ -154,7 +154,7 @@ export function registerHandoffTools(server: McpServer, config: BridgeConfig): v
       try {
         const handoff = routes.getHandoffById(handoffId);
         if (!handoff) return { content: [{ type: "text" as const, text: `Unknown handoff: ${handoffId}` }], isError: true };
-        if (handoff.claimedByOwnerContextId !== (liveOwnerContextId(config) ?? config.principalId)) {
+        if (handoff.claimedByOwnerContextId !== reviewOwnerContextId(config)) {
           return forbidden(config.principalRole, "submit_handoff_feedback");
         }
         if (handoff.revision !== expectedRevision) {
@@ -206,7 +206,7 @@ export function registerHandoffTools(server: McpServer, config: BridgeConfig): v
     async ({ handoffId }: { handoffId: string }) => {
       const handoff = routes?.getHandoffById(handoffId);
       if (!handoff) return { content: [{ type: "text" as const, text: `Unknown handoff: ${handoffId}` }], isError: true };
-      if (handoff.claimedByOwnerContextId !== (liveOwnerContextId(config) ?? config.principalId)) {
+      if (handoff.claimedByOwnerContextId !== reviewOwnerContextId(config)) {
         return forbidden(config.principalRole, "get_review_handoff_status");
       }
       return {
@@ -233,7 +233,7 @@ export function registerHandoffTools(server: McpServer, config: BridgeConfig): v
       try {
         const handoff = routes?.getHandoffById(handoffId);
         if (!handoff) return { content: [{ type: "text" as const, text: `Unknown handoff: ${handoffId}` }], isError: true };
-        if (handoff.claimedByOwnerContextId !== (liveOwnerContextId(config) ?? config.principalId)) {
+        if (handoff.claimedByOwnerContextId !== reviewOwnerContextId(config)) {
           return forbidden(config.principalRole, "release_review_handoff");
         }
         const released = routes!.markHandoffStatus({
@@ -283,7 +283,7 @@ export function registerHandoffTools(server: McpServer, config: BridgeConfig): v
       if (!routes) return { content: [{ type: "text" as const, text: "Review routing is unavailable." }], isError: true };
       const handoff = (routes as unknown as { getHandoffById?: (id: string) => unknown }).getHandoffById?.(handoffId) as { status?: string; claimedByOwnerContextId?: string; workSessionId?: string } | undefined;
       if (!handoff) return { content: [{ type: "text" as const, text: `Unknown handoff: ${handoffId}` }], isError: true };
-      if (handoff.claimedByOwnerContextId !== (liveOwnerContextId(config) ?? config.principalId)) {
+      if (handoff.claimedByOwnerContextId !== reviewOwnerContextId(config)) {
         return forbidden(config.principalRole, "get_review_handoff");
       }
       return {

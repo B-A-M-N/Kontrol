@@ -16,6 +16,7 @@ import { registerBridgeTools, runContinuationTick, type BridgeConfig } from "./a
 import { createAcpServer } from "./acp-server.js";
 import { openDatabase, databasePath } from "./db/client.js";
 import { createReviewWorkflowService } from "./review-workflow.js";
+import { createReviewRouteStore } from "./review-handoff/route-store.js";
 import { createApprovalRequestManager } from "./approval-requests.js";
 import { createPolicyEngine } from "./policy.js";
 import { createAgentMessageManager } from "./agent-messages.js";
@@ -149,6 +150,7 @@ const reviewCheckpoints = {
   commitReviewed: async () => {},
 } as any;
 
+const reviewRoutes = createReviewRouteStore(db);
 const reviewWorkflow = createReviewWorkflowService({
   workSessions,
   eventStore,
@@ -158,6 +160,7 @@ const reviewWorkflow = createReviewWorkflowService({
   workspaces,
   reviewCheckpoints,
   dispatchOutbox,
+  reviewRoutes,
 });
 const policyEngine = createPolicyEngine({ defaultMode: "allow", toolRules: {}, pathRules: [] });
 
@@ -172,6 +175,7 @@ const config: BridgeConfig = {
   dispatchOutbox,
   agentMessages,
   reviewWorkflow,
+  reviewRoutes,
   approvalRequests,
   missionLedger,
   supervisorRuns,
@@ -1239,6 +1243,33 @@ try {
     // A BOUND worker still cannot acknowledge a cross-session reply.
     const crossAck = await callBoundA("ack_agent_reply", { sessionId: sessionB, replyId: "reply-y", replyRevision: 1, deliveryAttemptId: "attempt-1" });
     assert.ok(crossAck.isError, "worker bound to A cannot acknowledge B's reply");
+  }
+
+  // ── Scenario 12c: R06 — a governed route blocks unclaimed feedback and admits
+  //    the exact claimed handoff through the authoritative workflow ──
+  {
+    const sessionId = createSession();
+    const configured = await callReviewer("configure_review_loop", {
+      workSessionId: sessionId, enabled: true, mode: "isolated_review", maxReviewRounds: 2,
+    });
+    assert.ok(!configured.isError, "reviewer can configure an isolated review route");
+    await callWorker("submit_for_review", { sessionId });
+    const submission = workSessions.get(sessionId)!.latestSubmission!;
+    const route = reviewRoutes.getRouteBySession(sessionId)!;
+    const handoff = reviewRoutes.getHandoffBySubmission(sessionId, submission.id, submission.reviewEpoch)!;
+    assert.ok(handoff, "a governed submission creates a handoff");
+
+    // Unclaimed handoff: ordinary feedback must be rejected by the workflow.
+    const blocked = await callReviewer("provide_review_feedback", { sessionId, verdict: "approve" });
+    assert.ok(blocked.isError, "unclaimed handoff blocks ordinary review feedback: " + JSON.stringify(blocked.content));
+    assert.equal(workSessions.get(sessionId)!.status, "awaiting_review", "blocked feedback did not mutate the session");
+
+    // Claim the exact handoff, then the same feedback is admitted.
+    const claimed = await callReviewer("claim_review_handoff", { handoffId: handoff.id, expectedRevision: handoff.revision });
+    assert.ok(!claimed.isError, "reviewer claims the handoff: " + JSON.stringify(claimed.content));
+    const admitted = await callReviewer("provide_review_feedback", { sessionId, verdict: "changes_requested", comments: "Please address the reviewed issue before resubmitting." });
+    assert.ok(!admitted.isError, "claimed handoff admits review feedback: " + JSON.stringify(admitted.content));
+    void route;
   }
 
   // ── Scenario 13: defect #1 + #4 — awaiting-review worker crash stays resumable ──
