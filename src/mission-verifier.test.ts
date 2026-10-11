@@ -157,7 +157,11 @@ try {
         workOrders: [], evidence, completionReports: [], mission: { finalVerification: input.finalVerification ?? [] },
       }),
       recordVerifierEvidence: (_missionId: string, entries: Array<Record<string, unknown>>) => {
-        evidence.push(...entries.map((entry) => ({ ...entry, source: "server_test_runner" })));
+        evidence.push(...entries.map((entry) => ({
+          ...entry,
+          source: "server_test_runner",
+          details: { ...(typeof entry.details === "object" && entry.details ? entry.details : {}), source: "server_test_runner" },
+        })));
         for (const entry of entries) {
           if (entry.status === "passed") {
             const criterion = criteria.find((item) => item.id === entry.criterionId);

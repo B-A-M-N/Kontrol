@@ -226,7 +226,13 @@ export function registerMissionTools(server: McpServer, config: BridgeConfig): v
       if (!config.missionLedger) return { content: [{ type: "text" as const, text: "Mission ledger unavailable." }], isError: true };
       let results;
       const currentSubmission = config.workSessions.get(workSessionId)?.latestSubmission;
-      const verificationOptions = config.serverConfig ? missionVerificationOptionsFromConfig(config.serverConfig) : {};
+      // P1-04: For a registered reviewer verification tool, missing server
+      // configuration is a fail-closed integration error. Omitting necessary
+      // configuration must never silently enable unsandboxed execution.
+      if (!config.serverConfig) {
+        return { content: [{ type: "text" as const, text: "Server configuration is required for verification; fail closed rather than using permissive defaults." }], isError: true };
+      }
+      const verificationOptions = missionVerificationOptionsFromConfig(config.serverConfig);
       try { results = await verifyMissionSubmission({ workSessionId, missionLedger: config.missionLedger, workSessions: config.workSessions, workspaces: config.workspaces, reviewCheckpoints: config.reviewCheckpoints, criterionIds, verificationScope, verificationPhase, submissionId: currentSubmission?.id, reviewEpoch: currentSubmission?.reviewEpoch, ...verificationOptions }); }
       catch (error) { return { content: [{ type: "text" as const, text: error instanceof Error ? error.message : String(error) }], isError: true }; }
       return { content: [{ type: "text" as const, text: `Recorded ${results.length} verification result(s).` }], structuredContent: { results, packet: await supervisorPacket(config, workSessionId) } };
@@ -301,13 +307,11 @@ export function registerMissionTools(server: McpServer, config: BridgeConfig): v
           uncertainty: workOrder.uncertainty,
         });
       }
-      // Anti-runaway guard: only extend the correction loop when this round is
-      // making progress. A round that surfaced new blocking in-scope findings
-      // extends (bounded by a progress-aware ceiling); a non-converging runaway
-      // is stopped and handed back to a human rather than auto-looping forever.
-      const resolvedFindingIds = config.missionLedger.getPacket(workSessionId).findings
-        .filter((finding) => finding.status === "verified_resolved" || finding.status === "waived")
-        .map((finding) => finding.id);
+      // P1-01: Historical resolutions must not be a progress signal. The
+      // durable state transitions above already capture what changed this
+      // round; the ledger's authoritative evaluateLoopExtension consumes
+      // actual mission state, not a caller-supplied cumulative list. This
+      // removes the stale-resolved-findings false progress signal.
       const approval = config.missionLedger.canApprove(workSessionId, {
         submissionId: latest.id,
         ...snapshotFields(latest),
@@ -315,18 +319,24 @@ export function registerMissionTools(server: McpServer, config: BridgeConfig): v
       });
       const extension = config.missionLedger.evaluateLoopExtension(workSessionId, {
         newFindingIds: createdFindings.map((f) => f.id),
-        resolvedFindingIds,
         missionApproved: approval.allowed,
       });
       if (!extension.extend) {
-        // The findings are already persisted (auditable), but we refuse to
-        // auto-dispatch another correction turn. A human decides whether the
-        // current work is approvable or whether to create a separately
-        // justified continuation.
+        // Three distinct non-extension terminal states:
+        //   converged — the approval predicate actually allows completion.
+        //   awaiting_human — bounded ceiling reached or stagnation requires
+        //     an explicit human decision.
+        //   continuation_authorized — reviewer explicitly requests another
+        //     bounded round; routed through the existing review workflow.
+        const status = approval.allowed
+          ? "converged"
+          : extension.ceilingHit
+            ? "awaiting_human"
+            : "continuation_authorized";
         return {
           content: [{ type: "text" as const, text: `Correction loop stopped: ${extension.reason}` }],
           structuredContent: {
-            status: extension.ceilingHit ? "awaiting_human" : "converged",
+            status,
             extension,
             packet: await supervisorPacket(config, workSessionId),
           },

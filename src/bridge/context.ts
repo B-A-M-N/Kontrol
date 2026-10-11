@@ -144,6 +144,17 @@ export const supervisedMissionOptionsSchema = z.object({
   outcomeEvidence: z.enum(["implementation_verified", "integration_verified", "outcome_verified", "operationally_stable"]).optional().describe("Minimum independent evidence strength required for mission completion. Defaults to implementation_verified for lightweight missions; outcome_verified requires an explicit outcome oracle beyond internal checks."),
   autonomyMode: z.enum(["manual", "verify_only", "correction_auto", "full"]).optional(),
   approvalMode: z.enum(["human_required", "policy_auto", "fully_automatic"]).optional(),
+}).superRefine((data, ctx) => {
+  // P1-02: A mission that requires integration evidence but declares no final
+  // verification command cannot reach its own success predicate. Reject this
+  // impossible contract at the tool boundary with actionable feedback.
+  if (data.outcomeEvidence === "integration_verified" && (!data.finalVerification || data.finalVerification.length === 0)) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["finalVerification"],
+      message: "outcomeEvidence integration_verified requires at least one finalVerification command.",
+    });
+  }
 });
 export const findingSchema = z.object({
   id: z.string().optional(),

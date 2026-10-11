@@ -179,6 +179,12 @@ const config: BridgeConfig = {
   resumeAgent: async () => {
     resumeCalls++;
   },
+  serverConfig: {
+    verifySandbox: false,
+    childEnvironmentAllowlist: [],
+    verifyToolchainPaths: [],
+    verifyMaxInflight: 1,
+  } as any,
 };
 
 function createSession(): string {
@@ -1365,11 +1371,32 @@ try {
     assert.equal(r2.structuredContent?.status, "awaiting_human", "non-converging runaway stops automatic dispatch at the ceiling");
     assert.equal(r2.structuredContent?.extension?.ceilingHit, true);
 
+    // Resolve the two blocking findings from rounds 1 and 2 so the authority
+    // predicate can actually converge; otherwise no-progress is correct.
+    const convMission = missionLedger.getMissionByWorkSession(sessionId)!;
+    const convPacket = missionLedger.getPacket(sessionId);
+    for (const finding of convPacket.findings.filter((f) => f.disposition === "blocking" && f.status !== "waived")) {
+      missionLedger.updateFindingStatus(convMission.id, [{ id: finding.id, status: "waived", waiverReason: "test-converged" }]);
+    }
+    const convLatest = workSessions.get(sessionId)?.latestSubmission;
+    const savedSnapshot = currentSnapshot;
+    if (convLatest?.id && convMission) {
+      missionLedger.recordVerifierEvidence(convMission.id, [{
+        criterionId: "y-crit",
+        submissionId: convLatest.id,
+        reviewEpoch: convLatest.reviewEpoch,
+        snapshotKind: "git" as const,
+        snapshotRef: convLatest.snapshotCommit ?? convLatest.snapshotRef,
+        status: "passed" as const,
+      }]);
+    }
+    currentSnapshot = convLatest?.snapshotCommit ?? savedSnapshot;
     const converged = await callReviewer("continue_supervised_work", {
       workSessionId: sessionId,
       comments: "Review the current result without adding another blocking issue.",
       workOrder: wo,
     });
+    currentSnapshot = savedSnapshot;
     assert.equal(converged.structuredContent?.status, "converged", "a converged loop cannot dispatch another correction round");
 
     // An out-of-scope finding must NOT gate approval on its own.

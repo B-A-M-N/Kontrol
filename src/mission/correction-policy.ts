@@ -19,12 +19,18 @@ export function evaluateCorrectionPolicy(input: {
   maxCorrectionRounds: number;
   newBlockingCount: number;
   round: CorrectionRoundInput;
+  /** The ledger's authoritative approval verdict for the current submission. */
+  currentApproval?: boolean;
 }): LoopExtensionDecision {
   // No new blocking findings can mean convergence, productive continuation, or
   // stagnation. A round that demonstrably progressed on unresolved actionable
   // work remains eligible for bounded continuation; only an approval-satisfied
   // mission converges, and only a non-progressing round escalates immediately.
-  if (input.newBlockingCount === 0 && input.round.missionApproved !== true) {
+  // Convergence requires the authoritative approval predicate, not merely the
+  // absence of new blocking findings. round.missionApproved is a hint; the
+  // ledger's canApprove is authoritative.
+  const converged = input.currentApproval === true || input.round.missionApproved === true;
+  if (input.newBlockingCount === 0 && !converged) {
     const resolvedCount = input.round.resolvedFindingIds?.length ?? 0;
     const madeProgress = input.round.progress?.madeProgress ?? resolvedCount > 0;
     if (madeProgress) {
@@ -55,12 +61,12 @@ export function evaluateCorrectionPolicy(input: {
       ceilingHit: false,
     };
   }
-  if (input.newBlockingCount === 0) {
+  if (input.newBlockingCount === 0 && converged) {
     return {
       extend: false,
       round: input.currentRound,
       maxRounds: input.maxCorrectionRounds,
-      reason: "Round surfaced no new blocking in-scope findings; loop has converged.",
+      reason: "Round surfaced no new blocking in-scope findings and the authoritative approval predicate allows completion; loop has converged.",
       ceilingHit: false,
     };
   }

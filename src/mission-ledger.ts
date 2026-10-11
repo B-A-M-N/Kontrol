@@ -17,7 +17,7 @@ import {
   type MissionCompletionReportRow,
 } from "./db/schema.js";
 import { normalizeWorkspaceSnapshotIdentity, type WorkspaceSnapshotKind } from "./review-checkpoints.js";
-import { fingerprintMissionContract, fingerprintStoredMissionContract, validateMissionCriterionContract } from "./mission/contract-authority.js";
+import { fingerprintMissionContract, fingerprintMissionContractV1, fingerprintStoredMissionContract, validateMissionCriterionContract } from "./mission/contract-authority.js";
 import { evaluateEffectiveFindingResolution, evaluateFindingResolutionEvidence, isEvidenceSourceAllowed, selectEffectiveEvidenceResult } from "./mission/evidence-authority.js";
 import { assertFindingStatusTransition, fingerprintFinding, mergeFindingEvidence } from "./mission/finding-authority.js";
 import { evaluateCorrectionPolicy } from "./mission/correction-policy.js";
@@ -263,13 +263,34 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
     if (input.outcomeEvidence === "outcome_verified" || input.outcomeEvidence === "operationally_stable") {
       throw new Error(`outcomeEvidence ${input.outcomeEvidence} is not yet supported; independent outcome oracle qualification is required before missions can demand it.`);
     }
+    // P1-02: A mission that requires integration evidence must declare at
+    // least one supported final-verification command, or its own verifier
+    // cannot produce the required passing report. This is the authoritative
+    // ledger invariant; the schema-level check above provides faster user
+    // feedback at the tool boundary.
+    if (input.outcomeEvidence === "integration_verified" && !(input.finalVerification ?? []).length) {
+      throw new Error("outcomeEvidence integration_verified requires at least one finalVerification command.");
+    }
     const contractFingerprint = fingerprintMissionContract(normalizedInput, criteria);
     const existingRow = database.db.select().from(missionContracts).where(eq(missionContracts.workSessionId, input.workSessionId)).get();
     if (existingRow) {
       const existing = rowToMission(existingRow);
-      const existingFingerprint = existingRow.contractFingerprint ?? fingerprintStoredMissionContract(existing, database.db.select().from(missionAcceptanceCriteria).where(eq(missionAcceptanceCriteria.missionId, existing.id)).orderBy(asc(missionAcceptanceCriteria.createdAt)).all().map(rowToCriterion));
+      const storedCriteria = database.db.select().from(missionAcceptanceCriteria).where(eq(missionAcceptanceCriteria.missionId, existing.id)).orderBy(asc(missionAcceptanceCriteria.createdAt)).all().map(rowToCriterion);
+      const storedFingerprint = existingRow.contractFingerprint;
+      const existingFingerprint = storedFingerprint ?? fingerprintStoredMissionContract(existing, storedCriteria);
       if (existingFingerprint !== contractFingerprint) {
-        throw new Error(`Mission contract conflict for work session ${input.workSessionId}; create a new work session or use an explicit mission revision.`);
+        // P1-05: A stored fingerprint from before fingerprint versioning is a
+        // v1 hash that omitted outcomeEvidence and the version wrapper. Retry
+        // against the v1 payload; if the intent matches, migrate the stored
+        // fingerprint to the current version so subsequent retries compare
+        // like-for-like. Changed criterion IDs or other real intent changes
+        // still conflict.
+        const legacyFingerprint = fingerprintMissionContractV1(normalizedInput, criteria);
+        if (storedFingerprint && storedFingerprint === legacyFingerprint) {
+          database.db.update(missionContracts).set({ contractFingerprint: contractFingerprint, updatedAt: now }).where(eq(missionContracts.id, existing.id)).run();
+        } else {
+          throw new Error(`Mission contract conflict for work session ${input.workSessionId}; create a new work session or use an explicit mission revision.`);
+        }
       }
       if (!existingRow.contractFingerprint) {
         database.db.update(missionContracts).set({ contractFingerprint, updatedAt: now }).where(eq(missionContracts.id, existing.id)).run();
@@ -480,7 +501,10 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
     if (!resolution.resolved) {
       throw new Error(`Finding ${findingId} is not effectively resolved: ${resolution.reasons.join("; ")}`);
     }
-    const evidenceIds = [...new Set(evidence.filter((entry) => entry.findingId === findingId && entry.status === "passed").map((entry) => entry.id))];
+    // Only the exact evidence selected by the effective-resolution authority
+    // is retained as resolution proof; historical superseded passes remain in
+    // the append-only history but cannot appear in the current receipt.
+    const evidenceIds = [...new Set(resolution.qualifyingEvidenceIds)];
     database.db.update(missionReviewFindings).set({
       status: "verified_resolved",
       resolutionSubmissionId: context.submissionId,
@@ -534,7 +558,11 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
     source: MissionEvidenceSource,
   ): void {
     const now = new Date().toISOString();
-    for (const entry of entries) {
+    // Batch atomicity: either every entry in the evidence batch persists or
+    // none do. A later invalid entry must not leave an accidentally partial
+    // verification batch behind.
+    const writeBatch = database.sqlite.transaction(() => {
+      for (const entry of entries) {
       let criterionType: string | undefined;
       const snapshot = normalizeWorkspaceSnapshotIdentity(entry);
       const snapshotRef = snapshot?.ref;
@@ -560,15 +588,13 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
         }
       }
       const details = { ...(typeof entry.details === "object" && entry.details ? entry.details as Record<string, unknown> : { value: entry.details }), source };
-      const scopeId = entry.criterionId ?? entry.findingId;
-      const attempt = scopeId
-        ? ((database.sqlite.prepare(`
-            select coalesce(max(attempt), 0) as next
-            from mission_evidence
-            where mission_id = ?
-              and (criterion_id = ? or finding_id = ?)
-          `).get(missionId, scopeId, scopeId) as { next?: number }).next ?? 0) + 1
-        : null;
+      // P0-02: Use one mission-wide monotonic counter so dual-associated
+      // evidence cannot outrank later observations allocated through a
+      // different scope key. The unique index independently detects duplicate
+      // attempt assignment; the transactional writer serializes allocation.
+      const attempt = ((database.sqlite.prepare(
+        "select coalesce(max(attempt), 0) as next from mission_evidence where mission_id = ?"
+      ).get(missionId) as { next?: number }).next ?? 0) + 1;
       database.db.insert(missionEvidence).values({
         id: `ev_${randomUUID()}`,
         missionId,
@@ -599,8 +625,10 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
           .where(and(eq(missionAcceptanceCriteria.id, entry.criterionId), eq(missionAcceptanceCriteria.missionId, missionId)))
           .run();
       }
-    }
-    touchMission(missionId);
+      }
+      touchMission(missionId);
+    });
+    writeBatch();
   }
 
   function recordEvidence(missionId: string, entries: MissionEvidenceInput[]): void {
@@ -670,9 +698,22 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
         )).orderBy(desc(missionCompletionReports.createdAt)).get()
       : undefined;
     const effectiveFindingResolutions: Record<string, { resolved: boolean; reasons: string[] }> = {};
+    const hasCompleteSubmissionContext = Boolean(
+      currentContext.submissionId
+      && currentSnapshot?.kind
+      && currentSnapshot.ref
+      && currentContext.reviewEpoch !== undefined,
+    );
     for (const finding of packet.findings) {
       if (finding.scope === "out_of_scope" || finding.disposition !== "blocking") continue;
       if (!["verified_resolved", "claimed_resolved"].includes(finding.status)) continue;
+      if (!hasCompleteSubmissionContext) {
+        effectiveFindingResolutions[finding.id] = {
+          resolved: false,
+          reasons: [`Finding ${finding.id} requires a complete current submission, snapshot, and review epoch; none exists yet, so resolution remains unproven.`],
+        };
+        continue;
+      }
       effectiveFindingResolutions[finding.id] = evaluateEffectiveFindingResolution(
         packet.evidence,
         finding.requiredVerification,
@@ -847,6 +888,8 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
       currentRound: mission.correctionRounds,
       maxCorrectionRounds: mission.maxCorrectionRounds,
       newBlockingCount: newBlocking.length,
+      // authoritativeRound stamps missionApproved from the ledger's own
+      // approval predicate, so a caller cannot false-claim convergence.
       round: authoritativeRound,
     });
     if (decision.extend) {

@@ -74,6 +74,7 @@ const migrations: Migration[] = [
   { version: 62, name: "mission-outcome-authority", up: migrateMissionOutcomeAuthority },
   { version: 63, name: "canonical-snapshot-report-identity", up: migrateCanonicalSnapshotReportIdentity },
   { version: 64, name: "mission-evidence-attempt-ordering", up: migrateMissionEvidenceAttemptOrdering },
+  { version: 65, name: "mission-evidence-mission-wide-attempt-ordering", up: migrateMissionEvidenceMissionWideAttemptOrdering },
 ];
 
 // v64: verification attempts need durable monotonic ordering because ISO
@@ -99,6 +100,30 @@ function migrateMissionEvidenceAttemptOrdering(sqlite: Database.Database): void 
      where attempt is null;
   `);
   sqlite.exec("create index if not exists mission_evidence_attempt_idx on mission_evidence(mission_id, criterion_id, finding_id, attempt)");
+}
+
+// v65: replace per-criterion/finding attempt scopes with one mission-wide
+// monotonic sequence. Dual-associated evidence allocated through a different
+// scope key must not outrank a later observation. Backfill uses durable
+// insertion order (rowid), then enforces uniqueness for non-null attempts.
+function migrateMissionEvidenceMissionWideAttemptOrdering(sqlite: Database.Database): void {
+  // Re-backfill every mission from rowid order because the v64 scoped
+  // backfill may have already assigned per-scope attempts that are not
+  // globally unique, and "attempt is null" filtering would skip them.
+  sqlite.exec(`
+    with mission_wide as (
+      select rowid, row_number() over (
+        partition by mission_id
+        order by created_at, rowid
+      ) as attempt
+      from mission_evidence
+    )
+    update mission_evidence
+       set attempt = (select attempt from mission_wide where mission_wide.rowid = mission_evidence.rowid);
+  `);
+  // A unique index independently detects duplicate attempt assignment even
+  // if a nontransactional writer races the select-then-insert sequence.
+  sqlite.exec("create unique index if not exists mission_evidence_attempt_unique_idx on mission_evidence(mission_id, attempt) where attempt is not null");
 }
 
 function migrateCanonicalSnapshotReportIdentity(sqlite: Database.Database): void {

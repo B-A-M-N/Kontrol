@@ -187,4 +187,100 @@ console.log("migration-fixtures: dirty WAL recovery passed");
 }
 console.log("migration-fixtures: corrupt database fail-closed passed");
 
+// ── Fixture: legacy v1 mission contract fingerprint survives migration ──────
+{
+  const sqlite = newSqlite();
+  try {
+    // Produce a "previous release" schema with no fingerprint-versioning
+    // column; v63 was the last pre-fingerprinting state.
+    migrateUpTo(sqlite, 63);
+    // Seed a legacy mission exactly as the pre-versioning ledger would have.
+    sqlite.pragma("foreign_keys = OFF");
+    sqlite.prepare(`
+      insert into mission_contracts
+        (id, work_session_id, workspace_session_id, revision, objective, desired_outcome,
+         constraints_json, non_goals_json, user_locked_fields_json, correction_rounds,
+         max_correction_rounds, final_verification_json, review_coverage_json, created_at, updated_at)
+      values ('legacy-mission', 'legacy-session', 'legacy-ws', 1, 'legacy objective', 'legacy objective',
+              '[]', '[]', '[]', 0, 5, '[]', '[]', '2020-01-01T00:00:00.000Z', '2020-01-01T00:00:00.000Z')
+    `).run();
+    sqlite.prepare(`
+      insert into mission_acceptance_criteria
+        (id, mission_id, description, priority, verification_type, verification_command,
+         affected_areas_json, depends_on_json, status, created_at, updated_at)
+      values ('legacy-crit', 'legacy-mission', 'works', 'required', 'test', 'npm --version',
+              '[]', '[]', 'unverified', '2020-01-01T00:00:00.000Z', '2020-01-01T00:00:00.000Z')
+    `).run();
+    sqlite.pragma("foreign_keys = ON");
+    // Simulate a v1 fingerprint stored by the pre-versioning ledger.
+    const { createHash } = await import("node:crypto");
+    const canonicalPayload = JSON.stringify({
+      workSessionId: "legacy-session",
+      workspaceSessionId: "legacy-ws",
+      objective: "legacy objective",
+      desiredOutcome: "legacy objective",
+      constraints: [],
+      nonGoals: [],
+      userLockedFields: ["objective", "desiredOutcome", "constraints", "nonGoals"],
+      supervisorInstructions: null,
+      baselineKind: null,
+      baselineRef: null,
+      maxCorrectionRounds: 5,
+      finalVerification: [],
+      reviewCoverage: [],
+      acceptanceCriteria: [{
+        id: "legacy-crit",
+        description: "works",
+        priority: "required",
+        verificationType: "test",
+        verificationCommand: "npm --version",
+        runtimeProbe: null,
+        affectedAreas: [],
+        dependsOnCriterionIds: [],
+        verificationGroup: null,
+        verificationScope: "full",
+        finalOnly: false,
+        mutatesWorkspace: false,
+        commandVersion: null,
+      }],
+    });
+    // canonicalize() sorts keys and drops undefined. We replicate that exactly:
+    const canonicalize = (value: unknown): unknown => {
+      if (Array.isArray(value)) return value.map(canonicalize);
+      if (value && typeof value === "object") {
+        return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+          .filter(([, child]) => child !== undefined)
+          .sort(([left], [right]) => left.localeCompare(right))
+          .map(([key, child]) => [key, canonicalize(child)]));
+      }
+      return value;
+    };
+    const v1Fingerprint = createHash("sha256").update(JSON.stringify(canonicalize(JSON.parse(canonicalPayload)))).digest("hex");
+    sqlite.prepare("update mission_contracts set contract_fingerprint = ? where id = ?").run(v1Fingerprint, "legacy-mission");
+    // Complete the full migration chain.
+    migrateDatabase(sqlite);
+    const stored = sqlite.prepare("select contract_fingerprint from mission_contracts where id = ?").get("legacy-mission") as { contract_fingerprint: string | null };
+    assert.ok(stored.contract_fingerprint, "legacy mission has a stored fingerprint after migration");
+    // Import the authority helper and confirm the v1 fingerprint still matches.
+    const { fingerprintMissionContractV1, fingerprintMissionContract } = await import("../mission/contract-authority.js");
+    const reconstructed = fingerprintMissionContractV1({
+      workSessionId: "legacy-session",
+      workspaceSessionId: "legacy-ws",
+      objective: "legacy objective",
+    }, [{ id: "legacy-crit", description: "works", verificationType: "test", verificationCommand: "npm --version" } as any]);
+    assert.equal(reconstructed, v1Fingerprint, "v1 fingerprint reconstruction matches the stored legacy hash");
+    // The v2 fingerprint differs (adds version wrapper + outcomeEvidence), so
+    // without the compatibility check the ledger would throw on retry.
+    const v2Fingerprint = fingerprintMissionContract({
+      workSessionId: "legacy-session",
+      workspaceSessionId: "legacy-ws",
+      objective: "legacy objective",
+    }, [{ id: "legacy-crit", description: "works", verificationType: "test", verificationCommand: "npm --version" } as any]);
+    assert.notEqual(v2Fingerprint, v1Fingerprint, "v2 fingerprint is distinct from v1");
+  } finally {
+    sqlite.close();
+  }
+}
+console.log("migration-fixtures: legacy mission fingerprint survives migration passed");
+
 console.log("migration-fixtures.test.ts: all assertions passed");

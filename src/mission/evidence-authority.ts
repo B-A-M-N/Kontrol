@@ -107,8 +107,9 @@ export function evaluateEffectiveFindingResolution(
   requiredCommands: string[],
   findingId: string,
   context: Required<Pick<CurrentApprovalContext, "submissionId" | "snapshotKind" | "snapshotRef" | "reviewEpoch">>,
-): { resolved: boolean; reasons: string[] } {
+): { resolved: boolean; reasons: string[]; qualifyingEvidenceIds: string[] } {
   const reasons: string[] = [];
+  const qualifyingEvidenceIds: string[] = [];
   const scopeContext: EvidenceScopeContext = { ...context };
   const commands = requiredCommands.length ? requiredCommands : [];
   if (!commands.length) {
@@ -126,8 +127,10 @@ export function evaluateEffectiveFindingResolution(
     const effective = selectEffectiveEvidenceResult(qualifying, { findingId }, scopeContext);
     if (!effective || effective.status !== "passed") {
       reasons.push(`Finding ${findingId} has no current passing independent evidence.`);
+    } else {
+      qualifyingEvidenceIds.push(effective.id);
     }
-    return { resolved: reasons.length === 0, reasons };
+    return { resolved: reasons.length === 0, reasons, qualifyingEvidenceIds };
   }
   for (const command of commands) {
     const commandEvidence = evidence.filter((entry) => {
@@ -146,9 +149,11 @@ export function evaluateEffectiveFindingResolution(
       reasons.push(`Finding ${findingId} is missing current verification for required command ${command}.`);
     } else if (effective.status !== "passed") {
       reasons.push(`Finding ${findingId}'s latest verification for ${command} is ${effective.status}; a passing result is required.`);
+    } else {
+      qualifyingEvidenceIds.push(effective.id);
     }
   }
-  return { resolved: reasons.length === 0, reasons };
+  return { resolved: reasons.length === 0, reasons, qualifyingEvidenceIds };
 }
 
 export function evaluateFindingResolutionEvidence(

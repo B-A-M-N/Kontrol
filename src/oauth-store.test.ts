@@ -105,6 +105,7 @@ async function testDatabaseConfiguration(stateDir: string): Promise<void> {
       { version: 62, name: "mission-outcome-authority" },
       { version: 63, name: "canonical-snapshot-report-identity" },
       { version: 64, name: "mission-evidence-attempt-ordering" },
+      { version: 65, name: "mission-evidence-mission-wide-attempt-ordering" },
     ]);
   } finally {
     database.close();

@@ -125,6 +125,8 @@ try {
     ],
   }), /Mission contract conflict/, "changing a criterion id changes the contract identity");
 
+  // P1-02: integration_verified without finalVerification is now a contract
+  // impossibility rejected before durable side effects.
   assert.throws(() => ledger.createMission({
     workSessionId: session.id,
     workspaceSessionId: "workspace-1",
@@ -134,6 +136,19 @@ try {
       { id: "crit-docs", description: "Docs are coherent", priority: "preferred", verificationType: "manual_review" },
     ],
     outcomeEvidence: "integration_verified",
+  }), /integration_verified requires at least one finalVerification/, "integration_verified without finalVerification is rejected");
+
+  // changing outcomeEvidence with valid finalVerification changes the contract identity
+  assert.throws(() => ledger.createMission({
+    workSessionId: session.id,
+    workspaceSessionId: "workspace-1",
+    objective: "Fix the bridge",
+    acceptanceCriteria: [
+      { id: "crit-tests", description: "Regression tests pass", priority: "required", verificationType: "test", verificationCommand: "npm test" },
+      { id: "crit-docs", description: "Docs are coherent", priority: "preferred", verificationType: "manual_review" },
+    ],
+    outcomeEvidence: "integration_verified",
+    finalVerification: ["npm run test:integration"],
   }), /Mission contract conflict/, "changing outcomeEvidence changes the contract identity");
 
   // Fingerprint definition version participates in identity: all fingerprints
@@ -343,6 +358,7 @@ try {
     objective: "Require integration-level independent evidence",
     acceptanceCriteria: [{ id: "f08-crit", description: "works", priority: "required", verificationType: "manual_review" }],
     outcomeEvidence: "integration_verified",
+    finalVerification: ["echo integration-check"],
   });
   const f08Submission = workSessions.submitForReview({ workSessionId: f08Session.id, diff: "A", snapshotKind: "git", snapshotRef: "f08-a", snapshotCommit: "f08-a" });
   const f08Context = { submissionId: f08Submission.id, snapshotKind: "git" as const, snapshotRef: "f08-a", snapshotCommit: "f08-a", reviewEpoch: f08Submission.reviewEpoch };
@@ -727,6 +743,87 @@ try {
   assert.equal(restartLedger.canApprove(restartSession.id, correctedContext).allowed, true,
     "fresh server evidence on the exact resubmission closes the durable mission after restart");
   restartDb.close();
+
+  // P0-02: mixed criterion/finding evidence must use mission-wide ordering.
+  {
+    const mixedSession = workSessions.create({
+      workspaceSessionId: "workspace-1", submittedBy: "webui", title: "P0-02 mixed ordering",
+      completionPolicy: "webui_approval_required",
+    });
+    const mixedMission = ledger.createMission({
+      workSessionId: mixedSession.id, workspaceSessionId: "workspace-1", objective: "Mixed evidence ordering",
+      acceptanceCriteria: [{ id: "mc-crit", description: "works", priority: "required", verificationType: "manual_review" }],
+    });
+    const mixedSubmission = workSessions.submitForReview({ workSessionId: mixedSession.id, diff: "A", snapshotKind: "git", snapshotRef: "mixed-a", snapshotCommit: "mixed-a" });
+    const mixedContext = { submissionId: mixedSubmission.id, snapshotKind: "git" as const, snapshotRef: "mixed-a", snapshotCommit: "mixed-a", reviewEpoch: mixedSubmission.reviewEpoch };
+    // Add a blocking finding that must be resolved.
+    const mixedFindings = ledger.addFindings(mixedMission.id, [
+      { description: "mixed ordering finding", requiredAction: "fix", severity: "blocker", scope: "in_scope", requiredVerification: ["check-finding"] },
+    ]);
+    const findingId = mixedFindings[0]!.id;
+    ledger.updateFindingStatus(mixedMission.id, [{ id: findingId, status: "claimed_resolved" }]);
+    // 1) Insert finding-only evidence at attempt 1 (passes).
+    ledger.recordVerifierEvidence(mixedMission.id, [{ findingId, command: "check-finding", ...mixedContext, status: "passed" as const, details: {} }]);
+    // 2) Insert a second finding-only passing evidence (attempt 2).
+    ledger.recordVerifierEvidence(mixedMission.id, [{ findingId, command: "check-finding", ...mixedContext, status: "passed" as const, details: {} }]);
+    // 3) Insert a dual-associated (criterion + finding) evidence that also passes.
+    //    Under P0-02 this must receive attempt=3 (not attempt=1) because the
+    //    mission-wide counter is authoritative, so the later observation wins.
+    //    The criterion is manual_review, so the criterion side needs a reviewer
+    //    attestation; the finding side carries the verifier evidence.
+    ledger.recordReviewerEvidence(mixedMission.id, [{ criterionId: "mc-crit", ...mixedContext, status: "passed" as const, details: {} }]);
+    ledger.recordVerifierEvidence(mixedMission.id, [{ findingId, command: "check-finding", ...mixedContext, status: "passed" as const, details: {} }]);
+    const resolution = ledger.resolveFinding(mixedMission.id, findingId, mixedContext);
+    assert.ok(resolution.evidenceIds.length >= 1, "dual-associated evidence resolves");
+    // The resolution receipt must contain only current, qualifying evidence IDs.
+    const packet = ledger.getPacket(mixedSession.id, mixedContext);
+    const finding = packet.findings.find((f) => f.id === findingId)!;
+    const allResolutionIds = finding.resolutionEvidenceIds ?? [];
+    for (const evidenceId of allResolutionIds) {
+      const record = packet.evidence.find((entry) => entry.id === evidenceId);
+      assert.ok(record, "resolution evidence ID exists");
+      assert.equal(record.submissionId, mixedSubmission.id, "resolution evidence is bound to the current submission");
+    }
+  }
+
+  // P0-02: evidence batch atomicity.
+  {
+    const atomicSession = workSessions.create({
+      workspaceSessionId: "workspace-1", submittedBy: "webui", title: "Evidence batch atomicity",
+      completionPolicy: "webui_approval_required",
+    });
+    const atomicMission = ledger.createMission({
+      workSessionId: atomicSession.id, workspaceSessionId: "workspace-1", objective: "Atomic evidence batch",
+      acceptanceCriteria: [{ id: "atom-crit", description: "works", priority: "required", verificationType: "test", verificationCommand: "npm test" }],
+    });
+    const atomicSubmission = workSessions.submitForReview({ workSessionId: atomicSession.id, diff: "A", snapshotKind: "git", snapshotRef: "atomic-a", snapshotCommit: "atomic-a" });
+    const atomicContext = { submissionId: atomicSubmission.id, snapshotKind: "git" as const, snapshotRef: "atomic-a", snapshotCommit: "atomic-a", reviewEpoch: atomicSubmission.reviewEpoch };
+    const beforeCount = ledger.getPacket(atomicSession.id, atomicContext).evidence.length;
+    // The second entry has an invalid criterion ID; the entire batch must reject.
+    assert.throws(() => ledger.recordVerifierEvidence(atomicMission.id, [
+      { criterionId: "atom-crit", ...atomicContext, status: "passed" as const },
+      { criterionId: "atom-invalid", ...atomicContext, status: "passed" as const },
+    ]), /does not belong to mission/);
+    const afterCount = ledger.getPacket(atomicSession.id, atomicContext).evidence.length;
+    assert.equal(afterCount, beforeCount, "invalid later entry leaves no partial evidence batch");
+  }
+
+  // P0-03: canApprove without submission returns a valid denial, not a crash.
+  {
+    const noSubmitSession = workSessions.create({
+      workspaceSessionId: "workspace-1", submittedBy: "webui", title: "Approval without submission",
+      completionPolicy: "webui_approval_required",
+    });
+    ledger.createMission({
+      workSessionId: noSubmitSession.id, workspaceSessionId: "workspace-1", objective: "No submission approval",
+      acceptanceCriteria: [{ id: "ns-crit", description: "works", priority: "required", verificationType: "manual_review" }],
+    });
+    assert.doesNotThrow(() => ledger.canApprove(noSubmitSession.id), "canApprove without submission does not throw");
+    assert.doesNotThrow(() => ledger.getPacket(noSubmitSession.id), "getPacket without submission does not throw");
+    const approvalResult = ledger.canApprove(noSubmitSession.id);
+    assert.equal(approvalResult.allowed, false, "canApprove without submission is denied");
+    assert.ok(approvalResult.reasons.length > 0, "denial has a reason");
+  }
 
   workSessions.close();
   ledger.close();

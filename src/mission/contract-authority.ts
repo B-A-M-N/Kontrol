@@ -168,6 +168,54 @@ export function fingerprintStoredMissionContract(
   })));
 }
 
+/**
+ * Reconstruct a v1 fingerprint (pre-versioning). It omits both the
+ * fingerprintVersion wrapper and the outcomeEvidence field, and stores an
+ * unversioned SHA-256 of the canonical payload. This is only used to check
+ * whether a stored legacy fingerprint matches the same intent under v1 rules;
+ * it is never used for new missions.
+ */
+export function fingerprintMissionContractV1(input: MissionContractInput, criteria: MissionCriterionInput[]): string {
+  const baselineIdentity = normalizeWorkspaceSnapshotIdentity({
+    snapshotKind: input.baselineKind,
+    snapshotRef: input.baselineRef,
+    snapshotCommit: input.baselineCommit,
+  });
+  const normalizedCriteria = criteria.map((criterion) => ({
+    id: criterion.id ?? null,
+    description: criterion.description,
+    priority: criterion.priority ?? "required",
+    verificationType: criterion.verificationType ?? (criterion.verificationCommand ? "test" : "manual_review"),
+    verificationCommand: criterion.verificationCommand ?? null,
+    runtimeProbe: criterion.runtimeProbe ?? null,
+    affectedAreas: criterion.affectedAreas ?? [],
+    dependsOnCriterionIds: criterion.dependsOnCriterionIds ?? [],
+    verificationGroup: criterion.verificationGroup ?? null,
+    verificationScope: criterion.verificationScope ?? "full",
+    finalOnly: criterion.finalOnly ?? false,
+    mutatesWorkspace: criterion.mutatesWorkspace ?? false,
+    commandVersion: criterion.commandVersion ?? null,
+  }));
+  const payload = {
+    workSessionId: input.workSessionId,
+    workspaceSessionId: input.workspaceSessionId,
+    objective: input.objective,
+    desiredOutcome: input.desiredOutcome ?? input.objective,
+    constraints: input.constraints ?? [],
+    nonGoals: input.nonGoals ?? [],
+    userLockedFields: input.userLockedFields ?? ["objective", "desiredOutcome", "constraints", "nonGoals"],
+    supervisorInstructions: input.supervisorInstructions ?? null,
+    baselineKind: baselineIdentity?.kind ?? null,
+    baselineRef: baselineIdentity?.ref ?? null,
+    maxCorrectionRounds: input.maxCorrectionRounds ?? 5,
+    finalVerification: input.finalVerification ?? [],
+    reviewCoverage: input.reviewCoverage ?? [],
+    acceptanceCriteria: normalizedCriteria.sort((left, right) =>
+      JSON.stringify(canonicalize(left)).localeCompare(JSON.stringify(canonicalize(right)))),
+  };
+  return hash(JSON.stringify(canonicalize(payload)));
+}
+
 function canonicalize(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonicalize);
   if (value && typeof value === "object") {

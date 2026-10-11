@@ -10,6 +10,7 @@ import type { MissionLedger } from "./mission-ledger.js";
 import type { WorkSessionManager } from "./work-sessions.js";
 import type { WorkspaceRegistry } from "./workspaces.js";
 import { normalizeWorkspaceSnapshotIdentity, type ReviewCheckpointManager, type WorkspaceSnapshot } from "./review-checkpoints.js";
+import { selectEffectiveEvidenceResult } from "./mission/evidence-authority.js";
 
 const ALLOWED_EXECUTABLES = new Set(["npm", "pytest", "cargo", "go", "make", "vitest", "jest", "tsc", "ruff"]);
 
@@ -698,11 +699,32 @@ export async function verifyMissionSubmission(input: {
       // "unspecified" is not a toolchain identity. Never reuse evidence across
       // verifier invocations unless the mission supplies a deterministic
       // command version (or an equivalent toolchain fingerprint).
+      // P0-01: Use the evidence authority to select the latest trusted result
+      // for the exact criterion, submission, snapshot, and review epoch. Only
+      // genuinely executed verifier evidence may enter the cache; untrusted
+      // provenance and later inconclusive results force fresh execution.
       const cached = criterion.verificationType === "test" && criterion.commandVersion
-        ? packet.evidence.find((entry) => {
-            const details = parseDetails(entry.details);
-            return entry.criterionId === criterion.id && entry.command === command && entry.submissionId === latest.id && entry.reviewEpoch === (latest.reviewEpoch ?? 0) && entry.snapshotKind === snapshotKind && entry.snapshotRef === snapshotRef && entry.status !== "inconclusive" && details.cacheKey === cacheKey;
-          })
+        ? (() => {
+            const scopeContext = {
+              submissionId: latest.id,
+              snapshotKind,
+              snapshotRef,
+              reviewEpoch: latest.reviewEpoch ?? 0,
+            };
+            const effective = selectEffectiveEvidenceResult(
+              packet.evidence,
+              { criterionId: criterion.id },
+              scopeContext,
+              (source) => source === "server_test_runner",
+            );
+            if (!effective || effective.status !== "passed") return undefined;
+            const details = typeof effective.details === "object" && effective.details ? effective.details as Record<string, unknown> : {};
+            if (details.cacheKey !== cacheKey) return undefined;
+            // Provenance must trace to a genuinely executed trusted verifier
+            // result; the reused result cannot become its own independent proof.
+            if (details.provenance !== "executed") return undefined;
+            return effective;
+          })()
         : undefined;
       let result: Omit<VerificationResult, "criterionId" | "command">;
       if (cached) {
