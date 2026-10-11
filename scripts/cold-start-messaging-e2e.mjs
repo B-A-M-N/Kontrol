@@ -113,7 +113,7 @@ async function main() {
     const dbPath = join(stateDir, "kontrol.sqlite");
     const db = new Database(dbPath, { readonly: true });
     const schemaVersion = db.prepare("select max(version) as v from kontrol_schema_migrations").get()?.v;
-    assert.ok(schemaVersion >= 69, `schema version should be >=69, got ${schemaVersion}`);
+    assert.ok(schemaVersion >= 70, `schema version should be >=70, got ${schemaVersion}`);
     const tables = db.prepare("select name from sqlite_master where type='table' and name in ('agent_message_replies','agent_reply_waits','review_routes','review_handoffs','scheduled_jobs','scheduled_job_attempts')").all().map((row) => row.name);
     for (const expected of ["agent_message_replies", "agent_reply_waits", "review_routes", "review_handoffs", "scheduled_jobs", "scheduled_job_attempts"]) {
       assert.ok(tables.includes(expected), `missing table ${expected}`);
@@ -132,7 +132,7 @@ async function main() {
     const { default: Database } = await import("better-sqlite3");
     const db = new Database(join(stateDir, "kontrol.sqlite"), { readonly: true });
     const schemaVersion = db.prepare("select max(version) as v from kontrol_schema_migrations").get()?.v;
-    assert.ok(schemaVersion >= 69, `schema survived restart, got ${schemaVersion}`);
+    assert.ok(schemaVersion >= 70, `schema survived restart, got ${schemaVersion}`);
     const rows = db.prepare("select count(*) as count from agent_message_replies").get();
     assert.ok(Number(rows.count) >= 0, "reply table queryable after restart");
     db.close();
