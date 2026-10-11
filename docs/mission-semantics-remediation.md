@@ -58,3 +58,13 @@ canApprove() result, not from caller input. A falsification test proves a
 caller asserting approval cannot converge a denied mission. Full unit suite
 (42) green; clean candidate built from f7b67ba. Root filesystem remains
 read-only; activation and soak still pending recovery.
+
+### Verification parity mapper (commit e194683, candidate c55d8746bbdbe61c)
+
+missionVerificationOptionsFromConfig is the single mapping from parsed
+server config to mission verification options; both the manual reviewer
+path and supervised ACP runtime consume it, with a parity test asserting
+identical sandbox, environment, toolchain, executable, and inflight
+settings from the same configuration. Full unit suite (42) green; clean
+candidate built from e194683. Root filesystem remains read-only; activation
+and soak still pending recovery.
