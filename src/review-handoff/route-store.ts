@@ -94,6 +94,12 @@ export interface ReviewRouteStore {
     completed?: boolean;
   }): ReviewHandoff;
   incrementCompletedRound(input: { routeId: string; expectedRevision: number }): ReviewRoute;
+  /**
+   * L04: change only the route's automation status (active/paused/disabled)
+   * without altering the selected routing mode or its round budget. Used by
+   * pause/resume/disable controls.
+   */
+  setStatus(input: { workSessionId: string; expectedRevision?: number; status: ReviewRouteStatus }): ReviewRoute;
   close(): void;
 }
 
@@ -292,6 +298,20 @@ export function createReviewRouteStore(database: DatabaseHandle): ReviewRouteSto
       if (updated.changes !== 1) throw new Error("Review route increment conflict.");
       const row = database.db.select().from(reviewRoutes).where(eq(reviewRoutes.id, input.routeId)).get();
       return rowToRoute(row!);
+    },
+
+    setStatus(input) {
+      const existing = getRouteBySession(input.workSessionId);
+      if (!existing) throw new Error("No review route is configured for this work session.");
+      if (input.expectedRevision !== undefined && input.expectedRevision !== existing.revision) {
+        throw new Error(`Review route revision conflict; expected ${input.expectedRevision}, current ${existing.revision}.`);
+      }
+      database.db.update(reviewRoutes).set({
+        status: input.status,
+        revision: existing.revision + 1,
+        updatedAt: new Date().toISOString(),
+      }).where(eq(reviewRoutes.id, existing.id)).run();
+      return getRouteBySession(input.workSessionId)!;
     },
 
     close() {

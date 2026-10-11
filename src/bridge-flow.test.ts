@@ -1272,6 +1272,28 @@ try {
     void route;
   }
 
+  // ── Scenario 12d: L04 — pause/resume/status route controls ──
+  {
+    const sessionId = createSession();
+    await callReviewer("configure_review_loop", { workSessionId: sessionId, enabled: true, mode: "isolated_review", maxReviewRounds: 3 });
+    const paused = await callReviewer("pause_review_loop", { workSessionId: sessionId });
+    assert.ok(!paused.isError, "reviewer can pause the review loop");
+    const status = await callReviewer("get_review_loop_status", { workSessionId: sessionId });
+    assert.ok(!status.isError, "reviewer can read review-loop status");
+    assert.equal((status.structuredContent as { status?: string })?.status, "paused", "status reflects the pause");
+    // A submission while paused does not create a handoff (automation stopped).
+    await callWorker("submit_for_review", { sessionId });
+    const submission = workSessions.get(sessionId)!.latestSubmission!;
+    assert.equal(
+      reviewRoutes.getHandoffBySubmission(sessionId, submission.id, submission.reviewEpoch),
+      undefined,
+      "a paused route creates no handoff on submission",
+    );
+    const resumed = await callReviewer("resume_review_loop", { workSessionId: sessionId });
+    assert.ok(!resumed.isError, "reviewer can resume the review loop");
+    assert.equal((resumed.structuredContent as { status?: string })?.status, "active", "resume restores the active route");
+  }
+
   // ── Scenario 13: defect #1 + #4 — awaiting-review worker crash stays resumable ──
   {
     const sessionId = createSession();

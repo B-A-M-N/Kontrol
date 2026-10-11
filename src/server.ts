@@ -774,7 +774,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
   if (config.acpEnabled) {
     const acp = createAcpRuntime({
       config,
-      bridge: { workspaces, workSessions, reviewCheckpoints, agentRegistry, eventStore, continuationManager, dispatchOutbox, missionLedger, supervisorRuns, agentMessages, liveWaiters, scheduledJobs },
+      bridge: { workspaces, workSessions, reviewCheckpoints, agentRegistry, eventStore, continuationManager, dispatchOutbox, missionLedger, supervisorRuns, agentMessages, liveWaiters, scheduledJobs, reviewRoutes },
       reviewWorkflow,
       recordPhaseTiming,
       database: db,

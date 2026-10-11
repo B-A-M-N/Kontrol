@@ -159,6 +159,21 @@ export function createAcpRuntime(deps: AcpRuntimeDeps): AcpRuntimeHandles {
       const session = workSessions.get(workSessionId);
       const latest = session?.latestSubmission;
       if (!mission || !latest?.id || !session) throw new Error("Cannot create a correction without a current mission submission.");
+      // L02/L03: the configured review-round maximum is a hard ceiling on
+      // automatic correction-driven submissions. When the route budget is
+      // exhausted (or the route is paused/disabled), the supervisor must not
+      // dispatch another correction; the run escalates to human intervention
+      // instead of silently exceeding the user's chosen limit.
+      if (bridge.reviewRoutes) {
+        const route = bridge.reviewRoutes.getRouteBySession(workSessionId);
+        if (route && (route.status !== "active" || route.completedReviewRounds >= route.maxReviewRounds)) {
+          const reason = route.status !== "active"
+            ? `Review loop is ${route.status}; automatic corrections are stopped.`
+            : `Review round budget exhausted (${route.completedReviewRounds}/${route.maxReviewRounds}); automatic corrections are stopped.`;
+          eventStore.appendEvent({ type: "review.loop.correction_blocked", sessionId: workSessionId, payload: { routeId: route.id, status: route.status, completedReviewRounds: route.completedReviewRounds, maxReviewRounds: route.maxReviewRounds } });
+          throw new Error(`Automatic correction blocked: ${reason}`);
+        }
+      }
       const packet = missionLedger.getPacket(workSessionId);
       const effectiveStatus = new Map(packet.criterionStates.map((criterion) => [criterion.criterionId, criterion.status]));
       const failedCriteria = packet.criteria.filter((criterion) => criterion.priority === "required" && effectiveStatus.get(criterion.id) !== "verified");

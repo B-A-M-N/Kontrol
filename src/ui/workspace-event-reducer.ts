@@ -255,8 +255,22 @@ export function reduceWorkSessionEvent(sessionId: string, event: AgentActivityEv
       handoffStatus: String(event.payload?.status ?? ""),
       roundNumber: Number(event.payload?.roundNumber ?? 0),
     };
+  } else if (event.type === "review.route.status_changed") {
+    view.reviewLoop = {
+      ...view.reviewLoop,
+      status: String(event.payload?.status ?? ""),
+      revision: Number(event.payload?.revision ?? 0),
+    };
+    const nextStatus = String(event.payload?.status ?? "");
+    view.notice = nextStatus === "paused"
+      ? { tone: "info", message: "Review loop paused. New automatic corrections are stopped." }
+      : nextStatus === "active"
+        ? { tone: "info", message: "Review loop resumed." }
+        : { tone: "warning", message: `Review loop ${nextStatus}.` };
   } else if (event.type === "review.loop.limit_reached") {
     view.notice = { tone: "warning", message: "Review round limit reached. Human review is required before further automatic rounds." };
+  } else if (event.type === "review.loop.correction_blocked") {
+    view.notice = { tone: "warning", message: "Automatic correction stopped: the review loop is paused or its round budget is exhausted." };
   } else if (event.type === "agent.message.resolved" || event.type === "agent.message.reply_accepted") {
     const messageId = String(event.payload?.messageId ?? "");
     if (messageId) {

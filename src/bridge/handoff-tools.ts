@@ -9,8 +9,41 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { BridgeConfig } from "./context.js";
 import { registerMutationAppTool } from "./app-tool.js";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
-import { forbidden, isReviewer, liveOwnerContextId, reviewOwnerContextId, requireWorkSessionMutation } from "./shared.js";
+import { forbidden, isReviewer, liveOwnerContextId, reviewOwnerContextId, requireWorkSessionMutation, requireWorkSessionRead } from "./shared.js";
 import { z } from "zod/v4";
+
+/**
+ * L04: shared pause/resume/disable control. Keeps route status independent of
+ * supervisor state; the caller may separately pause the supervisor when that is
+ * operationally appropriate.
+ */
+async function setRouteStatus(
+  config: BridgeConfig,
+  routes: BridgeConfig["reviewRoutes"],
+  workSessionId: string,
+  expectedRevision: number | undefined,
+  status: import("../review-handoff/route-store.js").ReviewRouteStatus,
+  tool: string,
+) {
+  if (!isReviewer(config.principalRole)) return forbidden(config.principalRole, tool);
+  const access = requireWorkSessionMutation(config, workSessionId);
+  if (access) return access;
+  if (!routes) return { content: [{ type: "text" as const, text: "Review routing is unavailable." }], isError: true };
+  try {
+    const route = routes.setStatus({ workSessionId, expectedRevision, status });
+    config.eventStore.appendEvent({
+      type: "review.route.status_changed",
+      sessionId: workSessionId,
+      payload: { routeId: route.id, status: route.status, revision: route.revision, routeEpoch: route.routeEpoch },
+    });
+    return {
+      content: [{ type: "text" as const, text: `Review loop ${route.status}.` }],
+      structuredContent: { routeId: route.id, status: route.status, revision: route.revision, routeEpoch: route.routeEpoch },
+    };
+  } catch (error) {
+    return { content: [{ type: "text" as const, text: error instanceof Error ? error.message : String(error) }], isError: true };
+  }
+}
 
 export function registerHandoffTools(server: McpServer, config: BridgeConfig): void {
   const routes = config.reviewRoutes;
@@ -122,6 +155,85 @@ export function registerHandoffTools(server: McpServer, config: BridgeConfig): v
       } catch (error) {
         return { content: [{ type: "text" as const, text: error instanceof Error ? error.message : String(error) }], isError: true };
       }
+    },
+  );
+
+  registerMutationAppTool(
+    server,
+    "pause_review_loop",
+    {
+      title: "Pause review loop",
+      description: "Pause autonomous review routing for a work session. New automation stops; already-committed feedback and pending submissions are preserved.",
+      inputSchema: { workSessionId: z.string(), expectedRevision: z.number().int().min(1).optional() },
+      outputSchema: { routeId: z.string(), status: z.string(), revision: z.number(), routeEpoch: z.number() },
+      _meta: {},
+      annotations: { readOnlyHint: false },
+    },
+    config,
+    async ({ workSessionId, expectedRevision }) => setRouteStatus(config, routes, workSessionId, expectedRevision, "paused", "pause_review_loop"),
+  );
+
+  registerMutationAppTool(
+    server,
+    "resume_review_loop",
+    {
+      title: "Resume review loop",
+      description: "Resume a paused review route, rebuilding the next action from durable state. Does not replay a stale request.",
+      inputSchema: { workSessionId: z.string(), expectedRevision: z.number().int().min(1).optional() },
+      outputSchema: { routeId: z.string(), status: z.string(), revision: z.number(), routeEpoch: z.number() },
+      _meta: {},
+      annotations: { readOnlyHint: false },
+    },
+    config,
+    async ({ workSessionId, expectedRevision }) => setRouteStatus(config, routes, workSessionId, expectedRevision, "active", "resume_review_loop"),
+  );
+
+  registerAppTool(
+    server,
+    "get_review_loop_status",
+    {
+      title: "Get review loop status",
+      description: "Read the durable review-route status, mode, round budget, and current destination for a work session.",
+      inputSchema: { workSessionId: z.string() },
+      outputSchema: {
+        configured: z.boolean(),
+        routeId: z.string().optional(),
+        status: z.string().optional(),
+        mode: z.string().optional(),
+        completedReviewRounds: z.number().optional(),
+        maxReviewRounds: z.number().optional(),
+        routeEpoch: z.number().optional(),
+        revision: z.number().optional(),
+        pinnedConversationId: z.string().optional(),
+      },
+      _meta: {},
+      annotations: { readOnlyHint: true },
+    },
+    async ({ workSessionId }: { workSessionId: string }) => {
+      const denied = requireWorkSessionRead(config, workSessionId);
+      if (denied) return denied;
+      if (!routes) return { content: [{ type: "text" as const, text: "Review routing is unavailable." }], isError: true };
+      const route = routes.getRouteBySession(workSessionId);
+      if (!route) {
+        return {
+          content: [{ type: "text" as const, text: `No review route is configured for ${workSessionId}.` }],
+          structuredContent: { configured: false },
+        };
+      }
+      return {
+        content: [{ type: "text" as const, text: `Review loop ${route.status}; round ${route.completedReviewRounds}/${route.maxReviewRounds}.` }],
+        structuredContent: {
+          configured: true,
+          routeId: route.id,
+          status: route.status,
+          mode: route.mode,
+          completedReviewRounds: route.completedReviewRounds,
+          maxReviewRounds: route.maxReviewRounds,
+          routeEpoch: route.routeEpoch,
+          revision: route.revision,
+          pinnedConversationId: route.pinnedConversationId,
+        },
+      };
     },
   );
 

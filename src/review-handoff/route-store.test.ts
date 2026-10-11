@@ -84,6 +84,53 @@ try {
     completed: true,
   });
   assert.equal(committed.status, "feedback_committed");
+
+  // ── L04: pause/resume change only automation status, not the mode/budget.
+  const paused = routes.setStatus({ workSessionId: "wsess-route", status: "paused" });
+  assert.equal(paused.status, "paused");
+  assert.equal(paused.mode, "isolated_review", "pause preserves the selected routing mode");
+  assert.equal(paused.maxReviewRounds, 2, "pause preserves the round budget");
+  // A paused route refuses new handoffs (no further automation).
+  let pausedCreate = false;
+  try {
+    routes.createHandoff({
+      routeId: configured.id, workSessionId: "wsess-route", submissionId: "sub-2",
+      reviewEpoch: 2, snapshotKind: "git", snapshotRef: "ref-2", diffSha256: "hash-2", roundNumber: 2,
+    });
+  } catch { pausedCreate = true; }
+  assert.ok(pausedCreate, "a paused route does not create new handoffs");
+
+  const resumed = routes.setStatus({ workSessionId: "wsess-route", status: "active" });
+  assert.equal(resumed.status, "active");
+  assert.equal(resumed.mode, "isolated_review");
+  assert.equal(resumed.maxReviewRounds, 2);
+
+  // ── L02/L03: the round budget is an absolute ceiling. After two rounds the
+  //    route refuses a third handoff regardless of convergence pressure.
+  const h2 = routes.createHandoff({
+    routeId: resumed.id, workSessionId: "wsess-route", submissionId: "sub-2",
+    reviewEpoch: 2, snapshotKind: "git", snapshotRef: "ref-2", diffSha256: "hash-2", roundNumber: 2,
+  });
+  assert.equal(routes.getRouteBySession("wsess-route")!.completedReviewRounds, 2);
+  let thirdRound = false;
+  try {
+    routes.createHandoff({
+      routeId: resumed.id, workSessionId: "wsess-route", submissionId: "sub-3",
+      reviewEpoch: 3, snapshotKind: "git", snapshotRef: "ref-3", diffSha256: "hash-3", roundNumber: 3,
+    });
+  } catch (error) {
+    thirdRound = /round limit reached/i.test(error instanceof Error ? error.message : String(error));
+  }
+  assert.ok(thirdRound, "the configured round maximum is an absolute ceiling on new handoffs");
+  void h2;
+
+  // Revision CAS is enforced on status changes.
+  let staleStatus = false;
+  try {
+    routes.setStatus({ workSessionId: "wsess-route", status: "paused", expectedRevision: 1 });
+  } catch { staleStatus = true; }
+  assert.ok(staleStatus, "stale revision cannot drive a route status change");
+
   db.close();
 } finally {
   await rm(root, { recursive: true, force: true });
