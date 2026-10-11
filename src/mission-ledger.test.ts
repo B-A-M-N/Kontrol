@@ -136,6 +136,12 @@ try {
     outcomeEvidence: "integration_verified",
   }), /Mission contract conflict/, "changing outcomeEvidence changes the contract identity");
 
+  // Fingerprint definition version participates in identity: all fingerprints
+  // are versioned so canonical-payload changes are explicit, not silent.
+  const { MISSION_CONTRACT_FINGERPRINT_VERSION } = await import("./mission/contract-authority.js");
+  assert.equal(typeof MISSION_CONTRACT_FINGERPRINT_VERSION, "number");
+  assert.equal(MISSION_CONTRACT_FINGERPRINT_VERSION > 1, true, "current canonical definition is versioned above the pre-ID/v1 payload");
+
   assert.throws(() => ledger.createMission({
     workSessionId: session.id,
     workspaceSessionId: "workspace-1",

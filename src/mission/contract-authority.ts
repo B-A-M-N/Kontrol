@@ -80,6 +80,14 @@ export function validateMissionCriterionContract(criteria: MissionCriterionInput
   }
 }
 
+/**
+ * Canonical fingerprint definition version. Bump when the canonical payload
+ * changes so stored identities can be interpreted against the definition that
+ * produced them; existing records keep their historical identity until an
+ * explicit validated migration resolves old and new forms.
+ */
+export const MISSION_CONTRACT_FINGERPRINT_VERSION = 2;
+
 export function fingerprintMissionContract(input: MissionContractInput, criteria: MissionCriterionInput[]): string {
   const baselineIdentity = normalizeWorkspaceSnapshotIdentity({
     snapshotKind: input.baselineKind,
@@ -121,7 +129,7 @@ export function fingerprintMissionContract(input: MissionContractInput, criteria
     acceptanceCriteria: normalizedCriteria.sort((left, right) =>
       JSON.stringify(canonicalize(left)).localeCompare(JSON.stringify(canonicalize(right)))),
   };
-  return hash(JSON.stringify(canonicalize(payload)));
+  return hash(JSON.stringify(canonicalize({ fingerprintVersion: MISSION_CONTRACT_FINGERPRINT_VERSION, ...payload })));
 }
 
 export function fingerprintStoredMissionContract(
