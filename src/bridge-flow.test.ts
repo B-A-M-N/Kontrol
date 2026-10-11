@@ -1292,6 +1292,21 @@ try {
     const resumed = await callReviewer("resume_review_loop", { workSessionId: sessionId });
     assert.ok(!resumed.isError, "reviewer can resume the review loop");
     assert.equal((resumed.structuredContent as { status?: string })?.status, "active", "resume restores the active route");
+
+    // C05: enabling a multi-round pinned review surfaces the context-drift warning.
+    const pinned = await callReviewer("configure_review_loop", {
+      workSessionId: sessionId, enabled: true, mode: "pinned_conversation", maxReviewRounds: 3,
+    });
+    assert.ok(!pinned.isError, "reviewer can enable a pinned review loop");
+    assert.match(
+      String((pinned.structuredContent as { warning?: string })?.warning ?? ""),
+      /context drift/i,
+      "enabling a multi-round pinned review warns about context drift",
+    );
+    const singleRound = await callReviewer("configure_review_loop", {
+      workSessionId: sessionId, enabled: true, mode: "pinned_conversation", maxReviewRounds: 1,
+    });
+    assert.equal((singleRound.structuredContent as { warning?: string })?.warning, undefined, "a single-round pinned review has no drift warning");
   }
 
   // ── Scenario 13: defect #1 + #4 — awaiting-review worker crash stays resumable ──

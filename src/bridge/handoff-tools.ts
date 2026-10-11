@@ -69,6 +69,7 @@ export function registerHandoffTools(server: McpServer, config: BridgeConfig): v
         routeEpoch: z.number(),
         completedReviewRounds: z.number(),
         maxReviewRounds: z.number(),
+        warning: z.string().optional(),
       },
       _meta: {},
       annotations: { readOnlyHint: false },
@@ -95,8 +96,13 @@ export function registerHandoffTools(server: McpServer, config: BridgeConfig): v
           sessionId: workSessionId,
           payload: { routeId: route.id, status: route.status, mode: route.mode, maxReviewRounds: route.maxReviewRounds, revision: route.revision, routeEpoch: route.routeEpoch },
         });
+        // C05: warn once, when enabling a multi-round pinned review — the
+        // configuration where repeated handoffs accumulate the most drift risk.
+        const warning = route.status === "active" && route.mode === "pinned_conversation" && route.maxReviewRounds > 1
+          ? "Extended review sessions: repeated agent/reviewer handoffs increase opportunities for context drift, inaccurate assumptions, and missed regressions. Kontrol preserves the original objective and requires fresh verification, but additional rounds cannot guarantee greater accuracy. You can pause the loop or switch to fresh isolated reviews at any time."
+          : undefined;
         return {
-          content: [{ type: "text" as const, text: `Review loop ${route.status}; round ${route.completedReviewRounds}/${route.maxReviewRounds}.` }],
+          content: [{ type: "text" as const, text: `Review loop ${route.status}; round ${route.completedReviewRounds}/${route.maxReviewRounds}.${warning ? ` ${warning}` : ""}` }],
           structuredContent: {
             routeId: route.id,
             status: route.status,
@@ -104,6 +110,7 @@ export function registerHandoffTools(server: McpServer, config: BridgeConfig): v
             routeEpoch: route.routeEpoch,
             completedReviewRounds: route.completedReviewRounds,
             maxReviewRounds: route.maxReviewRounds,
+            warning,
           },
         };
       } catch (error) {
