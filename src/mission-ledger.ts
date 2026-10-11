@@ -15,13 +15,15 @@ import {
   type MissionReviewFindingRow,
   type MissionWorkOrderRow,
   type MissionCompletionReportRow,
+  type MissionOutcomeObservationRow,
 } from "./db/schema.js";
+import { missionOutcomeObservations } from "./db/schema.js";
 import { normalizeWorkspaceSnapshotIdentity, type WorkspaceSnapshotKind } from "./review-checkpoints.js";
 import { fingerprintMissionContract, fingerprintMissionContractV1, fingerprintStoredMissionContract, validateMissionCriterionContract } from "./mission/contract-authority.js";
 import { evaluateEffectiveFindingResolution, evaluateFindingResolutionEvidence, isEvidenceSourceAllowed, selectEffectiveEvidenceResult } from "./mission/evidence-authority.js";
 import { assertFindingStatusTransition, fingerprintFinding, mergeFindingEvidence } from "./mission/finding-authority.js";
 import { evaluateCorrectionPolicy } from "./mission/correction-policy.js";
-import { evaluateEffectiveCriteria, evaluateMissionOutcome } from "./mission/outcome-evaluator.js";
+import { evaluateEffectiveCriteria, evaluateMissionOutcome, type OutcomeObservation } from "./mission/outcome-evaluator.js";
 
 export type CriterionStatus = "unverified" | "partially_verified" | "verified" | "failed";
 export type FindingStatus = "open" | "claimed_resolved" | "verified_resolved" | "waived";
@@ -112,6 +114,8 @@ export interface MissionContractInput {
   reviewCoverage?: string[];
   /** Minimum independent evidence strength required for completion. */
   outcomeEvidence?: "implementation_verified" | "integration_verified" | "outcome_verified" | "operationally_stable";
+  /** User-visible behavior the external observer must confirm for outcome_verified. */
+  outcomeExpectedBehavior?: string;
 }
 
 export interface ApprovalPredicate {
@@ -183,6 +187,15 @@ export interface MissionLedger {
   getCompletionReportHash(workSessionId: string, context: CurrentApprovalContext): string | undefined;
   getPacket(workSessionId: string, approvalContext?: CurrentApprovalContext): MissionReviewPacket;
   canApprove(workSessionId: string, context?: CurrentApprovalContext): ApprovalPredicate;
+  recordOutcomeObservation(missionId: string, input: {
+    submissionId: string;
+    snapshotKind: WorkspaceSnapshotKind;
+    snapshotRef: string;
+    observerIdentity: string;
+    expectedBehavior: string;
+    actualBehavior: string;
+    status: "confirmed" | "rejected";
+  }): { id: string };
   evaluateCriteria(workSessionId: string, context?: CurrentApprovalContext): EffectiveCriterionState[];
   /**
    * Decide whether a review round that surfaced new findings may EXTEND the
@@ -260,8 +273,13 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
     // external oracle/sustained-operation receipt, which is not yet implemented.
     // Fail closed at creation rather than silently weakening the approval gate
     // to an integration report.
-    if (input.outcomeEvidence === "outcome_verified" || input.outcomeEvidence === "operationally_stable") {
-      throw new Error(`outcomeEvidence ${input.outcomeEvidence} is not yet supported; independent outcome oracle qualification is required before missions can demand it.`);
+    if (input.outcomeEvidence === "operationally_stable") {
+      throw new Error("outcomeEvidence operationally_stable is not yet supported; sustained-operation oracle qualification is required before missions can demand it.");
+    }
+    // outcome_verified requires at least one declared expected-behavior
+    // contract so the external observer knows what to confirm or reject.
+    if (input.outcomeEvidence === "outcome_verified" && !input.outcomeExpectedBehavior?.trim()) {
+      throw new Error("outcomeEvidence outcome_verified requires a nonempty outcomeExpectedBehavior describing the user-visible result the observer must confirm.");
     }
     // P1-02: A mission that requires integration evidence must declare at
     // least one supported final-verification command, or its own verifier
@@ -319,6 +337,7 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
         finalVerificationJson: JSON.stringify(input.finalVerification ?? []),
         reviewCoverageJson: JSON.stringify(input.reviewCoverage ?? []),
         outcomeEvidence: input.outcomeEvidence ?? "implementation_verified",
+        outcomeExpectedBehavior: input.outcomeExpectedBehavior ?? null,
         createdAt: now,
         updatedAt: now,
       }).run();
@@ -726,6 +745,16 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
         },
       );
     }
+    const outcomeObservations: OutcomeObservation[] = currentContext.submissionId && currentSnapshot
+      ? database.db.select().from(missionOutcomeObservations)
+          .where(and(
+            eq(missionOutcomeObservations.missionId, mission.id),
+            eq(missionOutcomeObservations.submissionId, currentContext.submissionId),
+          ))
+          .orderBy(desc(missionOutcomeObservations.observedAt))
+          .all()
+          .map(rowToOutcomeObservation)
+      : [];
     return evaluateMissionOutcome({
       criteria: packet.criteria,
       criterionStates: evaluateCriteria(workSessionId, currentContext),
@@ -734,6 +763,7 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
       reviewCoverage: mission.reviewCoverage,
       outcomeEvidence: mission.outcomeEvidence,
       currentSubmissionId: currentContext.submissionId,
+      outcomeObservations,
       effectiveFindingResolutions,
       currentReport: currentReport ? {
         status: currentReport.status,
@@ -741,6 +771,51 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
         results: parseJson<unknown[]>(currentReport.resultsJson, []),
       } : undefined,
     });
+  }
+
+  function recordOutcomeObservation(missionId: string, input: {
+    submissionId: string;
+    snapshotKind: WorkspaceSnapshotKind;
+    snapshotRef: string;
+    observerIdentity: string;
+    expectedBehavior: string;
+    actualBehavior: string;
+    status: "confirmed" | "rejected";
+  }): { id: string } {
+    const mission = database.db.select().from(missionContracts).where(eq(missionContracts.id, missionId)).get();
+    if (!mission) throw new Error(`Mission ${missionId} not found.`);
+    if (mission.outcomeEvidence !== "outcome_verified" && mission.outcomeEvidence !== "operationally_stable") {
+      throw new Error(`Mission ${missionId} does not require outcome evidence (current level: ${mission.outcomeEvidence ?? "implementation_verified"}).`);
+    }
+    if (!input.observerIdentity.trim()) throw new Error("Outcome observation requires a nonempty observerIdentity.");
+    if (!input.expectedBehavior.trim()) throw new Error("Outcome observation requires a nonempty expectedBehavior.");
+    const id = `obs_${randomUUID()}`;
+    const now = new Date().toISOString();
+    const observationSha256 = createHash("sha256").update(JSON.stringify({
+      missionId,
+      submissionId: input.submissionId,
+      snapshotKind: input.snapshotKind,
+      snapshotRef: input.snapshotRef,
+      observerIdentity: input.observerIdentity,
+      expectedBehavior: input.expectedBehavior,
+      actualBehavior: input.actualBehavior,
+      status: input.status,
+    })).digest("hex");
+    database.db.insert(missionOutcomeObservations).values({
+      id,
+      missionId,
+      submissionId: input.submissionId,
+      snapshotKind: input.snapshotKind,
+      snapshotRef: input.snapshotRef,
+      observerIdentity: input.observerIdentity,
+      expectedBehavior: input.expectedBehavior,
+      actualBehavior: input.actualBehavior,
+      status: input.status,
+      observedAt: now,
+      observationSha256,
+    }).run();
+    touchMission(missionId);
+    return { id };
   }
 
   function evaluateCriteria(workSessionId: string, context?: CurrentApprovalContext): EffectiveCriterionState[] {
@@ -960,6 +1035,7 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
     getCompletionReportHash,
     getPacket,
     canApprove,
+    recordOutcomeObservation,
     evaluateCriteria,
     evaluateLoopExtension,
     resolveFinding,
@@ -1118,6 +1194,16 @@ function normalizeCurrentApprovalContext(context: CurrentApprovalContext): Curre
   const canonicalContext: CurrentApprovalContext = { ...context };
   delete canonicalContext.snapshotCommit;
   return { ...canonicalContext, snapshotKind: snapshot.kind, snapshotRef: snapshot.ref };
+}
+
+function rowToOutcomeObservation(row: MissionOutcomeObservationRow): OutcomeObservation {
+  return {
+    observerIdentity: row.observerIdentity,
+    expectedBehavior: row.expectedBehavior,
+    actualBehavior: row.actualBehavior,
+    status: row.status,
+    observedAt: row.observedAt,
+  };
 }
 
 function parseJson<T>(value: string | null | undefined, fallback: T): T {

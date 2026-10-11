@@ -469,6 +469,7 @@ export const missionContracts = sqliteTable("mission_contracts", {
   finalVerificationJson: text("final_verification_json").notNull().default("[]"),
   reviewCoverageJson: text("review_coverage_json").notNull().default("[]"),
   outcomeEvidence: text("outcome_evidence"),
+  outcomeExpectedBehavior: text("outcome_expected_behavior"),
   createdAt: text("created_at").notNull(),
   updatedAt: text("updated_at").notNull(),
 }, (table) => [
@@ -525,6 +526,26 @@ export const missionCompletionReports = sqliteTable("mission_completion_reports"
   index("mission_completion_reports_identity_idx").on(table.missionId, table.submissionId, table.snapshotKind, table.snapshotRef, table.createdAt),
 ]);
 export type MissionCompletionReportRow = typeof missionCompletionReports.$inferSelect;
+
+export const missionOutcomeObservations = sqliteTable("mission_outcome_observations", {
+  id: text("id").primaryKey(),
+  missionId: text("mission_id").notNull().references(() => missionContracts.id, { onDelete: "cascade" }),
+  submissionId: text("submission_id").notNull(),
+  snapshotKind: text("snapshot_kind").notNull(),
+  snapshotRef: text("snapshot_ref").notNull(),
+  /** Explicit external observer identity; server_test_runner is not valid here. */
+  observerIdentity: text("observer_identity").notNull(),
+  /** Declared user-visible behavior that the observer confirmed or rejected. */
+  expectedBehavior: text("expected_behavior").notNull(),
+  actualBehavior: text("actual_behavior").notNull(),
+  status: text("status").notNull(),
+  observedAt: text("observed_at").notNull(),
+  /** Hash of the observation payload so receipts are tamper-evident. */
+  observationSha256: text("observation_sha256").notNull(),
+}, (table) => [
+  index("mission_outcome_observations_current_idx").on(table.missionId, table.submissionId, table.snapshotRef, table.observedAt),
+]);
+export type MissionOutcomeObservationRow = typeof missionOutcomeObservations.$inferSelect;
 
 export const missionAcceptanceCriteria = sqliteTable("mission_acceptance_criteria", {
   id: text("id").primaryKey(),

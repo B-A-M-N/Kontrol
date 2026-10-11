@@ -372,13 +372,25 @@ try {
   assert.equal(f08Empty.allowed, false, "an empty passing report cannot certify integration evidence");
   ledger.recordCompletionReport(f08Mission.id, { submissionId: f08Submission.id, snapshotKind: "git", snapshotRef: "f08-a", status: "passed", results: [{ command: "npm test", status: "passed" }] });
   assert.equal(ledger.canApprove(f08Session.id, f08Context).allowed, true, "a passing final report with real results satisfies integration evidence");
+  // P2-03: outcome_verified is now supported with an external-observation
+  // receipt, but requires an explicit expected-behavior contract.
   assert.throws(() => ledger.createMission({
     workSessionId: f08Session.id,
     workspaceSessionId: "workspace-1",
     objective: "outcome level",
     acceptanceCriteria: [{ id: "x", description: "x", priority: "required", verificationType: "manual_review" }],
     outcomeEvidence: "outcome_verified",
-  }), /not yet supported/, "outcome_verified is refused until independent oracle support exists");
+  }), /outcomeExpectedBehavior/, "outcome_verified requires an expected-behavior contract");
+
+  // operationally_stable remains locked.
+  assert.throws(() => ledger.createMission({
+    workSessionId: f08Session.id,
+    workspaceSessionId: "workspace-1",
+    objective: "stable level",
+    acceptanceCriteria: [{ id: "x", description: "x", priority: "required", verificationType: "manual_review" }],
+    outcomeEvidence: "operationally_stable",
+    outcomeExpectedBehavior: "still works after 24h",
+  }), /operationally_stable is not yet supported/, "operationally_stable is refused until sustained-operation oracle support exists");
 
   // --- Re-review P0: a later failure on the same submission supersedes a
   // verified resolution. The finding must block approval until fresh passing
@@ -823,6 +835,38 @@ try {
     const approvalResult = ledger.canApprove(noSubmitSession.id);
     assert.equal(approvalResult.allowed, false, "canApprove without submission is denied");
     assert.ok(approvalResult.reasons.length > 0, "denial has a reason");
+  }
+
+  // --- P2-03: outcome_verified requires an external outcome observation ----
+  {
+    const ovs = workSessions.create({
+      workspaceSessionId: "workspace-1", submittedBy: "webui", title: "Outcome verified",
+      completionPolicy: "webui_approval_required",
+    });
+    const ovm = ledger.createMission({
+      workSessionId: ovs.id, workspaceSessionId: "workspace-1", objective: "Outcome-verified mission",
+      acceptanceCriteria: [{ id: "ov-crit", description: "works", priority: "required", verificationType: "manual_review" }],
+      outcomeEvidence: "outcome_verified",
+      outcomeExpectedBehavior: "User sees the fix in the UI after reload",
+    });
+    const ovSub = workSessions.submitForReview({ workSessionId: ovs.id, diff: "A", snapshotKind: "git", snapshotRef: "ov-a", snapshotCommit: "ov-a" });
+    const ovCtx = { submissionId: ovSub.id, snapshotKind: "git" as const, snapshotRef: "ov-a", snapshotCommit: "ov-a", reviewEpoch: ovSub.reviewEpoch };
+    ledger.recordReviewerEvidence(ovm.id, [{ criterionId: "ov-crit", ...ovCtx, status: "passed" as const }]);
+    // No observations yet → denied.
+    const noObs = ledger.canApprove(ovs.id, ovCtx);
+    assert.equal(noObs.allowed, false, "outcome_verified without observations is denied");
+    assert.match(noObs.reasons.join("\n"), /no outcome observations exist/, "denial cites missing outcome observation");
+    // A rejection blocks approval even if an earlier confirmation exists.
+    ledger.recordOutcomeObservation(ovm.id, { ...ovCtx, observerIdentity: "human:alice", expectedBehavior: "fix visible", actualBehavior: "not visible", status: "rejected" });
+    const rejected = ledger.canApprove(ovs.id, ovCtx);
+    assert.equal(rejected.allowed, false, "rejected observation blocks approval");
+    assert.match(rejected.reasons.join("\n"), /rejected the expected behavior/, "denial cites the rejection");
+    // A rejection is authoritative: a later confirmation does NOT silently
+    // undo it. The reviewer must supersede with a new submission or an
+    // explicit second-round review, not just add a confirm record.
+    ledger.recordOutcomeObservation(ovm.id, { ...ovCtx, observerIdentity: "human:bob", expectedBehavior: "fix visible", actualBehavior: "fix visible after reload", status: "confirmed" });
+    const confirmedAfterRejection = ledger.canApprove(ovs.id, ovCtx);
+    assert.equal(confirmedAfterRejection.allowed, false, "a rejection is authoritative even after a later confirmation");
   }
 
   workSessions.close();

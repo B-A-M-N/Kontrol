@@ -77,6 +77,46 @@ const OUTCOME_EVIDENCE_RANK = {
 
 export type OutcomeEvidenceLevel = keyof typeof OUTCOME_EVIDENCE_RANK;
 
+export interface OutcomeObservation {
+  observerIdentity: string;
+  expectedBehavior: string;
+  actualBehavior: string;
+  status: string;
+  observedAt: string;
+}
+
+/**
+ * Evaluate independent outcome observations for a submission. At least one
+ * qualifying observation must confirm the expected behavior against the exact
+ * current snapshot; a later rejection supersedes earlier confirmations.
+ * Observer identity must be nonempty and distinct from internal verifier
+ * sources so an integration report can never substitute for an external
+ * outcome check.
+ */
+export function evaluateOutcomeObservations(
+  observations: OutcomeObservation[],
+  context: { submissionId: string; snapshotKind: string; snapshotRef: string },
+): { satisfied: boolean; reasons: string[] } {
+  const reasons: string[] = [];
+  if (!observations.length) {
+    reasons.push("Mission requires independent outcome evidence; no outcome observations exist for the current submission.");
+    return { satisfied: false, reasons };
+  }
+  const rejection = observations
+    .filter((o) => o.status === "rejected")
+    .sort((a, b) => b.observedAt.localeCompare(a.observedAt))[0];
+  if (rejection) {
+    reasons.push(`Latest outcome observation from ${rejection.observerIdentity} rejected the expected behavior at ${rejection.observedAt}.`);
+    return { satisfied: false, reasons };
+  }
+  const confirmations = observations.filter((o) => o.status === "confirmed" && o.observerIdentity.trim());
+  if (!confirmations.length) {
+    reasons.push("Mission requires independent outcome evidence; no qualifying confirmed observation exists for the current submission.");
+    return { satisfied: false, reasons };
+  }
+  return { satisfied: true, reasons };
+}
+
 export function evaluateMissionOutcome(input: {
   criteria: OutcomeCriterion[];
   criterionStates: EffectiveCriterionState[];
@@ -87,6 +127,7 @@ export function evaluateMissionOutcome(input: {
   currentReport?: OutcomeReport;
   currentSubmissionId?: string;
   effectiveFindingResolutions?: Record<string, { resolved: boolean; reasons: string[] }>;
+  outcomeObservations?: OutcomeObservation[];
 }): { allowed: boolean; reasons: string[] } {
   const reasons: string[] = [];
   const states = new Map(input.criterionStates.map((state) => [state.criterionId, state]));
@@ -103,6 +144,16 @@ export function evaluateMissionOutcome(input: {
     } else if (!report.results?.length) {
       reasons.push(`Mission requires ${requiredStrength} evidence; the passing completion report contains no verification results and cannot certify integration.`);
     }
+  }
+  // outcome_verified and operationally_stable additionally require a
+  // qualifying external outcome observation against the exact submission.
+  if (OUTCOME_EVIDENCE_RANK[requiredStrength] >= OUTCOME_EVIDENCE_RANK.outcome_verified) {
+    const outcome = evaluateOutcomeObservations(input.outcomeObservations ?? [], {
+      submissionId: input.currentSubmissionId ?? "",
+      snapshotKind: "",
+      snapshotRef: "",
+    });
+    if (!outcome.satisfied) reasons.push(...outcome.reasons);
   }
   for (const criterion of input.criteria) {
     if (criterion.priority === "required") {

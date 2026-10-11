@@ -75,6 +75,7 @@ const migrations: Migration[] = [
   { version: 63, name: "canonical-snapshot-report-identity", up: migrateCanonicalSnapshotReportIdentity },
   { version: 64, name: "mission-evidence-attempt-ordering", up: migrateMissionEvidenceAttemptOrdering },
   { version: 65, name: "mission-evidence-mission-wide-attempt-ordering", up: migrateMissionEvidenceMissionWideAttemptOrdering },
+  { version: 66, name: "mission-outcome-observations", up: migrateMissionOutcomeObservations },
 ];
 
 // v64: verification attempts need durable monotonic ordering because ISO
@@ -124,6 +125,30 @@ function migrateMissionEvidenceMissionWideAttemptOrdering(sqlite: Database.Datab
   // A unique index independently detects duplicate attempt assignment even
   // if a nontransactional writer races the select-then-insert sequence.
   sqlite.exec("create unique index if not exists mission_evidence_attempt_unique_idx on mission_evidence(mission_id, attempt) where attempt is not null");
+}
+
+// v66: independent outcome observations. A mission that demands
+// outcome_verified or operationally_stable evidence cannot be satisfied by a
+// passing integration report alone; it needs an explicit external-observer
+// receipt bound to the exact submitted snapshot.
+function migrateMissionOutcomeObservations(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table if not exists mission_outcome_observations (
+      id text primary key,
+      mission_id text not null references mission_contracts(id) on delete cascade,
+      submission_id text not null,
+      snapshot_kind text not null,
+      snapshot_ref text not null,
+      observer_identity text not null,
+      expected_behavior text not null,
+      actual_behavior text not null,
+      status text not null,
+      observed_at text not null,
+      observation_sha256 text not null
+    );
+  `);
+  sqlite.exec("create index if not exists mission_outcome_observations_current_idx on mission_outcome_observations(mission_id, submission_id, snapshot_ref, observed_at)");
+  addColumnIfMissing(sqlite, "mission_contracts", "outcome_expected_behavior", "text");
 }
 
 function migrateCanonicalSnapshotReportIdentity(sqlite: Database.Database): void {

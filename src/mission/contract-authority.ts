@@ -17,6 +17,7 @@ export interface StoredMissionContract {
   finalVerification: string[];
   reviewCoverage: string[];
   outcomeEvidence?: "implementation_verified" | "integration_verified" | "outcome_verified" | "operationally_stable";
+  outcomeExpectedBehavior?: string;
 }
 
 export interface StoredMissionCriterion {
@@ -126,6 +127,7 @@ export function fingerprintMissionContract(input: MissionContractInput, criteria
     finalVerification: input.finalVerification ?? [],
     reviewCoverage: input.reviewCoverage ?? [],
     outcomeEvidence: input.outcomeEvidence ?? null,
+    outcomeExpectedBehavior: input.outcomeExpectedBehavior ?? null,
     acceptanceCriteria: normalizedCriteria.sort((left, right) =>
       JSON.stringify(canonicalize(left)).localeCompare(JSON.stringify(canonicalize(right)))),
   };
@@ -151,6 +153,7 @@ export function fingerprintStoredMissionContract(
     finalVerification: mission.finalVerification,
     reviewCoverage: mission.reviewCoverage,
     outcomeEvidence: mission.outcomeEvidence,
+    outcomeExpectedBehavior: mission.outcomeExpectedBehavior,
   }, criteria.map((criterion) => ({
     id: criterion.id ?? undefined,
     description: criterion.description,
