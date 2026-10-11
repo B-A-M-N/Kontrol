@@ -14,6 +14,7 @@ import {
   type LiveWaiterRegistry,
 } from "../acp-bridge.js";
 import { createSupervisorRuntime } from "../supervisor-runtime.js";
+import { createReplyDispatcher } from "../bridge/reply-dispatcher.js";
 import { verifyMissionSubmission } from "../mission-verifier.js";
 import { missionVerificationOptionsFromConfig } from "../bridge/verification-options.js";
 import { evaluateSupervisorMission } from "../supervisor-evaluator.js";
@@ -47,6 +48,7 @@ export interface AcpRuntimeDeps {
 export interface AcpRuntimeHandles {
   readonly dispatcher: ContinuationDispatcher;
   readonly supervisorRuntime: SupervisorRuntime;
+  readonly replyDispatcher: import("../bridge/reply-dispatcher.js").ReplyDispatcher;
 }
 
 export function createAcpRuntime(deps: AcpRuntimeDeps): AcpRuntimeHandles {
@@ -84,6 +86,8 @@ export function createAcpRuntime(deps: AcpRuntimeDeps): AcpRuntimeHandles {
   };
   const dispatcher = createContinuationDispatcher(bridgeBase);
   dispatcher.start();
+  const replyDispatcher = createReplyDispatcher(bridgeBase);
+  replyDispatcher.start();
   supervisorRuntime = createSupervisorRuntime({
     outbox: dispatchOutbox,
     events: eventStore,
@@ -203,5 +207,5 @@ export function createAcpRuntime(deps: AcpRuntimeDeps): AcpRuntimeHandles {
     },
   });
   supervisorRuntime.start();
-  return { dispatcher, supervisorRuntime };
+  return { dispatcher, supervisorRuntime, replyDispatcher };
 }

@@ -235,8 +235,21 @@ export function registerSessionTools(server: McpServer, config: BridgeConfig): v
           status: z.string().optional(),
           runId: z.string().optional(),
           createdAt: z.string().optional(),
+          replyId: z.string().optional(),
+          replyStatus: z.string().optional(),
+          replyBody: z.string().optional(),
         })).optional(),
         lastEventSeq: z.number().optional(),
+        reviewLoop: z.object({
+          routeId: z.string(),
+          status: z.string(),
+          mode: z.string(),
+          completedReviewRounds: z.number(),
+          maxReviewRounds: z.number(),
+          roundNumber: z.number().optional(),
+          handoffId: z.string().optional(),
+          handoffStatus: z.string().optional(),
+        }).optional(),
       },
       _meta: {},
       annotations: { readOnlyHint: true },
@@ -305,16 +318,26 @@ export function registerSessionTools(server: McpServer, config: BridgeConfig): v
           }))
         : [];
       const agentMessages = config.agentMessages
-        ? config.agentMessages.list(sessionId).filter((m) => m.status === "open").map((m) => ({
-            messageId: m.id,
-            kind: m.kind,
-            author: m.author,
-            title: m.title,
-            body: m.body,
-            status: m.status,
-            runId: m.runId,
-            createdAt: m.createdAt,
-          }))
+        ? config.agentMessages.list(sessionId).filter((m) => m.status === "open").map((m) => {
+            // Preserve the open question while joining any accepted reply so a
+            // cold WebUI can render "Reply saved — awaiting agent" rather than
+            // making the answered question look unanswered.
+            const reply = config.agentMessages!.listPendingReplies(sessionId).find((candidate) => candidate.messageId === m.id)
+              ?? config.agentMessages!.listReplies(sessionId).find((candidate) => candidate.messageId === m.id);
+            return {
+              messageId: m.id,
+              kind: m.kind,
+              author: m.author,
+              title: m.title,
+              body: m.body,
+              status: m.status,
+              runId: m.runId,
+              createdAt: m.createdAt,
+              replyId: reply?.id,
+              replyStatus: reply?.status,
+              replyBody: reply?.body,
+            };
+          })
         : [];
 
       return {
@@ -355,6 +378,26 @@ export function registerSessionTools(server: McpServer, config: BridgeConfig): v
           // Alias makes the cursor contract explicit to clients that use the
           // event-sourced terminology from the reliability protocol.
           lastEventSeq: lastSeq,
+          reviewLoop: config.reviewRoutes
+            ? (() => {
+                const route = config.reviewRoutes!.getRouteBySession(sessionId);
+                const handoff = route && latestSubmission
+                  ? config.reviewRoutes!.getHandoffBySubmission(sessionId, latestSubmission.id, latestSubmission.reviewEpoch ?? 0)
+                  : undefined;
+                return route
+                  ? {
+                      routeId: route.id,
+                      status: route.status,
+                      mode: route.mode,
+                      completedReviewRounds: route.completedReviewRounds,
+                      maxReviewRounds: route.maxReviewRounds,
+                      roundNumber: handoff?.roundNumber,
+                      handoffId: handoff?.id,
+                      handoffStatus: handoff?.status,
+                    }
+                  : undefined;
+              })()
+            : undefined,
         },
         };
       };

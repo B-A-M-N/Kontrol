@@ -76,6 +76,9 @@ const migrations: Migration[] = [
   { version: 64, name: "mission-evidence-attempt-ordering", up: migrateMissionEvidenceAttemptOrdering },
   { version: 65, name: "mission-evidence-mission-wide-attempt-ordering", up: migrateMissionEvidenceMissionWideAttemptOrdering },
   { version: 66, name: "mission-outcome-observations", up: migrateMissionOutcomeObservations },
+  { version: 67, name: "scheduled-job-lifecycle", up: migrateScheduledJobLifecycle },
+  { version: 68, name: "agent-reply-delivery", up: migrateAgentReplyDelivery },
+  { version: 69, name: "review-handoff-routing", up: migrateReviewHandoffRouting },
 ];
 
 // v64: verification attempts need durable monotonic ordering because ISO
@@ -125,6 +128,147 @@ function migrateMissionEvidenceMissionWideAttemptOrdering(sqlite: Database.Datab
   // A unique index independently detects duplicate attempt assignment even
   // if a nontransactional writer races the select-then-insert sequence.
   sqlite.exec("create unique index if not exists mission_evidence_attempt_unique_idx on mission_evidence(mission_id, attempt) where attempt is not null");
+}
+
+// v69: submission-scoped review handoffs and explicit routing modes. Legacy
+// sessions default to isolated/manual review; no background ChatGPT injection.
+function migrateReviewHandoffRouting(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table if not exists review_routes (
+      id text primary key,
+      work_session_id text not null references work_sessions(id) on delete cascade,
+      owner_principal_id text not null,
+      owner_context_id text not null,
+      mode text not null default 'isolated_review',
+      delivery_policy text not null default 'explicit_user_action',
+      pinned_conversation_id text,
+      max_review_rounds integer not null default 3,
+      completed_review_rounds integer not null default 0,
+      status text not null default 'disabled',
+      route_epoch integer not null default 1,
+      revision integer not null default 1,
+      created_at text not null,
+      updated_at text not null
+    );
+    create index if not exists review_routes_work_session_idx
+      on review_routes(work_session_id, status);
+    create table if not exists review_handoffs (
+      id text primary key,
+      route_id text not null references review_routes(id) on delete cascade,
+      work_session_id text not null references work_sessions(id) on delete cascade,
+      submission_id text not null,
+      review_epoch integer not null,
+      snapshot_kind text not null,
+      snapshot_ref text not null,
+      diff_sha256 text not null,
+      route_epoch integer not null,
+      round_number integer not null,
+      destination_conversation_id text,
+      claimed_by_principal_id text,
+      claimed_by_owner_context_id text,
+      status text not null default 'queued',
+      revision integer not null default 1,
+      created_at text not null,
+      claimed_at text,
+      completed_at text
+    );
+    create index if not exists review_handoffs_session_submission_idx
+      on review_handoffs(work_session_id, submission_id);
+    create index if not exists review_handoffs_status_idx
+      on review_handoffs(status, created_at);
+    create unique index if not exists review_handoffs_submission_active_unique
+      on review_handoffs(submission_id, review_epoch);
+  `);
+}
+
+// v68: immutable reviewer replies and durable cold-start waiting intent. Legacy
+// resolved messages are deliberately not treated as verified deliveries.
+function migrateAgentReplyDelivery(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table if not exists agent_message_replies (
+      id text primary key,
+      message_id text not null references agent_messages(id) on delete cascade,
+      work_session_id text not null references work_sessions(id) on delete cascade,
+      reply_revision integer not null default 1,
+      body text not null,
+      body_sha256 text not null,
+      reviewer_principal_id text not null,
+      status text not null default 'pending_delivery',
+      created_at text not null,
+      acknowledged_at text,
+      acknowledged_run_id text,
+      acknowledged_attempt integer,
+      acknowledged_actor_id text
+    );
+    create unique index if not exists agent_message_replies_message_revision_unique
+      on agent_message_replies(message_id, reply_revision);
+    create index if not exists agent_message_replies_session_idx
+      on agent_message_replies(work_session_id, status);
+    create table if not exists agent_reply_waits (
+      id text primary key,
+      message_id text not null references agent_messages(id) on delete cascade,
+      work_session_id text not null references work_sessions(id) on delete cascade,
+      run_id text,
+      worker_attempt integer not null default 1,
+      expects_reply integer not null default 1,
+      resume_on_reply integer not null default 0,
+      active integer not null default 1,
+      created_at text not null,
+      updated_at text not null
+    );
+    create index if not exists agent_reply_waits_message_active_idx
+      on agent_reply_waits(message_id, active);
+    create index if not exists agent_reply_waits_session_idx
+      on agent_reply_waits(work_session_id, active);
+  `);
+}
+
+// v67: durable one-shot scheduled jobs. Each committed job has an atomic
+// outbox wakeup, an immutable instruction/policy record, and attempts bounded
+// by a CAS revision state machine.
+function migrateScheduledJobLifecycle(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table if not exists scheduled_jobs (
+      id text primary key,
+      principal_id text not null,
+      owner_context_id text not null,
+      project_id text not null,
+      workspace_root text not null,
+      run_at text not null,
+      instruction_json text not null,
+      execution_mode text not null default 'read_only_audit',
+      policy_snapshot_json text not null,
+      agent_name text,
+      status text not null default 'pending',
+      revision integer not null default 1,
+      work_session_id text,
+      max_runtime_ms integer not null,
+      client_mutation_id text,
+      request_fingerprint text not null default '{}',
+      last_error text,
+      created_at text not null,
+      updated_at text not null
+    );
+    create index if not exists scheduled_jobs_status_due_idx
+      on scheduled_jobs(status, run_at);
+    create index if not exists scheduled_jobs_owner_idx
+      on scheduled_jobs(owner_context_id, run_at);
+    create unique index if not exists scheduled_jobs_principal_mutation_unique
+      on scheduled_jobs(principal_id, client_mutation_id)
+      where client_mutation_id is not null;
+    create table if not exists scheduled_job_attempts (
+      id text primary key,
+      job_id text not null references scheduled_jobs(id) on delete cascade,
+      dispatch_id text not null,
+      started_at text not null,
+      completed_at text,
+      agent_name text,
+      acp_run_id text,
+      outcome text
+    );
+    create index if not exists scheduled_job_attempts_job_idx
+      on scheduled_job_attempts(job_id, started_at);
+  `);
 }
 
 // v66: independent outcome observations. A mission that demands

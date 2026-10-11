@@ -1095,6 +1095,8 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
             else if (uri === DEVDESKTOP_WORKSPACE_APP_URI) workspaceAppResourceMetrics.devDesktopMigration++;
           },
           recordPhaseTiming,
+          undefined,
+          undefined,
           (catalogSessionId, handshake) => {
             if (!catalogSessionId) return;
             const state = mcpSessions.get(catalogSessionId);

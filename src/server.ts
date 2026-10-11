@@ -72,6 +72,8 @@ import { type ContinuationDispatcher, type LiveWaiterRegistry } from "./acp-brid
 import { createEventStore } from "./event-log.js";
 import { createContinuationManager } from "./continuation.js";
 import { createDispatchOutbox } from "./dispatch-outbox.js";
+import { createScheduledJobStore } from "./scheduling/scheduled-job-store.js";
+import { createReviewRouteStore } from "./review-handoff/route-store.js";
 import { setDefaultAcpTimeout } from "./acp-gateway.js";
 import { createSupervisorRuns } from "./supervisor-runs.js";
 import { shutdownMissionVerifiers } from "./mission-verifier.js";
@@ -403,6 +405,8 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
   const eventStore = createEventStore(db, recordPhaseTiming);
   const continuationManager = createContinuationManager(db);
   const dispatchOutbox = createDispatchOutbox(db);
+  const scheduledJobs = createScheduledJobStore(db, dispatchOutbox);
+  const reviewRoutes = createReviewRouteStore(db);
   const supervisorRuns = createSupervisorRuns(db);
   const approvalRequests = createApprovalRequestManager(db, {
     directReattachGraceMs: config.policyDirectApprovalReattachGraceMs,
@@ -459,6 +463,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     reviewCheckpoints,
     missionLedger,
     dispatchOutbox,
+    reviewRoutes,
   });
   // Shared live-waiter registry: the singleton dispatcher and every MCP client
   // consult the SAME instance, so a parked agent suppresses duplicate dispatch
@@ -668,6 +673,9 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
         else if (uri === DEVDESKTOP_WORKSPACE_APP_URI) workspaceAppResourceMetrics.devDesktopMigration++;
       },
       recordPhaseTiming,
+      scheduledJobs,
+      reviewRoutes,
+      (uri) => { /* noop handshake */ },
     ),
     mutationReceipts,
     workspaces,
@@ -761,15 +769,17 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
 
   let dispatcher: ContinuationDispatcher | undefined;
   let supervisorRuntime: import("./supervisor-runtime.js").SupervisorRuntime | undefined;
+  let replyDispatcher: import("./bridge/reply-dispatcher.js").ReplyDispatcher | undefined;
   if (config.acpEnabled) {
     const acp = createAcpRuntime({
       config,
-      bridge: { workspaces, workSessions, reviewCheckpoints, agentRegistry, eventStore, continuationManager, dispatchOutbox, missionLedger, supervisorRuns, agentMessages, liveWaiters },
+      bridge: { workspaces, workSessions, reviewCheckpoints, agentRegistry, eventStore, continuationManager, dispatchOutbox, missionLedger, supervisorRuns, agentMessages, liveWaiters, scheduledJobs },
       reviewWorkflow,
       recordPhaseTiming,
     });
     dispatcher = acp.dispatcher;
     supervisorRuntime = acp.supervisorRuntime;
+    replyDispatcher = acp.replyDispatcher;
   }
 
   const shutdown = createShutdownController({
@@ -787,6 +797,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     reviewCheckpoints,
     dispatcher,
     supervisorRuntime,
+    replyDispatcher,
     supervisorRuns,
     mcpSessionChurnTimer,
     shuttingDown: { get value() { return shuttingDown; }, set value(v: boolean) { shuttingDown = v; } },

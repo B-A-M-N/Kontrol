@@ -14,6 +14,9 @@ import { registerMissionTools } from "./mission-tools.js";
 import { registerSupervisorTools } from "./supervisor-tools.js";
 import { registerDelegationTools } from "./delegation-tools.js";
 import { registerMessageTools } from "./message-tools.js";
+import { registerScheduleTools } from "./schedule-tools.js";
+import { registerReplyTools } from "./reply-tools.js";
+import { registerHandoffTools } from "./handoff-tools.js";
 import { registerAgentTools } from "./agent-tools.js";
 
 export function registerBridgeTools(server: McpServer, config: BridgeConfig): void {
@@ -25,6 +28,9 @@ export function registerBridgeTools(server: McpServer, config: BridgeConfig): vo
   registerSupervisorTools(server, config);
   registerDelegationTools(server, config);
   registerMessageTools(server, config);
+  registerScheduleTools(server, config);
+  registerReplyTools(server, config);
+  registerHandoffTools(server, config);
   registerAgentTools(server, config);
 }
 

@@ -100,6 +100,8 @@ export function createMcpServer(
   mutationReceipts?: MutationReceiptStore,
   onWorkspaceAppResource?: (uri: string) => void,
   onPhaseTiming?: (phase: string, durationMs: number) => void,
+  scheduledJobs?: import("../scheduling/scheduled-job-store.js").ScheduledJobStore,
+  reviewRoutes?: import("../review-handoff/route-store.js").ReviewRouteStore,
   onToolCatalogHandshake?: (sessionId: string | undefined, result: {
     status: "accepted" | "rejected";
     serverCatalogSha256?: string;
@@ -109,6 +111,7 @@ export function createMcpServer(
     reason?: string;
   }) => void,
 ): McpServer {
+  // note: parameters remain in declared order; scheduledJobs precedes reviewRoutes.
   const serverConstructionStartedAt = performance.now();
   const mcpToolSurface = readMcpToolSurface();
   const server = new McpServer(
@@ -223,6 +226,8 @@ export function createMcpServer(
       connectionWorkspaceLeaseNonce: connectionContext?.workspaceLeaseNonce,
       liveWaiters,
       onPhaseTiming,
+      scheduledJobs,
+      reviewRoutes,
     };
     registerBridgeTools(server, bridgeConfig);
   }

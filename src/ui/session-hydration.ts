@@ -430,7 +430,8 @@ export async function hydrateWorkSessionSnapshot(view: WorkSessionViewState): Pr
         createdAt?: string;
         expiresAt?: string;
       }>;
-      agentMessages?: Array<{ messageId: string; kind: string; author?: string; title?: string; body?: string; status?: string; runId?: string; createdAt?: string }>;
+      agentMessages?: Array<{ messageId: string; kind: string; author?: string; title?: string; body?: string; status?: string; runId?: string; createdAt?: string; replyId?: string; replyStatus?: string; replyBody?: string }>;
+      reviewLoop?: { routeId?: string; status?: string; mode?: string; completedReviewRounds?: number; maxReviewRounds?: number; roundNumber?: number; handoffId?: string; handoffStatus?: string };
     }>(snapResult);
     if (!snap) return;
 
@@ -490,9 +491,16 @@ export async function hydrateWorkSessionSnapshot(view: WorkSessionViewState): Pr
         status: message.status ?? "open",
         runId: message.runId,
         createdAt: message.createdAt,
+        replyId: message.replyId,
+        replyStatus: message.replyStatus,
+        replyBody: message.replyBody,
       });
     }
     view.unresolvedMessageCount = view.openMessages.size;
+    // Review-loop state is part of the snapshot contract when available.
+    if (snap.reviewLoop) {
+      view.reviewLoop = snap.reviewLoop;
+    }
     for (const messageId of previousOpenMessageIds) {
       if (!view.openMessages.has(messageId)) host.messageMutationOutcomeUnknown.delete(messageId);
     }

@@ -127,10 +127,8 @@ export async function runContinuationTick(
       // A live agent is already parked on await_review_feedback for this session:
       // the feedback event will wake it directly. Do NOT spawn a second worker.
       if (liveWaiters.has(cont.sessionId)) {
-        outboxEvent
-          ? config.dispatchOutbox?.release(outboxEvent.id, DEFAULT_CLAIM_LEASE_MS, "live waiter attached")
-          : undefined;
-        return "deferred";
+        if (outboxEvent) config.dispatchOutbox?.markCompleted(outboxEvent.id);
+        return "completed";
       }
 
       const session = config.workSessions.get(cont.sessionId);
@@ -292,10 +290,17 @@ export async function runContinuationTick(
       }
 
       for (;;) {
-        const event = config.dispatchOutbox.claimNext(dispatcherId, DEFAULT_CLAIM_LEASE_MS);
+        // Claim only events owned by this dispatcher. The outbox is shared
+        // with supervisor/scheduled consumers, so an unfiltered claim would
+        // steal foreign events and this guard would otherwise acknowledge
+        // them without letting their designated owner process them.
+        const event = config.dispatchOutbox.claimNext(dispatcherId, DEFAULT_CLAIM_LEASE_MS, ["continuation.ready"]);
         if (!event) break;
         if (event.eventType !== "continuation.ready") {
-          config.dispatchOutbox.markCompleted(event.id);
+          // Defensive invariant: filtered claimNext() must never yield a
+          // foreign event. Preserve it for investigation rather than
+          // acknowledging a routing violation.
+          config.dispatchOutbox.markFailed(event.id, `Dispatch routing violation: ${event.eventType}`, 60_000);
           continue;
         }
         const cont = config.continuationManager.get(event.aggregateId);
@@ -303,7 +308,8 @@ export async function runContinuationTick(
           config.dispatchOutbox.markCompleted(event.id);
           continue;
         }
-        await dispatchContinuation(cont, event);
+        const result = await dispatchContinuation(cont, event);
+        if (result === "completed") config.dispatchOutbox.markCompleted(event.id);
       }
       return;
     }

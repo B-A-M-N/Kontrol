@@ -111,6 +111,9 @@ export interface AgentMessageView {
   status: string;
   runId?: string;
   createdAt?: string;
+  replyId?: string;
+  replyStatus?: string;
+  replyBody?: string;
 }
 
 export interface MissionPacketView {
@@ -126,6 +129,18 @@ export interface MissionPacketView {
 }
 
 export type FeedbackState = "idle" | "submitting" | "submitted" | "error" | "outcome_unknown";
+
+export interface ReviewLoopViewState {
+  routeId?: string;
+  status?: string;
+  mode?: string;
+  completedReviewRounds?: number;
+  maxReviewRounds?: number;
+  roundNumber?: number;
+  revision?: number;
+  handoffId?: string;
+  handoffStatus?: string;
+}
 
 export interface WorkSessionViewState {
   workspaceSessionId: string;
@@ -159,6 +174,7 @@ export interface WorkSessionViewState {
     message: string;
     action?: { label: string; run: () => void };
   };
+  reviewLoop?: ReviewLoopViewState;
   mission?: MissionPacketView;
   missionLoading?: boolean;
   missionError?: string;

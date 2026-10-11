@@ -65,6 +65,10 @@ export interface SubmitForReviewResult {
   runId?: string;
   /** P1 (audit): structured mutations this submission's diff cannot represent. */
   coverage?: CheckpointCoverage;
+  handoffId?: string;
+  handoffStatus?: string;
+  roundNumber?: number;
+  routeLimitReached?: boolean;
 }
 
 export interface ProvideFeedbackInput {
@@ -123,6 +127,7 @@ export interface ReviewWorkflowDeps {
   missionLedger?: MissionLedger;
   /** Optional durable dispatch outbox for continuation redrive. */
   dispatchOutbox?: DispatchOutbox;
+  reviewRoutes?: import("./review-handoff/route-store.js").ReviewRouteStore;
 }
 
 /**
@@ -175,6 +180,7 @@ export function createReviewWorkflowService(
   deps: ReviewWorkflowDeps,
 ): ReviewWorkflowService {
   const { workSessions, eventStore, continuationManager, agentRegistry, db, workspaces, reviewCheckpoints, missionLedger, dispatchOutbox } = deps;
+  const reviewRoutes = deps.reviewRoutes;
 
   async function submitForReview(input: SubmitForReviewInput): Promise<SubmitForReviewResult> {
     const session = workSessions.get(input.workSessionId);
@@ -263,7 +269,54 @@ export function createReviewWorkflowService(
         },
       });
 
-      return { submission, runId: correlatedRun?.runId };
+      let handoff: import("./review-handoff/route-store.js").ReviewHandoff | undefined;
+      let routeLimitReached = false;
+      if (reviewRoutes) {
+        try {
+          const route = reviewRoutes.getRouteBySession(input.workSessionId);
+          if (route?.status === "active") {
+            handoff = reviewRoutes.createHandoff({
+              routeId: route.id,
+              workSessionId: input.workSessionId,
+              submissionId: submission.id,
+              reviewEpoch: submission.reviewEpoch,
+              snapshotKind: input.snapshotKind ?? "git",
+              snapshotRef: input.snapshotRef ?? input.snapshotCommit ?? "",
+              diffSha256: input.diffSha256 ?? "",
+              roundNumber: route.completedReviewRounds + 1,
+            });
+          } else if (route && route.completedReviewRounds >= route.maxReviewRounds) {
+            routeLimitReached = true;
+          }
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          if (!message.includes("Review round limit reached.")) throw error;
+          routeLimitReached = true;
+        }
+      }
+      if (handoff) {
+        appendWorkflowEvent({
+          type: "review.handoff.created",
+          sessionId: input.workSessionId,
+          payload: {
+            handoffId: handoff.id,
+            submissionId: handoff.submissionId,
+            reviewEpoch: handoff.reviewEpoch,
+            roundNumber: handoff.roundNumber,
+            status: handoff.status,
+            routeId: handoff.routeId,
+            routeEpoch: handoff.routeEpoch,
+          },
+        });
+      }
+      if (routeLimitReached) {
+        appendWorkflowEvent({
+          type: "review.loop.limit_reached",
+          sessionId: input.workSessionId,
+          payload: { submissionId: submission.id, reviewEpoch: submission.reviewEpoch },
+        });
+      }
+      return { submission, runId: correlatedRun?.runId, handoff, routeLimitReached };
     })();
     eventStore.publishEvents(publishQueue);
 
@@ -275,6 +328,10 @@ export function createReviewWorkflowService(
       status: "awaiting_review",
       runId: result.runId,
       coverage,
+      handoffId: result.handoff?.id,
+      handoffStatus: result.handoff?.status,
+      roundNumber: result.handoff?.roundNumber,
+      routeLimitReached: result.routeLimitReached,
     };
   }
 

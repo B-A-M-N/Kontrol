@@ -26,6 +26,8 @@ export function registerMessageTools(server: McpServer, config: BridgeConfig): v
         title: z.string().optional().describe("Short headline."),
         body: z.string().optional().describe("Message text / question / description."),
         data: z.record(z.string(), z.unknown()).optional().describe("Structured payload: artifact ref, finding evidence, or answer options."),
+        expectsReply: z.boolean().optional().describe("Set true when this gating message requires an explicit reviewer reply."),
+        resumeOnReply: z.boolean().optional().describe("Set true only when the worker is explicitly blocked waiting and should be resumed on reply delivery."),
         clientMutationId: z.string().min(1).max(200).optional(),
       },
       outputSchema: { messageId: z.string(), status: z.string(), kind: z.string() },
@@ -33,7 +35,7 @@ export function registerMessageTools(server: McpServer, config: BridgeConfig): v
       annotations: { readOnlyHint: false },
     },
     config,
-    async ({ sessionId, kind, title, body, data }) => {
+    async ({ sessionId, kind, title, body, data, expectsReply, resumeOnReply }) => {
       if (!isWorkerOrClient(config.principalRole)) {
         return forbidden(config.principalRole, "post_agent_message");
       }
@@ -54,8 +56,18 @@ export function registerMessageTools(server: McpServer, config: BridgeConfig): v
           author: config.principalRole === "worker" ? "worker" : "agent",
           title,
           body,
-          data,
+          data: { ...data, expectsReply: expectsReply === true, resumeOnReply: resumeOnReply === true },
         });
+        if (expectsReply === true) {
+          config.agentMessages!.waitForReply({
+            messageId: message.id,
+            workSessionId: sessionId,
+            runId: run?.runId,
+            attempt: run?.attemptNumber ?? 1,
+            expectsReply: true,
+            resumeOnReply: resumeOnReply === true,
+          });
+        }
         // The event is inserted in the same SQLite transaction as the message;
         // publish only after commit so a live WebUI can never observe a
         // projection event whose durable message row rolled back.
@@ -68,6 +80,8 @@ export function registerMessageTools(server: McpServer, config: BridgeConfig): v
             title: message.title,
             body: message.body,
             status: message.status,
+            expectsReply: message.data.expectsReply === true,
+            resumeOnReply: message.data.resumeOnReply === true,
             runId: run?.runId,
           },
         }, { publish: false });
@@ -162,16 +176,51 @@ export function registerMessageTools(server: McpServer, config: BridgeConfig): v
         return { content: [{ type: "text" as const, text: "Message not found for this session." }], isError: true };
       }
       const commit = () => {
+        // Compatibility behavior: a nonempty reply is now a durable pending
+        // delivery, not a proof of worker consumption. Empty reply keeps the
+        // old explicit resolution semantics.
+        if (reply && reply.trim()) {
+          const accepted = config.agentMessages!.acceptReply({
+            messageId,
+            workSessionId: sessionId,
+            body: reply,
+            reviewerPrincipalId: config.principalId ?? `role:${config.principalRole ?? "reviewer"}`,
+          });
+          const event = config.eventStore.appendEvent({
+            type: "agent.message.reply_accepted",
+            sessionId,
+            payload: {
+              messageId,
+              replyId: accepted.id,
+              replyRevision: accepted.replyRevision,
+              status: accepted.status,
+              replyToKind: existing.kind,
+            },
+          }, { publish: false });
+          config.dispatchOutbox?.enqueue({
+            eventType: "agent.reply.ready",
+            aggregateId: accepted.id,
+            aggregateRevision: accepted.replyRevision,
+            payload: { replyId: accepted.id, messageId, workSessionId: sessionId },
+          });
+          return { accepted, event };
+        }
         const resolved = config.agentMessages!.resolve(messageId);
         const event = config.eventStore.appendEvent({
           type: "agent.message.resolved",
           sessionId,
-          payload: { messageId, reply, replyToKind: existing.kind },
+          payload: { messageId, replyToKind: existing.kind },
         }, { publish: false });
         return { resolved, event };
       };
       const committed = config.db ? config.db.sqlite.transaction(commit)() : commit();
       config.eventStore.publishEvents([committed.event]);
+      if ("accepted" in committed && committed.accepted) {
+        return {
+          content: [{ type: "text" as const, text: `Reply ${committed.accepted.id} saved; awaiting agent acknowledgement.` }],
+          structuredContent: { messageId, replyId: committed.accepted.id, status: committed.accepted.status },
+        };
+      }
       const resolved = committed.resolved;
       return {
         content: [{ type: "text" as const, text: `Resolved ${messageId}.` }],

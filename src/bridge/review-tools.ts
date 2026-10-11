@@ -389,6 +389,23 @@ export function registerReviewTools(server: McpServer, config: BridgeConfig): vo
         // Snapshot drift validation is performed centrally inside
         // reviewWorkflow.provideFeedback() (scoped to approval), so BOTH the
         // MCP and ACP transports enforce identical checks (P0 #5 / P1 #1).
+        // Review routing invariant: a governed handoff must be bound to this
+        // exact reviewer context and submission before ordinary feedback can
+        // reach the authoritative workflow.
+        if (config.reviewRoutes) {
+          const route = config.reviewRoutes.getRouteBySession(sessionId);
+          if (route?.status === "active") {
+            const submission = config.workSessions.getSubmissions(sessionId)
+              .find((candidate: { id?: string }) => candidate.id === targetSubmissionId);
+            const handoff = submission && config.reviewRoutes.getHandoffBySubmission(sessionId, submission.id, submission.reviewEpoch);
+            if (!handoff || handoff.status !== "claimed" || handoff.claimedByOwnerContextId !== (liveOwnerContextId(config) ?? config.principalId)) {
+              return {
+                content: [{ type: "text" as const, text: "Review routing conflict: this reviewer context has not claimed the current handoff." }],
+                isError: true,
+              };
+            }
+          }
+        }
         const result = await config.reviewWorkflow.provideFeedback({
           sessionId,
           submissionId: targetSubmissionId,

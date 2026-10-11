@@ -239,12 +239,33 @@ export function reduceWorkSessionEvent(sessionId: string, event: AgentActivityEv
       });
       view.unresolvedMessageCount = view.openMessages.size;
     }
-  } else if (event.type === "agent.message.resolved") {
+  } else if (event.type === "review.route.configured") {
+    view.reviewLoop = {
+      routeId: String(event.payload?.routeId ?? ""),
+      status: String(event.payload?.status ?? ""),
+      mode: String(event.payload?.mode ?? ""),
+      maxReviewRounds: Number(event.payload?.maxReviewRounds ?? 0),
+      completedReviewRounds: Number(event.payload?.completedReviewRounds ?? 0),
+      revision: Number(event.payload?.revision ?? 0),
+    };
+  } else if (event.type === "review.handoff.created") {
+    view.reviewLoop = {
+      ...view.reviewLoop,
+      handoffId: String(event.payload?.handoffId ?? ""),
+      handoffStatus: String(event.payload?.status ?? ""),
+      roundNumber: Number(event.payload?.roundNumber ?? 0),
+    };
+  } else if (event.type === "review.loop.limit_reached") {
+    view.notice = { tone: "warning", message: "Review round limit reached. Human review is required before further automatic rounds." };
+  } else if (event.type === "agent.message.resolved" || event.type === "agent.message.reply_accepted") {
     const messageId = String(event.payload?.messageId ?? "");
     if (messageId) {
       view.openMessages.delete(messageId);
       host.messageMutationOutcomeUnknown.delete(messageId);
       view.unresolvedMessageCount = view.openMessages.size;
+      if (event.type === "agent.message.reply_accepted") {
+        view.notice = { tone: "info", message: "Reply saved — awaiting agent acknowledgement." };
+      }
     }
   } else if (event.type === "session.handoff") {
     // Run identity and durable state are unchanged; only the agent handling the

@@ -73,6 +73,7 @@ let httpServer: Server | undefined;
 let acpHttp: import("node:http").Server | undefined;
 let agentUrl = "";
 let resumeCalls = 0;
+let receivedRunsBeforeForeign = -1;
 const receivedRuns: Array<Record<string, any>> = [];
 let reviewPatch = "diff --git a/x.txt b/x.txt\n--- a/x.txt\n+++ b/x.txt\n@@ -1 +1 @@\n-old\n+new\n";
 // Mutable workspace snapshot so a "changed workspace" (drift) can be simulated.
@@ -1429,6 +1430,45 @@ try {
     assert.equal(resumed.isError, undefined);
     assert.equal(supervisorRuns.getByWorkSession(sessionId)?.status, "correction_pending");
     assert.equal(supervisorWakeCalls, before + 1, "resuming correction_pending wakes the durable supervisor runtime");
+  }
+
+  // ── Outbox ownership: continuation dispatcher must not acknowledge foreign events ──
+  {
+    const foreignId = dispatchOutbox.enqueue({
+      eventType: "supervisor.verification.requested",
+      aggregateId: "run-foreign",
+      aggregateRevision: 7,
+      payload: { workSessionId: "ws-foreign" },
+    }).id;
+    const foreignScheduledId = dispatchOutbox.enqueue({
+      eventType: "scheduled_job.due",
+      aggregateId: "job-foreign",
+      aggregateRevision: 1,
+      payload: { scheduledJobId: "job-foreign" },
+    }).id;
+    const sessionId = createSession();
+    await callWorker("submit_for_review", { sessionId });
+    const ownedOriginalRun = agentRegistry.createRun({
+      agentName: "cli-coding-agent",
+      workspaceSessionId: WS,
+      workSessionId: sessionId,
+      inputPreview: "owned continuation provenance",
+      status: "running",
+    });
+    await callReviewer("provide_review_feedback", { sessionId, verdict: "changes_requested", comments: "owned event regression" });
+    const ownedContinuation = continuationManager.listForSession(sessionId).at(-1)!;
+    const owned = dispatchOutbox.listByAggregate(ownedContinuation.id)
+      .find((event) => event.eventType === "continuation.ready" && event.aggregateRevision === ownedContinuation.reviewEpoch);
+    assert.ok(owned, "owned continuation event exists in the same outbox");
+    // Foreign events must remain pending after any dispatcher pass. The
+    // continuation's own dispatch outcome is covered by prior scenarios; this
+    // test pins the ownership boundary.
+    await runContinuationTick({ ...config, resumeAgent: undefined });
+    const foreign = dispatchOutbox.get(foreignId)!;
+    const scheduled = dispatchOutbox.get(foreignScheduledId)!;
+    assert.equal(foreign.status, "pending", "supervisor event remains owned by its consumer");
+    assert.equal(scheduled.status, "pending", "scheduled event remains owned by its consumer");
+    void owned;
   }
 
   console.log("bridge-flow.test.ts: all assertions passed");

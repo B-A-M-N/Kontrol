@@ -91,6 +91,10 @@ export interface BridgeConfig {
   beforeContinuationDispatch?: (continuation: Continuation, sessionId: string) => Promise<void>;
   /** Rolling server diagnostics for expensive bridge phases. */
   onPhaseTiming?: (phase: string, durationMs: number) => void;
+  /** Durable one-shot scheduled-job store, shared with the server runtime. */
+  scheduledJobs?: import("../scheduling/scheduled-job-store.js").ScheduledJobStore;
+  /** Durable review-route/handoff store, shared with review workflow. */
+  reviewRoutes?: import("../review-handoff/route-store.js").ReviewRouteStore;
 }
 
 

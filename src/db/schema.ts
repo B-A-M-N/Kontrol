@@ -11,6 +11,55 @@ import { sql } from "drizzle-orm";
 /** Durable per-fragment adapter receipts. The payload is nulled only after a
  * coalesced event-log row commits; event_id and event_log_id remain as an
  * idempotency tombstone/mapping. */
+/** Durable one-shot scheduled-job lifecycle. SQLite is authoritative and this
+ * row is only created atomically with its recoverable outbox wakeup. */
+export const scheduledJobs = sqliteTable("scheduled_jobs", {
+  id: text("id").primaryKey(),
+  principalId: text("principal_id").notNull(),
+  ownerContextId: text("owner_context_id").notNull(),
+  projectId: text("project_id").notNull(),
+  workspaceRoot: text("workspace_root").notNull(),
+  runAt: text("run_at").notNull(),
+  instructionJson: text("instruction_json").notNull(),
+  executionMode: text("execution_mode").notNull().default("read_only_audit"),
+  policySnapshotJson: text("policy_snapshot_json").notNull(),
+  agentName: text("agent_name"),
+  status: text("status").notNull().default("pending"),
+  revision: integer("revision").notNull().default(1),
+  workSessionId: text("work_session_id"),
+  maxRuntimeMs: integer("max_runtime_ms").notNull(),
+  /** Durable retry receipt key; null for tools that omit retry protection. */
+  clientMutationId: text("client_mutation_id"),
+  requestFingerprint: text("request_fingerprint").notNull().default("{}"),
+  lastError: text("last_error"),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+}, (table) => [
+  index("scheduled_jobs_status_due_idx").on(table.status, table.runAt),
+  index("scheduled_jobs_owner_idx").on(table.ownerContextId, table.runAt),
+  uniqueIndex("scheduled_jobs_principal_mutation_unique").on(table.principalId, table.clientMutationId).where(sql`${table.clientMutationId} is not null`),
+]);
+
+export type ScheduledJobRow = typeof scheduledJobs.$inferSelect;
+export type NewScheduledJobRow = typeof scheduledJobs.$inferInsert;
+
+/** Bounded per-attempt dispatch/execution correlation. */
+export const scheduledJobAttempts = sqliteTable("scheduled_job_attempts", {
+  id: text("id").primaryKey(),
+  jobId: text("job_id").notNull().references(() => scheduledJobs.id, { onDelete: "cascade" }),
+  dispatchId: text("dispatch_id").notNull(),
+  startedAt: text("started_at").notNull(),
+  completedAt: text("completed_at"),
+  agentName: text("agent_name"),
+  acpRunId: text("acp_run_id"),
+  outcome: text("outcome"),
+}, (table) => [
+  index("scheduled_job_attempts_job_idx").on(table.jobId, table.startedAt),
+]);
+
+export type ScheduledJobAttemptRow = typeof scheduledJobAttempts.$inferSelect;
+export type NewScheduledJobAttemptRow = typeof scheduledJobAttempts.$inferInsert;
+
 export const telemetryIngress = sqliteTable("telemetry_ingress", {
   sequence: integer("sequence").primaryKey({ autoIncrement: true }),
   eventId: text("event_id").notNull().unique(),
@@ -677,3 +726,98 @@ export const agentMessages = sqliteTable("agent_messages", {
 
 export type AgentMessageRow = typeof agentMessages.$inferSelect;
 export type NewAgentMessageRow = typeof agentMessages.$inferInsert;
+
+/** Immutable reviewer answer with its own durable delivery/acknowledgement state. */
+export const agentMessageReplies = sqliteTable("agent_message_replies", {
+  id: text("id").primaryKey(),
+  messageId: text("message_id").notNull().references(() => agentMessages.id, { onDelete: "cascade" }),
+  workSessionId: text("work_session_id").notNull().references(() => workSessions.id, { onDelete: "cascade" }),
+  replyRevision: integer("reply_revision").notNull().default(1),
+  body: text("body").notNull(),
+  bodySha256: text("body_sha256").notNull(),
+  reviewerPrincipalId: text("reviewer_principal_id").notNull(),
+  status: text("status").notNull().default("pending_delivery"),
+  createdAt: text("created_at").notNull(),
+  acknowledgedAt: text("acknowledged_at"),
+  acknowledgedRunId: text("acknowledged_run_id"),
+  acknowledgedAttempt: integer("acknowledged_attempt"),
+  acknowledgedActorId: text("acknowledged_actor_id"),
+}, (table) => [
+  uniqueIndex("agent_message_replies_message_revision_unique").on(table.messageId, table.replyRevision),
+  index("agent_message_replies_session_idx").on(table.workSessionId, table.status),
+]);
+
+/** Durable worker waiting intent for a clarification reply (cold-start resumption). */
+export const agentReplyWaits = sqliteTable("agent_reply_waits", {
+  id: text("id").primaryKey(),
+  messageId: text("message_id").notNull().references(() => agentMessages.id, { onDelete: "cascade" }),
+  workSessionId: text("work_session_id").notNull().references(() => workSessions.id, { onDelete: "cascade" }),
+  runId: text("run_id"),
+  workerAttempt: integer("worker_attempt").notNull().default(1),
+  expectsReply: integer("expects_reply", { mode: "boolean" }).notNull().default(true),
+  resumeOnReply: integer("resume_on_reply", { mode: "boolean" }).notNull().default(false),
+  active: integer("active", { mode: "boolean" }).notNull().default(true),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+}, (table) => [
+  index("agent_reply_waits_message_active_idx").on(table.messageId, table.active),
+  index("agent_reply_waits_session_idx").on(table.workSessionId, table.active),
+]);
+
+export type AgentMessageReplyRow = typeof agentMessageReplies.$inferSelect;
+export type NewAgentMessageReplyRow = typeof agentMessageReplies.$inferInsert;
+export type AgentReplyWaitRow = typeof agentReplyWaits.$inferSelect;
+export type NewAgentReplyWaitRow = typeof agentReplyWaits.$inferInsert;
+
+/** Durable review routing for a work session. Conversation IDs are correlation
+ * only; authorization remains principal/session based. */
+export const reviewRoutes = sqliteTable("review_routes", {
+  id: text("id").primaryKey(),
+  workSessionId: text("work_session_id").notNull().references(() => workSessions.id, { onDelete: "cascade" }),
+  ownerPrincipalId: text("owner_principal_id").notNull(),
+  ownerContextId: text("owner_context_id").notNull(),
+  mode: text("mode").notNull().default("isolated_review"),
+  deliveryPolicy: text("delivery_policy").notNull().default("explicit_user_action"),
+  pinnedConversationId: text("pinned_conversation_id"),
+  maxReviewRounds: integer("max_review_rounds").notNull().default(3),
+  completedReviewRounds: integer("completed_review_rounds").notNull().default(0),
+  status: text("status").notNull().default("disabled"),
+  routeEpoch: integer("route_epoch").notNull().default(1),
+  revision: integer("revision").notNull().default(1),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+}, (table) => [
+  index("review_routes_work_session_idx").on(table.workSessionId, table.status),
+]);
+
+export type ReviewRouteRow = typeof reviewRoutes.$inferSelect;
+export type NewReviewRouteRow = typeof reviewRoutes.$inferInsert;
+
+/** One submission-scoped review handoff. */
+export const reviewHandoffs = sqliteTable("review_handoffs", {
+  id: text("id").primaryKey(),
+  routeId: text("route_id").notNull().references(() => reviewRoutes.id, { onDelete: "cascade" }),
+  workSessionId: text("work_session_id").notNull().references(() => workSessions.id, { onDelete: "cascade" }),
+  submissionId: text("submission_id").notNull(),
+  reviewEpoch: integer("review_epoch").notNull(),
+  snapshotKind: text("snapshot_kind").notNull(),
+  snapshotRef: text("snapshot_ref").notNull(),
+  diffSha256: text("diff_sha256").notNull(),
+  routeEpoch: integer("route_epoch").notNull(),
+  roundNumber: integer("round_number").notNull(),
+  destinationConversationId: text("destination_conversation_id"),
+  claimedByPrincipalId: text("claimed_by_principal_id"),
+  claimedByOwnerContextId: text("claimed_by_owner_context_id"),
+  status: text("status").notNull().default("queued"),
+  revision: integer("revision").notNull().default(1),
+  createdAt: text("created_at").notNull(),
+  claimedAt: text("claimed_at"),
+  completedAt: text("completed_at"),
+}, (table) => [
+  index("review_handoffs_session_submission_idx").on(table.workSessionId, table.submissionId),
+  index("review_handoffs_status_idx").on(table.status, table.createdAt),
+  uniqueIndex("review_handoffs_submission_active_unique").on(table.submissionId, table.reviewEpoch),
+]);
+
+export type ReviewHandoffRow = typeof reviewHandoffs.$inferSelect;
+export type NewReviewHandoffRow = typeof reviewHandoffs.$inferInsert;

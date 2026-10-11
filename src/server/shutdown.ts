@@ -28,6 +28,7 @@ export interface ShutdownDeps {
   readonly reviewCheckpoints: { drain(): Promise<unknown> };
   readonly dispatcher: { stop(): void } | undefined;
   readonly supervisorRuntime: { stop(): void } | undefined;
+  readonly replyDispatcher: { stop(): void } | undefined;
   readonly supervisorRuns: { close(): void };
   readonly mcpSessionChurnTimer: ReturnType<typeof setInterval>;
   readonly shuttingDown: { value: boolean };
@@ -105,6 +106,7 @@ export function createShutdownController(deps: ShutdownDeps): Pick<RunningServer
       // kill is covered by the durable transaction journal on next startup.
       await phase("review-checkpoints", () => deps.reviewCheckpoints.drain());
       await phase("dispatcher", () => deps.dispatcher?.stop());
+      await phase("reply-dispatcher", () => deps.replyDispatcher?.stop());
       await phase("supervisor-runtime", () => deps.supervisorRuntime?.stop());
       await phase("supervisor-runs", () => deps.supervisorRuns.close());
       await phase("mcp-admission", () => mcpAdmission.close());

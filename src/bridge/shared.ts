@@ -250,6 +250,15 @@ export function usesExternalReviewBarrier(agent?: Pick<AgentInfo, "capabilities"
   return agent?.capabilities.includes("native-acp") === true;
 }
 
+/**
+ * Ordinary reply delivery remains an MCP-worker contract in this phase. Native
+ * ACP adapters must explicitly advertise structured needs_input support before
+ * they receive cold-reply resume instructions; otherwise fail closed.
+ */
+export function supportsMcpReplyProtocol(agent?: Pick<AgentInfo, "capabilities">): boolean {
+  return !usesExternalReviewBarrier(agent);
+}
+
 export function workSessionInstructions(workSessionId: string, agent?: Pick<AgentInfo, "capabilities">): string {
   if (usesExternalReviewBarrier(agent)) {
     return `[Kontrol work session ${workSessionId}] This is a native ACP turn. Complete the bounded work order, run the requested checks, and return a concise summary. Kontrol will capture the review submission and enforce the review barrier after your turn returns. Do not wait for or search for submit_for_review, await_review_feedback, or start_work_session tools.`;

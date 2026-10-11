@@ -509,7 +509,7 @@ export function renderSessionNotice(container: HTMLElement, view: WorkSessionVie
 
 export function renderOpenMessages(container: HTMLElement, view: WorkSessionViewState): void {
   const stateKey = [...view.openMessages.values()]
-    .map((message) => `${message.messageId}:${message.status}:${message.title ?? ""}:${message.body ?? ""}:${host.messageMutationOutcomeUnknown.has(message.messageId) ? "unknown" : "ready"}`)
+    .map((message) => `${message.messageId}:${message.status}:${message.title ?? ""}:${message.body ?? ""}:${message.replyStatus ?? "none"}:${host.messageMutationOutcomeUnknown.has(message.messageId) ? "unknown" : "ready"}`)
     .join("|");
   if (container.dataset.stateKey === stateKey) return;
   container.replaceChildren();
@@ -524,6 +524,19 @@ export function renderOpenMessages(container: HTMLElement, view: WorkSessionView
       element("div", { className: "message-body", text: message.body ?? "No details provided." }),
       element("div", { className: "message-meta", text: `${message.author ?? "agent"}${message.runId ? ` · ${message.runId}` : ""}${message.createdAt ? ` · ${new Date(message.createdAt).toLocaleString()}` : ""}` }),
     );
+    if (message.replyId) {
+      const replyStatusText = message.replyStatus === "acknowledged"
+        ? "Agent received reply"
+        : message.replyStatus === "blocked"
+          ? "Cannot deliver automatically"
+          : "Reply saved — awaiting agent acknowledgement";
+      card.append(element("div", { className: "message-reply-status", text: replyStatusText }));
+      if (message.replyBody) {
+        card.append(element("div", { className: "message-reply-body", text: message.replyBody }));
+      }
+      container.append(card);
+      continue;
+    }
     const reply = document.createElement("textarea");
     reply.className = "message-reply";
     reply.id = stableDomId(`message-reply-${message.messageId}`);
@@ -547,7 +560,8 @@ export function renderOpenMessages(container: HTMLElement, view: WorkSessionView
       }).then(() => {
         view.openMessages.delete(message.messageId);
         view.unresolvedMessageCount = view.openMessages.size;
-        view.notice = { tone: "success", message: "Reply sent to the agent." };
+        // Persistence is proven; worker acknowledgement is a separate state.
+        view.notice = { tone: "info", message: "Reply saved — awaiting agent acknowledgement." };
         host.scheduleRender();
       }).catch((error) => {
         if (error instanceof AmbiguousMutationError) {
