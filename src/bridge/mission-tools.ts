@@ -10,6 +10,7 @@ import type { BridgeConfig } from "./context.js";
 import { selectHealthyAgent } from "../acp-gateway.js";
 import { verifyMissionSubmission } from "../mission-verifier.js";
 import { registerMutationAppTool } from "./app-tool.js";
+import { missionVerificationOptionsFromConfig } from "./verification-options.js";
 import { criterionUpdateSchema, dispatchAgentTask, findingSchema, findingUpdateSchema, supervisedMissionOptionsSchema, supervisorPacket, workOrderSchema } from "./context.js";
 import { acquireCheckoutModifyLease, captureMissionBaseline, forbidden, isReviewer, liveOwnerContextId, requireWorkSessionMutation, requireWorkSessionRead, renderMissionPrompt, workspaceAppModelAndAppMeta } from "./shared.js";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
@@ -225,12 +226,7 @@ export function registerMissionTools(server: McpServer, config: BridgeConfig): v
       if (!config.missionLedger) return { content: [{ type: "text" as const, text: "Mission ledger unavailable." }], isError: true };
       let results;
       const currentSubmission = config.workSessions.get(workSessionId)?.latestSubmission;
-      const verificationOptions = config.serverConfig ? {
-        sandbox: config.serverConfig.verifySandbox,
-        childEnvironmentAllowlist: config.serverConfig.childEnvironmentAllowlist,
-        verifyToolchainPaths: config.serverConfig.verifyToolchainPaths,
-        sandboxExecutablePath: config.serverConfig.verifySandboxExecutable,
-      } : {};
+      const verificationOptions = config.serverConfig ? missionVerificationOptionsFromConfig(config.serverConfig) : {};
       try { results = await verifyMissionSubmission({ workSessionId, missionLedger: config.missionLedger, workSessions: config.workSessions, workspaces: config.workspaces, reviewCheckpoints: config.reviewCheckpoints, criterionIds, verificationScope, verificationPhase, submissionId: currentSubmission?.id, reviewEpoch: currentSubmission?.reviewEpoch, ...verificationOptions }); }
       catch (error) { return { content: [{ type: "text" as const, text: error instanceof Error ? error.message : String(error) }], isError: true }; }
       return { content: [{ type: "text" as const, text: `Recorded ${results.length} verification result(s).` }], structuredContent: { results, packet: await supervisorPacket(config, workSessionId) } };

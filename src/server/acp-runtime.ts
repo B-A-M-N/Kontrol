@@ -15,6 +15,7 @@ import {
 } from "../acp-bridge.js";
 import { createSupervisorRuntime } from "../supervisor-runtime.js";
 import { verifyMissionSubmission } from "../mission-verifier.js";
+import { missionVerificationOptionsFromConfig } from "../bridge/verification-options.js";
 import { evaluateSupervisorMission } from "../supervisor-evaluator.js";
 import type { ServerConfig } from "../config.js";
 import { normalizeWorkspaceSnapshotIdentity } from "../review-checkpoints.js";
@@ -93,11 +94,7 @@ export function createAcpRuntime(deps: AcpRuntimeDeps): AcpRuntimeHandles {
     onVerify: async (workSessionId, deadlineAt, submission) => {
       await verifyMissionSubmission({
         workSessionId,
-        maxInflight: config.verifyMaxInflight,
-        sandbox: config.verifySandbox,
-        childEnvironmentAllowlist: config.childEnvironmentAllowlist,
-        verifyToolchainPaths: config.verifyToolchainPaths,
-        sandboxExecutablePath: config.verifySandboxExecutable,
+        ...missionVerificationOptionsFromConfig(config),
         missionLedger,
         workSessions,
         workspaces,
