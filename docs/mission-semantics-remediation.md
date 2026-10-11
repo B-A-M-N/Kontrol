@@ -68,3 +68,11 @@ identical sandbox, environment, toolchain, executable, and inflight
 settings from the same configuration. Full unit suite (42) green; clean
 candidate built from e194683. Root filesystem remains read-only; activation
 and soak still pending recovery.
+
+### Versioned fingerprint definition (commit 3680697, candidate 012f023b6409ed8a)
+
+MISSION_CONTRACT_FINGERPRINT_VERSION participates in the canonical payload;
+all fingerprints carry their definition version, and stored records keep
+their historical identity until an explicit migration. Full unit suite (42)
+green; clean candidate built from 3680697. Root filesystem remains
+read-only; activation and soak still pending host recovery.
