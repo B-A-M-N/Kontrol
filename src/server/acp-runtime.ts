@@ -15,6 +15,8 @@ import {
 } from "../acp-bridge.js";
 import { createSupervisorRuntime } from "../supervisor-runtime.js";
 import { createReplyDispatcher } from "../bridge/reply-dispatcher.js";
+import { createScheduledJobRuntime } from "../scheduling/scheduled-job-runtime.js";
+import { dispatchScheduledJob } from "../scheduling/scheduled-job-dispatch.js";
 import { verifyMissionSubmission } from "../mission-verifier.js";
 import { missionVerificationOptionsFromConfig } from "../bridge/verification-options.js";
 import { evaluateSupervisorMission } from "../supervisor-evaluator.js";
@@ -43,16 +45,19 @@ export interface AcpRuntimeDeps {
   };
   readonly reviewWorkflow: import("../review-workflow.js").ReviewWorkflowService;
   readonly recordPhaseTiming: RecordPhaseTiming;
+  /** Server-owned database handle for the scheduler runtime's durable reads. */
+  readonly database?: import("../db/client.js").DatabaseHandle;
 }
 
 export interface AcpRuntimeHandles {
   readonly dispatcher: ContinuationDispatcher;
   readonly supervisorRuntime: SupervisorRuntime;
   readonly replyDispatcher: import("../bridge/reply-dispatcher.js").ReplyDispatcher;
+  readonly scheduledJobRuntime?: import("../scheduling/scheduled-job-runtime.js").ScheduledJobRuntime;
 }
 
 export function createAcpRuntime(deps: AcpRuntimeDeps): AcpRuntimeHandles {
-  const { config, bridge, reviewWorkflow, recordPhaseTiming } = deps;
+  const { config, bridge, reviewWorkflow, recordPhaseTiming, database } = deps;
   const {
     workspaces,
     workSessions,
@@ -65,6 +70,7 @@ export function createAcpRuntime(deps: AcpRuntimeDeps): AcpRuntimeHandles {
     supervisorRuns,
     agentMessages,
     liveWaiters,
+    scheduledJobs,
   } = bridge;
   let supervisorRuntime: SupervisorRuntime | undefined;
   const bridgeBase: BridgeConfig = {
@@ -207,5 +213,25 @@ export function createAcpRuntime(deps: AcpRuntimeDeps): AcpRuntimeHandles {
     },
   });
   supervisorRuntime.start();
-  return { dispatcher, supervisorRuntime, replyDispatcher };
+
+  // S02: durable scheduling. The scheduler triggers the canonical ACP dispatch
+  // path for due jobs; it never becomes a second supervisor.
+  let scheduledJobRuntime: import("../scheduling/scheduled-job-runtime.js").ScheduledJobRuntime | undefined;
+  if (scheduledJobs) {
+    if (!database) throw new Error("Scheduled-job runtime requires the server database handle.");
+    scheduledJobRuntime = createScheduledJobRuntime({
+      database,
+      jobs: scheduledJobs,
+      dispatchOutbox,
+      dispatch: async (jobId) => {
+        const job = scheduledJobs.get(jobId);
+        if (!job) return "failed";
+        const outcome = await dispatchScheduledJob(bridgeBase, scheduledJobs, job);
+        return outcome.status;
+      },
+    });
+    scheduledJobRuntime.start();
+  }
+
+  return { dispatcher, supervisorRuntime, replyDispatcher, scheduledJobRuntime };
 }

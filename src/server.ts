@@ -770,16 +770,19 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
   let dispatcher: ContinuationDispatcher | undefined;
   let supervisorRuntime: import("./supervisor-runtime.js").SupervisorRuntime | undefined;
   let replyDispatcher: import("./bridge/reply-dispatcher.js").ReplyDispatcher | undefined;
+  let scheduledJobRuntime: import("./scheduling/scheduled-job-runtime.js").ScheduledJobRuntime | undefined;
   if (config.acpEnabled) {
     const acp = createAcpRuntime({
       config,
       bridge: { workspaces, workSessions, reviewCheckpoints, agentRegistry, eventStore, continuationManager, dispatchOutbox, missionLedger, supervisorRuns, agentMessages, liveWaiters, scheduledJobs },
       reviewWorkflow,
       recordPhaseTiming,
+      database: db,
     });
     dispatcher = acp.dispatcher;
     supervisorRuntime = acp.supervisorRuntime;
     replyDispatcher = acp.replyDispatcher;
+    scheduledJobRuntime = acp.scheduledJobRuntime;
   }
 
   const shutdown = createShutdownController({
@@ -798,6 +801,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     dispatcher,
     supervisorRuntime,
     replyDispatcher,
+    scheduledJobRuntime,
     supervisorRuns,
     mcpSessionChurnTimer,
     shuttingDown: { get value() { return shuttingDown; }, set value(v: boolean) { shuttingDown = v; } },
