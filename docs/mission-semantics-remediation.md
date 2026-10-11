@@ -30,3 +30,15 @@
 ### Deployment status (October 11, 2026)
 
 Candidate `7e00b709a84108c7` (clean source `1b6fe9f`, schema v64) passed preflight, build validation, and isolated boot smoke via `restart-kontrol.sh --prepare-only`. Activation could not complete because the host root filesystem remounted read-only (ext4 `errors=remount-ro`), making `/home/bamn/.local/share/kontrol` unwritable. The safe operator action is an offline `fsck` at reboot; the two-phase restart can then be rerun and the prepared candidate activated. All source-level remediation work remains committed and the checkout is clean.
+
+### Re-review remediation (October 11, 2026, commit cec77fb)
+
+Independent re-review findings addressed:
+- **P0 finding resolution**: effective resolution now follows the latest qualifying attempt per required command. Pass→fail blocks, pass→inconclusive blocks, fail→pass restores.
+- **P0 outcome evidence**: `outcome_verified`/`operationally_stable` are refused at creation until oracle support exists; empty passing reports cannot certify integration.
+- **P1 fingerprint**: `outcomeEvidence` participates in the payload and stored reconstruction carries criterion IDs.
+- **P2 evidence eligibility**: source filtering happens before newest-attempt selection; agent claims cannot displace verifier results.
+- **P2 correction policy**: demonstrated progress earns bounded continuation; stagnation escalates.
+- **P1 deployment**: `--activate-artifact` resumes a prepared candidate without re-preparing; all start-all behavior tests pass.
+
+Clean candidate `0c9c6b34b4c1ccbe` (source `cec77fb`, schema v64, gitDirty 0). Operational soak/external-host qualification still pending filesystem recovery.
