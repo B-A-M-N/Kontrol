@@ -301,3 +301,54 @@ for (const flag of ["-v", "--version"]) {
   rmSync(wsRoot, { recursive: true, force: true });
   rmSync(garbageDir, { recursive: true, force: true });
 }
+
+// L04 CLI: review-loop controls operate on the authoritative route store.
+{
+  const { mkdtempSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const stateDir = mkdtempSync(join(tmpdir(), "kontrol-cli-review-loop-"));
+  const dbScript = `
+    const { openDatabase } = await import("./src/db/client.js");
+    const db = openDatabase(${JSON.stringify(stateDir)});
+    const now = new Date().toISOString();
+    db.sqlite.prepare("insert into workspace_sessions (id, root, status, mode, managed, created_at, last_used_at) values (?, '/tmp', 'active', 'checkout', 'false', ?, ?)").run("wss_cli_rl", now, now);
+    db.sqlite.prepare("insert into work_sessions (id, workspace_session_id, submitted_by, status, created_at, updated_at) values ('ws_cli_rl', 'wss_cli_rl', 'test', 'in_progress', ?, ?)").run(now, now);
+    db.close();
+  `;
+  const seed = spawnSync(process.execPath, ["--import", "tsx", "--eval", dbScript, "dbseed"], { cwd: repositoryRoot, encoding: "utf8" });
+  assert.equal(seed.status, 0, `review-loop db seed must succeed; stderr: ${seed.stderr}`);
+  const cliEnv = {
+    ...process.env,
+    KONTROL_CONFIG_DIR: join(stateDir, "config"),
+    KONTROL_STATE_DIR: stateDir,
+    KONTROL_OAUTH_OWNER_TOKEN: "cli-review-loop-owner-token-long-enough",
+    KONTROL_ALLOWED_ROOTS: process.cwd(),
+  };
+  const runCli = (...args: string[]) => spawnSync(process.execPath, ["--import", "tsx", "src/cli.ts", ...args], { cwd: repositoryRoot, encoding: "utf8", env: cliEnv });
+
+  const on = runCli("review-loop", "on", "--session", "ws_cli_rl", "--max-rounds", "3", "--mode", "isolated_review");
+  assert.equal(on.status, 0, `review-loop on must exit 0; stderr: ${on.stderr}`);
+  assert.match(on.stdout, /Review loop active; round 0\/3/);
+
+  const pause = runCli("review-loop", "pause", "--session", "ws_cli_rl");
+  assert.equal(pause.status, 0, `review-loop pause must exit 0; stderr: ${pause.stderr}`);
+  assert.match(pause.stdout, /paused/);
+
+  const status = runCli("review-loop", "status", "--session", "ws_cli_rl");
+  assert.equal(status.status, 0, `review-loop status must exit 0; stderr: ${status.stderr}`);
+  const parsed = JSON.parse(status.stdout) as { status?: string; mode?: string; maxReviewRounds?: number };
+  assert.equal(parsed.status, "paused", "status reflects the pause");
+  assert.equal(parsed.mode, "isolated_review", "status preserves the mode");
+  assert.equal(parsed.maxReviewRounds, 3, "status preserves the round budget");
+
+  const resume = runCli("review-loop", "resume", "--session", "ws_cli_rl");
+  assert.equal(resume.status, 0);
+  assert.match(resume.stdout, /active/);
+
+  const off = runCli("review-loop", "off", "--session", "ws_cli_rl");
+  assert.equal(off.status, 0);
+  assert.match(off.stdout, /disabled/);
+
+  rmSync(stateDir, { recursive: true, force: true });
+}

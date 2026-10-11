@@ -13,6 +13,7 @@ import { databasePath, openDatabase } from "./db/client.js";
 import { FilesystemSnapshotStore } from "./filesystem-snapshot-store.js";
 import { loadPolicyConfig, policyCanAsk } from "./policy.js";
 import { collectDurableSnapshotRoots } from "./runtime/snapshot-roots.js";
+import { createReviewRouteStore } from "./review-handoff/route-store.js";
 import { runServiceCommand } from "./service.js";
 import { isRuntimeIdentityLive, readBuildIdentity, readRuntimeIdentity } from "./runtime-identity.js";
 import {
@@ -25,7 +26,7 @@ import {
 } from "./user-config.js";
 import { expandHomePath } from "./roots.js";
 
-type Command = "serve" | "up" | "init" | "doctor" | "config" | "service" | "snapshots" | "help" | "version";
+type Command = "serve" | "up" | "init" | "doctor" | "config" | "service" | "snapshots" | "review-loop" | "help" | "version";
 const require = createRequire(import.meta.url);
 const SUPPORTED_NODE_RANGE = ">=22.19 <23 || >=24 <25 || >=26 <27";
 
@@ -58,6 +59,9 @@ async function main(argv: string[]): Promise<void> {
     case "snapshots":
       await runSnapshotsCommand(args);
       return;
+    case "review-loop":
+      await runReviewLoopCommand(args);
+      return;
     case "help":
       printHelp();
       return;
@@ -70,6 +74,7 @@ async function main(argv: string[]): Promise<void> {
 function normalizeCommand(command: string | undefined): Command {
   if (!command || command === "serve" || command === "start") return "serve";
   if (command === "up" || command === "init" || command === "doctor" || command === "config" || command === "service" || command === "snapshots") return command;
+  if (command === "review-loop") return "review-loop";
   if (command === "help" || command === "--help" || command === "-h") return "help";
   if (command === "version" || command === "--version" || command === "-v") return "version";
   throw new Error(`Unknown command: ${command}`);
@@ -80,6 +85,69 @@ function runSnapshotsCommand(args: string[]): Promise<void> {
   if (sub === "stats") return snapshotsStats();
   if (sub === "gc") return snapshotsGc({ dryRun: args.includes("--dry-run") });
   throw new Error(`Unknown snapshots subcommand: ${sub} (expected "stats" or "gc")`);
+}
+
+/**
+ * L04 CLI: durable review-loop controls. These operate directly on the
+ * authoritative route store (not through an MCP session), so an operator can
+ * pause, resume, disable, or inspect the loop even while the WebUI/host is
+ * disconnected. Status changes are CAS-guarded on the route revision.
+ */
+async function runReviewLoopCommand(args: string[]): Promise<void> {
+  const sub = args[0];
+  const workSessionId = flagValue(args, "--session") ?? flagValue(args, "--work-session");
+  if (!sub || sub === "help") {
+    output.write("Usage: kontrol review-loop <status|on|off|pause|resume> --session <workSessionId> [--max-rounds N] [--mode pinned_conversation|isolated_review]\n");
+    return;
+  }
+  if (!workSessionId) throw new Error("review-loop requires --session <workSessionId>");
+  const config = loadConfig();
+  if (!existsSync(databasePath(config.stateDir))) throw new Error("Kontrol state database not found; run `kontrol init` first.");
+  const db = openDatabase(config.stateDir);
+  const routes = createReviewRouteStore(db);
+  try {
+    if (sub === "status") {
+      const route = routes.getRouteBySession(workSessionId);
+      if (!route) {
+        output.write(`No review route configured for ${workSessionId}.\n`);
+        return;
+      }
+      output.write(`${JSON.stringify({
+        routeId: route.id, status: route.status, mode: route.mode,
+        completedReviewRounds: route.completedReviewRounds, maxReviewRounds: route.maxReviewRounds,
+        routeEpoch: route.routeEpoch, revision: route.revision,
+      }, null, 2)}\n`);
+      return;
+    }
+    if (sub === "on" || sub === "off") {
+      const rounds = Number(flagValue(args, "--max-rounds") ?? "3");
+      const mode = (flagValue(args, "--mode") ?? "isolated_review") as "pinned_conversation" | "isolated_review";
+      const route = routes.configure({
+        workSessionId,
+        ownerPrincipalId: "cli-operator",
+        ownerContextId: `cli:${workSessionId}`,
+        enabled: sub === "on",
+        mode,
+        maxReviewRounds: Number.isFinite(rounds) ? rounds : 3,
+      });
+      output.write(`Review loop ${route.status}; round ${route.completedReviewRounds}/${route.maxReviewRounds} (${route.mode}).\n`);
+      return;
+    }
+    if (sub === "pause" || sub === "resume") {
+      const route = routes.setStatus({ workSessionId, status: sub === "pause" ? "paused" : "active" });
+      output.write(`Review loop ${route.status}.\n`);
+      return;
+    }
+    throw new Error(`Unknown review-loop subcommand: ${sub} (expected status|on|off|pause|resume)`);
+  } finally {
+    routes.close();
+    db.close();
+  }
+}
+
+function flagValue(args: string[], flag: string): string | undefined {
+  const index = args.indexOf(flag);
+  return index >= 0 ? args[index + 1] : undefined;
 }
 
 function fsSnapshotStoreFromConfig(): FilesystemSnapshotStore {
@@ -838,6 +906,8 @@ function printHelp(): void {
       "  kontrol config set publicBaseUrl <url|null>",
       "  kontrol config effective-policy --json",
       "  kontrol service install|start|stop|restart|upgrade|status|logs|uninstall",
+      "  kontrol snapshots stats|gc",
+      "  kontrol review-loop status|on|off|pause|resume --session <workSessionId>",
       "  kontrol -v, --version   Print the installed version",
       "",
       "For temporary tunnels:",
