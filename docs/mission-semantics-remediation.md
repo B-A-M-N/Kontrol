@@ -42,3 +42,11 @@ Independent re-review findings addressed:
 - **P1 deployment**: `--activate-artifact` resumes a prepared candidate without re-preparing; all start-all behavior tests pass.
 
 Clean candidate `0c9c6b34b4c1ccbe` (source `cec77fb`, schema v64, gitDirty 0). Operational soak/external-host qualification still pending filesystem recovery.
+
+### Composition-boundary test closure (commit cdaf4ab, candidate cf37f9560fbe7be8)
+
+- F03 fail-closed: a configured sandbox path that does not exist refuses execution; both entry paths consume the same execution context.
+- F05 composition: failing dependency blocks the dependent; a final-only prerequisite excluded from the progressive phase makes the dependent inconclusive (not a scheduling error); unrelated criteria remain excluded from focused selection.
+- F11 boundary: path-valued flag arguments and Windows separator traversal rejected; benign adjacent-dot names preserved.
+- Full unit suite (42) green; clean candidate `cf37f9560fbe7be8` built from `cdaf4ab`.
+- Filesystem blocker persists (root read-only); activation/soak pending recovery.
