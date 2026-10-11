@@ -881,3 +881,37 @@ body {
   font: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
   font-size: var(--font-text-sm-size, 12px);
 }
+
+/* U01: review-loop lifecycle header */
+.review-loop-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--color-border-primary, #3a3a40);
+  font-size: 12px;
+}
+.review-loop-header[hidden] {
+  display: none;
+}
+.review-loop-status {
+  font-weight: 600;
+  text-transform: capitalize;
+}
+.review-loop-status.paused,
+.review-loop-status.disabled {
+  color: var(--color-text-warning, #d9a441);
+}
+.review-loop-status.active {
+  color: var(--color-text-success, #4caf50);
+}
+.review-loop-mode,
+.review-loop-rounds,
+.review-loop-handoff {
+  color: var(--color-text-secondary, #a9a9b3);
+}
+.review-loop-warning {
+  color: var(--color-text-warning, #d9a441);
+  font-weight: 600;
+}

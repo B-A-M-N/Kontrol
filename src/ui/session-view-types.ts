@@ -225,6 +225,7 @@ export interface WorkSessionDom {
   activity: HTMLUListElement;
   activitySeqs: Set<number>;
   approvals: HTMLElement;
+  reviewLoop: HTMLElement;
   review: HTMLElement;
   reviewTitle: HTMLElement;
   reviewPayload: HTMLElement;

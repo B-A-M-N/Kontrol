@@ -306,6 +306,33 @@ assert.equal(document.activeElement, replyBox, "activity updates preserve review
 assert.equal(document.querySelectorAll(".message-reply").length, 1, "activity updates preserve the message tray DOM");
 assert.match(document.querySelector(".agent-event")?.textContent ?? "", /fragment-100/, "coalesced output updates the existing activity row");
 
+// U01: review-lifecycle header reflects the durable route state.
+{
+  const headerSession = __workspaceAppTest.ensureWorkSessionView("session-loop", "workspace-loop", "run-loop");
+  headerSession.status = "awaiting_review";
+  headerSession.reviewLoop = { routeId: "route-1", status: "active", mode: "isolated_review", completedReviewRounds: 1, maxReviewRounds: 3, handoffStatus: "claimed" };
+  __workspaceAppTest.renderWorkSessionView(headerSession);
+  const header = document.querySelector<HTMLElement>(".review-loop-header");
+  assert.ok(header && !header.hidden, "an active route renders the review-lifecycle header");
+  assert.match(header.textContent ?? "", /Review loop Active/i, "header shows the loop status");
+  assert.match(header.textContent ?? "", /Round 1\/3/, "header shows the current round against the maximum");
+  assert.match(header.textContent ?? "", /Fresh review per submission/i, "header shows the selected routing mode");
+
+  // Paused route is surfaced distinctly.
+  headerSession.reviewLoop = { routeId: "route-1", status: "paused", mode: "isolated_review", completedReviewRounds: 1, maxReviewRounds: 3 };
+  __workspaceAppTest.renderWorkSessionView(headerSession);
+  assert.match(document.querySelector(".review-loop-header")?.textContent ?? "", /Review loop Paused/i, "a paused route shows as paused");
+
+  // Budget-exhausted route warns that human review is required.
+  headerSession.reviewLoop = { routeId: "route-1", status: "active", mode: "isolated_review", completedReviewRounds: 3, maxReviewRounds: 3 };
+  __workspaceAppTest.renderWorkSessionView(headerSession);
+  assert.match(document.querySelector(".review-loop-header")?.textContent ?? "", /Round budget exhausted/i, "an exhausted budget warns");
+
+  // A session without a route hides the header.
+  const plain = __workspaceAppTest.ensureWorkSessionView("session-no-loop", "workspace-loop", "run-none");
+  __workspaceAppTest.renderWorkSessionView(plain);
+}
+
 const secondSession = __workspaceAppTest.ensureWorkSessionView("session-dom-2", "workspace-dom", "run-dom-2");
 secondSession.title = "Second session";
 secondSession.updatedAt = new Date(Date.now() + 1_000).toISOString();
