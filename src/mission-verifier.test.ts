@@ -109,7 +109,7 @@ try {
   assert.equal(failing.status, "failed", "failing verification command is recorded as failed");
   assert.notEqual(failing.exitCode, 0);
 
-  function harness(input: { criteria: Array<Record<string, unknown>>; finalVerification?: string[]; changed?: boolean }) {
+  function harness(input: { criteria: Array<Record<string, unknown>>; finalVerification?: string[]; changed?: boolean; findings?: Array<Record<string, unknown>> }) {
     const evidence: Array<Record<string, unknown>> = [];
     const mission = { id: "mission_verify", finalVerification: input.finalVerification ?? [] };
     const session = { workspaceSessionId: "workspace_verify", latestSubmission: { id: "sub_verify", snapshotCommit: "snap_verify", files: [{ path: "src/target.ts", type: "change", additions: 1, removals: 0 }] } };
@@ -124,7 +124,8 @@ try {
       getPacket: () => ({
         criteria,
         criterionStates: criteria.map((criterion) => ({ criterionId: criterion.id, status: criterion.status })),
-        findings: [], workOrders: [], evidence, completionReports: [], mission: { finalVerification: input.finalVerification ?? [] },
+        findings: (input.findings ?? []).map((f) => ({ resolutionSubmissionId: undefined, requiredVerification: [], ...f })),
+        workOrders: [], evidence, completionReports: [], mission: { finalVerification: input.finalVerification ?? [] },
       }),
       recordVerifierEvidence: (_missionId: string, entries: Array<Record<string, unknown>>) => {
         evidence.push(...entries.map((entry) => ({ ...entry, source: "server_test_runner" })));
@@ -145,6 +146,7 @@ try {
         }
       },
       recordCompletionReport: (_missionId: string, report: Record<string, unknown>) => { evidence.push({ completion: report }); },
+      resolveFinding: (_missionId: string, findingId: string) => { evidence.push({ resolvedFindingId: findingId }); },
     };
     return {
       evidence,
@@ -210,6 +212,17 @@ try {
   const staleHarness = harness({ criteria: [{ id: "stale", description: "stale", verificationCommand: "npm --version" }], changed: true });
   await assert.rejects(staleHarness.run(), /workspace no longer matches/);
   assert.equal(staleHarness.evidence.length, 0, "stale snapshot blocks command execution and evidence recording");
+
+  // A verified_resolved finding whose resolution belongs to an older submission
+  // is reverified on the current snapshot, not silently accepted as still valid.
+  const staleFindingHarness = harness({
+    criteria: [{ id: "dependent", description: "dependent", verificationCommand: "npm --version" }],
+    findings: [{ id: "finding-stale", status: "verified_resolved", resolutionSubmissionId: "older_submission", requiredVerification: ["npm --version"] }],
+  });
+  const staleFindingResults = await staleFindingHarness.run();
+  assert.ok(staleFindingResults.some((result) => result.criterionId === "finding:finding-stale"), "stale verified_resolved findings are reverified");
+  assert.ok(staleFindingHarness.evidence.some((entry: Record<string, unknown>) => entry.resolvedFindingId === "finding-stale"), "the ledger resolves the renewed stale finding");
+
 
   console.log("mission-verifier.test.ts: all assertions passed");
 } finally {
