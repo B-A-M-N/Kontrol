@@ -73,7 +73,7 @@ try {
       pollMs: 60_000,
       dispatch: async (jobId) => {
         dispatchLog.push(jobId);
-        return "dispatched";
+        return { status: "dispatched", workSessionId: `ws-${jobId}` };
       },
     });
 
@@ -95,6 +95,7 @@ try {
     await runtime.drainOnce();
     assert.deepEqual(dispatchLog, [dueJob.id], "exactly one dispatch for the due job");
     assert.equal(jobs.get(dueJob.id)?.status, "running", "a dispatched job advances to running");
+    assert.equal(jobs.get(dueJob.id)?.workSessionId, `ws-${dueJob.id}`, "the dispatch result's work-session correlation is persisted on the job");
 
     // A second drain must not re-dispatch: the trigger is consumed.
     await runtime.drainOnce();

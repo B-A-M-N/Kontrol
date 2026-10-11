@@ -10,6 +10,12 @@ import type { DispatchOutbox, OutboxClaim } from "../dispatch-outbox.js";
 import type { DatabaseHandle } from "../db/client.js";
 import type { ScheduledJobStore } from "./scheduled-job-store.js";
 
+export interface ScheduledDispatchOutcome {
+  status: "dispatched" | "blocked" | "failed" | "uncertain";
+  workSessionId?: string;
+  reason?: string;
+}
+
 export interface ScheduledJobRuntime {
   start(): void;
   stop(): void;
@@ -21,8 +27,12 @@ export interface ScheduledJobRuntimeOptions {
   database: DatabaseHandle;
   jobs: ScheduledJobStore;
   dispatchOutbox?: DispatchOutbox;
-  /** Authorized dispatch hook. Returns the resulting job-relevant status. */
-  dispatch?: (jobId: string) => Promise<"dispatched" | "blocked" | "failed" | "uncertain">;
+  /**
+   * Authorized dispatch hook. Returns the resulting job-relevant status plus
+   * the durable work-session correlation and any real failure reason, so the
+   * recorded job carries its evidence rather than only a status word.
+   */
+  dispatch?: (jobId: string) => Promise<ScheduledDispatchOutcome>;
   schedulerInstanceId?: string;
   leaseMs?: number;
   pollMs?: number;
@@ -133,12 +143,30 @@ export function createScheduledJobRuntime(options: ScheduledJobRuntimeOptions): 
           const current = jobs.get(job.id);
           if (current && current.revision === job.revision) {
             try {
-              if (outcome === "dispatched" || outcome === "uncertain") {
-                jobs.transition({ jobId: job.id, expectedRevision: job.revision, nextStatus: "running" });
-              } else if (outcome === "blocked") {
-                jobs.transition({ jobId: job.id, expectedRevision: job.revision, nextStatus: "blocked", lastError: "Scheduled dispatch blocked." });
+              if (outcome.status === "dispatched" || outcome.status === "uncertain") {
+                jobs.transition({
+                  jobId: job.id,
+                  expectedRevision: job.revision,
+                  nextStatus: "running",
+                  workSessionId: outcome.workSessionId ?? null,
+                  lastError: outcome.status === "uncertain" ? (outcome.reason ?? "Dispatch acceptance uncertain; reconciling.") : null,
+                });
+              } else if (outcome.status === "blocked") {
+                jobs.transition({
+                  jobId: job.id,
+                  expectedRevision: job.revision,
+                  nextStatus: "blocked",
+                  workSessionId: outcome.workSessionId ?? null,
+                  lastError: outcome.reason ?? "Scheduled dispatch blocked.",
+                });
               } else {
-                jobs.transition({ jobId: job.id, expectedRevision: job.revision, nextStatus: "failed", lastError: "Scheduled dispatch failed." });
+                jobs.transition({
+                  jobId: job.id,
+                  expectedRevision: job.revision,
+                  nextStatus: "failed",
+                  workSessionId: outcome.workSessionId ?? null,
+                  lastError: outcome.reason ?? "Scheduled dispatch failed.",
+                });
               }
             } catch {
               // Terminal/cancelled job or revision conflict: leave durable state.
