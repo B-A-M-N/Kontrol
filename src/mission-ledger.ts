@@ -836,11 +836,18 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
       .filter((f): f is MissionReviewFindingRow => !!f)
       .filter((f) => f.scope !== "out_of_scope" && f.disposition === "blocking");
 
+    // missionApproved is derived from the authoritative approval predicate,
+    // never from a caller-supplied claim. A round may not declare convergence
+    // by asserting approval that the durable gate does not grant.
+    const authoritativeRound: NewRoundInput = {
+      ...round,
+      missionApproved: canApprove(workSessionId, getCurrentApprovalContext(workSessionId)).allowed,
+    };
     const decision = evaluateCorrectionPolicy({
       currentRound: mission.correctionRounds,
       maxCorrectionRounds: mission.maxCorrectionRounds,
       newBlockingCount: newBlocking.length,
-      round,
+      round: authoritativeRound,
     });
     if (decision.extend) {
       database.db.update(missionContracts).set({ correctionRounds: decision.round, updatedAt: new Date().toISOString() }).where(eq(missionContracts.id, mission.id)).run();

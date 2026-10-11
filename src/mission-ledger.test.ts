@@ -450,12 +450,10 @@ try {
   assert.ok(advisory[0]);
   assert.ok(!ledger.canApprove(loopSession.id).reasons.some((r) => r.includes(advisory[0].id)), "advisory findings do not block approval");
 
-  // A round with no new blocking findings and a satisfied approval predicate
-  // has converged; unresolved requirements instead escalate to a human.
-  const converged = ledger.evaluateLoopExtension(loopSession.id, { newFindingIds: [], missionApproved: true });
-  assert.equal(converged.extend, false);
-  assert.match(converged.reason, /converged/);
-  const unresolved = ledger.evaluateLoopExtension(loopSession.id, { newFindingIds: [], missionApproved: false });
+  // missionApproved is derived from the authoritative canApprove() gate. The
+  // loop test mission has an unverified criterion, so the gate denies approval
+  // and the round escalates instead of converging.
+  const unresolved = ledger.evaluateLoopExtension(loopSession.id, { newFindingIds: [] });
   assert.equal(unresolved.extend, false);
   assert.match(unresolved.reason, /unresolved mission requirements/);
   // A round with demonstrated progress and unresolved actionable work remains
@@ -475,15 +473,20 @@ try {
   });
   const progressing = ledger.evaluateLoopExtension(progressSession2.id, {
     newFindingIds: [],
-    missionApproved: false,
     resolvedFindingIds: ["some-resolved"],
   });
   assert.equal(progressing.extend, true, "demonstrated progress earns bounded continuation");
   assert.equal(progressing.round, 1);
   // Without progress the same unresolved state escalates.
-  const stagnant = ledger.evaluateLoopExtension(progressSession2.id, { newFindingIds: [], missionApproved: false, resolvedFindingIds: [] });
+  const stagnant = ledger.evaluateLoopExtension(progressSession2.id, { newFindingIds: [], resolvedFindingIds: [] });
   assert.equal(stagnant.extend, false);
   assert.match(stagnant.reason, /no demonstrated progress/);
+
+  // missionApproved is derived from the authoritative gate: a caller asserting
+  // convergence cannot bypass a denied approval predicate.
+  const callerConvergence = ledger.evaluateLoopExtension(loopSession.id, { newFindingIds: [], missionApproved: true } as never);
+  assert.equal(callerConvergence.extend, false, "a caller-supplied approval claim cannot converge a denied mission");
+  assert.match(callerConvergence.reason, /unresolved mission requirements/);
 
   // P2 #34/#35: review-coverage contract. A mission declaring coverage lenses
   // blocks approval until a completion report records every lens as covered;
