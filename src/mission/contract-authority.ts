@@ -20,6 +20,7 @@ export interface StoredMissionContract {
 }
 
 export interface StoredMissionCriterion {
+  id?: string;
   description: string;
   priority: string;
   verificationType?: string;
@@ -88,7 +89,7 @@ export function fingerprintMissionContract(input: MissionContractInput, criteria
   const normalizedCriteria = criteria.map((criterion) => ({
     // Criterion IDs participate in identity: dependencies, evidence, work
     // orders, and verification all address criteria by these stable IDs.
-    id: criterion.id ?? null,
+    id: criterion.id,
     description: criterion.description,
     priority: criterion.priority ?? "required",
     verificationType: criterion.verificationType ?? (criterion.verificationCommand ? "test" : "manual_review"),
@@ -116,6 +117,7 @@ export function fingerprintMissionContract(input: MissionContractInput, criteria
     maxCorrectionRounds: input.maxCorrectionRounds ?? 5,
     finalVerification: input.finalVerification ?? [],
     reviewCoverage: input.reviewCoverage ?? [],
+    outcomeEvidence: input.outcomeEvidence ?? null,
     acceptanceCriteria: normalizedCriteria.sort((left, right) =>
       JSON.stringify(canonicalize(left)).localeCompare(JSON.stringify(canonicalize(right)))),
   };
@@ -142,6 +144,7 @@ export function fingerprintStoredMissionContract(
     reviewCoverage: mission.reviewCoverage,
     outcomeEvidence: mission.outcomeEvidence,
   }, criteria.map((criterion) => ({
+    id: criterion.id ?? undefined,
     description: criterion.description,
     priority: criterion.priority as MissionCriterionInput["priority"],
     verificationType: criterion.verificationType as MissionCriterionInput["verificationType"],

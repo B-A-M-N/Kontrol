@@ -23,6 +23,7 @@ export interface OutcomeFinding {
 export interface OutcomeReport {
   status: string;
   reviewCoverage: string[];
+  results?: unknown[];
 }
 
 export function evaluateEffectiveCriteria(
@@ -85,15 +86,23 @@ export function evaluateMissionOutcome(input: {
   outcomeEvidence?: OutcomeEvidenceLevel;
   currentReport?: OutcomeReport;
   currentSubmissionId?: string;
+  effectiveFindingResolutions?: Record<string, { resolved: boolean; reasons: string[] }>;
 }): { allowed: boolean; reasons: string[] } {
   const reasons: string[] = [];
   const states = new Map(input.criterionStates.map((state) => [state.criterionId, state]));
-  // Evidence-strength gate: missions demanding stronger independent evidence
-  // require a passing final integration report at the corresponding level.
+  // Evidence-strength gate. integration_verified is the strongest currently
+  // enforceable level: it requires a passing final integration report whose
+  // results are nonempty. outcome_verified / operationally_stable are refused
+  // at mission creation until independent oracle support exists, so the
+  // evaluator never treats them as satisfiable by an empty passing report.
   const requiredStrength = input.outcomeEvidence ?? "implementation_verified";
-  const requiredRank = OUTCOME_EVIDENCE_RANK[requiredStrength];
-  if (requiredRank >= OUTCOME_EVIDENCE_RANK.integration_verified && input.currentReport?.status !== "passed") {
-    reasons.push(`Mission requires ${requiredStrength} evidence; a passing final integration report is mandatory for the current submission.`);
+  if (OUTCOME_EVIDENCE_RANK[requiredStrength] >= OUTCOME_EVIDENCE_RANK.integration_verified) {
+    const report = input.currentReport;
+    if (!report || report.status !== "passed") {
+      reasons.push(`Mission requires ${requiredStrength} evidence; a passing final integration report is mandatory for the current submission.`);
+    } else if (!report.results?.length) {
+      reasons.push(`Mission requires ${requiredStrength} evidence; the passing completion report contains no verification results and cannot certify integration.`);
+    }
   }
   for (const criterion of input.criteria) {
     if (criterion.priority === "required") {
@@ -105,13 +114,17 @@ export function evaluateMissionOutcome(input: {
     if (finding.scope === "out_of_scope") continue;
     if (finding.disposition !== "blocking") continue;
     if (finding.status === "waived") continue;
-    if (finding.status === "verified_resolved") {
-      // A verified resolution is contextual. If its evidence was recorded for a
-      // different submission/snapshot/epoch than the current approval context,
-      // it must be reverified before the current submission can approve.
-      if (finding.resolutionSubmissionId && input.currentSubmissionId && finding.resolutionSubmissionId !== input.currentSubmissionId) {
-        reasons.push(`Finding ${finding.id} was resolved for submission ${finding.resolutionSubmissionId}, but the current submission is ${input.currentSubmissionId}; renewed verification is required.`);
+    // The ledger supplies the effective resolution verdict; a stored status
+    // alone is never trusted. A later failed or inconclusive verification on
+    // the same submission supersedes an earlier passing resolution.
+    const resolution = input.effectiveFindingResolutions?.[finding.id];
+    if (finding.status === "verified_resolved" || finding.status === "claimed_resolved") {
+      if (!resolution) {
+        reasons.push(`Finding ${finding.id} has no current effective-resolution evaluation; renewal is required.`);
         continue;
+      }
+      if (!resolution.resolved) {
+        reasons.push(`Finding ${finding.id} is not effectively resolved: ${resolution.reasons.join("; ")}`);
       }
       continue;
     }

@@ -20,15 +20,38 @@ export function evaluateCorrectionPolicy(input: {
   newBlockingCount: number;
   round: CorrectionRoundInput;
 }): LoopExtensionDecision {
-  // No new blocking findings can mean convergence or unresolved work. If the
-  // approval predicate is not satisfied, unresolved requirements remain and
-  // the loop must escalate rather than declare convergence.
+  // No new blocking findings can mean convergence, productive continuation, or
+  // stagnation. A round that demonstrably progressed on unresolved actionable
+  // work remains eligible for bounded continuation; only an approval-satisfied
+  // mission converges, and only a non-progressing round escalates immediately.
   if (input.newBlockingCount === 0 && input.round.missionApproved !== true) {
+    const resolvedCount = input.round.resolvedFindingIds?.length ?? 0;
+    const madeProgress = input.round.progress?.madeProgress ?? resolvedCount > 0;
+    if (madeProgress) {
+      const nextRound = input.currentRound + 1;
+      const effectiveMax = input.maxCorrectionRounds;
+      if (nextRound > effectiveMax) {
+        return {
+          extend: false,
+          round: input.currentRound,
+          maxRounds: effectiveMax,
+          reason: `Progressing correction reached the bounded ceiling (${input.currentRound}/${effectiveMax}); escalation to a human is required.`,
+          ceilingHit: true,
+        };
+      }
+      return {
+        extend: true,
+        round: nextRound,
+        maxRounds: effectiveMax,
+        reason: `Extending correction loop on demonstrated progress (${resolvedCount} finding(s) resolved), round ${nextRound}/${effectiveMax}.`,
+        ceilingHit: false,
+      };
+    }
     return {
       extend: false,
       round: input.currentRound,
       maxRounds: input.maxCorrectionRounds,
-      reason: "No new blocking findings and unresolved mission requirements remain; escalation to a human is required.",
+      reason: "No new blocking findings, no demonstrated progress, and unresolved mission requirements remain; escalation to a human is required.",
       ceilingHit: false,
     };
   }

@@ -128,6 +128,17 @@ try {
   assert.throws(() => ledger.createMission({
     workSessionId: session.id,
     workspaceSessionId: "workspace-1",
+    objective: "Fix the bridge",
+    acceptanceCriteria: [
+      { id: "crit-tests", description: "Regression tests pass", priority: "required", verificationType: "test", verificationCommand: "npm test" },
+      { id: "crit-docs", description: "Docs are coherent", priority: "preferred", verificationType: "manual_review" },
+    ],
+    outcomeEvidence: "integration_verified",
+  }), /Mission contract conflict/, "changing outcomeEvidence changes the contract identity");
+
+  assert.throws(() => ledger.createMission({
+    workSessionId: session.id,
+    workspaceSessionId: "workspace-1",
     objective: "Silently replace the original contract",
     acceptanceCriteria: [{ id: "crit-tests", description: "Regression tests pass", priority: "required", verificationType: "test", verificationCommand: "npm test" }],
   }), /Mission contract conflict/, "different mission intent cannot be silently ignored");
@@ -206,7 +217,7 @@ try {
     status: "passed",
     details: { reviewerIndependentlyConfirmed: true },
   }]);
-  assert.throws(() => ledger.resolveFinding(mission.id, "find-security", currentContext), /no independent evidence for the current submitted snapshot/);
+  assert.throws(() => ledger.resolveFinding(mission.id, "find-security", currentContext), /not effectively resolved/);
   ledger.recordReviewerEvidence(mission.id, [{
     findingId: "find-security",
     ...currentContext,
@@ -333,8 +344,62 @@ try {
   const f08Blocked = ledger.canApprove(f08Session.id, f08Context);
   assert.equal(f08Blocked.allowed, false, "integration_verified outcome evidence requires a passing final report");
   assert.match(f08Blocked.reasons.join("\n"), /integration_verified/);
+  // An empty passing report cannot certify integration evidence.
   ledger.recordCompletionReport(f08Mission.id, { submissionId: f08Submission.id, snapshotKind: "git", snapshotRef: "f08-a", status: "passed", results: [] });
-  assert.equal(ledger.canApprove(f08Session.id, f08Context).allowed, true, "a passing final report satisfies integration evidence");
+  const f08Empty = ledger.canApprove(f08Session.id, f08Context);
+  assert.equal(f08Empty.allowed, false, "an empty passing report cannot certify integration evidence");
+  ledger.recordCompletionReport(f08Mission.id, { submissionId: f08Submission.id, snapshotKind: "git", snapshotRef: "f08-a", status: "passed", results: [{ command: "npm test", status: "passed" }] });
+  assert.equal(ledger.canApprove(f08Session.id, f08Context).allowed, true, "a passing final report with real results satisfies integration evidence");
+  assert.throws(() => ledger.createMission({
+    workSessionId: f08Session.id,
+    workspaceSessionId: "workspace-1",
+    objective: "outcome level",
+    acceptanceCriteria: [{ id: "x", description: "x", priority: "required", verificationType: "manual_review" }],
+    outcomeEvidence: "outcome_verified",
+  }), /not yet supported/, "outcome_verified is refused until independent oracle support exists");
+
+  // --- Re-review P0: a later failure on the same submission supersedes a
+  // verified resolution. The finding must block approval until fresh passing
+  // evidence is recorded.
+  const rrSession = workSessions.create({
+    workspaceSessionId: "workspace-1",
+    submittedBy: "webui",
+    title: "Re-review superseded resolution",
+    completionPolicy: "webui_approval_required",
+  });
+  const rrMission = ledger.createMission({
+    workSessionId: rrSession.id,
+    workspaceSessionId: "workspace-1",
+    objective: "Resolution must follow the latest evidence",
+    acceptanceCriteria: [{ id: "rr-crit", description: "works", priority: "required", verificationType: "test", verificationCommand: "npm test" }],
+  });
+  const [rrFinding] = ledger.addFindings(rrMission.id, [{ id: "rr-finding", description: "defect", requiredAction: "fix", requiredVerification: ["npm test"], severity: "blocker", scope: "in_scope" }]);
+  const rrSubmission = workSessions.submitForReview({ workSessionId: rrSession.id, diff: "RR", snapshotKind: "git", snapshotRef: "rr-snap", snapshotCommit: "rr-snap" });
+  const rrContext = { submissionId: rrSubmission.id, snapshotKind: "git" as const, snapshotRef: "rr-snap", snapshotCommit: "rr-snap", reviewEpoch: rrSubmission.reviewEpoch };
+  ledger.recordVerifierEvidence(rrMission.id, [
+    { criterionId: "rr-crit", ...rrContext, command: "npm test", status: "passed", details: { exitCode: 0 } },
+    { findingId: "rr-finding", ...rrContext, command: "npm test", status: "passed", details: { exitCode: 0 } },
+  ]);
+  ledger.updateFindingStatus(rrMission.id, [{ id: "rr-finding", status: "claimed_resolved" }]);
+  ledger.resolveFinding(rrMission.id, "rr-finding", rrContext);
+  assert.equal(ledger.canApprove(rrSession.id, rrContext).allowed, true);
+
+  // Later failed attempt on the same submission supersedes the resolution.
+  ledger.recordVerifierEvidence(rrMission.id, [{ findingId: "rr-finding", ...rrContext, command: "npm test", status: "failed", details: { exitCode: 1 } }]);
+  const rrSuperseded = ledger.canApprove(rrSession.id, rrContext);
+  assert.equal(rrSuperseded.allowed, false, "a later failed verification must supersede a prior verified resolution");
+  assert.match(rrSuperseded.reasons.join("\n"), /rr-finding/);
+
+  // An inconclusive attempt also blocks.
+  ledger.recordVerifierEvidence(rrMission.id, [{ findingId: "rr-finding", ...rrContext, command: "npm test", status: "inconclusive", details: { reason: "interrupted" } }]);
+  const rrInconclusive = ledger.canApprove(rrSession.id, rrContext);
+  assert.equal(rrInconclusive.allowed, false, "an inconclusive latest attempt blocks the resolution");
+
+  // A new passing attempt restores the resolution.
+  ledger.updateFindingStatus(rrMission.id, [{ id: "rr-finding", status: "claimed_resolved" }]);
+  ledger.recordVerifierEvidence(rrMission.id, [{ findingId: "rr-finding", ...rrContext, command: "npm test", status: "passed", details: { exitCode: 0 } }]);
+  ledger.resolveFinding(rrMission.id, "rr-finding", rrContext);
+  assert.equal(ledger.canApprove(rrSession.id, rrContext).allowed, true, "a fresh passing attempt restores the resolution");
 
   // --- Anti-runaway loop guard -------------------------------------------
   const loopSession = workSessions.create({
@@ -393,6 +458,32 @@ try {
   const unresolved = ledger.evaluateLoopExtension(loopSession.id, { newFindingIds: [], missionApproved: false });
   assert.equal(unresolved.extend, false);
   assert.match(unresolved.reason, /unresolved mission requirements/);
+  // A round with demonstrated progress and unresolved actionable work remains
+  // eligible for bounded continuation instead of premature escalation.
+  const progressSession2 = workSessions.create({
+    workspaceSessionId: "workspace-1",
+    submittedBy: "webui",
+    title: "progressing rounds",
+    completionPolicy: "webui_approval_required",
+  });
+  ledger.createMission({
+    workSessionId: progressSession2.id,
+    workspaceSessionId: "workspace-1",
+    objective: "progressing rounds",
+    acceptanceCriteria: [{ id: "p2-crit", description: "works", priority: "required", verificationType: "test", verificationCommand: "npm test" }],
+    maxCorrectionRounds: 2,
+  });
+  const progressing = ledger.evaluateLoopExtension(progressSession2.id, {
+    newFindingIds: [],
+    missionApproved: false,
+    resolvedFindingIds: ["some-resolved"],
+  });
+  assert.equal(progressing.extend, true, "demonstrated progress earns bounded continuation");
+  assert.equal(progressing.round, 1);
+  // Without progress the same unresolved state escalates.
+  const stagnant = ledger.evaluateLoopExtension(progressSession2.id, { newFindingIds: [], missionApproved: false, resolvedFindingIds: [] });
+  assert.equal(stagnant.extend, false);
+  assert.match(stagnant.reason, /no demonstrated progress/);
 
   // P2 #34/#35: review-coverage contract. A mission declaring coverage lenses
   // blocks approval until a completion report records every lens as covered;
@@ -607,7 +698,7 @@ try {
   };
   assert.equal(restartLedger.evaluateCriteria(restartSession.id, correctedContext)[0]?.status, "unverified",
     "snapshot-A failure or any earlier status cannot certify snapshot B");
-  assert.throws(() => restartLedger.resolveFinding(restartMission.id, restartFinding.id, correctedContext), /missing current server verification/);
+  assert.throws(() => restartLedger.resolveFinding(restartMission.id, restartFinding.id, correctedContext), /missing current verification/);
   restartLedger.recordVerifierEvidence(restartMission.id, [{
     criterionId: "restart-test",
     findingId: restartFinding.id,

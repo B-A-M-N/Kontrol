@@ -14,8 +14,31 @@ source "$ENV_FILE"
 set +a
 export KONTROL_ENV_FILE="$ENV_FILE"
 
+# Explicit activation selector: --activate-artifact <path or releases/<buildId>>
+# resumes/activates a previously prepared candidate without re-preparing.
+# The value is validated as an immutable artifact by start-all.sh.
+ACTIVATE_ARTIFACT_PATH=""
+FILTERED_ARGS=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --activate-artifact)
+      [[ $# -ge 2 ]] || { echo "ERROR: --activate-artifact requires a path argument" >&2; exit 2; }
+      ACTIVATE_ARTIFACT_PATH="$2"
+      shift 2
+      ;;
+    *)
+      FILTERED_ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+if [[ -n "$ACTIVATE_ARTIFACT_PATH" ]]; then
+  [[ "$ACTIVATE_ARTIFACT_PATH" = /* ]] || ACTIVATE_ARTIFACT_PATH="$DESKTOP_PWD/$ACTIVATE_ARTIFACT_PATH"
+  export KONTROL_ACTIVATE_ARTIFACT_PATH="$ACTIVATE_ARTIFACT_PATH"
+fi
+
 DEPLOYMENT_ID="deployment-$(date +%s)-$$"
-START_ARGS=("$@")
+START_ARGS=("${FILTERED_ARGS[@]+"${FILTERED_ARGS[@]}"}")
 DEPLOYMENT_LOCK_TOKEN=""
 DEPLOYMENT_LOCK_OWNED=0
 HANDOFF_STARTED=0
@@ -122,15 +145,22 @@ if [[ -n "$OWNER_INFO" ]]; then
       # The deployment lock remains held by this shell across both phases.
       # start-all validates the inherited token and uses transaction-specific
       # candidate state, so a second restart cannot cross the cutover.
-      if ! KONTROL_USE_EXISTING_DIST=false ./start-all.sh --prepare-only; then
-        echo "ERROR: candidate preparation failed; the current Kontrol generation was left running." >&2
-        exit 1
+      if [[ -n "$ACTIVATE_ARTIFACT_PATH" ]]; then
+        # Explicit resume: validate and activate the named immutable artifact
+        # without creating a new candidate.
+        echo "[*] Explicit artifact activation requested: $ACTIVATE_ARTIFACT_PATH" >&2
+        KONTROL_USE_EXISTING_DIST=true ./start-all.sh --activate-existing "${START_ARGS[@]+"${START_ARGS[@]}"}"
+      else
+        if ! KONTROL_USE_EXISTING_DIST=false ./start-all.sh --prepare-only; then
+          echo "ERROR: candidate preparation failed; the current Kontrol generation was left running." >&2
+          exit 1
+        fi
+        PREPARED_CANDIDATE_BUILD_ID="$(json_file_field "${KONTROL_STATE_DIR}/candidate.${DEPLOYMENT_ID}.json" buildId)"
+        HANDOFF_STARTED=1
+        ./stop-all.sh
+        KONTROL_USE_EXISTING_DIST=true ./start-all.sh --activate-existing "${START_ARGS[@]+"${START_ARGS[@]}"}"
+        HANDOFF_STARTED=0
       fi
-      PREPARED_CANDIDATE_BUILD_ID="$(json_file_field "${KONTROL_STATE_DIR}/candidate.${DEPLOYMENT_ID}.json" buildId)"
-      HANDOFF_STARTED=1
-      ./stop-all.sh
-      KONTROL_USE_EXISTING_DIST=true ./start-all.sh --activate-existing "$@"
-      HANDOFF_STARTED=0
       ;;
     systemd)
       echo "Kontrol is already managed by systemd. Use: scripts/kontrol-user-service.sh restart" >&2
@@ -147,6 +177,11 @@ if [[ -n "$OWNER_INFO" ]]; then
   esac
 else
   # No existing owner: start-all validates the inherited deployment lock, then
-  # releases it after the new generation is committed.
-  ./start-all.sh "$@"
+  # releases it after the new generation is committed. An explicit artifact
+  # selector activates that candidate directly without a fresh preparation.
+  if [[ -n "$ACTIVATE_ARTIFACT_PATH" ]]; then
+    KONTROL_USE_EXISTING_DIST=true ./start-all.sh --activate-existing "${START_ARGS[@]+"${START_ARGS[@]}"}"
+  else
+    ./start-all.sh "${START_ARGS[@]+"${START_ARGS[@]}"}"
+  fi
 fi

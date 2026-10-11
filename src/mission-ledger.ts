@@ -18,7 +18,7 @@ import {
 } from "./db/schema.js";
 import { normalizeWorkspaceSnapshotIdentity, type WorkspaceSnapshotKind } from "./review-checkpoints.js";
 import { fingerprintMissionContract, fingerprintStoredMissionContract, validateMissionCriterionContract } from "./mission/contract-authority.js";
-import { evaluateFindingResolutionEvidence, isEvidenceSourceAllowed, selectEffectiveEvidenceResult } from "./mission/evidence-authority.js";
+import { evaluateEffectiveFindingResolution, evaluateFindingResolutionEvidence, isEvidenceSourceAllowed, selectEffectiveEvidenceResult } from "./mission/evidence-authority.js";
 import { assertFindingStatusTransition, fingerprintFinding, mergeFindingEvidence } from "./mission/finding-authority.js";
 import { evaluateCorrectionPolicy } from "./mission/correction-policy.js";
 import { evaluateEffectiveCriteria, evaluateMissionOutcome } from "./mission/outcome-evaluator.js";
@@ -256,6 +256,13 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
       throw new Error("Mission requires at least one required acceptance criterion.");
     }
     validateMissionCriterionContract(criteria);
+    // Outcome-evidence levels above integration_verified require an independent
+    // external oracle/sustained-operation receipt, which is not yet implemented.
+    // Fail closed at creation rather than silently weakening the approval gate
+    // to an integration report.
+    if (input.outcomeEvidence === "outcome_verified" || input.outcomeEvidence === "operationally_stable") {
+      throw new Error(`outcomeEvidence ${input.outcomeEvidence} is not yet supported; independent outcome oracle qualification is required before missions can demand it.`);
+    }
     const contractFingerprint = fingerprintMissionContract(normalizedInput, criteria);
     const existingRow = database.db.select().from(missionContracts).where(eq(missionContracts.workSessionId, input.workSessionId)).get();
     if (existingRow) {
@@ -457,19 +464,23 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
     }
 
     const requiredCommands = parseJson<string[]>(finding.requiredVerificationJson, []);
+    // Do not pre-filter to passing evidence: a later failed or inconclusive
+    // attempt on the same scope must supersede an earlier pass. The effective
+    // projection evaluates the latest qualifying attempt for every command.
     const evidence = database.db.select().from(missionEvidence)
-      .where(and(eq(missionEvidence.missionId, missionId), eq(missionEvidence.findingId, findingId), eq(missionEvidence.status, "passed")))
-      .orderBy(desc(missionEvidence.createdAt)).all()
+      .where(and(eq(missionEvidence.missionId, missionId), eq(missionEvidence.findingId, findingId)))
+      .orderBy(asc(missionEvidence.attempt), asc(missionEvidence.createdAt)).all()
       .map(rowToEvidence);
-    const { eligible, missingCommands } = evaluateFindingResolutionEvidence(evidence, requiredCommands, {
+    const resolution = evaluateEffectiveFindingResolution(evidence, requiredCommands, findingId, {
       submissionId: context.submissionId,
       snapshotKind,
       snapshotRef,
       reviewEpoch: context.reviewEpoch,
     });
-    if (missingCommands.length) throw new Error(`Finding ${findingId} is missing current server verification: ${missingCommands.join(", ")}.`);
-    if (!eligible.length) throw new Error(`Finding ${findingId} has no independent evidence for the current submitted snapshot.`);
-    const evidenceIds = [...new Set(eligible.map((entry) => entry.id))];
+    if (!resolution.resolved) {
+      throw new Error(`Finding ${findingId} is not effectively resolved: ${resolution.reasons.join("; ")}`);
+    }
+    const evidenceIds = [...new Set(evidence.filter((entry) => entry.findingId === findingId && entry.status === "passed").map((entry) => entry.id))];
     database.db.update(missionReviewFindings).set({
       status: "verified_resolved",
       resolutionSubmissionId: context.submissionId,
@@ -658,6 +669,22 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
           eq(missionCompletionReports.snapshotRef, currentSnapshot.ref),
         )).orderBy(desc(missionCompletionReports.createdAt)).get()
       : undefined;
+    const effectiveFindingResolutions: Record<string, { resolved: boolean; reasons: string[] }> = {};
+    for (const finding of packet.findings) {
+      if (finding.scope === "out_of_scope" || finding.disposition !== "blocking") continue;
+      if (!["verified_resolved", "claimed_resolved"].includes(finding.status)) continue;
+      effectiveFindingResolutions[finding.id] = evaluateEffectiveFindingResolution(
+        packet.evidence,
+        finding.requiredVerification,
+        finding.id,
+        {
+          submissionId: currentContext.submissionId!,
+          snapshotKind: currentSnapshot!.kind!,
+          snapshotRef: currentSnapshot!.ref!,
+          reviewEpoch: currentContext.reviewEpoch!,
+        },
+      );
+    }
     return evaluateMissionOutcome({
       criteria: packet.criteria,
       criterionStates: evaluateCriteria(workSessionId, currentContext),
@@ -666,9 +693,11 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
       reviewCoverage: mission.reviewCoverage,
       outcomeEvidence: mission.outcomeEvidence,
       currentSubmissionId: currentContext.submissionId,
+      effectiveFindingResolutions,
       currentReport: currentReport ? {
         status: currentReport.status,
         reviewCoverage: parseJson<string[]>(currentReport.reviewCoverageJson, []),
+        results: parseJson<unknown[]>(currentReport.resultsJson, []),
       } : undefined,
     });
   }
@@ -833,23 +862,20 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
       .orderBy(asc(missionEvidence.attempt), asc(missionEvidence.createdAt))
       .all()
       .map(rowToEvidence);
-    const effective = selectEffectiveEvidenceResult(rows, { criterionId }, {
+    // Source eligibility is part of the selection, not a post-filter: an
+    // untrusted agent claim must never displace a trusted verifier result.
+    return selectEffectiveEvidenceResult(rows, { criterionId }, {
       ...context,
       snapshotKind,
       snapshotRef,
-    });
-    if (!effective) return undefined;
-    // Legacy compatibility: reject a source that cannot satisfy the criterion.
-    const details = typeof effective.details === "object" && effective.details ? effective.details as Record<string, unknown> : {};
-    return isEvidenceSourceAllowed(criterion.verificationType, details.source as import("./mission-ledger.js").MissionEvidenceSource)
-      ? effective
-      : undefined;
+    }, (source) => isEvidenceSourceAllowed(criterion.verificationType, source));
   }
 
   function getPacketWithoutApproval(missionId: string) {
     return {
       criteria: database.db.select().from(missionAcceptanceCriteria).where(eq(missionAcceptanceCriteria.missionId, missionId)).all().map(rowToCriterion),
       findings: database.db.select().from(missionReviewFindings).where(eq(missionReviewFindings.missionId, missionId)).all().map(rowToFinding),
+      evidence: database.db.select().from(missionEvidence).where(eq(missionEvidence.missionId, missionId)).orderBy(asc(missionEvidence.attempt), asc(missionEvidence.createdAt)).all().map(rowToEvidence),
     };
   }
 
