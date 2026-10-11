@@ -53,8 +53,16 @@ function sandboxExecutable(configuredPath?: string): string {
   if (process.platform !== "linux") {
     throw new Error("Verification sandbox requested, but this host has no supported sandbox primitive.");
   }
-  for (const candidate of [configuredPath, "/usr/bin/bwrap", "/bin/bwrap"]) {
-    if (candidate && existsSync(candidate)) return candidate;
+  // An explicitly configured sandbox path is an operator decision: when it is
+  // unavailable, fail closed rather than silently searching other locations.
+  if (configuredPath) {
+    if (!existsSync(configuredPath)) {
+      throw new Error(`Verification sandbox requested, but the configured bubblewrap path is unavailable: ${configuredPath}`);
+    }
+    return configuredPath;
+  }
+  for (const candidate of ["/usr/bin/bwrap", "/bin/bwrap"]) {
+    if (existsSync(candidate)) return candidate;
   }
   throw new Error("Verification sandbox requested, but bubblewrap is unavailable; refusing unsandboxed execution.");
 }
@@ -128,9 +136,23 @@ export function parseVerificationCommand(command: string): { executable: string;
   if (!executable || !ALLOWED_EXECUTABLES.has(executable)) {
     throw new Error(`Verification executable ${JSON.stringify(executable)} is not allowlisted.`);
   }
-  // Reject path traversal components, not benign names that merely contain
-  // two adjacent dots (for example `src/foo..test.ts`).
-  if (args.some((arg) => arg.split("/").includes("..") || arg.startsWith("/"))) {
+  // Reject path traversal in any argument position, including path-valued
+  // flag forms (`--out=../escape`, `--out ../escape`) and Windows separators,
+  // while preserving benign names that merely contain adjacent dots.
+  const traversalComponent = (value: string): boolean => value === "..";
+  const pathTraversal = (arg: string): boolean => {
+    const candidates: string[] = [];
+    if (arg.includes("=")) {
+      const [, ...rest] = arg.split("=");
+      candidates.push(rest.join("="));
+    }
+    candidates.push(arg);
+    return candidates.some((candidate) => {
+      const normalized = candidate.replace(/\\/g, "/");
+      return normalized.split("/").some(traversalComponent);
+    });
+  };
+  if (args.some((arg) => pathTraversal(arg) || arg.startsWith("/"))) {
     throw new Error("Verification arguments may not escape the workspace.");
   }
   return { executable, args };
@@ -188,9 +210,13 @@ export async function createVerificationExecutionContext(input: {
   const sandbox = sandboxRequested({ sandbox: input.sandbox });
   const environment = buildChildEnvironment({ sandbox, additionalKeys: input.childEnvironmentAllowlist });
   const toolchainPaths = input.verifyToolchainPaths ?? [];
-  const sandboxPath = input.sandboxExecutablePath
-    ?? ["/usr/bin/bwrap", "/bin/bwrap"].find((candidate) => existsSync(candidate));
-  const [sandboxExecutable, ...toolchainPathIdentities] = await Promise.all([
+  // Fail closed: when sandboxing is requested the primitive must exist before
+  // returning an execution context. This keeps manual and supervised paths
+  // from silently falling back to unsandboxed execution.
+  const sandboxPath = sandbox
+    ? sandboxExecutable(input.sandboxExecutablePath)
+    : input.sandboxExecutablePath ?? ["/usr/bin/bwrap", "/bin/bwrap"].find((candidate) => existsSync(candidate));
+  const [sandboxExecutableIdentity, ...toolchainPathIdentities] = await Promise.all([
     pathExecutionIdentity(sandboxPath),
     ...toolchainPaths.map((path) => pathExecutionIdentity(path)),
   ]);
@@ -199,7 +225,7 @@ export async function createVerificationExecutionContext(input: {
     environment,
     toolchainPaths,
     sandboxExecutablePath: sandboxPath,
-    executionIdentity: { sandboxExecutable, toolchainPaths: toolchainPathIdentities },
+    executionIdentity: { sandboxExecutable: sandboxExecutableIdentity, toolchainPaths: toolchainPathIdentities },
   };
 }
 
@@ -708,7 +734,18 @@ export async function verifyMissionSubmission(input: {
 
   while (remaining.size > 0 && !bindingLost) {
     const ready = [...remaining.values()].filter((criterion) => (criterion.dependsOnCriterionIds ?? []).every((dependency) => dependencyStatus(dependency) !== undefined));
-    if (ready.length === 0) throw new VerificationBindingError("Verification dependency graph could not be scheduled.");
+    if (ready.length === 0) {
+      // A dependency excluded from this phase (for example a finalOnly
+      // prerequisite during progressive verification) is not a scheduling
+      // failure. Record the blocked criterion as inconclusive so the phase
+      // completes and the final phase can rerun the dependency first.
+      for (const criterion of [...remaining.values()]) {
+        const command = criterion.verificationCommand ?? runtimeProbeLabel(criterion.runtimeProbe!);
+        recordResult(criterion, inconclusiveResult(criterion.id, command, "Verification skipped because a required prerequisite is not scheduled in this verification phase."));
+      }
+      remaining.clear();
+      break;
+    }
     const runnable = ready.filter((criterion) => !(criterion.dependsOnCriterionIds ?? []).some((dependency) => dependencyStatus(dependency) !== "passed"));
     const blocked = ready.filter((criterion) => !runnable.includes(criterion));
     const batch = runnable.length > 0 ? runnable.filter((criterion) => !criterion.mutatesWorkspace).slice(0, maxVerificationInflight) : blocked.slice(0, maxVerificationInflight);

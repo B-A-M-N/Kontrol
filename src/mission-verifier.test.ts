@@ -1,11 +1,17 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { mkdtemp, rm } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdtemp, mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createVerificationExecutionContext, parseVerificationCommand, runRuntimeProbe, runVerificationCommand, verificationCacheKey, verifyMissionSubmission } from "./mission-verifier.js";
 
 const root = await mkdtemp(join(tmpdir(), "kontrol-mission-verifier-test-"));
+// Sandboxed execution-identity tests require real sandbox and toolchain paths.
+await mkdir(join(root, "sandbox-a"), { recursive: true });
+await mkdir(join(root, "sandbox-b"), { recursive: true });
+await mkdir(join(root, "toolchain-a"), { recursive: true });
+await mkdir(join(root, "toolchain-b"), { recursive: true });
 try {
   assert.deepEqual(parseVerificationCommand("npm test"), { executable: "npm", args: ["test"] });
   assert.throws(() => parseVerificationCommand("npm test; rm -rf /"), /not permitted/);
@@ -15,6 +21,12 @@ try {
   const dotsName = parseVerificationCommand("npm run foo..bar");
   assert.deepEqual(dotsName.args, ["run", "foo..bar"], "benign file names containing adjacent dots are allowed");
   assert.throws(() => parseVerificationCommand("npm test ../escape"), /may not escape/);
+  assert.throws(() => parseVerificationCommand("npm test --out=../escape"), /may not escape/,
+    "path-valued flag arguments cannot traverse the workspace");
+  assert.throws(() => parseVerificationCommand("npm test src\\..\\escape"), /may not escape/,
+    "Windows separator traversal is rejected");
+  assert.deepEqual(parseVerificationCommand("npm run foo..bar").args, ["run", "foo..bar"],
+    "benign adjacent-dot names are still allowed");
 
   const originalCacheEnv = process.env.VERIFIER_CACHE_TEST_FLAG;
   try {
@@ -79,6 +91,23 @@ try {
     await assert.rejects(runRuntimeProbe({ url: "http://example.com/" }, Date.now() + 5000), /restricted to unauthenticated loopback/);
   } finally {
     await new Promise<void>((resolve, reject) => runtimeProbeServer.close((error) => error ? reject(error) : resolve()));
+  }
+
+  // F03 fail-closed: sandbox requested with an unavailable primitive refuses
+  // execution rather than silently falling back to unsandboxed execution. On
+  // hosts that do provide bwrap, a configured path that does not exist must
+  // still fail closed rather than silently search standard locations.
+  if (existsSync("/usr/bin/bwrap")) {
+    await assert.rejects(
+      createVerificationExecutionContext({ sandbox: true, sandboxExecutablePath: join(root, "missing-bwrap") }),
+      /bubblewrap path is unavailable|bubblewrap is unavailable/,
+      "a configured sandbox path that does not exist fails closed",
+    );
+  } else {
+    await assert.rejects(
+      createVerificationExecutionContext({ sandbox: true }),
+      /no supported sandbox primitive|bubblewrap is unavailable/,
+    );
   }
 
   const passing = await runVerificationCommand("npm --version", root);
@@ -216,6 +245,45 @@ try {
   // Focused verification expands the explicit selection to transitive
   // dependencies: selecting the dependent runs both, and a failing dependency
   // prevents the dependent from running.
+  // F05 composition: a failing dependency prevents the dependent from running.
+  const failingDependencyHarness = harness({
+    criteria: [
+      { id: "base", description: "base", verificationCommand: "npm test" },
+      { id: "dependent", description: "dependent", verificationCommand: "npm --version", dependsOnCriterionIds: ["base"] },
+    ],
+  });
+  // npm test fails in this temp root (no package.json), simulating dependency failure.
+  const failingDependencyResults = await failingDependencyHarness.run(["dependent"]);
+  assert.equal(failingDependencyResults.find((r) => r.criterionId === "base")?.status, "failed",
+    "a failing dependency is recorded as failed");
+  assert.equal(failingDependencyResults.find((r) => r.criterionId === "dependent")?.status, "inconclusive",
+    "a dependent criterion is inconclusive when its dependency fails");
+
+  // Final-only dependencies unlock only in the final phase.
+  const finalDependencyHarness = harness({
+    criteria: [
+      { id: "base", description: "base", verificationCommand: "npm --version", finalOnly: true },
+      { id: "dependent", description: "dependent", verificationCommand: "npm --version", dependsOnCriterionIds: ["base"] },
+    ],
+  });
+  const progressiveFinal = await finalDependencyHarness.run(["dependent"], "progressive");
+  assert.equal(progressiveFinal.find((r) => r.criterionId === "dependent")?.status, "inconclusive",
+    "a dependent whose final-only prerequisite is excluded from the progressive phase is inconclusive, not failed");
+  const finalPhase = await finalDependencyHarness.run(["dependent"], "final");
+  assert.deepEqual(finalPhase.map((r) => r.criterionId), ["base", "dependent"], "final phase unlocks the final-only dependency before its dependent");
+
+  // Unrelated criteria remain excluded from a focused selection.
+  const unrelatedHarness = harness({
+    criteria: [
+      { id: "base", description: "base", verificationCommand: "npm --version" },
+      { id: "dependent", description: "dependent", verificationCommand: "npm --version", dependsOnCriterionIds: ["base"] },
+      { id: "unrelated", description: "unrelated", verificationCommand: "npm --version" },
+    ],
+  });
+  const unrelatedResults = await unrelatedHarness.run(["dependent"]);
+  assert.deepEqual(unrelatedResults.map((r) => r.criterionId), ["base", "dependent"],
+    "focused selection expands dependencies but excludes unrelated criteria");
+
   const dependencyHarness = harness({
     criteria: [
       { id: "base", description: "base", verificationCommand: "npm --version" },
