@@ -15,7 +15,7 @@
 
 ### Operational items still open
 
-- **F07** — MCP tool catalog mismatch requires a live fresh-host probe. Source registration is verified by `mcp-tool-surface-contract.test.ts`, which passes. The active production server was not running during this remediation window, so live catalog parity is still pending a fresh host connection.
+- **F07** — Live candidate verification completed on October 11, 2026: isolated candidate `c97f59b097f8821a` started on loopback 7699 in tunnel auth mode. The `scripts/probe-mcp-tunnel.mjs` dual-cycle probe passed 5 cycles (37 correlated responses), and an explicit git-tools probe invoked `git_status`, `git_log`, `git_diff`, and `git_show` successfully (4/4). Together with the probe's concurrent `read`, `grep`, `glob`, and `ls` inspections, all eight required inspection tools plus `poll_process` are callable against the current candidate. A real fresh ChatGPT host connection remains the final external-parity check for full release qualification. A probe bug that misparsed single-chunk SSE JSON-RPC responses was also fixed in commit `f19abcf`.
 - **F09/F10** — Operational soak, external catalog qualification, and real-host outcome efficacy require a running deployment and 12-hour wall-clock soak. The exact-candidate soak is the required next operational step after deploying the current build.
 
 ### Verification run (all green)
