@@ -378,6 +378,17 @@ export function createReviewWorkflowService(
             409,
           );
         }
+        // R02/E-toggle: the handoff's route epoch must still match the current
+        // route. A mode/route change increments routeEpoch, so feedback claimed
+        // under the previous route cannot be committed after the destination
+        // changed — the reviewer must re-claim against the current route.
+        if (handoff!.routeEpoch !== route.routeEpoch) {
+          throw new WorkflowError(
+            "Review routing conflict: the claimed handoff belongs to a superseded route epoch.",
+            "conflict",
+            409,
+          );
+        }
       }
     }
 

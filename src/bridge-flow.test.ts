@@ -1309,6 +1309,105 @@ try {
     assert.equal((singleRound.structuredContent as { warning?: string })?.warning, undefined, "a single-round pinned review has no drift warning");
   }
 
+  // ── Experiment C: pinned review, maximum 3 rounds, 4th automatic round blocked ──
+  {
+    const sessionId = createSession();
+    // Enable a pinned review route with a hard 3-round ceiling and disable the
+    // live waiter so reviewer feedback drives the automation deterministically.
+    await callReviewer("configure_review_loop", {
+      workSessionId: sessionId, enabled: true, mode: "pinned_conversation", maxReviewRounds: 3,
+    });
+
+    // Round 1: submit S1, reviewer claims the handoff and requests changes.
+    await callWorker("submit_for_review", { sessionId });
+    let sub = workSessions.get(sessionId)!.latestSubmission!;
+    let handoff = reviewRoutes.getHandoffBySubmission(sessionId, sub.id, sub.reviewEpoch)!;
+    await callReviewer("claim_review_handoff", { handoffId: handoff.id, expectedRevision: handoff.revision });
+    await callReviewer("provide_review_feedback", { sessionId, verdict: "changes_requested", comments: "round 1 fix" });
+    assert.equal(reviewRoutes.getRouteBySession(sessionId)!.completedReviewRounds, 1, "round 1 consumed a review round");
+
+    // Round 2.
+    await callWorker("submit_for_review", { sessionId });
+    sub = workSessions.get(sessionId)!.latestSubmission!;
+    handoff = reviewRoutes.getHandoffBySubmission(sessionId, sub.id, sub.reviewEpoch)!;
+    await callReviewer("claim_review_handoff", { handoffId: handoff.id, expectedRevision: handoff.revision });
+    await callReviewer("provide_review_feedback", { sessionId, verdict: "changes_requested", comments: "round 2 fix" });
+    assert.equal(reviewRoutes.getRouteBySession(sessionId)!.completedReviewRounds, 2, "round 2 consumed a review round");
+
+    // Round 3.
+    await callWorker("submit_for_review", { sessionId });
+    sub = workSessions.get(sessionId)!.latestSubmission!;
+    handoff = reviewRoutes.getHandoffBySubmission(sessionId, sub.id, sub.reviewEpoch)!;
+    await callReviewer("claim_review_handoff", { handoffId: handoff.id, expectedRevision: handoff.revision });
+    await callReviewer("provide_review_feedback", { sessionId, verdict: "changes_requested", comments: "round 3 fix" });
+    assert.equal(reviewRoutes.getRouteBySession(sessionId)!.completedReviewRounds, 3, "round 3 consumed the final review round");
+
+    // A 4th submission cannot open a new automatic review round: the route
+    // refuses to create a handoff once the budget is exhausted.
+    await callWorker("submit_for_review", { sessionId });
+    sub = workSessions.get(sessionId)!.latestSubmission!;
+    assert.equal(
+      reviewRoutes.getHandoffBySubmission(sessionId, sub.id, sub.reviewEpoch),
+      undefined,
+      "no 4th handoff is created once the round budget is exhausted",
+    );
+    // The reviewer's ordinary feedback is blocked because there is no claimed
+    // handoff, and the budget itself cannot be exceeded.
+    const overflow = await callReviewer("provide_review_feedback", { sessionId, verdict: "changes_requested", comments: "round 4" });
+    assert.ok(overflow.isError, "a 4th automatic round is blocked at the workflow boundary");
+  }
+
+  // ── Experiment D: loop OFF creates fresh isolated handoffs and preserves
+  //    the original work session across submissions ──
+  {
+    const sessionId = createSession();
+    const originalSessionId = sessionId;
+    await callReviewer("configure_review_loop", {
+      workSessionId: sessionId, enabled: true, mode: "isolated_review", maxReviewRounds: 3,
+    });
+    await callWorker("submit_for_review", { sessionId });
+    const s1 = workSessions.get(sessionId)!.latestSubmission!;
+    const h1 = reviewRoutes.getHandoffBySubmission(sessionId, s1.id, s1.reviewEpoch)!;
+    await callReviewer("claim_review_handoff", { handoffId: h1.id, expectedRevision: h1.revision });
+    await callReviewer("provide_review_feedback", { sessionId, verdict: "changes_requested", comments: "fresh review 1" });
+
+    await callWorker("submit_for_review", { sessionId });
+    const s2 = workSessions.get(sessionId)!.latestSubmission!;
+    const h2 = reviewRoutes.getHandoffBySubmission(sessionId, s2.id, s2.reviewEpoch)!;
+    assert.notEqual(h1.id, h2.id, "each submission gets a fresh isolated handoff");
+    assert.notEqual(h1.reviewEpoch + ":" + h1.submissionId, h2.reviewEpoch + ":" + h2.submissionId, "handoffs bind to distinct submissions");
+    // The original work session is never replaced by a fresh review.
+    assert.equal(workSessions.get(sessionId)!.id, originalSessionId, "loop OFF does not create a new coding work session");
+    await callReviewer("claim_review_handoff", { handoffId: h2.id, expectedRevision: h2.revision });
+    const approved = await callReviewer("provide_review_feedback", { sessionId, verdict: "approve", comments: "fresh review 2" });
+    assert.ok(!approved.isError, "a fresh authorized handoff returns its verdict to the original work session");
+  }
+
+  // ── Experiment E: a route change mid-flight supersedes a stale claim ──
+  {
+    const sessionId = createSession();
+    await callReviewer("configure_review_loop", { workSessionId: sessionId, enabled: true, mode: "isolated_review", maxReviewRounds: 3 });
+    await callWorker("submit_for_review", { sessionId });
+    const sub = workSessions.get(sessionId)!.latestSubmission!;
+    const handoff = reviewRoutes.getHandoffBySubmission(sessionId, sub.id, sub.reviewEpoch)!;
+    await callReviewer("claim_review_handoff", { handoffId: handoff.id, expectedRevision: handoff.revision });
+
+    // The reviewer switches routing mode before committing feedback. This
+    // increments the route epoch, invalidating the handoff claimed against the
+    // old destination.
+    const reconfigured = await callReviewer("configure_review_loop", {
+      workSessionId: sessionId, enabled: true, mode: "pinned_conversation", maxReviewRounds: 3,
+    });
+    assert.equal(
+      (reconfigured.structuredContent as { routeEpoch?: number })?.routeEpoch,
+      2,
+      "a mode change advances the route epoch",
+    );
+    const staleCommit = await callReviewer("provide_review_feedback", { sessionId, verdict: "changes_requested", comments: "stale route" });
+    assert.ok(staleCommit.isError, "feedback claimed under a superseded route epoch is rejected");
+    assert.equal(workSessions.get(sessionId)!.status, "awaiting_review", "the stale commit did not mutate the session");
+  }
+
   // ── Scenario 13: defect #1 + #4 — awaiting-review worker crash stays resumable ──
   {
     const sessionId = createSession();
