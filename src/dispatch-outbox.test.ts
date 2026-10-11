@@ -156,6 +156,46 @@ try {
     db.close();
   }
 
+  // --- F01b: event-type ownership. A consumer filtered to its own event
+  //     types must never claim a foreign consumer's event, and each owner can
+  //     drain only its own queue. ---
+  {
+    const db = openDatabase(join(root, "ownership"));
+    const outbox = createDispatchOutbox(db);
+    outbox.enqueue({ eventType: "continuation.ready", aggregateId: "c-1", aggregateRevision: 1 });
+    outbox.enqueue({ eventType: "scheduled_job.due", aggregateId: "j-1", aggregateRevision: 1 });
+    outbox.enqueue({ eventType: "supervisor.verification.requested", aggregateId: "s-1", aggregateRevision: 1 });
+    outbox.enqueue({ eventType: "agent.reply.ready", aggregateId: "r-1", aggregateRevision: 1 });
+
+    // The continuation consumer only ever sees its own type.
+    const contEvents = [];
+    for (;;) {
+      const event = outbox.claimNext("continuation-consumer", 10_000, ["continuation.ready"]);
+      if (!event) break;
+      contEvents.push(event);
+      outbox.markCompleted(claimOf(event));
+    }
+    assert.deepEqual(contEvents.map((e) => e.eventType), ["continuation.ready"],
+      "a filtered consumer claims only its own event type");
+    assert.equal(contEvents.length, 1, "exactly one continuation event was owned");
+
+    // The other three consumers each still see their own event untouched.
+    for (const [consumer, type, expectedId] of [
+      ["scheduler", "scheduled_job.due", "j-1"],
+      ["supervisor", "supervisor.verification.requested", "s-1"],
+      ["reply", "agent.reply.ready", "r-1"],
+    ] as const) {
+      const event = outbox.claimNext(consumer, 10_000, [type]);
+      assert.ok(event, `${consumer} reclaims its own event`);
+      assert.equal(event.eventType, type);
+      assert.equal(event.aggregateId, expectedId);
+      outbox.markCompleted(claimOf(event));
+    }
+    assert.equal(outbox.listPending().length, 0, "every owned event was consumed by its own owner");
+    outbox.close();
+    db.close();
+  }
+
   // --- Fix 2: checkout-lease renewal from a worker heartbeat. ---
   {
     const db = openDatabase(join(root, "leases"));
