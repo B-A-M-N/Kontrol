@@ -329,6 +329,26 @@ export function assertWorkerSessionBinding(config: BridgeConfig, sessionId: stri
   return null;
 }
 
+/**
+ * F02: worker-specific delivery/consumption must never ride the permissive
+ * legacy `requireWorkSessionRead` worker branch. A worker may only create,
+ * consume, or acknowledge messages for the exact work session its signed
+ * envelope bound it to; an unbound worker (which should not occur for a
+ * verified token, but must fail closed regardless) has no such authority.
+ * Ordinary clients are not workers and are left to the read/owner-context
+ * checks in their own tools.
+ */
+export function requireWorkerDeliveryBinding(config: BridgeConfig, sessionId: string) {
+  if (config.principalRole !== "worker") return null;
+  if (!config.connectionWorkSessionId) {
+    return forbidden(config.principalRole, "unbound worker has no message delivery authority");
+  }
+  if (config.connectionWorkSessionId !== sessionId) {
+    return forbidden(config.principalRole, "cross-session message delivery");
+  }
+  return assertWorkerSessionBinding(config, sessionId);
+}
+
 export function requireWorkSessionMutation(config: BridgeConfig, sessionId: string) {
   const access = requireWorkSessionRead(config, sessionId);
   if (access) return access;

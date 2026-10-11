@@ -110,6 +110,7 @@ async function testDatabaseConfiguration(stateDir: string): Promise<void> {
       { version: 67, name: "scheduled-job-lifecycle" },
       { version: 68, name: "agent-reply-delivery" },
       { version: 69, name: "review-handoff-routing" },
+      { version: 70, name: "dispatch-outbox-claim-fencing" },
     ]);
   } finally {
     database.close();

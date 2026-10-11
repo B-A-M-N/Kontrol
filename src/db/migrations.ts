@@ -79,6 +79,7 @@ const migrations: Migration[] = [
   { version: 67, name: "scheduled-job-lifecycle", up: migrateScheduledJobLifecycle },
   { version: 68, name: "agent-reply-delivery", up: migrateAgentReplyDelivery },
   { version: 69, name: "review-handoff-routing", up: migrateReviewHandoffRouting },
+  { version: 70, name: "dispatch-outbox-claim-fencing", up: migrateDispatchOutboxClaimFencing },
 ];
 
 // v64: verification attempts need durable monotonic ordering because ISO
@@ -1413,6 +1414,25 @@ function migrateDispatchOutboxFailureCount(sqlite: Database.Database): void {
 /**
  * v22: durable agent→WebUI messages and artifacts. See schema.ts agentMessages.
  */
+/**
+ * v70 (F01): fencing token for claimed outbox events. `markCompleted`,
+ * `release`, and `markFailed` previously accepted a bare event id, so a
+ * claimant whose lease expired and whose event was re-claimed by another
+ * worker could still acknowledge the new claimant's work. Every claimed
+ * transition now requires the exact `claim_token` minted by the claiming
+ * `claimNext()` CAS. Pre-existing claimed rows have no token and therefore
+ * cannot be acknowledged by a stale holder; they are reaped back to pending
+ * and re-claimed with a fresh token.
+ */
+function migrateDispatchOutboxClaimFencing(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "dispatch_outbox", "claim_token", "text");
+  // Any in-flight claim from an older binary carries no token and must not be
+  // completed under the new fenced interface. Return it to pending so it is
+  // picked up with a freshly minted token; the claim odometer already records
+  // the interrupted attempt.
+  sqlite.exec("update dispatch_outbox set status = 'pending', claimed_by = null, claim_expires_at = null where status = 'claimed' and claim_token is null");
+}
+
 function migrateAgentMessages(sqlite: Database.Database): void {
   sqlite.exec(`
     create table if not exists agent_messages (

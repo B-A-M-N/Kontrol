@@ -9,7 +9,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { BridgeConfig } from "./context.js";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
 import { registerMutationAppTool } from "./app-tool.js";
-import { assertWorkerSessionBinding, forbidden, isWorkerOrClient, requireWorkSessionRead } from "./shared.js";
+import { forbidden, isWorkerOrClient, requireWorkerDeliveryBinding, requireWorkSessionRead } from "./shared.js";
 import { z } from "zod/v4";
 
 export function registerReplyTools(server: McpServer, config: BridgeConfig): void {
@@ -36,7 +36,7 @@ export function registerReplyTools(server: McpServer, config: BridgeConfig): voi
       if (!isWorkerOrClient(config.principalRole)) return forbidden(config.principalRole, "get_pending_agent_replies");
       const denied = requireWorkSessionRead(config, sessionId);
       if (denied) return denied;
-      const bind = assertWorkerSessionBinding(config, sessionId);
+      const bind = requireWorkerDeliveryBinding(config, sessionId);
       if (bind) return bind;
       if (!config.agentMessages) return { content: [{ type: "text" as const, text: "Agent-message store unavailable." }], isError: true };
       const replies = config.agentMessages.listPendingReplies(sessionId);
@@ -80,7 +80,7 @@ export function registerReplyTools(server: McpServer, config: BridgeConfig): voi
       if (!isWorkerOrClient(config.principalRole)) return forbidden(config.principalRole, "await_agent_reply");
       const denied = requireWorkSessionRead(config, sessionId);
       if (denied) return denied;
-      const bind = assertWorkerSessionBinding(config, sessionId);
+      const bind = requireWorkerDeliveryBinding(config, sessionId);
       if (bind) return bind;
       if (!config.agentMessages) return { content: [{ type: "text" as const, text: "Agent-message store unavailable." }], isError: true };
       const message = config.agentMessages.get(messageId);
@@ -132,7 +132,11 @@ export function registerReplyTools(server: McpServer, config: BridgeConfig): voi
     const sessionId = String(input.sessionId ?? "");
     const replyId = String(input.replyId ?? "");
     if (!isWorkerOrClient(config.principalRole)) return forbidden(config.principalRole, "ack_agent_reply");
-    const bind = assertWorkerSessionBinding(config, sessionId);
+    // Acknowledgement is consumption, so a binding is mandatory for workers:
+    // an unbound worker cannot acknowledge a reply it was never delivered.
+    const bind = config.principalRole === "worker"
+      ? requireWorkerDeliveryBinding(config, sessionId)
+      : requireWorkSessionRead(config, sessionId);
     if (bind) return bind;
     if (!config.agentMessages) return { content: [{ type: "text" as const, text: "Agent-message store unavailable." }], isError: true };
     const run = config.agentRegistry.getRunByWorkSessionId(sessionId);

@@ -1,5 +1,5 @@
 import { createDispatchOutbox } from "../dispatch-outbox.js";
-import type { DispatchOutbox } from "../dispatch-outbox.js";
+import type { DispatchOutbox, OutboxClaim } from "../dispatch-outbox.js";
 import type { DatabaseHandle } from "../db/client.js";
 
 export interface ScheduledJobRuntime {
@@ -17,22 +17,12 @@ export interface ScheduledJobRuntimeOptions {
   pollMs?: number;
 }
 
-interface DueEvent {
-  id: string;
-  aggregateId: string;
-  aggregateRevision: number;
-  markCompleted(id: string): void;
-}
-
 export function createScheduledJobRuntime(options: ScheduledJobRuntimeOptions): ScheduledJobRuntime {
   const database = options.database;
   const dispatchOutbox = options.dispatchOutbox ?? createDispatchOutbox(database);
   const schedulerInstanceId = options.schedulerInstanceId ?? "kontrol-scheduler";
   const leaseMs = options.leaseMs ?? 60_000;
   const pollMs = options.pollMs ?? 5_000;
-  const outboxAny = dispatchOutbox as unknown as {
-    claimNext(workerId: string, leaseMs: number, eventTypes?: string[]): DueEvent | null;
-  };
   let timer: ReturnType<typeof setTimeout> | null = null;
   let stopped = false;
 
@@ -43,19 +33,20 @@ export function createScheduledJobRuntime(options: ScheduledJobRuntimeOptions): 
   async function drainOnce(): Promise<void> {
     if (stopped) return;
     dispatchOutbox.reapExpiredClaims(leaseMs);
-    let event: DueEvent | null;
-    while ((event = outboxAny.claimNext(schedulerInstanceId, leaseMs, ["scheduled_job.due"])) !== null) {
+    for (;;) {
+      const event = dispatchOutbox.claimNext(schedulerInstanceId, leaseMs, ["scheduled_job.due"]);
+      if (!event) break;
+      const claim: OutboxClaim = { eventId: event.id, claimOwner: event.claimedBy ?? "", claimToken: event.claimToken ?? "" };
       try {
         const row = database.sqlite.prepare("select revision from scheduled_jobs where id = ?").get(event.aggregateId) as { revision?: number } | undefined;
         if (!row) {
-          dispatchOutbox.markCompleted(event.id);
+          dispatchOutbox.markCompleted(claim);
           continue;
         }
         markDue(event.aggregateId);
-        dispatchOutbox.markCompleted(event.id);
-        void row;
+        dispatchOutbox.markCompleted(claim);
       } catch (error) {
-        dispatchOutbox.markFailed(event.id, error instanceof Error ? error.message : String(error), 5_000);
+        dispatchOutbox.markFailed(claim, error instanceof Error ? error.message : String(error), 5_000);
       }
     }
   }

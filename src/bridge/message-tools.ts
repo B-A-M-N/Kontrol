@@ -9,7 +9,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { BridgeConfig } from "./context.js";
 import { AGENT_MESSAGE_KINDS } from "../agent-messages.js";
 import { registerMutationAppTool } from "./app-tool.js";
-import { assertWorkerSessionBinding, forbidden, isReviewer, isWorkerOrClient, requireWorkSessionMutation, requireWorkSessionRead, workspaceAppModelAndAppMeta } from "./shared.js";
+import { forbidden, isReviewer, isWorkerOrClient, requireWorkerDeliveryBinding, requireWorkSessionMutation, requireWorkSessionRead, workspaceAppModelAndAppMeta } from "./shared.js";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
 import { z } from "zod/v4";
 
@@ -44,7 +44,9 @@ export function registerMessageTools(server: McpServer, config: BridgeConfig): v
       }
       const session = config.workSessions.get(sessionId);
       if (!session) return { content: [{ type: "text" as const, text: "Session not found." }], isError: true };
-      const bind = assertWorkerSessionBinding(config, sessionId);
+      // F02: message creation is a worker delivery action and must never use
+      // the permissive legacy worker read branch.
+      const bind = requireWorkerDeliveryBinding(config, sessionId);
       if (bind) return bind;
 
       const run = config.agentRegistry.getRunByWorkSessionId(sessionId);
@@ -205,16 +207,21 @@ export function registerMessageTools(server: McpServer, config: BridgeConfig): v
           });
           return { accepted, event };
         }
-        const resolved = config.agentMessages!.resolve(messageId);
-        const event = config.eventStore.appendEvent({
-          type: "agent.message.resolved",
-          sessionId,
-          payload: { messageId, replyToKind: existing.kind },
-        }, { publish: false });
-        return { resolved, event };
+        const resolution = config.agentMessages!.resolve(messageId);
+        // F03: only a real open→resolved transition may produce a resolution
+        // event. A repeat request that finds the message already resolved is a
+        // truthful no-op and must not append a duplicate apparent resolution.
+        const event = resolution.changed
+          ? config.eventStore.appendEvent({
+              type: "agent.message.resolved",
+              sessionId,
+              payload: { messageId, replyToKind: existing.kind },
+            }, { publish: false })
+          : undefined;
+        return { resolved: resolution.message, changed: resolution.changed, event };
       };
       const committed = config.db ? config.db.sqlite.transaction(commit)() : commit();
-      config.eventStore.publishEvents([committed.event]);
+      if (committed.event) config.eventStore.publishEvents([committed.event]);
       if ("accepted" in committed && committed.accepted) {
         return {
           content: [{ type: "text" as const, text: `Reply ${committed.accepted.id} saved; awaiting agent acknowledgement.` }],
@@ -222,6 +229,12 @@ export function registerMessageTools(server: McpServer, config: BridgeConfig): v
         };
       }
       const resolved = committed.resolved;
+      if (committed.changed === false) {
+        return {
+          content: [{ type: "text" as const, text: `Message ${messageId} was already resolved; no change recorded.` }],
+          structuredContent: { messageId, status: resolved?.status ?? "resolved" },
+        };
+      }
       return {
         content: [{ type: "text" as const, text: `Resolved ${messageId}.` }],
         structuredContent: { messageId, status: resolved?.status ?? "resolved" },

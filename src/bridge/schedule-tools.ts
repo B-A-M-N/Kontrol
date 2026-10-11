@@ -46,7 +46,7 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
       annotations: { readOnlyHint: false },
     },
     config,
-    async ({ workspaceId, runAt, instructions, executionMode, maxRuntimeMinutes, agentName }) => {
+    async ({ workspaceId, runAt, instructions, executionMode, maxRuntimeMinutes, agentName, clientMutationId }) => {
       if (!isReviewer(config.principalRole)) return forbidden(config.principalRole, "schedule_job");
       if (!jobs) {
         return { content: [{ type: "text" as const, text: "Scheduled jobs are unavailable: the scheduler store is not configured." }], isError: true };
@@ -64,7 +64,7 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
           policySnapshotJson: { workspaceAccess: "read_only", mutate: false },
           agentName,
           maxRuntimeMs: maxRuntimeMinutes * 60_000,
-          clientMutationId: undefined,
+          clientMutationId,
         });
         return {
           content: [{ type: "text" as const, text: `Scheduled job ${job.id} for ${job.runAt}.` }],
@@ -128,6 +128,88 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
 
   readTool("get_scheduled_job", "Get scheduled job", "Retrieve a durable scheduled job by ID.");
   readTool("get_scheduled_job_result", "Get scheduled job result", "Retrieve the current scheduled-job correlation and terminal outcome.");
+
+  registerAppTool(
+    server,
+    "list_scheduled_jobs",
+    {
+      title: "List scheduled jobs",
+      description: "List durable scheduled jobs owned by this reviewer context, for inbox/rehydration views.",
+      inputSchema: { limit: z.number().int().min(1).max(200).optional() },
+      outputSchema: {
+        jobs: z.array(z.object({
+          scheduledJobId: z.string(),
+          status: z.string(),
+          revision: z.number(),
+          runAt: z.string(),
+          workSessionId: z.string().optional(),
+        })),
+      },
+      _meta: {},
+      annotations: { readOnlyHint: true },
+    } as any,
+    async (input: unknown) => {
+      if (!isReviewer(config.principalRole)) return forbidden(config.principalRole, "list_scheduled_jobs");
+      if (!jobs) return { content: [{ type: "text" as const, text: "Scheduled jobs are unavailable." }], isError: true };
+      const { limit } = (input ?? {}) as { limit?: number };
+      const owner = liveOwnerContextId(config) ?? config.principalId ?? "unknown-owner";
+      const owned = jobs.listForOwner(owner, limit);
+      return {
+        content: [{ type: "text" as const, text: `${owned.length} scheduled job(s).` }],
+        structuredContent: {
+          jobs: owned.map((job) => ({
+            scheduledJobId: job.id,
+            status: job.status,
+            revision: job.revision,
+            runAt: job.runAt,
+            workSessionId: job.workSessionId,
+          })),
+        },
+      };
+    },
+  );
+
+  registerMutationAppTool(
+    server,
+    "cancel_scheduled_job",
+    {
+      title: "Cancel scheduled job",
+      description: "Cancel a durable scheduled job before or instead of its execution, using CAS on its revision. Idempotent for an already-terminal cancellation.",
+      inputSchema: {
+        scheduledJobId: z.string(),
+        expectedRevision: z.number().int().min(1),
+        clientMutationId: z.string().min(1).max(200).optional(),
+      },
+      outputSchema: { scheduledJobId: z.string(), status: z.string(), revision: z.number() },
+      _meta: {},
+      annotations: { readOnlyHint: false },
+    },
+    config,
+    async ({ scheduledJobId, expectedRevision }) => {
+      if (!isReviewer(config.principalRole)) return forbidden(config.principalRole, "cancel_scheduled_job");
+      if (!jobs) return { content: [{ type: "text" as const, text: "Scheduled jobs are unavailable." }], isError: true };
+      const job = jobs.get(scheduledJobId);
+      if (!job) return { content: [{ type: "text" as const, text: `Unknown scheduled job: ${scheduledJobId}` }], isError: true };
+      if (job.ownerContextId !== (liveOwnerContextId(config) ?? config.principalId ?? "unknown-owner")) {
+        return forbidden(config.principalRole, "cancel_scheduled_job");
+      }
+      if (job.status === "cancelled" || job.status === "failed" || job.status === "completed" || job.status === "blocked") {
+        return {
+          content: [{ type: "text" as const, text: `Scheduled job ${scheduledJobId} is already ${job.status}.` }],
+          structuredContent: { scheduledJobId: job.id, status: job.status, revision: job.revision },
+        };
+      }
+      try {
+        const cancelled = jobs.transition({ jobId: scheduledJobId, expectedRevision, nextStatus: "cancelled", lastError: "operator cancelled" });
+        return {
+          content: [{ type: "text" as const, text: `Cancelled scheduled job ${scheduledJobId}.` }],
+          structuredContent: { scheduledJobId: cancelled.id, status: cancelled.status, revision: cancelled.revision },
+        };
+      } catch (error) {
+        return { content: [{ type: "text" as const, text: error instanceof Error ? error.message : String(error) }], isError: true };
+      }
+    },
+  );
 }
 
 void schedulingOperation;

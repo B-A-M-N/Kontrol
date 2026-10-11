@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, asc, eq, inArray, lt, lte, notInArray, or } from "drizzle-orm";
+import { and, asc, eq, gt, inArray, isNull, lt, lte, notInArray, or } from "drizzle-orm";
 import { openDatabase, type DatabaseHandle } from "./db/client.js";
 import { dispatchOutbox, type DispatchOutboxRow } from "./db/schema.js";
 
@@ -12,6 +12,9 @@ export interface DispatchOutboxEvent {
   aggregateRevision: number;
   payload: Record<string, unknown>;
   status: OutboxStatus;
+  /** Fencing token minted by the successful claim CAS. Present only while the
+   * event is owned by an active claim; required for release/complete/fail. */
+  claimToken?: string;
   /** Claim odometer (observability). Bumped on every claim. */
   attemptCount: number;
   /** Genuine dispatch failures. Drives backoff + dead-lettering. */
@@ -22,6 +25,13 @@ export interface DispatchOutboxEvent {
   lastError?: string;
   createdAt: string;
   completedAt?: string;
+}
+
+/** Fencing identity for a claimed outbox event. */
+export interface OutboxClaim {
+  eventId: string;
+  claimOwner: string;
+  claimToken: string;
 }
 
 export interface DispatchOutbox {
@@ -39,12 +49,19 @@ export interface DispatchOutbox {
   /** Reap expired claims back to pending. Returns count requeued. */
   reapExpiredClaims(leaseMs: number): number;
 
-  /** Release a claimed event without recording a failed attempt. */
-  release(id: string, retryDelayMs?: number, note?: string): void;
+  /**
+   * F01 fencing: every claimed-event transition must present the exact
+   * `claimToken` minted by the claiming claimNext(). The CAS also requires the
+   * row to still be `claimed`, owned by `claimOwner`, and unexpired, so a
+   * stale claimant whose lease lapsed and whose event was re-claimed by a
+   * different worker cannot release, complete, or dead-letter foreign work.
+   * Each returns true only when exactly one row was transitioned.
+   */
+  release(claim: OutboxClaim, retryDelayMs?: number, note?: string): boolean;
 
-  markCompleted(id: string): void;
+  markCompleted(claim: OutboxClaim): boolean;
 
-  markFailed(id: string, error: string, retryDelayMs: number): void;
+  markFailed(claim: OutboxClaim, error: string, retryDelayMs: number): boolean;
 
   get(id: string): DispatchOutboxEvent | undefined;
   listByAggregate(aggregateId: string): DispatchOutboxEvent[];
@@ -126,12 +143,17 @@ export function createDispatchOutbox(
 
     if (!candidate) return null;
 
+    // Mint a fresh fencing token as part of the claim CAS. The token is the
+    // authority for every subsequent transition; reaping clears it so a
+    // reclaimed event always carries a token the old holder does not know.
+    const claimToken = `clm_${randomUUID()}`;
     const updated = database.db
       .update(dispatchOutbox)
       .set({
         status: "claimed",
         claimedBy: workerId,
         claimExpiresAt,
+        claimToken,
         attemptCount: candidate.attemptCount + 1,
       })
       .where(and(eq(dispatchOutbox.id, candidate.id), eq(dispatchOutbox.status, "pending")))
@@ -151,9 +173,11 @@ export function createDispatchOutbox(
       .all();
 
     for (const row of rows) {
+      // Clearing the token invalidates the expired holder's fencing identity:
+      // it can no longer release/complete/fail the row even if it wakes up.
       database.db
         .update(dispatchOutbox)
-        .set({ status: "pending", claimedBy: null, claimExpiresAt: null })
+        .set({ status: "pending", claimedBy: null, claimExpiresAt: null, claimToken: null })
         .where(eq(dispatchOutbox.id, row.id))
         .run();
     }
@@ -169,62 +193,86 @@ export function createDispatchOutbox(
     return database.db.select().from(dispatchOutbox).where(eq(dispatchOutbox.aggregateId, aggregateId)).orderBy(asc(dispatchOutbox.createdAt)).all().map(rowToEvent);
   }
 
-  function release(id: string, retryDelayMs = 0, note?: string): void {
+  /**
+   * Fenced ownership predicate. Requires the live claim identity: the row must
+   * still be `claimed`, owned by the presenting `claimOwner`, carry the exact
+   * `claimToken`, and have an unexpired lease. A claimant whose lease lapsed
+   * and whose event was reaped (token cleared) or re-claimed (token rotated)
+   * matches zero rows and therefore cannot mutate the event.
+   */
+  function fencedClaimWhere(claim: OutboxClaim) {
+    return and(
+      eq(dispatchOutbox.id, claim.eventId),
+      eq(dispatchOutbox.status, "claimed"),
+      eq(dispatchOutbox.claimedBy, claim.claimOwner),
+      eq(dispatchOutbox.claimToken, claim.claimToken),
+      or(isNull(dispatchOutbox.claimExpiresAt), gt(dispatchOutbox.claimExpiresAt, new Date().toISOString())),
+    );
+  }
+
+  function release(claim: OutboxClaim, retryDelayMs = 0, note?: string): boolean {
     const availableAt = new Date(Date.now() + retryDelayMs).toISOString();
-    database.db
+    const result = database.db
       .update(dispatchOutbox)
       .set({
         status: "pending",
         claimedBy: null,
         claimExpiresAt: null,
+        claimToken: null,
         availableAt,
         lastError: note ?? null,
       })
-      .where(and(eq(dispatchOutbox.id, id), eq(dispatchOutbox.status, "claimed")))
+      .where(fencedClaimWhere(claim))
       .run();
+    return result.changes === 1;
   }
 
-  function markCompleted(id: string): void {
-    database.db
+  function markCompleted(claim: OutboxClaim): boolean {
+    const result = database.db
       .update(dispatchOutbox)
-      .set({ status: "completed", completedAt: new Date().toISOString() })
-      .where(eq(dispatchOutbox.id, id))
+      .set({ status: "completed", completedAt: new Date().toISOString(), claimToken: null, claimedBy: null, claimExpiresAt: null })
+      .where(fencedClaimWhere(claim))
       .run();
+    return result.changes === 1;
   }
 
-  function markFailed(id: string, error: string, retryDelayMs: number): void {
-    const row = database.db.select().from(dispatchOutbox).where(eq(dispatchOutbox.id, id)).get();
-    if (!row) return;
+  function markFailed(claim: OutboxClaim, error: string, retryDelayMs: number): boolean {
+    // Read the failure budget only under the fence so a stale holder cannot
+    // inflate (or consume) another owner's retry budget.
+    const row = database.db.select().from(dispatchOutbox).where(fencedClaimWhere(claim)).get();
+    if (!row) return false;
 
     // Count THIS failure. Dead-lettering and backoff are keyed off genuine
     // failures, not claims — a claim reaped after a dispatcher crash must not
     // consume the failure budget (that was the pre-v21 bug).
     const failures = (row.failureCount ?? 0) + 1;
     if (failures >= 3) {
-      database.db
+      const result = database.db
         .update(dispatchOutbox)
-        .set({ status: "dead_lettered", failureCount: failures, lastError: error })
-        .where(eq(dispatchOutbox.id, id))
+        .set({ status: "dead_lettered", failureCount: failures, lastError: error, claimToken: null, claimedBy: null, claimExpiresAt: null })
+        .where(fencedClaimWhere(claim))
         .run();
-    } else {
-      // Backoff exponent is (failures - 1): first retry waits retryDelayMs,
-      // second waits 2×, matching the intended geometric schedule.
-      const availableAt = new Date(
-        Date.now() + retryDelayMs * Math.pow(2, failures - 1),
-      ).toISOString();
-      database.db
-        .update(dispatchOutbox)
-        .set({
-          status: "pending",
-          claimedBy: null,
-          claimExpiresAt: null,
-          failureCount: failures,
-          lastError: error,
-          availableAt,
-        })
-        .where(eq(dispatchOutbox.id, id))
-        .run();
+      return result.changes === 1;
     }
+    // Backoff exponent is (failures - 1): first retry waits retryDelayMs,
+    // second waits 2×, matching the intended geometric schedule.
+    const availableAt = new Date(
+      Date.now() + retryDelayMs * Math.pow(2, failures - 1),
+    ).toISOString();
+    const result = database.db
+      .update(dispatchOutbox)
+      .set({
+        status: "pending",
+        claimedBy: null,
+        claimExpiresAt: null,
+        claimToken: null,
+        failureCount: failures,
+        lastError: error,
+        availableAt,
+      })
+      .where(fencedClaimWhere(claim))
+      .run();
+    return result.changes === 1;
   }
 
   function listPending(limit = 50): DispatchOutboxEvent[] {
@@ -269,6 +317,7 @@ export function createDispatchOutbox(
         availableAt: now,
         claimedBy: null,
         claimExpiresAt: null,
+        claimToken: null,
         lastError: null,
         completedAt: null,
       })
@@ -332,6 +381,7 @@ function rowToEvent(row: DispatchOutboxRow): DispatchOutboxEvent {
     availableAt: row.availableAt,
     claimedBy: row.claimedBy ?? undefined,
     claimExpiresAt: row.claimExpiresAt ?? undefined,
+    claimToken: row.claimToken ?? undefined,
     lastError: row.lastError ?? undefined,
     createdAt: row.createdAt,
     completedAt: row.completedAt ?? undefined,

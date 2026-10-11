@@ -486,6 +486,10 @@ export const dispatchOutbox = sqliteTable("dispatch_outbox", {
   availableAt: text("available_at").notNull(),
   claimedBy: text("claimed_by"),
   claimExpiresAt: text("claim_expires_at"),
+  /** Fencing token minted by the successful claimNext() CAS. Every claimed
+   * transition must present this exact token; a stale claimant whose lease was
+   * reaped and re-claimed by another worker cannot acknowledge foreign work. */
+  claimToken: text("claim_token"),
   lastError: text("last_error"),
   createdAt: text("created_at").notNull(),
   completedAt: text("completed_at"),

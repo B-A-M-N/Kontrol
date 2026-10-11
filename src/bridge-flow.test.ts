@@ -18,6 +18,7 @@ import { openDatabase, databasePath } from "./db/client.js";
 import { createReviewWorkflowService } from "./review-workflow.js";
 import { createApprovalRequestManager } from "./approval-requests.js";
 import { createPolicyEngine } from "./policy.js";
+import { createAgentMessageManager } from "./agent-messages.js";
 import { registerPolicyTools } from "./policy-tools.js";
 import { authorizeWorkSessionAction } from "./work-session-action-guard.js";
 import { compactMissionPacket, projectMissionExecutionContract, renderMissionPrompt } from "./bridge/shared.js";
@@ -110,6 +111,7 @@ const workSessions = createWorkSessionManager(db);
 const eventStore = createEventStore(db);
 const continuationManager = createContinuationManager(db);
 const dispatchOutbox = createDispatchOutbox(db);
+const agentMessages = createAgentMessageManager(db);
 const missionLedger = createMissionLedger(db);
 const supervisorRuns = createSupervisorRuns(db);
 const approvalRequests = createApprovalRequestManager(db);
@@ -168,6 +170,7 @@ const config: BridgeConfig = {
   eventStore,
   continuationManager,
   dispatchOutbox,
+  agentMessages,
   reviewWorkflow,
   approvalRequests,
   missionLedger,
@@ -1201,6 +1204,41 @@ try {
     const ownConsume = await callBoundB("mark_continuation_consumed", { continuationId: contB.id });
     assert.ok(!ownConsume.isError, "worker bound to B can consume B's continuation");
     assert.equal(continuationManager.get(contB.id)!.status, "completed");
+  }
+
+  // ── Scenario 12b: F02 — message delivery/consumption requires a bound worker ──
+  {
+    const sessionA = createSession();
+    const sessionB = createSession();
+
+    // A worker bound to A may post its own message.
+    const boundA = fakeServer();
+    registerBridgeTools(boundA as any, { ...config, principalRole: "worker", connectionWorkSessionId: sessionA } as BridgeConfig);
+    const callBoundA = (name: string, args: any) => boundA.handlers.get(name)!(args);
+    const ownPost = await callBoundA("post_agent_message", { sessionId: sessionA, kind: "clarification_request", body: "which env?" });
+    assert.ok(!ownPost.isError, "worker bound to A may post its own message");
+
+    // ...but not B's.
+    const crossPost = await callBoundA("post_agent_message", { sessionId: sessionB, kind: "clarification_request", body: "leak?" });
+    assert.ok(crossPost.isError, "worker bound to A cannot post a message for B");
+    assert.equal(agentMessages.list(sessionB).length, 0, "cross-session post persisted nothing for B");
+
+    // An UNBOUND worker (no signed work-session envelope) must fail closed for
+    // message delivery and consumption; the legacy permissive worker read
+    // branch must not grant it message authority.
+    const unbound = fakeServer();
+    registerBridgeTools(unbound as any, { ...config, principalRole: "worker" } as BridgeConfig);
+    const callUnbound = (name: string, args: any) => unbound.handlers.get(name)!(args);
+    const unboundPost = await callUnbound("post_agent_message", { sessionId: sessionA, kind: "clarification_request", body: "no envelope" });
+    assert.ok(unboundPost.isError, "an unbound worker cannot post a message");
+    const unboundAck = await callUnbound("ack_agent_reply", { sessionId: sessionA, replyId: "reply-x", replyRevision: 1, deliveryAttemptId: "attempt-1" });
+    assert.ok(unboundAck.isError, "an unbound worker cannot acknowledge a reply");
+    const unboundPending = await callUnbound("get_pending_agent_replies", { sessionId: sessionA });
+    assert.ok(unboundPending.isError, "an unbound worker cannot enumerate pending replies");
+
+    // A BOUND worker still cannot acknowledge a cross-session reply.
+    const crossAck = await callBoundA("ack_agent_reply", { sessionId: sessionB, replyId: "reply-y", replyRevision: 1, deliveryAttemptId: "attempt-1" });
+    assert.ok(crossAck.isError, "worker bound to A cannot acknowledge B's reply");
   }
 
   // ── Scenario 13: defect #1 + #4 — awaiting-review worker crash stays resumable ──

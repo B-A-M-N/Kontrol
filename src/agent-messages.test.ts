@@ -68,16 +68,18 @@ try {
   assert.equal(findings.length, 1);
   assert.equal(findings[0].id, finding.id);
 
-  // resolve closes an open message; re-resolving is a no-op that stays resolved.
+  // resolve closes an open message; re-resolving is a truthful no-op.
   const resolved = messages.resolve(question.id);
-  assert.equal(resolved?.status, "resolved");
+  assert.equal(resolved.message?.status, "resolved");
+  assert.equal(resolved.changed, true, "the first resolve performs the open→resolved transition");
   assert.equal(
     messages.list(session.id, { openOnly: true }).length,
     1,
     "one gating message remains open after resolving the question",
   );
   const reResolved = messages.resolve(question.id);
-  assert.equal(reResolved?.status, "resolved", "resolving an already-resolved message is idempotent");
+  assert.equal(reResolved.message?.status, "resolved", "resolving an already-resolved message is idempotent");
+  assert.equal(reResolved.changed, false, "a repeat resolve reports no transition so no duplicate event is emitted");
 
   // Cascade: deleting the work session removes its messages (FK on delete cascade).
   db.sqlite.prepare("delete from work_sessions where id = ?").run(session.id);

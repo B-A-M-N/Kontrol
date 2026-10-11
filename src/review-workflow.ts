@@ -682,7 +682,18 @@ export function createReviewWorkflowService(
         agentRegistry.updateRun(correlatedRun.runId, { status: "cancelled", finishedAt: new Date().toISOString(), workerLeaseUntil: null });
       }
       const cancellation = dispatchOutbox?.listByAggregate(input.sessionId).find((event) => event.eventType === "worker.cancellation.requested" && ["pending", "claimed"].includes(event.status));
-      if (cancellation) dispatchOutbox?.markCompleted(cancellation.id);
+      // F01: completion is fenced. A pending cancellation has no claimant and
+      // is resolved by CAS on its durable identity (status + revision) rather
+      // than an owner token; a claimed one is resolved by its live token.
+      if (cancellation) {
+        if (cancellation.status === "claimed" && cancellation.claimedBy && cancellation.claimToken) {
+          dispatchOutbox?.markCompleted({ eventId: cancellation.id, claimOwner: cancellation.claimedBy, claimToken: cancellation.claimToken });
+        } else {
+          db.sqlite
+            .prepare("update dispatch_outbox set status = 'completed', completed_at = ? where id = ? and status = 'pending'")
+            .run(new Date().toISOString(), cancellation.id);
+        }
+      }
       appendWorkflowEvent({
         type: "agent.run.cancelled",
         sessionId: input.sessionId,

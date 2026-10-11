@@ -9,7 +9,7 @@ import { callRemoteAgent, selectHealthyAgent } from "../acp-gateway.js";
 import type { AgentCallResult } from "../acp-gateway.js";
 import { DEFAULT_CLAIM_LEASE_MS } from "../continuation.js";
 import type { Continuation } from "../continuation.js";
-import type { DispatchOutboxEvent } from "../dispatch-outbox.js";
+import type { DispatchOutboxEvent, OutboxClaim } from "../dispatch-outbox.js";
 import { TERMINAL_STATUSES } from "../review-workflow.js";
 import type { BridgeConfig } from "./context.js";
 import { acquireCheckoutModifyLease, checkoutLeaseMetadata, defaultLiveWaiters, renderMissionPrompt, resolveHealthyAgentUrl, workSessionInstructions } from "./shared.js";
@@ -96,9 +96,10 @@ export async function runContinuationTick(
       payload: { continuationId, reason },
     });
   };
+  const claimOf = (event: DispatchOutboxEvent): OutboxClaim => ({ eventId: event.id, claimOwner: event.claimedBy ?? "", claimToken: event.claimToken ?? "" });
   const markContinuationDispatchFailed = (event: DispatchOutboxEvent | undefined, continuation: Continuation, reason: string) => {
     if (!event || !config.dispatchOutbox) return;
-    config.dispatchOutbox.markFailed(event.id, reason, DEFAULT_CLAIM_LEASE_MS);
+    config.dispatchOutbox.markFailed(claimOf(event), reason, DEFAULT_CLAIM_LEASE_MS);
     const current = config.dispatchOutbox.get(event.id);
     if (current?.status === "dead_lettered") {
       config.eventStore.appendEvent({
@@ -127,39 +128,39 @@ export async function runContinuationTick(
       // A live agent is already parked on await_review_feedback for this session:
       // the feedback event will wake it directly. Do NOT spawn a second worker.
       if (liveWaiters.has(cont.sessionId)) {
-        if (outboxEvent) config.dispatchOutbox?.markCompleted(outboxEvent.id);
+        if (outboxEvent) config.dispatchOutbox?.markCompleted(claimOf(outboxEvent));
         return "completed";
       }
 
       const session = config.workSessions.get(cont.sessionId);
       if (!session) {
-        outboxEvent ? config.dispatchOutbox?.markCompleted(outboxEvent.id) : undefined;
+        outboxEvent ? config.dispatchOutbox?.markCompleted(claimOf(outboxEvent)) : undefined;
         return "completed";
       }
       if (TERMINAL_STATUSES.has(session.status)) {
         supersedeContinuation(cont.id, cont.sessionId, `session is ${session.status}`);
-        outboxEvent ? config.dispatchOutbox?.markCompleted(outboxEvent.id) : undefined;
+        outboxEvent ? config.dispatchOutbox?.markCompleted(claimOf(outboxEvent)) : undefined;
         return "completed";
       }
 
       // Atomic claim (CAS): only one dispatcher owns a given continuation.
       const claimed = config.continuationManager.claim(dispatcherId, { id: cont.id });
       if (!claimed) {
-        outboxEvent ? config.dispatchOutbox?.markCompleted(outboxEvent.id) : undefined;
+        outboxEvent ? config.dispatchOutbox?.markCompleted(claimOf(outboxEvent)) : undefined;
         return "completed";
       }
       const claimedSession = config.workSessions.get(claimed.sessionId);
       if (!claimedSession || TERMINAL_STATUSES.has(claimedSession.status)) {
         const reason = claimedSession ? `session is ${claimedSession.status}` : "session not found";
         supersedeContinuation(claimed.id, claimed.sessionId, reason);
-        outboxEvent ? config.dispatchOutbox?.markCompleted(outboxEvent.id) : undefined;
+        outboxEvent ? config.dispatchOutbox?.markCompleted(claimOf(outboxEvent)) : undefined;
         return "completed";
       }
 
       if (claimed.verdict !== "changes_requested") {
         // Defensive: pending continuations should only be changes_requested.
         config.continuationManager.markCompleted(claimed.id);
-        outboxEvent ? config.dispatchOutbox?.markCompleted(outboxEvent.id) : undefined;
+        outboxEvent ? config.dispatchOutbox?.markCompleted(claimOf(outboxEvent)) : undefined;
         return "completed";
       }
 
@@ -190,7 +191,7 @@ export async function runContinuationTick(
         // (the lease prevents it from being re-claimed too eagerly after a blip).
         config.continuationManager.release(dispatcherId, { id: claimed.id });
         outboxEvent
-          ? config.dispatchOutbox?.release(outboxEvent.id, DEFAULT_CLAIM_LEASE_MS, "No healthy agent available")
+          ? config.dispatchOutbox?.release(claimOf(outboxEvent), DEFAULT_CLAIM_LEASE_MS, "No healthy agent available")
           : undefined;
         return "deferred";
       }
@@ -200,7 +201,7 @@ export async function runContinuationTick(
         if (!preDispatchSession || TERMINAL_STATUSES.has(preDispatchSession.status)) {
           const reason = preDispatchSession ? `session is ${preDispatchSession.status}` : "session not found";
           supersedeContinuation(claimed.id, claimed.sessionId, reason);
-          outboxEvent ? config.dispatchOutbox?.markCompleted(outboxEvent.id) : undefined;
+          outboxEvent ? config.dispatchOutbox?.markCompleted(claimOf(outboxEvent)) : undefined;
           return "completed";
         }
         if (config.beforeContinuationDispatch) {
@@ -209,7 +210,7 @@ export async function runContinuationTick(
           if (!afterHookSession || TERMINAL_STATUSES.has(afterHookSession.status)) {
             const reason = afterHookSession ? `session is ${afterHookSession.status}` : "session not found";
             supersedeContinuation(claimed.id, claimed.sessionId, reason);
-            outboxEvent ? config.dispatchOutbox?.markCompleted(outboxEvent.id) : undefined;
+            outboxEvent ? config.dispatchOutbox?.markCompleted(claimOf(outboxEvent)) : undefined;
             return "completed";
           }
         }
@@ -242,7 +243,7 @@ export async function runContinuationTick(
         });
         if (!delivered) {
           outboxEvent
-            ? config.dispatchOutbox?.release(outboxEvent.id, DEFAULT_CLAIM_LEASE_MS, "continuation delivery CAS failed")
+            ? config.dispatchOutbox?.release(claimOf(outboxEvent), DEFAULT_CLAIM_LEASE_MS, "continuation delivery CAS failed")
             : undefined;
           return "deferred";
         }
@@ -254,7 +255,7 @@ export async function runContinuationTick(
           sessionId: claimed.sessionId,
           payload: { continuationId: claimed.id, runId: result.runId, remoteRunId: result.remoteRunId, attemptNumber: result.attemptNumber },
         });
-        outboxEvent ? config.dispatchOutbox?.markCompleted(outboxEvent.id) : undefined;
+        outboxEvent ? config.dispatchOutbox?.markCompleted(claimOf(outboxEvent)) : undefined;
         return "completed";
       } catch (error) {
         // Availability failures release the logical outbox row with backoff;
@@ -263,7 +264,7 @@ export async function runContinuationTick(
         const reason = error instanceof Error ? error.message : String(error);
         if (isTemporaryDispatchUnavailability(reason)) {
           outboxEvent
-            ? config.dispatchOutbox?.release(outboxEvent.id, DEFAULT_CLAIM_LEASE_MS, reason)
+            ? config.dispatchOutbox?.release(claimOf(outboxEvent), DEFAULT_CLAIM_LEASE_MS, reason)
             : undefined;
           return "deferred";
         }
@@ -296,20 +297,21 @@ export async function runContinuationTick(
         // them without letting their designated owner process them.
         const event = config.dispatchOutbox.claimNext(dispatcherId, DEFAULT_CLAIM_LEASE_MS, ["continuation.ready"]);
         if (!event) break;
+        const claim = claimOf(event);
         if (event.eventType !== "continuation.ready") {
           // Defensive invariant: filtered claimNext() must never yield a
           // foreign event. Preserve it for investigation rather than
           // acknowledging a routing violation.
-          config.dispatchOutbox.markFailed(event.id, `Dispatch routing violation: ${event.eventType}`, 60_000);
+          config.dispatchOutbox.markFailed(claim, `Dispatch routing violation: ${event.eventType}`, 60_000);
           continue;
         }
         const cont = config.continuationManager.get(event.aggregateId);
         if (!cont || cont.status !== "pending") {
-          config.dispatchOutbox.markCompleted(event.id);
+          config.dispatchOutbox.markCompleted(claim);
           continue;
         }
         const result = await dispatchContinuation(cont, event);
-        if (result === "completed") config.dispatchOutbox.markCompleted(event.id);
+        if (result === "completed") config.dispatchOutbox.markCompleted(claim);
       }
       return;
     }

@@ -79,7 +79,7 @@ export interface AgentMessageManager {
   }): AgentMessage;
   get(id: string): AgentMessage | undefined;
   list(workSessionId: string, opts?: { kind?: AgentMessageKind; openOnly?: boolean }): AgentMessage[];
-  resolve(id: string): AgentMessage | undefined;
+  resolve(id: string): { message: AgentMessage | undefined; changed: boolean };
   acceptReply(input: { messageId: string; workSessionId: string; body: string; reviewerPrincipalId: string }): AgentMessageReply;
   getReply(replyId: string): AgentMessageReply | undefined;
   listPendingReplies(workSessionId: string): AgentMessageReply[];
@@ -347,13 +347,20 @@ export function createAgentMessageManager(
       .run();
   }
 
-  function resolve(id: string): AgentMessage | undefined {
-    database.db
+  /**
+   * Resolve reports whether THIS call performed the open→resolved transition.
+   * The update is CAS-guarded on `status = open`, so a repeated call that finds
+   * the message already resolved returns changed:false. Callers must suppress
+   * their resolution event unless changed is true — otherwise a re-request
+   * manufactures a second `agent.message.resolved` that never happened.
+   */
+  function resolve(id: string): { message: AgentMessage | undefined; changed: boolean } {
+    const result = database.db
       .update(agentMessages)
       .set({ status: "resolved", resolvedAt: new Date().toISOString() })
       .where(and(eq(agentMessages.id, id), eq(agentMessages.status, "open")))
       .run();
-    return get(id);
+    return { message: get(id), changed: result.changes === 1 };
   }
 
   // P1 #11: DB owned by server

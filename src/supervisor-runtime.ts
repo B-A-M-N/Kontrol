@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import type { DispatchOutbox, DispatchOutboxEvent } from "./dispatch-outbox.js";
+import type { DispatchOutbox, DispatchOutboxEvent, OutboxClaim } from "./dispatch-outbox.js";
 import type { EventStore } from "./event-log.js";
 import type { SupervisorDecision } from "./supervisor-evaluator.js";
 import type { SupervisorProgressSnapshot, SupervisorRuns } from "./supervisor-runs.js";
@@ -231,28 +231,31 @@ export function createSupervisorRuntime(input: {
     return Boolean(deadlineAt && Date.parse(deadlineAt) <= Date.now());
   }
 
+  const claimOf = (event: DispatchOutboxEvent): OutboxClaim => ({ eventId: event.id, claimOwner: event.claimedBy ?? "", claimToken: event.claimToken ?? "" });
+
   async function processEvent(event: DispatchOutboxEvent): Promise<void> {
+    const claim = claimOf(event);
     const workSessionId = typeof event.payload.workSessionId === "string" ? event.payload.workSessionId : "";
     const current = input.runs.getByWorkSession(workSessionId);
     const expectedStatus = event.eventType === "supervisor.verification.requested" ? "verification_pending" : event.eventType === "supervisor.correction.requested" ? "correction_pending" : "approval_pending";
     if (!current || current.id !== event.aggregateId || current.status !== expectedStatus) {
-      input.outbox.markCompleted(event.id);
+      input.outbox.markCompleted(claim);
       return;
     }
     if (isExpired(current.deadlineAt)) {
       const transitioned = input.runs.transition({ id: current.id, expectedStatus: current.status, expectedRevision: current.revision, nextStatus: "awaiting_human", lastError: "Supervisor wall-clock deadline reached.", stallReason: "deadline_failsafe" });
-      if (transitioned) input.outbox.markCompleted(event.id);
-      else input.outbox.release(event.id, 250, "Deadline transition CAS failed, retrying");
+      if (transitioned) input.outbox.markCompleted(claim);
+      else input.outbox.release(claim, 250, "Deadline transition CAS failed, retrying");
       return;
     }
     const claimed = input.runs.claim(current.id, instanceId, leaseMs);
     if (!claimed) {
-      input.outbox.release(event.id, 250, "Supervisor run is leased by another instance.");
+      input.outbox.release(claim, 250, "Supervisor run is leased by another instance.");
       return;
     }
     const leaseNonce = claimed.leaseNonce;
     if (!leaseNonce) {
-      input.outbox.release(event.id, 250, "Supervisor lease has no fencing nonce.");
+      input.outbox.release(claim, 250, "Supervisor lease has no fencing nonce.");
       return;
     }
     const lease = { ownerInstanceId: instanceId, leaseNonce };
@@ -272,19 +275,19 @@ export function createSupervisorRuntime(input: {
         await input.onCorrect(workSessionId, reasons);
         const resumed = input.runs.transition({ id: claimed.id, expectedStatus: "correction_pending", expectedRevision: claimed.revision, nextStatus: "worker_active", cycleNumber: claimed.cycleNumber + 1, nextActionAt: null, stallReason: null, lease });
         if (!resumed) throw new Error("Supervisor state changed before correction dispatch.");
-        input.outbox.markCompleted(event.id);
+        input.outbox.markCompleted(claim);
         return;
       }
       if (event.eventType === "supervisor.approval.requested") {
         await input.onApprove(workSessionId);
         const completed = input.runs.transition({ id: claimed.id, expectedStatus: "approval_pending", expectedRevision: claimed.revision, nextStatus: "completed", nextActionAt: null, stallReason: null, lease });
         if (!completed) throw new Error("Supervisor state changed before automatic approval.");
-        input.outbox.markCompleted(event.id);
+        input.outbox.markCompleted(claim);
         return;
       }
       const verifying = input.runs.transition({ id: claimed.id, expectedStatus: "verification_pending", expectedRevision: claimed.revision, nextStatus: "verifying", lease });
       if (!verifying) {
-        input.outbox.release(event.id, 250, "Supervisor state changed before verification.");
+        input.outbox.release(claim, 250, "Supervisor state changed before verification.");
         return;
       }
       const verificationStartedAt = performance.now();
@@ -313,7 +316,7 @@ export function createSupervisorRuntime(input: {
       if (!decided) throw new Error("Supervisor state changed before decision.");
       if (decided.status === "correction_pending" && ["correction_auto", "full"].includes(decided.autonomyMode)) enqueueAction("supervisor.correction.requested", decided.id, decided.revision, workSessionId, evaluation.reasons);
       if (decided.status === "approval_pending" && decided.approvalMode !== "human_required") enqueueAction("supervisor.approval.requested", decided.id, decided.revision, workSessionId);
-      input.outbox.markCompleted(event.id);
+      input.outbox.markCompleted(claim);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       input.runs.noteFailure(claimed.id, instanceId, message, leaseNonce);
@@ -321,7 +324,7 @@ export function createSupervisorRuntime(input: {
       // via nextActionAt instead of retrying immediately and hot-looping.
       const failureCount = input.outbox.get(event.id)?.attemptCount ?? 0;
       const backoffMs = Math.min(30_000, 250 * Math.pow(2, Math.max(0, failureCount - 1)));
-      input.outbox.markFailed(event.id, message, backoffMs);
+      input.outbox.markFailed(claim, message, backoffMs);
       const stalled = input.runs.getByWorkSession(workSessionId);
       if (input.outbox.get(event.id)?.status === "dead_lettered" && stalled && !["completed", "failed", "cancelled", "awaiting_human"].includes(stalled.status)) {
         input.runs.transition({ id: stalled.id, expectedStatus: stalled.status, expectedRevision: stalled.revision, nextStatus: "awaiting_human", stallReason: "dispatch_failure", lastError: `Supervisor event dead-lettered: ${message}`, lease });
@@ -352,7 +355,7 @@ export function createSupervisorRuntime(input: {
       if (!event) break;
       const workSessionId = typeof event.payload.workSessionId === "string" ? event.payload.workSessionId : "";
       if (!workSessionId) {
-        input.outbox.markCompleted(event.id);
+        input.outbox.markCompleted(claimOf(event));
         continue;
       }
       const job = processEvent(event).finally(() => {

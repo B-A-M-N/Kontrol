@@ -3,7 +3,9 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDatabase } from "./db/client.js";
-import { createDispatchOutbox } from "./dispatch-outbox.js";
+import { createDispatchOutbox, type DispatchOutboxEvent, type OutboxClaim } from "./dispatch-outbox.js";
+
+const claimOf = (event: DispatchOutboxEvent): OutboxClaim => ({ eventId: event.id, claimOwner: event.claimedBy ?? "", claimToken: event.claimToken ?? "" });
 import { createWorkSessionManager } from "./work-sessions.js";
 
 const root = await mkdtemp(join(tmpdir(), "kontrol-outbox-test-"));
@@ -53,7 +55,7 @@ try {
     for (let i = 0; i < 2; i += 1) {
       const claimed = outbox.claimNext("dispatcher-a", 10_000);
       assert.ok(claimed);
-      outbox.markFailed(claimed.id, `boom ${i}`, 0);
+      outbox.markFailed(claimOf(claimed), `boom ${i}`, 0);
     }
     const afterTwoFailures = outbox
       .listPending()
@@ -67,7 +69,7 @@ try {
     // Third genuine failure crosses the threshold → dead-lettered.
     const claimedFinal = outbox.claimNext("dispatcher-a", 10_000);
     assert.ok(claimedFinal);
-    outbox.markFailed(claimedFinal.id, "boom final", 0);
+    outbox.markFailed(claimOf(claimedFinal), "boom final", 0);
     assert.equal(
       outbox.listPending().find((e) => e.aggregateId === "cont_dead_letter"),
       undefined,
@@ -82,6 +84,76 @@ try {
     assert.equal(redriven.failureCount, 0);
 
     outbox.close();
+  }
+
+  // --- F01: claimed transitions are fenced by a claim token. ---
+  {
+    const db = openDatabase(join(root, "fencing"));
+    const outbox = createDispatchOutbox(db);
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+    const event = outbox.enqueue({
+      eventType: "continuation.ready",
+      aggregateId: "cont_fenced",
+      aggregateRevision: 1,
+    });
+
+    // Worker A claims with a short lease, then stalls past expiry.
+    const claimA = outbox.claimNext("worker-a", 5);
+    assert.ok(claimA, "worker A should claim the event");
+    assert.ok(claimA.claimToken, "a claim must mint a fencing token");
+    const staleClaim: OutboxClaim = {
+      eventId: claimA.id,
+      claimOwner: "worker-a",
+      claimToken: claimA.claimToken!,
+    };
+
+    await sleep(15); // let A's lease expire in real wall time
+
+    // Worker B reclaims the same event after the reap.
+    assert.equal(outbox.reapExpiredClaims(0), 1, "expired claim is reaped back to pending");
+    const claimB = outbox.claimNext("worker-b", 10_000);
+    assert.ok(claimB, "worker B reclaims the expired event");
+    assert.equal(claimB.aggregateId, "cont_fenced");
+    assert.notEqual(claimB.claimToken, claimA.claimToken, "reclaiming rotates the fencing token");
+    const liveClaim: OutboxClaim = {
+      eventId: claimB.id,
+      claimOwner: "worker-b",
+      claimToken: claimB.claimToken!,
+    };
+
+    // A stale claimant whose lease expired must NOT be able to release,
+    // complete, or dead-letter the event B now owns.
+    assert.equal(outbox.release(staleClaim, 0, "stale A release"), false, "stale claimant cannot release another worker's event");
+    assert.equal(outbox.markCompleted(staleClaim), false, "stale claimant cannot complete another worker's event");
+    assert.equal(outbox.markFailed(staleClaim, "stale A failure", 0), false, "stale claimant cannot dead-letter another worker's event");
+
+    // B's ownership is intact and the event is still claimed by B.
+    const stillB = outbox.get(event.id)!;
+    assert.equal(stillB.status, "claimed", "the event remains claimed after stale transitions");
+    assert.equal(stillB.claimedBy, "worker-b");
+    assert.equal(stillB.claimToken, claimB.claimToken);
+    assert.equal(stillB.failureCount, 0, "a stale failure must not consume the retry budget");
+
+    // The legitimate holder can still complete it.
+    assert.equal(outbox.markCompleted(liveClaim), true, "the live claimant completes its own event");
+    assert.equal(outbox.get(event.id)!.status, "completed");
+
+    // A forged token for the right owner also fails closed.
+    const forged = outbox.enqueue({ eventType: "continuation.ready", aggregateId: "cont_forged", aggregateRevision: 1 });
+    const holder = outbox.claimNext("worker-c", 10_000);
+    assert.ok(holder);
+    assert.equal(
+      outbox.markCompleted({ eventId: holder.id, claimOwner: "worker-c", claimToken: "clm_not-the-token" }),
+      false,
+      "a forged claim token is rejected even for the correct owner",
+    );
+    assert.equal(outbox.get(forged.id)!.status, "claimed");
+    assert.equal(outbox.markCompleted({ eventId: holder.id, claimOwner: "someone-else", claimToken: holder.claimToken! }), false, "wrong owner is rejected");
+    assert.equal(outbox.markCompleted({ eventId: holder.id, claimOwner: "worker-c", claimToken: holder.claimToken! }), true);
+
+    outbox.close();
+    db.close();
   }
 
   // --- Fix 2: checkout-lease renewal from a worker heartbeat. ---
