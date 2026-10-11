@@ -352,3 +352,43 @@ for (const flag of ["-v", "--version"]) {
 
   rmSync(stateDir, { recursive: true, force: true });
 }
+
+// Generic ACP agent registration CLI: add/list/remove persist durable config
+// and refuse an unreachable or non-loopback endpoint.
+{
+  const { mkdtempSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { createServer } = await import("node:http");
+  const configDir = mkdtempSync(join(tmpdir(), "kontrol-cli-agent-"));
+  const cliEnv = { ...process.env, KONTROL_CONFIG_DIR: configDir };
+  const runCli = (...args: string[]) => spawnSync(process.execPath, ["--import", "tsx", "src/cli.ts", ...args], { cwd: repositoryRoot, encoding: "utf8", env: cliEnv });
+
+  const empty = runCli("agent", "list");
+  assert.equal(empty.status, 0);
+  assert.match(empty.stdout, /No ACP agents registered/);
+
+  // Non-loopback is rejected before any network attempt.
+  const remote = runCli("agent", "add", "remote", "http://example.com:9000");
+  assert.notEqual(remote.status, 0, "non-loopback agent URL is rejected");
+
+  // Stand up a loopback ACP agent and register it.
+  const port = 7991;
+  const agent = createServer((req, res) => { res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify({ ok: true })); });
+  await new Promise<void>((r) => agent.listen(port, "127.0.0.1", () => r()));
+  try {
+    const add = runCli("agent", "add", "generic-stdio", `http://127.0.0.1:${port}`, "generic adapter");
+    assert.equal(add.status, 0, `agent add must exit 0; stderr: ${add.stderr}`);
+    const addHealthy = runCli("agent", "add", "dead-agent", `http://127.0.0.1:7992`, "--require-healthy");
+    assert.notEqual(addHealthy.status, 0, "--require-healthy fails closed on an unreachable endpoint");
+    assert.match(add.stdout, /Registered ACP agent generic-stdio/);
+    const list = runCli("agent", "list");
+    assert.match(list.stdout, /generic-stdio\t+http:\/\/127\.0\.0\.1:7991/);
+    const remove = runCli("agent", "remove", "generic-stdio");
+    assert.equal(remove.status, 0);
+    assert.match(runCli("agent", "list").stdout, /No ACP agents registered/);
+  } finally {
+    await new Promise<void>((r) => agent.close(() => r()));
+  }
+  rmSync(configDir, { recursive: true, force: true });
+}

@@ -26,7 +26,7 @@ import {
 } from "./user-config.js";
 import { expandHomePath } from "./roots.js";
 
-type Command = "serve" | "up" | "init" | "doctor" | "config" | "service" | "snapshots" | "review-loop" | "help" | "version";
+type Command = "serve" | "up" | "init" | "doctor" | "config" | "service" | "snapshots" | "review-loop" | "agent" | "help" | "version";
 const require = createRequire(import.meta.url);
 const SUPPORTED_NODE_RANGE = ">=22.19 <23 || >=24 <25 || >=26 <27";
 
@@ -62,6 +62,9 @@ async function main(argv: string[]): Promise<void> {
     case "review-loop":
       await runReviewLoopCommand(args);
       return;
+    case "agent":
+      await runAgentCommand(args);
+      return;
     case "help":
       printHelp();
       return;
@@ -75,6 +78,7 @@ function normalizeCommand(command: string | undefined): Command {
   if (!command || command === "serve" || command === "start") return "serve";
   if (command === "up" || command === "init" || command === "doctor" || command === "config" || command === "service" || command === "snapshots") return command;
   if (command === "review-loop") return "review-loop";
+  if (command === "agent") return "agent";
   if (command === "help" || command === "--help" || command === "-h") return "help";
   if (command === "version" || command === "--version" || command === "-v") return "version";
   throw new Error(`Unknown command: ${command}`);
@@ -148,6 +152,68 @@ async function runReviewLoopCommand(args: string[]): Promise<void> {
 function flagValue(args: string[], flag: string): string | undefined {
   const index = args.indexOf(flag);
   return index >= 0 ? args[index + 1] : undefined;
+}
+
+/**
+ * Generic ACP agent registration (durable config, not code).
+ *
+ * Kontrol already dispatches to any loopback HTTP ACP peer that passes the
+ * readiness probe; this command removes the last hand-edit step by persisting
+ * a registration into the durable user config (KONTROL_ACP_AGENTS fallback).
+ * It is transport-agnostic: a stdio agent is wrapped by the generic
+ * scripts/acp-stdio-duplex-adapter.mjs, whose HTTP /runs URL is what gets
+ * registered. A live probe refuses to persist an unreachable endpoint.
+ */
+async function runAgentCommand(args: string[]): Promise<void> {
+  const sub = args[0] ?? "list";
+  const files = loadKontrolFiles();
+  const known = files.config.acpKnownAgents ?? [];
+  if (sub === "list") {
+    if (known.length === 0) {
+      output.write("No ACP agents registered. Add one: kontrol agent add <name> <url>\n");
+      return;
+    }
+    for (const entry of known) output.write(`${entry.name}\t${entry.url}${entry.description ? `\t${entry.description}` : ""}\n`);
+    return;
+  }
+  if (sub === "add") {
+    const name = args[1];
+    const url = args[2];
+    if (!name || !url) throw new Error("Usage: kontrol agent add <name> <url> [description]");
+    if (!/^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?/i.test(url)) {
+      throw new Error("ACP agent URLs must be loopback (127.0.0.1, localhost, ::1); remote peers are not supported.");
+    }
+    // Registration is a durable config write; the server probes the endpoint at
+    // dispatch time (and the managed launcher probes health before use). Pass
+    // --require-healthy to additionally fail closed on an unreachable endpoint
+    // right now (e.g. in a deploy script that starts the adapter first).
+    if (args.includes("--require-healthy")) {
+      let healthy = false;
+      try {
+        const res = await fetch(url.replace(/\/+$/, "") + "/health", { signal: AbortSignal.timeout(3000) });
+        healthy = res.ok || res.status === 404 || res.status === 405;
+      } catch {
+        healthy = false;
+      }
+      if (!healthy) throw new Error(`Agent at ${url} is not reachable; start the adapter before registering it.`);
+    }
+    const description = args.slice(3).filter((a) => !a.startsWith("--"))[0];
+    const next = known.filter((entry) => entry.name !== name);
+    next.push({ name, url, description });
+    writeKontrolConfig({ ...files.config, acpKnownAgents: next });
+    output.write(`Registered ACP agent ${name} -> ${url}. Restart the server to pick it up.\n`);
+    return;
+  }
+  if (sub === "remove") {
+    const name = args[1];
+    if (!name) throw new Error("Usage: kontrol agent remove <name>");
+    const next = known.filter((entry) => entry.name !== name);
+    if (next.length === known.length) throw new Error(`No ACP agent named ${name}.`);
+    writeKontrolConfig({ ...files.config, acpKnownAgents: next });
+    output.write(`Removed ACP agent ${name}.\n`);
+    return;
+  }
+  throw new Error(`Unknown agent subcommand: ${sub} (expected list|add|remove)`);
 }
 
 function fsSnapshotStoreFromConfig(): FilesystemSnapshotStore {
@@ -908,6 +974,7 @@ function printHelp(): void {
       "  kontrol service install|start|stop|restart|upgrade|status|logs|uninstall",
       "  kontrol snapshots stats|gc",
       "  kontrol review-loop status|on|off|pause|resume --session <workSessionId>",
+      "  kontrol agent list|add|remove      Register any loopback HTTP ACP agent",
       "  kontrol -v, --version   Print the installed version",
       "",
       "For temporary tunnels:",
