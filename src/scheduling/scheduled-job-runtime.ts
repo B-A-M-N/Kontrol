@@ -68,6 +68,20 @@ export function createScheduledJobRuntime(options: ScheduledJobRuntimeOptions): 
    * The due event itself is idempotent per (jobId, revision) so this never
    * creates duplicate logical executions.
    */
+  function reconcileRunningDeadlines(): void {
+    const now = Date.now();
+    const rows = database.sqlite
+      .prepare("select id, revision, work_session_id, max_runtime_ms, updated_at from scheduled_jobs where status in ('running','awaiting_approval')")
+      .all() as Array<{ id: string; revision: number; work_session_id: string | null; max_runtime_ms: number; updated_at: string }>;
+    for (const row of rows) {
+      const elapsed = now - Date.parse(row.updated_at);
+      if (elapsed < row.max_runtime_ms) continue;
+      database.sqlite
+        .prepare("update scheduled_jobs set status = 'failed', last_error = ?, updated_at = ? where id = ? and revision = ? and status in ('running','awaiting_approval')")
+        .run("Scheduled job exceeded maxRuntimeMs", new Date(now).toISOString(), row.id, row.revision);
+    }
+  }
+
   function reconcileNonterminalJobs(): void {
     const rows = database.sqlite
       .prepare("select id, revision, run_at from scheduled_jobs where status in ('pending','due','reconciling')")
@@ -105,6 +119,7 @@ export function createScheduledJobRuntime(options: ScheduledJobRuntimeOptions): 
 
   async function runDrain(): Promise<void> {
     try {
+      reconcileRunningDeadlines();
       dispatchOutbox.reapExpiredClaims(leaseMs);
       for (;;) {
         const event = dispatchOutbox.claimNext(schedulerInstanceId, leaseMs, ["scheduled_job.due"]);
@@ -197,6 +212,7 @@ export function createScheduledJobRuntime(options: ScheduledJobRuntimeOptions): 
     start() {
       stopped = false;
       reconcileNonterminalJobs();
+      reconcileRunningDeadlines();
       void drainOnce();
       scheduleNext();
     },

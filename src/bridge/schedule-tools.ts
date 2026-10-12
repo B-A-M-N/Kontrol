@@ -12,6 +12,7 @@ import { forbidden, isReviewer, liveOwnerContextId } from "./shared.js";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
 import { createScheduledJobStore, schedulingOperation } from "../scheduling/scheduled-job-store.js";
 import type { ScheduledJobStore } from "../scheduling/scheduled-job-store.js";
+import { cancelRemoteRun } from "../acp-gateway.js";
 import { z } from "zod/v4";
 
 function scheduledJobStore(config: BridgeConfig): ScheduledJobStore | undefined {
@@ -198,6 +199,34 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
           content: [{ type: "text" as const, text: `Scheduled job ${scheduledJobId} is already ${job.status}.` }],
           structuredContent: { scheduledJobId: job.id, status: job.status, revision: job.revision },
         };
+      }
+      if (job.status === "running" && job.workSessionId) {
+        const run = config.agentRegistry.getRunByWorkSessionId(job.workSessionId);
+        if (run) {
+          const remote = await cancelRemoteRun(
+            {
+              agentRegistry: config.agentRegistry,
+              workspaces: config.workspaces,
+              workSessions: config.workSessions,
+              adapterSecret: config.adapterSecret,
+            },
+            run,
+          );
+          const cancellation = jobs.transition({
+            jobId: scheduledJobId,
+            expectedRevision,
+            nextStatus: "cancellation_requested",
+            lastError: remote.acknowledged
+              ? "Remote termination acknowledged; awaiting cancellation."
+              : `Remote termination not confirmed: ${remote.error ?? "unavailable"}`,
+          });
+          return {
+            content: [{ type: "text" as const, text: remote.acknowledged
+              ? `Scheduled job ${scheduledJobId}: remote termination requested.`
+              : `Scheduled job ${scheduledJobId}: remote termination could not be confirmed.` }],
+            structuredContent: { scheduledJobId: cancellation.id, status: cancellation.status, revision: cancellation.revision, remoteAcknowledged: remote.acknowledged },
+          };
+        }
       }
       try {
         const cancelled = jobs.transition({ jobId: scheduledJobId, expectedRevision, nextStatus: "cancelled", lastError: "operator cancelled" });
