@@ -80,6 +80,7 @@ const migrations: Migration[] = [
   { version: 68, name: "agent-reply-delivery", up: migrateAgentReplyDelivery },
   { version: 69, name: "review-handoff-routing", up: migrateReviewHandoffRouting },
   { version: 70, name: "dispatch-outbox-claim-fencing", up: migrateDispatchOutboxClaimFencing },
+  { version: 71, name: "supervisor-oscillation-fingerprints", up: migrateSupervisorOscillationFingerprints },
 ];
 
 // v64: verification attempts need durable monotonic ordering because ISO
@@ -1424,6 +1425,15 @@ function migrateDispatchOutboxFailureCount(sqlite: Database.Database): void {
  * cannot be acknowledged by a stale holder; they are reaped back to pending
  * and re-claimed with a fresh token.
  */
+/**
+ * v71 (C04): accumulate distinct unresolved failure fingerprints so an
+ * alternating break/restore cycle (A, B, A, B, ...) is detected even though it
+ * resets the consecutive-fingerprint counter on every alternation.
+ */
+function migrateSupervisorOscillationFingerprints(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "supervisor_runs", "failure_fingerprint_set_json", "text not null default '{}'");
+}
+
 function migrateDispatchOutboxClaimFencing(sqlite: Database.Database): void {
   addColumnIfMissing(sqlite, "dispatch_outbox", "claim_token", "text");
   // Any in-flight claim from an older binary carries no token and must not be

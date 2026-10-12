@@ -53,9 +53,19 @@ try {
     "a stale lease owner cannot commit a supervisor transition",
   );
   assert.ok(runs.renew(lease.id, "test-fingerprint", lease.leaseNonce, 10_000), "current lease owner can renew with its nonce");
-  assert.equal(runs.noteFailureFingerprint(resumed.id, "test-fingerprint", "same-failure"), 1);
-  assert.equal(runs.noteFailureFingerprint(resumed.id, "test-fingerprint", "same-failure"), 2);
-  assert.equal(runs.noteFailureFingerprint(resumed.id, "test-fingerprint", "other-failure"), 1, "new failure fingerprint resets the repetition counter");
+  assert.deepEqual(runs.noteFailureFingerprint(resumed.id, "test-fingerprint", "same-failure"), { repeated: 1, distinct: 1, maxOccurrences: 1 });
+  assert.deepEqual(runs.noteFailureFingerprint(resumed.id, "test-fingerprint", "same-failure"), { repeated: 2, distinct: 1, maxOccurrences: 2 });
+  const alternated = runs.noteFailureFingerprint(resumed.id, "test-fingerprint", "other-failure");
+  assert.equal(alternated.repeated, 1, "new failure fingerprint resets the consecutive-repetition counter");
+  assert.equal(alternated.distinct, 2, "C04: the distinct unresolved fingerprint set still grows across alternation");
+  assert.equal(alternated.maxOccurrences, 2, "the earlier fingerprint has now recurred twice");
+  // An alternating A,B,A,B cycle never repeats consecutively, but a fingerprint
+  // RECURS — the oscillation signal that drives escalation.
+  assert.deepEqual(runs.noteFailureFingerprint(resumed.id, "test-fingerprint", "same-failure"), { repeated: 1, distinct: 2, maxOccurrences: 3 });
+  assert.deepEqual(runs.noteFailureFingerprint(resumed.id, "test-fingerprint", "other-failure"), { repeated: 1, distinct: 2, maxOccurrences: 3 });
+  // Clear the probe fingerprints so the runtime cycle below starts from a
+  // clean slate (this test asserts the fingerprint semantics, not escalation).
+  runs.clearFailureFingerprint(resumed.id, "test-fingerprint");
   runs.release(resumed.id, "test-fingerprint");
 
   let verified = 0;
@@ -83,6 +93,43 @@ try {
   assert.equal(advanced?.status, "worker_active");
   assert.equal(advanced?.cycleNumber, 1);
   assert.equal(outbox.listPending().filter((event) => event.eventType === "supervisor.verification.requested").length, 0);
+
+  // ── C04: an oscillating failure sequence escalates to awaiting_human even
+  //    though it never repeats the same fingerprint consecutively. ──
+  {
+    db.sqlite.prepare("insert into workspace_sessions (id, root, status, mode, managed, created_at, last_used_at) values (?, ?, ?, ?, ?, ?, ?)")
+      .run("ws_osc", "/tmp", "active", "checkout", "false", createdAt, createdAt);
+    db.sqlite.prepare("insert into work_sessions (id, workspace_session_id, status, completion_policy, review_epoch, submitted_by, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?)")
+      .run("work_osc", "ws_osc", "in_progress", "webui_approval_required", 0, "test", createdAt, createdAt);
+    db.sqlite.prepare("insert into mission_contracts (id, work_session_id, workspace_session_id, objective, desired_outcome, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?)")
+      .run("mission_osc", "work_osc", "ws_osc", "oscillation", "converge", createdAt, createdAt);
+    const oscRun = runs.create({ missionId: "mission_osc", workSessionId: "work_osc", workspaceSessionId: "ws_osc", autonomyMode: "correction_auto", maxCycles: 10 });
+    const oscActive = runs.transition({ id: oscRun.id, expectedStatus: "created", expectedRevision: oscRun.revision, nextStatus: "worker_active" });
+    assert.ok(oscActive);
+    let oscVerified = 0;
+    const oscRuntime = createSupervisorRuntime({
+      outbox, events, runs,
+      onVerify: async () => { oscVerified += 1; },
+      // Alternate two distinct failure reasons so the consecutive counter never
+      // reaches the limit, but the distinct set does.
+      onEvaluate: async () => ({ decision: "correction_pending", reasons: [oscVerified % 2 === 0 ? "regression in module A" : "regression in module B"] }),
+      onCorrect: async () => {},
+      onApprove: async () => { throw new Error("no approval"); },
+      currentSubmission: () => ({ id: "sub_osc", snapshotCommit: "snap_osc" }),
+      currentSessionStatus: () => "in_progress",
+      currentApproval: () => ({ allowed: false, reasons: ["oscillating"] }),
+    });
+    oscRuntime.start();
+    for (let i = 0; i < 4; i += 1) {
+      events.appendEvent({ type: "review.submitted", sessionId: "work_osc", payload: { submissionId: `sub_osc_${i}` } });
+      await oscRuntime.drainOnce();
+      await oscRuntime.drainOnce();
+    }
+    oscRuntime.stop();
+    const oscState = runs.getByWorkSession("work_osc");
+    assert.equal(oscState?.status, "awaiting_human", "an oscillating failure cycle escalates to human intervention");
+    assert.equal(oscState?.stallReason, "oscillating_verification", "the escalation records the oscillation stall reason");
+  }
 
   db.sqlite.prepare("insert into work_sessions (id, workspace_session_id, status, completion_policy, review_epoch, submitted_by, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?)")
     .run("work_approval", "ws_supervisor", "in_progress", "webui_approval_required", 0, "test", createdAt, createdAt);

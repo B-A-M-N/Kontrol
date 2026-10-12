@@ -52,7 +52,12 @@ export interface SupervisorRuns {
   pause(id: string, expectedRevision: number): ReturnType<typeof row> | undefined;
   resume(id: string, expectedRevision: number): ReturnType<typeof row> | undefined;
   noteFailure(id: string, instanceId: string, error: string, leaseNonce?: string): void;
-  noteFailureFingerprint(id: string, instanceId: string, fingerprint: string, leaseNonce?: string): number;
+  /**
+   * Record a failure fingerprint. Returns BOTH the consecutive-repeat count and
+   * the count of distinct unresolved fingerprints (oscillation signal). The
+   * caller escalates on either crossing its policy limit.
+   */
+  noteFailureFingerprint(id: string, instanceId: string, fingerprint: string, leaseNonce?: string): { repeated: number; distinct: number; maxOccurrences: number };
   clearFailureFingerprint(id: string, instanceId: string, leaseNonce?: string): void;
   recordProgress(id: string, instanceId: string, snapshot: SupervisorProgressSnapshot, leaseNonce?: string): SupervisorProgressRecord | undefined;
   getProgressHistory(workSessionId: string, limit?: number): SupervisorProgressRecord[];
@@ -172,13 +177,24 @@ export function createSupervisorRuns(stateDirOrHandle: string | DatabaseHandle):
     },
     noteFailureFingerprint(id, instanceId, fingerprint, leaseNonce) {
       const current = database.db.select().from(supervisorRuns).where(and(eq(supervisorRuns.id, id), eq(supervisorRuns.ownerInstanceId, instanceId), leaseNonce ? eq(supervisorRuns.leaseNonce, leaseNonce) : undefined)).get();
-      if (!current) return 0;
+      if (!current) return { repeated: 0, distinct: 0, maxOccurrences: 0 };
       const count = current.lastFailureFingerprint === fingerprint ? current.repeatedFailureCount + 1 : 1;
-      database.db.update(supervisorRuns).set({ lastFailureFingerprint: fingerprint, repeatedFailureCount: count, updatedAt: now() }).where(and(eq(supervisorRuns.id, id), eq(supervisorRuns.ownerInstanceId, instanceId), leaseNonce ? eq(supervisorRuns.leaseNonce, leaseNonce) : undefined)).run();
-      return count;
+      // C04: accumulate DISTINCT unresolved fingerprints. An alternating
+      // break/restore cycle keeps the consecutive count at 1, but the distinct
+      // set grows, so oscillation is still detected.
+      const seen = parseJson<Record<string, number>>(current.failureFingerprintSetJson, {}) ?? {};
+      seen[fingerprint] = (seen[fingerprint] ?? 0) + 1;
+      database.db.update(supervisorRuns).set({
+        lastFailureFingerprint: fingerprint,
+        repeatedFailureCount: count,
+        failureFingerprintSetJson: JSON.stringify(seen),
+        updatedAt: now(),
+      }).where(and(eq(supervisorRuns.id, id), eq(supervisorRuns.ownerInstanceId, instanceId), leaseNonce ? eq(supervisorRuns.leaseNonce, leaseNonce) : undefined)).run();
+      const maxOccurrences = Object.values(seen).reduce((max, n) => Math.max(max, n), 0);
+      return { repeated: count, distinct: Object.keys(seen).length, maxOccurrences };
     },
     clearFailureFingerprint(id, instanceId, leaseNonce) {
-      database.db.update(supervisorRuns).set({ lastFailureFingerprint: null, repeatedFailureCount: 0, updatedAt: now() }).where(and(eq(supervisorRuns.id, id), eq(supervisorRuns.ownerInstanceId, instanceId), leaseNonce ? eq(supervisorRuns.leaseNonce, leaseNonce) : undefined)).run();
+      database.db.update(supervisorRuns).set({ lastFailureFingerprint: null, repeatedFailureCount: 0, failureFingerprintSetJson: "{}", updatedAt: now() }).where(and(eq(supervisorRuns.id, id), eq(supervisorRuns.ownerInstanceId, instanceId), leaseNonce ? eq(supervisorRuns.leaseNonce, leaseNonce) : undefined)).run();
     },
     recordProgress(id, instanceId, snapshot, leaseNonce) {
       const current = database.db.select().from(supervisorRuns).where(and(eq(supervisorRuns.id, id), eq(supervisorRuns.ownerInstanceId, instanceId), leaseNonce ? eq(supervisorRuns.leaseNonce, leaseNonce) : undefined)).get();

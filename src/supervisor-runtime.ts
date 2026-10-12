@@ -13,6 +13,8 @@ export interface SupervisorRuntime {
 
 export type Evaluation = { decision: SupervisorDecision; reasons: string[]; failureSetSha256?: string; failureCount?: number };
 const TERMINAL_OR_PAUSED = new Set(["completed", "failed", "cancelled", "awaiting_human", "paused"]);
+/** C04: how many times an unresolved fingerprint may recur before escalation. */
+const OSCILLATION_RECURRENCE_LIMIT = 2;
 
 export interface SupervisorTimingSample {
   workSessionId: string;
@@ -300,19 +302,26 @@ export function createSupervisorRuntime(input: {
       timing.evaluationMs = Math.max(0, performance.now() - evaluationStartedAt);
       const progress = input.getProgressSnapshot?.(workSessionId, evaluation);
       const progressRecord = progress ? input.runs.recordProgress(claimed.id, instanceId, progress, leaseNonce) : undefined;
+      let oscillationStall = false;
       if (evaluation.decision === "correction_pending") {
         const fingerprint = deterministicFailureFingerprint(evaluation);
-        const repeats = input.runs.noteFailureFingerprint(claimed.id, instanceId, fingerprint, leaseNonce);
+        const fingerprintState = input.runs.noteFailureFingerprint(claimed.id, instanceId, fingerprint, leaseNonce);
         const failureLimit = claimed.repeatedFailureFingerprintLimit ?? 3;
-        if (repeats >= failureLimit) {
-          evaluation = { ...evaluation, decision: "awaiting_human", reasons: [`Repeated verification failure fingerprint (${repeats} consecutive cycles).`, ...evaluation.reasons] };
+        if (fingerprintState.repeated >= failureLimit) {
+          evaluation = { ...evaluation, decision: "awaiting_human", reasons: [`Repeated verification failure fingerprint (${fingerprintState.repeated} consecutive cycles).`, ...evaluation.reasons] };
+        } else if (fingerprintState.maxOccurrences >= OSCILLATION_RECURRENCE_LIMIT && fingerprintState.distinct >= 2) {
+          // C04: an alternating break/restore cycle (A→B→A) never repeats
+          // consecutively but a previously observed unresolved fingerprint
+          // RECURS. Escalate before the user's review budget is spent.
+          oscillationStall = true;
+          evaluation = { ...evaluation, decision: "awaiting_human", reasons: [`Oscillating verification failures (fingerprint recurred ${fingerprintState.maxOccurrences} times across ${fingerprintState.distinct} distinct unresolved states).`, ...evaluation.reasons] };
         } else if (progressRecord && progressRecord.stagnantCycleCount >= (claimed.maxStagnantCycles ?? 2)) {
           evaluation = { ...evaluation, decision: "awaiting_human", reasons: [`No demonstrable progress for ${progressRecord.stagnantCycleCount} supervisor cycles.`, ...evaluation.reasons] };
         }
       } else if (evaluation.decision === "approval_pending") {
         input.runs.clearFailureFingerprint(claimed.id, instanceId, leaseNonce);
       }
-      const decided = input.runs.transition({ id: evaluating.id, expectedStatus: "evaluation_pending", expectedRevision: evaluating.revision, nextStatus: evaluation.decision, stallReason: evaluation.decision === "awaiting_human" ? (progressRecord?.stagnantCycleCount ? "no_new_evidence" : "repeated_verification") : null, lease });
+      const decided = input.runs.transition({ id: evaluating.id, expectedStatus: "evaluation_pending", expectedRevision: evaluating.revision, nextStatus: evaluation.decision, stallReason: evaluation.decision === "awaiting_human" ? (oscillationStall ? "oscillating_verification" : progressRecord?.stagnantCycleCount ? "no_new_evidence" : "repeated_verification") : null, lease });
       if (!decided) throw new Error("Supervisor state changed before decision.");
       if (decided.status === "correction_pending" && ["correction_auto", "full"].includes(decided.autonomyMode)) enqueueAction("supervisor.correction.requested", decided.id, decided.revision, workSessionId, evaluation.reasons);
       if (decided.status === "approval_pending" && decided.approvalMode !== "human_required") enqueueAction("supervisor.approval.requested", decided.id, decided.revision, workSessionId);

@@ -545,6 +545,10 @@ export const supervisorRuns = sqliteTable("supervisor_runs", {
   lastProcessedEventSeq: integer("last_processed_event_seq").notNull().default(0), lastSubmissionId: text("last_submission_id"), lastSnapshotCommit: text("last_snapshot_commit"), lastSnapshotKind: text("last_snapshot_kind"), lastSnapshotRef: text("last_snapshot_ref"),
   nextActionAt: text("next_action_at"), failureCount: integer("failure_count").notNull().default(0), lastError: text("last_error"),
   lastFailureFingerprint: text("last_failure_fingerprint"), repeatedFailureCount: integer("repeated_failure_count").notNull().default(0),
+  /** C04: distinct failure fingerprints observed WITHOUT resolution, so an
+   * alternating break/restore cycle accumulates even when the consecutive
+   * fingerprint counter resets on every alternation. */
+  failureFingerprintSetJson: text("failure_fingerprint_set_json").notNull().default("{}"),
   deadlineAt: text("deadline_at"),
   autonomyMode: text("autonomy_mode").notNull().default("manual"), approvalMode: text("approval_mode").notNull().default("human_required"),
   createdAt: text("created_at").notNull(), updatedAt: text("updated_at").notNull(),
