@@ -244,6 +244,20 @@ export function createAcpRuntime(deps: AcpRuntimeDeps): AcpRuntimeHandles {
         const outcome = await dispatchScheduledJob(bridgeBase, scheduledJobs, job, {
           dispatchId: attempt.dispatchId,
         });
+        if (outcome.workSessionId) {
+          eventStore.subscribe(outcome.workSessionId, (event) => {
+            if (event.sessionId !== outcome.workSessionId) return;
+            const current = scheduledJobs.get(jobId);
+            if (!current || current.status === "completed" || current.status === "failed" || current.status === "cancelled") return;
+            if (event.type === "review.submitted") {
+              scheduledJobs.transition({ jobId, expectedRevision: current.revision, nextStatus: "awaiting_approval", workSessionId: outcome.workSessionId });
+            } else if (event.type === "agent.run.approved" || event.type === "agent.run.completed") {
+              scheduledJobs.transition({ jobId, expectedRevision: current.revision, nextStatus: "completed", workSessionId: outcome.workSessionId });
+            } else if (event.type === "agent.run.rejected" || event.type === "agent.run.failed" || event.type === "agent.run.cancelled") {
+              scheduledJobs.transition({ jobId, expectedRevision: current.revision, nextStatus: "failed", workSessionId: outcome.workSessionId, lastError: `Work session ended with ${event.type}` });
+            }
+          });
+        }
         return {
           status: outcome.status,
           workSessionId: outcome.workSessionId,
