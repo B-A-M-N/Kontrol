@@ -544,6 +544,17 @@ export function createReviewWorkflowService(
       return appended;
     };
     const result = db.sqlite.transaction(() => {
+      // Revalidate route binding immediately before writing. The earlier
+      // preflight is outside the transaction and cannot protect this interval.
+      if (reviewRoutes && input.reviewerId !== "supervisor-runtime") {
+        const currentRoute = reviewRoutes.getRouteBySession(input.sessionId);
+        if (currentRoute?.status === "active") {
+          const currentHandoff = reviewRoutes.getHandoffBySubmission(input.sessionId, input.submissionId, currentPending.reviewEpoch);
+          if (!currentHandoff || currentHandoff.status !== "claimed" || currentHandoff.routeEpoch !== currentRoute.routeEpoch) {
+            throw new WorkflowError("Review routing conflict: stale claim at feedback commit.", "conflict", 409);
+          }
+        }
+      }
       // 1. Insert feedback + advance session.
       const feedback = workSessions.submitFeedback({
         workSessionId: input.sessionId,
