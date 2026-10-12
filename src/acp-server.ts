@@ -36,6 +36,7 @@ export function createAcpServer(
   agentSecret?: string,
   reviewerSecret?: string,
   webhookPolicy?: WebhookPolicy,
+  database?: import("./db/client.js").DatabaseHandle,
 ): Router {
   // continuationManager is accepted for signature compatibility; the ACP HTTP
   // surface itself never dispatches through it (native ACP continuations

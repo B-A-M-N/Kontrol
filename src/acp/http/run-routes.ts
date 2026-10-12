@@ -20,7 +20,7 @@ import { ACP_TOOL_POLICY_NAMES } from "../../policy-enforcement.js";
 import { authorizeWorkSessionAction } from "../../work-session-action-guard.js";
 import { redactValue, redactedPreview } from "../../redaction.js";
 import type { AcpContext, AcpRole } from "./context.js";
-import { MUTATING_LOCAL_AGENTS } from "./context.js";
+import { MUTATING_LOCAL_AGENTS, READ_ONLY_AUDIT_ALLOWED_AGENTS } from "./context.js";
 import type { makeAuth } from "./auth.js";
 import type { makeSseHub } from "./sse-hub.js";
 import type { makeRunSupport } from "./run-support.js";
@@ -35,6 +35,10 @@ export function registerRunRoutes(
   barrier: ReturnType<typeof makeReviewBarrier>,
 ) {
   const { workspaces, workSessions, agentRegistry, eventStore, reviewCheckpoints, reviewWorkflow, policyEnforcer, adapterSecret, sharedSecret } = ctx;
+  const workSessionScheduledJob = (workSessionId: string) => {
+    const row = ctx.database?.sqlite.prepare("select execution_mode as executionMode from scheduled_jobs where work_session_id = ? limit 1").get(workSessionId) as { executionMode?: string } | undefined;
+    return row;
+  };
   const { authGate } = auth;
   const { emitSse, sseSubscribe, requestAbortSignal } = sse;
   const { resolveCwd, extractTaskText, resolveRunContext, acquireCheckoutModifyLease } = support;
@@ -167,6 +171,11 @@ export function registerRunRoutes(
     });
     if (!context) return;
     const { session, workspaceRoot, createdSession } = context;
+    const scheduledJob = workSessionScheduledJob(session.id);
+    if (scheduledJob?.executionMode === "read_only_audit" && !READ_ONLY_AUDIT_ALLOWED_AGENTS.has(agent_name)) {
+      res.status(403).json({ agent_name, status: "failed", error: { message: `Tool "${agent_name}" denied by read-only audit policy.` }, output: [] });
+      return;
+    }
     if (MUTATING_LOCAL_AGENTS.has(agent_name) && !(await acquireCheckoutModifyLease(res, session.workspaceSessionId, workspaceRoot, session.id))) {
       if (createdSession) workSessions.updateStatus(session.id, "cancelled");
       return;

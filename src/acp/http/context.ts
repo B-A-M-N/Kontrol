@@ -54,6 +54,13 @@ export const MUTATING_LOCAL_AGENTS = new Set([
   "kontrol-submit-work-to-webui",
 ]);
 
+/** Agents permitted under a scheduled read-only-audit execution policy. */
+export const READ_ONLY_AUDIT_ALLOWED_AGENTS = new Set([
+  "kontrol-read",
+  "kontrol-grep",
+  "kontrol-glob",
+]);
+
 /** Role resolved from the presented bearer secret. */
 export type AcpRole = "agent" | "reviewer" | "operator";
 
@@ -77,4 +84,5 @@ export interface AcpContext {
   sseHistory: Map<string, Array<{ id: string; event: string; data: unknown }>>;
   /** Local Kontrol tool agents exposed over the ACP surface. */
   agentMap: Map<string, { name: string; description: string }>;
+  database?: import("../../db/client.js").DatabaseHandle;
 }
