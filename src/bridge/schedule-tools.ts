@@ -95,6 +95,7 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
         runAt: z.string().optional(),
         workSessionId: z.string().optional(),
         lastError: z.string().optional(),
+        outputPreview: z.string().optional(),
       },
       _meta: {},
       annotations: { readOnlyHint: true },
@@ -113,6 +114,16 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
       if (job.ownerContextId !== (liveOwnerContextId(config) ?? config.principalId ?? "unknown-owner")) {
         return forbidden(config.principalRole, name);
       }
+      const run = job.workSessionId ? config.agentRegistry.getRunByWorkSessionId(job.workSessionId) : undefined;
+      let outputPreview: string | undefined;
+      if (run?.outputJson) {
+        try {
+          const parsed = JSON.parse(run.outputJson) as { output?: Array<{ parts?: Array<{ content?: string }> }> };
+          outputPreview = parsed.output?.flatMap((message) => message.parts?.map((part) => part.content ?? "") ?? []).join("\n") || undefined;
+        } catch {
+          outputPreview = undefined;
+        }
+      }
       return {
         content: [{ type: "text" as const, text: `${job.id}: ${job.status}` }],
         structuredContent: {
@@ -122,6 +133,7 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
           runAt: job.runAt,
           workSessionId: job.workSessionId,
           lastError: job.lastError,
+          outputPreview,
         },
       };
     });
