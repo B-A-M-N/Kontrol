@@ -8,7 +8,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { BridgeConfig } from "./context.js";
 import { registerMutationAppTool } from "./app-tool.js";
-import { forbidden, isReviewer, liveOwnerContextId } from "./shared.js";
+import { forbidden, isReviewer, liveOwnerContextId, requireWorkSessionMutation } from "./shared.js";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
 import { createScheduledJobStore, schedulingOperation } from "../scheduling/scheduled-job-store.js";
 import type { ScheduledJobStore } from "../scheduling/scheduled-job-store.js";
@@ -49,6 +49,8 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
     config,
     async ({ workspaceId, runAt, instructions, executionMode, maxRuntimeMinutes, agentName, clientMutationId }) => {
       if (!isReviewer(config.principalRole)) return forbidden(config.principalRole, "schedule_job");
+      const access = requireWorkSessionMutation(config, workspaceId);
+      if (access) return access;
       if (!jobs) {
         return { content: [{ type: "text" as const, text: "Scheduled jobs are unavailable: the scheduler store is not configured." }], isError: true };
       }
