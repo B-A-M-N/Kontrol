@@ -141,6 +141,11 @@ export function registerReplyTools(server: McpServer, config: BridgeConfig): voi
     if (!config.agentMessages) return { content: [{ type: "text" as const, text: "Agent-message store unavailable." }], isError: true };
     const run = config.agentRegistry.getRunByWorkSessionId(sessionId);
     if (!run) return { content: [{ type: "text" as const, text: "No logical run is bound to this session." }], isError: true };
+    // deliveryAttemptId binds acknowledgement to a specific delivery identity,
+    // preventing a forged or stale delivery token from consuming a reply.
+    if (String(input.deliveryAttemptId) !== `${run.runId}:${run.attemptNumber ?? 1}`) {
+      return { content: [{ type: "text" as const, text: "Stale or forged delivery attempt identity." }], isError: true };
+    }
     try {
       const reply = config.agentMessages.acknowledgeReply({
         replyId,
