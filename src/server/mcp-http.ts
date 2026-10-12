@@ -120,6 +120,8 @@ export interface McpHttpDeps {
   liveWaiters: LiveWaiterRegistry;
   agentMessages: import("../agent-messages.js").AgentMessageManager;
   supervisorRuns: import("../supervisor-runs.js").SupervisorRuns;
+  scheduledJobs?: import("../scheduling/scheduled-job-store.js").ScheduledJobStore;
+  reviewRoutes?: import("../review-handoff/route-store.js").ReviewRouteStore;
 }
 
 type CatalogRefreshPhase = "initialized" | "get_stream";
@@ -243,6 +245,8 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
     reviewWorkflow,
     agentMessages,
     supervisorRuns,
+    scheduledJobs,
+    reviewRoutes,
   } = deps;
   const {
     recordMcpTiming,
@@ -1095,8 +1099,8 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
             else if (uri === DEVDESKTOP_WORKSPACE_APP_URI) workspaceAppResourceMetrics.devDesktopMigration++;
           },
           recordPhaseTiming,
-          undefined,
-          undefined,
+          scheduledJobs,
+          reviewRoutes,
           (catalogSessionId, handshake) => {
             if (!catalogSessionId) return;
             const state = mcpSessions.get(catalogSessionId);

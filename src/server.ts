@@ -695,6 +695,8 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     agentMessages,
     supervisorRuns,
     supervisorWake,
+    scheduledJobs,
+    reviewRoutes,
   };
 
   const diagnosticsDeps = {
