@@ -25,10 +25,16 @@ export interface ScheduledDispatchResult {
  * Returns `uncertain` when the adapter transport failed in a way that cannot
  * prove the remote worker was not accepted — never a blind retry.
  */
+export interface ScheduledDispatchOptions {
+  /** Durable logical launch identity supplied by the runtime dispatch claim. */
+  dispatchId?: string;
+}
+
 export async function dispatchScheduledJob(
   config: BridgeConfig,
   jobs: ScheduledJobStore,
   job: ScheduledJob,
+  options: ScheduledDispatchOptions = {},
 ): Promise<ScheduledDispatchResult> {
   const workspaceSessionId = job.projectId;
   let workspace: { root: string };
@@ -83,6 +89,7 @@ export async function dispatchScheduledJob(
         agentName: peer.name,
         agentId: peer.id,
         task,
+        dispatchIdempotencyKey: options.dispatchId,
         workspaceSessionId,
         workSessionId,
         ...checkoutLeaseMetadata(config, workSessionId),

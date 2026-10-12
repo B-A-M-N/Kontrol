@@ -238,10 +238,12 @@ export function createAcpRuntime(deps: AcpRuntimeDeps): AcpRuntimeHandles {
       database,
       jobs: scheduledJobs,
       dispatchOutbox,
-      dispatch: async (jobId) => {
+      dispatch: async (jobId, attempt) => {
         const job = scheduledJobs.get(jobId);
         if (!job) return { status: "failed" as const, reason: `Unknown scheduled job: ${jobId}` };
-        const outcome = await dispatchScheduledJob(bridgeBase, scheduledJobs, job);
+        const outcome = await dispatchScheduledJob(bridgeBase, scheduledJobs, job, {
+          dispatchId: attempt.dispatchId,
+        });
         return { status: outcome.status, workSessionId: outcome.workSessionId, reason: outcome.reason };
       },
     });

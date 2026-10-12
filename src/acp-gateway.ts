@@ -299,6 +299,8 @@ export async function callRemoteAgent(
     workspaceLeaseNonce?: string;
     /** Expiry of the checkout lease that the worker must renew before its local deadline. */
     workspaceLeaseExpiresAt?: string;
+    /** Stable logical launch identity for exactly-once adapter dispatch. */
+    dispatchIdempotencyKey?: string;
   },
 ): Promise<AgentCallResult> {
   // Reuse the existing logical run across continuations so the UI keeps watching
@@ -364,6 +366,7 @@ export async function callRemoteAgent(
       attempt_number: attemptNumber,
       workspace_lease_nonce: params.workspaceLeaseNonce,
       workspace_lease_expires_at: params.workspaceLeaseExpiresAt,
+      dispatch_idempotency_key: params.dispatchIdempotencyKey,
     };
 
     if (params.webhookUrl) {

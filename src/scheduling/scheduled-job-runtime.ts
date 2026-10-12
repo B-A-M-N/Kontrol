@@ -32,7 +32,7 @@ export interface ScheduledJobRuntimeOptions {
    * the durable work-session correlation and any real failure reason, so the
    * recorded job carries its evidence rather than only a status word.
    */
-  dispatch?: (jobId: string) => Promise<ScheduledDispatchOutcome>;
+  dispatch?: (jobId: string, attempt: { dispatchId: string }) => Promise<ScheduledDispatchOutcome>;
   schedulerInstanceId?: string;
   leaseMs?: number;
   pollMs?: number;
@@ -145,7 +145,9 @@ export function createScheduledJobRuntime(options: ScheduledJobRuntimeOptions): 
             dispatcherInstanceId: schedulerInstanceId,
             leaseMs,
           });
-          const outcome = await options.dispatch(job.id);
+          const outcome = await options.dispatch(job.id, {
+            dispatchId: dispatchClaim.dispatchId,
+          });
           // Only advance the durable job state when the CAS revision still
           // matches what we observed; a concurrent cancellation wins.
           const current = jobs.get(job.id);
