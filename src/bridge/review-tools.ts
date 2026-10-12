@@ -417,6 +417,7 @@ export function registerReviewTools(server: McpServer, config: BridgeConfig): vo
         const result = await config.reviewWorkflow.provideFeedback({
           sessionId,
           submissionId: targetSubmissionId,
+          reviewerOwnerContextId: reviewOwnerContextId(config),
           diffSha256,
           reviewEpoch,
           verdict,

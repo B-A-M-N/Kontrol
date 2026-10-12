@@ -441,10 +441,13 @@ export function registerRunRoutes(
       return;
     }
 
+    const reviewerRole = authGate(req, res, ["reviewer"]);
+    if (!reviewerRole) return;
     try {
       const result = await reviewWorkflow.provideFeedback({
         sessionId,
         submissionId: submissionId ?? "",
+        reviewerOwnerContextId: `acp:${req.ip}`,
         diffSha256,
         reviewEpoch,
         verdict: verdict as "approve" | "changes_requested" | "reject",

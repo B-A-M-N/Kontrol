@@ -290,6 +290,7 @@ export function registerHandoffTools(server: McpServer, config: BridgeConfig): v
         const result = await config.reviewWorkflow.provideFeedback({
           sessionId: handoff.workSessionId,
           submissionId: handoff.submissionId,
+          reviewerOwnerContextId: reviewOwnerContextId(config),
           diffSha256: handoff.diffSha256,
           reviewEpoch: handoff.reviewEpoch,
           verdict,

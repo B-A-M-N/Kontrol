@@ -82,6 +82,8 @@ export interface ProvideFeedbackInput {
   requiredActions?: string[];
   allowedNextActions?: string[];
   reviewerId?: string;
+  /** Authenticated reviewer context from the transport; not a client token. */
+  reviewerOwnerContextId?: string;
   completionReportSha256?: string;
   /**
    * P1 (audit): explicit reviewer acknowledgment that a submission whose
@@ -552,6 +554,10 @@ export function createReviewWorkflowService(
           const currentHandoff = reviewRoutes.getHandoffBySubmission(input.sessionId, input.submissionId, currentPending.reviewEpoch);
           if (!currentHandoff || currentHandoff.status !== "claimed" || currentHandoff.routeEpoch !== currentRoute.routeEpoch) {
             throw new WorkflowError("Review routing conflict: stale claim at feedback commit.", "conflict", 409);
+          }
+          if (input.reviewerOwnerContextId
+            && currentHandoff.claimedByOwnerContextId !== input.reviewerOwnerContextId) {
+            throw new WorkflowError("Review routing conflict: this reviewer did not claim the handoff.", "conflict", 409);
           }
         }
       }
