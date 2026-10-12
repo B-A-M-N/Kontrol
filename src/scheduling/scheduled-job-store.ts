@@ -75,6 +75,7 @@ export interface ScheduledJobStore {
     expectedRevision: number;
     outcome: "dispatched" | "uncertain" | "failed";
     workSessionId?: string;
+    acpRunId?: string;
     lastError?: string;
   }): ScheduledJob;
   close(): void;
@@ -309,6 +310,7 @@ export function createScheduledJobStore(
     expectedRevision: number;
     outcome: "dispatched" | "uncertain" | "failed";
     workSessionId?: string;
+    acpRunId?: string;
     lastError?: string;
   }): ScheduledJob {
     const nextStatus = input.outcome === "dispatched" ? "running" : input.outcome === "uncertain" ? "uncertain_dispatch" : "failed";
@@ -329,7 +331,7 @@ export function createScheduledJobStore(
         ))
         .run();
       database.db.update(scheduledJobAttempts)
-        .set({ completedAt: now, outcome: input.outcome })
+        .set({ completedAt: now, outcome: input.outcome, acpRunId: input.acpRunId ?? null })
         .where(and(
           eq(scheduledJobAttempts.id, input.dispatchAttemptId),
           eq(scheduledJobAttempts.jobId, input.jobId),

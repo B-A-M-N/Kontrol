@@ -13,6 +13,7 @@ import type { ScheduledJobStore } from "./scheduled-job-store.js";
 export interface ScheduledDispatchOutcome {
   status: "dispatched" | "blocked" | "failed" | "uncertain";
   workSessionId?: string;
+  runId?: string;
   reason?: string;
 }
 
@@ -158,6 +159,7 @@ export function createScheduledJobRuntime(options: ScheduledJobRuntimeOptions): 
               expectedRevision: dispatchClaim.revision,
               outcome: outcome.status,
               workSessionId: outcome.workSessionId,
+              acpRunId: outcome.runId,
               lastError: outcome.reason,
             });
           } else {

@@ -244,7 +244,12 @@ export function createAcpRuntime(deps: AcpRuntimeDeps): AcpRuntimeHandles {
         const outcome = await dispatchScheduledJob(bridgeBase, scheduledJobs, job, {
           dispatchId: attempt.dispatchId,
         });
-        return { status: outcome.status, workSessionId: outcome.workSessionId, reason: outcome.reason };
+        return {
+          status: outcome.status,
+          workSessionId: outcome.workSessionId,
+          runId: outcome.runId,
+          reason: outcome.reason,
+        };
       },
     });
     scheduledJobRuntime.start();
