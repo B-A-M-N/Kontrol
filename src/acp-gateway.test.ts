@@ -388,6 +388,12 @@ try {
     assert.equal(agentRegistry.getRunByWorkSessionId(workSession.id)?.runId, uncertainRun?.runId,
       "the later submission still correlates to the original logical run after recovery");
     assert.equal(dispatchRequests, 1, "recovery lookup does not create a second remote run");
+    acceptedRecord = undefined;
+    assert.deepEqual(await lookupPeerDispatch({
+      agentUrl: `http://127.0.0.1:${peerPort}`,
+      adapterSecret: "secret",
+      dispatchIdempotencyKey: dispatchKey,
+    }), { status: "unknown" }, "an unrecognized successful lookup body remains unresolved");
     workSessions.close();
     agentRegistry.close();
   }
