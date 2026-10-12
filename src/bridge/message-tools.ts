@@ -184,13 +184,16 @@ export function registerMessageTools(server: McpServer, config: BridgeConfig): v
         // delivery, not a proof of worker consumption. Empty reply keeps the
         // old explicit resolution semantics.
         if (reply && reply.trim()) {
+          // getReply is keyed by reply ID, not message ID, so the authoritative
+          // duplicate signal is acceptReply returning a prior row.
           const accepted = config.agentMessages!.acceptReply({
             messageId,
             workSessionId: sessionId,
             body: reply,
             reviewerPrincipalId: config.principalId ?? `role:${config.principalRole ?? "reviewer"}`,
           });
-          const event = config.eventStore.appendEvent({
+          const isDuplicate = accepted.createdAt !== new Date().toISOString();
+          const event = isDuplicate ? undefined : config.eventStore.appendEvent({
             type: "agent.message.reply_accepted",
             sessionId,
             payload: {
