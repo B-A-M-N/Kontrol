@@ -59,7 +59,14 @@ try {
   }
   assert.ok(rejected, "stale job revision cannot drive the state machine");
 
-  jobs.transition({ jobId: job.id, expectedRevision: 2, nextStatus: "cancelled", lastError: "operator cancelled" });
+  let illegalSource = false;
+  try {
+    jobs.transition({ jobId: job.id, expectedRevision: 2, nextStatus: "cancelled", expectedSourceStatuses: ["due"], lastError: "operator cancelled" });
+  } catch {
+    illegalSource = true;
+  }
+  assert.ok(illegalSource, "illegal source status cannot drive a transition");
+  jobs.transition({ jobId: job.id, expectedRevision: 2, nextStatus: "cancelled", expectedSourceStatuses: ["dispatching"], lastError: "operator cancelled" });
   assert.equal(jobs.get(job.id)?.status, "cancelled");
 
   // ── S02: the runtime triggers exactly one authorized dispatch per due job,

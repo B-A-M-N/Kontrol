@@ -4,7 +4,7 @@ import type { DatabaseHandle } from "../db/client.js";
 import type { DispatchOutbox } from "../dispatch-outbox.js";
 import { scheduledJobs, scheduledJobAttempts, type ScheduledJobRow } from "../db/schema.js";
 import { createHash } from "node:crypto";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 
 export const schedulingOperation = "schedule_scheduled_job";
 
@@ -41,6 +41,7 @@ export interface ScheduledStateTransition {
   jobId: string;
   expectedRevision: number;
   nextStatus: ScheduledJobStatus;
+  expectedSourceStatuses?: ScheduledJobStatus[];
   workSessionId?: string | null;
   lastError?: string | null;
 }
@@ -359,9 +360,12 @@ export function createScheduledJobStore(
       .where(and(
         eq(scheduledJobs.id, input.jobId),
         eq(scheduledJobs.revision, input.expectedRevision),
+        ...(input.expectedSourceStatuses?.length
+          ? [sql`${scheduledJobs.status} in ${input.expectedSourceStatuses}`]
+          : []),
       ))
       .run();
-    if (updated.changes !== 1) throw new Error(`Scheduled job state transition conflict for ${input.jobId}.`);
+    if (updated.changes !== 1) throw new Error(`Scheduled job state transition conflict or illegal source status for ${input.jobId}.`);
     const next = get(input.jobId);
     if (!next) throw new Error(`Scheduled job disappeared during transition: ${input.jobId}`);
     return next;
