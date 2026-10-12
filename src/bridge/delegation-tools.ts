@@ -178,6 +178,10 @@ export function registerDelegationTools(server: McpServer, config: BridgeConfig)
         return leaseError;
       }
       const dispatchLease = config.workSessions.getWorkspaceLeaseForSession(wsId);
+      const runBeforeDispatch = config.agentRegistry.getRunByWorkSessionId(wsId!);
+      const priorAttemptKey = runBeforeDispatch
+        ? config.agentRegistry.getLatestDispatchAttemptForRun(runBeforeDispatch.runId)?.dispatchIdempotencyKey
+        : undefined;
 
       let supervisorRun: ReturnType<NonNullable<typeof config.supervisorRuns>["create"]> | undefined;
       const rollbackDispatch = (reason: string, runId?: string) => {
@@ -255,6 +259,29 @@ export function registerDelegationTools(server: McpServer, config: BridgeConfig)
             fireAndForget: true,
           },
         );
+        if (result.status === "uncertain") {
+          // The adapter may have accepted this launch. Preserve the session,
+          // lease, and durable run correlation while the server reconciles the
+          // same idempotency key; a transport error is not worker failure.
+          if (supervisorRun) {
+            config.supervisorRuns?.transition({
+              id: supervisorRun.id,
+              expectedStatus: "created",
+              expectedRevision: supervisorRun.revision,
+              nextStatus: "worker_active",
+              lastError: result.error ?? "ACP dispatch acceptance is uncertain; reconciliation is pending.",
+            });
+          }
+          config.eventStore.appendEvent({
+            type: "agent.dispatch.uncertain",
+            sessionId: wsId!,
+            payload: { runId: result.runId, reason: result.error ?? "ACP dispatch acceptance is uncertain." },
+          });
+          return {
+            content: [{ type: "text" as const, text: `${selectedAgentName}: dispatch acceptance is uncertain. Run ${result.runId} remains attached to this work session while Kontrol reconciles the original launch.` }],
+            structuredContent: { runId: result.runId, remoteRunId: result.remoteRunId, workSessionId: wsId, workspaceSessionId, status: "uncertain", output: result.output, error: result.error, retryable: false },
+          };
+        }
         if (result.status === "failed") {
           rollbackDispatch(result.error ?? "ACP dispatch failed", result.runId);
           return {
@@ -270,6 +297,51 @@ export function registerDelegationTools(server: McpServer, config: BridgeConfig)
         };
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error);
+        const correlatedRun = config.agentRegistry.getRunByWorkSessionId(wsId!);
+        const latestAttempt = correlatedRun
+          ? config.agentRegistry.getLatestDispatchAttemptForRun(correlatedRun.runId)
+          : undefined;
+        const newAttemptMayHaveReachedPeer = Boolean(
+          latestAttempt
+          && latestAttempt.dispatchIdempotencyKey !== priorAttemptKey
+          && ["dispatching", "uncertain", "accepted"].includes(latestAttempt.status),
+        );
+        if (newAttemptMayHaveReachedPeer || correlatedRun?.status === "dispatch_uncertain") {
+          const status = latestAttempt?.status === "accepted"
+            ? correlatedRun?.status ?? "running"
+            : "uncertain";
+          try {
+            if (supervisorRun) {
+              config.supervisorRuns?.transition({
+                id: supervisorRun.id,
+                expectedStatus: "created",
+                expectedRevision: supervisorRun.revision,
+                nextStatus: "worker_active",
+                lastError: errorMessage,
+              });
+            }
+          } catch { /* dispatch uncertainty stays durable even if supervisor bookkeeping needs reconciliation */ }
+          try {
+            config.eventStore.appendEvent({
+              type: "agent.dispatch.uncertain",
+              sessionId: wsId!,
+              payload: { runId: correlatedRun?.runId, reason: errorMessage },
+            });
+          } catch { /* the indexed dispatch attempt remains the recovery source */ }
+          return {
+            content: [{ type: "text" as const, text: `Submission follow-up failed after the dispatch may have reached the adapter: ${errorMessage}` }],
+            structuredContent: {
+              runId: correlatedRun?.runId,
+              remoteRunId: correlatedRun?.remoteRunId,
+              workSessionId: wsId,
+              workspaceSessionId,
+              status,
+              output: "",
+              error: errorMessage,
+              retryable: false,
+            },
+          };
+        }
         rollbackDispatch(errorMessage);
         return {
           content: [{ type: "text" as const, text: `Submission to coding agent failed: ${errorMessage}` }],

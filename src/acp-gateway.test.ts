@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import express from "express";
 import Database from "better-sqlite3";
-import { authHeadersForAgent, callRemoteAgent, dispatchToPeer, probeAgent, selectHealthyAgent } from "./acp-gateway.js";
+import { authHeadersForAgent, callRemoteAgent, dispatchToPeer, lookupPeerDispatch, probeAgent, selectHealthyAgent } from "./acp-gateway.js";
 import { createAcpServer } from "./acp-server.js";
 import { openDatabase, databasePath } from "./db/client.js";
 import { createAgentRegistryManager } from "./acp-registry.js";
@@ -284,9 +284,110 @@ try {
           mode: "async",
         },
       ),
-      /Cannot resume terminal run/,
+      /Cannot resume non-resumable run/,
     );
 
+    const cancellingRun = agentRegistry.createRun({
+      agentName: "remote-agent",
+      workspaceSessionId: "ws-terminal",
+      workSessionId: "wsess-cancelling",
+      inputPreview: "must remain fenced",
+      status: "cancelling",
+    });
+    await assert.rejects(
+      () => callRemoteAgent(
+        {
+          agentRegistry,
+          workspaces: { getWorkspace: () => ({ id: "ws-terminal", root: "/tmp", mode: "checkout" }) } as any,
+          workSessions,
+          adapterSecret: "secret",
+        },
+        {
+          agentUrl: "http://127.0.0.1:9",
+          agentName: "remote-agent",
+          task: "resume while cancelling",
+          existingRunId: cancellingRun.runId,
+          mode: "async",
+        },
+      ),
+      /Cannot resume non-resumable run/,
+      "a cancelling logical run cannot be resumed into a new adapter dispatch",
+    );
+
+    workSessions.close();
+    agentRegistry.close();
+  }
+
+  {
+    const dispatchKey = "disp-response-dropped";
+    let acceptedRecord: { run_id: string; dispatch_idempotency_key: string } | undefined;
+    let dispatchRequests = 0;
+    const peer = createServer(async (req, res) => {
+      if (req.method === "POST" && req.url === "/runs") {
+        dispatchRequests += 1;
+        const body = await readJson(req);
+        acceptedRecord = {
+          run_id: "remote-after-drop",
+          dispatch_idempotency_key: String(body.dispatch_idempotency_key),
+        };
+        // Model an adapter that persisted/started the real run before the
+        // acceptance response was lost at the transport boundary.
+        res.destroy();
+        return;
+      }
+      if (req.method === "GET" && req.url === `/runs/by-dispatch-id/${dispatchKey}`) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ accepted: true, run_id: acceptedRecord?.run_id, status: "running" }));
+        return;
+      }
+      res.writeHead(404).end();
+    });
+    servers.push(peer);
+    const peerPort = await listen(peer, "127.0.0.1");
+    const root = await mkdtemp(join(tmpdir(), "kontrol-acp-response-loss-"));
+    tempDirs.push(root);
+    const db = openDatabase(root);
+    seedWorkspace(root, "ws-response-loss");
+    const workSessions = createWorkSessionManager(db);
+    const agentRegistry = createAgentRegistryManager(db);
+    const workSession = workSessions.create({ workspaceSessionId: "ws-response-loss", submittedBy: "test" });
+    const gateway = {
+      agentRegistry,
+      workspaces: { getWorkspace: () => ({ id: "ws-response-loss", root: "/tmp", mode: "checkout" }) } as any,
+      workSessions,
+      adapterSecret: "secret",
+    };
+    const result = await callRemoteAgent(gateway, {
+      agentUrl: `http://127.0.0.1:${peerPort}`,
+      agentName: "remote-agent",
+      task: "audit after connection loss",
+      workspaceSessionId: "ws-response-loss",
+      workSessionId: workSession.id,
+      dispatchIdempotencyKey: dispatchKey,
+      mode: "async",
+      fireAndForget: true,
+    });
+    assert.equal(result.status, "uncertain");
+    assert.equal(acceptedRecord?.dispatch_idempotency_key, dispatchKey);
+    const uncertainRun = agentRegistry.getRunByDispatchIdempotencyKey(dispatchKey);
+    assert.equal(uncertainRun?.status, "dispatch_uncertain");
+    assert.equal(uncertainRun?.finishedAt, undefined, "transport uncertainty does not terminally fail the logical run");
+    const attempt = agentRegistry.getDispatchAttemptByIdempotencyKey(dispatchKey);
+    assert.equal(attempt?.status, "uncertain");
+
+    const lookup = await lookupPeerDispatch({
+      agentUrl: `http://127.0.0.1:${peerPort}`,
+      adapterSecret: "secret",
+      dispatchIdempotencyKey: dispatchKey,
+    });
+    assert.deepEqual(lookup, { status: "found", remoteRunId: "remote-after-drop", executionStatus: "running" });
+    agentRegistry.updateDispatchAttempt(dispatchKey, { status: "accepted", remoteRunId: lookup.remoteRunId });
+    agentRegistry.updateRun(uncertainRun!.runId, { status: "running", remoteRunId: lookup.remoteRunId });
+    const submission = workSessions.submitForReview({ workSessionId: workSession.id, diff: "report", snapshotKind: "git", snapshotRef: "snapshot-a" });
+    assert.ok(submission.id);
+    assert.equal(agentRegistry.getRunByWorkSessionId(workSession.id)?.runId, uncertainRun?.runId,
+      "the later submission still correlates to the original logical run after recovery");
+    assert.equal(dispatchRequests, 1, "recovery lookup does not create a second remote run");
     workSessions.close();
     agentRegistry.close();
   }

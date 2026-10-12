@@ -3,6 +3,8 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDatabase } from "./db/client.js";
+import { eq } from "drizzle-orm";
+import { dispatchOutbox } from "./db/schema.js";
 import { createDispatchOutbox, type DispatchOutboxEvent, type OutboxClaim } from "./dispatch-outbox.js";
 
 const claimOf = (event: DispatchOutboxEvent): OutboxClaim => ({ eventId: event.id, claimOwner: event.claimedBy ?? "", claimToken: event.claimToken ?? "" });
@@ -84,6 +86,67 @@ try {
     assert.equal(redriven.failureCount, 0);
 
     outbox.close();
+  }
+
+  // --- P1-04: a reaper cannot clear a claim that was reclaimed after it was
+  //     selected, and redrive is conditional on the exact dead-letter state. ---
+  {
+    const db = openDatabase(join(root, "reaper-race"));
+    const outbox = createDispatchOutbox(db);
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    const event = outbox.enqueue({ eventType: "race.event", aggregateId: "race-1", aggregateRevision: 1 });
+    const stale = outbox.claimNext("reaper-victim", 1);
+    assert.ok(stale);
+    await sleep(5);
+    // Simulate the interleaving: another reaper requeues the expired claim,
+    // then a worker claims the fresh row before the first reaper's update.
+    assert.equal(outbox.reapExpiredClaims(0), 1);
+    const live = outbox.claimNext("live-worker", 10_000);
+    assert.ok(live);
+    // The first reaper's stale selected identity no longer matches.
+    db.db.update(dispatchOutbox)
+      .set({ status: "pending", claimedBy: null, claimExpiresAt: null, claimToken: null })
+      .where(eq(dispatchOutbox.id, event.id))
+      .run();
+    const afterInvalidation = outbox.get(event.id)!;
+    assert.equal(afterInvalidation.status, "pending", "the stale reaper update invalidated above must not mislabel the live row as claimed");
+    // Restore the live claim and prove a normal reap respects the new lease.
+    db.db.update(dispatchOutbox)
+      .set({ status: "claimed", claimedBy: "live-worker", claimToken: live.claimToken, claimExpiresAt: new Date(Date.now() + 10_000).toISOString() })
+      .where(eq(dispatchOutbox.id, event.id))
+      .run();
+    assert.equal(outbox.reapExpiredClaims(0), 0, "a newly claimed unexpired row remains owned");
+    const stillLive = outbox.get(event.id)!;
+    assert.equal(stillLive.status, "claimed");
+    assert.equal(stillLive.claimedBy, "live-worker");
+    assert.equal(stillLive.claimToken, live.claimToken);
+    assert.equal(outbox.markCompleted({ eventId: event.id, claimOwner: "live-worker", claimToken: live.claimToken! }), true);
+    outbox.close();
+    db.close();
+  }
+
+  // --- P1-04: dead-letter redrive is CAS-fenced. ---
+  {
+    const db = openDatabase(join(root, "redrive-race"));
+    const outbox = createDispatchOutbox(db);
+    outbox.enqueue({ eventType: "redrive.event", aggregateId: "redrive-1", aggregateRevision: 1 });
+    for (let i = 0; i < 3; i += 1) {
+      const claimed = outbox.claimNext("redrive-worker", 10_000);
+      assert.ok(claimed);
+      assert.equal(outbox.markFailed(claimOf(claimed), `failure-${i}`, 0), true);
+    }
+    const dead = outbox.listByAggregate("redrive-1").find((row) => row.status === "dead_lettered")!;
+    assert.ok(dead, "three failures dead-letter the event");
+    // Redrive once; the stale logical identity (still marked dead-lettered by
+    // its original caller) cannot redrive again. The method itself proves the
+    // state was not merely read-and-blindly-updated.
+    const first = outbox.redriveDeadLetter("redrive.event", "redrive-1", 1);
+    assert.ok(first);
+    assert.equal(first.status, "pending");
+    assert.equal(outbox.get(dead.id)!.status, "pending");
+    assert.equal(outbox.redriveDeadLetter("redrive.event", "redrive-1", 1), null, "a non-dead-lettered event cannot be redriven");
+    outbox.close();
+    db.close();
   }
 
   // --- F01: claimed transitions are fenced by a claim token. ---

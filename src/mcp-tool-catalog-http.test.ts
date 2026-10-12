@@ -104,6 +104,31 @@ try {
   }, sessionId);
   assert.ok([200, 202].includes(ackResponse.status), `ack notification returned HTTP ${ackResponse.status}`);
 
+  const unsupportedClient = await rpc("initialize", {
+    protocolVersion: "2025-06-18",
+    capabilities: {},
+    clientInfo: { name: "catalog-ack-http-unsupported-client", version: "1.0.0" },
+  });
+  assert.equal(unsupportedClient.response.status, 200, JSON.stringify(unsupportedClient.payload));
+  const unsupportedSessionId = unsupportedClient.sessionId;
+  assert.ok(unsupportedSessionId, "fresh initialization must return a session ID");
+  await notification("notifications/initialized", {}, unsupportedSessionId);
+  const unsupportedListed = await rpc("tools/list", {}, unsupportedSessionId);
+  const unsupportedFingerprint = fingerprintToolCatalog(unsupportedListed.payload?.result);
+  assert.ok(unsupportedFingerprint, "fresh transport catalog must be fingerprintable");
+  await notification(TOOL_CATALOG_ACK_METHOD, {
+    contractVersion: 1,
+    serverVersion: unsupportedClient.payload?.result?.serverInfo?.version,
+    hostCatalogSha256: unsupportedFingerprint.sha256,
+    hostToolCount: unsupportedFingerprint.toolCount,
+  }, unsupportedSessionId);
+  const unsupportedCall = await rpc("tools/call", {
+    name: "open_workspace",
+    arguments: { path: workspaceRoot, mode: "checkout" },
+  }, unsupportedSessionId);
+  assert.equal(unsupportedCall.payload?.error?.code, -32012,
+    "strict catalog mode must fail closed for clients missing the acknowledgement extension");
+
   const opened = await rpc("tools/call", {
     name: "open_workspace",
     arguments: { path: workspaceRoot, mode: "checkout" },
@@ -121,8 +146,19 @@ try {
   assert.equal(session?.toolCatalogHandshake?.status, "accepted");
   assert.equal(session?.toolCatalogHandshake?.serverCatalogSha256, fingerprint.sha256);
   assert.equal(session?.toolCatalogHandshake?.hostCatalogSha256, fingerprint.sha256);
+  assert.equal(session?.toolCatalogParity?.status, "matched");
+  assert.equal(session?.toolCatalogParity?.degraded, false);
+  const unsupportedSessionHash = createHash("sha256").update(unsupportedSessionId).digest("hex");
+  const unsupportedDiagnostic = diagnostics.mcpSessionMetrics.sessions.find((item: any) => item.sessionIdSha256 === unsupportedSessionHash);
+  assert.equal(unsupportedDiagnostic?.toolCatalogHandshake?.status, "rejected");
+  assert.equal(unsupportedDiagnostic?.toolCatalogHandshake?.reason, "client_capability_missing");
+  assert.equal(unsupportedDiagnostic?.toolCatalogParity?.status, "mismatch");
+  assert.equal(unsupportedDiagnostic?.toolCatalogParity?.degraded, true);
+  assert.equal(diagnostics.mcpSessionMetrics.toolCatalogParity.status, "degraded");
+  assert.equal(diagnostics.mcpSessionMetrics.toolCatalogParity.degradedSessions, 1);
 
   await fetch(url, { method: "DELETE", headers: { "mcp-session-id": sessionId } }).catch(() => {});
+  await fetch(url, { method: "DELETE", headers: { "mcp-session-id": unsupportedSessionId } }).catch(() => {});
   console.log("mcp-tool-catalog-http.test.ts: strict-mode handshake passed");
 } finally {
   await running.drain();

@@ -43,7 +43,7 @@ try {
     workSessionId: session.id,
     body: "production",
     reviewerPrincipalId: "reviewer-a",
-  });
+  }).reply;
   dispatchOutbox.enqueue({
     eventType: "agent.reply.ready",
     aggregateId: reply.id,

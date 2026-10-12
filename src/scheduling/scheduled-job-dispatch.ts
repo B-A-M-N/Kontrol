@@ -68,8 +68,14 @@ export async function dispatchScheduledJob(
     ownerContextId: job.ownerContextId,
   });
   const workSessionId = created.id;
+  const isReadOnlyAudit = job.executionMode === "read_only_audit";
 
-  const leaseError = await acquireCheckoutModifyLease(config, workspaceSessionId, workSessionId, { takeover: false });
+  // Read-only audit jobs must never take a checkout mutation lease. The
+  // scheduled agent still needs the work-session identity and tool-boundary
+  // policy, but the original checkout remains untouched by the scheduler.
+  const leaseError = isReadOnlyAudit
+    ? undefined
+    : (await acquireCheckoutModifyLease(config, workspaceSessionId, workSessionId, { takeover: false }));
   if (leaseError) {
     config.workSessions.updateStatus(workSessionId, "failed");
     return { status: "blocked", workSessionId, reason: leaseError.content[0]?.text ?? "Workspace lease unavailable." };
@@ -92,19 +98,32 @@ export async function dispatchScheduledJob(
         dispatchIdempotencyKey: options.dispatchId,
         workspaceSessionId,
         workSessionId,
-        ...checkoutLeaseMetadata(config, workSessionId),
+        ...(isReadOnlyAudit ? {} : checkoutLeaseMetadata(config, workSessionId)),
+        ...(isReadOnlyAudit ? {
+          scheduledExecutionPolicy: {
+            executionMode: job.executionMode,
+            workspaceAccess: "read_only",
+            mutate: false,
+          },
+        } : {}),
         mode: "async",
         fireAndForget: true,
       },
     );
+    if (result.status === "uncertain") {
+      // Keep the logical session and its policy authority alive until the
+      // original adapter launch is authoritatively resolved.
+      return {
+        status: "uncertain",
+        workSessionId,
+        runId: result.runId,
+        reason: result.error ?? "Scheduled ACP dispatch failed.",
+      };
+    }
     if (result.status === "failed") {
-      // callRemoteAgent maps transport errors to status:"failed" without
-      // proving the adapter rejected the request. Treat an unproven rejection
-      // as uncertain so the job is not blindly relaunched.
-      const uncertain = /ECONNREFUSED|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|socket hang up|network/i.test(result.error ?? "");
       config.workSessions.updateStatus(workSessionId, "failed");
       return {
-        status: uncertain ? "uncertain" : "failed",
+        status: "failed",
         workSessionId,
         runId: result.runId,
         reason: result.error ?? "Scheduled ACP dispatch failed.",
@@ -114,8 +133,7 @@ export async function dispatchScheduledJob(
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const uncertain = /ECONNREFUSED|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|socket hang up|network/i.test(message);
-    config.workSessions.updateStatus(workSessionId, "failed");
+    if (!uncertain) config.workSessions.updateStatus(workSessionId, "failed");
     return { status: uncertain ? "uncertain" : "failed", workSessionId, reason: message };
   }
-
 }

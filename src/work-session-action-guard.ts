@@ -75,21 +75,63 @@ export interface RequiredAction {
  * is NOT in the allowed set is rejected — this turns "allowedNextActions" from
  * advisory text into a real gate.
  *
- * `await_feedback` and `cancel` are always allowed so the worker can never be
- * deadlocked by an overly strict action set.
+ * `await_feedback` and `cancel` remain available during ordinary review so a
+ * worker can observe feedback or exit. During cancellation, those are the only
+ * permitted action classes; all work is fenced until shutdown is confirmed.
  *
  * IMPORTANT: this guard reads the *latest* feedback. The authoritative verifier
  * (review workflow) decides whether resubmission is accepted; this guard merely
  * blocks clearly-forbidden tools between verdict and resubmission.
  */
+/** Server-owned scheduled execution policy bound to the dispatch attempt. */
+export interface ScheduledExecutionPolicy {
+  executionMode?: string;
+  workspaceAccess?: string;
+  mutate?: boolean;
+  allowedTools?: string[];
+}
+
+/**
+ * Read-only audit policy is enforced at the tool-action boundary. An unclassified
+ * tool or any edit/command class is denied when a scheduled job requires
+ * read-only workspace access; read-only tools remain available.
+ */
+function scheduledReadOnlyDecision(
+  policy: ScheduledExecutionPolicy | undefined,
+  input: { tool: string },
+): { allowed: boolean; reason?: string } {
+  if (!policy || policy.workspaceAccess !== "read_only" || policy.mutate !== false) return { allowed: true };
+  const actionClass = TOOL_TO_ACTION_CLASS[input.tool];
+  if (actionClass === "read_files") return { allowed: true };
+  if (policy.allowedTools?.includes(input.tool)) return { allowed: true };
+  return {
+    allowed: false,
+    reason: `Scheduled read-only audit policy denies tool "${input.tool}".`,
+  };
+}
+
 export function authorizeWorkSessionAction(
-  workSessions: WorkSessionManager,
-  input: { workSessionId: string; tool: string; path?: string; command?: string },
+  workSessions: WorkSessionManager | Pick<WorkSessionManager, "get">,
+  input: {
+    workSessionId: string;
+    tool: string;
+    path?: string;
+    command?: string;
+    scheduledExecutionPolicy?: ScheduledExecutionPolicy;
+  },
 ): { allowed: boolean; reason?: string } {
   const session = workSessions.get(input.workSessionId);
   if (!session) return { allowed: false, reason: "unknown work session" };
 
   const actionClass = TOOL_TO_ACTION_CLASS[input.tool];
+  if (session.status === "cancelling") {
+    if (actionClass === "await_feedback" || actionClass === "cancel") return { allowed: true };
+    return { allowed: false, reason: "Work session is cancelling; worker actions are fenced until shutdown is confirmed." };
+  }
+
+  const scheduledPolicyDecision = scheduledReadOnlyDecision(input.scheduledExecutionPolicy, input);
+  if (!scheduledPolicyDecision.allowed) return scheduledPolicyDecision;
+
   if (!actionClass) {
     if (session.completionPolicy === "webui_approval_required") {
       return {

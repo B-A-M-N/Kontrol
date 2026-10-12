@@ -26,8 +26,11 @@ import { compactMissionPacket, projectMissionExecutionContract, renderMissionPro
 
 const root = await mkdtemp(join(tmpdir(), "kontrol-bridge-flow-"));
 const VERIFY_WS = "ws-verification-test";
+const UNCERTAIN_WS = "ws-uncertain-dispatch-test";
 const verificationWorkspaceRoot = join(root, "verification-workspace");
+const uncertainWorkspaceRoot = join(root, "uncertain-workspace");
 await mkdir(verificationWorkspaceRoot, { recursive: true });
+await mkdir(uncertainWorkspaceRoot, { recursive: true });
 
 const staleCompactPacket = compactMissionPacket({
   criteria: [{ id: "stale-verified", status: "verified" }],
@@ -75,6 +78,7 @@ let httpServer: Server | undefined;
 let acpHttp: import("node:http").Server | undefined;
 let agentUrl = "";
 let resumeCalls = 0;
+let dropNextDispatchResponse = false;
 let receivedRunsBeforeForeign = -1;
 const receivedRuns: Array<Record<string, any>> = [];
 let reviewPatch = "diff --git a/x.txt b/x.txt\n--- a/x.txt\n+++ b/x.txt\n@@ -1 +1 @@\n-old\n+new\n";
@@ -126,6 +130,7 @@ const workspaces = {
   getWorkspace: (id: string) => {
     if (id === WS) return { id: WS, root: "/tmp", mode: "checkout" } as any;
     if (id === VERIFY_WS) return { id: VERIFY_WS, root: verificationWorkspaceRoot, mode: "checkout" } as any;
+    if (id === UNCERTAIN_WS) return { id: UNCERTAIN_WS, root: uncertainWorkspaceRoot, mode: "checkout" } as any;
     throw new Error(`Unknown workspace: ${id}`);
   },
   setActiveSession: () => {},
@@ -202,6 +207,7 @@ function createSession(): string {
 try {
   seedWorkspace(root, WS);
   seedWorkspace(root, VERIFY_WS, verificationWorkspaceRoot);
+  seedWorkspace(root, UNCERTAIN_WS, uncertainWorkspaceRoot);
 
   // Stand up a tiny healthy ACP agent endpoint so selectHealthyAgent() passes.
   httpServer = createServer(async (req, res) => {
@@ -209,6 +215,13 @@ try {
       const chunks: Buffer[] = [];
       for await (const chunk of req) chunks.push(Buffer.from(chunk));
       receivedRuns.push(chunks.length ? JSON.parse(Buffer.concat(chunks).toString()) : {});
+      if (dropNextDispatchResponse) {
+        dropNextDispatchResponse = false;
+        // The adapter accepted the request, but the HTTP response disappears
+        // after the handler has recorded the request body.
+        res.destroy();
+        return;
+      }
       res.writeHead(202, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ run_id: `remote-${receivedRuns.length}`, status: "running", output: [] }));
       return;
@@ -481,8 +494,12 @@ try {
     const pending = continuationManager.listForSession(sessionId).find((c) => c.status === "pending");
     assert.ok(pending, "changes_requested creates a pending continuation");
 
-    config.reviewWorkflow.cancelSession({ sessionId, reason: "test cancellation" });
-    assert.equal(workSessions.get(sessionId)!.status, "cancelled");
+    const cancellation = config.reviewWorkflow.cancelSession({ sessionId, reason: "test cancellation" });
+    assert.equal(cancellation.status, "cancelling",
+      "a correlated run with no remote ID or dispatch receipt remains fenced as an unknown worker state");
+    assert.equal(workSessions.get(sessionId)!.status, "cancelling");
+    assert.equal(eventStore.getEventsForSession(sessionId).some((event) => event.type === "agent.run.cancelled"), false,
+      "missing remote metadata does not fabricate worker shutdown");
     assert.equal(continuationManager.get(pending.id)?.status, "superseded");
 
     const before = resumeCalls;
@@ -517,9 +534,14 @@ try {
     };
     await runContinuationTick(raceConfig);
     assert.equal(adapterCalls, 0, "no adapter call occurs after cancellation wins the dispatch race");
-    assert.equal(workSessions.get(sessionId)!.status, "cancelled");
+    assert.equal(workSessions.get(sessionId)!.status, "cancelling",
+      "cancellation during an uncertain continuation dispatch does not release the session early");
+    assert.equal(authorizeWorkSessionAction(workSessions, { workSessionId: sessionId, tool: "edit" }).allowed, false,
+      "cancellation fences further worker mutations");
+    assert.equal(authorizeWorkSessionAction(workSessions, { workSessionId: sessionId, tool: "await_review_feedback" }).allowed, true,
+      "an already waiting worker may observe the cancellation signal and exit");
     assert.equal(continuationManager.get(pending.id)?.status, "superseded", "late delivery CAS does not overwrite superseded continuation");
-    assert.equal(agentRegistry.getRun(run.runId)?.status, "cancelled", "logical run remains cancelled");
+    assert.equal(agentRegistry.getRun(run.runId)?.status, "cancelling", "logical run remains fenced until shutdown evidence arrives");
   }
 
   // ── Scenario 2d: pre-outbox pending continuations are backfilled into the outbox ──
@@ -1249,7 +1271,7 @@ try {
   //    the exact claimed handoff through the authoritative workflow ──
   {
     const sessionId = createSession();
-    const configured = await callReviewer("configure_review_loop", {
+    const configured = await callOwnerA("configure_review_loop", {
       workSessionId: sessionId, enabled: true, mode: "isolated_review", maxReviewRounds: 2,
     });
     assert.ok(!configured.isError, "reviewer can configure an isolated review route");
@@ -1265,9 +1287,9 @@ try {
     assert.equal(workSessions.get(sessionId)!.status, "awaiting_review", "blocked feedback did not mutate the session");
 
     // Claim the exact handoff, then the same feedback is admitted.
-    const claimed = await callReviewer("claim_review_handoff", { handoffId: handoff.id, expectedRevision: handoff.revision, destinationConversationId: "conversation:owner-a" });
+    const claimed = await callOwnerA("claim_review_handoff", { handoffId: handoff.id, expectedRevision: handoff.revision, destinationConversationId: "conversation:owner-a" });
     assert.ok(!claimed.isError, "reviewer claims the handoff: " + JSON.stringify(claimed.content));
-    const admitted = await callReviewer("provide_review_feedback", { sessionId, verdict: "changes_requested", comments: "Please address the reviewed issue before resubmitting." });
+    const admitted = await callOwnerA("provide_review_feedback", { sessionId, verdict: "changes_requested", comments: "Please address the reviewed issue before resubmitting." });
     assert.ok(!admitted.isError, "claimed handoff admits review feedback: " + JSON.stringify(admitted.content));
     void route;
   }
@@ -1281,14 +1303,11 @@ try {
     const status = await callReviewer("get_review_loop_status", { workSessionId: sessionId });
     assert.ok(!status.isError, "reviewer can read review-loop status");
     assert.equal((status.structuredContent as { status?: string })?.status, "paused", "status reflects the pause");
-    // A submission while paused does not create a handoff (automation stopped).
-    await callWorker("submit_for_review", { sessionId });
-    const submission = workSessions.get(sessionId)!.latestSubmission!;
-    assert.equal(
-      reviewRoutes.getHandoffBySubmission(sessionId, submission.id, submission.reviewEpoch),
-      undefined,
-      "a paused route creates no handoff on submission",
-    );
+    // A submission while paused is blocked before mutation: the worker cannot
+    // create a stranded pending submission with no recoverable handoff.
+    const pausedSubmission = await callWorker("submit_for_review", { sessionId });
+    assert.ok(pausedSubmission.isError, "paused route blocks submission before mutation");
+    assert.equal(workSessions.get(sessionId)!.latestSubmission, undefined, "paused route does not create a stranded submission");
     const resumed = await callReviewer("resume_review_loop", { workSessionId: sessionId });
     assert.ok(!resumed.isError, "reviewer can resume the review loop");
     assert.equal((resumed.structuredContent as { status?: string })?.status, "active", "resume restores the active route");
@@ -1677,6 +1696,31 @@ const claimError = await callReviewer("claim_review_handoff", { handoffId: hando
     assert.equal(foreign.status, "pending", "supervisor event remains owned by its consumer");
     assert.equal(scheduled.status, "pending", "scheduled event remains owned by its consumer");
     void owned;
+  }
+
+  // ── K05: an accepted dispatch with a lost response remains recoverable. ──
+  {
+    dropNextDispatchResponse = true;
+    const uncertain = await callReviewer("submit_to_coding_agent", {
+      task: "continue after the adapter acceptance response is lost",
+      workspaceSessionId: UNCERTAIN_WS,
+    });
+    assert.equal(uncertain.structuredContent.status, "uncertain",
+      "a dropped acceptance response is reported as uncertain rather than failed");
+    const workSessionId = uncertain.structuredContent.workSessionId as string;
+    const runId = uncertain.structuredContent.runId as string;
+    const logicalRun = agentRegistry.getRun(runId)!;
+    const attempt = agentRegistry.getLatestDispatchAttemptForRun(runId)!;
+    assert.equal(logicalRun.status, "dispatch_uncertain", "uncertain transport does not terminally fail the logical run");
+    assert.equal(logicalRun.finishedAt, undefined, "uncertain transport has no false terminal timestamp");
+    assert.equal(attempt.status, "uncertain", "the durable attempt stays available for reconciliation");
+    assert.equal(workSessions.get(workSessionId)?.status, "in_progress", "the work session remains recoverable");
+    assert.ok(workSessions.getWorkspaceLeaseForSession(workSessionId), "the workspace fence stays with the unresolved worker");
+
+    const submitted = await callWorker("submit_for_review", { sessionId: workSessionId });
+    assert.ok(!submitted.isError, `a later submission remains correlated: ${JSON.stringify(submitted)}`);
+    assert.equal(agentRegistry.getRunByWorkSessionId(workSessionId)?.runId, runId,
+      "the later review submission resolves to the original logical run");
   }
 
   console.log("bridge-flow.test.ts: all assertions passed");

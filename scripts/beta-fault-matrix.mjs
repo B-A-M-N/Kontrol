@@ -15,7 +15,7 @@ const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const reportPath = resolve(process.env.KONTROL_BETA_FAULT_REPORT ?? join(root, "beta-fault-matrix.json"));
 const cases = [
   { id: "deployment-transaction", area: "deployment", command: process.execPath, args: ["src/start-all.behavior.test.mjs"] },
-  { id: "release-closure-and-boot", area: "deployment", command: process.execPath, args: ["src/release-artifact.test.mjs"] },
+  { id: "release-closure-and-boot", area: "deployment", command: "npm", args: ["run", "test:release-artifact"] },
   { id: "schema-changing-database-rollback", area: "deployment", command: "npx", args: ["--no-install", "tsx", "src/db/deployment-backup.test.ts"] },
   { id: "mcp-process-continuity", area: "mcp", command: "npx", args: ["--no-install", "tsx", "src/mcp-process-continuity.test.ts"] },
   // P1 #9: mandatory transport-resilience evidence — lost launch response,

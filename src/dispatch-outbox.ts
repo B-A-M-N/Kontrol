@@ -165,23 +165,40 @@ export function createDispatchOutbox(
   }
 
   function reapExpiredClaims(leaseMs: number): number {
-    const cutoff = new Date().toISOString();
+    // The CAS uses the still-expired lease observed at selection time. A row
+    // reset by another reaper and then freshly claimed has a new owner,
+    // token, and lease, so this update intentionally matches zero rows.
+    const cutoff = new Date(Date.now() - leaseMs).toISOString();
     const rows = database.db
-      .select()
+      .select({
+        id: dispatchOutbox.id,
+        claimedBy: dispatchOutbox.claimedBy,
+        claimToken: dispatchOutbox.claimToken,
+        claimExpiresAt: dispatchOutbox.claimExpiresAt,
+      })
       .from(dispatchOutbox)
       .where(and(eq(dispatchOutbox.status, "claimed"), lt(dispatchOutbox.claimExpiresAt, cutoff)))
       .all();
 
+    let reaped = 0;
     for (const row of rows) {
       // Clearing the token invalidates the expired holder's fencing identity:
       // it can no longer release/complete/fail the row even if it wakes up.
-      database.db
+      const result = database.db
         .update(dispatchOutbox)
         .set({ status: "pending", claimedBy: null, claimExpiresAt: null, claimToken: null })
-        .where(eq(dispatchOutbox.id, row.id))
+        .where(and(
+          eq(dispatchOutbox.id, row.id),
+          eq(dispatchOutbox.status, "claimed"),
+          ...(row.claimedBy === null ? [isNull(dispatchOutbox.claimedBy)] : [eq(dispatchOutbox.claimedBy, row.claimedBy)]),
+          ...(row.claimToken === null ? [isNull(dispatchOutbox.claimToken)] : [eq(dispatchOutbox.claimToken, row.claimToken)]),
+          ...(row.claimExpiresAt === null ? [isNull(dispatchOutbox.claimExpiresAt)] : [eq(dispatchOutbox.claimExpiresAt, row.claimExpiresAt)]),
+          lt(dispatchOutbox.claimExpiresAt, cutoff),
+        ))
         .run();
+      reaped += result.changes;
     }
-    return rows.length;
+    return reaped;
   }
 
   function get(id: string): DispatchOutboxEvent | undefined {
@@ -308,23 +325,24 @@ export function createDispatchOutbox(
     const existing = getByLogical(eventType, aggregateId, aggregateRevision);
     if (!existing || existing.status !== "dead_lettered") return null;
     const now = new Date().toISOString();
-    database.db
-      .update(dispatchOutbox)
-      .set({
-        status: "pending",
-        attemptCount: 0,
-        failureCount: 0,
-        availableAt: now,
-        claimedBy: null,
-        claimExpiresAt: null,
-        claimToken: null,
-        lastError: null,
-        completedAt: null,
-      })
-      .where(eq(dispatchOutbox.id, existing.id))
-      .run();
-    const row = database.db.select().from(dispatchOutbox).where(eq(dispatchOutbox.id, existing.id)).get();
-    return row ? rowToEvent(row) : null;
+    const result = database.sqlite.transaction(() => {
+      const update = database.sqlite.prepare(
+        `update dispatch_outbox
+            set status = 'pending', attempt_count = 0, failure_count = 0,
+                available_at = ?, claimed_by = null, claim_expires_at = null,
+                claim_token = null, last_error = null, completed_at = null
+          where id = ? and status = 'dead_lettered'
+            and failure_count = ? and attempt_count = ?`,
+      ).run(now, existing.id, existing.failureCount, existing.attemptCount);
+      // Re-read inside the same transaction so the caller can never observe
+      // a row changed between CAS and projection.
+      const row = update.changes === 1
+        ? database.db.select().from(dispatchOutbox).where(eq(dispatchOutbox.id, existing.id)).get()
+        : undefined;
+      return { update, row };
+    })();
+    if (result.update.changes !== 1) return null;
+    return result.row ? rowToEvent(result.row) : null;
   }
 
   function getByLogical(eventType: string, aggregateId: string, aggregateRevision: number): DispatchOutboxEvent | null {

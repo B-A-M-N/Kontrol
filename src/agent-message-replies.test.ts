@@ -28,7 +28,7 @@ try {
     workSessionId: "wsess-replies",
     body: "production",
     reviewerPrincipalId: "reviewer-a",
-  });
+  }).reply;
   assert.match(reply.id, /^reply_/);
   assert.equal(reply.status, "pending_delivery");
   assert.equal(reply.replyRevision, 1);
@@ -50,7 +50,7 @@ try {
     runId: "run-a",
     attempt: 2,
     actorId: "worker-a",
-  });
+  }).reply;
   assert.equal(ack.status, "acknowledged");
   assert.equal(ack.acknowledgedRunId, "run-a");
   const repeated = messages.acknowledgeReply({
@@ -59,7 +59,7 @@ try {
     runId: "run-a",
     attempt: 2,
     actorId: "worker-a",
-  });
+  }).reply;
   assert.equal(repeated.id, ack.id, "idempotent acknowledgement returns existing receipt");
   let foreign = false;
   try {

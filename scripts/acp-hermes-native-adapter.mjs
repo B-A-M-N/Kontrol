@@ -18,6 +18,7 @@ import { readJsonBody, truncateUtf8Tail, writeAdapterError } from "./lib/adapter
 import { buildToolEnvironment } from "./lib/tool-environment.mjs";
 import { adapterStatePath, atomicWriteJson, processStartToken, readJsonOr, reconcileOwnedProcesses, terminateProcessGroup } from "./lib/managed-agent-process.mjs";
 import { applyWorkspaceLeaseRenewal, workspaceLeaseDeadline, workspaceLeaseDeadlineReached } from "./lib/workspace-lease.mjs";
+import { findAdapterDispatchReceipt, loadAdapterDispatchReceipts, recordAdapterDispatchReceipt } from "./lib/adapter-dispatch-receipts.mjs";
 
 const KONTROL_ACP_URL = process.env.KONTROL_ACP_URL || "http://127.0.0.1:7676/acp";
 const AGENT_SECRET = process.env.KONTROL_ACP_AGENT_SECRET;
@@ -33,6 +34,8 @@ const MAX_RUN_MS = positiveDuration(process.env.KONTROL_HERMES_MAX_RUN_SECONDS, 
 const FINAL_OUTPUT_BYTES = 2 * 1024 * 1024;
 const OWNED_PROCESSES_PATH = process.env.KONTROL_HERMES_OWNED_PROCESSES
   || adapterStatePath("hermes", "owned-processes.json");
+const DISPATCH_RECEIPTS_PATH = process.env.KONTROL_HERMES_DISPATCH_RECEIPTS
+  || adapterStatePath("hermes", "dispatch-receipts.json");
 const TERMINAL_SPOOL_PATH = process.env.KONTROL_HERMES_TERMINAL_SPOOL
   || adapterStatePath("hermes", "terminal-spool.json");
 const EVENT_SPOOL_PATH = process.env.KONTROL_HERMES_EVENT_SPOOL
@@ -70,6 +73,7 @@ const PYTHON_BIN = resolveHermesPython();
 let degraded = PYTHON_BIN === null;
 const active = new Map();
 const ownedProcesses = new Map();
+const dispatchReceipts = await loadAdapterDispatchReceipts(DISPATCH_RECEIPTS_PATH);
 const pendingTerminalSpool = new Map();
 const pendingEventSpool = new Map();
 let agentIdentity = null;
@@ -209,6 +213,18 @@ async function handle(req, res) {
     cancelRun(run, "cancelled by Kontrol");
     return writeJson(res, 202, { run_id: remoteRunId, status: "cancelled" });
   }
+  const dispatchLookup = (req.url || "").match(/^\/runs\/by-dispatch-id\/([^/]+)$/);
+  if (req.method === "GET" && dispatchLookup) {
+    if ((req.headers.authorization || "") !== `Bearer ${ADAPTER_SECRET}`) {
+      return writeJson(res, 401, { error: { code: "unauthorized" } });
+    }
+    const key = decodeURIComponent(dispatchLookup[1]);
+    const activeRun = [...active.values()].find((run) => run.dispatchIdempotencyKey === key);
+    const receipt = findAdapterDispatchReceipt(dispatchReceipts, key);
+    const remoteRunId = activeRun?.remoteRunId ?? receipt?.remoteRunId;
+    if (remoteRunId) return writeJson(res, 200, { run_id: remoteRunId, remote_run_id: remoteRunId, accepted: true, status: activeRun?.lifecycle?.toLowerCase() ?? receipt?.status ?? "accepted" });
+    return writeJson(res, 404, { error: { code: "not_found" } });
+  }
   if (req.method !== "POST" || req.url !== "/runs") {
     return writeJson(res, 404, { error: { code: "not_found" } });
   }
@@ -216,6 +232,13 @@ async function handle(req, res) {
     return writeJson(res, 401, { error: { code: "unauthorized" } });
   }
   const body = await readJsonBody(req);
+  const dispatchIdempotencyKey = typeof body.dispatch_idempotency_key === "string" && body.dispatch_idempotency_key.length > 0
+    ? body.dispatch_idempotency_key
+    : undefined;
+  if (dispatchIdempotencyKey) {
+    const receipt = findAdapterDispatchReceipt(dispatchReceipts, dispatchIdempotencyKey);
+    if (receipt) return writeJson(res, 202, { run_id: receipt.remoteRunId, remote_run_id: receipt.remoteRunId, accepted: true, status: receipt.status, replayed: true });
+  }
   if (degraded) {
     return writeJson(res, 503, { error: { code: "degraded", message: "Hermes adapter is degraded: no Python interpreter found" } });
   }
@@ -234,6 +257,7 @@ async function handle(req, res) {
     workSessionId: body.session_id,
     workspaceSessionId: body.workspace_session_id,
     agentId: body.agent_id,
+    dispatchIdempotencyKey,
     task,
     workspaceRoot,
     workspaceLeaseNonce: body.workspace_lease_nonce,
@@ -388,6 +412,9 @@ async function handle(req, res) {
     }
   });
 
+  if (dispatchIdempotencyKey) {
+    await recordAdapterDispatchReceipt(DISPATCH_RECEIPTS_PATH, dispatchReceipts, dispatchIdempotencyKey, run.remoteRunId, "running");
+  }
   return writeJson(res, 202, { run_id: run.remoteRunId, remote_run_id: run.remoteRunId, accepted: true, mode: body.mode || "async" });
 }
 

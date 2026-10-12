@@ -112,8 +112,16 @@ export interface ReviewRouteStore {
  * `freshConversationIds` lists explicitly attached isolated-review identities.
  */
 export interface ReviewHandoffAuthorization {
-  authorizedWorkSessionIds?: string[];
+  /**
+   * Authenticated live conversation/transport identity. For pinned mode this
+   * must match the route's pinned destination; for isolated mode it must match
+   * one of the explicit attachment identities.
+   */
   conversationId?: string;
+  /**
+   * Explicit attachment record produced outside the claim request (future
+   * durable isolated-review authorization). Required for isolated claims.
+   */
   freshConversationIds?: string[];
 }
 
@@ -128,8 +136,18 @@ function assertHandoffClaimAuthorization(
   },
 ): void {
   const authorization = input.authorization;
-  if (authorization?.authorizedWorkSessionIds?.length
-    && !authorization.authorizedWorkSessionIds.includes(handoff.workSessionId)) {
+  if (!authorization?.conversationId || authorization.conversationId !== input.ownerContextId) {
+    throw new Error("Review handoff requires a matching authenticated conversation identity.");
+  }
+  // Work-session access is established by the caller's authenticated ownership
+  // authority before the store is asked to claim. This boundary never accepts a
+  // self-asserted session allowlist. Internal adapters may omit the list; they
+  // own explicit session authority and remain subject to the principal check
+  // below.
+  // The authenticated transport identity must establish work-session ownership.
+  // The route's ownerContextId is the transport-derived identity recorded when
+  // the route was configured; direct session IDs are correlation, not authorization.
+  if (input.ownerContextId !== route.ownerContextId) {
     throw new Error("Review handoff authorization denied for this work session.");
   }
   // The authenticated ownerContextId is the sole claim identity.
@@ -219,44 +237,51 @@ export function createReviewRouteStore(database: DatabaseHandle): ReviewRouteSto
   return {
     configure(input) {
       if (input.maxReviewRounds < 1 || input.maxReviewRounds > 10) throw new Error("maxReviewRounds must be between 1 and 10.");
-      const existing = getRouteBySession(input.workSessionId);
       const now = new Date().toISOString();
-      if (!existing) {
-        const id = `route_${randomUUID()}`;
-        database.db.insert(reviewRoutes).values({
-          id,
-          workSessionId: input.workSessionId,
-          ownerPrincipalId: input.ownerPrincipalId,
-          ownerContextId: input.ownerContextId,
+      const configured = database.sqlite.transaction((): ReviewRoute => {
+        const existing = getRouteBySession(input.workSessionId);
+        if (!existing) {
+          const id = `route_${randomUUID()}`;
+          const insertResult = database.db.insert(reviewRoutes).values({
+            id,
+            workSessionId: input.workSessionId,
+            ownerPrincipalId: input.ownerPrincipalId,
+            ownerContextId: input.ownerContextId,
+            mode: input.mode,
+            deliveryPolicy: "explicit_user_action",
+            pinnedConversationId: input.pinnedConversationId ?? null,
+            maxReviewRounds: input.maxReviewRounds,
+            completedReviewRounds: 0,
+            status: input.enabled ? "active" : "disabled",
+            routeEpoch: 1,
+            revision: 1,
+            createdAt: now,
+            updatedAt: now,
+          }).run();
+          if (insertResult.changes !== 1) {
+            throw new Error(`Review route already exists for work session ${input.workSessionId}.`);
+          }
+          return getRouteBySession(input.workSessionId)!;
+        }
+
+        if (input.expectedRevision !== undefined && input.expectedRevision !== existing.revision) {
+          throw new Error(`Review route revision conflict; expected ${input.expectedRevision}, current ${existing.revision}.`);
+        }
+        const changedMode = input.mode !== existing.mode
+          || (input.pinnedConversationId ?? undefined) !== existing.pinnedConversationId;
+        database.db.update(reviewRoutes).set({
           mode: input.mode,
-          deliveryPolicy: "explicit_user_action",
           pinnedConversationId: input.pinnedConversationId ?? null,
           maxReviewRounds: input.maxReviewRounds,
-          completedReviewRounds: 0,
           status: input.enabled ? "active" : "disabled",
-          routeEpoch: 1,
-          revision: 1,
-          createdAt: now,
+          routeEpoch: changedMode ? existing.routeEpoch + 1 : existing.routeEpoch,
+          revision: existing.revision + 1,
+          warningAcknowledgedAt: existing.warningAcknowledgedAt ?? null,
           updatedAt: now,
-        }).run();
+        }).where(eq(reviewRoutes.id, existing.id)).run();
         return getRouteBySession(input.workSessionId)!;
-      }
-      if (input.expectedRevision !== undefined && input.expectedRevision !== existing.revision) {
-        throw new Error(`Review route revision conflict; expected ${input.expectedRevision}, current ${existing.revision}.`);
-      }
-      const changedMode = input.mode !== existing.mode
-        || (input.pinnedConversationId ?? undefined) !== existing.pinnedConversationId;
-      database.db.update(reviewRoutes).set({
-        mode: input.mode,
-        pinnedConversationId: input.pinnedConversationId ?? null,
-        maxReviewRounds: input.maxReviewRounds,
-        status: input.enabled ? "active" : "disabled",
-        routeEpoch: changedMode ? existing.routeEpoch + 1 : existing.routeEpoch,
-        revision: existing.revision + 1,
-        warningAcknowledgedAt: existing.warningAcknowledgedAt ?? null,
-        updatedAt: now,
-      }).where(eq(reviewRoutes.id, existing.id)).run();
-      return getRouteBySession(input.workSessionId)!;
+      });
+      return configured();
     },
 
     getRouteBySession,
@@ -301,6 +326,9 @@ export function createReviewRouteStore(database: DatabaseHandle): ReviewRouteSto
       if (!handoff) throw new Error(`Unknown review handoff: ${input.handoffId}`);
       const route = getRouteBySession(handoff.workSessionId);
       if (!route) throw new Error("Review route disappeared before claim.");
+      if (handoff.routeEpoch !== route.routeEpoch || route.status !== "active") {
+        throw new Error(`Review handoff is not claimable on a ${route.status} route with epoch ${route.routeEpoch}.`);
+      }
       assertHandoffClaimAuthorization(route, handoff, input);
       const now = new Date().toISOString();
       const updated = database.db.update(reviewHandoffs).set({
@@ -323,6 +351,16 @@ export function createReviewRouteStore(database: DatabaseHandle): ReviewRouteSto
 
     markHandoffStatus(input) {
       const now = new Date().toISOString();
+      const current = database.db.select().from(reviewHandoffs).where(eq(reviewHandoffs.id, input.handoffId)).get();
+      if (!current) throw new Error("Review handoff not found.");
+      const rowStatus = current.status as ReviewHandoffStatus;
+      const allowedSources: Record<string, string[]> = {
+        claimed: ["claimed"],
+        feedback_committed: ["claimed"],
+        released: ["claimed"],
+      };
+      const sourceStatuses = allowedSources[input.nextStatus] ?? [];
+      if (!sourceStatuses.includes(rowStatus)) throw new Error(`Review handoff transition ${rowStatus} -> ${input.nextStatus} is not allowed.`);
       const values: Record<string, unknown> = {
         status: input.nextStatus,
         revision: input.expectedRevision + 1,
@@ -331,6 +369,7 @@ export function createReviewRouteStore(database: DatabaseHandle): ReviewRouteSto
       const updated = database.db.update(reviewHandoffs).set(values).where(and(
         eq(reviewHandoffs.id, input.handoffId),
         eq(reviewHandoffs.revision, input.expectedRevision),
+        eq(reviewHandoffs.status, rowStatus),
       )).run();
       if (updated.changes !== 1) throw new Error("Review handoff status transition conflict.");
       const row = database.db.select().from(reviewHandoffs).where(eq(reviewHandoffs.id, input.handoffId)).get();

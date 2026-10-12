@@ -132,6 +132,17 @@ try {
       } as never);
       assert.equal(observedHandshake?.status, "rejected", `${mode} stale host catalog acknowledgement must be rejected`);
       assert.equal(observedHandshake?.reason, "host_catalog_fingerprint_mismatch");
+      await client.notification({
+        method: TOOL_CATALOG_ACK_METHOD,
+        params: {
+          contractVersion: 1,
+          serverVersion: "stale-immutable-server-version",
+          hostCatalogSha256: fingerprint.sha256,
+          hostToolCount: fingerprint.toolCount,
+        },
+      } as never);
+      assert.equal(observedHandshake?.status, "rejected", `${mode} a stale connected host version must be rejected`);
+      assert.equal(observedHandshake?.reason, "server_version_mismatch");
       const names = new Set(listed.tools.map((tool) => tool.name));
       for (const name of ["read", "grep", "glob", "ls", "git_status", "git_log", "git_diff", "git_show"]) {
         assert.ok(names.has(name), `${mode} must expose required inspection tool ${name}`);

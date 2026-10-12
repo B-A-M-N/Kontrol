@@ -718,6 +718,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     snapshotStoreDiagnostics,
     degradedAuditSnapshot,
     processSessionMetrics: () => processSessions.getMetrics(),
+    scheduledJobMetrics: () => scheduledJobRuntime?.getMetrics() ?? { available: false },
     countActiveWorkSessions: () => workSessions.countActiveWorkSessions(),
     countPendingReviews: () => workSessions.countPendingReviews(),
     countAliveAgents: () => agentRegistry?.listAlive?.()?.length ?? 0,

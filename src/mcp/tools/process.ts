@@ -35,7 +35,10 @@ export function registerCodexProcessTools(
   policyEngine?: PolicyEngine,
   connectionContext?: ConnectionContext,
   prepareForMutation?: (workspaceId: string) => Promise<void>,
+  scheduledExecutionPolicyFor?: (workSessionId: string) => import("../../work-session-action-guard.js").ScheduledExecutionPolicy | undefined,
 ): void {
+  const scheduledExecutionPolicy = (workSessionId: string | undefined) =>
+    workSessionId && scheduledExecutionPolicyFor ? scheduledExecutionPolicyFor(workSessionId) : undefined;
   registerAppTool(
     server,
     "exec_command",
@@ -103,6 +106,7 @@ export function registerCodexProcessTools(
           undefined,
           approvalResumeId,
           { cmd, workingDirectory, tty, columns, rows, yieldTimeMs, maxOutputTokens, clientMutationId },
+          scheduledExecutionPolicy(connectionContext?.workSessionId),
         );
         if (!approved.allowed) {
           return policyFailureResponse(approved, `Tool "exec_command" denied by policy. Command: ${cmd}`, {
@@ -218,6 +222,7 @@ export function registerCodexProcessTools(
           undefined,
           approvalResumeId,
           { sessionId, chars, columns, rows, yieldTimeMs, maxOutputTokens },
+          scheduledExecutionPolicy(connectionContext?.workSessionId),
         );
         if (!approved.allowed) {
           return policyFailureResponse(approved, `Tool "write_stdin" denied by policy: cannot send input to a gated process.`, {

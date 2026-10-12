@@ -19,7 +19,7 @@ import {
   findFilesTool,
   grepFilesTool,
   listDirectoryTool,
-  readFileTool,
+  readFileSnapshotTool,
   writeFileTool,
 } from "../../pi-tools.js";
 import { DEFAULT_MAX_RUNTIME_MS, type ProcessSessionManager } from "../../process-sessions.js";
@@ -82,6 +82,7 @@ export interface WorkspaceToolsDeps {
   readonly trackToolEvent: ToolEnvelope["trackToolEvent"];
   readonly prepareForMutation: (workspaceId: string) => Promise<void>;
   readonly processSessions: ProcessSessionManager;
+  readonly scheduledExecutionPolicyFor?: (workSessionId: string) => import("../../work-session-action-guard.js").ScheduledExecutionPolicy | undefined;
 }
 
 function instructionContent(files: Array<{ path: string; content: string }>, root: string): ToolContent[] {
@@ -249,7 +250,9 @@ export function registerWorkspaceTools(
   server: McpServer,
   deps: WorkspaceToolsDeps,
 ): ReadonlySet<string> {
-  const { config, workspaces, reviewCheckpoints, policyEngine, policyEnforcer, connectionContext, workSessions, trackToolEvent, prepareForMutation, processSessions } = deps;
+  const { config, workspaces, reviewCheckpoints, policyEngine, policyEnforcer, connectionContext, workSessions, trackToolEvent, prepareForMutation, processSessions, scheduledExecutionPolicyFor } = deps;
+  const scheduledExecutionPolicy = (workSessionId: string | undefined) =>
+    workSessionId && scheduledExecutionPolicyFor ? scheduledExecutionPolicyFor(workSessionId) : undefined;
   const registeredToolNames = new Set<string>();
   const registeredTool = (name: string): string => {
     registeredToolNames.add(name);
@@ -678,6 +681,7 @@ export function registerWorkspaceTools(
           undefined,
           input.approvalResumeId,
           input,
+          scheduledExecutionPolicy(connectionContext?.workSessionId),
         );
         if (!approved.allowed) {
           return policyFailureResponse(approved, `Tool "${toolNames.read}" denied by policy. Path: ${input.path}`, {
@@ -690,7 +694,7 @@ export function registerWorkspaceTools(
       const newlyApplicable = readPath.skillRead
         ? []
         : await workspaces.loadApplicableInstructions(workspace, input.path, connectionContext?.mcpSessionId);
-      const response = await readFileTool(
+      const response = await readFileSnapshotTool(
         { ...input, limit: Math.min(input.limit ?? MAX_READ_LINES, MAX_READ_LINES), path: readPath.absolutePath },
         {
           cwd: workspace.root,
@@ -715,7 +719,7 @@ export function registerWorkspaceTools(
         : response.content;
       const inspection = inspectionMetadata(responseContent, response.details, input.offset ?? 1);
       const responseForOutput = { ...response, content: inspection.content };
-      const contentSha256 = await readFileVersion(readPath.absolutePath);
+      const contentSha256 = response.contentSha256;
       const summary = {
         ...textSummary(inspection.content),
         offset: input.offset ?? 1,
@@ -820,6 +824,7 @@ export function registerWorkspaceTools(
             undefined,
             input.approvalResumeId,
             { expectedContentSha256, ...input },
+            scheduledExecutionPolicy(connectionContext?.workSessionId),
           );
         if (!approved.allowed) {
           return policyFailureResponse(approved, `Tool "${toolNames.write}" denied by policy. Path: ${input.path}`, {
@@ -976,6 +981,7 @@ export function registerWorkspaceTools(
             undefined,
             input.approvalResumeId,
             { expectedContentSha256, ...input },
+            scheduledExecutionPolicy(connectionContext?.workSessionId),
           );
         if (!approved.allowed) {
           return policyFailureResponse(approved, `Tool "${toolNames.edit}" denied by policy. Path: ${input.path}`, {
@@ -1142,6 +1148,7 @@ export function registerWorkspaceTools(
             policyPaths,
             approvalResumeId,
             { patch, expectedContentSha256ByPath },
+            scheduledExecutionPolicy(connectionContext?.workSessionId),
           );
           if (!approved.allowed) {
             return policyFailureResponse(approved, `Tool "apply_patch" denied by policy.`, {
@@ -1373,6 +1380,7 @@ export function registerWorkspaceTools(
             undefined,
             input.approvalResumeId,
             input,
+            scheduledExecutionPolicy(connectionContext?.workSessionId),
           );
           if (!approved.allowed) {
             return policyFailureResponse(approved, `Tool "${toolNames.grep}" denied by policy.`, {
@@ -1492,6 +1500,7 @@ export function registerWorkspaceTools(
             undefined,
             input.approvalResumeId,
             input,
+            scheduledExecutionPolicy(connectionContext?.workSessionId),
           );
           if (!approved.allowed) {
             return policyFailureResponse(approved, `Tool "${toolNames.glob}" denied by policy.`, {
@@ -1610,6 +1619,7 @@ export function registerWorkspaceTools(
             undefined,
             input.approvalResumeId,
             input,
+            scheduledExecutionPolicy(connectionContext?.workSessionId),
           );
           if (!approved.allowed) {
             return policyFailureResponse(approved, `Tool "${toolNames.ls}" denied by policy. Path: ${input.path}`, {
@@ -1850,6 +1860,7 @@ export function registerWorkspaceTools(
           undefined,
           input.approvalResumeId,
           { workingDirectory, ...input },
+          scheduledExecutionPolicy(connectionContext?.workSessionId),
         );
         if (!approved.allowed) {
           return policyFailureResponse(approved, `Tool "${toolNames.shell}" denied by policy. Command: ${input.command}`, {

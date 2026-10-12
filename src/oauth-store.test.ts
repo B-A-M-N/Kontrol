@@ -112,6 +112,12 @@ async function testDatabaseConfiguration(stateDir: string): Promise<void> {
       { version: 69, name: "review-handoff-routing" },
       { version: 70, name: "dispatch-outbox-claim-fencing" },
       { version: 71, name: "supervisor-oscillation-fingerprints" },
+      { version: 72, name: "review-route-session-uniqueness" },
+      { version: 73, name: "scheduled-dispatch-fencing" },
+      { version: 74, name: "scheduled-dispatch-outcome-separation" },
+      { version: 75, name: "acp-dispatch-idempotency-lookup" },
+      { version: 76, name: "scheduled-job-owner-cursors" },
+      { version: 77, name: "scheduled-job-cancellation-state" },
     ]);
   } finally {
     database.close();

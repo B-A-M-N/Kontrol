@@ -55,6 +55,7 @@ export interface DiagnosticsDeps {
   snapshotStoreDiagnostics(): Promise<Record<string, unknown>>;
   degradedAuditSnapshot(): Record<string, unknown>;
   processSessionMetrics(): unknown;
+  scheduledJobMetrics?(): unknown;
   countActiveWorkSessions(): number;
   countPendingReviews(): number;
   countAliveAgents(): number;
@@ -174,6 +175,17 @@ export async function handleDiagnostics(deps: DiagnosticsDeps, req: Request, res
       terminationReasons: sessionLifecycle.mcpSessionTerminationMetrics(),
       connectionRecovery: { ...deps.mcpConnectionMetrics },
       operationDiagnostics: deps.operationDiagnostics.snapshot(),
+      toolCatalogParity: (() => {
+        const sessions = [...mcpSessions.values()];
+        const degraded = sessions.filter((session) => session.toolCatalogHandshake?.status !== "accepted");
+        return {
+          status: sessions.length === 0 ? "unobserved" : degraded.length === 0 ? "matched" : "degraded",
+          required: config.mcpToolCatalogAckRequired === true,
+          activeSessions: sessions.length,
+          matchedSessions: sessions.length - degraded.length,
+          degradedSessions: degraded.length,
+        };
+      })(),
       policy: {
         unusedSessionIdleMs: config.mcpUnusedSessionIdleMs,
         ephemeralSessionIdleMs: config.mcpEphemeralSessionIdleMs,
@@ -217,6 +229,14 @@ export async function handleDiagnostics(deps: DiagnosticsDeps, req: Request, res
           lastToolName: state.lastToolName,
           toolSurfaceVersion: state.toolSurfaceVersion,
           toolCatalogHandshake: state.toolCatalogHandshake ? { ...state.toolCatalogHandshake } : undefined,
+          toolCatalogParity: {
+            status: state.toolCatalogHandshake?.status === "accepted"
+              ? "matched"
+              : state.toolCatalogHandshake?.status === "rejected"
+                ? "mismatch"
+                : "unconfirmed",
+            degraded: state.toolCatalogHandshake?.status !== "accepted",
+          },
           catalogRefresh: state.catalogRefresh ? { ...state.catalogRefresh } : undefined,
         })),
       perClient: Object.entries([...mcpSessions.values()].reduce((acc, s) => {
@@ -266,6 +286,7 @@ export async function handleDiagnostics(deps: DiagnosticsDeps, req: Request, res
       pendingReviews,
       activeAcps,
       processSessions: deps.processSessionMetrics(),
+      scheduledJobs: deps.scheduledJobMetrics?.() ?? { available: false },
       totalMcpSessions,
       mcpSessionMetrics: mcpMetrics,
       startupRecovery: deps.startupRecovery,

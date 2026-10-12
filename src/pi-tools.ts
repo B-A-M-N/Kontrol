@@ -1,3 +1,7 @@
+import { constants } from "node:fs";
+import { access as fsAccess, glob as fsGlob, readFile as fsReadFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { matchesGlob, resolve as resolvePath } from "node:path";
 import {
   createBashTool,
   createEditTool,
@@ -15,6 +19,7 @@ import {
   type ReadToolInput,
   type WriteToolInput,
   type AgentToolResult,
+  detectSupportedImageMimeTypeFromFile,
 } from "@earendil-works/pi-coding-agent";
 import { buildChildEnvironment } from "./process-environment.js";
 import { resolveAllowedPath, resolveAllowedPathCanonical } from "./roots.js";
@@ -84,6 +89,37 @@ export async function readFileTool(input: ReadToolInput, context: ToolContext): 
   }, context);
 }
 
+/** Read displayed bytes and their complete-file version from one observation. */
+export async function readFileSnapshotTool(
+  input: ReadToolInput,
+  context: ToolContext,
+): Promise<ToolResponse & { contentSha256?: string }> {
+  const path = await resolveAllowedPathCanonical(input.path, context.cwd, context.readRoots ?? [context.root]);
+  let observedBytes: Buffer | undefined;
+  const tool = createReadTool(context.cwd, {
+    operations: {
+      access: async (absolutePath) => fsAccess(absolutePath, constants.R_OK),
+      detectImageMimeType: detectSupportedImageMimeTypeFromFile,
+      readFile: async (absolutePath) => {
+        const canonical = await resolveAllowedPathCanonical(absolutePath, context.cwd, context.readRoots ?? [context.root]);
+        observedBytes = await fsReadFile(canonical);
+        return observedBytes;
+      },
+    },
+  });
+  const response = await runTool((params) => tool.execute("read_file", params), {
+    path,
+    offset: input.offset,
+    limit: input.limit,
+  }, context);
+  return {
+    ...response,
+    contentSha256: observedBytes
+      ? createHash("sha256").update(observedBytes).digest("hex")
+      : undefined,
+  };
+}
+
 export async function writeFileTool(input: WriteToolInput, context: ToolContext): Promise<ToolResponse> {
   const path = await resolveAllowedPathCanonical(input.path, context.cwd, [context.root]);
   const tool = createWriteTool(context.cwd);
@@ -114,8 +150,39 @@ export async function grepFilesTool(input: GrepToolInput, context: ToolContext):
 export async function findFilesTool(input: FindToolInput, context: ToolContext): Promise<ToolResponse> {
   if (input.path) await resolveAllowedPathCanonical(input.path, context.cwd, [context.root]);
   const tool = createFindTool(context.cwd);
+  const result = await runTool((params) => tool.execute("find_files", params), input, context);
+  const text = result.content.map((part) => part.type === "text" ? part.text : "").join("\n");
+  if (!result.isError || (!text.includes("--no-require-git") && !text.includes("fd is not available"))) return result;
 
-  return runTool((params) => tool.execute("find_files", params), input, context);
+  // Pi's default fd integration uses --no-require-git for workspaces outside
+  // a Git checkout. Older system fd builds reject the option, so retain the
+  // inspection tool contract with Node's built-in globber in that case.
+  const compatibleTool = createFindTool(context.cwd, {
+    operations: {
+      exists: async (path) => {
+        try {
+          await fsAccess(path, constants.R_OK);
+          return true;
+        } catch {
+          return false;
+        }
+      },
+      glob: async (pattern, cwd, options) => {
+        const hasPath = pattern.includes("/");
+        const effectivePattern = !hasPath
+          ? `**/${pattern}`
+          : (!pattern.startsWith("/") && !pattern.startsWith("**/") && pattern !== "**" ? `**/${pattern}` : pattern);
+        const matches: string[] = [];
+        for await (const match of fsGlob(effectivePattern, { cwd, exclude: options.ignore })) {
+          if (options.ignore.some((ignoredPattern) => matchesGlob(match, ignoredPattern))) continue;
+          matches.push(resolvePath(cwd, match));
+          if (matches.length >= options.limit) break;
+        }
+        return matches.sort();
+      },
+    },
+  });
+  return runTool((params) => compatibleTool.execute("find_files", params), input, context);
 }
 
 export async function listDirectoryTool(input: LsToolInput, context: ToolContext): Promise<ToolResponse> {

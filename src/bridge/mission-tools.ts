@@ -352,7 +352,8 @@ export function registerMissionTools(server: McpServer, config: BridgeConfig): v
         verdict: "changes_requested",
         comments,
         requiredActions: workOrder.requiredActions,
-        reviewerId: "webui",
+        invocationOrigin: "internal_supervisor",
+        reviewerId: "supervisor-runtime",
       });
       return {
           content: [{ type: "text" as const, text: `Changes requested for ${workSessionId}; continuation queued.${findingResolutionErrors.length ? ` Finding resolution remains pending: ${findingResolutionErrors.join("; ")}` : ""}` }],
@@ -449,6 +450,7 @@ export function registerMissionTools(server: McpServer, config: BridgeConfig): v
           reviewEpoch: latest.reviewEpoch,
           verdict: "approve",
           comments,
+          invocationOrigin: "internal_supervisor",
           reviewerId: "webui",
           completionReportSha256: config.missionLedger.getCompletionReportHash(workSessionId, { submissionId: latest.id, ...snapshotFields(latest), reviewEpoch: latest.reviewEpoch }),
         });

@@ -210,6 +210,23 @@ async function handleRequest(req, res) {
     return handleRunRequest(req, res, body);
   }
 
+  const dispatchLookupMatch = url.match(/^\/runs\/by-dispatch-id\/([^/]+)$/);
+  if (dispatchLookupMatch && method === "GET") {
+    if ((req.headers.authorization || "") !== `Bearer ${ADAPTER_SECRET}`) {
+      return writeJson(res, 401, { error: { code: "unauthorized" } });
+    }
+    const key = decodeURIComponent(dispatchLookupMatch[1]);
+    const active = [...activeProcesses.values()].find(({ run }) => run.dispatchIdempotencyKey === key)?.run;
+    const replay = replayByDispatchKey.get(key);
+    const response = active
+      ? { run_id: active.remoteRunId, remote_run_id: active.remoteRunId, accepted: true, status: "running" }
+      : replay?.response;
+    if (response?.accepted === true && (response.remote_run_id || response.run_id)) {
+      return writeJson(res, 200, { ...response, accepted: true });
+    }
+    return writeJson(res, 404, { error: { code: "not_found", message: "dispatch key has no authoritative accepted run" } });
+  }
+
   const cancelMatch = url.match(/^\/runs\/([^/]+)\/cancel$/);
   if (cancelMatch && method === "POST") {
     const auth = req.headers.authorization || "";
@@ -249,7 +266,9 @@ async function handleRunRequest(req, res, body) {
   const token = body.token;
   const mode = body.mode;
   const workspaceRootRaw = body.workspace_root;
-  const dispatchKey = continuationId ? `${devRunId}:${continuationId}` : undefined;
+  const dispatchKey = typeof body.dispatch_idempotency_key === "string" && body.dispatch_idempotency_key.length > 0
+    ? body.dispatch_idempotency_key
+    : continuationId ? `${devRunId}:${continuationId}` : undefined;
   const smokeTest = body.smoke_test === true || body?.metadata?.kontrol_smoke_test === true;
 
   if (!smokeTest && !task.trim()) {
@@ -283,6 +302,7 @@ async function handleRunRequest(req, res, body) {
     workSessionId,
     agentId,
     continuationId,
+    dispatchIdempotencyKey: dispatchKey,
     workspaceRoot: null, // set below; validateWorkspaceRoot throws on bad input
     task,
     mode,
@@ -499,7 +519,7 @@ async function handleRunRequest(req, res, body) {
     };
     if (dispatchKey) {
       replayByDispatchKey.set(dispatchKey, { response: acceptedResponse, createdAt: Date.now() });
-      void saveReplayStore();
+      await saveReplayStore();
     }
     return writeJson(res, 202, acceptedResponse);
   } catch (err) {
@@ -622,11 +642,7 @@ function pruneReplayStore() {
 async function saveReplayStore() {
   pruneReplayStore();
   const obj = Object.fromEntries(replayByDispatchKey);
-  try {
-    await atomicWriteJson(REPLAY_STORE_PATH, obj);
-  } catch (err) {
-    console.warn(`[adapter] failed to persist replay store: ${err.message}`);
-  }
+  await atomicWriteJson(REPLAY_STORE_PATH, obj);
 }
 
 async function saveOwnedProcesses() {

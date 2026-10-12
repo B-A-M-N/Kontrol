@@ -372,6 +372,22 @@ try {
   assert.equal(f08Empty.allowed, false, "an empty passing report cannot certify integration evidence");
   ledger.recordCompletionReport(f08Mission.id, { submissionId: f08Submission.id, snapshotKind: "git", snapshotRef: "f08-a", status: "passed", results: [{ command: "npm test", status: "passed" }] });
   assert.equal(ledger.canApprove(f08Session.id, f08Context).allowed, true, "a passing final report with real results satisfies integration evidence");
+  const f08Receipt = ledger.getResultReceipt(f08Session.id, f08Context);
+  assert.equal(f08Receipt?.currentSubmissionId, f08Submission.id);
+  assert.equal(f08Receipt?.completionReport?.snapshotRef, "f08-a");
+  assert.equal(f08Receipt?.approval.allowed, true);
+  assert.ok(f08Receipt?.evidence.some((item) => item.criterionId === "f08-crit"), "result receipt includes bounded evidence IDs for the exact submission");
+  workSessions.updateStatus(f08Session.id, "changes_requested");
+  const f08NextSubmission = workSessions.submitForReview({ workSessionId: f08Session.id, diff: "B", snapshotKind: "git", snapshotRef: "f08-b", snapshotCommit: "f08-b" });
+  const f08NextReceipt = ledger.getResultReceipt(f08Session.id, {
+    submissionId: f08NextSubmission.id,
+    snapshotKind: "git",
+    snapshotRef: "f08-b",
+    snapshotCommit: "f08-b",
+    reviewEpoch: f08NextSubmission.reviewEpoch,
+  });
+  assert.equal(f08NextReceipt?.completionReport, undefined, "a report for an earlier snapshot is never presented as the current result");
+  assert.equal(f08NextReceipt?.evidence.length, 0);
   // P2-03: outcome_verified is now supported with an external-observation
   // receipt, but requires an explicit expected-behavior contract.
   assert.throws(() => ledger.createMission({

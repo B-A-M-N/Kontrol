@@ -88,7 +88,7 @@ export function registerReplyTools(server: McpServer, config: BridgeConfig): voi
         return { content: [{ type: "text" as const, text: "Message not found for this session." }], isError: true };
       }
       const run = config.agentRegistry.getRunByWorkSessionId(sessionId);
-      config.agentMessages.waitForReply({
+      void config.agentMessages.waitForReply({
         messageId,
         workSessionId: sessionId,
         runId: run?.runId,
@@ -96,6 +96,17 @@ export function registerReplyTools(server: McpServer, config: BridgeConfig): voi
         expectsReply: true,
         resumeOnReply: message.data.resumeOnReply === true,
       });
+      // Subscribe before the durable query so a reply that arrives between the
+      // two steps wakes this waiter instead of being missed until timeout.
+      const lastSeq = config.eventStore.getEventsForSession(sessionId).slice(-1)[0]?.seq ?? 0;
+      const existing = config.agentMessages.listPendingReplies(sessionId).find((candidate) => candidate.messageId === messageId);
+      if (existing && existing.status !== "acknowledged") {
+        return {
+          content: [{ type: "text" as const, text: "Reviewer reply is available." }],
+          structuredContent: { status: "reply_ready", replyId: existing.id, replyRevision: existing.replyRevision, body: existing.body },
+        };
+      }
+      await config.eventStore.waitForEventsAfter(sessionId, lastSeq, Math.min(timeoutMs ?? 300_000, 300_000));
       const reply = config.agentMessages.listPendingReplies(sessionId).find((candidate) => candidate.messageId === messageId);
       if (reply && reply.status !== "acknowledged") {
         return {
@@ -103,7 +114,6 @@ export function registerReplyTools(server: McpServer, config: BridgeConfig): voi
           structuredContent: { status: "reply_ready", replyId: reply.id, replyRevision: reply.replyRevision, body: reply.body },
         };
       }
-      await new Promise((resolve) => setTimeout(resolve, Math.min(timeoutMs ?? 300_000, 250)));
       return {
         content: [{ type: "text" as const, text: "Reply is still pending." }],
         structuredContent: { status: "timeout" },
@@ -147,24 +157,29 @@ export function registerReplyTools(server: McpServer, config: BridgeConfig): voi
       return { content: [{ type: "text" as const, text: "Stale or forged delivery attempt identity." }], isError: true };
     }
     try {
-      const reply = config.agentMessages.acknowledgeReply({
+      const ackResult = config.agentMessages.acknowledgeReply({
         replyId,
         workSessionId: sessionId,
         runId: run.runId,
         attempt: run.attemptNumber ?? 1,
         actorId: config.principalId ?? `role:${config.principalRole ?? "worker"}`,
+        expectedReplyRevision: input.replyRevision,
       });
-      config.eventStore.appendEvent({
-        type: "agent.message.reply_acknowledged",
-        sessionId,
-        payload: {
-          messageId: reply.messageId,
-          replyId: reply.id,
-          replyRevision: reply.replyRevision,
-          runId: run.runId,
-          attempt: run.attemptNumber ?? 1,
-        },
-      });
+      const reply = ackResult.reply;
+      const ackEvent = ackResult.created
+        ? config.eventStore.appendEvent({
+            type: "agent.message.reply_acknowledged",
+            sessionId,
+            payload: {
+              messageId: reply.messageId,
+              replyId: reply.id,
+              replyRevision: reply.replyRevision,
+              runId: run.runId,
+              attempt: run.attemptNumber ?? 1,
+            },
+          })
+        : undefined;
+      void ackEvent;
       return {
         content: [{ type: "text" as const, text: `Reply ${reply.id} acknowledged.` }],
         structuredContent: { replyId: reply.id, status: reply.status, acknowledgedRunId: run.runId, acknowledgedAttempt: run.attemptNumber ?? 1 },

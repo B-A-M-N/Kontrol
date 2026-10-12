@@ -6,6 +6,7 @@ import { validateWebhookUrl, type WebhookPolicy } from "./webhook-policy.js";
 import {
   agentRegistry,
   acpRuns,
+  acpRunDispatchAttempts,
   agentWebhookQueue,
   type AgentRegistryRow,
   type AcpRunRow,
@@ -176,7 +177,34 @@ export interface PersistentAcpRun {
   /** Adapter-worker lease expiry. Cleared (null) when the worker attempt ends. */
   workerLeaseUntil?: string | null;
   createdAt: string;
-  finishedAt?: string;
+  finishedAt?: string | null;
+}
+
+export interface PersistentAcpDispatchAttempt {
+  dispatchIdempotencyKey: string;
+  runId: string;
+  agentId?: string;
+  attemptNumber: number;
+  remoteRunId?: string;
+  status: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/**
+ * A finished timestamp only proves the current worker attempt exited when it
+ * follows the latest durable dispatch attempt. Missing attempt metadata is
+ * deliberately inconclusive because legacy or resumed runs can carry stale
+ * timestamps.
+ */
+export function hasConfirmedWorkerAttemptExit(
+  run: Pick<PersistentAcpRun, "finishedAt">,
+  latestAttempt?: Pick<PersistentAcpDispatchAttempt, "createdAt">,
+): boolean {
+  if (!run.finishedAt || !latestAttempt) return false;
+  const finishedAt = Date.parse(run.finishedAt);
+  const attemptStartedAt = Date.parse(latestAttempt.createdAt);
+  return Number.isFinite(finishedAt) && Number.isFinite(attemptStartedAt) && attemptStartedAt < finishedAt;
 }
 
 export interface AgentRegistryManager {
@@ -213,6 +241,11 @@ export interface AgentRegistryManager {
   ): boolean;
   getRun(runId: string): PersistentAcpRun | undefined;
   getRunByWorkSessionId(workSessionId: string): PersistentAcpRun | undefined;
+  getRunByDispatchIdempotencyKey(key: string): PersistentAcpRun | undefined;
+  getDispatchAttemptByIdempotencyKey(key: string): PersistentAcpDispatchAttempt | undefined;
+  getLatestDispatchAttemptForRun(runId: string): PersistentAcpDispatchAttempt | undefined;
+  beginDispatchAttempt(input: { key: string; runId: string; agentId?: string; attemptNumber: number }): void;
+  updateDispatchAttempt(key: string, input: { status: string; remoteRunId?: string }): void;
   listRuns(workspaceSessionId?: string, limit?: number): PersistentAcpRun[];
   enqueueWebhook(runId: string, targetUrl: string, payload: unknown): void;
   processWebhooks(): Promise<number>;
@@ -570,7 +603,7 @@ class SqliteAgentRegistryManager implements AgentRegistryManager {
     if (updates.outputJson !== undefined) values.outputJson = updates.outputJson;
     if (updates.errorMessage !== undefined) values.errorMessage = updates.errorMessage;
     if (updates.webhookDelivered !== undefined) values.webhookDelivered = updates.webhookDelivered ? 1 : 0;
-    if (updates.finishedAt !== undefined) values.finishedAt = updates.finishedAt;
+    if (Object.prototype.hasOwnProperty.call(updates, "finishedAt")) values.finishedAt = updates.finishedAt ?? null;
     if (updates.remoteRunId !== undefined) values.remoteRunId = updates.remoteRunId;
     if (updates.attemptNumber !== undefined) values.attemptNumber = updates.attemptNumber;
     if (updates.lastHeartbeatAt !== undefined) values.lastHeartbeatAt = updates.lastHeartbeatAt;
@@ -628,6 +661,86 @@ class SqliteAgentRegistryManager implements AgentRegistryManager {
       .get();
 
     return row ? rowToPersistentRun(row) : undefined;
+  }
+
+  getRunByDispatchIdempotencyKey(key: string): PersistentAcpRun | undefined {
+    const attempt = this.getDispatchAttemptByIdempotencyKey(key);
+    if (!attempt) return undefined;
+    const run = this.getRun(attempt.runId);
+    return run ? { ...run, attemptNumber: attempt.attemptNumber, remoteRunId: attempt.remoteRunId ?? run.remoteRunId } : undefined;
+  }
+
+  getDispatchAttemptByIdempotencyKey(key: string): PersistentAcpDispatchAttempt | undefined {
+    const row = this.database.db
+      .select()
+      .from(acpRunDispatchAttempts)
+      .where(eq(acpRunDispatchAttempts.dispatchIdempotencyKey, key))
+      .limit(1)
+      .get();
+    if (!row) return undefined;
+    return {
+      dispatchIdempotencyKey: row.dispatchIdempotencyKey,
+      runId: row.runId,
+      agentId: row.agentId ?? undefined,
+      attemptNumber: row.attemptNumber,
+      remoteRunId: row.remoteRunId ?? undefined,
+      status: row.status,
+      createdAt: row.createdAt,
+      updatedAt: row.updatedAt,
+    };
+  }
+
+  getLatestDispatchAttemptForRun(runId: string): PersistentAcpDispatchAttempt | undefined {
+    const row = this.database.db.select().from(acpRunDispatchAttempts)
+      .where(eq(acpRunDispatchAttempts.runId, runId))
+      .orderBy(desc(acpRunDispatchAttempts.attemptNumber), desc(acpRunDispatchAttempts.createdAt))
+      .limit(1)
+      .get();
+    return row ? {
+      dispatchIdempotencyKey: row.dispatchIdempotencyKey,
+      runId: row.runId,
+      agentId: row.agentId ?? undefined,
+      attemptNumber: row.attemptNumber,
+      remoteRunId: row.remoteRunId ?? undefined,
+      status: row.status,
+      createdAt: row.createdAt,
+      updatedAt: row.updatedAt,
+    } : undefined;
+  }
+
+  beginDispatchAttempt(input: { key: string; runId: string; agentId?: string; attemptNumber: number }): void {
+    const now = new Date().toISOString();
+    this.database.sqlite.transaction(() => {
+      const prior = this.database.db.select().from(acpRunDispatchAttempts)
+        .where(eq(acpRunDispatchAttempts.dispatchIdempotencyKey, input.key)).limit(1).get();
+      if (prior) {
+        if (prior.runId !== input.runId || prior.agentId !== (input.agentId ?? null) || prior.attemptNumber !== input.attemptNumber) {
+          throw new Error("ACP dispatch idempotency key is already bound to a different execution attempt.");
+        }
+        return;
+      }
+      this.database.db.insert(acpRunDispatchAttempts).values({
+        dispatchIdempotencyKey: input.key,
+        runId: input.runId,
+        agentId: input.agentId ?? null,
+        attemptNumber: input.attemptNumber,
+        remoteRunId: null,
+        status: "dispatching",
+        createdAt: now,
+        updatedAt: now,
+      }).run();
+    })();
+  }
+
+  updateDispatchAttempt(key: string, input: { status: string; remoteRunId?: string }): void {
+    this.database.db.update(acpRunDispatchAttempts)
+      .set({
+        status: input.status,
+        remoteRunId: input.remoteRunId,
+        updatedAt: new Date().toISOString(),
+      })
+      .where(eq(acpRunDispatchAttempts.dispatchIdempotencyKey, key))
+      .run();
   }
 
   listRuns(workspaceSessionId?: string, limit = 20): PersistentAcpRun[] {

@@ -17,6 +17,8 @@ import { createSupervisorRuntime } from "../supervisor-runtime.js";
 import { createReplyDispatcher } from "../bridge/reply-dispatcher.js";
 import { createScheduledJobRuntime } from "../scheduling/scheduled-job-runtime.js";
 import { dispatchScheduledJob } from "../scheduling/scheduled-job-dispatch.js";
+import { cancelRemoteRun, lookupPeerDispatch } from "../acp-gateway.js";
+import { hasConfirmedWorkerAttemptExit } from "../acp-registry.js";
 import { verifyMissionSubmission } from "../mission-verifier.js";
 import { missionVerificationOptionsFromConfig } from "../bridge/verification-options.js";
 import { evaluateSupervisorMission } from "../supervisor-evaluator.js";
@@ -195,6 +197,7 @@ export function createAcpRuntime(deps: AcpRuntimeDeps): AcpRuntimeHandles {
         verdict: "changes_requested",
         comments: `Automatic verification requires correction:\n${reasons.join("\n")}`,
         requiredActions: workOrder.requiredActions,
+        invocationOrigin: "internal_supervisor",
         reviewerId: "supervisor-runtime",
       });
     },
@@ -222,6 +225,7 @@ export function createAcpRuntime(deps: AcpRuntimeDeps): AcpRuntimeHandles {
         reviewEpoch: latest.reviewEpoch,
         verdict: "approve",
         comments: "Automatically approved after current trusted mission verification.",
+        invocationOrigin: "internal_supervisor",
         reviewerId: "supervisor-runtime",
         completionReportSha256: missionLedger.getCompletionReportHash(workSessionId, { submissionId: latest.id, ...submissionSnapshotFields(latest), reviewEpoch: latest.reviewEpoch }),
       });
@@ -237,6 +241,7 @@ export function createAcpRuntime(deps: AcpRuntimeDeps): AcpRuntimeHandles {
     scheduledJobRuntime = createScheduledJobRuntime({
       database,
       jobs: scheduledJobs,
+      events: eventStore,
       dispatchOutbox,
       dispatch: async (jobId, attempt) => {
         const job = scheduledJobs.get(jobId);
@@ -245,18 +250,8 @@ export function createAcpRuntime(deps: AcpRuntimeDeps): AcpRuntimeHandles {
           dispatchId: attempt.dispatchId,
         });
         if (outcome.workSessionId) {
-          eventStore.subscribe(outcome.workSessionId, (event) => {
-            if (event.sessionId !== outcome.workSessionId) return;
-            const current = scheduledJobs.get(jobId);
-            if (!current || current.status === "completed" || current.status === "failed" || current.status === "cancelled") return;
-            if (event.type === "review.submitted") {
-              scheduledJobs.transition({ jobId, expectedRevision: current.revision, nextStatus: "awaiting_approval", workSessionId: outcome.workSessionId });
-            } else if (event.type === "agent.run.approved" || event.type === "agent.run.completed") {
-              scheduledJobs.transition({ jobId, expectedRevision: current.revision, nextStatus: "completed", workSessionId: outcome.workSessionId });
-            } else if (event.type === "agent.run.rejected" || event.type === "agent.run.failed" || event.type === "agent.run.cancelled") {
-              scheduledJobs.transition({ jobId, expectedRevision: current.revision, nextStatus: "failed", workSessionId: outcome.workSessionId, lastError: `Work session ended with ${event.type}` });
-            }
-          });
+          // The server-owned scheduled lifecycle projection consumes events
+          // independently of this dispatch request's lifetime.
         }
         return {
           status: outcome.status,
@@ -264,6 +259,106 @@ export function createAcpRuntime(deps: AcpRuntimeDeps): AcpRuntimeHandles {
           runId: outcome.runId,
           reason: outcome.reason,
         };
+      },
+      reconcileDispatch: async (input) => {
+        const attempt = agentRegistry.getDispatchAttemptByIdempotencyKey(input.dispatchId);
+        if (!attempt) {
+          return { status: "operator_intervention", reason: `No durable ACP attempt is bound to dispatch ${input.dispatchId}.` };
+        }
+        const run = agentRegistry.getRun(attempt.runId);
+        if (!run) return { status: "operator_intervention", reason: `ACP run ${attempt.runId} for dispatch ${input.dispatchId} is missing.` };
+        const terminalStatus = (status: string): "completed" | "failed" | "cancelled" | undefined => {
+          if (status === "approved") return "completed";
+          if (status === "rejected" || status === "failed" || status === "failed_protocol") return "failed";
+          if (status === "cancelled") return "cancelled";
+          return undefined;
+        };
+        const terminal = terminalStatus(run.status);
+        if (terminal) return { status: "terminal", terminalStatus: terminal, workSessionId: run.workSessionId, runId: run.runId };
+        if (attempt.status === "unstarted") return { status: "unstarted", reason: run.errorMessage };
+        if (attempt.status === "rejected") return { status: "terminal", terminalStatus: "failed", workSessionId: run.workSessionId, runId: run.runId, reason: run.errorMessage };
+        if (attempt.status === "accepted") {
+          if (run.status === "created" || run.status === "dispatch_uncertain" || run.status === "resuming") {
+            agentRegistry.updateRun(run.runId, { status: "running", remoteRunId: attempt.remoteRunId });
+          }
+          return { status: "accepted", workSessionId: run.workSessionId, runId: run.runId };
+        }
+
+        const agent = attempt.agentId ? agentRegistry.get(attempt.agentId) : undefined;
+        if (!agent) {
+          const ageMs = Date.now() - Date.parse(attempt.createdAt);
+          return ageMs >= 10 * 60_000
+            ? { status: "operator_intervention", reason: `Registered adapter ${attempt.agentId ?? "(unknown)"} is unavailable for dispatch reconciliation.` }
+            : { status: "unresolved", reason: `Registered adapter ${attempt.agentId ?? "(unknown)"} is unavailable; dispatch remains uncertain.` };
+        }
+        const lookup = await lookupPeerDispatch({
+          agentUrl: agent.url,
+          adapterSecret: config.acpAdapterSecret,
+          dispatchIdempotencyKey: input.dispatchId,
+        });
+        if (lookup.status === "found") {
+          agentRegistry.updateDispatchAttempt(input.dispatchId, { status: "accepted", remoteRunId: lookup.remoteRunId });
+          if (run.status === "created" || run.status === "dispatch_uncertain" || run.status === "resuming") {
+            agentRegistry.updateRun(run.runId, { status: "running", remoteRunId: lookup.remoteRunId });
+          }
+          return { status: "accepted", workSessionId: run.workSessionId, runId: run.runId };
+        }
+        if (lookup.status === "unstarted") {
+          agentRegistry.updateDispatchAttempt(input.dispatchId, { status: "unstarted" });
+          return { status: "unstarted", reason: "Adapter lookup authoritatively confirmed no run was accepted." };
+        }
+        const ageMs = Date.now() - Date.parse(attempt.createdAt);
+        return ageMs >= 10 * 60_000
+          ? { status: "operator_intervention", reason: "Adapter has no authoritative dispatch record after ten minutes; automatic redelivery remains fenced." }
+          : { status: "unresolved", reason: "Adapter lookup has not established whether the dispatch was accepted." };
+      },
+      reconcileCancellation: async (job) => {
+        const requestId = job.cancellationRequestId;
+        if (!requestId) return { state: "unknown", reason: "Cancellation has no durable request identity." };
+        if (!job.workSessionId) {
+          return { state: "unknown", reason: "No correlated work session is available; worker absence is unproven." };
+        }
+        const session = workSessions.get(job.workSessionId);
+        const run = agentRegistry.getRunByWorkSessionId(job.workSessionId);
+        if (session?.status === "cancelled" || run?.status === "cancelled") {
+          return { state: "worker_cancelled", reason: "The correlated work session or run is durably cancelled." };
+        }
+        if (!session || !run) {
+          return { state: "unknown", reason: "The correlated work session or ACP run is missing; worker absence is unproven." };
+        }
+        if (["approved", "rejected", "failed", "failed_protocol"].includes(run.status)) {
+          return { state: "unknown", reason: `The ACP run is already terminal (${run.status}); waiting for lifecycle projection.` };
+        }
+
+        if (hasConfirmedWorkerAttemptExit(run, agentRegistry.getLatestDispatchAttemptForRun(run.runId))) {
+          reviewWorkflow.cancelSession({ sessionId: session.id, reason: "scheduled job cancellation requested" });
+          reviewWorkflow.finalizeCancellation({ sessionId: session.id, reason: "the current worker attempt had already exited" });
+          return { state: "worker_stopped", reason: "The current worker attempt had already exited; the pending review was cancelled." };
+        }
+
+        reviewWorkflow.cancelSession({ sessionId: session.id, reason: "scheduled job cancellation requested" });
+        if (!run.remoteRunId) {
+          const attempt = agentRegistry.getLatestDispatchAttemptForRun(run.runId);
+          if (attempt && ["unstarted", "rejected"].includes(attempt.status)) {
+            return { state: "not_dispatched", reason: "The durable dispatch attempt confirms the adapter did not accept a run." };
+          }
+          return { state: "unknown", reason: "Remote run identity is unavailable while dispatch may still be active." };
+        }
+        const remote = await cancelRemoteRun({
+          agentRegistry,
+          workspaces,
+          workSessions,
+          adapterSecret: config.acpAdapterSecret,
+        }, run);
+        if (remote.status === 404) {
+          return {
+            state: "unknown",
+            reason: "The adapter reports no active run; a durable terminal event is still required to confirm worker shutdown.",
+          };
+        }
+        return remote.acknowledged
+          ? { state: "termination_acknowledged", reason: "Adapter acknowledged termination; waiting for the durable worker-cancelled event." }
+          : { state: "unknown", reason: `Remote worker state is unknown because termination was not confirmed: ${remote.error ?? "adapter unavailable"}` };
       },
     });
     scheduledJobRuntime.start();

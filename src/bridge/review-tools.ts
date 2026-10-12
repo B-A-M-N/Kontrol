@@ -418,6 +418,7 @@ export function registerReviewTools(server: McpServer, config: BridgeConfig): vo
           sessionId,
           submissionId: targetSubmissionId,
           reviewerOwnerContextId: reviewOwnerContextId(config),
+          invocationOrigin: "authenticated_reviewer",
           diffSha256,
           reviewEpoch,
           verdict,

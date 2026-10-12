@@ -94,9 +94,13 @@ Project scope boundary:
 
 Current implementation contracts:
 
-- Cancellation records a durable intermediate `cancelling` phase, requests the
-  remote worker stop, and becomes terminal only after worker shutdown or a
-  confirmed missing remote run; workspace leases remain fenced until then.
+- Scheduled cancellation records one durable request ID and the
+  `cancellation_requested` state before contacting a worker. Missing remote
+  metadata and termination acknowledgements are not proof of shutdown. A job
+  becomes terminal only after confirmed non-dispatch, confirmed remote absence,
+  or worker cancellation; workspace leases remain fenced until then. A
+  cancelling work session fences new worker actions, handoffs, and continuation
+  dispatches while already-waiting workers may drain the cancellation signal.
 - Unauthenticated liveness/readiness responses expose boolean status only.
   Build, process, session, and workflow diagnostics require the appropriate
   internal readiness or authenticated diagnostics boundary.
@@ -234,6 +238,12 @@ Current implementation contracts:
   identity. A stale host catalog receives bounded list-changed notifications
   after initialize and when a GET SSE stream is established; clients must
   establish a fresh MCP initialize if their tool catalog remains stale.
+  The `kontrol.dev/tool-catalog-ack-v1` receipt fingerprints exact server and
+  host `tools/list` descriptors and immutable server version. Authenticated
+  diagnostics expose pending or rejected parity as a machine-readable
+  degradation; beta release qualification requires a fresh exact external-host
+  parity receipt. Clients without the extension remain visibly unqualified,
+  and strict deployments reject tool calls until an exact receipt is accepted.
 - Workspace App resources use content-hashed HTML identities. Retain up to 64
   prior releases for 30 days as lazy immutable references; each historical
   modern URI and `.skybridge.html` alias must return the exact bytes matching
@@ -249,6 +259,9 @@ Current implementation contracts:
   report truncation. Ordinary tool cards do not copy result content into
   `_meta`; the Workspace App renders `result.content` when a compact card has
   no payload copy.
+- `glob` uses Pi's `fd` integration when available and falls back to Node's
+  built-in globber when `fd` is absent or rejects `--no-require-git`; both
+  paths keep `.git` and `node_modules` out of results.
 - Interactive MCP requests and Workspace App resource reads wait at most
   `KONTROL_MCP_INTERACTIVE_ADMISSION_TIMEOUT_MS` (default 8 seconds) for
   admission, with a per-session queued-request cap of 16. Durable authenticated
@@ -258,12 +271,28 @@ Current implementation contracts:
   bounded SSE comment heartbeats every 15 seconds by default with proxy
   buffering disabled. Operation diagnostics count `heartbeatBytes` separately
   from JSON-RPC `responseBytes`.
-- `read` returns a SHA-256 version of the complete file bytes. `write` and
-  `edit` accept an optional `expectedContentSha256`, while Codex
+- `read` returns content and the SHA-256 version of the complete file bytes
+  from the same byte observation, including when returning a partial line
+  range. `write` and `edit` accept an optional `expectedContentSha256`, while Codex
   `apply_patch` accepts `expectedContentSha256ByPath`; supplied preconditions
   are checked under a process-wide, path-keyed mutation coordinator immediately
   before mutation, so overlapping same-version edits serialize and a
   `file_version_conflict` response leaves all files unchanged.
+- Scheduled dispatch keeps uncertain attempts active until authoritative
+  reconciliation. Kontrol persists the dispatch idempotency key before outbound
+  ACP traffic and uses direct local lookup plus adapter-side lookup after
+  response loss; it never blindly redelivers an uncertain launch. A server-owned
+  event projection advances a durable per-job event cursor and treats worker
+  turn completion, reviewer approval, rejection, failure, and cancellation as
+  distinct lifecycle outcomes.
+- Scheduled jobs are durably owned by authenticated principal and remain
+  recoverable from a fresh MCP transport for that principal; foreign principals
+  cannot read or cancel them. `get_scheduled_job_result` is a read-only receipt
+  over existing ACP runs, submissions, and mission evidence, with paged report
+  retrieval and explicit execution, review, verification, and snapshot fields.
+  Scheduler history and recovery use SQL limits and cursors, bounded dispatch
+  concurrency, and diagnostics for due age, uncertain launches, unreconciled
+  attempt age, and dispatch throughput.
 - Periodic and startup reconciliation is bounded by pages/cursors so runtime
   state, approval expiry, direct-approval orphan cleanup, and telemetry work
   cannot become an unbounded synchronous serving-thread sweep.
@@ -294,6 +323,9 @@ Current implementation contracts:
   directory and passes its exact path to child checks. It must not leave a
   partial `dist/` projection in the checkout. CI sets a local Git identity for
   synthetic repository fixtures.
+- `npm run uat:release` packs and installs through `scripts/package-stage.mjs`
+  so its end-to-end checks exercise an immutable candidate built from the
+  current source instead of a potentially stale checkout `dist/` projection.
 - Workspace App event waits default to 18 seconds so the watcher remains below
   common intermediary idle limits; reconnect retries recreate the host `App`
   transport while preserving the durable UI projection and draft state.

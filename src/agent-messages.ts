@@ -80,11 +80,11 @@ export interface AgentMessageManager {
   get(id: string): AgentMessage | undefined;
   list(workSessionId: string, opts?: { kind?: AgentMessageKind; openOnly?: boolean }): AgentMessage[];
   resolve(id: string): { message: AgentMessage | undefined; changed: boolean };
-  acceptReply(input: { messageId: string; workSessionId: string; body: string; reviewerPrincipalId: string }): AgentMessageReply;
+  acceptReply(input: { messageId: string; workSessionId: string; body: string; reviewerPrincipalId: string }): { reply: AgentMessageReply; created: boolean };
   getReply(replyId: string): AgentMessageReply | undefined;
   listPendingReplies(workSessionId: string): AgentMessageReply[];
   listReplies(workSessionId: string): AgentMessageReply[];
-  acknowledgeReply(input: { replyId: string; workSessionId: string; runId: string; attempt: number; actorId: string }): AgentMessageReply;
+  acknowledgeReply(input: { replyId: string; workSessionId: string; runId: string; attempt: number; actorId: string; expectedReplyRevision?: number }): { reply: AgentMessageReply; created: boolean };
   setReplyDelivery(input: { replyId: string; expectedStatus: AgentReplyStatus; nextStatus: AgentReplyStatus }): AgentMessageReply | undefined;
   waitForReply(input: { messageId: string; workSessionId: string; runId?: string; attempt: number; expectsReply: boolean; resumeOnReply: boolean }): AgentReplyWait;
   getActiveWaitForMessage(messageId: string): AgentReplyWait | undefined;
@@ -191,7 +191,7 @@ export function createAgentMessageManager(
     };
   }
 
-  function acceptReply(input: { messageId: string; workSessionId: string; body: string; reviewerPrincipalId: string }): AgentMessageReply {
+  function acceptReply(input: { messageId: string; workSessionId: string; body: string; reviewerPrincipalId: string }): { reply: AgentMessageReply; created: boolean } {
     if (!input.body.trim()) throw new Error("Reply body must not be empty.");
     const existingForMessage = database.db.select().from(agentMessageReplies)
       .where(eq(agentMessageReplies.messageId, input.messageId))
@@ -201,7 +201,7 @@ export function createAgentMessageManager(
       if (prior.bodySha256 === createHash("sha256").update(input.body).digest("hex")
         && prior.reviewerPrincipalId === input.reviewerPrincipalId
         && prior.workSessionId === input.workSessionId) {
-        return rowToReply(prior);
+        return { reply: rowToReply(prior), created: false };
       }
       throw new Error(`Message ${input.messageId} already has an accepted reply.`);
     }
@@ -230,7 +230,7 @@ export function createAgentMessageManager(
     })();
     const created = getReply(id);
     if (!created) throw new Error("Reply commit could not be read back.");
-    return created;
+    return { reply: created, created: true };
   }
 
   function getReply(replyId: string): AgentMessageReply | undefined {
@@ -252,11 +252,12 @@ export function createAgentMessageManager(
       .all().map(rowToReply);
   }
 
-  function acknowledgeReply(input: { replyId: string; workSessionId: string; runId: string; attempt: number; actorId: string }): AgentMessageReply {
+  function acknowledgeReply(input: { replyId: string; workSessionId: string; runId: string; attempt: number; actorId: string; expectedReplyRevision?: number }): { reply: AgentMessageReply; created: boolean } {
     const existing = getReply(input.replyId);
     if (!existing || existing.workSessionId !== input.workSessionId) throw new Error("Reply not found for this session.");
+    if (input.expectedReplyRevision !== undefined && existing.replyRevision !== input.expectedReplyRevision) throw new Error("Reply revision conflict; stale acknowledgement rejected.");
     if (existing.status === "acknowledged") {
-      if (existing.acknowledgedRunId === input.runId && existing.acknowledgedAttempt === input.attempt) return existing;
+      if (existing.acknowledgedRunId === input.runId && existing.acknowledgedAttempt === input.attempt) return { reply: existing, created: false };
       throw new Error("Reply is already acknowledged by a different logical run or attempt.");
     }
     if (existing.status !== "pending_delivery" && existing.status !== "delivering") throw new Error(`Reply cannot be acknowledged from status ${existing.status}.`);
@@ -276,7 +277,7 @@ export function createAgentMessageManager(
       .run();
     if (updated.changes !== 1) throw new Error("Reply acknowledgement conflict; its delivery state changed concurrently.");
     closeWait({ messageId: existing.messageId, workSessionId: input.workSessionId });
-    return getReply(input.replyId)!;
+    return { reply: getReply(input.replyId)!, created: true };
   }
 
   function setReplyDelivery(input: { replyId: string; expectedStatus: AgentReplyStatus; nextStatus: AgentReplyStatus }): AgentMessageReply | undefined {

@@ -60,11 +60,11 @@ try {
     handoffId: h1.id,
     expectedRevision: 1,
     principalId: "user-b",
-    ownerContextId: "conv-b",
+    ownerContextId: "owner-a",
     destinationConversationId: "conv-b",
     authorization: {
-      authorizedWorkSessionIds: ["wsess-route"],
-      freshConversationIds: ["conv-b"],
+      conversationId: "owner-a",
+      freshConversationIds: ["owner-a"],
     },
   });
   assert.equal(claimed.status, "claimed");
@@ -127,6 +127,31 @@ try {
   }
   assert.ok(thirdRound, "the configured round maximum is an absolute ceiling on new handoffs");
   void h2;
+
+  // ── P1-08: concurrent initial configuration cannot create duplicate routes.
+  {
+    const raceDb = openDatabase(join(root, "route-race"));
+    const left = createReviewRouteStore(raceDb);
+    const right = createReviewRouteStore(raceDb);
+    const input = {
+      workSessionId: "wsess-route-race",
+      ownerPrincipalId: "user-a",
+      ownerContextId: "owner-a",
+      mode: "isolated_review" as const,
+      enabled: true,
+      maxReviewRounds: 2,
+    };
+    raceDb.sqlite.prepare("insert into workspace_sessions (id, root, status, mode, managed, created_at, last_used_at) values (?, '/tmp', 'active', 'checkout', 'false', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')").run("ws-route-race");
+    raceDb.sqlite.prepare("insert into work_sessions (id, workspace_session_id, submitted_by, status, created_at, updated_at) values (?, 'ws-route-race', 'tester', 'in_progress', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')").run(input.workSessionId);
+    const [first, second] = await Promise.all([
+      Promise.resolve().then(() => left.configure(input)),
+      Promise.resolve().then(() => right.configure(input)),
+    ]);
+    assert.equal(first.id, second.id, "concurrent initial configuration converges on one route");
+    const routeCount = raceDb.sqlite.prepare("select count(*) as count from review_routes where work_session_id = ?").get(input.workSessionId) as { count: number };
+    assert.equal(routeCount.count, 1);
+    raceDb.close();
+  }
 
   // Revision CAS is enforced on status changes.
   let staleStatus = false;

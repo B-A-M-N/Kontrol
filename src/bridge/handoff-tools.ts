@@ -153,6 +153,7 @@ export function registerHandoffTools(server: McpServer, config: BridgeConfig): v
       if (!handoff) return { content: [{ type: "text" as const, text: `Unknown handoff: ${handoffId}` }], isError: true };
       try {
         const route = routes.getRouteBySession(handoff.workSessionId);
+        if (!route) return { content: [{ type: "text" as const, text: "Review route not found for this handoff." }], isError: true };
         const claimed = routes.claimHandoff({
           handoffId,
           expectedRevision,
@@ -160,7 +161,6 @@ export function registerHandoffTools(server: McpServer, config: BridgeConfig): v
           ownerContextId: reviewOwnerContextId(config),
           destinationConversationId: destinationConversationId ?? reviewOwnerContextId(config),
           authorization: {
-            authorizedWorkSessionIds: [handoff.workSessionId],
             conversationId: reviewOwnerContextId(config),
             freshConversationIds: [reviewOwnerContextId(config)],
           },
@@ -277,6 +277,9 @@ export function registerHandoffTools(server: McpServer, config: BridgeConfig): v
         status: z.string(),
         verdict: z.string(),
         submissionId: z.string().optional(),
+        handoffId: z.string().optional(),
+        handoffRevision: z.number().optional(),
+        handoffStatus: z.string().optional(),
       },
       _meta: {},
       annotations: { readOnlyHint: false },
@@ -298,6 +301,7 @@ export function registerHandoffTools(server: McpServer, config: BridgeConfig): v
           sessionId: handoff.workSessionId,
           submissionId: handoff.submissionId,
           reviewerOwnerContextId: reviewOwnerContextId(config),
+          invocationOrigin: "authenticated_reviewer",
           diffSha256: handoff.diffSha256,
           reviewEpoch: handoff.reviewEpoch,
           verdict,
@@ -306,20 +310,16 @@ export function registerHandoffTools(server: McpServer, config: BridgeConfig): v
           allowedNextActions,
           reviewerId: config.principalId ?? "handoff-reviewer",
         });
-        routes.markHandoffStatus({
-          handoffId: handoff.id,
-          expectedRevision,
-          nextStatus: "feedback_committed",
-          completed: true,
-        });
-        config.eventStore.appendEvent({
-          type: "review.handoff.feedback_committed",
-          sessionId: handoff.workSessionId,
-          payload: { handoffId: handoff.id, verdict, submissionId: handoff.submissionId },
-        });
         return {
           content: [{ type: "text" as const, text: `Handoff ${handoff.id} feedback recorded: ${verdict}.` }],
-          structuredContent: { status: result.status, verdict, submissionId: result.submissionId },
+          structuredContent: {
+            status: result.status,
+            verdict,
+            submissionId: result.submissionId,
+            handoffId: result.handoffId,
+            handoffRevision: result.handoffRevision,
+            handoffStatus: result.handoffStatus,
+          },
         };
       } catch (error) {
         return { content: [{ type: "text" as const, text: error instanceof Error ? error.message : String(error) }], isError: true };

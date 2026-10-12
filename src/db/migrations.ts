@@ -81,6 +81,12 @@ const migrations: Migration[] = [
   { version: 69, name: "review-handoff-routing", up: migrateReviewHandoffRouting },
   { version: 70, name: "dispatch-outbox-claim-fencing", up: migrateDispatchOutboxClaimFencing },
   { version: 71, name: "supervisor-oscillation-fingerprints", up: migrateSupervisorOscillationFingerprints },
+  { version: 72, name: "review-route-session-uniqueness", up: migrateReviewRouteSessionUniqueness },
+  { version: 73, name: "scheduled-dispatch-fencing", up: migrateScheduledDispatchFencing },
+  { version: 74, name: "scheduled-dispatch-outcome-separation", up: migrateScheduledDispatchOutcomeSeparation },
+  { version: 75, name: "acp-dispatch-idempotency-lookup", up: migrateAcpDispatchIdempotencyLookup },
+  { version: 76, name: "scheduled-job-owner-cursors", up: migrateScheduledJobOwnerCursors },
+  { version: 77, name: "scheduled-job-cancellation-state", up: migrateScheduledJobCancellationState },
 ];
 
 // v64: verification attempts need durable monotonic ordering because ISO
@@ -155,6 +161,8 @@ function migrateReviewHandoffRouting(sqlite: Database.Database): void {
     );
     create index if not exists review_routes_work_session_idx
       on review_routes(work_session_id, status);
+    create unique index if not exists review_routes_work_session_unique
+      on review_routes(work_session_id);
     create table if not exists review_handoffs (
       id text primary key,
       route_id text not null references review_routes(id) on delete cascade,
@@ -1435,6 +1443,137 @@ function migrateSupervisorOscillationFingerprints(sqlite: Database.Database): vo
   addColumnIfMissing(sqlite, "supervisor_runs", "failure_fingerprint_set_json", "text not null default '{}'");
 }
 
+function migrateScheduledDispatchFencing(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "scheduled_jobs", "active_dispatch_attempt_id", "text");
+  addColumnIfMissing(sqlite, "scheduled_job_attempts", "dispatcher_instance_id", "text");
+  addColumnIfMissing(sqlite, "scheduled_job_attempts", "lease_expires_at", "text");
+  sqlite.exec(`
+    create index if not exists scheduled_job_attempts_incomplete_idx
+      on scheduled_job_attempts(job_id, completed_at);
+    create index if not exists scheduled_jobs_active_attempt_idx
+      on scheduled_jobs(active_dispatch_attempt_id);
+  `);
+}
+
+function migrateScheduledDispatchOutcomeSeparation(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "scheduled_jobs", "lifecycle_event_cursor", "integer not null default 0");
+  addColumnIfMissing(sqlite, "scheduled_job_attempts", "transport_status", "text not null default 'dispatching'");
+  sqlite.exec(`
+    update scheduled_job_attempts
+       set transport_status = case outcome
+         when 'dispatched' then 'accepted'
+         when 'uncertain' then 'uncertain'
+         when 'failed' then 'rejected'
+         when 'released' then 'unstarted'
+         else transport_status
+       end;
+
+    -- For jobs that are still executing or waiting for review, the legacy
+    -- completed_at/outcome pair only recorded adapter acceptance. Reopen that
+    -- attempt's worker outcome so a later durable lifecycle event can close it.
+    update scheduled_job_attempts
+       set completed_at = null, outcome = null, transport_status = 'accepted'
+     where id in (
+       select attempt.id
+         from scheduled_job_attempts attempt
+         join scheduled_jobs job on job.id = attempt.job_id
+        where attempt.outcome = 'dispatched'
+          and job.status in ('running','awaiting_approval','cancellation_requested')
+     );
+
+    -- Repair rows written by the previous uncertain-dispatch implementation:
+    -- it completed the attempt and cleared its only job association. Restore
+    -- the latest uncertain attempt as the active reconciliation target.
+    update scheduled_jobs
+       set active_dispatch_attempt_id = (
+         select attempt.id
+           from scheduled_job_attempts attempt
+          where attempt.job_id = scheduled_jobs.id
+            and attempt.outcome = 'uncertain'
+          order by attempt.started_at desc, attempt.id desc
+          limit 1
+       )
+     where scheduled_jobs.status = 'uncertain_dispatch'
+       and scheduled_jobs.active_dispatch_attempt_id is null
+       and exists (
+         select 1 from scheduled_job_attempts attempt
+          where attempt.job_id = scheduled_jobs.id and attempt.outcome = 'uncertain'
+       );
+
+    update scheduled_job_attempts
+       set completed_at = null, outcome = null, transport_status = 'uncertain'
+     where id in (
+       select active_dispatch_attempt_id from scheduled_jobs
+        where status = 'uncertain_dispatch' and active_dispatch_attempt_id is not null
+     );
+
+    create index if not exists scheduled_jobs_work_session_idx on scheduled_jobs(work_session_id, id);
+    create index if not exists scheduled_jobs_projection_idx on scheduled_jobs(status, work_session_id, id);
+  `);
+}
+
+function migrateAcpDispatchIdempotencyLookup(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table if not exists acp_run_dispatch_attempts (
+      dispatch_idempotency_key text primary key,
+      run_id text not null references acp_runs(run_id) on delete cascade,
+      agent_id text,
+      attempt_number integer not null,
+      remote_run_id text,
+      status text not null default 'dispatching',
+      created_at text not null,
+      updated_at text not null,
+      unique (run_id, attempt_number)
+    );
+    create index if not exists acp_run_dispatch_attempts_run_idx
+      on acp_run_dispatch_attempts(run_id, attempt_number);
+  `);
+}
+
+function migrateScheduledJobOwnerCursors(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create index if not exists scheduled_jobs_owner_cursor_idx
+      on scheduled_jobs(owner_context_id, id);
+    create index if not exists scheduled_jobs_principal_cursor_idx
+      on scheduled_jobs(principal_id, id);
+  `);
+}
+
+function migrateScheduledJobCancellationState(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "scheduled_jobs", "cancellation_request_id", "text");
+  addColumnIfMissing(sqlite, "scheduled_jobs", "cancellation_previous_status", "text");
+  addColumnIfMissing(sqlite, "scheduled_jobs", "cancellation_requested_at", "text");
+  addColumnIfMissing(sqlite, "scheduled_jobs", "cancellation_last_attempt_at", "text");
+  addColumnIfMissing(sqlite, "scheduled_jobs", "cancellation_last_confirmed_state", "text");
+  sqlite.exec(`
+    update scheduled_jobs
+       set cancellation_request_id = coalesce(cancellation_request_id, 'legacy-cancel:' || id),
+           cancellation_requested_at = coalesce(cancellation_requested_at, updated_at),
+           cancellation_last_confirmed_state = coalesce(cancellation_last_confirmed_state, 'unknown')
+     where status = 'cancellation_requested';
+  `);
+  sqlite.exec("create index if not exists scheduled_jobs_cancellation_idx on scheduled_jobs(status, cancellation_last_attempt_at, id)");
+}
+
+function migrateReviewRouteSessionUniqueness(sqlite: Database.Database): void {
+  // Enforce one durable review route per work session. Historical duplicates
+  // retain their canonical route (oldest), and dependent handoffs remain
+  // attached through the route-level cascade.
+  sqlite.exec(`
+    delete from review_routes
+     where id not in (
+       select keep.id from review_routes keep
+       join (
+         select work_session_id, min(id) as keep_id
+           from review_routes
+          group by work_session_id
+       ) canonical on canonical.work_session_id = keep.work_session_id
+        and canonical.keep_id = keep.id
+     );
+  `);
+  sqlite.exec("create unique index if not exists review_routes_work_session_unique on review_routes(work_session_id)");
+}
+
 function migrateDispatchOutboxClaimFencing(sqlite: Database.Database): void {
   addColumnIfMissing(sqlite, "dispatch_outbox", "claim_token", "text");
   // Any in-flight claim from an older binary carries no token and must not be
@@ -1566,7 +1705,7 @@ function migrateWorkSessionOwnerContext(sqlite: Database.Database): void {
 
 function addColumnIfMissing(
   sqlite: Database.Database,
-  table: "workspace_sessions" | "work_sessions" | "work_session_submissions" | "work_session_feedback" | "agent_registry" | "continuations" | "acp_runs" | "agent_webhook_queue" | "dispatch_outbox" | "approval_requests" | "mission_evidence" | "event_log" | "supervisor_runs" | "mission_acceptance_criteria" | "mission_review_findings" | "mission_contracts" | "mission_completion_reports",
+  table: "workspace_sessions" | "work_sessions" | "work_session_submissions" | "work_session_feedback" | "agent_registry" | "continuations" | "acp_runs" | "agent_webhook_queue" | "dispatch_outbox" | "approval_requests" | "mission_evidence" | "event_log" | "supervisor_runs" | "mission_acceptance_criteria" | "mission_review_findings" | "mission_contracts" | "mission_completion_reports" | "scheduled_jobs" | "scheduled_job_attempts",
   column: string,
   definition: string,
 ): void {

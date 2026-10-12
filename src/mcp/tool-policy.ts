@@ -112,6 +112,7 @@ export async function enforceToolPolicy(
   paths?: PolicyInvocation["paths"],
   approvalResumeId?: string,
   operationContent?: unknown,
+  scheduledExecutionPolicy?: import("../work-session-action-guard.js").ScheduledExecutionPolicy,
 ): Promise<{ allowed: boolean; approvalRequired?: boolean; approvalId?: string }> {
   if (workSessions && workSessionId) {
     const sessionDecision = authorizeWorkSessionAction(workSessions, {
@@ -119,6 +120,7 @@ export async function enforceToolPolicy(
       tool,
       path: typeof path === "string" ? path : path?.relativePath,
       command,
+      scheduledExecutionPolicy,
     });
     if (!sessionDecision.allowed) return { allowed: false };
   }

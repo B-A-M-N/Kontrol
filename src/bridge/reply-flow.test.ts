@@ -40,7 +40,7 @@ try {
     workSessionId: session.id,
     body: "production",
     reviewerPrincipalId: "reviewer-a",
-  });
+  }).reply;
   outbox.enqueue({
     eventType: "agent.reply.ready",
     aggregateId: reply.id,

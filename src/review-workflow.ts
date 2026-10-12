@@ -72,6 +72,14 @@ export interface SubmitForReviewResult {
   routeLimitReached?: boolean;
 }
 
+/**
+ * Trusted invocation origin for the authoritative review workflow. Public tool
+ * arguments may describe a reviewer for audit purposes but can never select
+ * this identity: each adapter supplies it from its authenticated transport or
+ * the server-owned supervisor runtime.
+ */
+export type ReviewInvocationOrigin = "authenticated_reviewer" | "internal_supervisor";
+
 export interface ProvideFeedbackInput {
   sessionId: string;
   submissionId: string;
@@ -81,7 +89,13 @@ export interface ProvideFeedbackInput {
   comments?: string;
   requiredActions?: string[];
   allowedNextActions?: string[];
+  /** Display/audit label only; never an authority selector. */
   reviewerId?: string;
+  /**
+   * Server-established invocation origin. Required for every feedback commit;
+   * public arguments cannot supply supervisor authority.
+   */
+  invocationOrigin: ReviewInvocationOrigin;
   /** Authenticated reviewer context from the transport; not a client token. */
   reviewerOwnerContextId?: string;
   completionReportSha256?: string;
@@ -102,6 +116,9 @@ export interface ProvideFeedbackResult {
   runId?: string;
   continuationId?: string;
   feedbackEventId?: string;
+  handoffId?: string;
+  handoffRevision?: number;
+  handoffStatus?: string;
 }
 
 export interface CancelSessionInput {
@@ -244,10 +261,20 @@ export function createReviewWorkflowService(
       // This outer transaction establishes the deferred read frame. The nested
       // immediate submission transaction is where concurrent submissions race.
       const admissionRoute = reviewRoutes?.getRouteBySession(input.workSessionId);
-      if (admissionRoute && admissionRoute.completedReviewRounds >= admissionRoute.maxReviewRounds) {
+      if (admissionRoute && admissionRoute.status !== "disabled" && admissionRoute.completedReviewRounds >= admissionRoute.maxReviewRounds) {
         throw new WorkflowError(
           `Review round limit reached (${admissionRoute.completedReviewRounds}/${admissionRoute.maxReviewRounds}); extend the budget explicitly to submit again.`,
           "review_round_limit",
+          409,
+        );
+      }
+      // A paused automated route must not silently admit an automatic-looking
+      // submission without a recoverable handoff. This blocks before mutation;
+      // the operator can resume the route and resubmit.
+      if (admissionRoute?.status === "paused") {
+        throw new WorkflowError(
+          `Review loop is paused for session ${input.workSessionId}; resume the loop or disable it before submitting.`,
+          "conflict",
           409,
         );
       }
@@ -357,16 +384,24 @@ export function createReviewWorkflowService(
     // handoff for the targeted submission. The MCP tool handler applies the
     // same check, but this is the single canonical chokepoint (also reached by
     // the ACP HTTP transport and the mission tools), so no path can bypass it.
-    // A trusted internal supervisor action (reviewerId "supervisor-runtime") is
-    // exempt; autonomous corrections are authorized under the mission/autonomy
-    // policy, not by claiming a reviewer context.
-    if (reviewRoutes && input.reviewerId !== "supervisor-runtime") {
+    // A trusted internal supervisor invocation is authorized by the server-owned
+    // runtime, not by any display/audit reviewerId. Autonomous corrections are
+    // governed by the mission/autonomy policy and never impersonate a reviewer.
+    if (reviewRoutes && input.invocationOrigin !== "internal_supervisor") {
       const route = reviewRoutes.getRouteBySession(input.sessionId);
       if (route?.status === "active") {
         const submissions = workSessions.getSubmissions(input.sessionId);
         const target = submissions.find((candidate: { id?: string }) => candidate.id === input.submissionId)
           ?? submissions[submissions.length - 1];
         const handoff = target?.id ? reviewRoutes.getHandoffBySubmission(input.sessionId, target.id, target.reviewEpoch) : undefined;
+        if (input.reviewerOwnerContextId
+          && handoff?.claimedByOwnerContextId !== input.reviewerOwnerContextId) {
+          throw new WorkflowError(
+            "Review routing conflict: this reviewer did not claim the handoff.",
+            "conflict",
+            409,
+          );
+        }
         const claimedHandoff = handoff && handoff.status === "claimed";
         if (!claimedHandoff) {
           throw new WorkflowError(
@@ -548,15 +583,14 @@ export function createReviewWorkflowService(
     const result = db.sqlite.transaction(() => {
       // Revalidate route binding immediately before writing. The earlier
       // preflight is outside the transaction and cannot protect this interval.
-      if (reviewRoutes && input.reviewerId !== "supervisor-runtime") {
+      if (reviewRoutes && input.invocationOrigin !== "internal_supervisor") {
         const currentRoute = reviewRoutes.getRouteBySession(input.sessionId);
         if (currentRoute?.status === "active") {
           const currentHandoff = reviewRoutes.getHandoffBySubmission(input.sessionId, input.submissionId, currentPending.reviewEpoch);
           if (!currentHandoff || currentHandoff.status !== "claimed" || currentHandoff.routeEpoch !== currentRoute.routeEpoch) {
             throw new WorkflowError("Review routing conflict: stale claim at feedback commit.", "conflict", 409);
           }
-          if (input.reviewerOwnerContextId
-            && currentHandoff.claimedByOwnerContextId !== input.reviewerOwnerContextId) {
+          if (input.reviewerOwnerContextId !== currentHandoff.claimedByOwnerContextId) {
             throw new WorkflowError("Review routing conflict: this reviewer did not claim the handoff.", "conflict", 409);
           }
         }
@@ -566,18 +600,22 @@ export function createReviewWorkflowService(
       // feedback entry point reaches this authority, so the route projection
       // cannot lag behind actual review state.
       let committedHandoff: import("./review-handoff/route-store.js").ReviewHandoff | undefined;
-      if (reviewRoutes && input.reviewerId !== "supervisor-runtime") {
+      if (reviewRoutes && input.invocationOrigin !== "internal_supervisor") {
         const currentRoute = reviewRoutes.getRouteBySession(input.sessionId);
         if (currentRoute?.status === "active") {
           const currentHandoff = reviewRoutes.getHandoffBySubmission(input.sessionId, input.submissionId, currentPending.reviewEpoch);
-          if (currentHandoff && currentHandoff.status === "claimed" && currentHandoff.routeEpoch === currentRoute.routeEpoch) {
-            committedHandoff = reviewRoutes.markHandoffStatus({
-              handoffId: currentHandoff.id,
-              expectedRevision: currentHandoff.revision,
-              nextStatus: "feedback_committed",
-              completed: true,
-            });
+          if (!currentHandoff || currentHandoff.status !== "claimed" || currentHandoff.routeEpoch !== currentRoute.routeEpoch) {
+            throw new WorkflowError("Review routing conflict: stale handoff at feedback commit.", "conflict", 409);
           }
+          if (currentHandoff.claimedByOwnerContextId !== input.reviewerOwnerContextId) {
+            throw new WorkflowError("Review routing conflict: this reviewer did not claim the handoff.", "conflict", 409);
+          }
+          committedHandoff = reviewRoutes.markHandoffStatus({
+            handoffId: currentHandoff.id,
+            expectedRevision: currentHandoff.revision,
+            nextStatus: "feedback_committed",
+            completed: true,
+          });
         }
       }
       const feedback = workSessions.submitFeedback({
@@ -668,6 +706,7 @@ export function createReviewWorkflowService(
         correlatedRun,
         continuationId,
         createdContinuation,
+        committedHandoff,
       };
     })();
     eventStore.publishEvents(publishQueue);
@@ -679,6 +718,9 @@ export function createReviewWorkflowService(
       runId: result.correlatedRun?.runId,
       continuationId: result.continuationId,
       feedbackEventId: result.feedbackEvent.id,
+      handoffId: result.committedHandoff?.id,
+      handoffRevision: result.committedHandoff?.revision,
+      handoffStatus: result.committedHandoff?.status,
     };
   }
 
@@ -707,6 +749,14 @@ export function createReviewWorkflowService(
       );
       const correlatedRun = agentRegistry.getRunByWorkSessionId(input.sessionId);
       if (correlatedRun) {
+        const dispatchAttempt = agentRegistry.getLatestDispatchAttemptForRun?.(correlatedRun.runId);
+        // Missing attempt metadata is an unknown legacy/in-flight state, not
+        // evidence that the adapter never received a launch. Only a durable
+        // not-started/rejected record permits immediate finalization when the
+        // run has no remote identifier.
+        const dispatchDefinitelyNotStarted = dispatchAttempt
+          ? ["unstarted", "rejected"].includes(dispatchAttempt.status)
+          : false;
         agentRegistry.updateRun(correlatedRun.runId, { status: "cancelling" });
         dispatchOutbox?.enqueue({
           eventType: "worker.cancellation.requested",
@@ -714,7 +764,10 @@ export function createReviewWorkflowService(
           aggregateRevision: session.reviewEpoch,
           payload: { runId: correlatedRun.runId, reason: input.reason ?? "cancelled" },
         });
-        finalizeImmediately = !correlatedRun.remoteRunId;
+        // A missing remote ID is not proof that an in-flight/uncertain launch
+        // never reached the adapter. Keep the session fenced until dispatch
+        // reconciliation or a cancellation event resolves it.
+        finalizeImmediately = !correlatedRun.remoteRunId && dispatchDefinitelyNotStarted;
       } else {
         // No durable remote attempt exists, so there is no worker process whose
         // stop must be awaited; the lease can be released immediately.

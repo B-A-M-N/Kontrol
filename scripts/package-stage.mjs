@@ -113,7 +113,7 @@ if (explicitCandidate) {
   }
 } else {
   if (!skipBuild) {
-    run("npm", ["run", "build"]);
+    run("npm", ["run", "build"], { env: { KONTROL_BUILD_RESULT_PATH: buildResultPath } });
   }
   if (!existsSync(buildResultPath)) {
     throw new Error(`no build result at ${buildResultPath}; run \`npm run build\` first (or drop --skip-build)`);

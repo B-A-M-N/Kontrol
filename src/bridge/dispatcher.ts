@@ -11,6 +11,8 @@ import { DEFAULT_CLAIM_LEASE_MS } from "../continuation.js";
 import type { Continuation } from "../continuation.js";
 import type { DispatchOutboxEvent, OutboxClaim } from "../dispatch-outbox.js";
 import { TERMINAL_STATUSES } from "../review-workflow.js";
+
+const DISPATCH_BLOCKED_SESSION_STATUSES = new Set([...TERMINAL_STATUSES, "cancelling"]);
 import type { BridgeConfig } from "./context.js";
 import { acquireCheckoutModifyLease, checkoutLeaseMetadata, defaultLiveWaiters, renderMissionPrompt, resolveHealthyAgentUrl, workSessionInstructions } from "./shared.js";
 import type { LiveWaiterRegistry } from "./shared.js";
@@ -137,7 +139,7 @@ export async function runContinuationTick(
         outboxEvent ? config.dispatchOutbox?.markCompleted(claimOf(outboxEvent)) : undefined;
         return "completed";
       }
-      if (TERMINAL_STATUSES.has(session.status)) {
+      if (DISPATCH_BLOCKED_SESSION_STATUSES.has(session.status)) {
         supersedeContinuation(cont.id, cont.sessionId, `session is ${session.status}`);
         outboxEvent ? config.dispatchOutbox?.markCompleted(claimOf(outboxEvent)) : undefined;
         return "completed";
@@ -150,7 +152,7 @@ export async function runContinuationTick(
         return "completed";
       }
       const claimedSession = config.workSessions.get(claimed.sessionId);
-      if (!claimedSession || TERMINAL_STATUSES.has(claimedSession.status)) {
+      if (!claimedSession || DISPATCH_BLOCKED_SESSION_STATUSES.has(claimedSession.status)) {
         const reason = claimedSession ? `session is ${claimedSession.status}` : "session not found";
         supersedeContinuation(claimed.id, claimed.sessionId, reason);
         outboxEvent ? config.dispatchOutbox?.markCompleted(claimOf(outboxEvent)) : undefined;
@@ -198,7 +200,7 @@ export async function runContinuationTick(
 
       try {
         const preDispatchSession = config.workSessions.get(claimed.sessionId);
-        if (!preDispatchSession || TERMINAL_STATUSES.has(preDispatchSession.status)) {
+        if (!preDispatchSession || DISPATCH_BLOCKED_SESSION_STATUSES.has(preDispatchSession.status)) {
           const reason = preDispatchSession ? `session is ${preDispatchSession.status}` : "session not found";
           supersedeContinuation(claimed.id, claimed.sessionId, reason);
           outboxEvent ? config.dispatchOutbox?.markCompleted(claimOf(outboxEvent)) : undefined;
@@ -207,7 +209,7 @@ export async function runContinuationTick(
         if (config.beforeContinuationDispatch) {
           await config.beforeContinuationDispatch(claimed, claimed.sessionId);
           const afterHookSession = config.workSessions.get(claimed.sessionId);
-          if (!afterHookSession || TERMINAL_STATUSES.has(afterHookSession.status)) {
+          if (!afterHookSession || DISPATCH_BLOCKED_SESSION_STATUSES.has(afterHookSession.status)) {
             const reason = afterHookSession ? `session is ${afterHookSession.status}` : "session not found";
             supersedeContinuation(claimed.id, claimed.sessionId, reason);
             outboxEvent ? config.dispatchOutbox?.markCompleted(claimOf(outboxEvent)) : undefined;

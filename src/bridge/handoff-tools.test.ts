@@ -19,7 +19,7 @@ try {
   const route = routes.configure({
     workSessionId: "wsess-handoff",
     ownerPrincipalId: "user-a",
-    ownerContextId: "owner-a",
+    ownerContextId: "conv-b",
     enabled: true,
     mode: "pinned_conversation",
     maxReviewRounds: 3,
@@ -42,11 +42,10 @@ try {
     routes.claimHandoff({
       handoffId: handoff.id,
       expectedRevision: 1,
-      principalId: "user-b",
+      principalId: "user-a",
       ownerContextId: "owner-b",
       destinationConversationId: "owner-b",
       authorization: {
-        authorizedWorkSessionIds: ["wsess-handoff"],
         conversationId: "owner-b",
         freshConversationIds: ["owner-b"],
       },
@@ -58,11 +57,10 @@ try {
   const claimed = routes.claimHandoff({
     handoffId: handoff.id,
     expectedRevision: 1,
-    principalId: "user-b",
+    principalId: "user-a",
     ownerContextId: "conv-b",
     destinationConversationId: "conv-b",
     authorization: {
-      authorizedWorkSessionIds: ["wsess-handoff"],
       conversationId: "conv-b",
       freshConversationIds: ["conv-b"],
     },

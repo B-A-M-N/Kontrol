@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import {
   serializeFinalAcpResult,
   truncateUtf8Tail,
@@ -58,6 +59,38 @@ export interface PeerDispatchResult {
   text: string;
 }
 
+export class AcpDispatchError extends Error {
+  constructor(
+    message: string,
+    readonly certainty: "rejected" | "uncertain",
+    readonly httpStatus?: number,
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
+    this.name = "AcpDispatchError";
+  }
+}
+
+function networkErrorCode(error: unknown): string | undefined {
+  let current: unknown = error;
+  for (let depth = 0; depth < 4 && current && typeof current === "object"; depth++) {
+    const record = current as { code?: unknown; cause?: unknown };
+    if (typeof record.code === "string") return record.code;
+    current = record.cause;
+  }
+  return undefined;
+}
+
+function dispatchFailureCertainty(error: unknown): "rejected" | "uncertain" {
+  const code = networkErrorCode(error);
+  // These errors prove that no HTTP request reached the peer. Timeouts,
+  // resets, and generic fetch failures do not prove that and stay uncertain.
+  if (code && ["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "EHOSTUNREACH", "ENETUNREACH"].includes(code)) {
+    return "rejected";
+  }
+  return "uncertain";
+}
+
 export async function dispatchToPeer(params: {
   agentUrl: string;
   adapterSecret?: string;
@@ -67,13 +100,33 @@ export async function dispatchToPeer(params: {
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   Object.assign(headers, authHeadersForAgent(params.agentUrl, params.adapterSecret));
 
-  const response = await fetch(params.agentUrl.replace(/\/+$/, "") + "/runs", {
-    method: "POST",
-    headers,
-    body: JSON.stringify(params.body),
-    signal: AbortSignal.timeout(params.timeoutMs ?? getAcpTimeout()),
-  });
-  const text = await response.text().catch(() => "");
+  let response: Response;
+  try {
+    response = await fetch(params.agentUrl.replace(/\/+$/, "") + "/runs", {
+      method: "POST",
+      headers,
+      body: JSON.stringify(params.body),
+      signal: AbortSignal.timeout(params.timeoutMs ?? getAcpTimeout()),
+    });
+  } catch (error) {
+    throw new AcpDispatchError(
+      error instanceof Error ? error.message : String(error),
+      dispatchFailureCertainty(error),
+      undefined,
+      { cause: error },
+    );
+  }
+  let text: string;
+  try {
+    text = await response.text();
+  } catch (error) {
+    throw new AcpDispatchError(
+      `ACP response body was interrupted after HTTP ${response.status}.`,
+      "uncertain",
+      response.status,
+      { cause: error },
+    );
+  }
   let parsed: Record<string, unknown> = {};
   if (text) {
     try {
@@ -83,9 +136,50 @@ export async function dispatchToPeer(params: {
     }
   }
   if (!response.ok) {
-    throw new Error(`ACP request failed (${response.status}): ${text.slice(0, 500) || "unknown"}`);
+    const certainty = response.status >= 400 && response.status < 500
+      && ![408, 409, 425, 429].includes(response.status)
+      ? "rejected"
+      : "uncertain";
+    throw new AcpDispatchError(`ACP request failed (${response.status}): ${text.slice(0, 500) || "unknown"}`, certainty, response.status);
   }
   return { status: response.status, body: parsed, text };
+}
+
+export interface PeerDispatchLookupResult {
+  status: "found" | "unstarted" | "unknown";
+  remoteRunId?: string;
+  executionStatus?: string;
+}
+
+/** Query an adapter using the same idempotency key sent to POST /runs. */
+export async function lookupPeerDispatch(params: {
+  agentUrl: string;
+  adapterSecret?: string;
+  dispatchIdempotencyKey: string;
+  timeoutMs?: number;
+}): Promise<PeerDispatchLookupResult> {
+  const endpoint = `${params.agentUrl.replace(/\/+$/, "")}/runs/by-dispatch-id/${encodeURIComponent(params.dispatchIdempotencyKey)}`;
+  const response = await fetch(endpoint, {
+    method: "GET",
+    headers: authHeadersForAgent(params.agentUrl, params.adapterSecret),
+    signal: AbortSignal.timeout(params.timeoutMs ?? 5_000),
+  });
+  if (response.status === 404 || response.status === 405) return { status: "unknown" };
+  const text = await response.text();
+  let body: Record<string, unknown> = {};
+  try { body = text ? JSON.parse(text) as Record<string, unknown> : {}; } catch { /* unknown response shape */ }
+  if (!response.ok) throw new Error(`ACP dispatch lookup failed (${response.status}): ${text.slice(0, 300)}`);
+  if (body.authoritatively_unstarted === true) return { status: "unstarted" };
+  const remoteRunId = typeof body.remote_run_id === "string" ? body.remote_run_id
+    : typeof body.run_id === "string" ? body.run_id : undefined;
+  if (body.accepted === true && remoteRunId) {
+    return {
+      status: "found",
+      remoteRunId,
+      executionStatus: typeof body.status === "string" ? body.status : undefined,
+    };
+  }
+  return { status: "unknown" };
 }
 
 export interface AgentProbeResult {
@@ -195,7 +289,7 @@ function normalizePlatformHint(value: string | undefined): string | undefined {
 // workSessionId via agentRegistry.getRunByWorkSessionId().
 
 const AGENT_SUBMIT_TIMEOUT_MS = 5 * 60 * 1000; // bound the "did it submit?" wait
-const TERMINAL_RUN_STATUSES = new Set(["approved", "rejected", "cancelled", "failed", "failed_protocol"]);
+const NON_RESUMABLE_RUN_STATUSES = new Set(["cancelling", "approved", "rejected", "cancelled", "failed", "failed_protocol"]);
 const TERMINAL_WORK_SESSION_STATUSES = new Set(["approved", "rejected", "cancelled", "failed", "failed_protocol"]);
 
 async function sleep(ms: number): Promise<void> {
@@ -301,8 +395,16 @@ export async function callRemoteAgent(
     workspaceLeaseExpiresAt?: string;
     /** Stable logical launch identity for exactly-once adapter dispatch. */
     dispatchIdempotencyKey?: string;
+    /** Server-owned scheduled execution policy forwarded to the adapter. */
+    scheduledExecutionPolicy?: {
+      executionMode?: string;
+      workspaceAccess?: string;
+      mutate?: boolean;
+      allowedTools?: string[];
+    };
   },
 ): Promise<AgentCallResult> {
+  const dispatchIdempotencyKey = params.dispatchIdempotencyKey ?? `disp_${randomUUID()}`;
   // Reuse the existing logical run across continuations so the UI keeps watching
   // one run while a resumed worker updates the same record (higher attempt #).
   let run: ReturnType<GatewayConfig["agentRegistry"]["createRun"]>;
@@ -313,8 +415,8 @@ export async function callRemoteAgent(
     if (!existing) {
       throw new Error(`No logical run for continuation: ${params.existingRunId}`);
     }
-    if (TERMINAL_RUN_STATUSES.has(existing.status)) {
-      throw new Error(`Cannot resume terminal run ${existing.runId}: ${existing.status}`);
+    if (NON_RESUMABLE_RUN_STATUSES.has(existing.status)) {
+      throw new Error(`Cannot resume non-resumable run ${existing.runId}: ${existing.status}`);
     }
     run = existing;
     attemptNumber = (existing.attemptNumber ?? 1) + 1;
@@ -326,7 +428,8 @@ export async function callRemoteAgent(
       finishedAt: undefined,
     });
   } else {
-    run = config.agentRegistry.createRun({
+    const prior = config.agentRegistry.getRunByDispatchIdempotencyKey(dispatchIdempotencyKey);
+    run = prior ?? config.agentRegistry.createRun({
       agentName: params.agentName,
       agentId: params.agentId,
       workspaceSessionId: params.workspaceSessionId,
@@ -335,9 +438,21 @@ export async function callRemoteAgent(
       webhookUrl: params.webhookUrl,
       status: "created",
     });
+    if (run.agentId !== params.agentId || run.workSessionId !== params.workSessionId) {
+      throw new Error("ACP dispatch idempotency key is already bound to a different agent or work session.");
+    }
+    expectedDispatchStatus = run.status;
+    attemptNumber = run.attemptNumber ?? 1;
   }
+  config.agentRegistry.beginDispatchAttempt({
+    key: dispatchIdempotencyKey,
+    runId: run.runId,
+    agentId: run.agentId,
+    attemptNumber,
+  });
 
   const started = Date.now();
+  let requestState: "not_sent" | "in_flight" | "accepted" = "not_sent";
   try {
     // Resolve the workspace root for the dispatch so the adapter can spawn
     // CRUSH in the correct repository, not in the Kontrol directory.
@@ -366,7 +481,8 @@ export async function callRemoteAgent(
       attempt_number: attemptNumber,
       workspace_lease_nonce: params.workspaceLeaseNonce,
       workspace_lease_expires_at: params.workspaceLeaseExpiresAt,
-      dispatch_idempotency_key: params.dispatchIdempotencyKey,
+      dispatch_idempotency_key: dispatchIdempotencyKey,
+      scheduled_execution_policy: params.scheduledExecutionPolicy,
     };
 
     if (params.webhookUrl) {
@@ -375,12 +491,14 @@ export async function callRemoteAgent(
 
     const useAsync = params.mode === "async";
 
+    requestState = "in_flight";
     const dispatched = await dispatchToPeer({
       agentUrl: params.agentUrl,
       adapterSecret: config.adapterSecret,
       body,
       timeoutMs: getAcpTimeout(),
     });
+    requestState = "accepted";
 
     const result = dispatched.body as {
       run_id?: string;
@@ -390,6 +508,7 @@ export async function callRemoteAgent(
     };
 
     const remoteRunId = result.run_id ?? run.runId;
+    config.agentRegistry.updateDispatchAttempt(dispatchIdempotencyKey, { status: "accepted", remoteRunId });
     const errorMessage = result.error?.message;
 
     if (useAsync) {
@@ -550,18 +669,23 @@ export async function callRemoteAgent(
     };
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
-    config.agentRegistry.updateRun(run.runId, {
-      status: "failed",
-      errorMessage,
-      finishedAt: new Date().toISOString(),
+    const certainty = error instanceof AcpDispatchError
+      ? error.certainty
+      : requestState === "in_flight" ? "uncertain" : "rejected";
+    const status = certainty === "uncertain" || requestState === "accepted" ? "dispatch_uncertain" : "failed";
+    config.agentRegistry.updateDispatchAttempt(dispatchIdempotencyKey, {
+      status: status === "dispatch_uncertain" ? "uncertain" : "rejected",
     });
+    config.agentRegistry.updateRun(run.runId, status === "dispatch_uncertain"
+      ? { status, errorMessage, finishedAt: undefined }
+      : { status, errorMessage, finishedAt: new Date().toISOString() });
 
     return {
       runId: run.runId,
       remoteRunId: run.remoteRunId,
       attemptNumber: run.attemptNumber ?? 1,
       agentName: params.agentName,
-      status: "failed",
+      status: status === "dispatch_uncertain" ? "uncertain" : "failed",
       output: "",
       error: errorMessage,
     };

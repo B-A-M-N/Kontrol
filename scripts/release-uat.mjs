@@ -113,8 +113,21 @@ try {
     installedCli = process.env.KONTROL_UAT_CLI;
     log("install", `skipped (--skip-install); using ${installedCli}`);
   } else {
-    log("pack", "npm pack");
-    execFileSync("npm", ["pack", "--pack-destination", tmp], { cwd: root, stdio: "pipe" });
+    log("pack", "building and packing immutable release candidate");
+    execFileSync(process.execPath, [
+      join(root, "scripts", "package-stage.mjs"),
+      "--pack-destination",
+      tmp,
+    ], {
+      cwd: root,
+      env: testHarnessEnvironment(process.env, {
+        overrides: {
+          KONTROL_BUILD_RESULT_PATH: join(tmp, "build-result.json"),
+          npm_config_cache: join(tmp, "npm-cache"),
+        },
+      }),
+      stdio: "pipe",
+    });
     const tarballPath = readdirSync(tmp).find((name) => name.endsWith(".tgz"));
     assert.ok(tarballPath, "npm pack produced no tarball");
     log("install", `installing ${tarballPath}`);

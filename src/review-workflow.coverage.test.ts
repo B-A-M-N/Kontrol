@@ -93,6 +93,7 @@ await assert.rejects(
     verdict: "approve",
     comments: "ship it",
     reviewerId: "webui",
+    invocationOrigin: "authenticated_reviewer",
   }),
   (error: unknown) => {
     assert.ok(error instanceof WorkflowError && error.code === "conflict");
@@ -115,6 +116,7 @@ await workflow.provideFeedback({
   verdict: "approve",
   comments: "hidden path reviewed out-of-band",
   reviewerId: "webui",
+  invocationOrigin: "authenticated_reviewer",
   acceptIncompleteCoverage: true,
 });
 assert.equal(workSessions.get(session.id)?.status, "approved");
@@ -143,6 +145,7 @@ assert.deepEqual(payload.uncoveredPaths, ["node_modules/patched.js"]);
     reviewEpoch: clean.reviewEpoch,
     verdict: "approve",
     reviewerId: "webui",
+    invocationOrigin: "authenticated_reviewer",
   });
   assert.equal(workSessions.get(session2.id)?.status, "approved");
 }
@@ -167,6 +170,7 @@ assert.deepEqual(payload.uncoveredPaths, ["node_modules/patched.js"]);
     verdict: "reject",
     comments: "not this",
     reviewerId: "webui",
+    invocationOrigin: "authenticated_reviewer",
   });
   assert.equal(workSessions.get(session3.id)?.status, "rejected");
 }

@@ -38,7 +38,7 @@ const submission = await workflow.submitForReview({
 
 writeFileSync(join(root, "tracked.txt"), "changed-after-review\n");
 await assert.rejects(
-  () => workflow.provideFeedback({ sessionId: session.id, submissionId: submission.submissionId, verdict: "approve", comments: "approve", reviewerId: "webui" }),
+  () => workflow.provideFeedback({ sessionId: session.id, submissionId: submission.submissionId, verdict: "approve", comments: "approve", reviewerId: "webui", invocationOrigin: "authenticated_reviewer" }),
   (error: unknown) => error instanceof WorkflowError && error.code === "stale_submission",
 );
 

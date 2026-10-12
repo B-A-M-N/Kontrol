@@ -61,6 +61,7 @@ try {
     "test:manifest",
     "build:app",
     "test:unit",
+    "test:find-compat",
     "test:adapters",
     "test:ui",
     "test:security",

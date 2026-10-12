@@ -20,6 +20,8 @@ import { realpath, stat } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 import { clearAgentIdentity, identityHeaders, loadAgentIdentity, saveAgentIdentity } from "./lib/acp-agent-identity.mjs";
 import { readJsonBody } from "./lib/adapter-http.mjs";
+import { adapterStatePath } from "./lib/managed-agent-process.mjs";
+import { findAdapterDispatchReceipt, loadAdapterDispatchReceipts, recordAdapterDispatchReceipt } from "./lib/adapter-dispatch-receipts.mjs";
 
 const KONTROL_ACP_URL = process.env.KONTROL_ACP_URL || "http://127.0.0.1:7676/acp";
 const AGENT_SECRET = process.env.KONTROL_ACP_AGENT_SECRET;
@@ -31,6 +33,8 @@ const AGENT_DESCRIPTION = process.env.ACP_STDIO_AGENT_DESCRIPTION || "Generic st
 const AGENT_COMMAND = process.env.ACP_STDIO_COMMAND;
 const AGENT_ARGS = parseJsonArray(process.env.ACP_STDIO_ARGS_JSON) ?? [];
 const DISPATCH_METHOD = process.env.ACP_STDIO_DISPATCH_METHOD || "session/prompt";
+const DISPATCH_RECEIPTS_PATH = process.env.KONTROL_STDIO_DISPATCH_RECEIPTS || adapterStatePath("stdio-duplex", "dispatch-receipts.json");
+const dispatchReceipts = await loadAdapterDispatchReceipts(DISPATCH_RECEIPTS_PATH);
 
 const VALIDATE_IMPORTS = process.argv.includes("--validate-imports");
 
@@ -154,10 +158,28 @@ async function handle(req, res) {
     return writeJson(res, 202, { run_id: remoteRunId, status: "cancelled" });
   }
 
+  const dispatchLookup = url.match(/^\/runs\/by-dispatch-id\/([^/]+)$/);
+  if (req.method === "GET" && dispatchLookup) {
+    if (!authorized(req)) return writeJson(res, 401, { error: { code: "unauthorized" } });
+    const key = decodeURIComponent(dispatchLookup[1]);
+    const activeRun = [...active.values()].find((run) => run.dispatchIdempotencyKey === key);
+    const receipt = findAdapterDispatchReceipt(dispatchReceipts, key);
+    const remoteRunId = activeRun?.remoteRunId ?? receipt?.remoteRunId;
+    if (remoteRunId) return writeJson(res, 200, { run_id: remoteRunId, remote_run_id: remoteRunId, accepted: true, status: activeRun?.finalized ? "completed" : receipt?.status ?? "running" });
+    return writeJson(res, 404, { error: { code: "not_found" } });
+  }
+
   if (req.method !== "POST" || url !== "/runs") return writeJson(res, 404, { error: { code: "not_found" } });
   if (!authorized(req)) return writeJson(res, 401, { error: { code: "unauthorized" } });
 
   const body = await readJsonBody(req);
+  const dispatchIdempotencyKey = typeof body.dispatch_idempotency_key === "string" && body.dispatch_idempotency_key.length > 0
+    ? body.dispatch_idempotency_key
+    : undefined;
+  if (dispatchIdempotencyKey) {
+    const receipt = findAdapterDispatchReceipt(dispatchReceipts, dispatchIdempotencyKey);
+    if (receipt) return writeJson(res, 202, { run_id: receipt.remoteRunId, remote_run_id: receipt.remoteRunId, accepted: true, status: receipt.status, replayed: true });
+  }
   if (body.smoke_test) {
     return writeJson(res, 202, { run_id: "stdio-duplex-smoke", smoke_test: true, duplex: true, accepted: true });
   }
@@ -173,6 +195,7 @@ async function handle(req, res) {
     workSessionId: body.session_id,
     workspaceSessionId: body.workspace_session_id,
     agentId: body.agent_id,
+    dispatchIdempotencyKey,
     workspaceRoot,
     task,
     child: null,
@@ -216,6 +239,9 @@ async function handle(req, res) {
       try { run.child?.kill("SIGTERM"); } catch { /* ignore */ }
     });
 
+    if (dispatchIdempotencyKey) {
+      await recordAdapterDispatchReceipt(DISPATCH_RECEIPTS_PATH, dispatchReceipts, dispatchIdempotencyKey, run.remoteRunId, "running");
+    }
     return writeJson(res, 202, {
       run_id: run.remoteRunId,
       remote_run_id: run.remoteRunId,

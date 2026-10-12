@@ -595,6 +595,9 @@ export function registerSessionTools(server: McpServer, config: BridgeConfig): v
       if (access) return access;
       const session = config.workSessions.get(sessionId);
       if (!session) return { content: [{ type: "text" as const, text: "Session not found." }], isError: true };
+      if (session.status === "cancelling") {
+        return { content: [{ type: "text" as const, text: "Session is cancelling; wait for worker shutdown before handing it off." }], isError: true };
+      }
       if (TERMINAL_STATUSES.has(session.status)) {
         return { content: [{ type: "text" as const, text: `Session is ${session.status}; cannot hand off a terminal session.` }], isError: true };
       }

@@ -114,6 +114,17 @@ export function createMcpServer(
   // note: parameters remain in declared order; scheduledJobs precedes reviewRoutes.
   const serverConstructionStartedAt = performance.now();
   const mcpToolSurface = readMcpToolSurface();
+  const scheduledExecutionPolicyFor = (workSessionId: string): import("../work-session-action-guard.js").ScheduledExecutionPolicy | undefined => {
+    if (!workSessionId || !scheduledJobs) return undefined;
+    const row = scheduledJobs.getByWorkSessionId(workSessionId);
+    if (!row) return undefined;
+    return {
+      executionMode: row.executionMode,
+      workspaceAccess: typeof row.policySnapshotJson.workspaceAccess === "string" ? row.policySnapshotJson.workspaceAccess : undefined,
+      mutate: row.policySnapshotJson.mutate === false ? false : undefined,
+      allowedTools: Array.isArray(row.policySnapshotJson.allowedTools) ? row.policySnapshotJson.allowedTools.filter((item): item is string => typeof item === "string") : undefined,
+    };
+  };
   const server = new McpServer(
     {
       name: "kontrol",
@@ -158,6 +169,7 @@ export function createMcpServer(
     trackToolEvent,
     prepareForMutation,
     processSessions,
+    scheduledExecutionPolicyFor,
   });
 
   // Process polling is available in every tool mode. This is the recovery
@@ -165,7 +177,8 @@ export function createMcpServer(
   registerProcessPollingTool(server, config, workspaces, processSessions, workSessions, connectionContext);
 
   if (config.toolMode === "codex") {
-    registerCodexProcessTools(server, config, workspaces, processSessions, workSessions, policyEnforcer, policyEngine, connectionContext, prepareForMutation);
+    // P1-02: scheduled read-only execution policy is enforced at the tool boundary.
+    registerCodexProcessTools(server, config, workspaces, processSessions, workSessions, policyEnforcer, policyEngine, connectionContext, prepareForMutation, scheduledExecutionPolicyFor);
   }
 
   // Policy approval tools — available whenever policy engine is configured.

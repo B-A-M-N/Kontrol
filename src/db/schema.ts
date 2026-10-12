@@ -27,6 +27,16 @@ export const scheduledJobs = sqliteTable("scheduled_jobs", {
   status: text("status").notNull().default("pending"),
   revision: integer("revision").notNull().default(1),
   workSessionId: text("work_session_id"),
+  /** Last durable work-session event projected into this job lifecycle. */
+  lifecycleEventCursor: integer("lifecycle_event_cursor").notNull().default(0),
+  /** Durable cancellation identity and latest worker-state evidence. */
+  cancellationRequestId: text("cancellation_request_id"),
+  cancellationPreviousStatus: text("cancellation_previous_status"),
+  cancellationRequestedAt: text("cancellation_requested_at"),
+  cancellationLastAttemptAt: text("cancellation_last_attempt_at"),
+  cancellationLastConfirmedState: text("cancellation_last_confirmed_state"),
+  /** Active dispatch-attempt fence; cleared when the attempt completes/releases. */
+  activeDispatchAttemptId: text("active_dispatch_attempt_id"),
   maxRuntimeMs: integer("max_runtime_ms").notNull(),
   /** Durable retry receipt key; null for tools that omit retry protection. */
   clientMutationId: text("client_mutation_id"),
@@ -37,6 +47,9 @@ export const scheduledJobs = sqliteTable("scheduled_jobs", {
 }, (table) => [
   index("scheduled_jobs_status_due_idx").on(table.status, table.runAt),
   index("scheduled_jobs_owner_idx").on(table.ownerContextId, table.runAt),
+  index("scheduled_jobs_owner_cursor_idx").on(table.ownerContextId, table.id),
+  index("scheduled_jobs_principal_cursor_idx").on(table.principalId, table.id),
+  index("scheduled_jobs_cancellation_idx").on(table.status, table.cancellationLastAttemptAt, table.id),
   uniqueIndex("scheduled_jobs_principal_mutation_unique").on(table.principalId, table.clientMutationId).where(sql`${table.clientMutationId} is not null`),
 ]);
 
@@ -50,6 +63,10 @@ export const scheduledJobAttempts = sqliteTable("scheduled_job_attempts", {
   dispatchId: text("dispatch_id").notNull(),
   startedAt: text("started_at").notNull(),
   completedAt: text("completed_at"),
+  /** External adapter handshake state, distinct from the final worker outcome. */
+  transportStatus: text("transport_status").notNull().default("dispatching"),
+  dispatcherInstanceId: text("dispatcher_instance_id"),
+  leaseExpiresAt: text("lease_expires_at"),
   agentName: text("agent_name"),
   acpRunId: text("acp_run_id"),
   outcome: text("outcome"),
@@ -337,6 +354,21 @@ export const acpRuns = sqliteTable("acp_runs", {
   uniqueIndex("acp_runs_one_logical_run_per_session")
     .on(table.workSessionId)
     .where(sql`${table.workSessionId} is not null`),
+]);
+
+/** One durable idempotency identity for each outbound ACP execution attempt. */
+export const acpRunDispatchAttempts = sqliteTable("acp_run_dispatch_attempts", {
+  dispatchIdempotencyKey: text("dispatch_idempotency_key").primaryKey(),
+  runId: text("run_id").notNull().references(() => acpRuns.runId, { onDelete: "cascade" }),
+  agentId: text("agent_id"),
+  attemptNumber: integer("attempt_number").notNull(),
+  remoteRunId: text("remote_run_id"),
+  status: text("status").notNull().default("dispatching"),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+}, (table) => [
+  uniqueIndex("acp_run_dispatch_attempts_run_attempt_unique").on(table.runId, table.attemptNumber),
+  index("acp_run_dispatch_attempts_run_idx").on(table.runId, table.attemptNumber),
 ]);
 
 export const agentWebhookQueue = sqliteTable("agent_webhook_queue", {
@@ -797,6 +829,7 @@ export const reviewRoutes = sqliteTable("review_routes", {
   updatedAt: text("updated_at").notNull(),
 }, (table) => [
   index("review_routes_work_session_idx").on(table.workSessionId, table.status),
+  uniqueIndex("review_routes_work_session_unique").on(table.workSessionId),
 ]);
 
 export type ReviewRouteRow = typeof reviewRoutes.$inferSelect;

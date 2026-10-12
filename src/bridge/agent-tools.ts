@@ -178,6 +178,17 @@ export function registerAgentTools(server: McpServer, config: BridgeConfig): voi
             isError: true,
           };
         }
+        if (result.status === "uncertain") {
+          config.eventStore.appendEvent({
+            type: "agent.dispatch.uncertain",
+            sessionId: wsId,
+            payload: { runId: result.runId, reason: result.error ?? "ACP dispatch acceptance is uncertain." },
+          });
+          return {
+            content: [{ type: "text" as const, text: `${agentName}: dispatch acceptance is uncertain. Run ${result.runId} remains attached to work session ${wsId} while Kontrol reconciles the original launch.` }],
+            structuredContent: { runId: result.runId, workSessionId: wsId, workspaceSessionId, status: "uncertain", output: result.output, error: result.error, retryable: false },
+          };
+        }
         return {
           content: [{ type: "text" as const, text: `${agentName}: ${result.status}\n${result.output.slice(0, 5000)}${result.error ? `\nError: ${result.error}` : ""}` }],
           structuredContent: { runId: result.runId, workSessionId: wsId, workspaceSessionId, status: result.status, output: result.output, error: result.error },

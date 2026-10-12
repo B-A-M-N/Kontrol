@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import express from "express";
@@ -11,11 +11,14 @@ import { createEventStore } from "./event-log.js";
 import { createWorkSessionManager } from "./work-sessions.js";
 
 const root = await mkdtemp(join(tmpdir(), "kontrol-acp-lifecycle-"));
+const cancellationWorkspaceRoot = join(root, "cancellation-workspace");
+await mkdir(cancellationWorkspaceRoot);
 const database = openDatabase(root);
 const agents = createAgentRegistryManager(database);
 const workSessions = createWorkSessionManager(database);
 const eventStore = createEventStore(database);
 const peerRuns: Array<Record<string, unknown>> = [];
+let remoteCancelRequests = 0;
 const peer = createServer(async (req, res) => {
   if (req.method === "GET" && req.url === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
@@ -27,19 +30,45 @@ const peer = createServer(async (req, res) => {
     for await (const chunk of req) chunks.push(Buffer.from(chunk));
     peerRuns.push(chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : {});
     res.writeHead(202, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ accepted: true, remote_run_id: "remote-e2e-1", status: "running", output: [] }));
+    res.end(JSON.stringify({ accepted: true, remote_run_id: `remote-e2e-${peerRuns.length}`, status: "running", output: [] }));
+    return;
+  }
+  if (req.method === "POST" && /^\/runs\/remote-e2e-\d+\/cancel$/.test(req.url ?? "")) {
+    remoteCancelRequests++;
+    res.writeHead(404, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: { code: "not_found", message: "active run not found" } }));
     return;
   }
   res.writeHead(404).end();
 });
+
+let cancellationFinalizeCalls = 0;
+const cancellationWorkflow = {
+  cancelSession({ sessionId }: { sessionId: string }) {
+    workSessions.updateStatus(sessionId, "cancelling");
+    const run = agents.getRunByWorkSessionId(sessionId);
+    if (run) agents.updateRun(run.runId, { status: "cancelling" });
+    eventStore.appendEvent({ type: "agent.run.cancellation_requested", sessionId, payload: {} });
+    return { status: "cancelling" };
+  },
+  finalizeCancellation({ sessionId }: { sessionId: string }) {
+    cancellationFinalizeCalls++;
+    workSessions.updateStatus(sessionId, "cancelled");
+    const run = agents.getRunByWorkSessionId(sessionId);
+    if (run) agents.updateRun(run.runId, { status: "cancelled", finishedAt: new Date().toISOString() });
+    eventStore.appendEvent({ type: "agent.run.cancelled", sessionId, payload: {} });
+    return { status: "cancelled" };
+  },
+};
 
 const acpApp = express();
 acpApp.use(express.json({ limit: "4mb" }));
 acpApp.use("/acp", createAcpServer(
   {
     getWorkspace: (id: string) => {
-      if (id !== "ws-e2e") throw new Error(`Unknown workspace: ${id}`);
-      return { id, root, mode: "checkout" };
+      if (id === "ws-e2e") return { id, root, mode: "checkout" };
+      if (id === "ws-e2e-cancel") return { id, root: cancellationWorkspaceRoot, mode: "checkout" };
+      throw new Error(`Unknown workspace: ${id}`);
     },
   } as any,
   workSessions,
@@ -49,7 +78,7 @@ acpApp.use("/acp", createAcpServer(
   eventStore,
   undefined,
   undefined,
-  undefined,
+  cancellationWorkflow as any,
   undefined,
   undefined,
   "agent-secret",
@@ -75,6 +104,11 @@ try {
       (id, root, status, mode, managed, created_at, last_used_at)
     values (?, ?, 'active', 'worktree', 'false', ?, ?)
   `).run("ws-e2e", root, "2026-01-01T00:00:00.000Z", "2026-01-01T00:00:00.000Z");
+  database.sqlite.prepare(`
+    insert into workspace_sessions
+      (id, root, status, mode, managed, created_at, last_used_at)
+    values (?, ?, 'active', 'worktree', 'false', ?, ?)
+  `).run("ws-e2e-cancel", cancellationWorkspaceRoot, "2026-01-01T00:00:00.000Z", "2026-01-01T00:00:00.000Z");
 
   const registration = await jsonFetch("/agents/register", {
     method: "POST",
@@ -160,6 +194,34 @@ try {
   assert.equal(agents.getRun(runId)?.status, "completed");
   assert.equal(agents.getRun(runId)?.remoteRunId, "remote-e2e-1");
   assert.equal(workSessions.get(sessionId)?.workspaceSessionId, "ws-e2e");
+
+  const cancellationDispatch = await jsonFetch("/runs", {
+    method: "POST",
+    headers: { Authorization: "Bearer reviewer-secret", "Content-Type": "application/json" },
+    body: JSON.stringify({
+      agent_name: "e2e-peer",
+      workspace_id: "ws-e2e-cancel",
+      mode: "async",
+      input: [{ parts: [{ content: "run the cancellation 404 contract" }] }],
+    }),
+  });
+  assert.equal(cancellationDispatch.status, 202);
+  const cancellationRunId = cancellationDispatch.body.kontrol_run_id as string;
+  const cancellationSessionId = cancellationDispatch.body.session_id as string;
+  const cancellationResponse = await jsonFetch(`/runs/${encodeURIComponent(cancellationRunId)}/cancel`, {
+    method: "POST",
+    headers: { Authorization: "Bearer reviewer-secret" },
+  });
+  assert.equal(cancellationResponse.status, 202);
+  assert.equal(cancellationResponse.body.status, "cancelling",
+    "adapter 404 means no active run, not confirmed worker shutdown");
+  assert.equal(cancellationResponse.body.remote_cancellation.status, 404);
+  assert.equal(remoteCancelRequests, 1);
+  assert.equal(cancellationFinalizeCalls, 0, "adapter 404 cannot finalize cancellation");
+  assert.equal(workSessions.get(cancellationSessionId)?.status, "cancelling");
+  assert.equal(agents.getRun(cancellationRunId)?.status, "cancelling");
+  assert.equal(eventStore.getEventsForSession(cancellationSessionId).some((event) => event.type === "agent.run.cancelled"), false,
+    "an adapter 404 does not fabricate a durable worker-cancelled event");
 
   console.log("acp-lifecycle.test.ts: all assertions passed");
 } finally {

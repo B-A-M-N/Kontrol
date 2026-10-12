@@ -185,6 +185,13 @@ export interface MissionLedger {
   recordCompletionReport(missionId: string, input: { submissionId: string; snapshotKind?: WorkspaceSnapshotKind; snapshotRef?: string; snapshotCommit?: string; status: "passed" | "failed"; results: unknown; reviewCoverage?: string[]; uncertainty?: unknown[] }): void;
   recordReviewCoverage(missionId: string, input: { submissionId: string; snapshotKind?: WorkspaceSnapshotKind; snapshotRef?: string; snapshotCommit?: string; reviewCoverage?: string[]; uncertainty?: unknown[] }): void;
   getCompletionReportHash(workSessionId: string, context: CurrentApprovalContext): string | undefined;
+  getResultReceipt(workSessionId: string, context?: CurrentApprovalContext): {
+    missionId: string;
+    currentSubmissionId?: string;
+    approval: ApprovalPredicate;
+    completionReport?: ReturnType<typeof rowToCompletionReport>;
+    evidence: Array<ReturnType<typeof rowToEvidence>>;
+  } | undefined;
   getPacket(workSessionId: string, approvalContext?: CurrentApprovalContext): MissionReviewPacket;
   canApprove(workSessionId: string, context?: CurrentApprovalContext): ApprovalPredicate;
   recordOutcomeObservation(missionId: string, input: {
@@ -682,6 +689,37 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
     return { mission, criteria, findings, workOrders, evidence, completionReports, approval: canApprove(workSessionId, currentContext), criterionStates: evaluateCriteria(workSessionId, currentContext), currentSubmissionId: currentContext.submissionId };
   }
 
+  function getResultReceipt(workSessionId: string, approvalContext?: CurrentApprovalContext) {
+    const mission = getMissionByWorkSession(workSessionId);
+    if (!mission) return undefined;
+    const context = normalizeCurrentApprovalContext(approvalContext ?? getCurrentApprovalContext(workSessionId));
+    const approval = canApprove(workSessionId, context);
+    if (!context.submissionId) return { missionId: mission.id, approval, evidence: [] };
+
+    let completionReport: ReturnType<typeof rowToCompletionReport> | undefined;
+    if (context.snapshotKind && context.snapshotRef) {
+      const row = database.db.select().from(missionCompletionReports).where(and(
+        eq(missionCompletionReports.missionId, mission.id),
+        eq(missionCompletionReports.submissionId, context.submissionId),
+        eq(missionCompletionReports.snapshotKind, context.snapshotKind),
+        eq(missionCompletionReports.snapshotRef, context.snapshotRef),
+      )).orderBy(desc(missionCompletionReports.createdAt)).limit(1).get();
+      completionReport = row ? rowToCompletionReport(row) : undefined;
+    }
+
+    let evidence: Array<ReturnType<typeof rowToEvidence>> = [];
+    if (context.snapshotKind && context.snapshotRef && context.reviewEpoch !== undefined) {
+      evidence = database.db.select().from(missionEvidence).where(and(
+        eq(missionEvidence.missionId, mission.id),
+        eq(missionEvidence.submissionId, context.submissionId),
+        eq(missionEvidence.snapshotKind, context.snapshotKind),
+        eq(missionEvidence.snapshotRef, context.snapshotRef),
+        eq(missionEvidence.reviewEpoch, context.reviewEpoch),
+      )).orderBy(desc(missionEvidence.createdAt)).limit(100).all().map(rowToEvidence);
+    }
+    return { missionId: mission.id, currentSubmissionId: context.submissionId, approval, completionReport, evidence };
+  }
+
   // P1 #26: Derive the current approval context from the latest pending
   // submission, so callers that don't pass an explicit context still get
   // consistent evidence-bound approval reasoning.
@@ -1033,6 +1071,7 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
     recordCompletionReport,
     recordReviewCoverage,
     getCompletionReportHash,
+    getResultReceipt,
     getPacket,
     canApprove,
     recordOutcomeObservation,

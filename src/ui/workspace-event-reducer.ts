@@ -10,6 +10,7 @@ import { noteSubmission, workSessionViews } from "./session-views.js";
 import { parsePolicyApprovalOptions } from "./review-feedback.js";
 import type { App } from "@modelcontextprotocol/ext-apps";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { workSessionTerminalOutcome } from "../work-session-lifecycle.js";
 import { getStructuredContent } from "./server-tool-call.js";
 import type {
   AgentActivityEvent,
@@ -66,6 +67,7 @@ export function reduceWorkSessionEvent(sessionId: string, event: AgentActivityEv
     return;
   }
   view.updatedAt = event.createdAt;
+  const terminalOutcome = workSessionTerminalOutcome(event.type, "webui_approval_required");
 
   // Coalesce adjacent transcript fragments so a fast agent does not turn each
   // 250ms flush into a separate visible activity row.
@@ -185,16 +187,10 @@ export function reduceWorkSessionEvent(sessionId: string, event: AgentActivityEv
     view.status = "awaiting_resume";
   } else if (event.type === "worker.attempt.failed" || event.type === "worker.attempt.exited") {
     view.status = "awaiting_resume";
-  } else if (event.type === "agent.run.failed_protocol") {
-    view.status = "failed_protocol";
-  } else if (event.type === "agent.run.approved") {
-    view.status = "approved";
-  } else if (event.type === "agent.run.rejected") {
-    view.status = "rejected";
   } else if (event.type === "agent.run.cancellation_requested") {
     view.status = "cancelling";
-  } else if (event.type === "agent.run.failed" || event.type === "agent.run.cancelled") {
-    view.status = event.type === "agent.run.failed" ? "failed" : "cancelled";
+  } else if (terminalOutcome) {
+    view.status = terminalOutcome.status;
   } else if (event.type === "policy.approval_requested" || event.type === "approval.requested") {
     const approvalId = String(event.payload?.approvalId ?? "");
     if (approvalId) {
