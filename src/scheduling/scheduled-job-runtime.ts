@@ -69,17 +69,19 @@ export function createScheduledJobRuntime(options: ScheduledJobRuntimeOptions): 
    */
   function reconcileNonterminalJobs(): void {
     const rows = database.sqlite
-      .prepare("select id, revision, run_at from scheduled_jobs where status in ('pending','due','dispatching','reconciling')")
+      .prepare("select id, revision, run_at from scheduled_jobs where status in ('pending','due','reconciling')")
       .all() as Array<{ id: string; revision: number; run_at: string }>;
     const now = new Date().toISOString();
     for (const row of rows) {
       const alreadyDue = Date.parse(row.run_at) <= Date.parse(now);
       const status = alreadyDue ? "due" : "pending";
       database.sqlite
-        .prepare("update scheduled_jobs set status = ?, updated_at = ? where id = ? and status in ('pending','due','dispatching','reconciling') and revision = ?")
+        .prepare("update scheduled_jobs set status = ?, updated_at = ? where id = ? and status in ('pending','due','reconciling') and revision = ?")
         .run(status, now, row.id, row.revision);
       // Re-arm the due trigger under the canonical logical key; enqueue() is
-      // idempotent for the same (type, aggregateId, revision).
+      // idempotent for the same (type, aggregateId, revision). Dispatching
+      // jobs are intentionally excluded: an expired lease represents a
+      // possible accepted launch, not permission to blindly redispatch.
       dispatchOutbox.enqueue({
         eventType: "scheduled_job.due",
         aggregateId: row.id,
@@ -137,43 +139,39 @@ export function createScheduledJobRuntime(options: ScheduledJobRuntimeOptions): 
             dispatchOutbox.markCompleted(claim);
             continue;
           }
+          const dispatchClaim = jobs.claimDispatch({
+            jobId: job.id,
+            expectedRevision: job.revision,
+            dispatcherInstanceId: schedulerInstanceId,
+            leaseMs,
+          });
           const outcome = await options.dispatch(job.id);
           // Only advance the durable job state when the CAS revision still
           // matches what we observed; a concurrent cancellation wins.
           const current = jobs.get(job.id);
-          if (current && current.revision === job.revision) {
-            try {
-              if (outcome.status === "dispatched" || outcome.status === "uncertain") {
-                jobs.transition({
-                  jobId: job.id,
-                  expectedRevision: job.revision,
-                  nextStatus: "running",
-                  workSessionId: outcome.workSessionId ?? null,
-                  lastError: outcome.status === "uncertain" ? (outcome.reason ?? "Dispatch acceptance uncertain; reconciling.") : null,
-                });
-              } else if (outcome.status === "blocked") {
-                jobs.transition({
-                  jobId: job.id,
-                  expectedRevision: job.revision,
-                  nextStatus: "blocked",
-                  workSessionId: outcome.workSessionId ?? null,
-                  lastError: outcome.reason ?? "Scheduled dispatch blocked.",
-                });
-              } else {
-                jobs.transition({
-                  jobId: job.id,
-                  expectedRevision: job.revision,
-                  nextStatus: "failed",
-                  workSessionId: outcome.workSessionId ?? null,
-                  lastError: outcome.reason ?? "Scheduled dispatch failed.",
-                });
-              }
-            } catch {
-              // Terminal/cancelled job or revision conflict: leave durable state.
-            }
+          if (outcome.status === "dispatched" || outcome.status === "uncertain" || outcome.status === "failed") {
+            jobs.completeDispatch({
+              jobId: job.id,
+              dispatchAttemptId: dispatchClaim.attemptId,
+              expectedRevision: dispatchClaim.revision,
+              outcome: outcome.status,
+              workSessionId: outcome.workSessionId,
+              lastError: outcome.reason,
+            });
+          } else {
+            jobs.releaseDispatch({
+              jobId: job.id,
+              dispatchAttemptId: dispatchClaim.attemptId,
+              expectedRevision: dispatchClaim.revision,
+            });
+            dispatchOutbox.release(claim, 1000, outcome.reason ?? "scheduled dispatch blocked before launch");
+            continue;
           }
           dispatchOutbox.markCompleted(claim);
         } catch (error) {
+          // If the error happened after a durable dispatch claim was created,
+          // the job stays in dispatching and the next startup reconciliation
+          // must handle it as an accepted-or-uncertain external launch.
           dispatchOutbox.markFailed(claim, error instanceof Error ? error.message : String(error), 5_000);
         }
       }

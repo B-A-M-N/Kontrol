@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { z } from "zod/v4";
 import type { DatabaseHandle } from "../db/client.js";
 import type { DispatchOutbox } from "../dispatch-outbox.js";
-import { scheduledJobs, type ScheduledJobRow } from "../db/schema.js";
+import { scheduledJobs, scheduledJobAttempts, type ScheduledJobRow } from "../db/schema.js";
 import { createHash } from "node:crypto";
 import { and, eq } from "drizzle-orm";
 
@@ -45,11 +45,38 @@ export interface ScheduledStateTransition {
   lastError?: string | null;
 }
 
+export interface DispatchClaim {
+  jobId: string;
+  attemptId: string;
+  dispatchId: string;
+  leaseExpiresAt: string;
+  revision: number;
+}
+
 export interface ScheduledJobStore {
   create(input: ScheduledJobInput): ScheduledJob;
   get(jobId: string): ScheduledJob | undefined;
   listForOwner(ownerContextId: string, limit?: number): ScheduledJob[];
   transition(input: ScheduledStateTransition): ScheduledJob;
+  /** Atomically fence one external dispatch attempt. */
+  claimDispatch(input: {
+    jobId: string;
+    expectedRevision: number;
+    dispatchAttemptId?: string;
+    dispatcherInstanceId: string;
+    leaseMs?: number;
+  }): DispatchClaim;
+  /** Release an unstarted claim back to due. */
+  releaseDispatch(input: { jobId: string; dispatchAttemptId: string; expectedRevision: number }): ScheduledJob;
+  /** Mark a dispatched claim uncertain or failed. */
+  completeDispatch(input: {
+    jobId: string;
+    dispatchAttemptId: string;
+    expectedRevision: number;
+    outcome: "dispatched" | "uncertain" | "failed";
+    workSessionId?: string;
+    lastError?: string;
+  }): ScheduledJob;
   close(): void;
 }
 
@@ -216,6 +243,107 @@ export function createScheduledJobStore(
     return commitJob(input);
   }
 
+  function claimDispatch(input: {
+    jobId: string;
+    expectedRevision: number;
+    dispatchAttemptId?: string;
+    dispatcherInstanceId: string;
+    leaseMs?: number;
+  }): DispatchClaim {
+    const now = Date.now();
+    const leaseExpiresAt = new Date(now + (input.leaseMs ?? 60_000)).toISOString();
+    const attemptId = input.dispatchAttemptId ?? `scha_${randomUUID()}`;
+    const dispatchId = `disp_${randomUUID()}`;
+    const claim = database.sqlite.transaction(() => {
+      const updated = database.db.update(scheduledJobs)
+        .set({ status: "dispatching", revision: input.expectedRevision + 1, updatedAt: new Date(now).toISOString() })
+        .where(and(
+          eq(scheduledJobs.id, input.jobId),
+          eq(scheduledJobs.revision, input.expectedRevision),
+          eq(scheduledJobs.status, "due"),
+        ))
+        .run();
+      if (updated.changes !== 1) throw new Error(`Scheduled dispatch claim conflict for ${input.jobId}.`);
+      database.db.insert(scheduledJobAttempts).values({
+        id: attemptId,
+        jobId: input.jobId,
+        dispatchId,
+        startedAt: new Date(now).toISOString(),
+        agentName: null,
+        acpRunId: null,
+        outcome: null,
+      }).run();
+      const row = database.db.select().from(scheduledJobs).where(eq(scheduledJobs.id, input.jobId)).get();
+      if (!row) throw new Error(`Scheduled job disappeared after dispatch claim: ${input.jobId}`);
+      return row.revision;
+    })();
+    return { jobId: input.jobId, attemptId, dispatchId, leaseExpiresAt, revision: claim };
+  }
+
+  function releaseDispatch(input: { jobId: string; dispatchAttemptId: string; expectedRevision: number }): ScheduledJob {
+    const next = database.db.transaction(() => {
+      database.db.update(scheduledJobs)
+        .set({ status: "due", revision: input.expectedRevision + 1, updatedAt: new Date().toISOString() })
+        .where(and(
+          eq(scheduledJobs.id, input.jobId),
+          eq(scheduledJobs.revision, input.expectedRevision),
+          eq(scheduledJobs.status, "dispatching"),
+        ))
+        .run();
+      database.db.update(scheduledJobAttempts)
+        .set({ completedAt: new Date().toISOString(), outcome: "released" })
+        .where(and(
+          eq(scheduledJobAttempts.id, input.dispatchAttemptId),
+          eq(scheduledJobAttempts.jobId, input.jobId),
+        ))
+        .run();
+      return database.db.select().from(scheduledJobs).where(eq(scheduledJobs.id, input.jobId)).get();
+    });
+    if (!next) throw new Error(`Scheduled job disappeared during dispatch release: ${input.jobId}`);
+    return rowToJob(next);
+  }
+
+  function completeDispatch(input: {
+    jobId: string;
+    dispatchAttemptId: string;
+    expectedRevision: number;
+    outcome: "dispatched" | "uncertain" | "failed";
+    workSessionId?: string;
+    lastError?: string;
+  }): ScheduledJob {
+    const nextStatus = input.outcome === "dispatched" ? "running" : input.outcome === "uncertain" ? "uncertain_dispatch" : "failed";
+    const now = new Date().toISOString();
+    database.sqlite.transaction(() => {
+      database.db.update(scheduledJobs)
+        .set({
+          status: nextStatus,
+          revision: input.expectedRevision + 1,
+          workSessionId: input.workSessionId ?? null,
+          lastError: input.lastError ?? null,
+          updatedAt: now,
+        })
+        .where(and(
+          eq(scheduledJobs.id, input.jobId),
+          eq(scheduledJobs.revision, input.expectedRevision),
+          eq(scheduledJobs.status, "dispatching"),
+        ))
+        .run();
+      database.db.update(scheduledJobAttempts)
+        .set({ completedAt: now, outcome: input.outcome })
+        .where(and(
+          eq(scheduledJobAttempts.id, input.dispatchAttemptId),
+          eq(scheduledJobAttempts.jobId, input.jobId),
+        ))
+        .run();
+      const row = database.db.select().from(scheduledJobs).where(eq(scheduledJobs.id, input.jobId)).get();
+      if (!row) throw new Error(`Scheduled job disappeared after dispatch completion: ${input.jobId}`);
+      return row.revision;
+    })();
+    const next = get(input.jobId);
+    if (!next) throw new Error(`Scheduled job disappeared during dispatch completion: ${input.jobId}`);
+    return next;
+  }
+
   function transition(input: ScheduledStateTransition): ScheduledJob {
     const now = new Date().toISOString();
     const updated = database.db.update(scheduledJobs)
@@ -247,6 +375,9 @@ export function createScheduledJobStore(
         .all().slice(0, limit).map(rowToJob);
     },
     transition,
+    claimDispatch,
+    releaseDispatch,
+    completeDispatch,
     close() {
       database.close();
     },
