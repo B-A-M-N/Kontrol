@@ -1265,7 +1265,7 @@ try {
     assert.equal(workSessions.get(sessionId)!.status, "awaiting_review", "blocked feedback did not mutate the session");
 
     // Claim the exact handoff, then the same feedback is admitted.
-    const claimed = await callReviewer("claim_review_handoff", { handoffId: handoff.id, expectedRevision: handoff.revision });
+    const claimed = await callReviewer("claim_review_handoff", { handoffId: handoff.id, expectedRevision: handoff.revision, destinationConversationId: "conversation:owner-a" });
     assert.ok(!claimed.isError, "reviewer claims the handoff: " + JSON.stringify(claimed.content));
     const admitted = await callReviewer("provide_review_feedback", { sessionId, verdict: "changes_requested", comments: "Please address the reviewed issue before resubmitting." });
     assert.ok(!admitted.isError, "claimed handoff admits review feedback: " + JSON.stringify(admitted.content));
@@ -1316,13 +1316,16 @@ try {
     // live waiter so reviewer feedback drives the automation deterministically.
     await callReviewer("configure_review_loop", {
       workSessionId: sessionId, enabled: true, mode: "pinned_conversation", maxReviewRounds: 3,
+      pinnedConversationId: "unknown-owner",
     });
 
     // Round 1: submit S1, reviewer claims the handoff and requests changes.
     await callWorker("submit_for_review", { sessionId });
     let sub = workSessions.get(sessionId)!.latestSubmission!;
     let handoff = reviewRoutes.getHandoffBySubmission(sessionId, sub.id, sub.reviewEpoch)!;
-    await callReviewer("claim_review_handoff", { handoffId: handoff.id, expectedRevision: handoff.revision });
+let claimResult: any;
+claimResult = await callReviewer("claim_review_handoff", { handoffId: handoff.id, expectedRevision: handoff.revision });
+    if (claimResult.isError) throw new Error(claimResult.content?.[0]?.text ?? "claim failed");
     await callReviewer("provide_review_feedback", { sessionId, verdict: "changes_requested", comments: "round 1 fix" });
     assert.equal(reviewRoutes.getRouteBySession(sessionId)!.completedReviewRounds, 1, "round 1 consumed a review round");
 
@@ -1330,7 +1333,8 @@ try {
     await callWorker("submit_for_review", { sessionId });
     sub = workSessions.get(sessionId)!.latestSubmission!;
     handoff = reviewRoutes.getHandoffBySubmission(sessionId, sub.id, sub.reviewEpoch)!;
-    await callReviewer("claim_review_handoff", { handoffId: handoff.id, expectedRevision: handoff.revision });
+claimResult = await callReviewer("claim_review_handoff", { handoffId: handoff.id, expectedRevision: handoff.revision });
+    if (claimResult.isError) throw new Error(claimResult.content?.[0]?.text ?? "claim failed");
     await callReviewer("provide_review_feedback", { sessionId, verdict: "changes_requested", comments: "round 2 fix" });
     assert.equal(reviewRoutes.getRouteBySession(sessionId)!.completedReviewRounds, 2, "round 2 consumed a review round");
 
@@ -1338,7 +1342,8 @@ try {
     await callWorker("submit_for_review", { sessionId });
     sub = workSessions.get(sessionId)!.latestSubmission!;
     handoff = reviewRoutes.getHandoffBySubmission(sessionId, sub.id, sub.reviewEpoch)!;
-    await callReviewer("claim_review_handoff", { handoffId: handoff.id, expectedRevision: handoff.revision });
+const claimError = await callReviewer("claim_review_handoff", { handoffId: handoff.id, expectedRevision: handoff.revision });
+    if (claimError.isError) throw new Error(claimError.content?.[0]?.text ?? "claim failed");
     await callReviewer("provide_review_feedback", { sessionId, verdict: "changes_requested", comments: "round 3 fix" });
     assert.equal(reviewRoutes.getRouteBySession(sessionId)!.completedReviewRounds, 3, "round 3 consumed the final review round");
 
@@ -1389,7 +1394,8 @@ try {
     await callWorker("submit_for_review", { sessionId });
     const sub = workSessions.get(sessionId)!.latestSubmission!;
     const handoff = reviewRoutes.getHandoffBySubmission(sessionId, sub.id, sub.reviewEpoch)!;
-    await callReviewer("claim_review_handoff", { handoffId: handoff.id, expectedRevision: handoff.revision });
+const claimError = await callReviewer("claim_review_handoff", { handoffId: handoff.id, expectedRevision: handoff.revision });
+    if (claimError.isError) throw new Error(claimError.content?.[0]?.text ?? "claim failed");
 
     // The reviewer switches routing mode before committing feedback. This
     // increments the route epoch, invalidating the handoff claimed against the

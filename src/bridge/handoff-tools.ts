@@ -142,13 +142,21 @@ export function registerHandoffTools(server: McpServer, config: BridgeConfig): v
     async ({ handoffId, expectedRevision, destinationConversationId }: { handoffId: string; expectedRevision: number; destinationConversationId?: string }) => {
       if (!isReviewer(config.principalRole)) return forbidden(config.principalRole, "claim_review_handoff");
       if (!routes) return { content: [{ type: "text" as const, text: "Review routing is unavailable." }], isError: true };
+      const handoff = routes.getHandoffById(handoffId);
+      if (!handoff) return { content: [{ type: "text" as const, text: `Unknown handoff: ${handoffId}` }], isError: true };
       try {
+        const route = routes.getRouteBySession(handoff.workSessionId);
         const claimed = routes.claimHandoff({
           handoffId,
           expectedRevision,
           principalId: config.principalId ?? `role:${config.principalRole ?? "reviewer"}`,
           ownerContextId: reviewOwnerContextId(config),
-          destinationConversationId,
+          destinationConversationId: destinationConversationId ?? reviewOwnerContextId(config),
+          authorization: {
+            authorizedWorkSessionIds: [handoff.workSessionId],
+            conversationId: reviewOwnerContextId(config),
+            freshConversationIds: [reviewOwnerContextId(config)],
+          },
         });
         config.eventStore.appendEvent({
           type: "review.handoff.claimed",

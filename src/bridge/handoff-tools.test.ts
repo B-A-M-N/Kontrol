@@ -21,8 +21,9 @@ try {
     ownerPrincipalId: "user-a",
     ownerContextId: "owner-a",
     enabled: true,
-    mode: "isolated_review",
+    mode: "pinned_conversation",
     maxReviewRounds: 3,
+    pinnedConversationId: "conv-b",
   });
   const handoff = routes.createHandoff({
     routeId: route.id,
@@ -36,14 +37,37 @@ try {
   });
   const fetched = routes.getHandoffById(handoff.id);
   assert.equal(fetched?.submissionId, "sub-1");
+  let wrongConversationDenied = false;
+  try {
+    routes.claimHandoff({
+      handoffId: handoff.id,
+      expectedRevision: 1,
+      principalId: "user-b",
+      ownerContextId: "owner-b",
+      destinationConversationId: "owner-b",
+      authorization: {
+        authorizedWorkSessionIds: ["wsess-handoff"],
+        conversationId: "owner-b",
+        freshConversationIds: ["owner-b"],
+      },
+    });
+  } catch {
+    wrongConversationDenied = true;
+  }
+  assert.ok(wrongConversationDenied, "wrong pinned conversation cannot claim the handoff");
   const claimed = routes.claimHandoff({
     handoffId: handoff.id,
     expectedRevision: 1,
     principalId: "user-b",
-    ownerContextId: "owner-b",
+    ownerContextId: "conv-b",
     destinationConversationId: "conv-b",
+    authorization: {
+      authorizedWorkSessionIds: ["wsess-handoff"],
+      conversationId: "conv-b",
+      freshConversationIds: ["conv-b"],
+    },
   });
-  assert.equal(claimed.claimedByOwnerContextId, "owner-b");
+  assert.equal(claimed.claimedByOwnerContextId, "conv-b");
   db.close();
 } finally {
   await rm(root, { recursive: true, force: true });

@@ -60,8 +60,12 @@ try {
     handoffId: h1.id,
     expectedRevision: 1,
     principalId: "user-b",
-    ownerContextId: "owner-b",
+    ownerContextId: "conv-b",
     destinationConversationId: "conv-b",
+    authorization: {
+      authorizedWorkSessionIds: ["wsess-route"],
+      freshConversationIds: ["conv-b"],
+    },
   });
   assert.equal(claimed.status, "claimed");
   let competing = false;

@@ -86,6 +86,7 @@ export interface ReviewRouteStore {
     principalId: string;
     ownerContextId: string;
     destinationConversationId?: string;
+    authorization?: ReviewHandoffAuthorization;
   }): ReviewHandoff;
   markHandoffStatus(input: {
     handoffId: string;
@@ -101,6 +102,48 @@ export interface ReviewRouteStore {
    */
   setStatus(input: { workSessionId: string; expectedRevision?: number; status: ReviewRouteStatus }): ReviewRoute;
   close(): void;
+}
+
+/**
+ * Authorization is validated at the store boundary, not reconstructed from
+ * handoff knowledge. `conversationId` is the authenticated live conversation;
+ * `freshConversationIds` lists explicitly attached isolated-review identities.
+ */
+export interface ReviewHandoffAuthorization {
+  authorizedWorkSessionIds?: string[];
+  conversationId?: string;
+  freshConversationIds?: string[];
+}
+
+function assertHandoffClaimAuthorization(
+  route: ReviewRoute,
+  handoff: ReviewHandoff,
+  input: {
+    principalId: string;
+    ownerContextId: string;
+    destinationConversationId?: string;
+    authorization?: ReviewHandoffAuthorization;
+  },
+): void {
+  const authorization = input.authorization;
+  if (authorization?.authorizedWorkSessionIds?.length
+    && !authorization.authorizedWorkSessionIds.includes(handoff.workSessionId)) {
+    throw new Error("Review handoff authorization denied for this work session.");
+  }
+  // The authenticated ownerContextId is the sole claim identity.
+  // destinationConversationId is display/routing metadata, never an auth token.
+  if (route.mode === "pinned_conversation") {
+    const required = route.pinnedConversationId ?? handoff.destinationConversationId;
+    if (!required || input.ownerContextId !== required) {
+      throw new Error("Review handoff must be claimed from the pinned conversation.");
+    }
+    return;
+  }
+  const allowedFresh = authorization?.freshConversationIds;
+  const claimIdentity = input.ownerContextId;
+  if (!claimIdentity || !allowedFresh || !allowedFresh.includes(claimIdentity)) {
+    throw new Error("Isolated review requires an authorized fresh conversation attachment.");
+  }
 }
 
 function rowToRoute(row: ReviewRouteRow): ReviewRoute {
@@ -250,6 +293,11 @@ export function createReviewRouteStore(database: DatabaseHandle): ReviewRouteSto
     },
 
     claimHandoff(input) {
+      const handoff = getHandoffById(input.handoffId);
+      if (!handoff) throw new Error(`Unknown review handoff: ${input.handoffId}`);
+      const route = getRouteBySession(handoff.workSessionId);
+      if (!route) throw new Error("Review route disappeared before claim.");
+      assertHandoffClaimAuthorization(route, handoff, input);
       const now = new Date().toISOString();
       const updated = database.db.update(reviewHandoffs).set({
         status: "claimed",
@@ -261,8 +309,9 @@ export function createReviewRouteStore(database: DatabaseHandle): ReviewRouteSto
       }).where(and(
         eq(reviewHandoffs.id, input.handoffId),
         eq(reviewHandoffs.revision, input.expectedRevision),
+        eq(reviewHandoffs.status, route.mode === "pinned_conversation" ? "ready" : "awaiting_attachment"),
       )).run();
-      if (updated.changes !== 1) throw new Error("Review handoff claim conflict.");
+      if (updated.changes !== 1) throw new Error("Review handoff claim conflict or invalid lifecycle state.");
       const row = database.db.select().from(reviewHandoffs).where(eq(reviewHandoffs.id, input.handoffId)).get();
       if (!row) throw new Error("Review handoff disappeared after claim.");
       return rowToHandoff(row);
