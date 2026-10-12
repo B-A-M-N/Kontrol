@@ -562,6 +562,24 @@ export function createReviewWorkflowService(
         }
       }
       // 1. Insert feedback + advance session.
+      // Bind handoff completion to the same transaction: every governed
+      // feedback entry point reaches this authority, so the route projection
+      // cannot lag behind actual review state.
+      let committedHandoff: import("./review-handoff/route-store.js").ReviewHandoff | undefined;
+      if (reviewRoutes && input.reviewerId !== "supervisor-runtime") {
+        const currentRoute = reviewRoutes.getRouteBySession(input.sessionId);
+        if (currentRoute?.status === "active") {
+          const currentHandoff = reviewRoutes.getHandoffBySubmission(input.sessionId, input.submissionId, currentPending.reviewEpoch);
+          if (currentHandoff && currentHandoff.status === "claimed" && currentHandoff.routeEpoch === currentRoute.routeEpoch) {
+            committedHandoff = reviewRoutes.markHandoffStatus({
+              handoffId: currentHandoff.id,
+              expectedRevision: currentHandoff.revision,
+              nextStatus: "feedback_committed",
+              completed: true,
+            });
+          }
+        }
+      }
       const feedback = workSessions.submitFeedback({
         workSessionId: input.sessionId,
         submissionId: input.submissionId,
