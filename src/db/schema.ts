@@ -792,6 +792,7 @@ export const reviewRoutes = sqliteTable("review_routes", {
   status: text("status").notNull().default("disabled"),
   routeEpoch: integer("route_epoch").notNull().default(1),
   revision: integer("revision").notNull().default(1),
+  warningAcknowledgedAt: text("warning_acknowledged_at"),
   createdAt: text("created_at").notNull(),
   updatedAt: text("updated_at").notNull(),
 }, (table) => [

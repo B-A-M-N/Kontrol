@@ -81,7 +81,7 @@ export function registerHandoffTools(server: McpServer, config: BridgeConfig): v
       if (access) return access;
       if (!routes) return { content: [{ type: "text" as const, text: "Review routing is unavailable." }], isError: true };
       try {
-        const route = routes.configure({
+        let route = routes.configure({
           workSessionId,
           ownerPrincipalId: config.principalId ?? `role:${config.principalRole ?? "reviewer"}`,
           ownerContextId: reviewOwnerContextId(config),
@@ -98,9 +98,16 @@ export function registerHandoffTools(server: McpServer, config: BridgeConfig): v
         });
         // C05: warn once, when enabling a multi-round pinned review — the
         // configuration where repeated handoffs accumulate the most drift risk.
-        const warning = route.status === "active" && route.mode === "pinned_conversation" && route.maxReviewRounds > 1
+        // Persist the warning marker so repeated configuration calls do not
+        // repeatedly surface a one-time operational warning.
+        const qualifiesForWarning = route.status === "active" && route.mode === "pinned_conversation" && route.maxReviewRounds > 1;
+        const warning = qualifiesForWarning && !route.warningAcknowledgedAt
           ? "Extended review sessions: repeated agent/reviewer handoffs increase opportunities for context drift, inaccurate assumptions, and missed regressions. Kontrol preserves the original objective and requires fresh verification, but additional rounds cannot guarantee greater accuracy. You can pause the loop or switch to fresh isolated reviews at any time."
           : undefined;
+        if (warning) {
+          const acknowledged = routes.markWarningAcknowledged({ workSessionId, expectedRevision: route.revision });
+          route = acknowledged;
+        }
         return {
           content: [{ type: "text" as const, text: `Review loop ${route.status}; round ${route.completedReviewRounds}/${route.maxReviewRounds}.${warning ? ` ${warning}` : ""}` }],
           structuredContent: {

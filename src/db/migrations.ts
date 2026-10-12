@@ -149,6 +149,7 @@ function migrateReviewHandoffRouting(sqlite: Database.Database): void {
       status text not null default 'disabled',
       route_epoch integer not null default 1,
       revision integer not null default 1,
+      warning_acknowledged_at text,
       created_at text not null,
       updated_at text not null
     );
