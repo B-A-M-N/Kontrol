@@ -76,3 +76,44 @@ all fingerprints carry their definition version, and stored records keep
 their historical identity until an explicit migration. Full unit suite (42)
 green; clean candidate built from 3680697. Root filesystem remains
 read-only; activation and soak still pending host recovery.
+
+### Durable scheduling / messaging / review-loop remediation (October 11, 2026)
+
+Implements the consolidated remediation plan's P0/P1 areas on top of the prior
+`d93d76e` feature commit. All gates green: typecheck, unit, security,
+integration, syntax, UI (Chromium), cold-start, scheduled-job E2E, build.
+
+Source-level fixes (with falsification tests):
+
+| Finding | Fix | Commit |
+| --- | --- | --- |
+| F01 outbox cross-consumer + unfenced completion | `claimNext` mints a claim token; `markCompleted`/`release`/`markFailed` CAS on (id, claimed, owner, token, unexpired lease). Event-type ownership test proves no foreign consumption. Stale/forged/wrong-owner transitions rejected. Schema v70. | `56766fe`, `2b9b858` |
+| F02 unbound worker message authority | `requireWorkerDeliveryBinding` fails closed for post/list/await/ack; unbound or cross-session workers cannot touch messages. Bridge-flow scenario asserts no persistence. | `56766fe` |
+| F03 duplicate resolution events | `resolve()` reports the open→resolved transition; repeat requests emit no event and return "already resolved". | `56766fe` |
+| S02/S03 scheduler never dispatched | Scheduler runtime triggers the canonical ACP dispatch path; dispatch outcome (work-session id + real reason) persists on the job; single-flight drain; startup reconciliation re-arms lost triggers under the idempotent logical key. | `4bd90c7`, `1d3bcd0` |
+| S04 idempotency + missing tools | `schedule_job` passes clientMutationId through; `list_scheduled_jobs`/`cancel_scheduled_job` registered. | `56766fe` |
+| R06 review-workflow bypass | Route enforcement moved into `provideFeedback` (single chokepoint for MCP, ACP HTTP, mission tools): governed sessions require a CLAIMED handoff for the exact submission; a superseded routeEpoch is rejected; supervisor-runtime actions remain exempt under mission/autonomy policy. Owner-context normalization unified so claims satisfy gates. | `a091e3a`, `bf240f3` |
+| L02/L03 round ceiling vs progress policy | Round maximum enforced at submission (createHandoff refuses a new round) AND at correction dispatch (onCorrect refuses when paused/exhausted), so progress-based convergence can never exceed the user limit. | `363a02c` |
+| L04 lifecycle controls | `pause/resume/get_review_loop_status` tools + `kontrol review-loop` CLI; CAS-guarded status changes that never alter mode or budget. | `363a02c`, `7f4260a` |
+| C04 oscillation | Unresolved-fingerprint recurrence (A→B→A) escalates to `awaiting_human` with `stallReason: oscillating_verification`; the consecutive counter alone masked it. Schema v71. | `61f636b` |
+| C05 drift warning | `configure_review_loop` warns once when enabling a multi-round pinned review. | `e769d9a` |
+| U01 lifecycle header | Workspace App renders routing mode, round/max, and handoff status; attachment vs decision are distinct; exhausted budget warns. | `3a618f6` |
+| U02 no unsolicited host messages | Verified: no `sendMessage`/`updateModelContext` call sites exist. | audit |
+| Generic ACP registration | `kontrol agent add|list|remove` persists any loopback HTTP ACP peer into durable config (the stdio duplex adapter supplies its HTTP URL), removing per-agent hand-editing. Loopback-only; `--require-healthy` fails closed. | `c8e1a55` |
+
+End-to-end experiments (real processes, real hosts where applicable):
+
+- Experiment A (`scripts/scheduled-job-e2e.mjs`): registers a loopback agent via
+  the production `/acp/agents/register` route, drives a due job through the
+  scheduler, asserts exactly one agent run with work-session correlation, and
+  proves restart survival with no duplicate dispatch. Wired into `test:cold-start`.
+- Experiment B (`scripts/cold-start-messaging-e2e.mjs`): real-process
+  clarification→reply→acknowledge across a full core restart. Schema assertion
+  advanced to v71.
+- Experiments C/D/E (`bridge-flow.test.ts`): pinned 3-round ceiling with a
+  blocked 4th automatic round; loop-OFF fresh isolated handoffs preserving the
+  original work session; mid-flight route change superseding a stale claim.
+
+Still operational (unchanged): 12-hour soak, external ChatGPT host catalog
+qualification, and real-host delivery evidence require a running deployment and
+are gated by `gate:beta`/`gate:beta:final`, not by this source work.
