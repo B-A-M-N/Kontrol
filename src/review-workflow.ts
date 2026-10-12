@@ -31,6 +31,7 @@ export class WorkflowError extends Error {
       | "conflict"
       | "bad_request"
       | "not_pending"
+      | "review_round_limit"
       | "stale_submission"
       | "server_error",
     public readonly httpStatus: number = 400,
@@ -237,6 +238,17 @@ export function createReviewWorkflowService(
       return appended;
     };
     const result = db.sqlite.transaction(() => {
+      // The round budget is authoritative at submission admission. This check is
+      // This outer transaction establishes the deferred read frame. The nested
+      // immediate submission transaction is where concurrent submissions race.
+      const admissionRoute = reviewRoutes?.getRouteBySession(input.workSessionId);
+      if (admissionRoute && admissionRoute.completedReviewRounds >= admissionRoute.maxReviewRounds) {
+        throw new WorkflowError(
+          `Review round limit reached (${admissionRoute.completedReviewRounds}/${admissionRoute.maxReviewRounds}); extend the budget explicitly to submit again.`,
+          "review_round_limit",
+          409,
+        );
+      }
       const submission = workSessions.submitForReview({
         workSessionId: input.workSessionId,
         diff: input.diff,
@@ -270,28 +282,19 @@ export function createReviewWorkflowService(
       });
 
       let handoff: import("./review-handoff/route-store.js").ReviewHandoff | undefined;
-      let routeLimitReached = false;
       if (reviewRoutes) {
-        try {
-          const route = reviewRoutes.getRouteBySession(input.workSessionId);
-          if (route?.status === "active") {
-            handoff = reviewRoutes.createHandoff({
-              routeId: route.id,
-              workSessionId: input.workSessionId,
-              submissionId: submission.id,
-              reviewEpoch: submission.reviewEpoch,
-              snapshotKind: input.snapshotKind ?? "git",
-              snapshotRef: input.snapshotRef ?? input.snapshotCommit ?? "",
-              diffSha256: input.diffSha256 ?? "",
-              roundNumber: route.completedReviewRounds + 1,
-            });
-          } else if (route && route.completedReviewRounds >= route.maxReviewRounds) {
-            routeLimitReached = true;
-          }
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          if (!message.includes("Review round limit reached.")) throw error;
-          routeLimitReached = true;
+        const route = reviewRoutes.getRouteBySession(input.workSessionId);
+        if (route?.status === "active") {
+          handoff = reviewRoutes.createHandoff({
+            routeId: route.id,
+            workSessionId: input.workSessionId,
+            submissionId: submission.id,
+            reviewEpoch: submission.reviewEpoch,
+            snapshotKind: input.snapshotKind ?? "git",
+            snapshotRef: input.snapshotRef ?? input.snapshotCommit ?? "",
+            diffSha256: input.diffSha256 ?? "",
+            roundNumber: route.completedReviewRounds + 1,
+          });
         }
       }
       if (handoff) {
@@ -309,14 +312,7 @@ export function createReviewWorkflowService(
           },
         });
       }
-      if (routeLimitReached) {
-        appendWorkflowEvent({
-          type: "review.loop.limit_reached",
-          sessionId: input.workSessionId,
-          payload: { submissionId: submission.id, reviewEpoch: submission.reviewEpoch },
-        });
-      }
-      return { submission, runId: correlatedRun?.runId, handoff, routeLimitReached };
+      return { submission, runId: correlatedRun?.runId, handoff };
     })();
     eventStore.publishEvents(publishQueue);
 
@@ -331,7 +327,6 @@ export function createReviewWorkflowService(
       handoffId: result.handoff?.id,
       handoffStatus: result.handoff?.status,
       roundNumber: result.handoff?.roundNumber,
-      routeLimitReached: result.routeLimitReached,
     };
   }
 

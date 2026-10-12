@@ -90,7 +90,9 @@ export function registerReviewTools(server: McpServer, config: BridgeConfig): vo
         // Delegate the state transition to the authoritative workflow service
         // (validates status, transitions to awaiting_review, updates the correlated
         // run, and emits review.submitted atomically).
-        const submitted = await config.reviewWorkflow.submitForReview({
+        let submitted;
+        try {
+          submitted = await config.reviewWorkflow.submitForReview({
           workSessionId: sessionId,
           diff: review.patch,
           message: message ?? review.result,
@@ -102,7 +104,13 @@ export function registerReviewTools(server: McpServer, config: BridgeConfig): vo
           snapshotKind: review.snapshotKind,
           snapshotRef: review.snapshotRef,
           snapshotCommit: review.snapshotCommit,
-        });
+          });
+        } catch (error) {
+          if (error instanceof Error && "code" in error && "httpStatus" in error) {
+            return { content: [{ type: "text", text: error.message }], isError: true };
+          }
+          throw error;
+        }
 
         const housekeepingWarnings: string[] = [];
         const recordHousekeepingFailure = (scope: string, error: unknown) => {

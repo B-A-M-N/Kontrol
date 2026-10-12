@@ -1342,19 +1342,18 @@ try {
     await callReviewer("provide_review_feedback", { sessionId, verdict: "changes_requested", comments: "round 3 fix" });
     assert.equal(reviewRoutes.getRouteBySession(sessionId)!.completedReviewRounds, 3, "round 3 consumed the final review round");
 
-    // A 4th submission cannot open a new automatic review round: the route
-    // refuses to create a handoff once the budget is exhausted.
-    await callWorker("submit_for_review", { sessionId });
-    sub = workSessions.get(sessionId)!.latestSubmission!;
-    assert.equal(
-      reviewRoutes.getHandoffBySubmission(sessionId, sub.id, sub.reviewEpoch),
-      undefined,
-      "no 4th handoff is created once the round budget is exhausted",
-    );
-    // The reviewer's ordinary feedback is blocked because there is no claimed
-    // handoff, and the budget itself cannot be exceeded.
-    const overflow = await callReviewer("provide_review_feedback", { sessionId, verdict: "changes_requested", comments: "round 4" });
-    assert.ok(overflow.isError, "a 4th automatic round is blocked at the workflow boundary");
+    // A 4th submission is rejected at admission; it cannot open a new automatic
+    // review round, leave an orphan submission, or consume another round.
+    let fourthSubmission: any;
+    try {
+      fourthSubmission = await callWorker("submit_for_review", { sessionId });
+    } catch (error) {
+      fourthSubmission = { isError: true, content: [{ text: error instanceof Error ? error.message : String(error) }] };
+    }
+    assert.ok(fourthSubmission.isError, "a 4th automatic round is blocked at submission admission");
+    assert.match(String(fourthSubmission.content?.[0]?.text ?? ""), /review round limit reached/i);
+    assert.equal(workSessions.get(sessionId)!.latestSubmission?.submissionNumber, 3, "the budget refusal leaves no orphan submission");
+    assert.equal(reviewRoutes.getRouteBySession(sessionId)!.completedReviewRounds, 3, "the exhausted round count is unchanged");
   }
 
   // ── Experiment D: loop OFF creates fresh isolated handoffs and preserves
@@ -1529,11 +1528,9 @@ try {
     assert.ok(latest?.id && latest.snapshotCommit);
     assert.equal(missionLedger.canApprove(sessionId, { submissionId: latest.id, snapshotCommit: latest.snapshotCommit }).allowed, true, "current final integration report enables approval");
     currentSnapshot = "verification-workspace-mutated";
-    await assert.rejects(
-      () => callReviewer("approve_supervised_work", { workSessionId: sessionId }),
-      /Workspace snapshot changed since submission/,
-      "mission approval refuses a workspace that changed after the verified submission",
-    );
+    const staleApproval = await callReviewer("approve_supervised_work", { workSessionId: sessionId });
+    assert.ok(staleApproval.isError, "mission approval refuses a workspace that changed after the verified submission");
+    assert.match(String(staleApproval.content?.[0]?.text ?? ""), /Workspace snapshot changed since submission/);
     assert.equal(workSessions.get(sessionId)?.status, "awaiting_review", "stale mission approval leaves the exact submission pending");
     currentSnapshot = "verification-snapshot";
     const approved = await callReviewer("approve_supervised_work", { workSessionId: sessionId });

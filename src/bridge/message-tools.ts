@@ -9,7 +9,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { BridgeConfig } from "./context.js";
 import { AGENT_MESSAGE_KINDS } from "../agent-messages.js";
 import { registerMutationAppTool } from "./app-tool.js";
-import { forbidden, isReviewer, isWorkerOrClient, requireWorkerDeliveryBinding, requireWorkSessionMutation, requireWorkSessionRead, workspaceAppModelAndAppMeta } from "./shared.js";
+import { forbidden, isReviewer, requireWorkerDeliveryBinding, requireWorkSessionMutation, requireWorkSessionRead, workspaceAppModelAndAppMeta } from "./shared.js";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
 import { z } from "zod/v4";
 
@@ -36,7 +36,9 @@ export function registerMessageTools(server: McpServer, config: BridgeConfig): v
     },
     config,
     async ({ sessionId, kind, title, body, data, expectsReply, resumeOnReply }) => {
-      if (!isWorkerOrClient(config.principalRole)) {
+      // Agent-message creation is worker-only. Ordinary clients must use a
+      // separately authorized reviewer capability, never this agent-author path.
+      if (config.principalRole !== "worker") {
         return forbidden(config.principalRole, "post_agent_message");
       }
       if (!config.agentMessages) {

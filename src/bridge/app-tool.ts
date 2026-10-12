@@ -26,7 +26,16 @@ export function registerMutationAppTool(
       operation: name,
       clientMutationId,
       request,
-      execute: () => handler(input),
+      execute: async () => {
+        try {
+          return await handler(input);
+        } catch (error) {
+          return {
+            content: [{ type: "text" as const, text: error instanceof Error ? error.message : String(error) }],
+            isError: true as const,
+          };
+        }
+      },
     });
   }) as any);
 }

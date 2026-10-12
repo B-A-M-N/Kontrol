@@ -441,16 +441,29 @@ export function registerMissionTools(server: McpServer, config: BridgeConfig): v
           isError: true,
         };
       }
-      await config.reviewWorkflow.provideFeedback({
-        sessionId: workSessionId,
-        submissionId: latest.id,
-        diffSha256: latest.diffSha256,
-        reviewEpoch: latest.reviewEpoch,
-        verdict: "approve",
-        comments,
-        reviewerId: "webui",
+      try {
+        await config.reviewWorkflow.provideFeedback({
+          sessionId: workSessionId,
+          submissionId: latest.id,
+          diffSha256: latest.diffSha256,
+          reviewEpoch: latest.reviewEpoch,
+          verdict: "approve",
+          comments,
+          reviewerId: "webui",
           completionReportSha256: config.missionLedger.getCompletionReportHash(workSessionId, { submissionId: latest.id, ...snapshotFields(latest), reviewEpoch: latest.reviewEpoch }),
-      });
+        });
+      } catch (error) {
+        return {
+          content: [{ type: "text" as const, text: error instanceof Error ? error.message : String(error) }],
+          structuredContent: {
+            status: "blocked",
+            approved: false,
+            reasons: [error instanceof Error ? error.message : String(error)],
+            packet: await supervisorPacket(config, workSessionId),
+          },
+          isError: true,
+        };
+      }
       const supervisor = config.supervisorRuns?.getByWorkSession(workSessionId);
       if (supervisor) config.supervisorRuns?.transition({ id: supervisor.id, expectedStatus: supervisor.status, expectedRevision: supervisor.revision, nextStatus: "completed" });
       return {
