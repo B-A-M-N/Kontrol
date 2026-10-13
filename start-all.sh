@@ -1062,7 +1062,8 @@ STARTUP_COMMITTED=1
 
 if [[ "$QUALIFY_MODE" == "1" ]]; then
   if ! start_beta_soak_monitor; then
-    echo "[!] The stack is ready, but the beta soak monitor did not start. Fix the reported configuration and launch ./start-all.sh --qualify again." >&2
+    echo "ERROR: application startup is healthy, but --qualify did not start the soak monitor; qualification is not running." >&2
+    exit 1
   fi
 fi
 

@@ -30,6 +30,11 @@ assert.ok(!smokeCurl.includes(doubleSmokeContinuation), "CRUSH smoke curl must n
 assert.match(script, /core-readyz/);
 assert.match(script, /KONTROL_ACP_AGENTS/);
 assert.match(script, /kontrol-supervisor/);
+assert.match(
+  script,
+  /if ! start_beta_soak_monitor; then[\s\S]*--qualify did not start the soak monitor; qualification is not running[\s\S]*exit 1\n\s+fi/,
+  "qualification mode must fail when it cannot start the soak monitor",
+);
 assert.match(script, /scripts\/kontrol-tunnel\.sh/);
 const tunnelScript = readText("scripts/kontrol-tunnel.sh");
 assert.match(tunnelScript, /KONTROL_TUNNEL_PROFILE/);
