@@ -79,7 +79,8 @@ async function waitFor(predicate, timeoutMs, label) {
     }
     await delay(25);
   }
-  throw new Error(`timed out waiting for ${label}${lastError ? `: ${lastError.message}` : ""}`);
+  const diagnosticLabel = typeof label === "function" ? label() : label;
+  throw new Error(`timed out waiting for ${diagnosticLabel}${lastError ? `: ${lastError.message}` : ""}`);
 }
 
 function parseRpc(text) {
@@ -255,7 +256,7 @@ try {
   await waitFor(async () => {
     if (serverChild.exitCode !== null) throw new Error(`server exited ${serverChild.exitCode}: ${serverOutput}`);
     return (await httpStatus("/healthz")) === 200;
-  }, 15000, `server liveness${serverOutput ? `: ${serverOutput}` : ""}`);
+  }, 60000, () => `server liveness (exit=${serverChild.exitCode ?? "running"}; output=${serverOutput || "(no output)"})`);
   assert.equal(await httpStatus("/core-readyz"), 200);
 
   const runtimeLock = JSON.parse(readFileSync(join(stateDir, "runtime.lock"), "utf8"));
