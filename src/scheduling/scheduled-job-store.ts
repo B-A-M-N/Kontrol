@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { z } from "zod/v4";
 import type { DatabaseHandle } from "../db/client.js";
 import type { DispatchOutbox } from "../dispatch-outbox.js";
-import { scheduledJobs, scheduledJobAttempts, type ScheduledJobRow } from "../db/schema.js";
+import { scheduledJobs, scheduledJobAttempts, scheduledJobReports, type ScheduledJobRow } from "../db/schema.js";
 import { createHash } from "node:crypto";
 import { and, asc, desc, eq, gt, isNull, lt, sql } from "drizzle-orm";
 import type { EventStoreEvent } from "../event-log.js";
@@ -69,6 +69,8 @@ export interface ScheduledJobStore {
   recordCancellationEvidence(input: { jobId: string; requestId: string; state: "not_dispatched" | "worker_active" | "termination_acknowledged" | "remote_missing" | "worker_stopped" | "worker_cancelled" | "unknown"; lastError?: string }): ScheduledJob;
   finalizeCancellation(input: { jobId: string; requestId: string; lastConfirmedState: "not_dispatched" | "remote_missing" | "worker_stopped" | "worker_cancelled"; reason?: string }): ScheduledJob;
   getAttempt(jobId: string, attemptId?: string): ScheduledJobAttempt | undefined;
+  persistReport(jobId: string, runId: string, reportText: string): ScheduledJobReport;
+  getReport(jobId: string, reportSha256: string): ScheduledJobReport | undefined;
   transition(input: ScheduledStateTransition): ScheduledJob;
   /** Atomically fence one external dispatch attempt. */
   claimDispatch(input: {
@@ -94,6 +96,10 @@ export interface ScheduledJobStore {
     dispatcherInstanceId: string;
     workSessionId?: string;
     acpRunId?: string;
+    acpDispatchId?: string;
+    acpAttemptNumber?: number;
+    acpRemoteRunId?: string;
+    executionReceipt?: object;
     lastError?: string;
   }): ScheduledJob;
   /** Resolve an uncertain launch after authoritative run/adapter evidence. */
@@ -104,6 +110,10 @@ export interface ScheduledJobStore {
     resolution: "accepted" | "unstarted" | "failed" | "completed" | "cancelled" | "operator_intervention";
     workSessionId?: string;
     acpRunId?: string;
+    acpDispatchId?: string;
+    acpAttemptNumber?: number;
+    acpRemoteRunId?: string;
+    executionReceipt?: object;
     lastError?: string;
   }): ScheduledJob;
   /** Atomically project a durable lifecycle event and advance its sequence cursor. */
@@ -144,13 +154,30 @@ export interface ScheduledJobAttempt {
   jobId: string;
   dispatchId: string;
   startedAt: string;
+  executionStartedAt?: string;
+  executionActiveSince?: string;
+  activeRuntimeMs: number;
+  executionStoppedAt?: string;
+  executionReceipt?: Record<string, unknown>;
   completedAt?: string;
   transportStatus: string;
   dispatcherInstanceId?: string;
   leaseExpiresAt?: string;
   agentName?: string;
   acpRunId?: string;
+  acpDispatchId?: string;
+  acpAttemptNumber?: number;
+  acpRemoteRunId?: string;
   outcome?: string;
+}
+
+export interface ScheduledJobReport {
+  id: string;
+  jobId: string;
+  runId: string;
+  reportSha256: string;
+  reportText: string;
+  createdAt: string;
 }
 
 const nonEmptyString = z.string().trim().min(1).max(1024);
@@ -407,6 +434,10 @@ export function createScheduledJobStore(
     dispatcherInstanceId: string;
     workSessionId?: string;
     acpRunId?: string;
+    acpDispatchId?: string;
+    acpAttemptNumber?: number;
+    acpRemoteRunId?: string;
+    executionReceipt?: object;
     lastError?: string;
   }): ScheduledJob {
     const nextStatus = input.outcome === "dispatched" ? "running" : input.outcome === "uncertain" ? "uncertain_dispatch" : "failed";
@@ -416,11 +447,17 @@ export function createScheduledJobStore(
       const current = database.db.select().from(scheduledJobs)
         .where(eq(scheduledJobs.id, input.jobId)).limit(1).all()[0];
       const cancellationPending = current?.status === "cancellation_requested" && Boolean(current.cancellationRequestId);
+      const lifecycleAdvanced = Boolean(current
+        && current.activeDispatchAttemptId === input.dispatchAttemptId
+        && (current.status === "awaiting_approval"
+          || (current.status === "running" && current.lifecycleEventCursor > 0)));
       if (!current || current.activeDispatchAttemptId !== input.dispatchAttemptId
-        || (!cancellationPending && (current.status !== "dispatching" || current.revision !== input.expectedRevision))) {
+        || (!cancellationPending && !lifecycleAdvanced && (current.status !== "dispatching" || current.revision !== input.expectedRevision))) {
         throw new Error(`Scheduled dispatch completion conflict for ${input.jobId} attempt ${input.dispatchAttemptId}.`);
       }
-      const effectiveStatus = cancellationPending ? "cancellation_requested" : nextStatus;
+      const effectiveStatus = cancellationPending ? "cancellation_requested"
+        : lifecycleAdvanced ? current.status
+          : nextStatus;
       const jobUpdate = database.db.update(scheduledJobs)
         .set({
           status: effectiveStatus,
@@ -436,7 +473,7 @@ export function createScheduledJobStore(
         .where(and(
           eq(scheduledJobs.id, input.jobId),
           eq(scheduledJobs.revision, current.revision),
-          sql`${scheduledJobs.status} in ('dispatching','cancellation_requested')`,
+          sql`${scheduledJobs.status} in ('dispatching','running','awaiting_approval','cancellation_requested')`,
           eq(scheduledJobs.activeDispatchAttemptId, input.dispatchAttemptId),
         ))
         .run();
@@ -446,6 +483,10 @@ export function createScheduledJobStore(
           transportStatus: input.outcome === "dispatched" ? "accepted" : uncertain ? "uncertain" : "rejected",
           outcome: null,
           acpRunId: input.acpRunId ?? null,
+          acpDispatchId: input.acpDispatchId ?? null,
+          acpAttemptNumber: input.acpAttemptNumber ?? null,
+          acpRemoteRunId: input.acpRemoteRunId ?? null,
+          executionReceiptJson: input.executionReceipt ? JSON.stringify(input.executionReceipt) : null,
         })
         .where(and(
           eq(scheduledJobAttempts.id, input.dispatchAttemptId),
@@ -471,6 +512,10 @@ export function createScheduledJobStore(
     resolution: "accepted" | "unstarted" | "failed" | "completed" | "cancelled" | "operator_intervention";
     workSessionId?: string;
     acpRunId?: string;
+    acpDispatchId?: string;
+    acpAttemptNumber?: number;
+    acpRemoteRunId?: string;
+    executionReceipt?: object;
     lastError?: string;
   }): ScheduledJob {
     const now = new Date().toISOString();
@@ -517,6 +562,10 @@ export function createScheduledJobStore(
         transportStatus,
         outcome: executionOutcome,
         acpRunId: input.acpRunId ?? undefined,
+        acpDispatchId: input.acpDispatchId ?? undefined,
+        acpAttemptNumber: input.acpAttemptNumber ?? undefined,
+        acpRemoteRunId: input.acpRemoteRunId ?? undefined,
+        executionReceiptJson: input.executionReceipt ? JSON.stringify(input.executionReceipt) : undefined,
       }).where(and(
         eq(scheduledJobAttempts.id, input.dispatchAttemptId),
         eq(scheduledJobAttempts.jobId, input.jobId),
@@ -542,10 +591,60 @@ export function createScheduledJobStore(
         .get();
       if (!row || event.seq <= row.lifecycleEventCursor) return row;
       const currentStatus = row.status as ScheduledJobStatus;
+      let activeAttempt = row.activeDispatchAttemptId
+        ? database.db.select().from(scheduledJobAttempts).where(eq(scheduledJobAttempts.id, row.activeDispatchAttemptId)).limit(1).get()
+        : undefined;
+      const eventAttemptNumber = typeof event.payload.attemptNumber === "number" && Number.isInteger(event.payload.attemptNumber)
+        ? event.payload.attemptNumber
+        : undefined;
+      const eventRunId = typeof event.payload.runId === "string" ? event.payload.runId : undefined;
+      const eventDispatchId = typeof event.payload.dispatchId === "string" ? event.payload.dispatchId : undefined;
+      const eventRemoteRunId = typeof event.payload.remoteRunId === "string" ? event.payload.remoteRunId : undefined;
+      // The ACP HTTP boundary has already authenticated the worker and checked
+      // its attempt against the registry. Persist a strictly newer attempt
+      // identity monotonically so a delayed older exit cannot stop it later.
+      const bindsInitialAttempt = Boolean(activeAttempt && !activeAttempt.acpRunId
+        && eventRunId && eventDispatchId === activeAttempt.dispatchId && eventAttemptNumber);
+      const advancesAttempt = Boolean(activeAttempt && eventAttemptNumber && eventRunId === activeAttempt.acpRunId
+        && (!activeAttempt.acpAttemptNumber || eventAttemptNumber > activeAttempt.acpAttemptNumber)
+        && eventDispatchId);
+      if (activeAttempt && eventAttemptNumber && eventRunId && eventDispatchId && (bindsInitialAttempt || advancesAttempt)) {
+        database.db.update(scheduledJobAttempts).set({
+          acpRunId: bindsInitialAttempt ? eventRunId : undefined,
+          acpDispatchId: eventDispatchId,
+          acpAttemptNumber: eventAttemptNumber,
+          acpRemoteRunId: eventRemoteRunId ?? null,
+        }).where(eq(scheduledJobAttempts.id, activeAttempt.id)).run();
+        activeAttempt = database.db.select().from(scheduledJobAttempts).where(eq(scheduledJobAttempts.id, activeAttempt.id)).limit(1).get();
+      }
       const projection = projectScheduledJobLifecycleEvent(currentStatus, event, {
         requestedAt: row.cancellationRequestedAt ?? undefined,
         previousStatus: row.cancellationPreviousStatus ?? undefined,
-      });
+      }, activeAttempt ? {
+        dispatchId: activeAttempt.acpDispatchId ?? activeAttempt.dispatchId,
+        runId: activeAttempt.acpRunId ?? undefined,
+        attemptNumber: activeAttempt.acpAttemptNumber ?? undefined,
+        remoteRunId: activeAttempt.acpRemoteRunId ?? undefined,
+      } : {});
+      const eventAt = Date.parse(event.createdAt);
+      if (activeAttempt && Number.isFinite(eventAt) && (projection.executionStarted || projection.executionPaused || projection.executionStopped || projection.finalWorkerOutcome)) {
+        if (projection.executionStarted) {
+          database.db.update(scheduledJobAttempts).set({
+            executionStartedAt: activeAttempt.executionStartedAt ?? event.createdAt,
+            executionActiveSince: activeAttempt.executionActiveSince ?? event.createdAt,
+            executionStoppedAt: null,
+          }).where(eq(scheduledJobAttempts.id, activeAttempt.id)).run();
+        } else {
+          const activeSince = activeAttempt.executionActiveSince ? Date.parse(activeAttempt.executionActiveSince) : Number.NaN;
+          const additionalRuntime = Number.isFinite(activeSince) ? Math.max(0, eventAt - activeSince) : 0;
+          database.db.update(scheduledJobAttempts).set({
+            activeRuntimeMs: Math.max(0, Number(activeAttempt.activeRuntimeMs ?? 0)) + additionalRuntime,
+            executionActiveSince: null,
+            executionStoppedAt: event.createdAt,
+          }).where(eq(scheduledJobAttempts.id, activeAttempt.id)).run();
+        }
+        activeAttempt = database.db.select().from(scheduledJobAttempts).where(eq(scheduledJobAttempts.id, activeAttempt.id)).limit(1).get();
+      }
       const updated = database.db.update(scheduledJobs).set({
         status: projection.nextStatus,
         revision: projection.nextStatus ? row.revision + 1 : row.revision,
@@ -567,20 +666,15 @@ export function createScheduledJobStore(
           update scheduled_job_attempts
              set completed_at = coalesce(completed_at, ?),
                  outcome = case when ? is null then outcome else ? end,
-                 transport_status = case when transport_status = 'uncertain' then 'accepted' else transport_status end
-           where id = (
-             select id from scheduled_job_attempts
-              where job_id = ?
-                and (? is null or acp_run_id = ?)
-              order by started_at desc, id desc limit 1
-           )
+                 transport_status = case when transport_status = 'uncertain' then 'accepted' else transport_status end,
+                 acp_run_id = coalesce(acp_run_id, ?)
+             where id = ?
         `).run(
           completedAt,
           projection.finalWorkerOutcome ?? null,
           projection.finalWorkerOutcome ?? null,
-          row.id,
           runId ?? null,
-          runId ?? null,
+          activeAttempt?.id ?? "",
         );
       }
 
@@ -593,7 +687,7 @@ export function createScheduledJobStore(
     return database.db.select().from(scheduledJobs)
       .where(and(
         gt(scheduledJobs.id, afterJobId),
-        sql`${scheduledJobs.status} in ('running','uncertain_dispatch','awaiting_approval','cancellation_requested')`,
+        sql`${scheduledJobs.status} in ('running','uncertain_dispatch','awaiting_approval','cancellation_requested','operator_intervention')`,
         sql`${scheduledJobs.workSessionId} is not null`,
       ))
       .orderBy(asc(scheduledJobs.id))
@@ -719,19 +813,75 @@ export function createScheduledJobStore(
         .where(eq(scheduledJobAttempts.jobId, jobId))
         .orderBy(desc(scheduledJobAttempts.startedAt), desc(scheduledJobAttempts.id))
         .limit(1).all()[0];
+    let executionReceipt: Record<string, unknown> | undefined;
+    if (row?.executionReceiptJson) {
+      try {
+        const parsed: unknown = JSON.parse(row.executionReceiptJson);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) executionReceipt = parsed as Record<string, unknown>;
+      } catch { /* corrupt optional receipt remains visibly absent */ }
+    }
     return row ? {
       id: row.id,
       jobId: row.jobId,
       dispatchId: row.dispatchId,
       startedAt: row.startedAt,
+      executionStartedAt: row.executionStartedAt ?? undefined,
+      executionActiveSince: row.executionActiveSince ?? undefined,
+      activeRuntimeMs: row.activeRuntimeMs ?? 0,
+      executionStoppedAt: row.executionStoppedAt ?? undefined,
+      executionReceipt,
       completedAt: row.completedAt ?? undefined,
       transportStatus: row.transportStatus,
       dispatcherInstanceId: row.dispatcherInstanceId ?? undefined,
       leaseExpiresAt: row.leaseExpiresAt ?? undefined,
       agentName: row.agentName ?? undefined,
       acpRunId: row.acpRunId ?? undefined,
+      acpDispatchId: row.acpDispatchId ?? undefined,
+      acpAttemptNumber: row.acpAttemptNumber ?? undefined,
+      acpRemoteRunId: row.acpRemoteRunId ?? undefined,
       outcome: row.outcome ?? undefined,
     } : undefined;
+  }
+
+  function persistReport(jobId: string, runId: string, reportText: string): ScheduledJobReport {
+    if (!get(jobId)) throw new Error(`Unknown scheduled job: ${jobId}`);
+    if (!runId.trim()) throw new Error("Scheduled report requires a correlated ACP run ID.");
+    if (Buffer.byteLength(reportText, "utf8") > 8 * 1024 * 1024) {
+      throw new Error("Scheduled report exceeds the 8 MiB immutable artifact limit.");
+    }
+    const reportSha256 = createHash("sha256").update(reportText, "utf8").digest("hex");
+    const now = new Date().toISOString();
+    database.sqlite.transaction(() => {
+      database.db.insert(scheduledJobReports).values({
+        id: `sched_report_${randomUUID()}`,
+        jobId,
+        runId,
+        reportSha256,
+        reportText,
+        createdAt: now,
+      }).onConflictDoNothing({ target: [scheduledJobReports.jobId, scheduledJobReports.runId] }).run();
+      const existing = database.db.select().from(scheduledJobReports).where(and(
+        eq(scheduledJobReports.jobId, jobId),
+        eq(scheduledJobReports.runId, runId),
+      )).limit(1).get();
+      if (!existing || existing.reportSha256 !== reportSha256) {
+        throw new Error("Scheduled ACP report changed after its immutable artifact was recorded.");
+      }
+    })();
+    const row = database.db.select().from(scheduledJobReports).where(and(
+      eq(scheduledJobReports.jobId, jobId),
+      eq(scheduledJobReports.runId, runId),
+    )).limit(1).get();
+    if (!row) throw new Error("Scheduled report artifact could not be persisted.");
+    return row;
+  }
+
+  function getReport(jobId: string, reportSha256: string): ScheduledJobReport | undefined {
+    const row = database.db.select().from(scheduledJobReports).where(and(
+      eq(scheduledJobReports.jobId, jobId),
+      eq(scheduledJobReports.reportSha256, reportSha256),
+    )).limit(1).get();
+    return row ?? undefined;
   }
 
   function transition(input: ScheduledStateTransition): ScheduledJob {
@@ -785,6 +935,8 @@ export function createScheduledJobStore(
     recordCancellationEvidence,
     finalizeCancellation,
     getAttempt,
+    persistReport,
+    getReport,
     transition,
     claimDispatch,
     releaseDispatch,

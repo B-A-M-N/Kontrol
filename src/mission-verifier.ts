@@ -460,7 +460,7 @@ interface VerificationWorkspace {
  * commands may write there, but the reviewed checkout and its ignored files
  * are never their working directory.
  */
-async function createVerificationWorkspace(
+export async function createVerificationWorkspace(
   workspaceId: string,
   workspaceRoot: string,
   snapshot: WorkspaceSnapshot,

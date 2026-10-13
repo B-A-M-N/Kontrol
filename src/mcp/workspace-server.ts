@@ -110,6 +110,7 @@ export function createMcpServer(
     acceptedAt: string;
     reason?: string;
   }) => void,
+  reconcileScheduledJob?: (jobId: string) => Promise<import("../scheduling/scheduled-job-store.js").ScheduledJob | undefined>,
 ): McpServer {
   // note: parameters remain in declared order; scheduledJobs precedes reviewRoutes.
   const serverConstructionStartedAt = performance.now();
@@ -240,6 +241,7 @@ export function createMcpServer(
       liveWaiters,
       onPhaseTiming,
       scheduledJobs,
+      reconcileScheduledJob,
       reviewRoutes,
     };
     registerBridgeTools(server, bridgeConfig);

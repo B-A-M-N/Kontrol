@@ -292,6 +292,105 @@ try {
     assert.equal(jobs.get(terminalJob.id)?.workSessionId, "ws-terminal");
   }
 
+  // Active runtime accounting pauses during reviewer wait and resumes only on
+  // an authenticated start event for the current attempt.
+  {
+    const makeActiveJob = (suffix: string, maxRuntimeMs: number) => {
+      const job = jobs.create({
+        principalId: "user-a",
+        ownerContextId: "owner-a",
+        projectId: "project-a",
+        workspaceRoot: "/tmp/project-a",
+        runAt: new Date(Date.now() - 1_000).toISOString(),
+        instructionJson: { instructions: "Account only active worker time." },
+        executionMode: "read_only_audit",
+        policySnapshotJson: { workspaceAccess: "read_only" },
+        maxRuntimeMs,
+        workSessionId: `ws-runtime-${suffix}`,
+      });
+      jobs.transition({ jobId: job.id, expectedRevision: job.revision, nextStatus: "due", expectedSourceStatuses: ["pending"] });
+      const claim = jobs.claimDispatch({ jobId: job.id, expectedRevision: 2, dispatcherInstanceId: `runtime-${suffix}` });
+      jobs.completeDispatch({
+        jobId: job.id,
+        dispatchAttemptId: claim.attemptId,
+        expectedRevision: claim.revision,
+        dispatcherInstanceId: `runtime-${suffix}`,
+        outcome: "dispatched",
+        workSessionId: `ws-runtime-${suffix}`,
+        acpRunId: `run-runtime-${suffix}`,
+        acpDispatchId: claim.dispatchId,
+        acpAttemptNumber: 1,
+        acpRemoteRunId: `remote-runtime-${suffix}`,
+      });
+      return { job, claim };
+    };
+    const startEvent = (suffix: string, dispatchId: string, seq: number, createdAt: string) => ({
+      id: `start-${suffix}-${seq}`,
+      seq,
+      durable: true,
+      type: "agent.run.started",
+      sessionId: `ws-runtime-${suffix}`,
+      payload: {
+        runId: `run-runtime-${suffix}`,
+        dispatchId,
+        attemptNumber: 1,
+        remoteRunId: `remote-runtime-${suffix}`,
+      },
+      createdAt,
+    });
+
+    const overdue = makeActiveJob("overdue", 1_000);
+    jobs.projectEvent(startEvent("overdue", overdue.claim.dispatchId, 1, new Date(Date.now() - 5_000).toISOString()) as any);
+    const deadlineRuntime = createScheduledJobRuntime({ database: db, jobs, pollMs: 60_000 });
+    await deadlineRuntime.drainOnce();
+    assert.equal(jobs.get(overdue.job.id)?.status, "cancellation_requested",
+      "a worker exceeding maxRuntimeMs while actively executing receives a durable cancellation request");
+
+    const reviewWait = makeActiveJob("review-wait", 1_000);
+    const startAt = new Date(Date.now() - 20_000).toISOString();
+    jobs.projectEvent(startEvent("review-wait", reviewWait.claim.dispatchId, 1, startAt) as any);
+    jobs.projectEvent({
+      id: "review-submitted-runtime",
+      seq: 2,
+      durable: true,
+      type: "review.submitted",
+      sessionId: "ws-runtime-review-wait",
+      payload: {
+        runId: "run-runtime-review-wait",
+        dispatchId: reviewWait.claim.dispatchId,
+        attemptNumber: 1,
+        remoteRunId: "remote-runtime-review-wait",
+      },
+      createdAt: new Date(Date.now() - 10_000).toISOString(),
+    });
+    const reviewWaitRuntime = createScheduledJobRuntime({ database: db, jobs, pollMs: 60_000 });
+    await reviewWaitRuntime.drainOnce();
+    const waiting = jobs.get(reviewWait.job.id)!;
+    const waitingAttempt = jobs.getAttempt(reviewWait.job.id)!;
+    assert.equal(waiting.status, "awaiting_approval");
+    assert.equal(waitingAttempt.executionActiveSince, undefined, "review submission closes the active execution segment");
+    assert.ok(waitingAttempt.activeRuntimeMs >= 10_000, "only the completed worker segment contributes to active runtime");
+    assert.equal(waiting.status, "awaiting_approval", "review wait beyond maxRuntimeMs does not request worker cancellation");
+
+    const resumeAt = new Date().toISOString();
+    jobs.projectEvent({
+      id: "resume-runtime-review-wait",
+      seq: 3,
+      durable: true,
+      type: "agent.run.started",
+      sessionId: "ws-runtime-review-wait",
+      payload: {
+        runId: "run-runtime-review-wait",
+        dispatchId: "runtime-resume-dispatch",
+        attemptNumber: 2,
+        remoteRunId: "remote-runtime-review-wait-2",
+      },
+      createdAt: resumeAt,
+    } as any);
+    assert.equal(jobs.get(reviewWait.job.id)?.status, "running", "a new current attempt resumes an awaiting review job");
+    assert.equal(jobs.getAttempt(reviewWait.job.id)?.executionActiveSince, resumeAt, "resumed work starts a new active segment");
+  }
+
   // ── P0-04: dispatch completion/release is fenced by the exact attempt.
   {
     const fencedJob = jobs.create({
@@ -476,7 +575,7 @@ try {
       jobs.projectEvent({ id: `late-approval-${activeState}`, seq: 1, durable: true, type: "agent.run.approved", sessionId: active.workSessionId!, payload: {}, createdAt: afterIntent });
       assert.equal(jobs.get(active.id)?.status, "cancellation_requested", "a late approval cannot erase a prior cancellation intent");
       jobs.projectEvent({ id: `confirmed-cancel-${activeState}`, seq: 2, durable: true, type: "agent.run.cancelled", sessionId: active.workSessionId!, payload: {}, createdAt: new Date(Date.parse(afterIntent) + 1_000).toISOString() });
-      assert.equal(jobs.get(active.id)?.status, "cancelled", "the canonical worker-cancelled event confirms terminal cancellation");
+      assert.equal(jobs.get(active.id)?.status, "cancellation_requested", "a lifecycle event without a current attempt identity cannot confirm worker shutdown");
     }
 
     for (const terminalWorkerEvent of ["worker.turn.completed", "worker.attempt.failed", "worker.attempt.exited", "agent.run.failed"] as const) {
@@ -513,12 +612,61 @@ try {
         payload: {},
         createdAt: new Date(Date.parse(cancellation.cancellationRequestedAt!) + 1_000).toISOString(),
       };
-      const resolved = jobs.projectEvent(exitEvent);
-      assert.equal(resolved?.status, "cancelled", `${terminalWorkerEvent} confirms shutdown while preserving cancellation intent`);
-      const revision = resolved?.revision;
-      const replayed = jobs.projectEvent(exitEvent);
-      assert.equal(replayed?.revision, revision, `${terminalWorkerEvent} replay is idempotent`);
+      const unresolved = jobs.projectEvent(exitEvent);
+      assert.equal(unresolved?.status, "cancellation_requested", `${terminalWorkerEvent} without attempt identity cannot confirm shutdown`);
     }
+
+    const attemptJob = jobs.create({
+      principalId: "user-a",
+      ownerContextId: "owner-a",
+      projectId: "project-a",
+      workspaceRoot: "/tmp/project-a",
+      runAt: new Date(Date.now() - 1_000).toISOString(),
+      instructionJson: { instructions: "Cancel exact current attempt." },
+      executionMode: "read_only_audit",
+      policySnapshotJson: { workspaceAccess: "read_only" },
+      maxRuntimeMs: 60_000,
+    });
+    jobs.transition({ jobId: attemptJob.id, expectedRevision: attemptJob.revision, nextStatus: "due", expectedSourceStatuses: ["pending"] });
+    const attemptClaim = jobs.claimDispatch({ jobId: attemptJob.id, expectedRevision: 2, dispatcherInstanceId: "test-scheduler" });
+    const activeRun = jobs.completeDispatch({
+      jobId: attemptJob.id,
+      dispatchAttemptId: attemptClaim.attemptId,
+      expectedRevision: attemptClaim.revision,
+      dispatcherInstanceId: "test-scheduler",
+      outcome: "dispatched",
+      workSessionId: "ws-current-attempt",
+      acpRunId: "run-current-attempt",
+      acpDispatchId: attemptClaim.dispatchId,
+      acpAttemptNumber: 2,
+      acpRemoteRunId: "remote-current-attempt",
+    });
+    const cancellation = jobs.requestCancellation({ jobId: activeRun.id, expectedRevision: activeRun.revision, requestId: "cancel-current-attempt" });
+    const staleExit = jobs.projectEvent({
+      id: "stale-attempt-exit",
+      seq: 1,
+      durable: true,
+      type: "worker.attempt.exited",
+      sessionId: "ws-current-attempt",
+      payload: { runId: "run-current-attempt", dispatchId: "old-dispatch", attemptNumber: 1, remoteRunId: "remote-old" },
+      createdAt: new Date(Date.parse(cancellation.cancellationRequestedAt!) + 1_000).toISOString(),
+    });
+    assert.equal(staleExit?.status, "cancellation_requested", "a delayed older exit cannot confirm the current worker stopped");
+    const currentExit = jobs.projectEvent({
+      id: "current-attempt-exit",
+      seq: 2,
+      durable: true,
+      type: "worker.attempt.exited",
+      sessionId: "ws-current-attempt",
+      payload: {
+        runId: "run-current-attempt",
+        dispatchId: attemptClaim.dispatchId,
+        attemptNumber: 2,
+        remoteRunId: "remote-current-attempt",
+      },
+      createdAt: new Date(Date.parse(cancellation.cancellationRequestedAt!) + 2_000).toISOString(),
+    });
+    assert.equal(currentExit?.status, "cancelled", "the exact current attempt can confirm cancellation");
 
     const cancelRoot = await mkdtemp(join(tmpdir(), "kontrol-cancel-restart-"));
     let cancelDb = openDatabase(cancelRoot);
@@ -601,6 +749,20 @@ try {
         outcome: "uncertain",
         workSessionId: "ws-lost-response",
         acpRunId: "run-original",
+        acpDispatchId: claim.dispatchId,
+        acpAttemptNumber: 1,
+        executionReceipt: {
+          issuer: "kontrol",
+          work_session_id: "ws-lost-response",
+          workspace_session_id: "project-a",
+          parent_run_id: "run-original",
+          remote_run_id: "remote-original",
+          attempt_number: 1,
+          dispatch_idempotency_key: claim.dispatchId,
+          grant_expires_at: Date.now() + 60_000,
+          grant_fingerprint: "b".repeat(64),
+          confinement: "bubblewrap-read-only-workspace-no-network",
+        },
       });
       firstOutbox.close();
       firstDb.close();
@@ -608,6 +770,8 @@ try {
       const restartedDb = openDatabase(recoveryRoot);
       const restartedOutbox = createDispatchOutbox(restartedDb);
       const restartedJobs = createScheduledJobStore(restartedDb, restartedOutbox);
+      assert.equal(restartedJobs.getAttempt(lostResponseJob.id)?.executionReceipt?.dispatch_idempotency_key, claim.dispatchId,
+        "the exact read-only execution receipt survives a server restart with its dispatch attempt");
       const events = createEventStore(restartedDb);
       let reconciliationCalls = 0;
       const runtime = createScheduledJobRuntime({
@@ -620,7 +784,7 @@ try {
           reconciliationCalls++;
           assert.equal(input.dispatchId, claim.dispatchId);
           assert.equal(input.dispatchAttemptId, claim.attemptId);
-          return { status: "accepted", workSessionId: "ws-lost-response", runId: "run-original" };
+          return { status: "accepted", workSessionId: "ws-lost-response", runId: "run-original", dispatchId: claim.dispatchId, attemptNumber: 1 };
         },
       });
       assert.equal(runtime.getMetrics().uncertainLaunches, 1,
@@ -632,14 +796,15 @@ try {
       assert.equal(runtime.getMetrics().uncertainLaunches, 0,
         "authoritative acceptance removes the launch from the uncertain metric");
 
-      restartedDb.sqlite.prepare("update scheduled_job_attempts set started_at = ? where id = ?")
-        .run(new Date(Date.now() - 120_000).toISOString(), claim.attemptId);
-      events.appendEvent({ type: "agent.run.completed", sessionId: "ws-lost-response", payload: { runId: "run-original" } });
+      events.appendEvent({ type: "agent.run.started", sessionId: "ws-lost-response", payload: { runId: "run-original", dispatchId: claim.dispatchId, attemptNumber: 1, remoteRunId: "remote-original" } });
+      events.appendEvent({ type: "agent.run.completed", sessionId: "ws-lost-response", payload: { runId: "run-original", dispatchId: claim.dispatchId, attemptNumber: 1, remoteRunId: "remote-original" } });
       await runtime.drainOnce();
       assert.equal(restartedJobs.get(lostResponseJob.id)?.status, "running", "worker turn completion cannot claim review approval");
-      const finishedAttempt = restartedDb.sqlite.prepare("select completed_at, outcome from scheduled_job_attempts where id = ?")
-        .get(claim.attemptId) as { completed_at: string | null; outcome: string | null };
-      assert.ok(finishedAttempt.completed_at, "worker completion closes the execution runtime window");
+      const finishedAttempt = restartedDb.sqlite.prepare("select completed_at, outcome, execution_active_since, execution_stopped_at from scheduled_job_attempts where id = ?")
+        .get(claim.attemptId) as { completed_at: string | null; outcome: string | null; execution_active_since: string | null; execution_stopped_at: string | null };
+      assert.equal(finishedAttempt.completed_at, null, "a worker turn pauses the attempt but keeps it open for review or continuation");
+      assert.equal(finishedAttempt.execution_active_since, null, "worker completion closes the active runtime segment");
+      assert.ok(finishedAttempt.execution_stopped_at, "worker completion persists its execution stop boundary");
       assert.equal(finishedAttempt.outcome, null, "worker completion remains distinct from reviewer approval");
 
       const submitted = events.appendEvent({ type: "review.submitted", sessionId: "ws-lost-response", payload: { runId: "run-original", submissionId: "sub-original" } });
@@ -671,6 +836,132 @@ try {
     } finally {
       await rm(recoveryRoot, { recursive: true, force: true });
     }
+  }
+
+  // Reviewer reconciliation reattaches the original uncertain run and never
+  // dispatches a replacement; durable late lifecycle evidence still resolves it.
+  {
+    const operatorJob = jobs.create({
+      principalId: "user-a",
+      ownerContextId: "owner-a",
+      projectId: "project-a",
+      workspaceRoot: "/tmp/project-a",
+      runAt: new Date(Date.now() - 1_000).toISOString(),
+      instructionJson: { instructions: "Reconcile original dispatch." },
+      executionMode: "read_only_audit",
+      policySnapshotJson: { workspaceAccess: "read_only" },
+      maxRuntimeMs: 60_000,
+    });
+    jobs.transition({ jobId: operatorJob.id, expectedRevision: 1, nextStatus: "due", expectedSourceStatuses: ["pending"] });
+    const operatorClaim = jobs.claimDispatch({ jobId: operatorJob.id, expectedRevision: 2, dispatcherInstanceId: "test-scheduler" });
+    const uncertain = jobs.completeDispatch({
+      jobId: operatorJob.id,
+      dispatchAttemptId: operatorClaim.attemptId,
+      expectedRevision: operatorClaim.revision,
+      dispatcherInstanceId: "test-scheduler",
+      outcome: "uncertain",
+      workSessionId: "ws-operator-intervention",
+      acpRunId: "run-operator-intervention",
+      acpDispatchId: operatorClaim.dispatchId,
+      acpAttemptNumber: 1,
+      acpRemoteRunId: "remote-operator-intervention",
+    });
+    const operatorState = jobs.resolveDispatch({
+      jobId: operatorJob.id,
+      dispatchAttemptId: operatorClaim.attemptId,
+      expectedRevision: uncertain.revision,
+      resolution: "operator_intervention",
+      workSessionId: "ws-operator-intervention",
+      acpRunId: "run-operator-intervention",
+      acpDispatchId: operatorClaim.dispatchId,
+      acpAttemptNumber: 1,
+      acpRemoteRunId: "remote-operator-intervention",
+    });
+    assert.equal(operatorState.status, "operator_intervention");
+    const interventionMetrics = createScheduledJobRuntime({ database: db, jobs, pollMs: 60_000 }).getMetrics();
+    assert.ok(interventionMetrics.operatorInterventionJobs >= 1,
+      "authenticated scheduler diagnostics count jobs that need operator reconciliation");
+    assert.ok(interventionMetrics.serviceability.reasons.some((reason) => /operator reconciliation/.test(reason)),
+      "operator intervention degrades scheduler serviceability without changing process liveness");
+    let dispatchCalls = 0;
+    const reconciliation = createScheduledJobRuntime({
+      database: db,
+      jobs,
+      pollMs: 60_000,
+      dispatch: async () => { dispatchCalls++; return { status: "dispatched" }; },
+      reconcileDispatch: async ({ dispatchId }) => {
+        assert.equal(dispatchId, operatorClaim.dispatchId);
+        return {
+          status: "accepted",
+          workSessionId: "ws-operator-intervention",
+          runId: "run-operator-intervention",
+          remoteRunId: "remote-operator-intervention",
+          dispatchId: operatorClaim.dispatchId,
+          attemptNumber: 1,
+        };
+      },
+    });
+    const recovered = await reconciliation.reconcileJob(operatorJob.id);
+    assert.equal(recovered?.status, "running", "authoritative adapter lookup reattaches the original run");
+    assert.equal(dispatchCalls, 0, "manual reconciliation never launches a second worker");
+    const lateTerminal = jobs.projectEvent({
+      id: "late-original-terminal",
+      seq: 1,
+      durable: true,
+      type: "agent.run.failed",
+      sessionId: "ws-operator-intervention",
+      payload: {
+        runId: "run-operator-intervention",
+        dispatchId: operatorClaim.dispatchId,
+        attemptNumber: 1,
+        remoteRunId: "remote-operator-intervention",
+      },
+      createdAt: new Date().toISOString(),
+    });
+    assert.equal(lateTerminal?.status, "failed", "late terminal evidence for the recovered original run remains projectable");
+
+    const diagnosticJob = jobs.create({
+      principalId: "user-a",
+      ownerContextId: "owner-a",
+      projectId: "project-a",
+      workspaceRoot: "/tmp/project-a",
+      runAt: new Date(Date.now() - 1_000).toISOString(),
+      instructionJson: { instructions: "Exercise scheduler failure diagnostics." },
+      executionMode: "read_only_audit",
+      policySnapshotJson: { workspaceAccess: "read_only" },
+      workSessionId: "ws-scheduler-diagnostic",
+      maxRuntimeMs: 60_000,
+    });
+    jobs.transition({ jobId: diagnosticJob.id, expectedRevision: diagnosticJob.revision, nextStatus: "running", expectedSourceStatuses: ["pending"] });
+    let failProjection = true;
+    const durableFailures: Array<{ type: string; payload: Record<string, unknown> }> = [];
+    const diagnosticEventStore = createEventStore(db);
+    const diagnosticEvents = {
+      getEventsAfter: () => { if (failProjection) throw new Error("injected projection database read failure"); return []; },
+      appendEvent: (event: { type: string; sessionId: string; payload: Record<string, unknown> }, options?: { publish?: boolean }) => {
+        durableFailures.push(event);
+        return diagnosticEventStore.appendEvent(event, options);
+      },
+      subscribeAll: () => () => undefined,
+    } as any;
+    const diagnosticRuntime = createScheduledJobRuntime({ database: db, jobs, events: diagnosticEvents, pollMs: 60_000 });
+    await diagnosticRuntime.drainOnce();
+    const diagnostics = diagnosticRuntime.getMetrics();
+    assert.equal(diagnostics.serviceability.status, "degraded", "authenticated scheduler metrics report a drain failure separately from liveness");
+    assert.equal(diagnostics.lastDrainFailurePhase, "project_lifecycle_events");
+    assert.equal(diagnostics.recentDrainFailures, 1);
+    assert.equal(durableFailures[0]?.type, "scheduled_job.scheduler_error");
+    assert.equal(durableFailures[0]?.payload.retryEligible, true);
+    assert.equal(durableFailures[0]?.payload.operationPhase, "project_lifecycle_events");
+    assert.equal(durableFailures[0]?.payload.recurrenceCount, 1);
+    await diagnosticRuntime.drainOnce();
+    const repeatedDiagnostics = diagnosticRuntime.getMetrics();
+    assert.equal(repeatedDiagnostics.recentDrainFailures, 2);
+    assert.equal(repeatedDiagnostics.lastDrainFailureRecurrenceCount, 2,
+      "repeated scheduler failures stay visible with a durable recurrence count");
+    failProjection = false;
+    await diagnosticRuntime.drainOnce();
+    diagnosticEventStore.close();
   }
 
   db.close();

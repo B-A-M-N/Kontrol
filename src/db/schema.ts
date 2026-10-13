@@ -62,6 +62,13 @@ export const scheduledJobAttempts = sqliteTable("scheduled_job_attempts", {
   jobId: text("job_id").notNull().references(() => scheduledJobs.id, { onDelete: "cascade" }),
   dispatchId: text("dispatch_id").notNull(),
   startedAt: text("started_at").notNull(),
+  /** First server-authenticated worker start, distinct from scheduler dispatch claim time. */
+  executionStartedAt: text("execution_started_at"),
+  /** Current active worker segment; null while waiting for a reviewer or terminal result. */
+  executionActiveSince: text("execution_active_since"),
+  activeRuntimeMs: integer("active_runtime_ms").notNull().default(0),
+  executionStoppedAt: text("execution_stopped_at"),
+  executionReceiptJson: text("execution_receipt_json"),
   completedAt: text("completed_at"),
   /** External adapter handshake state, distinct from the final worker outcome. */
   transportStatus: text("transport_status").notNull().default("dispatching"),
@@ -69,6 +76,9 @@ export const scheduledJobAttempts = sqliteTable("scheduled_job_attempts", {
   leaseExpiresAt: text("lease_expires_at"),
   agentName: text("agent_name"),
   acpRunId: text("acp_run_id"),
+  acpDispatchId: text("acp_dispatch_id"),
+  acpAttemptNumber: integer("acp_attempt_number"),
+  acpRemoteRunId: text("acp_remote_run_id"),
   outcome: text("outcome"),
 }, (table) => [
   index("scheduled_job_attempts_job_idx").on(table.jobId, table.startedAt),
@@ -76,6 +86,21 @@ export const scheduledJobAttempts = sqliteTable("scheduled_job_attempts", {
 
 export type ScheduledJobAttemptRow = typeof scheduledJobAttempts.$inferSelect;
 export type NewScheduledJobAttemptRow = typeof scheduledJobAttempts.$inferInsert;
+
+/** Immutable full worker report keyed by the scheduled logical job and ACP run. */
+export const scheduledJobReports = sqliteTable("scheduled_job_reports", {
+  id: text("id").primaryKey(),
+  jobId: text("job_id").notNull().references(() => scheduledJobs.id, { onDelete: "cascade" }),
+  runId: text("run_id").notNull(),
+  reportSha256: text("report_sha256").notNull(),
+  reportText: text("report_text").notNull(),
+  createdAt: text("created_at").notNull(),
+}, (table) => [
+  uniqueIndex("scheduled_job_reports_job_run_unique").on(table.jobId, table.runId),
+  index("scheduled_job_reports_hash_idx").on(table.jobId, table.reportSha256),
+]);
+
+export type ScheduledJobReportRow = typeof scheduledJobReports.$inferSelect;
 
 export const telemetryIngress = sqliteTable("telemetry_ingress", {
   sequence: integer("sequence").primaryKey({ autoIncrement: true }),

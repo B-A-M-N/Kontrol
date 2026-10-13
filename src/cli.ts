@@ -693,7 +693,7 @@ async function runDoctor(options: { strict?: boolean } = {}): Promise<void> {
     const distDir = existsSync(join(moduleDir, "build-meta.json"))
       ? moduleDir
       : resolve(process.cwd(), "dist");
-    const requiredArtifacts = ["cli.js", "server.js", "acp-duplex.js", "build-meta.json", "ui/workspace-app.html"];
+    const requiredArtifacts = ["cli.js", "server.js", "acp-duplex.js", "read-only-execution.mjs", "build-meta.json", "ui/workspace-app.html"];
     const missingArtifacts = requiredArtifacts.filter((file) => !existsSync(resolve(distDir, file)));
     doctorResult("Build artifacts", missingArtifacts.length === 0 ? "PASS" : "FAIL", missingArtifacts.length === 0 ? distDir : `missing ${missingArtifacts.join(", ")}`);
     const buildMeta = readBuildIdentity(resolve(distDir, "build-meta.json"));

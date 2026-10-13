@@ -118,6 +118,9 @@ async function testDatabaseConfiguration(stateDir: string): Promise<void> {
       { version: 75, name: "acp-dispatch-idempotency-lookup" },
       { version: 76, name: "scheduled-job-owner-cursors" },
       { version: 77, name: "scheduled-job-cancellation-state" },
+      { version: 78, name: "scheduled-job-acp-attempt-identity" },
+      { version: 79, name: "scheduled-job-immutable-reports" },
+      { version: 80, name: "scheduled-job-execution-accounting" },
     ]);
   } finally {
     database.close();

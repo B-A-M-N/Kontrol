@@ -7,7 +7,7 @@ import { z } from "zod/v4";
 import { createDispatchOutbox } from "../dispatch-outbox.js";
 import { openDatabase } from "../db/client.js";
 import { createScheduledJobStore } from "../scheduling/scheduled-job-store.js";
-import { registerScheduleTools } from "./schedule-tools.js";
+import { registerScheduleTools, sliceScheduledReportPage } from "./schedule-tools.js";
 
 const root = await mkdtemp(join(tmpdir(), "kontrol-scheduled-result-"));
 const database = openDatabase(root);
@@ -49,6 +49,8 @@ const run = {
 const handlers = new Map<string, (input: any) => Promise<any>>();
 const definitions = new Map<string, any>();
 let reviewCancellationFinalizations = 0;
+let manualReconciliationCalls = 0;
+let reconciliationTargetId = "";
 const server = {
   registerTool(name: string, definition: unknown, handler: (input: any) => Promise<any>) {
     definitions.set(name, definition);
@@ -78,6 +80,20 @@ try {
     outcome: "dispatched",
     workSessionId: session.id,
     acpRunId: run.runId,
+    acpDispatchId: dispatch.dispatchId,
+    acpAttemptNumber: 1,
+    executionReceipt: {
+      issuer: "kontrol",
+      work_session_id: session.id,
+      workspace_session_id: "project-a",
+      parent_run_id: run.runId,
+      remote_run_id: "remote-run-1",
+      attempt_number: 1,
+      dispatch_idempotency_key: dispatch.dispatchId,
+      grant_expires_at: Date.now() + 60_000,
+      grant_fingerprint: "a".repeat(64),
+      confinement: "bubblewrap-read-only-workspace-no-network",
+    },
   });
 
   const config: any = {
@@ -85,6 +101,11 @@ try {
     principalId: "principal-a",
     connectionContext: { authenticatedPrincipalId: "principal-a", mcpSessionId: "transport-B" },
     scheduledJobs: jobs,
+    reconcileScheduledJob: async (jobId: string) => {
+      manualReconciliationCalls++;
+      assert.equal(jobId, reconciliationTargetId);
+      return jobs.get(jobId);
+    },
     workspaces: { getWorkspace: () => ({ id: "project-a", root: "/tmp/project-a" }) },
     workSessions: { get: (id: string) => id === session.id
       ? { ...session, status: sessionStatus }
@@ -120,6 +141,58 @@ try {
   };
   registerScheduleTools(server, config);
 
+  const operatorJob = jobs.create({
+    principalId: "principal-a",
+    ownerContextId: "principal:principal-a|transport:A",
+    projectId: "project-a",
+    workspaceRoot: "/tmp/project-a",
+    runAt: new Date(Date.now() - 1_000).toISOString(),
+    instructionJson: { instructions: "Reconcile an uncertain dispatch." },
+    executionMode: "read_only_audit",
+    policySnapshotJson: { workspaceAccess: "read_only", mutate: false },
+    maxRuntimeMs: 60_000,
+  });
+  reconciliationTargetId = operatorJob.id;
+  jobs.transition({ jobId: operatorJob.id, expectedRevision: 1, nextStatus: "due", expectedSourceStatuses: ["pending"] });
+  const operatorClaim = jobs.claimDispatch({ jobId: operatorJob.id, expectedRevision: 2, dispatcherInstanceId: "test-scheduler" });
+  const uncertainDispatch = jobs.completeDispatch({
+    jobId: operatorJob.id,
+    dispatchAttemptId: operatorClaim.attemptId,
+    expectedRevision: operatorClaim.revision,
+    dispatcherInstanceId: "test-scheduler",
+    outcome: "uncertain",
+    workSessionId: "ws-operator-tool",
+    acpRunId: "run-operator-tool",
+    acpDispatchId: operatorClaim.dispatchId,
+    acpAttemptNumber: 1,
+    acpRemoteRunId: "remote-operator-tool",
+  });
+  jobs.resolveDispatch({
+    jobId: operatorJob.id,
+    dispatchAttemptId: operatorClaim.attemptId,
+    expectedRevision: uncertainDispatch.revision,
+    resolution: "operator_intervention",
+    workSessionId: "ws-operator-tool",
+    acpRunId: "run-operator-tool",
+    acpDispatchId: operatorClaim.dispatchId,
+    acpAttemptNumber: 1,
+    acpRemoteRunId: "remote-operator-tool",
+  });
+  const reconcileTool = handlers.get("reconcile_scheduled_job");
+  assert.ok(reconcileTool, "reviewer reconciliation is registered");
+  const reconciledJob = await reconcileTool({ scheduledJobId: operatorJob.id });
+  assert.equal(reconciledJob.structuredContent.status, "operator_intervention",
+    "manual reconciliation returns current durable state when the adapter receipt remains unresolved");
+  assert.equal(manualReconciliationCalls, 1);
+  assert.equal(jobs.get(operatorJob.id)?.status, "operator_intervention",
+    "an inconclusive lookup does not clear operator intervention");
+  const savedRole = config.principalRole;
+  config.principalRole = "agent";
+  const deniedReconciliation = await reconcileTool({ scheduledJobId: operatorJob.id });
+  config.principalRole = savedRole;
+  assert.equal(deniedReconciliation.isError, true, "only reviewers can manually reconcile an uncertain dispatch");
+  assert.equal(manualReconciliationCalls, 1, "forbidden reconciliation does not contact the adapter receipt lookup");
+
   const resultTool = handlers.get("get_scheduled_job_result");
   assert.ok(resultTool, "scheduled result retrieval is registered");
   const firstPage = await resultTool({ scheduledJobId: created.id, reportLimit: 100 });
@@ -132,17 +205,33 @@ try {
     "worker completion does not claim review approval");
   assert.equal(firstPage.structuredContent.resultReceipt.verificationStatus, "not_performed",
     "worker completion alone is not independent verification");
-  assert.equal(firstPage.structuredContent.resultReceipt.outcomeVerified, false);
+  assert.equal(firstPage.structuredContent.resultReceipt.independentOutcomeObserved, false);
+  assert.equal(firstPage.structuredContent.resultReceipt.reviewApproved, false);
+  assert.equal(firstPage.structuredContent.resultReceipt.verificationLevel, "not_performed");
   assert.equal(firstPage.structuredContent.report.length, 100);
+  assert.equal(jobs.getReport(created.id, firstPage.structuredContent.reportSha256)?.reportText, largeReport,
+    "the first page pins a durable immutable report for retrieval after restart");
   assert.equal(firstPage.structuredContent.reportSha256, expectedReportSha256,
     "the full persisted report hash is independent of the returned page size");
   assert.equal(firstPage.structuredContent.reportNextOffset, 101);
   assert.equal(firstPage.structuredContent.reportTruncated, true);
   assert.equal(firstPage.structuredContent.resultReceipt.runId, run.runId);
   assert.equal(firstPage.structuredContent.resultReceipt.workSessionId, session.id);
+  assert.equal(firstPage.structuredContent.resultReceipt.executionReceipt.dispatch_idempotency_key, dispatch.dispatchId,
+    "the scheduled result exposes the exact accepted read-only execution receipt");
   assert.ok(firstPage.structuredContent.resultReceipt.artifactReferences.some((item: any) => item.kind === "acp_run_output"));
   assert.equal(z.object(definitions.get("get_scheduled_job_result").outputSchema).safeParse(firstPage.structuredContent).success, true,
     "result receipt matches the published tool output schema");
+
+  const unpinnedPage = await resultTool({ scheduledJobId: created.id, reportOffset: 101, reportLimit: 200 });
+  assert.equal(unpinnedPage.isError, true, "later result pages require the first page's immutable report hash");
+
+  assert.deepEqual(sliceScheduledReportPage("a😀b", 2, 1), { page: "😀", nextOffset: 3 },
+    "Unicode pagination counts complete code points and never splits a surrogate pair");
+  const emojiPage = sliceScheduledReportPage("😀".repeat(12_001), 1, 48_000);
+  assert.equal(Buffer.byteLength(emojiPage.page, "utf8"), 48_000,
+    "report pages obey the structured result UTF-8 byte cap");
+  assert.equal(emojiPage.nextOffset, 12_001);
 
   missionReceipt = {
     completionReport: {
@@ -153,21 +242,36 @@ try {
       snapshotRef: "snapshot-1",
     },
     approval: { allowed: true, reasons: [] },
+    requiredEvidenceLevel: "integration_verified",
+    verificationEvidenceIds: ["evidence-1"],
+    outcomeObservationIds: [],
     evidence: [{ id: "evidence-1", outputDigest: "f".repeat(64), snapshotKind: "git", snapshotRef: "snapshot-1" }],
   };
-  const verified = await resultTool({ scheduledJobId: created.id, reportOffset: 101, reportLimit: 200 });
+  const verified = await resultTool({ scheduledJobId: created.id, reportSha256: firstPage.structuredContent.reportSha256, reportOffset: 101, reportLimit: 200 });
   assert.equal(verified.structuredContent.report.length, 200);
+  assert.equal(verified.structuredContent.report, largeReport.slice(100, 300),
+    "later pages read the pinned report artifact even if run output is unavailable");
   assert.equal(verified.structuredContent.resultReceipt.reviewStatus, "pending",
     "verification and human review remain independently visible");
   assert.equal(verified.structuredContent.resultReceipt.verificationStatus, "passed");
-  assert.equal(verified.structuredContent.resultReceipt.outcomeVerified, true);
+  assert.equal(verified.structuredContent.resultReceipt.verificationLevel, "integration");
+  assert.equal(verified.structuredContent.resultReceipt.independentOutcomeObserved, false,
+    "integration verification does not claim independent outcome observation");
   assert.ok(verified.structuredContent.resultReceipt.artifactReferences.some((item: any) => item.kind === "mission_completion_report"));
   assert.ok(verified.structuredContent.resultReceipt.artifactReferences.some((item: any) => item.kind === "mission_evidence"));
 
+  missionReceipt = { ...missionReceipt, outcomeObservationIds: ["outcome-observation-1"] };
+  const observedOutcome = await resultTool({ scheduledJobId: created.id, reportSha256: firstPage.structuredContent.reportSha256, reportOffset: 101, reportLimit: 200 });
+  assert.equal(observedOutcome.structuredContent.resultReceipt.verificationLevel, "outcome");
+  assert.equal(observedOutcome.structuredContent.resultReceipt.independentOutcomeObserved, true);
+  assert.ok(observedOutcome.structuredContent.resultReceipt.verificationEvidenceIds.includes("outcome-observation-1"),
+    "the result receipt retains the exact independent outcome evidence ID");
+
   sessionStatus = "approved";
-  const approved = await resultTool({ scheduledJobId: created.id, reportOffset: 301, reportLimit: 200 });
+  const approved = await resultTool({ scheduledJobId: created.id, reportSha256: firstPage.structuredContent.reportSha256, reportOffset: 301, reportLimit: 200 });
   assert.equal(approved.structuredContent.resultReceipt.reviewStatus, "approved");
-  assert.equal(approved.structuredContent.resultReceipt.outcomeVerified, true);
+  assert.equal(approved.structuredContent.resultReceipt.reviewApproved, true);
+  assert.equal(approved.structuredContent.resultReceipt.independentOutcomeObserved, true);
   jobs.projectEvent({
     id: "submission-event-1",
     seq: 1,
@@ -186,7 +290,7 @@ try {
     payload: { runId: run.runId },
     createdAt: "2026-10-12T12:01:00.000Z",
   });
-  const terminal = await resultTool({ scheduledJobId: created.id, reportOffset: 501, reportLimit: 200 });
+  const terminal = await resultTool({ scheduledJobId: created.id, reportSha256: firstPage.structuredContent.reportSha256, reportOffset: 501, reportLimit: 200 });
   assert.equal(terminal.structuredContent.resultReceipt.terminalAt, jobs.get(created.id)?.updatedAt,
     "the job terminal timestamp is recorded when lifecycle projection completes");
 

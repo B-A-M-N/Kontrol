@@ -198,6 +198,26 @@ Current implementation contracts:
   CRUSH output events are coalesced and serialized so terminal lifecycle events
   cannot overtake queued telemetry. Terminal events are spooled durably before
   network delivery.
+- The generic stdio ACP adapter launches agents through ACP v1 `initialize`,
+  `session/new`, and `session/prompt`; custom nonstandard dispatch methods must
+  be explicitly configured. A scheduled `read_only_audit` uses a signed,
+  attempt-bound `read_only_execution_grant`, never a mutation lease. Bundled
+  adapters verify the grant before launch and require Linux bubblewrap to mount
+  the canonical workspace read-only, provide private scratch, and disable
+  network access; unavailable confinement fails as `sandbox_unavailable`.
+  Read-only agent environment additions require
+  `KONTROL_READ_ONLY_AGENT_ENV_ALLOWLIST`.
+- Adapter dispatch receipts bind the idempotency key to a canonical request
+  fingerprint and execution identity before worker launch. Identical retries
+  return the existing receipt, conflicting content is rejected, startup
+  reconciles receipts with owned-child records, and unresolved receipts are
+  retained until terminal evidence permits pruning. CRUSH, Hermes, and generic
+  stdio workers wait behind a closed launch gate until the wrapper process and
+  durable start intent are recorded. A `dispatching` receipt is authoritatively
+  `unstarted` only while there is evidence that the gate never opened; after
+  `start_requested`, recovery terminates the owned process group and fails the
+  run rather than risking duplicate execution. Adapters report `running` only
+  after confirming the agent child spawned.
 - Direct MCP policy approval returns a durable, retryable `approval_required`
   result immediately; it must not depend on an hours-long HTTP request.
   Controlled ACP/work-session approval may remain blocking. Durable approval
@@ -293,6 +313,18 @@ Current implementation contracts:
   Scheduler history and recovery use SQL limits and cursors, bounded dispatch
   concurrency, and diagnostics for due age, uncertain launches, unreconciled
   attempt age, and dispatch throughput.
+- Scheduled worker runtime deadlines stop when execution stops and do not count
+  human review waiting. Lifecycle events bind to the active dispatch attempt,
+  logical run, attempt number, and remote run where available; stale attempts
+  cannot resolve current cancellation. `operator_intervention` keeps the
+  original attempt reconcilable and prohibits automatic redispatch. Scheduler
+  phase failures are durably attributed and exposed through authenticated
+  serviceability diagnostics.
+- Scheduled verification commands must be declared and allowlisted before
+  dispatch. A reviewer starts them against the exact submitted snapshot in a
+  disposable, network-isolated bubblewrap workspace; the source checkout stays
+  read-only. Verification reports are immutable, content-hashed artifacts with
+  bounded UTF-8-safe pagination.
 - Periodic and startup reconciliation is bounded by pages/cursors so runtime
   state, approval expiry, direct-approval orphan cleanup, and telemetry work
   cannot become an unbounded synchronous serving-thread sweep.

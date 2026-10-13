@@ -57,7 +57,7 @@ async function startAgent() {
       for await (const _ of req) { /* drain */ }
       agentRuns += 1;
       res.writeHead(202, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ run_id: `remote-sched-${agentRuns}`, status: "running", output: [] }));
+      res.end(JSON.stringify({ run_id: `remote-sched-${agentRuns}`, accepted: true, status: "running", output: [] }));
       return;
     }
     res.writeHead(200, { "Content-Type": "application/json" });

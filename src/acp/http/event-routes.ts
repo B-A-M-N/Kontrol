@@ -7,7 +7,9 @@
  * the blocking approval long-poll.
  */
 import type { Router } from "express";
+import { realpath } from "node:fs/promises";
 import { serializeFinalAcpResult } from "../../acp-registry.js";
+import { verifyReadOnlyExecutionGrant } from "../../read-only-execution.mjs";
 import type { ApprovalOption, ApprovalRequestManager } from "../../approval-requests.js";
 import type { AcpContext, AcpRole } from "./context.js";
 import { APPROVAL_WAIT_TIMEOUT_MS } from "./context.js";
@@ -58,6 +60,18 @@ export function registerEventRoutes(
     "user_input_required",
   ]);
 
+// These payload keys are populated from Kontrol's persisted run, current
+// attempt, or authenticated request envelope. Adapters may include arbitrary
+// diagnostic fields, but cannot claim server-owned event identity.
+const SERVER_OWNED_EVENT_PAYLOAD_FIELDS = new Set([
+  "runId",
+  "remoteRunId",
+  "attemptNumber",
+  "dispatchId",
+  "workSessionId",
+  "eventId",
+]);
+
   router.post("/runs/:run_id/events", async (req, res) => {
     const role = authGate(req, res, ["agent", "operator"]);
     if (!role) return;
@@ -71,6 +85,7 @@ export function registerEventRoutes(
       return;
     }
     const body = parsedEvent.data;
+    const authoritativeAttempt = agentRegistry.getLatestDispatchAttemptForRun(run.runId);
 
     if (!body.type || (!ADAPTER_EVENT_TYPE_TO_RUN[body.type] && !APPROVAL_EVENT_TYPES.has(body.type))) {
       res.status(400).json({ error: { code: "invalid_input", message: "unknown or missing event type" } });
@@ -88,6 +103,48 @@ export function registerEventRoutes(
       if (body.agent_id && body.agent_id !== run.agentId) {
         res.status(403).json({ error: { code: "forbidden", message: "agent_id does not match the bound run" } });
         return;
+      }
+    }
+
+    // A scheduled read-only execution has no checkout mutation lease. Its
+    // lifecycle authority is instead proved by the exact Kontrol-issued grant
+    // attached to this adapter event. The schedule row and current persisted
+    // ACP attempt are the authority; event payload claims alone are not.
+    let readOnlyExecutionAuthorized = false;
+    if (run.workSessionId && ctx.database) {
+      const scheduled = ctx.database.sqlite.prepare(
+        "select execution_mode as executionMode from scheduled_jobs where work_session_id = ? limit 1",
+      ).get(run.workSessionId) as { executionMode?: string } | undefined;
+      if (scheduled?.executionMode === "read_only_audit") {
+        let workspaceRoot: string | undefined;
+        try {
+          workspaceRoot = run.workspaceSessionId
+            ? await realpath(ctx.workspaces.getWorkspace(run.workspaceSessionId).root)
+            : undefined;
+        } catch { /* reject below when the canonical workspace cannot be recovered */ }
+        const grantValid = Boolean(
+          authoritativeAttempt
+          && workspaceRoot
+          && run.agentId
+          && verifyReadOnlyExecutionGrant(
+            body.read_only_execution_grant,
+            ctx.adapterSecret ?? ctx.sharedSecret,
+            {
+              workSessionId: run.workSessionId,
+              workspaceSessionId: run.workspaceSessionId,
+              workspaceRoot,
+              agentId: run.agentId,
+              runId: run.runId,
+              attemptNumber: body.attempt_number ?? run.attemptNumber,
+              dispatchIdempotencyKey: authoritativeAttempt.dispatchIdempotencyKey,
+            },
+          ),
+        );
+        if (!grantValid) {
+          res.status(403).json({ error: { code: "read_only_grant_invalid", message: "Scheduled read-only event lacks a valid current-attempt execution grant." } });
+          return;
+        }
+        readOnlyExecutionAuthorized = true;
       }
     }
 
@@ -129,7 +186,7 @@ export function registerEventRoutes(
     // possession of the exact nonce issued for this dispatch; Kontrol must not
     // look up and renew its own current token on the adapter's behalf.
     let workspaceLeaseExpiresAt: string | undefined;
-    if ((body.type === "started" || body.type === "heartbeat") && run.workSessionId) {
+    if ((body.type === "started" || body.type === "heartbeat") && run.workSessionId && !readOnlyExecutionAuthorized) {
       if (!body.workspace_lease_nonce) {
         res.status(409).json({
           error: {
@@ -323,12 +380,19 @@ export function registerEventRoutes(
       !TERMINAL_SESSION_STATUSES.has(session.status);
     if (sessionId && eventStore && !awaitingReviewCrash && !workflowHandledCancellation) {
       const eventType = gatedCompletedTurn ? "worker.turn.completed" : ADAPTER_EVENT_TYPE_TO_RUN[body.type]!;
+      const adapterPayload = Object.fromEntries(
+        Object.entries(body.payload ?? {}).filter(([key]) => !SERVER_OWNED_EVENT_PAYLOAD_FIELDS.has(key)),
+      );
       const eventPayload = {
+        ...adapterPayload,
         runId: run.runId,
         remoteRunId: body.remote_run_id ?? run.remoteRunId,
+        attemptNumber: body.attempt_number ?? run.attemptNumber ?? 1,
+        ...(authoritativeAttempt?.dispatchIdempotencyKey
+          ? { dispatchId: authoritativeAttempt.dispatchIdempotencyKey }
+          : {}),
         workSessionId: sessionId,
         ...(body.event_id ? { eventId: body.event_id } : {}),
-        ...(body.payload ?? {}),
       };
       if (eventType === "agent.run.output_delta" || eventType === "agent.run.thought_delta") {
         // This writes the event-id receipt and fragment to SQLite before the
@@ -382,14 +446,27 @@ export function registerEventRoutes(
         eventStore?.appendEvent({
           type: "worker.attempt.failed",
           sessionId: session.id,
-          payload: { runId: run.runId, resumable: true, reason: errorMessage },
+          payload: {
+            runId: run.runId,
+            remoteRunId: run.remoteRunId,
+            attemptNumber: run.attemptNumber ?? 1,
+            ...(authoritativeAttempt?.dispatchIdempotencyKey ? { dispatchId: authoritativeAttempt.dispatchIdempotencyKey } : {}),
+            resumable: true,
+            reason: errorMessage,
+          },
         });
       } else if (session && !TERMINAL_SESSION_STATUSES.has(session.status)) {
         workSessions.updateStatus(session.id, "failed");
         eventStore?.appendEvent({
           type: "agent.run.failed",
           sessionId: session.id,
-          payload: { runId: run.runId, reason: errorMessage },
+          payload: {
+            runId: run.runId,
+            remoteRunId: run.remoteRunId,
+            attemptNumber: run.attemptNumber ?? 1,
+            ...(authoritativeAttempt?.dispatchIdempotencyKey ? { dispatchId: authoritativeAttempt.dispatchIdempotencyKey } : {}),
+            reason: errorMessage,
+          },
         });
         agentRegistry.updateRun(run.runId, { status: "failed", errorMessage, finishedAt: now });
       } else {

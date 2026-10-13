@@ -155,7 +155,7 @@ try {
       for await (const chunk of req) chunks.push(Buffer.from(chunk));
       receivedRuns.push(chunks.length ? JSON.parse(Buffer.concat(chunks).toString()) : {});
       res.writeHead(202, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ run_id: `remote-${receivedRuns.length}`, status: "running", output: [] }));
+      res.end(JSON.stringify({ run_id: `remote-${receivedRuns.length}`, accepted: true, status: "running", output: [] }));
       return;
     }
     res.writeHead(200, { "Content-Type": "application/json" });

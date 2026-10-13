@@ -37,6 +37,8 @@ export const acpRunEventSchema = z.object({
   // Optional at the schema boundary so missing tokens receive the specific
   // workspace_lease_lost response from the lease authority, not a generic 400.
   workspace_lease_nonce: z.string().min(1).optional(),
+  /** Kontrol-signed, attempt-bound authority for a confined read-only run. */
+  read_only_execution_grant: z.unknown().optional(),
   // P0 #7: adapters echo the dispatch attempt number. Events from a
   // superseded attempt (an earlier continuation of the same logical run) are
   // rejected so a late event from attempt N cannot mutate attempt N+1.

@@ -67,7 +67,7 @@ function resolveAbsoluteModuleSpecifier(specifier) {
 
 export function validateRelease(artifactPath) {
   const root = realpathSync(resolve(artifactPath));
-  const required = ["cli.js", "server.js", "acp-duplex.js", "acp-worker-token.mjs", "build-meta.json", "ui/workspace-app.html"];
+  const required = ["cli.js", "server.js", "acp-duplex.js", "read-only-execution.mjs", "acp-worker-token.mjs", "build-meta.json", "ui/workspace-app.html"];
   const missing = required.filter((entry) => !existsSync(resolve(root, entry)));
   if (missing.length > 0) throw new Error(`release is missing required files: ${missing.join(", ")}`);
 

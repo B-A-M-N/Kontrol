@@ -8,6 +8,7 @@
  * the Kontrol-owned runtime, not by an untrusted MCP caller.
  */
 import { callRemoteAgent, selectHealthyAgent } from "../acp-gateway.js";
+import type { ReadOnlyExecutionReceipt } from "../acp-gateway.js";
 import type { BridgeConfig } from "../bridge/context.js";
 import { acquireCheckoutModifyLease, checkoutLeaseMetadata, workSessionInstructions } from "../bridge/shared.js";
 import type { ScheduledJob, ScheduledJobStore } from "./scheduled-job-store.js";
@@ -16,6 +17,9 @@ export interface ScheduledDispatchResult {
   status: "dispatched" | "blocked" | "failed" | "uncertain";
   workSessionId?: string;
   runId?: string;
+  remoteRunId?: string;
+  attemptNumber?: number;
+  executionReceipt?: ReadOnlyExecutionReceipt;
   reason?: string;
 }
 
@@ -104,6 +108,8 @@ export async function dispatchScheduledJob(
             executionMode: job.executionMode,
             workspaceAccess: "read_only",
             mutate: false,
+            executionGrantTtlMs: job.maxRuntimeMs + 5 * 60_000,
+            maxRuntimeMs: job.maxRuntimeMs,
           },
         } : {}),
         mode: "async",
@@ -117,6 +123,8 @@ export async function dispatchScheduledJob(
         status: "uncertain",
         workSessionId,
         runId: result.runId,
+        remoteRunId: result.remoteRunId,
+        attemptNumber: result.attemptNumber,
         reason: result.error ?? "Scheduled ACP dispatch failed.",
       };
     }
@@ -126,10 +134,19 @@ export async function dispatchScheduledJob(
         status: "failed",
         workSessionId,
         runId: result.runId,
+        remoteRunId: result.remoteRunId,
+        attemptNumber: result.attemptNumber,
         reason: result.error ?? "Scheduled ACP dispatch failed.",
       };
     }
-    return { status: "dispatched", workSessionId, runId: result.runId };
+    return {
+      status: "dispatched",
+      workSessionId,
+      runId: result.runId,
+      remoteRunId: result.remoteRunId,
+      attemptNumber: result.attemptNumber,
+      executionReceipt: result.executionReceipt,
+    };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const uncertain = /ECONNREFUSED|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|socket hang up|network/i.test(message);

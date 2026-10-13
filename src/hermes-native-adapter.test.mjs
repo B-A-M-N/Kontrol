@@ -40,6 +40,17 @@ assert.match(adapter, /workspaceLeaseNonce: body\.workspace_lease_nonce/);
 assert.match(adapter, /terminateProcessGroup/);
 assert.match(adapter, /could not confirm process group .* dead/);
 assert.match(adapter, /KONTROL_WORKSPACE_LEASE_NONCE/);
+assert.match(adapter, /prepareOwnedChild\(hermesLaunch\.command/);
+assert.ok(adapter.indexOf('launchState: "start_requested"') < adapter.indexOf("await launchGate.start()"),
+  "Hermes start intent is durable before opening the worker launch gate");
+assert.ok(adapter.indexOf("await launchGate.start()") < adapter.indexOf('run.remoteRunId, "running"'),
+  "Hermes acceptance is persisted only after the agent child has spawned");
+assert.match(adapter, /validateReadOnlyDispatchRequest\(body, workspaceRoot, ADAPTER_SECRET\)/,
+  "Hermes verifies the server-signed read-only grant before preparing a child");
+assert.match(adapter, /executionReceipt: run\.readOnlyExecutionReceipt/,
+  "Hermes persists the correlated read-only receipt with its durable dispatch record");
+assert.match(adapter, /!run\.readOnlyAudit && \(!run\.workspaceLeaseNonce/,
+  "read-only Hermes dispatch does not require a mutation lease");
 
 assert.match(runner, /add_observer\(on_raw_event\)/);
 assert.match(runner, /KontrolACPClient/);

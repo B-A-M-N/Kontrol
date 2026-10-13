@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import express from "express";
 import Database from "better-sqlite3";
-import { authHeadersForAgent, callRemoteAgent, dispatchToPeer, lookupPeerDispatch, probeAgent, selectHealthyAgent } from "./acp-gateway.js";
+import { AcpDispatchError, authHeadersForAgent, callRemoteAgent, dispatchToPeer, lookupPeerDispatch, probeAgent, selectHealthyAgent } from "./acp-gateway.js";
 import { createAcpServer } from "./acp-server.js";
 import { openDatabase, databasePath } from "./db/client.js";
 import { createAgentRegistryManager } from "./acp-registry.js";
@@ -48,6 +49,203 @@ try {
   assert.match(unsupportedProbe.note ?? "", /unsupported probe transport/);
 
   {
+    const originalFetch = globalThis.fetch;
+    const request = {
+      agentUrl: "http://127.0.0.1:9877",
+      body: {
+        session_id: "work-session-1",
+        dispatch_idempotency_key: "dispatch-1",
+      },
+    };
+    try {
+      for (const body of ["", "not-json", JSON.stringify({ accepted: true, status: "running" })]) {
+        globalThis.fetch = (async () => new Response(body, { status: 202 })) as typeof fetch;
+        await assert.rejects(
+          dispatchToPeer(request),
+          (error: unknown) => error instanceof AcpDispatchError && error.certainty === "uncertain",
+          "empty, invalid JSON, and incomplete success bodies leave dispatch uncertain",
+        );
+      }
+
+      globalThis.fetch = (async () => new Response(JSON.stringify({
+        run_id: "remote-1",
+        remote_run_id: "different-run",
+        accepted: true,
+        status: "running",
+      }), { status: 202 })) as typeof fetch;
+      await assert.rejects(
+        dispatchToPeer(request),
+        (error: unknown) => error instanceof AcpDispatchError && error.certainty === "uncertain",
+        "conflicting remote IDs cannot be treated as accepted",
+      );
+
+      globalThis.fetch = (async () => new Response(JSON.stringify({
+        run_id: "remote-1",
+        accepted: true,
+        status: "running",
+        dispatch_idempotency_key: "another-dispatch",
+      }), { status: 202 })) as typeof fetch;
+      await assert.rejects(
+        dispatchToPeer(request),
+        (error: unknown) => error instanceof AcpDispatchError && error.certainty === "uncertain",
+        "a mismatched dispatch key cannot bind the response to this request",
+      );
+
+      globalThis.fetch = (async () => new Response(JSON.stringify({
+        run_id: "remote-1",
+        accepted: true,
+        status: "running",
+      }), { status: 202 })) as typeof fetch;
+      await assert.rejects(
+        dispatchToPeer(request),
+        (error: unknown) => error instanceof AcpDispatchError && error.certainty === "uncertain",
+        "a successful response must echo the dispatch key when the adapter protocol received one",
+      );
+
+      const grant = { signature: "test-grant-signature", expiresAt: Date.now() + 60_000 };
+      const readOnlyRequest = {
+        agentUrl: request.agentUrl,
+        body: {
+          ...request.body,
+          workspace_session_id: "workspace-1",
+          parent_run_id: "kontrol-run-1",
+          attempt_number: 2,
+          read_only_execution_grant: grant,
+        },
+      };
+      const executionReceipt = {
+        issuer: "kontrol",
+        work_session_id: "work-session-1",
+        workspace_session_id: "workspace-1",
+        parent_run_id: "kontrol-run-1",
+        remote_run_id: "remote-read-only",
+        attempt_number: 2,
+        dispatch_idempotency_key: "dispatch-1",
+        grant_expires_at: grant.expiresAt,
+        grant_fingerprint: createHash("sha256").update(grant.signature).digest("hex"),
+        confinement: "bubblewrap-read-only-workspace-no-network",
+      };
+      globalThis.fetch = (async () => new Response(JSON.stringify({
+        run_id: "remote-read-only",
+        accepted: true,
+        status: "running",
+        dispatch_idempotency_key: "dispatch-1",
+        execution_receipt: executionReceipt,
+      }), { status: 202 })) as typeof fetch;
+      const readOnlyAccepted = await dispatchToPeer(readOnlyRequest);
+      assert.deepEqual(readOnlyAccepted.executionReceipt, executionReceipt,
+        "read-only acceptance requires a receipt correlated to the signed grant and current attempt");
+      globalThis.fetch = (async () => new Response(JSON.stringify({
+        run_id: "remote-read-only",
+        accepted: true,
+        status: "running",
+        dispatch_idempotency_key: "dispatch-1",
+      }), { status: 202 })) as typeof fetch;
+      await assert.rejects(
+        dispatchToPeer(readOnlyRequest),
+        (error: unknown) => error instanceof AcpDispatchError && error.certainty === "uncertain",
+        "a read-only adapter response without an execution receipt remains uncertain",
+      );
+      globalThis.fetch = (async () => new Response(JSON.stringify({
+        run_id: "remote-read-only",
+        remote_run_id: "remote-read-only",
+        accepted: true,
+        status: "running",
+        dispatch_idempotency_key: "dispatch-1",
+        execution_receipt: executionReceipt,
+      }), { status: 200 })) as typeof fetch;
+      const recoveredReadOnly = await lookupPeerDispatch({
+        agentUrl: request.agentUrl,
+        dispatchIdempotencyKey: "dispatch-1",
+        requireExecutionReceipt: true,
+        expectedReceipt: {
+          workSessionId: "work-session-1",
+          workspaceSessionId: "workspace-1",
+          parentRunId: "kontrol-run-1",
+          attemptNumber: 2,
+          dispatchIdempotencyKey: "dispatch-1",
+        },
+      });
+      assert.equal(recoveredReadOnly.status, "found");
+      assert.deepEqual(recoveredReadOnly.executionReceipt, executionReceipt,
+        "adapter restart lookup restores only the correlated read-only execution receipt");
+
+      globalThis.fetch = (async () => new Response(JSON.stringify({
+        error: { code: "duplicate_session" },
+        run_id: "remote-1",
+        work_session_id: "work-session-1",
+        dispatch_idempotency_key: "dispatch-1",
+      }), { status: 409 })) as typeof fetch;
+      const duplicate = await dispatchToPeer(request);
+      assert.equal(duplicate.body.accepted, true, "only an exact duplicate-session receipt can recover acceptance");
+      assert.equal(duplicate.body.run_id, "remote-1");
+
+      globalThis.fetch = (async () => new Response(JSON.stringify({
+        error: { code: "duplicate_session" },
+        run_id: "remote-1",
+        work_session_id: "work-session-1",
+        dispatch_idempotency_key: "wrong-dispatch",
+      }), { status: 409 })) as typeof fetch;
+      await assert.rejects(
+        dispatchToPeer(request),
+        (error: unknown) => error instanceof AcpDispatchError && error.certainty === "uncertain",
+        "uncorrelated duplicate-session conflicts remain unresolved",
+      );
+
+      globalThis.fetch = (async () => new Response(JSON.stringify({
+        error: { code: "duplicate_session" },
+        run_id: "remote-1",
+        dispatch_idempotency_key: "dispatch-1",
+      }), { status: 409 })) as typeof fetch;
+      await assert.rejects(
+        dispatchToPeer(request),
+        (error: unknown) => error instanceof AcpDispatchError && error.certainty === "uncertain",
+        "a duplicate-session response without matching work-session identity is not acceptance evidence",
+      );
+
+      globalThis.fetch = (async () => new Response(JSON.stringify({ error: { code: "workspace_lease_lost" } }), { status: 409 })) as typeof fetch;
+      await assert.rejects(
+        dispatchToPeer(request),
+        (error: unknown) => error instanceof AcpDispatchError && error.certainty === "rejected",
+        "a structured workspace lease loss proves the dispatch was rejected",
+      );
+
+      globalThis.fetch = (async () => new Response("", { status: 202 })) as typeof fetch;
+      const root = await mkdtemp(join(tmpdir(), "kontrol-acp-malformed-acceptance-"));
+      tempDirs.push(root);
+      const db = openDatabase(root);
+      seedWorkspace(root, "ws-malformed-acceptance");
+      const workSessions = createWorkSessionManager(db);
+      const agentRegistry = createAgentRegistryManager(db);
+      const workSession = workSessions.create({ workspaceSessionId: "ws-malformed-acceptance", submittedBy: "test" });
+      const result = await callRemoteAgent({
+        agentRegistry,
+        workspaces: { getWorkspace: () => ({ id: "ws-malformed-acceptance", root: "/tmp", mode: "checkout" }) } as any,
+        workSessions,
+        adapterSecret: "secret",
+      }, {
+        agentUrl: "http://127.0.0.1:9877",
+        agentName: "remote-agent",
+        agentId: "agent-malformed",
+        task: "do not falsely mark this active",
+        workspaceSessionId: "ws-malformed-acceptance",
+        workSessionId: workSession.id,
+        dispatchIdempotencyKey: "dispatch-malformed-acceptance",
+        mode: "async",
+        fireAndForget: true,
+      });
+      assert.equal(result.status, "uncertain");
+      assert.equal(agentRegistry.getRun(result.runId)?.status, "dispatch_uncertain",
+        "a malformed successful HTTP response cannot falsely mark the logical run active");
+      assert.equal(agentRegistry.getDispatchAttemptByIdempotencyKey("dispatch-malformed-acceptance")?.status, "uncertain");
+      workSessions.close();
+      agentRegistry.close();
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  }
+
+  {
     const probeServer = createServer((req, res) => {
       if (req.method === "GET" && req.url === "/health") res.writeHead(200).end("ok");
       else res.writeHead(404).end();
@@ -83,7 +281,7 @@ try {
         postAuth = req.headers.authorization;
         await readJson(req);
         res.writeHead(202, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ run_id: "remote-loopback", status: "running", output: [] }));
+        res.end(JSON.stringify({ run_id: "remote-loopback", accepted: true, status: "running", output: [] }));
         return;
       }
       res.writeHead(404).end();
@@ -134,7 +332,7 @@ try {
         peerAuth = req.headers.authorization;
         peerBody = await readJson(req);
         res.writeHead(202, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ run_id: "remote-direct", remote_run_id: "remote-direct", accepted: true }));
+        res.end(JSON.stringify({ run_id: "remote-direct", remote_run_id: "remote-direct", accepted: true, status: "running" }));
         return;
       }
       res.writeHead(404).end();
@@ -409,11 +607,17 @@ try {
         return;
       }
       if (req.method === "POST" && req.url === "/runs") {
-        await readJson(req);
+        const body = await readJson(req);
         markStarted();
         await new Promise<void>((r) => { resolveDispatch = r; });
         res.writeHead(202, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ run_id: "remote-delayed", status: "running", output: [] }));
+        res.end(JSON.stringify({
+          run_id: "remote-delayed",
+          accepted: true,
+          status: "running",
+          dispatch_idempotency_key: body.dispatch_idempotency_key,
+          output: [],
+        }));
         return;
       }
       if (req.method === "POST" && req.url === "/runs/remote-delayed/cancel") {

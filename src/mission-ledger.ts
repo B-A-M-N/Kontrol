@@ -23,7 +23,7 @@ import { fingerprintMissionContract, fingerprintMissionContractV1, fingerprintSt
 import { evaluateEffectiveFindingResolution, evaluateFindingResolutionEvidence, isEvidenceSourceAllowed, selectEffectiveEvidenceResult } from "./mission/evidence-authority.js";
 import { assertFindingStatusTransition, fingerprintFinding, mergeFindingEvidence } from "./mission/finding-authority.js";
 import { evaluateCorrectionPolicy } from "./mission/correction-policy.js";
-import { evaluateEffectiveCriteria, evaluateMissionOutcome, type OutcomeObservation } from "./mission/outcome-evaluator.js";
+import { evaluateEffectiveCriteria, evaluateMissionOutcome, evaluateOutcomeObservations, type OutcomeObservation } from "./mission/outcome-evaluator.js";
 
 export type CriterionStatus = "unverified" | "partially_verified" | "verified" | "failed";
 export type FindingStatus = "open" | "claimed_resolved" | "verified_resolved" | "waived";
@@ -189,6 +189,9 @@ export interface MissionLedger {
     missionId: string;
     currentSubmissionId?: string;
     approval: ApprovalPredicate;
+    requiredEvidenceLevel: "implementation_verified" | "integration_verified" | "outcome_verified" | "operationally_stable";
+    verificationEvidenceIds: string[];
+    outcomeObservationIds: string[];
     completionReport?: ReturnType<typeof rowToCompletionReport>;
     evidence: Array<ReturnType<typeof rowToEvidence>>;
   } | undefined;
@@ -694,7 +697,15 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
     if (!mission) return undefined;
     const context = normalizeCurrentApprovalContext(approvalContext ?? getCurrentApprovalContext(workSessionId));
     const approval = canApprove(workSessionId, context);
-    if (!context.submissionId) return { missionId: mission.id, approval, evidence: [] };
+    const requiredEvidenceLevel = mission.outcomeEvidence ?? "implementation_verified";
+    if (!context.submissionId) return {
+      missionId: mission.id,
+      approval,
+      requiredEvidenceLevel,
+      verificationEvidenceIds: [],
+      outcomeObservationIds: [],
+      evidence: [],
+    };
 
     let completionReport: ReturnType<typeof rowToCompletionReport> | undefined;
     if (context.snapshotKind && context.snapshotRef) {
@@ -717,7 +728,38 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
         eq(missionEvidence.reviewEpoch, context.reviewEpoch),
       )).orderBy(desc(missionEvidence.createdAt)).limit(100).all().map(rowToEvidence);
     }
-    return { missionId: mission.id, currentSubmissionId: context.submissionId, approval, completionReport, evidence };
+    const verificationEvidenceIds = evidence.filter((entry) => {
+      const source = typeof (entry.details as { source?: unknown })?.source === "string"
+        ? (entry.details as { source: string }).source
+        : undefined;
+      return entry.status === "passed" && source !== "agent_claim";
+    }).map((entry) => entry.id);
+    const outcomeRows = context.snapshotKind && context.snapshotRef
+      ? database.db.select().from(missionOutcomeObservations).where(and(
+          eq(missionOutcomeObservations.missionId, mission.id),
+          eq(missionOutcomeObservations.submissionId, context.submissionId),
+          eq(missionOutcomeObservations.snapshotKind, context.snapshotKind),
+          eq(missionOutcomeObservations.snapshotRef, context.snapshotRef),
+        )).orderBy(desc(missionOutcomeObservations.observedAt)).all()
+      : [];
+    const outcomeSatisfied = evaluateOutcomeObservations(outcomeRows.map(rowToOutcomeObservation), {
+      submissionId: context.submissionId,
+      snapshotKind: context.snapshotKind ?? "",
+      snapshotRef: context.snapshotRef ?? "",
+    }).satisfied;
+    const outcomeObservationIds = outcomeSatisfied
+      ? outcomeRows.filter((row) => row.status === "confirmed" && row.observerIdentity.trim()).map((row) => row.id)
+      : [];
+    return {
+      missionId: mission.id,
+      currentSubmissionId: context.submissionId,
+      approval,
+      requiredEvidenceLevel,
+      verificationEvidenceIds,
+      outcomeObservationIds,
+      completionReport,
+      evidence,
+    };
   }
 
   // P1 #26: Derive the current approval context from the latest pending

@@ -93,6 +93,8 @@ export interface BridgeConfig {
   onPhaseTiming?: (phase: string, durationMs: number) => void;
   /** Durable one-shot scheduled-job store, shared with the server runtime. */
   scheduledJobs?: import("../scheduling/scheduled-job-store.js").ScheduledJobStore;
+  /** Reviewer-only lookup of an uncertain scheduled dispatch; never starts work. */
+  reconcileScheduledJob?: (jobId: string) => Promise<import("../scheduling/scheduled-job-store.js").ScheduledJob | undefined>;
   /** Durable review-route/handoff store, shared with review workflow. */
   reviewRoutes?: import("../review-handoff/route-store.js").ReviewRouteStore;
 }

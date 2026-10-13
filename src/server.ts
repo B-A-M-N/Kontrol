@@ -676,6 +676,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
       scheduledJobs,
       reviewRoutes,
       (uri) => { /* noop handshake */ },
+      (jobId) => reconcileScheduledJob?.(jobId) ?? Promise.resolve(undefined),
     ),
     mutationReceipts,
     workspaces,
@@ -775,6 +776,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
   let supervisorRuntime: import("./supervisor-runtime.js").SupervisorRuntime | undefined;
   let replyDispatcher: import("./bridge/reply-dispatcher.js").ReplyDispatcher | undefined;
   let scheduledJobRuntime: import("./scheduling/scheduled-job-runtime.js").ScheduledJobRuntime | undefined;
+  let reconcileScheduledJob: ((jobId: string) => Promise<import("./scheduling/scheduled-job-store.js").ScheduledJob | undefined>) | undefined;
   if (config.acpEnabled) {
     const acp = createAcpRuntime({
       config,
@@ -787,6 +789,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     supervisorRuntime = acp.supervisorRuntime;
     replyDispatcher = acp.replyDispatcher;
     scheduledJobRuntime = acp.scheduledJobRuntime;
+    reconcileScheduledJob = acp.reconcileScheduledJob;
   }
 
   const shutdown = createShutdownController({

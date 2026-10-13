@@ -16,6 +16,8 @@ import { randomUUID } from "node:crypto";
 import { createHash } from "node:crypto";
 import { cancelRemoteRun } from "../acp-gateway.js";
 import { hasConfirmedWorkerAttemptExit } from "../acp-registry.js";
+import { parseVerificationCommand } from "../mission-verifier.js";
+import { verifyScheduledJob } from "../scheduling/scheduled-verification.js";
 import { z } from "zod/v4";
 
 function scheduledJobStore(config: BridgeConfig): ScheduledJobStore | undefined {
@@ -28,6 +30,20 @@ export function scheduledJobAccessAllowed(
 ): boolean {
   const principal = identity.authenticatedPrincipalId?.trim();
   return principal ? job.principalId === principal : job.ownerContextId === identity.ownerContextId;
+}
+
+export function sliceScheduledReportPage(text: string, offset: number, limit: number): { page: string; nextOffset?: number } {
+  const points = Array.from(text);
+  const start = Math.max(0, Math.min(points.length, offset - 1));
+  const end = Math.min(points.length, start + limit);
+  let bytes = 0;
+  let cursor = start;
+  for (; cursor < end; cursor += 1) {
+    const nextBytes = Buffer.byteLength(points[cursor]!, "utf8");
+    if (bytes + nextBytes > 48_000) break;
+    bytes += nextBytes;
+  }
+  return { page: points.slice(start, cursor).join(""), ...(cursor < points.length ? { nextOffset: cursor + 1 } : {}) };
 }
 
 export function registerScheduleTools(server: McpServer, config: BridgeConfig): void {
@@ -51,6 +67,8 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
         instructions: z.string().trim().min(1).describe("Bounded task instructions."),
         executionMode: z.literal("read_only_audit").default("read_only_audit"),
         maxRuntimeMinutes: z.number().int().min(1).max(24 * 60).default(90),
+        verificationCommands: z.array(z.string().trim().min(1).max(1_024)).max(5).optional()
+          .describe("Optional allowlisted tests to run later against a disposable copy of the submitted snapshot."),
         agentName: z.string().optional(),
         clientMutationId: z.string().min(1).max(200).optional(),
       },
@@ -64,7 +82,7 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
       annotations: { readOnlyHint: false },
     },
     config,
-    async ({ workspaceId, runAt, instructions, executionMode, maxRuntimeMinutes, agentName, clientMutationId }) => {
+    async ({ workspaceId, runAt, instructions, executionMode, maxRuntimeMinutes, verificationCommands, agentName, clientMutationId }) => {
       if (!isReviewer(config.principalRole)) return forbidden(config.principalRole, "schedule_job");
       // A workspace ID is not a work-session ID. Authorization for scheduling
       // is reviewer role plus authenticated ownership of that workspace, which
@@ -74,6 +92,10 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
         return { content: [{ type: "text" as const, text: "Scheduled jobs are unavailable: the scheduler store is not configured." }], isError: true };
       }
       try {
+        const checkedVerificationCommands = (verificationCommands ?? []).map((command: string) => {
+          parseVerificationCommand(command);
+          return command;
+        });
         const workspace = config.workspaces.getWorkspace(workspaceId);
         // The workspace registry itself is the workspace authority here: only
         // registered allowlisted roots are addressable, and the authenticated
@@ -87,7 +109,20 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
           runAt,
           instructionJson: { instructions },
           executionMode,
-          policySnapshotJson: { workspaceAccess: "read_only", mutate: false },
+          policySnapshotJson: {
+            workspaceAccess: "read_only",
+            mutate: false,
+            verificationCommands: checkedVerificationCommands,
+            verificationPolicy: {
+              capability: "read_only_verification",
+              sandboxRequired: true,
+              network: "disabled",
+              workspace: "disposable_submitted_snapshot",
+              maxCommands: 5,
+              maxRuntimeMs: Math.min(maxRuntimeMinutes * 60_000, 15 * 60_000),
+              maxOutputBytes: 20_000,
+            },
+          },
           agentName,
           maxRuntimeMs: maxRuntimeMinutes * 60_000,
           clientMutationId,
@@ -115,6 +150,7 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
         ...(name === "get_scheduled_job_result" ? {
           reportOffset: z.number().int().positive().optional(),
           reportLimit: z.number().int().positive().max(48_000).optional(),
+          reportSha256: z.string().regex(/^[a-f0-9]{64}$/).optional().describe("Immutable report identity returned by the first page."),
         } : {}),
       },
       outputSchema: {
@@ -139,7 +175,30 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
             executionStatus: z.string(),
             reviewStatus: z.string(),
             verificationStatus: z.enum(["passed", "failed", "inconclusive", "not_performed"]),
-            outcomeVerified: z.boolean(),
+            workerCompleted: z.boolean(),
+            reviewApproved: z.boolean(),
+            verificationLevel: z.enum(["not_performed", "implementation", "integration", "outcome", "operational"]),
+            independentOutcomeObserved: z.boolean(),
+            verificationEvidenceIds: z.array(z.string()),
+            executionReceipt: z.object({
+              issuer: z.literal("kontrol"),
+              work_session_id: z.string(),
+              workspace_session_id: z.string(),
+              parent_run_id: z.string(),
+              remote_run_id: z.string(),
+              attempt_number: z.number().int().positive(),
+              dispatch_idempotency_key: z.string(),
+              grant_expires_at: z.number().int().positive(),
+              grant_fingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+              confinement: z.literal("bubblewrap-read-only-workspace-no-network"),
+            }).optional(),
+            resultSnapshot: z.object({
+              submissionId: z.string().optional(),
+              snapshotKind: z.string().optional(),
+              snapshotRef: z.string().optional(),
+              reviewEpoch: z.number().optional(),
+            }),
+            verificationBlockers: z.array(z.string()),
             snapshotKind: z.string().optional(),
             snapshotRef: z.string().optional(),
             error: z.string().optional(),
@@ -153,15 +212,15 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
           }),
           report: z.string().optional(),
           reportSha256: z.string().optional(),
-          reportOffset: z.number().int().optional(),
-          reportNextOffset: z.number().int().optional(),
+          reportOffset: z.number().int().optional().describe("One-based Unicode code point offset."),
+          reportNextOffset: z.number().int().optional().describe("One-based Unicode code point offset for the next page."),
           reportTruncated: z.boolean().optional(),
         } : {}),
       },
       _meta: {},
       annotations: { readOnlyHint: true },
     } as any, async (input: unknown) => {
-      const { scheduledJobId, reportOffset, reportLimit } = input as { scheduledJobId?: string; reportOffset?: number; reportLimit?: number };
+      const { scheduledJobId, reportOffset, reportLimit, reportSha256: requestedReportSha256 } = input as { scheduledJobId?: string; reportOffset?: number; reportLimit?: number; reportSha256?: string };
       if (!scheduledJobId) {
         return { content: [{ type: "text" as const, text: "Missing scheduledJobId." }], isError: true };
       }
@@ -174,6 +233,9 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
       }
       if (!mayReadJob(job)) {
         return forbidden(config.principalRole, name);
+      }
+      if (name === "get_scheduled_job_result" && (reportOffset ?? 1) > 1 && !requestedReportSha256) {
+        return { content: [{ type: "text" as const, text: "Later report pages require the reportSha256 returned by the first page." }], isError: true };
       }
       const run = job.workSessionId ? config.agentRegistry.getRunByWorkSessionId(job.workSessionId) : undefined;
       const attempt = jobs.getAttempt(job.id);
@@ -190,6 +252,20 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
           reportText = "";
         }
       }
+      let reportArtifact;
+      if (requestedReportSha256) {
+        reportArtifact = jobs.getReport(job.id, requestedReportSha256);
+        if (!reportArtifact) {
+          return { content: [{ type: "text" as const, text: "The requested immutable report artifact is unavailable." }], isError: true };
+        }
+      } else if (reportText && run?.runId) {
+        try {
+          reportArtifact = jobs.persistReport(job.id, run.runId, reportText);
+        } catch (error) {
+          return { content: [{ type: "text" as const, text: error instanceof Error ? error.message : String(error) }], isError: true };
+        }
+      }
+      if (reportArtifact) reportText = reportArtifact.reportText;
       const resultReceipt = name === "get_scheduled_job_result" ? (() => {
         const latest = session?.latestSubmission;
         const snapshotKind = latest?.snapshotKind;
@@ -220,7 +296,7 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
                     : session.status === "changes_requested" ? "changes_requested"
                       : latest ? "pending" : "not_submitted";
         const artifactReferences: Array<{ kind: string; id: string; sha256?: string; snapshotKind?: string; snapshotRef?: string }> = [];
-        const reportSha256 = reportText ? createHash("sha256").update(reportText).digest("hex") : undefined;
+        const reportSha256 = reportArtifact?.reportSha256 ?? (reportText ? createHash("sha256").update(reportText, "utf8").digest("hex") : undefined);
         if (run && reportSha256) artifactReferences.push({ kind: "acp_run_output", id: run.runId, sha256: reportSha256 });
         if (latest) artifactReferences.push({
           kind: "work_session_submission",
@@ -253,7 +329,31 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
             executionStatus: run?.status ?? attempt?.transportStatus ?? job.status,
             reviewStatus,
             verificationStatus,
-            outcomeVerified: completionReport?.status === "passed" && Boolean(mission?.approval.allowed),
+            workerCompleted: Boolean(run?.finishedAt || (attempt?.completedAt && !["dispatching", "uncertain"].includes(attempt.transportStatus))),
+            reviewApproved: session?.status === "approved",
+            verificationLevel: (mission?.outcomeObservationIds?.length ?? 0) > 0
+              ? "outcome"
+              : completionReport?.status === "passed" && mission?.requiredEvidenceLevel === "integration_verified" && (mission?.verificationEvidenceIds?.length ?? 0) > 0
+                ? "integration"
+                : completionReport?.status === "passed" && (mission?.verificationEvidenceIds?.length ?? 0) > 0
+                  ? "implementation"
+                  : "not_performed",
+            independentOutcomeObserved: (mission?.outcomeObservationIds?.length ?? 0) > 0,
+            verificationEvidenceIds: [
+              ...(mission?.verificationEvidenceIds ?? []),
+              ...(mission?.outcomeObservationIds ?? []),
+              ...(completionReport?.status === "passed" ? [completionReport.id] : []),
+            ],
+            ...(attempt?.executionReceipt ? { executionReceipt: attempt.executionReceipt } : {}),
+            resultSnapshot: {
+              submissionId: latest?.id,
+              snapshotKind,
+              snapshotRef,
+              reviewEpoch: latest?.reviewEpoch,
+            },
+            verificationBlockers: mission?.approval.reasons.length
+              ? mission.approval.reasons
+              : verificationStatus === "passed" ? [] : ["No qualifying verification receipt is available for the current submission."],
             snapshotKind,
             snapshotRef,
             error: job.lastError ?? run?.errorMessage,
@@ -262,12 +362,11 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
           reportSha256,
         };
       })() : undefined;
-      const reportStart = Math.max(0, (reportOffset ?? 1) - 1);
+      const reportStart = reportOffset ?? 1;
       const reportPageLimit = Math.max(1, Math.min(48_000, reportLimit ?? 48_000));
-      const reportPage = resultReceipt ? reportText.slice(reportStart, reportStart + reportPageLimit) : undefined;
-      const reportNextOffset = resultReceipt && reportStart + reportPageLimit < reportText.length
-        ? reportStart + reportPageLimit + 1
-        : undefined;
+      const reportPageData = resultReceipt ? sliceScheduledReportPage(reportText, reportStart, reportPageLimit) : undefined;
+      const reportPage = reportPageData?.page;
+      const reportNextOffset = reportPageData?.nextOffset;
       return {
         content: [{ type: "text" as const, text: `${job.id}: ${job.status}` }],
         structuredContent: {
@@ -282,7 +381,7 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
             resultReceipt: resultReceipt.receipt,
             report: reportPage,
             reportSha256: resultReceipt.reportSha256,
-            reportOffset: reportOffset ?? 1,
+            reportOffset: reportStart,
             ...(reportNextOffset ? { reportNextOffset } : {}),
             reportTruncated: reportNextOffset !== undefined,
           } : {}),
@@ -293,6 +392,136 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
 
   readTool("get_scheduled_job", "Get scheduled job", "Retrieve a durable scheduled job by ID.");
   readTool("get_scheduled_job_result", "Get scheduled job result", "Retrieve the current scheduled-job correlation and terminal outcome.");
+
+  registerAppTool(server, "verify_scheduled_job", {
+    title: "Run scheduled verification",
+    description: "Run the job's predeclared allowlisted tests against a disposable copy of its exact submitted snapshot. Requires Linux bubblewrap; network access is disabled and the checkout stays unchanged.",
+    inputSchema: { scheduledJobId: z.string() },
+    outputSchema: {
+      scheduledJobId: z.string(),
+      verificationReportSha256: z.string().regex(/^[a-f0-9]{64}$/),
+      submissionId: z.string(),
+      snapshotKind: z.enum(["git", "filesystem"]),
+      snapshotRef: z.string(),
+      results: z.array(z.object({
+        criterionId: z.string(), command: z.string(), status: z.enum(["passed", "failed", "inconclusive"]),
+        exitCode: z.number().nullable(), signal: z.string().nullable(), durationMs: z.number(),
+        outputTail: z.string(), outputSha256: z.string(), failureSetSha256: z.string(),
+      })),
+    },
+    _meta: {},
+    annotations: { readOnlyHint: false, destructiveHint: false },
+  } as any, async (input: unknown) => {
+    if (!isReviewer(config.principalRole)) return forbidden(config.principalRole, "verify_scheduled_job");
+    if (!jobs || !config.workSessions || !config.workspaces || !config.reviewCheckpoints) {
+      return { content: [{ type: "text" as const, text: "Scheduled verification is unavailable: required workspace services are not configured." }], isError: true };
+    }
+    const scheduledJobId = (input as { scheduledJobId?: string } | undefined)?.scheduledJobId;
+    if (!scheduledJobId) return { content: [{ type: "text" as const, text: "Missing scheduledJobId." }], isError: true };
+    const job = jobs.get(scheduledJobId);
+    if (!job) return { content: [{ type: "text" as const, text: `Unknown scheduled job: ${scheduledJobId}` }], isError: true };
+    if (!mayReadJob(job)) return forbidden(config.principalRole, "verify_scheduled_job");
+    try {
+      const verification = await verifyScheduledJob({
+        job,
+        jobs,
+        workSessions: config.workSessions,
+        workspaces: config.workspaces,
+        reviewCheckpoints: config.reviewCheckpoints,
+        serverConfig: config.serverConfig,
+      });
+      return {
+        content: [{ type: "text" as const, text: `${verification.report.results.filter((result) => result.status === "passed").length}/${verification.report.results.length} verification commands passed.` }],
+        structuredContent: {
+          scheduledJobId: job.id,
+          verificationReportSha256: verification.reportSha256,
+          submissionId: verification.report.submissionId,
+          snapshotKind: verification.report.snapshotKind,
+          snapshotRef: verification.report.snapshotRef,
+          results: verification.report.results.map((result) => ({ ...result, outputTail: result.outputTail.slice(-2_000) })),
+        },
+      };
+    } catch (error) {
+      return { content: [{ type: "text" as const, text: error instanceof Error ? error.message : String(error) }], isError: true };
+    }
+  });
+
+  registerAppTool(server, "get_scheduled_job_verification", {
+    title: "Get scheduled verification report",
+    description: "Read a persisted verification receipt by its report hash, with bounded pagination across the immutable report.",
+    inputSchema: {
+      scheduledJobId: z.string(),
+      reportSha256: z.string().regex(/^[a-f0-9]{64}$/),
+      reportOffset: z.number().int().positive().optional(),
+      reportLimit: z.number().int().positive().max(48_000).optional(),
+    },
+    outputSchema: {
+      scheduledJobId: z.string(), reportSha256: z.string(), reportOffset: z.number(), report: z.string(), reportTruncated: z.boolean(), reportNextOffset: z.number().optional(),
+    },
+    _meta: {},
+    annotations: { readOnlyHint: true },
+  } as any, async (input: unknown) => {
+    if (!isReviewer(config.principalRole)) return forbidden(config.principalRole, "get_scheduled_job_verification");
+    if (!jobs) return { content: [{ type: "text" as const, text: "Scheduled verification reports are unavailable." }], isError: true };
+    const value = input as { scheduledJobId?: string; reportSha256?: string; reportOffset?: number; reportLimit?: number } | undefined;
+    const job = value?.scheduledJobId ? jobs.get(value.scheduledJobId) : undefined;
+    if (!job || !value?.reportSha256) return { content: [{ type: "text" as const, text: "Unknown scheduled job or missing verification report identity." }], isError: true };
+    if (!mayReadJob(job)) return forbidden(config.principalRole, "get_scheduled_job_verification");
+    const artifact = jobs.getReport(job.id, value.reportSha256);
+    if (!artifact || !artifact.runId.startsWith("verification:")) {
+      return { content: [{ type: "text" as const, text: "Unknown scheduled verification report." }], isError: true };
+    }
+    const offset = value.reportOffset ?? 1;
+    const { page, nextOffset } = sliceScheduledReportPage(artifact.reportText, offset, value.reportLimit ?? 48_000);
+    return {
+      content: [{ type: "text" as const, text: `${job.id}: verification report ${artifact.reportSha256}` }],
+      structuredContent: {
+        scheduledJobId: job.id,
+        reportSha256: artifact.reportSha256,
+        reportOffset: offset,
+        report: page,
+        reportTruncated: nextOffset !== undefined,
+        ...(nextOffset ? { reportNextOffset: nextOffset } : {}),
+      },
+    };
+  });
+
+  registerAppTool(server, "reconcile_scheduled_job", {
+    title: "Reconcile uncertain scheduled job",
+    description: "Ask the scheduler to inspect the original adapter receipt for an operator-intervention job. This never launches a worker.",
+    inputSchema: { scheduledJobId: z.string() },
+    outputSchema: { scheduledJobId: z.string(), status: z.string(), revision: z.number(), lastError: z.string().optional() },
+    _meta: {},
+    annotations: { readOnlyHint: false },
+  } as any, async (input: unknown) => {
+    if (!isReviewer(config.principalRole)) return forbidden(config.principalRole, "reconcile_scheduled_job");
+    if (!jobs || !config.reconcileScheduledJob) {
+      return { content: [{ type: "text" as const, text: "Scheduled-job reconciliation is unavailable." }], isError: true };
+    }
+    const scheduledJobId = (input as { scheduledJobId?: string } | undefined)?.scheduledJobId;
+    if (!scheduledJobId) return { content: [{ type: "text" as const, text: "Missing scheduledJobId." }], isError: true };
+    const before = jobs.get(scheduledJobId);
+    if (!before) return { content: [{ type: "text" as const, text: `Unknown scheduled job: ${scheduledJobId}` }], isError: true };
+    if (!mayReadJob(before)) return forbidden(config.principalRole, "reconcile_scheduled_job");
+    if (before.status !== "operator_intervention") {
+      return { content: [{ type: "text" as const, text: "Only operator-intervention jobs can be manually reconciled." }], isError: true };
+    }
+    try {
+      const reconciled = await config.reconcileScheduledJob(scheduledJobId);
+      if (!reconciled) return { content: [{ type: "text" as const, text: "Scheduled job disappeared during reconciliation." }], isError: true };
+      return {
+        content: [{ type: "text" as const, text: `${reconciled.id}: ${reconciled.status}` }],
+        structuredContent: {
+          scheduledJobId: reconciled.id,
+          status: reconciled.status,
+          revision: reconciled.revision,
+          lastError: reconciled.lastError,
+        },
+      };
+    } catch (error) {
+      return { content: [{ type: "text" as const, text: error instanceof Error ? error.message : String(error) }], isError: true };
+    }
+  });
 
   registerAppTool(
     server,

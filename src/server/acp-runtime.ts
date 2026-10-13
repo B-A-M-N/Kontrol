@@ -56,6 +56,7 @@ export interface AcpRuntimeHandles {
   readonly supervisorRuntime: SupervisorRuntime;
   readonly replyDispatcher: import("../bridge/reply-dispatcher.js").ReplyDispatcher;
   readonly scheduledJobRuntime?: import("../scheduling/scheduled-job-runtime.js").ScheduledJobRuntime;
+  readonly reconcileScheduledJob: (jobId: string) => Promise<import("../scheduling/scheduled-job-store.js").ScheduledJob | undefined>;
 }
 
 export function createAcpRuntime(deps: AcpRuntimeDeps): AcpRuntimeHandles {
@@ -257,6 +258,9 @@ export function createAcpRuntime(deps: AcpRuntimeDeps): AcpRuntimeHandles {
           status: outcome.status,
           workSessionId: outcome.workSessionId,
           runId: outcome.runId,
+          remoteRunId: outcome.remoteRunId,
+          attemptNumber: outcome.attemptNumber,
+          dispatchId: attempt.dispatchId,
           reason: outcome.reason,
         };
       },
@@ -265,6 +269,16 @@ export function createAcpRuntime(deps: AcpRuntimeDeps): AcpRuntimeHandles {
         if (!attempt) {
           return { status: "operator_intervention", reason: `No durable ACP attempt is bound to dispatch ${input.dispatchId}.` };
         }
+        const scheduledJob = scheduledJobs.get(input.jobId);
+        const scheduledAttempt = scheduledJobs.getAttempt(input.jobId, input.dispatchAttemptId);
+        const readOnlyAudit = scheduledJob?.executionMode === "read_only_audit";
+        const expectedReceipt = readOnlyAudit ? {
+          workSessionId: scheduledJob.workSessionId,
+          workspaceSessionId: scheduledJob.projectId,
+          parentRunId: attempt.runId,
+          attemptNumber: attempt.attemptNumber ?? 1,
+          dispatchIdempotencyKey: attempt.dispatchIdempotencyKey,
+        } : undefined;
         const run = agentRegistry.getRun(attempt.runId);
         if (!run) return { status: "operator_intervention", reason: `ACP run ${attempt.runId} for dispatch ${input.dispatchId} is missing.` };
         const terminalStatus = (status: string): "completed" | "failed" | "cancelled" | undefined => {
@@ -274,14 +288,25 @@ export function createAcpRuntime(deps: AcpRuntimeDeps): AcpRuntimeHandles {
           return undefined;
         };
         const terminal = terminalStatus(run.status);
-        if (terminal) return { status: "terminal", terminalStatus: terminal, workSessionId: run.workSessionId, runId: run.runId };
+        if (terminal) return {
+          status: "terminal",
+          terminalStatus: terminal,
+          workSessionId: run.workSessionId,
+          runId: run.runId,
+          remoteRunId: attempt.remoteRunId,
+          dispatchId: attempt.dispatchIdempotencyKey,
+          attemptNumber: attempt.attemptNumber,
+          executionReceipt: scheduledAttempt?.executionReceipt as import("../acp-gateway.js").ReadOnlyExecutionReceipt | undefined,
+        };
         if (attempt.status === "unstarted") return { status: "unstarted", reason: run.errorMessage };
         if (attempt.status === "rejected") return { status: "terminal", terminalStatus: "failed", workSessionId: run.workSessionId, runId: run.runId, reason: run.errorMessage };
         if (attempt.status === "accepted") {
           if (run.status === "created" || run.status === "dispatch_uncertain" || run.status === "resuming") {
             agentRegistry.updateRun(run.runId, { status: "running", remoteRunId: attempt.remoteRunId });
           }
-          return { status: "accepted", workSessionId: run.workSessionId, runId: run.runId };
+          if (!readOnlyAudit || scheduledAttempt?.executionReceipt) {
+            return { status: "accepted", workSessionId: run.workSessionId, runId: run.runId, remoteRunId: attempt.remoteRunId, dispatchId: attempt.dispatchIdempotencyKey, attemptNumber: attempt.attemptNumber, executionReceipt: scheduledAttempt?.executionReceipt as import("../acp-gateway.js").ReadOnlyExecutionReceipt | undefined };
+          }
         }
 
         const agent = attempt.agentId ? agentRegistry.get(attempt.agentId) : undefined;
@@ -295,13 +320,15 @@ export function createAcpRuntime(deps: AcpRuntimeDeps): AcpRuntimeHandles {
           agentUrl: agent.url,
           adapterSecret: config.acpAdapterSecret,
           dispatchIdempotencyKey: input.dispatchId,
+          requireExecutionReceipt: readOnlyAudit,
+          expectedReceipt,
         });
         if (lookup.status === "found") {
           agentRegistry.updateDispatchAttempt(input.dispatchId, { status: "accepted", remoteRunId: lookup.remoteRunId });
           if (run.status === "created" || run.status === "dispatch_uncertain" || run.status === "resuming") {
             agentRegistry.updateRun(run.runId, { status: "running", remoteRunId: lookup.remoteRunId });
           }
-          return { status: "accepted", workSessionId: run.workSessionId, runId: run.runId };
+          return { status: "accepted", workSessionId: run.workSessionId, runId: run.runId, remoteRunId: lookup.remoteRunId, dispatchId: attempt.dispatchIdempotencyKey, attemptNumber: attempt.attemptNumber, executionReceipt: lookup.executionReceipt };
         }
         if (lookup.status === "unstarted") {
           agentRegistry.updateDispatchAttempt(input.dispatchId, { status: "unstarted" });
@@ -364,5 +391,11 @@ export function createAcpRuntime(deps: AcpRuntimeDeps): AcpRuntimeHandles {
     scheduledJobRuntime.start();
   }
 
-  return { dispatcher, supervisorRuntime, replyDispatcher, scheduledJobRuntime };
+  return {
+    dispatcher,
+    supervisorRuntime,
+    replyDispatcher,
+    scheduledJobRuntime,
+    reconcileScheduledJob: (jobId) => scheduledJobRuntime?.reconcileJob(jobId) ?? Promise.resolve(undefined),
+  };
 }

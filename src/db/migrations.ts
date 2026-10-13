@@ -87,7 +87,61 @@ const migrations: Migration[] = [
   { version: 75, name: "acp-dispatch-idempotency-lookup", up: migrateAcpDispatchIdempotencyLookup },
   { version: 76, name: "scheduled-job-owner-cursors", up: migrateScheduledJobOwnerCursors },
   { version: 77, name: "scheduled-job-cancellation-state", up: migrateScheduledJobCancellationState },
+  { version: 78, name: "scheduled-job-acp-attempt-identity", up: migrateScheduledJobAcpAttemptIdentity },
+  { version: 79, name: "scheduled-job-immutable-reports", up: migrateScheduledJobImmutableReports },
+  { version: 80, name: "scheduled-job-execution-accounting", up: migrateScheduledJobExecutionAccounting },
 ];
+
+function migrateScheduledJobAcpAttemptIdentity(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "scheduled_job_attempts", "acp_dispatch_id", "text");
+  addColumnIfMissing(sqlite, "scheduled_job_attempts", "acp_attempt_number", "integer");
+  addColumnIfMissing(sqlite, "scheduled_job_attempts", "acp_remote_run_id", "text");
+  sqlite.exec(`
+    update scheduled_job_attempts
+       set acp_dispatch_id = coalesce(acp_dispatch_id, dispatch_id)
+     where acp_run_id is not null;
+  `);
+}
+
+function migrateScheduledJobImmutableReports(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table if not exists scheduled_job_reports (
+      id text primary key,
+      job_id text not null references scheduled_jobs(id) on delete cascade,
+      run_id text not null,
+      report_sha256 text not null,
+      report_text text not null,
+      created_at text not null
+    );
+    create unique index if not exists scheduled_job_reports_job_run_unique
+      on scheduled_job_reports(job_id, run_id);
+    create index if not exists scheduled_job_reports_hash_idx
+      on scheduled_job_reports(job_id, report_sha256);
+  `);
+}
+
+function migrateScheduledJobExecutionAccounting(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "scheduled_job_attempts", "execution_started_at", "text");
+  addColumnIfMissing(sqlite, "scheduled_job_attempts", "execution_active_since", "text");
+  addColumnIfMissing(sqlite, "scheduled_job_attempts", "active_runtime_ms", "integer not null default 0");
+  addColumnIfMissing(sqlite, "scheduled_job_attempts", "execution_stopped_at", "text");
+  addColumnIfMissing(sqlite, "scheduled_job_attempts", "execution_receipt_json", "text");
+  // Existing accepted workers predate authenticated start-event accounting.
+  // Preserve their conservative dispatch-based deadline while all new attempts
+  // start their execution clock only when the ACP start event is observed.
+  sqlite.exec(`
+    update scheduled_job_attempts
+       set execution_started_at = coalesce(execution_started_at, started_at),
+           execution_active_since = coalesce(execution_active_since, started_at)
+     where completed_at is null
+       and transport_status = 'accepted'
+       and exists (
+         select 1 from scheduled_jobs job
+          where job.active_dispatch_attempt_id = scheduled_job_attempts.id
+            and job.status = 'running'
+       )
+  `);
+}
 
 // v64: verification attempts need durable monotonic ordering because ISO
 // timestamps can collide. Backfill attempts within each evidence scope from

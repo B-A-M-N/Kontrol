@@ -446,16 +446,23 @@ duplex Agent Client Protocol directly over stdin/stdout:
 ACP_STDIO_AGENT_NAME=my-agent \
 ACP_STDIO_COMMAND=/path/to/agent \
 ACP_STDIO_ARGS_JSON='["acp"]' \
-ACP_STDIO_DISPATCH_METHOD=session/prompt \
 ACP_STDIO_ADAPTER_PORT=9921 \
 node scripts/acp-stdio-duplex-adapter.mjs
 ```
 
-The adapter registers as a normal Kontrol ACP peer and uses the reusable
-`createAcpDuplex` transport. Agent-initiated `session/request_permission` calls
-are converted into Kontrol approval requests and parked until the reviewer
-decides. Hermes currently uses `scripts/acp-hermes-native-adapter.mjs`, which
-bridges Hermes's Python ACP client into the same Kontrol approval/event system.
+The adapter registers as a normal Kontrol ACP peer, negotiates ACP v1, creates
+one agent session for the dispatch, and sends the task through
+`session/prompt`. It uses the reusable `createAcpDuplex` transport.
+Agent-initiated `session/request_permission` calls are converted into Kontrol
+approval requests and parked until the reviewer decides. Set
+`ACP_STDIO_DISPATCH_METHOD` only for a known wrapper with a nonstandard start
+method; that mode sends one direct JSON-RPC request and skips ACP initialization
+and session creation. Hermes currently uses
+`scripts/acp-hermes-native-adapter.mjs`, which bridges Hermes's Python ACP
+client into the same Kontrol approval/event system. To pass provider
+configuration, add only the required ordinary variable names to
+`KONTROL_CHILD_ENV_ALLOWLIST`; control-plane credentials remain filtered from
+the child environment.
 The adapter uses an activity-aware idle watchdog and a separate absolute run
 ceiling. Configure `KONTROL_HERMES_DEADMAN_IDLE_MS` for the idle threshold and
 `KONTROL_HERMES_MAX_RUN_SECONDS` for the hard upper bound; a known tool

@@ -1,4 +1,7 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { realpathSync } from "node:fs";
+import { z } from "zod/v4";
+import { createReadOnlyExecutionGrant } from "./read-only-execution.mjs";
 import {
   serializeFinalAcpResult,
   truncateUtf8Tail,
@@ -57,6 +60,58 @@ export interface PeerDispatchResult {
   status: number;
   body: Record<string, unknown>;
   text: string;
+  executionReceipt?: ReadOnlyExecutionReceipt;
+}
+
+export interface ReadOnlyExecutionReceipt {
+  issuer: "kontrol";
+  work_session_id: string;
+  workspace_session_id: string;
+  parent_run_id: string;
+  remote_run_id: string;
+  attempt_number: number;
+  dispatch_idempotency_key: string;
+  grant_expires_at: number;
+  grant_fingerprint: string;
+  confinement: "bubblewrap-read-only-workspace-no-network";
+}
+
+const readOnlyExecutionReceiptSchema = z.object({
+  issuer: z.literal("kontrol"),
+  work_session_id: z.string().min(1),
+  workspace_session_id: z.string().min(1),
+  parent_run_id: z.string().min(1),
+  remote_run_id: z.string().min(1),
+  attempt_number: z.number().int().positive(),
+  dispatch_idempotency_key: z.string().min(1),
+  grant_expires_at: z.number().int().positive(),
+  grant_fingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+  confinement: z.literal("bubblewrap-read-only-workspace-no-network"),
+}).strict();
+
+function correlateReadOnlyExecutionReceipt(
+  value: unknown,
+  requestBody: Record<string, unknown>,
+  remoteRunId: string,
+): ReadOnlyExecutionReceipt | undefined {
+  const grant = requestBody.read_only_execution_grant;
+  if (!grant || typeof grant !== "object" || Array.isArray(grant)) return undefined;
+  const claims = grant as Record<string, unknown>;
+  const signature = claims.signature;
+  if (typeof signature !== "string" || typeof claims.expiresAt !== "number") return undefined;
+  const parsed = readOnlyExecutionReceiptSchema.safeParse(value);
+  if (!parsed.success) return undefined;
+  const receipt = parsed.data;
+  const grantFingerprint = createHash("sha256").update(signature).digest("hex");
+  if (receipt.work_session_id !== requestBody.session_id
+    || receipt.workspace_session_id !== requestBody.workspace_session_id
+    || receipt.parent_run_id !== requestBody.parent_run_id
+    || receipt.remote_run_id !== remoteRunId
+    || receipt.attempt_number !== requestBody.attempt_number
+    || receipt.dispatch_idempotency_key !== requestBody.dispatch_idempotency_key
+    || receipt.grant_expires_at !== claims.expiresAt
+    || receipt.grant_fingerprint !== grantFingerprint) return undefined;
+  return receipt;
 }
 
 export class AcpDispatchError extends Error {
@@ -64,6 +119,7 @@ export class AcpDispatchError extends Error {
     message: string,
     readonly certainty: "rejected" | "uncertain",
     readonly httpStatus?: number,
+    readonly errorCode?: string,
     options?: ErrorOptions,
   ) {
     super(message, options);
@@ -113,6 +169,7 @@ export async function dispatchToPeer(params: {
       error instanceof Error ? error.message : String(error),
       dispatchFailureCertainty(error),
       undefined,
+      undefined,
       { cause: error },
     );
   }
@@ -124,31 +181,99 @@ export async function dispatchToPeer(params: {
       `ACP response body was interrupted after HTTP ${response.status}.`,
       "uncertain",
       response.status,
+      undefined,
       { cause: error },
     );
   }
-  let parsed: Record<string, unknown> = {};
+  let parsed: Record<string, unknown> | undefined;
   if (text) {
     try {
-      parsed = JSON.parse(text) as Record<string, unknown>;
+      const value: unknown = JSON.parse(text);
+      if (value && typeof value === "object" && !Array.isArray(value)) parsed = value as Record<string, unknown>;
     } catch {
-      parsed = {};
+      parsed = undefined;
     }
   }
   if (!response.ok) {
-    const certainty = response.status >= 400 && response.status < 500
-      && ![408, 409, 425, 429].includes(response.status)
+    const code = typeof parsed?.error === "object" && parsed.error && "code" in parsed.error
+      && typeof (parsed.error as { code?: unknown }).code === "string"
+      ? (parsed.error as { code: string }).code
+      : undefined;
+    const sessionId = typeof params.body.session_id === "string" ? params.body.session_id : undefined;
+    const dispatchKey = typeof params.body.dispatch_idempotency_key === "string" ? params.body.dispatch_idempotency_key : undefined;
+    const duplicateRemoteRunId = typeof parsed?.remote_run_id === "string" ? parsed.remote_run_id
+      : typeof parsed?.run_id === "string" ? parsed.run_id : undefined;
+    const duplicateExecutionReceipt = duplicateRemoteRunId
+      ? correlateReadOnlyExecutionReceipt(parsed?.execution_receipt, params.body, duplicateRemoteRunId)
+      : undefined;
+    const duplicateIsCorrelated = response.status === 409
+      && code === "duplicate_session"
+      && Boolean(duplicateRemoteRunId)
+      && (!sessionId || parsed?.work_session_id === sessionId)
+      && (!dispatchKey || parsed?.dispatch_idempotency_key === dispatchKey)
+      && (params.body.read_only_execution_grant === undefined || Boolean(duplicateExecutionReceipt));
+    if (duplicateIsCorrelated && parsed) {
+      parsed = {
+        ...parsed,
+        run_id: duplicateRemoteRunId,
+        remote_run_id: duplicateRemoteRunId,
+        accepted: true,
+        status: "running",
+      };
+      return { status: response.status, body: parsed, text, executionReceipt: duplicateExecutionReceipt };
+    }
+    const certainty = code === "workspace_lease_lost" || code === "dispatch_receipt_capacity"
       ? "rejected"
-      : "uncertain";
-    throw new AcpDispatchError(`ACP request failed (${response.status}): ${text.slice(0, 500) || "unknown"}`, certainty, response.status);
+      : response.status >= 400 && response.status < 500
+        && ![408, 409, 425, 429].includes(response.status)
+        ? "rejected"
+        : "uncertain";
+    throw new AcpDispatchError(
+      `ACP request failed (${response.status})${code ? ` ${code}` : ""}: ${text.slice(0, 500) || "unknown"}`,
+      certainty,
+      response.status,
+      code,
+    );
   }
-  return { status: response.status, body: parsed, text };
+  const acceptedResponse = z.object({
+    run_id: z.string().trim().min(1),
+    remote_run_id: z.string().trim().min(1).optional(),
+    accepted: z.literal(true),
+    status: z.enum(["accepted", "starting", "running", "completed", "failed", "cancelled"]),
+    dispatch_idempotency_key: z.string().min(1).optional(),
+  }).passthrough().safeParse(parsed);
+  if (!acceptedResponse.success) {
+    throw new AcpDispatchError(
+      `ACP peer returned a malformed successful acceptance response (${response.status}); dispatch outcome is uncertain.`,
+      "uncertain",
+      response.status,
+    );
+  }
+  const body = acceptedResponse.data as Record<string, unknown>;
+  if (body.remote_run_id !== undefined && body.remote_run_id !== body.run_id) {
+    throw new AcpDispatchError("ACP peer returned conflicting run_id and remote_run_id values; dispatch outcome is uncertain.", "uncertain", response.status);
+  }
+  const expectedDispatchKey = params.body.dispatch_idempotency_key;
+  if (typeof expectedDispatchKey === "string"
+    && body.dispatch_idempotency_key !== expectedDispatchKey) {
+    throw new AcpDispatchError("ACP peer acceptance did not confirm the current dispatch idempotency key; dispatch outcome is uncertain.", "uncertain", response.status);
+  }
+  const executionReceipt = params.body.read_only_execution_grant === undefined
+    ? undefined
+    : correlateReadOnlyExecutionReceipt(body.execution_receipt, params.body, body.run_id as string);
+  if (params.body.read_only_execution_grant !== undefined && !executionReceipt) {
+    throw new AcpDispatchError("ACP peer acceptance did not return a correlated read-only execution receipt; dispatch outcome is uncertain.", "uncertain", response.status);
+  }
+  if (executionReceipt) body.execution_receipt = executionReceipt;
+  if (body.status === "accepted" || body.status === "starting") body.status = "running";
+  return { status: response.status, body, text, executionReceipt };
 }
 
 export interface PeerDispatchLookupResult {
   status: "found" | "unstarted" | "unknown";
   remoteRunId?: string;
   executionStatus?: string;
+  executionReceipt?: ReadOnlyExecutionReceipt;
 }
 
 /** Query an adapter using the same idempotency key sent to POST /runs. */
@@ -156,6 +281,14 @@ export async function lookupPeerDispatch(params: {
   agentUrl: string;
   adapterSecret?: string;
   dispatchIdempotencyKey: string;
+  requireExecutionReceipt?: boolean;
+  expectedReceipt?: {
+    workSessionId?: string;
+    workspaceSessionId?: string;
+    parentRunId?: string;
+    attemptNumber?: number;
+    dispatchIdempotencyKey: string;
+  };
   timeoutMs?: number;
 }): Promise<PeerDispatchLookupResult> {
   const endpoint = `${params.agentUrl.replace(/\/+$/, "")}/runs/by-dispatch-id/${encodeURIComponent(params.dispatchIdempotencyKey)}`;
@@ -173,10 +306,25 @@ export async function lookupPeerDispatch(params: {
   const remoteRunId = typeof body.remote_run_id === "string" ? body.remote_run_id
     : typeof body.run_id === "string" ? body.run_id : undefined;
   if (body.accepted === true && remoteRunId) {
+    const parsedReceipt = body.execution_receipt === undefined
+      ? undefined
+      : readOnlyExecutionReceiptSchema.safeParse(body.execution_receipt);
+    const executionReceipt = parsedReceipt?.success ? parsedReceipt.data : undefined;
+    if (params.requireExecutionReceipt && !executionReceipt) return { status: "unknown" };
+    if (body.execution_receipt !== undefined && (!executionReceipt
+      || executionReceipt.remote_run_id !== remoteRunId
+      || executionReceipt.dispatch_idempotency_key !== params.dispatchIdempotencyKey
+      || (params.expectedReceipt?.workSessionId !== undefined && executionReceipt.work_session_id !== params.expectedReceipt.workSessionId)
+      || (params.expectedReceipt?.workspaceSessionId !== undefined && executionReceipt.workspace_session_id !== params.expectedReceipt.workspaceSessionId)
+      || (params.expectedReceipt?.parentRunId !== undefined && executionReceipt.parent_run_id !== params.expectedReceipt.parentRunId)
+      || (params.expectedReceipt?.attemptNumber !== undefined && executionReceipt.attempt_number !== params.expectedReceipt.attemptNumber))) {
+      return { status: "unknown" };
+    }
     return {
       status: "found",
       remoteRunId,
       executionStatus: typeof body.status === "string" ? body.status : undefined,
+      ...(executionReceipt ? { executionReceipt } : {}),
     };
   }
   return { status: "unknown" };
@@ -316,6 +464,7 @@ export interface AgentCallResult {
   error?: string;
   sessionId?: string;
   workSessionId?: string;
+  executionReceipt?: ReadOnlyExecutionReceipt;
 }
 
 export interface AgentCancelResult {
@@ -401,6 +550,8 @@ export async function callRemoteAgent(
       workspaceAccess?: string;
       mutate?: boolean;
       allowedTools?: string[];
+      executionGrantTtlMs?: number;
+      maxRuntimeMs?: number;
     };
   },
 ): Promise<AgentCallResult> {
@@ -485,6 +636,32 @@ export async function callRemoteAgent(
       scheduled_execution_policy: params.scheduledExecutionPolicy,
     };
 
+    if (params.scheduledExecutionPolicy?.executionMode === "read_only_audit") {
+      if (
+        params.scheduledExecutionPolicy.workspaceAccess !== "read_only"
+        || params.scheduledExecutionPolicy.mutate !== false
+        || !params.workSessionId
+        || !params.workspaceSessionId
+        || !run.agentId
+        || !config.adapterSecret
+        || !workspace
+      ) {
+        throw new Error("read_only_grant_claims_invalid");
+      }
+      const canonicalWorkspaceRoot = realpathSync(workspace.root);
+      body.workspace_root = canonicalWorkspaceRoot;
+      body.read_only_execution_grant = createReadOnlyExecutionGrant({
+        workSessionId: params.workSessionId,
+        workspaceSessionId: params.workspaceSessionId,
+        workspaceRoot: canonicalWorkspaceRoot,
+        agentId: run.agentId,
+        runId: run.runId,
+        attemptNumber,
+        dispatchIdempotencyKey,
+        ttlMs: params.scheduledExecutionPolicy.executionGrantTtlMs,
+      }, config.adapterSecret);
+    }
+
     if (params.webhookUrl) {
       body.webhook_url = params.webhookUrl;
     }
@@ -502,14 +679,45 @@ export async function callRemoteAgent(
 
     const result = dispatched.body as {
       run_id?: string;
+      remote_run_id?: string;
       status?: string;
       output?: Array<{ parts?: Array<{ content?: string }> }>;
       error?: { message?: string };
     };
 
-    const remoteRunId = result.run_id ?? run.runId;
+    const remoteRunId = result.remote_run_id ?? result.run_id;
+    if (!remoteRunId) {
+      // dispatchToPeer enforces this schema. Keep the durable boundary
+      // defensive in case a caller is introduced without that helper.
+      throw new AcpDispatchError("ACP peer acceptance did not include an adapter run ID.", "uncertain", dispatched.status);
+    }
     config.agentRegistry.updateDispatchAttempt(dispatchIdempotencyKey, { status: "accepted", remoteRunId });
     const errorMessage = result.error?.message;
+
+    if (useAsync && ["completed", "failed", "cancelled"].includes(String(result.status))) {
+      const outputText = Array.isArray(result.output)
+        ? result.output.flatMap((m) => m.parts?.map((p) => p.content ?? "").filter(Boolean) ?? []).join("\n")
+        : "";
+      config.agentRegistry.updateRun(run.runId, {
+        status: result.status as "completed" | "failed" | "cancelled",
+        remoteRunId,
+        attemptNumber,
+        outputPreview: outputText.slice(0, 2000),
+        outputJson: serializeFinalAcpResult(result, outputText),
+        errorMessage,
+        finishedAt: new Date().toISOString(),
+      });
+      return {
+        runId: run.runId,
+        remoteRunId,
+        attemptNumber,
+        agentName: params.agentName,
+        status: result.status as "completed" | "failed" | "cancelled",
+        output: outputText,
+        error: errorMessage,
+        workSessionId: params.workSessionId,
+      };
+    }
 
     if (useAsync) {
       const currentRun = config.agentRegistry.getRun(run.runId);
@@ -575,6 +783,7 @@ export async function callRemoteAgent(
           status: "running",
           output: "Agent accepted the task and is working. Observe via await_work_session_events or get_work_session.",
           workSessionId: params.workSessionId,
+          ...(dispatched.executionReceipt ? { executionReceipt: dispatched.executionReceipt } : {}),
         };
       }
 

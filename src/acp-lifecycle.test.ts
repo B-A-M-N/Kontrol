@@ -30,7 +30,7 @@ const peer = createServer(async (req, res) => {
     for await (const chunk of req) chunks.push(Buffer.from(chunk));
     peerRuns.push(chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : {});
     res.writeHead(202, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ accepted: true, remote_run_id: `remote-e2e-${peerRuns.length}`, status: "running", output: [] }));
+    res.end(JSON.stringify({ accepted: true, run_id: `remote-e2e-${peerRuns.length}`, remote_run_id: `remote-e2e-${peerRuns.length}`, status: "running", output: [] }));
     return;
   }
   if (req.method === "POST" && /^\/runs\/remote-e2e-\d+\/cancel$/.test(req.url ?? "")) {
@@ -179,12 +179,27 @@ try {
   assert.equal(staleNonce.body.error?.code, "workspace_lease_lost");
   assert.equal(agents.getRun(runId)?.lastHeartbeatAt, heartbeatBeforeStaleAttempt,
     "rejected lease renewals do not update worker heartbeat state");
-  const outputEvent = await lifecycle("output_delta", { text: "working" }, workspaceLeaseNonce, "telemetry-output-1");
+  const outputEvent = await lifecycle("output_delta", {
+    text: "working",
+    runId: "spoofed-run",
+    remoteRunId: "spoofed-remote-run",
+    attemptNumber: 999,
+    dispatchId: "spoofed-dispatch",
+    workSessionId: "spoofed-session",
+    eventId: "spoofed-event",
+  }, workspaceLeaseNonce, "telemetry-output-1");
   assert.equal(outputEvent.status, 202);
   const ingressReceipt = database.sqlite.prepare("select status, payload_json from telemetry_ingress where event_id = ?")
     .get("telemetry-output-1") as { status: string; payload_json?: string | null } | undefined;
   assert.ok(ingressReceipt, "the adapter fragment receipt is committed before HTTP 202 is sent");
-  assert.equal(JSON.parse(ingressReceipt.payload_json!).text, "working");
+  const projectedOutput = JSON.parse(ingressReceipt.payload_json!);
+  assert.equal(projectedOutput.text, "working");
+  assert.equal(projectedOutput.runId, runId, "adapter payload cannot replace the trusted run identity");
+  assert.equal(projectedOutput.remoteRunId, "remote-e2e-1", "adapter payload cannot replace the trusted remote run identity");
+  assert.equal(projectedOutput.attemptNumber, 1, "adapter payload cannot replace the trusted attempt number");
+  assert.notEqual(projectedOutput.dispatchId, "spoofed-dispatch", "adapter payload cannot replace the trusted dispatch identity");
+  assert.equal(projectedOutput.workSessionId, sessionId, "adapter payload cannot replace the trusted work session");
+  assert.equal(projectedOutput.eventId, "telemetry-output-1", "adapter payload cannot replace the trusted event identity");
   const duplicateOutput = await lifecycle("output_delta", { text: "working" }, workspaceLeaseNonce, "telemetry-output-1");
   assert.equal(duplicateOutput.status, 202);
   assert.equal(duplicateOutput.body.duplicate, true, "event-id retries are recognized while coalescing is still pending");
