@@ -124,6 +124,14 @@ export interface ProvideFeedbackResult {
 export interface CancelSessionInput {
   sessionId: string;
   reason?: string;
+  /** Exact adapter event identity, supplied only when finalizing a current ACP attempt. */
+  adapterEvent?: {
+    id: string;
+    runId: string;
+    remoteRunId: string;
+    attemptNumber: number;
+    dispatchIdempotencyKey: string;
+  };
 }
 
 export interface ReviewWorkflowService {
@@ -798,6 +806,19 @@ export function createReviewWorkflowService(
     db.sqlite.transaction(() => {
       workSessions.updateStatus(input.sessionId, "cancelled");
       const correlatedRun = agentRegistry.getRunByWorkSessionId(input.sessionId);
+      const latestAttempt = correlatedRun
+        ? agentRegistry.getLatestDispatchAttemptForRun(correlatedRun.runId)
+        : undefined;
+      const adapterEventMatches = Boolean(
+        input.adapterEvent
+        && correlatedRun
+        && latestAttempt
+        && correlatedRun.runId === input.adapterEvent.runId
+        && correlatedRun.remoteRunId === input.adapterEvent.remoteRunId
+        && latestAttempt.attemptNumber === input.adapterEvent.attemptNumber
+        && latestAttempt.remoteRunId === input.adapterEvent.remoteRunId
+        && latestAttempt.dispatchIdempotencyKey === input.adapterEvent.dispatchIdempotencyKey,
+      );
       if (correlatedRun) {
         agentRegistry.updateRun(correlatedRun.runId, { status: "cancelled", finishedAt: new Date().toISOString(), workerLeaseUntil: null });
       }
@@ -815,9 +836,18 @@ export function createReviewWorkflowService(
         }
       }
       appendWorkflowEvent({
+        ...(adapterEventMatches && input.adapterEvent ? { id: input.adapterEvent.id } : {}),
         type: "agent.run.cancelled",
         sessionId: input.sessionId,
-        payload: { reason: input.reason ?? "cancelled" },
+        payload: {
+          reason: input.reason ?? "cancelled",
+          ...(adapterEventMatches && input.adapterEvent ? {
+            runId: input.adapterEvent.runId,
+            remoteRunId: input.adapterEvent.remoteRunId,
+            attemptNumber: input.adapterEvent.attemptNumber,
+            dispatchId: input.adapterEvent.dispatchIdempotencyKey,
+          } : {}),
+        },
       });
     })();
     eventStore.publishEvents(publishQueue);

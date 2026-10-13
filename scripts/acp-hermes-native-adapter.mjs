@@ -19,7 +19,7 @@ import { readJsonBody, truncateUtf8Tail, writeAdapterError } from "./lib/adapter
 import { buildToolEnvironment } from "./lib/tool-environment.mjs";
 import { adapterStatePath, atomicWriteJson, prepareOwnedChild, processStartToken, readJsonOr, reconcileOwnedProcesses, terminateProcessGroup } from "./lib/managed-agent-process.mjs";
 import { applyWorkspaceLeaseRenewal, workspaceLeaseDeadline, workspaceLeaseDeadlineReached } from "./lib/workspace-lease.mjs";
-import { adapterDispatchFingerprint, findAdapterDispatchReceipt, isTerminalAdapterDispatchStatus, loadAdapterDispatchReceipts, reconcileAdapterDispatchReceipts, recordAdapterDispatchReceipt } from "./lib/adapter-dispatch-receipts.mjs";
+import { acknowledgeAdapterDispatchReceipt, adapterDispatchFingerprint, findAdapterDispatchReceipt, isTerminalAdapterDispatchStatus, loadAdapterDispatchReceipts, reconcileAdapterDispatchReceipts, recordAdapterDispatchReceipt } from "./lib/adapter-dispatch-receipts.mjs";
 const readOnlyModuleUrl = process.env.KONTROL_ARTIFACT_PATH
   ? pathToFileURL(resolve(process.env.KONTROL_ARTIFACT_PATH, "read-only-execution.mjs"))
   : new URL("./lib/read-only-execution.mjs", import.meta.url);
@@ -1089,6 +1089,7 @@ async function deliverEvent(runId, event, run) {
           (event.type === "started" || event.type === "heartbeat") &&
           !applyWorkspaceLeaseRenewal(run, body)
         ) return { acknowledged: false, leaseLost: true };
+        await acknowledgeTerminalDispatchReceipt(event, body);
         return { acknowledged: true, leaseLost: false };
       }
       if (response.status === 409 && body?.error?.code === "workspace_lease_lost") {
@@ -1098,6 +1099,25 @@ async function deliverEvent(runId, event, run) {
     if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
   }
   return { acknowledged: false, leaseLost: false };
+}
+
+async function acknowledgeTerminalDispatchReceipt(event, responseBody) {
+  if (!responseBody?.dispatch_receipt_acknowledged
+    || !["completed", "failed", "cancelled", "exited"].includes(event?.type)
+    || typeof event?.remote_run_id !== "string"
+    || typeof event?.attempt_number !== "number"
+    || typeof event?.event_id !== "string"
+    || typeof responseBody.dispatch_idempotency_key !== "string"
+    || responseBody.remote_run_id !== event.remote_run_id
+    || responseBody.attempt_number !== event.attempt_number
+    || typeof responseBody.event_id !== "string"
+    || responseBody.event_id !== event.event_id) return false;
+  return acknowledgeAdapterDispatchReceipt(DISPATCH_RECEIPTS_PATH, dispatchReceipts, {
+    dispatchIdempotencyKey: responseBody.dispatch_idempotency_key,
+    remoteRunId: event.remote_run_id,
+    attemptNumber: event.attempt_number,
+    eventId: event.event_id,
+  });
 }
 
 function scheduleLeaseLossTermination(run) {

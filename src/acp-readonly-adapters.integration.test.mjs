@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { appendFile, chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createReadOnlyExecutionGrant, findBubblewrap } from "./read-only-execution.mjs";
@@ -142,7 +142,8 @@ async function createWorkspace(root) {
   };
 }
 
-async function createControlPlane(agentId, events) {
+async function createControlPlane(agentId, events, expectedDispatch) {
+  const durableEventPath = join(expectedDispatch.root, "kontrol-durable-events.jsonl");
   const server = createServer(async (req, res) => {
     const chunks = [];
     for await (const chunk of req) chunks.push(Buffer.from(chunk));
@@ -153,12 +154,45 @@ async function createControlPlane(agentId, events) {
       res.end(JSON.stringify({ id: agentId, agentCredential: `${agentId}-credential` }));
       return;
     }
-    if (req.url?.includes("/events")) events.push(body);
+    const eventRoute = req.url?.match(/\/runs\/([^/]+)\/events$/);
+    let receiptAcknowledgement = {};
+    if (eventRoute) {
+      events.push(body);
+      const terminal = ["completed", "failed", "cancelled", "exited"].includes(body.type);
+      const exactDispatch = decodeURIComponent(eventRoute[1]) === expectedDispatch.runId
+        && body.attempt_number === expectedDispatch.attemptNumber
+        && typeof body.remote_run_id === "string"
+        && typeof body.event_id === "string";
+      if (terminal && exactDispatch) {
+        await appendFile(durableEventPath, `${JSON.stringify({ runId: expectedDispatch.runId, dispatchKey: expectedDispatch.dispatchKey, ...body })}\n`);
+        receiptAcknowledgement = {
+          dispatch_receipt_acknowledged: true,
+          dispatch_idempotency_key: expectedDispatch.dispatchKey,
+          remote_run_id: body.remote_run_id,
+          attempt_number: body.attempt_number,
+          event_id: body.event_id,
+        };
+      }
+    }
     res.writeHead(202, { "content-type": "application/json" });
-    res.end(JSON.stringify({ accepted: true }));
+    res.end(JSON.stringify({ accepted: true, ...receiptAcknowledgement }));
   });
   const port = await listen(server);
-  return { server, url: `http://127.0.0.1:${port}/acp` };
+  return { server, url: `http://127.0.0.1:${port}/acp`, durableEventPath };
+}
+
+async function assertReceiptAcknowledged({ adapterName, receiptsPath, dispatchKey, remoteRunId, control }) {
+  const receipt = await waitFor(`${adapterName} durable receipt acknowledgement`, async () => {
+    try {
+      const stored = JSON.parse(await readFile(receiptsPath, "utf8"));
+      return stored.find((item) => item.key === dispatchKey && item.remoteRunId === remoteRunId && item.controllerAcknowledgedAt);
+    } catch { return false; }
+  });
+  assert.equal(typeof receipt.controllerAcknowledgedAt, "number", `${adapterName} receipt is marked only after Kontrol acknowledgement`);
+  assert.equal(typeof receipt.controllerEventId, "string");
+  const durableEvents = (await readFile(control.durableEventPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+  assert.ok(durableEvents.some((event) => event.dispatchKey === dispatchKey && event.remote_run_id === remoteRunId && event.event_id === receipt.controllerEventId),
+    `${adapterName} only releases retention after the matching terminal event is durable at the controller`);
 }
 
 async function createBubblewrapWrapper(root) {
@@ -196,7 +230,11 @@ async function assertConfinedResult({ adapterName, state, accepted, events, outs
 async function runCrush(root) {
   const events = [];
   const state = await createWorkspace(root);
-  const control = await createControlPlane("agent-crush-integration", events);
+  const dispatchKey = "crush-read-only-integration";
+  const runId = "crush-read-only-run";
+  const workSessionId = "crush-read-only-session";
+  const agentId = "agent-crush-integration";
+  const control = await createControlPlane(agentId, events, { root, dispatchKey, runId, attemptNumber: 1 });
   const { wrapper, marker } = await createBubblewrapWrapper(root);
   const crushBin = join(root, "fake-crush");
   await writeFile(crushBin, `#!/bin/sh\n${mutationProbeShell()}\nexit 0\n`);
@@ -229,10 +267,6 @@ async function runCrush(root) {
     await waitFor("CRUSH adapter health", async () => {
       try { return (await fetch(`${baseUrl}/health`)).ok; } catch { return false; }
     }, 10_000).catch((error) => { throw new Error(`${error.message}\n${logs}`); });
-    const dispatchKey = "crush-read-only-integration";
-    const runId = "crush-read-only-run";
-    const workSessionId = "crush-read-only-session";
-    const agentId = "agent-crush-integration";
     const grant = createGrant({ workspaceRoot: state.workspaceRoot, agentId, runId, workSessionId, dispatchKey });
     const body = makeReadOnlyBody({ workspaceRoot: state.workspaceRoot, agentId, runId, workSessionId, dispatchKey, grant });
     assert.equal("workspace_lease_nonce" in body, false, "CRUSH read-only dispatch does not require a mutation lease");
@@ -246,6 +280,7 @@ async function runCrush(root) {
     assert.equal(result.json.dispatch_idempotency_key, dispatchKey);
     assert.ok(result.json.run_id);
     await assertConfinedResult({ adapterName: "CRUSH", state, accepted: result.json, events, outsideFile: state.outsideFile, logs });
+    await assertReceiptAcknowledged({ adapterName: "CRUSH", receiptsPath: join(root, "crush-receipts.json"), dispatchKey, remoteRunId: result.json.run_id, control });
     const lookup = await requestJson(`${baseUrl}/runs/by-dispatch-id/${encodeURIComponent(dispatchKey)}`);
     assert.equal(lookup.response.status, 200);
     assert.equal(lookup.json.run_id, result.json.run_id);
@@ -264,7 +299,11 @@ async function runCrush(root) {
 async function runHermes(root) {
   const events = [];
   const state = await createWorkspace(root);
-  const control = await createControlPlane("agent-hermes-integration", events);
+  const dispatchKey = "hermes-read-only-integration";
+  const runId = "hermes-read-only-run";
+  const workSessionId = "hermes-read-only-session";
+  const agentId = "agent-hermes-integration";
+  const control = await createControlPlane(agentId, events, { root, dispatchKey, runId, attemptNumber: 1 });
   const { wrapper, marker } = await createBubblewrapWrapper(root);
   const hermesRoot = join(root, "hermes-runtime");
   const toolchainRoot = await mkdtemp(join(process.cwd(), ".tmp-kontrol-hermes-toolchain-"));
@@ -348,10 +387,6 @@ async function runHermes(root) {
     await waitFor("Hermes adapter health", async () => {
       try { return (await fetch(`${baseUrl}/health`)).ok; } catch { return false; }
     }, 12_000).catch((error) => { throw new Error(`${error.message}\n${logs}`); });
-    const dispatchKey = "hermes-read-only-integration";
-    const runId = "hermes-read-only-run";
-    const workSessionId = "hermes-read-only-session";
-    const agentId = "agent-hermes-integration";
     const grant = createGrant({ workspaceRoot: state.workspaceRoot, agentId, runId, workSessionId, dispatchKey });
     const body = makeReadOnlyBody({ workspaceRoot: state.workspaceRoot, agentId, runId, workSessionId, dispatchKey, grant });
     assert.equal("workspace_lease_nonce" in body, false, "Hermes read-only dispatch does not require a mutation lease");
@@ -365,6 +400,7 @@ async function runHermes(root) {
     assert.equal(result.json.dispatch_idempotency_key, dispatchKey);
     assert.ok(result.json.run_id);
     await assertConfinedResult({ adapterName: "Hermes", state, accepted: result.json, events, outsideFile: state.outsideFile, logs });
+    await assertReceiptAcknowledged({ adapterName: "Hermes", receiptsPath: join(root, "hermes-receipts.json"), dispatchKey, remoteRunId: result.json.run_id, control });
     const lookup = await requestJson(`${baseUrl}/runs/by-dispatch-id/${encodeURIComponent(dispatchKey)}`);
     assert.equal(lookup.response.status, 200);
     assert.equal(lookup.json.run_id, result.json.run_id);

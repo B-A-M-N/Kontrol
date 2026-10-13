@@ -72,6 +72,41 @@ const SERVER_OWNED_EVENT_PAYLOAD_FIELDS = new Set([
   "eventId",
 ]);
 
+const ADAPTER_TERMINAL_EVENT_TYPES = new Set(["completed", "failed", "cancelled", "exited"]);
+
+function dispatchReceiptAcknowledgement(
+  body: { type?: string; event_id?: string; remote_run_id?: string; attempt_number?: number },
+  run: { runId: string; remoteRunId?: string },
+  attempt: { dispatchIdempotencyKey: string; runId: string; attemptNumber: number; remoteRunId?: string } | undefined,
+  durableOutcomeObserved: boolean,
+): Record<string, unknown> | undefined {
+  if (!durableOutcomeObserved || !body.type || !ADAPTER_TERMINAL_EVENT_TYPES.has(body.type)) return undefined;
+  if (!attempt?.dispatchIdempotencyKey || attempt.runId !== run.runId || !attempt.remoteRunId) return undefined;
+  if (typeof body.event_id !== "string" || body.event_id.length === 0) return undefined;
+  if (body.attempt_number !== attempt.attemptNumber || body.remote_run_id !== attempt.remoteRunId) return undefined;
+  if (run.remoteRunId !== attempt.remoteRunId) return undefined;
+  return {
+    dispatch_receipt_acknowledged: true,
+    dispatch_idempotency_key: attempt.dispatchIdempotencyKey,
+    remote_run_id: attempt.remoteRunId,
+    attempt_number: attempt.attemptNumber,
+    event_id: body.event_id,
+  };
+}
+
+function eventMatchesDispatch(event: { type: string; payload: Record<string, unknown> }, run: { runId: string; remoteRunId?: string }, body: { type?: string; event_id?: string; remote_run_id?: string; attempt_number?: number }, attempt: { dispatchIdempotencyKey: string; runId: string; attemptNumber: number; remoteRunId?: string } | undefined): boolean {
+  return Boolean(
+    body.type
+    && ADAPTER_TERMINAL_EVENT_TYPES.has(body.type)
+    && attempt?.dispatchIdempotencyKey
+    && event.payload.runId === run.runId
+    && event.payload.remoteRunId === body.remote_run_id
+    && event.payload.remoteRunId === attempt.remoteRunId
+    && event.payload.attemptNumber === body.attempt_number
+    && event.payload.dispatchId === attempt.dispatchIdempotencyKey,
+  );
+}
+
   router.post("/runs/:run_id/events", async (req, res) => {
     const role = authGate(req, res, ["agent", "operator"]);
     if (!role) return;
@@ -220,7 +255,17 @@ const SERVER_OWNED_EVENT_PAYLOAD_FIELDS = new Set([
     if (body.event_id && eventStore) {
       const existing = eventStore.getEventById(body.event_id);
       if (existing) {
-        res.status(202).json({ run_id: run.runId, status: run.status, accepted: true, duplicate: true, event_id: body.event_id });
+        const acknowledgement = eventMatchesDispatch(existing, run, body, authoritativeAttempt)
+          ? dispatchReceiptAcknowledgement(body, run, authoritativeAttempt, true)
+          : undefined;
+        res.status(202).json({
+          run_id: run.runId,
+          status: run.status,
+          accepted: true,
+          duplicate: true,
+          event_id: body.event_id,
+          ...(acknowledgement ?? {}),
+        });
         return;
       }
     }
@@ -417,7 +462,21 @@ const SERVER_OWNED_EVENT_PAYLOAD_FIELDS = new Set([
     } else if (body.type === "cancelled") {
       const session = sessionId ? workSessions.get(sessionId) : undefined;
       if (session && !TERMINAL_SESSION_STATUSES.has(session.status) && reviewWorkflow) {
-        await reviewWorkflow.finalizeCancellation({ sessionId: session.id, reason: stringPayload(body.payload?.message) ?? "worker cancelled" });
+        await reviewWorkflow.finalizeCancellation({
+          sessionId: session.id,
+          reason: stringPayload(body.payload?.message) ?? "worker cancelled",
+          ...(body.event_id && body.remote_run_id && body.attempt_number !== undefined && authoritativeAttempt?.dispatchIdempotencyKey
+            ? {
+                adapterEvent: {
+                  id: body.event_id,
+                  runId: run.runId,
+                  remoteRunId: body.remote_run_id,
+                  attemptNumber: body.attempt_number,
+                  dispatchIdempotencyKey: authoritativeAttempt.dispatchIdempotencyKey,
+                },
+              }
+            : {}),
+        });
       } else {
         agentRegistry.updateRun(run.runId, { status: "cancelled", finishedAt: now, workerLeaseUntil: null });
       }
@@ -442,6 +501,7 @@ const SERVER_OWNED_EVENT_PAYLOAD_FIELDS = new Set([
           workerLeaseUntil: null,
         });
         eventStore?.appendEvent({
+          id: body.event_id,
           type: "worker.attempt.failed",
           sessionId: session.id,
           payload: {
@@ -474,12 +534,20 @@ const SERVER_OWNED_EVENT_PAYLOAD_FIELDS = new Set([
 
     const finalRun = agentRegistry.getRun(run.runId);
     const finalSession = finalRun?.workSessionId ? workSessions.get(finalRun.workSessionId) : undefined;
+    const persistedTerminalEvent = body.event_id ? eventStore?.getEventById(body.event_id) : undefined;
+    const dispatchReceiptAck = dispatchReceiptAcknowledgement(
+      body,
+      run,
+      authoritativeAttempt,
+      Boolean(persistedTerminalEvent && eventMatchesDispatch(persistedTerminalEvent, run, body, authoritativeAttempt)),
+    );
     res.status(202).json({
       run_id: run.runId,
       status: finalRun?.status ?? run.status,
       work_session_status: finalSession?.status,
       ...(workspaceLeaseExpiresAt ? { workspace_lease_expires_at: workspaceLeaseExpiresAt } : {}),
       accepted: true,
+      ...(dispatchReceiptAck ?? {}),
     });
   });
 

@@ -20,7 +20,7 @@ export async function loadAdapterDispatchReceipts(path) {
   const receipts = new Map();
   for (const item of Array.isArray(stored) ? stored : []) {
     if (typeof item?.key !== "string" || typeof item?.remoteRunId !== "string" || typeof item?.createdAt !== "number") continue;
-    if (TERMINAL_STATUSES.has(item.status) && item.createdAt < now - RECEIPT_RETENTION_MS) continue;
+    if (isAcknowledgedTerminal(item) && item.controllerAcknowledgedAt < now - RECEIPT_RETENTION_MS) continue;
     receipts.set(item.key, item);
   }
   trimReceipts(receipts, now);
@@ -93,47 +93,28 @@ export function adapterDispatchFingerprint(body) {
 }
 
 export async function recordAdapterDispatchReceipt(path, receipts, key, remoteRunId, status = "running", details = {}) {
+  return withReceiptMutationLock(path, () => writeReceipt(path, receipts, key, remoteRunId, status, details));
+}
+
+/**
+ * Mark a terminal receipt reclaimable only after the controller has durably
+ * recorded the exact outcome. The event identity is echoed by Kontrol after
+ * its event transaction commits; receipt age starts from that acknowledgement.
+ */
+export async function acknowledgeAdapterDispatchReceipt(path, receipts, input) {
   return withReceiptMutationLock(path, async () => {
-    const prior = receipts.get(key);
-    if (prior?.requestFingerprint && details?.requestFingerprint && prior.requestFingerprint !== details.requestFingerprint) {
-      throw new Error(`dispatch receipt request fingerprint conflict for ${key}`);
-    }
-    if (prior && prior.remoteRunId !== remoteRunId) {
-      throw new Error(`dispatch receipt conflict for ${key}: existing remote run ${prior.remoteRunId} cannot be replaced`);
-    }
-    if (prior && TERMINAL_STATUSES.has(prior.status) && status !== prior.status) {
-      if (!TERMINAL_STATUSES.has(status)) status = prior.status;
-      else throw new Error(`dispatch receipt conflict for ${key}: terminal status ${prior.status} cannot change to ${status}`);
-    }
-    const now = Date.now();
-    const nextReceipts = new Map(receipts);
-    trimReceipts(nextReceipts, now);
-    if (!prior && nextReceipts.size >= ADAPTER_DISPATCH_RECEIPT_MAX_ENTRIES) {
-      // Terminal entries may be evicted early under capacity pressure; live
-      // and unresolved entries remain durable regardless of age.
-      const oldestTerminal = [...nextReceipts]
-        .filter(([, receipt]) => TERMINAL_STATUSES.has(receipt.status))
-        .sort((left, right) => (left[1].updatedAt ?? left[1].createdAt) - (right[1].updatedAt ?? right[1].createdAt))[0]?.[0];
-      if (oldestTerminal) nextReceipts.delete(oldestTerminal);
-    }
-    if (!prior && nextReceipts.size >= ADAPTER_DISPATCH_RECEIPT_MAX_ENTRIES) {
-      throw new AdapterDispatchReceiptCapacityError();
-    }
-    const receipt = {
-      ...prior,
-      ...(details && typeof details === "object" ? details : {}),
-      key,
-      remoteRunId,
-      status,
-      createdAt: prior?.createdAt ?? now,
-      updatedAt: now,
-    };
-    nextReceipts.set(key, receipt);
-    trimReceipts(nextReceipts, now);
-    await atomicWriteJson(path, [...nextReceipts.values()]);
-    receipts.clear();
-    for (const [nextKey, nextReceipt] of nextReceipts) receipts.set(nextKey, nextReceipt);
-    return receipt;
+    const prior = receipts.get(input.dispatchIdempotencyKey);
+    if (!prior
+      || prior.remoteRunId !== input.remoteRunId
+      || prior.attemptNumber !== input.attemptNumber
+      || !TERMINAL_STATUSES.has(prior.status)
+      || typeof input.eventId !== "string"
+      || input.eventId.length === 0) return false;
+    await writeReceipt(path, receipts, prior.key, prior.remoteRunId, prior.status, {
+      controllerAcknowledgedAt: prior.controllerAcknowledgedAt ?? input.acknowledgedAt ?? Date.now(),
+      controllerEventId: prior.controllerEventId ?? input.eventId,
+    });
+    return true;
   });
 }
 
@@ -154,11 +135,62 @@ async function withReceiptMutationLock(path, operation) {
 function trimReceipts(receipts, now) {
   const cutoff = now - RECEIPT_RETENTION_MS;
   for (const [key, receipt] of receipts) {
-    if (TERMINAL_STATUSES.has(receipt.status) && receipt.createdAt < cutoff) receipts.delete(key);
+    if (isAcknowledgedTerminal(receipt) && receipt.controllerAcknowledgedAt < cutoff) receipts.delete(key);
   }
   while (receipts.size > ADAPTER_DISPATCH_RECEIPT_MAX_ENTRIES) {
-    const oldest = [...receipts].find(([, receipt]) => TERMINAL_STATUSES.has(receipt.status))?.[0];
+    const oldest = [...receipts]
+      .filter(([, receipt]) => isAcknowledgedTerminal(receipt))
+      .sort((left, right) => left[1].controllerAcknowledgedAt - right[1].controllerAcknowledgedAt)[0]?.[0];
     if (!oldest) break;
     receipts.delete(oldest);
   }
+}
+
+function isAcknowledgedTerminal(receipt) {
+  return TERMINAL_STATUSES.has(receipt?.status) && Number.isSafeInteger(receipt?.controllerAcknowledgedAt);
+}
+
+async function writeReceipt(path, receipts, key, remoteRunId, requestedStatus, details = {}) {
+  const prior = receipts.get(key);
+  let status = requestedStatus;
+  if (prior?.requestFingerprint && details?.requestFingerprint && prior.requestFingerprint !== details.requestFingerprint) {
+    throw new Error(`dispatch receipt request fingerprint conflict for ${key}`);
+  }
+  if (prior && prior.remoteRunId !== remoteRunId) {
+    throw new Error(`dispatch receipt conflict for ${key}: existing remote run ${prior.remoteRunId} cannot be replaced`);
+  }
+  if (prior && TERMINAL_STATUSES.has(prior.status) && status !== prior.status) {
+    if (!TERMINAL_STATUSES.has(status)) status = prior.status;
+    else throw new Error(`dispatch receipt conflict for ${key}: terminal status ${prior.status} cannot change to ${status}`);
+  }
+  const now = Date.now();
+  const nextReceipts = new Map(receipts);
+  trimReceipts(nextReceipts, now);
+  if (!prior && nextReceipts.size >= ADAPTER_DISPATCH_RECEIPT_MAX_ENTRIES) {
+    // Capacity pressure may reclaim only terminal records already acknowledged
+    // by Kontrol. Unresolved dispatch evidence is never discarded to admit a
+    // new launch.
+    const oldestAcknowledged = [...nextReceipts]
+      .filter(([, receipt]) => isAcknowledgedTerminal(receipt))
+      .sort((left, right) => left[1].controllerAcknowledgedAt - right[1].controllerAcknowledgedAt)[0]?.[0];
+    if (oldestAcknowledged) nextReceipts.delete(oldestAcknowledged);
+  }
+  if (!prior && nextReceipts.size >= ADAPTER_DISPATCH_RECEIPT_MAX_ENTRIES) {
+    throw new AdapterDispatchReceiptCapacityError();
+  }
+  const receipt = {
+    ...prior,
+    ...(details && typeof details === "object" ? details : {}),
+    key,
+    remoteRunId,
+    status,
+    createdAt: prior?.createdAt ?? now,
+    updatedAt: now,
+  };
+  nextReceipts.set(key, receipt);
+  trimReceipts(nextReceipts, now);
+  await atomicWriteJson(path, [...nextReceipts.values()]);
+  receipts.clear();
+  for (const [nextKey, nextReceipt] of nextReceipts) receipts.set(nextKey, nextReceipt);
+  return receipt;
 }

@@ -51,12 +51,25 @@ const cancellationWorkflow = {
     eventStore.appendEvent({ type: "agent.run.cancellation_requested", sessionId, payload: {} });
     return { status: "cancelling" };
   },
-  finalizeCancellation({ sessionId }: { sessionId: string }) {
+  finalizeCancellation({ sessionId, adapterEvent }: {
+    sessionId: string;
+    adapterEvent?: { id: string; runId: string; remoteRunId: string; attemptNumber: number; dispatchIdempotencyKey: string };
+  }) {
     cancellationFinalizeCalls++;
     workSessions.updateStatus(sessionId, "cancelled");
     const run = agents.getRunByWorkSessionId(sessionId);
     if (run) agents.updateRun(run.runId, { status: "cancelled", finishedAt: new Date().toISOString() });
-    eventStore.appendEvent({ type: "agent.run.cancelled", sessionId, payload: {} });
+    eventStore.appendEvent({
+      ...(adapterEvent ? { id: adapterEvent.id } : {}),
+      type: "agent.run.cancelled",
+      sessionId,
+      payload: adapterEvent ? {
+        runId: adapterEvent.runId,
+        remoteRunId: adapterEvent.remoteRunId,
+        attemptNumber: adapterEvent.attemptNumber,
+        dispatchId: adapterEvent.dispatchIdempotencyKey,
+      } : {},
+    });
     return { status: "cancelled" };
   },
 };
@@ -139,6 +152,9 @@ try {
   const runId = dispatch.body.kontrol_run_id as string;
   const sessionId = dispatch.body.session_id as string;
   assert.ok(runId && sessionId);
+  const terminalDispatchKey = "acp-lifecycle-terminal-receipt";
+  agents.beginDispatchAttempt({ key: terminalDispatchKey, runId, agentId, attemptNumber: 1 });
+  agents.updateDispatchAttempt(terminalDispatchKey, { status: "accepted", remoteRunId: "remote-e2e-1" });
 
   const workspaceLeaseNonce = peerRuns[0]?.workspace_lease_nonce as string | undefined;
   assert.ok(workspaceLeaseNonce, "dispatch gives the adapter its checkout fencing nonce");
@@ -203,11 +219,21 @@ try {
   const duplicateOutput = await lifecycle("output_delta", { text: "working" }, workspaceLeaseNonce, "telemetry-output-1");
   assert.equal(duplicateOutput.status, 202);
   assert.equal(duplicateOutput.body.duplicate, true, "event-id retries are recognized while coalescing is still pending");
-  const completed = await lifecycle("completed", { final_output: "done ✅" }, workspaceLeaseNonce);
+  const completed = await lifecycle("completed", { final_output: "done ✅" }, workspaceLeaseNonce, "terminal-event-1");
   assert.equal(completed.status, 202);
   assert.equal(completed.body.status, "completed", "authenticated lifecycle completion updates the durable run");
   assert.equal(agents.getRun(runId)?.status, "completed");
   assert.equal(agents.getRun(runId)?.remoteRunId, "remote-e2e-1");
+  assert.equal(completed.body.dispatch_receipt_acknowledged, true,
+    "Kontrol acknowledges adapter receipt retention only after persisting the current attempt's terminal event");
+  assert.equal(completed.body.dispatch_idempotency_key, terminalDispatchKey);
+  assert.equal(completed.body.remote_run_id, "remote-e2e-1");
+  assert.equal(completed.body.attempt_number, 1);
+  assert.equal(completed.body.event_id, "terminal-event-1");
+  const duplicateCompletion = await lifecycle("completed", { final_output: "done ✅" }, workspaceLeaseNonce, "terminal-event-1");
+  assert.equal(duplicateCompletion.body.duplicate, true);
+  assert.equal(duplicateCompletion.body.dispatch_receipt_acknowledged, true,
+    "a retried terminal event repeats the same durable acknowledgement after a lost HTTP response");
   assert.equal(workSessions.get(sessionId)?.workspaceSessionId, "ws-e2e");
 
   const cancellationDispatch = await jsonFetch("/runs", {
@@ -237,6 +263,49 @@ try {
   assert.equal(agents.getRun(cancellationRunId)?.status, "cancelling");
   assert.equal(eventStore.getEventsForSession(cancellationSessionId).some((event) => event.type === "agent.run.cancelled"), false,
     "an adapter 404 does not fabricate a durable worker-cancelled event");
+
+  const cancellationRemoteRunId = "remote-e2e-2";
+  const cancellationAttemptKey = "acp-lifecycle-cancel-terminal";
+  agents.beginDispatchAttempt({ key: cancellationAttemptKey, runId: cancellationRunId, agentId, attemptNumber: 1 });
+  agents.updateDispatchAttempt(cancellationAttemptKey, { status: "accepted", remoteRunId: cancellationRemoteRunId });
+  const cancellationEventBody = {
+    type: "cancelled",
+    remote_run_id: cancellationRemoteRunId,
+    attempt_number: 1,
+    event_id: "cancel-terminal-event-1",
+    agent_id: agentId,
+    work_session_id: cancellationSessionId,
+    payload: { message: "worker confirmed cancellation" },
+  };
+  const cancelled = await jsonFetch(`/runs/${encodeURIComponent(cancellationRunId)}/events`, {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer agent-secret",
+      "Content-Type": "application/json",
+      "x-kontrol-agent-id": agentId,
+      "x-kontrol-agent-credential": agentCredential,
+    },
+    body: JSON.stringify(cancellationEventBody),
+  });
+  assert.equal(cancelled.status, 202);
+  assert.equal(cancelled.body.dispatch_receipt_acknowledged, true,
+    "workflow-finalized cancellation acknowledges only after persisting the exact adapter event ID");
+  assert.equal(cancelled.body.event_id, cancellationEventBody.event_id);
+  const persistedCancellationEvent = eventStore.getEventById(cancellationEventBody.event_id);
+  assert.equal(persistedCancellationEvent?.payload?.dispatchId, cancellationAttemptKey);
+  const duplicateCancelled = await jsonFetch(`/runs/${encodeURIComponent(cancellationRunId)}/events`, {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer agent-secret",
+      "Content-Type": "application/json",
+      "x-kontrol-agent-id": agentId,
+      "x-kontrol-agent-credential": agentCredential,
+    },
+    body: JSON.stringify(cancellationEventBody),
+  });
+  assert.equal(duplicateCancelled.body.duplicate, true);
+  assert.equal(duplicateCancelled.body.dispatch_receipt_acknowledged, true,
+    "a retried workflow cancellation repeats the acknowledgement from its persisted event identity");
 
   console.log("acp-lifecycle.test.ts: all assertions passed");
 } finally {

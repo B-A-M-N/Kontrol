@@ -175,6 +175,65 @@ assert.deepEqual(payload.uncoveredPaths, ["node_modules/patched.js"]);
   assert.equal(workSessions.get(session3.id)?.status, "rejected");
 }
 
+// Adapter receipt acknowledgement can only refer to the exact current attempt
+// event persisted by the workflow-owned cancellation transition.
+{
+  const cancellationSession = workSessions.create({ workspaceSessionId: "ws-coverage-e2e", submittedBy: "worker" });
+  const cancellationRun = agents.createRun({
+    agentName: "coverage-cancel-agent",
+    workspaceSessionId: "ws-coverage-e2e",
+    workSessionId: cancellationSession.id,
+    status: "cancelling",
+    remoteRunId: "coverage-cancel-remote",
+    attemptNumber: 2,
+  });
+  const dispatchIdempotencyKey = "coverage-cancel-dispatch-attempt-2";
+  agents.beginDispatchAttempt({ key: dispatchIdempotencyKey, runId: cancellationRun.runId, attemptNumber: 2 });
+  agents.updateDispatchAttempt(dispatchIdempotencyKey, { status: "accepted", remoteRunId: "coverage-cancel-remote" });
+  const adapterEventId = "coverage-cancel-event-2";
+  workflow.finalizeCancellation({
+    sessionId: cancellationSession.id,
+    reason: "worker stopped",
+    adapterEvent: {
+      id: adapterEventId,
+      runId: cancellationRun.runId,
+      remoteRunId: "coverage-cancel-remote",
+      attemptNumber: 2,
+      dispatchIdempotencyKey,
+    },
+  });
+  const cancellationEvent = eventStore.getEventById(adapterEventId);
+  assert.ok(cancellationEvent, "matching adapter event ID is persisted in the canonical cancellation event");
+  assert.equal(cancellationEvent.payload.runId, cancellationRun.runId);
+  assert.equal(cancellationEvent.payload.remoteRunId, "coverage-cancel-remote");
+  assert.equal(cancellationEvent.payload.attemptNumber, 2);
+  assert.equal(cancellationEvent.payload.dispatchId, dispatchIdempotencyKey);
+
+  const staleSession = workSessions.create({ workspaceSessionId: "ws-coverage-e2e", submittedBy: "worker" });
+  const staleRun = agents.createRun({
+    agentName: "coverage-stale-cancel-agent",
+    workspaceSessionId: "ws-coverage-e2e",
+    workSessionId: staleSession.id,
+    status: "cancelling",
+    remoteRunId: "coverage-stale-remote",
+    attemptNumber: 2,
+  });
+  agents.beginDispatchAttempt({ key: "coverage-stale-dispatch-attempt-2", runId: staleRun.runId, attemptNumber: 2 });
+  agents.updateDispatchAttempt("coverage-stale-dispatch-attempt-2", { status: "accepted", remoteRunId: "coverage-stale-remote" });
+  workflow.finalizeCancellation({
+    sessionId: staleSession.id,
+    adapterEvent: {
+      id: "coverage-stale-event-1",
+      runId: staleRun.runId,
+      remoteRunId: "coverage-stale-remote",
+      attemptNumber: 1,
+      dispatchIdempotencyKey: "coverage-stale-dispatch-attempt-1",
+    },
+  });
+  assert.equal(eventStore.getEventById("coverage-stale-event-1"), undefined,
+    "a stale adapter event cannot bind its identity to workflow cancellation");
+}
+
 workSessions.close();
 agents.close();
 eventStore.close();

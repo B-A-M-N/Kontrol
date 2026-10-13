@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   ADAPTER_DISPATCH_RECEIPT_MAX_ENTRIES,
+  acknowledgeAdapterDispatchReceipt,
   adapterDispatchFingerprint,
   findAdapterDispatchReceipt,
   loadAdapterDispatchReceipts,
@@ -115,13 +116,43 @@ try {
 
   const expiredStatusPath = join(root, "old-receipts.json");
   const oldCreatedAt = Date.now() - 31 * 24 * 60 * 60 * 1000;
+  const recentAcknowledgement = Date.now();
   await writeFile(expiredStatusPath, JSON.stringify([
     { key: "unresolved", remoteRunId: "remote-unresolved", status: "running", createdAt: oldCreatedAt, updatedAt: oldCreatedAt },
-    { key: "terminal", remoteRunId: "remote-terminal", status: "completed", createdAt: oldCreatedAt, updatedAt: oldCreatedAt },
+    { key: "unacknowledged-terminal", remoteRunId: "remote-terminal", attemptNumber: 1, status: "completed", createdAt: oldCreatedAt, updatedAt: oldCreatedAt },
+    { key: "acknowledged-terminal", remoteRunId: "remote-acknowledged", attemptNumber: 1, status: "completed", createdAt: oldCreatedAt, updatedAt: oldCreatedAt, controllerAcknowledgedAt: oldCreatedAt, controllerEventId: "event-old" },
+    { key: "recently-acknowledged-terminal", remoteRunId: "remote-recent", attemptNumber: 1, status: "completed", createdAt: oldCreatedAt, updatedAt: recentAcknowledgement, controllerAcknowledgedAt: recentAcknowledgement, controllerEventId: "event-recent" },
   ]));
   const retained = await loadAdapterDispatchReceipts(expiredStatusPath);
   assert.ok(findAdapterDispatchReceipt(retained, "unresolved"), "age alone cannot discard the only mapping for a live or unresolved run");
-  assert.equal(findAdapterDispatchReceipt(retained, "terminal"), undefined, "old terminal receipts remain eligible for bounded retention cleanup");
+  assert.ok(findAdapterDispatchReceipt(retained, "unacknowledged-terminal"), "a terminal receipt stays pinned until Kontrol confirms durable outcome persistence");
+  assert.equal(findAdapterDispatchReceipt(retained, "acknowledged-terminal"), undefined, "an acknowledged terminal receipt ages out from its controller acknowledgement");
+  assert.ok(findAdapterDispatchReceipt(retained, "recently-acknowledged-terminal"), "receipt retention starts when Kontrol acknowledges, not when the worker was launched");
+
+  const acknowledgementPath = join(root, "acknowledgement.json");
+  const acknowledgementReceipts = await loadAdapterDispatchReceipts(acknowledgementPath);
+  await recordAdapterDispatchReceipt(acknowledgementPath, acknowledgementReceipts, "ack-key", "ack-remote", "completed", { attemptNumber: 3 });
+  assert.equal(await acknowledgeAdapterDispatchReceipt(acknowledgementPath, acknowledgementReceipts, {
+    dispatchIdempotencyKey: "ack-key", remoteRunId: "ack-remote", attemptNumber: 2, eventId: "ack-event",
+  }), false, "stale attempt acknowledgements cannot release receipt retention");
+  assert.equal(await acknowledgeAdapterDispatchReceipt(acknowledgementPath, acknowledgementReceipts, {
+    dispatchIdempotencyKey: "ack-key", remoteRunId: "different-remote", attemptNumber: 3, eventId: "ack-event",
+  }), false, "a mismatched remote run cannot release receipt retention");
+  assert.equal(await acknowledgeAdapterDispatchReceipt(acknowledgementPath, acknowledgementReceipts, {
+    dispatchIdempotencyKey: "ack-key", remoteRunId: "ack-remote", attemptNumber: 3, eventId: "ack-event",
+  }), true, "the exact durable terminal outcome acknowledges its receipt");
+  assert.equal(findAdapterDispatchReceipt(acknowledgementReceipts, "ack-key")?.controllerEventId, "ack-event");
+
+  const saturatedTerminal = new Map();
+  for (let index = 0; index < ADAPTER_DISPATCH_RECEIPT_MAX_ENTRIES; index += 1) {
+    const key = `terminal-unacknowledged-${index}`;
+    saturatedTerminal.set(key, { key, remoteRunId: `remote-terminal-${index}`, status: "completed", createdAt: oldCreatedAt });
+  }
+  await assert.rejects(
+    () => recordAdapterDispatchReceipt(join(root, "saturated-terminal.json"), saturatedTerminal, "new-terminal", "remote-new-terminal", "dispatching"),
+    (error) => error?.code === "dispatch_receipt_capacity",
+    "capacity pressure cannot evict an unacknowledged terminal result",
+  );
 
   const saturatedPath = join(root, "saturated-receipts.json");
   const saturated = new Map();
@@ -135,6 +166,22 @@ try {
     "new launches fail closed when unresolved evidence fills the bounded receipt store",
   );
   assert.equal(saturated.has("new-launch"), false, "capacity rejection does not mutate the receipt projection");
+
+  const acknowledgedSaturated = new Map();
+  for (let index = 0; index < ADAPTER_DISPATCH_RECEIPT_MAX_ENTRIES; index += 1) {
+    const key = `acknowledged-${index}`;
+    acknowledgedSaturated.set(key, {
+      key,
+      remoteRunId: `remote-acknowledged-${index}`,
+      status: "completed",
+      createdAt: Date.now(),
+      controllerAcknowledgedAt: Date.now() - index,
+    });
+  }
+  const acknowledgedSaturatedPath = join(root, "acknowledged-saturated.json");
+  await recordAdapterDispatchReceipt(acknowledgedSaturatedPath, acknowledgedSaturated, "new-after-ack", "remote-new-after-ack", "dispatching");
+  assert.equal(acknowledgedSaturated.has("acknowledged-9999"), false, "capacity pressure reclaims the oldest Kontrol-acknowledged terminal receipt");
+  assert.ok(acknowledgedSaturated.has("new-after-ack"), "an acknowledged outcome frees capacity for a new dispatch");
 } finally {
   await rm(root, { recursive: true, force: true });
 }
