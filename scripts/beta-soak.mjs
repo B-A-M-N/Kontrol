@@ -363,6 +363,8 @@ async function exerciseConversationContinuity() {
   let sessionIdA;
   let written = false;
   let workspaceId;
+  let approvalResumeId;
+  let reviewerSessionId;
   try {
     const initA = await rpc("initialize", {
       protocolVersion: "2025-06-18",
@@ -379,14 +381,65 @@ async function exerciseConversationContinuity() {
       }, sessionIdA);
       workspaceId = opened.payload?.result?.structuredContent?.workspaceId;
       if (!workspaceId) throw new Error("continuity open_workspace returned no workspaceId");
-      await rpc("tools/call", {
+      // Read the configured workspace file first so any applicable AGENTS.md
+      // instructions are delivered and acknowledged in this transport before
+      // the mutation attempt.
+      const instructionRead = await rpc("tools/call", {
+        name: "read",
+        arguments: { workspaceId, path: readPath },
+      }, sessionIdA);
+      if (instructionRead.payload?.result?.isError === true) {
+        throw new Error("continuity could not read the configured workspace instructions");
+      }
+
+      const writeAttempt = await rpc("tools/call", {
         name: "write",
         arguments: { workspaceId, path: markerName, content: `${markerText}\n` },
       }, sessionIdA);
-      written = true;
+      const writeResult = writeAttempt.payload?.result;
+      const writeCard = writeResult?.structuredContent;
+      if (writeResult?.isError === true || writeCard?.status === "instructions_required") {
+        throw new Error(`continuity marker write failed: ${JSON.stringify(writeCard ?? writeResult)}`);
+      }
+      if (writeCard?.status === "approval_required") {
+        approvalResumeId = writeCard.approvalId;
+        if (typeof approvalResumeId !== "string" || approvalResumeId.length === 0) {
+          throw new Error("continuity marker write requires approval but returned no approvalId");
+        }
+
+        // A human reviewer decision is required by the active workspace
+        // policy. The configured reviewer credential is the qualification
+        // harness's reviewer authority, matching exerciseApprovalResume().
+        const reviewerInit = await rpc("initialize", {
+          protocolVersion: "2025-06-18",
+          capabilities: {},
+          clientInfo: { name: "kontrol-beta-soak-continuity-reviewer", version: "1" },
+        }, undefined, { reviewer: true, headerless: true });
+        reviewerSessionId = reviewerInit.sessionId;
+        if (!reviewerSessionId) throw new Error("continuity reviewer initialize did not return mcp-session-id");
+        await rpc("notifications/initialized", {}, reviewerSessionId, { reviewer: true, headerless: true });
+        const listing = await rpc("tools/call", {
+          name: "list_pending_approvals",
+          arguments: { workspaceId },
+        }, reviewerSessionId, { reviewer: true, headerless: true });
+        const approvals = listing.payload?.result?.structuredContent?.approvals ?? [];
+        if (!approvals.some((entry) => entry.approvalId === approvalResumeId)) {
+          throw new Error(`continuity approval ${approvalResumeId} is missing from the reviewer listing`);
+        }
+        const decision = await rpc("tools/call", {
+          name: "provide_policy_approval",
+          arguments: { approvalId: approvalResumeId, decision: "approve", reason: "kontrol-beta-soak conversation continuity" },
+        }, reviewerSessionId, { reviewer: true, headerless: true });
+        if (decision.payload?.result?.isError === true) {
+          throw new Error(`continuity approval failed: ${JSON.stringify(decision.payload.result)}`);
+        }
+      } else {
+        written = true;
+      }
     }
   } finally {
     try { await closeSession(sessionIdA); } catch { /* transport replacement is the point */ }
+    try { await closeSession(reviewerSessionId); } catch { /* reviewer cleanup */ }
   }
 
   // 2/3. Fresh transport, same conversation: durable state must be visible.
@@ -399,13 +452,38 @@ async function exerciseConversationContinuity() {
   if (!sessionIdA2) throw new Error("continuity reconnect initialize did not return mcp-session-id");
   try {
     await rpc("notifications/initialized", {}, sessionIdA2);
-    if (written) {
+    if (workspacePath) {
       const reopened = await rpc("tools/call", {
         name: "open_workspace",
         arguments: { path: workspacePath, mode: "checkout" },
       }, sessionIdA2);
       const reopenedId = reopened.payload?.result?.structuredContent?.workspaceId;
       if (!reopenedId) throw new Error("continuity reconnect open_workspace returned no workspaceId");
+      const instructionRead = await rpc("tools/call", {
+        name: "read",
+        arguments: { workspaceId: reopenedId, path: readPath },
+      }, sessionIdA2);
+      if (instructionRead.payload?.result?.isError === true) {
+        throw new Error("continuity reconnect could not read the configured workspace instructions");
+      }
+      if (approvalResumeId) {
+        const retry = await rpc("tools/call", {
+          name: "write",
+          arguments: {
+            workspaceId: reopenedId,
+            path: markerName,
+            content: `${markerText}\n`,
+            approvalResumeId,
+          },
+        }, sessionIdA2);
+        const retryResult = retry.payload?.result;
+        const retryCard = retryResult?.structuredContent;
+        if (retryResult?.isError === true || retryCard?.status === "approval_required" || retryCard?.status === "instructions_required") {
+          throw new Error(`continuity marker retry failed: ${JSON.stringify(retryCard ?? retryResult)}`);
+        }
+        written = true;
+      }
+      if (!written) throw new Error("continuity marker write was not completed before reconnect");
       const readBack = await rpc("tools/call", {
         name: "read",
         arguments: { workspaceId: reopenedId, path: markerName },
