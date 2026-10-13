@@ -92,6 +92,7 @@ try {
       dispatch_idempotency_key: dispatch.dispatchId,
       grant_expires_at: Date.now() + 60_000,
       grant_fingerprint: "a".repeat(64),
+      network_policy: "disabled",
       confinement: "bubblewrap-read-only-workspace-no-network",
     },
   });

@@ -19,15 +19,19 @@ try {
     task: "inspect the release",
     workspace_lease_nonce: "lease-a",
     workspace_lease_expires_at: "2026-10-12T13:00:00.000Z",
-    read_only_execution_grant: { signature: "grant-a", expiresAt: 1 },
+    read_only_execution_grant: { signature: "grant-a", issuedAt: 1, expiresAt: 2, networkPolicy: "disabled", workspaceRoot: "/tmp/project" },
   };
   const fingerprint = adapterDispatchFingerprint(fingerprintBody);
   assert.equal(adapterDispatchFingerprint({
     ...fingerprintBody,
     workspace_lease_nonce: "lease-b",
     workspace_lease_expires_at: "2026-10-12T14:00:00.000Z",
-    read_only_execution_grant: { signature: "grant-b", expiresAt: 2 },
+    read_only_execution_grant: { signature: "grant-b", issuedAt: 2, expiresAt: 3, networkPolicy: "disabled", workspaceRoot: "/tmp/project" },
   }), fingerprint, "retry identity is stable across refreshed authorization credentials");
+  assert.notEqual(adapterDispatchFingerprint({
+    ...fingerprintBody,
+    read_only_execution_grant: { ...fingerprintBody.read_only_execution_grant, networkPolicy: "host" },
+  }), fingerprint, "network authority remains part of durable dispatch identity");
   assert.notEqual(adapterDispatchFingerprint({ ...fingerprintBody, task: "change files" }), fingerprint,
     "task content remains part of the durable dispatch fingerprint");
 

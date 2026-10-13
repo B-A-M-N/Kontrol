@@ -91,6 +91,7 @@ export function createAcpRuntime(deps: AcpRuntimeDeps): AcpRuntimeHandles {
     agentMessages,
     knownAgents: config.acpKnownAgents,
     adapterSecret: config.acpAdapterSecret,
+    serverConfig: config,
     liveWaiters,
   };
   const dispatcher = createContinuationDispatcher(bridgeBase);
@@ -261,6 +262,7 @@ export function createAcpRuntime(deps: AcpRuntimeDeps): AcpRuntimeHandles {
           remoteRunId: outcome.remoteRunId,
           attemptNumber: outcome.attemptNumber,
           dispatchId: attempt.dispatchId,
+          executionReceipt: outcome.executionReceipt,
           reason: outcome.reason,
         };
       },

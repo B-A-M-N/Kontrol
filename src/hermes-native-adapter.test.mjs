@@ -45,8 +45,10 @@ assert.ok(adapter.indexOf('launchState: "start_requested"') < adapter.indexOf("a
   "Hermes start intent is durable before opening the worker launch gate");
 assert.ok(adapter.indexOf("await launchGate.start()") < adapter.indexOf('run.remoteRunId, "running"'),
   "Hermes acceptance is persisted only after the agent child has spawned");
-assert.match(adapter, /validateReadOnlyDispatchRequest\(body, workspaceRoot, ADAPTER_SECRET\)/,
+assert.match(adapter, /validateReadOnlyDispatchRequest\(body, workspaceRoot, ADAPTER_SECRET, agentIdentity\?\.agentId\)/,
   "Hermes verifies the server-signed read-only grant before preparing a child");
+assert.match(adapter, /bindFiles: \[\s*\{ source: hermesExecutable, target: hermesSandboxCommand \}/,
+  "Hermes exposes only its selected CLI executable rather than the containing credential-capable directory");
 assert.match(adapter, /executionReceipt: run\.readOnlyExecutionReceipt/,
   "Hermes persists the correlated read-only receipt with its durable dispatch record");
 assert.match(adapter, /!run\.readOnlyAudit && \(!run\.workspaceLeaseNonce/,

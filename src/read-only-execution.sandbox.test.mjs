@@ -31,6 +31,8 @@ try {
   }
 
   if (sandboxReady) {
+    assert.equal(probeReadOnlyExecutionSandbox({ workspaceRoot, networkPolicy: "host" }), true,
+      "the explicitly authorized host-network sandbox starts while retaining filesystem confinement");
     const script = [
       "set -eu",
       "test \"$(cat /workspace/source.txt)\" = 'source stays unchanged'",

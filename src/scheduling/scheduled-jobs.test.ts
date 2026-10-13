@@ -509,7 +509,23 @@ try {
       pollMs: 60_000,
       dispatch: async (jobId) => {
         dispatchLog.push(jobId);
-        return { status: "dispatched", workSessionId: `ws-${jobId}` };
+        return {
+          status: "dispatched",
+          workSessionId: `ws-${jobId}`,
+          executionReceipt: {
+            issuer: "kontrol",
+            work_session_id: `ws-${jobId}`,
+            workspace_session_id: "project-a",
+            parent_run_id: `run-${jobId}`,
+            remote_run_id: `remote-${jobId}`,
+            attempt_number: 1,
+            dispatch_idempotency_key: `dispatch-${jobId}`,
+            grant_expires_at: Date.now() + 60_000,
+            grant_fingerprint: "c".repeat(64),
+            network_policy: "disabled",
+            confinement: "bubblewrap-read-only-workspace-no-network",
+          },
+        };
       },
     });
 
@@ -532,6 +548,8 @@ try {
     assert.deepEqual(dispatchLog, [dueJob.id], "exactly one dispatch for the due job");
     assert.equal(jobs.get(dueJob.id)?.status, "running", "a dispatched job advances to running");
     assert.equal(jobs.get(dueJob.id)?.workSessionId, `ws-${dueJob.id}`, "the dispatch result's work-session correlation is persisted on the job");
+    assert.equal(jobs.getAttempt(dueJob.id)?.executionReceipt?.dispatch_idempotency_key, `dispatch-${dueJob.id}`,
+      "the production dispatch outcome persists its correlated read-only execution receipt");
 
     // A second drain must not re-dispatch: the trigger is consumed.
     await runtime.drainOnce();
@@ -761,6 +779,7 @@ try {
           dispatch_idempotency_key: claim.dispatchId,
           grant_expires_at: Date.now() + 60_000,
           grant_fingerprint: "b".repeat(64),
+          network_policy: "disabled",
           confinement: "bubblewrap-read-only-workspace-no-network",
         },
       });

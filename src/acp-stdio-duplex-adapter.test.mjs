@@ -21,7 +21,7 @@ assert.match(adapter, /recordAdapterDispatchReceipt\([^\n]+, "dispatching"/);
 assert.match(adapter, /prepareOwnedChild\(agentLaunch\.command/);
 assert.ok(adapter.indexOf('"dispatching", {') < adapter.indexOf("prepareOwnedChild(agentLaunch.command"), "dispatch admission is durable before creating a gated owner process");
 assert.ok(adapter.indexOf('launchState: "start_requested"') < adapter.indexOf("await launchGate.start()"), "start intent is durable before the worker launch gate opens");
-assert.match(adapter, /validateReadOnlyDispatchRequest\(body, workspaceRoot, ADAPTER_SECRET\)/,
+assert.match(adapter, /validateReadOnlyDispatchRequest\(body, workspaceRoot, ADAPTER_SECRET, agentIdentity\?\.agentId\)/,
   "the generic ACP adapter verifies signed read-only execution authority before child launch");
 assert.match(adapter, /executionReceipt: run\.readOnlyExecutionReceipt/,
   "the generic adapter persists the correlated execution receipt for recovery");

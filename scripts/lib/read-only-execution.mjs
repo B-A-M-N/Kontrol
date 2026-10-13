@@ -22,6 +22,7 @@ const GRANT_FIELDS = Object.freeze([
   "runId",
   "attemptNumber",
   "dispatchIdempotencyKey",
+  "networkPolicy",
   "operations",
   "issuedAt",
   "expiresAt",
@@ -62,6 +63,7 @@ export function createReadOnlyExecutionGrant(input, secret, now = Date.now()) {
     runId: input.runId,
     attemptNumber: input.attemptNumber,
     dispatchIdempotencyKey: input.dispatchIdempotencyKey,
+    networkPolicy: input.networkPolicy ?? "disabled",
     operations: [...READ_ONLY_EXECUTION_OPERATIONS],
     issuedAt: now,
     expiresAt: now + ttlMs,
@@ -75,6 +77,7 @@ export function createReadOnlyExecutionGrant(input, secret, now = Date.now()) {
     || !Number.isSafeInteger(payload.attemptNumber)
     || payload.attemptNumber < 1
     || !nonempty(payload.dispatchIdempotencyKey)
+    || !["disabled", "host"].includes(payload.networkPolicy)
   ) throw new Error("read_only_grant_claims_invalid");
   return { ...payload, signature: signatureFor(payload, secret) };
 }
@@ -102,7 +105,7 @@ export function verifyReadOnlyExecutionGrant(grant, secret, expected, now = Date
 }
 
 /** Validate the signed authority attached to one scheduled read-only dispatch. */
-export function validateReadOnlyDispatchRequest(body, canonicalWorkspaceRoot, secret) {
+export function validateReadOnlyDispatchRequest(body, canonicalWorkspaceRoot, secret, adapterAgentId) {
   const policy = body?.scheduled_execution_policy;
   const grant = body?.read_only_execution_grant;
   const declaresReadOnly = policy?.executionMode === "read_only_audit"
@@ -120,6 +123,8 @@ export function validateReadOnlyDispatchRequest(body, canonicalWorkspaceRoot, se
     || !Number.isSafeInteger(body?.attempt_number)
     || body.attempt_number < 1
     || !body?.dispatch_idempotency_key
+    || !nonempty(adapterAgentId)
+    || body.agent_id !== adapterAgentId
   ) return { readOnly: true, valid: false, code: "read_only_grant_invalid" };
   const valid = verifyReadOnlyExecutionGrant(grant, secret, {
     workSessionId: body.session_id,
@@ -207,6 +212,8 @@ export function buildReadOnlySandboxCommand({
   env = {},
   toolchainPaths = process.env.KONTROL_VERIFY_TOOLCHAIN_PATHS ?? process.env.KONTROL_READ_ONLY_TOOLCHAIN_PATHS,
   bindMounts = [],
+  bindFiles = [],
+  networkPolicy = "disabled",
   bubblewrapPath = process.env.KONTROL_BWRAP,
 }) {
   const bwrap = findBubblewrap(bubblewrapPath);
@@ -219,6 +226,9 @@ export function buildReadOnlySandboxCommand({
     throw new ReadOnlySandboxUnavailableError(`Required read-only execution path is unavailable: ${error.message}`);
   }
   const runtimePaths = parseToolchainPaths(toolchainPaths, sourceRoot);
+  if (!["disabled", "host"].includes(networkPolicy)) {
+    throw new ReadOnlySandboxUnavailableError(`Invalid read-only network policy: ${networkPolicy}`);
+  }
   const sandboxExecutable = executableTarget ?? `/opt/kontrol/bin/${basename(executablePath)}`;
   if (!isAbsolute(sandboxExecutable) || sandboxExecutable === "/" || sandboxExecutable === "/workspace" || sandboxExecutable.startsWith("/workspace/") || sandboxExecutable === "/tmp" || sandboxExecutable.startsWith("/tmp/")) {
     throw new ReadOnlySandboxUnavailableError("Read-only executable target must be an absolute path outside the workspace and scratch directory.");
@@ -242,6 +252,7 @@ export function buildReadOnlySandboxCommand({
     "--die-with-parent",
     "--new-session",
     "--unshare-all",
+    ...(networkPolicy === "host" ? ["--share-net"] : []),
     "--clearenv",
     "--dir", "/usr",
     "--dir", "/bin",
@@ -289,7 +300,6 @@ export function buildReadOnlySandboxCommand({
     result.push("--ro-bind", executablePath, sandboxExecutable);
   }
   for (const path of runtimePaths) {
-    if (path === executableDirectory) continue;
     const target = path;
     addMountTree(target, result, createdDirectories);
     if (target === "/" || target === "/workspace" || target.startsWith("/workspace/") || target === "/tmp" || target.startsWith("/tmp/")) {
@@ -312,6 +322,19 @@ export function buildReadOnlySandboxCommand({
     createdDirectories.add(target);
     result.push("--ro-bind", source, target);
   }
+  for (const mount of bindFiles) {
+    let source;
+    try { source = realpathSync(mount.source); } catch (error) {
+      throw new ReadOnlySandboxUnavailableError(`Read-only runtime file is unavailable: ${error.message}`);
+    }
+    const target = resolve(mount.target);
+    if (!isAbsolute(mount.target) || target === "/" || target === "/workspace" || target.startsWith("/workspace/") || target === "/tmp" || target.startsWith("/tmp/")) {
+      throw new ReadOnlySandboxUnavailableError("Read-only runtime file target must be absolute and outside the workspace and scratch directory.");
+    }
+    if (!statSync(source).isFile()) throw new ReadOnlySandboxUnavailableError(`Read-only runtime bind source must be a file: ${source}`);
+    addMountTree(target, result, createdDirectories);
+    result.push("--ro-bind", source, target);
+  }
   result.push("--chdir", "/workspace");
   for (const [key, value] of Object.entries(sandboxEnv)) {
     if (typeof value === "string" && value.length > 0) result.push("--setenv", key, value);
@@ -321,7 +344,7 @@ export function buildReadOnlySandboxCommand({
 }
 
 /** Exercise the complete mount policy with a harmless command before accepting a worker dispatch. */
-export function probeReadOnlyExecutionSandbox({ workspaceRoot, toolchainPaths, bindMounts, bubblewrapPath } = {}) {
+export function probeReadOnlyExecutionSandbox({ workspaceRoot, toolchainPaths, bindMounts, bindFiles, networkPolicy = "disabled", bubblewrapPath } = {}) {
   const launch = buildReadOnlySandboxCommand({
     workspaceRoot,
     executable: "/usr/bin/true",
@@ -329,6 +352,8 @@ export function probeReadOnlyExecutionSandbox({ workspaceRoot, toolchainPaths, b
     env: {},
     toolchainPaths,
     bindMounts,
+    bindFiles,
+    networkPolicy,
     bubblewrapPath,
   });
   const probe = spawnSync(launch.command, launch.args, {

@@ -93,6 +93,7 @@ export async function dispatchScheduledJob(
         workspaces: config.workspaces,
         workSessions: config.workSessions,
         adapterSecret: config.adapterSecret,
+        readOnlyExecutionNetworkPolicy: config.serverConfig?.readOnlyExecutionNetworkPolicy ?? "disabled",
       },
       {
         agentUrl: peer.url,

@@ -202,10 +202,13 @@ Current implementation contracts:
   `session/new`, and `session/prompt`; custom nonstandard dispatch methods must
   be explicitly configured. A scheduled `read_only_audit` uses a signed,
   attempt-bound `read_only_execution_grant`, never a mutation lease. Bundled
-  adapters verify the grant before launch and require Linux bubblewrap to mount
-  the canonical workspace read-only, provide private scratch, and disable
-  network access; unavailable confinement fails as `sandbox_unavailable`.
-  Read-only agent environment additions require
+  adapters verify the grant against the local registered agent identity before
+  launch and require Linux bubblewrap to mount the canonical workspace
+  read-only and provide private scratch; unavailable confinement fails as
+  `sandbox_unavailable`. Network access is disabled by default. An operator may
+  set `KONTROL_READ_ONLY_NETWORK_POLICY=host` to share host networking for model
+  inference; that choice is signed into each grant and returned in its receipt,
+  and the agent cannot elevate it. Read-only agent environment additions require
   `KONTROL_READ_ONLY_AGENT_ENV_ALLOWLIST`.
 - Adapter dispatch receipts bind the idempotency key to a canonical request
   fingerprint and execution identity before worker launch. Identical retries

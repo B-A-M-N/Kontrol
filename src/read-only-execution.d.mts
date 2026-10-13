@@ -12,6 +12,7 @@ export type ReadOnlyExecutionGrant = {
   runId: string;
   attemptNumber: number;
   dispatchIdempotencyKey: string;
+  networkPolicy: "disabled" | "host";
   operations: readonly string[];
   issuedAt: number;
   expiresAt: number;
@@ -19,7 +20,8 @@ export type ReadOnlyExecutionGrant = {
 };
 
 export function createReadOnlyExecutionGrant(
-  input: Omit<ReadOnlyExecutionGrant, "version" | "issuer" | "operations" | "issuedAt" | "expiresAt" | "signature"> & { ttlMs?: number },
+  input: Omit<ReadOnlyExecutionGrant, "version" | "issuer" | "operations" | "issuedAt" | "expiresAt" | "signature" | "networkPolicy">
+    & { ttlMs?: number; networkPolicy?: "disabled" | "host" },
   secret: string | undefined,
   now?: number,
 ): ReadOnlyExecutionGrant;
@@ -33,6 +35,7 @@ export function validateReadOnlyDispatchRequest(
   body: Record<string, unknown>,
   canonicalWorkspaceRoot: string,
   secret: string | undefined,
+  adapterAgentId?: string,
 ): { readOnly: boolean; valid?: boolean; code?: string; grant?: ReadOnlyExecutionGrant };
 export class ReadOnlySandboxUnavailableError extends Error { code: "sandbox_unavailable"; }
 export function findBubblewrap(configuredPath?: string): string;
@@ -45,12 +48,16 @@ export function buildReadOnlySandboxCommand(input: {
   env?: Record<string, string>;
   toolchainPaths?: string | string[];
   bindMounts?: Array<{ source: string; target: string }>;
+  bindFiles?: Array<{ source: string; target: string }>;
+  networkPolicy?: "disabled" | "host";
   bubblewrapPath?: string;
 }): { command: string; args: string[]; env: Record<string, string> };
 export function probeReadOnlyExecutionSandbox(input: {
   workspaceRoot: string;
   toolchainPaths?: string | string[];
   bindMounts?: Array<{ source: string; target: string }>;
+  bindFiles?: Array<{ source: string; target: string }>;
+  networkPolicy?: "disabled" | "host";
   bubblewrapPath?: string;
 }): boolean;
 export function readOnlyWorkerEnvironment(source?: NodeJS.ProcessEnv): Record<string, string>;

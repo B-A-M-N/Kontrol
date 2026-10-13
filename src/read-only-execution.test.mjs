@@ -37,6 +37,7 @@ try {
     ttlMs: 60_000,
   };
   const grant = createReadOnlyExecutionGrant(claims, secret, now);
+  assert.equal(grant.networkPolicy, "disabled", "network access is disabled in newly issued grants by default");
   const expectedClaims = {
     workSessionId: claims.workSessionId,
     workspaceSessionId: claims.workspaceSessionId,
@@ -61,9 +62,13 @@ try {
     scheduled_execution_policy: { executionMode: "read_only_audit", workspaceAccess: "read_only", mutate: false },
     read_only_execution_grant: grant,
   };
-  assert.equal(validateReadOnlyDispatchRequest(request, workspaceRoot, secret).valid, true);
-  assert.equal(validateReadOnlyDispatchRequest({ ...request, read_only_execution_grant: { ...grant, signature: "forged" } }, workspaceRoot, secret).valid, false);
-  assert.equal(validateReadOnlyDispatchRequest({ ...request, scheduled_execution_policy: { ...request.scheduled_execution_policy, mutate: true } }, workspaceRoot, secret).valid, false);
+  assert.equal(validateReadOnlyDispatchRequest(request, workspaceRoot, secret, "agent-1").valid, true);
+  assert.equal(validateReadOnlyDispatchRequest(request, workspaceRoot, secret, "another-agent").valid, false,
+    "a signed grant cannot be replayed to a different locally registered adapter");
+  assert.equal(validateReadOnlyDispatchRequest(request, workspaceRoot, secret).valid, false,
+    "read-only adapters fail closed when their registered identity is unavailable");
+  assert.equal(validateReadOnlyDispatchRequest({ ...request, read_only_execution_grant: { ...grant, signature: "forged" } }, workspaceRoot, secret, "agent-1").valid, false);
+  assert.equal(validateReadOnlyDispatchRequest({ ...request, scheduled_execution_policy: { ...request.scheduled_execution_policy, mutate: true } }, workspaceRoot, secret, "agent-1").valid, false);
   assert.equal(validateReadOnlyDispatchRequest({ workspace_root: workspaceRoot }, workspaceRoot, secret).readOnly, false);
 
   const env = readOnlyWorkerEnvironment({
@@ -104,6 +109,43 @@ try {
   assert.ok(!launch.args.includes("--bind"), "all workspace/toolchain binds are read-only");
   assert.equal(launch.args.at(-2), "/opt/kontrol/bin/test-agent");
   assert.equal(launch.args.at(-1), "--stdio");
+  const hostNetworkGrant = createReadOnlyExecutionGrant({ ...claims, networkPolicy: "host" }, secret, now);
+  assert.equal(verifyReadOnlyExecutionGrant(hostNetworkGrant, secret, { ...expectedClaims, networkPolicy: "host" }, now + 1), true,
+    "the network policy is covered by the grant signature");
+  assert.equal(verifyReadOnlyExecutionGrant(hostNetworkGrant, secret, { ...expectedClaims, networkPolicy: "disabled" }, now + 1), false,
+    "a signed host-network grant cannot be downgraded or substituted");
+  const hostNetworkLaunch = buildReadOnlySandboxCommand({ workspaceRoot, executable, networkPolicy: "host", bubblewrapPath: bubblewrap });
+  assert.ok(hostNetworkLaunch.args.includes("--unshare-all") && hostNetworkLaunch.args.includes("--share-net"),
+    "host networking is an explicit opt-in while the other bubblewrap namespaces remain isolated");
+
+  const configuredRuntime = buildReadOnlySandboxCommand({
+    workspaceRoot,
+    executable,
+    toolchainPaths: ["/usr"],
+    bubblewrapPath: bubblewrap,
+  });
+  assert.ok(configuredRuntime.args.some((value, index) => value === "--ro-bind" && configuredRuntime.args[index + 1] === "/usr"),
+    "explicitly approved runtime directories are mounted read-only without a builder ReferenceError");
+
+  const hermesCli = join(root, "hermes-cli");
+  const adjacentCredential = join(root, "credential.json");
+  writeFileSync(hermesCli, "#!/bin/sh\nexit 0\n");
+  writeFileSync(adjacentCredential, "secret\n");
+  const hermesLaunch = buildReadOnlySandboxCommand({
+    workspaceRoot,
+    executable,
+    bindFiles: [{ source: hermesCli, target: "/opt/kontrol/hermes-bin/hermes" }],
+    bubblewrapPath: bubblewrap,
+  });
+  assert.ok(hermesLaunch.args.some((value, index) => value === "--ro-bind" && hermesLaunch.args[index + 1] === hermesCli && hermesLaunch.args[index + 2] === "/opt/kontrol/hermes-bin/hermes"),
+    "a selected adapter executable can be mounted as one read-only file");
+  assert.ok(!hermesLaunch.args.includes(adjacentCredential), "individual executable binds do not expose neighboring credentials");
+  assert.throws(() => buildReadOnlySandboxCommand({
+    workspaceRoot,
+    executable,
+    bindFiles: [{ source: hermesCli, target: "/workspace/escape" }],
+    bubblewrapPath: bubblewrap,
+  }), /outside the workspace and scratch directory/);
 } finally {
   rmSync(root, { recursive: true, force: true });
 }

@@ -13,6 +13,10 @@ const baseEnv = {
 };
 
 assert.equal(loadConfig(baseEnv).widgets, "changes");
+assert.equal(loadConfig(baseEnv).readOnlyExecutionNetworkPolicy, "disabled", "read-only ACP network access stays disabled by default");
+assert.equal(loadConfig({ ...baseEnv, KONTROL_READ_ONLY_NETWORK_POLICY: "host" }).readOnlyExecutionNetworkPolicy, "host",
+  "operators can explicitly enable host networking for scheduled ACP inference");
+assert.throws(() => loadConfig({ ...baseEnv, KONTROL_READ_ONLY_NETWORK_POLICY: "anything" }), /Invalid KONTROL_READ_ONLY_NETWORK_POLICY/);
 assert.equal(loadConfig(baseEnv).workspaceAppSmokeEnabled, false, "diagnostic app tooling stays hidden by default");
 assert.equal(loadConfig({ ...baseEnv, KONTROL_DEV_WORKSPACE_APP_SMOKE: "1" }).workspaceAppSmokeEnabled, true);
 assert.equal(loadConfig({ ...baseEnv, KONTROL_DEV_WORKSPACE_APP_SMOKE: "true" }).workspaceAppSmokeEnabled, false);

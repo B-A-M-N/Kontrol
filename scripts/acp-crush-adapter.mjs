@@ -461,7 +461,7 @@ async function handleRunRequest(req, res, body) {
     throw err;
   }
 
-  const readOnlyAuthorization = validateReadOnlyDispatchRequest(body, run.workspaceRoot, ADAPTER_SECRET);
+  const readOnlyAuthorization = validateReadOnlyDispatchRequest(body, run.workspaceRoot, ADAPTER_SECRET, agentIdentity?.agentId);
   if (readOnlyAuthorization.readOnly && !readOnlyAuthorization.valid) {
     return writeJson(res, 403, { error: { code: "read_only_grant_invalid", message: "A valid Kontrol-issued read-only execution grant is required." } });
   }
@@ -473,12 +473,13 @@ async function handleRunRequest(req, res, body) {
       return writeJson(res, 503, { error: { code: "sandbox_unavailable", message: "The configured CRUSH executable cannot be resolved for confined execution." } });
     }
     try {
-      probeReadOnlyExecutionSandbox({ workspaceRoot: run.workspaceRoot });
+      probeReadOnlyExecutionSandbox({ workspaceRoot: run.workspaceRoot, networkPolicy: run.readOnlyExecutionGrant.networkPolicy });
       run.readOnlySandbox = buildReadOnlySandboxCommand({
         workspaceRoot: run.workspaceRoot,
         executable,
         args: buildAgentArgs(),
         env: workerEnvironment(run),
+        networkPolicy: run.readOnlyExecutionGrant.networkPolicy,
       });
     } catch (error) {
       if (error?.code === "sandbox_unavailable") {
@@ -497,7 +498,8 @@ async function handleRunRequest(req, res, body) {
       dispatch_idempotency_key: dispatchKey,
       grant_expires_at: grant.expiresAt,
       grant_fingerprint: createHash("sha256").update(grant.signature).digest("hex"),
-      confinement: "bubblewrap-read-only-workspace-no-network",
+      network_policy: grant.networkPolicy,
+      confinement: grant.networkPolicy === "host" ? "bubblewrap-read-only-workspace-host-network" : "bubblewrap-read-only-workspace-no-network",
     };
   } else if (workSessionId && (!run.workspaceLeaseNonce || workspaceLeaseDeadlineReached(run))) {
     return writeJson(res, 409, {

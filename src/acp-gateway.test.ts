@@ -102,7 +102,7 @@ try {
         "a successful response must echo the dispatch key when the adapter protocol received one",
       );
 
-      const grant = { signature: "test-grant-signature", expiresAt: Date.now() + 60_000 };
+      const grant = { signature: "test-grant-signature", expiresAt: Date.now() + 60_000, networkPolicy: "disabled" as const };
       const readOnlyRequest = {
         agentUrl: request.agentUrl,
         body: {
@@ -123,6 +123,7 @@ try {
         dispatch_idempotency_key: "dispatch-1",
         grant_expires_at: grant.expiresAt,
         grant_fingerprint: createHash("sha256").update(grant.signature).digest("hex"),
+        network_policy: grant.networkPolicy,
         confinement: "bubblewrap-read-only-workspace-no-network",
       };
       globalThis.fetch = (async () => new Response(JSON.stringify({
@@ -135,6 +136,18 @@ try {
       const readOnlyAccepted = await dispatchToPeer(readOnlyRequest);
       assert.deepEqual(readOnlyAccepted.executionReceipt, executionReceipt,
         "read-only acceptance requires a receipt correlated to the signed grant and current attempt");
+      globalThis.fetch = (async () => new Response(JSON.stringify({
+        run_id: "remote-read-only",
+        accepted: true,
+        status: "running",
+        dispatch_idempotency_key: "dispatch-1",
+        execution_receipt: { ...executionReceipt, network_policy: "host", confinement: "bubblewrap-read-only-workspace-host-network" },
+      }), { status: 202 })) as typeof fetch;
+      await assert.rejects(
+        dispatchToPeer(readOnlyRequest),
+        (error: unknown) => error instanceof AcpDispatchError && error.certainty === "uncertain",
+        "an execution receipt cannot claim a network policy different from the signed grant",
+      );
       globalThis.fetch = (async () => new Response(JSON.stringify({
         run_id: "remote-read-only",
         accepted: true,

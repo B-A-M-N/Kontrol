@@ -32,7 +32,7 @@ assert.ok(crushSource.indexOf('launchState: "start_requested"') < crushSource.in
   "CRUSH start intent is durable before opening the worker launch gate");
 assert.ok(crushSource.indexOf("await launchGate.start()") < crushSource.indexOf('run.remoteRunId, "running"'),
   "CRUSH acceptance is persisted only after the agent child has spawned");
-assert.match(crushSource, /validateReadOnlyDispatchRequest\(body, run\.workspaceRoot, ADAPTER_SECRET\)/,
+assert.match(crushSource, /validateReadOnlyDispatchRequest\(body, run\.workspaceRoot, ADAPTER_SECRET, agentIdentity\?\.agentId\)/,
   "CRUSH verifies the server-signed read-only grant before preparing a child");
 assert.match(crushSource, /executionReceipt: run\.readOnlyExecutionReceipt/,
   "CRUSH persists the correlated read-only receipt with its durable dispatch record");

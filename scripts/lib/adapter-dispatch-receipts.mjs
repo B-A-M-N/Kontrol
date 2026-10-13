@@ -11,8 +11,8 @@ const EPHEMERAL_DISPATCH_FIELDS = new Set([
   "worker_token",
   "workspace_lease_nonce",
   "workspace_lease_expires_at",
-  "read_only_execution_grant",
 ]);
+const EPHEMERAL_GRANT_FIELDS = new Set(["signature", "issuedAt", "expiresAt"]);
 
 export async function loadAdapterDispatchReceipts(path) {
   const stored = await readJsonOr(path, []);
@@ -85,7 +85,9 @@ export function adapterDispatchFingerprint(body) {
     if (Array.isArray(value)) return value.map(stable);
     if (!value || typeof value !== "object") return value;
     return Object.fromEntries(Object.keys(value).sort().filter((key) => !EPHEMERAL_DISPATCH_FIELDS.has(key))
-      .map((key) => [key, stable(value[key])]));
+      .map((key) => [key, stable(key === "read_only_execution_grant" && value[key] && typeof value[key] === "object"
+        ? Object.fromEntries(Object.entries(value[key]).filter(([grantKey]) => !EPHEMERAL_GRANT_FIELDS.has(grantKey)))
+        : value[key])]));
   };
   return createHash("sha256").update(JSON.stringify(stable(body ?? {}))).digest("hex");
 }

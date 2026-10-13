@@ -254,7 +254,7 @@ async function handle(req, res) {
   }
 
   const workspaceRoot = await validateWorkspaceRoot(body.workspace_root);
-  const readOnlyAuthorization = validateReadOnlyDispatchRequest(body, workspaceRoot, ADAPTER_SECRET);
+  const readOnlyAuthorization = validateReadOnlyDispatchRequest(body, workspaceRoot, ADAPTER_SECRET, agentIdentity?.agentId);
   if (readOnlyAuthorization.readOnly && !readOnlyAuthorization.valid) {
     return writeJson(res, 403, { error: { code: "read_only_grant_invalid", message: "A valid Kontrol-issued read-only execution grant is required." } });
   }
@@ -302,13 +302,14 @@ async function handle(req, res) {
       return writeJson(res, 503, { error: { code: "sandbox_unavailable", message: "The configured ACP executable cannot be resolved for confined execution." } });
     }
     try {
-      probeReadOnlyExecutionSandbox({ workspaceRoot });
+      probeReadOnlyExecutionSandbox({ workspaceRoot, networkPolicy: run.readOnlyExecutionGrant.networkPolicy });
       run.readOnlySandbox = buildReadOnlySandboxCommand({
         workspaceRoot,
         executable,
         args: AGENT_ARGS,
         env: readOnlyWorkerEnvironment(process.env),
         toolchainPaths: process.env.KONTROL_VERIFY_TOOLCHAIN_PATHS,
+        networkPolicy: run.readOnlyExecutionGrant.networkPolicy,
       });
     } catch (error) {
       if (error?.code === "sandbox_unavailable") {
@@ -326,7 +327,8 @@ async function handle(req, res) {
       dispatch_idempotency_key: dispatchIdempotencyKey,
       grant_expires_at: run.readOnlyExecutionGrant.expiresAt,
       grant_fingerprint: createHash("sha256").update(run.readOnlyExecutionGrant.signature).digest("hex"),
-      confinement: "bubblewrap-read-only-workspace-no-network",
+      network_policy: run.readOnlyExecutionGrant.networkPolicy,
+      confinement: run.readOnlyExecutionGrant.networkPolicy === "host" ? "bubblewrap-read-only-workspace-host-network" : "bubblewrap-read-only-workspace-no-network",
     };
   }
 

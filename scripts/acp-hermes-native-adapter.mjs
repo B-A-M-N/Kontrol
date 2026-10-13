@@ -347,7 +347,7 @@ async function handle(req, res) {
   const runMaxRuntimeMs = Number.isSafeInteger(requestedMaxRuntimeMs) && requestedMaxRuntimeMs > 0
     ? Math.min(MAX_RUN_MS, requestedMaxRuntimeMs)
     : MAX_RUN_MS;
-  const readOnlyAuthorization = validateReadOnlyDispatchRequest(body, workspaceRoot, ADAPTER_SECRET);
+  const readOnlyAuthorization = validateReadOnlyDispatchRequest(body, workspaceRoot, ADAPTER_SECRET, agentIdentity?.agentId);
   if (readOnlyAuthorization.readOnly && !readOnlyAuthorization.valid) {
     return writeJson(res, 403, { error: { code: "read_only_grant_invalid", message: "A valid Kontrol-issued read-only execution grant is required." } });
   }
@@ -409,7 +409,6 @@ async function handle(req, res) {
       copyFileSync(RUNNER, join(run.readOnlyRuntimeProjection, "hermes-native-runner.py"));
       copyFileSync(join(HERMES_ACP_COMPAT_PATH, "sitecustomize.py"), join(run.readOnlyRuntimeProjection, "sitecustomize.py"));
       const pythonRuntimeRoot = dirname(dirname(pythonExecutable));
-      const hermesBinDirectory = dirname(hermesExecutable);
       const hermesSandboxCommand = `/opt/kontrol/hermes-bin/${basename(hermesExecutable)}`;
       const configuredToolchains = (process.env.KONTROL_VERIFY_TOOLCHAIN_PATHS ?? "").split(delimiter).filter(Boolean).map((path) => resolve(path));
       const pythonUsesSystemRuntime = pythonExecutable.startsWith("/usr/") || pythonExecutable.startsWith("/bin/");
@@ -440,19 +439,24 @@ async function handle(req, res) {
           }),
         },
         toolchainPaths: configuredToolchains,
+        networkPolicy: run.readOnlyExecutionGrant.networkPolicy,
         bindMounts: [
           { source: run.readOnlyRuntimeProjection, target: "/opt/kontrol/hermes-runtime" },
-          { source: hermesBinDirectory, target: "/opt/kontrol/hermes-bin" },
+        ],
+        bindFiles: [
+          { source: hermesExecutable, target: hermesSandboxCommand },
         ],
       });
       run.readOnlyBindMounts = [
         { source: run.readOnlyRuntimeProjection, target: "/opt/kontrol/hermes-runtime" },
-        { source: hermesBinDirectory, target: "/opt/kontrol/hermes-bin" },
       ];
+      run.readOnlyBindFiles = [{ source: hermesExecutable, target: hermesSandboxCommand }];
       probeReadOnlyExecutionSandbox({
         workspaceRoot,
         toolchainPaths: configuredToolchains,
         bindMounts: run.readOnlyBindMounts,
+        bindFiles: run.readOnlyBindFiles,
+        networkPolicy: run.readOnlyExecutionGrant.networkPolicy,
       });
       const runtimeProbe = buildReadOnlySandboxCommand({
         workspaceRoot,
@@ -466,6 +470,8 @@ async function handle(req, res) {
         },
         toolchainPaths: configuredToolchains,
         bindMounts: run.readOnlyBindMounts,
+        bindFiles: run.readOnlyBindFiles,
+        networkPolicy: run.readOnlyExecutionGrant.networkPolicy,
       });
       const runtimeProbeResult = spawnSync(runtimeProbe.command, runtimeProbe.args, {
         encoding: "utf8",
@@ -487,7 +493,8 @@ async function handle(req, res) {
         dispatch_idempotency_key: dispatchIdempotencyKey,
         grant_expires_at: run.readOnlyExecutionGrant.expiresAt,
         grant_fingerprint: createHash("sha256").update(run.readOnlyExecutionGrant.signature).digest("hex"),
-        confinement: "bubblewrap-read-only-workspace-no-network",
+        network_policy: run.readOnlyExecutionGrant.networkPolicy,
+        confinement: run.readOnlyExecutionGrant.networkPolicy === "host" ? "bubblewrap-read-only-workspace-host-network" : "bubblewrap-read-only-workspace-no-network",
       };
     } catch (error) {
       removeHermesReadOnlyRuntime(run);

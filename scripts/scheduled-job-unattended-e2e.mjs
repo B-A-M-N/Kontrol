@@ -18,6 +18,7 @@
  *   6. Restart before launch, after launch, and with a lost acknowledgement.
  */
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { createServer as createHttpServer } from "node:http";
 import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync } from "node:fs";
 import { spawn } from "node:child_process";
@@ -35,6 +36,7 @@ const artifactPath = join(root, "unattended-audit-artifact.json");
 const artifactContents = JSON.stringify({ auditStatus: "clean", checkedPaths: 3 }, null, 2);
 const reviewerToken = "unattended-e2e-reviewer-token-long";
 const agentSecret = "unattended-e2e-agent-secret-long";
+const adapterSecret = "unattended-e2e-adapter-secret-long";
 const PORT = 7796;
 const AGENT_PORT = 7797;
 let agentRuns = 0;
@@ -47,6 +49,7 @@ writeFileSync(envFile, [
   `KONTROL_STATE_DIR=${stateDir}`,
   "HOST=127.0.0.1",
   "KONTROL_ACP_ENABLED=true",
+  "KONTROL_READ_ONLY_NETWORK_POLICY=host",
   "KONTROL_TOOL_MODE=full",
   "KONTROL_POLICY_MODE=allow",
   "KONTROL_AUTH_MODE=tunnel",
@@ -54,6 +57,7 @@ writeFileSync(envFile, [
   "KONTROL_LOG_REQUESTS=0",
   `KONTROL_ACP_AGENT_SECRET=${agentSecret}`,
   `KONTROL_ACP_REVIEWER_SECRET=${reviewerToken}`,
+  `KONTROL_ACP_ADAPTER_SECRET=${adapterSecret}`,
   `PORT=${PORT}`,
 ].join("\n") + "\n");
 
@@ -70,10 +74,30 @@ async function startAgent() {
       // a bounded task and emits an artifact with independently checkable
       // contents, rather than merely acknowledging launch.
       writeFileSync(artifactPath, artifactContents);
+      const remoteRunId = `remote-unattended-${agentRuns}`;
+      const grant = body.read_only_execution_grant;
+      assert.ok(grant?.signature, "scheduled read-only dispatch carries a signed execution grant");
+      const executionReceipt = {
+        issuer: "kontrol",
+        work_session_id: body.session_id,
+        workspace_session_id: body.workspace_session_id,
+        parent_run_id: body.parent_run_id,
+        remote_run_id: remoteRunId,
+        attempt_number: body.attempt_number,
+        dispatch_idempotency_key: body.dispatch_idempotency_key,
+        grant_expires_at: grant.expiresAt,
+        grant_fingerprint: createHash("sha256").update(grant.signature).digest("hex"),
+        network_policy: grant.networkPolicy,
+        confinement: grant.networkPolicy === "host" ? "bubblewrap-read-only-workspace-host-network" : "bubblewrap-read-only-workspace-no-network",
+      };
       res.writeHead(202, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
-        run_id: `remote-unattended-${agentRuns}`,
+        run_id: remoteRunId,
+        remote_run_id: remoteRunId,
+        accepted: true,
         status: "running",
+        dispatch_idempotency_key: body.dispatch_idempotency_key,
+        execution_receipt: executionReceipt,
         output: [],
       }));
       return;
@@ -94,12 +118,14 @@ async function startServer() {
     KONTROL_STATE_DIR: stateDir,
     KONTROL_AUTH_MODE: "tunnel",
     KONTROL_ACP_ENABLED: "true",
+    KONTROL_READ_ONLY_NETWORK_POLICY: "host",
     KONTROL_TOOL_MODE: "full",
     KONTROL_POLICY_MODE: "allow",
     KONTROL_LOG_LEVEL: "error",
     KONTROL_LOG_REQUESTS: "0",
     KONTROL_ACP_AGENT_SECRET: agentSecret,
     KONTROL_ACP_REVIEWER_SECRET: reviewerToken,
+    KONTROL_ACP_ADAPTER_SECRET: adapterSecret,
     PORT: String(PORT),
   };
   const child = spawn(process.execPath, ["--import", "tsx", "src/cli.ts", "serve"], {
@@ -191,12 +217,14 @@ async function main() {
 
   // ── Restart before launch ──
   let first = await startServer();
+  server = first;
   try {
     await waitForHealth();
     await registerAgent();
     first.kill("SIGTERM");
     await once(first, "exit").catch(() => {});
     first = await startServer();
+    server = first;
     await waitForHealth();
 
     // ── Public authorized scheduling tool ──
@@ -234,18 +262,28 @@ async function main() {
       await delay(200);
     }
     assert.notEqual(jobStatus, "pending", `production scheduler fired the job (status=${jobStatus})`);
+    assert.equal(jobStatus, "running", "the scheduled ACP attempt was accepted and remains observable");
+    const dispatchReceipt = await mcpCall("get_scheduled_job_result", { scheduledJobId: jobId });
+    assert.equal(dispatchReceipt?.structuredContent?.resultReceipt?.executionReceipt?.issuer, "kontrol",
+      "the accepted scheduled dispatch preserves its exact read-only execution receipt");
+    assert.match(dispatchReceipt.structuredContent.resultReceipt.executionReceipt.grant_fingerprint, /^[a-f0-9]{64}$/);
+    assert.equal(dispatchReceipt.structuredContent.resultReceipt.executionReceipt.network_policy, "host",
+      "the configured network policy is bound into the scheduled execution receipt");
+    assert.equal(dispatchReceipt.structuredContent.resultReceipt.verificationLevel, "not_performed",
+      "an accepted worker run is not represented as independently verified work");
 
     assert.ok(existsSync(artifactPath), "the unattended fixture wrote its artifact");
     const persisted = readFileSync(artifactPath, "utf8");
     assert.equal(JSON.parse(persisted).auditStatus, "clean", "artifact has independently checkable contents");
 
     // ── Restart after launch ──
-    if (server?.exitCode === null) {
-      server.kill("SIGTERM");
-      await once(server, "exit").catch(() => {});
-    }
+    first.kill("SIGTERM");
+    await once(first, "exit").catch(() => {});
+    server = undefined;
     const second = await startServer();
+    server = second;
     await waitForHealth();
+    mcpSessionId = undefined;
 
     // ── Lost acknowledgement restart ──
     // Simulate the server dying after dispatch but before terminal projection.
@@ -253,8 +291,11 @@ async function main() {
     // accepted launch without a duplicate remote request.
     second.kill("SIGTERM");
     await once(second, "exit").catch(() => {});
+    server = undefined;
     const third = await startServer();
+    server = third;
     await waitForHealth();
+    mcpSessionId = undefined;
 
     const finalJobs = await mcpCall("list_scheduled_jobs", { limit: 10 });
     const finalList = finalJobs?.structuredContent?.jobs ?? [];
@@ -263,9 +304,12 @@ async function main() {
 
     third.kill("SIGTERM");
     await once(third, "exit").catch(() => {});
+    server = undefined;
   } finally {
-    if (first?.exitCode === null) first.kill("SIGTERM");
-    if (server?.exitCode === null) server.kill("SIGTERM");
+    if (server?.exitCode === null) {
+      server.kill("SIGTERM");
+      await once(server, "exit").catch(() => {});
+    }
     await new Promise((r) => agent.close(r));
   }
 

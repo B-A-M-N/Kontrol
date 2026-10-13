@@ -73,7 +73,8 @@ export interface ReadOnlyExecutionReceipt {
   dispatch_idempotency_key: string;
   grant_expires_at: number;
   grant_fingerprint: string;
-  confinement: "bubblewrap-read-only-workspace-no-network";
+  network_policy: "disabled" | "host";
+  confinement: "bubblewrap-read-only-workspace-no-network" | "bubblewrap-read-only-workspace-host-network";
 }
 
 const readOnlyExecutionReceiptSchema = z.object({
@@ -86,7 +87,8 @@ const readOnlyExecutionReceiptSchema = z.object({
   dispatch_idempotency_key: z.string().min(1),
   grant_expires_at: z.number().int().positive(),
   grant_fingerprint: z.string().regex(/^[a-f0-9]{64}$/),
-  confinement: z.literal("bubblewrap-read-only-workspace-no-network"),
+  network_policy: z.enum(["disabled", "host"]),
+  confinement: z.enum(["bubblewrap-read-only-workspace-no-network", "bubblewrap-read-only-workspace-host-network"]),
 }).strict();
 
 function correlateReadOnlyExecutionReceipt(
@@ -110,7 +112,11 @@ function correlateReadOnlyExecutionReceipt(
     || receipt.attempt_number !== requestBody.attempt_number
     || receipt.dispatch_idempotency_key !== requestBody.dispatch_idempotency_key
     || receipt.grant_expires_at !== claims.expiresAt
-    || receipt.grant_fingerprint !== grantFingerprint) return undefined;
+    || receipt.grant_fingerprint !== grantFingerprint
+    || receipt.network_policy !== claims.networkPolicy
+    || receipt.confinement !== (claims.networkPolicy === "host"
+      ? "bubblewrap-read-only-workspace-host-network"
+      : "bubblewrap-read-only-workspace-no-network")) return undefined;
   return receipt;
 }
 
@@ -450,6 +456,7 @@ export interface GatewayConfig {
   workSessions: WorkSessionManager;
   /** P0 #9: outbound adapter credential (KONTROL_ACP_ADAPTER_SECRET). */
   adapterSecret?: string;
+  readOnlyExecutionNetworkPolicy?: "disabled" | "host";
 }
 
 export interface AgentCallResult {
@@ -658,6 +665,7 @@ export async function callRemoteAgent(
         runId: run.runId,
         attemptNumber,
         dispatchIdempotencyKey,
+        networkPolicy: config.readOnlyExecutionNetworkPolicy ?? "disabled",
         ttlMs: params.scheduledExecutionPolicy.executionGrantTtlMs,
       }, config.adapterSecret);
     }

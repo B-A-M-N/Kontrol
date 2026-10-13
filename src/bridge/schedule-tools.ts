@@ -2,8 +2,8 @@
  * Durable scheduled-job MCP tools.
  *
  * These tools create/read bounded one-shot jobs. They do not grant arbitrary
- * shell authority; execution remains read_only_audit until its policy layer is
- * fully wired in a later phase.
+ * shell authority; execution policy is enforced by signed ACP grants and the
+ * worker's operating-system sandbox.
  */
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { BridgeConfig } from "./context.js";
@@ -190,7 +190,8 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
               dispatch_idempotency_key: z.string(),
               grant_expires_at: z.number().int().positive(),
               grant_fingerprint: z.string().regex(/^[a-f0-9]{64}$/),
-              confinement: z.literal("bubblewrap-read-only-workspace-no-network"),
+              network_policy: z.enum(["disabled", "host"]),
+              confinement: z.enum(["bubblewrap-read-only-workspace-no-network", "bubblewrap-read-only-workspace-host-network"]),
             }).optional(),
             resultSnapshot: z.object({
               submissionId: z.string().optional(),

@@ -56,6 +56,8 @@ export interface ServerConfig {
    * the adapter credential never doubles as a broad-authority operator key.
    */
   acpAdapterSecret?: string;
+  /** Network access inside scheduled read-only ACP sandboxes; host access is opt-in. */
+  readOnlyExecutionNetworkPolicy: "disabled" | "host";
   policy: PolicyConfig;
   /** P1 #50: Secret required for /diagnostics access (even on loopback). */
   diagnosticsSecret?: string;
@@ -436,6 +438,12 @@ function parseAuthMode(value: string | undefined): AuthMode {
   throw new Error(`Invalid KONTROL_AUTH_MODE: ${value}. Expected "oauth" or "tunnel".`);
 }
 
+function parseReadOnlyExecutionNetworkPolicy(value: string | undefined): "disabled" | "host" {
+  if (!value || value === "disabled") return "disabled";
+  if (value === "host") return "host";
+  throw new Error(`Invalid KONTROL_READ_ONLY_NETWORK_POLICY: ${value}. Expected "disabled" or "host".`);
+}
+
 function isLoopbackHost(host: string): boolean {
   return host === "127.0.0.1" || host === "::1" || host === "localhost";
 }
@@ -588,6 +596,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     // P0 #9: outbound adapter credential; falls back to the legacy shared
     // secret only for backward compatibility.
     acpAdapterSecret: env.KONTROL_ACP_ADAPTER_SECRET ?? env.KONTROL_ACP_SHARED_SECRET,
+    readOnlyExecutionNetworkPolicy: parseReadOnlyExecutionNetworkPolicy(env.KONTROL_READ_ONLY_NETWORK_POLICY),
     policy,
     // P1 #50: Diagnostics secret — required for /diagnostics when set
     diagnosticsSecret: env.KONTROL_DIAGNOSTICS_SECRET,
