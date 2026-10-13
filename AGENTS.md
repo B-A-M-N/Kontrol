@@ -407,18 +407,24 @@ Current implementation contracts:
   than merging arrays. A qualification capture has `capturedAt`, `captureId`,
   `initialize`, and the matching `toolsList`; the receipt labels the host
   exchange operator-supplied and Kontrol's live server exchange
-  machine-verified. Qualification requires the deployed HTTPS intermediary,
+  machine-verified. Qualification requires the deployed HTTPS intermediary
+  (a public HTTPS origin or OpenAI Secure MCP Tunnel),
   at least two GET heartbeat bytes per session, two observed drain recoveries,
   eight bounded inspections per cycle, a near-complete 45-second POST heartbeat
   with separately counted diagnostics, and concurrent resource reads;
-  localhost idle-proxy runs cannot create receipts.
+  localhost idle-proxy runs cannot create receipts. Secure MCP Tunnel
+  qualification keeps Kontrol on loopback HTTP, binds the operator-supplied
+  HTTPS transport to the exact tunnel ID and soak, and requires authenticated
+  diagnostics to correlate the same host session's completed 45-second SSE
+  tool call and heartbeat bytes.
   Pass `--host-catalog-file` to fail closed on missing/extra invocable tools
   and stale `serverInfo.version`.
   The default receipt path is `beta-external-catalog.json`; override it with
   `KONTROL_BETA_EXTERNAL_CATALOG_RECEIPT` when running the final gate.
   `beta-gate:final` requires its fresh parity receipt to target the soak origin,
-  match the candidate's immutable MCP version, be captured during the soak, and
-  be probed again after the soak ends with streaming evidence present.
+  match the candidate's immutable MCP version and transport identity, be
+  captured during the soak, and be probed again after the soak ends with
+  streaming evidence present.
 - `npm run probe:idle-proxy` is a localhost-only intermediary harness for the
   25-second idle-response acceptance scenario; it does not substitute for the
   real tunnel or ChatGPT host. Run the dual probe through it with the 18-second

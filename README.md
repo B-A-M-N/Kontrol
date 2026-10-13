@@ -119,12 +119,18 @@ rest of the stack and leaves an `interrupted` report.
 The launcher requires `KONTROL_DIAGNOSTICS_SECRET` and a reviewer secret in
 the environment file. It uses `KONTROL_PUBLIC_BASE_URL` for the soak target
 when configured, otherwise it monitors the local MCP server. A local target
-is useful operational evidence, but final stable-beta qualification still
-requires the public HTTPS path and fresh external host-catalog evidence. The
-soak target, duration, workspace, report, and log can be set with
+gets recurring dual-session GET/POST SSE probes with real heartbeat bytes and
+server-side response accounting. With a public HTTPS URL, those probes use the
+deployed HTTPS origin. With `KONTROL_AUTH_MODE=tunnel`, the local MCP hop stays
+loopback HTTP by design; `tunnel-client` carries the external connection to
+OpenAI over HTTPS, and the monitor checks tunnel readiness separately. The
+local probe does not claim to observe the host's remote route, so final
+stable-beta qualification still needs fresh external host-catalog evidence.
+The soak target, duration, workspace, report, and log can be set with
 `KONTROL_BETA_SOAK_URL`, `KONTROL_BETA_SOAK_HOURS`,
 `KONTROL_BETA_WORKSPACE_PATH`, `KONTROL_BETA_SOAK_REPORT`, and
-`KONTROL_BETA_SOAK_LOG`. The stable-beta minimum remains 12 hours.
+`KONTROL_BETA_SOAK_LOG`; `KONTROL_BETA_SSE_PROBE_CADENCE` changes how often
+the streaming probe runs. The stable-beta minimum remains 12 hours.
 
 Routine development startup defaults to the fast preflight (syntax/typecheck
 plus a fresh atomic build) so reconnecting does not rerun the entire test

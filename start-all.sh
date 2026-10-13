@@ -49,6 +49,10 @@ if [[ "$QUALIFY_MODE" == "1" ]]; then
     echo "ERROR: KONTROL_BETA_SOAK_HOURS and KONTROL_BETA_MIN_SOAK_HOURS must be positive numbers." >&2
     exit 1
   fi
+  if [[ -n "${KONTROL_BETA_SSE_PROBE_CADENCE:-}" ]] && ! node -e 'process.exit(Number.isInteger(Number(process.argv[1])) && Number(process.argv[1]) > 0 ? 0 : 1)' "$KONTROL_BETA_SSE_PROBE_CADENCE"; then
+    echo "ERROR: KONTROL_BETA_SSE_PROBE_CADENCE must be a positive integer." >&2
+    exit 1
+  fi
   KONTROL_BETA_CODE_RECEIPT="${KONTROL_BETA_CODE_RECEIPT:-$DESKTOP_PWD/beta-code-qualification.json}"
   export KONTROL_BETA_CODE_RECEIPT
   echo "[*] Running the stable-beta code gate before changing the active generation..."
@@ -487,7 +491,7 @@ update_dist_projection() {
 }
 
 start_beta_soak_monitor() {
-  local configured_hours minimum_hours hours soak_url workspace_path read_path report_path log_path
+  local configured_hours minimum_hours hours soak_url workspace_path read_path report_path log_path soak_transport
   configured_hours="${KONTROL_BETA_SOAK_HOURS:-12}"
   minimum_hours="${KONTROL_BETA_MIN_SOAK_HOURS:-12}"
   if ! hours="$(node -e '
@@ -509,6 +513,13 @@ start_beta_soak_monitor() {
   fi
 
   soak_url="${KONTROL_BETA_SOAK_URL:-${KONTROL_PUBLIC_BASE_URL:-http://127.0.0.1:${DEV_PORT}}}"
+  if [[ "$soak_url" == https://* ]]; then
+    soak_transport="public_https"
+  elif [[ "${KONTROL_AUTH_MODE:-oauth}" == "tunnel" && "$soak_url" =~ ^http://(localhost|127\.0\.0\.1|\[::1\])(:[0-9]+)?$ ]]; then
+    soak_transport="secure_mcp_tunnel"
+  else
+    soak_transport="local_http"
+  fi
   workspace_path="${KONTROL_BETA_WORKSPACE_PATH:-$DESKTOP_PWD}"
   read_path="${KONTROL_BETA_SOAK_READ_PATH:-AGENTS.md}"
   report_path="${KONTROL_BETA_SOAK_REPORT:-$DESKTOP_PWD/beta-soak.json}"
@@ -522,6 +533,10 @@ start_beta_soak_monitor() {
   local -a soak_args=()
   soak_args+=(--hours "$hours" --url "$soak_url" --interval-ms "${KONTROL_BETA_SOAK_INTERVAL_MS:-5000}")
   soak_args+=(--report "$report_path" --workspace-path "$workspace_path" --read-path "$read_path")
+  soak_args+=(--transport "$soak_transport")
+  if [[ -n "${KONTROL_BETA_SSE_PROBE_CADENCE:-}" ]]; then
+    soak_args+=(--sse-probe-cadence "$KONTROL_BETA_SSE_PROBE_CADENCE")
+  fi
   soak_args+=(--build-id "$EXPECTED_BUILD_ID" --tunnel-url "${KONTROL_BETA_TUNNEL_URL:-http://127.0.0.1:8080}")
   soak_args+=(--approval-cadence "${KONTROL_BETA_APPROVAL_CADENCE:-60}")
   local quoted_arg
@@ -539,12 +554,14 @@ start_beta_soak_monitor() {
     return 1
   fi
   LAUNCHED_SESSIONS+=("kontrol-beta-soak")
-  echo "[*] Beta soak monitor started: ${hours}h against ${soak_url} (build=${EXPECTED_BUILD_ID})."
+  echo "[*] Beta soak monitor started: ${hours}h against ${soak_url} (transport=${soak_transport}, build=${EXPECTED_BUILD_ID})."
   echo "    Status: $report_path"
   echo "    Log:    $log_path"
   echo "    Attach: tmux attach -t kontrol-beta-soak"
-  if [[ "$soak_url" != https://* ]]; then
-    echo "[!] This target is not HTTPS; the soak is a local monitor. Stable-beta release qualification still needs the public HTTPS path and fresh external host-catalog evidence."
+  if [[ "$soak_transport" == "secure_mcp_tunnel" ]]; then
+    echo "[*] The soak checks GET/POST SSE on the local MCP origin and monitors tunnel-client readiness. OpenAI Secure MCP Tunnel carries the external connection over HTTPS; a fresh connected-host catalog receipt is still required for release qualification."
+  elif [[ "$soak_transport" == "local_http" ]]; then
+    echo "[!] This is a local HTTP soak. GET/POST SSE is exercised locally; stable-beta release qualification still needs the deployed HTTPS path and fresh external host-catalog evidence."
   fi
 }
 

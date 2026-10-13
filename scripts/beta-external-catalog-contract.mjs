@@ -52,6 +52,16 @@ function isExternalHttpsTarget(value) {
   }
 }
 
+function isLoopbackHttpTarget(value) {
+  try {
+    const url = new URL(value);
+    return url.protocol === "http:"
+      && ["localhost", "127.0.0.1", "::1"].includes(url.hostname);
+  } catch {
+    return false;
+  }
+}
+
 function workspaceAppResourceUris(toolMetadata) {
   if (!Array.isArray(toolMetadata)) return [];
   const uriPattern = /^ui:\/\/(?:kontrol|devdesktop)\/workspace-app(?:-[a-f0-9]{12})?(?:\.skybridge)?\.html$/i;
@@ -133,12 +143,30 @@ export function validateBetaExternalCatalogReceipt(receipt, { candidateBuildId, 
     && JSON.stringify(serverInputSchemas) === JSON.stringify(hostInputSchemas)
     && hasApprovalResumeInputs(serverInputSchemas),
   );
-  const sameCatalogTarget = Boolean(
+  const transportMode = receipt?.transport?.mode ?? "public_https";
+  const sameOrigin = Boolean(
     normalizedOrigin(receipt?.url)
     && normalizedOrigin(soak?.targetUrl)
-    && normalizedOrigin(receipt.url) === normalizedOrigin(soak.targetUrl)
-    && isExternalHttpsTarget(receipt?.url),
+    && normalizedOrigin(receipt.url) === normalizedOrigin(soak.targetUrl),
   );
+  const sameCatalogTarget = transportMode === "public_https"
+    ? Boolean(sameOrigin && isExternalHttpsTarget(receipt?.url))
+    : transportMode === "secure_mcp_tunnel"
+      ? Boolean(
+        sameOrigin
+        && isLoopbackHttpTarget(receipt?.url)
+        && receipt?.transport?.scheme === "https"
+        && receipt?.transport?.source === "operator_supplied_host_capture"
+        && soak?.transport?.mode === "secure_mcp_tunnel"
+        && typeof receipt?.transport?.tunnelId === "string"
+        && receipt.transport.tunnelId.startsWith("tunnel_")
+        && receipt.transport.tunnelId === soak?.transport?.tunnelId
+        && receipt?.hostCapture?.transport?.source === "operator_supplied"
+        && receipt.hostCapture.transport.kind === "openai_secure_mcp_tunnel"
+        && receipt.hostCapture.transport.scheme === "https"
+        && receipt.transport.tunnelId === receipt?.hostCapture?.transport?.tunnelId,
+      )
+      : false;
   const hostCaptureIsOperatorSupplied = Boolean(
     receipt?.hostCapture?.source === "operator_supplied"
     && typeof receipt.hostCapture.captureId === "string"
@@ -168,8 +196,38 @@ export function validateBetaExternalCatalogReceipt(receipt, { candidateBuildId, 
   const liveServerProbeIsMachineVerified = Boolean(
     receipt?.liveServerProbe?.source === "fresh_http_initialize_and_tools_list"
     && receipt.liveServerProbe.machineVerified === true
-    && normalizedOrigin(receipt.liveServerProbe.url) === normalizedOrigin(receipt.url),
+    && normalizedOrigin(receipt.liveServerProbe.url) === normalizedOrigin(receipt.url)
+    && (receipt.liveServerProbe.transportMode === undefined || receipt.liveServerProbe.transportMode === transportMode),
   );
+  const externalHostStreaming = receipt?.externalHostStreaming;
+  const externalHostStreamingStartedAtMs = Date.parse(externalHostStreaming?.startedAt ?? "");
+  const externalHostStreamingFinishedAtMs = Date.parse(externalHostStreaming?.finishedAt ?? "");
+  const externalHostStreamingEvidenceValid = transportMode !== "secure_mcp_tunnel"
+    || Boolean(
+      externalHostStreaming?.source === "authenticated_server_diagnostics"
+      && externalHostStreaming.machineVerified === true
+      && externalHostStreaming.tunnelId === receipt?.transport?.tunnelId
+      && externalHostStreaming.scheme === "https"
+      && /^[a-f0-9]{64}$/.test(externalHostStreaming.sessionIdSha256 ?? "")
+      && externalHostStreaming.sessionIdSha256 === receipt?.hostCapture?.sessionIdSha256
+      && externalHostStreaming.toolName === "await_workspace_events"
+      && Number.isInteger(externalHostStreaming.requestedWaitMs)
+      && externalHostStreaming.requestedWaitMs >= 45_000
+      && Number.isInteger(externalHostStreaming.durationMs)
+      && externalHostStreaming.durationMs >= externalHostStreaming.requestedWaitMs - 5_000
+      && Number.isInteger(externalHostStreaming.heartbeatBytes)
+      && externalHostStreaming.heartbeatBytes > 0
+      && Number.isInteger(externalHostStreaming.responseBytes)
+      && externalHostStreaming.responseBytes > 0
+      && externalHostStreaming.responseCloseClassification === "response_finished"
+      && externalHostStreaming.handlerStillRunning === false
+      && externalHostStreaming.terminalResultReceived === true
+      && Number.isFinite(externalHostStreamingStartedAtMs)
+      && Number.isFinite(externalHostStreamingFinishedAtMs)
+      && externalHostStreamingStartedAtMs >= soakStartedAtMs
+      && externalHostStreamingFinishedAtMs <= soakFinishedAtMs
+      && externalHostStreamingFinishedAtMs >= externalHostStreamingStartedAtMs,
+    );
   const streamingEvidenceValid = Boolean(
     receipt?.dualSession === true
     && Number.isInteger(receipt?.heartbeatCountPerSession)
@@ -248,6 +306,7 @@ export function validateBetaExternalCatalogReceipt(receipt, { candidateBuildId, 
     && workspaceAppCheck.valid
     && streamingEvidenceValid
     && postHeartbeatEvidenceValid
+    && externalHostStreamingEvidenceValid
     && boundedInspectionEvidenceValid
     && timeOrderValid,
   );
@@ -263,6 +322,7 @@ export function validateBetaExternalCatalogReceipt(receipt, { candidateBuildId, 
     liveServerProbeIsMachineVerified,
     streamingEvidenceValid,
     postHeartbeatEvidenceValid,
+    externalHostStreamingEvidenceValid,
     boundedInspectionEvidenceValid,
     timeOrderValid,
     hostCatalogCapturedAt: receipt?.hostCatalogCapturedAt,
