@@ -1217,6 +1217,7 @@ async function deliverEvent(runId, event, run) {
       if (response.ok) {
         if (
           run?.workSessionId &&
+          !run.readOnlyAudit &&
           (event.type === "started" || event.type === "heartbeat") &&
           !applyWorkspaceLeaseRenewal(run, body)
         ) return { acknowledged: false, leaseLost: true };

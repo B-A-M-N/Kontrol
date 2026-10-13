@@ -62,6 +62,7 @@ const lines = createInterface({ input: controlInput, crlfDelay: Infinity });
 let launch;
 let started = false;
 let worker;
+let reportedWorkerExitCode;
 const idleGateTimer = setTimeout(() => {
   if (!started) process.exit(0);
 }, 60_000).unref();
@@ -95,17 +96,30 @@ lines.on("line", (line) => {
       windowsHide: true,
     });
     worker.once("spawn", () => send({ type: "worker_spawned", pid: worker.pid }));
-    worker.once("error", (error) => send({ type: "worker_error", message: error.message, code: error.code }, () => process.exit(127)));
-    worker.once("exit", (code, signal) => send({ type: "worker_exit", code, signal }, () => process.exit(code ?? 1)));
+    worker.once("error", (error) => {
+      reportedWorkerExitCode = 127;
+      send({ type: "worker_error", message: error.message, code: error.code });
+      setTimeout(() => process.exit(reportedWorkerExitCode), 250).unref();
+    });
+    worker.once("exit", (code, signal) => {
+      reportedWorkerExitCode = code ?? 1;
+      send({ type: "worker_exit", code, signal });
+      // Let the owner observe worker_exit and close the control pipe. That
+      // closes this wrapper deterministically while preserving the worker's
+      // exit code for the adapter lifecycle event.
+      setTimeout(() => process.exit(reportedWorkerExitCode), 250).unref();
+    });
   } catch (error) {
     send({ type: "worker_error", message: error.message, code: error.code }, () => process.exit(127));
   }
 });
 controlInput.once("end", () => {
   if (!started) process.exit(0);
+  if (reportedWorkerExitCode !== undefined) process.exit(reportedWorkerExitCode);
 });
 lines.once("close", () => {
   if (!started) process.exit(0);
+  if (reportedWorkerExitCode !== undefined) process.exit(reportedWorkerExitCode);
 });
 process.on("SIGTERM", () => {
   if (worker?.pid) {
@@ -159,6 +173,7 @@ export async function prepareOwnedChild(command, args, options = {}) {
       buffered = buffered.slice(newline + 1);
       let message;
       try { message = JSON.parse(line); } catch { continue; }
+      if (message.type === "worker_exit" || message.type === "worker_error") controlInput.destroy();
       const waiter = [...waiters].find((item) => item.predicate(message));
       if (waiter) {
         waiters.delete(waiter);

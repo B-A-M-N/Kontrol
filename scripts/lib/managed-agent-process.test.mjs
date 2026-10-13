@@ -69,6 +69,26 @@ try {
   }
 
   const launchMarker = join(root, "worker-started");
+  const completedGate = await prepareOwnedChild("/bin/sh", ["-c", "exit 0"], {
+    cwd: root,
+    env: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
+  });
+  const completedGateExit = once(completedGate.child, "exit");
+  await completedGate.start();
+  let completedGateCode;
+  try {
+    [completedGateCode] = await Promise.race([
+      completedGateExit,
+      new Promise((_, reject) => setTimeout(() => {
+        reject(new Error("completed worker launch gate did not exit"));
+      }, 2_000).unref()),
+    ]);
+  } catch (error) {
+    await terminateProcessGroup({ pid: completedGate.child.pid, processGroupId: completedGate.child.pid, processStartToken: processStartToken(completedGate.child.pid) }, 1_000);
+    throw error;
+  }
+  assert.equal(completedGateCode, 0, "a naturally completed worker closes its owned launch gate with the worker exit code");
+
   const launchGate = await prepareOwnedChild(process.execPath, [
     "-e",
     "require('node:fs').writeFileSync(process.argv[1], 'started'); setTimeout(() => {}, 60000)",
