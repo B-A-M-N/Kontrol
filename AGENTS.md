@@ -373,6 +373,11 @@ Current implementation contracts:
 - Worker-bound MCP transports are protected by the associated nonterminal,
   actively owned work session rather than by an unbounded TTL. Detached or
   terminal worker sessions become reclaimable after their normal grace period.
+- Scheduled read-only execution mode is persisted on the logical ACP run before
+  the adapter request is sent. Lifecycle events may bypass checkout mutation
+  lease renewal only when that persisted mode and a signed grant for the exact
+  current attempt both match; scheduled-job work-session linkage can lag the
+  first adapter event and is not lifecycle authority.
 - `kontrol-supervisor.mjs` contains probe/status exceptions, opens a
   cooldown-backed per-component circuit after repeated failed recovery, and
   publishes generation/PID/start-token identity. `start-all.sh` validates that

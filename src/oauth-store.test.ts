@@ -121,6 +121,7 @@ async function testDatabaseConfiguration(stateDir: string): Promise<void> {
       { version: 78, name: "scheduled-job-acp-attempt-identity" },
       { version: 79, name: "scheduled-job-immutable-reports" },
       { version: 80, name: "scheduled-job-execution-accounting" },
+      { version: 81, name: "acp-run-scheduled-execution-mode" },
     ]);
   } finally {
     database.close();

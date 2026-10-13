@@ -166,6 +166,8 @@ export interface PersistentAcpRun {
   remoteRunId?: string;
   /** Attempt number within the same logical run (continuations bump this). */
   attemptNumber: number;
+  /** Server-owned scheduled execution authority; adapters cannot set this. */
+  scheduledExecutionMode?: string;
   status: string;
   inputPreview?: string;
   outputPreview?: string;
@@ -232,6 +234,7 @@ export interface AgentRegistryManager {
     status?: string;
     remoteRunId?: string;
     attemptNumber?: number;
+    scheduledExecutionMode?: string;
   }): PersistentAcpRun;
   updateRun(runId: string, updates: Partial<PersistentAcpRun>): void;
   updateRunIfCurrent(
@@ -551,6 +554,7 @@ class SqliteAgentRegistryManager implements AgentRegistryManager {
     status?: string;
     remoteRunId?: string;
     attemptNumber?: number;
+    scheduledExecutionMode?: string;
   }): PersistentAcpRun {
     const now = new Date().toISOString();
     const runId = `acp_run_${randomUUID()}`;
@@ -562,6 +566,7 @@ class SqliteAgentRegistryManager implements AgentRegistryManager {
       workSessionId: input.workSessionId ? brandWorkSessionId(input.workSessionId) : undefined,
       remoteRunId: input.remoteRunId,
       attemptNumber: input.attemptNumber ?? 1,
+      scheduledExecutionMode: input.scheduledExecutionMode,
       status: input.status ?? "created",
       inputPreview: input.inputPreview,
       webhookUrl: input.webhookUrl,
@@ -579,6 +584,7 @@ class SqliteAgentRegistryManager implements AgentRegistryManager {
         workSessionId: run.workSessionId ?? null,
         remoteRunId: run.remoteRunId ?? null,
         attemptNumber: run.attemptNumber,
+        scheduledExecutionMode: run.scheduledExecutionMode ?? null,
         status: run.status,
         inputPreview: run.inputPreview ?? null,
         outputPreview: null,
@@ -606,6 +612,7 @@ class SqliteAgentRegistryManager implements AgentRegistryManager {
     if (Object.prototype.hasOwnProperty.call(updates, "finishedAt")) values.finishedAt = updates.finishedAt ?? null;
     if (updates.remoteRunId !== undefined) values.remoteRunId = updates.remoteRunId;
     if (updates.attemptNumber !== undefined) values.attemptNumber = updates.attemptNumber;
+    if (updates.scheduledExecutionMode !== undefined) values.scheduledExecutionMode = updates.scheduledExecutionMode;
     if (updates.lastHeartbeatAt !== undefined) values.lastHeartbeatAt = updates.lastHeartbeatAt;
     // Clear the lease when the caller explicitly passes null. Use property
     // presence rather than value presence so `null` updates the nullable column
@@ -924,6 +931,7 @@ function runUpdateValues(updates: Partial<PersistentAcpRun>): Record<string, unk
   if (updates.finishedAt !== undefined) values.finishedAt = updates.finishedAt;
   if (updates.remoteRunId !== undefined) values.remoteRunId = updates.remoteRunId;
   if (updates.attemptNumber !== undefined) values.attemptNumber = updates.attemptNumber;
+  if (updates.scheduledExecutionMode !== undefined) values.scheduledExecutionMode = updates.scheduledExecutionMode;
   if (updates.lastHeartbeatAt !== undefined) values.lastHeartbeatAt = updates.lastHeartbeatAt;
   if (Object.prototype.hasOwnProperty.call(updates, "workerLeaseUntil")) {
     values.workerLeaseUntil = updates.workerLeaseUntil ?? null;
@@ -960,6 +968,7 @@ function rowToPersistentRun(row: AcpRunRow): PersistentAcpRun {
     workSessionId: row.workSessionId ? brandWorkSessionId(row.workSessionId) : undefined,
     remoteRunId: row.remoteRunId ?? undefined,
     attemptNumber: row.attemptNumber ?? 1,
+    scheduledExecutionMode: row.scheduledExecutionMode ?? undefined,
     status: row.status,
     inputPreview: row.inputPreview ?? undefined,
     outputPreview: row.outputPreview ?? undefined,

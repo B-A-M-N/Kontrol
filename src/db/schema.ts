@@ -362,6 +362,8 @@ export const acpRuns = sqliteTable("acp_runs", {
   workSessionId: text("work_session_id"),
   remoteRunId: text("remote_run_id"),
   attemptNumber: integer("attempt_number").notNull().default(1),
+  /** Server-owned execution authority, persisted before the adapter request. */
+  scheduledExecutionMode: text("scheduled_execution_mode"),
   status: text("status").notNull().default("created"),
   inputPreview: text("input_preview"),
   outputPreview: text("output_preview"),

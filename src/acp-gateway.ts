@@ -594,6 +594,9 @@ export async function callRemoteAgent(
       workSessionId: params.workSessionId,
       inputPreview: params.task.slice(0, 500),
       webhookUrl: params.webhookUrl,
+      scheduledExecutionMode: params.scheduledExecutionPolicy?.executionMode === "read_only_audit"
+        ? "read_only_audit"
+        : undefined,
       status: "created",
     });
     if (run.agentId !== params.agentId || run.workSessionId !== params.workSessionId) {
@@ -601,6 +604,11 @@ export async function callRemoteAgent(
     }
     expectedDispatchStatus = run.status;
     attemptNumber = run.attemptNumber ?? 1;
+  }
+  if (params.scheduledExecutionPolicy?.executionMode === "read_only_audit"
+    && run.scheduledExecutionMode !== "read_only_audit") {
+    config.agentRegistry.updateRun(run.runId, { scheduledExecutionMode: "read_only_audit" });
+    run.scheduledExecutionMode = "read_only_audit";
   }
   config.agentRegistry.beginDispatchAttempt({
     key: dispatchIdempotencyKey,
@@ -724,6 +732,7 @@ export async function callRemoteAgent(
         output: outputText,
         error: errorMessage,
         workSessionId: params.workSessionId,
+        ...(dispatched.executionReceipt ? { executionReceipt: dispatched.executionReceipt } : {}),
       };
     }
 
@@ -751,6 +760,7 @@ export async function callRemoteAgent(
           output: `Adapter accepted the run after the logical session became ${status}; remote attempt was cancelled.`,
           error: sessionTerminal ? `Session is ${currentSession?.status}` : `Run is ${currentRun?.status ?? "missing"}`,
           workSessionId: params.workSessionId,
+          ...(dispatched.executionReceipt ? { executionReceipt: dispatched.executionReceipt } : {}),
         };
       }
 
@@ -781,6 +791,7 @@ export async function callRemoteAgent(
             output: "Adapter accepted the run, but the logical run changed before it could be marked running; remote attempt was cancelled.",
             error: `Run changed before dispatch acceptance could be recorded.`,
             workSessionId: params.workSessionId,
+            ...(dispatched.executionReceipt ? { executionReceipt: dispatched.executionReceipt } : {}),
           };
         }
         return {

@@ -90,7 +90,22 @@ const migrations: Migration[] = [
   { version: 78, name: "scheduled-job-acp-attempt-identity", up: migrateScheduledJobAcpAttemptIdentity },
   { version: 79, name: "scheduled-job-immutable-reports", up: migrateScheduledJobImmutableReports },
   { version: 80, name: "scheduled-job-execution-accounting", up: migrateScheduledJobExecutionAccounting },
+  { version: 81, name: "acp-run-scheduled-execution-mode", up: migrateAcpRunScheduledExecutionMode },
 ];
+
+function migrateAcpRunScheduledExecutionMode(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "acp_runs", "scheduled_execution_mode", "text");
+  sqlite.exec(`
+    update acp_runs
+       set scheduled_execution_mode = 'read_only_audit'
+     where scheduled_execution_mode is null
+       and exists (
+         select 1 from scheduled_jobs job
+          where job.work_session_id = acp_runs.work_session_id
+            and job.execution_mode = 'read_only_audit'
+       )
+  `);
+}
 
 function migrateScheduledJobAcpAttemptIdentity(sqlite: Database.Database): void {
   addColumnIfMissing(sqlite, "scheduled_job_attempts", "acp_dispatch_id", "text");

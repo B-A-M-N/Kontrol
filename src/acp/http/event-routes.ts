@@ -106,46 +106,44 @@ const SERVER_OWNED_EVENT_PAYLOAD_FIELDS = new Set([
       }
     }
 
-    // A scheduled read-only execution has no checkout mutation lease. Its
-    // lifecycle authority is instead proved by the exact Kontrol-issued grant
-    // attached to this adapter event. The schedule row and current persisted
-    // ACP attempt are the authority; event payload claims alone are not.
+    // A scheduled read-only execution has no checkout mutation lease. The
+    // gateway persists its execution mode on the ACP run before sending the
+    // adapter request, because the scheduler's work-session link may not yet
+    // have been projected onto the scheduled-job row when an eager worker
+    // reports its first event. The signed grant must still bind this exact
+    // current attempt and workspace.
     let readOnlyExecutionAuthorized = false;
-    if (run.workSessionId && ctx.database) {
-      const scheduled = ctx.database.sqlite.prepare(
-        "select execution_mode as executionMode from scheduled_jobs where work_session_id = ? limit 1",
-      ).get(run.workSessionId) as { executionMode?: string } | undefined;
-      if (scheduled?.executionMode === "read_only_audit") {
-        let workspaceRoot: string | undefined;
-        try {
-          workspaceRoot = run.workspaceSessionId
-            ? await realpath(ctx.workspaces.getWorkspace(run.workspaceSessionId).root)
-            : undefined;
-        } catch { /* reject below when the canonical workspace cannot be recovered */ }
-        const grantValid = Boolean(
-          authoritativeAttempt
-          && workspaceRoot
-          && run.agentId
-          && verifyReadOnlyExecutionGrant(
-            body.read_only_execution_grant,
-            ctx.adapterSecret ?? ctx.sharedSecret,
-            {
-              workSessionId: run.workSessionId,
-              workspaceSessionId: run.workspaceSessionId,
-              workspaceRoot,
-              agentId: run.agentId,
-              runId: run.runId,
-              attemptNumber: body.attempt_number ?? run.attemptNumber,
-              dispatchIdempotencyKey: authoritativeAttempt.dispatchIdempotencyKey,
-            },
-          ),
-        );
-        if (!grantValid) {
-          res.status(403).json({ error: { code: "read_only_grant_invalid", message: "Scheduled read-only event lacks a valid current-attempt execution grant." } });
-          return;
-        }
-        readOnlyExecutionAuthorized = true;
+    if (run.scheduledExecutionMode === "read_only_audit") {
+      let workspaceRoot: string | undefined;
+      try {
+        workspaceRoot = run.workspaceSessionId
+          ? await realpath(ctx.workspaces.getWorkspace(run.workspaceSessionId).root)
+          : undefined;
+      } catch { /* reject below when the canonical workspace cannot be recovered */ }
+      const grantValid = Boolean(
+        authoritativeAttempt
+        && run.workSessionId
+        && workspaceRoot
+        && run.agentId
+        && verifyReadOnlyExecutionGrant(
+          body.read_only_execution_grant,
+          ctx.adapterSecret ?? ctx.sharedSecret,
+          {
+            workSessionId: run.workSessionId,
+            workspaceSessionId: run.workspaceSessionId,
+            workspaceRoot,
+            agentId: run.agentId,
+            runId: run.runId,
+            attemptNumber: body.attempt_number ?? run.attemptNumber,
+            dispatchIdempotencyKey: authoritativeAttempt.dispatchIdempotencyKey,
+          },
+        ),
+      );
+      if (!grantValid) {
+        res.status(403).json({ error: { code: "read_only_grant_invalid", message: "Scheduled read-only event lacks a valid current-attempt execution grant." } });
+        return;
       }
+      readOnlyExecutionAuthorized = true;
     }
 
     // P0 #7: bind lifecycle events to the exact dispatch attempt. An event
