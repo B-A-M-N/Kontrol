@@ -137,11 +137,21 @@ export function createScheduledJobRuntime(options: ScheduledJobRuntimeOptions): 
     const at = Date.now();
     recentDrainFailures.push({ at, phase, failureClass, fingerprint, recurrenceCount });
     while (recentDrainFailures.length > 100) recentDrainFailures.shift();
-    const job = jobId ? jobs.get(jobId) : undefined;
+    let sessionId = "scheduler-runtime";
+    if (jobId) {
+      try {
+        const job = jobs.get(jobId);
+        sessionId = job?.workSessionId ?? job?.projectId ?? sessionId;
+      } catch {
+        // Failure attribution must not recursively fail because the same
+        // scheduler database read path is unhealthy. Keep the job ID in the
+        // payload and persist under the scheduler-owned fallback session.
+      }
+    }
     try {
       options.events?.appendEvent({
         type: "scheduled_job.scheduler_error",
-        sessionId: job?.workSessionId ?? job?.projectId ?? "scheduler-runtime",
+        sessionId,
         payload: {
           operationPhase: phase,
           failureClass,
@@ -218,10 +228,18 @@ export function createScheduledJobRuntime(options: ScheduledJobRuntimeOptions): 
       return;
     }
     for (const job of targets) {
+      const previousCursor = projectionTargetCursor;
       projectionTargetCursor = job.id;
       activeDrainJobId = job.id;
       activeDrainAttemptId = job.activeDispatchAttemptId;
-      if (job.workSessionId) await projectSessionEvents(job.workSessionId);
+      try {
+        if (job.workSessionId) await projectSessionEvents(job.workSessionId);
+      } catch (error) {
+        // Keep the failed target at the head of the next bounded page so a
+        // transient projection/read error is retried on the next poll.
+        projectionTargetCursor = previousCursor;
+        throw error;
+      }
     }
     activeDrainJobId = undefined;
     activeDrainAttemptId = undefined;

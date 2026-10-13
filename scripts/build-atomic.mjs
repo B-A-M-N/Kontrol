@@ -156,7 +156,7 @@ try {
   // relative dependency remains release-local.
   const workerToken = join(root, "scripts/lib/acp-worker-token.mjs");
   if (existsSync(workerToken)) copyFileSync(workerToken, join(tempDist, "acp-worker-token.mjs"));
-  const readOnlyExecution = join(root, "src/read-only-execution.mjs");
+  const readOnlyExecution = join(root, "scripts/lib/read-only-execution.mjs");
   if (existsSync(readOnlyExecution)) copyFileSync(readOnlyExecution, join(tempDist, "read-only-execution.mjs"));
   chmodSync(join(tempDist, "cli.js"), 0o755);
 

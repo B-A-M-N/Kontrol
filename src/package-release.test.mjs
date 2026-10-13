@@ -18,6 +18,7 @@ import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { tmpdir } from "node:os";
 import { gunzipSync } from "node:zlib";
+import { testHarnessEnvironment } from "../scripts/lib/tool-environment.mjs";
 
 const root = process.cwd();
 const tmp = mkdtempSync(join(tmpdir(), "kontrol-package-"));
@@ -31,7 +32,7 @@ try {
   console.log("[package-release] staging + packing release artifact...");
   execFileSync("node", [join(root, "scripts", "package-stage.mjs"), "--pack-destination", tmp], {
     cwd: root,
-    env: { ...process.env, npm_config_cache: join(tmp, "npm-cache") },
+    env: testHarnessEnvironment(process.env, { overrides: { npm_config_cache: join(tmp, "npm-cache") } }),
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -80,10 +81,7 @@ try {
     tarball,
   ], {
     cwd: tmp,
-    env: {
-      ...process.env,
-      npm_config_update_notifier: "false",
-    },
+    env: testHarnessEnvironment(process.env, { overrides: { npm_config_update_notifier: "false" } }),
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -142,8 +140,7 @@ try {
 
   const servicePort = await unusedTcpPort();
   const serviceState = join(tmp, "installed-state");
-  const serviceEnv = {
-    ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("KONTROL_POLICY_"))),
+  const serviceEnv = testHarnessEnvironment(process.env, { overrides: {
     HOST: "127.0.0.1",
     PORT: String(servicePort),
     KONTROL_AUTH_MODE: "tunnel",
@@ -158,7 +155,7 @@ try {
     // read-only discovery is frictionless, while arbitrary shell and file
     // mutation return approval_required without executing.
     KONTROL_TUNNEL_REVIEWER_SECRET: "package-release-reviewer-secret-long-enough",
-  };
+  } });
   const doctorOutput = execFileSync("node", [installedCli, "doctor"], {
     cwd: installPrefix,
     env: serviceEnv,
@@ -536,13 +533,12 @@ function assertUserFacingBranding(pkg) {
 }
 
 function serviceEnvForInstall(tmpRoot, installPrefix) {
-  return {
-    ...process.env,
+  return testHarnessEnvironment(process.env, { overrides: {
     XDG_CONFIG_HOME: join(tmpRoot, "service-config-home"),
     XDG_DATA_HOME: join(tmpRoot, "service-data-home"),
     KONTROL_SERVICE_DATA_DIR: join(tmpRoot, "service-data"),
     KONTROL_ALLOWED_ROOTS: installPrefix,
-  };
+  } });
 }
 
 function removeAllowedAttribution(file, text) {

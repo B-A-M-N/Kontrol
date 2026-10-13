@@ -42,6 +42,7 @@ const workspaceDir = join(tmp, "workspace");
 
 let server = null;
 let serverStderr = "";
+let serverStdout = "";
 
 function log(step, message) {
   console.log(`[release-uat] ${step}: ${message}`);
@@ -57,7 +58,7 @@ function unusedTcpPort() {
   });
 }
 
-async function waitForHttp(url, timeoutMs = 30_000) {
+async function waitForHttp(url, timeoutMs = 30_000, diagnostics = () => "") {
   const deadline = Date.now() + timeoutMs;
   let lastError;
   while (Date.now() < deadline) {
@@ -70,7 +71,7 @@ async function waitForHttp(url, timeoutMs = 30_000) {
     }
     await new Promise((r) => setTimeout(r, 250));
   }
-  throw new Error(`timed out waiting for ${url}: ${lastError?.message ?? "unknown"}`);
+  throw new Error(`timed out waiting for ${url}: ${lastError?.message ?? "unknown"}${diagnostics()}`);
 }
 
 let rpcId = 0;
@@ -151,8 +152,7 @@ try {
 
   // ── 3: launch the installed server ────────────────────────────────────────
   const servicePort = await unusedTcpPort();
-  const serviceEnv = {
-    ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("KONTROL_POLICY_"))),
+  const serviceEnv = testHarnessEnvironment(process.env, { overrides: {
     HOST: "127.0.0.1",
     PORT: String(servicePort),
     KONTROL_AUTH_MODE: "tunnel",
@@ -166,17 +166,18 @@ try {
     KONTROL_POLICY_TOOL_BASH: "ask",
     KONTROL_TUNNEL_REVIEWER_SECRET: "release-uat-reviewer-secret-long-enough",
     KONTROL_LOG_FORMAT: "pretty",
-  };
+  } });
   log("launch", `starting installed server on :${servicePort}`);
   server = spawn("node", [installedCli, "serve"], {
     cwd: installPrefix,
     env: serviceEnv,
     stdio: ["ignore", "pipe", "pipe"],
   });
+  server.stdout?.on("data", (chunk) => { serverStdout = `${serverStdout}${String(chunk)}`.slice(-32_000); });
   server.stderr?.on("data", (chunk) => { serverStderr += String(chunk); });
 
   // ── 4: health gates ───────────────────────────────────────────────────────
-  await waitForHttp(`http://127.0.0.1:${servicePort}/healthz`);
+  await waitForHttp(`http://127.0.0.1:${servicePort}/healthz`, 30_000, () => `\nserver output:\n${serverStdout}\n${serverStderr}`);
   log("healthz", "ok");
   const coreReady = await waitForHttp(`http://127.0.0.1:${servicePort}/core-readyz`);
   assert.ok(coreReady.ok, "core-readyz not ok");

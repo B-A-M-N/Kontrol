@@ -35,6 +35,10 @@ assert.ok(
   pkg.files.includes("scripts/acp-stdio-duplex-adapter.mjs"),
   "stdio duplex adapter is included in the published package",
 );
+assert.ok(
+  pkg.files.includes("scripts/lib/read-only-execution.mjs"),
+  "shared execution grant and sandbox implementation is included with the adapters",
+);
 assert.match(pkg.scripts["test:adapters"], /acp-stdio-duplex-adapter\.mjs/);
 assert.match(pkg.scripts["test:adapters"], /acp-stdio-duplex-adapter\.test\.mjs/);
 

@@ -961,6 +961,228 @@ try {
       "repeated scheduler failures stay visible with a durable recurrence count");
     failProjection = false;
     await diagnosticRuntime.drainOnce();
+
+    const faultRoot = join(root, "scheduler-fault-diagnostics");
+    const faultDb = openDatabase(faultRoot);
+    const faultOutbox = createDispatchOutbox(faultDb);
+    const faultJobs = createScheduledJobStore(faultDb, faultOutbox);
+    const faultEventStore = createEventStore(faultDb);
+    const faultEvents: Array<{ type: string; sessionId: string; payload: Record<string, unknown> }> = [];
+    const makeFaultEventStore = (getEventsAfter: (sessionId: string, cursor: number) => any[] = () => []) => ({
+      getEventsAfter,
+      appendEvent: (event: { type: string; sessionId: string; payload: Record<string, unknown> }, options?: { publish?: boolean }) => {
+        faultEvents.push(event);
+        return faultEventStore.appendEvent(event, options);
+      },
+      subscribeAll: () => () => undefined,
+    }) as any;
+    const makeFailureJob = (suffix: string, workSessionId?: string) => faultJobs.create({
+      principalId: "failure-user",
+      ownerContextId: "failure-owner",
+      projectId: "failure-project",
+      workspaceRoot: "/tmp/failure-project",
+      runAt: new Date(Date.now() - 1_000).toISOString(),
+      instructionJson: { instructions: `Exercise ${suffix} recovery.` },
+      executionMode: "read_only_audit",
+      policySnapshotJson: { workspaceAccess: "read_only" },
+      workSessionId,
+      maxRuntimeMs: 60_000,
+    });
+    const beginDispatch = (target: ScheduledJob, dispatcherInstanceId: string) => {
+      faultJobs.transition({ jobId: target.id, expectedRevision: target.revision, nextStatus: "due", expectedSourceStatuses: ["pending"] });
+      return faultJobs.claimDispatch({ jobId: target.id, expectedRevision: target.revision + 1, dispatcherInstanceId });
+    };
+
+    // A raw scheduler query failure must be durably attributed and the same
+    // runtime must keep polling; the due job dispatches on the next pass.
+    {
+      const rawReadJob = makeFailureJob("raw scheduler read");
+      let injectReadFailure = true;
+      const failingSqlite = new Proxy(faultDb.sqlite, {
+        get(target, property) {
+          if (property === "prepare") return (statement: string) => {
+            if (injectReadFailure && statement.includes("select id, revision, run_at from scheduled_jobs")) {
+              injectReadFailure = false;
+              throw new Error("injected scheduler database read failure");
+            }
+            return target.prepare(statement);
+          };
+          const value = Reflect.get(target, property, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+      const failingDatabase = { sqlite: failingSqlite, db: faultDb.db, close: faultDb.close } as any;
+      const events = makeFaultEventStore();
+      let dispatchCalls = 0;
+      const runtime = createScheduledJobRuntime({
+        database: failingDatabase,
+        jobs: faultJobs,
+        dispatchOutbox: faultOutbox,
+        events,
+        pollMs: 60_000,
+        dispatch: async () => { dispatchCalls += 1; return { status: "failed", reason: "test dispatch complete" }; },
+      });
+      await runtime.drainOnce();
+      const readFailure = faultEvents.find((event) => event.payload.operationPhase === "reconcile_nonterminal_jobs");
+      assert.ok(readFailure, "raw scheduler database read failures persist a phase-attributed event");
+      assert.equal(readFailure.payload.retryEligible, true);
+      assert.equal(runtime.getMetrics().serviceability.status, "degraded");
+      await runtime.drainOnce();
+      assert.equal(dispatchCalls, 1, "the scheduler continues polling and dispatches due work after the read recovers");
+      assert.equal(faultJobs.get(rawReadJob.id)?.status, "failed");
+    }
+
+    // An exception while applying an otherwise readable lifecycle event is
+    // retained at the projection cursor and retried on the very next drain.
+    {
+      const projectionJob = makeFailureJob("projection application", "ws-projection-application-fault");
+      const claim = beginDispatch(projectionJob, "projection-fault-scheduler");
+      faultJobs.completeDispatch({
+        jobId: projectionJob.id,
+        dispatchAttemptId: claim.attemptId,
+        expectedRevision: claim.revision,
+        dispatcherInstanceId: "projection-fault-scheduler",
+        outcome: "dispatched",
+        workSessionId: "ws-projection-application-fault",
+        acpRunId: "run-projection-application-fault",
+        acpDispatchId: claim.dispatchId,
+        acpAttemptNumber: 1,
+      });
+      const event = {
+        id: "projection-application-fault-event",
+        seq: 1,
+        durable: true,
+        type: "agent.run.started",
+        sessionId: "ws-projection-application-fault",
+        payload: { runId: "run-projection-application-fault", dispatchId: claim.dispatchId, attemptNumber: 1 },
+        createdAt: new Date().toISOString(),
+      };
+      let projectCalls = 0;
+      let injectProjectionFailure = true;
+      const failingJobs = new Proxy(faultJobs, {
+        get(target, property, receiver) {
+          if (property === "projectEvent") return (candidate: typeof event) => {
+            projectCalls += 1;
+            if (injectProjectionFailure) {
+              injectProjectionFailure = false;
+              throw new Error("injected lifecycle projection application failure");
+            }
+            return target.projectEvent(candidate as any);
+          };
+          const value = Reflect.get(target, property, receiver);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+      const events = makeFaultEventStore((sessionId, cursor) => sessionId === event.sessionId && cursor < event.seq ? [event] : []);
+      const runtime = createScheduledJobRuntime({ database: faultDb, jobs: failingJobs, dispatchOutbox: faultOutbox, events, pollMs: 60_000 });
+      await runtime.drainOnce();
+      assert.equal(runtime.getMetrics().lastDrainFailurePhase, "project_lifecycle_events");
+      assert.equal(faultEvents.find((item) => item.payload.operationPhase === "project_lifecycle_events")?.payload.retryEligible, true);
+      assert.equal(projectCalls, 1);
+      await runtime.drainOnce();
+      assert.equal(projectCalls, 2, "failed projection retries from the same bounded target on the next drain");
+    }
+
+    // Cancellation adapter errors leave the durable cancellation request
+    // fenced and retryable until a later callback confirms worker shutdown.
+    {
+      const cancellationJob = makeFailureJob("cancellation adapter lookup", "ws-cancellation-adapter-fault");
+      const claim = beginDispatch(cancellationJob, "cancellation-fault-scheduler");
+      const current = faultJobs.get(cancellationJob.id)!;
+      const cancellation = faultJobs.requestCancellation({ jobId: current.id, expectedRevision: current.revision, requestId: "cancel-after-adapter-error" });
+      let injectCancellationFailure = true;
+      const events = makeFaultEventStore();
+      const runtime = createScheduledJobRuntime({
+        database: faultDb,
+        jobs: faultJobs,
+        dispatchOutbox: faultOutbox,
+        events,
+        pollMs: 60_000,
+        reconcileCancellation: async () => {
+          if (injectCancellationFailure) {
+            injectCancellationFailure = false;
+            throw new Error("injected cancellation adapter lookup failure");
+          }
+          return { state: "worker_cancelled", reason: "adapter confirmed shutdown" };
+        },
+      });
+      await runtime.drainOnce();
+      assert.equal(faultJobs.get(cancellationJob.id)?.status, "cancellation_requested");
+      const cancellationFailure = faultEvents.find((event) => event.payload.operationPhase === "reconcile_cancellation");
+      assert.ok(cancellationFailure, "cancellation adapter lookup failure is durably attributed");
+      assert.equal(cancellationFailure.payload.scheduledJobId, cancellationJob.id);
+      assert.equal(cancellationFailure.payload.dispatchAttemptId, claim.attemptId);
+      assert.equal(cancellationFailure.payload.retryEligible, true);
+      assert.equal(runtime.getMetrics().lastDrainFailurePhase, "reconcile_cancellation");
+      faultDb.sqlite.prepare("update scheduled_jobs set cancellation_last_attempt_at = ? where id = ?")
+        .run(new Date(Date.now() - 60_000).toISOString(), cancellationJob.id);
+      await runtime.drainOnce();
+      assert.equal(faultJobs.get(cancellationJob.id)?.status, "cancelled", "the same durable cancellation recovers after adapter lookup returns");
+      assert.equal(faultJobs.get(cancellationJob.id)?.cancellationRequestId, cancellation.cancellationRequestId);
+    }
+
+    // Interrupted-dispatch adapter lookup errors preserve the original
+    // attempt, emit retryable diagnostics, and later reattach without launch.
+    {
+      const lookupJob = makeFailureJob("dispatch adapter lookup", "ws-dispatch-adapter-fault");
+      const claim = beginDispatch(lookupJob, "dispatch-fault-scheduler");
+      faultDb.sqlite.prepare("update scheduled_job_attempts set lease_expires_at = ? where id = ?")
+        .run("2000-01-01T00:00:00.000Z", claim.attemptId);
+      let injectLookupFailure = true;
+      let injectJobReadFailure = true;
+      const failingJobs = new Proxy(faultJobs, {
+        get(target, property, receiver) {
+          if (property === "get") return (jobId: string) => {
+            if (injectJobReadFailure) {
+              injectJobReadFailure = false;
+              throw new Error("injected scheduler job read failure while recording adapter lookup error");
+            }
+            return target.get(jobId);
+          };
+          const value = Reflect.get(target, property, receiver);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+      const events = makeFaultEventStore();
+      let dispatchCalls = 0;
+      const runtime = createScheduledJobRuntime({
+        database: faultDb,
+        jobs: failingJobs,
+        dispatchOutbox: faultOutbox,
+        events,
+        pollMs: 60_000,
+        dispatch: async () => { dispatchCalls += 1; return { status: "failed" }; },
+        reconcileDispatch: async () => {
+          if (injectLookupFailure) {
+            injectLookupFailure = false;
+            throw new Error("injected adapter dispatch receipt lookup failure");
+          }
+          return {
+            status: "accepted",
+            workSessionId: "ws-dispatch-adapter-fault",
+            runId: "run-dispatch-adapter-fault",
+            dispatchId: claim.dispatchId,
+            attemptNumber: 1,
+          };
+        },
+      });
+      await runtime.drainOnce();
+      const lookupFailure = faultEvents.find((event) => event.payload.operationPhase === "reconcile_dispatch");
+      assert.ok(lookupFailure, "adapter receipt lookup error is persisted even if job attribution lookup also fails");
+      assert.equal(lookupFailure.payload.scheduledJobId, lookupJob.id);
+      assert.equal(lookupFailure.payload.dispatchAttemptId, claim.attemptId);
+      assert.equal(lookupFailure.payload.retryEligible, true);
+      assert.equal(faultJobs.get(lookupJob.id)?.status, "uncertain_dispatch");
+      assert.equal(runtime.getMetrics().serviceability.status, "degraded");
+      await runtime.drainOnce();
+      assert.equal(faultJobs.get(lookupJob.id)?.status, "running", "later authoritative lookup reattaches the same remote attempt");
+      assert.equal(dispatchCalls, 0, "receipt recovery never launches a duplicate worker");
+    }
+
+    faultEventStore.close();
+    faultJobs.close();
+    faultOutbox.close();
+    faultDb.close();
     diagnosticEventStore.close();
   }
 

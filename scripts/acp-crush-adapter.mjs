@@ -34,8 +34,8 @@ import { applyWorkspaceLeaseRenewal, workspaceLeaseDeadline, workspaceLeaseDeadl
 import { adapterDispatchFingerprint, findAdapterDispatchReceipt, isTerminalAdapterDispatchStatus, loadAdapterDispatchReceipts, reconcileAdapterDispatchReceipts, recordAdapterDispatchReceipt } from "./lib/adapter-dispatch-receipts.mjs";
 const readOnlyModuleUrl = process.env.KONTROL_ARTIFACT_PATH
   ? pathToFileURL(resolve(process.env.KONTROL_ARTIFACT_PATH, "read-only-execution.mjs"))
-  : new URL("../dist/read-only-execution.mjs", import.meta.url);
-const readOnlyExecutionModule = await import(readOnlyModuleUrl).catch(() => import(new URL("../src/read-only-execution.mjs", import.meta.url)));
+  : new URL("./lib/read-only-execution.mjs", import.meta.url);
+const readOnlyExecutionModule = await import(readOnlyModuleUrl);
 const {
   buildReadOnlySandboxCommand,
   probeReadOnlyExecutionSandbox,

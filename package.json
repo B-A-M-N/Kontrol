@@ -31,6 +31,7 @@
     "scripts/lib/adapter-http.mjs",
     "scripts/lib/adapter-dispatch-receipts.mjs",
     "scripts/lib/managed-agent-process.mjs",
+    "scripts/lib/read-only-execution.mjs",
     "scripts/lib/workspace-lease.mjs",
     "scripts/lib/tool-environment.mjs",
     "scripts/mcp-stdio-bridge.mjs"
@@ -104,6 +105,7 @@
   "license": "MIT",
   "dependencies": {
     "@clack/prompts": "^1.5.1",
+    "@earendil-works/pi-codemode": "1.0.3",
     "@earendil-works/pi-coding-agent": "^1.0.3",
     "@modelcontextprotocol/ext-apps": "1.7.5",
     "@modelcontextprotocol/sdk": "1.31.0",

@@ -42,17 +42,43 @@ function sha256(path) {
 }
 
 // Fabricate a qualified combined receipt + candidate from the newest local
-// release (the bundle transport never requires the soak host's checkout).
+// release built against the current pinned dependency closure (the bundle
+// transport never requires the soak host's checkout).
 const releasesDir = join(root, "releases");
+const packageManifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+const packageLock = JSON.parse(readFileSync(join(root, "package-lock.json"), "utf8"));
+const expectedDependencies = Object.fromEntries(Object.keys(packageManifest.dependencies ?? {}).sort().map((name) => {
+  const version = packageLock.packages?.[`node_modules/${name}`]?.version;
+  assert.ok(version, `package lock is missing the resolved runtime version for ${name}`);
+  return [name, version];
+}));
 const candidates = existsSync(releasesDir)
-  ? readdirSync(releasesDir, { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort().reverse()
+  ? readdirSync(releasesDir, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => {
+      try {
+        const candidateSource = join(releasesDir, entry.name);
+        const metadata = JSON.parse(readFileSync(join(candidateSource, "build-meta.json"), "utf8"));
+        const dependencies = Object.fromEntries(Object.entries(metadata.dependencies ?? {}).sort(([a], [b]) => a.localeCompare(b)));
+        return {
+          name: entry.name,
+          candidateSource,
+          metadata,
+          compatible: JSON.stringify(dependencies) === JSON.stringify(expectedDependencies),
+        };
+      } catch {
+        return undefined;
+      }
+    })
+    .filter((candidate) => candidate?.compatible)
+    .sort((left, right) => Date.parse(right.metadata.buildTimestamp) - Date.parse(left.metadata.buildTimestamp))
   : [];
 let buildResult;
 for (const candidate of candidates) {
-  const candidateSource = join(releasesDir, candidate);
+  const candidateSource = candidate.candidateSource;
   try {
-    const metadata = JSON.parse(readFileSync(join(candidateSource, "build-meta.json"), "utf8"));
-    if (metadata.buildId !== candidate) continue;
+    const metadata = candidate.metadata;
+    if (metadata.buildId !== candidate.name) continue;
     validateRelease(candidateSource);
     buildResult = {
       buildId: metadata.buildId,

@@ -3,7 +3,7 @@
 // server tests load the app during module initialization, but test setup must
 // not create an incomplete dist/ projection in the user's checkout.
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { copyFileSync, existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -37,6 +37,12 @@ function compileRuntimeArtifact() {
   if (result.status !== 0) {
     throw new Error(`temporary runtime artifact compile failed with status ${result.status ?? "unknown"}`);
   }
+  // Adapter child tests use this exact artifact directory as
+  // KONTROL_ARTIFACT_PATH. Ship the self-contained grant/sandbox module into
+  // it just as build-atomic does for an immutable release.
+  const readOnlyExecution = join(artifactDirectory, "read-only-execution.mjs");
+  copyFileSync(join(root, "scripts", "lib", "read-only-execution.mjs"), readOnlyExecution);
+  if (!existsSync(readOnlyExecution)) throw new Error("temporary runtime artifact is missing read-only-execution.mjs");
 }
 
 function run(script) {
