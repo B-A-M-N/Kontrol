@@ -74,7 +74,8 @@ async function waitFor(description, predicate, timeoutMs = 25_000) {
     }
     await delay(100);
   }
-  throw new Error(`Timed out waiting for ${description}${lastError ? `: ${lastError.message}` : ""}`);
+  const label = typeof description === "function" ? description() : description;
+  throw new Error(`Timed out waiting for ${label}${lastError ? `: ${lastError.message}` : ""}`);
 }
 
 async function createWorkspace(root) {
@@ -414,12 +415,17 @@ async function runAdapterCase(name) {
     // due event. Wait for the durable accepted projection instead of assuming
     // this test runtime claimed it first. A very fast fixture may already have
     // advanced into review by the time acceptance becomes visible.
-    const dispatched = await waitFor(`${name} read-only scheduled dispatch acceptance`, () => {
+    const dispatched = await waitFor(() => {
+      const current = jobs.get(job.id);
+      const attempt = jobs.getAttempt(job.id);
+      const lastError = current?.lastError ? String(current.lastError).slice(0, 240) : "none";
+      return `${name} read-only scheduled dispatch acceptance (job=${current?.status ?? "missing"}, transport=${attempt?.transportStatus ?? "missing"}, error=${lastError})`;
+    }, () => {
       const current = jobs.get(job.id);
       return current && ["running", "awaiting_approval", "completed"].includes(current.status)
         ? current
         : undefined;
-    });
+    }, 60_000);
     assert.ok(dispatched?.workSessionId, `${name} scheduled dispatch owns a work session`);
     assert.equal(agentRegistry.getRunByWorkSessionId(dispatched.workSessionId)?.scheduledExecutionMode, "read_only_audit",
       `${name} run records read-only authority before its eager lifecycle events arrive`);
