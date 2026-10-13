@@ -101,6 +101,31 @@ reconnect, transient, stale-route, diagnostic, supervisor, tunnel, integrity,
 and leak metrics in `beta-soak.json`. It exits nonzero if the soak is
 interrupted, observes a failed iteration, or its final assertions fail.
 
+For a one-command local qualification launch, use:
+
+```bash
+./start-all.sh --qualify
+```
+
+This runs `gate:beta:code` first, then activates that exact immutable
+candidate and starts the 12-hour soak in the separate `kontrol-beta-soak`
+tmux session after the stack is ready. The soak runs in the background, so
+the MCP server remains available while you use it. Check `beta-soak.json`,
+read the log from `KONTROL_BETA_SOAK_LOG` (default: the Kontrol state
+directory's `beta-soak.log`), or attach with
+`tmux attach -t kontrol-beta-soak`. `./stop-all.sh` stops the monitor with the
+rest of the stack and leaves an `interrupted` report.
+
+The launcher requires `KONTROL_DIAGNOSTICS_SECRET` and a reviewer secret in
+the environment file. It uses `KONTROL_PUBLIC_BASE_URL` for the soak target
+when configured, otherwise it monitors the local MCP server. A local target
+is useful operational evidence, but final stable-beta qualification still
+requires the public HTTPS path and fresh external host-catalog evidence. The
+soak target, duration, workspace, report, and log can be set with
+`KONTROL_BETA_SOAK_URL`, `KONTROL_BETA_SOAK_HOURS`,
+`KONTROL_BETA_WORKSPACE_PATH`, `KONTROL_BETA_SOAK_REPORT`, and
+`KONTROL_BETA_SOAK_LOG`. The stable-beta minimum remains 12 hours.
+
 Routine development startup defaults to the fast preflight (syntax/typecheck
 plus a fresh atomic build) so reconnecting does not rerun the entire test
 suite. Set `KONTROL_STARTUP_PROFILE=normal` for the full test gate, or

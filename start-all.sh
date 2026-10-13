@@ -9,19 +9,83 @@ export DESKTOP_PWD
 
 PREPARE_ONLY=0
 ACTIVATE_EXISTING=0
+QUALIFY_MODE=0
 for argument in "$@"; do
   case "$argument" in
     --prepare-only) PREPARE_ONLY=1 ;;
     --activate-existing) ACTIVATE_EXISTING=1 ;;
+    --qualify) QUALIFY_MODE=1 ;;
     *) echo "ERROR: unknown start-all.sh option: $argument" >&2; exit 2 ;;
   esac
 done
+if [[ "$QUALIFY_MODE" == "1" && ( "$PREPARE_ONLY" == "1" || "$ACTIVATE_EXISTING" == "1" ) ]]; then
+  echo "ERROR: --qualify selects and activates its own code-qualified candidate; it cannot be combined with --prepare-only or --activate-existing." >&2
+  exit 2
+fi
 
 # --- Source .env FIRST so all config is available ---
 ENV_FILE="${KONTROL_ENV_FILE:-$DESKTOP_PWD/.env}"
 [[ -f "$ENV_FILE" ]] || { echo "ERROR: environment file missing: $ENV_FILE" >&2; exit 1; }
 set -a; source "$ENV_FILE"; set +a
 printf -v ENV_FILE_QUOTED '%q' "$ENV_FILE"
+
+# Qualification must monitor the exact immutable candidate which passed the
+# stable-beta code gate. Build the receipt before disrupting any serving
+# generation, then activate its artifact instead of creating a second build.
+if [[ "$QUALIFY_MODE" == "1" ]]; then
+  if [[ -z "${KONTROL_DIAGNOSTICS_SECRET:-}" ]]; then
+    echo "ERROR: --qualify requires KONTROL_DIAGNOSTICS_SECRET in the launcher environment file." >&2
+    exit 1
+  fi
+  if [[ -z "${KONTROL_TUNNEL_REVIEWER_SECRET:-${KONTROL_ACP_REVIEWER_SECRET:-}}" ]]; then
+    echo "ERROR: --qualify requires KONTROL_TUNNEL_REVIEWER_SECRET or KONTROL_ACP_REVIEWER_SECRET in the launcher environment file." >&2
+    exit 1
+  fi
+  if ! node -e '
+    const requested = Number(process.argv[1]);
+    const minimum = Number(process.argv[2]);
+    process.exit(Number.isFinite(requested) && requested > 0 && Number.isFinite(minimum) && minimum > 0 ? 0 : 1);
+  ' "${KONTROL_BETA_SOAK_HOURS:-12}" "${KONTROL_BETA_MIN_SOAK_HOURS:-12}"; then
+    echo "ERROR: KONTROL_BETA_SOAK_HOURS and KONTROL_BETA_MIN_SOAK_HOURS must be positive numbers." >&2
+    exit 1
+  fi
+  KONTROL_BETA_CODE_RECEIPT="${KONTROL_BETA_CODE_RECEIPT:-$DESKTOP_PWD/beta-code-qualification.json}"
+  export KONTROL_BETA_CODE_RECEIPT
+  echo "[*] Running the stable-beta code gate before changing the active generation..."
+  if ! npm run gate:beta:code; then
+    echo "ERROR: stable-beta code gate failed; the current generation was not changed." >&2
+    exit 1
+  fi
+  QUALIFY_CANDIDATE="$(node -e '
+    const fs = require("node:fs");
+    try {
+      const receipt = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+      const candidate = receipt.candidate ?? {};
+      const source = receipt.source ?? {};
+      if (receipt.codeQualified !== true
+        || !candidate.buildId
+        || !candidate.artifactPath
+        || source.started?.gitSha !== source.finished?.gitSha
+        || source.finished?.dirtyPaths?.length !== 0) process.exit(1);
+      process.stdout.write(`${candidate.buildId}\n${candidate.artifactPath}`);
+    } catch { process.exit(1); }
+  ' "$KONTROL_BETA_CODE_RECEIPT")" || {
+    echo "ERROR: code gate did not produce a clean, qualified immutable candidate in $KONTROL_BETA_CODE_RECEIPT." >&2
+    exit 1
+  }
+  QUALIFY_BUILD_ID="${QUALIFY_CANDIDATE%%$'\n'*}"
+  QUALIFY_ARTIFACT_PATH="${QUALIFY_CANDIDATE#*$'\n'}"
+  [[ -n "$QUALIFY_BUILD_ID" && -n "$QUALIFY_ARTIFACT_PATH" ]] || {
+    echo "ERROR: code gate candidate identity is incomplete." >&2
+    exit 1
+  }
+  ACTIVATE_EXISTING=1
+  export KONTROL_USE_EXISTING_DIST=true
+  export KONTROL_SKIP_PREFLIGHT_TESTS=true
+  export KONTROL_ACTIVATE_ARTIFACT_PATH="$QUALIFY_ARTIFACT_PATH"
+  export KONTROL_BETA_BUILD_ID="$QUALIFY_BUILD_ID"
+  echo "[*] Qualification candidate ready: build=$QUALIFY_BUILD_ID"
+fi
 if [[ "$ACTIVATE_EXISTING" == "1" ]]; then
   export KONTROL_USE_EXISTING_DIST=true
   export KONTROL_SKIP_PREFLIGHT_TESTS=true
@@ -420,6 +484,68 @@ update_dist_projection() {
   fi
   echo "[!] dist/ is a regular directory; leaving the development projection unchanged (generation.json is authoritative)." >&2
   return 0
+}
+
+start_beta_soak_monitor() {
+  local configured_hours minimum_hours hours soak_url workspace_path read_path report_path log_path
+  configured_hours="${KONTROL_BETA_SOAK_HOURS:-12}"
+  minimum_hours="${KONTROL_BETA_MIN_SOAK_HOURS:-12}"
+  if ! hours="$(node -e '
+    const requested = Number(process.argv[1]);
+    const minimum = Number(process.argv[2]);
+    if (!Number.isFinite(requested) || requested <= 0 || !Number.isFinite(minimum) || minimum <= 0) process.exit(1);
+    process.stdout.write(String(Math.max(12, requested, minimum)));
+  ' "$configured_hours" "$minimum_hours")"; then
+    echo "ERROR: KONTROL_BETA_SOAK_HOURS and KONTROL_BETA_MIN_SOAK_HOURS must be positive numbers." >&2
+    return 1
+  fi
+  if [[ -z "${KONTROL_DIAGNOSTICS_SECRET:-}" ]]; then
+    echo "ERROR: --qualify requires KONTROL_DIAGNOSTICS_SECRET in the launcher environment file." >&2
+    return 1
+  fi
+  if [[ -z "${KONTROL_TUNNEL_REVIEWER_SECRET:-${KONTROL_ACP_REVIEWER_SECRET:-}}" ]]; then
+    echo "ERROR: --qualify requires KONTROL_TUNNEL_REVIEWER_SECRET or KONTROL_ACP_REVIEWER_SECRET in the launcher environment file." >&2
+    return 1
+  fi
+
+  soak_url="${KONTROL_BETA_SOAK_URL:-${KONTROL_PUBLIC_BASE_URL:-http://127.0.0.1:${DEV_PORT}}}"
+  workspace_path="${KONTROL_BETA_WORKSPACE_PATH:-$DESKTOP_PWD}"
+  read_path="${KONTROL_BETA_SOAK_READ_PATH:-AGENTS.md}"
+  report_path="${KONTROL_BETA_SOAK_REPORT:-$DESKTOP_PWD/beta-soak.json}"
+  log_path="${KONTROL_BETA_SOAK_LOG:-$KONTROL_STATE_DIR/beta-soak.log}"
+  mkdir -p "$(dirname "$log_path")"
+  if tmux has-session -t kontrol-beta-soak 2>/dev/null; then
+    echo "ERROR: an existing kontrol-beta-soak tmux session is still running." >&2
+    return 1
+  fi
+
+  local -a soak_args=()
+  soak_args+=(--hours "$hours" --url "$soak_url" --interval-ms "${KONTROL_BETA_SOAK_INTERVAL_MS:-5000}")
+  soak_args+=(--report "$report_path" --workspace-path "$workspace_path" --read-path "$read_path")
+  soak_args+=(--build-id "$EXPECTED_BUILD_ID" --tunnel-url "${KONTROL_BETA_TUNNEL_URL:-http://127.0.0.1:8080}")
+  soak_args+=(--approval-cadence "${KONTROL_BETA_APPROVAL_CADENCE:-60}")
+  local quoted_arg
+  local -a escaped_args=()
+  for quoted_arg in "${soak_args[@]}"; do
+    printf -v quoted_arg '%q' "$quoted_arg"
+    escaped_args+=("$quoted_arg")
+  done
+  local build_id_quoted log_path_quoted
+  printf -v build_id_quoted '%q' "$EXPECTED_BUILD_ID"
+  printf -v log_path_quoted '%q' "$log_path"
+  local command="set -a && source ${ENV_FILE_QUOTED} && set +a && export KONTROL_BETA_BUILD_ID=${build_id_quoted} && exec node scripts/beta-soak.mjs ${escaped_args[*]} >>${log_path_quoted} 2>&1"
+  if ! tmux new-session -d -s kontrol-beta-soak -c "$DESKTOP_PWD" "$command"; then
+    echo "ERROR: could not start the beta soak monitor; the application remains available." >&2
+    return 1
+  fi
+  LAUNCHED_SESSIONS+=("kontrol-beta-soak")
+  echo "[*] Beta soak monitor started: ${hours}h against ${soak_url} (build=${EXPECTED_BUILD_ID})."
+  echo "    Status: $report_path"
+  echo "    Log:    $log_path"
+  echo "    Attach: tmux attach -t kontrol-beta-soak"
+  if [[ "$soak_url" != https://* ]]; then
+    echo "[!] This target is not HTTPS; the soak is a local monitor. Stable-beta release qualification still needs the public HTTPS path and fresh external host-catalog evidence."
+  fi
 }
 
 launch_generation() {
@@ -917,6 +1043,12 @@ else
 fi
 STARTUP_COMMITTED=1
 
+if [[ "$QUALIFY_MODE" == "1" ]]; then
+  if ! start_beta_soak_monitor; then
+    echo "[!] The stack is ready, but the beta soak monitor did not start. Fix the reported configuration and launch ./start-all.sh --qualify again." >&2
+  fi
+fi
+
   echo ""
   if [[ "${ROLLBACK_ACTIVE:-false}" == "true" ]]; then
     echo "=== KONTROL READY — ROLLED BACK ==="
@@ -1338,7 +1470,7 @@ write_deployment_record "stopping" "candidate is prepared; stopping the previous
 
 # --- Graceful stop: signal, wait, escalate (P1 #42: only our own sessions) ---
 echo "[*] Stopping any stale processes (graceful first)..."
-STALE_SESSIONS=("kontrol-adapter" "kontrol-adapter-crush" "kontrol-adapter-hermes" "kontrol-server" "kontrol-tunnel" "kontrol-supervisor")
+STALE_SESSIONS=("kontrol-adapter" "kontrol-adapter-crush" "kontrol-adapter-hermes" "kontrol-server" "kontrol-tunnel" "kontrol-supervisor" "kontrol-beta-soak")
 
 stop_owned_sessions() {
   local session

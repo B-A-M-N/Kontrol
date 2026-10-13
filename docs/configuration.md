@@ -478,6 +478,12 @@ Supervisor and verification concurrency are bounded independently:
 | `KONTROL_CRUSH_MAX_RUN_MS` | `86400000` | CRUSH absolute emergency ceiling regardless of activity |
 | `KONTROL_CRUSH_TERMINATE_GRACE_MS` | `5000` | Grace between SIGTERM and SIGKILL when terminating a stuck/cancelled CRUSH run |
 | `KONTROL_STARTUP_PROFILE` | `dev-fast` | `dev-fast` / `normal` / `release` preflight depth for start-all.sh. Fast development startup is the default; use `normal` or `release` for the complete test gate. |
+| `KONTROL_BETA_SOAK_URL` | `KONTROL_PUBLIC_BASE_URL` or local MCP origin | `./start-all.sh --qualify` soak target. A local origin runs the monitor but cannot provide the public-path evidence required by the final stable-beta gate. |
+| `KONTROL_BETA_SOAK_HOURS` | `12` | Requested wall-clock soak duration for `start-all.sh --qualify`; the launcher enforces at least 12 hours and honors a larger `KONTROL_BETA_MIN_SOAK_HOURS`. |
+| `KONTROL_BETA_WORKSPACE_PATH` | Checkout root | Workspace used by soak read, continuity, approval, and resource exercises. The runner removes its uniquely named continuity marker after each exercise. |
+| `KONTROL_BETA_SOAK_REPORT` | `<checkout>/beta-soak.json` | Atomic progress and final report path. |
+| `KONTROL_BETA_SOAK_LOG` | `<stateDir>/beta-soak.log` | Background soak session log path. |
+| `KONTROL_BETA_APPROVAL_CADENCE` | `60` | Number of soak iterations between approval-resume exercises. |
 | `KONTROL_POLICY_MODE` | `allow` | Default trust posture: `allow` (read-only frictionless), `deny`, or `ask` (gate everything not explicitly allowed) |
 | `KONTROL_POLICY_TOOL_<TOOL>` | secure baseline (`ask` for bash/write/edit/apply_patch; read tools allow) | Per-tool override. With no explicit policy configured, Kontrol applies a secure baseline that gates shell and mutating tools behind approval while keeping read-only inspection frictionless. Any explicit per-tool rule or global mode replaces the baseline. |
 

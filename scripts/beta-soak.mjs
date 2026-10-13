@@ -356,7 +356,7 @@ async function checkTunnel() {
 // provided; otherwise the exercise degrades to the identity assertion (3/4)
 // which needs no durable filesystem state.
 async function exerciseConversationContinuity() {
-  const markerName = `.kontrol-soak-continuity-${report.iterations}.txt`;
+  const markerName = `.kontrol-soak-continuity-${process.pid}-${Date.now()}-${report.iterations}.txt`;
   const markerText = `continuity-${process.pid}-${report.iterations}`;
 
   // 1. Conversation A: durable write.
@@ -546,6 +546,13 @@ async function exerciseConversationContinuity() {
         if (String(error?.message ?? "").includes("conversation isolation broken")) throw error;
         // Foreign-side setup failures (e.g. no capacity) are not continuity
         // failures; the ownership assertion above already ran.
+      }
+    }
+    if (workspacePath) {
+      try {
+        rmSync(join(workspacePath, markerName), { force: true });
+      } catch (error) {
+        throw new Error(`continuity marker cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
   }
