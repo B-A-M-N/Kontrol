@@ -401,8 +401,17 @@ async function runAdapterCase(name) {
     });
 
     await runtime.drainOnce();
-    const dispatched = jobs.get(job.id);
-    assert.equal(dispatched?.status, "running", `${name} read-only scheduled dispatch was accepted: ${dispatched?.lastError ?? ""}`);
+    // The server started its production scheduler during startup. This E2E
+    // runtime also drains the shared outbox, so either scheduler may own the
+    // due event. Wait for the durable accepted projection instead of assuming
+    // this test runtime claimed it first. A very fast fixture may already have
+    // advanced into review by the time acceptance becomes visible.
+    const dispatched = await waitFor(`${name} read-only scheduled dispatch acceptance`, () => {
+      const current = jobs.get(job.id);
+      return current && ["running", "awaiting_approval", "completed"].includes(current.status)
+        ? current
+        : undefined;
+    });
     assert.ok(dispatched?.workSessionId, `${name} scheduled dispatch owns a work session`);
     assert.equal(agentRegistry.getRunByWorkSessionId(dispatched.workSessionId)?.scheduledExecutionMode, "read_only_audit",
       `${name} run records read-only authority before its eager lifecycle events arrive`);
