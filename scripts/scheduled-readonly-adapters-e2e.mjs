@@ -230,15 +230,23 @@ async function startServer({ root, stateDir, configDir, port }) {
   });
 }
 
-async function waitForHttp(url, description, timeoutMs = 25_000) {
-  return waitFor(description, async () => {
+async function waitForHttp(url, description, childRecord, timeoutMs = 60_000) {
+  const deadline = Date.now() + timeoutMs;
+  let lastResponse;
+  while (Date.now() < deadline) {
+    if (childRecord.child.exitCode !== null) {
+      throw new Error(`${description} child exited with code ${childRecord.child.exitCode}:\n${childRecord.getLogs().slice(-4_000)}`);
+    }
     try {
       const response = await fetch(url);
-      return response.ok;
-    } catch {
-      return false;
+      if (response.ok) return true;
+      lastResponse = `HTTP ${response.status}`;
+    } catch (error) {
+      lastResponse = error instanceof Error ? error.message : String(error);
     }
-  }, timeoutMs);
+    await delay(100);
+  }
+  throw new Error(`Timed out waiting for ${description} after ${timeoutMs}ms; last response: ${lastResponse ?? "none"}; child logs:\n${childRecord?.getLogs().slice(-4_000) ?? "unavailable"}`);
 }
 
 async function startAdapter(name, { port, acpUrl, root, wrapper, hermes, stateDir }) {
@@ -307,7 +315,7 @@ async function runAdapterCase(name) {
   let sharedDb;
   try {
     server = await startServer({ root, stateDir, configDir, port: serverPort });
-    await waitForHttp(`${baseUrl}/healthz`, `${name} Kontrol server health`);
+    await waitForHttp(`${baseUrl}/healthz`, `${name} Kontrol server health`, server);
     adapter = await startAdapter(name, {
       port: adapterPort,
       acpUrl: `${baseUrl}/acp`,
@@ -317,7 +325,7 @@ async function runAdapterCase(name) {
       stateDir,
     });
     const adapterUrl = `http://127.0.0.1:${adapterPort}`;
-    await waitForHttp(`${adapterUrl}/health`, `${name} adapter health`);
+    await waitForHttp(`${adapterUrl}/health`, `${name} adapter health`, adapter);
 
     const { openDatabase } = await import("../src/db/client.js");
     const { createDispatchOutbox } = await import("../src/dispatch-outbox.js");
