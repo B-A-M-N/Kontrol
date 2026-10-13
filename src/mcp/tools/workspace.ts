@@ -1782,13 +1782,13 @@ export function registerWorkspaceTools(
     const result = await git(root, args, { maxBuffer: 262_144, timeoutMs: 15_000 });
     return result.stdout || "(no diff)";
   });
-  registerGitInspection(toolNames.gitShow, "Git show", "Read-only bounded Git object or file view for an open workspace.", { revision: z.string().regex(/^[A-Za-z0-9._/~^@{}-]+$/).default("HEAD") }, async (root, path, input) => {
+  registerGitInspection(toolNames.gitShow, "Git show", "Read-only bounded Git view for an open workspace. With path, returns the file or tree object at the selected revision; without path, returns revision metadata and stats.", { revision: z.string().regex(/^[A-Za-z0-9._/~^@{}-]+$/).default("HEAD") }, async (root, path, input) => {
     const revision = String(input.revision ?? "HEAD");
-    const args = ["show", "--no-ext-diff", "--no-textconv", "--format=fuller", revision];
-    if (path) args.push("--", path);
-    else args.push("--no-patch", "--stat");
+    const args = ["show", "--no-ext-diff", "--no-textconv"];
+    if (path) args.push(`${revision}:${path}`);
+    else args.push("--format=fuller", "--no-patch", "--stat", revision);
     const result = await git(root, args, { maxBuffer: 262_144, timeoutMs: 15_000 });
-    return result.stdout || "(empty object)";
+    return result.stdout || (path ? "" : "(empty object)");
   });
 
   if (config.toolMode !== "codex") {

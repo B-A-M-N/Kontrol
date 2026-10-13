@@ -255,7 +255,9 @@ Current implementation contracts:
   pointers rotate only after readiness is proven.
 - The MCP tool surface has a mandatory structured inspection contract:
   `read`, `grep`, `glob`, `ls`, `git_status`, `git_log`, `git_diff`, and
-  `git_show` are registered and verified in every tool mode. The server
+  `git_show` are registered and verified in every tool mode. `git_show` with a
+  validated `path` returns the file or tree object at `<revision>:<path>`;
+  without a path it returns revision metadata and stats. The server
   version includes the immutable artifact content identity; `open_workspace`,
   authenticated diagnostics, and `generation.json` expose the surface
   identity. A stale host catalog receives bounded list-changed notifications

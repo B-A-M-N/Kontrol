@@ -453,6 +453,8 @@ const gitHarnessRoot = mkdtempSync(join(tmpdir(), "kontrol-git-tools-"));
 const gitRoot = join(gitHarnessRoot, "repo");
 mkdirSync(gitRoot, { recursive: true });
 writeFileSync(join(gitRoot, "README.md"), "git inspection fixture\n");
+writeFileSync(join(gitRoot, "stable.txt"), "unchanged tracked file contents\n");
+writeFileSync(join(gitRoot, "empty.txt"), "");
 const gitFixtureIdentity = {
   name: execFileSync("git", ["config", "user.name"], { cwd: process.cwd(), encoding: "utf8" }).trim(),
   email: execFileSync("git", ["config", "user.email"], { cwd: process.cwd(), encoding: "utf8" }).trim(),
@@ -460,8 +462,11 @@ const gitFixtureIdentity = {
 execFileSync("git", ["init", "-q"], { cwd: gitRoot });
 execFileSync("git", ["config", "user.name", gitFixtureIdentity.name], { cwd: gitRoot });
 execFileSync("git", ["config", "user.email", gitFixtureIdentity.email], { cwd: gitRoot });
-execFileSync("git", ["add", "README.md"], { cwd: gitRoot });
+execFileSync("git", ["add", "README.md", "stable.txt", "empty.txt"], { cwd: gitRoot });
 execFileSync("git", ["commit", "-q", "-m", "init"], { cwd: gitRoot });
+writeFileSync(join(gitRoot, "README.md"), "updated tracked file contents\n");
+execFileSync("git", ["add", "README.md"], { cwd: gitRoot });
+execFileSync("git", ["commit", "-q", "-m", "update README"], { cwd: gitRoot });
 {
   await createMcpServerForGitFixture();
 }
@@ -497,6 +502,25 @@ async function createMcpServerForGitFixture(): Promise<void> {
       const result = await client.callTool({ name, arguments: { workspaceId, ...args } });
       assert.notEqual(result.isError, true, `${name} should not fail: ${JSON.stringify(result)}`);
       assert.notEqual((result.structuredContent as { status?: string }).status, "approval_required", `${name} must not prompt`);
+    }
+
+    const showCases = [
+      { path: "stable.txt", revision: "HEAD", expected: "unchanged tracked file contents\n", label: "unchanged tracked file" },
+      { path: "empty.txt", revision: "HEAD", expected: "", label: "empty tracked file" },
+      { path: "README.md", revision: "HEAD", expected: "updated tracked file contents\n", label: "file changed in the selected revision" },
+      { path: "README.md", revision: "HEAD~1", expected: "git inspection fixture\n", label: "historical file revision" },
+    ];
+    for (const testCase of showCases) {
+      const result = await client.callTool({
+        name: "git_show",
+        arguments: { workspaceId, path: testCase.path, revision: testCase.revision },
+      });
+      assert.notEqual(result.isError, true, `git_show returns ${testCase.label}: ${JSON.stringify(result)}`);
+      assert.equal(
+        (result.structuredContent as { result?: string }).result,
+        testCase.expected,
+        `git_show returns blob contents for ${testCase.label}`,
+      );
     }
   } finally {
     await client.close();
