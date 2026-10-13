@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { execFileSync, spawnSync } from "node:child_process";
+import { createServer } from "node:http";
+import { chmod, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { findBubblewrap } from "../read-only-execution.mjs";
 import { verifyScheduledJob } from "./scheduled-verification.js";
 
 const root = await mkdtemp(join(tmpdir(), "kontrol-scheduled-verification-"));
@@ -123,6 +127,111 @@ try {
     workspaces: {} as any,
     reviewCheckpoints: {} as any,
   }), /only while the submitted result awaits review/);
+
+  const realBubblewrap = process.platform === "linux" ? findBubblewrap() : undefined;
+  if (realBubblewrap) {
+    const realRoot = await mkdtemp(join(process.cwd(), ".tmp-kontrol-scheduled-verification-"));
+    const realWorkspaceRoot = join(realRoot, "workspace");
+    const outsideFile = join(realRoot, "outside.txt");
+    const httpServer = createServer((_req, res) => res.end("host network reached"));
+    try {
+      await import("node:fs/promises").then(({ mkdir }) => mkdir(realWorkspaceRoot, { recursive: true }));
+      await writeFile(join(realWorkspaceRoot, "source.txt"), "main checkout source stays unchanged\n");
+      await writeFile(outsideFile, "outside target stays unchanged\n");
+      await symlink(outsideFile, join(realWorkspaceRoot, "outside-link"));
+      execFileSync("git", ["init", "-q", realWorkspaceRoot]);
+      execFileSync("git", ["-C", realWorkspaceRoot, "config", "user.name", "fixture"]);
+      const sourcePath = join(realWorkspaceRoot, "source.txt");
+      const gitConfigPath = join(realWorkspaceRoot, ".git", "config");
+      const sourceHash = createHash("sha256").update(await readFile(sourcePath)).digest("hex");
+      const gitConfigHash = createHash("sha256").update(await readFile(gitConfigPath)).digest("hex");
+      const outsideHash = createHash("sha256").update(await readFile(outsideFile)).digest("hex");
+      await new Promise<void>((resolve, reject) => {
+        httpServer.once("error", reject);
+        httpServer.listen(0, "127.0.0.1", resolve);
+      });
+      const networkPort = (httpServer.address() as { port: number }).port;
+      const probeScript = [
+        "(async () => {",
+        "const fs = require('node:fs');",
+        "const net = require('node:net');",
+        "const { spawnSync } = require('node:child_process');",
+        `const sourcePath = '/workspace/source.txt';`,
+        `const gitConfigPath = '/workspace/.git/config';`,
+        `const workspaceRoot = '/workspace';`,
+        "const canWrite = (path, content) => { try { fs.writeFileSync(path, content); return true; } catch { return false; } };",
+        "const sourceSnapshotWritable = canWrite(sourcePath, 'changed inside disposable snapshot');",
+        "const gitProbe = spawnSync('git', ['-C', workspaceRoot, 'config', 'user.name', 'attacker'], { encoding: 'utf8' });",
+        "const gitRan = !gitProbe.error && gitProbe.status !== null;",
+        "const gitSnapshotWritable = gitRan && gitProbe.status === 0;",
+        "const gitFileSnapshotWritable = canWrite(gitConfigPath, '[user]\\n\\tname = snapshot-write\\n');",
+        "let symlinkWriteBlocked = false;",
+        "let symlinkCreated = false;",
+        `try { fs.symlinkSync(${JSON.stringify(outsideFile)}, '/workspace/host-outside-link'); symlinkCreated = true; symlinkWriteBlocked = !canWrite('/workspace/host-outside-link', 'escaped'); } catch { symlinkWriteBlocked = false; }`,
+        "const helperProbe = spawnSync(process.execPath, ['-e', `require('node:fs').writeFileSync('/workspace/source.txt', 'helper')`], { encoding: 'utf8' });",
+        "const helperRan = !helperProbe.error && helperProbe.status !== null;",
+        "const helperSnapshotWritable = helperRan && helperProbe.status === 0;",
+        "fs.writeFileSync('/tmp/kontrol-scheduled-verification-scratch', 'scratch');",
+        "const scratchWritable = fs.readFileSync('/tmp/kontrol-scheduled-verification-scratch', 'utf8') === 'scratch';",
+        `const networkBlocked = await new Promise(resolve => { const socket = net.createConnection({ host: '127.0.0.1', port: ${networkPort} }); const timer = setTimeout(() => { socket.destroy(); resolve(true); }, 1_000); socket.once('connect', () => { clearTimeout(timer); socket.destroy(); resolve(false); }); socket.once('error', () => { clearTimeout(timer); resolve(true); }); });`,
+        "const result = { sourceSnapshotWritable, gitRan, gitSnapshotWritable, gitFileSnapshotWritable, symlinkCreated, symlinkWriteBlocked, helperRan, helperSnapshotWritable, scratchWritable, networkBlocked };",
+        "console.log(JSON.stringify(result));",
+        "if (!sourceSnapshotWritable || !gitRan || !gitSnapshotWritable || !gitFileSnapshotWritable || !symlinkCreated || !symlinkWriteBlocked || !helperRan || !helperSnapshotWritable || !scratchWritable || !networkBlocked) process.exitCode = 1;",
+        "})().catch(error => { console.error(error); process.exitCode = 1; });",
+        "",
+      ].join("\n");
+      await writeFile(join(realWorkspaceRoot, "package.json"), JSON.stringify({ name: "real-confined-verification", private: true, scripts: { test: "node probe.js" } }));
+      await writeFile(join(realWorkspaceRoot, "probe.js"), probeScript);
+
+      const realResult = await verifyScheduledJob({
+        job: { ...job, id: "scheduled-real-verification", workspaceRoot: realWorkspaceRoot, projectId: "workspace-real", policySnapshotJson: { verificationCommands: ["npm test"] } },
+        jobs: { persistReport: () => ({ reportSha256: "b".repeat(64), reportText: "real confinement receipt" }) } as any,
+        workSessions: {
+          get: () => ({
+            id: "work-session-real",
+            workspaceSessionId: "workspace-real",
+            status: "awaiting_review",
+            latestSubmission: { id: "submission-real", snapshotKind: "filesystem", snapshotRef: "fs:real-snapshot", createdAt: "2026-10-12T12:00:00.000Z" },
+          }),
+        } as any,
+        workspaces: { getWorkspace: () => ({ id: "workspace-real", root: realWorkspaceRoot }) } as any,
+        reviewCheckpoints: {
+          assertSnapshotMatches: async () => true,
+          materializeSnapshot: async ({ destination }: { destination: string }) => {
+            const { cp, mkdir } = await import("node:fs/promises");
+            await mkdir(destination, { recursive: true });
+            await cp(realWorkspaceRoot, destination, { recursive: true });
+          },
+        } as any,
+        serverConfig: {
+          verifySandboxExecutable: realBubblewrap,
+          verifyToolchainPaths: [dirname(dirname(process.execPath))],
+          childEnvironmentAllowlist: [],
+        } as any,
+      });
+      assert.equal(realResult.report.results[0]?.status, "passed",
+        `real bubblewrap permits the declared test while confining its effects: ${realResult.report.results[0]?.outputTail}`);
+      assert.equal(realResult.report.executionPolicy.capability, "read_only_verification");
+      assert.equal(realResult.report.executionPolicy.network, "disabled");
+      assert.match(realResult.report.results[0]?.outputTail ?? "", /\"networkBlocked\":true/);
+      assert.match(realResult.report.results[0]?.outputTail ?? "", /\"scratchWritable\":true/);
+      assert.match(realResult.report.results[0]?.outputTail ?? "", /\"gitRan\":true/);
+      assert.match(realResult.report.results[0]?.outputTail ?? "", /\"gitSnapshotWritable\":true/);
+      assert.match(realResult.report.results[0]?.outputTail ?? "", /\"gitFileSnapshotWritable\":true/);
+      assert.match(realResult.report.results[0]?.outputTail ?? "", /\"symlinkCreated\":true/);
+      assert.match(realResult.report.results[0]?.outputTail ?? "", /\"helperRan\":true/);
+      assert.match(realResult.report.results[0]?.outputTail ?? "", /\"helperSnapshotWritable\":true/);
+      assert.equal(createHash("sha256").update(await readFile(sourcePath)).digest("hex"), sourceHash,
+        "the real confined verifier cannot mutate the original checkout source");
+      assert.equal(createHash("sha256").update(await readFile(gitConfigPath)).digest("hex"), gitConfigHash,
+        "the real confined verifier cannot mutate original Git configuration");
+      assert.equal(createHash("sha256").update(await readFile(outsideFile)).digest("hex"), outsideHash,
+        "the real confined verifier cannot mutate a symlink target outside its snapshot");
+    } finally {
+      if (httpServer.listening) await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+      await rm(realRoot, { recursive: true, force: true });
+    }
+  }
   console.log("scheduling/scheduled-verification.test.ts: all assertions passed");
 } finally {
   await rm(root, { recursive: true, force: true });

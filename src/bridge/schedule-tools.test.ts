@@ -59,6 +59,59 @@ const server = {
 } as any;
 
 try {
+  const reportRestartRoot = join(root, "report-restart");
+  let reportRestartDb: ReturnType<typeof openDatabase> | undefined = openDatabase(reportRestartRoot);
+  let reportRestartOutbox: ReturnType<typeof createDispatchOutbox> | undefined = createDispatchOutbox(reportRestartDb);
+  let reportRestartJobs: ReturnType<typeof createScheduledJobStore> | undefined = createScheduledJobStore(reportRestartDb, reportRestartOutbox);
+  try {
+    const reportJob = reportRestartJobs.create({
+      principalId: "principal-restart",
+      ownerContextId: "principal:principal-restart|transport:A",
+      projectId: "project-restart",
+      workspaceRoot: "/tmp/project-restart",
+      runAt: new Date().toISOString(),
+      instructionJson: { instructions: "Keep the exact report across restart." },
+      executionMode: "read_only_audit",
+      policySnapshotJson: { workspaceAccess: "read_only", mutate: false },
+      maxRuntimeMs: 60_000,
+    });
+    const originalText = `A😀B\n${"R".repeat(40)}`;
+    const originalHash = createHash("sha256").update(originalText, "utf8").digest("hex");
+    reportRestartJobs.persistReport(reportJob.id, "verification:before-restart", originalText);
+
+    reportRestartJobs.close();
+    reportRestartJobs = undefined;
+    reportRestartOutbox.close();
+    reportRestartOutbox = undefined;
+    reportRestartDb.close();
+    reportRestartDb = undefined;
+
+    reportRestartDb = openDatabase(reportRestartRoot);
+    reportRestartOutbox = createDispatchOutbox(reportRestartDb);
+    reportRestartJobs = createScheduledJobStore(reportRestartDb, reportRestartOutbox);
+    const laterText = "newer report after restart";
+    reportRestartJobs.persistReport(reportJob.id, "verification:after-restart", laterText);
+    const pinned = reportRestartJobs.getReport(reportJob.id, originalHash);
+    assert.equal(pinned?.reportText, originalText, "reopening the database preserves the original immutable report artifact");
+
+    const pages: string[] = [];
+    let offset = 1;
+    while (true) {
+      const page = sliceScheduledReportPage(pinned!.reportText, offset, 5);
+      pages.push(page.page);
+      if (page.nextOffset === undefined) break;
+      offset = page.nextOffset;
+    }
+    const reconstructed = pages.join("");
+    assert.equal(reconstructed, originalText, "restart-safe pages reconstruct the exact pinned report despite a newer run");
+    assert.equal(createHash("sha256").update(reconstructed, "utf8").digest("hex"), originalHash,
+      "the full report digest remains stable across pagination and database restart");
+  } finally {
+    reportRestartJobs?.close();
+    reportRestartOutbox?.close();
+    reportRestartDb?.close();
+  }
+
   const created = jobs.create({
     principalId: "principal-a",
     ownerContextId: "principal:principal-a|transport:A",
