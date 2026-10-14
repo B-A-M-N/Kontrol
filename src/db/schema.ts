@@ -38,6 +38,10 @@ export const scheduledJobs = sqliteTable("scheduled_jobs", {
   /** Active dispatch-attempt fence; cleared when the attempt completes/releases. */
   activeDispatchAttemptId: text("active_dispatch_attempt_id"),
   maxRuntimeMs: integer("max_runtime_ms").notNull(),
+  dispatchRetryCount: integer("dispatch_retry_count").notNull().default(0),
+  dispatchNextEligibleAt: text("dispatch_next_eligible_at"),
+  dispatchLastAttemptedAgent: text("dispatch_last_attempted_agent"),
+  dispatchBlockerKind: text("dispatch_blocker_kind"),
   /** Durable retry receipt key; null for tools that omit retry protection. */
   clientMutationId: text("client_mutation_id"),
   requestFingerprint: text("request_fingerprint").notNull().default("{}"),
@@ -69,6 +73,9 @@ export const scheduledJobAttempts = sqliteTable("scheduled_job_attempts", {
   activeRuntimeMs: integer("active_runtime_ms").notNull().default(0),
   executionStoppedAt: text("execution_stopped_at"),
   executionReceiptJson: text("execution_receipt_json"),
+  /** Authenticated result for the latest bound ACP execution attempt. */
+  workerExecutionOutcome: text("worker_execution_outcome"),
+  workerExecutionAt: text("worker_execution_at"),
   completedAt: text("completed_at"),
   /** External adapter handshake state, distinct from the final worker outcome. */
   transportStatus: text("transport_status").notNull().default("dispatching"),
@@ -101,6 +108,58 @@ export const scheduledJobReports = sqliteTable("scheduled_job_reports", {
 ]);
 
 export type ScheduledJobReportRow = typeof scheduledJobReports.$inferSelect;
+
+/** Durable single-flight record and immutable report for reviewer-run scheduled verification. */
+export const scheduledJobVerifications = sqliteTable("scheduled_job_verifications", {
+  id: text("id").primaryKey(),
+  jobId: text("job_id").notNull().references(() => scheduledJobs.id, { onDelete: "cascade" }),
+  requestKey: text("request_key").notNull(),
+  requestFingerprint: text("request_fingerprint").notNull(),
+  clientMutationId: text("client_mutation_id"),
+  executionIdentity: text("execution_identity").notNull().unique(),
+  workSessionId: text("work_session_id").notNull(),
+  submissionId: text("submission_id").notNull(),
+  reviewEpoch: integer("review_epoch").notNull(),
+  snapshotKind: text("snapshot_kind").notNull(),
+  snapshotRef: text("snapshot_ref").notNull(),
+  commandFingerprint: text("command_fingerprint").notNull(),
+  policyFingerprint: text("policy_fingerprint").notNull(),
+  status: text("status").notNull().default("running"),
+  deadlineAt: text("deadline_at").notNull(),
+  reportSha256: text("report_sha256"),
+  reportText: text("report_text"),
+  failureReason: text("failure_reason"),
+  createdAt: text("created_at").notNull(),
+  startedAt: text("started_at").notNull(),
+  finishedAt: text("finished_at"),
+}, (table) => [
+  uniqueIndex("scheduled_job_verifications_request_unique").on(table.jobId, table.requestKey),
+  index("scheduled_job_verifications_current_idx").on(table.jobId, table.submissionId, table.reviewEpoch, table.createdAt),
+  index("scheduled_job_verifications_status_deadline_idx").on(table.status, table.deadlineAt, table.id),
+  index("scheduled_job_verifications_hash_idx").on(table.jobId, table.reportSha256),
+]);
+
+export type ScheduledJobVerificationRow = typeof scheduledJobVerifications.$inferSelect;
+
+/** Retryable finalization obligations for worker output after an authenticated terminal lifecycle event. */
+export const scheduledJobReportFinalizations = sqliteTable("scheduled_job_report_finalizations", {
+  id: text("id").primaryKey(),
+  jobId: text("job_id").notNull().references(() => scheduledJobs.id, { onDelete: "cascade" }),
+  runId: text("run_id").notNull(),
+  attemptNumber: integer("attempt_number").notNull(),
+  eventId: text("event_id").notNull(),
+  status: text("status").notNull().default("pending"),
+  reportText: text("report_text"),
+  reportSha256: text("report_sha256"),
+  lastError: text("last_error"),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+}, (table) => [
+  uniqueIndex("scheduled_job_report_finalizations_attempt_unique").on(table.jobId, table.runId, table.attemptNumber),
+  index("scheduled_job_report_finalizations_pending_idx").on(table.status, table.updatedAt, table.id),
+]);
+
+export type ScheduledJobReportFinalizationRow = typeof scheduledJobReportFinalizations.$inferSelect;
 
 export const telemetryIngress = sqliteTable("telemetry_ingress", {
   sequence: integer("sequence").primaryKey({ autoIncrement: true }),

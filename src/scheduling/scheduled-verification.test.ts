@@ -6,13 +6,63 @@ import { chmod, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { findBubblewrap } from "../read-only-execution.mjs";
+import type { ScheduledVerificationClaimInput, ScheduledVerificationExecution } from "./scheduled-job-store.js";
 import { verifyScheduledJob } from "./scheduled-verification.js";
+import { scheduledVerificationFingerprints } from "./scheduled-verification-projection.js";
 
 const root = await mkdtemp(join(tmpdir(), "kontrol-scheduled-verification-"));
 const workspaceRoot = join(root, "workspace");
 const fakeBubblewrap = join(root, "bwrap");
 const capturedCwd = join(root, "sandbox-cwd.txt");
+const commandLaunches = join(root, "command-launches.txt");
+
+function createVerificationJobs() {
+  const executions = new Map<string, ScheduledVerificationExecution>();
+  return {
+    executions,
+    claimVerificationExecution(input: ScheduledVerificationClaimInput) {
+      const prior = executions.get(input.requestKey);
+      if (prior) {
+        if (prior.requestFingerprint !== input.requestFingerprint) throw new Error("Verification idempotency key was already used with different content.");
+        return { execution: prior, owner: false };
+      }
+      const now = new Date().toISOString();
+      const execution: ScheduledVerificationExecution = {
+        ...input,
+        id: `record:${input.executionIdentity}`,
+        status: "running",
+        createdAt: now,
+        startedAt: now,
+      };
+      executions.set(input.requestKey, execution);
+      return { execution, owner: true };
+    },
+    completeVerificationExecution({ executionId, reportText }: { executionId: string; reportText: string }) {
+      const execution = [...executions.values()].find((entry) => entry.id === executionId)!;
+      execution.status = "completed";
+      execution.reportText = reportText;
+      execution.reportSha256 = createHash("sha256").update(reportText, "utf8").digest("hex");
+      execution.finishedAt = new Date().toISOString();
+      return execution;
+    },
+    failVerificationExecution({ executionId, reason }: { executionId: string; reason: string }) {
+      const execution = [...executions.values()].find((entry) => entry.id === executionId)!;
+      execution.status = "failed";
+      execution.failureReason = reason;
+      execution.finishedAt = new Date().toISOString();
+      return execution;
+    },
+  };
+}
+
 try {
+  const invalidPolicyFingerprint = scheduledVerificationFingerprints({
+    policySnapshotJson: { verificationCommands: ["npm test; touch source.txt"] },
+  });
+  assert.deepEqual(invalidPolicyFingerprint.commands, [],
+    "receipt fingerprinting tolerates invalid historical commands so read-only result retrieval remains available");
+  assert.equal(invalidPolicyFingerprint.commandPolicyValid, false);
+
   await import("node:fs/promises").then(({ mkdir }) => mkdir(workspaceRoot));
   await writeFile(join(workspaceRoot, "package.json"), JSON.stringify({
     name: "scheduled-verification-fixture",
@@ -33,6 +83,7 @@ try {
     "done",
     "[ \"$unshare\" = 1 ] && [ \"$bind\" = 1 ] || exit 91",
     `printf '%s' "$PWD" > ${JSON.stringify(capturedCwd)}`,
+    `printf 'launch\\n' >> ${JSON.stringify(commandLaunches)}`,
     "shift",
     "exec \"$@\"",
     "",
@@ -48,26 +99,22 @@ try {
     maxRuntimeMs: 60_000,
     policySnapshotJson: { verificationCommands: ["npm test"] },
   };
-  let persistedReport: any;
-  const result = await verifyScheduledJob({
+  const verificationJobs = createVerificationJobs();
+  let activeSubmission = {
+    id: "submission-1",
+    snapshotKind: "filesystem" as const,
+    snapshotRef: "fs:submitted-snapshot",
+    createdAt: "2026-10-12T12:00:00.000Z",
+  };
+  const verificationInput: Parameters<typeof verifyScheduledJob>[0] = {
     job,
-    jobs: {
-      persistReport(_jobId: string, runId: string, reportText: string) {
-        persistedReport = { runId, reportText };
-        return { reportSha256: "a".repeat(64), reportText };
-      },
-    } as any,
+    jobs: verificationJobs as any,
     workSessions: {
       get: () => ({
         id: "work-session-1",
         workspaceSessionId: "workspace-1",
         status: "awaiting_review",
-        latestSubmission: {
-          id: "submission-1",
-          snapshotKind: "filesystem",
-          snapshotRef: "fs:submitted-snapshot",
-          createdAt: "2026-10-12T12:00:00.000Z",
-        },
+        latestSubmission: activeSubmission,
       }),
     } as any,
     workspaces: { getWorkspace: () => ({ id: "workspace-1", root: workspaceRoot }) } as any,
@@ -84,28 +131,57 @@ try {
       verifyToolchainPaths: [],
       childEnvironmentAllowlist: [],
     } as any,
-  });
+    clientMutationId: "reviewer-request-1",
+  };
+  const [result, duplicateResult] = await Promise.all([
+    verifyScheduledJob(verificationInput),
+    verifyScheduledJob(verificationInput),
+  ]);
+  assert.equal(duplicateResult.executionIdentity, result.executionIdentity,
+    "concurrent identical verification calls share one durable execution identity");
+  assert.ok(["running", "completed"].includes(result.status));
+  assert.ok(["running", "completed"].includes(duplicateResult.status));
+  assert.equal((await readFile(commandLaunches, "utf8")).trim().split("\n").length, 1,
+    "concurrent duplicate requests execute the verification suite once");
+  const completedResult = await verifyScheduledJob(verificationInput);
+  assert.equal(completedResult.status, "completed", "a retry after execution completion retrieves the durable report");
+  const freshVerification = await verifyScheduledJob({ ...verificationInput, clientMutationId: "reviewer-request-2" });
+  assert.notEqual(freshVerification.executionIdentity, completedResult.executionIdentity,
+    "a deliberate fresh verification gets a new immutable execution identity");
+  assert.equal((await readFile(commandLaunches, "utf8")).trim().split("\n").length, 2);
+  activeSubmission = { ...activeSubmission, id: "submission-2", snapshotRef: "fs:submitted-snapshot-2" };
+  await assert.rejects(
+    verifyScheduledJob({ ...verificationInput, clientMutationId: "reviewer-request-1" }),
+    /already used with different content/,
+    "reusing one idempotency key after the submitted snapshot changes fails closed",
+  );
+  const changedSubmissionVerification = await verifyScheduledJob({ ...verificationInput, clientMutationId: "reviewer-request-3" });
+  assert.equal(changedSubmissionVerification.report?.submissionId, "submission-2");
+  assert.equal((await readFile(commandLaunches, "utf8")).trim().split("\n").length, 3);
 
-  assert.equal(result.report.results[0]?.status, "passed", "allowlisted command runs through the confined verifier launcher");
-  assert.equal(result.report.executionPolicy.capability, "read_only_verification");
-  assert.equal(result.report.executionPolicy.network, "disabled");
-  assert.deepEqual(result.report.executionPolicy.commands, [{
+  assert.equal(completedResult.status, "completed");
+  assert.ok(completedResult.report);
+  assert.equal(completedResult.report.results[0]?.status, "passed", "allowlisted command runs through the confined verifier launcher");
+  assert.equal(completedResult.report.executionPolicy.capability, "read_only_verification");
+  assert.equal(completedResult.report.executionPolicy.network, "disabled");
+  assert.deepEqual(completedResult.report.executionPolicy.commands, [{
     command: "npm test",
     executable: "npm",
     args: ["test"],
     argumentPolicy: "exact_predeclared_argv_no_shell_path_traversal_denied",
     maxRuntimeMs: 5 * 60_000,
   }], "report records the exact command and argument policy that was approved");
-  assert.deepEqual(result.report.executionPolicy.writablePaths, [
+  assert.deepEqual(completedResult.report.executionPolicy.writablePaths, [
     "/workspace (disposable submitted snapshot)",
     "/tmp (private temporary filesystem)",
   ]);
-  assert.deepEqual(result.report.executionPolicy.environment, {
+  assert.deepEqual(completedResult.report.executionPolicy.environment, {
     policy: "explicit_child_environment_allowlist",
     allowedNames: [],
   }, "report records environment variable names without storing values");
-  assert.equal(result.report.snapshotRef, "fs:submitted-snapshot");
-  assert.match(persistedReport.runId, /^verification:submission-1:/, "verification report is durably tied to the submission");
+  assert.equal(completedResult.report.snapshotRef, "fs:submitted-snapshot");
+  assert.match(completedResult.executionIdentity, /^verification:/, "verification report is durably tied to a unique execution identity");
+  assert.equal(completedResult.report.submissionId, "submission-1");
   const executionCwd = await readFile(capturedCwd, "utf8");
   assert.notEqual(executionCwd, workspaceRoot, "tests run in a disposable submitted-snapshot copy");
   await assert.rejects(readFile(join(workspaceRoot, "verification-output.txt")), /ENOENT/,
@@ -185,7 +261,7 @@ try {
 
       const realResult = await verifyScheduledJob({
         job: { ...job, id: "scheduled-real-verification", workspaceRoot: realWorkspaceRoot, projectId: "workspace-real", policySnapshotJson: { verificationCommands: ["npm test"] } },
-        jobs: { persistReport: () => ({ reportSha256: "b".repeat(64), reportText: "real confinement receipt" }) } as any,
+        jobs: createVerificationJobs() as any,
         workSessions: {
           get: () => ({
             id: "work-session-real",
@@ -209,6 +285,8 @@ try {
           childEnvironmentAllowlist: [],
         } as any,
       });
+      assert.equal(realResult.status, "completed");
+      assert.ok(realResult.report);
       assert.equal(realResult.report.results[0]?.status, "passed",
         `real bubblewrap permits the declared test while confining its effects: ${realResult.report.results[0]?.outputTail}`);
       assert.equal(realResult.report.executionPolicy.capability, "read_only_verification");

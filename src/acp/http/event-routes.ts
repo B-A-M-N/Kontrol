@@ -511,6 +511,9 @@ function eventMatchesDispatch(event: { type: string; payload: Record<string, unk
             ...(authoritativeAttempt?.dispatchIdempotencyKey ? { dispatchId: authoritativeAttempt.dispatchIdempotencyKey } : {}),
             resumable: true,
             reason: errorMessage,
+            ...(stringPayload(body.payload?.final_output) !== undefined
+              ? { final_output: stringPayload(body.payload?.final_output) }
+              : {}),
           },
         });
       } else if (session && !TERMINAL_SESSION_STATUSES.has(session.status)) {

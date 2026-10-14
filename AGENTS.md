@@ -318,6 +318,35 @@ Current implementation contracts:
   Scheduler history and recovery use SQL limits and cursors, bounded dispatch
   concurrency, and diagnostics for due age, uncertain launches, unreconciled
   attempt age, and dispatch throughput.
+- Scheduled worker completion is derived only from authenticated lifecycle
+  evidence bound to the authoritative dispatch attempt. Dispatch acceptance,
+  worker start/stop outcome, and reviewer approval remain separate; a rejected
+  pre-spawn attempt or a failed worker cannot produce `workerCompleted: true`.
+- Scheduled result getters never persist artifacts or otherwise mutate durable
+  state. Lifecycle projection records a durable report-finalization obligation
+  before persisting the immutable report; bounded reconciliation retries any
+  incomplete finalization after failure or restart.
+- Scheduled verification execution has a durable reviewer-request idempotency
+  claim bound to job, work session, submission, review epoch, canonical snapshot,
+  policy, commands, and deadline. Identical retries reuse the running or
+  completed execution, conflicting reuse fails closed, expired executions
+  become durable failures, and a new reviewer request creates a separate
+  immutable report. The job receipt projects only evidence for the exact active
+  submission and snapshot; a newer failed report cannot be hidden by an older
+  passing report, and a scheduled pass alone does not claim independent outcome
+  verification.
+- Temporary scheduled-dispatch blockers use persisted exponential backoff with
+  bounded jitter and retain retry count, next eligible time, blocker, and last
+  attempted agent across restart. Permanent configuration blockers become
+  `blocked` and require a reviewer retry after correction; they are not retried
+  automatically.
+- Beta qualification records scheduled control-plane lifecycle evidence
+  separately from bundled-adapter security evidence. The
+  `scheduled-job-unattended-e2e.mjs` fixture does not qualify adapter
+  confinement; `scheduled-readonly-adapters-e2e.mjs`,
+  `acp-readonly-adapters.integration.test.mjs`, and
+  `adapter-launch-recovery.test.mjs` provide the named bundled-adapter,
+  signed-grant/receipt, and crash-recovery evidence.
 - Scheduled worker runtime deadlines stop when execution stops and do not count
   human review waiting. Lifecycle events bind to the active dispatch attempt,
   logical run, attempt number, and remote run where available; stale attempts

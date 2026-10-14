@@ -5,6 +5,7 @@ import { workSessionTerminalOutcome } from "../work-session-lifecycle.js";
 export interface ScheduledJobLifecycleProjection {
   nextStatus?: ScheduledJobStatus;
   finalWorkerOutcome?: "completed" | "failed" | "cancelled";
+  workerExecutionOutcome?: "completed" | "failed" | "failed_protocol" | "cancelled";
   lastError?: string;
   executionStarted?: boolean;
   executionPaused?: boolean;
@@ -89,6 +90,7 @@ export function projectScheduledJobLifecycleEvent(
     return {
       nextStatus: "cancelled",
       finalWorkerOutcome: "cancelled",
+      workerExecutionOutcome: "cancelled",
       executionStopped: true,
       lastError: event.type === "agent.run.cancelled"
         ? "Scheduled worker cancellation confirmed."
@@ -114,7 +116,12 @@ export function projectScheduledJobLifecycleEvent(
   // shared session lifecycle authority owns review-required terminal meaning.
   if (event.type === "agent.run.completed" || event.type === "worker.turn.completed"
     || event.type === "worker.attempt.failed" || event.type === "worker.attempt.exited") {
-    return { executionPaused: true };
+    return {
+      executionPaused: true,
+      workerExecutionOutcome: event.type === "worker.attempt.failed" || event.type === "worker.attempt.exited"
+        ? "failed"
+        : "completed",
+    };
   }
   const terminal = workSessionTerminalOutcome(event.type, "webui_approval_required");
 
@@ -132,12 +139,24 @@ export function projectScheduledJobLifecycleEvent(
 
   if (terminal?.status === "failed" || terminal?.status === "failed_protocol") {
     return currentStatus === "dispatching" || currentStatus === "running" || currentStatus === "awaiting_approval" || currentStatus === "uncertain_dispatch" || currentStatus === "operator_intervention"
-      ? { nextStatus: "failed", finalWorkerOutcome: "failed", lastError: `Work session ended with ${event.type}.`, executionStopped: true }
+      ? {
+          nextStatus: "failed",
+          finalWorkerOutcome: "failed",
+          workerExecutionOutcome: terminal.status === "failed_protocol" ? "failed_protocol" : "failed",
+          lastError: `Work session ended with ${event.type}.`,
+          executionStopped: true,
+        }
       : {};
   }
 
   if (terminal?.status === "cancelled") {
-    return { nextStatus: "cancelled", finalWorkerOutcome: "cancelled", lastError: "Scheduled worker cancelled.", executionStopped: true };
+    return {
+      nextStatus: "cancelled",
+      finalWorkerOutcome: "cancelled",
+      workerExecutionOutcome: "cancelled",
+      lastError: "Scheduled worker cancelled.",
+      executionStopped: true,
+    };
   }
 
   if (EXECUTION_STOPPED_EVENTS.has(event.type)) return { executionStopped: true };

@@ -7,6 +7,7 @@ import { z } from "zod/v4";
 import { createDispatchOutbox } from "../dispatch-outbox.js";
 import { openDatabase } from "../db/client.js";
 import { createScheduledJobStore } from "../scheduling/scheduled-job-store.js";
+import { scheduledVerificationFingerprints } from "../scheduling/scheduled-verification-projection.js";
 import { registerScheduleTools, sliceScheduledReportPage } from "./schedule-tools.js";
 
 const root = await mkdtemp(join(tmpdir(), "kontrol-scheduled-result-"));
@@ -78,6 +79,59 @@ try {
     const originalText = `A😀B\n${"R".repeat(40)}`;
     const originalHash = createHash("sha256").update(originalText, "utf8").digest("hex");
     reportRestartJobs.persistReport(reportJob.id, "verification:before-restart", originalText);
+    assert.throws(
+      () => reportRestartJobs!.persistReport(reportJob.id, "verification:before-restart", "partial output changed later"),
+      /changed after its immutable artifact was recorded/,
+      "a later partial or terminal output cannot replace an immutable report for the same execution identity",
+    );
+    const durableVerificationInput = {
+      jobId: reportJob.id,
+      requestKey: "mutation:verification-across-restart",
+      requestFingerprint: "f".repeat(64),
+      clientMutationId: "verification-across-restart",
+      executionIdentity: "verification:across-restart",
+      workSessionId: "work-session-restart",
+      submissionId: "submission-restart",
+      reviewEpoch: 1,
+      snapshotKind: "git" as const,
+      snapshotRef: "snapshot-restart",
+      commandFingerprint: "c".repeat(64),
+      policyFingerprint: "p".repeat(64),
+      deadlineAt: new Date(Date.now() + 60_000).toISOString(),
+    };
+    const durableVerification = reportRestartJobs.claimVerificationExecution(durableVerificationInput);
+    assert.equal(durableVerification.owner, true);
+    const runningRetry = reportRestartJobs.claimVerificationExecution({
+      ...durableVerificationInput,
+      executionIdentity: "verification:retry-before-response",
+    });
+    assert.equal(runningRetry.owner, false);
+    assert.equal(runningRetry.execution.id, durableVerification.execution.id,
+      "concurrent idempotent claims return the same durable running record");
+    assert.throws(
+      () => reportRestartJobs!.claimVerificationExecution({
+        ...durableVerificationInput,
+        requestFingerprint: "d".repeat(64),
+        executionIdentity: "verification:conflicting-request",
+      }),
+      /already used with different submission or verification content/,
+      "the durable claim rejects conflicting reuse of a reviewer mutation ID",
+    );
+    const verificationReportText = "immutable scheduled verification across restart";
+    const completedVerification = reportRestartJobs.completeVerificationExecution({
+      executionId: durableVerification.execution.id,
+      reportText: verificationReportText,
+    });
+    const staleVerificationInput = {
+      ...durableVerificationInput,
+      requestKey: "mutation:verification-interrupted-by-restart",
+      requestFingerprint: "e".repeat(64),
+      clientMutationId: "verification-interrupted-by-restart",
+      executionIdentity: "verification:interrupted-by-restart",
+      deadlineAt: new Date(Date.now() - 1_000).toISOString(),
+    };
+    const interruptedVerification = reportRestartJobs.claimVerificationExecution(staleVerificationInput);
+    assert.equal(interruptedVerification.execution.status, "running");
 
     reportRestartJobs.close();
     reportRestartJobs = undefined;
@@ -89,6 +143,28 @@ try {
     reportRestartDb = openDatabase(reportRestartRoot);
     reportRestartOutbox = createDispatchOutbox(reportRestartDb);
     reportRestartJobs = createScheduledJobStore(reportRestartDb, reportRestartOutbox);
+    const completedRetry = reportRestartJobs.claimVerificationExecution({
+      ...durableVerificationInput,
+      executionIdentity: "verification:retry-after-restart",
+    });
+    assert.equal(completedRetry.owner, false);
+    assert.equal(completedRetry.execution.id, completedVerification.id);
+    assert.equal(completedRetry.execution.status, "completed",
+      "completed verification receipts remain idempotently retrievable after restart");
+    assert.equal(reportRestartJobs.getVerificationReport(reportJob.id, completedVerification.reportSha256!)?.reportText, verificationReportText);
+    assert.equal(reportRestartJobs.reconcileStaleVerificationExecutions(25), 1,
+      "restart recovery converts expired in-flight verification into a durable failure");
+    const reconciledInterrupted = reportRestartJobs.getLatestVerificationExecution({
+      jobId: reportJob.id,
+      workSessionId: staleVerificationInput.workSessionId,
+      submissionId: staleVerificationInput.submissionId,
+      reviewEpoch: staleVerificationInput.reviewEpoch,
+      snapshotKind: staleVerificationInput.snapshotKind,
+      snapshotRef: staleVerificationInput.snapshotRef,
+      commandFingerprint: staleVerificationInput.commandFingerprint,
+      policyFingerprint: staleVerificationInput.policyFingerprint,
+    });
+    assert.equal(reconciledInterrupted?.status, "failed");
     const laterText = "newer report after restart";
     reportRestartJobs.persistReport(reportJob.id, "verification:after-restart", laterText);
     const pinned = reportRestartJobs.getReport(reportJob.id, originalHash);
@@ -120,7 +196,7 @@ try {
     runAt: new Date(Date.now() - 1_000).toISOString(),
     instructionJson: { instructions: "Produce a reviewable report." },
     executionMode: "read_only_audit",
-    policySnapshotJson: { workspaceAccess: "read_only", mutate: false },
+    policySnapshotJson: { workspaceAccess: "read_only", mutate: false, verificationCommands: ["npm test"] },
     maxRuntimeMs: 60_000,
   });
   jobs.transition({ jobId: created.id, expectedRevision: created.revision, nextStatus: "due", expectedSourceStatuses: ["pending"] });
@@ -149,6 +225,40 @@ try {
       confinement: "bubblewrap-read-only-workspace-no-network",
     },
   });
+  const lifecycleBase = new Date().toISOString();
+  jobs.projectEvent({
+    id: "scheduled-worker-started",
+    seq: 1,
+    durable: true,
+    type: "agent.run.started",
+    sessionId: session.id,
+    payload: { runId: run.runId, dispatchId: dispatch.dispatchId, attemptNumber: 1, remoteRunId: "remote-run-1" },
+    createdAt: lifecycleBase,
+  });
+  jobs.projectEvent({
+    id: "scheduled-review-submitted",
+    seq: 2,
+    durable: true,
+    type: "review.submitted",
+    sessionId: session.id,
+    payload: { runId: run.runId, submissionId: submission.id },
+    createdAt: new Date(Date.parse(lifecycleBase) + 1).toISOString(),
+  });
+  jobs.projectEvent({
+    id: "scheduled-worker-turn-completed",
+    seq: 3,
+    durable: true,
+    type: "worker.turn.completed",
+    sessionId: session.id,
+    payload: {
+      runId: run.runId,
+      dispatchId: dispatch.dispatchId,
+      attemptNumber: 1,
+      remoteRunId: "remote-run-1",
+      final_output: "R".repeat(49_000),
+    },
+    createdAt: new Date(Date.parse(lifecycleBase) + 2).toISOString(),
+  });
 
   const config: any = {
     principalRole: "reviewer",
@@ -163,11 +273,19 @@ try {
     workspaces: { getWorkspace: () => ({ id: "project-a", root: "/tmp/project-a" }) },
     workSessions: { get: (id: string) => id === session.id
       ? { ...session, status: sessionStatus }
+      : id === "work-session-unpersisted" ? { id, status: "awaiting_review", updatedAt: "2026-10-12T12:00:00.000Z" }
       : id === cancelSession.id ? cancelSession
         : id === reviewStoppedSession.id ? reviewStoppedSession
           : undefined },
     agentRegistry: { getRunByWorkSessionId: (id: string) => id === session.id
       ? run
+      : id === "work-session-unpersisted" ? {
+          runId: "run-unpersisted",
+          status: "completed",
+          agentName: "codex",
+          finishedAt: "2026-10-12T12:01:00.000Z",
+          outputJson: JSON.stringify({ output: [{ parts: [{ content: "not yet persisted" }] }] }),
+        }
       : id === cancelSession.id ? cancelRun
         : id === reviewStoppedSession.id ? reviewStoppedRun
           : undefined,
@@ -249,10 +367,170 @@ try {
 
   const resultTool = handlers.get("get_scheduled_job_result");
   assert.ok(resultTool, "scheduled result retrieval is registered");
+  const jobReadTool = handlers.get("get_scheduled_job");
+  assert.ok(jobReadTool, "scheduled job retrieval is registered");
+  const unpersistedJob = jobs.create({
+    principalId: "principal-a",
+    ownerContextId: "principal:principal-a|transport:A",
+    projectId: "project-a",
+    workspaceRoot: "/tmp/project-a",
+    runAt: new Date().toISOString(),
+    instructionJson: { instructions: "Read a result without creating its artifact." },
+    executionMode: "read_only_audit",
+    policySnapshotJson: { workspaceAccess: "read_only", mutate: false },
+    workSessionId: "work-session-unpersisted",
+    maxRuntimeMs: 60_000,
+  });
+  const reportRowsBeforeReads = Number((database.sqlite.prepare("select count(*) as count from scheduled_job_reports").get() as { count: number }).count);
+  const priorMissionLedger = config.missionLedger;
+  config.missionLedger = undefined;
+  const noArtifactResult = await resultTool({ scheduledJobId: unpersistedJob.id });
+  const noArtifactStatus = await jobReadTool({ scheduledJobId: unpersistedJob.id });
+  config.missionLedger = priorMissionLedger;
+  assert.equal(noArtifactResult.structuredContent.resultReceipt.workerCompleted, false,
+    "a finishedAt value alone does not prove authoritative worker completion");
+  assert.equal(noArtifactResult.structuredContent.report, "",
+    "result reads do not manufacture an immutable report from live ACP output");
+  assert.equal(noArtifactStatus.structuredContent.scheduledJobId, unpersistedJob.id);
+  assert.equal(Number((database.sqlite.prepare("select count(*) as count from scheduled_job_reports").get() as { count: number }).count), reportRowsBeforeReads,
+    "both read-only job getters leave the report table unchanged when no artifact exists");
+
+  const rejectedJob = jobs.create({
+    principalId: "principal-a",
+    ownerContextId: "principal:principal-a|transport:A",
+    projectId: "project-a",
+    workspaceRoot: "/tmp/project-a",
+    runAt: new Date(Date.now() - 1_000).toISOString(),
+    instructionJson: { instructions: "Reject before worker spawn." },
+    executionMode: "read_only_audit",
+    policySnapshotJson: { workspaceAccess: "read_only", mutate: false },
+    maxRuntimeMs: 60_000,
+  });
+  jobs.transition({ jobId: rejectedJob.id, expectedRevision: rejectedJob.revision, nextStatus: "due", expectedSourceStatuses: ["pending"] });
+  const rejectedClaim = jobs.claimDispatch({ jobId: rejectedJob.id, expectedRevision: 2, dispatcherInstanceId: "test-scheduler" });
+  jobs.completeDispatch({
+    jobId: rejectedJob.id,
+    dispatchAttemptId: rejectedClaim.attemptId,
+    expectedRevision: rejectedClaim.revision,
+    dispatcherInstanceId: "test-scheduler",
+    outcome: "failed",
+    lastError: "Adapter rejected admission before spawn.",
+  });
+  const rejectedReceipt = await resultTool({ scheduledJobId: rejectedJob.id });
+  assert.equal(rejectedReceipt.structuredContent.resultReceipt.dispatchStatus, "rejected");
+  assert.equal(rejectedReceipt.structuredContent.resultReceipt.workerCompleted, false,
+    "definitive pre-spawn rejection never becomes worker completion");
+  assert.equal(rejectedReceipt.structuredContent.resultReceipt.executionStatus, "dispatch_rejected");
+
+  const failedExecutionJob = jobs.create({
+    principalId: "principal-a",
+    ownerContextId: "principal:principal-a|transport:A",
+    projectId: "project-a",
+    workspaceRoot: "/tmp/project-a",
+    runAt: new Date(Date.now() - 1_000).toISOString(),
+    instructionJson: { instructions: "Fail after worker start." },
+    executionMode: "read_only_audit",
+    policySnapshotJson: { workspaceAccess: "read_only", mutate: false },
+    workSessionId: "work-session-failed-execution",
+    maxRuntimeMs: 60_000,
+  });
+  jobs.transition({ jobId: failedExecutionJob.id, expectedRevision: failedExecutionJob.revision, nextStatus: "due", expectedSourceStatuses: ["pending"] });
+  const failedExecutionClaim = jobs.claimDispatch({ jobId: failedExecutionJob.id, expectedRevision: 2, dispatcherInstanceId: "test-scheduler" });
+  jobs.completeDispatch({
+    jobId: failedExecutionJob.id,
+    dispatchAttemptId: failedExecutionClaim.attemptId,
+    expectedRevision: failedExecutionClaim.revision,
+    dispatcherInstanceId: "test-scheduler",
+    outcome: "dispatched",
+    workSessionId: "work-session-failed-execution",
+    acpRunId: "run-failed-execution",
+    acpDispatchId: failedExecutionClaim.dispatchId,
+    acpAttemptNumber: 1,
+  });
+  jobs.projectEvent({
+    id: "failed-execution-started",
+    seq: 1,
+    durable: true,
+    type: "agent.run.started",
+    sessionId: "work-session-failed-execution",
+    payload: { runId: "run-failed-execution", dispatchId: failedExecutionClaim.dispatchId, attemptNumber: 1 },
+    createdAt: lifecycleBase,
+  });
+  jobs.projectEvent({
+    id: "failed-execution-terminal",
+    seq: 2,
+    durable: true,
+    type: "agent.run.failed",
+    sessionId: "work-session-failed-execution",
+    payload: {
+      runId: "run-failed-execution",
+      dispatchId: failedExecutionClaim.dispatchId,
+      attemptNumber: 1,
+      final_output: "worker exited unsuccessfully",
+    },
+    createdAt: new Date(Date.parse(lifecycleBase) + 3).toISOString(),
+  });
+  const failedExecutionReceipt = await resultTool({ scheduledJobId: failedExecutionJob.id });
+  assert.equal(failedExecutionReceipt.structuredContent.resultReceipt.workerCompleted, false);
+  assert.equal(failedExecutionReceipt.structuredContent.resultReceipt.workerExecutionOutcome, "failed");
+  assert.equal(failedExecutionReceipt.structuredContent.resultReceipt.executionStatus, "failed",
+    "a started worker's unsuccessful exit remains an execution failure");
+
+  const finalizationJob = jobs.create({
+    principalId: "principal-a",
+    ownerContextId: "principal:principal-a|transport:A",
+    projectId: "project-a",
+    workspaceRoot: "/tmp/project-a",
+    runAt: new Date(Date.now() - 1_000).toISOString(),
+    instructionJson: { instructions: "Recover terminal report persistence." },
+    executionMode: "read_only_audit",
+    policySnapshotJson: { workspaceAccess: "read_only", mutate: false },
+    workSessionId: "work-session-finalization",
+    maxRuntimeMs: 60_000,
+  });
+  jobs.transition({ jobId: finalizationJob.id, expectedRevision: 1, nextStatus: "due", expectedSourceStatuses: ["pending"] });
+  const finalizationClaim = jobs.claimDispatch({ jobId: finalizationJob.id, expectedRevision: 2, dispatcherInstanceId: "test-scheduler" });
+  jobs.completeDispatch({
+    jobId: finalizationJob.id,
+    dispatchAttemptId: finalizationClaim.attemptId,
+    expectedRevision: finalizationClaim.revision,
+    dispatcherInstanceId: "test-scheduler",
+    outcome: "dispatched",
+    workSessionId: "work-session-finalization",
+    acpRunId: "run-finalization",
+    acpDispatchId: finalizationClaim.dispatchId,
+    acpAttemptNumber: 1,
+  });
+  database.sqlite.exec(`create trigger fail_scheduled_report_insert before insert on scheduled_job_reports when new.job_id = '${finalizationJob.id}' begin select raise(fail, 'simulated artifact persistence failure'); end`);
+  jobs.projectEvent({
+    id: "finalization-worker-terminal",
+    seq: 1,
+    durable: true,
+    type: "worker.turn.completed",
+    sessionId: "work-session-finalization",
+    payload: {
+      runId: "run-finalization",
+      dispatchId: finalizationClaim.dispatchId,
+      attemptNumber: 1,
+      final_output: "durable output awaiting artifact recovery",
+    },
+    createdAt: lifecycleBase,
+  });
+  const pendingFinalization = jobs.getReportFinalization(finalizationJob.id, "run-finalization", 1);
+  assert.equal(pendingFinalization?.status, "pending");
+  assert.match(pendingFinalization?.lastError ?? "", /simulated artifact persistence failure/);
+  database.sqlite.exec("drop trigger fail_scheduled_report_insert");
+  assert.equal(jobs.reconcilePendingReportFinalizations(25), 1,
+    "terminal report persistence is retried by the scheduler without a result read");
+  assert.equal(jobs.getReportFinalization(finalizationJob.id, "run-finalization", 1)?.status, "completed");
+  assert.equal(jobs.getReportForAttempt(finalizationJob.id, "run-finalization", 1)?.reportText, "durable output awaiting artifact recovery");
+
   const firstPage = await resultTool({ scheduledJobId: created.id, reportLimit: 100 });
   assert.equal(firstPage.structuredContent.resultReceipt.executionStatus, "completed",
     "a finished worker turn is reported as execution completion");
-  assert.equal(firstPage.structuredContent.resultReceipt.executionTerminalAt, run.finishedAt);
+  assert.equal(firstPage.structuredContent.resultReceipt.executionTerminalAt, new Date(Date.parse(lifecycleBase) + 2).toISOString());
+  assert.equal(firstPage.structuredContent.resultReceipt.workerExecutionOutcome, "completed");
+  assert.equal(firstPage.structuredContent.resultReceipt.workerCompleted, true);
   assert.equal(firstPage.structuredContent.resultReceipt.terminalAt, undefined,
     "the scheduled job has no terminal timestamp while review is pending");
   assert.equal(firstPage.structuredContent.resultReceipt.reviewStatus, "pending",
@@ -287,6 +565,100 @@ try {
     "report pages obey the structured result UTF-8 byte cap");
   assert.equal(emojiPage.nextOffset, 12_001);
 
+  const fingerprints = scheduledVerificationFingerprints({ policySnapshotJson: created.policySnapshotJson, serverConfig: config.serverConfig });
+  const verificationIdentity = {
+    jobId: created.id,
+    workSessionId: session.id,
+    submissionId: submission.id,
+    reviewEpoch: submission.reviewEpoch,
+    snapshotKind: submission.snapshotKind as "git" | "filesystem",
+    snapshotRef: submission.snapshotRef,
+    commandFingerprint: fingerprints.commandFingerprint,
+    policyFingerprint: fingerprints.policyFingerprint,
+  };
+  const verificationRequestFingerprint = createHash("sha256").update(JSON.stringify(verificationIdentity)).digest("hex");
+  const claimVerification = (mutationId: string, executionIdentity: string, requestFingerprint = verificationRequestFingerprint) => jobs.claimVerificationExecution({
+    ...verificationIdentity,
+    requestKey: `mutation:${mutationId}`,
+    requestFingerprint,
+    clientMutationId: mutationId,
+    executionIdentity,
+    deadlineAt: new Date(Date.now() + 60_000).toISOString(),
+  });
+  const verificationReportText = (status: "passed" | "failed") => JSON.stringify({
+    version: 1,
+    scheduledJobId: created.id,
+    workSessionId: session.id,
+    submissionId: submission.id,
+    snapshotKind: submission.snapshotKind,
+    snapshotRef: submission.snapshotRef,
+    results: [{
+      criterionId: "scheduled:1",
+      command: "npm test",
+      status,
+      exitCode: status === "passed" ? 0 : 1,
+      signal: null,
+      durationMs: 42,
+      outputTail: status === "passed" ? "ok" : "failed",
+      outputSha256: (status === "passed" ? "a" : "b").repeat(64),
+      failureSetSha256: (status === "passed" ? "c" : "d").repeat(64),
+    }],
+  });
+  config.missionLedger = undefined;
+  const runningVerification = claimVerification("verify-pass", "verification:pass");
+  assert.equal(runningVerification.owner, true);
+  const identicalVerificationRetry = claimVerification("verify-pass", "verification:retry");
+  assert.equal(identicalVerificationRetry.owner, false, "an identical idempotency retry reuses the running execution claim");
+  assert.equal(identicalVerificationRetry.execution.id, runningVerification.execution.id);
+  const runningReceipt = await resultTool({ scheduledJobId: created.id });
+  assert.equal(runningReceipt.structuredContent.resultReceipt.verificationStatus, "inconclusive",
+    "an active verification is visible as unresolved instead of falling back to an older pass");
+  const passingVerificationText = verificationReportText("passed");
+  const passingVerification = jobs.completeVerificationExecution({ executionId: runningVerification.execution.id, reportText: passingVerificationText });
+  assert.equal(passingVerification.status, "completed");
+  const repeatedCompletedClaim = claimVerification("verify-pass", "verification:later-retry");
+  assert.equal(repeatedCompletedClaim.owner, false);
+  assert.equal(repeatedCompletedClaim.execution.executionIdentity, passingVerification.executionIdentity,
+    "a lost-response retry returns the existing completed report instead of executing commands again");
+  assert.throws(() => claimVerification("verify-pass", "verification:conflict", "0".repeat(64)), /different submission or verification content/,
+    "a reused idempotency key cannot bind different verification content");
+  const passedScheduledReceipt = await resultTool({ scheduledJobId: created.id });
+  assert.equal(passedScheduledReceipt.structuredContent.resultReceipt.verificationStatus, "passed",
+    "scheduled verification passes are visible even without a mission ledger");
+  assert.equal(passedScheduledReceipt.structuredContent.resultReceipt.verificationLevel, "implementation");
+  assert.equal(passedScheduledReceipt.structuredContent.resultReceipt.independentOutcomeObserved, false,
+    "scheduled tests do not claim independent outcome verification");
+  assert.equal(passedScheduledReceipt.structuredContent.resultReceipt.verificationReportSha256, passingVerification.reportSha256);
+  assert.equal(passedScheduledReceipt.structuredContent.resultReceipt.verificationResults[0].status, "passed");
+  assert.ok(passedScheduledReceipt.structuredContent.resultReceipt.artifactReferences.some((item: any) => item.kind === "scheduled_verification_report"));
+
+  const getVerificationReportTool = handlers.get("get_scheduled_job_verification");
+  assert.ok(getVerificationReportTool);
+  const verificationReportRead = await getVerificationReportTool({ scheduledJobId: created.id, reportSha256: passingVerification.reportSha256, reportLimit: 100 });
+  assert.equal(verificationReportRead.structuredContent.report, passingVerificationText.slice(0, 100));
+  assert.equal(z.object(definitions.get("get_scheduled_job_verification").outputSchema).safeParse(verificationReportRead.structuredContent).success, true);
+
+  const failedVerificationClaim = claimVerification("verify-fresh-failure", "verification:fresh-failure");
+  const failedVerification = jobs.completeVerificationExecution({
+    executionId: failedVerificationClaim.execution.id,
+    reportText: verificationReportText("failed"),
+  });
+  const latestFailedReceipt = await resultTool({ scheduledJobId: created.id });
+  assert.equal(latestFailedReceipt.structuredContent.resultReceipt.verificationStatus, "failed",
+    "a newer failed command cannot be hidden by an older passing report");
+  assert.equal(latestFailedReceipt.structuredContent.resultReceipt.verificationReportSha256, failedVerification.reportSha256);
+  assert.equal(latestFailedReceipt.structuredContent.resultReceipt.verificationResults[0].status, "failed");
+  assert.ok(latestFailedReceipt.structuredContent.resultReceipt.unresolvedBlockers.some((item: string) => item.includes("failed: npm test")));
+
+  const savedSubmission = session.latestSubmission;
+  session.latestSubmission = { ...submission, id: "submission-2", snapshotRef: "snapshot-2", snapshotCommit: "snapshot-2", reviewEpoch: 2 };
+  const changedSubmissionReceipt = await resultTool({ scheduledJobId: created.id });
+  assert.equal(changedSubmissionReceipt.structuredContent.resultReceipt.verificationStatus, "not_performed",
+    "verification reports from an older submission never qualify for a changed snapshot");
+  assert.equal(changedSubmissionReceipt.structuredContent.resultReceipt.verificationReportSha256, undefined);
+  session.latestSubmission = savedSubmission;
+
+  config.missionLedger = priorMissionLedger;
   missionReceipt = {
     completionReport: {
       id: "completion-1",
@@ -307,7 +679,8 @@ try {
     "later pages read the pinned report artifact even if run output is unavailable");
   assert.equal(verified.structuredContent.resultReceipt.reviewStatus, "pending",
     "verification and human review remain independently visible");
-  assert.equal(verified.structuredContent.resultReceipt.verificationStatus, "passed");
+  assert.equal(verified.structuredContent.resultReceipt.verificationStatus, "failed",
+    "a passing mission receipt cannot hide a newer failed scheduled command for the same submission");
   assert.equal(verified.structuredContent.resultReceipt.verificationLevel, "integration");
   assert.equal(verified.structuredContent.resultReceipt.independentOutcomeObserved, false,
     "integration verification does not claim independent outcome observation");
@@ -328,7 +701,7 @@ try {
   assert.equal(approved.structuredContent.resultReceipt.independentOutcomeObserved, true);
   jobs.projectEvent({
     id: "submission-event-1",
-    seq: 1,
+    seq: 4,
     durable: true,
     type: "review.submitted",
     sessionId: session.id,
@@ -337,7 +710,7 @@ try {
   });
   jobs.projectEvent({
     id: "approval-event-2",
-    seq: 2,
+    seq: 5,
     durable: true,
     type: "agent.run.approved",
     sessionId: session.id,

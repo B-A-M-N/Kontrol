@@ -15,6 +15,8 @@ import type { ReadOnlyExecutionReceipt } from "../acp-gateway.js";
 
 export interface ScheduledDispatchOutcome {
   status: "dispatched" | "blocked" | "failed" | "uncertain";
+  blockerKind?: "temporary_dependency" | "permanent_configuration";
+  lastAttemptedAgent?: string;
   workSessionId?: string;
   runId?: string;
   dispatchId?: string;
@@ -88,6 +90,16 @@ export interface ScheduledJobRuntimeOptions {
   leaseMs?: number;
   pollMs?: number;
   dispatchConcurrency?: number;
+}
+
+const TRANSIENT_DISPATCH_RETRY_BASE_MS = 2_000;
+const TRANSIENT_DISPATCH_RETRY_MAX_MS = 5 * 60_000;
+
+export function scheduledDispatchRetryDelayMs(retryCount: number, random = Math.random): number {
+  const exponent = Math.max(0, Math.min(16, retryCount - 1));
+  const base = Math.min(TRANSIENT_DISPATCH_RETRY_MAX_MS, TRANSIENT_DISPATCH_RETRY_BASE_MS * (2 ** exponent));
+  const jittered = base * (0.8 + random() * 0.4);
+  return Math.min(TRANSIENT_DISPATCH_RETRY_MAX_MS, Math.max(1_000, Math.round(jittered)));
 }
 
 export function createScheduledJobRuntime(options: ScheduledJobRuntimeOptions): ScheduledJobRuntime {
@@ -605,6 +617,14 @@ export function createScheduledJobRuntime(options: ScheduledJobRuntimeOptions): 
         }
         job = jobs.get(job.id) ?? job;
       }
+      if (job.dispatchNextEligibleAt && Date.parse(job.dispatchNextEligibleAt) > Date.now()) {
+        dispatchOutbox.release(
+          claim,
+          Date.parse(job.dispatchNextEligibleAt) - Date.now(),
+          job.lastError ?? "scheduled dispatch is waiting for its bounded retry window",
+        );
+        return;
+      }
       if (!options.dispatch) {
         dispatchOutbox.markCompleted(claim);
         return;
@@ -629,6 +649,7 @@ export function createScheduledJobRuntime(options: ScheduledJobRuntimeOptions): 
           acpAttemptNumber: outcome.attemptNumber,
           acpRemoteRunId: outcome.remoteRunId,
           executionReceipt: outcome.executionReceipt,
+          agentName: outcome.lastAttemptedAgent,
           lastError: outcome.reason,
         });
         if (completed.status === "cancellation_requested" && completed.cancellationLastConfirmedState === "not_dispatched"
@@ -642,6 +663,14 @@ export function createScheduledJobRuntime(options: ScheduledJobRuntimeOptions): 
           dispatchAttemptId: dispatchClaim.attemptId,
           expectedRevision: dispatchClaim.revision,
           dispatcherInstanceId: schedulerInstanceId,
+          blocker: {
+            kind: outcome.blockerKind ?? "temporary_dependency",
+            reason: outcome.reason ?? "scheduled dispatch blocked before launch",
+            ...(outcome.blockerKind === "permanent_configuration"
+              ? {}
+              : { nextEligibleAt: new Date(Date.now() + scheduledDispatchRetryDelayMs(job.dispatchRetryCount + 1)).toISOString() }),
+            lastAttemptedAgent: outcome.lastAttemptedAgent ?? job.agentName,
+          },
         });
         if (released.status === "cancellation_requested" && released.cancellationRequestId
           && released.cancellationLastConfirmedState === "not_dispatched") {
@@ -649,7 +678,15 @@ export function createScheduledJobRuntime(options: ScheduledJobRuntimeOptions): 
           dispatchOutbox.markCompleted(claim);
           return;
         }
-        dispatchOutbox.release(claim, 1000, outcome.reason ?? "scheduled dispatch blocked before launch");
+        if (released.status === "blocked") {
+          dispatchOutbox.markCompleted(claim);
+          return;
+        }
+        dispatchOutbox.release(
+          claim,
+          Math.max(0, Date.parse(released.dispatchNextEligibleAt ?? new Date().toISOString()) - Date.now()),
+          outcome.reason ?? "scheduled dispatch blocked before launch",
+        );
         return;
       }
       dispatchOutbox.markCompleted(claim);
@@ -669,6 +706,10 @@ export function createScheduledJobRuntime(options: ScheduledJobRuntimeOptions): 
       dispatchOutbox.reapExpiredClaims(leaseMs);
       phase = "project_lifecycle_events";
       await reconcileProjectableEvents();
+      phase = "finalize_scheduled_reports";
+      jobs.reconcilePendingReportFinalizations(25);
+      phase = "reconcile_scheduled_verifications";
+      jobs.reconcileStaleVerificationExecutions(25);
       // Replay durable worker events before enforcing deadlines. A completion
       // already in the event log must close the execution window before an
       // overdue timer can request cancellation.

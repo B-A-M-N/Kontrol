@@ -91,7 +91,68 @@ const migrations: Migration[] = [
   { version: 79, name: "scheduled-job-immutable-reports", up: migrateScheduledJobImmutableReports },
   { version: 80, name: "scheduled-job-execution-accounting", up: migrateScheduledJobExecutionAccounting },
   { version: 81, name: "acp-run-scheduled-execution-mode", up: migrateAcpRunScheduledExecutionMode },
+  { version: 82, name: "scheduled-job-result-ownership", up: migrateScheduledJobResultOwnership },
 ];
+
+function migrateScheduledJobResultOwnership(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "scheduled_jobs", "dispatch_retry_count", "integer not null default 0");
+  addColumnIfMissing(sqlite, "scheduled_jobs", "dispatch_next_eligible_at", "text");
+  addColumnIfMissing(sqlite, "scheduled_jobs", "dispatch_last_attempted_agent", "text");
+  addColumnIfMissing(sqlite, "scheduled_jobs", "dispatch_blocker_kind", "text");
+  addColumnIfMissing(sqlite, "scheduled_job_attempts", "worker_execution_outcome", "text");
+  addColumnIfMissing(sqlite, "scheduled_job_attempts", "worker_execution_at", "text");
+  sqlite.exec(`
+    create table if not exists scheduled_job_verifications (
+      id text primary key,
+      job_id text not null references scheduled_jobs(id) on delete cascade,
+      request_key text not null,
+      request_fingerprint text not null,
+      client_mutation_id text,
+      execution_identity text not null unique,
+      work_session_id text not null,
+      submission_id text not null,
+      review_epoch integer not null,
+      snapshot_kind text not null,
+      snapshot_ref text not null,
+      command_fingerprint text not null,
+      policy_fingerprint text not null,
+      status text not null default 'running',
+      deadline_at text not null,
+      report_sha256 text,
+      report_text text,
+      failure_reason text,
+      created_at text not null,
+      started_at text not null,
+      finished_at text
+    );
+    create unique index if not exists scheduled_job_verifications_request_unique
+      on scheduled_job_verifications(job_id, request_key);
+    create index if not exists scheduled_job_verifications_current_idx
+      on scheduled_job_verifications(job_id, submission_id, review_epoch, created_at);
+    create index if not exists scheduled_job_verifications_status_deadline_idx
+      on scheduled_job_verifications(status, deadline_at, id);
+    create index if not exists scheduled_job_verifications_hash_idx
+      on scheduled_job_verifications(job_id, report_sha256);
+
+    create table if not exists scheduled_job_report_finalizations (
+      id text primary key,
+      job_id text not null references scheduled_jobs(id) on delete cascade,
+      run_id text not null,
+      attempt_number integer not null,
+      event_id text not null,
+      status text not null default 'pending',
+      report_text text,
+      report_sha256 text,
+      last_error text,
+      created_at text not null,
+      updated_at text not null
+    );
+    create unique index if not exists scheduled_job_report_finalizations_attempt_unique
+      on scheduled_job_report_finalizations(job_id, run_id, attempt_number);
+    create index if not exists scheduled_job_report_finalizations_pending_idx
+      on scheduled_job_report_finalizations(status, updated_at, id);
+  `);
+}
 
 function migrateAcpRunScheduledExecutionMode(sqlite: Database.Database): void {
   addColumnIfMissing(sqlite, "acp_runs", "scheduled_execution_mode", "text");

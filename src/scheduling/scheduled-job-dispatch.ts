@@ -15,6 +15,8 @@ import type { ScheduledJob, ScheduledJobStore } from "./scheduled-job-store.js";
 
 export interface ScheduledDispatchResult {
   status: "dispatched" | "blocked" | "failed" | "uncertain";
+  blockerKind?: "temporary_dependency" | "permanent_configuration";
+  lastAttemptedAgent?: string;
   workSessionId?: string;
   runId?: string;
   remoteRunId?: string;
@@ -45,16 +47,33 @@ export async function dispatchScheduledJob(
   try {
     workspace = config.workspaces.getWorkspace(workspaceSessionId);
   } catch {
-    return { status: "blocked", reason: `Unknown workspace for scheduled job: ${workspaceSessionId}` };
+    return {
+      status: "blocked",
+      blockerKind: "permanent_configuration",
+      reason: `Unknown workspace for scheduled job: ${workspaceSessionId}`,
+    };
   }
 
-  const selection = await selectHealthyAgent(config.agentRegistry.listAlive(), {
+  const candidates = config.agentRegistry.listAlive().filter((agent) => agent.role === "agent" && (!job.agentName || agent.name === job.agentName));
+  const selection = await selectHealthyAgent(candidates, {
     name: job.agentName,
     role: "agent",
     adapterSecret: config.adapterSecret,
   });
   if (!selection.agent) {
-    return { status: "blocked", reason: "No healthy dispatchable ACP agent is registered." };
+    const blockerKind = selection.permanentBlocker || (Boolean(job.agentName) && candidates.length === 0)
+      ? "permanent_configuration"
+      : "temporary_dependency";
+    return {
+      status: "blocked",
+      blockerKind,
+      lastAttemptedAgent: candidates[0]?.name ?? job.agentName,
+      reason: selection.deadUrls.length
+        ? `No healthy dispatchable ACP agent is registered: ${selection.deadUrls.join("; ")}`
+        : job.agentName && candidates.length === 0
+          ? `Configured ACP agent ${job.agentName} is not registered.`
+          : "No healthy dispatchable ACP agent is registered.",
+    };
   }
   const peer = selection.agent;
 
@@ -122,6 +141,7 @@ export async function dispatchScheduledJob(
       // original adapter launch is authoritatively resolved.
       return {
         status: "uncertain",
+        lastAttemptedAgent: peer.name,
         workSessionId,
         runId: result.runId,
         remoteRunId: result.remoteRunId,
@@ -133,6 +153,7 @@ export async function dispatchScheduledJob(
       config.workSessions.updateStatus(workSessionId, "failed");
       return {
         status: "failed",
+        lastAttemptedAgent: peer.name,
         workSessionId,
         runId: result.runId,
         remoteRunId: result.remoteRunId,
@@ -142,6 +163,7 @@ export async function dispatchScheduledJob(
     }
     return {
       status: "dispatched",
+      lastAttemptedAgent: peer.name,
       workSessionId,
       runId: result.runId,
       remoteRunId: result.remoteRunId,
@@ -152,6 +174,6 @@ export async function dispatchScheduledJob(
     const message = error instanceof Error ? error.message : String(error);
     const uncertain = /ECONNREFUSED|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|socket hang up|network/i.test(message);
     if (!uncertain) config.workSessions.updateStatus(workSessionId, "failed");
-    return { status: uncertain ? "uncertain" : "failed", workSessionId, reason: message };
+    return { status: uncertain ? "uncertain" : "failed", lastAttemptedAgent: peer.name, workSessionId, reason: message };
   }
 }

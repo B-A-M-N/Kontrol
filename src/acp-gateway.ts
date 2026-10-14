@@ -393,6 +393,7 @@ export async function probeAgent(url: string, sharedSecret?: string): Promise<Ag
 export interface HealthyAgentSelection {
   agent?: AgentInfo;
   deadUrls: string[];
+  permanentBlocker?: boolean;
 }
 
 /**
@@ -420,12 +421,21 @@ export async function selectHealthyAgent(
     });
   }
   const deadUrls: string[] = [];
+  let allFailuresPermanent = candidates.length > 0;
   for (const peer of candidates) {
     const probe = await probeAgent(peer.url, opts.adapterSecret);
     if (probe.healthy) return { agent: peer, deadUrls };
     deadUrls.push(`${peer.url} (${probe.error ? probe.error : "HTTP " + probe.status})`);
+    allFailuresPermanent = allFailuresPermanent && (
+      probe.note?.startsWith("unsupported") === true
+      || probe.note?.includes("requires authentication") === true
+      || probe.status === 401
+      || probe.status === 403
+      || probe.status === 404
+      || probe.status === 405
+    );
   }
-  return { deadUrls };
+  return { deadUrls, permanentBlocker: allFailuresPermanent };
 }
 
 function normalizePlatformHint(value: string | undefined): string | undefined {

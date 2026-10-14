@@ -6,7 +6,7 @@ import { openDatabase } from "../db/client.js";
 import { createDispatchOutbox } from "../dispatch-outbox.js";
 import { createEventStore } from "../event-log.js";
 import { createScheduledJobStore, schedulingOperation, type ScheduledJob } from "./scheduled-job-store.js";
-import { createScheduledJobRuntime } from "./scheduled-job-runtime.js";
+import { createScheduledJobRuntime, scheduledDispatchRetryDelayMs } from "./scheduled-job-runtime.js";
 import { scheduledJobAccessAllowed } from "../bridge/schedule-tools.js";
 
 const root = await mkdtemp(join(tmpdir(), "kontrol-scheduling-test-"));
@@ -157,6 +157,125 @@ try {
       scaleJobs.close();
       scaleOutbox.close();
       await rm(scaleRoot, { recursive: true, force: true });
+    }
+  }
+
+  // ── K-R04: temporary dispatch blockers back off across scheduler restart. ──
+  {
+    const retryRoot = await mkdtemp(join(tmpdir(), "kontrol-scheduling-retry-"));
+    const retryDb = openDatabase(retryRoot);
+    const retryOutbox = createDispatchOutbox(retryDb);
+    const retryJobs = createScheduledJobStore(retryDb, retryOutbox);
+    const dueAt = new Date(Date.now() - 1_000).toISOString();
+    try {
+      const temporaryJob = retryJobs.create({
+        principalId: "retry-principal",
+        ownerContextId: "retry-owner",
+        projectId: "retry-project",
+        workspaceRoot: "/tmp/retry-project",
+        runAt: dueAt,
+        instructionJson: { instructions: "Retry after a temporary adapter outage" },
+        executionMode: "read_only_audit",
+        policySnapshotJson: { workspaceAccess: "read_only" },
+        maxRuntimeMs: 60_000,
+      });
+      let temporaryDispatchCalls = 0;
+      const firstRuntime = createScheduledJobRuntime({
+        database: retryDb,
+        jobs: retryJobs,
+        dispatchOutbox: retryOutbox,
+        pollMs: 60_000,
+        dispatch: async () => {
+          temporaryDispatchCalls += 1;
+          return {
+            status: "blocked",
+            blockerKind: "temporary_dependency",
+            lastAttemptedAgent: "offline-agent",
+            reason: "adapter temporarily unavailable",
+          };
+        },
+      });
+      await firstRuntime.drainOnce();
+      const waitingRetry = retryJobs.get(temporaryJob.id)!;
+      assert.equal(waitingRetry.status, "due");
+      assert.equal(waitingRetry.dispatchRetryCount, 1);
+      assert.equal(waitingRetry.dispatchLastAttemptedAgent, "offline-agent");
+      assert.equal(waitingRetry.dispatchBlockerKind, "temporary_dependency");
+      assert.ok(Date.parse(waitingRetry.dispatchNextEligibleAt!) - Date.now() >= 1_500,
+        "the first temporary retry is durably delayed instead of immediately looping");
+      assert.equal(scheduledDispatchRetryDelayMs(1, () => 0), 1_600);
+      assert.equal(scheduledDispatchRetryDelayMs(16, () => 1), 300_000,
+        "exponential retry delay is capped at five minutes");
+      await firstRuntime.drainOnce();
+      assert.equal(temporaryDispatchCalls, 1, "a repeated immediate drain cannot bypass the retry window");
+      firstRuntime.stop();
+
+      const restartedRuntime = createScheduledJobRuntime({
+        database: retryDb,
+        jobs: retryJobs,
+        dispatchOutbox: retryOutbox,
+        pollMs: 60_000,
+        dispatch: async () => {
+          temporaryDispatchCalls += 1;
+          return { status: "dispatched", workSessionId: "retry-work-session" };
+        },
+      });
+      await restartedRuntime.drainOnce();
+      assert.equal(temporaryDispatchCalls, 1, "restart preserves the durable retry delay");
+      await new Promise((resolve) => setTimeout(resolve, Math.max(0, Date.parse(waitingRetry.dispatchNextEligibleAt!) - Date.now() + 20)));
+      await restartedRuntime.drainOnce();
+      assert.equal(temporaryDispatchCalls, 2, "the restored scheduler dispatches once after the retry window");
+      assert.equal(retryJobs.get(temporaryJob.id)?.status, "running");
+      await restartedRuntime.drainOnce();
+      assert.equal(temporaryDispatchCalls, 2, "accepted work is never launched again by a subsequent drain");
+      restartedRuntime.stop();
+
+      const permanentJob = retryJobs.create({
+        principalId: "retry-principal",
+        ownerContextId: "retry-owner",
+        projectId: "retry-project",
+        workspaceRoot: "/tmp/retry-project",
+        runAt: dueAt,
+        instructionJson: { instructions: "Require reviewer correction after a permanent adapter mismatch" },
+        executionMode: "read_only_audit",
+        policySnapshotJson: { workspaceAccess: "read_only" },
+        maxRuntimeMs: 60_000,
+      });
+      let permanentDispatchCalls = 0;
+      let permanentConfigurationFixed = false;
+      const permanentRuntime = createScheduledJobRuntime({
+        database: retryDb,
+        jobs: retryJobs,
+        dispatchOutbox: retryOutbox,
+        pollMs: 60_000,
+        dispatch: async () => {
+          permanentDispatchCalls += 1;
+          if (permanentConfigurationFixed) return { status: "dispatched", workSessionId: "corrected-work-session" };
+          return {
+            status: "blocked",
+            blockerKind: "permanent_configuration",
+            lastAttemptedAgent: "unsupported-agent",
+            reason: "configured agent does not support the required protocol",
+          };
+        },
+      });
+      await permanentRuntime.drainOnce();
+      const blockedPermanently = retryJobs.get(permanentJob.id)!;
+      assert.equal(blockedPermanently.status, "blocked");
+      assert.equal(blockedPermanently.dispatchRetryCount, 0, "permanent configuration failures do not enter automatic retry");
+      await permanentRuntime.drainOnce();
+      assert.equal(permanentDispatchCalls, 1);
+      retryJobs.retryBlockedJob({ jobId: permanentJob.id, expectedRevision: blockedPermanently.revision });
+      permanentConfigurationFixed = true;
+      await permanentRuntime.drainOnce();
+      assert.equal(permanentDispatchCalls, 2, "reviewer retry adds one deliberate dispatch after correcting configuration");
+      assert.equal(retryJobs.get(permanentJob.id)?.status, "running",
+        "the job dispatches after the reviewer corrects its permanent configuration blocker");
+      permanentRuntime.stop();
+    } finally {
+      retryJobs.close();
+      retryOutbox.close();
+      await rm(retryRoot, { recursive: true, force: true });
     }
   }
 
