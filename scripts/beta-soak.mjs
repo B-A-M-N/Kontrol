@@ -439,8 +439,14 @@ async function checkSseStreaming() {
     ...(process.env.KONTROL_MCP_CANARY_AUTHORIZATION
       ? { KONTROL_MCP_CANARY_AUTHORIZATION: process.env.KONTROL_MCP_CANARY_AUTHORIZATION }
       : {}),
-    ...((process.env.KONTROL_MCP_TUNNEL_REVIEWER ?? process.env.KONTROL_TUNNEL_REVIEWER_SECRET)
-      ? { KONTROL_MCP_TUNNEL_REVIEWER: process.env.KONTROL_MCP_TUNNEL_REVIEWER ?? process.env.KONTROL_TUNNEL_REVIEWER_SECRET }
+    ...((process.env.KONTROL_MCP_TUNNEL_REVIEWER
+      || process.env.KONTROL_TUNNEL_REVIEWER_SECRET
+      || process.env.KONTROL_ACP_REVIEWER_SECRET)
+      ? {
+        KONTROL_MCP_TUNNEL_REVIEWER: process.env.KONTROL_MCP_TUNNEL_REVIEWER
+          || process.env.KONTROL_TUNNEL_REVIEWER_SECRET
+          || process.env.KONTROL_ACP_REVIEWER_SECRET,
+      }
       : {}),
     ...(process.env.KONTROL_MCP_SSE_HEARTBEAT_MS
       ? { KONTROL_MCP_SSE_HEARTBEAT_MS: process.env.KONTROL_MCP_SSE_HEARTBEAT_MS }
