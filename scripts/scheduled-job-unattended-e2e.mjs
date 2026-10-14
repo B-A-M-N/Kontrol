@@ -37,10 +37,24 @@ const artifactContents = JSON.stringify({ auditStatus: "clean", checkedPaths: 3 
 const reviewerToken = "unattended-e2e-reviewer-token-long";
 const agentSecret = "unattended-e2e-agent-secret-long";
 const adapterSecret = "unattended-e2e-adapter-secret-long";
-const PORT = 7796;
-const AGENT_PORT = 7797;
+async function findFreeLoopbackPort(excludedPorts = new Set()) {
+  for (;;) {
+    const probe = createHttpServer();
+    await new Promise((resolveListen, reject) => {
+      probe.once("error", reject);
+      probe.listen(0, "127.0.0.1", resolveListen);
+    });
+    const address = probe.address();
+    if (!address || typeof address === "string") throw new Error("Could not allocate a loopback fixture port.");
+    await new Promise((resolveClose, reject) => probe.close((error) => error ? reject(error) : resolveClose()));
+    if (!excludedPorts.has(address.port)) return address.port;
+  }
+}
+const PORT = await findFreeLoopbackPort();
+const AGENT_PORT = await findFreeLoopbackPort(new Set([PORT]));
 let agentRuns = 0;
 let server;
+const serverOutput = new WeakMap();
 
 writeFileSync(join(root, "tracked.txt"), "baseline\n");
 writeFileSync(envFile, [
@@ -132,6 +146,7 @@ async function startServer() {
     cwd: repoRoot, env: serverEnv, stdio: ["ignore", "pipe", "pipe"],
   });
   let output = "";
+  serverOutput.set(child, () => output.slice(-4_000));
   child.stdout.on("data", (c) => { output += String(c); });
   child.stderr.on("data", (c) => { output += String(c); });
   child.once("exit", (code) => {
@@ -149,7 +164,9 @@ async function waitForHealth(timeoutMs = 20000) {
     } catch { /* retry */ }
     await delay(150);
   }
-  throw new Error("server health timeout");
+  const exit = server?.exitCode;
+  const output = server && serverOutput.get(server)?.();
+  throw new Error(`server health timeout${exit === null || exit === undefined ? "" : ` (exit=${exit})`}${output ? `\n${output}` : ""}`);
 }
 
 async function registerAgent() {
