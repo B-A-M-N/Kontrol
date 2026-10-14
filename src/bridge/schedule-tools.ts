@@ -171,8 +171,12 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
             startedAt: z.string().optional(),
             executionTerminalAt: z.string().optional(),
             terminalAt: z.string().optional(),
+            blockedAt: z.string().optional(),
+            operatorInterventionAt: z.string().optional(),
+            lastStateChangedAt: z.string().optional(),
             scheduledJobStatus: z.string(),
             executionStatus: z.string(),
+            reportAvailability: z.enum(["available", "pending_finalization", "no_output", "unavailable"]),
             dispatchStatus: z.string().optional(),
             dispatchRetryCount: z.number().int().nonnegative(),
             dispatchNextEligibleAt: z.string().optional(),
@@ -255,18 +259,6 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
       const run = job.workSessionId ? config.agentRegistry.getRunByWorkSessionId(job.workSessionId) : undefined;
       const attempt = jobs.getAttempt(job.id);
       const session = job.workSessionId ? config.workSessions.get(job.workSessionId) : undefined;
-      let outputPreview: string | undefined;
-      let liveOutput = "";
-      if (run?.outputJson) {
-        try {
-          const parsed = JSON.parse(run.outputJson) as { output?: Array<{ parts?: Array<{ content?: string }> }> };
-          liveOutput = parsed.output?.flatMap((message) => message.parts?.map((part) => part.content ?? "") ?? []).join("\n") ?? "";
-          outputPreview = liveOutput.slice(0, 2_000) || undefined;
-        } catch {
-          outputPreview = undefined;
-          liveOutput = "";
-        }
-      }
       let reportArtifact;
       if (requestedReportSha256) {
         reportArtifact = jobs.getReport(job.id, requestedReportSha256);
@@ -277,6 +269,7 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
         reportArtifact = jobs.getReportForAttempt(job.id, attempt.acpRunId, attempt.acpAttemptNumber);
       }
       const reportText = reportArtifact?.reportText ?? "";
+      const outputPreview = reportText.slice(0, 2_000) || undefined;
       const resultReceipt = name === "get_scheduled_job_result" ? (() => {
         const latest = session?.latestSubmission;
         const snapshotKind = latest?.snapshotKind;
@@ -308,6 +301,14 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
         const finalization = attempt?.acpRunId && attempt.acpAttemptNumber
           ? jobs.getReportFinalization(job.id, attempt.acpRunId, attempt.acpAttemptNumber)
           : undefined;
+        const reportAvailability = reportArtifact
+          ? "available"
+          : finalization?.status === "pending" ? "pending_finalization"
+            : finalization?.status === "no_output" ? "no_output"
+              : !finalization && attempt
+                && (attempt.transportStatus === "accepted" || attempt.transportStatus === "uncertain" || attempt.executionActiveSince)
+                  ? "pending_finalization"
+                  : "unavailable";
         const reviewStatus = !session ? "not_started"
           : session.status === "approved" ? "approved"
             : session.status === "rejected" ? "rejected"
@@ -367,11 +368,13 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
             dispatchStatus: attempt?.transportStatus,
             dispatchRetryCount: job.dispatchRetryCount,
             dispatchNextEligibleAt: job.dispatchNextEligibleAt,
-            terminalAt: ["completed", "failed", "cancelled", "blocked", "operator_intervention"].includes(job.status)
-              ? job.updatedAt
-              : undefined,
+            terminalAt: ["completed", "failed", "cancelled"].includes(job.status) ? job.terminalAt : undefined,
+            blockedAt: job.blockedAt,
+            operatorInterventionAt: job.operatorInterventionAt,
+            lastStateChangedAt: job.lastStateChangedAt,
             scheduledJobStatus: job.status,
             executionStatus,
+            reportAvailability,
             workerExecutionOutcome: attempt?.workerExecutionOutcome,
             workerExecutionAt: attempt?.workerExecutionAt,
             reviewStatus,

@@ -108,6 +108,16 @@ try {
     assert.equal(runningRetry.owner, false);
     assert.equal(runningRetry.execution.id, durableVerification.execution.id,
       "concurrent idempotent claims return the same durable running record");
+    const distinctRunningRequest = reportRestartJobs.claimVerificationExecution({
+      ...durableVerificationInput,
+      requestKey: "mutation:verification-distinct-active-request",
+      requestFingerprint: "1".repeat(64),
+      clientMutationId: "verification-distinct-active-request",
+      executionIdentity: "verification:distinct-active-request",
+    });
+    assert.equal(distinctRunningRequest.owner, false);
+    assert.equal(distinctRunningRequest.execution.id, durableVerification.execution.id,
+      "different reviewer request IDs join the active execution for the same snapshot and verification policy");
     assert.throws(
       () => reportRestartJobs!.claimVerificationExecution({
         ...durableVerificationInput,
@@ -121,6 +131,20 @@ try {
     const completedVerification = reportRestartJobs.completeVerificationExecution({
       executionId: durableVerification.execution.id,
       reportText: verificationReportText,
+    });
+    const sequentialFreshVerification = reportRestartJobs.claimVerificationExecution({
+      ...durableVerificationInput,
+      requestKey: "mutation:verification-sequential-fresh",
+      requestFingerprint: "2".repeat(64),
+      clientMutationId: "verification-sequential-fresh",
+      executionIdentity: "verification:sequential-fresh",
+    });
+    assert.equal(sequentialFreshVerification.owner, true,
+      "a distinct request can start a fresh equivalent verification after the prior execution completes");
+    assert.notEqual(sequentialFreshVerification.execution.id, completedVerification.id);
+    reportRestartJobs.completeVerificationExecution({
+      executionId: sequentialFreshVerification.execution.id,
+      reportText: "second sequential verification report",
     });
     const staleVerificationInput = {
       ...durableVerificationInput,
@@ -279,6 +303,12 @@ try {
           : undefined },
     agentRegistry: { getRunByWorkSessionId: (id: string) => id === session.id
       ? run
+      : id === "work-session-finalization" ? {
+          runId: "run-finalization",
+          status: "completed",
+          agentName: "codex",
+          outputJson: JSON.stringify({ output: [{ parts: [{ content: "stale first-attempt report must not be reused" }] }] }),
+        }
       : id === "work-session-unpersisted" ? {
           runId: "run-unpersisted",
           status: "completed",
@@ -524,10 +554,60 @@ try {
     "terminal report persistence is retried by the scheduler without a result read");
   assert.equal(jobs.getReportFinalization(finalizationJob.id, "run-finalization", 1)?.status, "completed");
   assert.equal(jobs.getReportForAttempt(finalizationJob.id, "run-finalization", 1)?.reportText, "durable output awaiting artifact recovery");
+  const firstAttemptState = jobs.get(finalizationJob.id)!;
+  const nextAttemptDue = jobs.transition({
+    jobId: finalizationJob.id,
+    expectedRevision: firstAttemptState.revision,
+    nextStatus: "due",
+    expectedSourceStatuses: ["running"],
+  });
+  const secondFinalizationClaim = jobs.claimDispatch({
+    jobId: finalizationJob.id,
+    expectedRevision: nextAttemptDue.revision,
+    dispatcherInstanceId: "test-scheduler",
+  });
+  jobs.completeDispatch({
+    jobId: finalizationJob.id,
+    dispatchAttemptId: secondFinalizationClaim.attemptId,
+    expectedRevision: secondFinalizationClaim.revision,
+    dispatcherInstanceId: "test-scheduler",
+    outcome: "dispatched",
+    workSessionId: "work-session-finalization",
+    acpRunId: "run-finalization",
+    acpDispatchId: secondFinalizationClaim.dispatchId,
+    acpAttemptNumber: 2,
+  });
+  jobs.projectEvent({
+    id: "finalization-second-attempt-no-output",
+    seq: 2,
+    durable: true,
+    type: "worker.turn.completed",
+    sessionId: "work-session-finalization",
+    payload: {
+      runId: "run-finalization",
+      dispatchId: secondFinalizationClaim.dispatchId,
+      attemptNumber: 2,
+      report_availability: "no_output",
+    },
+    createdAt: new Date(Date.parse(lifecycleBase) + 4).toISOString(),
+  });
+  assert.equal(jobs.getReportForAttempt(finalizationJob.id, "run-finalization", 1)?.reportText,
+    "durable output awaiting artifact recovery", "the first attempt's immutable output remains available");
+  assert.equal(jobs.getReportFinalization(finalizationJob.id, "run-finalization", 2)?.status, "no_output");
+  assert.equal(jobs.getReportForAttempt(finalizationJob.id, "run-finalization", 2), undefined,
+    "an attempt without authoritative text has no report artifact");
+  const missingAttemptReport = await resultTool({ scheduledJobId: finalizationJob.id });
+  assert.equal(missingAttemptReport.structuredContent.resultReceipt.reportAvailability, "no_output");
+  assert.equal(missingAttemptReport.structuredContent.report, "");
+  assert.equal(missingAttemptReport.structuredContent.outputPreview, undefined,
+    "the previous attempt's outputJson cannot masquerade as the new attempt's audit report");
 
   const firstPage = await resultTool({ scheduledJobId: created.id, reportLimit: 100 });
   assert.equal(firstPage.structuredContent.resultReceipt.executionStatus, "completed",
     "a finished worker turn is reported as execution completion");
+  assert.equal(firstPage.structuredContent.resultReceipt.reportAvailability, "available");
+  assert.equal(firstPage.structuredContent.outputPreview, largeReport.slice(0, 2_000),
+    "the result preview comes from the persisted attempt report");
   assert.equal(firstPage.structuredContent.resultReceipt.executionTerminalAt, new Date(Date.parse(lifecycleBase) + 2).toISOString());
   assert.equal(firstPage.structuredContent.resultReceipt.workerExecutionOutcome, "completed");
   assert.equal(firstPage.structuredContent.resultReceipt.workerCompleted, true);
@@ -564,6 +644,74 @@ try {
   assert.equal(Buffer.byteLength(emojiPage.page, "utf8"), 48_000,
     "report pages obey the structured result UTF-8 byte cap");
   assert.equal(emojiPage.nextOffset, 12_001);
+
+  const stateTimeJob = jobs.create({
+    principalId: "principal-a",
+    ownerContextId: "principal:principal-a|transport:A",
+    projectId: "project-a",
+    workspaceRoot: "/tmp/project-a",
+    runAt: new Date(Date.now() - 1_000).toISOString(),
+    instructionJson: { instructions: "Track recoverable and terminal state times." },
+    executionMode: "read_only_audit",
+    policySnapshotJson: { workspaceAccess: "read_only", mutate: false },
+    maxRuntimeMs: 60_000,
+  });
+  const stateTimeDue = jobs.transition({ jobId: stateTimeJob.id, expectedRevision: stateTimeJob.revision, nextStatus: "due", expectedSourceStatuses: ["pending"] });
+  const blockedClaim = jobs.claimDispatch({ jobId: stateTimeJob.id, expectedRevision: stateTimeDue.revision, dispatcherInstanceId: "test-scheduler" });
+  const blockedJob = jobs.releaseDispatch({
+    jobId: stateTimeJob.id,
+    dispatchAttemptId: blockedClaim.attemptId,
+    expectedRevision: blockedClaim.revision,
+    dispatcherInstanceId: "test-scheduler",
+    blocker: { kind: "permanent_configuration", reason: "test blocker" },
+  });
+  assert.ok(blockedJob.blockedAt);
+  assert.equal(blockedJob.terminalAt, undefined, "recoverable blocked state does not set terminalAt");
+  const retriedJob = jobs.retryBlockedJob({ jobId: blockedJob.id, expectedRevision: blockedJob.revision });
+  assert.equal(retriedJob.status, "due");
+  assert.ok(retriedJob.blockedAt, "the blocked timestamp remains visible after a reviewer retry");
+  assert.equal(retriedJob.terminalAt, undefined);
+  const runningClaim = jobs.claimDispatch({ jobId: retriedJob.id, expectedRevision: retriedJob.revision, dispatcherInstanceId: "test-scheduler" });
+  const runningJob = jobs.completeDispatch({
+    jobId: retriedJob.id,
+    dispatchAttemptId: runningClaim.attemptId,
+    expectedRevision: runningClaim.revision,
+    dispatcherInstanceId: "test-scheduler",
+    outcome: "dispatched",
+  });
+  assert.equal(runningJob.status, "running");
+  assert.equal(runningJob.terminalAt, undefined);
+  const awaitingApprovalJob = jobs.transition({ jobId: runningJob.id, expectedRevision: runningJob.revision, nextStatus: "awaiting_approval", expectedSourceStatuses: ["running"] });
+  assert.equal(awaitingApprovalJob.terminalAt, undefined);
+  assert.ok(awaitingApprovalJob.lastStateChangedAt);
+  const completedStateTimeJob = jobs.transition({ jobId: awaitingApprovalJob.id, expectedRevision: awaitingApprovalJob.revision, nextStatus: "completed", expectedSourceStatuses: ["awaiting_approval"] });
+  assert.ok(completedStateTimeJob.terminalAt);
+  assert.equal(completedStateTimeJob.terminalAt, completedStateTimeJob.lastStateChangedAt,
+    "only the definitive completed transition establishes terminalAt");
+
+  const stateOperatorJob = jobs.create({
+    principalId: "principal-a",
+    ownerContextId: "principal:principal-a|transport:A",
+    projectId: "project-a",
+    workspaceRoot: "/tmp/project-a",
+    runAt: new Date(Date.now() - 1_000).toISOString(),
+    instructionJson: { instructions: "Track operator intervention time." },
+    executionMode: "read_only_audit",
+    policySnapshotJson: { workspaceAccess: "read_only", mutate: false },
+    maxRuntimeMs: 60_000,
+  });
+  const operatorDue = jobs.transition({ jobId: stateOperatorJob.id, expectedRevision: stateOperatorJob.revision, nextStatus: "due", expectedSourceStatuses: ["pending"] });
+  const stateOperatorClaim = jobs.claimDispatch({ jobId: stateOperatorJob.id, expectedRevision: operatorDue.revision, dispatcherInstanceId: "test-scheduler" });
+  const operatorInterventionJob = jobs.resolveDispatch({
+    jobId: stateOperatorJob.id,
+    dispatchAttemptId: stateOperatorClaim.attemptId,
+    expectedRevision: stateOperatorClaim.revision,
+    resolution: "operator_intervention",
+    lastError: "manual reconciliation needed",
+  });
+  assert.ok(operatorInterventionJob.operatorInterventionAt);
+  assert.equal(operatorInterventionJob.terminalAt, undefined,
+    "operator intervention remains recoverable and does not set terminalAt");
 
   const fingerprints = scheduledVerificationFingerprints({ policySnapshotJson: created.policySnapshotJson, serverConfig: config.serverConfig });
   const verificationIdentity = {
@@ -610,6 +758,10 @@ try {
   const identicalVerificationRetry = claimVerification("verify-pass", "verification:retry");
   assert.equal(identicalVerificationRetry.owner, false, "an identical idempotency retry reuses the running execution claim");
   assert.equal(identicalVerificationRetry.execution.id, runningVerification.execution.id);
+  const distinctActiveVerificationRequest = claimVerification("verify-distinct-active", "verification:distinct-active");
+  assert.equal(distinctActiveVerificationRequest.owner, false,
+    "a distinct reviewer request cannot launch a concurrent equivalent verification suite");
+  assert.equal(distinctActiveVerificationRequest.execution.id, runningVerification.execution.id);
   const runningReceipt = await resultTool({ scheduledJobId: created.id });
   assert.equal(runningReceipt.structuredContent.resultReceipt.verificationStatus, "inconclusive",
     "an active verification is visible as unresolved instead of falling back to an older pass");
@@ -620,6 +772,13 @@ try {
   assert.equal(repeatedCompletedClaim.owner, false);
   assert.equal(repeatedCompletedClaim.execution.executionIdentity, passingVerification.executionIdentity,
     "a lost-response retry returns the existing completed report instead of executing commands again");
+  const sequentialFreshVerification = claimVerification("verify-pass-sequential", "verification:sequential-fresh");
+  assert.equal(sequentialFreshVerification.owner, true,
+    "a fresh request is allowed after the previous equivalent verification completes");
+  jobs.completeVerificationExecution({
+    executionId: sequentialFreshVerification.execution.id,
+    reportText: verificationReportText("passed"),
+  });
   assert.throws(() => claimVerification("verify-pass", "verification:conflict", "0".repeat(64)), /different submission or verification content/,
     "a reused idempotency key cannot bind different verification content");
   const passedScheduledReceipt = await resultTool({ scheduledJobId: created.id });
@@ -718,8 +877,10 @@ try {
     createdAt: "2026-10-12T12:01:00.000Z",
   });
   const terminal = await resultTool({ scheduledJobId: created.id, reportSha256: firstPage.structuredContent.reportSha256, reportOffset: 501, reportLimit: 200 });
-  assert.equal(terminal.structuredContent.resultReceipt.terminalAt, jobs.get(created.id)?.updatedAt,
-    "the job terminal timestamp is recorded when lifecycle projection completes");
+  assert.equal(terminal.structuredContent.resultReceipt.terminalAt, jobs.get(created.id)?.terminalAt,
+    "the job terminal timestamp is the persisted definitive terminal transition time");
+  assert.ok(terminal.structuredContent.resultReceipt.terminalAt);
+  assert.equal(terminal.structuredContent.resultReceipt.blockedAt, undefined);
 
   const activeCancelJob = jobs.create({
     principalId: "principal-a",

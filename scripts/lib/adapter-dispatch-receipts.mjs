@@ -62,6 +62,7 @@ export async function reconcileAdapterDispatchReceipts(path, receipts, ownedReco
   const outcomes = [];
   for (const receipt of receipts.values()) {
     if (receipt.launchGateVersion !== 1 || isTerminalAdapterDispatchStatus(receipt.status)) continue;
+    if (receipt.deliveryState === "spool_failed" && receipt.terminalEvent) continue;
     if (!["dispatching", "running"].includes(receipt.status)) continue;
     const owner = owners.get(receipt.key);
     const authoritativelyUnstarted = receipt.status === "dispatching"
@@ -108,6 +109,7 @@ export async function acknowledgeAdapterDispatchReceipt(path, receipts, input) {
       || prior.remoteRunId !== input.remoteRunId
       || prior.attemptNumber !== input.attemptNumber
       || !TERMINAL_STATUSES.has(prior.status)
+      || (prior.terminalEventId && prior.terminalEventId !== input.eventId)
       || typeof input.eventId !== "string"
       || input.eventId.length === 0) return false;
     await writeReceipt(path, receipts, prior.key, prior.remoteRunId, prior.status, {

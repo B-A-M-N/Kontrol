@@ -111,6 +111,139 @@ assert.equal(background.running, true);
 assert.ok(background.sessionId);
 assert.equal(typeof background.sessionId, "string");
 
+// An authenticated owner can reattach through a fresh transport using the
+// bounded output-only capability returned by the original launch.
+const recoveryManager = new ProcessSessionManager({
+  maxRunningProcesses: 4,
+  maxRunningProcessesPerOwner: 4,
+  idleTimeoutMs: 10_000,
+  maxRuntimeMs: 10_000,
+  reaperIntervalMs: 25,
+});
+try {
+  const recoverable = await recoveryManager.start({
+    workspaceId: "workspace-recovery",
+    ownerId: "transport-A",
+    principalId: "principal-A",
+    cwd: process.cwd(),
+    command: `${node} -e "console.log('recovered output'); process.stdin.once('data', () => process.exit(0))"`,
+    yieldTimeMs: 30,
+  });
+  assert.equal(recoverable.running, true);
+  assert.ok(recoverable.sessionId);
+  assert.ok(recoverable.recoveryCapability);
+  assert.ok(recoverable.recoveryCapability.length >= 40);
+
+  let recoveredOutput = "";
+  const firstPollDeadline = Date.now() + 2_000;
+  while (Date.now() < firstPollDeadline && !/recovered output/.test(recoveredOutput)) {
+    const reattached = await recoveryManager.write({
+      workspaceId: "workspace-recovery",
+      sessionId: recoverable.sessionId!,
+      ownerId: "transport-B",
+      principalId: "principal-A",
+      recoveryCapability: recoverable.recoveryCapability,
+      afterCursor: 0,
+      yieldTimeMs: 20,
+    });
+    recoveredOutput = reattached.output;
+    if (!/recovered output/.test(recoveredOutput)) await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.match(recoveredOutput, /recovered output/,
+    "the same authenticated principal reads output after the transport owner changes");
+  await recoveryManager.terminateByOwner("transport-A");
+  assert.equal(recoveryManager.getMetrics().running, 1,
+    "transport teardown preserves a process while its output-recovery capability is live");
+  const reattachedAfterDisconnect = await recoveryManager.write({
+    workspaceId: "workspace-recovery",
+    sessionId: recoverable.sessionId!,
+    ownerId: "transport-B",
+    principalId: "principal-A",
+    recoveryCapability: recoverable.recoveryCapability,
+    afterCursor: 0,
+    yieldTimeMs: 1,
+  });
+  assert.match(reattachedAfterDisconnect.output, /recovered output/);
+
+  await assert.rejects(recoveryManager.write({
+    workspaceId: "workspace-recovery",
+    sessionId: recoverable.sessionId!,
+    principalId: "principal-B",
+    recoveryCapability: recoverable.recoveryCapability,
+    afterCursor: 0,
+    yieldTimeMs: 1,
+  }), /another principal/);
+  await assert.rejects(recoveryManager.write({
+    workspaceId: "workspace-other",
+    sessionId: recoverable.sessionId!,
+    principalId: "principal-A",
+    recoveryCapability: recoverable.recoveryCapability,
+    afterCursor: 0,
+    yieldTimeMs: 1,
+  }), /another workspace/);
+  await assert.rejects(recoveryManager.write({
+    workspaceId: "workspace-recovery",
+    sessionId: "proc_wrong_process",
+    principalId: "principal-A",
+    recoveryCapability: recoverable.recoveryCapability,
+    afterCursor: 0,
+    yieldTimeMs: 1,
+  }), /another process/);
+  await assert.rejects(recoveryManager.write({
+    workspaceId: "workspace-recovery",
+    sessionId: recoverable.sessionId!,
+    recoveryCapability: recoverable.recoveryCapability,
+    afterCursor: 0,
+    yieldTimeMs: 1,
+  }), /authenticated principal/);
+  await assert.rejects(recoveryManager.write({
+    workspaceId: "workspace-recovery",
+    sessionId: recoverable.sessionId!,
+    principalId: "principal-A",
+    recoveryCapability: recoverable.recoveryCapability,
+    chars: "must not reach stdin\n",
+    yieldTimeMs: 1,
+  }), /output polling only/);
+
+  const record = [...(recoveryManager as any).recoveryCapabilities.values()][0];
+  record.expiresAt = Date.now() - 1;
+  await assert.rejects(recoveryManager.write({
+    workspaceId: "workspace-recovery",
+    sessionId: recoverable.sessionId!,
+    principalId: "principal-A",
+    recoveryCapability: recoverable.recoveryCapability,
+    afterCursor: 0,
+    yieldTimeMs: 1,
+  }), /invalid, expired, or revoked/);
+
+  const revocable = await recoveryManager.start({
+    workspaceId: "workspace-recovery",
+    ownerId: "transport-A",
+    principalId: "principal-A",
+    cwd: process.cwd(),
+    command: `${node} -e "process.stdin.once('data', () => process.exit(0))"`,
+    yieldTimeMs: 5,
+  });
+  assert.ok(revocable.recoveryCapability);
+  assert.equal(recoveryManager.revokeRecoveryCapability(revocable.recoveryCapability!, "principal-A"), true);
+  await assert.rejects(recoveryManager.write({
+    workspaceId: "workspace-recovery",
+    sessionId: revocable.sessionId!,
+    ownerId: "transport-B",
+    principalId: "principal-A",
+    recoveryCapability: revocable.recoveryCapability,
+    afterCursor: 0,
+    yieldTimeMs: 1,
+  }), /invalid, expired, or revoked/);
+
+  await recoveryManager.terminateByOwner("transport-A");
+  assert.equal(recoveryManager.getMetrics().running, 0,
+    "expired and explicitly revoked capabilities no longer protect sessions from owner cleanup");
+  recoveryManager.terminate("workspace-recovery", revocable.sessionId!, "transport-A");
+} finally {
+  await recoveryManager.shutdown();
+}
+
 await assert.rejects(
   manager.write({
     workspaceId: "workspace-b",

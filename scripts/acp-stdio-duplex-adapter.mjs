@@ -20,7 +20,8 @@ import { pathToFileURL } from "node:url";
 import { clearAgentIdentity, identityHeaders, loadAgentIdentity, saveAgentIdentity } from "./lib/acp-agent-identity.mjs";
 import { readJsonBody } from "./lib/adapter-http.mjs";
 import { adapterStatePath, atomicWriteJson, prepareOwnedChild, processStartToken, reconcileOwnedProcesses, terminateProcessGroup } from "./lib/managed-agent-process.mjs";
-import { adapterDispatchFingerprint, findAdapterDispatchReceipt, isTerminalAdapterDispatchStatus, loadAdapterDispatchReceipts, reconcileAdapterDispatchReceipts, recordAdapterDispatchReceipt } from "./lib/adapter-dispatch-receipts.mjs";
+import { acknowledgeAdapterDispatchReceipt, adapterDispatchFingerprint, findAdapterDispatchReceipt, isTerminalAdapterDispatchStatus, loadAdapterDispatchReceipts, reconcileAdapterDispatchReceipts, recordAdapterDispatchReceipt } from "./lib/adapter-dispatch-receipts.mjs";
+import { createAdapterEventSpool } from "./lib/adapter-event-spool.mjs";
 import { workspaceLeaseDeadline } from "./lib/workspace-lease.mjs";
 const readOnlyModuleUrl = process.env.KONTROL_ARTIFACT_PATH
   ? pathToFileURL(resolve(process.env.KONTROL_ARTIFACT_PATH, "read-only-execution.mjs"))
@@ -46,6 +47,8 @@ const AGENT_ARGS = parseJsonArray(process.env.ACP_STDIO_ARGS_JSON) ?? [];
 const DISPATCH_METHOD = process.env.ACP_STDIO_DISPATCH_METHOD;
 const DISPATCH_RECEIPTS_PATH = process.env.KONTROL_STDIO_DISPATCH_RECEIPTS || adapterStatePath("stdio-duplex", "dispatch-receipts.json");
 const OWNED_PROCESSES_PATH = process.env.KONTROL_STDIO_OWNED_PROCESSES || adapterStatePath("stdio-duplex", "owned-processes.json");
+const TERMINAL_SPOOL_PATH = process.env.KONTROL_STDIO_TERMINAL_SPOOL || adapterStatePath("stdio-duplex", "terminal-spool.json");
+const EVENT_SPOOL_PATH = process.env.KONTROL_STDIO_EVENT_SPOOL || adapterStatePath("stdio-duplex", "event-spool.json");
 const dispatchReceipts = await loadAdapterDispatchReceipts(DISPATCH_RECEIPTS_PATH);
 
 const VALIDATE_IMPORTS = process.argv.includes("--validate-imports");
@@ -71,13 +74,40 @@ if (!AGENT_COMMAND) {
 const active = new Map();
 const ownedProcesses = new Map();
 let agentIdentity = null;
+const eventSpool = createAdapterEventSpool({
+  eventPath: EVENT_SPOOL_PATH,
+  terminalPath: TERMINAL_SPOOL_PATH,
+  deliver: async (runId, event) => fetch(`${KONTROL_ACP_URL}/runs/${runId}/events`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", authorization: `Bearer ${AGENT_SECRET}`, ...identityHeaders(agentIdentity) },
+    body: JSON.stringify(event),
+  }),
+  acknowledgeTerminal: acknowledgeTerminalDispatchReceipt,
+});
+await eventSpool.load();
 
 const reconciliation = await reconcileOwnedProcesses(OWNED_PROCESSES_PATH, "stdio-duplex");
-await reconcileAdapterDispatchReceipts(DISPATCH_RECEIPTS_PATH, dispatchReceipts, reconciliation.records);
+for (const entry of eventSpool.pendingTerminalEntries()) {
+  const event = entry.event;
+  const status = event.type === "completed" || event.type === "cancelled" ? event.type : "failed";
+  if (event.dispatch_idempotency_key && event.remote_run_id && event.attempt_number) {
+    await recordAdapterDispatchReceipt(DISPATCH_RECEIPTS_PATH, dispatchReceipts, event.dispatch_idempotency_key, event.remote_run_id, status, {
+      attemptNumber: event.attempt_number,
+      terminalEventId: event.event_id,
+      deliveryState: "pending_controller_acknowledgement",
+    });
+  }
+}
+const pendingTerminalDispatchKeys = new Set(eventSpool.pendingTerminalEntries()
+  .map((entry) => entry.event.dispatch_idempotency_key)
+  .filter((key) => typeof key === "string"));
 const recoveredRuns = reconciliation.records.filter((record) => record?.dispatchIdempotencyKey && record?.kontrolRunId
-  && findAdapterDispatchReceipt(dispatchReceipts, record.dispatchIdempotencyKey)?.status !== "unstarted");
+  && !pendingTerminalDispatchKeys.has(record.dispatchIdempotencyKey)
+  && !isTerminalAdapterDispatchStatus(findAdapterDispatchReceipt(dispatchReceipts, record.dispatchIdempotencyKey)?.status));
+await reconcileAdapterDispatchReceipts(DISPATCH_RECEIPTS_PATH, dispatchReceipts, reconciliation.records);
 for (const record of recoveredRuns) {
   const receipt = findAdapterDispatchReceipt(dispatchReceipts, record.dispatchIdempotencyKey);
+  if (receipt?.deliveryState === "spool_failed" && receipt.terminalEvent) continue;
   if (!isTerminalAdapterDispatchStatus(receipt?.status)) {
     await recordAdapterDispatchReceipt(DISPATCH_RECEIPTS_PATH, dispatchReceipts, record.dispatchIdempotencyKey, record.remoteRunId, "failed", {
       requestFingerprint: receipt?.requestFingerprint ?? record.requestFingerprint,
@@ -90,7 +120,9 @@ for (const record of recoveredRuns) {
   }
 }
 await registerAgentWithRetry();
+await eventSpool.flush();
 for (const record of recoveredRuns) await reportRecoveredRun(record);
+setInterval(() => eventSpool.flush().catch((err) => console.warn("[stdio-duplex] event spool flush failed:", err.message)), 10_000).unref?.();
 setInterval(() => heartbeat().catch((err) => console.warn("[stdio-duplex] heartbeat:", err.message)), 55_000);
 
 createServer((req, res) => {
@@ -279,12 +311,16 @@ async function handle(req, res) {
     readOnlyAudit: readOnlyAuthorization.readOnly,
     readOnlyExecutionGrant: readOnlyAuthorization.grant,
     task,
+    eventSequence: 0,
+    sendChain: Promise.resolve(),
     launchState: "dispatching",
     child: null,
     conn: null,
     finalized: false,
     authoritativeCompletion: false,
+    finalOutput: undefined,
   };
+  run.eventSequence = eventSpool.nextSequence(run.remoteRunId) - 1;
   if (run.workSessionId && [...active.values()].some((item) => item.workSessionId === run.workSessionId)) {
     const existing = [...active.values()].find((item) => item.workSessionId === run.workSessionId);
     return writeJson(res, 409, {
@@ -373,19 +409,25 @@ async function handle(req, res) {
     run.conn = createAcpDuplex(stream, createKontrolHttpHandler(run));
     run.child.stderr.setEncoding("utf8");
     run.child.stderr.on("data", (chunk) => reportStructured(run, "output_delta", { channel: "stderr", text: String(chunk) }));
-    const onChildExit = (code, signal) => {
+    const onChildExit = async (code, signal) => {
       clearInterval(heartbeatTimer);
       active.delete(run.remoteRunId);
-      ownedProcesses.delete(run.remoteRunId);
-      void atomicWriteJson(OWNED_PROCESSES_PATH, [...ownedProcesses.values()]).catch((err) => console.error("[stdio-duplex] ownership cleanup failed:", err));
-      if (run.finalized) return;
+      if (run.finalized) {
+        const terminalDelivery = run.terminalDeliveryPromise ?? run.sendChain;
+        const delivered = await terminalDelivery.catch(() => false);
+        await finalizeOwnedProcessAfterTerminal(run, run.terminalEvent, delivered);
+        return;
+      }
       run.finalized = true;
       const terminalStatus = code === 0 && run.authoritativeCompletion ? "completed" : "failed";
-      if (run.dispatchIdempotencyKey) void recordAdapterDispatchReceipt(DISPATCH_RECEIPTS_PATH, dispatchReceipts, run.dispatchIdempotencyKey, run.remoteRunId, terminalStatus).catch((err) => console.error("[stdio-duplex] receipt finalization failed:", err));
-      if (terminalStatus === "completed") reportEvent(run, "completed");
-      else reportEvent(run, "failed", code === 0
+      const errorMessage = terminalStatus === "completed" ? undefined : code === 0
         ? "protocol_incomplete: ACP turn ended without an authoritative result"
-        : signal ? `terminated by ${signal}` : `exit code ${code}`);
+        : signal ? `terminated by ${signal}` : `exit code ${code}`;
+      run.terminalDeliveryPromise = reportEvent(run, terminalStatus, errorMessage, {
+        onEventCreated: (event) => { run.terminalEvent = event; },
+      });
+      const delivered = await run.terminalDeliveryPromise;
+      await finalizeOwnedProcessAfterTerminal(run, run.terminalEvent, delivered);
     };
     run.child.on("exit", (code, signal) => {
       if (!run.acceptancePersisted) {
@@ -447,17 +489,18 @@ async function handle(req, res) {
     run.acceptancePersisted = true;
     run.launchState = "running";
     reportEvent(run, "started");
-    if (run.pendingExit) onChildExit(...run.pendingExit);
+    if (run.pendingExit) void onChildExit(...run.pendingExit);
 
     if (!run.finalized) void dispatchTurn(run).catch((err) => {
       if (run.finalized) return;
       run.finalized = true;
       active.delete(run.remoteRunId);
       clearInterval(heartbeatTimer);
-      if (run.dispatchIdempotencyKey) {
-        void recordAdapterDispatchReceipt(DISPATCH_RECEIPTS_PATH, dispatchReceipts, run.dispatchIdempotencyKey, run.remoteRunId, "failed").catch(() => {});
-      }
-      reportEvent(run, "failed", err instanceof Error ? err.message : String(err));
+      run.terminalDeliveryPromise = reportEvent(run, "failed", err instanceof Error ? err.message : String(err), {
+        onEventCreated: (event) => { run.terminalEvent = event; },
+      });
+      void run.terminalDeliveryPromise.then((delivered) =>
+        finalizeOwnedProcessAfterTerminal(run, run.terminalEvent, delivered));
       try { run.conn?.close(); } catch { /* ignore */ }
       try { run.child?.kill("SIGTERM"); } catch { /* ignore */ }
     });
@@ -510,19 +553,11 @@ async function handle(req, res) {
       };
       const stopped = await terminateProcessGroup(ownership, 5_000).catch(() => false);
       if (stopped) {
-        let terminalReceiptPersisted = true;
-        if (dispatchIdempotencyKey) {
-          try {
-            await recordAdapterDispatchReceipt(DISPATCH_RECEIPTS_PATH, dispatchReceipts, dispatchIdempotencyKey, run.remoteRunId, "failed", {
-              lastError: `Worker started but acceptance could not be durably recorded: ${error instanceof Error ? error.message : String(error)}`,
-            });
-          } catch { terminalReceiptPersisted = false; }
-        }
-        if (terminalReceiptPersisted) {
-          ownedProcesses.delete(run.remoteRunId);
-          await atomicWriteJson(OWNED_PROCESSES_PATH, [...ownedProcesses.values()]).catch(() => {});
-          await reportEvent(run, "failed", "Worker stopped because durable acceptance could not be recorded.");
-        }
+        run.terminalDeliveryPromise = reportEvent(run, "failed", "Worker stopped because durable acceptance could not be recorded.", {
+          onEventCreated: (event) => { run.terminalEvent = event; },
+        });
+        const delivered = await run.terminalDeliveryPromise;
+        await finalizeOwnedProcessAfterTerminal(run, run.terminalEvent, delivered);
       }
     } else if (run.child?.pid && !run.finalized) {
       cancelRun(run, "adapter could not confirm worker launch outcome");
@@ -568,12 +603,24 @@ async function dispatchTurn(run) {
     };
   }
   const result = await run.conn.request(method, params);
+  run.finalOutput = normalizeAcpPromptOutput(result);
   reportStructured(run, "output_delta", {
     channel: "result",
-    text: typeof result === "string" ? result : JSON.stringify(result),
-    raw: result,
+    ...(run.finalOutput !== undefined ? { text: run.finalOutput } : {}),
+    resultType: typeof result,
   });
   run.authoritativeCompletion = true;
+}
+
+function normalizeAcpPromptOutput(result) {
+  if (typeof result === "string") return result;
+  const content = Array.isArray(result?.content) ? result.content
+    : Array.isArray(result?.message?.content) ? result.message.content
+      : undefined;
+  if (!content) return typeof result?.text === "string" ? result.text : undefined;
+  const text = content.filter((part) => part?.type === "text" && typeof part.text === "string")
+    .map((part) => part.text).join("");
+  return text.length > 0 ? text : undefined;
 }
 
 function createKontrolHttpHandler(run) {
@@ -672,10 +719,6 @@ function childDuplexStream(child) {
 function cancelRun(run, reason) {
   run.finalized = true;
   active.delete(run.remoteRunId);
-  if (run.dispatchIdempotencyKey) {
-    void recordAdapterDispatchReceipt(DISPATCH_RECEIPTS_PATH, dispatchReceipts, run.dispatchIdempotencyKey, run.remoteRunId, "cancelled")
-      .catch((error) => console.error("[stdio-duplex] cancellation receipt failed:", error));
-  }
   try { run.conn?.cancelInbound(); } catch { /* ignore */ }
   try { run.conn?.close(); } catch { /* ignore */ }
   if (run.child?.pid) {
@@ -688,55 +731,168 @@ function cancelRun(run, reason) {
       try { process.kill(-run.child.pid, "SIGKILL"); } catch { try { run.child.kill("SIGKILL"); } catch { /* ignore */ } }
     }, 1500).unref?.();
   }
-  void reportEvent(run, "cancelled", reason);
+  run.terminalDeliveryPromise = reportEvent(run, "cancelled", reason, {
+    onEventCreated: (event) => { run.terminalEvent = event; },
+  });
+  void run.terminalDeliveryPromise.then((delivered) => finalizeOwnedProcessAfterTerminal(run, run.terminalEvent, delivered));
+}
+
+async function finalizeOwnedProcessAfterTerminal(run, terminalEvent, delivered) {
+  if (run.terminalOwnershipPromise) return run.terminalOwnershipPromise;
+  run.terminalOwnershipPromise = (async () => {
+    const receipt = run.dispatchIdempotencyKey
+      ? findAdapterDispatchReceipt(dispatchReceipts, run.dispatchIdempotencyKey)
+      : undefined;
+    const eventPersisted = Boolean(terminalEvent && (
+      delivered
+      || eventSpool.hasPendingEvent(terminalEvent.event_id)
+      || (receipt?.terminalEventId === terminalEvent.event_id
+        && ["pending_controller_acknowledgement", "controller_acknowledged"].includes(receipt.deliveryState))
+      || receipt?.controllerEventId === terminalEvent.event_id
+    ));
+    if (eventPersisted) {
+      ownedProcesses.delete(run.remoteRunId);
+      try {
+        await atomicWriteJson(OWNED_PROCESSES_PATH, [...ownedProcesses.values()]);
+      } catch (error) {
+        console.error(`[stdio-duplex] ownership cleanup failed for ${run.remoteRunId}:`, error.message);
+      }
+      return;
+    }
+    console.error(`[stdio-duplex] terminal event could not be durably queued for ${run.remoteRunId}; preserving recovery ownership`);
+    if (run.dispatchIdempotencyKey && terminalEvent) {
+      await recordAdapterDispatchReceipt(DISPATCH_RECEIPTS_PATH, dispatchReceipts, run.dispatchIdempotencyKey, run.remoteRunId, receipt?.status ?? "running", {
+        attemptNumber: run.attemptNumber,
+        deliveryState: "spool_failed",
+        intendedTerminalStatus: terminalEvent.type,
+        terminalEvent,
+        lastError: "Terminal event could not be durably queued; recovery ownership was retained.",
+      }).catch((receiptError) => console.error("[stdio-duplex] terminal recovery receipt failure:", receiptError.message));
+    }
+  })();
+  return run.terminalOwnershipPromise;
 }
 
 async function reportRecoveredRun(record) {
   if (!record?.kontrolRunId || !record?.remoteRunId) return;
-  await fetch(`${KONTROL_ACP_URL}/runs/${record.kontrolRunId}/events`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", authorization: `Bearer ${AGENT_SECRET}`, ...identityHeaders(agentIdentity) },
-    body: JSON.stringify({
-      type: "failed",
-      remote_run_id: record.remoteRunId,
-      work_session_id: record.workSessionId,
-      attempt_number: record.attemptNumber,
-      ...(record.readOnlyExecutionGrant ? { read_only_execution_grant: record.readOnlyExecutionGrant } : {}),
-      payload: { error: "Adapter restarted and confirmed the detached ACP worker stopped; its turn result is unavailable." },
-    }),
-  }).catch((error) => console.warn("[stdio-duplex] recovered-run event delivery failed:", error.message));
+  const receipt = record.dispatchIdempotencyKey
+    ? findAdapterDispatchReceipt(dispatchReceipts, record.dispatchIdempotencyKey)
+    : undefined;
+  const savedTerminalEvent = receipt?.deliveryState === "spool_failed" ? receipt.terminalEvent : undefined;
+  const savedTerminalType = ["completed", "failed", "cancelled", "exited"].includes(savedTerminalEvent?.type)
+    ? savedTerminalEvent.type
+    : "failed";
+  const run = {
+    remoteRunId: record.remoteRunId,
+    devRunId: record.kontrolRunId,
+    workSessionId: record.workSessionId,
+    attemptNumber: record.attemptNumber,
+    dispatchIdempotencyKey: record.dispatchIdempotencyKey,
+    workspaceLeaseNonce: record.workspaceLeaseNonce,
+    readOnlyExecutionGrant: record.readOnlyExecutionGrant,
+    finalOutput: typeof savedTerminalEvent?.payload?.final_output === "string"
+      ? savedTerminalEvent.payload.final_output
+      : undefined,
+    eventSequence: eventSpool.nextSequence(record.remoteRunId) - 1,
+    sendChain: Promise.resolve(),
+  };
+  await reportEvent(run, savedTerminalType,
+    typeof savedTerminalEvent?.payload?.error === "string"
+      ? savedTerminalEvent.payload.error
+      : "Adapter restarted and confirmed the detached ACP worker stopped; its turn result is unavailable.", {
+    reportAvailability: savedTerminalEvent?.payload?.report_availability === "available" ? "available" : "unavailable",
+    ...(savedTerminalEvent?.payload && typeof savedTerminalEvent.payload === "object"
+      ? { payloadOverride: savedTerminalEvent.payload }
+      : {}),
+  });
 }
 
-async function reportEvent(run, type, errorMessage) {
-  await fetch(`${KONTROL_ACP_URL}/runs/${run.devRunId}/events`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", authorization: `Bearer ${AGENT_SECRET}`, ...identityHeaders(agentIdentity) },
-    body: JSON.stringify({
-      type,
-      remote_run_id: run.remoteRunId,
-      work_session_id: run.workSessionId,
-      attempt_number: run.attemptNumber,
-      workspace_lease_nonce: run.workspaceLeaseNonce,
-      ...(run.readOnlyExecutionGrant ? { read_only_execution_grant: run.readOnlyExecutionGrant } : {}),
-      payload: errorMessage ? { error: errorMessage } : {},
-    }),
-  }).catch(() => {});
+function createAdapterEvent(run, type, payload) {
+  const eventSequence = ++run.eventSequence;
+  return {
+    event_id: `${run.remoteRunId}:${run.attemptNumber}:${eventSequence}`,
+    event_sequence: eventSequence,
+    type,
+    remote_run_id: run.remoteRunId,
+    work_session_id: run.workSessionId,
+    attempt_number: run.attemptNumber,
+    dispatch_idempotency_key: run.dispatchIdempotencyKey,
+    workspace_lease_nonce: run.workspaceLeaseNonce,
+    ...(run.readOnlyExecutionGrant ? { read_only_execution_grant: run.readOnlyExecutionGrant } : {}),
+    payload,
+  };
+}
+
+function reportEvent(run, type, errorMessage, { reportAvailability, payloadOverride, onEventCreated } = {}) {
+  const availability = reportAvailability ?? (typeof run.finalOutput === "string" && run.finalOutput.length > 0
+    ? "available"
+    : type === "completed" ? "no_output" : "unavailable");
+  const payload = payloadOverride ?? {
+    ...(errorMessage ? { error: errorMessage } : {}),
+    ...(["completed", "failed", "cancelled", "exited"].includes(type) && typeof run.finalOutput === "string"
+      ? { final_output: run.finalOutput }
+      : {}),
+    report_availability: availability,
+  };
+  return enqueueRunEvent(run, type, payload, {
+    terminal: ["completed", "failed", "cancelled", "exited"].includes(type),
+    onEventCreated,
+    beforeDelivery: async (event) => {
+      if (!isTerminalAdapterDispatchStatus(type) || !run.dispatchIdempotencyKey) return;
+      await recordAdapterDispatchReceipt(DISPATCH_RECEIPTS_PATH, dispatchReceipts, run.dispatchIdempotencyKey, run.remoteRunId, type, {
+        attemptNumber: run.attemptNumber,
+        terminalEventId: event.event_id,
+        deliveryState: "pending_controller_acknowledgement",
+        lastError: errorMessage,
+      });
+    },
+  });
 }
 
 function reportStructured(run, type, payload) {
-  void fetch(`${KONTROL_ACP_URL}/runs/${run.devRunId}/events`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", authorization: `Bearer ${AGENT_SECRET}`, ...identityHeaders(agentIdentity) },
-    body: JSON.stringify({
-      type,
-      remote_run_id: run.remoteRunId,
-      work_session_id: run.workSessionId,
-      attempt_number: run.attemptNumber,
-      workspace_lease_nonce: run.workspaceLeaseNonce,
-      ...(run.readOnlyExecutionGrant ? { read_only_execution_grant: run.readOnlyExecutionGrant } : {}),
-      payload,
-    }),
-  }).catch(() => {});
+  return enqueueRunEvent(run, type, payload);
+}
+
+function enqueueRunEvent(run, type, payload, { terminal = false, beforeDelivery, onEventCreated } = {}) {
+  const event = createAdapterEvent(run, type, payload);
+  onEventCreated?.(event);
+  const delivery = run.sendChain.catch(() => false).then(() =>
+    eventSpool.enqueue(run.devRunId, event, terminal, () => beforeDelivery?.(event)));
+  run.sendChain = delivery.catch((error) => {
+    console.error(`[stdio-duplex] ${terminal ? "terminal " : ""}event delivery unresolved for ${run.remoteRunId}: ${error instanceof Error ? error.message : String(error)}`);
+    return false;
+  });
+  return run.sendChain;
+}
+
+async function acknowledgeTerminalDispatchReceipt(event, responseBody) {
+  if (!responseBody?.dispatch_receipt_acknowledged
+    || !["completed", "failed", "cancelled", "exited"].includes(event?.type)
+    || typeof event?.dispatch_idempotency_key !== "string"
+    || typeof event?.remote_run_id !== "string"
+    || typeof event?.attempt_number !== "number"
+    || typeof event?.event_id !== "string"
+    || responseBody.dispatch_idempotency_key !== event.dispatch_idempotency_key
+    || responseBody.remote_run_id !== event.remote_run_id
+    || responseBody.attempt_number !== event.attempt_number
+    || responseBody.event_id !== event.event_id) return false;
+  const acknowledged = await acknowledgeAdapterDispatchReceipt(DISPATCH_RECEIPTS_PATH, dispatchReceipts, {
+    dispatchIdempotencyKey: responseBody.dispatch_idempotency_key,
+    remoteRunId: event.remote_run_id,
+    attemptNumber: event.attempt_number,
+    eventId: event.event_id,
+  });
+  if (acknowledged) {
+    const receipt = findAdapterDispatchReceipt(dispatchReceipts, event.dispatch_idempotency_key);
+    if (receipt) {
+      await recordAdapterDispatchReceipt(DISPATCH_RECEIPTS_PATH, dispatchReceipts, event.dispatch_idempotency_key, event.remote_run_id, receipt.status, {
+        deliveryState: "controller_acknowledged",
+        terminalEventId: event.event_id,
+        lastError: undefined,
+      });
+    }
+  }
+  return acknowledged;
 }
 
 function authorized(req) {

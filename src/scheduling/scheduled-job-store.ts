@@ -3,7 +3,6 @@ import { z } from "zod/v4";
 import type { DatabaseHandle } from "../db/client.js";
 import type { DispatchOutbox } from "../dispatch-outbox.js";
 import {
-  acpRuns,
   scheduledJobs,
   scheduledJobAttempts,
   scheduledJobReportFinalizations,
@@ -174,6 +173,10 @@ export interface ScheduledJob {
   dispatchLastAttemptedAgent?: string;
   dispatchBlockerKind?: "temporary_dependency" | "permanent_configuration";
   lastError?: string;
+  terminalAt?: string;
+  blockedAt?: string;
+  operatorInterventionAt?: string;
+  lastStateChangedAt?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -217,7 +220,7 @@ export interface ScheduledJobReportFinalization {
   runId: string;
   attemptNumber: number;
   eventId: string;
-  status: "pending" | "completed";
+  status: "pending" | "completed" | "no_output" | "unavailable";
   reportSha256?: string;
   lastError?: string;
   createdAt: string;
@@ -312,6 +315,10 @@ function rowToJob(row: ScheduledJobRow): ScheduledJob {
       ? row.dispatchBlockerKind
       : undefined,
     lastError: row.lastError ?? undefined,
+    terminalAt: row.terminalAt ?? undefined,
+    blockedAt: row.blockedAt ?? undefined,
+    operatorInterventionAt: row.operatorInterventionAt ?? undefined,
+    lastStateChangedAt: row.lastStateChangedAt ?? undefined,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };
@@ -373,6 +380,20 @@ function canonicalFingerprint(value: Record<string, unknown>): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
 
+const DEFINITIVE_TERMINAL_JOB_STATUSES = new Set<ScheduledJobStatus>(["completed", "failed", "cancelled"]);
+
+function stateTimestampFields(nextStatus: ScheduledJobStatus, previousStatus: string | undefined, now: string) {
+  if (nextStatus === previousStatus) return {};
+  return {
+    lastStateChangedAt: now,
+    ...(nextStatus === "blocked" ? { blockedAt: now } : {}),
+    ...(nextStatus === "operator_intervention" ? { operatorInterventionAt: now } : {}),
+    ...(DEFINITIVE_TERMINAL_JOB_STATUSES.has(nextStatus)
+      ? { terminalAt: sql`coalesce(${scheduledJobs.terminalAt}, ${now})` }
+      : {}),
+  };
+}
+
 export function createScheduledJobStore(
   database: DatabaseHandle,
   dispatchOutbox: DispatchOutbox,
@@ -423,6 +444,7 @@ export function createScheduledJobStore(
         requestFingerprint: input.clientMutationId ? canonicalFingerprint(canonicalRequest(input)) : "{}",
         createdAt: now,
         updatedAt: now,
+        lastStateChangedAt: now,
       }).run();
       dispatchOutbox.enqueue({
         eventType: "scheduled_job.due",
@@ -463,6 +485,7 @@ export function createScheduledJobStore(
     leaseMs?: number;
   }): DispatchClaim {
     const now = Date.now();
+    const nowIso = new Date(now).toISOString();
     const leaseExpiresAt = new Date(now + (input.leaseMs ?? 60_000)).toISOString();
     const attemptId = input.dispatchAttemptId ?? `scha_${randomUUID()}`;
     const dispatchId = `disp_${randomUUID()}`;
@@ -472,7 +495,8 @@ export function createScheduledJobStore(
           status: "dispatching",
           revision: input.expectedRevision + 1,
           activeDispatchAttemptId: attemptId,
-          updatedAt: new Date(now).toISOString(),
+          updatedAt: nowIso,
+          ...stateTimestampFields("dispatching", "due", nowIso),
         })
         .where(and(
           eq(scheduledJobs.id, input.jobId),
@@ -532,6 +556,7 @@ export function createScheduledJobStore(
           } : {}),
           ...(cancellationPending ? { cancellationLastConfirmedState: "not_dispatched" } : {}),
           updatedAt: now,
+          ...stateTimestampFields(nextStatus, current?.status, now),
         })
         .where(and(
           eq(scheduledJobs.id, input.jobId),
@@ -577,6 +602,7 @@ export function createScheduledJobStore(
         dispatchBlockerKind: null,
         lastError: null,
         updatedAt: now,
+        ...stateTimestampFields("due", current.status, now),
       }).where(and(
         eq(scheduledJobs.id, input.jobId),
         eq(scheduledJobs.revision, current.revision),
@@ -625,9 +651,9 @@ export function createScheduledJobStore(
         || (!cancellationPending && !lifecycleAdvanced && (current.status !== "dispatching" || current.revision !== input.expectedRevision))) {
         throw new Error(`Scheduled dispatch completion conflict for ${input.jobId} attempt ${input.dispatchAttemptId}.`);
       }
-      const effectiveStatus = cancellationPending ? "cancellation_requested"
-        : lifecycleAdvanced ? current.status
-          : nextStatus;
+      const effectiveStatus: ScheduledJobStatus = cancellationPending ? "cancellation_requested"
+        : lifecycleAdvanced ? current.status as ScheduledJobStatus
+          : nextStatus as ScheduledJobStatus;
       const jobUpdate = database.db.update(scheduledJobs)
         .set({
           status: effectiveStatus,
@@ -642,6 +668,7 @@ export function createScheduledJobStore(
           dispatchBlockerKind: null,
           lastError: input.lastError ?? null,
           updatedAt: now,
+          ...stateTimestampFields(effectiveStatus, current.status, now),
         })
         .where(and(
           eq(scheduledJobs.id, input.jobId),
@@ -725,6 +752,7 @@ export function createScheduledJobStore(
           : {}),
         lastError: input.lastError ?? (cancellationPending ? current?.lastError ?? null : null),
         updatedAt: now,
+        ...stateTimestampFields(effectiveNextStatus, current?.status, now),
       }).where(and(
         eq(scheduledJobs.id, input.jobId),
         eq(scheduledJobs.revision, input.expectedRevision),
@@ -848,13 +876,15 @@ export function createScheduledJobStore(
           }
         }
       }
+      const stateChangedAt = new Date().toISOString();
       const updated = database.db.update(scheduledJobs).set({
         status: projection.nextStatus,
         revision: projection.nextStatus ? row.revision + 1 : row.revision,
         activeDispatchAttemptId: projection.finalWorkerOutcome ? null : undefined,
         lifecycleEventCursor: event.seq,
         lastError: projection.lastError ?? (projection.nextStatus ? null : undefined),
-        updatedAt: new Date().toISOString(),
+        updatedAt: stateChangedAt,
+        ...(projection.nextStatus ? stateTimestampFields(projection.nextStatus, currentStatus, stateChangedAt) : {}),
       }).where(and(
         eq(scheduledJobs.id, row.id),
         eq(scheduledJobs.revision, row.revision),
@@ -932,6 +962,7 @@ export function createScheduledJobStore(
         cancellationLastAttemptAt: null,
         lastError: input.reason ?? "Cancellation requested; waiting for worker-state confirmation.",
         updatedAt: now,
+        ...stateTimestampFields("cancellation_requested", current.status, now),
       }).where(and(eq(scheduledJobs.id, input.jobId), eq(scheduledJobs.revision, input.expectedRevision))).run();
       if (updated.changes !== 1) throw new Error(`Scheduled job cancellation conflict for ${input.jobId}.`);
       return database.db.select().from(scheduledJobs).where(eq(scheduledJobs.id, input.jobId)).get()!;
@@ -994,6 +1025,7 @@ export function createScheduledJobStore(
         cancellationLastConfirmedState: input.lastConfirmedState,
         lastError: input.reason ?? "Scheduled job cancellation confirmed.",
         updatedAt: now,
+        ...stateTimestampFields("cancelled", "cancellation_requested", now),
       }).where(and(
         eq(scheduledJobs.id, input.jobId),
         eq(scheduledJobs.status, "cancellation_requested"),
@@ -1109,7 +1141,9 @@ export function createScheduledJobStore(
       runId: row.runId,
       attemptNumber: row.attemptNumber,
       eventId: row.eventId,
-      status: row.status === "completed" ? "completed" : "pending",
+      status: row.status === "completed" || row.status === "no_output" || row.status === "unavailable"
+        ? row.status
+        : "pending",
       reportSha256: row.reportSha256 ?? undefined,
       lastError: row.lastError ?? undefined,
       createdAt: row.createdAt,
@@ -1121,7 +1155,22 @@ export function createScheduledJobStore(
     if (!get(input.jobId)) throw new Error(`Unknown scheduled job: ${input.jobId}`);
     const now = new Date().toISOString();
     const id = `sched_verify_${randomUUID()}`;
-    const result = database.sqlite.transaction(() => {
+    const identityWhere = and(
+      eq(scheduledJobVerifications.jobId, input.jobId),
+      eq(scheduledJobVerifications.workSessionId, input.workSessionId),
+      eq(scheduledJobVerifications.submissionId, input.submissionId),
+      eq(scheduledJobVerifications.reviewEpoch, input.reviewEpoch),
+      eq(scheduledJobVerifications.snapshotKind, input.snapshotKind),
+      eq(scheduledJobVerifications.snapshotRef, input.snapshotRef),
+      eq(scheduledJobVerifications.commandFingerprint, input.commandFingerprint),
+      eq(scheduledJobVerifications.policyFingerprint, input.policyFingerprint),
+      eq(scheduledJobVerifications.status, "running"),
+    );
+    const findActiveIdentity = () => database.db.select().from(scheduledJobVerifications)
+      .where(identityWhere)
+      .orderBy(asc(scheduledJobVerifications.createdAt), asc(scheduledJobVerifications.id))
+      .limit(1).get();
+    const runClaim = () => database.sqlite.transaction(() => {
       const existing = database.db.select().from(scheduledJobVerifications).where(and(
         eq(scheduledJobVerifications.jobId, input.jobId),
         eq(scheduledJobVerifications.requestKey, input.requestKey),
@@ -1140,6 +1189,21 @@ export function createScheduledJobStore(
         const refreshed = database.db.select().from(scheduledJobVerifications).where(eq(scheduledJobVerifications.id, existing.id)).get();
         if (!refreshed) throw new Error("Scheduled verification execution disappeared during idempotency lookup.");
         return { execution: rowToVerification(refreshed), owner: false };
+      }
+      const activeEquivalent = findActiveIdentity();
+      if (activeEquivalent) {
+        const deadline = Date.parse(activeEquivalent.deadlineAt);
+        if (Number.isFinite(deadline) && deadline > Date.now()) {
+          return { execution: rowToVerification(activeEquivalent), owner: false };
+        }
+        database.db.update(scheduledJobVerifications).set({
+          status: "failed",
+          failureReason: "Scheduled verification exceeded its active deadline and was reconciled after interruption.",
+          finishedAt: now,
+        }).where(and(
+          eq(scheduledJobVerifications.id, activeEquivalent.id),
+          eq(scheduledJobVerifications.status, "running"),
+        )).run();
       }
       const latestExecution = database.db.select({ createdAt: scheduledJobVerifications.createdAt }).from(scheduledJobVerifications)
         .where(eq(scheduledJobVerifications.jobId, input.jobId))
@@ -1175,7 +1239,26 @@ export function createScheduledJobStore(
       if (!inserted) throw new Error("Scheduled verification execution could not be read after claim.");
       return { execution: rowToVerification(inserted), owner: true };
     })();
-    return result;
+    try {
+      return runClaim();
+    } catch (error) {
+      const sameRequest = database.db.select().from(scheduledJobVerifications).where(and(
+        eq(scheduledJobVerifications.jobId, input.jobId),
+        eq(scheduledJobVerifications.requestKey, input.requestKey),
+      )).limit(1).get();
+      if (sameRequest) {
+        if (sameRequest.requestFingerprint !== input.requestFingerprint) throw error;
+        return { execution: rowToVerification(sameRequest), owner: false };
+      }
+      // A second process can win the partial unique-index race after this
+      // transaction's identity lookup. Reconcile that exact active execution
+      // and only mask the insert error when it is still authoritative.
+      const concurrent = findActiveIdentity();
+      if (concurrent && Date.parse(concurrent.deadlineAt) > Date.now()) {
+        return { execution: rowToVerification(concurrent), owner: false };
+      }
+      throw error;
+    }
   }
 
   function completeVerificationExecution(input: { executionId: string; reportText: string }): ScheduledVerificationExecution {
@@ -1274,16 +1357,6 @@ export function createScheduledJobStore(
     return count;
   }
 
-  function reportTextFromOutputJson(outputJson: string | null | undefined): string | undefined {
-    if (!outputJson) return undefined;
-    try {
-      const parsed = JSON.parse(outputJson) as { output?: Array<{ parts?: Array<{ content?: string }> }> };
-      const contents = parsed.output?.flatMap((message) => message.parts?.map((part) => part.content ?? "") ?? []);
-      if (contents) return contents.join("\n");
-    } catch { /* preserve an opaque legacy result as text below */ }
-    return outputJson;
-  }
-
   function recordReportFinalizationObligation(event: EventStoreEvent): void {
     const reportOutcomes = new Set([
       "worker.turn.completed",
@@ -1329,21 +1402,23 @@ export function createScheduledJobStore(
     if (!projection.workerExecutionOutcome) return;
 
     const now = new Date().toISOString();
-    const output = typeof event.payload.final_output === "string"
-      ? event.payload.final_output
-      : reportTextFromOutputJson(database.db.select({ outputJson: acpRuns.outputJson }).from(acpRuns)
-          .where(and(eq(acpRuns.runId, runId), eq(acpRuns.workSessionId, event.sessionId))).limit(1).get()?.outputJson)
-        ?? JSON.stringify({ runId, attemptNumber, outcome: projection.workerExecutionOutcome });
+    const finalOutput = event.payload.final_output;
+    const reportText = typeof finalOutput === "string" && finalOutput.length > 0 ? finalOutput : undefined;
+    const reportAvailability = reportText
+      ? "pending"
+      : event.payload.report_availability === "unavailable" ? "unavailable" : "no_output";
     database.db.insert(scheduledJobReportFinalizations).values({
       id: `sched_finalization_${randomUUID()}`,
       jobId: job.id,
       runId,
       attemptNumber,
       eventId: event.id,
-      status: "pending",
-      reportText: output,
+      status: reportAvailability,
+      reportText: reportText ?? null,
       reportSha256: null,
-      lastError: null,
+      lastError: reportText ? null : reportAvailability === "unavailable"
+        ? "This execution stopped before an authoritative ACP report was available."
+        : "The authoritative ACP prompt response contained no report text.",
       createdAt: now,
       updatedAt: now,
     }).onConflictDoNothing({ target: [
@@ -1407,6 +1482,8 @@ export function createScheduledJobStore(
       throw new Error("Scheduled cancellation states must use the durable cancellation state machine.");
     }
     const now = new Date().toISOString();
+    const current = get(input.jobId);
+    if (!current) throw new Error(`Unknown scheduled job: ${input.jobId}`);
     const updated = database.db.update(scheduledJobs)
       .set({
         status: input.nextStatus,
@@ -1414,6 +1491,7 @@ export function createScheduledJobStore(
         workSessionId: input.workSessionId === undefined ? undefined : input.workSessionId,
         lastError: input.lastError === undefined ? undefined : input.lastError,
         updatedAt: now,
+        ...stateTimestampFields(input.nextStatus, current.status, now),
       })
       .where(and(
         eq(scheduledJobs.id, input.jobId),

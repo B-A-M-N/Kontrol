@@ -6,6 +6,9 @@ const pkg = JSON.parse(readFileSync("package.json", "utf8"));
 
 assert.match(adapter, /dist\/acp-duplex\.js/);
 assert.match(adapter, /createAcpDuplex/);
+assert.match(adapter, /createAdapterEventSpool/);
+assert.match(adapter, /dispatch_idempotency_key: run\.dispatchIdempotencyKey/);
+assert.match(adapter, /final_output: run\.finalOutput/);
 assert.match(adapter, /session\/request_permission|requestPermission/);
 assert.match(adapter, /permission\.requested/);
 assert.match(adapter, /approvals\/\$\{approvalId\}\/decision/);
@@ -39,6 +42,8 @@ assert.ok(
   pkg.files.includes("scripts/lib/read-only-execution.mjs"),
   "shared execution grant and sandbox implementation is included with the adapters",
 );
+assert.ok(pkg.files.includes("scripts/lib/adapter-event-spool.mjs"),
+  "generic adapter recovery includes its durable lifecycle spool");
 assert.match(pkg.scripts["test:adapters"], /acp-stdio-duplex-adapter\.mjs/);
 assert.match(pkg.scripts["test:adapters"], /acp-stdio-duplex-adapter\.test\.mjs/);
 

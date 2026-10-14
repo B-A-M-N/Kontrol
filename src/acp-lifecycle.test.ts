@@ -236,6 +236,46 @@ try {
     "a retried terminal event repeats the same durable acknowledgement after a lost HTTP response");
   assert.equal(workSessions.get(sessionId)?.workspaceSessionId, "ws-e2e");
 
+  const nextDispatchKey = "acp-lifecycle-next-attempt";
+  agents.beginDispatchAttempt({ key: nextDispatchKey, runId, agentId, attemptNumber: 2 });
+  agents.updateDispatchAttempt(nextDispatchKey, { status: "accepted", remoteRunId: "remote-e2e-2" });
+  agents.updateRun(runId, {
+    status: "running",
+    remoteRunId: "remote-e2e-2",
+    attemptNumber: 2,
+    outputPreview: "",
+    outputJson: "",
+    finishedAt: undefined,
+  });
+  const latePriorTerminal = await jsonFetch(`/runs/${encodeURIComponent(runId)}/events`, {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer agent-secret",
+      "Content-Type": "application/json",
+      "x-kontrol-agent-id": agentId,
+      "x-kontrol-agent-credential": agentCredential,
+    },
+    body: JSON.stringify({
+      type: "completed",
+      remote_run_id: "remote-e2e-1",
+      attempt_number: 1,
+      dispatch_idempotency_key: terminalDispatchKey,
+      event_id: "late-prior-terminal-event",
+      agent_id: agentId,
+      work_session_id: sessionId,
+      payload: { final_output: "late output from attempt one" },
+    }),
+  });
+  assert.equal(latePriorTerminal.status, 202);
+  assert.equal(latePriorTerminal.body.dispatch_receipt_acknowledged, true,
+    "a durable late terminal event is acknowledged against its exact superseded dispatch attempt");
+  assert.equal(latePriorTerminal.body.dispatch_idempotency_key, terminalDispatchKey);
+  assert.equal(latePriorTerminal.body.attempt_number, 1);
+  assert.equal(latePriorTerminal.body.event_id, "late-prior-terminal-event");
+  assert.equal(agents.getRun(runId)?.status, "running");
+  assert.equal(agents.getRun(runId)?.attemptNumber, 2,
+    "a terminal event from an older attempt cannot overwrite the current attempt state");
+
   const cancellationDispatch = await jsonFetch("/runs", {
     method: "POST",
     headers: { Authorization: "Bearer reviewer-secret", "Content-Type": "application/json" },

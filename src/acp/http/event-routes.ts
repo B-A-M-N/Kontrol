@@ -84,7 +84,6 @@ function dispatchReceiptAcknowledgement(
   if (!attempt?.dispatchIdempotencyKey || attempt.runId !== run.runId || !attempt.remoteRunId) return undefined;
   if (typeof body.event_id !== "string" || body.event_id.length === 0) return undefined;
   if (body.attempt_number !== attempt.attemptNumber || body.remote_run_id !== attempt.remoteRunId) return undefined;
-  if (run.remoteRunId !== attempt.remoteRunId) return undefined;
   return {
     dispatch_receipt_acknowledged: true,
     dispatch_idempotency_key: attempt.dispatchIdempotencyKey,
@@ -121,6 +120,16 @@ function eventMatchesDispatch(event: { type: string; payload: Record<string, unk
     }
     const body = parsedEvent.data;
     const authoritativeAttempt = agentRegistry.getLatestDispatchAttemptForRun(run.runId);
+    const eventDispatchAttempt = body.dispatch_idempotency_key
+      ? agentRegistry.getDispatchAttemptByIdempotencyKey(body.dispatch_idempotency_key)
+      : authoritativeAttempt;
+    if (body.dispatch_idempotency_key && (!eventDispatchAttempt
+      || eventDispatchAttempt.runId !== run.runId
+      || body.attempt_number !== eventDispatchAttempt.attemptNumber
+      || body.remote_run_id !== eventDispatchAttempt.remoteRunId)) {
+      res.status(409).json({ error: { code: "dispatch_attempt_mismatch", message: "Lifecycle event does not match its durable dispatch attempt." } });
+      return;
+    }
 
     if (!body.type || (!ADAPTER_EVENT_TYPE_TO_RUN[body.type] && !APPROVAL_EVENT_TYPES.has(body.type))) {
       res.status(400).json({ error: { code: "invalid_input", message: "unknown or missing event type" } });
@@ -156,7 +165,7 @@ function eventMatchesDispatch(event: { type: string; payload: Record<string, unk
           : undefined;
       } catch { /* reject below when the canonical workspace cannot be recovered */ }
       const grantValid = Boolean(
-        authoritativeAttempt
+        eventDispatchAttempt
         && run.workSessionId
         && workspaceRoot
         && run.agentId
@@ -170,7 +179,7 @@ function eventMatchesDispatch(event: { type: string; payload: Record<string, unk
             agentId: run.agentId,
             runId: run.runId,
             attemptNumber: body.attempt_number ?? run.attemptNumber,
-            dispatchIdempotencyKey: authoritativeAttempt.dispatchIdempotencyKey,
+            dispatchIdempotencyKey: eventDispatchAttempt.dispatchIdempotencyKey,
           },
         ),
       );
@@ -185,15 +194,36 @@ function eventMatchesDispatch(event: { type: string; payload: Record<string, unk
     // from a superseded attempt is recorded diagnostically and idempotently
     // acked — it must never mutate the current attempt's state.
     if (body.attempt_number !== undefined && run.attemptNumber !== undefined && body.attempt_number !== run.attemptNumber) {
+      const priorStaleEvent = body.event_id ? eventStore?.getEventById(body.event_id) : undefined;
+      if (priorStaleEvent) {
+        const acknowledgement = eventMatchesDispatch(priorStaleEvent, run, body, eventDispatchAttempt)
+          ? dispatchReceiptAcknowledgement(body, run, eventDispatchAttempt, true)
+          : undefined;
+        res.status(202).json({
+          run_id: run.runId,
+          status: run.status,
+          accepted: true,
+          duplicate: true,
+          stale_attempt: true,
+          ...(acknowledgement ?? {}),
+        });
+        return;
+      }
       eventStore?.appendEvent({
+        id: body.event_id,
         type: "agent.event.stale_attempt",
         sessionId: run.workSessionId ?? run.workspaceSessionId ?? "",
         payload: {
           runId: run.runId,
+          remoteRunId: body.remote_run_id,
+          attemptNumber: body.attempt_number,
+          dispatchId: eventDispatchAttempt?.dispatchIdempotencyKey,
           eventAttempt: body.attempt_number,
           currentAttempt: run.attemptNumber,
           eventType: body.type,
-          remoteRunId: body.remote_run_id,
+          ...(stringPayload(body.payload?.final_output) !== undefined
+            ? { final_output: stringPayload(body.payload?.final_output) }
+            : {}),
         },
       }, { publish: false });
       if (body.type === "started" || body.type === "heartbeat") {
@@ -205,7 +235,11 @@ function eventMatchesDispatch(event: { type: string; payload: Record<string, unk
         });
         return;
       }
-      res.status(202).json({ run_id: run.runId, status: run.status, ignored: true, stale_attempt: true });
+      const staleEvent = body.event_id ? eventStore?.getEventById(body.event_id) : undefined;
+      const acknowledgement = eventMatchesDispatch(staleEvent ?? { type: "agent.event.stale_attempt", payload: {} }, run, body, eventDispatchAttempt)
+        ? dispatchReceiptAcknowledgement(body, run, eventDispatchAttempt, true)
+        : undefined;
+      res.status(202).json({ run_id: run.runId, status: run.status, ignored: true, stale_attempt: true, ...(acknowledgement ?? {}) });
       return;
     }
 
@@ -255,8 +289,8 @@ function eventMatchesDispatch(event: { type: string; payload: Record<string, unk
     if (body.event_id && eventStore) {
       const existing = eventStore.getEventById(body.event_id);
       if (existing) {
-        const acknowledgement = eventMatchesDispatch(existing, run, body, authoritativeAttempt)
-          ? dispatchReceiptAcknowledgement(body, run, authoritativeAttempt, true)
+        const acknowledgement = eventMatchesDispatch(existing, run, body, eventDispatchAttempt)
+          ? dispatchReceiptAcknowledgement(body, run, eventDispatchAttempt, true)
           : undefined;
         res.status(202).json({
           run_id: run.runId,
@@ -431,8 +465,8 @@ function eventMatchesDispatch(event: { type: string; payload: Record<string, unk
         runId: run.runId,
         remoteRunId: body.remote_run_id ?? run.remoteRunId,
         attemptNumber: body.attempt_number ?? run.attemptNumber ?? 1,
-        ...(authoritativeAttempt?.dispatchIdempotencyKey
-          ? { dispatchId: authoritativeAttempt.dispatchIdempotencyKey }
+        ...(eventDispatchAttempt?.dispatchIdempotencyKey
+          ? { dispatchId: eventDispatchAttempt.dispatchIdempotencyKey }
           : {}),
         workSessionId: sessionId,
         ...(body.event_id ? { eventId: body.event_id } : {}),
@@ -465,14 +499,14 @@ function eventMatchesDispatch(event: { type: string; payload: Record<string, unk
         await reviewWorkflow.finalizeCancellation({
           sessionId: session.id,
           reason: stringPayload(body.payload?.message) ?? "worker cancelled",
-          ...(body.event_id && body.remote_run_id && body.attempt_number !== undefined && authoritativeAttempt?.dispatchIdempotencyKey
+          ...(body.event_id && body.remote_run_id && body.attempt_number !== undefined && eventDispatchAttempt?.dispatchIdempotencyKey
             ? {
                 adapterEvent: {
                   id: body.event_id,
                   runId: run.runId,
                   remoteRunId: body.remote_run_id,
                   attemptNumber: body.attempt_number,
-                  dispatchIdempotencyKey: authoritativeAttempt.dispatchIdempotencyKey,
+                  dispatchIdempotencyKey: eventDispatchAttempt.dispatchIdempotencyKey,
                 },
               }
             : {}),
@@ -508,11 +542,14 @@ function eventMatchesDispatch(event: { type: string; payload: Record<string, unk
             runId: run.runId,
             remoteRunId: run.remoteRunId,
             attemptNumber: run.attemptNumber ?? 1,
-            ...(authoritativeAttempt?.dispatchIdempotencyKey ? { dispatchId: authoritativeAttempt.dispatchIdempotencyKey } : {}),
+            ...(eventDispatchAttempt?.dispatchIdempotencyKey ? { dispatchId: eventDispatchAttempt.dispatchIdempotencyKey } : {}),
             resumable: true,
             reason: errorMessage,
             ...(stringPayload(body.payload?.final_output) !== undefined
               ? { final_output: stringPayload(body.payload?.final_output) }
+              : {}),
+            ...(body.payload?.report_availability === "unavailable" || body.payload?.report_availability === "no_output"
+              ? { report_availability: body.payload.report_availability }
               : {}),
           },
         });
@@ -525,7 +562,7 @@ function eventMatchesDispatch(event: { type: string; payload: Record<string, unk
             runId: run.runId,
             remoteRunId: run.remoteRunId,
             attemptNumber: run.attemptNumber ?? 1,
-            ...(authoritativeAttempt?.dispatchIdempotencyKey ? { dispatchId: authoritativeAttempt.dispatchIdempotencyKey } : {}),
+            ...(eventDispatchAttempt?.dispatchIdempotencyKey ? { dispatchId: eventDispatchAttempt.dispatchIdempotencyKey } : {}),
             reason: errorMessage,
           },
         });
@@ -541,8 +578,8 @@ function eventMatchesDispatch(event: { type: string; payload: Record<string, unk
     const dispatchReceiptAck = dispatchReceiptAcknowledgement(
       body,
       run,
-      authoritativeAttempt,
-      Boolean(persistedTerminalEvent && eventMatchesDispatch(persistedTerminalEvent, run, body, authoritativeAttempt)),
+      eventDispatchAttempt,
+      Boolean(persistedTerminalEvent && eventMatchesDispatch(persistedTerminalEvent, run, body, eventDispatchAttempt)),
     );
     res.status(202).json({
       run_id: run.runId,

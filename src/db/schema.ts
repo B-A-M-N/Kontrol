@@ -48,6 +48,10 @@ export const scheduledJobs = sqliteTable("scheduled_jobs", {
   lastError: text("last_error"),
   createdAt: text("created_at").notNull(),
   updatedAt: text("updated_at").notNull(),
+  terminalAt: text("terminal_at"),
+  blockedAt: text("blocked_at"),
+  operatorInterventionAt: text("operator_intervention_at"),
+  lastStateChangedAt: text("last_state_changed_at"),
 }, (table) => [
   index("scheduled_jobs_status_due_idx").on(table.status, table.runAt),
   index("scheduled_jobs_owner_idx").on(table.ownerContextId, table.runAt),
@@ -134,6 +138,16 @@ export const scheduledJobVerifications = sqliteTable("scheduled_job_verification
   finishedAt: text("finished_at"),
 }, (table) => [
   uniqueIndex("scheduled_job_verifications_request_unique").on(table.jobId, table.requestKey),
+  uniqueIndex("scheduled_job_verifications_active_identity_unique").on(
+    table.jobId,
+    table.workSessionId,
+    table.submissionId,
+    table.reviewEpoch,
+    table.snapshotKind,
+    table.snapshotRef,
+    table.commandFingerprint,
+    table.policyFingerprint,
+  ).where(sql`${table.status} = 'running'`),
   index("scheduled_job_verifications_current_idx").on(table.jobId, table.submissionId, table.reviewEpoch, table.createdAt),
   index("scheduled_job_verifications_status_deadline_idx").on(table.status, table.deadlineAt, table.id),
   index("scheduled_job_verifications_hash_idx").on(table.jobId, table.reportSha256),

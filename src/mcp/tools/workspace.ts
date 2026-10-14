@@ -1885,6 +1885,7 @@ export function registerWorkspaceTools(
             workspaceId,
             ownerId: processSessionOwnerId(connectionContext),
             workSessionId: connectionContext?.workSessionId,
+            principalId: connectionContext?.authenticatedPrincipalId,
             command: input.command,
             cwd,
             timeoutMs: timeoutSeconds * 1_000,

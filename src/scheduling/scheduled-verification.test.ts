@@ -26,6 +26,19 @@ function createVerificationJobs() {
         if (prior.requestFingerprint !== input.requestFingerprint) throw new Error("Verification idempotency key was already used with different content.");
         return { execution: prior, owner: false };
       }
+      const activeEquivalent = [...new Set(executions.values())].find((entry) => entry.status === "running"
+        && entry.jobId === input.jobId
+        && entry.workSessionId === input.workSessionId
+        && entry.submissionId === input.submissionId
+        && entry.reviewEpoch === input.reviewEpoch
+        && entry.snapshotKind === input.snapshotKind
+        && entry.snapshotRef === input.snapshotRef
+        && entry.commandFingerprint === input.commandFingerprint
+        && entry.policyFingerprint === input.policyFingerprint);
+      if (activeEquivalent) {
+        executions.set(input.requestKey, activeEquivalent);
+        return { execution: activeEquivalent, owner: false };
+      }
       const now = new Date().toISOString();
       const execution: ScheduledVerificationExecution = {
         ...input,
@@ -133,14 +146,18 @@ try {
     } as any,
     clientMutationId: "reviewer-request-1",
   };
-  const [result, duplicateResult] = await Promise.all([
+  const [result, duplicateResult, distinctRequestResult] = await Promise.all([
     verifyScheduledJob(verificationInput),
     verifyScheduledJob(verificationInput),
+    verifyScheduledJob({ ...verificationInput, clientMutationId: "reviewer-request-concurrent" }),
   ]);
   assert.equal(duplicateResult.executionIdentity, result.executionIdentity,
     "concurrent identical verification calls share one durable execution identity");
+  assert.equal(distinctRequestResult.executionIdentity, result.executionIdentity,
+    "concurrent distinct reviewer request IDs share the active equivalent verification execution");
   assert.ok(["running", "completed"].includes(result.status));
   assert.ok(["running", "completed"].includes(duplicateResult.status));
+  assert.ok(["running", "completed"].includes(distinctRequestResult.status));
   assert.equal((await readFile(commandLaunches, "utf8")).trim().split("\n").length, 1,
     "concurrent duplicate requests execute the verification suite once");
   const completedResult = await verifyScheduledJob(verificationInput);

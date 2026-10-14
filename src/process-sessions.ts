@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { resolveShellCommand, terminateProcessTree } from "./process-platform.js";
 import { buildChildEnvironment } from "./process-environment.js";
@@ -23,6 +23,7 @@ const DEFAULT_MAX_RUNNING_PROCESSES_PER_OWNER = 8;
 const DEFAULT_IDLE_TIMEOUT_MS = 15 * 60 * 1_000;
 export const DEFAULT_MAX_RUNTIME_MS = 60 * 60 * 1_000;
 const DEFAULT_REAPER_INTERVAL_MS = 30_000;
+const MAX_PROCESS_RECOVERY_CAPABILITIES = 1_024;
 const DEFAULT_COLUMNS = 80;
 const DEFAULT_ROWS = 24;
 
@@ -31,6 +32,8 @@ export interface StartCommandInput {
   /** Stable owner for this MCP transport; never infer cross-client ownership from workspace alone. */
   ownerId?: string;
   workSessionId?: string;
+  /** Authenticated principal for output-only recovery after a transport reconnect. */
+  principalId?: string;
   command: string;
   cwd: string;
   tty?: boolean;
@@ -51,6 +54,8 @@ export interface WriteStdinInput {
   sessionId: string;
   ownerId?: string;
   workSessionId?: string;
+  principalId?: string;
+  recoveryCapability?: string;
   chars?: string;
   columns?: number;
   rows?: number;
@@ -81,6 +86,8 @@ export interface ProcessSnapshot {
   /** Epoch ms when the child was launched; lets a UI advance elapsed time
    *  locally between polls (P1: live process-card elapsed). */
   startedAtEpochMs: number;
+  /** Opaque, expiring output-poll authority; never permits input or signals. */
+  recoveryCapability?: string;
 }
 
 interface ManagedProcess {
@@ -94,6 +101,9 @@ interface ProcessSession {
   workspaceId: string;
   ownerId: string;
   workSessionId?: string;
+  principalId?: string;
+  recoveryCapability?: string;
+  recoveryCapabilityHash?: string;
   command: string;
   process?: ManagedProcess;
   startedAt: number;
@@ -119,6 +129,15 @@ interface LaunchRecord {
   sessionId: string;
   finalSnapshot?: ProcessSnapshot;
   cleanupTimer?: NodeJS.Timeout;
+}
+
+interface ProcessRecoveryCapability {
+  sessionId: string;
+  workspaceId: string;
+  principalId: string;
+  workSessionId?: string;
+  expiresAt: number;
+  operations: readonly ["poll_output"];
 }
 
 export interface ProcessSessionManagerOptions {
@@ -381,6 +400,7 @@ export class ProcessSessionManager {
   private readonly idleTimeoutMs: number;
   private readonly maxRuntimeMs: number;
   private readonly childEnvironmentAllowlist: string[];
+  private readonly recoveryCapabilities = new Map<string, ProcessRecoveryCapability>();
   private readonly reaperTimer: NodeJS.Timeout;
 
   constructor(options: ProcessSessionManagerOptions = {}) {
@@ -440,7 +460,7 @@ export class ProcessSessionManager {
         session.timeoutTimer.unref?.();
       }
     } catch (error) {
-      this.sessions.delete(session.id);
+      this.removeSession(session.id);
       if (launchKey) this.launches.delete(launchKey);
       throw error;
     }
@@ -454,11 +474,20 @@ export class ProcessSessionManager {
   }
 
   async write(input: WriteStdinInput): Promise<ProcessSnapshot> {
-    const session = this.getOwnedSession(input.workspaceId, input.sessionId, input.ownerId, input.workSessionId);
-    session.lastClientActivityAt = Date.now();
     const chars = input.chars ?? "";
     const interactionRequested =
       chars.length > 0 || input.columns !== undefined || input.rows !== undefined;
+    const session = input.recoveryCapability
+      ? this.getRecoverySession(
+          input.workspaceId,
+          input.sessionId,
+          input.principalId,
+          input.workSessionId,
+          input.recoveryCapability,
+          interactionRequested,
+        )
+      : this.getOwnedSession(input.workspaceId, input.sessionId, input.ownerId, input.workSessionId);
+    session.lastClientActivityAt = Date.now();
 
     if (input.columns !== undefined || input.rows !== undefined) {
       session.columns = terminalSize(input.columns, session.columns);
@@ -499,9 +528,27 @@ export class ProcessSessionManager {
     if (session.running) session.process?.kill("SIGTERM");
   }
 
+  revokeRecoveryCapability(recoveryCapability: string, principalId: string): boolean {
+    const tokenHash = this.hashRecoveryCapability(recoveryCapability);
+    const capability = this.recoveryCapabilities.get(tokenHash);
+    if (!capability || capability.principalId !== principalId) return false;
+    this.recoveryCapabilities.delete(tokenHash);
+    const session = this.sessions.get(capability.sessionId);
+    if (session?.recoveryCapabilityHash === tokenHash) {
+      session.recoveryCapability = undefined;
+      session.recoveryCapabilityHash = undefined;
+    }
+    return true;
+  }
+
   /** Terminate all live sessions belonging to one MCP transport owner. */
   async terminateByOwner(ownerId: string, timeoutMs = 2_000): Promise<void> {
-    const running = [...this.sessions.values()].filter((session) => session.running && session.ownerId === ownerId);
+    // A principal-bound recovery capability gives the original requester a
+    // short read-only reconnect window. Its bounded idle/runtime reaper still
+    // owns cleanup; transport teardown must not erase the output being recovered.
+    const running = [...this.sessions.values()].filter((session) => session.running
+      && session.ownerId === ownerId
+      && !session.recoveryCapabilityHash);
     for (const session of running) session.process?.kill("SIGTERM");
     await this.waitForSessions(running, timeoutMs);
     for (const session of running) {
@@ -554,6 +601,7 @@ export class ProcessSessionManager {
     }
     await this.waitForSessions(running, Math.min(timeoutMs, 500));
     this.sessions.clear();
+    this.recoveryCapabilities.clear();
     for (const launch of this.launches.values()) {
       if (launch.cleanupTimer) clearTimeout(launch.cleanupTimer);
     }
@@ -621,11 +669,12 @@ export class ProcessSessionManager {
       resolveExit = resolve;
     });
 
-    return {
+    const session: ProcessSession = {
       id: `proc_${randomUUID()}`,
       workspaceId: input.workspaceId,
       ownerId: input.ownerId ?? `workspace:${input.workspaceId}`,
       workSessionId: input.workSessionId,
+      principalId: input.principalId,
       command: input.command,
       startedAt: Date.now(),
       columns: terminalSize(input.columns, DEFAULT_COLUMNS),
@@ -638,6 +687,71 @@ export class ProcessSessionManager {
       lastClientActivityAt: Date.now(),
       lastProcessActivityAt: Date.now(),
     };
+    if (input.principalId?.trim()) this.issueRecoveryCapability(session, input.principalId);
+    return session;
+  }
+
+  private issueRecoveryCapability(session: ProcessSession, principalId: string): void {
+    this.pruneRecoveryCapabilities();
+    if (this.recoveryCapabilities.size >= MAX_PROCESS_RECOVERY_CAPABILITIES) return;
+    const token = randomBytes(32).toString("base64url");
+    const tokenHash = this.hashRecoveryCapability(token);
+    session.recoveryCapability = token;
+    session.recoveryCapabilityHash = tokenHash;
+    this.recoveryCapabilities.set(tokenHash, {
+      sessionId: session.id,
+      workspaceId: session.workspaceId,
+      principalId,
+      workSessionId: session.workSessionId,
+      expiresAt: session.startedAt + this.maxRuntimeMs + this.completedSessionTtlMs,
+      operations: ["poll_output"],
+    });
+  }
+
+  private hashRecoveryCapability(capability: string): string {
+    return createHash("sha256").update(capability, "utf8").digest("hex");
+  }
+
+  private pruneRecoveryCapabilities(now = Date.now()): void {
+    for (const [tokenHash, capability] of this.recoveryCapabilities) {
+      if (capability.expiresAt <= now || !this.sessions.has(capability.sessionId)) {
+        this.recoveryCapabilities.delete(tokenHash);
+        const session = this.sessions.get(capability.sessionId);
+        if (session?.recoveryCapabilityHash === tokenHash) {
+          session.recoveryCapability = undefined;
+          session.recoveryCapabilityHash = undefined;
+        }
+      }
+    }
+  }
+
+  private getRecoverySession(
+    workspaceId: string,
+    sessionId: string,
+    principalId: string | undefined,
+    workSessionId: string | undefined,
+    recoveryCapability: string,
+    interactionRequested: boolean,
+  ): ProcessSession {
+    if (interactionRequested) {
+      throw new Error("Process recovery capabilities permit output polling only; input, resize, and signals require the original owner.");
+    }
+    if (!principalId?.trim()) throw new Error("Process recovery requires an authenticated principal.");
+    this.pruneRecoveryCapabilities();
+    const tokenHash = this.hashRecoveryCapability(recoveryCapability);
+    const capability = this.recoveryCapabilities.get(tokenHash);
+    if (!capability || capability.expiresAt <= Date.now() || !capability.operations.includes("poll_output")) {
+      throw new Error("Process recovery capability is invalid, expired, or revoked.");
+    }
+    if (capability.principalId !== principalId) throw new Error("Process recovery capability belongs to another principal.");
+    if (capability.workspaceId !== workspaceId) throw new Error("Process recovery capability belongs to another workspace.");
+    if (capability.sessionId !== sessionId) throw new Error("Process recovery capability belongs to another process.");
+    if (capability.workSessionId !== workSessionId) throw new Error("Process recovery capability is bound to another work session.");
+    const session = this.sessions.get(sessionId);
+    if (!session) throw new Error(`Unknown process session: ${sessionId}`);
+    if (session.recoveryCapabilityHash !== tokenHash) throw new Error("Process recovery capability has been revoked.");
+    session.lastClientActivityAt = Date.now();
+    return session;
   }
 
   private startPipe(session: ProcessSession, input: StartCommandInput): void {
@@ -707,7 +821,7 @@ export class ProcessSessionManager {
     session.signal = signal;
     session.resolveExit();
     session.cleanupTimer = setTimeout(
-      () => this.sessions.delete(session.id),
+      () => this.removeSession(session.id),
       this.completedSessionTtlMs,
     );
     session.cleanupTimer.unref();
@@ -752,6 +866,7 @@ export class ProcessSessionManager {
       outputCursor: read.nextCursor,
       oldestAvailableCursor: read.oldestAvailableCursor,
       startedAtEpochMs: session.startedAt,
+      ...(session.running && session.recoveryCapability ? { recoveryCapability: session.recoveryCapability } : {}),
     };
     if (!snapshot.running && session.launchKey) {
       const launch = this.launches.get(session.launchKey);
@@ -798,5 +913,8 @@ export class ProcessSessionManager {
     const session = this.sessions.get(sessionId);
     if (session?.cleanupTimer) clearTimeout(session.cleanupTimer);
     this.sessions.delete(sessionId);
+    for (const [tokenHash, capability] of this.recoveryCapabilities) {
+      if (capability.sessionId === sessionId) this.recoveryCapabilities.delete(tokenHash);
+    }
   }
 }

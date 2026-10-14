@@ -92,7 +92,38 @@ const migrations: Migration[] = [
   { version: 80, name: "scheduled-job-execution-accounting", up: migrateScheduledJobExecutionAccounting },
   { version: 81, name: "acp-run-scheduled-execution-mode", up: migrateAcpRunScheduledExecutionMode },
   { version: 82, name: "scheduled-job-result-ownership", up: migrateScheduledJobResultOwnership },
+  { version: 83, name: "scheduled-state-times-and-verification-single-flight", up: migrateScheduledStateTimesAndVerificationSingleFlight },
 ];
+
+function migrateScheduledStateTimesAndVerificationSingleFlight(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "scheduled_jobs", "terminal_at", "text");
+  addColumnIfMissing(sqlite, "scheduled_jobs", "blocked_at", "text");
+  addColumnIfMissing(sqlite, "scheduled_jobs", "operator_intervention_at", "text");
+  addColumnIfMissing(sqlite, "scheduled_jobs", "last_state_changed_at", "text");
+  sqlite.exec(`
+    with ranked as (
+      select id,
+             row_number() over (
+               partition by job_id, work_session_id, submission_id, review_epoch,
+                            snapshot_kind, snapshot_ref, command_fingerprint, policy_fingerprint
+               order by created_at, id
+             ) as position
+        from scheduled_job_verifications
+       where status = 'running'
+    )
+    update scheduled_job_verifications
+       set status = 'failed',
+           failure_reason = 'Superseded while installing the single-flight verification policy.',
+           finished_at = coalesce(finished_at, created_at)
+     where id in (select id from ranked where position > 1);
+
+    create unique index if not exists scheduled_job_verifications_active_identity_unique
+      on scheduled_job_verifications(
+        job_id, work_session_id, submission_id, review_epoch,
+        snapshot_kind, snapshot_ref, command_fingerprint, policy_fingerprint
+      ) where status = 'running';
+  `);
+}
 
 function migrateScheduledJobResultOwnership(sqlite: Database.Database): void {
   addColumnIfMissing(sqlite, "scheduled_jobs", "dispatch_retry_count", "integer not null default 0");

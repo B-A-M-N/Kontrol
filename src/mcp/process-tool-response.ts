@@ -22,6 +22,7 @@ export function processResult(snapshot: ProcessSnapshot): string {
 export function processOutputSchema(): z.ZodRawShape {
   return resultOutputSchema({
     sessionId: z.string().optional(),
+    recoveryCapability: z.string().optional(),
     command: z.string().optional(),
     // Approval-required responses use the gated tool's shared result schema
     // and intentionally do not contain process lifecycle fields yet.
@@ -64,6 +65,7 @@ export function processToolResponse(
       tool,
       result,
       sessionId: snapshot.sessionId,
+      recoveryCapability: snapshot.recoveryCapability,
       command: snapshot.command,
       running: snapshot.running,
       exitCode: snapshot.exitCode,

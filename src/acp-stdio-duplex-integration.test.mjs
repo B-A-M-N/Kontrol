@@ -11,6 +11,7 @@ const state = await mkdtemp(join(tmpdir(), "kontrol-stdio-integration-"));
 const workspaceRoot = join(state, "workspace");
 await mkdir(workspaceRoot);
 const events = [];
+const acceptedEventIds = new Set();
 const control = createServer(async (req, res) => {
   const chunks = [];
   for await (const chunk of req) chunks.push(Buffer.from(chunk));
@@ -20,7 +21,22 @@ const control = createServer(async (req, res) => {
     res.end(JSON.stringify({ id: "stdio-test-agent", agentCredential: "stdio-test-credential" }));
     return;
   }
-  if (req.url?.includes("/events")) events.push(body);
+  if (req.url?.includes("/events")) {
+    if (!acceptedEventIds.has(body.event_id)) {
+      acceptedEventIds.add(body.event_id);
+      events.push(body);
+    }
+    res.writeHead(202, { "content-type": "application/json" });
+    res.end(JSON.stringify(["completed", "failed", "cancelled", "exited"].includes(body.type) ? {
+      accepted: true,
+      dispatch_receipt_acknowledged: true,
+      dispatch_idempotency_key: body.dispatch_idempotency_key,
+      remote_run_id: body.remote_run_id,
+      attempt_number: body.attempt_number,
+      event_id: body.event_id,
+    } : { accepted: true }));
+    return;
+  }
   res.writeHead(202, { "content-type": "application/json" });
   res.end(JSON.stringify({ accepted: true }));
 });
@@ -43,7 +59,7 @@ try {
   probeReadOnlyExecutionSandbox({ workspaceRoot });
   readOnlySandboxAvailable = true;
 } catch { /* the integration below asserts fail-closed when user namespaces are unavailable */ }
-const childCode = `const fs=require("node:fs");try{fs.appendFileSync(${JSON.stringify(launchCountPath)},"1")}catch{};let b="",seen=[];process.stdin.setEncoding("utf8");process.stdin.on("data",c=>{b+=c;for(const line of b.split(/\\r?\\n/).slice(0,-1)){const m=JSON.parse(line);if(m.method==="initialize"){seen.push(m.method);process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:m.id,result:{protocolVersion:1,agentCapabilities:{}}})+"\\n")}else if(m.method==="session/new"){seen.push(m.method);process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:m.id,result:{sessionId:"agent-session-1"}})+"\\n")}else if(m.method==="session/prompt"){seen.push(m.method);let workspaceWriteBlocked=false;if(process.env.READ_ONLY_TEST==="1"){try{fs.writeFileSync("/workspace/readonly-test-write.txt","should fail")}catch{workspaceWriteBlocked=true}};process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:m.id,result:{sessionId:m.params.sessionId,received:m.params.prompt,methods:seen,workspaceWriteBlocked}})+"\\n");setTimeout(()=>process.exit(0),20)}}b=b.split(/\\r?\\n/).at(-1)||""})`;
+const childCode = `const fs=require("node:fs");try{fs.appendFileSync(${JSON.stringify(launchCountPath)},"1")}catch{};let b="",seen=[];process.stdin.setEncoding("utf8");process.stdin.on("data",c=>{b+=c;for(const line of b.split(/\\r?\\n/).slice(0,-1)){const m=JSON.parse(line);if(m.method==="initialize"){seen.push(m.method);process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:m.id,result:{protocolVersion:1,agentCapabilities:{}}})+"\\n")}else if(m.method==="session/new"){seen.push(m.method);process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:m.id,result:{sessionId:"agent-session-1"}})+"\\n")}else if(m.method==="session/prompt"){seen.push(m.method);let workspaceWriteBlocked=false;if(process.env.READ_ONLY_TEST==="1"){try{fs.writeFileSync("/workspace/readonly-test-write.txt","should fail")}catch{workspaceWriteBlocked=true}};const report="Audit report: café 🌲\\nFindings persisted."+(workspaceWriteBlocked?"\\nworkspaceWriteBlocked=true":"");process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:m.id,result:{sessionId:m.params.sessionId,content:[{type:"text",text:report}],methods:seen,workspaceWriteBlocked}})+"\\n");setTimeout(()=>process.exit(0),20)}}b=b.split(/\\r?\\n/).at(-1)||""})`;
 const adapter = spawn(process.execPath, ["scripts/acp-stdio-duplex-adapter.mjs"], {
   cwd: process.cwd(),
   env: {
@@ -54,6 +70,8 @@ const adapter = spawn(process.execPath, ["scripts/acp-stdio-duplex-adapter.mjs"]
     KONTROL_ACP_AGENT_STATE_FILE: join(state, "identity.json"),
     KONTROL_STDIO_DISPATCH_RECEIPTS: join(state, "dispatch-receipts.json"),
     KONTROL_STDIO_OWNED_PROCESSES: join(state, "owned-processes.json"),
+    KONTROL_STDIO_EVENT_SPOOL: join(state, "event-spool.json"),
+    KONTROL_STDIO_TERMINAL_SPOOL: join(state, "terminal-spool.json"),
     KONTROL_BWRAP: bubblewrapPath,
     KONTROL_ALLOWED_ROOTS: workspaceRoot,
     KONTROL_READ_ONLY_AGENT_ENV_ALLOWLIST: "READ_ONLY_TEST",
@@ -66,6 +84,7 @@ const adapter = spawn(process.execPath, ["scripts/acp-stdio-duplex-adapter.mjs"]
   },
   stdio: ["ignore", "pipe", "pipe"],
 });
+adapter.stderr.on("data", (chunk) => process.stderr.write(`[stdio integration adapter] ${chunk}`));
 try {
   const deadline = Date.now() + 5_000;
   while (Date.now() < deadline) {
@@ -100,15 +119,27 @@ try {
   assert.equal(accepted.dispatch_idempotency_key, "stdio-normal-dispatch");
   assert.ok(["running", "completed"].includes(accepted.status));
   const deadlineForEvent = Date.now() + 5_000;
-  while (Date.now() < deadlineForEvent && !events.some((event) => JSON.stringify(event).includes("task reaches stdio child"))) {
+  while (Date.now() < deadlineForEvent && !events.some((event) => event.type === "completed")) {
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
-  assert.ok(events.some((event) => JSON.stringify(event).includes("task reaches stdio child")), "dispatched task did not reach child stdin");
-  const protocolResult = events.find((event) => JSON.stringify(event.payload).includes("task reaches stdio child"));
-  assert.ok(protocolResult, "ACP protocol result was not projected");
+  const protocolResult = events.find((event) => event.type === "output_delta" && event.payload?.channel === "result");
+  assert.ok(protocolResult, `ACP protocol result was not projected; observed events: ${JSON.stringify(events)}`);
   const protocolOutput = JSON.stringify(protocolResult.payload);
-  assert.match(protocolOutput, /initialize.*session\/new.*session\/prompt/, "generic adapter uses the standard ACP session handshake");
-  assert.match(protocolOutput, /agent-session-1/, "generic adapter prompts the ACP session returned by session/new");
+  assert.match(protocolOutput, /Audit report: café 🌲\\nFindings persisted\./, "generic adapter records the authoritative multiline Unicode prompt response");
+  const terminalEvent = events.find((event) => event.type === "completed");
+  assert.equal(terminalEvent?.payload.final_output, "Audit report: café 🌲\nFindings persisted.",
+    "the terminal lifecycle event carries the exact attempt-scoped ACP report");
+  assert.equal(terminalEvent?.dispatch_idempotency_key, "stdio-normal-dispatch");
+  assert.equal(terminalEvent?.attempt_number, 1);
+  assert.ok(terminalEvent?.event_id, "terminal delivery has a stable attempt-scoped identity");
+  const deadlineForAcknowledgement = Date.now() + 5_000;
+  while (Date.now() < deadlineForAcknowledgement) {
+    const pendingTerminalEvents = JSON.parse(await readFile(join(state, "terminal-spool.json"), "utf8"));
+    if (pendingTerminalEvents.length === 0) break;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.deepEqual(JSON.parse(await readFile(join(state, "event-spool.json"), "utf8")), [], "acknowledged output events leave the spool");
+  assert.deepEqual(JSON.parse(await readFile(join(state, "terminal-spool.json"), "utf8")), [], "terminal event leaves the spool after exact controller acknowledgement");
   const replayResponse = await fetch(`http://127.0.0.1:${adapterPort}/runs`, {
     method: "POST",
     headers: { "content-type": "application/json", authorization: "Bearer adapter-secret" },
@@ -162,12 +193,12 @@ try {
     assert.equal(readOnlyAccepted.execution_receipt?.network_policy, "disabled");
     assert.equal(readOnlyAccepted.execution_receipt?.confinement, "bubblewrap-read-only-workspace-no-network");
     const readOnlyEventDeadline = Date.now() + 5_000;
-    while (Date.now() < readOnlyEventDeadline && !events.some((event) => JSON.stringify(event.payload).includes("must remain sandboxed"))) {
+    while (Date.now() < readOnlyEventDeadline && !events.some((event) => event.type === "output_delta" && event.payload?.channel === "result" && event.payload?.text?.includes("workspaceWriteBlocked=true"))) {
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
-    const confinedResult = events.find((event) => JSON.stringify(event.payload).includes("must remain sandboxed"));
+    const confinedResult = events.find((event) => event.type === "output_delta" && event.payload?.channel === "result" && event.payload?.text?.includes("workspaceWriteBlocked=true"));
     assert.ok(confinedResult, "the read-only ACP child completed a real protocol prompt");
-    assert.match(JSON.stringify(confinedResult.payload), /workspaceWriteBlocked.*true|true.*workspaceWriteBlocked/,
+    assert.match(confinedResult.payload.text, /workspaceWriteBlocked=true/,
       "the ACP child could not modify the read-only workspace mount");
   } else {
     assert.equal(readOnlyResponse.status, 503, "an unavailable OS namespace backend fails closed");

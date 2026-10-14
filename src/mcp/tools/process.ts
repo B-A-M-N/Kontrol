@@ -123,6 +123,7 @@ export function registerCodexProcessTools(
           workspaceId,
           ownerId: processSessionOwnerId(connectionContext),
           workSessionId: connectionContext?.workSessionId,
+          principalId: connectionContext?.authenticatedPrincipalId,
           command: cmd,
           cwd,
           tty,
@@ -286,10 +287,12 @@ export function registerProcessPollingTool(
         "Retrieve output and completion state for a process returned by bash. This tool never writes process input "
         + "and never consumes output: pass afterCursor (the outputCursor from your previous poll) to read only new "
         + "output; a retried identical poll at the same cursor returns the same output until retention evicts it "
-        + "(oldestAvailableCursor reports eviction). Omitting afterCursor advances the session's shared read pointer.",
+        + "(oldestAvailableCursor reports eviction). Omitting afterCursor advances the session's shared read pointer. "
+        + "After a transport reconnect, provide the recoveryCapability returned by bash to reattach for output polling only.",
       inputSchema: {
         workspaceId: z.string().describe("Workspace identifier used to start the process."),
         sessionId: z.string().describe("Opaque process session identifier returned by bash."),
+        recoveryCapability: z.string().min(40).max(200).optional().describe("Expiring output-only capability returned by bash for same-principal transport reattachment."),
         afterCursor: z
           .number()
           .int()
@@ -309,7 +312,7 @@ export function registerProcessPollingTool(
       // is a read-once operation, not an idempotent one.
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     },
-    async ({ workspaceId, sessionId, afterCursor, yieldTimeMs, maxOutputTokens }) => {
+    async ({ workspaceId, sessionId, recoveryCapability, afterCursor, yieldTimeMs, maxOutputTokens }) => {
       workspaces.getWorkspace(workspaceId);
       const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
       if (bindingErr) return bindingErr;
@@ -318,6 +321,8 @@ export function registerProcessPollingTool(
         sessionId,
         ownerId: processSessionOwnerId(connectionContext),
         workSessionId: connectionContext?.workSessionId,
+        principalId: connectionContext?.authenticatedPrincipalId,
+        recoveryCapability,
         afterCursor,
         yieldTimeMs,
         maxOutputTokens,

@@ -592,6 +592,8 @@ export async function callRemoteAgent(
     config.agentRegistry.updateRun(run.runId, {
       attemptNumber,
       status: "resuming",
+      outputPreview: "",
+      outputJson: "",
       errorMessage: undefined,
       finishedAt: undefined,
     });

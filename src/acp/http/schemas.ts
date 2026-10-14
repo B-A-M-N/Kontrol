@@ -43,6 +43,8 @@ export const acpRunEventSchema = z.object({
   // superseded attempt (an earlier continuation of the same logical run) are
   // rejected so a late event from attempt N cannot mutate attempt N+1.
   attempt_number: z.number().int().positive().optional(),
+  /** Exact durable dispatch claim for delayed lifecycle delivery. */
+  dispatch_idempotency_key: z.string().min(1).optional(),
   type: z.string().min(1),
   event_id: z.string().min(1).optional().describe("Stable adapter event identity for retry deduplication."),
   event_sequence: z.number().int().positive().optional().describe("Adapter-local ordering for replay."),

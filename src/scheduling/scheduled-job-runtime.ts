@@ -263,8 +263,8 @@ export function createScheduledJobRuntime(options: ScheduledJobRuntimeOptions): 
   function markDue(jobId: string): number | undefined {
     const now = new Date().toISOString();
     const result = database.sqlite
-      .prepare("update scheduled_jobs set status = 'due', revision = revision + 1, updated_at = ? where id = ? and status = 'pending'")
-      .run(now, jobId);
+      .prepare("update scheduled_jobs set status = 'due', revision = revision + 1, updated_at = ?, last_state_changed_at = ? where id = ? and status = 'pending'")
+      .run(now, now, jobId);
     if (result.changes !== 1) return undefined;
     const row = database.sqlite.prepare("select revision from scheduled_jobs where id = ?").get(jobId) as { revision?: number } | undefined;
     return row?.revision;
@@ -328,8 +328,8 @@ export function createScheduledJobRuntime(options: ScheduledJobRuntimeOptions): 
       const alreadyDue = Date.parse(row.run_at) <= Date.parse(now);
       const status = alreadyDue ? "due" : "pending";
       database.sqlite
-        .prepare("update scheduled_jobs set status = ?, updated_at = ? where id = ? and status in ('pending','due','reconciling') and revision = ?")
-        .run(status, now, row.id, row.revision);
+        .prepare("update scheduled_jobs set status = ?, updated_at = ?, last_state_changed_at = case when status != ? then ? else last_state_changed_at end where id = ? and status in ('pending','due','reconciling') and revision = ?")
+        .run(status, now, status, now, row.id, row.revision);
       // Re-arm the due trigger under the canonical logical key; enqueue() is
       // idempotent for the same (type, aggregateId, revision). Dispatching
       // jobs are intentionally excluded: an expired lease represents a
