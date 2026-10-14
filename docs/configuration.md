@@ -510,7 +510,8 @@ Supervisor and verification concurrency are bounded independently:
 | `KONTROL_CRUSH_MAX_RUN_MS` | `86400000` | CRUSH absolute emergency ceiling regardless of activity |
 | `KONTROL_CRUSH_TERMINATE_GRACE_MS` | `5000` | Grace between SIGTERM and SIGKILL when terminating a stuck/cancelled CRUSH run |
 | `KONTROL_STARTUP_PROFILE` | `dev-fast` | `dev-fast` / `normal` / `release` preflight depth for start-all.sh. Fast development startup is the default; use `normal` or `release` for the complete test gate. |
-| `KONTROL_BETA_SOAK_URL` | `KONTROL_PUBLIC_BASE_URL` or local MCP origin | `./start-all.sh --qualify` soak target. HTTPS URLs exercise the deployed HTTPS origin. With `KONTROL_AUTH_MODE=tunnel`, a loopback HTTP origin exercises Kontrol's local SSE stream while tunnel readiness monitors the OpenAI Secure MCP Tunnel's outbound HTTPS path; a connected-host receipt is still required for end-to-end external qualification. |
+| `KONTROL_BETA_SOAK_URL` | Selected profile's endpoint | Optional `./start-all.sh --qualify` target override. Hosted mode requires a non-loopback HTTPS origin with `KONTROL_AUTH_MODE=oauth`; Secure MCP Tunnel mode requires loopback HTTP with `KONTROL_AUTH_MODE=tunnel`. |
+| `KONTROL_BETA_SOAK_TRANSPORT` | Derived from `KONTROL_AUTH_MODE` | `public_https` or `secure_mcp_tunnel`. Explicit selection must match the auth mode. Local HTTP qualification is rejected before the code gate or generation activation. |
 | `KONTROL_BETA_SOAK_HOURS` | `12` | Requested wall-clock soak duration for `start-all.sh --qualify`; the launcher enforces at least 12 hours and honors a larger `KONTROL_BETA_MIN_SOAK_HOURS`. |
 | `KONTROL_BETA_WORKSPACE_PATH` | Checkout root | Workspace used by soak read, continuity, approval, and resource exercises. The runner removes its uniquely named continuity marker after each exercise. |
 | `KONTROL_BETA_SOAK_REPORT` | `<checkout>/beta-soak.json` | Atomic progress and final report path. |

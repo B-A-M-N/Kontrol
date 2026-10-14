@@ -412,8 +412,16 @@ Current implementation contracts:
   than merging arrays. A qualification capture has `capturedAt`, `captureId`,
   `initialize`, and the matching `toolsList`; the receipt labels the host
   exchange operator-supplied and Kontrol's live server exchange
-  machine-verified. Qualification requires the deployed HTTPS intermediary
-  (a public HTTPS origin or OpenAI Secure MCP Tunnel),
+  machine-verified. Qualification supports two mutually exclusive endpoint
+  profiles: a hosted public HTTPS origin with `KONTROL_AUTH_MODE=oauth`, or
+  OpenAI Secure MCP Tunnel with `KONTROL_AUTH_MODE=tunnel` and a loopback MCP
+  origin. `start-all.sh --qualify` derives the profile from auth mode unless
+  `KONTROL_BETA_SOAK_TRANSPORT` selects it explicitly, validates URL/profile
+  agreement before running the code gate or changing the generation, and
+  rejects local-only HTTP qualification. A single running generation and its
+  receipt bind to one endpoint profile; qualify the other profile in its own
+  run and retain its matching code, soak, and host-catalog evidence.
+  Qualification requires the deployed HTTPS intermediary,
   at least two GET heartbeat bytes per session, two observed drain recoveries,
   eight bounded inspections per cycle, a near-complete 45-second POST heartbeat
   with separately counted diagnostics, and concurrent resource reads;

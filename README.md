@@ -117,20 +117,44 @@ directory's `beta-soak.log`), or attach with
 rest of the stack and leaves an `interrupted` report.
 
 The launcher requires `KONTROL_DIAGNOSTICS_SECRET` and a reviewer secret in
-the environment file. It uses `KONTROL_PUBLIC_BASE_URL` for the soak target
-when configured, otherwise it monitors the local MCP server. A local target
-gets recurring dual-session GET/POST SSE probes with real heartbeat bytes and
-server-side response accounting. With a public HTTPS URL, those probes use the
-deployed HTTPS origin. With `KONTROL_AUTH_MODE=tunnel`, the local MCP hop stays
-loopback HTTP by design; `tunnel-client` carries the external connection to
-OpenAI over HTTPS, and the monitor checks tunnel readiness separately. The
-local probe does not claim to observe the host's remote route, so final
-stable-beta qualification still needs fresh external host-catalog evidence.
-The soak target, duration, workspace, report, and log can be set with
-`KONTROL_BETA_SOAK_URL`, `KONTROL_BETA_SOAK_HOURS`,
+the environment file. It supports two qualification profiles. For a hosted
+endpoint, set `KONTROL_AUTH_MODE=oauth` and a non-loopback HTTPS
+`KONTROL_PUBLIC_BASE_URL`; the monitor probes that HTTPS origin. For OpenAI
+Secure MCP Tunnel, set `KONTROL_AUTH_MODE=tunnel`; the monitor probes the
+loopback MCP origin while `tunnel-client` carries the external connection over
+HTTPS and reports tunnel readiness. These profiles use different auth trust
+boundaries, so one running generation qualifies one profile at a time. The
+launcher rejects local-only HTTP or a URL/profile mismatch before running the
+code gate or changing the active generation. Each profile still needs fresh
+external host-catalog evidence for its exact endpoint and candidate.
+
+`KONTROL_BETA_SOAK_TRANSPORT` can explicitly select `public_https` or
+`secure_mcp_tunnel`; it must match `KONTROL_AUTH_MODE`. `KONTROL_BETA_SOAK_URL`
+overrides the matching profile's target. The duration, workspace, report, and
+log can be set with `KONTROL_BETA_SOAK_HOURS`,
 `KONTROL_BETA_WORKSPACE_PATH`, `KONTROL_BETA_SOAK_REPORT`, and
 `KONTROL_BETA_SOAK_LOG`; `KONTROL_BETA_SSE_PROBE_CADENCE` changes how often
 the streaming probe runs. The stable-beta minimum remains 12 hours.
+
+Use the same launcher for each profile, with its matching settings in `.env`.
+For a hosted endpoint:
+
+```dotenv
+KONTROL_AUTH_MODE=oauth
+KONTROL_PUBLIC_BASE_URL=https://kontrol.example.com
+KONTROL_BETA_SOAK_TRANSPORT=public_https
+```
+
+For OpenAI Secure MCP Tunnel:
+
+```dotenv
+KONTROL_AUTH_MODE=tunnel
+KONTROL_BETA_SOAK_TRANSPORT=secure_mcp_tunnel
+```
+
+Run `./start-all.sh --qualify` after selecting either profile. Each run creates
+evidence for that exact endpoint and build; switching profiles starts a new
+qualification run.
 
 Routine development startup defaults to the fast preflight (syntax/typecheck
 plus a fresh atomic build) so reconnecting does not rerun the entire test

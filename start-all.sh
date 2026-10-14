@@ -10,6 +10,8 @@ export DESKTOP_PWD
 PREPARE_ONLY=0
 ACTIVATE_EXISTING=0
 QUALIFY_MODE=0
+QUALIFY_SOAK_URL=""
+QUALIFY_SOAK_TRANSPORT=""
 for argument in "$@"; do
   case "$argument" in
     --prepare-only) PREPARE_ONLY=1 ;;
@@ -39,6 +41,45 @@ if [[ "$QUALIFY_MODE" == "1" ]]; then
   fi
   if [[ -z "${KONTROL_TUNNEL_REVIEWER_SECRET:-${KONTROL_ACP_REVIEWER_SECRET:-}}" ]]; then
     echo "ERROR: --qualify requires KONTROL_TUNNEL_REVIEWER_SECRET or KONTROL_ACP_REVIEWER_SECRET in the launcher environment file." >&2
+    exit 1
+  fi
+  case "${KONTROL_AUTH_MODE:-oauth}" in
+    tunnel)
+      QUALIFY_SOAK_TRANSPORT="${KONTROL_BETA_SOAK_TRANSPORT:-secure_mcp_tunnel}"
+      QUALIFY_SOAK_URL="${KONTROL_BETA_SOAK_URL:-http://127.0.0.1:${PORT:-7676}}"
+      if [[ "$QUALIFY_SOAK_TRANSPORT" != "secure_mcp_tunnel" ]]; then
+        echo "ERROR: KONTROL_AUTH_MODE=tunnel qualifies through secure_mcp_tunnel. Use KONTROL_AUTH_MODE=oauth for a hosted public HTTPS endpoint." >&2
+        exit 1
+      fi
+      ;;
+    oauth)
+      QUALIFY_SOAK_TRANSPORT="${KONTROL_BETA_SOAK_TRANSPORT:-public_https}"
+      QUALIFY_SOAK_URL="${KONTROL_BETA_SOAK_URL:-${KONTROL_PUBLIC_BASE_URL:-}}"
+      if [[ "$QUALIFY_SOAK_TRANSPORT" != "public_https" ]]; then
+        echo "ERROR: hosted qualification requires KONTROL_AUTH_MODE=oauth and transport=public_https. Use KONTROL_AUTH_MODE=tunnel for OpenAI Secure MCP Tunnel." >&2
+        exit 1
+      fi
+      ;;
+    *)
+      echo "ERROR: --qualify supports KONTROL_AUTH_MODE=tunnel or oauth; got '${KONTROL_AUTH_MODE}'." >&2
+      exit 1
+      ;;
+  esac
+  if ! node -e '
+    const value = process.argv[1];
+    const mode = process.argv[2];
+    try {
+      const url = new URL(value);
+      const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
+      if (url.username || url.password || url.pathname !== "/" || url.search || url.hash) process.exit(1);
+      if (mode === "public_https") {
+        if (url.protocol !== "https:" || loopback) process.exit(1);
+      } else if (mode === "secure_mcp_tunnel") {
+        if (url.protocol !== "http:" || !loopback) process.exit(1);
+      } else process.exit(1);
+    } catch { process.exit(1); }
+  ' "$QUALIFY_SOAK_URL" "$QUALIFY_SOAK_TRANSPORT"; then
+    echo "ERROR: --qualify needs a matching external endpoint: use a non-loopback KONTROL_PUBLIC_BASE_URL=https://... with oauth, or a loopback HTTP URL with tunnel auth." >&2
     exit 1
   fi
   if ! node -e '
@@ -512,14 +553,8 @@ start_beta_soak_monitor() {
     return 1
   fi
 
-  soak_url="${KONTROL_BETA_SOAK_URL:-${KONTROL_PUBLIC_BASE_URL:-http://127.0.0.1:${DEV_PORT}}}"
-  if [[ "$soak_url" == https://* ]]; then
-    soak_transport="public_https"
-  elif [[ "${KONTROL_AUTH_MODE:-oauth}" == "tunnel" && "$soak_url" =~ ^http://(localhost|127\.0\.0\.1|\[::1\])(:[0-9]+)?$ ]]; then
-    soak_transport="secure_mcp_tunnel"
-  else
-    soak_transport="local_http"
-  fi
+  soak_url="$QUALIFY_SOAK_URL"
+  soak_transport="$QUALIFY_SOAK_TRANSPORT"
   workspace_path="${KONTROL_BETA_WORKSPACE_PATH:-$DESKTOP_PWD}"
   read_path="${KONTROL_BETA_SOAK_READ_PATH:-AGENTS.md}"
   report_path="${KONTROL_BETA_SOAK_REPORT:-$DESKTOP_PWD/beta-soak.json}"
@@ -560,8 +595,6 @@ start_beta_soak_monitor() {
   echo "    Attach: tmux attach -t kontrol-beta-soak"
   if [[ "$soak_transport" == "secure_mcp_tunnel" ]]; then
     echo "[*] The soak checks GET/POST SSE on the local MCP origin and monitors tunnel-client readiness. OpenAI Secure MCP Tunnel carries the external connection over HTTPS; a fresh connected-host catalog receipt is still required for release qualification."
-  elif [[ "$soak_transport" == "local_http" ]]; then
-    echo "[!] This is a local HTTP soak. GET/POST SSE is exercised locally; stable-beta release qualification still needs the deployed HTTPS path and fresh external host-catalog evidence."
   fi
 }
 
