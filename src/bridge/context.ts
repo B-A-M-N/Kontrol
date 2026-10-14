@@ -22,6 +22,7 @@ import type { ReviewWorkflowService } from "../review-workflow.js";
 import type { SupervisorRuns } from "../supervisor-runs.js";
 import type { WorkSessionManager } from "../work-sessions.js";
 import type { WorkspaceRegistry } from "../workspaces.js";
+import type { McpQualificationEvidenceJournal } from "../server/mcp-qualification-evidence.js";
 import { checkoutLeaseMetadata, compactMissionPacket, workSessionInstructions } from "./shared.js";
 import type { LiveWaiterRegistry } from "./shared.js";
 import { createHash } from "node:crypto";
@@ -97,6 +98,10 @@ export interface BridgeConfig {
   reconcileScheduledJob?: (jobId: string) => Promise<import("../scheduling/scheduled-job-store.js").ScheduledJob | undefined>;
   /** Durable review-route/handoff store, shared with review workflow. */
   reviewRoutes?: import("../review-handoff/route-store.js").ReviewRouteStore;
+  /** Durable, content-addressed external-host qualification evidence. */
+  qualificationEvidence?: McpQualificationEvidenceJournal;
+  /** Immutable MCP tool-surface version observed by this server process. */
+  toolSurfaceVersion?: string;
 }
 
 

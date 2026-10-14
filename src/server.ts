@@ -113,6 +113,7 @@ import { handleDiagnostics } from "./server/diagnostics.js";
 import { handleMcpHttpRequest, type McpHttpDeps } from "./server/mcp-http.js";
 import { ExpiredMcpOperationTracker } from "./server/mcp-expired-operations.js";
 import { McpOperationDiagnostics } from "./server/mcp-operation-diagnostics.js";
+import { McpQualificationEvidenceJournal } from "./server/mcp-qualification-evidence.js";
 import {
   handleMcpRequestWithDeadline,
   McpAdmission,
@@ -308,6 +309,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     deploymentId: deploymentContext.deploymentId,
     expectedSchemaVersion: deploymentContext.expectedSchemaVersion,
   });
+  const qualificationEvidence = new McpQualificationEvidenceJournal(db.sqlite);
   const mutationReceipts = createMutationReceiptStore(db);
   const workspaceStore = createWorkspaceStore(db);
   const workspaces = new WorkspaceRegistry(config, workspaceStore);
@@ -623,6 +625,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     mcpResourceAdmission,
     expiredMcpOperations,
     operationDiagnostics,
+    qualificationEvidence,
     sessionLifecycle,
     workspaceAppResourceMetrics,
     recordUnknownSessionRequest: (sessionId: string) => {
@@ -677,6 +680,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
       reviewRoutes,
       (uri) => { /* noop handshake */ },
       (jobId) => reconcileScheduledJob?.(jobId) ?? Promise.resolve(undefined),
+      qualificationEvidence,
     ),
     mutationReceipts,
     workspaces,
@@ -708,6 +712,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     mcpResourceAdmission,
     expiredMcpOperations,
     operationDiagnostics,
+    qualificationEvidence,
     sessionLifecycle,
     policyWaiters,
     workspaceAppResourceMetrics,

@@ -16,6 +16,7 @@ import type { McpSessionState, WorkspaceAppResourceMetrics } from "./mcp-session
 import type { McpAdmission } from "./mcp-admission.js";
 import type { ExpiredMcpOperationTracker } from "./mcp-expired-operations.js";
 import type { McpOperationDiagnostics } from "./mcp-operation-diagnostics.js";
+import type { McpQualificationEvidenceJournal } from "./mcp-qualification-evidence.js";
 import type { Request, Response } from "express";
 import { toolListCacheDiagnostics } from "../mcp-tool-list-cache.js";
 import { readMcpToolSurface } from "../mcp/tool-names.js";
@@ -28,6 +29,7 @@ export interface DiagnosticsDeps {
   readonly mcpResourceAdmission: McpAdmission;
   readonly expiredMcpOperations: ExpiredMcpOperationTracker;
   readonly operationDiagnostics: McpOperationDiagnostics;
+  readonly qualificationEvidence: McpQualificationEvidenceJournal;
   readonly sessionLifecycle: McpSessionLifecycle;
   readonly policyWaiters: McpPolicyWaiterRegistry;
   readonly workspaceAppResourceMetrics: WorkspaceAppResourceMetrics;
@@ -80,6 +82,33 @@ export async function handleDiagnostics(deps: DiagnosticsDeps, req: Request, res
   const b = Buffer.from(expected);
   if (a.length !== b.length || !timingSafeEqual(a, b)) {
     return res.status(403).json({ ok: false, error: "Forbidden: valid X-Kontrol-Diagnostics credential required" });
+  }
+  const query = req.query as Record<string, unknown>;
+  const includeQualificationEvidence = query.qEvidence === "1";
+  const qualificationFilters: {
+    serverBuildId?: string;
+    captureId?: string;
+    sessionIdSha256?: string;
+    operationId?: string;
+  } = {};
+  if (includeQualificationEvidence) {
+    const filterFields = [
+      ["qBuild", "serverBuildId", 256],
+      ["qCapture", "captureId", 256],
+      ["qSession", "sessionIdSha256", 64],
+      ["qOperation", "operationId", 128],
+    ] as const;
+    for (const [queryKey, filterKey, maxLength] of filterFields) {
+      const raw = query[queryKey];
+      if (raw === undefined) continue;
+      if (typeof raw !== "string" || raw.length === 0 || raw.length > maxLength) {
+        return res.status(400).json({ ok: false, error: `Invalid ${queryKey} qualification evidence filter` });
+      }
+      if (filterKey === "sessionIdSha256" && !/^[a-f0-9]{64}$/.test(raw)) {
+        return res.status(400).json({ ok: false, error: `Invalid ${queryKey} qualification evidence filter` });
+      }
+      qualificationFilters[filterKey] = raw;
+    }
   }
   try {
     const sqlite = deps.sqlite();
@@ -175,6 +204,28 @@ export async function handleDiagnostics(deps: DiagnosticsDeps, req: Request, res
       terminationReasons: sessionLifecycle.mcpSessionTerminationMetrics(),
       connectionRecovery: { ...deps.mcpConnectionMetrics },
       operationDiagnostics: deps.operationDiagnostics.snapshot(),
+      ...(includeQualificationEvidence
+        ? {
+            qualificationEvidence: {
+              source: "sqlite",
+              records: deps.qualificationEvidence.listRecent({ ...qualificationFilters, limit: 500 }),
+              associations: deps.qualificationEvidence.listQualificationAssociations({
+                serverBuildId: qualificationFilters.serverBuildId,
+                captureId: qualificationFilters.captureId,
+                sessionIdSha256: qualificationFilters.sessionIdSha256,
+                limit: 500,
+              }),
+              externalCatalogObservations: qualificationFilters.captureId && qualificationFilters.sessionIdSha256
+                ? deps.qualificationEvidence.listExternalCatalogObservations({
+                    serverBuildId: qualificationFilters.serverBuildId,
+                    captureId: qualificationFilters.captureId,
+                    sessionIdSha256: qualificationFilters.sessionIdSha256,
+                    limit: 10,
+                  })
+                : [],
+            },
+          }
+        : {}),
       toolCatalogParity: (() => {
         const sessions = [...mcpSessions.values()];
         const degraded = sessions.filter((session) => session.toolCatalogHandshake?.status !== "accepted");

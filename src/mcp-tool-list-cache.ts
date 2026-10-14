@@ -1,15 +1,9 @@
 /**
- * P1 #42: compatibility adapter for the tools/list descriptor cache.
- *
- * This optimization reaches into MCP SDK internals (`_requestHandlers`) to
- * memoize the tool-list descriptor. That is fragile across SDK upgrades, so
- * ALL internal access is funnelled through this one module, which:
- *   1. runtime-checks the expected SDK shape before touching anything,
- *   2. falls back cleanly to uncached behavior when the shape changes,
- *   3. records why caching is unavailable for diagnostics.
- *
- * If the SDK internals change, the only failure mode is losing the cache —
- * never breaking tools/list.
+ * Intercept the SDK's public `setRequestHandler` registration API so catalog
+ * observation and descriptor caching remain independent. The fingerprint
+ * observer is mandatory for acknowledgement; the cache is optional. If the
+ * registration hook is unavailable, tools/list remains uncached and
+ * diagnostics explain why catalog verification is unavailable.
  */
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { ZodType } from "zod/v4";
@@ -20,6 +14,7 @@ export interface ToolListCacheMetrics {
   hits: number;
   misses: number;
   unavailableReason?: string;
+  fingerprintObservationUnavailableReason?: string;
 }
 
 // The map is keyed by a per-session McpServer instance. A strong map here
@@ -47,6 +42,9 @@ function foldMetrics(metrics: ToolListCacheMetrics, event?: "hit" | "miss"): voi
   if (metrics.unavailableReason && !cumulativeMetrics.unavailableReason) {
     cumulativeMetrics.unavailableReason = metrics.unavailableReason;
   }
+  if (metrics.fingerprintObservationUnavailableReason && !cumulativeMetrics.fingerprintObservationUnavailableReason) {
+    cumulativeMetrics.fingerprintObservationUnavailableReason = metrics.fingerprintObservationUnavailableReason;
+  }
 }
 
 /** Diagnostics view of cache health, including any unavailability reason. */
@@ -59,48 +57,87 @@ export function toolListCacheDiagnostics(): Array<{ metrics: ToolListCacheMetric
     hits: cumulativeMetrics.hits,
     misses: cumulativeMetrics.misses,
     ...(cumulativeMetrics.unavailableReason ? { unavailableReason: cumulativeMetrics.unavailableReason } : {}),
+    ...(cumulativeMetrics.fingerprintObservationUnavailableReason
+      ? { fingerprintObservationUnavailableReason: cumulativeMetrics.fingerprintObservationUnavailableReason }
+      : {}),
   };
   return [{ metrics: total }];
 }
 
+function registrationInterceptor(
+  server: McpServer,
+  listToolsSchema: ZodType,
+  wrap: (handler: InternalRequestHandler) => InternalRequestHandler,
+  onUnavailable: (metrics: ToolListCacheMetrics) => void,
+): { finalizeRegistration(): boolean } {
+  const metrics = metricsFor(server);
+  const protocol = server.server as unknown as {
+    setRequestHandler?: (schema: ZodType, handler: InternalRequestHandler) => void;
+  };
+  if (!protocol || typeof protocol.setRequestHandler !== "function") {
+    onUnavailable(metrics);
+    foldMetrics(metrics);
+    return { finalizeRegistration: () => false };
+  }
+  const originalSetRequestHandler = protocol.setRequestHandler.bind(protocol);
+  let listHandlerObserved = false;
+  protocol.setRequestHandler = (schema, originalHandler) => {
+    if (schema !== listToolsSchema) {
+      originalSetRequestHandler(schema, originalHandler);
+      return;
+    }
+    listHandlerObserved = true;
+    originalSetRequestHandler(schema, wrap(originalHandler));
+  };
+  return {
+    finalizeRegistration() {
+      if (!listHandlerObserved) {
+        onUnavailable(metrics);
+        foldMetrics(metrics);
+      }
+      return listHandlerObserved;
+    },
+  };
+}
+
 /**
- * Install the descriptor cache. Returns true when caching is active; false
- * when the SDK's internal shape did not match expectations (uncached path
- * remains fully functional).
+ * Observe the exact tools/list response emitted by the SDK. Install this
+ * before registering tools. It is independent of the descriptor cache so
+ * cache failure cannot make catalog acknowledgement unavailable.
+ */
+export function observeToolListDescriptors(
+  server: McpServer,
+  listToolsSchema: ZodType,
+  onDescriptor: (descriptor: unknown) => void,
+): { finalizeRegistration(): boolean } {
+  return registrationInterceptor(server, listToolsSchema, (handler) => async (request, extra) => {
+    const descriptor = await handler(request, extra);
+    onDescriptor(descriptor);
+    return descriptor;
+  }, (metrics) => {
+    metrics.fingerprintObservationUnavailableReason = "SDK tools/list registration hook was not observed; catalog verification is unavailable";
+  });
+}
+
+/**
+ * Install the optional descriptor cache using the SDK's public handler
+ * registration API. Cache failure leaves the list handler untouched.
  */
 export function installCachedToolList(
   server: McpServer,
   cacheKey: string,
   cache: Map<string, Promise<unknown>>,
   listToolsSchema: ZodType,
-  onDescriptor?: (descriptor: unknown) => void,
-): boolean {
-  const metrics = metricsFor(server);
-  // Runtime shape check against the exact internals we depend on.
-  const protocol = server.server as unknown as {
-    _requestHandlers?: Map<string, InternalRequestHandler>;
-    setRequestHandler?: (schema: ZodType, handler: InternalRequestHandler) => void;
-  };
-  if (!protocol || typeof protocol.setRequestHandler !== "function" || !(protocol._requestHandlers instanceof Map)) {
-    metrics.unavailableReason = "SDK internals changed: _requestHandlers/setRequestHandler not found";
-    foldMetrics(metrics);
-    return false;
-  }
-  const original = protocol._requestHandlers.get("tools/list");
-  if (!original) {
-    metrics.unavailableReason = "no tools/list handler registered before cache install";
-    foldMetrics(metrics);
-    return false;
-  }
-
-  protocol.setRequestHandler(listToolsSchema, async (request, extra) => {
+): { finalizeRegistration(): boolean } {
+  return registrationInterceptor(server, listToolsSchema, (originalHandler) => async (request, extra) => {
+    const metrics = metricsFor(server);
     let cached = cache.get(cacheKey);
     if (!cached) {
       metrics.misses++;
       foldMetrics(metrics, "miss");
       // Do not retain a transient failure as the descriptor forever. The
       // identity check prevents a late rejection from deleting a newer retry.
-      const pending = Promise.resolve(original(request, extra));
+      const pending = Promise.resolve(originalHandler(request, extra));
       cached = pending.catch((error) => {
         if (cache.get(cacheKey) === cached) cache.delete(cacheKey);
         throw error;
@@ -110,9 +147,8 @@ export function installCachedToolList(
       metrics.hits++;
       foldMetrics(metrics, "hit");
     }
-    const descriptor = await cached;
-    onDescriptor?.(descriptor);
-    return descriptor;
+    return cached;
+  }, (metrics) => {
+    metrics.unavailableReason = "SDK tools/list registration hook was not observed; descriptor caching is disabled";
   });
-  return true;
 }

@@ -187,19 +187,42 @@ npm run probe:tunnel -- --url "$KONTROL_PUBLIC_BASE_URL" --workspace "$PWD" --du
 npm run gate:beta:final
 ```
 
-Capture `external-tools-list.json` from the connected MCP host after the
-candidate deployment. It must include `capturedAt`, `captureId`, the full
-`mcpSessionId`, the fresh `initialize` response, the matching server
+If the host has a supported producer for its actual callable registry, capture
+`external-tools-list.json` with `capturedAt`, `captureId`, the SHA-256 of the
+full MCP session ID, the fresh `initialize` response, the matching server
 `toolsList`, the host's actual `registeredCatalog`, and its acknowledgement
-notification record. The probe correlates that same session with authenticated
-Kontrol diagnostics and requires matching server and host catalog fingerprints.
-The host capture remains operator-supplied; the receipt separately marks
-Kontrol's accepted acknowledgement and fresh live server probe as
-machine-verified. See `docs/mcp-tool-catalog-ack.md` for the wrapper contract.
+record with the same `captureId`. Do not provide the raw session ID. For
+Secure MCP Tunnel, also include the completed `await_workspace_events` call
+and its exact `x-kontrol-operation-id` response header in
+`streamingCall.operationId`.
+
+The probe retrieves retained SQLite evidence by capture, full session hash,
+build, and operation ID, so Kontrol may restart before the post-soak probe. The
+reviewer tools `submit_external_catalog_observation` and
+`get_external_catalog_observation` persist an observation on the currently
+claimed review handoff with its investigation direction. They label all
+submitted host data `operator_reported`; missing registry access is recorded
+as `host_capture_unsupported`. The current ChatGPT host path has no supported
+callable-registry producer, so its registration remains unverified and the
+final beta gate will reject qualification. See
+`docs/mcp-tool-catalog-ack.md` for evidence and refresh details.
+
 The probe also exercises two live SSE heartbeat cycles under concurrent
 Workspace App resource reads and requires two observed drain recoveries. A
 localhost or idle-proxy run cannot write a qualification receipt. Capture the
 host snapshot during the candidate soak and run the probe after the soak ends.
+
+Kontrol's `tools/list_changed` refresh pulse and reinitialize tests exercise
+the server side of a release transition. They do not update or prove ChatGPT's
+published app registry. After deploying release B, a ChatGPT Business,
+Enterprise, or Edu admin with app-management permission and a valid connection
+must open **Workspace Settings → Apps**, select the app's **… → Action
+control → Refresh**, and review the action diff. ChatGPT disables newly added
+actions by default until an admin enables them.
+Capture the refreshed release B catalog on a new MCP session and provide it to
+the qualification probe. That capture remains operator-reported because
+Kontrol cannot read ChatGPT's internal registry through the current host path.
+See `docs/mcp-tool-catalog-ack.md` for the evidence boundary.
 
 For a reported ChatGPT stream interruption, preserve the browser HAR, the
 authenticated diagnostics snapshot, Kontrol JSON logs, and any intermediary

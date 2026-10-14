@@ -93,6 +93,8 @@ const migrations: Migration[] = [
   { version: 81, name: "acp-run-scheduled-execution-mode", up: migrateAcpRunScheduledExecutionMode },
   { version: 82, name: "scheduled-job-result-ownership", up: migrateScheduledJobResultOwnership },
   { version: 83, name: "scheduled-state-times-and-verification-single-flight", up: migrateScheduledStateTimesAndVerificationSingleFlight },
+  { version: 84, name: "mcp-qualification-evidence", up: migrateMcpQualificationEvidence },
+  { version: 85, name: "external-catalog-observations-and-associations", up: migrateExternalCatalogObservationsAndAssociations },
 ];
 
 function migrateScheduledStateTimesAndVerificationSingleFlight(sqlite: Database.Database): void {
@@ -1862,6 +1864,134 @@ function migrateApprovalOwnerContext(sqlite: Database.Database): void {
 function migrateWorkSessionOwnerContext(sqlite: Database.Database): void {
   addColumnIfMissing(sqlite, "work_sessions", "owner_context_id", "text");
   sqlite.exec("create index if not exists work_sessions_owner_context_idx on work_sessions(owner_context_id, updated_at)");
+}
+
+function migrateMcpQualificationEvidence(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table if not exists mcp_qualification_evidence (
+      record_id text primary key not null,
+      record_type text not null check (record_type in ('catalog_acknowledgement', 'external_sse')),
+      capture_id text,
+      server_build_id text,
+      server_version text not null,
+      session_id_sha256 text not null,
+      operation_id text,
+      observed_at text not null,
+      expires_at text not null,
+      content_sha256 text not null,
+      accepted integer,
+      server_catalog_sha256 text,
+      host_catalog_sha256 text,
+      tool_count integer,
+      rejection_reason text,
+      http_method text,
+      rpc_method text,
+      tool_name text,
+      started_at text,
+      finished_at text,
+      duration_ms integer,
+      http_status integer,
+      response_bytes integer,
+      heartbeat_bytes integer,
+      response_close_classification text,
+      handler_still_running integer
+    );
+    create index if not exists mcp_qualification_evidence_build_idx
+      on mcp_qualification_evidence(server_build_id, observed_at, record_id);
+    create index if not exists mcp_qualification_evidence_capture_idx
+      on mcp_qualification_evidence(capture_id, observed_at, record_id);
+    create index if not exists mcp_qualification_evidence_session_idx
+      on mcp_qualification_evidence(session_id_sha256, observed_at, record_id);
+    create unique index if not exists mcp_qualification_evidence_operation_idx
+      on mcp_qualification_evidence(operation_id) where operation_id is not null;
+    create index if not exists mcp_qualification_evidence_expiry_idx
+      on mcp_qualification_evidence(expires_at, observed_at);
+  `);
+}
+
+function migrateExternalCatalogObservationsAndAssociations(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table if not exists mcp_external_catalog_observations (
+      record_id text primary key not null,
+      capture_id text not null,
+      host_kind text not null,
+      server_build_id text,
+      server_version text not null,
+      session_id_sha256 text not null,
+      captured_at text not null,
+      submitted_at text not null,
+      observation_source text not null check (observation_source in ('operator_reported')),
+      status text not null check (status in ('host_capture_unsupported', 'operator_reported_match', 'operator_reported_mismatch')),
+      server_catalog_sha256 text not null,
+      host_catalog_sha256 text,
+      host_tool_count integer,
+      record_json text not null,
+      content_sha256 text not null,
+      work_session_id text,
+      handoff_id text,
+      expires_at text not null
+    );
+    create index if not exists mcp_external_catalog_observations_build_idx
+      on mcp_external_catalog_observations(server_build_id, submitted_at, record_id);
+    create index if not exists mcp_external_catalog_observations_capture_idx
+      on mcp_external_catalog_observations(capture_id, submitted_at, record_id);
+    create index if not exists mcp_external_catalog_observations_session_idx
+      on mcp_external_catalog_observations(session_id_sha256, submitted_at, record_id);
+    create index if not exists mcp_external_catalog_observations_handoff_idx
+      on mcp_external_catalog_observations(handoff_id, submitted_at, record_id);
+    create index if not exists mcp_external_catalog_observations_expiry_idx
+      on mcp_external_catalog_observations(expires_at, submitted_at);
+
+    create table if not exists mcp_qualification_associations (
+      record_id text primary key not null,
+      server_build_id text not null,
+      capture_id text not null,
+      session_id_sha256 text not null,
+      soak_id text,
+      observation_record_id text,
+      acknowledgement_record_id text,
+      external_sse_record_id text,
+      created_at text not null,
+      content_sha256 text not null,
+      expires_at text not null
+    );
+    create index if not exists mcp_qualification_associations_build_idx
+      on mcp_qualification_associations(server_build_id, created_at, record_id);
+    create index if not exists mcp_qualification_associations_capture_idx
+      on mcp_qualification_associations(capture_id, created_at, record_id);
+    create index if not exists mcp_qualification_associations_session_idx
+      on mcp_qualification_associations(session_id_sha256, created_at, record_id);
+    create unique index if not exists mcp_qualification_associations_evidence_unique
+      on mcp_qualification_associations(
+        server_build_id,
+        capture_id,
+        session_id_sha256,
+        acknowledgement_record_id,
+        ifnull(external_sse_record_id, ''),
+        ifnull(observation_record_id, ''),
+        ifnull(soak_id, '')
+      );
+    create index if not exists mcp_qualification_associations_expiry_idx
+      on mcp_qualification_associations(expires_at, created_at);
+
+    create table if not exists review_handoff_external_catalog_attachments (
+      attachment_id text primary key not null,
+      observation_record_id text not null,
+      work_session_id text not null,
+      handoff_id text not null,
+      reviewer_principal_id text not null,
+      reviewer_owner_context_id text not null,
+      investigation_direction text not null,
+      attached_at text not null,
+      content_sha256 text not null,
+      expires_at text not null,
+      unique (observation_record_id, handoff_id)
+    );
+    create index if not exists review_handoff_catalog_attachments_handoff_idx
+      on review_handoff_external_catalog_attachments(handoff_id, attached_at, attachment_id);
+    create index if not exists review_handoff_catalog_attachments_expiry_idx
+      on review_handoff_external_catalog_attachments(expires_at, attached_at);
+  `);
 }
 
 function addColumnIfMissing(

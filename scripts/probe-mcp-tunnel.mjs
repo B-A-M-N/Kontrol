@@ -7,7 +7,9 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
-import { assertInputSchemaCompatibility, extractCatalog, extractServerInfoVersion, extractWorkspaceAppResourceUris, fingerprintToolCatalog, matchJsonRpcResponse, parseSseEventChunks } from "./lib/mcp-probe-protocol.mjs";
+import { assertInputSchemaCompatibility, extractCatalog, extractRegisteredCatalog, extractServerInfoVersion, extractWorkspaceAppResourceUris, fingerprintToolCatalog, matchJsonRpcResponse, parseSseEventChunks, TOOL_CATALOG_ACK_CAPABILITY, TOOL_CATALOG_ACK_METHOD } from "./lib/mcp-probe-protocol.mjs";
+import { matchCatalogAcknowledgementEvidence, matchExternalSseEvidence } from "./lib/mcp-qualification-evidence.mjs";
+import { classifyProbeFailure, writeFailedProbeReceipt } from "./lib/probe-failure-receipt.mjs";
 
 const args = process.argv.slice(2);
 function option(name, fallback) {
@@ -15,10 +17,37 @@ function option(name, fallback) {
   return index >= 0 ? args[index + 1] : fallback;
 }
 function has(name) { return args.includes(name); }
+function canonicalQualificationJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalQualificationJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value).filter((key) => value[key] !== undefined).sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalQualificationJson(value[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+function contentAddress(value) {
+  return createHash("sha256").update(canonicalQualificationJson(value)).digest("hex");
+}
 const dualSession = has("--dual");
 const REQUIRED_INSPECTION_TOOLS = ["read", "grep", "glob", "ls", "git_status", "git_log", "git_diff", "git_show"];
 
 const target = option("--url", "http://127.0.0.1:7676");
+const resultFilePath = option("--result-file", undefined);
+const failureResultFilePath = option("--failure-result-file", resultFilePath ? `${resolve(resultFilePath)}.failed.json` : undefined);
+let qualificationFailureContext = {};
+let failureReceiptWritten = false;
+if (failureResultFilePath) {
+  const handleQualificationFailure = (error) => {
+    if (failureReceiptWritten) return;
+    failureReceiptWritten = true;
+    const reason = classifyProbeFailure(error);
+    try { writeFailedProbeReceipt(failureResultFilePath, error, qualificationFailureContext); } catch { /* preserve the original failure */ }
+    process.stderr.write(`qualification probe failed: ${reason}\n`);
+    process.exit(1);
+  };
+  process.on("uncaughtException", handleQualificationFailure);
+  process.on("unhandledRejection", handleQualificationFailure);
+}
 const targetOrigin = new URL(target);
 const transportMode = option("--transport", targetOrigin.protocol === "https:" ? "public_https" : "local_http");
 const qualificationTunnelId = option("--tunnel-id", undefined);
@@ -28,7 +57,6 @@ const buildMetaPath = option("--build-meta", undefined);
 const expectedMcpVersion = option("--expected-mcp-version", undefined);
 const expectedBuildId = option("--expected-build-id", undefined);
 const hostCatalogPath = option("--host-catalog-file", undefined);
-const resultFilePath = option("--result-file", undefined);
 const diagnosticsSecret = option("--diagnostics-secret", process.env.KONTROL_DIAGNOSTICS_SECRET);
 const toolName = option("--tool-name", "bash");
 const toolCommand = option("--tool-command", "sleep 0.25; printf tunnel-regression-ok");
@@ -108,11 +136,26 @@ const hostCatalogDocument = hostCatalogPath
   ? JSON.parse(readFileSync(resolve(hostCatalogPath), "utf8"))
   : undefined;
 const hostCaptureEnvelope = hostCatalogDocument?.payload ?? hostCatalogDocument;
-const hostRegisteredCatalog = hostCaptureEnvelope?.registeredCatalog;
-const hostCatalog = hostCatalogDocument
-  ? extractCatalog(hostRegisteredCatalog ?? hostCatalogDocument)
-  : undefined;
+const hostCatalog = hostCaptureEnvelope ? extractRegisteredCatalog(hostCaptureEnvelope) : undefined;
 const hostCatalogVersion = hostCatalogDocument ? extractServerInfoVersion(hostCatalogDocument) : undefined;
+const hostInitializeResult = hostCaptureEnvelope?.initializeResult ?? hostCaptureEnvelope?.initialize;
+const hostToolsListResult = hostCaptureEnvelope?.toolsListResult ?? hostCaptureEnvelope?.toolsList;
+const hostAcknowledgement = hostCaptureEnvelope?.acknowledgement ?? hostCaptureEnvelope?.catalogAcknowledgement;
+const hostStreamingCall = hostCaptureEnvelope?.streamingCall;
+const hostSessionIdSha256 = /^[a-f0-9]{64}$/.test(hostCaptureEnvelope?.sessionIdSha256 ?? "")
+  ? hostCaptureEnvelope.sessionIdSha256
+  : typeof hostCaptureEnvelope?.mcpSessionId === "string"
+    ? createHash("sha256").update(hostCaptureEnvelope.mcpSessionId).digest("hex")
+    : undefined;
+const qualificationCaptureId = typeof hostCaptureEnvelope?.captureId === "string"
+  ? hostCaptureEnvelope.captureId
+  : undefined;
+qualificationFailureContext = {
+  expectedBuildId,
+  expectedMcpVersion: expectedVersion,
+  captureId: qualificationCaptureId,
+  transportMode,
+};
 if (resultFilePath) {
   const document = hostCaptureEnvelope;
   assert.ok(hostCatalogPath, "--result-file requires --host-catalog-file");
@@ -122,31 +165,33 @@ if (resultFilePath) {
     "--result-file requires a timestamped external host catalog envelope");
   assert.ok(typeof document?.captureId === "string" && document.captureId.length > 0,
     "--result-file requires an operator-supplied captureId identifying the external host connection");
-  assert.ok(typeof document?.mcpSessionId === "string" && document.mcpSessionId.length >= 16,
-    "--result-file requires the MCP session ID of the external host transport");
+  assert.ok(typeof hostSessionIdSha256 === "string",
+    "--result-file requires the SHA-256 identity of the external host session; raw session IDs are unnecessary");
   assert.ok(document?.registeredCatalog && Array.isArray(hostCatalog?.rawTools),
-    "--result-file requires registeredCatalog from the host's callable tool registry, in addition to toolsList");
-  assert.equal(document?.catalogAcknowledgement?.method, "notifications/experimental/kontrol/tool-catalog-accepted",
+    "host_capture_unsupported: --result-file requires registeredCatalog from the host's callable tool registry, in addition to toolsList; Kontrol cannot derive it from toolsList");
+  assert.equal(hostAcknowledgement?.method, "notifications/experimental/kontrol/tool-catalog-accepted",
     "--result-file requires the host's catalog acknowledgement notification record");
-  assert.equal(document?.catalogAcknowledgement?.contractVersion, 1,
+  assert.equal(hostAcknowledgement?.contractVersion, 1,
     "--result-file requires catalog acknowledgement contract version 1");
-  assert.ok(document?.initialize && document?.toolsList,
+  assert.equal(hostAcknowledgement?.captureId, document.captureId,
+    "the host acknowledgement must bind to the same captureId as the external host envelope");
+  assert.ok(hostInitializeResult && hostToolsListResult,
     "--result-file requires initialize and toolsList from the same fresh external host connection");
-  const capturedVersion = extractServerInfoVersion(document.initialize);
+  const capturedVersion = extractServerInfoVersion(hostInitializeResult);
   assert.ok(capturedVersion,
     "--result-file requires serverInfo.version in the captured initialize response");
   assert.equal(hostCatalogVersion, capturedVersion,
     "initialize.serverInfo.version and toolsList must come from the same unambiguous host envelope");
-  const explicitToolsList = extractCatalog(document.toolsList);
+  const explicitToolsList = extractCatalog(hostToolsListResult);
   assert.deepEqual([...explicitToolsList.names].sort(), [...hostCatalog.names].sort(),
     "the captured toolsList must be the one authoritative catalog in the host envelope");
   const registeredFingerprint = fingerprintToolCatalog(hostCatalog.rawTools);
   assert.ok(registeredFingerprint, "the host registered catalog must be hashable");
-  assert.equal(document.catalogAcknowledgement.hostCatalogSha256, registeredFingerprint.sha256,
+  assert.equal(hostAcknowledgement.hostCatalogSha256, registeredFingerprint.sha256,
     "the host acknowledgement record must fingerprint the actual registered catalog");
-  assert.equal(document.catalogAcknowledgement.hostToolCount, registeredFingerprint.toolCount,
+  assert.equal(hostAcknowledgement.hostToolCount, registeredFingerprint.toolCount,
     "the host acknowledgement record must include its registered tool count");
-  assert.equal(document.catalogAcknowledgement.serverVersion, capturedVersion,
+  assert.equal(hostAcknowledgement.serverVersion, capturedVersion,
     "the host acknowledgement must target the same immutable server version as initialize");
   if (transportMode === "secure_mcp_tunnel") {
     assert.equal(document?.transport?.kind, "openai_secure_mcp_tunnel",
@@ -157,7 +202,7 @@ if (resultFilePath) {
       "Secure MCP Tunnel capture must attest the host-facing HTTPS transport");
     assert.equal(document?.transport?.tunnelId, qualificationTunnelId,
       "host capture and live tunnel ID do not match");
-    const stream = document?.streamingCall;
+    const stream = hostStreamingCall;
     assert.equal(stream?.toolName, "await_workspace_events",
       "Secure MCP Tunnel capture must include a real long-running SSE tool call");
     assert.ok(Number.isInteger(stream?.requestedWaitMs) && stream.requestedWaitMs >= 45_000,
@@ -168,11 +213,18 @@ if (resultFilePath) {
       && Number.isFinite(Date.parse(stream?.finishedAt ?? ""))
       && Date.parse(stream.finishedAt) >= Date.parse(stream.startedAt),
     "host streaming call must include ordered start and finish timestamps");
+    assert.ok(typeof stream?.operationId === "string" && stream.operationId.length > 0 && stream.operationId.length <= 128,
+      "host streaming call must include the exact server-issued operationId from its HTTP response");
+    if (stream.captureId !== undefined) {
+      assert.equal(stream.captureId, document.captureId,
+        "host streaming call captureId must match the external host capture");
+    }
   }
 }
 
 const observedCatalogs = [];
 const sessionVersions = new Map();
+const probeClientAcknowledgements = [];
 const observedRequestCorrelations = [];
 const validatedWorkspaceAppResources = new Map();
 let deployedWorkspaceAppUri;
@@ -216,6 +268,8 @@ function assertCatalogParity(label, listed, sessionId) {
     serverCatalogSha256: liveCatalogFingerprint.sha256,
     serverTools: [...actual.names].sort(),
     serverToolMetadata: actual.tools,
+    serverToolDescriptors: actual.rawTools,
+    serverCatalogSha256: liveCatalogFingerprint.sha256,
   });
   return actual;
 }
@@ -320,15 +374,25 @@ async function writeProbeReceipt(cycles) {
   assert.ok(observed, "no fresh server tools/list exchange was observed");
   const registeredFingerprint = fingerprintToolCatalog(hostCatalog?.rawTools);
   assert.ok(registeredFingerprint, "external host callable catalog fingerprint is missing");
-  const diagnosticSnapshot = await diagnostics();
-  assert.ok(diagnosticSnapshot, "external catalog qualification requires authenticated server diagnostics");
-  const sessionIdSha256 = createHash("sha256").update(document.mcpSessionId).digest("hex");
-  const hostSession = (diagnosticSnapshot?.mcpSessionMetrics?.sessions ?? [])
-    .find((candidate) => candidate.sessionIdSha256 === sessionIdSha256);
-  assert.ok(hostSession, "the captured external host session is not present in authenticated diagnostics");
-  const acceptedHandshake = hostSession.toolCatalogHandshake;
-  assert.equal(acceptedHandshake?.status, "accepted",
-    "Kontrol did not accept the catalog acknowledgement on the captured external host session");
+  const sessionIdSha256 = hostSessionIdSha256;
+  const acknowledgementSnapshot = await diagnostics({
+    serverBuildId: expectedBuildId,
+    captureId: document.captureId,
+    sessionIdSha256,
+  });
+  assert.ok(acknowledgementSnapshot, "external catalog qualification requires authenticated server diagnostics");
+  const acknowledgementRecords = acknowledgementSnapshot?.mcpSessionMetrics?.qualificationEvidence?.records ?? [];
+  const acceptedHandshakes = matchCatalogAcknowledgementEvidence(acknowledgementRecords, {
+    captureId: document.captureId,
+    serverBuildId: expectedBuildId,
+    serverVersion: extractServerInfoVersion(hostInitializeResult),
+    sessionIdSha256,
+    catalogSha256: registeredFingerprint.sha256,
+    toolCount: registeredFingerprint.toolCount,
+  });
+  assert.ok(acceptedHandshakes.length > 0,
+    "SQLite qualification evidence must contain an accepted acknowledgement bound to this capture, session, build, and catalog");
+  const acceptedHandshake = acceptedHandshakes[0];
   assert.equal(acceptedHandshake.hostCatalogSha256, registeredFingerprint.sha256,
     "Kontrol's accepted host catalog digest does not match the host's registered catalog");
   assert.equal(acceptedHandshake.serverCatalogSha256, registeredFingerprint.sha256,
@@ -338,47 +402,151 @@ async function writeProbeReceipt(cycles) {
   assert.equal(acceptedHandshake.toolCount, registeredFingerprint.toolCount,
     "the accepted host catalog tool count does not match the captured callable catalog");
   let externalHostStreaming;
+  let hostEvidenceSnapshot = acknowledgementSnapshot;
   if (transportMode === "secure_mcp_tunnel") {
-    const stream = document.streamingCall;
-    const streamStartedAtMs = Date.parse(stream.startedAt);
-    const streamFinishedAtMs = Date.parse(stream.finishedAt);
-    const diagnosticsStream = (diagnosticSnapshot?.mcpSessionMetrics?.operationDiagnostics?.recent ?? [])
-      .find((operation) => operation.sessionIdPrefix === document.mcpSessionId.slice(0, 8)
-        && operation.method === "POST"
-        && operation.toolName === stream.toolName
-        && operation.heartbeatBytes > 0
-        && operation.responseBytes > 0
-        && operation.responseCloseClassification === "response_finished"
-        && operation.handlerStillRunning === false
-        && Date.parse(operation.startedAt ?? "") >= streamStartedAtMs - 2_000
-        && Date.parse(operation.finishedAt ?? "") <= streamFinishedAtMs + 2_000
-        && Number(operation.totalDurationMs) >= stream.requestedWaitMs - 5_000);
-    assert.ok(diagnosticsStream,
-      "authenticated server diagnostics did not observe the captured host's completed 45-second SSE call");
+    const stream = hostStreamingCall;
+    const streamSnapshot = await diagnostics({
+      serverBuildId: expectedBuildId,
+      captureId: document.captureId,
+      sessionIdSha256,
+      operationId: stream.operationId,
+    });
+    assert.ok(streamSnapshot, "external SSE qualification requires authenticated server diagnostics");
+    hostEvidenceSnapshot = streamSnapshot;
+    const streamRecords = streamSnapshot?.mcpSessionMetrics?.qualificationEvidence?.records ?? [];
+    const diagnosticsStreams = matchExternalSseEvidence(streamRecords, {
+      operationId: stream.operationId,
+      sessionIdSha256,
+      serverBuildId: expectedBuildId,
+      serverVersion: extractServerInfoVersion(hostInitializeResult),
+      captureId: document.captureId,
+      toolName: stream.toolName,
+      startedAt: stream.startedAt,
+      finishedAt: stream.finishedAt,
+      requestedWaitMs: stream.requestedWaitMs,
+    });
+    assert.equal(diagnosticsStreams.length, 1,
+      "authenticated SQLite evidence must contain exactly the same session, build, and operation ID as the completed host SSE capture");
+    const diagnosticsStream = diagnosticsStreams[0];
     externalHostStreaming = {
       source: "authenticated_server_diagnostics",
       machineVerified: true,
-      tunnelId: qualificationTunnelId,
-      scheme: "https",
+      evidenceId: diagnosticsStream.recordId,
+      evidenceContentSha256: diagnosticsStream.contentSha256,
+      serverBuildId: diagnosticsStream.serverBuildId,
+      serverVersion: diagnosticsStream.serverVersion,
       sessionIdSha256,
       operationId: diagnosticsStream.operationId,
       toolName: diagnosticsStream.toolName,
       requestedWaitMs: stream.requestedWaitMs,
       startedAt: stream.startedAt,
       finishedAt: stream.finishedAt,
-      durationMs: diagnosticsStream.totalDurationMs,
+      durationMs: diagnosticsStream.durationMs,
       heartbeatBytes: diagnosticsStream.heartbeatBytes,
       responseBytes: diagnosticsStream.responseBytes,
       responseCloseClassification: diagnosticsStream.responseCloseClassification,
       handlerStillRunning: diagnosticsStream.handlerStillRunning,
       terminalResultReceived: stream.terminalResultReceived,
+      evidenceRecord: diagnosticsStream,
     };
   }
+  const hostEvidence = hostEvidenceSnapshot.mcpSessionMetrics?.qualificationEvidence;
+  const hostObservationRecord = (hostEvidence?.externalCatalogObservations ?? []).find((record) =>
+    record.captureId === document.captureId
+    && record.serverBuildId === expectedBuildId
+    && record.sessionIdSha256 === sessionIdSha256);
+  const hostQualificationAssociation = (hostEvidence?.associations ?? []).find((record) =>
+    record.serverBuildId === expectedBuildId
+    && record.captureId === document.captureId
+    && record.sessionIdSha256 === sessionIdSha256
+    && record.acknowledgementRecordId === acceptedHandshake.recordId
+    && (!hostObservationRecord || record.observationRecordId === hostObservationRecord.recordId)
+    && (transportMode !== "secure_mcp_tunnel"
+      || record.externalSseRecordId === externalHostStreaming?.evidenceId));
+  assert.ok(hostQualificationAssociation,
+    "authenticated server diagnostics must return a durable association for this exact host acknowledgement and session");
   const finishedAt = new Date().toISOString();
-  const hostCatalogSha256 = createHash("sha256").update(JSON.stringify(hostCatalogDocument)).digest("hex");
+  const hostCatalogSha256 = registeredFingerprint.sha256;
+  const serverCatalogEvidenceBody = {
+    source: "fresh_http_tools_list",
+    serverVersion: observed.serverInfoVersion,
+    tools: observed.serverToolDescriptors,
+    catalogSha256: observed.serverCatalogSha256,
+  };
+  const serverCatalogEvidence = {
+    ...serverCatalogEvidenceBody,
+    contentSha256: contentAddress(serverCatalogEvidenceBody),
+  };
+  const externalHostObservationBody = {
+    contractVersion: 1,
+    captureId: document.captureId,
+    capturedAt: document.capturedAt,
+    hostKind: document.hostKind ?? "unknown",
+    serverVersion: extractServerInfoVersion(hostInitializeResult),
+    sessionIdSha256,
+    initializeResult: hostInitializeResult,
+    toolsListResult: { tools: extractCatalog(hostToolsListResult).rawTools },
+    registeredCatalog: hostCatalog.rawTools,
+    serverCatalogSha256: observed.serverCatalogSha256,
+    hostCatalogSha256: registeredFingerprint.sha256,
+    hostToolCount: registeredFingerprint.toolCount,
+    acknowledgement: {
+      method: hostAcknowledgement.method,
+      contractVersion: hostAcknowledgement.contractVersion,
+      captureId: hostAcknowledgement.captureId,
+      serverVersion: hostAcknowledgement.serverVersion,
+      hostCatalogSha256: hostAcknowledgement.hostCatalogSha256,
+      hostToolCount: hostAcknowledgement.hostToolCount,
+    },
+    observationSource: "operator_reported",
+    status: registeredFingerprint.sha256 === observed.serverCatalogSha256
+      ? "operator_reported_match"
+      : "operator_reported_mismatch",
+  };
+  const externalHostObservation = {
+    ...externalHostObservationBody,
+    contentSha256: contentAddress(externalHostObservationBody),
+  };
+  const externalTransport = transportMode === "public_https" ? {
+    source: "authenticated_server_diagnostics",
+    machineVerified: true,
+    mode: "public_https",
+    url: target,
+    serverBuildId: expectedBuildId,
+    serverVersion: expectedVersion,
+    sessionIdSha256: postHeartbeatEvidence.sessionIdSha256,
+    operationId: postHeartbeatEvidence.evidenceRecord?.operationId,
+    evidenceId: postHeartbeatEvidence.evidenceId,
+    evidenceRecord: postHeartbeatEvidence.evidenceRecord,
+    qualificationAssociation: postHeartbeatEvidence.qualificationAssociation,
+  } : undefined;
+  const hostFacingTransportObservation = transportMode === "secure_mcp_tunnel" ? {
+    source: "operator_reported_host_capture",
+    observationSource: "operator_reported",
+    mode: "secure_mcp_tunnel",
+    scheme: "https",
+    tunnelId: qualificationTunnelId,
+    captureId: document.captureId,
+    sessionIdSha256,
+    operationId: hostStreamingCall?.operationId,
+    contentSha256: contentAddress({
+      source: "operator_reported_host_capture",
+      observationSource: "operator_reported",
+      mode: "secure_mcp_tunnel",
+      scheme: "https",
+      tunnelId: qualificationTunnelId,
+      captureId: document.captureId,
+      sessionIdSha256,
+      operationId: hostStreamingCall?.operationId,
+    }),
+  } : undefined;
   const receipt = {
     kind: "kontrol-external-catalog-probe",
-    status: "passed",
+    status: "unverified",
+    statusReason: "host_registration_unverified",
+    serverCatalogVerified: true,
+    hostRegistrationVerified: false,
+    externalTransportVerified: Boolean(externalTransport?.evidenceRecord),
     expectedBuildId,
     expectedMcpVersion: expectedVersion,
     transport: {
@@ -391,8 +559,12 @@ async function writeProbeReceipt(cycles) {
     hostCatalogVersion,
     serverTools: observed.serverTools,
     serverToolMetadata: observed.serverToolMetadata,
+    serverToolDescriptors: observed.serverToolDescriptors,
+    serverCatalogEvidence,
     hostTools: [...hostCatalog.names].sort(),
     hostToolMetadata: hostCatalog.tools,
+    hostToolDescriptors: hostCatalog.rawTools,
+    externalHostObservation,
     catalogParity: true,
     inputSchemaParity: true,
     workspaceApp: {
@@ -412,11 +584,37 @@ async function writeProbeReceipt(cycles) {
       machineVerified: false,
       sha256: hostCatalogSha256,
       sessionIdSha256,
+      ...(hostStreamingCall?.operationId ? { streamingOperationId: hostStreamingCall.operationId } : {}),
       ...(document.transport ? { transport: document.transport } : {}),
     },
+    qualificationEvidenceAssociation: {
+      source: "authenticated_server_sqlite_evidence",
+      machineVerified: true,
+      recordId: hostQualificationAssociation.recordId,
+      contentSha256: hostQualificationAssociation.contentSha256,
+      serverBuildId: hostQualificationAssociation.serverBuildId,
+      captureId: hostQualificationAssociation.captureId,
+      sessionIdSha256: hostQualificationAssociation.sessionIdSha256,
+      catalogAcknowledgementRecordId: hostQualificationAssociation.acknowledgementRecordId,
+      ...(hostQualificationAssociation.externalSseRecordId
+        ? { externalSseRecordId: hostQualificationAssociation.externalSseRecordId }
+        : {}),
+      ...(hostQualificationAssociation.observationRecordId
+        ? { observationRecordId: hostQualificationAssociation.observationRecordId }
+        : {}),
+      evidenceRecord: hostQualificationAssociation,
+    },
+    ...(hostObservationRecord ? { externalCatalogObservationRecord: hostObservationRecord } : {}),
+    ...(hostFacingTransportObservation ? { hostFacingTransportObservation } : {}),
+    probeClientAcknowledgements: [...probeClientAcknowledgements],
     hostCatalogHandshake: {
       source: "authenticated_server_diagnostics",
       machineVerified: true,
+      evidenceId: acceptedHandshake.recordId,
+      evidenceContentSha256: acceptedHandshake.contentSha256,
+      serverBuildId: acceptedHandshake.serverBuildId,
+      serverVersion: acceptedHandshake.serverVersion,
+      captureId: acceptedHandshake.captureId,
       method: "notifications/experimental/kontrol/tool-catalog-accepted",
       contractVersion: 1,
       sessionIdSha256,
@@ -424,7 +622,8 @@ async function writeProbeReceipt(cycles) {
       serverCatalogSha256: acceptedHandshake.serverCatalogSha256,
       clientCatalogSha256: registeredFingerprint.sha256,
       toolCount: acceptedHandshake.toolCount,
-      acceptedAt: acceptedHandshake.acceptedAt,
+      acceptedAt: acceptedHandshake.observedAt,
+      evidenceRecord: acceptedHandshake,
     },
     liveServerProbe: {
       source: "fresh_http_initialize_and_tools_list",
@@ -435,6 +634,7 @@ async function writeProbeReceipt(cycles) {
       transportMode,
     },
     ...(externalHostStreaming ? { externalHostStreaming } : {}),
+    ...(externalTransport ? { externalTransport } : {}),
     hostCatalogCapturedAt: document.capturedAt,
     hostCatalogCaptureId: document.captureId,
     hostCatalogEvidenceSource: "operator_supplied",
@@ -505,6 +705,7 @@ async function rpc(method, params, sessionId) {
       accept: "application/json, text/event-stream",
       ...(authorization ? { authorization } : {}),
       ...(tunnelReviewer ? { "x-kontrol-tunnel-reviewer": tunnelReviewer } : {}),
+      ...(qualificationCaptureId ? { "x-kontrol-qualification-capture-id": qualificationCaptureId } : {}),
       ...(sessionId ? { "mcp-session-id": sessionId } : {}),
     },
     body: JSON.stringify({
@@ -561,6 +762,7 @@ async function probePostHeartbeat(sessionId, workspaceId, afterSeq) {
       accept: "application/json, text/event-stream",
       ...(authorization ? { authorization } : {}),
       ...(tunnelReviewer ? { "x-kontrol-tunnel-reviewer": tunnelReviewer } : {}),
+      ...(qualificationCaptureId ? { "x-kontrol-qualification-capture-id": qualificationCaptureId } : {}),
       "mcp-session-id": sessionId,
     },
     body: JSON.stringify({
@@ -618,9 +820,18 @@ async function probePostHeartbeat(sessionId, workspaceId, afterSeq) {
     terminalResponseReceived: true,
     contentType,
     ...(operationId ? { operationId } : {}),
+    sessionIdSha256: createHash("sha256").update(sessionId).digest("hex"),
   };
   if (diagnosticsSecret) {
-    const snapshot = await diagnostics();
+    const sessionIdSha256 = createHash("sha256").update(sessionId).digest("hex");
+    const snapshot = resultFilePath
+      ? await diagnostics({
+          serverBuildId: expectedBuildId,
+          captureId: qualificationCaptureId,
+          sessionIdSha256,
+          operationId,
+        })
+      : await diagnostics();
     const operation = snapshot.mcpSessionMetrics?.operationDiagnostics?.recent?.find((item) => item.operationId === operationId);
     assert.ok(operationId && operation, "authenticated diagnostics must expose the completed POST operation");
     assert.ok(operation.heartbeatBytes > 0, "POST keepalive bytes must be counted separately in diagnostics");
@@ -640,6 +851,38 @@ async function probePostHeartbeat(sessionId, workspaceId, afterSeq) {
       handlerStillRunning: operation.handlerStillRunning,
       stalledWriterEvents: stalledAfter - stalledBefore,
     };
+    if (resultFilePath) {
+      const records = snapshot.mcpSessionMetrics?.qualificationEvidence?.records ?? [];
+      const matchingStreams = matchExternalSseEvidence(records, {
+        operationId,
+        sessionIdSha256,
+        serverBuildId: expectedBuildId,
+        serverVersion: sessionVersions.get(sessionId),
+        captureId: qualificationCaptureId,
+        toolName: "await_workspace_events",
+        startedAt: operation.startedAt,
+        finishedAt: operation.finishedAt,
+        requestedWaitMs: postHeartbeatMs,
+      });
+      assert.equal(matchingStreams.length, 1,
+        "authenticated SQLite evidence must contain this exact probe-client POST SSE operation");
+      const evidenceRecord = matchingStreams[0];
+      const association = (snapshot.mcpSessionMetrics?.qualificationEvidence?.associations ?? [])
+        .find((item) => item.serverBuildId === expectedBuildId
+          && item.captureId === qualificationCaptureId
+          && item.sessionIdSha256 === sessionIdSha256
+          && item.acknowledgementRecordId === probeClientAcknowledgements.find((item) => item.sessionIdSha256 === sessionIdSha256)?.evidenceId
+          && item.externalSseRecordId === evidenceRecord.recordId);
+      assert.ok(association,
+        "authenticated SQLite evidence must return the durable association for this exact probe ACK and POST SSE operation");
+      postHeartbeatEvidence = {
+        ...postHeartbeatEvidence,
+        evidenceId: evidenceRecord.recordId,
+        evidenceContentSha256: evidenceRecord.contentSha256,
+        evidenceRecord,
+        qualificationAssociation: association,
+      };
+    }
   }
   return postHeartbeatEvidence;
 }
@@ -647,7 +890,7 @@ async function probePostHeartbeat(sessionId, workspaceId, afterSeq) {
 async function openSession(cycle) {
   const initialized = await rpc("initialize", {
     protocolVersion: "2025-06-18",
-    capabilities: {},
+    capabilities: { extensions: { [TOOL_CATALOG_ACK_CAPABILITY]: { contractVersion: 1 } } },
     clientInfo: { name: "mcp:tunnel-regression", version: "1.0.0" },
   });
   const sessionId = initialized.sessionId;
@@ -659,6 +902,65 @@ async function openSession(cycle) {
   }
   const notification = await rpc("notifications/initialized", {}, sessionId);
   assert.ok([200, 202].includes(notification.response.status));
+
+  const ackCapability = initialized.payload?.result?.capabilities?.extensions?.[TOOL_CATALOG_ACK_CAPABILITY];
+  if (!ackCapability) {
+    assert.equal(Boolean(resultFilePath), false,
+      "external qualification requires the deployed server to advertise catalog acknowledgement support");
+    probeClientAcknowledgements.push({
+      source: "kontrol_probe_client",
+      sessionIdSha256: createHash("sha256").update(sessionId).digest("hex"),
+      serverVersion: sessionVersions.get(sessionId),
+      status: "unsupported",
+    });
+    return sessionId;
+  }
+
+  const listed = await rpc("tools/list", {}, sessionId);
+  const catalog = assertCatalogParity(`probe session ${cycle}`, listed, sessionId);
+  const fingerprint = fingerprintToolCatalog(catalog.rawTools);
+  assert.ok(fingerprint, `probe session ${cycle} tools/list catalog must be fingerprintable`);
+  const serverVersion = sessionVersions.get(sessionId);
+  assert.ok(typeof serverVersion === "string" && serverVersion.length > 0,
+    `probe session ${cycle} initialize response omitted serverInfo.version`);
+  const acknowledgement = await rpc(TOOL_CATALOG_ACK_METHOD, {
+    contractVersion: 1,
+    serverVersion,
+    ...(qualificationCaptureId ? { captureId: qualificationCaptureId } : {}),
+    hostCatalogSha256: fingerprint.sha256,
+    hostToolCount: fingerprint.toolCount,
+  }, sessionId);
+  assert.ok([200, 202].includes(acknowledgement.response.status));
+
+  const acknowledgementEvidence = {
+    source: "kontrol_probe_client",
+    ...(qualificationCaptureId ? { captureId: qualificationCaptureId } : {}),
+    sessionIdSha256: createHash("sha256").update(sessionId).digest("hex"),
+    serverVersion,
+    serverCatalogSha256: fingerprint.sha256,
+    probeClientCatalogSha256: fingerprint.sha256,
+    toolCount: fingerprint.toolCount,
+    status: "sent_unverified",
+  };
+  if (diagnosticsSecret) {
+    const snapshot = await diagnostics();
+    const session = (snapshot?.mcpSessionMetrics?.sessions ?? [])
+      .find((candidate) => candidate.sessionIdSha256 === acknowledgementEvidence.sessionIdSha256);
+    const handshake = session?.toolCatalogHandshake;
+    assert.equal(handshake?.status, "accepted",
+      `probe session ${cycle} catalog acknowledgement was not accepted before tool use (${handshake?.reason ?? "no diagnostic acknowledgement"})`);
+    assert.equal(handshake?.serverCatalogSha256, fingerprint.sha256,
+      `probe session ${cycle} accepted a different server catalog fingerprint`);
+    assert.equal(handshake?.hostCatalogSha256, fingerprint.sha256,
+      `probe session ${cycle} accepted a different probe catalog fingerprint`);
+    assert.equal(handshake?.toolCount, fingerprint.toolCount,
+      `probe session ${cycle} accepted a different probe catalog tool count`);
+    acknowledgementEvidence.status = "accepted";
+    if (handshake.evidenceId) acknowledgementEvidence.evidenceId = handshake.evidenceId;
+  } else if (ackCapability.required === true) {
+    throw new Error(`probe session ${cycle} server requires catalog acknowledgement, but --diagnostics-secret is needed to confirm it before tool use`);
+  }
+  probeClientAcknowledgements.push(acknowledgementEvidence);
   return sessionId;
 }
 
@@ -711,9 +1013,17 @@ async function disconnectSse(stream) {
   await stream.reader.cancel().catch(() => {});
 }
 
-async function diagnostics() {
+async function diagnostics(qualificationFilter) {
   if (!diagnosticsSecret) return undefined;
-  const response = await fetch(diagnosticsUrl, {
+  const url = new URL(diagnosticsUrl);
+  if (qualificationFilter) {
+    url.searchParams.set("qEvidence", "1");
+    if (qualificationFilter.serverBuildId) url.searchParams.set("qBuild", qualificationFilter.serverBuildId);
+    if (qualificationFilter.captureId) url.searchParams.set("qCapture", qualificationFilter.captureId);
+    if (qualificationFilter.sessionIdSha256) url.searchParams.set("qSession", qualificationFilter.sessionIdSha256);
+    if (qualificationFilter.operationId) url.searchParams.set("qOperation", qualificationFilter.operationId);
+  }
+  const response = await fetch(url, {
     headers: { "x-kontrol-diagnostics": diagnosticsSecret },
     signal: AbortSignal.timeout(3_000),
   });
@@ -851,6 +1161,7 @@ if (dualSession) {
   console.log(JSON.stringify({ ok: true, url, dualSession: true, cycles, heartbeatBytesObserved: totalHeartbeatBytesObserved,
     drainRecoveryEvents: totalDrainRecoveryEvents, resourceLoadReads: totalResourceLoadReads,
     boundedInspectionCalls: totalBoundedInspectionCalls,
+    probeClientAcknowledgements: [...probeClientAcknowledgements],
     postHeartbeat: postHeartbeatEvidence ?? null,
     correlatedServerResponses: observedRequestCorrelations.filter((item) => item.operationId).length,
     requiredTools: [...REQUIRED_INSPECTION_TOOLS, "poll_process"] }));
@@ -898,5 +1209,6 @@ for (let cycle = 0; cycle < cycles; cycle++) {
 
 await writeProbeReceipt(cycles);
 console.log(JSON.stringify({ ok: true, url, cycles,
+  probeClientAcknowledgements: [...probeClientAcknowledgements],
   correlatedServerResponses: observedRequestCorrelations.filter((item) => item.operationId).length,
   requiredTools: [...REQUIRED_INSPECTION_TOOLS, "poll_process"] }));

@@ -1,13 +1,125 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import {
   assertInputSchemaCompatibility,
   extractCatalog,
+  extractRegisteredCatalog,
   extractServerInfoVersion,
   extractWorkspaceAppResourceUris,
   fingerprintToolCatalog,
   matchJsonRpcResponse,
   parseSseEventChunks,
 } from "./lib/mcp-probe-protocol.mjs";
+import {
+  matchCatalogAcknowledgementEvidence,
+  matchExternalSseEvidence,
+  verifyQualificationEvidenceContentHash,
+} from "./lib/mcp-qualification-evidence.mjs";
+
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
+function contentAddressedRecord(record) {
+  return {
+    ...record,
+    contentSha256: createHash("sha256").update(canonicalJson(record)).digest("hex"),
+  };
+}
+
+const receivedOnly = { toolsList: { tools: [{ name: "server-read", inputSchema: { type: "object" } }] } };
+assert.equal(extractRegisteredCatalog(receivedOnly), undefined,
+  "a received tools/list must never be treated as the host's callable registry");
+const registered = [{ name: "host-read", inputSchema: { type: "object", properties: { path: { type: "string" } } } }];
+assert.deepEqual(extractRegisteredCatalog({ registeredCatalog: registered })?.rawTools, registered,
+  "only an explicit registeredCatalog field can provide host registry descriptors");
+
+const captureSessionHash = "01234567" + "a".repeat(56);
+const collidingPrefixSessionHash = "01234567" + "b".repeat(56);
+const ackRecord = contentAddressedRecord({
+  recordId: "ack-evidence-1",
+  recordType: "catalog_acknowledgement",
+  captureId: "capture-1",
+  serverBuildId: "build-1",
+  serverVersion: "1.0.0+build-1",
+  sessionIdSha256: captureSessionHash,
+  observedAt: "2026-10-14T12:00:00.000Z",
+  expiresAt: "2027-01-12T12:00:00.000Z",
+  status: "accepted",
+  serverCatalogSha256: "a".repeat(64),
+  hostCatalogSha256: "a".repeat(64),
+  toolCount: 9,
+});
+assert.equal(verifyQualificationEvidenceContentHash(ackRecord), true);
+assert.equal(matchCatalogAcknowledgementEvidence([ackRecord], {
+  captureId: "capture-1",
+  serverBuildId: "build-1",
+  serverVersion: "1.0.0+build-1",
+  sessionIdSha256: captureSessionHash,
+  catalogSha256: "a".repeat(64),
+  toolCount: 9,
+}).length, 1, "persisted acknowledgement matches the exact capture, session, build and catalog");
+assert.equal(matchCatalogAcknowledgementEvidence([ackRecord], {
+  captureId: "capture-1",
+  serverBuildId: "build-1",
+  serverVersion: "1.0.0+build-1",
+  sessionIdSha256: collidingPrefixSessionHash,
+  catalogSha256: "a".repeat(64),
+  toolCount: 9,
+}).length, 0, "matching session prefixes cannot substitute for the complete session hash");
+
+const streamRecord = contentAddressedRecord({
+  recordId: "sse-evidence-1",
+  recordType: "external_sse",
+  captureId: "capture-1",
+  serverBuildId: "build-1",
+  serverVersion: "1.0.0+build-1",
+  sessionIdSha256: captureSessionHash,
+  operationId: "operation-1",
+  observedAt: "2026-10-14T12:00:45.000Z",
+  expiresAt: "2027-01-12T12:00:45.000Z",
+  httpMethod: "POST",
+  rpcMethod: "tools/call",
+  toolName: "await_workspace_events",
+  startedAt: "2026-10-14T12:00:00.000Z",
+  finishedAt: "2026-10-14T12:00:45.000Z",
+  durationMs: 45_000,
+  httpStatus: 200,
+  responseBytes: 500,
+  heartbeatBytes: 60,
+  responseCloseClassification: "response_finished",
+  handlerStillRunning: false,
+});
+const streamExpectation = {
+  operationId: "operation-1",
+  sessionIdSha256: captureSessionHash,
+  serverBuildId: "build-1",
+  serverVersion: "1.0.0+build-1",
+  captureId: "capture-1",
+  toolName: "await_workspace_events",
+  startedAt: "2026-10-14T12:00:00.500Z",
+  finishedAt: "2026-10-14T12:00:45.500Z",
+  requestedWaitMs: 45_000,
+};
+assert.equal(matchExternalSseEvidence([streamRecord], streamExpectation).length, 1,
+  "external SSE evidence must match exact operation ID, full session hash, build and time window");
+assert.equal(matchExternalSseEvidence([streamRecord], {
+  ...streamExpectation,
+  operationId: "another-operation",
+}).length, 0, "a different server operation ID cannot qualify the host capture");
+assert.equal(matchExternalSseEvidence([streamRecord], {
+  ...streamExpectation,
+  sessionIdSha256: collidingPrefixSessionHash,
+}).length, 0, "an operation from a session with the same prefix cannot qualify another capture");
+const { contentSha256: _streamContentSha256, ...streamContent } = streamRecord;
+assert.equal(matchExternalSseEvidence([contentAddressedRecord({ ...streamContent, httpStatus: 500 })], streamExpectation).length, 0,
+  "a completed SSE response with an unsuccessful HTTP status cannot qualify");
+assert.equal(matchExternalSseEvidence([{ ...streamRecord, responseBytes: 501 }], streamExpectation).length, 0,
+  "tampered evidence fields fail their content hash");
 
 const completeTools = ["read", "grep", "glob", "ls", "git_status", "git_log", "git_diff", "git_show", "poll_process"];
 const rawList = { jsonrpc: "2.0", id: 4, result: { tools: completeTools.map((name) => ({ name })) } };

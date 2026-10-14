@@ -63,6 +63,8 @@ export interface McpSessionState {
   toolSurfaceVersion?: string;
   toolCatalogHandshake?: {
     status: "pending" | "accepted" | "rejected";
+    captureId?: string;
+    evidenceId?: string;
     serverCatalogSha256?: string;
     hostCatalogSha256?: string;
     toolCount?: number;

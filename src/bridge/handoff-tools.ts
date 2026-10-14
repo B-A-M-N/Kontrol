@@ -11,6 +11,10 @@ import { registerMutationAppTool } from "./app-tool.js";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
 import { forbidden, isReviewer, liveOwnerContextId, reviewOwnerContextId, requireWorkSessionMutation, requireWorkSessionRead } from "./shared.js";
 import { z } from "zod/v4";
+import {
+  ExternalCatalogObservationSubmissionSchema,
+  validateExternalCatalogObservation,
+} from "../qualification/external-catalog-capture.js";
 
 /**
  * L04: shared pause/resume/disable control. Keeps route status independent of
@@ -410,20 +414,210 @@ export function registerHandoffTools(server: McpServer, config: BridgeConfig): v
         snapshotRef: z.string(),
         diffSha256: z.string(),
         roundNumber: z.number(),
+        externalCatalogAttachments: z.array(z.object({
+          attachmentId: z.string(),
+          observationRecordId: z.string(),
+          investigationDirection: z.string(),
+          attachedAt: z.string(),
+          expiresAt: z.string(),
+          contentSha256: z.string(),
+        })),
       },
       _meta: {},
       annotations: { readOnlyHint: true },
     },
     async ({ handoffId }: { handoffId: string }) => {
       if (!routes) return { content: [{ type: "text" as const, text: "Review routing is unavailable." }], isError: true };
-      const handoff = (routes as unknown as { getHandoffById?: (id: string) => unknown }).getHandoffById?.(handoffId) as { status?: string; claimedByOwnerContextId?: string; workSessionId?: string } | undefined;
+      const handoff = routes.getHandoffById(handoffId);
       if (!handoff) return { content: [{ type: "text" as const, text: `Unknown handoff: ${handoffId}` }], isError: true };
       if (handoff.claimedByOwnerContextId !== reviewOwnerContextId(config)) {
         return forbidden(config.principalRole, "get_review_handoff");
       }
+      const externalCatalogAttachments = config.qualificationEvidence
+        ?.listHandoffObservationAttachments(handoffId)
+        .map(({ attachmentId, observationRecordId, investigationDirection, attachedAt, expiresAt, contentSha256 }) => ({
+          attachmentId,
+          observationRecordId,
+          investigationDirection,
+          attachedAt,
+          expiresAt,
+          contentSha256,
+        })) ?? [];
       return {
         content: [{ type: "text" as const, text: `Handoff ${handoffId}: ${handoff.status}` }],
-        structuredContent: handoff as never,
+        structuredContent: {
+          handoffId: handoff.id,
+          status: handoff.status,
+          revision: handoff.revision,
+          workSessionId: handoff.workSessionId,
+          submissionId: handoff.submissionId,
+          reviewEpoch: handoff.reviewEpoch,
+          snapshotKind: handoff.snapshotKind,
+          snapshotRef: handoff.snapshotRef,
+          diffSha256: handoff.diffSha256,
+          roundNumber: handoff.roundNumber,
+          externalCatalogAttachments,
+        },
+      };
+    },
+  );
+
+  registerMutationAppTool(
+    server,
+    "submit_external_catalog_observation",
+    {
+      title: "Submit external catalog observation",
+      description: "Persist a reviewer-submitted external-host observation and attach it to the currently claimed review handoff. A model or operator supplied registry remains operator_reported; Kontrol never promotes it to verified host registration.",
+      inputSchema: {
+        handoffId: z.string().min(1).max(256),
+        investigationDirection: z.string().trim().min(1).max(4_000),
+        soakId: z.string().min(1).max(256).optional(),
+        observation: ExternalCatalogObservationSubmissionSchema,
+      },
+      outputSchema: {
+        recordId: z.string(),
+        contentSha256: z.string(),
+        observationSource: z.literal("operator_reported"),
+        status: z.enum(["host_capture_unsupported", "operator_reported_match", "operator_reported_mismatch"]),
+        validationReasons: z.array(z.string()),
+        attachmentId: z.string(),
+        qualificationAssociationRecordId: z.string().optional(),
+        qualificationAssociationContentSha256: z.string().optional(),
+      },
+      _meta: {},
+      annotations: { readOnlyHint: false },
+    },
+    config,
+    async ({ handoffId, investigationDirection, soakId, observation }: {
+      handoffId: string;
+      investigationDirection: string;
+      soakId?: string;
+      observation: unknown;
+    }) => {
+      if (!isReviewer(config.principalRole)) return forbidden(config.principalRole, "submit_external_catalog_observation");
+      if (!routes || !config.qualificationEvidence) {
+        return { content: [{ type: "text" as const, text: "External catalog evidence storage is unavailable." }], isError: true };
+      }
+      const handoff = routes.getHandoffById(handoffId);
+      if (!handoff) return { content: [{ type: "text" as const, text: `Unknown handoff: ${handoffId}` }], isError: true };
+      const denied = requireWorkSessionRead(config, handoff.workSessionId);
+      if (denied) return denied;
+      if (handoff.claimedByOwnerContextId !== reviewOwnerContextId(config)) {
+        return forbidden(config.principalRole, "submit_external_catalog_observation");
+      }
+      try {
+        const validated = validateExternalCatalogObservation(observation);
+        if (config.toolSurfaceVersion && validated.serverVersion !== config.toolSurfaceVersion) {
+          return {
+            content: [{ type: "text" as const, text: "The observation server version does not match this Kontrol process." }],
+            structuredContent: { code: "build_identity_mismatch" },
+            isError: true,
+          };
+        }
+        const record = config.qualificationEvidence.recordExternalCatalogObservation(validated, {
+          serverBuildId: config.serverConfig?.expectedBuildId,
+          workSessionId: handoff.workSessionId,
+          handoffId: handoff.id,
+        });
+        const attachment = config.qualificationEvidence.attachObservationToHandoff({
+          observationRecordId: record.recordId,
+          workSessionId: handoff.workSessionId,
+          handoffId: handoff.id,
+          reviewerPrincipalId: config.principalId ?? `role:${config.principalRole}`,
+          reviewerOwnerContextId: reviewOwnerContextId(config),
+          investigationDirection,
+        });
+        let qualificationAssociation: ReturnType<NonNullable<BridgeConfig["qualificationEvidence"]>["recordQualificationAssociation"]> | undefined;
+        const serverBuildId = config.serverConfig?.expectedBuildId;
+        const matchingEvidence = serverBuildId
+          ? config.qualificationEvidence.listRecent({
+              serverBuildId,
+              captureId: record.captureId,
+              sessionIdSha256: record.sessionIdSha256,
+              limit: 500,
+            })
+          : [];
+        const acknowledgement = matchingEvidence.find((item) => item.recordType === "catalog_acknowledgement" && item.status === "accepted");
+        const streaming = record.streamingOperationId
+          ? matchingEvidence.find((item) => item.recordType === "external_sse" && item.operationId === record.streamingOperationId)
+          : undefined;
+        if (serverBuildId && acknowledgement && (!record.streamingOperationId || streaming)) {
+          qualificationAssociation = config.qualificationEvidence.recordQualificationAssociation({
+            serverBuildId,
+            captureId: record.captureId,
+            sessionIdSha256: record.sessionIdSha256,
+            soakId: soakId ?? record.soakId,
+            observationRecordId: record.recordId,
+            acknowledgementRecordId: acknowledgement.recordId,
+            ...(streaming?.recordType === "external_sse" ? { externalSseRecordId: streaming.recordId } : {}),
+          });
+        }
+        config.eventStore.appendEvent({
+          type: "review.handoff.external_catalog_observation_attached",
+          sessionId: handoff.workSessionId,
+          payload: {
+            handoffId: handoff.id,
+            observationRecordId: record.recordId,
+            observationContentSha256: record.contentSha256,
+            attachmentId: attachment.attachmentId,
+            attachmentContentSha256: attachment.contentSha256,
+            observationSource: record.observationSource,
+            status: record.status,
+            investigationDirection,
+          },
+        });
+        return {
+          content: [{ type: "text" as const, text: record.status === "host_capture_unsupported"
+            ? `Observation ${record.recordId} stored. Host registry capture is unsupported; this record remains operator_reported.`
+            : `Observation ${record.recordId} stored as operator_reported; it is not machine-verified host registration.` }],
+          structuredContent: {
+            recordId: record.recordId,
+            contentSha256: record.contentSha256,
+            observationSource: record.observationSource,
+            status: record.status,
+            validationReasons: record.validationReasons,
+            attachmentId: attachment.attachmentId,
+            ...(qualificationAssociation ? {
+              qualificationAssociationRecordId: qualificationAssociation.recordId,
+              qualificationAssociationContentSha256: qualificationAssociation.contentSha256,
+            } : {}),
+          },
+        };
+      } catch (error) {
+        return {
+          content: [{ type: "text" as const, text: error instanceof Error ? error.message : "Invalid external catalog observation." }],
+          structuredContent: { code: error instanceof Error && "code" in error ? error.code : "invalid_observation" },
+          isError: true,
+        };
+      }
+    },
+  );
+
+  registerAppTool(
+    server,
+    "get_external_catalog_observation",
+    {
+      title: "Get external catalog observation",
+      description: "Read one content-addressed external-host observation through the claimed reviewer handoff that owns it.",
+      inputSchema: { recordId: z.string().min(1).max(128) },
+      outputSchema: { observation: z.record(z.string(), z.unknown()) },
+      _meta: {},
+      annotations: { readOnlyHint: true },
+    },
+    async ({ recordId }: { recordId: string }) => {
+      if (!isReviewer(config.principalRole)) return forbidden(config.principalRole, "get_external_catalog_observation");
+      const record = config.qualificationEvidence?.getExternalCatalogObservation(recordId);
+      if (!record) return { content: [{ type: "text" as const, text: "External catalog observation not found or expired." }], isError: true };
+      const handoff = record.handoffId ? routes?.getHandoffById(record.handoffId) : undefined;
+      if (!handoff || handoff.workSessionId !== record.workSessionId
+        || handoff.claimedByOwnerContextId !== reviewOwnerContextId(config)) {
+        return forbidden(config.principalRole, "get_external_catalog_observation");
+      }
+      const denied = requireWorkSessionRead(config, handoff.workSessionId);
+      if (denied) return denied;
+      return {
+        content: [{ type: "text" as const, text: `Observation ${record.recordId}: ${record.status} (${record.observationSource}).` }],
+        structuredContent: { observation: record },
       };
     },
   );

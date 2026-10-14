@@ -31,6 +31,7 @@ import {
 import type { McpSessionLifecycle } from "./mcp-session-lifecycle.js";
 import type { ExpiredMcpOperationTracker } from "./mcp-expired-operations.js";
 import type { McpOperationDiagnostics } from "./mcp-operation-diagnostics.js";
+import type { McpQualificationEvidenceJournal } from "./mcp-qualification-evidence.js";
 import type { McpPolicyWaiterRegistry } from "./policy-waiters.js";
 import type { LogicalContinuityIndex } from "../mcp-logical-continuity.js";
 import { startMcpSseHeartbeat } from "./mcp-sse-heartbeat.js";
@@ -67,6 +68,11 @@ function externalCorrelation(req: Request): string | undefined {
   return undefined;
 }
 
+function qualificationCaptureId(req: Request): string | undefined {
+  const value = req.header("x-kontrol-qualification-capture-id")?.trim();
+  return value && value.length <= 256 && /^[A-Za-z0-9._:-]+$/.test(value) ? value : undefined;
+}
+
 function responseChunkBytes(chunk: unknown, encoding: unknown): number {
   if (typeof chunk === "string") {
     try { return Buffer.byteLength(chunk, typeof encoding === "string" ? encoding as BufferEncoding : "utf8"); }
@@ -90,6 +96,7 @@ export interface McpHttpDeps {
   readonly mcpResourceAdmission: McpAdmission;
   readonly expiredMcpOperations: ExpiredMcpOperationTracker;
   readonly operationDiagnostics: McpOperationDiagnostics;
+  readonly qualificationEvidence: McpQualificationEvidenceJournal;
   readonly sessionLifecycle: McpSessionLifecycle;
   readonly recordUnknownSessionRequest?: (sessionId: string) => void;
   readonly recordFreshInitialization?: (reconnected: boolean, durationMs?: number) => void;
@@ -217,6 +224,7 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
     mcpResourceAdmission,
     expiredMcpOperations,
     operationDiagnostics,
+    qualificationEvidence,
     sessionLifecycle,
     workspaceAppResourceMetrics,
     trackSocketAbort,
@@ -284,12 +292,19 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
         : "execution";
     const operationId = randomUUID();
     const externalCorrelationId = externalCorrelation(req);
+    const operationSessionState = sessionId ? mcpSessions.get(sessionId) : undefined;
+    const operationSessionIdSha256 = sessionId ? createHash("sha256").update(sessionId).digest("hex") : undefined;
+    const operationServerVersion = operationSessionState?.toolSurfaceVersion;
+    const operationCaptureId = qualificationCaptureId(req);
     operationDiagnostics.begin({
       operationId,
       requestId,
       externalCorrelationId,
       generationId: config.launchGenerationId,
       sessionIdPrefix: sessionIdPrefix(sessionId),
+      sessionIdSha256: operationSessionIdSha256,
+      serverBuildId: config.expectedBuildId,
+      serverVersion: operationServerVersion,
       method: req.method,
       rpcMethod: requestRpcMethod,
       toolName: requestToolName,
@@ -440,6 +455,34 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
         sessionInFlight,
         connectionMetrics,
       });
+      try {
+        const responseContentType = res.getHeader("content-type")?.toString().toLowerCase() ?? "";
+        qualificationEvidence.recordCompletedSseOperation({
+          operationId,
+          qualificationCaptureId: operationCaptureId,
+          serverBuildId: config.expectedBuildId,
+          serverVersion: operationServerVersion,
+          sessionIdSha256: operationSessionIdSha256,
+          httpMethod: req.method,
+          rpcMethod: requestRpcMethod,
+          toolName: requestToolName,
+          startedAt: new Date(requestStartedAtMs).toISOString(),
+          finishedAt: new Date(finishedAtMs).toISOString(),
+          durationMs: Math.max(0, finishedAtMs - requestStartedAtMs),
+          isSseResponse: responseContentType.includes("text/event-stream"),
+          httpStatus: res.statusCode,
+          responseBytes,
+          heartbeatBytes,
+          responseCloseClassification: completedResponseCloseClassification,
+          handlerStillRunning: !handlerSettled,
+        });
+      } catch (error) {
+        logEvent(config.logging, "error", "mcp_qualification_evidence_write_failed", {
+          operationId,
+          recordType: "external_sse",
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
       logEvent(config.logging, "debug", "mcp_operation_finished", {
         operationId,
         requestId,
@@ -1105,7 +1148,19 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
             if (!catalogSessionId) return;
             const state = mcpSessions.get(catalogSessionId);
             if (!state) return;
-            state.toolCatalogHandshake = { ...handshake };
+            const evidence = qualificationEvidence.recordCatalogAcknowledgement({
+              sessionId: catalogSessionId,
+              captureId: handshake.captureId,
+              serverBuildId: config.expectedBuildId,
+              serverVersion: handshake.serverVersion || state.toolSurfaceVersion || "unknown",
+              status: handshake.status,
+              serverCatalogSha256: handshake.serverCatalogSha256,
+              hostCatalogSha256: handshake.hostCatalogSha256,
+              toolCount: handshake.toolCount,
+              rejectionReason: handshake.reason,
+              observedAt: handshake.acceptedAt,
+            });
+            state.toolCatalogHandshake = { ...handshake, evidenceId: evidence.recordId };
             logEvent(config.logging, handshake.status === "accepted" ? "info" : "warn", "mcp_tool_catalog_handshake", {
               sessionIdPrefix: sessionIdPrefix(catalogSessionId),
               status: handshake.status,
@@ -1116,6 +1171,8 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
               reason: handshake.reason,
             });
           },
+          undefined,
+          qualificationEvidence,
         );
         sessionMcpServer = server;
         const initializedHandler = server.server.oninitialized;

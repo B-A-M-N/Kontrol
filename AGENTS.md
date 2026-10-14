@@ -429,6 +429,22 @@ Current implementation contracts:
   should correlate a browser HAR, Kontrol diagnostics/logs, and tunnel delivery
   logs with `scripts/analyze-mcp-stream-failure.mjs`, which keeps exact-ID
   matches separate from timestamp proximity.
+- External MCP qualification persists accepted/rejected catalog acknowledgements
+  and completed `await_workspace_events` POST SSE observations in SQLite.
+  Records contain content hashes, immutable build/version, full session SHA-256,
+  exact operation ID for SSE, capture ID when supplied, timing, byte counts,
+  and close classification; they never contain raw session IDs, arguments,
+  response bodies, bearer tokens, or conversation data. Authenticated diagnostics
+  can retrieve bounded evidence with exact build/capture/session/operation
+  filters. Evidence is retained for 90 days and the journal is capped at 20,000
+  records so qualification survives session eviction and process restart.
+- Reviewer-submitted host observations and handoff attachments are content
+  addressed and always `operator_reported`; `tools/list` plus an acknowledgement
+  cannot prove the host's internal callable registry. Until a genuine host
+  integration supplies that registry, `hostRegistrationVerified` stays false.
+  Secure MCP Tunnel's Kontrol-side SSE evidence is distinct from the
+  operator-reported host-facing HTTPS tunnel observation. List-changed pulses
+  prove only server notification delivery, not client registry refresh.
 - `scripts/probe-mcp-tunnel.mjs --dual` validates both fresh catalogs, uses
   reviewer authority for Workspace App event watchers when supplied, exercises
   an 18-second empty watcher heartbeat, reads actual repeated SSE heartbeat

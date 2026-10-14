@@ -9,6 +9,34 @@ export interface ToolCatalogFingerprint {
   toolCount: number;
 }
 
+export type ToolCatalogHandshakeRejectionReason =
+  | "tools_list_not_observed"
+  | "client_capability_missing"
+  | "server_version_mismatch"
+  | "host_catalog_fingerprint_mismatch"
+  | "host_catalog_tool_count_mismatch";
+
+export function evaluateToolCatalogAcknowledgement(input: {
+  expected?: ToolCatalogFingerprint;
+  received: Pick<ToolCatalogAcceptedNotification["params"], "serverVersion" | "hostCatalogSha256" | "hostToolCount">;
+  authoritativeServerVersion: string;
+  clientSupportsExtension: boolean;
+}): { status: "accepted" | "rejected"; reason?: ToolCatalogHandshakeRejectionReason } {
+  const { expected, received } = input;
+  const reason: ToolCatalogHandshakeRejectionReason | undefined = !expected
+    ? "tools_list_not_observed"
+    : !input.clientSupportsExtension
+      ? "client_capability_missing"
+      : received.serverVersion !== input.authoritativeServerVersion
+        ? "server_version_mismatch"
+        : received.hostCatalogSha256 !== expected.sha256
+          ? "host_catalog_fingerprint_mismatch"
+          : received.hostToolCount !== expected.toolCount
+            ? "host_catalog_tool_count_mismatch"
+            : undefined;
+  return reason ? { status: "rejected", reason } : { status: "accepted" };
+}
+
 function canonicalJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
   if (value && typeof value === "object") {
@@ -48,6 +76,7 @@ export const ToolCatalogAcceptedNotificationSchema = z.object({
   params: z.object({
     contractVersion: z.literal(1),
     serverVersion: z.string().min(1).max(256),
+    captureId: z.string().min(1).max(256).optional(),
     hostCatalogSha256: z.string().regex(/^[a-f0-9]{64}$/),
     hostToolCount: z.number().int().nonnegative(),
   }),

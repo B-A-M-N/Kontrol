@@ -67,20 +67,42 @@ enforces it mechanically inside the publish path:
    use the loopback HTTP origin and treat tunnel-client readiness as the
    separate outbound HTTPS observation. That local probe does not stand in for
    a fresh connected-host catalog receipt.
-5. **Fresh external catalog probe** — for public deployments capture the host-side `initialize`,
-   server `tools/list`, the host's registered callable catalog, and its catalog
-   acknowledgement on one session during the candidate soak, then run
+5. **External catalog observation** — if the connected host supplies a genuine
+   registry producer, capture its `initialize`, server `tools/list`, callable
+   catalog, and acknowledgement (including the matching `captureId`) on one
+   session during the candidate soak, then run
    `scripts/probe-mcp-tunnel.mjs` with `--host-catalog-file`,
    `--expected-mcp-version`, `--expected-build-id`, and `--result-file` after
    the soak ends. The probe opens a fresh server transport and fails on stale
-   versions or any missing/extra invocable tool. For OpenAI Secure MCP Tunnel,
+   versions or any missing/extra invocable tool. The reviewer handoff tools
+   retain the observation and investigation direction. A submitted descriptor
+   list is `operator_reported` unless a supported host integration supplied
+   the registry; the current ChatGPT path cannot expose that registry. In that
+   case `hostRegistrationVerified` remains false and the final gate cannot
+   qualify the release. For a published ChatGPT MCP app, a Business,
+   Enterprise, or Edu admin with app-management permission and a valid
+   connection opens **Workspace Settings → Apps**, selects the app's
+   **… → Action control → Refresh**, reviews the action diff, and explicitly
+   enables any new actions (disabled by default). Capture the release B catalog
+   after refresh and use a fresh MCP session for the probe. This operator
+   capture does not independently prove ChatGPT's registry; see
+   `docs/mcp-tool-catalog-ack.md` for the evidence boundary. For OpenAI Secure MCP Tunnel,
    the capture must also bind the operator-supplied HTTPS tunnel ID and include
-   a 45-second `await_workspace_events` call on that same host session; the
-   post-soak probe targets the local loopback origin and matches the same ID.
+   a 45-second `await_workspace_events` call with its exact
+   `x-kontrol-operation-id` response header on that same host session. The
+   post-soak probe targets the local loopback origin and matches the durable
+   server record by operation ID, full session hash, build/version, and time.
+   Catalog and SSE evidence survives session closure and process restart; it is
+   retained for 90 days, subject to the journal's bounded record cap. The
+   Secure Tunnel operation record verifies Kontrol's local response. The
+   operator-reported HTTPS tunnel observation remains a separate, unverified
+   host-facing transport fact.
 6. **Final joined receipt** — `npm run gate:beta:final` writes
    `beta-qualification.json` with `stage=combined, qualified=true` only when
    code receipt, soak receipt, external catalog receipt, candidate identity,
-   and clean checkout all match.
+   and clean checkout all match and the host registration evidence is
+   independently verified. Server refresh notifications are not proof that
+   the host refreshed its internal catalog.
 7. **Release verification** — `npm run release:verify` (receipt ↔ buildId ↔
    source SHA ↔ artifact, release-local import validation, clean checkout).
 8. **Staged package UAT** — the packed tarball installed into a clean prefix

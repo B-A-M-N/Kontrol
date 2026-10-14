@@ -28,8 +28,9 @@ import type { MutationReceiptStore } from "../mutation-receipts.js";
 import type { ReviewWorkflowService } from "../review-workflow.js";
 import type { LiveWaiterRegistry } from "../bridge/shared.js";
 import type { DatabaseHandle } from "../db/client.js";
-import { installCachedToolList } from "../mcp-tool-list-cache.js";
+import { installCachedToolList, observeToolListDescriptors } from "../mcp-tool-list-cache.js";
 import {
+  evaluateToolCatalogAcknowledgement,
   fingerprintToolCatalog,
   TOOL_CATALOG_ACK_CAPABILITY,
   ToolCatalogAcceptedNotificationSchema,
@@ -64,9 +65,9 @@ export {
 } from "./mutation-barrier.js";
 export { type ConnectionContext, processSessionOwnerId } from "./connection-context.js";
 
-// P1 #42: SDK internal-hook usage is isolated in mcp-tool-list-cache.ts.
+// The descriptor cache observes the public tools/list handler registration;
+// catalog fingerprints come from the exact descriptor response.
 const toolListDescriptorCache = new Map<string, Promise<unknown>>();
-let toolListDescriptorCacheActive = false;
 
 export type { DiffStats, ToolContent } from "./tool-result.js";
 export { toolNames } from "./tool-names.js";
@@ -104,6 +105,8 @@ export function createMcpServer(
   reviewRoutes?: import("../review-handoff/route-store.js").ReviewRouteStore,
   onToolCatalogHandshake?: (sessionId: string | undefined, result: {
     status: "accepted" | "rejected";
+    serverVersion: string;
+    captureId?: string;
     serverCatalogSha256?: string;
     hostCatalogSha256: string;
     toolCount?: number;
@@ -111,6 +114,7 @@ export function createMcpServer(
     reason?: string;
   }) => void,
   reconcileScheduledJob?: (jobId: string) => Promise<import("../scheduling/scheduled-job-store.js").ScheduledJob | undefined>,
+  qualificationEvidence?: import("../server/mcp-qualification-evidence.js").McpQualificationEvidenceJournal,
 ): McpServer {
   // note: parameters remain in declared order; scheduledJobs precedes reviewRoutes.
   const serverConstructionStartedAt = performance.now();
@@ -139,6 +143,20 @@ export function createMcpServer(
     {
       instructions: cachedServerInstructions(config),
     },
+  );
+  let toolCatalogFingerprint: ToolCatalogFingerprint | undefined;
+  const toolListDescriptorObservation = observeToolListDescriptors(
+    server,
+    ListToolsRequestSchema,
+    (descriptor) => {
+      toolCatalogFingerprint = fingerprintToolCatalog(descriptor);
+    },
+  );
+  const toolListCacheInstallation = installCachedToolList(
+    server,
+    `${config.toolMode}|${config.widgets}|${config.skillsEnabled ? "skills" : "no-skills"}|${config.acpEnabled ? "acp" : "no-acp"}|${policyEngine ? "policy" : "no-policy"}|surface:${mcpToolSurface.version}`,
+    toolListDescriptorCache,
+    ListToolsRequestSchema,
   );
   server.server.registerCapabilities({
     extensions: {
@@ -243,23 +261,18 @@ export function createMcpServer(
       scheduledJobs,
       reconcileScheduledJob,
       reviewRoutes,
+      qualificationEvidence,
+      toolSurfaceVersion: mcpToolSurface.version,
     };
     registerBridgeTools(server, bridgeConfig);
   }
 
-  let toolCatalogFingerprint: ToolCatalogFingerprint | undefined;
-  toolListDescriptorCacheActive = installCachedToolList(
-    server,
-    `${config.toolMode}|${config.widgets}|${config.skillsEnabled ? "skills" : "no-skills"}|${config.acpEnabled ? "acp" : "no-acp"}|${policyEngine ? "policy" : "no-policy"}|surface:${mcpToolSurface.version}`,
-    toolListDescriptorCache,
-    ListToolsRequestSchema,
-    (descriptor) => {
-      toolCatalogFingerprint = fingerprintToolCatalog(descriptor);
-    },
-  );
-  if (!toolListDescriptorCacheActive) {
-    console.warn("[kontrol] tools/list descriptor cache unavailable (SDK internals changed); serving uncached");
+  const catalogObservationAvailable = toolListDescriptorObservation.finalizeRegistration();
+  const descriptorCacheAvailable = toolListCacheInstallation.finalizeRegistration();
+  if (!catalogObservationAvailable) {
+    console.warn("[kontrol] tools/list descriptor observation unavailable; serving uncached and rejecting catalog acknowledgements");
   }
+  if (!descriptorCacheAvailable) console.warn("[kontrol] tools/list descriptor cache unavailable; serving uncached");
   server.server.setNotificationHandler(ToolCatalogAcceptedNotificationSchema, async (notification) => {
     const expected = toolCatalogFingerprint;
     const received = notification.params;
@@ -270,24 +283,21 @@ export function createMcpServer(
       && typeof clientExtension === "object"
       && (clientExtension as { contractVersion?: unknown }).contractVersion === 1,
     );
-    const reason = !expected
-      ? "tools_list_not_observed"
-      : !clientSupportsExtension
-        ? "client_capability_missing"
-      : received.serverVersion !== mcpToolSurface.version
-        ? "server_version_mismatch"
-        : received.hostCatalogSha256 !== expected.sha256
-          ? "host_catalog_fingerprint_mismatch"
-          : received.hostToolCount !== expected.toolCount
-            ? "host_catalog_tool_count_mismatch"
-            : undefined;
+    const validation = evaluateToolCatalogAcknowledgement({
+      expected,
+      received,
+      authoritativeServerVersion: mcpToolSurface.version,
+      clientSupportsExtension,
+    });
     onToolCatalogHandshake?.(connectionContext?.mcpSessionId, {
-      status: reason ? "rejected" : "accepted",
+      status: validation.status,
+      serverVersion: mcpToolSurface.version,
+      captureId: received.captureId,
       serverCatalogSha256: expected?.sha256,
       hostCatalogSha256: received.hostCatalogSha256,
       toolCount: expected?.toolCount,
       acceptedAt,
-      reason,
+      reason: validation.reason,
     });
   });
   assertRequiredInspectionTools(workspaceToolNames);

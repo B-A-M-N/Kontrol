@@ -55,6 +55,40 @@ try {
       .some((index) => index.name === "policy_approval_grants_principal_idx"),
     "effective policy grants retain their indexed composite identity",
   );
+  assert.ok(
+    (sqlite.prepare("pragma table_info(mcp_qualification_evidence)").all() as Array<{ name: string }>)
+      .some((column) => column.name === "content_sha256"),
+    "MCP qualification evidence is durably stored with content hashes",
+  );
+  const qualificationIndexes = (sqlite.prepare("pragma index_list(mcp_qualification_evidence)").all() as Array<{ name: string }>)
+    .map((index) => index.name);
+  for (const index of [
+    "mcp_qualification_evidence_build_idx",
+    "mcp_qualification_evidence_capture_idx",
+    "mcp_qualification_evidence_session_idx",
+    "mcp_qualification_evidence_operation_idx",
+  ]) {
+    assert.ok(qualificationIndexes.includes(index), `qualification evidence has its ${index} lookup index`);
+  }
+  assert.ok(
+    (sqlite.prepare("pragma table_info(mcp_external_catalog_observations)").all() as Array<{ name: string }>)
+      .some((column) => column.name === "content_sha256"),
+    "external host observations are retained as content-addressed records",
+  );
+  const associationIndexes = (sqlite.prepare("pragma index_list(mcp_qualification_associations)").all() as Array<{ name: string }>)
+    .map((index) => index.name);
+  for (const index of [
+    "mcp_qualification_associations_build_idx",
+    "mcp_qualification_associations_capture_idx",
+    "mcp_qualification_associations_session_idx",
+  ]) {
+    assert.ok(associationIndexes.includes(index), `qualification association has its ${index} lookup index`);
+  }
+  assert.ok(
+    (sqlite.prepare("pragma table_info(review_handoff_external_catalog_attachments)").all() as Array<{ name: string }>)
+      .some((column) => column.name === "investigation_direction"),
+    "reviewer capture handoff attachments retain the investigation direction",
+  );
   sqlite.pragma("foreign_keys = OFF");
   sqlite.prepare(`
     insert into mission_completion_reports
