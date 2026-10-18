@@ -220,6 +220,33 @@ export interface GcSliceResult {
   corrupt: number;
 }
 
+export type SnapshotBlobAccounting = {
+  hash: string;
+  size: number;
+  classification: "live" | "grace_protected" | "reclaimable";
+  pinReasons: string[];
+};
+
+export interface SnapshotStorageAccounting {
+  generatedAt: string;
+  manifests: {
+    retainedLive: number;
+    retainedTerminal: number;
+    graceProtected: number;
+    reclaimable: number;
+    total: number;
+  };
+  blobs: {
+    counts: Record<SnapshotBlobAccounting["classification"], number>;
+    bytes: Record<SnapshotBlobAccounting["classification"], number>;
+    samples: SnapshotBlobAccounting[];
+    total: number;
+    totalBytes: number;
+  };
+  staging: { bytes: number };
+  pinnedRefsByReason: Record<string, string[]>;
+}
+
 const MB = 1024 * 1024;
 const GB = 1024 * MB;
 
@@ -1167,6 +1194,17 @@ export class FilesystemSnapshotStore {
     }
   }
 
+  private async stagingBytes(): Promise<number> {
+    let total = 0;
+    try {
+      const stagingParent = join(this.storeRoot, "staging");
+      for (const entry of await readdir(stagingParent)) {
+        total += await this.dirBytes(join(stagingParent, entry));
+      }
+    } catch { /* ignore */ }
+    return total;
+  }
+
   /** Directory byte usage (sharded + legacy, recursion for shards). */
   async approxStoreBytes(): Promise<{ blobs: number; blobBytes: number; manifests: number; stagingBytes: number }> {
     const blobs = await this.listBlobFiles();
@@ -1205,6 +1243,154 @@ export class FilesystemSnapshotStore {
       }
     }
     return total;
+  }
+
+  /**
+   * Explain the current physical store without changing GC authority.
+   *
+   * Counts use the exact policy implemented by `gcSlice`: strong pins and
+   * terminal snapshots within retention (plus the recent per-workspace tail)
+   * are retained; fresh orphans are grace-protected; everything else is safe
+   * for the next destructive sweep. This is the operator-visible answer to
+   * "why is snapshot storage retained?", not a permission to delete evidence.
+   */
+  async storageAccounting(listDbSnapshots?: () => Array<{ ref: string; terminal?: boolean; terminalAt?: string }>): Promise<SnapshotStorageAccounting> {
+    const { strong, terminal } = await this.collectRoots(listDbSnapshots ?? this.durableRoots);
+    const nowMs = Date.now();
+    const terminalByRef = new Map(terminal.map((item) => [item.ref, item]));
+    const protectedAfterTtl = new Set([...terminal]
+      .sort((left, right) => right.ageAtMs - left.ageAtMs)
+      .slice(0, this.retainPerWorkspace)
+      .map((item) => item.ref));
+
+    const account = new Map<string, { hash: string; size: number; classification: SnapshotBlobAccounting["classification"]; pinReasons: Set<string> }>();
+    const addBlob = async (hash: string, reason: string, classification: SnapshotBlobAccounting["classification"]) => {
+      if (!HASH_RE.test(hash)) return;
+      const existing = account.get(hash);
+      if (existing) {
+        existing.pinReasons.add(reason);
+        if (classification === "reclaimable") return;
+        if (existing.classification === "reclaimable" || (classification === "grace_protected" && existing.classification !== "live")) {
+          existing.classification = classification;
+        }
+        return;
+      }
+      const path = this.blobPath(hash);
+      const st = await lstat(path).catch(() => undefined);
+      if (!st || !st.isFile()) return;
+      account.set(hash, { hash, size: st.size, classification, pinReasons: new Set([reason]) });
+    };
+    const legacyHashes = new Set<string>();
+    try {
+      for (const name of await readdir(join(this.storeRoot, "blobs"))) {
+        if (HASH_RE.test(name)) legacyHashes.add(name);
+      }
+    } catch { /* no legacy blobs */ }
+
+    let retainedLiveManifests = 0;
+    let retainedTerminalManifests = 0;
+    let graceProtectedManifests = 0;
+    let reclaimableManifests = 0;
+    const pinReasons = new Map<string, Set<string>>();
+
+    for (const file of await this.listManifestFiles()) {
+      const ref = FS_REF_PREFIX + file.replace(/\.json$/, "");
+      const terminalRef = terminalByRef.get(ref);
+      const withinRetention = terminalRef !== undefined && nowMs - terminalRef.ageAtMs < this.retentionMs;
+      const strongPinned = strong.has(ref);
+      const tailProtected = protectedAfterTtl.has(ref);
+      const retained = strongPinned || withinRetention || tailProtected;
+      const reasons: string[] = [];
+      if (strongPinned) reasons.push("strong_pin");
+      if (withinRetention) reasons.push("terminal_retention");
+      if (tailProtected) reasons.push("terminal_recent_tail");
+
+      let manifest: FilesystemManifest | undefined;
+      try {
+        manifest = await this.readManifest({ kind: "filesystem", ref, createdAt: new Date(0).toISOString() });
+      } catch (error) {
+        this.recordCorruption(`manifest:${ref}`, error instanceof Error ? error.message : String(error));
+      }
+      const reasonKey = reasons.length ? reasons.join("+") : "unpinned";
+      pinReasons.set(reasonKey, (pinReasons.get(reasonKey) ?? new Set()).add(ref));
+      if (!retained) {
+        const mtime = await this.manifestMtimeMs(ref);
+        const graceProtected = mtime !== undefined && nowMs - mtime < this.orphanGraceMs;
+        if (graceProtected) {
+          graceProtectedManifests++;
+          reasons.push("orphan_grace");
+        } else {
+          reclaimableManifests++;
+          reasons.push("gc_eligible");
+        }
+      } else if (terminalRef || (!strongPinned && (withinRetention || tailProtected))) {
+        retainedTerminalManifests++;
+      } else {
+        retainedLiveManifests++;
+      }
+
+      if (manifest) {
+        const classification: SnapshotBlobAccounting["classification"] = retained
+          ? "live"
+          : reasons.includes("orphan_grace") ? "grace_protected" : "reclaimable";
+        for (const entry of manifest.entries) {
+          if (entry.type !== "file") continue;
+          if (legacyHashes.has(entry.sha256)) {
+            await addBlob(entry.sha256, `${reasonKey}:legacy`, classification === "live" ? "live" : classification);
+          }
+          await addBlob(entry.sha256, reasonKey, classification);
+        }
+      }
+    }
+
+    const markedHashes = new Set(account.keys());
+    const stagingBytes = await this.stagingBytes();
+    for (const blob of await this.listBlobFiles()) {
+      if (markedHashes.has(blob.hash)) continue;
+      const ageMs = nowMs - ((await this.mtimeMs(blob.path)) ?? nowMs);
+      const graceProtected = ageMs < this.orphanGraceMs;
+      const size = await this.sizeOf(blob.path);
+      account.set(blob.hash, {
+        hash: blob.hash,
+        size,
+        classification: graceProtected ? "grace_protected" : "reclaimable",
+        pinReasons: new Set([graceProtected ? "orphan_grace" : "gc_eligible"]),
+      });
+    }
+
+    const blobs = [...account.values()].map((item) => ({
+      hash: item.hash,
+      size: item.size,
+      classification: item.classification,
+      pinReasons: [...item.pinReasons].sort(),
+    }));
+    const byClassification = { live: 0, grace_protected: 0, reclaimable: 0 } as Record<SnapshotBlobAccounting["classification"], number>;
+    const bytesByClassification = { ...byClassification } as Record<SnapshotBlobAccounting["classification"], number>;
+    for (const blob of blobs) {
+      byClassification[blob.classification]++;
+      bytesByClassification[blob.classification] += blob.size;
+    }
+    return {
+      generatedAt: new Date().toISOString(),
+      manifests: {
+        retainedLive: retainedLiveManifests,
+        retainedTerminal: retainedTerminalManifests,
+        graceProtected: graceProtectedManifests,
+        reclaimable: reclaimableManifests,
+        total: await this.listManifestFiles().then((files) => files.length),
+      },
+      blobs: {
+        counts: byClassification,
+        bytes: bytesByClassification,
+        samples: blobs.sort((left, right) => right.size - left.size).slice(0, 20),
+        total: blobs.length,
+        totalBytes: blobs.reduce((sum, blob) => sum + blob.size, 0),
+      },
+      staging: { bytes: stagingBytes },
+      pinnedRefsByReason: Object.fromEntries([...pinReasons.entries()]
+        .map(([reason, refs]): [string, string[]] => [reason, [...refs].sort()])
+        .sort(([left], [right]) => left.localeCompare(right))),
+    };
   }
 
   async storeStats(): Promise<StoreStats> {

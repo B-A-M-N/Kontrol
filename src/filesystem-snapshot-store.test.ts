@@ -491,3 +491,46 @@ function snap(ref: string, terminal = false): { ref: string; terminal?: boolean 
 }
 
 console.log("filesystem-snapshot-store: all scenarios passed");
+
+// --- Audit §8: storage accounting explains pins without bypassing GC roots ---
+{
+  const storeRoot = makeRoot("kontrol-fss-accounting-");
+  const workspaceRoot = makeRoot("kontrol-fss-accounting-root-");
+  const store = new FilesystemSnapshotStore({
+    storeRoot,
+    limits: { orphanGraceMs: 0, retentionMs: 30_000, retainPerWorkspace: 0 },
+  });
+  file(workspaceRoot, "pinned.txt", "pinned evidence\n");
+  const pinned = await store.capture(workspaceRoot);
+  await store.saveBaselines("ws-accounting", workspaceRoot, {
+    open: pinned, presentation: pinned, legacy: pinned, sessions: new Map(),
+  });
+
+  file(workspaceRoot, "terminal.txt", "terminal evidence\n");
+  const terminal = await store.capture(workspaceRoot);
+
+  file(workspaceRoot, "unpinned.txt", "unpinned content\n");
+  const unpinned = await store.capture(workspaceRoot);
+
+  const accounting = await store.storageAccounting(() => [
+    { ref: pinned.ref, terminal: false },
+    { ref: terminal.ref, terminal: true, terminalAt: new Date().toISOString() },
+  ]);
+  assert.equal(accounting.manifests.retainedLive, 1, "strong pin classified as live");
+  assert.equal(accounting.manifests.retainedTerminal, 1, "terminal retention classified separately");
+  assert.equal(accounting.manifests.reclaimable, 1, "unpinned manifest is gc-eligible");
+  assert.ok(accounting.blobs.counts.live >= 2, "live evidence blobs counted");
+  assert.ok(accounting.blobs.counts.reclaimable >= 1, "unreferenced blob is reclaimable");
+  assert.deepEqual(accounting.pinnedRefsByReason.strong_pin, [pinned.ref], "strong pin reason is exposed");
+  assert.ok(accounting.pinnedRefsByReason.terminal_retention.includes(terminal.ref), "terminal pin reason is exposed");
+
+  // Accounting is observability only: GC still owns destructive collection.
+  await gcToCompletion(store, () => [
+    { ref: pinned.ref, terminal: false },
+    { ref: terminal.ref, terminal: true, terminalAt: new Date().toISOString() },
+  ]);
+  assert.equal(existsSync(store.manifestPath(pinned.ref)), true, "strong pin survives after accounting");
+  assert.equal(existsSync(store.manifestPath(terminal.ref)), true, "retained terminal survives after accounting");
+  assert.equal(existsSync(store.manifestPath(unpinned.ref)), false, "accounting did not interfere with normal GC");
+  await store.close();
+}

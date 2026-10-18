@@ -541,7 +541,9 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
       const stats = await store.storeStats();
       const movable = Number(stats.blobBytes) || 0;
       const reachable = await store.estimateReachableBytes(collectFsSnapshotDbRoots);
+      const accounting = await store.storageAccounting(collectFsSnapshotDbRoots);
       return {
+        accounting,
         blobs: stats.blobs,
         blobBytes: stats.blobBytes,
         manifests: stats.manifests,
@@ -716,6 +718,8 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     sessionLifecycle,
     policyWaiters,
     workspaceAppResourceMetrics,
+    workspaceStateMapTelemetry: () => workspaces.stateMapTelemetry(),
+    eventStoreMemoryTelemetry: () => eventStore.memoryTelemetry(),
     mcpConnectionMetrics,
     logicalContinuity,
     startupRecovery,

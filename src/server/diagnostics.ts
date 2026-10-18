@@ -4,6 +4,7 @@
  * closures become an explicit dependency object.
  */
 import { createHash, timingSafeEqual } from "node:crypto";
+import { monitorEventLoopDelay } from "node:perf_hooks";
 import { readFileSync, statSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -33,6 +34,8 @@ export interface DiagnosticsDeps {
   readonly sessionLifecycle: McpSessionLifecycle;
   readonly policyWaiters: McpPolicyWaiterRegistry;
   readonly workspaceAppResourceMetrics: WorkspaceAppResourceMetrics;
+  readonly workspaceStateMapTelemetry?: () => Record<string, number>;
+  readonly eventStoreMemoryTelemetry?: () => { available?: boolean; subscribers?: number; subscriberSessions?: number; subscriberWorkspaces?: number; globalSubscribers?: number; telemetryBuffers?: number; };
   readonly mcpConnectionMetrics: {
     unknownSessionRequests: number;
     freshInitializations: number;
@@ -63,6 +66,27 @@ export interface DiagnosticsDeps {
   countAliveAgents(): number;
   listPendingApprovals(): Array<{ kind: string; origin?: string; approvalId: string; reattachDeadline?: string }>;
   sqlite(): { prepare?: (sql: string) => { get?: () => unknown } } | undefined;
+}
+
+/** Server-owned bounded event-loop sampling state (audit §7). */
+const eventLoopMonitor = monitorEventLoopDelay({ resolution: 10 });
+eventLoopMonitor.enable();
+const diagnosticsProcessStartedAt = performance.now();
+
+function eventLoopTelemetry() {
+  eventLoopMonitor.disable();
+  eventLoopMonitor.enable();
+  const mean = Number.isFinite(eventLoopMonitor.mean) ? eventLoopMonitor.mean / 1_000_000 : undefined;
+  const max = Number.isFinite(eventLoopMonitor.max) ? eventLoopMonitor.max / 1_000_000 : undefined;
+  const p99 = eventLoopMonitor.percentile(99) / 1_000_000;
+  return {
+    resolutionMs: 10,
+    sampleCount: eventLoopMonitor.count,
+    meanMs: mean,
+    maxMs: max,
+    p99Ms: Number.isFinite(p99) ? p99 : undefined,
+    uptimeMs: Math.round(performance.now() - diagnosticsProcessStartedAt),
+  };
 }
 
 export async function handleDiagnostics(deps: DiagnosticsDeps, req: Request, res: Response): Promise<unknown> {
@@ -172,6 +196,7 @@ export async function handleDiagnostics(deps: DiagnosticsDeps, req: Request, res
         return undefined;
       }
     })();
+    const workspaceStateMapTelemetry = deps.workspaceStateMapTelemetry?.() ?? { available: false };
     const mcpMetrics = {
       created: sessionLifecycle.metrics.created,
       evicted: sessionLifecycle.metrics.evicted,
@@ -352,6 +377,11 @@ export async function handleDiagnostics(deps: DiagnosticsDeps, req: Request, res
       external: memUsage.external,
       uptimeMs: Math.round(performance.now()),
       memoryUsage: memUsage,
+      memoryTelemetry: {
+        eventLoop: eventLoopTelemetry(),
+        workspaceStateMaps: workspaceStateMapTelemetry,
+        eventStore: deps.eventStoreMemoryTelemetry?.() ?? { available: false },
+      },
       pid: process.pid,
     });
   } catch (err) {

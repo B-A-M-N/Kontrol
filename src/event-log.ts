@@ -48,6 +48,16 @@ export type EventPredicate = (event: EventStoreEvent) => boolean;
 
 export type EventStoreTimingCallback = (phase: string, durationMs: number) => void;
 
+export interface EventStoreMemoryTelemetry {
+  /** Total live callbacks across per-session, workspace, and global maps. */
+  subscribers: number;
+  subscriberSessions: number;
+  subscriberWorkspaces: number;
+  globalSubscribers: number;
+  /** Pending coalesced telemetry fragments retained in memory. */
+  telemetryBuffers: number;
+}
+
 export interface EventStore {
  appendEvent(input: {
    id?: string;
@@ -152,6 +162,8 @@ export interface EventStore {
     timeoutMs: number,
     signal?: AbortSignal,
   ): Promise<EventStoreEvent | null>;
+
+  memoryTelemetry(): EventStoreMemoryTelemetry;
 
   close(): void;
 }
@@ -1148,6 +1160,13 @@ export function createEventStore(
     subscribeAll,
     waitForEvent,
     waitForMatchingEventAfter,
+    memoryTelemetry: (): EventStoreMemoryTelemetry => ({
+      subscribers: [...subscribers.values()].reduce((sum, set) => sum + set.size, 0),
+      subscriberSessions: subscribers.size,
+      subscriberWorkspaces: workspaceSubscribers.size,
+      globalSubscribers: globalSubscribers.size,
+      telemetryBuffers: telemetryBuffers.size,
+    }),
     close,
   };
 }
