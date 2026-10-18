@@ -12,6 +12,7 @@ export const toolNames = {
   showWorkspaceUi: "show_workspace_ui",
   read: "read",
   write: "write",
+  stagedWrite: "staged_file_write",
   edit: "edit",
   grep: "grep",
   glob: "glob",

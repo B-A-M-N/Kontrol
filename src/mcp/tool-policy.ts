@@ -35,7 +35,7 @@ export function policyFailureResponse(
   result: { allowed: boolean; approvalRequired?: boolean; approvalId?: string },
   deniedMessage: string,
   context: {
-    tool: "exec_command" | "write_stdin" | "read" | "write" | "edit" | "apply_patch" | "grep" | "glob" | "ls" | "bash" | "git_status" | "git_log" | "git_diff" | "git_show";
+    tool: string;
     workspaceId: string;
     path?: string;
     command?: string;

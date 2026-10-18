@@ -812,7 +812,10 @@ function reportRawUpdate(run, params) {
   }
   if (updateType === "tool_call") {
     const status = String(update.status || update.toolCallStatus || "");
-    if (status === "completed") return reportStructured(run, "tool_completed", toolPayload(update));
+    if (status === "completed") {
+      const payload = toolPayload(update);
+      return reportStructured(run, "tool_completed", { ...payload, rawOutput: update.raw_output ?? update.rawOutput });
+    }
     if (status === "failed") return reportStructured(run, "tool_failed", toolPayload(update));
     return reportStructured(run, "tool_started", toolPayload(update));
   }
@@ -820,7 +823,10 @@ function reportRawUpdate(run, params) {
     return reportStructured(run, "plan_updated", { raw: update, text: textFromContent(update.content) });
   }
   if (updateType.includes("tool") && updateType.includes("start")) return reportStructured(run, "tool_started", toolPayload(update));
-  if (updateType.includes("tool") && (updateType.includes("complete") || updateType.includes("end"))) return reportStructured(run, "tool_completed", toolPayload(update));
+  if (updateType === "tool_call_update" || updateType.includes("tool") && (updateType.includes("complete") || updateType.includes("end"))) {
+    const payload = toolPayload(update);
+    return reportStructured(run, "tool_completed", { ...payload, rawOutput: update.raw_output ?? update.rawOutput });
+  }
   if (updateType.includes("tool") && updateType.includes("fail")) return reportStructured(run, "tool_failed", toolPayload(update));
   if (updateType.includes("plan") || updateType.includes("todo")) return reportStructured(run, "plan_updated", { raw: update, text: textFromContent(update.content) });
   return reportOutput(run, JSON.stringify(update), `acp:${updateType}`);

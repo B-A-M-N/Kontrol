@@ -803,11 +803,17 @@ export function registerWorkspaceTools(
       const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
       if (bindingErr) return bindingErr;
       const resolvedPath = workspaces.resolvePath(workspace, input.path);
+      const scheduledPolicy = scheduledExecutionPolicy(connectionContext?.workSessionId);
+      const stagedWrite = scheduledPolicy?.executionMode === "bounded_file_write"
+        && scheduledPolicy.workspaceAccess === "staged_write"
+        && Array.isArray(scheduledPolicy.allowedOutputs)
+        && scheduledPolicy.allowedOutputs.some((output) => output?.path === input.path);
+      const writeTool = stagedWrite ? toolNames.stagedWrite : toolNames.write;
       const policyPath = canonicalPolicyPath(workspace.root, input.path, resolvedPath);
 
       const newlyApplicable = await workspaces.loadApplicableInstructions(workspace, input.path, connectionContext?.mcpSessionId);
       if (newlyApplicable.length > 0 && input.instructionContentHash !== hashInstructionContent(newlyApplicable)) {
-        return instructionsRequiredResponse(toolNames.write, newlyApplicable, workspace.root, workspaceId, input.path, `Read and acknowledge the returned instructions, then retry write with instructionContentHash="${hashInstructionContent(newlyApplicable)}". No file was changed.`);
+        return instructionsRequiredResponse(writeTool, newlyApplicable, workspace.root, workspaceId, input.path, `Read and acknowledge the returned instructions, then retry write with instructionContentHash="${hashInstructionContent(newlyApplicable)}". No file was changed.`);
       }
 
       // Policy enforcement for file writes
@@ -818,7 +824,7 @@ export function registerWorkspaceTools(
           brandWorkspaceId(workspaceId),
           connectionContext?.workSessionId ? brandWorkSessionId(connectionContext.workSessionId) : undefined,
           connectionContext?.runId,
-            toolNames.write,
+            writeTool,
             policyPath,
             undefined,
             undefined,
@@ -827,8 +833,8 @@ export function registerWorkspaceTools(
             scheduledExecutionPolicy(connectionContext?.workSessionId),
           );
         if (!approved.allowed) {
-          return policyFailureResponse(approved, `Tool "${toolNames.write}" denied by policy. Path: ${input.path}`, {
-            tool: toolNames.write,
+          return policyFailureResponse(approved, `Tool "${writeTool}" denied by policy. Path: ${input.path}`, {
+            tool: writeTool,
             workspaceId,
             path: input.path,
           });
@@ -837,7 +843,7 @@ export function registerWorkspaceTools(
 
       const mutation = await withFileMutationLock<LockedToolMutation<Awaited<ReturnType<typeof writeFileTool>>>>([resolvedPath], async (): Promise<LockedToolMutation<Awaited<ReturnType<typeof writeFileTool>>>> => {
         const versionConflict = await checkFileVersion(
-          toolNames.write,
+          writeTool,
           workspaceId,
           resolvedPath,
           expectedContentSha256,
@@ -855,7 +861,7 @@ export function registerWorkspaceTools(
 
       if (response.isError) {
         logFailedToolResponse(config, {
-          tool: toolNames.write,
+          tool: writeTool,
           workspaceId,
           path: input.path,
         }, response.content, startedAt);
@@ -874,7 +880,7 @@ export function registerWorkspaceTools(
         characters: input.content.length,
       };
       logToolCall(config, {
-        tool: toolNames.write,
+        tool: writeTool,
         workspaceId,
         path: input.path,
         success: true,
@@ -885,12 +891,12 @@ export function registerWorkspaceTools(
         ? { ...response, content: [...instructionContent(newlyApplicable, workspace.root), ...response.content] }
         : response;
       const contentSha256 = mutation.contentSha256;
-      trackToolEvent(workspaceId, toolNames.write, input, responseWithInstructions, startedAt);
+      trackToolEvent(workspaceId, writeTool, input, responseWithInstructions, startedAt);
 
       return {
         ...responseWithInstructions,
         _meta: {
-          tool: toolNames.write,
+          tool: writeTool,
           card: {
             workspaceId,
             path: input.path,
@@ -902,7 +908,7 @@ export function registerWorkspaceTools(
           },
         },
         structuredContent: {
-          tool: toolNames.write,
+          tool: writeTool,
           result: contentText(responseWithInstructions.content),
           contentSha256,
         },
