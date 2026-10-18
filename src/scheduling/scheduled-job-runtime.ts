@@ -743,11 +743,24 @@ export function createScheduledJobRuntime(options: ScheduledJobRuntimeOptions): 
 
   function scheduleNext(): void {
     if (timer) clearTimeout(timer);
+    let nextWakeMs = pollMs;
+    try {
+      const nextDue = database.sqlite.prepare(`
+        select min(case when run_at > ? then run_at else ? end) as next
+          from scheduled_jobs
+         where status in ('pending','due')
+      `).get(new Date(Date.now() + pollMs).toISOString(), new Date(Date.now() + pollMs).toISOString()) as { next?: string | null } | undefined;
+      if (nextDue?.next) {
+        const dueMs = Math.max(0, Date.parse(nextDue.next) - Date.now());
+        nextWakeMs = Math.min(pollMs, dueMs);
+      }
+    } catch { /* fallback to normal polling on diagnostic read failure */ }
     timer = setTimeout(() => {
       void drainOnce().then(() => {
         if (!stopped) scheduleNext();
       });
-    }, pollMs);
+    }, nextWakeMs);
+    timer.unref?.();
   }
 
   function getMetrics(): ScheduledJobRuntime extends { getMetrics(): infer T } ? T : never {
