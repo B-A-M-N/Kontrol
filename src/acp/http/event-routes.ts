@@ -456,12 +456,21 @@ function eventMatchesDispatch(event: { type: string; payload: Record<string, unk
       session !== undefined &&
       !TERMINAL_SESSION_STATUSES.has(session.status);
     if (sessionId && eventStore && !awaitingReviewCrash && !workflowHandledCancellation) {
-      const eventType = gatedCompletedTurn ? "worker.turn.completed" : ADAPTER_EVENT_TYPE_TO_RUN[body.type]!;
+      const scheduledJobForSession = sessionId ? ctx.scheduledJobs?.getByWorkSessionId(sessionId) : undefined;
+      const scheduledAttempt = scheduledJobForSession
+        ? ctx.scheduledJobs!.getAttempt(scheduledJobForSession.id)
+        : undefined;
+      const autonomousBoundedWrite = body.type === "completed"
+        && session?.completionPolicy === "agent_completion"
+        && scheduledJobForSession?.executionMode === "bounded_file_write"
+        && Boolean(scheduledAttempt?.publicationReceipts?.some((r: Record<string, unknown>) => r.outcome === "committed" && r.readBackVerified === true));
+      const eventType = (gatedCompletedTurn || autonomousBoundedWrite) ? "worker.turn.completed" : ADAPTER_EVENT_TYPE_TO_RUN[body.type]!;
       const adapterPayload = Object.fromEntries(
         Object.entries(body.payload ?? {}).filter(([key]) => !SERVER_OWNED_EVENT_PAYLOAD_FIELDS.has(key)),
       );
       const eventPayload = {
         ...adapterPayload,
+        ...(autonomousBoundedWrite ? { autonomousCompletion: true } : {}),
         runId: run.runId,
         remoteRunId: body.remote_run_id ?? run.remoteRunId,
         attemptNumber: body.attempt_number ?? run.attemptNumber ?? 1,

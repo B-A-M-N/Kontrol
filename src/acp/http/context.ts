@@ -85,4 +85,5 @@ export interface AcpContext {
   /** Local Kontrol tool agents exposed over the ACP surface. */
   agentMap: Map<string, { name: string; description: string }>;
   database?: import("../../db/client.js").DatabaseHandle;
+  scheduledJobs?: import("../../scheduling/scheduled-job-store.js").ScheduledJobStore;
 }

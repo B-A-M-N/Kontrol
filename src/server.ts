@@ -757,6 +757,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
       config.acpReviewerSecret,
       { enabled: config.webhookEnabled, allowedHosts: config.webhookAllowedHosts },
       db,
+      scheduledJobs,
     ));
   }
   app.all("/mcp", (req, res) => {
