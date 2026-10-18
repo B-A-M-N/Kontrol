@@ -126,7 +126,10 @@ export function createMcpServer(
     return {
       executionMode: row.executionMode,
       workspaceAccess: typeof row.policySnapshotJson.workspaceAccess === "string" ? row.policySnapshotJson.workspaceAccess : undefined,
-      mutate: row.policySnapshotJson.mutate === false ? false : undefined,
+      mutate: row.policySnapshotJson.mutate === true ? true : row.policySnapshotJson.mutate === false ? false : undefined,
+      allowedOutputs: Array.isArray(row.policySnapshotJson.allowedOutputs)
+        ? row.policySnapshotJson.allowedOutputs.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
+        : undefined,
       allowedTools: Array.isArray(row.policySnapshotJson.allowedTools) ? row.policySnapshotJson.allowedTools.filter((item): item is string => typeof item === "string") : undefined,
     };
   };

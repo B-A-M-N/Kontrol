@@ -93,13 +93,16 @@ export async function dispatchScheduledJob(
   });
   const workSessionId = created.id;
   const isReadOnlyAudit = job.executionMode === "read_only_audit";
+  const isBoundedFileWrite = job.executionMode === "bounded_file_write";
 
   // Read-only audit jobs must never take a checkout mutation lease. The
   // scheduled agent still needs the work-session identity and tool-boundary
   // policy, but the original checkout remains untouched by the scheduler.
   const leaseError = isReadOnlyAudit
     ? undefined
-    : (await acquireCheckoutModifyLease(config, workspaceSessionId, workSessionId, { takeover: false }));
+    : (isBoundedFileWrite
+      ? undefined
+      : await acquireCheckoutModifyLease(config, workspaceSessionId, workSessionId, { takeover: false }));
   if (leaseError) {
     config.workSessions.updateStatus(workSessionId, "failed");
     return { status: "blocked", workSessionId, reason: leaseError.content[0]?.text ?? "Workspace lease unavailable." };
@@ -123,12 +126,23 @@ export async function dispatchScheduledJob(
         dispatchIdempotencyKey: options.dispatchId,
         workspaceSessionId,
         workSessionId,
-        ...(isReadOnlyAudit ? {} : checkoutLeaseMetadata(config, workSessionId)),
+        ...(isReadOnlyAudit || isBoundedFileWrite ? {} : checkoutLeaseMetadata(config, workSessionId)),
         ...(isReadOnlyAudit ? {
           scheduledExecutionPolicy: {
             executionMode: job.executionMode,
             workspaceAccess: "read_only",
             mutate: false,
+            executionGrantTtlMs: job.maxRuntimeMs + 5 * 60_000,
+            maxRuntimeMs: job.maxRuntimeMs,
+          },
+        } : isBoundedFileWrite ? {
+          scheduledExecutionPolicy: {
+            executionMode: job.executionMode,
+            workspaceAccess: "staged_write",
+            mutate: true,
+            allowedOutputs: Array.isArray(job.policySnapshotJson.allowedOutputs)
+              ? job.policySnapshotJson.allowedOutputs.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
+              : [],
             executionGrantTtlMs: job.maxRuntimeMs + 5 * 60_000,
             maxRuntimeMs: job.maxRuntimeMs,
           },

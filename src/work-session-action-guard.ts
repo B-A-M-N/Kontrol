@@ -89,6 +89,7 @@ export interface ScheduledExecutionPolicy {
   workspaceAccess?: string;
   mutate?: boolean;
   allowedTools?: string[];
+  allowedOutputs?: Array<Record<string, unknown>>;
 }
 
 /**
@@ -107,6 +108,36 @@ function scheduledReadOnlyDecision(
   return {
     allowed: false,
     reason: `Scheduled read-only audit policy denies tool "${input.tool}".`,
+  };
+}
+
+/**
+ * Bounded scheduled writes are staged and published only through Kontrol's
+ * artifact publisher. The worker receives no writable checkout bind and no
+ * arbitrary shell/tool authority.
+ */
+function scheduledBoundedWriteDecision(
+  policy: ScheduledExecutionPolicy | undefined,
+  input: { tool: string; path?: string },
+): { allowed: boolean; reason?: string } {
+  if (!policy || policy.executionMode !== "bounded_file_write") return { allowed: true };
+  if (policy.workspaceAccess !== "staged_write" || policy.mutate !== true) {
+    return { allowed: false, reason: "Scheduled bounded-write policy is malformed." };
+  }
+  if (input.tool === "staged_file_write") {
+    const outputs = Array.isArray(policy.allowedOutputs) ? policy.allowedOutputs : [];
+    const requested = typeof input.path === "string" ? input.path : undefined;
+    const authorized = requested !== undefined && outputs.some((output) => output?.path === requested);
+    return authorized
+      ? { allowed: true }
+      : { allowed: false, reason: `Scheduled bounded-write policy denies "${requested ?? "unknown path"}".` };
+  }
+  const actionClass = TOOL_TO_ACTION_CLASS[input.tool];
+  if (actionClass === "read_files") return { allowed: true };
+  if (input.tool === "submit_for_review" || input.tool === "await_review_feedback" || input.tool === "check_review_status") return { allowed: true };
+  return {
+    allowed: false,
+    reason: `Scheduled bounded-write policy denies tool "${input.tool}".`,
   };
 }
 
@@ -131,6 +162,8 @@ export function authorizeWorkSessionAction(
 
   const scheduledPolicyDecision = scheduledReadOnlyDecision(input.scheduledExecutionPolicy, input);
   if (!scheduledPolicyDecision.allowed) return scheduledPolicyDecision;
+  const boundedWriteDecision = scheduledBoundedWriteDecision(input.scheduledExecutionPolicy, input);
+  if (!boundedWriteDecision.allowed) return boundedWriteDecision;
 
   if (!actionClass) {
     if (session.completionPolicy === "webui_approval_required") {

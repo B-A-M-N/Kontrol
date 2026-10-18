@@ -39,7 +39,7 @@ export interface ScheduledJobInput {
   workspaceRoot: string;
   runAt: string;
   instructionJson: unknown;
-  executionMode: "read_only_audit";
+  executionMode: "read_only_audit" | "bounded_file_write";
   policySnapshotJson: unknown;
   agentName?: string;
   workSessionId?: string;
@@ -280,10 +280,19 @@ const scheduledJobRequestSchema = z.object({
   workspaceRoot: nonEmptyString,
   runAt: z.string().datetime({ offset: true }),
   instructionJson: z.record(z.string(), z.unknown()),
-  executionMode: z.literal("read_only_audit"),
+  executionMode: z.enum(["read_only_audit", "bounded_file_write"]),
   policySnapshotJson: z.record(z.string(), z.unknown()),
   maxRuntimeMs: z.number().int().min(1_000).max(24 * 60 * 60 * 1_000),
 });
+
+/** Exact-path, exact-content output authority for scheduled bounded writes. */
+export interface BoundedFileWriteOutputPolicy {
+  path: string;
+  operation: "create" | "replace";
+  expectedSha256?: string;
+  overwrite: "deny" | "expected_hash";
+  expectedPreviousSha256?: string;
+}
 
 function rowToJob(row: ScheduledJobRow): ScheduledJob {
   return {

@@ -24,6 +24,11 @@ const readOnlyModuleUrl = process.env.KONTROL_ARTIFACT_PATH
   ? pathToFileURL(resolve(process.env.KONTROL_ARTIFACT_PATH, "read-only-execution.mjs"))
   : new URL("./lib/read-only-execution.mjs", import.meta.url);
 const readOnlyExecutionModule = await import(readOnlyModuleUrl);
+const boundedWriteModuleUrl = process.env.KONTROL_ARTIFACT_PATH
+  ? pathToFileURL(resolve(process.env.KONTROL_ARTIFACT_PATH, "bounded-file-write.mjs"))
+  : new URL("./lib/bounded-file-write.mjs", import.meta.url);
+const boundedFileWriteModule = await import(boundedWriteModuleUrl);
+const { validateBoundedFileWriteDispatchRequest } = boundedFileWriteModule;
 const {
   buildReadOnlySandboxCommand,
   probeReadOnlyExecutionSandbox,
@@ -351,6 +356,10 @@ async function handle(req, res) {
   if (readOnlyAuthorization.readOnly && !readOnlyAuthorization.valid) {
     return writeJson(res, 403, { error: { code: "read_only_grant_invalid", message: "A valid Kontrol-issued read-only execution grant is required." } });
   }
+  const boundedWriteAuthorization = validateBoundedFileWriteDispatchRequest(body, ADAPTER_SECRET, agentIdentity?.agentId);
+  if (boundedWriteAuthorization.boundedWrite && !boundedWriteAuthorization.valid) {
+    return writeJson(res, 403, { error: { code: "bounded_file_write_grant_invalid", message: "A valid Kontrol-issued bounded file-write grant is required." } });
+  }
   const run = {
     remoteRunId: `hermes_${randomUUID().slice(0, 8)}`,
     devRunId: body.parent_run_id || body.run_id,
@@ -362,7 +371,9 @@ async function handle(req, res) {
     requestFingerprint,
     task,
     workspaceRoot,
-    readOnlyAudit: readOnlyAuthorization.readOnly,
+    readOnlyAudit: readOnlyAuthorization.readOnly && !boundedWriteAuthorization.boundedWrite,
+    boundedFileWrite: boundedWriteAuthorization.boundedWrite,
+    boundedFileWriteGrant: boundedWriteAuthorization.grant,
     readOnlyExecutionGrant: readOnlyAuthorization.grant,
     workspaceLeaseNonce: body.workspace_lease_nonce,
     workspaceLeaseExpiresAt: body.workspace_lease_expires_at,
@@ -393,12 +404,12 @@ async function handle(req, res) {
       ...(existing?.dispatchIdempotencyKey ? { dispatch_idempotency_key: existing.dispatchIdempotencyKey } : {}),
     });
   }
-  if (run.workSessionId && !run.readOnlyAudit && (!run.workspaceLeaseNonce || workspaceLeaseDeadlineReached(run))) {
+  if (run.workSessionId && !run.readOnlyAudit && !run.boundedFileWrite && (!run.workspaceLeaseNonce || workspaceLeaseDeadlineReached(run))) {
     return writeJson(res, 409, {
       error: { code: "workspace_lease_lost", message: "A live workspace lease nonce and expiry are required before a worker can start." },
     });
   }
-  if (run.readOnlyAudit) {
+  if (run.readOnlyAudit || run.boundedFileWrite) {
     try {
       const pythonExecutable = resolveExecutablePath(PYTHON_BIN);
       const hermesExecutable = resolveHermesBinaryPath();

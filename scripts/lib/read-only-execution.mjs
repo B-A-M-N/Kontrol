@@ -110,7 +110,7 @@ export function validateReadOnlyDispatchRequest(body, canonicalWorkspaceRoot, se
   const grant = body?.read_only_execution_grant;
   const declaresReadOnly = policy?.executionMode === "read_only_audit"
     || policy?.workspaceAccess === "read_only"
-    || grant !== undefined;
+    || (grant !== undefined && policy?.executionMode !== "bounded_file_write");
   if (!declaresReadOnly) return { readOnly: false };
   if (
     policy?.executionMode !== "read_only_audit"

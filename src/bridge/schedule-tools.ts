@@ -69,7 +69,14 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
         workspaceId: z.string().describe("Workspace ID from open_workspace."),
         runAt: z.string().datetime({ offset: true }).describe("UTC execution deadline."),
         instructions: z.string().trim().min(1).describe("Bounded task instructions."),
-        executionMode: z.literal("read_only_audit").default("read_only_audit"),
+        executionMode: z.enum(["read_only_audit", "bounded_file_write"]).default("read_only_audit"),
+        allowedOutputs: z.array(z.object({
+          path: z.string().trim().min(1).max(1_024),
+          operation: z.enum(["create", "replace"]),
+          expectedSha256: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+          overwrite: z.enum(["deny", "expected_hash"]),
+          expectedPreviousSha256: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+        })).max(8).optional(),
         maxRuntimeMinutes: z.number().int().min(1).max(24 * 60).default(90),
         verificationCommands: z.array(z.string().trim().min(1).max(1_024)).max(5).optional()
           .describe("Optional allowlisted tests to run later against a disposable copy of the submitted snapshot."),
@@ -86,7 +93,7 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
       annotations: { readOnlyHint: false },
     },
     config,
-    async ({ workspaceId, runAt, instructions, executionMode, maxRuntimeMinutes, verificationCommands, agentName, clientMutationId }) => {
+    async ({ workspaceId, runAt, instructions, executionMode, allowedOutputs, maxRuntimeMinutes, verificationCommands, agentName, clientMutationId }) => {
       if (!isReviewer(config.principalRole)) return forbidden(config.principalRole, "schedule_job");
       // A workspace ID is not a work-session ID. Authorization for scheduling
       // is reviewer role plus authenticated ownership of that workspace, which
@@ -100,6 +107,24 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
           parseVerificationCommand(command);
           return command;
         });
+        const outputs = executionMode === "bounded_file_write" ? (allowedOutputs ?? []) : [];
+        if (executionMode === "bounded_file_write" && outputs.length === 0) {
+          throw new Error("bounded_file_write requires at least one exact authorized output.");
+        }
+        if (executionMode !== "bounded_file_write" && allowedOutputs?.length) {
+          throw new Error("allowedOutputs are only valid with bounded_file_write.");
+        }
+        for (const output of outputs) {
+          if (output.path.includes("\\") || output.path.startsWith("/") || output.path.includes("..")) {
+            throw new Error("Authorized output paths must be relative workspace paths.");
+          }
+          if (output.overwrite === "deny" && output.expectedPreviousSha256) {
+            throw new Error("expectedPreviousSha256 requires overwrite=expected_hash.");
+          }
+          if (output.overwrite === "expected_hash" && !output.expectedPreviousSha256) {
+            throw new Error("overwrite=expected_hash requires expectedPreviousSha256.");
+          }
+        }
         const workspace = config.workspaces.getWorkspace(workspaceId);
         // The workspace registry itself is the workspace authority here: only
         // registered allowlisted roots are addressable, and the authenticated
@@ -114,8 +139,16 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
           instructionJson: { instructions },
           executionMode,
           policySnapshotJson: {
-            workspaceAccess: "read_only",
-            mutate: false,
+            ...(executionMode === "bounded_file_write"
+              ? {
+                workspaceAccess: "staged_write",
+                mutate: true,
+                allowedOutputs: outputs,
+              }
+              : {
+                workspaceAccess: "read_only",
+                mutate: false,
+              }),
             verificationCommands: checkedVerificationCommands,
             verificationPolicy: {
               capability: "read_only_verification",

@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { z } from "zod/v4";
 import { createReadOnlyExecutionGrant } from "./read-only-execution.mjs";
+import { createBoundedFileWriteGrant } from "./bounded-file-write.mjs";
 import {
   serializeFinalAcpResult,
   truncateUtf8Tail,
@@ -567,6 +568,7 @@ export async function callRemoteAgent(
       workspaceAccess?: string;
       mutate?: boolean;
       allowedTools?: string[];
+      allowedOutputs?: Array<Record<string, unknown>>;
       executionGrantTtlMs?: number;
       maxRuntimeMs?: number;
     };
@@ -608,7 +610,7 @@ export async function callRemoteAgent(
       webhookUrl: params.webhookUrl,
       scheduledExecutionMode: params.scheduledExecutionPolicy?.executionMode === "read_only_audit"
         ? "read_only_audit"
-        : undefined,
+        : params.scheduledExecutionPolicy?.executionMode,
       status: "created",
     });
     if (run.agentId !== params.agentId || run.workSessionId !== params.workSessionId) {
@@ -621,6 +623,11 @@ export async function callRemoteAgent(
     && run.scheduledExecutionMode !== "read_only_audit") {
     config.agentRegistry.updateRun(run.runId, { scheduledExecutionMode: "read_only_audit" });
     run.scheduledExecutionMode = "read_only_audit";
+  }
+  if (params.scheduledExecutionPolicy?.executionMode === "bounded_file_write"
+    && run.scheduledExecutionMode !== "bounded_file_write") {
+    config.agentRegistry.updateRun(run.runId, { scheduledExecutionMode: "bounded_file_write" });
+    run.scheduledExecutionMode = "bounded_file_write";
   }
   config.agentRegistry.beginDispatchAttempt({
     key: dispatchIdempotencyKey,
@@ -686,6 +693,34 @@ export async function callRemoteAgent(
         attemptNumber,
         dispatchIdempotencyKey,
         networkPolicy: config.readOnlyExecutionNetworkPolicy ?? "disabled",
+        ttlMs: params.scheduledExecutionPolicy.executionGrantTtlMs,
+      }, config.adapterSecret);
+    }
+
+    if (params.scheduledExecutionPolicy?.executionMode === "bounded_file_write") {
+      if (
+        params.scheduledExecutionPolicy.workspaceAccess !== "staged_write"
+        || params.scheduledExecutionPolicy.mutate !== true
+        || !params.scheduledExecutionPolicy.allowedOutputs?.length
+        || !params.workSessionId
+        || !params.workspaceSessionId
+        || !run.agentId
+        || !config.adapterSecret
+        || !workspace
+      ) {
+        throw new Error("bounded_file_write_grant_claims_invalid");
+      }
+      const canonicalWorkspaceRoot = realpathSync(workspace.root);
+      body.workspace_root = canonicalWorkspaceRoot;
+      body.bounded_file_write_grant = createBoundedFileWriteGrant({
+        workSessionId: params.workSessionId,
+        workspaceSessionId: params.workspaceSessionId,
+        workspaceRoot: canonicalWorkspaceRoot,
+        agentId: run.agentId,
+        runId: run.runId,
+        attemptNumber,
+        dispatchIdempotencyKey,
+        allowedOutputs: params.scheduledExecutionPolicy.allowedOutputs,
         ttlMs: params.scheduledExecutionPolicy.executionGrantTtlMs,
       }, config.adapterSecret);
     }
