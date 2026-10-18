@@ -77,6 +77,8 @@ export const scheduledJobAttempts = sqliteTable("scheduled_job_attempts", {
   activeRuntimeMs: integer("active_runtime_ms").notNull().default(0),
   executionStoppedAt: text("execution_stopped_at"),
   executionReceiptJson: text("execution_receipt_json"),
+  /** Durable artifact-publication receipts from the bounded-write publisher. */
+  publicationReceiptsJson: text("publication_receipts_json"),
   /** Authenticated result for the latest bound ACP execution attempt. */
   workerExecutionOutcome: text("worker_execution_outcome"),
   workerExecutionAt: text("worker_execution_at"),

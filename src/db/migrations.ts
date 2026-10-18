@@ -96,6 +96,7 @@ const migrations: Migration[] = [
   { version: 84, name: "mcp-qualification-evidence", up: migrateMcpQualificationEvidence },
   { version: 85, name: "external-catalog-observations-and-associations", up: migrateExternalCatalogObservationsAndAssociations },
   { version: 86, name: "work-session-principal-identity", up: migrateWorkSessionPrincipalIdentity },
+  { version: 87, name: "scheduled-job-publication-receipts", up: migrateScheduledJobPublicationReceipts },
 ];
 
 function migrateScheduledStateTimesAndVerificationSingleFlight(sqlite: Database.Database): void {
@@ -2020,4 +2021,8 @@ function addColumnIfMissing(
   if (columns.some((existingColumn) => existingColumn.name === column)) return;
 
   sqlite.exec(`alter table ${table} add column ${column} ${definition}`);
+}
+
+function migrateScheduledJobPublicationReceipts(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "scheduled_job_attempts", "publication_receipts_json", "text");
 }

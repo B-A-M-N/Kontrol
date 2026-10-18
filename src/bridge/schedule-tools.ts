@@ -419,10 +419,14 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
             reportAvailability,
             workerStatus: attempt?.workerExecutionOutcome ?? (attempt?.executionActiveSince ? "running" : "not_started"),
             publicationStatus: job.executionMode === "bounded_file_write"
-              ? (job.status === "completed" ? "committed" : job.status === "failed" ? "failed" : "pending")
+              ? (attempt?.publicationReceipts?.some((r) => r.outcome === "committed")
+                ? "committed"
+                : attempt?.publicationReceipts?.some((r) => r.outcome === "conflict" || r.outcome === "rejected")
+                  ? "failed"
+                  : "pending")
               : "not_applicable",
             outcomeObserved: job.executionMode === "bounded_file_write"
-              ? job.status === "completed"
+              ? (attempt?.publicationReceipts?.some((r) => r.outcome === "committed" && r.readBackVerified === true) ?? false)
               : verification.independentOutcomeObserved,
             workerExecutionOutcome: attempt?.workerExecutionOutcome,
             workerExecutionAt: attempt?.workerExecutionAt,

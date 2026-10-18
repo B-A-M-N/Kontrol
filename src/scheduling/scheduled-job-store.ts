@@ -140,6 +140,8 @@ export interface ScheduledJobStore {
     executionReceipt?: object;
     lastError?: string;
   }): ScheduledJob;
+  /** Durable bounded-write artifact publication receipt bound to the active attempt. */
+  recordPublicationReceipt(input: { jobId: string; receipt: Record<string, unknown> }): void;
   /** Atomically project a durable lifecycle event and advance its sequence cursor. */
   projectEvent(event: EventStoreEvent): ScheduledJob | undefined;
   listProjectionTargets(afterJobId?: string, limit?: number): ScheduledJob[];
@@ -191,6 +193,7 @@ export interface ScheduledJobAttempt {
   activeRuntimeMs: number;
   executionStoppedAt?: string;
   executionReceipt?: Record<string, unknown>;
+  publicationReceipts?: Array<Record<string, unknown>>;
   workerExecutionOutcome?: "completed" | "failed" | "failed_protocol" | "cancelled";
   workerExecutionAt?: string;
   completedAt?: string;
@@ -1066,6 +1069,13 @@ export function createScheduledJobStore(
         if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) executionReceipt = parsed as Record<string, unknown>;
       } catch { /* corrupt optional receipt remains visibly absent */ }
     }
+    let publicationReceipts: Array<Record<string, unknown>> | undefined;
+    if (row?.publicationReceiptsJson) {
+      try {
+        const parsed: unknown = JSON.parse(row.publicationReceiptsJson);
+        if (Array.isArray(parsed)) publicationReceipts = parsed.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object");
+      } catch { /* corrupt optional receipts remain visibly absent */ }
+    }
     return row ? {
       id: row.id,
       jobId: row.jobId,
@@ -1076,6 +1086,7 @@ export function createScheduledJobStore(
       activeRuntimeMs: row.activeRuntimeMs ?? 0,
       executionStoppedAt: row.executionStoppedAt ?? undefined,
       executionReceipt,
+      publicationReceipts,
       workerExecutionOutcome: row.workerExecutionOutcome === "completed" || row.workerExecutionOutcome === "failed"
           || row.workerExecutionOutcome === "failed_protocol" || row.workerExecutionOutcome === "cancelled"
         ? row.workerExecutionOutcome
@@ -1561,6 +1572,23 @@ export function createScheduledJobStore(
     resolveDispatch,
     projectEvent,
     listProjectionTargets,
+    recordPublicationReceipt(input: { jobId: string; receipt: Record<string, unknown> }): void {
+      database.sqlite.transaction(() => {
+        const job = database.db.select().from(scheduledJobs).where(eq(scheduledJobs.id, input.jobId)).limit(1).all()[0];
+        if (!job) throw new Error(`Unknown scheduled job for publication receipt: ${input.jobId}`);
+        const attemptId = job.activeDispatchAttemptId;
+        if (!attemptId) throw new Error(`No active dispatch attempt for publication receipt on job ${input.jobId}`);
+        const row = database.db.select().from(scheduledJobAttempts).where(eq(scheduledJobAttempts.id, attemptId)).limit(1).all()[0];
+        if (!row) throw new Error(`Active dispatch attempt disappeared: ${attemptId}`);
+        const existing: Array<Record<string, unknown>> = row.publicationReceiptsJson
+          ? JSON.parse(row.publicationReceiptsJson) as Array<Record<string, unknown>>
+          : [];
+        existing.push(input.receipt);
+        database.db.update(scheduledJobAttempts).set({
+          publicationReceiptsJson: JSON.stringify(existing),
+        }).where(eq(scheduledJobAttempts.id, attemptId)).run();
+      });
+    },
     close() {
       database.close();
     },
