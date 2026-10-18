@@ -192,6 +192,11 @@ export function createMcpServer(
     prepareForMutation,
     processSessions,
     scheduledExecutionPolicyFor,
+    recordPublicationReceipt: (input: { jobId: string; receipt: Record<string, unknown> }) => {
+      if (!scheduledJobs) throw new Error("Scheduled jobs are unavailable for publication receipts.");
+      scheduledJobs.recordPublicationReceipt(input);
+    },
+    scheduledJobFor: (workSessionId: string) => scheduledJobs?.getByWorkSessionId(workSessionId),
   });
 
   // Process polling is available in every tool mode. This is the recovery

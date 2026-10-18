@@ -66,6 +66,7 @@ import {
 import { logToolCall } from "../tool-logging.js";
 import { runMutationBarrier } from "../mutation-barrier.js";
 import { assertWorkerWorkspaceBinding, processOutputSchema, processToolResponse } from "../process-tool-response.js";
+import { publishScheduledArtifact } from "../../scheduling/scheduled-artifact-publisher.js";
 import type { ToolEnvelope } from "../tool-envelope.js";
 import { processSessionOwnerId, type ConnectionContext } from "../connection-context.js";
 import { MISSING_FILE_VERSION, readFileVersion, withFileMutationLock } from "../../mutation-version.js";
@@ -83,6 +84,19 @@ export interface WorkspaceToolsDeps {
   readonly prepareForMutation: (workspaceId: string) => Promise<void>;
   readonly processSessions: ProcessSessionManager;
   readonly scheduledExecutionPolicyFor?: (workSessionId: string) => import("../../work-session-action-guard.js").ScheduledExecutionPolicy | undefined;
+  readonly recordPublicationReceipt?: (input: { jobId: string; receipt: Record<string, unknown> }) => void;
+  readonly scheduledJobFor?: (workSessionId: string) => {
+    id: string;
+    policySnapshotJson: {
+      allowedOutputs?: Array<{
+        path?: string;
+        operation?: string;
+        expectedSha256?: string;
+        overwrite?: string;
+        expectedPreviousSha256?: string;
+      }>;
+    };
+  } | undefined;
 }
 
 function instructionContent(files: Array<{ path: string; content: string }>, root: string): ToolContent[] {
@@ -250,7 +264,7 @@ export function registerWorkspaceTools(
   server: McpServer,
   deps: WorkspaceToolsDeps,
 ): ReadonlySet<string> {
-  const { config, workspaces, reviewCheckpoints, policyEngine, policyEnforcer, connectionContext, workSessions, trackToolEvent, prepareForMutation, processSessions, scheduledExecutionPolicyFor } = deps;
+  const { config, workspaces, reviewCheckpoints, policyEngine, policyEnforcer, connectionContext, workSessions, trackToolEvent, prepareForMutation, processSessions, scheduledExecutionPolicyFor, recordPublicationReceipt, scheduledJobFor } = deps;
   const scheduledExecutionPolicy = (workSessionId: string | undefined) =>
     workSessionId && scheduledExecutionPolicyFor ? scheduledExecutionPolicyFor(workSessionId) : undefined;
   const registeredToolNames = new Set<string>();
@@ -841,21 +855,63 @@ export function registerWorkspaceTools(
         }
       }
 
-      const mutation = await withFileMutationLock<LockedToolMutation<Awaited<ReturnType<typeof writeFileTool>>>>([resolvedPath], async (): Promise<LockedToolMutation<Awaited<ReturnType<typeof writeFileTool>>>> => {
-        const versionConflict = await checkFileVersion(
-          writeTool,
-          workspaceId,
-          resolvedPath,
-          expectedContentSha256,
-        );
-        if (versionConflict) return { versionConflict } as const;
-        const response = await writeFileTool(input, {
-          cwd: workspace.root,
-          root: workspace.root,
+      const scheduledJob = stagedWrite && connectionContext?.workSessionId
+        ? scheduledJobFor?.(connectionContext.workSessionId)
+        : undefined;
+      const authorizedOutput = stagedWrite && scheduledJob
+        ? scheduledJob.policySnapshotJson.allowedOutputs?.find((o) => o.path === input.path)
+        : undefined;
+
+      let mutation: LockedToolMutation<Awaited<ReturnType<typeof writeFileTool>>> | undefined;
+      if (stagedWrite && scheduledJob && authorizedOutput) {
+        // Bounded scheduled writes route through the publisher for atomic
+        // replacement, symlink-escape rejection, and read-back verification.
+        const publication = await withFileMutationLock<LockedToolMutation<Awaited<ReturnType<typeof writeFileTool>>>>([resolvedPath], async (): Promise<LockedToolMutation<Awaited<ReturnType<typeof writeFileTool>>>> => {
+          const receipt = await publishScheduledArtifact({
+            jobId: scheduledJob.id,
+            workSessionId: connectionContext?.workSessionId ?? "",
+            workspaceRoot: workspace.root,
+            path: input.path,
+            content: Buffer.from(input.content, "utf8"),
+            output: {
+              path: input.path,
+              operation: (authorizedOutput.operation === "replace" ? "replace" : "create") as "create" | "replace",
+              ...(authorizedOutput.expectedSha256 ? { expectedSha256: authorizedOutput.expectedSha256 } : {}),
+              overwrite: (authorizedOutput.overwrite === "expected_hash" ? "expected_hash" : "deny") as "deny" | "expected_hash",
+              ...(authorizedOutput.expectedPreviousSha256 ? { expectedPreviousSha256: authorizedOutput.expectedPreviousSha256 } : {}),
+            },
+          });
+          recordPublicationReceipt?.({ jobId: scheduledJob.id, receipt: receipt as unknown as Record<string, unknown> });
+          if (receipt.outcome !== "committed") {
+            const response: Awaited<ReturnType<typeof writeFileTool>> = {
+              content: [{ type: "text", text: `Artifact publication ${receipt.outcome}: ${receipt.reason ?? "unknown"}` }],
+              isError: true,
+            };
+            return { response, contentSha256: undefined };
+          }
+          return {
+            response: { content: [{ type: "text", text: `Published ${input.path} (sha256: ${receipt.sha256}, read-back verified).` }], isError: false },
+            contentSha256: receipt.sha256,
+          };
         });
-        if (response.isError) return { response, contentSha256: undefined } as const;
-        return { response, contentSha256: await readFileVersion(resolvedPath) } as const;
-      });
+      } else {
+        mutation = await withFileMutationLock<LockedToolMutation<Awaited<ReturnType<typeof writeFileTool>>>>([resolvedPath], async (): Promise<LockedToolMutation<Awaited<ReturnType<typeof writeFileTool>>>> => {
+          const versionConflict = await checkFileVersion(
+            writeTool,
+            workspaceId,
+            resolvedPath,
+            expectedContentSha256,
+          );
+          if (versionConflict) return { versionConflict } as const;
+          const response = await writeFileTool(input, {
+            cwd: workspace.root,
+            root: workspace.root,
+          });
+          if (response.isError) return { response, contentSha256: undefined } as const;
+          return { response, contentSha256: await readFileVersion(resolvedPath) } as const;
+        });
+      }
+      if (!mutation) throw new Error("unreachable: mutation must be assigned in either branch");
       if ("versionConflict" in mutation) return mutation.versionConflict;
       const response = mutation.response;
 
