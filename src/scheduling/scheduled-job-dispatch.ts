@@ -87,7 +87,7 @@ export async function dispatchScheduledJob(
     workspaceSessionId,
     submittedBy: "scheduler",
     title: instruction.slice(0, 80),
-    completionPolicy: "webui_approval_required",
+    completionPolicy: job.executionMode === "bounded_file_write" ? "agent_completion" : "webui_approval_required",
     ownerContextId: job.ownerContextId,
     principalId: job.principalId,
   });
