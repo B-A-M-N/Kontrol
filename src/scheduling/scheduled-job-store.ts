@@ -141,6 +141,7 @@ export interface ScheduledJobStore {
     lastError?: string;
   }): ScheduledJob;
   /** Durable bounded-write artifact publication receipt bound to the active attempt. */
+  recordReconcileProbe(input: { jobId: string; attemptId: string; evidence: string; now?: string }): void;
   recordPublicationReceipt(input: { jobId: string; receipt: Record<string, unknown> }): void;
   /** Atomically project a durable lifecycle event and advance its sequence cursor. */
   projectEvent(event: EventStoreEvent): ScheduledJob | undefined;
@@ -1589,6 +1590,26 @@ export function createScheduledJobStore(
         }).where(eq(scheduledJobAttempts.id, attemptId)).run();
       });
     },
+    recordReconcileProbe(input: { jobId: string; attemptId: string; evidence: string; now?: string }): void {
+      const now = input.now ?? new Date().toISOString();
+      database.sqlite.transaction(() => {
+        const row = database.db.select().from(scheduledJobAttempts)
+          .where(and(eq(scheduledJobAttempts.id, input.attemptId), eq(scheduledJobAttempts.jobId, input.jobId)))
+          .limit(1).all()[0];
+        if (!row) return;
+        const nextCount = (row.reconcileProbeCount ?? 0) + 1;
+        // Capped exponential backoff with bounded jitter: 2^n seconds, max 10 minutes.
+        const baseMs = Math.min(2 ** nextCount * 1_000, 600_000);
+        const jitterMs = Math.floor(Math.random() * Math.min(baseMs * 0.25, 60_000));
+        const nextAt = new Date(Date.parse(now) + baseMs + jitterMs).toISOString();
+        database.db.update(scheduledJobAttempts).set({
+          reconcileProbeCount: nextCount,
+          nextReconcileAt: nextAt,
+          lastReconcileEvidence: input.evidence.slice(0, 2_000),
+        }).where(eq(scheduledJobAttempts.id, input.attemptId)).run();
+      });
+    },
+
     close() {
       database.close();
     },

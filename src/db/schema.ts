@@ -79,6 +79,10 @@ export const scheduledJobAttempts = sqliteTable("scheduled_job_attempts", {
   executionReceiptJson: text("execution_receipt_json"),
   /** Durable artifact-publication receipts from the bounded-write publisher. */
   publicationReceiptsJson: text("publication_receipts_json"),
+  /** Durable exponential-backoff for uncertain dispatch reconciliation. */
+  reconcileProbeCount: integer("reconcile_probe_count").notNull().default(0),
+  nextReconcileAt: text("next_reconcile_at"),
+  lastReconcileEvidence: text("last_reconcile_evidence"),
   /** Authenticated result for the latest bound ACP execution attempt. */
   workerExecutionOutcome: text("worker_execution_outcome"),
   workerExecutionAt: text("worker_execution_at"),

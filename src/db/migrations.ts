@@ -97,6 +97,7 @@ const migrations: Migration[] = [
   { version: 85, name: "external-catalog-observations-and-associations", up: migrateExternalCatalogObservationsAndAssociations },
   { version: 86, name: "work-session-principal-identity", up: migrateWorkSessionPrincipalIdentity },
   { version: 87, name: "scheduled-job-publication-receipts", up: migrateScheduledJobPublicationReceipts },
+  { version: 88, name: "scheduled-job-reconcile-backoff", up: migrateScheduledJobReconcileBackoff },
 ];
 
 function migrateScheduledStateTimesAndVerificationSingleFlight(sqlite: Database.Database): void {
@@ -2025,4 +2026,11 @@ function addColumnIfMissing(
 
 function migrateScheduledJobPublicationReceipts(sqlite: Database.Database): void {
   addColumnIfMissing(sqlite, "scheduled_job_attempts", "publication_receipts_json", "text");
+}
+
+function migrateScheduledJobReconcileBackoff(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "scheduled_job_attempts", "reconcile_probe_count", "integer not null default 0");
+  addColumnIfMissing(sqlite, "scheduled_job_attempts", "next_reconcile_at", "text");
+  addColumnIfMissing(sqlite, "scheduled_job_attempts", "last_reconcile_evidence", "text");
+  sqlite.exec("create index if not exists scheduled_job_attempts_reconcile_idx on scheduled_job_attempts(next_reconcile_at)");
 }

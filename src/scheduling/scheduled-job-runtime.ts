@@ -371,10 +371,11 @@ export function createScheduledJobRuntime(options: ScheduledJobRuntimeOptions): 
            and attempt.transport_status in ('dispatching','uncertain')
            and attempt.id > ?
            and (job.status = 'uncertain_dispatch' or attempt.lease_expires_at is null or attempt.lease_expires_at <= ?)
+           and (attempt.next_reconcile_at is null or attempt.next_reconcile_at <= ?)
          order by attempt.id
          limit 100
       `)
-      .all(dispatchRecoveryCursor, now) as Array<{ job_id: string; job_revision: number; job_status: string; attempt_id: string; dispatch_id: string; lease_expires_at: string | null }>;
+      .all(dispatchRecoveryCursor, now, now) as Array<{ job_id: string; job_revision: number; job_status: string; attempt_id: string; dispatch_id: string; lease_expires_at: string | null }>;
     for (const row of rows) {
       dispatchRecoveryCursor = row.attempt_id;
       try {
@@ -457,6 +458,7 @@ export function createScheduledJobRuntime(options: ScheduledJobRuntimeOptions): 
             payload: { scheduledJobId: row.job_id, revision: released.revision, reconciledRetry: true },
           });
         } else {
+          jobs.recordReconcileProbe({ jobId: row.job_id, attemptId: row.attempt_id, evidence: outcome.reason ?? "unresolved" });
           const current = jobs.get(row.job_id);
           if (!current || current.status === "uncertain_dispatch") continue;
           jobs.transition({
@@ -468,6 +470,7 @@ export function createScheduledJobRuntime(options: ScheduledJobRuntimeOptions): 
           });
         }
       } catch (error) {
+        jobs.recordReconcileProbe({ jobId: row.job_id, attemptId: row.attempt_id, evidence: error instanceof Error ? error.message : String(error) });
         recordDrainFailure("reconcile_dispatch", error, row.job_id, row.attempt_id);
         const current = jobs.get(row.job_id);
           if (current && ["dispatching", "operator_intervention"].includes(current.status)) {
