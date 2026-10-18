@@ -51,7 +51,7 @@ assert.match(adapter, /bindFiles: \[\s*\{ source: hermesExecutable, target: herm
   "Hermes exposes only its selected CLI executable rather than the containing credential-capable directory");
 assert.match(adapter, /executionReceipt: run\.readOnlyExecutionReceipt/,
   "Hermes persists the correlated read-only receipt with its durable dispatch record");
-assert.match(adapter, /!run\.readOnlyAudit && \(!run\.workspaceLeaseNonce/,
+assert.match(adapter, /!run\.readOnlyAudit && !run\.boundedFileWrite && \(!run\.workspaceLeaseNonce/,
   "read-only Hermes dispatch does not require a mutation lease");
 
 assert.match(runner, /add_observer\(on_raw_event\)/);
