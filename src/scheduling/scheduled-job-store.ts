@@ -887,13 +887,15 @@ export function createScheduledJobStore(
       }
       const stateChangedAt = new Date().toISOString();
       const updated = database.db.update(scheduledJobs).set({
-        status: projection.nextStatus,
+        status: projection.autonomousCompletion && row.executionMode === "bounded_file_write"
+          ? "completed"
+          : projection.nextStatus,
         revision: projection.nextStatus ? row.revision + 1 : row.revision,
         activeDispatchAttemptId: projection.finalWorkerOutcome ? null : undefined,
         lifecycleEventCursor: event.seq,
         lastError: projection.lastError ?? (projection.nextStatus ? null : undefined),
         updatedAt: stateChangedAt,
-        ...(projection.nextStatus ? stateTimestampFields(projection.nextStatus, currentStatus, stateChangedAt) : {}),
+        ...(projection.nextStatus || projection.autonomousCompletion ? stateTimestampFields(projection.autonomousCompletion ? "completed" : projection.nextStatus!, currentStatus, stateChangedAt) : {}),
       }).where(and(
         eq(scheduledJobs.id, row.id),
         eq(scheduledJobs.revision, row.revision),

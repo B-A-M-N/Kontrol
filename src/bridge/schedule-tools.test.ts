@@ -615,6 +615,10 @@ try {
   const firstPage = await resultTool({ scheduledJobId: created.id, reportLimit: 100 });
   assert.equal(firstPage.structuredContent.resultReceipt.executionStatus, "completed",
     "a finished worker turn is reported as execution completion");
+  assert.equal(firstPage.structuredContent.resultReceipt.workerStatus, "completed");
+  assert.equal(firstPage.structuredContent.resultReceipt.publicationStatus, "not_applicable");
+  assert.equal(firstPage.structuredContent.resultReceipt.outcomeObserved, false,
+    "worker completion alone cannot claim independent outcome observation");
   assert.equal(firstPage.structuredContent.resultReceipt.reportAvailability, "available");
   assert.equal(firstPage.structuredContent.outputPreview, largeReport.slice(0, 2_000),
     "the result preview comes from the persisted attempt report");

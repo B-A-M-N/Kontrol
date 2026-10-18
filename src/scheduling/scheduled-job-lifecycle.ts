@@ -6,6 +6,8 @@ export interface ScheduledJobLifecycleProjection {
   nextStatus?: ScheduledJobStatus;
   finalWorkerOutcome?: "completed" | "failed" | "cancelled";
   workerExecutionOutcome?: "completed" | "failed" | "failed_protocol" | "cancelled";
+  /** Autonomous bounded-write success requires an independently observed artifact receipt. */
+  autonomousCompletion?: boolean;
   lastError?: string;
   executionStarted?: boolean;
   executionPaused?: boolean;
@@ -121,6 +123,9 @@ export function projectScheduledJobLifecycleEvent(
       workerExecutionOutcome: event.type === "worker.attempt.failed" || event.type === "worker.attempt.exited"
         ? "failed"
         : "completed",
+      ...(event.type === "worker.turn.completed" && event.payload.autonomousCompletion === true
+        ? { autonomousCompletion: true }
+        : {}),
     };
   }
   const terminal = workSessionTerminalOutcome(event.type, "webui_approval_required");

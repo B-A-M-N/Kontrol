@@ -214,6 +214,9 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
             scheduledJobStatus: z.string(),
             executionStatus: z.string(),
             reportAvailability: z.enum(["available", "pending_finalization", "no_output", "unavailable"]),
+            workerStatus: z.enum(["not_started", "running", "completed", "failed", "failed_protocol", "cancelled"]),
+            publicationStatus: z.enum(["pending", "committed", "failed", "not_applicable"]),
+            outcomeObserved: z.boolean(),
             dispatchStatus: z.string().optional(),
             dispatchRetryCount: z.number().int().nonnegative(),
             dispatchNextEligibleAt: z.string().optional(),
@@ -414,6 +417,13 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
             scheduledJobStatus: job.status,
             executionStatus,
             reportAvailability,
+            workerStatus: attempt?.workerExecutionOutcome ?? (attempt?.executionActiveSince ? "running" : "not_started"),
+            publicationStatus: job.executionMode === "bounded_file_write"
+              ? (job.status === "completed" ? "committed" : job.status === "failed" ? "failed" : "pending")
+              : "not_applicable",
+            outcomeObserved: job.executionMode === "bounded_file_write"
+              ? job.status === "completed"
+              : verification.independentOutcomeObserved,
             workerExecutionOutcome: attempt?.workerExecutionOutcome,
             workerExecutionAt: attempt?.workerExecutionAt,
             reviewStatus,
