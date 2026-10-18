@@ -89,6 +89,7 @@ export async function dispatchScheduledJob(
     title: instruction.slice(0, 80),
     completionPolicy: "webui_approval_required",
     ownerContextId: job.ownerContextId,
+    principalId: job.principalId,
   });
   const workSessionId = created.id;
   const isReadOnlyAudit = job.executionMode === "read_only_audit";

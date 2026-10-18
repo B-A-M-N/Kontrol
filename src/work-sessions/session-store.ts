@@ -79,6 +79,7 @@ export function createWorkSessionStore(deps: WorkSessionStoreDeps) {
       reviewEpoch: row.reviewEpoch ?? 0,
       submittedBy: row.submittedBy,
       ownerContextId: row.ownerContextId ?? undefined,
+      principalId: row.principalId ?? undefined,
       title: row.title ?? undefined,
       lastConsumedFeedbackId: row.lastConsumedFeedbackId ?? undefined,
       lastConsumedReviewEpoch: row.lastConsumedReviewEpoch ?? 0,
@@ -95,7 +96,7 @@ export function createWorkSessionStore(deps: WorkSessionStoreDeps) {
     /** Hydrate a raw row into the enriched WorkSession projection. */
     enrichSession,
 
-    create(input: { workspaceSessionId: string; submittedBy: string; title?: string; completionPolicy?: CompletionPolicy; ownerContextId?: string }): WorkSession {
+    create(input: { workspaceSessionId: string; submittedBy: string; title?: string; completionPolicy?: CompletionPolicy; ownerContextId?: string; principalId?: string }): WorkSession {
       const now = new Date().toISOString();
       return db.sqlite.transaction(() => {
         const workspace = db.sqlite.prepare("select status from workspace_sessions where id = ?")
@@ -113,6 +114,7 @@ export function createWorkSessionStore(deps: WorkSessionStoreDeps) {
           reviewEpoch: 0,
           submittedBy: input.submittedBy,
           ownerContextId: input.ownerContextId,
+          principalId: input.principalId,
           title: input.title,
           lastConsumedFeedbackId: undefined,
           lastConsumedReviewEpoch: 0,
@@ -135,6 +137,7 @@ export function createWorkSessionStore(deps: WorkSessionStoreDeps) {
             reviewEpoch: session.reviewEpoch,
             submittedBy: session.submittedBy,
             ownerContextId: session.ownerContextId ?? null,
+            principalId: session.principalId ?? null,
             title: session.title ?? null,
             lastConsumedFeedbackId: null,
             lastConsumedReviewEpoch: 0,

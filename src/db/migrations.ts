@@ -95,6 +95,7 @@ const migrations: Migration[] = [
   { version: 83, name: "scheduled-state-times-and-verification-single-flight", up: migrateScheduledStateTimesAndVerificationSingleFlight },
   { version: 84, name: "mcp-qualification-evidence", up: migrateMcpQualificationEvidence },
   { version: 85, name: "external-catalog-observations-and-associations", up: migrateExternalCatalogObservationsAndAssociations },
+  { version: 86, name: "work-session-principal-identity", up: migrateWorkSessionPrincipalIdentity },
 ];
 
 function migrateScheduledStateTimesAndVerificationSingleFlight(sqlite: Database.Database): void {
@@ -648,11 +649,11 @@ function migratePolicyApprovalDirectReconnectDeadline(sqlite: Database.Database)
   }
 }
 
-/** Canonical current schema version — readiness requires exact equality. */
-export const LATEST_SCHEMA_VERSION = migrations[migrations.length - 1]!.version;
-
 /** Ordered migration chain (exported for migration fixture tests). */
 export const migrationChain = migrations;
+
+/** Canonical current schema version — readiness requires exact equality. */
+export const LATEST_SCHEMA_VERSION = migrations[migrations.length - 1]!.version;
 
 function migrateAgentPerAgentCredential(sqlite: Database.Database): void {
   addColumnIfMissing(sqlite, "agent_registry", "agent_credential_hash", "text");
@@ -1906,6 +1907,21 @@ function migrateMcpQualificationEvidence(sqlite: Database.Database): void {
       on mcp_qualification_evidence(operation_id) where operation_id is not null;
     create index if not exists mcp_qualification_evidence_expiry_idx
       on mcp_qualification_evidence(expires_at, observed_at);
+  `);
+}
+
+// v86: durable authenticated principal on a work session. Conversation and
+// transport context remain session-scope keys; this column lets a returned
+// owner recover its own delegated job without making sessions globally readable.
+function migrateWorkSessionPrincipalIdentity(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "work_sessions", "principal_id", "text");
+  sqlite.exec(`
+    create index if not exists work_sessions_principal_idx
+      on work_sessions(principal_id, updated_at);
+    update work_sessions
+       set principal_id = owner_context_id
+     where principal_id is null
+       and owner_context_id like 'principal:%';
   `);
 }
 

@@ -36,6 +36,7 @@ export interface WorkSession {
   reviewEpoch: number;
   submittedBy: string;
   ownerContextId?: string;
+  principalId?: string;
   title?: string;
   lastConsumedFeedbackId?: string;
   lastConsumedReviewEpoch: number;

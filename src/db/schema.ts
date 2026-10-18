@@ -293,6 +293,8 @@ export const workSessions = sqliteTable("work_sessions", {
   submittedBy: text("submitted_by").notNull(),
   /** Trusted conversation/transport owner that created this durable session. */
   ownerContextId: text("owner_context_id"),
+  /** Durable authenticated principal for reconnect-stable job ownership. */
+  principalId: text("principal_id"),
   title: text("title"),
   lastConsumedFeedbackId: text("last_consumed_feedback_id"),
   lastConsumedReviewEpoch: integer("last_consumed_review_epoch").notNull().default(0),

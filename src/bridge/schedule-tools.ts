@@ -50,6 +50,10 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
   const jobs = scheduledJobStore(config);
   const authenticatedPrincipalId = config.connectionContext?.authenticatedPrincipalId?.trim();
   const ownerContextId = liveOwnerContextId(config) ?? config.principalId ?? "unknown-owner";
+  const requireScheduledJobRead = (): { content: Array<{ type: "text"; text: string }>; isError: true } | undefined => {
+    if (!isReviewer(config.principalRole)) return forbidden(config.principalRole, "scheduled_job_result_read");
+    return undefined;
+  };
   const mayReadJob = (job: ScheduledJob): boolean => scheduledJobAccessAllowed(job, {
     authenticatedPrincipalId,
     ownerContextId,
@@ -250,6 +254,8 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
       if (!job) {
         return { content: [{ type: "text" as const, text: `Unknown scheduled job: ${scheduledJobId}` }], isError: true };
       }
+      const roleAccess = requireScheduledJobRead();
+      if (roleAccess) return roleAccess;
       if (!mayReadJob(job)) {
         return forbidden(config.principalRole, name);
       }

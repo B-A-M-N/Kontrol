@@ -32,6 +32,7 @@ const submission = {
 const session = {
   id: "work-session-1",
   status: sessionStatus,
+  principalId: "principal-a",
   updatedAt: "2026-10-12T12:00:00.000Z",
   latestSubmission: submission,
 };
@@ -397,8 +398,17 @@ try {
 
   const resultTool = handlers.get("get_scheduled_job_result");
   assert.ok(resultTool, "scheduled result retrieval is registered");
+  const savedResultRole = config.principalRole;
+  config.principalRole = "agent";
+  const foreignResult = await resultTool({ scheduledJobId: created.id });
+  config.principalRole = savedResultRole;
+  assert.equal(foreignResult.isError, true, "non-reviewers cannot read scheduled results");
   const jobReadTool = handlers.get("get_scheduled_job");
   assert.ok(jobReadTool, "scheduled job retrieval is registered");
+  config.principalRole = "agent";
+  const foreignJobRead = await jobReadTool({ scheduledJobId: created.id });
+  config.principalRole = savedResultRole;
+  assert.equal(foreignJobRead.isError, true, "non-reviewers cannot read scheduled jobs");
   const unpersistedJob = jobs.create({
     principalId: "principal-a",
     ownerContextId: "principal:principal-a|transport:A",

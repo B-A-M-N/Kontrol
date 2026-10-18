@@ -227,6 +227,12 @@ export function liveOwnerContextId(config: BridgeConfig): string | undefined {
   return mcpOwnerContextId(identity);
 }
 
+/** Durable authenticated principal, distinct from transport/conversation scope. */
+export function livePrincipalId(config: BridgeConfig): string | undefined {
+  return config.connectionContext?.authenticatedPrincipalId?.trim()
+    || config.principalId?.trim();
+}
+
 export async function captureMissionBaseline(
   config: BridgeConfig,
   workspaceSessionId: string,
@@ -373,6 +379,11 @@ export function requireWorkSessionRead(config: BridgeConfig, sessionId: string) 
   if (config.principalRole === "worker" && (config.connectionWorkSessionId === sessionId || !config.connectionWorkSessionId)) return null;
   const session = config.workSessions.get(sessionId);
   const owner = liveOwnerContextId(config);
+  const principal = livePrincipalId(config);
+  // A reconnecting owner has a durable principal but may not have the original
+  // conversation or transport. That identity is enough to read its delegated
+  // job result; it never broadens mutation or cross-conversation access.
+  if (session?.principalId && principal && session.principalId === principal) return null;
   if (session?.ownerContextId && owner && session.ownerContextId !== owner) {
     return forbidden(config.principalRole, "cross-conversation work-session read");
   }

@@ -10,7 +10,7 @@ import type { BridgeConfig } from "./context.js";
 import { cancelRemoteRun, selectHealthyAgent } from "../acp-gateway.js";
 import { TERMINAL_STATUSES } from "../review-workflow.js";
 import { registerMutationAppTool } from "./app-tool.js";
-import { assertWorkerSessionBinding, forbidden, isReviewer, liveConnectionIdentity, liveOwnerContextId, requireWorkSessionMutation, requireWorkSessionRead, workspaceAppModelAndAppMeta } from "./shared.js";
+import { assertWorkerSessionBinding, forbidden, isReviewer, liveConnectionIdentity, liveOwnerContextId, livePrincipalId, requireWorkSessionMutation, requireWorkSessionRead, workspaceAppModelAndAppMeta } from "./shared.js";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
 import { z } from "zod/v4";
 
@@ -35,7 +35,7 @@ export function registerSessionTools(server: McpServer, config: BridgeConfig): v
     async ({ workspaceId, title, completionPolicy }) => {
       try {
         config.workspaces.getWorkspace(workspaceId);
-        const session = config.workSessions.create({ workspaceSessionId: workspaceId, submittedBy: "cli", title, completionPolicy, ownerContextId: liveOwnerContextId(config) ?? config.principalId });
+        const session = config.workSessions.create({ workspaceSessionId: workspaceId, submittedBy: "cli", title, completionPolicy, ownerContextId: liveOwnerContextId(config) ?? config.principalId, principalId: livePrincipalId(config) });
         config.workspaces.setActiveSession(workspaceId, session.id, liveConnectionIdentity(config).mcpSessionId);
         return {
           content: [{ type: "text" as const, text: `Session ${session.id} active. Tool calls will be logged. Use submit_for_review when ready.` }],
@@ -59,6 +59,7 @@ export function registerSessionTools(server: McpServer, config: BridgeConfig): v
       outputSchema: {
         sessionId: z.string(),
         status: z.string(),
+        principalId: z.string().optional(),
         submittedBy: z.string(),
         title: z.string().optional(),
         submissionCount: z.number(),
@@ -124,6 +125,7 @@ export function registerSessionTools(server: McpServer, config: BridgeConfig): v
         structuredContent: {
           sessionId: session.id,
           status: session.status,
+          principalId: session.principalId,
           submittedBy: session.submittedBy,
           title: session.title,
           submissionCount: submissions.length,
@@ -487,6 +489,7 @@ export function registerSessionTools(server: McpServer, config: BridgeConfig): v
             filter,
             afterUpdatedAt && afterSessionId ? { updatedAt: afterUpdatedAt, sessionId: afterSessionId } : undefined,
             owner,
+            livePrincipalId(config),
           ),
         });
         const surface = config.db
@@ -539,7 +542,7 @@ export function registerSessionTools(server: McpServer, config: BridgeConfig): v
       }
       const owner = liveOwnerContextId(config);
       if (config.connectionContext && !owner) return forbidden(config.principalRole, "list_active_work_sessions");
-      const surface = config.workSessions.getWorkspaceSessionSurface(workspaceId, 50, "live", undefined, owner);
+      const surface = config.workSessions.getWorkspaceSessionSurface(workspaceId, 50, "live", undefined, owner, livePrincipalId(config));
       const mapped = surface.map((s) => {
         return {
           sessionId: s.sessionId,

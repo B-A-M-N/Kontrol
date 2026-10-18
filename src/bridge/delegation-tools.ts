@@ -10,7 +10,7 @@ import type { BridgeConfig } from "./context.js";
 import { callRemoteAgent, selectHealthyAgent } from "../acp-gateway.js";
 import { registerMutationAppTool } from "./app-tool.js";
 import { supervisedMissionOptionsSchema, workOrderSchema } from "./context.js";
-import { acquireCheckoutModifyLease, captureMissionBaseline, checkoutLeaseMetadata, forbidden, isReviewer, liveOwnerContextId, requireWorkSessionRead, renderMissionPrompt, resolveDelegationContext, workSessionInstructions, workspaceAppModelAndAppMeta } from "./shared.js";
+import { acquireCheckoutModifyLease, captureMissionBaseline, checkoutLeaseMetadata, forbidden, isReviewer, liveOwnerContextId, livePrincipalId, requireWorkSessionRead, renderMissionPrompt, resolveDelegationContext, workSessionInstructions, workspaceAppModelAndAppMeta } from "./shared.js";
 import { z } from "zod/v4";
 
 export function registerDelegationTools(server: McpServer, config: BridgeConfig): void {
@@ -133,6 +133,7 @@ export function registerDelegationTools(server: McpServer, config: BridgeConfig)
           title: task.slice(0, 80),
           completionPolicy: missionContract ? "webui_approval_required" : completionPolicy ?? "webui_approval_required",
           ownerContextId: liveOwnerContextId(config) ?? config.principalId,
+          principalId: livePrincipalId(config),
         });
         wsId = created.id;
         createdSessionForDispatch = true;

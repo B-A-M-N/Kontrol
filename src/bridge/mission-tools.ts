@@ -12,7 +12,7 @@ import { verifyMissionSubmission } from "../mission-verifier.js";
 import { registerMutationAppTool } from "./app-tool.js";
 import { missionVerificationOptionsFromConfig } from "./verification-options.js";
 import { criterionUpdateSchema, dispatchAgentTask, findingSchema, findingUpdateSchema, supervisedMissionOptionsSchema, supervisorPacket, workOrderSchema } from "./context.js";
-import { acquireCheckoutModifyLease, captureMissionBaseline, forbidden, isReviewer, liveOwnerContextId, requireWorkSessionMutation, requireWorkSessionRead, renderMissionPrompt, workspaceAppModelAndAppMeta } from "./shared.js";
+import { acquireCheckoutModifyLease, captureMissionBaseline, forbidden, isReviewer, liveOwnerContextId, livePrincipalId, requireWorkSessionMutation, requireWorkSessionRead, renderMissionPrompt, workspaceAppModelAndAppMeta } from "./shared.js";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
 import { z } from "zod/v4";
 import { normalizeWorkspaceSnapshotIdentity } from "../review-checkpoints.js";
@@ -112,6 +112,7 @@ export function registerMissionTools(server: McpServer, config: BridgeConfig): v
         title: objective.slice(0, 80),
         completionPolicy: "webui_approval_required",
         ownerContextId: liveOwnerContextId(config) ?? config.principalId,
+        principalId: livePrincipalId(config),
       });
       const leaseError = await acquireCheckoutModifyLease(config, workspaceSessionId, created.id);
       if (leaseError) {
