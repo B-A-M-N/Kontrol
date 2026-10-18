@@ -320,16 +320,22 @@ export function createScheduledJobRuntime(options: ScheduledJobRuntimeOptions): 
 
   function reconcileNonterminalJobs(): void {
     const rows = database.sqlite
-      .prepare("select id, revision, run_at from scheduled_jobs where status in ('pending','due','reconciling') and id > ? order by id limit 100")
-      .all(nonterminalCursor) as Array<{ id: string; revision: number; run_at: string }>;
+      .prepare("select id, revision, run_at, status from scheduled_jobs where status in ('pending','due','reconciling') and id > ? order by id limit 100")
+      .all(nonterminalCursor) as Array<{ id: string; revision: number; run_at: string; status: string }>;
     const now = new Date().toISOString();
     for (const row of rows) {
       nonterminalCursor = row.id;
       const alreadyDue = Date.parse(row.run_at) <= Date.parse(now);
       const status = alreadyDue ? "due" : "pending";
-      database.sqlite
-        .prepare("update scheduled_jobs set status = ?, updated_at = ?, last_state_changed_at = case when status != ? then ? else last_state_changed_at end where id = ? and status in ('pending','due','reconciling') and revision = ?")
-        .run(status, now, status, now, row.id, row.revision);
+      // Startup reconciliation must repair a lost due event, not rewrite every
+      // future/pending job on each five-second drain. CAS on the unchanged
+      // revision makes no-op scans read-only for unchanged rows; a lost
+      // outbox event is still repaired by enqueue() below.
+      if (row.status === "reconciling") {
+        database.sqlite
+          .prepare("update scheduled_jobs set status = ?, updated_at = ?, last_state_changed_at = case when status != ? then ? else last_state_changed_at end where id = ? and status in ('pending','due','reconciling') and revision = ?")
+          .run(status, now, status, now, row.id, row.revision);
+      }
       // Re-arm the due trigger under the canonical logical key; enqueue() is
       // idempotent for the same (type, aggregateId, revision). Dispatching
       // jobs are intentionally excluded: an expired lease represents a

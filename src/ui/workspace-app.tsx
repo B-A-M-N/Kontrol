@@ -101,6 +101,7 @@ import {
 } from "./payload-mount.js";
 import {
   connectBootstrapWithRetry,
+  bindAppInstanceCallback,
   cancelReconnect,
   reconnectApp,
   renderApprovalCenterView,
@@ -601,7 +602,7 @@ async function bootInternal(): Promise<void> {
     renderPayloadIfNeeded();
   };
 
-  app.onteardown = async () => {
+  app.onteardown = bindAppInstanceCallback(async () => {
     cancelReconnect();
     connected = false;
     connectionState = "DISCONNECTED";
@@ -611,7 +612,7 @@ async function bootInternal(): Promise<void> {
     // replacement connection rehydrates before mutations are enabled.
     app = null;
     return {};
-  };
+  });
 
   bootstrapStage = "app-connect";
   await connectBootstrapWithRetry();
@@ -647,7 +648,7 @@ function reportBootstrapFailure(error: unknown): void {
 function installAppErrorHandler(target: App): void {
   // The ext-apps runtime exposes this callback, while the checked-in SDK
   // declaration currently omits it. Keep the narrow cast local to the bridge.
-  (target as App & { onerror?: (error: unknown) => void }).onerror = (error) => {
+  (target as App & { onerror?: (error: unknown) => void }).onerror = bindAppInstanceCallback((error) => {
     const message = formatBootstrapDiagnostic(connected ? "host-transport" : bootstrapStage, error);
     connectionError = message;
     if (!connected) {
@@ -659,7 +660,7 @@ function installAppErrorHandler(target: App): void {
     connectionState = "DEGRADED";
     render();
     void reconnectApp(error).catch(() => undefined);
-  };
+  });
 }
 
 function activateWorkspace(newWorkspaceId: string): void {

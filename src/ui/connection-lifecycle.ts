@@ -44,12 +44,16 @@ let host: LifecycleHost;
 let reconnectPromise: Promise<void> | null = null;
 let reconnectGeneration = 0;
 const reconnectWaiters = new Set<() => void>();
+// SDK callbacks are reattached to replacement App instances. A late callback
+// from the obsolete instance must not disturb the replacement's connection.
+let appInstanceGeneration = 0;
 export function setLifecycleHost(next: LifecycleHost): void {
   host = next;
 }
 
 /** Cancel the current reconnect owner and wake any bounded retry backoff. */
 export function cancelReconnect(): void {
+  appInstanceGeneration += 1;
   reconnectGeneration += 1;
   for (const wake of reconnectWaiters) wake();
   reconnectWaiters.clear();
@@ -83,6 +87,20 @@ function finishConnection(generation: number): boolean {
   host.setConnectionError(null);
   host.queueSessionRehydration();
   return true;
+}
+
+/**
+ * Fence a callback to the App instance that installed it. Replacement and
+ * teardown both advance the generation, so a stale SDK callback is ignored.
+ */
+export function bindAppInstanceCallback<T extends (...args: never[]) => unknown>(
+  callback: T,
+): (...args: unknown[]) => void {
+  const generation = appInstanceGeneration;
+  return (...args: unknown[]) => {
+    if (generation !== appInstanceGeneration) return;
+    (callback as unknown as (...args: unknown[]) => unknown)(...args);
+  };
 }
 
 /** Initial App startup gets one bounded retry and then shows a terminal error. */

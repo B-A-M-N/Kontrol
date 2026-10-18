@@ -172,6 +172,8 @@ export interface WorkSessionViewState {
   notice?: {
     tone: "error" | "warning" | "success" | "info";
     message: string;
+    /** Owner boundary for narrowly scoped lifecycle cleanup. */
+    owner?: "workspace-watcher" | "selected-session-transport";
     action?: { label: string; run: () => void };
   };
   reviewLoop?: ReviewLoopViewState;

@@ -72,26 +72,42 @@ export function ensureSurface(key: string): void {
   host.setRenderedSurfaceKey(key);
 }
 
-// Live running-process badges: each running badge gets a 1s local interval so
-// a card never sits frozen at its snapshot wallTimeMs while the child keeps
-// running (P1 #6). Timers are registered centrally and stopped when the
-// payload surface is torn down — a detached badge must not tick forever.
-const liveBadgeTimers = new Set<() => void>();
-
-function stopAllLiveBadges(): void {
-  for (const stop of liveBadgeTimers) stop();
-  liveBadgeTimers.clear();
-}
+// Live running-process badges share one surface-owned 1s ticker. Replacing a
+// badge during a periodic render therefore cannot create another persistent
+// interval; detached badge elements are pruned automatically.
+const liveBadgeElements = new Set<WeakRef<HTMLElement & { kontrolLiveBadgeTick?: (now: number) => void }>>();
+let liveBadgeTimer: ReturnType<typeof setInterval> | undefined;
 
 function startLiveBadge(badge: HTMLElement, startedAtEpochMs: number): void {
-  const render = () => {
-    const elapsedMs = Math.max(0, Date.now() - startedAtEpochMs);
+  const update = (now = Date.now()) => {
+    const elapsedMs = Math.max(0, now - startedAtEpochMs);
     badge.textContent = `Running · ${formatElapsed(elapsedMs)}`;
   };
-  render();
-  const timer = setInterval(render, 1_000);
-  const stop = () => clearInterval(timer);
-  liveBadgeTimers.add(stop);
+  update();
+  (badge as HTMLElement & { kontrolLiveBadgeTick?: (now: number) => void }).kontrolLiveBadgeTick = (now) => {
+    update(now);
+  };
+  const reference = new WeakRef(badge);
+  liveBadgeElements.add(reference);
+  if (liveBadgeTimer) return;
+  liveBadgeTimer = setInterval(() => {
+    for (const reference of [...liveBadgeElements]) {
+      const badge = reference.deref();
+      if (!badge) {
+        liveBadgeElements.delete(reference);
+        continue;
+      }
+      badge.kontrolLiveBadgeTick?.(Date.now());
+    }
+    if (liveBadgeElements.size === 0) stopLiveBadgeTicker();
+  }, 1_000);
+  liveBadgeTimer.unref?.();
+}
+
+function stopLiveBadgeTicker(): void {
+  if (!liveBadgeTimer) return;
+  clearInterval(liveBadgeTimer);
+  liveBadgeTimer = undefined;
 }
 
 export function renderSummaryBadge(card: ToolResultCard): HTMLElement {
@@ -124,7 +140,8 @@ export function renderSummaryBadge(card: ToolResultCard): HTMLElement {
 
 export function unmountPayload(): void {
   generation += 1;
-  stopAllLiveBadges();
+  stopLiveBadgeTicker();
+  liveBadgeElements.clear();
   if (currentPayload) {
     try {
       currentPayload.unmount();

@@ -540,6 +540,8 @@ export function renderSessionNotice(container: HTMLElement, view: WorkSessionVie
   }
   container.hidden = false;
   container.className = `session-notice ${notice.tone}`;
+  if (notice.owner) container.dataset.noticeOwner = notice.owner;
+  else delete container.dataset.noticeOwner;
   container.replaceChildren(element("span", { text: notice.message }));
   if (notice.action) {
     const action = element("button", { className: "notice-action", type: "button", text: notice.action.label });

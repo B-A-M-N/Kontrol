@@ -1139,7 +1139,7 @@ try {
       const failingSqlite = new Proxy(faultDb.sqlite, {
         get(target, property) {
           if (property === "prepare") return (statement: string) => {
-            if (injectReadFailure && statement.includes("select id, revision, run_at from scheduled_jobs")) {
+            if (injectReadFailure && statement.includes("select id, revision, run_at, status from scheduled_jobs")) {
               injectReadFailure = false;
               throw new Error("injected scheduler database read failure");
             }

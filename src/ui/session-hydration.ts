@@ -78,6 +78,60 @@ export function setHydrationHost(next: HydrationHost): void {
   host = next;
 }
 
+/**
+ * Watcher-owned transport health is not durable work-session state. Keeping
+ * it separate lets recovery clear stale transport text without touching an
+ * approval, policy, or worker-error notice.
+ */
+export type WorkspaceWatcherHealth = "healthy" | "reconnecting" | "unavailable";
+
+const WATCHER_NOTICE_OWNER = "workspace-watcher";
+const TRANSPORT_NOTICE_OWNER = "selected-session-transport";
+
+let activeWatcherHealth: WorkspaceWatcherHealth = "healthy";
+
+function removeWatcherOwnedTransportNotices(): void {
+  const root = globalThis.document;
+  if (!root) return;
+  for (const notice of root.querySelectorAll<HTMLElement>(".session-notice[data-notice-owner]")) {
+    if (notice.dataset.noticeOwner === WATCHER_NOTICE_OWNER
+      || notice.dataset.noticeOwner === TRANSPORT_NOTICE_OWNER) {
+      notice.remove();
+    }
+  }
+}
+
+function setWatcherHealth(health: WorkspaceWatcherHealth, errorMessage?: string): void {
+  activeWatcherHealth = health;
+  removeWatcherOwnedTransportNotices();
+  if (health === "healthy") {
+    const selected = host.getSelectedWorkSessionId()
+      ? workSessionViews.get(host.getSelectedWorkSessionId()!)
+      : undefined;
+    if (selected?.notice?.message.startsWith("Workspace activity connection interrupted: ")) {
+      selected.notice = undefined;
+    }
+  } else {
+    const selected = host.getSelectedWorkSessionId()
+      ? workSessionViews.get(host.getSelectedWorkSessionId()!)
+      : undefined;
+    if (selected) {
+      selected.notice = {
+        tone: "warning",
+        message: health === "unavailable"
+          ? `Workspace activity connection unavailable: ${errorMessage ?? "unknown error"}`
+          : `Workspace activity connection interrupted: ${errorMessage ?? "reconnecting"}`,
+        owner: health === "unavailable" ? WATCHER_NOTICE_OWNER : TRANSPORT_NOTICE_OWNER,
+      };
+    }
+  }
+  host.scheduleRender();
+}
+
+export function workspaceWatcherHealth(): WorkspaceWatcherHealth {
+  return activeWatcherHealth;
+}
+
 const snapshotHydrations = new Map<string, Promise<void>>();
 
 export async function rehydrateActiveSessions(): Promise<void> {
@@ -732,16 +786,22 @@ export async function watchWorkspaceEvents(workspaceId: string, initialSeq: numb
       }
       cursor = Math.max(cursor, content.nextSeq);
       host.setWorkspaceEventCursor(cursor);
+      setWatcherHealth("healthy");
       host.scheduleRender();
     } catch (error) {
       if (host.workspaceWatcherGeneration() !== generation) return;
       const selectionNow = host.getSelectedWorkSessionId();
-    const selected = selectionNow ? workSessionViews.get(selectionNow) : undefined;
+      const selected = selectionNow ? workSessionViews.get(selectionNow) : undefined;
       if (selected) {
-        selected.notice = {
-          tone: "warning",
-          message: `Workspace activity connection interrupted: ${error instanceof Error ? error.message : String(error)}`,
-        };
+        setWatcherHealth(
+          error instanceof Error
+            && (/^(ECONN|EHOST|ENET|ETIMEDOUT)/i.test((error as Error & { code?: unknown }).code as string | undefined ?? "")
+              || /reconnect|closed|network|transport/i.test(error.message))
+            ? "reconnecting"
+            : "unavailable",
+          error instanceof Error ? error.message : String(error),
+        );
+        host.scheduleRender();
       }
       host.scheduleRender();
       // P1 #34: exponential backoff with jitter instead of a flat 1s retry.
