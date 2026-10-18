@@ -102,22 +102,36 @@ if (!AGENT_SECRET || !ADAPTER_SECRET) {
   process.exit(1);
 }
 
-const check = spawnSync(HERMES_BIN, ["acp", "--check"], {
-  encoding: "utf8",
-  // P1.10: explicit allowlist; hermes children get the toolchain plus the
-  // hermes root/python path, never launcher authority.
-  env: buildToolEnvironment(process.env, {
+function hermesCheckEnvironment() {
+  return buildToolEnvironment(process.env, {
     overrides: {
       HERMES_AGENT_ROOT,
       PYTHONPATH: withHermesPythonPath(process.env.PYTHONPATH),
     },
-  }),
+  });
+}
+
+// Hermes agent refactoring split the old `hermes acp ...` subcommand into a
+// standalone `hermes-acp` entry point. Support both forms: try the legacy
+// subcommand first, then the direct-entry `--check` flag.
+let hermesCheck = spawnSync(HERMES_BIN, ["acp", "--check"], {
+  encoding: "utf8",
+  env: hermesCheckEnvironment(),
 });
-if (check.status !== 0) {
-  console.error("[hermes-native] hermes acp --check failed; refusing to register hermes-agent");
-  console.error((check.stderr || check.stdout || "").trim());
+let hermesCheckMode = "subcommand";
+if (hermesCheck.status !== 0 && /unrecognized arguments?/.test(hermesCheck.stderr ?? hermesCheck.stdout ?? "")) {
+  hermesCheck = spawnSync(HERMES_BIN, ["--check"], {
+    encoding: "utf8",
+    env: hermesCheckEnvironment(),
+  });
+  hermesCheckMode = "direct-entry";
+}
+if (hermesCheck.status !== 0) {
+  console.error(`[hermes-native] hermes acp --check (${hermesCheckMode}) failed; refusing to register hermes-agent`);
+  console.error((hermesCheck.stderr || hermesCheck.stdout || "").trim());
   process.exit(1);
 }
+const HERMES_ACP_ENTRY_MODE = hermesCheckMode;
 
 const PYTHON_BIN = resolveHermesPython();
 let degraded = PYTHON_BIN === null;
@@ -528,7 +542,7 @@ async function handle(req, res) {
       KONTROL_WORKSPACE_LEASE_NONCE: run.workspaceLeaseNonce || "",
       KONTROL_HERMES_NATIVE_INPUT: JSON.stringify({
         command: HERMES_BIN,
-        args: ["acp"],
+        args: HERMES_ACP_ENTRY_MODE === "direct-entry" ? [] : ["acp"],
         cwd: workspaceRoot,
         task: run.task,
         runId: run.remoteRunId,
