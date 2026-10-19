@@ -97,8 +97,109 @@ async def main() -> int:
         async def session_update(self, **_kwargs) -> None:
             return None
 
-        async def write_text_file(self, **_kwargs):
-            return None
+        async def write_text_file(self, **kwargs):
+            path = kwargs.get("path")
+            content = kwargs.get("content")
+            if not isinstance(path, str) or not isinstance(content, str):
+                emit({"type": "error", "error": "write_text_file requires string path and content"})
+                raise RuntimeError("write_text_file requires string path and content")
+
+            mcp_url = os.environ.get("KONTROL_MCP_URL")
+            worker_token = os.environ.get("KONTROL_WORKER_TOKEN")
+            workspace_session_id = os.environ.get("KONTROL_WORKSPACE_SESSION_ID")
+            work_session_id = os.environ.get("KONTROL_WORK_SESSION_ID")
+            if not mcp_url or not worker_token or not workspace_session_id:
+                emit({"type": "error", "error": "Kontrol bounded-write MCP environment is incomplete"})
+                raise RuntimeError("Kontrol bounded-write MCP environment is incomplete")
+
+            # Initialize MCP session and call open_workspace + staged_file_write.
+            try:
+                import urllib.request
+                import urllib.error
+
+                headers = {
+                    "Content-Type": "application/json",
+                    "Accept": "application/json, text/event-stream",
+                    "Authorization": f"Bearer {worker_token}",
+                    "X-Kontrol-Worker-Token": worker_token,
+                }
+                mcp_session_id = None
+
+                def mcp_rpc(method: str, params: dict | None = None) -> dict:
+                    nonlocal mcp_session_id
+                    body = {"jsonrpc": "2.0", "id": str(uuid.uuid4()), "method": method}
+                    if params is not None:
+                        body["params"] = params
+                    req_headers = dict(headers)
+                    if mcp_session_id:
+                        req_headers["Mcp-Session-Id"] = mcp_session_id
+                    req = urllib.request.Request(
+                        mcp_url,
+                        data=json.dumps(body).encode("utf-8"),
+                        headers=req_headers,
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(req, timeout=30) as resp:
+                        resp_headers = resp.headers
+                        raw = resp.read().decode("utf-8")
+                        # SSE format: extract data: lines
+                        if "text/event-stream" in resp_headers.get("Content-Type", ""):
+                            data_lines = [line[6:] for line in raw.split("\n") if line.startswith("data: ")]
+                            raw = data_lines[-1] if data_lines else "{}"
+                        result = json.loads(raw)
+                        session_id = resp_headers.get("Mcp-Session-Id")
+                        if session_id:
+                            mcp_session_id = session_id
+                    if result.get("error"):
+                        raise RuntimeError(f"MCP error: {result['error']}")
+                    return result.get("result", {})
+
+                # Initialize
+                mcp_rpc("initialize", {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {"name": "kontrol-hermes-runner", "version": "1.0.0"},
+                })
+                mcp_rpc("notifications/initialized", {})
+
+                # Open workspace
+                open_result = mcp_rpc("tools/call", {
+                    "name": "open_workspace",
+                    "arguments": {"path": "/workspace"},
+                })
+                workspace_id = None
+                sc = open_result.get("structuredContent") or {}
+                workspace_id = sc.get("workspaceId") or sc.get("workspace_id")
+                if not workspace_id:
+                    raise RuntimeError(f"open_workspace did not return workspaceId: {open_result}")
+
+                # Staged file write
+                write_result = mcp_rpc("tools/call", {
+                    "name": "staged_file_write",
+                    "arguments": {
+                        "workspaceId": workspace_id,
+                        "path": path,
+                        "content": content,
+                    },
+                })
+                write_sc = write_result.get("structuredContent") or {}
+                if write_result.get("isError"):
+                    text = "\n".join(
+                        part.get("text", "")
+                        for part in write_result.get("content", [])
+                        if isinstance(part, dict)
+                    )
+                    raise RuntimeError(f"staged_file_write failed: {text}")
+                emit({
+                    "type": "kontrol_bounded_write",
+                    "path": path,
+                    "sha256": write_sc.get("contentSha256"),
+                    "workspaceId": workspace_id,
+                })
+                return
+            except Exception as exc:
+                emit({"type": "error", "error": f"bounded write failed: {exc}"})
+                raise
 
         async def read_text_file(self, **_kwargs):
             raise RuntimeError("Kontrol native bridge does not expose client-side file reads")

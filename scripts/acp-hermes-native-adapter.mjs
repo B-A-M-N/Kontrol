@@ -17,6 +17,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { clearAgentIdentity, identityHeaders, loadAgentIdentity, saveAgentIdentity } from "./lib/acp-agent-identity.mjs";
 import { readJsonBody, truncateUtf8Tail, writeAdapterError } from "./lib/adapter-http.mjs";
 import { buildToolEnvironment } from "./lib/tool-environment.mjs";
+import { signWorkerToken, TOKEN_TTL_MS } from "./lib/acp-worker-token.mjs";
 import { adapterStatePath, atomicWriteJson, prepareOwnedChild, processStartToken, readJsonOr, reconcileOwnedProcesses, terminateProcessGroup } from "./lib/managed-agent-process.mjs";
 import { applyWorkspaceLeaseRenewal, workspaceLeaseDeadline, workspaceLeaseDeadlineReached } from "./lib/workspace-lease.mjs";
 import { acknowledgeAdapterDispatchReceipt, adapterDispatchFingerprint, findAdapterDispatchReceipt, isTerminalAdapterDispatchStatus, loadAdapterDispatchReceipts, reconcileAdapterDispatchReceipts, recordAdapterDispatchReceipt } from "./lib/adapter-dispatch-receipts.mjs";
@@ -38,6 +39,7 @@ const {
 } = readOnlyExecutionModule;
 
 const KONTROL_ACP_URL = process.env.KONTROL_ACP_URL || "http://127.0.0.1:7676/acp";
+const KONTROL_MCP_URL = process.env.KONTROL_MCP_URL || KONTROL_ACP_URL.replace(/\/acp$/, "/mcp");
 const AGENT_SECRET = process.env.KONTROL_ACP_AGENT_SECRET;
 const ADAPTER_SECRET = process.env.KONTROL_ACP_ADAPTER_SECRET;
 const HERMES_BIN = process.env.HERMES_BIN || "hermes";
@@ -387,6 +389,7 @@ async function handle(req, res) {
     workspaceRoot,
     readOnlyAudit: readOnlyAuthorization.readOnly && !boundedWriteAuthorization.boundedWrite,
     boundedFileWrite: boundedWriteAuthorization.boundedWrite,
+    workerToken: null,
     boundedFileWriteGrant: boundedWriteAuthorization.grant,
     readOnlyExecutionGrant: readOnlyAuthorization.grant,
     workspaceLeaseNonce: body.workspace_lease_nonce,
@@ -417,6 +420,15 @@ async function handle(req, res) {
       work_session_id: run.workSessionId,
       ...(existing?.dispatchIdempotencyKey ? { dispatch_idempotency_key: existing.dispatchIdempotencyKey } : {}),
     });
+  }
+  if (run.workSessionId) {
+    run.workerToken = signWorkerToken({
+      role: "worker",
+      workSessionId: run.workSessionId,
+      workspaceSessionId: run.workspaceSessionId ?? "",
+      runId: run.devRunId,
+      exp: Date.now() + TOKEN_TTL_MS,
+    }, AGENT_SECRET);
   }
   if (run.workSessionId && !run.readOnlyAudit && !run.boundedFileWrite && (!run.workspaceLeaseNonce || workspaceLeaseDeadlineReached(run))) {
     return writeJson(res, 409, {
@@ -454,6 +466,8 @@ async function handle(req, res) {
           KONTROL_WORK_SESSION_ID: run.workSessionId || "",
           KONTROL_PARENT_RUN_ID: run.devRunId || "",
           KONTROL_READ_ONLY_EXECUTION: "1",
+          KONTROL_MCP_URL,
+          KONTROL_WORKER_TOKEN: run.workerToken,
           KONTROL_HERMES_NATIVE_INPUT: JSON.stringify({
             command: hermesSandboxCommand,
             args: ["acp"],
