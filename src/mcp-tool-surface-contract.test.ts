@@ -191,7 +191,7 @@ function createServerWithHandshakeObserver(
   checkpoints: ReturnType<typeof createReviewCheckpointManager>,
   processSessions: ProcessSessionManager,
   connectionContext: { mcpSessionId: string },
-  onHandshake: NonNullable<Parameters<typeof createMcpServer>[25]>,
+  onHandshake: NonNullable<Parameters<typeof createMcpServer>[26]>,
 ) {
   return createMcpServer(
     config,              // 1
@@ -213,13 +213,14 @@ function createServerWithHandshakeObserver(
     undefined,           // 17 agentMessages
     undefined,           // 18 supervisorRuns
     undefined,           // 19 onSupervisorResume
-    undefined,           // 20 db
-    undefined,           // 21 mutationReceipts
-    undefined,           // 22 onWorkspaceAppResource
-    undefined,           // 23 onPhaseTiming
-    undefined,           // 24 scheduledJobs
-    undefined,           // 25 reviewRoutes
-    onHandshake,         // 26 onToolCatalogHandshake
+    undefined,           // 20 onScheduledJobCreated
+    undefined,           // 21 db
+    undefined,           // 22 mutationReceipts
+    undefined,           // 23 onWorkspaceAppResource
+    undefined,           // 24 onPhaseTiming
+    undefined,           // 25 scheduledJobs
+    undefined,           // 26 reviewRoutes
+    onHandshake,         // 27 onToolCatalogHandshake
   );
 }
 

@@ -89,6 +89,8 @@ export interface ScheduledJobRuntimeOptions {
   schedulerInstanceId?: string;
   leaseMs?: number;
   pollMs?: number;
+  /** Bounded fallback when no nearer durable deadline exists. */
+  maxRecoveryIntervalMs?: number;
   dispatchConcurrency?: number;
 }
 
@@ -746,18 +748,36 @@ export function createScheduledJobRuntime(options: ScheduledJobRuntimeOptions): 
 
   function scheduleNext(): void {
     if (timer) clearTimeout(timer);
-    let nextWakeMs = pollMs;
+    let nextWakeMs = options.maxRecoveryIntervalMs ?? 5 * 60_000;
     try {
-      const nextDue = database.sqlite.prepare(`
-        select min(case when run_at > ? then run_at else ? end) as next
+      const now = new Date();
+      const due = database.sqlite.prepare(`
+        select min(run_at) as due
           from scheduled_jobs
          where status in ('pending','due')
-      `).get(new Date(Date.now() + pollMs).toISOString(), new Date(Date.now() + pollMs).toISOString()) as { next?: string | null } | undefined;
-      if (nextDue?.next) {
-        const dueMs = Math.max(0, Date.parse(nextDue.next) - Date.now());
-        nextWakeMs = Math.min(pollMs, dueMs);
+      `).get() as { due?: string | null } | undefined;
+      const retry = database.sqlite.prepare(`
+        select min(min(next_eligible, next_reconcile)) as deadline
+          from (
+            select job.dispatch_next_eligible_at as next_eligible,
+                   attempt.next_reconcile_at as next_reconcile
+              from scheduled_jobs job
+              join scheduled_job_attempts attempt on attempt.id = job.active_dispatch_attempt_id
+             where job.status in ('blocked','dispatching','uncertain_dispatch','operator_intervention','cancellation_requested')
+               and attempt.completed_at is null
+          )
+      `).get() as { deadline?: string | null } | undefined;
+      const candidates = [
+        due?.due,
+        retry?.deadline,
+      ].filter((value): value is string => Boolean(value))
+        .map((value) => Date.parse(value))
+        .filter((value) => Number.isFinite(value));
+      if (candidates.length) {
+        const earliest = Math.min(...candidates);
+        nextWakeMs = Math.max(0, earliest - Date.now());
       }
-    } catch { /* fallback to normal polling on diagnostic read failure */ }
+    } catch { /* fall back to the bounded recovery interval on diagnostic failure */ }
     timer = setTimeout(() => {
       void drainOnce().then(() => {
         if (!stopped) scheduleNext();
@@ -881,6 +901,11 @@ export function createScheduledJobRuntime(options: ScheduledJobRuntimeOptions): 
     getMetrics,
     wake() {
       void drainOnce();
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      scheduleNext();
     },
   };
 }

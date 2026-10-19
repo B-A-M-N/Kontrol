@@ -164,6 +164,7 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
           maxRuntimeMs: maxRuntimeMinutes * 60_000,
           clientMutationId,
         });
+        config.onScheduledJobCreated?.();
         return {
           content: [{ type: "text" as const, text: `Scheduled job ${job.id} for ${job.runAt}.` }],
           structuredContent: { scheduledJobId: job.id, status: job.status, revision: job.revision, runAt: job.runAt },

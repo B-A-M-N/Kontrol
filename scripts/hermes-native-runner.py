@@ -120,15 +120,35 @@ async def main() -> int:
                 headers = {
                     "Content-Type": "application/json",
                     "Accept": "application/json, text/event-stream",
-                    "Authorization": f"Bearer {worker_token}",
                     "X-Kontrol-Worker-Token": worker_token,
                 }
                 mcp_session_id = None
+                rpc_id = 0
 
-                def mcp_rpc(method: str, params: dict | None = None) -> dict:
-                    nonlocal mcp_session_id
-                    body = {"jsonrpc": "2.0", "id": str(uuid.uuid4()), "method": method}
-                    if params is not None:
+                def parse_rpc_payload(raw: str, content_type: str) -> dict | None:
+                    if "text/event-stream" not in content_type:
+                        return json.loads(raw) if raw.strip() else None
+                    message: dict | None = None
+                    for raw_line in raw.splitlines():
+                        if not raw_line.startswith("data:"):
+                            continue
+                        value = raw_line[5:].strip()
+                        if not value:
+                            continue
+                        parsed = json.loads(value)
+                        if "method" in parsed and "id" not in parsed:
+                            continue
+                        message = parsed
+                    return message
+
+                def mcp_rpc(method: str, params: dict | None = None, notification: bool = False) -> dict | None:
+                    nonlocal mcp_session_id, rpc_id
+                    body: dict = {"jsonrpc": "2.0", "method": method}
+                    if notification:
+                        body["params"] = params or {}
+                    else:
+                        rpc_id += 1
+                        body["id"] = rpc_id
                         body["params"] = params
                     req_headers = dict(headers)
                     if mcp_session_id:
@@ -139,17 +159,23 @@ async def main() -> int:
                         headers=req_headers,
                         method="POST",
                     )
-                    with urllib.request.urlopen(req, timeout=30) as resp:
-                        resp_headers = resp.headers
-                        raw = resp.read().decode("utf-8")
-                        # SSE format: extract data: lines
-                        if "text/event-stream" in resp_headers.get("Content-Type", ""):
-                            data_lines = [line[6:] for line in raw.split("\n") if line.startswith("data: ")]
-                            raw = data_lines[-1] if data_lines else "{}"
-                        result = json.loads(raw)
-                        session_id = resp_headers.get("Mcp-Session-Id")
-                        if session_id:
-                            mcp_session_id = session_id
+                    try:
+                        with urllib.request.urlopen(req, timeout=30) as resp:
+                            content_type = resp.headers.get("Content-Type", "")
+                            raw = resp.read().decode("utf-8")
+                            session_id = resp.headers.get("Mcp-Session-Id")
+                            if session_id:
+                                mcp_session_id = session_id
+                            if notification:
+                                if resp.status not in (200, 202, 204):
+                                    raise RuntimeError(f"MCP {method} failed: HTTP {resp.status}")
+                                return None
+                            result = parse_rpc_payload(raw, content_type)
+                    except urllib.error.HTTPError as exc:
+                        detail = exc.read().decode("utf-8", errors="replace")
+                        raise RuntimeError(f"MCP {method} failed: HTTP {exc.code}: {detail}") from exc
+                    if not result:
+                        raise RuntimeError(f"MCP {method} returned no JSON-RPC response")
                     if result.get("error"):
                         raise RuntimeError(f"MCP error: {result['error']}")
                     return result.get("result", {})
@@ -160,18 +186,11 @@ async def main() -> int:
                     "capabilities": {},
                     "clientInfo": {"name": "kontrol-hermes-runner", "version": "1.0.0"},
                 })
-                mcp_rpc("notifications/initialized", {})
+                mcp_rpc("notifications/initialized", {}, notification=True)
 
-                # Open workspace
-                open_result = mcp_rpc("tools/call", {
-                    "name": "open_workspace",
-                    "arguments": {"path": "/workspace"},
-                })
-                workspace_id = None
-                sc = open_result.get("structuredContent") or {}
-                workspace_id = sc.get("workspaceId") or sc.get("workspace_id")
-                if not workspace_id:
-                    raise RuntimeError(f"open_workspace did not return workspaceId: {open_result}")
+                # Reuse the signed workspace identity; /workspace is only the
+                # sandbox alias and is not a registered host workspace path.
+                workspace_id = workspace_session_id
 
                 # Staged file write
                 write_result = mcp_rpc("tools/call", {

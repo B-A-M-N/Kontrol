@@ -486,7 +486,8 @@ export class ProcessSessionManager {
           input.recoveryCapability,
           interactionRequested,
         )
-      : this.getOwnedSession(input.workspaceId, input.sessionId, input.ownerId, input.workSessionId);
+      : this.getOwnedSession(input.workspaceId, input.sessionId, input.ownerId, input.workSessionId)
+        ?? this.getDurablePrincipalSession(input.workspaceId, input.sessionId, input.principalId, input.workSessionId, interactionRequested);
     session.lastClientActivityAt = Date.now();
 
     if (input.columns !== undefined || input.rows !== undefined) {
@@ -525,7 +526,7 @@ export class ProcessSessionManager {
 
   terminate(workspaceId: string, sessionId: string, ownerId?: string, workSessionId?: string): void {
     const session = this.getOwnedSession(workspaceId, sessionId, ownerId, workSessionId);
-    if (session.running) session.process?.kill("SIGTERM");
+    if (session?.running) session.process?.kill("SIGTERM");
   }
 
   revokeRecoveryCapability(recoveryCapability: string, principalId: string): boolean {
@@ -893,7 +894,7 @@ export class ProcessSessionManager {
     });
   }
 
-  private getOwnedSession(workspaceId: string, sessionId: string, ownerId?: string, workSessionId?: string): ProcessSession {
+  private getOwnedSession(workspaceId: string, sessionId: string, ownerId?: string, workSessionId?: string): ProcessSession | undefined {
     const session = this.sessions.get(sessionId);
     if (!session) throw new Error(`Unknown process session: ${sessionId}`);
     if (session.workspaceId !== workspaceId) {
@@ -901,7 +902,37 @@ export class ProcessSessionManager {
     }
     const expectedOwner = ownerId ?? `workspace:${workspaceId}`;
     if (session.ownerId !== expectedOwner) {
+      // A verified durable principal may inspect output across transports,
+      // but this helper deliberately returns undefined so control/input still
+      // requires the original owner or an explicit recovery capability.
+      return undefined;
+    }
+    if (session.workSessionId !== workSessionId) {
+      throw new Error(`Process session ${sessionId} is bound to another work session.`);
+    }
+    return session;
+  }
+
+  private getDurablePrincipalSession(
+    workspaceId: string,
+    sessionId: string,
+    principalId: string | undefined,
+    workSessionId: string | undefined,
+    interactionRequested: boolean,
+  ): ProcessSession {
+    if (interactionRequested) {
+      throw new Error(`Process session ${sessionId} is owned by another client; input and process control require the original owner.`);
+    }
+    if (!principalId?.trim()) {
       throw new Error(`Process session ${sessionId} is owned by another client.`);
+    }
+    const session = this.sessions.get(sessionId);
+    if (!session) throw new Error(`Unknown process session: ${sessionId}`);
+    if (session.workspaceId !== workspaceId) {
+      throw new Error(`Process session ${sessionId} does not belong to workspace ${workspaceId}.`);
+    }
+    if (session.principalId !== principalId) {
+      throw new Error(`Process session ${sessionId} belongs to another principal.`);
     }
     if (session.workSessionId !== workSessionId) {
       throw new Error(`Process session ${sessionId} is bound to another work session.`);

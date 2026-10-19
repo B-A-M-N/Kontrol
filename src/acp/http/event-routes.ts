@@ -460,10 +460,41 @@ function eventMatchesDispatch(event: { type: string; payload: Record<string, unk
       const scheduledAttempt = scheduledJobForSession
         ? ctx.scheduledJobs!.getAttempt(scheduledJobForSession.id)
         : undefined;
+      const authorizedOutputs = Array.isArray(scheduledJobForSession?.policySnapshotJson.allowedOutputs)
+        ? scheduledJobForSession.policySnapshotJson.allowedOutputs as Array<{ path?: string; expectedSha256?: string }>
+        : [];
+      const currentAttemptId = scheduledAttempt?.id;
+      const currentAttemptNumber = scheduledAttempt?.acpAttemptNumber ?? run.attemptNumber ?? 1;
+      const committedReceipts = (scheduledAttempt?.publicationReceipts ?? []).filter((receipt: Record<string, unknown>) =>
+        receipt.outcome === "committed"
+        && receipt.readBackVerified === true
+        && receipt.attemptId === currentAttemptId
+        && receipt.attemptNumber === currentAttemptNumber);
+      const receiptPaths = new Set<string>();
+      let conflictingCommittedReceipts = false;
+      for (const receipt of committedReceipts) {
+        const path = typeof receipt.path === "string" ? receipt.path : undefined;
+        if (!path || receiptPaths.has(path)) {
+          conflictingCommittedReceipts = true;
+          break;
+        }
+        receiptPaths.add(path);
+      }
+      const unresolvedPublicationFailure = (scheduledAttempt?.publicationReceipts ?? []).some((receipt: Record<string, unknown>) =>
+        receipt.outcome === "rejected" || receipt.outcome === "conflict");
+      const outputsVerified = authorizedOutputs.length > 0
+        && authorizedOutputs.every((output) =>
+          typeof output?.path === "string"
+          && receiptPaths.has(output.path)
+          && committedReceipts.some((receipt: Record<string, unknown>) =>
+            receipt.path === output.path
+            && (output.expectedSha256 === undefined || receipt.sha256 === output.expectedSha256)));
       const autonomousBoundedWrite = body.type === "completed"
         && session?.completionPolicy === "agent_completion"
         && scheduledJobForSession?.executionMode === "bounded_file_write"
-        && Boolean(scheduledAttempt?.publicationReceipts?.some((r: Record<string, unknown>) => r.outcome === "committed" && r.readBackVerified === true));
+        && outputsVerified
+        && !conflictingCommittedReceipts
+        && !unresolvedPublicationFailure;
       const eventType = (gatedCompletedTurn || autonomousBoundedWrite) ? "worker.turn.completed" : ADAPTER_EVENT_TYPE_TO_RUN[body.type]!;
       const adapterPayload = Object.fromEntries(
         Object.entries(body.payload ?? {}).filter(([key]) => !SERVER_OWNED_EVENT_PAYLOAD_FIELDS.has(key)),

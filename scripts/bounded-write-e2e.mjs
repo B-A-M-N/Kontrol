@@ -19,9 +19,9 @@ const envFile = join(configDir, "bw.env");
 const artifactPath = join(root, "Hello-World.txt");
 const artifactContent = "hello from bounded write\n";
 const expectedSha256 = createHash("sha256").update(artifactContent).digest("hex");
-const reviewerToken = "bw-e2e-reviewer-token-long";
-const agentSecret = "bw-e2e-agent-secret-long";
-const adapterSecret = "bw-e2e-adapter-secret-long";
+const reviewerToken = "bw-e2e-reviewer-token-long-enough-for-policy";
+const agentSecret = "bw-e2e-agent-secret-long-enough-for-policy";
+const adapterSecret = "bw-e2e-adapter-secret-long-enough-for-policy";
 
 writeFileSync(join(root, "tracked.txt"), "baseline\n");
 writeFileSync(envFile, [
@@ -68,21 +68,28 @@ async function startAgent() {
       agentRuns += 1;
       const grant = body.bounded_file_write_grant;
       const remoteRunId = `bw-${agentRuns}`;
-      if (!grant?.signature) {
+      if (!grant?.signature || !body.session_id) {
         res.writeHead(403).end(JSON.stringify({ error: { code: "bounded_file_write_grant_invalid" } }));
         return;
       }
-      // Simulate the Hermes runner: call Kontrol's MCP staged_file_write
+      // Simulate the Hermes adapter/runner boundary: the runner derives its
+      // signed MCP worker identity from the adapter's configured agent secret.
       try {
-        const mcpUrl = process.env.KONTROL_MCP_URL;
-        const workerToken = process.env.KONTROL_WORKER_TOKEN;
+        const { signWorkerToken } = await import("./lib/acp-worker-token.mjs");
+        const mcpUrl = `http://127.0.0.1:${PORT}/mcp`;
+        const workerToken = signWorkerToken({
+          role: "worker",
+          workSessionId: body.session_id,
+          workspaceSessionId: body.workspace_session_id,
+          runId: body.parent_run_id,
+          exp: Date.now() + 60_000,
+        }, agentSecret);
         const workspaceSessionId = body.workspace_session_id;
         if (!mcpUrl || !workerToken) throw new Error("MCP env incomplete");
 
         const headers = {
           "Content-Type": "application/json",
           "Accept": "application/json, text/event-stream",
-          "Authorization": `Bearer ${agentSecret}`,
           "X-Kontrol-Worker-Token": workerToken,
         };
         let mcpSessionId;
@@ -120,7 +127,7 @@ async function startAgent() {
         console.log(`[bw-e2e] agent published ${sha}`);
       } catch (error) {
         console.error("[bw-e2e] agent write failed:", error.message);
-        res.writeHead(200).end(JSON.stringify({ run_id: remoteRunId, remote_run_id: remoteRunId, accepted: true, status: "failed", output: [{ parts: [{ content: error.message }] }] }));
+        res.writeHead(200).end(JSON.stringify({ run_id: remoteRunId, remote_run_id: remoteRunId, accepted: true, status: "failed", dispatch_idempotency_key: body.dispatch_idempotency_key, attempt_number: body.attempt_number, output: [{ parts: [{ content: error.message }] }] }));
         return;
       }
       res.writeHead(202).end(JSON.stringify({
@@ -129,6 +136,7 @@ async function startAgent() {
         accepted: true,
         status: "completed",
         dispatch_idempotency_key: body.dispatch_idempotency_key,
+        attempt_number: body.attempt_number,
         output: [{ parts: [{ content: "bounded write completed" }] }],
       }));
       return;
@@ -158,8 +166,7 @@ async function startServer() {
       KONTROL_ACP_REVIEWER_SECRET: reviewerToken,
       KONTROL_ACP_ADAPTER_SECRET: adapterSecret,
       PORT: String(PORT),
-      KONTROL_MCP_URL: `http://127.0.0.1:${PORT}/mcp`,
-      KONTROL_WORKER_TOKEN: agentSecret,
+
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -187,6 +194,7 @@ async function rpc(method, params) {
     "Content-Type": "application/json",
     "Accept": "application/json, text/event-stream",
     "Authorization": `Bearer ${reviewerToken}`,
+    "x-kontrol-tunnel-reviewer": reviewerToken,
   };
   if (mcpSessionId) headers["Mcp-Session-Id"] = mcpSessionId;
   const resp = await fetch(`http://127.0.0.1:${PORT}/mcp`, {
@@ -285,7 +293,11 @@ try {
   if (server) { server.kill("SIGKILL"); }
   process.exitCode = 1;
 } finally {
-  rmSync(root, { recursive: true, force: true });
-  rmSync(stateDir, { recursive: true, force: true });
-  rmSync(configDir, { recursive: true, force: true });
+  if (!process.env.KONTROL_BW_KEEP) {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(configDir, { recursive: true, force: true });
+  } else {
+    console.log("kept:", root, stateDir, configDir);
+  }
 }

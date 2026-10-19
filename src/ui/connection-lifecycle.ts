@@ -51,6 +51,12 @@ export function setLifecycleHost(next: LifecycleHost): void {
   host = next;
 }
 
+/** Advance fencing when an App instance is replaced without a teardown. */
+export function advanceAppInstanceGeneration(): number {
+  appInstanceGeneration += 1;
+  return appInstanceGeneration;
+}
+
 /** Cancel the current reconnect owner and wake any bounded retry backoff. */
 export function cancelReconnect(): void {
   appInstanceGeneration += 1;

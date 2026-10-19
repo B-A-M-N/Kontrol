@@ -79,6 +79,7 @@ import { createSupervisorRuns } from "./supervisor-runs.js";
 import { shutdownMissionVerifiers } from "./mission-verifier.js";
 import { createReviewWorkflowService, type ReviewWorkflowService } from "./review-workflow.js";
 import { databasePath, openDatabase, type DatabaseHandle } from "./db/client.js";
+import { pruneUnreferencedMigrationBackups } from "./db/deployment-backup.js";
 import { LATEST_SCHEMA_VERSION } from "./db/migrations.js";
 import { createPolicyEngine, policyCanAsk, type PolicyConfig, type PolicyEngine, type ApprovalScope } from "./policy.js";
 import { createSqliteGrantStore } from "./policy-grants.js";
@@ -649,6 +650,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     oauthEnabled: () => oauthEnabled,
     shuttingDown: () => shuttingDown,
     serveWorkspaceAppResource,
+    onScheduledJobCreated: () => scheduledJobRuntimeRef?.wake(),
     createServerForSession: (connectionContext: ConnectionContext) => createMcpServer(
       config,
       workspaces,
@@ -669,6 +671,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
       agentMessages,
       supervisorRuns,
       supervisorWake,
+      () => scheduledJobRuntimeRef?.wake(),
       db,
       mutationReceipts,
       (uri) => {
@@ -786,11 +789,12 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
   let supervisorRuntime: import("./supervisor-runtime.js").SupervisorRuntime | undefined;
   let replyDispatcher: import("./bridge/reply-dispatcher.js").ReplyDispatcher | undefined;
   let scheduledJobRuntime: import("./scheduling/scheduled-job-runtime.js").ScheduledJobRuntime | undefined;
+  let scheduledJobRuntimeRef: import("./scheduling/scheduled-job-runtime.js").ScheduledJobRuntime | undefined;
   let reconcileScheduledJob: ((jobId: string) => Promise<import("./scheduling/scheduled-job-store.js").ScheduledJob | undefined>) | undefined;
   if (config.acpEnabled) {
     const acp = createAcpRuntime({
       config,
-      bridge: { workspaces, workSessions, reviewCheckpoints, agentRegistry, eventStore, continuationManager, dispatchOutbox, missionLedger, supervisorRuns, agentMessages, liveWaiters, scheduledJobs, reviewRoutes },
+      bridge: { workspaces, workSessions, reviewCheckpoints, agentRegistry, eventStore, continuationManager, dispatchOutbox, missionLedger, supervisorRuns, agentMessages, liveWaiters, scheduledJobs, reviewRoutes, onScheduledJobCreated: () => scheduledJobRuntimeRef?.wake() },
       reviewWorkflow,
       recordPhaseTiming,
       database: db,
@@ -799,6 +803,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     supervisorRuntime = acp.supervisorRuntime;
     replyDispatcher = acp.replyDispatcher;
     scheduledJobRuntime = acp.scheduledJobRuntime;
+    scheduledJobRuntimeRef = acp.scheduledJobRuntime;
     reconcileScheduledJob = acp.reconcileScheduledJob;
   }
 

@@ -84,15 +84,13 @@ const job = { jobId: "job-test", workSessionId: "ws-test", workspaceRoot, attemp
   assert.equal(result.outcome, "rejected");
 }
 
-// 8. Sibling denial: policy only authorizes exact path.
+// 8. Publisher independently rejects a request/path policy mismatch.
 {
   const policy: BoundedFileWriteOutputPolicy = { path: "authorized.txt", operation: "create", overwrite: "deny" };
   const result = await publishScheduledArtifact({ ...job, path: "unauthorized-sibling.txt", content: Buffer.from("not authorized\n"), output: policy });
-  // The policy.path mismatch is the caller's responsibility to enforce; the
-  // publisher itself validates the output parameter against the path. This
-  // test confirms the publisher receives the policy for the requested path.
-  // The action-guard layer denies unauthorized tool calls before this point.
-  assert.ok(result, "publisher returns a receipt (deny is enforced upstream)");
+  assert.equal(result.outcome, "rejected");
+  assert.equal(result.reason, "path_policy_mismatch");
+  assert.ok(!existsSync(join(workspaceRoot, "unauthorized-sibling.txt")));
 }
 
 // 9. Nested directory creation.

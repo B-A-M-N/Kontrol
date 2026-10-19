@@ -365,14 +365,28 @@ export function requireWorkerDeliveryBinding(config: BridgeConfig, sessionId: st
 }
 
 export function requireWorkSessionMutation(config: BridgeConfig, sessionId: string) {
+  // Mutations must not inherit the durable-principal read-recovery branch:
+  // result visibility is broader than the authority to resume, approve,
+  // cancel, or otherwise modify a work session.
+  const canMutate = canMutateWorkSession(config, sessionId);
+  if (canMutate) return null;
   const access = requireWorkSessionRead(config, sessionId);
   if (access) return access;
-  const bind = assertWorkerSessionBinding(config, sessionId);
-  if (bind) return bind;
-  if (config.connectionContext && !liveOwnerContextId(config)) {
-    return forbidden(config.principalRole, "missing transport identity");
+  return forbidden(config.principalRole, "work-session mutation");
+}
+
+function canMutateWorkSession(config: BridgeConfig, sessionId: string): boolean {
+  if (config.principalRole === "worker") {
+    if (config.connectionWorkSessionId !== sessionId) return false;
+    const lease = config.workSessions.getWorkspaceLeaseForSession(sessionId);
+    if (lease && lease.leaseNonce !== config.connectionWorkspaceLeaseNonce) return false;
+    return true;
   }
-  return null;
+  const session = config.workSessions.get(sessionId);
+  const owner = liveOwnerContextId(config);
+  if (config.connectionContext && !owner) return false;
+  if (session?.ownerContextId && owner && session.ownerContextId === owner) return true;
+  return isReviewer(config.principalRole);
 }
 
 export function requireWorkSessionRead(config: BridgeConfig, sessionId: string) {

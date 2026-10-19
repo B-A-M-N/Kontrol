@@ -164,6 +164,8 @@ export interface ScheduledJob {
   revision: number;
   workSessionId?: string;
   activeDispatchAttemptId?: string;
+  /** Server-bound ACP attempt number when the active attempt has started. */
+  attemptNumber?: number;
   lifecycleEventCursor: number;
   cancellationRequestId?: string;
   cancellationPreviousStatus?: string;
@@ -420,7 +422,13 @@ export function createScheduledJobStore(
 
   function getByWorkSessionId(workSessionId: string): ScheduledJob | undefined {
     const row = select.where(eq(scheduledJobs.workSessionId, workSessionId)).limit(1).all()[0];
-    return row ? rowToJob(row) : undefined;
+    if (!row) return undefined;
+    const job = rowToJob(row);
+    if (row.activeDispatchAttemptId) {
+      const attemptRow = database.db.select().from(scheduledJobAttempts).where(eq(scheduledJobAttempts.id, row.activeDispatchAttemptId)).limit(1).all()[0];
+      job.attemptNumber = attemptRow?.acpAttemptNumber ?? undefined;
+    }
+    return job;
   }
 
   function commitJob(input: ScheduledJobInput): ScheduledJob {
@@ -890,16 +898,18 @@ export function createScheduledJobStore(
         }
       }
       const stateChangedAt = new Date().toISOString();
+      const terminalStatus = projection.autonomousCompletion && row.executionMode === "bounded_file_write"
+        ? "completed" as ScheduledJobStatus
+        : projection.nextStatus;
+      const terminalTransition = Boolean(terminalStatus && ["completed", "failed", "cancelled"].includes(terminalStatus));
       const updated = database.db.update(scheduledJobs).set({
-        status: projection.autonomousCompletion && row.executionMode === "bounded_file_write"
-          ? "completed"
-          : projection.nextStatus,
-        revision: projection.nextStatus ? row.revision + 1 : row.revision,
-        activeDispatchAttemptId: projection.finalWorkerOutcome ? null : undefined,
+        status: terminalStatus,
+        revision: terminalTransition ? row.revision + 1 : row.revision,
+        activeDispatchAttemptId: terminalTransition ? null : undefined,
         lifecycleEventCursor: event.seq,
         lastError: projection.lastError ?? (projection.nextStatus ? null : undefined),
         updatedAt: stateChangedAt,
-        ...(projection.nextStatus || projection.autonomousCompletion ? stateTimestampFields(projection.autonomousCompletion ? "completed" : projection.nextStatus!, currentStatus, stateChangedAt) : {}),
+        ...(terminalStatus ? stateTimestampFields(terminalStatus, currentStatus, stateChangedAt) : {}),
       }).where(and(
         eq(scheduledJobs.id, row.id),
         eq(scheduledJobs.revision, row.revision),
@@ -907,7 +917,7 @@ export function createScheduledJobStore(
       )).run();
       if (updated.changes !== 1) throw new Error(`Scheduled event projection conflict for ${row.id} at event ${event.seq}.`);
 
-      if (projection.executionStopped || projection.finalWorkerOutcome) {
+      if (terminalTransition) {
         const runId = typeof event.payload.runId === "string" ? event.payload.runId : undefined;
         const completedAt = new Date().toISOString();
         database.sqlite.prepare(`
@@ -1581,9 +1591,30 @@ export function createScheduledJobStore(
         if (!attemptId) throw new Error(`No active dispatch attempt for publication receipt on job ${input.jobId}`);
         const row = database.db.select().from(scheduledJobAttempts).where(eq(scheduledJobAttempts.id, attemptId)).limit(1).all()[0];
         if (!row) throw new Error(`Active dispatch attempt disappeared: ${attemptId}`);
+        if (row.completedAt || row.outcome) {
+          throw new Error(`Publication is fenced after terminal attempt: ${attemptId}`);
+        }
+        const receiptAttemptId = typeof input.receipt?.attemptId === "string" ? input.receipt.attemptId : undefined;
+        if (receiptAttemptId && receiptAttemptId !== attemptId) {
+          throw new Error(`Publication receipt is bound to stale attempt: ${receiptAttemptId}`);
+        }
+        const receiptAttemptNumber = typeof input.receipt?.attemptNumber === "number" ? input.receipt.attemptNumber : undefined;
+        if (receiptAttemptNumber !== undefined && row.acpAttemptNumber !== null && receiptAttemptNumber !== row.acpAttemptNumber) {
+          throw new Error(`Publication receipt attempt number mismatch: ${receiptAttemptNumber} != ${row.acpAttemptNumber}`);
+        }
         const existing: Array<Record<string, unknown>> = row.publicationReceiptsJson
           ? JSON.parse(row.publicationReceiptsJson) as Array<Record<string, unknown>>
           : [];
+        const receiptPath = typeof input.receipt?.path === "string" ? input.receipt.path : undefined;
+        const duplicate = receiptPath && input.receipt?.outcome === "committed"
+          ? existing.find((candidate) => candidate?.path === receiptPath && candidate?.outcome === "committed")
+          : undefined;
+        if (duplicate) {
+          if (duplicate.sha256 !== input.receipt.sha256) {
+            throw new Error(`Conflicting committed publication receipt for ${receiptPath}`);
+          }
+          return;
+        }
         existing.push(input.receipt);
         database.db.update(scheduledJobAttempts).set({
           publicationReceiptsJson: JSON.stringify(existing),

@@ -124,6 +124,11 @@ async function testDatabaseConfiguration(stateDir: string): Promise<void> {
       { version: 81, name: "acp-run-scheduled-execution-mode" },
       { version: 82, name: "scheduled-job-result-ownership" },
       { version: 83, name: "scheduled-state-times-and-verification-single-flight" },
+      { version: 84, name: "mcp-qualification-evidence" },
+      { version: 85, name: "external-catalog-observations-and-associations" },
+      { version: 86, name: "work-session-principal-identity" },
+      { version: 87, name: "scheduled-job-publication-receipts" },
+      { version: 88, name: "scheduled-job-reconcile-backoff" },
     ]);
   } finally {
     database.close();

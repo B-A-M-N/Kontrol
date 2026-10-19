@@ -108,7 +108,8 @@ function setWatcherHealth(health: WorkspaceWatcherHealth, errorMessage?: string)
     const selected = host.getSelectedWorkSessionId()
       ? workSessionViews.get(host.getSelectedWorkSessionId()!)
       : undefined;
-    if (selected?.notice?.message.startsWith("Workspace activity connection interrupted: ")) {
+    if (selected?.notice?.owner === WATCHER_NOTICE_OWNER
+      || selected?.notice?.owner === TRANSPORT_NOTICE_OWNER) {
       selected.notice = undefined;
     }
   } else {

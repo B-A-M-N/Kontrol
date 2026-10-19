@@ -341,7 +341,8 @@ async function handle(req, res) {
         return writeJson(res, 409, { error: { code: receipt.requestFingerprint ? "dispatch_idempotency_conflict" : "dispatch_fingerprint_unavailable", message: "The original dispatch key is already bound to different or unverifiable request content." } });
       }
       return writeJson(res, 202, {
-        run_id: receipt.remoteRunId,
+        worker_token: run.workerToken,
+      run_id: receipt.remoteRunId,
         remote_run_id: receipt.remoteRunId,
         accepted: !["dispatching", "unstarted"].includes(receipt.status),
         status: receipt.status === "dispatching" ? "uncertain" : receipt.status,
@@ -430,6 +431,29 @@ async function handle(req, res) {
       exp: Date.now() + TOKEN_TTL_MS,
     }, AGENT_SECRET);
   }
+  const execution = run.boundedFileWrite
+    ? {
+      mode: "bounded_file_write",
+      grant: run.boundedFileWriteGrant,
+      networkPolicy: "host",
+      grantFingerprint: run.boundedFileWriteGrant
+        ? createHash("sha256").update(run.boundedFileWriteGrant.signature).digest("hex")
+        : undefined,
+    }
+    : {
+      mode: "read_only_audit",
+      grant: run.readOnlyExecutionGrant,
+      networkPolicy: run.readOnlyExecutionGrant?.networkPolicy,
+      grantFingerprint: run.readOnlyExecutionGrant
+        ? createHash("sha256").update(run.readOnlyExecutionGrant.signature).digest("hex")
+        : undefined,
+    };
+  if (!execution.grant || !execution.networkPolicy || !execution.grantFingerprint) {
+    return writeJson(res, 403, {
+      error: { code: "execution_grant_incomplete", message: "A complete signed execution grant is required for confined Hermes execution." },
+    });
+  }
+  run.execution = execution;
   if (run.workSessionId && !run.readOnlyAudit && !run.boundedFileWrite && (!run.workspaceLeaseNonce || workspaceLeaseDeadlineReached(run))) {
     return writeJson(res, 409, {
       error: { code: "workspace_lease_lost", message: "A live workspace lease nonce and expiry are required before a worker can start." },
@@ -465,7 +489,7 @@ async function handle(req, res) {
           KONTROL_WORKSPACE_SESSION_ID: run.workspaceSessionId || "",
           KONTROL_WORK_SESSION_ID: run.workSessionId || "",
           KONTROL_PARENT_RUN_ID: run.devRunId || "",
-          KONTROL_READ_ONLY_EXECUTION: "1",
+          ...(run.execution.mode === "bounded_file_write" ? { KONTROL_BOUNDED_FILE_WRITE: "1" } : { KONTROL_READ_ONLY_EXECUTION: "1" }),
           KONTROL_MCP_URL,
           KONTROL_WORKER_TOKEN: run.workerToken,
           KONTROL_HERMES_NATIVE_INPUT: JSON.stringify({
@@ -478,7 +502,7 @@ async function handle(req, res) {
           }),
         },
         toolchainPaths: configuredToolchains,
-        networkPolicy: run.readOnlyExecutionGrant.networkPolicy,
+        networkPolicy: run.execution.networkPolicy,
         bindMounts: [
           { source: run.readOnlyRuntimeProjection, target: "/opt/kontrol/hermes-runtime" },
         ],
@@ -495,7 +519,7 @@ async function handle(req, res) {
         toolchainPaths: configuredToolchains,
         bindMounts: run.readOnlyBindMounts,
         bindFiles: run.readOnlyBindFiles,
-        networkPolicy: run.readOnlyExecutionGrant.networkPolicy,
+        networkPolicy: run.execution.networkPolicy,
       });
       const runtimeProbe = buildReadOnlySandboxCommand({
         workspaceRoot,
@@ -510,7 +534,7 @@ async function handle(req, res) {
         toolchainPaths: configuredToolchains,
         bindMounts: run.readOnlyBindMounts,
         bindFiles: run.readOnlyBindFiles,
-        networkPolicy: run.readOnlyExecutionGrant.networkPolicy,
+        networkPolicy: run.execution.networkPolicy,
       });
       const runtimeProbeResult = spawnSync(runtimeProbe.command, runtimeProbe.args, {
         encoding: "utf8",
@@ -523,6 +547,8 @@ async function handle(req, res) {
         throw Object.assign(new Error(`Hermes read-only runtime probe failed: ${detail}`), { code: "sandbox_unavailable" });
       }
       run.readOnlyExecutionReceipt = {
+        mode: run.execution.mode,
+        execution_grant: run.execution.grant,
         issuer: "kontrol",
         work_session_id: run.workSessionId,
         workspace_session_id: run.workspaceSessionId,
@@ -530,10 +556,10 @@ async function handle(req, res) {
         remote_run_id: run.remoteRunId,
         attempt_number: run.attemptNumber,
         dispatch_idempotency_key: dispatchIdempotencyKey,
-        grant_expires_at: run.readOnlyExecutionGrant.expiresAt,
-        grant_fingerprint: createHash("sha256").update(run.readOnlyExecutionGrant.signature).digest("hex"),
-        network_policy: run.readOnlyExecutionGrant.networkPolicy,
-        confinement: run.readOnlyExecutionGrant.networkPolicy === "host" ? "bubblewrap-read-only-workspace-host-network" : "bubblewrap-read-only-workspace-no-network",
+        grant_expires_at: run.execution.grant.expiresAt,
+        grant_fingerprint: run.execution.grantFingerprint,
+        network_policy: run.execution.networkPolicy,
+        confinement: run.execution.networkPolicy === "host" ? "bubblewrap-read-only-workspace-host-network" : "bubblewrap-read-only-workspace-no-network",
       };
     } catch (error) {
       removeHermesReadOnlyRuntime(run);
@@ -791,6 +817,7 @@ async function handle(req, res) {
   else if (run.pendingChildExit) handleChildExit(...run.pendingChildExit);
   const acceptedStatus = acceptedReceipt?.status ?? "running";
   return writeJson(res, 202, {
+    worker_token: run.workerToken,
     run_id: run.remoteRunId,
     remote_run_id: run.remoteRunId,
     accepted: true,

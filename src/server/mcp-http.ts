@@ -110,6 +110,7 @@ export interface McpHttpDeps {
   serveWorkspaceAppResource(res: Response, requestId: string | undefined, body: { id?: unknown; params?: { uri?: unknown } }, sessionless: boolean, clientKey: string, abortSignal: AbortSignal | undefined, acceptEncoding?: string | undefined, context?: { sessionId?: string; generationId?: string }): Promise<boolean>;
   createServerForSession(connectionContext: ConnectionContext): McpServer;
   supervisorWake(workSessionId: string): void;
+  onScheduledJobCreated?: () => void;
   mutationReceipts: MutationReceiptStore;
   workspaces: import("../workspaces.js").WorkspaceRegistry;
   reviewCheckpoints: import("../review-checkpoints.js").ReviewCheckpointManager;
@@ -1132,6 +1133,7 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
           agentMessages,
           supervisorRuns,
           supervisorWake,
+          deps.onScheduledJobCreated,
           db,
           mutationReceipts,
           (uri) => {

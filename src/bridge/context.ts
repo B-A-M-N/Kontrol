@@ -96,6 +96,8 @@ export interface BridgeConfig {
   scheduledJobs?: import("../scheduling/scheduled-job-store.js").ScheduledJobStore;
   /** Reviewer-only lookup of an uncertain scheduled dispatch; never starts work. */
   reconcileScheduledJob?: (jobId: string) => Promise<import("../scheduling/scheduled-job-store.js").ScheduledJob | undefined>;
+  /** Wake the scheduler timer when an earlier durable deadline is introduced. */
+  onScheduledJobCreated?: () => void;
   /** Durable review-route/handoff store, shared with review workflow. */
   reviewRoutes?: import("../review-handoff/route-store.js").ReviewRouteStore;
   /** Durable, content-addressed external-host qualification evidence. */

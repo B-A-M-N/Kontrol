@@ -101,6 +101,7 @@ import {
 } from "./payload-mount.js";
 import {
   connectBootstrapWithRetry,
+  advanceAppInstanceGeneration,
   bindAppInstanceCallback,
   cancelReconnect,
   reconnectApp,
@@ -254,6 +255,11 @@ function restoreFocusSnapshot(snapshot: FocusSnapshot | undefined): void {
 }
 
 let heartbeatRefreshTimer: ReturnType<typeof setInterval> | undefined;
+// Current-bound handler refs for the replacement App; stale instance closures
+// are never copied directly onto the replacement.
+const toolResultHandlerRef: { current?: (result: unknown) => void } = {};
+const hostContextHandlerRef: { current?: (ctx: unknown) => void } = {};
+const teardownHandlerRef: { current?: () => Promise<unknown> | void } = {};
 
 function syncHeartbeatRefreshTimer(): void {
   const view = selectedWorkSessionId ? workSessionViews.get(selectedWorkSessionId) : undefined;
@@ -305,18 +311,22 @@ setLifecycleHost({
     setHostContext: (v) => { hostContext = v as HostContext | undefined; },
     recreateApp: async () => {
       const previous = app as (App & { close?: () => Promise<void> }) | null;
-      const toolResultHandler = previous?.ontoolresult;
-      const hostContextHandler = previous?.onhostcontextchanged;
-      const teardownHandler = previous?.onteardown;
+      advanceAppInstanceGeneration();
       try { await previous?.close?.(); } catch { /* the failed transport is already being replaced */ }
       const replacement = (uiTestAppFactory?.() ?? new App(
         { name: "kontrol-tool-cards", version: "0.4.0" },
         {},
       )) as App;
       installAppErrorHandler(replacement);
-      replacement.ontoolresult = toolResultHandler;
-      replacement.onhostcontextchanged = hostContextHandler;
-      replacement.onteardown = teardownHandler;
+      replacement.ontoolresult = bindAppInstanceCallback((result) => {
+        toolResultHandlerRef.current?.(result);
+      });
+      replacement.onhostcontextchanged = bindAppInstanceCallback((ctx) => {
+        hostContextHandlerRef.current?.(ctx);
+      });
+      replacement.onteardown = bindAppInstanceCallback(async () => {
+        await teardownHandlerRef.current?.();
+      });
       app = replacement;
     },
     applyHostContext,
@@ -491,7 +501,7 @@ async function bootInternal(): Promise<void> {
     );
   installAppErrorHandler(app);
 
-  app.ontoolresult = (result) => {
+  const handleToolResult = (result: Parameters<NonNullable<App["ontoolresult"]>>[0]) => {
     const structuredContent = getStructuredContent<Partial<ToolResultCard>>(result);
     const metaCard = cardFromMeta(result);
     const card = metaCard
@@ -596,13 +606,18 @@ async function bootInternal(): Promise<void> {
     render();
   };
 
-  app.onhostcontextchanged = (ctx) => {
-    hostContext = { ...hostContext, ...ctx };
+  toolResultHandlerRef.current = handleToolResult;
+  app.ontoolresult = bindAppInstanceCallback(handleToolResult);
+
+  const handleHostContext = (ctx: unknown) => {
+    hostContext = { ...hostContext, ...(ctx as Record<string, unknown>) };
     applyHostContext();
     renderPayloadIfNeeded();
   };
+  hostContextHandlerRef.current = handleHostContext;
+  app.onhostcontextchanged = bindAppInstanceCallback(handleHostContext);
 
-  app.onteardown = bindAppInstanceCallback(async () => {
+  const handleTeardown = async () => {
     cancelReconnect();
     connected = false;
     connectionState = "DISCONNECTED";
@@ -612,7 +627,9 @@ async function bootInternal(): Promise<void> {
     // replacement connection rehydrates before mutations are enabled.
     app = null;
     return {};
-  });
+  };
+  teardownHandlerRef.current = handleTeardown;
+  app.onteardown = bindAppInstanceCallback(handleTeardown);
 
   bootstrapStage = "app-connect";
   await connectBootstrapWithRetry();

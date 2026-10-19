@@ -76,6 +76,7 @@ export function createAcpRuntime(deps: AcpRuntimeDeps): AcpRuntimeHandles {
     scheduledJobs,
   } = bridge;
   let supervisorRuntime: SupervisorRuntime | undefined;
+  let scheduledJobRuntime: import("../scheduling/scheduled-job-runtime.js").ScheduledJobRuntime | undefined;
   const bridgeBase: BridgeConfig = {
     workspaces,
     workSessions,
@@ -93,6 +94,9 @@ export function createAcpRuntime(deps: AcpRuntimeDeps): AcpRuntimeHandles {
     adapterSecret: config.acpAdapterSecret,
     serverConfig: config,
     liveWaiters,
+    scheduledJobs,
+    reconcileScheduledJob: undefined,
+    onScheduledJobCreated: () => scheduledJobRuntime?.wake(),
   };
   const dispatcher = createContinuationDispatcher(bridgeBase);
   dispatcher.start();
@@ -237,7 +241,6 @@ export function createAcpRuntime(deps: AcpRuntimeDeps): AcpRuntimeHandles {
 
   // S02: durable scheduling. The scheduler triggers the canonical ACP dispatch
   // path for due jobs; it never becomes a second supervisor.
-  let scheduledJobRuntime: import("../scheduling/scheduled-job-runtime.js").ScheduledJobRuntime | undefined;
   if (scheduledJobs) {
     if (!database) throw new Error("Scheduled-job runtime requires the server database handle.");
     scheduledJobRuntime = createScheduledJobRuntime({

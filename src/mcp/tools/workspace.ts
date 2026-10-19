@@ -87,6 +87,8 @@ export interface WorkspaceToolsDeps {
   readonly recordPublicationReceipt?: (input: { jobId: string; receipt: Record<string, unknown> }) => void;
   readonly scheduledJobFor?: (workSessionId: string) => {
     id: string;
+    activeDispatchAttemptId?: string;
+    attemptNumber?: number;
     policySnapshotJson: {
       allowedOutputs?: Array<{
         path?: string;
@@ -778,6 +780,105 @@ export function registerWorkspaceTools(
   );
 
   if (config.toolMode !== "codex") {
+  registerAppTool(
+    server,
+    registeredTool(toolNames.stagedWrite),
+    {
+      title: "Staged file write",
+      description: "Publish one signed bounded-write artifact through Kontrol's durable artifact publisher. Callable only by the signed worker bound to an active bounded-write scheduled job.",
+      inputSchema: {
+        workspaceId: z.string().describe("Signed worker's registered workspace identifier."),
+        path: z.string().describe("Exactly one authorized output path, relative to the workspace root."),
+        content: z.string().describe("Complete artifact content."),
+      },
+      outputSchema: resultOutputSchema({
+        contentSha256: z.string().optional(),
+        publicationReceipt: z.record(z.string(), z.unknown()).optional(),
+      }),
+      ...toolWidgetDescriptorMeta(config, "write"),
+      annotations: WRITE_TOOL_ANNOTATIONS,
+    },
+    async ({ workspaceId, ...input }) => {
+      const startedAt = performance.now();
+      if (connectionContext?.authenticatedRole !== "worker" || !connectionContext.workSessionId) {
+        return { content: [textBlock("Forbidden: staged_file_write requires a signed bounded-write worker.")], isError: true };
+      }
+      const workSessionId = connectionContext.workSessionId;
+      const scheduledPolicy = scheduledExecutionPolicy(workSessionId);
+      if (scheduledPolicy?.executionMode !== "bounded_file_write" || scheduledPolicy.workspaceAccess !== "staged_write" || scheduledPolicy.mutate !== true) {
+        return { content: [textBlock("Forbidden: staged_file_write requires an active bounded-write scheduled job.")], isError: true };
+      }
+      const scheduledJob = scheduledJobFor?.(workSessionId);
+      if (!scheduledJob) {
+        return { content: [textBlock("Forbidden: no scheduled job is bound to this worker.")], isError: true };
+      }
+      const authorizedOutput = Array.isArray(scheduledJob.policySnapshotJson.allowedOutputs)
+        ? scheduledJob.policySnapshotJson.allowedOutputs.find((output) => output?.path === input.path)
+        : undefined;
+      if (!authorizedOutput) {
+        return { content: [textBlock(`Forbidden: path "${input.path}" is not an authorized output.`)], isError: true };
+      }
+      const workspace = workspaces.getWorkspace(workspaceId);
+      const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
+      if (bindingErr) return bindingErr;
+      const blocked = await runMutationBarrier(prepareForMutation, workspaceId, toolNames.stagedWrite);
+      if (blocked) return blocked;
+      const resolvedPath = workspaces.resolvePath(workspace, input.path);
+      const publication = await withFileMutationLock<LockedToolMutation<Awaited<ReturnType<typeof writeFileTool>>>>([resolvedPath], async (): Promise<LockedToolMutation<Awaited<ReturnType<typeof writeFileTool>>>> => {
+        const receipt = await publishScheduledArtifact({
+          jobId: scheduledJob.id,
+          workSessionId,
+          workspaceRoot: workspace.root,
+          path: input.path,
+          content: Buffer.from(input.content, "utf8"),
+          attemptId: scheduledJob.activeDispatchAttemptId,
+          attemptNumber: scheduledJob.attemptNumber,
+          output: {
+            path: input.path,
+            operation: (authorizedOutput.operation === "replace" ? "replace" : "create") as "create" | "replace",
+            ...(authorizedOutput.expectedSha256 ? { expectedSha256: authorizedOutput.expectedSha256 } : {}),
+            overwrite: (authorizedOutput.overwrite === "expected_hash" ? "expected_hash" : "deny") as "deny" | "expected_hash",
+            ...(authorizedOutput.expectedPreviousSha256 ? { expectedPreviousSha256: authorizedOutput.expectedPreviousSha256 } : {}),
+          },
+        });
+        recordPublicationReceipt?.({ jobId: scheduledJob.id, receipt: receipt as unknown as Record<string, unknown> });
+        if (receipt.outcome !== "committed") {
+          const response: Awaited<ReturnType<typeof writeFileTool>> = {
+            content: [{ type: "text", text: `Artifact publication ${receipt.outcome}: ${receipt.reason ?? "unknown"}` }],
+            isError: true,
+          };
+          return { response, contentSha256: undefined };
+        }
+        return {
+          response: { content: [{ type: "text", text: `Published ${input.path} (sha256: ${receipt.sha256}, read-back verified).` }], isError: false },
+          contentSha256: receipt.sha256,
+        };
+      });
+      if ("versionConflict" in publication) return publication.versionConflict;
+      const response = publication.response;
+      if (response.isError) {
+        logFailedToolResponse(config, { tool: toolNames.stagedWrite, workspaceId, path: input.path }, response.content, startedAt);
+        return response;
+      }
+      const patch = newFilePatch(input.path, input.content);
+      const summary = { ...countDiffStats(patch), lines: contentLineCount(input.content), characters: input.content.length };
+      logToolCall(config, { tool: toolNames.stagedWrite, workspaceId, path: input.path, success: true, durationMs: Math.round(performance.now() - startedAt) });
+      trackToolEvent(workspaceId, toolNames.stagedWrite, input, response, startedAt);
+      return {
+        ...response,
+        _meta: {
+          tool: toolNames.stagedWrite,
+          card: { workspaceId, path: input.path, summary: { ...summary, contentSha256: publication.contentSha256 } },
+        },
+        structuredContent: {
+          tool: toolNames.stagedWrite,
+          result: contentText(response.content),
+          contentSha256: publication.contentSha256,
+        },
+      };
+    },
+  );
+
   registerAppTool(
     server,
     registeredTool(toolNames.write),

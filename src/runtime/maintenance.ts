@@ -40,10 +40,12 @@ export interface MaintenanceDeps {
   };
   reviewCheckpoints: Pick<ReviewCheckpointManager, "getSnapshotStore">;
   managedWorktreeGc?: () => Promise<{ removed: number; retained: number; failed: number }>;
+  /** Prune unreferenced, completed migration backups after retention. */
+  pruneDeploymentBackups?: () => string[];
 }
 
 export function createMaintenanceCoordinator(deps: MaintenanceDeps) {
-  const { config, db, workSessions, approvalRequests, eventStore, mutationReceipts, reviewCheckpoints, managedWorktreeGc } = deps;
+  const { config, db, workSessions, approvalRequests, eventStore, mutationReceipts, reviewCheckpoints, managedWorktreeGc, pruneDeploymentBackups } = deps;
   const reportMaintenanceFailure = (scope: string, error: unknown, fields: Record<string, unknown> = {}) => {
     const detail = error instanceof Error ? error.message : String(error);
     logEvent(config.logging, "error", "maintenance_failure", { scope, detail, ...fields });
@@ -281,17 +283,19 @@ export function createMaintenanceCoordinator(deps: MaintenanceDeps) {
           if (slice.error) {
             maintenanceStats.lastError = slice.error;
             reportMaintenanceFailure("snapshot_gc", slice.error);
-            // Advance past the failing GC class so a corrupt store cannot wedge
-            // all future maintenance; it is retried next cycle.
-            snapshotGcDone = true;
-            setImmediate(step);
-            return;
           }
           const wasDone = snapshotGcDone;
           snapshotGcDone = !slice.hasMore;
           // Once a full GC pass completes, drop stale session baseline pins so
           // the blobs they rooted become reclaimable.
           if (!wasDone && snapshotGcDone) await pruneStaleSessionBaselines();
+          if (pruneDeploymentBackups) {
+            try {
+              pruneDeploymentBackups();
+            } catch (error) {
+              reportMaintenanceFailure("deployment_backup_prune", error);
+            }
+          }
           setImmediate(step);
           return;
         }
