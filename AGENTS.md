@@ -326,7 +326,9 @@ Current implementation contracts:
 - Scheduled result getters never persist artifacts or otherwise mutate durable
   state. Lifecycle projection records a durable report-finalization obligation
   before persisting the immutable report; bounded reconciliation retries any
-  incomplete finalization after failure or restart.
+  incomplete finalization after failure or restart. Result receipts accept every
+  persisted finalization state: `pending`, `completed`, `no_output`, or
+  `unavailable`.
 - Scheduled verification execution has a durable reviewer-request idempotency
   claim bound to job, work session, submission, review epoch, canonical snapshot,
   policy, commands, and deadline. Identical retries reuse the running or

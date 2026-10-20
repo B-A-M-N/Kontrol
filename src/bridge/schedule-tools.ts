@@ -286,7 +286,7 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
             }),
             verificationBlockers: z.array(z.string()),
             unresolvedBlockers: z.array(z.string()),
-            reportFinalizationStatus: z.enum(["pending", "completed"]).optional(),
+            reportFinalizationStatus: z.enum(["pending", "completed", "no_output", "unavailable"]).optional(),
             reportFinalizationError: z.string().optional(),
             snapshotKind: z.string().optional(),
             snapshotRef: z.string().optional(),

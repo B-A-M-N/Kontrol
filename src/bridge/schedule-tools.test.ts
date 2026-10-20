@@ -713,6 +713,17 @@ try {
   assert.equal(missingAttemptReport.structuredContent.report, "");
   assert.equal(missingAttemptReport.structuredContent.outputPreview, undefined,
     "the previous attempt's outputJson cannot masquerade as the new attempt's audit report");
+  const resultOutputSchema = z.object(definitions.get("get_scheduled_job_result").outputSchema);
+  assert.equal(resultOutputSchema.safeParse(missingAttemptReport.structuredContent).success, true,
+    "a valid no_output report-finalization state remains readable through the declared result schema");
+  for (const reportFinalizationStatus of ["pending", "completed", "no_output", "unavailable"] as const) {
+    const candidate = {
+      ...missingAttemptReport.structuredContent,
+      resultReceipt: { ...missingAttemptReport.structuredContent.resultReceipt, reportFinalizationStatus },
+    };
+    assert.equal(resultOutputSchema.safeParse(candidate).success, true,
+      `report finalization state ${reportFinalizationStatus} is accepted by the result schema`);
+  }
 
   const firstPage = await resultTool({ scheduledJobId: created.id, reportLimit: 100 });
   assert.equal(firstPage.structuredContent.resultReceipt.executionStatus, "completed",
