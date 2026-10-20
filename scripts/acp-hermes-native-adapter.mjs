@@ -1172,6 +1172,7 @@ function spoolRunEvent(runId, event) {
 }
 
 async function deliverEvent(runId, event, run) {
+  let lastRejection;
   for (let attempt = 0; attempt <= 3; attempt += 1) {
     try {
       const response = await fetch(`${KONTROL_ACP_URL}/runs/${runId}/events`, {
@@ -1193,10 +1194,14 @@ async function deliverEvent(runId, event, run) {
       if (response.status === 409 && body?.error?.code === "workspace_lease_lost") {
         return { acknowledged: false, leaseLost: true };
       }
+      lastRejection = {
+        status: response.status,
+        code: typeof body?.error?.code === "string" ? body.error.code : undefined,
+      };
     } catch { /* retry transient delivery failures until the local deadline */ }
     if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
   }
-  return { acknowledged: false, leaseLost: false };
+  return { acknowledged: false, leaseLost: false, ...lastRejection };
 }
 
 async function acknowledgeTerminalDispatchReceipt(event, responseBody) {
@@ -1370,7 +1375,12 @@ function enqueueRunEvent(run, type, payload, { allowFinalizing = false, terminal
         console.error(`[hermes-native] Kontrol rejected the workspace lease for ${run.remoteRunId}`);
         return false;
       }
-      if (!deliveryResult.acknowledged) throw new Error(`event delivery failed: ${type}`);
+      if (!deliveryResult.acknowledged) {
+        const rejection = deliveryResult.status
+          ? ` (Kontrol HTTP ${deliveryResult.status}${deliveryResult.code ? ` ${deliveryResult.code}` : ""})`
+          : "";
+        throw new Error(`event delivery failed: ${type}${rejection}`);
+      }
       if (!terminal) {
         pendingEventSpool.delete(event.event_id);
         await saveEventSpool();

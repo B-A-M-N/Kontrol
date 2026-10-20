@@ -1162,7 +1162,10 @@ function enqueueRunEvent(run, event, terminal = false) {
         return false;
       }
       if (!deliveryResult.acknowledged) {
-        console.error(`[run ${run.remoteRunId}] failed to report ${event.type}`);
+        const rejection = deliveryResult.status
+          ? ` (Kontrol HTTP ${deliveryResult.status}${deliveryResult.code ? ` ${deliveryResult.code}` : ""})`
+          : "";
+        console.error(`[run ${run.remoteRunId}] failed to report ${event.type}${rejection}`);
         return false;
       }
       if (!terminal && !run.syntheticSmoke) {
@@ -1225,6 +1228,7 @@ function spoolRunEvent(runId, event) {
 }
 
 async function deliverEvent(runId, event, run) {
+  let lastRejection;
   for (let attempt = 0; attempt <= 3; attempt += 1) {
     try {
       const response = await fetch(`${KONTROL_ACP_URL}/runs/${runId}/events`, {
@@ -1246,10 +1250,14 @@ async function deliverEvent(runId, event, run) {
       if (response.status === 409 && body?.error?.code === "workspace_lease_lost") {
         return { acknowledged: false, leaseLost: true };
       }
+      lastRejection = {
+        status: response.status,
+        code: typeof body?.error?.code === "string" ? body.error.code : undefined,
+      };
     } catch { /* retry transient delivery failures until the local deadline */ }
     if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
   }
-  return { acknowledged: false, leaseLost: false };
+  return { acknowledged: false, leaseLost: false, ...lastRejection };
 }
 
 async function acknowledgeTerminalDispatchReceipt(event, responseBody) {

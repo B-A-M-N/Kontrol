@@ -469,6 +469,76 @@ try {
   assert.equal(rejectedReceipt.structuredContent.resultReceipt.workerCompleted, false,
     "definitive pre-spawn rejection never becomes worker completion");
   assert.equal(rejectedReceipt.structuredContent.resultReceipt.executionStatus, "dispatch_rejected");
+  assert.equal(rejectedReceipt.structuredContent.resultReceipt.reviewApproved, false);
+  assert.equal(rejectedReceipt.structuredContent.resultReceipt.verificationStatus, "not_performed");
+
+  const interruptedJob = jobs.create({
+    principalId: "principal-a",
+    ownerContextId: "principal:principal-a|transport:A",
+    projectId: "project-a",
+    workspaceRoot: "/tmp/project-a",
+    runAt: new Date(Date.now() - 1_000).toISOString(),
+    instructionJson: { instructions: "Recover a lost adapter acknowledgement." },
+    executionMode: "read_only_audit",
+    policySnapshotJson: { workspaceAccess: "read_only", mutate: false },
+    maxRuntimeMs: 60_000,
+  });
+  jobs.transition({ jobId: interruptedJob.id, expectedRevision: interruptedJob.revision, nextStatus: "due", expectedSourceStatuses: ["pending"] });
+  const interruptedClaim = jobs.claimDispatch({ jobId: interruptedJob.id, expectedRevision: 2, dispatcherInstanceId: "test-scheduler" });
+  jobs.completeDispatch({
+    jobId: interruptedJob.id,
+    dispatchAttemptId: interruptedClaim.attemptId,
+    expectedRevision: interruptedClaim.revision,
+    dispatcherInstanceId: "test-scheduler",
+    outcome: "uncertain",
+    workSessionId: "work-session-interrupted-dispatch",
+    acpRunId: "run-interrupted-dispatch",
+    agentName: "cli-coding-agent",
+    lastError: "Adapter response was lost after start intent.",
+    failureClass: "adapter_acceptance_uncertain",
+    probeResult: { executionMode: "read_only_audit", healthProbe: "healthy" },
+  });
+  const interruptedReceipt = await resultTool({ scheduledJobId: interruptedJob.id });
+  assert.equal(interruptedReceipt.structuredContent.resultReceipt.scheduledJobStatus, "uncertain_dispatch");
+  assert.equal(interruptedReceipt.structuredContent.resultReceipt.dispatchStatus, "uncertain");
+  assert.equal(interruptedReceipt.structuredContent.resultReceipt.executionStatus, "dispatch_uncertain");
+  assert.equal(interruptedReceipt.structuredContent.resultReceipt.workerCompleted, false,
+    "an interrupted acknowledgement is distinct from a started or completed worker");
+  assert.equal(interruptedReceipt.structuredContent.resultReceipt.dispatchAttempts[0]?.failureClass, "adapter_acceptance_uncertain");
+
+  const unavailableSandboxJob = jobs.create({
+    principalId: "principal-a",
+    ownerContextId: "principal:principal-a|transport:A",
+    projectId: "project-a",
+    workspaceRoot: "/tmp/project-a",
+    runAt: new Date(Date.now() - 1_000).toISOString(),
+    instructionJson: { instructions: "Fail closed when read-only confinement is unavailable." },
+    executionMode: "read_only_audit",
+    policySnapshotJson: { workspaceAccess: "read_only", mutate: false },
+    maxRuntimeMs: 60_000,
+  });
+  jobs.transition({ jobId: unavailableSandboxJob.id, expectedRevision: unavailableSandboxJob.revision, nextStatus: "due", expectedSourceStatuses: ["pending"] });
+  const unavailableSandboxClaim = jobs.claimDispatch({ jobId: unavailableSandboxJob.id, expectedRevision: 2, dispatcherInstanceId: "test-scheduler" });
+  jobs.releaseDispatch({
+    jobId: unavailableSandboxJob.id,
+    dispatchAttemptId: unavailableSandboxClaim.attemptId,
+    expectedRevision: unavailableSandboxClaim.revision,
+    dispatcherInstanceId: "test-scheduler",
+    blocker: {
+      kind: "permanent_configuration",
+      reason: "Scheduled read_only_audit preflight failed: required bubblewrap confinement is unavailable.",
+      lastAttemptedAgent: "cli-coding-agent",
+      failureClass: "execution_mode_preflight_failed",
+      probeResult: { executionMode: "read_only_audit", healthProbe: "healthy", confinementAvailable: false },
+    },
+  });
+  const unavailableSandboxReceipt = await resultTool({ scheduledJobId: unavailableSandboxJob.id });
+  assert.equal(unavailableSandboxReceipt.structuredContent.resultReceipt.scheduledJobStatus, "blocked");
+  assert.equal(unavailableSandboxReceipt.structuredContent.resultReceipt.dispatchStatus, "unstarted");
+  assert.equal(unavailableSandboxReceipt.structuredContent.resultReceipt.workerCompleted, false);
+  assert.equal(unavailableSandboxReceipt.structuredContent.resultReceipt.dispatchAttempts[0]?.failureClass, "execution_mode_preflight_failed");
+  assert.equal(unavailableSandboxReceipt.structuredContent.resultReceipt.dispatchAttempts[0]?.probeResult?.confinementAvailable, false);
+  assert.match(unavailableSandboxReceipt.structuredContent.resultReceipt.dispatchAttempts[0]?.failureReason ?? "", /bubblewrap confinement is unavailable/);
 
   const failedExecutionJob = jobs.create({
     principalId: "principal-a",
@@ -543,6 +613,8 @@ try {
   assert.equal(failedExecutionReceipt.structuredContent.resultReceipt.workerExecutionOutcome, "failed");
   assert.equal(failedExecutionReceipt.structuredContent.resultReceipt.executionStatus, "failed",
     "a started worker's unsuccessful exit remains an execution failure");
+  assert.equal(failedExecutionReceipt.structuredContent.resultReceipt.reviewApproved, false);
+  assert.equal(failedExecutionReceipt.structuredContent.resultReceipt.verificationStatus, "not_performed");
   assert.equal(failedExecutionReceipt.structuredContent.resultReceipt.workerFailureEvidence?.exitCode, 1);
   assert.match(failedExecutionReceipt.structuredContent.resultReceipt.workerFailureEvidence?.sanitizedStderrTail ?? "", /No prompt provided/);
 
@@ -961,6 +1033,12 @@ try {
   assert.match(cancelled.structuredContent.cancellationRequestId, /^cancel:/);
   assert.equal(z.object(definitions.get("cancel_scheduled_job").outputSchema).safeParse(cancelled.structuredContent).success, true,
     "durable cancellation identity and remote-state evidence match the published output schema");
+  const cancellationReceipt = await resultTool({ scheduledJobId: activeJob.id });
+  assert.equal(cancellationReceipt.structuredContent.resultReceipt.scheduledJobStatus, "cancellation_requested");
+  assert.equal(cancellationReceipt.structuredContent.resultReceipt.cancellationRequestId, cancelled.structuredContent.cancellationRequestId);
+  assert.equal(cancellationReceipt.structuredContent.resultReceipt.cancellationLastConfirmedState, "unknown");
+  assert.equal(cancellationReceipt.structuredContent.resultReceipt.workerCompleted, false,
+    "a pending cancellation is readable without claiming confirmed worker shutdown");
 
   const reviewStoppedJob = jobs.create({
     principalId: "principal-a",
@@ -994,6 +1072,12 @@ try {
     "human-review cancellation finalizes when the current worker attempt is durably known to have exited");
   assert.equal(reviewStoppedCancellation.structuredContent.lastConfirmedRemoteState, "worker_stopped");
   assert.equal(reviewCancellationFinalizations, 1);
+  const cancelledReceipt = await resultTool({ scheduledJobId: reviewStoppedJob.id });
+  assert.equal(cancelledReceipt.structuredContent.resultReceipt.scheduledJobStatus, "cancelled");
+  assert.equal(cancelledReceipt.structuredContent.resultReceipt.cancellationLastConfirmedState, "worker_stopped");
+  assert.equal(cancelledReceipt.structuredContent.resultReceipt.workerCompleted, false);
+  assert.equal(cancelledReceipt.structuredContent.resultReceipt.reviewApproved, false);
+  assert.equal(cancelledReceipt.structuredContent.resultReceipt.verificationStatus, "not_performed");
   console.log("bridge/schedule-tools.test.ts: all assertions passed");
 } finally {
   jobs.close();

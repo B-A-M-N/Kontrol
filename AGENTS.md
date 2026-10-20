@@ -314,7 +314,8 @@ Current implementation contracts:
   recoverable from a fresh MCP transport for that principal; foreign principals
   cannot read or cancel them. `get_scheduled_job_result` is a read-only receipt
   over existing ACP runs, submissions, and mission evidence, with paged report
-  retrieval and explicit execution, review, verification, and snapshot fields.
+  retrieval and explicit execution, review, verification, snapshot, and
+  cancellation request/remote-confirmation fields.
   Scheduler history and recovery use SQL limits and cursors, bounded dispatch
   concurrency, and diagnostics for due age, uncertain launches, unreconciled
   attempt age, and dispatch throughput.

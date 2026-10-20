@@ -12,12 +12,15 @@ This work implements the attached Kontrol scheduled-job correctness audit. Exist
 - Added forward migrations v89 and v90. V89 repairs the historical `mission_contracts.outcome_evidence` and `review_routes.warning_acknowledged_at` drift. V90 stores per-dispatch failure class, reason, probe result, and retry eligibility.
 - Added a Drizzle-to-SQLite table/column schema contract after migration and to readiness. It reports the expected schema version, missing tables/columns, and deployed build identity; migration fixtures cover v88 repair, data preservation, idempotence, and fail-closed drift.
 - Kept ordinary scheduled execution receipts readable if mission-ledger receipt construction fails. Receipts expose explicit verification/evidence limitations and bounded dispatch-attempt and worker-failure evidence.
+- Added durable cancellation request, prior-state, timing, and last-confirmed-remote-state fields to scheduled result receipts.
 - Persisted sanitized, byte-bounded worker failure evidence on terminal lifecycle events and retrieve it by exact job, attempt, and ACP run identity.
 - Fixed scheduler diagnostics to read `event_log.payload`; made phase failures durable and restart-visible; isolated recoverable lifecycle projection failures from unrelated due dispatch; bounded wakeups and retry deadlines.
 - Added exact execution-mode preflight for registered agents, signed grant policy, sandbox and executable readiness, input contract, and accepted network policy.
 - Added constrained scheduled verification profiles including `python3 -m pytest` and `cargo test`. Report-only work without a submission explicitly reports verification as unavailable/not performed.
 - Updated CRUSH to use a fixed positional instruction while keeping task content on stdin. The adapter integration fixture now checks empty-task rejection, large multiline task delivery without truncation, task secrecy in argv/logs, captured completion output, and unchanged confinement.
 - Updated the Hermes native runner for the refactored upstream public ACP v1 SDK and retained the detached-child, signed-grant, and durable-receipt boundaries.
+- Kept adapter event delivery failures diagnosable with HTTP status and machine error code only; no event payload is logged.
+- Corrected the synthetic scheduler lifecycle fixture to advertise the exact mode and correlated receipt, carry a terminal event through two server restarts, and retrieve the result plus work-session snapshot through a fresh MCP transport. It remains separate from real bundled-adapter and real-model qualification.
 
 ## Verification
 
@@ -25,6 +28,10 @@ Passed:
 
 - `npm run typecheck`
 - `npm run test:adapters` with host permission after sandbox loopback/namespace restrictions blocked the first run
+- `node --import tsx scripts/scheduled-readonly-adapters-e2e.mjs` (CRUSH and Hermes confined adapter fixtures)
+- `node --import tsx scripts/scheduled-job-unattended-e2e.mjs` (scheduled dispatch, terminal report persistence, restart recovery, and fresh-MCP snapshot)
+- `npm run test:schedule-result` and `npx tsx src/scheduling/scheduled-job-dispatch.test.ts` (receipt projections and exact mode preflight)
+- Candidate migration against a disposable clone of the production v88 backup: schema advanced to v90, 16 mission rows preserved, repair columns present, original database untouched
 - CRUSH and Hermes read-only adapter integration, including the large multiline stdin case
 - scheduled result, scheduled dispatch, scheduled-job runtime/restart, verification profile, and migration tests
 - CLI test in isolation and every remaining unit-test command in the declared `test:unit` sequence
@@ -32,7 +39,7 @@ Passed:
 
 The aggregate `npm run test:unit` invocation was interrupted while its serial CLI subprocess test was taking several minutes. The CLI test then passed separately, and all subsequent tests in that script passed in sequence. The earlier portion of the aggregate run passed through OAuth.
 
-The installed CRUSH CLI help confirms that `crush run` accepts a positional prompt and piped stdin. Adapter tests validate the complete task-to-child-to-result path with a controlled CLI fixture; no real model invocation was made.
+The installed CRUSH CLI help confirms that `crush run` accepts a positional prompt and piped stdin. Adapter tests validate the complete task-to-child-to-result path with a controlled CLI fixture. `hermes acp --check` passes against the refactored upstream checkout. No real model invocation was made.
 
 ## Release qualification still required
 
@@ -40,8 +47,8 @@ The audit's final convergence gate is not complete. In particular:
 
 1. Back up the production database and deploy an immutable release through the normal deployment controller so migrations v89/v90 apply. Do not manually edit the live SQLite file.
 2. Run one scheduled read-only audit through a real supported coding agent, then retrieve its result over a fresh MCP connection.
-3. Qualify distinct failed execution, rejection, cancellation, interrupted dispatch, and unavailable-sandbox receipts.
+3. Qualify failed execution, rejection, pending and confirmed cancellation, interrupted dispatch, and unavailable-sandbox receipts through the live scheduler; their result projections now have passing tests.
 4. Run independent verification against the submitted snapshot and prove the source checkout remains unchanged.
 5. Restart Kontrol and verify receipts, evidence, dispatch identity, and diagnostics through a fresh transport.
 
-No production database mutation, deployment, external model request, or push was performed.
+No production database mutation, deployment, external model request, or push was performed. Live deployment and a real Hermes model run remain necessary for final convergence; read-only networking remains disabled unless explicitly authorized.

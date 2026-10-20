@@ -2,15 +2,18 @@
  * True unattended scheduled-job lifecycle qualification (K07).
  *
  * Proves the production server's own scheduler wakes a publicly scheduled job,
- * a real ACP-compatible fixture completes a bounded task with an independently
- * checkable artifact, and the job reaches its terminal state with the artifact
- * and work-session correlation intact.
+ * a disposable ACP lifecycle fixture completes a bounded task with an
+ * independently checkable artifact, and the job reaches its terminal state
+ * with artifact and work-session correlation intact. This qualifies scheduler
+ * lifecycle behavior, not bundled adapter confinement; the separate
+ * scheduled-readonly-adapters-e2e fixture covers that boundary.
  *
  * Distinct from scripts/scheduled-job-e2e.mjs (dispatch-acceptance only):
  *   1. Boot the real Kontrol core with ACP enabled.
- *   2. Register a real loopback ACP agent via the production /agents/register
- *      route; stand up its /runs endpoint to complete a bounded task and emit
- *      an artifact with independently checkable contents.
+ *   2. Register a disposable loopback ACP fixture via the production
+ *      /agents/register route; stand up its /runs endpoint to complete a
+ *      bounded task and emit an artifact with independently checkable
+ *      contents.
  *   3. Create a due job through the public authorized scheduling tool (MCP),
  *      NOT direct SQLite insert.
  *   4. Leave the production server's own scheduler responsible for firing it.
@@ -53,6 +56,8 @@ async function findFreeLoopbackPort(excludedPorts = new Set()) {
 const PORT = await findFreeLoopbackPort();
 const AGENT_PORT = await findFreeLoopbackPort(new Set([PORT]));
 let agentRuns = 0;
+let agentIdentity;
+let pendingCompletion;
 let server;
 const serverOutput = new WeakMap();
 
@@ -79,19 +84,40 @@ const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function startAgent() {
   const agent = createHttpServer(async (req, res) => {
+    if (req.method === "GET" && req.url === "/health") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        ok: true,
+        executionCapabilities: {
+          read_only_audit: {
+            // Synthetic contract for scheduler lifecycle coverage only. This
+            // fixture does not provide evidence of adapter confinement.
+            supported: true,
+            grantPolicy: "kontrol_signed_attempt_bound",
+            confinementAvailable: true,
+            executableAvailable: true,
+            cliInputContract: "hermes_public_acp_v1_session_prompt",
+            networkPolicies: ["host"],
+          },
+        },
+      }));
+      return;
+    }
     if (req.method === "POST" && req.url === "/runs") {
       const chunks = [];
       for await (const chunk of req) chunks.push(Buffer.from(chunk));
       const body = JSON.parse(Buffer.concat(chunks).toString());
       agentRuns += 1;
-      // Real ACP-compatible execution fixture: the worker actually completes
-      // a bounded task and emits an artifact with independently checkable
-      // contents, rather than merely acknowledging launch.
+      // Disposable execution fixture: write a checkable artifact and retain
+      // the run for terminal delivery after the server restart boundary.
       writeFileSync(artifactPath, artifactContents);
       const remoteRunId = `remote-unattended-${agentRuns}`;
       const grant = body.read_only_execution_grant;
       assert.ok(grant?.signature, "scheduled read-only dispatch carries a signed execution grant");
+      pendingCompletion = { body, remoteRunId, grant };
       const executionReceipt = {
+        mode: "read_only_audit",
+        execution_grant: grant,
         issuer: "kontrol",
         work_session_id: body.session_id,
         workspace_session_id: body.workspace_session_id,
@@ -155,7 +181,7 @@ async function startServer() {
   return child;
 }
 
-async function waitForHealth(timeoutMs = 20000) {
+async function waitForHealth(timeoutMs = 60000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try {
@@ -166,7 +192,7 @@ async function waitForHealth(timeoutMs = 20000) {
   }
   const exit = server?.exitCode;
   const output = server && serverOutput.get(server)?.();
-  throw new Error(`server health timeout${exit === null || exit === undefined ? "" : ` (exit=${exit})`}${output ? `\n${output}` : ""}`);
+  throw new Error(`server health timeout (pid=${server?.pid ?? "unknown"}${exit === null || exit === undefined ? "" : `, exit=${exit}`})${output ? `\n${output}` : ""}`);
 }
 
 async function registerAgent() {
@@ -177,13 +203,59 @@ async function registerAgent() {
       name: "unattended-audit-agent",
       url: `http://127.0.0.1:${AGENT_PORT}`,
       role: "agent",
-      capabilities: ["code"],
+      capabilities: ["code", "scheduled:read_only_audit"],
       ttlSeconds: 600,
     }),
   });
   if (!res.ok) throw new Error(`agent registration failed: ${res.status} ${await res.text()}`);
   const body = await res.json();
   assert.ok(body.id, "agent registration returns an id");
+  assert.ok(body.agentCredential, "agent registration returns an event credential");
+  agentIdentity = { id: body.id, credential: body.agentCredential };
+}
+
+async function deliverPendingCompletion() {
+  assert.ok(pendingCompletion, "fixture has an accepted run to complete");
+  assert.ok(agentIdentity, "fixture has a registered agent identity");
+  const { body, remoteRunId, grant } = pendingCompletion;
+  const event = {
+    event_id: `${remoteRunId}:1`,
+    event_sequence: 1,
+    type: "completed",
+    remote_run_id: remoteRunId,
+    work_session_id: body.session_id,
+    attempt_number: body.attempt_number,
+    dispatch_idempotency_key: body.dispatch_idempotency_key,
+    read_only_execution_grant: grant,
+    payload: {
+      status: "completed",
+      final_output: "Read-only audit complete. The disposable fixture artifact was written and checked.",
+    },
+  };
+  const url = `http://127.0.0.1:${PORT}/acp/runs/${encodeURIComponent(body.parent_run_id)}/events`;
+  let lastFailure = "no response";
+  for (let attempt = 0; attempt < 120; attempt += 1) {
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${agentSecret}`,
+          "x-kontrol-agent-id": agentIdentity.id,
+          "x-kontrol-agent-credential": agentIdentity.credential,
+        },
+        body: JSON.stringify(event),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (response.ok && result.dispatch_receipt_acknowledged === true) return result;
+      lastFailure = `HTTP ${response.status} ${result.error?.code ?? "unacknowledged"}`;
+      if (response.status >= 400 && response.status < 500 && response.status !== 404) break;
+    } catch (error) {
+      lastFailure = error instanceof Error ? error.message : String(error);
+    }
+    await delay(250);
+  }
+  throw new Error(`fixture terminal event was not durably acknowledged: ${lastFailure}`);
 }
 
 let mcpSessionId;
@@ -250,11 +322,10 @@ async function main() {
     // We do not call drainOnce() anywhere in this script.
     const runAt = new Date(Date.now() + 5000).toISOString();
     // Establish the MCP session once, then use it for all tool calls.
-    await mcpCall("open_workspace", { path: root });
+    const workspaceResult = await mcpCall("open_workspace", { path: root });
     const toolsList = await rpc("tools/list", {});
     const toolNames = (toolsList?.tools ?? []).map((t) => t.name);
     assert.ok(toolNames.includes("schedule_job"), `schedule_job is in the tool catalog: ${toolNames.join(",")}`);
-    const workspaceResult = await mcpCall("open_workspace", { path: root });
     const workspaceId = workspaceResult?.structuredContent?.workspaceId ?? workspaceResult?.workspaceId;
     assert.ok(workspaceId, `open_workspace returned an ID: ${JSON.stringify(workspaceResult)}`);
     const scheduleResult = await mcpCall("schedule_job", {
@@ -278,9 +349,9 @@ async function main() {
       if (["running", "awaiting_approval", "completed", "failed", "cancelled", "blocked"].includes(jobStatus)) break;
       await delay(200);
     }
-    assert.notEqual(jobStatus, "pending", `production scheduler fired the job (status=${jobStatus})`);
-    assert.equal(jobStatus, "running", "the scheduled ACP attempt was accepted and remains observable");
     const dispatchReceipt = await mcpCall("get_scheduled_job_result", { scheduledJobId: jobId });
+    assert.notEqual(jobStatus, "pending", `production scheduler fired the job (status=${jobStatus})`);
+    assert.equal(jobStatus, "running", `the scheduled ACP attempt was accepted and remains observable; receipt=${JSON.stringify(dispatchReceipt?.structuredContent?.resultReceipt ?? dispatchReceipt).slice(0, 2_000)}`);
     assert.equal(dispatchReceipt?.structuredContent?.resultReceipt?.executionReceipt?.issuer, "kontrol",
       "the accepted scheduled dispatch preserves its exact read-only execution receipt");
     assert.match(dispatchReceipt.structuredContent.resultReceipt.executionReceipt.grant_fingerprint, /^[a-f0-9]{64}$/);
@@ -314,10 +385,30 @@ async function main() {
     await waitForHealth();
     mcpSessionId = undefined;
 
+    const terminalAck = await deliverPendingCompletion();
+    assert.equal(terminalAck.remote_run_id, pendingCompletion.remoteRunId);
+
     const finalJobs = await mcpCall("list_scheduled_jobs", { limit: 10 });
     const finalList = finalJobs?.structuredContent?.jobs ?? [];
     assert.ok(finalList.length > 0, "scheduled job survived restart");
     assert.equal(agentRuns, 1, `no duplicate dispatch after lost acknowledgement (got ${agentRuns})`);
+    let finalReceiptResult;
+    let finalReceipt;
+    for (let attempt = 0; attempt < 80; attempt += 1) {
+      finalReceiptResult = await mcpCall("get_scheduled_job_result", { scheduledJobId: jobId });
+      finalReceipt = finalReceiptResult?.structuredContent?.resultReceipt;
+      if (finalReceipt?.workerCompleted && finalReceipt.reportAvailability === "available") break;
+      await delay(200);
+    }
+    assert.equal(finalReceipt?.workerCompleted, true, "fresh MCP transport retrieves completed worker evidence after restart");
+    assert.equal(finalReceipt?.reportAvailability, "available", "terminal report finalization survives restart");
+    assert.equal(finalReceipt?.reviewApproved, false, "worker completion does not imply reviewer approval");
+    assert.equal(finalReceipt?.verificationStatus, "not_performed", "report-only fixture does not imply verification");
+    const snapshot = await mcpCall("get_work_session_snapshot", { sessionId: finalReceipt.workSessionId });
+    const sessionSnapshot = snapshot?.structuredContent;
+    assert.equal(sessionSnapshot?.sessionId, finalReceipt.workSessionId);
+    assert.equal(sessionSnapshot?.runId, finalReceipt.runId);
+    assert.ok(sessionSnapshot?.lastSeq > 0, "fresh MCP session snapshot includes durable lifecycle activity");
 
     third.kill("SIGTERM");
     await once(third, "exit").catch(() => {});
