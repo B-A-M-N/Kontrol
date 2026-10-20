@@ -397,8 +397,18 @@ try {
   assert.equal(deniedReconciliation.isError, true, "only reviewers can manually reconcile an uncertain dispatch");
   assert.equal(manualReconciliationCalls, 1, "forbidden reconciliation does not contact the adapter receipt lookup");
 
-  const resultTool = handlers.get("get_scheduled_job_result");
-  assert.ok(resultTool, "scheduled result retrieval is registered");
+  const registeredResultTool = handlers.get("get_scheduled_job_result");
+  assert.ok(registeredResultTool, "scheduled result retrieval is registered");
+  const resultOutputSchema = z.object(definitions.get("get_scheduled_job_result").outputSchema);
+  const resultTool = async (input: any) => {
+    const result = await registeredResultTool(input);
+    if (!result.isError) {
+      const parsed = resultOutputSchema.safeParse(result.structuredContent);
+      assert.equal(parsed.success, true,
+        `scheduled result matches its output schema${parsed.success ? "" : `: ${JSON.stringify(parsed.error.issues)}`}`);
+    }
+    return result;
+  };
   const savedResultRole = config.principalRole;
   config.principalRole = "agent";
   const foreignResult = await resultTool({ scheduledJobId: created.id });
@@ -743,7 +753,6 @@ try {
   assert.equal(missingAttemptReport.structuredContent.report, "");
   assert.equal(missingAttemptReport.structuredContent.outputPreview, undefined,
     "the previous attempt's outputJson cannot masquerade as the new attempt's audit report");
-  const resultOutputSchema = z.object(definitions.get("get_scheduled_job_result").outputSchema);
   assert.equal(resultOutputSchema.safeParse(missingAttemptReport.structuredContent).success, true,
     "a valid no_output report-finalization state remains readable through the declared result schema");
   for (const reportFinalizationStatus of ["pending", "completed", "no_output", "unavailable"] as const) {
