@@ -323,6 +323,9 @@ Current implementation contracts:
   evidence bound to the authoritative dispatch attempt. Dispatch acceptance,
   worker start/stop outcome, and reviewer approval remain separate; a rejected
   pre-spawn attempt or a failed worker cannot produce `workerCompleted: true`.
+- Scheduled failure receipts may project pre-structured terminal events only
+  when run, attempt, and dispatch identities match the current attempt. Legacy
+  stderr is redacted and byte-bounded before it is exposed.
 - Scheduled result getters never persist artifacts or otherwise mutate durable
   state. Lifecycle projection records a durable report-finalization obligation
   before persisting the immutable report; bounded reconciliation retries any

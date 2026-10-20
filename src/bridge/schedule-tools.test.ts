@@ -597,15 +597,8 @@ try {
       runId: "run-failed-execution",
       dispatchId: failedExecutionClaim.dispatchId,
       attemptNumber: 1,
-      workerFailureEvidence: {
-        phase: "execution",
-        category: "nonzero_exit",
-        exitCode: 1,
-        sanitizedStderrTail: "ERROR\\nNo prompt provided.",
-        eventId: "failed-execution-terminal",
-        runId: "run-failed-execution",
-        attemptNumber: 1,
-      },
+      exit_code: 1,
+      stderr: "ERROR\\nNo prompt provided.\\nAuthorization: Bearer legacy-secret-value",
     },
   });
   const failedExecutionReceipt = await resultTool({ scheduledJobId: failedExecutionJob.id });
@@ -617,6 +610,32 @@ try {
   assert.equal(failedExecutionReceipt.structuredContent.resultReceipt.verificationStatus, "not_performed");
   assert.equal(failedExecutionReceipt.structuredContent.resultReceipt.workerFailureEvidence?.exitCode, 1);
   assert.match(failedExecutionReceipt.structuredContent.resultReceipt.workerFailureEvidence?.sanitizedStderrTail ?? "", /No prompt provided/);
+  assert.doesNotMatch(failedExecutionReceipt.structuredContent.resultReceipt.workerFailureEvidence?.sanitizedStderrTail ?? "", /legacy-secret-value/,
+    "legacy stderr is redacted before it is exposed by a scheduled result");
+  assert.equal(failedExecutionReceipt.structuredContent.resultReceipt.workerFailureEvidence?.eventId, "failed-execution-diagnostic-event");
+
+  durableFailureEvents.appendEvent({
+    id: "structured-failed-execution-diagnostic-event",
+    type: "agent.run.failed",
+    sessionId: "work-session-failed-execution",
+    payload: {
+      runId: "run-failed-execution",
+      dispatchId: failedExecutionClaim.dispatchId,
+      attemptNumber: 1,
+      workerFailureEvidence: {
+        phase: "execution",
+        category: "nonzero_exit",
+        exitCode: 1,
+        sanitizedStderrTail: "ERROR\\nNo prompt provided.",
+        eventId: "failed-execution-terminal",
+        runId: "run-failed-execution",
+        attemptNumber: 1,
+      },
+    },
+  });
+  const structuredFailureReceipt = await resultTool({ scheduledJobId: failedExecutionJob.id });
+  assert.equal(structuredFailureReceipt.structuredContent.resultReceipt.workerFailureEvidence?.eventId, "failed-execution-terminal",
+    "new structured worker evidence remains preferred when available");
 
   const finalizationJob = jobs.create({
     principalId: "principal-a",

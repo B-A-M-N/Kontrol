@@ -14,7 +14,7 @@ import { createHash } from "node:crypto";
 import { and, asc, desc, eq, gt, isNull, lte, lt, sql } from "drizzle-orm";
 import type { EventStoreEvent } from "../event-log.js";
 import { projectScheduledJobLifecycleEvent } from "./scheduled-job-lifecycle.js";
-import { redactedPreview } from "../redaction.js";
+import { redactString, redactedPreview } from "../redaction.js";
 
 export const schedulingOperation = "schedule_scheduled_job";
 
@@ -267,6 +267,14 @@ export interface WorkerFailureEvidence {
   eventId?: string;
   runId: string;
   attemptNumber: number;
+}
+
+function boundedFailureDiagnosticTail(value: unknown, maxBytes = 4_000): string | undefined {
+  if (typeof value !== "string" || value.length === 0) return undefined;
+  const redacted = redactString(value.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, ""));
+  const bytes = Buffer.from(redacted, "utf8");
+  if (bytes.byteLength <= maxBytes) return redacted;
+  return new TextDecoder().decode(bytes.subarray(-maxBytes)).replace(/^\uFFFD/, "");
 }
 
 export interface ScheduledJobReport {
@@ -1198,16 +1206,37 @@ export function createScheduledJobStore(
     const attempt = getAttempt(jobId);
     if (!job?.workSessionId || !attempt?.acpRunId || !attempt.acpAttemptNumber) return undefined;
     const rows = database.sqlite.prepare(`
-      select type, payload from event_log
+      select id, type, payload from event_log
        where session_id = ? and type in ('agent.run.failed','worker.attempt.failed')
        order by seq desc limit 25
-    `).all(job.workSessionId) as Array<{ type: string; payload: string }>;
+    `).all(job.workSessionId) as Array<{ id: string; type: string; payload: string }>;
     for (const row of rows) {
       try {
         const payload = JSON.parse(row.payload) as Record<string, unknown>;
-        const evidence = payload.workerFailureEvidence as Record<string, unknown> | undefined;
-        if (!evidence || evidence.runId !== attempt.acpRunId || evidence.attemptNumber !== attempt.acpAttemptNumber) continue;
+        if (payload.runId !== attempt.acpRunId || payload.attemptNumber !== attempt.acpAttemptNumber) continue;
         if (attempt.acpDispatchId && payload.dispatchId !== attempt.acpDispatchId) continue;
+        const evidence = payload.workerFailureEvidence as Record<string, unknown> | undefined;
+        if (!evidence) {
+          // Older terminal events stored raw process diagnostics on the durable
+          // work-session event. Project only exact run/attempt matches and
+          // sanitize before exposing them through the scheduled receipt.
+          const exitCode = typeof payload.exit_code === "number" && Number.isInteger(payload.exit_code)
+            ? payload.exit_code
+            : undefined;
+          const signal = boundedFailureDiagnosticTail(payload.signal, 128);
+          const stderr = boundedFailureDiagnosticTail(payload.stderr);
+          return {
+            phase: "execution",
+            category: signal ? "signal_termination" : exitCode !== undefined && exitCode !== 0 ? "nonzero_exit" : "legacy_worker_failure",
+            ...(exitCode !== undefined ? { exitCode } : {}),
+            ...(signal ? { signal } : {}),
+            ...(stderr ? { sanitizedStderrTail: stderr } : {}),
+            eventId: row.id.slice(0, 200),
+            runId: attempt.acpRunId,
+            attemptNumber: attempt.acpAttemptNumber,
+          };
+        }
+        if (evidence.runId !== attempt.acpRunId || evidence.attemptNumber !== attempt.acpAttemptNumber) continue;
         if (evidence.phase !== "execution" && evidence.phase !== "spawn" && evidence.phase !== "admission" && evidence.phase !== "reporting") continue;
         if (typeof evidence.category !== "string") continue;
         return {
