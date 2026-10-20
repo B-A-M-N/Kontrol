@@ -601,6 +601,17 @@ try {
       stderr: "ERROR\\nNo prompt provided.\\nAuthorization: Bearer legacy-secret-value",
     },
   });
+  durableFailureEvents.appendEvent({
+    id: "failed-execution-reason-only-event",
+    type: "agent.run.failed",
+    sessionId: "work-session-failed-execution",
+    payload: {
+      runId: "run-failed-execution",
+      dispatchId: failedExecutionClaim.dispatchId,
+      attemptNumber: 1,
+      reason: "worker process exited",
+    },
+  });
   const failedExecutionReceipt = await resultTool({ scheduledJobId: failedExecutionJob.id });
   assert.equal(failedExecutionReceipt.structuredContent.resultReceipt.workerCompleted, false);
   assert.equal(failedExecutionReceipt.structuredContent.resultReceipt.workerExecutionOutcome, "failed");

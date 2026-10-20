@@ -1225,6 +1225,7 @@ export function createScheduledJobStore(
             : undefined;
           const signal = boundedFailureDiagnosticTail(payload.signal, 128);
           const stderr = boundedFailureDiagnosticTail(payload.stderr);
+          if (exitCode === undefined && !signal && !stderr) continue;
           return {
             phase: "execution",
             category: signal ? "signal_termination" : exitCode !== undefined && exitCode !== 0 ? "nonzero_exit" : "legacy_worker_failure",
