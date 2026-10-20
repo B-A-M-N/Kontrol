@@ -97,6 +97,10 @@ async function startAgent() {
             confinementAvailable: true,
             executableAvailable: true,
             cliInputContract: "hermes_public_acp_v1_session_prompt",
+            // This synthetic adapter fixture advertises the capability bit
+            // required by Hermes preflight. Real toolchain availability is
+            // validated separately by the bundled-adapter integration.
+            toolchainAvailable: true,
             networkPolicies: ["host"],
           },
         },
