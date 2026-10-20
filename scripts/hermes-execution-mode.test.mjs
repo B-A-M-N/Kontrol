@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
 const adapter = readFileSync("scripts/acp-hermes-native-adapter.mjs", "utf8");
+assert.ok(adapter.indexOf("`${HERMES_AGENT_ROOT}/venv/bin/python`") < adapter.indexOf("`${HERMES_AGENT_ROOT}/.venv/bin/python`"),
+  "Hermes prefers its upstream-managed runtime before a checkout-level ambient Python environment");
 assert.match(adapter, /const execution = run\.boundedFileWrite/);
 assert.match(adapter, /if \(run\.readOnlyAudit \|\| run\.boundedFileWrite\)/);
 assert.match(adapter, /networkPolicy: run\.execution\.networkPolicy/);

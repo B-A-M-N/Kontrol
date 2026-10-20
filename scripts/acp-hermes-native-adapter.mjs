@@ -1572,8 +1572,10 @@ function positiveDuration(value, fallback) {
 function resolveHermesPython() {
   const candidates = [
     process.env.HERMES_NATIVE_PYTHON,
-    `${HERMES_AGENT_ROOT}/.venv/bin/python`,
+    // Current upstream keeps its isolated Hermes runtime under `venv`; prefer
+    // it over a checkout-level `.venv`, which may resolve to an ambient Python.
     `${HERMES_AGENT_ROOT}/venv/bin/python`,
+    `${HERMES_AGENT_ROOT}/.venv/bin/python`,
     detectHermesPython(),
     "python3",
   ].filter(Boolean);
