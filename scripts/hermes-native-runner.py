@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import sys
 import threading
 import uuid
@@ -278,6 +279,25 @@ async def main() -> int:
         return 3
 
     env = dict(os.environ)
+    profile_source = env.pop("KONTROL_HERMES_PROFILE_SOURCE", None)
+    if profile_source:
+        hermes_home = Path(env.get("HERMES_HOME") or (Path.home() / ".hermes"))
+        hermes_home.mkdir(parents=True, exist_ok=True)
+        source_root = Path(profile_source)
+        config_source = source_root / "config.yaml"
+        if not config_source.is_file() or config_source.is_symlink():
+            emit({"type": "error", "error": "Hermes sandbox profile is missing config.yaml"})
+            return 4
+        for name in ("config.yaml", "auth.json"):
+            source = source_root / name
+            if source.exists():
+                if source.is_symlink() or not source.is_file():
+                    emit({"type": "error", "error": f"Hermes sandbox profile entry is invalid: {name}"})
+                    return 4
+                destination = hermes_home / name
+                shutil.copyfile(source, destination)
+                destination.chmod(0o600)
+        env["HERMES_HOME"] = str(hermes_home)
     command = spec.get("command") or "hermes"
     args = spec.get("args") or []
     cwd = spec.get("cwd") or os.getcwd()

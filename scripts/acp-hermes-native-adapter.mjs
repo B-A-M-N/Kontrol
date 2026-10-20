@@ -10,7 +10,7 @@ import { spawnSync } from "node:child_process";
 import { createServer } from "node:http";
 import { createHash, randomUUID } from "node:crypto";
 import { basename, delimiter, dirname, isAbsolute, join, resolve } from "node:path";
-import { copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync } from "node:fs";
 import { realpath, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -47,6 +47,11 @@ const HERMES_BIN = process.env.HERMES_BIN || "hermes";
 const HERMES_BIN_EXPLICIT = Boolean(process.env.HERMES_BIN);
 const HERMES_ACP_BIN = process.env.HERMES_ACP_BIN;
 const HERMES_AGENT_ROOT = process.env.HERMES_AGENT_ROOT || detectHermesAgentRoot() || process.cwd();
+// Optional operator-prepared profile containing only config.yaml and auth.json.
+// It is copied into per-run private scratch; the host Hermes home is never mounted.
+const HERMES_SANDBOX_HOME_PROFILE = process.env.KONTROL_HERMES_SANDBOX_HOME
+  ? resolve(process.env.KONTROL_HERMES_SANDBOX_HOME)
+  : undefined;
 const ADAPTER_PORT = Number(process.env.HERMES_ACP_ADAPTER_PORT || process.env.ACP_ADAPTER_PORT || "9911");
 const ADAPTER_HOST = process.env.HERMES_ACP_ADAPTER_HOST || "127.0.0.1";
 const RUNNER = fileURLToPath(new URL("./hermes-native-runner.py", import.meta.url));
@@ -137,6 +142,8 @@ console.log(`[hermes-native] using Hermes ACP entry: ${HERMES_ACP_ENTRY.command}
 
 const PYTHON_BIN = resolveHermesPython();
 let degraded = PYTHON_BIN === null;
+const HERMES_ACP_PYTHON_SITE_ROOT = PYTHON_BIN ? resolveHermesAcpPythonSiteRoot(PYTHON_BIN) : undefined;
+const HERMES_READ_ONLY_TOOLCHAIN_STATUS = getHermesReadOnlyToolchainStatus(PYTHON_BIN, HERMES_ACP_PYTHON_SITE_ROOT);
 const active = new Map();
 const ownedProcesses = new Map();
 const dispatchReceipts = await loadAdapterDispatchReceipts(DISPATCH_RECEIPTS_PATH);
@@ -287,6 +294,8 @@ async function handle(req, res) {
           grantPolicy: "kontrol_signed_attempt_bound",
           confinementAvailable: Boolean(resolveExecutablePath("bwrap") && resolveExecutablePath("prlimit")),
           executableAvailable: Boolean(PYTHON_BIN && resolveExecutablePath(PYTHON_BIN) && resolveExecutablePath(HERMES_ACP_ENTRY.command) && existsSync(RUNNER)),
+          toolchainAvailable: HERMES_READ_ONLY_TOOLCHAIN_STATUS.available,
+          ...(HERMES_READ_ONLY_TOOLCHAIN_STATUS.reason ? { toolchainFailure: HERMES_READ_ONLY_TOOLCHAIN_STATUS.reason } : {}),
           cliInputContract: "hermes_public_acp_v1_session_prompt",
           networkPolicies: ["disabled", "host"],
         },
@@ -295,6 +304,8 @@ async function handle(req, res) {
           grantPolicy: "kontrol_signed_attempt_bound",
           confinementAvailable: Boolean(resolveExecutablePath("bwrap") && resolveExecutablePath("prlimit")),
           executableAvailable: Boolean(PYTHON_BIN && resolveExecutablePath(PYTHON_BIN) && resolveExecutablePath(HERMES_ACP_ENTRY.command) && existsSync(RUNNER)),
+          toolchainAvailable: HERMES_READ_ONLY_TOOLCHAIN_STATUS.available,
+          ...(HERMES_READ_ONLY_TOOLCHAIN_STATUS.reason ? { toolchainFailure: HERMES_READ_ONLY_TOOLCHAIN_STATUS.reason } : {}),
           cliInputContract: "hermes_public_acp_v1_session_prompt",
           networkPolicies: ["disabled", "host"],
         },
@@ -492,16 +503,22 @@ async function handle(req, res) {
       if (!pythonExecutable || !hermesExecutable) {
         throw Object.assign(new Error("Hermes Python or selected ACP executable cannot be resolved for confined execution."), { code: "sandbox_unavailable" });
       }
+      if (!HERMES_READ_ONLY_TOOLCHAIN_STATUS.available || !HERMES_ACP_PYTHON_SITE_ROOT) {
+        throw Object.assign(new Error(`Hermes Python/ACP SDK toolchain is unavailable in the approved read-only environment${HERMES_READ_ONLY_TOOLCHAIN_STATUS.reason ? `: ${HERMES_READ_ONLY_TOOLCHAIN_STATUS.reason}` : "."}`), { code: "sandbox_unavailable" });
+      }
+      if (HERMES_SANDBOX_HOME_PROFILE) {
+        const profileInfo = lstatSync(HERMES_SANDBOX_HOME_PROFILE);
+        const profileRoot = realpathSync(HERMES_SANDBOX_HOME_PROFILE);
+        if (profileInfo.isSymbolicLink() || profileRoot === workspaceRoot || profileRoot.startsWith(`${workspaceRoot}/`)) {
+          throw Object.assign(new Error("Hermes sandbox profile must be a separate operator-prepared directory outside the workspace."), { code: "sandbox_unavailable" });
+        }
+      }
       run.readOnlyRuntimeProjection = prepareHermesReadOnlyRuntime();
       copyFileSync(RUNNER, join(run.readOnlyRuntimeProjection, "hermes-native-runner.py"));
       copyFileSync(join(HERMES_ACP_COMPAT_PATH, "sitecustomize.py"), join(run.readOnlyRuntimeProjection, "sitecustomize.py"));
-      const pythonRuntimeRoot = dirname(dirname(pythonExecutable));
       const hermesSandboxCommand = `/opt/kontrol/hermes-bin/${basename(hermesExecutable)}`;
       const configuredToolchains = (process.env.KONTROL_VERIFY_TOOLCHAIN_PATHS ?? "").split(delimiter).filter(Boolean).map((path) => resolve(path));
       const pythonUsesSystemRuntime = pythonExecutable.startsWith("/usr/") || pythonExecutable.startsWith("/bin/");
-      if (!pythonUsesSystemRuntime && !configuredToolchains.some((path) => pythonRuntimeRoot === path || pythonRuntimeRoot.startsWith(path + "/"))) {
-        throw Object.assign(new Error("Hermes Python runtime must be explicitly approved in KONTROL_VERIFY_TOOLCHAIN_PATHS."), { code: "sandbox_unavailable" });
-      }
       run.readOnlySandbox = buildReadOnlySandboxCommand({
         workspaceRoot,
         executable: pythonExecutable,
@@ -510,12 +527,14 @@ async function handle(req, res) {
         env: {
           ...readOnlyWorkerEnvironment(process.env),
           HERMES_AGENT_ROOT: "/opt/kontrol/hermes-runtime",
-          PYTHONPATH: "/opt/kontrol/hermes-runtime",
+          HERMES_HOME: "/tmp/home/.hermes",
+          PYTHONPATH: hermesReadOnlyPythonPath(),
           PATH: `/opt/kontrol/bin:/opt/kontrol/hermes-bin:/usr/local/bin:/usr/bin:/bin`,
           KONTROL_WORKSPACE_SESSION_ID: run.workspaceSessionId || "",
           KONTROL_WORK_SESSION_ID: run.workSessionId || "",
           KONTROL_PARENT_RUN_ID: run.devRunId || "",
           ...(run.execution.mode === "bounded_file_write" ? { KONTROL_BOUNDED_FILE_WRITE: "1" } : { KONTROL_READ_ONLY_EXECUTION: "1" }),
+          ...(HERMES_SANDBOX_HOME_PROFILE ? { KONTROL_HERMES_PROFILE_SOURCE: "/opt/kontrol/hermes-runtime/hermes-profile" } : {}),
           KONTROL_MCP_URL,
           KONTROL_WORKER_TOKEN: run.workerToken,
           KONTROL_HERMES_NATIVE_INPUT: JSON.stringify({
@@ -531,6 +550,7 @@ async function handle(req, res) {
         networkPolicy: run.execution.networkPolicy,
         bindMounts: [
           { source: run.readOnlyRuntimeProjection, target: "/opt/kontrol/hermes-runtime" },
+          { source: HERMES_ACP_PYTHON_SITE_ROOT, target: "/opt/kontrol/hermes-python-packages" },
         ],
         bindFiles: [
           { source: hermesExecutable, target: hermesSandboxCommand },
@@ -538,6 +558,7 @@ async function handle(req, res) {
       });
       run.readOnlyBindMounts = [
         { source: run.readOnlyRuntimeProjection, target: "/opt/kontrol/hermes-runtime" },
+        { source: HERMES_ACP_PYTHON_SITE_ROOT, target: "/opt/kontrol/hermes-python-packages" },
       ];
       run.readOnlyBindFiles = [{ source: hermesExecutable, target: hermesSandboxCommand }];
       probeReadOnlyExecutionSandbox({
@@ -554,7 +575,7 @@ async function handle(req, res) {
         args: ["-c", "import acp; from acp.core import connect_to_agent; from acp.schema import ClientCapabilities, FileSystemCapabilities, Implementation, TextContentBlock; import acp_adapter.entry; import acp_adapter.server"],
         env: {
           HERMES_AGENT_ROOT: "/opt/kontrol/hermes-runtime",
-          PYTHONPATH: "/opt/kontrol/hermes-runtime",
+          PYTHONPATH: hermesReadOnlyPythonPath(),
           PATH: "/opt/kontrol/bin:/opt/kontrol/hermes-bin:/usr/local/bin:/usr/bin:/bin",
         },
         toolchainPaths: configuredToolchains,
@@ -1510,6 +1531,23 @@ function prepareHermesReadOnlyRuntime() {
       const info = lstatSync(source);
       if (info.isDirectory() && !info.isSymbolicLink()) copyHermesRuntimeTree(source, join(root, name));
     }
+    if (HERMES_SANDBOX_HOME_PROFILE) {
+      const profileRoot = realpathSync(HERMES_SANDBOX_HOME_PROFILE);
+      if (!statSync(profileRoot).isDirectory()) throw new Error("Hermes sandbox profile must be a directory.");
+      const profileNames = readdirSync(profileRoot).sort();
+      if (profileNames.some((name) => !["auth.json", "config.yaml"].includes(name)) || !profileNames.includes("config.yaml")) {
+        throw new Error("Hermes sandbox profile may contain only config.yaml and optional auth.json.");
+      }
+      const projection = join(root, "hermes-profile");
+      mkdirSync(projection, { recursive: true, mode: 0o700 });
+      for (const name of profileNames) {
+        const source = join(profileRoot, name);
+        const info = lstatSync(source);
+        if (!info.isFile() || info.isSymbolicLink()) throw new Error(`Hermes sandbox profile entry is not a regular file: ${name}`);
+        copyFileSync(source, join(projection, name));
+        chmodSync(join(projection, name), 0o600);
+      }
+    }
     if (!existsSync(join(root, "acp_adapter")) || !existsSync(join(root, "agent"))) {
       throw new Error("Hermes read-only runtime projection is missing required ACP or agent modules.");
     }
@@ -1603,6 +1641,65 @@ function detectHermesPython() {
 
 function withHermesPythonPath(existing) {
   return [HERMES_ACP_COMPAT_PATH, HERMES_AGENT_ROOT, existing].filter(Boolean).join(delimiter);
+}
+
+function resolveHermesAcpPythonSiteRoot(pythonExecutable) {
+  const probe = spawnSync(pythonExecutable, [
+    "-c",
+    "import importlib.util, pathlib, sys; spec = importlib.util.find_spec('acp'); path = (spec.origin if spec and spec.origin else next(iter(spec.submodule_search_locations), '') if spec else ''); print(pathlib.Path(path).resolve().parent.parent if path.endswith('.py') else pathlib.Path(path).resolve().parent if path else '')",
+  ], {
+    encoding: "utf8",
+    timeout: 10_000,
+    env: hermesCheckEnvironment(),
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (probe.error || probe.status !== 0) return undefined;
+  const candidate = probe.stdout.trim().split(/\r?\n/).filter(Boolean).at(-1);
+  if (!candidate) return undefined;
+  try {
+    const root = realpathSync(candidate);
+    return statSync(root).isDirectory() && existsSync(join(root, "acp")) ? root : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function configuredHermesToolchains() {
+  return (process.env.KONTROL_VERIFY_TOOLCHAIN_PATHS ?? "").split(delimiter).filter(Boolean).flatMap((path) => {
+    try {
+      const root = realpathSync(resolve(path));
+      return statSync(root).isDirectory() ? [root] : [];
+    } catch {
+      return [];
+    }
+  });
+}
+
+function isSystemHermesPath(path) {
+  return ["/usr", "/bin", "/lib", "/lib64"].some((root) => path === root || path.startsWith(`${root}/`));
+}
+
+function isInsideApprovedHermesToolchain(path, roots) {
+  return roots.some((root) => path === root || path.startsWith(`${root}/`));
+}
+
+function getHermesReadOnlyToolchainStatus(pythonExecutable, acpSiteRoot) {
+  if (!pythonExecutable || !resolveExecutablePath(pythonExecutable)) {
+    return { available: false, reason: "python_runtime_unavailable" };
+  }
+  if (!acpSiteRoot) return { available: false, reason: "acp_python_sdk_unavailable" };
+  const resolvedPython = resolveExecutablePath(pythonExecutable);
+  const pythonRuntimeRoot = dirname(dirname(resolvedPython));
+  const roots = configuredHermesToolchains();
+  const pythonApproved = isSystemHermesPath(pythonRuntimeRoot) || isInsideApprovedHermesToolchain(pythonRuntimeRoot, roots);
+  if (!pythonApproved) return { available: false, reason: "python_runtime_not_allowlisted" };
+  const packagesApproved = isSystemHermesPath(acpSiteRoot) || isInsideApprovedHermesToolchain(acpSiteRoot, roots);
+  if (!packagesApproved) return { available: false, reason: "acp_python_packages_not_allowlisted" };
+  return { available: true };
+}
+
+function hermesReadOnlyPythonPath() {
+  return ["/opt/kontrol/hermes-runtime", "/opt/kontrol/hermes-python-packages"].join(delimiter);
 }
 
 function hasActiveSession(workSessionId) {

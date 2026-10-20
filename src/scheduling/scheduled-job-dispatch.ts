@@ -127,6 +127,9 @@ export async function dispatchScheduledJob(
     ...(modeCapability?.confinementAvailable === true ? [] : ["required bubblewrap/prlimit confinement is unavailable"]),
     ...(modeCapability?.executableAvailable === true ? [] : ["agent executable or adapter runtime is unavailable"]),
     ...(inputContract && acceptedInputContracts.has(inputContract) ? [] : ["agent input contract is missing or unsupported"]),
+    ...(inputContract === "hermes_public_acp_v1_session_prompt" && modeCapability?.toolchainAvailable !== true
+      ? ["Hermes Python runtime or ACP SDK is unavailable in explicitly approved sandbox toolchains"]
+      : []),
     ...(networkPolicies.includes(networkPolicy) ? [] : [`network policy ${networkPolicy} is unsupported`]),
   ];
   const probeResult = {
@@ -137,6 +140,10 @@ export async function dispatchScheduledJob(
     capabilityContractAdvertised: Boolean(modeCapability),
     confinementAvailable: modeCapability?.confinementAvailable === true,
     executableAvailable: modeCapability?.executableAvailable === true,
+    ...(inputContract === "hermes_public_acp_v1_session_prompt" ? {
+      toolchainAvailable: modeCapability?.toolchainAvailable === true,
+      ...(typeof modeCapability?.toolchainFailure === "string" ? { toolchainFailure: modeCapability.toolchainFailure } : {}),
+    } : {}),
     grantPolicy: typeof modeCapability?.grantPolicy === "string" ? modeCapability.grantPolicy : "unavailable",
     cliInputContract: inputContract ?? "unavailable",
     networkPolicy,

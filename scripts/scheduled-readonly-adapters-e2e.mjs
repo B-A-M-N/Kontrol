@@ -107,12 +107,16 @@ async function createBubblewrapWrapper(root) {
 
 async function createHermesFixture(root) {
   const hermesRoot = join(root, "hermes-runtime");
+  const sandboxHome = join(root, "hermes-sandbox-home");
   const toolchainRoot = await mkdtemp(join(repoRoot, ".tmp-kontrol-scheduled-hermes-toolchain-"));
   const pythonRuntime = join(toolchainRoot, ".venv");
   const pythonBin = join(pythonRuntime, "bin", "python");
   const sitePackages = join(pythonRuntime, "lib", "python3.10", "site-packages");
   const fakeHermesBin = join(root, "fake-hermes");
   await mkdir(join(pythonRuntime, "bin"), { recursive: true });
+  await mkdir(sandboxHome, { recursive: true, mode: 0o700 });
+  await writeFile(join(sandboxHome, "config.yaml"), "model:\n  provider: fixture\n  default: fixture-model\n");
+  await writeFile(join(sandboxHome, "auth.json"), '{"provider":"fixture"}\n');
   await mkdir(join(sitePackages, "acp"), { recursive: true });
   for (const packagePath of ["acp_adapter", "agent"]) {
     await mkdir(join(hermesRoot, packagePath), { recursive: true });
@@ -151,7 +155,7 @@ async function createHermesFixture(root) {
   await chmod(pythonBin, 0o700);
   await writeFile(fakeHermesBin, `#!/bin/sh\nif [ "$1" = acp ] && [ "$2" = --check ]; then exit 0; fi\nif [ "$1" = acp ]; then\n${mutationProbeShell()}\nexit 0\nfi\nexit 93\n`);
   await chmod(fakeHermesBin, 0o700);
-  return { hermesRoot, toolchainRoot, pythonRuntime, pythonBin, fakeHermesBin };
+  return { hermesRoot, sandboxHome, toolchainRoot, pythonRuntime, pythonBin, fakeHermesBin };
 }
 
 function makeEnvironment(overrides = {}) {
@@ -275,7 +279,7 @@ async function startAdapter(name, { port, acpUrl, root, wrapper, hermes, stateDi
       });
     });
   }
-  return writeFile(hermes.fakeHermesBin, `#!/bin/sh\nif [ "$1" = acp ] && [ "$2" = --check ]; then exit 0; fi\nif [ "$1" = acp ]; then\nprintf 'worker-started\\n'\n${mutationProbeShell()}\nexit 0\nfi\nexit 93\n`).then(async () => {
+  return writeFile(hermes.fakeHermesBin, `#!/bin/sh\nif [ "$1" = acp ] && [ "$2" = --check ]; then exit 0; fi\nif [ "$1" = acp ]; then\nprintf 'worker-started\\n'\nprintf 'hermes_config=%s;hermes_auth=%s;hermes_home_write=' "$(test -f "$HERMES_HOME/config.yaml" && echo present || echo missing)" "$(test -f "$HERMES_HOME/auth.json" && echo present || echo missing)"\nprintf state > "$HERMES_HOME/session-state" 2>/dev/null; echo $?\nprintf 'hermes_acp_sdk=%s\\n' "$(test -f /opt/kontrol/hermes-python-packages/acp/__init__.py && echo present || echo missing)"\n${mutationProbeShell()}\nexit 0\nfi\nexit 93\n`).then(async () => {
     await chmod(hermes.fakeHermesBin, 0o700);
     const portValue = String(port);
     return startChild(process.execPath, ["scripts/acp-hermes-native-adapter.mjs"], {
@@ -284,6 +288,7 @@ async function startAdapter(name, { port, acpUrl, root, wrapper, hermes, stateDi
         ...commonEnv,
         HERMES_ACP_ADAPTER_PORT: portValue,
         HERMES_AGENT_ROOT: hermes.hermesRoot,
+        KONTROL_HERMES_SANDBOX_HOME: hermes.sandboxHome,
         HERMES_NATIVE_PYTHON: hermes.pythonBin,
         HERMES_BIN: hermes.fakeHermesBin,
         KONTROL_VERIFY_TOOLCHAIN_PATHS: hermes.pythonRuntime,
@@ -323,6 +328,11 @@ async function runAdapterCase(name) {
     });
     const adapterUrl = `http://127.0.0.1:${adapterPort}`;
     await waitForHttp(`${adapterUrl}/health`, `${name} adapter health`, adapter);
+    if (name === "hermes") {
+      const health = await (await fetch(`${adapterUrl}/health`)).json();
+      assert.equal(health.executionCapabilities?.read_only_audit?.toolchainAvailable, true,
+        "Hermes health advertises the explicitly approved ACP SDK and Python runtime");
+    }
 
     const { openDatabase } = await import("../src/db/client.js");
     const { createDispatchOutbox } = await import("../src/dispatch-outbox.js");
@@ -444,6 +454,12 @@ async function runAdapterCase(name) {
       assert.match(output, new RegExp(`${field}=[1-9]`), `${name} denied ${field}: ${output}`);
     }
     assert.match(output, /worker-started/, `${name} launched the bounded worker process`);
+    if (name === "hermes") {
+      assert.match(output, /hermes_config=present;hermes_auth=present;hermes_home_write=0/,
+        "Hermes receives only its projected model profile in writable per-run private home");
+      assert.match(output, /hermes_acp_sdk=present/,
+        "Hermes receives the upstream ACP SDK from its approved read-only Python packages mount");
+    }
     assert.match(output, /scratch_write=0/, `${name} provided isolated scratch storage: ${output}`);
     assert.ok((await readFile(marker, "utf8")).includes("called"), `${name} reached the real Bubblewrap wrapper`);
     assert.equal(sha256(await readFile(join(workspace.workspaceRoot, "source.txt"))), workspace.sourceHash,

@@ -2,6 +2,16 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { dispatchScheduledJob } from "./scheduled-job-dispatch.js";
 
+let modeCapability: Record<string, unknown> = {
+  supported: true,
+  grantPolicy: "kontrol_signed_attempt_bound",
+  confinementAvailable: false,
+  executableAvailable: true,
+  toolchainAvailable: true,
+  cliInputContract: "hermes_public_acp_v1_session_prompt",
+  networkPolicies: ["disabled", "host"],
+};
+
 const server = createServer((request, response) => {
   if (request.url !== "/health") {
     response.writeHead(404).end();
@@ -11,14 +21,7 @@ const server = createServer((request, response) => {
   response.end(JSON.stringify({
     ready: true,
     executionCapabilities: {
-      read_only_audit: {
-        supported: true,
-        grantPolicy: "kontrol_signed_attempt_bound",
-        confinementAvailable: false,
-        executableAvailable: true,
-        cliInputContract: "hermes_public_acp_v1_session_prompt",
-        networkPolicies: ["disabled", "host"],
-      },
+      read_only_audit: modeCapability,
     },
   }));
 });
@@ -74,6 +77,14 @@ try {
   assert.equal(unavailableSandbox.probeResult?.selectedAgent, "hermes-agent");
   assert.match(unavailableSandbox.reason ?? "", /bubblewrap\/prlimit confinement is unavailable/);
   assert.equal(sessionCreations, 0, "a sandbox failure is classified before any scheduled worker can start");
+
+  modeCapability = { ...modeCapability, confinementAvailable: true, toolchainAvailable: false, toolchainFailure: "acp_python_packages_not_allowlisted" };
+  const unavailableToolchain = await dispatchScheduledJob(config, {} as any, job);
+  assert.equal(unavailableToolchain.status, "blocked");
+  assert.equal(unavailableToolchain.failureClass, "execution_mode_preflight_failed");
+  assert.equal(unavailableToolchain.probeResult?.toolchainAvailable, false);
+  assert.match(unavailableToolchain.reason ?? "", /Python runtime or ACP SDK.*approved sandbox toolchains/);
+  assert.equal(sessionCreations, 0, "a missing Hermes toolchain is rejected before scheduled worker creation");
 } finally {
   await new Promise<void>((resolve) => server.close(() => resolve()));
 }
