@@ -9,6 +9,7 @@ import { findBubblewrap } from "../read-only-execution.mjs";
 import type { ScheduledVerificationClaimInput, ScheduledVerificationExecution } from "./scheduled-job-store.js";
 import { verifyScheduledJob } from "./scheduled-verification.js";
 import { scheduledVerificationFingerprints } from "./scheduled-verification-projection.js";
+import { parseScheduledVerificationCommand } from "./verification-profiles.js";
 
 const root = await mkdtemp(join(tmpdir(), "kontrol-scheduled-verification-"));
 const workspaceRoot = join(root, "workspace");
@@ -69,6 +70,22 @@ function createVerificationJobs() {
 }
 
 try {
+  assert.deepEqual(parseScheduledVerificationCommand("python3 -m pytest -q tests/test_routes.py"), {
+    command: "python3 -m pytest -q tests/test_routes.py",
+    executable: "python3",
+    args: ["-m", "pytest", "-q", "tests/test_routes.py"],
+    profile: "python-pytest",
+  }, "Python verification uses the constrained pytest profile");
+  assert.deepEqual(parseScheduledVerificationCommand("cargo test --offline -p athena_core"), {
+    command: "cargo test --offline -p athena_core",
+    executable: "cargo",
+    args: ["test", "--offline", "-p", "athena_core"],
+    profile: "rust-cargo-test",
+  }, "Rust verification uses the constrained cargo test profile");
+  assert.throws(() => parseScheduledVerificationCommand("python3 -c print(1)"), /not permitted/);
+  assert.throws(() => parseScheduledVerificationCommand("cargo run"), /only permits/);
+  assert.throws(() => parseScheduledVerificationCommand("cargo test ../escape"), /may not escape/);
+
   const invalidPolicyFingerprint = scheduledVerificationFingerprints({
     policySnapshotJson: { verificationCommands: ["npm test; touch source.txt"] },
   });
@@ -183,6 +200,7 @@ try {
   assert.equal(completedResult.report.executionPolicy.network, "disabled");
   assert.deepEqual(completedResult.report.executionPolicy.commands, [{
     command: "npm test",
+    profile: "npm-test",
     executable: "npm",
     args: ["test"],
     argumentPolicy: "exact_predeclared_argv_no_shell_path_traversal_denied",

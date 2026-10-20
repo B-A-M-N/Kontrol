@@ -384,8 +384,10 @@ function canMutateWorkSession(config: BridgeConfig, sessionId: string): boolean 
   }
   const session = config.workSessions.get(sessionId);
   const owner = liveOwnerContextId(config);
-  if (config.connectionContext && !owner) return false;
-  if (session?.ownerContextId && owner && session.ownerContextId === owner) return true;
+  if (config.connectionContext || owner) {
+    if (!owner) return false;
+    return !session?.ownerContextId || session.ownerContextId === owner;
+  }
   return isReviewer(config.principalRole);
 }
 

@@ -65,6 +65,8 @@ export interface PeerDispatchResult {
 }
 
 export interface ReadOnlyExecutionReceipt {
+  mode: "read_only_audit" | "bounded_file_write";
+  execution_grant: Record<string, unknown>;
   issuer: "kontrol";
   work_session_id: string;
   workspace_session_id: string;
@@ -79,6 +81,8 @@ export interface ReadOnlyExecutionReceipt {
 }
 
 const readOnlyExecutionReceiptSchema = z.object({
+  mode: z.enum(["read_only_audit", "bounded_file_write"]),
+  execution_grant: z.record(z.string(), z.unknown()),
   issuer: z.literal("kontrol"),
   work_session_id: z.string().min(1),
   workspace_session_id: z.string().min(1),
@@ -92,12 +96,14 @@ const readOnlyExecutionReceiptSchema = z.object({
   confinement: z.enum(["bubblewrap-read-only-workspace-no-network", "bubblewrap-read-only-workspace-host-network"]),
 }).strict();
 
-function correlateReadOnlyExecutionReceipt(
+function correlateExecutionReceipt(
   value: unknown,
   requestBody: Record<string, unknown>,
   remoteRunId: string,
+  grantField: "read_only_execution_grant" | "bounded_file_write_grant",
+  expectedMode: ReadOnlyExecutionReceipt["mode"],
 ): ReadOnlyExecutionReceipt | undefined {
-  const grant = requestBody.read_only_execution_grant;
+  const grant = requestBody[grantField];
   if (!grant || typeof grant !== "object" || Array.isArray(grant)) return undefined;
   const claims = grant as Record<string, unknown>;
   const signature = claims.signature;
@@ -105,6 +111,7 @@ function correlateReadOnlyExecutionReceipt(
   const parsed = readOnlyExecutionReceiptSchema.safeParse(value);
   if (!parsed.success) return undefined;
   const receipt = parsed.data;
+  if (receipt.mode !== expectedMode || JSON.stringify(receipt.execution_grant) !== JSON.stringify(claims)) return undefined;
   const grantFingerprint = createHash("sha256").update(signature).digest("hex");
   if (receipt.work_session_id !== requestBody.session_id
     || receipt.workspace_session_id !== requestBody.workspace_session_id
@@ -210,15 +217,20 @@ export async function dispatchToPeer(params: {
     const dispatchKey = typeof params.body.dispatch_idempotency_key === "string" ? params.body.dispatch_idempotency_key : undefined;
     const duplicateRemoteRunId = typeof parsed?.remote_run_id === "string" ? parsed.remote_run_id
       : typeof parsed?.run_id === "string" ? parsed.run_id : undefined;
-    const duplicateExecutionReceipt = duplicateRemoteRunId
-      ? correlateReadOnlyExecutionReceipt(parsed?.execution_receipt, params.body, duplicateRemoteRunId)
+    const grantField = params.body.read_only_execution_grant !== undefined
+      ? "read_only_execution_grant"
+      : params.body.bounded_file_write_grant !== undefined ? "bounded_file_write_grant" : undefined;
+    const executionMode = grantField === "read_only_execution_grant" ? "read_only_audit"
+      : grantField === "bounded_file_write_grant" ? "bounded_file_write" : undefined;
+    const duplicateExecutionReceipt = duplicateRemoteRunId && grantField && executionMode
+      ? correlateExecutionReceipt(parsed?.execution_receipt, params.body, duplicateRemoteRunId, grantField, executionMode)
       : undefined;
     const duplicateIsCorrelated = response.status === 409
       && code === "duplicate_session"
       && Boolean(duplicateRemoteRunId)
       && (!sessionId || parsed?.work_session_id === sessionId)
       && (!dispatchKey || parsed?.dispatch_idempotency_key === dispatchKey)
-      && (params.body.read_only_execution_grant === undefined || Boolean(duplicateExecutionReceipt));
+      && (grantField === undefined || Boolean(duplicateExecutionReceipt));
     if (duplicateIsCorrelated && parsed) {
       parsed = {
         ...parsed,
@@ -265,11 +277,16 @@ export async function dispatchToPeer(params: {
     && body.dispatch_idempotency_key !== expectedDispatchKey) {
     throw new AcpDispatchError("ACP peer acceptance did not confirm the current dispatch idempotency key; dispatch outcome is uncertain.", "uncertain", response.status);
   }
-  const executionReceipt = params.body.read_only_execution_grant === undefined
-    ? undefined
-    : correlateReadOnlyExecutionReceipt(body.execution_receipt, params.body, body.run_id as string);
-  if (params.body.read_only_execution_grant !== undefined && !executionReceipt) {
-    throw new AcpDispatchError("ACP peer acceptance did not return a correlated read-only execution receipt; dispatch outcome is uncertain.", "uncertain", response.status);
+  const grantField = params.body.read_only_execution_grant !== undefined
+    ? "read_only_execution_grant"
+    : params.body.bounded_file_write_grant !== undefined ? "bounded_file_write_grant" : undefined;
+  const executionMode = grantField === "read_only_execution_grant" ? "read_only_audit"
+    : grantField === "bounded_file_write_grant" ? "bounded_file_write" : undefined;
+  const executionReceipt = grantField && executionMode
+    ? correlateExecutionReceipt(body.execution_receipt, params.body, body.run_id as string, grantField, executionMode)
+    : undefined;
+  if (grantField && !executionReceipt) {
+    throw new AcpDispatchError("ACP peer acceptance did not return a correlated signed execution receipt; dispatch outcome is uncertain.", "uncertain", response.status);
   }
   if (executionReceipt) body.execution_receipt = executionReceipt;
   if (body.status === "accepted" || body.status === "starting") body.status = "running";
@@ -289,6 +306,8 @@ export async function lookupPeerDispatch(params: {
   adapterSecret?: string;
   dispatchIdempotencyKey: string;
   requireExecutionReceipt?: boolean;
+  expectedExecutionMode?: ReadOnlyExecutionReceipt["mode"];
+  expectedNetworkPolicy?: "disabled" | "host";
   expectedReceipt?: {
     workSessionId?: string;
     workspaceSessionId?: string;
@@ -321,6 +340,8 @@ export async function lookupPeerDispatch(params: {
     if (body.execution_receipt !== undefined && (!executionReceipt
       || executionReceipt.remote_run_id !== remoteRunId
       || executionReceipt.dispatch_idempotency_key !== params.dispatchIdempotencyKey
+      || (params.expectedExecutionMode !== undefined && executionReceipt.mode !== params.expectedExecutionMode)
+      || (params.expectedNetworkPolicy !== undefined && executionReceipt.network_policy !== params.expectedNetworkPolicy)
       || (params.expectedReceipt?.workSessionId !== undefined && executionReceipt.work_session_id !== params.expectedReceipt.workSessionId)
       || (params.expectedReceipt?.workspaceSessionId !== undefined && executionReceipt.workspace_session_id !== params.expectedReceipt.workspaceSessionId)
       || (params.expectedReceipt?.parentRunId !== undefined && executionReceipt.parent_run_id !== params.expectedReceipt.parentRunId)
@@ -342,6 +363,7 @@ export interface AgentProbeResult {
   status: number;
   error?: string;
   note?: string;
+  executionCapabilities?: Record<string, unknown>;
 }
 
 export async function probeAgent(url: string, sharedSecret?: string): Promise<AgentProbeResult> {
@@ -360,7 +382,17 @@ export async function probeAgent(url: string, sharedSecret?: string): Promise<Ag
       headers,
       signal: AbortSignal.timeout(3000),
     });
-    if (health.ok) return { healthy: true, status: health.status, note: "/health" };
+    if (health.ok) {
+      let executionCapabilities: Record<string, unknown> | undefined;
+      try {
+        const payload: unknown = await health.clone().json();
+        if (payload && typeof payload === "object" && !Array.isArray(payload)) {
+          const value = (payload as Record<string, unknown>).executionCapabilities;
+          if (value && typeof value === "object" && !Array.isArray(value)) executionCapabilities = value as Record<string, unknown>;
+        }
+      } catch { /* a generic ACP health body carries no mode-specific capability contract */ }
+      return { healthy: true, status: health.status, note: "/health", ...(executionCapabilities ? { executionCapabilities } : {}) };
+    }
     if (health.status !== 404 && health.status !== 405) {
       return { healthy: false, status: health.status };
     }
@@ -562,6 +594,12 @@ export async function callRemoteAgent(
     workspaceLeaseExpiresAt?: string;
     /** Stable logical launch identity for exactly-once adapter dispatch. */
     dispatchIdempotencyKey?: string;
+    /** Persist the allocated ACP identity before an adapter can start its worker. */
+    onAcpAttemptAllocated?: (identity: {
+      runId: string;
+      attemptNumber: number;
+      dispatchIdempotencyKey: string;
+    }) => void;
     /** Server-owned scheduled execution policy forwarded to the adapter. */
     scheduledExecutionPolicy?: {
       executionMode?: string;
@@ -639,6 +677,16 @@ export async function callRemoteAgent(
   const started = Date.now();
   let requestState: "not_sent" | "in_flight" | "accepted" = "not_sent";
   try {
+    if (params.scheduledExecutionPolicy?.executionMode === "bounded_file_write") {
+      if (!params.workSessionId || !params.onAcpAttemptAllocated) {
+        throw new Error("bounded_file_write_attempt_binding_unavailable");
+      }
+      params.onAcpAttemptAllocated({
+        runId: run.runId,
+        attemptNumber,
+        dispatchIdempotencyKey,
+      });
+    }
     // Resolve the workspace root for the dispatch so the adapter can spawn
     // CRUSH in the correct repository, not in the Kontrol directory.
     const workspace = params.workspaceSessionId
@@ -721,8 +769,13 @@ export async function callRemoteAgent(
         attemptNumber,
         dispatchIdempotencyKey,
         allowedOutputs: params.scheduledExecutionPolicy.allowedOutputs,
+        networkPolicy: config.readOnlyExecutionNetworkPolicy ?? "disabled",
         ttlMs: params.scheduledExecutionPolicy.executionGrantTtlMs,
       }, config.adapterSecret);
+      // The top-level echo is part of the canonical dispatch request. The
+      // adapter verifies it against the signed grant before selecting its
+      // bubblewrap network namespace.
+      body.execution_network_policy = config.readOnlyExecutionNetworkPolicy ?? "disabled";
     }
 
     if (params.webhookUrl) {
@@ -757,6 +810,37 @@ export async function callRemoteAgent(
     config.agentRegistry.updateDispatchAttempt(dispatchIdempotencyKey, { status: "accepted", remoteRunId });
     const errorMessage = result.error?.message;
 
+    // A scheduled bounded-write run is an async logical execution. An adapter may
+    // synchronously report a provisional terminal result before its worker has
+    // published artifacts or delivered lifecycle events. Preserve the logical
+    // run/session so publication remains authorized; final terminal evidence is
+    // observed through the durable lifecycle event route.
+    if (useAsync && params.fireAndForget && params.scheduledExecutionPolicy?.executionMode === "bounded_file_write" &&
+      ["completed", "failed", "cancelled"].includes(String(result.status))) {
+      const currentRun = config.agentRegistry.getRun(run.runId);
+      const runStillDispatchable =
+        currentRun?.status === expectedDispatchStatus &&
+        currentRun.attemptNumber === attemptNumber;
+      if (!runStillDispatchable) {
+        throw new Error("Run changed before provisional bounded-write acceptance could be recorded.");
+      }
+      config.agentRegistry.updateRun(run.runId, {
+        status: "running",
+        remoteRunId,
+        attemptNumber,
+        lastHeartbeatAt: new Date().toISOString(),
+      });
+      return {
+        runId: run.runId,
+        remoteRunId,
+        attemptNumber,
+        agentName: params.agentName,
+        status: "running",
+        output: "Agent accepted the task and is working. Observe via await_work_session_events or get_work_session.",
+        workSessionId: params.workSessionId,
+        ...(dispatched.executionReceipt ? { executionReceipt: dispatched.executionReceipt } : {}),
+      };
+    }
     if (useAsync && ["completed", "failed", "cancelled"].includes(String(result.status))) {
       const outputText = Array.isArray(result.output)
         ? result.output.flatMap((m) => m.parts?.map((p) => p.content ?? "").filter(Boolean) ?? []).join("\n")

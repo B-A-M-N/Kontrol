@@ -17,6 +17,7 @@ const GRANT_FIELDS = Object.freeze([
   "attemptNumber",
   "dispatchIdempotencyKey",
   "allowedOutputs",
+  "networkPolicy",
   "issuedAt",
   "expiresAt",
 ]);
@@ -82,6 +83,7 @@ export function createBoundedFileWriteGrant(input, secret, now = Date.now()) {
     attemptNumber: input.attemptNumber,
     dispatchIdempotencyKey: input.dispatchIdempotencyKey,
     allowedOutputs,
+    networkPolicy: input.networkPolicy,
     issuedAt: now,
     expiresAt: now + ttlMs,
   };
@@ -94,6 +96,7 @@ export function createBoundedFileWriteGrant(input, secret, now = Date.now()) {
     || !Number.isSafeInteger(payload.attemptNumber)
     || payload.attemptNumber < 1
     || !nonempty(payload.dispatchIdempotencyKey)
+    || (payload.networkPolicy !== "disabled" && payload.networkPolicy !== "host")
   ) throw new Error("bounded_file_write_grant_claims_invalid");
   return { ...payload, signature: signatureFor(payload, secret) };
 }
@@ -103,6 +106,7 @@ export function verifyBoundedFileWriteGrant(grant, secret, expected, now = Date.
   if (GRANT_FIELDS.some((field) => !(field in grant))) return false;
   if (Object.keys(grant).some((field) => field !== "signature" && !GRANT_FIELDS.includes(field))) return false;
   if (grant.version !== GRANT_VERSION || grant.issuer !== BOUNDED_FILE_WRITE_ISSUER) return false;
+  if (grant.networkPolicy !== "disabled" && grant.networkPolicy !== "host") return false;
   if (!Array.isArray(grant.allowedOutputs) || stableJson(grant.allowedOutputs) !== stableJson(canonicalAllowedOutputs(grant.allowedOutputs))) return false;
   if (!Number.isSafeInteger(grant.issuedAt) || !Number.isSafeInteger(grant.expiresAt)) return false;
   if (grant.issuedAt > now + 30_000 || grant.expiresAt <= now || grant.expiresAt <= grant.issuedAt) return false;
@@ -143,11 +147,13 @@ export function validateBoundedFileWriteDispatchRequest(body, secret, adapterAge
   const valid = allowedOutputs && verifyBoundedFileWriteGrant(grant, secret, {
     workSessionId: body.session_id,
     workspaceSessionId: body.workspace_session_id,
+    workspaceRoot: body.workspace_root,
     agentId: body.agent_id,
     runId: body.parent_run_id || body.run_id,
     attemptNumber: body.attempt_number,
     dispatchIdempotencyKey: body.dispatch_idempotency_key,
     allowedOutputs,
+    networkPolicy: body.execution_network_policy,
   });
   return valid
     ? { boundedWrite: true, valid: true, grant }

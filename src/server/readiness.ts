@@ -15,6 +15,7 @@ export interface ReadinessDeps {
   readonly config: ServerConfig;
   databaseProbe(): void;
   schemaVersion(): number;
+  schemaContract(): { ok: boolean; detail: string };
   executionAdmissionStats(): { active: number; activeWeight: number; availableWeight: number; queued: number; maxInflight: number };
   workspaceRegistryInitialized(): boolean;
   reviewSubsystemInitialized(): boolean;
@@ -30,17 +31,21 @@ export function readinessChecks(deps: ReadinessDeps, req: Request, includeAgents
   let schemaVersion = 0;
   try {
     deps.databaseProbe();
-    // P1 #17: readiness requires the EXACT current schema, not just a
-    // migrated-at-some-point database. A partial/older schema must fail.
-    schemaVersion = deps.schemaVersion();
-    checks.database = { ok: true, detail: "select 1 ok" };
-    checks.schema = {
-      ok: schemaVersion === LATEST_SCHEMA_VERSION,
-      detail: `version=${schemaVersion} expected=${LATEST_SCHEMA_VERSION}`,
-    };
+    checks.database = { ok: true, detail: "bounded query ok" };
   } catch (error) {
     checks.database = { ok: false, detail: error instanceof Error ? error.message : String(error) };
-    checks.schema = { ok: false, detail: "schema query failed" };
+  }
+  try {
+    // A recorded migration version alone cannot detect historical migration
+    // source edits applied after a live database already recorded the version.
+    schemaVersion = deps.schemaVersion();
+    const contract = deps.schemaContract();
+    checks.schema = {
+      ok: schemaVersion === LATEST_SCHEMA_VERSION && contract.ok,
+      detail: `version=${schemaVersion} expected=${LATEST_SCHEMA_VERSION}; ${contract.detail}`,
+    };
+  } catch (error) {
+    checks.schema = { ok: false, detail: error instanceof Error ? error.message : "schema contract query failed" };
   }
   // Full integrity scans are intentionally absent from readiness. They run
   // in a separate worker and are exposed through authenticated diagnostics;

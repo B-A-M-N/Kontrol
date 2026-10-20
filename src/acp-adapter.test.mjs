@@ -61,8 +61,9 @@ try {
   {
     const mod = await loadAdapter({ ACP_AGENT_BIN: "crush" });
     const args = mod.buildAgentArgs("do the thing");
-    await t("crush builds run --debug --quiet argv without prompt leakage", () => {
-      assert.deepEqual(args, ["run", "--debug", "--quiet"]);
+    await t("crush receives a fixed positional instruction without task leakage", () => {
+      assert.deepEqual(args, ["run", "--debug", "--quiet", mod.CRUSH_STDIN_INSTRUCTION]);
+      assert.match(mod.CRUSH_STDIN_INSTRUCTION, /standard input/);
       assert.equal(args.some((arg) => arg.includes("do the thing")), false);
     });
     await t("crush registered agent name is cli-coding-agent", () => {

@@ -80,7 +80,7 @@ import { shutdownMissionVerifiers } from "./mission-verifier.js";
 import { createReviewWorkflowService, type ReviewWorkflowService } from "./review-workflow.js";
 import { databasePath, openDatabase, type DatabaseHandle } from "./db/client.js";
 import { pruneUnreferencedMigrationBackups } from "./db/deployment-backup.js";
-import { LATEST_SCHEMA_VERSION } from "./db/migrations.js";
+import { inspectDatabaseSchemaContract, LATEST_SCHEMA_VERSION } from "./db/migrations.js";
 import { createPolicyEngine, policyCanAsk, type PolicyConfig, type PolicyEngine, type ApprovalScope } from "./policy.js";
 import { createSqliteGrantStore } from "./policy-grants.js";
 import { registerPolicyTools } from "./policy-tools.js";
@@ -99,6 +99,7 @@ import { mcpSessionIdleReason, mcpSessionIdleTtl } from "./mcp-session-policy.js
 import { LogicalContinuityIndex } from "./mcp-logical-continuity.js";
 import { installCachedToolList, toolListCacheDiagnostics } from "./mcp-tool-list-cache.js";
 import { isPathInsideRoot } from "./roots.js";
+import { brandBuildId } from "./branded.js";
 
 
 /**
@@ -309,6 +310,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
   const db: DatabaseHandle = openDatabase(config.stateDir, {
     deploymentId: deploymentContext.deploymentId,
     expectedSchemaVersion: deploymentContext.expectedSchemaVersion,
+    expectedBuildId: deploymentContext.expectedBuildId ?? (buildMeta.buildId ? brandBuildId(buildMeta.buildId) : undefined),
   });
   const qualificationEvidence = new McpQualificationEvidenceJournal(db.sqlite);
   const mutationReceipts = createMutationReceiptStore(db);
@@ -384,6 +386,13 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     schemaVersion: () => {
       const schema = db.sqlite.prepare("select max(version) as v from kontrol_schema_migrations").get() as { v?: number } | undefined;
       return Number(schema?.v ?? 0);
+    },
+    schemaContract: () => {
+      const contract = inspectDatabaseSchemaContract(db.sqlite, { deployedBuildId: buildMeta.buildId });
+      return {
+        ok: contract.ok,
+        detail: `expectedVersion=${contract.expectedVersion}; deployedBuildId=${contract.deployedBuildId ?? "unknown"}; missing=${JSON.stringify(contract.missing)}`,
+      };
     },
     executionAdmissionStats: () => mcpAdmission.getStats(),
     workspaceRegistryInitialized: () => Boolean(workspaces && workspaceStore),

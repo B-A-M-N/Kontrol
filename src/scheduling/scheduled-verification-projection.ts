@@ -1,9 +1,10 @@
 import { createHash } from "node:crypto";
-import { parseVerificationCommand } from "../mission-verifier.js";
+import { parseScheduledVerificationCommand } from "./verification-profiles.js";
 import type { ServerConfig } from "../config.js";
 import type { ScheduledVerificationExecution } from "./scheduled-job-store.js";
 
-const ALLOWED_EXECUTABLES = ["cargo", "go", "jest", "make", "npm", "pytest", "ruff", "tsc", "vitest"];
+const ALLOWED_EXECUTABLES = ["cargo", "go", "jest", "make", "npm", "pytest", "python3", "ruff", "tsc", "vitest"];
+const ALLOWED_PROFILES = ["python-pytest", "rust-cargo-test", "npm-test", "go-test", "make-test", "vitest-run", "jest-run", "tsc-check", "ruff-check"];
 
 function canonicalJson(value: unknown): string {
   if (value === undefined) return "null";
@@ -21,17 +22,17 @@ export function scheduledVerificationFingerprints(input: {
   policySnapshotJson: Record<string, unknown>;
   serverConfig?: ServerConfig;
 }): {
-  commands: Array<{ command: string; executable: string; args: string[] }>;
+  commands: Array<{ command: string; executable: string; args: string[]; profile: string }>;
   commandFingerprint: string;
   policyFingerprint: string;
   commandPolicyValid: boolean;
 } {
   const declared = input.policySnapshotJson.verificationCommands;
-  let commands: Array<{ command: string; executable: string; args: string[] }> = [];
+  let commands: Array<{ command: string; executable: string; args: string[]; profile: string }> = [];
   let invalidCommandPolicy = false;
   if (Array.isArray(declared) && declared.length <= 5 && declared.every((value) => typeof value === "string")) {
     try {
-      commands = declared.map((command) => ({ command, ...parseVerificationCommand(command) }));
+      commands = declared.map((command) => parseScheduledVerificationCommand(command));
     } catch {
       // Result retrieval must remain available even if an old or manually
       // edited policy contains an invalid command. Verification itself rejects
@@ -41,11 +42,12 @@ export function scheduledVerificationFingerprints(input: {
   }
   const commandFingerprint = sha256(invalidCommandPolicy
     ? { invalidDeclaredCommands: declared }
-    : commands.map(({ command, executable, args }) => ({ command, executable, args })));
+    : commands.map(({ command, executable, args, profile }) => ({ command, executable, args, profile })));
   const policyFingerprint = sha256({
     policySnapshotJson: input.policySnapshotJson,
-    verifierPolicy: "scheduled-read-only-bubblewrap-v2",
+    verifierPolicy: "scheduled-read-only-bubblewrap-profiles-v3",
     allowedExecutables: ALLOWED_EXECUTABLES,
+    allowedProfiles: ALLOWED_PROFILES,
     network: "disabled",
     sandbox: input.serverConfig?.verifySandboxExecutable ?? "platform-default",
     childEnvironmentAllowlist: [...(input.serverConfig?.childEnvironmentAllowlist ?? [])].sort(),

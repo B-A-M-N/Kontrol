@@ -283,4 +283,70 @@ console.log("migration-fixtures: corrupt database fail-closed passed");
 }
 console.log("migration-fixtures: legacy mission fingerprint survives migration passed");
 
+// ── Fixture: historical v64/v69 edits repaired by a forward-only migration ──
+{
+  const sqlite = newSqlite();
+  try {
+    migrateUpTo(sqlite, 88);
+    const now = "2025-10-20T12:00:00.000Z";
+    sqlite.prepare("insert into workspace_sessions (id, root, status, created_at, last_used_at) values (?, ?, 'active', ?, ?)")
+      .run("schema-drift-ws", "/tmp/schema-drift", now, now);
+    sqlite.prepare("insert into work_sessions (id, workspace_session_id, submitted_by, created_at, updated_at) values (?, ?, ?, ?, ?)")
+      .run("schema-drift-session", "schema-drift-ws", "fixture", now, now);
+    sqlite.prepare(`
+      insert into mission_contracts (id, work_session_id, workspace_session_id, objective, desired_outcome, created_at, updated_at)
+      values (?, ?, ?, ?, ?, ?, ?)
+    `).run("schema-drift-mission", "schema-drift-session", "schema-drift-ws", "preserve mission", "preserve data", now, now);
+    sqlite.prepare(`
+      insert into review_routes (id, work_session_id, owner_principal_id, owner_context_id, created_at, updated_at)
+      values (?, ?, ?, ?, ?, ?)
+    `).run("schema-drift-route", "schema-drift-session", "fixture-principal", "fixture-owner", now, now);
+
+    sqlite.exec(`
+      alter table mission_contracts drop column outcome_evidence;
+      alter table review_routes drop column warning_acknowledged_at;
+    `);
+    assert.ok(appliedVersions(sqlite).includes(88), "fixture records all historical migrations through v88");
+    assert.equal((sqlite.prepare("pragma table_info(mission_contracts)").all() as Array<{ name: string }>).some((c) => c.name === "outcome_evidence"), false);
+    assert.equal((sqlite.prepare("pragma table_info(review_routes)").all() as Array<{ name: string }>).some((c) => c.name === "warning_acknowledged_at"), false);
+
+    migrateDatabase(sqlite, { deployedBuildId: "schema-drift-repair-fixture" });
+    assert.ok(appliedVersions(sqlite).includes(89), "forward-only v89 repair is recorded");
+    assert.ok((sqlite.prepare("pragma table_info(mission_contracts)").all() as Array<{ name: string }>).some((c) => c.name === "outcome_evidence"));
+    assert.ok((sqlite.prepare("pragma table_info(review_routes)").all() as Array<{ name: string }>).some((c) => c.name === "warning_acknowledged_at"));
+    assert.deepEqual(
+      sqlite.prepare("select id, objective, desired_outcome from mission_contracts where id = ?").get("schema-drift-mission"),
+      { id: "schema-drift-mission", objective: "preserve mission", desired_outcome: "preserve data" },
+      "mission data remains unchanged by nullable-column repair",
+    );
+    assert.deepEqual(
+      sqlite.prepare("select id, owner_context_id, status from review_routes where id = ?").get("schema-drift-route"),
+      { id: "schema-drift-route", owner_context_id: "fixture-owner", status: "disabled" },
+      "review-route data remains unchanged by nullable-column repair",
+    );
+    migrateDatabase(sqlite, { deployedBuildId: "schema-drift-repair-fixture" });
+    assert.equal(appliedVersions(sqlite).filter((version) => version === 89).length, 1, "rerun is idempotent");
+  } finally {
+    sqlite.close();
+  }
+}
+console.log("migration-fixtures: v88 historical schema drift repaired without data loss");
+
+// ── Fixture: startup rejects drift that appears after a migration is recorded ─
+{
+  const sqlite = newSqlite();
+  try {
+    migrateDatabase(sqlite);
+    sqlite.exec("alter table mission_contracts drop column outcome_evidence");
+    assert.throws(
+      () => migrateDatabase(sqlite, { deployedBuildId: "deliberately-broken-fixture" }),
+      /Database schema contract failed:.*deliberately-broken-fixture.*outcome_evidence/,
+      "a fully recorded migration ledger cannot conceal missing deployed columns",
+    );
+  } finally {
+    sqlite.close();
+  }
+}
+console.log("migration-fixtures: schema contract fails closed on post-migration drift");
+
 console.log("migration-fixtures.test.ts: all assertions passed");

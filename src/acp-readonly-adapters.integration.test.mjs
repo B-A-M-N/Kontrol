@@ -72,7 +72,7 @@ async function requestJson(url, { method = "GET", body, secret = ADAPTER_SECRET 
   return { response, json };
 }
 
-function makeReadOnlyBody({ workspaceRoot, agentId, runId, workSessionId, dispatchKey, grant }) {
+function makeReadOnlyBody({ workspaceRoot, agentId, runId, workSessionId, dispatchKey, grant, taskText = task }) {
   return {
     workspace_root: workspaceRoot,
     workspace_session_id: `workspace-${workSessionId}`,
@@ -87,7 +87,7 @@ function makeReadOnlyBody({ workspaceRoot, agentId, runId, workSessionId, dispat
       mutate: false,
     },
     read_only_execution_grant: grant,
-    input: [{ parts: [{ content: task }] }],
+    input: [{ parts: [{ content: taskText }] }],
   };
 }
 
@@ -237,7 +237,7 @@ async function runCrush(root) {
   const control = await createControlPlane(agentId, events, { root, dispatchKey, runId, attemptNumber: 1 });
   const { wrapper, marker } = await createBubblewrapWrapper(root);
   const crushBin = join(root, "fake-crush");
-  await writeFile(crushBin, `#!/bin/sh\n${mutationProbeShell()}\nexit 0\n`);
+  await writeFile(crushBin, `#!/bin/sh\nprintf '\\n__ARGS_START__\\n'\nprintf '<%s>\\n' "$@"\nprintf '__ARGS_END__\\n'\n${mutationProbeShell()}\nprintf '\\n__STDIN_START__\\n'\ncat\nprintf '\\n__STDIN_END__\\n'\nexit 0\n`);
   await chmod(crushBin, 0o700);
   const adapterPort = await freePort();
   const adapter = spawn(process.execPath, ["scripts/acp-crush-adapter.mjs"], {
@@ -268,8 +268,14 @@ async function runCrush(root) {
       try { return (await fetch(`${baseUrl}/health`)).ok; } catch { return false; }
     }, 10_000).catch((error) => { throw new Error(`${error.message}\n${logs}`); });
     const grant = createGrant({ workspaceRoot: state.workspaceRoot, agentId, runId, workSessionId, dispatchKey });
-    const body = makeReadOnlyBody({ workspaceRoot: state.workspaceRoot, agentId, runId, workSessionId, dispatchKey, grant });
+    const secretPromptValue = "KONTROL_PROMPT_SECRET_MUST_ONLY_APPEAR_ON_STDIN";
+    const largePrompt = `${secretPromptValue}\n${Array.from({ length: 2048 }, (_, index) => `instruction-${String(index).padStart(4, "0")}: verify complete multiline delivery ${"payload-".repeat(4)}`).join("\n")}\nPROMPT_END_MARKER`;
+    const body = makeReadOnlyBody({ workspaceRoot: state.workspaceRoot, agentId, runId, workSessionId, dispatchKey, grant, taskText: largePrompt });
     assert.equal("workspace_lease_nonce" in body, false, "CRUSH read-only dispatch does not require a mutation lease");
+    const emptyTask = await requestJson(`${baseUrl}/runs`, { method: "POST", body: { ...body, input: [] } });
+    assert.equal(emptyTask.response.status, 400, "CRUSH rejects an empty task before accepting dispatch");
+    assert.equal(emptyTask.json.error?.code, "invalid_task");
+    await assert.rejects(readFile(marker), { code: "ENOENT" }, "CRUSH does not start Bubblewrap for an empty task");
     const forged = await requestJson(`${baseUrl}/runs`, { method: "POST", body: { ...body, read_only_execution_grant: { ...grant, signature: "forged" } } });
     assert.equal(forged.response.status, 403, "CRUSH rejects a forged execution grant before sandbox or child launch");
     await assert.rejects(readFile(marker), { code: "ENOENT" }, "CRUSH does not invoke Bubblewrap for a forged grant");
@@ -280,6 +286,14 @@ async function runCrush(root) {
     assert.equal(result.json.dispatch_idempotency_key, dispatchKey);
     assert.ok(result.json.run_id);
     await assertConfinedResult({ adapterName: "CRUSH", state, accepted: result.json, events, outsideFile: state.outsideFile, logs });
+    const completed = events.find((event) => event.type === "completed");
+    const finalOutput = completed?.payload?.final_output;
+    assert.equal(typeof finalOutput, "string", "CRUSH completion includes captured worker output, not only a successful spawn");
+    assert.ok(finalOutput.includes(largePrompt), "the complete large multiline task reached the worker through stdin without truncation");
+    const args = finalOutput.split("__ARGS_START__")[1]?.split("__ARGS_END__")[0] ?? "";
+    assert.match(args, /Execute the complete task supplied on standard input\./, "CRUSH receives its required fixed positional instruction");
+    assert.equal(args.includes(secretPromptValue), false, "sensitive task content is absent from process arguments");
+    assert.equal(logs.includes(secretPromptValue), false, "sensitive task content is absent from routine adapter logs");
     await assertReceiptAcknowledged({ adapterName: "CRUSH", receiptsPath: join(root, "crush-receipts.json"), dispatchKey, remoteRunId: result.json.run_id, control });
     const lookup = await requestJson(`${baseUrl}/runs/by-dispatch-id/${encodeURIComponent(dispatchKey)}`);
     assert.equal(lookup.response.status, 200);
@@ -317,39 +331,34 @@ async function runHermes(root) {
     await mkdir(join(hermesRoot, packagePath), { recursive: true });
     await writeFile(join(hermesRoot, packagePath, "__init__.py"), "# integration fixture\n");
   }
-  await writeFile(join(sitePackages, "acp", "__init__.py"), "async def connect_to_agent(*args, **kwargs):\n    raise RuntimeError('fixture ACP client is provided by the adapter test')\nclass Client:\n    pass\n");
-  await writeFile(join(sitePackages, "acp", "connection.py"), "class StreamDirection:\n    INCOMING = 'incoming'\nclass StreamEvent:\n    pass\n");
-  await writeFile(join(hermesRoot, "acp_adapter", "client.py"), [
-    "import asyncio",
+  await writeFile(join(sitePackages, "acp", "__init__.py"), "# fixture SDK package\n");
+  await writeFile(join(sitePackages, "acp", "meta.py"), "PROTOCOL_VERSION = '1.0'\n");
+  await writeFile(join(sitePackages, "acp", "schema.py"), [
     "from types import SimpleNamespace",
-    "",
-    "class TaskEvent:",
-    "    def __init__(self, success, response_text, error=''):",
-    "        self.success = success",
-    "        self.response_text = response_text",
-    "        self.thought_text = ''",
-    "        self.usage = {}",
-    "        self.stop_reason = 'completed' if success else 'error'",
-    "        self.error = error",
-    "",
+    "class ClientCapabilities:",
+    "    def __init__(self, fs=None): self.fs = fs",
+    "class FileSystemCapabilities:",
+    "    def __init__(self, write_text_file=False): self.write_text_file = write_text_file",
+    "class Implementation:",
+    "    def __init__(self, name, version): self.name, self.version = name, version",
+    "class TextContentBlock:",
+    "    def __init__(self, type, text): self.type, self.text = type, text",
+    ""] .join("\n"));
+  await writeFile(join(sitePackages, "acp", "core.py"), [
+    "from types import SimpleNamespace",
     "class _Connection:",
-    "    def add_observer(self, _observer):",
-    "        return None",
-    "",
-    "class ACPClient:",
-    "    def __init__(self, command, args, cwd, env, on_event, timeout, model):",
-    "        self.command, self.args, self.cwd, self.env, self.timeout = command, args, cwd, env, timeout",
-    "        self._conn = SimpleNamespace(_conn=_Connection())",
-    "    async def __aenter__(self):",
-    "        return self",
-    "    async def __aexit__(self, *_args):",
-    "        return False",
-    "    async def dispatch_task(self, prompt, task_id, timeout, cwd):",
-    "        process = await asyncio.create_subprocess_exec(self.command, *self.args, cwd=cwd, env=self.env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)",
-    "        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)",
-    "        return TaskEvent(process.returncode == 0, stdout.decode(), stderr.decode())",
-    "",
-  ].join("\n"));
+    "    def __init__(self, client, output_stream): self.client, self.output_stream = client, output_stream",
+    "    async def initialize(self, **_kwargs): return None",
+    "    async def new_session(self, **_kwargs): return SimpleNamespace(session_id='fixture-session')",
+    "    async def prompt(self, **_kwargs):",
+    "        text = (await self.output_stream.read()).decode('utf-8', errors='replace')",
+    "        await self.client.session_update('fixture-session', {'sessionUpdate': 'agent_message_chunk', 'content': {'text': text}})",
+    "        return SimpleNamespace(stop_reason='end_turn', usage=None)",
+    "    async def close(self): return None",
+    "def connect_to_agent(client, output_stream, **_kwargs): return _Connection(client, output_stream)",
+    ""] .join("\n"));
+  await writeFile(join(hermesRoot, "acp_adapter", "entry.py"), "# public ACP server module fixture\n");
+  await writeFile(join(hermesRoot, "acp_adapter", "server.py"), "# public ACP server module fixture\n");
   // The Hermes adapter consumes JSONL from its runner, so the fixture emits
   // protocol frames after performing the same confined process probes.
   await writeFile(pythonBin, `#!/bin/sh\nexport PYTHONPATH=${shellQuote(sitePackages)}:"$PYTHONPATH"\nexec /usr/bin/python3 "$@"\n`);

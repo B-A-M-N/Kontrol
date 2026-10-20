@@ -1,7 +1,9 @@
 import type Database from "better-sqlite3";
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
+import { getTableName, isTable } from "drizzle-orm";
 import { DEFAULT_DIRECT_APPROVAL_REATTACH_GRACE_MS } from "../policy-approval-defaults.js";
+import * as drizzleSchema from "./schema.js";
 
 interface Migration {
   version: number;
@@ -98,6 +100,8 @@ const migrations: Migration[] = [
   { version: 86, name: "work-session-principal-identity", up: migrateWorkSessionPrincipalIdentity },
   { version: 87, name: "scheduled-job-publication-receipts", up: migrateScheduledJobPublicationReceipts },
   { version: 88, name: "scheduled-job-reconcile-backoff", up: migrateScheduledJobReconcileBackoff },
+  { version: 89, name: "historical-schema-drift-repair", up: migrateHistoricalSchemaDrift },
+  { version: 90, name: "scheduled-dispatch-attempt-diagnostics", up: migrateScheduledDispatchAttemptDiagnostics },
 ];
 
 function migrateScheduledStateTimesAndVerificationSingleFlight(sqlite: Database.Database): void {
@@ -657,6 +661,73 @@ export const migrationChain = migrations;
 /** Canonical current schema version — readiness requires exact equality. */
 export const LATEST_SCHEMA_VERSION = migrations[migrations.length - 1]!.version;
 
+export interface DatabaseSchemaContract {
+  ok: boolean;
+  appliedVersion: number;
+  expectedVersion: number;
+  deployedBuildId?: string;
+  expectedTableCount: number;
+  missing: Array<{ table: string; columns?: string[] }>;
+}
+
+/**
+ * Compare every exported Drizzle table and column with the live SQLite schema.
+ * Migration history alone is not proof that historical migration source still
+ * matches what an existing database actually received.
+ */
+export function inspectDatabaseSchemaContract(
+  sqlite: Database.Database,
+  options: { deployedBuildId?: string } = {},
+): DatabaseSchemaContract {
+  let appliedVersion = 0;
+  try {
+    const row = sqlite.prepare("select max(version) as version from kontrol_schema_migrations").get() as { version?: number } | undefined;
+    appliedVersion = Number(row?.version ?? 0);
+  } catch {
+    appliedVersion = 0;
+  }
+
+  const missing: DatabaseSchemaContract["missing"] = [];
+  const columnsSymbol = Symbol.for("drizzle:Columns");
+  const tables = Object.values(drizzleSchema).filter((value) => isTable(value));
+  for (const table of tables) {
+    const tableName = getTableName(table);
+    const expectedColumns = Object.values(
+      (table as unknown as Record<symbol, Record<string, { name: string }>>)[columnsSymbol] ?? {},
+    ).map((column) => column.name);
+    const quotedName = tableName.replaceAll('"', '""');
+    const deployedColumns = new Set(
+      (sqlite.prepare(`pragma table_info("${quotedName}")`).all() as Array<{ name: string }>).map((column) => column.name),
+    );
+    if (deployedColumns.size === 0) {
+      missing.push({ table: tableName, columns: expectedColumns });
+      continue;
+    }
+    const missingColumns = expectedColumns.filter((column) => !deployedColumns.has(column));
+    if (missingColumns.length) missing.push({ table: tableName, columns: missingColumns });
+  }
+
+  return {
+    ok: appliedVersion === LATEST_SCHEMA_VERSION && missing.length === 0,
+    appliedVersion,
+    expectedVersion: LATEST_SCHEMA_VERSION,
+    ...(options.deployedBuildId ? { deployedBuildId: options.deployedBuildId } : {}),
+    expectedTableCount: tables.length,
+    missing,
+  };
+}
+
+export function assertDatabaseSchemaContract(
+  sqlite: Database.Database,
+  options: { deployedBuildId?: string } = {},
+): DatabaseSchemaContract {
+  const contract = inspectDatabaseSchemaContract(sqlite, options);
+  if (!contract.ok) {
+    throw new Error(`Database schema contract failed: ${JSON.stringify(contract)}`);
+  }
+  return contract;
+}
+
 function migrateAgentPerAgentCredential(sqlite: Database.Database): void {
   addColumnIfMissing(sqlite, "agent_registry", "agent_credential_hash", "text");
 }
@@ -1003,7 +1074,7 @@ function migrateWorkspaceLeases(sqlite: Database.Database): void {
   `);
 }
 
-export function migrateDatabase(sqlite: Database.Database): void {
+export function migrateDatabase(sqlite: Database.Database, options: { deployedBuildId?: string } = {}): void {
   const migrate = sqlite.transaction(() => {
     sqlite.exec(`
       create table if not exists kontrol_schema_migrations (
@@ -1036,10 +1107,20 @@ export function migrateDatabase(sqlite: Database.Database): void {
   });
 
   migrate.immediate();
-  // Startup only needs to establish that the migrated connection can execute
-  // a bounded query. Full integrity and foreign-key scans are diagnostics and
-  // run asynchronously after the HTTP server has bound its socket.
   sqlite.prepare("select 1").get();
+  assertDatabaseSchemaContract(sqlite, options);
+}
+
+function migrateHistoricalSchemaDrift(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "mission_contracts", "outcome_evidence", "text");
+  addColumnIfMissing(sqlite, "review_routes", "warning_acknowledged_at", "text");
+}
+
+function migrateScheduledDispatchAttemptDiagnostics(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "scheduled_job_attempts", "dispatch_failure_class", "text");
+  addColumnIfMissing(sqlite, "scheduled_job_attempts", "dispatch_failure_reason", "text");
+  addColumnIfMissing(sqlite, "scheduled_job_attempts", "dispatch_probe_result_json", "text");
+  addColumnIfMissing(sqlite, "scheduled_job_attempts", "next_eligible_at", "text");
 }
 
 function migrateWorkspaceState(sqlite: Database.Database): void {
@@ -2014,7 +2095,7 @@ function migrateExternalCatalogObservationsAndAssociations(sqlite: Database.Data
 
 function addColumnIfMissing(
   sqlite: Database.Database,
-  table: "workspace_sessions" | "work_sessions" | "work_session_submissions" | "work_session_feedback" | "agent_registry" | "continuations" | "acp_runs" | "agent_webhook_queue" | "dispatch_outbox" | "approval_requests" | "mission_evidence" | "event_log" | "supervisor_runs" | "mission_acceptance_criteria" | "mission_review_findings" | "mission_contracts" | "mission_completion_reports" | "scheduled_jobs" | "scheduled_job_attempts",
+  table: "workspace_sessions" | "work_sessions" | "work_session_submissions" | "work_session_feedback" | "agent_registry" | "continuations" | "acp_runs" | "agent_webhook_queue" | "dispatch_outbox" | "approval_requests" | "mission_evidence" | "event_log" | "supervisor_runs" | "mission_acceptance_criteria" | "mission_review_findings" | "mission_contracts" | "mission_completion_reports" | "scheduled_jobs" | "scheduled_job_attempts" | "review_routes",
   column: string,
   definition: string,
 ): void {

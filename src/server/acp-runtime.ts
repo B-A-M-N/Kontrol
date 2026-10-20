@@ -253,6 +253,7 @@ export function createAcpRuntime(deps: AcpRuntimeDeps): AcpRuntimeHandles {
         if (!job) return { status: "failed" as const, reason: `Unknown scheduled job: ${jobId}` };
         const outcome = await dispatchScheduledJob(bridgeBase, scheduledJobs, job, {
           dispatchId: attempt.dispatchId,
+          dispatchAttemptId: attempt.dispatchAttemptId,
         });
         if (outcome.workSessionId) {
           // The server-owned scheduled lifecycle projection consumes events
@@ -267,6 +268,8 @@ export function createAcpRuntime(deps: AcpRuntimeDeps): AcpRuntimeHandles {
           dispatchId: attempt.dispatchId,
           executionReceipt: outcome.executionReceipt,
           reason: outcome.reason,
+          failureClass: outcome.failureClass,
+          probeResult: outcome.probeResult,
         };
       },
       reconcileDispatch: async (input) => {
@@ -277,6 +280,7 @@ export function createAcpRuntime(deps: AcpRuntimeDeps): AcpRuntimeHandles {
         const scheduledJob = scheduledJobs.get(input.jobId);
         const scheduledAttempt = scheduledJobs.getAttempt(input.jobId, input.dispatchAttemptId);
         const readOnlyAudit = scheduledJob?.executionMode === "read_only_audit";
+        const boundedFileWrite = scheduledJob?.executionMode === "bounded_file_write";
         const expectedReceipt = readOnlyAudit ? {
           workSessionId: scheduledJob.workSessionId,
           workspaceSessionId: scheduledJob.projectId,
@@ -325,7 +329,9 @@ export function createAcpRuntime(deps: AcpRuntimeDeps): AcpRuntimeHandles {
           agentUrl: agent.url,
           adapterSecret: config.acpAdapterSecret,
           dispatchIdempotencyKey: input.dispatchId,
-          requireExecutionReceipt: readOnlyAudit,
+          requireExecutionReceipt: readOnlyAudit || boundedFileWrite,
+          expectedExecutionMode: readOnlyAudit ? "read_only_audit" : boundedFileWrite ? "bounded_file_write" : undefined,
+          expectedNetworkPolicy: readOnlyAudit || boundedFileWrite ? config.readOnlyExecutionNetworkPolicy : undefined,
           expectedReceipt,
         });
         if (lookup.status === "found") {

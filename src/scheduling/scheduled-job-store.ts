@@ -14,6 +14,7 @@ import { createHash } from "node:crypto";
 import { and, asc, desc, eq, gt, isNull, lte, lt, sql } from "drizzle-orm";
 import type { EventStoreEvent } from "../event-log.js";
 import { projectScheduledJobLifecycleEvent } from "./scheduled-job-lifecycle.js";
+import { redactedPreview } from "../redaction.js";
 
 export const schedulingOperation = "schedule_scheduled_job";
 
@@ -76,6 +77,8 @@ export interface ScheduledJobStore {
   recordCancellationEvidence(input: { jobId: string; requestId: string; state: "not_dispatched" | "worker_active" | "termination_acknowledged" | "remote_missing" | "worker_stopped" | "worker_cancelled" | "unknown"; lastError?: string }): ScheduledJob;
   finalizeCancellation(input: { jobId: string; requestId: string; lastConfirmedState: "not_dispatched" | "remote_missing" | "worker_stopped" | "worker_cancelled"; reason?: string }): ScheduledJob;
   getAttempt(jobId: string, attemptId?: string): ScheduledJobAttempt | undefined;
+  listDispatchAttempts?(jobId: string, limit?: number): ScheduledDispatchAttemptDiagnostic[];
+  getWorkerFailureEvidence?(jobId: string): WorkerFailureEvidence | undefined;
   persistReport(jobId: string, runId: string, reportText: string): ScheduledJobReport;
   getReport(jobId: string, reportSha256: string): ScheduledJobReport | undefined;
   getReportForAttempt(jobId: string, runId: string, attemptNumber: number): ScheduledJobReport | undefined;
@@ -107,6 +110,8 @@ export interface ScheduledJobStore {
       reason: string;
       nextEligibleAt?: string;
       lastAttemptedAgent?: string;
+      failureClass?: string;
+      probeResult?: Record<string, unknown>;
     };
   }): ScheduledJob;
   retryBlockedJob(input: { jobId: string; expectedRevision?: number }): ScheduledJob;
@@ -125,6 +130,8 @@ export interface ScheduledJobStore {
     executionReceipt?: object;
     agentName?: string;
     lastError?: string;
+    failureClass?: string;
+    probeResult?: Record<string, unknown>;
   }): ScheduledJob;
   /** Resolve an uncertain launch after authoritative run/adapter evidence. */
   resolveDispatch(input: {
@@ -140,9 +147,31 @@ export interface ScheduledJobStore {
     executionReceipt?: object;
     lastError?: string;
   }): ScheduledJob;
-  /** Durable bounded-write artifact publication receipt bound to the active attempt. */
+  /** Bind the newly created logical work session before the worker is launched. */
+  bindWorkSession(input: { jobId: string; dispatchAttemptId: string; workSessionId: string }): ScheduledJob;
+  /** Bind the ACP run/attempt identity before the adapter can start the worker. */
+  bindAcpAttempt(input: {
+    jobId: string;
+    dispatchAttemptId: string;
+    workSessionId: string;
+    dispatchIdempotencyKey: string;
+    runId: string;
+    attemptNumber: number;
+  }): void;
+  /** Durable bounded-write publication intent recorded before destination mutation. */
+  recordPublicationIntent(input: { jobId: string; intent: Record<string, unknown> }): void;
+  /** Durable bounded-write artifact publication receipt bound to its intent. */
   recordReconcileProbe(input: { jobId: string; attemptId: string; evidence: string; now?: string }): void;
   recordPublicationReceipt(input: { jobId: string; receipt: Record<string, unknown> }): void;
+  recordPublicationFailure(input: { jobId: string; receiptId: string; outcome: "rejected" | "conflict"; reason: string }): void;
+  listPendingPublicationIntents(limit?: number): Array<{
+    jobId: string;
+    workSessionId: string;
+    workspaceRoot: string;
+    attemptId: string;
+    attemptNumber: number;
+    intent: Record<string, unknown>;
+  }>;
   /** Atomically project a durable lifecycle event and advance its sequence cursor. */
   projectEvent(event: EventStoreEvent): ScheduledJob | undefined;
   listProjectionTargets(afterJobId?: string, limit?: number): ScheduledJob[];
@@ -166,6 +195,9 @@ export interface ScheduledJob {
   activeDispatchAttemptId?: string;
   /** Server-bound ACP attempt number when the active attempt has started. */
   attemptNumber?: number;
+  /** ACP execution identity exposed only with the active work-session lookup. */
+  acpRunId?: string;
+  dispatchIdempotencyKey?: string;
   lifecycleEventCursor: number;
   cancellationRequestId?: string;
   cancellationPreviousStatus?: string;
@@ -209,6 +241,32 @@ export interface ScheduledJobAttempt {
   acpAttemptNumber?: number;
   acpRemoteRunId?: string;
   outcome?: string;
+}
+
+export interface ScheduledDispatchAttemptDiagnostic {
+  attemptId: string;
+  dispatchId: string;
+  startedAt: string;
+  completedAt?: string;
+  selectedAgent?: string;
+  transportStatus: string;
+  runId?: string;
+  attemptNumber?: number;
+  failureClass?: string;
+  failureReason?: string;
+  probeResult?: Record<string, unknown>;
+  nextEligibleAt?: string;
+}
+
+export interface WorkerFailureEvidence {
+  phase: "admission" | "spawn" | "execution" | "reporting";
+  category: string;
+  exitCode?: number;
+  signal?: string;
+  sanitizedStderrTail?: string;
+  eventId?: string;
+  runId: string;
+  attemptNumber: number;
 }
 
 export interface ScheduledJobReport {
@@ -427,6 +485,8 @@ export function createScheduledJobStore(
     if (row.activeDispatchAttemptId) {
       const attemptRow = database.db.select().from(scheduledJobAttempts).where(eq(scheduledJobAttempts.id, row.activeDispatchAttemptId)).limit(1).all()[0];
       job.attemptNumber = attemptRow?.acpAttemptNumber ?? undefined;
+      job.acpRunId = attemptRow?.acpRunId ?? undefined;
+      job.dispatchIdempotencyKey = attemptRow?.acpDispatchId ?? undefined;
     }
     return job;
   }
@@ -554,6 +614,8 @@ export function createScheduledJobStore(
       reason: string;
       nextEligibleAt?: string;
       lastAttemptedAgent?: string;
+      failureClass?: string;
+      probeResult?: Record<string, unknown>;
     };
   }): ScheduledJob {
     const now = new Date().toISOString();
@@ -573,7 +635,7 @@ export function createScheduledJobStore(
             dispatchNextEligibleAt: input.blocker.kind === "temporary_dependency" ? input.blocker.nextEligibleAt ?? null : null,
             dispatchLastAttemptedAgent: input.blocker.lastAttemptedAgent ?? null,
             dispatchBlockerKind: input.blocker.kind,
-            lastError: input.blocker.reason,
+            lastError: redactedPreview(input.blocker.reason, 1_000),
           } : {}),
           ...(cancellationPending ? { cancellationLastConfirmedState: "not_dispatched" } : {}),
           updatedAt: now,
@@ -587,7 +649,16 @@ export function createScheduledJobStore(
         ))
         .run();
       const attemptUpdate = database.db.update(scheduledJobAttempts)
-        .set({ completedAt: now, transportStatus: "unstarted", outcome: null })
+        .set({
+          completedAt: now,
+          transportStatus: "unstarted",
+          outcome: null,
+          agentName: input.blocker?.lastAttemptedAgent ?? null,
+          dispatchFailureClass: input.blocker?.failureClass ?? input.blocker?.kind ?? "released_unstarted",
+          dispatchFailureReason: redactedPreview(input.blocker?.reason ?? "Dispatch claim was released before a worker started.", 1_000),
+          dispatchProbeResultJson: input.blocker?.probeResult ? JSON.stringify(input.blocker.probeResult).slice(0, 4_000) : null,
+          nextEligibleAt: input.blocker?.nextEligibleAt ?? null,
+        })
         .where(and(
           eq(scheduledJobAttempts.id, input.dispatchAttemptId),
           eq(scheduledJobAttempts.jobId, input.jobId),
@@ -656,6 +727,8 @@ export function createScheduledJobStore(
     executionReceipt?: object;
     agentName?: string;
     lastError?: string;
+    failureClass?: string;
+    probeResult?: Record<string, unknown>;
   }): ScheduledJob {
     const nextStatus = input.outcome === "dispatched" ? "running" : input.outcome === "uncertain" ? "uncertain_dispatch" : "failed";
     const uncertain = input.outcome === "uncertain";
@@ -687,7 +760,7 @@ export function createScheduledJobStore(
           ...(input.agentName ? { dispatchLastAttemptedAgent: input.agentName } : {}),
           dispatchNextEligibleAt: null,
           dispatchBlockerKind: null,
-          lastError: input.lastError ?? null,
+          lastError: input.lastError ? redactedPreview(input.lastError, 1_000) : null,
           updatedAt: now,
           ...stateTimestampFields(effectiveStatus, current.status, now),
         })
@@ -709,6 +782,10 @@ export function createScheduledJobStore(
           acpRemoteRunId: input.acpRemoteRunId ?? null,
           agentName: input.agentName ?? null,
           executionReceiptJson: input.executionReceipt ? JSON.stringify(input.executionReceipt) : null,
+          dispatchFailureClass: input.failureClass ?? (input.outcome === "dispatched" ? "accepted" : `dispatch_${input.outcome}`),
+          dispatchFailureReason: input.outcome === "dispatched" ? null : redactedPreview(input.lastError ?? `Dispatch ${input.outcome}.`, 1_000),
+          dispatchProbeResultJson: input.probeResult ? JSON.stringify(input.probeResult).slice(0, 4_000) : null,
+          nextEligibleAt: null,
         })
         .where(and(
           eq(scheduledJobAttempts.id, input.dispatchAttemptId),
@@ -1114,6 +1191,80 @@ export function createScheduledJobStore(
       acpRemoteRunId: row.acpRemoteRunId ?? undefined,
       outcome: row.outcome ?? undefined,
     } : undefined;
+  }
+
+  function getWorkerFailureEvidence(jobId: string): WorkerFailureEvidence | undefined {
+    const job = database.db.select().from(scheduledJobs).where(eq(scheduledJobs.id, jobId)).limit(1).all()[0];
+    const attempt = getAttempt(jobId);
+    if (!job?.workSessionId || !attempt?.acpRunId || !attempt.acpAttemptNumber) return undefined;
+    const rows = database.sqlite.prepare(`
+      select type, payload from event_log
+       where session_id = ? and type in ('agent.run.failed','worker.attempt.failed')
+       order by seq desc limit 25
+    `).all(job.workSessionId) as Array<{ type: string; payload: string }>;
+    for (const row of rows) {
+      try {
+        const payload = JSON.parse(row.payload) as Record<string, unknown>;
+        const evidence = payload.workerFailureEvidence as Record<string, unknown> | undefined;
+        if (!evidence || evidence.runId !== attempt.acpRunId || evidence.attemptNumber !== attempt.acpAttemptNumber) continue;
+        if (attempt.acpDispatchId && payload.dispatchId !== attempt.acpDispatchId) continue;
+        if (evidence.phase !== "execution" && evidence.phase !== "spawn" && evidence.phase !== "admission" && evidence.phase !== "reporting") continue;
+        if (typeof evidence.category !== "string") continue;
+        return {
+          phase: evidence.phase,
+          category: evidence.category.slice(0, 120),
+          ...(typeof evidence.exitCode === "number" && Number.isInteger(evidence.exitCode) ? { exitCode: evidence.exitCode } : {}),
+          ...(typeof evidence.signal === "string" ? { signal: evidence.signal.slice(0, 128) } : {}),
+          ...(typeof evidence.sanitizedStderrTail === "string" ? { sanitizedStderrTail: evidence.sanitizedStderrTail.slice(-4_000) } : {}),
+          ...(typeof evidence.eventId === "string" ? { eventId: evidence.eventId.slice(0, 200) } : {}),
+          runId: attempt.acpRunId,
+          attemptNumber: attempt.acpAttemptNumber,
+        };
+      } catch { /* malformed historical telemetry is not failure authority */ }
+    }
+    return undefined;
+  }
+
+  function listDispatchAttempts(jobId: string, requestedLimit = 50): ScheduledDispatchAttemptDiagnostic[] {
+    const limit = Math.max(1, Math.min(100, Math.trunc(requestedLimit) || 50));
+    const rows = database.sqlite.prepare(`
+      select id, dispatch_id, started_at, completed_at, agent_name, transport_status,
+             acp_run_id, acp_attempt_number, dispatch_failure_class,
+             dispatch_failure_reason, dispatch_probe_result_json, next_eligible_at
+        from scheduled_job_attempts
+       where job_id = ?
+       order by started_at desc, id desc
+       limit ?
+    `).all(jobId, limit) as Array<{
+      id: string; dispatch_id: string; started_at: string; completed_at: string | null;
+      agent_name: string | null; transport_status: string; acp_run_id: string | null;
+      acp_attempt_number: number | null; dispatch_failure_class: string | null;
+      dispatch_failure_reason: string | null; dispatch_probe_result_json: string | null;
+      next_eligible_at: string | null;
+    }>;
+    return rows.reverse().map((row) => {
+      let probeResult: Record<string, unknown> | undefined;
+      if (row.dispatch_probe_result_json) {
+        try {
+          const parsed: unknown = JSON.parse(row.dispatch_probe_result_json);
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) probeResult = parsed as Record<string, unknown>;
+        } catch { /* corrupt optional preflight data remains unavailable */ }
+      }
+      return {
+        attemptId: row.id,
+        dispatchId: row.dispatch_id,
+        startedAt: row.started_at,
+        ...(row.completed_at ? { completedAt: row.completed_at } : {}),
+        ...(row.agent_name ? { selectedAgent: row.agent_name } : {}),
+        transportStatus: row.transport_status,
+        ...(row.acp_run_id ? { runId: row.acp_run_id } : {}),
+        ...(row.acp_attempt_number ? { attemptNumber: row.acp_attempt_number } : {}),
+        ...(row.dispatch_failure_class ? { failureClass: row.dispatch_failure_class } : {}),
+        ...(row.dispatch_failure_reason ? { failureReason: row.dispatch_failure_reason } : {}),
+        ...(probeResult ? { probeResult } : {}),
+        ...(row.next_eligible_at ? { nextEligibleAt: row.next_eligible_at } : {}),
+      };
+    });
   }
 
   function persistReportWithinTransaction(jobId: string, runId: string, reportText: string, now: string): ScheduledJobReport {
@@ -1564,6 +1715,8 @@ export function createScheduledJobStore(
     recordCancellationEvidence,
     finalizeCancellation,
     getAttempt,
+    listDispatchAttempts,
+    getWorkerFailureEvidence,
     persistReport,
     getReport,
     getReportForAttempt,
@@ -1583,43 +1736,252 @@ export function createScheduledJobStore(
     resolveDispatch,
     projectEvent,
     listProjectionTargets,
+    recordPublicationIntent(input: { jobId: string; intent: Record<string, unknown> }): void {
+      database.sqlite.transaction(() => {
+        const job = database.db.select().from(scheduledJobs).where(eq(scheduledJobs.id, input.jobId)).limit(1).get();
+        if (!job || job.executionMode !== "bounded_file_write" || !job.workSessionId
+          || job.workSessionId !== input.intent.workSessionId) {
+          throw new Error(`Publication intent is not bound to the active bounded-write job ${input.jobId}.`);
+        }
+        const attemptId = job.activeDispatchAttemptId;
+        if (!attemptId || input.intent.attemptId !== attemptId) {
+          throw new Error(`Publication intent is bound to a stale attempt for job ${input.jobId}.`);
+        }
+        const attempt = database.db.select().from(scheduledJobAttempts)
+          .where(and(eq(scheduledJobAttempts.id, attemptId), eq(scheduledJobAttempts.jobId, input.jobId)))
+          .limit(1).get();
+        if (!attempt || attempt.completedAt || attempt.outcome
+          || !Number.isSafeInteger(attempt.acpAttemptNumber)
+          || input.intent.attemptNumber !== attempt.acpAttemptNumber
+          || !attempt.acpRunId || input.intent.runId !== attempt.acpRunId
+          || input.intent.dispatchIdempotencyKey !== attempt.acpDispatchId) {
+          throw new Error(`Publication intent does not match the active ACP identity for ${attemptId}.`);
+        }
+        const path = typeof input.intent.path === "string" ? input.intent.path : undefined;
+        const policy = JSON.parse(job.policySnapshotJson) as { allowedOutputs?: Array<Record<string, unknown>> };
+        const authorized = policy.allowedOutputs?.find((output) => output?.path === path);
+        if (!authorized || authorized.operation !== input.intent.operation
+          || typeof input.intent.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(input.intent.sha256)
+          || (authorized.expectedSha256 !== undefined && authorized.expectedSha256 !== input.intent.sha256)
+          || (authorized.overwrite === "expected_hash" && authorized.expectedPreviousSha256 !== input.intent.expectedPreviousSha256)
+          || (authorized.overwrite === "deny" && input.intent.expectedPreviousSha256 !== undefined)
+          || !Number.isSafeInteger(input.intent.bytes) || Number(input.intent.bytes) < 0
+          || typeof input.intent.receiptId !== "string" || !input.intent.receiptId
+          || input.intent.state !== "pending") {
+          throw new Error(`Publication intent is outside the authorized output contract for job ${input.jobId}.`);
+        }
+        const existing: Array<Record<string, unknown>> = attempt.publicationReceiptsJson
+          ? JSON.parse(attempt.publicationReceiptsJson) as Array<Record<string, unknown>>
+          : [];
+        const duplicate = existing.find((candidate) => candidate.receiptId === input.intent.receiptId);
+        if (duplicate) {
+          if (JSON.stringify(duplicate) !== JSON.stringify(input.intent)) {
+            throw new Error(`Conflicting publication intent ${input.intent.receiptId}.`);
+          }
+          return;
+        }
+        existing.push(input.intent);
+        const updated = database.db.update(scheduledJobAttempts).set({ publicationReceiptsJson: JSON.stringify(existing) })
+          .where(and(
+            eq(scheduledJobAttempts.id, attemptId),
+            eq(scheduledJobAttempts.jobId, input.jobId),
+            eq(scheduledJobAttempts.acpAttemptNumber, input.intent.attemptNumber as number),
+            isNull(scheduledJobAttempts.completedAt),
+            isNull(scheduledJobAttempts.outcome),
+          )).run();
+        if (updated.changes !== 1) throw new Error(`Publication intent persistence conflict for attempt ${attemptId}.`);
+      })();
+    },
     recordPublicationReceipt(input: { jobId: string; receipt: Record<string, unknown> }): void {
       database.sqlite.transaction(() => {
-        const job = database.db.select().from(scheduledJobs).where(eq(scheduledJobs.id, input.jobId)).limit(1).all()[0];
+        const job = database.db.select().from(scheduledJobs).where(eq(scheduledJobs.id, input.jobId)).limit(1).get();
         if (!job) throw new Error(`Unknown scheduled job for publication receipt: ${input.jobId}`);
-        const attemptId = job.activeDispatchAttemptId;
-        if (!attemptId) throw new Error(`No active dispatch attempt for publication receipt on job ${input.jobId}`);
-        const row = database.db.select().from(scheduledJobAttempts).where(eq(scheduledJobAttempts.id, attemptId)).limit(1).all()[0];
-        if (!row) throw new Error(`Active dispatch attempt disappeared: ${attemptId}`);
-        if (row.completedAt || row.outcome) {
-          throw new Error(`Publication is fenced after terminal attempt: ${attemptId}`);
+        if (job.executionMode !== "bounded_file_write") {
+          throw new Error(`Publication receipts are only valid for bounded-write jobs: ${input.jobId}`);
         }
-        const receiptAttemptId = typeof input.receipt?.attemptId === "string" ? input.receipt.attemptId : undefined;
-        if (receiptAttemptId && receiptAttemptId !== attemptId) {
-          throw new Error(`Publication receipt is bound to stale attempt: ${receiptAttemptId}`);
+        if (typeof input.receipt?.workSessionId !== "string" || input.receipt?.jobId !== input.jobId) {
+          throw new Error(`Publication receipt is not bound to the job and work session for ${input.jobId}`);
         }
-        const receiptAttemptNumber = typeof input.receipt?.attemptNumber === "number" ? input.receipt.attemptNumber : undefined;
-        if (receiptAttemptNumber !== undefined && row.acpAttemptNumber !== null && receiptAttemptNumber !== row.acpAttemptNumber) {
+        if (input.receipt?.outcome !== "committed" || input.receipt?.readBackVerified !== true) {
+          throw new Error("Only committed, read-back-verified publications may be recorded as success evidence.");
+        }
+        const attemptId = typeof input.receipt.attemptId === "string" ? input.receipt.attemptId : undefined;
+        if (!attemptId) throw new Error(`Publication receipt is missing its attempt identity for ${input.jobId}`);
+        const row = database.db.select().from(scheduledJobAttempts).where(and(
+          eq(scheduledJobAttempts.id, attemptId), eq(scheduledJobAttempts.jobId, input.jobId),
+        )).limit(1).get();
+        if (!row) throw new Error(`Publication attempt disappeared: ${attemptId}`);
+        if (!row.acpRunId || input.receipt.runId !== row.acpRunId
+          || !row.acpDispatchId || input.receipt.dispatchIdempotencyKey !== row.acpDispatchId) {
+          throw new Error(`Publication receipt ACP identity mismatch for attempt ${attemptId}`);
+        }
+        const receiptAttemptNumber = typeof input.receipt.attemptNumber === "number" ? input.receipt.attemptNumber : undefined;
+        if (!Number.isSafeInteger(receiptAttemptNumber) || row.acpAttemptNumber === null || row.acpAttemptNumber === undefined
+          || receiptAttemptNumber !== row.acpAttemptNumber) {
           throw new Error(`Publication receipt attempt number mismatch: ${receiptAttemptNumber} != ${row.acpAttemptNumber}`);
+        }
+        const receiptPath = typeof input.receipt.path === "string" ? input.receipt.path : undefined;
+        const receiptSha256 = typeof input.receipt.sha256 === "string" ? input.receipt.sha256 : undefined;
+        const policy = JSON.parse(job.policySnapshotJson) as { allowedOutputs?: Array<Record<string, unknown>> };
+        const authorizedOutput = policy.allowedOutputs?.find((output) => output?.path === receiptPath);
+        if (!receiptPath || !authorizedOutput || authorizedOutput.operation !== input.receipt.operation) {
+          throw new Error(`Publication receipt path or operation is not authorized for job ${input.jobId}`);
+        }
+        if (!receiptSha256 || !/^[a-f0-9]{64}$/.test(receiptSha256)
+          || (authorizedOutput.expectedSha256 !== undefined && authorizedOutput.expectedSha256 !== receiptSha256)
+          || !Number.isSafeInteger(input.receipt.bytes) || Number(input.receipt.bytes) < 0) {
+          throw new Error(`Publication receipt content proof is invalid for ${receiptPath}`);
         }
         const existing: Array<Record<string, unknown>> = row.publicationReceiptsJson
           ? JSON.parse(row.publicationReceiptsJson) as Array<Record<string, unknown>>
           : [];
-        const receiptPath = typeof input.receipt?.path === "string" ? input.receipt.path : undefined;
-        const duplicate = receiptPath && input.receipt?.outcome === "committed"
-          ? existing.find((candidate) => candidate?.path === receiptPath && candidate?.outcome === "committed")
-          : undefined;
+        const duplicate = existing.find((candidate) => candidate?.path === receiptPath
+          && candidate?.attemptId === attemptId && candidate?.outcome === "committed");
         if (duplicate) {
-          if (duplicate.sha256 !== input.receipt.sha256) {
+          if (duplicate.sha256 !== receiptSha256 || duplicate.attemptNumber !== receiptAttemptNumber
+            || duplicate.workSessionId !== input.receipt.workSessionId || duplicate.operation !== input.receipt.operation
+            || duplicate.bytes !== input.receipt.bytes || duplicate.receiptId !== input.receipt.receiptId
+            || duplicate.runId !== input.receipt.runId || duplicate.dispatchIdempotencyKey !== input.receipt.dispatchIdempotencyKey) {
             throw new Error(`Conflicting committed publication receipt for ${receiptPath}`);
           }
           return;
         }
-        existing.push(input.receipt);
-        database.db.update(scheduledJobAttempts).set({
-          publicationReceiptsJson: JSON.stringify(existing),
-        }).where(eq(scheduledJobAttempts.id, attemptId)).run();
-      });
+        const intentIndex = existing.findIndex((candidate) => candidate?.receiptId === input.receipt.receiptId && candidate?.state === "pending");
+        if (intentIndex < 0) throw new Error(`No durable publication intent exists for receipt ${String(input.receipt.receiptId)}.`);
+        const intent = existing[intentIndex];
+        if (intent.path !== receiptPath || intent.sha256 !== receiptSha256 || intent.bytes !== input.receipt.bytes
+          || intent.operation !== input.receipt.operation || intent.attemptId !== attemptId
+          || intent.attemptNumber !== receiptAttemptNumber || intent.workSessionId !== input.receipt.workSessionId
+          || intent.runId !== input.receipt.runId || intent.dispatchIdempotencyKey !== input.receipt.dispatchIdempotencyKey) {
+          throw new Error(`Publication receipt does not match its durable intent for ${receiptPath}.`);
+        }
+        if (job.activeDispatchAttemptId !== attemptId && row.completedAt === null && row.outcome === null) {
+          throw new Error(`Publication receipt is bound to stale attempt: ${attemptId}`);
+        }
+        existing[intentIndex] = input.receipt;
+        const updated = database.db.update(scheduledJobAttempts).set({ publicationReceiptsJson: JSON.stringify(existing) })
+          .where(and(
+            eq(scheduledJobAttempts.id, attemptId),
+            eq(scheduledJobAttempts.jobId, input.jobId),
+            eq(scheduledJobAttempts.acpAttemptNumber, receiptAttemptNumber),
+          )).run();
+        if (updated.changes !== 1) throw new Error(`Publication receipt persistence conflict for attempt ${attemptId}.`);
+      })();
+    },
+    recordPublicationFailure(input: { jobId: string; receiptId: string; outcome: "rejected" | "conflict"; reason: string }): void {
+      database.sqlite.transaction(() => {
+        const rows = database.sqlite.prepare(`
+          select id, publication_receipts_json as publicationReceiptsJson
+            from scheduled_job_attempts
+           where job_id = ? and publication_receipts_json is not null
+        `).all(input.jobId) as Array<{ id: string; publicationReceiptsJson: string }>;
+        for (const row of rows) {
+          const receipts = JSON.parse(row.publicationReceiptsJson) as Array<Record<string, unknown>>;
+          const index = receipts.findIndex((candidate) => candidate.receiptId === input.receiptId && candidate.state === "pending");
+          if (index < 0) continue;
+          receipts[index] = { ...receipts[index], state: input.outcome, reason: input.reason.slice(0, 2_000), resolvedAt: new Date().toISOString() };
+          database.sqlite.prepare("update scheduled_job_attempts set publication_receipts_json = ? where id = ?").run(JSON.stringify(receipts), row.id);
+          return;
+        }
+      })();
+    },
+    listPendingPublicationIntents(limit = 25) {
+      const boundedLimit = Math.max(1, Math.min(100, limit));
+      const rows = database.sqlite.prepare(`
+        select job.id as jobId, job.work_session_id as workSessionId, job.workspace_root as workspaceRoot,
+               attempt.id as attemptId, attempt.publication_receipts_json as publicationReceiptsJson
+          from scheduled_jobs job
+          join scheduled_job_attempts attempt on attempt.job_id = job.id
+         where job.execution_mode = 'bounded_file_write'
+           and instr(attempt.publication_receipts_json, '"state":"pending"') > 0
+         order by attempt.started_at, job.id
+         limit ?
+      `).all(boundedLimit) as Array<{
+        jobId: string; workSessionId: string | null; workspaceRoot: string; attemptId: string; publicationReceiptsJson: string;
+      }>;
+      const pending: Array<{ jobId: string; workSessionId: string; workspaceRoot: string; attemptId: string; attemptNumber: number; intent: Record<string, unknown> }> = [];
+      for (const row of rows) {
+        if (!row.workSessionId) continue;
+        const entries = JSON.parse(row.publicationReceiptsJson) as Array<Record<string, unknown>>;
+        for (const intent of entries.filter((candidate) => candidate.state === "pending")) {
+          if (!Number.isSafeInteger(intent.attemptNumber)) continue;
+          pending.push({ jobId: row.jobId, workSessionId: row.workSessionId, workspaceRoot: row.workspaceRoot, attemptId: row.attemptId, attemptNumber: intent.attemptNumber as number, intent });
+          if (pending.length >= boundedLimit) return pending;
+        }
+      }
+      return pending;
+    },
+    bindWorkSession(input: { jobId: string; dispatchAttemptId: string; workSessionId: string }): ScheduledJob {
+      const now = new Date().toISOString();
+      const next = database.sqlite.transaction(() => {
+        const updated = database.db.update(scheduledJobs).set({
+          workSessionId: input.workSessionId,
+          updatedAt: now,
+        }).where(and(
+          eq(scheduledJobs.id, input.jobId),
+          eq(scheduledJobs.activeDispatchAttemptId, input.dispatchAttemptId),
+          sql`${scheduledJobs.status} in ('dispatching','running','uncertain_dispatch','operator_intervention','cancellation_requested')`,
+        )).run();
+        if (updated.changes !== 1) {
+          throw new Error(`Scheduled work-session binding conflict for ${input.jobId} attempt ${input.dispatchAttemptId}.`);
+        }
+        return database.db.select().from(scheduledJobs).where(eq(scheduledJobs.id, input.jobId)).limit(1).all()[0];
+      })();
+      if (!next) throw new Error(`Scheduled job disappeared during work-session binding: ${input.jobId}`);
+      return rowToJob(next);
+    },
+    bindAcpAttempt(input: {
+      jobId: string;
+      dispatchAttemptId: string;
+      workSessionId: string;
+      dispatchIdempotencyKey: string;
+      runId: string;
+      attemptNumber: number;
+    }): void {
+      if (!input.runId.trim() || !input.dispatchIdempotencyKey.trim()
+        || !Number.isSafeInteger(input.attemptNumber) || input.attemptNumber < 1) {
+        throw new Error("ACP attempt identity is invalid.");
+      }
+      database.sqlite.transaction(() => {
+        const job = database.db.select().from(scheduledJobs)
+          .where(eq(scheduledJobs.id, input.jobId)).limit(1).get();
+        const attempt = database.db.select().from(scheduledJobAttempts)
+          .where(and(
+            eq(scheduledJobAttempts.id, input.dispatchAttemptId),
+            eq(scheduledJobAttempts.jobId, input.jobId),
+          )).limit(1).get();
+        if (!job || !attempt
+          || job.activeDispatchAttemptId !== input.dispatchAttemptId
+          || job.status !== "dispatching"
+          || job.workSessionId !== input.workSessionId
+          || attempt.dispatchId !== input.dispatchIdempotencyKey
+          || attempt.completedAt || attempt.outcome) {
+          throw new Error(`ACP attempt binding conflict for ${input.jobId} attempt ${input.dispatchAttemptId}.`);
+        }
+        const existingBinding = attempt.acpRunId !== null || attempt.acpAttemptNumber !== null || attempt.acpDispatchId !== null;
+        if (existingBinding) {
+          if (attempt.acpRunId === input.runId
+            && attempt.acpAttemptNumber === input.attemptNumber
+            && attempt.acpDispatchId === input.dispatchIdempotencyKey) return;
+          throw new Error(`ACP attempt identity is already bound for ${input.dispatchAttemptId}.`);
+        }
+        const updated = database.db.update(scheduledJobAttempts).set({
+          acpRunId: input.runId,
+          acpDispatchId: input.dispatchIdempotencyKey,
+          acpAttemptNumber: input.attemptNumber,
+        }).where(and(
+          eq(scheduledJobAttempts.id, input.dispatchAttemptId),
+          eq(scheduledJobAttempts.jobId, input.jobId),
+          eq(scheduledJobAttempts.dispatchId, input.dispatchIdempotencyKey),
+          isNull(scheduledJobAttempts.acpRunId),
+          isNull(scheduledJobAttempts.acpAttemptNumber),
+          isNull(scheduledJobAttempts.completedAt),
+          isNull(scheduledJobAttempts.outcome),
+        )).run();
+        if (updated.changes !== 1) {
+          throw new Error(`ACP attempt identity could not be bound for ${input.dispatchAttemptId}.`);
+        }
+      })();
     },
     recordReconcileProbe(input: { jobId: string; attemptId: string; evidence: string; now?: string }): void {
       const now = input.now ?? new Date().toISOString();
@@ -1638,7 +2000,7 @@ export function createScheduledJobStore(
           nextReconcileAt: nextAt,
           lastReconcileEvidence: input.evidence.slice(0, 2_000),
         }).where(eq(scheduledJobAttempts.id, input.attemptId)).run();
-      });
+      })();
     },
 
     close() {

@@ -27,6 +27,7 @@ export interface ToolEnvelopeDeps {
   readonly workSessions?: ReturnType<typeof createWorkSessionManager>;
   readonly eventStore?: EventStore;
   readonly connectionContext?: ConnectionContext;
+  readonly scheduledExecutionPolicyFor?: (workSessionId: string) => import("../work-session-action-guard.js").ScheduledExecutionPolicy | undefined;
 }
 
 export interface ToolEnvelope {
@@ -41,7 +42,7 @@ export interface ToolEnvelope {
 }
 
 export function createToolEnvelope(deps: ToolEnvelopeDeps): ToolEnvelope {
-  const { config, workspaces, reviewCheckpoints, workSessions, eventStore, connectionContext } = deps;
+  const { config, workspaces, reviewCheckpoints, workSessions, eventStore, connectionContext, scheduledExecutionPolicyFor } = deps;
 
   function trackToolEvent(
     workspaceId: string,
@@ -142,6 +143,15 @@ export function createToolEnvelope(deps: ToolEnvelopeDeps): ToolEnvelope {
 
     const workspace = workspaces.getWorkspace(workspaceId);
     if (connectionContext?.authenticatedRole === "worker") {
+      const scheduledPolicy = scheduledExecutionPolicyFor?.(connectionContext.workSessionId ?? "");
+      const stagedWrite = scheduledPolicy?.executionMode === "bounded_file_write"
+        && scheduledPolicy.workspaceAccess === "staged_write"
+        && scheduledPolicy.mutate === true;
+      if (stagedWrite) {
+        // Scheduled staged writes are publisher-authoritative. They deliberately
+        // hold no checkout mutation lease and must bypass checkout-lease preflight.
+        return;
+      }
       const lease = workSessions?.getActiveWorkspaceLease(workspace.root);
       if (
         !connectionContext.workSessionId ||

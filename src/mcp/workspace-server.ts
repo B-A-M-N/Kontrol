@@ -176,7 +176,7 @@ export function createMcpServer(
   const toolRegistrationStartedAt = performance.now();
   const mutationPrincipalId = connectionContext?.authenticatedPrincipalId
     || `${connectionContext?.authSource ?? "anonymous"}:${connectionContext?.authenticatedRole ?? "client"}`;
-  const envelope = createToolEnvelope({ config, workspaces, reviewCheckpoints, workSessions, eventStore, connectionContext });
+  const envelope = createToolEnvelope({ config, workspaces, reviewCheckpoints, workSessions, eventStore, connectionContext, scheduledExecutionPolicyFor });
   const { trackToolEvent, prepareForMutation } = envelope;
 
   registerWorkspaceAppResources(server, config, onWorkspaceAppResource);
@@ -193,9 +193,17 @@ export function createMcpServer(
     prepareForMutation,
     processSessions,
     scheduledExecutionPolicyFor,
+    recordPublicationIntent: (input: { jobId: string; intent: Record<string, unknown> }) => {
+      if (!scheduledJobs) throw new Error("Scheduled jobs are unavailable for publication intents.");
+      scheduledJobs.recordPublicationIntent(input);
+    },
     recordPublicationReceipt: (input: { jobId: string; receipt: Record<string, unknown> }) => {
       if (!scheduledJobs) throw new Error("Scheduled jobs are unavailable for publication receipts.");
       scheduledJobs.recordPublicationReceipt(input);
+    },
+    recordPublicationFailure: (input: { jobId: string; receiptId: string; outcome: "rejected" | "conflict"; reason: string }) => {
+      if (!scheduledJobs) throw new Error("Scheduled jobs are unavailable for publication outcomes.");
+      scheduledJobs.recordPublicationFailure(input);
     },
     scheduledJobFor: (workSessionId: string) => scheduledJobs?.getByWorkSessionId(workSessionId),
   });

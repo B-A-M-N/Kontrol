@@ -16,6 +16,39 @@ import { APPROVAL_WAIT_TIMEOUT_MS } from "./context.js";
 import type { makeAuth } from "./auth.js";
 import type { makeReviewBarrier } from "./review-barrier.js";
 import { acpRunEventSchema } from "./schemas.js";
+import { redactString } from "../../redaction.js";
+
+function boundedDiagnosticTail(value: unknown, maxBytes = 4_000): string | undefined {
+  if (typeof value !== "string" || value.length === 0) return undefined;
+  const redacted = redactString(value.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, ""));
+  const bytes = Buffer.from(redacted, "utf8");
+  if (bytes.byteLength <= maxBytes) return redacted;
+  return new TextDecoder().decode(bytes.subarray(-maxBytes)).replace(/^\uFFFD/, "");
+}
+
+function workerFailureEvidence(input: {
+  payload?: Record<string, unknown>;
+  eventId?: string;
+  runId: string;
+  attemptNumber: number;
+}): Record<string, unknown> {
+  const exitCode = input.payload?.exit_code;
+  const signal = typeof input.payload?.signal === "string" ? boundedDiagnosticTail(input.payload.signal, 128) : undefined;
+  const category = signal ? "signal_termination"
+    : typeof exitCode === "number" && Number.isInteger(exitCode) ? "nonzero_exit"
+      : "worker_failure";
+  const stderr = boundedDiagnosticTail(input.payload?.stderr);
+  return {
+    phase: "execution",
+    category,
+    ...(typeof exitCode === "number" && Number.isInteger(exitCode) ? { exitCode } : {}),
+    ...(signal ? { signal } : {}),
+    ...(stderr ? { sanitizedStderrTail: stderr } : {}),
+    ...(input.eventId ? { eventId: input.eventId } : {}),
+    runId: input.runId,
+    attemptNumber: input.attemptNumber,
+  };
+}
 
 export function registerEventRoutes(
   router: Router,
@@ -70,6 +103,7 @@ const SERVER_OWNED_EVENT_PAYLOAD_FIELDS = new Set([
   "dispatchId",
   "workSessionId",
   "eventId",
+  "workerFailureEvidence",
 ]);
 
 const ADAPTER_TERMINAL_EVENT_TYPES = new Set(["completed", "failed", "cancelled", "exited"]);
@@ -502,6 +536,14 @@ function eventMatchesDispatch(event: { type: string; payload: Record<string, unk
       const eventPayload = {
         ...adapterPayload,
         ...(autonomousBoundedWrite ? { autonomousCompletion: true } : {}),
+        ...(body.type === "failed" || body.type === "exited"
+          ? { workerFailureEvidence: workerFailureEvidence({
+              payload: body.payload,
+              eventId: body.event_id,
+              runId: run.runId,
+              attemptNumber: run.attemptNumber ?? 1,
+            }) }
+          : {}),
         runId: run.runId,
         remoteRunId: body.remote_run_id ?? run.remoteRunId,
         attemptNumber: body.attempt_number ?? run.attemptNumber ?? 1,
@@ -563,6 +605,12 @@ function eventMatchesDispatch(event: { type: string; payload: Record<string, unk
       // state (handled by evaluateCompletion) is a protocol failure.
       const session = sessionId ? workSessions.get(sessionId) : undefined;
       const errorMessage = stringPayload(body.payload?.message) ?? "worker process exited";
+      const failureEvidence = workerFailureEvidence({
+        payload: body.payload,
+        eventId: body.event_id,
+        runId: run.runId,
+        attemptNumber: run.attemptNumber ?? 1,
+      });
       if (session && session.status === "awaiting_review") {
         // Worker died after submitting but before the reviewer responded. Keep
         // the durable review OPEN (resumable): mark the attempt detached and do
@@ -585,6 +633,7 @@ function eventMatchesDispatch(event: { type: string; payload: Record<string, unk
             ...(eventDispatchAttempt?.dispatchIdempotencyKey ? { dispatchId: eventDispatchAttempt.dispatchIdempotencyKey } : {}),
             resumable: true,
             reason: errorMessage,
+            workerFailureEvidence: failureEvidence,
             ...(stringPayload(body.payload?.final_output) !== undefined
               ? { final_output: stringPayload(body.payload?.final_output) }
               : {}),
@@ -604,6 +653,7 @@ function eventMatchesDispatch(event: { type: string; payload: Record<string, unk
             attemptNumber: run.attemptNumber ?? 1,
             ...(eventDispatchAttempt?.dispatchIdempotencyKey ? { dispatchId: eventDispatchAttempt.dispatchIdempotencyKey } : {}),
             reason: errorMessage,
+            workerFailureEvidence: failureEvidence,
           },
         });
         agentRegistry.updateRun(run.runId, { status: "failed", errorMessage, finishedAt: now });

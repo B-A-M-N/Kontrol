@@ -4,12 +4,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { databasePath, openDatabase } from "./client.js";
-import { LATEST_SCHEMA_VERSION, migrateDatabase } from "./migrations.js";
+import { inspectDatabaseSchemaContract, LATEST_SCHEMA_VERSION, migrateDatabase } from "./migrations.js";
 
 const sqlite = new Database(":memory:");
 sqlite.pragma("foreign_keys = ON");
 try {
   migrateDatabase(sqlite);
+  const schemaContract = inspectDatabaseSchemaContract(sqlite);
+  assert.equal(schemaContract.expectedTableCount, 41, "schema contract covers all Drizzle table mappings");
+  assert.deepEqual(schemaContract.missing, [], "all Drizzle tables and columns are present in migrated SQLite");
+  assert.equal(schemaContract.appliedVersion, LATEST_SCHEMA_VERSION);
   assert.ok(
     (sqlite.prepare("pragma table_info(work_session_submissions)").all() as Array<{ name: string }>)
       .some((column) => column.name === "files_json"),

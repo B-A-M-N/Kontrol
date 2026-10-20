@@ -669,21 +669,32 @@ if [[ "$START_CRUSH_ADAPTER" == "true" ]]; then
 fi
 
 if [[ "$START_HERMES_ADAPTER" != "false" ]]; then
-  if ! command -v "${HERMES_BIN:-hermes}" >/dev/null 2>&1; then
+  HERMES_COMMAND="${HERMES_BIN:-hermes}"
+  HERMES_ACP_CHECK_COMMAND=()
+  if [[ -n "${HERMES_ACP_BIN:-}" ]]; then
+    HERMES_ACP_CHECK_COMMAND=("$HERMES_ACP_BIN")
+  elif [[ "$(basename "$HERMES_COMMAND")" == "hermes-acp" ]]; then
+    HERMES_ACP_CHECK_COMMAND=("$HERMES_COMMAND")
+  else
+    HERMES_COMMAND_PATH="$(command -v "$HERMES_COMMAND" 2>/dev/null || true)"
+    HERMES_ACP_SIBLING="${HERMES_COMMAND_PATH%/*}/hermes-acp"
+    if [[ -n "$HERMES_COMMAND_PATH" && -x "$HERMES_ACP_SIBLING" ]]; then
+      HERMES_ACP_CHECK_COMMAND=("$HERMES_ACP_SIBLING")
+    elif command -v hermes-acp >/dev/null 2>&1; then
+      HERMES_ACP_CHECK_COMMAND=("$(command -v hermes-acp)")
+    else
+      HERMES_ACP_CHECK_COMMAND=("$HERMES_COMMAND" acp)
+    fi
+  fi
+  if ! PYTHONPATH="$HERMES_ACP_COMPAT_PATH:${PYTHONPATH:-}" "${HERMES_ACP_CHECK_COMMAND[@]}" --check >/dev/null 2>&1; then
     if [[ "$START_HERMES_ADAPTER" == "true" ]]; then
-      echo "ERROR: Hermes binary not found: ${HERMES_BIN:-hermes}" >&2
+      echo "ERROR: Hermes ACP --check failed for ${HERMES_ACP_CHECK_COMMAND[*]}." >&2
       return 1
     fi
-    START_HERMES_ADAPTER="false"
-  elif ! PYTHONPATH="$HERMES_ACP_COMPAT_PATH:${PYTHONPATH:-}" "${HERMES_BIN:-hermes}" acp --check >/dev/null 2>&1; then
-    if [[ "$START_HERMES_ADAPTER" == "true" ]]; then
-      echo "ERROR: hermes acp --check failed." >&2
-      return 1
-    fi
-    echo "[*] Hermes native adapter disabled: hermes acp --check failed."
+    echo "[*] Hermes native adapter disabled: ACP --check failed for ${HERMES_ACP_CHECK_COMMAND[*]}."
     START_HERMES_ADAPTER="false"
   else
-    echo "[*] Coding agent: Hermes native ACP (${HERMES_BIN:-hermes})"
+    echo "[*] Coding agent: Hermes native ACP (${HERMES_ACP_CHECK_COMMAND[*]})"
   fi
 fi
 

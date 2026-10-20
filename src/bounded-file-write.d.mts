@@ -21,6 +21,7 @@ export type BoundedFileWriteGrant = {
   attemptNumber: number;
   dispatchIdempotencyKey: string;
   allowedOutputs: readonly BoundedFileWriteOutput[];
+  networkPolicy: "disabled" | "host";
   issuedAt: number;
   expiresAt: number;
   signature: string;

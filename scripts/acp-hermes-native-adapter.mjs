@@ -2,7 +2,7 @@
 // Native Hermes ACP bridge.
 //
 // This adapter registers `hermes-agent` as an HTTP ACP peer for Kontrol, but
-// executes turns by spawning Hermes's native `hermes acp` stdio server through
+// executes turns through Hermes's native ACP stdio server via
 // scripts/hermes-native-runner.py. It is separate from acp-crush-adapter.mjs on
 // purpose: Hermes must not be represented as a CRUSH-style subprocess wrapper.
 
@@ -20,6 +20,7 @@ import { buildToolEnvironment } from "./lib/tool-environment.mjs";
 import { signWorkerToken, TOKEN_TTL_MS } from "./lib/acp-worker-token.mjs";
 import { adapterStatePath, atomicWriteJson, prepareOwnedChild, processStartToken, readJsonOr, reconcileOwnedProcesses, terminateProcessGroup } from "./lib/managed-agent-process.mjs";
 import { applyWorkspaceLeaseRenewal, workspaceLeaseDeadline, workspaceLeaseDeadlineReached } from "./lib/workspace-lease.mjs";
+import { formatHermesAcpAttempts, hermesAcpCandidates, selectHermesAcpEntry } from "./lib/hermes-acp-entry.mjs";
 import { acknowledgeAdapterDispatchReceipt, adapterDispatchFingerprint, findAdapterDispatchReceipt, isTerminalAdapterDispatchStatus, loadAdapterDispatchReceipts, reconcileAdapterDispatchReceipts, recordAdapterDispatchReceipt } from "./lib/adapter-dispatch-receipts.mjs";
 const readOnlyModuleUrl = process.env.KONTROL_ARTIFACT_PATH
   ? pathToFileURL(resolve(process.env.KONTROL_ARTIFACT_PATH, "read-only-execution.mjs"))
@@ -43,6 +44,8 @@ const KONTROL_MCP_URL = process.env.KONTROL_MCP_URL || KONTROL_ACP_URL.replace(/
 const AGENT_SECRET = process.env.KONTROL_ACP_AGENT_SECRET;
 const ADAPTER_SECRET = process.env.KONTROL_ACP_ADAPTER_SECRET;
 const HERMES_BIN = process.env.HERMES_BIN || "hermes";
+const HERMES_BIN_EXPLICIT = Boolean(process.env.HERMES_BIN);
+const HERMES_ACP_BIN = process.env.HERMES_ACP_BIN;
 const HERMES_AGENT_ROOT = process.env.HERMES_AGENT_ROOT || detectHermesAgentRoot() || process.cwd();
 const ADAPTER_PORT = Number(process.env.HERMES_ACP_ADAPTER_PORT || process.env.ACP_ADAPTER_PORT || "9911");
 const ADAPTER_HOST = process.env.HERMES_ACP_ADAPTER_HOST || "127.0.0.1";
@@ -113,27 +116,24 @@ function hermesCheckEnvironment() {
   });
 }
 
-// Hermes agent refactoring split the old `hermes acp ...` subcommand into a
-// standalone `hermes-acp` entry point. Support both forms: try the legacy
-// subcommand first, then the direct-entry `--check` flag.
-let hermesCheck = spawnSync(HERMES_BIN, ["acp", "--check"], {
-  encoding: "utf8",
-  env: hermesCheckEnvironment(),
-});
-let hermesCheckMode = "subcommand";
-if (hermesCheck.status !== 0 && /unrecognized arguments?/.test(hermesCheck.stderr ?? hermesCheck.stdout ?? "")) {
-  hermesCheck = spawnSync(HERMES_BIN, ["--check"], {
+// Current upstream exposes `hermes-acp`; older installations may still only
+// provide `hermes acp`. Probe once and retain the exact successful command so
+// confined and ordinary launches use the same entry point.
+const hermesBinPath = resolveHermesBinaryPath();
+const hermesAcpSelection = selectHermesAcpEntry(
+  hermesAcpCandidates({ hermesAcpBin: HERMES_ACP_BIN, hermesBin: HERMES_BIN, hermesBinPath, hermesBinExplicit: HERMES_BIN_EXPLICIT }),
+  (entry) => spawnSync(entry.command, [...entry.args, "--check"], {
     encoding: "utf8",
     env: hermesCheckEnvironment(),
-  });
-  hermesCheckMode = "direct-entry";
-}
-if (hermesCheck.status !== 0) {
-  console.error(`[hermes-native] hermes acp --check (${hermesCheckMode}) failed; refusing to register hermes-agent`);
-  console.error((hermesCheck.stderr || hermesCheck.stdout || "").trim());
+  }),
+);
+if (!hermesAcpSelection.entry) {
+  console.error("[hermes-native] no supported Hermes ACP entry point passed --check; refusing to register hermes-agent");
+  console.error(formatHermesAcpAttempts(hermesAcpSelection.attempts));
   process.exit(1);
 }
-const HERMES_ACP_ENTRY_MODE = hermesCheckMode;
+const HERMES_ACP_ENTRY = hermesAcpSelection.entry;
+console.log(`[hermes-native] using Hermes ACP entry: ${HERMES_ACP_ENTRY.command} ${HERMES_ACP_ENTRY.args.join(" ")}`.trim());
 
 const PYTHON_BIN = resolveHermesPython();
 let degraded = PYTHON_BIN === null;
@@ -235,7 +235,7 @@ async function registerAgent() {
       url: `http://${ADAPTER_HOST}:${ADAPTER_PORT}`,
       description: "Native Hermes ACP stdio bridge with HTTP approval bridge",
       role: "agent",
-      capabilities: ["native-acp", "streaming", "tool-events", "http-approval-bridge", "review-barrier"],
+      capabilities: ["native-acp", "streaming", "tool-events", "http-approval-bridge", "review-barrier", "scheduled:read_only_audit", "scheduled:bounded_file_write"],
       ttlSeconds: 90,
     }),
   });
@@ -281,6 +281,24 @@ async function handle(req, res) {
       active: active.size,
       native: true,
       generationId: adapterGenerationId,
+      executionCapabilities: {
+        read_only_audit: {
+          supported: true,
+          grantPolicy: "kontrol_signed_attempt_bound",
+          confinementAvailable: Boolean(resolveExecutablePath("bwrap") && resolveExecutablePath("prlimit")),
+          executableAvailable: Boolean(PYTHON_BIN && resolveExecutablePath(PYTHON_BIN) && resolveExecutablePath(HERMES_ACP_ENTRY.command) && existsSync(RUNNER)),
+          cliInputContract: "hermes_public_acp_v1_session_prompt",
+          networkPolicies: ["disabled", "host"],
+        },
+        bounded_file_write: {
+          supported: true,
+          grantPolicy: "kontrol_signed_attempt_bound",
+          confinementAvailable: Boolean(resolveExecutablePath("bwrap") && resolveExecutablePath("prlimit")),
+          executableAvailable: Boolean(PYTHON_BIN && resolveExecutablePath(PYTHON_BIN) && resolveExecutablePath(HERMES_ACP_ENTRY.command) && existsSync(RUNNER)),
+          cliInputContract: "hermes_public_acp_v1_session_prompt",
+          networkPolicies: ["disabled", "host"],
+        },
+      },
     });
   }
   const cancelMatch = (req.url || "").match(/^\/runs\/([^/]+)\/cancel$/);
@@ -435,7 +453,7 @@ async function handle(req, res) {
     ? {
       mode: "bounded_file_write",
       grant: run.boundedFileWriteGrant,
-      networkPolicy: "host",
+      networkPolicy: run.boundedFileWriteGrant?.networkPolicy,
       grantFingerprint: run.boundedFileWriteGrant
         ? createHash("sha256").update(run.boundedFileWriteGrant.signature).digest("hex")
         : undefined,
@@ -453,6 +471,14 @@ async function handle(req, res) {
       error: { code: "execution_grant_incomplete", message: "A complete signed execution grant is required for confined Hermes execution." },
     });
   }
+  if (run.boundedFileWrite && execution.networkPolicy !== "host") {
+    return writeJson(res, 503, {
+      error: {
+        code: "sandbox_control_plane_unavailable",
+        message: "Hermes bounded writes require the explicitly configured host network policy until Kontrol provides a local IPC transport inside an isolated network namespace.",
+      },
+    });
+  }
   run.execution = execution;
   if (run.workSessionId && !run.readOnlyAudit && !run.boundedFileWrite && (!run.workspaceLeaseNonce || workspaceLeaseDeadlineReached(run))) {
     return writeJson(res, 409, {
@@ -462,9 +488,9 @@ async function handle(req, res) {
   if (run.readOnlyAudit || run.boundedFileWrite) {
     try {
       const pythonExecutable = resolveExecutablePath(PYTHON_BIN);
-      const hermesExecutable = resolveHermesBinaryPath();
+      const hermesExecutable = resolveExecutablePath(HERMES_ACP_ENTRY.command);
       if (!pythonExecutable || !hermesExecutable) {
-        throw Object.assign(new Error("Hermes Python or CLI executable cannot be resolved for confined execution."), { code: "sandbox_unavailable" });
+        throw Object.assign(new Error("Hermes Python or selected ACP executable cannot be resolved for confined execution."), { code: "sandbox_unavailable" });
       }
       run.readOnlyRuntimeProjection = prepareHermesReadOnlyRuntime();
       copyFileSync(RUNNER, join(run.readOnlyRuntimeProjection, "hermes-native-runner.py"));
@@ -494,7 +520,7 @@ async function handle(req, res) {
           KONTROL_WORKER_TOKEN: run.workerToken,
           KONTROL_HERMES_NATIVE_INPUT: JSON.stringify({
             command: hermesSandboxCommand,
-            args: ["acp"],
+            args: HERMES_ACP_ENTRY.args,
             cwd: "/workspace",
             task: run.task,
             runId: run.remoteRunId,
@@ -525,7 +551,7 @@ async function handle(req, res) {
         workspaceRoot,
         executable: pythonExecutable,
         executableTarget: pythonUsesSystemRuntime ? undefined : pythonExecutable,
-        args: ["-c", "import acp; import acp_adapter.client"],
+        args: ["-c", "import acp; from acp.core import connect_to_agent; from acp.schema import ClientCapabilities, FileSystemCapabilities, Implementation, TextContentBlock; import acp_adapter.entry; import acp_adapter.server"],
         env: {
           HERMES_AGENT_ROOT: "/opt/kontrol/hermes-runtime",
           PYTHONPATH: "/opt/kontrol/hermes-runtime",
@@ -581,8 +607,8 @@ async function handle(req, res) {
       KONTROL_PARENT_RUN_ID: run.devRunId || "",
       KONTROL_WORKSPACE_LEASE_NONCE: run.workspaceLeaseNonce || "",
       KONTROL_HERMES_NATIVE_INPUT: JSON.stringify({
-        command: HERMES_BIN,
-        args: HERMES_ACP_ENTRY_MODE === "direct-entry" ? [] : ["acp"],
+        command: HERMES_ACP_ENTRY.command,
+        args: HERMES_ACP_ENTRY.args,
         cwd: workspaceRoot,
         task: run.task,
         runId: run.remoteRunId,
@@ -1504,7 +1530,7 @@ function resolveHermesPython() {
     "python3",
   ].filter(Boolean);
   for (const candidate of candidates) {
-    const result = spawnSync(candidate, ["-c", "import acp; import acp_adapter.client; assert hasattr(acp, 'connect_to_agent'); assert hasattr(acp, 'Client')"], {
+    const result = spawnSync(candidate, ["-c", "import acp; from acp.core import connect_to_agent; from acp.schema import ClientCapabilities, FileSystemCapabilities, Implementation, TextContentBlock; import acp_adapter.entry; import acp_adapter.server"], {
       encoding: "utf8",
       // P1.10: explicit allowlist (see the --check spawn above).
       env: buildToolEnvironment(process.env, {

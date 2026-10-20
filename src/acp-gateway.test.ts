@@ -114,6 +114,8 @@ try {
         },
       };
       const executionReceipt = {
+        mode: "read_only_audit",
+        execution_grant: grant,
         issuer: "kontrol",
         work_session_id: "work-session-1",
         workspace_session_id: "workspace-1",

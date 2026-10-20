@@ -31,8 +31,10 @@ export interface ScheduledVerificationResult {
     executionPolicy: {
       capability: "read_only_verification";
       allowedExecutables: string[];
+      allowedProfiles: string[];
       commands: Array<{
         command: string;
+        profile: string;
         executable: string;
         args: string[];
         argumentPolicy: "exact_predeclared_argv_no_shell_path_traversal_denied";
@@ -176,8 +178,10 @@ export async function verifyScheduledJob(input: {
       executionPolicy: {
         capability: "read_only_verification" as const,
         allowedExecutables: [...new Set(fingerprints.commands.map((command) => command.executable))],
-        commands: fingerprints.commands.map(({ command, executable, args }) => ({
+        allowedProfiles: [...new Set(fingerprints.commands.map((command) => command.profile))],
+        commands: fingerprints.commands.map(({ command, executable, args, profile }) => ({
           command,
+          profile,
           executable,
           args,
           argumentPolicy: "exact_predeclared_argv_no_shell_path_traversal_denied" as const,

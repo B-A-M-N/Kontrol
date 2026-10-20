@@ -354,6 +354,8 @@ async function handle(req, res) {
       throw error;
     }
     run.readOnlyExecutionReceipt = {
+      mode: "read_only_audit",
+      execution_grant: run.readOnlyExecutionGrant,
       issuer: "kontrol",
       work_session_id: run.workSessionId,
       workspace_session_id: run.workspaceSessionId,

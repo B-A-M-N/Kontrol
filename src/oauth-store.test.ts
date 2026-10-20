@@ -129,6 +129,8 @@ async function testDatabaseConfiguration(stateDir: string): Promise<void> {
       { version: 86, name: "work-session-principal-identity" },
       { version: 87, name: "scheduled-job-publication-receipts" },
       { version: 88, name: "scheduled-job-reconcile-backoff" },
+      { version: 89, name: "historical-schema-drift-repair" },
+      { version: 90, name: "scheduled-dispatch-attempt-diagnostics" },
     ]);
   } finally {
     database.close();

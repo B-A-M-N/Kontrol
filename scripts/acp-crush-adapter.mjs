@@ -193,7 +193,7 @@ async function registerAgent() {
         url: `http://${ADAPTER_HOST}:${ADAPTER_PORT}`,
         description: `ACP adapter wrapping the ${AGENT_BIN} coding agent`,
         role: "agent",
-        capabilities: ["file-read", "file-write", "shell", "submit-review", `agent:${AGENT_BIN}`],
+        capabilities: ["file-read", "file-write", "shell", "submit-review", "scheduled:read_only_audit", `agent:${AGENT_BIN}`],
         ttlSeconds: Math.max(60, Math.floor(HEARTBEAT_INTERVAL_MS / 1000) + 30),
       }),
     });
@@ -245,6 +245,8 @@ async function handleRequest(req, res) {
 
   if (url === "/health" && method === "GET") {
     const ready = reconciliationComplete && !shuttingDown;
+    const executableAvailable = Boolean(resolveExecutablePath(CRUSH_BIN));
+    const confinementAvailable = Boolean(resolveExecutablePath("bwrap") && resolveExecutablePath("prlimit"));
     return writeJson(res, ready ? 200 : 503, {
       ok: ready,
       ready,
@@ -253,6 +255,16 @@ async function handleRequest(req, res) {
       orphanProcessesTerminated,
       workers: activeProcesses.size,
       generationId: adapterGenerationId,
+      executionCapabilities: {
+        read_only_audit: {
+          supported: true,
+          grantPolicy: "kontrol_signed_attempt_bound",
+          confinementAvailable,
+          executableAvailable,
+          cliInputContract: "crush_positional_instruction_plus_stdin_v1",
+          networkPolicies: ["disabled", "host"],
+        },
+      },
     });
   }
 
@@ -489,6 +501,8 @@ async function handleRunRequest(req, res, body) {
     }
     const grant = run.readOnlyExecutionGrant;
     run.readOnlyExecutionReceipt = {
+      mode: "read_only_audit",
+      execution_grant: grant,
       issuer: "kontrol",
       work_session_id: workSessionId,
       workspace_session_id: workspaceSessionId,
@@ -794,8 +808,13 @@ export function extractTask(input) {
 // Exported so it can be unit-tested without spawning the model. The installed
 // CRUSH build does not support `--no-color`; it supports `--quiet`, and the
 // adapter already suppresses ANSI via NO_COLOR=1 in workerEnvironment().
+export const CRUSH_STDIN_INSTRUCTION = "Execute the complete task supplied on standard input.";
+
 export function buildCrushArgs() {
-  return ["run", "--debug", "--quiet"];
+  // CRUSH requires a positional prompt to enter run mode. Keep that prompt
+  // fixed and non-sensitive; the complete task remains on stdin so it never
+  // appears in process listings or routine adapter logs.
+  return ["run", "--debug", "--quiet", CRUSH_STDIN_INSTRUCTION];
 }
 
 export function buildAgentArgs() {

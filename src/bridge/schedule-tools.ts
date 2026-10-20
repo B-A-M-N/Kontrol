@@ -15,7 +15,7 @@ import type { ScheduledJob, ScheduledJobStore } from "../scheduling/scheduled-jo
 import { randomUUID } from "node:crypto";
 import { cancelRemoteRun } from "../acp-gateway.js";
 import { hasConfirmedWorkerAttemptExit } from "../acp-registry.js";
-import { parseVerificationCommand } from "../mission-verifier.js";
+import { parseScheduledVerificationCommand } from "../scheduling/verification-profiles.js";
 import { verifyScheduledJob } from "../scheduling/scheduled-verification.js";
 import { projectScheduledVerification, scheduledVerificationFingerprints } from "../scheduling/scheduled-verification-projection.js";
 import { z } from "zod/v4";
@@ -104,7 +104,7 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
       }
       try {
         const checkedVerificationCommands = (verificationCommands ?? []).map((command: string) => {
-          parseVerificationCommand(command);
+          parseScheduledVerificationCommand(command);
           return command;
         });
         const outputs = executionMode === "bounded_file_write" ? (allowedOutputs ?? []) : [];
@@ -221,11 +221,35 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
             dispatchStatus: z.string().optional(),
             dispatchRetryCount: z.number().int().nonnegative(),
             dispatchNextEligibleAt: z.string().optional(),
+            dispatchAttempts: z.array(z.object({
+              attemptId: z.string(),
+              dispatchId: z.string(),
+              startedAt: z.string(),
+              completedAt: z.string().optional(),
+              selectedAgent: z.string().optional(),
+              transportStatus: z.string(),
+              runId: z.string().optional(),
+              attemptNumber: z.number().int().optional(),
+              failureClass: z.string().optional(),
+              failureReason: z.string().optional(),
+              probeResult: z.record(z.string(), z.unknown()).optional(),
+              nextEligibleAt: z.string().optional(),
+            })),
             reviewStatus: z.string(),
             verificationStatus: z.enum(["passed", "failed", "inconclusive", "not_performed"]),
             workerCompleted: z.boolean(),
             workerExecutionOutcome: z.enum(["completed", "failed", "failed_protocol", "cancelled"]).optional(),
             workerExecutionAt: z.string().optional(),
+            workerFailureEvidence: z.object({
+              phase: z.enum(["admission", "spawn", "execution", "reporting"]),
+              category: z.string(),
+              exitCode: z.number().int().optional(),
+              signal: z.string().optional(),
+              sanitizedStderrTail: z.string().optional(),
+              eventId: z.string().optional(),
+              runId: z.string(),
+              attemptNumber: z.number().int().positive(),
+            }).optional(),
             reviewApproved: z.boolean(),
             verificationLevel: z.enum(["not_performed", "implementation", "integration", "outcome", "operational"]),
             independentOutcomeObserved: z.boolean(),
@@ -317,15 +341,24 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
         const latest = session?.latestSubmission;
         const snapshotKind = latest?.snapshotKind;
         const snapshotRef = latest?.snapshotRef ?? latest?.snapshotCommit;
-        const mission = session && config.missionLedger
-          ? config.missionLedger.getResultReceipt(session.id, latest ? {
+        let mission;
+        let missionLedgerUnavailable = false;
+        if (session && config.missionLedger) {
+          try {
+            mission = config.missionLedger.getResultReceipt(session.id, latest ? {
               submissionId: latest.id,
               snapshotKind,
               snapshotRef,
               snapshotCommit: latest.snapshotCommit,
               reviewEpoch: latest.reviewEpoch,
-            } : undefined)
-          : undefined;
+            } : undefined);
+          } catch {
+            // The execution receipt is backed by the scheduled-job and ACP
+            // ledgers. A mission projection failure must not make that
+            // operational receipt unreadable or imply that verification ran.
+            missionLedgerUnavailable = true;
+          }
+        }
         const completionReport = mission?.completionReport;
         const fingerprints = scheduledVerificationFingerprints({ policySnapshotJson: job.policySnapshotJson, serverConfig: config.serverConfig });
         const scheduledVerification = latest && session
@@ -393,7 +426,15 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
                   : attempt?.executionStartedAt ? "stopped"
                     : attempt?.transportStatus === "accepted" ? "accepted"
                       : job.status);
+        const workerFailureEvidence = jobs.getWorkerFailureEvidence?.(job.id);
         const unresolvedBlockers = [...verification.unresolvedBlockers];
+        const reportOnlyVerificationBlocker = !latest && session && job.executionMode === "read_only_audit"
+          ? "Scheduled verification is unavailable for this report-only audit because no submitted immutable snapshot exists."
+          : undefined;
+        if (reportOnlyVerificationBlocker) unresolvedBlockers.push(reportOnlyVerificationBlocker);
+        if (missionLedgerUnavailable) {
+          unresolvedBlockers.push("Mission evidence is unavailable because the mission ledger could not be read.");
+        }
         if (finalization?.status === "pending") {
           unresolvedBlockers.push(finalization.lastError
             ? `Worker report finalization is pending: ${finalization.lastError}`
@@ -411,6 +452,7 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
             dispatchStatus: attempt?.transportStatus,
             dispatchRetryCount: job.dispatchRetryCount,
             dispatchNextEligibleAt: job.dispatchNextEligibleAt,
+            dispatchAttempts: jobs.listDispatchAttempts?.(job.id, 50) ?? [],
             terminalAt: ["completed", "failed", "cancelled"].includes(job.status) ? job.terminalAt : undefined,
             blockedAt: job.blockedAt,
             operatorInterventionAt: job.operatorInterventionAt,
@@ -431,6 +473,7 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
               : verification.independentOutcomeObserved,
             workerExecutionOutcome: attempt?.workerExecutionOutcome,
             workerExecutionAt: attempt?.workerExecutionAt,
+            workerFailureEvidence,
             reviewStatus,
             verificationStatus: verification.verificationStatus,
             workerCompleted: attempt?.workerExecutionOutcome === "completed",
@@ -447,7 +490,9 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
               snapshotRef,
               reviewEpoch: latest?.reviewEpoch,
             },
-            verificationBlockers: verification.verificationBlockers,
+            verificationBlockers: reportOnlyVerificationBlocker
+              ? [...verification.verificationBlockers, reportOnlyVerificationBlocker]
+              : verification.verificationBlockers,
             unresolvedBlockers,
             ...(finalization ? {
               reportFinalizationStatus: finalization.status,

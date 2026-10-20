@@ -23,6 +23,7 @@ const claims = {
   attemptNumber: 2,
   dispatchIdempotencyKey: "dispatch-2",
   allowedOutputs,
+  networkPolicy: "host",
   ttlMs: 60_000,
 };
 const grant = createBoundedFileWriteGrant(claims, secret, now);
@@ -51,6 +52,7 @@ const body = {
   parent_run_id: claims.runId,
   attempt_number: claims.attemptNumber,
   dispatch_idempotency_key: claims.dispatchIdempotencyKey,
+  execution_network_policy: claims.networkPolicy,
   scheduled_execution_policy: {
     executionMode: "bounded_file_write",
     workspaceAccess: "staged_write",
@@ -60,6 +62,10 @@ const body = {
   bounded_file_write_grant: grant,
 };
 assert.equal(validateBoundedFileWriteDispatchRequest(body, secret, "agent-1").valid, true);
+assert.equal(validateBoundedFileWriteDispatchRequest({ ...body, execution_network_policy: "disabled" }, secret, "agent-1").valid, false,
+  "the adapter rejects a network policy that differs from the signed grant");
+assert.equal(validateBoundedFileWriteDispatchRequest({ ...body, workspace_root: "/tmp/other-workspace" }, secret, "agent-1").valid, false,
+  "the grant is bound to the exact workspace root");
 assert.equal(validateBoundedFileWriteDispatchRequest(body, secret, "other-agent").valid, false);
 assert.equal(validateBoundedFileWriteDispatchRequest({
   ...body,

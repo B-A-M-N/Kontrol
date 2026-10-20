@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { hermesAcpCandidates, selectHermesAcpEntry } from "../scripts/lib/hermes-acp-entry.mjs";
 
 const adapter = readFileSync("scripts/acp-hermes-native-adapter.mjs", "utf8");
 const runner = readFileSync("scripts/hermes-native-runner.py", "utf8");
 
 assert.match(adapter, /resolveHermesPython/);
-assert.match(adapter, /import acp; import acp_adapter\.client/);
+assert.doesNotMatch(adapter, /acp_adapter\.client/);
+assert.match(adapter, /from acp\.core import connect_to_agent/);
+assert.match(adapter, /HERMES_ACP_BIN/);
 assert.match(adapter, /HERMES_ACP_COMPAT_PATH/);
 assert.match(adapter, /hermes-acp-compat/);
 assert.match(adapter, /HERMES_AGENT_ROOT\}\/\.venv\/bin\/python/);
@@ -54,7 +57,10 @@ assert.match(adapter, /executionReceipt: run\.readOnlyExecutionReceipt/,
 assert.match(adapter, /!run\.readOnlyAudit && !run\.boundedFileWrite && \(!run\.workspaceLeaseNonce/,
   "read-only Hermes dispatch does not require a mutation lease");
 
-assert.match(runner, /add_observer\(on_raw_event\)/);
+assert.match(runner, /from acp\.core import connect_to_agent/);
+assert.match(runner, /asyncio\.create_subprocess_exec/);
+assert.match(runner, /session_update\(self, session_id: str, update/);
+assert.match(runner, /FileSystemCapabilities\(write_text_file=True\)/);
 assert.match(runner, /KontrolACPClient/);
 assert.match(runner, /request_permission/);
 assert.match(runner, /permission_request/);
@@ -62,7 +68,7 @@ assert.match(runner, /permission_response/);
 assert.match(runner, /RequestPermissionResponse/);
 assert.match(runner, /"raw_update"/);
 assert.match(runner, /"raw_request"/);
-assert.match(runner, /connects? to ``hermes acp``|hermes acp/);
+assert.match(runner, /public ACP Python SDK/);
 assert.doesNotMatch(runner, /hermes_idle_completion_fallback/);
 assert.doesNotMatch(runner, /stop_reason="idle_end_turn"/);
 assert.match(runner, /max_run_seconds/);
@@ -73,5 +79,45 @@ assert.match(adapter, /deliveryErrors/);
 assert.match(adapter, /terminalOutcome/);
 assert.match(adapter, /flushCoalesced\(run, type, true\)/);
 assert.doesNotMatch(adapter, /stdoutBuffer \+= chunk;\s*stdoutBuffer \+= chunk;/);
+
+const currentCandidates = hermesAcpCandidates({
+  hermesBin: "hermes",
+  hermesBinPath: "/opt/hermes/bin/hermes",
+});
+assert.deepEqual(currentCandidates.slice(0, 2).map(({ command, args }) => ({ command, args })), [
+  { command: "/opt/hermes/bin/hermes-acp", args: [] },
+  { command: "hermes-acp", args: [] },
+], "the upstream standalone ACP entry is preferred to the compatibility subcommand");
+assert.deepEqual(currentCandidates.at(-1), {
+  command: "hermes",
+  args: ["acp"],
+  mode: "subcommand",
+  source: "legacy subcommand",
+});
+
+const explicitCandidates = hermesAcpCandidates({ hermesAcpBin: "/custom/hermes-acp", hermesBin: "hermes" });
+assert.deepEqual(explicitCandidates, [{
+  command: "/custom/hermes-acp",
+  args: [],
+  mode: "standalone",
+  source: "HERMES_ACP_BIN",
+}], "an explicit ACP executable is authoritative");
+
+const selected = selectHermesAcpEntry(currentCandidates, (entry) => ({
+  status: entry.mode === "standalone" && entry.command === "hermes-acp" ? 0 : 2,
+}));
+assert.equal(selected.entry?.command, "hermes-acp", "entry selection continues through missing sibling executables");
+assert.equal(selected.attempts.length, 2);
+const legacy = selectHermesAcpEntry(currentCandidates, (entry) => ({ status: entry.mode === "subcommand" ? 0 : 127 }));
+assert.deepEqual(legacy.entry?.args, ["acp"], "older Hermes installs remain supported when the standalone command is absent");
+const explicitLegacy = hermesAcpCandidates({
+  hermesBin: "/fixture/hermes-test-double",
+  hermesBinPath: "/fixture/hermes-test-double",
+  hermesBinExplicit: true,
+});
+assert.deepEqual(explicitLegacy.slice(0, 2).map(({ command, args }) => ({ command, args })), [
+  { command: "/fixture/hermes-acp", args: [] },
+  { command: "/fixture/hermes-test-double", args: ["acp"] },
+], "an explicit HERMES_BIN does not get shadowed by an unrelated hermes-acp on PATH");
 
 console.log("hermes-native-adapter.test.mjs: all assertions passed");

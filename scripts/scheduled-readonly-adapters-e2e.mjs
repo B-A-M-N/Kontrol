@@ -118,39 +118,35 @@ async function createHermesFixture(root) {
     await mkdir(join(hermesRoot, packagePath), { recursive: true });
     await writeFile(join(hermesRoot, packagePath, "__init__.py"), "# scheduled integration fixture\n");
   }
-  await writeFile(join(sitePackages, "acp", "__init__.py"), "async def connect_to_agent(*args, **kwargs):\n    raise RuntimeError('fixture ACP client is provided by the native adapter')\nclass Client:\n    pass\n");
-  await writeFile(join(sitePackages, "acp", "connection.py"), "class StreamDirection:\n    INCOMING = 'incoming'\nclass StreamEvent:\n    pass\n");
-  await writeFile(join(hermesRoot, "acp_adapter", "client.py"), [
-    "import asyncio",
-    "from types import SimpleNamespace",
-    "",
-    "class TaskEvent:",
-    "    def __init__(self, success, response_text, error=''):",
-    "        self.success = success",
-    "        self.response_text = response_text",
-    "        self.thought_text = ''",
-    "        self.usage = {}",
-    "        self.stop_reason = 'completed' if success else 'error'",
-    "        self.error = error",
-    "",
-    "class _Connection:",
-    "    def add_observer(self, _observer):",
-    "        return None",
-    "",
-    "class ACPClient:",
-    "    def __init__(self, command, args, cwd, env, on_event, timeout, model):",
-    "        self.command, self.args, self.cwd, self.env, self.timeout = command, args, cwd, env, timeout",
-    "        self._conn = SimpleNamespace(_conn=_Connection())",
-    "    async def __aenter__(self):",
-    "        return self",
-    "    async def __aexit__(self, *_args):",
-    "        return False",
-    "    async def dispatch_task(self, prompt, task_id, timeout, cwd):",
-    "        process = await asyncio.create_subprocess_exec(self.command, *self.args, cwd=cwd, env=self.env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)",
-    "        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)",
-    "        return TaskEvent(process.returncode == 0, stdout.decode(), stderr.decode())",
+  await writeFile(join(sitePackages, "acp", "__init__.py"), "# public ACP SDK fixture\n");
+  await writeFile(join(sitePackages, "acp", "meta.py"), "PROTOCOL_VERSION = '1.0'\n");
+  await writeFile(join(sitePackages, "acp", "schema.py"), [
+    "class ClientCapabilities:",
+    "    def __init__(self, fs=None): self.fs = fs",
+    "class FileSystemCapabilities:",
+    "    def __init__(self, write_text_file=False): self.write_text_file = write_text_file",
+    "class Implementation:",
+    "    def __init__(self, name, version): self.name, self.version = name, version",
+    "class TextContentBlock:",
+    "    def __init__(self, type, text): self.type, self.text = type, text",
     "",
   ].join("\n"));
+  await writeFile(join(sitePackages, "acp", "core.py"), [
+    "from types import SimpleNamespace",
+    "class _Connection:",
+    "    def __init__(self, client, output_stream): self.client, self.output_stream = client, output_stream",
+    "    async def initialize(self, **_kwargs): return None",
+    "    async def new_session(self, **_kwargs): return SimpleNamespace(session_id='fixture-session')",
+    "    async def prompt(self, **_kwargs):",
+    "        text = (await self.output_stream.read()).decode('utf-8', errors='replace')",
+    "        await self.client.session_update('fixture-session', {'sessionUpdate': 'agent_message_chunk', 'content': {'text': text}})",
+    "        return SimpleNamespace(stop_reason='end_turn', usage=None)",
+    "    async def close(self): return None",
+    "def connect_to_agent(client, output_stream, **_kwargs): return _Connection(client, output_stream)",
+    "",
+  ].join("\n"));
+  await writeFile(join(hermesRoot, "acp_adapter", "entry.py"), "# public ACP server module fixture\n");
+  await writeFile(join(hermesRoot, "acp_adapter", "server.py"), "# public ACP server module fixture\n");
   await writeFile(pythonBin, `#!/bin/sh\nexport PYTHONPATH=${shellQuote(sitePackages)}:"$PYTHONPATH"\nexec /usr/bin/python3 "$@"\n`);
   await chmod(pythonBin, 0o700);
   await writeFile(fakeHermesBin, `#!/bin/sh\nif [ "$1" = acp ] && [ "$2" = --check ]; then exit 0; fi\nif [ "$1" = acp ]; then\n${mutationProbeShell()}\nexit 0\nfi\nexit 93\n`);

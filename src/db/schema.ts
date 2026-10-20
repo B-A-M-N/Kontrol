@@ -96,6 +96,10 @@ export const scheduledJobAttempts = sqliteTable("scheduled_job_attempts", {
   acpDispatchId: text("acp_dispatch_id"),
   acpAttemptNumber: integer("acp_attempt_number"),
   acpRemoteRunId: text("acp_remote_run_id"),
+  dispatchFailureClass: text("dispatch_failure_class"),
+  dispatchFailureReason: text("dispatch_failure_reason"),
+  dispatchProbeResultJson: text("dispatch_probe_result_json"),
+  nextEligibleAt: text("next_eligible_at"),
   outcome: text("outcome"),
 }, (table) => [
   index("scheduled_job_attempts_job_idx").on(table.jobId, table.startedAt),

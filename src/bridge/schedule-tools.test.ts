@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod/v4";
 import { createDispatchOutbox } from "../dispatch-outbox.js";
+import { createEventStore } from "../event-log.js";
 import { openDatabase } from "../db/client.js";
 import { createScheduledJobStore } from "../scheduling/scheduled-job-store.js";
 import { scheduledVerificationFingerprints } from "../scheduling/scheduled-verification-projection.js";
@@ -423,7 +424,7 @@ try {
   });
   const reportRowsBeforeReads = Number((database.sqlite.prepare("select count(*) as count from scheduled_job_reports").get() as { count: number }).count);
   const priorMissionLedger = config.missionLedger;
-  config.missionLedger = undefined;
+  config.missionLedger = { getResultReceipt: () => { throw new Error("no such column: outcome_evidence"); } } as any;
   const noArtifactResult = await resultTool({ scheduledJobId: unpersistedJob.id });
   const noArtifactStatus = await jobReadTool({ scheduledJobId: unpersistedJob.id });
   config.missionLedger = priorMissionLedger;
@@ -432,6 +433,13 @@ try {
   assert.equal(noArtifactResult.structuredContent.report, "",
     "result reads do not manufacture an immutable report from live ACP output");
   assert.equal(noArtifactStatus.structuredContent.scheduledJobId, unpersistedJob.id);
+  assert.equal(noArtifactResult.structuredContent.resultReceipt.verificationStatus, "not_performed",
+    "mission-ledger failure cannot manufacture a passing verification result");
+  assert.ok(noArtifactResult.structuredContent.resultReceipt.unresolvedBlockers.some((item: string) => item.includes("mission ledger could not be read")),
+    "the ordinary execution receipt remains readable and exposes its mission-evidence limitation");
+  assert.equal(noArtifactResult.structuredContent.resultReceipt.verificationStatus, "not_performed");
+  assert.ok(noArtifactResult.structuredContent.resultReceipt.verificationBlockers.some((item: string) => item.includes("no submitted immutable snapshot")),
+    "report-only audits never imply that scheduled verification ran without a submitted baseline");
   assert.equal(Number((database.sqlite.prepare("select count(*) as count from scheduled_job_reports").get() as { count: number }).count), reportRowsBeforeReads,
     "both read-only job getters leave the report table unchanged when no artifact exists");
 
@@ -510,11 +518,33 @@ try {
     },
     createdAt: new Date(Date.parse(lifecycleBase) + 3).toISOString(),
   });
+  const durableFailureEvents = createEventStore(database);
+  durableFailureEvents.appendEvent({
+    id: "failed-execution-diagnostic-event",
+    type: "agent.run.failed",
+    sessionId: "work-session-failed-execution",
+    payload: {
+      runId: "run-failed-execution",
+      dispatchId: failedExecutionClaim.dispatchId,
+      attemptNumber: 1,
+      workerFailureEvidence: {
+        phase: "execution",
+        category: "nonzero_exit",
+        exitCode: 1,
+        sanitizedStderrTail: "ERROR\\nNo prompt provided.",
+        eventId: "failed-execution-terminal",
+        runId: "run-failed-execution",
+        attemptNumber: 1,
+      },
+    },
+  });
   const failedExecutionReceipt = await resultTool({ scheduledJobId: failedExecutionJob.id });
   assert.equal(failedExecutionReceipt.structuredContent.resultReceipt.workerCompleted, false);
   assert.equal(failedExecutionReceipt.structuredContent.resultReceipt.workerExecutionOutcome, "failed");
   assert.equal(failedExecutionReceipt.structuredContent.resultReceipt.executionStatus, "failed",
     "a started worker's unsuccessful exit remains an execution failure");
+  assert.equal(failedExecutionReceipt.structuredContent.resultReceipt.workerFailureEvidence?.exitCode, 1);
+  assert.match(failedExecutionReceipt.structuredContent.resultReceipt.workerFailureEvidence?.sanitizedStderrTail ?? "", /No prompt provided/);
 
   const finalizationJob = jobs.create({
     principalId: "principal-a",

@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, symlinkSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, symlinkSync, rmSync, renameSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
-import { publishScheduledArtifact } from "./scheduled-artifact-publisher.js";
+import { publishScheduledArtifact, recoverScheduledArtifactPublication } from "./scheduled-artifact-publisher.js";
 import type { BoundedFileWriteOutputPolicy } from "./scheduled-job-store.js";
 
 function makeRoot(): string {
@@ -106,6 +106,119 @@ const job = { jobId: "job-test", workSessionId: "ws-test", workspaceRoot, attemp
   const policy: BoundedFileWriteOutputPolicy = { path: "not-there.txt", operation: "replace", overwrite: "deny" };
   const result = await publishScheduledArtifact({ ...job, path: "not-there.txt", content: Buffer.from("x\n"), output: policy });
   assert.equal(result.outcome, "conflict");
+}
+
+// 11. Concurrent create cannot replace a winner, and only one publication commits.
+{
+  const path = "racing-create.txt";
+  const output: BoundedFileWriteOutputPolicy = { path, operation: "create", overwrite: "deny" };
+  const candidates = ["first writer\n", "second writer\n"];
+  const results = await Promise.all(candidates.map((value) => publishScheduledArtifact({
+    ...job,
+    path,
+    content: Buffer.from(value),
+    output,
+  })));
+  assert.equal(results.filter((result) => result.outcome === "committed").length, 1);
+  assert.equal(results.filter((result) => result.outcome === "conflict").length, 1);
+  assert.ok(candidates.includes(readFileSync(join(workspaceRoot, path), "utf8")));
+}
+
+// 12. A destination appearing after the first check is never overwritten; intent and temp files are resolved.
+{
+  const path = "create-race-hook.txt";
+  const output: BoundedFileWriteOutputPolicy = { path, operation: "create", overwrite: "deny" };
+  let intent: Record<string, unknown> | undefined;
+  let failure: { outcome: string; reason: string } | undefined;
+  const result = await publishScheduledArtifact({
+    ...job,
+    path,
+    content: Buffer.from("authorized bytes\n"),
+    output,
+    recordPublicationIntent: (value) => {
+      intent = value;
+      writeFileSync(join(workspaceRoot, path), "external winner\n");
+    },
+    recordPublicationReceipt: () => undefined,
+    recordPublicationFailure: (_receiptId, outcome, reason) => { failure = { outcome, reason }; },
+  });
+  assert.equal(result.outcome, "conflict");
+  assert.equal(readFileSync(join(workspaceRoot, path), "utf8"), "external winner\n");
+  assert.equal(failure?.outcome, "conflict");
+  assert.equal(readdirSync(workspaceRoot).some((name) => name.includes(".tmp-") || name.endsWith(".proof")), false);
+  assert.ok(intent);
+  assert.equal(await recoverScheduledArtifactPublication({
+    jobId: job.jobId,
+    workSessionId: job.workSessionId,
+    workspaceRoot,
+    attemptId: "attempt-1",
+    attemptNumber: 1,
+    intent: intent!,
+  }), undefined, "matching output bytes without the publisher inode proof cannot recover a receipt");
+}
+
+// 13. A parent symlink swap after the directory is anchored cannot redirect publication outside the workspace.
+{
+  const root = makeRoot();
+  const parent = join(root, "parent");
+  const heldParent = join(root, "parent-held");
+  const outside = makeRoot();
+  mkdirSync(parent);
+  const path = "parent/anchored.txt";
+  const output: BoundedFileWriteOutputPolicy = { path, operation: "create", overwrite: "deny" };
+  const result = await publishScheduledArtifact({
+    ...job,
+    workspaceRoot: root,
+    path,
+    content: Buffer.from("anchored\n"),
+    output,
+    recordPublicationIntent: () => {
+      renameSync(parent, heldParent);
+      symlinkSync(outside, parent);
+    },
+    recordPublicationReceipt: () => undefined,
+    recordPublicationFailure: () => undefined,
+  });
+  receipt_ok(result, "parent symlink swap");
+  assert.equal(readFileSync(join(heldParent, "anchored.txt"), "utf8"), "anchored\n");
+  assert.equal(existsSync(join(outside, "anchored.txt")), false);
+  rmSync(root, { recursive: true, force: true });
+  rmSync(outside, { recursive: true, force: true });
+}
+
+// 14. A receipt-store failure leaves durable intent and a same-inode proof for restart recovery.
+{
+  const root = makeRoot();
+  const path = "recover-me.txt";
+  const output: BoundedFileWriteOutputPolicy = { path, operation: "create", overwrite: "deny" };
+  let intent: Record<string, unknown> | undefined;
+  const result = await publishScheduledArtifact({
+    ...job,
+    workspaceRoot: root,
+    path,
+    content: Buffer.from("recoverable bytes\n"),
+    output,
+    attemptId: "attempt-recovery",
+    attemptNumber: 2,
+    runId: "run-recovery",
+    dispatchIdempotencyKey: "dispatch-recovery",
+    recordPublicationIntent: (value) => { intent = value; },
+    recordPublicationReceipt: () => { throw new Error("simulated database write failure"); },
+  });
+  assert.equal(result.outcome, "rejected");
+  assert.ok(existsSync(join(root, path)), "the destination was published before receipt persistence failed");
+  assert.ok(intent && intent.state === "pending", "intent remains pending after database failure");
+  const recovered = await recoverScheduledArtifactPublication({
+    jobId: job.jobId,
+    workSessionId: job.workSessionId,
+    workspaceRoot: root,
+    attemptId: "attempt-recovery",
+    attemptNumber: 2,
+    intent: intent!,
+  });
+  assert.equal(recovered?.outcome, "committed");
+  assert.equal(recovered?.sha256, hash("recoverable bytes\n"));
+  rmSync(root, { recursive: true, force: true });
 }
 
 rmSync(workspaceRoot, { recursive: true, force: true });

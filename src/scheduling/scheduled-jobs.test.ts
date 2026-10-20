@@ -1,15 +1,35 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { eq } from "drizzle-orm";
 import { openDatabase } from "../db/client.js";
+import { scheduledJobAttempts } from "../db/schema.js";
 import { createDispatchOutbox } from "../dispatch-outbox.js";
 import { createEventStore } from "../event-log.js";
 import { createScheduledJobStore, schedulingOperation, type ScheduledJob } from "./scheduled-job-store.js";
-import { createScheduledJobRuntime, scheduledDispatchRetryDelayMs } from "./scheduled-job-runtime.js";
+import { createScheduledJobRuntime, scheduledDispatchRetryDelayMs, scheduledWakeDelayMs } from "./scheduled-job-runtime.js";
 import { scheduledJobAccessAllowed } from "../bridge/schedule-tools.js";
 
 const root = await mkdtemp(join(tmpdir(), "kontrol-scheduling-test-"));
+
+{
+  const now = 1_800_000_000_000;
+  const recovery = 5 * 60_000;
+  assert.equal(scheduledWakeDelayMs(now, [now + 4 * 60 * 60_000], recovery), recovery,
+    "a far-future job cannot delay bounded scheduler maintenance");
+  assert.equal(scheduledWakeDelayMs(now, [now + 35_000], recovery), 35_000,
+    "an outbox backoff deadline controls the next actionable dispatch wake");
+  assert.equal(scheduledWakeDelayMs(now, [now - 60_000], recovery), 100,
+    "an overdue outbox row is delayed by a small floor instead of spinning at zero delay");
+  assert.equal(scheduledWakeDelayMs(now, [now + 2 * 60_000], recovery), 2 * 60_000,
+    "running-work reconciliation deadlines wake before the recovery ceiling");
+  assert.equal(scheduledWakeDelayMs(now, [], recovery), recovery,
+    "an empty outbox after restart still receives bounded maintenance");
+  assert.equal(scheduledWakeDelayMs(now, [now + 10_000_000_000], 2_147_483_647), 2_147_483_647,
+    "deadlines are clamped to the valid platform timer range");
+}
 
 try {
   const db = openDatabase(root);
@@ -58,6 +78,112 @@ try {
     clientMutationId,
   });
   assert.equal(replay.id, job.id, "durable scheduling retry returns the original job");
+
+  // Publication and reconciliation transactions must execute and persist their
+  // callback bodies. Read the SQLite rows directly so a no-op transaction
+  // wrapper cannot pass merely because its public method did not throw.
+  {
+    const outputContent = "durable bounded artifact\n";
+    const outputSha256 = createHash("sha256").update(outputContent).digest("hex");
+    const bounded = jobs.create({
+      principalId: "bounded-user",
+      ownerContextId: "bounded-owner",
+      projectId: "bounded-project",
+      workspaceRoot: "/tmp/bounded-project",
+      runAt: new Date(Date.now() + 60_000).toISOString(),
+      instructionJson: { instructions: "Publish one authorized artifact." },
+      executionMode: "bounded_file_write",
+      policySnapshotJson: {
+        workspaceAccess: "staged_write",
+        allowedOutputs: [{ path: "artifact.txt", operation: "create", overwrite: "deny", expectedSha256: outputSha256 }],
+      },
+      maxRuntimeMs: 60_000,
+    });
+    jobs.transition({ jobId: bounded.id, expectedRevision: bounded.revision, nextStatus: "due", expectedSourceStatuses: ["pending"] });
+    const claim = jobs.claimDispatch({ jobId: bounded.id, expectedRevision: 2, dispatcherInstanceId: "bounded-test" });
+    jobs.bindWorkSession({ jobId: bounded.id, dispatchAttemptId: claim.attemptId, workSessionId: "ws-bounded-test" });
+    jobs.bindAcpAttempt({
+      jobId: bounded.id,
+      dispatchAttemptId: claim.attemptId,
+      workSessionId: "ws-bounded-test",
+      dispatchIdempotencyKey: claim.dispatchId,
+      runId: "run-bounded-test",
+      attemptNumber: 1,
+    });
+    assert.equal(jobs.getByWorkSessionId("ws-bounded-test")?.attemptNumber, 1,
+      "the allocated ACP attempt number is available before the adapter response");
+
+    const receipt = {
+      receiptId: "publication-bounded-test",
+      jobId: bounded.id,
+      workSessionId: "ws-bounded-test",
+      path: "artifact.txt",
+      operation: "create",
+      outcome: "committed",
+      sha256: outputSha256,
+      bytes: Buffer.byteLength(outputContent),
+      attemptId: claim.attemptId,
+      attemptNumber: 1,
+      runId: "run-bounded-test",
+      dispatchIdempotencyKey: claim.dispatchId,
+      readBackVerified: true,
+    };
+    jobs.recordPublicationIntent({
+      jobId: bounded.id,
+      intent: {
+        state: "pending",
+        receiptId: receipt.receiptId,
+        jobId: bounded.id,
+        workSessionId: "ws-bounded-test",
+        workspaceRoot: "/tmp/bounded-project",
+        path: receipt.path,
+        operation: receipt.operation,
+        sha256: receipt.sha256,
+        bytes: receipt.bytes,
+        attemptId: claim.attemptId,
+        attemptNumber: 1,
+        runId: "run-bounded-test",
+        dispatchIdempotencyKey: claim.dispatchId,
+        createdAt: new Date().toISOString(),
+      },
+    });
+    assert.equal(jobs.listPendingPublicationIntents().length, 1,
+      "the publication intent is durable before the destination mutation");
+    jobs.recordPublicationReceipt({ jobId: bounded.id, receipt });
+    const storedAfterPublication = db.db.select().from(scheduledJobAttempts)
+      .where(eq(scheduledJobAttempts.id, claim.attemptId)).get();
+    assert.ok(storedAfterPublication?.publicationReceiptsJson,
+      "a committed receipt is stored in the active SQLite attempt row");
+    assert.deepEqual(JSON.parse(storedAfterPublication.publicationReceiptsJson), [receipt]);
+    assert.equal(jobs.listPendingPublicationIntents().length, 0,
+      "receipt commit resolves the durable publication intent");
+
+    assert.throws(() => jobs.recordPublicationReceipt({
+      jobId: bounded.id,
+      receipt: { ...receipt, attemptId: "stale-attempt" },
+    }), /attempt disappeared|stale attempt/,
+    "a missing or stale attempt identity is rejected at the durable store boundary");
+    assert.throws(() => jobs.recordPublicationReceipt({
+      jobId: bounded.id,
+      receipt: { ...receipt, attemptNumber: 2 },
+    }), /attempt number mismatch/,
+    "a mismatched ACP attempt number is rejected");
+
+    const probeTime = new Date().toISOString();
+    jobs.recordReconcileProbe({ jobId: bounded.id, attemptId: claim.attemptId, evidence: "first probe", now: probeTime });
+    const firstProbe = db.db.select().from(scheduledJobAttempts)
+      .where(eq(scheduledJobAttempts.id, claim.attemptId)).get();
+    assert.equal(firstProbe?.reconcileProbeCount, 1,
+      "a reconcile probe increments the durable count");
+    assert.ok(firstProbe?.nextReconcileAt, "a reconcile probe persists its next deadline");
+    jobs.recordReconcileProbe({ jobId: bounded.id, attemptId: claim.attemptId, evidence: "second probe", now: probeTime });
+    const secondProbe = db.db.select().from(scheduledJobAttempts)
+      .where(eq(scheduledJobAttempts.id, claim.attemptId)).get();
+    assert.equal(secondProbe?.reconcileProbeCount, 2,
+      "repeated probes advance the durable count");
+    assert.ok(Date.parse(secondProbe?.nextReconcileAt ?? "") > Date.parse(firstProbe?.nextReconcileAt ?? ""),
+      "the next reconciliation deadline advances with bounded backoff");
+  }
 
   // ── K10: history reads stay page-bounded and due dispatch has a fixed pool. ──
   {
@@ -632,6 +758,8 @@ try {
           status: "dispatched",
           workSessionId: `ws-${jobId}`,
           executionReceipt: {
+            mode: "read_only_audit",
+            execution_grant: { signature: "test", expiresAt: Date.now() + 60_000 },
             issuer: "kontrol",
             work_session_id: `ws-${jobId}`,
             workspace_session_id: "project-a",
@@ -889,6 +1017,8 @@ try {
         acpDispatchId: claim.dispatchId,
         acpAttemptNumber: 1,
         executionReceipt: {
+          mode: "read_only_audit",
+          execution_grant: { signature: "test", expiresAt: Date.now() + 60_000 },
           issuer: "kontrol",
           work_session_id: "ws-lost-response",
           workspace_session_id: "project-a",
@@ -1100,6 +1230,52 @@ try {
     failProjection = false;
     await diagnosticRuntime.drainOnce();
 
+    // The durable diagnostic projection survives a process/database restart.
+    {
+      const diagnosticRestartRoot = join(root, "scheduler-diagnostic-restart");
+      const firstDb = openDatabase(diagnosticRestartRoot);
+      const firstOutbox = createDispatchOutbox(firstDb);
+      const firstJobs = createScheduledJobStore(firstDb, firstOutbox);
+      const restartJob = firstJobs.create({
+        principalId: "diagnostic-restart-user",
+        ownerContextId: "diagnostic-restart-owner",
+        projectId: "diagnostic-restart-project",
+        workspaceRoot: "/tmp/diagnostic-restart-project",
+        runAt: new Date(Date.now() - 1_000).toISOString(),
+        instructionJson: { instructions: "Persist one failure diagnostic." },
+        executionMode: "read_only_audit",
+        policySnapshotJson: { workspaceAccess: "read_only" },
+        workSessionId: "ws-diagnostic-restart",
+        maxRuntimeMs: 60_000,
+      });
+      firstJobs.transition({ jobId: restartJob.id, expectedRevision: restartJob.revision, nextStatus: "running", expectedSourceStatuses: ["pending"] });
+      const persistedEventStore = createEventStore(firstDb);
+      const failOnceEvents = {
+        getEventsAfter: () => { throw new Error("injected restart-persistent projection failure"); },
+        appendEvent: (event: any) => persistedEventStore.appendEvent(event),
+      } as any;
+      const firstRuntime = createScheduledJobRuntime({ database: firstDb, jobs: firstJobs, dispatchOutbox: firstOutbox, events: failOnceEvents });
+      await firstRuntime.drainOnce();
+      const beforeRestart = firstRuntime.getMetrics();
+      assert.equal(beforeRestart.lastDrainFailurePhase, "project_lifecycle_events");
+      const failureRow = firstDb.sqlite.prepare("select payload from event_log where type = 'scheduled_job.scheduler_error' order by seq desc limit 1").get() as { payload: string };
+      const persistedFailure = JSON.parse(failureRow.payload) as { fingerprint?: string; recurrenceCount?: number; operationPhase?: string };
+      assert.equal(persistedFailure.operationPhase, "project_lifecycle_events");
+      firstRuntime.stop();
+      firstDb.close();
+
+      const reopenedDb = openDatabase(diagnosticRestartRoot);
+      const reopenedOutbox = createDispatchOutbox(reopenedDb);
+      const reopenedJobs = createScheduledJobStore(reopenedDb, reopenedOutbox);
+      const reopenedRuntime = createScheduledJobRuntime({ database: reopenedDb, jobs: reopenedJobs, dispatchOutbox: reopenedOutbox });
+      const afterRestart = reopenedRuntime.getMetrics();
+      assert.equal(afterRestart.lastDrainFailurePhase, "project_lifecycle_events");
+      assert.equal(afterRestart.lastDrainFailureFingerprint, persistedFailure.fingerprint);
+      assert.equal(afterRestart.lastDrainFailureRecurrenceCount, 1);
+      reopenedRuntime.stop();
+      reopenedDb.close();
+    }
+
     const faultRoot = join(root, "scheduler-fault-diagnostics");
     const faultDb = openDatabase(faultRoot);
     const faultOutbox = createDispatchOutbox(faultDb);
@@ -1158,7 +1334,15 @@ try {
         dispatchOutbox: faultOutbox,
         events,
         pollMs: 60_000,
-        dispatch: async () => { dispatchCalls += 1; return { status: "failed", reason: "test dispatch complete" }; },
+        dispatch: async () => {
+          dispatchCalls += 1;
+          return {
+            status: "failed",
+            reason: "test dispatch complete",
+            failureClass: "adapter_rejected_dispatch",
+            probeResult: { executionMode: "read_only_audit", healthProbe: "healthy" },
+          };
+        },
       });
       await runtime.drainOnce();
       const readFailure = faultEvents.find((event) => event.payload.operationPhase === "reconcile_nonterminal_jobs");
@@ -1168,12 +1352,18 @@ try {
       await runtime.drainOnce();
       assert.equal(dispatchCalls, 1, "the scheduler continues polling and dispatches due work after the read recovers");
       assert.equal(faultJobs.get(rawReadJob.id)?.status, "failed");
+      const attempts = faultJobs.listDispatchAttempts?.(rawReadJob.id) ?? [];
+      assert.equal(attempts.length, 1);
+      assert.equal(attempts[0]?.failureClass, "adapter_rejected_dispatch");
+      assert.equal(attempts[0]?.failureReason, "test dispatch complete");
+      assert.deepEqual(attempts[0]?.probeResult, { executionMode: "read_only_audit", healthProbe: "healthy" });
     }
 
     // An exception while applying an otherwise readable lifecycle event is
     // retained at the projection cursor and retried on the very next drain.
     {
       const projectionJob = makeFailureJob("projection application", "ws-projection-application-fault");
+      const unrelatedDueJob = makeFailureJob("unrelated due dispatch");
       const claim = beginDispatch(projectionJob, "projection-fault-scheduler");
       faultJobs.completeDispatch({
         jobId: projectionJob.id,
@@ -1212,13 +1402,30 @@ try {
         },
       });
       const events = makeFaultEventStore((sessionId, cursor) => sessionId === event.sessionId && cursor < event.seq ? [event] : []);
-      const runtime = createScheduledJobRuntime({ database: faultDb, jobs: failingJobs, dispatchOutbox: faultOutbox, events, pollMs: 60_000 });
+      let independentDispatchCalls = 0;
+      const runtime = createScheduledJobRuntime({
+        database: faultDb,
+        jobs: failingJobs,
+        dispatchOutbox: faultOutbox,
+        events,
+        pollMs: 60_000,
+        dispatch: async () => {
+          independentDispatchCalls += 1;
+          return { status: "failed", reason: "independent dispatch complete", failureClass: "test_failure" };
+        },
+      });
       await runtime.drainOnce();
       assert.equal(runtime.getMetrics().lastDrainFailurePhase, "project_lifecycle_events");
       assert.equal(faultEvents.find((item) => item.payload.operationPhase === "project_lifecycle_events")?.payload.retryEligible, true);
       assert.equal(projectCalls, 1);
+      assert.equal(independentDispatchCalls, 1,
+        "a session-local projection failure does not block an unrelated authorized due-job dispatch");
+      assert.equal(faultJobs.get(unrelatedDueJob.id)?.status, "failed");
+      assert.equal((faultJobs.listDispatchAttempts?.(unrelatedDueJob.id) ?? []).length, 1,
+        "the due dispatch keeps one durable idempotency attempt");
       await runtime.drainOnce();
       assert.equal(projectCalls, 2, "failed projection retries from the same bounded target on the next drain");
+      assert.equal(independentDispatchCalls, 1, "projection recovery does not redispatch the completed attempt");
     }
 
     // Cancellation adapter errors leave the durable cancellation request
@@ -1312,6 +1519,11 @@ try {
       assert.equal(lookupFailure.payload.retryEligible, true);
       assert.equal(faultJobs.get(lookupJob.id)?.status, "uncertain_dispatch");
       assert.equal(runtime.getMetrics().serviceability.status, "degraded");
+      // The failed lookup now persists bounded backoff. Move that durable
+      // deadline into the past to exercise the later authoritative retry
+      // without sleeping through the production delay.
+      faultDb.sqlite.prepare("update scheduled_job_attempts set next_reconcile_at = ? where id = ?")
+        .run("2000-01-01T00:00:00.000Z", claim.attemptId);
       await runtime.drainOnce();
       assert.equal(faultJobs.get(lookupJob.id)?.status, "running", "later authoritative lookup reattaches the same remote attempt");
       assert.equal(dispatchCalls, 0, "receipt recovery never launches a duplicate worker");

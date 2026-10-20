@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run one Hermes native-ACP turn and emit JSONL events for Kontrol.
 
-This intentionally talks to ``hermes acp`` through Hermes's ACP client helper.
+This talks to Hermes through the public ACP Python SDK.
 It does not wrap ``hermes chat`` and it does not enable ``--yolo``. Kontrol
 owns the outer review barrier after the turn completes.
 """
@@ -12,6 +12,7 @@ import asyncio
 import json
 import os
 import sys
+import threading
 import uuid
 from pathlib import Path
 
@@ -31,23 +32,38 @@ async def main() -> int:
     sys.path.insert(0, str(hermes_root))
 
     pending_permissions: dict[str, asyncio.Future[dict]] = {}
-    stdin_task: asyncio.Task | None = None
+    response_text: list[str] = []
+    thought_text: list[str] = []
+    streaming_usage: dict = {}
 
-    async def read_adapter_responses() -> None:
+    def dump_acp(value):
+        if hasattr(value, "model_dump"):
+            return value.model_dump(mode="json", by_alias=True, exclude_none=True)
+        if isinstance(value, list):
+            return [dump_acp(item) for item in value]
+        if isinstance(value, dict):
+            return {key: dump_acp(item) for key, item in value.items()}
+        return value
+
+    def read_adapter_responses(loop: asyncio.AbstractEventLoop) -> None:
+        def deliver(msg: dict) -> None:
+            if msg.get("type") != "permission_response":
+                return
+            request_id = str(msg.get("requestId") or "")
+            future = pending_permissions.get(request_id)
+            if future and not future.done():
+                future.set_result(msg)
+
         while True:
-            line = await asyncio.to_thread(sys.stdin.readline)
+            line = sys.stdin.readline()
             if not line:
                 return
             try:
                 msg = json.loads(line)
             except Exception:
                 continue
-            if msg.get("type") != "permission_response":
-                continue
-            request_id = str(msg.get("requestId") or "")
-            future = pending_permissions.get(request_id)
-            if future and not future.done():
-                future.set_result(msg)
+            if isinstance(msg, dict):
+                loop.call_soon_threadsafe(deliver, msg)
 
     class KontrolACPClient:
         def on_connect(self, _conn) -> None:
@@ -61,19 +77,12 @@ async def main() -> int:
             future: asyncio.Future[dict] = loop.create_future()
             pending_permissions[request_id] = future
 
-            def dump(value):
-                if hasattr(value, "model_dump"):
-                    return value.model_dump(mode="json", by_alias=True, exclude_none=True)
-                if isinstance(value, list):
-                    return [dump(item) for item in value]
-                return value
-
             emit({
                 "type": "permission_request",
                 "requestId": request_id,
                 "sessionId": session_id,
-                "toolCall": dump(tool_call),
-                "options": dump(options),
+                "toolCall": dump_acp(tool_call),
+                "options": dump_acp(options),
             })
 
             # No timeout: a human may step away for hours. Like the CLI coding
@@ -89,15 +98,31 @@ async def main() -> int:
 
             if response.get("approved"):
                 option_id = str(response.get("optionId") or "")
-                allowed = {str(option.get("optionId") or option.get("option_id") or "") for option in dump(options)}
+                allowed = {str(option.get("optionId") or option.get("option_id") or "") for option in dump_acp(options)}
                 if option_id in allowed:
                     return RequestPermissionResponse(outcome=AllowedOutcome(option_id=option_id, outcome="selected"))
             return RequestPermissionResponse(outcome=DeniedOutcome(outcome="cancelled"))
 
-        async def session_update(self, **_kwargs) -> None:
-            return None
+        async def session_update(self, session_id: str, update, **_kwargs) -> None:
+            data = dump_acp(update)
+            update_type = str(data.get("sessionUpdate") or data.get("type") or "") if isinstance(data, dict) else ""
+            content = data.get("content") if isinstance(data, dict) else None
+            text = content.get("text", "") if isinstance(content, dict) else ""
+            if update_type == "agent_message_chunk" and isinstance(text, str):
+                response_text.append(text)
+            elif update_type == "agent_thought_chunk" and isinstance(text, str):
+                thought_text.append(text)
+            elif update_type == "usage_update":
+                streaming_usage.update(data)
+            emit({"type": "raw_update", "params": {"sessionId": session_id, "update": data}})
 
         async def write_text_file(self, **kwargs):
+            from acp.schema import WriteTextFileResponse
+
+            if os.environ.get("KONTROL_BOUNDED_FILE_WRITE") != "1" or os.environ.get("KONTROL_READ_ONLY_EXECUTION") == "1":
+                emit({"type": "error", "error": "write_text_file is unavailable outside a signed bounded-write execution"})
+                raise RuntimeError("write_text_file is unavailable outside a signed bounded-write execution")
+
             path = kwargs.get("path")
             content = kwargs.get("content")
             if not isinstance(path, str) or not isinstance(content, str):
@@ -215,7 +240,7 @@ async def main() -> int:
                     "sha256": write_sc.get("contentSha256"),
                     "workspaceId": workspace_id,
                 })
-                return
+                return WriteTextFileResponse()
             except Exception as exc:
                 emit({"type": "error", "error": f"bounded write failed: {exc}"})
                 raise
@@ -245,44 +270,16 @@ async def main() -> int:
             emit({"type": "raw_request", "method": method, "params": params})
 
     try:
-        import acp
-        from acp.connection import StreamDirection, StreamEvent
-        from acp_adapter.client import ACPClient, TaskEvent
+        from acp.core import connect_to_agent
+        from acp.meta import PROTOCOL_VERSION
+        from acp.schema import ClientCapabilities, FileSystemCapabilities, Implementation, TextContentBlock
     except Exception as exc:  # pragma: no cover - exercised by integration env
-        emit({"type": "error", "error": f"failed to import Hermes ACP client: {exc}"})
+        emit({"type": "error", "error": f"failed to import public ACP SDK: {exc}"})
         return 3
-
-    original_connect_to_agent = acp.connect_to_agent
-
-    def connect_to_agent_with_kontrol_client(client, *args, **kwargs):
-        return original_connect_to_agent(client or KontrolACPClient(), *args, **kwargs)
-
-    acp.connect_to_agent = connect_to_agent_with_kontrol_client
-
-    def on_event(event: TaskEvent) -> None:
-        event_type = event.event_type
-        data = event.data or {}
-        emit({"type": "event", "eventType": event_type, "data": data})
-
-    def on_raw_event(event: StreamEvent) -> None:
-        if event.direction != StreamDirection.INCOMING:
-            return
-        message = event.message
-        if not isinstance(message, dict):
-            return
-        method = message.get("method")
-        if method == "session/update" and "id" not in message:
-            note_activity()
-            update = message.get("params", {}).get("update", {})
-            if isinstance(update, dict):
-                update_type = str(update.get("sessionUpdate") or update.get("type") or "")
-            emit({"type": "raw_update", "params": message.get("params", {})})
-        elif isinstance(method, str) and method.startswith("session/"):
-            emit({"type": "raw_request", "method": method, "params": message.get("params", {})})
 
     env = dict(os.environ)
     command = spec.get("command") or "hermes"
-    args = spec.get("args") or ["acp"]
+    args = spec.get("args") or []
     cwd = spec.get("cwd") or os.getcwd()
     max_run_seconds = positive_duration(
         spec.get("maxRunSeconds") or os.environ.get("KONTROL_HERMES_MAX_RUN_SECONDS"),
@@ -294,58 +291,103 @@ async def main() -> int:
     timeout = positive_duration(spec.get("timeoutSeconds"), max_run_seconds)
 
     try:
-        stdin_task = asyncio.create_task(read_adapter_responses())
-        async with ACPClient(
-            command=command,
-            args=args,
-            cwd=cwd,
+        loop = asyncio.get_running_loop()
+        threading.Thread(target=read_adapter_responses, args=(loop,), name="kontrol-adapter-responses", daemon=True).start()
+        process = await asyncio.create_subprocess_exec(
+            command,
+            *args,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
             env=env,
-            on_event=on_event,
-            timeout=timeout,
-            model=str(spec.get("model") or ""),
-        ) as client:
-            try:
-                client._conn._conn.add_observer(on_raw_event)  # type: ignore[attr-defined]
-            except Exception as exc:
-                emit({"type": "event", "eventType": "warning", "data": {"message": f"failed to attach raw ACP observer: {exc}"}})
-            task = asyncio.create_task(client.dispatch_task(
-                prompt=str(spec.get("task") or ""),
-                task_id=str(spec.get("runId") or ""),
-                timeout=timeout,
-                cwd=cwd,
-            ))
-            # Completion is owned by the ACP task result.  Wall-clock silence
-            # is not a protocol event: Hermes may be running a long test,
-            # waiting for permission/review, or processing a large tool result.
-            # In particular, never cancel the task and synthesize success from
-            # an idle timer.  The outer timeout remains a failure boundary in
-            # ACPClient, not a successful turn.
-            try:
-                result = await asyncio.wait_for(task, timeout=max_run_seconds)
-            except asyncio.TimeoutError:
-                task.cancel()
-                emit({"type": "error", "error": f"absolute run ceiling exceeded after {max_run_seconds:.0f}s"})
-                return 1
-    except Exception as exc:
-        emit({"type": "error", "error": str(exc)})
-        return 1
-    finally:
-        if stdin_task is not None:
-            stdin_task.cancel()
-            try:
-                await stdin_task
-            except asyncio.CancelledError:
-                pass
+            cwd=cwd,
+            limit=10 * 1024 * 1024,
+        )
+        if process.stdout is None or process.stdin is None:
+            raise RuntimeError("Hermes ACP subprocess did not expose both stdio pipes")
+        stderr_task = None
+        if process.stderr is not None:
+            async def forward_stderr() -> None:
+                while chunk := await process.stderr.read(64 * 1024):
+                    sys.stderr.buffer.write(chunk)
+                    sys.stderr.buffer.flush()
+            stderr_task = asyncio.create_task(forward_stderr())
 
+        connection = None
+        try:
+            client = KontrolACPClient()
+            connection = connect_to_agent(
+                client=client,
+                input_stream=process.stdin,
+                output_stream=process.stdout,
+                use_unstable_protocol=True,
+            )
+            try:
+                await connection.initialize(
+                    protocol_version=PROTOCOL_VERSION,
+                    client_capabilities=ClientCapabilities(fs=FileSystemCapabilities(write_text_file=True)),
+                    client_info=Implementation(name="kontrol-hermes-runner", version="1.0.0"),
+                )
+                session = await connection.new_session(cwd=cwd, mcp_servers=[])
+                prompt = str(spec.get("task") or "")
+                result = await asyncio.wait_for(
+                    connection.prompt(
+                        prompt=[TextContentBlock(type="text", text=prompt)],
+                        session_id=session.session_id,
+                    ),
+                    timeout=min(timeout, max_run_seconds),
+                )
+            except asyncio.TimeoutError:
+                emit({"type": "error", "error": f"ACP prompt exceeded its {min(timeout, max_run_seconds):.0f}s deadline (absolute run ceiling: {max_run_seconds:.0f}s)"})
+                return 1
+        finally:
+            if connection is not None:
+                await connection.close()
+            if process.stdin and not process.stdin.is_closing():
+                process.stdin.close()
+                try:
+                    await process.stdin.wait_closed()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+            try:
+                await asyncio.wait_for(process.wait(), timeout=2.0)
+            except asyncio.TimeoutError:
+                if process.returncode is None:
+                    try:
+                        process.terminate()
+                    except ProcessLookupError:
+                        pass
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    if process.returncode is None:
+                        try:
+                            process.kill()
+                        except ProcessLookupError:
+                            pass
+                    await process.wait()
+            if stderr_task is not None:
+                try:
+                    await asyncio.wait_for(stderr_task, timeout=2.0)
+                except asyncio.TimeoutError:
+                    stderr_task.cancel()
+                    try:
+                        await stderr_task
+                    except asyncio.CancelledError:
+                        pass
+    except Exception as exc:
+        emit({"type": "error", "error": f"{type(exc).__name__}: {exc}"})
+        return 1
+
+    stop_reason = getattr(result.stop_reason, "value", result.stop_reason)
     emit({
-        "type": "complete" if result.success else "error",
-        "responseText": result.response_text,
-        "thoughtText": result.thought_text,
-        "usage": result.usage,
-        "stopReason": result.stop_reason,
-        "error": result.error,
+        "type": "complete",
+        "responseText": "".join(response_text),
+        "thoughtText": "".join(thought_text),
+        "usage": dump_acp(result.usage) if getattr(result, "usage", None) else streaming_usage,
+        "stopReason": stop_reason,
     })
-    return 0 if result.success else 1
+    return 0
 
 
 def positive_duration(value, fallback: float) -> float:

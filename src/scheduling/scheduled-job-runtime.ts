@@ -12,6 +12,8 @@ import type { DatabaseHandle } from "../db/client.js";
 import type { EventStore, EventStoreEvent } from "../event-log.js";
 import type { ScheduledJob, ScheduledJobStore } from "./scheduled-job-store.js";
 import type { ReadOnlyExecutionReceipt } from "../acp-gateway.js";
+import { recoverScheduledArtifactPublication, removeScheduledArtifactProof } from "./scheduled-artifact-publisher.js";
+import { redactedPreview } from "../redaction.js";
 
 export interface ScheduledDispatchOutcome {
   status: "dispatched" | "blocked" | "failed" | "uncertain";
@@ -24,6 +26,8 @@ export interface ScheduledDispatchOutcome {
   attemptNumber?: number;
   executionReceipt?: ReadOnlyExecutionReceipt;
   reason?: string;
+  failureClass?: string;
+  probeResult?: Record<string, unknown>;
 }
 
 export interface ScheduledJobRuntime {
@@ -78,7 +82,7 @@ export interface ScheduledJobRuntimeOptions {
    * the durable work-session correlation and any real failure reason, so the
    * recorded job carries its evidence rather than only a status word.
    */
-  dispatch?: (jobId: string, attempt: { dispatchId: string }) => Promise<ScheduledDispatchOutcome>;
+  dispatch?: (jobId: string, attempt: { dispatchId: string; dispatchAttemptId: string }) => Promise<ScheduledDispatchOutcome>;
   /** Query the authoritative run registry for an interrupted dispatch attempt. */
   reconcileDispatch?: (input: {
     jobId: string;
@@ -102,6 +106,13 @@ export function scheduledDispatchRetryDelayMs(retryCount: number, random = Math.
   const base = Math.min(TRANSIENT_DISPATCH_RETRY_MAX_MS, TRANSIENT_DISPATCH_RETRY_BASE_MS * (2 ** exponent));
   const jittered = base * (0.8 + random() * 0.4);
   return Math.min(TRANSIENT_DISPATCH_RETRY_MAX_MS, Math.max(1_000, Math.round(jittered)));
+}
+
+export function scheduledWakeDelayMs(nowMs: number, deadlines: number[], recoveryIntervalMs = 5 * 60_000): number {
+  const recoveryLimit = Math.max(1_000, Math.min(2_147_483_647, recoveryIntervalMs));
+  const valid = deadlines.filter(Number.isFinite);
+  const earliest = valid.length ? Math.min(...valid) : undefined;
+  return Math.max(100, Math.min(recoveryLimit, earliest === undefined ? recoveryLimit : earliest - nowMs));
 }
 
 export function createScheduledJobRuntime(options: ScheduledJobRuntimeOptions): ScheduledJobRuntime {
@@ -130,19 +141,19 @@ export function createScheduledJobRuntime(options: ScheduledJobRuntimeOptions): 
   const recurrenceByFingerprint = new Map<string, number>();
 
   function recordDrainFailure(phase: string, error: unknown, jobId?: string, attemptId?: string): void {
-    const message = error instanceof Error ? error.message : String(error);
+    const message = redactedPreview(error instanceof Error ? error.message : String(error), 500);
     const failureClass = error instanceof Error ? error.name || "Error" : "NonErrorThrow";
     const fingerprint = createHash("sha256").update(`${phase}\n${failureClass}\n${message}`).digest("hex");
     let durableRecurrenceCount = 0;
     try {
       const cutoff = new Date(Date.now() - 5 * 60_000).toISOString();
       const rows = database.sqlite.prepare(`
-        select payload_json from event_log
+        select payload from event_log
          where type = 'scheduled_job.scheduler_error' and created_at >= ?
          order by seq desc limit 100
-      `).all(cutoff) as Array<{ payload_json: string }>;
+      `).all(cutoff) as Array<{ payload: string }>;
       durableRecurrenceCount = rows.reduce((count, row) => {
-        try { return count + (JSON.parse(row.payload_json)?.fingerprint === fingerprint ? 1 : 0); }
+        try { return count + (JSON.parse(row.payload)?.fingerprint === fingerprint ? 1 : 0); }
         catch { return count; }
       }, 0);
     } catch { /* a failing diagnostic read must not stop the scheduler */ }
@@ -632,7 +643,7 @@ export function createScheduledJobRuntime(options: ScheduledJobRuntimeOptions): 
         dispatchOutbox.release(
           claim,
           Date.parse(job.dispatchNextEligibleAt) - Date.now(),
-          job.lastError ?? "scheduled dispatch is waiting for its bounded retry window",
+          redactedPreview(job.lastError ?? "scheduled dispatch is waiting for its bounded retry window", 500),
         );
         return;
       }
@@ -646,7 +657,7 @@ export function createScheduledJobRuntime(options: ScheduledJobRuntimeOptions): 
         dispatcherInstanceId: schedulerInstanceId,
         leaseMs,
       });
-      const outcome = await options.dispatch(job.id, { dispatchId: dispatchClaim.dispatchId });
+      const outcome = await options.dispatch(job.id, { dispatchId: dispatchClaim.dispatchId, dispatchAttemptId: dispatchClaim.attemptId });
       if (outcome.status === "dispatched" || outcome.status === "uncertain" || outcome.status === "failed") {
         const completed = jobs.completeDispatch({
           jobId: job.id,
@@ -662,6 +673,8 @@ export function createScheduledJobRuntime(options: ScheduledJobRuntimeOptions): 
           executionReceipt: outcome.executionReceipt,
           agentName: outcome.lastAttemptedAgent,
           lastError: outcome.reason,
+          failureClass: outcome.failureClass,
+          probeResult: outcome.probeResult,
         });
         if (completed.status === "cancellation_requested" && completed.cancellationLastConfirmedState === "not_dispatched"
           && completed.cancellationRequestId) {
@@ -681,6 +694,8 @@ export function createScheduledJobRuntime(options: ScheduledJobRuntimeOptions): 
               ? {}
               : { nextEligibleAt: new Date(Date.now() + scheduledDispatchRetryDelayMs(job.dispatchRetryCount + 1)).toISOString() }),
             lastAttemptedAgent: outcome.lastAttemptedAgent ?? job.agentName,
+            failureClass: outcome.failureClass,
+            probeResult: outcome.probeResult,
           },
         });
         if (released.status === "cancellation_requested" && released.cancellationRequestId
@@ -696,41 +711,68 @@ export function createScheduledJobRuntime(options: ScheduledJobRuntimeOptions): 
         dispatchOutbox.release(
           claim,
           Math.max(0, Date.parse(released.dispatchNextEligibleAt ?? new Date().toISOString()) - Date.now()),
-          outcome.reason ?? "scheduled dispatch blocked before launch",
+          redactedPreview(outcome.reason ?? "scheduled dispatch blocked before launch", 500),
         );
         return;
       }
       dispatchOutbox.markCompleted(claim);
     } catch (error) {
       recordDrainFailure("dispatch_due_event", error, event.aggregateId);
-      dispatchOutbox.markFailed(claim, error instanceof Error ? error.message : String(error), 5_000);
+        dispatchOutbox.markFailed(claim, redactedPreview(error instanceof Error ? error.message : String(error), 500), 5_000);
     }
   }
 
   async function runDrain(): Promise<void> {
-    let phase = "reconcile_nonterminal_jobs";
     activeDrainJobId = undefined;
     activeDrainAttemptId = undefined;
-    try {
-      reconcileNonterminalJobs();
-      phase = "outbox_claim_reaping";
-      dispatchOutbox.reapExpiredClaims(leaseMs);
-      phase = "project_lifecycle_events";
-      await reconcileProjectableEvents();
-      phase = "finalize_scheduled_reports";
-      jobs.reconcilePendingReportFinalizations(25);
-      phase = "reconcile_scheduled_verifications";
-      jobs.reconcileStaleVerificationExecutions(25);
-      // Replay durable worker events before enforcing deadlines. A completion
-      // already in the event log must close the execution window before an
-      // overdue timer can request cancellation.
-      phase = "execution_deadlines";
-      reconcileRunningDeadlines();
-      phase = "reconcile_interrupted_dispatches";
-      await reconcileInterruptedDispatches();
-      phase = "reconcile_cancellations";
-      await reconcileCancellations();
-      phase = "claim_and_dispatch_due_jobs";
+    const runPhase = async (phase: string, operation: () => void | Promise<void>, critical = false): Promise<boolean> => {
+      try {
+        await operation();
+        activeDrainJobId = undefined;
+        activeDrainAttemptId = undefined;
+        return true;
+      } catch (error) {
+        recordDrainFailure(phase, error, activeDrainJobId, activeDrainAttemptId);
+        activeDrainJobId = undefined;
+        activeDrainAttemptId = undefined;
+        const code = error && typeof error === "object" && "code" in error
+          ? String((error as { code?: unknown }).code ?? "")
+          : "";
+        const globalDatabaseFailure = /^(?:SQLITE_(?:CORRUPT|NOTADB|IOERR|FULL|READONLY|CANTOPEN))/.test(code);
+        return !critical && !globalDatabaseFailure;
+      }
+    };
+
+    // These first two phases establish safe ownership of the durable outbox.
+    // If either fails, do not make new dispatch claims in this drain.
+    if (!await runPhase("reconcile_nonterminal_jobs", () => reconcileNonterminalJobs(), true)) return;
+    if (!await runPhase("outbox_claim_reaping", () => { dispatchOutbox.reapExpiredClaims(leaseMs); }, true)) return;
+
+    if (!await runPhase("reconcile_bounded_publications", async () => {
+      for (const pending of jobs.listPendingPublicationIntents(25)) {
+        try {
+          const receipt = await recoverScheduledArtifactPublication(pending);
+          if (!receipt) continue;
+          jobs.recordPublicationReceipt({ jobId: pending.jobId, receipt: receipt as unknown as Record<string, unknown> });
+          await removeScheduledArtifactProof(pending);
+        } catch (error) {
+          recordDrainFailure("reconcile_bounded_publication", error, pending.jobId, pending.attemptId);
+        }
+      }
+    })) return;
+    // Each maintenance phase keeps its own cursor/claim transaction. A stale
+    // lifecycle projection for one session must not starve unrelated due-job
+    // dispatch; the event cursor advances only when that projection commits.
+    if (!await runPhase("project_lifecycle_events", () => reconcileProjectableEvents())) return;
+    if (!await runPhase("finalize_scheduled_reports", () => { jobs.reconcilePendingReportFinalizations(25); })) return;
+    if (!await runPhase("reconcile_scheduled_verifications", () => { jobs.reconcileStaleVerificationExecutions(25); })) return;
+    // Replay durable worker events before enforcing deadlines. A completion
+    // already in the event log must close the execution window before an
+    // overdue timer can request cancellation.
+    if (!await runPhase("execution_deadlines", () => { reconcileRunningDeadlines(); })) return;
+    if (!await runPhase("reconcile_interrupted_dispatches", () => reconcileInterruptedDispatches())) return;
+    if (!await runPhase("reconcile_cancellations", () => reconcileCancellations())) return;
+    await runPhase("claim_and_dispatch_due_jobs", async () => {
       const dueEvents: Array<{ id: string; aggregateId: string; claimedBy?: string; claimToken?: string }> = [];
       for (let index = 0; index < dispatchConcurrency; index += 1) {
         const event = dispatchOutbox.claimNext(schedulerInstanceId, leaseMs, ["scheduled_job.due"]);
@@ -738,29 +780,30 @@ export function createScheduledJobRuntime(options: ScheduledJobRuntimeOptions): 
         dueEvents.push(event);
       }
       await Promise.all(dueEvents.map((event) => processDueEvent(event)));
-    } catch (error) {
-      recordDrainFailure(phase, error, activeDrainJobId, activeDrainAttemptId);
-      activeDrainJobId = undefined;
-      activeDrainAttemptId = undefined;
-      // A drain failure never stops the runtime; the next poll retries.
-    }
+    }, true);
   }
 
   function scheduleNext(): void {
     if (timer) clearTimeout(timer);
-    let nextWakeMs = options.maxRecoveryIntervalMs ?? 5 * 60_000;
+    const maxRecoveryIntervalMs = Math.max(1_000, Math.min(2_147_483_647, options.maxRecoveryIntervalMs ?? 5 * 60_000));
+    const deadlines: number[] = [];
     try {
-      const now = new Date();
-      const due = database.sqlite.prepare(`
-        select min(run_at) as due
-          from scheduled_jobs
-         where status in ('pending','due')
-      `).get() as { due?: string | null } | undefined;
+      const outbox = database.sqlite.prepare(`
+        select min(available_at) as pending_at,
+               min(claim_expires_at) as claimed_until
+          from dispatch_outbox
+         where event_type = 'scheduled_job.due'
+           and status in ('pending','claimed')
+      `).get() as { pending_at?: string | null; claimed_until?: string | null } | undefined;
       const retry = database.sqlite.prepare(`
-        select min(min(next_eligible, next_reconcile)) as deadline
+        select min(deadline) as deadline
           from (
-            select job.dispatch_next_eligible_at as next_eligible,
-                   attempt.next_reconcile_at as next_reconcile
+            select job.dispatch_next_eligible_at as deadline
+              from scheduled_jobs job
+             where job.status = 'due'
+               and job.dispatch_next_eligible_at is not null
+            union all
+            select attempt.next_reconcile_at as deadline
               from scheduled_jobs job
               join scheduled_job_attempts attempt on attempt.id = job.active_dispatch_attempt_id
              where job.status in ('blocked','dispatching','uncertain_dispatch','operator_intervention','cancellation_requested')
@@ -768,16 +811,18 @@ export function createScheduledJobRuntime(options: ScheduledJobRuntimeOptions): 
           )
       `).get() as { deadline?: string | null } | undefined;
       const candidates = [
-        due?.due,
+        outbox?.pending_at,
+        outbox?.claimed_until,
         retry?.deadline,
       ].filter((value): value is string => Boolean(value))
         .map((value) => Date.parse(value))
         .filter((value) => Number.isFinite(value));
-      if (candidates.length) {
-        const earliest = Math.min(...candidates);
-        nextWakeMs = Math.max(0, earliest - Date.now());
-      }
+      deadlines.push(...candidates);
     } catch { /* fall back to the bounded recovery interval on diagnostic failure */ }
+    // Maintenance always gets a bounded recovery opportunity. Use outbox
+    // availability (which includes retry backoff) instead of overdue run_at,
+    // and avoid zero-delay timer loops on already-expired rows.
+    const nextWakeMs = scheduledWakeDelayMs(Date.now(), deadlines, maxRecoveryIntervalMs);
     timer = setTimeout(() => {
       void drainOnce().then(() => {
         if (!stopped) scheduleNext();
@@ -825,13 +870,13 @@ export function createScheduledJobRuntime(options: ScheduledJobRuntimeOptions): 
     try {
       const cutoff = new Date(now - 5 * 60_000).toISOString();
       const rows = database.sqlite.prepare(`
-        select created_at, payload_json from event_log
+        select created_at, payload from event_log
          where type = 'scheduled_job.scheduler_error' and created_at >= ?
          order by seq desc limit 100
-      `).all(cutoff) as Array<{ created_at: string; payload_json: string }>;
+      `).all(cutoff) as Array<{ created_at: string; payload: string }>;
       durableFailures = rows.flatMap((row) => {
         try {
-          const payload = JSON.parse(row.payload_json) as Record<string, unknown>;
+          const payload = JSON.parse(row.payload) as Record<string, unknown>;
           if (typeof payload.fingerprint !== "string") return [];
           return [{
             at: Date.parse(typeof payload.occurredAt === "string" ? payload.occurredAt : row.created_at),

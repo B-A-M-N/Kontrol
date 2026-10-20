@@ -84,11 +84,15 @@ export interface WorkspaceToolsDeps {
   readonly prepareForMutation: (workspaceId: string) => Promise<void>;
   readonly processSessions: ProcessSessionManager;
   readonly scheduledExecutionPolicyFor?: (workSessionId: string) => import("../../work-session-action-guard.js").ScheduledExecutionPolicy | undefined;
+  readonly recordPublicationIntent?: (input: { jobId: string; intent: Record<string, unknown> }) => void;
   readonly recordPublicationReceipt?: (input: { jobId: string; receipt: Record<string, unknown> }) => void;
+  readonly recordPublicationFailure?: (input: { jobId: string; receiptId: string; outcome: "rejected" | "conflict"; reason: string }) => void;
   readonly scheduledJobFor?: (workSessionId: string) => {
     id: string;
     activeDispatchAttemptId?: string;
     attemptNumber?: number;
+    acpRunId?: string;
+    dispatchIdempotencyKey?: string;
     policySnapshotJson: {
       allowedOutputs?: Array<{
         path?: string;
@@ -266,7 +270,7 @@ export function registerWorkspaceTools(
   server: McpServer,
   deps: WorkspaceToolsDeps,
 ): ReadonlySet<string> {
-  const { config, workspaces, reviewCheckpoints, policyEngine, policyEnforcer, connectionContext, workSessions, trackToolEvent, prepareForMutation, processSessions, scheduledExecutionPolicyFor, recordPublicationReceipt, scheduledJobFor } = deps;
+  const { config, workspaces, reviewCheckpoints, policyEngine, policyEnforcer, connectionContext, workSessions, trackToolEvent, prepareForMutation, processSessions, scheduledExecutionPolicyFor, recordPublicationIntent, recordPublicationReceipt, recordPublicationFailure, scheduledJobFor } = deps;
   const scheduledExecutionPolicy = (workSessionId: string | undefined) =>
     workSessionId && scheduledExecutionPolicyFor ? scheduledExecutionPolicyFor(workSessionId) : undefined;
   const registeredToolNames = new Set<string>();
@@ -812,11 +816,18 @@ export function registerWorkspaceTools(
       if (!scheduledJob) {
         return { content: [textBlock("Forbidden: no scheduled job is bound to this worker.")], isError: true };
       }
+      if (!scheduledJob.activeDispatchAttemptId || !Number.isSafeInteger(scheduledJob.attemptNumber) || (scheduledJob.attemptNumber ?? 0) < 1
+        || !scheduledJob.acpRunId || !scheduledJob.dispatchIdempotencyKey) {
+        return { content: [textBlock("Forbidden: the active ACP attempt identity is not durably bound.")], isError: true };
+      }
       const authorizedOutput = Array.isArray(scheduledJob.policySnapshotJson.allowedOutputs)
         ? scheduledJob.policySnapshotJson.allowedOutputs.find((output) => output?.path === input.path)
         : undefined;
       if (!authorizedOutput) {
         return { content: [textBlock(`Forbidden: path "${input.path}" is not an authorized output.`)], isError: true };
+      }
+      if (!recordPublicationIntent || !recordPublicationReceipt || !recordPublicationFailure) {
+        return { content: [textBlock("Internal error: scheduled publication durability is unavailable.")], isError: true };
       }
       const workspace = workspaces.getWorkspace(workspaceId);
       const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
@@ -833,6 +844,11 @@ export function registerWorkspaceTools(
           content: Buffer.from(input.content, "utf8"),
           attemptId: scheduledJob.activeDispatchAttemptId,
           attemptNumber: scheduledJob.attemptNumber,
+          runId: scheduledJob.acpRunId,
+          dispatchIdempotencyKey: scheduledJob.dispatchIdempotencyKey,
+          recordPublicationIntent: (intent) => recordPublicationIntent({ jobId: scheduledJob.id, intent }),
+          recordPublicationReceipt: (receipt) => recordPublicationReceipt({ jobId: scheduledJob.id, receipt: receipt as unknown as Record<string, unknown> }),
+          recordPublicationFailure: (receiptId, outcome, reason) => recordPublicationFailure({ jobId: scheduledJob.id, receiptId, outcome, reason }),
           output: {
             path: input.path,
             operation: (authorizedOutput.operation === "replace" ? "replace" : "create") as "create" | "replace",
@@ -841,7 +857,6 @@ export function registerWorkspaceTools(
             ...(authorizedOutput.expectedPreviousSha256 ? { expectedPreviousSha256: authorizedOutput.expectedPreviousSha256 } : {}),
           },
         });
-        recordPublicationReceipt?.({ jobId: scheduledJob.id, receipt: receipt as unknown as Record<string, unknown> });
         if (receipt.outcome !== "committed") {
           const response: Awaited<ReturnType<typeof writeFileTool>> = {
             content: [{ type: "text", text: `Artifact publication ${receipt.outcome}: ${receipt.reason ?? "unknown"}` }],
@@ -917,13 +932,38 @@ export function registerWorkspaceTools(
       const workspace = workspaces.getWorkspace(workspaceId);
       const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
       if (bindingErr) return bindingErr;
-      const resolvedPath = workspaces.resolvePath(workspace, input.path);
       const scheduledPolicy = scheduledExecutionPolicy(connectionContext?.workSessionId);
-      const stagedWrite = scheduledPolicy?.executionMode === "bounded_file_write"
-        && scheduledPolicy.workspaceAccess === "staged_write"
-        && Array.isArray(scheduledPolicy.allowedOutputs)
-        && scheduledPolicy.allowedOutputs.some((output) => output?.path === input.path);
+      const stagedWrite = scheduledPolicy?.executionMode === "bounded_file_write";
       const writeTool = stagedWrite ? toolNames.stagedWrite : toolNames.write;
+      const scheduledJob = stagedWrite && connectionContext?.workSessionId
+        ? scheduledJobFor?.(connectionContext.workSessionId)
+        : undefined;
+      const authorizedOutput = stagedWrite && scheduledJob
+        ? scheduledJob.policySnapshotJson.allowedOutputs?.find((output) => output?.path === input.path)
+        : undefined;
+      if (stagedWrite) {
+        if (scheduledPolicy?.workspaceAccess !== "staged_write"
+          || scheduledPolicy.mutate !== true
+          || !Array.isArray(scheduledPolicy.allowedOutputs)) {
+          return { content: [textBlock("Forbidden: bounded-write execution policy is invalid.")], isError: true };
+        }
+        if (!scheduledJob) {
+          return { content: [textBlock("Forbidden: no scheduled job is bound to this worker.")], isError: true };
+        }
+        if (!authorizedOutput) {
+          return { content: [textBlock(`Forbidden: path "${input.path}" is not an authorized output.`)], isError: true };
+        }
+        if (!scheduledJob.activeDispatchAttemptId
+          || !Number.isSafeInteger(scheduledJob.attemptNumber)
+          || (scheduledJob.attemptNumber ?? 0) < 1
+          || !scheduledJob.acpRunId || !scheduledJob.dispatchIdempotencyKey) {
+          return { content: [textBlock("Forbidden: the active ACP attempt identity is not durably bound.")], isError: true };
+        }
+        if (!recordPublicationIntent || !recordPublicationReceipt || !recordPublicationFailure) {
+          return { content: [textBlock("Internal error: scheduled publication durability is unavailable.")], isError: true };
+        }
+      }
+      const resolvedPath = workspaces.resolvePath(workspace, input.path);
       const policyPath = canonicalPolicyPath(workspace.root, input.path, resolvedPath);
 
       const newlyApplicable = await workspaces.loadApplicableInstructions(workspace, input.path, connectionContext?.mcpSessionId);
@@ -956,33 +996,34 @@ export function registerWorkspaceTools(
         }
       }
 
-      const scheduledJob = stagedWrite && connectionContext?.workSessionId
-        ? scheduledJobFor?.(connectionContext.workSessionId)
-        : undefined;
-      const authorizedOutput = stagedWrite && scheduledJob
-        ? scheduledJob.policySnapshotJson.allowedOutputs?.find((o) => o.path === input.path)
-        : undefined;
-
-      let mutation: LockedToolMutation<Awaited<ReturnType<typeof writeFileTool>>> | undefined;
-      if (stagedWrite && scheduledJob && authorizedOutput) {
+      let mutation: LockedToolMutation<Awaited<ReturnType<typeof writeFileTool>>>;
+      if (stagedWrite) {
+        const activeJob = scheduledJob!;
+        const output = authorizedOutput!;
         // Bounded scheduled writes route through the publisher for atomic
         // replacement, symlink-escape rejection, and read-back verification.
-        const publication = await withFileMutationLock<LockedToolMutation<Awaited<ReturnType<typeof writeFileTool>>>>([resolvedPath], async (): Promise<LockedToolMutation<Awaited<ReturnType<typeof writeFileTool>>>> => {
+        mutation = await withFileMutationLock<LockedToolMutation<Awaited<ReturnType<typeof writeFileTool>>>>([resolvedPath], async (): Promise<LockedToolMutation<Awaited<ReturnType<typeof writeFileTool>>>> => {
           const receipt = await publishScheduledArtifact({
-            jobId: scheduledJob.id,
+            jobId: activeJob.id,
             workSessionId: connectionContext?.workSessionId ?? "",
             workspaceRoot: workspace.root,
             path: input.path,
             content: Buffer.from(input.content, "utf8"),
+            attemptId: activeJob.activeDispatchAttemptId,
+            attemptNumber: activeJob.attemptNumber,
+            runId: activeJob.acpRunId,
+            dispatchIdempotencyKey: activeJob.dispatchIdempotencyKey,
+            recordPublicationIntent: (intent) => recordPublicationIntent!({ jobId: activeJob.id, intent }),
+            recordPublicationReceipt: (receipt) => recordPublicationReceipt!({ jobId: activeJob.id, receipt: receipt as unknown as Record<string, unknown> }),
+            recordPublicationFailure: (receiptId, outcome, reason) => recordPublicationFailure!({ jobId: activeJob.id, receiptId, outcome, reason }),
             output: {
               path: input.path,
-              operation: (authorizedOutput.operation === "replace" ? "replace" : "create") as "create" | "replace",
-              ...(authorizedOutput.expectedSha256 ? { expectedSha256: authorizedOutput.expectedSha256 } : {}),
-              overwrite: (authorizedOutput.overwrite === "expected_hash" ? "expected_hash" : "deny") as "deny" | "expected_hash",
-              ...(authorizedOutput.expectedPreviousSha256 ? { expectedPreviousSha256: authorizedOutput.expectedPreviousSha256 } : {}),
+              operation: (output.operation === "replace" ? "replace" : "create") as "create" | "replace",
+              ...(output.expectedSha256 ? { expectedSha256: output.expectedSha256 } : {}),
+              overwrite: (output.overwrite === "expected_hash" ? "expected_hash" : "deny") as "deny" | "expected_hash",
+              ...(output.expectedPreviousSha256 ? { expectedPreviousSha256: output.expectedPreviousSha256 } : {}),
             },
           });
-          recordPublicationReceipt?.({ jobId: scheduledJob.id, receipt: receipt as unknown as Record<string, unknown> });
           if (receipt.outcome !== "committed") {
             const response: Awaited<ReturnType<typeof writeFileTool>> = {
               content: [{ type: "text", text: `Artifact publication ${receipt.outcome}: ${receipt.reason ?? "unknown"}` }],
@@ -1012,7 +1053,6 @@ export function registerWorkspaceTools(
           return { response, contentSha256: await readFileVersion(resolvedPath) } as const;
         });
       }
-      if (!mutation) throw new Error("unreachable: mutation must be assigned in either branch");
       if ("versionConflict" in mutation) return mutation.versionConflict;
       const response = mutation.response;
 
