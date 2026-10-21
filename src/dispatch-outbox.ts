@@ -43,6 +43,10 @@ export interface DispatchOutbox {
     availableAt?: string;
   }): DispatchOutboxEvent;
 
+  /** Wake in-process consumers after a durable event is committed. Consumers
+   * must still reconcile the database on startup; notifications are hints. */
+  subscribe(listener: (event: DispatchOutboxEvent) => void, eventTypes?: string[]): () => void;
+
   /** Atomically claim the next available event for this worker. CAS on status. */
   claimNext(workerId: string, leaseMs: number, eventTypes?: string[], excludeAggregateIds?: string[]): DispatchOutboxEvent | null;
 
@@ -66,7 +70,7 @@ export interface DispatchOutbox {
   get(id: string): DispatchOutboxEvent | undefined;
   listByAggregate(aggregateId: string): DispatchOutboxEvent[];
 
-  listPending(limit?: number): DispatchOutboxEvent[];
+  listPending(limit?: number, eventTypes?: string[]): DispatchOutboxEvent[];
 
   hasActive(eventType: string, aggregateId: string): boolean;
   hasLogical(eventType: string, aggregateId: string, aggregateRevision?: number): boolean;
@@ -80,6 +84,20 @@ export function createDispatchOutbox(
 ): DispatchOutbox {
   const database =
     typeof stateDirOrHandle === "string" ? openDatabase(stateDirOrHandle) : stateDirOrHandle;
+  const listeners = new Set<{ listener: (event: DispatchOutboxEvent) => void; eventTypes?: Set<string> }>();
+
+  function notify(event: DispatchOutboxEvent): void {
+    for (const entry of listeners) {
+      if (entry.eventTypes && !entry.eventTypes.has(event.eventType)) continue;
+      try { entry.listener(event); } catch { /* durable enqueue must not depend on an observer */ }
+    }
+  }
+
+  function subscribe(listener: (event: DispatchOutboxEvent) => void, eventTypes?: string[]): () => void {
+    const entry = { listener, eventTypes: eventTypes ? new Set(eventTypes) : undefined };
+    listeners.add(entry);
+    return () => { listeners.delete(entry); };
+  }
 
   function enqueue(input: {
     eventType: string;
@@ -110,7 +128,7 @@ export function createDispatchOutbox(
       })
       .run();
 
-    return {
+    const event: DispatchOutboxEvent = {
       id,
       eventType: input.eventType,
       aggregateId: input.aggregateId,
@@ -122,6 +140,8 @@ export function createDispatchOutbox(
       availableAt: input.availableAt ?? now,
       createdAt: now,
     };
+    queueMicrotask(() => notify(event));
+    return event;
   }
 
   function claimNext(workerId: string, leaseMs: number, eventTypes?: string[], excludeAggregateIds?: string[]): DispatchOutboxEvent | null {
@@ -292,11 +312,11 @@ export function createDispatchOutbox(
     return result.changes === 1;
   }
 
-  function listPending(limit = 50): DispatchOutboxEvent[] {
+  function listPending(limit = 50, eventTypes?: string[]): DispatchOutboxEvent[] {
     return database.db
       .select()
       .from(dispatchOutbox)
-      .where(eq(dispatchOutbox.status, "pending"))
+      .where(and(eq(dispatchOutbox.status, "pending"), ...(eventTypes?.length ? [inArray(dispatchOutbox.eventType, eventTypes)] : [])))
       .orderBy(asc(dispatchOutbox.availableAt))
       .limit(limit)
       .all()
@@ -342,7 +362,9 @@ export function createDispatchOutbox(
       return { update, row };
     })();
     if (result.update.changes !== 1) return null;
-    return result.row ? rowToEvent(result.row) : null;
+    const event = result.row ? rowToEvent(result.row) : null;
+    if (event) queueMicrotask(() => notify(event));
+    return event;
   }
 
   function getByLogical(eventType: string, aggregateId: string, aggregateRevision: number): DispatchOutboxEvent | null {
@@ -364,6 +386,7 @@ export function createDispatchOutbox(
 
   return {
     enqueue,
+    subscribe,
     claimNext,
     reapExpiredClaims,
     release,

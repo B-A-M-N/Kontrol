@@ -12,7 +12,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { basename, delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync } from "node:fs";
 import { realpath, stat } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { clearAgentIdentity, identityHeaders, loadAgentIdentity, saveAgentIdentity } from "./lib/acp-agent-identity.mjs";
 import { readJsonBody, truncateUtf8Tail, writeAdapterError } from "./lib/adapter-http.mjs";
@@ -21,6 +21,7 @@ import { signWorkerToken, TOKEN_TTL_MS } from "./lib/acp-worker-token.mjs";
 import { adapterStatePath, atomicWriteJson, prepareOwnedChild, processStartToken, readJsonOr, reconcileOwnedProcesses, terminateProcessGroup } from "./lib/managed-agent-process.mjs";
 import { applyWorkspaceLeaseRenewal, workspaceLeaseDeadline, workspaceLeaseDeadlineReached } from "./lib/workspace-lease.mjs";
 import { formatHermesAcpAttempts, hermesAcpCandidates, selectHermesAcpEntry } from "./lib/hermes-acp-entry.mjs";
+import { classifyHermesStopReason } from "./lib/hermes-stop-reason.mjs";
 import { acknowledgeAdapterDispatchReceipt, adapterDispatchFingerprint, findAdapterDispatchReceipt, isTerminalAdapterDispatchStatus, loadAdapterDispatchReceipts, reconcileAdapterDispatchReceipts, recordAdapterDispatchReceipt } from "./lib/adapter-dispatch-receipts.mjs";
 const readOnlyModuleUrl = process.env.KONTROL_ARTIFACT_PATH
   ? pathToFileURL(resolve(process.env.KONTROL_ARTIFACT_PATH, "read-only-execution.mjs"))
@@ -66,6 +67,10 @@ const DISPATCH_RECEIPTS_PATH = process.env.KONTROL_HERMES_DISPATCH_RECEIPTS
   || adapterStatePath("hermes", "dispatch-receipts.json");
 const TERMINAL_SPOOL_PATH = process.env.KONTROL_HERMES_TERMINAL_SPOOL
   || adapterStatePath("hermes", "terminal-spool.json");
+const PROVIDER_SESSIONS_PATH = process.env.KONTROL_HERMES_PROVIDER_SESSIONS
+  || adapterStatePath("hermes", "provider-sessions.json");
+const HERMES_SESSION_HOME_ROOT = resolve(process.env.KONTROL_HERMES_SESSION_HOME_ROOT
+  || join(dirname(PROVIDER_SESSIONS_PATH), "session-homes"));
 const EVENT_SPOOL_PATH = process.env.KONTROL_HERMES_EVENT_SPOOL
   || adapterStatePath("hermes", "event-spool.json");
 const EVENT_SPOOL_MAX_EVENTS = 512;
@@ -145,9 +150,23 @@ const PYTHON_BIN = resolveHermesPython();
 let degraded = PYTHON_BIN === null;
 const HERMES_ACP_PYTHON_SITE_ROOT = PYTHON_BIN ? resolveHermesAcpPythonSiteRoot(PYTHON_BIN) : undefined;
 const HERMES_READ_ONLY_TOOLCHAIN_STATUS = getHermesReadOnlyToolchainStatus(PYTHON_BIN, HERMES_ACP_PYTHON_SITE_ROOT);
+const HERMES_PROVIDER_GENERATION = createHash("sha256").update(JSON.stringify({
+  hermesRoot: resolve(HERMES_AGENT_ROOT),
+  hermesVersion: detectHermesVersion(),
+  python: PYTHON_BIN ? resolve(PYTHON_BIN) : null,
+  executable: resolveHermesExecutableIdentity(HERMES_ACP_ENTRY.command),
+  args: HERMES_ACP_ENTRY.args,
+})).digest("hex");
 const active = new Map();
 const ownedProcesses = new Map();
 const dispatchReceipts = await loadAdapterDispatchReceipts(DISPATCH_RECEIPTS_PATH);
+const providerSessionBindings = new Map();
+for (const [key, binding] of Object.entries(await readJsonOr(PROVIDER_SESSIONS_PATH, {}))) {
+  if (binding && typeof binding.workSessionId === "string" && typeof binding.providerSessionId === "string") {
+    providerSessionBindings.set(key, binding);
+  }
+}
+let providerSessionWrite = Promise.resolve();
 const pendingTerminalSpool = new Map();
 const pendingEventSpool = new Map();
 let agentIdentity = null;
@@ -445,6 +464,36 @@ async function handle(req, res) {
     stderrTail: "",
     childExit: undefined,
   };
+  run.providerGeneration = HERMES_PROVIDER_GENERATION;
+  const providerSessionKey = run.workSessionId ? hashProviderSessionKey(run.workSessionId) : undefined;
+  const existingProviderBinding = providerSessionKey ? providerSessionBindings.get(providerSessionKey) : undefined;
+  if (existingProviderBinding && (existingProviderBinding.workSessionId !== run.workSessionId
+    || existingProviderBinding.agentId !== run.agentId
+    || existingProviderBinding.workspaceRoot !== run.workspaceRoot
+    || existingProviderBinding.providerGeneration !== run.providerGeneration)) {
+    return writeJson(res, 409, {
+      error: { code: "continuation_session_binding_conflict", message: "The persisted Hermes provider session belongs to a different work session, agent, workspace, or provider generation." },
+    });
+  }
+  if (body.continuation_id && !existingProviderBinding) {
+    return writeJson(res, 409, {
+      error: { code: "continuation_session_missing", message: "No persisted Hermes provider session exists for this continuation; refusing to start a new conversation." },
+    });
+  }
+  run.providerSessionBinding = existingProviderBinding ?? null;
+  if (run.workSessionId) {
+    try {
+      run.hermesSessionHome = prepareHermesSessionHome(
+        run.workSessionId,
+        run.workspaceRoot,
+        !existingProviderBinding,
+        !run.readOnlyAudit && !run.boundedFileWrite,
+      );
+    } catch (error) {
+      const code = existingProviderBinding ? "continuation_session_missing" : "provider_session_storage_unavailable";
+      return writeJson(res, 503, { error: { code, message: error instanceof Error ? error.message : String(error) } });
+    }
+  }
   if (run.workSessionId && hasActiveSession(run.workSessionId)) {
     const existing = [...active.values()].find((item) => item.workSessionId === run.workSessionId);
     return writeJson(res, 409, {
@@ -536,7 +585,7 @@ async function handle(req, res) {
         env: {
           ...readOnlyWorkerEnvironment(process.env),
           HERMES_AGENT_ROOT: "/opt/kontrol/hermes-runtime",
-          HERMES_HOME: "/tmp/home/.hermes",
+          HERMES_HOME: run.hermesSessionHome ? "/opt/kontrol/hermes-session" : "/tmp/home/.hermes",
           PYTHONPATH: hermesReadOnlyPythonPath(),
           PATH: `/opt/kontrol/bin:/opt/kontrol/hermes-bin:/usr/local/bin:/usr/bin:/bin`,
           KONTROL_WORKSPACE_SESSION_ID: run.workspaceSessionId || "",
@@ -552,11 +601,17 @@ async function handle(req, res) {
             cwd: "/workspace",
             task: run.task,
             runId: run.remoteRunId,
+            workSessionId: run.workSessionId,
+            agentId: run.agentId,
+            workspaceRoot: run.workspaceRoot,
+            providerGeneration: run.providerGeneration,
+            sessionBinding: run.providerSessionBinding,
             maxRunSeconds: Math.floor(run.maxRunMs / 1000),
           }),
         },
         toolchainPaths: configuredToolchains,
         networkPolicy: run.execution.networkPolicy,
+        writableBindMounts: run.hermesSessionHome ? [{ source: run.hermesSessionHome, target: "/opt/kontrol/hermes-session" }] : [],
         bindMounts: [
           { source: run.readOnlyRuntimeProjection, target: "/opt/kontrol/hermes-runtime" },
           { source: HERMES_ACP_PYTHON_SITE_ROOT, target: "/opt/kontrol/hermes-python-packages" },
@@ -567,11 +622,15 @@ async function handle(req, res) {
         { source: run.readOnlyRuntimeProjection, target: "/opt/kontrol/hermes-runtime" },
         { source: HERMES_ACP_PYTHON_SITE_ROOT, target: "/opt/kontrol/hermes-python-packages" },
       ];
+      run.readOnlyWritableBindMounts = run.hermesSessionHome
+        ? [{ source: run.hermesSessionHome, target: "/opt/kontrol/hermes-session" }]
+        : [];
       run.readOnlyBindFiles = hermesRuntimeBindFiles;
       probeReadOnlyExecutionSandbox({
         workspaceRoot,
         toolchainPaths: configuredToolchains,
         bindMounts: run.readOnlyBindMounts,
+        writableBindMounts: run.readOnlyWritableBindMounts,
         bindFiles: run.readOnlyBindFiles,
         networkPolicy: run.execution.networkPolicy,
       });
@@ -655,6 +714,7 @@ async function handle(req, res) {
     env: run.readOnlySandbox?.env ?? {
       ...safeEnv(),
       HERMES_AGENT_ROOT,
+      ...(run.hermesSessionHome ? { HERMES_HOME: run.hermesSessionHome } : {}),
       PYTHONPATH: withHermesPythonPath(process.env.PYTHONPATH),
       KONTROL_WORKSPACE_SESSION_ID: run.workspaceSessionId || "",
       KONTROL_WORK_SESSION_ID: run.workSessionId || "",
@@ -666,6 +726,11 @@ async function handle(req, res) {
         cwd: workspaceRoot,
         task: run.task,
         runId: run.remoteRunId,
+        workSessionId: run.workSessionId,
+        agentId: run.agentId,
+        workspaceRoot: run.workspaceRoot,
+        providerGeneration: run.providerGeneration,
+        sessionBinding: run.providerSessionBinding,
         maxRunSeconds: Math.floor(MAX_RUN_MS / 1000),
       }),
     },
@@ -920,6 +985,10 @@ function handleRunnerLine(run, line) {
   if (msg.type === "raw_update") return reportRawUpdate(run, msg.params);
   if (msg.type === "raw_request") return reportRawRequest(run, msg);
   if (msg.type === "permission_request") return handlePermissionRequest(run, msg);
+  if (msg.type === "session_binding") {
+    void persistHermesProviderSession(run, msg);
+    return;
+  }
   if (msg.type === "event") {
     noteChildOperation(run, msg.eventType, msg.data);
     const text = msg.data?.text || msg.data?.error || JSON.stringify(msg.data || {});
@@ -931,10 +1000,60 @@ function handleRunnerLine(run, line) {
     // P1 #11: Runner emitted explicit completion — finalize the turn.
     // The runner is the authoritative turn-end detector, not a timer.
     run.explicitCompletion = true;
-    void terminateRun(run, msg.stopReason || "Hermes reported completion", "completed");
+    const outcome = classifyHermesStopReason(msg.stopReason);
+    void terminateRun(run, outcome.message ?? "Hermes reported end_turn", outcome.status);
     return;
   }
   if (msg.type === "error") return reportOutput(run, msg.error || "Hermes ACP error", "error");
+}
+
+async function persistHermesProviderSession(run, msg) {
+  const requestId = typeof msg.requestId === "string" ? msg.requestId : "";
+  let accepted = false;
+  let error;
+  try {
+    if (!requestId || !run.workSessionId || !run.agentId
+      || msg.workSessionId !== run.workSessionId
+      || msg.agentId !== run.agentId
+      || msg.workspaceRoot !== run.workspaceRoot
+      || msg.providerGeneration !== run.providerGeneration
+      || typeof msg.providerSessionId !== "string"
+      || msg.providerSessionId.trim().length === 0) {
+      throw new Error("provider_session_binding_mismatch");
+    }
+    const key = hashProviderSessionKey(run.workSessionId);
+    const existing = providerSessionBindings.get(key);
+    if (existing && existing.providerSessionId !== msg.providerSessionId) {
+      throw new Error("provider_session_binding_conflict");
+    }
+    const previousBinding = existing;
+    providerSessionBindings.set(key, {
+      workSessionId: run.workSessionId,
+      agentId: run.agentId,
+      providerSessionId: msg.providerSessionId,
+      workspaceRoot: run.workspaceRoot,
+      providerGeneration: run.providerGeneration,
+      createdAt: existing?.createdAt ?? new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+    providerSessionWrite = providerSessionWrite.catch(() => undefined).then(() => atomicWriteJson(
+      PROVIDER_SESSIONS_PATH,
+      Object.fromEntries(providerSessionBindings),
+    ));
+    try {
+      await providerSessionWrite;
+    } catch (cause) {
+      if (previousBinding) providerSessionBindings.set(key, previousBinding);
+      else providerSessionBindings.delete(key);
+      throw cause;
+    }
+    accepted = true;
+  } catch (cause) {
+    error = cause instanceof Error ? cause.message : String(cause);
+    console.error(`[hermes-native] could not persist provider session binding: ${error}`);
+  }
+  if (!run.child?.stdin?.writable) return;
+  run.child.stdin.write(`${JSON.stringify({ type: "session_binding_ack", requestId, accepted, ...(error ? { error } : {}) })}\n`);
 }
 
 function reportRawUpdate(run, params) {
@@ -1615,6 +1734,76 @@ function removeHermesReadOnlyRuntime(run) {
 function positiveDuration(value, fallback) {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function hashProviderSessionKey(workSessionId) {
+  return createHash("sha256").update(workSessionId).digest("hex");
+}
+
+function prepareHermesSessionHome(workSessionId, workspaceRoot, createIfMissing, seedFromHostProfile) {
+  mkdirSync(HERMES_SESSION_HOME_ROOT, { recursive: true, mode: 0o700 });
+  const rootInfo = lstatSync(HERMES_SESSION_HOME_ROOT);
+  if (rootInfo.isSymbolicLink() || !rootInfo.isDirectory()) {
+    throw new Error("Hermes provider session storage root must be a real directory.");
+  }
+  chmodSync(HERMES_SESSION_HOME_ROOT, 0o700);
+  const root = realpathSync(HERMES_SESSION_HOME_ROOT);
+  if (root === workspaceRoot || root.startsWith(`${workspaceRoot}/`)) {
+    throw new Error("Hermes provider session storage must be outside the workspace.");
+  }
+  const home = join(root, hashProviderSessionKey(workSessionId));
+  let homeInfo;
+  try { homeInfo = lstatSync(home); } catch (error) {
+    if (error?.code !== "ENOENT" || !createIfMissing) throw error;
+    mkdirSync(home, { mode: 0o700 });
+    homeInfo = lstatSync(home);
+    if (seedFromHostProfile) {
+      try {
+        seedHermesProfile(home);
+      } catch (seedError) {
+        rmSync(home, { recursive: true, force: true });
+        throw seedError;
+      }
+    }
+  }
+  if (homeInfo.isSymbolicLink() || !homeInfo.isDirectory()) {
+    throw new Error("Hermes provider session home must be a real directory.");
+  }
+  if (typeof process.getuid === "function" && homeInfo.uid !== process.getuid()) {
+    throw new Error("Hermes provider session home is owned by another user.");
+  }
+  chmodSync(home, 0o700);
+  const resolvedHome = realpathSync(home);
+  if (resolvedHome !== home) throw new Error("Hermes provider session home escaped its private storage root.");
+  return resolvedHome;
+}
+
+function seedHermesProfile(home) {
+  const sourceRoot = resolve(process.env.HERMES_HOME || join(homedir(), ".hermes"));
+  for (const name of ["config.yaml", "auth.json"]) {
+    const source = join(sourceRoot, name);
+    if (!existsSync(source)) continue;
+    const info = lstatSync(source);
+    if (info.isSymbolicLink() || !info.isFile()) {
+      throw new Error(`Hermes provider profile entry is invalid: ${name}`);
+    }
+    const destination = join(home, name);
+    copyFileSync(source, destination);
+    chmodSync(destination, 0o600);
+  }
+}
+
+function resolveHermesExecutableIdentity(command) {
+  return resolveExecutablePath(command) ?? resolve(command);
+}
+
+function detectHermesVersion() {
+  try {
+    const pyproject = readFileSync(join(HERMES_AGENT_ROOT, "pyproject.toml"), "utf8");
+    return pyproject.match(/^version\s*=\s*["']([^"']+)["']/m)?.[1] ?? "unknown";
+  } catch {
+    return "unknown";
+  }
 }
 
 function resolveHermesPython() {

@@ -186,6 +186,14 @@ Current implementation contracts:
   known child operation or pending permission. `KONTROL_HERMES_MAX_RUN_SECONDS`
   remains the absolute safety ceiling, and `KONTROL_HERMES_DEADMAN_IDLE_MS`
   controls only the idle watchdog.
+- Hermes provider sessions are durably bound to the work session, selected
+  agent, workspace, and provider generation before the first prompt executes.
+  Continuations load that exact ACP session and fail closed when it is missing,
+  mismatched, or unsupported. Per-work-session Hermes homes are private
+  directories outside the checkout; confined runs mount only that session
+  directory writable while keeping the workspace and runtime projections
+  read-only. Only ACP `end_turn` counts as successful completion; cancellation,
+  refusal, limits, missing stop reasons, and unknown reasons do not.
 - Confined Hermes launches bind only the selected ACP executable and its
   expected sibling Python interpreter, then run the exact selected entrypoint's
   `--check` inside Bubblewrap before accepting the worker. A launcher that
@@ -571,3 +579,58 @@ MCP context isolation:
 - `write`, `edit`, and `apply_patch` return `instructions_required` with the
   full nested instruction contents and content hash before any mutation when
   governing instructions have not been acknowledged by that transport.
+- Review loops keep one Kontrol reviewer-thread identity per route epoch,
+  separate from each immutable submission handoff. A one-time expiring
+  activation grant is principal-scoped and stored only as a hash; reviewer
+  claims require the activated principal and authenticated context. Host
+  conversation IDs are correlation data and remain unverified unless a trusted
+  host adapter attests them. Handoff messages track preparation, presentation,
+  claim, and committed feedback separately. Pausing suppresses queued delivery
+  while preserving the thread binding; route-epoch changes fence old claims.
+  `completedReviewRounds` counts committed review feedback, while
+  `admittedReviewRounds` enforces the immutable submission ceiling. MCP does
+  not create or message a new ChatGPT conversation in the background; ChatGPT
+  review activation requires an explicit user-opened context and grant. Once
+  activated, the Workspace App event watcher may deliver queued review packets
+  into that same conversation through MCP Apps `ui/message` when the host
+  advertises messaging support. Delivery is acknowledged only after the host
+  accepts the message; an ambiguous response stays fenced for inspection and is
+  not blindly resent. The WebUI model reviews and submits feedback through the
+  existing handoff tools, while human approval remains in the existing approval
+  center. Review delivery may also use an explicitly selected, principal-owned
+  private Chromium profile. The reviewer must open ChatGPT, choose the exact
+  existing conversation, and bind that tab to the active review thread. Kontrol
+  never creates a ChatGPT conversation. Native CDP sends only the bounded,
+  hashed review packet and observes prompt acceptance as transport evidence.
+  The browser attempt remains active until authenticated feedback commits; page
+  generation is not a review outcome. Browser and worker-reply dispatchers wake
+  from post-commit outbox notifications, reconcile durable work at startup, and
+  use a deadline timer only for scheduled retries. Only authenticated review
+  tools commit feedback and wake the agent. Login or
+  verification screens require human action; uncertain sends remain fenced
+  until reconciled.
+- Clarification replies remain authoritative in the durable agent-reply store.
+  The `agent.reply.ready` outbox event wakes native-resume handling once; an
+  MCP waiter consumes replies through its subscribe-before-query wait and can
+  recover unacknowledged replies after reconnect. Outbox wake events are not
+  kept cycling as a substitute for reply persistence.
+- In native-CDP review mode, worker clarification and blocker messages are
+  queued to that route's bound conversation as advisory requests. Their replies
+  settle the browser turn and return through the durable agent-reply path; they
+  cannot commit a review verdict or grant workspace permissions.
+- Review handoff claims carry a bounded 15-minute lease. Feedback commit checks
+  the exact claim, principal, context, route epoch, pending submission, snapshot,
+  and unexpired lease in its authoritative transaction. A reviewer can renew an
+  expired claim through compare-and-swap; release clears all claim identity.
+- The generic stdio ACP adapter persists provider-native session IDs by durable
+  work-session identity. A continuation reloads that same session only when
+  the ACP agent advertises `loadSession`; otherwise it fails closed instead of
+  starting an unrelated conversation. ACP worker identity, the review WebUI
+  thread, and the Kontrol work session remain separate identities.
+
+## Child DOX Index
+
+| Path | Purpose |
+|------|---------|
+| `src/review-thread/` | Persistent reviewer-thread identity, activation authority, and message lifecycle |
+| `src/review-browser/` | Private Chromium profile lifecycle, exact ChatGPT conversation binding, and bounded review packet transport |

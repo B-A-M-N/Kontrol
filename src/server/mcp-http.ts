@@ -130,6 +130,8 @@ export interface McpHttpDeps {
   supervisorRuns: import("../supervisor-runs.js").SupervisorRuns;
   scheduledJobs?: import("../scheduling/scheduled-job-store.js").ScheduledJobStore;
   reviewRoutes?: import("../review-handoff/route-store.js").ReviewRouteStore;
+  reviewBrowserController?: import("../review-browser/browser-controller.js").ReviewerBrowserController;
+  reviewThreads?: import("../review-thread/thread-store.js").ReviewThreadStore;
 }
 
 type CatalogRefreshPhase = "initialized" | "get_stream";
@@ -1175,6 +1177,8 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
           },
           undefined,
           qualificationEvidence,
+          deps.reviewBrowserController,
+          deps.reviewThreads,
         );
         sessionMcpServer = server;
         const initializedHandler = server.server.oninitialized;

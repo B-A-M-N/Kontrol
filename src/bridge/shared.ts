@@ -222,6 +222,23 @@ export function reviewOwnerContextId(config: BridgeConfig): string {
   return liveOwnerContextId(config) ?? config.principalId ?? "unknown-owner";
 }
 
+/**
+ * Review-thread authority must be bound to the server-issued MCP transport
+ * session, not an upstream conversation ID. The latter is correlation data
+ * supplied by the host and can be copied by another conversation.
+ */
+export function reviewerThreadContextId(config: BridgeConfig): string | undefined {
+  const identity = liveConnectionIdentity(config);
+  const principalId = identity.principalId?.trim();
+  const mcpSessionId = identity.mcpSessionId?.trim();
+  if (!principalId || !mcpSessionId) return undefined;
+  return `principal:${principalId}|mcp-session:${mcpSessionId}`;
+}
+
+export function reviewClaimContextId(config: BridgeConfig, mode: "isolated_review" | "pinned_conversation"): string | undefined {
+  return mode === "isolated_review" ? reviewerThreadContextId(config) : reviewOwnerContextId(config);
+}
+
 export function liveOwnerContextId(config: BridgeConfig): string | undefined {
   const identity = liveConnectionIdentity(config);
   return mcpOwnerContextId(identity);

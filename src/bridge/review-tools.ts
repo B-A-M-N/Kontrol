@@ -12,9 +12,34 @@ import type { EventPredicate, EventStoreEvent } from "../event-log.js";
 import type { ReviewSubmissionDTO } from "../review-submission.js";
 import { authorizeWorkSessionAction } from "../work-session-action-guard.js";
 import { registerMutationAppTool } from "./app-tool.js";
-import { assertWorkerSessionBinding, defaultLiveWaiters, forbidden, isReviewer, isWorkerOrClient, liveOwnerContextId, reviewOwnerContextId, parsePatchFiles, requireWorkSessionMutation, requireWorkSessionRead, workspaceAppModelAndAppMeta } from "./shared.js";
+import { assertWorkerSessionBinding, defaultLiveWaiters, forbidden, isReviewer, isWorkerOrClient, liveOwnerContextId, reviewClaimContextId, reviewOwnerContextId, parsePatchFiles, requireWorkSessionMutation, requireWorkSessionRead, workspaceAppModelAndAppMeta } from "./shared.js";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
 import { z } from "zod/v4";
+
+function hasClaimedReviewSubmissionAccess(config: BridgeConfig, sessionId: string, submissionId: string): boolean {
+  if (!isReviewer(config.principalRole)) return false;
+  const route = config.reviewRoutes?.getRouteBySession(sessionId);
+  if (!route || route.mode !== "isolated_review" || (route.status !== "active" && route.status !== "paused")) return false;
+  const contextId = reviewClaimContextId(config, route.mode);
+  if (!contextId || !config.reviewThreads) return false;
+  const thread = config.reviewThreads.getForRoute(route.id, route.routeEpoch);
+  if (!thread || (thread.status !== "active" && thread.status !== "paused")
+    || thread.reviewerPrincipalId !== (config.principalId ?? `role:${config.principalRole ?? "reviewer"}`)
+    || thread.reviewerContextId !== contextId) return false;
+  const submission = config.workSessions.getSubmissions(sessionId).find((item: { id?: string }) => item.id === submissionId);
+  if (!submission) return false;
+  const handoff = config.reviewRoutes?.getHandoffBySubmission(sessionId, submission.id, submission.reviewEpoch);
+  return Boolean(handoff
+    && handoff.status === "claimed"
+    && handoff.claimExpiresAt
+    && Date.parse(handoff.claimExpiresAt) > Date.now()
+    && handoff.routeEpoch === route.routeEpoch
+    && handoff.claimedByOwnerContextId === contextId
+    && handoff.claimedByPrincipalId === (config.principalId ?? `role:${config.principalRole ?? "reviewer"}`)
+    && handoff.diffSha256 === submission.diffSha256
+    && handoff.snapshotKind === submission.snapshotKind
+    && handoff.snapshotRef === submission.snapshotRef);
+}
 
 export function registerReviewTools(server: McpServer, config: BridgeConfig): void {
   registerMutationAppTool(
@@ -177,6 +202,7 @@ export function registerReviewTools(server: McpServer, config: BridgeConfig): vo
           submissionNumber: submitted.submissionNumber,
         };
         const correlatedRun = config.agentRegistry.getRunByWorkSessionId(sessionId);
+        const routedReview = config.reviewRoutes?.getRouteBySession(sessionId)?.status === "active";
 
         // review-workflow.submitForReview already emitted the canonical
         // review.submitted event with file stats. Do not emit a duplicate.
@@ -203,7 +229,7 @@ export function registerReviewTools(server: McpServer, config: BridgeConfig): vo
               ? { backend: submitted.coverage.backend, uncoveredPaths: submitted.coverage.uncoveredPaths, reasons: submitted.coverage.reasons }
               : undefined,
           } satisfies ReviewSubmissionDTO,
-          _meta: {
+          ...(routedReview ? {} : { _meta: {
             tool: "submit_for_review",
             card: {
               tool: "submit_for_review",
@@ -213,7 +239,7 @@ export function registerReviewTools(server: McpServer, config: BridgeConfig): vo
               files: review.files,
               payload: { patch: review.patch },
             },
-          },
+          } }),
         };
       } catch (error) {
         return { content: [{ type: "text" as const, text: `Review capture failed: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
@@ -226,7 +252,7 @@ export function registerReviewTools(server: McpServer, config: BridgeConfig): vo
     "get_review_submission",
     {
       title: "Get review submission",
-      description: "Fetch the full review submission (including the diff/patch) for a work session, so the WebUI can render the acceptance card after the original submit_for_review tool invocation has ended.",
+      description: "Fetch the full immutable submission diff. An activated reviewer can read only its claimed submission; the tool does not create a reviewer-facing card.",
       inputSchema: {
         sessionId: z.string().describe("Work session ID."),
         submissionId: z.string().optional().describe("Specific submission ID; defaults to the latest."),
@@ -252,14 +278,16 @@ export function registerReviewTools(server: McpServer, config: BridgeConfig): vo
     async ({ sessionId, submissionId }) => {
       const startedAt = performance.now();
       try {
-        const access = requireWorkSessionRead(config, sessionId);
-      if (access) return access;
       const session = config.workSessions.get(sessionId);
       if (!session) return { content: [{ type: "text" as const, text: "Session not found." }], isError: true };
+      const routedReview = config.reviewRoutes?.getRouteBySession(sessionId)?.status === "active";
 
       const submission = submissionId
         ? config.workSessions.getSubmissions(sessionId).find((s) => s.id === submissionId)
         : config.workSessions.getLatestSubmission(sessionId);
+      const access = requireWorkSessionRead(config, sessionId);
+      const reviewerScopedRead = Boolean(access && submission && hasClaimedReviewSubmissionAccess(config, sessionId, submission.id));
+      if (access && !reviewerScopedRead) return access;
       if (!submission) {
         return {
           content: [{ type: "text" as const, text: `Submission ${submissionId} was not found for session ${sessionId}.` }],
@@ -305,7 +333,7 @@ export function registerReviewTools(server: McpServer, config: BridgeConfig): vo
       return {
         content: [{ type: "text" as const, text: `Submission #${submission.submissionNumber}: ${files.length} file(s).` }],
         structuredContent: dto,
-        _meta: {
+        ...((reviewerScopedRead || routedReview) ? {} : { _meta: {
           tool: "submit_for_review",
           card: {
             tool: "submit_for_review",
@@ -326,7 +354,7 @@ export function registerReviewTools(server: McpServer, config: BridgeConfig): vo
             files,
             payload: { patch },
           },
-        },
+        } }),
       };
       } finally {
         config.onPhaseTiming?.("review.diff_fetch", performance.now() - startedAt);
@@ -403,10 +431,11 @@ export function registerReviewTools(server: McpServer, config: BridgeConfig): vo
         if (config.reviewRoutes) {
           const route = config.reviewRoutes.getRouteBySession(sessionId);
           if (route?.status === "active") {
+            const reviewerContextId = reviewClaimContextId(config, route.mode);
             const submission = config.workSessions.getSubmissions(sessionId)
               .find((candidate: { id?: string }) => candidate.id === targetSubmissionId);
             const handoff = submission && config.reviewRoutes.getHandoffBySubmission(sessionId, submission.id, submission.reviewEpoch);
-            if (!handoff || handoff.status !== "claimed" || handoff.claimedByOwnerContextId !== reviewOwnerContextId(config)) {
+            if (!reviewerContextId || !handoff || handoff.status !== "claimed" || handoff.claimedByOwnerContextId !== reviewerContextId) {
               return {
                 content: [{ type: "text" as const, text: "Review routing conflict: this reviewer context has not claimed the current handoff." }],
                 isError: true,
@@ -417,7 +446,10 @@ export function registerReviewTools(server: McpServer, config: BridgeConfig): vo
         const result = await config.reviewWorkflow.provideFeedback({
           sessionId,
           submissionId: targetSubmissionId,
-          reviewerOwnerContextId: reviewOwnerContextId(config),
+          reviewerOwnerContextId: config.reviewRoutes?.getRouteBySession(sessionId)
+            ? reviewClaimContextId(config, config.reviewRoutes.getRouteBySession(sessionId)!.mode)
+            : reviewOwnerContextId(config),
+          reviewerPrincipalId: config.principalId ?? `role:${config.principalRole ?? "reviewer"}`,
           invocationOrigin: "authenticated_reviewer",
           diffSha256,
           reviewEpoch,

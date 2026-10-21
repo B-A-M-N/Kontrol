@@ -127,6 +127,25 @@ try {
   assert.ok(configuredRuntime.args.some((value, index) => value === "--ro-bind" && configuredRuntime.args[index + 1] === "/usr"),
     "explicitly approved runtime directories are mounted read-only without a builder ReferenceError");
 
+  const hermesSessionHome = join(root, "hermes-session-home");
+  mkdirSync(hermesSessionHome);
+  const hermesSessionLaunch = buildReadOnlySandboxCommand({
+    workspaceRoot,
+    executable,
+    writableBindMounts: [{ source: hermesSessionHome, target: "/opt/kontrol/hermes-session" }],
+    bubblewrapPath: bubblewrap,
+  });
+  assert.ok(hermesSessionLaunch.args.some((value, index) => value === "--bind"
+    && hermesSessionLaunch.args[index + 1] === hermesSessionHome
+    && hermesSessionLaunch.args[index + 2] === "/opt/kontrol/hermes-session"),
+  "an explicitly selected provider-session directory can persist outside the read-only checkout");
+  assert.throws(() => buildReadOnlySandboxCommand({
+    workspaceRoot,
+    executable,
+    writableBindMounts: [{ source: hermesSessionHome, target: "/workspace/session-state" }],
+    bubblewrapPath: bubblewrap,
+  }), /outside the workspace and scratch directory/);
+
   const hermesCli = join(root, "hermes-cli");
   const adjacentCredential = join(root, "credential.json");
   writeFileSync(hermesCli, "#!/bin/sh\nexit 0\n");

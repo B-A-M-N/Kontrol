@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { hermesAcpCandidates, selectHermesAcpEntry } from "../scripts/lib/hermes-acp-entry.mjs";
+import { classifyHermesStopReason } from "../scripts/lib/hermes-stop-reason.mjs";
 
 const adapter = readFileSync("scripts/acp-hermes-native-adapter.mjs", "utf8");
 const runner = readFileSync("scripts/hermes-native-runner.py", "utf8");
@@ -27,6 +28,7 @@ assert.match(adapter, /stdoutBuffer/);
 assert.match(adapter, /setInterval\(\(\) => reportEvent\(run, "heartbeat"\)/);
 assert.match(adapter, /duplicate_session/);
 assert.match(adapter, /explicitCompletion/);
+assert.match(adapter, /classifyHermesStopReason\(msg\.stopReason\)/);
 assert.match(adapter, /protocol_incomplete/);
 assert.match(adapter, /runner exited without an explicit complete event/);
 assert.match(adapter, /lifecycle: "STARTING"/);
@@ -37,6 +39,12 @@ assert.match(adapter, /reconcileOwnedProcesses/);
 assert.match(adapter, /terminal-spool/);
 assert.match(adapter, /KONTROL_HERMES_DEADMAN_IDLE_MS/);
 assert.match(adapter, /KONTROL_HERMES_MAX_RUN_SECONDS/);
+assert.match(adapter, /provider-sessions\.json/);
+assert.match(adapter, /body\.continuation_id && !existingProviderBinding/,
+  "Hermes continuations fail before launch when no provider session was persisted");
+assert.match(adapter, /continuation_session_binding_conflict/,
+  "Hermes provider sessions are fenced to their original work session, agent, workspace, and provider generation");
+assert.match(adapter, /persistHermesProviderSession/);
 assert.match(adapter, /activeChildOperations/);
 assert.match(adapter, /absoluteDeadlineAt/);
 assert.match(adapter, /workspaceLeaseNonce: body\.workspace_lease_nonce/);
@@ -67,6 +75,13 @@ assert.match(runner, /request_permission/);
 assert.match(runner, /permission_request/);
 assert.match(runner, /permission_response/);
 assert.match(runner, /RequestPermissionResponse/);
+assert.match(runner, /connection\.load_session\(cwd=spec\.get\("cwd"\) or os\.getcwd\(\), session_id=provider_session_id, mcp_servers=\[\]\)/,
+  "Hermes continuations load the exact persisted provider session");
+assert.match(runner, /continuation_session_unsupported/);
+assert.match(runner, /continuation_session_missing/);
+assert.match(runner, /session_binding_ack/);
+assert.ok(runner.indexOf('"type": "session_binding"') < runner.indexOf("connection.prompt("),
+  "initial Hermes sessions are durably acknowledged by Kontrol before the first prompt executes");
 assert.match(runner, /"raw_update"/);
 assert.match(runner, /"raw_request"/);
 assert.match(runner, /public ACP Python SDK/);
@@ -132,5 +147,11 @@ assert.deepEqual(explicitLegacy.slice(0, 2).map(({ command, args }) => ({ comman
   { command: "/fixture/hermes-acp", args: [] },
   { command: "/fixture/hermes-test-double", args: ["acp"] },
 ], "an explicit HERMES_BIN does not get shadowed by an unrelated hermes-acp on PATH");
+
+assert.deepEqual(classifyHermesStopReason("end_turn"), { status: "completed", message: undefined });
+assert.equal(classifyHermesStopReason("cancelled").status, "cancelled");
+for (const reason of ["error", "refusal", "max_tokens", "max_turn_requests", "unknown_future_reason", undefined]) {
+  assert.equal(classifyHermesStopReason(reason).status, "failed", `${reason} cannot advance a work session as successful`);
+}
 
 console.log("hermes-native-adapter.test.mjs: all assertions passed");

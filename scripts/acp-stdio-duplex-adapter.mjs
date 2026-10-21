@@ -15,7 +15,7 @@
 import { createServer } from "node:http";
 import { createHash, randomUUID } from "node:crypto";
 import { isAbsolute, resolve } from "node:path";
-import { realpath, stat } from "node:fs/promises";
+import { readFile, realpath, stat } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 import { clearAgentIdentity, identityHeaders, loadAgentIdentity, saveAgentIdentity } from "./lib/acp-agent-identity.mjs";
 import { readJsonBody } from "./lib/adapter-http.mjs";
@@ -49,7 +49,26 @@ const DISPATCH_RECEIPTS_PATH = process.env.KONTROL_STDIO_DISPATCH_RECEIPTS || ad
 const OWNED_PROCESSES_PATH = process.env.KONTROL_STDIO_OWNED_PROCESSES || adapterStatePath("stdio-duplex", "owned-processes.json");
 const TERMINAL_SPOOL_PATH = process.env.KONTROL_STDIO_TERMINAL_SPOOL || adapterStatePath("stdio-duplex", "terminal-spool.json");
 const EVENT_SPOOL_PATH = process.env.KONTROL_STDIO_EVENT_SPOOL || adapterStatePath("stdio-duplex", "event-spool.json");
+const SESSION_BINDINGS_PATH = process.env.KONTROL_STDIO_SESSION_BINDINGS || adapterStatePath("stdio-duplex", "session-bindings.json");
 const dispatchReceipts = await loadAdapterDispatchReceipts(DISPATCH_RECEIPTS_PATH);
+const providerSessionBindings = new Map();
+try {
+  const parsed = JSON.parse(await readFile(SESSION_BINDINGS_PATH, "utf8"));
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+    for (const [key, value] of Object.entries(parsed)) {
+      if (value && typeof value.sessionId === "string" && typeof value.agentId === "string" && typeof value.workspaceRoot === "string") {
+        providerSessionBindings.set(key, value);
+      }
+    }
+  }
+} catch {
+  // A missing binding file is expected on first launch. Corrupt files do not
+  // authorize silently replacing a provider conversation on a continuation.
+}
+
+async function persistProviderSessionBindings() {
+  await atomicWriteJson(SESSION_BINDINGS_PATH, Object.fromEntries(providerSessionBindings));
+}
 
 const VALIDATE_IMPORTS = process.argv.includes("--validate-imports");
 
@@ -301,6 +320,7 @@ async function handle(req, res) {
     remoteRunId: `stdio_${randomUUID().slice(0, 8)}`,
     devRunId: body.parent_run_id || body.run_id,
     workSessionId: body.session_id,
+    continuationId: body.continuation_id,
     workspaceSessionId: body.workspace_session_id,
     agentId: body.agent_id,
     attemptNumber: body.attempt_number,
@@ -580,17 +600,44 @@ async function dispatchTurn(run) {
     if (!initialization || initialization.protocolVersion !== 1) {
       throw new Error("ACP agent did not negotiate protocol version 1.");
     }
-    const session = await run.conn.request("session/new", {
-      cwd: run.readOnlyAudit ? "/workspace" : run.workspaceRoot,
-      mcpServers: [],
-    });
-    if (!session || typeof session.sessionId !== "string" || session.sessionId.trim().length === 0) {
-      throw new Error("ACP agent returned no sessionId from session/new.");
+    const supportsSessionLoad = initialization.agentCapabilities?.loadSession === true;
+    const cwd = run.readOnlyAudit ? "/workspace" : run.workspaceRoot;
+    const bindingKey = run.workSessionId
+      ? createHash("sha256").update(run.workSessionId).digest("hex")
+      : undefined;
+    const existing = bindingKey ? providerSessionBindings.get(bindingKey) : undefined;
+    if (run.continuationId && !existing) {
+      throw new Error("continuation_session_missing: refusing to reset the implementing agent conversation.");
     }
-    run.acpSessionId = session.sessionId;
+    if (existing && (existing.agentId !== run.agentId || existing.workspaceRoot !== run.workspaceRoot)) {
+      throw new Error("continuation_session_binding_conflict: provider conversation belongs to a different agent or workspace.");
+    }
+    if (existing) {
+      if (!supportsSessionLoad) {
+        throw new Error("continuation_session_unsupported: the ACP agent did not advertise loadSession; refusing to start a new conversation.");
+      }
+      run.acpSessionId = existing.sessionId;
+      await run.conn.request("session/load", { sessionId: existing.sessionId, cwd, mcpServers: [] });
+    } else {
+      const session = await run.conn.request("session/new", { cwd, mcpServers: [] });
+      if (!session || typeof session.sessionId !== "string" || session.sessionId.trim().length === 0) {
+        throw new Error("ACP agent returned no sessionId from session/new.");
+      }
+      run.acpSessionId = session.sessionId;
+      if (bindingKey && run.agentId) {
+        providerSessionBindings.set(bindingKey, {
+          sessionId: session.sessionId,
+          agentId: run.agentId,
+          workspaceRoot: run.workspaceRoot,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        });
+        await persistProviderSessionBindings();
+      }
+    }
     method = "session/prompt";
     params = {
-      sessionId: session.sessionId,
+      sessionId: run.acpSessionId,
       prompt: [{ type: "text", text: run.task }],
     };
   } else {

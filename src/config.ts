@@ -50,6 +50,8 @@ export interface ServerConfig {
   acpAgentSecret?: string;
   /** Shared secret used by the reviewer (WebUI) for ACP calls. */
   acpReviewerSecret?: string;
+  /** Optional explicit Chromium executable for private reviewer browser profiles. */
+  reviewBrowserChromePath?: string;
   /**
    * P0 #9: secret Kontrol presents to ADAPTERS on outbound /runs, cancel, and
    * probe calls. Distinct from acpSharedSecret (legacy operator ingress) so
@@ -593,6 +595,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     acpAgentSecret: env.KONTROL_ACP_AGENT_SECRET,
     /** Shared secret used by the reviewer (WebUI) for ACP calls. */
     acpReviewerSecret: env.KONTROL_ACP_REVIEWER_SECRET,
+    reviewBrowserChromePath: env.KONTROL_REVIEW_BROWSER_CHROME_PATH?.trim() || undefined,
     // P0 #9: outbound adapter credential; falls back to the legacy shared
     // secret only for backward compatibility.
     acpAdapterSecret: env.KONTROL_ACP_ADAPTER_SECRET ?? env.KONTROL_ACP_SHARED_SECRET,

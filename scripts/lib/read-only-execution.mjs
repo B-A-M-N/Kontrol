@@ -212,6 +212,7 @@ export function buildReadOnlySandboxCommand({
   env = {},
   toolchainPaths = process.env.KONTROL_VERIFY_TOOLCHAIN_PATHS ?? process.env.KONTROL_READ_ONLY_TOOLCHAIN_PATHS,
   bindMounts = [],
+  writableBindMounts = [],
   bindFiles = [],
   networkPolicy = "disabled",
   bubblewrapPath = process.env.KONTROL_BWRAP,
@@ -322,6 +323,19 @@ export function buildReadOnlySandboxCommand({
     createdDirectories.add(target);
     result.push("--ro-bind", source, target);
   }
+  for (const mount of writableBindMounts) {
+    let source;
+    try { source = realpathSync(mount.source); } catch (error) {
+      throw new ReadOnlySandboxUnavailableError(`Required private writable state path is unavailable: ${error.message}`);
+    }
+    const target = typeof mount.target === "string" ? mount.target : "";
+    if (!statSync(source).isDirectory()) throw new ReadOnlySandboxUnavailableError(`Private writable state source must be a directory: ${source}`);
+    if (!isAbsolute(target) || resolve(target) !== target || target === "/" || target === "/workspace" || target.startsWith("/workspace/") || target === "/tmp" || target.startsWith("/tmp/")) {
+      throw new ReadOnlySandboxUnavailableError("Private writable state target must be absolute and outside the workspace and scratch directory.");
+    }
+    addMountTree(target, result, createdDirectories);
+    result.push("--bind", source, target);
+  }
   for (const mount of bindFiles) {
     let source;
     try { source = realpathSync(mount.source); } catch (error) {
@@ -344,7 +358,7 @@ export function buildReadOnlySandboxCommand({
 }
 
 /** Exercise the complete mount policy with a harmless command before accepting a worker dispatch. */
-export function probeReadOnlyExecutionSandbox({ workspaceRoot, toolchainPaths, bindMounts, bindFiles, networkPolicy = "disabled", bubblewrapPath } = {}) {
+export function probeReadOnlyExecutionSandbox({ workspaceRoot, toolchainPaths, bindMounts, writableBindMounts, bindFiles, networkPolicy = "disabled", bubblewrapPath } = {}) {
   const launch = buildReadOnlySandboxCommand({
     workspaceRoot,
     executable: "/usr/bin/true",
@@ -352,6 +366,7 @@ export function probeReadOnlyExecutionSandbox({ workspaceRoot, toolchainPaths, b
     env: {},
     toolchainPaths,
     bindMounts,
+    writableBindMounts,
     bindFiles,
     networkPolicy,
     bubblewrapPath,

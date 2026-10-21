@@ -13,6 +13,28 @@ import { createWorkSessionManager } from "./work-sessions.js";
 const root = await mkdtemp(join(tmpdir(), "kontrol-outbox-test-"));
 
 try {
+  // Durable outbox inserts wake only matching in-process subscribers. The
+  // database remains the recovery source if no subscriber is connected.
+  {
+    const db = openDatabase(join(root, "notifications"));
+    const outbox = createDispatchOutbox(db);
+    const observed: DispatchOutboxEvent[] = [];
+    const unsubscribe = outbox.subscribe((event) => observed.push(event), ["reviewer.browser_turn.ready"]);
+    outbox.enqueue({ eventType: "unrelated.event", aggregateId: "unrelated" });
+    let queued: DispatchOutboxEvent | undefined;
+    db.sqlite.transaction(() => {
+      queued = outbox.enqueue({ eventType: "reviewer.browser_turn.ready", aggregateId: "review" });
+      assert.equal(observed.length, 0, "the consumer wake must not run before the enclosing transaction commits");
+    })();
+    await Promise.resolve();
+    assert.deepEqual(observed.map((event) => event.id), [queued!.id]);
+    unsubscribe();
+    outbox.enqueue({ eventType: "reviewer.browser_turn.ready", aggregateId: "after-unsubscribe" });
+    assert.equal(observed.length, 1, "unsubscribed consumers receive no further wakeups");
+    assert.equal(outbox.listPending(1, ["reviewer.browser_turn.ready"])[0]?.aggregateId, "review");
+    db.close();
+  }
+
   // --- Fix 1: dead-lettering is keyed off genuine failures, not claims. ---
   {
     const db = openDatabase(root);

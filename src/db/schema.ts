@@ -930,9 +930,12 @@ export const reviewRoutes = sqliteTable("review_routes", {
   ownerContextId: text("owner_context_id").notNull(),
   mode: text("mode").notNull().default("isolated_review"),
   deliveryPolicy: text("delivery_policy").notNull().default("explicit_user_action"),
+  deliveryTransport: text("delivery_transport").notNull().default("mcp_app"),
+  browserProfileId: text("browser_profile_id"),
   pinnedConversationId: text("pinned_conversation_id"),
   maxReviewRounds: integer("max_review_rounds").notNull().default(3),
   completedReviewRounds: integer("completed_review_rounds").notNull().default(0),
+  admittedReviewRounds: integer("admitted_review_rounds").notNull().default(0),
   status: text("status").notNull().default("disabled"),
   routeEpoch: integer("route_epoch").notNull().default(1),
   revision: integer("revision").notNull().default(1),
@@ -966,6 +969,7 @@ export const reviewHandoffs = sqliteTable("review_handoffs", {
   revision: integer("revision").notNull().default(1),
   createdAt: text("created_at").notNull(),
   claimedAt: text("claimed_at"),
+  claimExpiresAt: text("claim_expires_at"),
   completedAt: text("completed_at"),
 }, (table) => [
   index("review_handoffs_session_submission_idx").on(table.workSessionId, table.submissionId),
@@ -975,3 +979,118 @@ export const reviewHandoffs = sqliteTable("review_handoffs", {
 
 export type ReviewHandoffRow = typeof reviewHandoffs.$inferSelect;
 export type NewReviewHandoffRow = typeof reviewHandoffs.$inferInsert;
+
+/** One application-level reviewer context bound to a route generation. */
+export const reviewThreads = sqliteTable("review_threads", {
+  id: text("id").primaryKey(),
+  routeId: text("route_id").notNull().references(() => reviewRoutes.id, { onDelete: "cascade" }),
+  routeEpoch: integer("route_epoch").notNull(),
+  workSessionId: text("work_session_id").notNull().references(() => workSessions.id, { onDelete: "cascade" }),
+  ownerPrincipalId: text("owner_principal_id").notNull(),
+  reviewerPrincipalId: text("reviewer_principal_id"),
+  reviewerContextId: text("reviewer_context_id"),
+  hostKind: text("host_kind").notNull().default("kontrol_ui"),
+  hostConversationId: text("host_conversation_id"),
+  hostBindingVerified: integer("host_binding_verified", { mode: "boolean" }).notNull().default(false),
+  reviewerBindingId: text("reviewer_binding_id"),
+  browserProfileId: text("browser_profile_id"),
+  browserGeneration: integer("browser_generation"),
+  browserTargetId: text("browser_target_id"),
+  browserCdpSessionId: text("browser_cdp_session_id"),
+  conversationUrl: text("conversation_url"),
+  conversationKey: text("conversation_key"),
+  conversationFingerprint: text("conversation_fingerprint"),
+  conversationBindingRevision: integer("conversation_binding_revision"),
+  conversationBindingStatus: text("conversation_binding_status"),
+  conversationBindingAssurance: text("conversation_binding_assurance"),
+  resumeChallengeSha256: text("resume_challenge_sha256"),
+  resumeChallengeExpiresAt: text("resume_challenge_expires_at"),
+  bindingGeneration: integer("binding_generation").notNull().default(0),
+  status: text("status").notNull().default("pending_activation"),
+  maxRounds: integer("max_rounds").notNull(),
+  revision: integer("revision").notNull().default(1),
+  createdAt: text("created_at").notNull(),
+  activatedAt: text("activated_at"),
+  closedAt: text("closed_at"),
+}, (table) => [
+  uniqueIndex("review_threads_route_epoch_unique").on(table.routeId, table.routeEpoch),
+  index("review_threads_session_status_idx").on(table.workSessionId, table.status),
+]);
+
+export const reviewThreadActivations = sqliteTable("review_thread_activations", {
+  id: text("id").primaryKey(),
+  threadId: text("thread_id").notNull().references(() => reviewThreads.id, { onDelete: "cascade" }),
+  routeId: text("route_id").notNull(),
+  routeEpoch: integer("route_epoch").notNull(),
+  principalId: text("principal_id").notNull(),
+  activationSecretSha256: text("activation_secret_sha256").notNull().unique(),
+  createdAt: text("created_at").notNull(),
+  expiresAt: text("expires_at").notNull(),
+  consumedAt: text("consumed_at"),
+  revokedAt: text("revoked_at"),
+}, (table) => [
+  index("review_thread_activations_thread_expiry_idx").on(table.threadId, table.expiresAt),
+]);
+
+export const reviewThreadMessages = sqliteTable("review_thread_messages", {
+  id: text("id").primaryKey(),
+  threadId: text("thread_id").notNull().references(() => reviewThreads.id, { onDelete: "cascade" }),
+  routeEpoch: integer("route_epoch").notNull(),
+  workSessionId: text("work_session_id").notNull(),
+  handoffId: text("handoff_id").notNull(),
+  submissionId: text("submission_id").notNull(),
+  reviewEpoch: integer("review_epoch").notNull(),
+  roundNumber: integer("round_number").notNull(),
+  kind: text("kind").notNull(),
+  payloadJson: text("payload_json").notNull(),
+  payloadSha256: text("payload_sha256").notNull(),
+  status: text("status").notNull().default("awaiting_activation"),
+  revision: integer("revision").notNull().default(1),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+}, (table) => [
+  uniqueIndex("review_thread_messages_submission_unique").on(table.threadId, table.submissionId, table.reviewEpoch),
+  index("review_thread_messages_delivery_idx").on(table.threadId, table.status, table.createdAt),
+]);
+
+export const reviewBrowserTurns = sqliteTable("review_browser_turns", {
+  id: text("id").primaryKey(),
+  reviewMessageId: text("review_message_id").notNull().references(() => reviewThreadMessages.id, { onDelete: "cascade" }),
+  reviewThreadId: text("review_thread_id").notNull(),
+  routeEpoch: integer("route_epoch").notNull(),
+  profileId: text("profile_id").notNull(),
+  conversationFingerprint: text("conversation_fingerprint").notNull(),
+  attemptNumber: integer("attempt_number").notNull(),
+  browserGeneration: integer("browser_generation"),
+  leaseOwner: text("lease_owner"),
+  leaseTokenSha256: text("lease_token_sha256"),
+  leaseExpiresAt: text("lease_expires_at"),
+  state: text("state").notNull(),
+  promptSha256: text("prompt_sha256").notNull(),
+  baselineUserMessageCount: integer("baseline_user_message_count"),
+  baselineAssistantMessageCount: integer("baseline_assistant_message_count"),
+  submittedAt: text("submitted_at"),
+  generationFinishedAt: text("generation_finished_at"),
+  feedbackCommittedAt: text("feedback_committed_at"),
+  errorCode: text("error_code"),
+  createdAt: text("created_at").notNull(),
+}, (table) => [
+  uniqueIndex("review_browser_turns_message_number_unique").on(table.reviewMessageId, table.attemptNumber),
+  index("review_browser_turns_state_lease_idx").on(table.state, table.leaseExpiresAt),
+  uniqueIndex("review_browser_turns_message_active_unique").on(table.reviewMessageId).where(sql`${table.state} in ('leased', 'browser_ready', 'dispatching', 'prompt_accepted', 'model_generating', 'generation_finished', 'awaiting_feedback', 'uncertain')`),
+  uniqueIndex("review_browser_turns_thread_active_unique").on(table.reviewThreadId).where(sql`${table.state} in ('leased', 'browser_ready', 'dispatching', 'prompt_accepted', 'model_generating', 'generation_finished', 'awaiting_feedback', 'uncertain')`),
+]);
+
+export const reviewBrowserProfiles = sqliteTable("review_browser_profiles", {
+  id: text("id").primaryKey(),
+  ownerPrincipalId: text("owner_principal_id").notNull(),
+  browserEngine: text("browser_engine").notNull().default("chromium"),
+  mode: text("mode").notNull().default("headed"),
+  status: text("status").notNull().default("stopped"),
+  generation: integer("generation").notNull().default(0),
+  lastVerifiedAt: text("last_verified_at"),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+}, (table) => [
+  index("review_browser_profiles_owner_idx").on(table.ownerPrincipalId, table.status),
+]);

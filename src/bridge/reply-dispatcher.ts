@@ -15,7 +15,9 @@ const claimOf = (event: DispatchOutboxEvent): OutboxClaim => ({ eventId: event.i
 export function createReplyDispatcher(config: BridgeConfig): ReplyDispatcher {
   let timer: ReturnType<typeof setTimeout> | null = null;
   let stopped = false;
-  let unsub: (() => void) | null = null;
+  let started = false;
+  let running: Promise<void> | undefined;
+  let unsub: (() => void) | undefined;
 
   async function dispatchReply(event: DispatchOutboxEvent): Promise<"completed" | "deferred" | "failed"> {
     const agentMessages = config.agentMessages;
@@ -65,10 +67,10 @@ export function createReplyDispatcher(config: BridgeConfig): ReplyDispatcher {
     }
     if (wait?.resumeOnReply !== true) {
       // MCP-capable live waiter is responsible for its own consumption. Keep
-      // the delivery pending and return it on reconnect; do not spawn a worker
-      // merely because a question exists.
-      config.dispatchOutbox?.release(claimOf(event), DEFAULT_CLAIM_LEASE_MS, "waiting for authorized MCP worker");
-      return "deferred";
+      // the durable reply record pending for reconnect; do not keep a dispatch
+      // event cycling while the worker waits or is offline.
+      config.dispatchOutbox?.markCompleted(claimOf(event));
+      return "completed";
     }
     // Native ACP resume path intentionally fails closed in this first phase.
     // It requires adapter support for structured needs_input and authenticated
@@ -89,32 +91,41 @@ export function createReplyDispatcher(config: BridgeConfig): ReplyDispatcher {
   }
 
   async function drainOnce(): Promise<void> {
-    if (!config.dispatchOutbox || stopped) return;
-    config.dispatchOutbox.reapExpiredClaims(DEFAULT_CLAIM_LEASE_MS);
-    for (;;) {
-      const event = config.dispatchOutbox.claimNext(REPLY_DISPATCHER_ID, DEFAULT_CLAIM_LEASE_MS, ["agent.reply.ready"]);
-      if (!event) break;
-      const claim = claimOf(event);
-      if (event.eventType !== "agent.reply.ready") {
-        config.dispatchOutbox.markFailed(claim, `Reply routing violation: ${event.eventType}`, DEFAULT_CLAIM_LEASE_MS);
-        continue;
+    const outbox = config.dispatchOutbox;
+    if (!outbox || stopped) return;
+    if (running) return running;
+    running = (async () => {
+      outbox.reapExpiredClaims(DEFAULT_CLAIM_LEASE_MS);
+      for (;;) {
+        if (stopped) break;
+        const event = outbox.claimNext(REPLY_DISPATCHER_ID, DEFAULT_CLAIM_LEASE_MS, ["agent.reply.ready"]);
+        if (!event) break;
+        const claim = claimOf(event);
+        try {
+          const result = await dispatchReply(event);
+          if (result === "completed") outbox.markCompleted(claim);
+        } catch (error) {
+          outbox.markFailed(claim, error instanceof Error ? error.message : String(error), DEFAULT_CLAIM_LEASE_MS);
+        }
       }
-      try {
-        const result = await dispatchReply(event);
-        if (result === "completed") config.dispatchOutbox.markCompleted(claim);
-      } catch (error) {
-        config.dispatchOutbox.markFailed(claim, error instanceof Error ? error.message : String(error), DEFAULT_CLAIM_LEASE_MS);
-      }
-    }
+    })().finally(() => {
+      running = undefined;
+      scheduleNextEligible();
+    });
+    return running;
   }
 
-  function scheduleNext(): void {
+  function scheduleNextEligible(): void {
     if (timer) clearTimeout(timer);
+    timer = null;
+    const outbox = config.dispatchOutbox;
+    if (!outbox || stopped || !started) return;
+    const next = outbox.listPending(1, ["agent.reply.ready"])[0];
+    if (!next) return;
     timer = setTimeout(() => {
-      void drainOnce().then(() => {
-        if (!stopped) scheduleNext();
-      });
-    }, DEFAULT_CLAIM_LEASE_MS);
+      timer = null;
+      void drainOnce();
+    }, Math.max(0, Date.parse(next.availableAt) - Date.now()));
   }
 
   async function defaultResumeReply(config: BridgeConfig, reply: NonNullable<ReturnType<NonNullable<typeof config.agentMessages>["getReply"]>>, wait: NonNullable<ReturnType<NonNullable<typeof config.agentMessages>["getActiveWaitForMessage"]>>): Promise<"completed" | "deferred" | "failed"> {
@@ -140,19 +151,23 @@ export function createReplyDispatcher(config: BridgeConfig): ReplyDispatcher {
 
   return {
     start() {
+      if (started) return;
+      started = true;
       stopped = false;
+      const outbox = config.dispatchOutbox;
+      if (!outbox) return;
+      unsub = outbox.subscribe(() => { void drainOnce(); }, ["agent.reply.ready"]);
+      // A fresh process reconstructs work from the durable outbox before
+      // depending on notifications for newly committed replies.
       void drainOnce();
-      unsub = config.eventStore.subscribeAll((event) => {
-        if (event.type === "agent.message.reply_accepted") void drainOnce();
-      });
-      scheduleNext();
     },
     stop() {
       stopped = true;
+      started = false;
       if (timer) clearTimeout(timer);
       timer = null;
       unsub?.();
-      unsub = null;
+      unsub = undefined;
     },
     drainOnce,
   };

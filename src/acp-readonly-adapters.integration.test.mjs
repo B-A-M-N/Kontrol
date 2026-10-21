@@ -72,15 +72,16 @@ async function requestJson(url, { method = "GET", body, secret = ADAPTER_SECRET 
   return { response, json };
 }
 
-function makeReadOnlyBody({ workspaceRoot, agentId, runId, workSessionId, dispatchKey, grant, taskText = task }) {
+function makeReadOnlyBody({ workspaceRoot, agentId, runId, workSessionId, dispatchKey, grant, taskText = task, attemptNumber = 1, continuationId }) {
   return {
     workspace_root: workspaceRoot,
     workspace_session_id: `workspace-${workSessionId}`,
     session_id: workSessionId,
     agent_id: agentId,
     parent_run_id: runId,
-    attempt_number: 1,
+    attempt_number: attemptNumber,
     dispatch_idempotency_key: dispatchKey,
+    ...(continuationId ? { continuation_id: continuationId } : {}),
     scheduled_execution_policy: {
       executionMode: "read_only_audit",
       workspaceAccess: "read_only",
@@ -91,14 +92,14 @@ function makeReadOnlyBody({ workspaceRoot, agentId, runId, workSessionId, dispat
   };
 }
 
-function createGrant({ workspaceRoot, agentId, runId, workSessionId, dispatchKey }) {
+function createGrant({ workspaceRoot, agentId, runId, workSessionId, dispatchKey, attemptNumber = 1 }) {
   return createReadOnlyExecutionGrant({
     workSessionId,
     workspaceSessionId: `workspace-${workSessionId}`,
     workspaceRoot,
     agentId,
     runId,
-    attemptNumber: 1,
+    attemptNumber,
     dispatchIdempotencyKey: dispatchKey,
   }, ADAPTER_SECRET);
 }
@@ -143,7 +144,8 @@ async function createWorkspace(root) {
 }
 
 async function createControlPlane(agentId, events, expectedDispatch) {
-  const durableEventPath = join(expectedDispatch.root, "kontrol-durable-events.jsonl");
+  const dispatches = Array.isArray(expectedDispatch) ? expectedDispatch : [expectedDispatch];
+  const durableEventPath = join(dispatches[0].root, "kontrol-durable-events.jsonl");
   const server = createServer(async (req, res) => {
     const chunks = [];
     for await (const chunk of req) chunks.push(Buffer.from(chunk));
@@ -159,15 +161,16 @@ async function createControlPlane(agentId, events, expectedDispatch) {
     if (eventRoute) {
       events.push(body);
       const terminal = ["completed", "failed", "cancelled", "exited"].includes(body.type);
-      const exactDispatch = decodeURIComponent(eventRoute[1]) === expectedDispatch.runId
-        && body.attempt_number === expectedDispatch.attemptNumber
+      const correlatedDispatch = dispatches.find((dispatch) => decodeURIComponent(eventRoute[1]) === dispatch.runId
+        && body.attempt_number === dispatch.attemptNumber);
+      const exactDispatch = Boolean(correlatedDispatch)
         && typeof body.remote_run_id === "string"
         && typeof body.event_id === "string";
       if (terminal && exactDispatch) {
-        await appendFile(durableEventPath, `${JSON.stringify({ runId: expectedDispatch.runId, dispatchKey: expectedDispatch.dispatchKey, ...body })}\n`);
+        await appendFile(durableEventPath, `${JSON.stringify({ runId: correlatedDispatch.runId, dispatchKey: correlatedDispatch.dispatchKey, ...body })}\n`);
         receiptAcknowledgement = {
           dispatch_receipt_acknowledged: true,
-          dispatch_idempotency_key: expectedDispatch.dispatchKey,
+          dispatch_idempotency_key: correlatedDispatch.dispatchKey,
           remote_run_id: body.remote_run_id,
           attempt_number: body.attempt_number,
           event_id: body.event_id,
@@ -315,9 +318,14 @@ async function runHermes(root) {
   const state = await createWorkspace(root);
   const dispatchKey = "hermes-read-only-integration";
   const runId = "hermes-read-only-run";
+  const continuationDispatchKey = "hermes-read-only-continuation-integration";
+  const continuationRunId = "hermes-read-only-continuation-run";
   const workSessionId = "hermes-read-only-session";
   const agentId = "agent-hermes-integration";
-  const control = await createControlPlane(agentId, events, { root, dispatchKey, runId, attemptNumber: 1 });
+  const control = await createControlPlane(agentId, events, [
+    { root, dispatchKey, runId, attemptNumber: 1 },
+    { root, dispatchKey: continuationDispatchKey, runId: continuationRunId, attemptNumber: 2 },
+  ]);
   const { wrapper, marker } = await createBubblewrapWrapper(root);
   const hermesRoot = join(root, "hermes-runtime");
   const toolchainRoot = await mkdtemp(join(process.cwd(), ".tmp-kontrol-hermes-toolchain-"));
@@ -345,11 +353,23 @@ async function runHermes(root) {
     "    def __init__(self, type, text): self.type, self.text = type, text",
     ""] .join("\n"));
   await writeFile(join(sitePackages, "acp", "core.py"), [
+    "import os",
+    "from pathlib import Path",
     "from types import SimpleNamespace",
     "class _Connection:",
     "    def __init__(self, client, output_stream): self.client, self.output_stream = client, output_stream",
-    "    async def initialize(self, **_kwargs): return None",
-    "    async def new_session(self, **_kwargs): return SimpleNamespace(session_id='fixture-session')",
+    "    async def initialize(self, **_kwargs): return SimpleNamespace(agent_capabilities=SimpleNamespace(load_session=True))",
+    "    async def new_session(self, **_kwargs):",
+    "        home = Path(os.environ['HERMES_HOME'])",
+    "        home.mkdir(parents=True, exist_ok=True)",
+    "        (home / 'fixture-session-id').write_text('fixture-session')",
+    "        return SimpleNamespace(session_id='fixture-session')",
+    "    async def load_session(self, cwd, session_id, mcp_servers=None):",
+    "        home = Path(os.environ['HERMES_HOME'])",
+    "        stored = (home / 'fixture-session-id').read_text() if (home / 'fixture-session-id').exists() else ''",
+    "        if stored != session_id: return None",
+    "        (home / 'loaded-session-id').write_text(session_id)",
+    "        return object()",
     "    async def prompt(self, **_kwargs):",
     "        text = (await self.output_stream.read()).decode('utf-8', errors='replace')",
     "        await self.client.session_update('fixture-session', {'sessionUpdate': 'agent_message_chunk', 'content': {'text': text}})",
@@ -377,6 +397,8 @@ async function runHermes(root) {
       KONTROL_HERMES_OWNED_PROCESSES: join(root, "hermes-owned.json"),
       KONTROL_HERMES_TERMINAL_SPOOL: join(root, "hermes-terminal-spool.json"),
       KONTROL_HERMES_EVENT_SPOOL: join(root, "hermes-event-spool.json"),
+      KONTROL_HERMES_PROVIDER_SESSIONS: join(root, "hermes-provider-sessions.json"),
+      KONTROL_HERMES_SESSION_HOME_ROOT: join(root, "hermes-session-homes"),
       HERMES_ACP_ADAPTER_PORT: String(adapterPort),
       HERMES_AGENT_ROOT: hermesRoot,
       HERMES_NATIVE_PYTHON: pythonBin,
@@ -416,6 +438,40 @@ async function runHermes(root) {
     assert.equal(lookup.json.execution_receipt?.grant_fingerprint, result.json.execution_receipt.grant_fingerprint,
       "Hermes retains the same correlated execution receipt for dispatch recovery");
     assert.ok((await readFile(marker, "utf8")).trim().length > 0, "valid Hermes execution exercised Bubblewrap");
+
+    const continuationGrant = createGrant({
+      workspaceRoot: state.workspaceRoot,
+      agentId,
+      runId: continuationRunId,
+      workSessionId,
+      dispatchKey: continuationDispatchKey,
+      attemptNumber: 2,
+    });
+    const continuationBody = makeReadOnlyBody({
+      workspaceRoot: state.workspaceRoot,
+      agentId,
+      runId: continuationRunId,
+      workSessionId,
+      dispatchKey: continuationDispatchKey,
+      grant: continuationGrant,
+      taskText: "Continue in the existing Hermes conversation and confirm the session loaded.",
+      attemptNumber: 2,
+      continuationId: "continuation-2",
+    });
+    const continued = await requestJson(`${baseUrl}/runs`, { method: "POST", body: continuationBody });
+    assert.equal(continued.response.status, 202, `${continued.json.error?.message ?? "Hermes continuation was not accepted"}\n${logs}`);
+    assert.ok(continued.json.run_id);
+    await waitFor("Hermes continuation completion", () => events.find((event) => event.type === "completed" && event.remote_run_id === continued.json.run_id));
+    await assertReceiptAcknowledged({
+      adapterName: "Hermes continuation",
+      receiptsPath: join(root, "hermes-receipts.json"),
+      dispatchKey: continuationDispatchKey,
+      remoteRunId: continued.json.run_id,
+      control,
+    });
+    const sessionHome = join(root, "hermes-session-homes", sha256(workSessionId));
+    assert.equal(await readFile(join(sessionHome, "loaded-session-id"), "utf8"), "fixture-session",
+      "the continuation loaded the same Hermes provider session from its persistent per-work-session home");
     console.log("acp-readonly-adapters.integration: Hermes dispatched and resisted confined mutation attempts");
   } finally {
     adapter.kill("SIGTERM");

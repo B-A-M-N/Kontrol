@@ -59,7 +59,8 @@ try {
   const wait = agentMessages.getActiveWaitForMessage(question.id);
   assert.equal(wait?.resumeOnReply ?? false, false);
   const foreign = dispatchOutbox.listPending().filter((event) => event.eventType === "agent.reply.ready");
-  assert.ok(foreign.length >= 1, "reply remains pending for MCP worker consumption");
+  assert.equal(foreign.length, 0, "the outbox wake is consumed once; replies remain durable independently");
+  assert.equal(agentMessages.listPendingReplies(session.id).some((item) => item.id === reply.id), true, "the MCP worker can recover the unacknowledged reply after reconnect");
   eventStore.close();
   db.close();
   dispatchOutbox.close();

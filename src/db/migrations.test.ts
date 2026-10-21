@@ -11,7 +11,7 @@ sqlite.pragma("foreign_keys = ON");
 try {
   migrateDatabase(sqlite);
   const schemaContract = inspectDatabaseSchemaContract(sqlite);
-  assert.equal(schemaContract.expectedTableCount, 41, "schema contract covers all Drizzle table mappings");
+  assert.equal(schemaContract.expectedTableCount, 46, "schema contract covers all Drizzle table mappings");
   assert.deepEqual(schemaContract.missing, [], "all Drizzle tables and columns are present in migrated SQLite");
   assert.equal(schemaContract.appliedVersion, LATEST_SCHEMA_VERSION);
   assert.ok(
@@ -23,6 +23,31 @@ try {
     (sqlite.prepare("pragma table_info(work_sessions)").all() as Array<{ name: string }>)
       .some((column) => column.name === "owner_context_id"),
     "work session owner context column is present after migration",
+  );
+  assert.ok(
+    (sqlite.prepare("pragma table_info(review_handoffs)").all() as Array<{ name: string }>)
+      .some((column) => column.name === "claim_expires_at"),
+    "review handoff claim leases are durable after migration",
+  );
+  assert.ok(
+    (sqlite.prepare("pragma table_info(review_routes)").all() as Array<{ name: string }>)
+      .some((column) => column.name === "delivery_transport"),
+    "review routes persist their selected delivery transport",
+  );
+  assert.ok(
+    (sqlite.prepare("pragma table_info(review_threads)").all() as Array<{ name: string }>)
+      .some((column) => column.name === "conversation_fingerprint"),
+    "review threads persist exact browser conversation identity",
+  );
+  assert.ok(
+    (sqlite.prepare("pragma table_info(review_browser_turns)").all() as Array<{ name: string }>)
+      .some((column) => column.name === "lease_token_sha256"),
+    "browser review turns persist fenced delivery leases",
+  );
+  assert.ok(
+    (sqlite.prepare("pragma table_info(review_browser_profiles)").all() as Array<{ name: string }>)
+      .some((column) => column.name === "owner_principal_id"),
+    "review browser profiles remain owned by the authenticated principal",
   );
   assert.ok(
     (sqlite.prepare("pragma table_info(approval_requests)").all() as Array<{ name: string }>)

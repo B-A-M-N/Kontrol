@@ -19,7 +19,7 @@ export function registerDelegationTools(server: McpServer, config: BridgeConfig)
     "submit_to_coding_agent",
     {
       title: "Submit task to coding agent",
-      description: "Optional reviewer-directed delegation from the WebUI to a currently dispatchable registered ACP harness. If agentName is omitted, Kontrol prefers the native registered harness for the caller platform (ChatGPT/OpenAI prefers Codex), then falls back to any healthy role=agent HTTP ACP adapter. The platform hint affects routing only. The WebUI remains the reviewer.",
+      description: "Reviewer-directed delegation to a registered ACP harness. An explicit agentName is honored exactly; required_delegate fails if that peer is unavailable and never falls back to another adapter. If agentName is omitted, the optional routing policy may select a healthy peer.",
       inputSchema: {
         task: z.string().trim().min(1).describe("Bounded instruction or task for the coding agent."),
         dispatchIntent: z.enum(["optional_assist", "required_delegate"]).optional().describe("Optional assistance falls back to direct workspace work when unavailable; required_delegate returns an error instead."),
@@ -46,6 +46,8 @@ export function registerDelegationTools(server: McpServer, config: BridgeConfig)
         retryable: z.boolean().optional(),
         fallback: z.string().optional(),
         reason: z.string().optional(),
+        agentName: z.string().optional(),
+        agentId: z.string().optional(),
       },
       _meta: workspaceAppModelAndAppMeta(),
       annotations: { readOnlyHint: false },
@@ -280,21 +282,21 @@ export function registerDelegationTools(server: McpServer, config: BridgeConfig)
           });
           return {
             content: [{ type: "text" as const, text: `${selectedAgentName}: dispatch acceptance is uncertain. Run ${result.runId} remains attached to this work session while Kontrol reconciles the original launch.` }],
-            structuredContent: { runId: result.runId, remoteRunId: result.remoteRunId, workSessionId: wsId, workspaceSessionId, status: "uncertain", output: result.output, error: result.error, retryable: false },
+            structuredContent: { runId: result.runId, remoteRunId: result.remoteRunId, workSessionId: wsId, workspaceSessionId, status: "uncertain", output: result.output, error: result.error, retryable: false, agentName: selectedAgentName, agentId: peer.id },
           };
         }
         if (result.status === "failed") {
           rollbackDispatch(result.error ?? "ACP dispatch failed", result.runId);
           return {
             content: [{ type: "text" as const, text: result.error ?? "ACP call failed with no error detail." }],
-            structuredContent: { runId: result.runId, remoteRunId: result.remoteRunId, workSessionId: wsId, workspaceSessionId, status: result.status, output: result.output, error: result.error },
+            structuredContent: { runId: result.runId, remoteRunId: result.remoteRunId, workSessionId: wsId, workspaceSessionId, status: result.status, output: result.output, error: result.error, agentName: selectedAgentName, agentId: peer.id },
             isError: true,
           };
         }
         if (supervisorRun) config.supervisorRuns?.transition({ id: supervisorRun.id, expectedStatus: "created", expectedRevision: supervisorRun.revision, nextStatus: "worker_active" });
         return {
           content: [{ type: "text" as const, text: result.output || "(no output)" }],
-          structuredContent: { runId: result.runId, remoteRunId: result.remoteRunId, workSessionId: wsId, workspaceSessionId, status: result.status, output: result.output },
+          structuredContent: { runId: result.runId, remoteRunId: result.remoteRunId, workSessionId: wsId, workspaceSessionId, status: result.status, output: result.output, agentName: selectedAgentName, agentId: peer.id },
         };
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error);

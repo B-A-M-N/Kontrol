@@ -33,6 +33,7 @@ async def main() -> int:
     sys.path.insert(0, str(hermes_root))
 
     pending_permissions: dict[str, asyncio.Future[dict]] = {}
+    pending_session_bindings: dict[str, asyncio.Future[dict]] = {}
     response_text: list[str] = []
     thought_text: list[str] = []
     streaming_usage: dict = {}
@@ -48,9 +49,15 @@ async def main() -> int:
 
     def read_adapter_responses(loop: asyncio.AbstractEventLoop) -> None:
         def deliver(msg: dict) -> None:
-            if msg.get("type") != "permission_response":
-                return
+            message_type = msg.get("type")
             request_id = str(msg.get("requestId") or "")
+            if message_type == "session_binding_ack":
+                future = pending_session_bindings.get(request_id)
+                if future and not future.done():
+                    future.set_result(msg)
+                return
+            if message_type != "permission_response":
+                return
             future = pending_permissions.get(request_id)
             if future and not future.done():
                 future.set_result(msg)
@@ -270,6 +277,33 @@ async def main() -> int:
         async def ext_notification(self, method: str, params: dict) -> None:
             emit({"type": "raw_request", "method": method, "params": params})
 
+    async def persist_provider_session_binding(provider_session_id: str) -> None:
+        work_session_id = str(spec.get("workSessionId") or "")
+        agent_id = str(spec.get("agentId") or "")
+        if not work_session_id or not agent_id:
+            return
+        request_id = f"session_{uuid.uuid4()}"
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[dict] = loop.create_future()
+        pending_session_bindings[request_id] = future
+        emit({
+            "type": "session_binding",
+            "requestId": request_id,
+            "workSessionId": work_session_id,
+            "agentId": agent_id,
+            "providerSessionId": provider_session_id,
+            "workspaceRoot": str(spec.get("workspaceRoot") or ""),
+            "providerGeneration": str(spec.get("providerGeneration") or ""),
+        })
+        try:
+            acknowledgement = await asyncio.wait_for(future, timeout=10)
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError("provider_session_persist_failed: Kontrol did not confirm the session binding") from exc
+        finally:
+            pending_session_bindings.pop(request_id, None)
+        if acknowledgement.get("accepted") is not True:
+            raise RuntimeError(f"provider_session_persist_failed: {acknowledgement.get('error') or 'Kontrol rejected the session binding'}")
+
     try:
         from acp.core import connect_to_agent
         from acp.meta import PROTOCOL_VERSION
@@ -295,8 +329,9 @@ async def main() -> int:
                     emit({"type": "error", "error": f"Hermes sandbox profile entry is invalid: {name}"})
                     return 4
                 destination = hermes_home / name
-                shutil.copyfile(source, destination)
-                destination.chmod(0o600)
+                if not destination.exists():
+                    shutil.copyfile(source, destination)
+                    destination.chmod(0o600)
         env["HERMES_HOME"] = str(hermes_home)
     command = spec.get("command") or "hermes"
     args = spec.get("args") or []
@@ -343,17 +378,22 @@ async def main() -> int:
                 use_unstable_protocol=True,
             )
             try:
-                await connection.initialize(
+                initialization = await connection.initialize(
                     protocol_version=PROTOCOL_VERSION,
                     client_capabilities=ClientCapabilities(fs=FileSystemCapabilities(write_text_file=True)),
                     client_info=Implementation(name="kontrol-hermes-runner", version="1.0.0"),
                 )
-                session = await connection.new_session(cwd=cwd, mcp_servers=[])
+                session_id = await open_provider_session(
+                    connection,
+                    initialization,
+                    spec,
+                    persist_provider_session_binding,
+                )
                 prompt = str(spec.get("task") or "")
                 result = await asyncio.wait_for(
                     connection.prompt(
                         prompt=[TextContentBlock(type="text", text=prompt)],
-                        session_id=session.session_id,
+                        session_id=session_id,
                     ),
                     timeout=min(timeout, max_run_seconds),
                 )
@@ -408,6 +448,43 @@ async def main() -> int:
         "stopReason": stop_reason,
     })
     return 0
+
+
+async def open_provider_session(connection, initialization, spec: dict, persist_binding) -> str:
+    """Open the task's original Hermes session or create and persist the first one."""
+    binding = spec.get("sessionBinding")
+    if binding is not None:
+        work_session_id = str(spec.get("workSessionId") or "")
+        agent_id = str(spec.get("agentId") or "")
+        workspace_root = str(spec.get("workspaceRoot") or "")
+        provider_generation = str(spec.get("providerGeneration") or "")
+        if not isinstance(binding, dict) or not work_session_id or not agent_id or not workspace_root or not provider_generation:
+            raise RuntimeError("continuation_session_binding_invalid: incomplete trusted session binding")
+        expected = {
+            "workSessionId": work_session_id,
+            "agentId": agent_id,
+            "workspaceRoot": workspace_root,
+            "providerGeneration": provider_generation,
+        }
+        if any(binding.get(key) != value for key, value in expected.items()):
+            raise RuntimeError("continuation_session_binding_conflict: session binding does not match this work session")
+        capabilities = getattr(initialization, "agent_capabilities", None)
+        if getattr(capabilities, "load_session", False) is not True:
+            raise RuntimeError("continuation_session_unsupported: Hermes ACP did not advertise session/load")
+        provider_session_id = binding.get("providerSessionId")
+        if not isinstance(provider_session_id, str) or not provider_session_id.strip():
+            raise RuntimeError("continuation_session_missing: provider session ID is empty")
+        session = await connection.load_session(cwd=spec.get("cwd") or os.getcwd(), session_id=provider_session_id, mcp_servers=[])
+        if session is None:
+            raise RuntimeError("continuation_session_missing: Hermes ACP could not load the persisted provider session")
+        return provider_session_id
+
+    session = await connection.new_session(cwd=spec.get("cwd") or os.getcwd(), mcp_servers=[])
+    session_id = getattr(session, "session_id", None)
+    if not isinstance(session_id, str) or not session_id.strip():
+        raise RuntimeError("Hermes ACP returned no session ID from session/new")
+    await persist_binding(session_id)
+    return session_id
 
 
 def positive_duration(value, fallback: float) -> float:

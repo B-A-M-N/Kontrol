@@ -52,10 +52,6 @@ try {
       principalId: "user-a",
       ownerContextId: "owner-b",
       destinationConversationId: "owner-b",
-      authorization: {
-        conversationId: "owner-b",
-        freshConversationIds: ["owner-b"],
-      },
     });
   } catch {
     wrongConversationDenied = true;
@@ -67,20 +63,23 @@ try {
     principalId: "user-a",
     ownerContextId,
     destinationConversationId: ownerContextId,
-    authorization: {
-      conversationId: ownerContextId,
-      freshConversationIds: [ownerContextId],
-    },
   });
   assert.equal(claimed.claimedByOwnerContextId, ownerContextId);
 
   const eventTypes: string[] = [];
   const eventPayloads: unknown[] = [];
+  const testSubmission = {
+    id: "sub-1", workSessionId: "wsess-handoff", submissionNumber: 1,
+    diffSha256: "hash-1", snapshotKind: "git" as const, snapshotRef: "ref-1",
+    reviewEpoch: 1, status: "pending" as const, createdAt: new Date().toISOString(),
+    message: "bounded change summary", summaryJson: JSON.stringify({ files: 1, additions: 2, removals: 0 }),
+    files: [{ path: "src/example.ts", type: "change" as const, additions: 2, removals: 0 }],
+  };
   const reviewerConfig = {
     workspaces: {},
-    workSessions: { get: () => ({ ownerContextId }) },
+    workSessions: { get: () => ({ id: "wsess-handoff", ownerContextId, title: "Review objective" }), getSubmissions: () => [testSubmission] },
     reviewCheckpoints: {},
-    agentRegistry: {},
+    agentRegistry: { getRunByWorkSessionId: () => undefined },
     eventStore: { appendEvent: (event: { type: string; payload: unknown }) => { eventTypes.push(event.type); eventPayloads.push(event.payload); } },
     continuationManager: {},
     reviewWorkflow: {},
@@ -127,6 +126,9 @@ try {
   const packet = handoffPacket.structuredContent as { externalCatalogAttachments: Array<Record<string, unknown>> };
   assert.equal(packet.externalCatalogAttachments.length, 1);
   assert.equal(packet.externalCatalogAttachments[0].observationRecordId, submittedContent.recordId);
+  assert.equal((packet as any).reviewPacket.submission.snapshot.ref, "ref-1");
+  assert.equal((packet as any).reviewPacket.originalObjective, "Review objective");
+  assert.ok((packet as any).reviewPacket.packetSha256);
   assert.equal(eventTypes.includes("review.handoff.external_catalog_observation_attached"), true);
   assert.equal(JSON.stringify(eventPayloads).includes("host_integration"), false,
     "reviewer-provided data is never promoted to host integration evidence");

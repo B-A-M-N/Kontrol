@@ -208,8 +208,10 @@ let fakeConnectCount = 0;
 let fakeSurfaceFailures = 0;
 let fakeEventDelivered = false;
 let fakeReplayDelivered = false;
+const parkedWorkspaceWatchers = new Set<string>();
 let fakeMutationCalls = 0;
 const fakeToolCalls: string[] = [];
+const fakeToolArguments: Array<{ name: string; arguments?: Record<string, unknown> }> = [];
 // Durable pending approvals, keyed by workspace — the fake server is
 // authoritative, matching production: a policy-blocked request is persisted
 // before the approval_required response is returned.
@@ -228,6 +230,16 @@ const fakeApp = {
     const name = String(request.name ?? "");
     const workspaceId = String((request.arguments as { workspaceId?: string } | undefined)?.workspaceId ?? "");
     fakeToolCalls.push(name);
+    fakeToolArguments.push({ name, arguments: request.arguments });
+    if (name === "discover_agents") {
+      return { isError: false, content: [], structuredContent: { agents: [
+        { name: "hermes-agent", role: "agent", alive: true, healthy: true, dispatchable: true, probeStatus: 200, capabilities: [], checkedAt: new Date().toISOString() },
+        { name: "cli-coding-agent", role: "agent", alive: false, healthy: false, dispatchable: false, probeStatus: 0, probeNote: "heartbeat unavailable", capabilities: [], checkedAt: new Date().toISOString() },
+      ] } };
+    }
+    if (name === "submit_to_coding_agent") {
+      return { isError: false, content: [], structuredContent: { runId: "run-ui-agent", workSessionId: "session-ui-agent", workspaceSessionId: "workspace-dom", status: "running", agentName: "hermes-agent" } };
+    }
     if (name === "get_workspace_session_surface") {
       if (fakeSurfaceFailures > 0) {
         fakeSurfaceFailures -= 1;
@@ -240,7 +252,8 @@ const fakeApp = {
       return { isError: false, content: [], structuredContent: { approvals: fakePendingApprovals.get(workspaceId) ?? [] } };
     }
     if (name === "await_workspace_events") {
-      if (workspaceId === "workspace-fresh") {
+      if (workspaceId.startsWith("workspace-") && !parkedWorkspaceWatchers.has(workspaceId)) {
+        parkedWorkspaceWatchers.add(workspaceId);
         return { isError: false, content: [], structuredContent: { events: [], nextSeq: Number((request.arguments as { afterSeq?: number } | undefined)?.afterSeq ?? 0) } };
       }
       if (workspaceId === "workspace-dom" && !fakeReplayDelivered) {
@@ -306,32 +319,9 @@ assert.equal(document.activeElement, replyBox, "activity updates preserve review
 assert.equal(document.querySelectorAll(".message-reply").length, 1, "activity updates preserve the message tray DOM");
 assert.match(document.querySelector(".agent-event")?.textContent ?? "", /fragment-100/, "coalesced output updates the existing activity row");
 
-// U01: review-lifecycle header reflects the durable route state.
-{
-  const headerSession = __workspaceAppTest.ensureWorkSessionView("session-loop", "workspace-loop", "run-loop");
-  headerSession.status = "awaiting_review";
-  headerSession.reviewLoop = { routeId: "route-1", status: "active", mode: "isolated_review", completedReviewRounds: 1, maxReviewRounds: 3, handoffStatus: "claimed" };
-  __workspaceAppTest.renderWorkSessionView(headerSession);
-  const header = document.querySelector<HTMLElement>(".review-loop-header");
-  assert.ok(header && !header.hidden, "an active route renders the review-lifecycle header");
-  assert.match(header.textContent ?? "", /Review loop Active/i, "header shows the loop status");
-  assert.match(header.textContent ?? "", /Round 1\/3/, "header shows the current round against the maximum");
-  assert.match(header.textContent ?? "", /Fresh review per submission/i, "header shows the selected routing mode");
-
-  // Paused route is surfaced distinctly.
-  headerSession.reviewLoop = { routeId: "route-1", status: "paused", mode: "isolated_review", completedReviewRounds: 1, maxReviewRounds: 3 };
-  __workspaceAppTest.renderWorkSessionView(headerSession);
-  assert.match(document.querySelector(".review-loop-header")?.textContent ?? "", /Review loop Paused/i, "a paused route shows as paused");
-
-  // Budget-exhausted route warns that human review is required.
-  headerSession.reviewLoop = { routeId: "route-1", status: "active", mode: "isolated_review", completedReviewRounds: 3, maxReviewRounds: 3 };
-  __workspaceAppTest.renderWorkSessionView(headerSession);
-  assert.match(document.querySelector(".review-loop-header")?.textContent ?? "", /Round budget exhausted/i, "an exhausted budget warns");
-
-  // A session without a route hides the header.
-  const plain = __workspaceAppTest.ensureWorkSessionView("session-no-loop", "workspace-loop", "run-none");
-  __workspaceAppTest.renderWorkSessionView(plain);
-}
+// Review handoffs run through MCP in the active WebUI context; the Workspace
+// App does not render a separate reviewer-facing lifecycle surface.
+assert.equal(document.querySelector(".review-loop-header"), null, "review-loop state does not create a reviewer UI surface");
 
 const secondSession = __workspaceAppTest.ensureWorkSessionView("session-dom-2", "workspace-dom", "run-dom-2");
 secondSession.title = "Second session";
@@ -344,7 +334,7 @@ __workspaceAppTest.renderWorkSessionView(session);
 const sessionButtons = [...document.querySelectorAll<HTMLButtonElement>(".session-switcher-item")];
 assert.equal(sessionButtons.length, 3, "multiple recovered sessions render a switcher and historical-review disclosure");
 sessionButtons.find((button) => button.textContent?.includes("Second session"))?.click();
-__workspaceAppTest.renderWorkSessionView(secondSession);
+__workspaceAppTest.renderNow();
 assert.ok(document.querySelector(".session-switcher-item.selected")?.textContent?.includes("Second session"), "session switcher selects another work session");
 
 // Reconnect replay is cursor-safe and direct approvals remain outside the
@@ -421,9 +411,20 @@ assert.match(document.querySelector(".tool-title")?.textContent ?? "", /Workspac
   "show_workspace_ui renders the workspace surface card");
 assert.ok(__workspaceAppTest.getLastSuccessfulHydrationAt(), "workspace state is hydrated after open_workspace");
 __workspaceAppTest.activateWorkspace("workspace-dom");
-__workspaceAppTest.renderWorkSessionView(__workspaceAppTest.ensureWorkSessionView("session-dom", "workspace-dom", "run-dom"));
+__workspaceAppTest.renderWorkSessionView(secondSession);
 const agentBars = document.querySelectorAll(".agent-submit-bar");
 assert.equal(agentBars.length, 1, "renders create one persistent agent submit bar");
+await settle();
+const agentSelect = document.querySelector<HTMLSelectElement>(".agent-submit-agent");
+assert.ok(agentSelect, "agent task bar exposes live registered-agent selection");
+assert.deepEqual([...agentSelect!.options].map((option) => option.value), ["", "hermes-agent", "cli-coding-agent"], "selector includes registered agents and their live dispatchability state");
+const submitButton = document.querySelector<HTMLButtonElement>(".agent-submit-btn");
+agentSelect!.value = "cli-coding-agent";
+agentSelect!.dispatchEvent(new dom.window.Event("change", { bubbles: true }));
+assert.equal(submitButton?.disabled, true, "an unavailable explicitly selected agent cannot be dispatched");
+assert.match(document.querySelector(".agent-submit-status")?.textContent ?? "", /heartbeat unavailable/, "the unavailable peer's actual discovery reason is shown");
+agentSelect!.value = "hermes-agent";
+agentSelect!.dispatchEvent(new dom.window.Event("change", { bubbles: true }));
 const agentInput = document.querySelector<HTMLTextAreaElement>(".agent-submit-input");
 assert.ok(agentInput, "the agent task editor is multiline");
 agentInput.value = "line one\nline two";
@@ -433,19 +434,16 @@ agentInput.setSelectionRange(3, 7);
 const callsBeforeEditorKeys = fakeToolCalls.length;
 agentInput.dispatchEvent(new dom.window.KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
 assert.equal(fakeToolCalls.length, callsBeforeEditorKeys, "plain Enter inserts a newline without submitting");
-__workspaceAppTest.renderWorkSessionView(__workspaceAppTest.ensureWorkSessionView("session-dom", "workspace-dom", "run-dom"));
+assert.equal(document.activeElement, agentInput, "agent editor is focused before the application rerender");
+__workspaceAppTest.renderNow();
 assert.equal(document.querySelectorAll(".agent-submit-bar").length, 1, "telemetry renders do not duplicate the agent submit bar");
 assert.equal(document.querySelector<HTMLTextAreaElement>(".agent-submit-input")?.value, "line one\nline two", "draft persists across renders");
 assert.equal(document.activeElement, agentInput, "agent editor focus persists across renders");
 assert.equal(document.querySelector<HTMLTextAreaElement>(".agent-submit-input")?.selectionStart, 3, "agent editor selection persists across renders");
-agentInput.dispatchEvent(new dom.window.KeyboardEvent("keydown", { key: "Enter", ctrlKey: true, bubbles: true, cancelable: true }));
-await settle();
-assert.ok(fakeToolCalls.includes("submit_to_coding_agent"), "Ctrl+Enter submits the multiline agent task");
 agentInput.value = "::chatgpt-content-reference::";
 agentInput.dispatchEvent(new dom.window.Event("input", { bubbles: true }));
 assert.equal(document.querySelector<HTMLElement>(".agent-submit-reference-warning")?.hidden, false, "reference-only input is warned without being removed");
 assert.equal(document.querySelector<HTMLTextAreaElement>(".agent-submit-input")?.value, "::chatgpt-content-reference::", "reference-only warning keeps the pasted content visible");
-await settle();
 const replayedActivity = document.querySelectorAll(".agent-event").length;
 await waitForAssertion(
   () => __workspaceAppTest.getWorkSessionView("session-dom")?.lastSeq === 102
@@ -458,6 +456,15 @@ assert.equal(
   6,
   "event watcher catches up the durable event cursor",
 );
+
+agentInput.value = "line one\nline two";
+agentInput.dispatchEvent(new dom.window.Event("input", { bubbles: true }));
+agentInput.dispatchEvent(new dom.window.KeyboardEvent("keydown", { key: "Enter", ctrlKey: true, bubbles: true, cancelable: true }));
+await settle();
+assert.ok(fakeToolCalls.includes("submit_to_coding_agent"), "Ctrl+Enter submits the multiline agent task");
+const dispatchArgs = fakeToolArguments.slice().reverse().find((entry) => entry.name === "submit_to_coding_agent")?.arguments;
+assert.equal(dispatchArgs?.agentName, "hermes-agent", "the selected registered agent is passed explicitly");
+assert.equal(dispatchArgs?.dispatchIntent, "required_delegate", "an explicitly selected agent cannot fall back to another adapter");
 
 const surfaceCallsBeforeReconnect = fakeToolCalls.filter((name) => name === "get_workspace_session_surface").length;
 fakeSurfaceFailures = 1;

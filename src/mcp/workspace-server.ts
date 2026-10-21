@@ -116,6 +116,9 @@ export function createMcpServer(
   }) => void,
   reconcileScheduledJob?: (jobId: string) => Promise<import("../scheduling/scheduled-job-store.js").ScheduledJob | undefined>,
   qualificationEvidence?: import("../server/mcp-qualification-evidence.js").McpQualificationEvidenceJournal,
+  reviewBrowserController?: import("../review-browser/browser-controller.js").ReviewerBrowserController,
+  reviewThreads?: import("../review-thread/thread-store.js").ReviewThreadStore,
+  reviewBrowserJobs?: import("../review-thread/reviewer-job-store.js").ReviewerJobStore,
 ): McpServer {
   // note: parameters remain in declared order; scheduledJobs precedes reviewRoutes.
   const serverConstructionStartedAt = performance.now();
@@ -279,6 +282,9 @@ export function createMcpServer(
       scheduledJobs,
       reconcileScheduledJob,
       reviewRoutes,
+      reviewBrowserController,
+      reviewThreads,
+      reviewBrowserJobs,
       qualificationEvidence,
       toolSurfaceVersion: mcpToolSurface.version,
     };

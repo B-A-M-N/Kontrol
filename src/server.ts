@@ -74,6 +74,10 @@ import { createContinuationManager } from "./continuation.js";
 import { createDispatchOutbox } from "./dispatch-outbox.js";
 import { createScheduledJobStore } from "./scheduling/scheduled-job-store.js";
 import { createReviewRouteStore } from "./review-handoff/route-store.js";
+import { createReviewThreadStore } from "./review-thread/thread-store.js";
+import { createReviewerJobStore } from "./review-thread/reviewer-job-store.js";
+import { createReviewerBrowserController } from "./review-browser/browser-controller.js";
+import { createReviewerTurnDispatcher } from "./review-browser/turn-dispatcher.js";
 import { setDefaultAcpTimeout } from "./acp-gateway.js";
 import { createSupervisorRuns } from "./supervisor-runs.js";
 import { shutdownMissionVerifiers } from "./mission-verifier.js";
@@ -419,6 +423,16 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
   const dispatchOutbox = createDispatchOutbox(db);
   const scheduledJobs = createScheduledJobStore(db, dispatchOutbox);
   const reviewRoutes = createReviewRouteStore(db);
+  const reviewThreads = createReviewThreadStore(db);
+  const reviewBrowserJobs = createReviewerJobStore(db);
+  const reviewBrowserController = createReviewerBrowserController({
+    database: db,
+    stateDir: config.stateDir,
+    dispatchOutbox,
+    chromePath: config.reviewBrowserChromePath,
+  });
+  const reviewerTurnDispatcher = createReviewerTurnDispatcher({ outbox: dispatchOutbox, jobs: reviewBrowserJobs, browser: reviewBrowserController });
+  reviewerTurnDispatcher.start();
   const supervisorRuns = createSupervisorRuns(db);
   const approvalRequests = createApprovalRequestManager(db, {
     directReattachGraceMs: config.policyDirectApprovalReattachGraceMs,
@@ -476,6 +490,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     missionLedger,
     dispatchOutbox,
     reviewRoutes,
+    reviewBrowserJobs,
   });
   // Shared live-waiter registry: the singleton dispatcher and every MCP client
   // consult the SAME instance, so a parked agent suppresses duplicate dispatch
@@ -695,6 +710,9 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
       (uri) => { /* noop handshake */ },
       (jobId) => reconcileScheduledJob?.(jobId) ?? Promise.resolve(undefined),
       qualificationEvidence,
+      reviewBrowserController,
+      reviewThreads,
+      reviewBrowserJobs,
     ),
     mutationReceipts,
     workspaces,
@@ -716,6 +734,9 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     supervisorWake,
     scheduledJobs,
     reviewRoutes,
+    reviewThreads,
+    reviewBrowserController,
+    reviewerTurnDispatcher,
   };
 
   const diagnosticsDeps = {
@@ -803,7 +824,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
   if (config.acpEnabled) {
     const acp = createAcpRuntime({
       config,
-      bridge: { workspaces, workSessions, reviewCheckpoints, agentRegistry, eventStore, continuationManager, dispatchOutbox, missionLedger, supervisorRuns, agentMessages, liveWaiters, scheduledJobs, reviewRoutes, onScheduledJobCreated: () => scheduledJobRuntimeRef?.wake() },
+      bridge: { workspaces, workSessions, reviewCheckpoints, agentRegistry, eventStore, continuationManager, dispatchOutbox, missionLedger, supervisorRuns, agentMessages, liveWaiters, scheduledJobs, reviewRoutes, reviewThreads, onScheduledJobCreated: () => scheduledJobRuntimeRef?.wake() },
       reviewWorkflow,
       recordPhaseTiming,
       database: db,
@@ -846,6 +867,8 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     processSessions,
     shutdownMissionVerifiers,
     integrity,
+    reviewBrowserController,
+    reviewerTurnDispatcher,
   });
   return {
     app,
