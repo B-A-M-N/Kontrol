@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { join, resolve } from "node:path";
@@ -198,12 +199,17 @@ async function bootSmoke(artifactPath, buildId) {
     KONTROL_PUBLIC_BASE_URL: `http://127.0.0.1:${port}`,
     KONTROL_STATE_DIR: join(smokeRoot, "state"),
     KONTROL_WORKTREE_ROOT: join(smokeRoot, "worktrees"),
-    KONTROL_ACP_ENABLED: "false",
+    // The review-thread manifest is registered by the ACP bridge. Enable the
+    // candidate bridge with isolated probe-only credentials so fresh tools/list
+    // covers the same MCP surface that a DevDesktop reviewer receives.
+    KONTROL_ACP_ENABLED: "true",
+    KONTROL_ACP_AGENT_SECRET: randomBytes(48).toString("base64url"),
+    KONTROL_ACP_REVIEWER_SECRET: randomBytes(48).toString("base64url"),
+    KONTROL_ACP_ADAPTER_SECRET: randomBytes(48).toString("base64url"),
     // Release smoke exercises boot/serve/transport plumbing, not the approval
     // boundary; the ask baseline would trip the tunnel reviewer gate.
     KONTROL_POLICY_MODE: "allow",
     KONTROL_TUNNEL_DOCTOR: "false",
-    KONTROL_ACP_REVIEWER_SECRET: "release-probe-reviewer",
     KONTROL_EXPECTED_BUILD_ID: buildId,
     KONTROL_ARTIFACT_PATH: artifactPath,
     KONTROL_LAUNCHER: "release-smoke",
