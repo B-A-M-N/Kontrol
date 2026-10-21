@@ -74,6 +74,7 @@ import { createContinuationManager } from "./continuation.js";
 import { createDispatchOutbox } from "./dispatch-outbox.js";
 import { createScheduledJobStore } from "./scheduling/scheduled-job-store.js";
 import { createReviewRouteStore } from "./review-handoff/route-store.js";
+import { createReviewThreadStore } from "./review-thread/thread-store.js";
 import { setDefaultAcpTimeout } from "./acp-gateway.js";
 import { createSupervisorRuns } from "./supervisor-runs.js";
 import { shutdownMissionVerifiers } from "./mission-verifier.js";
@@ -419,6 +420,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
   const dispatchOutbox = createDispatchOutbox(db);
   const scheduledJobs = createScheduledJobStore(db, dispatchOutbox);
   const reviewRoutes = createReviewRouteStore(db);
+  const reviewThreads = createReviewThreadStore(db);
   const supervisorRuns = createSupervisorRuns(db);
   const approvalRequests = createApprovalRequestManager(db, {
     directReattachGraceMs: config.policyDirectApprovalReattachGraceMs,
@@ -716,6 +718,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     supervisorWake,
     scheduledJobs,
     reviewRoutes,
+    reviewThreads,
   };
 
   const diagnosticsDeps = {
@@ -803,7 +806,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
   if (config.acpEnabled) {
     const acp = createAcpRuntime({
       config,
-      bridge: { workspaces, workSessions, reviewCheckpoints, agentRegistry, eventStore, continuationManager, dispatchOutbox, missionLedger, supervisorRuns, agentMessages, liveWaiters, scheduledJobs, reviewRoutes, onScheduledJobCreated: () => scheduledJobRuntimeRef?.wake() },
+      bridge: { workspaces, workSessions, reviewCheckpoints, agentRegistry, eventStore, continuationManager, dispatchOutbox, missionLedger, supervisorRuns, agentMessages, liveWaiters, scheduledJobs, reviewRoutes, reviewThreads, onScheduledJobCreated: () => scheduledJobRuntimeRef?.wake() },
       reviewWorkflow,
       recordPhaseTiming,
       database: db,

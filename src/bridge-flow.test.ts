@@ -17,6 +17,7 @@ import { createAcpServer } from "./acp-server.js";
 import { openDatabase, databasePath } from "./db/client.js";
 import { createReviewWorkflowService } from "./review-workflow.js";
 import { createReviewRouteStore } from "./review-handoff/route-store.js";
+import { createReviewThreadStore } from "./review-thread/thread-store.js";
 import { createApprovalRequestManager } from "./approval-requests.js";
 import { createPolicyEngine } from "./policy.js";
 import { createAgentMessageManager } from "./agent-messages.js";
@@ -156,6 +157,7 @@ const reviewCheckpoints = {
 } as any;
 
 const reviewRoutes = createReviewRouteStore(db);
+const reviewThreads = createReviewThreadStore(db);
 const reviewWorkflow = createReviewWorkflowService({
   workSessions,
   eventStore,
@@ -181,6 +183,7 @@ const config: BridgeConfig = {
   agentMessages,
   reviewWorkflow,
   reviewRoutes,
+  reviewThreads,
   approvalRequests,
   missionLedger,
   supervisorRuns,
@@ -298,6 +301,27 @@ try {
   const callOwnerB = (name: string, args: any) => reviewerOwnerBServer.handlers.get(name)!(args);
   const callTransportA = (name: string, args: any) => reviewerTransportAServer.handlers.get(name)!(args);
   const callTransportB = (name: string, args: any) => reviewerTransportBServer.handlers.get(name)!(args);
+  const createIsolatedReviewerContext = (conversationId: string) => {
+    const isolatedServer = fakeServer();
+    const mcpSessionId = `review-session-${conversationId}`;
+    registerBridgeTools(isolatedServer as any, {
+      ...config,
+      principalRole: "reviewer",
+      principalId: "role:reviewer",
+      // Copyable host conversation IDs are correlation metadata only. The
+      // authenticated MCP session is the context-binding authority.
+      connectionConversationId: "same-untrusted-host-conversation",
+      connectionMcpSessionId: mcpSessionId,
+    });
+    return {
+      contextId: `principal:role:reviewer|mcp-session:${mcpSessionId}`,
+      call: (name: string, args: any) => isolatedServer.handlers.get(name)!(args),
+    };
+  };
+  const activateForReviewerContext = (routeId: string, contextId: string) => {
+    const grant = reviewThreads.createActivation({ routeId, ownerPrincipalId: "role:reviewer", reviewerPrincipalId: "role:reviewer" });
+    return reviewThreads.activate({ activationSecret: grant.activationSecret, principalId: "role:reviewer", contextId });
+  };
   const callClient = (name: string, args: any) => clientServer.handlers.get(name)!(args);
 
   // ── App visibility contract: every iframe-called tool grants app visibility ──
@@ -1270,16 +1294,19 @@ try {
   // ── Scenario 12c: R06 — a governed route blocks unclaimed feedback and admits
   //    the exact claimed handoff through the authoritative workflow ──
   {
-    const sessionId = createSession();
+    const sessionId = workSessions.create({ workspaceSessionId: WS, submittedBy: "webui", ownerContextId: "conversation:owner-a" }).id;
     const configured = await callOwnerA("configure_review_loop", {
       workSessionId: sessionId, enabled: true, mode: "isolated_review", maxReviewRounds: 2,
     });
     assert.ok(!configured.isError, "reviewer can configure an isolated review route");
-    await callWorker("submit_for_review", { sessionId });
+    const submittedForLoop = await callWorker("submit_for_review", { sessionId });
+    assert.equal(submittedForLoop._meta?.card, undefined, "an active review loop sends its submission through MCP without adding a reviewer UI card");
     const submission = workSessions.get(sessionId)!.latestSubmission!;
     const route = reviewRoutes.getRouteBySession(sessionId)!;
     const handoff = reviewRoutes.getHandoffBySubmission(sessionId, submission.id, submission.reviewEpoch)!;
     assert.ok(handoff, "a governed submission creates a handoff");
+    const reviewContext = createIsolatedReviewerContext("owner-b-session-12c");
+    const thread = activateForReviewerContext(route.id, reviewContext.contextId);
 
     // Unclaimed handoff: ordinary feedback must be rejected by the workflow.
     const blocked = await callReviewer("provide_review_feedback", { sessionId, verdict: "approve" });
@@ -1287,10 +1314,51 @@ try {
     assert.equal(workSessions.get(sessionId)!.status, "awaiting_review", "blocked feedback did not mutate the session");
 
     // Claim the exact handoff, then the same feedback is admitted.
-    const claimed = await callOwnerA("claim_review_handoff", { handoffId: handoff.id, expectedRevision: handoff.revision, destinationConversationId: "conversation:owner-a" });
+    const claimed = await reviewContext.call("claim_review_handoff", { handoffId: handoff.id, expectedRevision: handoff.revision, reviewThreadId: thread.id, destinationConversationId: reviewContext.contextId });
     assert.ok(!claimed.isError, "reviewer claims the handoff: " + JSON.stringify(claimed.content));
-    const admitted = await callOwnerA("provide_review_feedback", { sessionId, verdict: "changes_requested", comments: "Please address the reviewed issue before resubmitting." });
-    assert.ok(!admitted.isError, "claimed handoff admits review feedback: " + JSON.stringify(admitted.content));
+    const claimedSubmission = await reviewContext.call("get_review_submission", { sessionId, submissionId: submission.id });
+    assert.ok(!claimedSubmission.isError, "the activated reviewer can read the exact claimed submission from its separate context");
+    assert.match(String((claimedSubmission.structuredContent as { patch?: string }).patch ?? ""), /diff --git/, "the authorized reviewer receives the immutable submission diff");
+    assert.equal(claimedSubmission._meta?.card, undefined, "the reviewer receives the diff through MCP without a reviewer-facing UI card");
+    const crossContextFeedback = await callOwnerA("provide_review_feedback", { sessionId, verdict: "approve", comments: "wrong context" });
+    assert.ok(crossContextFeedback.isError, "the originating context cannot answer a handoff claimed by the separate reviewer context");
+    assert.equal(workSessions.get(sessionId)!.status, "awaiting_review", "cross-context feedback leaves the pending review unchanged");
+    const released = await reviewContext.call("release_review_handoff", {
+      handoffId: handoff.id,
+      expectedRevision: (claimed.structuredContent as { revision: number }).revision,
+    });
+    assert.ok(!released.isError, "the bound reviewer can release an unused claim");
+    const releasedSubmission = await reviewContext.call("get_review_submission", { sessionId, submissionId: submission.id });
+    assert.ok(releasedSubmission.isError, "releasing the claim removes the fresh context's submission-read authority");
+    const staleFeedback = await reviewContext.call("submit_handoff_feedback", {
+      handoffId: handoff.id,
+      expectedRevision: (claimed.structuredContent as { revision: number }).revision,
+      verdict: "approve",
+    });
+    assert.ok(staleFeedback.isError, "a released reviewer cannot commit feedback with its stale claim revision");
+    assert.equal(workSessions.get(sessionId)!.status, "awaiting_review", "stale feedback after release leaves the submission pending");
+    const releasedHandoff = reviewRoutes.getHandoffById(handoff.id)!;
+    const reclaimed = await reviewContext.call("claim_review_handoff", {
+      handoffId: handoff.id,
+      expectedRevision: releasedHandoff.revision,
+      reviewThreadId: thread.id,
+    });
+    assert.ok(!reclaimed.isError, "the activated context can reclaim the released handoff with its current revision");
+    const waiter = callWorker("await_review_feedback", { sessionId, timeoutMs: 5_000 });
+    const admitted = await reviewContext.call("submit_handoff_feedback", {
+      handoffId: handoff.id,
+      expectedRevision: (reclaimed.structuredContent as { revision: number }).revision,
+      verdict: "changes_requested",
+      comments: "Please address the reviewed issue before resubmitting.",
+      requiredActions: ["Fix the reviewed issue"],
+    });
+    assert.ok(!admitted.isError, "the authenticated WebUI reviewer submits feedback through its claimed handoff: " + JSON.stringify(admitted.content));
+    const returned = await waiter;
+    assert.equal(returned.structuredContent.status, "feedback_ready", "the blocked worker is woken by committed WebUI handoff feedback");
+    assert.equal(returned.structuredContent.feedback.verdict, "changes_requested");
+    assert.equal(returned.structuredContent.feedback.comments, "Please address the reviewed issue before resubmitting.");
+    assert.deepEqual(returned.structuredContent.feedback.requiredActions, ["Fix the reviewed issue"]);
+    assert.equal(workSessions.get(sessionId)!.status, "changes_requested");
     void route;
   }
 
@@ -1378,10 +1446,24 @@ const claimError = await callReviewer("claim_review_handoff", { handoffId: hando
     assert.match(String(fourthSubmission.content?.[0]?.text ?? ""), /review round limit reached/i);
     assert.equal(workSessions.get(sessionId)!.latestSubmission?.submissionNumber, 3, "the budget refusal leaves no orphan submission");
     assert.equal(reviewRoutes.getRouteBySession(sessionId)!.completedReviewRounds, 3, "the exhausted round count is unchanged");
+
+    const beforeExtension = reviewRoutes.getRouteBySession(sessionId)!;
+    const extension = await callReviewer("configure_review_loop", {
+      workSessionId: sessionId,
+      enabled: true,
+      mode: "pinned_conversation",
+      maxReviewRounds: 4,
+      expectedRevision: beforeExtension.revision,
+    });
+    assert.ok(!extension.isError, "the authorized route owner can explicitly extend the exhausted budget");
+    const extendedSubmission = await callWorker("submit_for_review", { sessionId });
+    assert.ok(!extendedSubmission.isError, "a new review round is admitted only after the explicit extension");
+    const extended = workSessions.get(sessionId)!.latestSubmission!;
+    assert.equal(reviewRoutes.getHandoffBySubmission(sessionId, extended.id, extended.reviewEpoch)?.roundNumber, 4, "the extended round number remains server-derived");
   }
 
-  // ── Experiment D: loop OFF creates fresh isolated handoffs and preserves
-  //    the original work session across submissions ──
+  // ── Experiment D: one activated reviewer thread receives fresh immutable
+  //    handoffs while preserving the original work session across submissions ──
   {
     const sessionId = createSession();
     const originalSessionId = sessionId;
@@ -1391,8 +1473,10 @@ const claimError = await callReviewer("claim_review_handoff", { handoffId: hando
     await callWorker("submit_for_review", { sessionId });
     const s1 = workSessions.get(sessionId)!.latestSubmission!;
     const h1 = reviewRoutes.getHandoffBySubmission(sessionId, s1.id, s1.reviewEpoch)!;
-    await callReviewer("claim_review_handoff", { handoffId: h1.id, expectedRevision: h1.revision });
-    await callReviewer("provide_review_feedback", { sessionId, verdict: "changes_requested", comments: "fresh review 1" });
+    const reviewContext = createIsolatedReviewerContext("owner-b-session-loop");
+    const thread = activateForReviewerContext(reviewRoutes.getRouteBySession(sessionId)!.id, reviewContext.contextId);
+    await reviewContext.call("claim_review_handoff", { handoffId: h1.id, expectedRevision: h1.revision, reviewThreadId: thread.id });
+    await reviewContext.call("provide_review_feedback", { sessionId, verdict: "changes_requested", comments: "thread review 1" });
 
     await callWorker("submit_for_review", { sessionId });
     const s2 = workSessions.get(sessionId)!.latestSubmission!;
@@ -1401,9 +1485,9 @@ const claimError = await callReviewer("claim_review_handoff", { handoffId: hando
     assert.notEqual(h1.reviewEpoch + ":" + h1.submissionId, h2.reviewEpoch + ":" + h2.submissionId, "handoffs bind to distinct submissions");
     // The original work session is never replaced by a fresh review.
     assert.equal(workSessions.get(sessionId)!.id, originalSessionId, "loop OFF does not create a new coding work session");
-    await callReviewer("claim_review_handoff", { handoffId: h2.id, expectedRevision: h2.revision });
-    const approved = await callReviewer("provide_review_feedback", { sessionId, verdict: "approve", comments: "fresh review 2" });
-    assert.ok(!approved.isError, "a fresh authorized handoff returns its verdict to the original work session");
+    await reviewContext.call("claim_review_handoff", { handoffId: h2.id, expectedRevision: h2.revision, reviewThreadId: thread.id });
+    const approved = await reviewContext.call("provide_review_feedback", { sessionId, verdict: "approve", comments: "thread review 2" });
+    assert.ok(!approved.isError, "the persistent authorized reviewer thread returns its verdict to the original work session");
   }
 
   // ── Experiment E: a route change mid-flight supersedes a stale claim ──
@@ -1413,7 +1497,9 @@ const claimError = await callReviewer("claim_review_handoff", { handoffId: hando
     await callWorker("submit_for_review", { sessionId });
     const sub = workSessions.get(sessionId)!.latestSubmission!;
     const handoff = reviewRoutes.getHandoffBySubmission(sessionId, sub.id, sub.reviewEpoch)!;
-const claimError = await callReviewer("claim_review_handoff", { handoffId: handoff.id, expectedRevision: handoff.revision });
+    const reviewContext = createIsolatedReviewerContext("owner-b-session-stale");
+    const thread = activateForReviewerContext(reviewRoutes.getRouteBySession(sessionId)!.id, reviewContext.contextId);
+    const claimError = await reviewContext.call("claim_review_handoff", { handoffId: handoff.id, expectedRevision: handoff.revision, reviewThreadId: thread.id });
     if (claimError.isError) throw new Error(claimError.content?.[0]?.text ?? "claim failed");
 
     // The reviewer switches routing mode before committing feedback. This
@@ -1427,7 +1513,7 @@ const claimError = await callReviewer("claim_review_handoff", { handoffId: hando
       2,
       "a mode change advances the route epoch",
     );
-    const staleCommit = await callReviewer("provide_review_feedback", { sessionId, verdict: "changes_requested", comments: "stale route" });
+    const staleCommit = await reviewContext.call("provide_review_feedback", { sessionId, verdict: "changes_requested", comments: "stale route" });
     assert.ok(staleCommit.isError, "feedback claimed under a superseded route epoch is rejected");
     assert.equal(workSessions.get(sessionId)!.status, "awaiting_review", "the stale commit did not mutate the session");
   }

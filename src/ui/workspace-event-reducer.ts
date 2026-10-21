@@ -17,6 +17,8 @@ import type {
   ReviewSubmissionView,
   WorkSessionViewState,
 } from "./session-view-types.js";
+import { deliverPendingReviewMessages } from "./review-thread-delivery.js";
+import { createMcpAppsReviewHostAdapter } from "../review-thread/host-adapter.js";
 
 export interface ReducerHost {
   getApp(): App | null;
@@ -31,6 +33,18 @@ export interface ReducerHost {
 let host: ReducerHost;
 export function setReducerHost(next: ReducerHost): void {
   host = next;
+}
+
+export async function deliverQueuedReviewMessages(): Promise<void> {
+  const app = host.getApp();
+  // A missing capability means this host cannot be used as the delivery
+  // channel. Keep packets queued and make no claim that the reviewer saw them.
+  if (!app) return;
+  await deliverPendingReviewMessages({
+    adapter: createMcpAppsReviewHostAdapter(app),
+    callTool: host.callServerToolChecked,
+    onUncertain: (message) => { host.setErrorMessage(message); host.render(); },
+  });
 }
 
 export function workspaceEventTargetSessionId(event: AgentActivityEvent): string {
@@ -235,38 +249,16 @@ export function reduceWorkSessionEvent(sessionId: string, event: AgentActivityEv
       });
       view.unresolvedMessageCount = view.openMessages.size;
     }
-  } else if (event.type === "review.route.configured") {
-    view.reviewLoop = {
-      routeId: String(event.payload?.routeId ?? ""),
-      status: String(event.payload?.status ?? ""),
-      mode: String(event.payload?.mode ?? ""),
-      maxReviewRounds: Number(event.payload?.maxReviewRounds ?? 0),
-      completedReviewRounds: Number(event.payload?.completedReviewRounds ?? 0),
-      revision: Number(event.payload?.revision ?? 0),
-    };
   } else if (event.type === "review.handoff.created") {
-    view.reviewLoop = {
-      ...view.reviewLoop,
-      handoffId: String(event.payload?.handoffId ?? ""),
-      handoffStatus: String(event.payload?.status ?? ""),
-      roundNumber: Number(event.payload?.roundNumber ?? 0),
-    };
-  } else if (event.type === "review.route.status_changed") {
-    view.reviewLoop = {
-      ...view.reviewLoop,
-      status: String(event.payload?.status ?? ""),
-      revision: Number(event.payload?.revision ?? 0),
-    };
-    const nextStatus = String(event.payload?.status ?? "");
-    view.notice = nextStatus === "paused"
-      ? { tone: "info", message: "Review loop paused. New automatic corrections are stopped." }
-      : nextStatus === "active"
-        ? { tone: "info", message: "Review loop resumed." }
-        : { tone: "warning", message: `Review loop ${nextStatus}.` };
-  } else if (event.type === "review.loop.limit_reached") {
-    view.notice = { tone: "warning", message: "Review round limit reached. Human review is required before further automatic rounds." };
-  } else if (event.type === "review.loop.correction_blocked") {
-    view.notice = { tone: "warning", message: "Automatic correction stopped: the review loop is paused or its round budget is exhausted." };
+    void deliverQueuedReviewMessages().catch((error) => {
+      host.setErrorMessage(`Could not deliver the review submission to this WebUI context: ${error instanceof Error ? error.message : String(error)}`);
+      host.render();
+    });
+  } else if (event.type === "review.thread.activated" || event.type === "review.thread.delivery_requeued") {
+    void deliverQueuedReviewMessages().catch((error) => {
+      host.setErrorMessage(`Could not deliver queued review submissions to this WebUI context: ${error instanceof Error ? error.message : String(error)}`);
+      host.render();
+    });
   } else if (event.type === "agent.message.resolved" || event.type === "agent.message.reply_accepted") {
     const messageId = String(event.payload?.messageId ?? "");
     if (messageId) {

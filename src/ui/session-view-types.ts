@@ -130,18 +130,6 @@ export interface MissionPacketView {
 
 export type FeedbackState = "idle" | "submitting" | "submitted" | "error" | "outcome_unknown";
 
-export interface ReviewLoopViewState {
-  routeId?: string;
-  status?: string;
-  mode?: string;
-  completedReviewRounds?: number;
-  maxReviewRounds?: number;
-  roundNumber?: number;
-  revision?: number;
-  handoffId?: string;
-  handoffStatus?: string;
-}
-
 export interface WorkSessionViewState {
   workspaceSessionId: string;
   workSessionId: string;
@@ -176,7 +164,6 @@ export interface WorkSessionViewState {
     owner?: "workspace-watcher" | "selected-session-transport";
     action?: { label: string; run: () => void };
   };
-  reviewLoop?: ReviewLoopViewState;
   mission?: MissionPacketView;
   missionLoading?: boolean;
   missionError?: string;
@@ -227,7 +214,6 @@ export interface WorkSessionDom {
   activity: HTMLUListElement;
   activitySeqs: Set<number>;
   approvals: HTMLElement;
-  reviewLoop: HTMLElement;
   review: HTMLElement;
   reviewTitle: HTMLElement;
   reviewPayload: HTMLElement;

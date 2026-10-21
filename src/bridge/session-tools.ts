@@ -244,9 +244,12 @@ export function registerSessionTools(server: McpServer, config: BridgeConfig): v
         lastEventSeq: z.number().optional(),
         reviewLoop: z.object({
           routeId: z.string(),
+          reviewThreadId: z.string().optional(),
+          reviewThreadStatus: z.string().optional(),
           status: z.string(),
           mode: z.string(),
           completedReviewRounds: z.number(),
+          admittedReviewRounds: z.number(),
           maxReviewRounds: z.number(),
           roundNumber: z.number().optional(),
           handoffId: z.string().optional(),
@@ -386,12 +389,16 @@ export function registerSessionTools(server: McpServer, config: BridgeConfig): v
                 const handoff = route && latestSubmission
                   ? config.reviewRoutes!.getHandoffBySubmission(sessionId, latestSubmission.id, latestSubmission.reviewEpoch ?? 0)
                   : undefined;
+                const thread = route ? config.reviewThreads?.getForRoute(route.id, route.routeEpoch) : undefined;
                 return route
                   ? {
                       routeId: route.id,
+                      reviewThreadId: thread?.id,
+                      reviewThreadStatus: thread?.status,
                       status: route.status,
                       mode: route.mode,
                       completedReviewRounds: route.completedReviewRounds,
+                      admittedReviewRounds: route.admittedReviewRounds,
                       maxReviewRounds: route.maxReviewRounds,
                       roundNumber: handoff?.roundNumber,
                       handoffId: handoff?.id,

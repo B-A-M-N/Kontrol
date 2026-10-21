@@ -100,6 +100,7 @@ export interface BridgeConfig {
   onScheduledJobCreated?: () => void;
   /** Durable review-route/handoff store, shared with review workflow. */
   reviewRoutes?: import("../review-handoff/route-store.js").ReviewRouteStore;
+  reviewThreads?: import("../review-thread/thread-store.js").ReviewThreadStore;
   /** Durable, content-addressed external-host qualification evidence. */
   qualificationEvidence?: McpQualificationEvidenceJournal;
   /** Immutable MCP tool-surface version observed by this server process. */

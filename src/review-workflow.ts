@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod/v4";
 import type { DatabaseHandle } from "./db/client.js";
 import type { EventStoreEvent } from "./event-log.js";
@@ -11,6 +11,7 @@ import type { ReviewCheckpointManager, ReviewFile, WorkspaceSnapshot, WorkspaceS
 import type { CheckpointCoverage } from "./checkpoint-coverage.js";
 import type { MissionLedger } from "./mission-ledger.js";
 import type { DispatchOutbox } from "./dispatch-outbox.js";
+import { createReviewPacket } from "./review-thread/review-packet.js";
 
 export type WorkflowVerdict = "approve" | "changes_requested" | "reject";
 
@@ -98,6 +99,8 @@ export interface ProvideFeedbackInput {
   invocationOrigin: ReviewInvocationOrigin;
   /** Authenticated reviewer context from the transport; not a client token. */
   reviewerOwnerContextId?: string;
+  /** Authenticated principal from the active reviewer transport. */
+  reviewerPrincipalId?: string;
   completionReportSha256?: string;
   /**
    * P1 (audit): explicit reviewer acknowledgment that a submission whose
@@ -269,9 +272,9 @@ export function createReviewWorkflowService(
       // This outer transaction establishes the deferred read frame. The nested
       // immediate submission transaction is where concurrent submissions race.
       const admissionRoute = reviewRoutes?.getRouteBySession(input.workSessionId);
-      if (admissionRoute && admissionRoute.status !== "disabled" && admissionRoute.completedReviewRounds >= admissionRoute.maxReviewRounds) {
+      if (admissionRoute && admissionRoute.status !== "disabled" && admissionRoute.admittedReviewRounds >= admissionRoute.maxReviewRounds) {
         throw new WorkflowError(
-          `Review round limit reached (${admissionRoute.completedReviewRounds}/${admissionRoute.maxReviewRounds}); extend the budget explicitly to submit again.`,
+          `Review round limit reached (${admissionRoute.admittedReviewRounds}/${admissionRoute.maxReviewRounds}); extend the budget explicitly to submit again.`,
           "review_round_limit",
           409,
         );
@@ -327,10 +330,34 @@ export function createReviewWorkflowService(
             workSessionId: input.workSessionId,
             submissionId: submission.id,
             reviewEpoch: submission.reviewEpoch,
-            snapshotKind: input.snapshotKind ?? "git",
-            snapshotRef: input.snapshotRef ?? input.snapshotCommit ?? "",
-            diffSha256: input.diffSha256 ?? "",
-            roundNumber: route.completedReviewRounds + 1,
+            snapshotKind: submission.snapshotKind ?? input.snapshotKind ?? "git",
+            snapshotRef: submission.snapshotRef ?? input.snapshotRef ?? input.snapshotCommit ?? "",
+            diffSha256: submission.diffSha256,
+            roundNumber: route.admittedReviewRounds + 1,
+          });
+          const session = workSessions.get(input.workSessionId);
+          const run = agentRegistry.getRunByWorkSessionId(input.workSessionId);
+          let missionPacket: unknown;
+          try { missionPacket = missionLedger?.getPacket(input.workSessionId); } catch { /* ordinary sessions have no mission packet */ }
+          const priorFeedback = db.sqlite.prepare(`
+            select submission_id as submissionId, verdict, comments,
+                   required_actions_json as requiredActionsJson, created_at as createdAt
+              from work_session_feedback
+             where work_session_id = ? and submission_id != ?
+             order by created_at desc limit 10
+          `).all(input.workSessionId, submission.id).map((row: any) => ({
+            submissionId: row.submissionId,
+            verdict: row.verdict,
+            comments: row.comments ?? undefined,
+            requiredActions: (() => { try { return JSON.parse(row.requiredActionsJson ?? "[]") as string[]; } catch { return []; } })(),
+            createdAt: row.createdAt,
+          })).reverse();
+          const reviewPacket = createReviewPacket({ session, submission, roundNumber: handoff.roundNumber, objective: run?.inputPreview, mission: missionPacket, priorFeedback });
+          const payloadJson = JSON.stringify(reviewPacket);
+          reviewRoutes.setReviewPacket({
+            handoffId: handoff.id,
+            payloadJson,
+            payloadSha256: createHash("sha256").update(payloadJson).digest("hex"),
           });
         }
       }
@@ -397,23 +424,29 @@ export function createReviewWorkflowService(
     // governed by the mission/autonomy policy and never impersonate a reviewer.
     if (reviewRoutes && input.invocationOrigin !== "internal_supervisor") {
       const route = reviewRoutes.getRouteBySession(input.sessionId);
-      if (route?.status === "active") {
+      if (route) {
+        if (route.status === "disabled" || route.status === "closed") {
+          throw new WorkflowError("Review routing is disabled or closed; this handoff cannot accept feedback.", "conflict", 409);
+        }
         const submissions = workSessions.getSubmissions(input.sessionId);
-        const target = submissions.find((candidate: { id?: string }) => candidate.id === input.submissionId)
-          ?? submissions[submissions.length - 1];
+        const target = submissions.find((candidate: { id?: string }) => candidate.id === input.submissionId);
         const handoff = target?.id ? reviewRoutes.getHandoffBySubmission(input.sessionId, target.id, target.reviewEpoch) : undefined;
-        if (input.reviewerOwnerContextId
-          && handoff?.claimedByOwnerContextId !== input.reviewerOwnerContextId) {
+        if (!target || !handoff || handoff.status !== "claimed"
+          || !handoff.claimExpiresAt || Date.parse(handoff.claimExpiresAt) <= Date.now()
+          || handoff.routeEpoch !== route.routeEpoch
+          || !input.reviewerOwnerContextId
+          || !input.reviewerPrincipalId
+          || handoff.claimedByOwnerContextId !== input.reviewerOwnerContextId
+          || handoff.claimedByPrincipalId !== input.reviewerPrincipalId) {
           throw new WorkflowError(
-            "Review routing conflict: this reviewer did not claim the handoff.",
+            "Review routing conflict: feedback requires the current reviewer claim for the exact submission and route epoch.",
             "conflict",
             409,
           );
         }
-        const claimedHandoff = handoff && handoff.status === "claimed";
-        if (!claimedHandoff) {
+        if (route.status === "paused" && !handoff.claimedAt) {
           throw new WorkflowError(
-            "Review routing conflict: this submission has no claimed review handoff.",
+            "Review routing is paused; only an already-claimed review may finish.",
             "conflict",
             409,
           );
@@ -422,7 +455,7 @@ export function createReviewWorkflowService(
         // route. A mode/route change increments routeEpoch, so feedback claimed
         // under the previous route cannot be committed after the destination
         // changed — the reviewer must re-claim against the current route.
-        if (handoff!.routeEpoch !== route.routeEpoch) {
+        if (handoff.routeEpoch !== route.routeEpoch) {
           throw new WorkflowError(
             "Review routing conflict: the claimed handoff belongs to a superseded route epoch.",
             "conflict",
@@ -593,12 +626,17 @@ export function createReviewWorkflowService(
       // preflight is outside the transaction and cannot protect this interval.
       if (reviewRoutes && input.invocationOrigin !== "internal_supervisor") {
         const currentRoute = reviewRoutes.getRouteBySession(input.sessionId);
-        if (currentRoute?.status === "active") {
+        if (currentRoute) {
+          if (currentRoute.status === "disabled" || currentRoute.status === "closed") {
+            throw new WorkflowError("Review routing was disabled or closed before feedback commit.", "conflict", 409);
+          }
           const currentHandoff = reviewRoutes.getHandoffBySubmission(input.sessionId, input.submissionId, currentPending.reviewEpoch);
-          if (!currentHandoff || currentHandoff.status !== "claimed" || currentHandoff.routeEpoch !== currentRoute.routeEpoch) {
+          if (!currentHandoff || currentHandoff.status !== "claimed" || !currentHandoff.claimExpiresAt
+            || Date.parse(currentHandoff.claimExpiresAt) <= Date.now() || currentHandoff.routeEpoch !== currentRoute.routeEpoch) {
             throw new WorkflowError("Review routing conflict: stale claim at feedback commit.", "conflict", 409);
           }
-          if (input.reviewerOwnerContextId !== currentHandoff.claimedByOwnerContextId) {
+          if (!input.reviewerOwnerContextId || input.reviewerOwnerContextId !== currentHandoff.claimedByOwnerContextId
+            || !input.reviewerPrincipalId || input.reviewerPrincipalId !== currentHandoff.claimedByPrincipalId) {
             throw new WorkflowError("Review routing conflict: this reviewer did not claim the handoff.", "conflict", 409);
           }
         }
@@ -610,12 +648,17 @@ export function createReviewWorkflowService(
       let committedHandoff: import("./review-handoff/route-store.js").ReviewHandoff | undefined;
       if (reviewRoutes && input.invocationOrigin !== "internal_supervisor") {
         const currentRoute = reviewRoutes.getRouteBySession(input.sessionId);
-        if (currentRoute?.status === "active") {
+        if (currentRoute) {
+          if (currentRoute.status === "disabled" || currentRoute.status === "closed") {
+            throw new WorkflowError("Review routing was disabled or closed before feedback commit.", "conflict", 409);
+          }
           const currentHandoff = reviewRoutes.getHandoffBySubmission(input.sessionId, input.submissionId, currentPending.reviewEpoch);
-          if (!currentHandoff || currentHandoff.status !== "claimed" || currentHandoff.routeEpoch !== currentRoute.routeEpoch) {
+          if (!currentHandoff || currentHandoff.status !== "claimed" || !currentHandoff.claimExpiresAt
+            || Date.parse(currentHandoff.claimExpiresAt) <= Date.now() || currentHandoff.routeEpoch !== currentRoute.routeEpoch) {
             throw new WorkflowError("Review routing conflict: stale handoff at feedback commit.", "conflict", 409);
           }
-          if (currentHandoff.claimedByOwnerContextId !== input.reviewerOwnerContextId) {
+          if (currentHandoff.claimedByOwnerContextId !== input.reviewerOwnerContextId
+            || !input.reviewerPrincipalId || currentHandoff.claimedByPrincipalId !== input.reviewerPrincipalId) {
             throw new WorkflowError("Review routing conflict: this reviewer did not claim the handoff.", "conflict", 409);
           }
           committedHandoff = reviewRoutes.markHandoffStatus({
@@ -707,6 +750,7 @@ export function createReviewWorkflowService(
           },
         });
       }
+      if (input.verdict !== "changes_requested") reviewRoutes?.closeThreadForSession(input.sessionId);
 
       return {
         feedback,
@@ -805,6 +849,7 @@ export function createReviewWorkflowService(
     };
     db.sqlite.transaction(() => {
       workSessions.updateStatus(input.sessionId, "cancelled");
+      reviewRoutes?.closeThreadForSession(input.sessionId);
       const correlatedRun = agentRegistry.getRunByWorkSessionId(input.sessionId);
       const latestAttempt = correlatedRun
         ? agentRegistry.getLatestDispatchAttemptForRun(correlatedRun.runId)

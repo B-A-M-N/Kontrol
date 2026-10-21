@@ -11,7 +11,7 @@ sqlite.pragma("foreign_keys = ON");
 try {
   migrateDatabase(sqlite);
   const schemaContract = inspectDatabaseSchemaContract(sqlite);
-  assert.equal(schemaContract.expectedTableCount, 41, "schema contract covers all Drizzle table mappings");
+  assert.equal(schemaContract.expectedTableCount, 44, "schema contract covers all Drizzle table mappings");
   assert.deepEqual(schemaContract.missing, [], "all Drizzle tables and columns are present in migrated SQLite");
   assert.equal(schemaContract.appliedVersion, LATEST_SCHEMA_VERSION);
   assert.ok(
@@ -23,6 +23,11 @@ try {
     (sqlite.prepare("pragma table_info(work_sessions)").all() as Array<{ name: string }>)
       .some((column) => column.name === "owner_context_id"),
     "work session owner context column is present after migration",
+  );
+  assert.ok(
+    (sqlite.prepare("pragma table_info(review_handoffs)").all() as Array<{ name: string }>)
+      .some((column) => column.name === "claim_expires_at"),
+    "review handoff claim leases are durable after migration",
   );
   assert.ok(
     (sqlite.prepare("pragma table_info(approval_requests)").all() as Array<{ name: string }>)

@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDatabase } from "../db/client.js";
 import { createReviewRouteStore } from "./route-store.js";
+import { createReviewThreadStore } from "../review-thread/thread-store.js";
 
 const root = await mkdtemp(join(tmpdir(), "kontrol-review-route-test-"));
 
@@ -16,6 +17,7 @@ try {
     .prepare("insert into work_sessions (id, workspace_session_id, submitted_by, status, created_at, updated_at) values ('wsess-route', 'ws-route', 'tester', 'in_progress', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')")
     .run();
   const routes = createReviewRouteStore(db);
+  const threads = createReviewThreadStore(db);
 
   const configured = routes.configure({
     workSessionId: "wsess-route",
@@ -39,9 +41,20 @@ try {
     roundNumber: 1,
   });
   assert.equal(h1.status, "awaiting_attachment");
-  let duplicate = false;
-  try {
-    routes.createHandoff({
+  const pendingThread = threads.getForRoute(configured.id, configured.routeEpoch)!;
+  assert.equal(pendingThread.status, "pending_activation");
+  assert.equal(threads.listMessages(pendingThread.id)[0]?.status, "awaiting_activation");
+  routes.setStatus({ workSessionId: "wsess-route", status: "paused" });
+  routes.setStatus({ workSessionId: "wsess-route", status: "active" });
+  assert.equal(threads.getForRoute(configured.id, configured.routeEpoch)?.status, "pending_activation",
+    "resuming a route does not activate a thread without reviewer authority");
+  assert.equal(threads.listMessages(pendingThread.id)[0]?.status, "awaiting_activation",
+    "resuming a route does not queue packets before reviewer activation");
+  const activation = threads.createActivation({ routeId: configured.id, ownerPrincipalId: "user-a", reviewerPrincipalId: "user-b" });
+  const activated = threads.activate({ activationSecret: activation.activationSecret, principalId: "user-b", contextId: "review-context-b", hostKind: "chatgpt", hostConversationId: "chat-id-unverified" });
+  assert.equal(activated.status, "active");
+  assert.equal(activated.hostBindingVerified, false, "host conversation IDs remain correlation metadata");
+  const duplicate = routes.createHandoff({
       routeId: configured.id,
       workSessionId: "wsess-route",
       submissionId: "sub-1",
@@ -51,23 +64,40 @@ try {
       diffSha256: "hash-1",
       roundNumber: 2,
     });
-  } catch {
-    duplicate = true;
-  }
-  assert.ok(duplicate, "duplicate handoff for same submission is rejected");
+  assert.equal(duplicate.id, h1.id, "duplicate handoff delivery reuses the existing message identity");
+  assert.equal(routes.getRouteBySession("wsess-route")!.admittedReviewRounds, 1, "duplicate handoff does not consume a review round");
+
+  assert.throws(() => routes.claimHandoff({
+    handoffId: h1.id, expectedRevision: h1.revision, principalId: "user-b",
+    ownerContextId: "owner-a", reviewThreadId: activated.id,
+    destinationConversationId: "invented-destination-is-not-authority",
+  }), /context/i, "an owner context or destination ID cannot substitute for the activated reviewer context");
+  assert.throws(() => routes.claimHandoff({
+    handoffId: h1.id, expectedRevision: h1.revision, principalId: "user-c",
+    ownerContextId: "review-context-b", reviewThreadId: activated.id,
+  }), /principal/i, "a different principal cannot borrow the activated context");
 
   const claimed = routes.claimHandoff({
     handoffId: h1.id,
     expectedRevision: 1,
     principalId: "user-b",
-    ownerContextId: "owner-a",
+    ownerContextId: "review-context-b",
+    reviewThreadId: activated.id,
     destinationConversationId: "conv-b",
-    authorization: {
-      conversationId: "owner-a",
-      freshConversationIds: ["owner-a"],
-    },
+    claimLeaseMs: 1_000,
   });
   assert.equal(claimed.status, "claimed");
+  const renewedClaim = routes.renewHandoffClaim({
+    handoffId: h1.id, expectedRevision: claimed.revision, principalId: "user-b",
+    ownerContextId: "review-context-b", claimLeaseMs: 10_000,
+  });
+  assert.equal(renewedClaim.revision, claimed.revision + 1, "renewal uses compare-and-swap revisioning");
+  assert.equal(renewedClaim.claimedAt, claimed.claimedAt, "renewal preserves the cumulative lease start");
+  assert.ok(Date.parse(renewedClaim.claimExpiresAt!) > Date.parse(claimed.claimExpiresAt!), "renewal extends the same active claim");
+  assert.throws(() => routes.renewHandoffClaim({
+    handoffId: h1.id, expectedRevision: renewedClaim.revision, principalId: "user-c",
+    ownerContextId: "review-context-b",
+  }), /different reviewer/i);
   let competing = false;
   try {
     routes.claimHandoff({
@@ -75,19 +105,38 @@ try {
       expectedRevision: 1,
       principalId: "user-c",
       ownerContextId: "owner-c",
+      reviewThreadId: activated.id,
     });
   } catch {
     competing = true;
   }
   assert.ok(competing, "two conversations cannot claim the same handoff revision");
 
+  await new Promise((resolve) => setTimeout(resolve, 1_050));
+  const reclaimedExpiredClaim = routes.claimHandoff({
+    handoffId: h1.id, expectedRevision: renewedClaim.revision, principalId: "user-b",
+    ownerContextId: "review-context-b", reviewThreadId: activated.id, claimLeaseMs: 10_000,
+  });
+  assert.equal(reclaimedExpiredClaim.status, "claimed", "an expired crashed-reviewer lease can be reclaimed with a fresh revision");
+  assert.ok(Date.parse(reclaimedExpiredClaim.claimExpiresAt!) > Date.now(), "the replacement claim has a live bounded lease");
+  const released = routes.markHandoffStatus({ handoffId: h1.id, expectedRevision: reclaimedExpiredClaim.revision, nextStatus: "awaiting_attachment" });
+  assert.equal(released.claimedByPrincipalId, undefined, "release invalidates the old principal claim");
+  assert.equal(released.claimedByOwnerContextId, undefined, "release invalidates the old context claim");
+  assert.throws(() => routes.renewHandoffClaim({
+    handoffId: h1.id, expectedRevision: released.revision, principalId: "user-b",
+    ownerContextId: "review-context-b",
+  }), /expired, released/i, "renewal cannot resurrect a released claim");
+  const reclaimed = routes.claimHandoff({ handoffId: h1.id, expectedRevision: released.revision, principalId: "user-b", ownerContextId: "review-context-b", reviewThreadId: activated.id });
+
   const committed = routes.markHandoffStatus({
     handoffId: h1.id,
-    expectedRevision: claimed.revision,
+    expectedRevision: reclaimed.revision,
     nextStatus: "feedback_committed",
     completed: true,
   });
   assert.equal(committed.status, "feedback_committed");
+  assert.equal(routes.getRouteBySession("wsess-route")!.completedReviewRounds, 1, "completed rounds count committed feedback, not packet creation");
+  assert.equal(routes.getRouteBySession("wsess-route")!.admittedReviewRounds, 1, "admitted rounds count unique submissions");
 
   // ── L04: pause/resume change only automation status, not the mode/budget.
   const paused = routes.setStatus({ workSessionId: "wsess-route", status: "paused" });
@@ -115,7 +164,7 @@ try {
     routeId: resumed.id, workSessionId: "wsess-route", submissionId: "sub-2",
     reviewEpoch: 2, snapshotKind: "git", snapshotRef: "ref-2", diffSha256: "hash-2", roundNumber: 2,
   });
-  assert.equal(routes.getRouteBySession("wsess-route")!.completedReviewRounds, 2);
+  assert.equal(routes.getRouteBySession("wsess-route")!.admittedReviewRounds, 2);
   let thirdRound = false;
   try {
     routes.createHandoff({
@@ -126,7 +175,22 @@ try {
     thirdRound = /round limit reached/i.test(error instanceof Error ? error.message : String(error));
   }
   assert.ok(thirdRound, "the configured round maximum is an absolute ceiling on new handoffs");
-  void h2;
+
+  const h2Claim = routes.claimHandoff({
+    handoffId: h2.id, expectedRevision: h2.revision, principalId: "user-b",
+    ownerContextId: "review-context-b", reviewThreadId: activated.id,
+  });
+  const pendingGrant = threads.createActivation({ routeId: resumed.id, ownerPrincipalId: "user-a", reviewerPrincipalId: "user-b" });
+  const disabled = routes.setStatus({ workSessionId: "wsess-route", status: "disabled" });
+  assert.equal(disabled.routeEpoch, resumed.routeEpoch + 1, "disabling the route advances its generation");
+  assert.equal(threads.getById(activated.id)?.status, "closed", "disabling closes the reviewer thread");
+  const superseded = routes.getHandoffById(h2.id)!;
+  assert.equal(superseded.status, "superseded", "disabling fences an in-flight reviewer claim");
+  assert.equal(superseded.claimedByPrincipalId, undefined, "disabling clears stale reviewer principal authority");
+  assert.equal(superseded.claimedByOwnerContextId, undefined, "disabling clears stale reviewer context authority");
+  assert.ok(h2Claim.revision < superseded.revision);
+  assert.throws(() => threads.activate({ activationSecret: pendingGrant.activationSecret, principalId: "user-b", contextId: "replacement-context" }), /invalid|stale|expired/i,
+    "disabling revokes unused reviewer activation grants");
 
   // ── P1-08: concurrent initial configuration cannot create duplicate routes.
   {

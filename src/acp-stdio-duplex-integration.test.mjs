@@ -51,6 +51,7 @@ const adapterPort = await new Promise((resolve) => {
 });
 const fakeBubblewrap = join(state, "bwrap");
 const launchCountPath = join(state, "launch-count.txt");
+const sessionLogPath = join(state, "provider-session-log.jsonl");
 await writeFile(fakeBubblewrap, "#!/bin/sh\necho namespace-denied >&2\nexit 1\n", { mode: 0o700 });
 let bubblewrapPath = fakeBubblewrap;
 let readOnlySandboxAvailable = false;
@@ -59,8 +60,9 @@ try {
   probeReadOnlyExecutionSandbox({ workspaceRoot });
   readOnlySandboxAvailable = true;
 } catch { /* the integration below asserts fail-closed when user namespaces are unavailable */ }
-const childCode = `const fs=require("node:fs");try{fs.appendFileSync(${JSON.stringify(launchCountPath)},"1")}catch{};let b="",seen=[];process.stdin.setEncoding("utf8");process.stdin.on("data",c=>{b+=c;for(const line of b.split(/\\r?\\n/).slice(0,-1)){const m=JSON.parse(line);if(m.method==="initialize"){seen.push(m.method);process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:m.id,result:{protocolVersion:1,agentCapabilities:{}}})+"\\n")}else if(m.method==="session/new"){seen.push(m.method);process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:m.id,result:{sessionId:"agent-session-1"}})+"\\n")}else if(m.method==="session/prompt"){seen.push(m.method);let workspaceWriteBlocked=false;if(process.env.READ_ONLY_TEST==="1"){try{fs.writeFileSync("/workspace/readonly-test-write.txt","should fail")}catch{workspaceWriteBlocked=true}};const report="Audit report: café 🌲\\nFindings persisted."+(workspaceWriteBlocked?"\\nworkspaceWriteBlocked=true":"");process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:m.id,result:{sessionId:m.params.sessionId,content:[{type:"text",text:report}],methods:seen,workspaceWriteBlocked}})+"\\n");setTimeout(()=>process.exit(0),20)}}b=b.split(/\\r?\\n/).at(-1)||""})`;
-const adapter = spawn(process.execPath, ["scripts/acp-stdio-duplex-adapter.mjs"], {
+const childCode = `const fs=require("node:fs");try{fs.appendFileSync(${JSON.stringify(launchCountPath)},"1")}catch{};let b="",seen=[];process.stdin.setEncoding("utf8");process.stdin.on("data",c=>{b+=c;for(const line of b.split(/\\r?\\n/).slice(0,-1)){const m=JSON.parse(line);seen.push(m.method);try{fs.appendFileSync(${JSON.stringify(sessionLogPath)},JSON.stringify({method:m.method,sessionId:m.params?.sessionId??(m.method==="session/new"?"agent-session-1":undefined)})+"\\n")}catch{};if(m.method==="initialize"){process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:m.id,result:{protocolVersion:1,agentCapabilities:{loadSession:true}}})+"\\n")}else if(m.method==="session/new"){process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:m.id,result:{sessionId:"agent-session-1"}})+"\\n")}else if(m.method==="session/load"){process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:m.id,result:{sessionId:m.params.sessionId}})+"\\n")}else if(m.method==="session/prompt"){let workspaceWriteBlocked=false;if(process.env.READ_ONLY_TEST==="1"){try{fs.writeFileSync("/workspace/readonly-test-write.txt","should fail")}catch{workspaceWriteBlocked=true}};const report="Audit report: café 🌲\\nFindings persisted."+(workspaceWriteBlocked?"\\nworkspaceWriteBlocked=true":"");process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:m.id,result:{sessionId:m.params.sessionId,content:[{type:"text",text:report}],methods:seen,workspaceWriteBlocked}})+"\\n");setTimeout(()=>process.exit(0),20)}}b=b.split(/\\r?\\n/).at(-1)||""})`;
+const spawnAdapter = () => {
+  const child = spawn(process.execPath, ["scripts/acp-stdio-duplex-adapter.mjs"], {
   cwd: process.cwd(),
   env: {
     ...process.env,
@@ -72,6 +74,7 @@ const adapter = spawn(process.execPath, ["scripts/acp-stdio-duplex-adapter.mjs"]
     KONTROL_STDIO_OWNED_PROCESSES: join(state, "owned-processes.json"),
     KONTROL_STDIO_EVENT_SPOOL: join(state, "event-spool.json"),
     KONTROL_STDIO_TERMINAL_SPOOL: join(state, "terminal-spool.json"),
+    KONTROL_STDIO_SESSION_BINDINGS: join(state, "session-bindings.json"),
     KONTROL_BWRAP: bubblewrapPath,
     KONTROL_ALLOWED_ROOTS: workspaceRoot,
     KONTROL_READ_ONLY_AGENT_ENV_ALLOWLIST: "READ_ONLY_TEST",
@@ -83,8 +86,11 @@ const adapter = spawn(process.execPath, ["scripts/acp-stdio-duplex-adapter.mjs"]
     ACP_STDIO_ADAPTER_PORT: String(adapterPort),
   },
   stdio: ["ignore", "pipe", "pipe"],
-});
-adapter.stderr.on("data", (chunk) => process.stderr.write(`[stdio integration adapter] ${chunk}`));
+  });
+  child.stderr.on("data", (chunk) => process.stderr.write(`[stdio integration adapter] ${chunk}`));
+  return child;
+};
+let adapter = spawnAdapter();
 try {
   const deadline = Date.now() + 5_000;
   while (Date.now() < deadline) {
@@ -104,6 +110,9 @@ try {
     workspace_root: workspaceRoot,
     parent_run_id: "stdio-normal-run",
     agent_id: "stdio-test-agent",
+    session_id: "stdio-work-session",
+  workspace_lease_nonce: "stdio-test-lease",
+  workspace_lease_expires_at: new Date(Date.now() + 120_000).toISOString(),
     attempt_number: 1,
     dispatch_idempotency_key: "stdio-normal-dispatch",
     input: [{ parts: [{ content: "task reaches stdio child" }] }],
@@ -113,7 +122,7 @@ try {
     headers: { "content-type": "application/json", authorization: "Bearer adapter-secret" },
     body: JSON.stringify(normalBody),
   });
-  assert.equal(response.status, 202);
+  assert.equal(response.status, 202, JSON.stringify(await response.clone().json()));
   const accepted = await response.json();
   assert.equal(accepted.accepted, true);
   assert.equal(accepted.dispatch_idempotency_key, "stdio-normal-dispatch");
@@ -147,6 +156,42 @@ try {
   });
   assert.equal(replayResponse.status, 202, "an identical idempotency retry returns the existing execution receipt");
   assert.equal((await replayResponse.json()).replayed, true);
+  adapter.kill("SIGTERM");
+  await new Promise((resolve) => adapter.once("exit", resolve));
+  adapter = spawnAdapter();
+  const restartedAdapterDeadline = Date.now() + 5_000;
+  let restartedAdapterReady = false;
+  while (Date.now() < restartedAdapterDeadline) {
+    try {
+      const health = await fetch(`http://127.0.0.1:${adapterPort}/health`);
+      if (health.ok) { restartedAdapterReady = true; break; }
+    } catch { /* adapter is restoring durable receipts and bindings */ }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.ok(restartedAdapterReady, "adapter restart recovers its listener and durable provider session binding");
+  const continuationBody = {
+    ...normalBody,
+    attempt_number: 2,
+    dispatch_idempotency_key: "stdio-continuation-dispatch",
+    continuation_id: "continuation-2",
+    input: [{ parts: [{ content: "continue the same implementation conversation" }] }],
+  };
+  const continuationResponse = await fetch(`http://127.0.0.1:${adapterPort}/runs`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: "Bearer adapter-secret" },
+    body: JSON.stringify(continuationBody),
+  });
+  assert.equal(continuationResponse.status, 202, "a continuation reloads the existing provider conversation");
+  const continuationDeadline = Date.now() + 5_000;
+  while (Date.now() < continuationDeadline && events.filter((event) => event.dispatch_idempotency_key === "stdio-continuation-dispatch" && event.type === "completed").length === 0) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  const sessionMethods = (await readFile(sessionLogPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+  assert.ok(sessionMethods.some((entry) => entry.method === "session/new" && entry.sessionId === "agent-session-1"));
+  assert.ok(sessionMethods.some((entry) => entry.method === "session/load" && entry.sessionId === "agent-session-1"),
+    "continuation resumes the same provider-native session ID");
+  assert.equal(sessionMethods.filter((entry) => entry.method === "session/new").length, 1,
+    "review continuation does not create a second implementing-agent conversation");
   const conflictResponse = await fetch(`http://127.0.0.1:${adapterPort}/runs`, {
     method: "POST",
     headers: { "content-type": "application/json", authorization: "Bearer adapter-secret" },
@@ -204,7 +249,7 @@ try {
     assert.equal(readOnlyResponse.status, 503, "an unavailable OS namespace backend fails closed");
     assert.equal((await readOnlyResponse.json()).error.code, "sandbox_unavailable");
   }
-  assert.equal(await readFile(launchCountPath, "utf8"), "1",
+  assert.equal(await readFile(launchCountPath, "utf8"), "11",
     "invalid grants never launch; read-only execution cannot alter the host-side launch marker");
   console.log(`acp-stdio-duplex-integration: task reached child stdin; read-only sandbox ${readOnlySandboxAvailable ? "executed" : "failed closed"}`);
 } finally {

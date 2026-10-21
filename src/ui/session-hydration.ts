@@ -25,6 +25,7 @@ import type {
   WorkSessionViewState,
 } from "./session-view-types.js";
 import {
+  deliverQueuedReviewMessages,
   reduceWorkSessionEvent,
   workspaceEventTargetSessionId,
 } from "./workspace-event-reducer.js";
@@ -486,7 +487,6 @@ export async function hydrateWorkSessionSnapshot(view: WorkSessionViewState): Pr
         expiresAt?: string;
       }>;
       agentMessages?: Array<{ messageId: string; kind: string; author?: string; title?: string; body?: string; status?: string; runId?: string; createdAt?: string; replyId?: string; replyStatus?: string; replyBody?: string }>;
-      reviewLoop?: { routeId?: string; status?: string; mode?: string; completedReviewRounds?: number; maxReviewRounds?: number; roundNumber?: number; handoffId?: string; handoffStatus?: string };
     }>(snapResult);
     if (!snap) return;
 
@@ -552,10 +552,6 @@ export async function hydrateWorkSessionSnapshot(view: WorkSessionViewState): Pr
       });
     }
     view.unresolvedMessageCount = view.openMessages.size;
-    // Review-loop state is part of the snapshot contract when available.
-    if (snap.reviewLoop) {
-      view.reviewLoop = snap.reviewLoop;
-    }
     for (const messageId of previousOpenMessageIds) {
       if (!view.openMessages.has(messageId)) host.messageMutationOutcomeUnknown.delete(messageId);
     }
@@ -743,6 +739,11 @@ export async function loadHistoricalPendingReviews(): Promise<void> {
 
 export async function watchWorkspaceEvents(workspaceId: string, initialSeq: number, generation: number): Promise<void> {
   let cursor = initialSeq;
+  // Recover queued deliveries on a fresh/reconnected reviewer widget even if
+  // its original activation or requeue event predates the current cursor.
+  try { await deliverQueuedReviewMessages(); } catch (error) {
+    host.noteHydrationFailure(`Review message delivery recovery failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
   // P1 #34: bounded exponential backoff with jitter. Resets after any
   // successful response so steady-state polling latency is unaffected.
   let retryDelayMs = 1_000;

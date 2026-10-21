@@ -192,7 +192,6 @@ export function renderWorkSessionView(view: WorkSessionViewState): void {
   }
 
   renderSessionSwitcher(dom.sessionSwitcher);
-  renderReviewLoopHeader(dom.reviewLoop, view);
   renderSessionNotice(dom.notice, view);
   // P0.3: a direct approval must be discoverable on every current surface.
   // When the reviewer's focus is inside an input/textarea, focus is preserved
@@ -268,44 +267,6 @@ export function renderWorkSessionView(view: WorkSessionViewState): void {
   maybeAppendAgentBar();
 }
 
-/**
- * U01: review-lifecycle header. Shows the selected routing mode, current round
- * against the configured maximum, and delivery status, so a reviewer can see at
- * a glance whether automation is active and which round is under way.
- */
-function renderReviewLoopHeader(slot: HTMLElement, view: WorkSessionViewState): void {
-  const loop = view.reviewLoop;
-  if (!loop || !loop.routeId) {
-    slot.hidden = true;
-    slot.replaceChildren();
-    return;
-  }
-  slot.hidden = false;
-  const mode = loop.mode === "pinned_conversation" ? "Pinned conversation" : loop.mode === "isolated_review" ? "Fresh review per submission" : (loop.mode ?? "Review");
-  const status = loop.status ?? "active";
-  const roundText = typeof loop.completedReviewRounds === "number" && typeof loop.maxReviewRounds === "number"
-    ? `${loop.completedReviewRounds}/${loop.maxReviewRounds}`
-    : "—";
-  slot.replaceChildren();
-  slot.append(
-    element("span", { className: `review-loop-status ${status}`, text: `Review loop ${humanizeStatus(status)}` }),
-    element("span", { className: "review-loop-mode", text: mode }),
-    element("span", { className: "review-loop-rounds", text: `Round ${roundText}` }),
-  );
-  // Distinguish awaiting reviewer attachment from awaiting reviewer decision —
-  // operationally different blockers.
-  const handoff = loop.handoffStatus;
-  if (handoff) {
-    slot.append(element("span", {
-      className: `review-loop-handoff ${handoff}`,
-      text: humanizeStatus(handoff),
-    }));
-  }
-  if (status === "active" && typeof loop.completedReviewRounds === "number" && typeof loop.maxReviewRounds === "number" && loop.completedReviewRounds >= loop.maxReviewRounds) {
-    slot.append(element("span", { className: "review-loop-warning", text: "Round budget exhausted — human review required." }));
-  }
-}
-
 export function createWorkSessionDom(workSessionId: string): WorkSessionDom {
   const main = element("main", { className: "shell workspace-surface" });
   const sessionSwitcher = element("nav", { className: "session-switcher", ariaLabel: "Work sessions" });
@@ -325,13 +286,12 @@ export function createWorkSessionDom(workSessionId: string): WorkSessionDom {
   const activityHeader = element("div", { className: "agent-activity-header", text: "Agent activity" });
   const activity = element("ul", { className: "agent-activity" });
   const approvals = element("div", { className: "approval-slot" });
-  const reviewLoop = element("div", { className: "review-loop-header", hidden: true });
   const review = element("section", { className: "session-review" });
   const reviewTitle = element("div", { className: "agent-activity-header" });
   const reviewPayload = element("div", { className: "review-payload" });
   const reviewFeedback = element("div", { className: "review-feedback" });
   review.append(reviewTitle, reviewPayload, reviewFeedback);
-  section.append(header, meta, notice, reviewLoop, mission, messages, activityHeader, activity, approvals, review);
+  section.append(header, meta, notice, mission, messages, activityHeader, activity, approvals, review);
   main.append(sessionSwitcher, section);
   return {
     workSessionId,
@@ -347,7 +307,6 @@ export function createWorkSessionDom(workSessionId: string): WorkSessionDom {
     activity,
     activitySeqs: new Set(),
     approvals,
-    reviewLoop,
     review,
     reviewTitle,
     reviewPayload,

@@ -102,7 +102,92 @@ const migrations: Migration[] = [
   { version: 88, name: "scheduled-job-reconcile-backoff", up: migrateScheduledJobReconcileBackoff },
   { version: 89, name: "historical-schema-drift-repair", up: migrateHistoricalSchemaDrift },
   { version: 90, name: "scheduled-dispatch-attempt-diagnostics", up: migrateScheduledDispatchAttemptDiagnostics },
+  { version: 91, name: "persistent-review-threads", up: migratePersistentReviewThreads },
+  { version: 92, name: "review-handoff-claim-leases", up: migrateReviewHandoffClaimLeases },
 ];
+
+function migrateReviewHandoffClaimLeases(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "review_handoffs", "claim_expires_at", "text");
+  sqlite.exec(`
+    update review_handoffs
+       set claim_expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', claimed_at, '+15 minutes')
+     where status = 'claimed' and claimed_at is not null and claim_expires_at is null;
+    update review_handoffs
+       set claim_expires_at = '1970-01-01T00:00:00.000Z'
+     where status = 'claimed' and claimed_at is null and claim_expires_at is null;
+  `);
+}
+
+function migratePersistentReviewThreads(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "review_routes", "admitted_review_rounds", "integer not null default 0");
+  sqlite.exec(`
+    update review_routes
+       set admitted_review_rounds = max(admitted_review_rounds, completed_review_rounds),
+           completed_review_rounds = (
+             select count(*) from review_handoffs h
+              where h.route_id = review_routes.id and h.status = 'feedback_committed'
+           );
+  `);
+  sqlite.exec(`
+    create table if not exists review_threads (
+      id text primary key not null,
+      route_id text not null references review_routes(id) on delete cascade,
+      route_epoch integer not null,
+      work_session_id text not null references work_sessions(id) on delete cascade,
+      owner_principal_id text not null,
+      reviewer_principal_id text,
+      reviewer_context_id text,
+      host_kind text not null default 'kontrol_ui',
+      host_conversation_id text,
+      host_binding_verified integer not null default 0,
+      status text not null default 'pending_activation',
+      max_rounds integer not null,
+      revision integer not null default 1,
+      created_at text not null,
+      activated_at text,
+      closed_at text
+    );
+    create unique index if not exists review_threads_route_epoch_unique
+      on review_threads(route_id, route_epoch);
+    create index if not exists review_threads_session_status_idx
+      on review_threads(work_session_id, status);
+    create table if not exists review_thread_activations (
+      id text primary key not null,
+      thread_id text not null references review_threads(id) on delete cascade,
+      route_id text not null,
+      route_epoch integer not null,
+      principal_id text not null,
+      activation_secret_sha256 text not null unique,
+      created_at text not null,
+      expires_at text not null,
+      consumed_at text,
+      revoked_at text
+    );
+    create index if not exists review_thread_activations_thread_expiry_idx
+      on review_thread_activations(thread_id, expires_at);
+    create table if not exists review_thread_messages (
+      id text primary key not null,
+      thread_id text not null references review_threads(id) on delete cascade,
+      route_epoch integer not null,
+      work_session_id text not null,
+      handoff_id text not null,
+      submission_id text not null,
+      review_epoch integer not null,
+      round_number integer not null,
+      kind text not null,
+      payload_json text not null,
+      payload_sha256 text not null,
+      status text not null default 'awaiting_activation',
+      revision integer not null default 1,
+      created_at text not null,
+      updated_at text not null
+    );
+    create unique index if not exists review_thread_messages_submission_unique
+      on review_thread_messages(thread_id, submission_id, review_epoch);
+    create index if not exists review_thread_messages_delivery_idx
+      on review_thread_messages(thread_id, status, created_at);
+  `);
+}
 
 function migrateScheduledStateTimesAndVerificationSingleFlight(sqlite: Database.Database): void {
   addColumnIfMissing(sqlite, "scheduled_jobs", "terminal_at", "text");
@@ -2095,7 +2180,7 @@ function migrateExternalCatalogObservationsAndAssociations(sqlite: Database.Data
 
 function addColumnIfMissing(
   sqlite: Database.Database,
-  table: "workspace_sessions" | "work_sessions" | "work_session_submissions" | "work_session_feedback" | "agent_registry" | "continuations" | "acp_runs" | "agent_webhook_queue" | "dispatch_outbox" | "approval_requests" | "mission_evidence" | "event_log" | "supervisor_runs" | "mission_acceptance_criteria" | "mission_review_findings" | "mission_contracts" | "mission_completion_reports" | "scheduled_jobs" | "scheduled_job_attempts" | "review_routes",
+  table: "workspace_sessions" | "work_sessions" | "work_session_submissions" | "work_session_feedback" | "agent_registry" | "continuations" | "acp_runs" | "agent_webhook_queue" | "dispatch_outbox" | "approval_requests" | "mission_evidence" | "event_log" | "supervisor_runs" | "mission_acceptance_criteria" | "mission_review_findings" | "mission_contracts" | "mission_completion_reports" | "scheduled_jobs" | "scheduled_job_attempts" | "review_routes" | "review_handoffs",
   column: string,
   definition: string,
 ): void {

@@ -933,6 +933,7 @@ export const reviewRoutes = sqliteTable("review_routes", {
   pinnedConversationId: text("pinned_conversation_id"),
   maxReviewRounds: integer("max_review_rounds").notNull().default(3),
   completedReviewRounds: integer("completed_review_rounds").notNull().default(0),
+  admittedReviewRounds: integer("admitted_review_rounds").notNull().default(0),
   status: text("status").notNull().default("disabled"),
   routeEpoch: integer("route_epoch").notNull().default(1),
   revision: integer("revision").notNull().default(1),
@@ -966,6 +967,7 @@ export const reviewHandoffs = sqliteTable("review_handoffs", {
   revision: integer("revision").notNull().default(1),
   createdAt: text("created_at").notNull(),
   claimedAt: text("claimed_at"),
+  claimExpiresAt: text("claim_expires_at"),
   completedAt: text("completed_at"),
 }, (table) => [
   index("review_handoffs_session_submission_idx").on(table.workSessionId, table.submissionId),
@@ -975,3 +977,62 @@ export const reviewHandoffs = sqliteTable("review_handoffs", {
 
 export type ReviewHandoffRow = typeof reviewHandoffs.$inferSelect;
 export type NewReviewHandoffRow = typeof reviewHandoffs.$inferInsert;
+
+/** One application-level reviewer context bound to a route generation. */
+export const reviewThreads = sqliteTable("review_threads", {
+  id: text("id").primaryKey(),
+  routeId: text("route_id").notNull().references(() => reviewRoutes.id, { onDelete: "cascade" }),
+  routeEpoch: integer("route_epoch").notNull(),
+  workSessionId: text("work_session_id").notNull().references(() => workSessions.id, { onDelete: "cascade" }),
+  ownerPrincipalId: text("owner_principal_id").notNull(),
+  reviewerPrincipalId: text("reviewer_principal_id"),
+  reviewerContextId: text("reviewer_context_id"),
+  hostKind: text("host_kind").notNull().default("kontrol_ui"),
+  hostConversationId: text("host_conversation_id"),
+  hostBindingVerified: integer("host_binding_verified", { mode: "boolean" }).notNull().default(false),
+  status: text("status").notNull().default("pending_activation"),
+  maxRounds: integer("max_rounds").notNull(),
+  revision: integer("revision").notNull().default(1),
+  createdAt: text("created_at").notNull(),
+  activatedAt: text("activated_at"),
+  closedAt: text("closed_at"),
+}, (table) => [
+  uniqueIndex("review_threads_route_epoch_unique").on(table.routeId, table.routeEpoch),
+  index("review_threads_session_status_idx").on(table.workSessionId, table.status),
+]);
+
+export const reviewThreadActivations = sqliteTable("review_thread_activations", {
+  id: text("id").primaryKey(),
+  threadId: text("thread_id").notNull().references(() => reviewThreads.id, { onDelete: "cascade" }),
+  routeId: text("route_id").notNull(),
+  routeEpoch: integer("route_epoch").notNull(),
+  principalId: text("principal_id").notNull(),
+  activationSecretSha256: text("activation_secret_sha256").notNull().unique(),
+  createdAt: text("created_at").notNull(),
+  expiresAt: text("expires_at").notNull(),
+  consumedAt: text("consumed_at"),
+  revokedAt: text("revoked_at"),
+}, (table) => [
+  index("review_thread_activations_thread_expiry_idx").on(table.threadId, table.expiresAt),
+]);
+
+export const reviewThreadMessages = sqliteTable("review_thread_messages", {
+  id: text("id").primaryKey(),
+  threadId: text("thread_id").notNull().references(() => reviewThreads.id, { onDelete: "cascade" }),
+  routeEpoch: integer("route_epoch").notNull(),
+  workSessionId: text("work_session_id").notNull(),
+  handoffId: text("handoff_id").notNull(),
+  submissionId: text("submission_id").notNull(),
+  reviewEpoch: integer("review_epoch").notNull(),
+  roundNumber: integer("round_number").notNull(),
+  kind: text("kind").notNull(),
+  payloadJson: text("payload_json").notNull(),
+  payloadSha256: text("payload_sha256").notNull(),
+  status: text("status").notNull().default("awaiting_activation"),
+  revision: integer("revision").notNull().default(1),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+}, (table) => [
+  uniqueIndex("review_thread_messages_submission_unique").on(table.threadId, table.submissionId, table.reviewEpoch),
+  index("review_thread_messages_delivery_idx").on(table.threadId, table.status, table.createdAt),
+]);

@@ -571,3 +571,37 @@ MCP context isolation:
 - `write`, `edit`, and `apply_patch` return `instructions_required` with the
   full nested instruction contents and content hash before any mutation when
   governing instructions have not been acknowledged by that transport.
+- Review loops keep one Kontrol reviewer-thread identity per route epoch,
+  separate from each immutable submission handoff. A one-time expiring
+  activation grant is principal-scoped and stored only as a hash; reviewer
+  claims require the activated principal and authenticated context. Host
+  conversation IDs are correlation data and remain unverified unless a trusted
+  host adapter attests them. Handoff messages track preparation, presentation,
+  claim, and committed feedback separately. Pausing suppresses queued delivery
+  while preserving the thread binding; route-epoch changes fence old claims.
+  `completedReviewRounds` counts committed review feedback, while
+  `admittedReviewRounds` enforces the immutable submission ceiling. MCP does
+  not create or message a new ChatGPT conversation in the background; ChatGPT
+  review activation requires an explicit user-opened context and grant. Once
+  activated, the Workspace App event watcher may deliver queued review packets
+  into that same conversation through MCP Apps `ui/message` when the host
+  advertises messaging support. Delivery is acknowledged only after the host
+  accepts the message; an ambiguous response stays fenced for inspection and is
+  not blindly resent. The WebUI model reviews and submits feedback through the
+  existing handoff tools, while human approval remains in the existing approval
+  center.
+- Review handoff claims carry a bounded 15-minute lease. Feedback commit checks
+  the exact claim, principal, context, route epoch, pending submission, snapshot,
+  and unexpired lease in its authoritative transaction. A reviewer can renew an
+  expired claim through compare-and-swap; release clears all claim identity.
+- The generic stdio ACP adapter persists provider-native session IDs by durable
+  work-session identity. A continuation reloads that same session only when
+  the ACP agent advertises `loadSession`; otherwise it fails closed instead of
+  starting an unrelated conversation. ACP worker identity, the review WebUI
+  thread, and the Kontrol work session remain separate identities.
+
+## Child DOX Index
+
+| Path | Purpose |
+|------|---------|
+| `src/review-thread/` | Persistent reviewer-thread identity, activation authority, and message lifecycle |
