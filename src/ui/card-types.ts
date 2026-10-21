@@ -17,7 +17,9 @@ export type ToolName =
   | "poll_process"
   | "submit_for_review"
   | "submit_to_coding_agent"
-  | "open_approval_center";
+  | "open_approval_center"
+  | "activate_review_thread"
+  | "reattach_review_thread";
 
 export type HostContext = NonNullable<ReturnType<App["getHostContext"]>>;
 
@@ -38,6 +40,7 @@ export interface ToolResultCard {
   root?: string;
   status?: string;
   runId?: string;
+  reviewThreadId?: string;
   workSessionId?: string;
   output?: string;
   agentStatus?: string;
@@ -99,7 +102,9 @@ export function isToolName(value: unknown): value is ToolName {
     value === "poll_process" ||
     value === "submit_for_review" ||
     value === "submit_to_coding_agent" ||
-    value === "open_approval_center"
+    value === "open_approval_center" ||
+    value === "activate_review_thread" ||
+    value === "reattach_review_thread"
   );
 }
 

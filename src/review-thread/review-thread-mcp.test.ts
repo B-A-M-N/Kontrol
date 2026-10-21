@@ -11,6 +11,7 @@ import { createReviewRouteStore } from "../review-handoff/route-store.js";
 import { createReviewThreadStore } from "./thread-store.js";
 import { registerHandoffTools } from "../bridge/handoff-tools.js";
 import { REQUIRED_REVIEW_THREAD_TOOLS } from "../../scripts/lib/review-thread-tool-manifest.mjs";
+import { isWorkspaceAppUri, workspaceAppRenderToolMeta } from "../workspace-app-resource.js";
 
 const root = await mkdtemp(join(tmpdir(), "kontrol-review-thread-mcp-test-"));
 try {
@@ -72,13 +73,15 @@ try {
     for (const required of REQUIRED_REVIEW_THREAD_TOOLS) assert.ok(registeredNames.has(required), `MCP tools/list is missing required review-thread tool ${required}`);
     const activationTool = tools.tools.find((tool) => tool.name === "activate_review_thread");
     const reattachTool = tools.tools.find((tool) => tool.name === "reattach_review_thread");
-    assert.equal((activationTool?._meta?.ui as { resourceUri?: unknown } | undefined)?.resourceUri, undefined,
-      "review activation does not create a reviewer UI surface");
-    assert.equal(activationTool?._meta?.["openai/outputTemplate"], undefined,
-      "review activation remains a model-facing MCP operation without a reviewer UI surface");
-    assert.equal((reattachTool?._meta?.ui as { resourceUri?: unknown } | undefined)?.resourceUri, undefined,
-      "review reattachment does not create a reviewer UI surface");
-    assert.equal(reattachTool?._meta?.["openai/outputTemplate"], undefined);
+    const appMeta = workspaceAppRenderToolMeta() as { ui: { resourceUri: string }; "openai/outputTemplate": string };
+    for (const tool of [activationTool, reattachTool]) {
+      assert.ok(tool, "activation and reattachment are registered");
+      assert.equal((tool._meta?.ui as { resourceUri?: unknown } | undefined)?.resourceUri, appMeta.ui.resourceUri,
+        "activation and reattachment mount the existing Workspace App transport");
+      assert.equal(tool._meta?.["openai/outputTemplate"], appMeta["openai/outputTemplate"],
+        "the host receives the matching existing Workspace App compatibility renderer");
+      assert.ok(isWorkspaceAppUri(appMeta.ui.resourceUri), "the renderer resolves to the existing content-hashed Workspace App resource");
+    }
     const activationRetry = reviewThreads.createActivation({ routeId: route.id, ownerPrincipalId: "owner", reviewerPrincipalId: "reviewer" });
     reviewer.setWorkspaceResolvable(false);
     const unresolvedWorkspace = await reviewer.client.callTool({ name: "activate_review_thread", arguments: { activationSecret: activationRetry.activationSecret } });
@@ -90,6 +93,7 @@ try {
     assert.equal(activated.isError, undefined, "the owner-issued activation grant binds the current authenticated MCP session");
     assert.equal((activated.structuredContent as { threadId: string; hostBindingVerified: boolean }).threadId, activeThread.id);
     assert.equal((activated.structuredContent as { reviewThreadId: string }).reviewThreadId, activeThread.id);
+    assert.equal((activated.structuredContent as { tool: string }).tool, "activate_review_thread");
     assert.equal((activated.structuredContent as { hostBindingVerified: boolean }).hostBindingVerified, false, "caller-supplied host conversation IDs remain unverified metadata");
 
     const attackerClaim = await other.client.callTool({ name: "claim_review_thread_deliveries", arguments: {} });
@@ -139,6 +143,7 @@ try {
     const rebound = await other.client.callTool({ name: "reattach_review_thread", arguments: { activationSecret: replacementActivation.activationSecret } });
     assert.equal(rebound.isError, undefined, "a fresh authenticated context can consume a replacement grant");
     assert.equal((rebound.structuredContent as { threadId: string }).threadId, activeThread.id, "the durable thread identity survives context replacement");
+    assert.equal((rebound.structuredContent as { tool: string }).tool, "reattach_review_thread");
     assert.equal(reviewThreads.listMessages(activeThread.id)[0]?.status, "queued", "the uncompleted packet is queued for the replacement context");
     const newContextDelivery = await other.client.callTool({ name: "claim_review_thread_deliveries", arguments: {} });
     assert.equal((newContextDelivery.structuredContent as { messages: unknown[] }).messages.length, 1,

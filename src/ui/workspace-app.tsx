@@ -522,6 +522,24 @@ async function bootInternal(): Promise<void> {
       return;
     }
 
+    // Activation results mount the existing Workspace App only as the
+    // MCP Apps message bridge for the authenticated WebUI conversation. They
+    // do not create or select a reviewer-specific screen; the event watcher
+    // recovers queued packets and the model uses the ordinary handoff tools.
+    if (
+      (tool === "activate_review_thread" || tool === "reattach_review_thread") &&
+      typeof structured.workspaceId === "string" &&
+      typeof structured.reviewThreadId === "string"
+    ) {
+      activateWorkspace(structured.workspaceId);
+      lastToolCard = null;
+      expanded = false;
+      reviewFilesExpanded = false;
+      errorMessage = null;
+      scheduleRender();
+      return;
+    }
+
     // open_workspace carries the currently opened workspace ID.
     if (tool === "open_workspace" && structured.workspaceId) {
       activateWorkspace(structured.workspaceId);

@@ -15,6 +15,7 @@ import { and, eq, sql } from "drizzle-orm";
 import { createReviewPacket } from "../review-thread/review-packet.js";
 import { reviewThreadMessages } from "../db/schema.js";
 import { createHash } from "node:crypto";
+import { workspaceAppRenderToolMeta } from "../workspace-app-resource.js";
 import {
   ExternalCatalogObservationSubmissionSchema,
   validateExternalCatalogObservation,
@@ -189,8 +190,8 @@ export function registerHandoffTools(server: McpServer, config: BridgeConfig): v
       title: "Activate reviewer thread",
       description: "Consume a one-time owner-issued grant and bind this authenticated reviewer context to the persistent Kontrol review thread.",
       inputSchema: { activationSecret: z.string().min(20), hostKind: z.enum(["chatgpt", "kontrol_ui", "external"]).optional(), hostConversationId: z.string().optional() },
-      outputSchema: { threadId: z.string(), reviewThreadId: z.string(), routeId: z.string(), routeEpoch: z.number(), workspaceId: z.string(), status: z.string(), hostBindingVerified: z.boolean() },
-      _meta: {},
+      outputSchema: { tool: z.literal("activate_review_thread"), threadId: z.string(), reviewThreadId: z.string(), routeId: z.string(), routeEpoch: z.number(), workspaceId: z.string(), status: z.string(), hostBindingVerified: z.boolean() },
+      _meta: workspaceAppRenderToolMeta(),
       annotations: { readOnlyHint: false },
     },
     async ({ activationSecret, hostKind, hostConversationId }: { activationSecret: string; hostKind?: "chatgpt" | "kontrol_ui" | "external"; hostConversationId?: string }) => {
@@ -212,7 +213,7 @@ export function registerHandoffTools(server: McpServer, config: BridgeConfig): v
           hostConversationId,
         });
         config.eventStore.appendEvent({ type: "review.thread.activated", sessionId: thread.workSessionId, workspaceSessionId: workspaceId, payload: { threadId: thread.id, routeId: thread.routeId, routeEpoch: thread.routeEpoch, reviewerPrincipalId: thread.reviewerPrincipalId, hostBindingVerified: false } });
-        return { content: [{ type: "text" as const, text: `Review thread ${thread.id} activated for route epoch ${thread.routeEpoch}. Host conversation identity remains unverified.` }], structuredContent: { threadId: thread.id, reviewThreadId: thread.id, routeId: thread.routeId, routeEpoch: thread.routeEpoch, workspaceId, status: thread.status, hostBindingVerified: thread.hostBindingVerified } };
+        return { content: [{ type: "text" as const, text: `Review thread ${thread.id} activated for route epoch ${thread.routeEpoch}. Host conversation identity remains unverified.` }], structuredContent: { tool: "activate_review_thread", threadId: thread.id, reviewThreadId: thread.id, routeId: thread.routeId, routeEpoch: thread.routeEpoch, workspaceId, status: thread.status, hostBindingVerified: thread.hostBindingVerified } };
       } catch (error) {
         return { content: [{ type: "text" as const, text: error instanceof Error ? error.message : String(error) }], isError: true };
       }
@@ -226,8 +227,8 @@ export function registerHandoffTools(server: McpServer, config: BridgeConfig): v
       title: "Reattach reviewer thread",
       description: "Consume an owner-issued, one-time recovery grant to move the existing reviewer thread to this authenticated replacement context. The thread ID and round budget are preserved; uncertain presenting messages remain fenced for explicit recovery.",
       inputSchema: { activationSecret: z.string().min(20), hostKind: z.enum(["chatgpt", "kontrol_ui", "external"]).optional(), hostConversationId: z.string().optional() },
-      outputSchema: { threadId: z.string(), reviewThreadId: z.string(), routeId: z.string(), routeEpoch: z.number(), workspaceId: z.string(), status: z.string(), hostBindingVerified: z.boolean() },
-      _meta: {},
+      outputSchema: { tool: z.literal("reattach_review_thread"), threadId: z.string(), reviewThreadId: z.string(), routeId: z.string(), routeEpoch: z.number(), workspaceId: z.string(), status: z.string(), hostBindingVerified: z.boolean() },
+      _meta: workspaceAppRenderToolMeta(),
       annotations: { readOnlyHint: false },
     },
     async ({ activationSecret, hostKind, hostConversationId }: { activationSecret: string; hostKind?: "chatgpt" | "kontrol_ui" | "external"; hostConversationId?: string }) => {
@@ -250,7 +251,7 @@ export function registerHandoffTools(server: McpServer, config: BridgeConfig): v
           reattachOnly: true,
         });
         config.eventStore.appendEvent({ type: "review.thread.reattached", sessionId: thread.workSessionId, workspaceSessionId: workspaceId, payload: { threadId: thread.id, routeId: thread.routeId, routeEpoch: thread.routeEpoch, reviewerPrincipalId: thread.reviewerPrincipalId, hostBindingVerified: false } });
-        return { content: [{ type: "text" as const, text: `Review thread ${thread.id} reattached in route epoch ${thread.routeEpoch}.` }], structuredContent: { threadId: thread.id, reviewThreadId: thread.id, routeId: thread.routeId, routeEpoch: thread.routeEpoch, workspaceId, status: thread.status, hostBindingVerified: thread.hostBindingVerified } };
+        return { content: [{ type: "text" as const, text: `Review thread ${thread.id} reattached in route epoch ${thread.routeEpoch}.` }], structuredContent: { tool: "reattach_review_thread", threadId: thread.id, reviewThreadId: thread.id, routeId: thread.routeId, routeEpoch: thread.routeEpoch, workspaceId, status: thread.status, hostBindingVerified: thread.hostBindingVerified } };
       } catch (error) {
         return { content: [{ type: "text" as const, text: error instanceof Error ? error.message : String(error) }], isError: true };
       }

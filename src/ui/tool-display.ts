@@ -118,6 +118,10 @@ export function getToolDisplay(card: ToolResultCard): ToolDisplay {
       return { icon: agentIcon(), title: "Coding Agent", label, tone: "agent" };
     case "open_approval_center":
       return { icon: reviewIcon(), title: "Approval Center", label, tone: "agent" };
+    case "activate_review_thread":
+      return { icon: reviewIcon(), title: "Review Thread Connection", label, tone: "review" };
+    case "reattach_review_thread":
+      return { icon: reviewIcon(), title: "Review Thread Recovery", label, tone: "review" };
   }
 }
 

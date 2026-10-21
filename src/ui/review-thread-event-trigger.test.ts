@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { ensureWorkSessionView, workSessionViews } from "./session-views.js";
 import { reduceWorkSessionEvent, setReducerHost } from "./workspace-event-reducer.js";
 
 const toolCalls: string[] = [];
@@ -32,7 +31,6 @@ setReducerHost({
   setErrorMessage: (message) => { throw new Error(message ?? "unexpected reducer error"); },
 });
 
-ensureWorkSessionView("session-1", "workspace-1", "");
 reduceWorkSessionEvent("session-1", {
   seq: 1,
   id: "event-reattached",
@@ -45,7 +43,5 @@ reduceWorkSessionEvent("session-1", {
 await delivered;
 await new Promise((resolve) => setTimeout(resolve, 0));
 assert.deepEqual(toolCalls, ["claim_review_thread_deliveries", "acknowledge_review_thread_delivery"],
-  "reattachment immediately drains queued review messages into the active WebUI context");
-assert.equal(workSessionViews.get("session-1")?.activity[0]?.type, "review.thread.reattached");
-workSessionViews.delete("session-1");
+  "reattachment drains queued review messages even before a work-session card exists");
 console.log("review-thread-event-trigger.test.ts: all assertions passed");
