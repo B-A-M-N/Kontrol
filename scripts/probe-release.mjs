@@ -7,6 +7,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { tmpdir } from "node:os";
 import { validateRelease } from "./validate-release.mjs";
 import { buildToolEnvironment, releaseProbeEnvironment } from "./lib/tool-environment.mjs";
+import { REQUIRED_REVIEW_THREAD_TOOLS } from "./lib/review-thread-tool-manifest.mjs";
 
 const repositoryRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 
@@ -129,6 +130,9 @@ async function probeCandidateSurface(baseUrl, workspace, requiredInspectionTools
   const names = new Set(tools.map((tool) => tool.name));
   for (const required of requiredInspectionTools) {
     assert.ok(names.has(required), `candidate tools/list is missing required inspection tool ${required}`);
+  }
+  for (const required of REQUIRED_REVIEW_THREAD_TOOLS) {
+    assert.ok(names.has(required), `candidate tools/list is missing required review-thread tool ${required}`);
   }
   const listedResources = await rpc("resources/list", {});
   const appResources = (listedResources.resources ?? []).filter((resource) =>

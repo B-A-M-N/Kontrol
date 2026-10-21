@@ -10,6 +10,7 @@ import { openDatabase } from "../db/client.js";
 import { createReviewRouteStore } from "../review-handoff/route-store.js";
 import { createReviewThreadStore } from "./thread-store.js";
 import { registerHandoffTools } from "../bridge/handoff-tools.js";
+import { REQUIRED_REVIEW_THREAD_TOOLS } from "../../scripts/lib/review-thread-tool-manifest.mjs";
 
 const root = await mkdtemp(join(tmpdir(), "kontrol-review-thread-mcp-test-"));
 try {
@@ -65,6 +66,8 @@ try {
   ]);
   try {
     const tools = await reviewer.client.listTools();
+    const registeredNames = new Set(tools.tools.map((tool) => tool.name));
+    for (const required of REQUIRED_REVIEW_THREAD_TOOLS) assert.ok(registeredNames.has(required), `MCP tools/list is missing required review-thread tool ${required}`);
     const activationTool = tools.tools.find((tool) => tool.name === "activate_review_thread");
     assert.equal(activationTool?._meta?.["openai/outputTemplate"], undefined,
       "review activation remains a model-facing MCP operation without a reviewer UI surface");
