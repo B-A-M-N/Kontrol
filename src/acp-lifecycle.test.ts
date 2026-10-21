@@ -276,6 +276,42 @@ try {
   assert.equal(agents.getRun(runId)?.attemptNumber, 2,
     "a terminal event from an older attempt cannot overwrite the current attempt state");
 
+  const hermesFailure = await jsonFetch(`/runs/${encodeURIComponent(runId)}/events`, {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer agent-secret",
+      "Content-Type": "application/json",
+      "x-kontrol-agent-id": agentId,
+      "x-kontrol-agent-credential": agentCredential,
+    },
+    body: JSON.stringify({
+      type: "failed",
+      remote_run_id: "remote-e2e-2",
+      attempt_number: 2,
+      dispatch_idempotency_key: nextDispatchKey,
+      event_id: "hermes-failure-terminal",
+      agent_id: agentId,
+      work_session_id: sessionId,
+      payload: {
+        error: "deadman idle timeout; Authorization: Bearer lifecycle-secret-token",
+        stderr: "Traceback summary; Authorization: Bearer lifecycle-secret-token",
+        exit_code: 1,
+        signal: "SIGTERM",
+      },
+    }),
+  });
+  assert.equal(hermesFailure.status, 202);
+  const persistedHermesFailure = eventStore.getEventById("hermes-failure-terminal");
+  const persistedFailureEvidence = persistedHermesFailure?.payload.workerFailureEvidence as Record<string, unknown> | undefined;
+  assert.equal(persistedFailureEvidence?.category, "timeout",
+    "terminal Hermes deadman failures retain a specific timeout classification");
+  assert.match(String(persistedFailureEvidence?.reason), /deadman idle timeout/);
+  assert.match(String(persistedFailureEvidence?.sanitizedStderrTail), /Traceback summary/);
+  assert.doesNotMatch(JSON.stringify(persistedHermesFailure?.payload), /lifecycle-secret-token/,
+    "raw error and stderr are removed after their bounded diagnostics are redacted");
+  assert.equal(persistedHermesFailure?.payload.stderr, undefined);
+  assert.equal(persistedHermesFailure?.payload.error, undefined);
+
   const cancellationDispatch = await jsonFetch("/runs", {
     method: "POST",
     headers: { Authorization: "Bearer reviewer-secret", "Content-Type": "application/json" },

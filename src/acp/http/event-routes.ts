@@ -31,16 +31,30 @@ function workerFailureEvidence(input: {
   eventId?: string;
   runId: string;
   attemptNumber: number;
-}): Record<string, unknown> {
+}): {
+  phase: "execution";
+  category: string;
+  reason?: string;
+  exitCode?: number;
+  signal?: string;
+  sanitizedStderrTail?: string;
+  eventId?: string;
+  runId: string;
+  attemptNumber: number;
+} {
   const exitCode = input.payload?.exit_code;
   const signal = typeof input.payload?.signal === "string" ? boundedDiagnosticTail(input.payload.signal, 128) : undefined;
-  const category = signal ? "signal_termination"
-    : typeof exitCode === "number" && Number.isInteger(exitCode) ? "nonzero_exit"
-      : "worker_failure";
+  const reason = boundedDiagnosticTail(input.payload?.error ?? input.payload?.message ?? input.payload?.reason);
+  const category = reason && /timeout|timed out|deadman|run ceiling/i.test(reason) ? "timeout"
+    : reason && /protocol_incomplete/i.test(reason) ? "protocol_failure"
+      : signal ? "signal_termination"
+        : typeof exitCode === "number" && Number.isInteger(exitCode) && exitCode !== 0 ? "nonzero_exit"
+          : "worker_failure";
   const stderr = boundedDiagnosticTail(input.payload?.stderr);
   return {
     phase: "execution",
     category,
+    ...(reason ? { reason } : {}),
     ...(typeof exitCode === "number" && Number.isInteger(exitCode) ? { exitCode } : {}),
     ...(signal ? { signal } : {}),
     ...(stderr ? { sanitizedStderrTail: stderr } : {}),
@@ -530,19 +544,27 @@ function eventMatchesDispatch(event: { type: string; payload: Record<string, unk
         && !conflictingCommittedReceipts
         && !unresolvedPublicationFailure;
       const eventType = (gatedCompletedTurn || autonomousBoundedWrite) ? "worker.turn.completed" : ADAPTER_EVENT_TYPE_TO_RUN[body.type]!;
+      const failureEvidence = body.type === "failed" || body.type === "exited"
+        ? workerFailureEvidence({
+            payload: body.payload,
+            eventId: body.event_id,
+            runId: run.runId,
+            attemptNumber: run.attemptNumber ?? 1,
+          })
+        : undefined;
       const adapterPayload = Object.fromEntries(
-        Object.entries(body.payload ?? {}).filter(([key]) => !SERVER_OWNED_EVENT_PAYLOAD_FIELDS.has(key)),
+        Object.entries(body.payload ?? {}).filter(([key]) =>
+          !SERVER_OWNED_EVENT_PAYLOAD_FIELDS.has(key)
+          && !(failureEvidence && ["error", "message", "stderr", "exit_code", "signal"].includes(key))),
       );
       const eventPayload = {
         ...adapterPayload,
         ...(autonomousBoundedWrite ? { autonomousCompletion: true } : {}),
-        ...(body.type === "failed" || body.type === "exited"
-          ? { workerFailureEvidence: workerFailureEvidence({
-              payload: body.payload,
-              eventId: body.event_id,
-              runId: run.runId,
-              attemptNumber: run.attemptNumber ?? 1,
-            }) }
+        ...(failureEvidence
+          ? {
+              workerFailureEvidence: failureEvidence,
+              ...(failureEvidence.reason ? { reason: failureEvidence.reason } : {}),
+            }
           : {}),
         runId: run.runId,
         remoteRunId: body.remote_run_id ?? run.remoteRunId,
@@ -604,13 +626,13 @@ function eventMatchesDispatch(event: { type: string; payload: Record<string, unk
       // still open. Map to `failed`; only a zero-exit in the wrong session
       // state (handled by evaluateCompletion) is a protocol failure.
       const session = sessionId ? workSessions.get(sessionId) : undefined;
-      const errorMessage = stringPayload(body.payload?.message) ?? "worker process exited";
       const failureEvidence = workerFailureEvidence({
         payload: body.payload,
         eventId: body.event_id,
         runId: run.runId,
         attemptNumber: run.attemptNumber ?? 1,
       });
+      const errorMessage = failureEvidence.reason ?? "worker process exited";
       if (session && session.status === "awaiting_review") {
         // Worker died after submitting but before the reviewer responded. Keep
         // the durable review OPEN (resumable): mark the attempt detached and do

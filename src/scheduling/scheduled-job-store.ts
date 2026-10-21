@@ -261,6 +261,7 @@ export interface ScheduledDispatchAttemptDiagnostic {
 export interface WorkerFailureEvidence {
   phase: "admission" | "spawn" | "execution" | "reporting";
   category: string;
+  reason?: string;
   exitCode?: number;
   signal?: string;
   sanitizedStderrTail?: string;
@@ -1225,10 +1226,16 @@ export function createScheduledJobStore(
             : undefined;
           const signal = boundedFailureDiagnosticTail(payload.signal, 128);
           const stderr = boundedFailureDiagnosticTail(payload.stderr);
-          if (exitCode === undefined && !signal && !stderr) continue;
+          const reason = boundedFailureDiagnosticTail(payload.reason ?? payload.error ?? payload.message);
+          if (exitCode === undefined && !signal && !stderr && !reason) continue;
           return {
             phase: "execution",
-            category: signal ? "signal_termination" : exitCode !== undefined && exitCode !== 0 ? "nonzero_exit" : "legacy_worker_failure",
+            category: reason && /timeout|timed out|deadman|run ceiling/i.test(reason) ? "timeout"
+              : reason && /protocol_incomplete/i.test(reason) ? "protocol_failure"
+                : signal ? "signal_termination"
+                  : exitCode !== undefined && exitCode !== 0 ? "nonzero_exit"
+                    : "legacy_worker_failure",
+            ...(reason ? { reason } : {}),
             ...(exitCode !== undefined ? { exitCode } : {}),
             ...(signal ? { signal } : {}),
             ...(stderr ? { sanitizedStderrTail: stderr } : {}),
@@ -1243,9 +1250,10 @@ export function createScheduledJobStore(
         return {
           phase: evidence.phase,
           category: evidence.category.slice(0, 120),
+          ...(typeof evidence.reason === "string" ? { reason: boundedFailureDiagnosticTail(evidence.reason) } : {}),
           ...(typeof evidence.exitCode === "number" && Number.isInteger(evidence.exitCode) ? { exitCode: evidence.exitCode } : {}),
-          ...(typeof evidence.signal === "string" ? { signal: evidence.signal.slice(0, 128) } : {}),
-          ...(typeof evidence.sanitizedStderrTail === "string" ? { sanitizedStderrTail: evidence.sanitizedStderrTail.slice(-4_000) } : {}),
+          ...(typeof evidence.signal === "string" ? { signal: boundedFailureDiagnosticTail(evidence.signal, 128) } : {}),
+          ...(typeof evidence.sanitizedStderrTail === "string" ? { sanitizedStderrTail: boundedFailureDiagnosticTail(evidence.sanitizedStderrTail) } : {}),
           ...(typeof evidence.eventId === "string" ? { eventId: evidence.eventId.slice(0, 200) } : {}),
           runId: attempt.acpRunId,
           attemptNumber: attempt.acpAttemptNumber,

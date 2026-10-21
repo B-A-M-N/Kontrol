@@ -50,8 +50,9 @@ assert.ok(adapter.indexOf("await launchGate.start()") < adapter.indexOf('run.rem
   "Hermes acceptance is persisted only after the agent child has spawned");
 assert.match(adapter, /validateReadOnlyDispatchRequest\(body, workspaceRoot, ADAPTER_SECRET, agentIdentity\?\.agentId\)/,
   "Hermes verifies the server-signed read-only grant before preparing a child");
-assert.match(adapter, /bindFiles: \[\s*\{ source: hermesExecutable, target: hermesSandboxCommand \}/,
-  "Hermes exposes only its selected CLI executable rather than the containing credential-capable directory");
+assert.match(adapter, /const hermesRuntimeBindFiles = \[\s*\{ source: hermesExecutable, target: hermesSandboxCommand \},\s*hermesPythonBindFile,\s*\]/,
+  "Hermes exposes only its selected CLI and sibling Python executables rather than the containing credential-capable directory");
+assert.match(adapter, /run\.readOnlyBindFiles = hermesRuntimeBindFiles/);
 assert.match(adapter, /executionReceipt: run\.readOnlyExecutionReceipt/,
   "Hermes persists the correlated read-only receipt with its durable dispatch record");
 assert.match(adapter, /!run\.readOnlyAudit && !run\.boundedFileWrite && \(!run\.workspaceLeaseNonce/,
@@ -79,6 +80,18 @@ assert.match(adapter, /deliveryErrors/);
 assert.match(adapter, /terminalOutcome/);
 assert.match(adapter, /flushCoalesced\(run, type, true\)/);
 assert.doesNotMatch(adapter, /stdoutBuffer \+= chunk;\s*stdoutBuffer \+= chunk;/);
+assert.match(adapter, /run\.stderrTail = truncateUtf8Tail\(`\$\{run\.stderrTail\}\$\{text\}`,\s*FAILURE_DIAGNOSTIC_BYTES\)/,
+  "Hermes retains a bounded stderr tail for terminal failure receipts");
+assert.match(adapter, /run\.childExit = \{ code, signal \}/,
+  "Hermes records child exit metadata even when termination is already in progress");
+assert.match(adapter, /exit_code: exitCode/);
+assert.match(adapter, /stderr: truncateUtf8Tail\(stderr, FAILURE_DIAGNOSTIC_BYTES\)/,
+  "Hermes sends bounded diagnostics with the terminal failure event");
+assert.match(adapter, /const hermesSandboxPython = join\(dirname\(hermesSandboxCommand\), "python"\)/,
+  "Hermes console-script launchers receive their sibling Python interpreter inside Bubblewrap");
+assert.match(adapter, /source: pythonExecutable, target: hermesSandboxPython/);
+assert.match(adapter, /Hermes ACP launcher sandbox preflight failed/,
+  "the exact confined ACP launcher is checked before an accepted worker dispatch");
 
 const currentCandidates = hermesAcpCandidates({
   hermesBin: "hermes",

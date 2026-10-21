@@ -59,6 +59,7 @@ const HERMES_ACP_COMPAT_PATH = fileURLToPath(new URL("./hermes-acp-compat", impo
 const DEADMAN_IDLE_MS = positiveDuration(process.env.KONTROL_HERMES_DEADMAN_IDLE_MS, 5 * 60_000);
 const MAX_RUN_MS = positiveDuration(process.env.KONTROL_HERMES_MAX_RUN_SECONDS, 2 * 60 * 60) * 1000;
 const FINAL_OUTPUT_BYTES = 2 * 1024 * 1024;
+const FAILURE_DIAGNOSTIC_BYTES = 16 * 1024;
 const OWNED_PROCESSES_PATH = process.env.KONTROL_HERMES_OWNED_PROCESSES
   || adapterStatePath("hermes", "owned-processes.json");
 const DISPATCH_RECEIPTS_PATH = process.env.KONTROL_HERMES_DISPATCH_RECEIPTS
@@ -441,6 +442,8 @@ async function handle(req, res) {
     eventSequence: 0,
     terminalOutcome: null,
     finalOutput: "",
+    stderrTail: "",
+    childExit: undefined,
   };
   if (run.workSessionId && hasActiveSession(run.workSessionId)) {
     const existing = [...active.values()].find((item) => item.workSessionId === run.workSessionId);
@@ -517,6 +520,12 @@ async function handle(req, res) {
       copyFileSync(RUNNER, join(run.readOnlyRuntimeProjection, "hermes-native-runner.py"));
       copyFileSync(join(HERMES_ACP_COMPAT_PATH, "sitecustomize.py"), join(run.readOnlyRuntimeProjection, "sitecustomize.py"));
       const hermesSandboxCommand = `/opt/kontrol/hermes-bin/${basename(hermesExecutable)}`;
+      const hermesSandboxPython = join(dirname(hermesSandboxCommand), "python");
+      const hermesPythonBindFile = { source: pythonExecutable, target: hermesSandboxPython };
+      const hermesRuntimeBindFiles = [
+        { source: hermesExecutable, target: hermesSandboxCommand },
+        hermesPythonBindFile,
+      ];
       const configuredToolchains = (process.env.KONTROL_VERIFY_TOOLCHAIN_PATHS ?? "").split(delimiter).filter(Boolean).map((path) => resolve(path));
       const pythonUsesSystemRuntime = pythonExecutable.startsWith("/usr/") || pythonExecutable.startsWith("/bin/");
       run.readOnlySandbox = buildReadOnlySandboxCommand({
@@ -552,15 +561,13 @@ async function handle(req, res) {
           { source: run.readOnlyRuntimeProjection, target: "/opt/kontrol/hermes-runtime" },
           { source: HERMES_ACP_PYTHON_SITE_ROOT, target: "/opt/kontrol/hermes-python-packages" },
         ],
-        bindFiles: [
-          { source: hermesExecutable, target: hermesSandboxCommand },
-        ],
+        bindFiles: hermesRuntimeBindFiles,
       });
       run.readOnlyBindMounts = [
         { source: run.readOnlyRuntimeProjection, target: "/opt/kontrol/hermes-runtime" },
         { source: HERMES_ACP_PYTHON_SITE_ROOT, target: "/opt/kontrol/hermes-python-packages" },
       ];
-      run.readOnlyBindFiles = [{ source: hermesExecutable, target: hermesSandboxCommand }];
+      run.readOnlyBindFiles = hermesRuntimeBindFiles;
       probeReadOnlyExecutionSandbox({
         workspaceRoot,
         toolchainPaths: configuredToolchains,
@@ -568,6 +575,32 @@ async function handle(req, res) {
         bindFiles: run.readOnlyBindFiles,
         networkPolicy: run.execution.networkPolicy,
       });
+      const launcherProbe = buildReadOnlySandboxCommand({
+        workspaceRoot,
+        executable: hermesExecutable,
+        executableTarget: hermesSandboxCommand,
+        args: [...HERMES_ACP_ENTRY.args, "--check"],
+        env: {
+          HERMES_AGENT_ROOT: "/opt/kontrol/hermes-runtime",
+          HERMES_HOME: "/tmp/home/.hermes",
+          PYTHONPATH: hermesReadOnlyPythonPath(),
+          PATH: "/opt/kontrol/bin:/opt/kontrol/hermes-bin:/usr/local/bin:/usr/bin:/bin",
+        },
+        toolchainPaths: configuredToolchains,
+        bindMounts: run.readOnlyBindMounts,
+        bindFiles: [hermesPythonBindFile],
+        networkPolicy: run.execution.networkPolicy,
+      });
+      const launcherProbeResult = spawnSync(launcherProbe.command, launcherProbe.args, {
+        encoding: "utf8",
+        timeout: 15_000,
+        env: launcherProbe.env,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      if (launcherProbeResult.error || launcherProbeResult.status !== 0) {
+        const detail = launcherProbeResult.error?.message ?? `exit ${launcherProbeResult.status}`;
+        throw Object.assign(new Error(`Hermes ACP launcher sandbox preflight failed: ${detail}`), { code: "sandbox_unavailable" });
+      }
       const runtimeProbe = buildReadOnlySandboxCommand({
         workspaceRoot,
         executable: pythonExecutable,
@@ -795,7 +828,11 @@ async function handle(req, res) {
       handleRunnerLine(run, line);
     }
   });
-  child.stderr.on("data", (chunk) => reportOutput(run, String(chunk), "stderr"));
+  child.stderr.on("data", (chunk) => {
+    const text = String(chunk);
+    run.stderrTail = truncateUtf8Tail(`${run.stderrTail}${text}`, FAILURE_DIAGNOSTIC_BYTES);
+    reportOutput(run, text, "stderr");
+  });
   const handleChildError = (err) => {
     clearInterval(heartbeatTimer);
     clearInterval(run.leaseWatchdogTimer);
@@ -813,6 +850,7 @@ async function handle(req, res) {
     handleChildError(err);
   });
   const handleChildExit = (code, signal) => {
+    run.childExit = { code, signal };
     clearInterval(heartbeatTimer);
     clearInterval(run.leaseWatchdogTimer);
     if (stdoutBuffer.trim()) handleRunnerLine(run, stdoutBuffer);
@@ -1078,11 +1116,14 @@ function refreshOperationActivity(run) {
   }
 }
 
-function reportEvent(run, type, errorMessage, { allowFinalizing = false } = {}) {
+function reportEvent(run, type, errorMessage, { allowFinalizing = false, exitCode, signal, stderr } = {}) {
   const terminal = type === "completed" || type === "failed" || type === "cancelled";
   const payload = {
     payload: {
-      ...(errorMessage ? { error: errorMessage } : {}),
+      ...(errorMessage ? { error: truncateUtf8Tail(errorMessage, 4_000) } : {}),
+      ...(type === "failed" && Number.isInteger(exitCode) ? { exit_code: exitCode } : {}),
+      ...(type === "failed" && typeof signal === "string" && signal ? { signal } : {}),
+      ...(type === "failed" && typeof stderr === "string" && stderr ? { stderr: truncateUtf8Tail(stderr, FAILURE_DIAGNOSTIC_BYTES) } : {}),
       ...(terminal && run.finalOutput ? { final_output: run.finalOutput } : {}),
     },
   };
@@ -1463,7 +1504,14 @@ async function finalizeRun(run, status, stopReason) {
   // flushed above, before emitting the terminal frame. The terminal event is
   // the durable boundary consumed by Kontrol; it must be last.
   await run.sendChain;
-  await reportEvent(run, status, stopReason, { allowFinalizing: true });
+  await reportEvent(run, status, stopReason, {
+    allowFinalizing: true,
+    ...(status === "failed" ? {
+      exitCode: run.childExit?.code,
+      signal: run.childExit?.signal,
+      stderr: run.stderrTail,
+    } : {}),
+  });
   active.delete(run.remoteRunId);
   removeHermesReadOnlyRuntime(run);
   run.lifecycle = "TERMINAL";

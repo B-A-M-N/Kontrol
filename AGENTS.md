@@ -186,6 +186,10 @@ Current implementation contracts:
   known child operation or pending permission. `KONTROL_HERMES_MAX_RUN_SECONDS`
   remains the absolute safety ceiling, and `KONTROL_HERMES_DEADMAN_IDLE_MS`
   controls only the idle watchdog.
+- Confined Hermes launches bind only the selected ACP executable and its
+  expected sibling Python interpreter, then run the exact selected entrypoint's
+  `--check` inside Bubblewrap before accepting the worker. A launcher that
+  cannot resolve that interpreter fails as `sandbox_unavailable`.
 - Tunnel supervision distinguishes local daemon liveness from remote
   control-plane state. Transient throttling, authentication, and upstream
   outages remain degraded without restarting a healthy tunnel/core; a local
@@ -323,6 +327,11 @@ Current implementation contracts:
   evidence bound to the authoritative dispatch attempt. Dispatch acceptance,
   worker start/stop outcome, and reviewer approval remain separate; a rejected
   pre-spawn attempt or a failed worker cannot produce `workerCompleted: true`.
+- Available terminal worker failure details are projected into bounded,
+  redacted reason, exit code, signal, and stderr-tail evidence for the exact run
+  and attempt. Explicit timeout and protocol reasons take precedence over
+  signal and exit-code fallback classes. Raw adapter diagnostic fields are
+  removed before event persistence.
 - Scheduled failure receipts may project pre-structured terminal events only
   when run, attempt, and dispatch identities match the current attempt. Legacy
   stderr is redacted and byte-bounded before it is exposed.

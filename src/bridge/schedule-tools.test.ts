@@ -622,6 +622,22 @@ try {
       reason: "worker process exited",
     },
   });
+  assert.equal(jobs.getWorkerFailureEvidence?.(failedExecutionJob.id)?.reason, "worker process exited",
+    "legacy reason-only failure events remain useful evidence");
+  durableFailureEvents.appendEvent({
+    id: "failed-execution-full-diagnostic-event",
+    type: "agent.run.failed",
+    sessionId: "work-session-failed-execution",
+    payload: {
+      runId: "run-failed-execution",
+      dispatchId: failedExecutionClaim.dispatchId,
+      attemptNumber: 1,
+      error: "deadman idle timeout; Authorization: Bearer legacy-secret-value",
+      exit_code: 1,
+      signal: "SIGTERM",
+      stderr: "ERROR\\nNo prompt provided.\\nAuthorization: Bearer legacy-secret-value",
+    },
+  });
   const failedExecutionReceipt = await resultTool({ scheduledJobId: failedExecutionJob.id });
   assert.equal(failedExecutionReceipt.structuredContent.resultReceipt.workerCompleted, false);
   assert.equal(failedExecutionReceipt.structuredContent.resultReceipt.workerExecutionOutcome, "failed");
@@ -630,10 +646,15 @@ try {
   assert.equal(failedExecutionReceipt.structuredContent.resultReceipt.reviewApproved, false);
   assert.equal(failedExecutionReceipt.structuredContent.resultReceipt.verificationStatus, "not_performed");
   assert.equal(failedExecutionReceipt.structuredContent.resultReceipt.workerFailureEvidence?.exitCode, 1);
+  assert.equal(failedExecutionReceipt.structuredContent.resultReceipt.workerFailureEvidence?.category, "timeout",
+    "the explicit deadman reason takes precedence over a child signal and exit code");
+  assert.match(failedExecutionReceipt.structuredContent.resultReceipt.workerFailureEvidence?.reason ?? "", /deadman idle timeout/);
+  assert.doesNotMatch(failedExecutionReceipt.structuredContent.resultReceipt.workerFailureEvidence?.reason ?? "", /legacy-secret-value/,
+    "failure reasons are redacted before they are exposed by a scheduled result");
   assert.match(failedExecutionReceipt.structuredContent.resultReceipt.workerFailureEvidence?.sanitizedStderrTail ?? "", /No prompt provided/);
   assert.doesNotMatch(failedExecutionReceipt.structuredContent.resultReceipt.workerFailureEvidence?.sanitizedStderrTail ?? "", /legacy-secret-value/,
     "legacy stderr is redacted before it is exposed by a scheduled result");
-  assert.equal(failedExecutionReceipt.structuredContent.resultReceipt.workerFailureEvidence?.eventId, "failed-execution-diagnostic-event");
+  assert.equal(failedExecutionReceipt.structuredContent.resultReceipt.workerFailureEvidence?.eventId, "failed-execution-full-diagnostic-event");
 
   durableFailureEvents.appendEvent({
     id: "structured-failed-execution-diagnostic-event",

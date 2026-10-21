@@ -248,6 +248,7 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
             workerFailureEvidence: z.object({
               phase: z.enum(["admission", "spawn", "execution", "reporting"]),
               category: z.string(),
+              reason: z.string().optional(),
               exitCode: z.number().int().optional(),
               signal: z.string().optional(),
               sanitizedStderrTail: z.string().optional(),
