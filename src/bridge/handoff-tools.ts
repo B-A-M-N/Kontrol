@@ -199,15 +199,18 @@ export function registerHandoffTools(server: McpServer, config: BridgeConfig): v
       const contextId = reviewerThreadContextId(config);
       if (!contextId) return { content: [{ type: "text" as const, text: "A server-issued authenticated MCP reviewer session is required to activate this thread." }], isError: true };
       try {
+        const principalId = config.principalId ?? `role:${config.principalRole ?? "reviewer"}`;
+        const target = config.reviewThreads.getActivationTarget({ activationSecret, principalId });
+        if (!target) throw new Error("Review thread activation is invalid, expired, or already consumed.");
+        const workspaceId = config.workSessions.get(target.workSessionId)?.workspaceSessionId;
+        if (!workspaceId) throw new Error("The review thread workspace could not be resolved.");
         const thread = config.reviewThreads.activate({
           activationSecret,
-          principalId: config.principalId ?? `role:${config.principalRole ?? "reviewer"}`,
+          principalId,
           contextId,
           hostKind,
           hostConversationId,
         });
-        const workspaceId = config.workSessions.get(thread.workSessionId)?.workspaceSessionId;
-        if (!workspaceId) throw new Error("The review thread workspace could not be resolved.");
         config.eventStore.appendEvent({ type: "review.thread.activated", sessionId: thread.workSessionId, workspaceSessionId: workspaceId, payload: { threadId: thread.id, routeId: thread.routeId, routeEpoch: thread.routeEpoch, reviewerPrincipalId: thread.reviewerPrincipalId, hostBindingVerified: false } });
         return { content: [{ type: "text" as const, text: `Review thread ${thread.id} activated for route epoch ${thread.routeEpoch}. Host conversation identity remains unverified.` }], structuredContent: { threadId: thread.id, reviewThreadId: thread.id, routeId: thread.routeId, routeEpoch: thread.routeEpoch, workspaceId, status: thread.status, hostBindingVerified: thread.hostBindingVerified } };
       } catch (error) {
@@ -233,16 +236,19 @@ export function registerHandoffTools(server: McpServer, config: BridgeConfig): v
       const contextId = reviewerThreadContextId(config);
       if (!contextId) return { content: [{ type: "text" as const, text: "A server-issued authenticated MCP reviewer session is required to reattach this thread." }], isError: true };
       try {
+        const principalId = config.principalId ?? `role:${config.principalRole ?? "reviewer"}`;
+        const target = config.reviewThreads.getActivationTarget({ activationSecret, principalId });
+        if (!target) throw new Error("Review thread activation is invalid, expired, or already consumed.");
+        const workspaceId = config.workSessions.get(target.workSessionId)?.workspaceSessionId;
+        if (!workspaceId) throw new Error("The review thread workspace could not be resolved.");
         const thread = config.reviewThreads.activate({
           activationSecret,
-          principalId: config.principalId ?? `role:${config.principalRole ?? "reviewer"}`,
+          principalId,
           contextId,
           hostKind,
           hostConversationId,
           reattachOnly: true,
         });
-        const workspaceId = config.workSessions.get(thread.workSessionId)?.workspaceSessionId;
-        if (!workspaceId) throw new Error("The review thread workspace could not be resolved.");
         config.eventStore.appendEvent({ type: "review.thread.reattached", sessionId: thread.workSessionId, workspaceSessionId: workspaceId, payload: { threadId: thread.id, routeId: thread.routeId, routeEpoch: thread.routeEpoch, reviewerPrincipalId: thread.reviewerPrincipalId, hostBindingVerified: false } });
         return { content: [{ type: "text" as const, text: `Review thread ${thread.id} reattached in route epoch ${thread.routeEpoch}.` }], structuredContent: { threadId: thread.id, reviewThreadId: thread.id, routeId: thread.routeId, routeEpoch: thread.routeEpoch, workspaceId, status: thread.status, hostBindingVerified: thread.hostBindingVerified } };
       } catch (error) {

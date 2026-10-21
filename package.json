@@ -78,7 +78,7 @@
     "test:find-compat": "node --import tsx src/pi-tools-find.test.ts",
     "test:release-artifact": "node src/release-artifact.test.mjs",
     "test:schedule-result": "node --import tsx src/bridge/schedule-tools.test.ts",
-    "test:review-thread": "tsx src/review-thread/review-thread.test.ts && tsx src/review-thread/review-thread-mcp.test.ts && tsx src/review-handoff/route-store.test.ts && tsx src/bridge/handoff-tools.test.ts && tsx src/ui/review-thread-delivery.test.ts && tsx src/bridge-flow.test.ts",
+    "test:review-thread": "tsx src/review-thread/review-thread.test.ts && tsx src/review-thread/review-thread-mcp.test.ts && tsx src/review-handoff/route-store.test.ts && tsx src/bridge/handoff-tools.test.ts && tsx src/ui/review-thread-delivery.test.ts && tsx src/ui/review-thread-event-trigger.test.ts && tsx src/bridge-flow.test.ts",
     "test:scheduled-artifact-publisher": "node --import tsx src/scheduling/scheduled-artifact-publisher.test.ts",
     "test:workspace-app-registry": "node --import tsx src/workspace-app-resource-registry.test.mjs",
     "test:workspace-app-bootstrap": "node --import tsx src/ui/connection-lifecycle.bootstrap.test.ts",

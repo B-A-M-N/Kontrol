@@ -35,10 +35,11 @@ try {
   const activeThread = reviewThreads.activate({ activationSecret: activation.activationSecret, principalId: "reviewer", contextId: "principal:reviewer|mcp-session:review-mcp-session" });
 
   const createConnection = (principalId: string, conversationId: string, mcpSessionId: string) => {
+    let workspaceResolvable = true;
     const config = {
       db, workspaces: {},
       workSessions: {
-        get: () => ({ id: route.workSessionId, title: "Review task", workspaceSessionId: "ws-review-mcp" }),
+        get: () => workspaceResolvable ? ({ id: route.workSessionId, title: "Review task", workspaceSessionId: "ws-review-mcp" }) : undefined,
         getSubmissions: () => [{ id: handoff.submissionId, submissionNumber: 1, reviewEpoch: handoff.reviewEpoch, diffSha256: handoff.diffSha256, snapshotKind: handoff.snapshotKind, snapshotRef: handoff.snapshotRef, status: "pending" }],
       },
       reviewCheckpoints: {},
@@ -49,11 +50,12 @@ try {
       connectionMcpSessionId: mcpSessionId,
       reviewRoutes, reviewThreads,
     } as any;
+    const setWorkspaceResolvable = (value: boolean) => { workspaceResolvable = value; };
     const server = new McpServer({ name: "review-thread-mcp-test", version: "1.0.0" });
     registerHandoffTools(server, config);
     const client = new Client({ name: "review-thread-mcp-client", version: "1.0.0" });
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-    return { config, server, client, clientTransport, serverTransport };
+    return { config, server, client, clientTransport, serverTransport, setWorkspaceResolvable };
   };
 
   const reviewer = createConnection("reviewer", "review-b", "review-mcp-session");
@@ -69,9 +71,21 @@ try {
     const registeredNames = new Set(tools.tools.map((tool) => tool.name));
     for (const required of REQUIRED_REVIEW_THREAD_TOOLS) assert.ok(registeredNames.has(required), `MCP tools/list is missing required review-thread tool ${required}`);
     const activationTool = tools.tools.find((tool) => tool.name === "activate_review_thread");
+    const reattachTool = tools.tools.find((tool) => tool.name === "reattach_review_thread");
+    assert.equal((activationTool?._meta?.ui as { resourceUri?: unknown } | undefined)?.resourceUri, undefined,
+      "review activation does not create a reviewer UI surface");
     assert.equal(activationTool?._meta?.["openai/outputTemplate"], undefined,
       "review activation remains a model-facing MCP operation without a reviewer UI surface");
+    assert.equal((reattachTool?._meta?.ui as { resourceUri?: unknown } | undefined)?.resourceUri, undefined,
+      "review reattachment does not create a reviewer UI surface");
+    assert.equal(reattachTool?._meta?.["openai/outputTemplate"], undefined);
     const activationRetry = reviewThreads.createActivation({ routeId: route.id, ownerPrincipalId: "owner", reviewerPrincipalId: "reviewer" });
+    reviewer.setWorkspaceResolvable(false);
+    const unresolvedWorkspace = await reviewer.client.callTool({ name: "activate_review_thread", arguments: { activationSecret: activationRetry.activationSecret } });
+    assert.equal(unresolvedWorkspace.isError, true, "activation fails before consuming a grant when its workspace cannot be resolved");
+    assert.ok(reviewThreads.getActivationTarget({ activationSecret: activationRetry.activationSecret, principalId: "reviewer" }),
+      "a transient workspace lookup failure leaves the one-time grant available for retry");
+    reviewer.setWorkspaceResolvable(true);
     const activated = await reviewer.client.callTool({ name: "activate_review_thread", arguments: { activationSecret: activationRetry.activationSecret, hostKind: "chatgpt", hostConversationId: "review-b" } });
     assert.equal(activated.isError, undefined, "the owner-issued activation grant binds the current authenticated MCP session");
     assert.equal((activated.structuredContent as { threadId: string; hostBindingVerified: boolean }).threadId, activeThread.id);
@@ -117,6 +131,11 @@ try {
     const expiredStatusRead = await reviewer.client.callTool({ name: "get_review_handoff_status", arguments: { handoffId: handoff.id } });
     assert.equal(expiredStatusRead.isError, true, "an expired claim cannot keep reading claim status");
     const replacementActivation = reviewThreads.createActivation({ routeId: route.id, ownerPrincipalId: "owner", reviewerPrincipalId: "reviewer" });
+    other.setWorkspaceResolvable(false);
+    const unresolvedReattach = await other.client.callTool({ name: "reattach_review_thread", arguments: { activationSecret: replacementActivation.activationSecret } });
+    assert.equal(unresolvedReattach.isError, true, "reattachment also validates workspace access before consuming its grant");
+    assert.ok(reviewThreads.getActivationTarget({ activationSecret: replacementActivation.activationSecret, principalId: "reviewer" }));
+    other.setWorkspaceResolvable(true);
     const rebound = await other.client.callTool({ name: "reattach_review_thread", arguments: { activationSecret: replacementActivation.activationSecret } });
     assert.equal(rebound.isError, undefined, "a fresh authenticated context can consume a replacement grant");
     assert.equal((rebound.structuredContent as { threadId: string }).threadId, activeThread.id, "the durable thread identity survives context replacement");

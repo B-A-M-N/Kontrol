@@ -48,6 +48,7 @@ export interface ReviewThreadStore {
   getForContext(principalId: string, contextId: string): ReviewThread | undefined;
   listForContext(principalId: string, contextId: string): ReviewThread[];
   getById(threadId: string): ReviewThread | undefined;
+  getActivationTarget(input: { activationSecret: string; principalId: string }): ReviewThread | undefined;
   createActivation(input: { routeId: string; ownerPrincipalId: string; reviewerPrincipalId: string; ttlMs?: number }): { threadId: string; activationSecret: string; expiresAt: string };
   activate(input: { activationSecret: string; principalId: string; contextId: string; hostKind?: string; hostConversationId?: string; reattachOnly?: boolean }): ReviewThread;
   setRouteStatus(routeId: string, routeEpoch: number, status: "active" | "paused" | "disabled" | "closed"): void;
@@ -69,6 +70,22 @@ export function createReviewThreadStore(database: DatabaseHandle): ReviewThreadS
   return {
     getForRoute,
     getById,
+    getActivationTarget(input) {
+      const hash = createHash("sha256").update(input.activationSecret).digest("hex");
+      const now = new Date().toISOString();
+      const grant = database.db.select().from(reviewThreadActivations).where(and(
+        eq(reviewThreadActivations.activationSecretSha256, hash),
+        eq(reviewThreadActivations.principalId, input.principalId),
+        isNull(reviewThreadActivations.consumedAt), isNull(reviewThreadActivations.revokedAt),
+        gt(reviewThreadActivations.expiresAt, now),
+      )).get();
+      if (!grant) return undefined;
+      const route = database.db.select().from(reviewRoutes).where(eq(reviewRoutes.id, grant.routeId)).get();
+      const thread = database.db.select().from(reviewThreads).where(eq(reviewThreads.id, grant.threadId)).get();
+      if (!route || !thread || route.status !== "active" || route.routeEpoch !== grant.routeEpoch
+        || thread.routeEpoch !== grant.routeEpoch || thread.status === "closed") return undefined;
+      return asThread(thread);
+    },
     getForContext(principalId, contextId) {
       const row = database.db.select().from(reviewThreads).where(and(
         eq(reviewThreads.reviewerPrincipalId, principalId),
