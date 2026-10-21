@@ -144,6 +144,8 @@ async function probeCandidateSurface(baseUrl, workspace, requiredInspectionTools
   const rendererTools = [
     "show_workspace_ui",
     "show_changes",
+    "activate_review_thread",
+    "reattach_review_thread",
     ...(names.has("open_approval_center") ? ["open_approval_center"] : []),
   ];
   for (const name of rendererTools) {
