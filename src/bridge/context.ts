@@ -157,6 +157,7 @@ export const supervisedMissionOptionsSchema = z.object({
   maxWallTimeMinutes: z.number().int().min(1).max(10_080).optional(),
   finalVerification: z.array(z.string()).optional(),
   reviewCoverage: z.array(z.string()).optional(),
+  completionClaim: z.enum(["implementation", "real_world_outcome"]).optional().describe("Declare whether completion means delivering/verifying an implementation or confirming a real-world result. real_world_outcome requires outcome_verified evidence and outcomeExpectedBehavior."),
   outcomeExpectedBehavior: z.string().trim().min(1).max(8_000).optional().describe("Required when outcomeEvidence is outcome_verified; the exact user-visible behavior an authenticated external reviewer must observe."),
   outcomeEvidence: z.enum(["implementation_verified", "integration_verified", "outcome_verified", "operationally_stable"]).optional().describe("Minimum independent evidence strength required for mission completion. Defaults to implementation_verified for lightweight missions; outcome_verified requires an explicit outcome oracle beyond internal checks."),
   autonomyMode: z.enum(["manual", "verify_only", "correction_auto", "full"]).optional(),
@@ -178,6 +179,15 @@ export const supervisedMissionOptionsSchema = z.object({
       path: ["outcomeExpectedBehavior"],
       message: "outcomeEvidence outcome_verified requires the exact user-visible behavior an authenticated external reviewer must confirm.",
     });
+  }
+  if (data.completionClaim === "real_world_outcome"
+    && data.outcomeEvidence !== undefined
+    && data.outcomeEvidence !== "outcome_verified"
+    && data.outcomeEvidence !== "operationally_stable") {
+    ctx.addIssue({ code: "custom", path: ["outcomeEvidence"], message: "completionClaim real_world_outcome requires outcomeEvidence outcome_verified or stronger." });
+  }
+  if (data.completionClaim === "real_world_outcome" && !data.outcomeExpectedBehavior?.trim()) {
+    ctx.addIssue({ code: "custom", path: ["outcomeExpectedBehavior"], message: "completionClaim real_world_outcome requires the exact user-visible behavior an authenticated external reviewer must confirm." });
   }
 });
 export const findingSchema = z.object({

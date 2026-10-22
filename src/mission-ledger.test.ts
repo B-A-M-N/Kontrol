@@ -164,6 +164,34 @@ try {
     acceptanceCriteria: [{ id: "crit-tests", description: "Regression tests pass", priority: "required", verificationType: "test", verificationCommand: "npm test" }],
   }), /Mission contract conflict/, "different mission intent cannot be silently ignored");
 
+  const outcomeClaimSession = workSessions.create({ workspaceSessionId: "workspace-1", submittedBy: "webui" });
+  const outcomeClaim = ledger.createMission({
+    workSessionId: outcomeClaimSession.id,
+    workspaceSessionId: "workspace-1",
+    objective: "Confirm the feature is usable by customers",
+    completionClaim: "real_world_outcome",
+    outcomeExpectedBehavior: "Customers can complete checkout after reload.",
+    acceptanceCriteria: [{ id: "outcome-claim-criterion", description: "The feature is delivered", verificationType: "manual_review" }],
+  });
+  assert.equal(outcomeClaim.outcomeEvidence, "outcome_verified", "real-world claims default to an external outcome gate instead of implementation-only approval");
+  assert.equal(ledger.createMission({
+    workSessionId: outcomeClaimSession.id,
+    workspaceSessionId: "workspace-1",
+    objective: "Confirm the feature is usable by customers",
+    outcomeEvidence: "outcome_verified",
+    outcomeExpectedBehavior: "Customers can complete checkout after reload.",
+    acceptanceCriteria: [{ id: "outcome-claim-criterion", description: "The feature is delivered", verificationType: "manual_review" }],
+  }).id, outcomeClaim.id, "explicit claim and its normalized evidence level have the same contract identity");
+  assert.throws(() => ledger.createMission({
+    workSessionId: outcomeClaimSession.id,
+    workspaceSessionId: "workspace-1",
+    objective: "Confirm the feature is usable by customers",
+    completionClaim: "real_world_outcome",
+    outcomeEvidence: "implementation_verified",
+    outcomeExpectedBehavior: "Customers can complete checkout after reload.",
+    acceptanceCriteria: [{ id: "outcome-claim-criterion", description: "The feature is delivered", verificationType: "manual_review" }],
+  }), /requires outcomeEvidence outcome_verified/, "a real-world claim cannot be weakened to implementation-only evidence");
+
   const firstSubmission = workSessions.submitForReview({
     workSessionId: session.id,
     diff: "diff --git a/src/bridge.ts b/src/bridge.ts",
@@ -868,6 +896,7 @@ try {
     const ovSub = workSessions.submitForReview({ workSessionId: ovs.id, diff: "A", snapshotKind: "git", snapshotRef: "ov-a", snapshotCommit: "ov-a" });
     const ovCtx = { submissionId: ovSub.id, snapshotKind: "git" as const, snapshotRef: "ov-a", snapshotCommit: "ov-a", reviewEpoch: ovSub.reviewEpoch };
     ledger.recordReviewerEvidence(ovm.id, [{ criterionId: "ov-crit", ...ovCtx, status: "passed" as const }]);
+    ledger.recordCompletionReport(ovm.id, { submissionId: ovSub.id, snapshotKind: "git", snapshotRef: "ov-a", status: "passed", results: [{ status: "passed" }] });
     // No observations yet → denied.
     const noObs = ledger.canApprove(ovs.id, ovCtx);
     assert.equal(noObs.allowed, false, "outcome_verified without observations is denied");
@@ -886,12 +915,12 @@ try {
     const rejected = ledger.canApprove(ovs.id, ovCtx);
     assert.equal(rejected.allowed, false, "rejected observation blocks approval");
     assert.match(rejected.reasons.join("\n"), /rejected the expected behavior/, "denial cites the rejection");
-    // A rejection is authoritative: a later confirmation does NOT silently
-    // undo it. The reviewer must supersede with a new submission or an
-    // explicit second-round review, not just add a confirm record.
+    // The latest authenticated observation for this exact contract controls.
     ledger.recordOutcomeObservation(ovm.id, { ...ovCtx, observerPrincipalId: "reviewer-bob", evidenceBasis: "firsthand_external_observation", externalEvidence: "Observed the UI after reload; the fix was visible.", actualBehavior: "fix visible after reload", status: "confirmed" });
     const confirmedAfterRejection = ledger.canApprove(ovs.id, ovCtx);
-    assert.equal(confirmedAfterRejection.allowed, false, "a rejection is authoritative even after a later confirmation");
+    assert.equal(confirmedAfterRejection.allowed, true, `a later confirmation supersedes an older rejection: ${confirmedAfterRejection.reasons.join("; ")}`);
+    ledger.recordOutcomeObservation(ovm.id, { ...ovCtx, observerPrincipalId: "reviewer-carol", evidenceBasis: "firsthand_external_observation", externalEvidence: "A later reload no longer showed the fix.", actualBehavior: "fix not visible after reload", status: "rejected" });
+    assert.equal(ledger.canApprove(ovs.id, ovCtx).allowed, false, "a later rejection supersedes the earlier confirmation");
   }
 
   workSessions.close();

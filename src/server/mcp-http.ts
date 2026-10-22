@@ -30,6 +30,7 @@ import {
 } from "./mcp-session-state.js";
 import type { McpSessionLifecycle } from "./mcp-session-lifecycle.js";
 import type { ExpiredMcpOperationTracker } from "./mcp-expired-operations.js";
+import { sendCatalogRefreshNotification } from "./catalog-refresh.js";
 import type { McpOperationDiagnostics } from "./mcp-operation-diagnostics.js";
 import type { McpQualificationEvidenceJournal } from "./mcp-qualification-evidence.js";
 import type { McpPolicyWaiterRegistry } from "./policy-waiters.js";
@@ -134,7 +135,7 @@ export interface McpHttpDeps {
   reviewThreads?: import("../review-thread/thread-store.js").ReviewThreadStore;
 }
 
-type CatalogRefreshPhase = "initialized" | "get_stream";
+type CatalogRefreshPhase = "initialized" | "get_stream" | "request_retry";
 
 function requestAdmissionTimeout(state: McpSessionState | undefined, config: ServerConfig): number {
   return state?.durableWorkerSession ? config.mcpAdmissionTimeoutMs : config.mcpInteractiveAdmissionTimeoutMs;
@@ -152,6 +153,8 @@ function catalogRefreshStats(state: McpSessionState) {
     resourceListRefreshSuccesses: 0,
     toolListRefreshFailures: 0,
     resourceListRefreshFailures: 0,
+    toolListRefreshInFlight: false,
+    resourceListRefreshInFlight: false,
   };
 }
 
@@ -165,10 +168,8 @@ async function sendCatalogRefreshPulse(
   if (!state || !server || state.closing || state.closed) return;
   const refresh = catalogRefreshStats(state);
   if (phase === "initialized") {
-    if (refresh.initializedPulseAttempted) return;
     refresh.initializedPulseAttempted = true;
-  } else {
-    if (refresh.getStreamPulseAttempted) return;
+  } else if (phase === "get_stream") {
     refresh.getStreamPulseAttempted = true;
   }
   refresh.lastAttemptAt = new Date().toISOString();
@@ -177,24 +178,7 @@ async function sendCatalogRefreshPulse(
     method: "tools" | "resources",
     send: () => Promise<void>,
   ): Promise<void> => {
-    const attemptsKey = method === "tools" ? "toolListRefreshAttempts" : "resourceListRefreshAttempts";
-    const successesKey = method === "tools" ? "toolListRefreshSuccesses" : "resourceListRefreshSuccesses";
-    const failuresKey = method === "tools" ? "toolListRefreshFailures" : "resourceListRefreshFailures";
-    const sentKey = method === "tools" ? "toolListRefreshSent" : "resourceListRefreshSent";
-    refresh[attemptsKey] += 1;
-    let timer: NodeJS.Timeout | undefined;
-    try {
-      await Promise.race([
-        send(),
-        new Promise<never>((_, reject) => {
-          timer = setTimeout(() => reject(new Error("list-changed notification send deadline exceeded")), 1_500);
-          timer.unref?.();
-        }),
-      ]);
-      refresh[successesKey] += 1;
-      refresh[sentKey] = true;
-    } catch (error) {
-      refresh[failuresKey] += 1;
+    await sendCatalogRefreshNotification(refresh, method, send, (error) => {
       logEvent(deps.config.logging, "warn", "mcp_catalog_refresh_failed", {
         sessionIdPrefix: sessionIdPrefix(sessionId),
         phase,
@@ -202,9 +186,7 @@ async function sendCatalogRefreshPulse(
         surfaceVersion: state.toolSurfaceVersion,
         error: error instanceof Error ? error.message : String(error),
       });
-    } finally {
-      if (timer) clearTimeout(timer);
-    }
+    });
   };
 
   await Promise.all([
@@ -606,6 +588,13 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
       const finishedAt = performance.now();
       recordPhaseTiming("mcp.response", finishedAt - requestStartedAt);
       if (handlerStartedAt > 0) recordPhaseTiming("mcp.serialization", finishedAt - handlerStartedAt);
+      // A completed tools/list response is a later, useful retry opportunity:
+      // the transport is demonstrably carrying a response, and a failed
+      // initialize/stream notification can be retried without duplicating a
+      // channel that already accepted its change pulse.
+      if (req.method === "POST" && requestRpcMethod === "tools/list" && sessionId) {
+        void sendCatalogRefreshPulse(deps, sessionId, "request_retry");
+      }
       if (req.method === "DELETE" && sessionId) {
         deps.recordMcpConnectionEvent?.({ kind: "explicit_delete", sessionId, requestKind: "delete" });
         const state = mcpSessions.get(sessionId);

@@ -117,7 +117,7 @@ export function registerMissionTools(server: McpServer, config: BridgeConfig): v
       annotations: { readOnlyHint: false },
     },
     config,
-    async ({ workspaceSessionId, objective, desiredOutcome, constraints, nonGoals, acceptanceCriteria, supervisorInstructions, maxCorrectionRounds, maxWallTimeMinutes, finalVerification, reviewCoverage, outcomeEvidence, outcomeExpectedBehavior, autonomyMode, approvalMode, workOrder, agentName }: any) => {
+    async ({ workspaceSessionId, objective, desiredOutcome, constraints, nonGoals, acceptanceCriteria, supervisorInstructions, maxCorrectionRounds, maxWallTimeMinutes, finalVerification, reviewCoverage, completionClaim, outcomeEvidence, outcomeExpectedBehavior, autonomyMode, approvalMode, workOrder, agentName }: any) => {
       if (!isReviewer(config.principalRole)) return forbidden(config.principalRole, "begin_supervised_work");
       if (!config.missionLedger) return { content: [{ type: "text" as const, text: "Mission ledger unavailable." }], isError: true };
       const requiredCount = (acceptanceCriteria ?? []).filter((c: any) => (c.priority ?? "required") === "required").length;
@@ -174,6 +174,7 @@ export function registerMissionTools(server: McpServer, config: BridgeConfig): v
           maxCorrectionRounds,
           finalVerification,
           reviewCoverage,
+          completionClaim,
           outcomeEvidence,
           outcomeExpectedBehavior,
           ...baseline,

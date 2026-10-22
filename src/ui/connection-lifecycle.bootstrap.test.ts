@@ -109,4 +109,20 @@ assert.equal(remainsFailed.connected, false);
 assert.equal(remainsFailed.state, "DISCONNECTED");
 assert.equal(remainsFailed.connectionError, "bootstrap failed 2");
 
+let delayedHostAvailable = false;
+let delayedHostAttempts = 0;
+const delayedHost = makeHost(async () => {
+  delayedHostAttempts += 1;
+  if (!delayedHostAvailable) throw new Error("host is not attached yet");
+});
+setLifecycleHost(delayedHost.host);
+await assert.rejects(connectBootstrapWithRetry(), /host is not attached yet/);
+assert.equal(delayedHost.connected, false, "exhausted bootstrap remains in a recoverable disconnected state");
+delayedHostAvailable = true;
+await reconnectApp(new Error("user requested reconnect after host became available"));
+assert.equal(delayedHost.connected, true, "explicit reconnect recovers after the host becomes available later");
+assert.equal(delayedHost.state, "CONNECTED");
+assert.equal(delayedHost.rehydrationCount, 1, "recovery queues authoritative server-state hydration");
+assert.equal(delayedHostAttempts, 3, "later host recovery uses a fresh connection attempt");
+
 console.log("connection-lifecycle.bootstrap.test.ts: bounded bootstrap retry assertions passed");

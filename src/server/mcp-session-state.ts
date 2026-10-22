@@ -84,6 +84,10 @@ export interface McpSessionState {
     resourceListRefreshSuccesses: number;
     toolListRefreshFailures: number;
     resourceListRefreshFailures: number;
+    toolListRefreshLastAttemptMs?: number;
+    resourceListRefreshLastAttemptMs?: number;
+    toolListRefreshInFlight: boolean;
+    resourceListRefreshInFlight: boolean;
     lastAttemptAt?: string;
   };
   /** Durable reason for the last transport termination decision. */

@@ -195,6 +195,13 @@ Current implementation contracts:
   owned by `src/mission/` authority modules. `src/mission-ledger.ts` persists
   records and assembles packets; callers must consume its effective projections
   rather than infer completion from stored status fields.
+- Supervised mission callers may declare `completionClaim: implementation` or
+  `completionClaim: real_world_outcome`. Implementation remains the ordinary
+  default. A real-world claim requires exact expected behavior and is normalized
+  to `outcome_verified`; it cannot complete from implementation evidence alone.
+- MCP catalog-change notifications retry only failed tool/resource channels on
+  later eligible opportunities, with bounded attempts and backoff. A successful
+  channel is never resent for the same session refresh state.
 - Both supervised public entry paths use the same mission contract and
   reviewer-gated completion policy. Correction rounds are separate from the
   supervisor emergency cycle ceiling. Baseline capture is required before a

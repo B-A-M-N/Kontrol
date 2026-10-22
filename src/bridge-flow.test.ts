@@ -31,6 +31,14 @@ assert.equal(supervisedMissionOptionsSchema.safeParse({ outcomeEvidence: "outcom
 assert.equal(supervisedMissionOptionsSchema.safeParse({
   outcomeEvidence: "outcome_verified", outcomeExpectedBehavior: "The reviewer can see the saved change after reload.",
 }).success, true, "the MCP mission contract exposes the declared expected behavior used by the reviewer observation tool");
+assert.equal(supervisedMissionOptionsSchema.safeParse({ completionClaim: "real_world_outcome" }).success, false,
+  "real-world completion claims require an explicit observable behavior");
+assert.equal(supervisedMissionOptionsSchema.safeParse({
+  completionClaim: "real_world_outcome", outcomeEvidence: "implementation_verified", outcomeExpectedBehavior: "The change is visible to users.",
+}).success, false, "real-world completion cannot use implementation-only evidence");
+assert.equal(supervisedMissionOptionsSchema.safeParse({
+  completionClaim: "real_world_outcome", outcomeExpectedBehavior: "The change is visible to users.",
+}).success, true, "real-world completion may derive outcome_verified from its explicit claim");
 
 const root = await mkdtemp(join(tmpdir(), "kontrol-bridge-flow-"));
 const VERIFY_WS = "ws-verification-test";
