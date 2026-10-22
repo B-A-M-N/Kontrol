@@ -327,6 +327,30 @@ Current implementation contracts:
   bounded SSE comment heartbeats every 15 seconds by default with proxy
   buffering disabled. Operation diagnostics count `heartbeatBytes` separately
   from JSON-RPC `responseBytes`.
+- SSE responses track writer stalls and terminate only the affected response
+  after `KONTROL_MCP_SSE_MAX_STALL_MS` (30 seconds by default). A stalled
+  response does not close the MCP transport or change the authoritative state
+  of its unfinished operation; stall timeout, recovery, and stream abort have
+  distinct diagnostics.
+- Workspace App reconnects are limited to classified transport, expired-session,
+  and transient-availability failures. Tool, protocol, and authorization errors
+  do not invalidate a healthy App transport. Mutations with an ambiguous
+  outcome are reconciled and never blindly replayed; stale App generations
+  cannot initiate a second reconnect.
+- The stdio bridge retains its downstream MCP server during upstream
+  interruptions and rebuilds a fresh upstream session through a bounded,
+  single-flight reconnect lifecycle. It preserves worker attribution headers,
+  fences callbacks by connection generation, and never replays an operation
+  whose outcome is unknown.
+- An MCP handler that outlives its HTTP response deadline retains its admission
+  ownership until it actually settles. Cancellation moves through
+  `CANCELLING` to visible `STUCK` state after
+  `KONTROL_MCP_OPERATION_CANCEL_GRACE_MS`; diagnostics expose stuck age and
+  admission weight. Shutdown stops new admission and waits up to
+  `KONTROL_MCP_SHUTDOWN_DRAIN_MS`; if an execution remains active, its transport,
+  stores, and runtime ownership remain fenced for a later drain retry. Once
+  executions quiesce, passive MCP watchers may be woken by closing their
+  transports before dependent stores are closed.
 - `read` returns content and the SHA-256 version of the complete file bytes
   from the same byte observation, including when returning a partial line
   range. `write` and `edit` accept an optional `expectedContentSha256`, while Codex
@@ -477,6 +501,10 @@ Current implementation contracts:
   should correlate a browser HAR, Kontrol diagnostics/logs, and tunnel delivery
   logs with `scripts/analyze-mcp-stream-failure.mjs`, which keeps exact-ID
   matches separate from timestamp proximity.
+- Authenticated MCP connection diagnostics expose a bounded lifecycle timeline
+  with request/operation IDs, generation, session prefix, outcome class, and
+  timing only. It excludes request bodies, tool arguments, and credentials;
+  local response-write evidence does not prove host delivery or acceptance.
 - External MCP qualification persists accepted/rejected catalog acknowledgements
   and completed `await_workspace_events` POST SSE observations in SQLite.
   Records contain content hashes, immutable build/version, full session SHA-256,

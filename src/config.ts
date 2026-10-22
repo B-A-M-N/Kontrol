@@ -127,6 +127,9 @@ export interface ServerConfig {
   mcpSessionReclaimGraceMs: number;
   /** Interval for standalone MCP SSE keep-alive comments. */
   mcpSseHeartbeatMs: number;
+  mcpSseMaxStallMs: number;
+  mcpShutdownDrainMs: number;
+  mcpOperationCancelGraceMs: number;
   /** Maximum execution time for ordinary, non-waiter MCP requests. */
   mcpExecutionTimeoutMs: number;
   /** Periodic maintenance scheduling and wall-clock budget. */
@@ -649,6 +652,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     mcpMaxResourceReadsPerClient: parsePositiveInteger(env.KONTROL_MCP_MAX_RESOURCE_READS_PER_CLIENT, 1, "KONTROL_MCP_MAX_RESOURCE_READS_PER_CLIENT"),
     mcpMaxResourceReadQueue: parsePositiveInteger(env.KONTROL_MCP_MAX_RESOURCE_READ_QUEUE, 16, "KONTROL_MCP_MAX_RESOURCE_READ_QUEUE"),
     mcpSseHeartbeatMs: parsePositiveInteger(env.KONTROL_MCP_SSE_HEARTBEAT_MS, 15_000, "KONTROL_MCP_SSE_HEARTBEAT_MS"),
+    mcpSseMaxStallMs: parsePositiveInteger(env.KONTROL_MCP_SSE_MAX_STALL_MS, 30_000, "KONTROL_MCP_SSE_MAX_STALL_MS"),
+    mcpShutdownDrainMs: parsePositiveInteger(env.KONTROL_MCP_SHUTDOWN_DRAIN_MS, 30_000, "KONTROL_MCP_SHUTDOWN_DRAIN_MS"),
+    mcpOperationCancelGraceMs: parsePositiveInteger(env.KONTROL_MCP_OPERATION_CANCEL_GRACE_MS, 5_000, "KONTROL_MCP_OPERATION_CANCEL_GRACE_MS"),
     mcpSessionReclaimGraceMs: parsePositiveInteger(env.KONTROL_MCP_SESSION_RECLAIM_GRACE_MS, 5 * 60_000, "KONTROL_MCP_SESSION_RECLAIM_GRACE_MS"),
     mcpAdmissionTimeoutMs: parsePositiveInteger(
       env.KONTROL_MCP_ADMISSION_TIMEOUT_MS ?? env.KONTROL_MCP_REQUEST_DEADLINE_MS,

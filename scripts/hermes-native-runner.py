@@ -17,6 +17,8 @@ import threading
 import uuid
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 
 def emit(payload: dict) -> None:
     print(json.dumps(payload, separators=(",", ":")), flush=True)
@@ -147,93 +149,26 @@ async def main() -> int:
 
             # Initialize MCP session and call open_workspace + staged_file_write.
             try:
-                import urllib.request
-                import urllib.error
+                from lib.mcp_http_session import McpHttpSession
 
-                headers = {
-                    "Content-Type": "application/json",
-                    "Accept": "application/json, text/event-stream",
+                mcp_session = McpHttpSession(mcp_url, {
                     "X-Kontrol-Worker-Token": worker_token,
-                }
-                mcp_session_id = None
-                rpc_id = 0
-
-                def parse_rpc_payload(raw: str, content_type: str) -> dict | None:
-                    if "text/event-stream" not in content_type:
-                        return json.loads(raw) if raw.strip() else None
-                    message: dict | None = None
-                    for raw_line in raw.splitlines():
-                        if not raw_line.startswith("data:"):
-                            continue
-                        value = raw_line[5:].strip()
-                        if not value:
-                            continue
-                        parsed = json.loads(value)
-                        if "method" in parsed and "id" not in parsed:
-                            continue
-                        message = parsed
-                    return message
-
-                def mcp_rpc(method: str, params: dict | None = None, notification: bool = False) -> dict | None:
-                    nonlocal mcp_session_id, rpc_id
-                    body: dict = {"jsonrpc": "2.0", "method": method}
-                    if notification:
-                        body["params"] = params or {}
-                    else:
-                        rpc_id += 1
-                        body["id"] = rpc_id
-                        body["params"] = params
-                    req_headers = dict(headers)
-                    if mcp_session_id:
-                        req_headers["Mcp-Session-Id"] = mcp_session_id
-                    req = urllib.request.Request(
-                        mcp_url,
-                        data=json.dumps(body).encode("utf-8"),
-                        headers=req_headers,
-                        method="POST",
-                    )
-                    try:
-                        with urllib.request.urlopen(req, timeout=30) as resp:
-                            content_type = resp.headers.get("Content-Type", "")
-                            raw = resp.read().decode("utf-8")
-                            session_id = resp.headers.get("Mcp-Session-Id")
-                            if session_id:
-                                mcp_session_id = session_id
-                            if notification:
-                                if resp.status not in (200, 202, 204):
-                                    raise RuntimeError(f"MCP {method} failed: HTTP {resp.status}")
-                                return None
-                            result = parse_rpc_payload(raw, content_type)
-                    except urllib.error.HTTPError as exc:
-                        detail = exc.read().decode("utf-8", errors="replace")
-                        raise RuntimeError(f"MCP {method} failed: HTTP {exc.code}: {detail}") from exc
-                    if not result:
-                        raise RuntimeError(f"MCP {method} returned no JSON-RPC response")
-                    if result.get("error"):
-                        raise RuntimeError(f"MCP error: {result['error']}")
-                    return result.get("result", {})
-
-                # Initialize
-                mcp_rpc("initialize", {
-                    "protocolVersion": "2025-06-18",
-                    "capabilities": {},
-                    "clientInfo": {"name": "kontrol-hermes-runner", "version": "1.0.0"},
                 })
-                mcp_rpc("notifications/initialized", {}, notification=True)
+                mcp_session.initialize()
 
                 # Reuse the signed workspace identity; /workspace is only the
                 # sandbox alias and is not a registered host workspace path.
                 workspace_id = workspace_session_id
 
                 # Staged file write
-                write_result = mcp_rpc("tools/call", {
+                write_result = mcp_session.rpc("tools/call", {
                     "name": "staged_file_write",
                     "arguments": {
                         "workspaceId": workspace_id,
                         "path": path,
                         "content": content,
                     },
-                })
+                }, retry_safe=False)
                 write_sc = write_result.get("structuredContent") or {}
                 if write_result.get("isError"):
                     text = "\n".join(

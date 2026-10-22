@@ -32,6 +32,7 @@ const state: McpSessionState = {
   resourceReadCount: 0,
   activeLongPollCount: 0,
   activeSseStreams: 1,
+  transportAttached: true,
   activePolicyWaiters: 0,
   closing: false,
   closed: false,

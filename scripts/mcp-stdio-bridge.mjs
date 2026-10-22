@@ -30,6 +30,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { McpUpstreamConnection } from "./lib/mcp-upstream-connection.mjs";
 import {
   InitializeRequestSchema,
   ListToolsRequestSchema,
@@ -124,16 +125,22 @@ if (process.env.KONTROL_WORKER_TOKEN) {
   headers["X-Kontrol-Worker-Token"] = process.env.KONTROL_WORKER_TOKEN;
 }
 
-// 1) HTTP MCP client -> Kontrol. Establishes the session + sends
-//    notifications/initialized at connect() time.
-const client = new Client(
-  { name: "kontrol-stdio-bridge", version: "1.0.0" },
-  { capabilities: {} },
-);
-const httpTransport = new StreamableHTTPClientTransport(new URL(KONTROL_URL), {
-  requestInit: { headers },
+// The manager replaces the HTTP client/transport as needed. Auth and worker
+// attribution headers are captured above and applied to every new generation.
+const upstream = new McpUpstreamConnection({
+  createClient: () => ({
+    client: new Client({ name: "kontrol-stdio-bridge", version: "1.0.0" }, { capabilities: {} }),
+    transport: new StreamableHTTPClientTransport(new URL(KONTROL_URL), { requestInit: { headers } }),
+  }),
+  onState: (state, generation) => console.error(`[mcp-stdio-bridge] upstream=${state} generation=${generation}`),
 });
-await client.connect(httpTransport);
+const activeUpstreamOperations = new Set();
+function withUpstreamOperation(operation) {
+  const promise = Promise.resolve().then(() => operation(upstream.requireClient()));
+  activeUpstreamOperations.add(promise);
+  void promise.finally(() => activeUpstreamOperations.delete(promise)).catch(() => undefined);
+  return promise;
+}
 
 // 2) stdio MCP server -> the agent (CRUSH / MiMo).
 const server = new Server(
@@ -155,7 +162,7 @@ function rejection(name) {
 }
 
 server.setRequestHandler(ListToolsRequestSchema, async () => {
-  const all = await client.listTools();
+  const all = await withUpstreamOperation((client) => client.listTools());
   const filtered = {
     ...all,
     tools: (all.tools ?? []).filter((t) => WORKER_TOOLS.has(t.name)),
@@ -168,18 +175,47 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
   if (!WORKER_TOOLS.has(name) || REVIEWER_TOOLS.has(name)) {
     return rejection(name);
   }
-  return client.callTool({ name, arguments: req.params.arguments ?? {} });
+  try {
+    return await withUpstreamOperation((client) => client.callTool({ name, arguments: req.params.arguments ?? {} }));
+  } catch (error) {
+    return {
+      content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }],
+      isError: true,
+    };
+  }
 });
 
-server.setRequestHandler(ListResourcesRequestSchema, async () => client.listResources());
-server.setRequestHandler(ReadResourceRequestSchema, async (req) =>
-  client.readResource({ uri: req.params.uri }),
-);
+server.setRequestHandler(ListResourcesRequestSchema, async () => withUpstreamOperation((client) => client.listResources()));
+server.setRequestHandler(ReadResourceRequestSchema, async (req) => withUpstreamOperation((client) => client.readResource({ uri: req.params.uri })));
 server.setRequestHandler(PingRequestSchema, async () => ({}));
 
 const stdio = new StdioServerTransport();
 await server.connect(stdio);
 
-// Keep the process alive; exit cleanly if either side drops.
-client.onclose = () => process.exit(0);
-server.onclose = () => process.exit(0);
+let stopping = false;
+let shutdownPromise;
+function shutdown(reason) {
+  if (shutdownPromise) return shutdownPromise;
+  stopping = true;
+  console.error(`[mcp-stdio-bridge] stopping reason=${reason}`);
+  shutdownPromise = (async () => {
+    try { await server.close(); } catch { /* downstream already closed */ }
+    let drainTimer;
+    try {
+      await Promise.race([
+        Promise.allSettled([...activeUpstreamOperations]),
+        new Promise((resolve) => { drainTimer = setTimeout(resolve, 5_000); }),
+      ]);
+    } finally {
+      if (drainTimer) clearTimeout(drainTimer);
+    }
+    await upstream.close();
+    process.exitCode = 0;
+  })();
+  return shutdownPromise;
+}
+server.onclose = () => { void shutdown("downstream_closed"); };
+process.stdin.on("end", () => { void shutdown("stdin_eof"); });
+process.once("SIGTERM", () => { void shutdown("sigterm"); });
+process.once("SIGINT", () => { void shutdown("sigint"); });
+void upstream.start();

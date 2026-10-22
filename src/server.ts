@@ -47,7 +47,7 @@ import { FilesystemSnapshotStore } from "./filesystem-snapshot-store.js";
 import { createMaintenanceCoordinator } from "./runtime/maintenance.js";
 import { createDatabaseIntegrityMonitor } from "./runtime/database-integrity.js";
 import { createStartupReconciliation } from "./server/startup-recovery.js";
-import { createShutdownController } from "./server/shutdown.js";
+import { createShutdownController, McpDrainIncompleteError } from "./server/shutdown.js";
 import { createAcpRuntime } from "./server/acp-runtime.js";
 import {
   constantTimeStringEqual,
@@ -277,7 +277,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     config.mcpMaxResourceReadQueue,
     config.mcpMaxQueuePerSession,
   );
-  const expiredMcpOperations = new ExpiredMcpOperationTracker();
+  const expiredMcpOperations = new ExpiredMcpOperationTracker(64, config.mcpOperationCancelGraceMs);
   const operationDiagnostics = new McpOperationDiagnostics();
   const workspaceAppResourceMetrics: WorkspaceAppResourceMetrics = {
     currentHashed: 0,
@@ -607,9 +607,23 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     events: {} as Record<string, number>,
     byGeneration: {} as Record<string, Record<string, number>>,
     byTransport: {} as Record<string, Record<string, number>>,
+    timeline: [] as Array<Record<string, unknown>>,
   };
-  const recordMcpConnectionEvent = (event: { kind: string; sessionId?: string; requestKind?: string; durationMs?: number }): void => {
+  const recordMcpConnectionEvent = (event: { kind: string; sessionId?: string; requestId?: string; operationId?: string; requestKind?: string; toolName?: string; failureClass?: string; durationMs?: number }): void => {
     const kind = event.kind;
+    mcpConnectionMetrics.timeline.push({
+      at: new Date().toISOString(),
+      kind,
+      generationId: config.launchGenerationId || "unknown-generation",
+      ...(event.sessionId ? { sessionIdPrefix: sessionIdPrefix(event.sessionId) } : {}),
+      ...(event.requestId ? { requestId: event.requestId } : {}),
+      ...(event.operationId ? { operationId: event.operationId } : {}),
+      ...(event.requestKind ? { requestKind: event.requestKind } : {}),
+      ...(event.toolName ? { toolName: event.toolName } : {}),
+      ...(event.failureClass ? { failureClass: event.failureClass } : {}),
+      ...(event.durationMs !== undefined ? { durationMs: Math.max(0, event.durationMs) } : {}),
+    });
+    if (mcpConnectionMetrics.timeline.length > 500) mcpConnectionMetrics.timeline.splice(0, mcpConnectionMetrics.timeline.length - 500);
     mcpConnectionMetrics.events[kind] = (mcpConnectionMetrics.events[kind] ?? 0) + 1;
     const generation = config.launchGenerationId || "unknown-generation";
     const transport = event.sessionId ? (sessionIdPrefix(event.sessionId) ?? "sessionless") : "sessionless";
@@ -1029,6 +1043,16 @@ export async function runServer(config = loadConfig()): Promise<void> {
       process.exit(0);
     } catch (error) {
       console.error(`kontrol graceful shutdown failed: ${error instanceof Error ? error.message : String(error)}`);
+      if (error instanceof McpDrainIncompleteError) {
+        // Leave the generation, transports, and SQLite alive while the
+        // authoritative handlers still own admission. A later signal can
+        // retry the drain after they settle; emergency process termination
+        // remains the supervisor's bounded stop policy.
+        shutdownStarted = false;
+        process.once("SIGINT", shutdown);
+        process.once("SIGTERM", shutdown);
+        return;
+      }
       await close();
       if (runtimeIdentityWritten) removeRuntimeIdentity(config.stateDir, runtimeIdentity.instanceId);
       if (ownsRuntimeLock) await releaseRuntimeLock(runtimeLock);

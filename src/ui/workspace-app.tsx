@@ -101,6 +101,7 @@ import {
 } from "./payload-mount.js";
 import {
   connectBootstrapWithRetry,
+  connectWithRetry,
   advanceAppInstanceGeneration,
   bindAppInstanceCallback,
   cancelReconnect,
@@ -168,6 +169,7 @@ import {
   getStructuredContent,
   setServerToolHost,
 } from "./server-tool-call.js";
+import { classifyMcpFailure, isMcpReconnectFailure } from "./mcp-failure.js";
 
 // ── Work-session view model ───────────────────────────
 // A run is a long-lived workflow, not a succession of unrelated single cards.
@@ -669,14 +671,30 @@ function reportBootstrapFailure(error: unknown): void {
   connectionError = formatBootstrapDiagnostic(bootstrapStage, error);
   errorMessage = connectionError;
   renderConnectionError(connectionError);
+  if (app) {
+    // Keep a bounded recovery window after bootstrap's initial attempts. If
+    // the host has removed the channel, onteardown clears `app` and cancels it.
+    void connectWithRetry(error).catch((retryError) => {
+      if (!app) return;
+      connectionError = formatBootstrapDiagnostic("host-transport", retryError);
+      connectionState = "DISCONNECTED";
+      connected = false;
+      renderConnectionError(connectionError);
+    });
+  }
 }
 
 function installAppErrorHandler(target: App): void {
   // The ext-apps runtime exposes this callback, while the checked-in SDK
   // declaration currently omits it. Keep the narrow cast local to the bridge.
   (target as App & { onerror?: (error: unknown) => void }).onerror = bindAppInstanceCallback((error) => {
+    const failure = classifyMcpFailure(error);
     const message = formatBootstrapDiagnostic(connected ? "host-transport" : bootstrapStage, error);
     connectionError = message;
+    if (!isMcpReconnectFailure(failure)) {
+      render();
+      return;
+    }
     if (!connected) {
       connectionState = "DISCONNECTED";
       errorMessage = message;
@@ -685,7 +703,7 @@ function installAppErrorHandler(target: App): void {
     }
     connectionState = "DEGRADED";
     render();
-    void reconnectApp(error).catch(() => undefined);
+    void reconnectApp({ failure, cause: error }).catch(() => undefined);
   });
 }
 

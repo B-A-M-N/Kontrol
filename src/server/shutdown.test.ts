@@ -42,3 +42,54 @@ assert.ok(events.indexOf("browser-close") < events.indexOf("database-close"), "d
 assert.equal(events.at(-1), "database-close", "database is the final shutdown resource");
 
 console.log("server/shutdown.test.ts: browser drain ordering assertions passed");
+
+const guardedEvents: string[] = [];
+let activeRequests = 1;
+const guarded = createShutdownController({
+  config: { mcpShutdownDrainMs: 15 } as any,
+  db: { close: () => guardedEvents.push("database-close") } as any,
+  transports: new Map([["session", { close: async () => { guardedEvents.push("transport-close"); } }]]) as any,
+  mcpServers: new Map(), mcpSessions: new Map(),
+  sessionLifecycle: { recordMcpSessionEnd() {}, reaper: timer, memorySampler: timer } as any,
+  mcpAdmission: { close() {}, getStats: () => ({ active: activeRequests, activeWeight: 3 }) } as any,
+  mcpWaiterAdmission: { close() {}, getStats: () => ({ active: 0, activeWeight: 0 }) } as any,
+  mcpResourceAdmission: { close() {}, getStats: () => ({ active: 0, activeWeight: 0 }) } as any,
+  startupReconciliation: { stop() {} }, maintenance: { stop() {} },
+  reviewCheckpoints: { drain: async () => undefined }, supervisorRuns: { close() {} },
+  dispatcher: undefined, supervisorRuntime: undefined, replyDispatcher: undefined, scheduledJobRuntime: undefined,
+  mcpSessionChurnTimer: timer, shuttingDown: { value: false }, oauthProvider: null,
+  workspaceStore: {}, workSessions: {}, agentRegistry: { close() {} }, eventStore: { close() {} },
+  continuationManager: { close() {} }, dispatchOutbox: { close() {} }, processSessions: { shutdown: async () => undefined },
+  shutdownMissionVerifiers: async () => undefined, integrity: { stop: async () => undefined },
+} as any);
+await assert.rejects(guarded.drain(), /MCP drain remains fenced/);
+assert.equal(guardedEvents.length, 0, "a stuck handler keeps its transport and database open after the bounded drain window");
+activeRequests = 0;
+await guarded.drain();
+assert.ok(guardedEvents.includes("transport-close"));
+assert.ok(guardedEvents.includes("database-close"));
+
+const passiveEvents: string[] = [];
+let activeWaiters = 1;
+const passive = createShutdownController({
+  config: { mcpShutdownDrainMs: 100 } as any,
+  db: { close: () => passiveEvents.push("database-close") } as any,
+  transports: new Map([[
+    "session",
+    { close: async () => { passiveEvents.push("transport-close"); activeWaiters = 0; } },
+  ]]) as any,
+  mcpServers: new Map(), mcpSessions: new Map(),
+  sessionLifecycle: { recordMcpSessionEnd() {}, reaper: timer, memorySampler: timer } as any,
+  mcpAdmission: { close() {}, getStats: () => ({ active: 0, activeWeight: 0 }) } as any,
+  mcpWaiterAdmission: { close() {}, getStats: () => ({ active: activeWaiters, activeWeight: activeWaiters }) } as any,
+  mcpResourceAdmission: { close() {}, getStats: () => ({ active: 0, activeWeight: 0 }) } as any,
+  startupReconciliation: { stop() {} }, maintenance: { stop() {} },
+  reviewCheckpoints: { drain: async () => undefined }, supervisorRuns: { close() {} },
+  dispatcher: undefined, supervisorRuntime: undefined, replyDispatcher: undefined, scheduledJobRuntime: undefined,
+  mcpSessionChurnTimer: timer, shuttingDown: { value: false }, oauthProvider: null,
+  workspaceStore: {}, workSessions: {}, agentRegistry: { close() {} }, eventStore: { close() {} },
+  continuationManager: { close() {} }, dispatchOutbox: { close() {} }, processSessions: { shutdown: async () => undefined },
+  shutdownMissionVerifiers: async () => undefined, integrity: { stop: async () => undefined },
+} as any);
+await passive.drain();
+assert.ok(passiveEvents.indexOf("transport-close") < passiveEvents.indexOf("database-close"), "passive watchers are woken before stores close");

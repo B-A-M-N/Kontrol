@@ -177,6 +177,22 @@ try {
   // the one-tool and reusable idle cutoffs. The reaper must not mistake age
   // for idleness or create a replacement transport behind the caller's back.
   const sustained = await openSession("sustained-a");
+  const sequentialCreated = (await diagnostics()).mcpSessionMetrics.created;
+  for (let index = 0; index < 100; index++) {
+    const result = await rpc("tools/list", {}, sustained.sessionId, "sustained-a");
+    assert.equal(result.response.status, 200, `same transport failed on sequential call ${index}`);
+    assert.equal(result.sessionId, sustained.sessionId, `sequential call ${index} replaced the session ID`);
+  }
+  const concurrent = await Promise.all(Array.from({ length: 16 }, () => rpc("tools/list", {}, sustained.sessionId, "sustained-a")));
+  assert.ok(concurrent.every((result) => result.response.status === 200 && result.sessionId === sustained.sessionId),
+    "16 concurrent calls must share the same healthy transport");
+  assert.equal((await diagnostics()).mcpSessionMetrics.created, sequentialCreated,
+    "100 sequential and 16 concurrent calls must not create replacement transports");
+  const lifecycleTimeline = (await diagnostics()).mcpSessionMetrics.connectionRecovery.timeline;
+  assert.ok(lifecycleTimeline.some((event: any) => event.kind === "tool_call_started" && event.requestKind === "tools/call"));
+  assert.ok(lifecycleTimeline.some((event: any) => event.kind === "response_finished"));
+  assert.ok(lifecycleTimeline.every((event: any) => !("body" in event) && !("arguments" in event) && !("headers" in event)),
+    "lifecycle timeline contains correlation metadata only");
   const sustainedSecondTool = await rpc("tools/call", {
     name: "open_workspace",
     arguments: { path: root, mode: "checkout" },
@@ -203,8 +219,16 @@ try {
     headers: { accept: "text/event-stream", "mcp-session-id": socketSession.sessionId },
   });
   assert.equal(sse.status, 200);
+  const attachedSession = (await diagnostics()).mcpSessionMetrics.sessions.find(
+    (session: any) => session.sessionLabel.endsWith(`/mcp:${socketSession.sessionId.slice(0, 8)}`),
+  );
+  assert.equal(attachedSession?.transportAttached, true, "diagnostics distinguish a live GET SSE attachment from a retained idle session");
   await sse.body?.cancel();
   await waitFor(async () => (await diagnostics()).mcpSessionMetrics.activeSseStreams === 0);
+  const detachedSession = (await diagnostics()).mcpSessionMetrics.sessions.find(
+    (session: any) => session.sessionLabel.endsWith(`/mcp:${socketSession.sessionId.slice(0, 8)}`),
+  );
+  assert.equal(detachedSession?.transportAttached, false);
   const socketReuse = await rpc("tools/list", {}, socketSession.sessionId, "socket-loss-a");
   assert.equal(socketReuse.response.status, 200, "SSE disconnect must leave the shared session reusable");
   assert.equal(socketReuse.sessionId, socketSession.sessionId);

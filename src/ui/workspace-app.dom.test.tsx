@@ -247,7 +247,7 @@ const fakeApp = {
       }
       if (fakeSurfaceFailures > 0) {
         fakeSurfaceFailures -= 1;
-        throw new Error("simulated transport loss");
+        throw new Error("simulated socket hang up");
       }
       return { isError: false, content: [], structuredContent: { lastSeq: 5, sessions: [] } };
     }
@@ -287,7 +287,7 @@ const fakeApp = {
     }
     if (name === "provide_review_feedback") {
       fakeMutationCalls += 1;
-      throw new Error("simulated mutation transport loss");
+      throw new Error("simulated mutation socket hang up");
     }
     return { isError: false, content: [], structuredContent: {} };
   },

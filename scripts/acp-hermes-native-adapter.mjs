@@ -567,6 +567,8 @@ async function handle(req, res) {
       }
       run.readOnlyRuntimeProjection = prepareHermesReadOnlyRuntime();
       copyFileSync(RUNNER, join(run.readOnlyRuntimeProjection, "hermes-native-runner.py"));
+      mkdirSync(join(run.readOnlyRuntimeProjection, "lib"), { recursive: true, mode: 0o700 });
+      copyFileSync(join(dirname(RUNNER), "lib", "mcp_http_session.py"), join(run.readOnlyRuntimeProjection, "lib", "mcp_http_session.py"));
       copyFileSync(join(HERMES_ACP_COMPAT_PATH, "sitecustomize.py"), join(run.readOnlyRuntimeProjection, "sitecustomize.py"));
       const hermesSandboxCommand = `/opt/kontrol/hermes-bin/${basename(hermesExecutable)}`;
       const hermesSandboxPython = join(dirname(hermesSandboxCommand), "python");

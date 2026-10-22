@@ -100,7 +100,7 @@ export interface McpHttpDeps {
   readonly sessionLifecycle: McpSessionLifecycle;
   readonly recordUnknownSessionRequest?: (sessionId: string) => void;
   readonly recordFreshInitialization?: (reconnected: boolean, durationMs?: number) => void;
-  readonly recordMcpConnectionEvent?: (event: { kind: string; sessionId?: string; requestKind?: string; durationMs?: number }) => void;
+  readonly recordMcpConnectionEvent?: (event: { kind: string; sessionId?: string; requestId?: string; operationId?: string; requestKind?: string; toolName?: string; failureClass?: string; durationMs?: number }) => void;
   readonly workspaceAppResourceMetrics: { currentHashed: number; previousHashed: number; staleHashMisses: number; openAiCompatibility: number; legacyKontrol: number; devDesktopMigration: number };
   trackSocketAbort(socket: Socket, controller: AbortController): () => void;
   bearerAuth(): ((req: Request, res: Response, next: (error?: unknown) => void) => void) | undefined;
@@ -314,11 +314,20 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
       startedAtMs: requestStartedAtMs,
       admissionClass,
     });
+    deps.recordMcpConnectionEvent?.({
+      kind: requestRpcMethod === "initialize" ? "initialize_started" : requestRpcMethod === "tools/call" ? "tool_call_started" : "request_started",
+      sessionId,
+      requestId: requestId ?? operationId,
+      operationId,
+      requestKind: requestRpcMethod ?? req.method,
+      ...(requestToolName ? { toolName: requestToolName } : {}),
+    });
     res.setHeader("x-kontrol-operation-id", operationId);
     res.setHeader("x-kontrol-request-id", requestId ?? operationId);
     if (externalCorrelationId) res.setHeader("x-kontrol-correlation-id", externalCorrelationId);
     let handlerStartedAt = 0;
     let handlerSettled = false;
+    let requestAdmissionWeight = 1;
     let responseBytes = 0;
     let heartbeatBytes = 0;
     let responseCloseClassification: string | undefined;
@@ -357,6 +366,7 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
             requestKind,
           });
         }, () => {
+          deps.recordMcpConnectionEvent?.({ kind: "sse_recovered", sessionId, requestKind });
           deps.recordMcpConnectionEvent?.({ kind: "sse_writer_drained", sessionId, requestKind });
           logEvent(config.logging, "info", "mcp_sse_writer_drained", {
             requestId,
@@ -365,6 +375,19 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
           });
         }, (bytes) => {
           heartbeatBytes += bytes;
+        }, {
+          maxStallMs: config.mcpSseMaxStallMs,
+          onStallTimeout: ({ stalledSince, lastSuccessfulWriteAt, consecutiveStallCount }) => {
+            deps.recordMcpConnectionEvent?.({ kind: "sse_stall_timeout", sessionId, requestKind, durationMs: Math.max(0, Date.now() - stalledSince) });
+            logEvent(config.logging, "warn", "mcp_sse_stall_timeout", {
+              requestId,
+              sessionIdPrefix: sessionIdPrefix(sessionId),
+              requestKind,
+              stalledSince: new Date(stalledSince).toISOString(),
+              lastSuccessfulWriteAt: new Date(lastSuccessfulWriteAt).toISOString(),
+              consecutiveStallCount,
+            });
+          },
         });
       }
       if (req.method === "GET" && sessionId) void sendCatalogRefreshPulse(deps, sessionId, "get_stream");
@@ -458,6 +481,16 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
         sessionInFlight,
         connectionMetrics,
       });
+      deps.recordMcpConnectionEvent?.({
+        kind: completedResponseCloseClassification === "response_finished" ? "response_finished" : "stream_aborted",
+        sessionId,
+        requestId: requestId ?? operationId,
+        operationId,
+        requestKind: requestRpcMethod ?? req.method,
+        ...(requestToolName ? { toolName: requestToolName } : {}),
+        ...(requestErrorClass ? { failureClass: requestErrorClass } : {}),
+        durationMs: Math.max(0, finishedAtMs - requestStartedAtMs),
+      });
       try {
         const responseContentType = res.getHeader("content-type")?.toString().toLowerCase() ?? "";
         qualificationEvidence.recordCompletedSseOperation({
@@ -544,7 +577,7 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
       if (!res.writableFinished) {
         responseCloseClassification = "response_closed_before_finish";
         deps.recordMcpConnectionEvent?.({
-          kind: requestIsWaiter ? "watcher_aborted" : "response_channel_closed",
+          kind: requestIsSseStream ? "stream_aborted" : requestIsWaiter ? "watcher_aborted" : "response_channel_closed",
           sessionId,
           requestKind: requestIsSseStream ? "sse_stream" : req.method === "POST" ? "post_response" : "http_response",
         });
@@ -801,7 +834,10 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
             logicalContinuity.touch(sessionState.logicalClientId, sessionState.sessionId, activityAt);
           }
           sessionRequestClass = requestIsSseStream ? "stream" : requestIsWaiter ? "waiter" : "execution";
-          if (sessionRequestClass === "stream") sessionState.activeSseStreams++;
+          if (sessionRequestClass === "stream") {
+            sessionState.activeSseStreams++;
+            sessionState.transportAttached = true;
+          }
           else if (sessionRequestClass === "waiter") sessionState.activeLongPollCount++;
           else {
             sessionState.inFlightRequests++;
@@ -950,6 +986,7 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
                 resourceReadCount: 0,
                 activeLongPollCount: 0,
                 activeSseStreams: 0,
+                transportAttached: false,
                 activePolicyWaiters: 0,
                 closing: false,
                 closed: false,
@@ -1254,6 +1291,7 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
         const admission = requestIsWaiter ? mcpWaiterAdmission : mcpAdmission;
         admissionClass = requestIsWaiter ? "waiter" : "execution";
         const admissionWeight = requestIsWaiter ? 1 : mcpAdmissionWeight(requestRpcMethod, requestToolName);
+        requestAdmissionWeight = admissionWeight;
         const admissionStartedAt = performance.now();
         let acquiredAdmission: (() => void) | null;
         try {
@@ -1343,6 +1381,10 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
                   .update(sessionState?.logicalClientId ?? sessionId ?? "unowned")
                   .digest("hex")
                   .slice(0, 16),
+                ...(sessionState?.workSessionId ? {
+                  workSessionHash: createHash("sha256").update(sessionState.workSessionId).digest("hex").slice(0, 16),
+                } : {}),
+                admissionWeight: requestAdmissionWeight,
                 startedAtMs: requestStartedAtMs,
                 expiredAtMs: Date.now(),
               });
@@ -1424,7 +1466,10 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
       if (sessionId && handlerSettled) {
         const state = mcpSessions.get(sessionId);
         if (state && sessionRequestClass) {
-          if (sessionRequestClass === "stream" && state.activeSseStreams > 0) state.activeSseStreams--;
+          if (sessionRequestClass === "stream" && state.activeSseStreams > 0) {
+            state.activeSseStreams--;
+            state.transportAttached = state.activeSseStreams > 0;
+          }
           else if (sessionRequestClass === "waiter" && state.activeLongPollCount > 0) state.activeLongPollCount--;
           else if (sessionRequestClass === "execution" && sessionExecutionCounted && state.inFlightRequests > 0) state.inFlightRequests--;
           const activityAt = Date.now();

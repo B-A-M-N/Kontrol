@@ -52,6 +52,7 @@ export interface DiagnosticsDeps {
     events: Record<string, number>;
     byGeneration: Record<string, Record<string, number>>;
     byTransport: Record<string, Record<string, number>>;
+    timeline: Array<Record<string, unknown>>;
   };
   readonly logicalContinuity: { size(): number; snapshot(): unknown };
   readonly startupRecovery: Record<string, unknown>;
@@ -227,7 +228,10 @@ export async function handleDiagnostics(deps: DiagnosticsDeps, req: Request, res
       memoryEstimate: sessionLifecycle.estimateMcpSessionMemoryCost(),
       reuse: sessionLifecycle.mcpSessionReuseMetrics(),
       terminationReasons: sessionLifecycle.mcpSessionTerminationMetrics(),
-      connectionRecovery: { ...deps.mcpConnectionMetrics },
+      connectionRecovery: {
+        ...deps.mcpConnectionMetrics,
+        timeline: deps.mcpConnectionMetrics.timeline.slice(-500),
+      },
       operationDiagnostics: deps.operationDiagnostics.snapshot(),
       ...(includeQualificationEvidence
         ? {
@@ -298,6 +302,7 @@ export async function handleDiagnostics(deps: DiagnosticsDeps, req: Request, res
           resourceReadCount: state.resourceReadCount,
           activeLongPollCount: state.activeLongPollCount,
           activeSseStreams: state.activeSseStreams,
+          transportAttached: state.transportAttached,
           activePolicyWaiters: state.activePolicyWaiters,
           inFlightRequests: state.inFlightRequests,
           durableWorkerSession: state.durableWorkerSession,

@@ -42,6 +42,7 @@ let host: LifecycleHost;
 
 // Reconnect de-dup: overlapping transport failures collapse into one retry.
 let reconnectPromise: Promise<void> | null = null;
+let bootstrapPromise: Promise<void> | null = null;
 let reconnectGeneration = 0;
 const reconnectWaiters = new Set<() => void>();
 // SDK callbacks are reattached to replacement App instances. A late callback
@@ -110,7 +111,13 @@ export function bindAppInstanceCallback<T extends (...args: never[]) => unknown>
 }
 
 /** Initial App startup gets one bounded retry and then shows a terminal error. */
-export async function connectBootstrapWithRetry(): Promise<void> {
+export function connectBootstrapWithRetry(): Promise<void> {
+  if (bootstrapPromise) return bootstrapPromise;
+  bootstrapPromise = connectBootstrapOwner().finally(() => { bootstrapPromise = null; });
+  return bootstrapPromise;
+}
+
+async function connectBootstrapOwner(): Promise<void> {
   const generation = reconnectGeneration;
   let lastError: unknown;
   for (let attempt = 0; attempt < 2 && generation === reconnectGeneration; attempt += 1) {
@@ -146,7 +153,7 @@ export async function connectBootstrapWithRetry(): Promise<void> {
 export async function connectWithRetry(reason?: unknown): Promise<void> {
   const generation = reconnectGeneration;
   let retryDelayMs = 1_000;
-  while (generation === reconnectGeneration && host.app() && !host.isConnected()) {
+  for (let attempt = 0; attempt < 8 && generation === reconnectGeneration && host.app() && !host.isConnected(); attempt += 1) {
     host.setConnectionState(retryDelayMs === 1_000 && !reason ? "CONNECTING" : "RECONNECTING");
     host.scheduleRender();
     try {
@@ -176,11 +183,18 @@ export async function connectWithRetry(reason?: unknown): Promise<void> {
       reason = undefined;
     }
   }
+  if (generation === reconnectGeneration && !host.isConnected()) {
+    host.setConnected(false);
+    host.setConnectionState("DISCONNECTED");
+    host.setConnectionError("The host connection is still unavailable. Reconnect the host and try again.");
+    host.scheduleRender();
+  }
   throw new Error("The MCP host connection is unavailable.");
 }
 
 
 export async function reconnectApp(reason: unknown): Promise<void> {
+  if (bootstrapPromise) return bootstrapPromise;
   if (reconnectPromise) return reconnectPromise;
   reconnectPromise = (async () => {
     if (!host.app()) throw new Error("The MCP host connection is unavailable.");

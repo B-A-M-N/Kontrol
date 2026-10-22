@@ -11,6 +11,8 @@ assert.doesNotMatch(adapter, /acp_adapter\.client/);
 assert.match(adapter, /from acp\.core import connect_to_agent/);
 assert.match(adapter, /HERMES_ACP_BIN/);
 assert.match(adapter, /HERMES_ACP_COMPAT_PATH/);
+assert.match(adapter, /join\(dirname\(RUNNER\), "lib", "mcp_http_session\.py"\)/,
+  "the confined Hermes runtime projects the bounded-write MCP session helper beside its runner");
 assert.match(adapter, /hermes-acp-compat/);
 assert.match(adapter, /HERMES_AGENT_ROOT\}\/\.venv\/bin\/python/);
 assert.match(adapter, /HERMES_AGENT_ROOT\}\/venv\/bin\/python/);

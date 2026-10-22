@@ -53,6 +53,8 @@ export interface McpSessionState {
   resourceReadCount: number;
   activeLongPollCount: number;
   activeSseStreams: number;
+  /** A live GET SSE channel is attached; otherwise this is an idle retained session. */
+  transportAttached: boolean;
   activePolicyWaiters: number;
   closing: boolean;
   closed: boolean;
