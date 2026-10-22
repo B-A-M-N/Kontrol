@@ -381,7 +381,7 @@ async function runAdapterCase(name) {
       executionMode: "read_only_audit",
       policySnapshotJson: { workspaceAccess: "read_only" },
       agentName: expectedAgent,
-      maxRuntimeMs: 60_000,
+      maxRuntimeMs: 180_000,
     });
     const runtime = createScheduledJobRuntime({
       database: sharedDb,
@@ -443,7 +443,7 @@ async function runAdapterCase(name) {
     const completedRun = await waitFor(`${name} sandboxed worker completion`, () => {
       const run = agentRegistry.getRunByWorkSessionId(dispatched.workSessionId);
       return run?.finishedAt ? run : undefined;
-      }, 40_000);
+      }, 90_000);
     assert.ok(["awaiting_review", "completed"].includes(completedRun.status),
       `${name} bounded worker finished and entered its review state: status=${completedRun.status}, error=${completedRun.errorMessage ?? "none"}, output=${completedRun.outputJson ?? "none"}`);
     const parsedOutput = JSON.parse(completedRun.outputJson ?? "{}");

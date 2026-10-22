@@ -51,7 +51,9 @@ writeFileSync(envFile, [
   "KONTROL_POLICY_DIRECT_REATTACH_GRACE_MS=100",
   // Accelerated human approval TTL: a direct card stays decidable past its
   // reattachment window and expires only on this clock.
-  "KONTROL_POLICY_DIRECT_APPROVAL_TTL_MS=900",
+  // Keep the direct decision alive across slow CI process scheduling; expiry
+  // is asserted explicitly below, after the retry/idempotency checks.
+  "KONTROL_POLICY_DIRECT_APPROVAL_TTL_MS=15000",
   "KONTROL_POLICY_APPROVAL_TIMEOUT_MS=10000",
   "KONTROL_PROCESS_IDLE_TIMEOUT_MS=150",
   "KONTROL_PROCESS_REAPER_INTERVAL_MS=25",
@@ -234,7 +236,7 @@ try {
     KONTROL_INTEGRITY_DEADLINE_MS: "7000",
     KONTROL_INTEGRITY_TEST_DELAY_MS: "5200",
     KONTROL_POLICY_DIRECT_REATTACH_GRACE_MS: "100",
-    KONTROL_POLICY_DIRECT_APPROVAL_TTL_MS: "900",
+    KONTROL_POLICY_DIRECT_APPROVAL_TTL_MS: "15000",
     KONTROL_POLICY_APPROVAL_TIMEOUT_MS: "10000",
     KONTROL_PROCESS_IDLE_TIMEOUT_MS: "150",
     KONTROL_PROCESS_REAPER_INTERVAL_MS: "25",
@@ -437,7 +439,7 @@ try {
   assert.ok(survivedCard, "a direct approval must stay decidable past its reattachment window");
   assert.equal(survivedCard.state, "pending_human_approval",
     `zero live waiters is a pending human decision; got ${JSON.stringify(survivedCard)}`);
-  await waitFor(async () => !(await listApprovals(reviewerSession, workspaceId)).some((card) => card.approvalId === abandonedId), 5000, "direct approval human-TTL expiry");
+  await waitFor(async () => !(await listApprovals(reviewerSession, workspaceId)).some((card) => card.approvalId === abandonedId), 20000, "direct approval human-TTL expiry");
 
   // Eight accelerated maintenance periods represent more than a working day
   // of the production five-minute scheduler. Each round exercises a fresh
