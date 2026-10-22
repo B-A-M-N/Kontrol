@@ -1,6 +1,11 @@
 # DevSpace Ralphie Muntz Review Loop Handoff
 
-Updated: 2026-10-21
+Updated: 2026-10-21 (reconcile pass in isolated worktree `handoff/reconcile-review-loop`)
+
+> Reconciliation pass: this document was updated after the remaining review-loop
+> fixes were implemented in an isolated worktree and compared against the
+> alternate feature branch rather than copied. The reconciled implementation is
+> UNCOMMITTED and awaits review. See "Reconcile pass (this worktree)" below.
 
 ## Goal and boundaries
 
@@ -122,3 +127,125 @@ has been qualified against a live authenticated ChatGPT conversation.
   inspected read-only for its persistent-profile and exact-target patterns.
 - The dedicated ChatGPT profile is outside the repository and is not part of
   the commit. No credentials or review packet were sent.
+
+---
+
+## Reconcile pass (this worktree)
+
+Implemented in isolated worktree
+`/home/bamn/.local/share/opencode/worktrees/devspace/handoff-reconcile-review-loop`
+on branch `handoff/reconcile-review-loop` (base `132d4aa`). All changes are
+UNCOMMITTED and await review. The alternate feature branch
+`/home/bamn/.devdesktop/worktrees/devspace-review-browser` at `2b64ecc` was
+used as a read-only reference — its superior typed `DeliveryOutcome`,
+`getActivationTarget` preflight, and `setRouteStatus` `pending_activation` guard
+were adapted to this branch's structure, not copied verbatim.
+
+### Reconciled items
+
+1. **Activation renderer metadata + identity, scoped activation event, reducer
+   pre-session drain.** `activate_review_thread` now returns
+   `workspaceAppRenderToolMeta()` `_meta` and `tool`/`threadId`/`reviewThreadId`/
+   `workspaceId` output; the `review.thread.activated` event carries
+   `workspaceSessionId`. `workspace-event-reducer.ts` drains queued review
+   messages for `review.thread.activated`, `review.thread.reattached`, and
+   `review.thread.delivery_requeued` even before a session card exists.
+2. **`reattach_review_thread` with preflight.** New tool consumes an owner-issued
+   one-time recovery grant; `threads.getActivationTarget()` preflights
+   grant+route+thread WITHOUT consuming it, and `activate(reattachOnly)` fails
+   closed when no existing distinct binding exists, so an unresolved workspace
+   never burns the grant. Uncertain presenting packets remain fenced.
+3. **`renew_review_handoff_claim`.** `route-store.renewHandoffClaim()` requires
+   same principal/context/revision/route epoch + unexpired lease, clamps each
+   renewal to 60s–30m and caps cumulative claim at 2h from `claimedAt`; new
+   `review.handoff.claim_renewed` event; MCP tool `renew_review_handoff_claim`.
+4. **Required review-thread manifest in release + tunnel probes.** New
+   `scripts/lib/review-thread-tool-manifest.mjs` (+ `.d.mts`) lists the 8
+   reviewer-thread tools; `probe-release.mjs` asserts them on the candidate
+   tools/list, adds activate/reattach to renderer tools, and enables the
+   isolated probe-only bridge (`KONTROL_ACP_ENABLED=true` + `randomBytes(48)`
+   ACP secrets); `probe-mcp-tunnel.mjs` requires the manifest tools.
+5. **Typed delivery outcomes.** `review-thread-delivery.ts` now returns
+   `DeliveryOutcome` = `unsupported | empty | accepted | rejected | uncertain |
+   tool_error`; authenticated verdict separation is preserved (transport
+   acceptance never asserts the model read the packet).
+6. **`setRouteStatus` preserves `pending_activation`.** A route status change
+   does not fabricate an active thread when no reviewer principal/context
+   binding exists.
+
+### Fresh evidence (run in this worktree)
+
+- `npm run typecheck -- --pretty false` — clean.
+- `npm run test:review-thread` — all 7 suites pass, including the new
+  `src/ui/review-thread-event-trigger.test.ts` (pre-session drain) and the
+  rewritten `review-thread-mcp.test.ts` (manifest, renderer meta, preflight
+  fail-closed leaving grant intact, reattach).
+- `review-thread-delivery.test.ts` asserts every typed `DeliveryOutcome`
+  (`unsupported`, `empty`, `accepted`, `rejected`, `uncertain`, `tool_error`).
+- `review-thread.test.ts` asserts `setRouteStatus` preserves `pending_activation`
+  for an unbound thread (active and paused).
+- `src/bridge/handoff-tools.test.ts`, `src/review-handoff/route-store.test.ts`
+  — renewal success / stalled-revision / wrong-principal / expired / reclaim
+  all passing.
+- `npm run test:ui` — full Chromium UI chain (build + size + contract +
+  responsive/focus/theme/status render) passes, exercising the reducer change.
+- UI unit tests: `workspace-app-contract`, `tool-display`, `server-tool-call`,
+  `workspace-app-host-lifecycle` all pass.
+- `npm run test:syntax` — clean, including `node --check` on
+  `probe-release.mjs`, `probe-mcp-tunnel.mjs`, and the new manifest.
+- `dist/` was rebuilt (`npm run build:app`) so `review-thread-mcp.test.ts`
+  (which requires the built Workspace App artifact) can run.
+
+### Remaining live prerequisites (NOT completed here)
+
+- The full `probe-release.mjs` candidate boot and the live `probe-mcp-tunnel.mjs`
+  catalog parity are deployment gates; they were syntax/import checked but not
+  executed against a deployed candidate/tunnel in this session.
+- No end-to-end ChatGPT sign-in, packet delivery, or feedback round trip was
+  qualified against a live authenticated conversation.
+- The original handoff's remaining work (Chrome update, re-auth, bind
+  conversation, qualify full loop, decide stale worktrees, no remote publish)
+  is unchanged and still applies.
+
+### Boundary
+
+No edits were made to `/home/bamn/devspace` or any other worktree. Nothing was
+pushed or merged, no service was restarted, no browser/profile was touched, and
+no secret was read. Working diff only — **do not commit until review**.
+
+---
+
+## Integration candidate (composed worktree)
+
+Composed into the `handoff/integration-candidate` worktree (base `132d4aa`) by
+reproducing the exact `git diff 132d4aa` from each source worktree (reconcile
+review loop, browser-restore-cleanup, package-hermes-dependency, and
+qualify-browser-feedback) and copying the new files verbatim (md5-verified, no
+drift). All changes remain UNCOMMITTED on this branch.
+
+### Wiring decisions (documented)
+
+- `test:review-browser` now runs `contracts.test.ts && browser-restore-cleanup.test.ts`
+  (fixes the browser-restore-cleanup P2 wiring into a runnable script).
+- Added a NEW standalone script `test:review-loop-integration`:
+  `KONTROL_WORKSPACE_APP_HTML_PATH=./dist/ui/workspace-app.html node --import tsx src/review-browser-handoff-integration.test.ts`.
+- It was NOT added to the canonical `npm test` / `test:runtime` chain and NOT
+  appended to `test:review-thread`. Reason: the canonical runtime runner
+  (`scripts/run-runtime-tests.mjs`) builds the Workspace App to a temporary
+  artifact directory and sets `KONTROL_WORKSPACE_APP_HTML_PATH` to its `ui/`
+  subfolder — it never produces `./dist/ui/workspace-app.html` in the checkout,
+  and the integration test fails fast (by design) when the artifact path is
+  absent. So it stays a standalone, artifact-gated script; run `npm run build:app`
+  (or build via `test:runtime` into a known artifact) before
+  `npm run test:review-loop-integration`.
+- The `handoff-package-hermes-dependency` change (adds
+  `scripts/lib/hermes-stop-reason.mjs` to npm `files`) was merged with the
+  reconcile package.json change; both coexist (files array + the
+  `test:review-thread` script line).
+
+### Non-conflict verification
+
+`handoff-reconcile-review-loop` modifies `src/bridge/handoff-tools.ts`;
+`handoff-qualify-browser-feedback` modifies `src/bridge/review-tools.ts`. These
+are DIFFERENT files — no edit conflict. All four patch files applied cleanly via
+`git apply --check` and no hunks overlapped.

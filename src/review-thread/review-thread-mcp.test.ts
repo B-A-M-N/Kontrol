@@ -10,6 +10,8 @@ import { openDatabase } from "../db/client.js";
 import { createReviewRouteStore } from "../review-handoff/route-store.js";
 import { createReviewThreadStore } from "./thread-store.js";
 import { registerHandoffTools } from "../bridge/handoff-tools.js";
+import { REQUIRED_REVIEW_THREAD_TOOLS } from "../../scripts/lib/review-thread-tool-manifest.mjs";
+import { isWorkspaceAppUri, workspaceAppRenderToolMeta } from "../workspace-app-resource.js";
 
 const root = await mkdtemp(join(tmpdir(), "kontrol-review-thread-mcp-test-"));
 try {
@@ -34,10 +36,11 @@ try {
   const activeThread = reviewThreads.activate({ activationSecret: activation.activationSecret, principalId: "reviewer", contextId: "principal:reviewer|mcp-session:review-mcp-session" });
 
   const createConnection = (principalId: string, conversationId: string, mcpSessionId: string) => {
+    let workspaceResolvable = true;
     const config = {
       db, workspaces: {},
       workSessions: {
-        get: () => ({ id: route.workSessionId, title: "Review task" }),
+        get: () => workspaceResolvable ? ({ id: route.workSessionId, title: "Review task", workspaceSessionId: "ws-review-mcp" }) : undefined,
         getSubmissions: () => [{ id: handoff.submissionId, submissionNumber: 1, reviewEpoch: handoff.reviewEpoch, diffSha256: handoff.diffSha256, snapshotKind: handoff.snapshotKind, snapshotRef: handoff.snapshotRef, status: "pending" }],
       },
       reviewCheckpoints: {},
@@ -48,11 +51,12 @@ try {
       connectionMcpSessionId: mcpSessionId,
       reviewRoutes, reviewThreads,
     } as any;
+    const setWorkspaceResolvable = (value: boolean) => { workspaceResolvable = value; };
     const server = new McpServer({ name: "review-thread-mcp-test", version: "1.0.0" });
     registerHandoffTools(server, config);
     const client = new Client({ name: "review-thread-mcp-client", version: "1.0.0" });
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-    return { config, server, client, clientTransport, serverTransport };
+    return { config, server, client, clientTransport, serverTransport, setWorkspaceResolvable };
   };
 
   const reviewer = createConnection("reviewer", "review-b", "review-mcp-session");
@@ -64,10 +68,34 @@ try {
     other.server.connect(other.serverTransport), other.client.connect(other.clientTransport),
   ]);
   try {
+    const tools = await reviewer.client.listTools();
+    const registeredNames = new Set(tools.tools.map((tool) => tool.name));
+    for (const required of REQUIRED_REVIEW_THREAD_TOOLS) assert.ok(registeredNames.has(required), `MCP tools/list is missing required review-thread tool ${required}`);
+    const activationTool = tools.tools.find((tool) => tool.name === "activate_review_thread");
+    const reattachTool = tools.tools.find((tool) => tool.name === "reattach_review_thread");
+    const appMeta = workspaceAppRenderToolMeta() as { ui: { resourceUri: string }; "openai/outputTemplate": string };
+    for (const tool of [activationTool, reattachTool]) {
+      assert.ok(tool, "activation and reattachment are registered");
+      assert.equal((tool._meta?.ui as { resourceUri?: unknown } | undefined)?.resourceUri, appMeta.ui.resourceUri,
+        "activation and reattachment mount the existing Workspace App transport");
+      assert.equal(tool._meta?.["openai/outputTemplate"], appMeta["openai/outputTemplate"],
+        "the host receives the matching existing Workspace App compatibility renderer");
+      assert.ok(isWorkspaceAppUri(appMeta.ui.resourceUri), "the renderer resolves to the existing content-hashed Workspace App resource");
+    }
     const activationRetry = reviewThreads.createActivation({ routeId: route.id, ownerPrincipalId: "owner", reviewerPrincipalId: "reviewer" });
+    reviewer.setWorkspaceResolvable(false);
+    const unresolvedWorkspace = await reviewer.client.callTool({ name: "activate_review_thread", arguments: { activationSecret: activationRetry.activationSecret } });
+    assert.equal(unresolvedWorkspace.isError, true, "activation fails before consuming a grant when its workspace cannot be resolved");
+    assert.ok(reviewThreads.getActivationTarget({ activationSecret: activationRetry.activationSecret, principalId: "reviewer" }),
+      "a transient workspace lookup failure leaves the one-time grant available for retry");
+    reviewer.setWorkspaceResolvable(true);
     const activated = await reviewer.client.callTool({ name: "activate_review_thread", arguments: { activationSecret: activationRetry.activationSecret, hostKind: "chatgpt", hostConversationId: "review-b" } });
     assert.equal(activated.isError, undefined, "the owner-issued activation grant binds the current authenticated MCP session");
     assert.equal((activated.structuredContent as { threadId: string; hostBindingVerified: boolean }).threadId, activeThread.id);
+    assert.equal((activated.structuredContent as { reviewThreadId: string }).reviewThreadId, activeThread.id);
+    assert.equal((activated.structuredContent as { tool: string }).tool, "activate_review_thread");
+    assert.equal((activated.structuredContent as { workspaceId: string }).workspaceId, "ws-review-mcp",
+      "activation returns the resolved workspace identity for the Workspace App bridge");
     assert.equal((activated.structuredContent as { hostBindingVerified: boolean }).hostBindingVerified, false, "caller-supplied host conversation IDs remain unverified metadata");
 
     const attackerClaim = await other.client.callTool({ name: "claim_review_thread_deliveries", arguments: {} });
@@ -109,9 +137,15 @@ try {
     const expiredStatusRead = await reviewer.client.callTool({ name: "get_review_handoff_status", arguments: { handoffId: handoff.id } });
     assert.equal(expiredStatusRead.isError, true, "an expired claim cannot keep reading claim status");
     const replacementActivation = reviewThreads.createActivation({ routeId: route.id, ownerPrincipalId: "owner", reviewerPrincipalId: "reviewer" });
-    const rebound = await other.client.callTool({ name: "activate_review_thread", arguments: { activationSecret: replacementActivation.activationSecret } });
+    other.setWorkspaceResolvable(false);
+    const unresolvedReattach = await other.client.callTool({ name: "reattach_review_thread", arguments: { activationSecret: replacementActivation.activationSecret } });
+    assert.equal(unresolvedReattach.isError, true, "reattachment also validates workspace access before consuming its grant");
+    assert.ok(reviewThreads.getActivationTarget({ activationSecret: replacementActivation.activationSecret, principalId: "reviewer" }));
+    other.setWorkspaceResolvable(true);
+    const rebound = await other.client.callTool({ name: "reattach_review_thread", arguments: { activationSecret: replacementActivation.activationSecret } });
     assert.equal(rebound.isError, undefined, "a fresh authenticated context can consume a replacement grant");
     assert.equal((rebound.structuredContent as { threadId: string }).threadId, activeThread.id, "the durable thread identity survives context replacement");
+    assert.equal((rebound.structuredContent as { tool: string }).tool, "reattach_review_thread");
     assert.equal(reviewThreads.listMessages(activeThread.id)[0]?.status, "queued", "the uncompleted packet is queued for the replacement context");
     const newContextDelivery = await other.client.callTool({ name: "claim_review_thread_deliveries", arguments: {} });
     assert.equal((newContextDelivery.structuredContent as { messages: unknown[] }).messages.length, 1,

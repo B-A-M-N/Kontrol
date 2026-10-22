@@ -54,7 +54,7 @@ export function registerReviewTools(server: McpServer, config: BridgeConfig): vo
         continuationId: z.string().optional().describe("Continuation ID returned by await_review_feedback; completed only after this submission is persisted."),
         clientMutationId: z.string().min(1).max(200).optional(),
       },
-      outputSchema: { submissionId: z.string(), status: z.string(), files: z.number(), additions: z.number(), removals: z.number(), diffSha256: z.string().optional(), reviewEpoch: z.number(), snapshotKind: z.enum(["git", "filesystem"]).optional(), snapshotRef: z.string().optional(), housekeepingWarnings: z.array(z.string()).optional(), coverage: z.object({ backend: z.enum(["git", "filesystem"]), uncoveredPaths: z.array(z.string()), reasons: z.array(z.string()) }).optional() },
+      outputSchema: { submissionId: z.string(), status: z.string(), files: z.array(z.object({ path: z.string(), previousPath: z.string().optional(), type: z.string().optional(), operation: z.string().optional(), additions: z.number(), removals: z.number() })), fileCount: z.number(), additions: z.number(), removals: z.number(), diffSha256: z.string().optional(), reviewEpoch: z.number(), snapshotKind: z.enum(["git", "filesystem"]).optional(), snapshotRef: z.string().optional(), housekeepingWarnings: z.array(z.string()).optional(), coverage: z.object({ backend: z.enum(["git", "filesystem"]), uncoveredPaths: z.array(z.string()), reasons: z.array(z.string()) }).optional() },
       _meta: workspaceAppModelAndAppMeta(),
       annotations: { readOnlyHint: false },
     },

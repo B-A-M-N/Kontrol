@@ -63,6 +63,7 @@ try {
     principalId: "user-a",
     ownerContextId,
     destinationConversationId: ownerContextId,
+    claimLeaseMs: 60_000,
   });
   assert.equal(claimed.claimedByOwnerContextId, ownerContextId);
 
@@ -133,6 +134,24 @@ try {
   assert.equal(JSON.stringify(eventPayloads).includes("host_integration"), false,
     "reviewer-provided data is never promoted to host integration evidence");
 
+  // The same authenticated reviewer can renew a live claim before feedback,
+  // up to the bounded cumulative review duration. Renewal compares-and-swaps on
+  // the current revision and refuses a different principal/context.
+  const claimedAfterGet = routes.getHandoffById(handoff.id)!;
+  assert.equal(claimedAfterGet.status, "claimed");
+  const renewed = await reviewerClient.callTool({ name: "renew_review_handoff_claim", arguments: {
+    handoffId: handoff.id, expectedRevision: claimedAfterGet.revision, claimLeaseMs: 60_000,
+  } });
+  assert.equal(renewed.isError, undefined, "the same authenticated reviewer can renew a live claim");
+  assert.ok(Date.parse((renewed.structuredContent as { claimExpiresAt: string }).claimExpiresAt) > Date.parse(claimedAfterGet.claimExpiresAt!),
+    "renewal extends the unexpired claim lease");
+  assert.equal(eventTypes.includes("review.handoff.claim_renewed"), true);
+  // A stale expected revision cannot renew (compare-and-swap).
+  const staleRenew = await reviewerClient.callTool({ name: "renew_review_handoff_claim", arguments: {
+    handoffId: handoff.id, expectedRevision: claimedAfterGet.revision, claimLeaseMs: 60_000,
+  } });
+  assert.equal(staleRenew.isError, true, "a stale revision cannot renew an already-renewed claim");
+
   const clientConfig = { ...reviewerConfig, principalRole: "client" };
   const clientServer = new McpServer({ name: "handoff-client-auth-test", version: "1.0.0" });
   registerHandoffTools(clientServer, clientConfig);
@@ -145,6 +164,10 @@ try {
     observation,
   } });
   assert.equal(denied.isError, true, "non-reviewers cannot submit observations");
+  const clientRenew = await client.callTool({ name: "renew_review_handoff_claim", arguments: {
+    handoffId: handoff.id, expectedRevision: (renewed.structuredContent as { revision: number }).revision, claimLeaseMs: 60_000,
+  } });
+  assert.equal(clientRenew.isError, true, "non-reviewers cannot renew a claim even when they know the handoff id");
   await Promise.all([reviewerClient.close(), reviewerServer.close(), client.close(), clientServer.close()]);
   db.close();
 } finally {

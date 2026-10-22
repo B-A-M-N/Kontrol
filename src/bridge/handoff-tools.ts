@@ -15,6 +15,7 @@ import { and, eq, sql } from "drizzle-orm";
 import { createReviewPacket } from "../review-thread/review-packet.js";
 import { reviewThreadMessages } from "../db/schema.js";
 import { createHash } from "node:crypto";
+import { workspaceAppRenderToolMeta } from "../workspace-app-resource.js";
 import {
   ExternalCatalogObservationSubmissionSchema,
   validateExternalCatalogObservation,
@@ -275,8 +276,8 @@ export function registerHandoffTools(server: McpServer, config: BridgeConfig): v
       title: "Activate reviewer thread",
       description: "Consume a one-time owner-issued grant and bind this authenticated reviewer context to the persistent Kontrol review thread.",
       inputSchema: { activationSecret: z.string().min(20), hostKind: z.enum(["chatgpt", "kontrol_ui", "external"]).optional(), hostConversationId: z.string().optional() },
-      outputSchema: { threadId: z.string(), routeId: z.string(), routeEpoch: z.number(), status: z.string(), hostBindingVerified: z.boolean() },
-      _meta: {},
+      outputSchema: { tool: z.literal("activate_review_thread"), threadId: z.string(), reviewThreadId: z.string(), routeId: z.string(), routeEpoch: z.number(), workspaceId: z.string(), status: z.string(), hostBindingVerified: z.boolean() },
+      _meta: workspaceAppRenderToolMeta(),
       annotations: { readOnlyHint: false },
     },
     async ({ activationSecret, hostKind, hostConversationId }: { activationSecret: string; hostKind?: "chatgpt" | "kontrol_ui" | "external"; hostConversationId?: string }) => {
@@ -285,15 +286,65 @@ export function registerHandoffTools(server: McpServer, config: BridgeConfig): v
       const contextId = reviewerThreadContextId(config);
       if (!contextId) return { content: [{ type: "text" as const, text: "A server-issued authenticated MCP reviewer session is required to activate this thread." }], isError: true };
       try {
+        const principalId = config.principalId ?? `role:${config.principalRole ?? "reviewer"}`;
+        // Preflight the grant before consuming it. A transient failure to
+        // resolve the caller's workspace must leave the one-time grant
+        // available for retry rather than burning it on an unusable activation.
+        const target = config.reviewThreads.getActivationTarget({ activationSecret, principalId });
+        if (!target) throw new Error("Review thread activation is invalid, expired, or already consumed.");
+        const session = config.workSessions.get(target.workSessionId);
+        const workspaceId = session?.workspaceSessionId;
+        if (!workspaceId) throw new Error("The review thread workspace could not be resolved.");
         const thread = config.reviewThreads.activate({
           activationSecret,
-          principalId: config.principalId ?? `role:${config.principalRole ?? "reviewer"}`,
+          principalId,
           contextId,
           hostKind,
           hostConversationId,
         });
-        config.eventStore.appendEvent({ type: "review.thread.activated", sessionId: thread.workSessionId, payload: { threadId: thread.id, routeId: thread.routeId, routeEpoch: thread.routeEpoch, reviewerPrincipalId: thread.reviewerPrincipalId, hostBindingVerified: false } });
-        return { content: [{ type: "text" as const, text: `Review thread ${thread.id} activated for route epoch ${thread.routeEpoch}. Host conversation identity remains unverified.` }], structuredContent: { threadId: thread.id, routeId: thread.routeId, routeEpoch: thread.routeEpoch, status: thread.status, hostBindingVerified: thread.hostBindingVerified } };
+        config.eventStore.appendEvent({ type: "review.thread.activated", sessionId: thread.workSessionId, workspaceSessionId: workspaceId, payload: { threadId: thread.id, routeId: thread.routeId, routeEpoch: thread.routeEpoch, reviewerPrincipalId: thread.reviewerPrincipalId, hostBindingVerified: false } });
+        return { content: [{ type: "text" as const, text: `Review thread ${thread.id} activated for route epoch ${thread.routeEpoch}. Host conversation identity remains unverified.` }], structuredContent: { tool: "activate_review_thread", threadId: thread.id, reviewThreadId: thread.id, routeId: thread.routeId, routeEpoch: thread.routeEpoch, workspaceId, status: thread.status, hostBindingVerified: thread.hostBindingVerified } };
+      } catch (error) {
+        return { content: [{ type: "text" as const, text: error instanceof Error ? error.message : String(error) }], isError: true };
+      }
+    },
+  );
+
+  registerAppTool(
+    server,
+    "reattach_review_thread",
+    {
+      title: "Reattach reviewer thread",
+      description: "Consume an owner-issued, one-time recovery grant to move the existing reviewer thread to this authenticated replacement context. The thread ID and round budget are preserved; uncertain presenting messages remain fenced for explicit recovery.",
+      inputSchema: { activationSecret: z.string().min(20), hostKind: z.enum(["chatgpt", "kontrol_ui", "external"]).optional(), hostConversationId: z.string().optional() },
+      outputSchema: { tool: z.literal("reattach_review_thread"), threadId: z.string(), reviewThreadId: z.string(), routeId: z.string(), routeEpoch: z.number(), workspaceId: z.string(), status: z.string(), hostBindingVerified: z.boolean() },
+      _meta: workspaceAppRenderToolMeta(),
+      annotations: { readOnlyHint: false },
+    },
+    async ({ activationSecret, hostKind, hostConversationId }: { activationSecret: string; hostKind?: "chatgpt" | "kontrol_ui" | "external"; hostConversationId?: string }) => {
+      if (!isReviewer(config.principalRole)) return forbidden(config.principalRole, "reattach_review_thread");
+      if (!config.reviewThreads) return { content: [{ type: "text" as const, text: "Review thread storage is unavailable." }], isError: true };
+      const contextId = reviewerThreadContextId(config);
+      if (!contextId) return { content: [{ type: "text" as const, text: "A server-issued authenticated MCP reviewer session is required to reattach this thread." }], isError: true };
+      try {
+        const principalId = config.principalId ?? `role:${config.principalRole ?? "reviewer"}`;
+        // Preflight before consuming the recovery grant, exactly like
+        // activation: an unresolved workspace must not burn the one-time grant.
+        const target = config.reviewThreads.getActivationTarget({ activationSecret, principalId });
+        if (!target) throw new Error("Review thread activation is invalid, expired, or already consumed.");
+        const session = config.workSessions.get(target.workSessionId);
+        const workspaceId = session?.workspaceSessionId;
+        if (!workspaceId) throw new Error("The review thread workspace could not be resolved.");
+        const thread = config.reviewThreads.activate({
+          activationSecret,
+          principalId,
+          contextId,
+          hostKind,
+          hostConversationId,
+          reattachOnly: true,
+        });
+        config.eventStore.appendEvent({ type: "review.thread.reattached", sessionId: thread.workSessionId, workspaceSessionId: workspaceId, payload: { threadId: thread.id, routeId: thread.routeId, routeEpoch: thread.routeEpoch, reviewerPrincipalId: thread.reviewerPrincipalId, hostBindingVerified: false } });
+        return { content: [{ type: "text" as const, text: `Review thread ${thread.id} reattached in route epoch ${thread.routeEpoch}.` }], structuredContent: { tool: "reattach_review_thread", threadId: thread.id, reviewThreadId: thread.id, routeId: thread.routeId, routeEpoch: thread.routeEpoch, workspaceId, status: thread.status, hostBindingVerified: thread.hostBindingVerified } };
       } catch (error) {
         return { content: [{ type: "text" as const, text: error instanceof Error ? error.message : String(error) }], isError: true };
       }
@@ -513,6 +564,48 @@ export function registerHandoffTools(server: McpServer, config: BridgeConfig): v
         return {
           content: [{ type: "text" as const, text: `Handoff ${claimed.id} claimed for round ${claimed.roundNumber}.` }],
           structuredContent: { handoffId: claimed.id, status: claimed.status, revision: claimed.revision, roundNumber: claimed.roundNumber, claimExpiresAt: claimed.claimExpiresAt },
+        };
+      } catch (error) {
+        return { content: [{ type: "text" as const, text: error instanceof Error ? error.message : String(error) }], isError: true };
+      }
+    },
+  );
+
+  registerMutationAppTool(
+    server,
+    "renew_review_handoff_claim",
+    {
+      title: "Renew review handoff claim",
+      description: "Extend the current reviewer claim before a lengthy inspection or feedback pass. Only the same authenticated reviewer can renew an unexpired claim, up to the bounded cumulative review duration.",
+      inputSchema: { handoffId: z.string(), expectedRevision: z.number().int().min(1), claimLeaseMs: z.number().int().min(60_000).max(30 * 60_000).optional() },
+      outputSchema: { handoffId: z.string(), status: z.string(), revision: z.number(), claimExpiresAt: z.string() },
+      _meta: {},
+      annotations: { readOnlyHint: false },
+    },
+    config,
+    async ({ handoffId, expectedRevision, claimLeaseMs }: { handoffId: string; expectedRevision: number; claimLeaseMs?: number }) => {
+      if (!isReviewer(config.principalRole)) return forbidden(config.principalRole, "renew_review_handoff_claim");
+      const handoff = routes?.getHandoffById(handoffId);
+      if (!handoff || !hasCurrentHandoffClaim(handoff)) return forbidden(config.principalRole, "renew_review_handoff_claim");
+      const route = routes?.getRouteBySession(handoff.workSessionId);
+      const contextId = route ? reviewClaimContextId(config, route.mode) : undefined;
+      if (!contextId || !routes) return forbidden(config.principalRole, "renew_review_handoff_claim");
+      try {
+        const renewed = routes.renewHandoffClaim({
+          handoffId,
+          expectedRevision,
+          principalId: config.principalId ?? `role:${config.principalRole ?? "reviewer"}`,
+          ownerContextId: contextId,
+          claimLeaseMs,
+        });
+        config.eventStore.appendEvent({
+          type: "review.handoff.claim_renewed",
+          sessionId: renewed.workSessionId,
+          payload: { handoffId: renewed.id, revision: renewed.revision, claimExpiresAt: renewed.claimExpiresAt },
+        });
+        return {
+          content: [{ type: "text" as const, text: `Review claim renewed until ${renewed.claimExpiresAt}.` }],
+          structuredContent: { handoffId: renewed.id, status: renewed.status, revision: renewed.revision, claimExpiresAt: renewed.claimExpiresAt! },
         };
       } catch (error) {
         return { content: [{ type: "text" as const, text: error instanceof Error ? error.message : String(error) }], isError: true };

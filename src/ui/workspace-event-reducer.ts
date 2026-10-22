@@ -67,7 +67,18 @@ export function workspaceEventTargetSessionId(event: AgentActivityEvent): string
 
 export function reduceWorkSessionEvent(sessionId: string, event: AgentActivityEvent): void {
   const view = workSessionViews.get(sessionId);
-  if (!view) return;
+  if (!view) {
+    // Review activation/reattach is a transport lifecycle event. A freshly
+    // activated reviewer context may not have a session card yet, but it must
+    // still drain the durable queue into the active WebUI conversation.
+    if (event.type === "review.thread.activated" || event.type === "review.thread.reattached" || event.type === "review.thread.delivery_requeued") {
+      void deliverQueuedReviewMessages().catch((error) => {
+        host.setErrorMessage(`Could not deliver queued review submissions to this WebUI context: ${error instanceof Error ? error.message : String(error)}`);
+        host.render();
+      });
+    }
+    return;
+  }
   // The server's snapshot+cursor handoff and reconnects are deliberately
   // idempotent. Never duplicate an already-applied durable event if a host
   // retries a tool call or returns an overlapping page.
@@ -254,7 +265,7 @@ export function reduceWorkSessionEvent(sessionId: string, event: AgentActivityEv
       host.setErrorMessage(`Could not deliver the review submission to this WebUI context: ${error instanceof Error ? error.message : String(error)}`);
       host.render();
     });
-  } else if (event.type === "review.thread.activated" || event.type === "review.thread.delivery_requeued") {
+  } else if (event.type === "review.thread.activated" || event.type === "review.thread.reattached" || event.type === "review.thread.delivery_requeued") {
     void deliverQueuedReviewMessages().catch((error) => {
       host.setErrorMessage(`Could not deliver queued review submissions to this WebUI context: ${error instanceof Error ? error.message : String(error)}`);
       host.render();

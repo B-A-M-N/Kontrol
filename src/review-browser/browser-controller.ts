@@ -2,7 +2,7 @@ import { and, eq, inArray } from "drizzle-orm";
 import type { DatabaseHandle } from "../db/client.js";
 import { reviewBrowserProfiles, reviewRoutes, reviewThreads, reviewBrowserTurns, reviewThreadMessages } from "../db/schema.js";
 import type { DispatchOutbox } from "../dispatch-outbox.js";
-import { launchOrReconnectChrome, type OwnedChrome } from "./chrome-process.js";
+import { launchOrReconnectChrome, type ChromeProcessOptions, type OwnedChrome } from "./chrome-process.js";
 import { ChatGptPageDriver } from "./chatgpt-page-driver.js";
 import { createReviewerBrowserProfileStore, type ReviewerBrowserMode, type ReviewerBrowserProfile, type ReviewerBrowserProfileStore } from "./profile-store.js";
 import { bindReviewerTarget, canonicalReviewerConversation, restoreReviewerTarget, reviewerConversationFingerprint, type BoundReviewerTarget, type ReviewerTabBinding } from "./target-binding.js";
@@ -27,6 +27,8 @@ export function createReviewerBrowserController(input: {
   dispatchOutbox?: DispatchOutbox;
   chromePath?: string;
   environment?: NodeJS.ProcessEnv;
+  /** Test seam: override Chromium launch so focused tests can inject a fake CDP handle. */
+  launchChrome?: (options: ChromeProcessOptions) => Promise<OwnedChrome>;
 }): ReviewerBrowserController {
   const profiles = createReviewerBrowserProfileStore(input.database, input.stateDir);
   const processes = new Map<string, OwnedChrome>();
@@ -46,7 +48,7 @@ export function createReviewerBrowserController(input: {
     const starting = profiles.transition({ profileId, expectedGeneration: current.generation, status: "starting", mode: requestedMode });
     try {
       const profileDirectory = await profiles.profileDirectory(profileId);
-      const chrome = await launchOrReconnectChrome({
+      const chrome = await (input.launchChrome ?? launchOrReconnectChrome)({
         profileDirectory,
         generation: starting.generation,
         mode: requestedMode,
@@ -199,25 +201,53 @@ export function createReviewerBrowserController(input: {
         status: "bound",
       },
     });
-    await chrome.cdp.send("Page.enable", {}, target.sessionId);
-    await chrome.cdp.send("Runtime.enable", {}, target.sessionId);
-    const driver = new ChatGptPageDriver(chrome.cdp, target);
-    const readiness = await driver.inspect(key);
-    if (readiness.status !== "ready") {
-      const status = "recovery_required";
-      input.database.db.update(reviewThreads).set({ conversationBindingStatus: status, revision: thread.revision + 1 })
-        .where(and(eq(reviewThreads.id, thread.id), eq(reviewThreads.revision, thread.revision))).run();
-      throw new Error(`Bound reviewer conversation is not ready: ${readiness.status}.`);
+    // `target.sessionId` is the CDP session freshly attached by this restore call.
+    // It is owned by this invocation until it is committed to the durable binding;
+    // every failure path below must dispose it so a stale attachment is not leaked.
+    const detachOwnSession = (): Promise<void> =>
+      chrome.cdp.send("Target.detachFromTarget", { sessionId: target.sessionId }).then(() => undefined).catch(() => undefined);
+    let committed = false;
+    try {
+      await chrome.cdp.send("Page.enable", {}, target.sessionId);
+      await chrome.cdp.send("Runtime.enable", {}, target.sessionId);
+      const driver = new ChatGptPageDriver(chrome.cdp, target);
+      const readiness = await driver.inspect(key);
+      if (readiness.status !== "ready") {
+        const status = "recovery_required";
+        input.database.db.update(reviewThreads).set({ conversationBindingStatus: status, revision: thread.revision + 1 })
+          .where(and(eq(reviewThreads.id, thread.id), eq(reviewThreads.revision, thread.revision))).run();
+        throw new Error(`Bound reviewer conversation is not ready: ${readiness.status}.`);
+      }
+      const priorBinding = bindings.get(thread.id);
+      const updated = input.database.db.update(reviewThreads).set({
+        browserGeneration: profile.generation,
+        browserTargetId: target.targetId,
+        browserCdpSessionId: target.sessionId,
+        conversationBindingStatus: "bound",
+        revision: thread.revision + 1,
+      }).where(and(eq(reviewThreads.id, thread.id), eq(reviewThreads.revision, thread.revision))).run();
+      if (updated.changes !== 1) {
+        // The thread revision changed concurrently (for example another restore
+        // already committed a fresh binding). Fail closed: never cache our stale
+        // target, and dispose the attachment we created rather than leaking it.
+        throw new Error("Reviewer conversation restoration lost its thread revision compare-and-swap.");
+      }
+      committed = true;
+      bindings.set(thread.id, target);
+      // Our newly attached session is now the durable binding. Dispose the target
+      // it superseded (tracked ownership, strictly older by the CAS ordering above)
+      // so repeated restores do not accumulate orphaned CDP attachments. We never
+      // detach a newer binding, because the CAS only commits the newest restore.
+      if (priorBinding && priorBinding.sessionId && priorBinding.sessionId !== target.sessionId) {
+        await chrome.cdp.send("Target.detachFromTarget", { sessionId: priorBinding.sessionId }).catch(() => undefined);
+      }
+      return { target, driver };
+    } catch (error) {
+      // Our ephemeral attachment was never committed as the durable binding, so it
+      // must be disposed. A committed (durable) session is intentionally retained.
+      if (!committed) await detachOwnSession();
+      throw error;
     }
-    input.database.db.update(reviewThreads).set({
-      browserGeneration: profile.generation,
-      browserTargetId: target.targetId,
-      browserCdpSessionId: target.sessionId,
-      conversationBindingStatus: "bound",
-      revision: thread.revision + 1,
-    }).where(and(eq(reviewThreads.id, thread.id), eq(reviewThreads.revision, thread.revision))).run();
-    bindings.set(thread.id, target);
-    return { target, driver };
   }
 
   return {

@@ -62,6 +62,15 @@ try {
   const pendingThread = threads.getForRoute(route.id, route.routeEpoch)!;
   assert.equal(pendingThread.status, "pending_activation");
   assert.equal(threads.listMessages(pendingThread.id).length, 1);
+  // A route status change must not fabricate an active thread binding when none
+  // exists: with no reviewer principal/context yet, the thread stays
+  // `pending_activation` instead of being promoted to a ready-but-unbound state.
+  threads.setRouteStatus(route.id, route.routeEpoch, "active");
+  assert.equal(threads.getForRoute(route.id, route.routeEpoch)?.status, "pending_activation",
+    "setRouteStatus preserves pending_activation until a real reviewer binding exists");
+  threads.setRouteStatus(route.id, route.routeEpoch, "paused");
+  assert.equal(threads.getForRoute(route.id, route.routeEpoch)?.status, "pending_activation",
+    "pausing an unbound thread also leaves it pending_activation");
 
   const activation = threads.createActivation({ routeId: route.id, ownerPrincipalId: "owner", reviewerPrincipalId: "reviewer" });
   const storedGrant = db.sqlite.prepare("select activation_secret_sha256 from review_thread_activations where thread_id = ?").get(pendingThread.id) as { activation_secret_sha256: string };

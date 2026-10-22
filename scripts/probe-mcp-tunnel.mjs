@@ -10,6 +10,7 @@ import { dirname, resolve } from "node:path";
 import { assertInputSchemaCompatibility, extractCatalog, extractRegisteredCatalog, extractServerInfoVersion, extractWorkspaceAppResourceUris, fingerprintToolCatalog, matchJsonRpcResponse, parseSseEventChunks, TOOL_CATALOG_ACK_CAPABILITY, TOOL_CATALOG_ACK_METHOD } from "./lib/mcp-probe-protocol.mjs";
 import { matchCatalogAcknowledgementEvidence, matchExternalSseEvidence } from "./lib/mcp-qualification-evidence.mjs";
 import { classifyProbeFailure, writeFailedProbeReceipt } from "./lib/probe-failure-receipt.mjs";
+import { REQUIRED_REVIEW_THREAD_TOOLS } from "./lib/review-thread-tool-manifest.mjs";
 
 const args = process.argv.slice(2);
 function option(name, fallback) {
@@ -238,7 +239,7 @@ let postHeartbeatEvidence;
 
 function assertCatalogParity(label, listed, sessionId) {
   const actual = extractCatalog(listed);
-  const requiredTools = [...REQUIRED_INSPECTION_TOOLS, "poll_process"];
+  const requiredTools = [...REQUIRED_INSPECTION_TOOLS, "poll_process", ...REQUIRED_REVIEW_THREAD_TOOLS];
   const missingFromServer = requiredTools.filter((required) => !actual.names.has(required));
   if (missingFromServer.length > 0) {
     throw new Error(`${label} raw server tools/list is incomplete; diagnosis=deployed_server_catalog_incomplete; missing=${missingFromServer.join(",")}`);

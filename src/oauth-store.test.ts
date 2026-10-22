@@ -131,6 +131,9 @@ async function testDatabaseConfiguration(stateDir: string): Promise<void> {
       { version: 88, name: "scheduled-job-reconcile-backoff" },
       { version: 89, name: "historical-schema-drift-repair" },
       { version: 90, name: "scheduled-dispatch-attempt-diagnostics" },
+      { version: 91, name: "persistent-review-threads" },
+      { version: 92, name: "review-handoff-claim-leases" },
+      { version: 93, name: "browser-review-transport" },
     ]);
   } finally {
     database.close();

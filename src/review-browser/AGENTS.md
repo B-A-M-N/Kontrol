@@ -20,6 +20,7 @@ Review workflow stores own submissions, reviewer claims, and verdict authority. 
 - The browser turn dispatcher consumes the existing review dispatch outbox. It never claims handoffs, commits feedback, approves work, or treats generated prose as a verdict.
 - Browser turn dispatch wakes from post-commit outbox notifications and reconciles pending rows once at startup. Delayed retries use one timer for the next eligible deadline; there is no recurring outbox or page-generation poll.
 - Visible prompt acceptance is transport evidence only. The browser attempt remains active until authenticated feedback commits through the review workflow.
+- Restoration attaches a fresh CDP session per call. That session becomes the durable binding only after a successful thread-revision commit; every other `restoreThread` exit path detaches exactly the session it created, and only a strictly-older superseded binding is disposed on success. Committed (durable) and newer bindings are never detached.
 - Reviewer profile and binding controls are reviewer-only MCP tools. Do not create a reviewer dashboard; human approval remains in the existing Approval Center.
 
 ## Work Guidance
@@ -38,3 +39,4 @@ Keep browser transport independent from ACP coding-agent selection and from prov
 | `profile-store.ts`, `chrome-process.ts`, `cdp-client.ts`, `target-binding.ts` | Private profile lifecycle, owned Chromium/CDP, and exact conversation recovery. |
 | `chatgpt-page-driver.ts`, `browser-controller.ts`, `turn-dispatcher.ts` | Narrow ChatGPT DOM operations and durable browser-turn transport. |
 | `contracts.test.ts` | Contract tests without launching a live browser or contacting ChatGPT. |
+| `browser-restore-cleanup.test.ts` | Focused restoration ownership tests (inspect/enable failures, CAS race, superseded-session disposal) using a fake CDP/controller. |

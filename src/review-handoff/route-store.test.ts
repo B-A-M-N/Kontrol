@@ -155,7 +155,30 @@ try {
   const h2Claim = routes.claimHandoff({
     handoffId: h2.id, expectedRevision: h2.revision, principalId: "user-b",
     ownerContextId: "review-context-b", reviewThreadId: activated.id,
+    claimLeaseMs: 60_000,
   });
+  // ── bounded claim renewal: same principal/context, unexpired lease, and a
+  //    cumulative budget hung off the original claim time.
+  const renewed = routes.renewHandoffClaim({
+    handoffId: h2.id, expectedRevision: h2Claim.revision, principalId: "user-b",
+    ownerContextId: "review-context-b", claimLeaseMs: 60_000,
+  });
+  assert.equal(renewed.status, "claimed");
+  assert.ok(Date.parse(renewed.claimExpiresAt!) > Date.parse(h2Claim.claimExpiresAt!),
+    "renewal extends the unexpired lease");
+  assert.throws(() => routes.renewHandoffClaim({
+    handoffId: h2.id, expectedRevision: renewed.revision, principalId: "user-c",
+    ownerContextId: "review-context-b", claimLeaseMs: 60_000,
+  }), /expired|released|different/i, "a different principal cannot renew a live claim");
+  // An expired claim cannot be renewed; it must be reclaimed instead.
+  const bakedExpiry = routes.getHandoffById(h2.id)!;
+  db.sqlite.prepare("update review_handoffs set claim_expires_at = ? where id = ?").run("1970-01-01T00:00:00.000Z", h2.id);
+  // `bakedExpiry.revision` is the current revision: a failed renew call never
+  // bumps it, and baking expiry only touches the timestamp column.
+  assert.throws(() => routes.renewHandoffClaim({
+    handoffId: h2.id, expectedRevision: bakedExpiry.revision, principalId: "user-b",
+    ownerContextId: "review-context-b", claimLeaseMs: 60_000,
+  }), /expired|released|different/i, "an expired claim cannot be renewed, only reclaimed");
   const pendingGrant = threads.createActivation({ routeId: resumed.id, ownerPrincipalId: "user-a", reviewerPrincipalId: "user-b" });
   const disabled = routes.setStatus({ workSessionId: "wsess-route", status: "disabled" });
   assert.equal(disabled.routeEpoch, resumed.routeEpoch + 1, "disabling the route advances its generation");

@@ -99,6 +99,19 @@ export interface ReviewRouteStore {
     destinationConversationId?: string;
     claimLeaseMs?: number;
   }): ReviewHandoff;
+  /**
+   * Extend the current reviewer claim before a lengthy inspection or feedback
+   * pass. Only the same authenticated reviewer can renew an unexpired claim,
+   * up to the bounded cumulative review duration measured from the original
+   * claim. Renewal never revives an expired, released, or re-bound claim.
+   */
+  renewHandoffClaim(input: {
+    handoffId: string;
+    expectedRevision: number;
+    principalId: string;
+    ownerContextId: string;
+    claimLeaseMs?: number;
+  }): ReviewHandoff;
   markHandoffStatus(input: {
     handoffId: string;
     expectedRevision: number;
@@ -494,6 +507,46 @@ export function createReviewRouteStore(database: DatabaseHandle): ReviewRouteSto
         const row = database.db.select().from(reviewHandoffs).where(eq(reviewHandoffs.id, input.handoffId)).get();
         if (!row) throw new Error("Review handoff disappeared after claim.");
         return rowToHandoff(row);
+      })();
+    },
+
+    renewHandoffClaim(input) {
+      return database.sqlite.transaction(() => {
+        const handoff = getHandoffById(input.handoffId);
+        if (!handoff) throw new Error(`Unknown review handoff: ${input.handoffId}`);
+        const route = getRouteBySession(handoff.workSessionId);
+        const nowMs = Date.now();
+        const now = new Date(nowMs).toISOString();
+        if (!route || route.status !== "active" || handoff.routeEpoch !== route.routeEpoch) {
+          throw new Error("Review claim cannot be renewed for an inactive or stale route.");
+        }
+        if (handoff.status !== "claimed" || handoff.revision !== input.expectedRevision
+          || handoff.claimedByPrincipalId !== input.principalId
+          || handoff.claimedByOwnerContextId !== input.ownerContextId
+          || !handoff.claimedAt || !handoff.claimExpiresAt || Date.parse(handoff.claimExpiresAt) <= nowMs) {
+          throw new Error("Review claim is expired, released, or bound to a different reviewer.");
+        }
+        // The cumulative claim budget is measured from the original claim so a
+        // reviewer cannot extend one handoff indefinitely with repeated
+        // renewals. The per-renewal lease is bounded and clamped to the budget.
+        const maximumClaimDurationMs = 2 * 60 * 60_000;
+        const maximumExpiry = Date.parse(handoff.claimedAt) + maximumClaimDurationMs;
+        const requestedLeaseMs = Math.max(60_000, Math.min(input.claimLeaseMs ?? 15 * 60_000, 30 * 60_000));
+        const claimExpiresAt = new Date(Math.min(nowMs + requestedLeaseMs, maximumExpiry)).toISOString();
+        if (Date.parse(claimExpiresAt) <= nowMs) throw new Error("The maximum cumulative review-claim duration has elapsed.");
+        const updated = database.db.update(reviewHandoffs).set({
+          claimExpiresAt,
+          revision: input.expectedRevision + 1,
+        }).where(and(
+          eq(reviewHandoffs.id, handoff.id),
+          eq(reviewHandoffs.revision, input.expectedRevision),
+          eq(reviewHandoffs.status, "claimed"),
+          eq(reviewHandoffs.claimedByPrincipalId, input.principalId),
+          eq(reviewHandoffs.claimedByOwnerContextId, input.ownerContextId),
+          sql`${reviewHandoffs.claimExpiresAt} > ${now}`,
+        )).run();
+        if (updated.changes !== 1) throw new Error("Review claim renewal compare-and-swap conflict.");
+        return getHandoffById(input.handoffId)!;
       })();
     },
 
