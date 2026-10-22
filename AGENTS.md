@@ -137,6 +137,25 @@ Current implementation contracts:
   revoked at terminal session state (including startup reconciliation), while
   workspace grants survive restart until explicitly revoked. A session grant
   is never offered without a concrete work-session ID.
+- Native-CDP reviewer authentication uses a separate durable auth state. Manual
+  sign-in runs in official Chrome without remote debugging, then the same
+  private profile is relaunched under loopback CDP and ChatGPT session readiness
+  is verified before conversation binding. Credentials and cookies never enter
+  MCP or Kontrol storage. Expired browser dispatch leases requeue only attempts
+  known to be before the send boundary; later attempts remain fenced for exact
+  conversation reconciliation. Shutdown drains the dispatcher before closing
+  CDP or SQLite.
+- An expired post-dispatch browser attempt remains fenced until authenticated
+  feedback commits or the active reviewer explicitly inspects the exact bound
+  conversation and confirms the immutable prompt is absent. Recovery records
+  the reviewer principal and a hash of the inspection note before requeueing
+  the same immutable reviewer message; uncertain prompts are never auto-retried.
+- `outcome_verified` mission observations are recorded only by the authenticated
+  reviewer workflow and bind the exact submission, review epoch, snapshot,
+  contract-declared expected behavior, observer principal, and external-evidence
+  hash. `canApprove` consumes only matching receipts. `operationally_stable`
+  remains unsupported until its durability window and signed qualification
+  receipt exist.
 - Ordinary `bash` in minimal/full tool modes starts through
   `ProcessSessionManager` with a bounded request yield and an independent child
   timeout; a still-running command returns a process session for the read-only
@@ -331,6 +350,9 @@ Current implementation contracts:
   Scheduler history and recovery use SQL limits and cursors, bounded dispatch
   concurrency, and diagnostics for due age, uncertain launches, unreconciled
   attempt age, and dispatch throughput.
+- Scheduled job capability metadata describes both `read_only_audit` and
+  `bounded_file_write`; host catalog availability and a real bounded-write
+  receipt still require current external qualification evidence.
 - Scheduled worker completion is derived only from authenticated lifecycle
   evidence bound to the authoritative dispatch attempt. Dispatch acceptance,
   worker start/stop outcome, and reviewer approval remain separate; a rejected
@@ -393,6 +415,9 @@ Current implementation contracts:
   same project scope, and review/tool cursors use stable timestamp-plus-ID
   ordering. Older pending reviews are discoverable through an explicit stale
   history filter rather than silently disappearing from the active surface.
+- Historical pending-review UI uses the server's descending timestamp-plus-ID
+  keyset cursor, keeps loading state visible, and reports when the history is
+  exhausted. Workspace changes discard the prior history cursor.
 - `changes_requested` review feedback requires nonempty agent instructions.
   Durable bridge and policy mutations accept an optional authenticated
   principal-scoped `clientMutationId`; canonical request receipts replay
@@ -634,3 +659,6 @@ MCP context isolation:
 |------|---------|
 | `src/review-thread/` | Persistent reviewer-thread identity, activation authority, and message lifecycle |
 | `src/review-browser/` | Private Chromium profile lifecycle, exact ChatGPT conversation binding, and bounded review packet transport |
+| `src/server/` | Startup recovery, bounded reconciliation, and ordered server shutdown |
+| `src/ui/` | Workspace App hydration, event replay, and reviewer-visible recovery state |
+| `src/mission-ledger.ts` | Durable mission evidence, exact-snapshot approval projection, and external outcome receipts |

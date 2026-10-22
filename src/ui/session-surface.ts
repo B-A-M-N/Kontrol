@@ -102,6 +102,8 @@ export interface SessionSurfaceHost {
   connectionState(): string;
   render(): void;
   historicalPendingReviewsLoaded(): boolean;
+  historicalPendingReviewsLoading(): boolean;
+  historicalPendingReviewsCursor(): { updatedAt: string; sessionId: string } | null;
   reviewCardFromSubmission(submission: ReviewSubmissionView, sessionId: string): ToolResultCard;
   getLastToolCard(): ToolResultCard | null;
   getErrorMessage(): string | null;
@@ -338,13 +340,15 @@ export function renderSessionSwitcher(container: HTMLElement): void {
     button.addEventListener("click", () => selectWorkSession(approvalCenter.workSessionId));
     container.append(button);
   }
-  if (host.getActiveWorkspaceId() && !host.historicalPendingReviewsLoaded()) {
+  if (host.getActiveWorkspaceId()) {
+    const historyLoaded = host.historicalPendingReviewsLoaded();
+    const historyLoading = host.historicalPendingReviewsLoading();
     const history = element("button", {
       className: "session-switcher-item history-action",
       type: "button",
-      text: "Load older pending reviews",
-      ariaLabel: "Load older pending reviews",
-      disabled: !host.uiMutationsAllowed(),
+      text: historyLoading ? "Loading older pending reviews…" : historyLoaded ? "No older pending reviews" : host.historicalPendingReviewsCursor() ? "Load more older pending reviews" : "Load older pending reviews",
+      ariaLabel: historyLoaded ? "No older pending reviews" : "Load older pending reviews",
+      disabled: !host.uiMutationsAllowed() || historyLoading || historyLoaded,
     });
     history.dataset.focusKey = "session-history";
     history.addEventListener("click", () => { void loadHistoricalPendingReviews(); });

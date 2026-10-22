@@ -157,6 +157,7 @@ export const supervisedMissionOptionsSchema = z.object({
   maxWallTimeMinutes: z.number().int().min(1).max(10_080).optional(),
   finalVerification: z.array(z.string()).optional(),
   reviewCoverage: z.array(z.string()).optional(),
+  outcomeExpectedBehavior: z.string().trim().min(1).max(8_000).optional().describe("Required when outcomeEvidence is outcome_verified; the exact user-visible behavior an authenticated external reviewer must observe."),
   outcomeEvidence: z.enum(["implementation_verified", "integration_verified", "outcome_verified", "operationally_stable"]).optional().describe("Minimum independent evidence strength required for mission completion. Defaults to implementation_verified for lightweight missions; outcome_verified requires an explicit outcome oracle beyond internal checks."),
   autonomyMode: z.enum(["manual", "verify_only", "correction_auto", "full"]).optional(),
   approvalMode: z.enum(["human_required", "policy_auto", "fully_automatic"]).optional(),
@@ -169,6 +170,13 @@ export const supervisedMissionOptionsSchema = z.object({
       code: "custom",
       path: ["finalVerification"],
       message: "outcomeEvidence integration_verified requires at least one finalVerification command.",
+    });
+  }
+  if (data.outcomeEvidence === "outcome_verified" && !data.outcomeExpectedBehavior?.trim()) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["outcomeExpectedBehavior"],
+      message: "outcomeEvidence outcome_verified requires the exact user-visible behavior an authenticated external reviewer must confirm.",
     });
   }
 });

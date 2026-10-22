@@ -206,6 +206,7 @@ assert.equal(reviewContainer.childElementCount, 0, "review renderer unmount is c
 (globalThis as { __KONTROL_UI_TEST_MODE__?: boolean }).__KONTROL_UI_TEST_MODE__ = true;
 let fakeConnectCount = 0;
 let fakeSurfaceFailures = 0;
+let fakeHistoricalResponse: (() => Promise<unknown>) | undefined;
 let fakeEventDelivered = false;
 let fakeReplayDelivered = false;
 const parkedWorkspaceWatchers = new Set<string>();
@@ -241,6 +242,9 @@ const fakeApp = {
       return { isError: false, content: [], structuredContent: { runId: "run-ui-agent", workSessionId: "session-ui-agent", workspaceSessionId: "workspace-dom", status: "running", agentName: "hermes-agent" } };
     }
     if (name === "get_workspace_session_surface") {
+      if ((request.arguments as { filter?: string } | undefined)?.filter === "stale_pending_review" && fakeHistoricalResponse) {
+        return await fakeHistoricalResponse();
+      }
       if (fakeSurfaceFailures > 0) {
         fakeSurfaceFailures -= 1;
         throw new Error("simulated transport loss");
@@ -479,6 +483,61 @@ assert.ok(
   fakeToolCalls.filter((name) => name === "get_workspace_session_surface").length > surfaceCallsBeforeReconnect + 1,
   "reconnect rehydrates durable workspace state before/alongside the safe retry",
 );
+
+// Historical review loading must page in the server's descending keyset order,
+// keep loading visible while a request is in flight, and stop only at the end.
+{
+  __workspaceAppTest.activateWorkspace("workspace-reconnect");
+  __workspaceAppTest.renderWorkSessionView(__workspaceAppTest.getWorkSessionView("session-reconnect")!);
+  let releaseFirstPage!: (value: unknown) => void;
+  fakeHistoricalResponse = () => new Promise((resolve) => { releaseFirstPage = resolve; });
+  const firstPageLoad = __workspaceAppTest.loadHistoricalPendingReviews();
+  await settle();
+  __workspaceAppTest.renderWorkSessionView(__workspaceAppTest.getWorkSessionView("session-reconnect")!);
+  assert.match(document.querySelector<HTMLButtonElement>(".history-action")?.textContent ?? "", /Loading older pending reviews/,
+    "history load state is visible while the server request is pending");
+  const firstPageSessions = Array.from({ length: 100 }, (_, index) => ({
+    sessionId: `history-${String(199 - index).padStart(3, "0")}`,
+    workspaceSessionId: "workspace-reconnect", status: "awaiting_review", runtimeState: "stale", lifecycle: "stale",
+    submittedBy: "reviewer", updatedAt: "2025-01-01T00:00:00.000Z", lastSeq: 0,
+  }));
+  releaseFirstPage({ isError: false, content: [], structuredContent: { lastSeq: 0, sessions: firstPageSessions } });
+  await firstPageLoad;
+  __workspaceAppTest.renderWorkSessionView(__workspaceAppTest.getWorkSessionView("session-reconnect")!);
+  assert.match(document.querySelector<HTMLButtonElement>(".history-action")?.textContent ?? "", /Load more older pending reviews/,
+    "a full page advertises that older history remains available");
+  fakeHistoricalResponse = async () => ({ isError: false, content: [], structuredContent: { lastSeq: 0, sessions: [{
+    sessionId: "history-099", workspaceSessionId: "workspace-reconnect", status: "awaiting_review", runtimeState: "stale", lifecycle: "stale",
+    submittedBy: "reviewer", updatedAt: "2025-01-01T00:00:00.000Z", lastSeq: 0,
+  }] } });
+  await __workspaceAppTest.loadHistoricalPendingReviews();
+  const historicalCalls = fakeToolArguments.filter((entry) => entry.name === "get_workspace_session_surface" && entry.arguments?.filter === "stale_pending_review");
+  assert.equal(historicalCalls.length, 2, "history is loaded as bounded pages");
+  assert.deepEqual({ afterUpdatedAt: historicalCalls[1]?.arguments?.afterUpdatedAt, afterSessionId: historicalCalls[1]?.arguments?.afterSessionId },
+    { afterUpdatedAt: "2025-01-01T00:00:00.000Z", afterSessionId: "history-100" },
+    "the second history page uses the exact timestamp-plus-session keyset cursor");
+  __workspaceAppTest.renderWorkSessionView(__workspaceAppTest.getWorkSessionView("session-reconnect")!);
+  const historyEnd = document.querySelector<HTMLButtonElement>(".history-action");
+  assert.match(historyEnd?.textContent ?? "", /No older pending reviews/, "the UI visibly marks the end of history");
+  assert.equal(historyEnd?.disabled, true);
+  fakeHistoricalResponse = undefined;
+
+  __workspaceAppTest.activateWorkspace("workspace-history-race");
+  let releaseStalePage!: (value: unknown) => void;
+  fakeHistoricalResponse = () => new Promise((resolve) => { releaseStalePage = resolve; });
+  const stalePageLoad = __workspaceAppTest.loadHistoricalPendingReviews();
+  await settle();
+  assert.equal(__workspaceAppTest.isHistoricalPendingReviewsLoading(), true);
+  __workspaceAppTest.activateWorkspace("workspace-history-next");
+  assert.equal(__workspaceAppTest.isHistoricalPendingReviewsLoading(), false, "switching workspaces releases the prior history loading state");
+  releaseStalePage({ isError: false, content: [], structuredContent: { lastSeq: 0, sessions: [{
+    sessionId: "must-not-leak", workspaceSessionId: "workspace-history-race", status: "awaiting_review", runtimeState: "stale", lifecycle: "stale",
+    submittedBy: "reviewer", updatedAt: "2025-01-01T00:00:00.000Z", lastSeq: 0,
+  }] } });
+  await stalePageLoad;
+  assert.equal(__workspaceAppTest.getWorkSessionView("must-not-leak"), undefined, "late history results from a previous workspace are discarded");
+  fakeHistoricalResponse = undefined;
+}
 
 await assert.rejects(
   __workspaceAppTest.callServerToolChecked({

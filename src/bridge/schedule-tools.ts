@@ -64,7 +64,7 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
     "schedule_job",
     {
       title: "Schedule bounded job",
-      description: "Create a durable future job for a workspace. Current execution mode is read_only_audit; work is dispatched through the normal ACP path at the requested UTC time.",
+      description: "Create a durable future job for a workspace. Choose read_only_audit or bounded_file_write; bounded writes require exact allowedOutputs and publish through the controlled staged publisher. Work is dispatched through the normal ACP path at the requested UTC time.",
       inputSchema: {
         workspaceId: z.string().describe("Workspace ID from open_workspace."),
         runAt: z.string().datetime({ offset: true }).describe("UTC execution deadline."),

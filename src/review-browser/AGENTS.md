@@ -15,6 +15,9 @@ Review workflow stores own submissions, reviewer claims, and verdict authority. 
 - Conversation creation is disabled unless an operator explicitly enables it.
 - Browser generation and prompt acceptance are transport evidence only. Only authenticated MCP review tools commit feedback.
 - Authentication and verification screens stop work for human action. Do not bypass them.
+- Manual authentication uses the same private persistent profile in official Chrome without CDP; controlled review starts only after that process exits and Kontrol verifies the ChatGPT session after relaunch.
+- Authentication state is durable and separate from browser generation/process status. Never accept credentials, recovery codes, OTPs, or cookies through MCP; a blocked handoff preserves the review route and queued packet.
+- Manual authentication and controlled review must share the profile ownership lock and cannot overlap. The default manual-auth executable must be official Chrome; arbitrary Chromium is not a silent fallback.
 - DOM selectors and generation observation stay inside `chatgpt-page-driver.ts`.
 - The native Chromium controller uses the built-in WebSocket CDP client; do not add Playwright, ActiveTab imports, or a separate browser worker.
 - The browser turn dispatcher consumes the existing review dispatch outbox. It never claims handoffs, commits feedback, approves work, or treats generated prose as a verdict.

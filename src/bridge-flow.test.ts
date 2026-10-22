@@ -24,6 +24,13 @@ import { createAgentMessageManager } from "./agent-messages.js";
 import { registerPolicyTools } from "./policy-tools.js";
 import { authorizeWorkSessionAction } from "./work-session-action-guard.js";
 import { compactMissionPacket, projectMissionExecutionContract, renderMissionPrompt } from "./bridge/shared.js";
+import { supervisedMissionOptionsSchema } from "./bridge/context.js";
+
+assert.equal(supervisedMissionOptionsSchema.safeParse({ outcomeEvidence: "outcome_verified" }).success, false,
+  "the MCP mission contract requires its external outcome oracle before supervised work can start");
+assert.equal(supervisedMissionOptionsSchema.safeParse({
+  outcomeEvidence: "outcome_verified", outcomeExpectedBehavior: "The reviewer can see the saved change after reload.",
+}).success, true, "the MCP mission contract exposes the declared expected behavior used by the reviewer observation tool");
 
 const root = await mkdtemp(join(tmpdir(), "kontrol-bridge-flow-"));
 const VERIFY_WS = "ws-verification-test";

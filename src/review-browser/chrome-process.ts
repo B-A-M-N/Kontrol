@@ -28,12 +28,30 @@ export interface ChromeProcessOptions {
   environment?: NodeJS.ProcessEnv;
 }
 
-function chromeBinary(explicit?: string): string {
+export type ChromeLaunchPurpose = "manual_authentication" | "controlled_review";
+
+export function chromeArguments(profileDirectory: string, purpose: ChromeLaunchPurpose, mode: ReviewerBrowserMode = "headed"): string[] {
+  const common = [`--user-data-dir=${profileDirectory}`, "--no-first-run", "--no-default-browser-check"];
+  if (purpose === "manual_authentication") return [...common, "https://chatgpt.com/"];
+  return [
+    ...common,
+    "--remote-debugging-port=0",
+    "--remote-debugging-address=127.0.0.1",
+    ...(mode === "headless" ? ["--headless=new"] : []),
+    "about:blank",
+  ];
+}
+
+function chromeBinary(explicit?: string, purpose: ChromeLaunchPurpose = "controlled_review"): string {
   if (explicit) return explicit;
   const candidates = process.platform === "linux"
-    ? ["/usr/bin/google-chrome", "/usr/bin/google-chrome-stable", "/usr/bin/chromium", "/usr/bin/chromium-browser", "/snap/bin/chromium"]
+    ? purpose === "manual_authentication"
+      ? ["/usr/bin/google-chrome", "/usr/bin/google-chrome-stable"]
+      : ["/usr/bin/google-chrome", "/usr/bin/google-chrome-stable", "/usr/bin/chromium", "/usr/bin/chromium-browser", "/snap/bin/chromium"]
     : process.platform === "darwin"
-      ? ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "/Applications/Chromium.app/Contents/MacOS/Chromium"]
+      ? purpose === "manual_authentication"
+        ? ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"]
+        : ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "/Applications/Chromium.app/Contents/MacOS/Chromium"]
       : ["C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe", "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe"];
   const found = candidates.find((candidate) => existsSync(candidate));
   if (!found) throw new Error("Chromium was not found; set the explicit KONTROL_REVIEW_BROWSER_CHROME_PATH.");
@@ -103,10 +121,13 @@ async function readDebugEndpoint(profileDirectory: string): Promise<string | und
 
 async function verifyExisting(profileDirectory: string): Promise<{ cdp: CdpClient; version: Record<string, unknown>; pid?: number } | undefined> {
   const endpoint = await readDebugEndpoint(profileDirectory);
-  if (!endpoint) return undefined;
   const pid = await chromePidForProfile(profileDirectory);
   const lockPresent = await lstat(join(profileDirectory, "SingletonLock")).then(() => true).catch(() => false);
   if (lockPresent && !pid && process.platform === "linux") throw new Error("Chromium profile lock exists but its owner cannot be verified; refusing to launch or attach.");
+  if (!endpoint) {
+    if (pid) throw new Error("The selected reviewer profile is open in ordinary Chrome without CDP; close it before starting controlled review.");
+    return undefined;
+  }
   if (!lockPresent && process.platform === "linux") return undefined;
   const cdp = await new CdpClient(endpoint, 5_000).connect().catch(() => undefined);
   if (!cdp) {
@@ -140,8 +161,7 @@ async function waitForExit(child: ChildProcess, timeoutMs: number): Promise<bool
   });
 }
 
-export async function launchOrReconnectChrome(options: ChromeProcessOptions): Promise<OwnedChrome> {
-  const profileDirectory = resolve(options.profileDirectory);
+async function acquireProfileLock(profileDirectory: string, generation: number): Promise<() => Promise<void>> {
   if (activeProfileLocks.has(profileDirectory)) throw new Error("Another browser controller in this process owns the selected reviewer profile.");
   await assertPrivateProfile(profileDirectory);
   const lockPath = join(profileDirectory, "kontrol-controller.lock");
@@ -151,23 +171,82 @@ export async function launchOrReconnectChrome(options: ChromeProcessOptions): Pr
   catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
     let ownerPid: number | undefined;
-    try { ownerPid = Number((JSON.parse(await readFile(lockPath, "utf8")) as { pid?: unknown }).pid); } catch { /* stale malformed lock reconciled below */ }
+    try { ownerPid = Number((JSON.parse(await readFile(lockPath, "utf8")) as { pid?: unknown }).pid); } catch { /* reconcile only a conclusively dead process */ }
     if (ownerPid && ownerPid !== process.pid) {
       try { process.kill(ownerPid, 0); throw new Error("Another Kontrol browser controller owns this profile."); }
-      catch (probeError) {
-        if (probeError instanceof Error && probeError.message === "Another Kontrol browser controller owns this profile.") throw probeError;
-      }
+      catch (probeError) { if (probeError instanceof Error && probeError.message === "Another Kontrol browser controller owns this profile.") throw probeError; }
     }
     await unlink(lockPath).catch(() => undefined);
     lockHandle = await open(lockPath, "wx", 0o600);
   }
   activeProfileLocks.add(profileDirectory);
-  await lockHandle.writeFile(JSON.stringify({ pid: process.pid, generation: options.generation, acquiredAt: new Date().toISOString() }));
+  await lockHandle.writeFile(JSON.stringify({ pid: process.pid, generation, acquiredAt: new Date().toISOString() }));
   await lockHandle.close();
+  return async () => { await unlink(lockPath).catch(() => undefined); activeProfileLocks.delete(profileDirectory); };
+}
+
+export interface ManualChromeAuthentication {
+  readonly browserPid?: number;
+  hasExited(): boolean;
+  releaseAfterExit(): Promise<void>;
+  close(): Promise<boolean>;
+}
+
+export async function launchManualAuthenticationChrome(options: Pick<ChromeProcessOptions, "profileDirectory" | "generation" | "chromePath" | "startupTimeoutMs" | "environment">): Promise<ManualChromeAuthentication> {
+  const profileDirectory = resolve(options.profileDirectory);
+  const releaseLock = await acquireProfileLock(profileDirectory, options.generation);
+  let child: ChildProcess | undefined;
+  try {
+    const existingOwner = await chromePidForProfile(profileDirectory);
+    const hasProfileLock = await lstat(join(profileDirectory, "SingletonLock")).then(() => true).catch(() => false);
+    const hasDebugEndpoint = Boolean(await readDebugEndpoint(profileDirectory));
+    if (existingOwner || hasProfileLock || hasDebugEndpoint) throw new Error("The selected reviewer profile is already open or has unresolved browser ownership; close Chrome and reconcile the profile before beginning manual authentication.");
+    const executable = chromeBinary(options.chromePath, "manual_authentication");
+    child = spawn(executable, chromeArguments(profileDirectory, "manual_authentication"), {
+      stdio: "ignore", env: chromeEnvironment(options.environment ?? process.env), windowsHide: false,
+    });
+    const deadline = Date.now() + (options.startupTimeoutMs ?? 30_000);
+    let owned = false;
+    while (Date.now() < deadline) {
+      if (child.exitCode !== null || child.signalCode !== null) throw new Error("Official Chrome exited before manual authentication opened.");
+      if (await chromePidForProfile(profileDirectory).catch(() => undefined)) { owned = true; break; }
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
+    }
+    if (!owned) throw new Error("Official Chrome did not establish ownership of the reviewer profile before the startup deadline.");
+    let released = false;
+    const release = async () => {
+      if (released) return;
+      if (child!.exitCode === null && child!.signalCode === null) throw new Error("Close the manual Chrome window before completing the authentication handoff.");
+      const owner = await chromePidForProfile(profileDirectory).catch(() => undefined);
+      if (owner) throw new Error("The reviewer profile is still open in another Chrome process; close every window before handoff.");
+      released = true;
+      await releaseLock();
+    };
+    return {
+      ...(child.pid ? { browserPid: child.pid } : {}),
+      hasExited: () => child!.exitCode !== null || child!.signalCode !== null,
+      releaseAfterExit: release,
+      async close() {
+        if (child!.exitCode === null && child!.signalCode === null) child!.kill("SIGTERM");
+        const exited = await waitForExit(child!, 8_000);
+        if (!exited) return false;
+        await release();
+        return true;
+      },
+    };
+  } catch (error) {
+    if (child?.pid && child.exitCode === null) { child.kill("SIGTERM"); await waitForExit(child, 2_000); }
+    await releaseLock();
+    throw error;
+  }
+}
+
+export async function launchOrReconnectChrome(options: ChromeProcessOptions): Promise<OwnedChrome> {
+  const profileDirectory = resolve(options.profileDirectory);
+  const releaseLock = await acquireProfileLock(profileDirectory, options.generation);
   let child: ChildProcess | undefined;
   let cdp: CdpClient | undefined;
   let stopped = false;
-  const releaseLock = async () => { await unlink(lockPath).catch(() => undefined); activeProfileLocks.delete(profileDirectory); };
   try {
     const existing = await verifyExisting(profileDirectory);
     if (existing) {
@@ -175,17 +254,7 @@ export async function launchOrReconnectChrome(options: ChromeProcessOptions): Pr
       return createHandle(existing.pid, existing.version, true);
     }
     const executable = chromeBinary(options.chromePath);
-    const args = [
-      `--user-data-dir=${profileDirectory}`,
-      "--remote-debugging-port=0",
-      "--remote-debugging-address=127.0.0.1",
-      "--no-first-run",
-      "--no-default-browser-check",
-      "--disable-default-apps",
-    ];
-    if (options.mode === "headless") args.push("--headless=new");
-    args.push("about:blank");
-    child = spawn(executable, args, { stdio: "ignore", env: chromeEnvironment(options.environment ?? process.env), windowsHide: false });
+    child = spawn(executable, chromeArguments(profileDirectory, "controlled_review", options.mode), { stdio: "ignore", env: chromeEnvironment(options.environment ?? process.env), windowsHide: false });
     const endpoint = await waitForEndpoint(profileDirectory, child, options.startupTimeoutMs ?? 30_000);
     cdp = await new CdpClient(endpoint, 5_000).connect();
     const version = await cdp.send<Record<string, unknown>>("Browser.getVersion");

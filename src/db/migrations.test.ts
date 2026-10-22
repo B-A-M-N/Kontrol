@@ -11,7 +11,7 @@ sqlite.pragma("foreign_keys = ON");
 try {
   migrateDatabase(sqlite);
   const schemaContract = inspectDatabaseSchemaContract(sqlite);
-  assert.equal(schemaContract.expectedTableCount, 46, "schema contract covers all Drizzle table mappings");
+  assert.equal(schemaContract.expectedTableCount, 47, "schema contract covers all Drizzle table mappings");
   assert.deepEqual(schemaContract.missing, [], "all Drizzle tables and columns are present in migrated SQLite");
   assert.equal(schemaContract.appliedVersion, LATEST_SCHEMA_VERSION);
   assert.ok(
@@ -43,6 +43,14 @@ try {
     (sqlite.prepare("pragma table_info(review_browser_turns)").all() as Array<{ name: string }>)
       .some((column) => column.name === "lease_token_sha256"),
     "browser review turns persist fenced delivery leases",
+  );
+  const browserTurnColumns = (sqlite.prepare("pragma table_info(review_browser_turns)").all() as Array<{ name: string }>).map((column) => column.name);
+  assert.ok(browserTurnColumns.includes("generation_started_at") && browserTurnColumns.includes("generation_started_observation_id")
+    && browserTurnColumns.includes("generation_finished_observation_id"), "browser turns persist bounded generation observation identity and timestamps");
+  assert.ok(
+    (sqlite.prepare("pragma table_info(review_browser_turn_resolutions)").all() as Array<{ name: string }>)
+      .some((column) => column.name === "evidence_sha256"),
+    "operator browser recovery receipts persist only a hash of the inspection note",
   );
   assert.ok(
     (sqlite.prepare("pragma table_info(review_browser_profiles)").all() as Array<{ name: string }>)

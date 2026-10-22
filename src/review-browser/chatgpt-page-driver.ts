@@ -5,7 +5,8 @@ import { canonicalReviewerConversation } from "./target-binding.js";
 
 export type BrowserReadiness =
   | { status: "ready"; conversationUrl: string; conversationKey: string }
-  | { status: "login_required" | "verification_required" | "connector_authorization_required" | "composer_unavailable" | "wrong_conversation" | "generation_active" | "browser_disconnected"; detail?: string };
+  | { status: "login_required" | "verification_required" | "identity_provider_unsupported_browser" | "session_expired" | "authentication_handoff_failed" | "connector_authorization_required" | "composer_unavailable" | "wrong_conversation" | "generation_active" | "browser_disconnected"; detail?: string };
+export type AuthenticationFailure = "login_required" | "identity_provider_unsupported_browser" | "verification_required" | "session_expired" | "authentication_handoff_failed";
 export interface TurnBaseline { conversationKey: string; userMessageCount: number; assistantMessageCount: number; capturedAt: string }
 export type PromptSubmission = { status: "accepted"; submittedAt: string; conversationKey: string }
   | { status: "rejected"; reason: string }
@@ -21,6 +22,8 @@ const inspectPage = `(() => {
   const visible = e => { const r=e.getBoundingClientRect(), s=getComputedStyle(e); return r.width>0 && r.height>0 && s.display!=='none' && s.visibility!=='hidden'; };
   const select = selectors => { const set=new Set(); for (const s of selectors) for (const e of document.querySelectorAll(s)) if (visible(e)) set.add(e); return [...set]; };
   if (/^\\/auth\\/(login|signin)|^\\/login/.test(path)) return {status:'login_required'};
+  if (['insecure browser','unsupported browser','browser may not be secure'].some(x=>body.includes(x))) return {status:'identity_provider_unsupported_browser'};
+  if (['session expired','your session has expired'].some(x=>body.includes(x))) return {status:'session_expired'};
   if (['verify you are human','security check','complete the captcha','unusual activity'].some(x=>body.includes(x)) || document.querySelector('iframe[src*="captcha"],iframe[title*="challenge" i]')) return {status:'verification_required'};
   if (!url.startsWith('${ORIGIN}/')) return {status:'wrong_conversation'};
   const match=path.match(/^\\/c\\/([A-Za-z0-9_-]{8,160})\\/?$/);
@@ -105,7 +108,7 @@ export class ChatGptPageDriver {
 
   async observeGeneration(baseline: TurnBaseline, attemptId?: string): Promise<GenerationState> {
     const ready = await this.inspect(baseline.conversationKey);
-    if (["login_required", "verification_required", "wrong_conversation"].includes(ready.status)) return "blocked";
+    if (["login_required", "verification_required", "identity_provider_unsupported_browser", "session_expired", "authentication_handoff_failed", "wrong_conversation"].includes(ready.status)) return "blocked";
     if (ready.status === "browser_disconnected") return "unknown";
     if (ready.status === "generation_active") return "generating";
     if (ready.status !== "ready") return "not_started";
@@ -118,6 +121,30 @@ export class ChatGptPageDriver {
     if (!state.attemptPresent) return "unknown";
     if (state.generating) return "generating";
     return state.assistants > baseline.assistantMessageCount ? "finished" : "not_started";
+  }
+
+  async waitForGeneration(baseline: TurnBaseline, attemptId: string, phase: "start" | "finish", timeoutMs = 30 * 60_000): Promise<GenerationState> {
+    const ready = await this.inspect(baseline.conversationKey);
+    if (["login_required", "verification_required", "identity_provider_unsupported_browser", "session_expired", "authentication_handoff_failed", "wrong_conversation"].includes(ready.status)) return "blocked";
+    if (ready.status === "browser_disconnected") return "unknown";
+    const expression = `new Promise(resolve => {
+      const baseline=${JSON.stringify(baseline)}, attempt=${JSON.stringify(attemptId)}, phase=${JSON.stringify(phase)};
+      const visible=e=>{const r=e.getBoundingClientRect(),s=getComputedStyle(e);return r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden'};
+      const inspect=()=>{const users=[...document.querySelectorAll('[data-message-author-role="user"]')],last=users[users.length-1];
+        if(!(last?.innerText||'').includes(attempt))return 'unknown';
+        const generating=${JSON.stringify(STOPS)}.some(s=>[...document.querySelectorAll(s)].some(visible));
+        const finished=document.querySelectorAll('[data-message-author-role="assistant"]').length>baseline.assistantMessageCount;
+        if(phase==='start')return generating?'generating':finished?'finished':null;
+        return finished&&!generating?'finished':null;
+      };
+      const initial=inspect();if(initial)return resolve(initial);
+      let done=false;const finish=value=>{if(done)return;done=true;observer.disconnect();clearTimeout(timer);resolve(value)};
+      const observer=new MutationObserver(()=>{const state=inspect();if(state)finish(state)});
+      observer.observe(document.body,{childList:true,subtree:true,attributes:true,characterData:true});
+      const timer=setTimeout(()=>finish('unknown'),${Math.max(1000, Math.min(timeoutMs, 30 * 60_000))});
+    })`;
+    try { return await this.evaluate<GenerationState>(expression, Math.min(timeoutMs, 30 * 60_000) + 2_000, true); }
+    catch { return "unknown"; }
   }
 
   private async evaluate<T>(expression: string, timeoutMs = 10_000, awaitPromise = false): Promise<T> {

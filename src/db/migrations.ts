@@ -105,7 +105,44 @@ const migrations: Migration[] = [
   { version: 91, name: "persistent-review-threads", up: migratePersistentReviewThreads },
   { version: 92, name: "review-handoff-claim-leases", up: migrateReviewHandoffClaimLeases },
   { version: 93, name: "browser-review-transport", up: migrateBrowserReviewTransport },
+  { version: 94, name: "review-browser-auth-state", up: migrateReviewerBrowserAuthState },
+  { version: 95, name: "authenticated-outcome-observation-receipts", up: migrateAuthenticatedOutcomeObservationReceipts },
+  { version: 96, name: "review-browser-attempt-recovery-receipts", up: migrateReviewBrowserAttemptRecoveryReceipts },
+  { version: 97, name: "review-browser-generation-observations", up: migrateReviewBrowserGenerationObservations },
 ];
+
+function migrateReviewerBrowserAuthState(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "review_browser_profiles", "auth_state", "text not null default 'unknown'");
+}
+
+function migrateAuthenticatedOutcomeObservationReceipts(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "mission_outcome_observations", "review_epoch", "integer");
+  addColumnIfMissing(sqlite, "mission_outcome_observations", "observer_principal_id", "text");
+  addColumnIfMissing(sqlite, "mission_outcome_observations", "observation_source", "text not null default 'legacy_operator_reported'");
+  addColumnIfMissing(sqlite, "mission_outcome_observations", "external_evidence_sha256", "text");
+}
+
+function migrateReviewBrowserAttemptRecoveryReceipts(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table if not exists review_browser_turn_resolutions (
+      attempt_id text primary key not null references review_browser_turns(id) on delete cascade,
+      review_thread_id text not null,
+      route_epoch integer not null,
+      reviewer_principal_id text not null,
+      resolution text not null,
+      evidence_sha256 text not null,
+      created_at text not null
+    );
+    create index if not exists review_browser_turn_resolutions_thread_idx
+      on review_browser_turn_resolutions(review_thread_id, created_at);
+  `);
+}
+
+function migrateReviewBrowserGenerationObservations(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "review_browser_turns", "generation_started_at", "text");
+  addColumnIfMissing(sqlite, "review_browser_turns", "generation_started_observation_id", "text");
+  addColumnIfMissing(sqlite, "review_browser_turns", "generation_finished_observation_id", "text");
+}
 
 function migrateBrowserReviewTransport(sqlite: Database.Database): void {
   addColumnIfMissing(sqlite, "review_routes", "delivery_transport", "text not null default 'mcp_app'");
@@ -2243,7 +2280,7 @@ function migrateExternalCatalogObservationsAndAssociations(sqlite: Database.Data
 
 function addColumnIfMissing(
   sqlite: Database.Database,
-  table: "workspace_sessions" | "work_sessions" | "work_session_submissions" | "work_session_feedback" | "agent_registry" | "continuations" | "acp_runs" | "agent_webhook_queue" | "dispatch_outbox" | "approval_requests" | "mission_evidence" | "event_log" | "supervisor_runs" | "mission_acceptance_criteria" | "mission_review_findings" | "mission_contracts" | "mission_completion_reports" | "scheduled_jobs" | "scheduled_job_attempts" | "review_routes" | "review_handoffs" | "review_threads" | "review_browser_turns",
+  table: "workspace_sessions" | "work_sessions" | "work_session_submissions" | "work_session_feedback" | "agent_registry" | "continuations" | "acp_runs" | "agent_webhook_queue" | "dispatch_outbox" | "approval_requests" | "mission_evidence" | "event_log" | "supervisor_runs" | "mission_acceptance_criteria" | "mission_review_findings" | "mission_contracts" | "mission_completion_reports" | "scheduled_jobs" | "scheduled_job_attempts" | "review_routes" | "review_handoffs" | "review_threads" | "review_browser_turns" | "review_browser_profiles" | "mission_outcome_observations",
   column: string,
   definition: string,
 ): void {

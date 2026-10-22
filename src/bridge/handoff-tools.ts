@@ -11,9 +11,9 @@ import { registerMutationAppTool } from "./app-tool.js";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
 import { forbidden, isReviewer, reviewClaimContextId, reviewOwnerContextId, reviewerThreadContextId, requireWorkSessionMutation, requireWorkSessionRead } from "./shared.js";
 import { z } from "zod/v4";
-import { and, eq, sql } from "drizzle-orm";
+import { and, desc, eq, sql } from "drizzle-orm";
 import { createReviewPacket } from "../review-thread/review-packet.js";
-import { reviewThreadMessages } from "../db/schema.js";
+import { reviewBrowserTurns, reviewThreadMessages } from "../db/schema.js";
 import { createHash } from "node:crypto";
 import {
   ExternalCatalogObservationSubmissionSchema,
@@ -215,7 +215,7 @@ export function registerHandoffTools(server: McpServer, config: BridgeConfig): v
 
   registerMutationAppTool(server, "open_reviewer_browser_login", {
     title: "Open reviewer browser login",
-    description: "Open ChatGPT in the dedicated headed Chromium profile for login or human verification. Kontrol does not automate verification challenges.",
+    description: "Compatibility login opener for an existing controlled browser. If the identity provider rejects a software-controlled browser, use begin_reviewer_browser_auth and complete_reviewer_browser_auth to sign in in ordinary Chrome before Kontrol enables CDP.",
     inputSchema: { profileId: z.string() }, outputSchema: { profileId: z.string(), targetId: z.string() }, _meta: {}, annotations: { readOnlyHint: false },
   }, config, async ({ profileId }) => {
     if (!isReviewer(config.principalRole)) return forbidden(config.principalRole, "open_reviewer_browser_login");
@@ -224,6 +224,41 @@ export function registerHandoffTools(server: McpServer, config: BridgeConfig): v
     try {
       const opened = await config.reviewBrowserController!.openLoginPage(profileId);
       return { content: [{ type: "text" as const, text: "ChatGPT opened in the dedicated headed reviewer browser. Complete login or verification manually, then bind the exact conversation." }], structuredContent: { profileId, targetId: opened.targetId } };
+    } catch (error) { return { content: [{ type: "text" as const, text: error instanceof Error ? error.message : String(error) }], isError: true }; }
+  });
+
+  registerMutationAppTool(server, "begin_reviewer_browser_auth", {
+    title: "Begin reviewer browser authentication",
+    description: "Open the dedicated persistent profile in official Chrome without remote debugging so the reviewer can sign in manually. Never send passwords, one-time codes, recovery codes, or cookies through Kontrol.",
+    inputSchema: { profileId: z.string() },
+    outputSchema: { profileId: z.string(), generation: z.number(), browserPid: z.number().optional() },
+    _meta: {}, annotations: { readOnlyHint: false },
+  }, config, async ({ profileId }) => {
+    if (!isReviewer(config.principalRole)) return forbidden(config.principalRole, "begin_reviewer_browser_auth");
+    const owner = config.reviewBrowserController?.profiles.get(profileId);
+    if (!owner || owner.ownerPrincipalId !== config.principalId) return { content: [{ type: "text" as const, text: "Reviewer browser profile owner authorization failed." }], isError: true };
+    try {
+      const result = await config.reviewBrowserController!.beginManualAuthentication(profileId);
+      return { content: [{ type: "text" as const, text: "Official Chrome opened without remote debugging. Sign in manually, close every Chrome window for this profile, then call complete_reviewer_browser_auth." }], structuredContent: result };
+    } catch (error) { return { content: [{ type: "text" as const, text: error instanceof Error ? error.message : String(error) }], isError: true }; }
+  });
+
+  registerMutationAppTool(server, "complete_reviewer_browser_auth", {
+    title: "Complete reviewer browser authentication",
+    description: "After ordinary Chrome has exited, relaunch the same dedicated profile under loopback CDP and verify ChatGPT authentication before offering exact conversation targets.",
+    inputSchema: { profileId: z.string() },
+    outputSchema: { status: z.enum(["authenticated", "auth_required", "auth_blocked"]), reason: z.string().optional(), targets: z.array(z.object({ targetId: z.string(), url: z.string(), title: z.string() })) },
+    _meta: {}, annotations: { readOnlyHint: false },
+  }, config, async ({ profileId }) => {
+    if (!isReviewer(config.principalRole)) return forbidden(config.principalRole, "complete_reviewer_browser_auth");
+    const owner = config.reviewBrowserController?.profiles.get(profileId);
+    if (!owner || owner.ownerPrincipalId !== config.principalId) return { content: [{ type: "text" as const, text: "Reviewer browser profile owner authorization failed." }], isError: true };
+    try {
+      const result = await config.reviewBrowserController!.completeManualAuthentication(profileId);
+      const text = result.status === "authenticated"
+        ? "ChatGPT authentication survived the controlled-browser handoff. Select an exact conversation target to bind."
+        : `Authentication handoff did not verify (${result.reason ?? result.status}). ${result.status === "auth_blocked" ? "This authentication method is blocked; use an authorized alternative instead of retrying the controlled login." : "Keep the reviewer route and queued submission intact, authenticate manually, then retry the handoff."}`;
+      return { content: [{ type: "text" as const, text }], structuredContent: result };
     } catch (error) { return { content: [{ type: "text" as const, text: error instanceof Error ? error.message : String(error) }], isError: true }; }
   });
 
@@ -376,7 +411,7 @@ export function registerHandoffTools(server: McpServer, config: BridgeConfig): v
       title: "List review thread messages",
       description: "Read the bounded delivery index for the reviewer thread activated in this authenticated context. Reading does not mark packets delivered.",
       inputSchema: { threadId: z.string() },
-      outputSchema: { threadId: z.string(), routeEpoch: z.number(), messages: z.array(z.object({ handoffId: z.string(), submissionId: z.string(), reviewEpoch: z.number(), roundNumber: z.number(), kind: z.string(), status: z.string(), revision: z.number(), payloadSha256: z.string() })) },
+      outputSchema: { threadId: z.string(), routeEpoch: z.number(), messages: z.array(z.object({ handoffId: z.string(), submissionId: z.string(), reviewEpoch: z.number(), roundNumber: z.number(), kind: z.string(), status: z.string(), deliveryState: z.string(), nextAction: z.string(), revision: z.number(), payloadSha256: z.string() })) },
       _meta: {},
       annotations: { readOnlyHint: true },
     },
@@ -391,16 +426,34 @@ export function registerHandoffTools(server: McpServer, config: BridgeConfig): v
       if (!route || route.routeEpoch !== thread.routeEpoch || route.status === "disabled" || route.status === "closed") {
         return { content: [{ type: "text" as const, text: "Review thread is unavailable for the current route epoch." }], isError: true };
       }
-      const messages = config.reviewThreads!.listMessages(threadId).slice(-20).map((message) => ({
-        handoffId: message.handoffId,
-        submissionId: message.submissionId,
-        reviewEpoch: message.reviewEpoch,
-        roundNumber: message.roundNumber,
-        kind: message.kind,
-        status: message.status,
-        revision: message.revision,
-        payloadSha256: message.payloadSha256,
-      }));
+      const recentMessages = config.reviewThreads!.listMessages(threadId).slice(-20);
+      const attempts = new Map(recentMessages.map((message) => [message.id, config.db?.db.select().from(reviewBrowserTurns)
+        .where(eq(reviewBrowserTurns.reviewMessageId, message.id)).orderBy(desc(reviewBrowserTurns.attemptNumber)).limit(1).get()]));
+      const messages = recentMessages.map((message) => {
+        const attempt = attempts.get(message.id);
+        const deliveryState = attempt?.state === "uncertain" ? "dispatch_uncertain"
+          : attempt?.state === "awaiting_feedback" ? "awaiting_reviewer_action"
+            : attempt?.state === "prompt_accepted" || attempt?.state === "model_generating" || attempt?.state === "generation_finished" ? "prompt_accepted"
+              : ["blocked_auth", "blocked_browser", "failed"].includes(attempt?.state ?? "") || message.status === "failed" ? "recovery_required"
+                : ["feedback_committed", "settled"].includes(attempt?.state ?? "") ? "feedback_committed"
+                : message.status === "presented" ? "prompt_accepted"
+                  : message.status === "queued" ? "pending_delivery"
+                    : message.status === "settled" ? "feedback_committed"
+                      : "delivery_pending";
+        const nextAction = deliveryState === "pending_delivery" ? "Deliver the queued packet through the active reviewer context."
+          : deliveryState === "dispatch_uncertain" ? "Inspect the exact conversation and resolve this attempt before any resend."
+            : deliveryState === "prompt_accepted" ? "Wait for generation or inspect the exact conversation; generation is not a verdict."
+              : deliveryState === "awaiting_reviewer_action" ? "Submit feedback through the authenticated review tools."
+                : deliveryState === "feedback_committed" ? "No reviewer action is pending for this message."
+                  : deliveryState === "recovery_required" ? "Check browser login, profile ownership, and connection, then resolve the durable attempt."
+                    : "Check the active reviewer transport and delivery receipt.";
+        return {
+          handoffId: message.handoffId, submissionId: message.submissionId,
+          reviewEpoch: message.reviewEpoch, roundNumber: message.roundNumber, kind: message.kind,
+          status: message.status, deliveryState, nextAction, revision: message.revision,
+          payloadSha256: message.payloadSha256,
+        };
+      });
       return { content: [{ type: "text" as const, text: `Review thread ${threadId} has ${messages.length} recent submission packet(s).` }], structuredContent: { threadId, routeEpoch: thread.routeEpoch, messages } };
     },
   );
@@ -446,6 +499,50 @@ export function registerHandoffTools(server: McpServer, config: BridgeConfig): v
       if (updated.changes !== 1) return { content: [{ type: "text" as const, text: "Review delivery revision conflict." }], isError: true };
       config.eventStore.appendEvent({ type: "review.thread.delivery_requeued", sessionId: thread.workSessionId, payload: { threadId: thread.id, handoffId } });
       return { content: [{ type: "text" as const, text: `Review message ${handoffId} requeued for host delivery.` }], structuredContent: { handoffId, status: "queued", revision: message.revision + 1 } };
+    },
+  );
+
+  registerMutationAppTool(
+    server,
+    "resolve_uncertain_reviewer_browser_attempt",
+    {
+      title: "Resolve an uncertain reviewer browser attempt",
+      description: "After inspecting the exact bound ChatGPT conversation, explicitly confirm that the immutable prompt is absent and no reviewer feedback was committed. This records a reviewer recovery receipt and requeues the same immutable message. If the prompt may have been accepted, leave the attempt fenced and wait for feedback; generation text is never a verdict.",
+      inputSchema: {
+        attemptId: z.string(),
+        threadId: z.string(),
+        confirmPromptAbsent: z.literal(true),
+        inspectionEvidence: z.string().trim().min(12).max(2_000),
+      },
+      outputSchema: { attemptId: z.string(), status: z.literal("queued"), messageId: z.string(), messageRevision: z.number(), resolutionSha256: z.string() },
+      _meta: {}, annotations: { readOnlyHint: false },
+    },
+    config,
+    async ({ attemptId, threadId, confirmPromptAbsent, inspectionEvidence }) => {
+      if (!isReviewer(config.principalRole)) return forbidden(config.principalRole, "resolve_uncertain_reviewer_browser_attempt");
+      const thread = config.reviewThreads?.getById(threadId);
+      const reviewerPrincipalId = config.principalId ?? `role:${config.principalRole ?? "reviewer"}`;
+      if (!config.reviewBrowserJobs || !thread || thread.status !== "active"
+        || thread.reviewerPrincipalId !== reviewerPrincipalId
+        || thread.reviewerContextId !== reviewerThreadContextId(config)) {
+        return { content: [{ type: "text" as const, text: "An active browser review thread bound to this authenticated reviewer context is required." }], isError: true };
+      }
+      try {
+        const result = config.reviewBrowserJobs.resolveUncertainAttemptForRetry({
+          attemptId, reviewThreadId: thread.id, routeEpoch: thread.routeEpoch, reviewerPrincipalId,
+          confirmPromptAbsent, inspectionEvidence,
+        });
+        config.eventStore.appendEvent({
+          type: "review.browser_turn.operator_reconciled", sessionId: thread.workSessionId,
+          payload: { threadId: thread.id, attemptId, resolution: "confirmed_prompt_absent_requeue", resolutionSha256: result.resolutionSha256 },
+        });
+        return {
+          content: [{ type: "text" as const, text: "The exact uncertain attempt was reconciled from your conversation inspection. The same immutable reviewer message is queued for a new delivery attempt." }],
+          structuredContent: { attemptId, status: "queued" as const, ...result },
+        };
+      } catch (error) {
+        return { content: [{ type: "text" as const, text: error instanceof Error ? error.message : String(error) }], isError: true };
+      }
     },
   );
 

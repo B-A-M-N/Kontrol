@@ -2,12 +2,12 @@ import { and, eq, inArray } from "drizzle-orm";
 import type { DatabaseHandle } from "../db/client.js";
 import { reviewBrowserProfiles, reviewRoutes, reviewThreads, reviewBrowserTurns, reviewThreadMessages } from "../db/schema.js";
 import type { DispatchOutbox } from "../dispatch-outbox.js";
-import { launchOrReconnectChrome, type OwnedChrome } from "./chrome-process.js";
+import { launchManualAuthenticationChrome, launchOrReconnectChrome, type ManualChromeAuthentication, type OwnedChrome } from "./chrome-process.js";
 import { ChatGptPageDriver } from "./chatgpt-page-driver.js";
 import { createReviewerBrowserProfileStore, type ReviewerBrowserMode, type ReviewerBrowserProfile, type ReviewerBrowserProfileStore } from "./profile-store.js";
 import { bindReviewerTarget, canonicalReviewerConversation, restoreReviewerTarget, reviewerConversationFingerprint, type BoundReviewerTarget, type ReviewerTabBinding } from "./target-binding.js";
 
-const ACTIVE_TURN_STATES = ["leased", "browser_ready", "dispatching", "prompt_accepted", "model_generating", "generation_finished", "awaiting_feedback", "uncertain"];
+const LIVE_DISPATCH_STATES = ["leased", "browser_ready", "dispatching", "model_generating"];
 
 export interface ReviewerBrowserController {
   profiles: ReviewerBrowserProfileStore;
@@ -16,6 +16,8 @@ export interface ReviewerBrowserController {
   stopProfile(profileId: string): Promise<ReviewerBrowserProfile>;
   switchMode(profileId: string, mode: ReviewerBrowserMode): Promise<ReviewerBrowserProfile>;
   openLoginPage(profileId: string): Promise<{ targetId: string; sessionId: string }>;
+  beginManualAuthentication(profileId: string): Promise<{ profileId: string; generation: number; browserPid?: number }>;
+  completeManualAuthentication(profileId: string): Promise<{ status: "authenticated" | "auth_required" | "auth_blocked"; reason?: string; targets: Array<{ targetId: string; url: string; title: string }> }>;
   bindConversation(input: { profileId: string; reviewThreadId: string; targetId: string; principalId: string }): Promise<ReviewerTabBinding>;
   restoreThread(reviewThreadId: string): Promise<{ target: BoundReviewerTarget; driver: ChatGptPageDriver }>;
   close(): Promise<void>;
@@ -27,26 +29,33 @@ export function createReviewerBrowserController(input: {
   dispatchOutbox?: DispatchOutbox;
   chromePath?: string;
   environment?: NodeJS.ProcessEnv;
+  launchControlled?: typeof launchOrReconnectChrome;
+  launchManualAuthentication?: typeof launchManualAuthenticationChrome;
 }): ReviewerBrowserController {
   const profiles = createReviewerBrowserProfileStore(input.database, input.stateDir);
   const processes = new Map<string, OwnedChrome>();
+  const manualProcesses = new Map<string, ManualChromeAuthentication>();
   const bindings = new Map<string, BoundReviewerTarget>();
+  const profileFlights = new Map<string, { operation: string; promise: Promise<unknown> }>();
+  const launchControlled = input.launchControlled ?? launchOrReconnectChrome;
+  const launchManual = input.launchManualAuthentication ?? launchManualAuthenticationChrome;
   const activeForProfile = (profileId: string): number => input.database.db.select({ id: reviewBrowserTurns.id })
-    .from(reviewBrowserTurns).where(and(eq(reviewBrowserTurns.profileId, profileId), inArray(reviewBrowserTurns.state, ACTIVE_TURN_STATES))).all().length;
+    .from(reviewBrowserTurns).where(and(eq(reviewBrowserTurns.profileId, profileId), inArray(reviewBrowserTurns.state, LIVE_DISPATCH_STATES))).all().length;
 
-  async function startProfile(profileId: string, mode?: ReviewerBrowserMode): Promise<ReviewerBrowserProfile> {
+  async function startProfileOnce(profileId: string, mode?: ReviewerBrowserMode): Promise<ReviewerBrowserProfile> {
     const current = profiles.get(profileId);
     if (!current) throw new Error("Reviewer browser profile is not registered.");
+    if (manualProcesses.has(profileId)) throw new Error("Manual authentication owns this profile; complete or stop that handoff first.");
     const requestedMode = mode ?? current.mode;
     const existing = processes.get(profileId);
     if (existing) {
       if (current.mode === requestedMode) return current;
-      return switchMode(profileId, requestedMode);
+      return switchModeOnce(profileId, requestedMode);
     }
     const starting = profiles.transition({ profileId, expectedGeneration: current.generation, status: "starting", mode: requestedMode });
     try {
       const profileDirectory = await profiles.profileDirectory(profileId);
-      const chrome = await launchOrReconnectChrome({
+      const chrome = await launchControlled({
         profileDirectory,
         generation: starting.generation,
         mode: requestedMode,
@@ -63,10 +72,36 @@ export function createReviewerBrowserController(input: {
     }
   }
 
-  async function stopProfile(profileId: string): Promise<ReviewerBrowserProfile> {
+  function runProfileFlight<T>(profileId: string, operationKey: string, operation: () => Promise<T>): Promise<T> {
+    const flight = profileFlights.get(profileId);
+    if (flight) {
+      if (flight.operation !== operationKey) return Promise.reject(new Error("A reviewer browser profile operation is already running; wait for that generation to finish."));
+      return flight.promise as Promise<T>;
+    }
+    const promise = operation().finally(() => {
+      if (profileFlights.get(profileId)?.promise === promise) profileFlights.delete(profileId);
+    });
+    profileFlights.set(profileId, { operation: operationKey, promise });
+    return promise;
+  }
+
+  function startProfile(profileId: string, mode?: ReviewerBrowserMode): Promise<ReviewerBrowserProfile> {
+    const current = profiles.get(profileId);
+    if (!current) return Promise.reject(new Error("Reviewer browser profile is not registered."));
+    const requestedMode = mode ?? current.mode;
+    return runProfileFlight(profileId, `mode:${requestedMode}`, () => startProfileOnce(profileId, requestedMode));
+  }
+
+  async function stopProfileOnce(profileId: string): Promise<ReviewerBrowserProfile> {
     const current = profiles.get(profileId);
     if (!current) throw new Error("Reviewer browser profile is not registered.");
-    if (activeForProfile(profileId)) throw new Error("A reviewer turn is active or awaiting authoritative feedback; reconcile it before stopping Chromium.");
+    if (activeForProfile(profileId)) throw new Error("A browser dispatch is still running; wait for it to finish or become explicitly uncertain before stopping Chromium.");
+    const manual = manualProcesses.get(profileId);
+    if (manual) {
+      const closed = await manual.close();
+      if (!closed) throw new Error("Manual Chrome is still shutting down; retry after it exits.");
+      manualProcesses.delete(profileId);
+    }
     const chrome = processes.get(profileId);
     if (chrome) {
       await chrome.close();
@@ -81,11 +116,12 @@ export function createReviewerBrowserController(input: {
     return profiles.transition({ profileId, expectedGeneration: latest.generation, status: "stopped" });
   }
 
-  async function switchMode(profileId: string, mode: ReviewerBrowserMode): Promise<ReviewerBrowserProfile> {
+  async function switchModeOnce(profileId: string, mode: ReviewerBrowserMode): Promise<ReviewerBrowserProfile> {
     const current = profiles.get(profileId);
     if (!current) throw new Error("Reviewer browser profile is not registered.");
+    if (manualProcesses.has(profileId)) throw new Error("Manual authentication owns this profile; complete or stop that handoff first.");
     if (current.mode === mode && processes.has(profileId)) return current;
-    if (activeForProfile(profileId)) throw new Error("Cannot switch headed/headless mode while a reviewer turn is active or awaiting feedback.");
+    if (activeForProfile(profileId)) throw new Error("Cannot switch headed/headless mode while a browser dispatch is running.");
     const chrome = processes.get(profileId);
     if (chrome) {
       await chrome.close();
@@ -93,7 +129,16 @@ export function createReviewerBrowserController(input: {
     }
     const stopped = profiles.get(profileId)!;
     if (stopped.status !== "stopped") profiles.transition({ profileId, expectedGeneration: stopped.generation, status: "stopped" });
-    return startProfile(profileId, mode);
+    return startProfileOnce(profileId, mode);
+  }
+
+  function switchMode(profileId: string, mode: ReviewerBrowserMode): Promise<ReviewerBrowserProfile> {
+    if (!profiles.get(profileId)) return Promise.reject(new Error("Reviewer browser profile is not registered."));
+    return runProfileFlight(profileId, `mode:${mode}`, () => switchModeOnce(profileId, mode));
+  }
+
+  function stopProfile(profileId: string): Promise<ReviewerBrowserProfile> {
+    return runProfileFlight(profileId, "stop", () => stopProfileOnce(profileId));
   }
 
   async function openLoginPage(profileId: string): Promise<{ targetId: string; sessionId: string }> {
@@ -108,6 +153,102 @@ export function createReviewerBrowserController(input: {
     if (!attached.sessionId) throw new Error("Kontrol could not attach to the ChatGPT login page.");
     await chrome.cdp.send("Page.enable", {}, attached.sessionId);
     return { targetId: created.targetId, sessionId: attached.sessionId };
+  }
+
+  async function beginManualAuthenticationOnce(profileId: string): Promise<{ profileId: string; generation: number; browserPid?: number }> {
+    let profile = profiles.get(profileId);
+    if (!profile) throw new Error("Reviewer browser profile is not registered.");
+    if (manualProcesses.has(profileId)) throw new Error("Manual authentication is already running for this reviewer profile.");
+    if (activeForProfile(profileId)) throw new Error("An active browser dispatch must finish or become recoverable before authentication mode can change.");
+    const currentChrome = processes.get(profileId);
+    if (currentChrome) {
+      await currentChrome.close();
+      processes.delete(profileId);
+    }
+    const current = profiles.get(profileId)!;
+    const starting = profiles.transition({ profileId, expectedGeneration: current.generation, status: "starting", mode: "headed", authState: "manual_auth_in_progress" });
+    try {
+      const profileDirectory = await profiles.profileDirectory(profileId);
+      const manual = await launchManual({
+        profileDirectory, generation: starting.generation, chromePath: input.chromePath, environment: input.environment,
+      });
+      manualProcesses.set(profileId, manual);
+      const inProgress = profiles.transition({ profileId, expectedGeneration: starting.generation, status: "login_required", authState: "manual_auth_in_progress", mode: "headed" });
+      return { profileId, generation: inProgress.generation, ...(manual.browserPid ? { browserPid: manual.browserPid } : {}) };
+    } catch (error) {
+      const latest = profiles.get(profileId);
+      if (latest?.generation === starting.generation) profiles.transition({ profileId, expectedGeneration: starting.generation, status: "blocked", authState: "auth_blocked" });
+      throw error;
+    }
+  }
+
+  function beginManualAuthentication(profileId: string): Promise<{ profileId: string; generation: number; browserPid?: number }> {
+    return runProfileFlight(profileId, "manual-auth:start", () => beginManualAuthenticationOnce(profileId));
+  }
+
+  async function completeManualAuthenticationOnce(profileId: string): Promise<{ status: "authenticated" | "auth_required" | "auth_blocked"; reason?: string; targets: Array<{ targetId: string; url: string; title: string }> }> {
+    const manual = manualProcesses.get(profileId);
+    let profile = profiles.get(profileId);
+    if (!profile) throw new Error("Reviewer browser profile is not registered.");
+    if (!manual) throw new Error("No manual authentication handoff is active for this profile.");
+    if (!manual.hasExited()) {
+      profiles.transition({ profileId, expectedGeneration: profile.generation, status: "login_required", authState: "handoff_pending" });
+      return { status: "auth_required", reason: "close_all_chrome_windows_before_handoff", targets: [] };
+    }
+    try { await manual.releaseAfterExit(); }
+    catch (error) {
+      profiles.transition({ profileId, expectedGeneration: profile.generation, status: "login_required", authState: "handoff_pending" });
+      return { status: "auth_required", reason: error instanceof Error ? error.message.slice(0, 240) : "profile_still_owned", targets: [] };
+    }
+    manualProcesses.delete(profileId);
+    const starting = profiles.transition({ profileId, expectedGeneration: profile.generation, status: "starting", mode: "headed", authState: "handoff_pending" });
+    try {
+      const profileDirectory = await profiles.profileDirectory(profileId);
+      const chrome = await launchControlled({ profileDirectory, generation: starting.generation, mode: "headed", chromePath: input.chromePath, environment: input.environment });
+      processes.set(profileId, chrome);
+      profile = profiles.transition({ profileId, expectedGeneration: starting.generation, status: "ready", mode: "headed", authState: "handoff_pending" });
+      const listed = await chrome.cdp.send<{ targetInfos?: Array<{ targetId: string; type: string; url: string; title?: string }> }>("Target.getTargets");
+      const candidates = (listed.targetInfos ?? []).filter((target) => target.type === "page" && /^https:\/\/([a-z0-9-]+\.)?chatgpt\.com\//i.test(target.url));
+      let authenticated = false;
+      let blocked = false;
+      let unsupportedBrowser = false;
+      for (const target of candidates) {
+        let sessionId: string | undefined;
+        try {
+          const attached = await chrome.cdp.send<{ sessionId?: string }>("Target.attachToTarget", { targetId: target.targetId, flatten: true });
+          sessionId = attached.sessionId;
+          if (!sessionId) continue;
+          await chrome.cdp.send("Runtime.enable", {}, sessionId);
+          const observed = await chrome.cdp.send<{ result?: { value?: { authenticated: boolean; loginRequired: boolean; verificationRequired: boolean; unsupportedBrowser: boolean } } }>("Runtime.evaluate", {
+            expression: `(() => { const u=new URL(location.href), body=(document.body?.innerText||'').toLowerCase(); const visible=e=>{const r=e.getBoundingClientRect(),s=getComputedStyle(e);return r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden'}; const composer=[...document.querySelectorAll('#prompt-textarea,[data-testid="prompt-textarea"],[contenteditable="true"][role="textbox"]')].some(visible); return {loginRequired:/^\\/(auth\\/(login|signin)|login)/.test(u.pathname),verificationRequired:['verify you are human','security check','complete the captcha'].some(x=>body.includes(x)),unsupportedBrowser:['insecure browser','unsupported browser','browser may not be secure'].some(x=>body.includes(x)),authenticated:composer}; })()`,
+            returnByValue: true,
+          }, sessionId);
+          const value = observed.result?.value;
+          if (value?.verificationRequired) blocked = true;
+          if (value?.unsupportedBrowser) { blocked = true; unsupportedBrowser = true; }
+          if (value?.authenticated && !value.loginRequired && !value.verificationRequired && !value.unsupportedBrowser) authenticated = true;
+        } catch { /* classify from another visible ChatGPT tab if one exists */ }
+        finally { if (sessionId) await chrome.cdp.send("Target.detachFromTarget", { sessionId }).catch(() => undefined); }
+      }
+      const targets = candidates.map(({ targetId, url, title }) => ({ targetId, url: url.slice(0, 500), title: (title ?? "").slice(0, 160) }));
+      if (authenticated) {
+        profiles.transition({ profileId, expectedGeneration: profile.generation, status: "ready", authState: "authenticated", verified: true });
+        return { status: "authenticated", targets };
+      }
+      const reason = blocked
+        ? unsupportedBrowser ? "identity_provider_unsupported_browser_after_handoff" : "verification_required_after_browser_handoff"
+        : candidates.length ? "chatgpt_session_not_authenticated_after_browser_handoff" : "no_chatgpt_tab_after_browser_handoff";
+      profiles.transition({ profileId, expectedGeneration: profile.generation, status: blocked ? "blocked" : "login_required", authState: blocked ? "auth_blocked" : "manual_auth_required" });
+      return { status: blocked ? "auth_blocked" : "auth_required", reason, targets };
+    } catch (error) {
+      const latest = profiles.get(profileId);
+      if (latest) profiles.transition({ profileId, expectedGeneration: latest.generation, status: "blocked", authState: "auth_blocked" });
+      return { status: "auth_blocked", reason: error instanceof Error ? error.message.slice(0, 240) : "controlled_browser_start_failed", targets: [] };
+    }
+  }
+
+  function completeManualAuthentication(profileId: string): Promise<{ status: "authenticated" | "auth_required" | "auth_blocked"; reason?: string; targets: Array<{ targetId: string; url: string; title: string }> }> {
+    return runProfileFlight(profileId, "manual-auth:complete", () => completeManualAuthenticationOnce(profileId));
   }
 
   async function bindConversation(bindingInput: { profileId: string; reviewThreadId: string; targetId: string; principalId: string }): Promise<ReviewerTabBinding> {
@@ -209,13 +350,17 @@ export function createReviewerBrowserController(input: {
         .where(and(eq(reviewThreads.id, thread.id), eq(reviewThreads.revision, thread.revision))).run();
       throw new Error(`Bound reviewer conversation is not ready: ${readiness.status}.`);
     }
-    input.database.db.update(reviewThreads).set({
+    const restoredBinding = input.database.db.update(reviewThreads).set({
       browserGeneration: profile.generation,
       browserTargetId: target.targetId,
       browserCdpSessionId: target.sessionId,
       conversationBindingStatus: "bound",
       revision: thread.revision + 1,
     }).where(and(eq(reviewThreads.id, thread.id), eq(reviewThreads.revision, thread.revision))).run();
+    if (restoredBinding.changes !== 1) {
+      await chrome.cdp.send("Target.detachFromTarget", { sessionId: target.sessionId }).catch(() => undefined);
+      throw new Error("Reviewer conversation restoration lost its thread revision compare-and-swap; recovery is required.");
+    }
     bindings.set(thread.id, target);
     return { target, driver };
   }
@@ -227,9 +372,16 @@ export function createReviewerBrowserController(input: {
     stopProfile,
     switchMode,
     openLoginPage,
+    beginManualAuthentication,
+    completeManualAuthentication,
     bindConversation,
     restoreThread,
     async close() {
+      for (const [profileId, manual] of manualProcesses) {
+        const closed = await manual.close();
+        if (!closed) throw new Error(`Manual Chrome for reviewer profile ${profileId} did not exit during shutdown.`);
+        manualProcesses.delete(profileId);
+      }
       for (const [profileId, chrome] of processes) {
         await chrome.detach();
         processes.delete(profileId);

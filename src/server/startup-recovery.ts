@@ -54,6 +54,33 @@ export interface StartupRecoveryHandles {
   stop(): void;
 }
 
+export function reconcileReplyDeliveryPage(db: DatabaseHandle, after?: { createdAt: string; id: string }, limit = 100): { reconciled: number; next?: { createdAt: string; id: string } } {
+  const page = db.sqlite.prepare(`select id, created_at from agent_message_replies
+    where status = 'delivering'
+      and (? is null or created_at > ? or (created_at = ? and id > ?))
+    order by created_at, id limit ?`).all(after?.createdAt ?? null, after?.createdAt ?? null,
+      after?.createdAt ?? null, after?.id ?? null, limit) as Array<{ id: string; created_at: string }>;
+  for (const reply of page) db.sqlite.prepare("update agent_message_replies set status = 'pending_delivery' where id = ? and status = 'delivering'").run(reply.id);
+  const last = page.at(-1);
+  return { reconciled: page.length, ...(page.length === limit && last ? { next: { createdAt: last.created_at, id: last.id } } : {}) };
+}
+
+export function reconcileReviewHandoffPage(db: DatabaseHandle, afterId?: string, limit = 100): { reconciled: number; nextAfterId?: string } {
+  const rows = db.sqlite.prepare(`select h.id, ws.status as work_session_status
+      from review_handoffs h left join work_sessions ws on ws.id = h.work_session_id
+      where (? is null or h.id > ?) order by h.id limit ?`)
+    .all(afterId ?? null, afterId ?? null, limit) as Array<{ id: string; work_session_status: string | null }>;
+  let reconciled = 0;
+  for (const row of rows) {
+    const terminalSession = ["approved", "rejected", "cancelled", "failed", "failed_protocol"].includes(row.work_session_status ?? "");
+    if (!terminalSession && row.work_session_status !== null) continue;
+    reconciled += db.sqlite.prepare("update review_handoffs set status = 'closed', completed_at = coalesce(completed_at, ?) where id = ? and status not in ('closed', 'feedback_committed')")
+      .run(new Date().toISOString(), row.id).changes;
+  }
+  const last = rows.at(-1);
+  return { reconciled, ...(rows.length === limit && last ? { nextAfterId: last.id } : {}) };
+}
+
 export function createStartupReconciliation(deps: StartupRecoveryDeps): StartupRecoveryHandles {
   const { config, db, approvalRequests, workSessions, eventStore, continuationManager, maintenance } = deps;
   const startupRecovery = deps.startupRecovery;
@@ -168,23 +195,10 @@ export function createStartupReconciliation(deps: StartupRecoveryDeps): StartupR
   // Replies survive process restart. Mark delivery rows left in `delivering`
   // back to pending_delivery so the outbox can redrive them; acknowledged rows
   // are terminal and historical pending rows remain intentionally visible.
-  const reconcileReplyPage = (before?: { createdAt: string; id: string }): void => {
+  const reconcileReplyPage = (after?: { createdAt: string; id: string }): void => {
     if (startupRecoveryStopped) return;
-    const page = db.sqlite.prepare(`
-      select id, created_at
-        from agent_message_replies
-       where status = 'delivering'
-         and (? is null or created_at < ? or (created_at = ? and id > ?))
-       order by created_at, id
-       limit 100
-    `).all(before?.createdAt ?? null, before?.createdAt ?? null, before?.createdAt ?? null, before?.id ?? null) as Array<{ id: string; created_at: string }>;
-    for (const reply of page) {
-      db.sqlite.prepare("update agent_message_replies set status = 'pending_delivery' where id = ? and status = 'delivering'").run(reply.id);
-    }
-    if (page.length === 100) {
-      const last = page[page.length - 1]!;
-      setImmediate(() => reconcileReplyPage({ createdAt: last.created_at, id: last.id }));
-    }
+    const page = reconcileReplyDeliveryPage(db, after);
+    if (page.next) setImmediate(() => reconcileReplyPage(page.next));
   };
   reconcileReplyPage();
 
@@ -192,21 +206,8 @@ export function createStartupReconciliation(deps: StartupRecoveryDeps): StartupR
   // and queued isolated handoffs remain awaiting attachment.
   const reconcileHandoffPage = (afterId?: string): void => {
     if (startupRecoveryStopped) return;
-    const rows = db.sqlite.prepare(`
-      select h.id, h.work_session_id, h.status
-        from review_handoffs h
-        join work_sessions ws on ws.id = h.work_session_id
-       where (? is null or h.id > ?)
-       order by h.id
-       limit 100
-    `).all(afterId ?? null, afterId ?? null) as Array<{ id: string; work_session_id: string; status: string }>;
-    let nextAfterId: string | undefined;
-    for (const row of rows) {
-      nextAfterId = row.id;
-      if (!["approved", "rejected", "cancelled", "failed", "failed_protocol"].includes(row.status)) continue;
-      db.sqlite.prepare("update review_handoffs set status = 'closed', completed_at = coalesce(completed_at, ?) where id = ? and status not in ('closed', 'feedback_committed')").run(new Date().toISOString(), row.id);
-    }
-    if (rows.length === 100 && nextAfterId) setImmediate(() => reconcileHandoffPage(nextAfterId));
+    const page = reconcileReviewHandoffPage(db, afterId);
+    if (page.nextAfterId) setImmediate(() => reconcileHandoffPage(page.nextAfterId));
   };
   reconcileHandoffPage();
 

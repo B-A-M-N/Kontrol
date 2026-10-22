@@ -106,6 +106,57 @@ try {
   assert.equal(browserJobs.getActiveForThread(activeThread.id), undefined, "accepted reviewer reply settles the browser wake without a verdict");
   assert.equal(threads.listMessages(activeThread.id).find((message) => message.id === queuedQuestion.id)?.status, "settled");
 
+  const preDispatchQuestion = agentMessages.post({ workSessionId: "session-thread", kind: "clarification_request", title: "Pre-dispatch recovery", body: "Recover safely." });
+  const preDispatchMessage = threads.queueAgentMessage({ threadId: activeThread.id, agentMessageId: preDispatchQuestion.id, kind: "clarification_request", title: preDispatchQuestion.title, body: preDispatchQuestion.body })!;
+  const preDispatchClaim = browserJobs.claim({ messageId: preDispatchMessage.id, profileId: "profile-thread", browserGeneration: 7 })!;
+  browserJobs.transition({ attemptId: preDispatchClaim.attemptId, leaseToken: preDispatchClaim.leaseToken, profileId: "profile-thread", browserGeneration: 7, nextStatus: "browser_ready" });
+  db.sqlite.prepare("update review_browser_turns set lease_expires_at = ? where id = ?").run("2000-01-01T00:00:00.000Z", preDispatchClaim.attemptId);
+  const safeRecovery = browserJobs.reconcileExpiredAttempts({ now: new Date().toISOString(), limit: 100 });
+  assert.equal(safeRecovery.reconciled, 1, "an expired attempt before dispatch is safely requeued");
+  assert.equal(threads.listMessages(activeThread.id).find((message) => message.id === preDispatchMessage.id)?.status, "queued");
+  const observedClaim = browserJobs.claim({ messageId: preDispatchMessage.id, profileId: "profile-thread", browserGeneration: 7 })!;
+  for (const nextStatus of ["browser_ready", "dispatching", "prompt_accepted", "model_generating"] as const) {
+    browserJobs.transition({ attemptId: observedClaim.attemptId, leaseToken: observedClaim.leaseToken, profileId: "profile-thread", browserGeneration: 7, nextStatus });
+  }
+  const generatingAttempt = browserJobs.getActiveForThread(activeThread.id)!;
+  assert.ok(generatingAttempt.generationStartedAt, "observed generation start is durably timestamped");
+  assert.equal(generatingAttempt.generationStartedObservationId, `${observedClaim.attemptId}:chatgpt-dom:start`);
+  browserJobs.transition({ attemptId: observedClaim.attemptId, leaseToken: observedClaim.leaseToken, profileId: "profile-thread", browserGeneration: 7, nextStatus: "generation_finished" });
+  browserJobs.transition({ attemptId: observedClaim.attemptId, leaseToken: observedClaim.leaseToken, profileId: "profile-thread", browserGeneration: 7, nextStatus: "awaiting_feedback" });
+  const finishedAttempt = browserJobs.getActiveForThread(activeThread.id)!;
+  assert.ok(finishedAttempt.generationFinishedAt, "observed generation finish is durably timestamped");
+  assert.equal(finishedAttempt.generationFinishedObservationId, `${observedClaim.attemptId}:chatgpt-dom:finish`);
+  agentMessages.acceptReply({ messageId: preDispatchQuestion.id, workSessionId: "session-thread", body: "Proceed.", reviewerPrincipalId: "reviewer" });
+  browserJobs.settleForAgentMessage({ agentMessageId: preDispatchQuestion.id, routeEpoch: route.routeEpoch });
+
+  const postBoundaryQuestion = agentMessages.post({ workSessionId: "session-thread", kind: "clarification_request", title: "Post-boundary recovery", body: "Do not resend." });
+  const postBoundaryMessage = threads.queueAgentMessage({ threadId: activeThread.id, agentMessageId: postBoundaryQuestion.id, kind: "clarification_request", title: postBoundaryQuestion.title, body: postBoundaryQuestion.body })!;
+  const postBoundaryClaim = browserJobs.claim({ messageId: postBoundaryMessage.id, profileId: "profile-thread", browserGeneration: 7 })!;
+  browserJobs.transition({ attemptId: postBoundaryClaim.attemptId, leaseToken: postBoundaryClaim.leaseToken, profileId: "profile-thread", browserGeneration: 7, nextStatus: "browser_ready" });
+  browserJobs.transition({ attemptId: postBoundaryClaim.attemptId, leaseToken: postBoundaryClaim.leaseToken, profileId: "profile-thread", browserGeneration: 7, nextStatus: "dispatching" });
+  db.sqlite.prepare("update review_browser_turns set lease_expires_at = ? where id = ?").run("2000-01-01T00:00:00.000Z", postBoundaryClaim.attemptId);
+  const uncertainRecovery = browserJobs.reconcileExpiredAttempts({ now: new Date().toISOString(), limit: 100 });
+  assert.equal(uncertainRecovery.uncertain, 1, "an expired attempt after the dispatch boundary remains explicitly uncertain");
+  assert.equal(browserJobs.getActiveForThread(activeThread.id)?.status, "uncertain", "uncertain delivery retains the thread fence");
+  assert.equal(browserJobs.claim({ messageId: postBoundaryMessage.id, profileId: "profile-thread", browserGeneration: 7 }), undefined,
+    "an uncertain attempt cannot be cleared by claiming the same message again");
+  const resolution = browserJobs.resolveUncertainAttemptForRetry({
+    attemptId: postBoundaryClaim.attemptId, reviewThreadId: activeThread.id, routeEpoch: route.routeEpoch,
+    reviewerPrincipalId: "reviewer", confirmPromptAbsent: true,
+    inspectionEvidence: "I inspected the bound conversation and confirmed the exact prompt is absent.",
+  });
+  assert.equal(threads.listMessages(activeThread.id).find((message) => message.id === postBoundaryMessage.id)?.status, "queued",
+    "operator-confirmed absence requeues the same immutable reviewer message");
+  assert.equal(browserJobs.getActiveForThread(activeThread.id), undefined, "operator resolution releases the thread fence transactionally");
+  assert.match(resolution.resolutionSha256, /^[a-f0-9]{64}$/);
+  const resolutionReceipt = db.sqlite.prepare("select reviewer_principal_id, resolution, evidence_sha256 from review_browser_turn_resolutions where attempt_id = ?")
+    .get(postBoundaryClaim.attemptId) as { reviewer_principal_id: string; resolution: string; evidence_sha256: string };
+  assert.deepEqual(resolutionReceipt, {
+    reviewer_principal_id: "reviewer", resolution: "confirmed_prompt_absent_requeue", evidence_sha256: resolution.resolutionSha256,
+  }, "recovery records the reviewer identity and hashes, not the freeform inspection note");
+  assert.ok(browserJobs.claim({ messageId: postBoundaryMessage.id, profileId: "profile-thread", browserGeneration: 7 }),
+    "a replacement attempt is allowed only after the durable reviewer recovery receipt");
+
   const claimed = routes.claimHandoff({
     handoffId: first.id, expectedRevision: first.revision, principalId: "reviewer",
     ownerContextId: "fresh-review-context", reviewThreadId: activeThread.id,

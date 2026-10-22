@@ -4,10 +4,11 @@ import type { ReviewerJobStore, ReviewerJobClaim } from "../review-thread/review
 
 const EVENT = "reviewer.browser_turn.ready";
 const LEASE_MS = 30 * 60_000;
+const RENEW_INTERVAL_MS = 5 * 60_000;
 
 export interface ReviewerTurnDispatcher {
   start(): void;
-  stop(): void;
+  stopAndDrain(): Promise<void>;
   drainOnce(): Promise<void>;
 }
 
@@ -19,12 +20,21 @@ export function createReviewerTurnDispatcher(input: {
   outbox: DispatchOutbox;
   jobs: ReviewerJobStore;
   browser: ReviewerBrowserController;
+  drainTimeoutMs?: number;
 }): ReviewerTurnDispatcher {
   const workerId = `reviewer-browser-${process.pid}`;
   let stopped = true;
   let running: Promise<void> | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let unsubscribe: (() => void) | undefined;
+  let stopPromise: Promise<void> | undefined;
+
+  function markCompleted(claim: OutboxClaim, eventId: string, attemptId?: string): void {
+    if (!input.outbox.markCompleted(claim)) {
+      console.warn("reviewer_browser_outbox_completion_fenced", { eventId, ...(attemptId ? { attemptId } : {}) });
+    }
+  }
+  let activeTurn: { claim: ReviewerJobClaim; profileId: string; generation: number; crossedDispatchBoundary: boolean; shutdownPersisted: boolean; eventClaim: OutboxClaim } | undefined;
 
   async function handle(event: DispatchOutboxEvent): Promise<void> {
     const eventClaim = claimOf(event);
@@ -32,6 +42,7 @@ export function createReviewerTurnDispatcher(input: {
     const profileId = typeof event.payload.profileId === "string" ? event.payload.profileId : undefined;
     let turnClaim: ReviewerJobClaim | undefined;
     let crossedDispatchBoundary = false;
+    let leaseHeartbeat: ReturnType<typeof setInterval> | undefined;
     if (!profileId) {
       input.outbox.markFailed(eventClaim, "review_browser_profile_missing", LEASE_MS);
       return;
@@ -47,27 +58,57 @@ export function createReviewerTurnDispatcher(input: {
       }
       const threadId = typeof event.payload.threadId === "string" ? event.payload.threadId : "";
       const restored = await input.browser.restoreThread(threadId);
+      if (stopped) {
+        input.outbox.markFailed(eventClaim, "shutdown_before_dispatch", LEASE_MS);
+        return;
+      }
       turnClaim = input.jobs.claim({ messageId, profileId, browserGeneration: profile.generation, leaseMs: LEASE_MS });
       if (!turnClaim) {
-        input.outbox.markCompleted(eventClaim);
+        markCompleted(eventClaim, event.id);
         return;
       }
       input.jobs.transition({ attemptId: turnClaim.attemptId, leaseToken: turnClaim.leaseToken, profileId, browserGeneration: profile.generation, nextStatus: "browser_ready" });
+      activeTurn = { claim: turnClaim, profileId, generation: profile.generation, crossedDispatchBoundary: false, shutdownPersisted: false, eventClaim };
+      leaseHeartbeat = setInterval(() => {
+        try { input.jobs.renewLease({ attemptId: turnClaim!.attemptId, leaseToken: turnClaim!.leaseToken, profileId: profileId!, browserGeneration: profile!.generation, leaseMs: LEASE_MS }); }
+        catch { /* a stale generation cannot renew; the durable attempt remains fenced */ }
+      }, RENEW_INTERVAL_MS);
       const baseline = await restored.driver.captureBaseline();
+      if (stopped) {
+        input.jobs.transition({ attemptId: turnClaim.attemptId, leaseToken: turnClaim.leaseToken, profileId, browserGeneration: profile.generation, nextStatus: "blocked_browser", errorCode: "shutdown_before_dispatch" });
+        input.outbox.markFailed(eventClaim, "shutdown_before_dispatch", LEASE_MS);
+        return;
+      }
       // Persist the irreversible boundary before the only send action.
       input.jobs.transition({ attemptId: turnClaim.attemptId, leaseToken: turnClaim.leaseToken, profileId, browserGeneration: profile.generation, nextStatus: "dispatching" });
       crossedDispatchBoundary = true;
+      activeTurn.crossedDispatchBoundary = true;
       const result = await restored.driver.submitPrompt({ prompt: turnClaim.prompt, attemptId: turnClaim.attemptId, expectedConversationKey: turnClaim.conversationKey, baseline });
+      if (activeTurn.shutdownPersisted) return;
       if (result.status === "accepted") {
         input.jobs.transition({ attemptId: turnClaim.attemptId, leaseToken: turnClaim.leaseToken, profileId, browserGeneration: profile.generation, nextStatus: "prompt_accepted" });
-        input.outbox.markCompleted(eventClaim);
+        markCompleted(eventClaim, event.id, turnClaim.attemptId);
+        let generation = await restored.driver.waitForGeneration(baseline, turnClaim.attemptId, "start");
+        if (activeTurn.shutdownPersisted) return;
+        if (generation === "generating") {
+          input.jobs.transition({ attemptId: turnClaim.attemptId, leaseToken: turnClaim.leaseToken, profileId, browserGeneration: profile.generation, nextStatus: "model_generating" });
+          generation = await restored.driver.waitForGeneration(baseline, turnClaim.attemptId, "finish");
+          if (activeTurn.shutdownPersisted) return;
+        }
+        if (generation === "finished") {
+          input.jobs.transition({ attemptId: turnClaim.attemptId, leaseToken: turnClaim.leaseToken, profileId, browserGeneration: profile.generation, nextStatus: "generation_finished" });
+          input.jobs.transition({ attemptId: turnClaim.attemptId, leaseToken: turnClaim.leaseToken, profileId, browserGeneration: profile.generation, nextStatus: "awaiting_feedback" });
+        } else {
+          input.jobs.transition({ attemptId: turnClaim.attemptId, leaseToken: turnClaim.leaseToken, profileId, browserGeneration: profile.generation,
+            nextStatus: "uncertain", errorCode: generation === "blocked" ? "authentication_lost_during_review" : "generation_observation_unavailable" });
+        }
       } else if (result.status === "uncertain") {
         input.jobs.transition({ attemptId: turnClaim.attemptId, leaseToken: turnClaim.leaseToken, profileId, browserGeneration: profile.generation, nextStatus: "uncertain", errorCode: result.reason });
-        input.outbox.markCompleted(eventClaim);
+        markCompleted(eventClaim, event.id, turnClaim.attemptId);
       } else {
-        const blocked = ["login_required", "verification_required", "connector_authorization_required"].includes(result.reason);
+        const blocked = ["login_required", "verification_required", "identity_provider_unsupported_browser", "session_expired", "authentication_handoff_failed", "connector_authorization_required"].includes(result.reason);
         input.jobs.transition({ attemptId: turnClaim.attemptId, leaseToken: turnClaim.leaseToken, profileId, browserGeneration: profile.generation, nextStatus: blocked ? "blocked_auth" : "blocked_browser", errorCode: result.reason });
-        input.outbox.markCompleted(eventClaim);
+        markCompleted(eventClaim, event.id, turnClaim.attemptId);
       }
     } catch (error) {
       const latest = input.outbox.get(event.id);
@@ -81,12 +122,15 @@ export function createReviewerTurnDispatcher(input: {
           } catch { /* a stale/fenced attempt remains durable for reconciliation */ }
         }
         if (latest?.status === "claimed") {
-          if (crossedDispatchBoundary) input.outbox.markCompleted(eventClaim);
+          if (crossedDispatchBoundary) markCompleted(eventClaim, event.id, turnClaim.attemptId);
           else input.outbox.markFailed(eventClaim, "browser_not_ready_before_dispatch", LEASE_MS);
         }
       } else if (latest?.status === "claimed") {
         input.outbox.markFailed(eventClaim, error instanceof Error ? error.message.slice(0, 300) : "browser_dispatch_failed", LEASE_MS);
       }
+    } finally {
+      if (leaseHeartbeat) clearInterval(leaseHeartbeat);
+      if (activeTurn?.claim.attemptId === turnClaim?.attemptId) activeTurn = undefined;
     }
   }
 
@@ -95,6 +139,13 @@ export function createReviewerTurnDispatcher(input: {
     if (running) return running;
     running = (async () => {
       input.outbox.reapExpiredClaims(LEASE_MS);
+      let recovery: ReturnType<ReviewerJobStore["reconcileExpiredAttempts"]>;
+      do {
+        recovery = input.jobs.reconcileExpiredAttempts({ now: new Date().toISOString(), limit: 100 });
+        if (recovery.reconciled + recovery.uncertain + recovery.fenced === 100) {
+          await new Promise<void>((resolve) => setImmediate(resolve));
+        }
+      } while (!stopped && recovery.reconciled + recovery.uncertain + recovery.fenced === 100);
       let event: ReturnType<DispatchOutbox["claimNext"]>;
       while (!stopped && (event = input.outbox.claimNext(workerId, LEASE_MS, [EVENT]))) {
         await handle(event);
@@ -119,21 +170,48 @@ export function createReviewerTurnDispatcher(input: {
     }, delay);
   }
 
+  function stopAndDrain(): Promise<void> {
+    if (stopPromise) return stopPromise;
+    stopped = true;
+    unsubscribe?.();
+    unsubscribe = undefined;
+    if (timer) clearTimeout(timer);
+    timer = undefined;
+    stopPromise = (async () => {
+      if (!running) return;
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      const drained = await Promise.race([
+        running.then(() => true),
+        new Promise<false>((resolve) => { timeout = setTimeout(() => resolve(false), Math.max(1, input.drainTimeoutMs ?? 5_000)); }),
+      ]);
+      if (timeout) clearTimeout(timeout);
+      if (drained || !activeTurn) return;
+      const current = activeTurn;
+      try {
+        input.jobs.transition({
+          attemptId: current.claim.attemptId, leaseToken: current.claim.leaseToken,
+          profileId: current.profileId, browserGeneration: current.generation,
+          nextStatus: current.crossedDispatchBoundary ? "uncertain" : "blocked_browser",
+          errorCode: current.crossedDispatchBoundary ? "shutdown_during_dispatch" : "shutdown_before_dispatch",
+        });
+      } catch { /* a concurrent authoritative transition already fenced this attempt */ }
+      if (current.crossedDispatchBoundary) markCompleted(current.eventClaim, current.eventClaim.eventId, current.claim.attemptId);
+      else input.outbox.markFailed(current.eventClaim, "shutdown_before_dispatch", LEASE_MS);
+      current.shutdownPersisted = true;
+    })();
+    return stopPromise;
+  }
+
   return {
     start() {
       if (!stopped) return;
+      stopPromise = undefined;
       stopped = false;
       unsubscribe = input.outbox.subscribe(() => { void drainOnce(); }, [EVENT]);
       // Reconcile durable work left by a crash before relying on notifications.
       void drainOnce();
     },
-    stop() {
-      stopped = true;
-      unsubscribe?.();
-      unsubscribe = undefined;
-      if (timer) clearTimeout(timer);
-      timer = undefined;
-    },
+    stopAndDrain,
     drainOnce,
   };
 }

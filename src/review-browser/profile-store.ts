@@ -6,6 +6,7 @@ import { reviewBrowserProfiles } from "../db/schema.js";
 
 export type ReviewerBrowserMode = "headed" | "headless";
 export type ReviewerBrowserProfileStatus = "stopped" | "starting" | "login_required" | "ready" | "busy" | "recovering" | "blocked";
+export type ReviewerBrowserAuthState = "unknown" | "manual_auth_required" | "manual_auth_in_progress" | "handoff_pending" | "authenticated" | "auth_blocked";
 
 export interface ReviewerBrowserProfile {
   id: string;
@@ -13,6 +14,7 @@ export interface ReviewerBrowserProfile {
   browserEngine: "chromium";
   mode: ReviewerBrowserMode;
   status: ReviewerBrowserProfileStatus;
+  authState: ReviewerBrowserAuthState;
   generation: number;
   lastVerifiedAt?: string;
 }
@@ -38,6 +40,7 @@ function fromRow(row: typeof reviewBrowserProfiles.$inferSelect): ReviewerBrowse
     browserEngine: "chromium",
     mode: row.mode as ReviewerBrowserMode,
     status: row.status as ReviewerBrowserProfileStatus,
+    authState: row.authState as ReviewerBrowserAuthState,
     generation: row.generation,
     lastVerifiedAt: row.lastVerifiedAt ?? undefined,
   };
@@ -48,7 +51,7 @@ export interface ReviewerBrowserProfileStore {
   get(profileId: string): ReviewerBrowserProfile | undefined;
   listForOwner(ownerPrincipalId: string): ReviewerBrowserProfile[];
   profileDirectory(profileId: string): Promise<string>;
-  transition(input: { profileId: string; expectedGeneration: number; status: ReviewerBrowserProfileStatus; mode?: ReviewerBrowserMode; verified?: boolean }): ReviewerBrowserProfile;
+  transition(input: { profileId: string; expectedGeneration: number; status: ReviewerBrowserProfileStatus; mode?: ReviewerBrowserMode; authState?: ReviewerBrowserAuthState; verified?: boolean }): ReviewerBrowserProfile;
 }
 
 export function createReviewerBrowserProfileStore(database: DatabaseHandle, stateDir: string): ReviewerBrowserProfileStore {
@@ -72,6 +75,7 @@ export function createReviewerBrowserProfileStore(database: DatabaseHandle, stat
         browserEngine: "chromium",
         mode: input.mode ?? "headed",
         status: "stopped",
+        authState: "unknown",
         generation: 0,
         createdAt: now,
         updatedAt: now,
@@ -103,6 +107,7 @@ export function createReviewerBrowserProfileStore(database: DatabaseHandle, stat
       const now = new Date().toISOString();
       const updated = database.db.update(reviewBrowserProfiles).set({
         status: input.status,
+        authState: input.authState ?? current.authState,
         mode: input.mode ?? current.mode,
         generation,
         lastVerifiedAt: input.verified ? now : current.lastVerifiedAt,

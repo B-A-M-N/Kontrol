@@ -732,10 +732,14 @@ export const missionOutcomeObservations = sqliteTable("mission_outcome_observati
   id: text("id").primaryKey(),
   missionId: text("mission_id").notNull().references(() => missionContracts.id, { onDelete: "cascade" }),
   submissionId: text("submission_id").notNull(),
+  reviewEpoch: integer("review_epoch"),
   snapshotKind: text("snapshot_kind").notNull(),
   snapshotRef: text("snapshot_ref").notNull(),
   /** Explicit external observer identity; server_test_runner is not valid here. */
   observerIdentity: text("observer_identity").notNull(),
+  observerPrincipalId: text("observer_principal_id"),
+  observationSource: text("observation_source").notNull().default("legacy_operator_reported"),
+  externalEvidenceSha256: text("external_evidence_sha256"),
   /** Declared user-visible behavior that the observer confirmed or rejected. */
   expectedBehavior: text("expected_behavior").notNull(),
   actualBehavior: text("actual_behavior").notNull(),
@@ -1070,7 +1074,10 @@ export const reviewBrowserTurns = sqliteTable("review_browser_turns", {
   baselineUserMessageCount: integer("baseline_user_message_count"),
   baselineAssistantMessageCount: integer("baseline_assistant_message_count"),
   submittedAt: text("submitted_at"),
+  generationStartedAt: text("generation_started_at"),
+  generationStartedObservationId: text("generation_started_observation_id"),
   generationFinishedAt: text("generation_finished_at"),
+  generationFinishedObservationId: text("generation_finished_observation_id"),
   feedbackCommittedAt: text("feedback_committed_at"),
   errorCode: text("error_code"),
   createdAt: text("created_at").notNull(),
@@ -1081,12 +1088,25 @@ export const reviewBrowserTurns = sqliteTable("review_browser_turns", {
   uniqueIndex("review_browser_turns_thread_active_unique").on(table.reviewThreadId).where(sql`${table.state} in ('leased', 'browser_ready', 'dispatching', 'prompt_accepted', 'model_generating', 'generation_finished', 'awaiting_feedback', 'uncertain')`),
 ]);
 
+export const reviewBrowserTurnResolutions = sqliteTable("review_browser_turn_resolutions", {
+  attemptId: text("attempt_id").primaryKey().references(() => reviewBrowserTurns.id, { onDelete: "cascade" }),
+  reviewThreadId: text("review_thread_id").notNull(),
+  routeEpoch: integer("route_epoch").notNull(),
+  reviewerPrincipalId: text("reviewer_principal_id").notNull(),
+  resolution: text("resolution").notNull(),
+  evidenceSha256: text("evidence_sha256").notNull(),
+  createdAt: text("created_at").notNull(),
+}, (table) => [
+  index("review_browser_turn_resolutions_thread_idx").on(table.reviewThreadId, table.createdAt),
+]);
+
 export const reviewBrowserProfiles = sqliteTable("review_browser_profiles", {
   id: text("id").primaryKey(),
   ownerPrincipalId: text("owner_principal_id").notNull(),
   browserEngine: text("browser_engine").notNull().default("chromium"),
   mode: text("mode").notNull().default("headed"),
   status: text("status").notNull().default("stopped"),
+  authState: text("auth_state").notNull().default("unknown"),
   generation: integer("generation").notNull().default(0),
   lastVerifiedAt: text("last_verified_at"),
   createdAt: text("created_at").notNull(),

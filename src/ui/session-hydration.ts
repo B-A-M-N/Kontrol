@@ -54,6 +54,10 @@ export interface HydrationHost {
   setLastSuccessfulHydrationAt(v: string | null): void;
   historicalPendingReviewsLoaded(): boolean;
   setHistoricalPendingReviewsLoaded(v: boolean): void;
+  historicalPendingReviewsCursor(): { updatedAt: string; sessionId: string } | null;
+  setHistoricalPendingReviewsCursor(v: { updatedAt: string; sessionId: string } | null): void;
+  historicalPendingReviewsLoading(): boolean;
+  setHistoricalPendingReviewsLoading(v: boolean): void;
   approvalRecoveryState(): "healthy" | "degraded" | "forbidden" | "disconnected";
   setApprovalRecoveryState(v: "healthy" | "degraded" | "forbidden" | "disconnected"): void;
   approvalAttentionDelivered: Set<string>;
@@ -75,8 +79,14 @@ const unsetHost: HydrationHost = new Proxy({} as HydrationHost, {
 });
 
 let host: HydrationHost = unsetHost;
+let historicalLoadGeneration = 0;
 export function setHydrationHost(next: HydrationHost): void {
   host = next;
+}
+
+export function invalidateHistoricalPendingReviewLoad(): void {
+  historicalLoadGeneration += 1;
+  host.setHistoricalPendingReviewsLoading(false);
 }
 
 /**
@@ -692,12 +702,17 @@ export async function refreshMission(view: WorkSessionViewState): Promise<void> 
 
 export async function loadHistoricalPendingReviews(): Promise<void> {
   const workspaceId = host.getActiveWorkspaceId();
-  if (!workspaceId || !host.uiMutationsAllowed()) return;
+  if (!workspaceId || !host.uiMutationsAllowed() || host.historicalPendingReviewsLoaded() || host.historicalPendingReviewsLoading()) return;
+  const requestGeneration = ++historicalLoadGeneration;
+  host.setHistoricalPendingReviewsLoading(true);
+  host.render();
   try {
+    const cursor = host.historicalPendingReviewsCursor();
     const result = await callServerToolChecked({
       name: "get_workspace_session_surface",
-      arguments: { workspaceId, filter: "stale_pending_review", limit: 100 },
+      arguments: { workspaceId, filter: "stale_pending_review", limit: 100, ...(cursor ? { afterUpdatedAt: cursor.updatedAt, afterSessionId: cursor.sessionId } : {}) },
     });
+    if (requestGeneration !== historicalLoadGeneration || host.getActiveWorkspaceId() !== workspaceId) return;
     const surface = getStructuredContent<{ sessions?: WorkspaceSurfaceSession[] }>(result)?.sessions ?? [];
     for (const s of surface) {
       const view = ensureWorkSessionView(s.sessionId, s.workspaceSessionId, s.runId ?? "");
@@ -728,12 +743,20 @@ export async function loadHistoricalPendingReviews(): Promise<void> {
         });
       }
     }
-    host.setHistoricalPendingReviewsLoaded(true);
+    const last = surface.at(-1);
+    if (last) host.setHistoricalPendingReviewsCursor({ updatedAt: last.updatedAt, sessionId: last.sessionId });
+    host.setHistoricalPendingReviewsLoaded(surface.length < 100);
     host.setLastSuccessfulHydrationAt(new Date().toISOString());
   } catch (error) {
-    host.setErrorMessage(`Older reviews could not be loaded: ${error instanceof Error ? error.message : String(error)}`);
+    if (requestGeneration === historicalLoadGeneration && host.getActiveWorkspaceId() === workspaceId) {
+      host.setErrorMessage(`Older reviews could not be loaded: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  } finally {
+    if (requestGeneration === historicalLoadGeneration && host.getActiveWorkspaceId() === workspaceId) {
+      host.setHistoricalPendingReviewsLoading(false);
+      host.render();
+    }
   }
-  host.scheduleRender();
 }
 
 

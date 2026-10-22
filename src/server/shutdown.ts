@@ -27,7 +27,7 @@ export interface ShutdownDeps {
   readonly maintenance: { stop(): void };
   readonly reviewCheckpoints: { drain(): Promise<unknown> };
   readonly reviewBrowserController?: { close(): Promise<void> };
-  readonly reviewerTurnDispatcher?: { stop(): void };
+  readonly reviewerTurnDispatcher?: { stopAndDrain(): Promise<void> };
   readonly dispatcher: { stop(): void } | undefined;
   readonly supervisorRuntime: { stop(): void } | undefined;
   readonly replyDispatcher: { stop(): void } | undefined;
@@ -108,7 +108,7 @@ export function createShutdownController(deps: ShutdownDeps): Pick<RunningServer
       // graceful stop finishes active publishes and clears their staging; a hard
       // kill is covered by the durable transaction journal on next startup.
       await phase("review-checkpoints", () => deps.reviewCheckpoints.drain());
-      await phase("review-browser-turn-dispatcher", () => deps.reviewerTurnDispatcher?.stop());
+      await phase("review-browser-turn-dispatcher", () => deps.reviewerTurnDispatcher?.stopAndDrain(), 6_000);
       await phase("review-browser-controller", () => deps.reviewBrowserController?.close());
       await phase("dispatcher", () => deps.dispatcher?.stop());
       await phase("reply-dispatcher", () => deps.replyDispatcher?.stop());

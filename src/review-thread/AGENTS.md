@@ -17,6 +17,8 @@ The review workflow and handoff stores own submission and feedback authority. Th
 - Host conversation IDs are correlation metadata; `hostBindingVerified` remains false without a trusted host adapter receipt.
 - Thread messages are immutable per `(threadId, submissionId, reviewEpoch)` and distinguish activation wait, queued delivery, presentation, claim, and committed feedback.
 - Clarification and blocker messages may enter the task-bound native-CDP conversation as advisory WebUI requests. They use the existing agent-message and reply stores; a reviewer reply settles the browser turn but never acts as a review verdict or permission grant.
+- Browser dispatch leases are separate from logical review responsibility. Expired pre-dispatch attempts may be requeued; any attempt past the durable dispatch boundary remains uncertain or requires exact conversation reconciliation and is never resent automatically.
+- An uncertain browser attempt can be requeued only by an authenticated reviewer bound to the active thread after explicitly confirming that the immutable prompt is absent. Persist a principal-bound resolution receipt and hash of the inspection note; if prompt acceptance is possible, preserve the fence and wait for authenticated feedback.
 - The bounded reviewer packet is prepared and content-hashed with the submission transaction; a retry cannot replace an already-prepared packet.
 - The implementing agent's provider-native session is independent of the reviewer thread and work-session IDs.
 - Reviewer decisions travel through the existing MCP handoff tools; do not build a separate reviewer-facing UI or approval screen. Human approvals use the existing Approval Center.

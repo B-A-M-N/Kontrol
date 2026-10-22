@@ -186,6 +186,13 @@ export async function reconnectApp(reason: unknown): Promise<void> {
     if (!host.app()) throw new Error("The MCP host connection is unavailable.");
     host.setConnected(false);
     host.bumpWorkspaceWatcherGeneration();
+    // A transport can report closed while the SDK App still retains its
+    // transport reference. Calling connect() on that instance is rejected
+    // with "App is already connected" even though the host channel is dead.
+    // Replace it before the first reconnect attempt instead of surfacing that
+    // avoidable failure and only then creating a fresh instance.
+    await host.recreateApp();
+    if (!host.app()) throw new Error("The MCP host connection is unavailable.");
     await connectWithRetry(reason);
   })().finally(() => {
     reconnectPromise = null;

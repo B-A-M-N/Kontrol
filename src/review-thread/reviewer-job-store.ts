@@ -1,7 +1,7 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
 import type { DatabaseHandle } from "../db/client.js";
-import { agentMessages, reviewRoutes, reviewThreads, reviewThreadMessages, reviewBrowserTurns } from "../db/schema.js";
+import { agentMessages, reviewRoutes, reviewThreads, reviewThreadMessages, reviewBrowserTurns, reviewBrowserTurnResolutions, reviewHandoffs } from "../db/schema.js";
 import { redactValue } from "../redaction.js";
 
 const ACTIVE = ["leased", "browser_ready", "dispatching", "prompt_accepted", "model_generating", "generation_finished", "awaiting_feedback", "uncertain"] as const;
@@ -17,7 +17,8 @@ export interface ReviewerJobClaim {
 export interface ReviewerAttempt {
   id: string; messageId: string; reviewThreadId: string; routeEpoch: number; profileId?: string;
   browserGeneration?: number; attemptNumber: number; status: string; leaseExpiresAt?: string;
-  promptSubmittedAt?: string; generationStartedAt?: string; generationFinishedAt?: string;
+  promptSubmittedAt?: string; generationStartedAt?: string; generationStartedObservationId?: string;
+  generationFinishedAt?: string; generationFinishedObservationId?: string;
   settledAt?: string; lastErrorCode?: string;
 }
 
@@ -28,6 +29,12 @@ export interface ReviewerJobStore {
     nextStatus: "browser_ready" | "dispatching" | "prompt_accepted" | "model_generating" | "generation_finished" | "awaiting_feedback" | "uncertain" | "blocked_auth" | "blocked_browser" | "failed";
     errorCode?: string;
   }): ReviewerAttempt;
+  renewLease(input: { attemptId: string; leaseToken: string; profileId: string; browserGeneration: number; leaseMs?: number }): string;
+  reconcileExpiredAttempts(input: { now: string; limit: number }): { reconciled: number; uncertain: number; fenced: number };
+  resolveUncertainAttemptForRetry(input: {
+    attemptId: string; reviewThreadId: string; routeEpoch: number; reviewerPrincipalId: string;
+    confirmPromptAbsent: true; inspectionEvidence: string;
+  }): { messageId: string; messageRevision: number; resolutionSha256: string };
   settleForFeedback(input: { handoffId: string; routeEpoch: number }): void;
   settleForAgentMessage(input: { agentMessageId: string; routeEpoch: number }): void;
   getActiveForThread(reviewThreadId: string): ReviewerAttempt | undefined;
@@ -42,7 +49,11 @@ function asAttempt(row: typeof reviewBrowserTurns.$inferSelect): ReviewerAttempt
     profileId: row.profileId, browserGeneration: row.browserGeneration ?? undefined,
     attemptNumber: row.attemptNumber, status: row.state, leaseExpiresAt: row.leaseExpiresAt ?? undefined,
     promptSubmittedAt: row.submittedAt ?? undefined,
-    generationFinishedAt: row.generationFinishedAt ?? undefined, settledAt: row.feedbackCommittedAt ?? undefined,
+    generationStartedAt: row.generationStartedAt ?? undefined,
+    generationStartedObservationId: row.generationStartedObservationId ?? undefined,
+    generationFinishedAt: row.generationFinishedAt ?? undefined,
+    generationFinishedObservationId: row.generationFinishedObservationId ?? undefined,
+    settledAt: row.feedbackCommittedAt ?? undefined,
     lastErrorCode: row.errorCode ?? undefined,
   };
 }
@@ -156,6 +167,10 @@ export function createReviewerJobStore(database: DatabaseHandle): ReviewerJobSto
           || !row.leaseExpiresAt || Date.parse(row.leaseExpiresAt) <= Date.now() || !ACTIVE.includes(row.state as typeof ACTIVE[number])) {
           throw new Error("Browser turn lease is stale, expired, or owned by another profile generation.");
         }
+        if (["blocked_auth", "blocked_browser", "failed"].includes(input.nextStatus)
+          && ["prompt_accepted", "model_generating", "generation_finished", "awaiting_feedback"].includes(row.state)) {
+          throw new Error("A submitted review prompt cannot be requeued from a blocked or failed state; reconcile its exact conversation or preserve uncertainty.");
+        }
         const thread = database.db.select().from(reviewThreads).where(eq(reviewThreads.id, row.reviewThreadId)).get();
         const route = thread && database.db.select().from(reviewRoutes).where(eq(reviewRoutes.id, thread.routeId)).get();
         if (!thread || !route || route.status !== "active" || route.deliveryTransport !== "native_cdp"
@@ -165,9 +180,16 @@ export function createReviewerJobStore(database: DatabaseHandle): ReviewerJobSto
           || thread.conversationFingerprint !== row.conversationFingerprint) throw new Error("Browser turn was fenced by route, profile, generation, or conversation change.");
         const update: Record<string, unknown> = { state: input.nextStatus, errorCode: input.errorCode ?? null };
         if (input.nextStatus === "prompt_accepted") update.submittedAt = now;
-        if (input.nextStatus === "generation_finished" || input.nextStatus === "awaiting_feedback") update.generationFinishedAt = now;
+        if (input.nextStatus === "model_generating") {
+          update.generationStartedAt = now;
+          update.generationStartedObservationId = `${row.id}:chatgpt-dom:start`;
+        }
+        if (input.nextStatus === "generation_finished") {
+          update.generationFinishedAt = now;
+          update.generationFinishedObservationId = `${row.id}:chatgpt-dom:finish`;
+        }
         if (["blocked_auth", "blocked_browser", "failed"].includes(input.nextStatus)) {
-          update.feedbackCommittedAt = now; update.leaseTokenSha256 = null; update.leaseExpiresAt = null;
+          update.leaseTokenSha256 = null; update.leaseExpiresAt = null;
         }
         const changed = database.db.update(reviewBrowserTurns).set(update).where(and(
           eq(reviewBrowserTurns.id, row.id), eq(reviewBrowserTurns.leaseTokenSha256, row.leaseTokenSha256), eq(reviewBrowserTurns.state, row.state),
@@ -175,9 +197,102 @@ export function createReviewerJobStore(database: DatabaseHandle): ReviewerJobSto
         if (changed.changes !== 1) throw new Error("Browser turn status compare-and-swap failed.");
         if (input.nextStatus === "prompt_accepted") database.db.update(reviewThreadMessages).set({ status: "presented", revision: sql`${reviewThreadMessages.revision} + 1`, updatedAt: now })
           .where(and(eq(reviewThreadMessages.id, row.reviewMessageId), eq(reviewThreadMessages.status, "presenting"))).run();
-        if (["blocked_auth", "blocked_browser", "failed"].includes(input.nextStatus)) database.db.update(reviewThreadMessages).set({ status: "queued", revision: sql`${reviewThreadMessages.revision} + 1`, updatedAt: now })
+        if (["blocked_auth", "blocked_browser", "failed"].includes(input.nextStatus)
+          && ["leased", "browser_ready", "dispatching"].includes(row.state)) database.db.update(reviewThreadMessages).set({ status: "queued", revision: sql`${reviewThreadMessages.revision} + 1`, updatedAt: now })
           .where(and(eq(reviewThreadMessages.id, row.reviewMessageId), eq(reviewThreadMessages.status, "presenting"))).run();
         return asAttempt(database.db.select().from(reviewBrowserTurns).where(eq(reviewBrowserTurns.id, row.id)).get()!);
+      })();
+    },
+    renewLease(input) {
+      const now = Date.now();
+      const leaseMs = Math.max(30_000, Math.min(input.leaseMs ?? 5 * 60_000, 30 * 60_000));
+      const expiresAt = new Date(now + leaseMs).toISOString();
+      const updated = database.sqlite.prepare(`update review_browser_turns
+        set lease_expires_at = ?
+        where id = ? and profile_id = ? and browser_generation = ?
+          and lease_token_sha256 = ? and lease_expires_at > ?
+          and state in ('leased', 'browser_ready', 'dispatching', 'prompt_accepted', 'model_generating')`)
+        .run(expiresAt, input.attemptId, input.profileId, input.browserGeneration, sha256(input.leaseToken), new Date(now).toISOString());
+      if (updated.changes !== 1) throw new Error("Browser turn lease renewal was fenced or expired.");
+      return expiresAt;
+    },
+    reconcileExpiredAttempts(input) {
+      const limit = Math.max(1, Math.min(Math.floor(input.limit), 500));
+      return database.sqlite.transaction(() => {
+        const rows = database.sqlite.prepare(`select id, review_message_id, state
+          from review_browser_turns
+          where lease_expires_at is not null and lease_expires_at <= ?
+            and state in ('leased', 'browser_ready', 'dispatching', 'prompt_accepted', 'model_generating', 'generation_finished', 'awaiting_feedback', 'uncertain')
+          order by lease_expires_at, id limit ?`).all(input.now, limit) as Array<{ id: string; review_message_id: string; state: string }>;
+        let reconciled = 0;
+        let uncertain = 0;
+        let fenced = 0;
+        for (const row of rows) {
+          if (row.state === "leased" || row.state === "browser_ready") {
+            database.sqlite.prepare(`update review_browser_turns set state = 'recovered', error_code = 'lease_expired_before_dispatch',
+              lease_token_sha256 = null, lease_expires_at = null where id = ? and state = ?`).run(row.id, row.state);
+            database.sqlite.prepare(`update review_thread_messages set status = 'queued', revision = revision + 1, updated_at = ?
+              where id = ? and status = 'presenting'`).run(input.now, row.review_message_id);
+            reconciled++;
+          } else if (row.state === "dispatching") {
+            database.sqlite.prepare(`update review_browser_turns set state = 'uncertain', error_code = 'lease_expired_after_dispatch_boundary',
+              lease_token_sha256 = null, lease_expires_at = null where id = ? and state = 'dispatching'`).run(row.id);
+            uncertain++;
+          } else {
+            // The logical review remains active, but expired dispatch ownership
+            // is revoked. Exact conversation reconciliation is required before
+            // any browser operation can resume.
+            database.sqlite.prepare(`update review_browser_turns set error_code = coalesce(error_code, 'lease_expired_reconciliation_required'),
+              lease_token_sha256 = null, lease_expires_at = null where id = ? and state = ?`).run(row.id, row.state);
+            fenced++;
+          }
+        }
+        return { reconciled, uncertain, fenced };
+      })();
+    },
+    resolveUncertainAttemptForRetry(input) {
+      const inspectionEvidence = input.inspectionEvidence.trim();
+      if (!input.reviewerPrincipalId.trim() || input.confirmPromptAbsent !== true || inspectionEvidence.length < 12) {
+        throw new Error("Recovery requires an authenticated reviewer, explicit prompt-absent confirmation, and a concise inspection note.");
+      }
+      const now = new Date().toISOString();
+      const evidenceSha256 = sha256(inspectionEvidence);
+      return database.sqlite.transaction(() => {
+        const attempt = database.db.select().from(reviewBrowserTurns).where(eq(reviewBrowserTurns.id, input.attemptId)).get();
+        if (!attempt || attempt.reviewThreadId !== input.reviewThreadId || attempt.routeEpoch !== input.routeEpoch || attempt.state !== "uncertain") {
+          throw new Error("The exact uncertain browser attempt is unavailable or has already been reconciled.");
+        }
+        if (attempt.leaseExpiresAt && Date.parse(attempt.leaseExpiresAt) > Date.parse(now)) {
+          throw new Error("The browser attempt still has a live dispatch lease; wait for its owner to finish before recovery.");
+        }
+        const thread = database.db.select().from(reviewThreads).where(eq(reviewThreads.id, attempt.reviewThreadId)).get();
+        const route = thread && database.db.select().from(reviewRoutes).where(eq(reviewRoutes.id, thread.routeId)).get();
+        const message = database.db.select().from(reviewThreadMessages).where(eq(reviewThreadMessages.id, attempt.reviewMessageId)).get();
+        const handoff = message && database.db.select().from(reviewHandoffs).where(eq(reviewHandoffs.id, message.handoffId)).get();
+        if (!thread || thread.status !== "active" || thread.routeEpoch !== input.routeEpoch
+          || !route || route.status !== "active" || route.routeEpoch !== input.routeEpoch
+          || route.deliveryTransport !== "native_cdp" || route.browserProfileId !== attempt.profileId
+          || thread.browserProfileId !== attempt.profileId || thread.conversationBindingStatus !== "bound"
+          || thread.conversationFingerprint !== attempt.conversationFingerprint
+          || !message || message.threadId !== thread.id || message.routeEpoch !== input.routeEpoch
+          || !["presenting", "presented"].includes(message.status)
+          || handoff?.status === "feedback_committed") {
+          throw new Error("The attempt no longer matches the active route, exact conversation, or unresolved message; it remains fenced.");
+        }
+        const updatedAttempt = database.db.update(reviewBrowserTurns).set({
+          state: "recovered", errorCode: "operator_confirmed_prompt_absent", leaseTokenSha256: null, leaseExpiresAt: null,
+        }).where(and(eq(reviewBrowserTurns.id, attempt.id), eq(reviewBrowserTurns.state, "uncertain"), sql`(${reviewBrowserTurns.leaseExpiresAt} is null or ${reviewBrowserTurns.leaseExpiresAt} <= ${now})`)).run();
+        if (updatedAttempt.changes !== 1) throw new Error("The uncertain browser attempt changed while recovery was being committed.");
+        const updatedMessage = database.db.update(reviewThreadMessages).set({
+          status: "queued", revision: sql`${reviewThreadMessages.revision} + 1`, updatedAt: now,
+        }).where(and(eq(reviewThreadMessages.id, message.id), eq(reviewThreadMessages.revision, message.revision), sql`${reviewThreadMessages.status} in ('presenting', 'presented')`)).run();
+        if (updatedMessage.changes !== 1) throw new Error("The reviewer message changed while recovery was being committed.");
+        database.db.insert(reviewBrowserTurnResolutions).values({
+          attemptId: attempt.id, reviewThreadId: thread.id, routeEpoch: input.routeEpoch,
+          reviewerPrincipalId: input.reviewerPrincipalId, resolution: "confirmed_prompt_absent_requeue",
+          evidenceSha256, createdAt: now,
+        }).run();
+        return { messageId: message.id, messageRevision: message.revision + 1, resolutionSha256: evidenceSha256 };
       })();
     },
     settleForFeedback(input) {

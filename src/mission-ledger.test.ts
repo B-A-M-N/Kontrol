@@ -872,15 +872,24 @@ try {
     const noObs = ledger.canApprove(ovs.id, ovCtx);
     assert.equal(noObs.allowed, false, "outcome_verified without observations is denied");
     assert.match(noObs.reasons.join("\n"), /no outcome observations exist/, "denial cites missing outcome observation");
+    ledger.recordOutcomeObservation(ovm.id, {
+      ...ovCtx, snapshotRef: "another-snapshot", reviewEpoch: ovSub.reviewEpoch + 1,
+      observerPrincipalId: "reviewer-alice", externalEvidence: "Observed a different submitted tree.",
+      evidenceBasis: "firsthand_external_observation",
+      actualBehavior: "fix visible", status: "confirmed",
+    });
+    assert.match(ledger.canApprove(ovs.id, ovCtx).reasons.join("\n"), /no outcome observations exist/, "observations for another snapshot or review epoch cannot satisfy approval");
     // A rejection blocks approval even if an earlier confirmation exists.
-    ledger.recordOutcomeObservation(ovm.id, { ...ovCtx, observerIdentity: "human:alice", expectedBehavior: "fix visible", actualBehavior: "not visible", status: "rejected" });
+    const rejectionReceipt = ledger.recordOutcomeObservation(ovm.id, { ...ovCtx, observerPrincipalId: "reviewer-alice", evidenceBasis: "firsthand_external_observation", externalEvidence: "Observed the UI after reload; the fix was not visible.", actualBehavior: "not visible", status: "rejected" });
+    assert.equal(rejectionReceipt.receipt.source, "firsthand_authenticated_external_reviewer");
+    assert.equal(rejectionReceipt.receipt.expectedBehavior, "User sees the fix in the UI after reload");
     const rejected = ledger.canApprove(ovs.id, ovCtx);
     assert.equal(rejected.allowed, false, "rejected observation blocks approval");
     assert.match(rejected.reasons.join("\n"), /rejected the expected behavior/, "denial cites the rejection");
     // A rejection is authoritative: a later confirmation does NOT silently
     // undo it. The reviewer must supersede with a new submission or an
     // explicit second-round review, not just add a confirm record.
-    ledger.recordOutcomeObservation(ovm.id, { ...ovCtx, observerIdentity: "human:bob", expectedBehavior: "fix visible", actualBehavior: "fix visible after reload", status: "confirmed" });
+    ledger.recordOutcomeObservation(ovm.id, { ...ovCtx, observerPrincipalId: "reviewer-bob", evidenceBasis: "firsthand_external_observation", externalEvidence: "Observed the UI after reload; the fix was visible.", actualBehavior: "fix visible after reload", status: "confirmed" });
     const confirmedAfterRejection = ledger.canApprove(ovs.id, ovCtx);
     assert.equal(confirmedAfterRejection.allowed, false, "a rejection is authoritative even after a later confirmation");
   }

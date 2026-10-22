@@ -122,6 +122,7 @@ import {
 import {
   fetchReviewDiff,
   hydrateWorkSessionSnapshot,
+  invalidateHistoricalPendingReviewLoad,
   loadHistoricalPendingReviews,
   queueSessionRehydration,
   reconcileAuthoritativeApprovals,
@@ -210,6 +211,8 @@ let rehydrationPromise: Promise<void> | null = null;
 let rehydrationRequested = false;
 let lastSuccessfulHydrationAt: string | null = null;
 let historicalPendingReviewsLoaded = false;
+let historicalPendingReviewsLoading = false;
+let historicalPendingReviewsCursor: { updatedAt: string; sessionId: string } | null = null;
 
 // View-local UI state (replaced the previous globals).
 let expanded = false;
@@ -398,6 +401,8 @@ setLifecycleHost({
     connectionState: () => connectionState,
     render: () => render(),
     historicalPendingReviewsLoaded: () => historicalPendingReviewsLoaded,
+    historicalPendingReviewsLoading: () => historicalPendingReviewsLoading,
+    historicalPendingReviewsCursor: () => historicalPendingReviewsCursor,
     reviewCardFromSubmission,
     getLastToolCard: () => lastToolCard,
     setLastToolCard: (v) => { lastToolCard = v; },
@@ -432,6 +437,10 @@ setLifecycleHost({
     setLastSuccessfulHydrationAt: (v) => { lastSuccessfulHydrationAt = v; },
     historicalPendingReviewsLoaded: () => historicalPendingReviewsLoaded,
     setHistoricalPendingReviewsLoaded: (v) => { historicalPendingReviewsLoaded = v; },
+    historicalPendingReviewsLoading: () => historicalPendingReviewsLoading,
+    setHistoricalPendingReviewsLoading: (v) => { historicalPendingReviewsLoading = v; },
+    historicalPendingReviewsCursor: () => historicalPendingReviewsCursor,
+    setHistoricalPendingReviewsCursor: (v) => { historicalPendingReviewsCursor = v; },
     approvalRecoveryState: () => approvalRecoveryState,
     setApprovalRecoveryState: (v) => { approvalRecoveryState = v; },
     approvalAttentionDelivered,
@@ -682,8 +691,11 @@ function installAppErrorHandler(target: App): void {
 
 function activateWorkspace(newWorkspaceId: string): void {
   if (activeWorkspaceId !== newWorkspaceId) {
+    invalidateHistoricalPendingReviewLoad();
     activeWorkspaceId = newWorkspaceId;
     historicalPendingReviewsLoaded = false;
+    historicalPendingReviewsLoading = false;
+    historicalPendingReviewsCursor = null;
     // P0.5 isolation invariant: a workspace transition must start on the
     // new workspace's own surface. Old-workspace state is kept internally
     // for a fast return but can never render under the new selection.
@@ -907,4 +919,6 @@ export const __workspaceAppTest = {
   surfaceNewDirectApprovalResolved: (workspaceId: string) => maybeRestoreAfterApprovalResolved(workspaceId),
   selectWorkSession,
   reconcileAuthoritativeApprovals,
+  loadHistoricalPendingReviews,
+  isHistoricalPendingReviewsLoading: () => historicalPendingReviewsLoading,
 };

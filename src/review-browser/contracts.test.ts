@@ -4,16 +4,26 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDatabase } from "../db/client.js";
 import { createReviewerBrowserProfileStore } from "./profile-store.js";
+import { createReviewerBrowserController } from "./browser-controller.js";
 import { bindReviewerTarget, canonicalReviewerConversation, restoreReviewerTarget, reviewerConversationFingerprint } from "./target-binding.js";
 import type { CdpClient } from "./cdp-client.js";
-import { ChatGptPageDriver } from "./chatgpt-page-driver.js";
+import { ChatGptPageDriver, type TurnBaseline } from "./chatgpt-page-driver.js";
 import type { BoundReviewerTarget } from "./target-binding.js";
+import { chromeArguments } from "./chrome-process.js";
+import { createReviewerTurnDispatcher } from "./turn-dispatcher.js";
 
 const root = await mkdtemp(join(tmpdir(), "kontrol-review-browser-test-"));
 try {
   const canonical = canonicalReviewerConversation("https://www.chatgpt.com/c/conversation_12345678?foo=1#x");
   assert.deepEqual(canonical, { url: "https://chatgpt.com/c/conversation_12345678", key: "conversation_12345678" });
   assert.equal(reviewerConversationFingerprint(canonical.key).length, 64);
+  const manualArgs = chromeArguments("/private/reviewer-profile", "manual_authentication");
+  assert.ok(manualArgs.includes("https://chatgpt.com/"));
+  assert.ok(manualArgs.includes("--user-data-dir=/private/reviewer-profile"));
+  assert.equal(manualArgs.some((arg) => arg.includes("remote-debugging")), false, "manual authentication never starts Chrome with a debugging endpoint");
+  const controlledArgs = chromeArguments("/private/reviewer-profile", "controlled_review", "headed");
+  assert.ok(controlledArgs.includes("--remote-debugging-address=127.0.0.1"));
+  assert.ok(controlledArgs.includes("--user-data-dir=/private/reviewer-profile"), "both modes use the same dedicated profile");
   for (const url of ["http://chatgpt.com/c/conversation_12345678", "https://chatgpt.com/", "https://chatgpt.com/c/short", "https://evil.example/c/conversation_12345678"]) {
     assert.throws(() => canonicalReviewerConversation(url));
   }
@@ -41,12 +51,93 @@ try {
     const profiles = createReviewerBrowserProfileStore(db, join(root, "state"));
     const profile = profiles.create({ id: "reviewer-default", ownerPrincipalId: "reviewer-1" });
     assert.equal(profile.status, "stopped");
+    assert.equal(profile.authState, "unknown", "authentication status is independent of browser process status");
     const directory = await profiles.profileDirectory(profile.id);
     assert.ok(directory.startsWith(join(root, "state", "reviewer-browser", "profiles")));
     assert.equal((await stat(directory)).mode & 0o777, 0o700);
     assert.throws(() => profiles.create({ id: "../outside", ownerPrincipalId: "reviewer-1" }));
     assert.throws(() => profiles.create({ id: "reviewer-default", ownerPrincipalId: "reviewer-2" }), /another principal/i);
   } finally { db.close(); }
+
+  {
+    const controllerDb = openDatabase(join(root, "controller-state"));
+    let controlledLaunches = 0;
+    let releaseInitialLaunch!: (value: any) => void;
+    let releaseHandoffLaunch!: (value: any) => void;
+    const initialLaunch = new Promise<any>((resolve) => { releaseInitialLaunch = resolve; });
+    const handoffLaunch = new Promise<any>((resolve) => { releaseHandoffLaunch = resolve; });
+    let manualExited = false;
+    let manualCloseCalls = 0;
+    const fakeChrome = (generation: number, authenticated = false) => ({
+      profileDirectory: join(root, "controller-state", "profile"), generation, browserPid: 999,
+      version: { product: "Chrome/test" }, reused: false,
+      cdp: { async send(method: string) {
+        if (method === "Target.getTargets") return { targetInfos: [{ targetId: "auth-tab", type: "page", url: "https://chatgpt.com/", title: "ChatGPT" }] };
+        if (method === "Target.attachToTarget") return { sessionId: "auth-session" };
+        if (method === "Runtime.evaluate") return { result: { value: { authenticated, loginRequired: false, verificationRequired: false } } };
+        return {};
+      } },
+      async detach() {}, async close() {},
+    });
+    const controller = createReviewerBrowserController({
+      database: controllerDb, stateDir: join(root, "controller-state"),
+      launchControlled: async (options) => {
+        controlledLaunches += 1;
+        if (controlledLaunches === 1) return initialLaunch;
+        if (controlledLaunches === 2) return handoffLaunch;
+        return fakeChrome(options.generation, true) as any;
+      },
+      launchManualAuthentication: async (options) => ({
+        browserPid: 1000,
+        hasExited: () => manualExited,
+        async releaseAfterExit() { if (!manualExited) throw new Error("still running"); },
+        async close() { manualCloseCalls += 1; manualExited = true; return true; },
+      }),
+    });
+    try {
+      controller.createProfile({ profileId: "controller-test", ownerPrincipalId: "reviewer-1" });
+      const startA = controller.startProfile("controller-test", "headed");
+      for (let i = 0; i < 50 && controlledLaunches === 0; i += 1) await new Promise((resolve) => setTimeout(resolve, 2));
+      const startB = controller.startProfile("controller-test", "headed");
+      assert.equal(startA, startB, "same-generation concurrent profile starts share the in-flight promise");
+      await assert.rejects(controller.beginManualAuthentication("controller-test"), /operation is already running/i,
+        "manual auth cannot overlap a profile start");
+      releaseInitialLaunch(fakeChrome(1) as any);
+      await Promise.all([startA, startB]);
+      const auth = await controller.beginManualAuthentication("controller-test");
+      assert.equal(auth.generation, 2);
+      assert.equal(controller.profiles.get("controller-test")?.authState, "manual_auth_in_progress");
+      await assert.rejects(controller.startProfile("controller-test"), /manual authentication owns this profile/i,
+        "controlled mode cannot start while ordinary Chrome owns the profile");
+      manualExited = true;
+      const completing = controller.completeManualAuthentication("controller-test");
+      for (let i = 0; i < 50 && controlledLaunches < 2; i += 1) await new Promise((resolve) => setTimeout(resolve, 2));
+      await assert.rejects(controller.startProfile("controller-test"), /operation is already running/i,
+        "profile restart cannot overlap authentication handoff verification");
+      releaseHandoffLaunch(fakeChrome(3, true) as any);
+      const completed = await completing;
+      assert.equal(completed.status, "authenticated", "controlled relaunch verifies the persisted ChatGPT session");
+      assert.equal(controller.profiles.get("controller-test")?.authState, "authenticated");
+      await controller.close();
+    } finally { controllerDb.close(); }
+
+    const shutdownDb = openDatabase(join(root, "controller-shutdown-state"));
+    let shutdownManualCloseCalls = 0;
+    const shutdownController = createReviewerBrowserController({
+      database: shutdownDb, stateDir: join(root, "controller-shutdown-state"),
+      launchManualAuthentication: async () => ({
+        hasExited: () => false,
+        async releaseAfterExit() {},
+        async close() { shutdownManualCloseCalls += 1; return true; },
+      }),
+    });
+    try {
+      shutdownController.createProfile({ profileId: "shutdown-test", ownerPrincipalId: "reviewer-1" });
+      await shutdownController.beginManualAuthentication("shutdown-test");
+      await shutdownController.close();
+      assert.equal(shutdownManualCloseCalls, 1, "controller shutdown closes an ordinary Chrome authentication process and releases ownership");
+    } finally { shutdownDb.close(); }
+  }
 
   const driverCommands: string[] = [];
   let enteredPrompt: string | undefined;
@@ -79,6 +170,92 @@ try {
   const retry = await driver.submitPrompt({ prompt: "bounded review packet", attemptId: "attempt-1", expectedConversationKey: canonical.key, baseline });
   assert.equal(retry.status, "accepted", "an exact already-present attempt is reconciled without sending again");
   assert.equal(driverCommands.filter((method) => method === "Input.dispatchMouseEvent").length, 3, "an accepted retry does not click Send again");
+
+  const makeDispatcher = (driver: any, failPromptAcknowledgement = false) => {
+    let claimed = false;
+    const transitions: string[] = [];
+    let failed = false;
+    let completed = false;
+    const claim = {
+      attemptId: "attempt-shutdown", messageId: "message-shutdown", reviewThreadId: "thread-shutdown", handoffId: "handoff-shutdown", routeId: "route-shutdown",
+      routeEpoch: 1, attemptNumber: 1, profileId: "reviewer-shutdown", browserGeneration: 7,
+      leaseToken: "lease-shutdown", leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(), conversationUrl: canonical.url,
+      conversationKey: canonical.key, conversationFingerprint: "f".repeat(64), bindingRevision: 1,
+      promptPayloadSha256: "a".repeat(64), prompt: "prompt",
+    };
+    const event = { id: "event-shutdown", aggregateId: "message-shutdown", payload: { messageId: "message-shutdown", threadId: "thread-shutdown", profileId: "reviewer-shutdown" }, status: "claimed", claimToken: "token", claimedBy: "worker" };
+    const dispatcher = createReviewerTurnDispatcher({
+      drainTimeoutMs: 20,
+      outbox: {
+        subscribe: () => () => undefined,
+        reapExpiredClaims: () => 0,
+        claimNext: () => { if (claimed) return undefined; claimed = true; return event; },
+        listPending: () => [],
+        markFailed: () => { failed = true; return true; },
+        markCompleted: () => { completed = true; return true; },
+        get: () => event,
+      } as any,
+      jobs: {
+        claim: () => claim,
+        transition: (input: { nextStatus: string }) => {
+          transitions.push(input.nextStatus);
+          if (failPromptAcknowledgement && input.nextStatus === "prompt_accepted") throw new Error("simulated durable acknowledgement failure after host acceptance");
+          return {};
+        },
+        renewLease: () => new Date(Date.now() + 60_000).toISOString(),
+        reconcileExpiredAttempts: () => ({ reconciled: 0, uncertain: 0, fenced: 0 }),
+      } as any,
+      browser: {
+        profiles: { get: () => ({ id: "reviewer-shutdown", generation: 7, status: "ready", mode: "headed" }) },
+        startProfile: async () => ({ generation: 7, status: "ready" }),
+        restoreThread: async () => ({ target: pageTarget, driver }),
+      } as any,
+    });
+    return { dispatcher, transitions, wasFailed: () => failed, wasCompleted: () => completed };
+  };
+
+  let releaseBaseline!: (value: TurnBaseline) => void;
+  let baselineEntered!: () => void;
+  const baselineStarted = new Promise<void>((resolve) => { baselineEntered = resolve; });
+  const slowBaselineDriver = {
+    captureBaseline: () => { baselineEntered(); return new Promise<TurnBaseline>((resolve) => { releaseBaseline = resolve; }); },
+    submitPrompt: async () => { throw new Error("shutdown before dispatch must not submit"); },
+  };
+  const beforeDispatch = makeDispatcher(slowBaselineDriver);
+  beforeDispatch.dispatcher.start();
+  await baselineStarted;
+  const beforeDrain = beforeDispatch.dispatcher.stopAndDrain();
+  releaseBaseline({ conversationKey: canonical.key, userMessageCount: 0, assistantMessageCount: 0, capturedAt: new Date().toISOString() });
+  await beforeDrain;
+  assert.equal(beforeDispatch.wasFailed(), true, "shutdown before prompt submission releases the durable dispatch claim");
+  assert.equal(beforeDispatch.transitions.includes("dispatching"), false);
+
+  let submitEntered!: () => void;
+  let releaseSubmit!: (value: { status: "accepted"; submittedAt: string; conversationKey: string }) => void;
+  const submitStarted = new Promise<void>((resolve) => { submitEntered = resolve; });
+  const slowSubmitDriver = {
+    captureBaseline: async () => ({ conversationKey: canonical.key, userMessageCount: 0, assistantMessageCount: 0, capturedAt: new Date().toISOString() }),
+    submitPrompt: () => { submitEntered(); return new Promise<{ status: "accepted"; submittedAt: string; conversationKey: string }>((resolve) => { releaseSubmit = resolve; }); },
+  };
+  const duringDispatch = makeDispatcher(slowSubmitDriver);
+  duringDispatch.dispatcher.start();
+  await submitStarted;
+  await duringDispatch.dispatcher.stopAndDrain();
+  assert.equal(duringDispatch.transitions.at(-1), "uncertain", "shutdown after the irreversible send boundary preserves uncertainty");
+  assert.equal(duringDispatch.wasCompleted(), true, "uncertain delivery is not automatically redelivered");
+  releaseSubmit({ status: "accepted", submittedAt: new Date().toISOString(), conversationKey: canonical.key });
+
+  const acceptedThenAckFailed = makeDispatcher({
+    captureBaseline: async () => ({ conversationKey: canonical.key, userMessageCount: 0, assistantMessageCount: 0, capturedAt: new Date().toISOString() }),
+    submitPrompt: async () => ({ status: "accepted", submittedAt: new Date().toISOString(), conversationKey: canonical.key }),
+  }, true);
+  acceptedThenAckFailed.dispatcher.start();
+  await acceptedThenAckFailed.dispatcher.drainOnce();
+  assert.ok(acceptedThenAckFailed.transitions.includes("dispatching"));
+  assert.ok(acceptedThenAckFailed.transitions.includes("prompt_accepted"));
+  assert.equal(acceptedThenAckFailed.transitions.at(-1), "uncertain", "a lost durable acknowledgement after host acceptance keeps the send boundary uncertain");
+  assert.equal(acceptedThenAckFailed.wasCompleted(), true, "the accepted prompt's outbox item is fenced against redelivery after acknowledgement failure");
+  await acceptedThenAckFailed.dispatcher.stopAndDrain();
 } finally {
   await rm(root, { recursive: true, force: true });
 }

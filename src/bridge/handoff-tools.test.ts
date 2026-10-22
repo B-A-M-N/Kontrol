@@ -10,6 +10,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { registerHandoffTools } from "./handoff-tools.js";
 import { mcpOwnerContextId } from "../mcp/owner-context.js";
 import { McpQualificationEvidenceJournal } from "../server/mcp-qualification-evidence.js";
+import { reviewerThreadContextId } from "./shared.js";
 
 const root = await mkdtemp(join(tmpdir(), "kontrol-handoff-tools-test-"));
 
@@ -68,6 +69,8 @@ try {
 
   const eventTypes: string[] = [];
   const eventPayloads: unknown[] = [];
+  let browserRecoveryInput: Record<string, unknown> | undefined;
+  const browserAuthCalls: string[] = [];
   const testSubmission = {
     id: "sub-1", workSessionId: "wsess-handoff", submissionNumber: 1,
     diffSha256: "hash-1", snapshotKind: "git" as const, snapshotRef: "ref-1",
@@ -89,6 +92,30 @@ try {
     connectionConversationId: "conv-b",
     connectionMcpSessionId: "mcp-reviewer-1",
     reviewRoutes: routes,
+    reviewThreads: {
+      getById: (id: string) => id === "thread-recovery" ? {
+        id, status: "active", reviewerPrincipalId: "user-a",
+        reviewerContextId: reviewerThreadContextId({ principalRole: "reviewer", principalId: "user-a", connectionConversationId: "conv-b", connectionMcpSessionId: "mcp-reviewer-1" } as any),
+        routeEpoch: route.routeEpoch, workSessionId: "wsess-handoff",
+      } : undefined,
+    },
+    reviewBrowserJobs: {
+      resolveUncertainAttemptForRetry: (input: Record<string, unknown>) => {
+        browserRecoveryInput = input;
+        return { messageId: "message-recovered", messageRevision: 3, resolutionSha256: "b".repeat(64) };
+      },
+    },
+    reviewBrowserController: {
+      profiles: { get: (profileId: string) => profileId === "reviewer-profile" ? { id: profileId, ownerPrincipalId: "user-a" } : undefined },
+      beginManualAuthentication: async (profileId: string) => {
+        browserAuthCalls.push(`begin:${profileId}`);
+        return { profileId, generation: 4, browserPid: 4321 };
+      },
+      completeManualAuthentication: async (profileId: string) => {
+        browserAuthCalls.push(`complete:${profileId}`);
+        return { status: "auth_required", reason: "close_all_chrome_windows_before_handoff", targets: [] };
+      },
+    },
     qualificationEvidence: new McpQualificationEvidenceJournal(db.sqlite),
     toolSurfaceVersion: "1.0.4+capture-test",
     serverConfig: { expectedBuildId: "build-capture-test" },
@@ -132,6 +159,27 @@ try {
   assert.equal(eventTypes.includes("review.handoff.external_catalog_observation_attached"), true);
   assert.equal(JSON.stringify(eventPayloads).includes("host_integration"), false,
     "reviewer-provided data is never promoted to host integration evidence");
+  const resolvedBrowserAttempt = await reviewerClient.callTool({ name: "resolve_uncertain_reviewer_browser_attempt", arguments: {
+    attemptId: "rturn-uncertain", threadId: "thread-recovery", confirmPromptAbsent: true,
+    inspectionEvidence: "I inspected the bound conversation and confirmed the prompt is absent.",
+  } });
+  assert.equal(resolvedBrowserAttempt.isError, undefined);
+  assert.deepEqual(browserRecoveryInput, {
+    attemptId: "rturn-uncertain", reviewThreadId: "thread-recovery", routeEpoch: route.routeEpoch,
+    reviewerPrincipalId: "user-a", confirmPromptAbsent: true,
+    inspectionEvidence: "I inspected the bound conversation and confirmed the prompt is absent.",
+  }, "recovery tool binds the explicit resolution to the active reviewer principal and route epoch");
+  assert.equal((resolvedBrowserAttempt.structuredContent as Record<string, unknown>).status, "queued");
+  assert.equal(eventTypes.includes("review.browser_turn.operator_reconciled"), true);
+
+  const authStarted = await reviewerClient.callTool({ name: "begin_reviewer_browser_auth", arguments: { profileId: "reviewer-profile" } });
+  assert.equal(authStarted.isError, undefined, "authenticated reviewers can start the dedicated ordinary-Chrome auth handoff");
+  assert.deepEqual(authStarted.structuredContent, { profileId: "reviewer-profile", generation: 4, browserPid: 4321 });
+  assert.match(JSON.stringify(authStarted.content), /without remote debugging/);
+  const authCompleted = await reviewerClient.callTool({ name: "complete_reviewer_browser_auth", arguments: { profileId: "reviewer-profile" } });
+  assert.equal(authCompleted.isError, undefined);
+  assert.equal((authCompleted.structuredContent as { status: string }).status, "auth_required");
+  assert.deepEqual(browserAuthCalls, ["begin:reviewer-profile", "complete:reviewer-profile"]);
 
   const clientConfig = { ...reviewerConfig, principalRole: "client" };
   const clientServer = new McpServer({ name: "handoff-client-auth-test", version: "1.0.0" });
@@ -145,6 +193,14 @@ try {
     observation,
   } });
   assert.equal(denied.isError, true, "non-reviewers cannot submit observations");
+  const deniedBrowserRecovery = await client.callTool({ name: "resolve_uncertain_reviewer_browser_attempt", arguments: {
+    attemptId: "rturn-forged", threadId: "thread-forged", confirmPromptAbsent: true,
+    inspectionEvidence: "I inspected the conversation carefully.",
+  } });
+  assert.equal(deniedBrowserRecovery.isError, true, "non-reviewers cannot release an uncertain browser-attempt fence");
+  const deniedBrowserAuth = await client.callTool({ name: "begin_reviewer_browser_auth", arguments: { profileId: "reviewer-profile" } });
+  assert.equal(deniedBrowserAuth.isError, true, "non-reviewers cannot launch ordinary Chrome for reviewer authentication");
+  assert.deepEqual(browserAuthCalls, ["begin:reviewer-profile", "complete:reviewer-profile"], "denied auth requests never reach the browser controller");
   await Promise.all([reviewerClient.close(), reviewerServer.close(), client.close(), clientServer.close()]);
   db.close();
 } finally {
