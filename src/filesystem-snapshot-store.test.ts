@@ -11,7 +11,7 @@ import { writeFile, readFile, mkdir, open } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
-import { FilesystemSnapshotStore, FilesystemSnapshotLimits, DEFAULT_SNAPSHOT_LIMITS } from "./filesystem-snapshot-store.js";
+import { FilesystemSnapshotStore, FilesystemSnapshotLimits, DEFAULT_SNAPSHOT_LIMITS, type WorkspaceSnapshot } from "./filesystem-snapshot-store.js";
 
 function makeRoot(prefix: string): string {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -449,6 +449,79 @@ function snap(ref: string, terminal = false): { ref: string; terminal?: boolean 
       assert.equal(existsSync(store.blobPath(entry.sha256)), true, `newly rooted blob ${entry.sha256} survives`);
     }
   }
+}
+
+// A process restart during each resumable GC phase discards only in-memory
+// cursors. The next store instance reconstructs reachability from durable
+// baseline roots and completes reclamation without deleting the rooted tree.
+{
+  const { store: initialStore, storeRoot, workspaceRoot } = makeStore({ limits: { retentionMs: 0, retainPerWorkspace: 0 } });
+  const limits = { orphanGraceMs: 0, retentionMs: 0, retainPerWorkspace: 0 };
+  file(workspaceRoot, "durable.txt", "durable snapshot content\n");
+  const durable = await initialStore.capture(workspaceRoot);
+  await initialStore.saveBaselines("ws-gc-restart", workspaceRoot, {
+    open: durable, presentation: durable, legacy: durable, sessions: new Map(),
+  });
+  const unrooted: WorkspaceSnapshot[] = [];
+  for (let index = 0; index < 4; index++) {
+    file(workspaceRoot, `garbage-${index}.txt`, `unrooted snapshot ${index}\n`);
+    unrooted.push(await initialStore.capture(workspaceRoot));
+  }
+  await initialStore.saveBaselines("ws-gc-restart", workspaceRoot, {
+    open: durable,
+    presentation: durable,
+    legacy: durable,
+    sessions: new Map([["ws-gc-restart-pinned", unrooted[0]!]]),
+  });
+
+  let store = initialStore;
+  const roots = () => [];
+  const state = (candidate: FilesystemSnapshotStore) => (candidate as unknown as { gcState: {
+    phase: number;
+    markStage: string | null;
+    markCursor: number;
+    expireCursor: number;
+    expiredRefs: string[];
+  } }).gcState;
+  const advanceUntil = async (predicate: () => boolean, message: string) => {
+    for (let index = 0; index < 500 && !predicate(); index++) {
+      await store.gcSlice({ budgetMs: 1000, pageSize: 1, dryRun: false, listDbSnapshots: roots });
+    }
+    assert.ok(predicate(), message);
+  };
+  const restart = async () => {
+    (store as unknown as { closeGcDirectoryCursors(): void }).closeGcDirectoryCursors();
+    await store.close();
+    store = new FilesystemSnapshotStore({ storeRoot, limits });
+  };
+
+  await store.gcSlice({ budgetMs: 1000, pageSize: 1, dryRun: false, listDbSnapshots: roots });
+  assert.equal(state(store).phase, 0);
+  assert.equal(state(store).markStage, "classify");
+  await restart();
+
+  await advanceUntil(() => state(store).markStage === "mark" && state(store).markCursor > 0,
+    "GC reaches the manifest mark phase before restart");
+  await restart();
+
+  await advanceUntil(() => state(store).markStage === "expire" && state(store).expireCursor > 0
+    && state(store).expireCursor < state(store).expiredRefs.length,
+  "GC reaches the partial manifest-expiration phase before restart");
+  await restart();
+
+  await advanceUntil(() => state(store).phase === 1,
+    "GC reaches the blob-sweep phase before restart");
+  await restart();
+  await gcToCompletion(store, roots);
+
+  assert.equal(existsSync(store.manifestPath(durable.ref)), true, "durable snapshot manifest survives every GC restart");
+  const durableManifest = await store.readManifest(durable);
+  for (const entry of durableManifest.entries) {
+    if (entry.type === "file") assert.equal(existsSync(store.blobPath(entry.sha256)), true, "durable snapshot blob survives every GC restart");
+  }
+  assert.equal(existsSync(store.manifestPath(unrooted[0]!.ref)), true, "secondary durable baseline survives every GC restart");
+  for (const snapshot of unrooted.slice(1)) assert.equal(existsSync(store.manifestPath(snapshot.ref)), false, "unrooted manifest is eventually reclaimed after restart");
+  await store.close();
 }
 
 // GC continues through sharded blob directories with a cursor instead of
