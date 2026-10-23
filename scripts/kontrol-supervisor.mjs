@@ -343,13 +343,13 @@ export function createMcpCanaryRunner({
   function snapshot() {
     return {
       enabled: state.enabled,
-      running: state.running,
+      running: state.running || Boolean(activeChild),
       lastStartedAt: state.lastStartedAt,
       lastCompletedAt: state.lastCompletedAt,
       lastOk: state.lastOk,
       lastError: state.lastError,
       lastDurationMs: state.lastDurationMs,
-      runningDurationMs: state.running && state.lastStartedAt ? Math.max(0, now() - Date.parse(state.lastStartedAt)) : 0,
+      runningDurationMs: (state.running || activeChild) && state.lastStartedAt ? Math.max(0, now() - Date.parse(state.lastStartedAt)) : 0,
       consecutiveFailures: state.consecutiveFailures,
       totalRuns: state.totalRuns,
       totalFailures: state.totalFailures,
@@ -357,10 +357,12 @@ export function createMcpCanaryRunner({
   }
 
   let activePromise;
+  let activeChild;
+  let activeChildClosed;
   let cancelActive = () => {};
 
   async function runIfDue(at = now()) {
-    if (!enabled || state.running || at < state.nextRunAt) return false;
+    if (!enabled || state.running || activeChild || at < state.nextRunAt) return false;
     state.running = true;
     state.lastStartedAt = new Date(at).toISOString();
     state.totalRuns += 1;
@@ -408,6 +410,13 @@ export function createMcpCanaryRunner({
         finish(false, error instanceof Error ? error.message : String(error));
         return;
       }
+      activeChild = child;
+      activeChildClosed = new Promise((resolveClosed) => {
+        child.once("close", () => {
+          if (activeChild === child) activeChild = undefined;
+          resolveClosed();
+        });
+      });
       cancelActive = () => {
         try { child.kill("SIGTERM"); } catch { /* already exited */ }
         finish(false, "shutdown");
@@ -426,7 +435,17 @@ export function createMcpCanaryRunner({
 
   async function stop() {
     cancelActive();
+    if (activeChild) {
+      try { activeChild.kill("SIGTERM"); } catch { /* already exited */ }
+    }
     await activePromise;
+    const closePromise = activeChildClosed;
+    if (!activeChild || !closePromise) return;
+    const sleep = (ms) => new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
+    const closedAfterTerm = await Promise.race([closePromise.then(() => true), sleep(2_000).then(() => false)]);
+    if (closedAfterTerm || !activeChild) return;
+    try { activeChild.kill("SIGKILL"); } catch { /* already exited */ }
+    await Promise.race([closePromise, sleep(1_000)]);
   }
 
   return { runIfDue, snapshot, stop };

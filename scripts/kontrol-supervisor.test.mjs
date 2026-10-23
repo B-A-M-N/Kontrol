@@ -157,13 +157,18 @@ assert.equal(failedCanary.snapshot().totalFailures, 1);
 
 let blockedCanaryNow = 5_000;
 let blockedCanaryKilled = false;
+let blockedCanaryClosed = false;
 const blockedCanary = createMcpCanaryRunner({
   url: "https://mcp.example.test",
   intervalMs: 1_000,
   now: () => blockedCanaryNow,
   spawnFn: () => {
     const child = new EventEmitter();
-    child.kill = () => { blockedCanaryKilled = true; };
+    child.once("close", () => { blockedCanaryClosed = true; });
+    child.kill = (signal) => {
+      blockedCanaryKilled = true;
+      if (signal === "SIGTERM") queueMicrotask(() => child.emit("close", null, "SIGTERM"));
+    };
     return child;
   },
 });
@@ -188,6 +193,8 @@ await blockedCanary.stop();
 assert.equal(await blockedRun, false, "shutdown cancels the outstanding canary result");
 assert.equal(blockedCanaryKilled, true, "shutdown terminates the outstanding canary child");
 assert.equal(blockedCanary.snapshot().lastError, "shutdown");
+assert.equal(blockedCanary.snapshot().running, false, "shutdown drains the canary child lifecycle");
+assert.equal(blockedCanaryClosed, true, "shutdown waits until the probe child actually closes");
 
 // Exercise the actual recovery state machine with injected process/probe
 // boundaries. A successful tmux launch is not enough: the restart is only
