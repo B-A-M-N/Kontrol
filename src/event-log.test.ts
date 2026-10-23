@@ -68,6 +68,12 @@ try {
   assert.equal(ingressEvents.length, 1, "durable ingress rows coalesce to one event-log record");
   assert.equal(ingressEvents[0]?.payload.count, 2);
   assert.equal(ingressEvents[0]?.payload.text, "durable-one durable-two ");
+  assert.deepEqual(events.appendTelemetryIngress({ id: "adapter-event-1", type: "agent.run.output_delta", sessionId: "session-ingress", payload: ingressOne }), {
+    eventId: "adapter-event-1", duplicate: true,
+  }, "a retry remains idempotent after the ingress receipt has been materialized");
+  assert.throws(() => events.appendTelemetryIngress({
+    id: "adapter-event-1", type: "agent.run.output_delta", sessionId: "session-ingress", payload: { ...ingressOne, text: "tampered after commit" },
+  }), /reused with different telemetry content/, "a committed event ID cannot be reused with altered content");
   const mappedReceipt = events.getEventById("adapter-event-1");
   assert.equal(mappedReceipt?.id, "adapter-event-1");
   assert.equal(mappedReceipt?.seq, ingressEvents[0]?.seq);

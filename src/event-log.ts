@@ -189,6 +189,7 @@ export function createEventStore(
     insert into telemetry_ingress
       (event_id, session_id, workspace_session_id, type, payload_json, payload_sha256, publish, status, received_at)
     values (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+    on conflict(event_id) do nothing
   `);
   const TELEMETRY_FLUSH_INTERVAL_MS = 250;
   const TELEMETRY_MAX_BYTES = 16 * 1024;
@@ -357,17 +358,7 @@ export function createEventStore(
     const eventId = input.id ?? randomUUID();
     const payloadJson = stableJson(input.payload);
     const payloadSha256 = telemetryPayloadHashFromJson(input, payloadJson);
-    const existing = findTelemetryIngress.get(eventId) as { session_id: string; workspace_session_id?: string | null; type: string; payload_sha256: string } | undefined;
-    if (existing) {
-      if (existing.session_id !== input.sessionId
-        || (existing.workspace_session_id ?? undefined) !== input.workspaceSessionId
-        || existing.type !== input.type
-        || (existing.payload_sha256 !== payloadSha256 && existing.payload_sha256 !== telemetryPayloadHash(input))) {
-        throw new Error(`Adapter event id ${eventId} was reused with different telemetry content`);
-      }
-      return { eventId, duplicate: true };
-    }
-    insertTelemetryIngress.run(
+    const inserted = insertTelemetryIngress.run(
       eventId,
       input.sessionId,
       input.workspaceSessionId ?? null,
@@ -377,6 +368,17 @@ export function createEventStore(
       opts.publish === false ? 0 : 1,
       new Date().toISOString(),
     );
+    if (inserted.changes === 0) {
+      const existing = findTelemetryIngress.get(eventId) as { session_id: string; workspace_session_id?: string | null; type: string; payload_sha256: string } | undefined;
+      if (!existing) throw new Error(`Adapter event id ${eventId} conflicted but its telemetry receipt could not be read`);
+      if (existing.session_id !== input.sessionId
+        || (existing.workspace_session_id ?? undefined) !== input.workspaceSessionId
+        || existing.type !== input.type
+        || (existing.payload_sha256 !== payloadSha256 && existing.payload_sha256 !== telemetryPayloadHash(input))) {
+        throw new Error(`Adapter event id ${eventId} was reused with different telemetry content`);
+      }
+      return { eventId, duplicate: true };
+    }
     scheduleTelemetryIngressFlush();
     return { eventId, duplicate: false };
   }
