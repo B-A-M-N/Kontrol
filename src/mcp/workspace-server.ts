@@ -9,6 +9,7 @@
 import { performance } from "node:perf_hooks";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { z } from "zod/v4";
 import type { ServerConfig } from "../config.js";
 import type { PolicyEngine } from "../policy.js";
 import type { WorkspaceRegistry } from "../workspaces.js";
@@ -68,6 +69,34 @@ export { type ConnectionContext, processSessionOwnerId } from "./connection-cont
 // The descriptor cache observes the public tools/list handler registration;
 // catalog fingerprints come from the exact descriptor response.
 const toolListDescriptorCache = new Map<string, Promise<unknown>>();
+const toolSchemaCacheByConfig = new WeakMap<ServerConfig, Map<string, unknown>>();
+
+function isZodSchema(value: unknown): value is { safeParse: (input: unknown) => unknown } {
+  return Boolean(value && typeof value === "object" && typeof (value as { safeParse?: unknown }).safeParse === "function");
+}
+
+function normalizeAndCacheToolSchema<T>(
+  cache: Map<string, unknown>,
+  key: string,
+  schema: T,
+): T {
+  if (!schema) return schema;
+  if (cache.has(key)) return cache.get(key) as T;
+
+  let normalized: unknown = schema;
+  if (schema && typeof schema === "object" && !Array.isArray(schema) && !isZodSchema(schema)) {
+    const shape = schema as Record<string, unknown>;
+    if (Object.keys(shape).every((field) => isZodSchema(shape[field]))) {
+      // McpServer normally converts raw field shapes into a new Zod object for
+      // every session. Tool schemas depend on the immutable server build and
+      // registration profile, so share that object while keeping each server's
+      // callback and authorization context independent.
+      normalized = z.object(shape as z.ZodRawShape);
+    }
+  }
+  cache.set(key, normalized);
+  return normalized as T;
+}
 
 export type { DiffStats, ToolContent } from "./tool-result.js";
 export { toolNames } from "./tool-names.js";
@@ -151,6 +180,50 @@ export function createMcpServer(
       instructions: cachedServerInstructions(config),
     },
   );
+  let toolSchemaCache = toolSchemaCacheByConfig.get(config);
+  if (!toolSchemaCache) {
+    toolSchemaCache = new Map();
+    toolSchemaCacheByConfig.set(config, toolSchemaCache);
+  }
+  const toolRegistrationProfile = JSON.stringify([
+    mcpToolSurface.version,
+    config.toolMode,
+    config.widgets,
+    config.skillsEnabled,
+    config.acpEnabled,
+    Boolean(workSessions),
+    Boolean(agentRegistry),
+    Boolean(eventStore),
+    Boolean(continuationManager),
+    Boolean(dispatchOutbox),
+    Boolean(policyEngine),
+    Boolean(policyEnforcer),
+    Boolean(approvalRequests),
+    Boolean(missionLedger),
+    Boolean(reviewWorkflow),
+    Boolean(liveWaiters),
+    Boolean(agentMessages),
+    Boolean(supervisorRuns),
+    Boolean(db),
+    Boolean(mutationReceipts),
+    Boolean(scheduledJobs),
+    Boolean(reconcileScheduledJob),
+    Boolean(reviewRoutes),
+    Boolean(qualificationEvidence),
+    Boolean(reviewBrowserController),
+    Boolean(reviewThreads),
+    Boolean(reviewBrowserJobs),
+  ]);
+  const registerTool = server.registerTool.bind(server);
+  server.registerTool = ((name, definition, callback) => {
+    const key = `${toolRegistrationProfile}:${name}`;
+    return registerTool(name, {
+      ...definition,
+      inputSchema: normalizeAndCacheToolSchema(toolSchemaCache!, `${key}:input`, definition.inputSchema),
+      outputSchema: normalizeAndCacheToolSchema(toolSchemaCache!, `${key}:output`, definition.outputSchema),
+    }, callback);
+  }) as typeof server.registerTool;
+
   let toolCatalogFingerprint: ToolCatalogFingerprint | undefined;
   const toolListDescriptorObservation = observeToolListDescriptors(
     server,
