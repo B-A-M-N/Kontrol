@@ -451,6 +451,30 @@ function snap(ref: string, terminal = false): { ref: string; terminal?: boolean 
   }
 }
 
+// GC continues through sharded blob directories with a cursor instead of
+// materializing the full content-addressed inventory for each slice.
+{
+  const { store } = makeStore();
+  for (let index = 0; index < 300; index++) {
+    const hash = sha256(`gc-orphan-${index}`);
+    const path = store.blobPath(hash);
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(path, `orphan-${index}`);
+  }
+  let hasMore = true;
+  let reclaimed = 0;
+  let slices = 0;
+  while (hasMore) {
+    const slice = await store.gcSlice({ budgetMs: 1000, pageSize: 7, dryRun: false, listDbSnapshots: () => [] });
+    reclaimed += slice.result.blobsReclaimed;
+    hasMore = slice.hasMore;
+    slices++;
+    assert.ok(slices < 100, "bounded page cursor completes without restarting its directory walk");
+  }
+  assert.equal(reclaimed, 300, "all unreferenced blobs are reclaimed across small pages");
+  assert.equal((await store.storeStats()).blobs, 0, "completed GC leaves no test orphan blobs");
+}
+
 // --- 15. Baseline corruption: malformed baseline reported as corrupt, not absent ---
 {
   const storeRoot = makeRoot("kontrol-fss-corrupt-");

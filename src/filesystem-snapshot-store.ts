@@ -42,8 +42,9 @@
  *     blobs/⟨00..ff⟩/<sha256>
  */
 import { createHash, randomUUID } from "node:crypto";
-import { createReadStream, createWriteStream } from "node:fs";
+import { createReadStream, createWriteStream, type Dir } from "node:fs";
 import {
+  opendir,
   lstat,
   mkdir,
   readdir,
@@ -283,17 +284,20 @@ export class FilesystemSnapshotStore {
     strongRoots: Set<string>;
     terminalByRef: Map<string, { ref: string; refMtimeMs: number; ageAtMs: number }>;
     protectedAfterTtl: Set<string>;
-    manifestFiles: string[];
-    classifyCursor: number;
+    manifestDir: Dir | null;
     markRefs: string[];
     markCursor: number;
     expiredRefs: string[];
     expireCursor: number;
-    blobCursor: number;
+    blobRootDir: Dir | null;
+    blobShardDirs: string[] | null;
+    blobShardProbeIndex: number;
+    blobShardCursor: number;
+    blobDir: Dir | null;
+    blobFlatLayout: boolean | null;
+    pendingBlobFiles: Array<{ hash: string; path: string }>;
+    blobEnumerationDone: boolean;
     dirty: boolean;
-    /** Cached blob listing for the current sweep phase, so the full directory
-     * isn't re-enumerated on every bounded slice (O(n) total, not O(n²)). */
-    allBlobs: Array<{ hash: string; path: string }> | null;
   } = {
     phase: 0,
     retained: new Set(),
@@ -302,15 +306,20 @@ export class FilesystemSnapshotStore {
     strongRoots: new Set(),
     terminalByRef: new Map(),
     protectedAfterTtl: new Set(),
-    manifestFiles: [],
-    classifyCursor: 0,
+    manifestDir: null,
     markRefs: [],
     markCursor: 0,
     expiredRefs: [],
     expireCursor: 0,
-    blobCursor: 0,
+    blobRootDir: null,
+    blobShardDirs: null,
+    blobShardProbeIndex: 0,
+    blobShardCursor: 0,
+    blobDir: null,
+    blobFlatLayout: null,
+    pendingBlobFiles: [],
+    blobEnumerationDone: false,
     dirty: false,
-    allBlobs: null,
   };
   private retentionMs: number;
   private retainPerWorkspace: number;
@@ -1049,14 +1058,11 @@ export class FilesystemSnapshotStore {
       this.gcState.strongRoots.clear();
       this.gcState.terminalByRef.clear();
       this.gcState.protectedAfterTtl.clear();
-      this.gcState.manifestFiles = [];
-      this.gcState.classifyCursor = 0;
       this.gcState.markRefs = [];
       this.gcState.markCursor = 0;
       this.gcState.expiredRefs = [];
       this.gcState.expireCursor = 0;
-      this.gcState.blobCursor = 0;
-      this.gcState.allBlobs = null;
+      this.closeGcDirectoryCursors();
     };
     const currentRootsAreCovered = async (): Promise<boolean> => {
       const { strong, terminal } = await this.collectRoots(listDbSnapshots);
@@ -1081,10 +1087,12 @@ export class FilesystemSnapshotStore {
           .sort((a, b) => b.ageAtMs - a.ageAtMs)
           .slice(0, this.retainPerWorkspace)
           .map((entry) => entry.ref));
-        this.gcState.manifestFiles = await this.listManifestFiles();
+        this.gcState.manifestDir = await opendir(join(this.storeRoot, "manifests")).catch((error: NodeJS.ErrnoException) => {
+          if (error.code === "ENOENT") return null;
+          throw error;
+        });
         this.gcState.retained.clear();
         this.gcState.expiredRefs = [];
-        this.gcState.classifyCursor = 0;
         this.gcState.markRefs = [];
         this.gcState.markCursor = 0;
         this.gcState.expireCursor = 0;
@@ -1095,10 +1103,18 @@ export class FilesystemSnapshotStore {
 
       let scanned = 0;
       while (this.gcState.markStage === "classify"
-        && this.gcState.classifyCursor < this.gcState.manifestFiles.length
         && performance.now() - startedAt < options.budgetMs
         && scanned < pageSize) {
-        const file = this.gcState.manifestFiles[this.gcState.classifyCursor++]!;
+        const entry = await this.gcState.manifestDir?.read();
+        if (!entry) {
+          await this.gcState.manifestDir?.close().catch(() => undefined);
+          this.gcState.manifestDir = null;
+          this.gcState.markRefs = [...this.gcState.retained];
+          this.gcState.markStage = "mark";
+          break;
+        }
+        if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+        const file = entry.name;
         const ref = FS_REF_PREFIX + file.replace(/\.json$/, "");
         const terminalRef = this.gcState.terminalByRef.get(ref);
         const retained = this.gcState.strongRoots.has(ref)
@@ -1111,10 +1127,6 @@ export class FilesystemSnapshotStore {
           else this.gcState.expiredRefs.push(ref);
         }
         scanned++;
-      }
-      if (this.gcState.markStage === "classify" && this.gcState.classifyCursor >= this.gcState.manifestFiles.length) {
-        this.gcState.markRefs = [...this.gcState.retained];
-        this.gcState.markStage = "mark";
       }
       while (this.gcState.markStage === "mark"
         && this.gcState.markCursor < this.gcState.markRefs.length
@@ -1166,18 +1178,24 @@ export class FilesystemSnapshotStore {
       }
       if (this.gcState.expireCursor < this.gcState.expiredRefs.length) return { result, hasMore: true };
       this.gcState.phase = 1;
-      this.gcState.blobCursor = 0;
+      this.gcState.pendingBlobFiles = [];
+      this.gcState.blobEnumerationDone = false;
       // Blob enumeration and reclamation now belong to the sweep phase, after
       // the complete, budgeted manifest mark is established.
     }
 
     // ----- phase 1: sweep blobs in bounded pages -----
-    const allBlobs = this.gcState.allBlobs ?? (await this.listBlobFiles());
     const marked = this.gcState.marked;
     let scanned = 0;
-    let index = this.gcState.blobCursor;
-    while (index < allBlobs.length && performance.now() - startedAt < options.budgetMs && scanned < pageSize) {
-      const blobFile = allBlobs[index];
+    if (this.gcState.pendingBlobFiles.length === 0 && !this.gcState.blobEnumerationDone) {
+      const page = await this.nextGcBlobPage(pageSize);
+      this.gcState.pendingBlobFiles = page.files;
+      this.gcState.blobEnumerationDone = page.done;
+    }
+    while (this.gcState.pendingBlobFiles.length > 0
+      && performance.now() - startedAt < options.budgetMs
+      && scanned < pageSize) {
+      const blobFile = this.gcState.pendingBlobFiles.shift()!;
       const hash = blobFile.hash;
       if (marked.has(hash)) {
         result.blobsReachable++;
@@ -1199,11 +1217,9 @@ export class FilesystemSnapshotStore {
         }
       }
       scanned++;
-      index++;
-      this.gcState.blobCursor = index;
     }
 
-    const hasMore = index < allBlobs.length;
+    const hasMore = this.gcState.pendingBlobFiles.length > 0 || !this.gcState.blobEnumerationDone;
     if (hasMore) {
       return { result, hasMore: true };
     }
@@ -1213,11 +1229,9 @@ export class FilesystemSnapshotStore {
     this.gcState.marked.clear();
     this.gcState.retained.clear();
     this.gcState.markStage = null;
-    this.gcState.manifestFiles = [];
     this.gcState.expiredRefs = [];
     this.gcState.markRefs = [];
-    this.gcState.blobCursor = 0;
-    this.gcState.allBlobs = null;
+    this.closeGcDirectoryCursors();
     if (!this.lastGcStartedAt) this.lastGcStartedAt = new Date().toISOString();
     this.lastGcCompletedAt = new Date().toISOString();
     this.lastGcReclaimedBlobs = result.blobsReclaimed;
@@ -1232,6 +1246,101 @@ export class FilesystemSnapshotStore {
     } catch {
       return [];
     }
+  }
+
+  /** Continue the blob-directory cursor without materializing the full CAS inventory. */
+  private async nextGcBlobPage(limit: number): Promise<{ files: Array<{ hash: string; path: string }>; done: boolean }> {
+    const state = this.gcState;
+    const files: Array<{ hash: string; path: string }> = [];
+    const blobsRoot = join(this.storeRoot, "blobs");
+    if (state.blobFlatLayout === null) {
+      state.blobShardDirs ??= [];
+      let probed = 0;
+      while (state.blobShardProbeIndex < 256 && probed < limit) {
+        const shard = state.blobShardProbeIndex.toString(16).padStart(2, "0");
+        const shardPath = join(blobsRoot, shard);
+        const shardStat = await lstat(shardPath).catch(() => undefined);
+        if (shardStat?.isDirectory()) state.blobShardDirs.push(shard);
+        state.blobShardProbeIndex++;
+        probed++;
+      }
+      if (state.blobShardProbeIndex < 256) return { files, done: false };
+      if (state.blobShardDirs.length > 0) {
+        state.blobFlatLayout = false;
+      } else {
+        try {
+          state.blobRootDir = await opendir(blobsRoot);
+          state.blobFlatLayout = true;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+          state.blobFlatLayout = true;
+          state.blobEnumerationDone = true;
+          return { files, done: true };
+        }
+      }
+    }
+
+    if (state.blobFlatLayout) {
+      const root = state.blobRootDir;
+      if (!root) return { files, done: true };
+      while (files.length < limit) {
+        const entry = await root.read();
+        if (!entry) {
+          await root.close().catch(() => undefined);
+          state.blobRootDir = null;
+          state.blobEnumerationDone = true;
+          break;
+        }
+        if (entry.isFile() && HASH_RE.test(entry.name)) files.push({ hash: entry.name, path: join(blobsRoot, entry.name) });
+      }
+      return { files, done: state.blobEnumerationDone };
+    }
+
+    const shards = state.blobShardDirs ?? [];
+    while (files.length < limit && state.blobShardCursor < shards.length) {
+      if (!state.blobDir) {
+        const shardPath = join(blobsRoot, shards[state.blobShardCursor]!);
+        try {
+          state.blobDir = await opendir(shardPath);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+            state.blobShardCursor++;
+            continue;
+          }
+          throw error;
+        }
+      }
+      const entry = await state.blobDir.read();
+      if (!entry) {
+        await state.blobDir.close().catch(() => undefined);
+        state.blobDir = null;
+        state.blobShardCursor++;
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      const shard = shards[state.blobShardCursor]!;
+      const hash = shard + entry.name;
+      if (HASH_RE.test(hash)) files.push({ hash, path: join(blobsRoot, shard, entry.name) });
+    }
+    const done = state.blobShardCursor >= shards.length && state.blobDir === null;
+    if (done) state.blobEnumerationDone = true;
+    return { files, done };
+  }
+
+  private closeGcDirectoryCursors(): void {
+    const state = this.gcState;
+    for (const dir of [state.manifestDir, state.blobRootDir, state.blobDir]) {
+      if (dir) void dir.close().catch(() => undefined);
+    }
+    state.manifestDir = null;
+    state.blobRootDir = null;
+    state.blobShardDirs = null;
+    state.blobShardProbeIndex = 0;
+    state.blobShardCursor = 0;
+    state.blobDir = null;
+    state.blobFlatLayout = null;
+    state.pendingBlobFiles = [];
+    state.blobEnumerationDone = false;
   }
 
   private async listBlobFiles(): Promise<Array<{ hash: string; path: string }>> {
