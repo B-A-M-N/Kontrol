@@ -1176,15 +1176,15 @@ export class FilesystemSnapshotStore {
         result.manifestsRetained = this.gcState.retained.size;
         return { result, hasMore: true };
       }
-      if (!(await currentRootsAreCovered())) {
-        resetMark();
-        return { result, hasMore: true };
-      }
       this.gcState.dirty = true;
     }
 
     // Root changes between maintenance slices invalidate the cached mark. This
     // prevents a newly referenced snapshot from inheriting an old unmarked set.
+    // This single check also covers the mark-to-sweep transition above; doing
+    // another full durable-root collection there doubled the largest
+    // synchronous part of a completed mark pass without adding a safety
+    // boundary (no destructive operation occurs between the two checks).
     if (!(await currentRootsAreCovered())) {
       resetMark();
       return { result, hasMore: true };

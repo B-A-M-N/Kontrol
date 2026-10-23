@@ -548,6 +548,34 @@ function snap(ref: string, terminal = false): { ref: string; terminal?: boolean 
   assert.equal((await store.storeStats()).blobs, 0, "completed GC leaves no test orphan blobs");
 }
 
+// A completed mark is validated once immediately before the destructive
+// phase. Collecting the same durable root set twice at that boundary adds a
+// full SQLite scan without protecting any intervening mutation.
+{
+  const { store } = makeStore({});
+  let rootCollections = 0;
+  const collectionsPerSlice: number[] = [];
+  let hasMore = true;
+  while (hasMore) {
+    const before = rootCollections;
+    const slice = await store.gcSlice({
+      budgetMs: 1000,
+      pageSize: 100,
+      dryRun: false,
+      listDbSnapshots: () => {
+        rootCollections++;
+        return [];
+      },
+    });
+    hasMore = slice.hasMore;
+    collectionsPerSlice.push(rootCollections - before);
+  }
+  assert.ok(collectionsPerSlice.length > 1, "empty store completes its GC mark and sweep");
+  assert.equal(collectionsPerSlice[0], 2, "mark pass uses initial roots plus one pre-sweep revalidation");
+  assert.ok(collectionsPerSlice.slice(1).every((count) => count === 1), "later sweep slices validate roots once");
+  await store.close();
+}
+
 // --- 15. Baseline corruption: malformed baseline reported as corrupt, not absent ---
 {
   const storeRoot = makeRoot("kontrol-fss-corrupt-");
