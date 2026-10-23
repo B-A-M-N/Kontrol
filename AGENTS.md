@@ -696,10 +696,11 @@ MCP context isolation:
   they must not retain an unbounded map or scan an arbitrary tail of unrelated
   scheduler events.
 - Snapshot GC marks retained manifests in resumable budgeted pages and
-  revalidates durable roots before destructive work. A newly live root
-  invalidates the mark and restarts collection. Snapshot diagnostics use the
-  shared storage accounting projection instead of repeating independent full
-  store scans.
+  streams manifest/blob directory entries through resumable cursors; it does
+  not change capture, pinning, grace periods, or retention. It revalidates
+  durable roots between slices, and a newly live root invalidates the mark and
+  restarts collection. Snapshot diagnostics use the shared storage accounting
+  projection instead of repeating independent full store scans.
 - The supervisor MCP canary is observational and cannot hold up local health
   ticks. Shutdown cancels and drains its active probe child.
 - Async ACP dispatch waiters subscribe to matching durable work-session run
