@@ -348,6 +348,8 @@ export const workSessionSubmissions = sqliteTable("work_session_submissions", {
 }, (table) => [
   index("wss_work_session_idx").on(table.workSessionId, table.submissionNumber),
   uniqueIndex("work_session_submission_number_unique").on(table.workSessionId, table.submissionNumber),
+  index("wss_filesystem_snapshot_roots_idx").on(table.snapshotRef, table.workSessionId)
+    .where(sql`${table.snapshotKind} = 'filesystem' and ${table.snapshotRef} is not null`),
 ]);
 
 export const workSessionFeedback = sqliteTable("work_session_feedback", {
@@ -696,7 +698,13 @@ export const supervisorRuns = sqliteTable("supervisor_runs", {
   deadlineAt: text("deadline_at"),
   autonomyMode: text("autonomy_mode").notNull().default("manual"), approvalMode: text("approval_mode").notNull().default("human_required"),
   createdAt: text("created_at").notNull(), updatedAt: text("updated_at").notNull(),
-}, (table) => [uniqueIndex("supervisor_runs_mission_unique").on(table.missionId), uniqueIndex("supervisor_runs_work_session_unique").on(table.workSessionId), index("supervisor_runs_status_next_idx").on(table.status, table.nextActionAt)]);
+}, (table) => [
+  uniqueIndex("supervisor_runs_mission_unique").on(table.missionId),
+  uniqueIndex("supervisor_runs_work_session_unique").on(table.workSessionId),
+  index("supervisor_runs_status_next_idx").on(table.status, table.nextActionAt),
+  index("supervisor_runs_filesystem_snapshot_roots_idx").on(table.lastSnapshotRef)
+    .where(sql`${table.lastSnapshotKind} = 'filesystem' and ${table.lastSnapshotRef} is not null`),
+]);
 
 export const supervisorProgressSnapshots = sqliteTable("supervisor_progress_snapshots", {
   id: text("id").primaryKey(),
@@ -725,6 +733,8 @@ export const missionCompletionReports = sqliteTable("mission_completion_reports"
 }, (table) => [
   index("mission_completion_reports_current_idx").on(table.missionId, table.submissionId, table.snapshotCommit, table.createdAt),
   index("mission_completion_reports_identity_idx").on(table.missionId, table.submissionId, table.snapshotKind, table.snapshotRef, table.createdAt),
+  index("mission_completion_reports_filesystem_snapshot_roots_idx").on(table.snapshotRef)
+    .where(sql`${table.snapshotKind} = 'filesystem' and ${table.snapshotRef} is not null`),
 ]);
 export type MissionCompletionReportRow = typeof missionCompletionReports.$inferSelect;
 
@@ -839,6 +849,8 @@ export const missionEvidence = sqliteTable("mission_evidence", {
 }, (table) => [
   index("mission_evidence_mission_idx").on(table.missionId, table.createdAt),
   index("mission_evidence_criterion_idx").on(table.criterionId, table.createdAt),
+  index("mission_evidence_filesystem_snapshot_roots_idx").on(table.snapshotRef)
+    .where(sql`${table.snapshotKind} = 'filesystem' and ${table.snapshotRef} is not null`),
 ]);
 
 export type MissionContractRow = typeof missionContracts.$inferSelect;

@@ -110,6 +110,7 @@ const migrations: Migration[] = [
   { version: 96, name: "review-browser-attempt-recovery-receipts", up: migrateReviewBrowserAttemptRecoveryReceipts },
   { version: 97, name: "review-browser-generation-observations", up: migrateReviewBrowserGenerationObservations },
   { version: 98, name: "scheduler-error-fingerprint-index", up: migrateSchedulerErrorFingerprintIndex },
+  { version: 99, name: "filesystem-snapshot-root-indexes", up: migrateFilesystemSnapshotRootIndexes },
 ];
 
 function migrateReviewerBrowserAuthState(sqlite: Database.Database): void {
@@ -1774,6 +1775,23 @@ function migrateSchedulerErrorFingerprintIndex(sqlite: Database.Database): void 
     create index if not exists event_log_scheduled_error_fingerprint_time_idx
       on event_log(type, json_extract(payload, '$.fingerprint'), created_at)
       where type = 'scheduled_job.scheduler_error';
+  `);
+}
+
+function migrateFilesystemSnapshotRootIndexes(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create index if not exists wss_filesystem_snapshot_roots_idx
+      on work_session_submissions(snapshot_ref, work_session_id)
+      where snapshot_kind = 'filesystem' and snapshot_ref is not null;
+    create index if not exists mission_evidence_filesystem_snapshot_roots_idx
+      on mission_evidence(snapshot_ref)
+      where snapshot_kind = 'filesystem' and snapshot_ref is not null;
+    create index if not exists mission_completion_reports_filesystem_snapshot_roots_idx
+      on mission_completion_reports(snapshot_ref)
+      where snapshot_kind = 'filesystem' and snapshot_ref is not null;
+    create index if not exists supervisor_runs_filesystem_snapshot_roots_idx
+      on supervisor_runs(last_snapshot_ref)
+      where last_snapshot_kind = 'filesystem' and last_snapshot_ref is not null;
   `);
 }
 

@@ -62,6 +62,26 @@ const stateDir = mkdtempSync(join(tmpdir(), "kontrol-snapshot-roots-"));
   assert.ok(terminalRoot, "terminal-session submission is a retention-tracked root");
   assert.equal(terminalRoot!.terminal, true, "terminal flag set");
   assert.equal(terminalRoot!.terminalAt, "2026-01-15T10:30:00.000Z", "terminalAt propagates verbatim for retention aging");
+  const rootPlans = [
+    ["wss_filesystem_snapshot_roots_idx", `explain query plan
+      select wss.snapshot_ref as ref, ws.status as status, ws.terminal_at as terminal_at
+        from work_session_submissions wss
+        left join work_sessions ws on ws.id = wss.work_session_id
+       where wss.snapshot_kind = 'filesystem' and wss.snapshot_ref is not null`],
+    ["mission_evidence_filesystem_snapshot_roots_idx", `explain query plan
+      select snapshot_ref as ref from mission_evidence
+       where snapshot_kind = 'filesystem' and snapshot_ref is not null`],
+    ["mission_completion_reports_filesystem_snapshot_roots_idx", `explain query plan
+      select snapshot_ref as ref from mission_completion_reports
+       where snapshot_kind = 'filesystem' and snapshot_ref is not null`],
+    ["supervisor_runs_filesystem_snapshot_roots_idx", `explain query plan
+      select last_snapshot_ref as ref from supervisor_runs
+       where last_snapshot_kind = 'filesystem' and last_snapshot_ref is not null`],
+  ] as const;
+  for (const [indexName, query] of rootPlans) {
+    const plan = db.sqlite.prepare(query).all() as Array<{ detail: string }>;
+    assert.ok(plan.some((step) => step.detail.includes(indexName)), `durable root query uses ${indexName}`);
+  }
   db.close();
 }
 
