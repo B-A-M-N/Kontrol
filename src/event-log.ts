@@ -161,6 +161,7 @@ export interface EventStore {
     predicate: EventPredicate,
     timeoutMs: number,
     signal?: AbortSignal,
+    onProgress?: (lastObservedSeq: number) => void,
   ): Promise<EventStoreEvent | null>;
 
   memoryTelemetry(): EventStoreMemoryTelemetry;
@@ -875,13 +876,20 @@ export function createEventStore(
     predicate: EventPredicate,
     timeoutMs: number,
     signal?: AbortSignal,
+    onProgress?: (lastObservedSeq: number) => void,
   ): Promise<EventStoreEvent | null> {
     return new Promise((resolve) => {
       let resolved = false;
+      let cursor = afterSeq;
 
       let timeout: ReturnType<typeof setTimeout> | undefined;
       let unsubscribe: (() => void) | undefined;
       const abort = () => finish(null);
+      const advanceCursor = (seq: number) => {
+        if (seq <= cursor) return;
+        cursor = seq;
+        onProgress?.(cursor);
+      };
 
       const finish = (event: EventStoreEvent | null) => {
         if (resolved) return;
@@ -895,16 +903,16 @@ export function createEventStore(
       // Subscribe first so a concurrently-published event cannot be lost
       // between the query below and the subscription.
       unsubscribe = subscribe(sessionId, (event) => {
-        if (resolved) return;
-        if (event.seq > afterSeq && predicate(event)) {
-          finish(event);
-        }
+        if (resolved || event.seq <= cursor) return;
+        advanceCursor(event.seq);
+        if (predicate(event)) finish(event);
       });
 
       // Re-query durable events after the subscription: something may have
       // been published between the subscribe and the original check.
-      const events = getEventsAfter(sessionId, afterSeq);
+      const events = getEventsAfter(sessionId, cursor);
       for (const event of events) {
+        advanceCursor(event.seq);
         if (predicate(event)) {
           finish(event);
           return;

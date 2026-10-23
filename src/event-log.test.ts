@@ -169,6 +169,29 @@ try {
   assert.equal(arrived.length, 1, "workspace waiter wakes for a later session event");
   assert.equal(arrived[0].type, "review.submitted");
 
+  const unrelatedRunEvent = events.appendEvent({
+    type: "agent.run.output_delta",
+    sessionId: "session-event-progress",
+    payload: { runId: "another-run", text: "unrelated" },
+  });
+  let observedSeq = 0;
+  const matchingRunEvent = events.waitForMatchingEventAfter(
+    "session-event-progress",
+    0,
+    (event) => event.payload.runId === "target-run",
+    1_000,
+    undefined,
+    (seq) => { observedSeq = Math.max(observedSeq, seq); },
+  );
+  assert.equal(observedSeq, unrelatedRunEvent.seq, "durable nonmatching events advance the caller's reconciliation cursor");
+  const targetRunEvent = events.appendEvent({
+    type: "review.submitted",
+    sessionId: "session-event-progress",
+    payload: { runId: "target-run" },
+  });
+  assert.equal((await matchingRunEvent)?.seq, targetRunEvent.seq, "the event waiter still resolves on the matching durable event");
+  assert.equal(observedSeq, targetRunEvent.seq, "live matching events also advance the caller's cursor");
+
   const abortController = new AbortController();
   const aborted = events.waitForWorkspaceEventsAfter("workspace-2", arrived[0].seq, 10_000, abortController.signal);
   abortController.abort();

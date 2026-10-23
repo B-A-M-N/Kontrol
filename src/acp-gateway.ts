@@ -985,6 +985,8 @@ export async function callRemoteAgent(
               afterSeq,
               (candidate) => candidate.payload.runId === run.runId,
               Math.min(2_000, remaining),
+              undefined,
+              (lastObservedSeq) => { afterSeq = Math.max(afterSeq, lastObservedSeq); },
             );
             if (event) afterSeq = Math.max(afterSeq, event.seq);
           } catch {
