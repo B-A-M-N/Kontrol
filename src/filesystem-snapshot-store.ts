@@ -146,7 +146,7 @@ export interface FilesystemSnapshotStoreOptions {
    * Without it the store refuses DESTRUCTIVE GC (`gcSlice` with dryRun
    * unset/false and high-water emergency GC) rather than guessing what is
    * live. Read-only estimates keep accepting an explicit provider too. */
-  durableRoots?: () => Array<{ ref: string; terminal?: boolean; terminalAt?: string }>;
+  durableRoots?: () => Iterable<{ ref: string; terminal?: boolean; terminalAt?: string }>;
 }
 
 export interface FilesystemManifestEntry {
@@ -334,7 +334,7 @@ export class FilesystemSnapshotStore {
   /** P1.6: directory names never descended into during capture. */
   private excludedDirectories: Set<string> = new Set(DEFAULT_SNAPSHOT_EXCLUDED_DIRECTORIES);
   /** P0 GC safety: production durable-root provider (see options doc). */
-  private readonly durableRoots?: () => Array<{ ref: string; terminal?: boolean; terminalAt?: string }>;
+  private readonly durableRoots?: () => Iterable<{ ref: string; terminal?: boolean; terminalAt?: string }>;
 
   constructor(options: FilesystemSnapshotStoreOptions = {}) {
     this.storeRoot = resolve(options.storeRoot ?? join(tmpdir(), "kontrol-workspace-snapshots"));
@@ -367,7 +367,7 @@ export class FilesystemSnapshotStore {
    * call-site argument wins; the constructor-injected production provider is
    * the fallback. Destructive collection REQUIRES a provider — see gcSlice.
    */
-  private rootsProvider(explicit?: () => Array<{ ref: string; terminal?: boolean; terminalAt?: string }>): () => Array<{ ref: string; terminal?: boolean; terminalAt?: string }> {
+  private rootsProvider(explicit?: () => Iterable<{ ref: string; terminal?: boolean; terminalAt?: string }>): () => Iterable<{ ref: string; terminal?: boolean; terminalAt?: string }> {
     const provider = explicit ?? this.durableRoots;
     if (!provider) {
       throw new Error(
@@ -811,7 +811,7 @@ export class FilesystemSnapshotStore {
       if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
         return {};
       }
-      return {};
+      throw error;
     }
     let value: unknown;
     try {
@@ -938,7 +938,7 @@ export class FilesystemSnapshotStore {
    * whether the owning work session is terminal (for retention) or still
    * nonterminal (always pinned).
    */
-  private async collectRoots(listDbSnapshots?: () => Array<{ ref: string; terminal?: boolean; terminalAt?: string }>): Promise<{
+  private async collectRoots(listDbSnapshots?: () => Iterable<{ ref: string; terminal?: boolean; terminalAt?: string }>): Promise<{
     /** Strong pins: never expire during the collection. */
     strong: Set<string>;
     /** Retention-tracked terminal refs (expire retentionMs after the session
@@ -952,35 +952,58 @@ export class FilesystemSnapshotStore {
     // 1. Persisted baselines: open/presentation/legacy + session pins are
     //    strong pins (they are the live top-of-workspace refs).
     const baselineDir = join(this.storeRoot, "baselines");
-    let baselineFiles: string[] = [];
+    let baselineDirectory: Dir | undefined;
     try {
-      baselineFiles = (await readdir(baselineDir)).filter((name) => name.endsWith(".json"));
-    } catch {
-      baselineFiles = [];
+      baselineDirectory = await opendir(baselineDir);
+    } catch (error) {
+      if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) throw error;
     }
-    for (const file of baselineFiles) {
-      const raw = await readFile(join(baselineDir, file), "utf8").catch(() => undefined);
-      if (!raw) continue;
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(raw);
-      } catch {
-        continue;
-      }
-      const obj = parsed as { open?: WorkspaceSnapshot; presentation?: WorkspaceSnapshot; legacy?: WorkspaceSnapshot; sessions?: Record<string, WorkspaceSnapshot>; presentations?: Record<string, WorkspaceSnapshot> };
-      for (const key of ["open", "presentation", "legacy"] as const) {
-        const snap = obj[key];
-        if (snap && snap.kind === "filesystem" && snap.ref) strong.add(snap.ref);
-      }
-      if (obj.presentations && typeof obj.presentations === "object") {
-        for (const snapshot of Object.values(obj.presentations)) {
-          if (snapshot && snapshot.kind === "filesystem" && snapshot.ref) strong.add(snapshot.ref);
+    if (baselineDirectory) {
+      for await (const entry of baselineDirectory) {
+        if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+        let raw: string;
+        try {
+          raw = await readFile(join(baselineDir, entry.name), "utf8");
+        } catch (error) {
+          if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") continue;
+          throw error;
         }
-      }
-      if (obj.sessions && typeof obj.sessions === "object") {
-        for (const sref of Object.values(obj.sessions)) {
-          const snap = sref as WorkspaceSnapshot | undefined;
-          if (snap && snap.kind === "filesystem" && snap.ref) strong.add(snap.ref);
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(raw);
+        } catch (error) {
+          await this.recordCorruption(`baseline:${entry.name}`, "invalid JSON in baseline file");
+          throw new Error(`Cannot establish snapshot roots: baseline ${entry.name} is corrupt.`, { cause: error });
+        }
+        const isSnapshot = (value: unknown): value is WorkspaceSnapshot => Boolean(
+          value && typeof value === "object"
+          && ((value as WorkspaceSnapshot).kind === "filesystem" || (value as WorkspaceSnapshot).kind === "git")
+          && typeof (value as WorkspaceSnapshot).ref === "string"
+          && (value as WorkspaceSnapshot).ref.length > 0,
+        );
+        const isSnapshotMap = (value: unknown): value is Record<string, WorkspaceSnapshot> => Boolean(
+          value && typeof value === "object" && !Array.isArray(value)
+          && Object.values(value as Record<string, unknown>).every(isSnapshot),
+        );
+        const obj = parsed as { root?: unknown; open?: unknown; presentation?: unknown; legacy?: unknown; sessions?: unknown; presentations?: unknown };
+        if (!obj || typeof obj !== "object" || typeof obj.root !== "string" || !obj.root
+          || !isSnapshot(obj.open) || !isSnapshot(obj.presentation) || !isSnapshot(obj.legacy)
+          || !isSnapshotMap(obj.sessions)
+          || (obj.presentations !== undefined && !isSnapshotMap(obj.presentations))) {
+          await this.recordCorruption(`baseline:${entry.name}`, "invalid structure in baseline file");
+          throw new Error(`Cannot establish snapshot roots: baseline ${entry.name} has an invalid structure.`);
+        }
+        for (const key of ["open", "presentation", "legacy"] as const) {
+          const snap = obj[key] as WorkspaceSnapshot;
+          if (snap.kind === "filesystem") strong.add(snap.ref);
+        }
+        if (obj.presentations !== undefined) {
+          for (const snapshot of Object.values(obj.presentations as Record<string, WorkspaceSnapshot>)) {
+            if (snapshot.kind === "filesystem") strong.add(snapshot.ref);
+          }
+        }
+        for (const snapshot of Object.values(obj.sessions as Record<string, WorkspaceSnapshot>)) {
+          if (snapshot.kind === "filesystem") strong.add(snapshot.ref);
         }
       }
     }
@@ -1054,7 +1077,7 @@ export class FilesystemSnapshotStore {
      * durableRoots option): a destructive collection must never run against
      * an unvalidated (implicitly empty) root set. The provider must throw on
      * enumeration failure — never return [] to mean "could not read". */
-    listDbSnapshots?: () => Array<{ ref: string; terminal?: boolean; terminalAt?: string }>;
+    listDbSnapshots?: () => Iterable<{ ref: string; terminal?: boolean; terminalAt?: string }>;
     dryRun?: boolean;
   }): Promise<{ result: GcSliceResult; hasMore: boolean }> {
     const startedAt = performance.now();
@@ -1495,7 +1518,7 @@ export class FilesystemSnapshotStore {
    * for the next destructive sweep. This is the operator-visible answer to
    * "why is snapshot storage retained?", not a permission to delete evidence.
    */
-  async storageAccounting(listDbSnapshots?: () => Array<{ ref: string; terminal?: boolean; terminalAt?: string }>): Promise<SnapshotStorageAccounting> {
+  async storageAccounting(listDbSnapshots?: () => Iterable<{ ref: string; terminal?: boolean; terminalAt?: string }>): Promise<SnapshotStorageAccounting> {
     const { strong, terminal } = await this.collectRoots(listDbSnapshots ?? this.durableRoots);
     const nowMs = Date.now();
     const terminalByRef = new Map(terminal.map((item) => [item.ref, item]));
@@ -1685,7 +1708,7 @@ export class FilesystemSnapshotStore {
    * baselines plus the optional DB root collector (same production roots GC
    * uses). This does not delete anything.
    */
-  async estimateReachableBytes(listDbSnapshots?: () => Array<{ ref: string; terminal?: boolean; terminalAt?: string }>): Promise<{
+  async estimateReachableBytes(listDbSnapshots?: () => Iterable<{ ref: string; terminal?: boolean; terminalAt?: string }>): Promise<{
     blobs: number;
     bytes: number;
     manifests: number;

@@ -14,7 +14,7 @@ import type { ServerConfig } from "../config.js";
 import type { DatabaseHandle } from "../db/client.js";
 import type { FilesystemSnapshotStore } from "../filesystem-snapshot-store.js";
 import type { ReviewCheckpointManager } from "../review-checkpoints.js";
-import { collectDurableSnapshotRoots, type DurableSnapshotRoot } from "./snapshot-roots.js";
+import { iterateDurableSnapshotRoots, type DurableSnapshotRoot } from "./snapshot-roots.js";
 
 /** Canonical terminal work-session statuses (shared with server.ts). */
 export const terminalWorkSessionStatuses = new Set(["approved", "rejected", "cancelled", "failed", "failed_protocol"]);
@@ -105,9 +105,9 @@ export function createMaintenanceCoordinator(deps: MaintenanceDeps) {
   // could not determine what data is live" into "nothing in SQLite is live".
   // The GC slice is skipped while degraded; the next cycle retries.
   let snapshotRootEnumerationFailed = false;
-  const collectFsSnapshotDbRoots = (): DurableSnapshotRoot[] => {
+  const collectFsSnapshotDbRoots = function* (): Generator<DurableSnapshotRoot> {
     try {
-      return collectDurableSnapshotRoots(db);
+      yield* iterateDurableSnapshotRoots(db);
     } catch (error) {
       snapshotRootEnumerationFailed = true;
       throw error;

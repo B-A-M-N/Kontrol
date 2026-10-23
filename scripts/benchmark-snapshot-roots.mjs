@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { performance } from "node:perf_hooks";
-import { collectDurableSnapshotRoots } from "../src/runtime/snapshot-roots.ts";
+import { collectDurableSnapshotRoots, iterateDurableSnapshotRoots } from "../src/runtime/snapshot-roots.ts";
 import { openDatabase } from "../src/db/client.ts";
 
 const irrelevantRows = Number(process.env.KONTROL_SNAPSHOT_ROOT_BENCH_ROWS ?? 50_000);
@@ -48,12 +48,12 @@ try {
   })();
 
   const indexName = "wss_filesystem_snapshot_roots_idx";
-  const measure = () => {
+  const measure = (collect = () => collectDurableSnapshotRoots(db)) => {
     const samples = [];
     let roots;
     for (let index = 0; index < rounds; index++) {
       const startedAt = performance.now();
-      roots = collectDurableSnapshotRoots(db);
+      roots = collect();
       samples.push(performance.now() - startedAt);
     }
     samples.sort((left, right) => left - right);
@@ -66,6 +66,11 @@ try {
     on work_session_submissions(snapshot_ref, work_session_id)
     where snapshot_kind = 'filesystem' and snapshot_ref is not null`);
   const indexed = measure();
+  const indexedStreaming = measure(() => {
+    const roots = [];
+    for (const root of iterateDurableSnapshotRoots(db)) roots.push(root);
+    return roots;
+  });
   const queryPlan = db.sqlite.prepare(`explain query plan
     select wss.snapshot_ref as ref, ws.status as status, ws.terminal_at as terminal_at
       from work_session_submissions wss
@@ -73,6 +78,7 @@ try {
      where wss.snapshot_kind = 'filesystem' and wss.snapshot_ref is not null`)
     .all();
   assert.deepEqual(indexed.roots, unindexed.roots, "index preserves the exact durable root set");
+  assert.deepEqual(indexedStreaming.roots, indexed.roots, "streaming preserves the exact durable root set");
   assert.equal(indexed.roots.length, filesystemRoots, "only filesystem snapshots are returned");
   assert.ok(JSON.stringify(queryPlan).includes(indexName), "query planner uses the partial root index");
   console.log(JSON.stringify({
@@ -82,6 +88,7 @@ try {
     rounds,
     unindexedMedianMs: unindexed.medianMs,
     indexedMedianMs: indexed.medianMs,
+    indexedStreamingMedianMs: indexedStreaming.medianMs,
     speedup: unindexed.medianMs / indexed.medianMs,
     exactRootSetPreserved: true,
     queryPlan,

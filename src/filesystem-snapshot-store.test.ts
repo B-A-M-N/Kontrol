@@ -582,11 +582,20 @@ function snap(ref: string, terminal = false): { ref: string; terminal?: boolean 
   const store = new FilesystemSnapshotStore({ storeRoot });
   const workspace = "ws-corrupt";
   await mkdir(join(storeRoot, "baselines"), { recursive: true });
+  await mkdir(join(storeRoot, "manifests"), { recursive: true });
+  const pinnedRef = "fs:sha256:" + "c".repeat(64);
+  await writeFile(store.manifestPath(pinnedRef), JSON.stringify({ version: 1, entries: [] }));
   await writeFile(join(storeRoot, "baselines", `${workspace}.json`), '{"root": "broken json');
   const loaded = await store.loadBaselines(workspace);
   assert.equal(loaded, undefined, "corrupt baseline yields no baseline value");
   const stats = await store.storeStats();
   assert.ok(stats.corruptionCount >= 1, "corruption reported rather than silently treated as absent");
+  await assert.rejects(
+    () => store.gcSlice({ budgetMs: 1000, dryRun: false, listDbSnapshots: () => [] }),
+    /Cannot establish snapshot roots/,
+    "destructive GC fails closed when baseline roots cannot be parsed",
+  );
+  assert.equal(existsSync(store.manifestPath(pinnedRef)), true, "corrupt baseline cannot cause a pinned snapshot to be deleted");
 
   // A missing baseline (ENOENT) is NOT corruption.
   const fresh = new FilesystemSnapshotStore({ storeRoot });
