@@ -154,6 +154,28 @@ function snap(ref: string, terminal = false): { ref: string; terminal?: boolean 
   assert.equal((await store2.storeStats()).blobs, blobsAfterBaseline, "no recapture happened on reinit with a valid persisted baseline");
 }
 
+// Combined stats and reachability share the same store inventory while
+// preserving the existing standalone results exactly.
+{
+  const { store, workspaceRoot } = makeStore();
+  file(workspaceRoot, "retained.txt", "retained-accounting-content\n");
+  const retained = await store.capture(workspaceRoot);
+  await store.saveBaselines("ws-accounting", workspaceRoot, {
+    open: retained,
+    presentation: retained,
+    legacy: retained,
+    sessions: new Map(),
+  });
+  file(workspaceRoot, "orphan.txt", "orphan-accounting-content\n");
+  await store.capture(workspaceRoot);
+
+  const expectedStats = await store.storeStats();
+  const expectedReachability = await store.estimateReachableBytes();
+  const combined = await store.storeStatsWithReachability();
+  assert.deepEqual(combined.stats, expectedStats, "combined stats match the existing stats query");
+  assert.deepEqual(combined.reachable, expectedReachability, "combined reachable bytes match the existing estimate");
+}
+
 // --- 7. GC reachability: unpinned manifest/blob reclaimed, pinned retained ---
 {
   const { store, workspaceRoot } = makeStore();

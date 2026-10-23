@@ -1475,9 +1475,31 @@ export class FilesystemSnapshotStore {
 
   /** Directory byte usage (sharded + legacy, recursion for shards). */
   async approxStoreBytes(): Promise<{ blobs: number; blobBytes: number; manifests: number; stagingBytes: number }> {
+    const inventory = await this.collectStoreInventory(false);
+    return {
+      blobs: inventory.blobs.length,
+      blobBytes: inventory.blobBytes,
+      manifests: inventory.manifestFiles.length,
+      stagingBytes: inventory.stagingBytes,
+    };
+  }
+
+  private async collectStoreInventory(includeBlobSizes: boolean): Promise<{
+    blobs: Array<{ hash: string; path: string }>;
+    blobBytes: number;
+    blobSizes: Map<string, number>;
+    manifestFiles: string[];
+    stagingBytes: number;
+  }> {
     const blobs = await this.listBlobFiles();
     let blobBytes = 0;
-    for (const b of blobs) blobBytes += await this.sizeOf(b.path);
+    const blobSizes = new Map<string, number>();
+    for (const blob of blobs) {
+      const size = await this.sizeOf(blob.path);
+      blobBytes += size;
+      if (includeBlobSizes) blobSizes.set(blob.hash, size);
+    }
+    const manifestFiles = await this.listManifestFiles();
     let stagingBytes = 0;
     try {
       const stagingParent = join(this.storeRoot, "staging");
@@ -1487,12 +1509,7 @@ export class FilesystemSnapshotStore {
     } catch {
       /* ignore */
     }
-    return {
-      blobs: blobs.length,
-      blobBytes,
-      manifests: await this.listManifestFiles().then((f) => f.length),
-      stagingBytes,
-    };
+    return { blobs, blobBytes, blobSizes, manifestFiles, stagingBytes };
   }
 
   private async dirBytes(dir: string): Promise<number> {
@@ -1673,6 +1690,69 @@ export class FilesystemSnapshotStore {
       lastGcReclaimedBlobs: this.lastGcReclaimedBlobs,
       lastGcReclaimedBytes: this.lastGcReclaimedBytes,
       corruptionCount: this.corruptCount,
+    };
+  }
+
+  /**
+   * Produce the operator stats and reachable-byte estimate from one physical
+   * store inventory and one durable-root observation. This avoids re-listing
+   * manifests and re-statting reachable blobs in CLI stats/doctor paths.
+   */
+  async storeStatsWithReachability(
+    listDbSnapshots?: () => Iterable<{ ref: string; terminal?: boolean; terminalAt?: string }>,
+  ): Promise<{ stats: StoreStats; reachable: { blobs: number; bytes: number; manifests: number } }> {
+    const inventory = await this.collectStoreInventory(true);
+    const { strong, terminal } = await this.collectRoots(listDbSnapshots ?? this.durableRoots);
+    const now = Date.now();
+    const roots = new Set(strong);
+    const protectedAfterTtl = this.terminalTailRefs(terminal);
+    for (const item of terminal) {
+      if (now - item.ageAtMs < this.retentionMs || protectedAfterTtl.has(item.ref)) roots.add(item.ref);
+    }
+
+    const marked = new Set<string>();
+    let reachableManifests = 0;
+    let reachableBytes = 0;
+    for (const manifestFile of inventory.manifestFiles) {
+      const ref = FS_REF_PREFIX + manifestFile.replace(/\.json$/, "");
+      if (!roots.has(ref)) continue;
+      reachableManifests++;
+      try {
+        const manifest = await this.readManifest({ kind: "filesystem", ref, createdAt: new Date(0).toISOString() });
+        for (const entry of manifest.entries) {
+          if (entry.type !== "file" || marked.has(entry.sha256)) continue;
+          marked.add(entry.sha256);
+          const inventoriedSize = inventory.blobSizes.get(entry.sha256);
+          if (inventoriedSize !== undefined) {
+            reachableBytes += inventoriedSize;
+          } else {
+            // Preserve estimateReachableBytes() behavior for legacy flat blobs
+            // when a store also contains sharded blobs, which the ordinary
+            // inventory intentionally reports as the active layout only.
+            const verified = await this.verifyBlob(entry.sha256);
+            if (verified.ok) reachableBytes += verified.size;
+          }
+        }
+      } catch {
+        // Corrupt manifests are excluded by the existing read-only estimate.
+      }
+    }
+
+    return {
+      stats: {
+        manifests: inventory.manifestFiles.length,
+        blobs: inventory.blobs.length,
+        blobBytes: inventory.blobBytes,
+        stagingBytes: inventory.stagingBytes,
+        activeCaptures: this.activeCaptures.size,
+        incompleteTransactions: await this.countIncompleteTransactions(),
+        lastGcStartedAt: this.lastGcStartedAt,
+        lastGcCompletedAt: this.lastGcCompletedAt,
+        lastGcReclaimedBlobs: this.lastGcReclaimedBlobs,
+        lastGcReclaimedBytes: this.lastGcReclaimedBytes,
+        corruptionCount: this.corruptCount,
+      },
+      reachable: { blobs: marked.size, bytes: reachableBytes, manifests: reachableManifests },
     };
   }
 

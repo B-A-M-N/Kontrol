@@ -240,11 +240,10 @@ function formatBytes(value: number): string {
 
 async function snapshotsStats(): Promise<void> {
   const store = fsSnapshotStoreFromConfig();
-  const stats = await store.storeStats();
-  const reachable = await store.estimateReachableBytes();
+  const { stats, reachable } = await store.storeStatsWithReachability();
   const orphanBlobs = Math.max(0, stats.blobs - reachable.blobs);
   const orphanBytes = Math.max(0, stats.blobBytes - reachable.bytes);
-  const incomplete = await store.countIncompleteTransactionsPublic();
+  const incomplete = stats.incompleteTransactions;
   const storeRoot = store.storePath;
   console.log(`Store: ${storeRoot}`);
   console.log("");
@@ -632,12 +631,11 @@ async function runDoctor(options: { strict?: boolean } = {}): Promise<void> {
         limits: config.fsSnapshot,
         durableRoots: () => collectDurableSnapshotRoots(doctorDb),
       });
-      const stats = await store.storeStats();
-      const reachable = await store.estimateReachableBytes();
+      const { stats, reachable } = await store.storeStatsWithReachability();
       const orphan = Math.max(0, stats.blobs - reachable.blobs);
       const orphanRatio = stats.blobs > 0 ? orphan / stats.blobs : 0;
       const highWater = config.fsSnapshot.highWaterBytes;
-      const incomplete = await store.countIncompleteTransactionsPublic();
+      const incomplete = stats.incompleteTransactions;
       const problems: string[] = [];
       if (orphanRatio > 0.3) problems.push(`orphan ratio ${(orphanRatio * 100).toFixed(0)}%`);
       if (highWater && stats.blobBytes > highWater) problems.push("store over high-water mark");
