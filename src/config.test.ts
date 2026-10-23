@@ -105,6 +105,8 @@ assert.equal(loadConfig(baseEnv).mcpEphemeralSessionIdleMs, 86_400_000);
 assert.equal(loadConfig(baseEnv).mcpReusableSessionIdleMs, 86_400_000);
 assert.equal(loadConfig(baseEnv).mcpSessionReaperIntervalMs, 15_000);
 assert.equal(loadConfig(baseEnv).mcpLogicalContinuityRetentionMs, 259_200_000);
+assert.equal(loadConfig(baseEnv).mcpClientMetricsHistoryLimit, 5_000);
+assert.equal(loadConfig({ ...baseEnv, KONTROL_MCP_CLIENT_METRICS_HISTORY_LIMIT: "256" }).mcpClientMetricsHistoryLimit, 256);
 assert.equal(loadConfig(baseEnv).mcpSessionMaxPerClient, 20);
 assert.equal(loadConfig(baseEnv).mcpSessionSoftCap, 150);
 assert.equal(loadConfig(baseEnv).mcpSessionHardCap, 200);

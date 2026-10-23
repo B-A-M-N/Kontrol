@@ -14,6 +14,7 @@ import type { ScheduledJob, ScheduledJobStore } from "./scheduled-job-store.js";
 import type { ReadOnlyExecutionReceipt } from "../acp-gateway.js";
 import { recoverScheduledArtifactPublication, removeScheduledArtifactProof } from "./scheduled-artifact-publisher.js";
 import { redactedPreview } from "../redaction.js";
+import { BoundedCounterMap } from "./bounded-counter-map.js";
 
 export interface ScheduledDispatchOutcome {
   status: "dispatched" | "blocked" | "failed" | "uncertain";
@@ -100,6 +101,8 @@ export interface ScheduledJobRuntimeOptions {
 
 const TRANSIENT_DISPATCH_RETRY_BASE_MS = 2_000;
 const TRANSIENT_DISPATCH_RETRY_MAX_MS = 5 * 60_000;
+const FAILURE_FINGERPRINT_WINDOW_MS = 5 * 60_000;
+const FAILURE_FINGERPRINT_MEMORY_LIMIT = 2_000;
 
 export function scheduledDispatchRetryDelayMs(retryCount: number, random = Math.random): number {
   const exponent = Math.max(0, Math.min(16, retryCount - 1));
@@ -138,28 +141,27 @@ export function createScheduledJobRuntime(options: ScheduledJobRuntimeOptions): 
   let dispatchRecoveryCursor = "";
   let projectionTargetCursor = "";
   const recentDrainFailures: Array<{ at: number; phase: string; failureClass: string; fingerprint: string; recurrenceCount: number }> = [];
-  const recurrenceByFingerprint = new Map<string, number>();
+  const recurrenceByFingerprint = new BoundedCounterMap(FAILURE_FINGERPRINT_MEMORY_LIMIT);
 
   function recordDrainFailure(phase: string, error: unknown, jobId?: string, attemptId?: string): void {
     const message = redactedPreview(error instanceof Error ? error.message : String(error), 500);
     const failureClass = error instanceof Error ? error.name || "Error" : "NonErrorThrow";
     const fingerprint = createHash("sha256").update(`${phase}\n${failureClass}\n${message}`).digest("hex");
+    const at = Date.now();
     let durableRecurrenceCount = 0;
     try {
-      const cutoff = new Date(Date.now() - 5 * 60_000).toISOString();
-      const rows = database.sqlite.prepare(`
-        select payload from event_log
-         where type = 'scheduled_job.scheduler_error' and created_at >= ?
-         order by seq desc limit 100
-      `).all(cutoff) as Array<{ payload: string }>;
-      durableRecurrenceCount = rows.reduce((count, row) => {
-        try { return count + (JSON.parse(row.payload)?.fingerprint === fingerprint ? 1 : 0); }
-        catch { return count; }
-      }, 0);
+      const cutoff = new Date(at - FAILURE_FINGERPRINT_WINDOW_MS).toISOString();
+      const row = database.sqlite.prepare(`
+        select count(*) as count from event_log
+         where type = 'scheduled_job.scheduler_error'
+           and created_at >= ?
+           and json_extract(payload, '$.fingerprint') = ?
+      `).get(cutoff, fingerprint) as { count: number } | undefined;
+      durableRecurrenceCount = Number(row?.count ?? 0);
     } catch { /* a failing diagnostic read must not stop the scheduler */ }
-    const recurrenceCount = Math.max(recurrenceByFingerprint.get(fingerprint) ?? 0, durableRecurrenceCount) + 1;
-    recurrenceByFingerprint.set(fingerprint, recurrenceCount);
-    const at = Date.now();
+    const recentMemoryCount = recurrenceByFingerprint.get(fingerprint, at, FAILURE_FINGERPRINT_WINDOW_MS) ?? 0;
+    const recurrenceCount = Math.max(recentMemoryCount, durableRecurrenceCount) + 1;
+    recurrenceByFingerprint.set(fingerprint, recurrenceCount, at);
     recentDrainFailures.push({ at, phase, failureClass, fingerprint, recurrenceCount });
     while (recentDrainFailures.length > 100) recentDrainFailures.shift();
     let sessionId = "scheduler-runtime";

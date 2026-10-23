@@ -122,6 +122,20 @@ export interface McpSessionClientMetrics {
   totalToolCalls: number;
   totalLifetimeMs: number;
   oldestIdleMs: number;
+  completedSessions: number;
+  lastSeenAt: number;
+}
+
+export interface McpSessionClientTotals {
+  sessionsCreated: number;
+  sessionsClosed: number;
+  sessionsExpired: number;
+  zeroToolSessions: number;
+  singleToolSessions: number;
+  multiToolSessions: number;
+  totalToolCalls: number;
+  totalLifetimeMs: number;
+  completedSessions: number;
 }
 
 export interface McpSessionMetrics {
@@ -131,6 +145,9 @@ export interface McpSessionMetrics {
   expired: number;
   inFlight: number;
   clients: Map<string, McpSessionClientMetrics>;
+  retiredClientTotals: McpSessionClientTotals;
+  retiredClientCount: number;
+  retainedHistoricalClientCount: number;
   windowEvents: Array<{ at: number; kind: McpSessionWindowKind }>;
   completedToolCounts: number[];
   terminationReasons: Map<string, number>;

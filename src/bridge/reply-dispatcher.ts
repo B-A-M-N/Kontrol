@@ -133,7 +133,7 @@ export function createReplyDispatcher(config: BridgeConfig): ReplyDispatcher {
     const agent = config.agentRegistry.listAlive().find((candidate) => candidate.name === run?.agentName);
     if (!run || !agent) return "failed";
     const result = await import("../acp-gateway.js").then(({ callRemoteAgent }) => callRemoteAgent(
-      { agentRegistry: config.agentRegistry, workspaces: config.workspaces, workSessions: config.workSessions, adapterSecret: config.adapterSecret },
+      { agentRegistry: config.agentRegistry, workspaces: config.workspaces, workSessions: config.workSessions, eventStore: config.eventStore, adapterSecret: config.adapterSecret },
       {
         agentUrl: agent.url,
         agentName: agent.name,

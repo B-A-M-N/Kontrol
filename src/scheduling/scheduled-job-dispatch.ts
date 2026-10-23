@@ -219,6 +219,7 @@ export async function dispatchScheduledJob(
         agentRegistry: config.agentRegistry,
         workspaces: config.workspaces,
         workSessions: config.workSessions,
+        eventStore: config.eventStore,
         adapterSecret: config.adapterSecret,
         readOnlyExecutionNetworkPolicy: config.serverConfig?.readOnlyExecutionNetworkPolicy ?? "disabled",
       },

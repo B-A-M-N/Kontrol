@@ -279,6 +279,16 @@ export class FilesystemSnapshotStore {
     phase: 0 | 1;
     retained: Set<string>;
     marked: Set<string>;
+    markStage: "classify" | "mark" | "expire" | null;
+    strongRoots: Set<string>;
+    terminalByRef: Map<string, { ref: string; refMtimeMs: number; ageAtMs: number }>;
+    protectedAfterTtl: Set<string>;
+    manifestFiles: string[];
+    classifyCursor: number;
+    markRefs: string[];
+    markCursor: number;
+    expiredRefs: string[];
+    expireCursor: number;
     blobCursor: number;
     dirty: boolean;
     /** Cached blob listing for the current sweep phase, so the full directory
@@ -288,6 +298,16 @@ export class FilesystemSnapshotStore {
     phase: 0,
     retained: new Set(),
     marked: new Set(),
+    markStage: null,
+    strongRoots: new Set(),
+    terminalByRef: new Map(),
+    protectedAfterTtl: new Set(),
+    manifestFiles: [],
+    classifyCursor: 0,
+    markRefs: [],
+    markCursor: 0,
+    expiredRefs: [],
+    expireCursor: 0,
     blobCursor: 0,
     dirty: false,
     allBlobs: null,
@@ -351,11 +371,23 @@ export class FilesystemSnapshotStore {
     return this.storeRoot;
   }
 
-  getStoreStatsForMetrics(): { manifests: number; activeCaptures: number; corruptionCount: number } {
+  getStoreStatsForMetrics(): {
+    manifests: number;
+    activeCaptures: number;
+    corruptionCount: number;
+    lastGcStartedAt?: string;
+    lastGcCompletedAt?: string;
+    lastGcReclaimedBlobs: number;
+    lastGcReclaimedBytes: number;
+  } {
     return {
       manifests: this.manifestsNow(),
       activeCaptures: this.activeCaptures.size,
       corruptionCount: this.corruptCount,
+      lastGcStartedAt: this.lastGcStartedAt,
+      lastGcCompletedAt: this.lastGcCompletedAt,
+      lastGcReclaimedBlobs: this.lastGcReclaimedBlobs,
+      lastGcReclaimedBytes: this.lastGcReclaimedBytes,
     };
   }
 
@@ -1009,46 +1041,86 @@ export class FilesystemSnapshotStore {
       corrupt: 0,
     };
 
-    // ----- phase 0: roots + retained manifests + mark blobs -----
-    if (this.gcState.phase === 0) {
+    const resetMark = () => {
+      this.gcState.phase = 0;
+      this.gcState.marked.clear();
+      this.gcState.retained.clear();
+      this.gcState.markStage = null;
+      this.gcState.strongRoots.clear();
+      this.gcState.terminalByRef.clear();
+      this.gcState.protectedAfterTtl.clear();
+      this.gcState.manifestFiles = [];
+      this.gcState.classifyCursor = 0;
+      this.gcState.markRefs = [];
+      this.gcState.markCursor = 0;
+      this.gcState.expiredRefs = [];
+      this.gcState.expireCursor = 0;
+      this.gcState.blobCursor = 0;
+      this.gcState.allBlobs = null;
+    };
+    const currentRootsAreCovered = async (): Promise<boolean> => {
       const { strong, terminal } = await this.collectRoots(listDbSnapshots);
-      const retained = new Set<string>();
-      // Retain the newest `retainPerWorkspace` terminal refs beyond their TTL so
-      // operators keep a bounded recent tail even after retention expires.
-      // Newest by terminal age (ageAtMs), not manifest mtime (P0).
-      const protectedAfterTtl = new Set([...terminal]
+      for (const ref of strong) if (!this.gcState.retained.has(ref)) return false;
+      const tail = new Set([...terminal]
         .sort((a, b) => b.ageAtMs - a.ageAtMs)
         .slice(0, this.retainPerWorkspace)
-        .map((t) => t.ref));
-      const expired: string[] = [];
-      for (const f of await this.listManifestFiles()) {
-        const ref = FS_REF_PREFIX + f.replace(/\.json$/, "");
-        // A manifest that still exists is retained if it is a strong pin,
-        // within its retention window (terminal), or fresh (orphan grace).
-        // Retention ages from the terminal moment, not the manifest mtime.
-        const isStrong = strong.has(ref);
-        const terminalRef = terminal.find((t) => t.ref === ref);
-        const withinRetention = terminalRef !== undefined && nowMs - terminalRef.ageAtMs < this.retentionMs;
-        if (isStrong || withinRetention || protectedAfterTtl.has(ref)) {
-          retained.add(ref);
-        } else {
-          expired.push(ref);
-        }
+        .map((entry) => entry.ref));
+      for (const entry of terminal) {
+        if ((nowMs - entry.ageAtMs < this.retentionMs || tail.has(entry.ref)) && !this.gcState.retained.has(entry.ref)) return false;
       }
-      // Honoring orphan grace for very new manifests: anything fresh is kept.
-      for (const ref of expired) {
-        const mt = await this.manifestMtimeMs(ref);
-        const isNew = mt !== undefined && nowMs - mt < this.orphanGraceMs;
-        if (isNew) {
-          retained.add(ref);
-        } else {
-          if (!options.dryRun) await rm(this.manifestPath(ref), { force: true }).catch(() => undefined);
-          result.manifestsExpired++;
-        }
+      return true;
+    };
+
+    // ----- phase 0: resumable root classification and manifest marking -----
+    if (this.gcState.phase === 0) {
+      if (this.gcState.markStage === null) {
+        const { strong, terminal } = await this.collectRoots(listDbSnapshots);
+        this.gcState.strongRoots = strong;
+        this.gcState.terminalByRef = new Map(terminal.map((entry) => [entry.ref, entry]));
+        this.gcState.protectedAfterTtl = new Set([...terminal]
+          .sort((a, b) => b.ageAtMs - a.ageAtMs)
+          .slice(0, this.retainPerWorkspace)
+          .map((entry) => entry.ref));
+        this.gcState.manifestFiles = await this.listManifestFiles();
+        this.gcState.retained.clear();
+        this.gcState.expiredRefs = [];
+        this.gcState.classifyCursor = 0;
+        this.gcState.markRefs = [];
+        this.gcState.markCursor = 0;
+        this.gcState.expireCursor = 0;
+        this.gcState.marked.clear();
+        this.gcState.markStage = "classify";
+        if (this.lastGcStartedAt === undefined) this.lastGcStartedAt = new Date().toISOString();
       }
-      result.manifestsRetained = retained.size;
-      // Mark blobs referenced by every retained manifest.
-      for (const ref of retained) {
+
+      let scanned = 0;
+      while (this.gcState.markStage === "classify"
+        && this.gcState.classifyCursor < this.gcState.manifestFiles.length
+        && performance.now() - startedAt < options.budgetMs
+        && scanned < pageSize) {
+        const file = this.gcState.manifestFiles[this.gcState.classifyCursor++]!;
+        const ref = FS_REF_PREFIX + file.replace(/\.json$/, "");
+        const terminalRef = this.gcState.terminalByRef.get(ref);
+        const retained = this.gcState.strongRoots.has(ref)
+          || (terminalRef !== undefined && nowMs - terminalRef.ageAtMs < this.retentionMs)
+          || this.gcState.protectedAfterTtl.has(ref);
+        if (retained) this.gcState.retained.add(ref);
+        else {
+          const mtime = await this.manifestMtimeMs(ref);
+          if (mtime !== undefined && nowMs - mtime < this.orphanGraceMs) this.gcState.retained.add(ref);
+          else this.gcState.expiredRefs.push(ref);
+        }
+        scanned++;
+      }
+      if (this.gcState.markStage === "classify" && this.gcState.classifyCursor >= this.gcState.manifestFiles.length) {
+        this.gcState.markRefs = [...this.gcState.retained];
+        this.gcState.markStage = "mark";
+      }
+      while (this.gcState.markStage === "mark"
+        && this.gcState.markCursor < this.gcState.markRefs.length
+        && performance.now() - startedAt < options.budgetMs
+        && scanned < pageSize) {
+        const ref = this.gcState.markRefs[this.gcState.markCursor++]!;
         try {
           const manifest = await this.readManifest({ kind: "filesystem", ref, createdAt: new Date(0).toISOString() });
           for (const entry of manifest.entries) {
@@ -1058,15 +1130,45 @@ export class FilesystemSnapshotStore {
           await this.recordCorruption(`manifest:${ref}`, error instanceof Error ? error.message : String(error));
           result.corrupt++;
         }
+        scanned++;
       }
-      this.gcState.retained = retained;
+      if (this.gcState.markStage === "mark" && this.gcState.markCursor >= this.gcState.markRefs.length) {
+        this.gcState.markStage = "expire";
+      }
+      if (this.gcState.markStage !== "expire") {
+        result.manifestsRetained = this.gcState.retained.size;
+        return { result, hasMore: true };
+      }
+      if (!(await currentRootsAreCovered())) {
+        resetMark();
+        return { result, hasMore: true };
+      }
+      this.gcState.dirty = true;
+    }
+
+    // Root changes between maintenance slices invalidate the cached mark. This
+    // prevents a newly referenced snapshot from inheriting an old unmarked set.
+    if (!(await currentRootsAreCovered())) {
+      resetMark();
+      return { result, hasMore: true };
+    }
+    result.manifestsRetained = this.gcState.retained.size;
+
+    if (this.gcState.phase === 0) {
+      let deleted = 0;
+      while (this.gcState.expireCursor < this.gcState.expiredRefs.length
+        && performance.now() - startedAt < options.budgetMs
+        && deleted < pageSize) {
+        const ref = this.gcState.expiredRefs[this.gcState.expireCursor++]!;
+        if (!options.dryRun) await rm(this.manifestPath(ref), { force: true }).catch(() => undefined);
+        result.manifestsExpired++;
+        deleted++;
+      }
+      if (this.gcState.expireCursor < this.gcState.expiredRefs.length) return { result, hasMore: true };
       this.gcState.phase = 1;
       this.gcState.blobCursor = 0;
-      this.gcState.dirty = true;
-      // Snapshot the blob listing once for this sweep; reused across slices.
-      this.gcState.allBlobs = await this.listBlobFiles();
-      if (this.lastGcStartedAt === undefined) this.lastGcStartedAt = new Date().toISOString();
-      return { result, hasMore: true };
+      // Blob enumeration and reclamation now belong to the sweep phase, after
+      // the complete, budgeted manifest mark is established.
     }
 
     // ----- phase 1: sweep blobs in bounded pages -----
@@ -1110,6 +1212,10 @@ export class FilesystemSnapshotStore {
     this.gcState.phase = 0;
     this.gcState.marked.clear();
     this.gcState.retained.clear();
+    this.gcState.markStage = null;
+    this.gcState.manifestFiles = [];
+    this.gcState.expiredRefs = [];
+    this.gcState.markRefs = [];
     this.gcState.blobCursor = 0;
     this.gcState.allBlobs = null;
     if (!this.lastGcStartedAt) this.lastGcStartedAt = new Date().toISOString();
@@ -1293,7 +1399,8 @@ export class FilesystemSnapshotStore {
     let reclaimableManifests = 0;
     const pinReasons = new Map<string, Set<string>>();
 
-    for (const file of await this.listManifestFiles()) {
+    const manifestFiles = await this.listManifestFiles();
+    for (const file of manifestFiles) {
       const ref = FS_REF_PREFIX + file.replace(/\.json$/, "");
       const terminalRef = terminalByRef.get(ref);
       const withinRetention = terminalRef !== undefined && nowMs - terminalRef.ageAtMs < this.retentionMs;
@@ -1377,7 +1484,7 @@ export class FilesystemSnapshotStore {
         retainedTerminal: retainedTerminalManifests,
         graceProtected: graceProtectedManifests,
         reclaimable: reclaimableManifests,
-        total: await this.listManifestFiles().then((files) => files.length),
+        total: manifestFiles.length,
       },
       blobs: {
         counts: byClassification,

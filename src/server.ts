@@ -548,7 +548,9 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     if (window.sessionsCreated > 10 || (window.toolCalls > 0 && window.sessionsPerToolCall >= 0.75)) {
       logEvent(config.logging, "warn", "mcp_session_reuse_low", {
         ...window,
-        logicalClients: mcpSessionMetrics.clients.size,
+        logicalClientsRetained: mcpSessionMetrics.clients.size,
+        retiredClientMetricRows: mcpSessionMetrics.retiredClientCount,
+        retainedHistoricalClientMetricRows: mcpSessionMetrics.retainedHistoricalClientCount,
       });
     }
   }, 60_000);
@@ -563,26 +565,26 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
   const snapshotStoreDiagnostics = async (): Promise<Record<string, unknown>> => {
     try {
       const store = reviewCheckpoints.getSnapshotStore();
-      const stats = await store.storeStats();
-      const movable = Number(stats.blobBytes) || 0;
-      const reachable = await store.estimateReachableBytes(collectFsSnapshotDbRoots);
       const accounting = await store.storageAccounting(collectFsSnapshotDbRoots);
+      const runtimeStats = store.getStoreStatsForMetrics();
+      const reachableBlobs = accounting.blobs.counts.live;
+      const reachableBytes = accounting.blobs.bytes.live;
       return {
         accounting,
-        blobs: stats.blobs,
-        blobBytes: stats.blobBytes,
-        manifests: stats.manifests,
-        retainedManifests: reachable.manifests,
-        reachableBlobs: reachable.blobs,
-        reachableBytes: reachable.bytes,
-        orphanEstimate: Math.max(0, stats.blobs - reachable.blobs),
-        orphanBytesEstimate: Math.max(0, movable - reachable.bytes),
-        stagingBytes: stats.stagingBytes,
-        activeCaptures: stats.activeCaptures,
-        lastGcStartedAt: stats.lastGcStartedAt,
-        lastGcCompletedAt: stats.lastGcCompletedAt,
-        lastGcReclaimedBlobs: stats.lastGcReclaimedBlobs,
-        lastGcReclaimedBytes: stats.lastGcReclaimedBytes,
+        blobs: accounting.blobs.total,
+        blobBytes: accounting.blobs.totalBytes,
+        manifests: accounting.manifests.total,
+        retainedManifests: accounting.manifests.retainedLive + accounting.manifests.retainedTerminal,
+        reachableBlobs,
+        reachableBytes,
+        orphanEstimate: Math.max(0, accounting.blobs.total - reachableBlobs),
+        orphanBytesEstimate: Math.max(0, accounting.blobs.totalBytes - reachableBytes),
+        stagingBytes: accounting.staging.bytes,
+        activeCaptures: runtimeStats.activeCaptures,
+        lastGcStartedAt: runtimeStats.lastGcStartedAt,
+        lastGcCompletedAt: runtimeStats.lastGcCompletedAt,
+        lastGcReclaimedBlobs: runtimeStats.lastGcReclaimedBlobs,
+        lastGcReclaimedBytes: runtimeStats.lastGcReclaimedBytes,
       };
     } catch (error) {
       return { error: error instanceof Error ? error.message : String(error) };

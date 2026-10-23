@@ -158,7 +158,7 @@ export function registerAgentTools(server: McpServer, config: BridgeConfig): voi
 
       try {
         const result = await callRemoteAgent(
-          { agentRegistry: config.agentRegistry, workspaces: config.workspaces, workSessions: config.workSessions, adapterSecret: config.adapterSecret },
+          { agentRegistry: config.agentRegistry, workspaces: config.workspaces, workSessions: config.workSessions, eventStore: config.eventStore, adapterSecret: config.adapterSecret },
           {
             agentUrl: selection.agent.url,
             agentName,

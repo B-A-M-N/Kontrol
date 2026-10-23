@@ -427,6 +427,30 @@ function snap(ref: string, terminal = false): { ref: string; terminal?: boolean 
   assert.equal(existsSync(store.blobPath(extraHash)), true, "published blob survived concurrent GC");
 }
 
+// A root that appears after a bounded GC slice invalidates the old mark before
+// its manifest or blobs can be swept.
+{
+  const { store, workspaceRoot } = makeStore();
+  file(workspaceRoot, "late-root.txt", "late-root-content\n");
+  const lateRoot = await store.capture(workspaceRoot);
+  file(workspaceRoot, "other.txt", "other-content\n");
+  await store.capture(workspaceRoot);
+
+  let roots: Array<{ ref: string; terminal?: boolean }> = [];
+  const first = await store.gcSlice({ budgetMs: 1000, pageSize: 1, dryRun: false, listDbSnapshots: () => roots });
+  assert.equal(first.hasMore, true, "small GC page leaves resumable work");
+  roots = [{ ref: lateRoot.ref, terminal: false }];
+  await gcToCompletion(store, () => roots);
+
+  assert.equal(existsSync(store.manifestPath(lateRoot.ref)), true, "newly rooted manifest survives mark restart");
+  const manifest = await store.readManifest(lateRoot);
+  for (const entry of manifest.entries) {
+    if (entry.type === "file" && entry.sha256) {
+      assert.equal(existsSync(store.blobPath(entry.sha256)), true, `newly rooted blob ${entry.sha256} survives`);
+    }
+  }
+}
+
 // --- 15. Baseline corruption: malformed baseline reported as corrupt, not absent ---
 {
   const storeRoot = makeRoot("kontrol-fss-corrupt-");

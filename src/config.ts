@@ -154,6 +154,8 @@ export interface ServerConfig {
   mcpSessionReaperIntervalMs: number;
   /** Retention for trusted logical-client continuity after transport loss. */
   mcpLogicalContinuityRetentionMs: number;
+  /** Retained inactive logical-client metric rows; active clients are never evicted. */
+  mcpClientMetricsHistoryLimit: number;
   mcpSessionMaxPerClient: number;
   mcpSessionSoftCap: number;
   mcpSessionHardCap: number;
@@ -738,6 +740,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     mcpReusableSessionIdleMs: parsePositiveInteger(env.KONTROL_MCP_REUSABLE_SESSION_IDLE_MS, 24 * 60 * 60_000, "KONTROL_MCP_REUSABLE_SESSION_IDLE_MS"),
     mcpSessionReaperIntervalMs: parsePositiveInteger(env.KONTROL_MCP_SESSION_REAPER_INTERVAL_MS, 15_000, "KONTROL_MCP_SESSION_REAPER_INTERVAL_MS"),
     mcpLogicalContinuityRetentionMs: parsePositiveInteger(env.KONTROL_MCP_LOGICAL_CONTINUITY_RETENTION_MS, 72 * 60 * 60_000, "KONTROL_MCP_LOGICAL_CONTINUITY_RETENTION_MS"),
+    mcpClientMetricsHistoryLimit: parsePositiveInteger(env.KONTROL_MCP_CLIENT_METRICS_HISTORY_LIMIT, 5_000, "KONTROL_MCP_CLIENT_METRICS_HISTORY_LIMIT"),
     mcpSessionMaxPerClient: parsePositiveInteger(env.KONTROL_MCP_SESSION_MAX_PER_CLIENT, 20, "KONTROL_MCP_SESSION_MAX_PER_CLIENT"),
     mcpSessionSoftCap: parsePositiveInteger(env.KONTROL_MCP_SESSION_SOFT_CAP, 150, "KONTROL_MCP_SESSION_SOFT_CAP"),
     mcpSessionHardCap: parsePositiveInteger(env.KONTROL_MCP_SESSION_HARD_CAP, 200, "KONTROL_MCP_SESSION_HARD_CAP"),

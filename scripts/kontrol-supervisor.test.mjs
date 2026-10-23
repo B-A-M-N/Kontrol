@@ -155,6 +155,40 @@ assert.equal(await failedCanary.runIfDue(), false, "canary failure is recorded w
 assert.equal(failedCanary.snapshot().lastOk, false);
 assert.equal(failedCanary.snapshot().totalFailures, 1);
 
+let blockedCanaryNow = 5_000;
+let blockedCanaryKilled = false;
+const blockedCanary = createMcpCanaryRunner({
+  url: "https://mcp.example.test",
+  intervalMs: 1_000,
+  now: () => blockedCanaryNow,
+  spawnFn: () => {
+    const child = new EventEmitter();
+    child.kill = () => { blockedCanaryKilled = true; };
+    return child;
+  },
+});
+const blockedRun = blockedCanary.runIfDue();
+blockedCanaryNow += 15_000;
+assert.equal(blockedCanary.snapshot().runningDurationMs, 15_000, "status exposes the active canary duration");
+let healthTicks = 0;
+let monitoring;
+monitoring = runSupervisorMonitoringLoop({
+  intervalMs: 1,
+  tick: async () => {
+    healthTicks++;
+    void blockedCanary.runIfDue();
+    if (healthTicks >= 3) monitoring.stop();
+  },
+  assertOwnership: () => undefined,
+  sleepFn: async () => undefined,
+});
+await monitoring.promise;
+assert.ok(healthTicks >= 3, "routine health monitoring continues while the canary child remains blocked");
+await blockedCanary.stop();
+assert.equal(await blockedRun, false, "shutdown cancels the outstanding canary result");
+assert.equal(blockedCanaryKilled, true, "shutdown terminates the outstanding canary child");
+assert.equal(blockedCanary.snapshot().lastError, "shutdown");
+
 // Exercise the actual recovery state machine with injected process/probe
 // boundaries. A successful tmux launch is not enough: the restart is only
 // recovered after readiness is observed.

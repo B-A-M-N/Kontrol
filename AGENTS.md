@@ -687,6 +687,25 @@ MCP context isolation:
   the ACP agent advertises `loadSession`; otherwise it fails closed instead of
   starting an unrelated conversation. ACP worker identity, the review WebUI
   thread, and the Kontrol work session remain separate identities.
+- Historical MCP client metrics are bounded by
+  `KONTROL_MCP_CLIENT_METRICS_HISTORY_LIMIT` (default 5,000). Active client rows
+  are never pruned; retired rows are folded into aggregate counters, and the
+  bounded rolling tool-call sample is not used as the lifetime denominator.
+- Scheduler-local failure fingerprints are a bounded five-minute LRU hint.
+  Recurrence diagnostics reconcile against exact durable fingerprint matches;
+  they must not retain an unbounded map or scan an arbitrary tail of unrelated
+  scheduler events.
+- Snapshot GC marks retained manifests in resumable budgeted pages and
+  revalidates durable roots before destructive work. A newly live root
+  invalidates the mark and restarts collection. Snapshot diagnostics use the
+  shared storage accounting projection instead of repeating independent full
+  store scans.
+- The supervisor MCP canary is observational and cannot hold up local health
+  ticks. Shutdown cancels and drains its active probe child.
+- Async ACP dispatch waiters subscribe to matching durable work-session run
+  events and keep a bounded registry-status fallback for missed or older event
+  paths. They do not poll the registry at a fixed two-second cadence for the
+  full submit timeout.
 
 ## Child DOX Index
 

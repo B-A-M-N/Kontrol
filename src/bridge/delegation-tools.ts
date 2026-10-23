@@ -246,6 +246,7 @@ export function registerDelegationTools(server: McpServer, config: BridgeConfig)
             agentRegistry: config.agentRegistry,
             workspaces: config.workspaces,
             workSessions: config.workSessions,
+            eventStore: config.eventStore,
             adapterSecret: config.adapterSecret,
           },
           {

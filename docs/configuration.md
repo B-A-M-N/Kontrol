@@ -73,6 +73,7 @@ kontrol config set publicBaseUrl https://kontrol.example.com
 | `KONTROL_MCP_REUSABLE_SESSION_IDLE_MS` | Idle TTL for reusable or multi-tool sessions. Defaults to `86400000` (24 hours). |
 | `KONTROL_MCP_SESSION_REAPER_INTERVAL_MS` | Session reaper interval. Defaults to `15000`. |
 | `KONTROL_MCP_LOGICAL_CONTINUITY_RETENTION_MS` | Retention for trusted logical-client metadata after a transport disconnect. Defaults to `259200000` (72 hours); this never reuses a transport or replays a request. |
+| `KONTROL_MCP_CLIENT_METRICS_HISTORY_LIMIT` | Maximum inactive logical-client metric rows retained in memory. Active clients are preserved separately. Defaults to `5000`. |
 | `KONTROL_MCP_SESSION_MAX_PER_CLIENT` | Per-logical-client session cap. Defaults to `20`. |
 | `KONTROL_MCP_SESSION_SOFT_CAP` | Global session soft cap for LRU pressure cleanup. Defaults to `150`. |
 | `KONTROL_MCP_SESSION_HARD_CAP` | Global session admission hard cap. Defaults to `200`. |

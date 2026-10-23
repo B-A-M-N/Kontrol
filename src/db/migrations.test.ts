@@ -15,6 +15,20 @@ try {
   assert.deepEqual(schemaContract.missing, [], "all Drizzle tables and columns are present in migrated SQLite");
   assert.equal(schemaContract.appliedVersion, LATEST_SCHEMA_VERSION);
   assert.ok(
+    (sqlite.prepare("select name from sqlite_master where type = 'index'").all() as Array<{ name: string }>)
+      .some((index) => index.name === "event_log_scheduled_error_fingerprint_time_idx"),
+    "scheduler recurrence lookup has a fingerprint/time index",
+  );
+  const recurrencePlan = sqlite.prepare(`
+    explain query plan
+    select count(*) from event_log
+     where type = 'scheduled_job.scheduler_error'
+       and created_at >= ?
+       and json_extract(payload, '$.fingerprint') = ?
+  `).all("2026-01-01T00:00:00.000Z", "fingerprint") as Array<{ detail: string }>;
+  assert.ok(recurrencePlan.some((row) => row.detail.includes("event_log_scheduled_error_fingerprint_time_idx")),
+    "durable recurrence count uses the bounded fingerprint/time lookup index");
+  assert.ok(
     (sqlite.prepare("pragma table_info(work_session_submissions)").all() as Array<{ name: string }>)
       .some((column) => column.name === "files_json"),
     "submission file metadata column is present after migration",

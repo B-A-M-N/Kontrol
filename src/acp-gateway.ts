@@ -12,6 +12,7 @@ import {
 } from "./acp-registry.js";
 import type { WorkspaceRegistry } from "./workspaces.js";
 import type { WorkSessionManager } from "./work-sessions.js";
+import type { EventStore } from "./event-log.js";
 import {
   readFileTool,
   writeFileTool,
@@ -500,6 +501,8 @@ export interface GatewayConfig {
   /** P0 #9: outbound adapter credential (KONTROL_ACP_ADAPTER_SECRET). */
   adapterSecret?: string;
   readOnlyExecutionNetworkPolicy?: "disabled" | "host";
+  /** Durable lifecycle events wake asynchronous dispatch waiters; registry polling remains a bounded fallback. */
+  eventStore?: EventStore;
 }
 
 export interface AgentCallResult {
@@ -945,6 +948,9 @@ export async function callRemoteAgent(
       // If we hit the submit-timeout first, report "running" so the caller can
       // continue to observe via the work session instead of timing out.
       const pollStart = Date.now();
+      let afterSeq = params.workSessionId
+        ? config.eventStore?.getLatestEvent(params.workSessionId)?.seq ?? 0
+        : 0;
       while (Date.now() - pollStart < AGENT_SUBMIT_TIMEOUT_MS) {
         const current = config.agentRegistry.getRun(run.runId);
         const st = current?.status;
@@ -971,7 +977,24 @@ export async function callRemoteAgent(
             workSessionId: params.workSessionId,
           };
         }
-        await sleep(2000);
+        if (config.eventStore && params.workSessionId) {
+          const remaining = Math.max(1, AGENT_SUBMIT_TIMEOUT_MS - (Date.now() - pollStart));
+          try {
+            const event = await config.eventStore.waitForMatchingEventAfter(
+              params.workSessionId,
+              afterSeq,
+              (candidate) => candidate.payload.runId === run.runId,
+              Math.min(2_000, remaining),
+            );
+            if (event) afterSeq = Math.max(afterSeq, event.seq);
+          } catch {
+            // A failed wakeup query must not change the already-accepted run's
+            // outcome. Fall back to the bounded registry check cadence.
+            await sleep(Math.min(250, remaining));
+          }
+        } else {
+          await sleep(2000);
+        }
       }
       // Agent hasn't submitted within the bound — hand observation back to the
       // work session. The agent keeps running in the background.

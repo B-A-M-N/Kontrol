@@ -92,6 +92,13 @@ export function createMcpSessionLifecycle(deps: McpSessionLifecycleDeps): McpSes
     expired: 0,
     inFlight: 0,
     clients: new Map(),
+    retiredClientTotals: {
+      sessionsCreated: 0, sessionsClosed: 0, sessionsExpired: 0,
+      zeroToolSessions: 0, singleToolSessions: 0, multiToolSessions: 0,
+      totalToolCalls: 0, totalLifetimeMs: 0, completedSessions: 0,
+    },
+    retiredClientCount: 0,
+    retainedHistoricalClientCount: 0,
     windowEvents: [],
     completedToolCounts: [],
     terminationReasons: new Map(),
@@ -207,6 +214,8 @@ export function createMcpSessionLifecycle(deps: McpSessionLifecycleDeps): McpSes
         totalToolCalls: 0,
         totalLifetimeMs: 0,
         oldestIdleMs: 0,
+        completedSessions: 0,
+        lastSeenAt: Date.now(),
       };
       mcpSessionMetrics.clients.set(logicalClientId, metrics);
     }
@@ -230,13 +239,17 @@ export function createMcpSessionLifecycle(deps: McpSessionLifecycleDeps): McpSes
     state.endRecorded = true;
     state.closed = true;
     const metrics = clientMcpMetrics(state.logicalClientId);
+    const wasActive = metrics.currentSessions > 0;
     metrics.currentSessions = Math.max(0, metrics.currentSessions - 1);
     metrics.totalLifetimeMs += Math.max(0, now - state.createdAt);
     metrics.totalToolCalls += state.toolCallCount;
+    metrics.completedSessions++;
+    metrics.lastSeenAt = now;
     metrics.oldestIdleMs = 0;
     if (state.toolCallCount === 0) metrics.zeroToolSessions++;
     else if (state.toolCallCount === 1) metrics.singleToolSessions++;
     else metrics.multiToolSessions++;
+    if (wasActive && metrics.currentSessions === 0) mcpSessionMetrics.retainedHistoricalClientCount++;
     mcpSessionMetrics.completedToolCounts.push(state.toolCallCount);
     if (mcpSessionMetrics.completedToolCounts.length > 10_000) mcpSessionMetrics.completedToolCounts.shift();
     const terminationReason = state.terminationReason ?? reason;
@@ -253,14 +266,52 @@ export function createMcpSessionLifecycle(deps: McpSessionLifecycleDeps): McpSes
       metrics.sessionsClosed++;
       recordMcpWindowEvent("closed", now);
     }
+    // Map insertion order is the inactive-client LRU. Active rows are skipped
+    // and never contribute to the independent historical retention budget.
+    mcpSessionMetrics.clients.delete(state.logicalClientId);
+    mcpSessionMetrics.clients.set(state.logicalClientId, metrics);
+    pruneHistoricalClientMetrics();
   }
 
   function recordMcpSessionCreated(logicalClientId: string, at = Date.now()): void {
     const metrics = clientMcpMetrics(logicalClientId);
+    if (metrics.currentSessions === 0 && metrics.sessionsCreated > 0) {
+      mcpSessionMetrics.retainedHistoricalClientCount = Math.max(0, mcpSessionMetrics.retainedHistoricalClientCount - 1);
+    }
     metrics.sessionsCreated++;
     metrics.currentSessions++;
+    metrics.lastSeenAt = at;
+    mcpSessionMetrics.clients.delete(logicalClientId);
+    mcpSessionMetrics.clients.set(logicalClientId, metrics);
     mcpSessionMetrics.created++;
     recordMcpWindowEvent("created", at);
+  }
+
+  function pruneHistoricalClientMetrics(): void {
+    const limit = config.mcpClientMetricsHistoryLimit ?? 5_000;
+    const clients = mcpSessionMetrics.clients;
+    while (mcpSessionMetrics.retainedHistoricalClientCount > limit) {
+      let retired = false;
+      for (const [client, metrics] of clients) {
+        if (metrics.currentSessions > 0) continue;
+        const totals = mcpSessionMetrics.retiredClientTotals;
+        totals.sessionsCreated += metrics.sessionsCreated;
+        totals.sessionsClosed += metrics.sessionsClosed;
+        totals.sessionsExpired += metrics.sessionsExpired;
+        totals.zeroToolSessions += metrics.zeroToolSessions;
+        totals.singleToolSessions += metrics.singleToolSessions;
+        totals.multiToolSessions += metrics.multiToolSessions;
+        totals.totalToolCalls += metrics.totalToolCalls;
+        totals.totalLifetimeMs += metrics.totalLifetimeMs;
+        totals.completedSessions += metrics.completedSessions;
+        clients.delete(client);
+        mcpSessionMetrics.retainedHistoricalClientCount--;
+        mcpSessionMetrics.retiredClientCount++;
+        retired = true;
+        break;
+      }
+      if (!retired) break;
+    }
   }
 
   function completedToolPercentile(percentile: number): number {
@@ -272,18 +323,20 @@ export function createMcpSessionLifecycle(deps: McpSessionLifecycleDeps): McpSes
   function mcpSessionReuseMetrics() {
     const now = Date.now();
     const completed = mcpSessionMetrics.closed + mcpSessionMetrics.expired;
-    const perClient = [...mcpSessionMetrics.clients.entries()].map(([client, metrics]) => {
-      let currentZeroToolSessions = 0;
-      let currentSingleToolSessions = 0;
-      let currentMultiToolSessions = 0;
-      let oldestIdleMs = 0;
-      for (const state of mcpSessions.values()) {
-        if (state.logicalClientId !== client) continue;
-        if (state.toolCallCount === 0) currentZeroToolSessions++;
-        else if (state.toolCallCount === 1) currentSingleToolSessions++;
-        else currentMultiToolSessions++;
-        oldestIdleMs = Math.max(oldestIdleMs, now - state.lastApplicationActivityAt);
+    const activeByClient = new Map<string, { zero: number; single: number; multi: number; oldestIdleMs: number }>();
+    for (const state of mcpSessions.values()) {
+      let counts = activeByClient.get(state.logicalClientId);
+      if (!counts) {
+        counts = { zero: 0, single: 0, multi: 0, oldestIdleMs: 0 };
+        activeByClient.set(state.logicalClientId, counts);
       }
+      if (state.toolCallCount === 0) counts.zero++;
+      else if (state.toolCallCount === 1) counts.single++;
+      else counts.multi++;
+      counts.oldestIdleMs = Math.max(counts.oldestIdleMs, now - state.lastApplicationActivityAt);
+    }
+    const perClient = [...mcpSessionMetrics.clients.entries()].map(([client, metrics]) => {
+      const current = activeByClient.get(client);
       return {
         client,
         sessionsCreated: metrics.sessionsCreated,
@@ -293,27 +346,36 @@ export function createMcpSessionLifecycle(deps: McpSessionLifecycleDeps): McpSes
         singleToolSessions: metrics.singleToolSessions,
         multiToolSessions: metrics.multiToolSessions,
         unusedSessions: metrics.zeroToolSessions,
-        currentZeroToolSessions,
-        currentSingleToolSessions,
-        currentMultiToolSessions,
+        currentZeroToolSessions: current?.zero ?? 0,
+        currentSingleToolSessions: current?.single ?? 0,
+        currentMultiToolSessions: current?.multi ?? 0,
         averageToolCallsPerSession: metrics.sessionsCreated > 0 ? metrics.totalToolCalls / metrics.sessionsCreated : 0,
-        averageLifetimeMs: completed > 0 ? metrics.totalLifetimeMs / completed : 0,
-        oldestIdleMs,
+        averageLifetimeMs: metrics.completedSessions > 0 ? metrics.totalLifetimeMs / metrics.completedSessions : 0,
+        oldestIdleMs: current?.oldestIdleMs ?? 0,
       };
     });
     const clientTotals = [...mcpSessionMetrics.clients.values()].reduce((totals, metrics) => ({
       zeroToolSessions: totals.zeroToolSessions + metrics.zeroToolSessions,
       singleToolSessions: totals.singleToolSessions + metrics.singleToolSessions,
       multiToolSessions: totals.multiToolSessions + metrics.multiToolSessions,
-    }), { zeroToolSessions: 0, singleToolSessions: 0, multiToolSessions: 0 });
+    }), {
+      zeroToolSessions: mcpSessionMetrics.retiredClientTotals.zeroToolSessions,
+      singleToolSessions: mcpSessionMetrics.retiredClientTotals.singleToolSessions,
+      multiToolSessions: mcpSessionMetrics.retiredClientTotals.multiToolSessions,
+    });
+    const sampleCount = mcpSessionMetrics.completedToolCounts.length;
     return {
       sessionsCreated: mcpSessionMetrics.created,
       sessionsClosed: mcpSessionMetrics.closed,
       sessionsExpired: mcpSessionMetrics.expired,
+      retainedClientMetricRows: mcpSessionMetrics.clients.size,
+      retainedHistoricalClientRows: mcpSessionMetrics.retainedHistoricalClientCount,
+      retiredClientCount: mcpSessionMetrics.retiredClientCount,
+      retiredClientTotals: { ...mcpSessionMetrics.retiredClientTotals },
       zeroToolSessions: clientTotals.zeroToolSessions,
       singleToolSessions: clientTotals.singleToolSessions,
       multiToolSessions: clientTotals.multiToolSessions,
-      toolCallsPerSessionMean: completed > 0 ? mcpSessionMetrics.completedToolCounts.reduce((sum, count) => sum + count, 0) / completed : 0,
+      toolCallsPerSessionMean: sampleCount > 0 ? mcpSessionMetrics.completedToolCounts.reduce((sum, count) => sum + count, 0) / sampleCount : 0,
       toolCallsPerSessionP50: completedToolPercentile(0.5),
       toolCallsPerSessionP95: completedToolPercentile(0.95),
       windows: {

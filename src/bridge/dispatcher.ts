@@ -353,7 +353,7 @@ export async function defaultResume(
   ].filter(Boolean).join("\n\n");
   try {
     const result = await callRemoteAgent(
-      { agentRegistry: config.agentRegistry, workspaces: config.workspaces, workSessions: config.workSessions, adapterSecret: config.adapterSecret },
+      { agentRegistry: config.agentRegistry, workspaces: config.workspaces, workSessions: config.workSessions, eventStore: config.eventStore, adapterSecret: config.adapterSecret },
       {
       agentUrl: await resolveHealthyAgentUrl(config, agentName),
       agentName,

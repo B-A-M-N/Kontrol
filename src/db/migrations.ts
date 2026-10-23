@@ -109,6 +109,7 @@ const migrations: Migration[] = [
   { version: 95, name: "authenticated-outcome-observation-receipts", up: migrateAuthenticatedOutcomeObservationReceipts },
   { version: 96, name: "review-browser-attempt-recovery-receipts", up: migrateReviewBrowserAttemptRecoveryReceipts },
   { version: 97, name: "review-browser-generation-observations", up: migrateReviewBrowserGenerationObservations },
+  { version: 98, name: "scheduler-error-fingerprint-index", up: migrateSchedulerErrorFingerprintIndex },
 ];
 
 function migrateReviewerBrowserAuthState(sqlite: Database.Database): void {
@@ -1765,6 +1766,14 @@ function migrateEventLog(sqlite: Database.Database): void {
 
     create index if not exists event_log_workspace_seq_idx
       on event_log(workspace_session_id, seq);
+  `);
+}
+
+function migrateSchedulerErrorFingerprintIndex(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create index if not exists event_log_scheduled_error_fingerprint_time_idx
+      on event_log(type, json_extract(payload, '$.fingerprint'), created_at)
+      where type = 'scheduled_job.scheduler_error';
   `);
 }
 
