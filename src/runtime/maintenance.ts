@@ -104,7 +104,15 @@ export function createMaintenanceCoordinator(deps: MaintenanceDeps) {
   // swallowed that error and passed an empty root set to GC would turn "I
   // could not determine what data is live" into "nothing in SQLite is live".
   // The GC slice is skipped while degraded; the next cycle retries.
-  const collectFsSnapshotDbRoots = (): DurableSnapshotRoot[] => collectDurableSnapshotRoots(db);
+  let snapshotRootEnumerationFailed = false;
+  const collectFsSnapshotDbRoots = (): DurableSnapshotRoot[] => {
+    try {
+      return collectDurableSnapshotRoots(db);
+    } catch (error) {
+      snapshotRootEnumerationFailed = true;
+      throw error;
+    }
+  };
 
   const snapshotGcSlice = async (
     store: FilesystemSnapshotStore,
@@ -262,27 +270,27 @@ export function createMaintenanceCoordinator(deps: MaintenanceDeps) {
           // advanced per yielded step; if it reports more work, the next cycle
           // resumes (never monopolizing the serving thread).
           const store = reviewCheckpoints.getSnapshotStore();
-          // P0 fail-closed: probe the durable root set BEFORE any GC slice.
-          // An enumeration failure marks maintenance degraded and skips GC
-          // entirely (reclaim nothing); the next cycle retries.
-          try {
-            collectFsSnapshotDbRoots();
-            maintenanceStats.snapshotRootsDegraded = false;
-            maintenanceStats.snapshotRootsLastError = undefined;
-          } catch (error) {
-            const detail = error instanceof Error ? error.message : String(error);
+          // gcSlice establishes durable roots before every destructive phase
+          // and fails closed. Observe that result directly instead of doing a
+          // redundant full SQLite root scan before each slice.
+          snapshotRootEnumerationFailed = false;
+          const slice = await snapshotGcSlice(store, MAINTENANCE_BUDGET_MS, MAINTENANCE_PAGE_SIZE);
+          if (snapshotRootEnumerationFailed) {
+            const detail = slice.error ?? "durable snapshot root enumeration failed";
             maintenanceStats.snapshotRootsDegraded = true;
             maintenanceStats.snapshotRootsLastError = detail;
             maintenanceStats.lastError = detail;
-            reportMaintenanceFailure("snapshot_gc_db_roots", error);
+            reportMaintenanceFailure("snapshot_gc_db_roots", detail);
             snapshotGcDone = true;
             setImmediate(step);
             return;
           }
-          const slice = await snapshotGcSlice(store, MAINTENANCE_BUDGET_MS, MAINTENANCE_PAGE_SIZE);
           if (slice.error) {
             maintenanceStats.lastError = slice.error;
             reportMaintenanceFailure("snapshot_gc", slice.error);
+          } else {
+            maintenanceStats.snapshotRootsDegraded = false;
+            maintenanceStats.snapshotRootsLastError = undefined;
           }
           const wasDone = snapshotGcDone;
           snapshotGcDone = !slice.hasMore;
