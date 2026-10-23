@@ -51,6 +51,14 @@ try {
   assert.deepEqual(events.appendTelemetryIngress({ id: "adapter-event-1", type: "agent.run.output_delta", sessionId: "session-ingress", payload: ingressOne }), {
     eventId: "adapter-event-1", duplicate: true,
   }, "a retry with the same event id is durably deduplicated before event-log materialization");
+  assert.deepEqual(events.appendTelemetryIngress({
+    id: "adapter-event-1",
+    type: "agent.run.output_delta",
+    sessionId: "session-ingress",
+    payload: { text: ingressOne.text, channel: ingressOne.channel },
+  }), {
+    eventId: "adapter-event-1", duplicate: true,
+  }, "telemetry retries remain idempotent when object property order changes");
   assert.throws(() => events.appendTelemetryIngress({
     id: "adapter-event-1", type: "agent.run.output_delta", sessionId: "session-ingress", payload: { ...ingressOne, text: "tampered" },
   }), /reused with different telemetry content/);

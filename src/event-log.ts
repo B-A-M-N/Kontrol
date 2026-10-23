@@ -180,6 +180,16 @@ export function createEventStore(
   const globalSubscribers = new Set<Subscriber>();
   const workspaceSubscribers = new Map<string, Set<Subscriber>>();
   const telemetryBuffers = new Map<string, TelemetryBuffer>();
+  const findTelemetryIngress = database.sqlite.prepare(`
+    select session_id, workspace_session_id, type, payload_sha256
+      from telemetry_ingress
+     where event_id = ?
+  `);
+  const insertTelemetryIngress = database.sqlite.prepare(`
+    insert into telemetry_ingress
+      (event_id, session_id, workspace_session_id, type, payload_json, payload_sha256, publish, status, received_at)
+    values (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+  `);
   const TELEMETRY_FLUSH_INTERVAL_MS = 250;
   const TELEMETRY_MAX_BYTES = 16 * 1024;
   const TELEMETRY_INGRESS_BATCH_SIZE = 512;
@@ -218,6 +228,14 @@ export function createEventStore(
       workspaceSessionId: input.workspaceSessionId ?? "",
       payload: input.payload,
     })).digest("hex");
+  }
+
+  function telemetryPayloadHashFromJson(input: { type: string; sessionId: string; workspaceSessionId?: string; }, payloadJson: string): string {
+    // stableJson sorts object keys lexically. The canonical envelope has the
+    // same key order and values as telemetryPayloadHash(), reusing the payload
+    // serialization already written to SQLite.
+    const canonicalEnvelope = `{"payload":${payloadJson},"sessionId":${JSON.stringify(input.sessionId)},"type":${JSON.stringify(input.type)},"workspaceSessionId":${JSON.stringify(input.workspaceSessionId ?? "")}}`;
+    return createHash("sha256").update(canonicalEnvelope).digest("hex");
   }
 
   function hasPendingTelemetryIngress(sessionId?: string): boolean {
@@ -337,27 +355,19 @@ export function createEventStore(
       throw new Error(`Telemetry ingress does not accept event type ${input.type}`);
     }
     const eventId = input.id ?? randomUUID();
-    const payloadJson = JSON.stringify(input.payload);
-    const payloadSha256 = telemetryPayloadHash(input);
-    const existing = database.sqlite.prepare(`
-      select session_id, workspace_session_id, type, payload_sha256
-        from telemetry_ingress
-       where event_id = ?
-    `).get(eventId) as { session_id: string; workspace_session_id?: string | null; type: string; payload_sha256: string } | undefined;
+    const payloadJson = stableJson(input.payload);
+    const payloadSha256 = telemetryPayloadHashFromJson(input, payloadJson);
+    const existing = findTelemetryIngress.get(eventId) as { session_id: string; workspace_session_id?: string | null; type: string; payload_sha256: string } | undefined;
     if (existing) {
       if (existing.session_id !== input.sessionId
         || (existing.workspace_session_id ?? undefined) !== input.workspaceSessionId
         || existing.type !== input.type
-        || existing.payload_sha256 !== payloadSha256) {
+        || (existing.payload_sha256 !== payloadSha256 && existing.payload_sha256 !== telemetryPayloadHash(input))) {
         throw new Error(`Adapter event id ${eventId} was reused with different telemetry content`);
       }
       return { eventId, duplicate: true };
     }
-    database.sqlite.prepare(`
-      insert into telemetry_ingress
-        (event_id, session_id, workspace_session_id, type, payload_json, payload_sha256, publish, status, received_at)
-      values (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
-    `).run(
+    insertTelemetryIngress.run(
       eventId,
       input.sessionId,
       input.workspaceSessionId ?? null,
