@@ -138,7 +138,7 @@ async function makeFixture() {
       return { removed: 0, retained: 0, failed: 0 };
     },
   });
-  await new Promise((resolve) => setTimeout(resolve, 120));
+  await waitFor(() => managedWorktreeGcCalls > 0 && fx.telemetryPruneLimits.length > 0);
   healthy.stop();
 
   assert.equal(healthy.stats.snapshotRootsDegraded, false, "recovered cycle clears the degraded flag");

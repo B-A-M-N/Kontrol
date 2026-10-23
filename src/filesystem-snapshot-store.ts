@@ -288,6 +288,7 @@ export class FilesystemSnapshotStore {
     markRefs: string[];
     markCursor: number;
     expiredRefs: string[];
+    expiredRefSet: Set<string>;
     expireCursor: number;
     blobRootDir: Dir | null;
     blobShardDirs: string[] | null;
@@ -310,6 +311,7 @@ export class FilesystemSnapshotStore {
     markRefs: [],
     markCursor: 0,
     expiredRefs: [],
+    expiredRefSet: new Set(),
     expireCursor: 0,
     blobRootDir: null,
     blobShardDirs: null,
@@ -991,11 +993,14 @@ export class FilesystemSnapshotStore {
       for (const snap of listDbSnapshots()) {
         if (!snap || !snap.ref) continue;
         if (snap.terminal) {
-          const refMtimeMs = await this.manifestMtimeMs(snap.ref);
-          if (refMtimeMs !== undefined) {
-            const terminalAtMs = snap.terminalAt !== undefined ? Date.parse(snap.terminalAt) : Number.NaN;
-            const ageAtMs = Number.isFinite(terminalAtMs) ? terminalAtMs : refMtimeMs;
-            terminal.push({ ref: snap.ref, refMtimeMs, ageAtMs });
+          const terminalAtMs = snap.terminalAt !== undefined ? Date.parse(snap.terminalAt) : Number.NaN;
+          if (Number.isFinite(terminalAtMs)) {
+            // A persisted terminal timestamp is authoritative; avoid one stat
+            // syscall per durable root on every resumable GC slice.
+            terminal.push({ ref: snap.ref, refMtimeMs: 0, ageAtMs: terminalAtMs });
+          } else {
+            const refMtimeMs = await this.manifestMtimeMs(snap.ref);
+            if (refMtimeMs !== undefined) terminal.push({ ref: snap.ref, refMtimeMs, ageAtMs: refMtimeMs });
           }
           // A terminal ref whose manifest was already collected simply isn't a
           // live ref anymore; nothing to pin.
@@ -1005,6 +1010,23 @@ export class FilesystemSnapshotStore {
       }
     }
     return { strong, terminal };
+  }
+
+  /** Select the same newest terminal tail as a full stable sort, in O(T × N). */
+  private terminalTailRefs(terminal: Array<{ ref: string; ageAtMs: number }>): Set<string> {
+    const limit = this.retainPerWorkspace;
+    if (limit <= 0) return new Set();
+    const selected: Array<{ ref: string; ageAtMs: number; sourceIndex: number }> = [];
+    for (let sourceIndex = 0; sourceIndex < terminal.length; sourceIndex++) {
+      const candidate = terminal[sourceIndex]!;
+      const position = selected.findIndex((entry) => candidate.ageAtMs > entry.ageAtMs
+        || (candidate.ageAtMs === entry.ageAtMs && sourceIndex < entry.sourceIndex));
+      const insertAt = position < 0 ? selected.length : position;
+      if (insertAt >= limit) continue;
+      selected.splice(insertAt, 0, { ...candidate, sourceIndex });
+      if (selected.length > limit) selected.pop();
+    }
+    return new Set(selected.map((entry) => entry.ref));
   }
 
   /**
@@ -1061,18 +1083,20 @@ export class FilesystemSnapshotStore {
       this.gcState.markRefs = [];
       this.gcState.markCursor = 0;
       this.gcState.expiredRefs = [];
+      this.gcState.expiredRefSet.clear();
       this.gcState.expireCursor = 0;
       this.closeGcDirectoryCursors();
     };
     const currentRootsAreCovered = async (): Promise<boolean> => {
       const { strong, terminal } = await this.collectRoots(listDbSnapshots);
-      for (const ref of strong) if (!this.gcState.retained.has(ref)) return false;
-      const tail = new Set([...terminal]
-        .sort((a, b) => b.ageAtMs - a.ageAtMs)
-        .slice(0, this.retainPerWorkspace)
-        .map((entry) => entry.ref));
+      for (const ref of strong) {
+        if (this.gcState.retained.has(ref)) continue;
+        if (this.gcState.expiredRefSet.has(ref) || await this.manifestMtimeMs(ref) !== undefined) return false;
+      }
+      const tail = this.terminalTailRefs(terminal);
       for (const entry of terminal) {
-        if ((nowMs - entry.ageAtMs < this.retentionMs || tail.has(entry.ref)) && !this.gcState.retained.has(entry.ref)) return false;
+        if (!(nowMs - entry.ageAtMs < this.retentionMs || tail.has(entry.ref)) || this.gcState.retained.has(entry.ref)) continue;
+        if (this.gcState.expiredRefSet.has(entry.ref) || await this.manifestMtimeMs(entry.ref) !== undefined) return false;
       }
       return true;
     };
@@ -1083,16 +1107,14 @@ export class FilesystemSnapshotStore {
         const { strong, terminal } = await this.collectRoots(listDbSnapshots);
         this.gcState.strongRoots = strong;
         this.gcState.terminalByRef = new Map(terminal.map((entry) => [entry.ref, entry]));
-        this.gcState.protectedAfterTtl = new Set([...terminal]
-          .sort((a, b) => b.ageAtMs - a.ageAtMs)
-          .slice(0, this.retainPerWorkspace)
-          .map((entry) => entry.ref));
+        this.gcState.protectedAfterTtl = this.terminalTailRefs(terminal);
         this.gcState.manifestDir = await opendir(join(this.storeRoot, "manifests")).catch((error: NodeJS.ErrnoException) => {
           if (error.code === "ENOENT") return null;
           throw error;
         });
         this.gcState.retained.clear();
         this.gcState.expiredRefs = [];
+        this.gcState.expiredRefSet.clear();
         this.gcState.markRefs = [];
         this.gcState.markCursor = 0;
         this.gcState.expireCursor = 0;
@@ -1124,7 +1146,10 @@ export class FilesystemSnapshotStore {
         else {
           const mtime = await this.manifestMtimeMs(ref);
           if (mtime !== undefined && nowMs - mtime < this.orphanGraceMs) this.gcState.retained.add(ref);
-          else this.gcState.expiredRefs.push(ref);
+          else {
+            this.gcState.expiredRefs.push(ref);
+            this.gcState.expiredRefSet.add(ref);
+          }
         }
         scanned++;
       }
@@ -1230,6 +1255,7 @@ export class FilesystemSnapshotStore {
     this.gcState.retained.clear();
     this.gcState.markStage = null;
     this.gcState.expiredRefs = [];
+    this.gcState.expiredRefSet.clear();
     this.gcState.markRefs = [];
     this.closeGcDirectoryCursors();
     if (!this.lastGcStartedAt) this.lastGcStartedAt = new Date().toISOString();
@@ -1473,10 +1499,7 @@ export class FilesystemSnapshotStore {
     const { strong, terminal } = await this.collectRoots(listDbSnapshots ?? this.durableRoots);
     const nowMs = Date.now();
     const terminalByRef = new Map(terminal.map((item) => [item.ref, item]));
-    const protectedAfterTtl = new Set([...terminal]
-      .sort((left, right) => right.ageAtMs - left.ageAtMs)
-      .slice(0, this.retainPerWorkspace)
-      .map((item) => item.ref));
+    const protectedAfterTtl = this.terminalTailRefs(terminal);
 
     const account = new Map<string, { hash: string; size: number; classification: SnapshotBlobAccounting["classification"]; pinReasons: Set<string> }>();
     const addBlob = async (hash: string, reason: string, classification: SnapshotBlobAccounting["classification"]) => {
@@ -1674,11 +1697,12 @@ export class FilesystemSnapshotStore {
     const { strong, terminal } = await this.collectRoots(listDbSnapshots ?? this.durableRoots);
     const now = Date.now();
     const roots = new Set(strong);
+    const protectedAfterTtl = this.terminalTailRefs(terminal);
     for (const t of terminal) {
       // Count terminal refs as reachable within their retention window and the
       // bounded recent tail, mirroring gcSlice's retention logic (aged from the
       // terminal moment, not manifest mtime — P0).
-      if (now - t.ageAtMs < this.retentionMs || [...terminal].sort((a, b) => b.ageAtMs - a.ageAtMs).slice(0, this.retainPerWorkspace).some((x) => x.ref === t.ref)) {
+      if (now - t.ageAtMs < this.retentionMs || protectedAfterTtl.has(t.ref)) {
         roots.add(t.ref);
       }
     }
