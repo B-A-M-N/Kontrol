@@ -960,7 +960,11 @@ export class FilesystemSnapshotStore {
     }
     if (baselineDirectory) {
       for await (const entry of baselineDirectory) {
-        if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+        if (!entry.name.endsWith(".json")) continue;
+        if (!entry.isFile()) {
+          await this.recordCorruption(`baseline:${entry.name}`, "baseline entry is not a regular file");
+          throw new Error(`Cannot establish snapshot roots: baseline ${entry.name} is not a regular file.`);
+        }
         let raw: string;
         try {
           raw = await readFile(join(baselineDir, entry.name), "utf8");
