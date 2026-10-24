@@ -441,6 +441,63 @@ assert.deepEqual(
   ["vendor-custom", "generated-tree"],
 );
 
+// PR-A: ingress profile configuration is parsed only when
+// KONTROL_INGRESS_PROFILES is set; unset stays bit-identical.
+assert.equal(loadConfig(baseEnv).ingress, undefined, "ingress stays undefined when KONTROL_INGRESS_PROFILES is unset");
+
+const ingressServeProfile = {
+  id: "serve-1",
+  kind: "tailscale_serve",
+  audience: "peer",
+  externalOrigin: "https://node.tail-scale.ts.net:8443",
+  target: "peer_listener",
+  enabled: true,
+  managedByKontrol: false,
+  allowedHosts: ["node.tail-scale.ts.net:8443"],
+};
+const ingressEnv = {
+  ...baseEnv,
+  KONTROL_PEER_ENABLED: "1",
+  KONTROL_PEER_PORT: "7677",
+  KONTROL_PEER_CREDENTIAL_FILE: join(emptyConfigDir, "peers.json"),
+  KONTROL_INGRESS_PROFILES: JSON.stringify([ingressServeProfile]),
+};
+writeFileSync(join(emptyConfigDir, "peers.json"), JSON.stringify({
+  version: 1,
+  peers: [{
+    id: "muse",
+    credentialId: "muse-peer",
+    credentialHash: "b".repeat(64),
+    capabilities: ["workspace:inspect"],
+    grantedRoots: [process.cwd()],
+  }],
+}));
+// Peer audience needs the peer listener enabled with credentials; writeFileSync
+// alone is not enough for the file-mode check, so use a permissive fixture.
+try {
+  chmodSync(join(emptyConfigDir, "peers.json"), 0o600);
+} catch {
+  // windows test hosts skip mode tightening
+}
+{
+  const config = loadConfig(ingressEnv);
+  assert.equal(config.ingress?.profiles.length, 1, "valid serve profile parses through");
+  assert.deepEqual(config.ingress?.profiles[0].allowedHosts, ["node.tail-scale.ts.net:8443"]);
+}
+assert.throws(
+  () => loadConfig({
+    ...ingressEnv,
+    KONTROL_INGRESS_PROFILES: JSON.stringify([ingressServeProfile, { ...ingressServeProfile, id: "serve-2" }]),
+  }),
+  /ingress_profiles_invalid/,
+  "duplicate ingress profile ids fail startup",
+);
+assert.throws(
+  () => loadConfig({ ...ingressEnv, KONTROL_INGRESS_PROFILES: "{not json" }),
+  /ingress_profiles_invalid/,
+  "malformed ingress JSON fails startup",
+);
+
 // Low water must not exceed high water.
 assert.throws(
   () => loadConfig({

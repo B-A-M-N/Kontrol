@@ -9,6 +9,8 @@ import type { PolicyConfig } from "./policy.js";
 import { loadPolicyConfig, policyCanAsk } from "./policy.js";
 import { loadKontrolFiles } from "./user-config.js";
 import { DEFAULT_DIRECT_APPROVAL_REATTACH_GRACE_MS } from "./policy-approval-defaults.js";
+import { parseIngressProfilesEnv, validateIngressProfiles } from "./ingress/validate.js";
+import type { IngressConfig } from "./ingress/types.js";
 
 export type ToolMode = "minimal" | "full" | "codex";
 export type WidgetMode = "off" | "changes" | "full";
@@ -172,6 +174,12 @@ export interface ServerConfig {
    * owner/ACP credential behavior.
    */
   peer?: PeerServerConfig;
+  /**
+   * Optional, strictly opt-in ingress profile configuration (PR-A). Undefined
+   * unless KONTROL_INGRESS_PROFILES is set. Purely declarative here: wiring
+   * into live listeners arrives in a later PR.
+   */
+  ingress?: IngressConfig;
 }
 
 function parsePort(value: string | number | undefined): number {
@@ -846,7 +854,19 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
   if (mcpConfig.mcpSessionReaperIntervalMs > mcpConfig.mcpUnusedSessionIdleMs) {
     throw new Error(`KONTROL_MCP_SESSION_REAPER_INTERVAL_MS=${mcpConfig.mcpSessionReaperIntervalMs} should not exceed the shortest idle TTL (KONTROL_MCP_UNUSED_SESSION_IDLE_MS=${mcpConfig.mcpUnusedSessionIdleMs}); idle sessions would linger a full extra interval.`);
   }
-  return config;
+
+  // PR-A: parse ingress profiles once at startup (undefined when unset) and
+  // validate them against the deployment context. No listener wiring yet.
+  const ingress = parseIngressProfilesEnv(env.KONTROL_INGRESS_PROFILES);
+  if (ingress) {
+    validateIngressProfiles(ingress.profiles, {
+      authMode,
+      peerEnabled: config.peer !== undefined,
+      hasPeerCredentials: config.peer !== undefined,
+      publicBaseUrl,
+    });
+  }
+  return { ...config, ingress };
 }
 
 function parsePublicBaseUrl(value: string): string {
