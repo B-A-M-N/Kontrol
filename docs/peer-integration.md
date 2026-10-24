@@ -21,9 +21,17 @@ tunnel) behaves exactly as before.
 > (a Muse-owned client calling approved Kontrol MCP tools): the read-only
 > inspection surface plus, when the owner grants `workspace:propose_patch`,
 > review-gated isolated mutation inside managed worktrees. The outbound job
-> protocol (**C2**) and `workspace:run_bounded` remain **reserved follow-on
-> milestones** documented as contract, not shipped behavior. **C3** is not
-> claimed at all.
+> protocol (**C2**) is **implemented as of M3, bounded as follows**: peers
+> granted the `job:` capability family can claim durable peer-scoped jobs
+> over `POST /peer/jobs/claim` (every job route also REQUIRES the matching
+> `job:*` capability and answers `403 peer_capability_denied` without it),
+> heartbeat them through a dedicated fenced lease renewal bounded by the
+> job's `maxRuntimeMs` budget, affirmatively report "not started", and return
+> correlated, validated results — with uncertain-outcome reconciliation and
+> `actorClass` honesty labeling (`muse_vm_process` only; `meta_muse_agent`
+> is rejected because C3 evidence does not exist). The owner enqueues jobs
+> through the owner-only `enqueue_peer_job` MCP tool. **No artifact staging
+> or review binding yet (follow-on).** **C3** is not claimed at all.
 
 ## Capability distinction: C1, C2, C3
 
@@ -33,7 +41,7 @@ never be conflated, and evidence for a lower level never implies a higher one.
 | Capability | What it means | Status |
 | --- | --- | --- |
 | **C1** | A Muse-owned client calls an approved subset of Kontrol MCP tools when Muse (not Kontrol) initiates the connection. | Peer-listener portion **implemented** in this milestone (read-only inspection surface). |
-| **C2** | Durable task exchange with software running in the Muse Secure VM via outbound pull (Kontrol periodically claims/pulls task batches). Mutating and job-oriented capabilities (`workspace:propose_patch`, `workspace:run_bounded`, and the `job:` capability family) belong here. | **Reserved / not yet active.** Documented below as the target contract. |
+| **C2** | Durable task exchange with software running in the Muse Secure VM via outbound pull (Kontrol periodically claims/pulls task batches). Mutating and job-oriented capabilities (`workspace:propose_patch`, `workspace:run_bounded`, and the `job:` capability family) belong here. | **Partially implemented (M3):** durable peer-scoped job claim/heartbeat/result protocol with fenced leases and uncertain-outcome reconciliation; no artifact staging or review binding yet (follow-on). The M3 label is `vm_executor_result` semantics. |
 | **C3** | Verified activation of the actual hosted Muse agent — Kontrol initiating turns in a user's real consumer Muse conversation. | **Not supported.** |
 
 **Never claim C3 from C2 evidence.** C2 proves only that software inside the
@@ -44,9 +52,109 @@ be verified separately; the peer listener does **not** provide any API for
 initiating turns in a Muse conversation.
 
 Because the peer listener is Muse-initiated outbound (see below), the current
-milestone covers the peer side of C1 only. Do not rely on the outbound job
-protocol or mutation capabilities yet; their environment variables and
-capability values are reserved and inert until a later milestone activates them.
+milestone covers the peer side of C1 plus the owner-side enqueue half of C2
+(the `enqueue_peer_job` tool and the `/peer/jobs/*` protocol). Mutation
+capabilities beyond review-gated worktree mutation are still reserved; their
+environment variables and capability values that remain unimplemented stay
+inert until a later milestone activates them.
+
+## The M3 durable peer job protocol (C2)
+
+The owner enqueues jobs; the peer pulls them. Nothing runs on the peer unless
+the peer itself makes an outbound call.
+
+### Owner side: `enqueue_peer_job` (owner-only MCP tool)
+
+Registered on the owner MCP listener only. It is never part of any peer tool
+profile: peers cannot see it in `tools/list`, and calling it by name from a
+peer, worker, or reviewer session is denied (`Forbidden: enqueue_peer_job is
+owner-only.`). Arguments:
+
+| Argument | Type | Notes |
+| --- | --- | --- |
+| `peerId` | string, required | Must match an `id` in the credential registry. All authority derives from the stored descriptor, never caller-supplied data. |
+| `repositoryId` | string, required | Workspace root. Canonicalized against `KONTROL_ALLOWED_ROOTS` (realpath, like `open_workspace`) and then required to be inside the peer's `grantedRoots`; otherwise denied. |
+| `baseRevision` | string, required, nonempty | Immutable git SHA or snapshot identity. |
+| `taskClass` | enum | `read_only_audit` \| `propose_patch` \| `bounded_execution`. |
+| `instructions` | string, required | UTF-8 instruction text, capped at 256 KiB, delivered verbatim to the peer. The peer also sees its SHA-256 (`instructionHash`) via `/peer/commands`. |
+| `allowedOutputs` | string[] of relative path prefixes, **required** | The owner must declare which result manifest paths are permitted. An entry matches when the canonical manifest path equals the entry or begins with `entry + "/"`. `["*"]` is the explicit match-all escape. An **empty** set allows NO file outputs. Entries are normalized (trailing `/` stripped; `..`, backslashes, and absolute paths rejected). |
+| `maxRuntimeMs` | int, optional | Runtime budget. Default 600_000, max 3_600_000. |
+| `maxArtifactBytes` | int, optional | Result artifact byte cap. Default 1_048_576, max 16_777_216. |
+
+The per-peer active-job cap (`KONTROL_PEER_MAX_CLAIMED_JOBS`) is enforced on
+this path: exceeding it returns an error (`peer_jobs_cap_exceeded`).
+
+### Peer side: job routes and required capabilities
+
+Every `/peer/jobs/*` route requires the full authenticated principal to hold
+the owner-granted capability (from the credential registry, never the caller):
+
+| Route | Capability |
+| --- | --- |
+| `POST /peer/jobs/claim` | `job:claim` |
+| `POST /peer/jobs/:jobId/started` / `renew` / `fail` / `not-started` | `job:claim` |
+| `GET /peer/jobs/:jobId/status` / `instructions`, `GET /peer/commands` | `job:claim` |
+| `POST /peer/jobs/:jobId/result` | `job:complete` |
+| `POST /peer/jobs/:jobId/cancel-ack` | `job:cancel_ack` |
+
+Missing capabilities answer `403 {"error":{"code":"peer_capability_denied"}}`.
+Attempts presented against the wrong URL answer `404 job_attempt_mismatch`;
+other peers' jobs answer a scoped `404 job_not_found` with no existence leak.
+
+### Instructions delivery
+
+The claim response and `GET /peer/jobs/:jobId/instructions` return the
+`instructions` text verbatim (both require `job:claim`). `/peer/commands`
+remains a hash-only poll so a passive poller never receives the raw payload.
+
+### Result receipts and terminalState mapping
+
+`POST /peer/jobs/:jobId/result` validates the receipt against the job AND the
+attempt (`receipt.jobId`/`receipt.attemptId` must match; `422
+attempt_mismatch` otherwise), enforces `allowedOutputs`, the artifact byte
+cap, and the canonical manifest hash. The receipt is persisted on the
+attempt. `terminalState` maps to job state:
+
+- `succeeded` → job `result_received`
+- `failed` → job `failed` (terminal, reason `peer_reported_failure` prefixed with the first 200 chars of the receipt summary)
+- `cancelled` → job `cancelled` (terminal, reason `peer_reported_cancelled` prefixed with the first 200 chars of the receipt summary)
+
+Duplicate results are compared canonically inside the store: an IDENTICAL
+repeat returns the stored outcome (idempotent); a DIFFERENT receipt answers
+`409 conflicting_result` and never overwrites.
+
+### Runtime budget
+
+The job's `maxRuntimeMs` bounds heartbeat leases once the peer reports
+`started`: each `/renew` is clamped to the remaining budget, and an exhausted
+budget expires the attempt (`410 runtime_budget_exceeded`). The clock also
+runs for claims that never report `started`: the budget starts at claim time
+(the attempt's `createdAt`; legacy records use their lease start), so a
+claim-without-start cannot renew indefinitely.
+
+### The not-started honesty contract
+
+A claim sets the attempt certainty to `unknown` — a claim is NOT evidence the
+peer began work. The peer either reports `started` (certainty becomes
+`started`) or affirmatively reports `POST /peer/jobs/:jobId/not-started`
+(certainty becomes `not_started`). When a lease expires:
+
+- `not_started` → the job requeues as `pending` (it may be claimed again).
+- `started` or `unknown` → the job moves to `awaiting_reconciliation`. It is
+  NEVER silently requeued or re-executed. A peer cannot contradict itself:
+  `not-started` is rejected with `409 not_started_after_started` once the
+  attempt has reported `started`.
+
+The same policy applies on process restart: boot reconciliation never revives
+claimed/running jobs. A background reaper (30s interval, unref'd timer)
+sweeps expired leases with this exact policy; its teardown is bound to the
+peer job routes handle.
+
+### Honest C2 scope
+
+No artifact staging and no review binding yet: a `result_received` job's
+manifest is validated and stored, but artifacts are not staged into review
+checkpoints. C3 (hosted Muse-agent activation) remains unclaimed.
 
 ## Muse-specific notes
 
@@ -100,7 +208,7 @@ All of the following are ignored unless `KONTROL_PEER_ENABLED=1`.
 | `KONTROL_PEER_PORT` | *(required when enabled)* | Port for the peer listener. Must differ from the main `PORT` (default `7676`). |
 | `KONTROL_PEER_CREDENTIAL_FILE` | *(required when enabled)* | Absolute path to an operator-owned JSON credential registry (see below). The file must be mode `0600` or `0400`; startup refuses group- or other-readable files. |
 | `KONTROL_PEER_MAX_ACTIVE_SESSIONS` | `8` | Cap on concurrent peer MCP sessions. Also reused as the **per-peer managed-worktree cap** for peers granted `workspace:propose_patch` (on top of the existing global and per-project managed-worktree limits). |
-| `KONTROL_PEER_MAX_CLAIMED_JOBS` | `8` | Reserved for the outbound job protocol (C2). **Documented as reserved; not yet active.** |
+| `KONTROL_PEER_MAX_CLAIMED_JOBS` | `8` | Per-peer cap on active (pending/claimed/running/awaiting-reconciliation) durable peer jobs (C2, enforced on the owner-side `enqueue_peer_job` tool). |
 | `KONTROL_PEER_REQUEST_BYTES_LIMIT` | `1048576` | Per-request body limit on the peer listener. |
 
 ### Credential registry file
@@ -154,8 +262,8 @@ Supporting fields:
 - `credentialHash` — SHA-256 over the domain-separated string, hex-encoded.
 - `capabilities` — the capability values granted to this peer (see below).
   `workspace:inspect` is the default; `workspace:propose_patch` additionally
-  enables review-gated managed-worktree mutation (see below). The rest are
-  reserved.
+  enables review-gated managed-worktree mutation (see below). The `job:`
+  family gates the durable peer job protocol (see below).
 - `grantedRoots` — absolute workspace roots this peer may open. Each entry must
   lie inside the server's configured `KONTROL_ALLOWED_ROOTS`.
 - `notBefore` — optional UTC activation time; before this the descriptor is
@@ -170,9 +278,9 @@ Supporting fields:
 | `workspace:inspect` | Read-only structured inspection (`read`, `grep`, `glob`, `ls`, git tools) plus `open_workspace`. | **Implemented** (default peer profile). |
 | `workspace:propose_patch` | Review-gated isolated mutation: peers may open managed worktrees for granted source roots and mutate files inside them (`write`, `edit`) with mandatory checkpoint tracking. Direct checkout mutation is always denied; peers cannot approve their own changes. | **Implemented** (opt-in per peer). |
 | `workspace:run_bounded` | Run a bounded command in an approved workspace. | **Reserved** (follow-on). |
-| `job:claim` | Claim an outbound task from the job queue (C2). | **Reserved** (follow-on). |
-| `job:complete` | Report an outbound task result (C2). | **Reserved** (follow-on). |
-| `job:cancel_ack` | Acknowledge cancellation of an outbound task (C2). | **Reserved** (follow-on). |
+| `job:claim` | Claim an outbound task from the job queue (C2); also gates `started`, `renew`, `fail`, `not-started`, `status`, `instructions`, and `/peer/commands`. | **Implemented (M3)** via the `/peer/jobs/*` protocol (durable peer-scoped jobs; no artifact staging yet). |
+| `job:complete` | Report an outbound task result (C2). | **Implemented (M3)** via `POST /peer/jobs/:jobId/result` with validated, persisted receipts (no artifact staging yet). |
+| `job:cancel_ack` | Acknowledge cancellation of an outbound task (C2). | **Implemented (M3)** via `POST /peer/jobs/:jobId/cancel-ack`. |
 
 The default peer profile is `workspace:inspect` only. Do not assume any reserved
 capability is active in the current milestone.
@@ -261,16 +369,18 @@ The peer path is isolated and additive. Its guarantees:
   readable surface — and the default profile grants only `workspace:inspect`
   over those roots.
 - **Bound namespaces.** `KONTROL_PEER_*` variables are inert unless
-  `KONTROL_PEER_ENABLED=1`. `KONTROL_PEER_MAX_CLAIMED_JOBS` is reserved for the
-  not-yet-active outbound job protocol.
+  `KONTROL_PEER_ENABLED=1`. `KONTROL_PEER_MAX_CLAIMED_JOBS` bounds each
+  peer's active durable jobs and is enforced on the owner-side
+  `enqueue_peer_job` tool.
 
 The read-only default remains the safe posture because a peer is a hosted,
 remotely authenticated caller consuming potentially adversarial project content
 — the same prompt-injection exposure that motivates Kontrol's general secure
 baseline. With `workspace:propose_patch` granted, mutation is confined to
 isolated managed worktrees with mandatory review tracking; the live checkout is
-never mutated by a peer. Job capabilities (`workspace:run_bounded`, the `job:`
-family) are still gated behind later milestones and are not exposed now.
+never mutated by a peer. Job capabilities (`workspace:run_bounded`) are still
+gated behind later milestones; the `job:` family is active for the durable
+peer job protocol with the honest scope described above.
 
 ## Rollback
 
