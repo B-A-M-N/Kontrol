@@ -297,6 +297,18 @@ can use the server concurrently. Workspace and review continuity is carried by
 explicit durable IDs rather than by assuming that separate transports belong to
 one conversation.
 
+## Peer Integration
+
+An opt-in peer integration lets an independently authenticated remote peer — the
+primary use case being Meta's hosted consumer Muse agent at `muse.ai`, reached
+over a Tailscale tailnet or another approved path — call a scoped subset of
+Kontrol's MCP tools under sharing rules the owner grants. Peers are **not**
+reviewers or workers, and the default peer profile is read-only inspection. The
+feature is off by default and adds a second HTTP listener only when explicitly
+enabled; with it off, the main MCP listener is unchanged. See
+[Peer Integration](docs/peer-integration.md) for configuration, the credential
+registry format, security properties, and rollback.
+
 ## What Agents Can Do
 
 Once connected, an agent can open an approved project folder as a workspace and:

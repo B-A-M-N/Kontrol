@@ -708,6 +708,16 @@ MCP context isolation:
   paths. They do not poll the registry at a fixed two-second cadence for the
   full submit timeout.
 
+## Peer integration (M1+M2, opt-in)
+
+- The peer listener (Meta Muse use case) exists only when KONTROL_PEER_ENABLED=1; otherwise no peer listener is created and owner/ACP/scheduled/review behavior is unchanged.
+- Peers authenticate with per-peer bearer credentials from a mode-0600 registry (KONTROL_PEER_CREDENTIAL_FILE), completely separate from the OAuth owner token and ACP secrets. Peers are never reviewers or workers; unsigned worker/reviewer/conversation headers never promote a peer.
+- The peer app (src/server/peer-app.ts) mounts only /mcp, /peer/* (authenticated 404 placeholder for the future job protocol), and unauthenticated /peer/healthz liveness. No ACP router, OAuth flow, diagnostics, or static Workspace App assets.
+- Peer MCP sessions are bound to listenerKind "peer" at initialize; cross-port session attach is denied, and credential revocation hot-reloads without restart. Peer tool catalogs are restricted to the granted capability profile (read-only inspect baseline) and enforced again at execution.
+- Peer workspace access is confined to registry-granted roots (subset of KONTROL_ALLOWED_ROOTS), checked before and after canonicalization (worktree opens check the SOURCE root); credential/private-state paths (.env-style files, state dir, ~/.kontrol) are denied by default.
+- M2: peers granted workspace:propose_patch may open managed worktrees for granted source roots and mutate files inside them (write/edit) with MANDATORY checkpoint tracking — the widget-visibility early return and the global allowUntrackedMutation escape never apply to peers. Direct checkout mutation by peers is denied (WorkspaceMutationAuthorityError). Peer worktree ownership is tracked in a process-local fail-closed registry (src/peer/workspace-guard.ts): peers may only mutate worktrees they opened, granted-source re-check runs at every mutation, list_managed_worktrees filters to the caller peer's own entries, and ownership does not survive restart (re-open re-records). Peer worktrees are capped per peer by KONTROL_PEER_MAX_ACTIVE_SESSIONS on top of the existing managed-worktree limits. staged_file_write remains worker-role-bound and unusable by peers.
+- Only C1 (peer-initiated calls to approved Kontrol tools, now including isolated worktree mutation) is implemented. C2 (durable outbound job protocol) and C3 (verified hosted-Muse-agent activation) are follow-on milestones and must never be claimed from VM-process evidence. workspace:run_bounded and job:* capabilities remain reserved.
+
 ## Child DOX Index
 
 | Path | Purpose |

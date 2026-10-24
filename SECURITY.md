@@ -54,3 +54,23 @@ but behavior there may change without notice.
 
 See [the security model](docs/security.md) for filesystem, authentication,
 process, tunnel, and review-boundary guidance.
+
+## Peer credential hygiene
+
+When the opt-in [peer integration](docs/peer-integration.md) is enabled, the peer
+listener authenticates separately from the OAuth owner token and the ACP
+agent/reviewer/adapter secrets. Peer credentials never grant reviewer or worker
+authority, and the default peer profile is read-only inspection.
+
+- Store only the SHA-256 credential hash in the registry — never the plaintext
+  secret that the peer presents as `<credentialId>:<secret>`.
+- Keep `KONTROL_PEER_CREDENTIAL_FILE` mode `0600` or `0400`; the server refuses
+  group- or other-readable registry files at startup.
+- Treat peer credentials as live secrets. Revoke a compromised or rotated
+  credential by writing a `revokedAt` (or past `expiresAt`) into the registry —
+  the server hot-reloads it without a restart. Include only hashes in any
+  security report; never include a peer secret or its presenting token.
+- Limit each descriptor's `grantedRoots` to the narrowest directories it needs,
+  all inside `KONTROL_ALLOWED_ROOTS`, and assign only the capabilities the peer
+  actually needs. Mutating (`propose_patch`, `run_bounded`) and `job:*`
+  capabilities are reserved follow-on milestones and are not active yet.
