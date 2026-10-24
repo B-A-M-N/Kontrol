@@ -44,6 +44,7 @@ import {
   type ToolCatalogFingerprint,
 } from "./tool-catalog-handshake.js";
 import { registerPolicyTools } from "../policy-tools.js";
+import { registerPeerStatusTool } from "../peer/peer-tools.js";
 import { registerBridgeTools } from "../acp-bridge.js";
 // P1.3 decomposition: shared helpers live in focused modules. The names are
 // re-exported below so existing importers of ./mcp/workspace-server.js keep
@@ -429,6 +430,17 @@ export function createMcpServer(
       mutationReceipts,
     });
   }
+
+  // M5 WebUI visibility: reviewer/owner peer-status projection. The tool is
+  // never in a peer capability profile (peer/tool-profile.ts) and the peer
+  // execution guard denies it; the handler additionally denies peer/worker
+  // roles, so registering it on the peer listener too stays harmless while
+  // the catalog filter keeps it out of peer tools/list.
+  registerPeerStatusTool(server, {
+    config,
+    principalRole: connectionContext?.authenticatedRole ?? "client",
+    store: getPeerJobStore(),
+  });
 
   if (workSessions && config.acpEnabled && eventStore && reviewWorkflow && liveWaiters) {
     const bridgeConfig: Parameters<typeof registerBridgeTools>[1] = {

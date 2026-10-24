@@ -17,7 +17,8 @@ export type ToolName =
   | "poll_process"
   | "submit_for_review"
   | "submit_to_coding_agent"
-  | "open_approval_center";
+  | "open_approval_center"
+  | "list_peer_status";
 
 export type HostContext = NonNullable<ReturnType<App["getHostContext"]>>;
 
@@ -99,7 +100,8 @@ export function isToolName(value: unknown): value is ToolName {
     value === "poll_process" ||
     value === "submit_for_review" ||
     value === "submit_to_coding_agent" ||
-    value === "open_approval_center"
+    value === "open_approval_center" ||
+    value === "list_peer_status"
   );
 }
 

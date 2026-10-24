@@ -47,6 +47,8 @@ export interface PeerJobStore {
   getJob(jobId: string): PeerJob | undefined;
   listJobsForPeer(peerId: string, opts?: { includeTerminal?: boolean }): PeerJob[];
   getAttempt(attemptId: string): PeerAttempt | undefined;
+  /** Read-only projection: shallow copy of the attempts for a job, newest last. Never hands out live mutable internals. */
+  listAttemptsForJob(jobId: string): PeerAttempt[];
   claimNextJob(peerId: string, now: number, opts?: { taskClass?: string }): { job: PeerJob; attempt: PeerAttempt } | undefined;
   markStarted(attemptId: string, claimToken: string, peerId: string, now: number, remoteExecutionId?: string): { job: PeerJob; attempt: PeerAttempt };
   /** Peer affirmatively reports it never began the claimed attempt (fenced). */
@@ -220,11 +222,17 @@ export function openPeerJobStore(stateDir: string, logging: LoggingConfig): Peer
       const includeTerminal = opts?.includeTerminal ?? false;
       return jobs.filter(
         (job) => job.peerId === peerId && (includeTerminal || !isTerminalJobStatus(job.status)),
-      );
+      ).map((job) => ({ ...job }));
     },
 
     getAttempt(attemptId) {
       return attempts.find((candidate) => candidate.attemptId === attemptId);
+    },
+
+    listAttemptsForJob(jobId) {
+      return attempts
+        .filter((candidate) => candidate.jobId === jobId)
+        .map((attempt) => ({ ...attempt, receipt: attempt.receipt ? { ...attempt.receipt } : undefined }));
     },
 
     claimNextJob(peerId, now, opts) {

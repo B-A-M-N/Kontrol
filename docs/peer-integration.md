@@ -156,6 +156,29 @@ No artifact staging and no review binding yet: a `result_received` job's
 manifest is validated and stored, but artifacts are not staged into review
 checkpoints. C3 (hosted Muse-agent activation) remains unclaimed.
 
+## Reviewer/owner visibility (`list_peer_status`, M5)
+
+The owner/reviewer MCP surface registers a read-only tool `list_peer_status`
+(src/peer/peer-tools.ts). Roles: the **owner (authenticated `client`) and
+`reviewer`** may call it; **peer and worker sessions are denied** at the
+handler (`Forbidden: list_peer_status requires owner or reviewer authority.`),
+in addition to the tool never appearing in any peer capability profile
+(src/peer/tool-profile.ts) and being denied by the peer execution guard.
+
+What it shows: listener state (`enabled`, `bindHost`, `port`), enrolled peers
+(`id`, `credentialId`, `capabilities`, `grantedRoots`), durable jobs with
+status, honest per-status `displayHint` (e.g. `result_received` is labeled
+"NOT an approvable review submission"), latest-attempt `actorClass` /
+`outcomeCertainty`, per-status counts, and honesty notes.
+
+Deliberately excluded — never in the output: `claimToken`, `credentialHash`,
+raw job `instructions`. Credential liveness/revocation is registry-
+authoritative (`KONTROL_PEER_CREDENTIAL_FILE`) and hot-reloads; the tool's
+notes restate that `muse_vm_process` results are never evidence of C3 (hosted
+Muse-agent) execution and that peer delivery alone approves nothing — approval
+authority remains with the existing reviewer workflow. The WebUI consumes this
+surface for display only; it is not an authority path.
+
 ## Muse-specific notes
 
 The peer feature targets **Meta's hosted consumer Muse at `muse.ai`** — not

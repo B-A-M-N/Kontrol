@@ -34,6 +34,7 @@ export interface ToolDisplay {
 }
 
 export function workspacePayloadText(card: ToolResultCard): string {
+  if (card.tool === "list_peer_status") return peerStatusPayloadText(card.summary);
   const agentsFiles = card.agentsFiles ?? [];
   const availableAgentsFiles = card.availableAgentsFiles ?? [];
   const skills = card.skills ?? [];
@@ -63,6 +64,33 @@ export function formatAgentsFilesForPayload(
       return content ? `${path}\n\n${content}` : `${path}\n\nNo content loaded.`;
     })
     .join("\n\n");
+}
+
+/** Compact honest summary for list_peer_status cards (consumer-only). */
+function peerStatusPayloadText(summary: Record<string, unknown> | undefined): string {
+  const data = (summary ?? {}) as {
+    peer?: { enabled?: boolean; bindHost?: string; port?: number };
+    peers?: Array<{ id?: string; capabilities?: string[] }>;
+    jobs?: Array<{ status?: string; displayHint?: string; actorClass?: string }>;
+    counts?: Record<string, number>;
+  };
+  const peer = data.peer ?? {};
+  const lines = [
+    `Peer listener: ${peer.enabled ? "enabled" : "disabled"}${peer.bindHost ? ` @ ${peer.bindHost}:${peer.port ?? "?"}` : ""}`,
+    `Peers: ${(data.peers ?? []).map((entry) => `${entry.id ?? "?"} (${entry.capabilities?.length ?? 0} capabilities)`).join(", ") || "none"}`,
+  ];
+  const byStatus = new Map<string, string[]>();
+  for (const job of data.jobs ?? []) {
+    if (job.status === undefined) continue;
+    const bucket = byStatus.get(job.status) ?? [];
+    bucket.push(job.displayHint ?? job.actorClass ?? "");
+    byStatus.set(job.status, bucket);
+  }
+  for (const [status, hints] of byStatus) {
+    lines.push(`${status} x${hints.length}${hints[0] ? ` — ${hints[0]}` : ""}`);
+  }
+  if (byStatus.size === 0) lines.push("Jobs: none");
+  return lines.join("\n");
 }
 
 export function getPatchToolDisplay(card: ToolResultCard, label: string): ToolDisplay {
@@ -118,6 +146,8 @@ export function getToolDisplay(card: ToolResultCard): ToolDisplay {
       return { icon: agentIcon(), title: "Coding Agent", label, tone: "agent" };
     case "open_approval_center":
       return { icon: reviewIcon(), title: "Approval Center", label, tone: "agent" };
+    case "list_peer_status":
+      return { icon: agentIcon(), title: "Peer Status", label, tone: "agent" };
   }
 }
 

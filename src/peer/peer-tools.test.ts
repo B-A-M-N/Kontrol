@@ -1,0 +1,241 @@
+/**
+ * M5 tests for src/peer/peer-tools.ts (list_peer_status): role gating,
+ * secret exclusion, honest labels, peerId filtering, disabled config.
+ * Style: plain tsx script with node:assert/strict, fakeServer harness like
+ * src/bridge-flow.test.ts.
+ */
+import assert from "node:assert/strict";
+import { registerPeerStatusTool } from "./peer-tools.js";
+import type { PeerStatusToolDeps } from "./peer-tools.js";
+import type { PeerDescriptor } from "./config-types.js";
+import type { PeerJob, PeerAttempt, PeerJobResultReceipt } from "./jobs/contracts.js";
+
+function fakeServer(): {
+  registerTool: (n: string, c: unknown, h: (a: any) => any) => undefined;
+  handlers: Map<string, (a: any) => any>;
+  configs: Map<string, any>;
+} {
+  const handlers = new Map<string, (a: any) => any>();
+  const configs = new Map<string, any>();
+  return {
+    registerTool: (name, cfg, handler) => {
+      configs.set(name, cfg);
+      handlers.set(name, handler);
+    },
+    handlers,
+    configs,
+  };
+}
+
+const descriptor: PeerDescriptor = {
+  id: "meta-muse",
+  credentialId: "v1",
+  credentialHash: "a".repeat(64),
+  capabilities: ["workspace:inspect", "job:claim"],
+  grantedRoots: ["/home/you/projects/demo"],
+};
+
+function jobFixture(overrides: Partial<PeerJob>): PeerJob {
+  return {
+    jobId: "job_a",
+    peerId: "meta-muse",
+    repositoryId: "/repo",
+    baseRevision: "0".repeat(40),
+    taskClass: "read_only_audit",
+    instructionHash: "h",
+    instructions: "SECRET-INSTRUCTION-BODY",
+    allowedOutputs: ["out"],
+    maxRuntimeMs: 1000,
+    maxArtifactBytes: 100,
+    status: "pending",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    ...overrides,
+  };
+}
+
+function attemptFixture(overrides: Partial<PeerAttempt>): PeerAttempt {
+  return {
+    attemptId: "att_a",
+    jobId: "job_a",
+    claimToken: "0".repeat(64),
+    claimOwnerPeerId: "meta-muse",
+    generation: 1,
+    createdAt: "2026-01-01T00:00:01.000Z",
+    leaseExpiresAt: "2026-01-01T00:01:01.000Z",
+    outcomeCertainty: "unknown",
+    status: "active",
+    ...overrides,
+  };
+}
+
+function receiptFixture(attemptId: string): PeerJobResultReceipt {
+  return {
+    jobId: "job_a",
+    attemptId,
+    actorClass: "muse_vm_process",
+    baseRevision: "0".repeat(40),
+    manifestSha256: "m",
+    files: [],
+    totalBytes: 0,
+    terminalState: "succeeded",
+  };
+}
+
+interface StoreFixture {
+  stateDir: string;
+  jobsByPeer: Map<string, PeerJob[]>;
+  attemptsByJob: Map<string, PeerAttempt[]>;
+  listJobsForPeer: (peerId: string, opts?: { includeTerminal?: boolean }) => PeerJob[];
+  listAttemptsForJob: (jobId: string) => PeerAttempt[];
+}
+
+function storeFixture(jobs: PeerJob[], attempts: PeerAttempt[]): StoreFixture {
+  const jobsByPeer = new Map<string, PeerJob[]>();
+  for (const job of jobs) {
+    jobsByPeer.set(job.peerId, [...(jobsByPeer.get(job.peerId) ?? []), job]);
+  }
+  const attemptsByJob = new Map<string, PeerAttempt[]>();
+  for (const attempt of attempts) {
+    attemptsByJob.set(attempt.jobId, [...(attemptsByJob.get(attempt.jobId) ?? []), attempt]);
+  }
+  return {
+    stateDir: "/tmp/fixture",
+    jobsByPeer,
+    attemptsByJob,
+    listJobsForPeer: (peerId) => jobsByPeer.get(peerId) ?? [],
+    listAttemptsForJob: (jobId) => (attemptsByJob.get(jobId) ?? []).map((attempt) => ({ ...attempt })),
+  };
+}
+
+function deps(overrides: Partial<PeerStatusToolDeps> & { principalRole: PeerStatusToolDeps["principalRole"] }): PeerStatusToolDeps {
+  return { config: { peer: undefined }, store: undefined, ...overrides };
+}
+
+function register(d: PeerStatusToolDeps) {
+  const server = fakeServer();
+  registerPeerStatusTool(server as any, d);
+  return server.handlers.get("list_peer_status")!;
+}
+
+// --- (a) owner (client) role, full output with injected store fixture ---------
+{
+  const jobPending = jobFixture({ jobId: "job_pending", status: "pending" });
+  const jobAwaiting = jobFixture({ jobId: "job_awaiting", status: "awaiting_reconciliation" });
+  const attemptWithReceipt = attemptFixture({
+    jobId: "job_awaiting",
+    attemptId: "att_receipt",
+    status: "completed",
+    outcomeCertainty: "terminal_verified",
+    receipt: receiptFixture("att_receipt"),
+  });
+  const attemptExpired = attemptFixture({ jobId: "job_awaiting", attemptId: "att_expired", status: "expired" });
+  const store = storeFixture([jobPending, jobAwaiting], [attemptExpired, attemptWithReceipt]);
+  const handler = register(deps({ principalRole: "client", config: { peer: { enabled: true, bindHost: "127.0.0.1", port: 7677, credentialFile: "/x", maxActiveSessions: 1, maxClaimedJobs: 1, requestBytesLimit: 1, allowedPeers: [descriptor] } as any }, store: store as any }));
+  const result = await handler({});
+  assert.ok(!result.isError, JSON.stringify(result));
+  const out = result.structuredContent;
+  assert.equal(out.peer.enabled, true);
+  assert.equal(out.peer.bindHost, "127.0.0.1");
+  assert.equal(out.peer.port, 7677);
+  assert.equal(out.peers.length, 1);
+  assert.deepEqual(out.peers[0], { id: "meta-muse", credentialId: "v1", capabilities: ["workspace:inspect", "job:claim"], grantedRoots: ["/home/you/projects/demo"] });
+  assert.equal((out.peers[0] as Record<string, unknown>).credentialHash, undefined, "credentialHash must never appear");
+  assert.equal(out.jobs.length, 2);
+  const pendingRow = out.jobs.find((job: any) => job.jobId === "job_pending");
+  const awaitingRow = out.jobs.find((job: any) => job.jobId === "job_awaiting");
+  assert.equal(pendingRow.displayHint, "awaiting_peer_poll (requires Muse-side pickup)");
+  assert.equal(pendingRow.actorClass, undefined);
+  assert.equal(awaitingRow.displayHint, "requires_owner_reconciliation");
+  assert.equal(awaitingRow.actorClass, "muse_vm_process", "actorClass from newest receipt");
+  assert.equal(awaitingRow.outcomeCertainty, "terminal_verified", "certainty from latest attempt");
+  assert.equal(out.counts.pending, 1);
+  assert.equal(out.counts.awaitingReconciliation, 1);
+  assert.equal(out.counts.staging, 0, "staging counted explicitly (0 today)");
+  assert.equal(out.counts.awaitingReview, 0, "awaiting_review counted explicitly (0 today)");
+  assert.match(result.content[0].text, /Peer listener: enabled; 1 enrolled peer\(s\); 2 active job\(s\)\./);
+}
+
+// --- (b) reviewer role allowed -------------------------------------------------
+{
+  const handler = register(deps({ principalRole: "reviewer" }));
+  const result = await handler({});
+  assert.ok(!result.isError, "reviewer may call list_peer_status");
+  assert.deepEqual(result.structuredContent.peer, { enabled: false });
+}
+
+// --- (c) peer role denied; worker role denied ----------------------------------
+for (const role of ["peer", "worker"] as const) {
+  const handler = register(deps({ principalRole: role }));
+  const result = await handler({});
+  assert.ok(result.isError, `${role} must be denied`);
+  assert.match(result.content[0].text, /Forbidden: list_peer_status requires owner or reviewer authority\./);
+}
+
+// --- (d) disabled config --------------------------------------------------------
+{
+  const handler = register(deps({ principalRole: "client" }));
+  const result = await handler({});
+  assert.ok(!result.isError);
+  assert.deepEqual(result.structuredContent.peer, { enabled: false });
+  assert.deepEqual(result.structuredContent.peers, []);
+  assert.deepEqual(result.structuredContent.jobs, []);
+  assert.deepEqual(result.structuredContent.counts, { pending: 0, claimed: 0, running: 0, awaitingReconciliation: 0, resultReceived: 0, staging: 0, awaitingReview: 0, terminal: 0 });
+}
+
+// --- (e) deep scan: no secrets anywhere in the JSON ----------------------------
+{
+  const job = jobFixture({ status: "result_received" });
+  const attempt = attemptFixture({ status: "completed", outcomeCertainty: "terminal_verified", receipt: receiptFixture("att_a") });
+  const store = storeFixture([job], [attempt]);
+  const handler = register(deps({ principalRole: "client", config: { peer: { enabled: true, bindHost: "127.0.0.1", port: 7677, credentialFile: "/x", maxActiveSessions: 1, maxClaimedJobs: 1, requestBytesLimit: 1, allowedPeers: [descriptor] } as any }, store: store as any }));
+  const result = await handler({});
+  const json = JSON.stringify(result);
+  assert.ok(!json.includes("claimToken"), "no claimToken key");
+  assert.ok(!json.includes("0".repeat(64)), "no raw claim token bytes");
+  assert.ok(!json.includes("credentialHash"), "no credentialHash key");
+  assert.ok(!json.includes("a".repeat(64)), "no credential hash bytes");
+  assert.ok(!json.includes("SECRET-INSTRUCTION-BODY"), "no raw instructions");
+}
+
+// --- (f) peerId filter + unknown peerId error ----------------------------------
+{
+  const otherDescriptor: PeerDescriptor = { ...descriptor, id: "other-peer", credentialId: "v2" };
+  const jobA = jobFixture({ jobId: "job_a", peerId: "meta-muse" });
+  const jobB = jobFixture({ jobId: "job_b", peerId: "other-peer" });
+  const store = storeFixture([jobA, jobB], []);
+  const handler = register(deps({
+    principalRole: "client",
+    config: { peer: { enabled: true, bindHost: "127.0.0.1", port: 7677, credentialFile: "/x", maxActiveSessions: 1, maxClaimedJobs: 1, requestBytesLimit: 1, allowedPeers: [descriptor, otherDescriptor] } as any },
+    store: store as any,
+  }));
+  const filtered = await handler({ peerId: "other-peer" });
+  assert.equal(filtered.structuredContent.jobs.length, 1);
+  assert.equal(filtered.structuredContent.jobs[0].peerId, "other-peer");
+  const unknown = await handler({ peerId: "not-enrolled" });
+  assert.ok(unknown.isError, "unknown peerId must error");
+  assert.match(unknown.content[0].text, /unknown peerId/);
+}
+
+// --- (g) displayHint + honest notes --------------------------------------------
+{
+  const job = jobFixture({ jobId: "job_rr", status: "result_received" });
+  const store = storeFixture([job], []);
+  const handler = register(deps({ principalRole: "client", config: { peer: { enabled: true, bindHost: "127.0.0.1", port: 7677, credentialFile: "/x", maxActiveSessions: 1, maxClaimedJobs: 1, requestBytesLimit: 1, allowedPeers: [descriptor] } as any }, store: store as any }));
+  const result = await handler({});
+  const out = result.structuredContent;
+  assert.equal(out.jobs[0].displayHint, "result received; NOT an approvable review submission");
+  const notes = out.notes.join("\n");
+  assert.match(notes, /actorClass reflects only what the peer reported; muse_vm_process results are never evidence of hosted-Muse-agent \(C3\) execution/);
+  assert.match(notes, /peer delivery alone approves nothing\./);
+  assert.match(notes, /registry-authoritative — the operator-owned credential registry JSON file that the KONTROL_PEER_CREDENTIAL_FILE environment variable names — and hot-reloads/);
+}
+
+// --- read-only registration metadata -------------------------------------------
+{
+  const server = fakeServer();
+  registerPeerStatusTool(server as any, deps({ principalRole: "client" }));
+  assert.equal(server.configs.get("list_peer_status").annotations.readOnlyHint, true);
+  assert.equal(server.configs.get("list_peer_status").title, "List peer status");
+}
+
+console.log("peer-tools: all assertions passed");
