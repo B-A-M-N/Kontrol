@@ -768,6 +768,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     peerApp = createPeerHttpApp({
       config,
       registry: peerRegistry,
+      isShuttingDown: () => shuttingDown,
       handleMcpRequest: (req, res) => {
         void handleMcpHttpRequest(peerMcpDeps, req, res);
       },
@@ -1059,11 +1060,28 @@ export async function runServer(config = loadConfig()): Promise<void> {
         // Socket never became ours; resource cleanup below remains authoritative.
       }
       await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+      // Stop the peer job reaper and close the job store before the shared
+      // close() — a job-route teardown failure must never mask the original
+      // bind failure.
+      try {
+        const peerJobRoutesHandle = (peerApp?.locals as { peerJobRoutesHandle?: { close?: () => void } } | undefined)?.peerJobRoutesHandle;
+        peerJobRoutesHandle?.close?.();
+      } catch {
+        // Resource cleanup below remains authoritative.
+      }
       await close();
       if (ownsRuntimeLock) await releaseRuntimeLock(runtimeLock);
       throw new Error(`kontrol peer listener failed to bind ${config.peer.bindHost}:${config.peer.port}: ${error instanceof Error ? error.message : String(error)}`);
     }
     closePeerHttpServer = () => new Promise<void>((resolve) => {
+      // Stop the peer job reaper and close the job store (guarded: a close
+      // failure never breaks socket shutdown).
+      try {
+        const peerJobRoutesHandle = (peerApp?.locals as { peerJobRoutesHandle?: { close?: () => void } } | undefined)?.peerJobRoutesHandle;
+        peerJobRoutesHandle?.close?.();
+      } catch {
+        // Socket shutdown below remains authoritative.
+      }
       if (!peerHttpServer!.listening) {
         resolve();
         return;

@@ -14,6 +14,7 @@ import type { ServerConfig } from "../config.js";
 import { logEvent, requestPath } from "../logger.js";
 import { requestLogFields } from "../mcp/workspace-server.js";
 import { createPeerAuthMiddleware, type PeerCredentialRegistry } from "../peer/auth.js";
+import { registerPeerJobRoutes } from "../peer/jobs/routes.js";
 import {
   MCP_HTTP_BODY_LIMIT_BYTES,
   rejectOversizedBody,
@@ -25,6 +26,8 @@ export interface PeerHttpAppDeps {
   readonly registry: PeerCredentialRegistry;
   /** Bound MCP request handler (handleMcpHttpRequest with peer-listener deps). */
   readonly handleMcpRequest: (req: Request, res: Response) => void;
+  /** Returns true while the process is shutting down (job claims refused). */
+  readonly isShuttingDown?: () => boolean;
 }
 
 export function createPeerHttpApp(deps: PeerHttpAppDeps): Express {
@@ -93,8 +96,22 @@ export function createPeerHttpApp(deps: PeerHttpAppDeps): Express {
 
   app.all("/mcp", (req: Request, res: Response) => deps.handleMcpRequest(req, res));
 
-  // M1 exposes no /peer job endpoints yet; authenticated 404 keeps the shape
-  // explicit for the follow-on outbound job protocol.
+  // M3 durable peer-pull job protocol (C2, honestly labeled). The job store
+  // is opened on the first registerPeerJobRoutes call and kept as a
+  // module-level singleton; store lifecycle binds to the process and the
+  // durable sidecar (stateDir/peer-jobs.json, atomic temp-write+rename)
+  // makes restart safe. peerAuth above already guards /peer/*.
+  // The routes handle is retained on app.locals so the server shutdown and
+  // candidate-rollback paths can stop the lease reaper and close the store.
+  (app.locals as Record<string, unknown>).peerJobRoutesHandle = registerPeerJobRoutes(app, {
+    registry: deps.registry,
+    config: { stateDir: config.stateDir, peer },
+    logging: config.logging,
+    isShuttingDown: deps.isShuttingDown,
+  });
+
+  // Any /peer endpoint not explicitly mounted above keeps its authenticated
+  // 404 shape.
   app.use("/peer", (_req: Request, res: Response) => {
     res.status(404).json({ error: { code: "not_found", message: "Unknown peer endpoint" } });
   });

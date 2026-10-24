@@ -24,6 +24,7 @@ export const toolNames = {
   shell: "bash",
   pollProcess: "poll_process",
   writeStdin: "write_stdin",
+  enqueuePeerJob: "enqueue_peer_job",
 } as const;
 
 /**

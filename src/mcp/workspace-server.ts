@@ -7,10 +7,16 @@
  * lifecycle remain in src/server.ts.
  */
 import { performance } from "node:perf_hooks";
+import { createHash } from "node:crypto";
+import { realpath } from "node:fs/promises";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod/v4";
 import type { ServerConfig } from "../config.js";
+import { assertAllowedPath, expandHomePath } from "../roots.js";
+import { peerGrantsRoot, peerPrincipalFromDescriptor } from "../peer/principal.js";
+import { getPeerJobStore } from "../peer/jobs/store.js";
+import { enforcePeerJobsCap, MAX_INSTRUCTION_BYTES, normalizeAllowedOutputs } from "../peer/jobs/service.js";
 import type { PolicyEngine } from "../policy.js";
 import type { WorkspaceRegistry } from "../workspaces.js";
 import type { createReviewCheckpointManager } from "../review-checkpoints.js";
@@ -309,6 +315,96 @@ export function createMcpServer(
   // Process polling is available in every tool mode. This is the recovery
   // surface for a minimal-mode bash call whose original HTTP request ended.
   registerProcessPollingTool(server, config, workspaces, processSessions, workSessions, connectionContext);
+
+  // Owner-side enqueue for the M3 durable peer-pull job protocol (C2). This
+  // tool is NEVER in any peer tool profile (see peer/tool-profile.ts), so it
+  // is hidden from peer tools/list and denied by the peer execution guard;
+  // the handler additionally enforces owner-only authority so a worker,
+  // reviewer, or peer session can never enqueue even with a stale catalog.
+  server.registerTool(toolNames.enqueuePeerJob, {
+    title: "Enqueue peer job",
+    description:
+      "Owner-only: enqueue a durable, peer-scoped job for a granted peer to claim over the peer job protocol. "
+      + "instructions is delivered to the peer verbatim (capped at 256 KiB); allowedOutputs declares the RELATIVE path prefixes the peer's result manifest may contain (empty set allows no file outputs; \"*\" is the explicit match-all escape).",
+    inputSchema: {
+      peerId: z.string().min(1).describe("Operator-assigned peer identity from the credential registry."),
+      repositoryId: z.string().min(1).describe("Workspace root for the job; canonicalized against KONTROL_ALLOWED_ROOTS and the peer's grantedRoots."),
+      baseRevision: z.string().min(1).describe("Immutable git SHA or snapshot identity the job is based on."),
+      taskClass: z.enum(["read_only_audit", "propose_patch", "bounded_execution"]),
+      instructions: z.string().min(1).describe("UTF-8 instruction text delivered verbatim to the peer (max 256 KiB)."),
+      allowedOutputs: z.array(z.string().min(1)).min(1).describe("REQUIRED relative path prefixes the result manifest may contain (e.g. [\"out/\"]); [\"*\"] allows everything."),
+      maxRuntimeMs: z.number().int().positive().max(3_600_000).optional().describe("Runtime budget in ms (default 600000, max 3600000)."),
+      maxArtifactBytes: z.number().int().positive().max(16_777_216).optional().describe("Result artifact byte cap (default 1048576, max 16777216)."),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  }, async (args) => {
+    const denied = (text: string) => ({ content: [{ type: "text" as const, text }], isError: true as const });
+    // Owner authority FIRST: exactly an authenticated client on the owner
+    // listener may enqueue. Peer/worker/reviewer sessions are denied even if
+    // a stale catalog advertised the tool.
+    if (connectionContext?.authenticatedRole !== "client") {
+      return denied("Forbidden: enqueue_peer_job is owner-only.");
+    }
+    const peer = config.peer;
+    if (!peer) return denied("Peer integration is not enabled (no peer configuration).");
+    const descriptor = peer.allowedPeers.find((candidate) => candidate.id === args.peerId);
+    if (!descriptor) return denied(`Forbidden: peerId ${JSON.stringify(args.peerId)} is not in the peer credential registry.`);
+    if (Buffer.byteLength(args.instructions, "utf8") > MAX_INSTRUCTION_BYTES) {
+      return denied(`instructions exceed the ${MAX_INSTRUCTION_BYTES}-byte cap.`);
+    }
+    let allowedOutputs: string[];
+    try {
+      allowedOutputs = normalizeAllowedOutputs(args.allowedOutputs);
+    } catch (error) {
+      return denied(`Invalid allowedOutputs: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    // Canonicalize the repository root exactly like open_workspace does:
+    // resolve against the server's allowed roots, then realpath to the
+    // canonical root. Descriptors always come from config — never from the
+    // caller.
+    let canonicalRoot: string;
+    try {
+      canonicalRoot = await realpath(assertAllowedPath(expandHomePath(args.repositoryId), config.allowedRoots));
+    } catch {
+      return denied(`Forbidden: repositoryId ${JSON.stringify(args.repositoryId)} is outside the server's allowed roots or does not exist.`);
+    }
+    const peerPrincipal = peerPrincipalFromDescriptor(descriptor);
+    if (!peerGrantsRoot(peerPrincipal, canonicalRoot)) {
+      return denied(`Forbidden: peer ${descriptor.id} is not granted access to workspace root ${canonicalRoot}.`);
+    }
+    const store = getPeerJobStore();
+    if (!store) return denied("Peer integration is not enabled (no peer job store).");
+    try {
+      enforcePeerJobsCap(store, descriptor.id, { peer: { maxClaimedJobs: peer.maxClaimedJobs } });
+    } catch (error) {
+      return denied(error instanceof Error ? error.message : String(error));
+    }
+    const job = store.createJob({
+      peerId: descriptor.id,
+      repositoryId: canonicalRoot,
+      baseRevision: args.baseRevision,
+      taskClass: args.taskClass,
+      instructionHash: createHash("sha256").update(args.instructions, "utf8").digest("hex"),
+      instructions: args.instructions,
+      allowedOutputs,
+      maxRuntimeMs: args.maxRuntimeMs ?? 600_000,
+      maxArtifactBytes: args.maxArtifactBytes ?? 1_048_576,
+    });
+    return {
+      content: [{
+        type: "text" as const,
+        text: JSON.stringify({
+          jobId: job.jobId,
+          status: job.status,
+          peerId: job.peerId,
+          repositoryId: job.repositoryId,
+          instructionHash: job.instructionHash,
+          maxRuntimeMs: job.maxRuntimeMs,
+          maxArtifactBytes: job.maxArtifactBytes,
+        }),
+      }],
+    };
+  });
 
   if (config.toolMode === "codex") {
     // P1-02: scheduled read-only execution policy is enforced at the tool boundary.
