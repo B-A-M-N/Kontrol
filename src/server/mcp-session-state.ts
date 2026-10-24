@@ -32,11 +32,13 @@ export interface McpSessionState {
   sessionId: string;
   sessionLabel: string;
   logicalClientId: string;
-  identitySource: "instance_header" | "conversation" | "oauth" | "client_info_fallback";
-  authenticatedRole: "worker" | "reviewer" | "client";
+  identitySource: "instance_header" | "conversation" | "oauth" | "client_info_fallback" | "peer";
+  authenticatedRole: "worker" | "reviewer" | "client" | "peer";
   /** Stable authenticated principal used to namespace durable owner identity. */
   authenticatedPrincipalId?: string;
-  authSource: "oauth" | "reviewer_token" | "worker_token" | "tunnel_reviewer" | "anonymous";
+  authSource: "oauth" | "reviewer_token" | "worker_token" | "tunnel_reviewer" | "peer_token" | "anonymous";
+  /** Listener that created this session; sessions never migrate between listeners. */
+  listenerKind?: "owner" | "peer";
   conversationId?: string;
   approvalCorrelationId?: string;
   /** Durable work session that authenticated this worker transport, if any. */
@@ -207,7 +209,7 @@ export interface WorkspaceAppResourceMetrics {
 export const MCP_HTTP_BODY_LIMIT_BYTES = 8 * 1024 * 1024;
 export const ACP_HTTP_BODY_LIMIT_BYTES = 4 * 1024 * 1024;
 
-export function rejectOversizedBody(limitBytes: number, protocol: "mcp" | "acp") {
+export function rejectOversizedBody(limitBytes: number, protocol: "mcp" | "acp" | "peer") {
   return (req: Request, res: Response, next: NextFunction): void => {
     const rawLength = req.header("content-length");
     const contentLength = rawLength === undefined ? undefined : Number(rawLength);
@@ -245,6 +247,12 @@ export function authenticatedAcpBodyGate(config: ServerConfig) {
 
 export interface RunningServer {
   app: Express;
+  /**
+   * Optional peer-facing app (KONTROL_PEER_ENABLED=1). It is bound as a second
+   * listener under the same runtime lock and shares every manager/DB handle;
+   * shutdown must close it alongside the owner listener.
+   */
+  peerApp?: Express;
   config: ServerConfig;
   dispatcher?: ContinuationDispatcher;
   close(): Promise<void>;
@@ -258,6 +266,13 @@ export function logicalClientIdentity(req: Request): { id: string; source: McpSe
   // so two conversations of the same client cannot touch each other's direct
   // processes or reattach to each other's pending approvals.
   const suppliedConversation = conversationId(req);
+  // A verified peer credential is a first-class authenticated identity: the
+  // logical client IS the peer principal. Unlike the OAuth branch, no
+  // conversation narrowing applies — user-supplied conversation correlation
+  // remains correlation only and never partitions or broadens peer identity.
+  if (req.peerPrincipal) {
+    return { id: req.peerPrincipal.principalId, source: "peer" };
+  }
   if (req.auth?.clientId) {
     return suppliedConversation
       ? { id: `oauth:${req.auth.clientId}|conversation:${suppliedConversation}`, source: "oauth" }

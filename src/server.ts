@@ -155,6 +155,8 @@ import {
 } from "./server/mcp-session-state.js";
 import { deriveAuth } from "./server/auth.js";
 import { createHttpApp, mountWorkspaceAppAssets } from "./server/app.js";
+import { createPeerHttpApp } from "./server/peer-app.js";
+import { PeerCredentialRegistry } from "./peer/auth.js";
 import { createWorkspaceAppResourceServer } from "./server/workspace-resource-route.js";
 // P1.2 decomposition: admission classes/weights/queue live in
 // src/server/mcp-admission.ts; session-state types, identity derivation, and
@@ -755,6 +757,23 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     reviewerTurnDispatcher,
   };
 
+  // Peer listener (M1): strictly opt-in, separately authenticated, sharing
+  // every manager/DB/session map with the owner app. The MCP handler is the
+  // same code path with isPeerListener set; req.peerPrincipal (attached by
+  // the peer middleware) drives all peer authorization.
+  let peerApp: import("express").Express | undefined;
+  if (config.peer) {
+    const peerRegistry = PeerCredentialRegistry.open(config.peer.credentialFile);
+    const peerMcpDeps: McpHttpDeps = { ...mcpHttpDeps, isPeerListener: () => true };
+    peerApp = createPeerHttpApp({
+      config,
+      registry: peerRegistry,
+      handleMcpRequest: (req, res) => {
+        void handleMcpHttpRequest(peerMcpDeps, req, res);
+      },
+    });
+  }
+
   const diagnosticsDeps = {
     config,
     mcpSessions,
@@ -888,6 +907,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
   });
   return {
     app,
+    peerApp,
     config,
     dispatcher,
     close: shutdown.close,
@@ -927,7 +947,7 @@ export async function runServer(config = loadConfig()): Promise<void> {
     if (ownsRuntimeLock) await releaseRuntimeLock(runtimeLock);
     throw error;
   }
-  const { app, close, drain } = serverResources;
+  const { app, peerApp, close, drain } = serverResources;
   const runtimeIdentity = createRuntimeIdentityRecord(
     buildMeta,
     process.argv.join(" "),
@@ -1007,10 +1027,69 @@ export async function runServer(config = loadConfig()): Promise<void> {
     if (ownsRuntimeLock) await releaseRuntimeLock(runtimeLock);
     throw new Error(`kontrol failed to listen on ${config.host}:${config.port}: ${error instanceof Error ? error.message : String(error)}`);
   });
+  let peerHttpServer: import("node:http").Server | undefined;
+  let closePeerHttpServer: (() => Promise<void>) | undefined;
+  if (peerApp && config.peer) {
+    peerHttpServer = peerApp.listen(config.peer.port, config.peer.bindHost);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const onListening = () => {
+          peerHttpServer!.off("error", onError);
+          resolve();
+        };
+        const onError = (error: Error) => {
+          peerHttpServer!.off("listening", onListening);
+          reject(error);
+        };
+        peerHttpServer!.once("listening", onListening);
+        peerHttpServer!.once("error", onError);
+      });
+      console.log(`peer listener: http://${config.peer.bindHost}:${config.peer.port}/mcp (authenticated peers only)`);
+    } catch (error) {
+      // Candidate launch rollback: close both listener objects and the
+      // shared app resources; never publish a healthy generation with only
+      // one of the configured listeners alive.
+      try {
+        if (peerHttpServer.listening) {
+          await new Promise<void>((resolve) => peerHttpServer!.close(() => resolve()));
+        } else {
+          peerHttpServer.closeAllConnections?.();
+        }
+      } catch {
+        // Socket never became ours; resource cleanup below remains authoritative.
+      }
+      await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+      await close();
+      if (ownsRuntimeLock) await releaseRuntimeLock(runtimeLock);
+      throw new Error(`kontrol peer listener failed to bind ${config.peer.bindHost}:${config.peer.port}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    closePeerHttpServer = () => new Promise<void>((resolve) => {
+      if (!peerHttpServer!.listening) {
+        resolve();
+        return;
+      }
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        resolve();
+      };
+      const deadline = setTimeout(() => {
+        (peerHttpServer as { closeAllConnections?: () => void }).closeAllConnections?.();
+        finish();
+      }, 5_000);
+      peerHttpServer!.close(() => {
+        clearTimeout(deadline);
+        finish();
+      });
+    });
+  }
+
   try {
     writeRuntimeIdentity(config.stateDir, runtimeIdentity);
     runtimeIdentityWritten = true;
   } catch (error) {
+    await closePeerHttpServer?.();
     await close();
     await new Promise<void>((resolve) => httpServer.close(() => resolve()));
     if (ownsRuntimeLock) await releaseRuntimeLock(runtimeLock);
@@ -1039,6 +1118,7 @@ export async function runServer(config = loadConfig()): Promise<void> {
           finish();
         });
       });
+      await closePeerHttpServer?.();
       await close();
       if (runtimeIdentityWritten) removeRuntimeIdentity(config.stateDir, runtimeIdentity.instanceId);
       if (ownsRuntimeLock) await releaseRuntimeLock(runtimeLock);

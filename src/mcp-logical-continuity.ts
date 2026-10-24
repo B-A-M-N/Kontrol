@@ -8,7 +8,10 @@
  * or reuses a transport.
  */
 
-export type TrustedMcpIdentitySource = "instance_header" | "conversation" | "oauth";
+// "peer" identities are registry-authenticated principals; like "oauth" they
+// are trusted logical identities, but they never merge with oauth/instance
+// records because the identity string itself is listener-scoped.
+export type TrustedMcpIdentitySource = "instance_header" | "conversation" | "oauth" | "peer";
 
 export interface LogicalContinuityAttachInput {
   identity: string;

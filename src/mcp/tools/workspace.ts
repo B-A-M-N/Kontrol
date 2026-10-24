@@ -71,6 +71,14 @@ import type { ToolEnvelope } from "../tool-envelope.js";
 import { processSessionOwnerId, type ConnectionContext } from "../connection-context.js";
 import { MISSING_FILE_VERSION, readFileVersion, withFileMutationLock } from "../../mutation-version.js";
 import { assertAllowedPath, expandHomePath } from "../../roots.js";
+import {
+  countPeerWorktrees,
+  peerMayProposePatches,
+  peerOwnsWorktree,
+  peerSensitivePathDenied,
+  peerWorkspaceDenied,
+  recordPeerWorktree,
+} from "../../peer/workspace-guard.js";
 
 export interface WorkspaceToolsDeps {
   readonly config: ServerConfig;
@@ -273,6 +281,29 @@ export function registerWorkspaceTools(
   const { config, workspaces, reviewCheckpoints, policyEngine, policyEnforcer, connectionContext, workSessions, trackToolEvent, prepareForMutation, processSessions, scheduledExecutionPolicyFor, recordPublicationIntent, recordPublicationReceipt, recordPublicationFailure, scheduledJobFor } = deps;
   const scheduledExecutionPolicy = (workSessionId: string | undefined) =>
     workSessionId && scheduledExecutionPolicyFor ? scheduledExecutionPolicyFor(workSessionId) : undefined;
+
+  /**
+   * Peer inspection guard (M1): peers are confined to owner-granted workspace
+   * roots, and credential/private-state paths (.env*, the Kontrol state dir,
+   * ~/.kontrol) are denied outright. Returns an error result to return, or
+   * undefined when the call may proceed. Owner/reviewer/worker connections
+   * are unaffected.
+   */
+  const peerInspectionDenied = (
+    workspace: { root: string; sourceRoot?: string },
+    absolutePath?: string,
+  ): { content: ReturnType<typeof textBlock>[]; isError: true } | undefined => {
+    if (connectionContext?.authenticatedRole !== "peer") return undefined;
+    // M2: worktree workspaces are granted against the SOURCE root; the
+    // worktree path itself lives under KONTROL_WORKTREE_ROOT.
+    const rootDenied = peerWorkspaceDenied(connectionContext, workspace.sourceRoot ?? workspace.root);
+    if (rootDenied) return { content: [textBlock(rootDenied)], isError: true };
+    if (absolutePath) {
+      const pathDenied = peerSensitivePathDenied(config, absolutePath);
+      if (pathDenied) return { content: [textBlock(pathDenied)], isError: true };
+    }
+    return undefined;
+  };
   const registeredToolNames = new Set<string>();
   const registeredTool = (name: string): string => {
     registeredToolNames.add(name);
@@ -372,7 +403,48 @@ export function registerWorkspaceTools(
         }
         openedWorkspace = await workspaces.openExistingWorkspace(workspaceSessionId, connectionContext.mcpSessionId);
       } else {
+        // Peer connections are confined to owner-granted workspace roots.
+        // This check runs BEFORE any workspace state is created so an
+        // unauthorized open leaves no side effects, and again AFTER resolve
+        // because grants are compared against the canonical resolved root,
+        // not the lexical request path.
+        if (connectionContext?.authenticatedRole === "peer") {
+          if (mode === "worktree" && !peerMayProposePatches(connectionContext)) {
+            return { content: [textBlock("Forbidden: peers may not create managed worktrees.")], isError: true };
+          }
+          const requestedRoot = expandHomePath(path);
+          const preDenied = peerWorkspaceDenied(connectionContext, requestedRoot);
+          if (preDenied) return { content: [textBlock(preDenied)], isError: true };
+          if (mode === "worktree") {
+            // M2: per-peer managed-worktree cap. Reuses KONTROL_PEER_MAX_ACTIVE_SESSIONS
+            // (config.peer.maxActiveSessions, normally the concurrent peer-session cap)
+            // as the per-peer worktree budget, counted from this peer's ownership
+            // registry — never from the global enumeration. The global and per-project
+            // managed worktree limits inside openWorktreeWorkspace (src/workspaces.ts)
+            // still apply on top of this — they are not bypassed.
+            const cap = config.peer?.maxActiveSessions;
+            const principalId = connectionContext.authenticatedPrincipalId;
+            if (cap !== undefined && principalId && countPeerWorktrees(principalId) >= cap) {
+              return { content: [textBlock(`Forbidden: peer managed-worktree cap reached (${cap} via KONTROL_PEER_MAX_ACTIVE_SESSIONS). Retire a managed worktree first.`)], isError: true };
+            }
+          }
+        }
         openedWorkspace = await workspaces.openWorkspace({ path, mode, baseRef }, connectionContext?.mcpSessionId);
+        if (connectionContext?.authenticatedRole === "peer") {
+          // For worktree mode the worktree path lives under KONTROL_WORKTREE_ROOT,
+          // so the grant check must compare against the SOURCE root the peer was
+          // granted, not the worktree path.
+          const grantRoot = openedWorkspace.workspace.sourceRoot ?? openedWorkspace.workspace.root;
+          const postDenied = peerWorkspaceDenied(connectionContext, grantRoot);
+          if (postDenied) return { content: [textBlock(postDenied)], isError: true };
+          // M2 P0 fix: record ownership so this peer can mutate this worktree
+          // and enumerate it. Applies to both the new-create path and any
+          // existing-workspace reuse path that emerges from openWorkspace.
+          if (openedWorkspace.workspace.mode === "worktree") {
+            const principalId = connectionContext.authenticatedPrincipalId;
+            if (principalId) recordPeerWorktree(openedWorkspace.workspace.id, principalId);
+          }
+        }
       }
       const { workspace, agentsFiles, availableAgentsFiles } = openedWorkspace;
       const gitEligibility = await getGitEligibility(workspace.root);
@@ -514,6 +586,24 @@ export function registerWorkspaceTools(
       }
       try {
         const page = await workspaces.listManagedWorktrees(before);
+        if (connectionContext?.authenticatedRole === "peer") {
+          // M2 P0 fix: peers must never observe other principals' worktree
+          // ids/paths/sourceRoots — the page is filtered to worktrees this
+          // peer opened in this process. Owner/reviewer/writer callers see
+          // the unfiltered page.
+          const principalId = connectionContext.authenticatedPrincipalId;
+          const filteredPage = {
+            ...page,
+            worktrees: page.worktrees.filter((entry) =>
+              principalId !== undefined
+              && typeof entry.workspaceId === "string"
+              && peerOwnsWorktree(entry.workspaceId, principalId)),
+          };
+          return {
+            content: [textBlock(JSON.stringify(filteredPage, null, 2))],
+            structuredContent: filteredPage,
+          };
+        }
         return {
           content: [textBlock(JSON.stringify(page, null, 2))],
           structuredContent: page,
@@ -688,6 +778,10 @@ export function registerWorkspaceTools(
         if (bindingErr) return bindingErr;
       }
       const readPath = workspaces.resolveReadPath(workspace, input.path, connectionContext?.mcpSessionId);
+      {
+        const peerDenied = peerInspectionDenied(workspace, readPath.absolutePath);
+        if (peerDenied) return peerDenied;
+      }
       if (policyEnforcer && policyEngine) {
         const approved = await enforceToolPolicy(
           workSessions,
@@ -1567,6 +1661,13 @@ export function registerWorkspaceTools(
         const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
         if (bindingErr) return bindingErr;
       }
+        {
+          const peerDenied = peerInspectionDenied(
+            workspace,
+            input.path ? workspaces.resolvePath(workspace, input.path) : undefined,
+          );
+          if (peerDenied) return peerDenied;
+        }
         const policyPath = input.path
           ? canonicalPolicyPath(workspace.root, input.path, workspaces.resolvePath(workspace, input.path))
           : undefined;
@@ -1687,6 +1788,13 @@ export function registerWorkspaceTools(
         const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
         if (bindingErr) return bindingErr;
       }
+        {
+          const peerDenied = peerInspectionDenied(
+            workspace,
+            input.path ? workspaces.resolvePath(workspace, input.path) : undefined,
+          );
+          if (peerDenied) return peerDenied;
+        }
         const policyPath = input.path
           ? canonicalPolicyPath(workspace.root, input.path, workspaces.resolvePath(workspace, input.path))
           : undefined;
@@ -1808,6 +1916,10 @@ export function registerWorkspaceTools(
         if (bindingErr) return bindingErr;
       }
         const resolvedPath = workspaces.resolvePath(workspace, input.path);
+        {
+          const peerDenied = peerInspectionDenied(workspace, resolvedPath);
+          if (peerDenied) return peerDenied;
+        }
         const policyPath = canonicalPolicyPath(workspace.root, input.path, resolvedPath);
         if (policyEnforcer && policyEngine) {
           const approved = await enforceToolPolicy(
@@ -1920,6 +2032,10 @@ export function registerWorkspaceTools(
       const workspace = workspaces.getWorkspace(workspaceId);
       const pathArgs = gitPathArg(workspaces, workspace, requestedPath);
       const absolutePath = requestedPath !== undefined ? workspaces.resolvePath(workspace, requestedPath) : undefined;
+      {
+        const peerDenied = peerInspectionDenied(workspace, absolutePath);
+        if (peerDenied) return peerDenied;
+      }
       if (policyEnforcer && policyEngine) {
         const approved = await enforceToolPolicy(
           workSessions,

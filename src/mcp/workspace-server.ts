@@ -29,7 +29,7 @@ import type { MutationReceiptStore } from "../mutation-receipts.js";
 import type { ReviewWorkflowService } from "../review-workflow.js";
 import type { LiveWaiterRegistry } from "../bridge/shared.js";
 import type { DatabaseHandle } from "../db/client.js";
-import { installCachedToolList, observeToolListDescriptors } from "../mcp-tool-list-cache.js";
+import { installCachedToolList, installToolListFilter, observeToolListDescriptors } from "../mcp-tool-list-cache.js";
 import {
   evaluateToolCatalogAcknowledgement,
   fingerprintToolCatalog,
@@ -55,6 +55,7 @@ import { registerWorkspaceTools } from "./tools/workspace.js";
 import { registerCodexProcessTools, registerProcessPollingTool } from "./tools/process.js";
 import type { ConnectionContext } from "./connection-context.js";
 import { mcpOwnerContextId } from "./owner-context.js";
+import { peerAllowedToolNames, peerToolProfileKey } from "../peer/tool-profile.js";
 
 // Public re-exports: ./mcp/workspace-server.js remains the import surface.
 export { constantTimeStringEqual, degradedAuditSnapshot, requestLogFields, readMcpServerVersion, readPackageVersion } from "./tool-logging.js";
@@ -214,14 +215,32 @@ export function createMcpServer(
     Boolean(reviewThreads),
     Boolean(reviewBrowserJobs),
   ]);
+  // Peer-restricted servers (authenticatedRole === "peer") expose only the
+  // owner-granted capability profile: unauthorized tools are hidden from
+  // tools/list AND rejected at execution if invoked by name despite a stale
+  // catalog. Owner-authorized servers keep the full catalog.
+  const peerTools = connectionContext?.authenticatedRole === "peer"
+    ? peerAllowedToolNames(connectionContext.peerCapabilities ?? [])
+    : undefined;
   const registerTool = server.registerTool.bind(server);
   server.registerTool = ((name, definition, callback) => {
     const key = `${toolRegistrationProfile}:${name}`;
+    const guardedCallback = peerTools
+      ? async (args: unknown, extra: unknown) => {
+          if (!peerTools.has(name)) {
+            return {
+              content: [{ type: "text" as const, text: `Forbidden: tool '${name}' is not in the granted peer capability profile.` }],
+              isError: true,
+            };
+          }
+          return (callback as (callArgs: unknown, callExtra: unknown) => unknown)(args, extra);
+        }
+      : callback;
     return registerTool(name, {
       ...definition,
       inputSchema: normalizeAndCacheToolSchema(toolSchemaCache!, `${key}:input`, definition.inputSchema),
       outputSchema: normalizeAndCacheToolSchema(toolSchemaCache!, `${key}:output`, definition.outputSchema),
-    }, callback);
+    }, guardedCallback as typeof callback);
   }) as typeof server.registerTool;
 
   let toolCatalogFingerprint: ToolCatalogFingerprint | undefined;
@@ -234,10 +253,13 @@ export function createMcpServer(
   );
   const toolListCacheInstallation = installCachedToolList(
     server,
-    `${config.toolMode}|${config.widgets}|${config.skillsEnabled ? "skills" : "no-skills"}|${config.acpEnabled ? "acp" : "no-acp"}|${policyEngine ? "policy" : "no-policy"}|surface:${mcpToolSurface.version}`,
+    `${config.toolMode}|${config.widgets}|${config.skillsEnabled ? "skills" : "no-skills"}|${config.acpEnabled ? "acp" : "no-acp"}|${policyEngine ? "policy" : "no-policy"}|surface:${mcpToolSurface.version}|${peerTools ? `peer:${peerToolProfileKey(connectionContext?.peerCapabilities)}` : "owner"}`,
     toolListDescriptorCache,
     ListToolsRequestSchema,
   );
+  const peerFilterInstallation = peerTools
+    ? installToolListFilter(server, ListToolsRequestSchema, (toolName) => peerTools.has(toolName))
+    : undefined;
   server.server.registerCapabilities({
     extensions: {
       [TOOL_CATALOG_ACK_CAPABILITY]: {
@@ -370,6 +392,12 @@ export function createMcpServer(
     console.warn("[kontrol] tools/list descriptor observation unavailable; serving uncached and rejecting catalog acknowledgements");
   }
   if (!descriptorCacheAvailable) console.warn("[kontrol] tools/list descriptor cache unavailable; serving uncached");
+  if (peerFilterInstallation && !peerFilterInstallation.finalizeRegistration()) {
+    // Fail closed: a peer session that cannot hide unauthorized tools from
+    // tools/list must not be served at all — the execution guard alone leaves
+    // a confusing catalog that advertises tools the peer can never call.
+    throw new Error("Peer tool catalog could not be restricted; refusing to create an unrestricted peer MCP server.");
+  }
   server.server.setNotificationHandler(ToolCatalogAcceptedNotificationSchema, async (notification) => {
     const expected = toolCatalogFingerprint;
     const received = notification.params;

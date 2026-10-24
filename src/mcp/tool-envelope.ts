@@ -19,6 +19,7 @@ import { toolNames } from "./tool-names.js";
 import { WorkspaceMutationAuthorityError, WorkspaceMutationBlockedError } from "./mutation-barrier.js";
 import type { ConnectionContext } from "./connection-context.js";
 import { assertWorkerWorkspaceBinding } from "./process-tool-response.js";
+import { peerMayProposePatches, peerOwnsWorktree, peerSensitivePathDenied, peerWorkspaceDenied } from "../peer/workspace-guard.js";
 
 export interface ToolEnvelopeDeps {
   readonly config: ServerConfig;
@@ -142,6 +143,72 @@ export function createToolEnvelope(deps: ToolEnvelopeDeps): ToolEnvelope {
     }
 
     const workspace = workspaces.getWorkspace(workspaceId);
+    if (connectionContext?.authenticatedRole === "peer") {
+      // M2: peers with workspace:propose_patch may mutate ONLY inside isolated
+      // managed worktrees — never the user's live checkout — and their
+      // mutations are always checkpoint-tracked and review-bound. Peers are
+      // non-reviewers: they can propose, never approve.
+      if (!peerMayProposePatches(connectionContext) || workspace.mode !== "worktree" || !workspace.worktree?.managed) {
+        throw new WorkspaceMutationAuthorityError(
+          workspaceId,
+          "workspace_binding_denied",
+          "Forbidden: peers may only mutate inside isolated managed worktrees; direct checkout edits are not permitted.",
+          false,
+        );
+      }
+      // M2 P0 fix: cross-principal and grant confinement hardening. Ownership
+      // is process-local (recorded at open_workspace time); the source-root
+      // grant is re-checked so a worktree whose sourceRoot lies outside this
+      // peer's granted roots is refused even if it was opened by a principal
+      // with wider grants. Messages stay generic — they never echo absolute
+      // sourceRoot/root paths.
+      const peerPrincipalId = connectionContext.authenticatedPrincipalId;
+      if (!peerPrincipalId || !peerOwnsWorktree(workspace.id, peerPrincipalId)) {
+        throw new WorkspaceMutationAuthorityError(
+          workspaceId,
+          "workspace_binding_denied",
+          "Forbidden: peers may only mutate worktrees they opened in this session.",
+          false,
+        );
+      }
+      const peerSourceRootDenied = peerWorkspaceDenied(connectionContext, workspace.sourceRoot ?? workspace.root);
+      if (peerSourceRootDenied) {
+        throw new WorkspaceMutationAuthorityError(
+          workspaceId,
+          "workspace_binding_denied",
+          "Forbidden: peer is not granted access to this worktree's source root.",
+          false,
+        );
+      }
+      const peerPathDenied = peerSensitivePathDenied(config, workspace.root);
+      if (peerPathDenied) {
+        throw new WorkspaceMutationAuthorityError(
+          workspaceId,
+          "workspace_binding_denied",
+          "Forbidden: peer access to this workspace path is denied.",
+          false,
+        );
+      }
+      // Peer checkpoint gate runs regardless of config.widgets and ignores
+      // config.allowUntrackedMutation: peer mutations must remain tracked even
+      // when the operator allowed untracked mutation for local clients.
+      try {
+        await reviewCheckpoints.awaitWorkspaceReady({ workspaceId, root: workspace.root });
+      } catch (error) {
+        throw new WorkspaceMutationBlockedError(
+          workspaceId,
+          `Workspace mutation is disabled because the review baseline could not be established: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+      const snapshotInfo = await reviewCheckpoints.getSnapshotInfo({ workspaceId, root: workspace.root });
+      if (!snapshotInfo.available) {
+        throw new WorkspaceMutationBlockedError(
+          workspaceId,
+          `Workspace mutation is disabled because the review baseline could not be established: ${snapshotInfo.diagnostic ?? "no usable checkpoint backend"}`,
+        );
+      }
+      return;
+    }
     if (connectionContext?.authenticatedRole === "worker") {
       const scheduledPolicy = scheduledExecutionPolicyFor?.(connectionContext.workSessionId ?? "");
       const stagedWrite = scheduledPolicy?.executionMode === "bounded_file_write"

@@ -1,6 +1,8 @@
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { expandHomePath } from "./roots.js";
+import { expandHomePath, isPathInsideRoot } from "./roots.js";
+import type { PeerServerConfig } from "./peer/config-types.js";
+import { loadPeerCredentialFile } from "./peer/credentials.js";
 import type { LoggingConfig, LogFormat, LogLevel } from "./logger.js";
 import type { OAuthConfig } from "./oauth-provider.js";
 import type { PolicyConfig } from "./policy.js";
@@ -163,6 +165,13 @@ export interface ServerConfig {
   mcpToolCatalogAckRequired?: boolean;
   /** Filesystem snapshot admission + retention limits (P0/P1 storage hardness). */
   fsSnapshot: FilesystemSnapshotConfig;
+  /**
+   * Optional, strictly opt-in peer listener configuration (e.g. for a Meta
+   * Muse integration). Undefined unless KONTROL_PEER_ENABLED=1. Peers are
+   * independently authenticated and scoped; this never changes AuthMode or
+   * owner/ACP credential behavior.
+   */
+  peer?: PeerServerConfig;
 }
 
 function parsePort(value: string | number | undefined): number {
@@ -523,6 +532,70 @@ function validateAcpSecrets(env: NodeJS.ProcessEnv): void {
   }
 }
 
+/**
+ * Peer listener configuration (M1). Parsed only when KONTROL_PEER_ENABLED=1;
+ * otherwise the feature is completely invisible and startup is unchanged.
+ * Every ambiguity is rejected at startup: missing port/credential file,
+ * wildcard binds, port collision with the main listener, an empty peer
+ * allowlist, or granted roots outside the configured allowed roots.
+ */
+function parsePeerConfig(
+  env: NodeJS.ProcessEnv,
+  allowedRoots: string[],
+  mainPort: number,
+): PeerServerConfig | undefined {
+  if (!parseBoolean(env.KONTROL_PEER_ENABLED)) return undefined;
+
+  const bindHost = env.KONTROL_PEER_BIND_HOST?.trim() || "127.0.0.1";
+  if (bindHost === "0.0.0.0" || bindHost === "::" || bindHost === "*" || bindHost === "0::") {
+    throw new Error(
+      `KONTROL_PEER_BIND_HOST=${bindHost} is a wildcard bind and is rejected. Bind a specific local or tailnet interface (for example a 100.x tailnet address) and put an explicitly protected HTTPS front end in front if remote exposure is required.`,
+    );
+  }
+
+  if (!env.KONTROL_PEER_PORT) {
+    throw new Error("KONTROL_PEER_PORT is required when KONTROL_PEER_ENABLED=1.");
+  }
+  const port = parsePositiveInteger(env.KONTROL_PEER_PORT, 0, "KONTROL_PEER_PORT");
+  if (port === mainPort) {
+    throw new Error(`KONTROL_PEER_PORT=${port} must differ from the main server port (${mainPort}).`);
+  }
+
+  const credentialFileRaw = env.KONTROL_PEER_CREDENTIAL_FILE?.trim();
+  if (!credentialFileRaw) {
+    throw new Error("KONTROL_PEER_CREDENTIAL_FILE is required when KONTROL_PEER_ENABLED=1.");
+  }
+  const credentialFile = resolve(expandHomePath(credentialFileRaw));
+  // Fail fast at startup: malformed registries and group/other-readable
+  // credential files are refused before any listener exists.
+  const { peers } = loadPeerCredentialFile(credentialFile);
+  if (peers.length === 0) {
+    throw new Error(`Peer credential registry ${credentialFile} contains no peers; refusing to start a peer listener with an empty allowlist.`);
+  }
+  const allowedPeers = peers.map((peer) => {
+    const grantedRoots = peer.grantedRoots.map((root) => resolve(expandHomePath(root)));
+    for (const root of grantedRoots) {
+      if (!allowedRoots.some((allowed) => isPathInsideRoot(root, allowed))) {
+        throw new Error(
+          `Peer "${peer.id}" grantedRoot ${root} is outside every configured allowed root; peer granted roots must be a subset of KONTROL_ALLOWED_ROOTS.`,
+        );
+      }
+    }
+    return { ...peer, grantedRoots };
+  });
+
+  return {
+    enabled: true,
+    bindHost,
+    port,
+    credentialFile,
+    maxActiveSessions: parsePositiveInteger(env.KONTROL_PEER_MAX_ACTIVE_SESSIONS, 8, "KONTROL_PEER_MAX_ACTIVE_SESSIONS"),
+    maxClaimedJobs: parsePositiveInteger(env.KONTROL_PEER_MAX_CLAIMED_JOBS, 8, "KONTROL_PEER_MAX_CLAIMED_JOBS"),
+    requestBytesLimit: parsePositiveInteger(env.KONTROL_PEER_REQUEST_BYTES_LIMIT, 1024 * 1024, "KONTROL_PEER_REQUEST_BYTES_LIMIT"),
+    allowedPeers,
+  };
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
   const files = loadKontrolFiles(env);
   validateAcpSecrets(env);
@@ -540,6 +613,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
   }
 
   const policy = loadPolicyConfig(env);
+  const allowedRoots = parseAllowedRoots(env.KONTROL_ALLOWED_ROOTS ?? files.config.allowedRoots);
   // Direct policy approvals exist independently from ACP. In tunnel mode the
   // only reviewer authority is the secret-backed tunnel assertion, so an
   // ask-capable policy without one can mint approval cards that no surface is
@@ -570,7 +644,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     host,
     port,
     oauth: parseOAuthConfig(env, files.auth.ownerToken, authMode === "oauth"),
-    allowedRoots: parseAllowedRoots(env.KONTROL_ALLOWED_ROOTS ?? files.config.allowedRoots),
+    allowedRoots: allowedRoots,
     allowedHosts: parseAllowedHosts(env.KONTROL_ALLOWED_HOSTS, derivedAllowedHosts),
     publicBaseUrl,
     authMode,
@@ -746,6 +820,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     mcpSessionHardCap: parsePositiveInteger(env.KONTROL_MCP_SESSION_HARD_CAP, 200, "KONTROL_MCP_SESSION_HARD_CAP"),
     mcpToolCatalogAckRequired: parseBoolean(env.KONTROL_MCP_REQUIRE_TOOL_CATALOG_ACK),
     fsSnapshot: parseFsSnapshotConfig(env),
+    peer: parsePeerConfig(env, allowedRoots, port),
   };
   const mcpConfig = config;
 

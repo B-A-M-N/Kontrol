@@ -152,3 +152,26 @@ export function installCachedToolList(
     metrics.unavailableReason = "SDK tools/list registration hook was not observed; descriptor caching is disabled";
   });
 }
+
+/**
+ * Filter the tools/list descriptor for a restricted registration profile (e.g.
+ * a peer capability profile). Installed like the cache/observer wrappers; the
+ * filter applies AFTER descriptor retrieval so cached descriptors stay
+ * profile-independent while each response exposes only permitted tools.
+ */
+export function installToolListFilter(
+  server: McpServer,
+  listToolsSchema: ZodType,
+  isVisible: (toolName: string) => boolean,
+): { finalizeRegistration(): boolean } {
+  return registrationInterceptor(server, listToolsSchema, (handler) => async (request, extra) => {
+    const descriptor = (await handler(request, extra)) as { tools?: Array<{ name?: unknown }> } | undefined;
+    if (descriptor && Array.isArray(descriptor.tools)) {
+      descriptor.tools = descriptor.tools.filter((tool) =>
+        typeof tool?.name === "string" && isVisible(tool.name));
+    }
+    return descriptor;
+  }, (metrics) => {
+    metrics.unavailableReason = "SDK tools/list registration hook was not observed; peer tool filtering is unavailable";
+  });
+}

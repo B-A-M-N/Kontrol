@@ -108,6 +108,12 @@ export interface McpHttpDeps {
   resourceServerUrl(): URL | undefined;
   oauthEnabled(): boolean;
   shuttingDown(): boolean;
+  /**
+   * True when this handler serves the separately-authenticated peer listener.
+   * Peer requests carry a registry-verified req.peerPrincipal instead of OAuth
+   * context; on the peer listener a missing peer principal is always rejected.
+   */
+  isPeerListener?: () => boolean;
   serveWorkspaceAppResource(res: Response, requestId: string | undefined, body: { id?: unknown; params?: { uri?: unknown } }, sessionless: boolean, clientKey: string, abortSignal: AbortSignal | undefined, acceptEncoding?: string | undefined, context?: { sessionId?: string; generationId?: string }): Promise<boolean>;
   createServerForSession(connectionContext: ConnectionContext): McpServer;
   supervisorWake(workSessionId: string): void;
@@ -704,33 +710,60 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
       });
     }
 
-    if (bearerAuth && !req.auth) {
-      await new Promise<void>((resolve, reject) => {
-        bearerAuth(req, res, (error?: unknown) => {
-          if (error) reject(error);
-          else resolve();
-        });
+    // Peer-authenticated requests (peer listener only) carry a registry-
+    // verified principal instead of OAuth context. The peer credential is the
+    // whole trust boundary: no OAuth resource assertion applies, and unsigned
+    // worker/reviewer/conversation headers are never evaluated for promotion.
+    const peerPrincipal = req.peerPrincipal;
+    if (peerPrincipal) {
+      logEvent(config.logging, "debug", "peer_request_authenticated", {
+        requestId,
+        peerId: peerPrincipal.peerId,
+        credentialId: peerPrincipal.credentialId,
+        method: req.method,
+        path: requestPath(req),
       });
-      if (res.headersSent) return;
-    }
-    if (bearerAuth) {
-      if (res.headersSent) return;
-      if (!req.auth?.resource || !checkResourceAllowed({ requestedResource: req.auth.resource, configuredResource: resourceServerUrl! })) {
+    } else {
+      if (bearerAuth && !req.auth) {
+        await new Promise<void>((resolve, reject) => {
+          bearerAuth(req, res, (error?: unknown) => {
+            if (error) reject(error);
+            else resolve();
+          });
+        });
+        if (res.headersSent) return;
+      }
+      if (bearerAuth) {
+        if (res.headersSent) return;
+        if (!req.auth?.resource || !checkResourceAllowed({ requestedResource: req.auth.resource, configuredResource: resourceServerUrl! })) {
+          logEvent(config.logging, "warn", "auth_denied", {
+            requestId,
+            method: req.method,
+            path: requestPath(req),
+            reason: "invalid_oauth_resource",
+            ...requestLogFields(req, config),
+          });
+          sendJsonRpcError(res, 401, -32001, "Unauthorized");
+          return;
+        }
+      } else if (config.authMode === "tunnel") {
+        // Tunnel mode is intentionally unauthenticated at the local MCP hop.
+        // The OpenAI Secure MCP Tunnel owns the external trust boundary. In
+        // particular, never let a stale KONTROL_TUNNEL_TOKEN or Authorization
+        // header turn this mode back into a second, unsynchronized auth gate.
+      }
+      if (deps.isPeerListener?.()) {
+        // Defense in depth: the peer middleware normally rejects unauthenticated
+        // requests before this handler runs; never serve one that slipped through.
         logEvent(config.logging, "warn", "auth_denied", {
           requestId,
           method: req.method,
           path: requestPath(req),
-          reason: "invalid_oauth_resource",
-          ...requestLogFields(req, config),
+          reason: "missing_peer_principal",
         });
         sendJsonRpcError(res, 401, -32001, "Unauthorized");
         return;
       }
-    } else if (config.authMode === "tunnel") {
-      // Tunnel mode is intentionally unauthenticated at the local MCP hop.
-      // The OpenAI Secure MCP Tunnel owns the external trust boundary. In
-      // particular, never let a stale KONTROL_TUNNEL_TOKEN or Authorization
-      // header turn this mode back into a second, unsynchronized auth gate.
     }
 
     // tunnel-client performs liveness and compatibility probes with an empty
@@ -774,7 +807,16 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
           return;
         }
         sessionState = mcpSessions.get(sessionId);
-        if (config.authMode === "oauth" && sessionState && sessionState.logicalClientId !== logicalClientId(req)) {
+        // Identity continuity: an authenticated session (OAuth owner or peer)
+        // may only be resumed by the same logical client. A peer session's
+        // logical client IS the peer principal, so a rotated/revoked
+        // credential - or an owner/peer token presented on the other listener
+        // - cannot attach to an existing session.
+        if (
+          sessionState
+          && (config.authMode === "oauth" || sessionState.authSource === "peer_token")
+          && sessionState.logicalClientId !== logicalClientId(req)
+        ) {
           logEvent(config.logging, "warn", "mcp_session_client_mismatch", {
             requestId,
             sessionIdPrefix: sessionIdPrefix(sessionId),
@@ -795,6 +837,19 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
           });
           sendJsonRpcError(res, 403, -32001, "MCP session belongs to another conversation");
           return;
+        }
+        if (sessionState?.listenerKind) {
+          const requestListenerKind: "owner" | "peer" = peerPrincipal ? "peer" : "owner";
+          if (sessionState.listenerKind !== requestListenerKind) {
+            logEvent(config.logging, "warn", "mcp_session_listener_mismatch", {
+              requestId,
+              sessionIdPrefix: sessionIdPrefix(sessionId),
+              expectedListener: sessionState.listenerKind,
+              actualListener: requestListenerKind,
+            });
+            sendJsonRpcError(res, 403, -32001, "MCP session belongs to another listener");
+            return;
+          }
         }
         if (
           config.mcpToolCatalogAckRequired === true
@@ -916,6 +971,25 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
             });
           }
         }
+        // Peer sessions are capped independently of the global session budget
+        // so a peer can never starve owner MCP traffic.
+        if (peerPrincipal && config.peer) {
+          const peerSessionCount = [...mcpSessions.values()].filter((entry) => entry.authSource === "peer_token").length;
+          if (peerSessionCount >= config.peer.maxActiveSessions) {
+            logEvent(config.logging, "warn", "mcp_session_rejected", {
+              requestId,
+              reason: "peer_session_limit_reached",
+              peerId: peerPrincipal.peerId,
+              current: peerSessionCount,
+              maxActiveSessions: config.peer.maxActiveSessions,
+            });
+            return res.status(503).json({
+              jsonrpc: "2.0",
+              id: (req.body as { id?: unknown } | undefined)?.id ?? null,
+              error: { code: -32000, message: "Peer session limit reached. Try again later." },
+            });
+          }
+        }
         // A generic clientInfo name/version is not a trustworthy owner: many
         // independent host transports can share it. Use only an instance,
         // conversation, or authenticated OAuth identity for aggressive caps.
@@ -962,6 +1036,7 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
                 authenticatedRole: connectionContext.authenticatedRole ?? "client",
                 authenticatedPrincipalId: connectionContext.authenticatedPrincipalId,
                 authSource: connectionContext.authSource ?? "anonymous",
+                listenerKind: peerPrincipal ? "peer" : "owner",
                 conversationId: requestConversationId,
                 approvalCorrelationId: clientIdentity.source === "client_info_fallback" ? undefined : clientId,
                 workSessionId: connectionContext.workSessionId,
@@ -1059,6 +1134,26 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
         // role. A caller that omits/forges the token is treated as a
         // reviewer/client and cannot acquire worker rights (P0 #3: role is no
         // longer client-controlled).
+        let connectionContext: ConnectionContext;
+        if (peerPrincipal) {
+          // Peer identity derives ONLY from the verified credential registry.
+          // Spoofed worker/reviewer/conversation headers are never evaluated
+          // on this path: a peer remains a peer and can never acquire worker
+          // lease, reviewer approval, or policy-grant authority.
+          connectionContext = {
+            authenticatedRole: "peer",
+            authSource: "peer_token",
+            authenticatedPrincipalId: peerPrincipal.principalId,
+            listenerKind: "peer",
+            peerCapabilities: peerPrincipal.capabilities,
+            peerGrantedRoots: peerPrincipal.grantedRoots,
+            conversationId: conversationId(req),
+            clientPlatformHint: (() => {
+              const name = (req.body as { params?: { clientInfo?: { name?: unknown } } } | undefined)?.params?.clientInfo?.name;
+              return typeof name === "string" ? name.slice(0, 200) : undefined;
+            })(),
+          };
+        } else {
         const workerToken = req.header("x-kontrol-worker-token");
         let verifiedClaims: WorkerTokenClaims | undefined;
         if (workerToken && config.acpAgentSecret) {
@@ -1096,8 +1191,9 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
         // they cannot be spoofed by the headers below. Unsigned attribution
         // headers are used ONLY when no token is present (a reviewer/client
         // reaching /mcp directly) and never grant worker rights.
-        const connectionContext: ConnectionContext = {
+        connectionContext = {
           authenticatedRole: verifiedClaims ? "worker" : (verifiedReviewer || verifiedTunnelReviewer || verifiedOAuthReviewer) ? "reviewer" : "client",
+          listenerKind: "owner",
           authSource: verifiedClaims
             ? "worker_token"
             : verifiedReviewer
@@ -1139,6 +1235,7 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
             return typeof name === "string" ? name.slice(0, 200) : undefined;
           })(),
         };
+        }
 
         const serverCreateStarted = performance.now();
         const server = createMcpServer(

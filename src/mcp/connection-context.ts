@@ -10,10 +10,21 @@ export interface ConnectionContext {
    * unsigned attribution headers (P0 #3). The unsigned headers below are for
    * logging/attribution only and grant no privileges.
    */
-  authenticatedRole?: "worker" | "reviewer" | "client";
-  authSource?: "oauth" | "reviewer_token" | "worker_token" | "tunnel_reviewer" | "anonymous";
+  authenticatedRole?: "worker" | "reviewer" | "client" | "peer";
+  authSource?: "oauth" | "reviewer_token" | "worker_token" | "tunnel_reviewer" | "peer_token" | "anonymous";
   /** Authenticated principal for durable client mutation identities. */
   authenticatedPrincipalId?: string;
+  /**
+   * Which HTTP listener accepted this connection. Sessions are bound to their
+   * listener at initialization; a session created on the peer listener can
+   * never be attached from the owner listener and vice versa, even if a
+   * session ID leaks.
+   */
+  listenerKind?: "owner" | "peer";
+  /** Owner-granted capabilities when authenticatedRole === "peer" (registry-derived). */
+  peerCapabilities?: readonly import("../peer/config-types.js").PeerCapability[];
+  /** Canonical workspace roots granted to this peer (registry-derived). */
+  peerGrantedRoots?: readonly string[];
   workspaceSessionId?: string;
   workSessionId?: string;
   runId?: string;
