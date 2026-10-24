@@ -11,6 +11,8 @@ import { createServer } from "./server.js";
 import { loadConfig } from "./config.js";
 import type { ServerConfig } from "./config.js";
 import { hashPeerCredential } from "./peer/credentials.js";
+import { SingleUserOAuthProvider } from "./oauth-provider.js";
+import { createPeerAuthMiddleware, PeerCredentialRegistry } from "./peer/auth.js";
 
 const PEER_ID = "meta-muse";
 const CREDENTIAL_ID = "v1";
@@ -366,6 +368,343 @@ async function peerDelete(sessionId: string): Promise<void> {
   }
   assert.ok(revoked, "revoked credential must deny the live session on its next request");
   console.log("peer-listener: mid-session credential revocation takes effect without restart");
+}
+
+// ---------------------------------------------------------------------------
+// Gap 4 (audit matrix "Secret leakage via child env, logs, review packet"):
+// raw peer token must never reach logs. The peer auth middleware logs warn
+// events via console.warn/error (peer_auth_failed / peer_auth_rate_limited)
+// and the request logger is disabled here, so intercept console output across
+// a successful auth, a failed auth with a wrong secret, and a revocation and
+// assert the raw secret bytes never appear while a credentialId form does.
+// ---------------------------------------------------------------------------
+{
+  function captureConsole(run: () => Promise<void>): Promise<string[]> {
+    const lines: string[] = [];
+    const original = { log: console.log, warn: console.warn, error: console.error };
+    console.log = (...args: unknown[]) => { lines.push(args.map((a) => String(a)).join(" ")); };
+    console.warn = (...args: unknown[]) => { lines.push(args.map((a) => String(a)).join(" ")); };
+    console.error = (...args: unknown[]) => { lines.push(args.map((a) => String(a)).join(" ")); };
+    try {
+      return run().then(
+        () => lines,
+        (error) => { lines.push("THREW: " + String(error)); return lines; },
+      );
+    } finally {
+      console.log = original.log;
+      console.warn = original.warn;
+      console.error = original.error;
+    }
+  }
+
+  // (a) Successful auth: begin a peer session, list tools, delete it.
+  // The prior revocation section left the registry revoked; re-enable so the
+  // successful-auth and failed-auth log paths see a live credential registry.
+  writeRegistry([
+    {
+      id: PEER_ID,
+      credentialId: CREDENTIAL_ID,
+      credentialHash: hashPeerCredential(CREDENTIAL_ID, SECRET),
+      capabilities: ["workspace:inspect"],
+      grantedRoots: [root],
+    },
+  ]);
+  const leakSession = await peerInitialize();
+  const leakLogs1 = await captureConsole(async () => {
+    await peerRpc("tools/list", {}, leakSession);
+  });
+  await peerDelete(leakSession);
+
+  // (b) Failed auth with a wrong secret.
+  const wrongToken = "Bearer " + CREDENTIAL_ID + ":" + randomBytes(24).toString("hex");
+  const leakLogs2 = await captureConsole(async () => {
+    await rpc(peerUrl, "initialize", {
+      protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "x", version: "1" },
+    }, { authorization: wrongToken });
+  });
+
+  // (c) Revocation of a live session (the log path used by peer_auth_failed).
+  const revokeSession = await peerInitialize();
+  writeRegistry([
+    {
+      id: PEER_ID,
+      credentialId: CREDENTIAL_ID,
+      credentialHash: hashPeerCredential(CREDENTIAL_ID, SECRET),
+      capabilities: ["workspace:inspect"],
+      grantedRoots: [root],
+      revokedAt: new Date().toISOString(),
+    },
+  ]);
+  const leakLogs3 = await captureConsole(async () => {
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline) {
+      const attempt = await peerRpc("tools/list", {}, revokeSession);
+      if (attempt.response.status === 401) break;
+      await new Promise((resolveSleep) => setTimeout(resolveSleep, 25));
+    }
+  });
+
+  const allLeakLog = leakLogs1.concat(leakLogs2, leakLogs3).join("\n");
+  assert.equal(allLeakLog.includes(SECRET), false,
+    "the raw peer secret must appear nowhere in logged output");
+  assert.equal(allLeakLog.includes(wrongToken), false,
+    "the exact wrong Authorization header must appear nowhere in logged output");
+  // A credentialId-only form in logs is acceptable (never the raw secret);
+  // the enforced property is that the secret bytes stay out.
+  assert.equal(allLeakLog.includes(CREDENTIAL_ID + ":" + SECRET), false,
+    "the full credentialId:secret token pair must never reach logs");
+
+  // Meaningful enforcement of the middleware "never logged" contract even when
+  // warn events are NOT filtered out: run the peer auth middleware directly at
+  // a warn cursor and capture console.warn during a failed auth. The raw
+  // secret is in scope for every request; if it leaked it would appear here.
+  const leakLogDir = mkdtempSync(join(tmpdir(), "kontrol-peer-leaklog-"));
+  const leakRegistryPath = join(leakLogDir, "leak-registry.json");
+  const leakSecret = randomBytes(24).toString("hex");
+  writeFileSync(leakRegistryPath, JSON.stringify({
+    version: 1,
+    peers: [{
+      id: PEER_ID,
+      credentialId: CREDENTIAL_ID,
+      credentialHash: hashPeerCredential(CREDENTIAL_ID, leakSecret),
+      capabilities: ["workspace:inspect"],
+      grantedRoots: [root],
+    }],
+  }, null, 2));
+  chmodSync(leakRegistryPath, 0o600);
+  const leakRegistry = PeerCredentialRegistry.open(leakRegistryPath);
+  const leakMiddleware = createPeerAuthMiddleware(leakRegistry, {
+    logging: { level: "warn" },
+  });
+  const res = { status: () => res, json: () => res } as unknown as { status: () => unknown; json: () => unknown };
+  let leakWarnLines: string[] = [];
+  await captureConsole(async () => {
+    leakMiddleware(
+      { header: () => "Bearer " + CREDENTIAL_ID + ":" + leakSecret.slice(0, 4) } as never,
+      res as never,
+      (() => {}) as never,
+    );
+  }).then((lines) => { leakWarnLines = lines; });
+  assert.ok(leakWarnLines.length > 0, "peer auth must emit a warn failure event at a warn cursor");
+  assert.equal(leakWarnLines.join("\n").includes(leakSecret), false,
+    "peer auth warn logs must never contain the raw secret at a warn cursor");
+  assert.equal(leakWarnLines.join("\n").includes(CREDENTIAL_ID + ":" + leakSecret), false,
+    "peer auth warn logs must never contain the full token pair");
+
+  console.log("peer-listener: raw peer token never reaches logs (auth, failure, revocation)");
+}
+
+// ---------------------------------------------------------------------------
+// Gap 3 (audit matrix "Parallel peer + ChatGPT MCP work"): with peer enabled
+// alongside the owner listener, open a peer session AND an owner session
+// concurrently, interleave requests, and assert catalog correctness, stable
+// peer identity, and no request hangs. This runs on the tunnel-mode `running`
+// server whose owner /mcp requires no bearer token.
+// ---------------------------------------------------------------------------
+{
+  // Re-enable the peer credential (the previous section's revocation is the
+  // terminal registry state) so the parallel sessions can authenticate.
+  writeRegistry([
+    {
+      id: PEER_ID,
+      credentialId: CREDENTIAL_ID,
+      credentialHash: hashPeerCredential(CREDENTIAL_ID, SECRET),
+      capabilities: ["workspace:inspect"],
+      grantedRoots: [root],
+    },
+  ]);
+  const peerSessionId = await peerInitialize();
+  const ownerInit = await rpc(ownerUrl, "initialize", {
+    protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "mcp:parallel-owner", version: "1.0.0" },
+  });
+  assert.ok(ownerInit.sessionId, "parallel owner session must initialize");
+  const ownerSessionId = ownerInit.sessionId!;
+
+  const ownerInitTools = await rpc(ownerUrl, "tools/list", {}, { "mcp-session-id": ownerSessionId });
+  const ownerInitNames: string[] = (ownerInitTools.payload?.result?.tools ?? []).map((t: { name: string }) => t.name);
+
+  const peerInitTools = await peerRpc("tools/list", {}, peerSessionId);
+  const peerInitNames: string[] = (peerInitTools.payload?.result?.tools ?? []).map((t: { name: string }) => t.name);
+
+  const ITERATIONS = 12;
+  for (let i = 0; i < ITERATIONS; i++) {
+    // Interleave peer then owner on every iteration, bounded by timeout so a
+    // hung request fails the test instead of stalling CI.
+    const peerResult = await Promise.race([
+      peerRpc("tools/list", {}, peerSessionId).then((r) => ({ ok: true, r })),
+      new Promise<{ ok: false; r?: never }>((resolvePromise) => setTimeout(
+        () => resolvePromise({ ok: false }),
+        1500,
+      )),
+    ]);
+    assert.equal(peerResult.ok, true, "parallel peer tools/list must not hang");
+    const peerNames: string[] = (peerResult.r!.payload?.result?.tools ?? [])
+      .map((t: { name: string }) => t.name);
+    assert.deepEqual([...peerNames].sort(), [...peerInitNames].sort(),
+      "peer catalog must be stable across interleaved owner/peer requests");
+
+    const ownerResult = await Promise.race([
+      rpc(ownerUrl, "tools/list", {}, { "mcp-session-id": ownerSessionId }).then((r) => ({ ok: true, r })),
+      new Promise<{ ok: false; r?: never }>((resolvePromise) => setTimeout(
+        () => resolvePromise({ ok: false }),
+        1500,
+      )),
+    ]);
+    assert.equal(ownerResult.ok, true, "parallel owner tools/list must not hang");
+    const ownerNames: string[] = (ownerResult.r!.payload?.result?.tools ?? [])
+      .map((t: { name: string }) => t.name);
+    assert.deepEqual([...ownerNames].sort(), [...ownerInitNames].sort(),
+      "owner catalog must be stable across interleaved owner/peer requests");
+  }
+
+  // Peer catalog never carries owner-only tools (re-check after interleave).
+  assert.ok(!peerInitNames.includes("write"), "parallel peer catalog must not expose owner-only tools");
+  assert.ok(!peerInitNames.includes("bash"), "parallel peer catalog must not expose owner-only tools");
+
+  // Peer session identity stays peer: an owner-only tool call is still denied
+  // for the peer even when interleaved with a working owner session.
+  const deniedWrite = await peerRpc("tools/call", {
+    name: "write", arguments: { workspaceId: "x", path: "x.txt", content: "x" },
+  }, peerSessionId);
+  assert.equal(deniedWrite.payload?.result?.isError, true,
+    "interleaved peer write (owner-only) must still be denied");
+  assert.match(JSON.stringify(deniedWrite.payload), /capability profile/,
+    "peer denial must carry the peer capability-profile message, not an owner result");
+
+  await fetch(ownerUrl, { method: "DELETE", headers: { "mcp-session-id": ownerSessionId } });
+  await peerDelete(peerSessionId);
+  console.log("peer-listener: parallel peer+owner sessions interleave without alias, escalation, or starvation");
+}
+
+// ---------------------------------------------------------------------------
+// Gap 2 (M1 review deferral): cross-port negatives repeated under oauth mode
+// to prove listner separation is mode-independent. Bring up a SECOND server
+// with KONTROL_AUTH_MODE=oauth + an owner listener, issue a real owner access
+// token via the same OAuth flow the production authorizer uses, and assert:
+//   (a) a valid peer bearer token on the owner /mcp initialize does NOT create
+//       a peer session (rejected by owner OAuth gate),
+//   (b) the owner token presented to the peer listener is rejected 401,
+//   (c) a peer session still behaves identically (one tools/list).
+// ---------------------------------------------------------------------------
+{
+  const oauthStateDir = mkdtempSync(join(tmpdir(), "kontrol-peer-oauth-state-"));
+  const oauthConfigDir = mkdtempSync(join(tmpdir(), "kontrol-peer-oauth-config-"));
+  const oauthWorktreeRoot = mkdtempSync(join(tmpdir(), "kontrol-peer-oauth-worktrees-"));
+  const ownerToken = "audit-oauth-owner-token-that-is-long-enough";
+
+  const oauthCredentialFile = writeRegistry([
+    {
+      id: PEER_ID,
+      credentialId: CREDENTIAL_ID,
+      credentialHash: hashPeerCredential(CREDENTIAL_ID, SECRET),
+      capabilities: ["workspace:inspect"],
+      grantedRoots: [root],
+    },
+  ]);
+
+  const oauthConfig: ServerConfig = loadConfig({
+    KONTROL_CONFIG_DIR: oauthConfigDir,
+    KONTROL_ALLOWED_ROOTS: root + "," + outsideRoot,
+    KONTROL_STATE_DIR: oauthStateDir,
+    KONTROL_WORKTREE_ROOT: oauthWorktreeRoot,
+    KONTROL_AUTH_MODE: "oauth",
+    KONTROL_OAUTH_OWNER_TOKEN: ownerToken,
+    KONTROL_ACP_ENABLED: "false",
+    KONTROL_POLICY_MODE: "allow",
+    KONTROL_LOG_LEVEL: "error",
+    KONTROL_LOG_REQUESTS: "0",
+    KONTROL_DIAGNOSTICS_SECRET: "peer-listener-oauth-secret",
+    KONTROL_PEER_ENABLED: "1",
+    KONTROL_PEER_BIND_HOST: "127.0.0.1",
+    KONTROL_PEER_PORT: "47655",
+    KONTROL_PEER_CREDENTIAL_FILE: oauthCredentialFile,
+  });
+
+  // Issue a real owner access token through the same provider the server uses
+  // (share the SQLite OAuth store on oauthStateDir). Mirrors policy-longevity.
+  const issuingProvider = new SingleUserOAuthProvider(
+    oauthConfig.oauth,
+    new URL("/mcp", oauthConfig.publicBaseUrl),
+    oauthStateDir,
+  );
+  const redirectUri = "http://127.0.0.1/oauth/callback";
+  const oauthClient = await issuingProvider.clientsStore.registerClient?.({
+    redirect_uris: [redirectUri],
+    client_name: "peer-listener oatuh audit",
+  });
+  assert.ok(oauthClient, "oauth client must register");
+  const authorizationCode = "peer-audit-" + randomBytes(8).toString("hex");
+  issuingProvider["codes"].set(authorizationCode, {
+    clientId: oauthClient.client_id,
+    params: {
+      redirectUri,
+      codeChallenge: "peer-audit-challenge",
+      scopes: ["kontrol"],
+      resource: new URL("/mcp", oauthConfig.publicBaseUrl),
+    },
+    expiresAtMs: Date.now() + 60_000,
+  });
+  const oauthTokens = await issuingProvider.exchangeAuthorizationCode(
+    oauthClient,
+    authorizationCode,
+    undefined,
+    redirectUri,
+    new URL("/mcp", oauthConfig.publicBaseUrl),
+  );
+  issuingProvider.close();
+  const ownerAccessToken = `Bearer ${oauthTokens.access_token}`;
+
+  const oauthRunning = createServer(oauthConfig);
+  assert.ok(oauthRunning.peerApp, "oauth-mode server must expose the peer app");
+  const oauthOwner = await listen(oauthRunning.app as unknown as Server);
+  const oauthPeer = await listen(oauthRunning.peerApp as unknown as Server, oauthConfig.peer!.bindHost);
+  const oauthOwnerUrl = "http://127.0.0.1:" + oauthOwner.port + "/mcp";
+  const oauthPeerUrl = "http://127.0.0.1:" + oauthPeer.port + "/mcp";
+
+  const initParams = { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "mcp:oauth-audit", version: "1.0.0" } };
+
+  // (a) A valid peer bearer token on the owner /mcp must NOT produce a peer
+  // session: owner OAuth gate rejects it (401) before any session binding.
+  const peerOnOwner = await rpc(oauthOwnerUrl, "initialize", initParams, { authorization: token });
+  assert.equal(peerOnOwner.response.status, 401,
+    "peer bearer token must be rejected by the oauth owner /mcp initialize");
+
+  // (b) The valid owner token presented to the peer listener is rejected 401.
+  const ownerOnPeerRaw = await rpc(oauthPeerUrl, "initialize", initParams, { authorization: "Bearer " + ownerToken });
+  assert.equal(ownerOnPeerRaw.response.status, 401,
+    "raw owner password must be rejected on the peer listener in oauth mode");
+  const ownerOnPeerAccess = await rpc(oauthPeerUrl, "initialize", initParams, { authorization: ownerAccessToken });
+  assert.equal(ownerOnPeerAccess.response.status, 401,
+    "an issued owner access token must be rejected on the peer listener in oauth mode");
+
+  // Owner path still works with its real access token (proves the mode works
+  // and the negatives above are not a broken switchboard).
+  const ownerAllowed = await rpc(oauthOwnerUrl, "initialize", initParams, { authorization: ownerAccessToken });
+  assert.equal(ownerAllowed.response.status, 200,
+    "valid owner access token must initialize on the oauth owner /mcp");
+  assert.ok(ownerAllowed.sessionId, "owner session created under oauth mode");
+
+  // (c) Peer session behaves identically under oauth mode: one tools/list.
+  const oauthPeerSession = await rpc(oauthPeerUrl, "initialize", initParams, { authorization: token });
+  assert.equal(oauthPeerSession.response.status, 200, "peer initialize must work in oauth mode");
+  assert.ok(oauthPeerSession.sessionId, "peer session created under oauth mode");
+  const oauthPeerTools = await rpc(oauthPeerUrl, "tools/list", {}, {
+    authorization: token,
+    "mcp-session-id": oauthPeerSession.sessionId,
+  });
+  assert.equal(oauthPeerTools.response.status, 200);
+  const oauthPeerNames: string[] = (oauthPeerTools.payload?.result?.tools ?? []).map((t: { name: string }) => t.name);
+  assert.ok(oauthPeerNames.includes("read"), "oauth-mode peer catalog must include read");
+  assert.ok(!oauthPeerNames.includes("write"), "oauth-mode peer catalog must not include owner-only tools");
+
+  await rpc(oauthOwnerUrl, "initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "flush", version: "1" } }, { authorization: ownerAccessToken });
+  await fetch(oauthOwnerUrl, { method: "DELETE", headers: { "mcp-session-id": ownerAllowed.sessionId! } });
+  await fetch(oauthPeerUrl, { method: "DELETE", headers: { "mcp-session-id": oauthPeerSession.sessionId!, authorization: token } });
+
+  await closeServer(oauthPeer.server);
+  await closeServer(oauthOwner.server);
+  await oauthRunning.close();
+  console.log("peer-listener: oauth-mode cross-port negatives hold in both directions; peer session works");
 }
 
 await closeServer(peerListener.server);
