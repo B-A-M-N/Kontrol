@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /** Validate and receipt the exact installed Caddy bridge configuration. */
 import { createHash, randomUUID } from "node:crypto";
-import { closeSync, mkdirSync, openSync, readFileSync, renameSync, fsyncSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, fsyncSync, writeFileSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { dirname, resolve } from "node:path";
@@ -133,6 +133,16 @@ export function createCaddyQualificationReceipt({ configText, configPath, caddyV
   };
 }
 
+/**
+ * Resolve the bridge header-strip contract from the built artifact when it
+ * exists, and from the TypeScript source otherwise.
+ */
+async function importBridgeStripHeaders() {
+  const built = new URL("../dist/ingress/proxy-context.js", import.meta.url);
+  if (existsSync(built)) return import(built.href);
+  return import(new URL("../src/ingress/proxy-context.ts", import.meta.url));
+}
+
 function childEnvironment() {
   const env = {};
   for (const key of ["PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TMP", "TEMP", "XDG_CONFIG_HOME", "XDG_DATA_HOME"]) {
@@ -177,7 +187,10 @@ async function main() {
   let adaptedConfig;
   try { adaptedConfig = JSON.parse(adaptedText); }
   catch { throw new Error("Caddy adapt did not return valid JSON"); }
-  const { BRIDGE_STRIP_HEADERS } = await import(new URL("../dist/ingress/proxy-context.js", import.meta.url));
+  // The strip-list contract lives with the source that enforces it. A
+  // release qualification reads the built artifact; a source-mode run reads
+  // the TypeScript source (the runner then executes this script with tsx).
+  const { BRIDGE_STRIP_HEADERS } = await importBridgeStripHeaders();
   const receipt = createCaddyQualificationReceipt({ configText, configPath, caddyVersion, bridgeNode, publicHost, expectedUpstream, expectedHost, buildId, requiredStripHeaders: BRIDGE_STRIP_HEADERS, adaptedConfig });
   persistReceipt(receiptPath, receipt);
   process.stdout.write(`Caddy config validated: ${receipt.configSha256}\nreceipt: ${resolve(receiptPath)}\n`);

@@ -75,9 +75,15 @@ function runGuard(guard) {
     }
   }
   const startedAt = Date.now();
+  const overrides = { KONTROL_INGRESS_QUALIFICATION: "1" };
+  // The toolchain environment allowlist drops every KONTROL_* key on purpose,
+  // so a guard's own toolchain override is re-added explicitly.
+  if (guard.toolchain?.envVar && process.env[guard.toolchain.envVar]) {
+    overrides[guard.toolchain.envVar] = process.env[guard.toolchain.envVar];
+  }
   const result = spawnSync(guard.command, guard.args, {
     cwd: root,
-    env: testHarnessEnvironment(process.env, { overrides: { KONTROL_INGRESS_QUALIFICATION: "1" } }),
+    env: testHarnessEnvironment(process.env, { overrides }),
     stdio: ["ignore", "pipe", "pipe"],
     encoding: "utf8",
     timeout: guardTimeoutMs,

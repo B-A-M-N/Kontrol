@@ -153,14 +153,21 @@ export const INGRESS_QUALIFICATION_SCENARIOS: readonly IngressMatrixScenario[] =
     guards: [
       TS("src/ingress/bridge-asset.test.ts"),
       MJS("scripts/qualify-caddy-bridge.test.mjs"),
+      MJS("scripts/bridge-route-isolation.test.mjs"),
       {
         command: "node",
-        args: ["scripts/qualify-caddy-bridge.mjs", "--config", "deploy/bridge/Caddyfile.example", "--bridge-node", "local-qualification", "--public-host", "kontrol.example.test", "--upstream", "127.0.0.1:7678", "--build-id", "local-qualification", "--receipt", ".tmp-scratch/ingress-caddy-qualification.json"],
+        args: ["--import", "tsx", "scripts/qualify-caddy-bridge.mjs", "--config", "deploy/bridge/Caddyfile.example", "--bridge-node", "local-qualification", "--public-host", "kontrol.example.com", "--upstream", "kontrol-node.tail-scale.ts.net:9443", "--build-id", "local-qualification", "--receipt", ".tmp-scratch/ingress-caddy-qualification.json"],
+        tier: "local_integration",
+        toolchain: { binary: "caddy", envVar: "KONTROL_CADDY_BIN" },
+      },
+      {
+        command: "node",
+        args: ["scripts/bridge-route-isolation.mjs", "--config", "deploy/bridge/Caddyfile.example", "--build-id", "local-qualification", "--receipt", ".tmp-scratch/ingress-bridge-isolation.json"],
         tier: "local_integration",
         toolchain: { binary: "caddy", envVar: "KONTROL_CADDY_BIN" },
       },
     ],
-    notes: "The caddy adapt/validate guard needs a Caddy binary; without one the scenario stays unverified instead of claiming a config proof.",
+    notes: "The caddy adapt/validate and route-isolation guards need a Caddy binary; without one the scenario stays unverified instead of claiming a config proof. The route-isolation guard runs the packaged configuration against a controlled upstream that answers 200 on EVERY path, so a proxy that forwarded forbidden routes would fail it.",
   },
   {
     id: "forged-forwarded-and-x-kontrol-headers",
