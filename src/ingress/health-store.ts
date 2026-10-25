@@ -147,11 +147,17 @@ export function classifyIngressHealth(input: {
   localListener?: boolean;
   externalExpected: boolean;
 }): IngressHealthState {
-  if (input.localListener === false || input.checks.daemon === false || input.checks.mapping === false) return "DOWN";
-  const missing = input.requiredChecks.some((key) => input.checks[key] !== true)
-    || (input.externalExpected && input.checks.externalHttps !== true);
+  const { checks } = input;
+  // An OBSERVED failure is classified by severity; a check that was never
+  // performed is merely unverified. A bridge whose upstream went away is
+  // DOWN, not "unverified", and a failed external check must never be
+  // mistaken for missing evidence.
+  if (input.localListener === false || checks.daemon === false || checks.mapping === false) return "DOWN";
+  if (input.externalExpected && checks.externalHttps === false) return "DOWN";
+  if (checks.sse === false || checks.longPost === false || checks.oauthChallenge === false) return "DEGRADED";
+  const missing = input.requiredChecks.some((key) => checks[key] !== true)
+    || (input.externalExpected && checks.externalHttps !== true);
   if (missing) return "UNVERIFIED";
-  if (input.checks.sse === false || input.checks.longPost === false || input.checks.oauthChallenge === false) return "DEGRADED";
   return "READY";
 }
 

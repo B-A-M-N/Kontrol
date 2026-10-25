@@ -143,6 +143,12 @@ export function validateIngressProfiles(profiles: readonly IngressProfile[], con
 
     // 6+7. Exhaustive kind/target/audience/runtime matrix. Every mismatch is
     // rejected here, not deferred to the planner or listener implementation.
+    //
+    // The kind/target/audience combination is ALWAYS checked: an impossible
+    // authority topology is invalid even for a standby profile. The runtime
+    // requirements (an enabled listener, a matching auth mode) apply to
+    // ENABLED profiles only, so a disabled standby profile can be declared
+    // without the deployment it would eventually need.
     const target: IngressListenerTarget = profile.target;
     if (target === "peer_listener") {
       if (profile.kind !== "tailscale_serve") {
@@ -151,7 +157,7 @@ export function validateIngressProfiles(profiles: readonly IngressProfile[], con
       if (profile.audience !== "peer") {
         fail(`profile "${profile.id}" targets peer_listener but has ${profile.audience} audience; peer_listener requires peer audience`);
       }
-      if (!(context.peerEnabled && context.hasPeerCredentials)) {
+      if (profile.enabled && !(context.peerEnabled && context.hasPeerCredentials)) {
         fail(`profile "${profile.id}" targets peer_listener but the peer listener is not enabled with credentials`);
       }
     } else if (target === "public_oauth_listener") {
@@ -162,7 +168,7 @@ export function validateIngressProfiles(profiles: readonly IngressProfile[], con
       if (profile.audience !== "owner_public") {
         fail(`profile "${profile.id}" targets public_oauth_listener but has ${profile.audience} audience; public_oauth_listener requires owner_public audience`);
       }
-      if (context.authMode !== "oauth") {
+      if (profile.enabled && context.authMode !== "oauth") {
         fail(`profile "${profile.id}" targets public_oauth_listener but the deployment is tunnel-mode; public ingress requires OAuth mode`);
       }
     } else {
@@ -172,7 +178,7 @@ export function validateIngressProfiles(profiles: readonly IngressProfile[], con
       if (profile.audience !== "owner_public") {
         fail(`profile "${profile.id}" targets secure_tunnel_listener but has ${profile.audience} audience`);
       }
-      if (context.authMode !== "tunnel") {
+      if (profile.enabled && context.authMode !== "tunnel") {
         fail(`profile "${profile.id}" targets secure_tunnel_listener but the deployment is oauth-mode; Secure MCP Tunnel requires a compatible tunnel deployment`);
       }
     }
