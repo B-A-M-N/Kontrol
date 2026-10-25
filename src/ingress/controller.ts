@@ -25,7 +25,7 @@ export interface IngressOperationReceipt {
   cliVersion: string | null;
   intendedRoute: IngressRouteIdentity;
   observedRoute?: IngressRouteIdentity;
-  failureClass?: "command_failed" | "mapping_mismatch" | "listener_unready" | "observation_unknown";
+  failureClass?: "command_failed" | "command_timed_out" | "serve_not_enabled" | "mapping_mismatch" | "listener_unready" | "observation_unknown";
 }
 interface IngressReceiptStore { version: 1; receipts: IngressOperationReceipt[] }
 export interface IngressControllerDependencies {
@@ -126,6 +126,36 @@ async function defaultExecute(args: string[]): Promise<TailscaleExecResult> {
   });
 }
 
+/**
+ * Classify a failed Tailscale mutation command.
+ *
+ * The Tailscale CLI prints the actionable reason on stdout or stderr and can
+ * hang (the serve command waits for a tailnet that has Serve disabled). The
+ * operator must see the actual reason — "Serve is not enabled on your
+ * tailnet" is an enablement task, not an opaque non-zero exit — so the
+ * classification is derived from the output, and the output itself is kept
+ * for the operator message.
+ */
+export function classifyCommandFailure(result: TailscaleExecResult): IngressOperationReceipt["failureClass"] {
+  const output = `${result.stdout}\n${result.stderr}`.toLowerCase();
+  if (result.exitCode === 124) return "command_timed_out";
+  if (output.includes("serve is not enabled") || output.includes("funnel is not enabled")) return "serve_not_enabled";
+  return "command_failed";
+}
+
+/** The operator-facing reason for a failed command, with no host paths. */
+export function commandFailureMessage(result: TailscaleExecResult): string {
+  const output = `${result.stdout}\n${result.stderr}`
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .slice(0, 4)
+    .join(" ");
+  // A Tailscale message can contain a node id and a login URL; both are
+  // operator-facing and contain no credential material.
+  return output.slice(0, 400);
+}
+
 function selectProfile(config: IngressConfigSource, profileId: string): IngressProfile {
   const profiles = config.ingress?.profiles ?? [];
   validateIngressProfiles(profiles, validationContextFromConfig(config));
@@ -222,9 +252,10 @@ export async function applyIngressProfile(config: IngressConfigSource, stateDir:
     if (result.exitCode !== 0) {
       // A non-zero exit does not prove that the daemon left its route
       // unchanged. Keep the intent active until a fresh status observation.
-      receipt.state = "reconciliation_required"; receipt.failureClass = "command_failed";
+      receipt.state = "reconciliation_required"; receipt.failureClass = classifyCommandFailure(result);
       commitReceipt(stateDir, store, receipt, deps);
-      throw new Error(`Tailscale ${profile.kind === "tailscale_funnel" ? "funnel" : "serve"} command failed (exit ${result.exitCode})`);
+      const reason = commandFailureMessage(result);
+      throw new Error(`Tailscale ${profile.kind === "tailscale_funnel" ? "funnel" : "serve"} command failed (exit ${result.exitCode}, ${receipt.failureClass})${reason ? `: ${reason}` : ""}`);
     }
     receipt.state = "command_completed";
     commitReceipt(stateDir, store, receipt, deps);
@@ -285,9 +316,10 @@ export async function disableIngressProfile(config: IngressConfigSource, stateDi
     commitReceipt(stateDir, store, receipt, deps);
     const result = await (deps.execute ?? defaultExecute)(offArgs(profile));
     if (result.exitCode !== 0) {
-      receipt.state = "reconciliation_required"; receipt.failureClass = "command_failed";
+      receipt.state = "reconciliation_required"; receipt.failureClass = classifyCommandFailure(result);
       commitReceipt(stateDir, store, receipt, deps);
-      throw new Error(`Tailscale route disable command failed (exit ${result.exitCode})`);
+      const reason = commandFailureMessage(result);
+      throw new Error(`Tailscale route disable command failed (exit ${result.exitCode}, ${receipt.failureClass})${reason ? `: ${reason}` : ""}`);
     }
     receipt.state = "command_completed";
     commitReceipt(stateDir, store, receipt, deps);

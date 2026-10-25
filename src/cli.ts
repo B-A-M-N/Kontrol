@@ -272,7 +272,14 @@ async function runIngressCommand(args: string[]): Promise<void> {
         ? await disableIngressProfile(config, config.stateDir, profileId)
         : await reconcileIngressProfile(config, config.stateDir, profileId);
     if (json) console.log(JSON.stringify({ operation: operation ?? null }, null, 2));
-    else console.log(operation ? `ingress ${operation.action} ${operation.profileId}: ${operation.state} (${operation.operationId})` : `ingress ${profileId}: no operation receipt`);
+    else {
+      // The failure class is the operator-facing reason: a route change that
+      // failed because the tailnet has Serve disabled must not read like an
+      // opaque non-zero exit.
+      console.log(operation
+        ? `ingress ${operation.action} ${operation.profileId}: ${operation.state}${operation.failureClass ? ` (${operation.failureClass})` : ""} (${operation.operationId})`
+        : `ingress ${profileId}: no operation receipt`);
+    }
     if (operation && ["failed", "reconciliation_required"].includes(operation.state)) process.exitCode = 1;
     return;
   }

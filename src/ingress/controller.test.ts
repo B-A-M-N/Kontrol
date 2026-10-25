@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { applyIngressProfile, disableIngressProfile, listIngressOperationReceipts, reconcileIngressProfile } from "./controller.js";
+import { applyIngressProfile, classifyCommandFailure, commandFailureMessage, disableIngressProfile, listIngressOperationReceipts, reconcileIngressProfile } from "./controller.js";
 import { parseServeMappings, type TailscaleFacts } from "./tailscale-status.js";
 import type { IngressConfigSource } from "./profile-status.js";
 import type { IngressProfile } from "./types.js";
@@ -116,6 +116,26 @@ try {
     assert.equal(recovered?.state, "applied");
     assert.equal(executeCount, 1, "recovery observes the original attempt and never runs a duplicate command");
   } finally { rmSync(interruptedDir, { recursive: true, force: true }); }
+
+  // A failed Tailscale command must be classified from its own output so
+  // the operator sees the actionable reason, not only an exit code. The
+  // serve command HANGS when the tailnet has Serve disabled, so a timeout is
+  // a distinct, meaningful class.
+  assert.equal(classifyCommandFailure({ stdout: "", stderr: "", exitCode: 124 }), "command_timed_out");
+  assert.equal(
+    classifyCommandFailure({ stdout: "Serve is not enabled on your tailnet.\nTo enable, visit:\nhttps://login.tailscale.com/f/serve?node=abc\n", stderr: "", exitCode: 1 }),
+    "serve_not_enabled",
+  );
+  assert.equal(
+    classifyCommandFailure({ stdout: "Funnel is not enabled on your tailnet.", stderr: "", exitCode: 1 }),
+    "serve_not_enabled",
+  );
+  assert.equal(classifyCommandFailure({ stdout: "", stderr: "permission denied", exitCode: 1 }), "command_failed");
+  assert.match(
+    commandFailureMessage({ stdout: "Serve is not enabled on your tailnet.\nTo enable, visit:\nhttps://login.tailscale.com/f/serve?node=abc", stderr: "", exitCode: 1 }),
+    /Serve is not enabled on your tailnet/,
+  );
+  assert.equal(commandFailureMessage({ stdout: "", stderr: "", exitCode: 1 }), "");
 
   console.log("ingress controller: apply/disable receipts and conflict fencing passed");
 } finally {
