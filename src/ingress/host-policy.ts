@@ -38,7 +38,8 @@ export function normalizeHostEntry(value: string): string {
   if (parsed.hostname === "") {
     throw new Error(`invalid host entry: ${value} is not a valid host`);
   }
-  const host = parsed.hostname.includes(":") ? `[${parsed.hostname}]` : parsed.hostname;
+  // WHATWG URL.hostname already brackets IPv6 literals ("[::1]"); use it verbatim.
+  const host = parsed.hostname;
   const port = STRIPPABLE_PORTS.has(parsed.port) ? "" : parsed.port;
   return port ? `${host}:${port}` : host;
 }
@@ -85,6 +86,58 @@ export function hostFromRequestHeader(rawHost: string | undefined, rawHeaders: r
   } catch (error) {
     return { error: error instanceof Error ? error.message : "invalid host" };
   }
+}
+
+/**
+ * True for "*" and for ANY textual spelling of the unspecified ("all
+ * interfaces") address: IPv4 "0.0.0.0", IPv6 "::", "::0", "0::",
+ * "0:0:0:0:0:0:0:0", the IPv4-mapped family ("::ffff:0.0.0.0",
+ * "::ffff:0:0", "0:0:0:0:0:ffff:0:0", "::0.0.0.0"), and bracketed forms.
+ * Every IPv6 literal is expanded to 8 hex groups (with "::" compression and
+ * embedded dotted-quad tails converted), then classified: all-zero →
+ * unspecified; ::ffff:0:0 (mapped with a zero embedded-v4 tail) also binds
+ * the IPv4 wildcard, so unspecified. Bind gates use this so an
+ * equivalent-but-differently-spelled wildcard cannot sneak past an
+ * exact-string check. Pure: no I/O.
+ */
+export function isUnspecifiedAddress(host: string): boolean {
+  const value = host.trim().toLowerCase();
+  if (value === "*") return true;
+  const literal = value.startsWith("[") && value.endsWith("]") ? value.slice(1, -1) : value;
+  if (literal === "0.0.0.0") return true;
+  if (!literal.includes(":")) return false;
+  // Embedded dotted-quad tail ("::ffff:127.0.0.1", "::0.0.0.0"): convert it
+  // to the two hex groups it denotes so the generic expansion below sees one
+  // uniform IPv6 form. A malformed tail is not an unspecified spelling.
+  let v6 = literal;
+  const v4Tail = v6.match(/:(\d{1,3}(?:\.\d{1,3}){3})$/);
+  if (v4Tail) {
+    const octets = v4Tail[1]!.split(".").map(Number);
+    if (octets.length !== 4 || octets.some((octet) => !Number.isInteger(octet) || octet > 255)) {
+      return false;
+    }
+    const hi = ((octets[0]! << 8) | octets[1]!).toString(16);
+    const lo = ((octets[2]! << 8) | octets[3]!).toString(16);
+    v6 = v6.slice(0, v6.length - v4Tail[1]!.length) + hi + ":" + lo;
+  }
+  // Expand "::" compression to exactly 8 groups.
+  const halves = v6.split("::");
+  if (halves.length > 2) return false; // more than one "::" is invalid
+  const left = halves[0] === "" ? [] : halves[0]!.split(":");
+  const right = halves.length === 2 ? (halves[1] === "" ? [] : halves[1]!.split(":")) : [];
+  if (left.some((group) => !/^[0-9a-f]{1,4}$/.test(group))) return false;
+  if (right.some((group) => !/^[0-9a-f]{1,4}$/.test(group))) return false;
+  const missing = 8 - left.length - right.length;
+  if (missing < 0) return false; // more than 8 groups
+  if (halves.length === 1 && missing !== 0) return false; // no "::" → exactly 8 groups required
+  const groups = [...left, ...Array<string>(missing).fill("0"), ...right];
+  if (groups.every((group) => parseInt(group, 16) === 0)) return true;
+  // IPv4-mapped "::ffff:0:0" also binds the IPv4 wildcard: groups 1-5 zero,
+  // group 6 = ffff, embedded v4 tail (groups 7-8) zero.
+  return groups.slice(0, 5).every((group) => parseInt(group, 16) === 0)
+    && parseInt(groups[5]!, 16) === 0xffff
+    && parseInt(groups[6]!, 16) === 0
+    && parseInt(groups[7]!, 16) === 0;
 }
 
 /**

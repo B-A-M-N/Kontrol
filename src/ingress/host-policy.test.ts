@@ -53,6 +53,9 @@ assert.deepEqual(ok, { host: "example.com:8443" }, "single host normalized");
 // --- isLoopbackHostValue ---
 assert.equal(isLoopbackHostValue("127.0.0.1"), true);
 assert.equal(isLoopbackHostValue("::1"), true);
+assert.equal(normalizeHostEntry("[::1]"), "[::1]");
+assert.equal(normalizeHostEntry("[::1]:8443"), "[::1]:8443");
+assert.equal(normalizeHostEntry("[2001:DB8::1]"), "[2001:db8::1]");
 assert.equal(isLoopbackHostValue("localhost"), true);
 assert.equal(isLoopbackHostValue("example.com"), false);
 assert.equal(isLoopbackHostValue("127.0.0.2"), false);

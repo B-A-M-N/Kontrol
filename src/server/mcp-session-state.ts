@@ -37,8 +37,12 @@ export interface McpSessionState {
   /** Stable authenticated principal used to namespace durable owner identity. */
   authenticatedPrincipalId?: string;
   authSource: "oauth" | "reviewer_token" | "worker_token" | "tunnel_reviewer" | "peer_token" | "anonymous";
-  /** Listener that created this session; sessions never migrate between listeners. */
-  listenerKind?: "owner" | "peer";
+  /**
+   * Listener that created this session; sessions never migrate between
+   * listeners. REQUIRED (P2-1): the fence in mcp-http.ts compares
+   * unconditionally, so an absent kind can never fail open.
+   */
+  listenerKind: "owner" | "peer" | "owner_public";
   conversationId?: string;
   approvalCorrelationId?: string;
   /** Durable work session that authenticated this worker transport, if any. */
@@ -253,6 +257,13 @@ export interface RunningServer {
    * shutdown must close it alongside the owner listener.
    */
   peerApp?: Express;
+  /**
+   * Optional public OAuth MCP app (KONTROL_PUBLIC_MCP_ENABLED=1, oauth mode
+   * only). Bound as a third listener under the same runtime lock; shares
+   * every manager/DB handle; shutdown must close it alongside the owner and
+   * peer listeners.
+   */
+  publicApp?: Express;
   config: ServerConfig;
   dispatcher?: ContinuationDispatcher;
   close(): Promise<void>;

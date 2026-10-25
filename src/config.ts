@@ -10,6 +10,7 @@ import { loadPolicyConfig, policyCanAsk } from "./policy.js";
 import { loadKontrolFiles } from "./user-config.js";
 import { DEFAULT_DIRECT_APPROVAL_REATTACH_GRACE_MS } from "./policy-approval-defaults.js";
 import { parseIngressProfilesEnv, validateIngressProfiles } from "./ingress/validate.js";
+import { isUnspecifiedAddress } from "./ingress/host-policy.js";
 import type { IngressConfig } from "./ingress/types.js";
 
 export type ToolMode = "minimal" | "full" | "codex";
@@ -174,6 +175,24 @@ export interface ServerConfig {
    * owner/ACP credential behavior.
    */
   peer?: PeerServerConfig;
+  /**
+   * Optional, strictly opt-in public OAuth MCP listener (P0-02). Undefined
+   * unless KONTROL_PUBLIC_MCP_ENABLED=1; loadConfig refuses any deployment
+   * that enables it outside authMode=oauth or with a wildcard bind host.
+   * Serves only the OAuth-authenticated /mcp surface for public ingress —
+   * the tunnel-mode owner listener is never exposed through it.
+   */
+  publicMcp?: {
+    enabled: true;
+    port: number;
+    bindHost: string;
+    /** Edge-limiter caps (F2-1): successful OAuth-surface requests per minute per req.ip. */
+    edgeOAuthSurfaceMaxPerMinute: number;
+    /** /mcp tool-traffic requests per minute per req.ip. */
+    edgeMcpMaxPerMinute: number;
+    /** POST /authorize attempts per sliding 5-minute window per req.ip before 429s. */
+    edgeAuthorizeMaxAttemptsPerWindow: number;
+  };
   /**
    * Optional, strictly opt-in ingress profile configuration (PR-A). Undefined
    * unless KONTROL_INGRESS_PROFILES is set. Purely declarative here: wiring
@@ -604,6 +623,68 @@ function parsePeerConfig(
   };
 }
 
+/**
+ * Public OAuth MCP listener configuration (P0-02). Parsed only when
+ * KONTROL_PUBLIC_MCP_ENABLED is "1"/"true"; otherwise the field stays
+ * undefined and startup is unchanged (no app, no listener, no behavior).
+ * Ambiguity fails fast at load with the stable "public_mcp_invalid: " prefix:
+ * enabling outside OAuth mode (the tunnel-mode owner listener is
+ * unauthenticated and must never be exposed), wildcard bind hosts, and
+ * out-of-range ports.
+ */
+function parsePublicMcpConfig(env: NodeJS.ProcessEnv, authMode: AuthMode): ServerConfig["publicMcp"] {
+  const enabled = env.KONTROL_PUBLIC_MCP_ENABLED?.trim().toLowerCase();
+  if (enabled !== "1" && enabled !== "true") return undefined;
+
+  const PREFIX = "public_mcp_invalid: ";
+  if (authMode !== "oauth") {
+    throw new Error(
+      `${PREFIX}public listener requires authMode=oauth; the tunnel-mode owner listener is unauthenticated and must never be exposed`,
+    );
+  }
+  const bindHost = env.KONTROL_PUBLIC_MCP_BIND_HOST?.trim() || "127.0.0.1";
+  if (isUnspecifiedAddress(bindHost)) {
+    throw new Error(
+      `${PREFIX}KONTROL_PUBLIC_MCP_BIND_HOST=${bindHost} is a wildcard bind and is rejected. The public listener faces externally proxied traffic; bind a specific (normally loopback) interface and let the ingress front end terminate public exposure.`,
+    );
+  }
+  // Prefixed inline port parse (P2-3): every public-listener rejection carries
+  // the stable prefix, including parse failures from parsePositiveInteger.
+  let port: number;
+  try {
+    port = parsePositiveInteger(env.KONTROL_PUBLIC_MCP_PORT, 7678, "KONTROL_PUBLIC_MCP_PORT");
+  } catch (error) {
+    throw new Error(`${PREFIX}${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (port < 1 || port > 65535) {
+    throw new Error(`${PREFIX}KONTROL_PUBLIC_MCP_PORT=${port} is outside the valid port range 1-65535.`);
+  }
+  const parseEdgeCap = (name: string, fallback: number): number => {
+    try {
+      return parsePositiveInteger(env[name], fallback, name);
+    } catch (error) {
+      throw new Error(PREFIX + (error instanceof Error ? error.message : String(error)));
+    }
+  };
+  const edgeOAuthSurfaceMaxPerMinute = parseEdgeCap("KONTROL_PUBLIC_MCP_EDGE_OAUTH_MAX_PER_MINUTE", 60);
+  const edgeMcpMaxPerMinute = parseEdgeCap("KONTROL_PUBLIC_MCP_EDGE_MCP_MAX_PER_MINUTE", 240);
+  const edgeAuthorizeMaxAttemptsPerWindow = parseEdgeCap("KONTROL_PUBLIC_MCP_EDGE_AUTHORIZE_ATTEMPTS", 20);
+  // Upper bound: the throttle guarantee (one IP cannot spend half of the
+  // provider 50-failure global brute-force ceiling) only holds while the
+  // per-IP attempt budget stays below half that ceiling. A higher operator
+  // value would silently re-open the single-IP global-lockout path.
+  const EDGE_AUTHORIZE_ATTEMPT_CAP_CEILING = 25;
+  if (edgeAuthorizeMaxAttemptsPerWindow > EDGE_AUTHORIZE_ATTEMPT_CAP_CEILING) {
+    const shown = String(edgeAuthorizeMaxAttemptsPerWindow);
+    const max = String(EDGE_AUTHORIZE_ATTEMPT_CAP_CEILING);
+    const msg = "KONTROL_PUBLIC_MCP_EDGE_AUTHORIZE_ATTEMPTS=" + shown
+      + " exceeds the maximum of " + max
+      + ": the per-IP authorize-attempt budget must stay well below the provider global failure ceiling of 50 (the enforced bound admits at most cap+1 attempts per 5-minute span).";
+    throw new Error(PREFIX + msg);
+  }
+  return { enabled: true, port, bindHost, edgeOAuthSurfaceMaxPerMinute, edgeMcpMaxPerMinute, edgeAuthorizeMaxAttemptsPerWindow };
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
   const files = loadKontrolFiles(env);
   validateAcpSecrets(env);
@@ -619,6 +700,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
       `KONTROL_AUTH_MODE=tunnel requires HOST to bind a loopback address (127.0.0.1, ::1, or localhost), but HOST=${host}. Tunnel mode disables Kontrol's OAuth gate and must only be reachable through the OpenAI Secure MCP Tunnel on a loopback interface.`,
     );
   }
+
+  // P0-02: parsed immediately after authMode so a public-listener misconfig
+  // (tunnel mode, wildcard bind) fails before any other validation — the
+  // stable "public_mcp_invalid: " prefix must be the error an operator sees.
+  const publicMcp = parsePublicMcpConfig(env, authMode);
 
   const policy = loadPolicyConfig(env);
   const allowedRoots = parseAllowedRoots(env.KONTROL_ALLOWED_ROOTS ?? files.config.allowedRoots);
@@ -829,6 +915,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     mcpToolCatalogAckRequired: parseBoolean(env.KONTROL_MCP_REQUIRE_TOOL_CATALOG_ACK),
     fsSnapshot: parseFsSnapshotConfig(env),
     peer: parsePeerConfig(env, allowedRoots, port),
+    publicMcp,
   };
   const mcpConfig = config;
 

@@ -80,7 +80,7 @@ export function resolveClientIp(input: ResolveClientIpInput): ResolvedClientIp {
     return { ip: remote, proxied: false, chainLength: 0, rejectedForwarded: forwardedPresent };
   }
 
-  if (!remote || !normalizeTrustedPeers(input.policy.peers).includes(normalizeIpLiteral(remote))) {
+  if (!remote || !cachedNormalizedPeers(input.policy.peers).includes(normalizeIpLiteral(remote))) {
     return { ip: remote, proxied: false, chainLength: 0, rejectedForwarded: forwardedPresent };
   }
 
@@ -97,6 +97,40 @@ export function resolveClientIp(input: ResolveClientIpInput): ResolvedClientIp {
   }
   const originClient = chain[0];
   return { ip: isIpLiteral(originClient) ? originClient : remote, proxied: true, chainLength: chain.length, rejectedForwarded: false };
+}
+
+/**
+ * Union of proxyPeerIps across ENABLED profiles targeting the public OAuth
+ * listener (PR-B P0-04 wiring). Audience alone is NOT sufficient: a
+ * secure_tunnel_listener profile's relay peers must never become trusted
+ * peers of the public listener (F3-C), so target is filtered too. Empty (or
+ * no matching profiles) → direct mode: forwarded headers never influence
+ * anything. Nonempty → exact_peers with a bounded chain length;
+ * normalizeTrustedPeers reduces IPv4-mapped forms. Peers are already
+ * IP-literal-validated at config load (validate.ts).
+ */
+export function trustedProxyPolicyForIngressProfiles(
+  profiles: readonly { enabled: boolean; target: string; proxyPeerIps?: string[] }[] | undefined,
+): TrustedProxyPolicy {
+  const peers = (profiles ?? [])
+    .filter((profile) => profile.enabled && profile.target === "public_oauth_listener")
+    .flatMap((profile) => profile.proxyPeerIps ?? []);
+  if (peers.length === 0) return { mode: "direct" };
+  return { mode: "exact_peers", peers: [...cachedNormalizedPeers(peers)], maxChainLength: 5 };
+}
+
+// F3-E: peer normalization is deterministic per array, but resolveClientIp
+// runs per request. Memoize by array IDENTITY so repeat calls with the same
+// policy.peers skip re-normalization. WeakMap → bounded by the number of
+// live policy objects (no timers, no manual eviction).
+const normalizedPeersCache = new WeakMap<readonly string[], readonly string[]>();
+
+function cachedNormalizedPeers(peers: readonly string[]): readonly string[] {
+  const cached = normalizedPeersCache.get(peers);
+  if (cached) return cached;
+  const normalized = normalizeTrustedPeers(peers);
+  normalizedPeersCache.set(peers, normalized);
+  return normalized;
 }
 
 /**

@@ -9,7 +9,6 @@ import { realpath } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { hostHeaderValidation, localhostHostValidation } from "@modelcontextprotocol/sdk/server/middleware/hostHeaderValidation.js";
-import { mcpAuthRouter, getOAuthProtectedResourceMetadataUrl } from "@modelcontextprotocol/sdk/server/auth/router.js";
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
@@ -156,6 +155,8 @@ import {
 import { deriveAuth } from "./server/auth.js";
 import { createHttpApp, mountWorkspaceAppAssets } from "./server/app.js";
 import { createPeerHttpApp } from "./server/peer-app.js";
+import { createPublicMcpApp } from "./server/public-mcp-app.js";
+import { trustedProxyPolicyForIngressProfiles } from "./ingress/proxy-context.js";
 import { PeerCredentialRegistry } from "./peer/auth.js";
 import { createWorkspaceAppResourceServer } from "./server/workspace-resource-route.js";
 // P1.2 decomposition: admission classes/weights/queue live in
@@ -307,8 +308,8 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
   };
   const workspaceAppResources = createWorkspaceAppResourceServer(config, workspaceAppResourceMetrics, mcpResourceAdmission);
   const serveWorkspaceAppResource = workspaceAppResources.serve;
-  const { oauthEnabled, oauthProvider, bearerAuth, resourceServerUrl } = deriveAuth(config);
-  const { app } = createHttpApp({ config, oauthProvider, resourceServerUrl, bearerAuth });
+  const { oauthEnabled, oauthProvider, bearerAuth, resourceServerUrl, oauthRouter } = deriveAuth(config);
+  const { app } = createHttpApp({ config, oauthProvider, resourceServerUrl, bearerAuth, oauthRouter });
   // ONE shared DB handle for every manager + the review workflow service, so the
   // workflow can commit state + event log in a SINGLE transaction (P1 #15).
   // P0.3: deployment identity flows from the entrypoint-resolved context via
@@ -775,6 +776,43 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     });
   }
 
+  // Public OAuth MCP listener (P0-02): strictly opt-in via config.publicMcp
+  // (which loadConfig only produces in authMode=oauth). Shares every
+  // manager/DB/session map with the owner app through the deps spread; only
+  // the listener-kind fence differs (publicListener → "owner_public"
+  // sessions). Auth is derived ONCE above: the same provider, bearer gate,
+  // and resource URL as the owner listener — never a second provider.
+  let publicApp: import("express").Express | undefined;
+  if (config.publicMcp) {
+    const publicMcpDeps: McpHttpDeps = { ...mcpHttpDeps, publicListener: () => true };
+    // P0-04 wiring: the trusted-proxy policy derives ONCE at startup from the
+    // enabled owner_public profiles TARGETING the public OAuth listener
+    // (F3-C: a secure_tunnel_listener profile's relay peers must never become
+    // trusted peers here — the helper filters target too; this call-site
+    // filter keeps the contract visible where the policy is derived).
+    const publicProxyPolicy = trustedProxyPolicyForIngressProfiles(
+      config.ingress?.profiles.filter(
+        (profile) => profile.audience === "owner_public" && profile.target === "public_oauth_listener",
+      ),
+    );
+    publicApp = createPublicMcpApp({
+      config,
+      oauthProvider: oauthProvider!,
+      resourceServerUrl: resourceServerUrl!,
+      bearerAuth: bearerAuth!,
+      // F2-A: the public app builds its OWN OAuth router with SDK rate
+      // limiters disabled — the owner keeps deriveAuth's router and budgets.
+      trustedProxyPolicy: publicProxyPolicy,
+      // F2-1: operator-tunable edge caps from config.
+      edgeOAuthSurfaceMaxPerMinute: config.publicMcp.edgeOAuthSurfaceMaxPerMinute,
+      edgeMcpMaxPerMinute: config.publicMcp.edgeMcpMaxPerMinute,
+      edgeAuthorizeMaxAttemptsPerWindow: config.publicMcp.edgeAuthorizeMaxAttemptsPerWindow,
+      handleMcpRequest: (req, res) => {
+        void handleMcpHttpRequest(publicMcpDeps, req, res);
+      },
+    }).app;
+  }
+
   const diagnosticsDeps = {
     config,
     mcpSessions,
@@ -909,6 +947,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
   return {
     app,
     peerApp,
+    publicApp,
     config,
     dispatcher,
     close: shutdown.close,
@@ -948,7 +987,7 @@ export async function runServer(config = loadConfig()): Promise<void> {
     if (ownsRuntimeLock) await releaseRuntimeLock(runtimeLock);
     throw error;
   }
-  const { app, peerApp, close, drain } = serverResources;
+  const { app, peerApp, publicApp, close, drain } = serverResources;
   const runtimeIdentity = createRuntimeIdentityRecord(
     buildMeta,
     process.argv.join(" "),
@@ -1102,12 +1141,71 @@ export async function runServer(config = loadConfig()): Promise<void> {
       });
     });
   }
+  let publicHttpServer: import("node:http").Server | undefined;
+  let closePublicHttpServer: (() => Promise<void>) | undefined;
+  if (publicApp && config.publicMcp) {
+    publicHttpServer = publicApp.listen(config.publicMcp.port, config.publicMcp.bindHost);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const onListening = () => {
+          publicHttpServer!.off("error", onError);
+          resolve();
+        };
+        const onError = (error: Error) => {
+          publicHttpServer!.off("listening", onListening);
+          reject(error);
+        };
+        publicHttpServer!.once("listening", onListening);
+        publicHttpServer!.once("error", onError);
+      });
+      console.log(`public MCP listener: http://${config.publicMcp.bindHost}:${config.publicMcp.port}/mcp (OAuth required)`);
+    } catch (error) {
+      // Candidate launch rollback (mirrors the peer bind block): close the
+      // failing listener object, every already-bound listener, and the shared
+      // app resources; never publish a half-bound generation.
+      try {
+        if (publicHttpServer.listening) {
+          await new Promise<void>((resolve) => publicHttpServer!.close(() => resolve()));
+        } else {
+          publicHttpServer.closeAllConnections?.();
+        }
+      } catch {
+        // Socket never became ours; resource cleanup below remains authoritative.
+      }
+      await closePeerHttpServer?.();
+      await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+      await close();
+      if (ownsRuntimeLock) await releaseRuntimeLock(runtimeLock);
+      throw new Error(`kontrol public MCP listener failed to bind ${config.publicMcp.bindHost}:${config.publicMcp.port}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    closePublicHttpServer = () => new Promise<void>((resolve) => {
+      if (!publicHttpServer!.listening) {
+        resolve();
+        return;
+      }
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        resolve();
+      };
+      const deadline = setTimeout(() => {
+        (publicHttpServer as { closeAllConnections?: () => void }).closeAllConnections?.();
+        finish();
+      }, 5_000);
+      publicHttpServer!.close(() => {
+        clearTimeout(deadline);
+        finish();
+      });
+    });
+  }
 
   try {
     writeRuntimeIdentity(config.stateDir, runtimeIdentity);
     runtimeIdentityWritten = true;
   } catch (error) {
     await closePeerHttpServer?.();
+    await closePublicHttpServer?.();
     await close();
     await new Promise<void>((resolve) => httpServer.close(() => resolve()));
     if (ownsRuntimeLock) await releaseRuntimeLock(runtimeLock);
@@ -1137,6 +1235,7 @@ export async function runServer(config = loadConfig()): Promise<void> {
         });
       });
       await closePeerHttpServer?.();
+      await closePublicHttpServer?.();
       await close();
       if (runtimeIdentityWritten) removeRuntimeIdentity(config.stateDir, runtimeIdentity.instanceId);
       if (ownsRuntimeLock) await releaseRuntimeLock(runtimeLock);

@@ -114,6 +114,13 @@ export interface McpHttpDeps {
    * context; on the peer listener a missing peer principal is always rejected.
    */
   isPeerListener?: () => boolean;
+  /**
+   * True only on the public OAuth MCP listener (P0-02). Structurally no peer
+   * principal can exist there: the peer middleware is never mounted on the
+   * public app, so peer identity derivation is unreachable and sessions are
+   * fenced to "owner_public".
+   */
+  publicListener?: () => boolean;
   serveWorkspaceAppResource(res: Response, requestId: string | undefined, body: { id?: unknown; params?: { uri?: unknown } }, sessionless: boolean, clientKey: string, abortSignal: AbortSignal | undefined, acceptEncoding?: string | undefined, context?: { sessionId?: string; generationId?: string }): Promise<boolean>;
   createServerForSession(connectionContext: ConnectionContext): McpServer;
   supervisorWake(workSessionId: string): void;
@@ -838,18 +845,23 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
           sendJsonRpcError(res, 403, -32001, "MCP session belongs to another conversation");
           return;
         }
-        if (sessionState?.listenerKind) {
-          const requestListenerKind: "owner" | "peer" = peerPrincipal ? "peer" : "owner";
-          if (sessionState.listenerKind !== requestListenerKind) {
-            logEvent(config.logging, "warn", "mcp_session_listener_mismatch", {
-              requestId,
-              sessionIdPrefix: sessionIdPrefix(sessionId),
-              expectedListener: sessionState.listenerKind,
-              actualListener: requestListenerKind,
-            });
-            sendJsonRpcError(res, 403, -32001, "MCP session belongs to another listener");
-            return;
-          }
+        // Fail-closed listener fence (P2-1): the request's listener kind must
+        // EQUAL the session's. A missing session record (transport without
+        // state — an anomaly) or an unknown kind is a mismatch, never a skip.
+        const requestListenerKind: "owner" | "peer" | "owner_public" = peerPrincipal
+          ? "peer"
+          : deps.publicListener?.()
+            ? "owner_public"
+            : "owner";
+        if (sessionState?.listenerKind !== requestListenerKind) {
+          logEvent(config.logging, "warn", "mcp_session_listener_mismatch", {
+            requestId,
+            sessionIdPrefix: sessionIdPrefix(sessionId),
+            expectedListener: sessionState?.listenerKind,
+            actualListener: requestListenerKind,
+          });
+          sendJsonRpcError(res, 403, -32001, "MCP session belongs to another listener");
+          return;
         }
         if (
           config.mcpToolCatalogAckRequired === true
@@ -1036,7 +1048,7 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
                 authenticatedRole: connectionContext.authenticatedRole ?? "client",
                 authenticatedPrincipalId: connectionContext.authenticatedPrincipalId,
                 authSource: connectionContext.authSource ?? "anonymous",
-                listenerKind: peerPrincipal ? "peer" : "owner",
+                listenerKind: peerPrincipal ? "peer" : deps.publicListener?.() ? "owner_public" : "owner",
                 conversationId: requestConversationId,
                 approvalCorrelationId: clientIdentity.source === "client_info_fallback" ? undefined : clientId,
                 workSessionId: connectionContext.workSessionId,
@@ -1193,7 +1205,9 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
         // reaching /mcp directly) and never grant worker rights.
         connectionContext = {
           authenticatedRole: verifiedClaims ? "worker" : (verifiedReviewer || verifiedTunnelReviewer || verifiedOAuthReviewer) ? "reviewer" : "client",
-          listenerKind: "owner",
+          // P3-1: on the public OAuth listener this must not mislabel the
+          // connection as the local owner hop.
+          listenerKind: deps.publicListener?.() ? "owner_public" : "owner",
           authSource: verifiedClaims
             ? "worker_token"
             : verifiedReviewer

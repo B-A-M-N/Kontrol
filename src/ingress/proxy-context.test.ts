@@ -3,6 +3,7 @@ import {
   BRIDGE_STRIP_HEADERS,
   TS_IDENTITY_HEADERS,
   extractUntrustedTailscaleIdentity,
+  trustedProxyPolicyForIngressProfiles,
   isBridgeStrippedHeader,
   isIpLiteral,
   normalizeIpLiteral,
@@ -128,5 +129,36 @@ assert.equal(isBridgeStrippedHeader("x-kontrol-anything"), true);
 assert.equal(isBridgeStrippedHeader("x-kontrolfoo"), false, "prefix must match with hyphen");
 assert.equal(isBridgeStrippedHeader("X-Forwarded-Xx"), false, "lookalike not stripped");
 assert.equal(isBridgeStrippedHeader("Content-Type"), false, "ordinary header not stripped");
+
+// --- F3-C: policy derivation filters audience AND target ---
+{
+  const direct = trustedProxyPolicyForIngressProfiles(undefined);
+  assert.deepEqual(direct, { mode: "direct" }, "no profiles -> direct");
+
+  // Wrong TARGET (secure_tunnel_listener) with a matching audience: peers must
+  // be IGNORED - a tunnel relay peer must never become a trusted peer of the
+  // public OAuth listener.
+  const wrongTarget = trustedProxyPolicyForIngressProfiles([
+    { enabled: true, target: "secure_tunnel_listener", proxyPeerIps: ["100.64.0.9"] },
+  ]);
+  assert.deepEqual(wrongTarget, { mode: "direct" }, "secure_tunnel_listener peers ignored for the public listener");
+
+  // Correct target + audience: peers used, IPv4-mapped forms normalized.
+  const right = trustedProxyPolicyForIngressProfiles([
+    { enabled: false, target: "public_oauth_listener", proxyPeerIps: ["10.1.1.1"] },
+    { enabled: true, target: "public_oauth_listener", proxyPeerIps: ["::ffff:100.64.0.9", "100.64.0.10"] },
+    { enabled: true, target: "public_oauth_listener" },
+  ]);
+  assert.deepEqual(right, { mode: "exact_peers", peers: ["100.64.0.9", "100.64.0.10"], maxChainLength: 5 },
+    "enabled+targeted profile peers unioned and normalized; disabled profile ignored");
+
+  // F3-E: memoization by array identity - same policy.peers array must not
+  // re-normalize (observe via WeakMap-backed identity reuse semantics: calling
+  // twice with the SAME array yields equal results and the cache holds).
+  const peersArr = ["::ffff:100.64.0.9"];
+  const once = trustedProxyPolicyForIngressProfiles([{ enabled: true, target: "public_oauth_listener", proxyPeerIps: peersArr }]);
+  const twice = trustedProxyPolicyForIngressProfiles([{ enabled: true, target: "public_oauth_listener", proxyPeerIps: peersArr }]);
+  assert.deepEqual(twice, once, "repeat derivation with same peers array is stable");
+}
 
 console.log("proxy-context: all assertions passed");

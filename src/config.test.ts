@@ -507,3 +507,100 @@ assert.throws(
   }),
   /LOW_WATER_BYTES/,
 );
+
+// ---------------------------------------------------------------------------
+// PR-B: public MCP listener config (P0-02) — off by default, fail-fast at load.
+// ---------------------------------------------------------------------------
+assert.equal(
+  loadConfig(baseEnv).publicMcp,
+  undefined,
+  "publicMcp must be undefined unless KONTROL_PUBLIC_MCP_ENABLED is set (zero behavior)",
+);
+assert.equal(
+  loadConfig({ ...baseEnv, KONTROL_PUBLIC_MCP_ENABLED: "0" }).publicMcp,
+  undefined,
+  "any non-1/true value stays disabled",
+);
+assert.throws(
+  () => loadConfig({ ...baseEnv, KONTROL_AUTH_MODE: "tunnel", KONTROL_PUBLIC_MCP_ENABLED: "1" }),
+  /public_mcp_invalid: public listener requires authMode=oauth; the tunnel-mode owner listener is unauthenticated and must never be exposed/,
+  "public listener in tunnel mode fails at load",
+);
+assert.throws(
+  () => loadConfig({ ...baseEnv, KONTROL_PUBLIC_MCP_ENABLED: "1", KONTROL_PUBLIC_MCP_BIND_HOST: "0.0.0.0" }),
+  /public_mcp_invalid/,
+  "wildcard public bind host fails at load",
+);
+assert.throws(
+  () => loadConfig({ ...baseEnv, KONTROL_PUBLIC_MCP_ENABLED: "1", KONTROL_PUBLIC_MCP_BIND_HOST: "::" }),
+  /public_mcp_invalid/,
+  "IPv6 wildcard public bind host fails at load",
+);
+assert.throws(
+  () => loadConfig({ ...baseEnv, KONTROL_PUBLIC_MCP_ENABLED: "1", KONTROL_PUBLIC_MCP_PORT: "70000" }),
+  /public_mcp_invalid/,
+  "out-of-range public port fails at load",
+);
+assert.deepEqual(
+  loadConfig({ ...baseEnv, KONTROL_PUBLIC_MCP_ENABLED: "1" }).publicMcp,
+  { enabled: true, port: 7678, bindHost: "127.0.0.1", edgeOAuthSurfaceMaxPerMinute: 60, edgeMcpMaxPerMinute: 240, edgeAuthorizeMaxAttemptsPerWindow: 20 },
+  "enabled + oauth parses port/bindHost defaults",
+);
+assert.deepEqual(
+  loadConfig({ ...baseEnv, KONTROL_PUBLIC_MCP_ENABLED: "1", KONTROL_PUBLIC_MCP_PORT: "7900", KONTROL_PUBLIC_MCP_BIND_HOST: "127.0.0.2" }).publicMcp,
+  { enabled: true, port: 7900, bindHost: "127.0.0.2", edgeOAuthSurfaceMaxPerMinute: 60, edgeMcpMaxPerMinute: 240, edgeAuthorizeMaxAttemptsPerWindow: 20 },
+  "explicit port/bindHost parse through",
+);
+assert.deepEqual(
+  loadConfig({
+    ...baseEnv,
+    KONTROL_PUBLIC_MCP_ENABLED: "1",
+    KONTROL_PUBLIC_MCP_EDGE_OAUTH_MAX_PER_MINUTE: "90",
+    KONTROL_PUBLIC_MCP_EDGE_MCP_MAX_PER_MINUTE: "500",
+    KONTROL_PUBLIC_MCP_EDGE_AUTHORIZE_ATTEMPTS: "25",
+  }).publicMcp,
+  { enabled: true, port: 7678, bindHost: "127.0.0.1", edgeOAuthSurfaceMaxPerMinute: 90, edgeMcpMaxPerMinute: 500, edgeAuthorizeMaxAttemptsPerWindow: 25 },
+  "edge caps parse through",
+);
+assert.throws(
+  () => loadConfig({ ...baseEnv, KONTROL_PUBLIC_MCP_ENABLED: "1", KONTROL_PUBLIC_MCP_EDGE_AUTHORIZE_ATTEMPTS: "0" }),
+  /public_mcp_invalid/,
+  "non-positive edge cap fails with the stable prefix",
+);
+assert.throws(
+  () => loadConfig({ ...baseEnv, KONTROL_PUBLIC_MCP_ENABLED: "1", KONTROL_PUBLIC_MCP_EDGE_AUTHORIZE_ATTEMPTS: "26" }),
+  /public_mcp_invalid/,
+  "authorize-attempt cap above the provider-ceiling-safe maximum fails with the stable prefix",
+);
+assert.throws(
+  () => loadConfig({ ...baseEnv, KONTROL_PUBLIC_MCP_ENABLED: "1", KONTROL_PUBLIC_MCP_EDGE_MCP_MAX_PER_MINUTE: "abc" }),
+  /public_mcp_invalid/,
+  "non-numeric edge cap fails with the stable prefix",
+);
+
+// P1-3: wildcard bind rejection covers every unspecified-address spelling.
+for (const wildcardHost of ["0.0.0.0", "::", "::0", "0::", "0:0:0:0:0:0:0:0", "::ffff:0.0.0.0", "[::]", "[::0]", "[0:0:0:0:0:0:0:0]", "*",
+  // F2-C: hex mapped-spellings of the IPv4 wildcard.
+  "::ffff:0:0", "::ffff:0000:0000", "0:0:0:0:0:ffff:0:0", "[::ffff:0:0]", "::0.0.0.0"]) {
+  assert.throws(
+    () => loadConfig({ ...baseEnv, KONTROL_PUBLIC_MCP_ENABLED: "1", KONTROL_PUBLIC_MCP_BIND_HOST: wildcardHost }),
+    /public_mcp_invalid.*wildcard bind/i,
+    `unspecified-address spelling ${wildcardHost} must be rejected`,
+  );
+}
+for (const specificHost of ["127.0.0.1", "::1", "localhost", "fe80::1", "[::1]", "127.0.0.2",
+  // F2-C: mapped with a NONZERO embedded tail is a specific address.
+  "::ffff:127.0.0.1"]) {
+  assert.doesNotThrow(
+    () => loadConfig({ ...baseEnv, KONTROL_PUBLIC_MCP_ENABLED: "1", KONTROL_PUBLIC_MCP_BIND_HOST: specificHost }),
+    `specific bind host ${specificHost} must be accepted`,
+  );
+}
+// P2-3: port parse errors carry the stable prefix too.
+for (const badPort of ["0", "abc", "-1"]) {
+  assert.throws(
+    () => loadConfig({ ...baseEnv, KONTROL_PUBLIC_MCP_ENABLED: "1", KONTROL_PUBLIC_MCP_PORT: badPort }),
+    /public_mcp_invalid/,
+    `public port ${badPort} must fail with the public_mcp_invalid prefix`,
+  );
+}

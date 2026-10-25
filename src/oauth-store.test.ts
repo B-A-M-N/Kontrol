@@ -138,6 +138,8 @@ async function testDatabaseConfiguration(stateDir: string): Promise<void> {
       { version: 95, name: "authenticated-outcome-observation-receipts" },
       { version: 96, name: "review-browser-attempt-recovery-receipts" },
       { version: 97, name: "review-browser-generation-observations" },
+      { version: 98, name: "scheduler-error-fingerprint-index" },
+      { version: 99, name: "filesystem-snapshot-root-indexes" },
     ]);
   } finally {
     database.close();
