@@ -9,9 +9,12 @@
 import { randomUUID } from "node:crypto";
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { isIngressEvidenceTier, type IngressEvidenceTier } from "./evidence-tier.js";
 
 export type IngressHealthState = "DOWN" | "DEGRADED" | "UNVERIFIED" | "READY";
-export type IngressEvidenceTier = "unit" | "local_integration" | "real_tailnet" | "public_internet" | "operational";
+// The tier vocabulary is owned by evidence-tier.ts so the health store, the
+// management projection, and the qualification matrix cannot drift apart.
+export type { IngressEvidenceTier } from "./evidence-tier.js";
 
 export interface IngressHealthObservation {
   observationId: string;
@@ -50,7 +53,6 @@ interface HealthStore { version: 1; observations: IngressHealthObservation[] }
 const STORE_NAME = "ingress-health.json";
 const MAX_OBSERVATIONS = 512;
 const MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
-const TIERS = new Set<IngressEvidenceTier>(["unit", "local_integration", "real_tailnet", "public_internet", "operational"]);
 const STATES = new Set<IngressHealthState>(["DOWN", "DEGRADED", "UNVERIFIED", "READY"]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -64,7 +66,7 @@ function validateObservation(value: unknown): asserts value is IngressHealthObse
     || !/^[A-Za-z0-9._-]{1,64}$/.test(value.profileId) || typeof value.listener !== "string"
     || typeof value.buildId !== "string" || typeof value.probeOrigin !== "string"
     || !["owner_public", "peer", "none"].includes(String(value.principalClass))
-    || !STATES.has(value.state as IngressHealthState) || !TIERS.has(value.evidenceTier as IngressEvidenceTier)
+    || !STATES.has(value.state as IngressHealthState) || !isIngressEvidenceTier(value.evidenceTier)
     || typeof value.observedAt !== "string" || !Number.isFinite(Date.parse(value.observedAt))
     || !isRecord(value.checks)) {
     throw new Error("invalid ingress health observation");

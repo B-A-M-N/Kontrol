@@ -6,6 +6,7 @@ import type { ServerConfig } from "../config.js";
 import type { PrincipalRole } from "../policy-enforcement.js";
 import { workspaceAppCallableToolMeta } from "../workspace-app-resource.js";
 import { applyIngressProfile, disableIngressProfile, listIngressOperationReceipts } from "./controller.js";
+import { evidenceSatisfiesPrivacy, scopeForTier } from "./evidence-tier.js";
 import { latestIngressHealthByProfile, listIngressHealthObservations } from "./health-store.js";
 import { buildIngressReport, defaultLocalProbe, expectedLocalTargetPort } from "./profile-status.js";
 import { readTailscaleFacts, type TailscaleFacts } from "./tailscale-status.js";
@@ -33,9 +34,13 @@ export async function readIngressManagementProjection(
         evidenceTier: item.evidenceTier,
         failureClass: item.failureClass ?? item.state.toLowerCase(),
       }));
-    const appropriateExternalTier = profile.privacy === "TAILNET_PRIVATE"
-      ? qualification?.evidenceTier === "real_tailnet" || qualification?.evidenceTier === "operational"
-      : qualification?.evidenceTier === "public_internet" || qualification?.evidenceTier === "operational";
+    // The qualification scope is derived from the probe origin, not from the
+    // recorded tier label: a tailnet observation never qualifies a public
+    // origin and a public observation never qualifies a tailnet-private one.
+    const qualificationScope = qualification ? scopeForTier(qualification.evidenceTier, qualification.probeOrigin) : null;
+    const appropriateExternalTier = qualification && qualificationScope
+      ? evidenceSatisfiesPrivacy({ scope: qualificationScope, tier: qualification.evidenceTier }, profile.privacy)
+      : false;
     const externalTest = qualification?.checks.externalHttps === false
       ? "failed"
       : qualification?.checks.externalHttps === true && appropriateExternalTier ? "passed" : "unverified";
