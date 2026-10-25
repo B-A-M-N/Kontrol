@@ -40,6 +40,7 @@ function option(name, fallback) {
 }
 
 const evidencePath = option("--evidence");
+const evidenceStateDir = option("--evidence-state-dir");
 const reportPath = resolve(option("--report", join(root, "ingress-qualification-matrix.json")));
 const only = (option("--only", "") ?? "").split(",").map((value) => value.trim()).filter(Boolean);
 const skip = (option("--skip", "") ?? "").split(",").map((value) => value.trim()).filter(Boolean);
@@ -111,20 +112,29 @@ function runGuard(guard) {
  *     restating a field.
  */
 function loadObservations() {
-  if (!evidencePath) return [];
-  const absolute = resolve(evidencePath);
-  if (!existsSync(absolute)) throw new Error(`evidence file not found: ${absolute}`);
-  const parsed = JSON.parse(readFileSync(absolute, "utf8"));
-  const records = Array.isArray(parsed) ? parsed : parsed.observations ?? [parsed];
-  return records.map((record) => {
-    if (record && typeof record === "object" && "probeOrigin" in record && !("endpoint" in record)) {
-      // A durable health record: attach it to the deployment scenario whose
-      // expectation the probe's checks cover.
-      const scenarioId = record.scenarioId ?? healthRecordScenario(record);
-      return observationFromHealthRecord(record, scenarioId);
+  const sources = [];
+  if (evidencePath) sources.push(resolve(evidencePath));
+  if (evidenceStateDir) sources.push(resolve(evidenceStateDir, "ingress-health.json"));
+  const observations = [];
+  for (const source of sources) {
+    if (!existsSync(source)) {
+      if (source.endsWith("ingress-health.json")) continue; // an operator may not have run a probe yet
+      throw new Error(`evidence file not found: ${source}`);
     }
-    return validateIngressMatrixObservation(record);
-  });
+    const parsed = JSON.parse(readFileSync(source, "utf8"));
+    const records = Array.isArray(parsed) ? parsed : parsed.observations ?? [parsed];
+    for (const record of records) {
+      if (record && typeof record === "object" && "probeOrigin" in record && !("endpoint" in record)) {
+        // A durable health record: attach it to the deployment scenario whose
+        // expectation the probe's checks cover.
+        const scenarioId = record.scenarioId ?? healthRecordScenario(record);
+        observations.push(observationFromHealthRecord(record, scenarioId));
+        continue;
+      }
+      observations.push(validateIngressMatrixObservation(record));
+    }
+  }
+  return observations;
 }
 
 /**
@@ -134,6 +144,13 @@ function loadObservations() {
  */
 function healthRecordScenario(record) {
   const checks = record.checks ?? {};
+  const origin = String(record.probeOrigin ?? "");
+  if (origin.includes(".ts.net")) {
+    // A tailnet observation: the Serve mapping row.
+    if (checks.externalHttps === false) return "serve-mapping-exact-match";
+    if (checks.sse === false || checks.longPost === false) return "sse-idle-timeout-and-45s-post";
+    return "serve-mapping-exact-match";
+  }
   if (checks.externalHttps === false) return "external-tls-or-dns-failure";
   if (checks.sse === false || checks.longPost === false) return "sse-idle-timeout-and-45s-post";
   if (record.principalClass === "owner_public" && checks.externalHttps === true) return "funnel-public-authenticated";
