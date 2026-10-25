@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import type { Server } from "node:http";
 import { createServer } from "./server.js";
+import { request as httpRequest } from "node:http";
 import { loadConfig } from "./config.js";
 import type { ServerConfig } from "./config.js";
 import { hashPeerCredential } from "./peer/credentials.js";
@@ -744,4 +745,81 @@ async function peerDelete(sessionId: string): Promise<void> {
 await closeServer(peerListener.server);
 await closeServer(ownerListener.server);
 await running.close();
+// P0-03: the peer listener's Host validation consumes the TRUSTED
+// CONFIGURED allowlist (the enabled peer ingress profile), so a real
+// Tailscale Serve request that keeps its external .ts.net Host reaches the
+// listener — while a wrong Host is refused even with a valid credential.
+{
+  // Node's fetch forbids a custom Host header, so the Host cases use a raw
+  // HTTP request that can set the authority exactly.
+  const rawPost = (port: number, hostHeader: string, extraHeaders: Record<string, string> = {}): Promise<number> =>
+    new Promise((resolveStatus, rejectStatus) => {
+      const request = httpRequest({
+        host: "127.0.0.1",
+        port,
+        path: "/mcp",
+        method: "POST",
+        headers: {
+          Host: hostHeader,
+          authorization: token,
+          "content-type": "application/json",
+          accept: "application/json, text/event-stream",
+          ...extraHeaders,
+        },
+      }, (response) => {
+        response.resume();
+        response.on("end", () => resolveStatus(response.statusCode ?? 0));
+      });
+      request.on("error", rejectStatus);
+      request.end(JSON.stringify({
+        jsonrpc: "2.0",
+        id: "host-check",
+        method: "initialize",
+        params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "host-check", version: "1" } },
+      }));
+    });
+
+  const serveProfileConfig = loadConfig(peerEnv({
+    KONTROL_INGRESS_PROFILES: JSON.stringify([{
+      id: "serve-peer",
+      kind: "tailscale_serve",
+      audience: "peer",
+      externalOrigin: "https://node.tail8d285a.ts.net:8443",
+      target: "peer_listener",
+      enabled: true,
+      managedByKontrol: false,
+      allowedHosts: ["node.tail8d285a.ts.net:8443"],
+    }]),
+  }));
+  assert.equal(serveProfileConfig.ingress?.profiles.length, 1, "the peer serve profile parses");
+  const serveRunning = createServer(serveProfileConfig);
+  const servePeer = await listen(serveRunning.peerApp as unknown as Server, serveProfileConfig.peer!.bindHost);
+  const servePeerUrl = "http://127.0.0.1:" + servePeer.port + "/mcp";
+  try {
+    // The configured tailnet FQDN is accepted.
+    assert.equal(
+      await rawPost(servePeer.port, "node.tail8d285a.ts.net:8443"),
+      200,
+      "the configured tailnet FQDN reaches the peer listener",
+    );
+
+    // A wrong Host is refused even with a valid credential.
+    assert.equal(
+      await rawPost(servePeer.port, "evil.example.invalid"),
+      403,
+      "a wrong Host is refused by the peer listener",
+    );
+
+    // A client-supplied X-Forwarded-Host can never select authority.
+    assert.equal(
+      await rawPost(servePeer.port, "evil.example.invalid", { "x-forwarded-host": "node.tail8d285a.ts.net:8443" }),
+      403,
+      "X-Forwarded-Host never selects authority",
+    );
+  } finally {
+    await closeServer(servePeer.server);
+    await serveRunning.close();
+  }
+}
+
 console.log("peer-listener: all assertions passed");

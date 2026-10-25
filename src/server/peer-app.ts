@@ -39,9 +39,26 @@ export function createPeerHttpApp(deps: PeerHttpAppDeps): Express {
   // DNS-rebinding protection scoped to the peer listener. Loopback remains
   // permitted for local probes; enabled peer ingress profiles contribute
   // exact external FQDNs only (never wildcards/forwarded authority).
+  //
+  // The allowlist is the TRUSTED CONFIGURED one: the profile's own
+  // allowedHosts, never a client-supplied Host or X-Forwarded-Host. The
+  // profile's external origin authority is included as well, because a
+  // Tailscale Serve request that keeps its external .ts.net Host must
+  // reach the listener that the profile configures.
   const peerProfileHosts = (config.ingress?.profiles ?? [])
     .filter((profile) => profile.enabled && profile.target === "peer_listener")
-    .flatMap((profile) => profile.allowedHosts);
+    .flatMap((profile) => {
+      const hosts = [...profile.allowedHosts];
+      try {
+        const origin = new URL(profile.externalOrigin);
+        hosts.push(origin.hostname.toLowerCase());
+        if (origin.port) hosts.push(`${origin.hostname.toLowerCase()}:${origin.port}`);
+      } catch {
+        // An unparseable origin is rejected by ingress validation; it
+        // contributes no host here.
+      }
+      return hosts;
+    });
   app.use(strictHostHeaderValidation([
     peer.bindHost,
     "localhost",
