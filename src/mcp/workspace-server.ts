@@ -45,6 +45,7 @@ import {
 } from "./tool-catalog-handshake.js";
 import { registerPolicyTools } from "../policy-tools.js";
 import { registerPeerStatusTool } from "../peer/peer-tools.js";
+import { registerIngressManagementTool } from "../ingress/ingress-tools.js";
 import { registerBridgeTools } from "../acp-bridge.js";
 // P1.3 decomposition: shared helpers live in focused modules. The names are
 // re-exported below so existing importers of ./mcp/workspace-server.js keep
@@ -369,7 +370,7 @@ export function createMcpServer(
     } catch {
       return denied(`Forbidden: repositoryId ${JSON.stringify(args.repositoryId)} is outside the server's allowed roots or does not exist.`);
     }
-    const peerPrincipal = peerPrincipalFromDescriptor(descriptor);
+    const peerPrincipal = peerPrincipalFromDescriptor(descriptor, { revision: 0, hash: "unpublished" });
     if (!peerGrantsRoot(peerPrincipal, canonicalRoot)) {
       return denied(`Forbidden: peer ${descriptor.id} is not granted access to workspace root ${canonicalRoot}.`);
     }
@@ -440,6 +441,10 @@ export function createMcpServer(
     config,
     principalRole: connectionContext?.authenticatedRole ?? "client",
     store: getPeerJobStore(),
+  });
+  registerIngressManagementTool(server, {
+    config,
+    principalRole: connectionContext?.authenticatedRole ?? "client",
   });
 
   if (workSessions && config.acpEnabled && eventStore && reviewWorkflow && liveWaiters) {

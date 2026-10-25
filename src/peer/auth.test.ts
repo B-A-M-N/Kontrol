@@ -4,7 +4,7 @@
  * responses. Style: plain tsx script with node:assert/strict.
  */
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PeerCredentialRegistry, createPeerAuthMiddleware } from "./auth.js";
@@ -14,7 +14,7 @@ import type { PeerDescriptor } from "./config-types.js";
 const dir = mkdtempSync(join(tmpdir(), "kontrol-peer-auth-test-"));
 const registryPath = join(dir, "peer-credentials.json");
 
-const secret = "peer-auth-valid-secret-long";
+const secret = "peer-auth-valid-secret-that-is-at-least-32-chars";
 const hash = hashPeerCredential("cred-1", secret);
 const token = `Bearer cred-1:${secret}`;
 
@@ -51,7 +51,7 @@ assert.equal(principal!.principalId, "peer:meta-muse:cred-1");
 assert.deepEqual([...principal!.capabilities], ["workspace:inspect", "job:claim"]);
 assert.deepEqual([...principal!.grantedRoots], ["/srv/workspace"]);
 
-assert.equal(registry.authenticate(`Bearer cred-1:wrong-secret-entirely`), undefined, "wrong secret rejected");
+assert.equal(registry.authenticate(`Bearer cred-1:wrong-secret-entirely-but-long-enough`), undefined, "wrong secret rejected");
 assert.equal(registry.authenticate("Bearer unknown-cred:some-secret-long-enough"), undefined, "unknown credentialId rejected");
 assert.equal(registry.authenticate(`Bearer cred-1:short`), undefined, "short secret rejected");
 assert.equal(registry.authenticate("Basic cred-1:some-secret-long-enough"), undefined, "non-Bearer scheme rejected");
@@ -86,17 +86,39 @@ const revokedDescriptor = { ...baseDescriptor, revokedAt: pastIso };
 writeRegistry([revokedDescriptor], new Date(Date.now() + 2000));
 assert.equal(persistent.authenticate(token), undefined, "hot reload picks up revocation after mtime change");
 
-// Unchanged mtime: last good registry keeps serving (fail operational).
-const unchangedMtime = new Date(Date.now() - 60_000);
-writeRegistry([baseDescriptor], unchangedMtime);
-const operational = PeerCredentialRegistry.open(registryPath);
-assert.notEqual(operational.authenticate(token), undefined);
-// Rewrite with a BROKEN file but keep the old mtime: hot reload must not
-// parse it, and the last good registry keeps working.
-writeFileSync(registryPath, "this is not json");
+// Missing/malformed/over-permissive registry observations fail closed. A
+// malformed CHANGED publication may retain the prior generation only during a
+// narrow atomic-rename grace; the second observation clears it.
+const atomicWindow = new Date(Date.now() + 5000);
+writeRegistry([baseDescriptor], atomicWindow);
+const failClosed = PeerCredentialRegistry.open(registryPath);
+assert.notEqual(failClosed.authenticate(token), undefined, "pre-failure authenticate succeeds");
+writeFileSync(registryPath, "{ truncated");
 chmodSync(registryPath, 0o600);
-utimesSync(registryPath, unchangedMtime, unchangedMtime);
-assert.notEqual(operational.authenticate(token), undefined, "failed hot reload keeps last good registry");
+const malformedTime = new Date(Date.now() + 6000);
+utimesSync(registryPath, malformedTime, malformedTime);
+assert.equal(failClosed.authenticate(token), undefined, "malformed changed registry never authenticates while its invalid bytes are present");
+assert.equal(failClosed.snapshot().degraded, true, "malformed registry reports degraded");
+
+// A successful atomic replacement installs a new monotonic generation.
+writeRegistry([baseDescriptor], new Date(Date.now() + 7000));
+assert.notEqual(failClosed.authenticate(token), undefined, "valid replacement restores authentication");
+assert.ok(failClosed.snapshot().generation > 1, "registry generation advances on successful reload");
+
+// Registry disappearance is immediate revocation, not transient operation.
+const missingPath = registryPath;
+writeRegistry([baseDescriptor]);
+const missing = PeerCredentialRegistry.open(missingPath);
+assert.notEqual(missing.authenticate(token), undefined);
+rmSync(missingPath);
+assert.equal(missing.authenticate(token), undefined, "missing registry fails closed on first observation");
+assert.equal(missing.snapshot().reason, "missing", "missing registry reports its reason");
+
+// Wrong permissions are also an immediate revocation event.
+writeRegistry([baseDescriptor]);
+chmodSync(registryPath, 0o640);
+assert.equal(failClosed.authenticate(token), undefined, "over-permissive registry fails closed");
+chmodSync(registryPath, 0o600);
 
 // Middleware: success sets req.peerPrincipal; failure responds 401 with a
 // fixed body; >30 failures per IP within 60s respond 429.
@@ -169,5 +191,23 @@ for (let i = 0; i < 35; i++) {
 }
 assert.equal(saw429, true, "rate limiter engages after 30 failures");
 assert.deepEqual(lastBody, { error: { code: "peer_auth_rate_limited", message: "Too many failed peer authentication attempts" } });
+
+// Per-credential budget: a single credential ID reaches 429 even when each
+// failure comes from a distinct IP.
+const credentialLimitedMiddleware = createPeerAuthMiddleware(PeerCredentialRegistry.open(registryPath), { logging });
+let credentialSaw429 = false;
+for (let i = 0; i < 35; i++) {
+  const res = fakeResponse();
+  const req = {
+    header: (name: string) => (name === "authorization" ? `Bearer cred-1:wrong-secret-${i}-long-enough-for-validation` : undefined),
+    ip: `10.20.${i % 250}.${Math.floor(i / 250) + 1}`,
+  };
+  credentialLimitedMiddleware(req as never, res as never, (() => {}) as never);
+  if (res.statusCode === 429) {
+    credentialSaw429 = true;
+    break;
+  }
+}
+assert.equal(credentialSaw429, true, "per-credential failure budget engages independently of IP");
 
 console.log("src/peer/auth.test.ts: all assertions passed");

@@ -93,12 +93,12 @@ function publicEnv(overrides: Record<string, string> = {}): Record<string, strin
     KONTROL_INGRESS_PROFILES: JSON.stringify([
       {
         id: "funnel-1",
-        kind: "tailscale_funnel",
+        kind: "https_bridge",
         audience: "owner_public",
         externalOrigin: PUBLIC_BASE,
         target: "public_oauth_listener",
         enabled: true,
-        allowedHosts: ["kontrol.example.test"],
+        allowedHosts: ["kontrol.example.test:8443"],
       },
     ]),
     ...overrides,
@@ -188,7 +188,7 @@ function rawSocketStatus(port: number, rawRequest: string): Promise<{ statusLine
   const allowlistConfig: ServerConfig = loadConfig(publicEnv());
   assert.deepEqual(
     publicMcpAllowedHosts(allowlistConfig),
-    ["kontrol.example.test", "127.0.0.1", "localhost", "[::1]"],
+    ["kontrol.example.test", "kontrol.example.test:8443", "127.0.0.1", "localhost", "[::1]"],
     "public allowlist = enabled owner_public profile hosts + canonical hostname + loopback, deduped",
   );
   // F3-C: a secure_tunnel_listener profile hosts must NOT join the public
@@ -206,7 +206,7 @@ function rawSocketStatus(port: number, rawRequest: string): Promise<{ statusLine
     };
     const publicProfile: IngressProfile = {
       id: "funnel-1",
-      kind: "tailscale_funnel",
+      kind: "https_bridge",
       audience: "owner_public",
       externalOrigin: PUBLIC_BASE,
       target: "public_oauth_listener",
@@ -234,10 +234,11 @@ function rawSocketStatus(port: number, rawRequest: string): Promise<{ statusLine
     );
   }
   const allowlist = publicMcpAllowedHosts(allowlistConfig);
-  // Host-port cannot reroute traffic on a single-port listener: hostname-only
-  // form matches, unknown hostnames never do.
+  // External authorities match configured ports exactly; only loopback may
+  // carry the ephemeral port of a local probe.
   assert.equal(publicHostMatches("kontrol.example.test", allowlist), true);
   assert.equal(publicHostMatches("kontrol.example.test:8443", allowlist), true);
+  assert.equal(publicHostMatches("kontrol.example.test:8444", allowlist), false, "unexpected external Host ports are rejected");
   assert.equal(publicHostMatches("127.0.0.1", allowlist), true);
   assert.equal(publicHostMatches("127.0.0.1:7678", allowlist), true, "loopback probes on the bind port pass");
   assert.equal(publicHostMatches("[::1]", allowlist), true);

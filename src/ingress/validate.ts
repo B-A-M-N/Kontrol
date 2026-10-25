@@ -41,17 +41,26 @@ function checkExternalOrigin(profile: IngressProfile): void {
   if (url.pathname !== "/" && url.pathname !== "") {
     fail(`profile "${profile.id}" externalOrigin must not include a path`);
   }
+  if (url.search) {
+    fail(`profile "${profile.id}" externalOrigin must not include a query`);
+  }
   if (url.username || url.password) {
     fail(`profile "${profile.id}" externalOrigin must not contain userinfo`);
   }
   if (url.hash) {
     fail(`profile "${profile.id}" externalOrigin must not contain a fragment`);
   }
-  if (profile.kind !== "secure_mcp_tunnel" && url.protocol !== "https:") {
+  if (url.protocol !== "https:") {
     fail(`profile "${profile.id}" externalOrigin must use https`);
   }
   if (url.hostname.includes("*") || profile.externalOrigin.includes("*")) {
     fail(`profile "${profile.id}" externalOrigin must not contain a wildcard`);
+  }
+  if (profile.kind === "tailscale_serve" || profile.kind === "tailscale_funnel") {
+    const hostname = url.hostname.toLowerCase();
+    if (!/^[a-z0-9][a-z0-9-]*(\.[a-z0-9-]+)*\.ts\.net$/.test(hostname)) {
+      fail(`profile "${profile.id}" ${profile.kind} externalOrigin hostname must be a Tailscale-managed <node>.ts.net DNS name`);
+    }
   }
   if (profile.kind === "tailscale_funnel") {
     // WHATWG URL drops explicitly-written default ports (https://h:443 and
@@ -107,8 +116,22 @@ export function validateIngressProfiles(profiles: readonly IngressProfile[], con
     } catch (error) {
       fail(`profile "${profile.id}": ${error instanceof Error ? error.message : "invalid allowedHosts"}`);
     }
-    if (profile.enabled && (!hosts || hosts.length === 0)) {
-      fail(`profile "${profile.id}" is enabled and must declare at least one exact allowedHosts entry`);
+    if (profile.enabled) {
+      if (!hosts || hosts.length === 0) {
+        fail(`profile "${profile.id}" is enabled and must declare at least one exact allowedHosts entry`);
+      }
+      let origin: URL;
+      try {
+        origin = new URL(profile.externalOrigin);
+      } catch {
+        origin = new URL("https://invalid.invalid"); // already reported below
+      }
+      const originPort = origin.port !== "" ? origin.port : "443";
+      const originAuthority = `${origin.hostname.toLowerCase()}:${originPort}`;
+      const originHostname = origin.hostname.toLowerCase();
+      if (!hosts.includes(originAuthority) && !hosts.includes(originHostname)) {
+        fail(`profile "${profile.id}" allowedHosts must include its externalOrigin authority ${originAuthority}`);
+      }
     }
 
     // 10. proxyPeerIps must be IP literals
@@ -118,31 +141,40 @@ export function validateIngressProfiles(profiles: readonly IngressProfile[], con
       }
     }
 
-    // 6+7. target/audience/kind consistency and deployment-mode gating
+    // 6+7. Exhaustive kind/target/audience/runtime matrix. Every mismatch is
+    // rejected here, not deferred to the planner or listener implementation.
     const target: IngressListenerTarget = profile.target;
-    if (profile.audience === "peer" && target !== "peer_listener") {
-      fail(`profile "${profile.id}" has peer audience but target ${target}; peer audience must target peer_listener`);
-    }
-    if (target === "peer_listener" && !(context.peerEnabled && context.hasPeerCredentials)) {
-      fail(`profile "${profile.id}" targets peer_listener but the peer listener is not enabled with credentials`);
-    }
-    if (target === "public_oauth_listener") {
-      if (context.authMode !== "oauth") {
-        fail(`profile "${profile.id}" targets public_oauth_listener but the deployment is tunnel-mode; public ingress requires OAuth mode; tunnel-mode owner listener is unauthenticated and must never be proxied publicly`);
+    if (target === "peer_listener") {
+      if (profile.kind !== "tailscale_serve") {
+        fail(`profile "${profile.id}" targets peer_listener; only tailscale_serve may expose the peer listener`);
+      }
+      if (profile.audience !== "peer") {
+        fail(`profile "${profile.id}" targets peer_listener but has ${profile.audience} audience; peer_listener requires peer audience`);
+      }
+      if (!(context.peerEnabled && context.hasPeerCredentials)) {
+        fail(`profile "${profile.id}" targets peer_listener but the peer listener is not enabled with credentials`);
+      }
+    } else if (target === "public_oauth_listener") {
+      const allowedKind = profile.kind === "tailscale_serve" || profile.kind === "tailscale_funnel" || profile.kind === "https_bridge";
+      if (!allowedKind) {
+        fail(`profile "${profile.id}" of kind ${profile.kind} cannot target public_oauth_listener`);
       }
       if (profile.audience !== "owner_public") {
-        fail(`profile "${profile.id}" targets public_oauth_listener but has ${profile.audience} audience`);
+        fail(`profile "${profile.id}" targets public_oauth_listener but has ${profile.audience} audience; public_oauth_listener requires owner_public audience`);
       }
-    }
-    if (target === "secure_tunnel_listener") {
+      if (context.authMode !== "oauth") {
+        fail(`profile "${profile.id}" targets public_oauth_listener but the deployment is tunnel-mode; public ingress requires OAuth mode`);
+      }
+    } else {
       if (profile.kind !== "secure_mcp_tunnel") {
         fail(`profile "${profile.id}" targets secure_tunnel_listener; only secure_mcp_tunnel profiles may use that target`);
       }
       if (profile.audience !== "owner_public") {
         fail(`profile "${profile.id}" targets secure_tunnel_listener but has ${profile.audience} audience`);
       }
-    } else if (profile.kind === "secure_mcp_tunnel") {
-      fail(`profile "${profile.id}" of kind secure_mcp_tunnel must target secure_tunnel_listener`);
+      if (context.authMode !== "tunnel") {
+        fail(`profile "${profile.id}" targets secure_tunnel_listener but the deployment is oauth-mode; Secure MCP Tunnel requires a compatible tunnel deployment`);
+      }
     }
 
     // 8. canonical OAuth resource uniqueness for ENABLED owner_public profiles

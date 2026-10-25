@@ -14,19 +14,27 @@ export interface PeerPrincipal {
   grantedRoots: readonly string[];
   /** Canonical durable identity: `peer:<peerId>:<credentialId>`. */
   principalId: string;
+  /** Stable authorization grant identity; changes when grants change. */
+  grantRevision: number;
+  grantHash: string;
 }
 
 export function peerPrincipalId(peerId: string, credentialId: string): string {
   return `peer:${peerId}:${credentialId}`;
 }
 
-export function peerPrincipalFromDescriptor(d: PeerDescriptor): PeerPrincipal {
+export function peerPrincipalFromDescriptor(
+  d: PeerDescriptor,
+  authorization: { revision: number; hash: string },
+): PeerPrincipal {
   return {
     peerId: d.id,
     credentialId: d.credentialId,
     capabilities: [...d.capabilities],
     grantedRoots: [...d.grantedRoots],
     principalId: peerPrincipalId(d.id, d.credentialId),
+    grantRevision: authorization.revision,
+    grantHash: authorization.hash,
   };
 }
 

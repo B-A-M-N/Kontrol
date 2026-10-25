@@ -1,0 +1,98 @@
+# Kontrol public HTTPS bridge (PR-D, P1-09) - Caddyfile EXAMPLE
+#
+# Topology: public client -> this VPS (TLS termination, its own domain)
+#   -> private Tailscale Serve upstream on the Kontrol host (:9443)
+#   -> loopback 127.0.0.1:7678 (KONTROL_PUBLIC_MCP listener, OAuth).
+#
+# This file is an AUDITED EXAMPLE: every route, header rule, and timeout
+# below is deliberate. Do not add routes, do not disable TLS verification,
+# and never proxy any route outside the allowlist. Review diffs line by
+# line; src/ingress/bridge-asset.test.ts enforces the header strip-list
+# parity, the route allowlist, and the reverse_proxy-block structure
+# against the Kontrol source contracts.
+#
+# Preconditions (see deploy/bridge/README.md):
+#   - This VPS is a Tailscale tailnet member with a dedicated bridge tag.
+#   - The tailnet ACL allows ONLY this node to reach TCP 9443 on the host.
+#   - Kontrol host: tailscale serve --bg --https=9443 http://127.0.0.1:7678
+#   - Kontrol runs KONTROL_PUBLIC_MCP_ENABLED=1 with KONTROL_AUTH_MODE=oauth.
+#   - KONTROL_PUBLIC_BASE_URL origin equals this bridge origin.
+
+{
+	servers {
+		# Bound request-header memory per incoming connection. Keep body and
+		# stream limits separate: MCP uploads are capped below and SSE remains
+		# active through its heartbeat writes.
+		max_header_size 32KiB
+	}
+}
+
+kontrol.example.com {
+	# TLS via ACME (Let's Encrypt) is automatic; certificates are managed
+	# by Caddy and validated by clients. No TLS setting is weakened here.
+
+	# Only the MCP + OAuth surface may pass. Everything else is 404.
+	@mcp_or_auth path /mcp /.well-known/* /authorize /token /register /revoke /healthz
+
+	handle @mcp_or_auth {
+		reverse_proxy https://kontrol-node.tail-scale.ts.net:9443 {
+			# Header hygiene BEFORE proxying: the upstream trusts nothing a
+			# client sends. This strip list MUST stay in parity with
+			# BRIDGE_STRIP_HEADERS and the X-Kontrol-* prefix rule in
+			# src/ingress/proxy-context.ts (enforced by
+			# src/ingress/bridge-asset.test.ts). header_up is a
+			# reverse_proxy subdirective - it MUST stay inside this block.
+			header_up -X-Forwarded-For
+			header_up -X-Forwarded-Host
+			header_up -X-Forwarded-Proto
+			header_up -X-Forwarded-Port
+			header_up -X-Forwarded-Protocol
+			header_up -X-Forwarded-Scheme
+			header_up -X-Real-IP
+			header_up -CF-Connecting-IP
+			header_up -True-Client-IP
+			header_up -Tailscale-User-Login
+			header_up -Tailscale-User-Name
+			header_up -Tailscale-User-Profile-Pic
+			header_up -Tailscale-User
+			header_up -X-Kontrol-*
+			header_up -Forwarded
+
+			# Pin the upstream Host (and SNI) to the Serve listener; a client
+			# Host or Forwarded value can never influence OAuth redirects or
+			# audience binding. The Kontrol listener's Host allowlist must
+			# include this exact tailnet DNS name (see README).
+			header_up Host {upstream_hostport}
+
+			# Streamed responses (MCP SSE): no buffering, and transport
+			# timeouts far above the 15-second SSE heartbeat and 45-second
+			# POST responses so no Caddy cutoff ever fires first.
+			flush_interval -1
+			# Upstream TLS validation is ON by default; never add any
+			# transport override that weakens certificate verification.
+			transport http {
+				dial_timeout 5s
+				tls_timeout 10s
+				max_conns_per_host 128
+				read_timeout 3600s
+				write_timeout 3600s
+			}
+		}
+	}
+
+	handle {
+		respond 404
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		-Server
+	}
+
+	# Aligned with the public listener's own MCP body bound (8MB): a
+	# request accepted at the edge must not be rejected only at the bridge.
+	request_body {
+		max_size 8MB
+	}
+}

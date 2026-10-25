@@ -35,6 +35,8 @@ import {
 } from "./ingress/profile-status.js";
 import { readTailscaleFacts, sanitizeProxyTarget } from "./ingress/tailscale-status.js";
 import { validateIngressProfiles } from "./ingress/validate.js";
+import { applyIngressProfile, disableIngressProfile, listIngressOperationReceipts, reconcileIngressProfile } from "./ingress/controller.js";
+import { latestIngressHealthByProfile } from "./ingress/health-store.js";
 
 type Command = "serve" | "up" | "init" | "doctor" | "config" | "service" | "snapshots" | "review-loop" | "agent" | "ingress" | "help" | "version";
 const require = createRequire(import.meta.url);
@@ -231,22 +233,24 @@ async function runAgentCommand(args: string[]): Promise<void> {
 }
 
 const INGRESS_USAGE = [
-  "Usage: kontrol ingress <inspect|plan> [--json]",
+  "Usage: kontrol ingress <inspect|plan|apply|disable|reconcile|doctor> [profile-id] [--confirm] [--json]",
   "",
   "  inspect  Read-only observation: Tailscale facts, a bounded loopback probe of expected",
   "           local target ports, and an expected-vs-observed report per profile.",
   "  plan     Dry-run planner: prints the tailscale serve/funnel commands this deployment",
   "           would need. Nothing is executed.",
+  "  apply    Apply one enabled profile after recording a durable operation intent (--confirm required).",
+  "  disable  Remove only a route with a matching Kontrol ownership receipt (--confirm required).",
+  "  reconcile Observe and resolve an interrupted apply/disable operation; never retries commands.",
+  "  doctor   Show route mapping state and recent durable operation receipts.",
   "",
-  "This build performs ZERO Tailscale mutations. The apply and disable subcommands do not exist yet.",
+  "Apply and disable never reset Serve/Funnel globally and refuse routes owned outside Kontrol.",
   "",
 ].join("\n");
 
 /**
- * P1-08: read-only Tailscale ingress observation and dry-run planning. This
- * command NEVER mutates Tailscale state — no serve/funnel configuration, no
- * reset, no backend-state changes — and apply/disable intentionally do not
- * exist in this build (a later PR may add them behind explicit consent).
+ * Tailscale ingress observation, dry-run planning, and profile-scoped route
+ * lifecycle. Mutation requires an explicit --confirm and durable receipts.
  */
 async function runIngressCommand(args: string[]): Promise<void> {
   const sub = args[0];
@@ -255,11 +259,51 @@ async function runIngressCommand(args: string[]): Promise<void> {
     output.write(INGRESS_USAGE);
     return;
   }
-  if (sub !== "inspect" && sub !== "plan") {
-    throw new Error(`Unknown ingress subcommand: ${sub} (expected "inspect" or "plan")`);
+  if (["apply", "disable", "reconcile"].includes(sub)) {
+    const profileId = args[1];
+    if (!profileId || profileId.startsWith("--")) throw new Error(`Usage: kontrol ingress ${sub} <profile-id>${sub === "reconcile" ? "" : " --confirm"}`);
+    const confirm = args.includes("--confirm");
+    if (sub !== "reconcile" && !confirm) throw new Error(`kontrol ingress ${sub} requires --confirm to authorize a Tailscale route change`);
+    if (args.slice(2).some((arg) => arg !== "--confirm" && arg !== "--json")) throw new Error(`Unexpected argument for ingress ${sub}`);
+    const config = loadConfig();
+    const operation = sub === "apply"
+      ? await applyIngressProfile(config, config.stateDir, profileId)
+      : sub === "disable"
+        ? await disableIngressProfile(config, config.stateDir, profileId)
+        : await reconcileIngressProfile(config, config.stateDir, profileId);
+    if (json) console.log(JSON.stringify({ operation: operation ?? null }, null, 2));
+    else console.log(operation ? `ingress ${operation.action} ${operation.profileId}: ${operation.state} (${operation.operationId})` : `ingress ${profileId}: no operation receipt`);
+    if (operation && ["failed", "reconciliation_required"].includes(operation.state)) process.exitCode = 1;
+    return;
+  }
+  if (sub !== "inspect" && sub !== "plan" && sub !== "doctor") {
+    throw new Error(`Unknown ingress subcommand: ${sub} (expected inspect|plan|apply|disable|reconcile|doctor)`);
   }
   const config = loadConfig();
   const profiles = config.ingress?.profiles ?? [];
+  if (sub === "doctor") {
+    if (config.ingress) validateIngressProfiles(config.ingress.profiles, validationContextFromConfig(config));
+    const facts = await readTailscaleFacts();
+    const probes = await probeExpectedLocalPorts(config);
+    const report = buildIngressReport(config, facts, probes);
+    const receipts = listIngressOperationReceipts(config.stateDir);
+    const health = latestIngressHealthByProfile(config.stateDir);
+    const result = { report, health, receipts: receipts.slice(-32) };
+    if (json) console.log(JSON.stringify(result, null, 2));
+    else {
+      console.log("kontrol ingress doctor — observations are profile-scoped; mapping does not imply external readiness");
+      for (const warning of facts.warnings) console.log(`warning: ${warning}`);
+      for (const status of report.profiles) {
+        const latest = [...receipts].reverse().find((receipt) => receipt.profileId === status.id);
+        const healthStatus = health.find((item) => item.profileId === status.id);
+        console.log(`  [${status.id}] ${status.privacy} ${status.classification}${healthStatus ? `; last qualification=${healthStatus.state}/${healthStatus.evidenceTier} at ${healthStatus.observedAt}` : ""}${latest ? `; last operation=${latest.action}/${latest.state}` : ""}`);
+      }
+      if (receipts.length === 0) console.log("  no durable ingress operation receipts");
+      if (health.length === 0) console.log("  no durable ingress health observations");
+    }
+    if (facts.warnings.length > 0 || report.profiles.some((profile) => profile.enabled && ["UNKNOWN", "MISMATCH", "LOCAL_DOWN", "NETWORK_DOWN"].includes(profile.classification))) process.exitCode = 1;
+    return;
+  }
   if (sub === "plan") {
     let entries: IngressPlanEntry[];
     try {
@@ -328,7 +372,7 @@ async function runIngressCommand(args: string[]): Promise<void> {
   );
   const allMatched = report.profiles
     .filter((status) => enabledTailscale.has(status.id))
-    .every((status) => status.classification === "MATCHED");
+    .every((status) => status.classification === "MAPPING_MATCHED");
   // Any facts-layer warning means part of the observation could not run; the
   // report still prints (with notes) but automation must see a nonzero exit.
   if (!allMatched || facts.warnings.length > 0) process.exitCode = 1;
@@ -1108,7 +1152,7 @@ function printHelp(): void {
       "  kontrol snapshots stats|gc",
       "  kontrol review-loop status|on|off|pause|resume --session <workSessionId>",
       "  kontrol agent list|add|remove      Register any loopback HTTP ACP agent",
-      "  kontrol ingress inspect|plan       Read-only Tailscale ingress observation and dry-run planning (no apply/disable in this build)",
+      "  kontrol ingress inspect|plan|apply|disable|reconcile|doctor   Tailscale route control and qualification",
       "  kontrol -v, --version   Print the installed version",
       "",
       "For temporary tunnels:",

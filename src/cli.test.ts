@@ -405,23 +405,17 @@ for (const flag of ["-v", "--version"]) {
   );
   assert.match(cliSource, /command === "ingress"\) return "ingress";/, "normalizeCommand must accept ingress");
   assert.match(cliSource, /case "ingress":\s+await runIngressCommand\(args\);/, "main switch must dispatch ingress");
-  assert.match(cliSource, /Usage: kontrol ingress <inspect\|plan>/, "the ingress usage text must mention inspect and plan");
-  assert.match(cliSource, /apply and disable subcommands do not exist/, "help must state that apply/disable do not exist in this build");
+  assert.match(cliSource, /Usage: kontrol ingress <inspect\|plan\|apply\|disable\|reconcile\|doctor>/, "ingress help must expose observation and lifecycle commands");
+  assert.match(cliSource, /requires --confirm to authorize a Tailscale route change/, "route mutations must require explicit operator authorization");
 
-  // ZERO-MUTATION gate (the enforcement test for the ingress mandate): the
-  // CLI source must never contain a mutating tailscale invocation, and the
-  // gate spans EVERY ingress module - a mutating flag added to any of them is
-  // caught here, not just in tailscale-status's own runtime allowlist.
+  // Mutation boundary gate: only the facts reader and the narrow controller
+  // may spawn Tailscale; both use execFile without a shell. The controller's
+  // argument grammar excludes resets and only accepts profile-scoped routes.
   // Two complementary invariants:
-  // (1) tailscale-status.ts is the ONLY ingress module allowed to spawn a
-  //     subprocess at all (its runtime allowlist refuses mutating
-  //     invocations; tested behaviorally above/its own suite). It must never
-  //     contain a mutating flag/reset literal.
-  // (2) Every OTHER ingress module must not even import child_process — they
-  //     are pure config/report/plan logic (profile-status legitimately
-  //     PRINTS the exact command text an operator would run by hand, so a
-  //     blanket --bg string ban there would be wrong; the ban is on
-  //     execution capability, not on the dry-run text).
+  // (1) tailscale-status.ts is the read-only facts executor and must never
+  //     contain mutation flags. (2) controller.ts is the only mutation
+  //     executor and keeps a narrow argument allowlist. (3) all other ingress
+  //     modules remain free of child-process capability.
   const tailscaleStatusSource = readFileSync(fileURLToPath(new URL("./ingress/tailscale-status.ts", import.meta.url)), "utf8");
   for (const [banner, label] of [
     [new RegExp("--bg"), "the mutating --bg flag"],
@@ -439,23 +433,25 @@ for (const flag of ["-v", "--version"]) {
   assert.doesNotMatch(tailscaleStatusSource, new RegExp("require[(]"), "tailscale-status.ts must not use require()");
   const execFileCallSites = tailscaleStatusSource.split("execFile(").length - 1;
   assert.equal(execFileCallSites, 1, "tailscale-status.ts must have exactly ONE execFile call site (inside the guarded helper)");
-  // P3-D: scan the ingress directory instead of a fixed list so a NEW module
-  // importing child_process is caught too (tailscale-status.ts is the only
-  // sanctioned spawner).
+  const controllerSource = readFileSync(fileURLToPath(new URL("./ingress/controller.ts", import.meta.url)), "utf8");
+  assert.match(controllerSource, /import [{] execFile [}] from "node:child_process"/, "controller must use execFile, never a shell");
+  assert.equal(controllerSource.split("execFile(").length - 1, 1, "controller must have one guarded execFile site");
+  assert.match(controllerSource, /const allowed = \/\^\(serve\|funnel\)/, "controller must enforce exact Serve/Funnel argument grammar");
+  assert.doesNotMatch(controllerSource, /execSync|spawnSync/, "controller must never use a synchronous shell surface");
+  assert.match(controllerSource, /args\.some\(\(arg\) => arg === "reset"/, "controller explicitly rejects any reset argument");
+  // P3-D: scan the ingress directory so new modules cannot gain child process
+  // capability without being explicitly reviewed here.
   const ingressDir = fileURLToPath(new URL("./ingress/", import.meta.url));
   const pureIngressModules = readdirSync(ingressDir)
-    .filter((name) => name.endsWith(".ts") && !name.endsWith(".test.ts") && name !== "tailscale-status.ts")
+    .filter((name) => name.endsWith(".ts") && !name.endsWith(".test.ts") && name !== "tailscale-status.ts" && name !== "controller.ts")
     .sort()
     .map((name) => "./ingress/" + name);
   for (const gateFile of pureIngressModules) {
     const source = readFileSync(fileURLToPath(new URL(gateFile, import.meta.url)), "utf8");
     assert.doesNotMatch(source, new RegExp('from [\'\"]node:child_process|require[(][\'\"]node:child_process'), gateFile + " must never import child_process (pure logic only)");
   }
-  // P1-B: cli.ts itself is scanned too. It must never gain a mutating
-  // tailscale invocation, and it must never pass the tailscale binary name
-  // to any spawn/exec call - the ONLY sanctioned spawner is
-  // tailscale-status.ts behind its runtime allowlist (enforced behaviorally
-  // by the sentinel tripwires below).
+  // P1-B: cli.ts only calls the controller API. It must not gain a direct
+  // mutating flag or pass the Tailscale binary to any child process.
   assert.doesNotMatch(cliSource, new RegExp("--bg"), "cli.ts must never contain the mutating --bg flag");
   assert.doesNotMatch(cliSource, new RegExp("serve reset"), "cli.ts must never reset serve state");
   assert.doesNotMatch(cliSource, new RegExp("funnel reset"), "cli.ts must never reset funnel state");
@@ -487,6 +483,8 @@ for (const flag of ["-v", "--version"]) {
     allowedHosts: ["kontrol.example.com"],
   };
   const refused = runIngressPlan({
+    KONTROL_AUTH_MODE: "tunnel",
+    KONTROL_POLICY_MODE: "allow",
     KONTROL_PUBLIC_BASE_URL: "https://kontrol.example.com",
     KONTROL_INGRESS_PROFILES: JSON.stringify([tunnelProfile]),
   });

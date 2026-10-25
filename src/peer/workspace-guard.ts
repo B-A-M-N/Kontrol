@@ -7,6 +7,8 @@
  */
 import { homedir } from "node:os";
 import { basename, resolve } from "node:path";
+import { closeSync, existsSync, fsyncSync, openSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
 import type { ServerConfig } from "../config.js";
 import { isPathInsideRoot } from "../roots.js";
 import type { ConnectionContext } from "../mcp/connection-context.js";
@@ -48,11 +50,64 @@ export function peerMayProposePatches(
  * restart a peer regains access by re-running open_workspace on the source
  * path, which re-records ownership.
  */
+/**
+ * Durable ownership file. The map remains the runtime cache, but a mode-0600
+ * sidecar records peer-created worktree ownership so a restart can restore
+ * the exact principal binding instead of silently treating disk worktrees as
+ * orphaned. Existing corrupt state fails closed at restore time.
+ */
+const PEER_WORKTREE_OWNERS_FILE = "peer-worktree-owners.json";
 const peerWorktreeOwners = new Map<string, string>();
 
 /** Record that this peer principal opened this managed worktree workspace. */
-export function recordPeerWorktree(workspaceId: string, principalId: string): void {
+export function recordPeerWorktree(workspaceId: string, principalId: string, stateDir?: string): void {
   peerWorktreeOwners.set(workspaceId, principalId);
+  if (stateDir) persistPeerWorktreeOwners(stateDir);
+}
+
+function persistPeerWorktreeOwners(stateDir: string): void {
+  const payload = JSON.stringify(Object.fromEntries(peerWorktreeOwners));
+  const path = resolve(stateDir, PEER_WORKTREE_OWNERS_FILE);
+  const temporaryPath = `${path}.tmp.${randomBytes(8).toString("hex")}`;
+  const fd = openSync(temporaryPath, "wx", 0o600);
+  try {
+    writeFileSync(fd, payload);
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+  try {
+    renameSync(temporaryPath, path);
+    const directoryFd = openSync(resolve(stateDir), "r");
+    try { fsyncSync(directoryFd); } finally { closeSync(directoryFd); }
+  } catch (error) {
+    // Keep the old authority record intact if publication failed. A leftover
+    // uniquely named temporary file is inert and can be removed by bounded
+    // state-directory maintenance later.
+    throw error;
+  }
+}
+
+/** Restore ownership from durable state. Corrupt existing evidence fails closed. */
+export function restorePeerWorktreeOwners(stateDir: string): void {
+  const path = resolve(stateDir, PEER_WORKTREE_OWNERS_FILE);
+  if (!existsSync(path)) return;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(path, "utf8"));
+  } catch (error) {
+    throw new Error(`Peer worktree ownership state is corrupt (${(error as Error).message}); refusing to restore authority.`);
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error("Peer worktree ownership state is corrupt; refusing to restore authority.");
+  }
+  peerWorktreeOwners.clear();
+  for (const [workspaceId, owner] of Object.entries(parsed as Record<string, unknown>)) {
+    if (typeof owner !== "string" || owner.length === 0) {
+      throw new Error("Peer worktree ownership state is corrupt; refusing to restore authority.");
+    }
+    peerWorktreeOwners.set(workspaceId, owner);
+  }
 }
 
 /** True only when the worktree was recorded for exactly this principal. */

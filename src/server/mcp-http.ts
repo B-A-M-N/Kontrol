@@ -819,6 +819,25 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
         // logical client IS the peer principal, so a rotated/revoked
         // credential - or an owner/peer token presented on the other listener
         // - cannot attach to an existing session.
+        // Authorization continuity: a peer session must be resumed only by a
+        // principal carrying the exact authorization revision/hash used at
+        // initialization. Credential rotation or grant changes create a fresh
+        // initialize and never let old transports exercise stale authority.
+        if (
+          peerPrincipal
+          && sessionState
+          && (sessionState.peerAuthorizationRevision !== peerPrincipal.grantRevision
+            || sessionState.peerAuthorizationHash !== peerPrincipal.grantHash)
+        ) {
+          logEvent(config.logging, "warn", "mcp_session_authorization_stale", {
+            requestId,
+            sessionIdPrefix: sessionIdPrefix(sessionId),
+            expectedRevision: sessionState.peerAuthorizationRevision,
+            actualRevision: peerPrincipal.grantRevision,
+          });
+          sendJsonRpcError(res, 403, -32001, "MCP session authorization has been superseded; initialize a fresh session");
+          return;
+        }
         if (
           sessionState
           && (config.authMode === "oauth" || sessionState.authSource === "peer_token")
@@ -1049,6 +1068,8 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
                 authenticatedPrincipalId: connectionContext.authenticatedPrincipalId,
                 authSource: connectionContext.authSource ?? "anonymous",
                 listenerKind: peerPrincipal ? "peer" : deps.publicListener?.() ? "owner_public" : "owner",
+                peerAuthorizationRevision: peerPrincipal?.grantRevision,
+                peerAuthorizationHash: peerPrincipal?.grantHash,
                 conversationId: requestConversationId,
                 approvalCorrelationId: clientIdentity.source === "client_info_fallback" ? undefined : clientId,
                 workSessionId: connectionContext.workSessionId,

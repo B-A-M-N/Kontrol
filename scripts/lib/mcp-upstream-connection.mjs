@@ -1,6 +1,9 @@
 /** Owns a reconnectable upstream MCP client while leaving the downstream server alive. */
 export class McpUpstreamConnection {
   #createClient;
+  #prepareCandidate;
+  #qualifyClient;
+  #onConnectResult;
   #onState;
   #client = null;
   #transport = null;
@@ -10,9 +13,13 @@ export class McpUpstreamConnection {
   #retryTimer = null;
   #pendingDelay = null;
   #stopping = false;
+  #candidate;
 
-  constructor({ createClient, onState = () => {}, maxAttempts = 8, baseDelayMs = 250, maxDelayMs = 15_000, recoveryWindowMs = 30_000, random = Math.random }) {
+  constructor({ createClient, prepareCandidate, qualifyClient, onConnectResult = () => {}, onState = () => {}, maxAttempts = 8, baseDelayMs = 250, maxDelayMs = 15_000, recoveryWindowMs = 30_000, random = Math.random }) {
     this.#createClient = createClient;
+    this.#prepareCandidate = prepareCandidate;
+    this.#qualifyClient = qualifyClient;
+    this.#onConnectResult = onConnectResult;
     this.#onState = onState;
     this.maxAttempts = maxAttempts;
     this.baseDelayMs = baseDelayMs;
@@ -47,7 +54,7 @@ export class McpUpstreamConnection {
 
   #setState(state) {
     this.#state = state;
-    this.#onState(state, this.#generation);
+    this.#onState(state, this.#generation, this.#candidate);
   }
 
   async start() {
@@ -64,24 +71,30 @@ export class McpUpstreamConnection {
   async #connectOnce() {
     if (this.#stopping) throw new Error("Upstream connection is stopping");
     const generation = ++this.#generation;
-    const { client, transport } = this.#createClient();
+    const { client, transport, candidate } = this.#createClient();
+    this.#candidate = candidate;
     this.#client = client;
     this.#transport = transport;
     client.onclose = () => {
       if (generation !== this.#generation || this.#stopping) return;
+      if (candidate) this.#onConnectResult(candidate, false);
       this.#client = null;
       this.#transport = null;
       this.#setState("DEGRADED");
       void this.reconnect();
     };
     try {
+      await this.#prepareCandidate?.(candidate);
       await client.connect(transport);
+      await this.#qualifyClient?.(client, candidate);
       if (generation !== this.#generation || this.#stopping) {
         try { await client.close(); } catch {}
         throw new Error("Obsolete upstream connection generation");
       }
+      if (candidate) this.#onConnectResult(candidate, true);
       this.#setState("READY");
     } catch (error) {
+      if (candidate) this.#onConnectResult(candidate, false);
       if (generation === this.#generation) {
         this.#client = null;
         this.#transport = null;
@@ -96,16 +109,19 @@ export class McpUpstreamConnection {
     if (this.#reconnectPromise) return this.#reconnectPromise;
     this.#reconnectPromise = (async () => {
       this.#setState("RECONNECTING");
+      let retryAfterMs = 0;
       for (let attempt = 0; attempt < this.maxAttempts && !this.#stopping; attempt += 1) {
         if (attempt > 0) {
           const ceiling = Math.min(this.maxDelayMs, this.baseDelayMs * (2 ** (attempt - 1)));
-          await this.#wait(Math.floor(ceiling * (0.75 + this.random() * 0.5)));
+          await this.#wait(Math.max(retryAfterMs, Math.floor(ceiling * (0.75 + this.random() * 0.5))));
+          retryAfterMs = 0;
           if (this.#stopping) return;
         }
         try {
           await this.#connectOnce();
           return;
-        } catch {
+        } catch (error) {
+          if (Number.isFinite(error?.retryAfterMs)) retryAfterMs = Math.max(1, error.retryAfterMs);
           if (!this.#stopping) this.#setState("RECONNECTING");
         }
       }

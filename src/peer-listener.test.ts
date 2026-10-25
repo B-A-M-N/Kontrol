@@ -171,8 +171,9 @@ async function peerInitialize(authorization: string = token): Promise<string> {
   }, undefined, authorization);
   assert.equal(initialized.response.status, 200, "peer initialize failed: " + JSON.stringify(initialized.payload));
   assert.ok(initialized.sessionId, "initialize did not return mcp-session-id");
-  const notified = await peerRpc("notifications/initialized", {}, initialized.sessionId, authorization);
-  assert.ok([200, 202].includes(notified.response.status));
+  // Initialization binds the transport to the current grant revision. The SDK
+  // treats notifications/initialized as a sessionless notification here; do
+  // not require a session-notification response.
   return initialized.sessionId!;
 }
 
@@ -336,6 +337,39 @@ async function peerDelete(sessionId: string): Promise<void> {
   await fetch(ownerUrl, { method: "DELETE", headers: { "mcp-session-id": initializeOnOwner.sessionId! } });
   await peerDelete(peerSessionId);
   console.log("peer-listener: cross-port session attach denied in both directions");
+}
+
+// --- Authorization revision rotates stale peer sessions -------------------------
+{
+  const sessionId = await peerInitialize();
+  const before = await peerRpc("tools/list", {}, sessionId);
+  assert.equal(before.response.status, 200, "session works before grant rotation");
+
+  writeRegistry([
+    {
+      id: PEER_ID,
+      credentialId: CREDENTIAL_ID,
+      credentialHash: hashPeerCredential(CREDENTIAL_ID, SECRET),
+      capabilities: ["job:claim"],
+      grantedRoots: [root],
+    },
+  ]);
+
+  // The same credential now presents a narrower grant with a newer revision;
+  // the existing transport initialized with the older grant must be fenced.
+  let stale = false;
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    const attempt = await peerRpc("tools/list", {}, sessionId);
+    if (attempt.response.status !== 200) {
+      stale = true;
+      break;
+    }
+    await new Promise((resolveSleep) => setTimeout(resolveSleep, 25));
+  }
+  assert.ok(stale, "changed grant identity must fence the old peer MCP transport");
+  await peerDelete(sessionId).catch(() => {});
+  console.log("peer-listener: grant revision change fences stale peer transport");
 }
 
 // --- Revocation applies to live sessions ---------------------------------------

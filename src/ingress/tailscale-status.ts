@@ -42,6 +42,23 @@ export interface ServeMapping {
    * AllowFunnel HostPort map (or a nested boolean in tolerated shapes).
    * Undefined means the document does not say — never inferred from port. */
   allowFunnel?: boolean;
+  /** Exact identity when this mapping came from a recognized status-schema
+   * path and every identity field was unambiguous. Absence is inconclusive. */
+  identity?: IngressRouteIdentity;
+}
+
+/** Exact normalized route identity used for ingress matching. Query strings,
+ * userinfo, and fragments are never retained; a target carrying those extras
+ * is intentionally not representable and therefore cannot match. */
+export interface IngressRouteIdentity {
+  hostname: string;
+  listenPort: string;
+  handlerPath: string;
+  upstreamScheme: "http" | "https";
+  upstreamHost: string;
+  upstreamPort: string;
+  upstreamPath: string;
+  allowFunnel: boolean;
 }
 
 export interface TailscaleFacts {
@@ -60,6 +77,11 @@ export interface TailscaleFacts {
    * per-route allowFunnel flag attributed from the AllowFunnel HostPort map.
    */
   funnelMappings: ServeMapping[];
+  /** Whether serve status used a schema this build understands. Unsupported
+   * shapes remain inconclusive and can never produce a positive match. */
+  serveStatusSchemaSupported: boolean;
+  /** Same contract as serveStatusSchemaSupported for funnel status. */
+  funnelStatusSchemaSupported: boolean;
   /** One stable-category warning per failed fact command — never
    * subprocess output, paths, or secrets. */
   warnings: string[];
@@ -118,6 +140,8 @@ export async function readTailscaleFacts(exec: TailscaleExec = defaultTailscaleE
     dnsName: null,
     serveMappings: [],
     funnelMappings: [],
+    serveStatusSchemaSupported: true,
+    funnelStatusSchemaSupported: true,
     warnings,
   };
 
@@ -151,13 +175,23 @@ export async function readTailscaleFacts(exec: TailscaleExec = defaultTailscaleE
   const serve = await safeExec(exec, ["serve", "status", "--json"], warnings);
   if (serve) {
     const parsed = safeJsonParse(serve.stdout, ["serve", "status", "--json"], warnings);
-    if (parsed) facts.serveMappings = parseServeMappings(parsed);
+    if (parsed) {
+      const result = parseServeMappings(parsed);
+      facts.serveMappings = result.mappings;
+      facts.serveStatusSchemaSupported = result.schemaSupported;
+      if (!result.schemaSupported) warnings.push("tailscale serve status schema is unsupported; mapping comparison is inconclusive");
+    }
   }
 
   const funnel = await safeExec(exec, ["funnel", "status", "--json"], warnings);
   if (funnel) {
     const parsed = safeJsonParse(funnel.stdout, ["funnel", "status", "--json"], warnings);
-    if (parsed) facts.funnelMappings = parseServeMappings(parsed);
+    if (parsed) {
+      const result = parseServeMappings(parsed);
+      facts.funnelMappings = result.mappings;
+      facts.funnelStatusSchemaSupported = result.schemaSupported;
+      if (!result.schemaSupported) warnings.push("tailscale funnel status schema is unsupported; mapping comparison is inconclusive");
+    }
   }
 
   return facts;
@@ -219,118 +253,131 @@ function safeJsonParse(text: string, args: string[], warnings: string[]): Record
   return null;
 }
 
-const WALK_MAX_DEPTH = 12;
-const WALK_MAX_NODES = 2048;
-
-/**
- * Parse a serve/funnel status document into mappings. The configured schema
- * is version-dependent: current versions nest handlers under
- * Web.<host>:<port>.Handlers.<path>.Proxy with a top-level AllowFunnel map
- * keyed by route; older or unknown shapes are tolerated by the same walker.
- * Depth and node budgets bound the walk; overflow is tolerated silently
- * (unmapped shapes simply yield no classification data).
- */
-function parseServeMappings(parsed: Record<string, unknown>): ServeMapping[] {
-  // Upstream AllowFunnel is map[HostPort]bool keyed by SNI:port (ipn/serve.go
-  // deletes entries when unset), so attribution is by FULL HostPort — never
-  // by port alone, which would leak funnel state across hosts.
-  const funnelByHostPort = new Map<string, boolean>();
-  const out: ServeMapping[] = [];
-  walkForMappings(parsed, [], undefined, funnelByHostPort, out, 0, null);
-  for (const mapping of out) {
-    if (mapping.allowFunnel === undefined && mapping.hostPort !== undefined) {
-      const byHostPort = funnelByHostPort.get(mapping.hostPort);
-      if (byHostPort !== undefined) mapping.allowFunnel = byHostPort;
-    }
-  }
-  return out;
+interface ParsedServeStatus {
+  mappings: ServeMapping[];
+  schemaSupported: boolean;
 }
 
-/** Normalize a HostPort key (node.ts.net:443 or https://node.ts.net:443) to
- * the canonical host:port spelling. null for bare ports ("443"), bare words
- * (URL would invent a default port), and unrecognizable keys — attribution
- * must stay exact, never invented. */
+/**
+ * Parse only the schema this classifier can prove: top-level or service-local
+ * `Web.<HostPort>.Handlers.<path>.Proxy`, with `AllowFunnel` keyed by
+ * HostPort. Unknown documents return no positive identity; the facts layer
+ * marks them unsupported so classification becomes UNKNOWN.
+ */
+export function parseServeMappings(parsed: Record<string, unknown>): ParsedServeStatus {
+  const funnelByHostPort = new Map<string, boolean>();
+  const allowFunnel = parsed["AllowFunnel"] ?? parsed["allowFunnel"];
+  if (typeof allowFunnel === "object" && allowFunnel !== null && !Array.isArray(allowFunnel)) {
+    for (const [key, value] of Object.entries(allowFunnel as Record<string, unknown>)) {
+      if (typeof value !== "boolean") continue;
+      const hostPort = normalizeHostPort(key);
+      if (hostPort !== null) funnelByHostPort.set(hostPort, value);
+    }
+  }
+
+  const webRoots: Array<{ value: unknown; serviceLocal: boolean }> = [];
+  const web = parsed["Web"];
+  if (isPlainRecord(web)) webRoots.push({ value: web, serviceLocal: false });
+  const services = parsed["Services"];
+  if (isPlainRecord(services)) {
+    for (const service of Object.values(services)) {
+      if (!isPlainRecord(service) || !isPlainRecord(service["Web"])) continue;
+      webRoots.push({ value: service["Web"], serviceLocal: true });
+    }
+  }
+
+  if (webRoots.length === 0) {
+    return {
+      mappings: [],
+      schemaSupported: Object.keys(parsed).length === 0,
+    };
+  }
+
+  const mappings: ServeMapping[] = [];
+  for (const { value: webRoot } of webRoots) {
+    for (const [hostPortKey, hostNode] of Object.entries(webRoot as Record<string, unknown>)) {
+      if (!isPlainRecord(hostNode) || !isPlainRecord(hostNode["Handlers"])) continue;
+      const hostPort = normalizeHostPort(hostPortKey);
+      if (hostPort === null) continue;
+      const listenPort = portFromHostPort(hostPort);
+      const allowFunnelValue = funnelByHostPort.get(hostPort);
+      for (const [handlerPath, handler] of Object.entries(hostNode["Handlers"] as Record<string, unknown>)) {
+        if (!isPlainRecord(handler) || typeof handler["Proxy"] !== "string") continue;
+        const proxy = handler["Proxy"];
+        const mapping: ServeMapping = {
+          port: listenPort,
+          path: normalizeHandlerPath(handlerPath),
+          proxyTarget: sanitizeProxyTarget(proxy),
+        };
+        mapping.hostPort = hostPort;
+        if (allowFunnelValue !== undefined) mapping.allowFunnel = allowFunnelValue;
+        // AllowFunnel is a sparse true map: absence in a recognized Web
+        // schema means funnel disabled, not unknown.
+        const identity = routeIdentity(hostPort, mapping.path, proxy, allowFunnelValue ?? false);
+        if (identity) mapping.identity = identity;
+        mappings.push(mapping);
+      }
+    }
+  }
+  return { mappings, schemaSupported: true };
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function normalizeHandlerPath(path: string): string {
+  return path.startsWith("/") ? path : "/" + path;
+}
+
+function routeIdentity(
+  hostPort: string,
+  handlerPath: string,
+  proxy: string,
+  allowFunnel: boolean,
+): IngressRouteIdentity | undefined {
+  const hostname = hostPort.slice(0, hostPort.lastIndexOf(":"));
+  const listenPort = portFromHostPort(hostPort);
+  if (listenPort === "") return undefined;
+  let url: URL;
+  try {
+    url = new URL(proxy);
+  } catch {
+    return undefined;
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") return undefined;
+  if (url.username || url.password || url.search || url.hash) return undefined;
+  if (url.pathname !== "" && url.pathname !== "/") return undefined;
+  return {
+    hostname: hostname.toLowerCase(),
+    listenPort,
+    handlerPath,
+    upstreamScheme: url.protocol === "https:" ? "https" : "http",
+    upstreamHost: url.hostname.toLowerCase(),
+    upstreamPort: effectiveUrlPort(url),
+    upstreamPath: "/",
+    allowFunnel,
+  };
+}
+
+function effectiveUrlPort(url: URL): string {
+  return url.port !== "" ? url.port : url.protocol === "https:" ? "443" : "80";
+}
+
+/** Normalize a HostPort key to canonical host:port. Unrecognizable keys are
+ * rejected so they can never borrow another route's identity. */
 function normalizeHostPort(key: string): string | null {
-  if (/^\d{1,5}$/.test(key)) return null;
-  if (!key.includes(":")) return null;
+  if (/^\d{1,5}$/.test(key) || !key.includes(":")) return null;
   try {
     const url = new URL(key.includes("://") ? key : "https://" + key);
     if (!url.hostname || url.hostname === "https") return null;
-    const port = url.port !== "" ? url.port : url.protocol === "https:" ? "443" : "80";
-    return url.hostname.toLowerCase() + ":" + port;
+    return url.hostname.toLowerCase() + ":" + effectiveUrlPort(url);
   } catch {
     return null;
   }
 }
 
-function walkForMappings(
-  node: unknown,
-  path: string[],
-  inheritedAllowFunnel: boolean | undefined,
-  funnelByHostPort: Map<string, boolean>,
-  out: ServeMapping[],
-  depth: number,
-  currentHostPort: string | null,
-): void {
-  if (depth > WALK_MAX_DEPTH || out.length > WALK_MAX_NODES) return;
-  if (Array.isArray(node)) {
-    for (const entry of node) walkForMappings(entry, path, inheritedAllowFunnel, funnelByHostPort, out, depth + 1, currentHostPort);
-    return;
-  }
-  if (typeof node !== "object" || node === null) return;
-  const record = node as Record<string, unknown>;
-  const ownFunnel = firstBoolean(record["allowFunnel"], record["AllowFunnel"]);
-  const effectiveFunnel = ownFunnel ?? inheritedAllowFunnel;
-  // AllowFunnel can also be a MAP keyed by HostPort (node.ts.net:443 or a
-  // URL-ish spelling); collect it for exact per-host attribution.
-  for (const mapKey of ["allowFunnel", "AllowFunnel"]) {
-    const mapValue = record[mapKey];
-    if (typeof mapValue === "object" && mapValue !== null && !Array.isArray(mapValue)) {
-      for (const [routeKey, routeValue] of Object.entries(mapValue as Record<string, unknown>)) {
-        if (typeof routeValue !== "boolean") continue;
-        const hostPort = normalizeHostPort(routeKey);
-        if (hostPort !== null) funnelByHostPort.set(hostPort, routeValue);
-      }
-    }
-  }
-  const proxy = record["Proxy"];
-  if (typeof proxy === "string" && proxy.trim() !== "") {
-    const hostPort = currentHostPort !== null ? currentHostPort : hostPortFromPath(path);
-    const mapping: ServeMapping = {
-      port: portFromHostPort(hostPort) || portFromPath(path),
-      path: handlerPathFromPath(path),
-      proxyTarget: sanitizeProxyTarget(proxy),
-    };
-    if (hostPort !== null) mapping.hostPort = hostPort;
-    if (effectiveFunnel !== undefined) mapping.allowFunnel = effectiveFunnel;
-    out.push(mapping);
-  }
-  for (const [key, value] of Object.entries(record)) {
-    if (key === "Proxy" || key === "allowFunnel" || key === "AllowFunnel") continue;
-    // The Web section is keyed by HostPort (node.ts.net:443); the DEEPEST
-    // normalizable key wins so a nested Web section attributes correctly.
-    // Service-name keys ("svc:<digits>") look like host:port but are NOT:
-    // skipping them prevents a service name from hijacking the host (and
-    // its port) for the whole subtree.
-    const childHostPort = key.startsWith("svc:") ? null : normalizeHostPort(key);
-    const nextHostPort = childHostPort ?? currentHostPort;
-    walkForMappings(value, [...path, key], effectiveFunnel, funnelByHostPort, out, depth + 1, nextHostPort);
-  }
-}
-
-/** Derive the HostPort from the key path (fallback when the walk context did
- * not provide one): the first host:port or URL-ish segment wins. */
-function hostPortFromPath(path: string[]): string | null {
-  for (const segment of path) {
-    const normalized = normalizeHostPort(segment);
-    if (normalized !== null) return normalized;
-  }
-  return null;
-}
-
-/** Port part of a canonical host:port string; empty when null/malformed. */
-function portFromHostPort(hostPort: string | null): string {
-  if (hostPort === null) return "";
+function portFromHostPort(hostPort: string): string {
   const index = hostPort.lastIndexOf(":");
   return index === -1 ? "" : hostPort.slice(index + 1);
 }

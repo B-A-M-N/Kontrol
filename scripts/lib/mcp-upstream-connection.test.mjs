@@ -54,4 +54,26 @@ const closeStartedAt = Date.now();
 await offline.close();
 assert.ok(Date.now() - closeStartedAt < 250, "shutdown cancels an in-flight reconnect backoff immediately");
 assert.equal(offline.state, "STOPPED");
+
+const candidate = { id: "endpoint-a" };
+const qualificationOrder = [];
+const qualified = new McpUpstreamConnection({
+  createClient() {
+    return {
+      candidate,
+      client: {
+        async connect() { qualificationOrder.push("connect"); },
+        async close() {},
+      },
+      transport: {},
+    };
+  },
+  async prepareCandidate(selected) { assert.equal(selected, candidate); qualificationOrder.push("prepare"); },
+  async qualifyClient(_client, selected) { assert.equal(selected, candidate); qualificationOrder.push("qualify"); },
+  onConnectResult(selected, ok) { assert.equal(selected, candidate); assert.equal(ok, true); qualificationOrder.push("result"); },
+});
+await qualified.start();
+assert.equal(qualified.state, "READY");
+assert.deepEqual(qualificationOrder, ["prepare", "connect", "qualify", "result"], "resource preflight and MCP qualification must precede READY");
+await qualified.close();
 console.log("mcp-upstream-connection.test.mjs: recovery and shutdown assertions passed");

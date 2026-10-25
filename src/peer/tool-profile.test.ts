@@ -19,8 +19,11 @@ const inspectTools = [
   toolNames.gitShow,
 ];
 
-// Empty capabilities → read-only baseline (inspect set only).
-assert.deepEqual([...peerAllowedToolNames([])].sort(), [...inspectTools].sort(), "empty capabilities fall back to the read-only inspect surface");
+// Empty capabilities → NO tools. Even inspection must be explicitly granted;
+// job-only credentials must not read a workspace or resources by stale-catalog
+// tool-name guessing.
+const none = peerAllowedToolNames([]);
+assert.equal(none.size, 0, "empty capabilities grant no tools");
 
 // Inspect set matches the read-only surface exactly.
 const inspectOnly = peerAllowedToolNames(["workspace:inspect"]);
@@ -37,21 +40,28 @@ for (const name of [...inspectTools, toolNames.write, toolNames.edit, toolNames.
 assert.equal(withPatch.has(toolNames.shell), false, "propose_patch does not include bash");
 assert.equal(withPatch.size, inspectTools.length + 3);
 
-// run_bounded adds exactly the three execution tools.
-const withRun = peerAllowedToolNames(["workspace:inspect", "workspace:run_bounded"]);
-for (const name of [...inspectTools, toolNames.shell, toolNames.pollProcess, toolNames.writeStdin]) {
-  assert.equal(withRun.has(name), true, `run_bounded profile includes ${name}`);
+// workspace:run_bounded is reserved and grants no process tools until a
+// dedicated OS-confined peer execution boundary exists.
+const withRun = peerAllowedToolNames(["workspace:run_bounded"]);
+assert.equal(withRun.size, 0, "run_bounded is reserved and adds no process tools");
+for (const name of [toolNames.shell, toolNames.pollProcess, toolNames.writeStdin]) {
+  assert.equal(withRun.has(name), false, `run_bounded must not expose ${name}`);
 }
-assert.equal(withRun.has(toolNames.write), false, "run_bounded does not include write");
-assert.equal(withRun.size, inspectTools.length + 3);
 
-// Full grant: 10 inspect + 3 patch + 3 run.
+// Job-only credentials cannot inspect by tool-name guessing.
+const jobOnly = peerAllowedToolNames(["job:claim", "job:complete", "job:cancel_ack"]);
+assert.equal(jobOnly.size, 0, "job-only credentials expose no workspace tools");
+for (const name of inspectTools) {
+  assert.equal(jobOnly.has(name), false, `job-only credential cannot call ${name}`);
+}
+
+// Full currently-supported grant: inspect + patch only.
 const full = peerAllowedToolNames(["workspace:inspect", "workspace:propose_patch", "workspace:run_bounded"]);
-assert.equal(full.size, inspectTools.length + 6);
+assert.equal(full.size, inspectTools.length + 3);
 
 // Unknown capability strings are ignored (never widen the surface).
 const unknown = peerAllowedToolNames(["workspace:inspect", "job:claim", "totally:unknown"] as never);
-assert.deepEqual([...unknown].sort(), [...inspectTools].sort(), "non-mapping capabilities add no tools");
+assert.deepEqual([...unknown].sort(), [...inspectTools].sort(), "non-inspect capabilities add no workspace tools");
 
 // Bridge/policy/reviewer tools are never included under any profile.
 for (const tool of ["discover_agents", "submit_for_review", "await_review_feedback", "show_changes", "show_workspace_ui"]) {

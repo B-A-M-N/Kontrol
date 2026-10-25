@@ -1,124 +1,51 @@
-# DevSpace Ralphie Muntz Review Loop Handoff
+# Kontrol Multipath Ingress — Continuation Handoff
 
-Updated: 2026-10-21
+Updated: 2026-10-25
 
-## Goal and boundaries
+## Goal
 
-Complete the DevSpace review loop so an implementing agent can submit a bounded
-work packet to its already-bound WebUI reviewer context, receive authenticated
-review feedback, and continue. The WebUI is the reviewer and orchestrator.
-Human approvals stay in the existing Approval Center. There is no reviewer
-dashboard, and Kontrol does not create a new ChatGPT conversation. MAO is out of
-scope.
+Implement the requirements in `/home/bamn/.codex/attachments/458e9b15-a1ec-4247-aa20-19ec878f9be9/pasted-text-1.txt` for the Kontrol multipath ingress audit. Keep the full scope: security/correctness, lifecycle control, durable evidence, independent endpoint recovery, operator UI, and adversarial end-to-end qualification. Source tests alone do not qualify live routes.
 
-## Implemented in the live checkout
+Repository: `/home/bamn/devspace`
+Branch: `audit-k02-k04`
+Starting HEAD observed this turn: `5e19e7d30ed467f954f2bfe5086dd1b85f568187`
+The branch was 64 commits ahead and 0 behind `origin/audit-k02-k04`. No history rewrite or push is intended. Preserve untracked `.tmp-scratch/`.
 
-The implementation and its tests are included in the pending local commit from
-`/home/bamn/devspace`:
+## Implemented in source
 
-- Durable reviewer-thread identity is scoped to a route and route epoch. One-
-  time activation grants are expiring, principal-scoped, and persisted only as
-  hashes. Claims and feedback commits bind to the authorized principal,
-  transport context, submission, snapshot, epoch, and lease.
-- Review packets are bounded and content-addressed. Handoff preparation,
-  presentation, claim, and committed feedback have distinct durable states.
-  Host conversation IDs are correlation data unless a trusted host adapter
-  verifies them.
-- MCP Apps delivery can send a queued packet into the explicitly activated
-  existing WebUI conversation. Native CDP delivery binds to an explicitly
-  selected ChatGPT profile and exact conversation target. Neither route creates
-  a conversation. Authentication and verification screens stop for human
-  action.
-- Browser delivery is transport only. Prompt acceptance and page generation do
-  not count as a verdict. Only authenticated review tools commit feedback and
-  wake the agent. Ambiguous sends remain fenced for inspection.
-- Clarification and blocker messages can wake the bound native-CDP conversation
-  as advisory requests. Replies return through the durable agent-reply store and
-  cannot approve work or grant permissions.
-- Browser and reply dispatchers reconcile durable outbox work at startup, wake
-  from post-commit events, and use a single deadline timer for retries instead
-  of polling.
-- Agent session continuations preserve provider-native identity. Hermes and
-  generic stdio ACP session bindings are persisted and fail closed when they
-  are missing or mismatched. Hermes per-session homes are isolated; only ACP
-  `end_turn` is successful completion. Confined Hermes launches bind the
-  selected executable and sibling interpreter.
-- Workspace session state and event projections expose review progress without
-  adding a reviewer dashboard. Root and subtree `AGENTS.md` contracts document
-  the authority, delivery, and UI boundaries.
+The current task changes include:
 
-## Verification already performed
+- Exact Tailscale Serve/Funnel route identities and classification, stricter profile/audience/listener validation, strict host policy, and distinct mapping versus application qualification.
+- Peer credential reload/auth/session authorization fencing and fail-closed peer job/worktree recovery changes.
+- Receipt-backed profile-specific Tailscale apply/disable/reconcile, bounded redacted ingress health observations, bridge qualification probes, owner and worker endpoint bridge separation, endpoint qualification/circuit failover, WireGuard/Tailscale Caddy templates, and packaged bridge asset hashes.
+- An authenticated `ingress_management` MCP tool and Workspace App panel showing configured profile, listener, local observation, mapping, external TLS/auth checks, health evidence tier, operation, and recent failures. Its controls require user confirmation; route actions also require server confirmation. `/diagnostics` includes the same projection as `kontrol ingress doctor`.
+- The owner-public stdio bridge now persists a complete endpoint preference ordering in an owner-only atomic file (`~/.kontrol/bridge-endpoint-preferences.json`, overridable with `KONTROL_BRIDGE_PREFERENCE_FILE`). The Workspace App exposes this control only when the app is connected through the owner bridge and `ingress_management` is allowed by the endpoint profile. Preference changes affect subsequent connection attempts and do not migrate a live MCP transport. Worker bridges cannot change the preference.
+- `handoff.md` is this continuation record; uppercase `HANDOFF.md` is a separate file and was left unchanged.
 
-These checks passed during implementation; they were not rerun while preparing
-this handoff or commit:
+## Verification performed for the current changes
 
-- `npm run typecheck -- --pretty false`
-- `npx tsx src/bridge/reply-dispatcher.test.ts`
-- `npx tsx src/bridge/reply-flow.test.ts`
-- `npx tsx src/dispatch-outbox.test.ts`
-- `npm run test:review-thread`
-- `npm run test:review-browser`
+Passed:
 
-No end-to-end ChatGPT sign-in, reviewer packet delivery, or feedback round trip
-has been qualified against a live authenticated ChatGPT conversation.
+- `npm run typecheck`
+- `npm run test:ui` including the ingress panel DOM case, Workspace App bundle/contract checks, and Chromium assertions
+- `npm run test:syntax` after an unchanged host-permission retry; sandbox initially denied its loopback probe with `EPERM`
+- `npm run test:package` including packed-install validation
+- `node scripts/lib/mcp-endpoint-selector.test.mjs`
+- `node --import tsx src/ingress/ingress-tools.test.ts`
+- `node --import tsx src/ui/ingress-management.dom.test.ts`
+- `node --check scripts/mcp-stdio-bridge.mjs`
+- `node --check scripts/lib/mcp-endpoint-selector.mjs`
+- `git diff --check`
 
-## Remaining work
+UI and syntax tests required host permission because the sandbox blocked local IPC or loopback binds. The authorized retries passed. These checks validate source and packaged artifacts, not a deployed endpoint.
 
-1. **Update Chrome before retrying sign-in.** The installed package was
-   `150.0.7871.114-1`; apt offered `156.0.8078.47-1`. The failed sign-in page
-   reported Chrome was out of date. Installation was blocked because this
-   session has no sudo password. Run:
+## Remaining work before the audit can be called complete
 
-   ```sh
-   sudo apt-get install --only-upgrade google-chrome-stable
-   ```
+1. **Real deployment evidence:** Run a valid tailnet client against the configured Serve route and an external non-tailnet client against the public bridge/Funnel route. Capture exact build/config hashes, TLS identity, principal, listener, operation/session correlation, protocol result, and failure classification in the bounded health receipts.
+2. **Effective bridge qualification:** On the deployed bridge, run `caddy adapt` and `caddy validate` against the exact packaged/deployed configuration. Test forbidden paths with a controlled upstream that returns success on every path; test forwarded and `X-Kontrol-*` header stripping, bounded connections/headers, direct-listener denial, authenticated SSE heartbeats over time, long POST, and fresh initialize after connection loss. No Caddy binary or external bridge was available in the local checks.
+3. **Owner preference runtime proof:** Exercise the owner stdio bridge end to end with two separately authorized OAuth resources. Change the preferred endpoint in the Workspace App, restart the bridge to prove persistence, force a transport loss, and verify the next qualified transport uses the selected route and correct origin-specific credential. Confirm ambiguous mutations are not replayed. The selector/store and panel controls have unit/DOM coverage; this deployment chain has not yet been exercised.
+4. **Adversarial matrix:** Run the attachment's full matrix, especially wrong Serve host/port/path/exposure, stopped Tailscale, rejected Funnel-to-peer topology, mid-SSE path loss, peer credential revocation on an existing session, wrong OAuth resource, upstream bridge outage without core restart, corrupt peer-job state, concurrent route switching, multi-listener restart recovery, and 45-second POST idle-timeout cases.
+5. **Live qualification boundary:** Keep `unit`, `local_integration`, `real_tailnet`, `public_internet`, and `operational` evidence tiers distinct. A lower tier cannot qualify a higher one; no source test or template hash substitutes for external evidence.
+6. **Repository state:** The ingress-audit implementation and this lowercase handoff file are committed together at the current branch HEAD. `.tmp-scratch/` was intentionally excluded and remains untouched. The commit is local only; do not push without separate authorization.
 
-2. **Reopen and authenticate.** After the update, reopen ChatGPT with the
-   dedicated persistent profile at
-   `/home/bamn/.local/share/devspace/chatgpt-reviewer-chrome`. The profile
-   remains on disk, but Chrome is currently closed and the prior CDP endpoint is
-   gone. The user must complete sign-in.
-
-3. **Bind the exact conversation.** In ChatGPT, select the intended existing
-   conversation and explicitly activate/bind its tab to the current review
-   thread. Verify the route, target, and principal bindings before sending. Do
-   not create a new conversation or send a packet until the exact binding is
-   established.
-
-4. **Qualify the full loop.** Verify one actual bounded packet reaches that
-   conversation, the WebUI returns structured authenticated feedback through
-   the existing handoff tools, and the agent receives the continuation. Also
-   verify that browser acceptance alone leaves the review pending and that
-   approval remains in the existing Approval Center.
-
-5. **Reconcile the alternate feature branch before integration.** The worktree
-   `/home/bamn/.devdesktop/worktrees/devspace-review-browser` is on
-   `codex/reviewer-browser-actuator` at `2b64ecc`; it is six commits ahead of
-   the live checkout's base (`7a44879`) and has additional dirty edits. Its
-   changes overlap the live checkout's uncommitted implementation. Compare the
-   complete diffs before cherry-picking or merging; do not combine them
-   blindly.
-
-6. **Decide the stale worktree records.** Preserve the clean detached
-   `/home/bamn/.devdesktop/worktrees/devspace-5f420827` at `a0c1311` as a
-   historical checkpoint. `/tmp/devspace-review-qualification` is a dirty
-   alternate candidate at `2b64ecc`, not the selected source. The registered
-   `/tmp/devspace-hermes-session` worktree is marked prunable because its gitdir
-   target is missing. None was cleaned or pruned.
-
-7. **No remote publication has happened.** The live branch `audit-k02-k04` was
-   31 commits ahead of `origin/audit-k02-k04` at handoff time. Do not push or
-   merge without explicit authorization.
-
-## Repository state at handoff
-
-- Authoritative working checkout: `/home/bamn/devspace`, branch
-  `audit-k02-k04`, pre-commit HEAD `7a448794af6d73cc87a5ff9235f5514fe9d1e1df`.
-- The live checkout contained a broad, internally related set of DevSpace
-  review-loop, ACP continuation, Hermes isolation, UI projection, test, and
-  instruction changes. These changes and this handoff are committed together
-  locally; no unrelated worktree was staged.
-- No MAO files or ActiveTab application files were changed. ActiveTab was
-  inspected read-only for its persistent-profile and exact-target patterns.
-- The dedicated ChatGPT profile is outside the repository and is not part of
-  the commit. No credentials or review packet were sent.
+The objective remains active until the code, package/deployment behavior, and required external qualification evidence are all proven against the attachment, requirement by requirement.

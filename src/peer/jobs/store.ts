@@ -96,6 +96,7 @@ export function openPeerJobStore(stateDir: string, logging: LoggingConfig): Peer
   mkdirSync(stateDir, { recursive: true, mode: 0o700 });
   const sidecarPath = join(stateDir, SIDECAR_FILE);
 
+  let stateCorrupted = false;
   let snapshot: PeerJobStoreSnapshot = { version: 1, jobs: [], attempts: [] };
   if (existsSync(sidecarPath)) {
     try {
@@ -115,8 +116,18 @@ export function openPeerJobStore(stateDir: string, logging: LoggingConfig): Peer
         })),
       };
     } catch (error) {
-      sink.log("warn", "peer_jobs_sidecar_corrupt", { path: sidecarPath, error: (error as Error).message });
-      snapshot = { version: 1, jobs: [], attempts: [] };
+      // An existing unreadable/corrupt sidecar is authoritative evidence that
+      // may contain uncertain work. Never reset it to an empty queue: fail
+      // closed and require operator recovery.
+      const corruptPath = sidecarPath + ".corrupt." + new Date().toISOString().replace(/[:.]/g, "-");
+      try {
+        renameSync(sidecarPath, corruptPath);
+        sink.log("error", "peer_jobs_sidecar_quarantined", { path: corruptPath, error: (error as Error).message });
+      } catch {
+        sink.log("error", "peer_jobs_sidecar_corrupt", { path: sidecarPath, error: (error as Error).message });
+      }
+      stateCorrupted = true;
+      throw new PeerJobError("peer_jobs_state_corrupt", "Existing peer-job state is unreadable; dispatch is refused to preserve prior evidence.", 503);
     }
   }
 
@@ -126,6 +137,7 @@ export function openPeerJobStore(stateDir: string, logging: LoggingConfig): Peer
   let warnedDirFsyncUnavailable = false;
 
   function persist(): void {
+    if (stateCorrupted) throw new PeerJobError("peer_jobs_state_corrupt", "Peer-job state is corrupt; persistence is refused.", 503);
     const payload = JSON.stringify({ version: 1 as const, jobs, attempts });
     const tempPath = sidecarPath + ".tmp." + randomBytes(4).toString("hex");
     // Atomic durable write: mode-0600 temp file, fsync the file BEFORE the
@@ -200,6 +212,9 @@ export function openPeerJobStore(stateDir: string, logging: LoggingConfig): Peer
     stateDir,
 
     createJob(input) {
+      if (stateCorrupted) {
+        throw new PeerJobError("peer_jobs_state_corrupt", "Peer-job state is corrupt; dispatch is refused.", 503);
+      }
       // Normalize allowedOutputs at creation so every later receipt
       // validation sees canonical relative prefixes ("out/" → "out").
       const job: PeerJob = {

@@ -16,7 +16,7 @@ import {
   type PeerCredentialFile,
 } from "./credentials.js";
 
-const secret = "enrolled-secret-long-enough";
+const secret = "enrolled-secret-that-is-at-least-32-characters";
 const id = "meta-muse";
 const credentialId = "cred-1";
 
@@ -38,7 +38,7 @@ function validPeer(overrides: Record<string, unknown> = {}): Record<string, unkn
   return {
     id: "meta-muse",
     credentialId: "cred-1",
-    credentialHash: hashPeerCredential("cred-1", "enrolled-secret-long-enough"),
+    credentialHash: hashPeerCredential("cred-1", secret),
     capabilities: ["workspace:inspect"],
     grantedRoots: ["/srv/workspace"],
     ...overrides,

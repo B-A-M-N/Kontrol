@@ -15,6 +15,7 @@
 // byte-equivalent to what the old flow produced — minus any possibility of
 // corrupting the checkout.
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
@@ -185,6 +186,32 @@ for (const entry of declaredFiles) {
   const target = join(stagedPkg, entry);
   mkdirSync(resolve(target, ".."), { recursive: true });
   cpSync(source, target, { recursive: true, dereference: true });
+}
+
+// Bind the packaged bridge deployment instructions to the exact Caddyfile
+// bytes shipped in this artifact. This is generated in the staged package so
+// the release manifest cannot accidentally describe a newer checkout file.
+const bridgeConfigPath = join(stagedPkg, "deploy/bridge/Caddyfile.example");
+if (existsSync(bridgeConfigPath)) {
+  const bridgeConfigSha256 = createHash("sha256").update(readFileSync(bridgeConfigPath)).digest("hex");
+  const bridgeConfigs = [
+    "Caddyfile.example",
+    "Caddyfile.multipath.example",
+    "KontrolGateway.Caddyfile.example",
+  ].map((name) => {
+    const path = join(stagedPkg, "deploy/bridge", name);
+    if (!existsSync(path)) throw new Error(`bridge deployment asset is missing from staged package: ${name}`);
+    return {
+      configPath: `deploy/bridge/${name}`,
+      configSha256: createHash("sha256").update(readFileSync(path)).digest("hex"),
+    };
+  });
+  writeFileSync(join(stagedPkg, "deploy/bridge/ingress-config-manifest.json"), `${JSON.stringify({
+    schemaVersion: 2,
+    configPath: "deploy/bridge/Caddyfile.example",
+    configSha256: bridgeConfigSha256,
+    configs: bridgeConfigs,
+  }, null, 2)}\n`);
 }
 
 // The staged package.json is identical except lifecycle hooks: a build/pack

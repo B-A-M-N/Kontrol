@@ -18,7 +18,8 @@ export type ToolName =
   | "submit_for_review"
   | "submit_to_coding_agent"
   | "open_approval_center"
-  | "list_peer_status";
+  | "list_peer_status"
+  | "ingress_management";
 
 export type HostContext = NonNullable<ReturnType<App["getHostContext"]>>;
 
@@ -101,7 +102,8 @@ export function isToolName(value: unknown): value is ToolName {
     value === "submit_for_review" ||
     value === "submit_to_coding_agent" ||
     value === "open_approval_center" ||
-    value === "list_peer_status"
+    value === "list_peer_status" ||
+    value === "ingress_management"
   );
 }
 

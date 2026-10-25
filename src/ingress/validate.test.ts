@@ -3,9 +3,9 @@ import type { IngressProfile } from "./types.js";
 import { kindPrivacy } from "./types.js";
 import { parseIngressProfilesEnv, validateIngressProfiles } from "./validate.js";
 
-const oauthCtx = { authMode: "oauth" as const, peerEnabled: true, hasPeerCredentials: true, publicBaseUrl: "https://kontrol.example.com" };
+const oauthCtx = { authMode: "oauth" as const, peerEnabled: true, hasPeerCredentials: true, publicBaseUrl: "https://kontrol-node.tail-scale.ts.net" };
 const tunnelCtx = { authMode: "tunnel" as const, peerEnabled: true, hasPeerCredentials: true };
-const noPeerCtx = { authMode: "oauth" as const, peerEnabled: false, hasPeerCredentials: false, publicBaseUrl: "https://kontrol.example.com" };
+const noPeerCtx = { authMode: "oauth" as const, peerEnabled: false, hasPeerCredentials: false, publicBaseUrl: "https://kontrol-node.tail-scale.ts.net" };
 
 let nextId = 0;
 function baseProfile(overrides: Partial<IngressProfile> = {}): IngressProfile {
@@ -41,9 +41,13 @@ assert.doesNotThrow(() => validateIngressProfiles([baseProfile({ id: "a", extern
 throwsIngress(() => validateIngressProfiles([baseProfile({ id: "a" }), baseProfile({ id: "a" })], oauthCtx), /duplicate profile id/);
 
 // 2. serve/funnel same external node+port
+throwsIngress(() => validateIngressProfiles([
+  baseProfile({ id: "serve", kind: "tailscale_serve", externalOrigin: "https://node.ts.net:8443", allowedHosts: ["node.ts.net:8443"] }),
+  baseProfile({ id: "funnel", kind: "tailscale_funnel", audience: "peer", target: "peer_listener", externalOrigin: "https://other.ts.net:8443", allowedHosts: ["other.ts.net:8443"] }),
+], oauthCtx), /only tailscale_serve may expose the peer listener/);
 assert.doesNotThrow(() => validateIngressProfiles([
   baseProfile({ id: "serve", kind: "tailscale_serve", externalOrigin: "https://node.ts.net:8443", allowedHosts: ["node.ts.net:8443"] }),
-  baseProfile({ id: "funnel", kind: "tailscale_funnel", externalOrigin: "https://other.ts.net:8443", allowedHosts: ["other.ts.net:8443"] }),
+  baseProfile({ id: "funnel", kind: "tailscale_funnel", audience: "owner_public", target: "public_oauth_listener", externalOrigin: "https://kontrol-node.tail-scale.ts.net", allowedHosts: ["kontrol-node.tail-scale.ts.net"] }),
 ], oauthCtx));
 throwsIngress(
   () => validateIngressProfiles([
@@ -87,23 +91,35 @@ throwsIngress(
 );
 
 // 5. funnel port constraint
+const validFunnel8443 = baseProfile({ kind: "tailscale_funnel", audience: "owner_public", target: "public_oauth_listener", externalOrigin: "https://kontrol-node.tail-scale.ts.net:8443", allowedHosts: ["kontrol-node.tail-scale.ts.net:8443"], enabled: false });
+assert.doesNotThrow(() => validateIngressProfiles([validFunnel8443], oauthCtx), "funnel port 8443 OK");
 assert.doesNotThrow(() => validateIngressProfiles(
-  [baseProfile({ kind: "tailscale_funnel", externalOrigin: "https://node.ts.net:8443", allowedHosts: ["node.ts.net:8443"] })],
-  oauthCtx,
-), "funnel port 8443 OK");
-assert.doesNotThrow(() => validateIngressProfiles(
-  [baseProfile({ kind: "tailscale_funnel", externalOrigin: "https://node.ts.net:10000", allowedHosts: ["node.ts.net:10000"] })],
+  [baseProfile({ kind: "tailscale_funnel", audience: "owner_public", target: "public_oauth_listener", externalOrigin: "https://kontrol-node.tail-scale.ts.net:10000", allowedHosts: ["kontrol-node.tail-scale.ts.net:10000"], enabled: false })],
   oauthCtx,
 ), "funnel port 10000 OK");
 throwsIngress(
   () => validateIngressProfiles([baseProfile({ kind: "tailscale_funnel", externalOrigin: "https://node.ts.net:5000", allowedHosts: ["node.ts.net:5000"] })], oauthCtx),
   /must be 443, 8443, or 10000/,
 );
+throwsIngress(
+  () => validateIngressProfiles([baseProfile({ kind: "tailscale_funnel", audience: "owner_public", target: "public_oauth_listener", externalOrigin: "https://kontrol-node.tail-scale.ts.net:5000", allowedHosts: ["kontrol-node.tail-scale.ts.net:5000"], enabled: false })], oauthCtx),
+  /must be 443, 8443, or 10000/,
+);
 
-// 6. target/audience/kind mismatches
+// 6. target/audience/kind exhaustive matrix
+throwsIngress(
+  () => validateIngressProfiles([baseProfile({ audience: "owner_public", target: "peer_listener", externalOrigin: "https://node.tail-scale.ts.net:8443", allowedHosts: ["node.tail-scale.ts.net:8443"] })], oauthCtx),
+  /peer_listener requires peer audience/,
+);
+throwsIngress(
+  () => validateIngressProfiles([baseProfile({ kind: "tailscale_funnel", audience: "peer", externalOrigin: "https://node.tail-scale.ts.net:8443", allowedHosts: ["node.tail-scale.ts.net:8443"] })], oauthCtx),
+  /only tailscale_serve may expose the peer listener/,
+);
+
+// target/audience/kind mismatches
 throwsIngress(
   () => validateIngressProfiles([baseProfile({ audience: "peer", target: "public_oauth_listener" })], oauthCtx),
-  /peer audience must target peer_listener/,
+  /public_oauth_listener requires owner_public audience/,
 );
 throwsIngress(
   () => validateIngressProfiles([baseProfile({ kind: "https_bridge", audience: "owner_public", target: "secure_tunnel_listener", externalOrigin: "https://bridge.example.com", allowedHosts: ["bridge.example.com"] })], oauthCtx),
@@ -111,17 +127,17 @@ throwsIngress(
 );
 throwsIngress(
   () => validateIngressProfiles([baseProfile({ kind: "secure_mcp_tunnel", target: "peer_listener", externalOrigin: "https://tunnel.example.com", allowedHosts: ["tunnel.example.com"] })], oauthCtx),
-  /must target secure_tunnel_listener/,
+  /only tailscale_serve may expose the peer listener/,
 );
-assert.doesNotThrow(() => validateIngressProfiles(
-  [baseProfile({ kind: "secure_mcp_tunnel", audience: "owner_public", target: "secure_tunnel_listener", externalOrigin: "https://kontrol.example.com", allowedHosts: ["kontrol.example.com"] })],
+throwsIngress(() => validateIngressProfiles(
+  [baseProfile({ kind: "secure_mcp_tunnel", audience: "owner_public", target: "secure_tunnel_listener", externalOrigin: "https://kontrol-node.tail-scale.ts.net", allowedHosts: ["kontrol-node.tail-scale.ts.net"] })],
   oauthCtx,
-), "secure tunnel targeting secure_tunnel_listener accepted");
+), /Secure MCP Tunnel requires a compatible tunnel deployment/);
 
 // 7. deployment-mode gating
 throwsIngress(
   () => validateIngressProfiles(
-    [baseProfile({ audience: "owner_public", target: "public_oauth_listener", externalOrigin: "https://kontrol.example.com", allowedHosts: ["kontrol.example.com"] })],
+    [baseProfile({ audience: "owner_public", target: "public_oauth_listener", externalOrigin: "https://kontrol-node.tail-scale.ts.net", allowedHosts: ["kontrol-node.tail-scale.ts.net"] })],
     tunnelCtx,
   ),
   /public ingress requires OAuth mode/,
@@ -133,18 +149,18 @@ throwsIngress(
 
 // 8. canonical OAuth resource uniqueness (enabled vs standby)
 assert.doesNotThrow(() => validateIngressProfiles(
-  [baseProfile({ audience: "owner_public", target: "public_oauth_listener", externalOrigin: "https://kontrol.example.com", allowedHosts: ["kontrol.example.com"] })],
+  [baseProfile({ audience: "owner_public", target: "public_oauth_listener", externalOrigin: "https://kontrol-node.tail-scale.ts.net", allowedHosts: ["kontrol-node.tail-scale.ts.net"] })],
   oauthCtx,
 ), "enabled owner_public origin matching canonical accepted");
 throwsIngress(
   () => validateIngressProfiles(
-    [baseProfile({ audience: "owner_public", target: "public_oauth_listener", externalOrigin: "https://other.example.com", allowedHosts: ["other.example.com"] })],
+    [baseProfile({ audience: "owner_public", target: "public_oauth_listener", externalOrigin: "https://other-node.tail-scale.ts.net", allowedHosts: ["other-node.tail-scale.ts.net"] })],
     oauthCtx,
   ),
   /does not equal the canonical publicBaseUrl/,
 );
 assert.doesNotThrow(() => validateIngressProfiles(
-  [baseProfile({ enabled: false, audience: "owner_public", target: "public_oauth_listener", externalOrigin: "https://standby.example.com", allowedHosts: ["standby.example.com"] })],
+  [baseProfile({ enabled: false, audience: "owner_public", target: "public_oauth_listener", externalOrigin: "https://standby-node.tail-scale.ts.net", allowedHosts: ["standby-node.tail-scale.ts.net"] })],
   oauthCtx,
 ), "disabled standby profile is exempt from canonical origin check");
 
@@ -160,7 +176,7 @@ throwsIngress(
   /invalid host entry/,
 );
 assert.doesNotThrow(() => validateIngressProfiles(
-  [baseProfile({ allowedHosts: ["Kontrol-Node.Example.TS.net:8443", "kontrol-node.example.ts.net:8443"] })],
+  [baseProfile({ allowedHosts: ["Node.Tail-Scale.TS.net:8443", "node.tail-scale.ts.net:8443"] })],
   oauthCtx,
 ), "IDNA-normalized duplicate dedupes and passes");
 

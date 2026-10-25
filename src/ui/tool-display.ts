@@ -148,6 +148,8 @@ export function getToolDisplay(card: ToolResultCard): ToolDisplay {
       return { icon: reviewIcon(), title: "Approval Center", label, tone: "agent" };
     case "list_peer_status":
       return { icon: agentIcon(), title: "Peer Status", label, tone: "agent" };
+    case "ingress_management":
+      return { icon: agentIcon(), title: "Ingress Management", label, tone: "agent" };
   }
 }
 

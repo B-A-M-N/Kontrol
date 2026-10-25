@@ -158,6 +158,7 @@ import { createPeerHttpApp } from "./server/peer-app.js";
 import { createPublicMcpApp } from "./server/public-mcp-app.js";
 import { trustedProxyPolicyForIngressProfiles } from "./ingress/proxy-context.js";
 import { PeerCredentialRegistry } from "./peer/auth.js";
+import { restorePeerWorktreeOwners } from "./peer/workspace-guard.js";
 import { createWorkspaceAppResourceServer } from "./server/workspace-resource-route.js";
 // P1.2 decomposition: admission classes/weights/queue live in
 // src/server/mcp-admission.ts; session-state types, identity derivation, and
@@ -319,6 +320,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     expectedSchemaVersion: deploymentContext.expectedSchemaVersion,
     expectedBuildId: deploymentContext.expectedBuildId ?? (buildMeta.buildId ? brandBuildId(buildMeta.buildId) : undefined),
   });
+  if (config.peer) restorePeerWorktreeOwners(config.stateDir);
   const qualificationEvidence = new McpQualificationEvidenceJournal(db.sqlite);
   const mutationReceipts = createMutationReceiptStore(db);
   const workspaceStore = createWorkspaceStore(db);

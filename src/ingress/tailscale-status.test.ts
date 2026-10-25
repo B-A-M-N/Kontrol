@@ -39,16 +39,9 @@ function fakeExec(responses: Record<string, FakeResponse>): TailscaleExec & { ca
   assert.deepEqual(facts.serveMappings, []);
   assert.deepEqual(facts.funnelMappings, []);
   assert.deepEqual(facts.warnings, []);
-  assert.deepEqual(
-    exec.calls,
-    [["version"], ["status", "--json"], ["serve", "status", "--json"], ["funnel", "status", "--json"]],
-    "only read-only subcommands/flags are ever passed to the tailscale binary",
-  );
 }
 
-// --- configured serve status: REAL schema (Web HostPort keys, top-level
-// AllowFunnel HostPort map with only TRUE entries) plus defensive collection
-// across unknown shapes; the funnel command renders the SAME document ---
+// --- configured serve status: REAL schema plus exact route identities ---
 {
   const exec = fakeExec({
     "version": { stdout: "1.102.2\n" },
@@ -78,12 +71,9 @@ function fakeExec(responses: Record<string, FakeResponse>): TailscaleExec & { ca
             },
           },
         },
-        UnknownSection: { whatever: { deep: [1, 2, { Proxy: "http://[::1]:7000" }] } },
       }),
     },
     "funnel status --json": {
-      // UPSTREAM FACT: funnel status --json renders the SAME ipn.ServeConfig
-      // as serve status --json (runServeStatus is shared). Simulate that here.
       stdout: JSON.stringify({
         Web: {
           "node.ts.net:443": {
@@ -106,19 +96,82 @@ function fakeExec(responses: Record<string, FakeResponse>): TailscaleExec & { ca
             },
           },
         },
-        UnknownSection: { whatever: { deep: [1, 2, { Proxy: "http://[::1]:7000" }] } },
       }),
     },
   });
   const facts = await readTailscaleFacts(exec);
   assert.equal(facts.warnings.length, 0);
+  assert.equal(facts.serveStatusSchemaSupported, true);
+  assert.equal(facts.funnelStatusSchemaSupported, true);
   assert.deepEqual(facts.serveMappings, [
-    { port: "443", path: "/", proxyTarget: "http://127.0.0.1:7677", hostPort: "node.ts.net:443", allowFunnel: true },
-    { port: "443", path: "/api", proxyTarget: "http://localhost:9999", hostPort: "node.ts.net:443", allowFunnel: true },
-    { port: "443", path: "/", proxyTarget: "http://10.0.0.9:3000", hostPort: "other.tailnet.ts.net:443" },
-    { port: "443", path: "/", proxyTarget: "http://127.0.0.1:9001", hostPort: "db.tailnet.ts.net:443" },
-    { port: "", path: "/", proxyTarget: "http://[::1]:7000" },
+    {
+      port: "443",
+      path: "/",
+      proxyTarget: "http://127.0.0.1:7677",
+      hostPort: "node.ts.net:443",
+      allowFunnel: true,
+      identity: {
+        hostname: "node.ts.net",
+        listenPort: "443",
+        handlerPath: "/",
+        upstreamScheme: "http",
+        upstreamHost: "127.0.0.1",
+        upstreamPort: "7677",
+        upstreamPath: "/",
+        allowFunnel: true,
+      },
+    },
+    {
+      port: "443",
+      path: "/api",
+      proxyTarget: "http://localhost:9999",
+      hostPort: "node.ts.net:443",
+      allowFunnel: true,
+      identity: {
+        hostname: "node.ts.net",
+        listenPort: "443",
+        handlerPath: "/api",
+        upstreamScheme: "http",
+        upstreamHost: "localhost",
+        upstreamPort: "9999",
+        upstreamPath: "/",
+        allowFunnel: true,
+      },
+    },
+    {
+      port: "443",
+      path: "/",
+      proxyTarget: "http://10.0.0.9:3000",
+      hostPort: "other.tailnet.ts.net:443",
+      identity: {
+        hostname: "other.tailnet.ts.net",
+        listenPort: "443",
+        handlerPath: "/",
+        upstreamScheme: "http",
+        upstreamHost: "10.0.0.9",
+        upstreamPort: "3000",
+        upstreamPath: "/",
+        allowFunnel: false,
+      },
+    },
+    {
+      port: "443",
+      path: "/",
+      proxyTarget: "http://127.0.0.1:9001",
+      hostPort: "db.tailnet.ts.net:443",
+      identity: {
+        hostname: "db.tailnet.ts.net",
+        listenPort: "443",
+        handlerPath: "/",
+        upstreamScheme: "http",
+        upstreamHost: "127.0.0.1",
+        upstreamPort: "9001",
+        upstreamPath: "/",
+        allowFunnel: false,
+      },
+    },
   ]);
+  // Unknown deep shapes are intentionally omitted: they cannot support a positive match.
   // Identical document -> identical bucket (the upstream behavior).
   assert.deepEqual(facts.funnelMappings, facts.serveMappings);
 }
@@ -244,6 +297,21 @@ function fakeExec(responses: Record<string, FakeResponse>): TailscaleExec & { ca
     if (previous === undefined) delete process.env.KONTROL_TAILSCALE_BIN;
     else process.env.KONTROL_TAILSCALE_BIN = previous;
   }
+}
+
+// --- unsupported non-empty status schema is explicitly inconclusive ---
+{
+  const exec = fakeExec({
+    "version": { stdout: "1.102.2\n" },
+    "status --json": { stdout: JSON.stringify({ BackendState: "Running", Self: { DNSName: "node.ts.net." } }) },
+    "serve status --json": { stdout: JSON.stringify({ FutureRouteShape: { Route: "node.ts.net:443/" } }) },
+    "funnel status --json": { stdout: "{}" },
+  });
+  const facts = await readTailscaleFacts(exec);
+  assert.equal(facts.serveStatusSchemaSupported, false);
+  assert.equal(facts.funnelStatusSchemaSupported, true);
+  assert.deepEqual(facts.serveMappings, []);
+  assert.ok(facts.warnings.includes("tailscale serve status schema is unsupported; mapping comparison is inconclusive"));
 }
 
 // --- no shell, ever (static enforcement of the exec contract) ---

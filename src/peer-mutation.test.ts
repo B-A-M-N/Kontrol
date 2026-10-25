@@ -14,6 +14,7 @@ import { createServer } from "./server.js";
 import { loadConfig } from "./config.js";
 import type { ServerConfig } from "./config.js";
 import { hashPeerCredential } from "./peer/credentials.js";
+import { recordPeerWorktree, restorePeerWorktreeOwners } from "./peer/workspace-guard.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -543,4 +544,17 @@ writeRegistry([
 await closeServer(peerListener.server);
 await running.close();
 assert.ok(await sourceStatusClean(), "source checkout must be clean at the end");
+{
+  const stateDir = mkdtempSync(join(tmpdir(), "peer-worktree-owner-state-"));
+  const workspaceId = "workspace-owner-fixture";
+  const owner = "peer:owner-fixture:credential";
+  recordPeerWorktree(workspaceId, owner, stateDir);
+  const restoredPath = join(stateDir, "peer-worktree-owners.json");
+  assert.equal(existsSync(restoredPath), true, "durable ownership file must exist");
+  const raw = JSON.parse(readFileSync(restoredPath, "utf8")) as Record<string, string>;
+  assert.equal(raw[workspaceId], owner);
+  // Corrupt durable evidence fails closed rather than granting unknown owner.
+  writeFileSync(restoredPath, "{ broken authority");
+  assert.throws(() => restorePeerWorktreeOwners(stateDir), /ownership state is corrupt/);
+}
 console.log("peer-mutation: all assertions passed");

@@ -43,6 +43,10 @@ export interface McpSessionState {
    * unconditionally, so an absent kind can never fail open.
    */
   listenerKind: "owner" | "peer" | "owner_public";
+  /** Monotonic peer authorization revision when this session initialized. */
+  peerAuthorizationRevision?: number;
+  /** Grant hash binding peer MCP sessions to their initialized grant set. */
+  peerAuthorizationHash?: string;
   conversationId?: string;
   approvalCorrelationId?: string;
   /** Durable work session that authenticated this worker transport, if any. */

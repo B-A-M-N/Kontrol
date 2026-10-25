@@ -231,6 +231,21 @@ Current implementation contracts:
   reconciliation restart. The external connector must establish a fresh MCP
   transport after a stale route; Kontrol never treats an old transport ID as
   durable continuity.
+- Ingress profiles are checked against exact route identity and authorization
+  topology. Tailscale route changes use profile-specific apply/disable receipts
+  and never global resets. Public bridge Caddy configuration is packaged with
+  content hashes; its optional Tailscale/WireGuard multipath uses an
+  mTLS-authenticated host gateway bound only to private interface addresses,
+  active health checks, and no automatic MCP request retries. Health evidence
+  remains profile-scoped and cannot restart a healthy Kontrol core.
+- The authenticated ingress Workspace App panel and `kontrol ingress doctor`
+  consume the same redacted route, qualification, and operation evidence. The
+  panel must label configured, locally observed, externally tested, and
+  authenticated states separately. Tailscale route mutation is owner/reviewer
+  gated and explicitly confirmed. Client endpoint preference remains client
+  configuration is client-local; only the owner stdio bridge may persist an
+  endpoint ordering preference, and it takes effect on subsequent connection
+  attempts rather than migrating a live MCP transport.
 - Adapter startup reconciles durable detached-child ownership before reporting
   `READY`; inability to terminate an orphan or persist ownership is fail-closed.
   CRUSH output events are coalesced and serialized so terminal lifecycle events
@@ -715,7 +730,7 @@ MCP context isolation:
 - The peer app (src/server/peer-app.ts) mounts only /mcp, /peer/* (the durable peer job protocol plus an authenticated 404 for unknown endpoints), and unauthenticated /peer/healthz liveness. No ACP router, OAuth flow, diagnostics, or static Workspace App assets.
 - Peer MCP sessions are bound to listenerKind "peer" at initialize; cross-port session attach is denied, and credential revocation hot-reloads without restart. Peer tool catalogs are restricted to the granted capability profile (read-only inspect baseline) and enforced again at execution.
 - Peer workspace access is confined to registry-granted roots (subset of KONTROL_ALLOWED_ROOTS), checked before and after canonicalization (worktree opens check the SOURCE root); credential/private-state paths (.env-style files, state dir, ~/.kontrol) are denied by default.
-- M2: peers granted workspace:propose_patch may open managed worktrees for granted source roots and mutate files inside them (write/edit) with MANDATORY checkpoint tracking — the widget-visibility early return and the global allowUntrackedMutation escape never apply to peers. Direct checkout mutation by peers is denied (WorkspaceMutationAuthorityError). Peer worktree ownership is tracked in a process-local fail-closed registry (src/peer/workspace-guard.ts): peers may only mutate worktrees they opened, granted-source re-check runs at every mutation, list_managed_worktrees filters to the caller peer's own entries, and ownership does not survive restart (re-open re-records). Peer worktrees are capped per peer by KONTROL_PEER_MAX_ACTIVE_SESSIONS on top of the existing managed-worktree limits. staged_file_write remains worker-role-bound and unusable by peers.
+- M2: peers granted workspace:propose_patch may open managed worktrees for granted source roots and mutate files inside them (write/edit) with MANDATORY checkpoint tracking — the widget-visibility early return and the global allowUntrackedMutation escape never apply to peers. Direct checkout mutation by peers is denied (WorkspaceMutationAuthorityError). Peer worktree ownership is cached in process and persisted in a mode-0600 atomic sidecar (src/peer/workspace-guard.ts); startup restores exact principal bindings and fails closed on corrupt state. Peers may mutate only owned worktrees, granted-source re-check runs at every mutation, and list_managed_worktrees filters to the caller peer's entries. Peer worktrees are capped per peer by KONTROL_PEER_MAX_ACTIVE_SESSIONS on top of the existing managed-worktree limits. staged_file_write remains worker-role-bound and unusable by peers.
 - Only C1 (peer-initiated calls to approved Kontrol tools, now including isolated worktree mutation) is implemented. C3 (verified hosted-Muse-agent activation) is a follow-on milestone and must never be claimed from VM-process evidence. workspace:run_bounded remains reserved. The M3 durable peer job protocol is enforced: every /peer/jobs/* route requires the peer's owner-granted job:claim / job:complete / job:cancel_ack capability (403 peer_capability_denied otherwise); the owner enqueues through the owner-only enqueue_peer_job MCP tool (never in any peer tool profile; handler role-guarded to authenticated clients); a claim sets attempt certainty "unknown" — requeue happens only after an affirmative not-started report, otherwise expiry routes to awaiting_reconciliation (never auto-repeat); duplicate results are idempotent only when the stored receipt compares canonically identical, differing receipts answer 409 conflicting_result; receipts are persisted on the attempt and terminalState maps succeeded→result_received, failed/cancelled→terminal peer_reported_* job states; heartbeat leases are clamped to the job's maxRuntimeMs budget (410 runtime_budget_exceeded when exhausted); a bounded reaper (30s, unref'd) sweeps expired leases and its lifecycle binds to the peer job routes handle on app.locals (closed on shutdown and candidate rollback).
 - M5 WebUI visibility: the owner/reviewer MCP surface exposes peer listener status, enrolled peers, and durable job states via the read-only, secret-free list_peer_status tool (src/peer/peer-tools.ts; never in any peer tool profile, handler additionally denies peer/worker roles); the WebUI is a consumer of durable state, not authority.
 

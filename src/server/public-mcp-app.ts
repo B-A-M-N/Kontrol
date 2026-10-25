@@ -23,7 +23,7 @@ import type { ServerConfig } from "../config.js";
 import type { SingleUserOAuthProvider } from "../oauth-provider.js";
 import type { DerivedAuth } from "./auth.js";
 import { logEvent, requestPath } from "../logger.js";
-import { hostFromRequestHeader, normalizeHostAllowlist } from "../ingress/host-policy.js";
+import { hostMatchesAllowlist, normalizeHostAllowlist, strictHostHeaderValidation } from "../ingress/host-policy.js";
 import { normalizeIpLiteral, resolveClientIp, type TrustedProxyPolicy } from "../ingress/proxy-context.js";
 import { MCP_HTTP_BODY_LIMIT_BYTES, rejectOversizedBody } from "./mcp-session-state.js";
 
@@ -242,32 +242,10 @@ export function publicMcpAllowedHosts(config: ServerConfig): string[] {
   ]);
 }
 
-function hostnameOnly(host: string): string {
-  // normalizeHostEntry keeps IPv6 bracketed ("[::1]" / "[::1]:8443"), so a
-  // trailing ":<digits>" after a closing bracket is a port; an unbracketed
-  // colon can only be a port after an IPv4/hostname.
-  const bracketed = host.match(/^(\[[^\]]*\])(:\d+)?$/);
-  if (bracketed) return bracketed[1]!;
-  const colon = host.indexOf(":");
-  return colon === -1 ? host : host.slice(0, colon);
-}
-
-/**
- * Whether a resolved (normalized, default-port-stripped) Host matches the
- * allowlist. The listener binds exactly one port, so the Host-header port
- * cannot reroute traffic: the hostname-only form may match a portless
- * allowlist entry (loopback probes reach 127.0.0.1:7678; proxies may forward
- * explicit ports), while any unknown hostname still fails closed.
- */
+/** Whether a normalized Host authority matches the exact listener allowlist.
+ * Only loopback entries permit an arbitrary probe port. */
 export function publicHostMatches(resolvedHost: string, allowlist: readonly string[]): boolean {
-  const requested = resolvedHost;
-  if (allowlist.some((entry) => entry === requested)) return true;
-  // The listener binds exactly one port, so the Host-header port cannot
-  // reroute traffic: the hostname-only form may match a portless allowlist
-  // entry (loopback probes reach 127.0.0.1:7678; proxies may forward explicit
-  // ports), while any unknown hostname still fails closed.
-  const requestedHostname = hostnameOnly(requested);
-  return allowlist.some((entry) => entry === requestedHostname);
+  return hostMatchesAllowlist(resolvedHost, allowlist);
 }
 
 /**
@@ -398,31 +376,10 @@ export function createPublicMcpApp(deps: PublicMcpAppDeps): { app: Express } {
     next();
   });
 
-  // 1. Host allowlist (PR-A host-policy). Rejects before any other work:
-  //    duplicate Host entries, absolute-form, wildcard, whitespace, and any
-  //    hostname outside the exact allowlist. X-Forwarded-Host is never read.
+  // 1. Strict shared Host allowlist. Rejects duplicate Host entries,
+  //    malformed authorities, unexpected ports, and unknown hosts.
   const allowedHosts = publicMcpAllowedHosts(config);
-  app.use((req: Request, res: Response, next: NextFunction) => {
-    const hostValues: string[] = [];
-    const rawHeaders = req.rawHeaders;
-    for (let i = 0; i + 1 < rawHeaders.length; i += 2) {
-      if (rawHeaders[i]!.toLowerCase() === "host") hostValues.push(rawHeaders[i + 1]!);
-    }
-    const resolution = hostFromRequestHeader(req.headers.host, hostValues);
-    const resolvedHost = "host" in resolution ? resolution.host : undefined;
-    const rejectReason = "host" in resolution ? undefined : resolution.error;
-    if (!resolvedHost || !publicHostMatches(resolvedHost, allowedHosts)) {
-      // The host value is not a secret; log it to make operator misconfig
-      // greppable. No other request data is emitted here.
-      logEvent(config.logging, "warn", "public_mcp_host_rejected", {
-        host: typeof req.headers.host === "string" ? req.headers.host : undefined,
-        reason: rejectReason ?? "host not in allowlist",
-      });
-      res.status(403).json({ error: { code: "forbidden_host", message: "Host header is not accepted by this listener" } });
-      return;
-    }
-    next();
-  });
+  app.use(strictHostHeaderValidation(allowedHosts));
 
   // 2. Request log middleware. Proxy fields were resolved ONCE per request
   //    in the edge limiter above (F3-E) and stashed on res.locals; they feed

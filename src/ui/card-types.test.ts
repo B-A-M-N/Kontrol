@@ -8,7 +8,7 @@ import {
 } from "./card-types.js";
 import { toolNameFromResult } from "./tool-display.js";
 
-for (const tool of ["apply_patch", "exec_command", "write_stdin", "poll_process", "list_peer_status"]) {
+for (const tool of ["apply_patch", "exec_command", "write_stdin", "poll_process", "list_peer_status", "ingress_management"]) {
   assert.equal(isToolName(tool), true, `${tool} should be a recognized card tool`);
 }
 assert.equal(isToolName("not_a_tool"), false);

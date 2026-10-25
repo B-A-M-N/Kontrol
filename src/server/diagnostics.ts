@@ -21,6 +21,7 @@ import type { McpQualificationEvidenceJournal } from "./mcp-qualification-eviden
 import type { Request, Response } from "express";
 import { toolListCacheDiagnostics } from "../mcp-tool-list-cache.js";
 import { readMcpToolSurface } from "../mcp/tool-names.js";
+import { readIngressManagementProjection } from "../ingress/ingress-tools.js";
 
 export interface DiagnosticsDeps {
   readonly config: ServerConfig;
@@ -376,6 +377,7 @@ export async function handleDiagnostics(deps: DiagnosticsDeps, req: Request, res
       snapshotStore: await deps.snapshotStoreDiagnostics(),
       generation: generationRecord,
       supervisor: supervisorStatus,
+      ingress: await readIngressManagementProjection(config),
       heapUsed: memUsage.heapUsed,
       heapTotal: memUsage.heapTotal,
       rss: memUsage.rss,

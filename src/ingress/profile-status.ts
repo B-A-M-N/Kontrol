@@ -1,17 +1,16 @@
 /**
- * Expected-vs-observed ingress classification and DRY-RUN planning (P1-08).
- * Pure configuration logic plus one bounded loopback probe primitive; the
- * probe and the Tailscale facts layer are only ever driven by the one-shot
- * `kontrol ingress inspect|plan` CLI command — never by the server hot path.
+ * Expected-vs-observed ingress classification and DRY-RUN planning.
+ * Configuration logic and one bounded loopback application probe; the Tailscale
+ * lifecycle controller lives separately in controller.ts.
  *
  * ZERO MUTATION: nothing here executes Tailscale. `buildIngressPlan` only
- * PRINTS the commands an operator would run by hand; apply/disable do not
- * exist in this build.
+ * prints a human-readable command preview; mutations go through the durable
+ * profile controller, never the server hot path.
  */
-import { connect } from "node:net";
+import { request as httpRequest } from "node:http";
 import type { IngressAudience, IngressConfig, IngressKind, IngressListenerTarget, IngressProfile } from "./types.js";
 import { kindPrivacy } from "./types.js";
-import type { ServeMapping, TailscaleFacts } from "./tailscale-status.js";
+import type { IngressRouteIdentity, ServeMapping, TailscaleFacts } from "./tailscale-status.js";
 import { validateIngressProfiles, type IngressValidationContext } from "./validate.js";
 
 /** Structural subset of ServerConfig this module needs (keeps the ingress
@@ -24,7 +23,16 @@ export interface IngressConfigSource {
   ingress?: IngressConfig;
 }
 
-export type ProfileClassification = "DISABLED" | "LOCAL_DOWN" | "NO_MAPPING" | "MISMATCH" | "MATCHED";
+export type ProfileClassification =
+  | "DISABLED"
+  | "CONFIG_INVALID"
+  | "LOCAL_DOWN"
+  | "NETWORK_DOWN"
+  | "NO_MAPPING"
+  | "MISMATCH"
+  | "MAPPING_MATCHED"
+  | "EXTERNAL_UNVERIFIED"
+  | "UNKNOWN";
 
 export type IngressPrivacy = ReturnType<typeof kindPrivacy>;
 
@@ -50,25 +58,77 @@ export function validationContextFromConfig(config: IngressConfigSource): Ingres
   };
 }
 
+export interface ExpectedRouteIdentity extends Omit<IngressRouteIdentity, "hostname" | "allowFunnel"> {
+  hostname: string | null;
+  allowFunnel: boolean;
+}
+
 /**
- * Normalize a proxy target to the canonical loopback spelling
- * http://127.0.0.1:<effectivePort>; null when the target is not loopback or
- * not a parseable URL. 127.0.0.1, [::1], and localhost all normalize to
- * 127.0.0.1, and the effective port falls back to the scheme default (80/443)
- * because WHATWG URL drops explicitly-written default ports.
+ * Parse a proxy target into the EXACT upstream identity. Unlike the old
+ * canonical string comparison, any path other than "/", query, fragment, or
+ * userinfo makes the identity unrepresentable (null). A configured loopback
+ * spelling of localhost or [::1] is normalized to 127.0.0.1; this is the one
+ * equivalence accepted for local upstream hostnames.
  */
 export function normalizeLocalTarget(raw: string): string | null {
+  const identity = parseUpstreamTarget(raw);
+  if (!identity || identity.path !== "/" ) return null;
+  const host = normalizeLoopbackHost(identity.host);
+  return host === null ? null : `${identity.scheme}://${host}:${identity.port}${identity.path}`;
+}
+
+function parseUpstreamTarget(raw: string): { scheme: "http" | "https"; host: string; port: string; path: string } | null {
   let url: URL;
   try {
     url = new URL(raw);
   } catch {
     return null;
   }
-  const host = url.hostname.toLowerCase();
-  // Node's URL keeps IPv6 hostnames bracketed ("[::1]"); both spellings loop back.
-  if (host !== "127.0.0.1" && host !== "::1" && host !== "[::1]" && host !== "localhost") return null;
+  if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+  if (url.username || url.password || url.search || url.hash) return null;
+  if (url.pathname !== "" && url.pathname !== "/") return null;
   const port = url.port !== "" ? url.port : url.protocol === "https:" ? "443" : "80";
-  return `http://127.0.0.1:${port}`;
+  return { scheme: url.protocol === "https:" ? "https" : "http", host: url.hostname.toLowerCase(), port, path: "/" };
+}
+
+function normalizeLoopbackHost(host: string): "127.0.0.1" | null {
+  // WHATWG URL keeps IPv6 authorities bracketed.
+  const unbracketed = host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
+  if (host === "localhost" || unbracketed === "::1") return "127.0.0.1";
+  return host === "127.0.0.1" ? "127.0.0.1" : null;
+}
+
+/**
+ * Build the complete expected route identity from the configured origin,
+ * target listener, and observed Tailscale self identity.
+ */
+export function expectedRouteIdentity(
+  profile: IngressProfile,
+  expectedLocalPort: number | null,
+  dnsName: string | null,
+): ExpectedRouteIdentity | null {
+  if (expectedLocalPort === null) return null;
+  try {
+    const url = new URL(profile.externalOrigin);
+    const hostname = url.hostname.toLowerCase();
+    // A configured .ts.net profile must match the actual Tailscale self DNS
+    // name. Other hostnames remain acceptable for aliases, but can never be
+    // proven by this facts document; hostname stays null and positive matching
+    // is inconclusive.
+    const nodeMatches = dnsName !== null && hostname === dnsName.toLowerCase();
+    return {
+      hostname: nodeMatches ? hostname : null,
+      listenPort: url.port !== "" ? url.port : "443",
+      handlerPath: "/",
+      upstreamScheme: "http",
+      upstreamHost: "127.0.0.1",
+      upstreamPort: String(expectedLocalPort),
+      upstreamPath: "/",
+      allowFunnel: profile.kind === "tailscale_funnel",
+    };
+  } catch {
+    return null;
+  }
 }
 
 export interface ProfileStatus {
@@ -100,46 +160,54 @@ export interface IngressReport {
 }
 
 /**
- * Host/origin equality cannot be verified from tailscale status output alone:
- * Tailscale terminates TLS and the serve/funnel status JSON does not carry the
- * HTTP origin the mapping will serve. Origin checks therefore stay plan-time
- * (config canonical-origin validation), never inspect-time.
+ * Exact route classification. `MAPPING_MATCHED` means every identity field
+ * matched, the backend is Running, and the actual self DNS identity proves
+ * the configured node. It intentionally does NOT claim end-to-end readiness:
+ * that requires an authenticated protocol probe over the external route.
  */
 export function classifyProfile(options: {
   profile: IngressProfile;
-  facts: Pick<TailscaleFacts, "serveMappings" | "funnelMappings">;
+  facts: Pick<TailscaleFacts, "serveMappings" | "funnelMappings" | "serveStatusSchemaSupported" | "funnelStatusSchemaSupported" | "backendState" | "dnsName">;
   expectedLocalPort: number | null;
   localReachable?: boolean;
 }): ProfileClassification {
   const { profile, facts, expectedLocalPort, localReachable } = options;
   if (!profile.enabled) return "DISABLED";
   if (profile.kind !== "tailscale_serve" && profile.kind !== "tailscale_funnel") {
-    // https_bridge / secure_mcp_tunnel: no Tailscale observation applies in
-    // this build (bridge deployment files arrive in a later PR).
-    return "NO_MAPPING";
+    return profile.kind === "https_bridge" ? "EXTERNAL_UNVERIFIED" : "NO_MAPPING";
   }
-  // Upstream tailscale renders the SAME ipn.ServeConfig for both status
-  // commands, so the funnel bucket alone proves nothing: a funnel profile may
-  // only match routes the document explicitly marks funnel-enabled.
-  const rawCandidates = profile.kind === "tailscale_funnel" ? facts.funnelMappings : facts.serveMappings;
-  const candidates = profile.kind === "tailscale_funnel"
-    ? rawCandidates.filter((mapping) => mapping.allowFunnel === true)
-    : rawCandidates;
+  const schemaSupported = profile.kind === "tailscale_funnel"
+    ? facts.funnelStatusSchemaSupported
+    : facts.serveStatusSchemaSupported;
+  if (!schemaSupported) return "UNKNOWN";
+  if (facts.backendState !== "Running") return "NETWORK_DOWN";
   if (expectedLocalPort === null) return "NO_MAPPING";
   if (localReachable === false) return "LOCAL_DOWN";
-  const expected = `http://127.0.0.1:${expectedLocalPort}`;
-  const matchedRoutes = candidates.filter((mapping) => normalizeLocalTarget(mapping.proxyTarget) === expected);
-  if (matchedRoutes.length > 0) {
-    // A serve profile expects a TAILNET_PRIVATE route; ANY funnel-enabled
-    // route to the same local port is PUBLIC exposure contradicting the
-    // expectation (mirrors the plan path refusing public peer exposure) -
-    // never a healthy MATCHED. ALL matches are scanned, not just the first,
-    // because upstream may list several hosts proxying one local port.
-    if (profile.kind === "tailscale_serve" && matchedRoutes.some((mapping) => mapping.allowFunnel === true)) return "MISMATCH";
-    return "MATCHED";
-  }
-  if (candidates.some((mapping) => routeDiffersForProfile(mapping, profile, expectedLocalPort))) return "MISMATCH";
+
+  const expected = expectedRouteIdentity(profile, expectedLocalPort, facts.dnsName);
+  if (!expected || expected.hostname === null) return "UNKNOWN";
+  const rawCandidates = profile.kind === "tailscale_funnel" ? facts.funnelMappings : facts.serveMappings;
+  const candidates = rawCandidates.filter((mapping) => mapping.identity !== undefined);
+  const exact = candidates.some((mapping) => routeIdentityEquals(mapping.identity, expected));
+  const routeDiffers = candidates.some((mapping) => routeDiffersForProfile(mapping, profile, expectedLocalPort));
+  if (exact) return "MAPPING_MATCHED";
+  if (routeDiffers) return "MISMATCH";
   return "NO_MAPPING";
+}
+
+function routeIdentityEquals(
+  actual: IngressRouteIdentity | undefined,
+  expected: ExpectedRouteIdentity,
+): boolean {
+  if (!actual || expected.hostname === null) return false;
+  return actual.hostname === expected.hostname
+    && actual.listenPort === expected.listenPort
+    && actual.handlerPath === expected.handlerPath
+    && actual.upstreamScheme === expected.upstreamScheme
+    && actual.upstreamHost === expected.upstreamHost
+    && actual.upstreamPort === expected.upstreamPort
+    && actual.upstreamPath === expected.upstreamPath
+    && actual.allowFunnel === expected.allowFunnel;
 }
 
 /** Effective port of a URL: WHATWG URL drops explicitly-written default
@@ -149,18 +217,36 @@ function effectivePort(url: URL): string {
   return url.port !== "" ? url.port : url.protocol === "https:" ? "443" : "80";
 }
 
-/** A route "exists for this profile" (so the classification is MISMATCH, not
- * NO_MAPPING) when its local target port equals the expected port via a
- * non-canonical spelling, or when the route's Tailscale listen port equals the
- * profile's externalOrigin port but points somewhere else. */
+/** A route is related to this profile when it shares the expected external
+ * host:port, local target port, or target path. Related-but-not-equal is an
+ * actionable MISMATCH, not NO_MAPPING. */
 function routeDiffersForProfile(mapping: ServeMapping, profile: IngressProfile, expectedLocalPort: number): boolean {
+  const identity = mapping.identity;
+  if (identity) {
+    if (identity.upstreamPort === String(expectedLocalPort)) return true;
+    if (identity.handlerPath !== "/") return true;
+    if (mapping.hostPort !== undefined) {
+      const expected = externalOriginHostPort(profile);
+      if (expected !== null && mapping.hostPort === expected) return true;
+    }
+    return false;
+  }
   try {
     if (effectivePort(new URL(mapping.proxyTarget)) === String(expectedLocalPort)) return true;
   } catch {
-    // unparseable proxy target is handled by the MATCHED/NO_MAPPING checks
+    // Unparseable legacy targets are inconclusive, not a positive mismatch.
   }
-  const originPort = externalOriginPort(profile);
-  return mapping.port !== "" && originPort !== "" && mapping.port === originPort;
+  const expected = externalOriginHostPort(profile);
+  return mapping.hostPort !== undefined && expected !== null && mapping.hostPort === expected;
+}
+
+function externalOriginHostPort(profile: IngressProfile): string | null {
+  try {
+    const url = new URL(profile.externalOrigin);
+    return url.hostname.toLowerCase() + ":" + (url.port !== "" ? url.port : "443");
+  } catch {
+    return null;
+  }
 }
 
 function externalOriginPort(profile: IngressProfile): string {
@@ -181,13 +267,10 @@ function findObservedMapping(profile: IngressProfile, expectedLocalPort: number 
   const candidates = profile.kind === "tailscale_funnel"
     ? rawCandidates.filter((mapping) => mapping.allowFunnel === true)
     : rawCandidates;
-  const expected = `http://127.0.0.1:${expectedLocalPort}`;
-  const matchedRoutes = candidates.filter((mapping) => normalizeLocalTarget(mapping.proxyTarget) === expected);
-  if (matchedRoutes.length > 0) {
-    // Prefer a funnel-enabled match so the observed route carries the
-    // exposure flag (drives the MISMATCH note and the FUNNEL-EXPOSED marker).
-    return matchedRoutes.find((mapping) => mapping.allowFunnel === true) ?? matchedRoutes[0];
-  }
+  const expected = expectedRouteIdentity(profile, expectedLocalPort, facts.dnsName);
+  if (!expected) return null;
+  const matchedRoutes = candidates.filter((mapping) => routeIdentityEquals(mapping.identity, expected));
+  if (matchedRoutes.length > 0) return matchedRoutes[0];
   // On MISMATCH, report the route that CAUSED the mismatch (THE shared
   // predicate, not a copy) so the operator sees what is actually mapped
   // where instead of a useless (none).
@@ -221,7 +304,7 @@ export function buildIngressReport(
       }
     }
     if (profile.kind === "tailscale_funnel" && classification === "NO_MAPPING" && expectedLocalPort !== null) {
-      const expectedTarget = `http://127.0.0.1:${expectedLocalPort}`;
+      const expectedTarget = `http://127.0.0.1:${expectedLocalPort}/`;
       if (facts.funnelMappings.some((mapping) => normalizeLocalTarget(mapping.proxyTarget) === expectedTarget && mapping.allowFunnel === undefined)) {
         notes.push("the status document lists a route for this target but does not mark it funnel-enabled; the tailscale status output may have changed shape");
       }
@@ -235,7 +318,7 @@ export function buildIngressReport(
       target: profile.target,
       enabled: profile.enabled,
       privacy: kindPrivacy(profile.kind),
-      expectedLocalTarget: expectedLocalPort !== null ? `http://127.0.0.1:${expectedLocalPort}` : null,
+      expectedLocalTarget: expectedLocalPort !== null ? `http://127.0.0.1:${expectedLocalPort}/` : null,
       observed: findObservedMapping(profile, expectedLocalPort, facts),
       classification,
       notes,
@@ -254,11 +337,14 @@ function classificationNotes(profile: IngressProfile, classification: ProfileCla
   if (classification === "DISABLED") {
     notes.push("profile is disabled (standby); no inspection applies");
   }
-  if (classification === "MATCHED") {
-    notes.push("mapping proxy target matches; external Host/origin equality cannot be verified from tailscale status output alone (Tailscale terminates TLS and the mapping does not carry the origin)");
+  if (classification === "MAPPING_MATCHED") {
+    notes.push("exact expected route tuple matched; end-to-end readiness still requires an authenticated protocol probe over the external route");
+  }
+  if (classification === "EXTERNAL_UNVERIFIED") {
+    notes.push("bridge deployment requires public-origin qualification; Tailscale status cannot establish this path");
   }
   if (profile.kind === "https_bridge") {
-    notes.push("no tailscale observation applies to this kind; bridge deployment files arrive in a later PR");
+    notes.push("no tailscale observation applies to this kind; qualify the bridge with scripts/probe-ingress-bridge.mjs against its PUBLIC origin (see deploy/bridge/README.md)");
   }
   if (profile.target === "secure_tunnel_listener") {
     notes.push("tunnel-mode owner listener is deliberately not observed or probed in this build");
@@ -317,7 +403,7 @@ export function buildIngressPlan(config: IngressConfigSource): IngressPlanEntry[
         id: profile.id,
         kind: profile.kind,
         privacy,
-        note: "informational — no command in this build (bridge deployment files arrive in a later PR)",
+        note: "informational — no Tailscale command applies; deploy the bridge from deploy/bridge/ and qualify with scripts/probe-ingress-bridge.mjs",
       });
       continue;
     }
@@ -357,19 +443,49 @@ export function buildIngressPlan(config: IngressConfigSource): IngressPlanEntry[
 }
 
 /**
- * Default bounded loopback readiness probe: a plain net.connect to
- * 127.0.0.1:<port> with a 500ms timeout. Resolves false on ANY failure —
- * it never throws and never retries. Used only inside the CLI command.
+ * Default bounded loopback application probe. It sends a valid MCP initialize
+ * without credentials and accepts only the expected authentication boundary:
+ * OAuth challenge or peer unauthorized response. A random TCP listener or an
+ * unauthenticated MCP listener cannot satisfy this check. This proves the
+ * listener protocol/auth gate is present; it does not prove valid credentials
+ * or external route readiness, so it never upgrades mapping to READY.
  */
 export function defaultLocalProbe(port: number): Promise<boolean> {
   return new Promise((resolve) => {
-    const socket = connect({ host: "127.0.0.1", port, timeout: 500 });
+    let settled = false;
     const settle = (up: boolean): void => {
-      socket.destroy();
+      if (settled) return;
+      settled = true;
       resolve(up);
     };
-    socket.on("connect", () => settle(true));
-    socket.on("timeout", () => settle(false));
-    socket.on("error", () => settle(false));
+    const request = httpRequest({
+      host: "127.0.0.1",
+      port,
+      path: "/mcp",
+      method: "POST",
+      timeout: 1_000,
+      headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
+    }, (response) => {
+      let body = "";
+      response.setEncoding("utf8");
+      response.on("data", (chunk: string) => {
+        body += chunk;
+        if (Buffer.byteLength(body, "utf8") > 4_096) request.destroy();
+      });
+      response.on("end", () => {
+        const oauthChallenge = response.statusCode === 401 && typeof response.headers["www-authenticate"] === "string";
+        const peerChallenge = response.statusCode === 401 && body.includes('"unauthorized_peer"');
+        settle(oauthChallenge || peerChallenge);
+      });
+      response.on("error", () => settle(false));
+    });
+    request.on("timeout", () => request.destroy());
+    request.on("error", () => settle(false));
+    request.end(JSON.stringify({
+      jsonrpc: "2.0",
+      id: "kontrol-ingress-local-probe",
+      method: "initialize",
+      params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "kontrol-ingress-probe", version: "1" } },
+    }));
   });
 }

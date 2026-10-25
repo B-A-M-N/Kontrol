@@ -19,6 +19,11 @@ export function hashPeerCredential(credentialId: string, secret: string): string
     .digest("hex");
 }
 
+export interface PeerCredentialFingerprint {
+  revision: number;
+  hash: string;
+}
+
 export interface PeerCredentialFile {
   version: 1;
   peers: PeerDescriptor[];

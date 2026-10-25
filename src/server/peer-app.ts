@@ -9,8 +9,8 @@
  */
 import { randomUUID } from "node:crypto";
 import express, { type Express, type NextFunction, type Request, type Response } from "express";
-import { hostHeaderValidation } from "@modelcontextprotocol/sdk/server/middleware/hostHeaderValidation.js";
 import type { ServerConfig } from "../config.js";
+import { strictHostHeaderValidation } from "../ingress/host-policy.js";
 import { logEvent, requestPath } from "../logger.js";
 import { requestLogFields } from "../mcp/workspace-server.js";
 import { createPeerAuthMiddleware, type PeerCredentialRegistry } from "../peer/auth.js";
@@ -36,9 +36,18 @@ export function createPeerHttpApp(deps: PeerHttpAppDeps): Express {
   if (!peer) throw new Error("createPeerHttpApp requires config.peer (KONTROL_PEER_ENABLED=1).");
 
   const app = express();
-  // DNS-rebinding protection scoped to the peer interface. Unlike the owner
-  // app there is no "*" escape hatch: the peer bind host is always specific.
-  app.use(hostHeaderValidation([peer.bindHost, "localhost", "127.0.0.1"]));
+  // DNS-rebinding protection scoped to the peer listener. Loopback remains
+  // permitted for local probes; enabled peer ingress profiles contribute
+  // exact external FQDNs only (never wildcards/forwarded authority).
+  const peerProfileHosts = (config.ingress?.profiles ?? [])
+    .filter((profile) => profile.enabled && profile.target === "peer_listener")
+    .flatMap((profile) => profile.allowedHosts);
+  app.use(strictHostHeaderValidation([
+    peer.bindHost,
+    "localhost",
+    "127.0.0.1",
+    ...new Set(peerProfileHosts),
+  ]));
 
   if (config.logging.trustProxy) {
     app.set(

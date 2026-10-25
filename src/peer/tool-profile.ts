@@ -22,12 +22,21 @@ const INSPECT_TOOLS: ReadonlySet<string> = new Set([
 ]);
 
 const PROPOSE_PATCH_TOOLS: readonly string[] = [toolNames.write, toolNames.edit, toolNames.stagedWrite];
-const RUN_BOUNDED_TOOLS: readonly string[] = [toolNames.shell, toolNames.pollProcess, toolNames.writeStdin];
+/**
+ * workspace:run_bounded remains a reserved future capability. The ordinary
+ * process tools are not an OS confinement boundary: exposing them to a peer
+ * would permit arbitrary process execution in a managed checkout. Until a
+ * dedicated bounded peer runner exists, this capability grants no tools.
+ */
+const RUN_BOUNDED_TOOLS: readonly string[] = [];
 
-/** MCP tool names a peer with these capabilities may see and call. Read-only by default: the inspect surface is always the baseline. */
+/** MCP tool names a peer with these capabilities may see and call. */
 export function peerAllowedToolNames(capabilities: readonly PeerCapability[]): ReadonlySet<string> {
-  const names = new Set<string>(INSPECT_TOOLS);
+  const names = new Set<string>();
   const has = (capability: PeerCapability): boolean => capabilities.includes(capability);
+  if (has("workspace:inspect")) {
+    for (const name of INSPECT_TOOLS) names.add(name);
+  }
   if (has("workspace:propose_patch")) {
     for (const name of PROPOSE_PATCH_TOOLS) names.add(name);
   }

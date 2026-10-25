@@ -2,7 +2,11 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { mkdtempSync } from "node:fs";
 import { openDatabase } from "../db/client.js";
+import { loadConfig } from "../config.js";
+import { createServer } from "../server.js";
+import { dropPeerWorktree, peerOwnsWorktree, recordPeerWorktree } from "../peer/workspace-guard.js";
 import { reconcileReplyDeliveryPage, reconcileReviewHandoffPage } from "./startup-recovery.js";
 
 const root = await mkdtemp(join(tmpdir(), "kontrol-startup-recovery-test-"));
@@ -60,5 +64,23 @@ try {
   db.close();
 } finally {
   await rm(root, { recursive: true, force: true });
+}
+{
+  // Peer worktree ownership restores across createServer restart.
+  const stateDir = mkdtempSync(join(tmpdir(), "kontrol-peer-owner-restart-"));
+  const workspaceId = "workspace-owner-restart-fixture";
+  const owner = "peer:meta-muse:credential";
+  recordPeerWorktree(workspaceId, owner, stateDir);
+  const config = loadConfig({
+    KONTROL_ALLOWED_ROOTS: "/tmp",
+    KONTROL_STATE_DIR: stateDir,
+    KONTROL_AUTH_MODE: "tunnel",
+    KONTROL_ACP_ENABLED: "false",
+    KONTROL_POLICY_MODE: "allow",
+  });
+  const running = createServer(config);
+  await running.close();
+  assert.equal(peerOwnsWorktree(workspaceId, owner), true, "peer worktree ownership must restore on startup");
+  dropPeerWorktree(workspaceId);
 }
 console.log("startup-recovery.test.ts: all assertions passed");

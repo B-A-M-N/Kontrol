@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createServer } from "node:http";
 import type { IngressProfile } from "./types.js";
 import {
   buildIngressPlan,
@@ -30,7 +31,7 @@ function profile(overrides: Partial<IngressProfile> = {}): IngressProfile {
 function config(profiles: IngressProfile[], overrides: Partial<IngressConfigSource> = {}): IngressConfigSource {
   return {
     authMode: "oauth",
-    publicBaseUrl: "https://kontrol.example.com",
+    publicBaseUrl: "https://kontrol-node.tail-scale.ts.net",
     peer: { port: 7677 },
     publicMcp: { port: 7678 },
     ingress: { profiles },
@@ -45,17 +46,42 @@ function facts(overrides: Partial<TailscaleFacts> = {}): TailscaleFacts {
     dnsName: "node.tail8d285a.ts.net",
     serveMappings: [],
     funnelMappings: [],
+    serveStatusSchemaSupported: true,
+    funnelStatusSchemaSupported: true,
     warnings: [],
     ...overrides,
   };
 }
 
-const servePeer = profile({ id: "serve-peer" });
+const servePeer = profile({ id: "serve-peer", externalOrigin: "https://node.tail8d285a.ts.net:8443", allowedHosts: ["node.tail8d285a.ts.net:8443"] });
+function mapping(overrides: Partial<ServeMapping> = {}): ServeMapping {
+  return {
+    port: "8443",
+    path: "/",
+    proxyTarget: "http://127.0.0.1:7677",
+    hostPort: "node.tail8d285a.ts.net:8443",
+    allowFunnel: false,
+    identity: {
+      hostname: "node.tail8d285a.ts.net",
+      listenPort: "8443",
+      handlerPath: "/",
+      upstreamScheme: "http",
+      upstreamHost: "127.0.0.1",
+      upstreamPort: "7677",
+      upstreamPath: "/",
+      allowFunnel: false,
+    },
+    ...overrides,
+  };
+}
 
 // --- normalizeLocalTarget ---
-assert.equal(normalizeLocalTarget("http://127.0.0.1:7677"), "http://127.0.0.1:7677");
-assert.equal(normalizeLocalTarget("http://localhost:7677"), "http://127.0.0.1:7677");
-assert.equal(normalizeLocalTarget("http://[::1]:7677"), "http://127.0.0.1:7677");
+assert.equal(normalizeLocalTarget("http://127.0.0.1:7677"), "http://127.0.0.1:7677/");
+assert.equal(normalizeLocalTarget("http://localhost:7677"), "http://127.0.0.1:7677/");
+assert.equal(normalizeLocalTarget("http://[::1]:7677"), "http://127.0.0.1:7677/");
+assert.equal(normalizeLocalTarget("https://127.0.0.1:7677"), "https://127.0.0.1:7677/");
+assert.equal(normalizeLocalTarget("http://127.0.0.1:7677/path"), null, "upstream path must not be discarded");
+assert.equal(normalizeLocalTarget("http://127.0.0.1:7677/?x=1"), null, "upstream query must not be discarded");
 assert.equal(normalizeLocalTarget("http://10.0.0.5:7677"), null);
 assert.equal(normalizeLocalTarget("not a url"), null);
 
@@ -63,30 +89,31 @@ assert.equal(normalizeLocalTarget("not a url"), null);
 {
   const matched = buildIngressReport(
     config([servePeer]),
-    facts({ serveMappings: [{ port: "443", path: "/", proxyTarget: "http://127.0.0.1:7677" }] }),
+    facts({ serveMappings: [mapping()] }),
     new Map([[7677, true]]),
   ).profiles[0];
-  assert.equal(matched.classification, "MATCHED");
-  assert.deepEqual(matched.observed, { port: "443", path: "/", proxyTarget: "http://127.0.0.1:7677" });
-  assert.equal(matched.expectedLocalTarget, "http://127.0.0.1:7677");
+  assert.equal(matched.classification, "MAPPING_MATCHED");
+  assert.deepEqual(matched.observed, mapping());
+  assert.equal(matched.expectedLocalTarget, "http://127.0.0.1:7677/");
   assert.equal(matched.privacy, "TAILNET_PRIVATE");
-  assert.ok(matched.notes.some((note) => note.includes("cannot be verified from tailscale status output alone")), "MATCHED documents the origin-verification limit");
+  assert.ok(matched.notes.some((note) => note.includes("authenticated protocol probe")), "MAPPING_MATCHED must not claim end-to-end readiness");
 }
 {
   // loopback spellings localhost / [::1] all match the 127.0.0.1 expectation
   for (const target of ["http://localhost:7677", "http://[::1]:7677"]) {
+    const route = mapping({ proxyTarget: target, identity: { ...mapping().identity!, upstreamHost: "127.0.0.1" } });
     const report = buildIngressReport(
       config([servePeer]),
-      facts({ serveMappings: [{ port: "443", path: "/", proxyTarget: target }] }),
+      facts({ serveMappings: [route] }),
       new Map([[7677, true]]),
     );
-    assert.equal(report.profiles[0].classification, "MATCHED", target);
+    assert.equal(report.profiles[0].classification, "MAPPING_MATCHED", target);
   }
 }
 {
   const down = buildIngressReport(
     config([servePeer]),
-    facts({ serveMappings: [{ port: "443", path: "/", proxyTarget: "http://127.0.0.1:7677" }] }),
+    facts({ serveMappings: [mapping()] }),
     new Map([[7677, false]]),
   ).profiles[0];
   assert.equal(down.classification, "LOCAL_DOWN", "unreachable expected port wins before mapping checks");
@@ -100,22 +127,22 @@ assert.equal(normalizeLocalTarget("not a url"), null);
   // MISMATCH (a): route to the expected local port via a non-loopback host
   const mismatchHost = buildIngressReport(
     config([servePeer]),
-    facts({ serveMappings: [{ port: "443", path: "/", proxyTarget: "http://10.0.0.5:7677" }] }),
+    facts({ serveMappings: [mapping({ proxyTarget: "http://10.0.0.5:7677", identity: { ...mapping().identity!, upstreamHost: "10.0.0.5" } })] }),
     new Map([[7677, true]]),
   ).profiles[0];
   assert.equal(mismatchHost.classification, "MISMATCH");
-  assert.deepEqual(mismatchHost.observed, { port: "443", path: "/", proxyTarget: "http://10.0.0.5:7677" }, "MISMATCH reports the route that caused it");
+  assert.deepEqual(mismatchHost.observed, mapping({ proxyTarget: "http://10.0.0.5:7677", identity: { ...mapping().identity!, upstreamHost: "10.0.0.5" } }), "MISMATCH reports the route that caused it");
 }
 {
   // MISMATCH (b): the origin's tailscale listen port is routed, but to a
   // different local target port
   const mismatchTarget = buildIngressReport(
     config([servePeer]),
-    facts({ serveMappings: [{ port: "8443", path: "/", proxyTarget: "http://127.0.0.1:9999" }] }),
+    facts({ serveMappings: [mapping({ proxyTarget: "http://127.0.0.1:9999", identity: { ...mapping().identity!, upstreamPort: "9999" } })] }),
     new Map([[7677, true]]),
   ).profiles[0];
   assert.equal(mismatchTarget.classification, "MISMATCH");
-  assert.deepEqual(mismatchTarget.observed, { port: "8443", path: "/", proxyTarget: "http://127.0.0.1:9999" }, "MISMATCH reports the route that caused it");
+  assert.deepEqual(mismatchTarget.observed, mapping({ proxyTarget: "http://127.0.0.1:9999", identity: { ...mapping().identity!, upstreamPort: "9999" } }), "MISMATCH reports the route that caused it");
 }
 {
   const disabled = buildIngressReport(
@@ -128,19 +155,22 @@ assert.equal(normalizeLocalTarget("not a url"), null);
 }
 {
   // UPSTREAM FACT: `funnel status --json` renders the SAME ipn.ServeConfig as
-  // `serve status --json` (shared runServeStatus). So a funnel profile must
-  // match ONLY routes explicitly marked allowFunnel: true — never a route
-  // that merely appears in the funnel bucket, and never a serve-only route.
-  const funnelPeer = profile({ id: "funnel-peer", kind: "tailscale_funnel", externalOrigin: "https://funnel.ts.net:8443", allowedHosts: ["funnel.ts.net:8443"] });
+  // `serve status --json`. Positive matching requires an exact recognized
+  // identity with allowFunnel proven; anything else is inconclusive.
+  const funnelPeer = profile({ id: "funnel-peer", kind: "tailscale_funnel", externalOrigin: "https://node.tail8d285a.ts.net:8443", allowedHosts: ["node.tail8d285a.ts.net:8443"] });
+  const exactFunnel = mapping({
+    allowFunnel: true,
+    identity: { ...mapping().identity!, allowFunnel: true },
+  });
   const mapped = buildIngressReport(
     config([funnelPeer]),
-    facts({ funnelMappings: [{ port: "8443", path: "/", proxyTarget: "http://127.0.0.1:7677", allowFunnel: true }] }),
+    facts({ funnelMappings: [exactFunnel] }),
     new Map([[7677, true]]),
   ).profiles[0];
-  assert.equal(mapped.classification, "MATCHED");
+  assert.equal(mapped.classification, "MAPPING_MATCHED");
 
-  // (a) The production case: BOTH buckets carry the same route, but the
-  // document never marks it funnel-enabled -> NO_MAPPING, never MATCHED.
+  // A route without an AllowFunnel entry is unrecognized and cannot satisfy a
+  // funnel profile, even when the funnel command lists it.
   const serveOnlyRoute = { port: "8443", path: "/", proxyTarget: "http://127.0.0.1:7677" };
   const notFunnelEnabled = buildIngressReport(
     config([funnelPeer]),
@@ -149,79 +179,54 @@ assert.equal(normalizeLocalTarget("not a url"), null);
   ).profiles[0];
   assert.equal(notFunnelEnabled.classification, "NO_MAPPING", "a route without an AllowFunnel entry must not satisfy a funnel profile even when the funnel command lists it");
 
-  // (b) A serve route in BOTH buckets WITH allowFunnel: true (the real
-  // funnel-on state upstream renders) -> MATCHED.
+  // Explicit allowFunnel: true satisfies a funnel profile.
   const funnelEnabled = buildIngressReport(
     config([funnelPeer]),
-    facts({ serveMappings: [{ ...serveOnlyRoute, allowFunnel: true }], funnelMappings: [{ ...serveOnlyRoute, allowFunnel: true }] }),
+    facts({ serveMappings: [exactFunnel], funnelMappings: [exactFunnel] }),
     new Map([[7677, true]]),
   ).profiles[0];
-  assert.equal(funnelEnabled.classification, "MATCHED", "an AllowFunnel-marked route satisfies a funnel profile regardless of bucket");
+  assert.equal(funnelEnabled.classification, "MAPPING_MATCHED", "an AllowFunnel-marked route satisfies a funnel profile regardless of bucket");
 
-  // (c) allowFunnel: false in the document -> NO_MAPPING (never inferred).
+  // Explicit allowFunnel: false cannot satisfy a funnel profile.
   const explicitlyOff = buildIngressReport(
     config([funnelPeer]),
-    facts({ funnelMappings: [{ ...serveOnlyRoute, allowFunnel: false }] }),
+    facts({ funnelMappings: [mapping({ allowFunnel: false, identity: { ...mapping().identity!, allowFunnel: false } })] }),
     new Map([[7677, true]]),
   ).profiles[0];
-  assert.equal(explicitlyOff.classification, "NO_MAPPING");
+  assert.equal(explicitlyOff.classification, "MISMATCH");
 }
 {
-  // serve profile + funnel-ENABLED matched route -> MISMATCH + mandatory
-  // exposure note: a public route must never be a healthy MATCHED for a
-  // tailnet-private profile (mirrors the plan-path refusal).
-  const servePriv = profile({ id: "serve-priv", kind: "tailscale_serve", externalOrigin: "https://priv.ts.net:8443", allowedHosts: ["priv.ts.net:8443"] });
+  // A funnel-enabled route to the same local port is a public-exposure
+  // contradiction for a tailnet-private serve profile.
+  const servePriv = profile({ id: "serve-priv", kind: "tailscale_serve", externalOrigin: "https://node.tail8d285a.ts.net:8443", allowedHosts: ["node.tail8d285a.ts.net:8443"] });
+  const exposedRoute = mapping({
+    hostPort: "priv.tail8d285a.ts.net:8443",
+    allowFunnel: true,
+    identity: { ...mapping().identity!, hostname: "priv.tail8d285a.ts.net", allowFunnel: true },
+  });
   const exposed = buildIngressReport(
     config([servePriv]),
-    facts({ serveMappings: [{ port: "443", path: "/", proxyTarget: "http://127.0.0.1:7677", allowFunnel: true }] }),
+    facts({ serveMappings: [exposedRoute] }),
     new Map([[7677, true]]),
   ).profiles[0];
-  assert.equal(exposed.classification, "MISMATCH", "a funnel-enabled route must never be a clean MATCHED for a serve profile");
-  assert.ok(exposed.notes.some((note) => note.includes("exposed to the PUBLIC internet")), "the exposure must be called out in notes");
-  assert.equal(exposed.observed?.allowFunnel, true, "the observed route carries the funnel flag");
-  const off = buildIngressReport(
-    config([servePriv]),
-    facts({ serveMappings: [{ port: "443", path: "/", proxyTarget: "http://127.0.0.1:7677", allowFunnel: false }] }),
-    new Map([[7677, true]]),
-  ).profiles[0];
-  assert.equal(off.classification, "MATCHED", "an explicitly funnel-off route stays MATCHED");
-  // The exposure scan covers ALL target-matching routes, not just the first:
-  // upstream may list several hosts proxying one local port.
-  const secondRouteExposed = buildIngressReport(
-    config([servePriv]),
-    facts({ serveMappings: [
-      { port: "443", path: "/", proxyTarget: "http://127.0.0.1:7677" },
-      { port: "443", path: "/x", proxyTarget: "http://127.0.0.1:7677", allowFunnel: true },
-    ] }),
-    new Map([[7677, true]]),
-  ).profiles[0];
-  assert.equal(secondRouteExposed.classification, "MISMATCH", "a funnel-enabled route to the same local port is caught even when it is not the first match");
-  assert.equal(secondRouteExposed.observed?.allowFunnel, true, "observed prefers the exposed route");
-  // P3-E: an unmarked funnel-bucket route earns the shape-drift note.
-  const funnelPriv = profile({ id: "funnel-priv", kind: "tailscale_funnel", externalOrigin: "https://priv.ts.net:8443", allowedHosts: ["priv.ts.net:8443"] });
-  const unmarked = buildIngressReport(
-    config([funnelPriv]),
-    facts({ funnelMappings: [{ port: "8443", path: "/", proxyTarget: "http://127.0.0.1:7677" }] }),
-    new Map([[7677, true]]),
-  ).profiles[0];
-  assert.equal(unmarked.classification, "NO_MAPPING");
-  assert.ok(unmarked.notes.some((note) => note.includes("may have changed shape")), "an unmarked funnel-bucket route earns a diagnostic note");
+  assert.equal(exposed.classification, "MISMATCH", "a funnel-enabled route must never satisfy a serve profile");
+  assert.ok(exposed.notes.some((note) => note.includes("exposed to the PUBLIC internet")), "the exposure earns a diagnostic note");
 }
 {
   // non-tailscale kinds: informational, no tailscale observation applies
-  const tunnel = profile({ id: "tunnel-1", kind: "secure_mcp_tunnel", audience: "owner_public", target: "secure_tunnel_listener", externalOrigin: "https://kontrol.example.com", allowedHosts: ["kontrol.example.com"] });
+  const tunnel = profile({ id: "tunnel-1", kind: "secure_mcp_tunnel", audience: "owner_public", target: "secure_tunnel_listener", externalOrigin: "https://kontrol-node.tail-scale.ts.net", allowedHosts: ["kontrol-node.tail-scale.ts.net"] });
   const tunnelStatus = buildIngressReport(config([tunnel]), facts({}), new Map()).profiles[0];
   assert.equal(tunnelStatus.classification, "NO_MAPPING");
   assert.equal(tunnelStatus.expectedLocalTarget, null, "secure_tunnel_listener gets no mapping and no probe");
   assert.ok(tunnelStatus.notes.some((note) => note.includes("deliberately not observed or probed")));
-  const bridge = profile({ id: "bridge-1", kind: "https_bridge", audience: "owner_public", target: "public_oauth_listener", externalOrigin: "https://kontrol.example.com", allowedHosts: ["kontrol.example.com"] });
+  const bridge = profile({ id: "bridge-1", kind: "https_bridge", audience: "owner_public", target: "public_oauth_listener", externalOrigin: "https://kontrol-node.tail-scale.ts.net", allowedHosts: ["kontrol-node.tail-scale.ts.net"] });
   const bridgeStatus = buildIngressReport(config([bridge]), facts({}), new Map()).profiles[0];
-  assert.equal(bridgeStatus.classification, "NO_MAPPING");
-  assert.ok(bridgeStatus.notes.some((note) => note.includes("bridge deployment files arrive in a later PR")));
+  assert.equal(bridgeStatus.classification, "EXTERNAL_UNVERIFIED", "a bridge is configured but cannot be positively verified by Tailscale status");
+  assert.ok(bridgeStatus.notes.some((note) => note.includes("qualify the bridge with scripts/probe-ingress-bridge.mjs")));
 }
 {
   // target listener not enabled -> nothing to observe locally
-  const publicProfile = profile({ id: "serve-public", audience: "owner_public", target: "public_oauth_listener", externalOrigin: "https://kontrol.example.com", allowedHosts: ["kontrol.example.com"] });
+  const publicProfile = profile({ id: "serve-public", audience: "owner_public", target: "public_oauth_listener", externalOrigin: "https://kontrol-node.tail-scale.ts.net", allowedHosts: ["kontrol-node.tail-scale.ts.net"] });
   const status = buildIngressReport(config([publicProfile], { publicMcp: undefined }), facts({})).profiles[0];
   assert.equal(status.classification, "NO_MAPPING");
   assert.equal(status.expectedLocalTarget, null);
@@ -240,13 +245,13 @@ assert.equal(normalizeLocalTarget("not a url"), null);
 // --- classifyProfile directly (used by the report builder) ---
 assert.equal(classifyProfile({ profile: { ...servePeer, enabled: false }, facts: facts({}), expectedLocalPort: 7677 }), "DISABLED");
 assert.equal(
-  classifyProfile({ profile: servePeer, facts: facts({ serveMappings: [{ port: "443", path: "/", proxyTarget: "http://127.0.0.1:7677" }] }), expectedLocalPort: 7677 }),
-  "MATCHED",
+  classifyProfile({ profile: servePeer, facts: facts({ serveMappings: [mapping()] }), expectedLocalPort: 7677 }),
+  "MAPPING_MATCHED",
 );
 
 // --- redaction: exact key sets, nothing else ---
 {
-  const tunnel = profile({ id: "tunnel-1", kind: "secure_mcp_tunnel", audience: "owner_public", target: "secure_tunnel_listener", externalOrigin: "https://kontrol.example.com", allowedHosts: ["kontrol.example.com"] });
+  const tunnel = profile({ id: "tunnel-1", kind: "secure_mcp_tunnel", audience: "owner_public", target: "secure_tunnel_listener", externalOrigin: "https://kontrol-node.tail-scale.ts.net", allowedHosts: ["kontrol-node.tail-scale.ts.net"] });
   const report = buildIngressReport(
     config([servePeer, tunnel]),
     facts({ warnings: ["tailscale version failed (exit 1): boom"] }),
@@ -281,8 +286,8 @@ assert.equal(
   }]);
 }
 {
-  const funnelPublic = profile({ id: "funnel-public", kind: "tailscale_funnel", audience: "owner_public", target: "public_oauth_listener", externalOrigin: "https://kontrol.example.com:8443", allowedHosts: ["kontrol.example.com:8443"] });
-  const entries = buildIngressPlan(config([funnelPublic], { publicBaseUrl: "https://kontrol.example.com:8443" }));
+  const funnelPublic = profile({ id: "funnel-public", kind: "tailscale_funnel", audience: "owner_public", target: "public_oauth_listener", externalOrigin: "https://kontrol-node.tail-scale.ts.net:8443", allowedHosts: ["kontrol-node.tail-scale.ts.net:8443"] });
+  const entries = buildIngressPlan(config([funnelPublic], { publicBaseUrl: "https://kontrol-node.tail-scale.ts.net:8443" }));
   assert.deepEqual(entries, [{
     id: "funnel-public",
     kind: "tailscale_funnel",
@@ -294,7 +299,7 @@ assert.equal(
 {
   // default external port 443 when the origin has no explicit port; serve to
   // the public OAuth listener is allowed but must carry the OAuth-mode note
-  const servePublic = profile({ id: "serve-public", audience: "owner_public", target: "public_oauth_listener", externalOrigin: "https://kontrol.example.com", allowedHosts: ["kontrol.example.com"] });
+  const servePublic = profile({ id: "serve-public", audience: "owner_public", target: "public_oauth_listener", externalOrigin: "https://kontrol-node.tail-scale.ts.net", allowedHosts: ["kontrol-node.tail-scale.ts.net"] });
   const entries = buildIngressPlan(config([servePublic]));
   assert.equal(entries.length, 1);
   assert.equal(entries[0].command, "tailscale serve --bg --https=443 http://127.0.0.1:7678");
@@ -304,22 +309,22 @@ assert.equal(
 
 // --- plan: refusals ---
 {
-  const funnelPeer = profile({ id: "funnel-peer", kind: "tailscale_funnel", externalOrigin: "https://funnel.ts.net:8443", allowedHosts: ["funnel.ts.net:8443"] });
-  const entries = buildIngressPlan(config([funnelPeer]));
+  const funnelStandby = profile({ id: "funnel-standby", kind: "tailscale_funnel", audience: "owner_public", target: "public_oauth_listener", externalOrigin: "https://kontrol-node.tail-scale.ts.net:8443", allowedHosts: ["kontrol-node.tail-scale.ts.net:8443"], enabled: false });
+  const entries = buildIngressPlan(config([funnelStandby]));
   assert.equal(entries.length, 1);
   assert.equal(entries[0].command, undefined);
-  assert.equal(entries[0].refused, "public peer-bearer exposure is not supported in this build (needs P0-05 edge hardening first)");
+  assert.match(entries[0].note ?? "", /disabled/);
 }
 {
-  const tunnel = profile({ id: "tunnel-1", kind: "secure_mcp_tunnel", audience: "owner_public", target: "secure_tunnel_listener", externalOrigin: "https://kontrol.example.com", allowedHosts: ["kontrol.example.com"] });
-  const entries = buildIngressPlan(config([tunnel]));
+  const tunnel = profile({ id: "tunnel-1", kind: "secure_mcp_tunnel", audience: "owner_public", target: "secure_tunnel_listener", externalOrigin: "https://kontrol-node.tail-scale.ts.net", allowedHosts: ["kontrol-node.tail-scale.ts.net"] });
+  const entries = buildIngressPlan(config([tunnel], { authMode: "tunnel" }));
   assert.equal(entries.length, 1);
   assert.equal(entries[0].command, undefined);
   assert.equal(entries[0].refused, "tunnel-mode owner listener is unauthenticated at the app layer; never proxy it through Tailscale");
 }
 {
   // target listener not enabled -> refusal, never a half-specified command
-  const servePublic = profile({ id: "serve-public", audience: "owner_public", target: "public_oauth_listener", externalOrigin: "https://kontrol.example.com", allowedHosts: ["kontrol.example.com"] });
+  const servePublic = profile({ id: "serve-public", audience: "owner_public", target: "public_oauth_listener", externalOrigin: "https://kontrol-node.tail-scale.ts.net", allowedHosts: ["kontrol-node.tail-scale.ts.net"] });
   const entries = buildIngressPlan(config([servePublic], { publicMcp: undefined }));
   assert.equal(entries[0].command, undefined);
   assert.match(entries[0].refused ?? "", /public OAuth listener/);
@@ -329,7 +334,7 @@ assert.equal(
 {
   const entries = buildIngressPlan(config([
     profile({ id: "standby", enabled: false }),
-    profile({ id: "bridge-1", kind: "https_bridge", audience: "owner_public", target: "public_oauth_listener", externalOrigin: "https://kontrol.example.com", allowedHosts: ["kontrol.example.com"] }),
+    profile({ id: "bridge-1", kind: "https_bridge", audience: "owner_public", target: "public_oauth_listener", externalOrigin: "https://kontrol-node.tail-scale.ts.net", allowedHosts: ["kontrol-node.tail-scale.ts.net"] }),
   ]));
   assert.equal(entries.length, 2);
   assert.equal(entries[0].command, undefined);
@@ -357,7 +362,7 @@ assert.equal(
 // --- validation context mirrors the startup builder ---
 assert.deepEqual(
   validationContextFromConfig(config([], { peer: undefined })),
-  { authMode: "oauth", peerEnabled: false, hasPeerCredentials: false, publicBaseUrl: "https://kontrol.example.com" },
+  { authMode: "oauth", peerEnabled: false, hasPeerCredentials: false, publicBaseUrl: "https://kontrol-node.tail-scale.ts.net" },
 );
 
 // --- default local probe: refuses a dead loopback port (bounded, no throw) ---
@@ -366,6 +371,16 @@ assert.deepEqual(
   assert.equal(typeof up, "boolean", "the probe resolves a boolean even when the connection fails");
   const dead = await defaultLocalProbe(1); // port 1: nothing listens, fails fast
   assert.equal(dead, false, "a closed loopback port must resolve false, never throw");
+
+  const fakeListener = createServer((_request, response) => {
+    response.writeHead(401, { "www-authenticate": 'Bearer resource_metadata="http://127.0.0.1/.well-known/oauth-protected-resource/mcp"' });
+    response.end(JSON.stringify({ error: "unauthorized" }));
+  });
+  await new Promise<void>((resolve) => fakeListener.listen(0, "127.0.0.1", resolve));
+  const address = fakeListener.address();
+  assert.ok(address && typeof address === "object");
+  assert.equal(await defaultLocalProbe(address.port), true, "a valid MCP auth challenge proves the expected local listener protocol is serving");
+  fakeListener.close();
 }
 
 console.log("profile-status: all assertions passed");

@@ -88,6 +88,7 @@ import {
 import type { LegacyReviewDom, WorkSessionDom } from "./session-view-types.js";
 import { formatElapsed, humanizeStatus } from "./ui-format.js";
 import { approvalCenterId, isApprovalCenterId } from "./approval-center.js";
+import { renderIngressManagementPanel } from "./ingress-management.js";
 import { relativeSessionAge, sessionCategory } from "./session-view-helpers.js";
 import {
   currentPayloadContainerElement,
@@ -825,6 +826,31 @@ function renderNowInternal(): void {
 
   const card = lastToolCard;
   ensureSurface(`tool:${card.tool}`);
+  if (card.tool === "ingress_management") {
+    appRoot.replaceChildren(renderIngressManagementPanel(card.summary ?? {}, {
+      manage: async (action, profileId, preferredEndpointIds) => {
+        try {
+          const result = await callServerToolChecked({
+            name: "ingress_management",
+            arguments: {
+              action,
+              ...(profileId ? { profileId } : {}),
+              ...(preferredEndpointIds ? { preferredEndpointIds } : {}),
+              ...(action === "inspect" ? {} : { confirm: true }),
+            },
+          }, { retry: action === "inspect" ? "safe" : "reconcile" });
+          const projection = result.structuredContent as Record<string, unknown> | undefined;
+          if (!projection) throw new Error("The ingress server returned no authoritative status projection.");
+          lastToolCard = { ...lastToolCard!, summary: projection };
+          errorMessage = null;
+        } catch (error) {
+          errorMessage = error instanceof Error ? error.message : String(error);
+        }
+        render();
+      },
+    }, errorMessage));
+    return;
+  }
   const display = getToolDisplay(card);
   if (card.tool === "open_approval_center") {
     renderApprovalCenterCard(card);

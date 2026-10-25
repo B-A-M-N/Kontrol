@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import { createServer as createNetServer } from "node:net";
@@ -50,6 +51,26 @@ try {
   assert.ok(existsSync(join(pkg, "dist/cli.js")), "packed package is missing dist/cli.js");
   assert.ok(existsSync(join(pkg, "dist/acp-worker-token.mjs")), "packed package is missing dist/acp-worker-token.mjs");
   assert.ok(existsSync(join(pkg, "dist/service.js")), "packed package is missing compiled service lifecycle code");
+  const packagedBridgeConfig = readFileSync(join(pkg, "deploy/bridge/Caddyfile.example"));
+  assert.deepEqual(
+    packagedBridgeConfig,
+    readFileSync(join(root, "deploy/bridge/Caddyfile.example")),
+    "packed release must carry the exact audited bridge configuration",
+  );
+  const bridgeManifest = JSON.parse(readFileSync(join(pkg, "deploy/bridge/ingress-config-manifest.json"), "utf8"));
+  assert.equal(bridgeManifest.schemaVersion, 2);
+  assert.equal(bridgeManifest.configPath, "deploy/bridge/Caddyfile.example");
+  assert.equal(
+    bridgeManifest.configSha256,
+    createHash("sha256").update(packagedBridgeConfig).digest("hex"),
+    "packaged bridge manifest must hash the exact included config bytes",
+  );
+  for (const name of ["Caddyfile.multipath.example", "KontrolGateway.Caddyfile.example"]) {
+    const packaged = readFileSync(join(pkg, "deploy/bridge", name));
+    assert.deepEqual(packaged, readFileSync(join(root, "deploy/bridge", name)), `packed release must carry ${name}`);
+    const receipt = bridgeManifest.configs?.find((entry) => entry.configPath === `deploy/bridge/${name}`);
+    assert.equal(receipt?.configSha256, createHash("sha256").update(packaged).digest("hex"), `release manifest must bind ${name}`);
+  }
   assert.equal(
     existsSync(join(pkg, "scripts/kontrol-user-service.sh")),
     false,
@@ -344,6 +365,13 @@ try {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
     });
+  }
+
+  for (const script of ["scripts/probe-ingress-bridge.mjs", "scripts/qualify-caddy-bridge.mjs", "scripts/lib/mcp-endpoint-selector.mjs", "scripts/mcp-owner-stdio-bridge.mjs"]) {
+    assert.ok(existsSync(join(installedPkg, script)), `clean install is missing ${script}`);
+  }
+  for (const module of ["dist/ingress/health-store.js", "dist/ingress/proxy-context.js"]) {
+    assert.ok(existsSync(join(installedPkg, module)), `clean install is missing qualification dependency ${module}`);
   }
 
   console.log("package-release.test.mjs: shipped adapter imports validated");

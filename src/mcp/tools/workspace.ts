@@ -442,7 +442,7 @@ export function registerWorkspaceTools(
           // existing-workspace reuse path that emerges from openWorkspace.
           if (openedWorkspace.workspace.mode === "worktree") {
             const principalId = connectionContext.authenticatedPrincipalId;
-            if (principalId) recordPeerWorktree(openedWorkspace.workspace.id, principalId);
+            if (principalId) recordPeerWorktree(openedWorkspace.workspace.id, principalId, config.stateDir);
           }
         }
       }

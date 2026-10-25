@@ -2,6 +2,7 @@
  * Pure Host-header / host-entry policy helpers for ingress profiles (PR-A).
  * No state, no timers, no listeners: every function maps inputs to outputs.
  */
+import type { NextFunction, Request, Response } from "express";
 
 const STRIPPABLE_PORTS = new Set(["443", "80"]);
 
@@ -86,6 +87,46 @@ export function hostFromRequestHeader(rawHost: string | undefined, rawHeaders: r
   } catch (error) {
     return { error: error instanceof Error ? error.message : "invalid host" };
   }
+}
+
+/** Strict listener-specific Host middleware shared by public and peer apps.
+ * Non-loopback authorities must match the configured host AND port exactly;
+ * only explicitly allowlisted loopback hosts may carry an ephemeral probe
+ * port. X-Forwarded-Host is never consulted. */
+export function strictHostHeaderValidation(
+  allowedHostEntries: readonly string[],
+): (req: Request, res: Response, next: NextFunction) => void {
+  const allowed = new Set(normalizeHostAllowlist(allowedHostEntries));
+  return (req, res, next) => {
+    const hostValues: string[] = [];
+    for (let index = 0; index + 1 < req.rawHeaders.length; index += 2) {
+      if (req.rawHeaders[index]!.toLowerCase() === "host") hostValues.push(req.rawHeaders[index + 1]!);
+    }
+    const resolution = hostFromRequestHeader(req.headers.host, hostValues);
+    if ("host" in resolution) {
+      const hostname = hostnameFromAuthority(resolution.host);
+      if (allowed.has(resolution.host) || (isLoopbackAuthority(hostname) && allowed.has(hostname))) { next(); return; }
+    }
+    res.status(403).json({ error: { code: "forbidden_host", message: "Host header is not accepted by this listener" } });
+  };
+}
+
+export function hostMatchesAllowlist(resolvedHost: string, allowlistEntries: readonly string[]): boolean {
+  const allowed = new Set(normalizeHostAllowlist(allowlistEntries));
+  if (allowed.has(resolvedHost)) return true;
+  const hostname = hostnameFromAuthority(resolvedHost);
+  return isLoopbackAuthority(hostname) && allowed.has(hostname);
+}
+
+function isLoopbackAuthority(hostname: string): boolean {
+  const value = hostname.startsWith("[") && hostname.endsWith("]") ? hostname.slice(1, -1) : hostname;
+  return isLoopbackHostValue(value);
+}
+
+function hostnameFromAuthority(authority: string): string {
+  if (authority.startsWith("[")) return authority.slice(0, authority.indexOf("]") + 1);
+  const colon = authority.lastIndexOf(":");
+  return colon > -1 && /^\d+$/.test(authority.slice(colon + 1)) ? authority.slice(0, colon) : authority;
 }
 
 /**

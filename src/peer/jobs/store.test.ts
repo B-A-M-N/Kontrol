@@ -7,7 +7,7 @@
  * node:assert/strict.
  */
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
@@ -517,4 +517,15 @@ const NOW = 1_700_000_000_000;
   console.log("store: restartReconciliation after durable reload");
 }
 
+{
+  const stateDir = mkdtempSync(join(tmpdir(), "peer-jobs-corrupt-"));
+  const corruptPath = join(stateDir, "peer-jobs.json");
+  writeFileSync(corruptPath, "{ broken evidence");
+  assert.throws(() => openPeerJobStore(stateDir, logging), (error: unknown) =>
+    error instanceof PeerJobError && error.code === "peer_jobs_state_corrupt",
+  "corrupt existing sidecar must fail closed, never reset to an empty queue");
+  const entries = readdirSync(stateDir);
+  assert.ok(entries.some((entry) => entry.startsWith("peer-jobs.json.corrupt.")), "corrupt evidence must be preserved/quarantined");
+  assert.equal(existsSync(corruptPath), false, "the corrupt file must not remain in the authoritative path");
+}
 console.log("src/peer/jobs/store.test.ts: all assertions passed");
