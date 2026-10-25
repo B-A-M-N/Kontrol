@@ -835,6 +835,10 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
             expectedRevision: sessionState.peerAuthorizationRevision,
             actualRevision: peerPrincipal.grantRevision,
           });
+          // Rejection alone leaves a stale standalone SSE transport attached.
+          // Close the transport and run the same lifecycle cleanup as an
+          // explicit close so direct process ownership and waiters are fenced.
+          finalizeMcpSession(sessionId, "client_closed", { evictionReason: "peer_authorization_superseded" });
           sendJsonRpcError(res, 403, -32001, "MCP session authorization has been superseded; initialize a fresh session");
           return;
         }
