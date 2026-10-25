@@ -388,6 +388,22 @@ export function parseRpcPayload(body, contentType = "") {
 	return undefined;
 }
 
+/**
+ * The evidence tier a bridge observation earns.
+ *
+ * The tier is DERIVED from the origin the probe actually contacted: a
+ * tailnet Serve route is real_tailnet evidence even when the probe file is
+ * called "bridge", and a loopback target is local_integration evidence even
+ * when the operator believed it was public. An operator cannot label a
+ * local run as public-internet evidence.
+ */
+export function bridgeObservationTier(origin) {
+  const host = String(origin ?? "").toLowerCase();
+  if (host.includes(".ts.net")) return "real_tailnet";
+  if (host.includes("127.0.0.1") || host.includes("localhost") || host.includes("[::1]")) return "local_integration";
+  return "public_internet";
+}
+
 export function createBridgeHealthObservation({ profileId, buildId, origin, authorization, observedChecks, sessionIdentityHash, operationId, metrics = {}, failureClass, observedAt = new Date().toISOString() }) {
 	const candidateChecks = {
 		externalHttps: observedChecks.healthz,
@@ -411,7 +427,7 @@ export function createBridgeHealthObservation({ profileId, buildId, origin, auth
 		probeOrigin: new URL(origin).origin + "/",
 		principalClass: authorization ? "owner_public" : "none",
 		state,
-		evidenceTier: "public_internet",
+		evidenceTier: bridgeObservationTier(origin),
 		observedAt,
 		checks,
 		metrics: {

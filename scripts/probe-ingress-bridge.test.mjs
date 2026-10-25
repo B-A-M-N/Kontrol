@@ -7,7 +7,7 @@
  */
 import assert from "node:assert/strict";
 import http from "node:http";
-import { runProbe, fencedFetch, isSameOrigin, assertUnauthorizedChallenge, takeSseFrames, qualifiesSseHeartbeats, createBridgeHealthObservation, readBoundedText, FORGED_AUTHORITY_HEADERS } from "./probe-ingress-bridge.mjs";
+import { runProbe, fencedFetch, isSameOrigin, assertUnauthorizedChallenge, takeSseFrames, qualifiesSseHeartbeats, createBridgeHealthObservation, bridgeObservationTier, readBoundedText, FORGED_AUTHORITY_HEADERS } from "./probe-ingress-bridge.mjs";
 
 const ALLOWED = new Set(["/mcp", "/healthz", "/.well-known/oauth-protected-resource/mcp", "/authorize", "/token", "/register", "/revoke"]);
 
@@ -106,6 +106,23 @@ assert.equal(FORGED_AUTHORITY_HEADERS["x-kontrol-role"], "reviewer");
 	assert.equal(createBridgeHealthObservation({ profileId: "bridge-main", buildId: "build-1", origin: "https://bridge.example.test", authorization: "Bearer t", observedChecks: { healthz: true }, failureClass: "authenticated-initialize" }).state, "DEGRADED");
 	assert.equal(createBridgeHealthObservation({ profileId: "bridge-main", buildId: "build-1", origin: "https://bridge.example.test", observedChecks: { healthz: true } }).state, "UNVERIFIED");
 }
+
+// The recorded evidence tier is DERIVED from the origin the probe contacted:
+// a loopback run can never be recorded as public-internet evidence.
+assert.equal(bridgeObservationTier("https://bridge.example.test"), "public_internet");
+assert.equal(bridgeObservationTier("https://node.tail8d285a.ts.net:8443"), "real_tailnet");
+assert.equal(bridgeObservationTier("http://127.0.0.1:7678"), "local_integration");
+assert.equal(bridgeObservationTier("https://localhost:8443"), "local_integration");
+assert.equal(
+	createBridgeHealthObservation({ profileId: "p", buildId: "b", origin: "http://127.0.0.1:7678", observedChecks: { healthz: true } }).evidenceTier,
+	"local_integration",
+	"a loopback observation is local integration evidence",
+);
+assert.equal(
+	createBridgeHealthObservation({ profileId: "p", buildId: "b", origin: "https://node.tail8d285a.ts.net:8443", observedChecks: { healthz: true } }).evidenceTier,
+	"real_tailnet",
+	"a tailnet observation is real tailnet evidence",
+);
 
 {
 	const first = takeSseFrames(": ping\r\n\ndata: partial");
