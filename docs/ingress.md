@@ -48,6 +48,95 @@ endpoint preference. Add `ingress_management` to each owner profile's
 IDs change, update or remove the saved preference file before restarting the
 bridge.
 
+## Qualification matrix and evidence tiers
+
+`npm run qualify:ingress` runs the adversarial qualification matrix as a
+repeatable harness instead of a collection of manually interpreted logs.
+Every scenario runs its canonical source-level guard as an isolated child
+process, and the report is a bounded, redacted artifact (no credentials, no
+response bodies, no project content).
+
+```sh
+npm run qualify:ingress -- --report ingress-qualification-matrix.json
+npm run qualify:ingress -- --only caddy-forbidden-route-negative
+npm run qualify:ingress -- --evidence-state-dir ~/.local/share/kontrol
+```
+
+Exit code 0 means every scenario passed; 1 means at least one scenario
+failed; 2 means at least one scenario is still unverified.
+
+### The five evidence tiers
+
+| tier               | meaning                                             |
+| ------------------ | --------------------------------------------------- |
+| `unit`             | a pure source-level assertion                       |
+| `local_integration` | a test that exercised the real code path locally     |
+| `real_tailnet`      | evidence captured from a real tailnet client        |
+| `public_internet`   | evidence captured from a non-tailnet client         |
+| `operational`       | sustained-operation qualification                   |
+
+Two rules keep the tiers honest:
+
+1. **A lower tier can never qualify a higher claim.** A source-level guard
+   that passes is a *regression guard*, not a qualification: the matrix
+   reports it as `source_verified`, and only evidence at the required tier
+   marks a scenario `pass`.
+2. **The tier is derived from the origin the evidence was collected
+   against**, never asserted by the operator. A probe that ran against
+   loopback is `local_integration` evidence even when it is called
+   "public internet"; an observation of a `.ts.net` origin is
+   `real_tailnet` evidence. A tailnet observation never qualifies a public
+   origin and a public observation never qualifies a tailnet route.
+
+`src/ingress/evidence-tier.ts` owns this vocabulary and the single
+qualification predicate; the health store, the management projection, the
+probes, and the matrix all consume it.
+
+### Collecting deployment evidence
+
+The public bridge probe and the tailnet Serve probe write redacted
+observations into `<stateDir>/ingress-health.json`:
+
+```sh
+# public bridge (public_internet evidence)
+node scripts/probe-ingress-bridge.mjs --url https://kontrol.example.com \
+  --authorization-file /path/to/token --profile-id bridge-1 \
+  --state-dir ~/.local/share/kontrol --build-id "$BUILD_ID"
+
+# tailnet Serve route (real_tailnet evidence)
+npm run probe:serve -- --url https://node.tail8d285a.ts.net:8443 \
+  --authorization-file /path/to/token --profile-id serve-1 \
+  --state-dir ~/.local/share/kontrol --build-id "$BUILD_ID"
+```
+
+The matrix consumes that exact artifact:
+
+```sh
+npm run qualify:ingress -- --evidence-state-dir ~/.local/share/kontrol
+```
+
+### Bridge route isolation
+
+The live bridge probe cannot by itself prove route isolation: a proxy that
+forwards EVERY path returns 404 for a forbidden path only because the
+upstream does. `scripts/bridge-route-isolation.mjs` proves it the other way
+round. It starts a controlled upstream that answers 200 on **every** path,
+runs the real configuration under a Caddy instance, and asserts that the
+bridge still answers forbidden routes with its own 404, that forged
+authority headers never reach the upstream, that the MCP contract headers
+survive the edge, and that the upstream sees the pinned Host.
+
+```sh
+node scripts/bridge-route-isolation.mjs --config deploy/bridge/Caddyfile.example \
+  --build-id "$BUILD_ID" --receipt /tmp/bridge-isolation.json
+```
+
+Only the site address and the upstream target are rewritten for the test;
+the route allowlist, header rules, and handle blocks are the exact bytes of
+the configuration under test. The guard needs a Caddy binary
+(`KONTROL_CADDY_BIN` overrides the lookup); without one the matrix leaves
+the scenario unverified instead of claiming a config proof.
+
 ## Worker bridge endpoint failover
 
 The stdio worker bridge accepts an ordered JSON list in

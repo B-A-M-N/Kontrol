@@ -34,6 +34,33 @@ Hosted MCP client -> https://kontrol.example.com/mcp
   profile example. Hosted owner-client migration remains an explicit
   reconfiguration.
 
+## Proving route isolation
+
+A probe that checks "a forbidden path returns 404" proves nothing when the
+upstream also returns 404 for that path: a proxy that forwards EVERY path
+passes that check. Route isolation is proven the other way round, against a
+controlled upstream that answers 200 on every path:
+
+```sh
+node scripts/bridge-route-isolation.mjs --config /etc/caddy/Caddyfile \
+  --build-id "$BUILD_ID" --receipt /var/lib/kontrol/bridge-isolation.json
+```
+
+The harness runs the configuration under test in a real Caddy instance and
+asserts that:
+
+- an allowlisted route reaches the controlled upstream;
+- every forbidden route still returns the bridge's OWN 404, even though the
+  upstream answered 200 on the same path;
+- no forged authority header (`X-Kontrol-*`, `X-Forwarded-*`,
+  `Tailscale-User-*`, `Forwarded`) reaches the upstream;
+- `Authorization`, `Mcp-Session-Id`, and `Last-Event-ID` survive the
+  edge;
+- the upstream sees the PINNED Host, never the client's Host.
+
+The receipt is redacted and records the configuration hash, the Caddy
+version, the allowlist, and every observation.
+
 ## VPS prerequisites
 
 1. A Linux VPS with its own domain (kontrol.example.com) and ports 80/443
