@@ -228,9 +228,19 @@ const upstream = new McpUpstreamConnection({
     const authorization = endpointAuthorization(candidate);
     if (authorization) requestHeaders.Authorization = authorization;
     const fetch = endpointFetch(candidate);
+    const client = new Client({ name: "kontrol-stdio-bridge", version: "1.0.0" }, { capabilities: {} });
+    // A transport-level failure (dropped stream, reset socket, exhausted
+    // stream reconnection) is a CONNECTION LOSS. Without this, the client
+    // keeps reporting READY against a broken transport and the bridge never
+    // rebuilds a fresh upstream session on the next endpoint. Closing the
+    // client makes the upstream manager observe onclose and run its bounded,
+    // single-flight recovery.
+    client.onerror = () => {
+      void client.close().catch(() => undefined);
+    };
     return {
       candidate,
-      client: new Client({ name: "kontrol-stdio-bridge", version: "1.0.0" }, { capabilities: {} }),
+      client,
       transport: new StreamableHTTPClientTransport(new URL(candidate.url), {
         requestInit: { headers: requestHeaders },
         fetch,

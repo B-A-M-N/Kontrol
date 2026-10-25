@@ -75,6 +75,9 @@ export interface IngressMatrixScenario {
 const TS = (file: string): IngressMatrixGuard => ({ command: "node", args: ["--import", "tsx", file], tier: "unit" });
 const TS_INTEGRATION = (file: string): IngressMatrixGuard => ({ command: "node", args: ["--import", "tsx", file], tier: "local_integration" });
 const MJS = (file: string): IngressMatrixGuard => ({ command: "node", args: [file], tier: "unit" });
+/** A guard that must run through npm (the packaged install resolves npm from
+ * npm_execpath, so it cannot be spawned as a bare node process). */
+const NPM = (script: string): IngressMatrixGuard => ({ command: "npm", args: ["run", script], tier: "local_integration" });
 
 /**
  * The audit's matrix, one scenario per row. `scope`/`tier` state the evidence
@@ -267,7 +270,7 @@ export const INGRESS_QUALIFICATION_SCENARIOS: readonly IngressMatrixScenario[] =
     scope: "loopback",
     tier: "local_integration",
     deployment: false,
-    guards: [MJS("src/package-release.test.mjs")],
+    guards: [NPM("test:package-release")],
   },
   {
     id: "external-tls-or-dns-failure",
@@ -601,12 +604,12 @@ export function evaluateIngressMatrix(evaluation: IngressMatrixEvaluation): Ingr
       status = "unverified";
       const evidence = observationEvidence(observation);
       reason = `supplied evidence (${evidence.tier}/${evidence.scope ?? "unscoped"}) does not qualify the required tier (${scenario.tier}/${scenario.scope})`;
-    } else if (scenarioGuards.some((guard) => guard.passed && !guard.skipped)) {
-      status = "source_verified";
-      reason = `the source-level guard passed, but ${scenario.tier}/${scenario.scope} evidence is still required`;
     } else if (scenarioGuards.some((guard) => guard.skipped)) {
       status = "unverified";
       reason = "a required toolchain is unavailable, so the scenario could not be exercised";
+    } else if (scenarioGuards.some((guard) => guard.passed && !guard.skipped)) {
+      status = "source_verified";
+      reason = `the source-level guard passed, but ${scenario.tier}/${scenario.scope} evidence is still required`;
     } else {
       status = "unverified";
       reason = "no source-level guard or deployment evidence was supplied";
