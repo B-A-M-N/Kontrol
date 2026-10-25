@@ -228,4 +228,37 @@ throwsIngress(
   /invalid kind/,
 );
 
+// --- regression (PR-C smoke): funnel on the DEFAULT port 443 must validate.
+// WHATWG URL drops explicitly-written default ports, so both spellings below
+// produce an empty url.port and must be checked by EFFECTIVE port.
+{
+  const base = {
+    id: "funnel-443",
+    kind: "tailscale_funnel" as const,
+    audience: "owner_public" as const,
+    target: "public_oauth_listener" as const,
+    enabled: true,
+    managedByKontrol: false,
+  };
+  for (const externalOrigin of ["https://node.ts.net", "https://node.ts.net:443"]) {
+    validateIngressProfiles(
+      [{ ...base, id: "funnel-443" + (externalOrigin.endsWith(":443") ? "-explicit" : ""), externalOrigin, allowedHosts: [externalOrigin.slice("https://".length)] }],
+      { authMode: "oauth", peerEnabled: false, hasPeerCredentials: false, publicBaseUrl: "https://node.ts.net" },
+    );
+  }
+  // 8443 remains valid; 8080 is still rejected.
+  validateIngressProfiles(
+    [{ ...base, externalOrigin: "https://node.ts.net:8443", allowedHosts: ["node.ts.net:8443"] }],
+    { authMode: "oauth", peerEnabled: false, hasPeerCredentials: false, publicBaseUrl: "https://node.ts.net:8443" },
+  );
+  assert.throws(
+    () =>
+      validateIngressProfiles(
+        [{ ...base, externalOrigin: "https://node.ts.net:8080", allowedHosts: ["node.ts.net:8080"] }],
+        { authMode: "oauth", peerEnabled: false, hasPeerCredentials: false, publicBaseUrl: "https://node.ts.net:8080" },
+      ),
+    /must be 443, 8443, or 10000/,
+  );
+}
+
 console.log("validate: all assertions passed");

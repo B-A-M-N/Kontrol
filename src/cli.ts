@@ -25,8 +25,18 @@ import {
   type KontrolUserConfig,
 } from "./user-config.js";
 import { expandHomePath } from "./roots.js";
+import {
+  buildIngressPlan,
+  buildIngressReport,
+  defaultLocalProbe,
+  expectedLocalTargetPort,
+  validationContextFromConfig,
+  type IngressPlanEntry,
+} from "./ingress/profile-status.js";
+import { readTailscaleFacts, sanitizeProxyTarget } from "./ingress/tailscale-status.js";
+import { validateIngressProfiles } from "./ingress/validate.js";
 
-type Command = "serve" | "up" | "init" | "doctor" | "config" | "service" | "snapshots" | "review-loop" | "agent" | "help" | "version";
+type Command = "serve" | "up" | "init" | "doctor" | "config" | "service" | "snapshots" | "review-loop" | "agent" | "ingress" | "help" | "version";
 const require = createRequire(import.meta.url);
 const SUPPORTED_NODE_RANGE = ">=22.19 <23 || >=24 <25 || >=26 <27";
 
@@ -65,6 +75,9 @@ async function main(argv: string[]): Promise<void> {
     case "agent":
       await runAgentCommand(args);
       return;
+    case "ingress":
+      await runIngressCommand(args);
+      return;
     case "help":
       printHelp();
       return;
@@ -79,6 +92,7 @@ function normalizeCommand(command: string | undefined): Command {
   if (command === "up" || command === "init" || command === "doctor" || command === "config" || command === "service" || command === "snapshots") return command;
   if (command === "review-loop") return "review-loop";
   if (command === "agent") return "agent";
+  if (command === "ingress") return "ingress";
   if (command === "help" || command === "--help" || command === "-h") return "help";
   if (command === "version" || command === "--version" || command === "-v") return "version";
   throw new Error(`Unknown command: ${command}`);
@@ -214,6 +228,127 @@ async function runAgentCommand(args: string[]): Promise<void> {
     return;
   }
   throw new Error(`Unknown agent subcommand: ${sub} (expected list|add|remove)`);
+}
+
+const INGRESS_USAGE = [
+  "Usage: kontrol ingress <inspect|plan> [--json]",
+  "",
+  "  inspect  Read-only observation: Tailscale facts, a bounded loopback probe of expected",
+  "           local target ports, and an expected-vs-observed report per profile.",
+  "  plan     Dry-run planner: prints the tailscale serve/funnel commands this deployment",
+  "           would need. Nothing is executed.",
+  "",
+  "This build performs ZERO Tailscale mutations. The apply and disable subcommands do not exist yet.",
+  "",
+].join("\n");
+
+/**
+ * P1-08: read-only Tailscale ingress observation and dry-run planning. This
+ * command NEVER mutates Tailscale state — no serve/funnel configuration, no
+ * reset, no backend-state changes — and apply/disable intentionally do not
+ * exist in this build (a later PR may add them behind explicit consent).
+ */
+async function runIngressCommand(args: string[]): Promise<void> {
+  const sub = args[0];
+  const json = args.slice(1).includes("--json");
+  if (!sub || sub === "help" || sub === "--help" || sub === "-h") {
+    output.write(INGRESS_USAGE);
+    return;
+  }
+  if (sub !== "inspect" && sub !== "plan") {
+    throw new Error(`Unknown ingress subcommand: ${sub} (expected "inspect" or "plan")`);
+  }
+  const config = loadConfig();
+  const profiles = config.ingress?.profiles ?? [];
+  if (sub === "plan") {
+    let entries: IngressPlanEntry[];
+    try {
+      // The planner validates first and rethrows with the stable
+      // ingress_profiles_invalid prefix; surface it verbatim on stderr.
+      entries = buildIngressPlan(config);
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exitCode = 1;
+      return;
+    }
+    if (json) {
+      console.log(JSON.stringify({ entries }, null, 2));
+    } else {
+      console.log("kontrol ingress plan — plan only, nothing was executed");
+      if (config.ingress === undefined) console.log("note: KONTROL_INGRESS_PROFILES is not configured");
+      for (const entry of entries) {
+        console.log(`  [${entry.id}] ${entry.kind} (${entry.privacy})`);
+        if (entry.command !== undefined) console.log(`    command: ${entry.command}`);
+        if (entry.refused !== undefined) console.log(`    refused: ${entry.refused}`);
+        if (entry.note !== undefined) console.log(`    note: ${entry.note}`);
+      }
+    }
+    const enabledTailscaleIds = new Set(
+      profiles.filter((p) => p.enabled && (p.kind === "tailscale_serve" || p.kind === "tailscale_funnel")).map((p) => p.id),
+    );
+    const anyRefused = entries.some((entry) => entry.refused !== undefined);
+    const missingCommand = entries.some((entry) => enabledTailscaleIds.has(entry.id) && entry.command === undefined);
+    if (anyRefused || missingCommand) process.exitCode = 1;
+    return;
+  }
+
+  // inspect: validate with EXACTLY the startup context (src/config.ts) before
+  // observing anything, so an invalid profile list fails closed the same way.
+  if (config.ingress) {
+    try {
+      validateIngressProfiles(config.ingress.profiles, validationContextFromConfig(config));
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exitCode = 1;
+      return;
+    }
+  }
+  const facts = await readTailscaleFacts();
+  const probeResults = await probeExpectedLocalPorts(config);
+  const report = buildIngressReport(config, facts, probeResults);
+  if (json) {
+    console.log(JSON.stringify(report, null, 2));
+  } else {
+    console.log("kontrol ingress inspect — read-only, no Tailscale mutations");
+    if (config.ingress === undefined) console.log("note: KONTROL_INGRESS_PROFILES is not configured");
+    console.log(`tailscale: version=${report.cliVersion ?? "unavailable"} backendState=${report.backendState ?? "unavailable"} dns=${report.dnsName ?? "unavailable"}`);
+    for (const warning of facts.warnings) console.log(`warning: ${warning}`);
+    for (const status of report.profiles) {
+      console.log(`  [${status.id}] ${status.kind} audience=${status.audience} privacy=${status.privacy} enabled=${status.enabled}`);
+      console.log(`    ${status.externalOrigin} -> ${status.expectedLocalTarget ?? "(no local target)"}`);
+      const observedText = status.observed ? sanitizeProxyTarget(status.observed.proxyTarget) : "(none)";
+      const funnelMark = status.observed?.allowFunnel === true ? " [FUNNEL-EXPOSED: public internet]" : status.observed?.allowFunnel === false ? " [funnel: off]" : "";
+      console.log(`    observed: ${observedText}${funnelMark}`);
+      console.log(`    classification: ${status.classification}`);
+      for (const note of status.notes) console.log(`    note: ${note}`);
+    }
+  }
+  const enabledTailscale = new Set(
+    profiles.filter((p) => p.enabled && (p.kind === "tailscale_serve" || p.kind === "tailscale_funnel")).map((p) => p.id),
+  );
+  const allMatched = report.profiles
+    .filter((status) => enabledTailscale.has(status.id))
+    .every((status) => status.classification === "MATCHED");
+  // Any facts-layer warning means part of the observation could not run; the
+  // report still prints (with notes) but automation must see a nonzero exit.
+  if (!allMatched || facts.warnings.length > 0) process.exitCode = 1;
+}
+
+/** Sequentially probe the expected local ports of enabled tailscale profiles
+ * (deduped). secure_tunnel_listener targets are never probed. */
+async function probeExpectedLocalPorts(config: Parameters<typeof expectedLocalTargetPort>[1]): Promise<Map<number, boolean>> {
+  const ports = new Set<number>();
+  for (const profile of config.ingress?.profiles ?? []) {
+    if (!profile.enabled) continue;
+    if (profile.kind !== "tailscale_serve" && profile.kind !== "tailscale_funnel") continue;
+    const port = expectedLocalTargetPort(profile, config);
+    if (port !== null) ports.add(port);
+  }
+  const results = new Map<number, boolean>();
+  for (const port of ports) {
+    results.set(port, await defaultLocalProbe(port));
+  }
+  return results;
 }
 
 function fsSnapshotStoreFromConfig(): FilesystemSnapshotStore {
@@ -973,6 +1108,7 @@ function printHelp(): void {
       "  kontrol snapshots stats|gc",
       "  kontrol review-loop status|on|off|pause|resume --session <workSessionId>",
       "  kontrol agent list|add|remove      Register any loopback HTTP ACP agent",
+      "  kontrol ingress inspect|plan       Read-only Tailscale ingress observation and dry-run planning (no apply/disable in this build)",
       "  kontrol -v, --version   Print the installed version",
       "",
       "For temporary tunnels:",

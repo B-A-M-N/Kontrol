@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repositoryRoot = fileURLToPath(new URL("..", import.meta.url));
@@ -391,4 +393,165 @@ for (const flag of ["-v", "--version"]) {
     await new Promise<void>((r) => agent.close(() => r()));
   }
   rmSync(configDir, { recursive: true, force: true });
+}
+
+// P1-08: ingress inspect|plan — read-only Tailscale ingress CLI surface.
+{
+  // static wiring: command union, normalizeCommand, and the main switch
+  assert.match(
+    cliSource,
+    /type Command = "serve"[^;]*"ingress"[^;]*"version";/,
+    "ingress must be part of the Command union",
+  );
+  assert.match(cliSource, /command === "ingress"\) return "ingress";/, "normalizeCommand must accept ingress");
+  assert.match(cliSource, /case "ingress":\s+await runIngressCommand\(args\);/, "main switch must dispatch ingress");
+  assert.match(cliSource, /Usage: kontrol ingress <inspect\|plan>/, "the ingress usage text must mention inspect and plan");
+  assert.match(cliSource, /apply and disable subcommands do not exist/, "help must state that apply/disable do not exist in this build");
+
+  // ZERO-MUTATION gate (the enforcement test for the ingress mandate): the
+  // CLI source must never contain a mutating tailscale invocation, and the
+  // gate spans EVERY ingress module - a mutating flag added to any of them is
+  // caught here, not just in tailscale-status's own runtime allowlist.
+  // Two complementary invariants:
+  // (1) tailscale-status.ts is the ONLY ingress module allowed to spawn a
+  //     subprocess at all (its runtime allowlist refuses mutating
+  //     invocations; tested behaviorally above/its own suite). It must never
+  //     contain a mutating flag/reset literal.
+  // (2) Every OTHER ingress module must not even import child_process — they
+  //     are pure config/report/plan logic (profile-status legitimately
+  //     PRINTS the exact command text an operator would run by hand, so a
+  //     blanket --bg string ban there would be wrong; the ban is on
+  //     execution capability, not on the dry-run text).
+  const tailscaleStatusSource = readFileSync(fileURLToPath(new URL("./ingress/tailscale-status.ts", import.meta.url)), "utf8");
+  for (const [banner, label] of [
+    [new RegExp("--bg"), "the mutating --bg flag"],
+    [new RegExp("funnel reset"), "funnel state reset"],
+    [new RegExp("serve reset"), "serve state reset"],
+    [new RegExp("shell:"), "shell-enabled exec"],
+    [new RegExp("execSync"), "synchronous exec surface"],
+  ] as Array<[RegExp, string]>) {
+    assert.doesNotMatch(tailscaleStatusSource, banner, "tailscale-status.ts must never contain " + label);
+  }
+  // P3-C: pin the EXACT child_process import shape of tailscale-status.ts:
+  // execFile only (never exec/spawn/execSync, which are shell-prone or
+  // unguarded), and no require() escape hatch.
+  assert.match(tailscaleStatusSource, new RegExp('import [{] execFile [}] from "node:child_process"'), "tailscale-status.ts must import ONLY execFile from child_process");
+  assert.doesNotMatch(tailscaleStatusSource, new RegExp("require[(]"), "tailscale-status.ts must not use require()");
+  const execFileCallSites = tailscaleStatusSource.split("execFile(").length - 1;
+  assert.equal(execFileCallSites, 1, "tailscale-status.ts must have exactly ONE execFile call site (inside the guarded helper)");
+  // P3-D: scan the ingress directory instead of a fixed list so a NEW module
+  // importing child_process is caught too (tailscale-status.ts is the only
+  // sanctioned spawner).
+  const ingressDir = fileURLToPath(new URL("./ingress/", import.meta.url));
+  const pureIngressModules = readdirSync(ingressDir)
+    .filter((name) => name.endsWith(".ts") && !name.endsWith(".test.ts") && name !== "tailscale-status.ts")
+    .sort()
+    .map((name) => "./ingress/" + name);
+  for (const gateFile of pureIngressModules) {
+    const source = readFileSync(fileURLToPath(new URL(gateFile, import.meta.url)), "utf8");
+    assert.doesNotMatch(source, new RegExp('from [\'\"]node:child_process|require[(][\'\"]node:child_process'), gateFile + " must never import child_process (pure logic only)");
+  }
+  // P1-B: cli.ts itself is scanned too. It must never gain a mutating
+  // tailscale invocation, and it must never pass the tailscale binary name
+  // to any spawn/exec call - the ONLY sanctioned spawner is
+  // tailscale-status.ts behind its runtime allowlist (enforced behaviorally
+  // by the sentinel tripwires below).
+  assert.doesNotMatch(cliSource, new RegExp("--bg"), "cli.ts must never contain the mutating --bg flag");
+  assert.doesNotMatch(cliSource, new RegExp("serve reset"), "cli.ts must never reset serve state");
+  assert.doesNotMatch(cliSource, new RegExp("funnel reset"), "cli.ts must never reset funnel state");
+  assert.doesNotMatch(cliSource, new RegExp('[\'\"]tailscale[\'\"]'), "cli.ts must never pass the tailscale binary name to a spawn/exec call");
+
+  const runIngress = (subcommand: "inspect" | "plan", envOverrides: Record<string, string | undefined>) =>
+    spawnSync("npx", ["tsx", "src/cli.ts", "ingress", subcommand], {
+      cwd: repositoryRoot,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        KONTROL_CONFIG_DIR: "/tmp/kontrol-cli-ingress-test",
+        KONTROL_OAUTH_OWNER_TOKEN: "cli-ingress-owner-token-that-is-long-enough",
+        KONTROL_ALLOWED_ROOTS: process.cwd(),
+        ...envOverrides,
+      },
+    });
+  const runIngressPlan = (envOverrides: Record<string, string | undefined>) => runIngress("plan", envOverrides);
+
+  // Functional e2e (hermetic — plan never spawns tailscale): a
+  // secure_tunnel_listener-targeting profile is refused with a nonzero exit.
+  const tunnelProfile = {
+    id: "tunnel-1",
+    kind: "secure_mcp_tunnel",
+    audience: "owner_public",
+    externalOrigin: "https://kontrol.example.com",
+    target: "secure_tunnel_listener",
+    enabled: true,
+    allowedHosts: ["kontrol.example.com"],
+  };
+  const refused = runIngressPlan({
+    KONTROL_PUBLIC_BASE_URL: "https://kontrol.example.com",
+    KONTROL_INGRESS_PROFILES: JSON.stringify([tunnelProfile]),
+  });
+  assert.notEqual(refused.status, 0, "plan must exit nonzero when a profile is refused");
+  assert.match(refused.stdout ?? "", /plan only, nothing was executed/, "plan output must be clearly labeled dry-run");
+  assert.match(refused.stdout ?? "", /never proxy it through Tailscale/, "the tunnel-target refusal reason must be printed");
+
+  // Unconfigured deployment: the empty-list note, exit 0, bit-identical to
+  // the previous behavior apart from the new command itself.
+  const unconfigured = runIngressPlan({ KONTROL_INGRESS_PROFILES: undefined });
+  assert.equal(unconfigured.status, 0, "plan over an unconfigured profile list exits 0");
+  assert.match(unconfigured.stdout ?? "", /KONTROL_INGRESS_PROFILES is not configured/);
+  assert.doesNotMatch(unconfigured.stdout ?? "", /command:/, "an unconfigured plan must not print any command");
+
+  // Spawn tripwire (authoritative for BOTH subcommands): the sentinel
+  // APPENDS its argv to a hit file inside a PRIVATE os.tmpdir() scratch dir
+  // (never the developer-scratch .tmp-scratch/). `ingress plan` must leave
+  // NO hit file (it never spawns). `ingress inspect` must reach the facts
+  // layer through the sentinel and produce EXACTLY the four read-only fact
+  // invocations - catching any direct cli.ts spawn or allowlist bypass
+  // implementation-agnostically.
+  const scratch = mkdtempSync(join(tmpdir(), "kontrol-cli-tripwire-"));
+  const sentinelScript = join(scratch, "sentinel.sh");
+  const sentinelHit = join(scratch, "hit.txt");
+  writeFileSync(
+    sentinelScript,
+    "#!/bin/sh\nprintf '%s\\n' \"$@\" >> " + JSON.stringify(sentinelHit) + "\nexit 0\n",
+    { mode: 0o755 },
+  );
+  try {
+    const serveProfile = {
+      id: "serve-pub",
+      kind: "tailscale_serve",
+      audience: "owner_public",
+      externalOrigin: "https://node.ts.net:8443",
+      target: "public_oauth_listener",
+      enabled: true,
+      managedByKontrol: false,
+      allowedHosts: ["node.ts.net:8443"],
+    };
+    const tripwireEnv = {
+      KONTROL_TAILSCALE_BIN: sentinelScript,
+      KONTROL_PUBLIC_BASE_URL: "https://node.ts.net:8443",
+      KONTROL_INGRESS_PROFILES: JSON.stringify([serveProfile]),
+    };
+    const planTripwire = runIngressPlan(tripwireEnv);
+    assert.ok(planTripwire.status !== undefined, "plan tripwire run must complete");
+    assert.equal(existsSync(sentinelHit), false, "plan must NEVER spawn the tailscale binary");
+
+    // Pre-run cleanup so an interrupted earlier run cannot false-fail here.
+    rmSync(sentinelHit, { force: true });
+    const inspectTripwire = runIngress("inspect", tripwireEnv);
+    assert.ok(inspectTripwire.status !== undefined, "inspect tripwire run must complete");
+    assert.ok(existsSync(sentinelHit), "inspect must reach the tailscale facts layer through the sentinel");
+    // The sentinel appends one line per argv element (spawnSync passes the
+    // args flat), so the expected file is the flattened, ordered sequence of
+    // the four fact invocations. Any extra invocation or flag appends more
+    // lines and fails the deepEqual.
+    const invocations = readFileSync(sentinelHit, "utf8").split("\n").filter((line) => line !== "");
+    assert.deepEqual(
+      invocations,
+      ["version", "status", "--json", "serve", "status", "--json", "funnel", "status", "--json"],
+      "the facts layer may ONLY run the four read-only fact commands",
+    );
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
 }

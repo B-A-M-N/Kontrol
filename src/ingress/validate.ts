@@ -53,8 +53,15 @@ function checkExternalOrigin(profile: IngressProfile): void {
   if (url.hostname.includes("*") || profile.externalOrigin.includes("*")) {
     fail(`profile "${profile.id}" externalOrigin must not contain a wildcard`);
   }
-  if (profile.kind === "tailscale_funnel" && !FUNNEL_PORTS.has(url.port)) {
-    fail(`profile "${profile.id}" tailscale_funnel externalOrigin port must be 443, 8443, or 10000 (got ${url.port || "443"})`);
+  if (profile.kind === "tailscale_funnel") {
+    // WHATWG URL drops explicitly-written default ports (https://h:443 and
+    // https://h both yield port with empty string), so the funnel-port check
+    // must use the EFFECTIVE port, otherwise the most common Funnel spelling
+    // (443) is wrongly rejected even though 443 is an allowed funnel port.
+    const effectivePort = url.port !== "" ? url.port : url.protocol === "https:" ? "443" : "80";
+    if (!FUNNEL_PORTS.has(effectivePort)) {
+      fail(`profile "${profile.id}" tailscale_funnel externalOrigin port must be 443, 8443, or 10000 (got ${effectivePort})`);
+    }
   }
 }
 
