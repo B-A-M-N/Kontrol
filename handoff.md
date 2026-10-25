@@ -42,12 +42,25 @@ Passed:
 
 - `npm run typecheck`
 - `node scripts/test-manifest.mjs` (192 test files, all reachable from the canonical chain)
+- `npm run test:syntax` (including the new bridge isolation, serve probe, and matrix checks)
+- `npm run test:integration` — the whole chain, including the two new integration tests
+- the remaining `test:unit` chain, run from the catalog-refresh test onward (see the pre-existing failure note below)
 - the new ingress source tests: `evidence-tier`, `qualification-matrix`, `validate-config`, `validate`, `profile-status`, `tailscale-status`, `health-store`, `ingress-tools`, `controller`, `bridge-asset`
 - `src/ingress/qualification.integration.test.ts` — a bridge upstream failure degrades only the bridge profile; core readiness stays bit-identical and the running generation is not replaced
 - `scripts/lib/mcp-owner-bridge.integration.test.mjs` — the owner preference runtime proof
 - `scripts/probe-ingress-serve.test.mjs`, `scripts/probe-ingress-bridge.test.mjs`, `scripts/bridge-route-isolation.test.mjs`, `scripts/qualify-caddy-bridge.test.mjs`
 - `npm run test:package` (release bundle, publish, and a packed-install of the release artifact)
 - `npm run qualify:ingress` — 11 of 18 matrix rows PASS at their required tier; 6 remain `source_verified` (they need real deployment evidence); 0 fail
+
+### Pre-existing failure (not caused by this work)
+
+`src/mcp-tool-catalog-http.test.ts` fails at the "release B sends the supported
+tools/list_changed refresh pulse over the existing GET stream" assertion. It
+was reproduced against the ORIGINAL branch HEAD (`9818473`) in a separate
+worktree, so it is not a regression from this continuation. Because the
+canonical `test:unit` chain is sequential, that one failure stops the chain
+before the remaining tests; the rest of the chain was therefore run
+separately and passed.
 
 The route-isolation harness was also run against the packaged `deploy/bridge/Caddyfile.example` with Caddy v2.10.2: every allowlisted route reached the controlled upstream, every forbidden route returned the bridge's own 404 while the upstream answered 200, and no forged authority header reached the upstream.
 
