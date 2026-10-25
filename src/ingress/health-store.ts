@@ -43,6 +43,17 @@ export interface IngressHealthObservation {
     failures?: number;
     reconnects?: number;
     maxHeartbeatGapMs?: number;
+    /**
+     * The server's OWN record of the correlated operation, when the probe
+     * could reach the authenticated diagnostics boundary. The identifiers
+     * and counters are bounded and carry no project content.
+     */
+    serverEvidenceRecordId?: string;
+    serverEvidenceContentSha256?: string;
+    serverEvidenceHeartbeatBytes?: number;
+    serverEvidenceResponseBytes?: number;
+    serverEvidenceCloseClassification?: string;
+    serverEvidenceServerBuildId?: string;
   };
   operationId?: string;
   sessionIdentityHash?: string;
@@ -76,15 +87,22 @@ function validateObservation(value: unknown): asserts value is IngressHealthObse
   if (origin.protocol !== "https:" || origin.username || origin.password || origin.search || origin.hash || origin.pathname !== "/") {
     throw new Error("ingress health probe origin must be a credential-free HTTPS origin");
   }
-  const allowedChecks = new Set(["daemon", "mapping", "localListener", "externalHttps", "oauthChallenge", "mcpInitialize", "toolsList", "sse", "longPost", "freshInitialize"]);
+  const allowedChecks = new Set(["daemon", "mapping", "localListener", "externalHttps", "oauthChallenge", "mcpInitialize", "toolsList", "sse", "longPost", "freshInitialize", "serverOperationCorrelation"]);
   for (const [key, item] of Object.entries(value.checks)) {
     if (!allowedChecks.has(key) || typeof item !== "boolean") throw new Error("invalid ingress health check evidence");
   }
   if (value.metrics !== undefined) {
     if (!isRecord(value.metrics)) throw new Error("invalid ingress health metrics");
     for (const [key, item] of Object.entries(value.metrics)) {
-      if (!["latencyMs", "failures", "reconnects", "maxHeartbeatGapMs"].includes(key)
-        || typeof item !== "number" || !Number.isFinite(item) || item < 0) throw new Error("invalid ingress health metric");
+      if (["latencyMs", "failures", "reconnects", "maxHeartbeatGapMs", "serverEvidenceHeartbeatBytes", "serverEvidenceResponseBytes"].includes(key)) {
+        if (typeof item !== "number" || !Number.isFinite(item) || item < 0) throw new Error("invalid ingress health metric");
+        continue;
+      }
+      if (!["serverEvidenceRecordId", "serverEvidenceContentSha256", "serverEvidenceCloseClassification", "serverEvidenceServerBuildId"].includes(key)) {
+        throw new Error("invalid ingress health metric");
+      }
+      if (typeof item !== "string" || item.length > 256) throw new Error("invalid ingress health metric");
+      if (key === "serverEvidenceContentSha256" && !/^[a-f0-9]{64}$/.test(item)) throw new Error("invalid ingress health metric");
     }
   }
   if (value.sessionIdentityHash !== undefined && (typeof value.sessionIdentityHash !== "string" || !/^[a-f0-9]{64}$/.test(value.sessionIdentityHash))) {

@@ -7,7 +7,7 @@
  */
 import assert from "node:assert/strict";
 import http from "node:http";
-import { runProbe, fencedFetch, isSameOrigin, assertUnauthorizedChallenge, takeSseFrames, qualifiesSseHeartbeats, createBridgeHealthObservation, bridgeObservationTier, readBoundedText, FORGED_AUTHORITY_HEADERS } from "./probe-ingress-bridge.mjs";
+import { runProbe, fencedFetch, isSameOrigin, assertUnauthorizedChallenge, takeSseFrames, qualifiesSseHeartbeats, createBridgeHealthObservation, bridgeObservationTier, correlateWithServerDiagnostics, readBoundedText, FORGED_AUTHORITY_HEADERS } from "./probe-ingress-bridge.mjs";
 
 const ALLOWED = new Set(["/mcp", "/healthz", "/.well-known/oauth-protected-resource/mcp", "/authorize", "/token", "/register", "/revoke"]);
 
@@ -205,4 +205,86 @@ await assert.rejects(
 );
 open.close();
 server.close();
+// The server operation correlation must match the server's OWN record, and
+// only that record's exact operation id and session identity hash count.
+{
+	const { createHash } = await import("node:crypto");
+	const sessionIdSha256 = "a".repeat(64);
+	const operationId = "op-correlation-1";
+	const startedAt = new Date().toISOString();
+	const finishedAt = new Date(Date.now() + 45_000).toISOString();
+	const record = {
+		recordId: "rec-1",
+		recordType: "external_sse",
+		serverBuildId: "build-1",
+		serverVersion: "1.0.4",
+		sessionIdSha256,
+		operationId,
+		observedAt: finishedAt,
+		expiresAt: new Date(Date.now() + 60_000).toISOString(),
+		httpMethod: "POST",
+		rpcMethod: "tools/call",
+		toolName: "await_workspace_events",
+		startedAt,
+		finishedAt,
+		durationMs: 45_000,
+		httpStatus: 200,
+		responseBytes: 4096,
+		heartbeatBytes: 128,
+		responseCloseClassification: "response_finished",
+		handlerStillRunning: false,
+	};
+	// The content address uses the canonical JSON form the server uses.
+	const canonical = (value) => {
+		if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+		if (value && typeof value === "object") {
+			return `{${Object.keys(value).filter((key) => value[key] !== undefined).sort()
+				.map((key) => `${JSON.stringify(key)}:${canonical(value[key])}`).join(",")}}`;
+		}
+		return JSON.stringify(value) ?? "null";
+	};
+	const { contentSha256: _ignored, ...content } = record;
+	const contentSha256 = createHash("sha256").update(canonical(content)).digest("hex");
+	const snapshot = { qualificationEvidence: { records: [{ ...record, contentSha256 }] } };
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async (url) => {
+		const parsed = new URL(String(url));
+		assert.equal(parsed.searchParams.get("qEvidence"), "1");
+		assert.equal(parsed.searchParams.get("qOperation"), operationId);
+		assert.equal(parsed.searchParams.get("qSession"), sessionIdSha256);
+		return new Response(JSON.stringify(snapshot), { status: 200, headers: { "content-type": "application/json" } });
+	};
+	try {
+		const correlated = await correlateWithServerDiagnostics({
+			diagnosticsUrl: "http://127.0.0.1:1/diagnostics",
+			diagnosticsSecret: "diagnostics-secret",
+			operationId,
+			sessionIdentityHash: sessionIdSha256,
+			serverVersion: "1.0.4",
+		});
+		assert.equal(correlated.matched, true, "the server record matches the client operation");
+		assert.equal(correlated.evidence?.operationId, operationId);
+		assert.equal(correlated.evidence?.heartbeatBytes, 128);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+	// Without the server's record the correlation does not claim a match.
+	const originalFetch2 = globalThis.fetch;
+	globalThis.fetch = async () => new Response(JSON.stringify({ qualificationEvidence: { records: [] } }), { status: 200 });
+	try {
+		const absent = await correlateWithServerDiagnostics({
+			diagnosticsUrl: "http://127.0.0.1:1/diagnostics",
+			diagnosticsSecret: "diagnostics-secret",
+			operationId,
+			sessionIdentityHash: sessionIdSha256,
+			serverVersion: "1.0.4",
+		});
+		assert.equal(absent.matched, false, "a missing server record never claims a correlation");
+	} finally {
+		globalThis.fetch = originalFetch2;
+	}
+	// A missing input never claims a correlation either.
+	assert.equal((await correlateWithServerDiagnostics({})).matched, false);
+}
+
 console.log("bridge probe tests passed");

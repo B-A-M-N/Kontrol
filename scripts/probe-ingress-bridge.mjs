@@ -29,6 +29,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
+import { matchExternalSseEvidence } from "./lib/mcp-qualification-evidence.mjs";
 
 const args = process.argv.slice(2);
 function option(name, fallback) {
@@ -136,7 +137,7 @@ import { pathToFileURL } from "node:url";
 
 /** Probe flow. log(line) prints one redacted line; returns check records. */
 export async function runProbe(options) {
-	const { baseUrl, authorization, heartbeatMs, log, onCheck = () => {}, onSessionId = () => {}, onOperationId = () => {}, onMetrics = () => {}, workspacePath, longPostMs } = options;
+	const { baseUrl, authorization, heartbeatMs, log, onCheck = () => {}, onSessionId = () => {}, onOperationId = () => {}, onMetrics = () => {}, onServerEvidence = () => {}, workspacePath, longPostMs, diagnosticsSecret, diagnosticsUrl, serverVersion } = options;
 	const origin = new URL(baseUrl).origin;
 	const results = [];
 	const probeMetrics = { failures: 0 };
@@ -273,6 +274,23 @@ export async function runProbe(options) {
 			probeMetrics.longPostDurationMs = durationMs;
 			record("authenticated-long-post", responseSeen && stableHeartbeats && durationMs >= longPostMs * 0.9,
 				`duration ${durationMs}ms; heartbeat-count ${heartbeatAt.length}; response ${responseSeen ? "complete" : "missing"}`);
+			// P1-02: correlate the client-side operation with the server's own
+			// authenticated operation diagnostics. Without the server's record,
+			// the client can only claim that ITS bytes arrived.
+			if (diagnosticsSecret && diagnosticsUrl && postOperationId) {
+				const correlated = await correlateWithServerDiagnostics({
+					diagnosticsUrl,
+					diagnosticsSecret,
+					operationId: postOperationId,
+					sessionIdentityHash,
+					serverVersion,
+				});
+				record("server-operation-correlation", correlated.matched,
+					`operation ${postOperationId} server-evidence ${correlated.matched ? "matched" : "absent"}`);
+				if (correlated.evidence) onServerEvidence(correlated.evidence);
+			} else {
+				log("skip server operation correlation (supply --diagnostics-secret to correlate with the server operation record)");
+			}
 		} else {
 			log("skip authenticated long POST qualification (supply --workspace-path and --long-post-ms)");
 		}
@@ -374,6 +392,81 @@ export async function readBoundedText(response, maxBytes) {
 }
 
 /** Accept ordinary JSON or JSON-RPC SSE data frames. */
+/**
+ * Correlate a client-observed MCP operation with the server's own
+ * authenticated operation record.
+ *
+ * The client can prove that ITS bytes arrived; only the server's record
+ * proves that the server observed the same operation, the same session, and
+ * the same build. The correlation is by exact operation id and session
+ * identity hash, and the record's content hash is verified.
+ */
+export async function correlateWithServerDiagnostics({ diagnosticsUrl, diagnosticsSecret, operationId, sessionIdentityHash, serverVersion }) {
+	if (!diagnosticsUrl || !diagnosticsSecret || !operationId || !sessionIdentityHash) {
+		return { matched: false, evidence: undefined };
+	}
+	const url = new URL(diagnosticsUrl);
+	url.searchParams.set("qEvidence", "1");
+	url.searchParams.set("qOperation", operationId);
+	url.searchParams.set("qSession", sessionIdentityHash);
+	const response = await fetch(url, {
+		headers: { "x-kontrol-diagnostics": diagnosticsSecret },
+		signal: AbortSignal.timeout(5_000),
+	});
+	if (response.status !== 200) return { matched: false, evidence: undefined };
+	const snapshot = await response.json();
+	const records = snapshot?.qualificationEvidence?.records ?? [];
+	// The candidate is the server's own record for THIS operation and THIS
+	// session. Its server build id is the observed build that served the
+	// request (the client cannot know it beforehand); the server VERSION is
+	// checked against the version the client observed in the handshake, and
+	// the record's content hash is verified.
+	const candidates = records.filter((record) => record?.operationId === operationId && record?.sessionIdSha256 === sessionIdentityHash);
+	const matched = matchExternalSseEvidence(candidates, {
+		operationId,
+		sessionIdSha256: sessionIdentityHash,
+		serverBuildId: candidates[0]?.serverBuildId,
+		serverVersion,
+		toolName: "await_workspace_events",
+		requestedWaitMs: longPostWaitMs(candidates, operationId),
+		startedAt: matchedStartedAt(candidates, operationId),
+		finishedAt: matchedFinishedAt(candidates, operationId),
+	});
+	if (matched.length !== 1) return { matched: false, evidence: undefined };
+	const evidence = matched[0];
+	return {
+		matched: true,
+		evidence: {
+			recordId: evidence.recordId,
+			operationId: evidence.operationId,
+			sessionIdSha256: evidence.sessionIdSha256,
+			serverBuildId: evidence.serverBuildId,
+			serverVersion: evidence.serverVersion,
+			contentSha256: evidence.contentSha256,
+			heartbeatBytes: evidence.heartbeatBytes,
+			responseBytes: evidence.responseBytes,
+			responseCloseClassification: evidence.responseCloseClassification,
+			observedAt: evidence.observedAt,
+		},
+	};
+}
+
+/** The wait the server observed for this operation, when it is recorded. */
+function longPostWaitMs(records, operationId) {
+	const record = records.find((item) => item?.operationId === operationId);
+	return Number.isFinite(record?.durationMs) ? record.durationMs : 0;
+}
+
+function matchedStartedAt(records, operationId) {
+	const record = records.find((item) => item?.operationId === operationId);
+	return typeof record?.startedAt === "string" ? record.startedAt : "";
+}
+
+function matchedFinishedAt(records, operationId) {
+	const record = records.find((item) => item?.operationId === operationId);
+	return typeof record?.finishedAt === "string" ? record.finishedAt : "";
+}
+
 export function parseRpcPayload(body, contentType = "") {
 	if (contentType.includes("application/json")) {
 		try { return JSON.parse(body); } catch { return undefined; }
@@ -404,8 +497,8 @@ export function bridgeObservationTier(origin) {
   return "public_internet";
 }
 
-export function createBridgeHealthObservation({ profileId, buildId, origin, authorization, observedChecks, sessionIdentityHash, operationId, metrics = {}, failureClass, observedAt = new Date().toISOString() }) {
-	const candidateChecks = {
+export function createBridgeHealthObservation({ profileId, buildId, origin, authorization, observedChecks, sessionIdentityHash, operationId, metrics = {}, failureClass, serverEvidence, observedAt = new Date().toISOString() }) {
+	const candidateChecksBase = {
 		externalHttps: observedChecks.healthz,
 		mapping: observedChecks["authenticated-initialize"],
 		oauthChallenge: observedChecks["unauthenticated-initialize-401"] === true && observedChecks["oauth-discovery"] === true,
@@ -415,9 +508,16 @@ export function createBridgeHealthObservation({ profileId, buildId, origin, auth
 		longPost: observedChecks["authenticated-long-post"],
 		freshInitialize: observedChecks["fresh-initialize-after-stream"],
 	};
+	const candidateChecks = {
+		...candidateChecksBase,
+		...(observedChecks["server-operation-correlation"] === undefined ? {} : { serverOperationCorrelation: observedChecks["server-operation-correlation"] }),
+	};
 	const checks = Object.fromEntries(Object.entries(candidateChecks).filter(([, value]) => value !== undefined));
 	const passed = Object.values(observedChecks).every(Boolean);
 	const required = ["externalHttps", "mapping", "oauthChallenge", "mcpInitialize", "toolsList", "sse", "longPost", "freshInitialize"];
+	// The server's own operation record is required when the probe could
+	// reach the authenticated diagnostics boundary: without it the probe can
+	// only claim that ITS bytes arrived.
 	const complete = Boolean(authorization) && required.every((key) => checks[key] === true);
 	const state = observedChecks.healthz === false ? "DOWN" : complete && passed ? "READY" : failureClass ? "DEGRADED" : "UNVERIFIED";
 	return {
@@ -434,6 +534,14 @@ export function createBridgeHealthObservation({ profileId, buildId, origin, auth
 			...(Number.isFinite(metrics.latencyMs) ? { latencyMs: metrics.latencyMs } : {}),
 			failures: Object.values(observedChecks).filter((value) => value === false).length,
 			...(Number.isFinite(metrics.maxHeartbeatGapMs) ? { maxHeartbeatGapMs: metrics.maxHeartbeatGapMs } : {}),
+			...(serverEvidence ? {
+				serverEvidenceRecordId: serverEvidence.recordId,
+				serverEvidenceContentSha256: serverEvidence.contentSha256,
+				serverEvidenceHeartbeatBytes: serverEvidence.heartbeatBytes,
+				serverEvidenceResponseBytes: serverEvidence.responseBytes,
+				serverEvidenceCloseClassification: serverEvidence.responseCloseClassification,
+				serverEvidenceServerBuildId: serverEvidence.serverBuildId,
+			} : {}),
 		},
 		...(sessionIdentityHash ? { sessionIdentityHash } : {}),
 		...(operationId ? { operationId } : {}),
@@ -485,7 +593,9 @@ async function main() {
 	let operationId;
 	let metrics = {};
 	let failureClass;
+	let serverEvidence;
 	let result;
+	const diagnosticsSecret = option("--diagnostics-secret", process.env.KONTROL_DIAGNOSTICS_SECRET);
 	try {
 		result = await runProbe({
 			baseUrl: url,
@@ -496,8 +606,12 @@ async function main() {
 			onSessionId: (hash) => { sessionIdentityHash = hash; },
 			onOperationId: (id) => { operationId = id; },
 			onMetrics: (value) => { metrics = value; },
+			onServerEvidence: (evidence) => { serverEvidence = evidence; },
 			workspacePath,
 			longPostMs: workspacePath ? longPostMs : undefined,
+			diagnosticsSecret,
+			diagnosticsUrl: option("--diagnostics-url", new URL("/diagnostics", url).href),
+			serverVersion: option("--server-version", undefined),
 		});
 	} catch (error) {
 		failureClass = Object.keys(observedChecks).find((name) => observedChecks[name] === false) ?? "probe_error";
@@ -505,7 +619,7 @@ async function main() {
 	} finally {
 		if (profileId) {
 			const { appendIngressHealthObservation } = await import(new URL("../dist/ingress/health-store.js", import.meta.url));
-			const observation = createBridgeHealthObservation({ profileId, buildId, origin: url, authorization, observedChecks, sessionIdentityHash, operationId, metrics, failureClass });
+			const observation = createBridgeHealthObservation({ profileId, buildId, origin: url, authorization, observedChecks, sessionIdentityHash, operationId, metrics, failureClass, serverEvidence });
 			appendIngressHealthObservation(stateDir, observation);
 		}
 	}
