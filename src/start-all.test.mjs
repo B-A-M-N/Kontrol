@@ -120,6 +120,12 @@ assert.match(readinessProbe, /await jsonOrText\(reviewerReadiness\)/, "reviewer 
 assert.match(readinessProbe, /REQUIRED_INSPECTION_TOOLS/, "readiness must use the canonical eight-tool registry");
 assert.match(readinessProbe, /git_status.*git_log.*git_diff.*git_show/s, "readiness must exercise all Git inspection tools");
 assert.match(readinessProbe, /open_approval_center/, "ask-capable readiness must exercise the reviewer approval center");
+assert.match(readinessProbe, /reviewerHeaderName[\s\S]*x-kontrol-tunnel-reviewer[\s\S]*x-kontrol-reviewer-token/,
+  "readiness must use the tunnel-specific reviewer assertion header in tunnel mode");
+assert.match(readinessProbe, /\[reviewerHeaderName\]: reviewerToken/,
+  "reviewer readiness sends the selected credential only in its matching authority header");
+assert.match(readinessProbe, /--rpc-timeout-ms/,
+  "readiness RPC timeout is configurable for large but bounded workspace inspections");
 assert.match(readinessProbe, /jsonOrText/);
 assert.match(readinessProbe, /args\.includes\("--probe-bash"\)/);
 assert.match(readinessProbe, /if \(probeBash\)/);

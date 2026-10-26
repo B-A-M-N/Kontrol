@@ -19,6 +19,10 @@ const skipDiscover = args.includes("--skip-discover");
 const probeBash = args.includes("--probe-bash");
 const buildMetaPath = flag("--build-meta", undefined);
 const expectedMcpVersion = flag("--expected-mcp-version", undefined);
+const rpcTimeoutMs = Number(flag("--rpc-timeout-ms", "10000"));
+if (!Number.isInteger(rpcTimeoutMs) || rpcTimeoutMs < 1_000 || rpcTimeoutMs > 120_000) {
+  throw new Error("--rpc-timeout-ms must be an integer between 1000 and 120000");
+}
 const agentSpecs = args
   .map((value, index) => value === "--agent" ? args[index + 1] : undefined)
   .filter(Boolean)
@@ -72,7 +76,7 @@ async function rpc(method, params, { withSession = true } = {}) {
     method: "POST",
     headers,
     body: JSON.stringify({ jsonrpc: "2.0", id: ++requestId, method, params }),
-    signal: AbortSignal.timeout(10_000),
+    signal: AbortSignal.timeout(rpcTimeoutMs),
   });
   const payload = decode(await response.text());
   if (method === "initialize") sessionId = response.headers.get("mcp-session-id") ?? sessionId;
@@ -191,8 +195,11 @@ const reviewerReadiness = await fetch(readyUrl, { signal: AbortSignal.timeout(3_
 const reviewerBody = await jsonOrText(reviewerReadiness);
 const askCapable = reviewerBody.approvalInteractive === true;
 if (askCapable) {
-  const reviewerToken =
-    process.env.KONTROL_TUNNEL_REVIEWER_SECRET ?? process.env.KONTROL_ACP_REVIEWER_SECRET;
+  const tunnelReviewerToken = process.env.KONTROL_TUNNEL_REVIEWER_SECRET;
+  const reviewerToken = tunnelReviewerToken ?? process.env.KONTROL_ACP_REVIEWER_SECRET;
+  const reviewerHeaderName = tunnelReviewerToken
+    ? "x-kontrol-tunnel-reviewer"
+    : "x-kontrol-reviewer-token";
   assert.ok(reviewerToken, "ask-capable policy requires KONTROL_TUNNEL_REVIEWER_SECRET (or KONTROL_ACP_REVIEWER_SECRET) for the reviewer readiness path");
 
   let reviewerSessionId;
@@ -201,7 +208,7 @@ if (askCapable) {
     const headers = {
       "content-type": "application/json",
       accept: "application/json, text/event-stream",
-      "x-kontrol-reviewer-token": reviewerToken,
+      [reviewerHeaderName]: reviewerToken,
     };
     if (token) headers.authorization = `Bearer ${token}`;
     if (withSession && reviewerSessionId) headers["mcp-session-id"] = reviewerSessionId;
@@ -209,7 +216,7 @@ if (askCapable) {
       method: "POST",
       headers,
       body: JSON.stringify({ jsonrpc: "2.0", id: ++reviewerRequestId, method, params }),
-      signal: AbortSignal.timeout(10_000),
+      signal: AbortSignal.timeout(rpcTimeoutMs),
     });
     const payload = decode(await response.text());
     if (method === "initialize") {
