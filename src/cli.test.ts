@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { readPtyReviewFeedback, readPtyReviewMutationId, readPtyReviewSubmission } from "./pty-review-cli.js";
+import { completePtyReviewMutationId, getOrCreatePtyReviewMutationId, readPtyReviewFeedback, readPtyReviewMutationId, readPtyReviewMutationIntent, readPtyReviewSubmission } from "./pty-review-cli.js";
 
 const repositoryRoot = fileURLToPath(new URL("..", import.meta.url));
 
@@ -29,10 +29,40 @@ assert.equal(readPtyReviewMutationId(["submit", "--client-mutation-id", "x".repe
   "mutation identity length matches the durable receipt contract");
 assert.equal(readPtyReviewMutationId(["submit", "--client-mutation-id", "first", "--client-mutation-id", "second"]).ok, false,
   "duplicate mutation identity flags are rejected as ambiguous");
-assert.match(cliSource, /clientMutationId: mutationId\.clientMutationId/,
-  "the stable PTY review mutation identity reaches submit_for_review");
+assert.match(cliSource, /clientMutationId = mutationId\.clientMutationId[\s\S]*getOrCreatePtyReviewMutationId/,
+  "managed PTY submissions reuse pending identities or create one automatically");
+assert.match(cliSource, /prior PTY review submission has an unresolved response/,
+  "an explicit new identity cannot bypass an unresolved automatic submission");
+assert.match(cliSource, /clientMutationId,\n\s*\},/,
+  "every managed PTY review submission carries an idempotency identity");
+assert.match(cliSource, /getOrCreatePtyReviewMutationId\(mutationIntentPath\)/,
+  "managed PTY submissions persist a retry identity before contacting MCP");
+assert.match(cliSource, /completePtyReviewMutationId\(mutationIntentPath, clientMutationId\)/,
+  "managed PTY submissions clear the retry identity only after receiving a durable receipt");
 assert.match(cliSource, /--client-mutation-id <stable-id>/,
   "PTY review help documents the retry identity option");
+const intentDirectory = mkdtempSync(join(tmpdir(), "kontrol-pty-review-intent-"));
+const intentPath = join(intentDirectory, "submission-intent");
+try {
+  const firstIntent = getOrCreatePtyReviewMutationId(intentPath);
+  assert.equal(getOrCreatePtyReviewMutationId(intentPath), firstIntent,
+    "a retry after losing the CLI response reuses its pending submission identity");
+  assert.equal(readPtyReviewMutationIntent(intentPath), firstIntent,
+    "pending submission identity can be checked before honoring an explicit override");
+  assert.equal(statSync(intentPath).mode & 0o077, 0,
+    "the persisted PTY retry identity is private to the agent process owner");
+  completePtyReviewMutationId(intentPath, firstIntent);
+  assert.equal(readPtyReviewMutationIntent(intentPath), undefined,
+    "a confirmed receipt clears the pending identity");
+  const nextIntent = getOrCreatePtyReviewMutationId(intentPath);
+  assert.notEqual(nextIntent, firstIntent,
+    "a later review round receives a fresh identity after the prior receipt is observed");
+  assert.throws(() => completePtyReviewMutationId(intentPath, firstIntent), /changed before receipt cleanup/,
+    "cleanup cannot erase a different pending submission after an unexpected race");
+  completePtyReviewMutationId(intentPath, nextIntent);
+} finally {
+  rmSync(intentDirectory, { recursive: true, force: true });
+}
 const feedbackTimeout = readPtyReviewFeedback({ structuredContent: { status: "timeout", sessionId: "work-1" } });
 assert.equal(feedbackTimeout.ok, true);
 assert.equal(feedbackTimeout.status, "timeout", "feedback timeout stays distinguishable so the CLI can continue waiting");

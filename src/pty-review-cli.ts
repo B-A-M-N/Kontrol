@@ -1,3 +1,7 @@
+import { closeSync, constants, fsyncSync, linkSync, lstatSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { dirname } from "node:path";
+
 export type PtyReviewFeedbackStatus = "feedback_ready" | "transferred" | "timeout";
 
 export type PtyReviewToolResult = { ok: true; receipt: Record<string, unknown> }
@@ -13,6 +17,73 @@ export function readPtyReviewMutationId(args: string[]): { ok: true; clientMutat
     return { ok: false, error: "--client-mutation-id requires a 1–200 character value." };
   }
   return { ok: true, clientMutationId };
+}
+
+function syncDirectory(path: string): void {
+  // Windows does not expose a syncable directory descriptor through Node.
+  if (process.platform === "win32") return;
+  const descriptor = openSync(path, constants.O_RDONLY);
+  try { fsyncSync(descriptor); } finally { closeSync(descriptor); }
+}
+
+function readPrivateIntent(path: string): string {
+  const stats = lstatSync(path);
+  if (!stats.isFile() || stats.isSymbolicLink() || (stats.mode & 0o077) !== 0) {
+    throw new Error("PTY review submission intent is not a private regular file.");
+  }
+  const value = readFileSync(path, "utf8").trim();
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)) {
+    throw new Error("PTY review submission intent is malformed; preserve it for safe reconciliation.");
+  }
+  return value;
+}
+
+export function readPtyReviewMutationIntent(path: string): string | undefined {
+  try { return readPrivateIntent(path); }
+  catch (error) {
+    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+/** Persist the retry key before the first MCP call so a restarted PTY command
+ * can replay the same logical submission after losing its response. */
+export function getOrCreatePtyReviewMutationId(path: string): string {
+  const existing = readPtyReviewMutationIntent(path);
+  if (existing) return existing;
+
+  const directory = dirname(path);
+  const temporaryPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  const value = randomUUID();
+  let descriptor: number | undefined;
+  try {
+    descriptor = openSync(temporaryPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
+    writeFileSync(descriptor, `${value}\n`, "utf8");
+    fsyncSync(descriptor);
+    closeSync(descriptor);
+    descriptor = undefined;
+    try {
+      // A hard link gives atomic create-if-absent semantics without replacing
+      // another concurrent PTY command's pending identity.
+      linkSync(temporaryPath, path);
+      syncDirectory(directory);
+      return value;
+    } catch (error) {
+      if (!(error && typeof error === "object" && "code" in error && error.code === "EEXIST")) throw error;
+      return readPrivateIntent(path);
+    }
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+    unlinkSync(temporaryPath);
+  }
+}
+
+/** Clear only the identity whose authoritative submission receipt was received. */
+export function completePtyReviewMutationId(path: string, expected: string): void {
+  const current = readPrivateIntent(path);
+  if (current !== expected) throw new Error("PTY review submission intent changed before receipt cleanup.");
+  unlinkSync(path);
+  syncDirectory(dirname(path));
 }
 
 function objectValue(value: unknown): Record<string, unknown> | undefined {

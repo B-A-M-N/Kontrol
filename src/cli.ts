@@ -39,7 +39,7 @@ import { applyIngressProfile, disableIngressProfile, listIngressOperationReceipt
 import { latestIngressHealthByProfile } from "./ingress/health-store.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { readPtyReviewFeedback, readPtyReviewMutationId, readPtyReviewSubmission } from "./pty-review-cli.js";
+import { completePtyReviewMutationId, getOrCreatePtyReviewMutationId, readPtyReviewFeedback, readPtyReviewMutationId, readPtyReviewMutationIntent, readPtyReviewSubmission } from "./pty-review-cli.js";
 
 type Command = "serve" | "up" | "init" | "doctor" | "config" | "service" | "snapshots" | "review-loop" | "review" | "agent" | "ingress" | "help" | "version";
 const require = createRequire(import.meta.url);
@@ -143,6 +143,15 @@ async function runPtyReviewCommand(args: string[]): Promise<void> {
     || typeof credential.workSessionId !== "string") {
     throw new Error("PTY review credential file is malformed.");
   }
+  const mutationIntentPath = join(dirname(canonicalPath), "submission-intent");
+  const pendingMutationId = readPtyReviewMutationIntent(mutationIntentPath);
+  if (mutationId.clientMutationId && pendingMutationId && mutationId.clientMutationId !== pendingMutationId) {
+    throw new Error("A prior PTY review submission has an unresolved response; retry it with its pending mutation ID before starting another submission.");
+  }
+  const clientMutationId = mutationId.clientMutationId
+    ?? pendingMutationId
+    ?? getOrCreatePtyReviewMutationId(mutationIntentPath);
+  const ownsAutomaticIntent = !mutationId.clientMutationId || pendingMutationId === clientMutationId;
   const credentialToken = credential.token;
   const endpoint = new URL(credential.mcpUrl);
   if (endpoint.protocol !== "http:" || !["127.0.0.1", "localhost", "[::1]"].includes(endpoint.hostname)
@@ -186,7 +195,7 @@ async function runPtyReviewCommand(args: string[]): Promise<void> {
       arguments: {
         sessionId: credential.workSessionId,
         ...(flagValue(args, "--message") ? { message: flagValue(args, "--message") } : {}),
-        ...(mutationId.clientMutationId ? { clientMutationId: mutationId.clientMutationId } : {}),
+        clientMutationId,
       },
     });
     const submission = readPtyReviewSubmission(submitted);
@@ -195,7 +204,8 @@ async function runPtyReviewCommand(args: string[]): Promise<void> {
       process.exitCode = 1;
       return;
     }
-    output.write(`${JSON.stringify({ ...submission.receipt, ...(mutationId.clientMutationId ? { clientMutationId: mutationId.clientMutationId } : {}) })}\n`);
+    if (ownsAutomaticIntent) completePtyReviewMutationId(mutationIntentPath, clientMutationId);
+    output.write(`${JSON.stringify({ ...submission.receipt, clientMutationId })}\n`);
     if (args.includes("--no-wait")) return;
     for (;;) {
       const feedback = await client!.callTool({
