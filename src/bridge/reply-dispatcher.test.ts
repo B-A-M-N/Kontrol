@@ -37,6 +37,7 @@ try {
   const destination = { id: "agent-destination", name: "destination", url: "http://destination", capabilities: ["native-reply-resume"] };
   const transferredRun = { runId: "run-transferred", agentName: origin.name, workSessionId: session.id };
   const routingConfig = {
+    eventStore: { getEventsForSession: () => [] },
     agentRegistry: {
       getRun: (runId: string) => runId === transferredRun.runId ? transferredRun : undefined,
       getLatestDispatchAttemptForRun: () => ({ runId: transferredRun.runId, agentId: destination.id, attemptNumber: 2, status: "accepted" }),
@@ -56,6 +57,16 @@ try {
   } as unknown as BridgeConfig;
   assert.equal(resolveReplyDispatchTarget(missingIdentityConfig, transferredRun.runId, session.id), undefined,
     "reply routing fails closed when the latest attempt has no durable destination identity");
+  const transferEvents = [
+    { type: "session.handoff", payload: { runId: transferredRun.runId, transferId: "transfer-1", toAgent: destination.name } },
+    { type: "session.handoff.state", payload: { transferId: "transfer-1", state: "destination_ready" } },
+  ];
+  const inFlightTransfer = { ...routingConfig, eventStore: { getEventsForSession: () => transferEvents } } as unknown as BridgeConfig;
+  assert.equal(resolveReplyDispatchTarget(inFlightTransfer, transferredRun.runId, session.id), undefined,
+    "clarification routing waits for the transfer's durable committed state");
+  transferEvents.push({ type: "session.handoff.state", payload: { transferId: "transfer-1", state: "committed" } });
+  assert.equal(resolveReplyDispatchTarget(inFlightTransfer, transferredRun.runId, session.id)?.id, destination.id,
+    "the committed transfer routes to the exact recorded destination identity");
 
   const question = agentMessages.post({
     workSessionId: session.id,

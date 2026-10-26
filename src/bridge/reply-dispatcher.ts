@@ -22,8 +22,25 @@ export function resolveReplyDispatchTarget(config: BridgeConfig, runId: string, 
   const run = config.agentRegistry.getRun(runId);
   if (!run || run.workSessionId !== workSessionId) return undefined;
   const attempt = config.agentRegistry.getLatestDispatchAttemptForRun(runId);
-  if (!attempt || attempt.runId !== runId || !attempt.agentId) return undefined;
-  return config.agentRegistry.listAlive().find((agent) => agent.id === attempt.agentId);
+  if (!attempt || attempt.runId !== runId || !attempt.agentId || attempt.status !== "accepted") return undefined;
+  const sessionEvents = config.eventStore.getEventsForSession(workSessionId);
+  const handoff = sessionEvents.filter((event) => event.type === "session.handoff"
+    && (event.payload as Record<string, unknown>).runId === runId).at(-1);
+  if (handoff) {
+    const payload = handoff.payload as Record<string, unknown>;
+    const transferId = payload.transferId;
+    if (typeof transferId !== "string") return undefined;
+    const currentState = sessionEvents.filter((event) => event.type === "session.handoff.state"
+      && (event.payload as Record<string, unknown>).transferId === transferId).at(-1)?.payload as Record<string, unknown> | undefined;
+    if (currentState?.state !== "committed") return undefined;
+  }
+  const agent = config.agentRegistry.listAlive().find((candidate) => candidate.id === attempt.agentId);
+  if (!agent) return undefined;
+  if (handoff) {
+    const toAgent = (handoff.payload as Record<string, unknown>).toAgent;
+    if (typeof toAgent !== "string" || agent.name !== toAgent) return undefined;
+  }
+  return agent;
 }
 
 export function createReplyDispatcher(config: BridgeConfig): ReplyDispatcher {
