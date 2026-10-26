@@ -34,6 +34,15 @@ try {
   assert.equal("segments" in durable[0].payload, false, "coalesced telemetry does not duplicate text in segments");
   assert.equal(durable[1].type, "agent.run.started");
   assert.ok(durable[1].seq > durable[0].seq);
+  assert.equal(events.getLatestEventSequenceForSession("session-1"), durable[1].seq,
+    "the indexed session watermark matches the newest durable event");
+  assert.equal(events.getLatestEventSequenceForSession("session-without-events"), 0,
+    "an empty session has a zero event watermark");
+  const watermarkPlan = database.sqlite.prepare(
+    "EXPLAIN QUERY PLAN select coalesce(max(seq), 0) from event_log where session_id = ?",
+  ).all("session-1") as Array<{ detail: string }>;
+  assert.ok(watermarkPlan.some((step) => step.detail.includes("event_log_session_seq_idx")),
+    "the latest-event watermark uses the session sequence index");
   events.appendEvent({
     type: "session.handoff",
     sessionId: "session-handoff-index",

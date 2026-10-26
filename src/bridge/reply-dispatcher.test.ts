@@ -99,6 +99,45 @@ try {
   assert.equal(foreign.length, 0, "the outbox wake is consumed once; replies remain durable independently");
   assert.equal(agentMessages.listPendingReplies(session.id).some((item) => item.id === reply.id), true, "the MCP worker can recover the unacknowledged reply after reconnect");
 
+  const staleWaitQuestion = agentMessages.post({
+    workSessionId: session.id,
+    kind: "clarification_request",
+    title: "Stale wait binding",
+    body: "Please confirm the deployment target.",
+    data: { resumeOnReply: true },
+  });
+  agentMessages.waitForReply({
+    messageId: staleWaitQuestion.id,
+    workSessionId: session.id,
+    runId: "missing-reply-run",
+    attempt: 1,
+    expectsReply: true,
+    resumeOnReply: true,
+  });
+  const staleWaitReply = agentMessages.acceptReply({
+    messageId: staleWaitQuestion.id,
+    workSessionId: session.id,
+    body: "Use staging.",
+    reviewerPrincipalId: "reviewer-a",
+  }).reply;
+  dispatchOutbox.enqueue({
+    eventType: "agent.reply.ready",
+    aggregateId: staleWaitReply.id,
+    aggregateRevision: staleWaitReply.replyRevision,
+    payload: { replyId: staleWaitReply.id, messageId: staleWaitQuestion.id, workSessionId: session.id },
+  });
+  await createReplyDispatcher({
+    ...config,
+    agentRegistry: { getRun: () => undefined },
+  } as unknown as BridgeConfig).drainOnce();
+  assert.equal(agentMessages.getReply(staleWaitReply.id)?.status, "blocked",
+    "a durable wait that references a missing run becomes visibly blocked instead of leaving a permanently pending reply");
+  const staleWaitBlocked = eventStore.getEventsForSession(session.id).filter((event) =>
+    event.type === "agent.message.reply_blocked"
+    && (event.payload as Record<string, unknown>).replyId === staleWaitReply.id).at(-1);
+  assert.match(String((staleWaitBlocked?.payload as Record<string, unknown> | undefined)?.reason), /missing worker run/,
+    "the blocked reply records an actionable stale-binding reason");
+
   let remoteDispatches = 0;
   let acceptedTask = "";
   let acceptedLeaseNonce = "";
@@ -224,7 +263,8 @@ try {
   assert.equal(awaitingAcknowledgement?.deliveryAttemptNumber, 2);
   assert.equal(awaitingAcknowledgement?.deliveryRemoteRunId, "remote-reply-attempt-2");
   const deliveryEvents = eventStore.getEventsForSession(session.id)
-    .filter((event) => event.type === "agent.message.reply_delivery_state")
+    .filter((event) => event.type === "agent.message.reply_delivery_state"
+      && (event.payload as Record<string, unknown>).replyId === nativeReply.id)
     .map((event) => event.payload as Record<string, unknown>);
   assert.deepEqual(deliveryEvents.map((event) => event.status), ["dispatching", "awaiting_acknowledgement"],
     "each committed reply-delivery state is projected to live Workspace App observers");

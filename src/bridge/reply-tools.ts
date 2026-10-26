@@ -98,7 +98,7 @@ export function registerReplyTools(server: McpServer, config: BridgeConfig): voi
       });
       // Subscribe before the durable query so a reply that arrives between the
       // two steps wakes this waiter instead of being missed until timeout.
-      const lastSeq = config.eventStore.getEventsForSession(sessionId).slice(-1)[0]?.seq ?? 0;
+      const lastSeq = config.eventStore.getLatestEventSequenceForSession(sessionId);
       const existing = config.agentMessages.listPendingReplies(sessionId).find((candidate) => candidate.messageId === messageId);
       if (existing && existing.status !== "acknowledged") {
         return {

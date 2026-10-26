@@ -71,6 +71,9 @@ export interface EventStore {
 
  getEventsForSession(sessionId: string): EventStoreEvent[];
 
+ /** Read the durable session watermark without decoding its event history. */
+ getLatestEventSequenceForSession(sessionId: string): number;
+
  /** Fetch one newest event without decoding an entire session history. */
  getLatestEventForSession(
    sessionId: string,
@@ -719,6 +722,13 @@ export function createEventStore(
     }));
   }
 
+  function getLatestEventSequenceForSession(sessionId: string): number {
+    const row = database.sqlite.prepare(
+      "select coalesce(max(seq), 0) as seq from event_log where session_id = ?",
+    ).get(sessionId) as { seq?: number } | undefined;
+    return Number(row?.seq ?? 0);
+  }
+
   function getLatestEventForSession(
     sessionId: string,
     type: string,
@@ -1216,6 +1226,7 @@ export function createEventStore(
       for (const event of events) publish(event);
     },
     getEventsForSession,
+    getLatestEventSequenceForSession,
     getLatestEventForSession,
     getEventById,
     getEventsAfter,

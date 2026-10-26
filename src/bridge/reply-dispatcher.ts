@@ -121,10 +121,27 @@ export function createReplyDispatcher(config: BridgeConfig): ReplyDispatcher {
     }
     const wait = agentMessages.getActiveWaitForMessage(reply.messageId);
     const run = wait?.runId ? config.agentRegistry.getRun(wait.runId) : undefined;
-    if (!wait || wait.workSessionId !== reply.workSessionId || !run || run.workSessionId !== reply.workSessionId) {
+    if (!wait) {
       config.dispatchOutbox?.markCompleted(claimOf(event));
       return "completed";
     }
+    const blockStaleWait = (reason: string): "completed" => {
+      setReplyDelivery({
+        replyId: reply.id,
+        expectedStatus: reply.status as "pending_delivery" | "delivering",
+        nextStatus: "blocked",
+      });
+      config.eventStore.appendEvent({
+        type: "agent.message.reply_blocked",
+        sessionId: reply.workSessionId,
+        payload: { replyId: reply.id, reason },
+      });
+      config.dispatchOutbox?.markCompleted(claimOf(event));
+      return "completed";
+    };
+    if (wait.workSessionId !== reply.workSessionId) return blockStaleWait("active reply wait belongs to another work session");
+    if (!wait.runId || !run) return blockStaleWait("active reply wait references a missing worker run");
+    if (run.workSessionId !== reply.workSessionId) return blockStaleWait("active reply wait references a worker run from another work session");
     const agentForRun = resolveReplyDispatchTarget(config, run.runId, reply.workSessionId);
     const supportsNativeReply = agentForRun?.capabilities.includes("native-reply-resume") === true;
     if (wait?.resumeOnReply === true && supportsNativeReply) {
