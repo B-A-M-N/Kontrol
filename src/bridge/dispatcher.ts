@@ -103,6 +103,15 @@ export async function runContinuationTick(
   const latestHandoff = (sessionId: string) => config.eventStore.getEventsForSession(sessionId)
     .filter((event) => event.type === "session.handoff")
     .at(-1);
+  const handoffState = (sessionId: string, transferId: unknown): string | undefined => {
+    if (typeof transferId !== "string") return undefined;
+    const event = config.eventStore.getEventsForSession(sessionId)
+      .filter((candidate) => candidate.type === "session.handoff.state")
+      .reverse()
+      .find((candidate) => (candidate.payload as { transferId?: unknown }).transferId === transferId);
+    const state = (event?.payload as { state?: unknown } | undefined)?.state;
+    return typeof state === "string" ? state : undefined;
+  };
   const handoffForRun = (sessionId: string, runId: string) => config.eventStore.getEventsForSession(sessionId)
     .filter((event) => event.type === "session.handoff")
     .reverse()
@@ -236,7 +245,11 @@ export async function runContinuationTick(
       const handoff = latestHandoff(cont.sessionId);
       const handoffPayload = handoff?.payload as Record<string, unknown> | undefined;
       if (liveWaiters.has(cont.sessionId)) {
-        if (handoff && handoffPayload?.toAgent) {
+        // A committed handoff means the live waiter belongs to the current
+        // destination worker. Later review feedback should wake that worker
+        // normally; recording quiescing_source here would regress the durable
+        // handoff and make its next wait look like an uncommitted transfer.
+        if (handoff && handoffPayload?.toAgent && handoffState(cont.sessionId, handoffPayload.transferId) !== "committed") {
           recordHandoffState(cont.sessionId, handoff, "quiescing_source", "Waiting for the source worker's handoff signal and waiter shutdown.");
           return "deferred";
         }

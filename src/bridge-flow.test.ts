@@ -554,6 +554,42 @@ try {
     assert.ok(lateFb.isError, "late feedback on approved session is rejected");
   }
 
+  // ── Scenario 1.1: committed transfer stays committed during later live feedback ──
+  {
+    const sessionId = createSession();
+    await callWorker("submit_for_review", { sessionId });
+    const transferId = `committed-transfer-${sessionId}`;
+    eventStore.appendEvent({
+      type: "session.handoff",
+      sessionId,
+      payload: { transferId, runId: `run-${sessionId}`, fromAgent: "source", toAgent: "destination" },
+    });
+    eventStore.appendEvent({
+      type: "session.handoff.state",
+      sessionId,
+      payload: { transferId, state: "committed" },
+    });
+
+    const waiter = callWorker("await_review_feedback", { sessionId, timeoutMs: 5_000 });
+    const waiterDeadline = Date.now() + 1_000;
+    while (!liveWaiters.has(sessionId) && Date.now() < waiterDeadline) await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.ok(liveWaiters.has(sessionId), "destination worker is parked for its next review round");
+    await callReviewer("provide_review_feedback", {
+      sessionId,
+      verdict: "changes_requested",
+      comments: "Continue in the already transferred worker session.",
+    });
+    await runContinuationTick(config);
+    const handoffStates = eventStore.getEventsForSession(sessionId)
+      .filter((event) => event.type === "session.handoff.state" && (event.payload as Record<string, unknown>).transferId === transferId)
+      .map((event) => (event.payload as Record<string, unknown>).state);
+    assert.deepEqual(handoffStates, ["committed"],
+      "a later live continuation must not regress a completed transfer to quiescing_source");
+    const feedback = await waiter;
+    assert.equal(feedback.structuredContent.status, "feedback_ready");
+    assert.equal(feedback.structuredContent.feedback.verdict, "changes_requested");
+  }
+
   // ── Scenario 1a: explicit handoff preserves origin and binds a fresh destination context ──
   {
     const sessionId = createSession();
