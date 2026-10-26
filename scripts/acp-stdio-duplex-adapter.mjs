@@ -44,6 +44,8 @@ const AGENT_NAME = process.env.ACP_STDIO_AGENT_NAME || "stdio-duplex-agent";
 const AGENT_DESCRIPTION = process.env.ACP_STDIO_AGENT_DESCRIPTION || "Generic stdio ACP duplex adapter";
 const AGENT_COMMAND = process.env.ACP_STDIO_COMMAND;
 const AGENT_ARGS = parseJsonArray(process.env.ACP_STDIO_ARGS_JSON) ?? [];
+const RESUME_IDLE_TIMEOUT_MS = Math.max(1_000, Math.min(300_000,
+  Number(process.env.KONTROL_ACP_RESUME_IDLE_TIMEOUT_MS) || 60_000));
 const DISPATCH_METHOD = process.env.ACP_STDIO_DISPATCH_METHOD;
 const DISPATCH_RECEIPTS_PATH = process.env.KONTROL_STDIO_DISPATCH_RECEIPTS || adapterStatePath("stdio-duplex", "dispatch-receipts.json");
 const OWNED_PROCESSES_PATH = process.env.KONTROL_STDIO_OWNED_PROCESSES || adapterStatePath("stdio-duplex", "owned-processes.json");
@@ -640,6 +642,7 @@ async function dispatchTurn(run) {
       run.acpSessionId = existing.sessionId;
       if (protocolVersion === 2) {
         await run.conn.request("session/resume", { sessionId: existing.sessionId, cwd, mcpServers: [], replayFrom: { type: "start" } });
+        await waitForResumedSessionIdle(run);
       } else {
         await run.conn.request("session/load", { sessionId: existing.sessionId, cwd, mcpServers: [] });
       }
@@ -718,6 +721,33 @@ async function dispatchTurn(run) {
   run.authoritativeCompletion = true;
 }
 
+async function waitForResumedSessionIdle(run) {
+  const state = run.v2ForegroundState;
+  if (state === "idle") return;
+  if (state !== "running" && state !== "requires_action") {
+    throw new Error(`continuation_session_state_unknown: ACP v2 resume reported ${String(state ?? "no state")}; refusing to send a prompt.`);
+  }
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      if (run.v2ResumeIdleWaiter?.timer === timer) run.v2ResumeIdleWaiter = undefined;
+      reject(new Error("continuation_session_busy: ACP v2 provider session did not become idle before the resume deadline."));
+    }, RESUME_IDLE_TIMEOUT_MS);
+    run.v2ResumeIdleWaiter = {
+      timer,
+      resolve: (update) => {
+        clearTimeout(timer);
+        run.v2ResumeIdleWaiter = undefined;
+        resolve(update);
+      },
+      reject: (error) => {
+        clearTimeout(timer);
+        run.v2ResumeIdleWaiter = undefined;
+        reject(error);
+      },
+    };
+  });
+}
+
 function normalizeAcpPromptOutput(result) {
   if (typeof result === "string") return result;
   const content = Array.isArray(result?.content) ? result.content
@@ -760,6 +790,16 @@ function createKontrolHttpHandler(run) {
     sessionUpdate(params) {
       reportStructured(run, "output_delta", { channel: "session/update", text: JSON.stringify(params), raw: params });
       const update = params?.update;
+      if (run.acpProtocolVersion === 2 && params?.sessionId === run.acpSessionId
+        && update?.sessionUpdate === "state_update") {
+        run.v2ForegroundState = update.state;
+        if (run.v2ResumeIdleWaiter) {
+          if (update.state === "idle") run.v2ResumeIdleWaiter.resolve(update);
+          else if (update.state !== "running" && update.state !== "requires_action") {
+            run.v2ResumeIdleWaiter.reject(new Error(`continuation_session_state_unknown: ACP v2 state changed to ${String(update.state)}; refusing to send a prompt.`));
+          }
+        }
+      }
       if (run.acpProtocolVersion === 2 && typeof update?.messageId === "string") {
         if (!run.v2AgentMessages) run.v2AgentMessages = new Map();
         if (update.sessionUpdate === "agent_message") {
@@ -778,6 +818,7 @@ function createKontrolHttpHandler(run) {
       }
     },
     connectionClosed() {
+      run.v2ResumeIdleWaiter?.reject(new Error("continuation_session_disconnected: ACP v2 provider disconnected before the resumed session became idle."));
       if (!run.v2TurnWaiter) return;
       const waiter = run.v2TurnWaiter;
       run.v2TurnWaiter = undefined;

@@ -62,7 +62,9 @@ try {
   readOnlySandboxAvailable = true;
 } catch { /* the integration below asserts fail-closed when user namespaces are unavailable */ }
 const childCode = `const fs=require("node:fs");try{fs.appendFileSync(${JSON.stringify(launchCountPath)},"1")}catch{};let b="",v2Mode=false;process.stdin.setEncoding("utf8");process.stdin.on("data",c=>{b+=c;for(const line of b.split(/\\r?\\n/).slice(0,-1)){const m=JSON.parse(line);try{fs.appendFileSync(${JSON.stringify(sessionLogPath)},JSON.stringify({method:m.method,sessionId:m.params?.sessionId??(m.method==="session/new"?(v2Mode?"agent-session-v2":"agent-session-1"):undefined),...(m.method==="session/prompt"?{prompt:m.params.prompt?.[0]?.text}:{})})+"\\n")}catch{};const v2=m.params?.protocolVersion===2&&process.argv[1]!=="force-v1";if(m.method==="initialize"){v2Mode=v2;const result=v2?{protocolVersion:2,info:{name:"fake",version:"1"},capabilities:{session:{}}}:{protocolVersion:1,agentCapabilities:{loadSession:true}};process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:m.id,result})+"\\n")}else if(m.method==="session/new"){process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:m.id,result:{sessionId:v2Mode?"agent-session-v2":"agent-session-1"}})+"\\n")}else if(m.method==="session/load"||m.method==="session/resume"){if(m.method==="session/resume")process.stdout.write(JSON.stringify({jsonrpc:"2.0",method:"session/update",params:{sessionId:m.params.sessionId,update:{sessionUpdate:"state_update",state:"idle"}}})+"\\n");process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:m.id,result:{sessionId:m.params.sessionId}})+"\\n")}else if(m.method==="session/prompt"){let workspaceWriteBlocked=false;if(process.env.READ_ONLY_TEST==="1"){try{fs.writeFileSync("/workspace/readonly-test-write.txt","should fail")}catch{workspaceWriteBlocked=true}};const report="Audit report: café 🌲\\nFindings persisted."+(workspaceWriteBlocked?"\\nworkspaceWriteBlocked=true":"");if(v2Mode){process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:m.id,result:{messageId:"user-message-1"}})+"\\n");setTimeout(()=>{process.stdout.write(JSON.stringify({jsonrpc:"2.0",method:"session/update",params:{sessionId:m.params.sessionId,update:{sessionUpdate:"agent_message",messageId:"agent-message-1",content:[{type:"text",text:report}]}}})+"\\n");process.stdout.write(JSON.stringify({jsonrpc:"2.0",method:"session/update",params:{sessionId:m.params.sessionId,update:{sessionUpdate:"state_update",state:"idle",stopReason:m.params.prompt?.[0]?.text==="v2-max"?"max_tokens":"end_turn"}}})+"\\n");setTimeout(()=>process.exit(0),20)},20)}else{process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:m.id,result:{sessionId:m.params.sessionId,...(m.params.prompt?.[0]?.text==="omit-stop-reason"?{}:{stopReason:({cancelled:"cancelled",refusal:"refusal",max_tokens:"max_tokens",max_turns:"max_turns"}[m.params?.prompt?.[0]?.text]??"end_turn")}),content:[{type:"text",text:report}],workspaceWriteBlocked}})+"\\n");setTimeout(()=>process.exit(0),20)}}}b=b.split(/\\r?\\n/).at(-1)||""})`;
-const spawnAdapter = (enableV2 = false, forceV1 = false) => {
+const v2BusyLogPath = join(state, "v2-busy-prompt.json");
+const v2BusyChildCode = `let b="",foreground=false;const fs=require("node:fs");process.stdin.setEncoding("utf8");process.stdin.on("data",c=>{b+=c;for(const line of b.split(/\\r?\\n/).slice(0,-1)){const m=JSON.parse(line);const send=(x)=>process.stdout.write(JSON.stringify(x)+"\\n");if(m.method==="initialize")send({jsonrpc:"2.0",id:m.id,result:{protocolVersion:2,info:{name:"busy-fake",version:"1"},capabilities:{session:{}}}});else if(m.method==="session/resume"){foreground=true;send({jsonrpc:"2.0",method:"session/update",params:{sessionId:m.params.sessionId,update:{sessionUpdate:"state_update",state:"running"}}});send({jsonrpc:"2.0",id:m.id,result:{sessionId:m.params.sessionId}});setTimeout(()=>{foreground=false;send({jsonrpc:"2.0",method:"session/update",params:{sessionId:m.params.sessionId,update:{sessionUpdate:"state_update",state:"idle",stopReason:"end_turn"}}})},150)}else if(m.method==="session/prompt"){fs.writeFileSync(${JSON.stringify(v2BusyLogPath)},JSON.stringify({promptBeforeIdle:foreground}));send({jsonrpc:"2.0",id:m.id,result:{messageId:"busy-user-message"}});setTimeout(()=>send({jsonrpc:"2.0",method:"session/update",params:{sessionId:m.params.sessionId,update:{sessionUpdate:"agent_message",messageId:"busy-agent-message",content:[{type:"text",text:"busy session resumed safely"}]}}}),220);setTimeout(()=>{send({jsonrpc:"2.0",method:"session/update",params:{sessionId:m.params.sessionId,update:{sessionUpdate:"state_update",state:"idle",stopReason:"end_turn"}}});setTimeout(()=>process.exit(0),20)},280)}}b=b.split(/\\r?\\n/).at(-1)||""})`;
+const spawnAdapter = (enableV2 = false, forceV1 = false, agentCode = childCode) => {
   const child = spawn(process.execPath, ["scripts/acp-stdio-duplex-adapter.mjs"], {
   cwd: process.cwd(),
   env: {
@@ -82,7 +84,7 @@ const spawnAdapter = (enableV2 = false, forceV1 = false) => {
     READ_ONLY_TEST: "1",
     ACP_STDIO_AGENT_NAME: "stdio-test-agent",
     ACP_STDIO_COMMAND: process.execPath,
-    ACP_STDIO_ARGS_JSON: JSON.stringify(["-e", childCode, ...(forceV1 ? ["force-v1"] : [])]),
+    ACP_STDIO_ARGS_JSON: JSON.stringify(["-e", agentCode, ...(forceV1 ? ["force-v1"] : [])]),
     ACP_STDIO_DISPATCH_METHOD: "",
     ACP_STDIO_ENABLE_V2: enableV2 ? "1" : "0",
     ACP_STDIO_ADAPTER_PORT: String(adapterPort),
@@ -460,6 +462,43 @@ try {
   const v2SessionMethods = (await readFile(sessionLogPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
   assert.ok(v2SessionMethods.some((entry) => entry.method === "session/resume" && entry.sessionId === "agent-session-v2"),
     "ACP v2 uses session/resume rather than the removed session/load method");
+  adapter.kill("SIGTERM");
+  await new Promise((resolve) => adapter.once("exit", resolve));
+  adapter = spawnAdapter(true, false, v2BusyChildCode);
+  const busyReadyDeadline = Date.now() + 5_000;
+  let busyReady = false;
+  while (Date.now() < busyReadyDeadline) {
+    try {
+      const health = await fetch(`http://127.0.0.1:${adapterPort}/health`);
+      if (health.ok) { busyReady = true; break; }
+    } catch { /* busy-session adapter is still starting */ }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.ok(busyReady, "ACP v2 adapter restarts with the persisted provider session binding");
+  const busyContinuationKey = "stdio-v2-busy-continuation";
+  const busyContinuationResponse = await fetch(`http://127.0.0.1:${adapterPort}/runs`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: "Bearer adapter-secret" },
+    body: JSON.stringify({
+      ...v2Body,
+      parent_run_id: "stdio-v2-busy-continuation-run",
+      attempt_number: 3,
+      dispatch_idempotency_key: busyContinuationKey,
+      continuation_id: "stdio-v2-busy-continuation-id",
+      input: [{ parts: [{ content: "wait until the resumed provider session is idle" }] }],
+    }),
+  });
+  assert.equal(busyContinuationResponse.status, 202, "busy resumed-session handling is part of the accepted dispatch lifecycle");
+  const busyContinuationDeadline = Date.now() + 5_000;
+  while (Date.now() < busyContinuationDeadline && !events.some((event) => event.dispatch_idempotency_key === busyContinuationKey && event.type === "completed")) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  const busyContinuation = events.find((event) => event.dispatch_idempotency_key === busyContinuationKey && event.type === "completed");
+  assert.ok(busyContinuation, "resumed ACP v2 session completes after its idle transition");
+  assert.equal(busyContinuation.payload.final_output, "busy session resumed safely",
+    "the pre-prompt idle snapshot cannot falsely complete the continuation");
+  assert.deepEqual(JSON.parse(await readFile(v2BusyLogPath, "utf8")), { promptBeforeIdle: false },
+    "Kontrol waits for the current foreground turn to become idle before sending another prompt");
   adapter.kill("SIGTERM");
   await new Promise((resolve) => adapter.once("exit", resolve));
   adapter = spawnAdapter(true, true);
