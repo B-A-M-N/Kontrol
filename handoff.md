@@ -3,8 +3,8 @@
 Updated: 2026-10-26 (sixth revision)
 Repository: `/home/bamn/devspace`
 Branch: `audit-k02-k04`
-Starting HEAD for this revision: `44c247a` (plus the local commits made
-in this pass).
+Starting HEAD for this revision: `44c247a`. The change is the range
+`44c247a..HEAD` - the local commits listed below.
 Commits are local only. Do not push without separate authorization.
 Preserve untracked `.tmp-scratch/`.
 
@@ -24,7 +24,8 @@ to restate a number that its own commit changes.
 | 5 | `e5a07c8` | `docs: record the contracts, the origin decision and the continuation record` |
 | 6 | `1e983ed` | `docs: correct the round-7 review row and record the round-13 residuals` |
 | 7 | `f6dcfa1` | `docs: map the changed-files table one-to-one onto the change` |
-| 8 | this commit | `docs: state the round-9 tally and cite the final full-chain run` |
+| 8 | `3859026` | `docs: state the round-9 tally and cite the final full-chain run` |
+| 9 | this commit | `docs: name the reviewed range and distinguish the two handoff records` |
 
 Requirement source:
 `/home/bamn/.codex/attachments/458e9b15-a1ec-4247-aa20-19ec878f9be9/pasted-text-1.txt`
@@ -875,7 +876,7 @@ they are the same 34 files that `git diff --name-only 44c247a..HEAD` names.
 | `AGENTS.md` | the catalog-notification, sandbox and ingress-attribution contracts, updated to match the code, and the canonical-chain rule stated as an executable position, including that a shell comment is not a command, that an unclassified interpreter flag fails the check, and that the package-manifest check is a scanner rather than a pattern |
 | `docs/ingress.md` | the public origin mode decision and the exposure-attribution rule |
 | `handoff.md` | this record |
-| `HANDOFF.md` | this record |
+| `HANDOFF.md` | the earlier scheduled-job audit record, updated with the deployment status this pass verified |
 
 ### Suites this change newly executes
 
