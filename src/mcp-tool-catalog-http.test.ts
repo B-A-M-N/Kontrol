@@ -367,6 +367,42 @@ try {
   }, releaseBSessionId);
   assert.ok([200, 202].includes(releaseBAcknowledgement.status));
 
+  // Reads a standalone SSE stream until the predicate matches or the deadline
+  // passes. A read that is still in flight when the deadline passes is
+  // abandoned, not lost: its eventual rejection (the stream is cancelled
+  // afterwards) is consumed so it never surfaces as an unhandled rejection.
+  const readStreamUntil = async (
+    reader: ReadableStreamDefaultReader<Uint8Array>,
+    predicate: (bytes: string) => boolean,
+    timeoutMs: number,
+  ): Promise<string> => {
+    let bytes = "";
+    let pending: Promise<ReadableStreamReadResult<Uint8Array>> | undefined;
+    const deadline = Date.now() + timeoutMs;
+    while (!predicate(bytes) && Date.now() < deadline) {
+      pending ??= reader.read();
+      const remaining = Math.max(1, deadline - Date.now());
+      const result = await Promise.race([
+        pending,
+        new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), remaining)),
+      ]);
+      if (result === "timeout") break;
+      pending = undefined;
+      if (result.done) break;
+      bytes += new TextDecoder().decode(result.value);
+    }
+    if (pending) pending.catch(() => {});
+    return bytes;
+  };
+  const releaseBHash = createHash("sha256").update(releaseBSessionId).digest("hex");
+  const readReleaseBSession = async (): Promise<any> => {
+    const diagnostics = await fetch(new URL("/diagnostics", url), {
+      headers: { "x-kontrol-diagnostics": diagnosticsSecret },
+    }).then((response) => response.json()) as any;
+    return diagnostics.mcpSessionMetrics.sessions
+      .find((item: any) => item.sessionIdSha256 === releaseBHash);
+  };
+
   const refreshController = new AbortController();
   const refreshStream = await fetch(url, {
     method: "GET",
@@ -380,23 +416,89 @@ try {
   assert.equal(refreshStream.status, 200, "the connected host can use the normal GET stream refresh path");
   const refreshReader = refreshStream.body?.getReader();
   assert.ok(refreshReader);
-  let refreshBytes = "";
   try {
-    const deadline = Date.now() + 5_000;
-    while (!refreshBytes.includes("notifications/tools/list_changed") && Date.now() < deadline) {
-      const chunk: ReadableStreamReadResult<Uint8Array> = await Promise.race([
-        refreshReader.read(),
-        new Promise<never>((_, reject) => setTimeout(() => reject(new Error("timed out waiting for release B catalog refresh")), 5_000)),
-      ]);
-      assert.equal(chunk.done, false, "the refresh stream remains open while carrying notifications");
-      refreshBytes += new TextDecoder().decode(chunk.value);
-    }
+    const refreshBytes = await readStreamUntil(
+      refreshReader,
+      (bytes) => bytes.includes("notifications/tools/list_changed"),
+      5_000,
+    );
     assert.match(refreshBytes, /notifications\/tools\/list_changed/,
       "release B sends the supported tools/list_changed refresh pulse over the existing GET stream");
+
+    // A delivered channel is not resent while its standalone stream stays
+    // attached: neither the retry opportunity of a later tools/list response
+    // nor the periodic SSE heartbeat may duplicate the notification.
+    const retryOpportunity = await rpc("tools/list", {}, releaseBSessionId);
+    assert.ok(retryOpportunity.payload?.result?.tools, "the retry opportunity still answers tools/list");
+    const afterRetryBytes = await readStreamUntil(
+      refreshReader,
+      (bytes) => bytes.includes("notifications/tools/list_changed"),
+      2_500,
+    );
+    assert.doesNotMatch(afterRetryBytes, /notifications\/tools\/list_changed/,
+      "a delivered channel is never resent for the same session refresh state on the same standalone stream");
+
+    const inStreamSession = await readReleaseBSession();
+    assert.equal(inStreamSession?.catalogRefresh?.toolListRefreshAttempts, 1,
+      "a pulse deferred for lack of a standalone stream consumes no send attempt");
+    assert.equal(inStreamSession?.catalogRefresh?.toolListRefreshSuccesses, 1,
+      "the delivered channel succeeds exactly once while its standalone stream stays attached");
+    assert.equal(inStreamSession?.catalogRefresh?.toolListRefreshFailures, 0,
+      "a delivered channel records no send failure");
+    assert.ok((inStreamSession?.catalogRefresh?.deferredNoStreamAttempts ?? 0) >= 1,
+      "a pulse attempted before any GET stream existed is recorded as deferred, never as a delivered success");
   } finally {
     refreshController.abort();
     await refreshStream.body?.cancel().catch(() => {});
     refreshReader.releaseLock();
+  }
+
+  // The standalone stream ended. Its delivery state is re-armed, so a success
+  // recorded against a stream that has since disappeared can never suppress
+  // the notification on the next standalone stream.
+  let rearmedSession: any;
+  const rearmDeadline = Date.now() + 5_000;
+  do {
+    rearmedSession = await readReleaseBSession();
+    if (rearmedSession?.catalogRefresh?.toolListRefreshSent === false) break;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  } while (Date.now() < rearmDeadline);
+  assert.equal(rearmedSession?.catalogRefresh?.toolListRefreshSent, false,
+    "a finished standalone stream re-arms the delivery so its success cannot suppress the next stream");
+
+  const secondController = new AbortController();
+  let secondStream: Response | undefined;
+  for (let attempt = 0; attempt < 20 && !secondStream; attempt++) {
+    const candidate = await fetch(url, {
+      method: "GET",
+      headers: {
+        accept: "text/event-stream",
+        "mcp-session-id": releaseBSessionId,
+        "x-kontrol-tunnel-reviewer": tunnelReviewerSecret,
+      },
+      signal: secondController.signal,
+    });
+    if (candidate.status === 200) secondStream = candidate;
+    else {
+      await candidate.body?.cancel().catch(() => {});
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+  assert.ok(secondStream, "the host can attach a new standalone stream after the previous one ended");
+  const secondReader = secondStream.body?.getReader();
+  assert.ok(secondReader);
+  try {
+    const secondBytes = await readStreamUntil(
+      secondReader,
+      (bytes) => bytes.includes("notifications/tools/list_changed"),
+      5_000,
+    );
+    assert.match(secondBytes, /notifications\/tools\/list_changed/,
+      "a re-armed standalone stream re-delivers the catalog refresh notification");
+  } finally {
+    secondController.abort();
+    await secondStream.body?.cancel().catch(() => {});
+    secondReader.releaseLock();
   }
   const releaseBHandshake = await rpc("tools/call", {
     name: "open_workspace",
@@ -404,7 +506,6 @@ try {
   }, releaseBSessionId);
   assert.notEqual(releaseBHandshake.payload?.result?.isError, true,
     "fresh release B registration and acknowledgement restore ordinary calls");
-  const releaseBHash = createHash("sha256").update(releaseBSessionId).digest("hex");
   const releaseBDiagnostics = await fetch(new URL("/diagnostics", url), {
     headers: { "x-kontrol-diagnostics": diagnosticsSecret },
   }).then((response) => response.json()) as any;

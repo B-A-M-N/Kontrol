@@ -304,6 +304,8 @@ export async function handleDiagnostics(deps: DiagnosticsDeps, req: Request, res
           activeLongPollCount: state.activeLongPollCount,
           activeSseStreams: state.activeSseStreams,
           transportAttached: state.transportAttached,
+          standaloneSseEstablished: state.standaloneSseEstablished === true,
+          deliveryGeneration: state.deliveryGeneration ?? 0,
           activePolicyWaiters: state.activePolicyWaiters,
           inFlightRequests: state.inFlightRequests,
           durableWorkerSession: state.durableWorkerSession,

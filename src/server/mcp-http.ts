@@ -158,6 +158,8 @@ function catalogRefreshStats(state: McpSessionState) {
   return state.catalogRefresh ??= {
     initializedPulseAttempted: false,
     getStreamPulseAttempted: false,
+    deferredNoStreamAttempts: 0,
+    staleDeliveries: 0,
     toolListRefreshSent: false,
     resourceListRefreshSent: false,
     toolListRefreshAttempts: 0,
@@ -171,10 +173,54 @@ function catalogRefreshStats(state: McpSessionState) {
   };
 }
 
+/**
+ * Delivery state belongs to the standalone stream that carries it. When that
+ * stream ends the channels are re-armed: the next standalone stream has to be
+ * able to deliver, because a success recorded against a stream that has since
+ * disappeared may never have reached the host.
+ */
+function rearmCatalogRefreshDelivery(state: McpSessionState): void {
+  const refresh = state.catalogRefresh;
+  if (!refresh) return;
+  refresh.toolListRefreshSent = false;
+  refresh.resourceListRefreshSent = false;
+  refresh.toolListRefreshAttempts = 0;
+  refresh.resourceListRefreshAttempts = 0;
+  refresh.toolListRefreshLastAttemptMs = undefined;
+  refresh.resourceListRefreshLastAttemptMs = undefined;
+}
+
+/**
+ * The standalone GET SSE stream is gone. The transport can no longer carry a
+ * server-initiated notification on it, and nothing recorded against it may
+ * suppress the delivery on the next standalone stream.
+ *
+ * The clear is fenced to the surface that owned it: a request that ends after
+ * a successor stream already established a new surface must not re-arm that
+ * successor. The owner passes the generation it established, and the clear
+ * only applies while the session still carries that surface.
+ */
+function clearStandaloneSseDelivery(state: McpSessionState, ownedGeneration?: number): void {
+  if (ownedGeneration !== undefined && (state.deliveryGeneration ?? 0) !== ownedGeneration) {
+    // A successor surface already replaced this one. The successor owns the
+    // delivery state; this late clear must not touch it.
+    return;
+  }
+  if (state.standaloneSseEstablished === true) {
+    // The surface identity changes, so a send that resolves against the surface
+    // that just ended is discarded instead of marking the channel sent. A
+    // second clear of the same surface changes nothing.
+    state.deliveryGeneration = (state.deliveryGeneration ?? 0) + 1;
+  }
+  state.standaloneSseEstablished = false;
+  rearmCatalogRefreshDelivery(state);
+}
+
 async function sendCatalogRefreshPulse(
   deps: McpHttpDeps,
   sessionId: string,
   phase: CatalogRefreshPhase,
+  retryDepth = 0,
 ): Promise<void> {
   const state = deps.mcpSessions.get(sessionId);
   const server = deps.mcpServers.get(sessionId);
@@ -187,11 +233,35 @@ async function sendCatalogRefreshPulse(
   }
   refresh.lastAttemptAt = new Date().toISOString();
 
+  // A server-initiated notification is only observable on a live standalone
+  // GET SSE channel. Without one the transport drops the message but still
+  // resolves the send, so recording that as a success would permanently
+  // suppress the pulse on the very channel that can carry it. Defer instead:
+  // the channel stays eligible and the GET-stream phase delivers the pulse.
+  if (state.standaloneSseEstablished !== true) {
+    refresh.deferredNoStreamAttempts += 1;
+    logEvent(deps.config.logging, "debug", "mcp_catalog_refresh_deferred", {
+      sessionIdPrefix: sessionIdPrefix(sessionId),
+      phase,
+      activeSseStreams: state.activeSseStreams,
+    });
+    return;
+  }
+
+  // The delivery surface that carries this pulse. When it ends while the send
+  // is in flight, the resolved send is discarded instead of marking the
+  // channel sent: a success recorded against a surface that has gone away may
+  // never have reached the host.
+  const deliveryGeneration = state.deliveryGeneration ?? 0;
+  const isDeliveryStillValid = (): boolean =>
+    (state.deliveryGeneration ?? 0) === deliveryGeneration
+    && state.standaloneSseEstablished === true;
+
   const sendOne = async (
     method: "tools" | "resources",
     send: () => Promise<void>,
-  ): Promise<void> => {
-    await sendCatalogRefreshNotification(refresh, method, send, (error) => {
+  ): Promise<"stale" | "delivered"> => {
+    const outcome = await sendCatalogRefreshNotification(refresh, method, send, (error) => {
       logEvent(deps.config.logging, "warn", "mcp_catalog_refresh_failed", {
         sessionIdPrefix: sessionIdPrefix(sessionId),
         phase,
@@ -199,13 +269,29 @@ async function sendCatalogRefreshPulse(
         surfaceVersion: state.toolSurfaceVersion,
         error: error instanceof Error ? error.message : String(error),
       });
+    }, Date.now(), { isDeliveryStillValid });
+    if (outcome !== "stale") return "delivered";
+    refresh.staleDeliveries += 1;
+    logEvent(deps.config.logging, "warn", "mcp_catalog_refresh_stale", {
+      sessionIdPrefix: sessionIdPrefix(sessionId),
+      phase,
+      method,
+      deliveryGeneration,
     });
+    return "stale";
   };
 
-  await Promise.all([
+  const outcomes = await Promise.all([
     sendOne("tools", () => server.server.sendToolListChanged()),
     sendOne("resources", () => server.server.sendResourceListChanged()),
   ]);
+
+  if (outcomes.includes("stale") && retryDepth === 0 && state.standaloneSseEstablished === true) {
+    // A successor surface is live and the host is still owed the notification.
+    // Pay it there instead of waiting for the next pulse opportunity. One
+    // follow-up per pulse invocation, and the retry is bounded to one round.
+    void sendCatalogRefreshPulse(deps, sessionId, phase, retryDepth + 1);
+  }
 }
 
 export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res: Response): Promise<unknown> {
@@ -330,6 +416,14 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
     let transport: Transport | undefined;
     let sessionState: McpSessionState | undefined;
     let stopSseHeartbeat: (() => void) | undefined;
+    // True only for the request that established the standalone delivery
+    // surface. A rejected or duplicate GET must not tear down the surface that
+    // another live stream still carries.
+    let standaloneStreamEstablished = false;
+    // The delivery generation this request established. A late teardown of
+    // this request must not re-arm a successor surface that already replaced
+    // it.
+    let standaloneStreamGeneration: number | undefined;
     const requestAbort = new AbortController();
     const instrumentedResponse = res as unknown as {
       write: (...args: unknown[]) => unknown;
@@ -385,7 +479,22 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
           },
         });
       }
-      if (req.method === "GET" && sessionId) void sendCatalogRefreshPulse(deps, sessionId, "get_stream");
+      if (req.method === "GET" && sessionId) {
+        // The transport registers the standalone GET stream before it writes
+        // these SSE headers, so a notification sent from here is deliverable
+        // on this channel.
+        const streamState = deps.mcpSessions.get(sessionId);
+        if (streamState && streamState.standaloneSseEstablished !== true) {
+          // A new delivery surface. Its identity changes, so a send that
+          // resolves against a previous surface can never mark the channel
+          // sent for this one.
+          streamState.standaloneSseEstablished = true;
+          streamState.deliveryGeneration = (streamState.deliveryGeneration ?? 0) + 1;
+          standaloneStreamEstablished = true;
+          standaloneStreamGeneration = streamState.deliveryGeneration;
+        }
+        void sendCatalogRefreshPulse(deps, sessionId, "get_stream");
+      }
     };
     const restoreResponseWriters = () => {
       if (responseWritersRestored) return;
@@ -565,6 +674,14 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
     // waiters) and they all no-op on a duplicated abort.
     req.once("aborted", abortIfDisconnected);
     const onResponseClose = () => {
+      if (standaloneStreamEstablished && sessionId) {
+        // The standalone GET stream that carried the delivery surface ended.
+        // This handler is registered before the transport registers its own
+        // stream cancellation, so the surface is cleared before the transport
+        // drops the stream.
+        const state = mcpSessions.get(sessionId);
+        if (state) clearStandaloneSseDelivery(state, standaloneStreamGeneration);
+      }
       // Cancel downstream work for this HTTP request, but preserve the MCP
       // session and any other concurrent requests sharing its transport. The
       // SDK owns individual SSE stream cancellation and session close() is
@@ -598,6 +715,10 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
     };
     const onResponseFinish = () => {
       responseCloseClassification ??= "response_finished";
+      if (standaloneStreamEstablished && sessionId) {
+        const state = mcpSessions.get(sessionId);
+        if (state) clearStandaloneSseDelivery(state, standaloneStreamGeneration);
+      }
       const finishedAt = performance.now();
       recordPhaseTiming("mcp.response", finishedAt - requestStartedAt);
       if (handlerStartedAt > 0) recordPhaseTiming("mcp.serialization", finishedAt - handlerStartedAt);
@@ -1594,6 +1715,9 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
           if (sessionRequestClass === "stream" && state.activeSseStreams > 0) {
             state.activeSseStreams--;
             state.transportAttached = state.activeSseStreams > 0;
+            if (state.activeSseStreams === 0 && standaloneStreamEstablished) {
+              clearStandaloneSseDelivery(state, standaloneStreamGeneration);
+            }
           }
           else if (sessionRequestClass === "waiter" && state.activeLongPollCount > 0) state.activeLongPollCount--;
           else if (sessionRequestClass === "execution" && sessionExecutionCounted && state.inFlightRequests > 0) state.inFlightRequests--;

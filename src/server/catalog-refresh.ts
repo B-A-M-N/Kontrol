@@ -15,6 +15,16 @@ export interface CatalogRefreshChannelState {
   resourceListRefreshInFlight: boolean;
 }
 
+export interface CatalogRefreshSendOptions {
+  /**
+   * Reports whether the delivery surface that carries this send is still the
+   * one the send started on. A send that completes after its surface ended may
+   * never have reached the host, so its success is discarded instead of
+   * marking the channel sent.
+   */
+  isDeliveryStillValid?: () => boolean;
+}
+
 const MAX_ATTEMPTS = 3;
 const INITIAL_RETRY_BACKOFF_MS = 100;
 const MAX_RETRY_BACKOFF_MS = 1_000;
@@ -27,7 +37,8 @@ export async function sendCatalogRefreshNotification(
   send: () => Promise<void>,
   onFailure: (error: unknown) => void,
   now = Date.now(),
-): Promise<"sent" | "failed" | "already_sent" | "in_flight" | "backoff" | "exhausted"> {
+  options: CatalogRefreshSendOptions = {},
+): Promise<"sent" | "failed" | "already_sent" | "in_flight" | "backoff" | "exhausted" | "stale"> {
   const prefix = channel === "tools" ? "toolList" : "resourceList";
   const sentKey = `${prefix}RefreshSent` as const;
   const attemptsKey = `${prefix}RefreshAttempts` as const;
@@ -56,6 +67,22 @@ export async function sendCatalogRefreshNotification(
         timer.unref?.();
       }),
     ]);
+    if (options.isDeliveryStillValid && !options.isDeliveryStillValid()) {
+      // The delivery surface ended while this send was in flight. The send may
+      // never have reached the host, so it is not a success: the channel stays
+      // eligible and the next delivery surface carries it. The attempt was made
+      // against a surface that is gone, so it does not consume the bounded
+      // retry budget of the next surface either.
+      state[attemptsKey] = Math.max(0, state[attemptsKey] - 1);
+      // The backoff timestamp is restored for the same reason, so the next
+      // delivery surface is not delayed by a backoff that a discarded send
+      // never earned. The restore is NARROWED to the timestamp this send
+      // advanced: when the surface ending also re-armed the channel, that
+      // re-arm owns the state and the restore must not resurrect a timestamp
+      // on a fresh surface.
+      if (state[lastAttemptKey] === now) state[lastAttemptKey] = previousAttemptAt;
+      return "stale";
+    }
     state[successesKey] += 1;
     state[sentKey] = true;
     return "sent";

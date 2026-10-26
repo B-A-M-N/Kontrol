@@ -65,6 +65,19 @@ export interface McpSessionState {
   activeSseStreams: number;
   /** A live GET SSE channel is attached; otherwise this is an idle retained session. */
   transportAttached: boolean;
+  /**
+   * A standalone GET SSE channel is established and can carry server-initiated
+   * notifications. Set once the transport has written its SSE headers, which
+   * happens after the SDK registers the standalone stream, and cleared as soon
+   * as that stream ends.
+   */
+  standaloneSseEstablished?: boolean;
+  /**
+   * Monotonic identity of the current delivery surface. A send that resolves
+   * after the surface changed was recorded against a channel that no longer
+   * exists, so its success is discarded instead of marking the channel sent.
+   */
+  deliveryGeneration?: number;
   activePolicyWaiters: number;
   closing: boolean;
   closed: boolean;
@@ -86,6 +99,10 @@ export interface McpSessionState {
   catalogRefresh?: {
     initializedPulseAttempted: boolean;
     getStreamPulseAttempted: boolean;
+    /** Pulses deferred because no standalone GET SSE channel could carry them. */
+    deferredNoStreamAttempts: number;
+    /** Sends that resolved after the delivery surface that carried them ended. */
+    staleDeliveries: number;
     toolListRefreshSent: boolean;
     resourceListRefreshSent: boolean;
     toolListRefreshAttempts: number;
