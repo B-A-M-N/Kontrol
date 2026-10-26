@@ -130,6 +130,7 @@ try {
   const peerUrl = `http://127.0.0.1:${address.port}`;
   const originAgent = { id: "agent-origin-native-reply", name: "origin-native-reply", url: "http://127.0.0.1:1", capabilities: ["native-reply-resume"] };
   const nativeAgent = { id: "agent-destination-native-reply", name: "destination-native-reply", url: peerUrl, capabilities: ["native-reply-resume"] };
+  const staleSameNameAgent = { id: "agent-stale-same-name", name: nativeAgent.name, url: "http://127.0.0.1:1", capabilities: ["native-reply-resume"] };
   const logicalRun = {
     runId: "run-native-reply",
     agentName: originAgent.name,
@@ -147,7 +148,7 @@ try {
     getRunByWorkSessionId: () => logicalRun,
     getDispatchAttemptByIdempotencyKey: (key: string) => attempts.get(key),
     getLatestDispatchAttemptForRun: () => [...attempts.values()].filter((attempt) => attempt.runId === logicalRun.runId).sort((a, b) => b.attemptNumber - a.attemptNumber)[0],
-    listAlive: () => [originAgent, nativeAgent],
+    listAlive: () => [originAgent, staleSameNameAgent, nativeAgent],
     updateRun: (_runId: string, updates: Record<string, unknown>) => Object.assign(logicalRun, updates),
     updateRunIfCurrent: (_runId: string, expected: { status: string; attemptNumber: number }, updates: Record<string, unknown>) => {
       if (logicalRun.status !== expected.status || logicalRun.attemptNumber !== expected.attemptNumber) return false;
@@ -189,6 +190,13 @@ try {
   const nativeConfig = {
     ...config,
     agentRegistry: registry,
+    eventStore: {
+      appendEvent: eventStore.appendEvent.bind(eventStore),
+      getEventsForSession: (workSessionId: string) => workSessionId === session.id ? [
+        { type: "session.handoff", payload: { runId: logicalRun.runId, transferId: "native-reply-transfer", toAgent: nativeAgent.name } },
+        { type: "session.handoff.state", payload: { transferId: "native-reply-transfer", state: "committed" } },
+      ] : [],
+    },
     workspaces: { getWorkspace: () => ({ id: "ws-reply-dispatch", root: "/tmp", mode: "checkout" }) },
     adapterSecret: "adapter-test-secret",
   } as unknown as BridgeConfig;
