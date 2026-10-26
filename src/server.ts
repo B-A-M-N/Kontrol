@@ -307,6 +307,9 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     cacheBytes: 0,
     maxCacheEntries: 0,
     maxCacheBytes: 0,
+    initialBuildDurationMs: 0,
+    lastSerializationDurationMs: 0,
+    maxSerializationDurationMs: 0,
   };
   const workspaceAppResources = createWorkspaceAppResourceServer(config, workspaceAppResourceMetrics, mcpResourceAdmission);
   const serveWorkspaceAppResource = workspaceAppResources.serve;

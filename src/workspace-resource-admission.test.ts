@@ -105,10 +105,16 @@ async function main() {
     cacheBytes: 0,
     maxCacheEntries: 0,
     maxCacheBytes: 0,
+    initialBuildDurationMs: 0,
+    lastSerializationDurationMs: 0,
+    maxSerializationDurationMs: 0,
   };
   // Deliberately tiny: 2 concurrent, 1 per client, queue 4.
   const pool = new McpAdmission(2, 1, 4);
   const { serve } = createWorkspaceAppResourceServer(config, metrics, pool);
+  assert.ok(Number.isFinite(metrics.initialBuildDurationMs), "initial compatibility-resource build duration is observable");
+  assert.ok(Number.isFinite(metrics.maxSerializationDurationMs), "resource serialization duration is observable");
+  assert.ok(metrics.cacheBytes <= 64 * 1024 * 1024, "aggregate serialized-content cache remains under its byte ceiling");
 
   // 1. Single read: served, permit released on finish.
   {

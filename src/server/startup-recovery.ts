@@ -241,7 +241,7 @@ export function createStartupReconciliation(deps: StartupRecoveryDeps): StartupR
     maintenance.resumeRuntimeReconciliationFrom(page.hasMore ? page.nextAfterId : undefined);
     startupRecovery.reconciledWorkSessions += page.reconciled;
     startupRecovery.markedStaleWorkSessions += page.markedStale;
-    recordRecoverySlice(startupRecovery, pageStartedAt, page.examined ?? page.reconciled + page.markedStale, page.reconciled + page.markedStale);
+    recordRecoverySlice(startupRecovery, pageStartedAt, page.examined ?? page.reconciled + page.markedStale, page.reconciled);
     if (page.hasMore && page.nextAfterId) {
       setImmediate(() => reconcileRuntimeStatePage(page.nextAfterId));
     }

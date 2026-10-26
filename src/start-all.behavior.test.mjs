@@ -585,7 +585,7 @@ const runWithFakeBin = [
   'fake_bin="$KONTROL_TEST_FAKE_BIN"',
   'if [ "${OS:-}" = "Windows_NT" ]; then fake_bin="$(/usr/bin/cygpath -u "$fake_bin")"; fi',
   'export PATH="$fake_bin:$PATH"',
-  'exec bash "$1"',
+  'exec bash "$@"',
 ].join("\n");
 
 function runLauncher(envPath, extraEnv = {}) {
@@ -608,9 +608,9 @@ function runLauncher(envPath, extraEnv = {}) {
   });
 }
 
-function runRestart(envPath, extraEnv = {}) {
+function runRestart(envPath, extraEnv = {}, args = ["--rebuild"]) {
   noteRuntimeLockPath(readEnvironmentStateDir(envPath));
-  return spawnSync("bash", ["-c", runWithFakeBin, "kontrol-launcher-test", "restart-kontrol.sh"], {
+  return spawnSync("bash", ["-c", runWithFakeBin, "kontrol-launcher-test", "restart-kontrol.sh", ...args], {
     cwd: root,
     encoding: "utf8",
     timeout: 120_000,
@@ -635,7 +635,7 @@ function startRestartController(envPath, extraEnv = {}) {
   noteRuntimeLockPath(readEnvironmentStateDir(envPath));
   let resolveResult;
   const result = new Promise((resolve) => { resolveResult = resolve; });
-  const child = spawn("bash", ["-c", runWithFakeBin, "kontrol-launcher-test", "restart-kontrol.sh"], {
+  const child = spawn("bash", ["-c", runWithFakeBin, "kontrol-launcher-test", "restart-kontrol.sh", "--rebuild"], {
     cwd: root,
     detached: true,
     env: {
@@ -791,6 +791,17 @@ try {
   assert.equal(sameGeneration.activeBuildId, baseBuildId);
   const sameGenerationLock = JSON.parse(readFileSync(join(successfulState, "runtime.lock"), "utf8"));
   process.kill(sameGenerationLock.launcherPid, "SIGTERM");
+  stopFakeSessions();
+
+  const npmLogBeforeInstalledRestart = readFileSync(join(harnessRoot, "npm.log"), "utf8");
+  const installedRestart = runRestart(successfulEnv, {}, []);
+  assert.equal(installedRestart.status, 0, "installed restart activates the committed immutable release:\n" + installedRestart.stdout + "\n" + installedRestart.stderr);
+  assert.match(installedRestart.stdout + installedRestart.stderr, /Activating explicitly selected immutable release/);
+  assert.equal(readFileSync(join(harnessRoot, "npm.log"), "utf8"), npmLogBeforeInstalledRestart,
+    "installed restart does not invoke typecheck, tests, or candidate build");
+  const installedRestartLock = JSON.parse(readFileSync(join(successfulState, "runtime.lock"), "utf8"));
+  assert.equal(installedRestartLock.buildId, baseBuildId);
+  process.kill(installedRestartLock.launcherPid, "SIGTERM");
   stopFakeSessions();
 
   // A deployment-lock command can fail transiently without the durable lock

@@ -226,6 +226,9 @@ export interface WorkspaceAppResourceMetrics {
   cacheBytes: number;
   maxCacheEntries: number;
   maxCacheBytes: number;
+  initialBuildDurationMs: number;
+  lastSerializationDurationMs: number;
+  maxSerializationDurationMs: number;
 }
 
 /** Explicit route-level HTTP body caps. These are deliberately finite: MCP

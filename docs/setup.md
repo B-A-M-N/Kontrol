@@ -157,13 +157,15 @@ kontrol up
 the checkout's `.env`, so configure that file before launching. Use
 `kontrol serve` when only the MCP server is needed.
 
-For a restart from a checkout, use `./restart-kontrol.sh`. It prepares and
-validates an immutable candidate while the current generation remains serving,
-then performs a readiness-gated handoff. Failed activation stops only
-Kontrol-owned sessions started by that invocation and restores the previous
-immutable release when one is available. Once ready, a persistent supervisor
-continues probing KONTROL, adapters, and the tunnel and applies thresholded
-component recovery.
+For a routine checkout restart, use `./restart-kontrol.sh`; it starts the exact
+committed immutable artifact without rebuilding source. Use
+`./restart-kontrol.sh --rebuild` to typecheck, build, and validate a replacement
+candidate while the current generation remains serving, then perform a
+readiness-gated handoff. Failed activation stops only Kontrol-owned sessions
+started by that invocation and restores the previous immutable release when
+one is available. Run `npm run gate:beta` for full release qualification.
+Once ready, a persistent supervisor continues probing KONTROL, adapters, and
+the tunnel and applies thresholded component recovery.
 
 Before a stable-beta deployment, run the canonical release gate from a clean
 checkout:

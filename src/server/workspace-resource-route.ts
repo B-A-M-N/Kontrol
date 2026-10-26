@@ -39,6 +39,9 @@ const MAX_WORKSPACE_APP_CACHE_ENTRIES = 4;
 const MAX_WORKSPACE_APP_CACHE_BYTES = 64 * 1024 * 1024;
 const workspaceAppContentJson = new Map<string, { json: string; bytes: number }>();
 let workspaceAppContentJsonBytes = 0;
+let workspaceAppInitialBuildDurationMs = 0;
+let workspaceAppLastSerializationDurationMs = 0;
+let workspaceAppMaxSerializationDurationMs = 0;
 let workspaceAppContentJsonMetrics: WorkspaceAppResourceMetrics | undefined;
 const reportedStaleWorkspaceUris = new Set<string>();
 function cachedWorkspaceAppContentJson(kind: string, uri: string): string {
@@ -54,21 +57,26 @@ function cachedWorkspaceAppContentJson(kind: string, uri: string): string {
     text: html,
     ...(resource.metadata ? { _meta: resource.metadata } : {}),
   };
+  const serializeStartedAt = performance.now();
   const json = JSON.stringify(content);
-  if (workspaceAppContentJson.size >= MAX_WORKSPACE_APP_CACHE_ENTRIES) {
-    const oldest = workspaceAppContentJson.keys().next().value as string | undefined;
-    if (oldest) {
+  workspaceAppLastSerializationDurationMs = Math.max(0, performance.now() - serializeStartedAt);
+  workspaceAppMaxSerializationDurationMs = Math.max(workspaceAppMaxSerializationDurationMs, workspaceAppLastSerializationDurationMs);
+  const bytes = Buffer.byteLength(json, "utf8");
+  if (bytes <= MAX_WORKSPACE_APP_CACHE_BYTES) {
+    while (workspaceAppContentJson.size >= MAX_WORKSPACE_APP_CACHE_ENTRIES
+      || workspaceAppContentJsonBytes + bytes > MAX_WORKSPACE_APP_CACHE_BYTES) {
+      const oldest = workspaceAppContentJson.keys().next().value as string | undefined;
+      if (!oldest) break;
       const removed = workspaceAppContentJson.get(oldest);
       workspaceAppContentJson.delete(oldest);
       workspaceAppContentJsonBytes -= removed?.bytes ?? 0;
     }
-  }
-  const bytes = Buffer.byteLength(json, "utf8");
-  if (bytes <= MAX_WORKSPACE_APP_CACHE_BYTES) {
     workspaceAppContentJson.set(key, { json, bytes });
     workspaceAppContentJsonBytes += bytes;
   }
   if (workspaceAppContentJsonMetrics) {
+    workspaceAppContentJsonMetrics.lastSerializationDurationMs = workspaceAppLastSerializationDurationMs;
+    workspaceAppContentJsonMetrics.maxSerializationDurationMs = workspaceAppMaxSerializationDurationMs;
     workspaceAppContentJsonMetrics.cacheEntries = workspaceAppContentJson.size;
     workspaceAppContentJsonMetrics.cacheBytes = workspaceAppContentJsonBytes;
     workspaceAppContentJsonMetrics.maxCacheEntries = Math.max(workspaceAppContentJsonMetrics.maxCacheEntries, workspaceAppContentJson.size);
@@ -80,12 +88,14 @@ function cachedWorkspaceAppContentJson(kind: string, uri: string): string {
 // Serialize the static app content once at server-module startup. The
 // dynamic JSON-RPC envelope is still built per request, but no request pays a
 // synchronous stringify cost for the widget body.
+const workspaceAppInitialBuildStartedAt = performance.now();
 for (const [kind, uri] of [
   ["current", WORKSPACE_APP_URI],
   ["openai", OPENAI_WORKSPACE_APP_URI],
   ["legacy", LEGACY_WORKSPACE_APP_URI],
   ["devdesktop", DEVDESKTOP_WORKSPACE_APP_URI],
 ] as const) cachedWorkspaceAppContentJson(kind, uri);
+workspaceAppInitialBuildDurationMs = Math.max(0, performance.now() - workspaceAppInitialBuildStartedAt);
 
 export interface WorkspaceAppResourceAdapters {
   serializeContentJson(kind: string, uri: string): string;
@@ -111,6 +121,9 @@ export function createWorkspaceAppResourceServer(
   const compress = adapters.compress ?? gzipAsync;
   metrics.cacheEntries = workspaceAppContentJson.size;
   metrics.cacheBytes = workspaceAppContentJsonBytes;
+  metrics.initialBuildDurationMs = workspaceAppInitialBuildDurationMs;
+  metrics.lastSerializationDurationMs = workspaceAppLastSerializationDurationMs;
+  metrics.maxSerializationDurationMs = workspaceAppMaxSerializationDurationMs;
   // P1 perf: the artifact is a large single-file HTML resource. The static
   // content JSON is serialized once at module load; only the small JSON-RPC envelope
   // varies per request. Compression is asynchronous so a second tab cannot

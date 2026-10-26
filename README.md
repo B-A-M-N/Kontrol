@@ -62,9 +62,11 @@ kontrol up
 `kontrol up` uses the checkout's `.env` and performs the same preflight and
 readiness checks as `start-all.sh`.
 
-The checkout also provides `./restart-kontrol.sh` for development/integration
-generations. It builds and verifies the replacement generation
-before stopping old owned processes and rolls back if a readiness stage fails.
+The checkout's `./restart-kontrol.sh` restarts the committed immutable release
+without rebuilding source. Use `./restart-kontrol.sh --rebuild` to typecheck,
+build, verify, and activate a new candidate; the current generation keeps
+serving during preparation and is restored if readiness fails. Run
+`npm run gate:beta` for full release qualification.
 
 For the complete stable-beta release gate, run:
 
