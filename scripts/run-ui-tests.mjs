@@ -46,6 +46,7 @@ try {
   runTsx(["src/ui/policy-grant-revoke.dom.test.tsx"]);
   runTsx(["src/ui/ingress-management.dom.test.ts"]);
   runTsx(["src/ui/workspace-app.dom.test.tsx"]);
+  runTsx(["src/ui/connection-lifecycle.bootstrap.test.ts"]);
 
   // Size test builds + enforces byte budgets (missing artifact = failure).
   runNode(["src/ui/workspace-app-size.test.mjs"]);

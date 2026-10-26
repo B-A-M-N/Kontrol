@@ -1,8 +1,3 @@
 {
-  "excluded": {
-    "scripts/lib/probe-failure-receipt.test.mjs": "deliberate manual probe fixture",
-    "scripts/probe-mcp-tunnel-failure.test.mjs": "deliberate manual tunnel probe fixture",
-    "src/qualification/external-catalog-capture.test.ts": "requires external host capture evidence",
-    "src/server/mcp-qualification-evidence.test.ts": "requires external qualification harness"
-  }
+  "excluded": {}
 }
