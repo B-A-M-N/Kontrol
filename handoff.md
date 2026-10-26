@@ -7,9 +7,9 @@ Starting HEAD for this revision: `44c247a`. The change is the reviewed
 range `44c247a..858e18f` - the commits of this change, listed below. The
 range is pinned to those commits on purpose: this branch is shared, other
 workstreams have since committed on top of it, and a moving `HEAD` would
-make every range claim in this record false. The last row of the commit table
-is this revision's documentation commit; it sits on top of that range and
-changes only this file.
+make every range claim in this record false. The last two rows of the commit
+table are this revision's documentation commits; they sit on top of that
+range and change only this file.
 Commits are local only. Do not push without separate authorization.
 Preserve untracked `.tmp-scratch/`.
 
@@ -17,9 +17,10 @@ Preserve untracked `.tmp-scratch/`.
 
 These commits are local only; nothing was pushed. The table has one row per
 commit of this change - the commits of the reviewed range
-`44c247a..858e18f`, then the documentation commit that pins that range -
-and no count is stated in prose, because every documentation commit would have
-to restate a number that its own commit changes.
+`44c247a..858e18f`, then the two documentation commits that pin that range
+and record the final verification run - and no count is stated in prose,
+because every documentation commit would have to restate a number that its
+own commit changes.
 
 | # | Commit | Subject |
 |---|--------|---------|
@@ -33,7 +34,8 @@ to restate a number that its own commit changes.
 | 8 | `3859026` | `docs: state the round-9 tally and cite the final full-chain run` |
 | 9 | `ec20e04` | `docs: name the reviewed range and distinguish the two handoff records` |
 | 10 | `858e18f` | `docs: record every review round and cite the pristine-archive test run` |
-| 11 | this commit | `docs: pin the reviewed range and record the re-recorded review rounds` |
+| 11 | `440faae` | `docs: pin the reviewed range and record the re-recorded review rounds` |
+| 12 | this commit | `docs: record the final verification run against this commit` |
 
 Requirement source:
 `/home/bamn/.codex/attachments/458e9b15-a1ec-4247-aa20-19ec878f9be9/pasted-text-1.txt`
@@ -849,18 +851,22 @@ Executed in this pass (all from the repository root):
   is discarded, does not consume the retry budget, and does not leave a
   backoff timestamp that the next delivery surface would have to wait out.
 - `npm test` - the full canonical chain, run in an isolated tree that holds
-  this change's committed tree plus exactly this 34-file change (no other
-  working-tree edit is present in it), so the result is not contaminated by
-  concurrent work in the shared checkout. `EXIT=0` on every run. The final
-  run is against a pristine extraction of the reviewed range's tip -
-  `git archive 858e18f` unpacked into an empty directory, whose 575 tracked
-  files are exactly the committed ones - and is recorded in
-  `.tmp-scratch/test-npm-test-r20.log`. The earlier runs are
+  exactly the committed tree of this change (no other working-tree edit is
+  present in it), so the result is not contaminated by concurrent work in
+  the shared checkout. `EXIT=0` on every run. The final run is against a
+  pristine extraction of the commit this document is in - `git archive` of
+  that commit, unpacked into an empty directory, whose tracked files are
+  exactly the committed ones - and is recorded in
+  `.tmp-scratch/test-npm-test-r20.log`. The earlier runs are against the
+  reviewed range's tip (`858e18f`, 575 tracked files) and are recorded in
   `.tmp-scratch/test-npm-test-r13.log`,
   `.tmp-scratch/test-npm-test-r14.log`,
   `.tmp-scratch/test-npm-test-r15.log` and
   `.tmp-scratch/test-npm-test-r16.log`. The logs are local artifacts, not
-  committed.
+  committed. One caveat for a reader who re-runs the older tree: it pins
+  `@modelcontextprotocol/ext-apps` 1.7.5, while the shared checkout's
+  `node_modules` now carries 2.0.3, so that exact tree needs its own
+  dependency set to compile.
 - `node --import tsx scripts/scheduled-readonly-adapters-e2e.mjs` — CRUSH and
   Hermes both dispatched and stayed confined.
 - `KONTROL_CADDY_BIN=/tmp/caddy npm run qualify:ingress` — 12 pass,
