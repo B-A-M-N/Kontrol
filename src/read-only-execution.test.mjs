@@ -117,6 +117,13 @@ try {
   const hostNetworkLaunch = buildReadOnlySandboxCommand({ workspaceRoot, executable, networkPolicy: "host", bubblewrapPath: bubblewrap });
   assert.ok(hostNetworkLaunch.args.includes("--unshare-all") && hostNetworkLaunch.args.includes("--share-net"),
     "host networking is an explicit opt-in while the other bubblewrap namespaces remain isolated");
+  assert.ok(hostNetworkLaunch.args.some((value, index) => value === "--ro-bind-try"
+    && hostNetworkLaunch.args[index + 1] === "/etc/resolv.conf"
+    && hostNetworkLaunch.args[index + 2] === "/etc/resolv.conf"),
+  "a host-networked run can resolve names through the host resolver configuration");
+  const isolatedNetworkLaunch = buildReadOnlySandboxCommand({ workspaceRoot, executable, networkPolicy: "disabled", bubblewrapPath: bubblewrap });
+  assert.ok(!isolatedNetworkLaunch.args.includes("/etc/resolv.conf"),
+    "a run without host networking does not observe the host resolver configuration");
 
   const configuredRuntime = buildReadOnlySandboxCommand({
     workspaceRoot,

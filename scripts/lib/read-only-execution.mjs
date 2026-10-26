@@ -273,6 +273,14 @@ export function buildReadOnlySandboxCommand({
     "--ro-bind-try", "/etc/nsswitch.conf", "/etc/nsswitch.conf",
     "--ro-bind-try", "/etc/passwd", "/etc/passwd",
     "--ro-bind-try", "/etc/group", "/etc/group",
+    // A host-networked run must still resolve names. The resolver
+    // configuration is host state, not a secret, and it is bound read-only
+    // only when the caller explicitly opted into host networking. A run
+    // without host networking has no network namespace to resolve through,
+    // so it must not observe the host resolver at all.
+    ...(networkPolicy === "host"
+      ? ["--ro-bind-try", "/etc/resolv.conf", "/etc/resolv.conf"]
+      : []),
     "--proc", "/proc",
     "--dev", "/dev",
     "--tmpfs", "/tmp",

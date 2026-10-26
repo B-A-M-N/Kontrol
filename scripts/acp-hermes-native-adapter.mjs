@@ -16,12 +16,14 @@ import { homedir, tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { clearAgentIdentity, identityHeaders, loadAgentIdentity, saveAgentIdentity } from "./lib/acp-agent-identity.mjs";
 import { readJsonBody, truncateUtf8Tail, writeAdapterError } from "./lib/adapter-http.mjs";
+import { probeFailureCategory, probeFailureDetail } from "./lib/adapter-diagnostics.mjs";
 import { buildToolEnvironment } from "./lib/tool-environment.mjs";
 import { signWorkerToken, TOKEN_TTL_MS } from "./lib/acp-worker-token.mjs";
 import { adapterStatePath, atomicWriteJson, prepareOwnedChild, processStartToken, readJsonOr, reconcileOwnedProcesses, terminateProcessGroup } from "./lib/managed-agent-process.mjs";
 import { applyWorkspaceLeaseRenewal, workspaceLeaseDeadline, workspaceLeaseDeadlineReached } from "./lib/workspace-lease.mjs";
 import { formatHermesAcpAttempts, hermesAcpCandidates, selectHermesAcpEntry } from "./lib/hermes-acp-entry.mjs";
 import { classifyHermesStopReason } from "./lib/hermes-stop-reason.mjs";
+import { hermesPythonRuntimeRootFor, isSystemHermesPath } from "./lib/hermes-python-runtime.mjs";
 import { acknowledgeAdapterDispatchReceipt, adapterDispatchFingerprint, findAdapterDispatchReceipt, isTerminalAdapterDispatchStatus, loadAdapterDispatchReceipts, reconcileAdapterDispatchReceipts, recordAdapterDispatchReceipt } from "./lib/adapter-dispatch-receipts.mjs";
 const readOnlyModuleUrl = process.env.KONTROL_ARTIFACT_PATH
   ? pathToFileURL(resolve(process.env.KONTROL_ARTIFACT_PATH, "read-only-execution.mjs"))
@@ -412,7 +414,6 @@ async function handle(req, res) {
   if (!task.trim()) {
     return writeJson(res, 400, { error: { code: "invalid_task", message: "ACP task must be non-empty" } });
   }
-
   const workspaceRoot = await validateWorkspaceRoot(body.workspace_root);
   const requestedMaxRuntimeMs = Number(body.scheduled_execution_policy?.maxRuntimeMs);
   const runMaxRuntimeMs = Number.isSafeInteger(requestedMaxRuntimeMs) && requestedMaxRuntimeMs > 0
@@ -573,6 +574,11 @@ async function handle(req, res) {
       const hermesSandboxCommand = `/opt/kontrol/hermes-bin/${basename(hermesExecutable)}`;
       const hermesSandboxPython = join(dirname(hermesSandboxCommand), "python");
       const hermesPythonBindFile = { source: pythonExecutable, target: hermesSandboxPython };
+      // A relocated CPython (the upstream Hermes runtime keeps its own
+      // interpreter generation) can only find its own standard library when
+      // PYTHONHOME names the runtime root that contains it. Without it the
+      // launcher fails inside Bubblewrap with an empty module search path.
+      const hermesPythonRuntimeRoot = hermesPythonRuntimeRootFor(pythonExecutable);
       const hermesRuntimeBindFiles = [
         { source: hermesExecutable, target: hermesSandboxCommand },
         hermesPythonBindFile,
@@ -588,6 +594,7 @@ async function handle(req, res) {
           ...readOnlyWorkerEnvironment(process.env),
           HERMES_AGENT_ROOT: "/opt/kontrol/hermes-runtime",
           HERMES_HOME: run.hermesSessionHome ? "/opt/kontrol/hermes-session" : "/tmp/home/.hermes",
+          ...(hermesPythonRuntimeRoot ? { PYTHONHOME: hermesPythonRuntimeRoot } : {}),
           PYTHONPATH: hermesReadOnlyPythonPath(),
           PATH: `/opt/kontrol/bin:/opt/kontrol/hermes-bin:/usr/local/bin:/usr/bin:/bin`,
           KONTROL_WORKSPACE_SESSION_ID: run.workspaceSessionId || "",
@@ -644,6 +651,7 @@ async function handle(req, res) {
         env: {
           HERMES_AGENT_ROOT: "/opt/kontrol/hermes-runtime",
           HERMES_HOME: "/tmp/home/.hermes",
+          ...(hermesPythonRuntimeRoot ? { PYTHONHOME: hermesPythonRuntimeRoot } : {}),
           PYTHONPATH: hermesReadOnlyPythonPath(),
           PATH: "/opt/kontrol/bin:/opt/kontrol/hermes-bin:/usr/local/bin:/usr/bin:/bin",
         },
@@ -659,8 +667,14 @@ async function handle(req, res) {
         stdio: ["ignore", "pipe", "pipe"],
       });
       if (launcherProbeResult.error || launcherProbeResult.status !== 0) {
-        const detail = launcherProbeResult.error?.message ?? `exit ${launcherProbeResult.status}`;
-        throw Object.assign(new Error(`Hermes ACP launcher sandbox preflight failed: ${detail}`), { code: "sandbox_unavailable" });
+        // The bounded launcher stderr stays in the adapter log. It is never
+        // placed in the error message, which reaches a scheduled-job receipt.
+        // The log is still a log, so the stderr is scrubbed of credential
+        // material before it is printed. The message itself carries only a
+        // stable category: no path, no stderr, no spawn error text.
+        const category = probeFailureCategory(launcherProbeResult);
+        console.error(`[hermes-native] launcher preflight failed: ${category} ${probeFailureDetail(launcherProbeResult)}`);
+        throw Object.assign(new Error(`Hermes ACP launcher sandbox preflight failed: ${category}`), { code: "sandbox_unavailable" });
       }
       const runtimeProbe = buildReadOnlySandboxCommand({
         workspaceRoot,
@@ -669,6 +683,7 @@ async function handle(req, res) {
         args: ["-c", "import acp; from acp.core import connect_to_agent; from acp.schema import ClientCapabilities, FileSystemCapabilities, Implementation, TextContentBlock; import acp_adapter.entry; import acp_adapter.server"],
         env: {
           HERMES_AGENT_ROOT: "/opt/kontrol/hermes-runtime",
+          ...(hermesPythonRuntimeRoot ? { PYTHONHOME: hermesPythonRuntimeRoot } : {}),
           PYTHONPATH: hermesReadOnlyPythonPath(),
           PATH: "/opt/kontrol/bin:/opt/kontrol/hermes-bin:/usr/local/bin:/usr/bin:/bin",
         },
@@ -684,8 +699,14 @@ async function handle(req, res) {
         stdio: ["ignore", "pipe", "pipe"],
       });
       if (runtimeProbeResult.error || runtimeProbeResult.status !== 0) {
-        const detail = runtimeProbeResult.error?.message ?? runtimeProbeResult.stderr?.trim() ?? `exit ${runtimeProbeResult.status}`;
-        throw Object.assign(new Error(`Hermes read-only runtime probe failed: ${detail}`), { code: "sandbox_unavailable" });
+        // The runtime probe is the same surface as the launcher probe: a
+        // Python traceback can echo a profile path, an environment value, or
+        // an authorization header. This message reaches the 503 body and
+        // therefore a scheduled-job receipt, so it carries only a stable
+        // category; the scrubbed detail goes to the adapter log.
+        const category = probeFailureCategory(runtimeProbeResult);
+        console.error(`[hermes-native] read-only runtime probe failed: ${category} ${probeFailureDetail(runtimeProbeResult)}`);
+        throw Object.assign(new Error(`Hermes read-only runtime probe failed: ${category}`), { code: "sandbox_unavailable" });
       }
       run.readOnlyExecutionReceipt = {
         mode: run.execution.mode,
@@ -1914,10 +1935,6 @@ function configuredHermesToolchains() {
       return [];
     }
   });
-}
-
-function isSystemHermesPath(path) {
-  return ["/usr", "/bin", "/lib", "/lib64"].some((root) => path === root || path.startsWith(`${root}/`));
 }
 
 function isInsideApprovedHermesToolchain(path, roots) {

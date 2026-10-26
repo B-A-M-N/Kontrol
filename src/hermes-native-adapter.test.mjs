@@ -109,6 +109,33 @@ assert.match(adapter, /const hermesSandboxPython = join\(dirname\(hermesSandboxC
 assert.match(adapter, /source: pythonExecutable, target: hermesSandboxPython/);
 assert.match(adapter, /Hermes ACP launcher sandbox preflight failed/,
   "the exact confined ACP launcher is checked before an accepted worker dispatch");
+assert.match(adapter, /hermesPythonRuntimeRootFor\(pythonExecutable\)/,
+  "the confined Hermes runtime resolves the runtime root of the selected interpreter");
+assert.match(adapter, /PYTHONHOME: hermesPythonRuntimeRoot/,
+  "a relocated Hermes interpreter finds its standard library through PYTHONHOME inside Bubblewrap");
+
+// A probe failure message reaches the 503 body and therefore a
+// scheduled-job receipt. Neither probe may put child stderr, a spawn error
+// message, or a path into that message.
+assert.doesNotMatch(adapter, /runtimeProbeResult\.stderr\?\.trim\(\)/,
+  "the runtime probe stderr never becomes the error detail");
+assert.doesNotMatch(adapter, /launcherProbeResult\.error\?\.message/,
+  "the launcher probe spawn error never becomes the error detail");
+assert.match(adapter, /probeFailureCategory\(runtimeProbeResult\)/,
+  "the runtime probe failure reports a stable category");
+assert.match(adapter, /probeFailureCategory\(launcherProbeResult\)/,
+  "the launcher probe failure reports a stable category");
+const runtimeProbeThrow = adapter.split("\n").find((line) => line.includes("Hermes read-only runtime probe failed:"));
+assert.ok(runtimeProbeThrow !== undefined, "the runtime probe failure throws a typed error");
+assert.ok(runtimeProbeThrow.includes("${category}"), "the runtime probe error message carries the category");
+assert.ok(!runtimeProbeThrow.includes("stderr"), "the runtime probe error message carries no stderr");
+assert.ok(!runtimeProbeThrow.includes("detail"), "the runtime probe error message carries no raw detail");
+const launcherProbeThrow = adapter.split("\n").find((line) => line.includes("Hermes ACP launcher sandbox preflight failed:"));
+assert.ok(launcherProbeThrow !== undefined, "the launcher probe failure throws a typed error");
+assert.ok(launcherProbeThrow.includes("${category}"), "the launcher probe error message carries the category");
+assert.ok(!launcherProbeThrow.includes("stderr"), "the launcher probe error message carries no stderr");
+assert.match(adapter, /import \{ hermesPythonRuntimeRootFor, isSystemHermesPath \} from "\.\/lib\/hermes-python-runtime\.mjs"/,
+  "the runtime-root resolution is the shared, behaviorally tested module");
 
 const currentCandidates = hermesAcpCandidates({
   hermesBin: "hermes",
