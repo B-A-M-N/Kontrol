@@ -213,6 +213,38 @@ try {
   assert.equal(retry.status, "accepted", "an exact already-present attempt is reconciled without sending again");
   assert.equal(driverCommands.filter((method) => method === "Input.dispatchMouseEvent").length, 3, "an accepted retry does not click Send again");
 
+  const fastGenerationCommands: string[] = [];
+  let fastGenerationPrompt: string | undefined;
+  let fastGenerationActive = false;
+  const fastGenerationCdp = {
+    async send(method: string, params: Record<string, unknown> = {}) {
+      fastGenerationCommands.push(method);
+      if (method === "Input.insertText") fastGenerationPrompt = String(params.text);
+      if (method === "Input.dispatchMouseEvent" && params.type === "mouseReleased") fastGenerationActive = true;
+      if (method !== "Runtime.evaluate") return {};
+      const expression = String(params.expression);
+      let value: unknown = {};
+      if (expression.includes("location.href")) value = fastGenerationActive
+        ? { status: "generation_active", url: canonical.url, key: canonical.key }
+        : { status: "ready", url: canonical.url, key: canonical.key };
+      else if (expression.includes("userMessageCount")) value = { userMessageCount: 0, assistantMessageCount: 0 };
+      else if (expression.includes("users.filter")) value = { found: fastGenerationPrompt !== undefined, exact: fastGenerationPrompt === "fast review packet" };
+      else if (expression.includes("composer_not_unique")) value = { ok: true };
+      else if (expression.includes("return ('value'in e")) value = true;
+      else if (expression.includes("send-button")) value = { ok: true, x: 20, y: 30 };
+      else if (expression.includes("new Promise(resolve")) value = fastGenerationPrompt === "fast review packet";
+      return { result: { value } };
+    },
+  } as unknown as CdpClient;
+  const fastGenerationDriver = new ChatGptPageDriver(fastGenerationCdp, pageTarget);
+  const fastBaseline = await fastGenerationDriver.captureBaseline();
+  const fastAccepted = await fastGenerationDriver.submitPrompt({ prompt: "fast review packet", attemptId: "attempt-fast", expectedConversationKey: canonical.key, baseline: fastBaseline });
+  assert.equal(fastAccepted.status, "accepted", "visible exact prompt acceptance remains accepted after generation starts immediately");
+  assert.equal(fastGenerationCommands.filter((method) => method === "Input.dispatchMouseEvent").length, 3, "the fast-generation send crosses the boundary once");
+  const fastRetry = await fastGenerationDriver.submitPrompt({ prompt: "fast review packet", attemptId: "attempt-fast", expectedConversationKey: canonical.key, baseline: fastBaseline });
+  assert.equal(fastRetry.status, "accepted", "retry reconciles the exact prompt while the conversation is generating");
+  assert.equal(fastGenerationCommands.filter((method) => method === "Input.dispatchMouseEvent").length, 3, "generation reconciliation does not send a duplicate");
+
   const makeDispatcher = (driver: any, failPromptAcknowledgement = false) => {
     let claimed = false;
     const transitions: string[] = [];

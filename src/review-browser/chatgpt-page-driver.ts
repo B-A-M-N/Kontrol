@@ -5,7 +5,8 @@ import { canonicalReviewerConversation } from "./target-binding.js";
 
 export type BrowserReadiness =
   | { status: "ready"; conversationUrl: string; conversationKey: string }
-  | { status: "login_required" | "verification_required" | "identity_provider_unsupported_browser" | "session_expired" | "authentication_handoff_failed" | "connector_authorization_required" | "composer_unavailable" | "wrong_conversation" | "generation_active" | "browser_disconnected"; detail?: string };
+  | { status: "generation_active"; conversationUrl: string; conversationKey: string }
+  | { status: "login_required" | "verification_required" | "identity_provider_unsupported_browser" | "session_expired" | "authentication_handoff_failed" | "connector_authorization_required" | "composer_unavailable" | "wrong_conversation" | "browser_disconnected"; detail?: string };
 export type AuthenticationFailure = "login_required" | "identity_provider_unsupported_browser" | "verification_required" | "session_expired" | "authentication_handoff_failed";
 export interface TurnBaseline { conversationKey: string; userMessageCount: number; assistantMessageCount: number; capturedAt: string }
 export type PromptSubmission = { status: "accepted"; submittedAt: string; conversationKey: string }
@@ -28,10 +29,11 @@ const inspectPage = `(() => {
   if (!url.startsWith('${ORIGIN}/')) return {status:'wrong_conversation'};
   const match=path.match(/^\\/c\\/([A-Za-z0-9_-]{8,160})\\/?$/);
   if (!match) return {status:'login_required'};
+  const conversation={url:'https://chatgpt.com/c/'+match[1],key:match[1]};
+  if (select(${JSON.stringify(STOPS)}).length) return {status:'generation_active',...conversation};
   const composers=select(${JSON.stringify(COMPOSERS)});
   if (composers.length!==1 || composers[0].matches(':disabled') || composers[0].getAttribute('aria-disabled')==='true') return {status:'composer_unavailable'};
-  if (select(${JSON.stringify(STOPS)}).length) return {status:'generation_active'};
-  return {status:'ready',url:'https://chatgpt.com/c/'+match[1],key:match[1]};
+  return {status:'ready',...conversation};
 })()`;
 
 export class ChatGptPageDriver {
@@ -40,7 +42,12 @@ export class ChatGptPageDriver {
   async inspect(expectedKey = this.target.conversationKey): Promise<BrowserReadiness> {
     try {
       const value = await this.evaluate<{ status: string; url?: string; key?: string }>(inspectPage);
-      if (value.status !== "ready") return { status: value.status as Exclude<BrowserReadiness, { status: "ready" }>["status"] };
+      if (value.status === "generation_active") {
+        const canonical = canonicalReviewerConversation(value.url ?? "");
+        if (canonical.key !== value.key || canonical.key !== expectedKey || canonical.key !== this.target.conversationKey) return { status: "wrong_conversation" };
+        return { status: "generation_active", conversationUrl: canonical.url, conversationKey: canonical.key };
+      }
+      if (value.status !== "ready") return { status: value.status as Exclude<BrowserReadiness, { status: "ready" } | { status: "generation_active" }>["status"] };
       const canonical = canonicalReviewerConversation(value.url ?? "");
       if (canonical.key !== expectedKey || canonical.key !== this.target.conversationKey) return { status: "wrong_conversation" };
       return { status: "ready", conversationUrl: canonical.url, conversationKey: canonical.key };
@@ -57,7 +64,7 @@ export class ChatGptPageDriver {
   async submitPrompt(input: { prompt: string; attemptId: string; expectedConversationKey: string; baseline: TurnBaseline }): Promise<PromptSubmission> {
     if (!input.prompt.trim() || Buffer.byteLength(input.prompt, "utf8") > 48_000) return { status: "rejected", reason: "prompt_size_invalid" };
     const ready = await this.inspect(input.expectedConversationKey);
-    if (ready.status !== "ready") return { status: "rejected", reason: ready.status };
+    if (ready.status !== "ready" && ready.status !== "generation_active") return { status: "rejected", reason: ready.status };
     if (input.baseline.conversationKey !== ready.conversationKey) return { status: "rejected", reason: "baseline_conversation_mismatch" };
     const prior = await this.evaluate<{ found: boolean; exact: boolean }>(`(() => {
       const users=[...document.querySelectorAll('[data-message-author-role="user"]')];
@@ -68,6 +75,7 @@ export class ChatGptPageDriver {
     if (prior.found) return prior.exact
       ? { status: "accepted", submittedAt: new Date().toISOString(), conversationKey: ready.conversationKey }
       : { status: "uncertain", reason: "attempt_id_already_present_with_unmatched_prompt" };
+    if (ready.status !== "ready") return { status: "rejected", reason: ready.status };
     const preparation = await this.evaluate<{ ok: boolean; reason?: string }>(`(() => {
       const selectors=${JSON.stringify(COMPOSERS)}, found=new Set();
       for(const s of selectors)for(const e of document.querySelectorAll(s)){const r=e.getBoundingClientRect(),c=getComputedStyle(e);if(r.width>0&&r.height>0&&c.display!=='none'&&c.visibility!=='hidden')found.add(e)}
@@ -100,7 +108,7 @@ export class ChatGptPageDriver {
         if(matches())return resolve(true);const observer=new MutationObserver(()=>{if(matches()){observer.disconnect();resolve(true)}});observer.observe(document.body,{childList:true,subtree:true,characterData:true});setTimeout(()=>{observer.disconnect();resolve(matches())},8000);
       })`, 10_000, true);
       const after = await this.inspect(input.expectedConversationKey);
-      if (after.status !== "ready") return { status: "uncertain", reason: after.status };
+      if (after.status !== "ready" && after.status !== "generation_active") return { status: "uncertain", reason: after.status };
       return accepted ? { status: "accepted", submittedAt: new Date().toISOString(), conversationKey: after.conversationKey }
         : { status: "uncertain", reason: "prompt_acceptance_not_observed" };
     } catch { return { status: "uncertain", reason: "post_send_observation_unavailable" }; }
