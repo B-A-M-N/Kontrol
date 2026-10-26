@@ -56,6 +56,7 @@ import {
   workspaceAppResourceKind,
 } from "../workspace-app-resource.js";
 import type { DatabaseHandle } from "../db/client.js";
+import type { AgentPtyBindingStore } from "../agent-pty-bindings.js";
 import type { MutationReceiptStore } from "../mutation-receipts.js";
 import type { LiveWaiterRegistry } from "../acp-bridge.js";
 import type { Request, Response } from "express";
@@ -68,6 +69,41 @@ function externalCorrelation(req: Request): string | undefined {
     if (value && value.length <= 128 && /^[A-Za-z0-9._:/-]+$/.test(value)) return value;
   }
   return undefined;
+}
+
+function ptyReviewCredential(req: Request, deps: McpHttpDeps): {
+  claims: WorkerTokenClaims;
+  binding: NonNullable<ReturnType<AgentPtyBindingStore["getByProcessSession"]>>;
+} | undefined {
+  const token = req.header("x-kontrol-worker-token");
+  if (!token || !deps.config.acpAgentSecret || !deps.agentPtyBindings) return undefined;
+  try {
+    const claims = verifyWorkerToken(token, deps.config.acpAgentSecret);
+    const scope = claims.agentPtyReview;
+    if (!scope || !Number.isSafeInteger(scope.processGeneration) || scope.processGeneration < 1) return undefined;
+    const binding = deps.agentPtyBindings.getByProcessSession(scope.processSessionId);
+    if (!binding || binding.id !== scope.bindingId || binding.processGeneration !== scope.processGeneration
+      || !["attached", "detached"].includes(binding.status)
+      || binding.workSessionId !== claims.workSessionId
+      || binding.workspaceSessionId !== claims.workspaceSessionId
+      || binding.runId !== claims.runId
+      || binding.ownerPrincipalId !== `worker-work-session:${claims.workSessionId}`) return undefined;
+    return { claims, binding };
+  } catch {
+    return undefined;
+  }
+}
+
+function presentsPtyReviewScope(token: string | undefined): boolean {
+  if (!token) return false;
+  try {
+    const payload = token.split(".")[1];
+    if (!payload) return false;
+    const claims = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as { agentPtyReview?: unknown };
+    return claims.agentPtyReview !== undefined;
+  } catch {
+    return false;
+  }
 }
 
 function qualificationCaptureId(req: Request): string | undefined {
@@ -123,6 +159,9 @@ function authenticatedConnection(req: Request, deps: McpHttpDeps, requestId?: st
       });
     }
   }
+  const ptyCredential = ptyReviewCredential(req, deps);
+  if (workerClaims?.agentPtyReview && !ptyCredential) workerClaims = undefined;
+  if (ptyCredential) workerClaims = ptyCredential.claims;
   const verifiedReviewer = constantTimeStringEqual(req.header("x-kontrol-reviewer-token"), config.acpReviewerSecret);
   const verifiedTunnelReviewer = config.authMode === "tunnel"
     && constantTimeStringEqual(req.header("x-kontrol-tunnel-reviewer"), config.tunnelReviewerSecret);
@@ -160,6 +199,11 @@ function authenticatedConnection(req: Request, deps: McpHttpDeps, requestId?: st
     workSessionId: workerClaims?.workSessionId,
     runId: workerClaims?.runId || req.header("x-kontrol-run") || undefined,
     continuationId: workerClaims?.continuationId || req.header("x-kontrol-continuation") || undefined,
+    ...(ptyCredential ? { agentPtyReviewBinding: {
+      bindingId: ptyCredential.binding.id,
+      processSessionId: ptyCredential.binding.processSessionId,
+      processGeneration: ptyCredential.binding.processGeneration,
+    } } : {}),
     workspaceLeaseNonce:
       (workerClaims as (WorkerTokenClaims & { workspaceLeaseNonce?: string }) | undefined)?.workspaceLeaseNonce
       || (workerClaims ? req.header("x-kontrol-workspace-lease-nonce") ?? undefined : undefined),
@@ -237,6 +281,7 @@ export interface McpHttpDeps {
   workspaces: import("../workspaces.js").WorkspaceRegistry;
   reviewCheckpoints: import("../review-checkpoints.js").ReviewCheckpointManager;
   processSessions: import("../process-sessions.js").ProcessSessionManager;
+  agentPtyBindings?: AgentPtyBindingStore;
   workSessions: import("../work-sessions.js").WorkSessionManager;
   agentRegistry: import("../acp-registry.js").AgentRegistryManager;
   eventStore: import("../event-log.js").EventStore;
@@ -440,6 +485,13 @@ async function sendCatalogRefreshPulse(
 }
 
 export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res: Response): Promise<unknown> {
+  const presentedWorkerToken = req.header("x-kontrol-worker-token");
+  if (presentsPtyReviewScope(presentedWorkerToken) && !ptyReviewCredential(req, deps)) {
+    // A stale or rebound PTY credential must never fall through as an
+    // unauthenticated client session when OAuth is disabled.
+    res.status(401).json({ error: "unauthorized" });
+    return;
+  }
   // Keep the established stateful 2025 route intact. Only requests classified
   // as 2026 per-request traffic take the stateless handler below.
   const webRequest = await toWebRequest(req, req.body);
@@ -477,6 +529,7 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
     workspaces,
     reviewCheckpoints,
     processSessions,
+    agentPtyBindings,
     workSessions,
     agentRegistry,
     eventStore,
@@ -995,6 +1048,7 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
     // whole trust boundary: no OAuth resource assertion applies, and unsigned
     // worker/reviewer/conversation headers are never evaluated for promotion.
     const peerPrincipal = req.peerPrincipal;
+    const ptyCredential = ptyReviewCredential(req, deps);
     if (peerPrincipal) {
       logEvent(config.logging, "debug", "peer_request_authenticated", {
         requestId,
@@ -1004,7 +1058,7 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
         path: requestPath(req),
       });
     } else {
-      if (bearerAuth && !req.auth) {
+      if (bearerAuth && !req.auth && !ptyCredential) {
         await new Promise<void>((resolve, reject) => {
           bearerAuth(req, res, (error?: unknown) => {
             if (error) reject(error);
@@ -1013,7 +1067,7 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
         });
         if (res.headersSent) return;
       }
-      if (bearerAuth) {
+      if (bearerAuth && !ptyCredential) {
         if (res.headersSent) return;
         if (!req.auth?.resource || !checkResourceAllowed({ requestedResource: req.auth.resource, configuredResource: resourceServerUrl! })) {
           logEvent(config.logging, "warn", "auth_denied", {

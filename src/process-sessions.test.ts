@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
+import { mkdirSync } from "node:fs";
 import { HeadTailBuffer, OutputLog, ProcessSessionManager } from "./process-sessions.js";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { openDatabase } from "./db/client.js";
 import { createAgentPtyBindingStore } from "./agent-pty-bindings.js";
 import { createWorkSessionManager } from "./work-sessions/index.js";
@@ -797,6 +798,44 @@ try {
         });
         assert.equal(replayedObservation?.output, observation?.output,
           "repeating an observation at the same cursor is nondestructive");
+
+        const credentialPath = join(stateDir, "agent-pty-review-test", "credential.json");
+        mkdirSync(dirname(credentialPath), { recursive: true });
+        let credentialCleaned = false;
+        const credentialLaunch = await ptyManager.start({
+          workspaceId: workspace.id,
+          ownerId: `work-session:${workSession.id}`,
+          workSessionId: workSession.id,
+          principalId: `worker-work-session:${workSession.id}`,
+          command: `${node} -e "process.stdout.write(String(process.env.KONTROL_AGENT_PTY_CREDENTIAL_FILE) + '|' + String(process.env.KONTROL_AGENT_PTY_TOKEN))"`,
+          cwd: process.cwd(),
+          tty: true,
+          yieldTimeMs: 40,
+          agentPtyBinding: {
+            workspaceSessionId: workspace.id,
+            runId: run.runId,
+            ownerPrincipalId: `worker-work-session:${workSession.id}`,
+            createReviewCredential: (binding) => {
+              assert.ok(binding.id.startsWith("pty_"), "credential is created only after durable binding exists");
+              return { credentialFilePath: credentialPath, cleanup: () => { credentialCleaned = true; } };
+            },
+          },
+        });
+        let credentialObservation = ptyManager.observeAgentPty({
+          workSessionId: workSession.id,
+          processSessionId: credentialLaunch.sessionId!,
+        });
+        for (let index = 0; index < 20 && !credentialCleaned; index += 1) {
+          await new Promise((resolve) => setTimeout(resolve, 25));
+          credentialObservation = ptyManager.observeAgentPty({
+            workSessionId: workSession.id,
+            processSessionId: credentialLaunch.sessionId!,
+          });
+        }
+        assert.match(credentialObservation?.output ?? "", /agent-pty-review-test\/credential\.json\|undefined/,
+          "the PTY receives only the private credential file path, never a bearer token in its environment");
+        assert.equal(credentialCleaned, true, "the private credential is removed after the PTY exits");
+
         await assert.rejects(ptyManager.write({
           workspaceId: workspace.id,
           sessionId: launched.sessionId!,

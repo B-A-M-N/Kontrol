@@ -54,6 +54,10 @@ export interface StartCommandInput {
     workspaceSessionId: string;
     runId: string;
     ownerPrincipalId: string;
+    createReviewCredential?: (binding: import("./agent-pty-bindings.js").AgentPtyBinding) => {
+      credentialFilePath: string;
+      cleanup(): void;
+    };
   };
 }
 
@@ -131,6 +135,8 @@ interface ProcessSession {
   timeoutTimer?: NodeJS.Timeout;
   launchKey?: string;
   agentPtyBinding?: { processSessionId: string; processGeneration: number };
+  agentPtyCredentialFilePath?: string;
+  agentPtyCredentialCleanup?: () => void;
 }
 
 interface LaunchRecord {
@@ -470,6 +476,26 @@ export class ProcessSessionManager {
     if (launchKey) this.launches.set(launchKey, { fingerprint: launchFingerprint, sessionId: session.id });
 
     try {
+      if (input.agentPtyBinding) {
+        const binding = this.agentPtyBindings!.attach({
+          processSessionId: session.id,
+          workspaceSessionId: input.agentPtyBinding.workspaceSessionId,
+          workSessionId: input.workSessionId ?? "",
+          runId: input.agentPtyBinding.runId,
+          ownerPrincipalId: input.agentPtyBinding.ownerPrincipalId,
+          running: true,
+          outputCursor: session.buffer.cursor,
+        });
+        session.agentPtyBinding = {
+          processSessionId: session.id,
+          processGeneration: binding.processGeneration,
+        };
+        const credential = input.agentPtyBinding.createReviewCredential?.(binding);
+        if (credential) {
+          session.agentPtyCredentialFilePath = credential.credentialFilePath;
+          session.agentPtyCredentialCleanup = credential.cleanup;
+        }
+      }
       if (input.tty && process.platform !== "win32") await this.startPty(session, input);
       else this.startPipe(session, input);
       // P1: a user-supplied child lifetime is bounded by the SAME configured
@@ -486,34 +512,19 @@ export class ProcessSessionManager {
         session.timeoutTimer.unref?.();
       }
     } catch (error) {
+      if (session.agentPtyBinding) {
+        try {
+          this.agentPtyBindings?.finish(
+            session.agentPtyBinding.processSessionId,
+            session.agentPtyBinding.processGeneration,
+            session.buffer.cursor,
+          );
+        } catch { /* preserve the original launch failure */ }
+      }
+      this.cleanupAgentPtyCredential(session);
       this.removeSession(session.id);
       if (launchKey) this.launches.delete(launchKey);
       throw error;
-    }
-
-    if (input.agentPtyBinding) {
-      try {
-        const binding = this.agentPtyBindings!.attach({
-          processSessionId: session.id,
-          workspaceSessionId: input.agentPtyBinding.workspaceSessionId,
-          workSessionId: input.workSessionId ?? "",
-          runId: input.agentPtyBinding.runId,
-          ownerPrincipalId: input.agentPtyBinding.ownerPrincipalId,
-          running: session.running,
-          outputCursor: session.buffer.cursor,
-        });
-        session.agentPtyBinding = {
-          processSessionId: session.id,
-          processGeneration: binding.processGeneration,
-        };
-      } catch (error) {
-        const stopped = await this.stopUnboundSession(session);
-        if (stopped) {
-          this.removeSession(session.id);
-          if (launchKey) this.launches.delete(launchKey);
-        }
-        throw error;
-      }
     }
 
     const yieldTimeMs = boundedInteger(input.yieldTimeMs, DEFAULT_EXEC_YIELD_MS, MAX_COMMAND_YIELD_MS);
@@ -888,9 +899,13 @@ export class ProcessSessionManager {
     const shell = resolveShellCommand(input.command);
     let pty: import("node-pty").IPty;
     try {
+      const env = processEnvironment(this.childEnvironmentAllowlist);
+      if (session.agentPtyCredentialFilePath) {
+        env.KONTROL_AGENT_PTY_CREDENTIAL_FILE = session.agentPtyCredentialFilePath;
+      }
       pty = nodePty.spawn(shell.executable, shell.args, {
         cwd: input.cwd,
-        env: processEnvironment(this.childEnvironmentAllowlist),
+        env,
         name: "xterm-256color",
         cols: session.columns,
         rows: session.rows,
@@ -931,6 +946,7 @@ export class ProcessSessionManager {
         console.error(`[kontrol] could not persist agent PTY exit for ${session.id}:`, error);
       }
     }
+    this.cleanupAgentPtyCredential(session);
     session.cleanupTimer = setTimeout(
       () => this.removeSession(session.id),
       this.completedSessionTtlMs,
@@ -943,6 +959,14 @@ export class ProcessSessionManager {
         launch.cleanupTimer.unref();
       }
     }
+  }
+
+  private cleanupAgentPtyCredential(session: ProcessSession): void {
+    const cleanup = session.agentPtyCredentialCleanup;
+    session.agentPtyCredentialCleanup = undefined;
+    session.agentPtyCredentialFilePath = undefined;
+    try { cleanup?.(); }
+    catch (error) { console.error(`[kontrol] could not remove agent PTY review credential for ${session.id}:`, error); }
   }
 
   private append(session: ProcessSession, output: string): void {

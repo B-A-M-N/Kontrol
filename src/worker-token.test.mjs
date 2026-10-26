@@ -28,6 +28,20 @@ t("valid round-trip preserves claims", () => {
   assert.equal(c.runId, "r1");
   assert.equal(c.continuationId, "c1");
 });
+t("PTY review scope remains bound to one process generation and lease", () => {
+  const scoped = {
+    ...baseClaims,
+    workspaceLeaseNonce: "lease_1",
+    agentPtyReview: {
+      bindingId: "pty_binding_1",
+      processSessionId: "proc_1",
+      processGeneration: 4,
+    },
+  };
+  const c = verifyWorkerToken(signWorkerToken(scoped, secret), secret);
+  assert.deepEqual(c.agentPtyReview, scoped.agentPtyReview);
+  assert.equal(c.workspaceLeaseNonce, "lease_1");
+});
 t("wrong secret rejected", () => {
   assert.throws(() => verifyWorkerToken(signWorkerToken(baseClaims, secret), "wrong"), WorkerTokenError);
 });

@@ -25,6 +25,12 @@ export interface ConnectionContext {
   peerCapabilities?: readonly import("../peer/config-types.js").PeerCapability[];
   /** Canonical workspace roots granted to this peer (registry-derived). */
   peerGrantedRoots?: readonly string[];
+  /** Signed, live-generation PTY grant; its catalog is limited to submit/await review tools. */
+  agentPtyReviewBinding?: {
+    bindingId: string;
+    processSessionId: string;
+    processGeneration: number;
+  };
   workspaceSessionId?: string;
   workSessionId?: string;
   runId?: string;

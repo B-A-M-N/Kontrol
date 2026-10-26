@@ -81,6 +81,7 @@ export { type ConnectionContext, processSessionOwnerId } from "./connection-cont
 const toolListDescriptorCache = new Map<string, Promise<unknown>>();
 const TOOL_LIST_DESCRIPTOR_CACHE_MAX_ENTRIES = 256;
 const PEER_JOB_WORKSPACE_RESERVATION_MS = 100 * 365 * 24 * 60 * 60 * 1000;
+const PTY_REVIEW_TOOL_NAMES = new Set(["submit_for_review", "await_review_feedback"]);
 const toolSchemaCacheByConfig = new WeakMap<ServerConfig, Map<string, unknown>>();
 
 function isZodSchema(value: unknown): value is { safeParse: (input: unknown) => unknown } {
@@ -233,14 +234,18 @@ export function createMcpServer(
   const peerTools = connectionContext?.authenticatedRole === "peer"
     ? peerAllowedToolNames(connectionContext.peerCapabilities ?? [])
     : undefined;
+  const isPtyReviewCredential = Boolean(connectionContext?.agentPtyReviewBinding);
+  const canSeeTool = (name: string) =>
+    (!peerTools || peerTools.has(name))
+    && (!isPtyReviewCredential || PTY_REVIEW_TOOL_NAMES.has(name));
   const registerTool = server.registerTool.bind(server);
   server.registerTool = ((name: string, definition: any, callback: any) => {
     const key = `${toolRegistrationProfile}:${name}`;
-    const guardedCallback = peerTools
+    const guardedCallback = peerTools || isPtyReviewCredential
       ? async (args: unknown, extra: unknown) => {
-          if (!peerTools.has(name)) {
+          if (!canSeeTool(name)) {
             return {
-              content: [{ type: "text" as const, text: `Forbidden: tool '${name}' is not in the granted peer capability profile.` }],
+              content: [{ type: "text" as const, text: `Forbidden: tool '${name}' is outside this connection's capability profile.` }],
               isError: true,
             };
           }
@@ -266,14 +271,16 @@ export function createMcpServer(
     server,
     toolListDescriptorCacheKey(
       toolRegistrationProfile,
-      peerTools ? `peer:${peerToolProfileKey(connectionContext?.peerCapabilities)}` : "owner",
+      isPtyReviewCredential
+        ? `pty-review:${connectionContext?.agentPtyReviewBinding?.bindingId}:${connectionContext?.agentPtyReviewBinding?.processGeneration}`
+        : peerTools ? `peer:${peerToolProfileKey(connectionContext?.peerCapabilities)}` : "owner",
     ),
     toolListDescriptorCache,
     ListToolsRequestSchema,
     TOOL_LIST_DESCRIPTOR_CACHE_MAX_ENTRIES,
   );
-  const peerFilterInstallation = peerTools
-    ? installToolListFilter(server, ListToolsRequestSchema, (toolName) => peerTools.has(toolName))
+  const visibilityFilterInstallation = peerTools || isPtyReviewCredential
+    ? installToolListFilter(server, ListToolsRequestSchema, canSeeTool)
     : undefined;
   server.server.registerCapabilities({
     extensions: {
@@ -604,7 +611,7 @@ export function createMcpServer(
     console.warn("[kontrol] tools/list descriptor observation unavailable; serving uncached and rejecting catalog acknowledgements");
   }
   if (!descriptorCacheAvailable) console.warn("[kontrol] tools/list descriptor cache unavailable; serving uncached");
-  if (peerFilterInstallation && !peerFilterInstallation.finalizeRegistration()) {
+  if (visibilityFilterInstallation && !visibilityFilterInstallation.finalizeRegistration()) {
     // Fail closed: a peer session that cannot hide unauthorized tools from
     // tools/list must not be served at all — the execution guard alone leaves
     // a confusing catalog that advertises tools the peer can never call.

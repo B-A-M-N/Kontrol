@@ -41,6 +41,7 @@ import {
 import { SingleUserOAuthProvider } from "./oauth-provider.js";
 import { ProcessSessionManager, type ProcessSnapshot } from "./process-sessions.js";
 import { createAgentPtyBindingStore } from "./agent-pty-bindings.js";
+import { removeStaleAgentPtyReviewCredentials } from "./agent-pty-review-credential.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { FilesystemSnapshotStore } from "./filesystem-snapshot-store.js";
 import { createMaintenanceCoordinator } from "./runtime/maintenance.js";
@@ -339,6 +340,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
   });
   const agentPtyBindings = createAgentPtyBindingStore(db.sqlite);
   const staleAgentPtyBindings = agentPtyBindings.markUnresolvedLost();
+  removeStaleAgentPtyReviewCredentials(config.stateDir);
   if (staleAgentPtyBindings > 0) {
     console.warn(`[kontrol] marked ${staleAgentPtyBindings} prior agent PTY binding(s) lost during startup reconciliation`);
   }
@@ -748,6 +750,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     workspaces,
     reviewCheckpoints,
     processSessions,
+    agentPtyBindings,
     workSessions,
     agentRegistry,
     eventStore,

@@ -5,7 +5,14 @@ export interface WorkerTokenClaims {
   workspaceSessionId: string;
   runId?: string;
   continuationId?: string;
+  workspaceLeaseNonce?: string;
   exp: number;
+  /** Restricts a locally launched PTY credential to its exact live PTY generation and review tools. */
+  agentPtyReview?: {
+    bindingId: string;
+    processSessionId: string;
+    processGeneration: number;
+  };
 }
 
 export const TOKEN_TTL_MS: number;

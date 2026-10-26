@@ -258,6 +258,7 @@ const makeLeaseClient = async (context?: {
   workspaceSessionId?: string;
   workspaceLeaseNonce?: string;
   mcpSessionId?: string;
+  agentPtyReviewBinding?: { bindingId: string; processSessionId: string; processGeneration: number };
 }, policy?: { engine?: any; enforcer?: any }) => {
   const server = createMcpServer(
     leaseConfig,
@@ -270,6 +271,17 @@ const makeLeaseClient = async (context?: {
     undefined, undefined,
     context,
   );
+  if (context?.agentPtyReviewBinding) {
+    // The shared bridge is intentionally omitted from this isolated helper;
+    // register stand-ins so this case exercises the production visibility and
+    // invocation guards without constructing the full review workflow.
+    server.registerTool("submit_for_review", { title: "Submit for review", inputSchema: {} }, async () => ({
+      content: [{ type: "text" as const, text: "submitted" }],
+    }));
+    server.registerTool("await_review_feedback", { title: "Await review feedback", inputSchema: {} }, async () => ({
+      content: [{ type: "text" as const, text: "awaited" }],
+    }));
+  }
   const client = new Client({ name: "lease-fence-test", version: "1.0.0" });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
@@ -319,6 +331,29 @@ try {
     mcpSessionId: "lease-worker-current",
   });
   leaseClients.push(worker);
+
+  const ptyReview = await makeLeaseClient({
+    authenticatedRole: "worker",
+    workSessionId: workSession.id,
+    workspaceSessionId: workspaceId,
+    workspaceLeaseNonce: acquired.lease.leaseNonce,
+    mcpSessionId: "pty-review-only",
+    agentPtyReviewBinding: {
+      bindingId: "pty_binding_fixture",
+      processSessionId: "proc_pty_fixture",
+      processGeneration: 1,
+    },
+  });
+  leaseClients.push(ptyReview);
+  const ptyTools = await ptyReview.client.listTools();
+  assert.deepEqual(ptyTools.tools.map((tool) => tool.name).sort(), ["await_review_feedback", "submit_for_review"],
+    "PTY review credentials expose only the two worker review tools");
+  const ptyHiddenTool = await ptyReview.client.callTool({
+    name: "open_workspace",
+    arguments: { path: canonicalLeaseWorkspaceRoot, mode: "checkout" },
+  });
+  assert.equal(ptyHiddenTool.isError, true, "hidden tools remain unavailable even when invoked directly by name");
+
   const workerReopen = await worker.client.callTool({
     name: "open_workspace",
     arguments: { path: canonicalLeaseWorkspaceRoot, mode: "checkout" },

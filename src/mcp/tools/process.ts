@@ -24,6 +24,7 @@ import {
 } from "../process-tool-response.js";
 import { processSessionOwnerId } from "../connection-context.js";
 import type { ConnectionContext } from "../connection-context.js";
+import { createAgentPtyReviewCredential } from "../../agent-pty-review-credential.js";
 
 export function registerCodexProcessTools(
   server: McpServer,
@@ -90,9 +91,9 @@ export function registerCodexProcessTools(
       if (bindingErr) return bindingErr;
       if (agentPty && (connectionContext?.authenticatedRole !== "worker" || !tty
         || !connectionContext.workSessionId || !connectionContext.workspaceSessionId
-        || !connectionContext.runId || !connectionContext.authenticatedPrincipalId)) {
+        || !connectionContext.runId || !connectionContext.authenticatedPrincipalId || !config.acpAgentSecret)) {
         return {
-          content: [{ type: "text" as const, text: "agentPty requires tty=true and a signed worker connection bound to a work session, run, workspace session, and principal." }],
+          content: [{ type: "text" as const, text: "agentPty requires tty=true and a signed worker connection with a bound work session, run, workspace session, principal, and worker signing key." }],
           isError: true,
         };
       }
@@ -138,6 +139,14 @@ export function registerCodexProcessTools(
               workspaceSessionId: connectionContext!.workspaceSessionId!,
               runId: connectionContext!.runId!,
               ownerPrincipalId: connectionContext!.authenticatedPrincipalId!,
+              createReviewCredential: (binding) => createAgentPtyReviewCredential({
+                stateDir: config.stateDir,
+                host: config.host,
+                port: config.port,
+                secret: config.acpAgentSecret!,
+                binding,
+                workspaceLeaseNonce: connectionContext!.workspaceLeaseNonce,
+              }),
             },
           } : {}),
           command: cmd,

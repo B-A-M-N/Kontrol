@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 import { createRequire } from "node:module";
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync, rmSync, statSync, statfsSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, realpathSync, rmSync, statSync, statfsSync, writeFileSync } from "node:fs";
 import { stdin as input, stdout as output } from "node:process";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as prompts from "@clack/prompts";
 import { getShellConfig } from "@earendil-works/pi-coding-agent";
@@ -37,8 +37,10 @@ import { readTailscaleFacts, sanitizeProxyTarget } from "./ingress/tailscale-sta
 import { validateIngressProfiles } from "./ingress/validate.js";
 import { applyIngressProfile, disableIngressProfile, listIngressOperationReceipts, reconcileIngressProfile } from "./ingress/controller.js";
 import { latestIngressHealthByProfile } from "./ingress/health-store.js";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
-type Command = "serve" | "up" | "init" | "doctor" | "config" | "service" | "snapshots" | "review-loop" | "agent" | "ingress" | "help" | "version";
+type Command = "serve" | "up" | "init" | "doctor" | "config" | "service" | "snapshots" | "review-loop" | "review" | "agent" | "ingress" | "help" | "version";
 const require = createRequire(import.meta.url);
 const SUPPORTED_NODE_RANGE = ">=22.19 <23 || >=24 <25 || >=26 <27";
 
@@ -74,6 +76,9 @@ async function main(argv: string[]): Promise<void> {
     case "review-loop":
       await runReviewLoopCommand(args);
       return;
+    case "review":
+      await runPtyReviewCommand(args);
+      return;
     case "agent":
       await runAgentCommand(args);
       return;
@@ -93,11 +98,81 @@ function normalizeCommand(command: string | undefined): Command {
   if (!command || command === "serve" || command === "start") return "serve";
   if (command === "up" || command === "init" || command === "doctor" || command === "config" || command === "service" || command === "snapshots") return command;
   if (command === "review-loop") return "review-loop";
+  if (command === "review") return "review";
   if (command === "agent") return "agent";
   if (command === "ingress") return "ingress";
   if (command === "help" || command === "--help" || command === "-h") return "help";
   if (command === "version" || command === "--version" || command === "-v") return "version";
   throw new Error(`Unknown command: ${command}`);
+}
+
+/** Submit and await review through the existing worker MCP tools. The only
+ * credential available to this command is a private, generation-bound file
+ * created for an explicitly launched agent PTY. */
+async function runPtyReviewCommand(args: string[]): Promise<void> {
+  const sub = args[0];
+  if (!sub || sub === "help") {
+    output.write("Usage: kontrol review submit [--message <text>] [--no-wait]\n");
+    return;
+  }
+  if (sub !== "submit") throw new Error(`Unknown review subcommand: ${sub} (expected submit)`);
+  const credentialPath = process.env.KONTROL_AGENT_PTY_CREDENTIAL_FILE;
+  if (!credentialPath) throw new Error("This command is available only inside a Kontrol-managed agent PTY.");
+  const canonicalPath = realpathSync(credentialPath);
+  const fileStat = lstatSync(credentialPath);
+  const directoryStat = lstatSync(dirname(canonicalPath));
+  if (!fileStat.isFile() || fileStat.isSymbolicLink() || (fileStat.mode & 0o077) !== 0
+    || !directoryStat.isDirectory() || directoryStat.isSymbolicLink()
+    || !basename(dirname(canonicalPath)).startsWith("agent-pty-review-")
+    || basename(canonicalPath) !== "credential.json") {
+    throw new Error("PTY review credential file is not a private Kontrol credential.");
+  }
+  const credential = JSON.parse(readFileSync(canonicalPath, "utf8")) as {
+    mcpUrl?: unknown;
+    token?: unknown;
+    workSessionId?: unknown;
+  };
+  if (typeof credential.mcpUrl !== "string" || typeof credential.token !== "string"
+    || typeof credential.workSessionId !== "string") {
+    throw new Error("PTY review credential file is malformed.");
+  }
+  const endpoint = new URL(credential.mcpUrl);
+  if (endpoint.protocol !== "http:" || !["127.0.0.1", "localhost", "[::1]"].includes(endpoint.hostname)) {
+    throw new Error("PTY review endpoint must be loopback HTTP.");
+  }
+  const client = new Client({ name: "kontrol-pty-review", version: "1.0.0" });
+  const transport = new StreamableHTTPClientTransport(endpoint, {
+    requestInit: { headers: { "x-kontrol-worker-token": credential.token } },
+    reconnectionOptions: {
+      maxRetries: 0,
+      initialReconnectionDelay: 100,
+      maxReconnectionDelay: 1_000,
+      reconnectionDelayGrowFactor: 1.5,
+    },
+  });
+  try {
+    await client.connect(transport);
+    const submitted = await client.callTool({
+      name: "submit_for_review",
+      arguments: {
+        sessionId: credential.workSessionId,
+        ...(flagValue(args, "--message") ? { message: flagValue(args, "--message") } : {}),
+      },
+    });
+    output.write(`${JSON.stringify(submitted.structuredContent ?? submitted)}\n`);
+    if (submitted.isError || args.includes("--no-wait")) return;
+    for (;;) {
+      const feedback = await client.callTool({
+        name: "await_review_feedback",
+        arguments: { sessionId: credential.workSessionId, timeoutMs: 900_000 },
+      });
+      output.write(`${JSON.stringify(feedback.structuredContent ?? feedback)}\n`);
+      const status = (feedback.structuredContent as { status?: unknown } | undefined)?.status;
+      if (feedback.isError || status !== "timeout") return;
+    }
+  } finally {
+    await client.close().catch(() => undefined);
+  }
 }
 
 function runSnapshotsCommand(args: string[]): Promise<void> {
@@ -1158,6 +1233,7 @@ function printHelp(): void {
       "  kontrol service install|start|stop|restart|upgrade|status|logs|uninstall",
       "  kontrol snapshots stats|gc",
       "  kontrol review-loop status|on|off|pause|resume --session <workSessionId>",
+      "  kontrol review submit [--message <text>] [--no-wait]   Submit from an agent PTY and await feedback",
       "  kontrol agent list|add|remove      Register any loopback HTTP ACP agent",
       "  kontrol ingress inspect|plan|apply|disable|reconcile|doctor   Tailscale route control and qualification",
       "  kontrol -v, --version   Print the installed version",

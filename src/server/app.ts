@@ -21,6 +21,7 @@ import {
   uiBuildDirectory,
 } from "./mcp-session-state.js";
 import type { RequestHandler } from "express";
+import { verifyWorkerToken } from "../acp-worker-token.mjs";
 
 export interface HttpAppDeps {
   readonly config: ServerConfig;
@@ -117,7 +118,20 @@ export function createHttpApp(deps: HttpAppDeps): { app: Express } {
   // unauthenticated request from spending parser memory and avoids the SDK's
   // unconditional ~100 KB parser.
   if (deps.bearerAuth) {
-    app.use("/mcp", (req: Request, res: Response, next: NextFunction) => deps.bearerAuth!(req, res, next));
+    app.use("/mcp", (req: Request, res: Response, next: NextFunction) => {
+      const workerToken = req.header("x-kontrol-worker-token");
+      if (workerToken && deps.config.acpAgentSecret) {
+        try {
+          if (verifyWorkerToken(workerToken, deps.config.acpAgentSecret).agentPtyReview) {
+            next();
+            return;
+          }
+        } catch {
+          // Invalid and expired worker credentials continue through normal OAuth.
+        }
+      }
+      deps.bearerAuth!(req, res, next);
+    });
   }
   if (config.acpEnabled) {
     app.use(
