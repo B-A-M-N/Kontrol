@@ -230,7 +230,13 @@ let worktreeRootPath: string;
   assert.notEqual(worktreeRootPath, root, "worktree root must differ from the source root");
   assert.ok(worktreeRootPath.startsWith(worktreeRoot), "worktree must live under KONTROL_WORKTREE_ROOT");
   assert.equal(structured.checkpointBackend !== "unavailable", true, "checkpoint backend must be available");
-  assert.equal(structured.capabilities?.changeTracking, true);
+  // open_workspace defers the baseline capture until a review or mutation
+  // needs an exact baseline, so the backend is reported as "pending" and
+  // change tracking is off at open time. Change tracking must follow the
+  // backend exactly: it may never be claimed while no backend is available.
+  assert.equal(structured.checkpointBackend, "pending", "open_workspace defers the checkpoint capture");
+  const backendIsAvailable = structured.checkpointBackend === "git" || structured.checkpointBackend === "filesystem";
+  assert.equal(structured.capabilities?.changeTracking, backendIsAvailable, "change tracking must follow the checkpoint backend");
 
   const write = await peer.callTool("write", {
     workspaceId: worktreeWorkspaceId, path: "peer-proposal.txt", content: "proposed change v1\n",
