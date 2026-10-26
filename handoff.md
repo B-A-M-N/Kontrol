@@ -1,27 +1,29 @@
 # Kontrol multipath ingress — remaining work
 
-Updated: 2026-10-26 (ninth revision)
+Updated: 2026-10-26 (tenth revision)
 Repository: `/home/bamn/devspace`
 Branch: `audit-k02-k04`
 Starting HEAD for this revision: `44c247a`. The change is the reviewed
 range `44c247a..858e18f` - the commits of this change, listed below. The
 range is pinned to those commits on purpose: this branch is shared, other
 workstreams have since committed on top of it, and a moving `HEAD` would
-make every range claim in this record false. The last three rows of the commit
-table sit on top of that range: two documentation commits, which change only
-this file, and one test-contract fix, which changes one test file.
+make every range claim in this record false. The last seven rows of the commit
+table sit on top of that range: four documentation commits, which change only
+this file, and three test-contract fixes, which each change one test file.
 Commits are local only. Do not push without separate authorization.
-Preserve untracked `.tmp-scratch/`.
+Preserve the untracked scratch directories: `.tmp-scratch/` and
+`.tmp-handoff-evidence/`, which holds the verification logs cited
+below.
 
 ## Local commits (not pushed)
 
 These commits are local only; nothing was pushed. The table has one row per
 commit of this change - the commits of the reviewed range
-`44c247a..858e18f`, then the two documentation commits that pin that range
-and record the final verification run, then the test-contract fix that
-restores the canonical chain - and no count is stated in prose, because
-every documentation commit would have to restate a number that its own
-commit changes.
+`44c247a..858e18f`, then the documentation commits that pin that range,
+then the three test-contract fixes that restore the canonical chain, and
+finally this revision's documentation commit - and no count is stated in
+prose, because every documentation commit would have to restate a number
+that its own commit changes.
 
 | # | Commit | Subject |
 |---|--------|---------|
@@ -38,7 +40,10 @@ commit changes.
 | 11 | `440faae` | `docs: pin the reviewed range and record the re-recorded review rounds` |
 | 12 | `50e7faf` | `docs: record the final verification run against this commit` |
 | 13 | `7a62023` | `test(peer): follow the deferred checkpoint contract in the change-tracking assertion` |
-| 14 | this commit | `docs: record the stale checkpoint assertion and the restored canonical chain` |
+| 14 | `8bd3973` | `docs: record the stale checkpoint assertion and the restored canonical chain` |
+| 15 | `4535e9f` | `test(checkpoints): carry the checkpoint error slot in the expected snapshot shape` |
+| 16 | `7b5749a` | `test(store): pin the two migrations the sibling commits declared` |
+| 17 | this commit | `docs: record the three stale sibling assertions and the restored canonical chain` |
 
 Requirement source:
 `/home/bamn/.codex/attachments/458e9b15-a1ec-4247-aa20-19ec878f9be9/pasted-text-1.txt`
@@ -553,9 +558,9 @@ What round 13 verified, from the code rather than from the prose:
   `git diff --name-only 44c247a..858e18f` matches the reviewed file list
   exactly. At the time of round 13 the range
   was `44c247a..e5a07c8`; every commit after it in this workstream changes
-  only `handoff.md`, except the test-contract fix of section 13, which
-  touches one test file outside that set, so the range and its file count
-  are unchanged. The range is written as `44c247a..858e18f` - this change's
+  only `handoff.md`, except the three test-contract fixes of section 13,
+  which touch three test files outside that set, so the range and its file
+  count are unchanged. The range is written as `44c247a..858e18f` - this change's
   own commits - so the claim stays checkable after other workstreams commit
   on this branch;
 - each of the five commits contains only files that belong to its stated
@@ -595,31 +600,57 @@ builds the app into a temporary artifact directory and points that variable at
 the build. It is now recorded in the environment notes below.
 
 
-### 13. A stale assertion in a sibling test broke the chain, and it is fixed
+### 13. Three stale assertions in sibling tests broke the chain, and all three are fixed
 
-Re-running the canonical chain against this revision's tree failed in
-`src/peer-mutation.test.ts` - a file this change does not touch. The cause
-is a sibling commit on this branch (`839987b`, "fix(checkpoints): defer
-capture until review barriers"), which deliberately changed the checkpoint
-contract: `open_workspace` no longer captures a baseline, so it reports
-`checkpointBackend: "pending"` and `capabilities.changeTracking: false`
-until a review or a mutation needs an exact baseline. That commit updated the
-two suites whose assertions encode that contract
-(`src/checkpoint-fail-closed.test.ts`, `src/mcp-sse-admission.test.ts`) but
-not the peer suite, whose assertion still demanded `changeTracking: true` at
-open time.
+Re-running the canonical chain against this revision's tree failed in three
+suites that this change does not touch. Each failure was a stale expectation
+left behind by a sibling commit on this branch, and in each case the
+expectation - not the contract - was what was wrong.
+
+**The checkpoint contract (`src/peer-mutation.test.ts`, `7a62023`).** The
+sibling commit `839987b` ("fix(checkpoints): defer capture until review
+barriers") deliberately changed the checkpoint contract: `open_workspace` no
+longer captures a baseline, so it reports `checkpointBackend: "pending"` and
+`capabilities.changeTracking: false` until a review or a mutation needs an
+exact baseline. That commit updated the two suites whose assertions encode
+that contract (`src/checkpoint-fail-closed.test.ts`,
+`src/mcp-sse-admission.test.ts`) but not the peer suite, whose assertion
+still demanded `changeTracking: true` at open time.
 
 The assertion was stale, not the contract. The peer worktree is still
 tracked: with that one line relaxed, the rest of the suite passes unchanged,
 including its assertions that the peer's mutation stays tracked and that the
-allow-untracked escape hatch does not apply to peers.
+allow-untracked escape hatch does not apply to peers. `7a62023` replaces the
+stale assertion with the invariant the contract actually guarantees - the
+backend is reported as `pending` at open time, and change tracking is claimed
+exactly when the backend is one that can track changes (`git` or
+`filesystem`), never while no backend is available. The peer suite keeps
+asserting the same property it asserted before: change tracking follows the
+backend.
 
-`7a62023` replaces the stale assertion with the invariant the contract
-actually guarantees - the backend is reported as `pending` at open time, and
-change tracking is claimed exactly when the backend is one that can track
-changes (`git` or `filesystem`), never while no backend is available.
-The full canonical chain is green again, and the peer suite keeps asserting
-the same property it asserted before: change tracking follows the backend.
+**The snapshot shape (`src/review-checkpoints.filesystem.test.ts`,
+`4535e9f`).** The same sibling commit added a `checkpointError` slot to the
+snapshot info that `getSnapshotInfo` returns, so the returned object carries
+one more key than before. The filesystem suite pins that whole object with
+`assert.deepEqual`, so it failed on the extra `checkpointError: undefined`
+key. `4535e9f` carries the slot explicitly in the expected shape, which
+asserts that the slot is present and empty in the success case - the same
+property the suite asserted before, now stated against the shape the manager
+actually returns.
+
+**The migration list (`src/oauth-store.test.ts`, `7b5749a`).** Two sibling
+commits on this branch added migrations - `47fa6d0` declared version 105
+(`durable-agent-reply-dispatch-ack`) and `957a608` declared version 106
+(`startup-recovery-selective-indexes`) - without adding the two rows to the
+migration list that `src/oauth-store.test.ts` pins with
+`assert.deepEqual`. The database really does apply both migrations, so the
+pinned list was the stale side of the contract. `7b5749a` adds the two rows
+in the order the migration table declares them. The test still pins the exact
+list: no assertion was relaxed, and the rows are the migration names the
+schema actually records.
+
+All three were expectation drift, not behaviour changes, and each fix leaves
+its suite asserting the property it asserted before.
 
 ## Still missing — operator-gated deployment evidence
 
@@ -786,8 +817,8 @@ Rounds 18 and 19 re-recorded that same committed state after the workflow
 guard scoped its review evidence over the whole tracked tree and concurrent
 work in this checkout changed it; both returned no findings. The final review
 round covers this revision's commits as well - the pinned range, the
-documentation commits and the test-contract fix of section 13 - and its
-verdict is recorded with the workflow guard.
+documentation commits and the three test-contract fixes of section 13 - and
+its verdict is recorded with the workflow guard.
 | Round | Reviewer | Verdict | Outcome |
 |-------|----------|---------|---------|
 | 1 | `glm-5.3-flash` | changes requested | The deferral gate alone was insufficient: the transport could still drop a notification on a stream that ended mid-send. Led to the stale-discard path. |
@@ -883,26 +914,39 @@ Executed in this pass (all from the repository root):
   is discarded, does not consume the retry budget, and does not leave a
   backoff timestamp that the next delivery surface would have to wait out.
 - `npm test` - the full canonical chain, run in an isolated tree that holds
-  exactly the committed tree of this change (no other working-tree edit is
-  present in it), so the result is not contaminated by concurrent work in
-  the shared checkout. `EXIT=0` on every run. The final run is against a
-  pristine extraction of `7a62023` - the commit that carries the
-  test-contract fix of section 13 - unpacked into an empty directory, whose
-  tracked files are exactly the committed ones; it is recorded in
-  `.tmp-scratch/test-npm-test-r20.log`. The only change this workstream
-  makes after that commit is this document. The first attempt of this pass ran
-  against `50e7faf` and failed in `src/peer-mutation.test.ts`; that
-  failure is what surfaced the stale assertion of section 13, and `50e7faf`
-  reproduces it. The earlier runs are against the
-  reviewed range's tip (`858e18f`, 575 tracked files) and are recorded in
-  `.tmp-scratch/test-npm-test-r13.log`,
-  `.tmp-scratch/test-npm-test-r14.log`,
-  `.tmp-scratch/test-npm-test-r15.log` and
-  `.tmp-scratch/test-npm-test-r16.log`. The logs are local artifacts, not
-  committed. One caveat for a reader who re-runs the older tree: it pins
+  exactly a committed tree of this change (no other working-tree edit is
+  present in it), so the result is not contaminated by concurrent work in the
+  shared checkout. `EXIT=0` on every run. Two runs of this pass are cited
+  here. Both are pristine extractions - `git archive` of a commit, unpacked
+  into an empty directory whose tracked files are exactly the committed ones -
+  and both carry their own locked dependency set (`npm ci`), because the
+  shared checkout's `node_modules` has moved on since these trees were
+  built:
+  - the reviewed range's tip (`858e18f`, 575 tracked files), recorded in
+    `.tmp-handoff-evidence/test-npm-test-range-858e18f.log`; its
+    `test:manifest` step reports "198 test files all executed by the
+    canonical chain (14 scripts, 26 runners)" and the run ends
+    `NPM_TEST_EXIT=0`;
+  - this revision's final commit, recorded in
+    `.tmp-handoff-evidence/test-npm-test-final.log`. The only change this
+    workstream makes after that commit is this document, and a document
+    cannot change a test result.
+  The runs that surfaced the stale assertions of section 13 are recorded in
+  this history: a run against `50e7faf` failed in
+  `src/peer-mutation.test.ts` and surfaced the stale checkpoint assertion,
+  and the per-suite diagnostic against `8bd3973` - every suite of the
+  `test:unit` chain run on its own, recorded in
+  `.tmp-handoff-evidence/unit-each-8bd3973.log` - named the two remaining
+  stale suites (`src/review-checkpoints.filesystem.test.ts` and
+  `src/oauth-store.test.ts`) out of 109. The logs of the earlier full-chain
+  runs of this pass (`.tmp-scratch/test-npm-test-r13.log` through
+  `.tmp-scratch/test-npm-test-r17.log`) were removed by a concurrent cleanup
+  of the untracked scratch directory, so they are no longer on disk and are
+  not cited as evidence here. The logs are local artifacts, not committed.
+  One caveat for a reader who re-runs an isolated tree: it pins
   `@modelcontextprotocol/ext-apps` 1.7.5, while the shared checkout's
-  `node_modules` now carries 2.0.3, so that exact tree needs its own
-  dependency set to compile.
+  `node_modules` now carries 2.0.3, so that tree needs its own dependency
+  set (`npm ci`) to compile.
 - `node --import tsx scripts/scheduled-readonly-adapters-e2e.mjs` — CRUSH and
   Hermes both dispatched and stayed confined.
 - `KONTROL_CADDY_BIN=/tmp/caddy npm run qualify:ingress` — 12 pass,
@@ -912,9 +956,9 @@ Executed in this pass (all from the repository root):
 
 One row per file. These are exactly the files the reviewed range touches,
 and they are the same 34 files that `git diff --name-only 44c247a..858e18f`
-names. One file outside that set is touched by a later commit of this
-workstream - `src/peer-mutation.test.ts`, the stale checkpoint assertion
-fixed in section 13 - and it is listed in its own table below.
+names. Three files outside that set are touched by later commits of this
+workstream - the stale sibling assertions fixed in section 13 - and they are
+listed in their own table below.
 
 | File | Change |
 |------|--------|
@@ -953,11 +997,13 @@ fixed in section 13 - and it is listed in its own table below.
 | `handoff.md` | this record |
 | `HANDOFF.md` | the earlier scheduled-job audit record, updated with the deployment status this pass verified |
 
-### One file outside the reviewed range
+### Three files outside the reviewed range
 
 | File | Change | Commit |
 |------|--------|--------|
 | `src/peer-mutation.test.ts` | the change-tracking assertion now follows the deferred checkpoint contract: the backend is reported as `pending` at open time, and change tracking is claimed only when the backend can actually track changes (section 13) | `7a62023` |
+| `src/review-checkpoints.filesystem.test.ts` | the pinned snapshot shape carries the `checkpointError` slot the checkpoint manager now returns, so the suite asserts that the slot is present and empty in the success case (section 13) | `4535e9f` |
+| `src/oauth-store.test.ts` | the pinned migration list carries the two migrations the sibling commits declared (versions 105 and 106); the list is still pinned exactly (section 13) | `7b5749a` |
 
 ### Suites this change newly executes
 
