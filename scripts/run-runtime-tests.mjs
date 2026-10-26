@@ -45,12 +45,24 @@ function compileRuntimeArtifact() {
   if (!existsSync(readOnlyExecution)) throw new Error("temporary runtime artifact is missing read-only-execution.mjs");
 }
 
+// A suite that spawns a bundled adapter child needs the compiled runtime
+// artifact, not a stale dist/ projection in the checkout: the adapter
+// resolves acp-duplex.js and read-only-execution.mjs from
+// KONTROL_ARTIFACT_PATH and falls back to ../dist/ only when it is unset.
+// The artifact directory is compiled once and stays valid for every later
+// step, so each step that spawns an adapter is given the same directory.
+const artifactSteps = new Set(["test:adapters", "test:lifecycle"]);
+let artifactCompiled = false;
+
 function run(script) {
   // This runner invokes only the repository's fixed npm test scripts.
-  if (script === "test:adapters") compileRuntimeArtifact();
+  if (artifactSteps.has(script) && !artifactCompiled) {
+    compileRuntimeArtifact();
+    artifactCompiled = true;
+  }
   const result = spawnSync(process.execPath, [npmExecPath, "run", script], {
     cwd: root,
-    env: script === "test:adapters"
+    env: artifactSteps.has(script)
       ? { ...env, KONTROL_ARTIFACT_PATH: artifactDirectory }
       : env,
     stdio: "inherit",
