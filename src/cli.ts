@@ -2,7 +2,7 @@
 import { createRequire } from "node:module";
 import { spawnSync } from "node:child_process";
 import { existsSync, lstatSync, readFileSync, realpathSync, rmSync, statSync, statfsSync, writeFileSync } from "node:fs";
-import { stdin as input, stdout as output } from "node:process";
+import { stdin as input, stderr as errorOutput, stdout as output } from "node:process";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as prompts from "@clack/prompts";
@@ -159,20 +159,42 @@ async function runPtyReviewCommand(args: string[]): Promise<void> {
         ...(flagValue(args, "--message") ? { message: flagValue(args, "--message") } : {}),
       },
     });
-    output.write(`${JSON.stringify(submitted.structuredContent ?? submitted)}\n`);
-    if (submitted.isError || args.includes("--no-wait")) return;
+    const submission = submitted.structuredContent as { submissionId?: unknown; status?: unknown } | undefined;
+    if (submitted.isError || !submission || typeof submission.submissionId !== "string" || typeof submission.status !== "string") {
+      errorOutput.write(`${toolErrorText(submitted, "submit_for_review returned an invalid response")}\n`);
+      process.exitCode = 1;
+      return;
+    }
+    output.write(`${JSON.stringify(submitted.structuredContent)}\n`);
+    if (args.includes("--no-wait")) return;
     for (;;) {
       const feedback = await client.callTool({
         name: "await_review_feedback",
         arguments: { sessionId: credential.workSessionId, timeoutMs: 900_000 },
       });
-      output.write(`${JSON.stringify(feedback.structuredContent ?? feedback)}\n`);
-      const status = (feedback.structuredContent as { status?: unknown } | undefined)?.status;
-      if (feedback.isError || status !== "timeout") return;
+      const receipt = feedback.structuredContent as { status?: unknown } | undefined;
+      const status = receipt?.status;
+      if (feedback.isError || !receipt || !["feedback_ready", "transferred", "timeout", "error"].includes(String(status))) {
+        errorOutput.write(`${toolErrorText(feedback, "await_review_feedback returned an invalid response")}\n`);
+        process.exitCode = 1;
+        return;
+      }
+      output.write(`${JSON.stringify(feedback.structuredContent)}\n`);
+      if (status === "error") process.exitCode = 1;
+      if (status !== "timeout") return;
     }
   } finally {
     await client.close().catch(() => undefined);
   }
+}
+
+function toolErrorText(result: unknown, fallback: string): string {
+  const content = result && typeof result === "object" && "content" in result && Array.isArray(result.content)
+    ? result.content as unknown[]
+    : [];
+  const detail = content.flatMap((item) => item && typeof item === "object" && "text" in item
+    && typeof item.text === "string" && item.text.length > 0 ? [item.text] : []).join("\n");
+  return detail || fallback;
 }
 
 function runSnapshotsCommand(args: string[]): Promise<void> {
