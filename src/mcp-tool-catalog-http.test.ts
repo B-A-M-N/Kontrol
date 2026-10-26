@@ -131,7 +131,42 @@ async function modernNotification(method: string, params: Record<string, unknown
   });
 }
 
+const sseReaderBuffers = new WeakMap<ReadableStreamDefaultReader<Uint8Array>, string>();
+async function readSseMessage(reader: ReadableStreamDefaultReader<Uint8Array>, abort: AbortController, expected: string): Promise<any> {
+  let buffered = sseReaderBuffers.get(reader) ?? "";
+  const decoder = new TextDecoder();
+  while (true) {
+    const separator = buffered.search(/\r?\n\r?\n/);
+    if (separator >= 0) {
+      const frame = buffered.slice(0, separator);
+      buffered = buffered.slice(separator).replace(/^\r?\n\r?\n/, "");
+      sseReaderBuffers.set(reader, buffered);
+      const data = frame.split(/\r?\n/).filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trim()).join("\n");
+      if (data) return JSON.parse(data);
+      continue;
+    }
+    const timer = setTimeout(() => abort.abort(new Error(`timed out waiting for modern subscription event: ${expected}`)), 5_000);
+    let chunk: ReadableStreamReadResult<Uint8Array>;
+    try {
+      chunk = await reader.read();
+    } finally {
+      clearTimeout(timer);
+    }
+    if (chunk.done) throw new Error("modern subscription stream ended before the expected event");
+    buffered += decoder.decode(chunk.value, { stream: true });
+  }
+}
+
 try {
+  const modernDiscovery = await modernRpc("server/discover", {}, ++nextId);
+  assert.equal(modernDiscovery.response.status, 200, JSON.stringify(modernDiscovery.payload));
+  assert.ok(modernDiscovery.payload?.result?.supportedVersions?.includes("2026-07-28"),
+    "server/discover advertises the negotiated modern protocol revision");
+  assert.equal(modernDiscovery.payload?.result?.capabilities?.tools?.listChanged, true,
+    "modern server discovery declares tool list change notifications");
+  assert.equal(modernDiscovery.payload?.result?.capabilities?.resources?.listChanged, true,
+    "modern server discovery declares resource list change notifications");
+
   const modernList = await modernRpc("tools/list", {}, ++nextId);
   assert.equal(modernList.response.status, 200, JSON.stringify(modernList.payload));
   const modernFingerprint = fingerprintToolCatalog(modernList.payload?.result);
@@ -160,6 +195,44 @@ try {
   assert.notEqual(modernAfterAck.payload?.error?.code, -32012,
     "modern catalog acknowledgement survives the next stateless HTTP request");
 
+  const modernListenAbort = new AbortController();
+  const modernListenResponse = await fetch(url, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      accept: "text/event-stream",
+      "mcp-protocol-version": "2026-07-28",
+      "mcp-method": "subscriptions/listen",
+      "x-kontrol-tunnel-reviewer": tunnelReviewerSecret,
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: "catalog-listen",
+      method: "subscriptions/listen",
+      params: {
+        notifications: { toolsListChanged: true, resourcesListChanged: true },
+        _meta: modernEnvelope,
+      },
+    }),
+    signal: modernListenAbort.signal,
+  });
+  assert.equal(modernListenResponse.status, 200, `modern subscriptions/listen returned HTTP ${modernListenResponse.status}`);
+  assert.match(modernListenResponse.headers.get("content-type") ?? "", /text\/event-stream/i,
+    "modern subscriptions/listen returns a long-lived SSE response");
+  assert.ok(modernListenResponse.body, "modern subscriptions/listen exposes its response stream");
+  const modernListenReader = modernListenResponse.body.getReader();
+  try {
+    const acknowledged = await readSseMessage(modernListenReader, modernListenAbort, "acknowledgement");
+    assert.equal(acknowledged.method, "notifications/subscriptions/acknowledged",
+      "modern subscription is acknowledged before any change event");
+    assert.deepEqual(acknowledged.params.notifications, { toolsListChanged: true, resourcesListChanged: true });
+    assert.equal(acknowledged.params._meta?.["io.modelcontextprotocol/subscriptionId"], "catalog-listen",
+      "acknowledgement is correlated to this listen request");
+  } catch (error) {
+    modernListenAbort.abort(error);
+    throw error;
+  }
+
   const initialized = await rpc("initialize", {
     protocolVersion: "2025-06-18",
     capabilities: { extensions: { [TOOL_CATALOG_ACK_CAPABILITY]: { contractVersion: 1 } } },
@@ -169,6 +242,21 @@ try {
   const sessionId = initialized.sessionId;
   assert.ok(sessionId, "initialize must return the MCP session ID");
   await notification("notifications/initialized", {}, sessionId);
+  try {
+    const modernRefresh = await readSseMessage(modernListenReader, modernListenAbort, "tool catalog refresh");
+    assert.equal(modernRefresh.method, "notifications/tools/list_changed",
+      "a real catalog refresh reaches the active modern subscription stream");
+    assert.equal(modernRefresh.params?._meta?.["io.modelcontextprotocol/subscriptionId"], "catalog-listen",
+      "modern catalog notifications carry the owning subscription ID");
+    const modernResourceRefresh = await readSseMessage(modernListenReader, modernListenAbort, "resource catalog refresh");
+    assert.equal(modernResourceRefresh.method, "notifications/resources/list_changed",
+      "resource catalog refreshes also reach the active modern subscription stream");
+    assert.equal(modernResourceRefresh.params?._meta?.["io.modelcontextprotocol/subscriptionId"], "catalog-listen",
+      "resource notifications carry the owning subscription ID");
+  } finally {
+    modernListenAbort.abort();
+    await modernListenReader.cancel().catch(() => undefined);
+  }
 
   const beforeAck = await rpc("tools/call", {
     name: "open_workspace",
