@@ -1,6 +1,6 @@
 # Kontrol multipath ingress — remaining work
 
-Updated: 2026-10-26 (fourth revision)
+Updated: 2026-10-26 (fifth revision)
 Repository: `/home/bamn/devspace`
 Branch: `audit-k02-k04`
 Starting HEAD for this revision: `44c247a` (plus the local commits made
@@ -10,7 +10,7 @@ Preserve untracked `.tmp-scratch/`.
 
 ## Local commits (not pushed)
 
-These five commits are local only; nothing was pushed.
+These six commits are local only; nothing was pushed.
 
 | # | Commit | Subject |
 |---|--------|---------|
@@ -18,7 +18,8 @@ These five commits are local only; nothing was pushed.
 | 2 | `c1614a6` | `fix(hermes): give the relocated interpreter its runtime root in the sandbox` |
 | 3 | `bf37f2e` | `fix(ingress): never report an unproven route as tailnet-private` |
 | 4 | `072771a` | `test(chain): execute every test file from the canonical chain` |
-| 5 | this commit | `docs: record the contracts, the origin decision and the continuation record` |
+| 5 | `e5a07c8` | `docs: record the contracts, the origin decision and the continuation record` |
+| 6 | this commit | `docs: correct the round-7 review row and record the round-13 residuals` |
 
 Requirement source:
 `/home/bamn/.codex/attachments/458e9b15-a1ec-4247-aa20-19ec878f9be9/pasted-text-1.txt`
@@ -519,6 +520,55 @@ chain uses a module flag except `python3 -m py_compile`, which compiles a
 file rather than running it.
 
 
+### 12. Round 13 reviewed the committed state, and its two P3 residuals are closed
+
+Round 13 was the first review of the **committed** change rather than of a
+working tree. It reconstructed `44c247a..e5a07c8` with `git archive` into its
+own scratch directory and worked there, because the shared checkout is edited
+concurrently and its working state is not the state under review. It returned
+approve with no P0, P1 or P2 finding, and two P3 residuals.
+
+What round 13 verified, from the code rather than from the prose:
+
+- the change is exactly 34 files, and `git diff --name-only 44c247a..e5a07c8`
+  matches the reviewed file list exactly;
+- each of the five commits contains only files that belong to its stated
+  subject, and neither `.tmp-scratch/` nor the generated
+  `ingress-qualification-matrix.json` is in any commit;
+- the two intermediate `package.json` blobs - the Hermes commit and the
+  canonical-chain commit - each parse as JSON and carry valid `scripts`;
+- `node scripts/test-manifest.mjs` reports "198 test files all executed by the
+  canonical chain (14 scripts, 26 runners)"; `node src/test-manifest.test.mjs`
+  and `node src/package-files-manifest.test.mjs` exit 0; and
+  `npx tsc -p tsconfig.json --noEmit` is clean;
+- `src/ingress/tailscale-status.test.ts`, `src/ingress/profile-status.test.ts`
+  and `src/server/catalog-refresh.test.ts` pass against the reconstructed tree,
+  re-run for this record;
+- the manifest scanner finds a single-quoted, multi-line, side-effect,
+  dynamic-with-options and export-from import of an undeclared sibling module,
+  and ignores a commented-out import and a path that is only data - the
+  sixteen-fixture behaviour `src/package-files-manifest.test.mjs` asserts.
+
+**P3 (a): the round-7 row contradicted the round-9 and round-10 rows.** The
+round-7 row still said its two P3 findings "are nits and are not addressed in
+this pass", while the round-9 and round-10 rows recorded both as closed - the
+shape-recovery scan in section 9, the backoff-timestamp rollback comparison in
+section 10. The round-7 row now says that both were accepted as nits at the
+time, left open in that round, and closed in the later rounds.
+
+**P3 (b): the Workspace App artifact prerequisite was not recorded.** The
+suites that start the server resolve the Workspace App artifact at startup, so
+they need a built artifact. Re-checked directly for this record: in a bare
+source tree with no `dist/ui/workspace-app.html`,
+`src/mcp-tool-catalog-http.test.ts` fails at startup with the resolver's own
+error - "No built Workspace App artifact found" - and with
+`KONTROL_WORKSPACE_APP_HTML_PATH` pointed at a built artifact it passes
+("strict-mode handshake passed"). This is an environment prerequisite, not a
+defect: the canonical chain supplies it, because `scripts/run-runtime-tests.mjs`
+builds the app into a temporary artifact directory and points that variable at
+the build. It is now recorded in the environment notes below.
+
+
 ## Still missing — operator-gated deployment evidence
 
 ### A. Real tailnet deployment evidence
@@ -650,7 +700,7 @@ external failure (not a route mismatch), captured from the public origin.
 
 ## Review rounds
 
-The fix was reviewed twelve times, each round in a fresh session that did not
+The fix was reviewed thirteen times, each round in a fresh session that did not
 write the code. Every round was against the complete diff, not a summary.
 Round 6 covered the whole diff, including the Hermes sandbox changes and
 the documentation, which rounds 1-5 had not seen. Round 7 reviewed the
@@ -668,7 +718,11 @@ confirmed all six round-10 findings closed from the code, and its two P3
 residuals are closed in section 11. Round 12 reviewed the whole diff a
 seventh time, after the round-11 fixes, and returned approve again with no
 P0, P1 or P2 finding; its one P3 is the direction the module flag takes and
-is recorded in section 11.
+is recorded in section 11. Round 13 reviewed the committed state - the five
+commits that make up this change - rather than the shared working tree,
+confirmed that the committed bytes are the reviewed bytes, and returned
+approve with no P0, P1 or P2 finding; its two P3 residuals are closed in
+section 12.
 | Round | Reviewer | Verdict | Outcome |
 |-------|----------|---------|---------|
 | 1 | `glm-5.3-flash` | changes requested | The deferral gate alone was insufficient: the transport could still drop a notification on a stream that ended mid-send. Led to the stale-discard path. |
@@ -677,12 +731,13 @@ is recorded in section 11.
 | 4 | `glm-5.3-flash` | approve with 1 P2, 1 P3 | The successor-stream transition race (a stale send resolving after its surface ended) and a double generation bump on a repeated clear. Both closed by the follow-up pulse, the retry-budget rollback and the idempotent clear. |
 | 5 | `deepseek-v4-flash` | approve with 1 P2, 2 P3 | The abandoned pending stream read in the test helper could surface as an unhandled rejection, and two follow-up pulses could fire when both channels went stale. Both closed: the abandoned read is now consumed, and there is one follow-up per pulse invocation. |
 | 6 | `glm-5.3-flash` | approve, 3 P3 | The Hermes runtime-root assertions were source-regex matches rather than behavioral tests; the adapter launcher stderr was bounded but not scrubbed; and a late teardown could re-arm a successor surface. All three closed: the resolver moved to `scripts/lib/hermes-python-runtime.mjs` with a behavioral test, the stderr passes through `scripts/lib/adapter-diagnostics.mjs`, and the clear is fenced to the generation that owned the surface. |
-| 7 | `glm-5.3-flash` | approve, 2 P2, 2 P3 | The runtime-probe failure message still carried raw child stderr into the scheduled-job receipt (closed in section 4), and the upgraded manifest check still proved execution by mention, so a comment or a self-referencing log line would have counted (closed in section 7). The two P3 findings - the shape-recovery scan accepting any boolean host:port map, and a backoff-timestamp rollback comparison - are nits and are not addressed in this pass. |
+| 7 | `glm-5.3-flash` | approve, 2 P2, 2 P3 | The runtime-probe failure message still carried raw child stderr into the scheduled-job receipt (closed in section 4), and the upgraded manifest check still proved execution by mention, so a comment or a self-referencing log line would have counted (closed in section 7). Its two P3 findings were accepted as nits at the time and left open in that round; both were closed in later rounds - the shape-recovery scan accepting any boolean host:port map (closed in section 9) and the backoff-timestamp rollback comparison (closed in section 10). |
 | 8 | `glm-5.3-flash` | approve, 1 P2, 3 P3 | The script-name array rule still counted an array that a runner only logs or iterates without executing, so the chain could widen without a suite ever running (closed in section 8); a helper whose name merely sounded like a spawn was accepted as a spawn (closed in section 8); the ingress attribution change carried cosmetic whitespace churn (removed); the source-pattern assertions in the Hermes adapter test were noted and kept, because that file uses that style and the behavioural coverage lives in `src/adapter-diagnostics.test.mjs`. |
 | 9 | `glm-5.3-flash` | changes requested | The check counted a suite path quoted inside a log message as executed (closed in section 9); it counted a path carried as data — an environment value — as executed (closed in section 9); the call graph ignored a spawn helper that lives in an imported local module (closed in section 9); the ingress exposure recovery accepted any boolean HostPort map and so guessed (closed in section 9); the documentation described a per-route rule while the code is per-profile (aligned in section 9); the unspawnable-runner case did not isolate the import rule (closed in section 9). |
 | 10 | `glm-5.3-flash` | changes requested | The check never stripped shell comments from a package.json script body, so a suite named behind a `#` counted as executed (closed in section 10); every token after the interpreter was an executable position, so a flag value that named a suite counted (closed in section 10); an incomplete exposure attribution fell through to the mismatch branch and reported a positive MISMATCH derived from a dropped signal (closed in section 10); an unreadable HostPort key was skipped instead of refused, so shape drift still read as private (closed in section 10); the Hermes adapter carried undeclared, untested `context_transfer` hunks that relaxed a fail-closed continuation gate (reverted in section 10); the dead `firstBoolean()` helper was removed and the uncovered backoff-timestamp restore was asserted (closed in section 10). |
 | 11 | `glm-5.3-flash` | approve, 2 P3 | The manifest guard matched only a double-quoted, single-line import, so four import forms that would ship an undeclared sibling module went unseen (closed in section 11); an interpreter flag outside the hardcoded value-flag set was guessed rather than refused (closed in section 11); the source-pattern assertions in the Hermes adapter test were noted and kept, because that file uses that style and the behavioural coverage lives in `src/adapter-diagnostics.test.mjs`. |
 | 12 | `glm-5.3-flash` | approve, 1 P3 | The two round-11 findings are confirmed closed with the reviewer's own fixtures: the package-manifest scanner finds a single-quoted, multi-line, side-effect, dynamic-with-options and export-from import of an undeclared sibling module, and ignores a commented-out import and a path that is only data; the interpreter-flag rule refuses an unclassified flag, keeps a classified flag value off the program, leaves the program in place after a boolean flag, and treats a python module flag as naming the program (all closed in section 11). The one P3 is the direction the module flag takes - a suite reachable only through one is reported as unexecuted rather than credited - which fails closed and is now stated in the contract. |
+| 13 | `glm-5.3-flash` | approve, 2 P3 | The change was reviewed as the committed state rather than as a working tree: the five commits contain exactly the 34 reviewed files, each commit holds only files that belong to its subject, the two intermediate `package.json` blobs parse, and the checks were re-run against a reconstruction of the committed tree (closed in section 12). The two P3 findings are documentation residuals: the round-7 row still claimed its two P3 findings were unaddressed, and the Workspace App artifact prerequisite of the server-starting suites was not recorded (closed in section 12). |
 
 
 The mutation table in section 1 is the executable form of these reviews: each
@@ -698,6 +753,10 @@ Executed in this pass (all from the repository root):
 - `npx tsc -p tsconfig.json --noEmit` — clean.
 - `npx tsx src/mcp-tool-catalog-http.test.ts` — passes with the fix; fails
   again with the gate removed (verified by temporarily reverting it).
+- the same suite run directly in a bare tree — fails at startup with the
+  resolver's own "No built Workspace App artifact found" error, and passes
+  when `KONTROL_WORKSPACE_APP_HTML_PATH` points at a built artifact; the
+  canonical chain supplies that artifact (section 12).
 - `npm run test:manifest` — `EXIT=0`: **198 test files all executed by the
   canonical chain** (14 scripts, 26 runners). Run against the committed
   `HEAD` tree, the same check names the 13 suites that were reachable but
@@ -825,3 +884,9 @@ Executed in this pass (all from the repository root):
   this pass contains only the files this change owns, and the
   verification run was executed against an isolated tree that holds
   `HEAD` plus exactly this change.
+- A suite that starts the server needs a built Workspace App artifact. In a
+  checkout without `dist/ui/workspace-app.html` it fails at startup with
+  "No built Workspace App artifact found"; run `npm run build:app` first, or
+  point `KONTROL_WORKSPACE_APP_HTML_PATH` at a built artifact. The canonical
+  chain needs no preparation, because `scripts/run-runtime-tests.mjs` builds
+  the app into a temporary artifact directory and points the variable at it.
