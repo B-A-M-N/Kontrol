@@ -576,7 +576,11 @@ export function renderOpenMessages(container: HTMLElement, view: WorkSessionView
         ? "Agent received reply"
         : message.replyStatus === "blocked"
           ? "Cannot deliver automatically"
-          : "Reply saved — awaiting agent acknowledgement";
+          : message.replyStatus === "reconciliation_required"
+            ? "Delivery uncertain — reconciliation required"
+            : message.replyStatus === "dispatching"
+              ? "Sending reply to the agent"
+              : "Reply delivered — awaiting agent acknowledgement";
       card.append(element("div", { className: "message-reply-status", text: replyStatusText }));
       if (message.replyBody) {
         card.append(element("div", { className: "message-reply-body", text: message.replyBody }));

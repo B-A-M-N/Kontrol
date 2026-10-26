@@ -95,6 +95,7 @@ if (!AGENT_COMMAND) {
 const active = new Map();
 const ownedProcesses = new Map();
 let agentIdentity = null;
+let nativeReplyResumeSupported = false;
 const eventSpool = createAdapterEventSpool({
   eventPath: EVENT_SPOOL_PATH,
   terminalPath: TERMINAL_SPOOL_PATH,
@@ -183,7 +184,9 @@ async function registerAgent() {
     "duplex-json-rpc",
     "reverse-permissions",
     "review-barrier",
-    ...String(process.env.ACP_STDIO_CAPABILITIES || "").split(",").map((s) => s.trim()).filter(Boolean),
+    ...String(process.env.ACP_STDIO_CAPABILITIES || "").split(",").map((s) => s.trim())
+      .filter((capability) => capability && capability !== "native-reply-resume"),
+    ...(nativeReplyResumeSupported ? ["native-reply-resume"] : []),
   ];
   const res = await fetch(`${KONTROL_ACP_URL}/agents/register`, {
     method: "POST",
@@ -620,6 +623,15 @@ async function dispatchTurn(run) {
     }
     run.acpProtocolVersion = protocolVersion;
     const supportsSessionLoad = initialization.agentCapabilities?.loadSession === true;
+    if (!DISPATCH_METHOD && (protocolVersion === 2 || supportsSessionLoad) && !nativeReplyResumeSupported) {
+      nativeReplyResumeSupported = true;
+      try {
+        await registerAgentWithRetry();
+      } catch (error) {
+        nativeReplyResumeSupported = false;
+        console.warn(`[stdio-duplex] native reply resume capability registration failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
     const cwd = run.readOnlyAudit ? "/workspace" : run.workspaceRoot;
     const bindingScope = run.contextTransfer?.id
       ? `${run.workSessionId}:transfer:${run.contextTransfer.id}`

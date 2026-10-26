@@ -22,6 +22,12 @@ try {
     const timestamp = `2026-01-${String(1 + Math.floor(index / 20)).padStart(2, "0")}T00:00:00.000Z`;
     insertReply.run(`reply-${String(index).padStart(3, "0")}`, id, "a".repeat(64), timestamp);
   }
+  insertMessage.run("message-correlated", "2026-01-20T00:00:00.000Z");
+  db.sqlite.prepare(`insert into agent_message_replies (
+    id, message_id, work_session_id, body, body_sha256, reviewer_principal_id, status,
+    delivery_dispatch_idempotency_key, delivery_run_id, delivery_attempt_number, delivery_remote_run_id, created_at
+  ) values ('reply-correlated', 'message-correlated', 'session', 'reply', ?, 'reviewer', 'delivering',
+    'reply_dispatch_exact', 'run_exact', 4, 'remote_exact', '2026-01-20T00:00:00.000Z')`).run("d".repeat(64));
   let after: { createdAt: string; id: string } | undefined;
   let reconciled = 0;
   for (;;) {
@@ -30,9 +36,18 @@ try {
     if (!page.next) break;
     after = page.next;
   }
-  assert.equal(reconciled, 250, "ascending keyset pagination reaches every stranded reply across timestamp collisions");
-  assert.equal((db.sqlite.prepare("select count(*) as count from agent_message_replies where status = 'pending_delivery'").get() as { count: number }).count, 250);
-  assert.equal(reconcileReplyDeliveryPage(db, undefined, 100).reconciled, 0, "a second restart reconciliation does not recover acknowledged delivery rows twice");
+  assert.equal(reconciled, 251, "ascending keyset pagination reaches every accepted reply across timestamp collisions");
+  assert.equal((db.sqlite.prepare("select count(*) as count from agent_message_replies where status = 'awaiting_acknowledgement'").get() as { count: number }).count, 251);
+  assert.deepEqual(db.sqlite.prepare(`select status, delivery_dispatch_idempotency_key as dispatchKey,
+    delivery_run_id as runId, delivery_attempt_number as attemptNumber, delivery_remote_run_id as remoteRunId
+    from agent_message_replies where id = 'reply-correlated'`).get(), {
+    status: "awaiting_acknowledgement",
+    dispatchKey: "reply_dispatch_exact",
+    runId: "run_exact",
+    attemptNumber: 4,
+    remoteRunId: "remote_exact",
+  }, "startup recovery preserves the accepted dispatch's exact correlation identity");
+  assert.equal(reconcileReplyDeliveryPage(db, undefined, 100).reconciled, 0, "a second restart reconciliation does not replay accepted replies");
 
   // A terminal parent closes its handoff; a live parent is retained. The left
   // join also lets corrupted/orphaned references be classified and closed.

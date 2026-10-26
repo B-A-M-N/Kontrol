@@ -116,7 +116,19 @@ const migrations: Migration[] = [
   { version: 102, name: "acp-run-exact-input-task", up: migrateAcpRunExactInputTask },
   { version: 103, name: "review-browser-binding-revision-fence", up: migrateReviewBrowserBindingRevisionFence },
   { version: 104, name: "scheduled-job-peer-pull-target", up: migrateScheduledJobPeerPullTarget },
+  { version: 105, name: "durable-agent-reply-dispatch-ack", up: migrateAgentReplyDispatchAck },
 ];
+
+function migrateAgentReplyDispatchAck(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "agent_message_replies", "delivery_dispatch_idempotency_key", "text");
+  addColumnIfMissing(sqlite, "agent_message_replies", "delivery_run_id", "text");
+  addColumnIfMissing(sqlite, "agent_message_replies", "delivery_attempt_number", "integer");
+  addColumnIfMissing(sqlite, "agent_message_replies", "delivery_remote_run_id", "text");
+  // Previous `delivering` rows only followed an adapter acceptance receipt.
+  // Preserve that fact across restart instead of making an accepted reply look
+  // like work that has not yet been dispatched.
+  sqlite.exec("update agent_message_replies set status = 'awaiting_acknowledgement' where status = 'delivering'");
+}
 
 function migrateScheduledJobPeerPullTarget(sqlite: Database.Database): void {
   addColumnIfMissing(sqlite, "scheduled_jobs", "dispatch_target", "text not null default 'direct_acp'");
@@ -2407,7 +2419,7 @@ function migrateExternalCatalogObservationsAndAssociations(sqlite: Database.Data
 
 function addColumnIfMissing(
   sqlite: Database.Database,
-  table: "workspace_sessions" | "work_sessions" | "work_session_submissions" | "work_session_feedback" | "agent_registry" | "continuations" | "acp_runs" | "agent_webhook_queue" | "dispatch_outbox" | "approval_requests" | "mission_evidence" | "event_log" | "supervisor_runs" | "mission_acceptance_criteria" | "mission_review_findings" | "mission_contracts" | "mission_completion_reports" | "scheduled_jobs" | "scheduled_job_attempts" | "review_routes" | "review_handoffs" | "review_threads" | "review_browser_turns" | "review_browser_profiles" | "mission_outcome_observations",
+  table: "workspace_sessions" | "work_sessions" | "work_session_submissions" | "work_session_feedback" | "agent_registry" | "continuations" | "acp_runs" | "agent_webhook_queue" | "dispatch_outbox" | "approval_requests" | "mission_evidence" | "event_log" | "supervisor_runs" | "mission_acceptance_criteria" | "mission_review_findings" | "mission_contracts" | "mission_completion_reports" | "scheduled_jobs" | "scheduled_job_attempts" | "review_routes" | "review_handoffs" | "review_threads" | "review_browser_turns" | "review_browser_profiles" | "mission_outcome_observations" | "agent_message_replies",
   column: string,
   definition: string,
 ): void {

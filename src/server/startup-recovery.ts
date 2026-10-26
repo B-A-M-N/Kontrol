@@ -60,7 +60,7 @@ export function reconcileReplyDeliveryPage(db: DatabaseHandle, after?: { created
       and (? is null or created_at > ? or (created_at = ? and id > ?))
     order by created_at, id limit ?`).all(after?.createdAt ?? null, after?.createdAt ?? null,
       after?.createdAt ?? null, after?.id ?? null, limit) as Array<{ id: string; created_at: string }>;
-  for (const reply of page) db.sqlite.prepare("update agent_message_replies set status = 'pending_delivery' where id = ? and status = 'delivering'").run(reply.id);
+  for (const reply of page) db.sqlite.prepare("update agent_message_replies set status = 'awaiting_acknowledgement' where id = ? and status = 'delivering'").run(reply.id);
   const last = page.at(-1);
   return { reconciled: page.length, ...(page.length === limit && last ? { next: { createdAt: last.created_at, id: last.id } } : {}) };
 }
@@ -192,9 +192,9 @@ export function createStartupReconciliation(deps: StartupRecoveryDeps): StartupR
   // work-session grants never survive the terminal boundary. Select only IDs
   // and page the history so startup does not hydrate a bounded projection and
   // silently miss older terminal sessions.
-  // Replies survive process restart. Mark delivery rows left in `delivering`
-  // back to pending_delivery so the outbox can redrive them; acknowledged rows
-  // are terminal and historical pending rows remain intentionally visible.
+  // Replies survive restart. `delivering` was recorded only after an adapter
+  // acceptance receipt, so preserve that fact and await the worker's exact ack
+  // instead of making an already dispatched reply eligible for another send.
   const reconcileReplyPage = (after?: { createdAt: string; id: string }): void => {
     if (startupRecoveryStopped) return;
     const page = reconcileReplyDeliveryPage(db, after);

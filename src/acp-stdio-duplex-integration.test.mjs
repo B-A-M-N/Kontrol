@@ -12,12 +12,14 @@ const state = await mkdtemp(join(tmpdir(), "kontrol-stdio-integration-"));
 const workspaceRoot = join(state, "workspace");
 await mkdir(workspaceRoot);
 const events = [];
+const capabilityRegistrations = [];
 const acceptedEventIds = new Set();
 const control = createServer(async (req, res) => {
   const chunks = [];
   for await (const chunk of req) chunks.push(Buffer.from(chunk));
   const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : {};
   if (req.url?.endsWith("/agents/register")) {
+    capabilityRegistrations.push(body.capabilities ?? []);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ id: "stdio-test-agent", agentCredential: "stdio-test-credential" }));
     return;
@@ -83,6 +85,7 @@ const spawnAdapter = (enableV2 = false, forceV1 = false, agentCode = childCode) 
     KONTROL_READ_ONLY_AGENT_ENV_ALLOWLIST: "READ_ONLY_TEST",
     READ_ONLY_TEST: "1",
     ACP_STDIO_AGENT_NAME: "stdio-test-agent",
+    ACP_STDIO_CAPABILITIES: "native-reply-resume",
     ACP_STDIO_COMMAND: process.execPath,
     ACP_STDIO_ARGS_JSON: JSON.stringify(["-e", agentCode, ...(forceV1 ? ["force-v1"] : [])]),
     ACP_STDIO_DISPATCH_METHOD: "",
@@ -104,6 +107,8 @@ try {
     } catch { /* adapter is still starting */ }
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
+  assert.equal(capabilityRegistrations[0]?.includes("native-reply-resume"), false,
+    "operator-provided capability strings cannot claim reply resume before ACP support is negotiated");
   const emptyResponse = await fetch(`http://127.0.0.1:${adapterPort}/runs`, {
     method: "POST",
     headers: { "content-type": "application/json", authorization: "Bearer adapter-secret" },
@@ -140,6 +145,8 @@ try {
   const protocolOutput = JSON.stringify(protocolResult.payload);
   assert.match(protocolOutput, /Audit report: café 🌲\\nFindings persisted\./, "generic adapter records the authoritative multiline Unicode prompt response");
   const terminalEvent = events.find((event) => event.type === "completed");
+  assert.ok(capabilityRegistrations.at(-1)?.includes("native-reply-resume"),
+    "a session-load-capable ACP child is registered for native reply resume after negotiation");
   assert.equal(terminalEvent?.payload.final_output, "Audit report: café 🌲\nFindings persisted.",
     "the terminal lifecycle event carries the exact attempt-scoped ACP report");
   assert.equal(terminalEvent?.dispatch_idempotency_key, "stdio-normal-dispatch");

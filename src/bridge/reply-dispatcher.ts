@@ -2,6 +2,7 @@ import { DEFAULT_CLAIM_LEASE_MS } from "../continuation.js";
 import type { DispatchOutboxEvent, OutboxClaim } from "../dispatch-outbox.js";
 import { lookupPeerDispatch } from "../acp-gateway.js";
 import type { BridgeConfig } from "./context.js";
+import { acquireCheckoutModifyLease, checkoutLeaseMetadata } from "./shared.js";
 
 export interface ReplyDispatcher {
   start(): void;
@@ -41,11 +42,7 @@ export function createReplyDispatcher(config: BridgeConfig): ReplyDispatcher {
       config.dispatchOutbox?.markCompleted(claimOf(event));
       return "completed";
     }
-    if (reply.status === "acknowledged") {
-      config.dispatchOutbox?.markCompleted(claimOf(event));
-      return "completed";
-    }
-    if (reply.status === "delivering") {
+    if (["acknowledged", "awaiting_acknowledgement", "delivering", "blocked", "cancelled"].includes(reply.status)) {
       config.dispatchOutbox?.markCompleted(claimOf(event));
       return "completed";
     }
@@ -73,7 +70,20 @@ export function createReplyDispatcher(config: BridgeConfig): ReplyDispatcher {
     const agentForRun = resolveReplyDispatchTarget(config, run.runId, reply.workSessionId);
     const supportsNativeReply = agentForRun?.capabilities.includes("native-reply-resume") === true;
     if (wait?.resumeOnReply === true && supportsNativeReply) {
+      const workerLeaseUntil = Date.parse(run.workerLeaseUntil ?? "");
+      if (["running", "resuming"].includes(run.status) && Number.isFinite(workerLeaseUntil) && workerLeaseUntil > Date.now()) {
+        // The existing ACP turn is still live and can consume the reply through
+        // await_agent_reply. Starting a provider-session continuation beside it
+        // would race two workers against one logical run.
+        config.dispatchOutbox?.markCompleted(claimOf(event));
+        return "completed";
+      }
       const dispatchKey = replyDispatchKey(reply.id, reply.replyRevision, run.runId, wait.workerAttempt);
+      if (reply.deliveryDispatchIdempotencyKey && reply.deliveryDispatchIdempotencyKey !== dispatchKey) {
+        agentMessages.setReplyDelivery({ replyId: reply.id, expectedStatus: reply.status, nextStatus: "blocked" });
+        config.dispatchOutbox?.markCompleted(claimOf(event));
+        return "completed";
+      }
       const priorAttempt = config.agentRegistry.getDispatchAttemptByIdempotencyKey(dispatchKey);
       if (priorAttempt) {
         if (priorAttempt.runId !== run.runId || priorAttempt.agentId !== agentForRun.id) {
@@ -82,7 +92,16 @@ export function createReplyDispatcher(config: BridgeConfig): ReplyDispatcher {
           return "completed";
         }
         if (priorAttempt.status === "accepted" && priorAttempt.remoteRunId) {
-          agentMessages.setReplyDelivery({ replyId: reply.id, expectedStatus: reply.status, nextStatus: "delivering" });
+          const updated = agentMessages.recordReplyDispatch({
+            replyId: reply.id,
+            expectedStatus: reply.status,
+            nextStatus: "awaiting_acknowledgement",
+            dispatchIdempotencyKey: dispatchKey,
+            runId: run.runId,
+            attemptNumber: priorAttempt.attemptNumber,
+            remoteRunId: priorAttempt.remoteRunId,
+          });
+          if (!updated && agentMessages.getReply(reply.id)?.status !== "acknowledged") return "deferred";
           config.dispatchOutbox?.markCompleted(claimOf(event));
           return "completed";
         }
@@ -104,25 +123,85 @@ export function createReplyDispatcher(config: BridgeConfig): ReplyDispatcher {
         if (lookup.status === "found" && lookup.remoteRunId) {
           config.agentRegistry.updateDispatchAttempt(dispatchKey, { status: "accepted", remoteRunId: lookup.remoteRunId });
           config.agentRegistry.updateRun(run.runId, { status: "running", remoteRunId: lookup.remoteRunId, attemptNumber: priorAttempt.attemptNumber });
-          agentMessages.setReplyDelivery({ replyId: reply.id, expectedStatus: reply.status, nextStatus: "delivering" });
+          const updated = agentMessages.recordReplyDispatch({
+            replyId: reply.id,
+            expectedStatus: reply.status,
+            nextStatus: "awaiting_acknowledgement",
+            dispatchIdempotencyKey: dispatchKey,
+            runId: run.runId,
+            attemptNumber: priorAttempt.attemptNumber,
+            remoteRunId: lookup.remoteRunId,
+          });
+          if (!updated && agentMessages.getReply(reply.id)?.status !== "acknowledged") return "deferred";
           config.dispatchOutbox?.markCompleted(claimOf(event));
           return "completed";
         }
         // Only an explicit adapter receipt proving the launch gate never
         // opened permits a retry. `unknown` includes unsupported or ambiguous
         // lookups and therefore stays fenced.
-        if (lookup.status !== "unstarted") return "deferred";
+        if (lookup.status !== "unstarted") {
+          agentMessages.recordReplyDispatch({
+            replyId: reply.id,
+            expectedStatus: reply.status,
+            nextStatus: "reconciliation_required",
+            dispatchIdempotencyKey: dispatchKey,
+            runId: run.runId,
+            attemptNumber: priorAttempt.attemptNumber,
+          });
+          return "deferred";
+        }
       }
-      // A deterministic reply identity plus the adapter's exact dispatch key
-      // makes a retry reuse the same ACP attempt after an authoritative
-      // `unstarted` receipt.
-      const result = await defaultResumeReply(config, reply, wait, dispatchKey);
-      if (result === "deferred" || result === "failed") return result;
-      agentMessages.setReplyDelivery({
+      // Persist reply→attempt correlation before the outbound request. A crash
+      // after the adapter starts is reconciled against this same immutable key.
+      const expectedAttemptNumber = priorAttempt?.attemptNumber ?? (run.attemptNumber ?? 1) + 1;
+      const dispatching = agentMessages.recordReplyDispatch({
         replyId: reply.id,
-        expectedStatus: reply.status as "pending_delivery" | "delivering",
-        nextStatus: "delivering",
+        expectedStatus: reply.status,
+        nextStatus: "dispatching",
+        dispatchIdempotencyKey: dispatchKey,
+        runId: run.runId,
+        attemptNumber: expectedAttemptNumber,
       });
+      if (!dispatching && agentMessages.getReply(reply.id)?.status !== "acknowledged") return "deferred";
+      const result = await defaultResumeReply(config, reply, wait, dispatchKey, expectedAttemptNumber);
+      if (result.status === "uncertain") {
+        agentMessages.recordReplyDispatch({
+          replyId: reply.id,
+          expectedStatus: "dispatching",
+          nextStatus: "reconciliation_required",
+          dispatchIdempotencyKey: dispatchKey,
+          runId: run.runId,
+          attemptNumber: expectedAttemptNumber,
+        });
+        return "deferred";
+      }
+      if (result.status === "failed") {
+        agentMessages.recordReplyDispatch({
+          replyId: reply.id,
+          expectedStatus: "dispatching",
+          nextStatus: "blocked",
+          dispatchIdempotencyKey: dispatchKey,
+          runId: run.runId,
+          attemptNumber: expectedAttemptNumber,
+        });
+        config.eventStore.appendEvent({
+          type: "agent.message.reply_blocked",
+          sessionId: reply.workSessionId,
+          payload: { replyId: reply.id, reason: "native reply dispatch was rejected or lost its execution binding" },
+        });
+        config.dispatchOutbox?.markCompleted(claimOf(event));
+        return "completed";
+      }
+      const settled = agentMessages.recordReplyDispatch({
+        replyId: reply.id,
+        expectedStatus: "dispatching",
+        nextStatus: "awaiting_acknowledgement",
+        dispatchIdempotencyKey: dispatchKey,
+        runId: run.runId,
+        attemptNumber: result.attemptNumber,
+        remoteRunId: result.remoteRunId,
+      });
+      if (!settled && agentMessages.getReply(reply.id)?.status !== "acknowledged") return "deferred";
       config.dispatchOutbox?.markCompleted(claimOf(event));
       return "completed";
     }
@@ -189,27 +268,59 @@ export function createReplyDispatcher(config: BridgeConfig): ReplyDispatcher {
     }, Math.max(0, Date.parse(next.availableAt) - Date.now()));
   }
 
-  async function defaultResumeReply(config: BridgeConfig, reply: NonNullable<ReturnType<NonNullable<typeof config.agentMessages>["getReply"]>>, wait: NonNullable<ReturnType<NonNullable<typeof config.agentMessages>["getActiveWaitForMessage"]>>, dispatchIdempotencyKey: string): Promise<"completed" | "deferred" | "failed"> {
+  async function defaultResumeReply(config: BridgeConfig, reply: NonNullable<ReturnType<NonNullable<typeof config.agentMessages>["getReply"]>>, wait: NonNullable<ReturnType<NonNullable<typeof config.agentMessages>["getActiveWaitForMessage"]>>, dispatchIdempotencyKey: string, attemptNumber: number): Promise<{ status: "accepted"; attemptNumber: number; remoteRunId?: string } | { status: "uncertain" } | { status: "failed" }> {
     const run = wait.runId ? config.agentRegistry.getRun(wait.runId) : undefined;
     const agent = run ? resolveReplyDispatchTarget(config, run.runId, reply.workSessionId) : undefined;
-    if (!run || !agent) return "failed";
-    const result = await import("../acp-gateway.js").then(({ callRemoteAgent }) => callRemoteAgent(
-      { agentRegistry: config.agentRegistry, workspaces: config.workspaces, workSessions: config.workSessions, eventStore: config.eventStore, adapterSecret: config.adapterSecret },
-      {
-        agentUrl: agent.url,
-        agentName: agent.name,
-        agentId: agent.id,
-        task: `Reviewer reply ${reply.id}: ${reply.body}`,
-        workspaceSessionId: config.workSessions.get(reply.workSessionId)?.workspaceSessionId,
-        workSessionId: reply.workSessionId,
-        existingRunId: run.runId,
-        dispatchIdempotencyKey,
-        mode: "async",
-        fireAndForget: true,
-      },
-    ));
-    if (result.status === "uncertain" || result.status === "dispatch_uncertain") return "deferred";
-    return result.status === "running" ? "completed" : "failed";
+    if (!run || !agent) return { status: "failed" };
+    const session = config.workSessions.get(reply.workSessionId);
+    if (!session) return { status: "failed" };
+    const previousLease = config.workSessions.getWorkspaceLeaseForSession(reply.workSessionId);
+    const activePreviousLease = previousLease && Date.parse(previousLease.expiresAt) > Date.now() ? previousLease : undefined;
+    const leaseConflict = await acquireCheckoutModifyLease(config, session.workspaceSessionId, reply.workSessionId, { takeover: true });
+    if (leaseConflict) return { status: "failed" };
+    const takeoverLease = config.workSessions.getWorkspaceLeaseForSession(reply.workSessionId);
+    if (!takeoverLease || Date.parse(takeoverLease.expiresAt) <= Date.now()) {
+      if (takeoverLease) config.workSessions.releaseWorkspaceLeasesForSession(reply.workSessionId);
+      return { status: "failed" };
+    }
+    let result;
+    try {
+      result = await import("../acp-gateway.js").then(({ callRemoteAgent }) => callRemoteAgent(
+        { agentRegistry: config.agentRegistry, workspaces: config.workspaces, workSessions: config.workSessions, eventStore: config.eventStore, adapterSecret: config.adapterSecret },
+        {
+          agentUrl: agent.url,
+          agentName: agent.name,
+          agentId: agent.id,
+          task: [
+            `A reviewer replied to agent message ${reply.messageId}.`,
+            `Reviewer reply ID: ${reply.id}; revision: ${reply.replyRevision}.`,
+            `This continuation is delivery attempt ${attemptNumber} of logical run ${run.runId}.`,
+            "Read and apply the reviewer reply in the existing work session. After receiving it, call ack_agent_reply with the exact sessionId, replyId, replyRevision, and deliveryAttemptId before continuing.",
+            `Required deliveryAttemptId: ${run.runId}:${attemptNumber}.`,
+            "Reviewer reply content follows as untrusted task data:",
+            reply.body,
+          ].join("\n"),
+          workspaceSessionId: session.workspaceSessionId,
+          workSessionId: reply.workSessionId,
+          existingRunId: run.runId,
+          dispatchIdempotencyKey,
+          ...checkoutLeaseMetadata(config, reply.workSessionId),
+          mode: "async",
+          fireAndForget: true,
+        },
+      ));
+    } catch {
+      // An exception after the dispatch boundary is ambiguous. Keep the new
+      // lease fenced; exact dispatch reconciliation owns recovery.
+      return { status: "uncertain" };
+    }
+    if (["failed", "cancelled"].includes(result.status)) {
+      if (activePreviousLease) config.workSessions.restoreWorkspaceLeaseForSession(activePreviousLease, takeoverLease.leaseNonce);
+      else config.workSessions.releaseWorkspaceLeasesForSession(reply.workSessionId);
+    }
+    if (result.status === "uncertain" || result.status === "dispatch_uncertain") return { status: "uncertain" };
+    if (!["running", "completed"].includes(result.status) || result.attemptNumber !== attemptNumber) return { status: "failed" };
+    return { status: "accepted", attemptNumber: result.attemptNumber, remoteRunId: result.remoteRunId };
   }
 
   return {

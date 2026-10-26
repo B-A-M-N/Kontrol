@@ -73,6 +73,7 @@ const WORKER_TOOLS = new Set([
   "get_continuation_prompt",
   "check_review_status",
   "get_review_submission",
+  "ack_agent_reply",
   "cancel_work_session",
 ]);
 
@@ -83,6 +84,7 @@ for (const name of REQUIRED_WORKER_INSPECTION_TOOLS) {
   if (!WORKER_TOOLS.has(name)) throw new Error("worker bridge is missing required inspection capability: " + name);
 }
 if (!WORKER_TOOLS.has("poll_process")) throw new Error("worker bridge is missing process polling capability");
+if (!WORKER_TOOLS.has("ack_agent_reply")) throw new Error("worker bridge is missing bounded reply acknowledgement capability");
 
 if (process.argv.includes("--validate-imports")) {
   console.log("[mcp-stdio-bridge] import and worker tool-surface validation ok");

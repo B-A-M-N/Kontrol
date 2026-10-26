@@ -15,6 +15,10 @@ assert.match(adapter, /approvals\/\$\{approvalId\}\/decision/);
 assert.match(adapter, /ACP_STDIO_COMMAND/);
 assert.match(adapter, /ACP_STDIO_DISPATCH_METHOD/);
 assert.match(adapter, /run\.conn\.request\("initialize"/);
+assert.match(adapter, /nativeReplyResumeSupported = true/,
+  "the adapter advertises native reply resume only after ACP session-resume support is negotiated");
+assert.match(adapter, /capability !== "native-reply-resume"/,
+  "environment capability overrides cannot falsely claim native reply resume support");
 assert.match(adapter, /run\.conn\.request\("session\/new"/);
 assert.match(adapter, /prompt: \[\{ type: "text", text: run\.task \}\]/);
 assert.match(adapter, /validateReadOnlyDispatchRequest/);
