@@ -137,23 +137,45 @@ async function runPtyReviewCommand(args: string[]): Promise<void> {
     || typeof credential.workSessionId !== "string") {
     throw new Error("PTY review credential file is malformed.");
   }
+  const credentialToken = credential.token;
   const endpoint = new URL(credential.mcpUrl);
-  if (endpoint.protocol !== "http:" || !["127.0.0.1", "localhost", "[::1]"].includes(endpoint.hostname)) {
+  if (endpoint.protocol !== "http:" || !["127.0.0.1", "localhost", "[::1]"].includes(endpoint.hostname)
+    || endpoint.pathname !== "/mcp" || endpoint.search || endpoint.hash) {
     throw new Error("PTY review endpoint must be loopback HTTP.");
   }
-  const client = new Client({ name: "kontrol-pty-review", version: "1.0.0" });
-  const transport = new StreamableHTTPClientTransport(endpoint, {
-    requestInit: { headers: { "x-kontrol-worker-token": credential.token } },
-    reconnectionOptions: {
-      maxRetries: 0,
-      initialReconnectionDelay: 100,
-      maxReconnectionDelay: 1_000,
-      reconnectionDelayGrowFactor: 1.5,
-    },
-  });
+  let client: Client | undefined;
+  const connectWithRenewedCredential = async () => {
+    const renewal = await fetch(new URL("/pty-review/renew", endpoint), {
+      method: "POST",
+      headers: { "x-kontrol-worker-token": credentialToken },
+      signal: AbortSignal.timeout(5_000),
+    });
+    const renewed = await renewal.json().catch(() => undefined) as { token?: unknown } | undefined;
+    if (!renewal.ok || typeof renewed?.token !== "string") {
+      throw new Error(`PTY review credential renewal failed (${renewal.status}).`);
+    }
+    const renewedToken = renewed.token as string;
+    const nextClient = new Client({ name: "kontrol-pty-review", version: "1.0.0" });
+    const transport = new StreamableHTTPClientTransport(endpoint, {
+      requestInit: { headers: { "x-kontrol-worker-token": renewedToken } },
+      reconnectionOptions: {
+        maxRetries: 0,
+        initialReconnectionDelay: 100,
+        maxReconnectionDelay: 1_000,
+        reconnectionDelayGrowFactor: 1.5,
+      },
+    });
+    try {
+      await nextClient.connect(transport);
+      client = nextClient;
+    } catch (error) {
+      await nextClient.close().catch(() => undefined);
+      throw error;
+    }
+  };
   try {
-    await client.connect(transport);
-    const submitted = await client.callTool({
+    await connectWithRenewedCredential();
+    const submitted = await client!.callTool({
       name: "submit_for_review",
       arguments: {
         sessionId: credential.workSessionId,
@@ -169,7 +191,7 @@ async function runPtyReviewCommand(args: string[]): Promise<void> {
     output.write(`${JSON.stringify(submission.receipt)}\n`);
     if (args.includes("--no-wait")) return;
     for (;;) {
-      const feedback = await client.callTool({
+      const feedback = await client!.callTool({
         name: "await_review_feedback",
         arguments: { sessionId: credential.workSessionId, timeoutMs: 900_000 },
       });
@@ -181,9 +203,12 @@ async function runPtyReviewCommand(args: string[]): Promise<void> {
       }
       output.write(`${JSON.stringify(received.receipt)}\n`);
       if (received.status !== "timeout") return;
+      await client!.close().catch(() => undefined);
+      client = undefined;
+      await connectWithRenewedCredential();
     }
   } finally {
-    await client.close().catch(() => undefined);
+    await client?.close().catch(() => undefined);
   }
 }
 

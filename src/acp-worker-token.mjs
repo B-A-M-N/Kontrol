@@ -4,6 +4,7 @@
 export {
   signWorkerToken,
   verifyWorkerToken,
+  verifyWorkerTokenSignature,
   WorkerTokenError,
   TOKEN_TTL_MS,
 } from "../scripts/lib/acp-worker-token.mjs";

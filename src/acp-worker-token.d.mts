@@ -22,3 +22,7 @@ export function signWorkerToken(claims: WorkerTokenClaims, secret: string): stri
 export class WorkerTokenError extends Error {}
 
 export function verifyWorkerToken(token: string, secret: string): WorkerTokenClaims;
+
+/** Verify an HMAC-signed worker token without enforcing exp. Use only for a
+ * renewal flow that revalidates the live bound process before reissuing. */
+export function verifyWorkerTokenSignature(token: string, secret: string): WorkerTokenClaims;

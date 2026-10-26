@@ -116,7 +116,7 @@ import { createPolicyWaiterRegistry } from "./server/policy-waiters.js";
 import { createMcpSessionLifecycle } from "./server/mcp-session-lifecycle.js";
 import { healthz, readinessChecks, sendReadiness } from "./server/readiness.js";
 import { handleDiagnostics } from "./server/diagnostics.js";
-import { handleMcpHttpRequest, type McpHttpDeps } from "./server/mcp-http.js";
+import { handleAgentPtyCredentialRenewal, handleMcpHttpRequest, type McpHttpDeps } from "./server/mcp-http.js";
 import { ExpiredMcpOperationTracker } from "./server/mcp-expired-operations.js";
 import { McpOperationDiagnostics } from "./server/mcp-operation-diagnostics.js";
 import { McpQualificationEvidenceJournal } from "./server/mcp-qualification-evidence.js";
@@ -889,6 +889,9 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
       scheduledJobs,
     ));
   }
+  app.post("/pty-review/renew", (req, res) => {
+    handleAgentPtyCredentialRenewal(mcpHttpDeps, req, res);
+  });
   app.all("/mcp", (req, res) => {
     void handleMcpHttpRequest(mcpHttpDeps, req, res);
   });

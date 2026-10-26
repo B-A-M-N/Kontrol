@@ -2,8 +2,8 @@ import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, readFileSync, statSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { verifyWorkerToken } from "./acp-worker-token.mjs";
-import { createAgentPtyReviewCredential, removeStaleAgentPtyReviewCredentials } from "./agent-pty-review-credential.js";
+import { signWorkerToken, verifyWorkerToken, verifyWorkerTokenSignature } from "./acp-worker-token.mjs";
+import { createAgentPtyReviewCredential, exchangeAgentPtyReviewCredential, removeStaleAgentPtyReviewCredentials } from "./agent-pty-review-credential.js";
 
 const stateDir = mkdtempSync(join(tmpdir(), "kontrol-pty-review-credential-"));
 try {
@@ -58,6 +58,62 @@ try {
   writeFileSync(join(stale, "credential.json"), "stale", { mode: 0o600 });
   assert.equal(removeStaleAgentPtyReviewCredentials(stateDir), 1);
   assert.equal(existsSync(stale), false, "startup recovery removes credentials left by a crashed server");
+
+  const expiredToken = signWorkerToken({
+    role: "worker",
+    workSessionId: binding.workSessionId,
+    workspaceSessionId: binding.workspaceSessionId,
+    runId: binding.runId,
+    workspaceLeaseNonce: "lease_1",
+    exp: 1,
+    agentPtyReview: { bindingId: binding.id, processSessionId: binding.processSessionId, processGeneration: binding.processGeneration },
+  }, secret);
+  assert.equal(verifyWorkerTokenSignature(expiredToken, secret).exp, 1,
+    "renewal can inspect an expired but correctly signed token");
+  assert.throws(() => verifyWorkerToken(expiredToken, secret), /expired/);
+
+  const currentBinding = { ...binding };
+  let processRunning = true;
+  let leaseNonce = "lease_1";
+  let latestAgentId = "agent_1";
+  let sessionStatus = "awaiting_review";
+  const renewalDeps = {
+    bindings: { getByProcessSession: () => currentBinding } as never,
+    processSessions: { observeAgentPty: () => ({ binding: currentBinding, running: processRunning }) } as never,
+    workSessions: {
+      get: () => ({ workspaceSessionId: binding.workspaceSessionId, status: sessionStatus }),
+      getWorkspaceLeaseForSession: () => ({
+        workSessionId: binding.workSessionId,
+        workspaceSessionId: binding.workspaceSessionId,
+        leaseNonce,
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      }),
+    } as never,
+    agentRegistry: {
+      getRun: () => ({ runId: binding.runId, workSessionId: binding.workSessionId, workspaceSessionId: binding.workspaceSessionId, agentId: "agent_1", status: "running" }),
+      getLatestDispatchAttemptForRun: () => ({ runId: binding.runId, agentId: latestAgentId }),
+    } as never,
+  };
+  const now = Date.now();
+  const renewed = exchangeAgentPtyReviewCredential({
+    token: expiredToken,
+    secret,
+    ...renewalDeps,
+    now,
+  });
+  assert.equal(verifyWorkerToken(renewed.token, secret).exp, renewed.expiresAt);
+  assert.equal(verifyWorkerToken(renewed.token, secret).workspaceLeaseNonce, "lease_1");
+  processRunning = false;
+  assert.throws(() => exchangeAgentPtyReviewCredential({ token: expiredToken, secret, ...renewalDeps, now }), /not live/);
+  processRunning = true;
+  leaseNonce = "lease_replaced";
+  assert.throws(() => exchangeAgentPtyReviewCredential({ token: expiredToken, secret, ...renewalDeps, now }), /lease/);
+  leaseNonce = "lease_1";
+  latestAgentId = "agent_after_handoff";
+  assert.throws(() => exchangeAgentPtyReviewCredential({ token: expiredToken, secret, ...renewalDeps, now }), /no longer current/);
+  latestAgentId = "agent_1";
+  sessionStatus = "cancelling";
+  assert.throws(() => exchangeAgentPtyReviewCredential({ token: expiredToken, secret, ...renewalDeps, now }), /no longer current/);
 } finally {
   rmSync(stateDir, { recursive: true, force: true });
 }

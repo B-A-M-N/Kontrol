@@ -68,6 +68,17 @@ export class WorkerTokenError extends Error {
  * @returns {WorkerTokenClaims}
  */
 export function verifyWorkerToken(token, secret) {
+  const claims = verifyWorkerTokenSignature(token, secret);
+  if (Date.now() > claims.exp) {
+    throw new WorkerTokenError("worker token expired");
+  }
+  return claims;
+}
+
+/** Verify the signed claim envelope without applying expiry. Only renewal
+ * endpoints may use this; they must revalidate the live bound process before
+ * issuing a replacement token. */
+export function verifyWorkerTokenSignature(token, secret) {
   const parts = token.split(".");
   if (parts.length !== 3) {
     throw new WorkerTokenError("malformed worker token");
@@ -93,8 +104,8 @@ export function verifyWorkerToken(token, secret) {
   } catch {
     throw new WorkerTokenError("corrupt worker token payload");
   }
-  if (typeof claims.exp !== "number" || Date.now() > claims.exp) {
-    throw new WorkerTokenError("worker token expired");
+  if (typeof claims.exp !== "number" || !Number.isFinite(claims.exp)) {
+    throw new WorkerTokenError("worker token missing expiry claim");
   }
   if (claims.role !== "worker" || typeof claims.workSessionId !== "string") {
     throw new WorkerTokenError("worker token missing required claims");

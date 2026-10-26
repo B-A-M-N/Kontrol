@@ -38,6 +38,7 @@ import type { LogicalContinuityIndex } from "../mcp-logical-continuity.js";
 import { startMcpSseHeartbeat } from "./mcp-sse-heartbeat.js";
 import { logEvent, requestPath, sessionIdPrefix } from "../logger.js";
 import { verifyWorkerToken, type WorkerTokenClaims } from "../acp-worker-token.mjs";
+import { exchangeAgentPtyReviewCredential } from "../agent-pty-review-credential.js";
 import {
   constantTimeStringEqual,
   createMcpServer,
@@ -299,6 +300,42 @@ export interface McpHttpDeps {
   reviewRoutes?: import("../review-handoff/route-store.js").ReviewRouteStore;
   reviewBrowserController?: import("../review-browser/browser-controller.js").ReviewerBrowserController;
   reviewThreads?: import("../review-thread/thread-store.js").ReviewThreadStore;
+}
+
+function isLoopbackAddress(address: string | undefined): boolean {
+  return address === "127.0.0.1" || address === "::1" || address === "::ffff:127.0.0.1";
+}
+
+/** Exchange an expired or near-expiry PTY review token only while its exact
+ * process generation, run and workspace lease remain live. */
+export function handleAgentPtyCredentialRenewal(deps: McpHttpDeps, req: Request, res: Response): void {
+  res.setHeader("Cache-Control", "no-store");
+  if (req.method !== "POST") {
+    res.setHeader("Allow", "POST").status(405).json({ error: "method_not_allowed" });
+    return;
+  }
+  if (!isLoopbackAddress(req.socket.remoteAddress)) {
+    res.status(403).json({ error: "loopback_required" });
+    return;
+  }
+  const token = req.header("x-kontrol-worker-token");
+  if (!token || !deps.config.acpAgentSecret || !deps.agentPtyBindings) {
+    res.status(401).json({ error: "unauthorized" });
+    return;
+  }
+  try {
+    const renewed = exchangeAgentPtyReviewCredential({
+      token,
+      secret: deps.config.acpAgentSecret,
+      bindings: deps.agentPtyBindings,
+      processSessions: deps.processSessions,
+      workSessions: deps.workSessions,
+      agentRegistry: deps.agentRegistry,
+    });
+    res.status(200).json(renewed);
+  } catch {
+    res.status(403).json({ error: "pty_review_renewal_denied" });
+  }
 }
 
 type CatalogRefreshPhase = "initialized" | "get_stream" | "request_retry";
