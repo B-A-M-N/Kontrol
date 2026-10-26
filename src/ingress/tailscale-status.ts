@@ -82,6 +82,16 @@ export interface TailscaleFacts {
   serveStatusSchemaSupported: boolean;
   /** Same contract as serveStatusSchemaSupported for funnel status. */
   funnelStatusSchemaSupported: boolean;
+  /**
+   * Whether the public-exposure attribution of the serve routes could be
+   * read. False when neither status document carried a readable
+   * AllowFunnel map, or when the two documents contradicted each other.
+   * A tailnet-private profile must not report a positive match while this
+   * is false: an unproven exposure signal is not a proven private route.
+   */
+  serveFunnelAttributionComplete: boolean;
+  /** Same contract as serveFunnelAttributionComplete for funnel status. */
+  funnelFunnelAttributionComplete: boolean;
   /** One stable-category warning per failed fact command — never
    * subprocess output, paths, or secrets. */
   warnings: string[];
@@ -142,6 +152,8 @@ export async function readTailscaleFacts(exec: TailscaleExec = defaultTailscaleE
     funnelMappings: [],
     serveStatusSchemaSupported: true,
     funnelStatusSchemaSupported: true,
+    serveFunnelAttributionComplete: true,
+    funnelFunnelAttributionComplete: true,
     warnings,
   };
 
@@ -173,25 +185,49 @@ export async function readTailscaleFacts(exec: TailscaleExec = defaultTailscaleE
   }
 
   const serve = await safeExec(exec, ["serve", "status", "--json"], warnings);
+  let serveParsed: Record<string, unknown> | null = null;
   if (serve) {
-    const parsed = safeJsonParse(serve.stdout, ["serve", "status", "--json"], warnings);
-    if (parsed) {
-      const result = parseServeMappings(parsed);
-      facts.serveMappings = result.mappings;
-      facts.serveStatusSchemaSupported = result.schemaSupported;
-      if (!result.schemaSupported) warnings.push("tailscale serve status schema is unsupported; mapping comparison is inconclusive");
-    }
+    serveParsed = safeJsonParse(serve.stdout, ["serve", "status", "--json"], warnings);
   }
 
   const funnel = await safeExec(exec, ["funnel", "status", "--json"], warnings);
+  let funnelParsed: Record<string, unknown> | null = null;
   if (funnel) {
-    const parsed = safeJsonParse(funnel.stdout, ["funnel", "status", "--json"], warnings);
-    if (parsed) {
-      const result = parseServeMappings(parsed);
-      facts.funnelMappings = result.mappings;
-      facts.funnelStatusSchemaSupported = result.schemaSupported;
-      if (!result.schemaSupported) warnings.push("tailscale funnel status schema is unsupported; mapping comparison is inconclusive");
-    }
+    funnelParsed = safeJsonParse(funnel.stdout, ["funnel", "status", "--json"], warnings);
+  }
+
+  // The union scan. Both status documents render the same serve
+  // configuration, so the AllowFunnel attribution is read from whichever
+  // document still carries it. When NEITHER document carries a readable
+  // map, no route's public exposure is proven, and a tailnet-private
+  // profile must not report a positive match.
+  const union = unionAllowFunnelAttribution(
+    serveParsed ? allowFunnelAttribution(serveParsed) : { hosts: new Map<string, boolean>(), readable: true },
+    funnelParsed ? allowFunnelAttribution(funnelParsed) : { hosts: new Map<string, boolean>(), readable: true },
+  );
+
+  if (serveParsed) {
+    const result = parseServeMappings(serveParsed, union.attribution);
+    facts.serveMappings = result.mappings;
+    facts.serveStatusSchemaSupported = result.schemaSupported;
+    if (!result.schemaSupported) warnings.push("tailscale serve status schema is unsupported; mapping comparison is inconclusive");
+  }
+
+  if (funnelParsed) {
+    const result = parseServeMappings(funnelParsed, union.attribution);
+    facts.funnelMappings = result.mappings;
+    facts.funnelStatusSchemaSupported = result.schemaSupported;
+    if (!result.schemaSupported) warnings.push("tailscale funnel status schema is unsupported; mapping comparison is inconclusive");
+  }
+
+  // Attribution is only in question when a route was actually observed.
+  // With no route at all there is nothing whose exposure is unproven.
+  const observedRoutes = facts.serveMappings.length + facts.funnelMappings.length;
+  const attributionComplete = observedRoutes === 0 || union.complete;
+  facts.serveFunnelAttributionComplete = attributionComplete;
+  facts.funnelFunnelAttributionComplete = attributionComplete;
+  if (observedRoutes > 0 && !union.complete) {
+    warnings.push("tailscale funnel exposure could not be attributed for every route; public exposure is unproven");
   }
 
   return facts;
@@ -258,22 +294,162 @@ interface ParsedServeStatus {
   schemaSupported: boolean;
 }
 
+/** The known upstream key for the funnel-exposure attribution map. */
+const ALLOW_FUNNEL_KEYS = ["AllowFunnel", "allowFunnel"];
+
+/**
+ * A renamed exposure field still names what it is. The name is the only
+ * evidence that distinguishes the funnel attribution from another boolean
+ * HostPort map in the same document, so recovery is limited to a name that
+ * identifies it.
+ */
+const FUNNEL_NAME_PATTERN = /funnel/i;
+
+/**
+ * A boolean map keyed by HostPort, read out of a status document.
+ *
+ * Upstream renders the exposure attribution as a sparse map that is OMITTED
+ * when no route is funnel-enabled, so an absent map is not drift by itself:
+ * it means no observed route is publicly exposed. A renamed field is still
+ * recovered, but only when its name still identifies it as the funnel
+ * attribution: shape alone cannot tell a renamed exposure map from an
+ * unrelated one, and guessing either way would be wrong in one direction
+ * or the other. An unidentifiable map leaves the exposure unproven.
+ */
+export interface FunnelAttribution {
+  /** The attribution, keyed by HostPort. Empty when no map was found. */
+  hosts: Map<string, boolean>;
+  /**
+   * False when the field was present but could not be read as a boolean
+   * HostPort map. The exposure of every route is then unproven.
+   */
+  readable: boolean;
+}
+
+/**
+ * Read a boolean HostPort map out of a candidate object.
+ *
+ * A key that is not a recognizable HostPort is drift, not a route to skip.
+ * Skipping it would read a funnel-enabled route whose key upstream renamed
+ * as a route with no exposure at all, and the classifier would then report a
+ * proven tailnet-private route that may in fact be public. An unreadable map
+ * proves nothing, so the whole map is unproven.
+ */
+function readHostPortBooleans(value: unknown): Map<string, boolean> | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const entries = Object.entries(value as Record<string, unknown>);
+  if (entries.length === 0) return new Map<string, boolean>();
+  const attribution = new Map<string, boolean>();
+  for (const [key, entry] of entries) {
+    if (typeof entry !== "boolean") return null;
+    const hostPort = normalizeHostPort(key);
+    if (hostPort === null) return null;
+    attribution.set(hostPort, entry);
+  }
+  return attribution;
+}
+
+/**
+ * The AllowFunnel attribution of a status document, keyed by HostPort.
+ *
+ * The known key is preferred. When it is absent, a renamed field is still
+ * recovered, but only when its name identifies it as the funnel
+ * attribution. A boolean HostPort map under any other name proves nothing:
+ * it may be an unrelated map, or it may be the renamed exposure field, and
+ * the shape cannot tell the two apart. Reading it as exposure would claim a
+ * public route that may be private; ignoring it would claim a private route
+ * that may be public. So the exposure of every route stays unproven, which
+ * keeps the route out of the proven-tailnet-private class.
+ */
+export function allowFunnelAttribution(parsed: Record<string, unknown>): FunnelAttribution {
+  for (const key of ALLOW_FUNNEL_KEYS) {
+    if (!(key in parsed)) continue;
+    const hosts = readHostPortBooleans(parsed[key]);
+    if (hosts === null) {
+      // The field is there but its shape is not the one this build reads.
+      // The exposure of every route is unproven.
+      return { hosts: new Map<string, boolean>(), readable: false };
+    }
+    return { hosts, readable: true };
+  }
+  // The known key is absent. Upstream omits an empty attribution map, so an
+  // absent map is the ordinary no-exposure state - as long as the document
+  // carries nothing that could be the renamed map.
+  let ambiguous = false;
+  for (const [key, value] of Object.entries(parsed)) {
+    if (key === "Web" || key === "Services") continue;
+    const hosts = readHostPortBooleans(value);
+    if (FUNNEL_NAME_PATTERN.test(key)) {
+      // A renamed exposure field: the name still says what the map is.
+      if (hosts === null) {
+        // The renamed field is there but its shape is not the one this build
+        // reads. The exposure of every route is unproven.
+        return { hosts: new Map<string, boolean>(), readable: false };
+      }
+      return { hosts, readable: true };
+    }
+    if (hosts !== null && hosts.size > 0) {
+      // Some other boolean HostPort map. It may be the renamed exposure
+      // field and it may not, so the exposure stays unproven.
+      ambiguous = true;
+    }
+  }
+  if (ambiguous) return { hosts: new Map<string, boolean>(), readable: false };
+  return { hosts: new Map<string, boolean>(), readable: true };
+}
+
+/**
+ * The union of the attribution carried by both status documents.
+ *
+ * Upstream renders the SAME serve configuration for the serve status and the
+ * funnel status command, so the two documents normally agree. Unioning them
+ * recovers the attribution when one document drifted and the other did not.
+ * A hostPort the two documents disagree about is dropped: a contradictory
+ * exposure signal proves nothing, so the classifier must not claim a
+ * positive match for it.
+ */
+export function unionAllowFunnelAttribution(
+  serveAttribution: FunnelAttribution,
+  funnelAttribution: FunnelAttribution,
+): { attribution: Map<string, boolean>; complete: boolean } {
+  const merged = new Map<string, boolean>(serveAttribution.hosts);
+  let complete = serveAttribution.readable && funnelAttribution.readable;
+  for (const [hostPort, value] of funnelAttribution.hosts) {
+    const existing = merged.get(hostPort);
+    if (existing !== undefined && existing !== value) {
+      // The two documents contradict each other about this route. Drop it:
+      // an unresolved exposure signal proves nothing.
+      merged.delete(hostPort);
+      complete = false;
+      continue;
+    }
+    merged.set(hostPort, value);
+  }
+  return { attribution: merged, complete };
+}
+
 /**
  * Parse only the schema this classifier can prove: top-level or service-local
  * `Web.<HostPort>.Handlers.<path>.Proxy`, with `AllowFunnel` keyed by
  * HostPort. Unknown documents return no positive identity; the facts layer
  * marks them unsupported so classification becomes UNKNOWN.
+ *
+ * `effectiveAttribution` overrides the document's own AllowFunnel map. It
+ * is how the facts layer applies the union of both status documents. Pass
+ * null to state that NO attribution is available at all.
+
+ * The completeness of the exposure attribution is NOT reported here: it is
+ * a property of the union of both documents, so the facts layer owns it and
+ * publishes it on the facts record.
  */
-export function parseServeMappings(parsed: Record<string, unknown>): ParsedServeStatus {
-  const funnelByHostPort = new Map<string, boolean>();
-  const allowFunnel = parsed["AllowFunnel"] ?? parsed["allowFunnel"];
-  if (typeof allowFunnel === "object" && allowFunnel !== null && !Array.isArray(allowFunnel)) {
-    for (const [key, value] of Object.entries(allowFunnel as Record<string, unknown>)) {
-      if (typeof value !== "boolean") continue;
-      const hostPort = normalizeHostPort(key);
-      if (hostPort !== null) funnelByHostPort.set(hostPort, value);
-    }
-  }
+export function parseServeMappings(
+  parsed: Record<string, unknown>,
+  effectiveAttribution?: Map<string, boolean> | null,
+): ParsedServeStatus {
+  const ownAttribution = effectiveAttribution === undefined
+    ? allowFunnelAttribution(parsed).hosts
+    : effectiveAttribution;
+  const effectiveMap = ownAttribution ?? new Map<string, boolean>();
 
   const webRoots: Array<{ value: unknown; serviceLocal: boolean }> = [];
   const web = parsed["Web"];
@@ -300,7 +476,7 @@ export function parseServeMappings(parsed: Record<string, unknown>): ParsedServe
       const hostPort = normalizeHostPort(hostPortKey);
       if (hostPort === null) continue;
       const listenPort = portFromHostPort(hostPort);
-      const allowFunnelValue = funnelByHostPort.get(hostPort);
+      const allowFunnelValue = effectiveMap.get(hostPort);
       for (const [handlerPath, handler] of Object.entries(hostNode["Handlers"] as Record<string, unknown>)) {
         if (!isPlainRecord(handler) || typeof handler["Proxy"] !== "string") continue;
         const proxy = handler["Proxy"];
@@ -398,13 +574,6 @@ export function sanitizeProxyTarget(raw: string): string {
   if (url.protocol !== "http:" && url.protocol !== "https:") return "(unrecognized target)";
   const port = url.port !== "" ? ":" + url.port : url.protocol === "https:" ? ":443" : ":80";
   return url.protocol + "//" + url.hostname + port;
-}
-
-function firstBoolean(...values: readonly unknown[]): boolean | undefined {
-  for (const value of values) {
-    if (typeof value === "boolean") return value;
-  }
-  return undefined;
 }
 
 /** Derive the Tailscale HTTPS listen port from the key path: a URL-ish key

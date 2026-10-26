@@ -41,6 +41,8 @@ function facts(mapped: boolean): TailscaleFacts {
     serveMappings: parsed.mappings,
     funnelMappings: parsed.mappings,
     serveStatusSchemaSupported: parsed.schemaSupported,
+    serveFunnelAttributionComplete: true,
+    funnelFunnelAttributionComplete: true,
     funnelStatusSchemaSupported: parsed.schemaSupported,
     warnings: [],
   };

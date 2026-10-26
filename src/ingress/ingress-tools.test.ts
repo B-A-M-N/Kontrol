@@ -16,6 +16,8 @@ try {
     serveMappings: [],
     funnelMappings: [],
     serveStatusSchemaSupported: true,
+    serveFunnelAttributionComplete: true,
+    funnelFunnelAttributionComplete: true,
     funnelStatusSchemaSupported: true,
     warnings: [],
   };

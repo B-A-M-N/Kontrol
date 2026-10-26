@@ -455,7 +455,10 @@ for (const flag of ["-v", "--version"]) {
   assert.doesNotMatch(cliSource, new RegExp("--bg"), "cli.ts must never contain the mutating --bg flag");
   assert.doesNotMatch(cliSource, new RegExp("serve reset"), "cli.ts must never reset serve state");
   assert.doesNotMatch(cliSource, new RegExp("funnel reset"), "cli.ts must never reset funnel state");
-  assert.doesNotMatch(cliSource, new RegExp('[\'\"]tailscale[\'\"]'), "cli.ts must never pass the tailscale binary name to a spawn/exec call");
+  // The ban covers any quoted form of the binary name, including a backtick
+  // template, so the name cannot be smuggled into a spawn/exec call through a
+  // different quoting style.
+  assert.doesNotMatch(cliSource, new RegExp("[\\'\"\u0060]tailscale[\\'\"\u0060]"), "cli.ts must never pass the tailscale binary name to a spawn/exec call");
 
   const runIngress = (subcommand: "inspect" | "plan", envOverrides: Record<string, string | undefined>) =>
     spawnSync("npx", ["tsx", "src/cli.ts", "ingress", subcommand], {
@@ -514,6 +517,11 @@ for (const flag of ["-v", "--version"]) {
     "#!/bin/sh\nprintf '%s\\n' \"$@\" >> " + JSON.stringify(sentinelHit) + "\nexit 0\n",
     { mode: 0o755 },
   );
+  // The sentinel is a POSIX shell script. On Windows there is no /bin/sh, so
+  // the sentinel cannot run and the tripwire cannot observe anything. The
+  // platform guard follows the repository convention: the tripwire is a
+  // POSIX-only assertion, and the rest of this suite still runs everywhere.
+  const skipTripwire = process.platform === "win32";
   try {
     const serveProfile = {
       id: "serve-pub",
@@ -530,25 +538,29 @@ for (const flag of ["-v", "--version"]) {
       KONTROL_PUBLIC_BASE_URL: "https://node.ts.net:8443",
       KONTROL_INGRESS_PROFILES: JSON.stringify([serveProfile]),
     };
-    const planTripwire = runIngressPlan(tripwireEnv);
-    assert.ok(planTripwire.status !== undefined, "plan tripwire run must complete");
-    assert.equal(existsSync(sentinelHit), false, "plan must NEVER spawn the tailscale binary");
+    if (skipTripwire) {
+      console.log("cli.test.ts: spawn tripwire skipped on this platform (POSIX-only sentinel)");
+    } else {
+      const planTripwire = runIngressPlan(tripwireEnv);
+      assert.ok(planTripwire.status !== undefined, "plan tripwire run must complete");
+      assert.equal(existsSync(sentinelHit), false, "plan must NEVER spawn the tailscale binary");
 
-    // Pre-run cleanup so an interrupted earlier run cannot false-fail here.
-    rmSync(sentinelHit, { force: true });
-    const inspectTripwire = runIngress("inspect", tripwireEnv);
-    assert.ok(inspectTripwire.status !== undefined, "inspect tripwire run must complete");
-    assert.ok(existsSync(sentinelHit), "inspect must reach the tailscale facts layer through the sentinel");
-    // The sentinel appends one line per argv element (spawnSync passes the
-    // args flat), so the expected file is the flattened, ordered sequence of
-    // the four fact invocations. Any extra invocation or flag appends more
-    // lines and fails the deepEqual.
-    const invocations = readFileSync(sentinelHit, "utf8").split("\n").filter((line) => line !== "");
-    assert.deepEqual(
-      invocations,
-      ["version", "status", "--json", "serve", "status", "--json", "funnel", "status", "--json"],
-      "the facts layer may ONLY run the four read-only fact commands",
-    );
+      // Pre-run cleanup so an interrupted earlier run cannot false-fail here.
+      rmSync(sentinelHit, { force: true });
+      const inspectTripwire = runIngress("inspect", tripwireEnv);
+      assert.ok(inspectTripwire.status !== undefined, "inspect tripwire run must complete");
+      assert.ok(existsSync(sentinelHit), "inspect must reach the tailscale facts layer through the sentinel");
+      // The sentinel appends one line per argv element (spawnSync passes the
+      // args flat), so the expected file is the flattened, ordered sequence of
+      // the four fact invocations. Any extra invocation or flag appends more
+      // lines and fails the deepEqual.
+      const invocations = readFileSync(sentinelHit, "utf8").split("\n").filter((line) => line !== "");
+      assert.deepEqual(
+        invocations,
+        ["version", "status", "--json", "serve", "status", "--json", "funnel", "status", "--json"],
+        "the facts layer may ONLY run the four read-only fact commands",
+      );
+    }
   } finally {
     rmSync(scratch, { recursive: true, force: true });
   }

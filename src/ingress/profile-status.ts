@@ -167,7 +167,15 @@ export interface IngressReport {
  */
 export function classifyProfile(options: {
   profile: IngressProfile;
-  facts: Pick<TailscaleFacts, "serveMappings" | "funnelMappings" | "serveStatusSchemaSupported" | "funnelStatusSchemaSupported" | "backendState" | "dnsName">;
+  facts: Pick<TailscaleFacts,
+    | "serveMappings"
+    | "funnelMappings"
+    | "serveStatusSchemaSupported"
+    | "funnelStatusSchemaSupported"
+    | "serveFunnelAttributionComplete"
+    | "funnelFunnelAttributionComplete"
+    | "backendState"
+    | "dnsName">;
   expectedLocalPort: number | null;
   localReachable?: boolean;
 }): ProfileClassification {
@@ -188,9 +196,22 @@ export function classifyProfile(options: {
   if (!expected || expected.hostname === null) return "UNKNOWN";
   const rawCandidates = profile.kind === "tailscale_funnel" ? facts.funnelMappings : facts.serveMappings;
   const candidates = rawCandidates.filter((mapping) => mapping.identity !== undefined);
+  // The completeness of the exposure attribution is a property of the union
+  // of both status documents, and it gates the classification in BOTH
+  // directions. When it is incomplete the route identity carries
+  // allowFunnel: false, because the exposure could not be read, so the route
+  // cannot be compared exactly. Falling through to the mismatch branch
+  // would derive a POSITIVE MISMATCH from a dropped exposure signal: the
+  // route would be reported as a different, actionable route when all that
+  // is actually known is that its exposure is unproven. A dropped signal
+  // proves nothing in either direction, so the classification stays UNKNOWN.
+  const attributionComplete = profile.kind === "tailscale_funnel"
+    ? facts.funnelFunnelAttributionComplete
+    : facts.serveFunnelAttributionComplete;
+  if (!attributionComplete) return "UNKNOWN";
   const exact = candidates.some((mapping) => routeIdentityEquals(mapping.identity, expected));
-  const routeDiffers = candidates.some((mapping) => routeDiffersForProfile(mapping, profile, expectedLocalPort));
   if (exact) return "MAPPING_MATCHED";
+  const routeDiffers = candidates.some((mapping) => routeDiffersForProfile(mapping, profile, expectedLocalPort));
   if (routeDiffers) return "MISMATCH";
   return "NO_MAPPING";
 }

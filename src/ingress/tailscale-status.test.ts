@@ -372,4 +372,142 @@ function fakeExec(responses: Record<string, FakeResponse>): TailscaleExec & { ca
   }
 }
 
+
+// --- upstream shape drift: the exposure field is renamed or unreadable ---
+{
+  // A renamed exposure field is RECOVERED: the classification still knows
+  // the route is publicly exposed, so it never passes as tailnet-private.
+  const exec = fakeExec({
+    "version": { stdout: "1.102.2\n" },
+    "status --json": { stdout: JSON.stringify({ BackendState: "Running", Self: { DNSName: "node.tail8d285a.ts.net." } }) },
+    "serve status --json": {
+      stdout: JSON.stringify({
+        Web: { "node.tail8d285a.ts.net:8443": { Handlers: { "/": { Proxy: "http://127.0.0.1:7677" } } } },
+        FunnelAllowedHosts: { "node.tail8d285a.ts.net:8443": true },
+      }),
+    },
+    "funnel status --json": { stdout: JSON.stringify({}) },
+  });
+  const facts = await readTailscaleFacts(exec);
+  assert.equal(facts.serveMappings.length, 1, "the renamed exposure field still yields the observed route");
+  assert.equal(facts.serveMappings[0].allowFunnel, true, "a renamed exposure field is recovered, so the route stays publicly exposed");
+}
+{
+  // An unrelated boolean HostPort map is NOT the exposure attribution.
+  // Its shape is identical to the renamed field's, so shape alone cannot
+  // tell the two apart. Reading it as exposure would claim a public route
+  // that may be private; ignoring it would claim a private route that may
+  // be public. The exposure stays unproven instead.
+  const exec = fakeExec({
+    "version": { stdout: "1.102.2\n" },
+    "status --json": { stdout: JSON.stringify({ BackendState: "Running", Self: { DNSName: "node.tail8d285a.ts.net." } }) },
+    "serve status --json": {
+      stdout: JSON.stringify({
+        Web: { "node.tail8d285a.ts.net:8443": { Handlers: { "/": { Proxy: "http://127.0.0.1:7677" } } } },
+        SomeFutureMap: { "node.tail8d285a.ts.net:8443": true },
+      }),
+    },
+    "funnel status --json": { stdout: JSON.stringify({}) },
+  });
+  const facts = await readTailscaleFacts(exec);
+  assert.equal(facts.serveFunnelAttributionComplete, false, "an unrelated boolean map leaves the exposure unproven");
+  assert.ok(facts.warnings.some((warning) => warning.includes("public exposure is unproven")), "the operator is told the exposure is unproven");
+  assert.equal(facts.serveMappings[0].identity?.allowFunnel, false, "an unrelated map is not read as public exposure");
+  assert.notEqual(facts.serveMappings[0].allowFunnel, true, "an unrelated map never marks the route funnel-exposed");
+}
+{
+  // A renamed exposure field whose shape this build cannot read is
+  // unproven too, even though the name still identifies it.
+  const exec = fakeExec({
+    "version": { stdout: "1.102.2\n" },
+    "status --json": { stdout: JSON.stringify({ BackendState: "Running", Self: { DNSName: "node.tail8d285a.ts.net." } }) },
+    "serve status --json": {
+      stdout: JSON.stringify({
+        Web: { "node.tail8d285a.ts.net:8443": { Handlers: { "/": { Proxy: "http://127.0.0.1:7677" } } } },
+        FunnelAllowedHosts: "unexpected-shape",
+      }),
+    },
+    "funnel status --json": { stdout: JSON.stringify({}) },
+  });
+  const facts = await readTailscaleFacts(exec);
+  assert.equal(facts.serveFunnelAttributionComplete, false, "a renamed field with an unreadable shape leaves the exposure unproven");
+}
+{
+  // An unreadable exposure field proves nothing about any route.
+  const exec = fakeExec({
+    "version": { stdout: "1.102.2\n" },
+    "status --json": { stdout: JSON.stringify({ BackendState: "Running", Self: { DNSName: "node.tail8d285a.ts.net." } }) },
+    "serve status --json": {
+      stdout: JSON.stringify({
+        Web: { "node.tail8d285a.ts.net:8443": { Handlers: { "/": { Proxy: "http://127.0.0.1:7677" } } } },
+        AllowFunnel: "unexpected-shape",
+      }),
+    },
+    "funnel status --json": { stdout: JSON.stringify({}) },
+  });
+  const facts = await readTailscaleFacts(exec);
+  assert.equal(facts.serveFunnelAttributionComplete, false, "an unreadable exposure field leaves the exposure unproven");
+  assert.ok(facts.warnings.some((warning) => warning.includes("public exposure is unproven")), "the operator is told the exposure is unproven");
+}
+{
+  // The two documents disagreeing about a route leaves that route's
+  // exposure unproven rather than resolved in either direction.
+  const exec = fakeExec({
+    "version": { stdout: "1.102.2\n" },
+    "status --json": { stdout: JSON.stringify({ BackendState: "Running", Self: { DNSName: "node.tail8d285a.ts.net." } }) },
+    "serve status --json": {
+      stdout: JSON.stringify({
+        Web: { "node.tail8d285a.ts.net:8443": { Handlers: { "/": { Proxy: "http://127.0.0.1:7677" } } } },
+        AllowFunnel: { "node.tail8d285a.ts.net:8443": true },
+      }),
+    },
+    "funnel status --json": {
+      stdout: JSON.stringify({
+        Web: { "node.tail8d285a.ts.net:8443": { Handlers: { "/": { Proxy: "http://127.0.0.1:7677" } } } },
+        AllowFunnel: { "node.tail8d285a.ts.net:8443": false },
+      }),
+    },
+  });
+  const facts = await readTailscaleFacts(exec);
+  assert.equal(facts.serveFunnelAttributionComplete, false, "contradictory documents leave the exposure unproven");
+}
+{
+  // A KEY that is not a recognizable HostPort is drift, not a route to skip.
+  // Skipping it would read a funnel-enabled route whose key upstream
+  // renamed as a route with no exposure at all, and the classifier would
+  // then report a proven tailnet-private route that may be public.
+  const exec = fakeExec({
+    "version": { stdout: "1.102.2\n" },
+    "status --json": { stdout: JSON.stringify({ BackendState: "Running", Self: { DNSName: "node.tail8d285a.ts.net." } }) },
+    "serve status --json": {
+      stdout: JSON.stringify({
+        Web: { "node.tail8d285a.ts.net:8443": { Handlers: { "/": { Proxy: "http://127.0.0.1:7677" } } } },
+        AllowFunnel: { "node.tail8d285a.ts.net:8443": false, "unrecognised key": true },
+      }),
+    },
+    "funnel status --json": { stdout: JSON.stringify({}) },
+  });
+  const facts = await readTailscaleFacts(exec);
+  assert.equal(facts.serveFunnelAttributionComplete, false, "an unrecognizable HostPort key leaves the exposure unproven");
+  assert.ok(facts.warnings.some((warning) => warning.includes("public exposure is unproven")), "the operator is told the exposure is unproven");
+  assert.notEqual(facts.serveMappings[0].allowFunnel, true, "a route with an unreadable exposure key is never marked as funnel-exposed");
+}
+{
+  // The same drift in a RENAMED exposure field is unproven too, for the same
+  // reason: the map is only partly readable, so it is only partly known.
+  const exec = fakeExec({
+    "version": { stdout: "1.102.2\n" },
+    "status --json": { stdout: JSON.stringify({ BackendState: "Running", Self: { DNSName: "node.tail8d285a.ts.net." } }) },
+    "serve status --json": {
+      stdout: JSON.stringify({
+        Web: { "node.tail8d285a.ts.net:8443": { Handlers: { "/": { Proxy: "http://127.0.0.1:7677" } } } },
+        FunnelAllowedHosts: { "node.tail8d285a.ts.net:8443": true, "unrecognised key": false },
+      }),
+    },
+    "funnel status --json": { stdout: JSON.stringify({}) },
+  });
+  const facts = await readTailscaleFacts(exec);
+  assert.equal(facts.serveFunnelAttributionComplete, false, "a renamed field with an unrecognizable key leaves the exposure unproven");
+  assert.notEqual(facts.serveMappings[0].allowFunnel, true, "a renamed field with an unreadable key is never read as public exposure");
+}
 console.log("tailscale-status: all assertions passed");

@@ -47,6 +47,8 @@ function facts(overrides: Partial<TailscaleFacts> = {}): TailscaleFacts {
     serveMappings: [],
     funnelMappings: [],
     serveStatusSchemaSupported: true,
+    serveFunnelAttributionComplete: true,
+    funnelFunnelAttributionComplete: true,
     funnelStatusSchemaSupported: true,
     warnings: [],
     ...overrides,
@@ -74,6 +76,12 @@ function mapping(overrides: Partial<ServeMapping> = {}): ServeMapping {
     ...overrides,
   };
 }
+
+/** A route that differs from the configured profile in its upstream port. */
+const differentPort = mapping({
+  proxyTarget: "http://127.0.0.1:9999",
+  identity: { ...mapping().identity!, upstreamPort: "9999" },
+});
 
 // --- normalizeLocalTarget ---
 assert.equal(normalizeLocalTarget("http://127.0.0.1:7677"), "http://127.0.0.1:7677/");
@@ -211,6 +219,86 @@ assert.equal(normalizeLocalTarget("not a url"), null);
   ).profiles[0];
   assert.equal(exposed.classification, "MISMATCH", "a funnel-enabled route must never satisfy a serve profile");
   assert.ok(exposed.notes.some((note) => note.includes("exposed to the PUBLIC internet")), "the exposure earns a diagnostic note");
+  // The human view marks the SAME route with the FUNNEL-EXPOSED marker. The
+  // marker is derived from the observed route's allowFunnel flag, so the
+  // observed mapping must carry it - otherwise the operator sees a
+  // tailnet-private route with no public-exposure warning.
+  assert.equal(exposed.observed?.allowFunnel, true, "the observed route carries the funnel-exposure flag the human view marks");
+  const privateRoute = buildIngressReport(
+    config([servePriv]),
+    facts({ serveMappings: [mapping({ allowFunnel: false, identity: { ...mapping().identity!, allowFunnel: false } })] }),
+    new Map([[7677, true]]),
+  ).profiles[0];
+  assert.notEqual(privateRoute.observed?.allowFunnel, true, "a tailnet-private route is not marked as funnel-exposed");
+}
+{
+  // The exposure attribution is unproven, so a tailnet-private profile
+  // must NOT report a positive match. The route identity carries
+  // allowFunnel: false, which without this gate would read as a proven
+  // private route even when the route may in fact be publicly exposed.
+  const serveUnproven = profile({ id: "serve-unproven", kind: "tailscale_serve", externalOrigin: "https://node.tail8d285a.ts.net:8443", allowedHosts: ["node.tail8d285a.ts.net:8443"] });
+  const unproven = buildIngressReport(
+    config([serveUnproven]),
+    facts({ serveMappings: [mapping()], serveFunnelAttributionComplete: false }),
+    new Map([[7677, true]]),
+  ).profiles[0];
+  assert.notEqual(unproven.classification, "MAPPING_MATCHED", "an unproven exposure must never be reported as a proven private route");
+  assert.equal(unproven.classification, "UNKNOWN", "an unproven exposure is inconclusive, not a mismatch and not a match");
+}
+{
+  // The exposure attribution is unproven AND the observed route differs from
+  // the configured profile. The difference is real, but it was derived from a
+  // route identity whose exposure could not be read, so it may be the
+  // exposure that differs rather than the route. A dropped signal proves
+  // nothing in either direction, so the classification stays UNKNOWN instead
+  // of reporting a positive MISMATCH.
+  const serveUnprovenDiffers = profile({
+    id: "serve-unproven-differs",
+    kind: "tailscale_serve",
+    externalOrigin: "https://node.tail8d285a.ts.net:8443",
+    allowedHosts: ["node.tail8d285a.ts.net:8443"],
+  });
+  const unprovenDiffers = buildIngressReport(
+    config([serveUnprovenDiffers]),
+    facts({ serveMappings: [differentPort], serveFunnelAttributionComplete: false }),
+    new Map([[7677, true]]),
+  ).profiles[0];
+  assert.equal(unprovenDiffers.classification, "UNKNOWN", "an unproven exposure never yields a positive mismatch");
+  assert.notEqual(unprovenDiffers.classification, "MISMATCH", "a dropped exposure signal proves no difference");
+}
+{
+  // The same shape for a FUNNEL profile, whose attribution completeness is
+  // read from the funnel document: an unproven funnel attribution must not
+  // yield a positive mismatch either.
+  const funnelUnprovenDiffers = profile({
+    id: "funnel-unproven-differs",
+    kind: "tailscale_funnel",
+    externalOrigin: "https://node.tail8d285a.ts.net:8443",
+    allowedHosts: ["node.tail8d285a.ts.net:8443"],
+  });
+  const unprovenFunnel = buildIngressReport(
+    config([funnelUnprovenDiffers]),
+    facts({ funnelMappings: [differentPort], funnelFunnelAttributionComplete: false }),
+    new Map([[7677, true]]),
+  ).profiles[0];
+  assert.equal(unprovenFunnel.classification, "UNKNOWN", "an unproven funnel exposure never yields a positive mismatch");
+  assert.notEqual(unprovenFunnel.classification, "MISMATCH", "a dropped funnel exposure signal proves no difference");
+}
+{
+  // With the attribution COMPLETE, the same difference is a real mismatch.
+  // The gate must not swallow a genuine finding.
+  const serveCompleteDiffers = profile({
+    id: "serve-complete-differs",
+    kind: "tailscale_serve",
+    externalOrigin: "https://node.tail8d285a.ts.net:8443",
+    allowedHosts: ["node.tail8d285a.ts.net:8443"],
+  });
+  const completeDiffers = buildIngressReport(
+    config([serveCompleteDiffers]),
+    facts({ serveMappings: [differentPort] }),
+    new Map([[7677, true]]),
+  ).profiles[0];
+  assert.equal(completeDiffers.classification, "MISMATCH", "a complete attribution still reports a genuine mismatch");
 }
 {
   // non-tailscale kinds: informational, no tailscale observation applies
