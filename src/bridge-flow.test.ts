@@ -31,6 +31,7 @@ import { getPeerJobStore, setPeerJobStoreSingleton } from "./peer/jobs/store.js"
 import { scheduledPeerContinuationJobId } from "./scheduling/scheduled-job-dispatch.js";
 import { openPeerJobStore } from "./peer/jobs/store.js";
 import { manifestSha256 } from "./peer/jobs/service.js";
+import { createMutationReceiptStore } from "./mutation-receipts.js";
 
 assert.equal(supervisedMissionOptionsSchema.safeParse({ outcomeEvidence: "outcome_verified" }).success, false,
   "the MCP mission contract requires its external outcome oracle before supervised work can start");
@@ -556,6 +557,37 @@ try {
     // Late changes_requested on an approved session is also rejected.
     const lateFb = await callReviewer("provide_review_feedback", { sessionId, verdict: "changes_requested" });
     assert.ok(lateFb.isError, "late feedback on approved session is rejected");
+  }
+
+  // ── Scenario 1.0: PTY-style retry identity replays one durable review submission ──
+  {
+    const sessionId = createSession();
+    const server = fakeServer();
+    registerBridgeTools(server as any, {
+      ...config,
+      principalRole: "worker",
+      mutationReceipts: createMutationReceiptStore(db),
+    } as BridgeConfig);
+    const call = (name: string, args: any) => server.handlers.get(name)!(args);
+    const request = {
+      sessionId,
+      message: "Retry this exact logical checkpoint safely.",
+      clientMutationId: "pty-review-retry-integration",
+    };
+    const first = await call("submit_for_review", request);
+    const retry = await call("submit_for_review", request);
+    assert.ok(!first.isError && !retry.isError, "the original submission and exact retry both return success");
+    assert.equal(retry.structuredContent.submissionId, first.structuredContent.submissionId,
+      "a lost CLI response can be retried with the same durable submission receipt");
+    assert.equal(workSessions.getSubmissions(sessionId).length, 1,
+      "same-key retry does not create a second review submission");
+    const conflicting = await call("submit_for_review", {
+      ...request,
+      message: "Different content must not reuse the receipt.",
+    });
+    assert.equal(conflicting.isError, true, "reusing the key for different content fails closed");
+    assert.equal(workSessions.getSubmissions(sessionId).length, 1,
+      "conflicting retry content cannot create another submission");
   }
 
   // ── Scenario 1.1: committed transfer stays committed during later live feedback ──
