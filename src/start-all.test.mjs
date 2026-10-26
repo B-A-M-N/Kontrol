@@ -129,6 +129,10 @@ assert.match(readinessProbe, /--rpc-timeout-ms/,
 assert.match(readinessProbe, /jsonOrText/);
 assert.match(readinessProbe, /args\.includes\("--probe-bash"\)/);
 assert.match(readinessProbe, /if \(probeBash\)/);
+assert.match(readinessProbe, /readOnlyInspection: true/,
+  "the optional Bash readiness probe must use the checkpoint-independent inspection path");
+assert.match(readinessProbe, /inputSchema\?\.properties\?\.readOnlyInspection/,
+  "readiness must reject a stale Bash tool schema without read-only inspection support");
 assert.match(readFileSync("restart-kontrol.sh", "utf8"), /node|start-all/);
 
 console.log("start-all.test.mjs: all assertions passed");

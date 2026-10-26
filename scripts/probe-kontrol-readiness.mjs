@@ -136,6 +136,10 @@ assert.doesNotMatch(
   /minimal tool mode.*disabled/i,
   "bash must not advertise the obsolete minimal-mode search-tool restriction",
 );
+assert.ok(
+  toolsByName.get("bash")?.inputSchema?.properties?.readOnlyInspection,
+  "bash must expose the bounded read-only inspection mode independently of checkpoint capture",
+);
 
 const discovered = skipDiscover ? { agents: [] } : await callTool("discover_agents", {});
 const agents = discovered?.agents ?? [];
@@ -179,7 +183,12 @@ for (const gitTool of ["git_status", "git_log", "git_diff", "git_show"]) {
   assert.ok(result !== undefined, `${gitTool} returned no result`);
 }
 if (probeBash) {
-  const bash = await callTool("bash", { workspaceId: opened.workspaceId, command: "pwd", timeout: 10 });
+  const bash = await callTool("bash", {
+    workspaceId: opened.workspaceId,
+    command: "pwd",
+    readOnlyInspection: true,
+    timeout: 10,
+  });
   assert.ok(typeof bash?.result === "string" || JSON.stringify(bash).includes(workspace), "bash did not execute in the opened workspace");
 }
 
