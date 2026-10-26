@@ -205,6 +205,7 @@ export function createToolEnvelope(deps: ToolEnvelopeDeps): ToolEnvelope {
         throw new WorkspaceMutationBlockedError(
           workspaceId,
           `Workspace mutation is disabled because the review baseline could not be established: ${snapshotInfo.diagnostic ?? "no usable checkpoint backend"}`,
+          snapshotInfo.checkpointError,
         );
       }
       return;
@@ -278,6 +279,7 @@ export function createToolEnvelope(deps: ToolEnvelopeDeps): ToolEnvelope {
     throw new WorkspaceMutationBlockedError(
       workspaceId,
       `Workspace mutation is disabled because the review baseline could not be established: ${snapshotInfo.diagnostic ?? "no usable checkpoint backend"}`,
+      snapshotInfo.checkpointError,
     );
   }
 

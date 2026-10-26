@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import { resolveShellCommand, terminateProcessTree } from "./process-platform.js";
 import { buildChildEnvironment } from "./process-environment.js";
 import type { AgentPtyBindingStore } from "./agent-pty-bindings.js";
+import { isReadOnlyShellInspectionCommand } from "./read-only-shell.js";
 
 // P1: detachment exists to return control (and a live process card) to the
 // reviewer quickly; a 10s request hold is long enough to trip intermediary
@@ -36,6 +37,8 @@ export interface StartCommandInput {
   /** Authenticated principal for output-only recovery after a transport reconnect. */
   principalId?: string;
   command: string;
+  /** True only for the narrow read-only shell inspection allowlist. */
+  readOnlyInspection?: boolean;
   cwd: string;
   tty?: boolean;
   columns?: number;
@@ -446,6 +449,9 @@ export class ProcessSessionManager {
   }
 
   async start(input: StartCommandInput): Promise<ProcessSnapshot> {
+    if (input.readOnlyInspection && !isReadOnlyShellInspectionCommand(input.command)) {
+      throw new Error("Command is not permitted in read-only shell inspection mode.");
+    }
     if (input.agentPtyBinding && (!input.tty || process.platform === "win32" || !this.agentPtyBindings)) {
       throw new Error("Agent PTY binding requires an interactive Unix PTY and durable binding store.");
     }
@@ -868,9 +874,29 @@ export class ProcessSessionManager {
   private startPipe(session: ProcessSession, input: StartCommandInput): void {
     const shell = resolveShellCommand(input.command);
     const detached = process.platform !== "win32";
+    const env = processEnvironment(this.childEnvironmentAllowlist);
+    if (input.readOnlyInspection) {
+      Object.assign(env, {
+        GIT_OPTIONAL_LOCKS: "0",
+        GIT_TERMINAL_PROMPT: "0",
+        GIT_PAGER: "cat",
+        PAGER: "cat",
+        GIT_CONFIG_COUNT: "5",
+        GIT_CONFIG_KEY_0: "core.hooksPath",
+        GIT_CONFIG_VALUE_0: "/dev/null",
+        GIT_CONFIG_KEY_1: "core.fsmonitor",
+        GIT_CONFIG_VALUE_1: "false",
+        GIT_CONFIG_KEY_2: "core.untrackedCache",
+        GIT_CONFIG_VALUE_2: "false",
+        GIT_CONFIG_KEY_3: "credential.helper",
+        GIT_CONFIG_VALUE_3: "",
+        GIT_CONFIG_KEY_4: "diff.external",
+        GIT_CONFIG_VALUE_4: "",
+      });
+    }
     const child = spawn(input.command, {
       cwd: input.cwd,
-      env: processEnvironment(this.childEnvironmentAllowlist),
+      env,
       stdio: "pipe",
       windowsHide: true,
       detached,
@@ -1032,6 +1058,7 @@ export class ProcessSessionManager {
       workspaceId: input.workspaceId,
       workSessionId: input.workSessionId ?? null,
       command: input.command,
+      readOnlyInspection: Boolean(input.readOnlyInspection),
       cwd: input.cwd,
       tty: Boolean(input.tty),
       columns: input.columns ?? null,

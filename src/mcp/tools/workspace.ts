@@ -66,6 +66,7 @@ import {
 import { logToolCall } from "../tool-logging.js";
 import { runMutationBarrier } from "../mutation-barrier.js";
 import { assertWorkerWorkspaceBinding, processOutputSchema, processToolResponse } from "../process-tool-response.js";
+import { readOnlyShellInspectionError } from "../../read-only-shell.js";
 import { publishScheduledArtifact } from "../../scheduling/scheduled-artifact-publisher.js";
 import type { ToolEnvelope } from "../tool-envelope.js";
 import { processSessionOwnerId, type ConnectionContext } from "../connection-context.js";
@@ -315,7 +316,7 @@ export function registerWorkspaceTools(
     {
       title: "Open workspace",
       description:
-        "Open a local project directory as a coding workspace. Call this once per project folder or worktree before reading, editing, searching, writing, showing changes, or running commands. Reuse the returned workspaceId for later calls in the same folder; do not call open_workspace again unless switching folders/worktrees, changing checkout/worktree mode, the workspaceId is rejected as unknown, or the user explicitly asks to reopen. By default this opens the actual checkout; set mode=\"worktree\" when the user asks for an isolated or parallel coding session. Ordinary non-Git directories are valid checkout workspaces and use filesystem change tracking; only managed worktrees require Git. Review and code-edit work stays direct in the workspace; optional ACP delegation follows discover_agents and healthy-agent checks. Returns the workspace capabilities and project instructions.",
+        "Open a local project directory as a coding workspace. Call this once per project folder or worktree before reading, editing, searching, writing, showing changes, or running commands. Reuse the returned workspaceId for later calls in the same folder; do not call open_workspace again unless switching folders/worktrees, changing checkout/worktree mode, the workspaceId is rejected as unknown, or the user explicitly asks to reopen. By default this opens the actual checkout; set mode=\"worktree\" when the user asks for an isolated or parallel coding session. Ordinary non-Git directories are valid checkout workspaces and use filesystem change tracking; only managed worktrees require Git. Checkpoint capture is deferred until a review or mutation needs an exact baseline, so opening a workspace and using read-only inspection does not scan the working tree. Review and code-edit work stays direct in the workspace; optional ACP delegation follows discover_agents and healthy-agent checks. Returns the workspace capabilities and project instructions.",
       inputSchema: {
         path: z
           .string()
@@ -341,7 +342,9 @@ export function registerWorkspaceTools(
         sourceRoot: z.string().optional(),
         workspaceKind: z.enum(["checkout", "worktree"]),
         versionControl: z.enum(["git", "none", "unknown"]),
-        checkpointBackend: z.enum(["git", "filesystem", "unavailable"]),
+        checkpointBackend: z.enum(["git", "filesystem", "pending", "unavailable"]),
+        checkpointDiagnostic: z.string().optional(),
+        checkpointError: z.object({ code: z.string(), operation: z.string(), stderr: z.string() }).optional(),
         capabilities: z.object({
           read: z.boolean(),
           search: z.boolean(),
@@ -457,8 +460,10 @@ export function registerWorkspaceTools(
       const snapshotInfo = await reviewCheckpoints.getSnapshotInfo({
         workspaceId: workspace.id,
         root: workspace.root,
+        initialize: false,
+        kindHint: gitEligibility.ok ? "git" : "filesystem",
       });
-      const checkpointBackend = snapshotInfo.available ? snapshotInfo.kind : "unavailable";
+      const checkpointBackend = snapshotInfo.pending ? "pending" : snapshotInfo.available ? snapshotInfo.kind : "unavailable";
       const changeTracking = snapshotInfo.available;
       const visibleSkills = workspace.skills
         .filter((skill) => !skill.disableModelInvocation)
@@ -478,7 +483,7 @@ export function registerWorkspaceTools(
       const baseInstruction = config.skillsEnabled
         ? "Use this workspaceId in all subsequent tool calls for this project. Do not call open_workspace again for this same folder unless this workspaceId stops working, the user asks to reopen, or you switch to a different folder/worktree. Follow loaded agentsFiles instructions. Nested instructions are loaded automatically when later tools enter their directory. Review, diagnosis, architecture, and code-edit requests go directly through this workspace first. Delegate only when the reviewer explicitly asks for bounded assistance: call discover_agents, use only a currently dispatchable healthy role=agent peer, and if optional assistance is unavailable continue directly without an alternate ACP route. The WebUI reviewer remains the approval authority. When a task matches an available skill in skills, read its path before proceeding. For skills not listed here, use the search_skills tool to discover global skills by keyword."
         : "Use this workspaceId in all subsequent tool calls for this project. Do not call open_workspace again for this same folder unless this workspaceId stops working, the user asks to reopen, or you switch to a different folder/worktree. Follow loaded agentsFiles instructions. Nested instructions are loaded automatically when later tools enter their directory. Review, diagnosis, architecture, and code-edit requests go directly through this workspace first. Delegate only when the reviewer explicitly asks for bounded assistance: call discover_agents, use only a currently dispatchable healthy role=agent peer, and if optional assistance is unavailable continue directly without an alternate ACP route. The WebUI reviewer remains the approval authority.";
-      const instruction = `${baseInstruction} The active Kontrol server exposes ${toolSurface.requiredInspectionTools.join(", ")} in tool surface ${toolSurface.version}. If this client's catalog omits any of them, refresh or initialize a fresh MCP connection; meanwhile continue with available bounded structured tools such as read. Do not substitute bash or find for structured inspection.`;
+      const instruction = `${baseInstruction} The active Kontrol server exposes ${toolSurface.requiredInspectionTools.join(", ")} in tool surface ${toolSurface.version}. If this client's catalog omits any of them, refresh or initialize a fresh MCP connection; meanwhile continue with available bounded structured tools such as read. Ordinary bash remains checkpoint-gated; use bash with readOnlyInspection=true only for its narrow pwd/ls/Git inspection allowlist.`;
       const resultContent: ToolContent[] = [
         {
           type: "text" as const,
@@ -533,6 +538,8 @@ export function registerWorkspaceTools(
           workspaceKind,
           versionControl,
           checkpointBackend,
+          ...(snapshotInfo.diagnostic ? { checkpointDiagnostic: snapshotInfo.diagnostic } : {}),
+          ...(snapshotInfo.checkpointError ? { checkpointError: snapshotInfo.checkpointError } : {}),
           capabilities: {
             read: true,
             search: true,
@@ -2136,6 +2143,9 @@ export function registerWorkspaceTools(
           .describe(
             `Shell command to run. Must not create or modify project files; use ${toolNames.edit} or ${toolNames.write} for file changes.`,
           ),
+        readOnlyInspection: z.boolean().optional().describe(
+          "Run only the fixed pwd/ls/read-only Git inspection allowlist. This mode bypasses baseline capture but retains workspace binding and shell policy checks. Other commands require the normal review checkpoint.",
+        ),
         workingDirectory: z
           .string()
           .optional()
@@ -2160,12 +2170,18 @@ export function registerWorkspaceTools(
     },
     async ({ workspaceId, workingDirectory, ...input }) => {
       const startedAt = performance.now();
-      // REVIEW-01: shell is mutation-capable regardless of the command
-      // string — a textual "read-only" classification is not a security
-      // boundary. It crosses the same checkpoint-readiness barrier as
-      // write/edit/apply_patch/exec_command.
-      const blocked = await runMutationBarrier(prepareForMutation, workspaceId, toolNames.shell);
-      if (blocked) return blocked;
+      if (input.readOnlyInspection && connectionContext?.authenticatedRole === "peer") {
+        return { content: [textBlock("Forbidden: peer shell inspection is unavailable; use structured read-only inspection tools.")], isError: true };
+      }
+      if (input.readOnlyInspection) {
+        const inspectionError = readOnlyShellInspectionError(input.command);
+        if (inspectionError) return { content: [textBlock(inspectionError)], isError: true };
+      } else {
+        // Ordinary shell commands remain mutation-capable regardless of their
+        // text and cross the same checkpoint barrier as write/edit/patch.
+        const blocked = await runMutationBarrier(prepareForMutation, workspaceId, toolNames.shell);
+        if (blocked) return blocked;
+      }
       const workspace = workspaces.getWorkspace(workspaceId);
       const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
       if (bindingErr) return bindingErr;
@@ -2216,6 +2232,7 @@ export function registerWorkspaceTools(
             workSessionId: connectionContext?.workSessionId,
             principalId: connectionContext?.authenticatedPrincipalId,
             command: input.command,
+            readOnlyInspection: input.readOnlyInspection === true,
             cwd,
             timeoutMs: timeoutSeconds * 1_000,
             yieldTimeMs: Math.min(timeoutSeconds * 1_000, 10_000),

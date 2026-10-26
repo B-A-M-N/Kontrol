@@ -93,6 +93,8 @@ interface WorkspaceReviewState {
   presentationRef: string;
   legacyBaselineRef: string;
   diagnostic?: string;
+  checkpointError?: CheckpointErrorSummary;
+  ready?: boolean;
   backend?: CheckpointBackend;
   filesystemBaselines?: {
     open: WorkspaceSnapshot;
@@ -102,6 +104,53 @@ interface WorkspaceReviewState {
     presentations: Map<string, WorkspaceSnapshot>;
   };
 }
+
+export interface CheckpointErrorSummary {
+  code: string;
+  operation: string;
+  stderr: string;
+}
+
+class CheckpointCaptureError extends Error {
+  constructor(readonly summary: CheckpointErrorSummary) {
+    super(`Review checkpoint failed during ${summary.operation}: ${summary.stderr || "Git returned no diagnostic output."}`);
+    this.name = "CheckpointCaptureError";
+  }
+}
+
+export class GitCheckpointCaptureCoordinator {
+  private readonly flights = new Map<string, Promise<unknown>>();
+  private readonly lanes = new Map<string, Promise<void>>();
+
+  run<T>(repositoryKey: string, captureKey: string, capture: () => Promise<T>): Promise<T> {
+    const key = `${resolve(repositoryKey)}\0${captureKey}`;
+    const existing = this.flights.get(key);
+    if (existing) return existing as Promise<T>;
+    let flight!: Promise<T>;
+    flight = this.runInRepositoryLane(resolve(repositoryKey), capture).finally(() => {
+      if (this.flights.get(key) === flight) this.flights.delete(key);
+    });
+    this.flights.set(key, flight);
+    return flight;
+  }
+
+  private async runInRepositoryLane<T>(repositoryKey: string, capture: () => Promise<T>): Promise<T> {
+    const previous = this.lanes.get(repositoryKey) ?? Promise.resolve();
+    let release!: () => void;
+    const gate = new Promise<void>((resolveGate) => { release = resolveGate; });
+    const lane = previous.then(() => gate);
+    this.lanes.set(repositoryKey, lane);
+    await previous;
+    try {
+      return await capture();
+    } finally {
+      release();
+      if (this.lanes.get(repositoryKey) === lane) this.lanes.delete(repositoryKey);
+    }
+  }
+}
+
+const gitCheckpointCaptures = new GitCheckpointCaptureCoordinator();
 
 /**
  * P0 #4: Single-flight, awaitable initialization. The state object exists
@@ -121,7 +170,7 @@ interface WorkspaceReviewStateWithInit extends WorkspaceReviewState {
 
 export interface ReviewCheckpointManager {
   initializeWorkspace(input: { workspaceId: string; root: string }): Promise<void>;
-  getSnapshotInfo(input: { workspaceId: string; root: string }): Promise<{ kind: WorkspaceSnapshotKind; available: boolean; diagnostic?: string }>;
+  getSnapshotInfo(input: { workspaceId: string; root: string; initialize?: boolean; kindHint?: WorkspaceSnapshotKind }): Promise<{ kind: WorkspaceSnapshotKind; available: boolean; pending?: boolean; diagnostic?: string; checkpointError?: CheckpointErrorSummary }>;
   reviewChanges(input: {
     workspaceId: string;
     root: string;
@@ -278,6 +327,7 @@ export function createReviewCheckpointManager(options: {
           await store.saveBaselines(workspaceId, root, state.filesystemBaselines);
         }
         state.diagnostic = undefined;
+        state.ready = true;
         resolveInit();
         return state;
       }
@@ -291,6 +341,7 @@ export function createReviewCheckpointManager(options: {
       // P1 #15: Clear diagnostic on success
       state.diagnostic = undefined;
       state.backend = new GitCheckpointBackend();
+      state.ready = true;
     } catch (error) {
       // P0.5: a failed initialization must leave NO backend behind. The
       // filesystem backend object is assigned before baseline capture, so an
@@ -299,6 +350,8 @@ export function createReviewCheckpointManager(options: {
       state.backend = undefined;
       state.filesystemBaselines = undefined;
       state.diagnostic = error instanceof Error ? error.message : String(error);
+      state.checkpointError = error instanceof CheckpointCaptureError ? error.summary : undefined;
+      state.ready = false;
     } finally {
       resolveInit();
     }
@@ -310,12 +363,38 @@ export function createReviewCheckpointManager(options: {
       await ensureInitialized(workspaceId, root);
     },
 
-    async getSnapshotInfo({ workspaceId, root }) {
+    async getSnapshotInfo({ workspaceId, root, initialize = true, kindHint }) {
+      if (!initialize) {
+        const existing = states.get(workspaceId);
+        if (!existing) {
+          return {
+            kind: kindHint ?? ((await getGitEligibility(root)).ok ? "git" : "filesystem"),
+            available: false,
+            pending: true,
+            diagnostic: "Review checkpoint capture is deferred until a review or mutation requires an exact baseline.",
+          };
+        }
+        if (!existing.ready && !existing.diagnostic) {
+          return {
+            kind: existing.gitRoot ? "git" : existing.backend?.kind ?? "filesystem",
+            available: false,
+            pending: true,
+            diagnostic: "Review checkpoint capture is in progress.",
+          };
+        }
+        return {
+          kind: existing.backend?.kind ?? (existing.gitRoot ? "git" : "filesystem"),
+          available: Boolean(existing.backend && (existing.backend.kind !== "filesystem" || existing.filesystemBaselines)),
+          diagnostic: existing.diagnostic,
+          checkpointError: existing.checkpointError,
+        };
+      }
       const state = await ensureInitialized(workspaceId, root);
       return {
         kind: state.backend?.kind ?? "filesystem",
         available: Boolean(state.backend),
         diagnostic: state.diagnostic,
+        checkpointError: state.checkpointError,
       };
     },
 
@@ -832,30 +911,78 @@ async function ensureRef(gitRoot: string, ref: string, fallbackRef: string): Pro
 
 async function createWorkingTreeSnapshot(gitRoot: string, workspaceRelativePath = "."): Promise<string> {
   const tree = await createWorkingTreeTree(gitRoot, workspaceRelativePath);
-  const parent = (await git(gitRoot, ["rev-parse", "--verify", "HEAD^{commit}"])).stdout.trim();
+  const parent = (await checkpointGit(gitRoot, "git rev-parse HEAD", ["rev-parse", "--verify", "HEAD^{commit}"])).stdout.trim();
   const tempDir = await mkdtemp(join(tmpdir(), "kontrol-review-index-"));
   const indexPath = join(tempDir, "index");
   const env = checkpointEnv(indexPath);
 
   try {
-    return (await git(gitRoot, ["commit-tree", tree, "-p", parent, "-m", "Kontrol review snapshot"], { env })).stdout.trim();
+    return (await checkpointGit(gitRoot, "git commit-tree", ["commit-tree", tree, "-p", parent, "-m", "Kontrol review snapshot"], { env })).stdout.trim();
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
 }
 
 async function createWorkingTreeTree(gitRoot: string, workspaceRelativePath = "."): Promise<string> {
+  const canonicalRoot = resolve(gitRoot);
+  const scope = workspaceRelativePath || ".";
+  return gitCheckpointCaptures.run(canonicalRoot, scope, () => createWorkingTreeTreeUncoordinated(canonicalRoot, scope));
+}
+
+async function createWorkingTreeTreeUncoordinated(gitRoot: string, workspaceRelativePath: string): Promise<string> {
   const tempDir = await mkdtemp(join(tmpdir(), "kontrol-review-index-"));
   const indexPath = join(tempDir, "index");
   const env = checkpointEnv(indexPath);
 
   try {
-    await git(gitRoot, ["read-tree", "HEAD"], { env });
-    await git(gitRoot, ["add", "-A", "--", workspaceRelativePath], { env });
-    return (await git(gitRoot, ["write-tree"], { env })).stdout.trim();
+    await checkpointGit(gitRoot, "git read-tree", ["read-tree", "HEAD"], { env }, tempDir);
+    await checkpointGit(gitRoot, "git add", ["add", "-A", "--", workspaceRelativePath], { env }, tempDir);
+    return (await checkpointGit(gitRoot, "git write-tree", ["write-tree"], { env }, tempDir)).stdout.trim();
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
+}
+
+async function checkpointGit(
+  gitRoot: string,
+  operation: string,
+  args: string[],
+  options: { env?: NodeJS.ProcessEnv } = {},
+  temporaryRoot?: string,
+) {
+  try {
+    return await git(gitRoot, args, options);
+  } catch (error) {
+    const entry = error !== null && typeof error === "object" ? error as { code?: unknown; stderr?: unknown } : undefined;
+    const rawStderr = typeof entry?.stderr === "string" ? entry.stderr : "";
+    const stderr = sanitizeCheckpointStderr(rawStderr, gitRoot, temporaryRoot);
+    const rawCode = entry?.code;
+    const code = typeof rawCode === "number" ? `exit_${rawCode}`
+      : typeof rawCode === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(rawCode) ? rawCode
+        : "git_failed";
+    throw new CheckpointCaptureError({ code, operation, stderr });
+  }
+}
+
+function sanitizeCheckpointStderr(stderr: string, gitRoot: string, temporaryRoot?: string): string {
+  let safe = stderr
+    .replace(/\u001b\[[0-9;]*m/g, "")
+    .replaceAll(resolve(gitRoot), "<workspace>");
+  if (temporaryRoot) safe = safe.replaceAll(temporaryRoot, "<temporary-index>");
+  safe = safe
+    .replace(/\bBearer\s+\S+/gi, "Bearer [redacted]")
+    .replace(/((?:token|password|secret|authorization|credential)[=:]\s*)\S+/gi, "$1[redacted]")
+    .replace(/[\r\n\t\u0000-\u001f]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const limit = 1_000;
+  if (Buffer.byteLength(safe, "utf8") <= limit) return safe;
+  let bounded = "";
+  for (const char of safe) {
+    if (Buffer.byteLength(bounded + char, "utf8") > limit - 3) break;
+    bounded += char;
+  }
+  return `${bounded}...`;
 }
 
 function checkpointEnv(indexPath: string): NodeJS.ProcessEnv {
