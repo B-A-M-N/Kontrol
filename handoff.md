@@ -1,15 +1,15 @@
 # Kontrol multipath ingress — remaining work
 
-Updated: 2026-10-26 (eighth revision)
+Updated: 2026-10-26 (ninth revision)
 Repository: `/home/bamn/devspace`
 Branch: `audit-k02-k04`
 Starting HEAD for this revision: `44c247a`. The change is the reviewed
 range `44c247a..858e18f` - the commits of this change, listed below. The
 range is pinned to those commits on purpose: this branch is shared, other
 workstreams have since committed on top of it, and a moving `HEAD` would
-make every range claim in this record false. The last two rows of the commit
-table are this revision's documentation commits; they sit on top of that
-range and change only this file.
+make every range claim in this record false. The last three rows of the commit
+table sit on top of that range: two documentation commits, which change only
+this file, and one test-contract fix, which changes one test file.
 Commits are local only. Do not push without separate authorization.
 Preserve untracked `.tmp-scratch/`.
 
@@ -18,9 +18,10 @@ Preserve untracked `.tmp-scratch/`.
 These commits are local only; nothing was pushed. The table has one row per
 commit of this change - the commits of the reviewed range
 `44c247a..858e18f`, then the two documentation commits that pin that range
-and record the final verification run - and no count is stated in prose,
-because every documentation commit would have to restate a number that its
-own commit changes.
+and record the final verification run, then the test-contract fix that
+restores the canonical chain - and no count is stated in prose, because
+every documentation commit would have to restate a number that its own
+commit changes.
 
 | # | Commit | Subject |
 |---|--------|---------|
@@ -35,7 +36,9 @@ own commit changes.
 | 9 | `ec20e04` | `docs: name the reviewed range and distinguish the two handoff records` |
 | 10 | `858e18f` | `docs: record every review round and cite the pristine-archive test run` |
 | 11 | `440faae` | `docs: pin the reviewed range and record the re-recorded review rounds` |
-| 12 | this commit | `docs: record the final verification run against this commit` |
+| 12 | `50e7faf` | `docs: record the final verification run against this commit` |
+| 13 | `7a62023` | `test(peer): follow the deferred checkpoint contract in the change-tracking assertion` |
+| 14 | this commit | `docs: record the stale checkpoint assertion and the restored canonical chain` |
 
 Requirement source:
 `/home/bamn/.codex/attachments/458e9b15-a1ec-4247-aa20-19ec878f9be9/pasted-text-1.txt`
@@ -546,13 +549,15 @@ approve with no P0, P1 or P2 finding, and two P3 residuals.
 
 What round 13 verified, from the code rather than from the prose:
 
-- the change is exactly 34 files, and
+- the reviewed range is exactly 34 files, and
   `git diff --name-only 44c247a..858e18f` matches the reviewed file list
   exactly. At the time of round 13 the range
-  was `44c247a..e5a07c8`; every commit after it changes only `handoff.md`,
-  which is already in that set, so the range and the file count are unchanged.
-  The range is written as `44c247a..858e18f` - this change's own commits -
-  so the claim stays checkable after other workstreams commit on this branch;
+  was `44c247a..e5a07c8`; every commit after it in this workstream changes
+  only `handoff.md`, except the test-contract fix of section 13, which
+  touches one test file outside that set, so the range and its file count
+  are unchanged. The range is written as `44c247a..858e18f` - this change's
+  own commits - so the claim stays checkable after other workstreams commit
+  on this branch;
 - each of the five commits contains only files that belong to its stated
   subject, and neither `.tmp-scratch/` nor the generated
   `ingress-qualification-matrix.json` is in any commit;
@@ -589,6 +594,32 @@ defect: the canonical chain supplies it, because `scripts/run-runtime-tests.mjs`
 builds the app into a temporary artifact directory and points that variable at
 the build. It is now recorded in the environment notes below.
 
+
+### 13. A stale assertion in a sibling test broke the chain, and it is fixed
+
+Re-running the canonical chain against this revision's tree failed in
+`src/peer-mutation.test.ts` - a file this change does not touch. The cause
+is a sibling commit on this branch (`839987b`, "fix(checkpoints): defer
+capture until review barriers"), which deliberately changed the checkpoint
+contract: `open_workspace` no longer captures a baseline, so it reports
+`checkpointBackend: "pending"` and `capabilities.changeTracking: false`
+until a review or a mutation needs an exact baseline. That commit updated the
+two suites whose assertions encode that contract
+(`src/checkpoint-fail-closed.test.ts`, `src/mcp-sse-admission.test.ts`) but
+not the peer suite, whose assertion still demanded `changeTracking: true` at
+open time.
+
+The assertion was stale, not the contract. The peer worktree is still
+tracked: with that one line relaxed, the rest of the suite passes unchanged,
+including its assertions that the peer's mutation stays tracked and that the
+allow-untracked escape hatch does not apply to peers.
+
+`7a62023` replaces the stale assertion with the invariant the contract
+actually guarantees - the backend is reported as `pending` at open time, and
+change tracking is claimed exactly when the backend is one that can track
+changes (`git` or `filesystem`), never while no backend is available.
+The full canonical chain is green again, and the peer suite keeps asserting
+the same property it asserted before: change tracking follows the backend.
 
 ## Still missing — operator-gated deployment evidence
 
@@ -753,9 +784,10 @@ and round 17 none. Each finding was closed by the next commit of this change,
 which the commit table at the top of this document lists.
 Rounds 18 and 19 re-recorded that same committed state after the workflow
 guard scoped its review evidence over the whole tracked tree and concurrent
-work in this checkout changed it; both returned no findings. This revision's
-documentation commit is reviewed the same way, and its verdict is recorded
-with the workflow guard.
+work in this checkout changed it; both returned no findings. The final review
+round covers this revision's commits as well - the pinned range, the
+documentation commits and the test-contract fix of section 13 - and its
+verdict is recorded with the workflow guard.
 | Round | Reviewer | Verdict | Outcome |
 |-------|----------|---------|---------|
 | 1 | `glm-5.3-flash` | changes requested | The deferral gate alone was insufficient: the transport could still drop a notification on a stream that ended mid-send. Led to the stale-discard path. |
@@ -854,10 +886,14 @@ Executed in this pass (all from the repository root):
   exactly the committed tree of this change (no other working-tree edit is
   present in it), so the result is not contaminated by concurrent work in
   the shared checkout. `EXIT=0` on every run. The final run is against a
-  pristine extraction of the commit this document is in - `git archive` of
-  that commit, unpacked into an empty directory, whose tracked files are
-  exactly the committed ones - and is recorded in
-  `.tmp-scratch/test-npm-test-r20.log`. The earlier runs are against the
+  pristine extraction of `7a62023` - the commit that carries the
+  test-contract fix of section 13 - unpacked into an empty directory, whose
+  tracked files are exactly the committed ones; it is recorded in
+  `.tmp-scratch/test-npm-test-r20.log`. The only change this workstream
+  makes after that commit is this document. The first attempt of this pass ran
+  against `50e7faf` and failed in `src/peer-mutation.test.ts`; that
+  failure is what surfaced the stale assertion of section 13, and `50e7faf`
+  reproduces it. The earlier runs are against the
   reviewed range's tip (`858e18f`, 575 tracked files) and are recorded in
   `.tmp-scratch/test-npm-test-r13.log`,
   `.tmp-scratch/test-npm-test-r14.log`,
@@ -874,9 +910,11 @@ Executed in this pass (all from the repository root):
 
 ### Changed and added files
 
-One row per file. These are exactly the files the change touches, and
-they are the same 34 files that `git diff --name-only 44c247a..858e18f`
-names.
+One row per file. These are exactly the files the reviewed range touches,
+and they are the same 34 files that `git diff --name-only 44c247a..858e18f`
+names. One file outside that set is touched by a later commit of this
+workstream - `src/peer-mutation.test.ts`, the stale checkpoint assertion
+fixed in section 13 - and it is listed in its own table below.
 
 | File | Change |
 |------|--------|
@@ -914,6 +952,12 @@ names.
 | `docs/ingress.md` | the public origin mode decision and the exposure-attribution rule |
 | `handoff.md` | this record |
 | `HANDOFF.md` | the earlier scheduled-job audit record, updated with the deployment status this pass verified |
+
+### One file outside the reviewed range
+
+| File | Change | Commit |
+|------|--------|--------|
+| `src/peer-mutation.test.ts` | the change-tracking assertion now follows the deferred checkpoint contract: the backend is reported as `pending` at open time, and change tracking is claimed only when the backend can actually track changes (section 13) | `7a62023` |
 
 ### Suites this change newly executes
 
