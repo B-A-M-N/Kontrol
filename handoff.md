@@ -1,18 +1,24 @@
 # Kontrol multipath ingress — remaining work
 
-Updated: 2026-10-26 (seventh revision)
+Updated: 2026-10-26 (eighth revision)
 Repository: `/home/bamn/devspace`
 Branch: `audit-k02-k04`
-Starting HEAD for this revision: `44c247a`. The change is the range
-`44c247a..HEAD` - the local commits listed below.
+Starting HEAD for this revision: `44c247a`. The change is the reviewed
+range `44c247a..858e18f` - the commits of this change, listed below. The
+range is pinned to those commits on purpose: this branch is shared, other
+workstreams have since committed on top of it, and a moving `HEAD` would
+make every range claim in this record false. The last row of the commit table
+is this revision's documentation commit; it sits on top of that range and
+changes only this file.
 Commits are local only. Do not push without separate authorization.
 Preserve untracked `.tmp-scratch/`.
 
 ## Local commits (not pushed)
 
 These commits are local only; nothing was pushed. The table has one row per
-commit of this change, the last row being the documentation commit itself;
-no count is stated in prose, because every documentation commit would have
+commit of this change - the commits of the reviewed range
+`44c247a..858e18f`, then the documentation commit that pins that range -
+and no count is stated in prose, because every documentation commit would have
 to restate a number that its own commit changes.
 
 | # | Commit | Subject |
@@ -26,7 +32,8 @@ to restate a number that its own commit changes.
 | 7 | `f6dcfa1` | `docs: map the changed-files table one-to-one onto the change` |
 | 8 | `3859026` | `docs: state the round-9 tally and cite the final full-chain run` |
 | 9 | `ec20e04` | `docs: name the reviewed range and distinguish the two handoff records` |
-| 10 | this commit | `docs: record every review round and cite the pristine-archive test run` |
+| 10 | `858e18f` | `docs: record every review round and cite the pristine-archive test run` |
+| 11 | this commit | `docs: pin the reviewed range and record the re-recorded review rounds` |
 
 Requirement source:
 `/home/bamn/.codex/attachments/458e9b15-a1ec-4247-aa20-19ec878f9be9/pasted-text-1.txt`
@@ -251,7 +258,7 @@ The manifest check only proved *reachability*: that a test file was mentioned
 by some `package.json` script or by the UI runner. A suite that only a
 standalone script runs protects no release, and the repository had **13** of
 them. This was reproduced against the committed tree rather than estimated:
-the upgraded check, run against `HEAD`, names all 13.
+the upgraded check, run against the committed tree, names all 13.
 
 | # | Suite that was never executed | Now executed by |
 |---|------------------------------|-----------------|
@@ -339,8 +346,8 @@ through a local helper) does widen it.
 array, the printed array, the unspawnable runner and the fake spawn-shaped
 name each make the check fail, and the directly spawned array, the array
 spawned through a local helper, the spawned suite and the wired suite each
-make it pass. Run against the committed `HEAD` tree, the check still names
-exactly the same 13 suites.
+make it pass. Run against the committed tree, the check still names exactly
+the same 13 suites.
 
 ### 9. A path in a log message is not an execution
 
@@ -439,9 +446,9 @@ helper that belonged to no declared slice, had no test coverage, and
 weakened a fail-closed gate: the `continuation_session_missing` refusal was
 relaxed to allow a continuation without a persisted provider session, and the
 scope key forked on a client-supplied packet hash. These hunks have been
-reverted from this change. The adapter now differs from `HEAD` only by the
-declared `PYTHONHOME` runtime root, the scrubbed probe diagnostics and the
-stable probe-failure category.
+reverted from this change. The adapter now differs from the base commit only
+by the declared `PYTHONHOME` runtime root, the scrubbed probe diagnostics
+and the stable probe-failure category.
 
 **The dead helper and the uncovered backoff restore (P3).** An unused
 `firstBoolean()` was removed. The backoff-timestamp restore on a discarded
@@ -464,8 +471,8 @@ dropped).
 ### 11. The eleventh review confirmed every round-10 fix, and its two residuals are closed
 
 The eleventh secondary review of this diff returned **approve**: it
-reconstructed the reviewed tree from `git archive HEAD` plus the patch, and
-confirmed from the code - not from the claims - that all six round-10
+reconstructed the reviewed tree from the base commit's archive plus the patch,
+and confirmed from the code - not from the claims - that all six round-10
 findings were genuinely closed: the shell-comment strip happens in the one
 place a script body is read; only the interpreter's first positional argument
 is the program; the attribution-completeness gate precedes both the
@@ -537,10 +544,13 @@ approve with no P0, P1 or P2 finding, and two P3 residuals.
 
 What round 13 verified, from the code rather than from the prose:
 
-- the change is exactly 34 files, and `git diff --name-only 44c247a..HEAD`
-  matches the reviewed file list exactly. At the time of round 13 the range
+- the change is exactly 34 files, and
+  `git diff --name-only 44c247a..858e18f` matches the reviewed file list
+  exactly. At the time of round 13 the range
   was `44c247a..e5a07c8`; every commit after it changes only `handoff.md`,
-  which is already in that set, so the range and the file count are unchanged;
+  which is already in that set, so the range and the file count are unchanged.
+  The range is written as `44c247a..858e18f` - this change's own commits -
+  so the claim stays checkable after other workstreams commit on this branch;
 - each of the five commits contains only files that belong to its stated
   subject, and neither `.tmp-scratch/` nor the generated
   `ingress-qualification-matrix.json` is in any commit;
@@ -739,6 +749,11 @@ shared working tree, each in its own fresh session. Round 14 raised two P3
 documentation findings, round 15 one P3, round 16 two P3 wording findings,
 and round 17 none. Each finding was closed by the next commit of this change,
 which the commit table at the top of this document lists.
+Rounds 18 and 19 re-recorded that same committed state after the workflow
+guard scoped its review evidence over the whole tracked tree and concurrent
+work in this checkout changed it; both returned no findings. This revision's
+documentation commit is reviewed the same way, and its verdict is recorded
+with the workflow guard.
 | Round | Reviewer | Verdict | Outcome |
 |-------|----------|---------|---------|
 | 1 | `glm-5.3-flash` | changes requested | The deferral gate alone was insufficient: the transport could still drop a notification on a stream that ended mid-send. Led to the stale-discard path. |
@@ -754,9 +769,9 @@ which the commit table at the top of this document lists.
 | 11 | `glm-5.3-flash` | approve, 2 P3 | The manifest guard matched only a double-quoted, single-line import, so four import forms that would ship an undeclared sibling module went unseen (closed in section 11); an interpreter flag outside the hardcoded value-flag set was guessed rather than refused (closed in section 11); the source-pattern assertions in the Hermes adapter test were noted and kept, because that file uses that style and the behavioural coverage lives in `src/adapter-diagnostics.test.mjs`. |
 | 12 | `glm-5.3-flash` | approve, 1 P3 | The two round-11 findings are confirmed closed with the reviewer's own fixtures: the package-manifest scanner finds a single-quoted, multi-line, side-effect, dynamic-with-options and export-from import of an undeclared sibling module, and ignores a commented-out import and a path that is only data; the interpreter-flag rule refuses an unclassified flag, keeps a classified flag value off the program, leaves the program in place after a boolean flag, and treats a python module flag as naming the program (all closed in section 11). The one P3 is the direction the module flag takes - a suite reachable only through one is reported as unexecuted rather than credited - which fails closed and is now stated in the contract. |
 | 13 | `glm-5.3-flash` | approve, 2 P3 | At that point the change was reviewed as the committed state rather than as a working tree: the five commits contain exactly the 34 reviewed files, each commit holds only files that belong to its subject, the two intermediate `package.json` blobs parse, and the checks were re-run against a reconstruction of the committed tree (closed in section 12). The two P3 findings are documentation residuals: the round-7 row still claimed its two P3 findings were unaddressed, and the Workspace App artifact prerequisite of the server-starting suites was not recorded (closed in section 12). |
-| 14 | `glm-5.3-flash` | approve, 2 P3 | The change was reviewed as the committed state. Two documentation findings. The "Changed and added files" table grouped several files into shared rows and mixed the 34 changed files with the 13 suites the change newly executes but does not modify, so it read as if those suites had been changed. Section 12 still showed the range `44c247a..e5a07c8`, which by then no longer yielded 34 files. Both closed: one row per file, the newly executed suites in their own table, and the range `44c247a..HEAD`. |
+| 14 | `glm-5.3-flash` | approve, 2 P3 | The change was reviewed as the committed state. Two documentation findings. The "Changed and added files" table grouped several files into shared rows and mixed the 34 changed files with the 13 suites the change newly executes but does not modify, so it read as if those suites had been changed. Section 12 still showed the range `44c247a..e5a07c8`, which by then no longer yielded 34 files. Both closed: one row per file, the newly executed suites in their own table, and a range that names this change's own commits. |
 | 15 | `glm-5.3-flash` | approve, 1 P3 | The round-9 row of this table listed six outcome clauses while the narrative tallied seven findings for that round, which read as a contradiction. Closed: the row carries the same tally and states that the clauses are the outcomes of the findings rather than one clause per finding. |
-| 16 | `glm-5.3-flash` | approve, 2 P3 | The changed-files table described `HANDOFF.md` as "this record", although it is a different document - the earlier scheduled-job audit record, whose deployment status this pass updated - and the header named only the starting commit of the revision. Both closed: the two rows now describe their own documents, and the header names the range `44c247a..HEAD`. |
+| 16 | `glm-5.3-flash` | approve, 2 P3 | The changed-files table described `HANDOFF.md` as "this record", although it is a different document - the earlier scheduled-job audit record, whose deployment status this pass updated - and the header named only the starting commit of the revision. Both closed: the two rows now describe their own documents, and the header names the reviewed range. |
 | 17 | `glm-5.3-flash` | approve, no findings | The two round-16 fixes were confirmed from the code: the 34-file set, the per-commit file lists, the re-run checks and the two tables. The document was confirmed internally consistent, with no overclaim. |
 
 
@@ -778,9 +793,8 @@ Executed in this pass (all from the repository root):
   when `KONTROL_WORKSPACE_APP_HTML_PATH` points at a built artifact; the
   canonical chain supplies that artifact (section 12).
 - `npm run test:manifest` — `EXIT=0`: **198 test files all executed by the
-  canonical chain** (14 scripts, 26 runners). Run against the committed
-  `HEAD` tree, the same check names the 13 suites that were reachable but
-  never executed.
+  canonical chain** (14 scripts, 26 runners). Run against the committed tree,
+  the same check names the 13 suites that were reachable but never executed.
 - `node scripts/test-manifest.mjs` — mutation-killable: removing one suite
   from `test:unit` makes the check name that suite and exit 1.
 - `node src/test-manifest.test.mjs` — the execution rule is
@@ -835,15 +849,17 @@ Executed in this pass (all from the repository root):
   is discarded, does not consume the retry budget, and does not leave a
   backoff timestamp that the next delivery surface would have to wait out.
 - `npm test` - the full canonical chain, run in an isolated tree that holds
-  `HEAD` plus exactly this 34-file change (no other working-tree edit is
-  present in it), so the result is not contaminated by concurrent work in
-  the shared checkout. `EXIT=0` on every run. The final run is against a
-  pristine extraction of the committed tree - `git archive HEAD` unpacked
-  into an empty directory, whose 575 tracked files are exactly the committed
-  ones - and is recorded in `.tmp-scratch/test-npm-test-r16.log`. The three
-  earlier runs are `.tmp-scratch/test-npm-test-r13.log`,
-  `.tmp-scratch/test-npm-test-r14.log` and
-  `.tmp-scratch/test-npm-test-r15.log`. The logs are local artifacts, not
+  this change's committed tree plus exactly this 34-file change (no other
+  working-tree edit is present in it), so the result is not contaminated by
+  concurrent work in the shared checkout. `EXIT=0` on every run. The final
+  run is against a pristine extraction of the reviewed range's tip -
+  `git archive 858e18f` unpacked into an empty directory, whose 575 tracked
+  files are exactly the committed ones - and is recorded in
+  `.tmp-scratch/test-npm-test-r20.log`. The earlier runs are
+  `.tmp-scratch/test-npm-test-r13.log`,
+  `.tmp-scratch/test-npm-test-r14.log`,
+  `.tmp-scratch/test-npm-test-r15.log` and
+  `.tmp-scratch/test-npm-test-r16.log`. The logs are local artifacts, not
   committed.
 - `node --import tsx scripts/scheduled-readonly-adapters-e2e.mjs` — CRUSH and
   Hermes both dispatched and stayed confined.
@@ -853,7 +869,8 @@ Executed in this pass (all from the repository root):
 ### Changed and added files
 
 One row per file. These are exactly the files the change touches, and
-they are the same 34 files that `git diff --name-only 44c247a..HEAD` names.
+they are the same 34 files that `git diff --name-only 44c247a..858e18f`
+names.
 
 | File | Change |
 |------|--------|
