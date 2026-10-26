@@ -172,15 +172,20 @@ async function runPtyReviewCommand(args: string[]): Promise<void> {
         name: "await_review_feedback",
         arguments: { sessionId: credential.workSessionId, timeoutMs: 900_000 },
       });
-      const receipt = feedback.structuredContent as { status?: unknown } | undefined;
+      const receipt = feedback.structuredContent as { status?: unknown; message?: unknown } | undefined;
       const status = receipt?.status;
       if (feedback.isError || !receipt || !["feedback_ready", "transferred", "timeout", "error"].includes(String(status))) {
         errorOutput.write(`${toolErrorText(feedback, "await_review_feedback returned an invalid response")}\n`);
         process.exitCode = 1;
         return;
       }
+      if (status === "error") {
+        const message = typeof receipt.message === "string" ? receipt.message : "await_review_feedback failed";
+        errorOutput.write(`${message}\n`);
+        process.exitCode = 1;
+        return;
+      }
       output.write(`${JSON.stringify(feedback.structuredContent)}\n`);
-      if (status === "error") process.exitCode = 1;
       if (status !== "timeout") return;
     }
   } finally {
