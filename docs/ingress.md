@@ -214,6 +214,48 @@ always land on the **OAuth-authenticated public listener**.
 > The planner refuses any such mapping; `kontrol ingress inspect` never probes
 > that listener.
 
+## Public origin mode decision (audit P1-06)
+
+**This deployment uses Mode A - stable public identity.** The owned domain
+behind the public HTTPS bridge is the single canonical owner-facing OAuth
+origin (`publicBaseUrl`). The MCP resource identity stays stable, so an
+ingress-backend failover is transparent to the client and never forces a
+reauthorization.
+
+Concretely:
+
+- Every **enabled** `owner_public` profile must use exactly the canonical
+  `publicBaseUrl` origin. `src/ingress/validate.ts` fails closed when an
+  enabled profile names any other origin; a disabled standby profile is
+  exempt. This is the machine-checked form of this decision.
+- Ingress backends (the HTTPS bridge, a Tailscale Funnel origin, the optional
+  WireGuard private upstream) are **not** separate client-visible identities.
+  They sit behind the canonical origin and are selected by DNS, routing, and
+  the bridge active health checks - never by the client.
+- Mode B - independent endpoint identities - remains the **explicit recovery
+  option** for the case where the canonical origin itself cannot serve. The
+  packaged `scripts/mcp-owner-stdio-bridge.mjs` implements it: it requires an
+  endpoint-specific owner-only bearer file and an exact resource identity per
+  origin, refuses to reuse one origin credential for another, and the client
+  explicitly reauthorizes when it switches origins. Using it is an
+  operator-authorized change, not an automatic fallback.
+
+Invariants that hold in both modes, and are never relaxed to make failover
+look transparent:
+
+- A bearer credential is never shared across origins, and no origin may reuse
+  another origin token file.
+- OAuth resource checks are not weakened: a token minted for one resource
+  audience is not accepted for another.
+- The tunnel-mode owner listener is never exposed through a public origin
+  (see the warning above).
+
+**Status.** The code enforces this mode and this section is the written
+decision the audit asked for. It does **not** claim public-deployment
+evidence: the `public_internet` matrix rows stay `source_verified` until a
+real public origin is deployed and a non-tailnet client qualifies it with
+`scripts/probe-ingress-bridge.mjs`.
+
 ## Inspect
 
 `kontrol ingress inspect [--json]` compares each profile against live
@@ -234,7 +276,31 @@ Classification per profile:
   upstream scheme/host/port/path, backend state, and Serve/Funnel exposure all
   match the configured route. This proves mapping only; it does not prove
   authenticated MCP readiness or external reachability.
-  - `UNKNOWN` — the status schema or node identity cannot prove the route.
+  - `UNKNOWN` — the status schema or node identity cannot prove the route,
+    OR the route's public exposure could not be attributed.
+
+The public-exposure attribution is read from the `AllowFunnel` map that
+upstream renders in the serve and funnel status documents. The two documents
+are unioned, so an attribution that survives in only one of them is still
+read. A renamed exposure field is recovered when its name still identifies
+it as the funnel attribution. A boolean HostPort map under any other name
+proves nothing - shape alone cannot tell a renamed exposure map from an
+unrelated one - so it is not read as exposure; the exposure of every route
+stays unproven instead, which keeps the route out of `MAPPING_MATCHED` rather
+than claiming it is tailnet-private. A key that is not a recognizable
+HostPort is drift rather than a route to skip, so it refuses the whole map
+instead of silently dropping the route it names. Attribution completeness is a
+property of the union of both documents, so an exposure that cannot be
+attributed, or about which the two documents contradict each other, withholds
+the positive match for every route of the profile, not only for the route it
+concerns.
+
+An unproven attribution withholds a positive finding in BOTH directions. The
+route cannot be reported as `MAPPING_MATCHED`, because its exposure may
+differ from what was configured; and it cannot be reported as `MISMATCH`
+either, because the only thing that differs may be the exposure signal that
+was dropped. A dropped signal proves nothing, so the classification stays
+`UNKNOWN` instead of `MAPPING_MATCHED` or `MISMATCH`.
 
 An enabled Tailscale profile must use the node's Tailscale-managed `.ts.net`
 name. `MAPPING_MATCHED` requires that exact name to agree with `Self.DNSName`;

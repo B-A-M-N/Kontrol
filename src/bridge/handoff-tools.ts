@@ -276,6 +276,13 @@ export function registerHandoffTools(server: McpServer, config: BridgeConfig): v
     } catch (error) { return { content: [{ type: "text" as const, text: error instanceof Error ? error.message : String(error) }], isError: true }; }
   });
 
+  // The two activation tools below are deliberately NOT mutation tools: they
+  // take no clientMutationId and produce no canonical request receipt. The
+  // one-time expiring activation grant is their idempotency fence - it is
+  // consumed atomically, so a replay of the same secret fails closed instead
+  // of binding the thread twice. The durable bridge mutations elsewhere in
+  // this file use registerMutationAppTool because they can legitimately be
+  // retried and therefore need a replayable receipt.
   registerAppTool(
     server,
     "prepare_review_thread_activation",
@@ -303,6 +310,9 @@ export function registerHandoffTools(server: McpServer, config: BridgeConfig): v
     },
   );
 
+  // Consuming a one-time grant: see the note above
+  // prepare_review_thread_activation for why this tool carries no mutation
+  // receipt.
   registerAppTool(
     server,
     "activate_review_thread",

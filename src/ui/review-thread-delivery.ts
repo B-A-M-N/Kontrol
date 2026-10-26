@@ -22,6 +22,10 @@ export async function deliverPendingReviewMessages(input: {
   const claim = getStructuredContent<ClaimedDeliveries>(result);
   if (!claim) return "idle";
   let delivered = false;
+  // The default is a host-boundary guard, not a redundant coalescing: the
+  // structured content arrives from the server over MCP and is not
+  // type-checked at runtime, so a malformed payload must not crash the
+  // delivery loop.
   for (const message of claim.messages ?? []) {
     if (inFlight.has(message.handoffId)) continue;
     inFlight.add(message.handoffId);

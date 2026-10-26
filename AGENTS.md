@@ -200,8 +200,18 @@ Current implementation contracts:
   default. A real-world claim requires exact expected behavior and is normalized
   to `outcome_verified`; it cannot complete from implementation evidence alone.
 - MCP catalog-change notifications retry only failed tool/resource channels on
-  later eligible opportunities, with bounded attempts and backoff. A successful
-  channel is never resent for the same session refresh state.
+  later eligible opportunities, with bounded attempts and backoff. A channel
+  counts as successful only when a live standalone GET SSE stream can carry the
+  notification: a send the transport drops because no such stream is attached
+  is not a success, stays eligible, and is delivered when the stream attaches.
+  Delivery state belongs to the standalone stream that carries it: a
+  successful channel is never resent while that stream stays attached, and the
+  channels are re-armed when it ends so the next standalone stream
+  re-delivers instead of inheriting a success the departed stream may never
+  have carried. A send that resolves after its stream ended is discarded as
+  stale rather than counted as a delivery: the channel stays eligible, its
+  bounded retry budget is not consumed, and a live successor surface receives
+  the notification without waiting for the next pulse opportunity.
 - Both supervised public entry paths use the same mission contract and
   reviewer-gated completion policy. Correction rounds are separate from the
   supervisor emergency cycle ceiling. Baseline capture is required before a
@@ -223,7 +233,15 @@ Current implementation contracts:
 - Confined Hermes launches bind only the selected ACP executable and its
   expected sibling Python interpreter, then run the exact selected entrypoint's
   `--check` inside Bubblewrap before accepting the worker. A launcher that
-  cannot resolve that interpreter fails as `sandbox_unavailable`.
+  cannot resolve that interpreter fails as `sandbox_unavailable`. A relocated
+  interpreter is given its own runtime root through `PYTHONHOME` so it can
+  find its standard library inside the sandbox; a launcher that cannot resolve
+  that runtime root still fails as `sandbox_unavailable`. Bounded launcher
+  and runtime-probe stderr stays in the adapter log, is scrubbed of credential
+  material before it is printed, and never reaches a scheduled-job receipt.
+  A probe failure message carries only a stable category
+  (`timed_out`, `spawn_failed`, `terminated_without_status`, `exit_<status>`): no path, no stderr, and no
+  spawn error text ever travel into the 503 body.
 - Tunnel supervision distinguishes local daemon liveness from remote
   control-plane state. Transient throttling, authentication, and upstream
   outages remain degraded without restarting a healthy tunnel/core; a local
@@ -233,8 +251,19 @@ Current implementation contracts:
   durable continuity.
 - Ingress profiles are checked against exact route identity and authorization
   topology. Tailscale route changes use profile-specific apply/disable receipts
-  and never global resets. Public bridge Caddy configuration is packaged with
-  content hashes; its optional Tailscale/WireGuard multipath uses an
+  and never global resets. A route's public exposure is read from the
+  union of both Tailscale status documents, so an attribution that survives in
+  only one of them is still read, and a renamed exposure field is recovered
+  when its name still identifies it as the funnel attribution. A boolean map
+  under any other name proves nothing - shape alone cannot tell a renamed
+  exposure map from an unrelated one - so the exposure of every route stays
+  unproven rather than guessed. Attribution completeness is a property of the
+  union of both documents, so an exposure that cannot be attributed, or about
+  which the two documents contradict each other, withholds the positive match
+  for every route of that profile: no route of it is reported as a proven
+  tailnet-private route, and its classification stays `UNKNOWN`.
+  Public bridge Caddy configuration is packaged with content hashes; its
+  optional Tailscale/WireGuard multipath uses an
   mTLS-authenticated host gateway bound only to private interface addresses,
   active health checks, and no automatic MCP request retries. Health evidence
   remains profile-scoped and cannot restart a healthy Kontrol core.
@@ -261,8 +290,10 @@ Current implementation contracts:
   `sandbox_unavailable`. Network access is disabled by default. An operator may
   set `KONTROL_READ_ONLY_NETWORK_POLICY=host` to share host networking for model
   inference; that choice is signed into each grant and returned in its receipt,
-  and the agent cannot elevate it. Read-only agent environment additions require
-  `KONTROL_READ_ONLY_AGENT_ENV_ALLOWLIST`.
+  and the agent cannot elevate it. A host-networked read-only run binds the host
+  resolver configuration read-only so it can resolve names; a run without host
+  networking observes no host resolver at all. Read-only agent environment
+  additions require `KONTROL_READ_ONLY_AGENT_ENV_ALLOWLIST`.
 - Adapter dispatch receipts bind the idempotency key to a canonical request
   fingerprint and execution identity before worker launch. Identical retries
   return the existing receipt, conflicting content is rejected, startup
@@ -306,6 +337,54 @@ Current implementation contracts:
   stale metadata cannot be reused for a new release identity.
   `generation.json` owns active, previous, and last-known-good artifacts; those
   pointers rotate only after readiness is proven.
+- The published package ships only the files `package.json` declares. Every
+  relative import of a shipped script must resolve to a declared package file,
+  transitively; an undeclared sibling module installs cleanly and then fails
+  with `ERR_MODULE_NOT_FOUND` in the clean install. The package manifest
+  check enforces this. The manifest check is a scanner, not a pattern: the
+  specifier of an import is whatever string literal follows the import or
+  export keyword, in any quote style and on any number of lines, so a
+  single-quoted or multi-line import is found exactly like a double-quoted
+  one-line import. A commented-out import is not an import, and a path that
+  is only data - inside a log message - names no module.
+- Every test file in the repository must be EXECUTED by the canonical test
+  chain, not merely mentioned by it. `scripts/test-manifest.mjs` resolves the
+  chain the canonical test script actually runs - package.json script bodies,
+  the runner scripts they spawn, and the script arrays those runners really
+  RUN - and fails when a suite is outside it. A suite that genuinely cannot
+  run in the chain needs an entry in `scripts/test-manifest-allowlist.json` with a
+  documented reason, and a stale entry (the suite is executed again, or the
+  file is gone) is itself a failure. Reachability alone is not coverage: a
+  suite that only a standalone script runs protects no release.
+  Execution is proven by an invocation context, never by a mention: a suite
+  path counts only as an interpreter command in a package.json script body
+  or as an argument of a call in a runner the chain spawns that really starts
+  a process. A comment, a self-referencing log line, and a `node --check` parse
+  are not executions. A shell comment is not a command either: a suite named
+  behind a `#` widens neither the closure nor the executed set. A script-name
+  array widens the chain only when the
+  name reaches a process: a runner that only logs, prints, or asserts over
+  the array proves nothing, and a call whose name merely sounds like a spawn
+  is not a spawn unless it reaches the `node:child_process` API.
+  The path must reach the process as the program it starts or as an element
+  of its argument vector. A path that is only DATA - quoted in a log
+  message, carried in an environment value or an options object - names no
+  program and runs nothing, and a call quoted inside a string literal is not
+  a call at all. A spawn helper that lives in an imported local module is
+  real code at runtime, so the closure it drives counts.
+  In a script body only the FIRST positional argument of an interpreter is
+  the program it runs: a flag value (`--config`, `--import`) and an argument
+  after the program are data the program reads, so a path there names no
+  program. An interpreter flag the checker cannot classify fails the check,
+  because the checker cannot know whether such a flag consumes the argument
+  that follows it and therefore cannot know which token is the program. A
+  flag that consumes the next argument is classified as a value flag, a flag
+  that does not is classified as a boolean flag, and a flag whose value names
+  the program - a python module - is classified as a module flag. The paths
+  after a module flag are arguments to that program, and the checker cannot
+  tell a module that RUNS its arguments from one that only reads them, so a
+  suite reachable only that way is reported as unexecuted rather than
+  credited.
 - The MCP tool surface has a mandatory structured inspection contract:
   `read`, `grep`, `glob`, `ls`, `git_status`, `git_log`, `git_diff`, and
   `git_show` are registered and verified in every tool mode. `git_show` with a
