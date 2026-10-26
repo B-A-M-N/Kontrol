@@ -145,6 +145,8 @@ async function testDatabaseConfiguration(stateDir: string): Promise<void> {
       { version: 102, name: "acp-run-exact-input-task" },
       { version: 103, name: "review-browser-binding-revision-fence" },
       { version: 104, name: "scheduled-job-peer-pull-target" },
+      { version: 105, name: "durable-agent-reply-dispatch-ack" },
+      { version: 106, name: "startup-recovery-selective-indexes" },
     ]);
   } finally {
     database.close();
