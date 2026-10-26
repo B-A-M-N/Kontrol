@@ -7,7 +7,7 @@ import { createDispatchOutbox } from "../dispatch-outbox.js";
 import { createAgentMessageManager } from "../agent-messages.js";
 import { createWorkSessionManager } from "../work-sessions.js";
 import { createEventStore } from "../event-log.js";
-import { createReplyDispatcher } from "./reply-dispatcher.js";
+import { createReplyDispatcher, resolveReplyDispatchTarget } from "./reply-dispatcher.js";
 import type { BridgeConfig } from "./context.js";
 
 const root = await mkdtemp(join(tmpdir(), "kontrol-reply-dispatcher-test-"));
@@ -30,6 +30,30 @@ try {
     dispatchOutbox,
     knownAgents: [],
   } as unknown as BridgeConfig;
+
+  const origin = { id: "agent-origin", name: "origin", url: "http://origin", capabilities: ["native-reply-resume"] };
+  const destination = { id: "agent-destination", name: "destination", url: "http://destination", capabilities: ["native-reply-resume"] };
+  const transferredRun = { runId: "run-transferred", agentName: origin.name, workSessionId: session.id };
+  const routingConfig = {
+    agentRegistry: {
+      getRun: (runId: string) => runId === transferredRun.runId ? transferredRun : undefined,
+      getLatestDispatchAttemptForRun: () => ({ runId: transferredRun.runId, agentId: destination.id, attemptNumber: 2, status: "accepted" }),
+      listAlive: () => [origin, destination],
+    },
+  } as unknown as BridgeConfig;
+  assert.equal(resolveReplyDispatchTarget(routingConfig, transferredRun.runId, session.id)?.id, destination.id,
+    "clarification replies follow the latest durable transfer attempt rather than the logical run's origin agent name");
+  assert.equal(resolveReplyDispatchTarget(routingConfig, transferredRun.runId, "foreign-session"), undefined,
+    "reply routing rejects a logical run from a different work session");
+  const missingIdentityConfig = {
+    ...routingConfig,
+    agentRegistry: {
+      ...routingConfig.agentRegistry,
+      getLatestDispatchAttemptForRun: () => ({ runId: transferredRun.runId, attemptNumber: 2, status: "accepted" }),
+    },
+  } as unknown as BridgeConfig;
+  assert.equal(resolveReplyDispatchTarget(missingIdentityConfig, transferredRun.runId, session.id), undefined,
+    "reply routing fails closed when the latest attempt has no durable destination identity");
 
   const question = agentMessages.post({
     workSessionId: session.id,

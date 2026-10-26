@@ -595,14 +595,20 @@ try {
     const dispatchKey = "disp-response-dropped";
     let acceptedRecord: { run_id: string; dispatch_idempotency_key: string } | undefined;
     let dispatchRequests = 0;
+    let remoteExecutions = 0;
     const peer = createServer(async (req, res) => {
       if (req.method === "POST" && req.url === "/runs") {
         dispatchRequests += 1;
         const body = await readJson(req);
-        acceptedRecord = {
-          run_id: "remote-after-drop",
-          dispatch_idempotency_key: String(body.dispatch_idempotency_key),
-        };
+        if (!acceptedRecord) {
+          remoteExecutions += 1;
+          acceptedRecord = { run_id: "remote-after-drop", dispatch_idempotency_key: String(body.dispatch_idempotency_key) };
+        }
+        if (dispatchRequests > 1) {
+          res.writeHead(202, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ accepted: true, run_id: acceptedRecord.run_id, status: "running", dispatch_idempotency_key: acceptedRecord.dispatch_idempotency_key }));
+          return;
+        }
         // Model an adapter that persisted/started the real run before the
         // acceptance response was lost at the transport boundary.
         res.destroy();
@@ -656,11 +662,26 @@ try {
     assert.deepEqual(lookup, { status: "found", remoteRunId: "remote-after-drop", executionStatus: "running" });
     agentRegistry.updateDispatchAttempt(dispatchKey, { status: "accepted", remoteRunId: lookup.remoteRunId });
     agentRegistry.updateRun(uncertainRun!.runId, { status: "running", remoteRunId: lookup.remoteRunId });
+    const retried = await callRemoteAgent(gateway, {
+      agentUrl: `http://127.0.0.1:${peerPort}`,
+      agentName: "remote-agent",
+      task: "audit after connection loss",
+      workspaceSessionId: "ws-response-loss",
+      workSessionId: workSession.id,
+      existingRunId: uncertainRun!.runId,
+      dispatchIdempotencyKey: dispatchKey,
+      mode: "async",
+      fireAndForget: true,
+    });
+    assert.equal(retried.status, "running", "a retry with the same dispatch key reconciles to its accepted worker execution");
+    assert.equal(retried.attemptNumber, 1, "a retry preserves the accepted dispatch attempt identity");
+    assert.equal(remoteExecutions, 1, "the peer's idempotency boundary creates only one remote execution");
     const submission = workSessions.submitForReview({ workSessionId: workSession.id, diff: "report", snapshotKind: "git", snapshotRef: "snapshot-a" });
     assert.ok(submission.id);
     assert.equal(agentRegistry.getRunByWorkSessionId(workSession.id)?.runId, uncertainRun?.runId,
       "the later submission still correlates to the original logical run after recovery");
-    assert.equal(dispatchRequests, 1, "recovery lookup does not create a second remote run");
+    assert.equal(dispatchRequests, 2, "same-identity recovery may repeat the request after reconciliation");
+    assert.equal(remoteExecutions, 1, "same-identity recovery does not create a second remote run");
     acceptedRecord = undefined;
     assert.deepEqual(await lookupPeerDispatch({
       agentUrl: `http://127.0.0.1:${peerPort}`,

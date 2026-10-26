@@ -1,5 +1,6 @@
 import { DEFAULT_CLAIM_LEASE_MS } from "../continuation.js";
 import type { DispatchOutboxEvent, OutboxClaim } from "../dispatch-outbox.js";
+import { lookupPeerDispatch } from "../acp-gateway.js";
 import type { BridgeConfig } from "./context.js";
 
 export interface ReplyDispatcher {
@@ -9,8 +10,20 @@ export interface ReplyDispatcher {
 }
 
 const REPLY_DISPATCHER_ID = "kontrol-reply-dispatcher";
+const replyDispatchKey = (replyId: string, revision: number, runId: string, workerAttempt: number) =>
+  `reply_${replyId}_rev_${revision}_run_${runId}_attempt_${workerAttempt}`;
 
 const claimOf = (event: DispatchOutboxEvent): OutboxClaim => ({ eventId: event.id, claimOwner: event.claimedBy ?? "", claimToken: event.claimToken ?? "" });
+
+/** Resolve the worker that currently owns the logical run after any transfer.
+ * A run's agentName is its immutable origin identity and cannot route replies. */
+export function resolveReplyDispatchTarget(config: BridgeConfig, runId: string, workSessionId: string) {
+  const run = config.agentRegistry.getRun(runId);
+  if (!run || run.workSessionId !== workSessionId) return undefined;
+  const attempt = config.agentRegistry.getLatestDispatchAttemptForRun(runId);
+  if (!attempt || attempt.runId !== runId || !attempt.agentId) return undefined;
+  return config.agentRegistry.listAlive().find((agent) => agent.id === attempt.agentId);
+}
 
 export function createReplyDispatcher(config: BridgeConfig): ReplyDispatcher {
   let timer: ReturnType<typeof setTimeout> | null = null;
@@ -32,6 +45,10 @@ export function createReplyDispatcher(config: BridgeConfig): ReplyDispatcher {
       config.dispatchOutbox?.markCompleted(claimOf(event));
       return "completed";
     }
+    if (reply.status === "delivering") {
+      config.dispatchOutbox?.markCompleted(claimOf(event));
+      return "completed";
+    }
     const session = config.workSessions.get(reply.workSessionId);
     if (!session || ["approved", "rejected", "cancelled", "failed", "failed_protocol"].includes(session.status)) {
       agentMessages.setReplyDelivery({
@@ -49,21 +66,65 @@ export function createReplyDispatcher(config: BridgeConfig): ReplyDispatcher {
     }
     const wait = agentMessages.getActiveWaitForMessage(reply.messageId);
     const run = wait?.runId ? config.agentRegistry.getRun(wait.runId) : undefined;
-    const agentForRun = run?.agentName ? config.agentRegistry.listAlive().find((candidate) => candidate.name === run.agentName) : undefined;
+    if (!wait || wait.workSessionId !== reply.workSessionId || !run || run.workSessionId !== reply.workSessionId) {
+      config.dispatchOutbox?.markCompleted(claimOf(event));
+      return "completed";
+    }
+    const agentForRun = resolveReplyDispatchTarget(config, run.runId, reply.workSessionId);
     const supportsNativeReply = agentForRun?.capabilities.includes("native-reply-resume") === true;
     if (wait?.resumeOnReply === true && supportsNativeReply) {
-      // Structured native resume: reuse the original logical run and adapter
-      // contract. The adapter is expected to expose needs_input/answer turn
-      // semantics and authenticated acknowledgement.
-      const result = await defaultResumeReply(config, reply, wait);
+      const dispatchKey = replyDispatchKey(reply.id, reply.replyRevision, run.runId, wait.workerAttempt);
+      const priorAttempt = config.agentRegistry.getDispatchAttemptByIdempotencyKey(dispatchKey);
+      if (priorAttempt) {
+        if (priorAttempt.runId !== run.runId || priorAttempt.agentId !== agentForRun.id) {
+          agentMessages.setReplyDelivery({ replyId: reply.id, expectedStatus: reply.status, nextStatus: "blocked" });
+          config.dispatchOutbox?.markCompleted(claimOf(event));
+          return "completed";
+        }
+        if (priorAttempt.status === "accepted" && priorAttempt.remoteRunId) {
+          agentMessages.setReplyDelivery({ replyId: reply.id, expectedStatus: reply.status, nextStatus: "delivering" });
+          config.dispatchOutbox?.markCompleted(claimOf(event));
+          return "completed";
+        }
+        if (priorAttempt.status !== "uncertain" && priorAttempt.status !== "dispatching") {
+          agentMessages.setReplyDelivery({ replyId: reply.id, expectedStatus: reply.status, nextStatus: "blocked" });
+          config.dispatchOutbox?.markCompleted(claimOf(event));
+          return "completed";
+        }
+        let lookup;
+        try {
+          lookup = await lookupPeerDispatch({
+            agentUrl: agentForRun.url,
+            adapterSecret: config.adapterSecret,
+            dispatchIdempotencyKey: dispatchKey,
+          });
+        } catch {
+          return "deferred";
+        }
+        if (lookup.status === "found" && lookup.remoteRunId) {
+          config.agentRegistry.updateDispatchAttempt(dispatchKey, { status: "accepted", remoteRunId: lookup.remoteRunId });
+          config.agentRegistry.updateRun(run.runId, { status: "running", remoteRunId: lookup.remoteRunId, attemptNumber: priorAttempt.attemptNumber });
+          agentMessages.setReplyDelivery({ replyId: reply.id, expectedStatus: reply.status, nextStatus: "delivering" });
+          config.dispatchOutbox?.markCompleted(claimOf(event));
+          return "completed";
+        }
+        // Only an explicit adapter receipt proving the launch gate never
+        // opened permits a retry. `unknown` includes unsupported or ambiguous
+        // lookups and therefore stays fenced.
+        if (lookup.status !== "unstarted") return "deferred";
+      }
+      // A deterministic reply identity plus the adapter's exact dispatch key
+      // makes a retry reuse the same ACP attempt after an authoritative
+      // `unstarted` receipt.
+      const result = await defaultResumeReply(config, reply, wait, dispatchKey);
       if (result === "deferred" || result === "failed") return result;
       agentMessages.setReplyDelivery({
         replyId: reply.id,
         expectedStatus: reply.status as "pending_delivery" | "delivering",
         nextStatus: "delivering",
       });
-      config.dispatchOutbox?.release(claimOf(event), DEFAULT_CLAIM_LEASE_MS, "native reply resume dispatched");
-      return "deferred";
+      config.dispatchOutbox?.markCompleted(claimOf(event));
+      return "completed";
     }
     if (wait?.resumeOnReply !== true) {
       // MCP-capable live waiter is responsible for its own consumption. Keep
@@ -128,9 +189,9 @@ export function createReplyDispatcher(config: BridgeConfig): ReplyDispatcher {
     }, Math.max(0, Date.parse(next.availableAt) - Date.now()));
   }
 
-  async function defaultResumeReply(config: BridgeConfig, reply: NonNullable<ReturnType<NonNullable<typeof config.agentMessages>["getReply"]>>, wait: NonNullable<ReturnType<NonNullable<typeof config.agentMessages>["getActiveWaitForMessage"]>>): Promise<"completed" | "deferred" | "failed"> {
+  async function defaultResumeReply(config: BridgeConfig, reply: NonNullable<ReturnType<NonNullable<typeof config.agentMessages>["getReply"]>>, wait: NonNullable<ReturnType<NonNullable<typeof config.agentMessages>["getActiveWaitForMessage"]>>, dispatchIdempotencyKey: string): Promise<"completed" | "deferred" | "failed"> {
     const run = wait.runId ? config.agentRegistry.getRun(wait.runId) : undefined;
-    const agent = config.agentRegistry.listAlive().find((candidate) => candidate.name === run?.agentName);
+    const agent = run ? resolveReplyDispatchTarget(config, run.runId, reply.workSessionId) : undefined;
     if (!run || !agent) return "failed";
     const result = await import("../acp-gateway.js").then(({ callRemoteAgent }) => callRemoteAgent(
       { agentRegistry: config.agentRegistry, workspaces: config.workspaces, workSessions: config.workSessions, eventStore: config.eventStore, adapterSecret: config.adapterSecret },
@@ -142,11 +203,13 @@ export function createReplyDispatcher(config: BridgeConfig): ReplyDispatcher {
         workspaceSessionId: config.workSessions.get(reply.workSessionId)?.workspaceSessionId,
         workSessionId: reply.workSessionId,
         existingRunId: run.runId,
+        dispatchIdempotencyKey,
         mode: "async",
         fireAndForget: true,
       },
     ));
-    return result.status === "failed" ? "failed" : "completed";
+    if (result.status === "uncertain" || result.status === "dispatch_uncertain") return "deferred";
+    return result.status === "running" ? "completed" : "failed";
   }
 
   return {

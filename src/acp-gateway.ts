@@ -632,7 +632,13 @@ export async function callRemoteAgent(
       throw new Error(`Cannot resume non-resumable run ${existing.runId}: ${existing.status}`);
     }
     run = existing;
-    attemptNumber = (existing.attemptNumber ?? 1) + 1;
+    const priorAttempt = params.dispatchIdempotencyKey
+      ? config.agentRegistry.getDispatchAttemptByIdempotencyKey(params.dispatchIdempotencyKey)
+      : undefined;
+    if (priorAttempt && (priorAttempt.runId !== existing.runId || priorAttempt.agentId !== (params.agentId ?? existing.agentId))) {
+      throw new Error("ACP dispatch idempotency key is already bound to a different execution identity.");
+    }
+    attemptNumber = priorAttempt?.attemptNumber ?? (existing.attemptNumber ?? 1) + 1;
     expectedDispatchStatus = "resuming";
     config.agentRegistry.updateRun(run.runId, {
       attemptNumber,
