@@ -427,6 +427,9 @@ async function handle(req, res) {
   if (boundedWriteAuthorization.boundedWrite && !boundedWriteAuthorization.valid) {
     return writeJson(res, 403, { error: { code: "bounded_file_write_grant_invalid", message: "A valid Kontrol-issued bounded file-write grant is required." } });
   }
+  if (body.context_transfer && !isValidContextTransfer(body.context_transfer)) {
+    return writeJson(res, 409, { error: { code: "context_transfer_invalid", message: "Cross-agent context transfer failed its immutable packet hash check." } });
+  }
   const run = {
     remoteRunId: `hermes_${randomUUID().slice(0, 8)}`,
     devRunId: body.parent_run_id || body.run_id,
@@ -434,6 +437,7 @@ async function handle(req, res) {
     workspaceSessionId: body.workspace_session_id,
     agentId: body.agent_id,
     dispatchIdempotencyKey,
+    contextTransfer: body.context_transfer,
     attemptNumber: body.attempt_number,
     requestFingerprint,
     task,
@@ -466,7 +470,10 @@ async function handle(req, res) {
     childExit: undefined,
   };
   run.providerGeneration = HERMES_PROVIDER_GENERATION;
-  const providerSessionKey = run.workSessionId ? hashProviderSessionKey(run.workSessionId) : undefined;
+  run.providerSessionScope = run.contextTransfer?.id
+    ? `${run.workSessionId}:transfer:${run.contextTransfer.id}`
+    : run.workSessionId;
+  const providerSessionKey = run.providerSessionScope ? hashProviderSessionKey(run.providerSessionScope) : undefined;
   const existingProviderBinding = providerSessionKey ? providerSessionBindings.get(providerSessionKey) : undefined;
   if (existingProviderBinding && (existingProviderBinding.workSessionId !== run.workSessionId
     || existingProviderBinding.agentId !== run.agentId
@@ -476,7 +483,14 @@ async function handle(req, res) {
       error: { code: "continuation_session_binding_conflict", message: "The persisted Hermes provider session belongs to a different work session, agent, workspace, or provider generation." },
     });
   }
-  if (body.continuation_id && !existingProviderBinding) {
+  if (run.contextTransfer?.fresh && existingProviderBinding) {
+    return writeJson(res, 409, {
+      error: { code: "context_transfer_already_started", message: "This immutable context transfer already has a provider session; refusing to start it as a fresh transfer again." },
+    });
+  }
+  const requiresExistingProviderBinding = Boolean(run.continuationId && !run.contextTransfer?.fresh)
+    || Boolean(run.contextTransfer?.id && !run.contextTransfer.fresh);
+  if (requiresExistingProviderBinding && !existingProviderBinding) {
     return writeJson(res, 409, {
       error: { code: "continuation_session_missing", message: "No persisted Hermes provider session exists for this continuation; refusing to start a new conversation." },
     });
@@ -485,7 +499,7 @@ async function handle(req, res) {
   if (run.workSessionId) {
     try {
       run.hermesSessionHome = prepareHermesSessionHome(
-        run.workSessionId,
+        run.providerSessionScope,
         run.workspaceRoot,
         !existingProviderBinding,
         !run.readOnlyAudit && !run.boundedFileWrite,
@@ -1044,7 +1058,7 @@ async function persistHermesProviderSession(run, msg) {
       || msg.providerSessionId.trim().length === 0) {
       throw new Error("provider_session_binding_mismatch");
     }
-    const key = hashProviderSessionKey(run.workSessionId);
+    const key = hashProviderSessionKey(run.providerSessionScope ?? run.workSessionId);
     const existing = providerSessionBindings.get(key);
     if (existing && existing.providerSessionId !== msg.providerSessionId) {
       throw new Error("provider_session_binding_conflict");
@@ -1761,6 +1775,15 @@ function positiveDuration(value, fallback) {
 
 function hashProviderSessionKey(workSessionId) {
   return createHash("sha256").update(workSessionId).digest("hex");
+}
+
+function isValidContextTransfer(value) {
+  if (!value || typeof value.id !== "string" || value.id.length === 0
+    || typeof value.sha256 !== "string" || !/^[a-f0-9]{64}$/i.test(value.sha256)
+    || typeof value.fresh !== "boolean"
+    || !value.packet || typeof value.packet !== "object" || Array.isArray(value.packet)) return false;
+  return value.packet.transferId === value.id
+    && createHash("sha256").update(JSON.stringify(value.packet)).digest("hex") === value.sha256;
 }
 
 function prepareHermesSessionHome(workSessionId, workspaceRoot, createIfMissing, seedFromHostProfile) {

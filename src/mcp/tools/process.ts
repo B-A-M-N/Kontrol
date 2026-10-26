@@ -55,6 +55,7 @@ export function registerCodexProcessTools(
           .boolean()
           .optional()
           .describe("Allocate a pseudo-terminal for interactive commands. Defaults to false."),
+        agentPty: z.boolean().optional().describe("Bind this interactive PTY to the authenticated worker run for durable observation after reconnect or restart. Requires an authenticated worker connection and tty=true."),
         columns: z.number().int().min(1).max(1_000).optional().describe("Initial PTY width. Defaults to 80."),
         rows: z.number().int().min(1).max(1_000).optional().describe("Initial PTY height. Defaults to 24."),
         workingDirectory: z
@@ -80,13 +81,21 @@ export function registerCodexProcessTools(
       ...toolWidgetDescriptorMeta(config, "shell"),
       annotations: SHELL_TOOL_ANNOTATIONS,
     },
-    async ({ workspaceId, cmd, approvalResumeId, clientMutationId, tty, columns, rows, workingDirectory, yieldTimeMs, maxOutputTokens }) => {
+    async ({ workspaceId, cmd, approvalResumeId, clientMutationId, tty, agentPty, columns, rows, workingDirectory, yieldTimeMs, maxOutputTokens }) => {
       const startedAt = performance.now();
       const blocked = await runMutationBarrier(prepareForMutation, workspaceId, "exec_command");
       if (blocked) return blocked;
       const workspace = workspaces.getWorkspace(workspaceId);
       const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
       if (bindingErr) return bindingErr;
+      if (agentPty && (connectionContext?.authenticatedRole !== "worker" || !tty
+        || !connectionContext.workSessionId || !connectionContext.workspaceSessionId
+        || !connectionContext.runId || !connectionContext.authenticatedPrincipalId)) {
+        return {
+          content: [{ type: "text" as const, text: "agentPty requires tty=true and a signed worker connection bound to a work session, run, workspace session, and principal." }],
+          isError: true,
+        };
+      }
       const cwd = workspaces.resolveWorkingDirectory(workspace, workingDirectory);
       const policyPath = canonicalPolicyPath(workspace.root, workingDirectory, cwd);
 
@@ -105,7 +114,7 @@ export function registerCodexProcessTools(
           cmd,
           undefined,
           approvalResumeId,
-          { cmd, workingDirectory, tty, columns, rows, yieldTimeMs, maxOutputTokens, clientMutationId },
+          { cmd, workingDirectory, tty, agentPty, columns, rows, yieldTimeMs, maxOutputTokens, clientMutationId },
           scheduledExecutionPolicy(connectionContext?.workSessionId),
         );
         if (!approved.allowed) {
@@ -124,6 +133,13 @@ export function registerCodexProcessTools(
           ownerId: processSessionOwnerId(connectionContext),
           workSessionId: connectionContext?.workSessionId,
           principalId: connectionContext?.authenticatedPrincipalId,
+          ...(agentPty ? {
+            agentPtyBinding: {
+              workspaceSessionId: connectionContext!.workspaceSessionId!,
+              runId: connectionContext!.runId!,
+              ownerPrincipalId: connectionContext!.authenticatedPrincipalId!,
+            },
+          } : {}),
           command: cmd,
           cwd,
           tty,

@@ -169,6 +169,9 @@ export interface PersistentAcpRun {
   /** Server-owned scheduled execution authority; adapters cannot set this. */
   scheduledExecutionMode?: string;
   status: string;
+  /** Exact original task, retained for context transfer; preview is for display only. */
+  inputTask?: string;
+  inputTaskSha256?: string;
   inputPreview?: string;
   outputPreview?: string;
   outputJson?: string;
@@ -229,6 +232,7 @@ export interface AgentRegistryManager {
     agentId?: string;
     workspaceSessionId?: string;
     workSessionId?: string;
+    inputTask?: string;
     inputPreview?: string;
     webhookUrl?: string;
     status?: string;
@@ -549,6 +553,7 @@ class SqliteAgentRegistryManager implements AgentRegistryManager {
     agentId?: string;
     workspaceSessionId?: string;
     workSessionId?: string;
+    inputTask?: string;
     inputPreview?: string;
     webhookUrl?: string;
     status?: string;
@@ -568,6 +573,10 @@ class SqliteAgentRegistryManager implements AgentRegistryManager {
       attemptNumber: input.attemptNumber ?? 1,
       scheduledExecutionMode: input.scheduledExecutionMode,
       status: input.status ?? "created",
+      inputTask: input.inputTask,
+      inputTaskSha256: input.inputTask === undefined
+        ? undefined
+        : createHash("sha256").update(input.inputTask).digest("hex"),
       inputPreview: input.inputPreview,
       webhookUrl: input.webhookUrl,
       webhookDelivered: false,
@@ -586,6 +595,8 @@ class SqliteAgentRegistryManager implements AgentRegistryManager {
         attemptNumber: run.attemptNumber,
         scheduledExecutionMode: run.scheduledExecutionMode ?? null,
         status: run.status,
+        inputTask: run.inputTask ?? null,
+        inputTaskSha256: run.inputTaskSha256 ?? null,
         inputPreview: run.inputPreview ?? null,
         outputPreview: null,
         outputJson: null,
@@ -605,6 +616,8 @@ class SqliteAgentRegistryManager implements AgentRegistryManager {
   updateRun(runId: string, updates: Partial<PersistentAcpRun>): void {
     const values: Record<string, unknown> = {};
     if (updates.status !== undefined) values.status = updates.status;
+    if (updates.inputTask !== undefined) values.inputTask = updates.inputTask;
+    if (updates.inputTaskSha256 !== undefined) values.inputTaskSha256 = updates.inputTaskSha256;
     if (updates.outputPreview !== undefined) values.outputPreview = updates.outputPreview;
     if (updates.outputJson !== undefined) values.outputJson = updates.outputJson;
     if (updates.errorMessage !== undefined) values.errorMessage = updates.errorMessage;
@@ -970,6 +983,8 @@ function rowToPersistentRun(row: AcpRunRow): PersistentAcpRun {
     attemptNumber: row.attemptNumber ?? 1,
     scheduledExecutionMode: row.scheduledExecutionMode ?? undefined,
     status: row.status,
+    inputTask: row.inputTask ?? undefined,
+    inputTaskSha256: row.inputTaskSha256 ?? undefined,
     inputPreview: row.inputPreview ?? undefined,
     outputPreview: row.outputPreview ?? undefined,
     outputJson: row.outputJson ?? undefined,

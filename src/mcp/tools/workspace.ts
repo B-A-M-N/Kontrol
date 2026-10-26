@@ -2085,29 +2085,39 @@ export function registerWorkspaceTools(
     });
   };
 
+  const boundedGitText = (result: Awaited<ReturnType<typeof git>>, emptyText: string): string => {
+    const output = result.stdout || emptyText;
+    return result.stdoutTruncated
+      ? `${output}\n\n[Truncated: Git inspection output exceeded its bounded capture.]`
+      : output;
+  };
+
   registerGitInspection(toolNames.gitStatus, "Git status", "Read-only short Git status for an open workspace; never requires shell approval.", {}, async (root, path) => {
-    const result = await git(root, ["status", "--short", "--branch", "--untracked-files=all", ...(path ? ["--", path] : [])], { maxBuffer: 262_144, timeoutMs: 15_000 });
-    return result.stdout || "(clean)";
+    // Report untracked directories as entries instead of expanding every
+    // nested file. The bounded Git capture also prevents huge status output
+    // from failing before MCP can return a truncation marker.
+    const result = await git(root, ["status", "--short", "--branch", "--untracked-files=normal", ...(path ? ["--", path] : [])], { maxOutputBytes: 45_000, timeoutMs: 15_000 });
+    return boundedGitText(result, "(clean)");
   });
   registerGitInspection(toolNames.gitLog, "Git log", "Read-only bounded Git history for an open workspace.", { limit: z.number().int().min(1).max(100).optional() }, async (root, path, input) => {
     const limit = Number(input.limit ?? 20);
-    const result = await git(root, ["log", `--max-count=${limit}`, "--date=iso-strict", "--format=%H%x09%ad%x09%an%x09%s", ...(path ? ["--", path] : [])], { maxBuffer: 262_144, timeoutMs: 15_000 });
-    return result.stdout || "(no commits)";
+    const result = await git(root, ["log", `--max-count=${limit}`, "--date=iso-strict", "--format=%H%x09%ad%x09%an%x09%s", ...(path ? ["--", path] : [])], { maxOutputBytes: 45_000, timeoutMs: 15_000 });
+    return boundedGitText(result, "(no commits)");
   });
   registerGitInspection(toolNames.gitDiff, "Git diff", "Read-only unified diff for an open workspace. Use git show for committed file content.", { staged: z.boolean().optional() }, async (root, path, input) => {
     const args = ["diff", "--no-ext-diff", "--unified=3"];
     if (input.staged === true) args.push("--cached");
     if (path) args.push("--", path);
-    const result = await git(root, args, { maxBuffer: 262_144, timeoutMs: 15_000 });
-    return result.stdout || "(no diff)";
+    const result = await git(root, args, { maxOutputBytes: 45_000, timeoutMs: 15_000 });
+    return boundedGitText(result, "(no diff)");
   });
   registerGitInspection(toolNames.gitShow, "Git show", "Read-only bounded Git view for an open workspace. With path, returns the file or tree object at the selected revision; without path, returns revision metadata and stats.", { revision: z.string().regex(/^[A-Za-z0-9._/~^@{}-]+$/).default("HEAD") }, async (root, path, input) => {
     const revision = String(input.revision ?? "HEAD");
     const args = ["show", "--no-ext-diff", "--no-textconv"];
     if (path) args.push(`${revision}:${path}`);
     else args.push("--format=fuller", "--no-patch", "--stat", revision);
-    const result = await git(root, args, { maxBuffer: 262_144, timeoutMs: 15_000 });
-    return result.stdout || (path ? "" : "(empty object)");
+    const result = await git(root, args, { maxOutputBytes: 45_000, timeoutMs: 15_000 });
+    return boundedGitText(result, path ? "" : "(empty object)");
   });
 
   if (config.toolMode !== "codex") {

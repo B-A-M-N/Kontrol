@@ -64,6 +64,8 @@ export function createMaintenanceCoordinator(deps: MaintenanceDeps) {
   const COMPACT_BATCH_SIZE = 250;
   let maintenanceStopped = false;
   let maintenanceRunning = false;
+  let currentCycleCompletion: Promise<void> | undefined;
+  let resolveCurrentCycle: (() => void) | undefined;
   let runtimeReconciliationCursor: string | undefined;
   let compactionCursor: string | undefined;
   const maintenanceStats: {
@@ -167,6 +169,7 @@ export function createMaintenanceCoordinator(deps: MaintenanceDeps) {
     maintenanceStats.cycles++;
     maintenanceStats.lastStartedAt = new Date().toISOString();
     maintenanceStats.lastError = undefined;
+    currentCycleCompletion = new Promise<void>((resolve) => { resolveCurrentCycle = resolve; });
     const startedAt = performance.now();
     let page: string[] = [];
     let pageIndex = 0;
@@ -185,6 +188,10 @@ export function createMaintenanceCoordinator(deps: MaintenanceDeps) {
       maintenanceStats.maxDurationMs = Math.max(maintenanceStats.maxDurationMs, durationMs);
       maintenanceStats.lastCompletedAt = new Date().toISOString();
       maintenanceRunning = false;
+      const resolve = resolveCurrentCycle;
+      currentCycleCompletion = undefined;
+      resolveCurrentCycle = undefined;
+      resolve?.();
     };
 
     const step = async (): Promise<void> => {
@@ -365,11 +372,11 @@ export function createMaintenanceCoordinator(deps: MaintenanceDeps) {
   const maintenanceTimer = setInterval(runMaintenanceCycle, MAINTENANCE_INTERVAL_MS);
   maintenanceTimer.unref?.();
 
-  /** Stop the loop: no further cycles start; an in-flight cycle finishes its
-   * current bounded step. */
-  function stop(): void {
+  /** Stop new cycles and drain the active bounded step before dependent stores close. */
+  async function stop(): Promise<void> {
     maintenanceStopped = true;
     clearInterval(maintenanceTimer);
+    await currentCycleCompletion;
   }
 
   /** Seed the runtime-reconciliation cursor from startup recovery, so the

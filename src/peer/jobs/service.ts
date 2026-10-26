@@ -171,6 +171,9 @@ export function validateResultReceipt(job: PeerJob, attempt: PeerAttempt, receip
   if (!Array.isArray(receipt.files)) {
     throw new PeerJobError("invalid_manifest", "receipt.files must be an array", 422);
   }
+  if (receipt.files.length > 4096) {
+    throw new PeerJobError("artifact_count_exceeded", "A peer job may return at most 4096 files", 422);
+  }
   if (receipt.terminalState !== "succeeded" && receipt.terminalState !== "failed" && receipt.terminalState !== "cancelled") {
     throw new PeerJobError("invalid_terminal_state", "receipt.terminalState must be succeeded | failed | cancelled", 422);
   }

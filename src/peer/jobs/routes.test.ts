@@ -7,7 +7,7 @@
  * factory. Style: plain tsx script with node:assert/strict.
  */
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomBytes, createHash } from "node:crypto";
@@ -15,7 +15,7 @@ import express from "express";
 import { PeerCredentialRegistry, createPeerAuthMiddleware } from "../auth.js";
 import { hashPeerCredential } from "../credentials.js";
 import { openPeerJobStore, setPeerJobStoreSingleton } from "./store.js";
-import { createPeerJobReaper, registerPeerJobRoutes } from "./routes.js";
+import { createPeerJobReaper, reconcilePeerJobWorkspaceReservations, registerPeerJobRoutes } from "./routes.js";
 import { manifestSha256 } from "./service.js";
 
 const PEER_ID = "meta-muse";
@@ -55,6 +55,32 @@ const logging = { level: "silent" as const, format: "json" as const, requests: f
 const registry = PeerCredentialRegistry.open(credentialFile);
 const store = openPeerJobStore(stateDir, logging);
 setPeerJobStoreSingleton(store);
+
+// Restart reconciliation may see a durable review/terminal result whose
+// workspace lease release was interrupted by a process crash. Clear only
+// leases still owned by that exact peer job, retaining uncertain fences.
+{
+  const releases: Array<{ workSessionId: string; leaseNonce: string }> = [];
+  const leases = new Map([
+    ["work-review", { leaseKind: "peer_job", ownerInstanceId: "peer-job:job-review", leaseNonce: "review-nonce" }],
+    ["work-uncertain", { leaseKind: "peer_job", ownerInstanceId: "peer-job:job-uncertain", leaseNonce: "uncertain-nonce" }],
+    ["work-replaced", { leaseKind: "peer_job", ownerInstanceId: "peer-job:newer-job", leaseNonce: "replacement-nonce" }],
+  ]);
+  const workSessions = {
+    getWorkspaceLeaseForSession: (workSessionId: string) => leases.get(workSessionId),
+    releaseWorkspaceLeaseForSession: (workSessionId: string, leaseNonce: string) => {
+      releases.push({ workSessionId, leaseNonce });
+      return true;
+    },
+  };
+  reconcilePeerJobWorkspaceReservations(workSessions as any, [
+    { jobId: "job-review", workSessionId: "work-review", status: "awaiting_review" },
+    { jobId: "job-uncertain", workSessionId: "work-uncertain", status: "awaiting_reconciliation" },
+    { jobId: "job-replaced", workSessionId: "work-replaced", status: "completed" },
+  ] as any);
+  assert.deepEqual(releases, [{ workSessionId: "work-review", leaseNonce: "review-nonce" }],
+    "startup releases only stale reservations for durable review/terminal jobs, never uncertain or replacement leases");
+}
 
 // The shutdown flag is mutable so the SAME app exercises both the open and
 // the shutting-down claim path.
@@ -99,6 +125,22 @@ async function post(path: string, body: unknown, authorization: string = token):
   return { status: response.status, payload: text ? JSON.parse(text) : undefined };
 }
 
+async function putArtifact(jobId: string, attemptId: string, claimToken: string, path: string, bytes: Buffer): Promise<{ status: number; payload: any }> {
+  const response = await fetch(base + `/peer/jobs/${jobId}/artifacts`, {
+    method: "PUT",
+    headers: {
+      "content-type": "application/octet-stream",
+      authorization: token,
+      "x-peer-attempt-id": attemptId,
+      "x-peer-claim-token": claimToken,
+      "x-peer-artifact-path": path,
+    },
+    body: new Blob([Uint8Array.from(bytes)]),
+  });
+  const text = await response.text();
+  return { status: response.status, payload: text ? JSON.parse(text) : undefined };
+}
+
 async function get(path: string, authorization: string = token): Promise<{ status: number; payload: any }> {
   const response = await fetch(base + path, { headers: { authorization } });
   const text = await response.text();
@@ -118,6 +160,8 @@ async function waitFor(description: string, predicate: () => boolean, timeoutMs 
 function makeJob(overrides: Record<string, unknown> = {}): ReturnType<typeof store.createJob> {
   return store.createJob({
     peerId: PEER_ID,
+    workspaceSessionId: "ws_peer_job_test",
+    workSessionId: "wsess_peer_job_test",
     repositoryId: grantedRoot,
     baseRevision: "0123456789abcdef0123456789abcdef01234567",
     taskClass: "read_only_audit",
@@ -159,6 +203,8 @@ assert.equal(claim.status, 200, JSON.stringify(claim.payload));
 assert.equal(claim.payload.job.jobId, job.jobId);
 assert.match(claim.payload.attempt.claimToken, /^[a-f0-9]{64}$/);
 assert.equal(claim.payload.instructions, "do the audit", "claim response carries the instruction payload");
+assert.equal(claim.payload.job.workspaceSessionId, undefined, "peer claim does not disclose owner workspace identity");
+assert.equal(claim.payload.job.workSessionId, undefined, "peer claim does not disclose owner work-session identity");
 const { attemptId, claimToken } = claim.payload.attempt;
 
 // GET instructions returns the same payload.
@@ -177,7 +223,11 @@ const renewed = await post("/peer/jobs/" + job.jobId + "/renew", { attemptId, cl
 assert.equal(renewed.status, 200, JSON.stringify(renewed.payload));
 assert.ok(Date.parse(renewed.payload.leaseExpiresAt) > Date.now());
 
-const files = [{ path: "out/report.json", sha256: "a".repeat(64), bytes: 7 }];
+const reportBytes = Buffer.from("report\n", "utf8");
+const files = [{ path: "out/report.json", sha256: createHash("sha256").update(reportBytes).digest("hex"), bytes: reportBytes.byteLength }];
+const upload = await putArtifact(job.jobId, attemptId, claimToken, files[0]!.path, reportBytes);
+assert.equal(upload.status, 200, JSON.stringify(upload.payload));
+assert.equal(upload.payload.sha256, files[0]!.sha256);
 const result = await post("/peer/jobs/" + job.jobId + "/result", {
   attemptId,
   claimToken,
@@ -199,7 +249,33 @@ assert.equal(result.payload.job.status, "result_received");
 const status = await get("/peer/jobs/" + job.jobId + "/status");
 assert.equal(status.status, 200);
 assert.equal(status.payload.job.status, "result_received");
+assert.equal(status.payload.job.resultProcessing, undefined, "peer status does not disclose owner review references");
 console.log("routes: full claim/started/renew/result/status flow");
+
+// --- A manifest cannot claim bytes that were not uploaded ------------------------
+{
+  const missingJob = makeJob({ baseRevision: "b".repeat(40) });
+  const missingClaim = await post("/peer/jobs/claim", {});
+  assert.equal(missingClaim.payload.job.jobId, missingJob.jobId);
+  const missingAttempt = missingClaim.payload.attempt as { attemptId: string; claimToken: string };
+  await post(`/peer/jobs/${missingJob.jobId}/started`, missingAttempt);
+  const missingBytesReceipt = await post(`/peer/jobs/${missingJob.jobId}/result`, {
+    ...missingAttempt,
+    receipt: {
+      jobId: missingJob.jobId,
+      attemptId: missingAttempt.attemptId,
+      actorClass: "muse_vm_process",
+      baseRevision: missingJob.baseRevision,
+      manifestSha256: manifestSha256(missingJob.baseRevision, files),
+      files,
+      totalBytes: reportBytes.byteLength,
+      terminalState: "succeeded",
+    },
+  });
+  assert.equal(missingBytesReceipt.status, 422);
+  assert.equal(missingBytesReceipt.payload.error.code, "artifact_missing_or_mismatched");
+  console.log("routes: manifest-only success rejected without matching artifact bytes");
+}
 
 // --- Idempotent duplicate result (through the store comparison) ------------------
 {
@@ -412,13 +488,14 @@ writeRegistry([
 
 // --- Production reaper factory (createPeerJobReaper) --------------------------------
 {
-  // Build an isolated store whose attempt lease we can honestly backdate:
-  // close, rewrite the sidecar, reopen, then drive the SAME factory the
-  // production route registration uses.
+  // Build an isolated SQLite-backed store, reopen it, then drive the SAME
+  // factory the production route registration uses.
   const reapStateDir = mkdtempSync(join(tmpdir(), "peer-jobs-reaper-"));
   const writer = openPeerJobStore(reapStateDir, logging);
   const reapJob = writer.createJob({
     peerId: PEER_ID,
+    workspaceSessionId: "ws_peer_reaper_test",
+    workSessionId: "wsess_peer_reaper_test",
     repositoryId: grantedRoot,
     baseRevision: "e".repeat(40),
     taskClass: "read_only_audit",
@@ -432,22 +509,14 @@ writeRegistry([
   assert.ok(reapClaim);
   writer.close();
 
-  const sidecarPath = join(reapStateDir, "peer-jobs.json");
-  const parsed = JSON.parse(readFileSync(sidecarPath, "utf8")) as {
-    jobs: Array<Record<string, unknown>>;
-    attempts: Array<Record<string, unknown>>;
-  };
-  // Backdate the attempt's lease into the past (test-side clock manipulation
-  // of the durable sidecar — the same state a reaper would observe).
-  parsed.attempts[0].leaseExpiresAt = new Date(Date.now() - 60_000).toISOString();
-  writeFileSync(sidecarPath, JSON.stringify(parsed));
-
   const reaperStore = openPeerJobStore(reapStateDir, logging);
   const reaper = createPeerJobReaper(reaperStore, 25);
   // Boot reconciliation already reconciled the orphaned active attempt, so
   // exercise the factory's delegation on a LIVE claim instead.
   const liveJob = reaperStore.createJob({
     peerId: PEER_ID,
+    workspaceSessionId: "ws_peer_reaper_live_test",
+    workSessionId: "wsess_peer_reaper_live_test",
     repositoryId: grantedRoot,
     baseRevision: "f".repeat(40),
     taskClass: "read_only_audit",
@@ -499,6 +568,6 @@ writeRegistry([
   console.log("routes: revoked credential mid-flow -> 401");
 }
 
-jobsClose.close();
+await jobsClose.close();
 await new Promise<void>((resolve) => httpServer.close(() => resolve()));
 console.log("src/peer/jobs/routes.test.ts: all assertions passed");

@@ -49,7 +49,9 @@ export interface ConnectionContext {
  * MCP transport. Generic clientInfo fallback remains deliberately ephemeral.
  */
 export function processSessionOwnerId(context?: ConnectionContext): string | undefined {
-  if (context?.workSessionId) return `work-session:${context.workSessionId}`;
+  if (context?.authenticatedRole === "worker" && context.workSessionId) {
+    return `work-session:${context.workSessionId}`;
+  }
   if (context?.approvalCorrelationId) return `logical-client:${context.approvalCorrelationId}`;
   return context?.mcpSessionId;
 }

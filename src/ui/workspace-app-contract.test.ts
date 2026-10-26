@@ -6,7 +6,7 @@ import { pathToFileURL } from "node:url";
 // P1.4: the app is decomposed across sibling modules; contract assertions
 // below that name extracted literals scan the module cluster, not only the
 // composition entrypoint.
-const uiModuleSources = ["workspace-app.tsx", "ui-dom.ts", "ui-format.ts", "approval-center.ts", "session-view-helpers.ts", "tool-display.ts", "session-views.ts", "session-view-types.ts", "server-tool-call.ts", "review-feedback.ts", "mission-panel.ts", "workspace-event-reducer.ts", "session-hydration.ts", "payload-mount.ts", "session-surface.ts", "raw-payload.tsx"]
+const uiModuleSources = ["workspace-app.tsx", "ui-dom.ts", "ui-format.ts", "approval-center.ts", "session-view-helpers.ts", "tool-display.ts", "peer-status-panel.ts", "session-views.ts", "session-view-types.ts", "server-tool-call.ts", "review-feedback.ts", "mission-panel.ts", "workspace-event-reducer.ts", "session-hydration.ts", "payload-mount.ts", "session-surface.ts", "raw-payload.tsx"]
   .map((name) => readFileSync(new URL(`./${name}`, import.meta.url), "utf8"))
   .join("\n");
 const source = readFileSync(new URL("./workspace-app.tsx", import.meta.url), "utf8");

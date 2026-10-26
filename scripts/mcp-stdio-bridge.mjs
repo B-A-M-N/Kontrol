@@ -47,11 +47,6 @@ const KONTROL_URL = process.env.KONTROL_BRIDGE_URL || "http://127.0.0.1:7676/mcp
 const KONTROL_ENV = process.env.KONTROL_BRIDGE_ENV || "";
 const BRIDGE_PRINCIPAL = process.env.KONTROL_BRIDGE_PRINCIPAL || "worker";
 
-if (process.argv.includes("--validate-imports")) {
-  console.log("[mcp-stdio-bridge] import validation ok");
-  process.exit(0);
-}
-
 // Tools the coding agent (worker) is permitted to use. Anything NOT in this
 // set — especially reviewer-only tools — is hidden from discovery AND rejected
 // on call. This is the second line of defense behind the server-side role
@@ -63,6 +58,11 @@ const WORKER_TOOLS = new Set([
   "grep",
   "glob",
   "ls",
+  "git_status",
+  "git_log",
+  "git_diff",
+  "git_show",
+  "poll_process",
   "bash",
   "apply_patch",
   "show_changes",
@@ -75,6 +75,19 @@ const WORKER_TOOLS = new Set([
   "get_review_submission",
   "cancel_work_session",
 ]);
+
+const REQUIRED_WORKER_INSPECTION_TOOLS = [
+  "read", "grep", "glob", "ls", "git_status", "git_log", "git_diff", "git_show",
+];
+for (const name of REQUIRED_WORKER_INSPECTION_TOOLS) {
+  if (!WORKER_TOOLS.has(name)) throw new Error("worker bridge is missing required inspection capability: " + name);
+}
+if (!WORKER_TOOLS.has("poll_process")) throw new Error("worker bridge is missing process polling capability");
+
+if (process.argv.includes("--validate-imports")) {
+  console.log("[mcp-stdio-bridge] import and worker tool-surface validation ok");
+  process.exit(0);
+}
 
 // Reviewer-only tools that must NEVER reach the worker.
 const REVIEWER_TOOLS = new Set([

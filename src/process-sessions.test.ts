@@ -1,5 +1,14 @@
 import assert from "node:assert/strict";
 import { HeadTailBuffer, OutputLog, ProcessSessionManager } from "./process-sessions.js";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { openDatabase } from "./db/client.js";
+import { createAgentPtyBindingStore } from "./agent-pty-bindings.js";
+import { createWorkSessionManager } from "./work-sessions/index.js";
+import { createAgentRegistryManager } from "./acp-registry.js";
+import { createWorkspaceStore } from "./workspace-store.js";
+import { processSessionOwnerId } from "./mcp/connection-context.js";
 
 const smallBuffer = new HeadTailBuffer(100);
 smallBuffer.append("hello\n");
@@ -685,6 +694,129 @@ try {
     );
   } finally {
     await lifetimeManager.shutdown();
+  }
+}
+
+// ── Authenticated worker PTY identity survives restart as a fenced record ──
+{
+  assert.equal(processSessionOwnerId({ authenticatedRole: "worker", workSessionId: "pty-work" }), "work-session:pty-work");
+  assert.equal(processSessionOwnerId({ authenticatedRole: "reviewer", workSessionId: "pty-work", mcpSessionId: "reviewer-mcp" }), "reviewer-mcp",
+    "reviewer work-session visibility does not grant terminal input ownership");
+  const stateDir = await mkdtemp(join(tmpdir(), "kontrol-agent-pty-binding-"));
+  const db = openDatabase(stateDir);
+  const workspaces = createWorkspaceStore(db);
+  const workSessions = createWorkSessionManager(db);
+  const agents = createAgentRegistryManager(db);
+  try {
+    const workspace = workspaces.createSession({ id: "workspace-pty-binding", root: process.cwd() });
+    const workSession = workSessions.create({ workspaceSessionId: workspace.id, submittedBy: "pty-binding-test" });
+    const run = agents.createRun({
+      agentName: "pty-agent-fixture",
+      workspaceSessionId: workspace.id,
+      workSessionId: workSession.id,
+      status: "running",
+    });
+    const bindings = createAgentPtyBindingStore(db.sqlite);
+    const first = bindings.attach({
+      processSessionId: "proc_pty_fixture_1",
+      workspaceSessionId: workspace.id,
+      workSessionId: workSession.id,
+      runId: run.runId,
+      ownerPrincipalId: `worker-work-session:${workSession.id}`,
+      running: true,
+      outputCursor: 0,
+    });
+    assert.equal(first.agentName, "pty-agent-fixture");
+    assert.equal(first.status, "attached");
+    bindings.advanceOutputCursor(first.processSessionId, first.processGeneration + 1, 29);
+    assert.equal(bindings.getByProcessSession(first.processSessionId)?.outputCursor, 0,
+      "an output callback with the wrong generation cannot update a durable PTY binding");
+    bindings.advanceOutputCursor(first.processSessionId, first.processGeneration, 17);
+    bindings.advanceOutputCursor(first.processSessionId, first.processGeneration, 12);
+    assert.equal(bindings.getByProcessSession(first.processSessionId)?.outputCursor, 17,
+      "persisted output cursor never moves backwards");
+    assert.equal(bindings.markUnresolvedLost("2026-10-26T12:00:00.000Z"), 1,
+      "startup reconciliation does not infer that an old PTY is still running");
+    assert.equal(bindings.getByProcessSession(first.processSessionId)?.status, "lost");
+    assert.equal(bindings.getByProcessSession(first.processSessionId)?.finishedAt, undefined,
+      "lost ownership is not misreported as a confirmed process exit");
+
+    const second = bindings.attach({
+      processSessionId: "proc_pty_fixture_2",
+      workspaceSessionId: workspace.id,
+      workSessionId: workSession.id,
+      runId: run.runId,
+      ownerPrincipalId: `worker-work-session:${workSession.id}`,
+      running: true,
+      outputCursor: 0,
+    });
+    assert.equal(second.processGeneration, first.processGeneration + 1,
+      "a replacement PTY receives a new durable generation instead of inheriting the prior binding");
+    bindings.advanceOutputCursor(second.processSessionId, second.processGeneration - 1, 29);
+    assert.equal(bindings.getByProcessSession(second.processSessionId)?.outputCursor, 0,
+      "a stale prior-generation output callback cannot advance the replacement PTY cursor");
+    bindings.advanceOutputCursor(second.processSessionId, second.processGeneration, 7);
+    bindings.finish(second.processSessionId, second.processGeneration - 1, 29);
+    assert.equal(bindings.getByProcessSession(second.processSessionId)?.status, "attached",
+      "a stale prior-generation exit callback cannot finish the replacement PTY");
+    bindings.finish(second.processSessionId, second.processGeneration, 29);
+    assert.equal(bindings.getByProcessSession(second.processSessionId)?.status, "exited");
+    assert.equal(bindings.getByProcessSession(second.processSessionId)?.outputCursor, 29);
+
+    if (process.platform !== "win32") {
+      const ptyManager = new ProcessSessionManager({ agentPtyBindings: bindings, childEnvironmentAllowlist: [] });
+      try {
+        const launched = await ptyManager.start({
+          workspaceId: workspace.id,
+          ownerId: `work-session:${workSession.id}`,
+          workSessionId: workSession.id,
+          principalId: `worker-work-session:${workSession.id}`,
+          command: `${node} -e "process.stdout.write('pty-agent-output\\n'); setTimeout(() => process.exit(0), 500)"`,
+          cwd: process.cwd(),
+          tty: true,
+          yieldTimeMs: 50,
+          agentPtyBinding: {
+            workspaceSessionId: workspace.id,
+            runId: run.runId,
+            ownerPrincipalId: `worker-work-session:${workSession.id}`,
+          },
+        });
+        assert.ok(launched.sessionId, "interactive worker launch returns a process session");
+        let observation = ptyManager.observeAgentPty({ workSessionId: workSession.id, processSessionId: launched.sessionId! });
+        for (let index = 0; index < 20 && !(observation?.output ?? "").includes("pty-agent-output"); index += 1) {
+          await new Promise((resolve) => setTimeout(resolve, 25));
+          observation = ptyManager.observeAgentPty({ workSessionId: workSession.id, processSessionId: launched.sessionId! });
+        }
+        assert.equal(observation?.binding.agentName, "pty-agent-fixture");
+        assert.match(observation?.output ?? "", /pty-agent-output/,
+          "read-only reviewer observation sees PTY output without consuming its worker cursor");
+        const replayedObservation = ptyManager.observeAgentPty({
+          workSessionId: workSession.id,
+          processSessionId: launched.sessionId!,
+          afterCursor: 0,
+        });
+        assert.equal(replayedObservation?.output, observation?.output,
+          "repeating an observation at the same cursor is nondestructive");
+        await assert.rejects(ptyManager.write({
+          workspaceId: workspace.id,
+          sessionId: launched.sessionId!,
+          ownerId: "reviewer-mcp-session",
+          workSessionId: workSession.id,
+          principalId: "reviewer-principal",
+          chars: "unauthorized input\\n",
+          yieldTimeMs: 20,
+        }), /another|Unknown process session|does not belong/,
+        "a reviewer with observation access cannot send terminal input");
+      } finally {
+        await ptyManager.shutdown();
+      }
+    }
+  } finally {
+    agents.close();
+    workSessions.close?.();
+    workspaces.close?.();
+    db.close();
+    await rm(stateDir, { recursive: true, force: true });
   }
 }
 

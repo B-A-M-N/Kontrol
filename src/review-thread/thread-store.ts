@@ -14,6 +14,13 @@ export interface ReviewThread {
   hostKind: string;
   hostConversationId?: string;
   hostBindingVerified: boolean;
+  browserProfileId?: string;
+  browserGeneration?: number;
+  conversationUrl?: string;
+  conversationKey?: string;
+  conversationFingerprint?: string;
+  conversationBindingRevision?: number;
+  conversationBindingStatus?: string;
   status: "pending_activation" | "active" | "paused" | "closed";
   maxRounds: number;
   revision: number;
@@ -34,6 +41,13 @@ function asThread(row: typeof reviewThreads.$inferSelect): ReviewThread {
     hostKind: row.hostKind,
     hostConversationId: row.hostConversationId ?? undefined,
     hostBindingVerified: row.hostBindingVerified,
+    browserProfileId: row.browserProfileId ?? undefined,
+    browserGeneration: row.browserGeneration ?? undefined,
+    conversationUrl: row.conversationUrl ?? undefined,
+    conversationKey: row.conversationKey ?? undefined,
+    conversationFingerprint: row.conversationFingerprint ?? undefined,
+    conversationBindingRevision: row.conversationBindingRevision ?? undefined,
+    conversationBindingStatus: row.conversationBindingStatus ?? undefined,
     status: row.status as ReviewThread["status"],
     maxRounds: row.maxRounds,
     revision: row.revision,

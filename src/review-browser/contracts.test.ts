@@ -5,6 +5,8 @@ import { join } from "node:path";
 import { openDatabase } from "../db/client.js";
 import { createReviewerBrowserProfileStore } from "./profile-store.js";
 import { createReviewerBrowserController } from "./browser-controller.js";
+import { createReviewRouteStore } from "../review-handoff/route-store.js";
+import { createReviewThreadStore } from "../review-thread/thread-store.js";
 import { bindReviewerTarget, canonicalReviewerConversation, restoreReviewerTarget, reviewerConversationFingerprint } from "./target-binding.js";
 import type { CdpClient } from "./cdp-client.js";
 import { ChatGptPageDriver, type TurnBaseline } from "./chatgpt-page-driver.js";
@@ -72,7 +74,10 @@ try {
       profileDirectory: join(root, "controller-state", "profile"), generation, browserPid: 999,
       version: { product: "Chrome/test" }, reused: false,
       cdp: { async send(method: string) {
-        if (method === "Target.getTargets") return { targetInfos: [{ targetId: "auth-tab", type: "page", url: "https://chatgpt.com/", title: "ChatGPT" }] };
+        if (method === "Target.getTargets") return { targetInfos: [
+          { targetId: "auth-tab", type: "page", url: "https://chatgpt.com/", title: "ChatGPT" },
+          { targetId: "review-tab", type: "page", url: "https://chatgpt.com/c/conversation_binding1", title: "Review" },
+        ] };
         if (method === "Target.attachToTarget") return { sessionId: "auth-session" };
         if (method === "Runtime.evaluate") return { result: { value: { authenticated, loginRequired: false, verificationRequired: false } } };
         return {};
@@ -118,6 +123,43 @@ try {
       const completed = await completing;
       assert.equal(completed.status, "authenticated", "controlled relaunch verifies the persisted ChatGPT session");
       assert.equal(controller.profiles.get("controller-test")?.authState, "authenticated");
+
+      controllerDb.sqlite.prepare("insert into workspace_sessions (id, root, status, mode, managed, created_at, last_used_at) values (?, '/tmp', 'active', 'checkout', 'false', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')")
+        .run("ws-controller-binding");
+      controllerDb.sqlite.prepare("insert into work_sessions (id, workspace_session_id, submitted_by, status, created_at, updated_at) values (?, 'ws-controller-binding', 'owner', 'in_progress', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')")
+        .run("session-controller-binding");
+      const routes = createReviewRouteStore(controllerDb);
+      const threads = createReviewThreadStore(controllerDb);
+      const route = routes.configure({
+        workSessionId: "session-controller-binding", ownerPrincipalId: "reviewer-1", ownerContextId: "owner-context",
+        enabled: true, mode: "pinned_conversation", maxReviewRounds: 2,
+        deliveryTransport: "native_cdp", browserProfileId: "controller-test",
+      });
+      const activation = threads.createActivation({ routeId: route.id, ownerPrincipalId: "reviewer-1", reviewerPrincipalId: "reviewer-1" });
+      const thread = threads.activate({ activationSecret: activation.activationSecret, principalId: "reviewer-1", contextId: "review-context" });
+      const binding = await controller.bindConversation({
+        profileId: "controller-test", reviewThreadId: thread.id, targetId: "review-tab", principalId: "reviewer-1",
+      });
+      assert.equal(binding.bindingRevision, 1);
+      const now = new Date().toISOString();
+      controllerDb.sqlite.prepare(`insert into review_thread_messages
+        (id, thread_id, route_epoch, work_session_id, handoff_id, submission_id, review_epoch, round_number, kind,
+         payload_json, payload_sha256, status, revision, created_at, updated_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'presenting', 1, ?, ?)`).run(
+        "message-binding-active", thread.id, route.routeEpoch, "session-controller-binding", "handoff-binding-active",
+        "submission-binding-active", 1, 1, "review", "{}", "b".repeat(64), now, now,
+      );
+      controllerDb.sqlite.prepare(`insert into review_browser_turns
+        (id, review_message_id, review_thread_id, route_epoch, profile_id, conversation_fingerprint, binding_revision,
+         attempt_number, browser_generation, state, prompt_sha256, created_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, 'dispatching', ?, ?)`).run(
+        "turn-binding-active", "message-binding-active", thread.id, route.routeEpoch, "controller-test",
+        "c".repeat(64), binding.bindingRevision, 1, binding.browserGeneration, "d".repeat(64), now,
+      );
+      controllerDb.sqlite.prepare("update review_threads set conversation_binding_status = 'recovery_required' where id = ?").run(thread.id);
+      await assert.rejects(controller.bindConversation({
+        profileId: "controller-test", reviewThreadId: thread.id, targetId: "review-tab", principalId: "reviewer-1",
+      }), /active browser turn/i, "target rebinding cannot race a claimed prompt after the physical dispatch boundary");
       await controller.close();
     } finally { controllerDb.close(); }
 
@@ -256,6 +298,67 @@ try {
   assert.equal(acceptedThenAckFailed.transitions.at(-1), "uncertain", "a lost durable acknowledgement after host acceptance keeps the send boundary uncertain");
   assert.equal(acceptedThenAckFailed.wasCompleted(), true, "the accepted prompt's outbox item is fenced against redelivery after acknowledgement failure");
   await acceptedThenAckFailed.dispatcher.stopAndDrain();
+
+  // Independent selected conversations must progress concurrently; a slow
+  // review in one conversation must not hold the global browser dispatcher.
+  {
+    const conversationTwo = "conversation_87654321";
+    const events = [
+      { id: "event-one", aggregateId: "message-one", payload: { messageId: "message-one", threadId: "thread-one", profileId: "reviewer-parallel" }, status: "claimed", claimToken: "one", claimedBy: "worker" },
+      { id: "event-two", aggregateId: "message-two", payload: { messageId: "message-two", threadId: "thread-two", profileId: "reviewer-parallel" }, status: "claimed", claimToken: "two", claimedBy: "worker" },
+    ];
+    let nextEvent = 0;
+    let secondBaseline = false;
+    let releaseFirstBaseline!: () => void;
+    const secondEntered = new Promise<void>((resolve) => { releaseFirstBaseline = resolve; });
+    const captured: string[] = [];
+    const dispatcher = createReviewerTurnDispatcher({
+      outbox: {
+        subscribe: () => () => undefined,
+        reapExpiredClaims: () => 0,
+        claimNext: () => events[nextEvent++] as any,
+        listPending: () => [],
+        markFailed: () => true,
+        markCompleted: () => true,
+        get: (id: string) => events.find((event) => event.id === id),
+      } as any,
+      jobs: {
+        claim: ({ messageId }: { messageId: string }) => ({
+          attemptId: `attempt-${messageId}`, messageId, reviewThreadId: messageId === "message-one" ? "thread-one" : "thread-two",
+          handoffId: `handoff-${messageId}`, routeId: "route", routeEpoch: 1, attemptNumber: 1, profileId: "reviewer-parallel",
+          browserGeneration: 3, leaseToken: `lease-${messageId}`, leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+          conversationUrl: canonical.url, conversationKey: messageId === "message-one" ? canonical.key : conversationTwo,
+          conversationFingerprint: "f".repeat(64), bindingRevision: 1, promptPayloadSha256: "a".repeat(64), prompt: "review",
+        }),
+        transition: () => ({}), renewLease: () => new Date(Date.now() + 60_000).toISOString(),
+        reconcileExpiredAttempts: () => ({ reconciled: 0, uncertain: 0, fenced: 0 }),
+      } as any,
+      browser: {
+        profiles: { get: () => ({ id: "reviewer-parallel", generation: 3, status: "ready", mode: "headed" }) },
+        restoreThread: async (threadId: string) => {
+          const conversationKey = threadId === "thread-one" ? canonical.key : conversationTwo;
+          return {
+            target: { conversationKey },
+            driver: {
+              captureBaseline: async () => {
+                captured.push(threadId);
+                if (threadId === "thread-one") await secondEntered;
+                else { secondBaseline = true; releaseFirstBaseline(); }
+                return { conversationKey, userMessageCount: 0, assistantMessageCount: 0, capturedAt: new Date().toISOString() };
+              },
+              submitPrompt: async () => ({ status: "accepted", submittedAt: new Date().toISOString(), conversationKey }),
+              waitForGeneration: async () => "finished",
+            },
+          };
+        },
+      } as any,
+    });
+    dispatcher.start();
+    await dispatcher.drainOnce();
+    assert.deepEqual(captured.sort(), ["thread-one", "thread-two"]);
+    assert.equal(secondBaseline, true, "separate conversation entered while the first conversation's baseline was held");
+    await dispatcher.stopAndDrain();
+  }
 } finally {
   await rm(root, { recursive: true, force: true });
 }

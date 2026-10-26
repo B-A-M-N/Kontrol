@@ -483,9 +483,13 @@ ACP_STDIO_ADAPTER_PORT=9921 \
 node scripts/acp-stdio-duplex-adapter.mjs
 ```
 
-The adapter registers as a normal Kontrol ACP peer, negotiates ACP v1, creates
-one agent session for the dispatch, and sends the task through
-`session/prompt`. It uses the reusable `createAcpDuplex` transport.
+The adapter registers as a normal Kontrol ACP peer and defaults to ACP v1. Set
+`ACP_STDIO_ENABLE_V2=1` to request ACP v2; v1-only agents may negotiate v1 as a
+fallback. For v2, completion comes from an idle `state_update` with
+`stopReason: "end_turn"`, and provider sessions resume through
+`session/resume`. V1 completion continues to require `stopReason: "end_turn"`
+in the `session/prompt` response. The adapter uses the reusable
+`createAcpDuplex` transport.
 Agent-initiated `session/request_permission` calls are converted into Kontrol
 approval requests and parked until the reviewer decides. Set
 `ACP_STDIO_DISPATCH_METHOD` only for a known wrapper with a nonstandard start

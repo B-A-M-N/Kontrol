@@ -26,6 +26,11 @@ export interface ToolListCacheMetrics {
 const metricsByServer = new WeakMap<McpServer, ToolListCacheMetrics>();
 const cumulativeMetrics: ToolListCacheMetrics = { hits: 0, misses: 0 };
 
+/** Cache identities bind both the complete registration surface and visibility profile. */
+export function toolListDescriptorCacheKey(registrationProfile: string, visibilityProfile: string): string {
+  return JSON.stringify([registrationProfile, visibilityProfile]);
+}
+
 function metricsFor(server: McpServer): ToolListCacheMetrics {
   let m = metricsByServer.get(server);
   if (!m) {
@@ -128,6 +133,7 @@ export function installCachedToolList(
   cacheKey: string,
   cache: Map<string, Promise<unknown>>,
   listToolsSchema: ZodType,
+  maxEntries = 256,
 ): { finalizeRegistration(): boolean } {
   return registrationInterceptor(server, listToolsSchema, (originalHandler) => async (request, extra) => {
     const metrics = metricsFor(server);
@@ -142,6 +148,12 @@ export function installCachedToolList(
         if (cache.get(cacheKey) === cached) cache.delete(cacheKey);
         throw error;
       });
+      const boundedMaxEntries = Math.max(1, Math.floor(maxEntries));
+      while (cache.size >= boundedMaxEntries) {
+        const oldestKey = cache.keys().next().value as string | undefined;
+        if (oldestKey === undefined) break;
+        cache.delete(oldestKey);
+      }
       cache.set(cacheKey, cached);
     } else {
       metrics.hits++;

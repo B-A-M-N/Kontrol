@@ -532,6 +532,66 @@ try {
   }
 
   {
+    let acceptedBody: Record<string, unknown> | undefined;
+    const peer = createServer(async (req, res) => {
+      if (req.method === "POST" && req.url === "/runs") {
+        acceptedBody = await readJson(req);
+        res.writeHead(202, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          run_id: "remote-destination-attempt",
+          accepted: true,
+          status: "running",
+          dispatch_idempotency_key: acceptedBody.dispatch_idempotency_key,
+        }));
+        return;
+      }
+      res.writeHead(404).end();
+    });
+    servers.push(peer);
+    const peerPort = await listen(peer, "127.0.0.1");
+    const root = await mkdtemp(join(tmpdir(), "kontrol-acp-destination-attempt-"));
+    tempDirs.push(root);
+    const db = openDatabase(root);
+    seedWorkspace(root, "ws-destination-attempt");
+    const workSessions = createWorkSessionManager(db);
+    const agentRegistry = createAgentRegistryManager(db);
+    const workSession = workSessions.create({ workspaceSessionId: "ws-destination-attempt", submittedBy: "test" });
+    const originalRun = agentRegistry.createRun({
+      agentName: "source-agent",
+      agentId: "source-agent-id",
+      workspaceSessionId: "ws-destination-attempt",
+      workSessionId: workSession.id,
+      inputPreview: "original task",
+      status: "awaiting_review",
+    });
+    const destinationKey = "disp-destination-agent-continuation";
+    const continued = await callRemoteAgent({
+      agentRegistry,
+      workspaces: { getWorkspace: () => ({ id: "ws-destination-attempt", root: "/tmp", mode: "checkout" }) } as any,
+      workSessions,
+      adapterSecret: "secret",
+    }, {
+      agentUrl: `http://127.0.0.1:${peerPort}`,
+      agentName: "destination-agent",
+      agentId: "destination-agent-id",
+      task: "continue with transferred context",
+      workspaceSessionId: "ws-destination-attempt",
+      workSessionId: workSession.id,
+      existingRunId: originalRun.runId,
+      continuationId: "continuation-destination-agent",
+      dispatchIdempotencyKey: destinationKey,
+      mode: "async",
+      fireAndForget: true,
+    });
+    assert.equal(continued.status, "running");
+    assert.equal(acceptedBody?.agent_id, "destination-agent-id", "the outbound continuation targets the selected destination identity");
+    assert.equal(agentRegistry.getRun(originalRun.runId)?.agentId, "source-agent-id", "the logical run retains immutable origin-agent identity");
+    assert.equal(agentRegistry.getDispatchAttemptByIdempotencyKey(destinationKey)?.agentId, "destination-agent-id", "the durable attempt records its destination identity");
+    workSessions.close();
+    agentRegistry.close();
+  }
+
+  {
     const dispatchKey = "disp-response-dropped";
     let acceptedRecord: { run_id: string; dispatch_idempotency_key: string } | undefined;
     let dispatchRequests = 0;

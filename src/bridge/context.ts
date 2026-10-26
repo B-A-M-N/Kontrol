@@ -68,6 +68,37 @@ export interface BridgeConfig {
   connectionWorkSessionId?: string;
   /** Live per-connection context; never snapshot it at registration time. */
   connectionContext?: import("../mcp/connection-context.js").ConnectionContext;
+  /** Read-only durable PTY binding projection for cold work-session hydration. */
+  agentPtyBindingsForWorkSession?: (workSessionId: string) => Array<{
+    processSessionId: string;
+    agentName: string;
+    processGeneration: number;
+    outputCursor: number;
+    status: string;
+    createdAt: string;
+    finishedAt?: string;
+  }>;
+  observeAgentPty?: (input: {
+    workSessionId: string;
+    processSessionId: string;
+    afterCursor?: number;
+    maxOutputCharacters?: number;
+  }) => {
+    output: string;
+    outputCursor: number;
+    oldestAvailableCursor: number;
+    outputTruncated: boolean;
+    running: boolean;
+    exitCode?: number;
+    signal?: string;
+    binding: {
+      agentName: string;
+      processGeneration: number;
+      status: string;
+      createdAt: string;
+      finishedAt?: string;
+    };
+  } | undefined;
   /** Transport identity used to scope workspace conversation state. */
   connectionMcpSessionId?: string;
   /** Trusted conversation identity used to scope durable work-session reads. */

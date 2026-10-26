@@ -144,6 +144,7 @@ export function createReviewerJobStore(database: DatabaseHandle): ReviewerJobSto
         database.db.insert(reviewBrowserTurns).values({
           id: attemptId, reviewMessageId: message.id, reviewThreadId: thread.id, routeEpoch: message.routeEpoch,
           profileId: input.profileId, conversationFingerprint: thread.conversationFingerprint,
+          bindingRevision: thread.conversationBindingRevision,
           browserGeneration: input.browserGeneration, leaseOwner: input.profileId, attemptNumber,
           leaseTokenSha256: sha256(leaseToken), leaseExpiresAt,
           promptSha256: sha256(prompt), state: "leased", createdAt: nowIso,
@@ -177,7 +178,8 @@ export function createReviewerJobStore(database: DatabaseHandle): ReviewerJobSto
           || route.routeEpoch !== row.routeEpoch || route.browserProfileId !== input.profileId
           || thread.routeEpoch !== row.routeEpoch || thread.browserProfileId !== input.profileId
           || thread.browserGeneration !== input.browserGeneration || thread.conversationBindingStatus !== "bound"
-          || thread.conversationFingerprint !== row.conversationFingerprint) throw new Error("Browser turn was fenced by route, profile, generation, or conversation change.");
+          || thread.conversationFingerprint !== row.conversationFingerprint
+          || thread.conversationBindingRevision !== row.bindingRevision) throw new Error("Browser turn was fenced by route, profile, generation, conversation, or binding revision change.");
         const update: Record<string, unknown> = { state: input.nextStatus, errorCode: input.errorCode ?? null };
         if (input.nextStatus === "prompt_accepted") update.submittedAt = now;
         if (input.nextStatus === "model_generating") {
@@ -234,6 +236,13 @@ export function createReviewerJobStore(database: DatabaseHandle): ReviewerJobSto
             database.sqlite.prepare(`update review_thread_messages set status = 'queued', revision = revision + 1, updated_at = ?
               where id = ? and status = 'presenting'`).run(input.now, row.review_message_id);
             reconciled++;
+          } else if (row.state === "generation_finished") {
+            // Generation completion is already backed by a durable exact-turn
+            // observation. Recover the following presentation state without
+            // touching the browser or replaying the prompt.
+            database.sqlite.prepare(`update review_browser_turns set state = 'awaiting_feedback',
+              lease_token_sha256 = null, lease_expires_at = null where id = ? and state = 'generation_finished'`).run(row.id);
+            reconciled++;
           } else if (row.state === "dispatching") {
             database.sqlite.prepare(`update review_browser_turns set state = 'uncertain', error_code = 'lease_expired_after_dispatch_boundary',
               lease_token_sha256 = null, lease_expires_at = null where id = ? and state = 'dispatching'`).run(row.id);
@@ -269,11 +278,18 @@ export function createReviewerJobStore(database: DatabaseHandle): ReviewerJobSto
         const route = thread && database.db.select().from(reviewRoutes).where(eq(reviewRoutes.id, thread.routeId)).get();
         const message = database.db.select().from(reviewThreadMessages).where(eq(reviewThreadMessages.id, attempt.reviewMessageId)).get();
         const handoff = message && database.db.select().from(reviewHandoffs).where(eq(reviewHandoffs.id, message.handoffId)).get();
+        // Legacy uncertain rows predate persisted binding revisions. They may
+        // be retried only through this authenticated, exact-conversation
+        // inspection path; new automatic transitions still reject a missing
+        // revision above.
+        const bindingRevisionMatches = thread && (attempt.bindingRevision === thread.conversationBindingRevision
+          || (attempt.bindingRevision == null && thread.conversationFingerprint === attempt.conversationFingerprint));
         if (!thread || thread.status !== "active" || thread.routeEpoch !== input.routeEpoch
           || !route || route.status !== "active" || route.routeEpoch !== input.routeEpoch
           || route.deliveryTransport !== "native_cdp" || route.browserProfileId !== attempt.profileId
           || thread.browserProfileId !== attempt.profileId || thread.conversationBindingStatus !== "bound"
           || thread.conversationFingerprint !== attempt.conversationFingerprint
+          || !bindingRevisionMatches
           || !message || message.threadId !== thread.id || message.routeEpoch !== input.routeEpoch
           || !["presenting", "presented"].includes(message.status)
           || handoff?.status === "feedback_committed") {

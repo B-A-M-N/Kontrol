@@ -233,7 +233,7 @@ async function handle(req, res) {
       active: active.size,
       duplex: true,
       dispatchMethod: DISPATCH_METHOD || "session/prompt",
-      protocolMode: DISPATCH_METHOD ? "custom" : "acp-v1",
+      protocolMode: DISPATCH_METHOD ? "custom" : process.env.ACP_STDIO_ENABLE_V2 === "1" ? "acp-v2-enabled" : "acp-v1",
     });
   }
 
@@ -303,6 +303,9 @@ async function handle(req, res) {
   if (!task.trim()) {
     return writeJson(res, 400, { error: { code: "invalid_task", message: "ACP task must be non-empty" } });
   }
+  if (body.context_transfer && !isValidContextTransfer(body.context_transfer)) {
+    return writeJson(res, 409, { error: { code: "context_transfer_invalid", message: "Cross-agent context transfer failed its immutable packet hash check." } });
+  }
 
   const workspaceRoot = await validateWorkspaceRoot(body.workspace_root);
   const readOnlyAuthorization = validateReadOnlyDispatchRequest(body, workspaceRoot, ADAPTER_SECRET, agentIdentity?.agentId);
@@ -321,6 +324,7 @@ async function handle(req, res) {
     devRunId: body.parent_run_id || body.run_id,
     workSessionId: body.session_id,
     continuationId: body.continuation_id,
+    contextTransfer: body.context_transfer,
     workspaceSessionId: body.workspace_session_id,
     agentId: body.agent_id,
     attemptNumber: body.attempt_number,
@@ -592,32 +596,53 @@ async function dispatchTurn(run) {
   let method = DISPATCH_METHOD;
   let params;
   if (!method) {
-    const initialization = await run.conn.request("initialize", {
+    const requestV2 = process.env.ACP_STDIO_ENABLE_V2 === "1";
+    const initialization = await run.conn.request("initialize", requestV2 ? {
+      protocolVersion: 2,
+      info: { name: "kontrol", title: "Kontrol ACP Adapter", version: "1" },
+      capabilities: {},
+    } : {
       protocolVersion: 1,
       clientCapabilities: {},
       clientInfo: { name: "kontrol", title: "Kontrol ACP Adapter", version: "1" },
     });
-    if (!initialization || initialization.protocolVersion !== 1) {
-      throw new Error("ACP agent did not negotiate protocol version 1.");
+    const protocolVersion = initialization?.protocolVersion;
+    if (protocolVersion !== 1 && protocolVersion !== 2) {
+      throw new Error("ACP agent negotiated an unsupported protocol version.");
     }
+    if (protocolVersion === 2 && !requestV2) {
+      throw new Error("ACP agent negotiated protocol version 2 when v2 support was not enabled.");
+    }
+    if (protocolVersion === 2 && initialization.capabilities?.session == null) {
+      throw new Error("ACP v2 agent did not advertise the required session capability.");
+    }
+    run.acpProtocolVersion = protocolVersion;
     const supportsSessionLoad = initialization.agentCapabilities?.loadSession === true;
     const cwd = run.readOnlyAudit ? "/workspace" : run.workspaceRoot;
-    const bindingKey = run.workSessionId
-      ? createHash("sha256").update(run.workSessionId).digest("hex")
+    const bindingScope = run.contextTransfer?.id
+      ? `${run.workSessionId}:transfer:${run.contextTransfer.id}`
+      : run.workSessionId;
+    const bindingKey = bindingScope
+      ? createHash("sha256").update(bindingScope).digest("hex")
       : undefined;
     const existing = bindingKey ? providerSessionBindings.get(bindingKey) : undefined;
-    if (run.continuationId && !existing) {
+    if (run.continuationId && !existing && !run.contextTransfer?.fresh) {
       throw new Error("continuation_session_missing: refusing to reset the implementing agent conversation.");
     }
-    if (existing && (existing.agentId !== run.agentId || existing.workspaceRoot !== run.workspaceRoot)) {
+    if (existing && (existing.agentId !== run.agentId || existing.workspaceRoot !== run.workspaceRoot
+      || (existing.protocolVersion !== undefined && existing.protocolVersion !== protocolVersion))) {
       throw new Error("continuation_session_binding_conflict: provider conversation belongs to a different agent or workspace.");
     }
     if (existing) {
-      if (!supportsSessionLoad) {
+      if (protocolVersion === 1 && !supportsSessionLoad) {
         throw new Error("continuation_session_unsupported: the ACP agent did not advertise loadSession; refusing to start a new conversation.");
       }
       run.acpSessionId = existing.sessionId;
-      await run.conn.request("session/load", { sessionId: existing.sessionId, cwd, mcpServers: [] });
+      if (protocolVersion === 2) {
+        await run.conn.request("session/resume", { sessionId: existing.sessionId, cwd, mcpServers: [], replayFrom: { type: "start" } });
+      } else {
+        await run.conn.request("session/load", { sessionId: existing.sessionId, cwd, mcpServers: [] });
+      }
     } else {
       const session = await run.conn.request("session/new", { cwd, mcpServers: [] });
       if (!session || typeof session.sessionId !== "string" || session.sessionId.trim().length === 0) {
@@ -629,6 +654,7 @@ async function dispatchTurn(run) {
           sessionId: session.sessionId,
           agentId: run.agentId,
           workspaceRoot: run.workspaceRoot,
+          protocolVersion,
           createdAt: new Date().toISOString(),
           updatedAt: new Date().toISOString(),
         });
@@ -651,8 +677,39 @@ async function dispatchTurn(run) {
       input: run.task,
     };
   }
-  const result = await run.conn.request(method, params);
-  run.finalOutput = normalizeAcpPromptOutput(result);
+  let result;
+  if (method === "session/prompt" && run.acpProtocolVersion === 2) {
+    let resolveIdle;
+    const idleState = new Promise((resolve) => { resolveIdle = resolve; });
+    run.v2AgentMessages = new Map();
+    run.v2TurnWaiter = { resolve: resolveIdle };
+    let accepted;
+    try {
+      accepted = await run.conn.request(method, params);
+    } catch (error) {
+      run.v2TurnWaiter = undefined;
+      throw error;
+    }
+    if (!accepted || typeof accepted.messageId !== "string" || accepted.messageId.length === 0) {
+      run.v2TurnWaiter = undefined;
+      throw new Error("ACP v2 session/prompt did not acknowledge insertion with a messageId.");
+    }
+    const idle = await idleState;
+    if (idle?.state !== "idle") throw new Error("ACP v2 stream closed before an idle completion state_update.");
+    result = { ...idle, messageId: accepted.messageId };
+    run.finalOutput = [...run.v2AgentMessages.values()].join("");
+  } else {
+    result = await run.conn.request(method, params);
+  }
+  if (method === "session/prompt" && run.acpProtocolVersion === 2 && result?.stopReason !== "end_turn") {
+    const stopReason = typeof result?.stopReason === "string" ? result.stopReason : "missing";
+    throw new Error(`ACP v2 prompt did not complete successfully (stopReason: ${stopReason}).`);
+  }
+  if (method === "session/prompt" && run.acpProtocolVersion !== 2 && result?.stopReason !== "end_turn") {
+    const stopReason = typeof result?.stopReason === "string" ? result.stopReason : "missing";
+    throw new Error(`ACP prompt did not complete successfully (stopReason: ${stopReason}).`);
+  }
+  if (run.acpProtocolVersion !== 2) run.finalOutput = normalizeAcpPromptOutput(result);
   reportStructured(run, "output_delta", {
     channel: "result",
     ...(run.finalOutput !== undefined ? { text: run.finalOutput } : {}),
@@ -670,6 +727,12 @@ function normalizeAcpPromptOutput(result) {
   const text = content.filter((part) => part?.type === "text" && typeof part.text === "string")
     .map((part) => part.text).join("");
   return text.length > 0 ? text : undefined;
+}
+
+function isValidContextTransfer(value) {
+  if (!value || typeof value.id !== "string" || !value.id || typeof value.sha256 !== "string"
+    || !value.packet || typeof value.packet !== "object" || Array.isArray(value.packet)) return false;
+  return createHash("sha256").update(JSON.stringify(value.packet)).digest("hex") === value.sha256;
 }
 
 function createKontrolHttpHandler(run) {
@@ -696,6 +759,29 @@ function createKontrolHttpHandler(run) {
     },
     sessionUpdate(params) {
       reportStructured(run, "output_delta", { channel: "session/update", text: JSON.stringify(params), raw: params });
+      const update = params?.update;
+      if (run.acpProtocolVersion === 2 && typeof update?.messageId === "string") {
+        if (!run.v2AgentMessages) run.v2AgentMessages = new Map();
+        if (update.sessionUpdate === "agent_message") {
+          run.v2AgentMessages.set(update.messageId, Array.isArray(update.content)
+            ? update.content.filter((part) => part?.type === "text" && typeof part.text === "string").map((part) => part.text).join("")
+            : "");
+        } else if (update.sessionUpdate === "agent_message_chunk" && update.content?.type === "text" && typeof update.content.text === "string") {
+          run.v2AgentMessages.set(update.messageId, (run.v2AgentMessages.get(update.messageId) ?? "") + update.content.text);
+        }
+      }
+      if (run.v2TurnWaiter && params?.sessionId === run.acpSessionId
+        && update?.sessionUpdate === "state_update" && update.state === "idle") {
+        const waiter = run.v2TurnWaiter;
+        run.v2TurnWaiter = undefined;
+        waiter.resolve(update);
+      }
+    },
+    connectionClosed() {
+      if (!run.v2TurnWaiter) return;
+      const waiter = run.v2TurnWaiter;
+      run.v2TurnWaiter = undefined;
+      waiter.resolve({ state: "disconnected" });
     },
   };
 }

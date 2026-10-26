@@ -7,7 +7,7 @@
  * node:assert/strict.
  */
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
@@ -19,14 +19,24 @@ import { canonicalManifestJson, canonicalizeManifestPath, manifestSha256, normal
 
 const logging = { level: "silent" as const, format: "json" as const, requests: false, assets: false, toolCalls: false, shellCommands: false };
 
+const openedStores: PeerJobStore[] = [];
+
+function openStore(stateDir: string): PeerJobStore {
+  const store = openPeerJobStore(stateDir, logging);
+  openedStores.push(store);
+  return store;
+}
+
 function newStore(): PeerJobStore {
   const stateDir = mkdtempSync(join(tmpdir(), "peer-jobs-store-"));
-  return openPeerJobStore(stateDir, logging);
+  return openStore(stateDir);
 }
 
 function jobInput(peerId: string, overrides: Partial<PeerJob> = {}): Omit<PeerJob, "jobId" | "status" | "createdAt"> & { peerId: string } {
   return {
     peerId,
+    workSessionId: "wsess_peer_store_test",
+    workspaceSessionId: "ws_peer_store_test",
     repositoryId: "/tmp/repo",
     baseRevision: "0123456789abcdef0123456789abcdef01234567",
     taskClass: "read_only_audit",
@@ -320,10 +330,67 @@ const NOW = 1_700_000_000_000;
   assert.equal(completed.attempt.outcomeCertainty, "terminal_verified");
   assert.deepEqual(completed.attempt.receipt, receipt, "receipt is persisted on the attempt");
 
+  const reconciliation = store.markAwaitingReconciliation(job.jobId, "artifact_temporary_conflict", NOW + 5050);
+  assert.equal(reconciliation.status, "awaiting_reconciliation");
+  assert.throws(
+    () => store.retryResultProcessing(job.jobId, "old_failure", NOW + 5060),
+    (error: unknown) => error instanceof PeerJobError && error.code === "peer_job_reconciliation_stale",
+    "a stale UI action cannot clear a newer result-processing failure",
+  );
+  const retried = store.retryResultProcessing(job.jobId, "artifact_temporary_conflict", NOW + 5070);
+  assert.equal(retried.status, "result_received");
+  assert.equal(retried.resultProcessing?.failure, undefined);
+  assert.equal(retried.resultProcessing?.retryRevision, 1);
+  assert.deepEqual(store.getAttempt(attempt.attemptId)?.receipt, receipt,
+    "local reconciliation preserves and reuses the exact successful receipt");
+
   // Identical duplicate result: idempotent (no throw, flagged).
   const again = store.completeAttempt(attempt.attemptId, attempt.claimToken, "peer-a", receipt, NOW + 6000);
   assert.equal(again.idempotent, true, "identical duplicate result returns the stored outcome");
   assert.equal(again.job.status, "result_received");
+
+  const receiptSha256 = createHash("sha256").update(JSON.stringify(receipt)).digest("hex");
+  assert.equal(store.markStaging(job.jobId, receiptSha256, NOW + 6100).status, "staging");
+  const awaitingReview = store.markAwaitingReview(job.jobId, {
+    receiptSha256,
+    submissionId: "submission-peer-test",
+    reviewEpoch: 3,
+    snapshotKind: "git",
+    snapshotRef: "d".repeat(40),
+    diffSha256: "e".repeat(64),
+  }, NOW + 6200);
+  assert.equal(awaitingReview.status, "awaiting_review");
+  assert.equal(awaitingReview.resultProcessing?.verificationStatus, undefined);
+  const verificationRecovered = store.markAwaitingReview(job.jobId, {
+    receiptSha256,
+    submissionId: "submission-peer-test",
+    reviewEpoch: 3,
+    snapshotKind: "git",
+    snapshotRef: "d".repeat(40),
+    diffSha256: "e".repeat(64),
+    verificationStatus: "not_configured",
+  }, NOW + 6250);
+  assert.equal(verificationRecovered.resultProcessing?.verificationStatus, "not_configured",
+    "reconciliation fills verification missing from an interrupted older row");
+  const immutableVerification = store.markAwaitingReview(job.jobId, {
+    receiptSha256,
+    submissionId: "submission-peer-test",
+    reviewEpoch: 3,
+    snapshotKind: "git",
+    snapshotRef: "d".repeat(40),
+    diffSha256: "e".repeat(64),
+    verificationStatus: "passed",
+  }, NOW + 6275);
+  assert.equal(immutableVerification.resultProcessing?.verificationStatus, "not_configured",
+    "replayed result processing cannot replace an existing verification receipt");
+  const changesRequested = store.finalizeReview(job.jobId, {
+    submissionId: "submission-peer-test",
+    reviewEpoch: 3,
+    feedbackId: "feedback-peer-test",
+    verdict: "changes_requested",
+  }, NOW + 6400);
+  assert.equal(changesRequested.status, "review_changes_requested");
+  assert.equal(changesRequested.resultProcessing?.reviewVerdict, "changes_requested");
 
   // Conflicting duplicate result: 409-coded error, no silent overwrite.
   const conflicting = { ...receipt, summary: "different" };
@@ -456,11 +523,37 @@ const NOW = 1_700_000_000_000;
   const store = newStore();
   const job = store.createJob(jobInput("peer-a", { baseRevision: "a".repeat(40) }));
   store.requestCancel(job.jobId, NOW);
-  const { attempt } = store.claimNextJob("peer-a", NOW)!;
+  assert.equal(store.claimNextJob("peer-a", NOW), undefined, "a pending cancellation request is never offered for a fresh peer claim");
+  const cancelled = store.cancelUnclaimedJob(job.jobId, NOW + 1);
+  assert.equal(cancelled.status, "cancelled");
+
+  const activeJob = store.createJob(jobInput("peer-a", { baseRevision: "c".repeat(40) }));
+  const { attempt } = store.claimNextJob("peer-a", NOW + 2)!;
+  store.markStarted(attempt.attemptId, attempt.claimToken, "peer-a", NOW + 2);
+  store.requestCancel(activeJob.jobId, NOW + 3);
   const acked = store.cancelAck(attempt.attemptId, attempt.claimToken, "peer-a", NOW + 1000);
   assert.equal(acked.job.status, "cancelled");
   assert.equal(acked.attempt.status, "failed");
   assert.equal(acked.job.terminalReason, "cancel_acknowledged");
+
+  const uncertainJob = store.createJob(jobInput("peer-a", { baseRevision: "d".repeat(40) }));
+  const { attempt: uncertainAttempt } = store.claimNextJob("peer-a", NOW + 2000)!;
+  store.markStarted(uncertainAttempt.attemptId, uncertainAttempt.claimToken, "peer-a", NOW + 2000);
+  store.reapExpiredLeases(NOW + 200_000);
+  assert.equal(store.getJob(uncertainJob.jobId)?.status, "awaiting_reconciliation");
+  store.requestCancel(uncertainJob.jobId, NOW + 200_001);
+  const expiredAck = store.cancelAck(uncertainAttempt.attemptId, uncertainAttempt.claimToken, "peer-a", NOW + 200_002);
+  assert.equal(expiredAck.job.status, "cancelled", "latest uncertain expired attempt may confirm shutdown after owner cancellation");
+
+  const restartedJob = store.createJob(jobInput("peer-a", { baseRevision: "e".repeat(40) }));
+  const restartNow = Date.now();
+  const { attempt: restartedAttempt } = store.claimNextJob("peer-a", restartNow)!;
+  store.markStarted(restartedAttempt.attemptId, restartedAttempt.claimToken, "peer-a", restartNow);
+  store.requestCancel(restartedJob.jobId, restartNow + 1);
+  store.restartReconciliation();
+  assert.equal(store.getAttempt(restartedAttempt.attemptId)?.status, "superseded");
+  const restartedAck = store.cancelAck(restartedAttempt.attemptId, restartedAttempt.claimToken, "peer-a", restartNow + 2);
+  assert.equal(restartedAck.job.status, "cancelled", "latest superseded attempt may confirm shutdown after restart and owner cancellation");
 
   const job2 = store.createJob(jobInput("peer-a", { baseRevision: "b".repeat(40) }));
   store.requestCancel(job2.jobId, NOW);
@@ -472,49 +565,83 @@ const NOW = 1_700_000_000_000;
 // --- instructions durability + legacy sidecar tolerance --------------------------
 {
   const stateDir = mkdtempSync(join(tmpdir(), "peer-jobs-instructions-"));
-  const store = openPeerJobStore(stateDir, logging);
+  const store = openStore(stateDir);
   const job = store.createJob(jobInput("peer-a", { instructions: "say the nonce potato", baseRevision: "c".repeat(40) }));
   store.close();
 
-  const reopened = openPeerJobStore(stateDir, logging);
-  assert.equal(reopened.getJob(job.jobId)?.instructions, "say the nonce potato", "instructions round-trip through the sidecar");
+  const reopened = openStore(stateDir);
+  assert.equal(reopened.getJob(job.jobId)?.instructions, "say the nonce potato", "instructions round-trip through SQLite");
   reopened.close();
 
-  // Legacy sidecar job without instructions tolerates open with "" default.
+  // Legacy sidecar job without instructions imports once and defaults to "".
   const legacyStateDir = mkdtempSync(join(tmpdir(), "peer-jobs-legacy-"));
-  const legacy = openPeerJobStore(legacyStateDir, logging);
-  const legacyJob = legacy.createJob(jobInput("peer-a", { baseRevision: "d".repeat(40) }));
-  legacy.close();
-  const raw = JSON.parse(readFileSync(join(legacyStateDir, "peer-jobs.json"), "utf8")) as { jobs: Array<Record<string, unknown>> };
-  for (const jobRecord of raw.jobs) delete jobRecord.instructions;
-  writeFileSync(join(legacyStateDir, "peer-jobs.json"), JSON.stringify(raw));
-  const legacyReopened = openPeerJobStore(legacyStateDir, logging);
+  const legacyJob = { ...jobInput("peer-a", { baseRevision: "d".repeat(40) }), jobId: "job_legacy", status: "pending", createdAt: new Date(NOW).toISOString() } as PeerJob;
+  const { instructions: _instructions, ...legacyJobWithoutInstructions } = legacyJob;
+  writeFileSync(join(legacyStateDir, "peer-jobs.json"), JSON.stringify({ version: 1, jobs: [legacyJobWithoutInstructions], attempts: [] }));
+  const legacyReopened = openStore(legacyStateDir);
   const restored = legacyReopened.getJob(legacyJob.jobId);
   assert.ok(restored);
   assert.equal(restored.instructions, "", "legacy sidecar job without instructions defaults to empty");
   legacyReopened.close();
-  console.log("store: instructions durability + legacy sidecar tolerance");
+  console.log("store: SQLite durability + one-time legacy sidecar import tolerance");
 }
 
 // --- restartReconciliation ------------------------------------------------------
 {
   const stateDir = mkdtempSync(join(tmpdir(), "peer-jobs-restart-"));
-  const store = openPeerJobStore(stateDir, logging);
+  const store = openStore(stateDir);
   const job = store.createJob(jobInput("peer-a", { baseRevision: "e".repeat(40) }));
   const { attempt } = store.claimNextJob("peer-a", NOW)!;
   store.markStarted(attempt.attemptId, attempt.claimToken, "peer-a", NOW);
   void job;
   store.close();
 
-  // Reopen: durable sidecar restores state; reconciliation flags the
+  // Reopen: durable SQLite rows restore state; reconciliation flags the
   // running job with no active attempt as awaiting_reconciliation.
-  const reopened = openPeerJobStore(stateDir, logging);
+  const reopened = openStore(stateDir);
   const restoredJobs = reopened.listJobsForPeer("peer-a", { includeTerminal: true });
   const restored = restoredJobs[0];
-  assert.ok(restored, "durable sidecar restores job state");
+  assert.ok(restored, "durable SQLite rows restore job state");
   assert.equal(restored.status, "awaiting_reconciliation", "claimed/running job with no active attempt reconciles on boot");
   reopened.close();
   console.log("store: restartReconciliation after durable reload");
+}
+
+// --- cursor queries use bounded SQL pages ------------------------------------
+{
+  const store = newStore();
+  const attemptJob = store.createJob(jobInput("peer-latest-attempt", { maxRuntimeMs: 300_000 }));
+  const attemptNow = Date.now() + 1;
+  for (let generation = 1; generation <= 3; generation += 1) {
+    const claimTime = attemptNow + (generation - 1) * 60_001;
+    const claimed = store.claimNextJob("peer-latest-attempt", claimTime)!;
+    assert.ok(claimed);
+    store.markNotStarted(claimed.attempt.attemptId, claimed.attempt.claimToken, "peer-latest-attempt", claimTime);
+    if (generation < 3) store.reapExpiredLeases(claimTime + 60_001);
+  }
+  assert.equal(store.getAttemptSummaryForJob(attemptJob.jobId).latest?.generation, 3,
+    "latest-attempt projection uses the highest durable generation");
+  for (let index = 0; index < 5; index += 1) {
+    store.createJob(jobInput("peer-page", { instructions: `page ${index}` }));
+  }
+  const first = store.listJobsForPeerPage("peer-page", { includeTerminal: true, limit: 2 });
+  assert.equal(first.length, 2);
+  const second = store.listJobsForPeerPage("peer-page", {
+    includeTerminal: true,
+    after: { createdAt: first[1]!.createdAt, jobId: first[1]!.jobId },
+    limit: 2,
+  });
+  assert.equal(second.length, 2);
+  assert.ok(second[0]!.createdAt > first[1]!.createdAt
+    || (second[0]!.createdAt === first[1]!.createdAt && second[0]!.jobId > first[1]!.jobId),
+  "cursor pages advance by the stable createdAt+jobId tuple");
+  const third = store.listJobsForPeerPage("peer-page", {
+    includeTerminal: true,
+    after: { createdAt: second[1]!.createdAt, jobId: second[1]!.jobId },
+    limit: 2,
+  });
+  assert.equal(third.length, 1);
+  console.log("store: peer job history uses bounded stable SQL cursor pages");
 }
 
 {
@@ -529,3 +656,4 @@ const NOW = 1_700_000_000_000;
   assert.equal(existsSync(corruptPath), false, "the corrupt file must not remain in the authoritative path");
 }
 console.log("src/peer/jobs/store.test.ts: all assertions passed");
+for (const store of openedStores) store.close();

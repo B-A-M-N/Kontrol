@@ -236,8 +236,16 @@ try {
     "a retried terminal event repeats the same durable acknowledgement after a lost HTTP response");
   assert.equal(workSessions.get(sessionId)?.workspaceSessionId, "ws-e2e");
 
+  const destinationRegistration = await jsonFetch("/agents/register", {
+    method: "POST",
+    headers: { Authorization: "Bearer agent-secret", "Content-Type": "application/json" },
+    body: JSON.stringify({ name: "destination-peer", url: peerUrl, role: "agent" }),
+  });
+  assert.equal(destinationRegistration.status, 201);
+  const destinationAgentId = destinationRegistration.body.id as string;
+  const destinationAgentCredential = destinationRegistration.body.agentCredential as string;
   const nextDispatchKey = "acp-lifecycle-next-attempt";
-  agents.beginDispatchAttempt({ key: nextDispatchKey, runId, agentId, attemptNumber: 2 });
+  agents.beginDispatchAttempt({ key: nextDispatchKey, runId, agentId: destinationAgentId, attemptNumber: 2 });
   agents.updateDispatchAttempt(nextDispatchKey, { status: "accepted", remoteRunId: "remote-e2e-2" });
   agents.updateRun(runId, {
     status: "running",
@@ -281,8 +289,8 @@ try {
     headers: {
       Authorization: "Bearer agent-secret",
       "Content-Type": "application/json",
-      "x-kontrol-agent-id": agentId,
-      "x-kontrol-agent-credential": agentCredential,
+      "x-kontrol-agent-id": destinationAgentId,
+      "x-kontrol-agent-credential": destinationAgentCredential,
     },
     body: JSON.stringify({
       type: "failed",
@@ -290,7 +298,7 @@ try {
       attempt_number: 2,
       dispatch_idempotency_key: nextDispatchKey,
       event_id: "hermes-failure-terminal",
-      agent_id: agentId,
+      agent_id: destinationAgentId,
       work_session_id: sessionId,
       payload: {
         error: "deadman idle timeout; Authorization: Bearer lifecycle-secret-token",
@@ -301,6 +309,10 @@ try {
     }),
   });
   assert.equal(hermesFailure.status, 202);
+  assert.equal(agents.getRun(runId)?.agentId, agentId,
+    "destination lifecycle events do not rewrite the logical run's original agent identity");
+  assert.equal(agents.getDispatchAttemptByIdempotencyKey(nextDispatchKey)?.agentId, destinationAgentId,
+    "the destination identity remains attached to its own immutable dispatch attempt");
   const persistedHermesFailure = eventStore.getEventById("hermes-failure-terminal");
   const persistedFailureEvidence = persistedHermesFailure?.payload.workerFailureEvidence as Record<string, unknown> | undefined;
   assert.equal(persistedFailureEvidence?.category, "timeout",

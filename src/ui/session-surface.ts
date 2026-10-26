@@ -176,6 +176,47 @@ export function renderWorkSessionView(view: WorkSessionViewState): void {
   if (view.workSessionId) details.append(element("span", { className: "agent-meta-row", text: `work session: ${view.workSessionId}` }));
   if (view.runId) details.append(element("span", { className: "agent-meta-row", text: `run: ${view.runId}` }));
   if (view.lifecycle) details.append(element("span", { className: "agent-meta-row", text: `lifecycle: ${humanizeStatus(view.lifecycle)}` }));
+  if (view.reviewLoop) {
+    const review = view.reviewLoop;
+    details.append(element("span", {
+      className: "agent-meta-row review-route-status",
+      text: `Review route · ${review.deliveryTransport ?? "MCP App"} · ${humanizeStatus(review.status)} · ${review.completedReviewRounds}/${review.maxReviewRounds} rounds`,
+    }));
+    if (review.browserProfileId) {
+      details.append(element("span", { className: "agent-meta-row review-profile", text: `Reviewer browser profile · ${review.browserProfileId}` }));
+    }
+    if (review.conversation) {
+      const conversation = review.conversation;
+      details.append(element("span", {
+        className: "agent-meta-row review-conversation",
+        text: `Reviewer conversation · ${conversation.key ?? "unbound"} · ${humanizeStatus(conversation.bindingStatus ?? "unbound")}${conversation.bindingRevision ? ` · binding ${conversation.bindingRevision}` : ""}${conversation.browserGeneration ? ` · browser generation ${conversation.browserGeneration}` : ""}`,
+      }));
+    }
+    if (review.deliveryMessage) {
+      details.append(element("span", {
+        className: `agent-meta-row review-message review-delivery-status ${review.browserAttempt?.status ?? review.deliveryMessage.status}`,
+        text: `Review message · ${humanizeStatus(review.deliveryMessage.status)} · ${humanizeStatus(review.deliveryMessage.kind)} · ${review.deliveryMessage.messageId}`,
+      }));
+    }
+    if (review.browserAttempt) {
+      details.append(element("span", {
+        className: `agent-meta-row review-browser-attempt ${review.browserAttempt.status}`,
+        text: `Browser turn · ${humanizeStatus(review.browserAttempt.status)} · attempt ${review.browserAttempt.attemptNumber} · ${review.browserAttempt.attemptId}`,
+      }));
+    }
+    if (review.browserAttempt?.errorCode) {
+      details.append(element("span", {
+        className: "agent-meta-row review-delivery-error",
+        text: `Review delivery needs attention · ${review.browserAttempt.errorCode}`,
+      }));
+    }
+  }
+  for (const pty of view.agentPtys ?? []) {
+    details.append(element("span", {
+      className: `agent-meta-row agent-pty-status ${pty.status}`,
+      text: `PTY · ${pty.agentName} · generation ${pty.processGeneration} · ${pty.status} · cursor ${pty.outputCursor} · ${pty.processSessionId}`,
+    }));
+  }
   dom.meta.append(details);
   const hydrationAt = host.getLastSuccessfulHydrationAt();
   if (hydrationAt) {

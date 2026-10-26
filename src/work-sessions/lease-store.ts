@@ -22,6 +22,7 @@ export function createWorkspaceLeaseStore(db: DatabaseHandle) {
       ownerInstanceId?: string;
       ttlMs?: number;
       takeover?: boolean;
+      leaseKind?: "modify" | "peer_job";
     }): WorkspaceLeaseResult {
       const now = new Date();
       const nowIso = now.toISOString();
@@ -40,6 +41,35 @@ export function createWorkspaceLeaseStore(db: DatabaseHandle) {
           .where(eq(workspaceLeases.canonicalRoot, input.canonicalRoot))
           .get();
 
+        const requestedLeaseKind = input.leaseKind ?? "modify";
+        if (existing?.leaseKind === "peer_job") {
+          // A peer result reservation is a checkout-wide fence. Same-session
+          // ACP workers cannot renew through it; only the matching durable
+          // peer-job owner may idempotently renew/recover the reservation.
+          if (
+            requestedLeaseKind !== "peer_job" ||
+            existing.workSessionId !== input.workSessionId ||
+            existing.workspaceSessionId !== input.workspaceSessionId ||
+            existing.ownerInstanceId !== ownerInstanceId
+          ) {
+            return {
+              acquired: false as const,
+              conflictingWorkSessionId: existing.workSessionId,
+              workspaceSessionId: existing.workspaceSessionId,
+              expiresAt: existing.expiresAt,
+            };
+          }
+        } else if (requestedLeaseKind === "peer_job" && existing) {
+          // Do not reserve a checkout while any ordinary worker owns it,
+          // including a worker attached to the same logical work session.
+          return {
+            acquired: false as const,
+            conflictingWorkSessionId: existing.workSessionId,
+            workspaceSessionId: existing.workspaceSessionId,
+            expiresAt: existing.expiresAt,
+          };
+        }
+
         if (existing && existing.workSessionId !== input.workSessionId) {
           return {
             acquired: false as const,
@@ -55,6 +85,7 @@ export function createWorkspaceLeaseStore(db: DatabaseHandle) {
             .set({
               heartbeatAt: nowIso,
               expiresAt,
+              ...(requestedLeaseKind === "peer_job" ? { ownerInstanceId, leaseKind: "peer_job" } : {}),
               ...(input.takeover ? { ownerInstanceId, leaseNonce: randomUUID() } : {}),
             })
             .where(eq(workspaceLeases.canonicalRoot, input.canonicalRoot))
@@ -67,7 +98,7 @@ export function createWorkspaceLeaseStore(db: DatabaseHandle) {
               canonicalRoot: input.canonicalRoot,
               workspaceSessionId: input.workspaceSessionId,
               workSessionId: input.workSessionId,
-              leaseKind: "modify",
+              leaseKind: requestedLeaseKind,
               ownerInstanceId,
               leaseNonce,
               acquiredAt: nowIso,
@@ -111,6 +142,14 @@ export function createWorkspaceLeaseStore(db: DatabaseHandle) {
         .prepare("delete from workspace_leases where work_session_id = ?")
         .run(workSessionId);
       return result.changes;
+    },
+
+    releaseWorkspaceLeaseForSession(workSessionId: string, leaseNonce: string): boolean {
+      if (!leaseNonce) return false;
+      const result = db.sqlite
+        .prepare("delete from workspace_leases where work_session_id = ? and lease_nonce = ?")
+        .run(workSessionId, leaseNonce);
+      return result.changes > 0;
     },
 
     renewWorkspaceLeaseForSession(workSessionId: string, ttlMs: number | undefined, leaseNonce: string): number {

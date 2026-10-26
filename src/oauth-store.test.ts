@@ -140,6 +140,10 @@ async function testDatabaseConfiguration(stateDir: string): Promise<void> {
       { version: 97, name: "review-browser-generation-observations" },
       { version: 98, name: "scheduler-error-fingerprint-index" },
       { version: 99, name: "filesystem-snapshot-root-indexes" },
+      { version: 100, name: "sqlite-peer-job-storage" },
+      { version: 101, name: "durable-agent-pty-bindings" },
+      { version: 102, name: "acp-run-exact-input-task" },
+      { version: 103, name: "review-browser-binding-revision-fence" },
     ]);
   } finally {
     database.close();

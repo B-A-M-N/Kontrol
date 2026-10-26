@@ -471,6 +471,8 @@ export async function hydrateWorkSessionSnapshot(view: WorkSessionViewState): Pr
       status: string;
       runId?: string;
       lastHeartbeatAt?: string;
+      reviewLoop?: WorkSessionViewState["reviewLoop"];
+      agentPtys?: NonNullable<WorkSessionViewState["agentPtys"]>;
       lastSeq: number;
       recentActivity?: AgentActivityEvent[];
       hasMission: boolean;
@@ -505,6 +507,8 @@ export async function hydrateWorkSessionSnapshot(view: WorkSessionViewState): Pr
       view.status = snap.status;
       view.runId = snap.runId ?? view.runId;
       view.lastHeartbeatAt = snap.lastHeartbeatAt;
+      view.agentPtys = snap.agentPtys ?? [];
+      view.reviewLoop = snap.reviewLoop;
       if (snap.recentActivity) {
         view.activity = snap.recentActivity.slice(-200);
       }

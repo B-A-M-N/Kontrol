@@ -15,6 +15,14 @@ import { logEvent, requestPath } from "../logger.js";
 import { requestLogFields } from "../mcp/workspace-server.js";
 import { createPeerAuthMiddleware, type PeerCredentialRegistry } from "../peer/auth.js";
 import { registerPeerJobRoutes } from "../peer/jobs/routes.js";
+import type { WorkspaceRegistry } from "../workspaces.js";
+import type { WorkSessionManager } from "../work-sessions/index.js";
+import type { ReviewCheckpointManager } from "../review-checkpoints.js";
+import type { ReviewWorkflowService } from "../review-workflow.js";
+import type { EventStore } from "../event-log.js";
+import type { DispatchOutbox } from "../dispatch-outbox.js";
+import type { MissionLedger } from "../mission-ledger.js";
+import type { DatabaseHandle } from "../db/client.js";
 import {
   MCP_HTTP_BODY_LIMIT_BYTES,
   rejectOversizedBody,
@@ -28,6 +36,14 @@ export interface PeerHttpAppDeps {
   readonly handleMcpRequest: (req: Request, res: Response) => void;
   /** Returns true while the process is shutting down (job claims refused). */
   readonly isShuttingDown?: () => boolean;
+  readonly workspaces?: WorkspaceRegistry;
+  readonly workSessions?: WorkSessionManager;
+  readonly reviewCheckpoints?: ReviewCheckpointManager;
+  readonly reviewWorkflow?: ReviewWorkflowService;
+  readonly eventStore?: EventStore;
+  readonly dispatchOutbox?: DispatchOutbox;
+  readonly missionLedger?: MissionLedger;
+  readonly database?: DatabaseHandle;
 }
 
 export function createPeerHttpApp(deps: PeerHttpAppDeps): Express {
@@ -124,9 +140,8 @@ export function createPeerHttpApp(deps: PeerHttpAppDeps): Express {
 
   // M3 durable peer-pull job protocol (C2, honestly labeled). The job store
   // is opened on the first registerPeerJobRoutes call and kept as a
-  // module-level singleton; store lifecycle binds to the process and the
-  // durable sidecar (stateDir/peer-jobs.json, atomic temp-write+rename)
-  // makes restart safe. peerAuth above already guards /peer/*.
+  // module-level singleton backed by the server's shared SQLite handle.
+  // peerAuth above already guards /peer/*.
   // The routes handle is retained on app.locals so the server shutdown and
   // candidate-rollback paths can stop the lease reaper and close the store.
   (app.locals as Record<string, unknown>).peerJobRoutesHandle = registerPeerJobRoutes(app, {
@@ -134,6 +149,15 @@ export function createPeerHttpApp(deps: PeerHttpAppDeps): Express {
     config: { stateDir: config.stateDir, peer },
     logging: config.logging,
     isShuttingDown: deps.isShuttingDown,
+    workspaces: deps.workspaces,
+    workSessions: deps.workSessions,
+    reviewCheckpoints: deps.reviewCheckpoints,
+    reviewWorkflow: deps.reviewWorkflow,
+    eventStore: deps.eventStore,
+    dispatchOutbox: deps.dispatchOutbox,
+    missionLedger: deps.missionLedger,
+    database: deps.database,
+    serverConfig: config,
   });
 
   // Any /peer endpoint not explicitly mounted above keeps its authenticated

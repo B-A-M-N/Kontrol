@@ -46,6 +46,11 @@ interface FailureTracker {
   lockedUntilMs: number;
 }
 
+/** Internal request marker used to isolate public-ingress password failures. */
+export const OAUTH_FAILURE_DOMAIN = Symbol("kontrol.oauthFailureDomain");
+type OAuthFailureDomain = "owner" | "public";
+type OAuthRequest = import("express").Request & { [OAUTH_FAILURE_DOMAIN]?: OAuthFailureDomain };
+
 function newFailureTracker(): FailureTracker {
   return { count: 0, firstFailureAtMs: 0, lockedUntilMs: 0 };
 }
@@ -147,9 +152,12 @@ function requestedScopesAllowed(requested: string[], supported: string[]): boole
 export class SingleUserOAuthProvider implements OAuthServerProvider {
   readonly clientsStore: OAuthRegisteredClientsStore;
   private readonly codes = new Map<string, AuthorizationCodeRecord>();
-  /** Failed authorizations keyed by "clientId|sourceIp", plus a global bucket. */
+  /** Failed authorizations keyed by listener domain + "clientId|sourceIp". */
   private readonly failures = new Map<string, FailureTracker>();
-  private readonly globalFailures: FailureTracker = newFailureTracker();
+  private readonly globalFailures: Record<OAuthFailureDomain, FailureTracker> = {
+    owner: newFailureTracker(),
+    public: newFailureTracker(),
+  };
   private maintenanceTimer?: ReturnType<typeof setInterval>;
   private readonly oauthStore: SqliteOAuthStore;
   private readonly resourceServerUrl: URL;
@@ -167,6 +175,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     this.maintenanceTimer = setInterval(() => {
       try {
         this.purgeExpiredCodes();
+        this.purgeExpiredFailures();
         this.oauthStore.deleteExpiredTokens(Math.floor(Date.now() / 1000));
       } catch {
         // Maintenance is best-effort; never crash the provider from a timer.
@@ -176,14 +185,14 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
   }
 
   /** True when the given key (or the global ceiling) is currently locked out. */
-  isLockedOut(key: string, nowMs = Date.now()): boolean {
-    const global = this.globalFailures;
+  isLockedOut(key: string, nowMs = Date.now(), domain: OAuthFailureDomain = "owner"): boolean {
+    const global = this.globalFailures[domain];
     if (global.lockedUntilMs > nowMs) return true;
-    const tracker = this.failures.get(key);
+    const tracker = this.failures.get(`${domain}|${key}`);
     if (!tracker) return false;
     // Window expiry resets the count.
     if (nowMs - tracker.firstFailureAtMs > AUTH_LOCKOUT_MS) {
-      this.failures.delete(key);
+      this.failures.delete(`${domain}|${key}`);
       return false;
     }
     return tracker.lockedUntilMs > nowMs || tracker.count >= AUTH_MAX_FAILURES;
@@ -192,15 +201,20 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
   /** Failures observed globally since the last window reset (diagnostics and
    * tests: the global tracker is private by design). */
   get globalFailureCount(): number {
-    return this.globalFailures.count;
+    return this.globalFailures.owner.count;
   }
 
-  recordFailure(key: string, nowMs = Date.now()): void {
+  get publicGlobalFailureCount(): number {
+    return this.globalFailures.public.count;
+  }
+
+  recordFailure(key: string, nowMs = Date.now(), domain: OAuthFailureDomain = "owner"): void {
+    const scopedKey = `${domain}|${key}`;
     // Per-key tracker: locks at AUTH_MAX_FAILURES.
-    let tracker = this.failures.get(key);
+    let tracker = this.failures.get(scopedKey);
     if (!tracker) {
       tracker = newFailureTracker();
-      this.failures.set(key, tracker);
+      this.failures.set(scopedKey, tracker);
     }
     advanceFailureWindow(tracker, nowMs);
     if (tracker.count >= AUTH_MAX_FAILURES) {
@@ -209,25 +223,39 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     // Global tracker: independent window and its own threshold — the global
     // ceiling exists to stop distributed brute force, not to punish five
     // failures against one key (which the per-key tracker already locks).
-    const global = this.globalFailures;
+    const global = this.globalFailures[domain];
     advanceFailureWindow(global, nowMs);
     if (global.count >= AUTH_GLOBAL_MAX_FAILURES) {
       global.lockedUntilMs = nowMs + AUTH_LOCKOUT_MS;
     }
   }
 
-  clearFailures(key: string): void {
-    this.failures.delete(key);
-    this.globalFailures.count = 0;
-    this.globalFailures.firstFailureAtMs = 0;
-    this.globalFailures.lockedUntilMs = 0;
+  clearFailures(key: string, domain: OAuthFailureDomain = "owner"): void {
+    this.failures.delete(`${domain}|${key}`);
+    const global = this.globalFailures[domain];
+    global.count = 0;
+    global.firstFailureAtMs = 0;
+    global.lockedUntilMs = 0;
   }
 
   /** Seconds until the key may retry (for Retry-After), 0 if not locked. */
-  retryAfterSeconds(key: string, nowMs = Date.now()): number {
-    const tracker = this.failures.get(key);
-    const until = Math.max(tracker?.lockedUntilMs ?? 0, this.globalFailures.lockedUntilMs);
+  retryAfterSeconds(key: string, nowMs = Date.now(), domain: OAuthFailureDomain = "owner"): number {
+    const tracker = this.failures.get(`${domain}|${key}`);
+    const until = Math.max(tracker?.lockedUntilMs ?? 0, this.globalFailures[domain].lockedUntilMs);
     return until > nowMs ? Math.ceil((until - nowMs) / 1000) : 0;
+  }
+
+  /** Remove listener-scoped failure keys that have aged out, including keys
+   * an attacker never presents again after its initial burst. */
+  purgeExpiredFailures(nowMs = Date.now()): number {
+    let removed = 0;
+    for (const [scopedKey, tracker] of this.failures) {
+      if (nowMs - tracker.firstFailureAtMs > AUTH_LOCKOUT_MS) {
+        this.failures.delete(scopedKey);
+        removed++;
+      }
+    }
+    return removed;
   }
 
   /** Remove expired codes; enforce the outstanding-code cap. */
@@ -282,9 +310,10 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     // P1 #6: brute-force controls keyed by client + source address with a
     // global fallback ceiling. Rejected attempts are counted, never logged
     // with the presented token.
+    const domain = (res.req as OAuthRequest)[OAUTH_FAILURE_DOMAIN] ?? "owner";
     const failureKey = `${client.client_id}|${res.req.socket.remoteAddress ?? "unknown"}`;
-    if (this.isLockedOut(failureKey)) {
-      const retryAfter = this.retryAfterSeconds(failureKey);
+    if (this.isLockedOut(failureKey, Date.now(), domain)) {
+      const retryAfter = this.retryAfterSeconds(failureKey, Date.now(), domain);
       res.status(429).setHeader("Retry-After", String(retryAfter)).setHeader("Content-Type", "text/html; charset=utf-8");
       res.send(
         formHtml({
@@ -298,7 +327,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
       return;
     }
     if (!safeEquals(providedToken, this.config.ownerToken)) {
-      this.recordFailure(failureKey);
+      this.recordFailure(failureKey, Date.now(), domain);
       res.status(401).setHeader("Content-Type", "text/html; charset=utf-8");
       res.send(
         formHtml({
@@ -311,7 +340,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
       );
       return;
     }
-    this.clearFailures(failureKey);
+    this.clearFailures(failureKey, domain);
 
     // Purge expired codes and enforce the outstanding-code cap before adding.
     this.purgeExpiredCodes();

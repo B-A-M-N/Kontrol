@@ -111,7 +111,96 @@ const migrations: Migration[] = [
   { version: 97, name: "review-browser-generation-observations", up: migrateReviewBrowserGenerationObservations },
   { version: 98, name: "scheduler-error-fingerprint-index", up: migrateSchedulerErrorFingerprintIndex },
   { version: 99, name: "filesystem-snapshot-root-indexes", up: migrateFilesystemSnapshotRootIndexes },
+  { version: 100, name: "sqlite-peer-job-storage", up: migratePeerJobStorage },
+  { version: 101, name: "durable-agent-pty-bindings", up: migrateAgentPtyBindings },
+  { version: 102, name: "acp-run-exact-input-task", up: migrateAcpRunExactInputTask },
+  { version: 103, name: "review-browser-binding-revision-fence", up: migrateReviewBrowserBindingRevisionFence },
 ];
+
+function migrateReviewBrowserBindingRevisionFence(sqlite: Database.Database): void {
+  // Historical attempts do not have enough evidence to reconstruct which
+  // exact conversation binding they observed. Leave their revision NULL so
+  // transition/retry checks fail closed until the attempt is reconciled.
+  addColumnIfMissing(sqlite, "review_browser_turns", "binding_revision", "integer");
+}
+
+function migrateAcpRunExactInputTask(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "acp_runs", "input_task", "text");
+  addColumnIfMissing(sqlite, "acp_runs", "input_task_sha256", "text");
+}
+
+function migratePeerJobStorage(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table if not exists peer_jobs (
+      job_id text primary key not null,
+      peer_id text not null,
+      status text not null,
+      created_at text not null,
+      task_class text not null,
+      repository_id text not null,
+      workspace_session_id text,
+      work_session_id text,
+      record_json text not null
+    );
+    create index if not exists peer_jobs_peer_created_cursor_idx
+      on peer_jobs(peer_id, created_at, job_id);
+    create index if not exists peer_jobs_peer_status_created_idx
+      on peer_jobs(peer_id, status, created_at, job_id);
+    create index if not exists peer_jobs_status_created_idx
+      on peer_jobs(status, created_at, job_id);
+    create index if not exists peer_jobs_work_session_idx
+      on peer_jobs(work_session_id, job_id);
+
+    create table if not exists peer_job_attempts (
+      attempt_id text primary key not null,
+      job_id text not null references peer_jobs(job_id) on delete cascade,
+      status text not null,
+      generation integer not null,
+      created_at text not null,
+      lease_expires_at text not null,
+      outcome_certainty text not null,
+      record_json text not null
+    );
+    create index if not exists peer_job_attempts_job_created_idx
+      on peer_job_attempts(job_id, created_at, attempt_id);
+    create index if not exists peer_job_attempts_job_generation_idx
+      on peer_job_attempts(job_id, generation);
+    create index if not exists peer_job_attempts_active_lease_idx
+      on peer_job_attempts(status, lease_expires_at, attempt_id);
+
+    create table if not exists peer_job_store_metadata (
+      key text primary key not null,
+      value text not null
+    );
+  `);
+}
+
+function migrateAgentPtyBindings(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table if not exists agent_pty_bindings (
+      id text primary key not null,
+      process_session_id text not null unique,
+      workspace_session_id text not null references workspace_sessions(id) on delete cascade,
+      work_session_id text not null references work_sessions(id) on delete cascade,
+      run_id text not null references acp_runs(run_id) on delete restrict,
+      agent_name text not null,
+      owner_principal_id text not null,
+      process_generation integer not null,
+      output_cursor integer not null default 0,
+      status text not null,
+      created_at text not null,
+      updated_at text not null,
+      finished_at text,
+      unique (work_session_id, process_generation)
+    );
+    create index if not exists agent_pty_bindings_work_session_idx
+      on agent_pty_bindings(work_session_id, created_at, id);
+    create index if not exists agent_pty_bindings_run_idx
+      on agent_pty_bindings(run_id, process_generation);
+    create index if not exists agent_pty_bindings_status_idx
+      on agent_pty_bindings(status, updated_at);
+  `);
+}
 
 function migrateReviewerBrowserAuthState(sqlite: Database.Database): void {
   addColumnIfMissing(sqlite, "review_browser_profiles", "auth_state", "text not null default 'unknown'");

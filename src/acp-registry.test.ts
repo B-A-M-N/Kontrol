@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -120,6 +121,7 @@ console.log("acp-registry.test.ts: redirect rejection OK");
       agentName: "dispatch-agent",
       agentId: "agent-dispatch",
       workSessionId: "ws-dispatch-key",
+      inputTask: "Preserve the exact task across registry restart.",
       status: "dispatch_uncertain",
     });
     registryA.beginDispatchAttempt({ key: "disp_original-response-lost", runId: original.runId, agentId: "agent-dispatch", attemptNumber: 1 });
@@ -139,6 +141,8 @@ console.log("acp-registry.test.ts: redirect rejection OK");
     assert.equal(attempt?.remoteRunId, "remote-original");
     assert.equal(recovered?.runId, original.runId);
     assert.equal(recovered?.workSessionId, "ws-dispatch-key");
+    assert.equal(recovered?.inputTask, "Preserve the exact task across registry restart.");
+    assert.equal(recovered?.inputTaskSha256, createHash("sha256").update(recovered!.inputTask!).digest("hex"));
     registryB.close();
     dbB.close();
   } finally {

@@ -4,6 +4,8 @@ import { createShutdownController } from "./shutdown.js";
 const events: string[] = [];
 let releaseDrain!: () => void;
 const drainingTurn = new Promise<void>((resolve) => { releaseDrain = resolve; });
+let releaseMaintenance!: () => void;
+const drainingMaintenance = new Promise<void>((resolve) => { releaseMaintenance = resolve; });
 const timer = setInterval(() => undefined, 60_000);
 timer.unref();
 
@@ -16,7 +18,7 @@ const shutdown = createShutdownController({
   mcpWaiterAdmission: { close: () => events.push("waiter-admission-close") } as any,
   mcpResourceAdmission: { close: () => events.push("resource-admission-close") } as any,
   startupReconciliation: { stop: () => events.push("startup-stop") },
-  maintenance: { stop: () => events.push("maintenance-stop") },
+  maintenance: { stop: async () => { events.push("maintenance-stop-start"); await drainingMaintenance; events.push("maintenance-stop-complete"); } },
   reviewCheckpoints: { drain: async () => { events.push("checkpoint-drain"); } },
   reviewerTurnDispatcher: { stopAndDrain: async () => { events.push("browser-turn-drain-start"); await drainingTurn; events.push("browser-turn-drain-complete"); } },
   reviewBrowserController: { close: async () => { events.push("browser-close"); } },
@@ -29,6 +31,13 @@ const shutdown = createShutdownController({
 } as any);
 
 const closePromise = shutdown.close();
+for (let index = 0; index < 50 && !events.includes("maintenance-stop-start"); index += 1) {
+  await new Promise((resolve) => setTimeout(resolve, 2));
+}
+assert.ok(events.includes("maintenance-stop-start"), "shutdown stops and drains maintenance first");
+assert.equal(events.includes("browser-turn-drain-start"), false, "later shutdown phases wait for maintenance to finish");
+assert.equal(events.includes("database-close"), false, "the database stays open while maintenance is active");
+releaseMaintenance();
 for (let index = 0; index < 50 && !events.includes("browser-turn-drain-start"); index += 1) {
   await new Promise((resolve) => setTimeout(resolve, 2));
 }
@@ -37,6 +46,7 @@ assert.equal(events.includes("browser-close"), false, "the browser controller st
 assert.equal(events.includes("database-close"), false, "the database stays open while an active dispatch drains");
 releaseDrain();
 await closePromise;
+assert.ok(events.indexOf("maintenance-stop-complete") < events.indexOf("database-close"), "maintenance drains before database close");
 assert.ok(events.indexOf("browser-turn-drain-complete") < events.indexOf("browser-close"), "browser teardown follows the completed turn drain");
 assert.ok(events.indexOf("browser-close") < events.indexOf("database-close"), "database close follows browser teardown");
 assert.equal(events.at(-1), "database-close", "database is the final shutdown resource");

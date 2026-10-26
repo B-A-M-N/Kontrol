@@ -41,6 +41,7 @@ import {
 } from "./pi-tools.js";
 import { SingleUserOAuthProvider } from "./oauth-provider.js";
 import { ProcessSessionManager, type ProcessSnapshot } from "./process-sessions.js";
+import { createAgentPtyBindingStore } from "./agent-pty-bindings.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { FilesystemSnapshotStore } from "./filesystem-snapshot-store.js";
 import { createMaintenanceCoordinator } from "./runtime/maintenance.js";
@@ -337,8 +338,14 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     // P1.6: operator-extended exclusion list, added to the defaults.
     excludedDirectories: config.fsSnapshot.excludedDirectories,
   });
+  const agentPtyBindings = createAgentPtyBindingStore(db.sqlite);
+  const staleAgentPtyBindings = agentPtyBindings.markUnresolvedLost();
+  if (staleAgentPtyBindings > 0) {
+    console.warn(`[kontrol] marked ${staleAgentPtyBindings} prior agent PTY binding(s) lost during startup reconciliation`);
+  }
   const processSessions = new ProcessSessionManager({
     childEnvironmentAllowlist: config.childEnvironmentAllowlist,
+    agentPtyBindings,
     // P1 #14: operator-tunable resource controls; manager applies defaults
     // for anything unset.
     ...(config.processMaxRunning !== undefined && { maxRunningProcesses: config.processMaxRunning }),
@@ -772,6 +779,14 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
       config,
       registry: peerRegistry,
       isShuttingDown: () => shuttingDown,
+      workspaces,
+      workSessions,
+      reviewCheckpoints,
+      reviewWorkflow,
+      eventStore,
+      dispatchOutbox,
+      missionLedger,
+      database: db,
       handleMcpRequest: (req, res) => {
         void handleMcpHttpRequest(peerMcpDeps, req, res);
       },
@@ -952,7 +967,11 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     publicApp,
     config,
     dispatcher,
-    close: shutdown.close,
+    close: async () => {
+      const peerJobRoutesHandle = (peerApp?.locals as { peerJobRoutesHandle?: { close?: () => Promise<void> } } | undefined)?.peerJobRoutesHandle;
+      await peerJobRoutesHandle?.close?.();
+      await shutdown.close();
+    },
     drain: shutdown.drain,
   };
 }
@@ -1105,8 +1124,8 @@ export async function runServer(config = loadConfig()): Promise<void> {
       // close() — a job-route teardown failure must never mask the original
       // bind failure.
       try {
-        const peerJobRoutesHandle = (peerApp?.locals as { peerJobRoutesHandle?: { close?: () => void } } | undefined)?.peerJobRoutesHandle;
-        peerJobRoutesHandle?.close?.();
+        const peerJobRoutesHandle = (peerApp?.locals as { peerJobRoutesHandle?: { close?: () => Promise<void> } } | undefined)?.peerJobRoutesHandle;
+        await peerJobRoutesHandle?.close?.();
       } catch {
         // Resource cleanup below remains authoritative.
       }
@@ -1114,34 +1133,34 @@ export async function runServer(config = loadConfig()): Promise<void> {
       if (ownsRuntimeLock) await releaseRuntimeLock(runtimeLock);
       throw new Error(`kontrol peer listener failed to bind ${config.peer.bindHost}:${config.peer.port}: ${error instanceof Error ? error.message : String(error)}`);
     }
-    closePeerHttpServer = () => new Promise<void>((resolve) => {
-      // Stop the peer job reaper and close the job store (guarded: a close
-      // failure never breaks socket shutdown).
+    closePeerHttpServer = async () => {
+      if (peerHttpServer!.listening) {
+        await new Promise<void>((resolve) => {
+          let settled = false;
+          const finish = () => {
+            if (settled) return;
+            settled = true;
+            resolve();
+          };
+          const deadline = setTimeout(() => {
+            (peerHttpServer as { closeAllConnections?: () => void }).closeAllConnections?.();
+            finish();
+          }, 5_000);
+          peerHttpServer!.close(() => {
+            clearTimeout(deadline);
+            finish();
+          });
+        });
+      }
+      // The listener no longer accepts requests. Drain the durable peer-result
+      // consumer before its sidecar and shared outbox/database are closed.
       try {
-        const peerJobRoutesHandle = (peerApp?.locals as { peerJobRoutesHandle?: { close?: () => void } } | undefined)?.peerJobRoutesHandle;
-        peerJobRoutesHandle?.close?.();
+        const peerJobRoutesHandle = (peerApp?.locals as { peerJobRoutesHandle?: { close?: () => Promise<void> } } | undefined)?.peerJobRoutesHandle;
+        await peerJobRoutesHandle?.close?.();
       } catch {
-        // Socket shutdown below remains authoritative.
+        // Socket shutdown remains authoritative; shared shutdown reports its own drain failures.
       }
-      if (!peerHttpServer!.listening) {
-        resolve();
-        return;
-      }
-      let settled = false;
-      const finish = () => {
-        if (settled) return;
-        settled = true;
-        resolve();
-      };
-      const deadline = setTimeout(() => {
-        (peerHttpServer as { closeAllConnections?: () => void }).closeAllConnections?.();
-        finish();
-      }, 5_000);
-      peerHttpServer!.close(() => {
-        clearTimeout(deadline);
-        finish();
-      });
-    });
+    };
   }
   let publicHttpServer: import("node:http").Server | undefined;
   let closePublicHttpServer: (() => Promise<void>) | undefined;

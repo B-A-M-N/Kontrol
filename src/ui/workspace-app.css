@@ -18,6 +18,27 @@
 .ingress-header, .ingress-profile { border: 1px solid var(--color-border-primary, #3a3a40); border-radius: 10px; background: var(--color-background-secondary, #28282d); padding: 14px; }
 .ingress-header h2, .ingress-profile h3 { margin: 0; font-size: 15px; }
 .ingress-header p, .ingress-evidence, .ingress-note { color: var(--color-text-secondary, #b6b6bd); font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+
+.peer-status-panel { padding: 14px; }
+.peer-status-heading, .peer-job-header, .peer-status-pagination { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.peer-status-title { margin: 0; font-size: 15px; }
+.peer-status-listener, .peer-status-page-count, .peer-job-hint, .peer-status-empty, .peer-status-note { margin: 4px 0 0; color: var(--color-text-secondary, #b6b6bd); font-size: 12px; line-height: 1.45; }
+.peer-status-page-count { white-space: nowrap; }
+.peer-status-peers { display: flex; flex-wrap: wrap; gap: 6px; margin: 12px 0; }
+.peer-status-peer, .peer-job-status { border: 1px solid var(--color-border-primary, #3a3a40); border-radius: 999px; padding: 3px 8px; color: var(--color-text-secondary, #d6d6dc); font-size: 11px; }
+.peer-job-list { display: grid; gap: 8px; max-height: min(64vh, 620px); overflow: auto; margin: 12px 0 0; padding: 0; list-style: none; }
+.peer-job { min-width: 0; padding: 10px; border: 1px solid var(--color-border-primary, #3a3a40); border-radius: 8px; background: var(--color-background-primary, #18191d); }
+.peer-job-id, .peer-job-detail-value { overflow-wrap: anywhere; font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace); font-size: 11px; }
+.peer-job-details { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr)); gap: 6px 14px; margin-top: 8px; }
+.peer-job-detail { display: grid; gap: 2px; min-width: 0; }
+.peer-job-detail-label { color: var(--color-text-secondary, #9ca3af); font-size: 10px; }
+.peer-job-detail-value { color: var(--color-text-primary, #e5e7eb); }
+.peer-status-pagination { justify-content: flex-start; flex-wrap: wrap; margin-top: 12px; }
+.peer-status-page-button { min-height: 36px; padding: 6px 12px; border: 1px solid var(--color-border-primary, #3a3a40); border-radius: 6px; background: var(--color-background-secondary, #28282d); color: var(--color-text-primary, #f5f5f6); font: inherit; cursor: pointer; }
+.peer-status-page-button:disabled { opacity: .55; cursor: default; }
+.peer-job-reconcile-button { min-height: 34px; margin-top: 10px; padding: 5px 10px; border: 1px solid var(--color-border-primary, #3a3a40); border-radius: 6px; background: var(--color-background-secondary, #28282d); color: var(--color-text-primary, #f5f5f6); font: inherit; cursor: pointer; }
+.peer-job-reconcile-button:disabled { opacity: .55; cursor: default; }
+.peer-status-error { color: var(--color-text-danger, #f87171); font-size: 12px; overflow-wrap: anywhere; }
 .ingress-profile-top, .ingress-actions { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
 .ingress-state { border: 1px solid var(--color-border-primary, #3a3a40); border-radius: 999px; padding: 4px 9px; font-size: 11px; text-transform: capitalize; }
 .ingress-state.mapping_matched, .ingress-state.ready { border-color: #228b5b; }

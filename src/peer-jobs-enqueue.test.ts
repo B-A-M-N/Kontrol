@@ -6,20 +6,26 @@
  * Harness pattern: src/peer-listener.test.ts.
  */
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomBytes, createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import type { Server } from "node:http";
 import { createServer } from "./server.js";
 import { loadConfig } from "./config.js";
 import type { ServerConfig } from "./config.js";
 import { hashPeerCredential } from "./peer/credentials.js";
 import { manifestSha256 } from "./peer/jobs/service.js";
+import { createPeerJobResultProcessor } from "./peer/jobs/result-processor.js";
+import { getPeerJobStore } from "./peer/jobs/store.js";
+import type { PeerJob } from "./peer/jobs/contracts.js";
+import { createWorkSessionManager } from "./work-sessions/index.js";
 
 const PEER_ID = "meta-muse";
 const CREDENTIAL_ID = "v1";
 const SECRET = randomBytes(24).toString("hex");
+const REVIEWER_SECRET = randomBytes(24).toString("hex");
 const token = "Bearer " + CREDENTIAL_ID + ":" + SECRET;
 const INSTRUCTIONS = "say the nonce potato";
 const expectedInstructionHash = createHash("sha256").update(INSTRUCTIONS, "utf8").digest("hex");
@@ -31,6 +37,13 @@ const worktreeRoot = mkdtempSync(join(tmpdir(), "kontrol-enqueue-worktrees-"));
 const configDir = mkdtempSync(join(tmpdir(), "kontrol-enqueue-config-"));
 
 writeFileSync(join(root, "hello.txt"), "hello from enqueue e2e\n");
+execFileSync("git", ["init", "-q"], { cwd: root });
+execFileSync("git", ["add", "--", "hello.txt"], { cwd: root });
+const authorIdent = execFileSync("git", ["var", "GIT_AUTHOR_IDENT"], { encoding: "utf8" }).trim();
+const authorMatch = /^(.*) <([^<>]+)> \d+ [+-]\d{4}$/.exec(authorIdent);
+assert.ok(authorMatch, "the test environment provides its configured Git identity");
+execFileSync("git", ["-c", `user.name=${authorMatch[1]}`, "-c", `user.email=${authorMatch[2]}`, "commit", "-m", "peer job baseline", "-q"], { cwd: root });
+const baseRevision = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim();
 
 function writeRegistry(peers: unknown[]): string {
   const file = join(configDir, "peer-fixture-registry.json");
@@ -57,7 +70,11 @@ const config: ServerConfig = loadConfig({
   KONTROL_STATE_DIR: stateDir,
   KONTROL_WORKTREE_ROOT: worktreeRoot,
   KONTROL_AUTH_MODE: "tunnel",
-  KONTROL_ACP_ENABLED: "false",
+  KONTROL_ACP_ENABLED: "true",
+  KONTROL_ACP_AGENT_SECRET: randomBytes(24).toString("hex"),
+  KONTROL_ACP_REVIEWER_SECRET: REVIEWER_SECRET,
+  KONTROL_ACP_ADAPTER_SECRET: randomBytes(24).toString("hex"),
+  KONTROL_TUNNEL_REVIEWER_SECRET: REVIEWER_SECRET,
   KONTROL_POLICY_MODE: "allow",
   KONTROL_LOG_LEVEL: "error",
   KONTROL_LOG_LEVEL_FALLBACK: "error",
@@ -139,6 +156,28 @@ async function deleteSession(url: string, sessionId: string, headers: Record<str
 
 // --- Sessions ------------------------------------------------------------------
 const ownerSession = await initialize(ownerUrl, "kontrol-enqueue-owner");
+const reviewerHeaders = { "x-kontrol-tunnel-reviewer": REVIEWER_SECRET };
+const reviewerSession = await initialize(ownerUrl, "kontrol-enqueue-reviewer", reviewerHeaders);
+const testWorkSessions = createWorkSessionManager(stateDir);
+
+async function createBoundTarget(): Promise<{ workspaceSessionId: string; workSessionId: string; workspaceRoot: string }> {
+  const opened = await rpc(ownerUrl, "tools/call", {
+    name: "open_workspace",
+    arguments: { path: root, mode: "worktree", baseRef: baseRevision },
+  }, { "mcp-session-id": ownerSession });
+  assert.equal(opened.payload?.result?.isError, undefined, JSON.stringify(opened.payload));
+  const workspaceSessionId = opened.payload?.result?.structuredContent?.workspaceId as string | undefined;
+  const workspaceRoot = opened.payload?.result?.structuredContent?.root as string | undefined;
+  assert.ok(workspaceSessionId, "open_workspace returns managed-worktree workspaceId");
+  assert.ok(workspaceRoot, "open_workspace returns the exact managed-worktree root");
+  const workSession = testWorkSessions.create({
+    workspaceSessionId,
+    submittedBy: "peer-job-e2e",
+    title: "Peer job integration test",
+    completionPolicy: "webui_approval_required",
+  });
+  return { workspaceSessionId, workSessionId: workSession.id, workspaceRoot };
+}
 
 const peerHeaders = { authorization: token };
 const peerMcpUrl = peerBase + "/mcp";
@@ -162,7 +201,7 @@ const peerSession = await initialize(peerMcpUrl, "mcp:meta-muse", peerHeaders);
 {
   const attempt = await rpc(peerMcpUrl, "tools/call", {
     name: "enqueue_peer_job",
-    arguments: { peerId: PEER_ID, repositoryId: root, baseRevision: "a".repeat(40), taskClass: "read_only_audit", instructions: "x", allowedOutputs: ["*"] },
+    arguments: { peerId: PEER_ID, repositoryId: root, workspaceSessionId: "ws_peer", workSessionId: "wsess_peer", baseRevision, taskClass: "read_only_audit", instructions: "x", allowedOutputs: ["*"] },
   }, { ...peerHeaders, "mcp-session-id": peerSession });
   assert.equal(attempt.response.status, 200);
   assert.equal(attempt.payload?.result?.isError, true, "peer-role enqueue call must be denied");
@@ -171,10 +210,13 @@ const peerSession = await initialize(peerMcpUrl, "mcp:meta-muse", peerHeaders);
 }
 
 // --- Owner enqueue happy path ----------------------------------------------------
+const enqueueTarget = await createBoundTarget();
+const { workspaceRoot: enqueueWorkspaceRoot, ...enqueueTargetArgs } = enqueueTarget;
 const enqueueArgs = {
   peerId: PEER_ID,
   repositoryId: root,
-  baseRevision: "0123456789abcdef0123456789abcdef01234567",
+  baseRevision,
+  ...enqueueTargetArgs,
   taskClass: "read_only_audit",
   instructions: INSTRUCTIONS,
   allowedOutputs: ["out/"],
@@ -190,6 +232,22 @@ let jobId: string;
   assert.equal(created.maxRuntimeMs, 600_000, "default maxRuntimeMs");
   assert.equal(created.maxArtifactBytes, 1_048_576, "default maxArtifactBytes");
   jobId = created.jobId;
+  const reservation = testWorkSessions.getWorkspaceLeaseForSession(enqueueTarget.workSessionId);
+  assert.equal(reservation?.leaseKind, "peer_job", "enqueue durably reserves the exact worktree for peer execution and staging");
+  assert.equal(reservation?.ownerInstanceId, `peer-job:${jobId}`);
+  const normalWorkerLease = testWorkSessions.acquireWorkspaceLease({
+    canonicalRoot: reservation!.canonicalRoot,
+    workspaceSessionId: enqueueTarget.workspaceSessionId,
+    workSessionId: enqueueTarget.workSessionId,
+  });
+  assert.equal(normalWorkerLease.acquired, false, "even the same work session cannot start a worker through a peer-job reservation");
+  const afterRestart = createWorkSessionManager(stateDir);
+  try {
+    assert.equal(afterRestart.getWorkspaceLeaseForSession(enqueueTarget.workSessionId)?.leaseNonce, reservation?.leaseNonce,
+      "the peer-job checkout reservation survives opening a fresh SQLite work-session manager");
+  } finally {
+    afterRestart.close();
+  }
   console.log("enqueue-e2e: owner enqueued job " + jobId + " with defaults");
 }
 
@@ -231,7 +289,29 @@ let claimToken: string;
   });
   assert.equal(started.status, 200, await started.clone().text());
 
-  const files = [{ path: "out/nonce.json", sha256: "a".repeat(64), bytes: 5 }];
+  const artifactBytes = Buffer.from("nonce", "utf8");
+  const artifactSha256 = createHash("sha256").update(artifactBytes).digest("hex");
+  const artifactPath = "out/nonce.json";
+  const files = [{ path: artifactPath, sha256: artifactSha256, bytes: artifactBytes.byteLength }];
+  const uploaded = await fetch(peerBase + "/peer/jobs/" + jobId + "/artifacts", {
+    method: "PUT",
+    headers: {
+      "content-type": "application/octet-stream",
+      authorization: token,
+      "x-peer-attempt-id": attemptId,
+      "x-peer-claim-token": claimToken,
+      "x-peer-artifact-path": files[0]!.path,
+    },
+    body: new Blob([Uint8Array.from(artifactBytes)]),
+  });
+  assert.equal(uploaded.status, 200, await uploaded.clone().text());
+  // Force the durable result processor into its ambiguous local-recovery state:
+  // a crash-left temp path exists but its bytes do not match this exact receipt.
+  // The peer has already uploaded the correct immutable artifact bytes, so an
+  // owner retry must be able to recover without relaunching the remote job.
+  const temporaryPath = join(enqueueWorkspaceRoot, `${artifactPath}.${artifactSha256}.peer.tmp`);
+  mkdirSync(join(enqueueWorkspaceRoot, "out"), { recursive: true });
+  writeFileSync(temporaryPath, "conflicting temporary bytes");
   const result = await fetch(peerBase + "/peer/jobs/" + jobId + "/result", {
     method: "POST",
     headers: { "content-type": "application/json", authorization: token },
@@ -254,7 +334,96 @@ let claimToken: string;
   assert.equal(result.status, 200, await result.clone().text());
   const payload = await result.json() as { job: { status: string } };
   assert.equal(payload.job.status, "result_received");
-  console.log("enqueue-e2e: result within allowedOutputs -> result_received");
+  console.log("enqueue-e2e: uploaded artifact bytes match the accepted result receipt");
+  const reconciliationDeadline = Date.now() + 10_000;
+  let processed: any;
+  while (Date.now() < reconciliationDeadline) {
+    const response = await rpc(ownerUrl, "tools/call", {
+      name: "list_peer_status",
+      arguments: { peerId: PEER_ID },
+    }, { "mcp-session-id": ownerSession });
+    processed = response.payload?.result?.structuredContent?.jobs?.find((job: { jobId: string }) => job.jobId === jobId);
+    if (processed?.status === "awaiting_reconciliation") break;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.equal(processed?.status, "awaiting_reconciliation", JSON.stringify(processed));
+  assert.equal(processed.resultProcessingFailure, "artifact_temporary_conflict",
+    "the owner status projection exposes the classified local recovery reason");
+  rmSync(temporaryPath);
+  const retry = await rpc(ownerUrl, "tools/call", {
+    name: "reconcile_peer_job_result",
+    arguments: {
+      jobId,
+      expectedFailure: "artifact_temporary_conflict",
+      clientMutationId: "peer-result-local-retry-1",
+    },
+  }, { "mcp-session-id": ownerSession });
+  assert.equal(retry.payload?.result?.isError, undefined, JSON.stringify(retry.payload));
+  assert.equal(retry.payload?.result?.structuredContent?.status, "result_received");
+  assert.equal(retry.payload?.result?.structuredContent?.retryRevision, 1);
+  assert.match(retry.payload?.result?.structuredContent?.message ?? "", /reviewer approval remains required/);
+  const retryAgain = await rpc(ownerUrl, "tools/call", {
+    name: "reconcile_peer_job_result",
+    arguments: {
+      jobId,
+      expectedFailure: "artifact_temporary_conflict",
+      clientMutationId: "peer-result-local-retry-1",
+    },
+  }, { "mcp-session-id": ownerSession });
+  assert.deepEqual(retryAgain.payload?.result?.structuredContent, retry.payload?.result?.structuredContent,
+    "an identical mutation retry returns its original recovery receipt");
+  assert.equal(getPeerJobStore()?.listAttemptsForJob(jobId).length, 1,
+    "local result reconciliation never launches a second remote peer attempt");
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    const response = await rpc(ownerUrl, "tools/call", {
+      name: "list_peer_status",
+      arguments: { peerId: PEER_ID },
+    }, { "mcp-session-id": ownerSession });
+    processed = response.payload?.result?.structuredContent?.jobs?.find((job: { jobId: string }) => job.jobId === jobId);
+    if (processed?.status === "awaiting_review") break;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.equal(processed?.status, "awaiting_review", JSON.stringify(processed));
+  assert.ok(processed.submissionId, "peer result is linked to an existing review submission");
+  assert.equal(processed.snapshotKind, "git");
+  assert.equal(processed.verificationStatus, "not_configured", "absence of a mission verifier is visible and never claimed as verified");
+  assert.equal(testWorkSessions.getWorkspaceLeaseForSession(enqueueTarget.workSessionId), undefined,
+    "successful staging releases only after the review submission and verification receipt are durable");
+  console.log("enqueue-e2e: owner retries exact stored receipt; result stages a local snapshot and submits to review");
+
+  const submission = testWorkSessions.getSubmissions(enqueueTarget.workSessionId).find((item) => item.id === processed.submissionId);
+  assert.ok(submission, "peer result submission remains available to the reviewer");
+  const feedback = await rpc(ownerUrl, "tools/call", {
+    name: "provide_review_feedback",
+    arguments: {
+      sessionId: enqueueTarget.workSessionId,
+      submissionId: submission.id,
+      diffSha256: submission.diffSha256,
+      reviewEpoch: submission.reviewEpoch,
+      verdict: "approve",
+      comments: "Peer result reviewed and accepted.",
+    },
+  }, { ...reviewerHeaders, "mcp-session-id": reviewerSession });
+  assert.equal(feedback.payload?.result?.isError, undefined, JSON.stringify(feedback.payload));
+  assert.equal(feedback.payload?.result?.structuredContent?.status, "approved", JSON.stringify(feedback.payload));
+  const committed = testWorkSessions.getLatestFeedback(enqueueTarget.workSessionId);
+  assert.equal(committed?.submissionId, submission.id, "review workflow durably committed feedback for the exact submission");
+  assert.equal(committed?.verdict, "approve");
+  const reviewDeadline = Date.now() + 5_000;
+  while (Date.now() < reviewDeadline) {
+    const response = await rpc(ownerUrl, "tools/call", {
+      name: "list_peer_status",
+      arguments: { peerId: PEER_ID },
+    }, { "mcp-session-id": ownerSession });
+    processed = response.payload?.result?.structuredContent?.jobs?.find((job: { jobId: string }) => job.jobId === jobId);
+    if (processed?.status === "completed") break;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.equal(processed?.status, "completed", JSON.stringify(processed));
+  assert.equal(processed.reviewVerdict, "approve", "peer job terminal state is bound to committed reviewer feedback");
+  console.log("enqueue-e2e: committed reviewer approval finalizes the peer job");
+
 }
 
 // --- Owner enqueue denials ----------------------------------------------------------
@@ -270,20 +439,149 @@ let claimToken: string;
   await enqueueError({ ...enqueueArgs, repositoryId: outsideRoot }, "ungranted repositoryId");
   // Outside the server's allowed roots entirely.
   await enqueueError({ ...enqueueArgs, repositoryId: "/definitely/not/allowed" }, "repositoryId outside allowed roots");
+  await enqueueError({
+    ...enqueueArgs,
+    ...(await createBoundTarget()),
+    taskClass: "propose_patch",
+  }, "propose_patch without a mission verification contract");
   // Cap exceeded: job1 is result_received (not active), so enqueue job2 OK…
   const second = await rpc(ownerUrl, "tools/call", {
     name: "enqueue_peer_job",
-    arguments: { ...enqueueArgs, baseRevision: "b".repeat(40) },
+    arguments: { ...enqueueArgs, ...(await createBoundTarget()) },
   }, { "mcp-session-id": ownerSession });
   assert.equal(second.payload?.result?.isError, undefined, "second enqueue fits the cap");
   // …then a third exceeds KONTROL_PEER_MAX_CLAIMED_JOBS=1.
   const third = await rpc(ownerUrl, "tools/call", {
     name: "enqueue_peer_job",
-    arguments: { ...enqueueArgs, baseRevision: "c".repeat(40) },
+    arguments: { ...enqueueArgs, ...(await createBoundTarget()) },
   }, { "mcp-session-id": ownerSession });
   assert.equal(third.payload?.result?.isError, true, "cap exceeded must be an isError denial");
   assert.match(JSON.stringify(third.payload), /maximum number of active jobs/);
   console.log("enqueue-e2e: per-peer job cap enforced on the owner enqueue path");
+}
+
+// --- Concurrent results targeting one worktree are serialized ---------------
+{
+  const resultRoot = mkdtempSync(join(tmpdir(), "kontrol-peer-result-lock-"));
+  const bytesByJob = new Map([["job_lock_a", Buffer.from("a")], ["job_lock_b", Buffer.from("b")]]);
+  const jobs = new Map<string, PeerJob>();
+  const attempts = new Map<string, any[]>();
+  for (const [jobId, filePath, bytes, workspaceSessionId, workSessionId] of [
+    ["job_lock_a", "a.txt", bytesByJob.get("job_lock_a")!, "workspace_lock", "work_lock_a"],
+    ["job_lock_b", "b.txt", bytesByJob.get("job_lock_b")!, "workspace_lock_alias", "work_lock_b"],
+  ] as const) {
+    const sha256 = createHash("sha256").update(bytes).digest("hex");
+    const receipt = {
+      jobId,
+      attemptId: `${jobId}_attempt`,
+      actorClass: "muse_vm_process" as const,
+      baseRevision: "base",
+      manifestSha256: "f".repeat(64),
+      files: [{ path: filePath, sha256, bytes: bytes.byteLength }],
+      totalBytes: bytes.byteLength,
+      terminalState: "succeeded" as const,
+    };
+    jobs.set(jobId, {
+      jobId,
+      peerId: PEER_ID,
+      workSessionId,
+      workspaceSessionId,
+      repositoryId: "repo",
+      baseRevision: "base",
+      taskClass: "propose_patch",
+      instructionHash: "0".repeat(64),
+      instructions: "",
+      allowedOutputs: ["*"],
+      maxRuntimeMs: 1000,
+      maxArtifactBytes: 100,
+      status: "result_received",
+      createdAt: new Date().toISOString(),
+    });
+    attempts.set(jobId, [{ attemptId: receipt.attemptId, receipt }]);
+  }
+  const fakeStore = {
+    getJob: (jobId: string) => jobs.get(jobId),
+    listAttemptsForJob: (jobId: string) => attempts.get(jobId) ?? [],
+    markStaging: (jobId: string, receiptSha256: string) => {
+      const job = jobs.get(jobId)!;
+      job.status = "staging";
+      job.resultProcessing = { receiptSha256, updatedAt: new Date().toISOString() };
+      return job;
+    },
+    markAwaitingReview: (jobId: string, value: any) => {
+      const job = jobs.get(jobId)!;
+      job.status = "awaiting_review";
+      job.resultProcessing = { ...value, updatedAt: new Date().toISOString() };
+      return job;
+    },
+    recordVerification: () => undefined,
+    markAwaitingReconciliation: (jobId: string, failure: string) => {
+      const job = jobs.get(jobId)!;
+      job.status = "awaiting_reconciliation";
+      job.resultProcessing = { ...job.resultProcessing, failure, updatedAt: new Date().toISOString() };
+      return job;
+    },
+  };
+  let concurrentSnapshots = 0;
+  let maxConcurrentSnapshots = 0;
+  let submissionNumber = 0;
+  const processor = createPeerJobResultProcessor({
+    store: fakeStore as any,
+    artifacts: { readReceipt: (job: PeerJob) => {
+      const attempt = attempts.get(job.jobId)![0];
+      const path = attempt.receipt.files[0].path;
+      return new Map([[path, bytesByJob.get(job.jobId)!]]);
+    } } as any,
+    workspaces: { getWorkspace: (workspaceSessionId: string) => ({
+      id: workspaceSessionId,
+      root: resultRoot,
+      mode: "worktree",
+      sourceRoot: "repo",
+      worktree: { managed: true, baseSha: "base" },
+    }) } as any,
+    workSessions: {
+      get: (workSessionId: string) => ({
+        workspaceSessionId: workSessionId === "work_lock_a" ? "workspace_lock" : "workspace_lock_alias",
+        status: "in_progress",
+      }),
+      getSubmissions: () => [],
+      acquireWorkspaceLease: (input: any) => ({ acquired: true, lease: {
+        ...input,
+        leaseKind: "peer_job",
+        ownerInstanceId: input.ownerInstanceId,
+        leaseNonce: `nonce-${input.ownerInstanceId}`,
+        acquiredAt: new Date().toISOString(),
+        heartbeatAt: new Date().toISOString(),
+        expiresAt: new Date(Date.now() + input.ttlMs).toISOString(),
+      } }),
+      releaseWorkspaceLeaseForSession: () => true,
+    } as any,
+    reviewCheckpoints: {
+      reviewChangesAgainstCommit: async () => {
+        concurrentSnapshots += 1;
+        maxConcurrentSnapshots = Math.max(maxConcurrentSnapshots, concurrentSnapshots);
+        await new Promise((resolve) => setTimeout(resolve, 15));
+        concurrentSnapshots -= 1;
+        return {
+          files: [],
+          patch: "fixture patch",
+          summary: { additions: 1, removals: 0 },
+          snapshotKind: "git",
+          snapshotRef: "snapshot",
+        };
+      },
+    } as any,
+    reviewWorkflow: { submitForReview: async () => ({ submissionId: `submission_${++submissionNumber}`, reviewEpoch: submissionNumber }) } as any,
+  });
+  try {
+    await Promise.all([processor.process(jobs.get("job_lock_a")!), processor.process(jobs.get("job_lock_b")!)]);
+    assert.equal(maxConcurrentSnapshots, 1, "peer receipt processing for one managed worktree never overlaps");
+    assert.equal(jobs.get("job_lock_a")?.status, "awaiting_review");
+    assert.equal(jobs.get("job_lock_b")?.status, "awaiting_review");
+    console.log("enqueue-e2e: workspace aliases for one worktree stage serially");
+  } finally {
+    rmSync(resultRoot, { recursive: true, force: true });
+  }
 }
 
 await deleteSession(ownerUrl, ownerSession);
@@ -291,4 +589,5 @@ await deleteSession(peerMcpUrl, peerSession, peerHeaders);
 await new Promise<void>((resolve) => ownerListener.server.close(() => resolve()));
 await new Promise<void>((resolve) => peerListener.server.close(() => resolve()));
 await running.close();
+testWorkSessions.close();
 console.log("src/peer-jobs-enqueue.test.ts: all assertions passed");

@@ -72,7 +72,7 @@ async function requestJson(url, { method = "GET", body, secret = ADAPTER_SECRET 
   return { response, json };
 }
 
-function makeReadOnlyBody({ workspaceRoot, agentId, runId, workSessionId, dispatchKey, grant, taskText = task, attemptNumber = 1, continuationId }) {
+function makeReadOnlyBody({ workspaceRoot, agentId, runId, workSessionId, dispatchKey, grant, taskText = task, attemptNumber = 1, continuationId, contextTransfer }) {
   return {
     workspace_root: workspaceRoot,
     workspace_session_id: `workspace-${workSessionId}`,
@@ -82,6 +82,7 @@ function makeReadOnlyBody({ workspaceRoot, agentId, runId, workSessionId, dispat
     attempt_number: attemptNumber,
     dispatch_idempotency_key: dispatchKey,
     ...(continuationId ? { continuation_id: continuationId } : {}),
+    ...(contextTransfer ? { context_transfer: contextTransfer } : {}),
     scheduled_execution_policy: {
       executionMode: "read_only_audit",
       workspaceAccess: "read_only",
@@ -325,6 +326,8 @@ async function runHermes(root) {
   const control = await createControlPlane(agentId, events, [
     { root, dispatchKey, runId, attemptNumber: 1 },
     { root, dispatchKey: continuationDispatchKey, runId: continuationRunId, attemptNumber: 2 },
+    { root, dispatchKey: "hermes-transfer-dispatch", runId: "hermes-transfer-run", attemptNumber: 3 },
+    { root, dispatchKey: "hermes-transfer-continuation-dispatch", runId: "hermes-transfer-run", attemptNumber: 4 },
   ]);
   const { wrapper, marker } = await createBubblewrapWrapper(root);
   const hermesRoot = join(root, "hermes-runtime");
@@ -370,8 +373,13 @@ async function runHermes(root) {
     "        if stored != session_id: return None",
     "        (home / 'loaded-session-id').write_text(session_id)",
     "        return object()",
-    "    async def prompt(self, **_kwargs):",
+    "    async def prompt(self, **kwargs):",
     "        text = (await self.output_stream.read()).decode('utf-8', errors='replace')",
+    "        prompt_blocks = kwargs.get('prompt') or []",
+    "        prompt_text = '\\n'.join(getattr(block, 'text', '') for block in prompt_blocks)",
+    "        home = Path(os.environ['HERMES_HOME'])",
+    "        home.mkdir(parents=True, exist_ok=True)",
+    "        (home / 'fixture-last-prompt').write_text(prompt_text)",
     "        await self.client.session_update('fixture-session', {'sessionUpdate': 'agent_message_chunk', 'content': {'text': text}})",
     "        return SimpleNamespace(stop_reason='end_turn', usage=None)",
     "    async def close(self): return None",
@@ -472,6 +480,125 @@ async function runHermes(root) {
     const sessionHome = join(root, "hermes-session-homes", sha256(workSessionId));
     assert.equal(await readFile(join(sessionHome, "loaded-session-id"), "utf8"), "fixture-session",
       "the continuation loaded the same Hermes provider session from its persistent per-work-session home");
+
+    const transferId = "hermes-cross-provider-transfer-1";
+    const transferPacket = {
+      version: 1,
+      transferId,
+      task: "Continue the CRUSH implementation without losing the original task.",
+      taskSha256: sha256("Continue the CRUSH implementation without losing the original task."),
+      checkpoint: { snapshotKind: "git", snapshotRef: "checkpoint-hermes-transfer", submissionId: "submission-transfer-1", reviewEpoch: 2 },
+      latestReviewerFeedback: { verdict: "changes_requested", comments: "Preserve the checkpoint and add the missing edge case." },
+      unresolvedRequirements: ["Add the missing edge case"],
+    };
+    const transferContext = {
+      id: transferId,
+      sha256: sha256(JSON.stringify(transferPacket)),
+      packet: transferPacket,
+      fresh: true,
+    };
+    const transferTask = `Continue from the imported CRUSH work.\n\nImmutable cross-agent context transfer (sha256 ${transferContext.sha256}):\n${JSON.stringify(transferPacket, null, 2)}`;
+    const transferDispatchKey = "hermes-transfer-dispatch";
+    const transferRunId = "hermes-transfer-run";
+    const transferGrant = createGrant({
+      workspaceRoot: state.workspaceRoot,
+      agentId,
+      runId: transferRunId,
+      workSessionId,
+      dispatchKey: transferDispatchKey,
+      attemptNumber: 3,
+    });
+    const transferred = await requestJson(`${baseUrl}/runs`, {
+      method: "POST",
+      body: makeReadOnlyBody({
+        workspaceRoot: state.workspaceRoot,
+        agentId,
+        runId: transferRunId,
+        workSessionId,
+        dispatchKey: transferDispatchKey,
+        grant: transferGrant,
+        taskText: transferTask,
+        attemptNumber: 3,
+        continuationId: "continuation-from-crush",
+        contextTransfer: transferContext,
+      }),
+    });
+    assert.equal(transferred.response.status, 202, `${transferred.json.error?.message ?? "Hermes rejected a valid fresh cross-provider transfer"}\n${logs}`);
+    const transferTerminal = await waitFor("Hermes cross-provider transfer terminal event", () => events.find((event) =>
+      ["completed", "failed", "cancelled"].includes(event.type) && event.remote_run_id === transferred.json.run_id))
+      .catch((error) => { throw new Error(`${error.message}; events=${JSON.stringify(events)}; adapter=${logs}`); });
+    assert.equal(transferTerminal.type, "completed", `Hermes cross-provider transfer failed: ${JSON.stringify(transferTerminal)}\n${logs}`);
+    await assertReceiptAcknowledged({
+      adapterName: "Hermes cross-provider transfer",
+      receiptsPath: join(root, "hermes-receipts.json"),
+      dispatchKey: transferDispatchKey,
+      remoteRunId: transferred.json.run_id,
+      control,
+    });
+    const transferSessionHome = join(root, "hermes-session-homes", sha256(`${workSessionId}:transfer:${transferId}`));
+    assert.equal(await readFile(join(transferSessionHome, "fixture-last-prompt"), "utf8"), transferTask,
+      "the Hermes ACP child receives the exact immutable transfer packet, checkpoint, and reviewer feedback");
+    assert.equal(await readFile(join(transferSessionHome, "fixture-session-id"), "utf8"), "fixture-session",
+      "cross-provider transfer created an isolated provider-native Hermes session");
+
+    const transferContinuationKey = "hermes-transfer-continuation-dispatch";
+    const transferContinuationGrant = createGrant({
+      workspaceRoot: state.workspaceRoot,
+      agentId,
+      runId: transferRunId,
+      workSessionId,
+      dispatchKey: transferContinuationKey,
+      attemptNumber: 4,
+    });
+    const transferContinuation = await requestJson(`${baseUrl}/runs`, {
+      method: "POST",
+      body: makeReadOnlyBody({
+        workspaceRoot: state.workspaceRoot,
+        agentId,
+        runId: transferRunId,
+        workSessionId,
+        dispatchKey: transferContinuationKey,
+        grant: transferContinuationGrant,
+        taskText: "Continue the Hermes-owned transfer session after the next review round.",
+        attemptNumber: 4,
+        continuationId: "hermes-transfer-round-two",
+        contextTransfer: { ...transferContext, fresh: false },
+      }),
+    });
+    assert.equal(transferContinuation.response.status, 202, `${transferContinuation.json.error?.message ?? "Hermes transfer continuation was not accepted"}\n${logs}`);
+    const transferContinuationTerminal = await waitFor("Hermes transfer continuation terminal event", () => events.find((event) =>
+      ["completed", "failed", "cancelled"].includes(event.type) && event.remote_run_id === transferContinuation.json.run_id))
+      .catch((error) => { throw new Error(`${error.message}; events=${JSON.stringify(events)}; adapter=${logs}`); });
+    assert.equal(transferContinuationTerminal.type, "completed", `Hermes transfer continuation failed: ${JSON.stringify(transferContinuationTerminal)}\n${logs}`);
+    assert.equal(await readFile(join(transferSessionHome, "loaded-session-id"), "utf8"), "fixture-session",
+      "the cross-provider continuation restored the transfer-scoped Hermes conversation");
+
+    const transferReplayKey = "hermes-transfer-replay-dispatch";
+    const replayGrant = createGrant({
+      workspaceRoot: state.workspaceRoot,
+      agentId,
+      runId: transferRunId,
+      workSessionId,
+      dispatchKey: transferReplayKey,
+      attemptNumber: 5,
+    });
+    const replayTransfer = await requestJson(`${baseUrl}/runs`, {
+      method: "POST",
+      body: makeReadOnlyBody({
+        workspaceRoot: state.workspaceRoot,
+        agentId,
+        runId: transferRunId,
+        workSessionId,
+        dispatchKey: transferReplayKey,
+        grant: replayGrant,
+        taskText: transferTask,
+        attemptNumber: 5,
+        continuationId: "duplicate-fresh-transfer",
+        contextTransfer: transferContext,
+      }),
+    });
+    assert.equal(replayTransfer.response.status, 409, "an already-started immutable transfer cannot be replayed as fresh");
+    assert.equal(replayTransfer.json.error?.code, "context_transfer_already_started");
     console.log("acp-readonly-adapters.integration: Hermes dispatched and resisted confined mutation attempts");
   } finally {
     adapter.kill("SIGTERM");

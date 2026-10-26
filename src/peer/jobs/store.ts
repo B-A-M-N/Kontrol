@@ -1,15 +1,14 @@
 /**
- * M3 peer job store: single-process authoritative in-memory state with a
- * DURABLE sidecar. Every state transition appends the full snapshot to
- * stateDir/peer-jobs.json via atomic temp-write+rename; the store is loaded
- * at open and a corrupt/missing file starts empty (logged, never fatal).
+ * M3 peer job store backed by the shared Kontrol SQLite database. The legacy
+ * JSON sidecar is imported once and retained as migration evidence.
  *
  * Store lifecycle binds to the process (module-level singleton opened on the
- * first registerPeerJobRoutes call); the durable sidecar makes restart safe.
+ * first registerPeerJobRoutes call); SQLite records survive restart.
  */
 import { randomBytes, randomUUID } from "node:crypto";
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync } from "node:fs";
 import { join } from "node:path";
+import { openDatabase, type DatabaseHandle } from "../../db/client.js";
 import type { LoggingConfig } from "../../logger.js";
 import { logEvent } from "../../logger.js";
 import { PeerJobError } from "./contracts.js";
@@ -20,7 +19,7 @@ import type {
   PeerJobResultReceipt,
 } from "./contracts.js";
 
-const SIDECAR_FILE = "peer-jobs.json";
+const LEGACY_SIDECAR_FILE = "peer-jobs.json";
 const LEASE_MS = 60_000;
 
 interface PeerJobStoreSnapshot {
@@ -43,10 +42,18 @@ function loggingSink(logging: LoggingConfig): StoreLogSink {
 
 export interface PeerJobStore {
   readonly stateDir: string;
-  createJob(input: Omit<PeerJob, "jobId" | "status" | "createdAt"> & { peerId: string }): PeerJob;
+  createJob(input: Omit<PeerJob, "jobId" | "status" | "createdAt"> & { peerId: string; jobId?: string }): PeerJob;
   getJob(jobId: string): PeerJob | undefined;
   listJobsForPeer(peerId: string, opts?: { includeTerminal?: boolean }): PeerJob[];
+  listJobsForPeerPage(peerId: string, input: {
+    includeTerminal?: boolean;
+    after?: { createdAt: string; jobId: string };
+    limit: number;
+  }): PeerJob[];
+  getAttemptSummaryForJob(jobId: string): { latest?: PeerAttempt; latestReceipt?: PeerAttempt };
   getAttempt(attemptId: string): PeerAttempt | undefined;
+  /** Read-only authorization fence for bounded artifact uploads. */
+  authorizeAttempt(jobId: string, attemptId: string, claimToken: string, peerId: string, now: number): { job: PeerJob; attempt: PeerAttempt };
   /** Read-only projection: shallow copy of the attempts for a job, newest last. Never hands out live mutable internals. */
   listAttemptsForJob(jobId: string): PeerAttempt[];
   claimNextJob(peerId: string, now: number, opts?: { taskClass?: string }): { job: PeerJob; attempt: PeerAttempt } | undefined;
@@ -55,6 +62,21 @@ export interface PeerJobStore {
   markNotStarted(attemptId: string, claimToken: string, peerId: string, now: number): { job: PeerJob; attempt: PeerAttempt };
   renewLease(attemptId: string, claimToken: string, peerId: string, now: number, leaseMs: number): { job: PeerJob; attempt: PeerAttempt };
   completeAttempt(attemptId: string, claimToken: string, peerId: string, receipt: PeerJobResultReceipt, now: number): { job: PeerJob; attempt: PeerAttempt; idempotent: boolean };
+  markStaging(jobId: string, receiptSha256: string, now: number): PeerJob;
+  markAwaitingReview(jobId: string, input: {
+    receiptSha256: string;
+    submissionId: string;
+    reviewEpoch: number;
+    snapshotKind: "git" | "filesystem";
+    snapshotRef: string;
+    diffSha256: string;
+    verificationStatus?: "passed" | "failed" | "inconclusive" | "not_configured";
+    verificationEvidenceSha256?: string;
+  }, now: number): PeerJob;
+  recordVerification(jobId: string, input: { submissionId: string; reviewEpoch: number; status: "passed" | "failed" | "inconclusive" | "not_configured"; evidenceSha256?: string }, now: number): PeerJob;
+  markAwaitingReconciliation(jobId: string, reason: string, now: number): PeerJob;
+  retryResultProcessing(jobId: string, expectedFailure: string, now: number): PeerJob;
+  finalizeReview(jobId: string, input: { submissionId: string; reviewEpoch: number; feedbackId: string; verdict: "approve" | "changes_requested" | "reject" }, now: number): PeerJob;
   failAttempt(attemptId: string, claimToken: string, peerId: string, reason: string, now: number): { job: PeerJob; attempt: PeerAttempt };
   requestCancel(jobId: string, now: number): PeerJob;
   cancelAck(attemptId: string, claimToken: string, peerId: string, now: number): { job: PeerJob; attempt: PeerAttempt };
@@ -65,7 +87,7 @@ export interface PeerJobStore {
 }
 
 function isTerminalJobStatus(status: PeerJob["status"]): boolean {
-  return status === "completed" || status === "failed" || status === "cancelled";
+  return status === "completed" || status === "failed" || status === "cancelled" || status === "review_changes_requested";
 }
 
 /** Deterministic JSON (sorted keys, undefined dropped) for receipt comparison. */
@@ -91,14 +113,19 @@ function assertActiveAttemptForFence(attempt: PeerAttempt, now: number): void {
   }
 }
 
-export function openPeerJobStore(stateDir: string, logging: LoggingConfig): PeerJobStore {
+export function openPeerJobStore(stateDir: string, logging: LoggingConfig, sharedDatabase?: DatabaseHandle): PeerJobStore {
   const sink = loggingSink(logging);
   mkdirSync(stateDir, { recursive: true, mode: 0o700 });
-  const sidecarPath = join(stateDir, SIDECAR_FILE);
+  const sidecarPath = join(stateDir, LEGACY_SIDECAR_FILE);
+  const database = sharedDatabase ?? openDatabase(stateDir);
+  const ownsDatabase = sharedDatabase === undefined;
+  const sqlite = database.sqlite;
 
   let stateCorrupted = false;
+  let closed = false;
   let snapshot: PeerJobStoreSnapshot = { version: 1, jobs: [], attempts: [] };
-  if (existsSync(sidecarPath)) {
+  const imported = sqlite.prepare("select value from peer_job_store_metadata where key = 'legacy_sidecar_import_v1'").get() as { value: string } | undefined;
+  if (!imported && existsSync(sidecarPath)) {
     try {
       const parsed = JSON.parse(readFileSync(sidecarPath, "utf8")) as PeerJobStoreSnapshot;
       if (parsed.version !== 1 || !Array.isArray(parsed.jobs) || !Array.isArray(parsed.attempts)) {
@@ -127,54 +154,138 @@ export function openPeerJobStore(stateDir: string, logging: LoggingConfig): Peer
         sink.log("error", "peer_jobs_sidecar_corrupt", { path: sidecarPath, error: (error as Error).message });
       }
       stateCorrupted = true;
+      if (ownsDatabase) database.close();
       throw new PeerJobError("peer_jobs_state_corrupt", "Existing peer-job state is unreadable; dispatch is refused to preserve prior evidence.", 503);
     }
   }
 
-  let jobs = snapshot.jobs;
-  let attempts = snapshot.attempts;
-
-  let warnedDirFsyncUnavailable = false;
-
-  function persist(): void {
-    if (stateCorrupted) throw new PeerJobError("peer_jobs_state_corrupt", "Peer-job state is corrupt; persistence is refused.", 503);
-    const payload = JSON.stringify({ version: 1 as const, jobs, attempts });
-    const tempPath = sidecarPath + ".tmp." + randomBytes(4).toString("hex");
-    // Atomic durable write: mode-0600 temp file, fsync the file BEFORE the
-    // rename, then a best-effort directory fsync (some platforms reject
-    // directory fsync — warn once and continue; the rename is still atomic).
-    const fd = openSync(tempPath, "w", 0o600);
-    try {
-      writeFileSync(fd, payload);
-      fsyncSync(fd);
-    } finally {
-      closeSync(fd);
+  if (!imported) {
+    const existingJobs = sqlite.prepare("select count(*) as count from peer_jobs").get() as { count: number };
+    const existingAttempts = sqlite.prepare("select count(*) as count from peer_job_attempts").get() as { count: number };
+    if (existingJobs.count > 0 || existingAttempts.count > 0) {
+      if (ownsDatabase) database.close();
+      throw new PeerJobError("peer_jobs_state_corrupt", "Peer-job SQLite rows exist without an import receipt; refusing ambiguous recovery.", 503);
     }
-    renameSync(tempPath, sidecarPath);
+    const importRows = sqlite.transaction(() => {
+      const insertJob = sqlite.prepare(`insert into peer_jobs
+        (job_id, peer_id, status, created_at, task_class, repository_id, workspace_session_id, work_session_id, record_json)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+      const insertAttempt = sqlite.prepare(`insert into peer_job_attempts
+        (attempt_id, job_id, status, generation, created_at, lease_expires_at, outcome_certainty, record_json)
+        values (?, ?, ?, ?, ?, ?, ?, ?)`);
+      for (const job of snapshot.jobs) insertJob.run(
+        job.jobId, job.peerId, job.status, job.createdAt, job.taskClass, job.repositoryId,
+        job.workspaceSessionId ?? null, job.workSessionId ?? null, JSON.stringify(job),
+      );
+      for (const attempt of snapshot.attempts) insertAttempt.run(
+        attempt.attemptId, attempt.jobId, attempt.status, attempt.generation, attempt.createdAt,
+        attempt.leaseExpiresAt, attempt.outcomeCertainty, JSON.stringify(attempt),
+      );
+      sqlite.prepare("insert into peer_job_store_metadata (key, value) values ('legacy_sidecar_import_v1', ?)")
+        .run(new Date().toISOString());
+    });
     try {
-      const dirFd = openSync(stateDir, "r");
-      try {
-        fsyncSync(dirFd);
-      } finally {
-        closeSync(dirFd);
-      }
+      importRows.immediate();
     } catch (error) {
-      if (!warnedDirFsyncUnavailable) {
-        warnedDirFsyncUnavailable = true;
-        sink.log("warn", "peer_jobs_dir_fsync_unavailable", { path: stateDir, error: (error as Error).message });
-      }
+      if (ownsDatabase) database.close();
+      throw new PeerJobError("peer_jobs_state_corrupt", `Peer-job sidecar migration failed; original evidence is preserved: ${error instanceof Error ? error.message : String(error)}`, 503);
+    }
+  }
+
+  let jobs: PeerJob[];
+  let attempts: PeerAttempt[];
+  const persistedJobs = new Map<string, string>();
+  const persistedAttempts = new Map<string, string>();
+  const jobById = new Map<string, PeerJob>();
+  const attemptById = new Map<string, PeerAttempt>();
+  const attemptsByJob = new Map<string, PeerAttempt[]>();
+  try {
+    jobs = (sqlite.prepare("select record_json from peer_jobs order by created_at, job_id").all() as Array<{ record_json: string }>)
+      .map((row) => JSON.parse(row.record_json) as PeerJob);
+    attempts = (sqlite.prepare("select record_json from peer_job_attempts order by created_at, attempt_id").all() as Array<{ record_json: string }>)
+      .map((row) => JSON.parse(row.record_json) as PeerAttempt);
+  } catch (error) {
+    if (ownsDatabase) database.close();
+    throw new PeerJobError("peer_jobs_state_corrupt", `Peer-job SQLite state is unreadable; dispatch is refused: ${error instanceof Error ? error.message : String(error)}`, 503);
+  }
+  for (const job of jobs) {
+    const json = JSON.stringify(job);
+    jobById.set(job.jobId, job);
+    persistedJobs.set(job.jobId, json);
+  }
+  for (const attempt of attempts) {
+    const json = JSON.stringify(attempt);
+    attemptById.set(attempt.attemptId, attempt);
+    persistedAttempts.set(attempt.attemptId, json);
+    const rows = attemptsByJob.get(attempt.jobId) ?? [];
+    rows.push(attempt);
+    attemptsByJob.set(attempt.jobId, rows);
+  }
+
+  function persist(changedJobs: PeerJob[], changedAttempts: PeerAttempt[] = []): void {
+    if (stateCorrupted) throw new PeerJobError("peer_jobs_state_corrupt", "Peer-job state is corrupt; persistence is refused.", 503);
+    // Callers identify the exact dirty records. SQLite writes remain row-scoped
+    // and compare-and-swap fenced without scanning or rewriting a snapshot.
+    const updateJob = sqlite.prepare(`update peer_jobs set
+      peer_id = ?, status = ?, created_at = ?, task_class = ?, repository_id = ?,
+      workspace_session_id = ?, work_session_id = ?, record_json = ?
+      where job_id = ? and record_json = ?`);
+    const insertJob = sqlite.prepare(`insert into peer_jobs
+      (job_id, peer_id, status, created_at, task_class, repository_id, workspace_session_id, work_session_id, record_json)
+      values (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+    const updateAttempt = sqlite.prepare(`update peer_job_attempts set
+      job_id = ?, status = ?, generation = ?, created_at = ?, lease_expires_at = ?,
+      outcome_certainty = ?, record_json = ? where attempt_id = ? and record_json = ?`);
+    const insertAttempt = sqlite.prepare(`insert into peer_job_attempts
+      (attempt_id, job_id, status, generation, created_at, lease_expires_at, outcome_certainty, record_json)
+      values (?, ?, ?, ?, ?, ?, ?, ?)`);
+    const jobJsonUpdates: Array<[string, string]> = [];
+    const attemptJsonUpdates: Array<[string, string]> = [];
+    try {
+      sqlite.transaction(() => {
+        for (const job of changedJobs) {
+          const json = JSON.stringify(job);
+          const previous = persistedJobs.get(job.jobId);
+          const result = previous === undefined
+            ? insertJob.run(job.jobId, job.peerId, job.status, job.createdAt, job.taskClass, job.repositoryId, job.workspaceSessionId ?? null, job.workSessionId ?? null, json)
+            : updateJob.run(job.peerId, job.status, job.createdAt, job.taskClass, job.repositoryId, job.workspaceSessionId ?? null, job.workSessionId ?? null, json, job.jobId, previous);
+          if (result.changes !== 1) throw new PeerJobError("peer_job_write_conflict", `Peer job ${job.jobId} changed concurrently; reload authoritative state before retrying.`, 409);
+          jobJsonUpdates.push([job.jobId, json]);
+        }
+        for (const attempt of changedAttempts) {
+          const json = JSON.stringify(attempt);
+          const previous = persistedAttempts.get(attempt.attemptId);
+          const result = previous === undefined
+            ? insertAttempt.run(attempt.attemptId, attempt.jobId, attempt.status, attempt.generation, attempt.createdAt, attempt.leaseExpiresAt, attempt.outcomeCertainty, json)
+            : updateAttempt.run(attempt.jobId, attempt.status, attempt.generation, attempt.createdAt, attempt.leaseExpiresAt, attempt.outcomeCertainty, json, attempt.attemptId, previous);
+          if (result.changes !== 1) throw new PeerJobError("peer_job_attempt_write_conflict", `Peer attempt ${attempt.attemptId} changed concurrently; reload authoritative state before retrying.`, 409);
+          attemptJsonUpdates.push([attempt.attemptId, json]);
+        }
+      }).immediate();
+    } catch (error) {
+      if (error instanceof PeerJobError) throw error;
+      throw new PeerJobError("peer_jobs_persistence_failed", `SQLite peer-job transaction failed: ${error instanceof Error ? error.message : String(error)}`, 503);
+    }
+    for (const [id, json] of jobJsonUpdates) persistedJobs.set(id, json);
+    for (const [id, json] of attemptJsonUpdates) persistedAttempts.set(id, json);
+    for (const job of changedJobs) jobById.set(job.jobId, job);
+    for (const attempt of changedAttempts) {
+      attemptById.set(attempt.attemptId, attempt);
+      const rows = attemptsByJob.get(attempt.jobId) ?? [];
+      if (!rows.some((row) => row.attemptId === attempt.attemptId)) rows.push(attempt);
+      attemptsByJob.set(attempt.jobId, rows);
     }
   }
 
   function jobOrThrow(jobId: string): PeerJob {
-    const job = jobs.find((candidate) => candidate.jobId === jobId);
+    const job = jobById.get(jobId);
     if (!job) throw new PeerJobError("job_not_found", `Job ${jobId} not found`, 404);
     return job;
   }
 
   function fencedAttempt(jobId: string, attemptId: string, claimToken: string, peerId: string): PeerAttempt {
     const job = jobOrThrow(jobId);
-    const attempt = attempts.find((candidate) => candidate.attemptId === attemptId);
+    const attempt = attemptById.get(attemptId);
     if (!attempt || attempt.jobId !== job.jobId) {
       throw new PeerJobError("attempt_not_found", `Attempt ${attemptId} not found for job ${jobId}`, 404);
     }
@@ -194,7 +305,7 @@ export function openPeerJobStore(stateDir: string, logging: LoggingConfig): Peer
 
   function jobGeneration(job: PeerJob): number {
     // Generation counts claim cycles for this job.
-    return attempts.filter((candidate) => candidate.jobId === job.jobId).length;
+    return attemptsByJob.get(job.jobId)?.length ?? 0;
   }
 
   function requeueJobAfterExpiredAttempt(job: PeerJob, attempt: PeerAttempt, now: number): void {
@@ -217,59 +328,119 @@ export function openPeerJobStore(stateDir: string, logging: LoggingConfig): Peer
       }
       // Normalize allowedOutputs at creation so every later receipt
       // validation sees canonical relative prefixes ("out/" → "out").
+      const jobId = input.jobId ?? "job_" + randomUUID();
+      if (!/^job_[0-9a-f-]{36}$/i.test(jobId)) {
+        throw new PeerJobError("invalid_job_id", "Peer job id must be a generated job UUID", 422);
+      }
       const job: PeerJob = {
         ...input,
         allowedOutputs: normalizeAllowedOutputs(input.allowedOutputs),
-        jobId: "job_" + randomUUID(),
+        jobId,
         status: "pending",
         createdAt: new Date().toISOString(),
       };
       jobs.push(job);
-      persist();
+      persist([job]);
       return job;
     },
 
     getJob(jobId) {
-      return jobs.find((candidate) => candidate.jobId === jobId);
+      return jobById.get(jobId);
     },
 
     listJobsForPeer(peerId, opts) {
       const includeTerminal = opts?.includeTerminal ?? false;
-      return jobs.filter(
-        (job) => job.peerId === peerId && (includeTerminal || !isTerminalJobStatus(job.status)),
-      ).map((job) => ({ ...job }));
+      const rows = includeTerminal
+        ? sqlite.prepare("select record_json from peer_jobs where peer_id = ? order by created_at, job_id").all(peerId)
+        : sqlite.prepare("select record_json from peer_jobs where peer_id = ? and status not in ('completed','failed','cancelled','review_changes_requested') order by created_at, job_id").all(peerId);
+      return (rows as Array<{ record_json: string }>).map((row) => JSON.parse(row.record_json) as PeerJob);
+    },
+
+    listJobsForPeerPage(peerId, input) {
+      const limit = Math.max(1, Math.min(100, Math.trunc(input.limit)));
+      const clauses = ["peer_id = ?"];
+      const params: Array<string | number> = [peerId];
+      if (!input.includeTerminal) {
+        clauses.push("status not in ('completed','failed','cancelled','review_changes_requested')");
+      }
+      if (input.after) {
+        clauses.push("(created_at > ? or (created_at = ? and job_id > ?))");
+        params.push(input.after.createdAt, input.after.createdAt, input.after.jobId);
+      }
+      params.push(limit);
+      const rows = sqlite.prepare(`
+        select record_json from peer_jobs
+        where ${clauses.join(" and ")}
+        order by created_at, job_id
+        limit ?
+      `).all(...params) as Array<{ record_json: string }>;
+      return rows.map((row) => JSON.parse(row.record_json) as PeerJob);
+    },
+
+    getAttemptSummaryForJob(jobId) {
+      const latestRow = sqlite.prepare(`
+        select record_json from peer_job_attempts
+        where job_id = ?
+        order by generation desc
+        limit 1
+      `).get(jobId) as { record_json: string } | undefined;
+      const receiptRow = sqlite.prepare(`
+        select record_json from peer_job_attempts
+        where job_id = ? and json_type(record_json, '$.receipt') = 'object'
+        order by generation desc
+        limit 1
+      `).get(jobId) as { record_json: string } | undefined;
+      const map = (row: { record_json: string } | undefined) => {
+        if (!row) return undefined;
+        const attempt = JSON.parse(row.record_json) as PeerAttempt;
+        return { ...attempt, receipt: attempt.receipt ? { ...attempt.receipt } : undefined };
+      };
+      return { latest: map(latestRow), latestReceipt: map(receiptRow) };
     },
 
     getAttempt(attemptId) {
-      return attempts.find((candidate) => candidate.attemptId === attemptId);
+      return attemptById.get(attemptId);
+    },
+
+    authorizeAttempt(jobId, attemptId, claimToken, peerId, now) {
+      const job = jobOrThrow(jobId);
+      const attempt = fencedAttempt(jobId, attemptId, claimToken, peerId);
+      assertActiveAttemptForFence(attempt, now);
+      if (job.status !== "claimed" && job.status !== "running") {
+        throw new PeerJobError("job_not_active", `Job ${jobId} is not accepting artifacts (status ${job.status})`);
+      }
+      return { job: { ...job, allowedOutputs: [...job.allowedOutputs] }, attempt: { ...attempt } };
     },
 
     listAttemptsForJob(jobId) {
-      return attempts
-        .filter((candidate) => candidate.jobId === jobId)
-        .map((attempt) => ({ ...attempt, receipt: attempt.receipt ? { ...attempt.receipt } : undefined }));
+      const rows = sqlite.prepare("select record_json from peer_job_attempts where job_id = ? order by created_at, attempt_id").all(jobId) as Array<{ record_json: string }>;
+      return rows.map((row) => {
+        const attempt = JSON.parse(row.record_json) as PeerAttempt;
+        return { ...attempt, receipt: attempt.receipt ? { ...attempt.receipt } : undefined };
+      });
     },
 
     claimNextJob(peerId, now, opts) {
       // CAS semantics: claim only from "pending"; peer-scoped — a job is
       // served exclusively to the peer it was assigned to.
       const taskClassFilter = opts?.taskClass;
-      const job = jobs
-        .filter(
-          (candidate) =>
-            candidate.peerId === peerId &&
-            candidate.status === "pending" &&
-            (taskClassFilter === undefined || candidate.taskClass === taskClassFilter),
-        )
-        .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.jobId.localeCompare(b.jobId))[0];
+      const candidateRow = taskClassFilter === undefined
+        ? sqlite.prepare("select record_json from peer_jobs where peer_id = ? and status = 'pending' and json_extract(record_json, '$.cancelRequestedAt') is null and work_session_id is not null and workspace_session_id is not null order by created_at, job_id limit 1").get(peerId) as { record_json: string } | undefined
+        : sqlite.prepare("select record_json from peer_jobs where peer_id = ? and status = 'pending' and json_extract(record_json, '$.cancelRequestedAt') is null and work_session_id is not null and workspace_session_id is not null and task_class = ? order by created_at, job_id limit 1").get(peerId, taskClassFilter) as { record_json: string } | undefined;
+      const job = candidateRow ? JSON.parse(candidateRow.record_json) as PeerJob : undefined;
       if (!job) return undefined;
+      jobById.set(job.jobId, job);
+      const localIndex = jobs.findIndex((candidate) => candidate.jobId === job.jobId);
+      if (localIndex >= 0) jobs[localIndex] = job;
+      else jobs.push(job);
 
+      const generationCount = sqlite.prepare("select count(*) as count from peer_job_attempts where job_id = ?").get(job.jobId) as { count: number };
       const attempt: PeerAttempt = {
         attemptId: "att_" + randomUUID(),
         jobId: job.jobId,
         claimToken: randomBytes(32).toString("hex"),
         claimOwnerPeerId: peerId,
-        generation: jobGeneration(job) + 1,
+        generation: generationCount.count + 1,
         createdAt: new Date(now).toISOString(),
         leaseExpiresAt: new Date(now + LEASE_MS).toISOString(),
         // Honesty contract: a claim is NOT evidence the peer began work. It
@@ -281,7 +452,7 @@ export function openPeerJobStore(stateDir: string, logging: LoggingConfig): Peer
       };
       job.status = "claimed";
       attempts.push(attempt);
-      persist();
+      persist([job], [attempt]);
       return { job, attempt };
     },
 
@@ -299,14 +470,14 @@ export function openPeerJobStore(stateDir: string, logging: LoggingConfig): Peer
         // at best — only an affirmative markNotStarted allows requeue).
         attempt.status = "expired";
         job.status = attempt.outcomeCertainty === "not_started" ? "pending" : "awaiting_reconciliation";
-        persist();
+        persist([job], [attempt]);
         return { job, attempt };
       }
       attempt.executionStartedAt = new Date(now).toISOString();
       attempt.remoteExecutionId = remoteExecutionId;
       attempt.outcomeCertainty = "started";
       job.status = "running";
-      persist();
+      persist([job], [attempt]);
       return { job, attempt };
     },
 
@@ -325,7 +496,7 @@ export function openPeerJobStore(stateDir: string, logging: LoggingConfig): Peer
       // The peer AFFIRMATIVELY reports it never began: only this honest
       // declaration (not a silent lease lapse) makes expiry requeue the job.
       attempt.outcomeCertainty = "not_started";
-      persist();
+      persist([job], [attempt]);
       return { job, attempt };
     },
 
@@ -351,7 +522,7 @@ export function openPeerJobStore(stateDir: string, logging: LoggingConfig): Peer
         if (remaining <= 0) {
           attempt.status = "expired";
           job.status = attempt.outcomeCertainty === "not_started" ? "pending" : "awaiting_reconciliation";
-          persist();
+          persist([job], [attempt]);
           throw new PeerJobError("runtime_budget_exceeded", `Job ${job.jobId} exceeded its maxRuntimeMs budget (${job.maxRuntimeMs}ms)`, 410);
         }
         if (Date.parse(attempt.leaseExpiresAt) > now) {
@@ -359,14 +530,14 @@ export function openPeerJobStore(stateDir: string, logging: LoggingConfig): Peer
           // local reaper lease. The job's maxRuntimeMs budget bounds the lease.
           attempt.leaseExpiresAt = new Date(now + Math.min(leaseMs, remaining)).toISOString();
           attempt.lastHeartbeatAt = new Date(now).toISOString();
-          persist();
+          persist([job], [attempt]);
           return { job, attempt };
         }
       }
       assertActiveAttemptForFence(attempt, now);
       attempt.leaseExpiresAt = new Date(now + leaseMs).toISOString();
       attempt.lastHeartbeatAt = new Date(now).toISOString();
-      persist();
+      persist([job], [attempt]);
       return { job, attempt };
     },
 
@@ -406,8 +577,136 @@ export function openPeerJobStore(stateDir: string, logging: LoggingConfig): Peer
           ? "peer_reported_cancelled: " + receipt.summary.slice(0, 200)
           : "peer_reported_cancelled";
       }
-      persist();
+      persist([job], [attempt]);
       return { job, attempt, idempotent: false };
+    },
+
+    markStaging(jobId, receiptSha256, now) {
+      const job = jobOrThrow(jobId);
+      if (job.status === "awaiting_review" || job.status === "completed") return { ...job };
+      if (job.status !== "result_received" && job.status !== "staging") {
+        throw new PeerJobError("invalid_result_transition", `Job ${jobId} cannot enter staging from ${job.status}`);
+      }
+      if (job.resultProcessing?.receiptSha256 && job.resultProcessing.receiptSha256 !== receiptSha256) {
+        throw new PeerJobError("result_receipt_conflict", "Staging receipt identity changed", 409);
+      }
+      job.status = "staging";
+      job.resultProcessing = { ...job.resultProcessing, receiptSha256, failure: undefined, updatedAt: new Date(now).toISOString() };
+      persist([job]);
+      return { ...job, resultProcessing: { ...job.resultProcessing } };
+    },
+
+    markAwaitingReview(jobId, input, now) {
+      const job = jobOrThrow(jobId);
+      if (job.status === "awaiting_review" && job.resultProcessing?.submissionId === input.submissionId) {
+        // Recovery may replay result processing after the submission was
+        // committed but before its verification receipt was stored. Fill only
+        // the matching missing receipt; never replace evidence already bound
+        // to this immutable submission.
+        if (job.resultProcessing.verificationStatus === undefined && input.verificationStatus !== undefined) {
+          job.resultProcessing = {
+            ...job.resultProcessing,
+            verificationStatus: input.verificationStatus,
+            verificationEvidenceSha256: input.verificationEvidenceSha256,
+            updatedAt: new Date(now).toISOString(),
+          };
+          persist([job]);
+        }
+        return { ...job, resultProcessing: { ...job.resultProcessing } };
+      }
+      if (job.status !== "staging" || job.resultProcessing?.receiptSha256 !== input.receiptSha256) {
+        throw new PeerJobError("invalid_result_transition", `Job ${jobId} is not staging this receipt`);
+      }
+      job.status = "awaiting_review";
+      job.resultProcessing = { ...input, updatedAt: new Date(now).toISOString() };
+      persist([job]);
+      return { ...job, resultProcessing: { ...job.resultProcessing } };
+    },
+
+    recordVerification(jobId, input, now) {
+      const job = jobOrThrow(jobId);
+      const processing = job.resultProcessing;
+      if (
+        job.status !== "awaiting_review" ||
+        processing?.submissionId !== input.submissionId ||
+        processing.reviewEpoch !== input.reviewEpoch
+      ) {
+        throw new PeerJobError("verification_identity_mismatch", "Verification does not match the active peer-job submission", 409);
+      }
+      job.resultProcessing = {
+        ...processing,
+        verificationStatus: input.status,
+        verificationEvidenceSha256: input.evidenceSha256,
+        updatedAt: new Date(now).toISOString(),
+      };
+      persist([job]);
+      return { ...job, resultProcessing: { ...job.resultProcessing } };
+    },
+
+    markAwaitingReconciliation(jobId, reason, now) {
+      const job = jobOrThrow(jobId);
+      if (job.status === "awaiting_review" || isTerminalJobStatus(job.status)) return { ...job };
+      job.status = "awaiting_reconciliation";
+      job.resultProcessing = {
+        ...job.resultProcessing,
+        failure: reason.slice(0, 1000),
+        updatedAt: new Date(now).toISOString(),
+      };
+      persist([job]);
+      return { ...job, resultProcessing: { ...job.resultProcessing } };
+    },
+
+    retryResultProcessing(jobId, expectedFailure, now) {
+      const job = jobOrThrow(jobId);
+      if (job.status !== "awaiting_reconciliation") {
+        throw new PeerJobError("peer_job_not_reconcilable", `Job ${jobId} is ${job.status}; only awaiting_reconciliation results can be retried.`, 409);
+      }
+      if (!expectedFailure || job.resultProcessing?.failure !== expectedFailure) {
+        throw new PeerJobError("peer_job_reconciliation_stale", "The observed result-processing failure is stale; refresh peer status before retrying.", 409);
+      }
+      const successfulAttempt = [...(attemptsByJob.get(jobId) ?? [])].reverse().find((attempt) =>
+        attempt.receipt?.terminalState === "succeeded");
+      if (!successfulAttempt) {
+        throw new PeerJobError("peer_job_result_unavailable", "No successful stored peer receipt is available; local result processing cannot be retried.", 409);
+      }
+      job.status = "result_received";
+      job.resultProcessing = {
+        ...job.resultProcessing,
+        failure: undefined,
+        retryRevision: (job.resultProcessing.retryRevision ?? 0) + 1,
+        updatedAt: new Date(now).toISOString(),
+      };
+      persist([job]);
+      return { ...job, resultProcessing: { ...job.resultProcessing } };
+    },
+
+    finalizeReview(jobId, input, now) {
+      const job = jobOrThrow(jobId);
+      if (isTerminalJobStatus(job.status)) return { ...job };
+      const processing = job.resultProcessing;
+      if (
+        job.status !== "awaiting_review" ||
+        processing?.submissionId !== input.submissionId ||
+        processing.reviewEpoch !== input.reviewEpoch
+      ) {
+        throw new PeerJobError("review_identity_mismatch", "Reviewer feedback is not bound to this peer job submission and epoch", 409);
+      }
+      job.resultProcessing = { ...processing, feedbackId: input.feedbackId, reviewVerdict: input.verdict, updatedAt: new Date(now).toISOString() };
+      if (input.verdict === "approve") {
+        job.status = "completed";
+        job.terminalAt = new Date(now).toISOString();
+        job.terminalReason = "reviewer_approved";
+      } else if (input.verdict === "reject") {
+        job.status = "failed";
+        job.terminalAt = new Date(now).toISOString();
+        job.terminalReason = "reviewer_rejected";
+      } else {
+        job.status = "review_changes_requested";
+        job.terminalAt = new Date(now).toISOString();
+        job.terminalReason = "reviewer_requested_changes";
+      }
+      persist([job]);
+      return { ...job, resultProcessing: { ...job.resultProcessing } };
     },
 
     failAttempt(attemptId, claimToken, peerId, reason, now) {
@@ -425,7 +724,7 @@ export function openPeerJobStore(stateDir: string, logging: LoggingConfig): Peer
         // Only an affirmative not-started report allows requeue.
         job.status = "pending";
       }
-      persist();
+      persist([job], [attempt]);
       return { job, attempt };
     },
 
@@ -434,8 +733,9 @@ export function openPeerJobStore(stateDir: string, logging: LoggingConfig): Peer
       if (isTerminalJobStatus(job.status)) {
         throw new PeerJobError("job_terminal", `Job ${jobId} is already terminal (${job.status})`, 409);
       }
+      if (job.cancelRequestedAt) return { ...job };
       job.cancelRequestedAt = new Date(now).toISOString();
-      persist();
+      persist([job]);
       return job;
     },
 
@@ -444,14 +744,23 @@ export function openPeerJobStore(stateDir: string, logging: LoggingConfig): Peer
       if (!attempt) throw new PeerJobError("attempt_not_found", `Attempt ${attemptId} not found`, 404);
       const job = jobOrThrow(attempt.jobId);
       fencedAttempt(job.jobId, attemptId, claimToken, peerId);
-      if (attempt.status !== "active") {
+      if (!job.cancelRequestedAt) {
+        throw new PeerJobError("cancel_not_requested", `Job ${job.jobId} has no outstanding cancellation request`, 409);
+      }
+      const latestAttempt = [...(attemptsByJob.get(job.jobId) ?? [])]
+        .sort((a, b) => b.generation - a.generation)[0];
+      const reconciledAttemptCancellation = (attempt.status === "expired" || attempt.status === "superseded")
+        && job.cancelRequestedAt !== undefined
+        && latestAttempt?.attemptId === attempt.attemptId
+        && (attempt.outcomeCertainty === "started" || attempt.outcomeCertainty === "unknown");
+      if (attempt.status !== "active" && !reconciledAttemptCancellation) {
         throw new PeerJobError("attempt_not_active", `Attempt ${attemptId} is not active`);
       }
       attempt.status = "failed";
       job.status = "cancelled";
       job.terminalAt = new Date(now).toISOString();
       job.terminalReason = "cancel_acknowledged";
-      persist();
+      persist([job], [attempt]);
       return { job, attempt };
     },
 
@@ -460,6 +769,9 @@ export function openPeerJobStore(stateDir: string, logging: LoggingConfig): Peer
       if (isTerminalJobStatus(job.status)) {
         throw new PeerJobError("job_terminal", `Job ${jobId} is already terminal (${job.status})`, 409);
       }
+      if (job.status !== "pending") {
+        throw new PeerJobError("cancel_requires_ack", `Job ${jobId} is ${job.status}; cancellation requires an exact peer acknowledgement or reconciliation.`, 409);
+      }
       const hasActiveAttempt = attempts.some((candidate) => candidate.jobId === jobId && candidate.status === "active");
       if (hasActiveAttempt) {
         throw new PeerJobError("cancel_requires_ack", "Active attempt exists; cancellation requires cancel-ack");
@@ -467,24 +779,29 @@ export function openPeerJobStore(stateDir: string, logging: LoggingConfig): Peer
       job.status = "cancelled";
       job.terminalAt = new Date(now).toISOString();
       job.terminalReason = "cancel_requested_unclaimed";
-      persist();
+      persist([job]);
       return job;
     },
 
     reapExpiredLeases(now, limit = 100) {
-      // Bounded sweep.
+      // Bounded indexed sweep over only active attempts whose leases expired.
       const reaped: Array<{ job: PeerJob; attempt: PeerAttempt }> = [];
-      for (const attempt of attempts) {
-        if (reaped.length >= limit) break;
-        if (attempt.status !== "active") continue;
-        if (Date.parse(attempt.leaseExpiresAt) > now) continue;
-        const job = jobs.find((candidate) => candidate.jobId === attempt.jobId);
+      const rows = sqlite.prepare(`select record_json from peer_job_attempts
+        where status = 'active' and lease_expires_at <= ?
+        order by lease_expires_at, attempt_id limit ?`).all(new Date(now).toISOString(), Math.max(1, Math.min(Math.floor(limit), 500))) as Array<{ record_json: string }>;
+      for (const row of rows) {
+        const attempt = JSON.parse(row.record_json) as PeerAttempt;
+        const localAttemptIndex = attempts.findIndex((candidate) => candidate.attemptId === attempt.attemptId);
+        if (localAttemptIndex >= 0) attempts[localAttemptIndex] = attempt;
+        else attempts.push(attempt);
+        attemptById.set(attempt.attemptId, attempt);
+        const job = jobById.get(attempt.jobId);
         if (!job) continue;
         if (job.status !== "claimed" && job.status !== "running") continue;
         requeueJobAfterExpiredAttempt(job, attempt, now);
         reaped.push({ job, attempt });
       }
-      if (reaped.length > 0) persist();
+      if (reaped.length > 0) persist([...new Map(reaped.map(({ job }) => [job.jobId, job])).values()], reaped.map(({ attempt }) => attempt));
       return reaped;
     },
 
@@ -494,9 +811,12 @@ export function openPeerJobStore(stateDir: string, logging: LoggingConfig): Peer
       // "active" by a previous process are orphaned at boot — no live
       // process holds their lease — so they count as non-active here.
       let changed = false;
+      const changedJobs: PeerJob[] = [];
+      const changedAttempts: PeerAttempt[] = [];
       for (const attempt of attempts) {
         if (attempt.status === "active") {
           attempt.status = Date.parse(attempt.leaseExpiresAt) > Date.now() ? "superseded" : "expired";
+          changedAttempts.push(attempt);
           changed = true;
         }
       }
@@ -505,16 +825,21 @@ export function openPeerJobStore(stateDir: string, logging: LoggingConfig): Peer
         const hasActiveAttempt = attempts.some((candidate) => candidate.jobId === job.jobId && candidate.status === "active");
         if (hasActiveAttempt) continue;
         job.status = "awaiting_reconciliation";
+        changedJobs.push(job);
         changed = true;
       }
-      if (changed) persist();
+      if (changed) persist(changedJobs, changedAttempts);
     },
 
     close() {
-      // Persist a final snapshot; durable sidecar makes restart safe.
-      persist();
+      if (closed) return;
+      closed = true;
       jobs = [];
       attempts = [];
+      jobById.clear();
+      attemptById.clear();
+      attemptsByJob.clear();
+      if (ownsDatabase) database.close();
     },
   };
 

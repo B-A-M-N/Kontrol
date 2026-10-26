@@ -277,6 +277,15 @@ export function createReviewerBrowserController(input: {
     await chrome.cdp.send("Page.enable", {}, result.target.sessionId);
     await chrome.cdp.send("Runtime.enable", {}, result.target.sessionId);
     const committed = input.database.sqlite.transaction(() => {
+      // Binding changes are serialized against durable browser-turn claims.
+      // A turn that already crossed into any active state keeps the current
+      // route and conversation fence until it settles or is explicitly
+      // reconciled; it must not race a new target binding.
+      const activeTurn = input.database.sqlite.prepare(`select id from review_browser_turns
+        where review_thread_id = ? and state in
+          ('leased', 'browser_ready', 'dispatching', 'prompt_accepted', 'model_generating', 'generation_finished', 'awaiting_feedback', 'uncertain')
+        limit 1`).get(thread.id);
+      if (activeTurn) return "active_turn" as const;
       const updated = input.database.db.update(reviewThreads).set({
         reviewerBindingId: thread.reviewerBindingId ?? `reviewer_binding_${thread.id}`,
         browserProfileId: profile.id,
@@ -292,7 +301,7 @@ export function createReviewerBrowserController(input: {
         bindingGeneration: (thread.bindingGeneration ?? 0) + 1,
         revision: thread.revision + 1,
       }).where(and(eq(reviewThreads.id, thread.id), eq(reviewThreads.revision, thread.revision))).run();
-      if (updated.changes !== 1) return false;
+      if (updated.changes !== 1) return "thread_revision_conflict" as const;
       const messages = input.database.db.select().from(reviewThreadMessages).where(eq(reviewThreadMessages.threadId, thread.id)).all();
       for (const message of messages) {
         if (message.status === "queued") input.dispatchOutbox?.enqueue({
@@ -302,10 +311,11 @@ export function createReviewerBrowserController(input: {
           payload: { messageId: message.id, threadId: thread.id, profileId: profile.id, routeEpoch: thread.routeEpoch, revision: message.revision },
         });
       }
-      return true;
+      return "committed" as const;
     })();
-    if (!committed) {
+    if (committed !== "committed") {
       await chrome.cdp.send("Target.detachFromTarget", { sessionId: result.target.sessionId }).catch(() => undefined);
+      if (committed === "active_turn") throw new Error("Reviewer conversation binding is fenced by an active browser turn.");
       throw new Error("Reviewer conversation binding lost its thread revision compare-and-swap.");
     }
     bindings.set(thread.id, result.target);

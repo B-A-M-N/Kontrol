@@ -505,6 +505,21 @@ async function createMcpServerForGitFixture(): Promise<void> {
       assert.notEqual((result.structuredContent as { status?: string }).status, "approval_required", `${name} must not prompt`);
     }
 
+    // Reproduce the reported MCP failure at the public tool boundary. A large
+    // untracked-file list used to overflow execFile's maxBuffer before Kontrol
+    // could return a truncation marker.
+    const longNamePrefix = "untracked-";
+    for (let index = 0; index < 5_000; index++) {
+      const suffix = index.toString().padStart(4, "0");
+      writeFileSync(join(gitRoot, `${longNamePrefix}${"x".repeat(205)}-${suffix}.txt`), "x");
+    }
+    const oversizedStatus = await client.callTool({ name: "git_status", arguments: { workspaceId } });
+    assert.notEqual(oversizedStatus.isError, true, `large git_status must return bounded output: ${JSON.stringify(oversizedStatus)}`);
+    const oversizedStatusContent = oversizedStatus.structuredContent as { result?: string; truncated?: boolean; bytes?: number };
+    assert.equal(oversizedStatusContent.truncated, true, "large git_status reports truncation instead of a child maxBuffer error");
+    assert.ok((oversizedStatusContent.bytes ?? Infinity) <= 48_000, "large git_status remains inside the MCP inspection byte cap");
+    assert.match(oversizedStatusContent.result ?? "", /Truncated: Git inspection output exceeded its bounded capture\./);
+
     const showCases = [
       { path: "stable.txt", revision: "HEAD", expected: "unchanged tracked file contents\n", label: "unchanged tracked file" },
       { path: "empty.txt", revision: "HEAD", expected: "", label: "empty tracked file" },

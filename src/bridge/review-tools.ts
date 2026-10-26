@@ -521,7 +521,7 @@ export function registerReviewTools(server: McpServer, config: BridgeConfig): vo
         timeoutMs: z.number().int().min(1000).max(900_000).optional().default(300_000).describe("Max wait in ms. Default 300000 (5 min). Max 900000 (15 min)."),
       },
       outputSchema: {
-        status: z.enum(["feedback_ready", "timeout", "error"]),
+        status: z.enum(["feedback_ready", "transferred", "timeout", "error"]),
         sessionId: z.string(),
         nextSeq: z.number().int().optional().describe("Durable event seq cursor; pass as afterSeq on resume to skip already-seen feedback."),
         feedback: z.object({
@@ -598,10 +598,21 @@ export function registerReviewTools(server: McpServer, config: BridgeConfig): vo
       }
       // Compare the FEEDBACK id (carried in the event payload as feedbackId),
       // not the event id — the anchor/lastConsumedFeedbackId is a feedback id.
+      const isUncommittedHandoff = (event: EventStoreEvent): boolean => {
+        if (event.type !== "session.handoff") return false;
+        const transferId = (event.payload as { transferId?: unknown }).transferId;
+        if (typeof transferId !== "string") return true;
+        const latestState = config.eventStore.getEventsForSession(sessionId)
+          .filter((candidate) => candidate.type === "session.handoff.state")
+          .reverse()
+          .find((candidate) => (candidate.payload as { transferId?: unknown }).transferId === transferId);
+        return (latestState?.payload as { state?: unknown } | undefined)?.state !== "committed";
+      };
       const predicate: EventPredicate = (event) =>
         (event.type === "review.feedback.provided" &&
           String((event.payload as { feedbackId?: unknown }).feedbackId ?? event.id) !== anchor) ||
-        event.type === "agent.run.cancelled";
+        event.type === "agent.run.cancelled" ||
+        isUncommittedHandoff(event);
 
       let matched: EventStoreEvent | null = null;
       const waitStartedAt = performance.now();
@@ -634,6 +645,21 @@ export function registerReviewTools(server: McpServer, config: BridgeConfig): vo
           content: [{ type: "text" as const, text: `Session cancelled: ${reason}` }],
           structuredContent: { status: "error" as const, sessionId, nextSeq: matched.seq, message: `Session cancelled: ${reason}` },
           isError: true,
+        };
+      }
+
+      if (matched.type === "session.handoff") {
+        cleanup();
+        const handoff = matched.payload as { transferId?: unknown; toAgent?: unknown };
+        const toAgent = typeof handoff.toAgent === "string" ? handoff.toAgent : "the destination agent";
+        return {
+          content: [{ type: "text" as const, text: `This work session was handed off to ${toAgent}. Stop this worker turn; the destination will receive the persisted checkpoint and review context.` }],
+          structuredContent: {
+            status: "transferred" as const,
+            sessionId,
+            nextSeq: matched.seq,
+            message: `Handoff ${String(handoff.transferId ?? "")} is routing the next continuation to ${toAgent}.`,
+          },
         };
       }
 

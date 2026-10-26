@@ -54,6 +54,64 @@ const { mountHeavyPayload } = await import("./heavy-payload.js");
 const { mountReviewPayload } = await import("./review-payload.js");
 const { renderSummaryBadge, unmountPayload } = await import("./payload-mount.js");
 const { getToolDisplay } = await import("./tool-display.js");
+const { renderPeerStatusPanel } = await import("./peer-status-panel.js");
+
+let requestedPeerCursor: string | undefined;
+let reconciledPeerJob: { jobId: string; expectedFailure: string } | undefined;
+let cancelledPeerJob: string | undefined;
+const peerPanel = renderPeerStatusPanel({
+  peer: { enabled: true, bindHost: "127.0.0.1", port: 7412 },
+  peers: [{ id: "peer-alpha", capabilities: ["bounded_file_write"] }],
+  jobs: [{
+    jobId: "job_abc123",
+    peerId: "peer-alpha",
+    workSessionId: "work-123",
+    workspaceSessionId: "workspace-456",
+    repositoryId: "repo-a",
+    status: "awaiting_review",
+    displayHint: "Peer result is staged and awaiting reviewer feedback.",
+    submissionId: "submission-789",
+    reviewEpoch: 2,
+    snapshotKind: "git",
+    snapshotRef: "deadbeef",
+    verificationStatus: "passed",
+    reviewVerdict: "pending",
+  }, {
+    jobId: "job_reconcile",
+    peerId: "peer-alpha",
+    workSessionId: "work-124",
+    workspaceSessionId: "workspace-457",
+    repositoryId: "repo-a",
+    status: "awaiting_reconciliation",
+    displayHint: "requires_owner_reconciliation",
+    resultProcessingFailure: "artifact_temporary_conflict",
+  }, {
+    jobId: "job_cancel",
+    peerId: "peer-alpha",
+    status: "running",
+    displayHint: "executing (VM process)",
+  }],
+  nextCursor: "cursor-next",
+}, {
+  previousAvailable: false,
+  reconcile: (jobId: string, expectedFailure: string) => { reconciledPeerJob = { jobId, expectedFailure }; },
+  cancel: (jobId: string) => { cancelledPeerJob = jobId; },
+  next: (cursor: string) => { requestedPeerCursor = cursor; },
+  previous: () => undefined,
+});
+assert.match(peerPanel.textContent ?? "", /job_abc123/, "peer lifecycle panel identifies the exact job");
+assert.match(peerPanel.textContent ?? "", /awaiting_review/, "peer lifecycle panel shows the current state");
+assert.match(peerPanel.textContent ?? "", /submission-789/, "peer lifecycle panel links the review submission identity");
+assert.match(peerPanel.textContent ?? "", /passed/, "peer lifecycle panel shows verification state");
+assert.match(peerPanel.textContent ?? "", /Retry local result processing/, "reconcilable peer results expose a local recovery action");
+assert.match(peerPanel.textContent ?? "", /Cancel peer job/, "active peer jobs expose owner cancellation");
+(peerPanel.querySelector(".peer-job-reconcile-button") as HTMLButtonElement).click();
+assert.deepEqual(reconciledPeerJob, { jobId: "job_reconcile", expectedFailure: "artifact_temporary_conflict" },
+  "recovery action is fenced to the exact job and observed failure");
+peerPanel.querySelectorAll<HTMLButtonElement>(".peer-job-cancel-button")[1]?.click();
+assert.equal(cancelledPeerJob, "job_cancel", "cancellation action targets the exact peer job");
+(peerPanel.querySelector("button.peer-status-page-button:last-of-type") as HTMLButtonElement).click();
+assert.equal(requestedPeerCursor, "cursor-next", "next page uses the server-issued cursor");
 
 const runningProcessCard: ToolResultCard = {
   tool: "bash",
@@ -213,14 +271,25 @@ const parkedWorkspaceWatchers = new Set<string>();
 let fakeMutationCalls = 0;
 const fakeToolCalls: string[] = [];
 const fakeToolArguments: Array<{ name: string; arguments?: Record<string, unknown> }> = [];
+let peerStatusPageCalls = 0;
+const fakeAppListeners = new Map<string, Set<(params: any) => void>>();
 // Durable pending approvals, keyed by workspace — the fake server is
 // authoritative, matching production: a policy-blocked request is persisted
 // before the approval_required response is returned.
 const fakePendingApprovals = new Map<string, Array<Record<string, unknown>>>();
 const fakeApp = {
-  ontoolresult: undefined as ((result: unknown) => void) | undefined,
-  onhostcontextchanged: undefined as ((context: unknown) => void) | undefined,
   onteardown: undefined as (() => Promise<unknown>) | undefined,
+  addEventListener(event: string, listener: (params: any) => void) {
+    const listeners = fakeAppListeners.get(event) ?? new Set();
+    listeners.add(listener);
+    fakeAppListeners.set(event, listeners);
+  },
+  removeEventListener(event: string, listener: (params: any) => void) {
+    fakeAppListeners.get(event)?.delete(listener);
+  },
+  emit(event: string, params: unknown) {
+    for (const listener of [...(fakeAppListeners.get(event) ?? [])]) listener(params);
+  },
   async connect() {
     fakeConnectCount += 1;
   },
@@ -240,6 +309,13 @@ const fakeApp = {
     }
     if (name === "submit_to_coding_agent") {
       return { isError: false, content: [], structuredContent: { runId: "run-ui-agent", workSessionId: "session-ui-agent", workspaceSessionId: "workspace-dom", status: "running", agentName: "hermes-agent" } };
+    }
+    if (name === "list_peer_status") {
+      peerStatusPageCalls += 1;
+      return { isError: false, content: [], structuredContent: {
+        jobs: [{ jobId: "job_second_page", status: "completed", peerId: "peer-alpha", displayHint: "Peer result approved." }],
+        peers: [],
+      } };
     }
     if (name === "get_workspace_session_surface") {
       if ((request.arguments as { filter?: string } | undefined)?.filter === "stale_pending_review" && fakeHistoricalResponse) {
@@ -297,6 +373,31 @@ const { __workspaceAppTest, AmbiguousMutationError } = await import("./workspace
 const session = __workspaceAppTest.ensureWorkSessionView("session-dom", "workspace-dom", "run-dom");
 session.title = "DOM lifecycle";
 session.status = "in_progress";
+session.agentPtys = [{
+  processSessionId: "proc_dom_worker",
+  agentName: "hermes-agent",
+  processGeneration: 2,
+  outputCursor: 91,
+  status: "attached",
+  createdAt: new Date().toISOString(),
+}];
+session.reviewLoop = {
+  routeId: "route-dom",
+  reviewThreadId: "thread-dom",
+  reviewThreadStatus: "active",
+  status: "active",
+  mode: "pinned_conversation",
+  completedReviewRounds: 0,
+  admittedReviewRounds: 1,
+  maxReviewRounds: 3,
+  handoffId: "handoff-dom",
+  handoffStatus: "ready",
+  deliveryTransport: "native_cdp",
+  browserProfileId: "reviewer-profile-dom",
+  conversation: { key: "conversation_dom", url: "https://chatgpt.com/c/conversation_dom", bindingStatus: "bound", bindingRevision: 2, browserGeneration: 5 },
+  deliveryMessage: { messageId: "review-message-dom", kind: "initial_review", status: "presented", updatedAt: new Date().toISOString() },
+  browserAttempt: { attemptId: "browser-attempt-dom", status: "awaiting_feedback", attemptNumber: 1 },
+};
 session.openMessages.set("message-dom", {
   messageId: "message-dom",
   kind: "clarification_request",
@@ -305,6 +406,14 @@ session.openMessages.set("message-dom", {
   status: "open",
 });
 __workspaceAppTest.renderWorkSessionView(session);
+assert.match(document.querySelector(".agent-pty-status")?.textContent ?? "", /hermes-agent · generation 2 · attached · cursor 91/,
+  "work-session UI exposes the durable PTY owner, generation, lifecycle, and output cursor");
+assert.match(document.querySelector(".review-conversation")?.textContent ?? "", /conversation_dom · Bound · binding 2 · browser generation 5/,
+  "work-session UI shows the exact bound reviewer conversation and binding generation");
+assert.match(document.querySelector(".review-message")?.textContent ?? "", /Presented · Initial Review · review-message-dom/,
+  "work-session UI shows whether the immutable review message was queued or presented");
+assert.match(document.querySelector(".review-browser-attempt")?.textContent ?? "", /Awaiting Feedback · attempt 1/,
+  "work-session UI distinguishes accepted browser generation from committed reviewer feedback");
 const replyBox = document.querySelector<HTMLTextAreaElement>(".message-reply");
 assert.ok(replyBox, "open agent messages render a reply control");
 replyBox?.focus();
@@ -387,7 +496,8 @@ assert.equal(session.activity.length, replayActivityCount, "overlapping event re
 // and does not blindly replay an ambiguous mutation.
 await __workspaceAppTest.boot();
 assert.equal(fakeConnectCount, 1, "initial app host connection succeeds");
-fakeApp.ontoolresult?.({
+assert.equal(fakeAppListeners.get("toolresult")?.size, 1, "tool results use one owned additive listener");
+fakeApp.emit("toolresult", {
   _meta: { tool: "open_workspace" },
   structuredContent: { workspaceId: "workspace-reconnect" },
   content: [],
@@ -395,7 +505,7 @@ fakeApp.ontoolresult?.({
 await settle();
 await settle();
 assert.equal(__workspaceAppTest.getConnectionState(), "CONNECTED", "app host reaches connected state");
-fakeApp.ontoolresult?.({
+fakeApp.emit("toolresult", {
   _meta: {},
   structuredContent: { tool: "read", path: "src/example.ts", result: "fallback result" },
   content: [{ type: "text", text: "fallback result" }],
@@ -405,7 +515,31 @@ assert.match(document.querySelector(".tool-title")?.textContent ?? "", /Read Fil
   "structuredContent.tool is accepted when _meta.tool is absent");
 assert.equal(__workspaceAppTest.getLastToolCard()?.payload?.content?.[0]?.text, "fallback result",
   "the Workspace App fills omitted metadata content from the MCP result content");
-fakeApp.ontoolresult?.({
+fakeApp.emit("toolresult", {
+  _meta: { tool: "list_peer_status", card: { tool: "list_peer_status", summary: {
+    jobs: [{ jobId: "job_first_page", status: "awaiting_review", displayHint: "Awaiting feedback." }],
+    peers: [],
+    nextCursor: "cursor-page-2",
+  } } },
+  structuredContent: {},
+  content: [],
+});
+await settle();
+assert.match(document.querySelector(".peer-status-panel")?.textContent ?? "", /job_first_page/,
+  "the peer status tool renders its exact current-page job records");
+(document.querySelector(".peer-status-page-button:last-of-type") as HTMLButtonElement).click();
+await settle();
+assert.equal(peerStatusPageCalls, 1, "the peer status next control requests one page");
+assert.equal(fakeToolArguments.at(-1)?.arguments?.cursor, "cursor-page-2", "the peer status next request carries the server cursor");
+assert.match(document.querySelector(".peer-status-panel")?.textContent ?? "", /job_second_page/,
+  "the next peer status page replaces the visible records");
+assert.equal((document.querySelector(".peer-status-page-button") as HTMLButtonElement).disabled, false,
+  "a previously loaded peer page can be revisited");
+(document.querySelector(".peer-status-page-button") as HTMLButtonElement).click();
+await settle();
+assert.match(document.querySelector(".peer-status-panel")?.textContent ?? "", /job_first_page/,
+  "previous returns to the retained peer status page without another server query");
+fakeApp.emit("toolresult", {
   _meta: { tool: "show_workspace_ui" },
   structuredContent: { tool: "show_workspace_ui", workspaceId: "workspace-ui-open", root: "/workspace", mode: "checkout", instruction: "Workspace UI ready" },
   content: [{ type: "text", text: "Workspace UI ready" }],
@@ -479,6 +613,8 @@ await __workspaceAppTest.callServerToolChecked({
 await settle();
 assert.ok(fakeConnectCount >= 2, "transport failure creates a fresh app host connection");
 assert.equal(__workspaceAppTest.getConnectionState(), "CONNECTED", "reconnected app host returns to connected state");
+assert.equal(fakeAppListeners.get("toolresult")?.size, 1, "reconnect removes the old listener before adding the replacement listener");
+assert.equal(fakeAppListeners.get("hostcontextchanged")?.size, 1, "host context listener is not duplicated across reconnects");
 assert.ok(
   fakeToolCalls.filter((name) => name === "get_workspace_session_surface").length > surfaceCallsBeforeReconnect + 1,
   "reconnect rehydrates durable workspace state before/alongside the safe retry",
@@ -765,7 +901,7 @@ assert.equal(__workspaceAppTest.getConnectionState(), "DISCONNECTED", "app teard
   assert.equal(fresh.getActiveWorkspaceId(), null, "a fresh iframe has no active workspace before any result");
   fakeEventDelivered = true; // keep the event watcher parked; no replay needed
 
-  fakeApp.ontoolresult?.({
+fakeApp.emit("toolresult", {
     _meta: {
       tool: "bash",
       card: {
@@ -824,7 +960,7 @@ assert.equal(__workspaceAppTest.getConnectionState(), "DISCONNECTED", "app teard
 
   // Switching to a second, completely separate workspace must not inherit the
   // first workspace's approval, and back again restores it.
-  fakeApp.ontoolresult?.({
+fakeApp.emit("toolresult", {
     _meta: {
       tool: "bash",
       card: {

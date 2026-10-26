@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { createServer } from "node:http";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { realpathSync } from "node:fs";
@@ -60,8 +61,8 @@ try {
   probeReadOnlyExecutionSandbox({ workspaceRoot });
   readOnlySandboxAvailable = true;
 } catch { /* the integration below asserts fail-closed when user namespaces are unavailable */ }
-const childCode = `const fs=require("node:fs");try{fs.appendFileSync(${JSON.stringify(launchCountPath)},"1")}catch{};let b="",seen=[];process.stdin.setEncoding("utf8");process.stdin.on("data",c=>{b+=c;for(const line of b.split(/\\r?\\n/).slice(0,-1)){const m=JSON.parse(line);seen.push(m.method);try{fs.appendFileSync(${JSON.stringify(sessionLogPath)},JSON.stringify({method:m.method,sessionId:m.params?.sessionId??(m.method==="session/new"?"agent-session-1":undefined)})+"\\n")}catch{};if(m.method==="initialize"){process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:m.id,result:{protocolVersion:1,agentCapabilities:{loadSession:true}}})+"\\n")}else if(m.method==="session/new"){process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:m.id,result:{sessionId:"agent-session-1"}})+"\\n")}else if(m.method==="session/load"){process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:m.id,result:{sessionId:m.params.sessionId}})+"\\n")}else if(m.method==="session/prompt"){let workspaceWriteBlocked=false;if(process.env.READ_ONLY_TEST==="1"){try{fs.writeFileSync("/workspace/readonly-test-write.txt","should fail")}catch{workspaceWriteBlocked=true}};const report="Audit report: café 🌲\\nFindings persisted."+(workspaceWriteBlocked?"\\nworkspaceWriteBlocked=true":"");process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:m.id,result:{sessionId:m.params.sessionId,content:[{type:"text",text:report}],methods:seen,workspaceWriteBlocked}})+"\\n");setTimeout(()=>process.exit(0),20)}}b=b.split(/\\r?\\n/).at(-1)||""})`;
-const spawnAdapter = () => {
+const childCode = `const fs=require("node:fs");try{fs.appendFileSync(${JSON.stringify(launchCountPath)},"1")}catch{};let b="",v2Mode=false;process.stdin.setEncoding("utf8");process.stdin.on("data",c=>{b+=c;for(const line of b.split(/\\r?\\n/).slice(0,-1)){const m=JSON.parse(line);try{fs.appendFileSync(${JSON.stringify(sessionLogPath)},JSON.stringify({method:m.method,sessionId:m.params?.sessionId??(m.method==="session/new"?(v2Mode?"agent-session-v2":"agent-session-1"):undefined),...(m.method==="session/prompt"?{prompt:m.params.prompt?.[0]?.text}:{})})+"\\n")}catch{};const v2=m.params?.protocolVersion===2&&process.argv[1]!=="force-v1";if(m.method==="initialize"){v2Mode=v2;const result=v2?{protocolVersion:2,info:{name:"fake",version:"1"},capabilities:{session:{}}}:{protocolVersion:1,agentCapabilities:{loadSession:true}};process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:m.id,result})+"\\n")}else if(m.method==="session/new"){process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:m.id,result:{sessionId:v2Mode?"agent-session-v2":"agent-session-1"}})+"\\n")}else if(m.method==="session/load"||m.method==="session/resume"){if(m.method==="session/resume")process.stdout.write(JSON.stringify({jsonrpc:"2.0",method:"session/update",params:{sessionId:m.params.sessionId,update:{sessionUpdate:"state_update",state:"idle"}}})+"\\n");process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:m.id,result:{sessionId:m.params.sessionId}})+"\\n")}else if(m.method==="session/prompt"){let workspaceWriteBlocked=false;if(process.env.READ_ONLY_TEST==="1"){try{fs.writeFileSync("/workspace/readonly-test-write.txt","should fail")}catch{workspaceWriteBlocked=true}};const report="Audit report: café 🌲\\nFindings persisted."+(workspaceWriteBlocked?"\\nworkspaceWriteBlocked=true":"");if(v2Mode){process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:m.id,result:{messageId:"user-message-1"}})+"\\n");setTimeout(()=>{process.stdout.write(JSON.stringify({jsonrpc:"2.0",method:"session/update",params:{sessionId:m.params.sessionId,update:{sessionUpdate:"agent_message",messageId:"agent-message-1",content:[{type:"text",text:report}]}}})+"\\n");process.stdout.write(JSON.stringify({jsonrpc:"2.0",method:"session/update",params:{sessionId:m.params.sessionId,update:{sessionUpdate:"state_update",state:"idle",stopReason:m.params.prompt?.[0]?.text==="v2-max"?"max_tokens":"end_turn"}}})+"\\n");setTimeout(()=>process.exit(0),20)},20)}else{process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:m.id,result:{sessionId:m.params.sessionId,...(m.params.prompt?.[0]?.text==="omit-stop-reason"?{}:{stopReason:({cancelled:"cancelled",refusal:"refusal",max_tokens:"max_tokens",max_turns:"max_turns"}[m.params?.prompt?.[0]?.text]??"end_turn")}),content:[{type:"text",text:report}],workspaceWriteBlocked}})+"\\n");setTimeout(()=>process.exit(0),20)}}}b=b.split(/\\r?\\n/).at(-1)||""})`;
+const spawnAdapter = (enableV2 = false, forceV1 = false) => {
   const child = spawn(process.execPath, ["scripts/acp-stdio-duplex-adapter.mjs"], {
   cwd: process.cwd(),
   env: {
@@ -81,8 +82,9 @@ const spawnAdapter = () => {
     READ_ONLY_TEST: "1",
     ACP_STDIO_AGENT_NAME: "stdio-test-agent",
     ACP_STDIO_COMMAND: process.execPath,
-    ACP_STDIO_ARGS_JSON: JSON.stringify(["-e", childCode]),
+    ACP_STDIO_ARGS_JSON: JSON.stringify(["-e", childCode, ...(forceV1 ? ["force-v1"] : [])]),
     ACP_STDIO_DISPATCH_METHOD: "",
+    ACP_STDIO_ENABLE_V2: enableV2 ? "1" : "0",
     ACP_STDIO_ADAPTER_PORT: String(adapterPort),
   },
   stdio: ["ignore", "pipe", "pipe"],
@@ -141,6 +143,49 @@ try {
   assert.equal(terminalEvent?.dispatch_idempotency_key, "stdio-normal-dispatch");
   assert.equal(terminalEvent?.attempt_number, 1);
   assert.ok(terminalEvent?.event_id, "terminal delivery has a stable attempt-scoped identity");
+  const missingStopReasonResponse = await fetch(`http://127.0.0.1:${adapterPort}/runs`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: "Bearer adapter-secret" },
+    body: JSON.stringify({
+      ...normalBody,
+      parent_run_id: "stdio-missing-stop-reason-run",
+      session_id: "stdio-missing-stop-reason-session",
+      attempt_number: 1,
+      dispatch_idempotency_key: "stdio-missing-stop-reason-dispatch",
+      input: [{ parts: [{ content: "omit-stop-reason" }] }],
+    }),
+  });
+  assert.equal(missingStopReasonResponse.status, 202, "the adapter accepts the dispatch before asynchronous ACP completion");
+  const missingStopReasonDeadline = Date.now() + 5_000;
+  while (Date.now() < missingStopReasonDeadline && !events.some((event) => event.dispatch_idempotency_key === "stdio-missing-stop-reason-dispatch" && event.type === "failed")) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  const missingStopReasonFailure = events.find((event) => event.dispatch_idempotency_key === "stdio-missing-stop-reason-dispatch" && event.type === "failed");
+  assert.ok(missingStopReasonFailure, "a missing ACP stop reason is reported as failure, never successful completion");
+  assert.match(JSON.stringify(missingStopReasonFailure.payload), /stopReason: missing/);
+  for (const stopReason of ["cancelled", "refusal", "max_tokens", "max_turns"]) {
+    const dispatchKey = `stdio-${stopReason}-dispatch`;
+    const response = await fetch(`http://127.0.0.1:${adapterPort}/runs`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer adapter-secret" },
+      body: JSON.stringify({
+        ...normalBody,
+        parent_run_id: `stdio-${stopReason}-run`,
+        session_id: `stdio-${stopReason}-session`,
+        attempt_number: 1,
+        dispatch_idempotency_key: dispatchKey,
+        input: [{ parts: [{ content: stopReason }] }],
+      }),
+    });
+    assert.equal(response.status, 202, `${stopReason} is classified after the adapter accepts the dispatch`);
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline && !events.some((event) => event.dispatch_idempotency_key === dispatchKey && ["failed", "completed"].includes(event.type))) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    const terminal = events.find((event) => event.dispatch_idempotency_key === dispatchKey && ["failed", "completed"].includes(event.type));
+    assert.equal(terminal?.type, "failed", `${stopReason} must fail and never be reported as successful completion`);
+    assert.match(JSON.stringify(terminal?.payload), new RegExp(`stopReason: ${stopReason}`));
+  }
   const deadlineForAcknowledgement = Date.now() + 5_000;
   while (Date.now() < deadlineForAcknowledgement) {
     const pendingTerminalEvents = JSON.parse(await readFile(join(state, "terminal-spool.json"), "utf8"));
@@ -186,12 +231,100 @@ try {
   while (Date.now() < continuationDeadline && events.filter((event) => event.dispatch_idempotency_key === "stdio-continuation-dispatch" && event.type === "completed").length === 0) {
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
+  const transferPacket = { version: 1, transferId: "stdio-transfer-1", checkpoint: { snapshotKind: "git", snapshotRef: "checkpoint-1" } };
+  const transferContext = {
+    id: "stdio-transfer-1",
+    sha256: createHash("sha256").update(JSON.stringify(transferPacket)).digest("hex"),
+    packet: transferPacket,
+    fresh: true,
+  };
+  const transferredTask = `continue with the transferred checkpoint\n\nImmutable cross-agent context transfer (sha256 ${transferContext.sha256}):\n${JSON.stringify(transferPacket, null, 2)}`;
+  const missingTransferPacket = { ...transferPacket, transferId: "stdio-transfer-missing" };
+  const missingTransferContext = {
+    id: missingTransferPacket.transferId,
+    sha256: createHash("sha256").update(JSON.stringify(missingTransferPacket)).digest("hex"),
+    packet: missingTransferPacket,
+    fresh: false,
+  };
+  const sessionsBeforeMissingTransfer = (await readFile(sessionLogPath, "utf8")).trim().split("\n").filter(Boolean)
+    .map((line) => JSON.parse(line)).filter((entry) => entry.method === "session/new").length;
+  const missingTransferBinding = await fetch(`http://127.0.0.1:${adapterPort}/runs`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: "Bearer adapter-secret" },
+    body: JSON.stringify({
+      ...normalBody,
+      attempt_number: 3,
+      dispatch_idempotency_key: "stdio-missing-transfer-binding",
+      continuation_id: "continuation-missing-transfer-binding",
+      context_transfer: missingTransferContext,
+    }),
+  });
+  assert.equal(missingTransferBinding.status, 202, "adapter acceptance is distinct from provider session startup");
+  const missingTransferDeadline = Date.now() + 5_000;
+  while (Date.now() < missingTransferDeadline && !events.some((event) =>
+    event.dispatch_idempotency_key === "stdio-missing-transfer-binding" && event.type === "failed")) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  const missingTransferFailure = events.find((event) =>
+    event.dispatch_idempotency_key === "stdio-missing-transfer-binding" && event.type === "failed");
+  assert.match(String(missingTransferFailure?.error ?? missingTransferFailure?.payload?.error), /continuation_session_missing/,
+    "a resumed transfer fails visibly when its exact provider binding is absent");
+  const sessionsAfterMissingTransfer = (await readFile(sessionLogPath, "utf8")).trim().split("\n").filter(Boolean)
+    .map((line) => JSON.parse(line)).filter((entry) => entry.method === "session/new").length;
+  assert.equal(sessionsAfterMissingTransfer, sessionsBeforeMissingTransfer,
+    "a missing transfer binding never creates a replacement provider conversation");
+  const transferResponse = await fetch(`http://127.0.0.1:${adapterPort}/runs`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: "Bearer adapter-secret" },
+    body: JSON.stringify({
+      ...normalBody,
+      attempt_number: 3,
+      dispatch_idempotency_key: "stdio-cross-agent-transfer-dispatch",
+      continuation_id: "continuation-transfer-1",
+      context_transfer: transferContext,
+      input: [{ parts: [{ content: transferredTask }] }],
+    }),
+  });
+  assert.equal(transferResponse.status, 202, "a verified transfer packet starts a fresh destination provider session");
+  const transferDeadline = Date.now() + 5_000;
+  while (Date.now() < transferDeadline && !events.some((event) => event.dispatch_idempotency_key === "stdio-cross-agent-transfer-dispatch" && event.type === "completed")) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.ok(events.some((event) => event.dispatch_idempotency_key === "stdio-cross-agent-transfer-dispatch" && event.type === "completed"),
+    "the fresh destination session completes with an authoritative end_turn");
+  const transferredPrompt = (await readFile(sessionLogPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line))
+    .findLast((entry) => entry.method === "session/prompt" && entry.sessionId === "agent-session-1")?.prompt;
+  assert.equal(transferredPrompt, transferredTask,
+    "the real ACP child receives the exact continuation prompt delivered to the destination adapter");
+  assert.ok(transferredPrompt.includes('"snapshotRef": "checkpoint-1"'),
+    "the destination ACP child receives the immutable transfer packet, including its exact checkpoint identity");
+  assert.ok(transferredPrompt.includes(transferContext.sha256),
+    "the destination ACP child receives the transfer packet hash used by the dispatch boundary");
+  const transferredContinuation = await fetch(`http://127.0.0.1:${adapterPort}/runs`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: "Bearer adapter-secret" },
+    body: JSON.stringify({
+      ...normalBody,
+      attempt_number: 4,
+      dispatch_idempotency_key: "stdio-cross-agent-transfer-continuation",
+      continuation_id: "continuation-transfer-2",
+      context_transfer: { ...transferContext, fresh: false },
+      input: [{ parts: [{ content: "continue the destination provider conversation" }] }],
+    }),
+  });
+  assert.equal(transferredContinuation.status, 202, "a later destination continuation restores the transfer-scoped provider session");
+  const transferredContinuationDeadline = Date.now() + 5_000;
+  while (Date.now() < transferredContinuationDeadline && !events.some((event) => event.dispatch_idempotency_key === "stdio-cross-agent-transfer-continuation" && event.type === "completed")) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
   const sessionMethods = (await readFile(sessionLogPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
   assert.ok(sessionMethods.some((entry) => entry.method === "session/new" && entry.sessionId === "agent-session-1"));
   assert.ok(sessionMethods.some((entry) => entry.method === "session/load" && entry.sessionId === "agent-session-1"),
     "continuation resumes the same provider-native session ID");
-  assert.equal(sessionMethods.filter((entry) => entry.method === "session/new").length, 1,
-    "review continuation does not create a second implementing-agent conversation");
+  assert.equal(sessionMethods.filter((entry) => entry.method === "session/new").length, 7,
+    "same-agent continuation reuses its session while the failed-stop cases and cross-agent transfer use isolated sessions");
+  assert.equal(sessionMethods.filter((entry) => entry.method === "session/load").length, 2,
+    "both same-agent and transferred-destination continuations restore their exact provider session");
   const conflictResponse = await fetch(`http://127.0.0.1:${adapterPort}/runs`, {
     method: "POST",
     headers: { "content-type": "application/json", authorization: "Bearer adapter-secret" },
@@ -221,12 +354,15 @@ try {
     read_only_execution_grant: grant,
     input: [{ parts: [{ content: "must remain sandboxed" }] }],
   };
+  const launchMarkerBeforeGrantChecks = await readFile(launchCountPath, "utf8");
   const forgedGrantResponse = await fetch(`http://127.0.0.1:${adapterPort}/runs`, {
     method: "POST",
     headers: { "content-type": "application/json", authorization: "Bearer adapter-secret" },
     body: JSON.stringify({ ...readOnlyBody, read_only_execution_grant: { ...grant, signature: "forged" } }),
   });
   assert.equal(forgedGrantResponse.status, 403, "forged scheduled read-only authority is rejected before any child launch");
+  assert.equal(await readFile(launchCountPath, "utf8"), launchMarkerBeforeGrantChecks,
+    "a forged grant cannot launch a worker");
   const readOnlyResponse = await fetch(`http://127.0.0.1:${adapterPort}/runs`, {
     method: "POST",
     headers: { "content-type": "application/json", authorization: "Bearer adapter-secret" },
@@ -249,8 +385,112 @@ try {
     assert.equal(readOnlyResponse.status, 503, "an unavailable OS namespace backend fails closed");
     assert.equal((await readOnlyResponse.json()).error.code, "sandbox_unavailable");
   }
-  assert.equal(await readFile(launchCountPath, "utf8"), "11",
-    "invalid grants never launch; read-only execution cannot alter the host-side launch marker");
+  assert.equal(await readFile(launchCountPath, "utf8"), launchMarkerBeforeGrantChecks,
+    "invalid grants never launch; sandbox execution does not alter the host-side launch marker");
+
+  adapter.kill("SIGTERM");
+  await new Promise((resolve) => adapter.once("exit", resolve));
+  adapter = spawnAdapter(true);
+  const v2ReadyDeadline = Date.now() + 5_000;
+  let v2Ready = false;
+  while (Date.now() < v2ReadyDeadline) {
+    try {
+      const health = await fetch(`http://127.0.0.1:${adapterPort}/health`);
+      if (health.ok) { v2Ready = true; break; }
+    } catch { /* v2 adapter is still starting */ }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.ok(v2Ready, "v2-enabled adapter restarts with its negotiated protocol mode");
+  const v2Body = {
+    workspace_root: workspaceRoot,
+    parent_run_id: "stdio-v2-run",
+    agent_id: "stdio-test-agent",
+    session_id: "stdio-v2-work-session",
+    workspace_lease_nonce: "stdio-v2-lease",
+    workspace_lease_expires_at: new Date(Date.now() + 120_000).toISOString(),
+    attempt_number: 1,
+    dispatch_idempotency_key: "stdio-v2-dispatch",
+    input: [{ parts: [{ content: "complete through v2 state_update" }] }],
+  };
+  const v2Response = await fetch(`http://127.0.0.1:${adapterPort}/runs`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: "Bearer adapter-secret" },
+    body: JSON.stringify(v2Body),
+  });
+  assert.equal(v2Response.status, 202, "ACP v2 prompt is accepted before its idle completion notification");
+  const v2Deadline = Date.now() + 5_000;
+  while (Date.now() < v2Deadline && !events.some((event) => event.dispatch_idempotency_key === "stdio-v2-dispatch" && event.type === "completed")) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  const v2Completed = events.find((event) => event.dispatch_idempotency_key === "stdio-v2-dispatch" && event.type === "completed");
+  assert.ok(v2Completed, "ACP v2 completes only after the idle state_update");
+  assert.equal(v2Completed.payload.final_output, "Audit report: café 🌲\nFindings persisted.", "ACP v2 agent_message update becomes the final output");
+  const v2ContinuationResponse = await fetch(`http://127.0.0.1:${adapterPort}/runs`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: "Bearer adapter-secret" },
+    body: JSON.stringify({ ...v2Body, parent_run_id: "stdio-v2-continuation", attempt_number: 2, dispatch_idempotency_key: "stdio-v2-continuation-dispatch", continuation_id: "stdio-v2-continuation-id" }),
+  });
+  assert.equal(v2ContinuationResponse.status, 202, "ACP v2 continuation restores its provider session");
+  const v2ContinuationDeadline = Date.now() + 5_000;
+  while (Date.now() < v2ContinuationDeadline && !events.some((event) => event.dispatch_idempotency_key === "stdio-v2-continuation-dispatch" && event.type === "completed")) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.ok(events.some((event) => event.dispatch_idempotency_key === "stdio-v2-continuation-dispatch" && event.type === "completed"),
+    "ACP v2 continuation restores and completes the exact provider conversation");
+  const v2LimitedResponse = await fetch(`http://127.0.0.1:${adapterPort}/runs`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: "Bearer adapter-secret" },
+    body: JSON.stringify({
+      ...v2Body,
+      parent_run_id: "stdio-v2-limited-run",
+      session_id: "stdio-v2-limited-work-session",
+      attempt_number: 1,
+      dispatch_idempotency_key: "stdio-v2-limited-dispatch",
+      input: [{ parts: [{ content: "v2-max" }] }],
+    }),
+  });
+  assert.equal(v2LimitedResponse.status, 202, "ACP v2 accepts the prompt before reporting its terminal reason");
+  const v2LimitedDeadline = Date.now() + 5_000;
+  while (Date.now() < v2LimitedDeadline && !events.some((event) => event.dispatch_idempotency_key === "stdio-v2-limited-dispatch" && event.type === "failed")) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  const v2LimitedFailure = events.find((event) => event.dispatch_idempotency_key === "stdio-v2-limited-dispatch" && event.type === "failed");
+  assert.ok(v2LimitedFailure, "ACP v2 max_tokens is a failed task, never a successful completion");
+  assert.match(JSON.stringify(v2LimitedFailure.payload), /stopReason: max_tokens/);
+  const v2SessionMethods = (await readFile(sessionLogPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+  assert.ok(v2SessionMethods.some((entry) => entry.method === "session/resume" && entry.sessionId === "agent-session-v2"),
+    "ACP v2 uses session/resume rather than the removed session/load method");
+  adapter.kill("SIGTERM");
+  await new Promise((resolve) => adapter.once("exit", resolve));
+  adapter = spawnAdapter(true, true);
+  const fallbackReadyDeadline = Date.now() + 5_000;
+  let fallbackReady = false;
+  while (Date.now() < fallbackReadyDeadline) {
+    try {
+      const health = await fetch(`http://127.0.0.1:${adapterPort}/health`);
+      if (health.ok) { fallbackReady = true; break; }
+    } catch { /* fallback adapter is still starting */ }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.ok(fallbackReady, "adapter restarts for legacy-agent fallback qualification");
+  const fallbackResponse = await fetch(`http://127.0.0.1:${adapterPort}/runs`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: "Bearer adapter-secret" },
+    body: JSON.stringify({
+      ...v2Body,
+      parent_run_id: "stdio-v2-fallback-run",
+      session_id: "stdio-v2-fallback-work-session",
+      attempt_number: 1,
+      dispatch_idempotency_key: "stdio-v2-fallback-dispatch",
+    }),
+  });
+  assert.equal(fallbackResponse.status, 202, "a v1-only agent may negotiate v1 after the adapter requests v2");
+  const fallbackDeadline = Date.now() + 5_000;
+  while (Date.now() < fallbackDeadline && !events.some((event) => event.dispatch_idempotency_key === "stdio-v2-fallback-dispatch" && event.type === "completed")) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.ok(events.some((event) => event.dispatch_idempotency_key === "stdio-v2-fallback-dispatch" && event.type === "completed"),
+    "v1 fallback retains v1 prompt-response completion semantics");
   console.log(`acp-stdio-duplex-integration: task reached child stdin; read-only sandbox ${readOnlySandboxAvailable ? "executed" : "failed closed"}`);
 } finally {
   adapter.kill("SIGTERM");

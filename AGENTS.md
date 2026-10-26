@@ -401,6 +401,11 @@ Current implementation contracts:
   degradation; beta release qualification requires a fresh exact external-host
   parity receipt. Clients without the extension remain visibly unqualified,
   and strict deployments reject tool calls until an exact receipt is accepted.
+  Descriptor-cache identity includes the full effective tool-registration
+  profile and peer visibility profile; retained descriptors are bounded to
+  256 entries. The worker stdio bridge also carries all eight structured
+  inspection tools and `poll_process`, while its discovery and call allowlists
+  continue to exclude reviewer-only tools.
 - Workspace App resources use content-hashed HTML identities. Retain up to 64
   prior releases for 30 days as lazy immutable references; each historical
   modern URI and `.skybridge.html` alias must return the exact bytes matching
@@ -437,7 +442,9 @@ Current implementation contracts:
   and transient-availability failures. Tool, protocol, and authorization errors
   do not invalidate a healthy App transport. Mutations with an ambiguous
   outcome are reconciled and never blindly replayed; stale App generations
-  cannot initiate a second reconnect.
+  cannot initiate a second reconnect. Tool-result and host-context callbacks
+  use owned additive App event listeners; replacement and teardown remove the
+  prior generation's listeners before a new listener set is attached.
 - The stdio bridge retains its downstream MCP server during upstream
   interruptions and rebuilds a fresh upstream session through a bounded,
   single-flight reconnect lifecycle. It preserves worker attribution headers,
@@ -465,7 +472,10 @@ Current implementation contracts:
   response loss; it never blindly redelivers an uncertain launch. A server-owned
   event projection advances a durable per-job event cursor and treats worker
   turn completion, reviewer approval, rejection, failure, and cancellation as
-  distinct lifecycle outcomes.
+  distinct lifecycle outcomes. Scheduled jobs currently dispatch only to a
+  registered direct ACP adapter; peer-pull jobs remain a separate transport
+  with their own claim/result lifecycle and are not a scheduled dispatch
+  target.
 - Scheduled jobs are durably owned by authenticated principal and remain
   recoverable from a fresh MCP transport for that principal; foreign principals
   cannot read or cancel them. `get_scheduled_job_result` is a read-only receipt
@@ -666,7 +676,9 @@ Current implementation contracts:
   watcher interval before external qualification.
 - MCP shutdown is one shared retry-safe close operation: each subsystem phase
   is bounded, later phases still run after an earlier failure, and repeated
-  `close()` calls observe the same completion result.
+  `close()` calls observe the same completion result. Periodic maintenance
+  stops starting cycles and drains its active bounded step before database
+  closure.
 - For the systemd core unit, `restart` means restart the installed immutable
   release; `upgrade` selects the latest immutable build candidate (falling
   back to the checkout `dist/` projection), verifies readiness, and restores
@@ -776,11 +788,28 @@ MCP context isolation:
   the exact claim, principal, context, route epoch, pending submission, snapshot,
   and unexpired lease in its authoritative transaction. A reviewer can renew an
   expired claim through compare-and-swap; release clears all claim identity.
-- The generic stdio ACP adapter persists provider-native session IDs by durable
-  work-session identity. A continuation reloads that same session only when
-  the ACP agent advertises `loadSession`; otherwise it fails closed instead of
-  starting an unrelated conversation. ACP worker identity, the review WebUI
-  thread, and the Kontrol work session remain separate identities.
+- Cross-agent ACP handoffs persist an immutable context packet with the task,
+  prior work, exact checkpoint, latest reviewer feedback, and unresolved
+  requirements. New ACP runs persist the exact original task and its SHA-256;
+  the bounded input preview is display-only. A legacy run without the exact
+  task is marked incomplete when its preview is transferred. The packet hash
+  and transfer ID are carried through dispatch. The
+  durable handoff states are `requested`, `quiescing_source`,
+  `destination_ready`, and `committed`, with `blocked` and
+  `reconciliation_required` for nonterminal exceptions. A parked source waiter
+  receives a transfer signal; its live workspace lease continues to fence
+  destination mutation until quiescence. The logical ACP run retains its
+  origin agent identity while each dispatch attempt binds the selected
+  destination identity. An uncertain destination acceptance is never treated
+  as a committed transfer or blindly retried.
+- Generic stdio and Hermes ACP provider-session bindings are scoped by durable
+  work-session identity and transfer ID. Same-agent continuations reload their
+  existing provider session; a cross-agent transfer starts a separately bound
+  provider session and later destination continuations restore that session.
+  Generic ACP v1 continuation reload requires the agent to advertise
+  `loadSession`; otherwise it fails closed instead of starting an unrelated
+  conversation. ACP worker identity, the review WebUI thread, and the Kontrol
+  work session remain separate identities.
 - Historical MCP client metrics are bounded by
   `KONTROL_MCP_CLIENT_METRICS_HISTORY_LIMIT` (default 5,000). Active client rows
   are never pruned; retired rows are folded into aggregate counters, and the
@@ -807,11 +836,14 @@ MCP context isolation:
 - The peer listener (Meta Muse use case) exists only when KONTROL_PEER_ENABLED=1; otherwise no peer listener is created and owner/ACP/scheduled/review behavior is unchanged.
 - Peers authenticate with per-peer bearer credentials from a mode-0600 registry (KONTROL_PEER_CREDENTIAL_FILE), completely separate from the OAuth owner token and ACP secrets. Peers are never reviewers or workers; unsigned worker/reviewer/conversation headers never promote a peer.
 - The peer app (src/server/peer-app.ts) mounts only /mcp, /peer/* (the durable peer job protocol plus an authenticated 404 for unknown endpoints), and unauthenticated /peer/healthz liveness. No ACP router, OAuth flow, diagnostics, or static Workspace App assets.
+- Public OAuth ingress shares OAuth clients, codes, and token storage with the owner app, while a private request symbol selects independent owner/public per-client and global password-failure budgets. Public authorize traffic cannot consume or clear the owner's lockout budget; per-IP edge throttling remains an additional public abuse bound.
 - Peer MCP sessions are bound to listenerKind "peer" at initialize; cross-port session attach is denied, and credential revocation hot-reloads without restart. Peer tool catalogs are restricted to the granted capability profile (read-only inspect baseline) and enforced again at execution.
 - Peer workspace access is confined to registry-granted roots (subset of KONTROL_ALLOWED_ROOTS), checked before and after canonicalization (worktree opens check the SOURCE root); credential/private-state paths (.env-style files, state dir, ~/.kontrol) are denied by default.
 - M2: peers granted workspace:propose_patch may open managed worktrees for granted source roots and mutate files inside them (write/edit) with MANDATORY checkpoint tracking — the widget-visibility early return and the global allowUntrackedMutation escape never apply to peers. Direct checkout mutation by peers is denied (WorkspaceMutationAuthorityError). Peer worktree ownership is cached in process and persisted in a mode-0600 atomic sidecar (src/peer/workspace-guard.ts); startup restores exact principal bindings and fails closed on corrupt state. Peers may mutate only owned worktrees, granted-source re-check runs at every mutation, and list_managed_worktrees filters to the caller peer's entries. Peer worktrees are capped per peer by KONTROL_PEER_MAX_ACTIVE_SESSIONS on top of the existing managed-worktree limits. staged_file_write remains worker-role-bound and unusable by peers.
 - Only C1 (peer-initiated calls to approved Kontrol tools, now including isolated worktree mutation) is implemented. C3 (verified hosted-Muse-agent activation) is a follow-on milestone and must never be claimed from VM-process evidence. workspace:run_bounded remains reserved. The M3 durable peer job protocol is enforced: every /peer/jobs/* route requires the peer's owner-granted job:claim / job:complete / job:cancel_ack capability (403 peer_capability_denied otherwise); the owner enqueues through the owner-only enqueue_peer_job MCP tool (never in any peer tool profile; handler role-guarded to authenticated clients); a claim sets attempt certainty "unknown" — requeue happens only after an affirmative not-started report, otherwise expiry routes to awaiting_reconciliation (never auto-repeat); duplicate results are idempotent only when the stored receipt compares canonically identical, differing receipts answer 409 conflicting_result; receipts are persisted on the attempt and terminalState maps succeeded→result_received, failed/cancelled→terminal peer_reported_* job states; heartbeat leases are clamped to the job's maxRuntimeMs budget (410 runtime_budget_exceeded when exhausted); a bounded reaper (30s, unref'd) sweeps expired leases and its lifecycle binds to the peer job routes handle on app.locals (closed on shutdown and candidate rollback).
-- M5 WebUI visibility: the owner/reviewer MCP surface exposes peer listener status, enrolled peers, and durable job states via the read-only, secret-free list_peer_status tool (src/peer/peer-tools.ts; never in any peer tool profile, handler additionally denies peer/worker roles); the WebUI is a consumer of durable state, not authority.
+- M5 WebUI visibility: the owner/reviewer MCP surface exposes peer listener status, enrolled peers, and durable job states via the read-only, secret-free list_peer_status tool (src/peer/peer-tools.ts; never in any peer tool profile, handler additionally denies peer/worker roles); job history uses SQL-limited stable createdAt+jobId cursor pages and returns at most 40 rows per page, with one indexed latest-attempt summary per returned job rather than loading full attempt histories; page counts describe only the returned page. The WebUI is a consumer of durable state, not authority.
+- Peer job creation is bound to an existing submittable work session and its exact workspace session. The destination must be a clean, managed worktree of the granted repository at the job's exact recorded base SHA; a peer supplied manifest does not select a write target. `propose_patch` and `bounded_execution` require a mission with a declared command or runtime probe. Artifact bytes arrive separately over a bounded octet-stream route, are content-hashed into private durable staging, and must exactly match the successful receipt. A durable `peer_job.result_received` outbox event drives idempotent staging into the bound managed worktree, a local baseline-relative snapshot, and the existing `submitForReview` workflow. Result processors serialize staging by workspace session so separate receipts cannot interleave writes or snapshots against the same worktree. Staging uses receipt-content-addressed temporary files and recovers only a matching temporary before baseline comparison, so a crash between fsync and rename is resumable without treating the known temporary as unrelated workspace content. The peer job stores the exact submission, review epoch, snapshot, diff hash, and verification projection. When a mission is bound, the server runs final verification against that exact submission and snapshot; without a mission verification contract, status is `not_configured`, never a verified claim. Authenticated committed feedback for that exact submission finalizes approval/rejection or records changes requested. Mission approval still consumes only qualifying mission evidence; peer receipts are not verification evidence. Hosted Muse activation (C3) remains unclaimed.
+- Legacy peer-job sidecar rows without both workspaceSessionId and workSessionId remain visible for reconciliation but are not claimable.
 
 ## Child DOX Index
 

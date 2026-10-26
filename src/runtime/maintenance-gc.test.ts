@@ -116,8 +116,8 @@ async function makeFixture() {
   fx.db.close(); // prepare() on a closed handle throws — a real DB outage
 
   const degraded = createMaintenanceCoordinator(fx.stubDeps(fx.db));
-  await new Promise((resolve) => setTimeout(resolve, 80));
-  degraded.stop();
+  await waitFor(() => degraded.stats.snapshotRootsDegraded === true);
+  await degraded.stop();
 
   assert.equal(degraded.stats.snapshotRootsDegraded, true, "degraded flag set when root enumeration fails");
   assert.ok(degraded.stats.snapshotRootsLastError, "degraded error detail recorded");
@@ -139,7 +139,7 @@ async function makeFixture() {
     },
   });
   await waitFor(() => managedWorktreeGcCalls > 0 && fx.telemetryPruneLimits.length > 0);
-  healthy.stop();
+  await healthy.stop();
 
   assert.equal(healthy.stats.snapshotRootsDegraded, false, "recovered cycle clears the degraded flag");
   assert.ok(managedWorktreeGcCalls > 0, "maintenance invokes the bounded managed-worktree cleanup hook");
@@ -157,7 +157,7 @@ async function makeFixture() {
   healthyDb.sqlite.prepare("update work_sessions set status = 'approved' where id = ?").run("ws_maint_gc");
   const terminal = createMaintenanceCoordinator(fx.stubDeps(healthyDb));
   const sessionPinPruned = await waitFor(() => !existsSync(fx.store.manifestPath(fx.sessionPinnedRef)));
-  terminal.stop();
+  await terminal.stop();
   assert.equal(sessionPinPruned, true, "all-terminal workspace session pins are pruned");
   assert.equal(existsSync(fx.store.manifestPath(fx.submittedRef)), true, "durable submission stays rooted after terminal pin pruning");
   assert.equal((await fx.store.storeStats()).manifests, 1);

@@ -2,6 +2,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { resolveShellCommand, terminateProcessTree } from "./process-platform.js";
 import { buildChildEnvironment } from "./process-environment.js";
+import type { AgentPtyBindingStore } from "./agent-pty-bindings.js";
 
 // P1: detachment exists to return control (and a live process card) to the
 // reviewer quickly; a 10s request hold is long enough to trip intermediary
@@ -47,6 +48,13 @@ export interface StartCommandInput {
   timeoutMs?: number;
   /** Stable caller identity for exact launch retries. Scoped to ownerId. */
   clientMutationId?: string;
+  /** Explicitly identifies an authenticated worker's interactive PTY. Ordinary
+   * shells stay outside the agent-binding lifecycle. */
+  agentPtyBinding?: {
+    workspaceSessionId: string;
+    runId: string;
+    ownerPrincipalId: string;
+  };
 }
 
 export interface WriteStdinInput {
@@ -122,6 +130,7 @@ interface ProcessSession {
   lastProcessActivityAt: number;
   timeoutTimer?: NodeJS.Timeout;
   launchKey?: string;
+  agentPtyBinding?: { processSessionId: string; processGeneration: number };
 }
 
 interface LaunchRecord {
@@ -149,6 +158,7 @@ export interface ProcessSessionManagerOptions {
   maxRuntimeMs?: number;
   reaperIntervalMs?: number;
   childEnvironmentAllowlist?: string[];
+  agentPtyBindings?: AgentPtyBindingStore;
 }
 
 export interface ProcessSessionMetrics {
@@ -156,6 +166,17 @@ export interface ProcessSessionMetrics {
   total: number;
   maxRunningProcesses: number;
   maxRunningProcessesPerOwner: number;
+}
+
+export interface AgentPtyObservation {
+  binding: import("./agent-pty-bindings.js").AgentPtyBinding;
+  output: string;
+  outputCursor: number;
+  oldestAvailableCursor: number;
+  outputTruncated: boolean;
+  running: boolean;
+  exitCode?: number;
+  signal?: string;
 }
 
 function boundedInteger(value: number | undefined, fallback: number, maximum: number): number {
@@ -400,6 +421,7 @@ export class ProcessSessionManager {
   private readonly idleTimeoutMs: number;
   private readonly maxRuntimeMs: number;
   private readonly childEnvironmentAllowlist: string[];
+  private readonly agentPtyBindings?: AgentPtyBindingStore;
   private readonly recoveryCapabilities = new Map<string, ProcessRecoveryCapability>();
   private readonly reaperTimer: NodeJS.Timeout;
 
@@ -411,12 +433,16 @@ export class ProcessSessionManager {
     this.idleTimeoutMs = positiveLimit(options.idleTimeoutMs, DEFAULT_IDLE_TIMEOUT_MS, "idleTimeoutMs");
     this.maxRuntimeMs = positiveLimit(options.maxRuntimeMs, DEFAULT_MAX_RUNTIME_MS, "maxRuntimeMs");
     this.childEnvironmentAllowlist = options.childEnvironmentAllowlist ?? [];
+    this.agentPtyBindings = options.agentPtyBindings;
     const reaperIntervalMs = positiveLimit(options.reaperIntervalMs, DEFAULT_REAPER_INTERVAL_MS, "reaperIntervalMs");
     this.reaperTimer = setInterval(() => this.reapExpired(), reaperIntervalMs);
     this.reaperTimer.unref?.();
   }
 
   async start(input: StartCommandInput): Promise<ProcessSnapshot> {
+    if (input.agentPtyBinding && (!input.tty || process.platform === "win32" || !this.agentPtyBindings)) {
+      throw new Error("Agent PTY binding requires an interactive Unix PTY and durable binding store.");
+    }
     const launchKey = this.launchKey(input);
     const launchFingerprint = this.launchFingerprint(input);
     if (launchKey) {
@@ -463,6 +489,31 @@ export class ProcessSessionManager {
       this.removeSession(session.id);
       if (launchKey) this.launches.delete(launchKey);
       throw error;
+    }
+
+    if (input.agentPtyBinding) {
+      try {
+        const binding = this.agentPtyBindings!.attach({
+          processSessionId: session.id,
+          workspaceSessionId: input.agentPtyBinding.workspaceSessionId,
+          workSessionId: input.workSessionId ?? "",
+          runId: input.agentPtyBinding.runId,
+          ownerPrincipalId: input.agentPtyBinding.ownerPrincipalId,
+          running: session.running,
+          outputCursor: session.buffer.cursor,
+        });
+        session.agentPtyBinding = {
+          processSessionId: session.id,
+          processGeneration: binding.processGeneration,
+        };
+      } catch (error) {
+        const stopped = await this.stopUnboundSession(session);
+        if (stopped) {
+          this.removeSession(session.id);
+          if (launchKey) this.launches.delete(launchKey);
+        }
+        throw error;
+      }
     }
 
     const yieldTimeMs = boundedInteger(input.yieldTimeMs, DEFAULT_EXEC_YIELD_MS, MAX_COMMAND_YIELD_MS);
@@ -567,6 +618,44 @@ export class ProcessSessionManager {
     };
   }
 
+  listAgentPtyBindings(workSessionId: string): import("./agent-pty-bindings.js").AgentPtyBinding[] {
+    return this.agentPtyBindings?.listForWorkSession(workSessionId) ?? [];
+  }
+
+  observeAgentPty(input: {
+    workSessionId: string;
+    processSessionId: string;
+    afterCursor?: number;
+    maxOutputCharacters?: number;
+  }): AgentPtyObservation | undefined {
+    const binding = this.agentPtyBindings?.getByProcessSession(input.processSessionId);
+    if (!binding || binding.workSessionId !== input.workSessionId) return undefined;
+    const session = this.sessions.get(input.processSessionId);
+    const maxOutputCharacters = Math.max(1, Math.min(20_000, Math.floor(input.maxOutputCharacters ?? 4_000)));
+    const afterCursor = input.afterCursor ?? Math.max(0, (session?.buffer.cursor ?? binding.outputCursor) - maxOutputCharacters);
+    if (!session) {
+      return {
+        binding,
+        output: "",
+        outputCursor: binding.outputCursor,
+        oldestAvailableCursor: binding.outputCursor,
+        outputTruncated: binding.outputCursor > afterCursor,
+        running: false,
+      };
+    }
+    const read = session.buffer.read(afterCursor, maxOutputCharacters);
+    return {
+      binding,
+      output: read.output,
+      outputCursor: read.nextCursor,
+      oldestAvailableCursor: read.oldestAvailableCursor,
+      outputTruncated: read.truncated,
+      running: session.running,
+      exitCode: session.exitCode,
+      signal: session.signal,
+    };
+  }
+
   /** Number of live child processes fenced to one persisted workspace. */
   countRunningForWorkspace(workspaceId: string): number {
     let count = 0;
@@ -662,6 +751,16 @@ export class ProcessSessionManager {
     } finally {
       if (timer) clearTimeout(timer);
     }
+  }
+
+  private async stopUnboundSession(session: ProcessSession): Promise<boolean> {
+    try { session.process?.kill("SIGTERM"); } catch { /* already gone */ }
+    await this.waitForExit(session, 2_000);
+    if (session.running) {
+      try { session.process?.kill("SIGKILL"); } catch { /* already gone */ }
+      await this.waitForExit(session, 500);
+    }
+    return !session.running;
   }
 
   private createSession(input: StartCommandInput): ProcessSession {
@@ -821,6 +920,17 @@ export class ProcessSessionManager {
     session.exitCode = exitCode;
     session.signal = signal;
     session.resolveExit();
+    if (session.agentPtyBinding) {
+      try {
+        this.agentPtyBindings?.finish(
+          session.agentPtyBinding.processSessionId,
+          session.agentPtyBinding.processGeneration,
+          session.buffer.cursor,
+        );
+      } catch (error) {
+        console.error(`[kontrol] could not persist agent PTY exit for ${session.id}:`, error);
+      }
+    }
     session.cleanupTimer = setTimeout(
       () => this.removeSession(session.id),
       this.completedSessionTtlMs,
@@ -838,6 +948,18 @@ export class ProcessSessionManager {
   private append(session: ProcessSession, output: string): void {
     if (output) session.lastProcessActivityAt = Date.now();
     session.buffer.append(output);
+    if (session.agentPtyBinding) {
+      try {
+        this.agentPtyBindings?.advanceOutputCursor(
+          session.agentPtyBinding.processSessionId,
+          session.agentPtyBinding.processGeneration,
+          session.buffer.cursor,
+        );
+      } catch (error) {
+        console.error(`[kontrol] could not persist agent PTY output cursor for ${session.id}:`, error);
+        session.process?.kill("SIGTERM");
+      }
+    }
   }
 
   /**
@@ -891,6 +1013,11 @@ export class ProcessSessionManager {
       columns: input.columns ?? null,
       rows: input.rows ?? null,
       timeoutMs: input.timeoutMs ?? null,
+      agentPtyBinding: input.agentPtyBinding ? {
+        workspaceSessionId: input.agentPtyBinding.workspaceSessionId,
+        runId: input.agentPtyBinding.runId,
+        ownerPrincipalId: input.agentPtyBinding.ownerPrincipalId,
+      } : null,
     });
   }
 

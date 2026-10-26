@@ -50,6 +50,11 @@ assert.equal(principal!.credentialId, "cred-1");
 assert.equal(principal!.principalId, "peer:meta-muse:cred-1");
 assert.deepEqual([...principal!.capabilities], ["workspace:inspect", "job:claim"]);
 assert.deepEqual([...principal!.grantedRoots], ["/srv/workspace"]);
+const dispatchDescriptor = registry.getActiveDescriptor("meta-muse");
+assert.deepEqual(dispatchDescriptor, baseDescriptor, "trusted dispatch resolves the active enrolled descriptor");
+dispatchDescriptor?.grantedRoots.push("/outside");
+assert.deepEqual(registry.getActiveDescriptor("meta-muse")?.grantedRoots, ["/srv/workspace"], "dispatch descriptor is defensive-copied");
+assert.equal(registry.getActiveDescriptor("unknown-peer"), undefined, "unknown peer cannot be resolved for dispatch");
 
 assert.equal(registry.authenticate(`Bearer cred-1:wrong-secret-entirely-but-long-enough`), undefined, "wrong secret rejected");
 assert.equal(registry.authenticate("Bearer unknown-cred:some-secret-long-enough"), undefined, "unknown credentialId rejected");
@@ -62,14 +67,17 @@ assert.equal(registry.authenticate(undefined), undefined, "missing header reject
 writeRegistry([{ ...baseDescriptor, revokedAt: pastIso }], new Date());
 let hot = PeerCredentialRegistry.open(registryPath);
 assert.equal(hot.authenticate(token), undefined, "revoked credential rejected");
+assert.equal(hot.getActiveDescriptor("meta-muse"), undefined, "revoked peer cannot be selected for dispatch");
 
 writeRegistry([{ ...baseDescriptor, expiresAt: pastIso }], new Date());
 hot = PeerCredentialRegistry.open(registryPath);
 assert.equal(hot.authenticate(token), undefined, "expired credential rejected");
+assert.equal(hot.getActiveDescriptor("meta-muse"), undefined, "expired peer cannot be selected for dispatch");
 
 writeRegistry([{ ...baseDescriptor, notBefore: futureIso }], new Date());
 hot = PeerCredentialRegistry.open(registryPath);
 assert.equal(hot.authenticate(token), undefined, "not-yet-valid credential rejected");
+assert.equal(hot.getActiveDescriptor("meta-muse"), undefined, "not-yet-valid peer cannot be selected for dispatch");
 
 // Future revokedAt / past notBefore still authenticate (window checks only).
 writeRegistry([{ ...baseDescriptor, revokedAt: futureIso, notBefore: pastIso }], new Date());

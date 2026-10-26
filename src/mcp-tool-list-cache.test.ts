@@ -5,6 +5,7 @@ import {
   installCachedToolList,
   observeToolListDescriptors,
   toolListCacheDiagnostics,
+  toolListDescriptorCacheKey,
 } from "./mcp-tool-list-cache.js";
 import {
   evaluateToolCatalogAcknowledgement,
@@ -44,6 +45,26 @@ assert.deepEqual(await handler({}, {}), { calls: 1 });
 const after = toolListCacheDiagnostics()[0]?.metrics;
 assert.equal((after?.misses ?? 0) - before.misses, 1, "one cache miss is counted once");
 assert.equal((after?.hits ?? 0) - before.hits, 1, "one cache hit is counted once");
+assert.notEqual(
+  toolListDescriptorCacheKey("profile-with-scheduled-jobs", "owner"),
+  toolListDescriptorCacheKey("profile-without-scheduled-jobs", "owner"),
+  "different effective registration profiles cannot share descriptors",
+);
+assert.notEqual(
+  toolListDescriptorCacheKey("same-registration", "peer:inspect"),
+  toolListDescriptorCacheKey("same-registration", "peer:inspect,job:claim"),
+  "different restricted visibility profiles receive distinct cache identities",
+);
+
+const boundedCache = new Map<string, Promise<unknown>>();
+for (const cacheKey of ["profile-a", "profile-b", "profile-c"]) {
+  const boundedServer = fakeServer(async () => ({ cacheKey }));
+  const boundedInstall = installCachedToolList(boundedServer, cacheKey, boundedCache, listToolsSchema, 2);
+  boundedServer.registerToolsList(listToolsSchema);
+  assert.equal(boundedInstall.finalizeRegistration(), true);
+  await (boundedServer as any).handlers.get(listToolsSchema)({}, {});
+}
+assert.deepEqual([...boundedCache.keys()], ["profile-b", "profile-c"], "descriptor cache evicts oldest profiles at its configured bound");
 
 let attempt = 0;
 const retryServer = fakeServer(async () => {

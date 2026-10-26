@@ -139,6 +139,47 @@ export interface WorkSessionViewState {
   status: string;
   updatedAt?: string;
   lastHeartbeatAt?: string;
+  agentPtys?: Array<{
+    processSessionId: string;
+    agentName: string;
+    processGeneration: number;
+    outputCursor: number;
+    status: "attached" | "detached" | "exited" | "lost";
+    createdAt: string;
+    finishedAt?: string;
+  }>;
+  reviewLoop?: {
+    routeId: string;
+    reviewThreadId?: string;
+    reviewThreadStatus?: string;
+    status: string;
+    mode: string;
+    completedReviewRounds: number;
+    admittedReviewRounds: number;
+    maxReviewRounds: number;
+    roundNumber?: number;
+    handoffId?: string;
+    handoffStatus?: string;
+    deliveryTransport?: string;
+    browserProfileId?: string;
+    conversation?: {
+      key?: string;
+      url?: string;
+      bindingStatus?: string;
+      bindingRevision?: number;
+      browserGeneration?: number;
+    };
+    deliveryMessage?: { messageId: string; kind: string; status: string; updatedAt: string };
+    browserAttempt?: {
+      attemptId: string;
+      status: string;
+      attemptNumber: number;
+      errorCode?: string;
+      submittedAt?: string;
+      generationStartedAt?: string;
+      generationFinishedAt?: string;
+    };
+  };
   lifecycle?: string;
   runtimeState?: string;
   unresolvedMessageCount: number;

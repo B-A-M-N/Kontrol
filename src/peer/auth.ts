@@ -94,6 +94,21 @@ export class PeerCredentialRegistry {
     return peerGrantHash(this.peers);
   }
 
+  /** Resolve a currently active enrolled peer for trusted server dispatch. */
+  getActiveDescriptor(peerId: string, nowMs = Date.now()): PeerDescriptor | undefined {
+    this.maybeReload();
+    const descriptor = this.peers.find((peer) => peer.id === peerId);
+    if (!descriptor || this.degradedAt !== undefined) return undefined;
+    if (descriptor.revokedAt !== undefined && Date.parse(descriptor.revokedAt) <= nowMs) return undefined;
+    if (descriptor.expiresAt !== undefined && Date.parse(descriptor.expiresAt) <= nowMs) return undefined;
+    if (descriptor.notBefore !== undefined && Date.parse(descriptor.notBefore) > nowMs) return undefined;
+    return {
+      ...descriptor,
+      capabilities: [...descriptor.capabilities],
+      grantedRoots: [...descriptor.grantedRoots],
+    };
+  }
+
   /** Monotonic identity for diagnostics/tests. */
   snapshot(): { generation: number; peerCount: number; degraded: boolean; reason?: string; lastFailure?: string } {
     return {

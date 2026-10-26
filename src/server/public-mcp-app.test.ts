@@ -534,6 +534,9 @@ function disabledConfigSnapshot(): ServerConfig {
     }
     assert.deepEqual(statuses, [401, 401, 401, 429, 429, 429], "repeated authorize attempts trip the edge throttle end-to-end");
     assert.equal(throttleBody?.error?.code, "rate_limited", "the throttle 429 body carries the rate_limited code");
+    assert.equal(throttleProvider.publicGlobalFailureCount, 3, "only provider-reached public failures enter the public budget");
+    assert.equal(throttleProvider.globalFailureCount, 0, "public failures do not consume the owner failure budget");
+    assert.equal(throttleProvider.isLockedOut("owner-client|127.0.0.1"), false, "public attempts cannot lock owner authorization");
 
     // P2-1 regression: Express 5 path variants reach the SAME provider
     // handler (router.use mount, case-insensitive, trailing slash optional),

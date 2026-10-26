@@ -450,10 +450,14 @@ export async function acquireCheckoutModifyLease(config: BridgeConfig, workspace
     takeover: options.takeover,
   });
   if (lease.acquired) return null;
+  const conflictingLease = config.workSessions.getActiveWorkspaceLease(canonicalRoot);
+  const conflictMessage = conflictingLease?.leaseKind === "peer_job"
+    ? `Workspace is reserved by peer job ${conflictingLease.ownerInstanceId.replace(/^peer-job:/, "")}; wait for result staging or cancel/reconcile that peer job before dispatching another modifying worker.`
+    : `Workspace root is already controlled by work session ${lease.conflictingWorkSessionId}. Use a separate worktree or cancel the existing session before dispatching another modifying worker.`;
   return {
     content: [{
       type: "text" as const,
-      text: `Workspace root is already controlled by work session ${lease.conflictingWorkSessionId}. Use a separate worktree or cancel the existing session before dispatching another modifying worker.`,
+      text: conflictMessage,
     }],
     structuredContent: {
       conflict: {

@@ -20,7 +20,7 @@ import { randomUUID } from "node:crypto";
 import express, { type Express, type NextFunction, type Request, type Response } from "express";
 import { mcpAuthRouter } from "@modelcontextprotocol/sdk/server/auth/router.js";
 import type { ServerConfig } from "../config.js";
-import type { SingleUserOAuthProvider } from "../oauth-provider.js";
+import { OAUTH_FAILURE_DOMAIN, type SingleUserOAuthProvider } from "../oauth-provider.js";
 import type { DerivedAuth } from "./auth.js";
 import { logEvent, requestPath } from "../logger.js";
 import { hostMatchesAllowlist, normalizeHostAllowlist, strictHostHeaderValidation } from "../ingress/host-policy.js";
@@ -41,10 +41,8 @@ export interface PublicMcpAppDeps {
    * F2-1: edge-limiter caps, injectable so tests can override and wired from
    * config (KONTROL_PUBLIC_MCP_EDGE_*). The authorize-attempt throttle (20
    * POST /authorize attempts per sliding 5-minute window per key,
-   * KONTROL_PUBLIC_MCP_EDGE_AUTHORIZE_ATTEMPTS) bounds the public listener's
-   * contribution to the shared provider global brute-force ceiling (50
-   * failures / 5-min window) to under half of it, so a single IP cannot lock
-   * the operator's own /authorize. Successful OAuth-surface requests are
+   * KONTROL_PUBLIC_MCP_EDGE_AUTHORIZE_ATTEMPTS) bounds public brute-force
+   * attempts. Successful OAuth-surface requests are
    * capped at 60/min/IP (one client bootstrap is ~6 requests); /mcp tool
    * traffic at 240/min/IP.
    */
@@ -64,11 +62,11 @@ export interface PublicMcpAppDeps {
 // skips rateLimit() entirely: no MemoryStore, no setInterval, zero timers).
 // Public rate protection is entirely OUR edge limiter below.
 //
-// Residual (documented, out of scope): public traffic still shares the
-// provider's GLOBAL brute-force failure ceiling with the owner; a distributed
-// attack can spend that ceiling. Full isolation requires provider surgery.
-// A SINGLE IP is bounded by the authorize-attempt throttle below, not by the
-// request caps.
+// The provider shares clients, codes, and token storage, but tags the request
+// with a private symbol so owner and public password-failure budgets remain
+// independent. Public ingress can lock its own budget without affecting the
+// owner's /authorize flow. The per-IP attempt throttle below remains a public
+// abuse bound.
 
 // P2-2/F2-B edge limiter: fixed-window, no timers (window/volume state is
 // evaluated lazily per request, mirroring the bounded failed-auth limiter in
@@ -84,9 +82,9 @@ const EDGE_MAX_KEYS = 1_024;
 const EDGE_OAUTH_SURFACE_DEFAULT_PER_MINUTE = 60;
 const EDGE_MCP_DEFAULT_PER_MINUTE = 240;
 // F2-1 (redesigned after the round-4 review): authorize-attempt throttle.
-// The provider's global brute-force ceiling (AUTH_GLOBAL_MAX_FAILURES = 50
-// per 5-minute ANCHORED window, src/oauth-provider.ts) is shared between the
-// owner app and this public listener, and the ONLY provider-recorded failure
+// The provider's public-domain brute-force ceiling (AUTH_GLOBAL_MAX_FAILURES
+// = 50 per 5-minute ANCHORED window, src/oauth-provider.ts) is applied only
+// to this listener, and the ONLY provider-recorded failure
 // path is POST /authorize with a wrong owner token (src/oauth-provider.ts:301,
 // answered 401). We therefore bound the raw ATTEMPT RATE per req.ip with a
 // true sliding window, counted at REQUEST time BEFORE the provider runs:
@@ -320,6 +318,10 @@ export function createPublicMcpApp(deps: PublicMcpAppDeps): { app: Express } {
     ?? config.publicMcp.edgeAuthorizeMaxAttemptsPerWindow
     ?? EDGE_AUTHORIZE_MAX_ATTEMPTS;
   app.use((req: Request, res: Response, next: NextFunction) => {
+    // This non-wire marker lets the shared OAuth provider keep public
+    // password failures in a separate per-listener budget. A header or query
+    // parameter cannot spoof it, and credentials/tokens remain shared.
+    (req as Request & { [OAUTH_FAILURE_DOMAIN]?: "public" })[OAUTH_FAILURE_DOMAIN] = "public";
     // Diagnostics-only resolution (leftmost XFF is forgeable; never used for
     // limiting or authorization). The limiter key is req.ip.
     const resolved = resolveClientIp({
@@ -341,11 +343,11 @@ export function createPublicMcpApp(deps: PublicMcpAppDeps): { app: Express } {
     const nowMs = Date.now();
     const onOAuthSurface = isOAuthSurfacePath(req.path);
     // F2-1: authorize-attempt throttle. POST /authorize is the ONLY path that
-    // can make the shared provider record a brute-force failure
+    // can make this listener's provider failure domain record a failure
     // (src/oauth-provider.ts:301), so the attempt rate per IP is bounded at
     // admission — BEFORE the provider runs — with a true sliding window. This
-    // bounds the public listener's contribution to the provider's global
-    // ceiling for ANY 5-minute span, immune to window anchoring and to
+    // bounds the public listener's contribution to its failure ceiling for
+    // ANY 5-minute span, immune to window anchoring and to
     // aborted responses.
     const isAuthorizeAttempt = req.method === "POST" && normalizedRoutePath(req.path) === "/authorize";
     if (isAuthorizeAttempt && !edgeAuthorizeAttemptCheck(edgeAuthorizeStore, key, nowMs, authorizeAttemptCap)) {

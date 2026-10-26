@@ -7,7 +7,7 @@
  * lifecycle remain in src/server.ts.
  */
 import { performance } from "node:perf_hooks";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { realpath } from "node:fs/promises";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
@@ -35,7 +35,7 @@ import type { MutationReceiptStore } from "../mutation-receipts.js";
 import type { ReviewWorkflowService } from "../review-workflow.js";
 import type { LiveWaiterRegistry } from "../bridge/shared.js";
 import type { DatabaseHandle } from "../db/client.js";
-import { installCachedToolList, installToolListFilter, observeToolListDescriptors } from "../mcp-tool-list-cache.js";
+import { installCachedToolList, installToolListFilter, observeToolListDescriptors, toolListDescriptorCacheKey } from "../mcp-tool-list-cache.js";
 import {
   evaluateToolCatalogAcknowledgement,
   fingerprintToolCatalog,
@@ -78,6 +78,8 @@ export { type ConnectionContext, processSessionOwnerId } from "./connection-cont
 // The descriptor cache observes the public tools/list handler registration;
 // catalog fingerprints come from the exact descriptor response.
 const toolListDescriptorCache = new Map<string, Promise<unknown>>();
+const TOOL_LIST_DESCRIPTOR_CACHE_MAX_ENTRIES = 256;
+const PEER_JOB_WORKSPACE_RESERVATION_MS = 100 * 365 * 24 * 60 * 60 * 1000;
 const toolSchemaCacheByConfig = new WeakMap<ServerConfig, Map<string, unknown>>();
 
 function isZodSchema(value: unknown): value is { safeParse: (input: unknown) => unknown } {
@@ -261,9 +263,13 @@ export function createMcpServer(
   );
   const toolListCacheInstallation = installCachedToolList(
     server,
-    `${config.toolMode}|${config.widgets}|${config.skillsEnabled ? "skills" : "no-skills"}|${config.acpEnabled ? "acp" : "no-acp"}|${policyEngine ? "policy" : "no-policy"}|surface:${mcpToolSurface.version}|${peerTools ? `peer:${peerToolProfileKey(connectionContext?.peerCapabilities)}` : "owner"}`,
+    toolListDescriptorCacheKey(
+      toolRegistrationProfile,
+      peerTools ? `peer:${peerToolProfileKey(connectionContext?.peerCapabilities)}` : "owner",
+    ),
     toolListDescriptorCache,
     ListToolsRequestSchema,
+    TOOL_LIST_DESCRIPTOR_CACHE_MAX_ENTRIES,
   );
   const peerFilterInstallation = peerTools
     ? installToolListFilter(server, ListToolsRequestSchema, (toolName) => peerTools.has(toolName))
@@ -327,11 +333,14 @@ export function createMcpServer(
     title: "Enqueue peer job",
     description:
       "Owner-only: enqueue a durable, peer-scoped job for a granted peer to claim over the peer job protocol. "
+      + "The target checkout is durably reserved against other worker dispatch until result staging or cancellation. "
       + "instructions is delivered to the peer verbatim (capped at 256 KiB); allowedOutputs declares the RELATIVE path prefixes the peer's result manifest may contain (empty set allows no file outputs; \"*\" is the explicit match-all escape).",
     inputSchema: {
       peerId: z.string().min(1).describe("Operator-assigned peer identity from the credential registry."),
       repositoryId: z.string().min(1).describe("Workspace root for the job; canonicalized against KONTROL_ALLOWED_ROOTS and the peer's grantedRoots."),
-      baseRevision: z.string().min(1).describe("Immutable git SHA or snapshot identity the job is based on."),
+      workspaceSessionId: z.string().min(1).describe("Existing managed-worktree workspace that will receive the peer result."),
+      workSessionId: z.string().min(1).describe("Existing work session bound to workspaceSessionId; peer output will enter its normal review flow."),
+      baseRevision: z.string().min(1).describe("Exact Git SHA recorded as the managed worktree's immutable base."),
       taskClass: z.enum(["read_only_audit", "propose_patch", "bounded_execution"]),
       instructions: z.string().min(1).describe("UTF-8 instruction text delivered verbatim to the peer (max 256 KiB)."),
       allowedOutputs: z.array(z.string().min(1)).min(1).describe("REQUIRED relative path prefixes the result manifest may contain (e.g. [\"out/\"]); [\"*\"] allows everything."),
@@ -374,6 +383,52 @@ export function createMcpServer(
     if (!peerGrantsRoot(peerPrincipal, canonicalRoot)) {
       return denied(`Forbidden: peer ${descriptor.id} is not granted access to workspace root ${canonicalRoot}.`);
     }
+    // Peer results must have an existing reviewer-owned destination before
+    // they can be dispatched. Bind the job to a managed worktree, the exact
+    // work session, and its immutable clean Git baseline; a manifest alone
+    // must never choose where result files are later written.
+    const workSession = workSessions?.get(args.workSessionId);
+    if (!workSession || workSession.workspaceSessionId !== args.workspaceSessionId) {
+      return denied("workSessionId must identify an existing session bound to workspaceSessionId.");
+    }
+    if (!["in_progress", "changes_requested", "resuming"].includes(workSession.status)) {
+      return denied(`workSessionId is ${workSession.status}; peer results can only target an active, submittable work session.`);
+    }
+    let destinationWorkspace: ReturnType<WorkspaceRegistry["getWorkspace"]>;
+    try {
+      destinationWorkspace = workspaces.getWorkspace(args.workspaceSessionId);
+    } catch {
+      return denied("workspaceSessionId must identify an active managed worktree workspace.");
+    }
+    if (
+      destinationWorkspace.mode !== "worktree" ||
+      destinationWorkspace.worktree?.managed !== true ||
+      destinationWorkspace.sourceRoot !== canonicalRoot ||
+      destinationWorkspace.worktree.baseSha !== args.baseRevision
+    ) {
+      return denied("Peer jobs require a managed worktree of repositoryId whose recorded base SHA exactly matches baseRevision.");
+    }
+    try {
+      const matchesBase = await reviewCheckpoints.assertTreeMatchesCommit({
+        workspaceId: destinationWorkspace.id,
+        root: destinationWorkspace.root,
+        baselineCommit: args.baseRevision,
+      });
+      if (!matchesBase) return denied("The managed worktree has changes; peer jobs require a clean immutable baseline.");
+    } catch {
+      return denied("The managed worktree baseline could not be verified.");
+    }
+    if (!workSessions) return denied("Peer jobs require the durable work-session and workspace-lease store.");
+    if (args.taskClass !== "read_only_audit") {
+      const missionPacket = missionLedger?.getPacket(workSession.id);
+      const hasIndependentCheck = missionPacket?.criteria.some((criterion) =>
+        (typeof criterion.verificationCommand === "string" && criterion.verificationCommand.length > 0) ||
+        Boolean(criterion.runtimeProbe),
+      ) ?? false;
+      if (!missionPacket?.mission || !hasIndependentCheck) {
+        return denied("propose_patch and bounded_execution jobs require a bound mission with a declared verification command or runtime probe.");
+      }
+    }
     const store = getPeerJobStore();
     if (!store) return denied("Peer integration is not enabled (no peer job store).");
     try {
@@ -381,17 +436,44 @@ export function createMcpServer(
     } catch (error) {
       return denied(error instanceof Error ? error.message : String(error));
     }
-    const job = store.createJob({
-      peerId: descriptor.id,
-      repositoryId: canonicalRoot,
-      baseRevision: args.baseRevision,
-      taskClass: args.taskClass,
-      instructionHash: createHash("sha256").update(args.instructions, "utf8").digest("hex"),
-      instructions: args.instructions,
-      allowedOutputs,
-      maxRuntimeMs: args.maxRuntimeMs ?? 600_000,
-      maxArtifactBytes: args.maxArtifactBytes ?? 1_048_576,
+    const jobId = `job_${randomUUID()}`;
+    let canonicalWorktreeRoot: string;
+    try {
+      canonicalWorktreeRoot = await realpath(destinationWorkspace.root);
+    } catch {
+      return denied("The managed worktree path could not be resolved for exclusive reservation.");
+    }
+    const reservation = workSessions.acquireWorkspaceLease({
+      canonicalRoot: canonicalWorktreeRoot,
+      workspaceSessionId: destinationWorkspace.id,
+      workSessionId: workSession.id,
+      ownerInstanceId: `peer-job:${jobId}`,
+      leaseKind: "peer_job",
+      ttlMs: PEER_JOB_WORKSPACE_RESERVATION_MS,
     });
+    if (!reservation.acquired) {
+      return denied(`The target checkout is already reserved by work session ${reservation.conflictingWorkSessionId}; stop or reconcile its current worker before enqueueing a peer job.`);
+    }
+    let job;
+    try {
+      job = store.createJob({
+        jobId,
+        peerId: descriptor.id,
+        workSessionId: workSession.id,
+        workspaceSessionId: destinationWorkspace.id,
+        repositoryId: canonicalRoot,
+        baseRevision: args.baseRevision,
+        taskClass: args.taskClass,
+        instructionHash: createHash("sha256").update(args.instructions, "utf8").digest("hex"),
+        instructions: args.instructions,
+        allowedOutputs,
+        maxRuntimeMs: args.maxRuntimeMs ?? 600_000,
+        maxArtifactBytes: args.maxArtifactBytes ?? 1_048_576,
+      });
+    } catch (error) {
+      workSessions.releaseWorkspaceLeaseForSession(workSession.id, reservation.lease.leaseNonce);
+      return denied(`Peer job could not be persisted; the checkout reservation was released. ${error instanceof Error ? error.message : String(error)}`);
+    }
     return {
       content: [{
         type: "text" as const,
@@ -399,6 +481,8 @@ export function createMcpServer(
           jobId: job.jobId,
           status: job.status,
           peerId: job.peerId,
+          workspaceSessionId: job.workspaceSessionId,
+          workSessionId: job.workSessionId,
           repositoryId: job.repositoryId,
           instructionHash: job.instructionHash,
           maxRuntimeMs: job.maxRuntimeMs,
@@ -441,6 +525,10 @@ export function createMcpServer(
     config,
     principalRole: connectionContext?.authenticatedRole ?? "client",
     store: getPeerJobStore(),
+    workSessions,
+    dispatchOutbox,
+    mutationReceipts,
+    mutationPrincipalId,
   });
   registerIngressManagementTool(server, {
     config,
@@ -452,6 +540,16 @@ export function createMcpServer(
       db,
       workspaces,
       workSessions,
+      agentPtyBindingsForWorkSession: (workSessionId) => processSessions.listAgentPtyBindings(workSessionId)
+        .map(({ processSessionId, agentName, processGeneration, outputCursor, status, createdAt, finishedAt }) => ({
+          processSessionId, agentName, processGeneration, outputCursor, status, createdAt, finishedAt,
+        })),
+      observeAgentPty: (input) => {
+        const observation = processSessions.observeAgentPty(input);
+        if (!observation) return undefined;
+        const { ownerPrincipalId: _ownerPrincipalId, ...binding } = observation.binding;
+        return { ...observation, binding };
+      },
       reviewCheckpoints,
       agentRegistry: agentRegistry!,
       eventStore,

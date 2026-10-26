@@ -25,6 +25,7 @@ export const toolNames = {
   pollProcess: "poll_process",
   writeStdin: "write_stdin",
   enqueuePeerJob: "enqueue_peer_job",
+  cancelPeerJob: "cancel_peer_job",
 } as const;
 
 /**

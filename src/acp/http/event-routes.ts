@@ -171,6 +171,9 @@ function eventMatchesDispatch(event: { type: string; payload: Record<string, unk
     const eventDispatchAttempt = body.dispatch_idempotency_key
       ? agentRegistry.getDispatchAttemptByIdempotencyKey(body.dispatch_idempotency_key)
       : authoritativeAttempt;
+    // Run identity is immutable origin provenance; the dispatch attempt owns
+    // the authenticated destination identity for a resumed execution.
+    const eventAgentId = eventDispatchAttempt?.agentId ?? run.agentId;
     if (body.dispatch_idempotency_key && (!eventDispatchAttempt
       || eventDispatchAttempt.runId !== run.runId
       || body.attempt_number !== eventDispatchAttempt.attemptNumber
@@ -191,9 +194,9 @@ function eventMatchesDispatch(event: { type: string; payload: Record<string, unk
     if (role === "agent") {
       // Agent ownership is header-bound; accepting the body copy here would
       // let a caller choose which registered identity it claims to be.
-      if (!requireAgentOwnership(req, res, role, run.agentId)) return;
-      if (body.agent_id && body.agent_id !== run.agentId) {
-        res.status(403).json({ error: { code: "forbidden", message: "agent_id does not match the bound run" } });
+      if (!requireAgentOwnership(req, res, role, eventAgentId)) return;
+      if (body.agent_id && body.agent_id !== eventAgentId) {
+        res.status(403).json({ error: { code: "forbidden", message: "agent_id does not match the bound dispatch attempt" } });
         return;
       }
     }
@@ -216,7 +219,7 @@ function eventMatchesDispatch(event: { type: string; payload: Record<string, unk
         eventDispatchAttempt
         && run.workSessionId
         && workspaceRoot
-        && run.agentId
+        && eventAgentId
         && verifyReadOnlyExecutionGrant(
           body.read_only_execution_grant,
           ctx.adapterSecret ?? ctx.sharedSecret,
@@ -224,7 +227,7 @@ function eventMatchesDispatch(event: { type: string; payload: Record<string, unk
             workSessionId: run.workSessionId,
             workspaceSessionId: run.workspaceSessionId,
             workspaceRoot,
-            agentId: run.agentId,
+            agentId: eventAgentId,
             runId: run.runId,
             attemptNumber: body.attempt_number ?? run.attemptNumber,
             dispatchIdempotencyKey: eventDispatchAttempt.dispatchIdempotencyKey,
@@ -393,7 +396,7 @@ function eventMatchesDispatch(event: { type: string; payload: Record<string, unk
         workspaceSessionId,
         workSessionId: sessionId,
         runId: run.runId,
-        agentId: run.agentId ?? run.agentName,
+        agentId: eventAgentId ?? run.agentName,
         title: stringPayload(payload.title) ?? stringPayload(payload.tool) ?? "Agent approval requested",
         description: stringPayload(payload.description) ?? stringPayload(payload.message),
         risk: stringPayload(payload.risk),

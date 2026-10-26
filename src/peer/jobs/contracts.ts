@@ -17,6 +17,7 @@ export const PEER_JOB_STATUSES = [
   "result_received",
   "staging",
   "awaiting_review",
+  "review_changes_requested",
   "completed",
   "failed",
   "cancelled",
@@ -34,8 +35,10 @@ export interface PeerJob {
   jobId: string; // job_<uuid>
   /** TRUSTED server assignment from the credential registry id. */
   peerId: string;
-  /** Optional linkage to existing work sessions. */
-  workSessionId?: string;
+  /** Existing reviewer-owned session receiving the eventual peer submission. */
+  workSessionId: string;
+  /** Exact managed-worktree workspace for the receiving session. */
+  workspaceSessionId: string;
   /** Canonical workspace root or repo identifier. */
   repositoryId: string;
   /** Immutable git SHA or snapshot identity. */
@@ -59,6 +62,22 @@ export interface PeerJob {
   cancelRequestedAt?: string;
   terminalAt?: string;
   terminalReason?: string;
+  resultProcessing?: {
+    receiptSha256?: string;
+    submissionId?: string;
+    reviewEpoch?: number;
+    snapshotKind?: "git" | "filesystem";
+    snapshotRef?: string;
+    diffSha256?: string;
+    reviewVerdict?: "approve" | "changes_requested" | "reject";
+    feedbackId?: string;
+    verificationStatus?: "passed" | "failed" | "inconclusive" | "not_configured";
+    verificationEvidenceSha256?: string;
+    failure?: string;
+    /** Incremented only by an authenticated owner/reviewer retry of local result processing. */
+    retryRevision?: number;
+    updatedAt: string;
+  };
 }
 
 export interface PeerAttempt {

@@ -42,8 +42,16 @@ assert.match(adapter, /terminal-spool/);
 assert.match(adapter, /KONTROL_HERMES_DEADMAN_IDLE_MS/);
 assert.match(adapter, /KONTROL_HERMES_MAX_RUN_SECONDS/);
 assert.match(adapter, /provider-sessions\.json/);
-assert.match(adapter, /body\.continuation_id && !existingProviderBinding/,
+assert.match(adapter, /run\.continuationId && !run\.contextTransfer\?\.fresh/,
   "Hermes continuations fail before launch when no provider session was persisted");
+assert.match(adapter, /isValidContextTransfer\(body\.context_transfer\)/,
+  "Hermes validates the immutable transfer packet before accepting a destination run");
+assert.match(adapter, /run\.providerSessionScope = run\.contextTransfer\?\.id/,
+  "Hermes provider sessions are scoped to the exact cross-agent transfer");
+assert.match(adapter, /run\.contextTransfer\?\.id && !run\.contextTransfer\.fresh/,
+  "a continuation of a transfer fails closed when its scoped provider session is missing");
+assert.match(adapter, /hashProviderSessionKey\(run\.providerSessionScope \?\? run\.workSessionId\)/,
+  "Hermes persists provider session identity under the transfer-scoped key");
 assert.match(adapter, /continuation_session_binding_conflict/,
   "Hermes provider sessions are fenced to their original work session, agent, workspace, and provider generation");
 assert.match(adapter, /persistHermesProviderSession/);

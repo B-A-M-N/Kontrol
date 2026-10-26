@@ -64,7 +64,7 @@ const unknown = peerAllowedToolNames(["workspace:inspect", "job:claim", "totally
 assert.deepEqual([...unknown].sort(), [...inspectTools].sort(), "non-inspect capabilities add no workspace tools");
 
 // Bridge/policy/reviewer tools are never included under any profile.
-for (const tool of ["discover_agents", "submit_for_review", "await_review_feedback", "show_changes", "show_workspace_ui"]) {
+for (const tool of ["discover_agents", "submit_for_review", "await_review_feedback", "show_changes", "show_workspace_ui", "reconcile_peer_job_result"]) {
   assert.equal(full.has(tool), false, `${tool} never peer-visible`);
 }
 

@@ -452,6 +452,8 @@ export const acpRuns = sqliteTable("acp_runs", {
   /** Server-owned execution authority, persisted before the adapter request. */
   scheduledExecutionMode: text("scheduled_execution_mode"),
   status: text("status").notNull().default("created"),
+  inputTask: text("input_task"),
+  inputTaskSha256: text("input_task_sha256"),
   inputPreview: text("input_preview"),
   outputPreview: text("output_preview"),
   outputJson: text("output_json"),
@@ -1076,6 +1078,7 @@ export const reviewBrowserTurns = sqliteTable("review_browser_turns", {
   routeEpoch: integer("route_epoch").notNull(),
   profileId: text("profile_id").notNull(),
   conversationFingerprint: text("conversation_fingerprint").notNull(),
+  bindingRevision: integer("binding_revision"),
   attemptNumber: integer("attempt_number").notNull(),
   browserGeneration: integer("browser_generation"),
   leaseOwner: text("lease_owner"),
@@ -1125,4 +1128,69 @@ export const reviewBrowserProfiles = sqliteTable("review_browser_profiles", {
   updatedAt: text("updated_at").notNull(),
 }, (table) => [
   index("review_browser_profiles_owner_idx").on(table.ownerPrincipalId, table.status),
+]);
+
+/** Peer-pull jobs are durable local control-plane records, separate from ACP scheduled dispatch. */
+export const peerJobs = sqliteTable("peer_jobs", {
+  id: text("job_id").primaryKey(),
+  peerId: text("peer_id").notNull(),
+  status: text("status").notNull(),
+  createdAt: text("created_at").notNull(),
+  taskClass: text("task_class").notNull(),
+  repositoryId: text("repository_id").notNull(),
+  workspaceSessionId: text("workspace_session_id"),
+  workSessionId: text("work_session_id"),
+  recordJson: text("record_json").notNull(),
+}, (table) => [
+  index("peer_jobs_peer_created_cursor_idx").on(table.peerId, table.createdAt, table.id),
+  index("peer_jobs_peer_status_created_idx").on(table.peerId, table.status, table.createdAt, table.id),
+  index("peer_jobs_status_created_idx").on(table.status, table.createdAt, table.id),
+  index("peer_jobs_work_session_idx").on(table.workSessionId, table.id),
+]);
+
+export const peerJobAttempts = sqliteTable("peer_job_attempts", {
+  id: text("attempt_id").primaryKey(),
+  jobId: text("job_id").notNull().references(() => peerJobs.id, { onDelete: "cascade" }),
+  status: text("status").notNull(),
+  generation: integer("generation").notNull(),
+  createdAt: text("created_at").notNull(),
+  leaseExpiresAt: text("lease_expires_at").notNull(),
+  outcomeCertainty: text("outcome_certainty").notNull(),
+  recordJson: text("record_json").notNull(),
+}, (table) => [
+  index("peer_job_attempts_job_created_idx").on(table.jobId, table.createdAt, table.id),
+  index("peer_job_attempts_job_generation_idx").on(table.jobId, table.generation),
+  index("peer_job_attempts_active_lease_idx").on(table.status, table.leaseExpiresAt, table.id),
+]);
+
+export const peerJobStoreMetadata = sqliteTable("peer_job_store_metadata", {
+  key: text("key").primaryKey(),
+  value: text("value").notNull(),
+});
+
+/** Authenticated worker PTYs are durably correlated without making shell
+ * output itself a workflow event. Process IDs are never reused as authority;
+ * every launch receives a monotonically increasing work-session generation. */
+export const agentPtyBindings = sqliteTable("agent_pty_bindings", {
+  id: text("id").primaryKey(),
+  processSessionId: text("process_session_id").notNull().unique(),
+  workspaceSessionId: text("workspace_session_id").notNull()
+    .references(() => workspaceSessions.id, { onDelete: "cascade" }),
+  workSessionId: text("work_session_id").notNull()
+    .references(() => workSessions.id, { onDelete: "cascade" }),
+  runId: text("run_id").notNull()
+    .references(() => acpRuns.runId, { onDelete: "restrict" }),
+  agentName: text("agent_name").notNull(),
+  ownerPrincipalId: text("owner_principal_id").notNull(),
+  processGeneration: integer("process_generation").notNull(),
+  outputCursor: integer("output_cursor").notNull().default(0),
+  status: text("status").notNull(),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+  finishedAt: text("finished_at"),
+}, (table) => [
+  uniqueIndex("agent_pty_bindings_work_generation_unique").on(table.workSessionId, table.processGeneration),
+  index("agent_pty_bindings_work_session_idx").on(table.workSessionId, table.createdAt, table.id),
+  index("agent_pty_bindings_run_idx").on(table.runId, table.processGeneration),
+  index("agent_pty_bindings_status_idx").on(table.status, table.updatedAt),
 ]);

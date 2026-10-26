@@ -591,6 +591,8 @@ export async function callRemoteAgent(
     existingRunId?: string;
     /** Continuation ID for resumed work (passed to the adapter, bound to the worker). */
     continuationId?: string;
+    /** Immutable checkpoint context and provider-session scope for a cross-agent continuation. */
+    contextTransfer?: { id: string; sha256: string; packet: Record<string, unknown>; fresh: boolean };
     /** Nonce of the checkout lease held by this work session. */
     workspaceLeaseNonce?: string;
     /** Expiry of the checkout lease that the worker must renew before its local deadline. */
@@ -647,6 +649,7 @@ export async function callRemoteAgent(
       agentId: params.agentId,
       workspaceSessionId: params.workspaceSessionId,
       workSessionId: params.workSessionId,
+      inputTask: params.task,
       inputPreview: params.task.slice(0, 500),
       webhookUrl: params.webhookUrl,
       scheduledExecutionMode: params.scheduledExecutionPolicy?.executionMode === "read_only_audit"
@@ -673,7 +676,10 @@ export async function callRemoteAgent(
   config.agentRegistry.beginDispatchAttempt({
     key: dispatchIdempotencyKey,
     runId: run.runId,
-    agentId: run.agentId,
+    // The logical run keeps its origin identity forever. A continuation may
+    // target another registered agent, so the dispatch attempt records the
+    // destination identity independently.
+    agentId: params.agentId ?? run.agentId,
     attemptNumber,
   });
 
@@ -712,8 +718,12 @@ export async function callRemoteAgent(
       workspace_root: workspace?.root,
       session_id: params.workSessionId,
       parent_run_id: run.runId,
-      agent_id: run.agentId,
+      // Bind the remote execution and its lifecycle receipts to the selected
+      // destination for this attempt without rewriting the logical run's
+      // historical origin agent.
+      agent_id: params.agentId ?? run.agentId,
       continuation_id: params.continuationId,
+      ...(params.contextTransfer ? { context_transfer: params.contextTransfer } : {}),
       attempt_number: attemptNumber,
       workspace_lease_nonce: params.workspaceLeaseNonce,
       workspace_lease_expires_at: params.workspaceLeaseExpiresAt,
@@ -727,7 +737,7 @@ export async function callRemoteAgent(
         || params.scheduledExecutionPolicy.mutate !== false
         || !params.workSessionId
         || !params.workspaceSessionId
-        || !run.agentId
+        || !(params.agentId ?? run.agentId)
         || !config.adapterSecret
         || !workspace
       ) {
@@ -739,7 +749,7 @@ export async function callRemoteAgent(
         workSessionId: params.workSessionId,
         workspaceSessionId: params.workspaceSessionId,
         workspaceRoot: canonicalWorkspaceRoot,
-        agentId: run.agentId,
+        agentId: params.agentId ?? run.agentId!,
         runId: run.runId,
         attemptNumber,
         dispatchIdempotencyKey,
@@ -755,7 +765,7 @@ export async function callRemoteAgent(
         || !params.scheduledExecutionPolicy.allowedOutputs?.length
         || !params.workSessionId
         || !params.workspaceSessionId
-        || !run.agentId
+        || !(params.agentId ?? run.agentId)
         || !config.adapterSecret
         || !workspace
       ) {
@@ -767,7 +777,7 @@ export async function callRemoteAgent(
         workSessionId: params.workSessionId,
         workspaceSessionId: params.workspaceSessionId,
         workspaceRoot: canonicalWorkspaceRoot,
-        agentId: run.agentId,
+        agentId: params.agentId ?? run.agentId!,
         runId: run.runId,
         attemptNumber,
         dispatchIdempotencyKey,

@@ -18,11 +18,12 @@ export interface GitEligibility {
 export async function git(
   cwd: string,
   args: string[],
-  options: { env?: NodeJS.ProcessEnv; maxBuffer?: number; timeoutMs?: number } = {},
+  options: { env?: NodeJS.ProcessEnv; maxBuffer?: number; maxOutputBytes?: number; timeoutMs?: number } = {},
 ): Promise<GitCommandResult> {
   return controlPlaneGit(cwd, args, {
     extraEnv: options.env,
     maxBuffer: options.maxBuffer,
+    maxOutputBytes: options.maxOutputBytes,
     timeoutMs: options.timeoutMs,
   });
 }
