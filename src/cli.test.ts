@@ -4,6 +4,7 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSy
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { readPtyReviewFeedback, readPtyReviewSubmission } from "./pty-review-cli.js";
 
 const repositoryRoot = fileURLToPath(new URL("..", import.meta.url));
 
@@ -11,6 +12,20 @@ const packageJson = JSON.parse(readFileSync(new URL("../package.json", import.me
   version: string;
 };
 const cliSource = readFileSync(new URL("./cli.ts", import.meta.url), "utf8");
+
+const validSubmission = readPtyReviewSubmission({ structuredContent: { submissionId: "submission-1", status: "awaiting_review" } });
+assert.equal(validSubmission.ok, true, "a valid PTY review submission returns its durable receipt");
+assert.equal(readPtyReviewSubmission({ isError: true, content: [{ type: "text", text: "token expired" }] }).ok, false,
+  "MCP submission errors, including expired credentials, fail closed");
+assert.equal(readPtyReviewSubmission({ structuredContent: { status: "awaiting_review" } }).ok, false,
+  "a malformed submission response is not printed as a successful result");
+const feedbackTimeout = readPtyReviewFeedback({ structuredContent: { status: "timeout", sessionId: "work-1" } });
+assert.equal(feedbackTimeout.ok, true);
+assert.equal(feedbackTimeout.status, "timeout", "feedback timeout stays distinguishable so the CLI can continue waiting");
+assert.equal(readPtyReviewFeedback({ structuredContent: { status: "error", message: "Session cancelled" } }).ok, false,
+  "cancellation is a failing feedback result rather than a successful stdout receipt");
+assert.equal(readPtyReviewFeedback({ isError: true, content: [{ type: "text", text: "credential expired" }] }).ok, false,
+  "MCP feedback errors are surfaced as failures");
 
 assert.match(
   cliSource,
