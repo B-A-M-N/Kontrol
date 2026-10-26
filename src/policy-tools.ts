@@ -490,16 +490,33 @@ export function registerPolicyTools(
       inputSchema: {
         scope: z.enum(["work_session", "workspace"]).optional(),
         scopeId: z.string().min(1).optional(),
+        workspaceId: z.string().min(1).optional().describe("Return effective workspace grants and work-session grants for this workspace, in bounded pages."),
+        afterId: z.string().min(1).optional().describe("Cursor from the previous workspace-scoped grant page."),
+        limit: z.number().int().min(1).max(200).optional(),
       },
       outputSchema: { grants: z.array(z.object({
         id: z.string(), principalId: z.string(), scope: z.string(), scopeId: z.string(), approvalKey: z.string(), createdAt: z.string(), expiresAt: z.string().optional(), reviewerId: z.string().optional(),
-      })) },
+      })), nextCursor: z.string().optional() },
       _meta: workspaceAppCallableMeta(),
       annotations: { readOnlyHint: true, destructiveHint: false },
     },
-    async ({ scope, scopeId }) => {
+    async ({ scope, scopeId, workspaceId, afterId, limit }) => {
       if (!isReviewer(config.principalRole)) {
         return { content: [{ type: "text" as const, text: "Forbidden: list_policy_grants requires reviewer authority." }], isError: true };
+      }
+      if (workspaceId) {
+        if (scope || scopeId) {
+          return { content: [{ type: "text" as const, text: "Workspace-scoped grant listing cannot be combined with scope filters." }], isError: true };
+        }
+        const page = config.policyEngine.listGrantsForWorkspace(workspaceId, afterId, limit, liveOwner(config));
+        const grants = page.grants.filter((grant) => grantOwnedBy(config, grant));
+        return {
+          content: [{ type: "text" as const, text: `${grants.length} effective policy grant(s) in this page.` }],
+          structuredContent: { grants, ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}) },
+        };
+      }
+      if (afterId) {
+        return { content: [{ type: "text" as const, text: "afterId requires workspaceId." }], isError: true };
       }
       const grants = config.policyEngine.listGrants(scope as ApprovalScope | undefined, scopeId)
         .filter((grant) => grantOwnedBy(config, grant));

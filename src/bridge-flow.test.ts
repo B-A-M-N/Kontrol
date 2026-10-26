@@ -22,6 +22,7 @@ import { createReviewRouteStore } from "./review-handoff/route-store.js";
 import { createReviewThreadStore } from "./review-thread/thread-store.js";
 import { createApprovalRequestManager } from "./approval-requests.js";
 import { createPolicyEngine } from "./policy.js";
+import { createSqliteGrantStore } from "./policy-grants.js";
 import { createAgentMessageManager } from "./agent-messages.js";
 import { registerPolicyTools } from "./policy-tools.js";
 import { authorizeWorkSessionAction } from "./work-session-action-guard.js";
@@ -414,6 +415,83 @@ try {
   const clientServer = fakeServer();
   registerBridgeTools(clientServer as any, { ...config, principalRole: "client" });
   registerPolicyTools(reviewerServer as any, { eventStore, policyEngine, approvalRequests, principalRole: "reviewer" });
+  const workspaceGrantOldSession = workSessions.create({ workspaceSessionId: WS, submittedBy: "fixture", ownerContextId: "owner-a" }).id;
+  const sameWorkspaceOtherOwnerSession = workSessions.create({ workspaceSessionId: WS, submittedBy: "fixture", ownerContextId: "owner-b" }).id;
+  const otherWorkspaceSession = workSessions.create({ workspaceSessionId: VERIFY_WS, submittedBy: "fixture" }).id;
+  const workspaceGrantStore = createSqliteGrantStore(db);
+  workspaceGrantStore.insert({
+    id: "a-policy-workspace-grant",
+    principalId: "owner-a",
+    scope: "workspace",
+    scopeId: WS,
+    approvalKey: "tool:write",
+    createdAt: new Date().toISOString(),
+  });
+  workspaceGrantStore.insert({
+    id: "b-policy-old-session-grant",
+    principalId: "reviewer-fixture",
+    scope: "work_session",
+    scopeId: workspaceGrantOldSession,
+    approvalKey: "tool:write",
+    createdAt: new Date().toISOString(),
+  });
+  workspaceGrantStore.insert({
+    id: "c-policy-other-owner-grant",
+    principalId: "owner-b",
+    scope: "work_session",
+    scopeId: sameWorkspaceOtherOwnerSession,
+    approvalKey: "tool:write",
+    createdAt: new Date().toISOString(),
+  });
+  workspaceGrantStore.insert({
+    id: "d-policy-other-workspace-grant",
+    principalId: "reviewer-fixture",
+    scope: "work_session",
+    scopeId: otherWorkspaceSession,
+    approvalKey: "tool:write",
+    createdAt: new Date().toISOString(),
+  });
+  const workspaceGrantServer = fakeServer();
+  registerPolicyTools(workspaceGrantServer as any, {
+    eventStore,
+    policyEngine: createPolicyEngine({ defaultMode: "allow", toolRules: {}, pathRules: [] }, workspaceGrantStore),
+    approvalRequests,
+    workSessions,
+    principalRole: "reviewer",
+  });
+  const firstGrantPage = await workspaceGrantServer.handlers.get("list_policy_grants")!({ workspaceId: WS, limit: 1 });
+  assert.deepEqual(firstGrantPage.structuredContent.grants.map((grant: { id: string }) => grant.id), ["a-policy-workspace-grant"]);
+  assert.equal(firstGrantPage.structuredContent.nextCursor, "a-policy-workspace-grant");
+  const secondGrantPage = await workspaceGrantServer.handlers.get("list_policy_grants")!({
+    workspaceId: WS,
+    limit: 1,
+    afterId: firstGrantPage.structuredContent.nextCursor,
+  });
+  assert.deepEqual(secondGrantPage.structuredContent.grants.map((grant: { id: string }) => grant.id), ["b-policy-old-session-grant"],
+    "workspace grant projection includes old sessions without scanning all grants in the Workspace App");
+  assert.equal(secondGrantPage.structuredContent.nextCursor, "b-policy-old-session-grant");
+  const thirdGrantPage = await workspaceGrantServer.handlers.get("list_policy_grants")!({
+    workspaceId: WS,
+    limit: 1,
+    afterId: secondGrantPage.structuredContent.nextCursor,
+  });
+  assert.deepEqual(thirdGrantPage.structuredContent.grants.map((grant: { id: string }) => grant.id), ["c-policy-other-owner-grant"]);
+  assert.equal(thirdGrantPage.structuredContent.nextCursor, undefined,
+    "workspace projection excludes grants whose sessions belong to other workspaces");
+  const ownerGrantServer = fakeServer();
+  registerPolicyTools(ownerGrantServer as any, {
+    eventStore,
+    policyEngine: createPolicyEngine({ defaultMode: "allow", toolRules: {}, pathRules: [] }, workspaceGrantStore),
+    approvalRequests,
+    workSessions,
+    principalRole: "reviewer",
+    ownerContextId: "owner-a",
+  });
+  const ownerGrantPage = await ownerGrantServer.handlers.get("list_policy_grants")!({ workspaceId: WS, limit: 10 });
+  assert.deepEqual(ownerGrantPage.structuredContent.grants.map((grant: { id: string }) => grant.id), [
+    "a-policy-workspace-grant",
+    "b-policy-old-session-grant",
+  ], "workspace grant pagination applies owner scoping inside the query without leaking hidden grant cursors");
   const callWorker = (name: string, args: any) => workerServer.handlers.get(name)!(args);
   const callReviewer = (name: string, args: any) => reviewerServer.handlers.get(name)!(args);
   const callOpenAIReviewer = (name: string, args: any) => reviewerOpenAIServer.handlers.get(name)!(args);

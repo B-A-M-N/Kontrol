@@ -373,35 +373,28 @@ export async function rehydrateActiveSessions(): Promise<void> {
       const target = ensureWorkSessionView(approvalCenterId(workspaceId), workspaceId, "");
       for (const approval of directApprovals) mergePendingApproval(target, approval, workspaceId);
     }
-    // Workspace-scoped grants are durable across restart, so they must be
-    // rehydrated beside pending approvals instead of remaining invisible in
-    // the approval center. Work-session grants in this workspace are ALSO
-    // effective authority and belong in the same reviewer surface (grouped
-    // separately by renderPolicyGrants). Work-session grant scopeIds are
-    // work-session ids, so list unfiltered and map them to this workspace
-    // through the hydrated session views.
+    // Workspace-scoped grants and grants from every work session in this
+    // workspace are durable authority. Ask the server for that exact
+    // projection: the initial session surface is intentionally paginated and
+    // cannot be used as an authority filter for older work-session grants.
     const grantCenter = ensureWorkSessionView(approvalCenterId(workspaceId), workspaceId, "");
     try {
-      const [workspaceGrantResult, allWorkSessionGrants] = await Promise.all([
-        callServerToolChecked({
+      const grants: PolicyGrantView[] = [];
+      const seenCursors = new Set<string>();
+      let afterId: string | undefined;
+      do {
+        const grantPageResult = await callServerToolChecked({
           name: "list_policy_grants",
-          arguments: { scope: "workspace", scopeId: workspaceId },
-        }),
-        callServerToolChecked({
-          name: "list_policy_grants",
-          arguments: { scope: "work_session" },
-        }).catch(() => undefined as undefined),
-      ]);
-      const workSessionIdsInWorkspace = new Set(
-        [...workSessionViews.values()]
-          .filter((sessionView) => sessionView.workspaceSessionId === workspaceId)
-          .map((sessionView) => sessionView.workSessionId),
-      );
-      const grants = [
-        ...getStructuredContent<{ grants?: PolicyGrantView[] }>(workspaceGrantResult)?.grants ?? [],
-        ...(allWorkSessionGrants ? getStructuredContent<{ grants?: PolicyGrantView[] }>(allWorkSessionGrants)?.grants ?? [] : [])
-          .filter((grant) => workSessionIdsInWorkspace.has(grant.scopeId)),
-      ];
+          arguments: { workspaceId, limit: 100, ...(afterId ? { afterId } : {}) },
+        });
+        if (!host.getApp() || host.getActiveWorkspaceId() !== workspaceId) return;
+        const page = getStructuredContent<{ grants?: PolicyGrantView[]; nextCursor?: string }>(grantPageResult);
+        grants.push(...page?.grants ?? []);
+        const nextCursor = page?.nextCursor;
+        if (nextCursor && seenCursors.has(nextCursor)) throw new Error("Policy grant pagination returned a repeated cursor.");
+        if (nextCursor) seenCursors.add(nextCursor);
+        afterId = nextCursor;
+      } while (afterId);
       grantCenter.policyGrants.clear();
       for (const grant of grants) {
         if (grant && typeof grant.id === "string" && typeof grant.scopeId === "string") {
