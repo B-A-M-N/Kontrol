@@ -5,11 +5,11 @@
  * explicit dependency object destructured at function entry.
  */
 import { createHash, randomUUID } from "node:crypto";
+import { Readable } from "node:stream";
 import type { Socket } from "node:net";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
-import { checkResourceAllowed } from "@modelcontextprotocol/sdk/shared/auth-utils.js";
+import { createMcpHandler, InMemoryServerEventBus, isInitializeRequest, isLegacyRequest, checkResourceAllowed } from "@modelcontextprotocol/server";
+import type { McpServer } from "@modelcontextprotocol/server";
+import { NodeStreamableHTTPServerTransport, toWebRequest } from "@modelcontextprotocol/node";
 import type { ServerConfig } from "../config.js";
 import {
   handleMcpRequestWithDeadline,
@@ -60,6 +60,7 @@ import type { MutationReceiptStore } from "../mutation-receipts.js";
 import type { LiveWaiterRegistry } from "../acp-bridge.js";
 import type { Request, Response } from "express";
 import { readMcpToolSurface } from "../mcp/tool-names.js";
+import { fingerprintToolCatalog, TOOL_CATALOG_ACK_METHOD } from "../mcp/tool-catalog-handshake.js";
 
 function externalCorrelation(req: Request): string | undefined {
   for (const name of ["cf-ray", "x-kontrol-correlation-id", "x-request-id"]) {
@@ -72,6 +73,101 @@ function externalCorrelation(req: Request): string | undefined {
 function qualificationCaptureId(req: Request): string | undefined {
   const value = req.header("x-kontrol-qualification-capture-id")?.trim();
   return value && value.length <= 256 && /^[A-Za-z0-9._:-]+$/.test(value) ? value : undefined;
+}
+
+function authenticatedConnection(req: Request, deps: McpHttpDeps, requestId?: string): {
+  context: ConnectionContext;
+  workerClaims?: WorkerTokenClaims;
+} {
+  const { config } = deps;
+  const peer = req.peerPrincipal;
+  const body = req.body as {
+    params?: {
+      clientInfo?: { name?: unknown };
+      _meta?: Record<string, unknown>;
+    };
+    clientInfo?: { name?: unknown };
+  } | undefined;
+  const clientName = body?.params?.clientInfo?.name ?? body?.clientInfo?.name;
+  const clientPlatformHint = typeof clientName === "string" ? clientName.slice(0, 200) : undefined;
+  const clientCapabilities = body?.params?._meta?.["io.modelcontextprotocol/clientCapabilities"];
+  const capabilities = clientCapabilities && typeof clientCapabilities === "object"
+    ? clientCapabilities as { extensions?: Record<string, unknown> }
+    : undefined;
+  if (peer) {
+    return {
+      context: {
+        authenticatedRole: "peer",
+        authSource: "peer_token",
+        authenticatedPrincipalId: peer.principalId,
+        listenerKind: "peer",
+        peerCapabilities: peer.capabilities,
+        peerGrantedRoots: peer.grantedRoots,
+        conversationId: conversationId(req),
+        clientPlatformHint,
+        clientCapabilities: capabilities,
+      },
+    };
+  }
+
+  let workerClaims: WorkerTokenClaims | undefined;
+  const workerToken = req.header("x-kontrol-worker-token");
+  if (workerToken && config.acpAgentSecret) {
+    try {
+      workerClaims = verifyWorkerToken(workerToken, config.acpAgentSecret);
+    } catch (error) {
+      logEvent(config.logging, "warn", "worker_token_rejected", {
+        requestId,
+        reason: error instanceof Error ? error.message : String(error),
+        ...requestLogFields(req, config),
+      });
+    }
+  }
+  const verifiedReviewer = constantTimeStringEqual(req.header("x-kontrol-reviewer-token"), config.acpReviewerSecret);
+  const verifiedTunnelReviewer = config.authMode === "tunnel"
+    && constantTimeStringEqual(req.header("x-kontrol-tunnel-reviewer"), config.tunnelReviewerSecret);
+  const oauthScopes = Array.isArray(req.auth?.scopes) ? req.auth.scopes : [];
+  const verifiedOAuthReviewer = deps.oauthEnabled() && oauthScopes.some((scope) =>
+    scope === "kontrol" || scope === "kontrol:review" || scope === "kontrol:approve"
+      || scope === "kontrol:mission" || scope === "kontrol:dispatch",
+  );
+  const context: ConnectionContext = {
+    authenticatedRole: workerClaims
+      ? "worker"
+      : verifiedReviewer || verifiedTunnelReviewer || verifiedOAuthReviewer
+        ? "reviewer"
+        : "client",
+    listenerKind: deps.publicListener?.() ? "owner_public" : "owner",
+    authSource: workerClaims
+      ? "worker_token"
+      : verifiedReviewer
+        ? "reviewer_token"
+        : verifiedTunnelReviewer
+          ? "tunnel_reviewer"
+          : deps.oauthEnabled()
+            ? "oauth"
+            : "anonymous",
+    authenticatedPrincipalId: workerClaims
+      ? `worker-work-session:${workerClaims.workSessionId}`
+      : req.auth?.clientId
+        ? `oauth-client:${req.auth.clientId}`
+        : verifiedReviewer
+          ? "reviewer-token"
+          : verifiedTunnelReviewer
+            ? "tunnel-reviewer"
+            : undefined,
+    workspaceSessionId: workerClaims?.workspaceSessionId || req.header("x-kontrol-workspace-session") || undefined,
+    workSessionId: workerClaims?.workSessionId,
+    runId: workerClaims?.runId || req.header("x-kontrol-run") || undefined,
+    continuationId: workerClaims?.continuationId || req.header("x-kontrol-continuation") || undefined,
+    workspaceLeaseNonce:
+      (workerClaims as (WorkerTokenClaims & { workspaceLeaseNonce?: string }) | undefined)?.workspaceLeaseNonce
+      || (workerClaims ? req.header("x-kontrol-workspace-lease-nonce") ?? undefined : undefined),
+    conversationId: conversationId(req),
+    clientPlatformHint,
+    clientCapabilities: capabilities,
+  };
+  return { context, workerClaims };
 }
 
 function responseChunkBytes(chunk: unknown, encoding: unknown): number {
@@ -122,7 +218,19 @@ export interface McpHttpDeps {
    */
   publicListener?: () => boolean;
   serveWorkspaceAppResource(res: Response, requestId: string | undefined, body: { id?: unknown; params?: { uri?: unknown } }, sessionless: boolean, clientKey: string, abortSignal: AbortSignal | undefined, acceptEncoding?: string | undefined, context?: { sessionId?: string; generationId?: string }): Promise<boolean>;
-  createServerForSession(connectionContext: ConnectionContext): McpServer;
+  createServerForSession(
+    connectionContext: ConnectionContext,
+    onToolCatalogHandshake?: (sessionId: string | undefined, result: {
+      status: "accepted" | "rejected";
+      serverVersion: string;
+      captureId?: string;
+      serverCatalogSha256?: string;
+      hostCatalogSha256: string;
+      toolCount?: number;
+      acceptedAt: string;
+      reason?: string;
+    }) => void,
+  ): McpServer;
   supervisorWake(workSessionId: string): void;
   onScheduledJobCreated?: () => void;
   mutationReceipts: MutationReceiptStore;
@@ -149,6 +257,41 @@ export interface McpHttpDeps {
 }
 
 type CatalogRefreshPhase = "initialized" | "get_stream" | "request_retry";
+
+const modernEventBuses = new WeakMap<McpHttpDeps, InMemoryServerEventBus>();
+const modernCatalogs = new WeakMap<McpHttpDeps, Map<string, { sha256: string; toolCount: number }>>();
+const modernCatalogAcknowledgements = new WeakMap<McpHttpDeps, Map<string, boolean>>();
+
+function modernEventBus(deps: McpHttpDeps): InMemoryServerEventBus {
+  let bus = modernEventBuses.get(deps);
+  if (!bus) {
+    bus = new InMemoryServerEventBus((error) => {
+      logEvent(deps.config.logging, "warn", "mcp_modern_event_listener_failed", {
+        reason: error.message,
+      });
+    });
+    modernEventBuses.set(deps, bus);
+  }
+  return bus;
+}
+
+function modernCatalogMap(deps: McpHttpDeps): Map<string, { sha256: string; toolCount: number }> {
+  let catalogs = modernCatalogs.get(deps);
+  if (!catalogs) {
+    catalogs = new Map();
+    modernCatalogs.set(deps, catalogs);
+  }
+  return catalogs;
+}
+
+function modernCatalogAcknowledgementMap(deps: McpHttpDeps): Map<string, boolean> {
+  let acknowledgements = modernCatalogAcknowledgements.get(deps);
+  if (!acknowledgements) {
+    acknowledgements = new Map();
+    modernCatalogAcknowledgements.set(deps, acknowledgements);
+  }
+  return acknowledgements;
+}
 
 function requestAdmissionTimeout(state: McpSessionState | undefined, config: ServerConfig): number {
   return state?.durableWorkerSession ? config.mcpAdmissionTimeoutMs : config.mcpInteractiveAdmissionTimeoutMs;
@@ -225,6 +368,8 @@ async function sendCatalogRefreshPulse(
   const state = deps.mcpSessions.get(sessionId);
   const server = deps.mcpServers.get(sessionId);
   if (!state || !server || state.closing || state.closed) return;
+  modernEventBus(deps).publish({ kind: "tools_list_changed" });
+  modernEventBus(deps).publish({ kind: "resources_list_changed" });
   const refresh = catalogRefreshStats(state);
   if (phase === "initialized") {
     refresh.initializedPulseAttempted = true;
@@ -295,6 +440,13 @@ async function sendCatalogRefreshPulse(
 }
 
 export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res: Response): Promise<unknown> {
+  // Keep the established stateful 2025 route intact. Only requests classified
+  // as 2026 per-request traffic take the stateless handler below.
+  const webRequest = await toWebRequest(req, req.body);
+  if (!(await isLegacyRequest(webRequest, req.body))) {
+    return handleModernMcpHttpRequest(deps, req, res, webRequest);
+  }
+
   const {
     config,
     db,
@@ -1178,7 +1330,7 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
         // cleanup; the transport property is only a fallback.
         let boundSessionId: string | undefined;
         let sessionMcpServer: McpServer | undefined;
-        transport = new StreamableHTTPServerTransport({
+        transport = new NodeStreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
           onsessioninitialized: (newSessionId) => {
             boundSessionId = newSessionId;
@@ -1292,110 +1444,9 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
         // role. A caller that omits/forges the token is treated as a
         // reviewer/client and cannot acquire worker rights (P0 #3: role is no
         // longer client-controlled).
-        let connectionContext: ConnectionContext;
-        if (peerPrincipal) {
-          // Peer identity derives ONLY from the verified credential registry.
-          // Spoofed worker/reviewer/conversation headers are never evaluated
-          // on this path: a peer remains a peer and can never acquire worker
-          // lease, reviewer approval, or policy-grant authority.
-          connectionContext = {
-            authenticatedRole: "peer",
-            authSource: "peer_token",
-            authenticatedPrincipalId: peerPrincipal.principalId,
-            listenerKind: "peer",
-            peerCapabilities: peerPrincipal.capabilities,
-            peerGrantedRoots: peerPrincipal.grantedRoots,
-            conversationId: conversationId(req),
-            clientPlatformHint: (() => {
-              const name = (req.body as { params?: { clientInfo?: { name?: unknown } } } | undefined)?.params?.clientInfo?.name;
-              return typeof name === "string" ? name.slice(0, 200) : undefined;
-            })(),
-          };
-        } else {
-        const workerToken = req.header("x-kontrol-worker-token");
-        let verifiedClaims: WorkerTokenClaims | undefined;
-        if (workerToken && config.acpAgentSecret) {
-          try {
-            verifiedClaims = verifyWorkerToken(workerToken, config.acpAgentSecret);
-          } catch (err) {
-            logEvent(config.logging, "warn", "worker_token_rejected", {
-              requestId,
-              reason: err instanceof Error ? err.message : String(err),
-              ...requestLogFields(req, config),
-            });
-          }
-        }
-        const reviewerToken = req.header("x-kontrol-reviewer-token");
-        const verifiedReviewer = constantTimeStringEqual(reviewerToken, config.acpReviewerSecret);
-        // Tunnel mode deliberately has no bearer gate on the local hop. The
-        // managed tunnel adds this separate secret-backed assertion only to
-        // MCP target traffic, allowing the WebUI to retain reviewer authority
-        // without promoting every loopback client or unsigned attribution
-        // header to reviewer.
-        const tunnelReviewerToken = req.header("x-kontrol-tunnel-reviewer");
-        const verifiedTunnelReviewer = config.authMode === "tunnel"
-          && constantTimeStringEqual(tunnelReviewerToken, config.tunnelReviewerSecret);
-        const oauthScopes = Array.isArray(req.auth?.scopes) ? req.auth.scopes : [];
-        const verifiedOAuthReviewer = oauthEnabled && oauthScopes.some((scope) =>
-          scope === "kontrol" ||
-          scope === "kontrol:review" ||
-          scope === "kontrol:approve" ||
-          scope === "kontrol:mission" ||
-          scope === "kontrol:dispatch"
-        );
-
-        // A verified worker token authenticates this connection as a worker. It
-        // also provides the bound work sessions (workspace/run/continuation) so
-        // they cannot be spoofed by the headers below. Unsigned attribution
-        // headers are used ONLY when no token is present (a reviewer/client
-        // reaching /mcp directly) and never grant worker rights.
-        connectionContext = {
-          authenticatedRole: verifiedClaims ? "worker" : (verifiedReviewer || verifiedTunnelReviewer || verifiedOAuthReviewer) ? "reviewer" : "client",
-          // P3-1: on the public OAuth listener this must not mislabel the
-          // connection as the local owner hop.
-          listenerKind: deps.publicListener?.() ? "owner_public" : "owner",
-          authSource: verifiedClaims
-            ? "worker_token"
-            : verifiedReviewer
-              ? "reviewer_token"
-              : verifiedTunnelReviewer
-                ? "tunnel_reviewer"
-                : oauthEnabled
-                  ? "oauth"
-                  : "anonymous",
-          authenticatedPrincipalId: verifiedClaims
-            ? `worker-work-session:${verifiedClaims.workSessionId}`
-            : req.auth?.clientId
-              ? `oauth-client:${req.auth.clientId}`
-              : verifiedReviewer
-                ? "reviewer-token"
-                : verifiedTunnelReviewer
-                  ? "tunnel-reviewer"
-                  : undefined,
-          workspaceSessionId:
-            verifiedClaims?.workspaceSessionId
-            || (req.header("x-kontrol-workspace-session") ?? undefined),
-          // A plain attribution header is never allowed to turn a client into
-          // a worker or to select the principal used for policy grants. Only
-          // the signed worker envelope supplies an operational work session.
-          workSessionId: verifiedClaims?.workSessionId,
-          runId:
-            verifiedClaims?.runId || (req.header("x-kontrol-run") ?? undefined),
-          continuationId:
-            verifiedClaims?.continuationId
-            || (req.header("x-kontrol-continuation") ?? undefined),
-          workspaceLeaseNonce:
-            (verifiedClaims as (WorkerTokenClaims & { workspaceLeaseNonce?: string }) | undefined)?.workspaceLeaseNonce
-            || (verifiedClaims ? req.header("x-kontrol-workspace-lease-nonce") ?? undefined : undefined),
-          conversationId: conversationId(req),
-          // clientInfo is caller-controlled; this hint affects dispatch
-          // preference only and never establishes identity or authority.
-          clientPlatformHint: (() => {
-            const name = (req.body as { params?: { clientInfo?: { name?: unknown } } } | undefined)?.params?.clientInfo?.name;
-            return typeof name === "string" ? name.slice(0, 200) : undefined;
-          })(),
-        };
-        }
+        // Authorization is resolved identically for modern and stateful legacy
+        // requests. Client identity hints remain dispatch preferences only.
+        const { context: connectionContext } = authenticatedConnection(req, deps, requestId);
 
         const serverCreateStarted = performance.now();
         const server = createMcpServer(
@@ -1742,4 +1793,254 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
     } finally {
       finalizeOperationDiagnostic();
     }
+}
+
+async function handleModernMcpHttpRequest(
+  deps: McpHttpDeps,
+  req: Request,
+  res: Response,
+  webRequest: globalThis.Request,
+): Promise<void> {
+  if (deps.shuttingDown()) {
+    res.setHeader("Retry-After", "1");
+    res.status(503).json({
+      jsonrpc: "2.0",
+      id: (req.body as { id?: unknown } | undefined)?.id ?? null,
+      error: { code: -32000, message: "KONTROL is draining; retry after restart." },
+    });
+    return;
+  }
+
+  if (deps.isPeerListener?.() && !req.peerPrincipal) {
+    res.status(401).json({ error: "unauthorized" });
+    return;
+  }
+  const { context: connectionContext, workerClaims } = authenticatedConnection(
+    req,
+    deps,
+    res.locals.requestId as string | undefined,
+  );
+  const conversation = connectionContext.conversationId;
+  const principalId = connectionContext.authenticatedPrincipalId;
+  const peer = req.peerPrincipal;
+  const catalogIdentity = principalId
+    ? JSON.stringify([
+        connectionContext.listenerKind,
+        principalId,
+        connectionContext.authenticatedRole,
+        connectionContext.workSessionId,
+        connectionContext.workspaceSessionId,
+        conversation,
+        [...(connectionContext.peerCapabilities ?? [])].sort(),
+      ])
+    : undefined;
+  const catalogMap = modernCatalogMap(deps);
+  const acknowledgementMap = modernCatalogAcknowledgementMap(deps);
+  const contextForModernRequest: ConnectionContext = {
+    ...connectionContext,
+    toolCatalogFingerprint: catalogIdentity ? catalogMap.get(catalogIdentity) : undefined,
+  };
+
+  const requestId = res.locals.requestId as string | undefined;
+  const requestBody = req.body as { method?: unknown; id?: unknown; params?: { name?: unknown } } | undefined;
+  if (
+    deps.config.mcpToolCatalogAckRequired === true
+    && requestBody?.method === "tools/call"
+    && (!catalogIdentity || acknowledgementMap.get(catalogIdentity) !== true)
+  ) {
+    res.status(200).json({
+      jsonrpc: "2.0",
+      id: requestBody.id ?? null,
+      error: {
+        code: -32012,
+        message: "Kontrol requires the client to acknowledge its registered tools/list catalog before calling tools. Follow the kontrol.dev/tool-catalog-ack-v1 capability.",
+      },
+    });
+    return;
+  }
+  const requestKey = peer?.principalId ?? workerClaims?.workSessionId ?? req.auth?.clientId ?? req.ip ?? "anonymous";
+  const controller = new AbortController();
+  const abortFromWeb = () => controller.abort(webRequest.signal.reason);
+  webRequest.signal.addEventListener("abort", abortFromWeb, { once: true });
+  if (webRequest.signal.aborted) abortFromWeb();
+  let released = false;
+  let handlerSettled = false;
+  let responseFinished = false;
+  let releaseAdmission: (() => void) | undefined;
+  let closeModernHandler: (() => void) | undefined;
+  const releaseWhenQuiescent = () => {
+    if (!handlerSettled || !responseFinished || released) return;
+    released = true;
+    closeModernHandler?.();
+    closeModernHandler = undefined;
+    releaseAdmission?.();
+    releaseAdmission = undefined;
+    webRequest.signal.removeEventListener("abort", abortFromWeb);
+    res.off("close", onResponseClose);
+    res.off("finish", onResponseFinish);
+  };
+  const onResponseClose = () => {
+    if (!res.writableFinished) controller.abort(new Error("HTTP response closed"));
+    responseFinished = true;
+    releaseWhenQuiescent();
+  };
+  const onResponseFinish = () => {
+    responseFinished = true;
+    releaseWhenQuiescent();
+  };
+  const release = () => {
+    if (released) return;
+    released = true;
+    releaseAdmission?.();
+    releaseAdmission = undefined;
+    webRequest.signal.removeEventListener("abort", abortFromWeb);
+    res.off("close", onResponseClose);
+    res.off("finish", onResponseFinish);
+  };
+  res.once("close", onResponseClose);
+  res.once("finish", onResponseFinish);
+
+  try {
+    const acquired = await deps.mcpAdmission.acquire(
+      requestKey,
+      deps.config.mcpInteractiveAdmissionTimeoutMs,
+      1,
+      controller.signal,
+    );
+    if (!acquired) {
+      res.setHeader("Retry-After", "1");
+      res.status(503).json({
+        jsonrpc: "2.0",
+        id: requestBody?.id ?? null,
+        error: { code: -32029, message: "MCP request capacity is temporarily exhausted. Retry later." },
+      });
+      release();
+      return;
+    }
+    releaseAdmission = acquired;
+
+    const handler = createMcpHandler(
+      () => deps.createServerForSession(contextForModernRequest, (_sessionId, handshake) => {
+        if (!catalogIdentity) return;
+        if (!acknowledgementMap.has(catalogIdentity) && acknowledgementMap.size >= 256) {
+          const oldest = acknowledgementMap.keys().next().value as string | undefined;
+          if (oldest !== undefined) acknowledgementMap.delete(oldest);
+        }
+        acknowledgementMap.set(catalogIdentity, handshake.status === "accepted");
+        logEvent(deps.config.logging, handshake.status === "accepted" ? "info" : "warn", "mcp_modern_tool_catalog_handshake", {
+          requestId,
+          status: handshake.status,
+          serverCatalogSha256: handshake.serverCatalogSha256,
+          hostCatalogSha256: handshake.hostCatalogSha256,
+          toolCount: handshake.toolCount,
+          reason: handshake.reason,
+        });
+      }),
+      { legacy: "reject", bus: modernEventBus(deps) },
+    );
+    closeModernHandler = () => { void handler.close(); };
+    const rpcId = typeof requestBody?.id === "string" || typeof requestBody?.id === "number"
+      ? String(requestBody.id)
+      : undefined;
+    const scopedRequest = new Request(webRequest, { signal: controller.signal });
+    const executionDeadline = mcpRequestHasExecutionDeadline(
+      typeof requestBody?.method === "string" ? requestBody.method : undefined,
+      typeof requestBody?.params?.name === "string" ? requestBody.params.name : undefined,
+    );
+    let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+    const fetchPromise = mcpRequestContext.run({
+      signal: controller.signal,
+      mcpRequestId: rpcId ?? requestId,
+      conversationId: connectionContext.conversationId,
+      principalId: connectionContext.authenticatedPrincipalId,
+      approvalCorrelationId: conversation && principalId ? `${principalId}|conversation:${conversation}` : undefined,
+    }, () => handler.fetch(scopedRequest));
+    void fetchPromise.then(
+      () => {
+        handlerSettled = true;
+        releaseWhenQuiescent();
+      },
+      () => {
+        handlerSettled = true;
+        releaseWhenQuiescent();
+      },
+    );
+    let response: globalThis.Response;
+    if (executionDeadline) {
+      const timedOut = Symbol("mcp_execution_timeout");
+      const outcome = await Promise.race([
+        fetchPromise,
+        new Promise<typeof timedOut>((resolve) => {
+          deadlineTimer = setTimeout(() => {
+            controller.abort(new McpExecutionTimeoutError(deps.config.mcpExecutionTimeoutMs));
+            resolve(timedOut);
+          }, deps.config.mcpExecutionTimeoutMs);
+          deadlineTimer.unref?.();
+        }),
+      ]);
+      if (outcome === timedOut) {
+        res.status(504).json({
+          jsonrpc: "2.0",
+          id: requestBody?.id ?? null,
+          error: { code: -32001, message: "MCP request execution exceeded its deadline." },
+        });
+        responseFinished = true;
+        releaseWhenQuiescent();
+        return;
+      }
+      response = outcome;
+    } else {
+      response = await fetchPromise;
+    }
+    if (deadlineTimer) clearTimeout(deadlineTimer);
+
+    if (catalogIdentity && requestBody?.method === "tools/list" && response.ok) {
+      try {
+        const payload = await response.clone().json() as { result?: unknown };
+        const fingerprint = fingerprintToolCatalog(payload.result);
+        if (fingerprint) {
+          // Keep only a bounded set of authenticated client/profile receipts.
+          if (!catalogMap.has(catalogIdentity) && catalogMap.size >= 256) {
+            const oldest = catalogMap.keys().next().value as string | undefined;
+            if (oldest !== undefined) catalogMap.delete(oldest);
+          }
+          catalogMap.delete(catalogIdentity);
+          catalogMap.set(catalogIdentity, fingerprint);
+          if (!contextForModernRequest.toolCatalogFingerprint
+            || contextForModernRequest.toolCatalogFingerprint.sha256 !== fingerprint.sha256) {
+            acknowledgementMap.set(catalogIdentity, false);
+          }
+        }
+      } catch {
+        // The catalog is cached only when the exact JSON response can be
+        // fingerprinted. An absent receipt makes strict acknowledgement fail closed.
+      }
+    }
+
+    res.statusCode = response.status;
+    response.headers.forEach((value, name) => res.setHeader(name, value));
+    if (!response.body) {
+      res.end();
+      return;
+    }
+    Readable.fromWeb(response.body as import("node:stream/web").ReadableStream<Uint8Array>).pipe(res);
+  } catch (error) {
+    handlerSettled = true;
+    if (!res.headersSent) responseFinished = true;
+    releaseWhenQuiescent();
+    if (res.headersSent || res.destroyed) {
+      res.destroy(error instanceof Error ? error : undefined);
+      return;
+    }
+    logEvent(deps.config.logging, "error", "mcp_modern_request_failed", {
+      requestId,
+      reason: error instanceof Error ? error.message : String(error),
+      method: typeof requestBody?.method === "string" ? requestBody.method : undefined,
+    });
+    res.status(500).json({
+      jsonrpc: "2.0",
+      id: requestBody?.id ?? null,
+      error: { code: -32603, message: "Internal MCP request error" },
+    });
+  }
 }

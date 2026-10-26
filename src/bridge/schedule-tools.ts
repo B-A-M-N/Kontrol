@@ -5,7 +5,7 @@
  * shell authority; execution policy is enforced by signed ACP grants and the
  * worker's operating-system sandbox.
  */
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer } from "@modelcontextprotocol/server";
 import type { BridgeConfig } from "./context.js";
 import { registerMutationAppTool } from "./app-tool.js";
 import { forbidden, isReviewer, liveOwnerContextId, requireWorkSessionMutation } from "./shared.js";

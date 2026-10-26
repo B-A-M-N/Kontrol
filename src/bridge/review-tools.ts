@@ -5,7 +5,7 @@
  * this capability module owns one semantic slice of the reviewer/worker
  * control-plane API and receives the same typed BridgeConfig context.
  */
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer } from "@modelcontextprotocol/server";
 import type { BridgeConfig } from "./context.js";
 import type { Continuation } from "../continuation.js";
 import type { EventPredicate, EventStoreEvent } from "../event-log.js";

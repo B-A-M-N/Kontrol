@@ -5,9 +5,8 @@
  * dependency object.
  */
 import type { Request, Response } from "express";
-import { getOAuthProtectedResourceMetadataUrl, mcpAuthRouter } from "@modelcontextprotocol/sdk/server/auth/router.js";
-import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
-import { resourceUrlFromServerUrl } from "@modelcontextprotocol/sdk/shared/auth-utils.js";
+import { resourceUrlFromServerUrl } from "@modelcontextprotocol/server";
+import { getOAuthProtectedResourceMetadataUrl, mcpAuthRouter, requireBearerAuth } from "@modelcontextprotocol/server-legacy/auth";
 import type { ServerConfig } from "../config.js";
 import { SingleUserOAuthProvider } from "../oauth-provider.js";
 

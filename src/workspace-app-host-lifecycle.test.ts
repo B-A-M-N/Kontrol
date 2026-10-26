@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { App } from "@modelcontextprotocol/ext-apps";
 import { AppBridge } from "@modelcontextprotocol/ext-apps/app-bridge";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { InMemoryTransport } from "@modelcontextprotocol/server";
 import { cancelReconnect, connectWithRetry, setLifecycleHost } from "./ui/connection-lifecycle.js";
 
 async function connectPair(connectApp = true) {

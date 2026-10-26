@@ -9,8 +9,8 @@
 import { performance } from "node:perf_hooks";
 import { createHash, randomUUID } from "node:crypto";
 import { realpath } from "node:fs/promises";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { ListToolsRequestSchema } from "@modelcontextprotocol/core";
+import { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod/v4";
 import type { ServerConfig } from "../config.js";
 import { assertAllowedPath, expandHomePath } from "../roots.js";
@@ -39,6 +39,7 @@ import { installCachedToolList, installToolListFilter, observeToolListDescriptor
 import {
   evaluateToolCatalogAcknowledgement,
   fingerprintToolCatalog,
+  TOOL_CATALOG_ACK_METHOD,
   TOOL_CATALOG_ACK_CAPABILITY,
   ToolCatalogAcceptedNotificationSchema,
   type ToolCatalogFingerprint,
@@ -233,7 +234,7 @@ export function createMcpServer(
     ? peerAllowedToolNames(connectionContext.peerCapabilities ?? [])
     : undefined;
   const registerTool = server.registerTool.bind(server);
-  server.registerTool = ((name, definition, callback) => {
+  server.registerTool = ((name: string, definition: any, callback: any) => {
     const key = `${toolRegistrationProfile}:${name}`;
     const guardedCallback = peerTools
       ? async (args: unknown, extra: unknown) => {
@@ -253,7 +254,7 @@ export function createMcpServer(
     }, guardedCallback as typeof callback);
   }) as typeof server.registerTool;
 
-  let toolCatalogFingerprint: ToolCatalogFingerprint | undefined;
+  let toolCatalogFingerprint: ToolCatalogFingerprint | undefined = connectionContext?.toolCatalogFingerprint;
   const toolListDescriptorObservation = observeToolListDescriptors(
     server,
     ListToolsRequestSchema,
@@ -335,18 +336,18 @@ export function createMcpServer(
       "Owner-only: enqueue a durable, peer-scoped job for a granted peer to claim over the peer job protocol. "
       + "The target checkout is durably reserved against other worker dispatch until result staging or cancellation. "
       + "instructions is delivered to the peer verbatim (capped at 256 KiB); allowedOutputs declares the RELATIVE path prefixes the peer's result manifest may contain (empty set allows no file outputs; \"*\" is the explicit match-all escape).",
-    inputSchema: {
-      peerId: z.string().min(1).describe("Operator-assigned peer identity from the credential registry."),
-      repositoryId: z.string().min(1).describe("Workspace root for the job; canonicalized against KONTROL_ALLOWED_ROOTS and the peer's grantedRoots."),
-      workspaceSessionId: z.string().min(1).describe("Existing managed-worktree workspace that will receive the peer result."),
-      workSessionId: z.string().min(1).describe("Existing work session bound to workspaceSessionId; peer output will enter its normal review flow."),
-      baseRevision: z.string().min(1).describe("Exact Git SHA recorded as the managed worktree's immutable base."),
-      taskClass: z.enum(["read_only_audit", "propose_patch", "bounded_execution"]),
-      instructions: z.string().min(1).describe("UTF-8 instruction text delivered verbatim to the peer (max 256 KiB)."),
-      allowedOutputs: z.array(z.string().min(1)).min(1).describe("REQUIRED relative path prefixes the result manifest may contain (e.g. [\"out/\"]); [\"*\"] allows everything."),
-      maxRuntimeMs: z.number().int().positive().max(3_600_000).optional().describe("Runtime budget in ms (default 600000, max 3600000)."),
-      maxArtifactBytes: z.number().int().positive().max(16_777_216).optional().describe("Result artifact byte cap (default 1048576, max 16777216)."),
-    },
+    inputSchema: z.object({
+          peerId: z.string().min(1).describe("Operator-assigned peer identity from the credential registry."),
+          repositoryId: z.string().min(1).describe("Workspace root for the job; canonicalized against KONTROL_ALLOWED_ROOTS and the peer's grantedRoots."),
+          workspaceSessionId: z.string().min(1).describe("Existing managed-worktree workspace that will receive the peer result."),
+          workSessionId: z.string().min(1).describe("Existing work session bound to workspaceSessionId; peer output will enter its normal review flow."),
+          baseRevision: z.string().min(1).describe("Exact Git SHA recorded as the managed worktree's immutable base."),
+          taskClass: z.enum(["read_only_audit", "propose_patch", "bounded_execution"]),
+          instructions: z.string().min(1).describe("UTF-8 instruction text delivered verbatim to the peer (max 256 KiB)."),
+          allowedOutputs: z.array(z.string().min(1)).min(1).describe("REQUIRED relative path prefixes the result manifest may contain (e.g. [\"out/\"]); [\"*\"] allows everything."),
+          maxRuntimeMs: z.number().int().positive().max(3_600_000).optional().describe("Runtime budget in ms (default 600000, max 3600000)."),
+          maxArtifactBytes: z.number().int().positive().max(16_777_216).optional().describe("Result artifact byte cap (default 1048576, max 16777216)."),
+        }),
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   }, async (args) => {
     const denied = (text: string) => ({ content: [{ type: "text" as const, text }], isError: true as const });
@@ -609,11 +610,14 @@ export function createMcpServer(
     // a confusing catalog that advertises tools the peer can never call.
     throw new Error("Peer tool catalog could not be restricted; refusing to create an unrestricted peer MCP server.");
   }
-  server.server.setNotificationHandler(ToolCatalogAcceptedNotificationSchema, async (notification) => {
+  server.server.setNotificationHandler(TOOL_CATALOG_ACK_METHOD, {
+    params: ToolCatalogAcceptedNotificationSchema.shape.params,
+  }, async (received) => {
     const expected = toolCatalogFingerprint;
-    const received = notification.params;
     const acceptedAt = new Date().toISOString();
-    const clientExtension = server.server.getClientCapabilities()?.extensions?.[TOOL_CATALOG_ACK_CAPABILITY];
+    const clientCapabilities = connectionContext?.clientCapabilities
+      ?? server.server.getClientCapabilities();
+    const clientExtension = clientCapabilities?.extensions?.[TOOL_CATALOG_ACK_CAPABILITY];
     const clientSupportsExtension = Boolean(
       clientExtension
       && typeof clientExtension === "object"

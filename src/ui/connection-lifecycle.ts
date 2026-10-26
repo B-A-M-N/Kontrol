@@ -100,13 +100,13 @@ function finishConnection(generation: number): boolean {
  * Fence a callback to the App instance that installed it. Replacement and
  * teardown both advance the generation, so a stale SDK callback is ignored.
  */
-export function bindAppInstanceCallback<T extends (...args: never[]) => unknown>(
-  callback: T,
-): (...args: unknown[]) => void {
+export function bindAppInstanceCallback<Args extends unknown[], Result>(
+  callback: (...args: Args) => Result,
+): (...args: Args) => Result {
   const generation = appInstanceGeneration;
-  return (...args: unknown[]) => {
-    if (generation !== appInstanceGeneration) return;
-    (callback as unknown as (...args: unknown[]) => unknown)(...args);
+  return (...args) => {
+    if (generation !== appInstanceGeneration) return undefined as Result;
+    return callback(...args);
   };
 }
 

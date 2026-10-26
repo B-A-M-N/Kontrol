@@ -5,7 +5,7 @@
 import * as z from "zod/v4";
 import { brandWorkSessionId, brandWorkspaceId } from "../../branded.js";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer } from "@modelcontextprotocol/server";
 import type { ServerConfig } from "../../config.js";
 import type { PolicyEngine } from "../../policy.js";
 import type { PolicyEnforcer } from "../../policy-enforcement.js";

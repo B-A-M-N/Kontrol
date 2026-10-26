@@ -5,7 +5,7 @@
  * replies. These tools create durable waiting intent and bind consumption to
  * the authenticated worker's logical run/attempt.
  */
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer } from "@modelcontextprotocol/server";
 import type { BridgeConfig } from "./context.js";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
 import { registerMutationAppTool } from "./app-tool.js";

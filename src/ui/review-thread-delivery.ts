@@ -1,4 +1,4 @@
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import type { CallToolResult } from "@modelcontextprotocol/server";
 import { getStructuredContent } from "./server-tool-call.js";
 import type { ReviewHostAdapter } from "../review-thread/host-adapter.js";
 

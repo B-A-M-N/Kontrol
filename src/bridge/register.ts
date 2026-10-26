@@ -4,7 +4,7 @@
  * single 2,966-line registerBridgeTools closure of the original acp-bridge.ts
  * god module (P0 refactor).
  */
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer } from "@modelcontextprotocol/server";
 import type { BridgeConfig } from "./context.js";
 import { registerSessionTools } from "./session-tools.js";
 import { registerReviewTools } from "./review-tools.js";

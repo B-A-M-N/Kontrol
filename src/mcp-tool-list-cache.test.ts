@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer } from "@modelcontextprotocol/server";
 import type { ZodType } from "zod/v4";
 import {
   installCachedToolList,

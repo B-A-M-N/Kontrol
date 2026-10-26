@@ -7,7 +7,7 @@
  * an explicit host binding installed at boot.
  */
 import type { App } from "@modelcontextprotocol/ext-apps";
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import type { CallToolResult } from "@modelcontextprotocol/server";
 import {
   isAgentRunCard,
   isReviewTool,

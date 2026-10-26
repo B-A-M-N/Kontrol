@@ -18,7 +18,7 @@
  */
 import { randomUUID } from "node:crypto";
 import express, { type Express, type NextFunction, type Request, type Response } from "express";
-import { mcpAuthRouter } from "@modelcontextprotocol/sdk/server/auth/router.js";
+import { mcpAuthRouter } from "@modelcontextprotocol/server-legacy/auth";
 import type { ServerConfig } from "../config.js";
 import { OAUTH_FAILURE_DOMAIN, type SingleUserOAuthProvider } from "../oauth-provider.js";
 import type { DerivedAuth } from "./auth.js";

@@ -7,12 +7,11 @@ import os from "node:os";
 import { join, dirname, relative, resolve, sep } from "node:path";
 import { realpath } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { hostHeaderValidation, localhostHostValidation } from "@modelcontextprotocol/sdk/server/middleware/hostHeaderValidation.js";
-import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { isInitializeRequest, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { checkResourceAllowed, resourceUrlFromServerUrl } from "@modelcontextprotocol/sdk/shared/auth-utils.js";
+import { ListToolsRequestSchema } from "@modelcontextprotocol/core";
+import { NodeStreamableHTTPServerTransport } from "@modelcontextprotocol/node";
+import { requireBearerAuth } from "@modelcontextprotocol/server-legacy/auth";
+import { hostHeaderValidation, localhostHostValidation } from "@modelcontextprotocol/express";
+import { McpServer, isInitializeRequest, checkResourceAllowed, resourceUrlFromServerUrl } from "@modelcontextprotocol/server";
 import {
   registerAppResource,
   registerAppTool,
@@ -703,7 +702,10 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     shuttingDown: () => shuttingDown,
     serveWorkspaceAppResource,
     onScheduledJobCreated: () => scheduledJobRuntimeRef?.wake(),
-    createServerForSession: (connectionContext: ConnectionContext) => createMcpServer(
+    createServerForSession: (
+      connectionContext: ConnectionContext,
+      onToolCatalogHandshake?: Parameters<typeof createMcpServer>[26],
+    ) => createMcpServer(
       config,
       workspaces,
       reviewCheckpoints,
@@ -735,7 +737,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
       recordPhaseTiming,
       scheduledJobs,
       reviewRoutes,
-      (uri) => { /* noop handshake */ },
+      onToolCatalogHandshake ?? ((uri) => { /* noop handshake */ }),
       (jobId) => reconcileScheduledJob?.(jobId) ?? Promise.resolve(undefined),
       qualificationEvidence,
       reviewBrowserController,

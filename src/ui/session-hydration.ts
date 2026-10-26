@@ -32,7 +32,7 @@ import {
 import { callServerToolChecked, getStructuredContent } from "./server-tool-call.js";
 
 import type { App } from "@modelcontextprotocol/ext-apps";
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import type { CallToolResult } from "@modelcontextprotocol/server";
 
 export const WORKSPACE_EVENT_WAIT_MS = 18_000;
 

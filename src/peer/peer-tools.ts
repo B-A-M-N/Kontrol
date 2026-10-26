@@ -9,7 +9,7 @@
  */
 import * as z from "zod/v4";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer } from "@modelcontextprotocol/server";
 import type { ServerConfig } from "../config.js";
 import type { PrincipalRole } from "../policy-enforcement.js";
 import type { PeerJobStore } from "./jobs/store.js";

@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { App } from "@modelcontextprotocol/ext-apps";
 import { AppBridge } from "@modelcontextprotocol/ext-apps/app-bridge";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { InMemoryTransport } from "@modelcontextprotocol/server";
+import type { CallToolResult } from "@modelcontextprotocol/server";
 import { deliverPendingReviewMessages } from "./review-thread-delivery.js";
 import { createMcpAppsReviewHostAdapter } from "../review-thread/host-adapter.js";
 

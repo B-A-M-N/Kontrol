@@ -88,7 +88,78 @@ async function notification(method: string, params: Record<string, unknown>, ses
   });
 }
 
+const modernEnvelope = {
+  "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+  "io.modelcontextprotocol/clientInfo": { name: "catalog-ack-modern-http-test", version: "1.0.0" },
+  "io.modelcontextprotocol/clientCapabilities": {
+    extensions: { [TOOL_CATALOG_ACK_CAPABILITY]: { contractVersion: 1 } },
+  },
+};
+
+async function modernRpc(method: string, params: Record<string, unknown>, id: number): Promise<{ response: Response; payload: any }> {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      accept: "application/json",
+      "mcp-protocol-version": "2026-07-28",
+      "mcp-method": method,
+      ...(typeof params.name === "string" ? { "mcp-name": params.name } : {}),
+      "x-kontrol-tunnel-reviewer": tunnelReviewerSecret,
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id,
+      method,
+      params: { ...params, _meta: modernEnvelope },
+    }),
+  });
+  return { response, payload: response.headers.get("content-type")?.includes("json") ? await response.json() : undefined };
+}
+
+async function modernNotification(method: string, params: Record<string, unknown>): Promise<Response> {
+  return fetch(url, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      accept: "application/json",
+      "mcp-protocol-version": "2026-07-28",
+      "mcp-method": method,
+      "x-kontrol-tunnel-reviewer": tunnelReviewerSecret,
+    },
+    body: JSON.stringify({ jsonrpc: "2.0", method, params: { ...params, _meta: modernEnvelope } }),
+  });
+}
+
 try {
+  const modernList = await modernRpc("tools/list", {}, ++nextId);
+  assert.equal(modernList.response.status, 200, JSON.stringify(modernList.payload));
+  const modernFingerprint = fingerprintToolCatalog(modernList.payload?.result);
+  assert.ok(modernFingerprint, "2026 tools/list catalog must be fingerprintable");
+  const modernServerVersion = modernList.payload?.result?._meta?.["io.modelcontextprotocol/serverInfo"]?.version;
+  assert.equal(typeof modernServerVersion, "string", "2026 responses expose immutable server identity");
+
+  const modernBeforeAck = await modernRpc("tools/call", {
+    name: "open_workspace",
+    arguments: { path: workspaceRoot, mode: "checkout" },
+  }, ++nextId);
+  assert.equal(modernBeforeAck.payload?.error?.code, -32012,
+    "strict mode rejects modern tool calls until the exact catalog is acknowledged");
+  const modernAck = await modernNotification(TOOL_CATALOG_ACK_METHOD, {
+    contractVersion: 1,
+    serverVersion: modernServerVersion,
+    hostCatalogSha256: modernFingerprint.sha256,
+    hostToolCount: modernFingerprint.toolCount,
+  });
+  assert.ok([200, 202].includes(modernAck.status), `modern catalog acknowledgement returned HTTP ${modernAck.status}`);
+  const modernAfterAck = await modernRpc("tools/call", {
+    name: "open_workspace",
+    arguments: { path: workspaceRoot, mode: "checkout" },
+  }, ++nextId);
+  assert.equal(modernAfterAck.response.status, 200, JSON.stringify(modernAfterAck.payload));
+  assert.notEqual(modernAfterAck.payload?.error?.code, -32012,
+    "modern catalog acknowledgement survives the next stateless HTTP request");
+
   const initialized = await rpc("initialize", {
     protocolVersion: "2025-06-18",
     capabilities: { extensions: { [TOOL_CATALOG_ACK_CAPABILITY]: { contractVersion: 1 } } },

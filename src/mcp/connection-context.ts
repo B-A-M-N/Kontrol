@@ -41,6 +41,10 @@ export interface ConnectionContext {
   clientPlatformHint?: string;
   /** Stable trusted identity used only for reconnecting one approval operation. */
   approvalCorrelationId?: string;
+  /** Exact catalog observed for this authenticated modern-protocol client. */
+  toolCatalogFingerprint?: { sha256: string; toolCount: number };
+  /** Client-declared capabilities, used only to validate the catalog handshake. */
+  clientCapabilities?: { extensions?: Record<string, unknown> };
 }
 
 /**

@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { InvalidGrantError, InvalidTokenError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
+import { InvalidGrantError, InvalidTokenError } from "@modelcontextprotocol/server-legacy/auth";
 import { databasePath, openDatabase } from "./db/client.js";
 import { SingleUserOAuthProvider } from "./oauth-provider.js";
 import { DCR_UNUSED_GRACE_SECONDS, MAX_OAUTH_CLIENTS, SqliteOAuthClientsStore, SqliteOAuthStore } from "./oauth-store.js";

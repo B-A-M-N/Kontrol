@@ -6,7 +6,7 @@
  */
 import { randomUUID } from "node:crypto";
 import express, { type Express, type NextFunction, type Request, type Response } from "express";
-import { hostHeaderValidation, localhostHostValidation } from "@modelcontextprotocol/sdk/server/middleware/hostHeaderValidation.js";
+import { hostHeaderValidation, localhostHostValidation } from "@modelcontextprotocol/express";
 import type { ServerConfig } from "../config.js";
 import type { DerivedAuth } from "./auth.js";
 import type { SingleUserOAuthProvider } from "../oauth-provider.js";

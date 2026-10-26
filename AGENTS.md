@@ -406,6 +406,12 @@ Current implementation contracts:
   256 entries. The worker stdio bridge also carries all eight structured
   inspection tools and `poll_process`, while its discovery and call allowlists
   continue to exclude reviewer-only tools.
+- MCP HTTP classifies 2026 per-request traffic separately from the stateful
+  legacy Streamable HTTP session path. Both paths use the same tool
+  registration and authenticated connection-context derivation; legacy GET
+  SSE retains its session and catalog-refresh lifecycle. Modern subscriptions
+  share a process-local event bus and are fenced by HTTP admission until both
+  request execution and response streaming settle.
 - Workspace App resources use content-hashed HTML identities. Retain up to 64
   prior releases for 30 days as lazy immutable references; each historical
   modern URI and `.skybridge.html` alias must return the exact bytes matching

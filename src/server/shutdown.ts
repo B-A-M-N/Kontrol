@@ -6,7 +6,7 @@
  * dependency object.
  */
 import type { Transport } from "../mcp/workspace-server.js";
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer } from "@modelcontextprotocol/server";
 import type { McpSessionState, RunningServer } from "./mcp-session-state.js";
 import type { McpAdmission } from "./mcp-admission.js";
 import type { McpSessionLifecycle } from "./mcp-session-lifecycle.js";

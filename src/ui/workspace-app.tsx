@@ -4,7 +4,7 @@ import {
   applyHostFonts,
   applyHostStyleVariables,
 } from "@modelcontextprotocol/ext-apps";
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import type { CallToolResult } from "@modelcontextprotocol/server";
 import {
   isEditTool,
   isExpandableCard,
@@ -356,6 +356,7 @@ setLifecycleHost({
       disposeAppEventListeners = attachAppEventListeners(replacement);
       replacement.onteardown = bindAppInstanceCallback(async () => {
         await teardownHandlerRef.current?.();
+        return {};
       });
       app = replacement;
     },
@@ -647,7 +648,9 @@ async function bootInternal(): Promise<void> {
     render();
   };
 
-  toolResultHandlerRef.current = handleToolResult;
+  toolResultHandlerRef.current = (result) => {
+    handleToolResult(result as Parameters<NonNullable<App["ontoolresult"]>>[0]);
+  };
 
   const handleHostContext = (ctx: unknown) => {
     hostContext = { ...hostContext, ...(ctx as Record<string, unknown>) };

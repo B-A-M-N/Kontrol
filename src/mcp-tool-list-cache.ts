@@ -5,7 +5,7 @@
  * registration hook is unavailable, tools/list remains uncached and
  * diagnostics explain why catalog verification is unavailable.
  */
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer } from "@modelcontextprotocol/server";
 import type { ZodType } from "zod/v4";
 
 type InternalRequestHandler = (request: unknown, extra: unknown) => Promise<unknown> | unknown;
@@ -77,7 +77,7 @@ function registrationInterceptor(
 ): { finalizeRegistration(): boolean } {
   const metrics = metricsFor(server);
   const protocol = server.server as unknown as {
-    setRequestHandler?: (schema: ZodType, handler: InternalRequestHandler) => void;
+    setRequestHandler?: (...args: unknown[]) => void;
   };
   if (!protocol || typeof protocol.setRequestHandler !== "function") {
     onUnavailable(metrics);
@@ -86,13 +86,28 @@ function registrationInterceptor(
   }
   const originalSetRequestHandler = protocol.setRequestHandler.bind(protocol);
   let listHandlerObserved = false;
-  protocol.setRequestHandler = (schema, originalHandler) => {
-    if (schema !== listToolsSchema) {
-      originalSetRequestHandler(schema, originalHandler);
+  protocol.setRequestHandler = (...args) => {
+    const [methodOrSchema, schemasOrHandler, maybeHandler] = args;
+    const isToolsList = methodOrSchema === "tools/list" || methodOrSchema === listToolsSchema;
+    if (!isToolsList) {
+      originalSetRequestHandler(...args);
+      return;
+    }
+    const originalHandler = (typeof maybeHandler === "function" ? maybeHandler : schemasOrHandler) as InternalRequestHandler;
+    if (typeof originalHandler !== "function") {
+      originalSetRequestHandler(...args);
       return;
     }
     listHandlerObserved = true;
-    originalSetRequestHandler(schema, wrap(originalHandler));
+    if (typeof methodOrSchema === "string") {
+      if (typeof schemasOrHandler === "function") {
+        originalSetRequestHandler(methodOrSchema, wrap(originalHandler));
+      } else {
+        originalSetRequestHandler(methodOrSchema, schemasOrHandler, wrap(originalHandler));
+      }
+    } else {
+      originalSetRequestHandler(methodOrSchema, wrap(originalHandler));
+    }
   };
   return {
     finalizeRegistration() {

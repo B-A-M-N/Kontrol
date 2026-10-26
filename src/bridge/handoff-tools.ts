@@ -5,7 +5,7 @@
  * it can read the packet or return feedback. Possession of a work-session ID is
  * not authorization.
  */
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer } from "@modelcontextprotocol/server";
 import type { BridgeConfig } from "./context.js";
 import { registerMutationAppTool } from "./app-tool.js";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";

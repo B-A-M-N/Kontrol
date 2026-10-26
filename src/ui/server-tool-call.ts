@@ -6,7 +6,7 @@
  * explicit host binding installed at boot.
  */
 import type { App } from "@modelcontextprotocol/ext-apps";
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import type { CallToolResult } from "@modelcontextprotocol/server";
 import type { ToolResultCard } from "./card-types.js";
 import { classifyMcpFailure, isMcpReconnectFailure } from "./mcp-failure.js";
 

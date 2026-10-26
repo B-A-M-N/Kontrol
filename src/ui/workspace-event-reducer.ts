@@ -9,7 +9,7 @@ import { approvalCenterId } from "./approval-center.js";
 import { noteSubmission, workSessionViews } from "./session-views.js";
 import { parsePolicyApprovalOptions } from "./review-feedback.js";
 import type { App } from "@modelcontextprotocol/ext-apps";
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import type { CallToolResult } from "@modelcontextprotocol/server";
 import { workSessionTerminalOutcome } from "../work-session-lifecycle.js";
 import { getStructuredContent } from "./server-tool-call.js";
 import type {

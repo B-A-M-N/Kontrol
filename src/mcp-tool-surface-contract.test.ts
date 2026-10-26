@@ -3,8 +3,7 @@ import { existsSync, mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
 import { createMcpServer } from "./mcp/workspace-server.js";
 import {
   mcpServerVersionFromBuildMeta,
@@ -119,7 +118,7 @@ try {
           hostToolCount: fingerprint.toolCount,
         },
       } as never);
-      assert.equal(observedHandshake?.status, "accepted", `${mode} exact host catalog acknowledgement should be accepted`);
+      assert.equal(observedHandshake?.status, "accepted", `${mode} exact host catalog acknowledgement should be accepted: ${JSON.stringify(observedHandshake)}`);
       assert.equal(observedHandshake?.serverCatalogSha256, fingerprint.sha256);
       await client.notification({
         method: TOOL_CATALOG_ACK_METHOD,

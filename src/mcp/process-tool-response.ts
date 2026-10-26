@@ -19,7 +19,7 @@ export function processResult(snapshot: ProcessSnapshot): string {
   return snapshot.output ? `${snapshot.output.replace(/\n$/, "")}\n${status}` : status;
 }
 
-export function processOutputSchema(): z.ZodRawShape {
+export function processOutputSchema() {
   return resultOutputSchema({
     sessionId: z.string().optional(),
     recoveryCapability: z.string().optional(),

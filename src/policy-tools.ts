@@ -1,6 +1,6 @@
 import * as z from "zod/v4";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer } from "@modelcontextprotocol/server";
 import type { EventStore } from "./event-log.js";
 import type { PolicyEngine } from "./policy.js";
 import type { ApprovalScope } from "./policy.js";

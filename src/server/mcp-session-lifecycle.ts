@@ -10,7 +10,7 @@ import { mcpSessionIdleReason, mcpSessionIdleTtl } from "../mcp-session-policy.j
 import { logEvent, sessionIdPrefix } from "../logger.js";
 import type { ProcessSessionManager } from "../process-sessions.js";
 import type { Transport } from "../mcp/workspace-server.js";
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer } from "@modelcontextprotocol/server";
 import {
   resolveMcpMemoryBudget,
   type McpSessionClientMetrics,

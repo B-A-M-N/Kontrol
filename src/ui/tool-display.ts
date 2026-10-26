@@ -2,7 +2,7 @@
  * Tool-card display mapping (icon/title/label/tone) and plain-text payload
  * fallbacks. Extracted verbatim from ui/workspace-app.tsx (P1.4).
  */
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import type { CallToolResult } from "@modelcontextprotocol/server";
 import {
   isReviewTool,
   isSearchTool,
