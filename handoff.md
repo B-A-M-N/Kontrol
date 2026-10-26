@@ -1,6 +1,6 @@
 # Kontrol multipath ingress — remaining work
 
-Updated: 2026-10-26 (fifth revision)
+Updated: 2026-10-26 (sixth revision)
 Repository: `/home/bamn/devspace`
 Branch: `audit-k02-k04`
 Starting HEAD for this revision: `44c247a` (plus the local commits made
@@ -10,7 +10,10 @@ Preserve untracked `.tmp-scratch/`.
 
 ## Local commits (not pushed)
 
-These seven commits are local only; nothing was pushed.
+These commits are local only; nothing was pushed. The table has one row per
+commit of this change, the last row being the documentation commit itself;
+no count is stated in prose, because every documentation commit would have
+to restate a number that its own commit changes.
 
 | # | Commit | Subject |
 |---|--------|---------|
@@ -20,7 +23,8 @@ These seven commits are local only; nothing was pushed.
 | 4 | `072771a` | `test(chain): execute every test file from the canonical chain` |
 | 5 | `e5a07c8` | `docs: record the contracts, the origin decision and the continuation record` |
 | 6 | `1e983ed` | `docs: correct the round-7 review row and record the round-13 residuals` |
-| 7 | this commit | `docs: map the changed-files table one-to-one onto the change` |
+| 7 | `f6dcfa1` | `docs: map the changed-files table one-to-one onto the change` |
+| 8 | this commit | `docs: state the round-9 tally and cite the final full-chain run` |
 
 Requirement source:
 `/home/bamn/.codex/attachments/458e9b15-a1ec-4247-aa20-19ec878f9be9/pasted-text-1.txt`
@@ -736,7 +740,7 @@ section 12.
 | 6 | `glm-5.3-flash` | approve, 3 P3 | The Hermes runtime-root assertions were source-regex matches rather than behavioral tests; the adapter launcher stderr was bounded but not scrubbed; and a late teardown could re-arm a successor surface. All three closed: the resolver moved to `scripts/lib/hermes-python-runtime.mjs` with a behavioral test, the stderr passes through `scripts/lib/adapter-diagnostics.mjs`, and the clear is fenced to the generation that owned the surface. |
 | 7 | `glm-5.3-flash` | approve, 2 P2, 2 P3 | The runtime-probe failure message still carried raw child stderr into the scheduled-job receipt (closed in section 4), and the upgraded manifest check still proved execution by mention, so a comment or a self-referencing log line would have counted (closed in section 7). Its two P3 findings were accepted as nits at the time and left open in that round; both were closed in later rounds - the shape-recovery scan accepting any boolean host:port map (closed in section 9) and the backoff-timestamp rollback comparison (closed in section 10). |
 | 8 | `glm-5.3-flash` | approve, 1 P2, 3 P3 | The script-name array rule still counted an array that a runner only logs or iterates without executing, so the chain could widen without a suite ever running (closed in section 8); a helper whose name merely sounded like a spawn was accepted as a spawn (closed in section 8); the ingress attribution change carried cosmetic whitespace churn (removed); the source-pattern assertions in the Hermes adapter test were noted and kept, because that file uses that style and the behavioural coverage lives in `src/adapter-diagnostics.test.mjs`. |
-| 9 | `glm-5.3-flash` | changes requested | The check counted a suite path quoted inside a log message as executed (closed in section 9); it counted a path carried as data — an environment value — as executed (closed in section 9); the call graph ignored a spawn helper that lives in an imported local module (closed in section 9); the ingress exposure recovery accepted any boolean HostPort map and so guessed (closed in section 9); the documentation described a per-route rule while the code is per-profile (aligned in section 9); the unspawnable-runner case did not isolate the import rule (closed in section 9). |
+| 9 | `glm-5.3-flash` | changes requested, 7 findings (1 P1, 3 P2, 3 P3) | The clauses below are the outcomes of those findings, not one clause per finding, and the round's own itemized report is not kept in the repository, so the clauses cannot be checked one-for-one against the tally. The check counted a suite path quoted inside a log message as executed (closed in section 9); it counted a path carried as data — an environment value — as executed (closed in section 9); the call graph ignored a spawn helper that lives in an imported local module (closed in section 9); the ingress exposure recovery accepted any boolean HostPort map and so guessed (closed in section 9); the documentation described a per-route rule while the code is per-profile (aligned in section 9); the unspawnable-runner case did not isolate the import rule (closed in section 9). |
 | 10 | `glm-5.3-flash` | changes requested | The check never stripped shell comments from a package.json script body, so a suite named behind a `#` counted as executed (closed in section 10); every token after the interpreter was an executable position, so a flag value that named a suite counted (closed in section 10); an incomplete exposure attribution fell through to the mismatch branch and reported a positive MISMATCH derived from a dropped signal (closed in section 10); an unreadable HostPort key was skipped instead of refused, so shape drift still read as private (closed in section 10); the Hermes adapter carried undeclared, untested `context_transfer` hunks that relaxed a fail-closed continuation gate (reverted in section 10); the dead `firstBoolean()` helper was removed and the uncovered backoff-timestamp restore was asserted (closed in section 10). |
 | 11 | `glm-5.3-flash` | approve, 2 P3 | The manifest guard matched only a double-quoted, single-line import, so four import forms that would ship an undeclared sibling module went unseen (closed in section 11); an interpreter flag outside the hardcoded value-flag set was guessed rather than refused (closed in section 11); the source-pattern assertions in the Hermes adapter test were noted and kept, because that file uses that style and the behavioural coverage lives in `src/adapter-diagnostics.test.mjs`. |
 | 12 | `glm-5.3-flash` | approve, 1 P3 | The two round-11 findings are confirmed closed with the reviewer's own fixtures: the package-manifest scanner finds a single-quoted, multi-line, side-effect, dynamic-with-options and export-from import of an undeclared sibling module, and ignores a commented-out import and a path that is only data; the interpreter-flag rule refuses an unclassified flag, keeps a classified flag value off the program, leaves the program in place after a boolean flag, and treats a python module flag as naming the program (all closed in section 11). The one P3 is the direction the module flag takes - a suite reachable only through one is reported as unexecuted rather than credited - which fails closed and is now stated in the contract. |
@@ -820,8 +824,12 @@ Executed in this pass (all from the repository root):
 - `npm test` - the full canonical chain, run in an isolated tree that holds
   `HEAD` plus exactly this 34-file change (no other working-tree edit is
   present in it), so the result is not contaminated by concurrent work in
-  the shared checkout. `EXIT=0`; the run log is
-  `.tmp-scratch/test-npm-test-r13.log` (a local artifact, not committed).
+  the shared checkout. `EXIT=0` on every run. The final run is against an
+  isolated tree whose tracked files are exactly the committed state:
+  `.tmp-scratch/test-npm-test-r15.log`. The two earlier runs are
+  `.tmp-scratch/test-npm-test-r13.log` and
+  `.tmp-scratch/test-npm-test-r14.log`. The logs are local artifacts, not
+  committed.
 - `node --import tsx scripts/scheduled-readonly-adapters-e2e.mjs` — CRUSH and
   Hermes both dispatched and stayed confined.
 - `KONTROL_CADDY_BIN=/tmp/caddy npm run qualify:ingress` — 12 pass,
