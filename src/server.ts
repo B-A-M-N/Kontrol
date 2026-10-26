@@ -478,6 +478,12 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     releasedSupervisorLeases: 0,
     reconciledWorkSessions: 0,
     markedStaleWorkSessions: 0,
+    recoveryWork: {
+      examinedRows: 0,
+      modifiedRows: 0,
+      totalDurationMs: 0,
+      longestSynchronousSliceMs: 0,
+    },
   };
   startupRecovery.releasedSupervisorLeases = supervisorRuns.releaseExpiredClaims();
   const startupReconciliation = createStartupReconciliation({

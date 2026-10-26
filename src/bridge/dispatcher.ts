@@ -103,27 +103,22 @@ export async function runContinuationTick(
     });
   };
   const claimOf = (event: DispatchOutboxEvent): OutboxClaim => ({ eventId: event.id, claimOwner: event.claimedBy ?? "", claimToken: event.claimToken ?? "" });
-  const latestHandoff = (sessionId: string) => config.eventStore.getEventsForSession(sessionId)
-    .filter((event) => event.type === "session.handoff")
-    .at(-1);
+  const latestHandoff = (sessionId: string) => config.eventStore.getLatestEventForSession(sessionId, "session.handoff");
   const handoffState = (sessionId: string, transferId: unknown): string | undefined => {
     if (typeof transferId !== "string") return undefined;
-    const event = config.eventStore.getEventsForSession(sessionId)
-      .filter((candidate) => candidate.type === "session.handoff.state")
-      .reverse()
-      .find((candidate) => (candidate.payload as { transferId?: unknown }).transferId === transferId);
+    const event = config.eventStore.getLatestEventForSession(sessionId, "session.handoff.state", { field: "transferId", value: transferId });
     const state = (event?.payload as { state?: unknown } | undefined)?.state;
     return typeof state === "string" ? state : undefined;
   };
-  const handoffForRun = (sessionId: string, runId: string) => config.eventStore.getEventsForSession(sessionId)
-    .filter((event) => event.type === "session.handoff")
-    .reverse()
-    .find((event) => (event.payload as Record<string, unknown>).runId === runId);
+  const handoffForRun = (sessionId: string, runId: string) => config.eventStore.getLatestEventForSession(
+    sessionId, "session.handoff", { field: "runId", value: runId },
+  );
   const recordHandoffState = (sessionId: string, handoff: NonNullable<ReturnType<typeof latestHandoff>>, state: string, detail?: string) => {
     const payload = handoff.payload as Record<string, unknown>;
-    const lastState = config.eventStore.getEventsForSession(sessionId)
-      .filter((event) => event.type === "session.handoff.state")
-      .at(-1)?.payload as Record<string, unknown> | undefined;
+    const lastState = config.eventStore.getLatestEventForSession(sessionId, "session.handoff.state", {
+      field: "transferId",
+      value: String(payload.transferId ?? ""),
+    })?.payload as Record<string, unknown> | undefined;
     if (lastState?.transferId === payload.transferId && lastState?.state === state && lastState?.detail === detail) return;
     config.eventStore.appendEvent({
       type: "session.handoff.state",
@@ -199,10 +194,11 @@ export async function runContinuationTick(
       recordHandoffState(continuation.sessionId, handoff, "destination_ready");
       recordHandoffState(continuation.sessionId, handoff, "committed");
       const transferId = handoffPayload.transferId;
-      const latestTransferContext = config.eventStore.getEventsForSession(continuation.sessionId)
-        .filter((event) => event.type === "session.handoff.context")
-        .reverse()
-        .find((event) => (event.payload as { transferId?: unknown }).transferId === transferId);
+      const latestTransferContext = config.eventStore.getLatestEventForSession(
+        continuation.sessionId,
+        "session.handoff.context",
+        { field: "transferId", value: String(transferId) },
+      );
       markTransferredFeedbackConsumed(
         continuation.sessionId,
         (latestTransferContext?.payload as { contextTransferPacket?: unknown } | undefined)?.contextTransferPacket
@@ -732,8 +728,16 @@ export async function runContinuationTick(
     for (const cont of config.continuationManager.listPending()) {
       await dispatchContinuation(cont);
     }
-  } catch {
-    // Swallow; next drain retries unclaimed continuations.
+  } catch (error) {
+    // The next bounded tick retries durable, still-pending work. Report only a
+    // stable category here: adapter messages can contain host paths or other
+    // request data and do not belong in startup/dispatcher diagnostics.
+    const reason = error instanceof Error ? error.message : "";
+    const category = /SQLITE_BUSY|database is locked/i.test(reason) ? "database_busy"
+      : /ECONNREFUSED|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|socket hang up/i.test(reason) ? "transport_unavailable"
+        : /timed? ?out|deadline/i.test(reason) ? "timeout"
+          : "unexpected";
+    console.warn(`[kontrol] continuation dispatcher tick failed (${category}); pending work remains retryable`);
   }
 }
 

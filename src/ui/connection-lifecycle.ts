@@ -52,6 +52,12 @@ export function setLifecycleHost(next: LifecycleHost): void {
   host = next;
 }
 
+function recordHostConnectDuration(startedAt: number): void {
+  if (typeof performance === "undefined" || typeof performance.measure !== "function") return;
+  performance.clearMeasures("kontrol.host_connect_ms");
+  performance.measure("kontrol.host_connect_ms", { start: startedAt, end: performance.now() });
+}
+
 /** Advance fencing when an App instance is replaced without a teardown. */
 export function advanceAppInstanceGeneration(): number {
   appInstanceGeneration += 1;
@@ -125,7 +131,9 @@ async function connectBootstrapOwner(): Promise<void> {
     host.setConnectionState(attempt === 0 ? "CONNECTING" : "RECONNECTING");
     host.scheduleRender();
     try {
+      const connectStartedAt = performance.now();
       await host.connectApp();
+      recordHostConnectDuration(connectStartedAt);
       if (finishConnection(generation)) return;
       break;
     } catch (error) {
@@ -157,7 +165,9 @@ export async function connectWithRetry(reason?: unknown): Promise<void> {
     host.setConnectionState(retryDelayMs === 1_000 && !reason ? "CONNECTING" : "RECONNECTING");
     host.scheduleRender();
     try {
+      const connectStartedAt = performance.now();
       await host.connectApp();
+      recordHostConnectDuration(connectStartedAt);
       if (finishConnection(generation)) return;
       break;
     } catch (connectErrorValue) {

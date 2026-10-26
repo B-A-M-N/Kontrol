@@ -34,6 +34,49 @@ try {
   assert.equal("segments" in durable[0].payload, false, "coalesced telemetry does not duplicate text in segments");
   assert.equal(durable[1].type, "agent.run.started");
   assert.ok(durable[1].seq > durable[0].seq);
+  events.appendEvent({
+    type: "session.handoff",
+    sessionId: "session-handoff-index",
+    payload: { runId: "run-old", transferId: "transfer-old" },
+  });
+  events.appendEvent({
+    type: "session.handoff",
+    sessionId: "session-handoff-index",
+    payload: { runId: "run-new", transferId: "transfer-new" },
+  });
+  events.appendEvent({
+    type: "session.handoff.state",
+    sessionId: "session-handoff-index",
+    payload: { transferId: "transfer-old", state: "blocked" },
+  });
+  events.appendEvent({
+    type: "session.handoff.state",
+    sessionId: "session-handoff-index",
+    payload: { transferId: "transfer-new", state: "committed" },
+  });
+  assert.equal(events.getLatestEventForSession("session-handoff-index", "session.handoff")?.payload.runId, "run-new",
+    "latest typed event lookup returns one newest event without decoding session history");
+  assert.equal(events.getLatestEventForSession("session-handoff-index", "session.handoff", { field: "runId", value: "run-old" })?.payload.transferId,
+    "transfer-old", "handoff lookup can bind the newest matching run identity");
+  assert.equal(events.getLatestEventForSession("session-handoff-index", "session.handoff.state", { field: "transferId", value: "transfer-old" })?.payload.state,
+    "blocked", "handoff state lookup is scoped to the exact transfer");
+  const handoffLookupPlan = database.sqlite.prepare(`explain query plan select id, seq, type, session_id,
+    workspace_session_id, payload, created_at from event_log where session_id = 'session-handoff-index'
+    and type = 'session.handoff.state' and (null is null or json_extract(payload, '$.transferId') = 'transfer-old')
+    order by seq desc limit 1`).all() as Array<{ detail: string }>;
+  assert.ok(handoffLookupPlan.some((row) => row.detail.includes("event_log_session_type_seq_idx")),
+    "handoff recovery lookup uses the bounded session/type/sequence index");
+  const insertHistory = database.sqlite.prepare(`insert into event_log
+    (id, type, session_id, workspace_session_id, payload, created_at)
+    values (?, ?, 'session-handoff-index', null, '{}', '2026')`);
+  const insertHistoryBatch = database.sqlite.transaction(() => {
+    for (let index = 0; index < 2_000; index += 1) {
+      insertHistory.run(`history-${index}`, index % 2 ? "agent.run.output_delta" : "agent.run.completed");
+    }
+  });
+  insertHistoryBatch();
+  assert.equal(events.getLatestEventForSession("session-handoff-index", "session.handoff")?.payload.runId, "run-new",
+    "indexed handoff lookup remains correct with thousands of unrelated lifecycle and telemetry events");
   assert.ok(timingPhases.includes("sqlite.commit"), "event-store writes expose commit timing");
   assert.ok(timingPhases.includes("agent.time_to_first_event"), "first agent event timing is recorded");
   assert.ok(timingPhases.includes("agent.event_interval"), "agent event intervals are recorded");

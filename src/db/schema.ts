@@ -569,6 +569,9 @@ export const policyApprovalGrants = sqliteTable("policy_approval_grants", {
   index("policy_approval_grants_principal_idx").on(
     table.principalId, table.scope, table.scopeId, table.approvalKey,
   ),
+  index("policy_approval_grants_terminal_recovery_idx").on(
+    table.scope, table.revokedAt, table.scopeId, table.expiresAt,
+  ),
 ]);
 
 export type PolicyApprovalRequestRow = typeof policyApprovalRequests.$inferSelect;
@@ -921,6 +924,7 @@ export const agentMessageReplies = sqliteTable("agent_message_replies", {
 }, (table) => [
   uniqueIndex("agent_message_replies_message_revision_unique").on(table.messageId, table.replyRevision),
   index("agent_message_replies_session_idx").on(table.workSessionId, table.status),
+  index("agent_message_replies_delivery_recovery_idx").on(table.status, table.createdAt, table.id),
 ]);
 
 /** Durable worker waiting intent for a clarification reply (cold-start resumption). */
@@ -998,6 +1002,8 @@ export const reviewHandoffs = sqliteTable("review_handoffs", {
 }, (table) => [
   index("review_handoffs_session_submission_idx").on(table.workSessionId, table.submissionId),
   index("review_handoffs_status_idx").on(table.status, table.createdAt),
+  index("review_handoffs_recovery_idx").on(table.id)
+    .where(sql`${table.status} not in ('closed', 'feedback_committed')`),
   uniqueIndex("review_handoffs_submission_active_unique").on(table.submissionId, table.reviewEpoch),
 ]);
 

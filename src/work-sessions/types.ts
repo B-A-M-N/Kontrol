@@ -174,6 +174,7 @@ export interface WorkspaceSessionSurfaceCursor {
 }
 
 export interface RuntimeReconciliationPage {
+  examined?: number;
   reconciled: number;
   markedStale: number;
   nextAfterId?: string;

@@ -32,6 +32,20 @@ export interface StartupRecoveryCounters {
   releasedSupervisorLeases: number;
   reconciledWorkSessions: number;
   markedStaleWorkSessions: number;
+  recoveryWork: {
+    examinedRows: number;
+    modifiedRows: number;
+    totalDurationMs: number;
+    longestSynchronousSliceMs: number;
+  };
+}
+
+function recordRecoverySlice(counters: StartupRecoveryCounters, startedAt: number, examined: number, modified: number): void {
+  const durationMs = Math.max(0, performance.now() - startedAt);
+  counters.recoveryWork.examinedRows += examined;
+  counters.recoveryWork.modifiedRows += modified;
+  counters.recoveryWork.totalDurationMs += durationMs;
+  counters.recoveryWork.longestSynchronousSliceMs = Math.max(counters.recoveryWork.longestSynchronousSliceMs, durationMs);
 }
 
 export interface StartupRecoveryDeps {
@@ -54,7 +68,7 @@ export interface StartupRecoveryHandles {
   stop(): void;
 }
 
-export function reconcileReplyDeliveryPage(db: DatabaseHandle, after?: { createdAt: string; id: string }, limit = 100): { reconciled: number; next?: { createdAt: string; id: string } } {
+export function reconcileReplyDeliveryPage(db: DatabaseHandle, after?: { createdAt: string; id: string }, limit = 100): { examined: number; reconciled: number; next?: { createdAt: string; id: string } } {
   const page = db.sqlite.prepare(`select id, created_at from agent_message_replies
     where status = 'delivering'
       and (? is null or created_at > ? or (created_at = ? and id > ?))
@@ -62,13 +76,20 @@ export function reconcileReplyDeliveryPage(db: DatabaseHandle, after?: { created
       after?.createdAt ?? null, after?.id ?? null, limit) as Array<{ id: string; created_at: string }>;
   for (const reply of page) db.sqlite.prepare("update agent_message_replies set status = 'awaiting_acknowledgement' where id = ? and status = 'delivering'").run(reply.id);
   const last = page.at(-1);
-  return { reconciled: page.length, ...(page.length === limit && last ? { next: { createdAt: last.created_at, id: last.id } } : {}) };
+  return {
+    reconciled: page.length,
+    examined: page.length,
+    ...(page.length === limit && last ? { next: { createdAt: last.created_at, id: last.id } } : {}),
+  };
 }
 
-export function reconcileReviewHandoffPage(db: DatabaseHandle, afterId?: string, limit = 100): { reconciled: number; nextAfterId?: string } {
+export function reconcileReviewHandoffPage(db: DatabaseHandle, afterId?: string, limit = 100): { examined: number; reconciled: number; nextAfterId?: string } {
   const rows = db.sqlite.prepare(`select h.id, ws.status as work_session_status
       from review_handoffs h left join work_sessions ws on ws.id = h.work_session_id
-      where (? is null or h.id > ?) order by h.id limit ?`)
+      where h.status not in ('closed', 'feedback_committed')
+        and (ws.id is null or ws.status in ('approved', 'rejected', 'cancelled', 'failed', 'failed_protocol'))
+        and (? is null or h.id > ?)
+      order by h.id limit ?`)
     .all(afterId ?? null, afterId ?? null, limit) as Array<{ id: string; work_session_status: string | null }>;
   let reconciled = 0;
   for (const row of rows) {
@@ -78,7 +99,34 @@ export function reconcileReviewHandoffPage(db: DatabaseHandle, afterId?: string,
       .run(new Date().toISOString(), row.id).changes;
   }
   const last = rows.at(-1);
-  return { reconciled, ...(rows.length === limit && last ? { nextAfterId: last.id } : {}) };
+  return { examined: rows.length, reconciled, ...(rows.length === limit && last ? { nextAfterId: last.id } : {}) };
+}
+
+export function reconcileTerminalGrantPage(
+  db: DatabaseHandle,
+  policyEngine: Pick<PolicyEngine, "revokeScope">,
+  afterId?: string,
+  limit = 100,
+): { examined: number; reconciled: number; nextAfterId?: string } {
+  const grantScopes = db.sqlite.prepare(`
+    select distinct g.scope_id as id
+    from policy_approval_grants g
+    left join work_sessions ws on ws.id = g.scope_id
+    where g.scope = 'work_session'
+      and g.revoked_at is null
+      and (g.expires_at is null or g.expires_at > ?)
+      and (ws.id is null or ws.status in ('approved', 'rejected', 'cancelled', 'failed', 'failed_protocol'))
+      and (? is null or g.scope_id > ?)
+    order by g.scope_id
+    limit ?
+  `).all(new Date().toISOString(), afterId ?? null, afterId ?? null, limit) as Array<{ id: string }>;
+  for (const row of grantScopes) policyEngine.revokeScope("work_session", row.id);
+  const last = grantScopes.at(-1);
+  return {
+    examined: grantScopes.length,
+    reconciled: grantScopes.length,
+    ...(grantScopes.length === limit && last ? { nextAfterId: last.id } : {}),
+  };
 }
 
 export function createStartupReconciliation(deps: StartupRecoveryDeps): StartupRecoveryHandles {
@@ -99,6 +147,7 @@ export function createStartupReconciliation(deps: StartupRecoveryDeps): StartupR
   // makes the recovery count reflect actual rows changed at startup.
   const expireStartupApprovalPage = (): void => {
     if (startupRecoveryStopped) return;
+    const pageStartedAt = performance.now();
     const expired = approvalRequests.expirePending(undefined, 100);
     for (const approval of expired) {
       const session = approval.workSessionId ? workSessions.get(approval.workSessionId) : undefined;
@@ -111,6 +160,7 @@ export function createStartupReconciliation(deps: StartupRecoveryDeps): StartupR
         }, { publish: false });
       }
     }
+    recordRecoverySlice(startupRecovery, pageStartedAt, expired.length, expired.length);
     if (expired.length === 100) setImmediate(expireStartupApprovalPage);
   };
   expireStartupApprovalPage();
@@ -120,13 +170,16 @@ export function createStartupReconciliation(deps: StartupRecoveryDeps): StartupR
   // log so recovery is inspectable rather than silently mutating state.
   const reconcileWorkSessionApprovalPage = (before?: { createdAt: string; id: string }): void => {
     if (startupRecoveryStopped) return;
+    const pageStartedAt = performance.now();
     const page = approvalRequests.listPendingPage(undefined, 100, before, "work_session");
+    let modified = 0;
     for (const approval of page.requests) {
       const session = approval.workSessionId ? workSessions.get(approval.workSessionId) : undefined;
       const orphaned = Boolean(approval.workSessionId && (!session || terminalWorkSessionStatuses.has(session.status)));
       if (!orphaned) continue;
       const status = "cancelled" as const;
       approvalRequests.resolve(approval.approvalId, { status, reason: "startup_reconciliation: referenced work session is terminal or missing", reviewerId: "kontrol-startup" });
+      modified += 1;
       startupRecovery.cancelledApprovals++;
       if (session) {
         eventStore.appendEvent({
@@ -136,6 +189,7 @@ export function createStartupReconciliation(deps: StartupRecoveryDeps): StartupR
         }, { publish: false });
       }
     }
+    recordRecoverySlice(startupRecovery, pageStartedAt, page.requests.length, modified);
     if (page.hasMore) setImmediate(() => reconcileWorkSessionApprovalPage(page.nextBefore));
   };
   reconcileWorkSessionApprovalPage();
@@ -146,6 +200,7 @@ export function createStartupReconciliation(deps: StartupRecoveryDeps): StartupR
   // serve requests.
   const reconcileContinuationPage = (afterId?: string): void => {
     if (startupRecoveryStopped) return;
+    const pageStartedAt = performance.now();
     const continuationRows = db.sqlite.prepare(`
       select c.id, c.session_id as sessionId, c.status, ws.status as workSessionStatus
       from continuations c
@@ -155,10 +210,12 @@ export function createStartupReconciliation(deps: StartupRecoveryDeps): StartupR
       order by c.id
       limit ?
     `).all(afterId ?? null, afterId ?? null, 100) as Array<{ id: string; sessionId: string; status: string; workSessionStatus?: string | null }>;
+    let modified = 0;
     for (const continuation of continuationRows) {
       if (continuation.workSessionStatus && !terminalWorkSessionStatuses.has(continuation.workSessionStatus)) continue;
       if (!continuationManager.supersede(continuation.id, "startup_reconciliation: referenced work session is terminal or missing")) continue;
       startupRecovery.supersededContinuations++;
+      modified += 1;
       if (continuation.workSessionStatus) {
         eventStore.appendEvent({
           type: "recovery.continuation.superseded",
@@ -167,6 +224,7 @@ export function createStartupReconciliation(deps: StartupRecoveryDeps): StartupR
         }, { publish: false });
       }
     }
+    recordRecoverySlice(startupRecovery, pageStartedAt, continuationRows.length, modified);
     if (continuationRows.length === 100) {
       const nextAfterId = continuationRows[continuationRows.length - 1]?.id;
       if (nextAfterId) setImmediate(() => reconcileContinuationPage(nextAfterId));
@@ -178,10 +236,12 @@ export function createStartupReconciliation(deps: StartupRecoveryDeps): StartupR
   // arbitrarily large remainder to the next five-minute maintenance tick.
   const reconcileRuntimeStatePage = (afterId?: string): void => {
     if (startupRecoveryStopped) return;
+    const pageStartedAt = performance.now();
     const page = workSessions.reconcileRuntimeStates(afterId, 100);
     maintenance.resumeRuntimeReconciliationFrom(page.hasMore ? page.nextAfterId : undefined);
     startupRecovery.reconciledWorkSessions += page.reconciled;
     startupRecovery.markedStaleWorkSessions += page.markedStale;
+    recordRecoverySlice(startupRecovery, pageStartedAt, page.examined ?? page.reconciled + page.markedStale, page.reconciled + page.markedStale);
     if (page.hasMore && page.nextAfterId) {
       setImmediate(() => reconcileRuntimeStatePage(page.nextAfterId));
     }
@@ -197,7 +257,9 @@ export function createStartupReconciliation(deps: StartupRecoveryDeps): StartupR
   // instead of making an already dispatched reply eligible for another send.
   const reconcileReplyPage = (after?: { createdAt: string; id: string }): void => {
     if (startupRecoveryStopped) return;
+    const pageStartedAt = performance.now();
     const page = reconcileReplyDeliveryPage(db, after);
+    recordRecoverySlice(startupRecovery, pageStartedAt, page.examined, page.reconciled);
     if (page.next) setImmediate(() => reconcileReplyPage(page.next));
   };
   reconcileReplyPage();
@@ -206,25 +268,20 @@ export function createStartupReconciliation(deps: StartupRecoveryDeps): StartupR
   // and queued isolated handoffs remain awaiting attachment.
   const reconcileHandoffPage = (afterId?: string): void => {
     if (startupRecoveryStopped) return;
+    const pageStartedAt = performance.now();
     const page = reconcileReviewHandoffPage(db, afterId);
+    recordRecoverySlice(startupRecovery, pageStartedAt, page.examined, page.reconciled);
     if (page.nextAfterId) setImmediate(() => reconcileHandoffPage(page.nextAfterId));
   };
   reconcileHandoffPage();
 
-  const reconcileTerminalGrantPage = (policyEngine: PolicyEngine, afterId?: string): void => {
+  const reconcileTerminalGrantBatch = (policyEngine: PolicyEngine, afterId?: string): void => {
     if (startupRecoveryStopped) return;
-    const terminalIds = db.sqlite.prepare(`
-      select id
-      from work_sessions
-      where status in ('approved', 'rejected', 'cancelled', 'failed', 'failed_protocol')
-        and (? is null or id > ?)
-      order by id
-      limit ?
-    `).all(afterId ?? null, afterId ?? null, 100) as Array<{ id: string }>;
-    for (const session of terminalIds) policyEngine.revokeScope("work_session", session.id);
-    if (terminalIds.length === 100) {
-      const nextAfterId = terminalIds[terminalIds.length - 1]?.id;
-      if (nextAfterId) setImmediate(() => reconcileTerminalGrantPage(policyEngine, nextAfterId));
+    const pageStartedAt = performance.now();
+    const page = reconcileTerminalGrantPage(db, policyEngine, afterId, 100);
+    recordRecoverySlice(startupRecovery, pageStartedAt, page.examined, page.reconciled);
+    if (page.nextAfterId) {
+      setImmediate(() => reconcileTerminalGrantBatch(policyEngine, page.nextAfterId));
     }
   };
   return {
@@ -232,7 +289,7 @@ export function createStartupReconciliation(deps: StartupRecoveryDeps): StartupR
     databaseIntegrity,
     terminalWorkSessionStatuses,
     reconcileTerminalGrants(policyEngine) {
-      reconcileTerminalGrantPage(policyEngine);
+      reconcileTerminalGrantBatch(policyEngine);
     },
     stop(): void {
       startupRecoveryStopped = true;

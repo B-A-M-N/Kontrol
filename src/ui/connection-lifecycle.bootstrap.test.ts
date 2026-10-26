@@ -61,6 +61,8 @@ assert.equal(succeedsOnRetry.connected, true);
 assert.equal(succeedsOnRetry.state, "CONNECTED");
 assert.equal(succeedsOnRetry.connectionError, null);
 assert.equal(succeedsOnRetry.rehydrationCount, 1);
+assert.ok(performance.getEntriesByName("kontrol.host_connect_ms").length > 0,
+  "host connection latency is recorded for startup diagnosis");
 
 let transportAttached = true;
 let reconnectConnectAttempts = 0;

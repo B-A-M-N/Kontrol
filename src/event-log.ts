@@ -71,6 +71,13 @@ export interface EventStore {
 
  getEventsForSession(sessionId: string): EventStoreEvent[];
 
+ /** Fetch one newest event without decoding an entire session history. */
+ getLatestEventForSession(
+   sessionId: string,
+   type: string,
+   payloadMatch?: { field: "transferId" | "runId"; value: string },
+ ): EventStoreEvent | undefined;
+
  /** Exact adapter event lookup for idempotent retry handling. */
  getEventById(eventId: string): EventStoreEvent | undefined;
 
@@ -712,6 +719,47 @@ export function createEventStore(
     }));
   }
 
+  function getLatestEventForSession(
+    sessionId: string,
+    type: string,
+    payloadMatch?: { field: "transferId" | "runId"; value: string },
+  ): EventStoreEvent | undefined {
+    const row = database.sqlite.prepare(`
+      select id, seq, type, session_id, workspace_session_id, payload, created_at
+      from event_log
+      where session_id = ? and type = ?
+        and (? is null or json_extract(payload, ?) = ?)
+      order by seq desc
+      limit 1
+    `).get(
+      sessionId,
+      type,
+      payloadMatch?.value ?? null,
+      payloadMatch ? `$.${payloadMatch.field}` : null,
+      payloadMatch?.value ?? null,
+    ) as {
+      id: string;
+      seq: number;
+      type: string;
+      session_id: string;
+      workspace_session_id?: string | null;
+      payload: string;
+      created_at: string;
+    } | undefined;
+    if (!row) return undefined;
+    return {
+      id: row.id,
+      seq: row.seq,
+      durable: true,
+      type: row.type,
+      sessionId: row.session_id,
+      workspaceSessionId: row.workspace_session_id ?? undefined,
+      workspaceProjectId: projectIdForWorkspaceSession(row.workspace_session_id ?? undefined),
+      payload: JSON.parse(row.payload) as Record<string, unknown>,
+      createdAt: row.created_at,
+    };
+  }
+
   function getEventsAfter(sessionId: string, afterSeq: number, limit = 500): EventStoreEvent[] {
     const rows = database.sqlite
       .prepare(
@@ -1168,6 +1216,7 @@ export function createEventStore(
       for (const event of events) publish(event);
     },
     getEventsForSession,
+    getLatestEventForSession,
     getEventById,
     getEventsAfter,
     getWorkspaceEventsAfter,

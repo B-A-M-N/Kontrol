@@ -36,6 +36,18 @@ import type { CallToolResult } from "@modelcontextprotocol/server";
 
 export const WORKSPACE_EVENT_WAIT_MS = 18_000;
 
+function recordStartupDuration(name: string, startedAt: number): void {
+  if (typeof performance === "undefined" || typeof performance.measure !== "function") return;
+  const metric = `kontrol.${name}`;
+  performance.clearMeasures(metric);
+  performance.measure(metric, { start: startedAt, end: performance.now() });
+}
+
+async function afterRenderedFrame(): Promise<void> {
+  if (typeof requestAnimationFrame !== "function") return;
+  await new Promise<void>((resolveFrame) => requestAnimationFrame(() => resolveFrame()));
+}
+
 export interface HydrationHost {
   getApp(): App | null;
   scheduleRender(): void;
@@ -148,6 +160,7 @@ const snapshotHydrations = new Map<string, Promise<void>>();
 
 export async function rehydrateActiveSessions(): Promise<void> {
   if (!host.getApp()) return;
+  const hydrationStartedAt = performance.now();
   // P0 #2: scoped rehydration. Only rehydrate sessions within the current
   // workspace. Never globally auto-rehydrate before the workspace is known.
   // P0 #1: use server-side snapshot + resume from lastSeq instead of replaying
@@ -157,15 +170,58 @@ export async function rehydrateActiveSessions(): Promise<void> {
 
   try {
     const pagedSessions = new Map<string, WorkspaceSurfaceSession>();
-    // Establish one authoritative watermark before paginating. A later page
-    // must never advance the cursor merely because it was read later; events
-    // committed after this boundary are replayed below by sequence.
+    // Fetch and paint the newest session page first. Its fixed watermark fences
+    // later pages and the event catch-up query so concurrent events remain
+    // replayable while live and pending surfaces hydrate.
     let snapshotWatermark: number | undefined;
     const boundaryResult = await callServerToolChecked({
       name: "get_workspace_session_surface",
-      arguments: { workspaceId, filter: "all", limit: 1 },
+      arguments: { workspaceId, filter: "all", limit: 25 },
     });
-    snapshotWatermark = getStructuredContent<{ lastSeq?: number }>(boundaryResult)?.lastSeq ?? 0;
+    const recentSurface = getStructuredContent<{ lastSeq?: number; sessions?: WorkspaceSurfaceSession[] }>(boundaryResult);
+    snapshotWatermark = recentSurface?.lastSeq ?? 0;
+    for (const session of recentSurface?.sessions ?? []) pagedSessions.set(session.sessionId, session);
+    recordStartupDuration("surface_first_page_ms", hydrationStartedAt);
+    for (const session of recentSurface?.sessions ?? []) {
+      const view = ensureWorkSessionView(session.sessionId, session.workspaceSessionId, session.runId ?? "");
+      view.status = session.status;
+      view.title = session.title;
+      view.submittedBy = session.submittedBy;
+      view.updatedAt = session.updatedAt;
+      view.lastHeartbeatAt = session.lastHeartbeatAt;
+      view.lifecycle = session.lifecycle;
+      view.runtimeState = session.runtimeState;
+      view.unresolvedMessageCount = session.unresolvedMessageCount;
+      view.pendingApprovalCount = session.pendingApprovalCount;
+      view.lastSeq = Math.max(view.lastSeq, session.lastSeq);
+      view.latestFeedback = session.latestFeedback;
+      if (session.latestSubmission) {
+        noteSubmission(view, {
+          submissionId: session.latestSubmission.submissionId,
+          sessionId: session.sessionId,
+          submissionNumber: session.latestSubmission.submissionNumber,
+          reviewEpoch: session.latestSubmission.reviewEpoch,
+          diffSha256: session.latestSubmission.diffSha256,
+          status: session.latestSubmission.status,
+          files: [],
+          patch: "",
+          fileCount: 0,
+          additions: session.latestSubmission.additions,
+          removals: session.latestSubmission.removals,
+        });
+      }
+    }
+    const newestRecent = [...(recentSurface?.sessions ?? [])]
+      .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt))[0];
+    const recentSelection = host.getSelectedWorkSessionId();
+    if (newestRecent && (!recentSelection
+      || workSessionViews.get(recentSelection)?.workspaceSessionId !== workspaceId
+      || isApprovalCenterId(recentSelection))) {
+      host.setSelectedWorkSessionId(newestRecent.sessionId);
+    }
+    host.scheduleRender();
+    await afterRenderedFrame();
+    recordStartupDuration("first_useful_paint_ms", hydrationStartedAt);
     const loadSurface = async (filter: "all" | "pending_review" | "live", pageSize: number, maxPages: number): Promise<void> => {
       let afterUpdatedAt: string | undefined;
       let afterSessionId: string | undefined;
@@ -198,9 +254,10 @@ export async function rehydrateActiveSessions(): Promise<void> {
     // tens of thousands of views; the cap is far above any real concurrent
     // control-plane surface and exposes "older available" via truncation.
     const HYDRATION_MAX_SESSIONS = 500;
-    await loadSurface("live", 50, HYDRATION_MAX_SESSIONS / 50);
-    await loadSurface("pending_review", 50, HYDRATION_MAX_SESSIONS / 50);
-    await loadSurface("all", 25, 1);
+    await Promise.all([
+      loadSurface("live", 50, HYDRATION_MAX_SESSIONS / 50),
+      loadSurface("pending_review", 50, HYDRATION_MAX_SESSIONS / 50),
+    ]);
     if (!host.getApp() || host.getActiveWorkspaceId() !== workspaceId) return;
     const replayWatermark = snapshotWatermark ?? 0;
     let replaySeq = replayWatermark;
@@ -209,7 +266,7 @@ export async function rehydrateActiveSessions(): Promise<void> {
       // during the page walk is returned even when it was not in any page.
       const replayResult = await callServerToolChecked({
         name: "await_workspace_events",
-        arguments: { workspaceId, afterSeq: replayWatermark, timeoutMs: 1_000 },
+        arguments: { workspaceId, afterSeq: replayWatermark, timeoutMs: 0 },
       });
       if (!host.getApp() || host.getActiveWorkspaceId() !== workspaceId) return;
       const replay = getStructuredContent<{ events?: AgentActivityEvent[]; nextSeq?: number }>(replayResult);
@@ -280,6 +337,7 @@ export async function rehydrateActiveSessions(): Promise<void> {
     // resolution whose response event died on the transport (e.g. Approve
     // committed, response lost, callServerToolChecked correctly refusing to
     // re-mutate) must remove the stale local card, not resurrect it.
+    const approvalHydrationStartedAt = performance.now();
     const directApprovals: PendingApprovalRecord[] = [];
     try {
       const approvalResult = await callServerToolChecked({
@@ -310,6 +368,7 @@ export async function rehydrateActiveSessions(): Promise<void> {
           ? "degraded"
           : "disconnected");
     }
+    recordStartupDuration("approval_hydration_ms", approvalHydrationStartedAt);
     if (directApprovals.length > 0) {
       const target = ensureWorkSessionView(approvalCenterId(workspaceId), workspaceId, "");
       for (const approval of directApprovals) mergePendingApproval(target, approval, workspaceId);
@@ -360,6 +419,7 @@ export async function rehydrateActiveSessions(): Promise<void> {
     if (selected && !isApprovalCenterId(selected.workSessionId)) await hydrateWorkSessionSnapshot(selected);
     if (!host.getApp() || host.getActiveWorkspaceId() !== workspaceId) return;
     host.setLastSuccessfulHydrationAt(new Date().toISOString());
+    recordStartupDuration("hydration_complete_ms", hydrationStartedAt);
     host.bumpWorkspaceWatcherGeneration();
     void watchWorkspaceEvents(workspaceId, host.workspaceEventCursor(), host.workspaceWatcherGeneration());
     host.scheduleRender();

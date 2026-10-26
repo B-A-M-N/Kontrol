@@ -7,11 +7,23 @@ import { openDatabase } from "../db/client.js";
 import { loadConfig } from "../config.js";
 import { createServer } from "../server.js";
 import { dropPeerWorktree, peerOwnsWorktree, recordPeerWorktree } from "../peer/workspace-guard.js";
-import { reconcileReplyDeliveryPage, reconcileReviewHandoffPage } from "./startup-recovery.js";
+import { reconcileReplyDeliveryPage, reconcileReviewHandoffPage, reconcileTerminalGrantPage } from "./startup-recovery.js";
 
 const root = await mkdtemp(join(tmpdir(), "kontrol-startup-recovery-test-"));
 try {
   const db = openDatabase(root);
+  const replyPlan = db.sqlite.prepare(`explain query plan select id, created_at from agent_message_replies
+    where status = 'delivering' and (created_at > '2026' or (created_at = '2026' and id > 'reply'))
+    order by created_at, id limit 100`).all() as Array<{ detail: string }>;
+  assert.ok(replyPlan.some((row) => row.detail.includes("agent_message_replies_delivery_recovery_idx")),
+    "reply recovery query uses the status/created/id recovery index");
+  const handoffPlan = db.sqlite.prepare(`explain query plan select h.id from review_handoffs h
+    left join work_sessions ws on ws.id = h.work_session_id
+    where h.status not in ('closed', 'feedback_committed')
+      and (ws.id is null or ws.status in ('approved', 'rejected', 'cancelled', 'failed', 'failed_protocol'))
+      and h.id > 'handoff' order by h.id limit 100`).all() as Array<{ detail: string }>;
+  assert.ok(handoffPlan.some((row) => row.detail.includes("review_handoffs_recovery_idx")),
+    "handoff recovery query uses the partial unresolved-handoff index");
   db.sqlite.prepare("insert into workspace_sessions (id, root, status, mode, managed, created_at, last_used_at) values ('ws', '/tmp', 'active', 'checkout', 'false', '2020', '2020')").run();
   db.sqlite.prepare("insert into work_sessions (id, workspace_session_id, submitted_by, status, created_at, updated_at) values ('session', 'ws', 'reviewer', 'in_progress', '2020', '2020')").run();
   const insertMessage = db.sqlite.prepare("insert into agent_messages (id, work_session_id, kind, author, title, body, data_json, status, created_at) values (?, 'session', 'clarification_request', 'worker', 'title', 'body', '{}', 'open', ?)");
@@ -70,12 +82,29 @@ try {
   const handoffPage = reconcileReviewHandoffPage(db, handoffCursor, 1);
   assert.equal(handoffPage.reconciled, 0, "live parent work does not close its handoff");
   handoffCursor = handoffPage.nextAfterId;
-  assert.ok(handoffCursor);
-  assert.equal(reconcileReviewHandoffPage(db, handoffCursor, 1).reconciled, 0);
+  assert.equal(handoffCursor, undefined, "active handoffs do not enter the terminal recovery scan");
   db.sqlite.pragma("foreign_keys = OFF");
   db.sqlite.prepare("delete from work_sessions where id = 'session'").run();
   assert.equal(reconcileReviewHandoffPage(db).reconciled, 1, "a handoff with a missing parent is explicitly closed by the left-join recovery path");
   assert.equal((db.sqlite.prepare("select status from review_handoffs where id = 'handoff-live'").get() as { status: string }).status, "closed");
+
+  db.sqlite.prepare("insert into work_sessions (id, workspace_session_id, submitted_by, status, created_at, updated_at) values ('terminal-grant-session', 'ws', 'reviewer', 'approved', '2020', '2020')").run();
+  db.sqlite.prepare("insert into work_sessions (id, workspace_session_id, submitted_by, status, created_at, updated_at) values ('active-grant-session', 'ws', 'reviewer', 'in_progress', '2020', '2020')").run();
+  const insertGrant = db.sqlite.prepare(`insert into policy_approval_grants
+    (id, principal_id, scope, scope_id, approval_key, created_at, expires_at, revoked_at, reviewer_id)
+    values (?, 'principal', 'work_session', ?, 'bash', '2026', ?, ?, 'reviewer')`);
+  insertGrant.run("terminal-grant", "terminal-grant-session", null, null);
+  insertGrant.run("terminal-grant-duplicate", "terminal-grant-session", null, null);
+  insertGrant.run("active-grant", "active-grant-session", null, null);
+  insertGrant.run("expired-terminal-grant", "terminal-grant-session", "2000", null);
+  insertGrant.run("revoked-terminal-grant", "terminal-grant-session", null, "2026");
+  const revokedScopes: string[] = [];
+  const grantPage = reconcileTerminalGrantPage(db, {
+    revokeScope: (scope: string, scopeId: string) => { revokedScopes.push(`${scope}:${scopeId}`); },
+  } as never);
+  assert.deepEqual(revokedScopes, ["work_session:terminal-grant-session"],
+    "startup revokes only effective grants attached to terminal sessions and de-duplicates grant scopes");
+  assert.equal(grantPage.reconciled, 1);
   db.close();
 } finally {
   await rm(root, { recursive: true, force: true });

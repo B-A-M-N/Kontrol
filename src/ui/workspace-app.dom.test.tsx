@@ -611,6 +611,12 @@ await settle();
 assert.match(document.querySelector(".tool-title")?.textContent ?? "", /Workspace/,
   "show_workspace_ui renders the workspace surface card");
 assert.ok(__workspaceAppTest.getLastSuccessfulHydrationAt(), "workspace state is hydrated after open_workspace");
+const workspaceDomSurfaceCalls = fakeToolArguments.filter((entry) => entry.name === "get_workspace_session_surface"
+  && entry.arguments?.workspaceId === "workspace-dom");
+assert.equal(workspaceDomSurfaceCalls[0]?.arguments?.filter, "all", "hydration fetches the recent session surface first");
+assert.equal(workspaceDomSurfaceCalls[0]?.arguments?.limit, 25, "the first surface page is bounded");
+assert.ok(workspaceDomSurfaceCalls.findIndex((entry) => entry.arguments?.filter === "live") > 0,
+  "live session pagination follows the first rendered page");
 __workspaceAppTest.activateWorkspace("workspace-dom");
 __workspaceAppTest.renderWorkSessionView(secondSession);
 const agentBars = document.querySelectorAll(".agent-submit-bar");
@@ -651,6 +657,13 @@ await waitForAssertion(
     && __workspaceAppTest.getWorkSessionView("session-reconnect")?.lastSeq === 6,
   `workspace hydration replays the committed event and advances the durable event cursor; active=${__workspaceAppTest.getActiveWorkspaceId()} domSeq=${__workspaceAppTest.getWorkSessionView("session-dom")?.lastSeq} reconnectSeq=${__workspaceAppTest.getWorkSessionView("session-reconnect")?.lastSeq} awaitCalls=${fakeToolCalls.filter((name) => name === "await_workspace_events").length}`,
 );
+const eventCatchup = fakeToolArguments.find((entry) => entry.name === "await_workspace_events"
+  && entry.arguments?.workspaceId === "workspace-dom"
+  && entry.arguments?.timeoutMs === 0);
+assert.equal(eventCatchup?.arguments?.timeoutMs, 0, "catch-up is nonblocking; the durable watcher owns the long wait");
+for (const metric of ["surface_first_page_ms", "first_useful_paint_ms", "approval_hydration_ms", "hydration_complete_ms"]) {
+  assert.ok(performance.getEntriesByName(`kontrol.${metric}`).length > 0, `startup timing records ${metric}`);
+}
 assert.equal(__workspaceAppTest.getWorkSessionView("session-dom")?.lastSeq, 102, "snapshot replay materializes a committed event during pagination");
 assert.equal(
   __workspaceAppTest.getWorkSessionView("session-reconnect")?.lastSeq,

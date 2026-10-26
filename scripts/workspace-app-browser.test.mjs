@@ -233,6 +233,11 @@ try {
     );
   }
   await page.locator(".review-feedback").waitFor({ state: "attached", timeout: STARTUP_TIMEOUT_MS });
+  await page.waitForFunction(
+    () => document.querySelectorAll(".approval-card .feedback-btn").length === 2,
+    undefined,
+    { timeout: STARTUP_TIMEOUT_MS },
+  );
   await capture("initial-review-approval");
 
   assert.equal(await page.locator(".agent-meta-primary").textContent().then((text) => text?.includes("Awaiting review")), true, "primary session state is humanized");

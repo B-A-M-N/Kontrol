@@ -117,7 +117,22 @@ const migrations: Migration[] = [
   { version: 103, name: "review-browser-binding-revision-fence", up: migrateReviewBrowserBindingRevisionFence },
   { version: 104, name: "scheduled-job-peer-pull-target", up: migrateScheduledJobPeerPullTarget },
   { version: 105, name: "durable-agent-reply-dispatch-ack", up: migrateAgentReplyDispatchAck },
+  { version: 106, name: "startup-recovery-selective-indexes", up: migrateStartupRecoverySelectiveIndexes },
 ];
+
+function migrateStartupRecoverySelectiveIndexes(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create index if not exists agent_message_replies_delivery_recovery_idx
+      on agent_message_replies(status, created_at, id);
+    create index if not exists review_handoffs_recovery_idx
+      on review_handoffs(id)
+      where status not in ('closed', 'feedback_committed');
+    create index if not exists policy_approval_grants_terminal_recovery_idx
+      on policy_approval_grants(scope, revoked_at, scope_id, expires_at);
+    create index if not exists event_log_session_type_seq_idx
+      on event_log(session_id, type, seq desc);
+  `);
+}
 
 function migrateAgentReplyDispatchAck(sqlite: Database.Database): void {
   addColumnIfMissing(sqlite, "agent_message_replies", "delivery_dispatch_idempotency_key", "text");
