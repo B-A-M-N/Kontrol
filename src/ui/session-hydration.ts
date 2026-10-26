@@ -498,7 +498,7 @@ export async function hydrateWorkSessionSnapshot(view: WorkSessionViewState): Pr
         createdAt?: string;
         expiresAt?: string;
       }>;
-      agentMessages?: Array<{ messageId: string; kind: string; author?: string; title?: string; body?: string; status?: string; runId?: string; createdAt?: string; replyId?: string; replyStatus?: string; replyBody?: string }>;
+      agentMessages?: Array<{ messageId: string; kind: string; author?: string; title?: string; body?: string; status?: string; runId?: string; createdAt?: string; replyId?: string; replyStatus?: string; replyBody?: string; replyDeliveryAttemptNumber?: number; replyDestinationAgentId?: string; replyDestinationAgentName?: string }>;
     }>(snapResult);
     if (!snap) return;
 
@@ -563,9 +563,12 @@ export async function hydrateWorkSessionSnapshot(view: WorkSessionViewState): Pr
         replyId: message.replyId,
         replyStatus: message.replyStatus,
         replyBody: message.replyBody,
+        replyDeliveryAttemptNumber: message.replyDeliveryAttemptNumber,
+        replyDestinationAgentId: message.replyDestinationAgentId,
+        replyDestinationAgentName: message.replyDestinationAgentName,
       });
     }
-    view.unresolvedMessageCount = view.openMessages.size;
+    view.unresolvedMessageCount = [...view.openMessages.values()].filter((message) => message.status === "open").length;
     for (const messageId of previousOpenMessageIds) {
       if (!view.openMessages.has(messageId)) host.messageMutationOutcomeUnknown.delete(messageId);
     }

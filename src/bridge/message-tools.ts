@@ -215,6 +215,12 @@ export function registerMessageTools(server: McpServer, config: BridgeConfig): v
             reviewerPrincipalId: config.principalId ?? `role:${config.principalRole ?? "reviewer"}`,
           });
           const accepted = acceptedResult.reply;
+          const currentAttempt = existing.runId
+            ? config.agentRegistry.getLatestDispatchAttemptForRun(existing.runId)
+            : undefined;
+          const destinationAgent = currentAttempt?.agentId
+            ? config.agentRegistry.listAlive().find((agent) => agent.id === currentAttempt.agentId)
+            : undefined;
           const event = acceptedResult.created
             ? config.eventStore.appendEvent({
                 type: "agent.message.reply_accepted",
@@ -224,6 +230,10 @@ export function registerMessageTools(server: McpServer, config: BridgeConfig): v
                   replyId: accepted.id,
                   replyRevision: accepted.replyRevision,
                   status: accepted.status,
+                  replyBody: accepted.body,
+                  deliveryAttemptNumber: currentAttempt?.attemptNumber,
+                  destinationAgentId: currentAttempt?.agentId,
+                  destinationAgentName: destinationAgent?.name,
                   replyToKind: existing.kind,
                 },
               }, { publish: false })

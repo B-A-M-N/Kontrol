@@ -215,6 +215,13 @@ try {
   assert.equal(awaitingAcknowledgement?.deliveryRunId, logicalRun.runId);
   assert.equal(awaitingAcknowledgement?.deliveryAttemptNumber, 2);
   assert.equal(awaitingAcknowledgement?.deliveryRemoteRunId, "remote-reply-attempt-2");
+  const deliveryEvents = eventStore.getEventsForSession(session.id)
+    .filter((event) => event.type === "agent.message.reply_delivery_state")
+    .map((event) => event.payload as Record<string, unknown>);
+  assert.deepEqual(deliveryEvents.map((event) => event.status), ["dispatching", "awaiting_acknowledgement"],
+    "each committed reply-delivery state is projected to live Workspace App observers");
+  assert.ok(deliveryEvents.every((event) => event.destinationAgentId === nativeAgent.id),
+    "reply status events retain the exact selected destination agent identity");
   assert.equal(logicalRun.agentId, originAgent.id, "transfer routing preserves the run's immutable origin identity");
   assert.ok(acceptedLeaseNonce, "native reply continuation is bound to the acquired workspace lease");
   assert.match(acceptedTask, new RegExp(`Required deliveryAttemptId: ${logicalRun.runId}:2`));

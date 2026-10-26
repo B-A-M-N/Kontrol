@@ -414,6 +414,68 @@ assert.match(document.querySelector(".review-message")?.textContent ?? "", /Pres
   "work-session UI shows whether the immutable review message was queued or presented");
 assert.match(document.querySelector(".review-browser-attempt")?.textContent ?? "", /Awaiting Feedback · attempt 1/,
   "work-session UI distinguishes accepted browser generation from committed reviewer feedback");
+const messageView = session.openMessages.get("message-dom")!;
+Object.assign(messageView, {
+  replyId: "reply-dom",
+  replyStatus: "pending_delivery",
+  replyBody: "Use the staged endpoint.",
+  replyDeliveryAttemptNumber: 3,
+  replyDestinationAgentId: "agent-destination-dom",
+  replyDestinationAgentName: "destination-coder",
+});
+__workspaceAppTest.renderWorkSessionView(session);
+assert.match(document.querySelector(".message-reply-status")?.textContent ?? "", /Reply queued for delivery · destination destination-coder · attempt 3/,
+  "a queued clarification is not rendered as already delivered and identifies its current destination attempt");
+for (const [status, expected] of [
+  ["dispatching", "Sending reply to the agent"],
+  ["reconciliation_required", "Delivery uncertain — reconciliation required"],
+  ["awaiting_acknowledgement", "Delivery accepted — awaiting agent acknowledgement"],
+  ["acknowledged", "Agent acknowledged reply"],
+  ["blocked", "Reply blocked — manual recovery required"],
+  ["cancelled", "Reply delivery cancelled"],
+  ["unknown_state", "Reply status unavailable"],
+] as const) {
+  messageView.replyStatus = status;
+  __workspaceAppTest.renderWorkSessionView(session);
+  assert.ok((document.querySelector(".message-reply-status")?.textContent ?? "").includes(expected),
+    `reply status ${status} has an accurate UI label`);
+}
+const activityBeforeReplyEvents = session.activity.slice();
+__workspaceAppTest.reduceWorkSessionEvent("session-dom", {
+  seq: 1,
+  id: "reply-accepted-dom",
+  type: "agent.message.reply_accepted",
+  sessionId: "session-dom",
+  payload: {
+    messageId: "message-dom", replyId: "reply-dom", status: "pending_delivery",
+    replyBody: "Use the staged endpoint.", deliveryAttemptNumber: 3,
+    destinationAgentId: "agent-destination-dom", destinationAgentName: "destination-coder",
+  },
+  createdAt: new Date().toISOString(),
+});
+assert.equal(messageView.replyStatus, "pending_delivery", "live reply acceptance keeps a resolved question visible until delivery settles");
+assert.equal(session.unresolvedMessageCount, 0, "an accepted reply no longer counts as unanswered input");
+__workspaceAppTest.reduceWorkSessionEvent("session-dom", {
+  seq: 2,
+  id: "reply-acknowledged-dom",
+  type: "agent.message.reply_acknowledged",
+  sessionId: "session-dom",
+  payload: { messageId: "message-dom", replyId: "reply-dom", status: "acknowledged", deliveryAttemptNumber: 3 },
+  createdAt: new Date().toISOString(),
+});
+assert.equal(messageView.replyStatus, "acknowledged", "live acknowledgement updates the durable reply projection");
+assert.notEqual(__workspaceAppTest.sessionCategory(session), "Needs input",
+  "an acknowledged reply does not leave the session switcher marked as awaiting reviewer input");
+session.lastSeq = 0;
+session.activity.splice(0, session.activity.length, ...activityBeforeReplyEvents);
+delete messageView.replyId;
+delete messageView.replyStatus;
+delete messageView.replyBody;
+delete messageView.replyDeliveryAttemptNumber;
+delete messageView.replyDestinationAgentId;
+delete messageView.replyDestinationAgentName;
+messageView.status = "open";
+__workspaceAppTest.renderWorkSessionView(session);
 const replyBox = document.querySelector<HTMLTextAreaElement>(".message-reply");
 assert.ok(replyBox, "open agent messages render a reply control");
 replyBox?.focus();
@@ -431,6 +493,7 @@ for (let seq = 1; seq <= 100; seq++) {
 assert.equal(document.activeElement, replyBox, "activity updates preserve reviewer input focus");
 assert.equal(document.querySelectorAll(".message-reply").length, 1, "activity updates preserve the message tray DOM");
 assert.match(document.querySelector(".agent-event")?.textContent ?? "", /fragment-100/, "coalesced output updates the existing activity row");
+
 
 // Review handoffs run through MCP in the active WebUI context; the Workspace
 // App does not render a separate reviewer-facing lifecycle surface.

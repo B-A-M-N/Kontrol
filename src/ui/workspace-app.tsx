@@ -1077,6 +1077,7 @@ export { AmbiguousMutationError } from "./server-tool-call.js";
 export const __workspaceAppTest = {
   ensureWorkSessionView,
   renderWorkSessionView,
+  sessionCategory,
   renderNow,
   reduceWorkSessionEvent,
   workspaceEventTargetSessionId,

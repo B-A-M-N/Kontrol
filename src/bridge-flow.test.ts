@@ -1564,6 +1564,50 @@ try {
       promptSubmittedAt: "2026-10-26T12:01:00.000Z", generationStartedAt: "2026-10-26T12:01:01.000Z",
       generationFinishedAt: "2026-10-26T12:01:02.000Z",
     } as any) : undefined;
+    const replyDestination = agentRegistry.listAlive().find((agent) => agent.name === "cli-coding-agent");
+    assert.ok(replyDestination, "snapshot reply fixture has a live destination agent");
+    const replyRun = agentRegistry.createRun({
+      agentName: replyDestination.name,
+      agentId: replyDestination.id,
+      workspaceSessionId: WS,
+      workSessionId: sessionId,
+      status: "running",
+      attemptNumber: 3,
+    });
+    const replyDispatchKey = "snapshot-reply-dispatch";
+    agentRegistry.beginDispatchAttempt({ key: replyDispatchKey, runId: replyRun.runId, agentId: replyDestination.id, attemptNumber: 4 });
+    agentRegistry.updateDispatchAttempt(replyDispatchKey, { status: "accepted", remoteRunId: "snapshot-reply-remote" });
+    const snapshotQuestion = agentMessages.post({
+      workSessionId: sessionId,
+      runId: replyRun.runId,
+      kind: "clarification_request",
+      title: "Clarify snapshot destination",
+      body: "Which endpoint should I use?",
+      data: { expectsReply: true, resumeOnReply: true },
+    });
+    agentMessages.waitForReply({
+      messageId: snapshotQuestion.id,
+      workSessionId: sessionId,
+      runId: replyRun.runId,
+      attempt: 3,
+      expectsReply: true,
+      resumeOnReply: true,
+    });
+    const snapshotReply = agentMessages.acceptReply({
+      messageId: snapshotQuestion.id,
+      workSessionId: sessionId,
+      body: "Use the staged endpoint.",
+      reviewerPrincipalId: "snapshot-reviewer",
+    }).reply;
+    agentMessages.recordReplyDispatch({
+      replyId: snapshotReply.id,
+      expectedStatus: "pending_delivery",
+      nextStatus: "awaiting_acknowledgement",
+      dispatchIdempotencyKey: replyDispatchKey,
+      runId: replyRun.runId,
+      attemptNumber: 4,
+      remoteRunId: "snapshot-reply-remote",
+    });
     const snapshot = await callReviewer("get_work_session_snapshot", { sessionId });
     assert.ok(!snapshot.isError, "work-session snapshot rehydrates");
     assert.equal(snapshot.structuredContent.latestSubmission.submissionId, submitted.structuredContent.submissionId);
@@ -1584,6 +1628,12 @@ try {
       reviewThreads.listMessages(deliveryThread.id).find((message) => message.handoffId === deliveryHandoff.id)?.id);
     assert.equal(snapshot.structuredContent.reviewLoop.browserAttempt.status, "awaiting_feedback",
       "snapshot exposes the current durable browser-turn state without claiming reviewer feedback");
+    const projectedReply = snapshot.structuredContent.agentMessages.find((message: { messageId: string }) => message.messageId === snapshotQuestion.id);
+    assert.equal(projectedReply.replyStatus, "awaiting_acknowledgement");
+    assert.equal(projectedReply.replyDeliveryAttemptNumber, 4);
+    assert.equal(projectedReply.replyDestinationAgentId, replyDestination.id,
+      "cold session hydration binds clarification state to the exact accepted destination attempt");
+    assert.equal(projectedReply.replyDestinationAgentName, replyDestination.name);
     const ptyObservation = await callReviewer("observe_agent_pty", {
       sessionId,
       processSessionId: "proc_reviewer_observe",

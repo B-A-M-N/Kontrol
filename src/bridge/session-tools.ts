@@ -241,6 +241,9 @@ export function registerSessionTools(server: McpServer, config: BridgeConfig): v
           replyId: z.string().optional(),
           replyStatus: z.string().optional(),
           replyBody: z.string().optional(),
+          replyDeliveryAttemptNumber: z.number().optional(),
+          replyDestinationAgentId: z.string().optional(),
+          replyDestinationAgentName: z.string().optional(),
         })).optional(),
         lastEventSeq: z.number().optional(),
         agentPtys: z.array(z.object({
@@ -357,26 +360,47 @@ export function registerSessionTools(server: McpServer, config: BridgeConfig): v
           }))
         : [];
       const agentMessages = config.agentMessages
-        ? config.agentMessages.list(sessionId).filter((m) => m.status === "open").map((m) => {
-            // Preserve the open question while joining any accepted reply so a
-            // cold WebUI can render "Reply saved — awaiting agent" rather than
-            // making the answered question look unanswered.
-            const reply = config.agentMessages!.listPendingReplies(sessionId).find((candidate) => candidate.messageId === m.id)
-              ?? config.agentMessages!.listReplies(sessionId).find((candidate) => candidate.messageId === m.id);
-            return {
-              messageId: m.id,
-              kind: m.kind,
-              author: m.author,
-              title: m.title,
-              body: m.body,
-              status: m.status,
-              runId: m.runId,
-              createdAt: m.createdAt,
-              replyId: reply?.id,
-              replyStatus: reply?.status,
-              replyBody: reply?.body,
-            };
-          })
+        ? (() => {
+            const repliesByMessageId = new Map(
+              config.agentMessages!.listReplies(sessionId).map((reply) => [reply.messageId, reply] as const),
+            );
+            const liveAgentsById = new Map(config.agentRegistry.listAlive().map((agent) => [agent.id, agent] as const));
+            return config.agentMessages!.list(sessionId)
+              .filter((message) => message.status === "open" || repliesByMessageId.has(message.id))
+              .map((m) => {
+                // Accepted replies resolve the message record. Keep those
+                // messages in the durable projection so cold hydration still
+                // shows delivery and acknowledgement state instead of dropping
+                // the reply.
+                const reply = repliesByMessageId.get(m.id);
+                const deliveryAttempt = reply?.deliveryDispatchIdempotencyKey
+                  ? config.agentRegistry.getDispatchAttemptByIdempotencyKey(reply.deliveryDispatchIdempotencyKey)
+                  : reply?.deliveryRunId
+                    ? config.agentRegistry.getLatestDispatchAttemptForRun(reply.deliveryRunId)
+                    : m.runId
+                      ? config.agentRegistry.getLatestDispatchAttemptForRun(m.runId)
+                      : undefined;
+                const destinationAgent = deliveryAttempt?.agentId
+                  ? liveAgentsById.get(deliveryAttempt.agentId)
+                  : undefined;
+                return {
+                  messageId: m.id,
+                  kind: m.kind,
+                  author: m.author,
+                  title: m.title,
+                  body: m.body,
+                  status: m.status,
+                  runId: m.runId,
+                  createdAt: m.createdAt,
+                  replyId: reply?.id,
+                  replyStatus: reply?.status,
+                  replyBody: reply?.body,
+                  replyDeliveryAttemptNumber: reply?.deliveryAttemptNumber ?? deliveryAttempt?.attemptNumber,
+                  replyDestinationAgentId: deliveryAttempt?.agentId,
+                  replyDestinationAgentName: destinationAgent?.name,
+                };
+              });
+          })()
         : [];
 
       return {

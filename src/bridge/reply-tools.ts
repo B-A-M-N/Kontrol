@@ -176,6 +176,8 @@ export function registerReplyTools(server: McpServer, config: BridgeConfig): voi
               replyRevision: reply.replyRevision,
               runId: run.runId,
               attempt: run.attemptNumber ?? 1,
+              status: reply.status,
+              destinationAgentId: config.agentRegistry.getLatestDispatchAttemptForRun(run.runId)?.agentId,
             },
           })
         : undefined;

@@ -114,6 +114,9 @@ export interface AgentMessageView {
   replyId?: string;
   replyStatus?: string;
   replyBody?: string;
+  replyDeliveryAttemptNumber?: number;
+  replyDestinationAgentId?: string;
+  replyDestinationAgentName?: string;
 }
 
 export interface MissionPacketView {

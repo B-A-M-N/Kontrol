@@ -247,7 +247,7 @@ export function reduceWorkSessionEvent(sessionId: string, event: AgentActivityEv
         runId: typeof event.payload?.runId === "string" ? event.payload.runId : undefined,
         createdAt: typeof event.payload?.createdAt === "string" ? event.payload.createdAt : event.createdAt,
       });
-      view.unresolvedMessageCount = view.openMessages.size;
+      view.unresolvedMessageCount = [...view.openMessages.values()].filter((message) => message.status === "open").length;
     }
   } else if (event.type === "review.handoff.created") {
     void deliverQueuedReviewMessages().catch((error) => {
@@ -259,16 +259,38 @@ export function reduceWorkSessionEvent(sessionId: string, event: AgentActivityEv
       host.setErrorMessage(`Could not deliver queued review submissions to this WebUI context: ${error instanceof Error ? error.message : String(error)}`);
       host.render();
     });
-  } else if (event.type === "agent.message.resolved" || event.type === "agent.message.reply_accepted") {
+  } else if (event.type === "agent.message.resolved") {
     const messageId = String(event.payload?.messageId ?? "");
     if (messageId) {
       view.openMessages.delete(messageId);
       host.messageMutationOutcomeUnknown.delete(messageId);
-      view.unresolvedMessageCount = view.openMessages.size;
-      if (event.type === "agent.message.reply_accepted") {
-        view.notice = { tone: "info", message: "Reply saved — awaiting agent acknowledgement." };
-      }
+      view.unresolvedMessageCount = [...view.openMessages.values()].filter((message) => message.status === "open").length;
     }
+  } else if (event.type === "agent.message.reply_accepted"
+    || event.type === "agent.message.reply_delivery_state"
+    || event.type === "agent.message.reply_acknowledged") {
+    const messageId = String(event.payload?.messageId ?? "");
+    const message = view.openMessages.get(messageId);
+    if (message) {
+      message.status = "resolved";
+      message.replyId = typeof event.payload?.replyId === "string" ? event.payload.replyId : message.replyId;
+      message.replyStatus = event.type === "agent.message.reply_acknowledged"
+        ? "acknowledged"
+        : typeof event.payload?.status === "string" ? event.payload.status : "pending_delivery";
+      message.replyBody = typeof event.payload?.replyBody === "string" ? event.payload.replyBody : message.replyBody;
+      message.replyDeliveryAttemptNumber = typeof event.payload?.deliveryAttemptNumber === "number"
+        ? event.payload.deliveryAttemptNumber
+        : message.replyDeliveryAttemptNumber;
+      message.replyDestinationAgentId = typeof event.payload?.destinationAgentId === "string"
+        ? event.payload.destinationAgentId
+        : message.replyDestinationAgentId;
+      message.replyDestinationAgentName = typeof event.payload?.destinationAgentName === "string"
+        ? event.payload.destinationAgentName
+        : message.replyDestinationAgentName;
+      host.messageMutationOutcomeUnknown.delete(messageId);
+      view.unresolvedMessageCount = [...view.openMessages.values()].filter((entry) => entry.status === "open").length;
+    }
+    if (event.type === "agent.message.reply_accepted") view.notice = { tone: "info", message: "Reply queued for delivery; worker acknowledgement is pending." };
   } else if (event.type === "session.handoff") {
     // Run identity and durable state are unchanged; only the agent handling the
     // next resume differs, so we just surface a notice.

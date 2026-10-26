@@ -556,13 +556,14 @@ export function renderSessionNotice(container: HTMLElement, view: WorkSessionVie
 
 export function renderOpenMessages(container: HTMLElement, view: WorkSessionViewState): void {
   const stateKey = [...view.openMessages.values()]
-    .map((message) => `${message.messageId}:${message.status}:${message.title ?? ""}:${message.body ?? ""}:${message.replyStatus ?? "none"}:${host.messageMutationOutcomeUnknown.has(message.messageId) ? "unknown" : "ready"}`)
+    .map((message) => `${message.messageId}:${message.status}:${message.title ?? ""}:${message.body ?? ""}:${message.replyStatus ?? "none"}:${message.replyDestinationAgentId ?? ""}:${message.replyDeliveryAttemptNumber ?? ""}:${host.messageMutationOutcomeUnknown.has(message.messageId) ? "unknown" : "ready"}`)
     .join("|");
   if (container.dataset.stateKey === stateKey) return;
   container.replaceChildren();
   container.dataset.stateKey = stateKey;
   if (view.openMessages.size === 0) return;
-  container.append(element("div", { className: "message-heading", text: "Needs your input" }));
+  const needsInput = [...view.openMessages.values()].some((message) => message.status === "open" && !message.replyId);
+  container.append(element("div", { className: "message-heading", text: needsInput ? "Needs your input" : "Agent messages" }));
   for (const message of view.openMessages.values()) {
     const card = element("article", { className: "agent-message blocker" });
     card.append(
@@ -573,15 +574,29 @@ export function renderOpenMessages(container: HTMLElement, view: WorkSessionView
     );
     if (message.replyId) {
       const replyStatusText = message.replyStatus === "acknowledged"
-        ? "Agent received reply"
+        ? "Agent acknowledged reply"
         : message.replyStatus === "blocked"
-          ? "Cannot deliver automatically"
+          ? "Reply blocked — manual recovery required"
           : message.replyStatus === "reconciliation_required"
             ? "Delivery uncertain — reconciliation required"
             : message.replyStatus === "dispatching"
               ? "Sending reply to the agent"
-              : "Reply delivered — awaiting agent acknowledgement";
-      card.append(element("div", { className: "message-reply-status", text: replyStatusText }));
+              : message.replyStatus === "pending_delivery"
+                ? "Reply queued for delivery"
+                : message.replyStatus === "cancelled"
+                  ? "Reply delivery cancelled"
+                  : message.replyStatus === "delivering" || message.replyStatus === "awaiting_acknowledgement"
+                    ? "Delivery accepted — awaiting agent acknowledgement"
+                    : "Reply status unavailable";
+      const destination = message.replyDestinationAgentName ?? message.replyDestinationAgentId;
+      const deliveryDetails = [
+        destination ? `destination ${destination}` : undefined,
+        message.replyDeliveryAttemptNumber !== undefined ? `attempt ${message.replyDeliveryAttemptNumber}` : undefined,
+      ].filter(Boolean).join(" · ");
+      card.append(element("div", {
+        className: "message-reply-status",
+        text: deliveryDetails ? `${replyStatusText} · ${deliveryDetails}` : replyStatusText,
+      }));
       if (message.replyBody) {
         card.append(element("div", { className: "message-reply-body", text: message.replyBody }));
       }
@@ -608,11 +623,20 @@ export function renderOpenMessages(container: HTMLElement, view: WorkSessionView
       void host.callServerToolChecked({
         name: "resolve_agent_message",
         arguments: { sessionId: view.workSessionId, messageId: message.messageId, reply: reply.value.trim() || undefined, clientMutationId: host.newClientMutationId() },
-      }).then(() => {
-        view.openMessages.delete(message.messageId);
-        view.unresolvedMessageCount = view.openMessages.size;
-        // Persistence is proven; worker acknowledgement is a separate state.
-        view.notice = { tone: "info", message: "Reply saved — awaiting agent acknowledgement." };
+      }).then((result) => {
+        const receipt = getStructuredContent<{ replyId?: string; status?: string }>(result);
+        if (receipt?.replyId) {
+          message.status = "resolved";
+          message.replyId = receipt.replyId;
+          message.replyStatus = receipt.status ?? "pending_delivery";
+          message.replyBody = reply.value.trim();
+          view.openMessages.set(message.messageId, message);
+          view.notice = { tone: "info", message: "Reply queued for delivery; worker acknowledgement is pending." };
+        } else {
+          view.openMessages.delete(message.messageId);
+          view.notice = { tone: "info", message: "Agent request resolved." };
+        }
+        view.unresolvedMessageCount = [...view.openMessages.values()].filter((entry) => entry.status === "open").length;
         host.scheduleRender();
       }).catch((error) => {
         if (error instanceof AmbiguousMutationError) {

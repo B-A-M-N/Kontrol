@@ -50,6 +50,47 @@ export function createReplyDispatcher(config: BridgeConfig): ReplyDispatcher {
   let running: Promise<void> | undefined;
   let unsub: (() => void) | undefined;
 
+  function publishReplyDeliveryState(reply: NonNullable<ReturnType<NonNullable<typeof config.agentMessages>["getReply"]>>): void {
+    const replyAttempt = reply.deliveryDispatchIdempotencyKey
+      ? config.agentRegistry.getDispatchAttemptByIdempotencyKey(reply.deliveryDispatchIdempotencyKey)
+      : undefined;
+    const attempt = replyAttempt?.agentId
+      ? replyAttempt
+      : reply.deliveryRunId
+        ? config.agentRegistry.getLatestDispatchAttemptForRun(reply.deliveryRunId)
+        : undefined;
+    const destination = attempt?.agentId
+      ? config.agentRegistry.listAlive().find((agent) => agent.id === attempt.agentId)
+      : undefined;
+    config.eventStore.appendEvent({
+      type: "agent.message.reply_delivery_state",
+      sessionId: reply.workSessionId,
+      payload: {
+        messageId: reply.messageId,
+        replyId: reply.id,
+        replyRevision: reply.replyRevision,
+        status: reply.status,
+        deliveryAttemptNumber: reply.deliveryAttemptNumber,
+        deliveryRunId: reply.deliveryRunId,
+        deliveryRemoteRunId: reply.deliveryRemoteRunId,
+        destinationAgentId: attempt?.agentId,
+        destinationAgentName: destination?.name,
+      },
+    });
+  }
+
+  function recordReplyDispatch(input: Parameters<NonNullable<typeof config.agentMessages>["recordReplyDispatch"]>[0]) {
+    const updated = config.agentMessages?.recordReplyDispatch(input);
+    if (updated) publishReplyDeliveryState(updated);
+    return updated;
+  }
+
+  function setReplyDelivery(input: Parameters<NonNullable<typeof config.agentMessages>["setReplyDelivery"]>[0]) {
+    const updated = config.agentMessages?.setReplyDelivery(input);
+    if (updated) publishReplyDeliveryState(updated);
+    return updated;
+  }
+
   async function dispatchReply(event: DispatchOutboxEvent): Promise<"completed" | "deferred" | "failed"> {
     const agentMessages = config.agentMessages;
     if (!agentMessages) return "failed";
@@ -65,7 +106,7 @@ export function createReplyDispatcher(config: BridgeConfig): ReplyDispatcher {
     }
     const session = config.workSessions.get(reply.workSessionId);
     if (!session || ["approved", "rejected", "cancelled", "failed", "failed_protocol"].includes(session.status)) {
-      agentMessages.setReplyDelivery({
+      setReplyDelivery({
         replyId: reply.id,
         expectedStatus: reply.status as "pending_delivery" | "delivering",
         nextStatus: "blocked",
@@ -97,19 +138,19 @@ export function createReplyDispatcher(config: BridgeConfig): ReplyDispatcher {
       }
       const dispatchKey = replyDispatchKey(reply.id, reply.replyRevision, run.runId, wait.workerAttempt);
       if (reply.deliveryDispatchIdempotencyKey && reply.deliveryDispatchIdempotencyKey !== dispatchKey) {
-        agentMessages.setReplyDelivery({ replyId: reply.id, expectedStatus: reply.status, nextStatus: "blocked" });
+        setReplyDelivery({ replyId: reply.id, expectedStatus: reply.status, nextStatus: "blocked" });
         config.dispatchOutbox?.markCompleted(claimOf(event));
         return "completed";
       }
       const priorAttempt = config.agentRegistry.getDispatchAttemptByIdempotencyKey(dispatchKey);
       if (priorAttempt) {
         if (priorAttempt.runId !== run.runId || priorAttempt.agentId !== agentForRun.id) {
-          agentMessages.setReplyDelivery({ replyId: reply.id, expectedStatus: reply.status, nextStatus: "blocked" });
+          setReplyDelivery({ replyId: reply.id, expectedStatus: reply.status, nextStatus: "blocked" });
           config.dispatchOutbox?.markCompleted(claimOf(event));
           return "completed";
         }
         if (priorAttempt.status === "accepted" && priorAttempt.remoteRunId) {
-          const updated = agentMessages.recordReplyDispatch({
+          const updated = recordReplyDispatch({
             replyId: reply.id,
             expectedStatus: reply.status,
             nextStatus: "awaiting_acknowledgement",
@@ -123,7 +164,7 @@ export function createReplyDispatcher(config: BridgeConfig): ReplyDispatcher {
           return "completed";
         }
         if (priorAttempt.status !== "uncertain" && priorAttempt.status !== "dispatching") {
-          agentMessages.setReplyDelivery({ replyId: reply.id, expectedStatus: reply.status, nextStatus: "blocked" });
+          setReplyDelivery({ replyId: reply.id, expectedStatus: reply.status, nextStatus: "blocked" });
           config.dispatchOutbox?.markCompleted(claimOf(event));
           return "completed";
         }
@@ -140,7 +181,7 @@ export function createReplyDispatcher(config: BridgeConfig): ReplyDispatcher {
         if (lookup.status === "found" && lookup.remoteRunId) {
           config.agentRegistry.updateDispatchAttempt(dispatchKey, { status: "accepted", remoteRunId: lookup.remoteRunId });
           config.agentRegistry.updateRun(run.runId, { status: "running", remoteRunId: lookup.remoteRunId, attemptNumber: priorAttempt.attemptNumber });
-          const updated = agentMessages.recordReplyDispatch({
+          const updated = recordReplyDispatch({
             replyId: reply.id,
             expectedStatus: reply.status,
             nextStatus: "awaiting_acknowledgement",
@@ -157,7 +198,7 @@ export function createReplyDispatcher(config: BridgeConfig): ReplyDispatcher {
         // opened permits a retry. `unknown` includes unsupported or ambiguous
         // lookups and therefore stays fenced.
         if (lookup.status !== "unstarted") {
-          agentMessages.recordReplyDispatch({
+          recordReplyDispatch({
             replyId: reply.id,
             expectedStatus: reply.status,
             nextStatus: "reconciliation_required",
@@ -171,7 +212,7 @@ export function createReplyDispatcher(config: BridgeConfig): ReplyDispatcher {
       // Persist reply→attempt correlation before the outbound request. A crash
       // after the adapter starts is reconciled against this same immutable key.
       const expectedAttemptNumber = priorAttempt?.attemptNumber ?? (run.attemptNumber ?? 1) + 1;
-      const dispatching = agentMessages.recordReplyDispatch({
+      const dispatching = recordReplyDispatch({
         replyId: reply.id,
         expectedStatus: reply.status,
         nextStatus: "dispatching",
@@ -182,7 +223,7 @@ export function createReplyDispatcher(config: BridgeConfig): ReplyDispatcher {
       if (!dispatching && agentMessages.getReply(reply.id)?.status !== "acknowledged") return "deferred";
       const result = await defaultResumeReply(config, reply, wait, dispatchKey, expectedAttemptNumber);
       if (result.status === "uncertain") {
-        agentMessages.recordReplyDispatch({
+        recordReplyDispatch({
           replyId: reply.id,
           expectedStatus: "dispatching",
           nextStatus: "reconciliation_required",
@@ -193,7 +234,7 @@ export function createReplyDispatcher(config: BridgeConfig): ReplyDispatcher {
         return "deferred";
       }
       if (result.status === "failed") {
-        agentMessages.recordReplyDispatch({
+        recordReplyDispatch({
           replyId: reply.id,
           expectedStatus: "dispatching",
           nextStatus: "blocked",
@@ -209,7 +250,7 @@ export function createReplyDispatcher(config: BridgeConfig): ReplyDispatcher {
         config.dispatchOutbox?.markCompleted(claimOf(event));
         return "completed";
       }
-      const settled = agentMessages.recordReplyDispatch({
+      const settled = recordReplyDispatch({
         replyId: reply.id,
         expectedStatus: "dispatching",
         nextStatus: "awaiting_acknowledgement",
@@ -233,7 +274,7 @@ export function createReplyDispatcher(config: BridgeConfig): ReplyDispatcher {
     // It requires adapter support for structured needs_input and authenticated
     // acknowledgement; blindly reusing callRemoteAgent would create duplicate
     // logical attempts. Operator-visible blocked status prevents unbounded retry.
-    agentMessages.setReplyDelivery({
+    setReplyDelivery({
       replyId: reply.id,
       expectedStatus: reply.status as "pending_delivery" | "delivering",
       nextStatus: "blocked",
