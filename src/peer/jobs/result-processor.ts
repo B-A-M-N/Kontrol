@@ -180,7 +180,13 @@ export function createPeerJobResultProcessor(deps: PeerJobResultProcessorDeps) {
       const attempts = deps.store.listAttemptsForJob(job.jobId);
       const attempt = [...attempts].reverse().find((candidate) => candidate.receipt?.terminalState === "succeeded");
       const receipt = attempt?.receipt;
-      if (!attempt || !receipt) return;
+      if (!attempt || !receipt) {
+        // `result_received` is only valid when its successful receipt is
+        // durable. Treat a missing receipt as an explicit reconciliation
+        // failure; silently returning here would leave the job looking
+        // retryable while its long-lived workspace reservation stayed held.
+        throw new PeerJobError("result_receipt_missing", "Peer result has no durable successful receipt to stage", 409);
+      }
       const receiptSha256 = receiptIdentity(receipt);
       deps.store.markStaging(job.jobId, receiptSha256, Date.now());
 

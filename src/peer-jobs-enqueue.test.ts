@@ -499,6 +499,23 @@ let claimToken: string;
     });
     attempts.set(jobId, [{ attemptId: receipt.attemptId, receipt }]);
   }
+  const missingReceiptJob: PeerJob = {
+    jobId: "job_lock_missing_receipt",
+    peerId: PEER_ID,
+    workSessionId: "work_lock_missing_receipt",
+    workspaceSessionId: "workspace_lock_alias",
+    repositoryId: "repo",
+    baseRevision: "base",
+    taskClass: "propose_patch",
+    instructionHash: "0".repeat(64),
+    instructions: "",
+    allowedOutputs: ["*"],
+    maxRuntimeMs: 1000,
+    maxArtifactBytes: 100,
+    status: "result_received",
+    createdAt: new Date().toISOString(),
+  };
+  jobs.set(missingReceiptJob.jobId, missingReceiptJob);
   const fakeStore = {
     getJob: (jobId: string) => jobs.get(jobId),
     listAttemptsForJob: (jobId: string) => attempts.get(jobId) ?? [],
@@ -578,6 +595,10 @@ let claimToken: string;
     assert.equal(maxConcurrentSnapshots, 1, "peer receipt processing for one managed worktree never overlaps");
     assert.equal(jobs.get("job_lock_a")?.status, "awaiting_review");
     assert.equal(jobs.get("job_lock_b")?.status, "awaiting_review");
+    await processor.process(missingReceiptJob);
+    assert.equal(missingReceiptJob.status, "awaiting_reconciliation",
+      "a result without its required durable receipt becomes an explicit recovery state instead of silently keeping a workspace reservation");
+    assert.equal(missingReceiptJob.resultProcessing?.failure, "result_receipt_missing");
     console.log("enqueue-e2e: workspace aliases for one worktree stage serially");
   } finally {
     rmSync(resultRoot, { recursive: true, force: true });
