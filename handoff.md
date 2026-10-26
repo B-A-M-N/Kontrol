@@ -1,6 +1,6 @@
 # Kontrol multipath ingress — remaining work
 
-Updated: 2026-10-26 (tenth revision)
+Updated: 2026-10-26 (eleventh revision)
 Repository: `/home/bamn/devspace`
 Branch: `audit-k02-k04`
 Starting HEAD for this revision: `44c247a`. The change is the reviewed
@@ -298,8 +298,11 @@ reasons - "requires external host capture evidence", "deliberate manual
 fixture" - were not true of the suites) and are gone; the allowlist is now
 empty, and an entry that is no longer needed is itself a failure.
 
-**Proves it.** The check reports `198 test files all executed by the
-canonical chain` (14 scripts, 26 runners). It is mutation-killable:
+**Proves it.** The check reports `199 test files all executed by the
+canonical chain` (14 scripts, 27 runners) for this revision's committed
+tree; the reviewed range on its own reports 198 files and 26 runners, and
+the difference is one test file that a concurrent commit on this branch
+added. It is mutation-killable:
 removing one suite from `test:unit` makes the check name that suite and exit 1.
 
 ### 7. The check proves execution, not a mention
@@ -408,7 +411,10 @@ an unreadable shape read as no exposure again.
 ### 10. A shell comment is not a command, and a flag value is not a program
 
 The tenth secondary review of this diff found one P1, three P2 and one P3
-besides a documentation note. All are closed.
+besides a documentation note. All are closed. The one P1 is written below as
+two clauses, because both turn on the same rule - which token names the
+program the interpreter runs - and each clause carries the P1 label so that
+neither reads as the aftermath of the other.
 
 **A shell comment ran a suite that never ran (P1).** The check stripped
 JavaScript comments from a runner but never stripped shell comments from a
@@ -625,8 +631,9 @@ stale assertion with the invariant the contract actually guarantees - the
 backend is reported as `pending` at open time, and change tracking is claimed
 exactly when the backend is one that can track changes (`git` or
 `filesystem`), never while no backend is available. The peer suite keeps
-asserting the same property it asserted before: change tracking follows the
-backend.
+asserting the invariant it asserted before, in its new form: change
+tracking follows the backend, so with the capture deferred at open time it
+reads `false` there.
 
 **The snapshot shape (`src/review-checkpoints.filesystem.test.ts`,
 `4535e9f`).** The same sibling commit added a `checkpointError` slot to the
@@ -815,10 +822,13 @@ and round 17 none. Each finding was closed by the next commit of this change,
 which the commit table at the top of this document lists.
 Rounds 18 and 19 re-recorded that same committed state after the workflow
 guard scoped its review evidence over the whole tracked tree and concurrent
-work in this checkout changed it; both returned no findings. The final review
-round covers this revision's commits as well - the pinned range, the
+work in this checkout changed it; both returned no findings. Round 20
+reviewed this revision's commits as well - the pinned range, the
 documentation commits and the three test-contract fixes of section 13 - and
-its verdict is recorded with the workflow guard.
+returned changes requested on two documentation findings, both of which are
+closed in this revision. The closing round re-reviews that same committed
+state against the two fixes, and its verdict is recorded with the workflow
+guard.
 | Round | Reviewer | Verdict | Outcome |
 |-------|----------|---------|---------|
 | 1 | `glm-5.3-flash` | changes requested | The deferral gate alone was insufficient: the transport could still drop a notification on a stream that ended mid-send. Led to the stale-discard path. |
@@ -838,6 +848,9 @@ its verdict is recorded with the workflow guard.
 | 15 | `glm-5.3-flash` | approve, 1 P3 | The round-9 row of this table listed six outcome clauses while the narrative tallied seven findings for that round, which read as a contradiction. Closed: the row carries the same tally and states that the clauses are the outcomes of the findings rather than one clause per finding. |
 | 16 | `glm-5.3-flash` | approve, 2 P3 | The changed-files table described `HANDOFF.md` as "this record", although it is a different document - the earlier scheduled-job audit record, whose deployment status this pass updated - and the header named only the starting commit of the revision. Both closed: the two rows now describe their own documents, and the header names the reviewed range. |
 | 17 | `glm-5.3-flash` | approve, no findings | The two round-16 fixes were confirmed from the code: the 34-file set, the per-commit file lists, the re-run checks and the two tables. The document was confirmed internally consistent, with no overclaim. |
+| 18 | `glm-5.3-flash` | approve, no findings | The committed state was re-recorded after the workflow guard scoped its review evidence over the whole tracked tree; no finding. |
+| 19 | `glm-5.3-flash` | approve, no findings | The same committed state was re-recorded again after concurrent work in the checkout changed the tracked tree; no finding. |
+| 20 | `deepseek-v4-flash` | changes requested, 1 P2 and 2 P3 | The change was reviewed as the committed state, reconstructed with `git archive` rather than read from the shared working tree. The review found no code-level defect: the three contracts are implemented, the three test fixes assert real invariants rather than tautologies, and the canonical-chain check provably executes every test file. Its findings are documentation findings, and all three are closed in this revision. The P2: two present-tense statements of the test-file count said 198 files and 26 runners, which is what the reviewed range's tip reports, while this revision's committed tree reports 199 files and 27 runners because a concurrent commit added a test file - both statements now name the tree they hold for (section 6 and the verification evidence). The P3s: the round-10 narrative tallied one P1 while the section's own body labels two P1 clauses, and the peer-mutation section said the suite kept asserting "the same property" although the asserted value changed - both are reconciled (sections 10 and 13). |
 
 
 The mutation table in section 1 is the executable form of these reviews: each
@@ -857,8 +870,9 @@ Executed in this pass (all from the repository root):
   resolver's own "No built Workspace App artifact found" error, and passes
   when `KONTROL_WORKSPACE_APP_HTML_PATH` points at a built artifact; the
   canonical chain supplies that artifact (section 12).
-- `npm run test:manifest` — `EXIT=0`: **198 test files all executed by the
-  canonical chain** (14 scripts, 26 runners). Run against the committed tree,
+- `npm run test:manifest` — `EXIT=0`: **199 test files all executed by the
+  canonical chain** (14 scripts, 27 runners) for this revision's committed
+  tree. Run against the committed tree,
   the same check names the 13 suites that were reachable but never executed.
 - `node scripts/test-manifest.mjs` — mutation-killable: removing one suite
   from `test:unit` makes the check name that suite and exit 1.
@@ -928,9 +942,13 @@ Executed in this pass (all from the repository root):
     canonical chain (14 scripts, 26 runners)" and the run ends
     `NPM_TEST_EXIT=0`;
   - this revision's final commit, recorded in
-    `.tmp-handoff-evidence/test-npm-test-final.log`. The only change this
-    workstream makes after that commit is this document, and a document
-    cannot change a test result.
+    `.tmp-handoff-evidence/test-npm-test-final.log`; its `test:manifest`
+    step reports "199 test files all executed by the canonical chain (14
+    scripts, 27 runners)" - the range's own tree reports 198 files and 26
+    runners, and the difference is one test file a concurrent commit added -
+    and the run ends `NPM_TEST_EXIT=0`. The only change this workstream
+    makes after that commit is this document, and a document cannot change a
+    test result.
   The runs that surfaced the stale assertions of section 13 are recorded in
   this history: a run against `50e7faf` failed in
   `src/peer-mutation.test.ts` and surfaced the stale checkpoint assertion,
