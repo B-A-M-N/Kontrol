@@ -1,6 +1,6 @@
 # Kontrol multipath ingress — remaining work
 
-Updated: 2026-10-26 (sixth revision)
+Updated: 2026-10-26 (seventh revision)
 Repository: `/home/bamn/devspace`
 Branch: `audit-k02-k04`
 Starting HEAD for this revision: `44c247a`. The change is the range
@@ -25,7 +25,8 @@ to restate a number that its own commit changes.
 | 6 | `1e983ed` | `docs: correct the round-7 review row and record the round-13 residuals` |
 | 7 | `f6dcfa1` | `docs: map the changed-files table one-to-one onto the change` |
 | 8 | `3859026` | `docs: state the round-9 tally and cite the final full-chain run` |
-| 9 | this commit | `docs: name the reviewed range and distinguish the two handoff records` |
+| 9 | `ec20e04` | `docs: name the reviewed range and distinguish the two handoff records` |
+| 10 | this commit | `docs: record every review round and cite the pristine-archive test run` |
 
 Requirement source:
 `/home/bamn/.codex/attachments/458e9b15-a1ec-4247-aa20-19ec878f9be9/pasted-text-1.txt`
@@ -708,8 +709,11 @@ external failure (not a route mismatch), captured from the public origin.
 
 ## Review rounds
 
-The fix was reviewed thirteen times, each round in a fresh session that did not
-write the code. Every round was against the complete diff, not a summary.
+Every review round ran in a fresh session that did not write the code, and every
+round was against the complete diff, not a summary. The table below itemises
+the rounds that produced the changes this document records; the final round
+re-reviewed the committed state and its verdict is recorded with the workflow
+guard.
 Round 6 covered the whole diff, including the Hermes sandbox changes and
 the documentation, which rounds 1-5 had not seen. Round 7 reviewed the
 whole diff again after the documentation was written, and its two P2
@@ -730,7 +734,11 @@ is recorded in section 11. Round 13 reviewed the committed state - the five
 commits that existed at that point - rather than the shared working tree,
 confirmed that the committed bytes are the reviewed bytes, and returned
 approve with no P0, P1 or P2 finding; its two P3 residuals are closed in
-section 12.
+section 12. Rounds 14 to 17 reviewed the committed state rather than the
+shared working tree, each in its own fresh session. Round 14 raised two P3
+documentation findings, round 15 one P3, round 16 two P3 wording findings,
+and round 17 none. Each finding was closed by the next commit of this change,
+which the commit table at the top of this document lists.
 | Round | Reviewer | Verdict | Outcome |
 |-------|----------|---------|---------|
 | 1 | `glm-5.3-flash` | changes requested | The deferral gate alone was insufficient: the transport could still drop a notification on a stream that ended mid-send. Led to the stale-discard path. |
@@ -746,6 +754,10 @@ section 12.
 | 11 | `glm-5.3-flash` | approve, 2 P3 | The manifest guard matched only a double-quoted, single-line import, so four import forms that would ship an undeclared sibling module went unseen (closed in section 11); an interpreter flag outside the hardcoded value-flag set was guessed rather than refused (closed in section 11); the source-pattern assertions in the Hermes adapter test were noted and kept, because that file uses that style and the behavioural coverage lives in `src/adapter-diagnostics.test.mjs`. |
 | 12 | `glm-5.3-flash` | approve, 1 P3 | The two round-11 findings are confirmed closed with the reviewer's own fixtures: the package-manifest scanner finds a single-quoted, multi-line, side-effect, dynamic-with-options and export-from import of an undeclared sibling module, and ignores a commented-out import and a path that is only data; the interpreter-flag rule refuses an unclassified flag, keeps a classified flag value off the program, leaves the program in place after a boolean flag, and treats a python module flag as naming the program (all closed in section 11). The one P3 is the direction the module flag takes - a suite reachable only through one is reported as unexecuted rather than credited - which fails closed and is now stated in the contract. |
 | 13 | `glm-5.3-flash` | approve, 2 P3 | At that point the change was reviewed as the committed state rather than as a working tree: the five commits contain exactly the 34 reviewed files, each commit holds only files that belong to its subject, the two intermediate `package.json` blobs parse, and the checks were re-run against a reconstruction of the committed tree (closed in section 12). The two P3 findings are documentation residuals: the round-7 row still claimed its two P3 findings were unaddressed, and the Workspace App artifact prerequisite of the server-starting suites was not recorded (closed in section 12). |
+| 14 | `glm-5.3-flash` | approve, 2 P3 | The change was reviewed as the committed state. Two documentation findings. The "Changed and added files" table grouped several files into shared rows and mixed the 34 changed files with the 13 suites the change newly executes but does not modify, so it read as if those suites had been changed. Section 12 still showed the range `44c247a..e5a07c8`, which by then no longer yielded 34 files. Both closed: one row per file, the newly executed suites in their own table, and the range `44c247a..HEAD`. |
+| 15 | `glm-5.3-flash` | approve, 1 P3 | The round-9 row of this table listed six outcome clauses while the narrative tallied seven findings for that round, which read as a contradiction. Closed: the row carries the same tally and states that the clauses are the outcomes of the findings rather than one clause per finding. |
+| 16 | `glm-5.3-flash` | approve, 2 P3 | The changed-files table described `HANDOFF.md` as "this record", although it is a different document - the earlier scheduled-job audit record, whose deployment status this pass updated - and the header named only the starting commit of the revision. Both closed: the two rows now describe their own documents, and the header names the range `44c247a..HEAD`. |
+| 17 | `glm-5.3-flash` | approve, no findings | The two round-16 fixes were confirmed from the code: the 34-file set, the per-commit file lists, the re-run checks and the two tables. The document was confirmed internally consistent, with no overclaim. |
 
 
 The mutation table in section 1 is the executable form of these reviews: each
@@ -825,11 +837,13 @@ Executed in this pass (all from the repository root):
 - `npm test` - the full canonical chain, run in an isolated tree that holds
   `HEAD` plus exactly this 34-file change (no other working-tree edit is
   present in it), so the result is not contaminated by concurrent work in
-  the shared checkout. `EXIT=0` on every run. The final run is against an
-  isolated tree whose tracked files are exactly the committed state:
-  `.tmp-scratch/test-npm-test-r15.log`. The two earlier runs are
-  `.tmp-scratch/test-npm-test-r13.log` and
-  `.tmp-scratch/test-npm-test-r14.log`. The logs are local artifacts, not
+  the shared checkout. `EXIT=0` on every run. The final run is against a
+  pristine extraction of the committed tree - `git archive HEAD` unpacked
+  into an empty directory, whose 575 tracked files are exactly the committed
+  ones - and is recorded in `.tmp-scratch/test-npm-test-r16.log`. The three
+  earlier runs are `.tmp-scratch/test-npm-test-r13.log`,
+  `.tmp-scratch/test-npm-test-r14.log` and
+  `.tmp-scratch/test-npm-test-r15.log`. The logs are local artifacts, not
   committed.
 - `node --import tsx scripts/scheduled-readonly-adapters-e2e.mjs` — CRUSH and
   Hermes both dispatched and stayed confined.
@@ -919,8 +933,8 @@ so a failure in one of them now fails the chain. The list is the same
 - Another session is editing the same checkout concurrently. Its edits
   are not part of this change and are not staged by it: every commit in
   this pass contains only the files this change owns, and the
-  verification run was executed against an isolated tree that holds
-  `HEAD` plus exactly this change.
+  verification run was executed against isolated trees that hold exactly
+  the committed state, never against the shared checkout.
 - A suite that starts the server needs a built Workspace App artifact. In a
   checkout without `dist/ui/workspace-app.html` it fails at startup with
   "No built Workspace App artifact found"; run `npm run build:app` first, or
