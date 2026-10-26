@@ -115,7 +115,18 @@ const migrations: Migration[] = [
   { version: 101, name: "durable-agent-pty-bindings", up: migrateAgentPtyBindings },
   { version: 102, name: "acp-run-exact-input-task", up: migrateAcpRunExactInputTask },
   { version: 103, name: "review-browser-binding-revision-fence", up: migrateReviewBrowserBindingRevisionFence },
+  { version: 104, name: "scheduled-job-peer-pull-target", up: migrateScheduledJobPeerPullTarget },
 ];
+
+function migrateScheduledJobPeerPullTarget(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "scheduled_jobs", "dispatch_target", "text not null default 'direct_acp'");
+  addColumnIfMissing(sqlite, "scheduled_jobs", "dispatch_peer_id", "text");
+  sqlite.exec(`
+    update scheduled_jobs
+       set dispatch_target = 'direct_acp'
+     where dispatch_target is null or dispatch_target = '';
+  `);
+}
 
 function migrateReviewBrowserBindingRevisionFence(sqlite: Database.Database): void {
   // Historical attempts do not have enough evidence to reconstruct which

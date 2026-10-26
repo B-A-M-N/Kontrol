@@ -12,6 +12,7 @@ import type { DatabaseHandle } from "../db/client.js";
 import type { EventStore, EventStoreEvent } from "../event-log.js";
 import type { ScheduledJob, ScheduledJobStore } from "./scheduled-job-store.js";
 import type { ReadOnlyExecutionReceipt } from "../acp-gateway.js";
+import type { PeerJobStore } from "../peer/jobs/store.js";
 import { recoverScheduledArtifactPublication, removeScheduledArtifactProof } from "./scheduled-artifact-publisher.js";
 import { redactedPreview } from "../redaction.js";
 import { BoundedCounterMap } from "./bounded-counter-map.js";
@@ -77,6 +78,8 @@ export interface ScheduledJobRuntimeOptions {
   database: DatabaseHandle;
   jobs: ScheduledJobStore;
   events?: EventStore;
+  /** Durable peer-pull state used to reconcile its worker outcome into the same session lifecycle. */
+  peerJobs?: PeerJobStore;
   dispatchOutbox?: DispatchOutbox;
   /**
    * Authorized dispatch hook. Returns the resulting job-relevant status plus
@@ -226,6 +229,44 @@ export function createScheduledJobRuntime(options: ScheduledJobRuntimeOptions): 
     }
   }
 
+  function reconcilePeerWorkerOutcome(job: ScheduledJob): void {
+    const eventStore = options.events;
+    const peerJobs = options.peerJobs;
+    if (!eventStore || !peerJobs || job.dispatchTarget.kind !== "peer_pull" || !job.workSessionId) return;
+    const scheduledAttempt = job.activeDispatchAttemptId
+      ? jobs.getAttempt(job.id, job.activeDispatchAttemptId)
+      : undefined;
+    if (!scheduledAttempt) return;
+    const peerJob = peerJobs.getLatestJobForWorkSession(job.dispatchTarget.peerId, job.workSessionId);
+    if (!peerJob || peerJob.schedulerDispatchId !== scheduledAttempt.dispatchId
+      || peerJob.workspaceSessionId !== job.projectId) return;
+    const latestReceipt = peerJobs.getAttemptSummaryForJob(peerJob.jobId).latestReceipt?.receipt;
+    const outcome = latestReceipt?.terminalState
+      ?? (peerJob.status === "failed" ? "failed" : peerJob.status === "cancelled" ? "cancelled" : undefined);
+    const eventType = outcome === "succeeded"
+      ? "worker.turn.completed"
+      : outcome === "failed"
+        ? "agent.run.failed"
+        : outcome === "cancelled"
+          ? "agent.run.cancelled"
+          : undefined;
+    if (!eventType) return;
+    const id = `peer-job:${peerJob.jobId}:${eventType}`;
+    if (eventStore.getEventById(id)) return;
+    eventStore.appendEvent({
+      id,
+      type: eventType,
+      sessionId: job.workSessionId,
+      workspaceSessionId: job.projectId,
+      payload: {
+        dispatchId: scheduledAttempt.dispatchId,
+        peerJobId: peerJob.jobId,
+        peerId: peerJob.peerId,
+        ...(latestReceipt ? { attemptId: latestReceipt.attemptId } : {}),
+      },
+    });
+  }
+
   function scheduleProjection(sessionId: string): void {
     if (!options.events || !sessionId) return;
     pendingProjectionSessions.add(sessionId);
@@ -260,7 +301,10 @@ export function createScheduledJobRuntime(options: ScheduledJobRuntimeOptions): 
       activeDrainJobId = job.id;
       activeDrainAttemptId = job.activeDispatchAttemptId;
       try {
-        if (job.workSessionId) await projectSessionEvents(job.workSessionId);
+        if (job.workSessionId) {
+          reconcilePeerWorkerOutcome(job);
+          await projectSessionEvents(job.workSessionId);
+        }
       } catch (error) {
         // Keep the failed target at the head of the next bounded page so a
         // transient projection/read error is retried on the next poll.

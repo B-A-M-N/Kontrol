@@ -53,6 +53,21 @@ try {
   assert.match(job.id, /^sched_/);
   assert.equal(job.revision, 1);
   assert.equal(job.status, "pending");
+  assert.deepEqual(job.dispatchTarget, { kind: "direct_acp" }, "existing schedule requests default to the established direct ACP transport");
+  const peerTargetJob = jobs.create({
+    principalId: "user-a",
+    ownerContextId: "owner-a",
+    projectId: "workspace-peer-worktree",
+    workspaceRoot: "/tmp/peer-worktree",
+    runAt,
+    instructionJson: { instructions: "Review this repository." },
+    executionMode: "read_only_audit",
+    policySnapshotJson: { allowedOutputs: [{ path: "reports/audit.md" }] },
+    dispatchTarget: { kind: "peer_pull", peerId: "peer-a" },
+    maxRuntimeMs: 90 * 60_000,
+  });
+  assert.deepEqual(peerTargetJob.dispatchTarget, { kind: "peer_pull", peerId: "peer-a" },
+    "the exact trusted peer target survives scheduled-job persistence");
   assert.equal(scheduledJobAccessAllowed(job, { authenticatedPrincipalId: "user-a", ownerContextId: "principal:user-a|transport:B" }), true,
     "a returning authenticated principal can recover a job created on another transport");
   assert.equal(scheduledJobAccessAllowed(job, { authenticatedPrincipalId: "user-b", ownerContextId: "principal:user-b|transport:B" }), false,
@@ -809,6 +824,89 @@ try {
     assert.deepEqual(dispatchLog, [dueJob.id], "a running job is not re-dispatched even if a stale trigger reappears");
 
     runtime.stop();
+  }
+
+  // ── Scheduled peer receipts project worker completion and failure through the same lifecycle. ──
+  {
+    const events = createEventStore(db);
+    const projectedPeerJobs = new Map<string, any>();
+    let dispatchId = "";
+    const runtime = createScheduledJobRuntime({
+      database: db,
+      jobs,
+      events,
+      dispatchOutbox: outbox,
+      pollMs: 60_000,
+      peerJobs: {
+        getLatestJobForWorkSession: (_peerId: string, workSessionId: string) => projectedPeerJobs.get(workSessionId),
+        getAttemptSummaryForJob: (peerJobId: string) => {
+          const receipt = [...projectedPeerJobs.values()].find((candidate) => candidate.jobId === peerJobId)?.receipt;
+          return { latestReceipt: receipt ? { receipt } : undefined };
+        },
+      } as any,
+      dispatch: async (jobId, attempt) => {
+        dispatchId = attempt.dispatchId;
+        return { status: "dispatched", workSessionId: `ws-${jobId}` };
+      },
+    });
+    const peerScheduledJob = jobs.create({
+      principalId: "user-a",
+      ownerContextId: "owner-a",
+      projectId: "workspace-peer-lifecycle",
+      workspaceRoot: "/tmp/peer-lifecycle",
+      runAt: new Date(Date.now() - 1_000).toISOString(),
+      instructionJson: { instructions: "Audit through peer pull." },
+      executionMode: "read_only_audit",
+      policySnapshotJson: { allowedOutputs: [{ path: "reports/audit.md" }] },
+      dispatchTarget: { kind: "peer_pull", peerId: "peer-lifecycle" },
+      maxRuntimeMs: 60_000,
+    });
+    await runtime.drainOnce();
+    assert.equal(jobs.get(peerScheduledJob.id)?.status, "running");
+    const peerWorkSessionId = `ws-${peerScheduledJob.id}`;
+    projectedPeerJobs.set(peerWorkSessionId, {
+      jobId: "job_scheduled_peer_success",
+      peerId: "peer-lifecycle",
+      schedulerDispatchId: dispatchId,
+      workspaceSessionId: "workspace-peer-lifecycle",
+      status: "awaiting_review",
+      receipt: { terminalState: "succeeded", attemptId: "peer-attempt-success" },
+    });
+    events.appendEvent({ type: "review.submitted", sessionId: peerWorkSessionId, payload: { submissionId: "peer-submission" } });
+    await runtime.drainOnce();
+    assert.equal(jobs.get(peerScheduledJob.id)?.status, "awaiting_approval",
+      "a peer success emits worker completion and the linked review submission advances the scheduled lifecycle");
+    assert.equal(jobs.getAttempt(peerScheduledJob.id)?.workerExecutionOutcome, "completed");
+    assert.ok(events.getEventsForSession(peerWorkSessionId).some((event) => event.type === "worker.turn.completed"
+      && event.payload.dispatchId === dispatchId && event.payload.peerJobId === "job_scheduled_peer_success"));
+
+    const failedPeerJob = jobs.create({
+      principalId: "user-a",
+      ownerContextId: "owner-a",
+      projectId: "workspace-peer-failure",
+      workspaceRoot: "/tmp/peer-failure",
+      runAt: new Date(Date.now() - 1_000).toISOString(),
+      instructionJson: { instructions: "Audit through peer pull." },
+      executionMode: "read_only_audit",
+      policySnapshotJson: { allowedOutputs: [{ path: "reports/audit.md" }] },
+      dispatchTarget: { kind: "peer_pull", peerId: "peer-lifecycle" },
+      maxRuntimeMs: 60_000,
+    });
+    await runtime.drainOnce();
+    const failedDispatchId = jobs.getAttempt(failedPeerJob.id)!.dispatchId;
+    projectedPeerJobs.set("ws-" + failedPeerJob.id, {
+      jobId: "job_scheduled_peer_failure",
+      peerId: "peer-lifecycle",
+      schedulerDispatchId: failedDispatchId,
+      workspaceSessionId: "workspace-peer-failure",
+      status: "failed",
+      receipt: { terminalState: "failed", attemptId: "peer-attempt-failed" },
+    });
+    await runtime.drainOnce();
+    assert.equal(jobs.get(failedPeerJob.id)?.status, "failed",
+      "an authenticated peer failure receipt terminally fails the matching scheduled lifecycle");
+    runtime.stop();
+    events.close();
   }
 
   // ── K06: cancellation intent survives adapter timeouts and a server restart.

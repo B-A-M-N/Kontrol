@@ -19,6 +19,9 @@ import { parseScheduledVerificationCommand } from "../scheduling/verification-pr
 import { verifyScheduledJob } from "../scheduling/scheduled-verification.js";
 import { projectScheduledVerification, scheduledVerificationFingerprints } from "../scheduling/scheduled-verification-projection.js";
 import { z } from "zod/v4";
+import { isPathInsideRoot } from "../roots.js";
+import { getPeerJobStore } from "../peer/jobs/store.js";
+import { scheduledPeerJobId } from "../scheduling/scheduled-job-dispatch.js";
 
 function scheduledJobStore(config: BridgeConfig): ScheduledJobStore | undefined {
   return config.scheduledJobs;
@@ -64,7 +67,7 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
     "schedule_job",
     {
       title: "Schedule bounded job",
-      description: "Create a durable future job for a workspace. Choose read_only_audit or bounded_file_write; bounded writes require exact allowedOutputs and publish through the controlled staged publisher. Work is dispatched through the normal ACP path at the requested UTC time.",
+      description: "Create a durable future job for a workspace. Choose direct_acp or a specific trusted peer_pull target. Peer-pull requires a managed worktree; peer read-only audits must declare exact report output paths, while bounded writes require exact authorized outputs.",
       inputSchema: {
         workspaceId: z.string().describe("Workspace ID from open_workspace."),
         runAt: z.string().datetime({ offset: true }).describe("UTC execution deadline."),
@@ -81,6 +84,10 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
         verificationCommands: z.array(z.string().trim().min(1).max(1_024)).max(5).optional()
           .describe("Optional allowlisted tests to run later against a disposable copy of the submitted snapshot."),
         agentName: z.string().optional(),
+        dispatchTarget: z.discriminatedUnion("kind", [
+          z.object({ kind: z.literal("direct_acp") }),
+          z.object({ kind: z.literal("peer_pull"), peerId: z.string().trim().min(1).max(64) }),
+        ]).default({ kind: "direct_acp" }),
         clientMutationId: z.string().min(1).max(200).optional(),
       },
       outputSchema: {
@@ -93,7 +100,7 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
       annotations: { readOnlyHint: false },
     },
     config,
-    async ({ workspaceId, runAt, instructions, executionMode, allowedOutputs, maxRuntimeMinutes, verificationCommands, agentName, clientMutationId }) => {
+    async ({ workspaceId, runAt, instructions, executionMode, allowedOutputs, maxRuntimeMinutes, verificationCommands, agentName, dispatchTarget, clientMutationId }) => {
       if (!isReviewer(config.principalRole)) return forbidden(config.principalRole, "schedule_job");
       // A workspace ID is not a work-session ID. Authorization for scheduling
       // is reviewer role plus authenticated ownership of that workspace, which
@@ -107,11 +114,24 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
           parseScheduledVerificationCommand(command);
           return command;
         });
-        const outputs = executionMode === "bounded_file_write" ? (allowedOutputs ?? []) : [];
+        const peerReadOnlyReport = dispatchTarget.kind === "peer_pull" && executionMode === "read_only_audit";
+        const outputs: Array<{
+          path: string;
+          operation: "create" | "replace";
+          overwrite: "deny" | "expected_hash";
+          expectedSha256?: string;
+          expectedPreviousSha256?: string;
+        }> = executionMode === "bounded_file_write" || peerReadOnlyReport ? (allowedOutputs ?? []) : [];
         if (executionMode === "bounded_file_write" && outputs.length === 0) {
           throw new Error("bounded_file_write requires at least one exact authorized output.");
         }
-        if (executionMode !== "bounded_file_write" && allowedOutputs?.length) {
+        if (peerReadOnlyReport && outputs.length === 0) {
+          throw new Error("peer_pull read_only_audit requires at least one exact report output path.");
+        }
+        if (peerReadOnlyReport && outputs.some((output) => output.operation !== "create" || output.overwrite !== "deny")) {
+          throw new Error("peer_pull read_only_audit report outputs must be create-only with overwrite=deny.");
+        }
+        if (executionMode !== "bounded_file_write" && !peerReadOnlyReport && allowedOutputs?.length) {
           throw new Error("allowedOutputs are only valid with bounded_file_write.");
         }
         for (const output of outputs) {
@@ -126,6 +146,24 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
           }
         }
         const workspace = config.workspaces.getWorkspace(workspaceId);
+        if (dispatchTarget.kind === "peer_pull") {
+          if (agentName) throw new Error("agentName is only valid for the direct_acp dispatch target.");
+          if (workspace.mode !== "worktree" || workspace.worktree?.managed !== true || !workspace.sourceRoot || !workspace.worktree.baseSha) {
+            throw new Error("peer_pull requires an explicitly opened managed worktree with an immutable base revision.");
+          }
+          const peer = config.serverConfig?.peer?.allowedPeers.find((candidate) => candidate.id === dispatchTarget.peerId);
+          if (!config.serverConfig?.peer?.enabled || !peer) {
+            throw new Error(`Peer ${dispatchTarget.peerId} is not present in the enabled trusted peer registry.`);
+          }
+          const requiredPeerCapabilities = ["job:claim", "job:complete", ...(executionMode === "bounded_file_write" ? ["workspace:propose_patch"] : [])];
+          const missingCapabilities = requiredPeerCapabilities.filter((capability) => !peer.capabilities.includes(capability as typeof peer.capabilities[number]));
+          if (missingCapabilities.length) {
+            throw new Error(`Peer ${dispatchTarget.peerId} lacks required scheduled-job capabilities: ${missingCapabilities.join(", ")}.`);
+          }
+          if (!peer.grantedRoots.some((root) => isPathInsideRoot(workspace.sourceRoot!, root))) {
+            throw new Error(`Peer ${dispatchTarget.peerId} is not granted the selected worktree's source repository.`);
+          }
+        }
         // The workspace registry itself is the workspace authority here: only
         // registered allowlisted roots are addressable, and the authenticated
         // reviewer identity is recorded as the job owner rather than passing
@@ -148,6 +186,7 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
               : {
                 workspaceAccess: "read_only",
                 mutate: false,
+                ...(peerReadOnlyReport ? { allowedOutputs: outputs } : {}),
               }),
             verificationCommands: checkedVerificationCommands,
             verificationPolicy: {
@@ -161,6 +200,7 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
             },
           },
           agentName,
+          dispatchTarget,
           maxRuntimeMs: maxRuntimeMinutes * 60_000,
           clientMutationId,
         });
@@ -196,6 +236,7 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
         status: z.string(),
         revision: z.number(),
         runAt: z.string().optional(),
+        dispatchTarget: z.object({ kind: z.enum(["direct_acp", "peer_pull"]), peerId: z.string().optional() }),
         workSessionId: z.string().optional(),
         lastError: z.string().optional(),
         outputPreview: z.string().optional(),
@@ -203,6 +244,9 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
           resultReceipt: z.object({
             jobId: z.string(),
             dispatchId: z.string().optional(),
+            dispatchTarget: z.object({ kind: z.enum(["direct_acp", "peer_pull"]), peerId: z.string().optional() }),
+            peerJobId: z.string().optional(),
+            peerJobStatus: z.string().optional(),
             workSessionId: z.string().optional(),
             runId: z.string().optional(),
             agentIdentity: z.string().optional(),
@@ -331,6 +375,14 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
       }
       const run = job.workSessionId ? config.agentRegistry.getRunByWorkSessionId(job.workSessionId) : undefined;
       const attempt = jobs.getAttempt(job.id);
+      const peerStore = job.dispatchTarget.kind === "peer_pull" ? getPeerJobStore() : undefined;
+      const initialPeerJob = job.dispatchTarget.kind === "peer_pull" && attempt
+        ? peerStore?.getJob(scheduledPeerJobId(attempt.dispatchId))
+        : undefined;
+      const latestPeerJob = job.dispatchTarget.kind === "peer_pull" && job.workSessionId
+        ? peerStore?.getLatestJobForWorkSession(job.dispatchTarget.peerId, job.workSessionId)
+        : undefined;
+      const peerJob = latestPeerJob?.schedulerDispatchId === attempt?.dispatchId ? latestPeerJob : initialPeerJob;
       const session = job.workSessionId ? config.workSessions.get(job.workSessionId) : undefined;
       let reportArtifact;
       if (requestedReportSha256) {
@@ -428,6 +480,11 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
           ?? (attempt?.transportStatus === "rejected" ? "dispatch_rejected"
             : attempt?.transportStatus === "uncertain" ? "dispatch_uncertain"
               : attempt?.transportStatus === "unstarted" ? "not_started"
+                : peerJob?.status === "running" || peerJob?.status === "claimed" || peerJob?.status === "awaiting_reconciliation" ? "running"
+                  : peerJob?.status === "result_received" || peerJob?.status === "staging" || peerJob?.status === "awaiting_review"
+                    || peerJob?.status === "completed" || peerJob?.status === "review_changes_requested" ? "completed"
+                      : peerJob?.status === "failed" ? "failed"
+                        : peerJob?.status === "cancelled" ? "cancelled"
                 : attempt?.executionActiveSince ? "running"
                   : attempt?.executionStartedAt ? "stopped"
                     : attempt?.transportStatus === "accepted" ? "accepted"
@@ -450,6 +507,9 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
           receipt: {
             jobId: job.id,
             dispatchId: attempt?.dispatchId,
+            dispatchTarget: job.dispatchTarget,
+            peerJobId: peerJob?.jobId,
+            peerJobStatus: peerJob?.status,
             workSessionId: job.workSessionId,
             runId: run?.runId ?? attempt?.acpRunId,
             agentIdentity: run?.agentName ?? attempt?.agentName ?? job.agentName,
@@ -471,7 +531,12 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
             scheduledJobStatus: job.status,
             executionStatus,
             reportAvailability,
-            workerStatus: attempt?.workerExecutionOutcome ?? (attempt?.executionActiveSince ? "running" : "not_started"),
+            workerStatus: attempt?.workerExecutionOutcome ?? (peerJob
+              ? (peerJob.status === "running" || peerJob.status === "claimed" || peerJob.status === "awaiting_reconciliation" ? "running"
+                : peerJob.status === "failed" ? "failed"
+                  : peerJob.status === "cancelled" ? "cancelled"
+                    : ["result_received", "staging", "awaiting_review", "completed", "review_changes_requested"].includes(peerJob.status) ? "completed" : "not_started")
+              : attempt?.executionActiveSince ? "running" : "not_started"),
             publicationStatus: job.executionMode === "bounded_file_write"
               ? (attempt?.publicationReceipts?.some((r) => r.outcome === "committed")
                 ? "committed"
@@ -487,7 +552,7 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
             workerFailureEvidence,
             reviewStatus,
             verificationStatus: verification.verificationStatus,
-            workerCompleted: attempt?.workerExecutionOutcome === "completed",
+            workerCompleted: attempt?.workerExecutionOutcome === "completed" || Boolean(peerJob && ["result_received", "staging", "awaiting_review", "completed", "review_changes_requested"].includes(peerJob.status)),
             reviewApproved: session?.status === "approved",
             verificationLevel: verification.verificationLevel,
             independentOutcomeObserved: verification.independentOutcomeObserved,
@@ -529,6 +594,7 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
           status: job.status,
           revision: job.revision,
           runAt: job.runAt,
+          dispatchTarget: job.dispatchTarget,
           workSessionId: job.workSessionId,
           lastError: job.lastError,
           outputPreview,
@@ -833,67 +899,192 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
             reason: "Cancelled before any worker dispatch began.",
           });
         } else if (jobs.claimCancellationAttempt({ jobId: cancellation.id, requestId, minimumIntervalMs: 30_000 })) {
-          const session = cancellation.workSessionId ? config.workSessions.get(cancellation.workSessionId) : undefined;
-          const run = cancellation.workSessionId
-            ? config.agentRegistry.getRunByWorkSessionId(cancellation.workSessionId)
-            : undefined;
-          if (!session || !run) {
-            cancellation = jobs.recordCancellationEvidence({
-              jobId: cancellation.id,
-              requestId,
-              state: "unknown",
-              lastError: "Cancellation is durable, but the correlated worker state is not available yet.",
-            });
-          } else if (["cancelled"].includes(run.status) || session.status === "cancelled") {
-            cancellation = jobs.recordCancellationEvidence({
-              jobId: cancellation.id,
-              requestId,
-              state: "worker_cancelled",
-              lastError: "The correlated worker reported cancellation.",
-            });
-            cancellation = jobs.finalizeCancellation({ jobId: cancellation.id, requestId, lastConfirmedState: "worker_cancelled" });
-          } else if (["approved", "rejected", "failed", "failed_protocol"].includes(run.status)) {
-            cancellation = jobs.recordCancellationEvidence({
-              jobId: cancellation.id,
-              requestId,
-              state: "unknown",
-              lastError: `The correlated run is already terminal (${run.status}); lifecycle reconciliation will determine the job outcome.`,
-            });
-          } else if (hasConfirmedWorkerAttemptExit(run, config.agentRegistry.getLatestDispatchAttemptForRun(run.runId))) {
-            config.reviewWorkflow.cancelSession({ sessionId: session.id, reason: "scheduled job cancellation requested" });
-            config.reviewWorkflow.finalizeCancellation({ sessionId: session.id, reason: "the current worker attempt had already exited" });
-            cancellation = jobs.recordCancellationEvidence({
-              jobId: cancellation.id,
-              requestId,
-              state: "worker_stopped",
-              lastError: "The current worker attempt had already exited; the pending review was cancelled.",
-            });
-            cancellation = jobs.finalizeCancellation({
-              jobId: cancellation.id,
-              requestId,
-              lastConfirmedState: "worker_stopped",
-            });
+          if (cancellation.dispatchTarget.kind === "peer_pull") {
+            const peerJobStore = getPeerJobStore();
+            const scheduledAttempt = cancellation.activeDispatchAttemptId
+              ? jobs.getAttempt(cancellation.id, cancellation.activeDispatchAttemptId)
+              : undefined;
+            const initialPeerJob = peerJobStore && scheduledAttempt
+              ? peerJobStore.getJob(scheduledPeerJobId(scheduledAttempt.dispatchId))
+              : undefined;
+            const peerJob = peerJobStore && cancellation.workSessionId && cancellation.dispatchTarget.kind === "peer_pull"
+              ? (() => {
+                  const latest = peerJobStore.getLatestJobForWorkSession(cancellation.dispatchTarget.peerId, cancellation.workSessionId!);
+                  return latest?.schedulerDispatchId === scheduledAttempt?.dispatchId ? latest : initialPeerJob;
+                })()
+              : initialPeerJob;
+            if (!peerJobStore || !scheduledAttempt) {
+              cancellation = jobs.recordCancellationEvidence({
+                jobId: cancellation.id,
+                requestId,
+                state: "unknown",
+                lastError: "Peer cancellation cannot be reconciled without the exact durable peer dispatch identity.",
+              });
+            } else if (!peerJob) {
+              cancellation = jobs.recordCancellationEvidence({
+                jobId: cancellation.id,
+                requestId,
+                state: "not_dispatched",
+                lastError: "No durable peer job exists for the exact scheduled dispatch attempt.",
+              });
+              cancellation = jobs.finalizeCancellation({ jobId: cancellation.id, requestId, lastConfirmedState: "not_dispatched" });
+            } else if (peerJob.schedulerDispatchId !== scheduledAttempt.dispatchId) {
+              cancellation = jobs.recordCancellationEvidence({
+                jobId: cancellation.id,
+                requestId,
+                state: "unknown",
+                lastError: "The latest peer job is not bound to the exact scheduled dispatch identity.",
+              });
+            } else if (peerJob.status === "pending") {
+              let cancelledBeforeClaim = false;
+              try {
+                peerJobStore.cancelUnclaimedJob(peerJob.jobId, Date.now());
+                cancelledBeforeClaim = true;
+              } catch (error) {
+                // The peer may claim between our read and the store's CAS.
+                // Reconcile that exact durable job and request its stop rather
+                // than losing the cancellation behind a failed pending-state
+                // transition.
+                const latestPeerJob = peerJobStore.getJob(peerJob.jobId);
+                if (latestPeerJob?.schedulerDispatchId === scheduledAttempt.dispatchId && latestPeerJob.status === "cancelled") {
+                  cancelledBeforeClaim = true;
+                } else if (latestPeerJob?.schedulerDispatchId === scheduledAttempt.dispatchId
+                  && !["completed", "failed", "cancelled"].includes(latestPeerJob.status)) {
+                  peerJobStore.requestCancel(peerJob.jobId, Date.now());
+                  const session = cancellation.workSessionId ? config.workSessions.get(cancellation.workSessionId) : undefined;
+                  if (session && session.status !== "cancelling" && session.status !== "cancelled") {
+                    config.reviewWorkflow.cancelSession({ sessionId: session.id, reason: "scheduled peer job cancellation requested during claim race" });
+                  }
+                  cancellation = jobs.recordCancellationEvidence({
+                    jobId: cancellation.id,
+                    requestId,
+                    state: "worker_active",
+                    lastError: `Peer job claim raced with cancellation (${error instanceof Error ? error.message : String(error)}); cancellation was forwarded to peer job ${peerJob.jobId}.`,
+                  });
+                } else {
+                  cancellation = jobs.recordCancellationEvidence({
+                    jobId: cancellation.id,
+                    requestId,
+                    state: "unknown",
+                    lastError: `Peer job changed while cancellation was being claimed; shutdown remains unproven (${error instanceof Error ? error.message : String(error)}).`,
+                  });
+                }
+              }
+              if (cancelledBeforeClaim) {
+                const session = cancellation.workSessionId ? config.workSessions.get(cancellation.workSessionId) : undefined;
+                if (session && session.status !== "cancelled") {
+                  config.reviewWorkflow.cancelSession({ sessionId: session.id, reason: "scheduled peer job cancelled before claim" });
+                  config.reviewWorkflow.finalizeCancellation({ sessionId: session.id, reason: "peer job was durably cancelled before claim" });
+                }
+                cancellation = jobs.recordCancellationEvidence({
+                  jobId: cancellation.id,
+                  requestId,
+                  state: "worker_cancelled",
+                  lastError: "The peer job was durably cancelled before claim.",
+                });
+                cancellation = jobs.finalizeCancellation({ jobId: cancellation.id, requestId, lastConfirmedState: "worker_cancelled" });
+              }
+            } else if (peerJob.status === "cancelled") {
+              cancellation = jobs.recordCancellationEvidence({ jobId: cancellation.id, requestId, state: "worker_cancelled" });
+              cancellation = jobs.finalizeCancellation({ jobId: cancellation.id, requestId, lastConfirmedState: "worker_cancelled" });
+            } else if (["result_received", "staging", "awaiting_review", "review_changes_requested"].includes(peerJob.status)) {
+              const session = cancellation.workSessionId ? config.workSessions.get(cancellation.workSessionId) : undefined;
+              if (session && session.status !== "cancelling" && session.status !== "cancelled") {
+                config.reviewWorkflow.cancelSession({ sessionId: session.id, reason: "scheduled peer work cancelled after worker result" });
+              }
+              if (session && session.status !== "cancelled") {
+                config.reviewWorkflow.finalizeCancellation({ sessionId: session.id, reason: "peer worker has stopped; scheduled work cancelled" });
+              }
+              cancellation = jobs.recordCancellationEvidence({
+                jobId: cancellation.id,
+                requestId,
+                state: "worker_stopped",
+                lastError: "Peer worker has stopped and its result is already durably linked; the scheduled work session was cancelled.",
+              });
+              cancellation = jobs.finalizeCancellation({ jobId: cancellation.id, requestId, lastConfirmedState: "worker_stopped" });
+            } else if (["completed", "failed"].includes(peerJob.status)) {
+              cancellation = jobs.recordCancellationEvidence({
+                jobId: cancellation.id,
+                requestId,
+                state: "unknown",
+                lastError: `Peer job is terminal (${peerJob.status}); the linked review lifecycle remains authoritative.`,
+              });
+            } else {
+              peerJobStore.requestCancel(peerJob.jobId, Date.now());
+              const session = cancellation.workSessionId ? config.workSessions.get(cancellation.workSessionId) : undefined;
+              if (session && session.status !== "cancelling" && session.status !== "cancelled") {
+                config.reviewWorkflow.cancelSession({ sessionId: session.id, reason: "scheduled peer job cancellation requested" });
+              }
+              cancellation = jobs.recordCancellationEvidence({
+                jobId: cancellation.id,
+                requestId,
+                state: "worker_active",
+                lastError: `Cancellation is recorded for peer job ${peerJob.jobId}; waiting for an exact peer acknowledgement.`,
+              });
+            }
           } else {
-            config.reviewWorkflow.cancelSession({ sessionId: session.id, reason: "scheduled job cancellation requested" });
-            const remote = await cancelRemoteRun(
-              {
-                agentRegistry: config.agentRegistry,
-                workspaces: config.workspaces,
-                workSessions: config.workSessions,
-                adapterSecret: config.adapterSecret,
-              },
-              run,
-            );
-            cancellation = jobs.recordCancellationEvidence({
-              jobId: cancellation.id,
-              requestId,
-              state: remote.acknowledged ? "termination_acknowledged" : "unknown",
-              lastError: remote.acknowledged
-                ? "Remote termination was acknowledged; waiting for the worker cancellation event."
-                : remote.status === 404
-                  ? "The adapter reports no active run; a durable terminal event is still required to confirm worker shutdown."
-                  : `Remote worker state is unknown because termination was not confirmed: ${remote.error ?? "unavailable"}`,
-            });
+            const session = cancellation.workSessionId ? config.workSessions.get(cancellation.workSessionId) : undefined;
+            const run = cancellation.workSessionId
+              ? config.agentRegistry.getRunByWorkSessionId(cancellation.workSessionId)
+              : undefined;
+            if (!session || !run) {
+              cancellation = jobs.recordCancellationEvidence({
+                jobId: cancellation.id,
+                requestId,
+                state: "unknown",
+                lastError: "Cancellation is durable, but the correlated worker state is not available yet.",
+              });
+            } else if (["cancelled"].includes(run.status) || session.status === "cancelled") {
+              cancellation = jobs.recordCancellationEvidence({
+                jobId: cancellation.id,
+                requestId,
+                state: "worker_cancelled",
+                lastError: "The correlated worker reported cancellation.",
+              });
+              cancellation = jobs.finalizeCancellation({ jobId: cancellation.id, requestId, lastConfirmedState: "worker_cancelled" });
+            } else if (["approved", "rejected", "failed", "failed_protocol"].includes(run.status)) {
+              cancellation = jobs.recordCancellationEvidence({
+                jobId: cancellation.id,
+                requestId,
+                state: "unknown",
+                lastError: `The correlated run is already terminal (${run.status}); lifecycle reconciliation will determine the job outcome.`,
+              });
+            } else if (hasConfirmedWorkerAttemptExit(run, config.agentRegistry.getLatestDispatchAttemptForRun(run.runId))) {
+              config.reviewWorkflow.cancelSession({ sessionId: session.id, reason: "scheduled job cancellation requested" });
+              config.reviewWorkflow.finalizeCancellation({ sessionId: session.id, reason: "the current worker attempt had already exited" });
+              cancellation = jobs.recordCancellationEvidence({
+                jobId: cancellation.id,
+                requestId,
+                state: "worker_stopped",
+                lastError: "The current worker attempt had already exited; the pending review was cancelled.",
+              });
+              cancellation = jobs.finalizeCancellation({
+                jobId: cancellation.id,
+                requestId,
+                lastConfirmedState: "worker_stopped",
+              });
+            } else {
+              config.reviewWorkflow.cancelSession({ sessionId: session.id, reason: "scheduled job cancellation requested" });
+              const remote = await cancelRemoteRun(
+                {
+                  agentRegistry: config.agentRegistry,
+                  workspaces: config.workspaces,
+                  workSessions: config.workSessions,
+                  adapterSecret: config.adapterSecret,
+                },
+                run,
+              );
+              cancellation = jobs.recordCancellationEvidence({
+                jobId: cancellation.id,
+                requestId,
+                state: remote.acknowledged ? "termination_acknowledged" : "unknown",
+                lastError: remote.acknowledged
+                  ? "Remote termination was acknowledged; waiting for the worker cancellation event."
+                  : remote.status === 404
+                    ? "The adapter reports no active run; a durable terminal event is still required to confirm worker shutdown."
+                    : `Remote worker state is unknown because termination was not confirmed: ${remote.error ?? "unavailable"}`,
+              });
+            }
           }
         }
         return {

@@ -312,6 +312,41 @@ export function registerPeerJobRoutes(app: Express, deps: PeerJobRouteDeps): Pee
     });
   }
 
+  function recordWorkerOutcome(job: PeerJob, attemptId: string, outcome: "succeeded" | "failed" | "cancelled", reason?: string): void {
+    const type = outcome === "succeeded"
+      ? "worker.turn.completed"
+      : outcome === "failed"
+        ? "agent.run.failed"
+        : "agent.run.cancelled";
+    if (outcome === "failed" && job.workSessionId && deps.workSessions) {
+      const session = deps.workSessions.get(job.workSessionId);
+      if (session && !["approved", "rejected", "cancelled", "failed", "failed_protocol"].includes(session.status)) {
+        deps.workSessions.updateStatus(session.id, "failed");
+      }
+    } else if (outcome === "cancelled" && job.workSessionId && deps.reviewWorkflow && deps.workSessions) {
+      const session = deps.workSessions.get(job.workSessionId);
+      if (session && !["approved", "rejected", "cancelled", "failed", "failed_protocol"].includes(session.status)) {
+        if (session.status !== "cancelling") {
+          deps.reviewWorkflow.cancelSession({ sessionId: session.id, reason: reason ?? "peer worker reported cancellation" });
+        }
+        deps.reviewWorkflow.finalizeCancellation({ sessionId: session.id, reason: reason ?? "peer worker cancellation confirmed" });
+      }
+    }
+    deps.eventStore?.appendEvent({
+      id: `peer-job:${job.jobId}:${type}`,
+      type,
+      sessionId: job.workSessionId,
+      workspaceSessionId: job.workspaceSessionId,
+      payload: {
+        peerJobId: job.jobId,
+        peerId: job.peerId,
+        attemptId,
+        ...(job.schedulerDispatchId ? { dispatchId: job.schedulerDispatchId } : {}),
+        ...(reason ? { reason: reason.slice(0, 2_000) } : {}),
+      },
+    });
+  }
+
   function processDirectly(job: PeerJob): void {
     if (!resultProcessor) return;
     const task = resultProcessor.process(job).then(() => {
@@ -445,6 +480,9 @@ export function registerPeerJobRoutes(app: Express, deps: PeerJobRouteDeps): Pee
         artifacts.readReceipt(job, attemptId, receipt);
       }
       const { job: updated, idempotent } = jobStore.completeAttempt(attemptId, claimToken, peerId, receipt, Date.now());
+      if (updated.status === "result_received") recordWorkerOutcome(updated, attemptId, "succeeded");
+      else if (updated.status === "failed") recordWorkerOutcome(updated, attemptId, "failed", receipt.summary ?? "Peer reported failure.");
+      else if (updated.status === "cancelled") recordWorkerOutcome(updated, attemptId, "cancelled", receipt.summary ?? "Peer reported cancellation.");
       if (updated.status === "result_received" && resultProcessor) {
         if (deps.dispatchOutbox) enqueueResultEvent(updated, attemptId);
         else processDirectly(updated);
@@ -499,6 +537,7 @@ export function registerPeerJobRoutes(app: Express, deps: PeerJobRouteDeps): Pee
           return;
         }
         const { job: updated } = jobStore.cancelAck(body.attemptId, body.claimToken, peerId, Date.now());
+        recordWorkerOutcome(updated, body.attemptId, "cancelled", "Peer acknowledged the exact cancellation request.");
         releasePeerJobWorkspaceReservation(deps.workSessions, updated);
         res.status(200).json({ job: peerJobProjection(updated) });
         return;

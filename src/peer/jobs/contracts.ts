@@ -39,6 +39,8 @@ export interface PeerJob {
   workSessionId: string;
   /** Exact managed-worktree workspace for the receiving session. */
   workspaceSessionId: string;
+  /** Scheduler dispatch identity when this peer job is a scheduled execution. */
+  schedulerDispatchId?: string;
   /** Canonical workspace root or repo identifier. */
   repositoryId: string;
   /** Immutable git SHA or snapshot identity. */

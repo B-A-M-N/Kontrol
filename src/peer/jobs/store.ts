@@ -44,6 +44,7 @@ export interface PeerJobStore {
   readonly stateDir: string;
   createJob(input: Omit<PeerJob, "jobId" | "status" | "createdAt"> & { peerId: string; jobId?: string }): PeerJob;
   getJob(jobId: string): PeerJob | undefined;
+  getLatestJobForWorkSession(peerId: string, workSessionId: string, excludeJobId?: string): PeerJob | undefined;
   listJobsForPeer(peerId: string, opts?: { includeTerminal?: boolean }): PeerJob[];
   listJobsForPeerPage(peerId: string, input: {
     includeTerminal?: boolean;
@@ -339,6 +340,29 @@ export function openPeerJobStore(stateDir: string, logging: LoggingConfig, share
         status: "pending",
         createdAt: new Date().toISOString(),
       };
+      const prior = jobById.get(jobId);
+      if (prior) {
+        const identity = (candidate: PeerJob) => ({
+          peerId: candidate.peerId,
+          workSessionId: candidate.workSessionId,
+          workspaceSessionId: candidate.workspaceSessionId,
+          schedulerDispatchId: candidate.schedulerDispatchId,
+          repositoryId: candidate.repositoryId,
+          baseRevision: candidate.baseRevision,
+          taskClass: candidate.taskClass,
+          instructionHash: candidate.instructionHash,
+          instructions: candidate.instructions,
+          allowedOutputs: candidate.allowedOutputs,
+          maxRuntimeMs: candidate.maxRuntimeMs,
+          maxArtifactBytes: candidate.maxArtifactBytes,
+        });
+        if (canonicalJson(identity(prior)) !== canonicalJson(identity(job))) {
+          throw new PeerJobError("peer_job_id_conflict", `Peer job ${jobId} already exists with different immutable request content`, 409);
+        }
+        // A dispatch retry after response loss returns the current durable job
+        // (including any claim/result state) instead of inserting a duplicate.
+        return prior;
+      }
       jobs.push(job);
       persist([job]);
       return job;
@@ -346,6 +370,16 @@ export function openPeerJobStore(stateDir: string, logging: LoggingConfig, share
 
     getJob(jobId) {
       return jobById.get(jobId);
+    },
+
+    getLatestJobForWorkSession(peerId, workSessionId, excludeJobId) {
+      const row = sqlite.prepare(`
+        select record_json from peer_jobs
+        where peer_id = ? and work_session_id = ? and (? is null or job_id <> ?)
+        order by created_at desc, rowid desc
+        limit 1
+      `).get(peerId, workSessionId, excludeJobId ?? null, excludeJobId ?? null) as { record_json: string } | undefined;
+      return row ? JSON.parse(row.record_json) as PeerJob : undefined;
     },
 
     listJobsForPeer(peerId, opts) {

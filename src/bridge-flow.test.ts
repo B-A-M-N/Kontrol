@@ -27,6 +27,10 @@ import { registerPolicyTools } from "./policy-tools.js";
 import { authorizeWorkSessionAction } from "./work-session-action-guard.js";
 import { compactMissionPacket, projectMissionExecutionContract, renderMissionPrompt } from "./bridge/shared.js";
 import { supervisedMissionOptionsSchema } from "./bridge/context.js";
+import { getPeerJobStore, setPeerJobStoreSingleton } from "./peer/jobs/store.js";
+import { scheduledPeerContinuationJobId } from "./scheduling/scheduled-job-dispatch.js";
+import { openPeerJobStore } from "./peer/jobs/store.js";
+import { manifestSha256 } from "./peer/jobs/service.js";
 
 assert.equal(supervisedMissionOptionsSchema.safeParse({ outcomeEvidence: "outcome_verified" }).success, false,
   "the MCP mission contract requires its external outcome oracle before supervised work can start");
@@ -2406,6 +2410,105 @@ const claimError = await callReviewer("claim_review_handoff", { handoffId: hando
     assert.ok(!submitted.isError, `a later submission remains correlated: ${JSON.stringify(submitted)}`);
     assert.equal(agentRegistry.getRunByWorkSessionId(workSessionId)?.runId, runId,
       "the later review submission resolves to the original logical run");
+  }
+
+  // ── Scheduled peer changes-requested feedback creates a fenced follow-up job. ──
+  {
+    const sessionId = createSession();
+    const priorSubmission = workSessions.submitForReview({
+      workSessionId: sessionId,
+      diff: "diff --git a/reports/audit.md b/reports/audit.md\n+prior report\n",
+      snapshotKind: "git",
+      snapshotRef: "a".repeat(40),
+      files: [{ path: "reports/audit.md", type: "new", additions: 1, removals: 0 }],
+      message: "Initial scheduled peer report",
+    });
+    const feedback = await reviewWorkflow.provideFeedback({
+      sessionId,
+      submissionId: priorSubmission.id,
+      diffSha256: priorSubmission.diffSha256,
+      reviewEpoch: priorSubmission.reviewEpoch,
+      verdict: "changes_requested",
+      comments: "Add the missing failure case and keep the report concise.",
+      invocationOrigin: "authenticated_reviewer",
+    });
+    assert.ok(feedback.continuationId);
+    const continuation = continuationManager.get(feedback.continuationId!)!;
+
+    const peerJobStore = openPeerJobStore(root, {
+      level: "silent", format: "json", requests: false, assets: false, toolCalls: false, shellCommands: false,
+    }, db);
+    const priorPeerJob = peerJobStore.createJob({
+      jobId: `job_${"1".repeat(8)}-${"1".repeat(4)}-${"1".repeat(4)}-${"1".repeat(4)}-${"1".repeat(12)}`,
+      peerId: "peer-scheduled",
+      workSessionId: sessionId,
+      workspaceSessionId: WS,
+      schedulerDispatchId: "dispatch-scheduled-peer",
+      repositoryId: "/tmp/scheduled-peer-repository",
+      baseRevision: "b".repeat(40),
+      taskClass: "read_only_audit",
+      instructionHash: createHash("sha256").update("prior scheduled instruction").digest("hex"),
+      instructions: "Inspect the repository and write reports/audit.md.",
+      allowedOutputs: ["reports/audit.md"],
+      maxRuntimeMs: 60_000,
+      maxArtifactBytes: 1024,
+    });
+    const peerClaim = peerJobStore.claimNextJob(priorPeerJob.peerId, Date.now())!;
+    peerJobStore.markStarted(peerClaim.attempt.attemptId, peerClaim.attempt.claimToken, priorPeerJob.peerId, Date.now());
+    const peerReceipt = {
+      jobId: priorPeerJob.jobId,
+      attemptId: peerClaim.attempt.attemptId,
+      actorClass: "muse_vm_process" as const,
+      baseRevision: priorPeerJob.baseRevision,
+      manifestSha256: manifestSha256(priorPeerJob.baseRevision, []),
+      files: [],
+      totalBytes: 0,
+      terminalState: "succeeded" as const,
+    };
+    peerJobStore.completeAttempt(peerClaim.attempt.attemptId, peerClaim.attempt.claimToken, priorPeerJob.peerId, peerReceipt, Date.now());
+    peerJobStore.markStaging(priorPeerJob.jobId, createHash("sha256").update(JSON.stringify(peerReceipt)).digest("hex"), Date.now());
+    peerJobStore.markAwaitingReview(priorPeerJob.jobId, {
+      receiptSha256: createHash("sha256").update(JSON.stringify(peerReceipt)).digest("hex"),
+      submissionId: priorSubmission.id,
+      reviewEpoch: priorSubmission.reviewEpoch,
+      snapshotKind: "git",
+      snapshotRef: "a".repeat(40),
+      diffSha256: priorSubmission.diffSha256!,
+    }, Date.now());
+    const priorFeedbackId = eventStore.getEventById(feedback.feedbackEventId!)!.payload.feedbackId as string;
+    peerJobStore.finalizeReview(priorPeerJob.jobId, {
+      submissionId: priorSubmission.id,
+      reviewEpoch: priorSubmission.reviewEpoch,
+      feedbackId: priorFeedbackId,
+      verdict: "changes_requested",
+    }, Date.now());
+    const previousPeerJobStore = getPeerJobStore();
+    setPeerJobStoreSingleton(peerJobStore);
+    try {
+      const scheduledJobs = {
+        getByWorkSessionId: (id: string) => id === sessionId
+          ? { id: "scheduled-peer-source", projectId: WS, workSessionId: sessionId, activeDispatchAttemptId: "scheduled-peer-attempt", dispatchTarget: { kind: "peer_pull", peerId: priorPeerJob.peerId } }
+          : undefined,
+        getAttempt: () => ({ dispatchId: "dispatch-scheduled-peer" }),
+      } as any;
+      await runContinuationTick({ ...config, scheduledJobs });
+      const resumedPeerJobId = scheduledPeerContinuationJobId(continuation.id);
+      const resumedPeerJob = peerJobStore.getJob(resumedPeerJobId);
+      assert.ok(resumedPeerJob, "the continuation becomes a durable peer job instead of failing for a missing ACP run");
+      assert.equal(resumedPeerJob.workSessionId, sessionId);
+      assert.equal(resumedPeerJob.workspaceSessionId, WS);
+      assert.equal(resumedPeerJob.baseRevision, priorPeerJob.baseRevision, "the follow-up remains fenced to the original immutable base");
+      assert.deepEqual(resumedPeerJob.allowedOutputs, priorPeerJob.allowedOutputs, "feedback cannot expand output authority");
+      assert.match(resumedPeerJob.instructions, /Add the missing failure case/);
+      assert.match(resumedPeerJob.instructions, /Exact prior checkpoint: git:/);
+      assert.match(resumedPeerJob.instructions, /complete final contents for every listed changed path/);
+      assert.equal(continuationManager.get(continuation.id)?.status, "dispatched");
+      assert.equal(continuationManager.get(continuation.id)?.target, `peer:${resumedPeerJobId}`);
+      assert.equal(workSessions.get(sessionId)?.lastConsumedFeedbackId, priorFeedbackId);
+    } finally {
+      setPeerJobStoreSingleton(previousPeerJobStore);
+      peerJobStore.close();
+    }
   }
 
   console.log("bridge-flow.test.ts: all assertions passed");

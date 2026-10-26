@@ -43,10 +43,15 @@ export interface ScheduledJobInput {
   executionMode: "read_only_audit" | "bounded_file_write";
   policySnapshotJson: unknown;
   agentName?: string;
+  dispatchTarget?: ScheduledDispatchTarget;
   workSessionId?: string;
   maxRuntimeMs: number;
   clientMutationId?: string;
 }
+
+export type ScheduledDispatchTarget =
+  | { kind: "direct_acp" }
+  | { kind: "peer_pull"; peerId: string };
 
 export interface ScheduledStateTransition {
   jobId: string;
@@ -189,6 +194,7 @@ export interface ScheduledJob {
   executionMode: string;
   policySnapshotJson: Record<string, unknown>;
   agentName?: string;
+  dispatchTarget: ScheduledDispatchTarget;
   status: ScheduledJobStatus;
   revision: number;
   workSessionId?: string;
@@ -355,6 +361,10 @@ const scheduledJobRequestSchema = z.object({
   instructionJson: z.record(z.string(), z.unknown()),
   executionMode: z.enum(["read_only_audit", "bounded_file_write"]),
   policySnapshotJson: z.record(z.string(), z.unknown()),
+  dispatchTarget: z.discriminatedUnion("kind", [
+    z.object({ kind: z.literal("direct_acp") }),
+    z.object({ kind: z.literal("peer_pull"), peerId: nonEmptyString.max(64) }),
+  ]).default({ kind: "direct_acp" }),
   maxRuntimeMs: z.number().int().min(1_000).max(24 * 60 * 60 * 1_000),
 });
 
@@ -368,6 +378,11 @@ export interface BoundedFileWriteOutputPolicy {
 }
 
 function rowToJob(row: ScheduledJobRow): ScheduledJob {
+  const dispatchTarget: ScheduledDispatchTarget = row.dispatchTarget === "direct_acp"
+    ? { kind: "direct_acp" }
+    : row.dispatchTarget === "peer_pull" && row.dispatchPeerId
+      ? { kind: "peer_pull", peerId: row.dispatchPeerId }
+      : (() => { throw new Error(`Scheduled job ${row.id} has an invalid durable dispatch target.`); })();
   return {
     id: row.id,
     principalId: row.principalId,
@@ -379,6 +394,7 @@ function rowToJob(row: ScheduledJobRow): ScheduledJob {
     executionMode: row.executionMode,
     policySnapshotJson: JSON.parse(row.policySnapshotJson),
     agentName: row.agentName ?? undefined,
+    dispatchTarget,
     status: row.status as ScheduledJobStatus,
     revision: row.revision,
     workSessionId: row.workSessionId ?? undefined,
@@ -442,10 +458,12 @@ function canonicalRequest(input: {
   executionMode: string;
   policySnapshotJson: unknown;
   agentName?: string;
+  dispatchTarget?: ScheduledDispatchTarget;
   maxRuntimeMs: number;
 }): Record<string, unknown> {
   return {
     agentName: input.agentName ?? null,
+    dispatchTarget: input.dispatchTarget ?? { kind: "direct_acp" },
     executionMode: input.executionMode,
     instructionJson: input.instructionJson,
     maxRuntimeMs: input.maxRuntimeMs,
@@ -510,6 +528,7 @@ export function createScheduledJobStore(
       instructionJson: input.instructionJson,
       executionMode: input.executionMode,
       policySnapshotJson: input.policySnapshotJson,
+      dispatchTarget: input.dispatchTarget ?? { kind: "direct_acp" },
       maxRuntimeMs: input.maxRuntimeMs,
     });
     const id = `sched_${randomUUID()}`;
@@ -526,6 +545,8 @@ export function createScheduledJobStore(
         executionMode: request.executionMode,
         policySnapshotJson: JSON.stringify(request.policySnapshotJson),
         agentName: input.agentName ?? null,
+        dispatchTarget: request.dispatchTarget.kind,
+        dispatchPeerId: request.dispatchTarget.kind === "peer_pull" ? request.dispatchTarget.peerId : null,
         status: "pending",
         revision: 1,
         workSessionId: input.workSessionId ?? null,

@@ -92,6 +92,7 @@ export function createContinuationManager(
       verdict: input.verdict,
       requiredActions: input.requiredActions ?? [],
       allowedNextActions: input.allowedNextActions ?? [],
+      feedbackSummary: input.feedbackSummary,
       resumeInstructions: input.resumeInstructions,
       submissionMessage: input.submissionMessage,
     });
@@ -433,6 +434,7 @@ function renderPrompt(input: {
   verdict: string;
   requiredActions: string[];
   allowedNextActions: string[];
+  feedbackSummary?: string;
   resumeInstructions?: string;
   submissionMessage?: string;
 }): string {
@@ -444,6 +446,12 @@ function renderPrompt(input: {
   lines.push(`Feedback event: ${input.feedbackEventId}`);
   lines.push(`Verdict: ${input.verdict}`);
   lines.push("");
+
+  if (input.feedbackSummary?.trim()) {
+    lines.push("Reviewer comments:");
+    lines.push(input.feedbackSummary.trim());
+    lines.push("");
+  }
 
   if (input.requiredActions.length > 0) {
     lines.push("Required actions:");

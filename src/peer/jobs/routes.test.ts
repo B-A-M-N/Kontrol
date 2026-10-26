@@ -51,6 +51,10 @@ const credentialFile = writeRegistry([
 ]);
 
 const logging = { level: "silent" as const, format: "json" as const, requests: false, assets: false, toolCalls: false, shellCommands: false };
+const workerOutcomeEvents: Array<Record<string, any>> = [];
+const workerSessions = new Map<string, { id: string; status: string }>();
+const workspaceReservations = new Map<string, { leaseKind: string; ownerInstanceId: string; leaseNonce: string }>();
+const releasedWorkspaceReservations: Array<{ workSessionId: string; leaseNonce: string }> = [];
 
 const registry = PeerCredentialRegistry.open(credentialFile);
 const store = openPeerJobStore(stateDir, logging);
@@ -106,6 +110,23 @@ const jobsClose = registerPeerJobRoutes(app, {
   },
   logging,
   isShuttingDown: () => shuttingDown,
+  workSessions: {
+    get: (id: string) => workerSessions.get(id),
+    updateStatus: (id: string, status: string) => {
+      const session = workerSessions.get(id);
+      if (session) session.status = status;
+      return session;
+    },
+    getWorkspaceLeaseForSession: (id: string) => workspaceReservations.get(id),
+    releaseWorkspaceLeaseForSession: (id: string, leaseNonce: string) => {
+      releasedWorkspaceReservations.push({ workSessionId: id, leaseNonce });
+      workspaceReservations.delete(id);
+      return true;
+    },
+  } as any,
+  eventStore: {
+    appendEvent: (event: Record<string, any>) => { workerOutcomeEvents.push(event); return event; },
+  } as any,
 });
 
 const httpServer = app.listen(0, "127.0.0.1");
@@ -320,6 +341,41 @@ console.log("routes: full claim/started/renew/result/status flow");
   assert.equal(conflict.status, 409, JSON.stringify(conflict.payload));
   assert.equal(conflict.payload.error.code, "conflicting_result");
   console.log("routes: conflicting duplicate result -> 409 conflicting_result");
+}
+
+// --- A started /fail report stays fenced until terminal evidence ---------------
+{
+  const failedJob = makeJob({
+    baseRevision: "c".repeat(40),
+    workSessionId: "wsess_peer_reported_failure",
+  });
+  workerSessions.set(failedJob.workSessionId, { id: failedJob.workSessionId, status: "in_progress" });
+  workspaceReservations.set(failedJob.workSessionId, {
+    leaseKind: "peer_job",
+    ownerInstanceId: `peer-job:${failedJob.jobId}`,
+    leaseNonce: "peer-failure-lease",
+  });
+  const failureClaim = await post("/peer/jobs/claim", {});
+  assert.equal(failureClaim.status, 200);
+  assert.equal(failureClaim.payload.job.jobId, failedJob.jobId);
+  const failureAttempt = failureClaim.payload.attempt as { attemptId: string; claimToken: string };
+  await post(`/peer/jobs/${failedJob.jobId}/started`, failureAttempt);
+  const failureResponse = await post(`/peer/jobs/${failedJob.jobId}/fail`, {
+    ...failureAttempt,
+    reason: "worker exited before producing a result",
+  });
+  assert.equal(failureResponse.status, 200);
+  assert.equal(failureResponse.payload.job.status, "awaiting_reconciliation",
+    "a started peer failure report is uncertain because work may have happened");
+  assert.equal(workerSessions.get(failedJob.workSessionId)?.status, "in_progress",
+    "uncertain peer failure does not terminally fail its work session");
+  assert.ok(!workerOutcomeEvents.some((event) => event.type === "agent.run.failed"
+    && event.sessionId === failedJob.workSessionId
+    && event.payload.peerJobId === failedJob.jobId),
+  "an uncorroborated peer failure does not emit worker-terminal lifecycle evidence");
+  assert.equal(workspaceReservations.get(failedJob.workSessionId)?.leaseNonce, "peer-failure-lease",
+    "uncertain peer failure keeps its exact workspace reservation fenced");
+  console.log("routes: started /fail remains awaiting reconciliation and keeps ownership fenced");
 }
 
 // --- URL/attempt correlation: foreign attempt -> 404 job_attempt_mismatch ----------

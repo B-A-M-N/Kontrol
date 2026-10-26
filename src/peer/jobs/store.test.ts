@@ -94,6 +94,16 @@ const NOW = 1_700_000_000_000;
   console.log("store: peer scoping enforced");
 }
 
+// --- latest work-session job lookup is peer-scoped ----------------------------
+{
+  const store = newStore();
+  const first = store.createJob({ ...jobInput("peer-a"), jobId: `job_${"1".repeat(8)}-${"1".repeat(4)}-${"1".repeat(4)}-${"1".repeat(4)}-${"1".repeat(12)}` });
+  const second = store.createJob({ ...jobInput("peer-a"), jobId: `job_${"2".repeat(8)}-${"2".repeat(4)}-${"2".repeat(4)}-${"2".repeat(4)}-${"2".repeat(12)}` });
+  assert.equal(store.getLatestJobForWorkSession("peer-a", first.workSessionId)?.jobId, second.jobId);
+  assert.equal(store.getLatestJobForWorkSession("peer-b", first.workSessionId), undefined);
+  console.log("store: latest work-session job lookup is peer-scoped");
+}
+
 // --- renew fencing + expiry honesty ------------------------------------------
 {
   const store = newStore();

@@ -9,6 +9,7 @@ import { createEventStore } from "../event-log.js";
 import { openDatabase } from "../db/client.js";
 import { createScheduledJobStore } from "../scheduling/scheduled-job-store.js";
 import { scheduledVerificationFingerprints } from "../scheduling/scheduled-verification-projection.js";
+import { setPeerJobStoreSingleton } from "../peer/jobs/store.js";
 import { registerScheduleTools, sliceScheduledReportPage } from "./schedule-tools.js";
 
 const root = await mkdtemp(join(tmpdir(), "kontrol-scheduled-result-"));
@@ -40,6 +41,7 @@ const session = {
 const cancelSession = { id: "work-session-cancel", status: "running", updatedAt: "2026-10-12T11:58:00.000Z" };
 const cancelRun = { runId: "run-cancel", status: "running", agentName: "codex" };
 const reviewStoppedSession = { id: "work-session-review-stopped", status: "awaiting_review", updatedAt: "2026-10-12T11:58:00.000Z" };
+const peerCancelSession = { id: "work-session-peer-cancel", status: "in_progress", updatedAt: new Date().toISOString() };
 const reviewStoppedAt = new Date(Date.now() - 30_000).toISOString();
 const reviewStoppedRun = { runId: "run-review-stopped", status: "awaiting_review", agentName: "codex", finishedAt: reviewStoppedAt };
 const run = {
@@ -302,6 +304,7 @@ try {
       : id === "work-session-unpersisted" ? { id, status: "awaiting_review", updatedAt: "2026-10-12T12:00:00.000Z" }
       : id === cancelSession.id ? cancelSession
         : id === reviewStoppedSession.id ? reviewStoppedSession
+          : id === peerCancelSession.id ? peerCancelSession
           : undefined },
     agentRegistry: { getRunByWorkSessionId: (id: string) => id === session.id
       ? run
@@ -1149,6 +1152,69 @@ try {
   assert.equal(cancelledReceipt.structuredContent.resultReceipt.workerCompleted, false);
   assert.equal(cancelledReceipt.structuredContent.resultReceipt.reviewApproved, false);
   assert.equal(cancelledReceipt.structuredContent.resultReceipt.verificationStatus, "not_performed");
+
+  // A peer claim racing the unclaimed-cancel CAS must receive a durable stop
+  // request; the scheduled record remains cancelling until exact peer ack.
+  {
+    const peerScheduledJob = jobs.create({
+      principalId: "principal-a",
+      ownerContextId: "principal:principal-a|transport:A",
+      projectId: "project-a",
+      workspaceRoot: "/tmp/project-a",
+      runAt: new Date(Date.now() - 1_000).toISOString(),
+      instructionJson: { instructions: "Cancel during peer claim." },
+      executionMode: "read_only_audit",
+      policySnapshotJson: { workspaceAccess: "read_only", mutate: false },
+      dispatchTarget: { kind: "peer_pull", peerId: "peer-cancel-race" },
+      workSessionId: peerCancelSession.id,
+      maxRuntimeMs: 60_000,
+    });
+    jobs.transition({ jobId: peerScheduledJob.id, expectedRevision: peerScheduledJob.revision, nextStatus: "due", expectedSourceStatuses: ["pending"] });
+    const peerDispatch = jobs.claimDispatch({ jobId: peerScheduledJob.id, expectedRevision: 2, dispatcherInstanceId: "test-scheduler" });
+    const activePeerSchedule = jobs.completeDispatch({
+      jobId: peerScheduledJob.id,
+      dispatchAttemptId: peerDispatch.attemptId,
+      expectedRevision: peerDispatch.revision,
+      dispatcherInstanceId: "test-scheduler",
+      outcome: "dispatched",
+      workSessionId: peerCancelSession.id,
+    });
+    const peerJob = {
+      jobId: "job_peer_cancel_race",
+      peerId: "peer-cancel-race",
+      schedulerDispatchId: peerDispatch.dispatchId,
+      status: "pending" as string,
+      cancelRequestedAt: undefined as string | undefined,
+    };
+    let peerCancelRequests = 0;
+    setPeerJobStoreSingleton({
+      getJob: () => peerJob,
+      getLatestJobForWorkSession: () => peerJob,
+      cancelUnclaimedJob: () => {
+        peerJob.status = "claimed";
+        throw new Error("cancel_requires_ack");
+      },
+      requestCancel: () => {
+        peerCancelRequests++;
+        peerJob.cancelRequestedAt = new Date().toISOString();
+        return peerJob;
+      },
+    } as any);
+    try {
+      const peerCancellation = await handlers.get("cancel_scheduled_job")!({
+        scheduledJobId: activePeerSchedule.id,
+        expectedRevision: activePeerSchedule.revision,
+        clientMutationId: "peer-claim-cancel-race",
+      });
+      assert.equal(peerCancellation.structuredContent.status, "cancellation_requested");
+      assert.equal(peerCancellation.structuredContent.lastConfirmedRemoteState, "worker_active",
+        "the job remains fenced until the peer acknowledges the raced cancellation");
+      assert.equal(peerCancelRequests, 1, "the exact claimed peer receives a durable cancellation request");
+      assert.ok(peerJob.cancelRequestedAt, "the peer job records cancellation before response");
+    } finally {
+      setPeerJobStoreSingleton(undefined);
+    }
+  }
   console.log("bridge/schedule-tools.test.ts: all assertions passed");
 } finally {
   jobs.close();

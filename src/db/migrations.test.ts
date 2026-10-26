@@ -14,6 +14,9 @@ try {
   assert.equal(schemaContract.expectedTableCount, 51, "schema contract covers all Drizzle table mappings, including peer-job and PTY binding storage");
   assert.deepEqual(schemaContract.missing, [], "all Drizzle tables and columns are present in migrated SQLite");
   assert.equal(schemaContract.appliedVersion, LATEST_SCHEMA_VERSION);
+  const scheduledTargetColumns = sqlite.prepare("pragma table_info(scheduled_jobs)").all() as Array<{ name: string }>;
+  assert.ok(scheduledTargetColumns.some((column) => column.name === "dispatch_target"), "scheduled dispatch target is durable after migration");
+  assert.ok(scheduledTargetColumns.some((column) => column.name === "dispatch_peer_id"), "scheduled peer identity is durable after migration");
   assert.ok(
     (sqlite.prepare("select name from sqlite_master where type = 'index'").all() as Array<{ name: string }>)
       .some((index) => index.name === "event_log_scheduled_error_fingerprint_time_idx"),

@@ -16,7 +16,8 @@ import {
 import { createSupervisorRuntime } from "../supervisor-runtime.js";
 import { createReplyDispatcher } from "../bridge/reply-dispatcher.js";
 import { createScheduledJobRuntime } from "../scheduling/scheduled-job-runtime.js";
-import { dispatchScheduledJob } from "../scheduling/scheduled-job-dispatch.js";
+import { dispatchScheduledJob, scheduledPeerJobId } from "../scheduling/scheduled-job-dispatch.js";
+import { getPeerJobStore } from "../peer/jobs/store.js";
 import { cancelRemoteRun, lookupPeerDispatch } from "../acp-gateway.js";
 import { hasConfirmedWorkerAttemptExit } from "../acp-registry.js";
 import { verifyMissionSubmission } from "../mission-verifier.js";
@@ -247,6 +248,7 @@ export function createAcpRuntime(deps: AcpRuntimeDeps): AcpRuntimeHandles {
       database,
       jobs: scheduledJobs,
       events: eventStore,
+      peerJobs: getPeerJobStore(),
       dispatchOutbox,
       dispatch: async (jobId, attempt) => {
         const job = scheduledJobs.get(jobId);
@@ -254,6 +256,7 @@ export function createAcpRuntime(deps: AcpRuntimeDeps): AcpRuntimeHandles {
         const outcome = await dispatchScheduledJob(bridgeBase, scheduledJobs, job, {
           dispatchId: attempt.dispatchId,
           dispatchAttemptId: attempt.dispatchAttemptId,
+          peerJobStore: getPeerJobStore(),
         });
         if (outcome.workSessionId) {
           // The server-owned scheduled lifecycle projection consumes events
@@ -273,6 +276,30 @@ export function createAcpRuntime(deps: AcpRuntimeDeps): AcpRuntimeHandles {
         };
       },
       reconcileDispatch: async (input) => {
+        const peerTargetJob = scheduledJobs.get(input.jobId);
+        if (peerTargetJob?.dispatchTarget.kind === "peer_pull") {
+          const peerJobStore = getPeerJobStore();
+          if (!peerJobStore) {
+            return { status: "operator_intervention", reason: "Peer-job storage is unavailable while reconciling the scheduled peer dispatch." };
+          }
+          const initialPeerJob = peerJobStore.getJob(scheduledPeerJobId(input.dispatchId));
+          const peerJob = peerTargetJob.workSessionId
+            ? peerJobStore.getLatestJobForWorkSession(peerTargetJob.dispatchTarget.peerId, peerTargetJob.workSessionId) ?? initialPeerJob
+            : initialPeerJob;
+          if (!peerJob) {
+            return { status: "unstarted", reason: "The deterministic peer-job identity is absent from the shared durable store; no peer dispatch was committed." };
+          }
+          if (peerJob.workSessionId !== peerTargetJob.workSessionId || peerJob.workspaceSessionId !== peerTargetJob.projectId
+            || peerJob.schedulerDispatchId !== input.dispatchId) {
+            return { status: "operator_intervention", reason: "The durable peer job does not match its scheduled work-session or workspace binding." };
+          }
+          return {
+            status: "accepted",
+            workSessionId: peerJob.workSessionId,
+            dispatchId: input.dispatchId,
+            reason: `Durable peer job ${peerJob.jobId} is ${peerJob.status}.`,
+          };
+        }
         const attempt = agentRegistry.getDispatchAttemptByIdempotencyKey(input.dispatchId);
         if (!attempt) {
           return { status: "operator_intervention", reason: `No durable ACP attempt is bound to dispatch ${input.dispatchId}.` };
@@ -353,6 +380,58 @@ export function createAcpRuntime(deps: AcpRuntimeDeps): AcpRuntimeHandles {
       reconcileCancellation: async (job) => {
         const requestId = job.cancellationRequestId;
         if (!requestId) return { state: "unknown", reason: "Cancellation has no durable request identity." };
+        if (job.dispatchTarget.kind === "peer_pull") {
+          const peerJobStore = getPeerJobStore();
+          const scheduledAttempt = job.activeDispatchAttemptId
+            ? scheduledJobs.getAttempt(job.id, job.activeDispatchAttemptId)
+            : undefined;
+          if (!peerJobStore || !scheduledAttempt) {
+            return { state: "unknown", reason: "Peer-job storage or the exact scheduled dispatch attempt is unavailable; peer shutdown is unproven." };
+          }
+          const initialPeerJob = peerJobStore.getJob(scheduledPeerJobId(scheduledAttempt.dispatchId));
+          const peerJob = job.workSessionId
+            ? peerJobStore.getLatestJobForWorkSession(job.dispatchTarget.peerId, job.workSessionId) ?? initialPeerJob
+            : initialPeerJob;
+          if (!peerJob) {
+            return { state: "not_dispatched", reason: "No durable peer job exists for the exact scheduled dispatch attempt." };
+          }
+          if (peerJob.schedulerDispatchId !== scheduledAttempt.dispatchId) {
+            return { state: "unknown", reason: "The latest peer job is not bound to the exact scheduled dispatch attempt." };
+          }
+          const session = peerJob.workSessionId ? workSessions.get(peerJob.workSessionId) : undefined;
+          if (peerJob.status === "cancelled") {
+            if (session && session.status !== "cancelled") {
+              reviewWorkflow.cancelSession({ sessionId: session.id, reason: "scheduled peer job cancellation confirmed" });
+              reviewWorkflow.finalizeCancellation({ sessionId: session.id, reason: "peer confirmed scheduled job cancellation" });
+            }
+            return { state: "worker_cancelled", reason: "The exact peer job is durably cancelled." };
+          }
+          if (peerJob.status === "pending") {
+            peerJobStore.cancelUnclaimedJob(peerJob.jobId, Date.now());
+            if (session && session.status !== "cancelled") {
+              reviewWorkflow.cancelSession({ sessionId: session.id, reason: "scheduled peer job cancelled before claim" });
+              reviewWorkflow.finalizeCancellation({ sessionId: session.id, reason: "peer job was durably cancelled before claim" });
+            }
+            return { state: "not_dispatched", reason: "The peer job was still pending and has been durably cancelled before claim." };
+          }
+          if (["result_received", "staging", "awaiting_review", "review_changes_requested"].includes(peerJob.status)) {
+            if (session && session.status !== "cancelling" && session.status !== "cancelled") {
+              reviewWorkflow.cancelSession({ sessionId: session.id, reason: "scheduled peer work cancelled after worker result" });
+            }
+            if (session && session.status !== "cancelled") {
+              reviewWorkflow.finalizeCancellation({ sessionId: session.id, reason: "peer worker has stopped; scheduled work cancelled" });
+            }
+            return { state: "worker_stopped", reason: "The peer worker has stopped and its result is durably linked; the scheduled work session was cancelled." };
+          }
+          if (["completed", "failed"].includes(peerJob.status)) {
+            return { state: "unknown", reason: `Peer job is terminal (${peerJob.status}); the linked review lifecycle remains authoritative.` };
+          }
+          peerJobStore.requestCancel(peerJob.jobId, Date.now());
+          if (session && session.status !== "cancelling" && session.status !== "cancelled") {
+            reviewWorkflow.cancelSession({ sessionId: session.id, reason: "scheduled peer job cancellation requested" });
+          }
+          return { state: "worker_active", reason: `Cancellation is recorded for peer job ${peerJob.jobId}; waiting for an exact peer acknowledgement.` };
+        }
         if (!job.workSessionId) {
           return { state: "unknown", reason: "No correlated work session is available; worker absence is unproven." };
         }

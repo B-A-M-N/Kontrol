@@ -24,6 +24,8 @@ export const scheduledJobs = sqliteTable("scheduled_jobs", {
   executionMode: text("execution_mode").notNull().default("read_only_audit"),
   policySnapshotJson: text("policy_snapshot_json").notNull(),
   agentName: text("agent_name"),
+  dispatchTarget: text("dispatch_target").notNull().default("direct_acp"),
+  dispatchPeerId: text("dispatch_peer_id"),
   status: text("status").notNull().default("pending"),
   revision: integer("revision").notNull().default(1),
   workSessionId: text("work_session_id"),
