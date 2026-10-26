@@ -948,6 +948,14 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
                 const latestPeerJob = peerJobStore.getJob(peerJob.jobId);
                 if (latestPeerJob?.schedulerDispatchId === scheduledAttempt.dispatchId && latestPeerJob.status === "cancelled") {
                   cancelledBeforeClaim = true;
+                } else if (latestPeerJob?.schedulerDispatchId === scheduledAttempt.dispatchId && latestPeerJob.status === "pending") {
+                  peerJobStore.requestCancel(peerJob.jobId, Date.now());
+                  cancellation = jobs.recordCancellationEvidence({
+                    jobId: cancellation.id,
+                    requestId,
+                    state: "unknown",
+                    lastError: `The peer job remains pending after its unclaimed-cancel compare-and-swap failed (${error instanceof Error ? error.message : String(error)}); durable cancel intent prevents a new claim, but cancellation is not yet confirmed.`,
+                  });
                 } else if (latestPeerJob?.schedulerDispatchId === scheduledAttempt.dispatchId
                   && !["completed", "failed", "cancelled"].includes(latestPeerJob.status)) {
                   peerJobStore.requestCancel(peerJob.jobId, Date.now());

@@ -1187,12 +1187,16 @@ try {
       cancelRequestedAt: undefined as string | undefined,
     };
     let peerCancelRequests = 0;
+    let peerClaimWins = true;
     setPeerJobStoreSingleton({
       getJob: () => peerJob,
       getLatestJobForWorkSession: () => peerJob,
       cancelUnclaimedJob: () => {
-        peerJob.status = "claimed";
-        throw new Error("cancel_requires_ack");
+        if (peerClaimWins) {
+          peerJob.status = "claimed";
+          throw new Error("cancel_requires_ack");
+        }
+        throw new Error("temporary_store_error");
       },
       requestCancel: () => {
         peerCancelRequests++;
@@ -1211,6 +1215,45 @@ try {
         "the job remains fenced until the peer acknowledges the raced cancellation");
       assert.equal(peerCancelRequests, 1, "the exact claimed peer receives a durable cancellation request");
       assert.ok(peerJob.cancelRequestedAt, "the peer job records cancellation before response");
+
+      const pendingRaceJob = jobs.create({
+        principalId: "principal-a",
+        ownerContextId: "principal:principal-a|transport:A",
+        projectId: "project-a",
+        workspaceRoot: "/tmp/project-a",
+        runAt: new Date(Date.now() - 1_000).toISOString(),
+        instructionJson: { instructions: "Cancel while the peer job remains pending." },
+        executionMode: "read_only_audit",
+        policySnapshotJson: { workspaceAccess: "read_only", mutate: false },
+        dispatchTarget: { kind: "peer_pull", peerId: "peer-cancel-race" },
+        workSessionId: peerCancelSession.id,
+        maxRuntimeMs: 60_000,
+      });
+      jobs.transition({ jobId: pendingRaceJob.id, expectedRevision: pendingRaceJob.revision, nextStatus: "due", expectedSourceStatuses: ["pending"] });
+      const pendingRaceDispatch = jobs.claimDispatch({ jobId: pendingRaceJob.id, expectedRevision: 2, dispatcherInstanceId: "test-scheduler" });
+      const activePendingRace = jobs.completeDispatch({
+        jobId: pendingRaceJob.id,
+        dispatchAttemptId: pendingRaceDispatch.attemptId,
+        expectedRevision: pendingRaceDispatch.revision,
+        dispatcherInstanceId: "test-scheduler",
+        outcome: "dispatched",
+        workSessionId: peerCancelSession.id,
+      });
+      peerClaimWins = false;
+      peerJob.jobId = "job_peer_pending_cancel_error";
+      peerJob.schedulerDispatchId = pendingRaceDispatch.dispatchId;
+      peerJob.status = "pending";
+      peerJob.cancelRequestedAt = undefined;
+      const uncertainPendingCancellation = await handlers.get("cancel_scheduled_job")!({
+        scheduledJobId: activePendingRace.id,
+        expectedRevision: activePendingRace.revision,
+        clientMutationId: "peer-pending-cancel-store-error",
+      });
+      assert.equal(uncertainPendingCancellation.structuredContent.status, "cancellation_requested");
+      assert.equal(uncertainPendingCancellation.structuredContent.lastConfirmedRemoteState, "unknown",
+        "a failed pending-state compare-and-swap does not claim a worker is active");
+      assert.equal(peerJob.status, "pending");
+      assert.ok(peerJob.cancelRequestedAt, "durable cancel intent fences the still-pending peer job from a later claim");
     } finally {
       setPeerJobStoreSingleton(undefined);
     }
