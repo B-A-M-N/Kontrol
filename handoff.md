@@ -10,7 +10,7 @@ Preserve untracked `.tmp-scratch/`.
 
 ## Local commits (not pushed)
 
-These six commits are local only; nothing was pushed.
+These seven commits are local only; nothing was pushed.
 
 | # | Commit | Subject |
 |---|--------|---------|
@@ -19,7 +19,8 @@ These six commits are local only; nothing was pushed.
 | 3 | `bf37f2e` | `fix(ingress): never report an unproven route as tailnet-private` |
 | 4 | `072771a` | `test(chain): execute every test file from the canonical chain` |
 | 5 | `e5a07c8` | `docs: record the contracts, the origin decision and the continuation record` |
-| 6 | this commit | `docs: correct the round-7 review row and record the round-13 residuals` |
+| 6 | `1e983ed` | `docs: correct the round-7 review row and record the round-13 residuals` |
+| 7 | this commit | `docs: map the changed-files table one-to-one onto the change` |
 
 Requirement source:
 `/home/bamn/.codex/attachments/458e9b15-a1ec-4247-aa20-19ec878f9be9/pasted-text-1.txt`
@@ -530,8 +531,10 @@ approve with no P0, P1 or P2 finding, and two P3 residuals.
 
 What round 13 verified, from the code rather than from the prose:
 
-- the change is exactly 34 files, and `git diff --name-only 44c247a..e5a07c8`
-  matches the reviewed file list exactly;
+- the change is exactly 34 files, and `git diff --name-only 44c247a..HEAD`
+  matches the reviewed file list exactly. At the time of round 13 the range
+  was `44c247a..e5a07c8`; every commit after it changes only `handoff.md`,
+  which is already in that set, so the range and the file count are unchanged;
 - each of the five commits contains only files that belong to its stated
   subject, and neither `.tmp-scratch/` nor the generated
   `ingress-qualification-matrix.json` is in any commit;
@@ -719,7 +722,7 @@ residuals are closed in section 11. Round 12 reviewed the whole diff a
 seventh time, after the round-11 fixes, and returned approve again with no
 P0, P1 or P2 finding; its one P3 is the direction the module flag takes and
 is recorded in section 11. Round 13 reviewed the committed state - the five
-commits that make up this change - rather than the shared working tree,
+commits that existed at that point - rather than the shared working tree,
 confirmed that the committed bytes are the reviewed bytes, and returned
 approve with no P0, P1 or P2 finding; its two P3 residuals are closed in
 section 12.
@@ -737,7 +740,7 @@ section 12.
 | 10 | `glm-5.3-flash` | changes requested | The check never stripped shell comments from a package.json script body, so a suite named behind a `#` counted as executed (closed in section 10); every token after the interpreter was an executable position, so a flag value that named a suite counted (closed in section 10); an incomplete exposure attribution fell through to the mismatch branch and reported a positive MISMATCH derived from a dropped signal (closed in section 10); an unreadable HostPort key was skipped instead of refused, so shape drift still read as private (closed in section 10); the Hermes adapter carried undeclared, untested `context_transfer` hunks that relaxed a fail-closed continuation gate (reverted in section 10); the dead `firstBoolean()` helper was removed and the uncovered backoff-timestamp restore was asserted (closed in section 10). |
 | 11 | `glm-5.3-flash` | approve, 2 P3 | The manifest guard matched only a double-quoted, single-line import, so four import forms that would ship an undeclared sibling module went unseen (closed in section 11); an interpreter flag outside the hardcoded value-flag set was guessed rather than refused (closed in section 11); the source-pattern assertions in the Hermes adapter test were noted and kept, because that file uses that style and the behavioural coverage lives in `src/adapter-diagnostics.test.mjs`. |
 | 12 | `glm-5.3-flash` | approve, 1 P3 | The two round-11 findings are confirmed closed with the reviewer's own fixtures: the package-manifest scanner finds a single-quoted, multi-line, side-effect, dynamic-with-options and export-from import of an undeclared sibling module, and ignores a commented-out import and a path that is only data; the interpreter-flag rule refuses an unclassified flag, keeps a classified flag value off the program, leaves the program in place after a boolean flag, and treats a python module flag as naming the program (all closed in section 11). The one P3 is the direction the module flag takes - a suite reachable only through one is reported as unexecuted rather than credited - which fails closed and is now stated in the contract. |
-| 13 | `glm-5.3-flash` | approve, 2 P3 | The change was reviewed as the committed state rather than as a working tree: the five commits contain exactly the 34 reviewed files, each commit holds only files that belong to its subject, the two intermediate `package.json` blobs parse, and the checks were re-run against a reconstruction of the committed tree (closed in section 12). The two P3 findings are documentation residuals: the round-7 row still claimed its two P3 findings were unaddressed, and the Workspace App artifact prerequisite of the server-starting suites was not recorded (closed in section 12). |
+| 13 | `glm-5.3-flash` | approve, 2 P3 | At that point the change was reviewed as the committed state rather than as a working tree: the five commits contain exactly the 34 reviewed files, each commit holds only files that belong to its subject, the two intermediate `package.json` blobs parse, and the checks were re-run against a reconstruction of the committed tree (closed in section 12). The two P3 findings are documentation residuals: the round-7 row still claimed its two P3 findings were unaddressed, and the Workspace App artifact prerequisite of the server-starting suites was not recorded (closed in section 12). |
 
 
 The mutation table in section 1 is the executable form of these reviews: each
@@ -826,6 +829,9 @@ Executed in this pass (all from the repository root):
 
 ### Changed and added files
 
+One row per file. These are exactly the files the change touches, and
+they are the same 34 files that `git diff --name-only 44c247a..HEAD` names.
+
 | File | Change |
 |------|--------|
 | `src/server/mcp-http.ts` | pulse deferral gate, delivery-surface ownership, re-arm, generation-fenced clear, single follow-up pulse |
@@ -848,21 +854,43 @@ Executed in this pass (all from the repository root):
 | `src/ingress/profile-status.ts` | a route with unproven public exposure is `UNKNOWN`, never `MAPPING_MATCHED` and never a positive `MISMATCH` |
 | `src/ingress/tailscale-status.test.ts` | drift cases: renamed field, unreadable field, contradictory documents, an unrelated boolean map, a renamed field with an unreadable shape, and an unrecognizable HostPort key |
 | `src/ingress/profile-status.test.ts` | the unproven-exposure classification (including the case where the route also differs), the `FUNNEL-EXPOSED` derivation, and the assertion that a complete attribution still reports a genuine mismatch |
-| `src/ingress/controller.test.ts`, `src/ingress/ingress-tools.test.ts`, `src/ingress/qualification.integration.test.ts` | fixture updates for the new facts fields |
+| `src/ingress/controller.test.ts` | fixture updates for the new facts fields |
+| `src/ingress/ingress-tools.test.ts` | fixture updates for the new facts fields |
+| `src/ingress/qualification.integration.test.ts` | fixture updates for the new facts fields |
 | `src/cli.test.ts` | platform-guarded spawn tripwire; the quoted-binary ban covers every quoting form |
 | `scripts/test-manifest.mjs` | the manifest check now proves *execution* by the canonical chain, not reachability: only a path that reaches a process as the program or as an argument-vector element counts, a call quoted in a string literal is not a call, a spawn helper in an imported local module is followed, shell comments in a script body are stripped, and only the first positional argument of an interpreter is the program it runs. An interpreter flag the checker cannot classify fails the check instead of being guessed (section 11) |
 | `scripts/test-manifest-allowlist.json` | the four stale exclusions removed; the allowlist is empty and a stale entry is now a failure |
 | `scripts/run-ui-tests.mjs` | the UI runner also executes the connection-lifecycle suite |
 | `src/bridge/handoff-tools.ts` | the one-time activation tools' lack of a mutation receipt is now documented (the grant is the idempotency fence) |
 | `src/ui/review-thread-delivery.ts` | the delivery-loop default is documented as a host-boundary guard, not a redundant coalescing |
-| `src/review-thread/review-thread.test.ts`, `src/review-thread/review-thread-mcp.test.ts`, `src/ui/review-thread-delivery.test.ts`, `src/review-browser/contracts.test.ts` | the review-loop suites, now executed by `test:unit` |
-| `src/mcp-inspection-output.test.ts`, `src/pi-tools-read-snapshot.test.ts`, `src/qualification/external-catalog-capture.test.ts`, `src/scheduling/scheduled-artifact-publisher.test.ts`, `src/server/mcp-qualification-evidence.test.ts`, `src/workspace-app-resource-registry.test.mjs` | unit suites, now executed by `test:unit` |
-| `src/ui/connection-lifecycle.bootstrap.test.ts` | now executed by the UI runner |
-| `scripts/probe-mcp-tunnel-failure.test.mjs`, `scripts/lib/probe-failure-receipt.test.mjs` | probe suites, now executed by `test:syntax` |
 | `package.json` | three new declared package files (one of them a pre-existing gap); thirteen suites that were reachable but never executed are now wired into the canonical chain, together with the three new suites this pass added |
 | `AGENTS.md` | the catalog-notification, sandbox and ingress-attribution contracts, updated to match the code, and the canonical-chain rule stated as an executable position, including that a shell comment is not a command, that an unclassified interpreter flag fails the check, and that the package-manifest check is a scanner rather than a pattern |
 | `docs/ingress.md` | the public origin mode decision and the exposure-attribution rule |
-| `handoff.md`, `HANDOFF.md` | this record |
+| `handoff.md` | this record |
+| `HANDOFF.md` | this record |
+
+### Suites this change newly executes
+
+None of these suites is modified by this change; their contents are
+unchanged. What changed is that the canonical chain now executes them,
+so a failure in one of them now fails the chain. The list is the same
+13-suite list as the table in section 6.
+
+| Suite | Now executed by |
+|-------|-----------------|
+| `src/review-thread/review-thread.test.ts` | `test:unit` |
+| `src/review-thread/review-thread-mcp.test.ts` | `test:unit` |
+| `src/ui/review-thread-delivery.test.ts` | `test:unit` |
+| `src/review-browser/contracts.test.ts` | `test:unit` |
+| `src/mcp-inspection-output.test.ts` | `test:unit` |
+| `src/pi-tools-read-snapshot.test.ts` | `test:unit` |
+| `src/qualification/external-catalog-capture.test.ts` | `test:unit` |
+| `src/scheduling/scheduled-artifact-publisher.test.ts` | `test:unit` |
+| `src/server/mcp-qualification-evidence.test.ts` | `test:unit` |
+| `src/workspace-app-resource-registry.test.mjs` | `test:unit` |
+| `src/ui/connection-lifecycle.bootstrap.test.ts` | `test:ui, through scripts/run-ui-tests.mjs` |
+| `scripts/probe-mcp-tunnel-failure.test.mjs` | `test:syntax` |
+| `scripts/lib/probe-failure-receipt.test.mjs` | `test:syntax` |
 
 ## Environment notes
 
