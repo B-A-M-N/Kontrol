@@ -39,7 +39,7 @@ import { applyIngressProfile, disableIngressProfile, listIngressOperationReceipt
 import { latestIngressHealthByProfile } from "./ingress/health-store.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { readPtyReviewFeedback, readPtyReviewSubmission } from "./pty-review-cli.js";
+import { readPtyReviewFeedback, readPtyReviewMutationId, readPtyReviewSubmission } from "./pty-review-cli.js";
 
 type Command = "serve" | "up" | "init" | "doctor" | "config" | "service" | "snapshots" | "review-loop" | "review" | "agent" | "ingress" | "help" | "version";
 const require = createRequire(import.meta.url);
@@ -113,10 +113,16 @@ function normalizeCommand(command: string | undefined): Command {
 async function runPtyReviewCommand(args: string[]): Promise<void> {
   const sub = args[0];
   if (!sub || sub === "help") {
-    output.write("Usage: kontrol review submit [--message <text>] [--no-wait]\n");
+    output.write("Usage: kontrol review submit [--message <text>] [--client-mutation-id <stable-id>] [--no-wait]\n");
     return;
   }
   if (sub !== "submit") throw new Error(`Unknown review subcommand: ${sub} (expected submit)`);
+  const mutationId = readPtyReviewMutationId(args);
+  if (!mutationId.ok) {
+    errorOutput.write(`${mutationId.error}\n`);
+    process.exitCode = 1;
+    return;
+  }
   const credentialPath = process.env.KONTROL_AGENT_PTY_CREDENTIAL_FILE;
   if (!credentialPath) throw new Error("This command is available only inside a Kontrol-managed agent PTY.");
   const canonicalPath = realpathSync(credentialPath);
@@ -180,6 +186,7 @@ async function runPtyReviewCommand(args: string[]): Promise<void> {
       arguments: {
         sessionId: credential.workSessionId,
         ...(flagValue(args, "--message") ? { message: flagValue(args, "--message") } : {}),
+        ...(mutationId.clientMutationId ? { clientMutationId: mutationId.clientMutationId } : {}),
       },
     });
     const submission = readPtyReviewSubmission(submitted);
@@ -188,7 +195,7 @@ async function runPtyReviewCommand(args: string[]): Promise<void> {
       process.exitCode = 1;
       return;
     }
-    output.write(`${JSON.stringify(submission.receipt)}\n`);
+    output.write(`${JSON.stringify({ ...submission.receipt, ...(mutationId.clientMutationId ? { clientMutationId: mutationId.clientMutationId } : {}) })}\n`);
     if (args.includes("--no-wait")) return;
     for (;;) {
       const feedback = await client!.callTool({
@@ -1270,7 +1277,7 @@ function printHelp(): void {
       "  kontrol service install|start|stop|restart|upgrade|status|logs|uninstall",
       "  kontrol snapshots stats|gc",
       "  kontrol review-loop status|on|off|pause|resume --session <workSessionId>",
-      "  kontrol review submit [--message <text>] [--no-wait]   Submit from an agent PTY and await feedback",
+      "  kontrol review submit [--message <text>] [--client-mutation-id <stable-id>] [--no-wait]   Submit from an agent PTY and await feedback",
       "  kontrol agent list|add|remove      Register any loopback HTTP ACP agent",
       "  kontrol ingress inspect|plan|apply|disable|reconcile|doctor   Tailscale route control and qualification",
       "  kontrol -v, --version   Print the installed version",

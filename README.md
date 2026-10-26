@@ -341,6 +341,8 @@ If agent stopped: it reads feedback when it resumes
 
 This loop lives in Kontrol's event log, not in any specific host. You can review submissions from the same interface you use to chat, from a terminal, or from a future tool.
 
+An agent running in a Kontrol-managed PTY can submit and wait with `kontrol review submit`. For safe retries after an uncertain CLI result, pass `--client-mutation-id <stable-id>` and reuse that same ID for the same logical submission; the successful receipt includes the ID.
+
 ## Skill Names
 
 ![Kontrol Ralphie and Nelson skill loop](https://raw.githubusercontent.com/B-A-M-N/Kontrol/main/docs/assets/kontrol-skill-loop.png)

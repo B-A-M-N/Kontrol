@@ -4,7 +4,7 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSy
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { readPtyReviewFeedback, readPtyReviewSubmission } from "./pty-review-cli.js";
+import { readPtyReviewFeedback, readPtyReviewMutationId, readPtyReviewSubmission } from "./pty-review-cli.js";
 
 const repositoryRoot = fileURLToPath(new URL("..", import.meta.url));
 
@@ -19,6 +19,20 @@ assert.equal(readPtyReviewSubmission({ isError: true, content: [{ type: "text", 
   "MCP submission errors, including expired credentials, fail closed");
 assert.equal(readPtyReviewSubmission({ structuredContent: { status: "awaiting_review" } }).ok, false,
   "a malformed submission response is not printed as a successful result");
+assert.deepEqual(readPtyReviewMutationId(["submit", "--client-mutation-id", "review-retry-1"]), {
+  ok: true,
+  clientMutationId: "review-retry-1",
+}, "PTY review retries can preserve a stable mutation identity");
+assert.equal(readPtyReviewMutationId(["submit", "--client-mutation-id"]).ok, false,
+  "a mutation identity cannot be omitted after its flag");
+assert.equal(readPtyReviewMutationId(["submit", "--client-mutation-id", "x".repeat(201)]).ok, false,
+  "mutation identity length matches the durable receipt contract");
+assert.equal(readPtyReviewMutationId(["submit", "--client-mutation-id", "first", "--client-mutation-id", "second"]).ok, false,
+  "duplicate mutation identity flags are rejected as ambiguous");
+assert.match(cliSource, /clientMutationId: mutationId\.clientMutationId/,
+  "the stable PTY review mutation identity reaches submit_for_review");
+assert.match(cliSource, /--client-mutation-id <stable-id>/,
+  "PTY review help documents the retry identity option");
 const feedbackTimeout = readPtyReviewFeedback({ structuredContent: { status: "timeout", sessionId: "work-1" } });
 assert.equal(feedbackTimeout.ok, true);
 assert.equal(feedbackTimeout.status, "timeout", "feedback timeout stays distinguishable so the CLI can continue waiting");

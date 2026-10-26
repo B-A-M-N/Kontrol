@@ -3,6 +3,18 @@ export type PtyReviewFeedbackStatus = "feedback_ready" | "transferred" | "timeou
 export type PtyReviewToolResult = { ok: true; receipt: Record<string, unknown> }
   | { ok: false; error: string };
 
+export function readPtyReviewMutationId(args: string[]): { ok: true; clientMutationId?: string } | { ok: false; error: string } {
+  const indexes = args.flatMap((argument, index) => argument === "--client-mutation-id" ? [index] : []);
+  if (indexes.length === 0) return { ok: true };
+  if (indexes.length > 1) return { ok: false, error: "--client-mutation-id may be specified only once." };
+  const index = indexes[0]!;
+  const clientMutationId = args[index + 1];
+  if (!clientMutationId || clientMutationId.startsWith("--") || clientMutationId.length > 200) {
+    return { ok: false, error: "--client-mutation-id requires a 1–200 character value." };
+  }
+  return { ok: true, clientMutationId };
+}
+
 function objectValue(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, unknown>
