@@ -265,7 +265,7 @@ export function reduceWorkSessionEvent(sessionId: string, event: AgentActivityEv
       host.setErrorMessage(`Could not deliver the review submission to this WebUI context: ${error instanceof Error ? error.message : String(error)}`);
       host.render();
     });
-  } else if (event.type === "review.thread.activated" || event.type === "review.thread.delivery_requeued") {
+  } else if (event.type === "review.thread.activated" || event.type === "review.thread.reattached" || event.type === "review.thread.delivery_requeued") {
     void deliverQueuedReviewMessages().catch((error) => {
       host.setErrorMessage(`Could not deliver queued review submissions to this WebUI context: ${error instanceof Error ? error.message : String(error)}`);
       host.render();

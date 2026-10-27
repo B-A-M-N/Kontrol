@@ -62,8 +62,20 @@ export interface ReviewThreadStore {
   getForContext(principalId: string, contextId: string): ReviewThread | undefined;
   listForContext(principalId: string, contextId: string): ReviewThread[];
   getById(threadId: string): ReviewThread | undefined;
+  /**
+   * Resolve the route and thread targeted by a still-valid activation grant
+   * WITHOUT consuming it. Used as a preflight so caller-supplied workspace or
+   * host identity can be validated before the one-time grant is burned.
+   */
+  getActivationTarget(input: { activationSecret: string; principalId: string }): ReviewThread | undefined;
   createActivation(input: { routeId: string; ownerPrincipalId: string; reviewerPrincipalId: string; ttlMs?: number }): { threadId: string; activationSecret: string; expiresAt: string };
-  activate(input: { activationSecret: string; principalId: string; contextId: string; hostKind?: string; hostConversationId?: string }): ReviewThread;
+  /**
+   * Activate a thread, optionally restricted to an existing binding moving to
+   * a distinct authenticated context (reattachOnly). `reattachOnly` fails
+   * closed when the thread was never bound, or when the caller is not a
+   * distinct context, so a recovery grant cannot fabricate a first binding.
+   */
+  activate(input: { activationSecret: string; principalId: string; contextId: string; hostKind?: string; hostConversationId?: string; reattachOnly?: boolean }): ReviewThread;
   setRouteStatus(routeId: string, routeEpoch: number, status: "active" | "paused" | "disabled" | "closed"): void;
   closeForSession(workSessionId: string): void;
   listMessages(threadId: string): Array<typeof reviewThreadMessages.$inferSelect>;
@@ -84,6 +96,22 @@ export function createReviewThreadStore(database: DatabaseHandle): ReviewThreadS
   return {
     getForRoute,
     getById,
+    getActivationTarget(input) {
+      const hash = createHash("sha256").update(input.activationSecret).digest("hex");
+      const now = new Date().toISOString();
+      const grant = database.db.select().from(reviewThreadActivations).where(and(
+        eq(reviewThreadActivations.activationSecretSha256, hash),
+        eq(reviewThreadActivations.principalId, input.principalId),
+        isNull(reviewThreadActivations.consumedAt), isNull(reviewThreadActivations.revokedAt),
+        gt(reviewThreadActivations.expiresAt, now),
+      )).get();
+      if (!grant) return undefined;
+      const route = database.db.select().from(reviewRoutes).where(eq(reviewRoutes.id, grant.routeId)).get();
+      const thread = database.db.select().from(reviewThreads).where(eq(reviewThreads.id, grant.threadId)).get();
+      if (!route || !thread || route.status !== "active" || route.routeEpoch !== grant.routeEpoch
+        || thread.routeEpoch !== grant.routeEpoch || thread.status === "closed") return undefined;
+      return asThread(thread);
+    },
     getForContext(principalId, contextId) {
       const row = database.db.select().from(reviewThreads).where(and(
         eq(reviewThreads.reviewerPrincipalId, principalId),
@@ -188,6 +216,9 @@ export function createReviewThreadStore(database: DatabaseHandle): ReviewThreadS
         if (existingContextBinding) throw new Error("This authenticated context is already bound to another active review thread.");
         const rebindsThread = Boolean(thread.reviewerContextId
           && (thread.reviewerContextId !== input.contextId || thread.reviewerPrincipalId !== input.principalId));
+        if (input.reattachOnly && (!thread.reviewerContextId || !thread.reviewerPrincipalId || !rebindsThread)) {
+          throw new Error("Review thread reattachment requires an existing binding and a distinct authenticated context.");
+        }
         const consumed = database.db.update(reviewThreadActivations).set({ consumedAt: now }).where(and(
           eq(reviewThreadActivations.id, grant.id), isNull(reviewThreadActivations.consumedAt), isNull(reviewThreadActivations.revokedAt),
         )).run();
@@ -231,9 +262,18 @@ export function createReviewThreadStore(database: DatabaseHandle): ReviewThreadS
       })();
     },
     setRouteStatus(routeId, routeEpoch, status) {
-      const nextThreadStatus = status === "active" ? "active" : status === "paused" ? "paused" : "closed";
       const current = database.db.select().from(reviewThreads).where(and(eq(reviewThreads.routeId, routeId), eq(reviewThreads.routeEpoch, routeEpoch))).get();
       if (!current || current.status === "closed") return;
+      // A route-status change must not fabricate an active thread binding when
+      // none exists. preserve `pending_activation` until a real reviewer
+      // context has been bound, otherwise a resume would look ready while the
+      // thread has no principal/context to deliver into.
+      const activated = Boolean(current.reviewerPrincipalId && current.reviewerContextId);
+      const nextThreadStatus = status === "closed" || status === "disabled"
+        ? "closed"
+        : status === "paused"
+          ? activated ? "paused" : "pending_activation"
+          : activated ? "active" : "pending_activation";
       database.sqlite.transaction(() => {
         database.db.update(reviewThreads).set({
           status: nextThreadStatus,

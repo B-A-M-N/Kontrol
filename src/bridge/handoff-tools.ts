@@ -16,6 +16,7 @@ import { createReviewPacket } from "../review-thread/review-packet.js";
 import { ManualAuthenticationRequiredError } from "../review-browser/browser-controller.js";
 import { reviewBrowserTurns, reviewThreadMessages } from "../db/schema.js";
 import { createHash } from "node:crypto";
+import { workspaceAppRenderToolMeta } from "../workspace-app-resource.js";
 import {
   ExternalCatalogObservationSubmissionSchema,
   validateExternalCatalogObservation,
@@ -911,6 +912,48 @@ export function registerHandoffTools(server: McpServer, config: BridgeConfig): v
         return {
           content: [{ type: "text" as const, text: `Handoff ${claimed.id} claimed for round ${claimed.roundNumber}.` }],
           structuredContent: { handoffId: claimed.id, status: claimed.status, revision: claimed.revision, roundNumber: claimed.roundNumber, claimExpiresAt: claimed.claimExpiresAt },
+        };
+      } catch (error) {
+        return { content: [{ type: "text" as const, text: error instanceof Error ? error.message : String(error) }], isError: true };
+      }
+    },
+  );
+
+  registerMutationAppTool(
+    server,
+    "renew_review_handoff_claim",
+    {
+      title: "Renew review handoff claim",
+      description: "Extend the current reviewer claim before a lengthy inspection or feedback pass. Only the same authenticated reviewer can renew an unexpired claim, up to the bounded cumulative review duration.",
+      inputSchema: { handoffId: z.string(), expectedRevision: z.number().int().min(1), claimLeaseMs: z.number().int().min(60_000).max(30 * 60_000).optional() },
+      outputSchema: { handoffId: z.string(), status: z.string(), revision: z.number(), claimExpiresAt: z.string() },
+      _meta: {},
+      annotations: { readOnlyHint: false },
+    },
+    config,
+    async ({ handoffId, expectedRevision, claimLeaseMs }: { handoffId: string; expectedRevision: number; claimLeaseMs?: number }) => {
+      if (!isReviewer(config.principalRole)) return forbidden(config.principalRole, "renew_review_handoff_claim");
+      const handoff = routes?.getHandoffById(handoffId);
+      if (!handoff || !hasCurrentHandoffClaim(handoff)) return forbidden(config.principalRole, "renew_review_handoff_claim");
+      const route = routes?.getRouteBySession(handoff.workSessionId);
+      const contextId = route ? reviewClaimContextId(config, route.mode) : undefined;
+      if (!contextId || !routes) return forbidden(config.principalRole, "renew_review_handoff_claim");
+      try {
+        const renewed = routes.renewHandoffClaim({
+          handoffId,
+          expectedRevision,
+          principalId: config.principalId ?? `role:${config.principalRole ?? "reviewer"}`,
+          ownerContextId: contextId,
+          claimLeaseMs,
+        });
+        config.eventStore.appendEvent({
+          type: "review.handoff.claim_renewed",
+          sessionId: renewed.workSessionId,
+          payload: { handoffId: renewed.id, revision: renewed.revision, claimExpiresAt: renewed.claimExpiresAt },
+        });
+        return {
+          content: [{ type: "text" as const, text: `Review claim renewed until ${renewed.claimExpiresAt}.` }],
+          structuredContent: { handoffId: renewed.id, status: renewed.status, revision: renewed.revision, claimExpiresAt: renewed.claimExpiresAt! },
         };
       } catch (error) {
         return { content: [{ type: "text" as const, text: error instanceof Error ? error.message : String(error) }], isError: true };
