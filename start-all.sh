@@ -429,18 +429,28 @@ restore_database_if_needed() {
 resolve_artifact_path() {
   local requested_path="$1"
   local resolved_path
-  resolved_path="$(readlink -f -- "$requested_path" 2>/dev/null || true)"
-  if [[ -z "$resolved_path" || ! -d "$resolved_path" ]]; then
+  # Resolve and check containment with Node so native Windows paths and
+  # Git-Bash paths compare in the same platform's path semantics. `readlink
+  # -f` can return a different spelling for the same Windows release path.
+  resolved_path="$(node --input-type=module -e '
+    import { realpathSync, statSync } from "node:fs";
+    import { isAbsolute, relative, sep } from "node:path";
+    try {
+      const requested = realpathSync(process.argv[1]);
+      const releases = realpathSync(process.argv[2]);
+      const rel = relative(releases, requested);
+      if (!statSync(requested).isDirectory()
+        || !rel
+        || rel === ".."
+        || rel.startsWith(`..${sep}`)
+        || isAbsolute(rel)) process.exit(1);
+      process.stdout.write(requested);
+    } catch { process.exit(1); }
+  ' "$requested_path" "$DESKTOP_PWD/releases" 2>/dev/null || true)"
+  if [[ -z "$resolved_path" ]]; then
     echo "ERROR: immutable artifact does not exist: $requested_path" >&2
     return 1
   fi
-  case "$resolved_path" in
-    "$DESKTOP_PWD/releases/"*) ;;
-    *)
-      echo "ERROR: serving artifact is outside immutable releases/: $resolved_path" >&2
-      return 1
-      ;;
-  esac
   local directory_build_id="${resolved_path##*/}"
   local metadata_build_id="$(read_json_field "$resolved_path/build-meta.json" buildId)"
   ARTIFACT_SCHEMA_VERSION="$(read_json_field "$resolved_path/build-meta.json" schemaVersion)"
