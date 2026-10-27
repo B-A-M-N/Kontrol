@@ -66,6 +66,13 @@ function writeExecutable(path, source) {
   chmodSync(path, 0o755);
 }
 
+function symlinkDirectory(target, path) {
+  // Windows requires the type for directory links; `junction` also works on
+  // runners without Developer Mode, where directory symlink creation is not
+  // available to unprivileged processes.
+  symlinkSync(target, path, process.platform === "win32" ? "junction" : "dir");
+}
+
 const shellQuote = (value) => "'" + String(value).replaceAll("'", "'\\''") + "'";
 const realNode = shellQuote(process.execPath);
 
@@ -737,7 +744,7 @@ const normalizeFilesystemPath = (path) => resolve(path);
 const canonicalBaseRelease = normalizeFilesystemPath(realpathSync(baseRelease));
 
 try {
-  symlinkSync(baseRelease, join(root, "dist"));
+  symlinkDirectory(baseRelease, join(root, "dist"));
 
   const successfulState = mkdtempSync(join(harnessRoot, "state-success-"));
   const successfulEnv = writeEnvironment(successfulState, 17676, { useExistingDist: true });
@@ -826,7 +833,7 @@ try {
   // Two deployment controllers must serialize before either can overwrite
   // candidate state or stop the serving generation.
   removeLink(join(root, "dist"));
-  symlinkSync(baseRelease, join(root, "dist"));
+  symlinkDirectory(baseRelease, join(root, "dist"));
   const concurrentState = mkdtempSync(join(harnessRoot, "state-concurrent-"));
   const concurrentEnv = writeEnvironment(concurrentState, 17681, { useExistingDist: true, buildDelaySeconds: "2" });
   const concurrentStart = runLauncher(concurrentEnv);
@@ -856,7 +863,7 @@ try {
   // remain intact and a later controller must be able to reclaim the stale
   // deployment lock and complete a new handoff.
   removeLink(join(root, "dist"));
-  symlinkSync(baseRelease, join(root, "dist"));
+  symlinkDirectory(baseRelease, join(root, "dist"));
   const prepareCrashState = mkdtempSync(join(harnessRoot, "state-controller-crash-prepare-"));
   const prepareCrashEnv = writeEnvironment(prepareCrashState, 17684, { useExistingDist: true });
   const prepareCrashStart = runLauncher(prepareCrashEnv);
@@ -885,7 +892,7 @@ try {
   // converge by activating a candidate and, when that candidate is unhealthy,
   // restoring the exact committed A release rather than leaving no owner.
   removeLink(join(root, "dist"));
-  symlinkSync(baseRelease, join(root, "dist"));
+  symlinkDirectory(baseRelease, join(root, "dist"));
   const postStopCrashState = mkdtempSync(join(harnessRoot, "state-controller-crash-post-stop-"));
   const postStopCrashEnv = writeEnvironment(postStopCrashState, 17685, { useExistingDist: true });
   const postStopCrashStart = runLauncher(postStopCrashEnv);
@@ -919,7 +926,7 @@ try {
 
   removeLink(join(root, "dist"));
   removeGeneratedArtifact(join(root, "dist.previous"), undefined);
-  symlinkSync(baseRelease, join(root, "dist"));
+  symlinkDirectory(baseRelease, join(root, "dist"));
 
   // Exercise the complete restart handoff: A remains healthy during
   // preparation, is stopped only after B is built, and B's failed readiness
@@ -959,7 +966,7 @@ try {
   // runtime-lock acquisition in that activation to fail; the activation trap
   // must reacquire ownership and restore A rather than leaving the stack down.
   removeLink(join(root, "dist"));
-  symlinkSync(baseRelease, join(root, "dist"));
+  symlinkDirectory(baseRelease, join(root, "dist"));
   const gapState = mkdtempSync(join(harnessRoot, "state-handoff-gap-"));
   const gapMarker = join(harnessRoot, "fail-runtime-lock-once");
   const gapEnv = writeEnvironment(gapState, 17680, { useExistingDist: true, failRuntimeLockAcquireOnce: true, runtimeLockFailureMarker: gapMarker });
@@ -984,7 +991,7 @@ try {
   // controller must recover the exact committed release instead of exiting
   // with no runtime owner and no rollback attempt.
   removeLink(join(root, "dist"));
-  symlinkSync(baseRelease, join(root, "dist"));
+  symlinkDirectory(baseRelease, join(root, "dist"));
   const deploymentGapState = mkdtempSync(join(harnessRoot, "state-deployment-gap-"));
   const deploymentGapMarker = join(harnessRoot, "fail-deployment-check-once");
   const deploymentGapEnv = writeEnvironment(deploymentGapState, 17682, {
@@ -1010,7 +1017,7 @@ try {
 
   removeLink(join(root, "dist"));
   removeGeneratedArtifact(join(root, "dist.previous"), undefined);
-  symlinkSync(baseRelease, join(root, "dist"));
+  symlinkDirectory(baseRelease, join(root, "dist"));
   const rollbackState = mkdtempSync(join(harnessRoot, "state-rollback-"));
   const rollbackAppProbeMarker = join(harnessRoot, "rollback-app-probe-compatibility-flag");
   const rollbackEnv = writeEnvironment(rollbackState, 17677, {
@@ -1050,7 +1057,7 @@ try {
   // its outer emergency trap, using the candidate record's build ID rather
   // than silently recording "unknown" provenance.
   removeLink(join(root, "dist"));
-  symlinkSync(baseRelease, join(root, "dist"));
+  symlinkDirectory(baseRelease, join(root, "dist"));
   const outerRecoveryState = mkdtempSync(join(harnessRoot, "state-outer-recovery-"));
   const outerRecoveryMarker = join(harnessRoot, "fail-server-launch-twice");
   const outerRecoveryEnv = writeEnvironment(outerRecoveryState, 17683, { useExistingDist: true, failServerLaunchMarker: outerRecoveryMarker });
@@ -1074,7 +1081,7 @@ try {
 
   removeLink(join(root, "dist"));
   removeGeneratedArtifact(join(root, "dist.previous"), undefined);
-  symlinkSync(baseRelease, join(root, "dist"));
+  symlinkDirectory(baseRelease, join(root, "dist"));
   const failedRollbackState = mkdtempSync(join(harnessRoot, "state-rollback-failed-"));
   const failedRollbackEnv = writeEnvironment(failedRollbackState, 17678, { useExistingDist: false, failAll: true });
   const failedRollback = runLauncher(failedRollbackEnv);
