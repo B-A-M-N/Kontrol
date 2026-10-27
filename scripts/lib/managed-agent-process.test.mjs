@@ -69,7 +69,7 @@ try {
   }
 
   const launchMarker = join(root, "worker-started");
-  const completedGate = await prepareOwnedChild("/bin/sh", ["-c", "exit 0"], {
+  const completedGate = await prepareOwnedChild(process.execPath, ["-e", "process.exit(0)"], {
     cwd: root,
     env: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
   });
