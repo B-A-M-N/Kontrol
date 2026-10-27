@@ -1539,7 +1539,14 @@ if [[ "$ACTIVATE_EXISTING" == "1" ]]; then
     echo "[*] Activating prepared immutable candidate ${CANDIDATE_BUILD_ID} at ${CANDIDATE_ARTIFACT_PATH}."
   fi
 elif [[ "${KONTROL_USE_EXISTING_DIST:-false}" == "true" ]]; then
-  resolve_dist_artifact || exit 1
+  # After an unplanned controller exit the mutable dist projection may be
+  # missing or stale while generation.json still names the committed release.
+  # Prefer that validated immutable artifact; dist remains the migration path
+  # for checkouts that predate generation records.
+  if [[ -z "$PREVIOUS_ARTIFACT_PATH" ]] \
+    || ! resolve_artifact_path "$PREVIOUS_ARTIFACT_PATH" >/dev/null 2>&1; then
+    resolve_dist_artifact || exit 1
+  fi
   CANDIDATE_BUILD_ID="$ARTIFACT_BUILD_ID"
   CANDIDATE_ARTIFACT_PATH="$ACTIVE_ARTIFACT_PATH"
   echo "[*] Reusing previously validated immutable release ${CANDIDATE_BUILD_ID}."

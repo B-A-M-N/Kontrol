@@ -790,9 +790,13 @@ try {
 
   // A clean restart after the process/supervisor disappeared may legitimately
   // select the same committed immutable release. It must not be mistaken for
-  // a rollback attempting to restore the failed candidate to itself.
+  // a rollback attempting to restore the failed candidate to itself. The
+  // mutable dist projection is deliberately absent: generation.json is the
+  // authoritative pointer once an immutable release has been committed.
+  removeLink(join(root, "dist"));
   const sameGenerationRestart = runLauncher(successfulEnv);
-  assert.equal(sameGenerationRestart.status, 0, "restarting the committed release should be allowed:\n" + sameGenerationRestart.stdout + "\n" + sameGenerationRestart.stderr);
+  assert.equal(sameGenerationRestart.status, 0, "restarting the committed release without a dist projection should be allowed:\n" + sameGenerationRestart.stdout + "\n" + sameGenerationRestart.stderr);
+  assert.match(sameGenerationRestart.stdout + sameGenerationRestart.stderr, /Reusing previously validated immutable release/);
   const sameGeneration = JSON.parse(readFileSync(join(successfulState, "generation.json"), "utf8"));
   assert.equal(sameGeneration.status, "active");
   assert.equal(sameGeneration.activeBuildId, baseBuildId);
