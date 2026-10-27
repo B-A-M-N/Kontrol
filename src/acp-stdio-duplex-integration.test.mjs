@@ -1,8 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { createServer } from "node:http";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { realpathSync } from "node:fs";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
@@ -341,7 +340,7 @@ try {
   });
   assert.equal(conflictResponse.status, 409, "a reused key with different content is rejected");
 
-  const canonicalWorkspaceRoot = realpathSync(workspaceRoot);
+  const canonicalWorkspaceRoot = await realpath(workspaceRoot);
   const grant = createReadOnlyExecutionGrant({
     workSessionId: "stdio-read-only-work",
     workspaceSessionId: "stdio-read-only-workspace",
