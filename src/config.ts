@@ -991,7 +991,23 @@ function localPublicBaseUrl(host: string, port: number): string {
 }
 
 function parsePublicBaseUrl(value: string): string {
-  const parsed = new URL(value);
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error(`KONTROL_PUBLIC_BASE_URL is not a valid URL: ${value}`);
+  }
+  // Deployment contract (P1 #7): the public base URL is embedded in OAuth
+  // redirects and issuer metadata, so it must be an origin we actually serve.
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+    throw new Error(`KONTROL_PUBLIC_BASE_URL must use http or https (got "${parsed.protocol}")`);
+  }
+  if (parsed.username || parsed.password) {
+    throw new Error("KONTROL_PUBLIC_BASE_URL must not contain username/password components");
+  }
+  if (parsed.hash) {
+    throw new Error("KONTROL_PUBLIC_BASE_URL must not contain a fragment");
+  }
   parsed.hash = "";
   parsed.search = "";
   parsed.pathname = parsed.pathname.replace(/\/+$/, "");

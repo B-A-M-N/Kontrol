@@ -380,6 +380,51 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
     }
   }
 
+  private ensureProject(canonicalRoot: string, now: string): string {
+    const existing = this.database.db
+      .select()
+      .from(workspaceProjects)
+      .where(eq(workspaceProjects.canonicalRoot, canonicalRoot))
+      .get();
+    if (existing) {
+      this.database.db.update(workspaceProjects).set({ lastUsedAt: now }).where(eq(workspaceProjects.id, existing.id)).run();
+      return existing.id;
+    }
+    const id = `project_${createHash("sha256").update(canonicalRoot).digest("hex").slice(0, 24)}`;
+    this.database.db.insert(workspaceProjects).values({ id, canonicalRoot, createdAt: now, lastUsedAt: now }).run();
+    return id;
+  }
+
+  /** P1 #8: debounce writes by caching lastUsedAt in memory and flushing periodically. */
+  touchSession(id: string): void {
+    const now = Date.now();
+    const last = this.lastUsedAtCache.get(id);
+    // Only update the cache; SQLite write happens on flush.
+    if (last && now - last < SqliteWorkspaceStore.FLUSH_INTERVAL_MS) {
+      return;
+    }
+    this.lastUsedAtCache.set(id, now);
+  }
+
+  private flushLastUsedAtCache(): void {
+    if (this.lastUsedAtCache.size === 0) return;
+    const entries = [...this.lastUsedAtCache.entries()];
+    this.lastUsedAtCache.clear();
+    const now = new Date().toISOString();
+    for (const [id] of entries) {
+      try {
+        this.database.db
+          .update(workspaceSessions)
+          .set({ lastUsedAt: now })
+          .where(eq(workspaceSessions.id, id))
+          .run();
+      } catch {
+        /* non-critical */
+      }
+    }
+  }
+
+  // P1 #11: Don't close shared DB handle - server owns it
   close(): void {
     if (this.flushInterval) {
       clearInterval(this.flushInterval);

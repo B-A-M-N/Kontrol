@@ -1237,6 +1237,90 @@ function inspectDoctorDatabase(stateDir: string): Record<string, { status: "PASS
   return result;
 }
 
+function doctorResult(label: string, status: "PASS" | "WARN" | "FAIL" | "UNAVAILABLE" | string, detail: string): void {
+  console.log(`[${status}] ${label}${detail ? `: ${detail}` : ""}`);
+}
+
+function isLoopbackHostForDoctor(host: string): boolean {
+  return host === "127.0.0.1" || host === "::1" || host === "localhost";
+}
+
+// Review #10: these are optional probes — outside a git checkout they must
+// fail QUIETLY. stdio is captured (never inherited) so Git's "fatal: not a
+// git repository" stderr never leaks into release-test output.
+function gitRevision(): string | undefined {
+  try {
+    return (require("node:child_process") as typeof import("node:child_process")).execFileSync("git", ["rev-parse", "HEAD"], { cwd: process.cwd(), encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+  } catch {
+    return undefined;
+  }
+}
+
+function gitDirtyFileCount(): number | undefined {
+  try {
+    const value = (require("node:child_process") as typeof import("node:child_process")).execFileSync("git", ["status", "--porcelain"], { cwd: process.cwd(), encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+    return value ? value.split("\n").length : 0;
+  } catch {
+    return undefined;
+  }
+}
+
+async function probeMcpInitialize(url: string): Promise<{ status: number; text: string }> {
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { accept: "application/json, text/event-stream", "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: "doctor", method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "kontrol-doctor", version: "1" } } }),
+      signal: AbortSignal.timeout(1_500),
+    });
+    return { status: response.status, text: `${response.status} ${response.statusText}` };
+  } catch (error) {
+    return { status: 0, text: `unreachable (${error instanceof Error ? error.message : String(error)})` };
+  }
+}
+
+function inspectDoctorDatabase(stateDir: string): Record<string, { status: "PASS" | "WARN" | "FAIL" | "UNAVAILABLE"; detail: string }> {
+  const result: Record<string, { status: "PASS" | "WARN" | "FAIL" | "UNAVAILABLE"; detail: string }> = {};
+  const path = join(stateDir, "kontrol.sqlite");
+  if (!existsSync(path)) {
+    result.Database = { status: "WARN", detail: "kontrol.sqlite not present" };
+    return result;
+  }
+  let db: { pragma: (value: string, options?: { simple?: boolean }) => unknown; prepare: (sql: string) => { all: (...args: unknown[]) => unknown[]; get: (...args: unknown[]) => unknown }; close: () => void } | undefined;
+  try {
+    const Database = require("better-sqlite3") as typeof import("better-sqlite3");
+    db = new Database(path, { readonly: true, fileMustExist: true }) as typeof db;
+    const database = db!;
+    const integrity = database.pragma("integrity_check", { simple: true });
+    result.Database = { status: integrity === "ok" ? "PASS" : "FAIL", detail: `integrity=${String(integrity)}` };
+    const schema = database.prepare("select max(version) as version from kontrol_schema_migrations").get() as { version?: number };
+    result["Database schema"] = { status: "PASS", detail: `version=${schema?.version ?? "unknown"}` };
+    const count = (sql: string): number => {
+      const row = database.prepare(sql).get() as { count?: number; c?: number } | undefined;
+      return Number(row?.count ?? row?.c ?? 0);
+    };
+    const statusCounts = (table: string): string => {
+      const rows = db!.prepare(`select status, count(*) as count from ${table} group by status`).all() as Array<{ status: string; count: number }>;
+      return rows.map((row) => `${row.status}=${row.count}`).join(", ") || "none";
+    };
+    result["Event rows"] = { status: "PASS", detail: `total=${count("select count(*) as count from event_log")}; output_delta=${count("select count(*) as count from event_log where type = 'agent.run.output_delta'")}; thought_delta=${count("select count(*) as count from event_log where type = 'agent.run.thought_delta'")}` };
+    result["Work-session states"] = { status: "PASS", detail: statusCounts("work_sessions") };
+    result["Supervisor states"] = { status: "PASS", detail: statusCounts("supervisor_runs") };
+    result["Pending approvals"] = { status: "PASS", detail: statusCounts("approval_requests") };
+    const deadLetters = count("select count(*) as count from dispatch_outbox where status = 'dead_lettered'");
+    result["Dead-letter supervisor actions"] = { status: deadLetters > 0 ? "WARN" : "PASS", detail: String(deadLetters) };
+    const expiredApprovals = count("select count(*) as count from approval_requests where status = 'pending' and expires_at is not null and expires_at < datetime('now')");
+    result["Expired approvals"] = { status: expiredApprovals > 0 ? "WARN" : "PASS", detail: String(expiredApprovals) };
+    const aliveAgents = count("select count(*) as count from agent_registry where datetime(last_heartbeat, '+' || ttl_seconds || ' seconds') >= datetime('now')");
+    result["Registered ACP agents"] = { status: "PASS", detail: String(aliveAgents) };
+  } catch (error) {
+    result.Database = { status: "UNAVAILABLE", detail: error instanceof Error ? error.message : String(error) };
+  } finally {
+    try { db?.close(); } catch { /* diagnostic cleanup */ }
+  }
+  return result;
+}
+
 function runConfigCommand(args: string[]): void {
   const [subcommand, key, ...rest] = args;
   if (subcommand === "effective-policy") {

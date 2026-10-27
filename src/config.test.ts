@@ -175,8 +175,8 @@ assert.throws(
   /Invalid KONTROL_TOOL_MODE: invalid/,
 );
 assert.throws(
-  () => loadConfig({ ...baseEnv, DEVSPACE_TOOL_MODE: "invalid" }),
-  /Invalid DEVSPACE_TOOL_MODE: invalid/,
+  () => loadConfig({ ...baseEnv, KONTROL_TOOL_MODE: "invalid" }),
+  /Invalid KONTROL_TOOL_MODE: invalid/,
 );
 
 assert.deepEqual(loadConfig(baseEnv).logging, {

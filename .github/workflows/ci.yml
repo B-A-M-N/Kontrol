@@ -67,6 +67,13 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
+      # Review P1 #16: production dependency audit is a release gate. High or
+      # critical advisories in runtime deps fail CI; exceptions require an
+      # explicit, documented allowlist — not a global suppression.
+      - name: Production dependency audit
+        if: matrix.os == 'ubuntu-latest'
+        run: npm audit --omit=dev --audit-level=high
+
       - name: Test
         run: npm test
 
