@@ -451,7 +451,11 @@ resolve_artifact_path() {
     echo "ERROR: immutable artifact does not exist: $requested_path" >&2
     return 1
   fi
-  local directory_build_id="${resolved_path##*/}"
+  local directory_build_id
+  directory_build_id="$(node --input-type=module -e '
+    import { basename } from "node:path";
+    process.stdout.write(basename(process.argv[1]));
+  ' "$resolved_path")"
   local metadata_build_id="$(read_json_field "$resolved_path/build-meta.json" buildId)"
   ARTIFACT_SCHEMA_VERSION="$(read_json_field "$resolved_path/build-meta.json" schemaVersion)"
   ARTIFACT_MAX_READABLE_SCHEMA_VERSION="$(read_json_field "$resolved_path/build-meta.json" maxReadableSchemaVersion)"
