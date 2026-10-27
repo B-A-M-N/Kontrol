@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -30,6 +31,11 @@ assert.equal(isPathInsideRoot("/workspace/..cache", "/workspace"), true, "a chil
 assert.equal(isPathInsideRoot("/workspace/..", "/workspace"), false, "an exact parent component escapes");
 assert.equal(isPathInsideRoot("/workspace/sub/..foo", "/workspace"), true, "a nested child named ..foo is inside");
 assert.equal(isPathInsideRoot("/outside/file", "/workspace"), false, "unrelated absolute path escapes");
+assert.equal(
+  isPathInsideRootCanonical(join(tmpdir(), `kontrol-missing-root-${randomUUID()}`), tmpdir()),
+  false,
+  "canonical grant checks fail closed when the requested path cannot be resolved",
+);
 
 if (process.platform === "win32") {
   assert.throws(

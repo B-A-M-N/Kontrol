@@ -47,8 +47,9 @@ export function isPathInsideRootCanonical(path: string, root: string): boolean {
   try {
     return isPathInsideRoot(realpathSync(path), realpathSync(root));
   } catch {
-    // Preserve lexical behavior for configured paths that do not exist yet.
-    return isPathInsideRoot(path, root);
+    // Authorization checks fail closed when either canonical path cannot be
+    // established; lexical containment cannot rule out an inaccessible link.
+    return false;
   }
 }
 
