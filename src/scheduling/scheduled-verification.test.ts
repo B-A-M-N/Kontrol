@@ -174,61 +174,73 @@ try {
     verifyScheduledJob(verificationInput),
     verifyScheduledJob({ ...verificationInput, clientMutationId: "reviewer-request-concurrent" }),
   ]);
-  assert.equal(duplicateResult.executionIdentity, result.executionIdentity,
-    "concurrent identical verification calls share one durable execution identity");
-  assert.equal(distinctRequestResult.executionIdentity, result.executionIdentity,
-    "concurrent distinct reviewer request IDs share the active equivalent verification execution");
-  assert.ok(["running", "completed"].includes(result.status));
-  assert.ok(["running", "completed"].includes(duplicateResult.status));
-  assert.ok(["running", "completed"].includes(distinctRequestResult.status));
-  assert.equal((await readFile(commandLaunches, "utf8")).trim().split("\n").length, 1,
-    "concurrent duplicate requests execute the verification suite once");
-  const completedResult = await verifyScheduledJob(verificationInput);
-  assert.equal(completedResult.status, "completed", "a retry after execution completion retrieves the durable report");
-  const freshVerification = await verifyScheduledJob({ ...verificationInput, clientMutationId: "reviewer-request-2" });
-  assert.notEqual(freshVerification.executionIdentity, completedResult.executionIdentity,
-    "a deliberate fresh verification gets a new immutable execution identity");
-  assert.equal((await readFile(commandLaunches, "utf8")).trim().split("\n").length, 2);
-  activeSubmission = { ...activeSubmission, id: "submission-2", snapshotRef: "fs:submitted-snapshot-2" };
-  await assert.rejects(
-    verifyScheduledJob({ ...verificationInput, clientMutationId: "reviewer-request-1" }),
-    /already used with different content/,
-    "reusing one idempotency key after the submitted snapshot changes fails closed",
-  );
-  const changedSubmissionVerification = await verifyScheduledJob({ ...verificationInput, clientMutationId: "reviewer-request-3" });
-  assert.equal(changedSubmissionVerification.report?.submissionId, "submission-2");
-  assert.equal((await readFile(commandLaunches, "utf8")).trim().split("\n").length, 3);
+  if (process.platform === "linux") {
+    assert.equal(duplicateResult.executionIdentity, result.executionIdentity,
+      "concurrent identical verification calls share one durable execution identity");
+    assert.equal(distinctRequestResult.executionIdentity, result.executionIdentity,
+      "concurrent distinct reviewer request IDs share the active equivalent verification execution");
+    assert.ok(["running", "completed"].includes(result.status));
+    assert.ok(["running", "completed"].includes(duplicateResult.status));
+    assert.ok(["running", "completed"].includes(distinctRequestResult.status));
+    assert.equal((await readFile(commandLaunches, "utf8")).trim().split("\n").length, 1,
+      "concurrent duplicate requests execute the verification suite once");
+    const completedResult = await verifyScheduledJob(verificationInput);
+    assert.equal(completedResult.status, "completed", "a retry after execution completion retrieves the durable report");
+    const freshVerification = await verifyScheduledJob({ ...verificationInput, clientMutationId: "reviewer-request-2" });
+    assert.notEqual(freshVerification.executionIdentity, completedResult.executionIdentity,
+      "a deliberate fresh verification gets a new immutable execution identity");
+    assert.equal((await readFile(commandLaunches, "utf8")).trim().split("\n").length, 2);
+    activeSubmission = { ...activeSubmission, id: "submission-2", snapshotRef: "fs:submitted-snapshot-2" };
+    await assert.rejects(
+      verifyScheduledJob({ ...verificationInput, clientMutationId: "reviewer-request-1" }),
+      /already used with different content/,
+      "reusing one idempotency key after the submitted snapshot changes fails closed",
+    );
+    const changedSubmissionVerification = await verifyScheduledJob({ ...verificationInput, clientMutationId: "reviewer-request-3" });
+    assert.equal(changedSubmissionVerification.report?.submissionId, "submission-2");
+    assert.equal((await readFile(commandLaunches, "utf8")).trim().split("\n").length, 3);
 
-  assert.equal(completedResult.status, "completed");
-  assert.ok(completedResult.report);
-  assert.equal(completedResult.report.results[0]?.status, "passed", "allowlisted command runs through the confined verifier launcher");
-  assert.equal(completedResult.report.executionPolicy.capability, "read_only_verification");
-  assert.equal(completedResult.report.executionPolicy.network, "disabled");
-  assert.deepEqual(completedResult.report.executionPolicy.commands, [{
-    command: "npm test",
-    profile: "npm-test",
-    executable: "npm",
-    args: ["test"],
-    argumentPolicy: "exact_predeclared_argv_no_shell_path_traversal_denied",
-    maxRuntimeMs: 5 * 60_000,
-  }], "report records the exact command and argument policy that was approved");
-  assert.deepEqual(completedResult.report.executionPolicy.writablePaths, [
-    "/workspace (disposable submitted snapshot)",
-    "/tmp (private temporary filesystem)",
-  ]);
-  assert.deepEqual(completedResult.report.executionPolicy.environment, {
-    policy: "explicit_child_environment_allowlist",
-    allowedNames: [],
-  }, "report records environment variable names without storing values");
-  assert.equal(completedResult.report.snapshotRef, "fs:submitted-snapshot");
-  assert.match(completedResult.executionIdentity, /^verification:/, "verification report is durably tied to a unique execution identity");
-  assert.equal(completedResult.report.submissionId, "submission-1");
-  const executionCwd = await readFile(capturedCwd, "utf8");
-  assert.notEqual(executionCwd, workspaceRoot, "tests run in a disposable submitted-snapshot copy");
-  await assert.rejects(readFile(join(workspaceRoot, "verification-output.txt")), /ENOENT/,
-    "test writes cannot alter the source checkout");
-  await assert.rejects(readFile(join(executionCwd, "verification-output.txt")), /ENOENT/,
-    "disposable verification files are removed after the run");
+    assert.equal(completedResult.status, "completed");
+    assert.ok(completedResult.report);
+    assert.equal(completedResult.report.results[0]?.status, "passed", "allowlisted command runs through the confined verifier launcher");
+    assert.equal(completedResult.report.executionPolicy.capability, "read_only_verification");
+    assert.equal(completedResult.report.executionPolicy.network, "disabled");
+    assert.deepEqual(completedResult.report.executionPolicy.commands, [{
+      command: "npm test",
+      profile: "npm-test",
+      executable: "npm",
+      args: ["test"],
+      argumentPolicy: "exact_predeclared_argv_no_shell_path_traversal_denied",
+      maxRuntimeMs: 5 * 60_000,
+    }], "report records the exact command and argument policy that was approved");
+    assert.deepEqual(completedResult.report.executionPolicy.writablePaths, [
+      "/workspace (disposable submitted snapshot)",
+      "/tmp (private temporary filesystem)",
+    ]);
+    assert.deepEqual(completedResult.report.executionPolicy.environment, {
+      policy: "explicit_child_environment_allowlist",
+      allowedNames: [],
+    }, "report records environment variable names without storing values");
+    assert.equal(completedResult.report.snapshotRef, "fs:submitted-snapshot");
+    assert.match(completedResult.executionIdentity, /^verification:/, "verification report is durably tied to a unique execution identity");
+    assert.equal(completedResult.report.submissionId, "submission-1");
+    const executionCwd = await readFile(capturedCwd, "utf8");
+    assert.notEqual(executionCwd, workspaceRoot, "tests run in a disposable submitted-snapshot copy");
+    await assert.rejects(readFile(join(workspaceRoot, "verification-output.txt")), /ENOENT/,
+      "test writes cannot alter the source checkout");
+    await assert.rejects(readFile(join(executionCwd, "verification-output.txt")), /ENOENT/,
+      "disposable verification files are removed after the run");
+  } else {
+    assert.equal(result.status, "failed", "unsupported hosts reject scheduled verification");
+    assert.match(result.failureReason ?? "", /no supported sandbox primitive/,
+      "unsupported hosts fail closed instead of running verification outside confinement");
+    assert.equal(duplicateResult.executionIdentity, result.executionIdentity,
+      "same-key retries resolve to the original fail-closed result");
+    assert.equal(distinctRequestResult.status, "failed",
+      "a separate request also fails closed when the platform cannot provide confinement");
+    await assert.rejects(readFile(commandLaunches, "utf8"), /ENOENT/,
+      "unsupported hosts never launch the verification command");
+  }
 
   await assert.rejects(verifyScheduledJob({
     job: { ...job, policySnapshotJson: { verificationCommands: ["npm test; touch source.txt"] } },
