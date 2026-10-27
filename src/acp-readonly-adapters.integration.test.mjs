@@ -609,12 +609,21 @@ async function runHermes(root) {
   }
 }
 
-const root = await mkdtemp(join(tmpdir(), "kontrol-readonly-adapters-"));
-try {
-  await mkdir(join(root, "crush"), { recursive: true });
-  await runCrush(join(root, "crush"));
-  await mkdir(join(root, "hermes"), { recursive: true });
-  await runHermes(join(root, "hermes"));
-} finally {
-  await rm(root, { recursive: true, force: true });
+if (process.platform !== "linux") {
+  assert.throws(
+    () => findBubblewrap(),
+    (error) => error?.code === "sandbox_unavailable",
+    "non-Linux hosts fail closed instead of claiming to run the Linux-only confined adapter integration",
+  );
+  console.log("acp-readonly-adapters.integration: unsupported platform fails closed; execution integration is Linux-only");
+} else {
+  const root = await mkdtemp(join(tmpdir(), "kontrol-readonly-adapters-"));
+  try {
+    await mkdir(join(root, "crush"), { recursive: true });
+    await runCrush(join(root, "crush"));
+    await mkdir(join(root, "hermes"), { recursive: true });
+    await runHermes(join(root, "hermes"));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 }
