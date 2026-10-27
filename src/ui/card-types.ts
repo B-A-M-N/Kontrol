@@ -40,6 +40,7 @@ export interface ToolResultCard {
   root?: string;
   status?: string;
   runId?: string;
+  reviewThreadId?: string;
   workSessionId?: string;
   output?: string;
   agentStatus?: string;

@@ -296,6 +296,13 @@ const fakeApp = {
   getHostContext() {
     return undefined;
   },
+  getHostCapabilities() {
+    return { message: { text: {} } };
+  },
+  async sendMessage(request: { content?: Array<{ text?: string }> }) {
+    fakeReviewMessage = request.content?.map((part) => part.text ?? "").join("\n") ?? "";
+    return {};
+  },
   async callServerTool(request: { name?: string; arguments?: Record<string, unknown> }) {
     const name = String(request.name ?? "");
     const workspaceId = String((request.arguments as { workspaceId?: string } | undefined)?.workspaceId ?? "");
@@ -330,6 +337,14 @@ const fakeApp = {
     if (name === "list_pending_approvals") {
       const workspaceId = String((request.arguments as { workspaceId?: string } | undefined)?.workspaceId ?? "");
       return { isError: false, content: [], structuredContent: { approvals: fakePendingApprovals.get(workspaceId) ?? [] } };
+    }
+    if (name === "claim_review_thread_deliveries") {
+      const messages = fakeReviewQueue;
+      fakeReviewQueue = [];
+      return { isError: false, content: [], structuredContent: { messages } };
+    }
+    if (name === "acknowledge_review_thread_delivery") {
+      return { isError: false, content: [], structuredContent: { status: "presented" } };
     }
     if (name === "await_workspace_events") {
       if (workspaceId.startsWith("workspace-") && !parkedWorkspaceWatchers.has(workspaceId)) {
@@ -1069,6 +1084,52 @@ fakeApp.emit("toolresult", {
     "the second workspace's center must not inherit the first workspace's approval",
   );
 
+  await fakeApp.onteardown?.();
+  (globalThis as { __KONTROL_UI_TEST_APP_FACTORY__?: () => never }).__KONTROL_UI_TEST_APP_FACTORY__ = undefined;
+}
+
+// Activation is itself the renderer entrypoint for the existing Workspace App
+// message bridge. It must select the authorized workspace and deliver the
+// queued packet without a separate review surface or unrelated renderer call.
+{
+  fakeToolCalls.length = 0;
+  fakeReviewActivationEventDelivered = false;
+  fakeReviewMessage = undefined;
+  fakeReviewQueue = [{
+    threadId: "review-thread-1",
+    handoffId: "review-handoff-1",
+    handoffRevision: 1,
+    payloadSha256: "b".repeat(64),
+    packet: { submission: { submissionId: "submission-first" } },
+  }];
+  fakeEventDelivered = true;
+  fakeReplayDelivered = true;
+  parkedWorkspaceWatchers.delete("workspace-review-activation");
+  (globalThis as { __KONTROL_UI_TEST_APP_FACTORY__?: () => never }).__KONTROL_UI_TEST_APP_FACTORY__ = () => fakeApp as never;
+  const freshApp = await import(`./workspace-app.js?review-activation=${Date.now()}`);
+  const fresh = (freshApp as typeof import("./workspace-app.js")).__workspaceAppTest;
+  await fresh.boot();
+  fakeApp.ontoolresult?.({
+    structuredContent: {
+      tool: "activate_review_thread",
+      threadId: "review-thread-1",
+      reviewThreadId: "review-thread-1",
+      workspaceId: "workspace-review-activation",
+      status: "active",
+    },
+    content: [{ type: "text", text: "Review thread activated." }],
+  });
+  for (let attempt = 0; attempt < 8 && !fakeReviewMessage; attempt += 1) await settle();
+  assert.equal(fresh.getActiveWorkspaceId(), "workspace-review-activation",
+    "activation selects the workspace for event recovery");
+  assert.ok(fakeToolCalls.includes("claim_review_thread_deliveries"),
+    "the activation event drains the review queue in the new app instance");
+  assert.match(fakeReviewMessage ?? "", /review-handoff-1/,
+    "the first queued submission reaches the active WebUI conversation");
+  assert.ok(fakeToolCalls.includes("acknowledge_review_thread_delivery"),
+    "host acceptance is recorded after the WebUI accepts the message");
+  assert.equal(fresh.getLastToolCard(), null, "activation does not create a reviewer-specific tool card");
+  assert.equal(document.querySelector(".review-loop-header"), null, "activation adds no reviewer dashboard or lifecycle screen");
   await fakeApp.onteardown?.();
   (globalThis as { __KONTROL_UI_TEST_APP_FACTORY__?: () => never }).__KONTROL_UI_TEST_APP_FACTORY__ = undefined;
 }

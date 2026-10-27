@@ -78,6 +78,17 @@ try {
     claimLeaseMs: 1_000,
   });
   assert.equal(claimed.status, "claimed");
+  const renewedClaim = routes.renewHandoffClaim({
+    handoffId: h1.id, expectedRevision: claimed.revision, principalId: "user-b",
+    ownerContextId: "review-context-b", claimLeaseMs: 10_000,
+  });
+  assert.equal(renewedClaim.revision, claimed.revision + 1, "renewal uses compare-and-swap revisioning");
+  assert.equal(renewedClaim.claimedAt, claimed.claimedAt, "renewal preserves the cumulative lease start");
+  assert.ok(Date.parse(renewedClaim.claimExpiresAt!) > Date.parse(claimed.claimExpiresAt!), "renewal extends the same active claim");
+  assert.throws(() => routes.renewHandoffClaim({
+    handoffId: h1.id, expectedRevision: renewedClaim.revision, principalId: "user-c",
+    ownerContextId: "review-context-b",
+  }), /different reviewer/i);
   let competing = false;
   try {
     routes.claimHandoff({
