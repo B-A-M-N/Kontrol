@@ -1,5 +1,5 @@
 import { mkdtemp, rm } from "node:fs/promises";
-import { mkdir, readFile as readFileAsync, readdir, lstat, readlink, symlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile as readFileAsync, readdir, lstat, readlink, realpath, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import { join, relative, resolve, dirname, sep } from "node:path";
@@ -297,7 +297,12 @@ export function createReviewCheckpointManager(options: {
     states.set(workspaceId, state);
 
     try {
-      const eligibility = await getGitEligibility(root);
+      // Canonicalize both paths before deriving a Git pathspec. Git may report
+      // a linked worktree via its physical path while an allowed workspace
+      // still carries an OS alias (notably /var vs /private/var on macOS).
+      const canonicalRoot = await realpath(root);
+      state.root = canonicalRoot;
+      const eligibility = await getGitEligibility(canonicalRoot);
       if (!eligibility.ok || !eligibility.gitRoot) {
         const store = getFsStore();
         state.backend = getFsBackend();
@@ -306,7 +311,7 @@ export function createReviewCheckpointManager(options: {
         // captured unconditionally, so every restart wrote another unreferenced
         // full-tree snapshot before checking whether a baseline existed.
         const persisted = await store.loadBaselines(workspaceId);
-        if (persisted && persisted.root === resolve(root) && await store.validateSnapshot(persisted.open)) {
+        if (persisted && persisted.root === resolve(canonicalRoot) && await store.validateSnapshot(persisted.open)) {
           state.filesystemBaselines = {
             open: persisted.open,
             presentation: persisted.presentation,
@@ -316,7 +321,7 @@ export function createReviewCheckpointManager(options: {
           };
         } else {
           await store.runStartupReconciliation();
-          const open = await store.capture(root);
+          const open = await store.capture(canonicalRoot);
           state.filesystemBaselines = {
             open,
             presentation: open,
@@ -324,7 +329,7 @@ export function createReviewCheckpointManager(options: {
             sessions: new Map(),
             presentations: new Map([["default", open]]),
           };
-          await store.saveBaselines(workspaceId, root, state.filesystemBaselines);
+          await store.saveBaselines(workspaceId, canonicalRoot, state.filesystemBaselines);
         }
         state.diagnostic = undefined;
         state.ready = true;
@@ -333,7 +338,7 @@ export function createReviewCheckpointManager(options: {
       }
 
       state.gitRoot = eligibility.gitRoot;
-      state.workspaceRelativePath = relative(eligibility.gitRoot, root) || ".";
+      state.workspaceRelativePath = relative(eligibility.gitRoot, canonicalRoot) || ".";
       const commit = await createWorkingTreeSnapshot(eligibility.gitRoot, state.workspaceRelativePath);
       await git(eligibility.gitRoot, ["update-ref", state.openRef, commit]);
       await git(eligibility.gitRoot, ["update-ref", state.presentationRef, commit]);

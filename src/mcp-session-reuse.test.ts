@@ -188,6 +188,9 @@ try {
     "16 concurrent calls must share the same healthy transport");
   assert.equal((await diagnostics()).mcpSessionMetrics.created, sequentialCreated,
     "100 sequential and 16 concurrent calls must not create replacement transports");
+  await waitFor(async () => (await diagnostics()).mcpSessionMetrics.connectionRecovery.timeline.some(
+    (event: any) => event.kind === "response_finished",
+  ));
   const lifecycleTimeline = (await diagnostics()).mcpSessionMetrics.connectionRecovery.timeline;
   assert.ok(lifecycleTimeline.some((event: any) => event.kind === "tool_call_started" && event.requestKind === "tools/call"));
   assert.ok(lifecycleTimeline.some((event: any) => event.kind === "response_finished"));

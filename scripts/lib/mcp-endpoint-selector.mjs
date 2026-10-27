@@ -115,8 +115,13 @@ export class EndpointPreferenceStore {
     finally { closeSync(fd); }
     try {
       renameSync(temporary, this.#path);
-      const dirFd = openSync(dirname(this.#path), "r");
-      try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
+      // Windows does not expose directory handles that Node can fsync. The
+      // preference payload itself is flushed before the atomic rename above;
+      // supported Linux production releases also flush the containing entry.
+      if (process.platform !== "win32") {
+        const dirFd = openSync(dirname(this.#path), "r");
+        try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
+      }
     } catch (error) {
       try { unlinkSync(temporary); } catch {}
       throw error;
