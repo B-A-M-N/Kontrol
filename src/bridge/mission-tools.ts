@@ -5,14 +5,14 @@
  * this capability module owns one semantic slice of the reviewer/worker
  * control-plane API and receives the same typed BridgeConfig context.
  */
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer } from "@modelcontextprotocol/server";
 import type { BridgeConfig } from "./context.js";
 import { selectHealthyAgent } from "../acp-gateway.js";
 import { verifyMissionSubmission } from "../mission-verifier.js";
 import { registerMutationAppTool } from "./app-tool.js";
 import { missionVerificationOptionsFromConfig } from "./verification-options.js";
 import { criterionUpdateSchema, dispatchAgentTask, findingSchema, findingUpdateSchema, supervisedMissionOptionsSchema, supervisorPacket, workOrderSchema } from "./context.js";
-import { acquireCheckoutModifyLease, captureMissionBaseline, forbidden, isReviewer, liveOwnerContextId, requireWorkSessionMutation, requireWorkSessionRead, renderMissionPrompt, workspaceAppModelAndAppMeta } from "./shared.js";
+import { acquireCheckoutModifyLease, captureMissionBaseline, forbidden, isReviewer, liveOwnerContextId, livePrincipalId, requireWorkSessionMutation, requireWorkSessionRead, renderMissionPrompt, workspaceAppModelAndAppMeta } from "./shared.js";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
 import { z } from "zod/v4";
 import { normalizeWorkspaceSnapshotIdentity } from "../review-checkpoints.js";
@@ -60,6 +60,46 @@ function tryResolveClaimedFindings(
 export function registerMissionTools(server: McpServer, config: BridgeConfig): void {
   registerMutationAppTool(
     server,
+    "record_mission_outcome_observation",
+    {
+      title: "Record external mission outcome observation",
+      description: "Record reviewer-observed user-visible behavior for the exact current submission, snapshot, and review epoch. The expected behavior comes from the immutable mission contract; observer identity comes from the authenticated reviewer principal. Supply concise external evidence. This does not itself approve the mission.",
+      inputSchema: {
+        workSessionId: z.string(),
+        evidenceBasis: z.literal("firsthand_external_observation"),
+        actualBehavior: z.string().trim().min(1).max(8_000),
+        externalEvidence: z.string().trim().min(1).max(16_000),
+        status: z.enum(["confirmed", "rejected"]),
+      },
+      outputSchema: { observationId: z.string(), receipt: z.object({ source: z.literal("firsthand_authenticated_external_reviewer"), observerPrincipalId: z.string(), submissionId: z.string(), reviewEpoch: z.number(), snapshotKind: z.enum(["git", "filesystem"]), snapshotRef: z.string(), expectedBehavior: z.string(), evidenceSha256: z.string(), observationSha256: z.string() }) },
+      _meta: {}, annotations: { readOnlyHint: false },
+    },
+    config,
+    async ({ workSessionId, evidenceBasis, actualBehavior, externalEvidence, status }) => {
+      if (!isReviewer(config.principalRole)) return forbidden(config.principalRole, "record_mission_outcome_observation");
+      const access = requireWorkSessionMutation(config, workSessionId);
+      if (access) return access;
+      const principalId = livePrincipalId(config);
+      const mission = config.missionLedger?.getMissionByWorkSession(workSessionId);
+      const latest = config.workSessions.get(workSessionId)?.latestSubmission;
+      const snapshot = latest && normalizeWorkspaceSnapshotIdentity(latest);
+      if (!config.missionLedger || !mission || !principalId) return { content: [{ type: "text" as const, text: "An authenticated reviewer and mission ledger are required." }], isError: true };
+      if (!latest || latest.reviewEpoch === undefined || !snapshot?.kind || !snapshot.ref) return { content: [{ type: "text" as const, text: "A current submission with an exact snapshot identity and review epoch is required before recording an outcome." }], isError: true };
+      try {
+        const result = config.missionLedger.recordOutcomeObservation(mission.id, {
+          submissionId: latest.id, reviewEpoch: latest.reviewEpoch, snapshotKind: snapshot.kind, snapshotRef: snapshot.ref,
+          observerPrincipalId: principalId, evidenceBasis, externalEvidence, actualBehavior, status,
+        });
+        return {
+          content: [{ type: "text" as const, text: `External outcome observation recorded for submission ${latest.id}, review epoch ${latest.reviewEpoch}. This receipt records evidence; approval still follows the mission policy.` }],
+          structuredContent: { observationId: result.id, receipt: result.receipt },
+        };
+      } catch (error) { return { content: [{ type: "text" as const, text: error instanceof Error ? error.message : String(error) }], isError: true }; }
+    },
+  );
+
+  registerMutationAppTool(
+    server,
     "begin_supervised_work",
     {
       title: "Begin supervised work",
@@ -77,7 +117,7 @@ export function registerMissionTools(server: McpServer, config: BridgeConfig): v
       annotations: { readOnlyHint: false },
     },
     config,
-    async ({ workspaceSessionId, objective, desiredOutcome, constraints, nonGoals, acceptanceCriteria, supervisorInstructions, maxCorrectionRounds, maxWallTimeMinutes, finalVerification, reviewCoverage, outcomeEvidence, autonomyMode, approvalMode, workOrder, agentName }: any) => {
+    async ({ workspaceSessionId, objective, desiredOutcome, constraints, nonGoals, acceptanceCriteria, supervisorInstructions, maxCorrectionRounds, maxWallTimeMinutes, finalVerification, reviewCoverage, completionClaim, outcomeEvidence, outcomeExpectedBehavior, autonomyMode, approvalMode, workOrder, agentName }: any) => {
       if (!isReviewer(config.principalRole)) return forbidden(config.principalRole, "begin_supervised_work");
       if (!config.missionLedger) return { content: [{ type: "text" as const, text: "Mission ledger unavailable." }], isError: true };
       const requiredCount = (acceptanceCriteria ?? []).filter((c: any) => (c.priority ?? "required") === "required").length;
@@ -112,6 +152,7 @@ export function registerMissionTools(server: McpServer, config: BridgeConfig): v
         title: objective.slice(0, 80),
         completionPolicy: "webui_approval_required",
         ownerContextId: liveOwnerContextId(config) ?? config.principalId,
+        principalId: livePrincipalId(config),
       });
       const leaseError = await acquireCheckoutModifyLease(config, workspaceSessionId, created.id);
       if (leaseError) {
@@ -133,7 +174,9 @@ export function registerMissionTools(server: McpServer, config: BridgeConfig): v
           maxCorrectionRounds,
           finalVerification,
           reviewCoverage,
+          completionClaim,
           outcomeEvidence,
+          outcomeExpectedBehavior,
           ...baseline,
         });
         // Mission correction rounds are an evidence/convergence policy. They
@@ -352,7 +395,8 @@ export function registerMissionTools(server: McpServer, config: BridgeConfig): v
         verdict: "changes_requested",
         comments,
         requiredActions: workOrder.requiredActions,
-        reviewerId: "webui",
+        invocationOrigin: "internal_supervisor",
+        reviewerId: "supervisor-runtime",
       });
       return {
           content: [{ type: "text" as const, text: `Changes requested for ${workSessionId}; continuation queued.${findingResolutionErrors.length ? ` Finding resolution remains pending: ${findingResolutionErrors.join("; ")}` : ""}` }],
@@ -441,16 +485,30 @@ export function registerMissionTools(server: McpServer, config: BridgeConfig): v
           isError: true,
         };
       }
-      await config.reviewWorkflow.provideFeedback({
-        sessionId: workSessionId,
-        submissionId: latest.id,
-        diffSha256: latest.diffSha256,
-        reviewEpoch: latest.reviewEpoch,
-        verdict: "approve",
-        comments,
-        reviewerId: "webui",
+      try {
+        await config.reviewWorkflow.provideFeedback({
+          sessionId: workSessionId,
+          submissionId: latest.id,
+          diffSha256: latest.diffSha256,
+          reviewEpoch: latest.reviewEpoch,
+          verdict: "approve",
+          comments,
+          invocationOrigin: "internal_supervisor",
+          reviewerId: "webui",
           completionReportSha256: config.missionLedger.getCompletionReportHash(workSessionId, { submissionId: latest.id, ...snapshotFields(latest), reviewEpoch: latest.reviewEpoch }),
-      });
+        });
+      } catch (error) {
+        return {
+          content: [{ type: "text" as const, text: error instanceof Error ? error.message : String(error) }],
+          structuredContent: {
+            status: "blocked",
+            approved: false,
+            reasons: [error instanceof Error ? error.message : String(error)],
+            packet: await supervisorPacket(config, workSessionId),
+          },
+          isError: true,
+        };
+      }
       const supervisor = config.supervisorRuns?.getByWorkSession(workSessionId);
       if (supervisor) config.supervisorRuns?.transition({ id: supervisor.id, expectedStatus: supervisor.status, expectedRevision: supervisor.revision, nextStatus: "completed" });
       return {

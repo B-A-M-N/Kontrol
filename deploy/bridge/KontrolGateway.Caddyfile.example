@@ -1,0 +1,60 @@
+# Kontrol host's private HTTPS gateway. It is reachable only on the exact
+# Tailscale and WireGuard interface addresses and authenticates the bridge
+# using mTLS plus source-address allowlists. Never bind this service publicly.
+{
+	servers {
+		max_header_size 32KiB
+	}
+}
+
+kontrol-gateway.internal:9444 {
+	bind 100.64.0.2 10.74.0.2
+	tls /etc/kontrol/gateway/server.crt /etc/kontrol/gateway/server.key {
+		client_auth {
+			mode require_and_verify
+			trust_pool file /etc/kontrol/gateway/bridge-client-ca.pem
+		}
+	}
+
+	@bridge remote_ip 100.64.0.3 10.74.0.3
+	@mcp_or_auth path /mcp /.well-known/* /authorize /token /register /revoke /healthz
+	handle @bridge {
+		handle @mcp_or_auth {
+			reverse_proxy 127.0.0.1:7678 {
+				header_up Host kontrol-gateway.internal:9444
+				header_up -X-Forwarded-For
+				header_up -X-Forwarded-Host
+				header_up -X-Forwarded-Proto
+				header_up -X-Forwarded-Port
+				header_up -X-Forwarded-Protocol
+				header_up -X-Forwarded-Scheme
+				header_up -X-Real-IP
+				header_up -CF-Connecting-IP
+				header_up -True-Client-IP
+				header_up -Tailscale-User-Login
+				header_up -Tailscale-User-Name
+				header_up -Tailscale-User-Profile-Pic
+				header_up -Tailscale-User
+				header_up -X-Kontrol-*
+				header_up -Forwarded
+				flush_interval -1
+				transport http {
+					dial_timeout 2s
+					max_conns_per_host 128
+					read_timeout 3600s
+					write_timeout 3600s
+				}
+			}
+		}
+		handle {
+			respond 404
+		}
+	}
+	handle {
+		respond 403
+	}
+
+	request_body {
+		max_size 8MB
+	}
+}

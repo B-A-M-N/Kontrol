@@ -5,12 +5,13 @@
  * this capability module owns one semantic slice of the reviewer/worker
  * control-plane API and receives the same typed BridgeConfig context.
  */
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer } from "@modelcontextprotocol/server";
 import type { BridgeConfig } from "./context.js";
 import { forbidden, isReviewer, liveOwnerContextId, requireWorkSessionRead, workspaceAppModelAndAppMeta } from "./shared.js";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
 import { z } from "zod/v4";
 import { currentMcpRequestSignal } from "../mcp/request-context.js";
+import { workSessionTerminalOutcome } from "../work-session-lifecycle.js";
 
 // Keep the normal Workspace App heartbeat below common intermediary idle
 // limits. Callers may request a shorter bounded wait, but the default must not
@@ -18,15 +19,6 @@ import { currentMcpRequestSignal } from "../mcp/request-context.js";
 export const DEFAULT_WORKSPACE_EVENT_WAIT_MS = 18_000;
 
 export function registerEventTools(server: McpServer, config: BridgeConfig): void {
-const TERMINAL_RUN_EVENTS = new Set([
-  "agent.run.approved",
-  "agent.run.rejected",
-  "agent.run.cancelled",
-  "agent.run.completed",
-  "agent.run.failed",
-  "agent.run.failed_protocol",
-]);
-
   registerAppTool(
     server,
     "await_work_session_events",
@@ -64,10 +56,7 @@ const TERMINAL_RUN_EVENTS = new Set([
       const waitStartedAt = performance.now();
       const events = await config.eventStore.waitForEventsAfter(sessionId, afterSeq, timeoutMs, currentMcpRequestSignal());
       config.onPhaseTiming?.("event.session_wait", performance.now() - waitStartedAt);
-      const terminal = events.some((e) =>
-        TERMINAL_RUN_EVENTS.has(e.type) &&
-        !(session.completionPolicy === "webui_approval_required" && e.type === "agent.run.completed")
-      );
+      const terminal = events.some((event) => Boolean(workSessionTerminalOutcome(event.type, session.completionPolicy)));
       const nextSeq = events.length ? events[events.length - 1].seq : afterSeq;
       return {
         content: [{ type: "text" as const, text: `${events.length} event(s) after seq ${afterSeq}; terminal=${terminal}.` }],
@@ -113,8 +102,7 @@ const TERMINAL_RUN_EVENTS = new Set([
         sessionId,
         afterSeq,
         (candidate) =>
-          TERMINAL_RUN_EVENTS.has(candidate.type) &&
-          !(session.completionPolicy === "webui_approval_required" && candidate.type === "agent.run.completed"),
+          Boolean(workSessionTerminalOutcome(candidate.type, session.completionPolicy)),
         timeoutMs,
       );
       config.onPhaseTiming?.("event.terminal_wait", performance.now() - waitStartedAt);
@@ -123,9 +111,10 @@ const TERMINAL_RUN_EVENTS = new Set([
       // For webui_approval_required sessions, success is ONLY agent.run.approved.
       // For ordinary agent_completion sessions, success is agent.run.completed
       // (a zero exit code is NOT approval — P1 #6).
+      const outcome = workSessionTerminalOutcome(event?.type, latest?.completionPolicy ?? session.completionPolicy);
       const successful = latest?.completionPolicy === "webui_approval_required"
-        ? status === "approved" && event?.type === "agent.run.approved"
-        : (event?.type === "agent.run.completed" || event?.type === "agent.run.approved" || status === "approved");
+        ? status === "approved" && outcome?.status === "approved"
+        : outcome?.successful === true || status === "approved";
       return {
         content: [{ type: "text" as const, text: event ? `Terminal: ${event.type}` : "Still pending." }],
         structuredContent: {

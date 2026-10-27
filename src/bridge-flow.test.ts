@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { createServer, type Server } from "node:http";
+import { spawn, type ChildProcess } from "node:child_process";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -17,17 +19,42 @@ import { createAcpServer } from "./acp-server.js";
 import { openDatabase, databasePath } from "./db/client.js";
 import { createReviewWorkflowService } from "./review-workflow.js";
 import { createReviewRouteStore } from "./review-handoff/route-store.js";
+import { createReviewThreadStore } from "./review-thread/thread-store.js";
 import { createApprovalRequestManager } from "./approval-requests.js";
 import { createPolicyEngine } from "./policy.js";
+import { createSqliteGrantStore } from "./policy-grants.js";
 import { createAgentMessageManager } from "./agent-messages.js";
 import { registerPolicyTools } from "./policy-tools.js";
 import { authorizeWorkSessionAction } from "./work-session-action-guard.js";
 import { compactMissionPacket, projectMissionExecutionContract, renderMissionPrompt } from "./bridge/shared.js";
+import { supervisedMissionOptionsSchema } from "./bridge/context.js";
+import { getPeerJobStore, setPeerJobStoreSingleton } from "./peer/jobs/store.js";
+import { scheduledPeerContinuationJobId } from "./scheduling/scheduled-job-dispatch.js";
+import { openPeerJobStore } from "./peer/jobs/store.js";
+import { manifestSha256 } from "./peer/jobs/service.js";
+import { createMutationReceiptStore } from "./mutation-receipts.js";
+
+assert.equal(supervisedMissionOptionsSchema.safeParse({ outcomeEvidence: "outcome_verified" }).success, false,
+  "the MCP mission contract requires its external outcome oracle before supervised work can start");
+assert.equal(supervisedMissionOptionsSchema.safeParse({
+  outcomeEvidence: "outcome_verified", outcomeExpectedBehavior: "The reviewer can see the saved change after reload.",
+}).success, true, "the MCP mission contract exposes the declared expected behavior used by the reviewer observation tool");
+assert.equal(supervisedMissionOptionsSchema.safeParse({ completionClaim: "real_world_outcome" }).success, false,
+  "real-world completion claims require an explicit observable behavior");
+assert.equal(supervisedMissionOptionsSchema.safeParse({
+  completionClaim: "real_world_outcome", outcomeEvidence: "implementation_verified", outcomeExpectedBehavior: "The change is visible to users.",
+}).success, false, "real-world completion cannot use implementation-only evidence");
+assert.equal(supervisedMissionOptionsSchema.safeParse({
+  completionClaim: "real_world_outcome", outcomeExpectedBehavior: "The change is visible to users.",
+}).success, true, "real-world completion may derive outcome_verified from its explicit claim");
 
 const root = await mkdtemp(join(tmpdir(), "kontrol-bridge-flow-"));
 const VERIFY_WS = "ws-verification-test";
+const UNCERTAIN_WS = "ws-uncertain-dispatch-test";
 const verificationWorkspaceRoot = join(root, "verification-workspace");
+const uncertainWorkspaceRoot = join(root, "uncertain-workspace");
 await mkdir(verificationWorkspaceRoot, { recursive: true });
+await mkdir(uncertainWorkspaceRoot, { recursive: true });
 
 const staleCompactPacket = compactMissionPacket({
   criteria: [{ id: "stale-verified", status: "verified" }],
@@ -73,10 +100,13 @@ const WS = "ws-test";
 
 let httpServer: Server | undefined;
 let acpHttp: import("node:http").Server | undefined;
+let destinationAdapter: ChildProcess | undefined;
 let agentUrl = "";
 let resumeCalls = 0;
+let dropNextDispatchResponse = false;
 let receivedRunsBeforeForeign = -1;
 const receivedRuns: Array<Record<string, any>> = [];
+const acceptedDispatches = new Map<string, string>();
 let reviewPatch = "diff --git a/x.txt b/x.txt\n--- a/x.txt\n+++ b/x.txt\n@@ -1 +1 @@\n-old\n+new\n";
 // Mutable workspace snapshot so a "changed workspace" (drift) can be simulated.
 let currentSnapshot = "deadbeef";
@@ -118,6 +148,7 @@ const supervisorRuns = createSupervisorRuns(db);
 const approvalRequests = createApprovalRequestManager(db);
 let supervisorWakeCalls = 0;
 const agentRegistry = createAgentRegistryManager(db);
+let ptyObservationSessionId: string | undefined;
 
 // Hoisted so the workflow service (created below) can share the exact same
 // workspaces + reviewCheckpoints the bridge config uses (P0 #4/#5 drift check
@@ -126,6 +157,7 @@ const workspaces = {
   getWorkspace: (id: string) => {
     if (id === WS) return { id: WS, root: "/tmp", mode: "checkout" } as any;
     if (id === VERIFY_WS) return { id: VERIFY_WS, root: verificationWorkspaceRoot, mode: "checkout" } as any;
+    if (id === UNCERTAIN_WS) return { id: UNCERTAIN_WS, root: uncertainWorkspaceRoot, mode: "checkout" } as any;
     throw new Error(`Unknown workspace: ${id}`);
   },
   setActiveSession: () => {},
@@ -151,6 +183,7 @@ const reviewCheckpoints = {
 } as any;
 
 const reviewRoutes = createReviewRouteStore(db);
+const reviewThreads = createReviewThreadStore(db);
 const reviewWorkflow = createReviewWorkflowService({
   workSessions,
   eventStore,
@@ -176,7 +209,27 @@ const config: BridgeConfig = {
   agentMessages,
   reviewWorkflow,
   reviewRoutes,
+  reviewThreads,
+  reviewBrowserJobs: { getActiveForThread: () => undefined } as any,
   approvalRequests,
+  agentPtyBindingsForWorkSession: (workSessionId) => workSessionId === ptyObservationSessionId ? [{
+    processSessionId: "proc_reviewer_observe",
+    agentName: "pty-fixture",
+    processGeneration: 3,
+    outputCursor: 24,
+    status: "attached",
+    createdAt: "2026-10-26T12:00:00.000Z",
+  }] : [],
+  observeAgentPty: ({ workSessionId, processSessionId }) => workSessionId === ptyObservationSessionId && processSessionId === "proc_reviewer_observe"
+    ? {
+        output: "read-only terminal output",
+        outputCursor: 24,
+        oldestAvailableCursor: 0,
+        outputTruncated: false,
+        running: true,
+        binding: { agentName: "pty-fixture", processGeneration: 3, status: "attached", createdAt: "2026-10-26T12:00:00.000Z" },
+      }
+    : undefined,
   missionLedger,
   supervisorRuns,
   onSupervisorResume: () => { supervisorWakeCalls += 1; },
@@ -202,15 +255,47 @@ function createSession(): string {
 try {
   seedWorkspace(root, WS);
   seedWorkspace(root, VERIFY_WS, verificationWorkspaceRoot);
+  seedWorkspace(root, UNCERTAIN_WS, uncertainWorkspaceRoot);
 
   // Stand up a tiny healthy ACP agent endpoint so selectHealthyAgent() passes.
   httpServer = createServer(async (req, res) => {
     if (req.method === "POST" && req.url === "/runs") {
       const chunks: Buffer[] = [];
       for await (const chunk of req) chunks.push(Buffer.from(chunk));
-      receivedRuns.push(chunks.length ? JSON.parse(Buffer.concat(chunks).toString()) : {});
+      const requestBody = chunks.length ? JSON.parse(Buffer.concat(chunks).toString()) : {};
+      receivedRuns.push(requestBody);
+      const remoteRunId = `remote-${receivedRuns.length}`;
+      if (typeof requestBody.dispatch_idempotency_key === "string") {
+        acceptedDispatches.set(requestBody.dispatch_idempotency_key, remoteRunId);
+      }
+      if (dropNextDispatchResponse) {
+        dropNextDispatchResponse = false;
+        // The adapter accepted the request, but the HTTP response disappears
+        // after the handler has recorded the request body.
+        res.destroy();
+        return;
+      }
       res.writeHead(202, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ run_id: `remote-${receivedRuns.length}`, status: "running", output: [] }));
+      res.end(JSON.stringify({
+        run_id: remoteRunId,
+        accepted: true,
+        status: "running",
+        output: [],
+        ...(requestBody.agent_name === "mimo-code" && requestBody.dispatch_idempotency_key
+          ? { dispatch_idempotency_key: requestBody.dispatch_idempotency_key }
+          : {}),
+      }));
+      return;
+    }
+    const dispatchLookup = req.url?.match(/^\/runs\/by-dispatch-id\/(.+)$/);
+    if (req.method === "GET" && dispatchLookup) {
+      const remoteRunId = acceptedDispatches.get(decodeURIComponent(dispatchLookup[1]!));
+      if (!remoteRunId) {
+        res.writeHead(404).end();
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ accepted: true, run_id: remoteRunId, status: "running" }));
       return;
     }
     res.writeHead(200, { "Content-Type": "application/json" });
@@ -250,6 +335,58 @@ try {
   const acpAddr = acpHttp.address();
   const acpPort = typeof acpAddr === "object" && acpAddr ? acpAddr.port : 0;
   const acpBase = `http://127.0.0.1:${acpPort}`;
+
+  // Register one real generic stdio adapter beside the fake agents. The
+  // cross-agent transfer scenario below dispatches to this adapter, whose
+  // ACP child records the prompt it actually receives over stdin. This joins
+  // the bridge's durable transfer packet to the provider-session boundary.
+  const destinationAdapterPort = await new Promise<number>((resolve) => {
+    const probe = createServer();
+    probe.listen(0, "127.0.0.1", () => {
+      const address = probe.address();
+      const port = typeof address === "object" && address ? address.port : 0;
+      probe.close(() => resolve(port));
+    });
+  });
+  const destinationPromptPath = join(root, "stdio-transfer-prompt.txt");
+  const destinationChildCode = `let b="";const sid="stdio-transfer-session";process.stdin.setEncoding("utf8");process.stdin.on("data",c=>{b+=c;const lines=b.split(/\\r?\\n/);b=lines.pop()||"";for(const line of lines){const m=JSON.parse(line);let result;if(m.method==="initialize")result={protocolVersion:1,agentCapabilities:{loadSession:true}};else if(m.method==="session/new")result={sessionId:sid};else if(m.method==="session/load")result={sessionId:m.params.sessionId};else if(m.method==="session/prompt"){require("node:fs").writeFileSync(${JSON.stringify(destinationPromptPath)},m.params.prompt[0].text);result={sessionId:m.params.sessionId,stopReason:"end_turn",content:[{type:"text",text:"destination processed transferred checkpoint"}]};setTimeout(()=>process.exit(0),20)}if(result)process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:m.id,result})+"\\n")}})`;
+  destinationAdapter = spawn(process.execPath, ["scripts/acp-stdio-duplex-adapter.mjs"], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      KONTROL_ACP_URL: acpBase,
+      KONTROL_ACP_AGENT_SECRET: "agent-secret",
+      KONTROL_ACP_ADAPTER_SECRET: "test-secret",
+      KONTROL_ACP_AGENT_STATE_FILE: join(root, "stdio-transfer-identity.json"),
+      KONTROL_STDIO_DISPATCH_RECEIPTS: join(root, "stdio-transfer-receipts.json"),
+      KONTROL_STDIO_OWNED_PROCESSES: join(root, "stdio-transfer-owned.json"),
+      KONTROL_STDIO_EVENT_SPOOL: join(root, "stdio-transfer-events.json"),
+      KONTROL_STDIO_TERMINAL_SPOOL: join(root, "stdio-transfer-terminals.json"),
+      KONTROL_STDIO_SESSION_BINDINGS: join(root, "stdio-transfer-bindings.json"),
+      KONTROL_ALLOWED_ROOTS: "/tmp",
+      ACP_STDIO_AGENT_NAME: "stdio-transfer",
+      ACP_STDIO_COMMAND: process.execPath,
+      ACP_STDIO_ARGS_JSON: JSON.stringify(["-e", destinationChildCode]),
+      ACP_STDIO_ADAPTER_PORT: String(destinationAdapterPort),
+    },
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+  let destinationAdapterStderr = "";
+  destinationAdapter.stderr?.on("data", (chunk: Buffer) => { destinationAdapterStderr += chunk.toString("utf8").slice(-4_000); });
+  const adapterReadyDeadline = Date.now() + 5_000;
+  let destinationAdapterReady = false;
+  while (Date.now() < adapterReadyDeadline && destinationAdapter.exitCode === null) {
+    try {
+      const health = await fetch(`http://127.0.0.1:${destinationAdapterPort}/health`);
+      if (health.ok && agentRegistry.listAlive().some((agent) => agent.name === "stdio-transfer")) {
+        destinationAdapterReady = true;
+        break;
+      }
+    } catch { /* adapter is still starting */ }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.ok(destinationAdapterReady, `real stdio destination adapter registered and became ready: ${destinationAdapterStderr}`);
+
   const postAcpEvent = async (runId: string, body: Record<string, unknown>) =>
     fetch(`${acpBase}/runs/${runId}/events`, {
       method: "POST",
@@ -278,6 +415,83 @@ try {
   const clientServer = fakeServer();
   registerBridgeTools(clientServer as any, { ...config, principalRole: "client" });
   registerPolicyTools(reviewerServer as any, { eventStore, policyEngine, approvalRequests, principalRole: "reviewer" });
+  const workspaceGrantOldSession = workSessions.create({ workspaceSessionId: WS, submittedBy: "fixture", ownerContextId: "owner-a" }).id;
+  const sameWorkspaceOtherOwnerSession = workSessions.create({ workspaceSessionId: WS, submittedBy: "fixture", ownerContextId: "owner-b" }).id;
+  const otherWorkspaceSession = workSessions.create({ workspaceSessionId: VERIFY_WS, submittedBy: "fixture" }).id;
+  const workspaceGrantStore = createSqliteGrantStore(db);
+  workspaceGrantStore.insert({
+    id: "a-policy-workspace-grant",
+    principalId: "owner-a",
+    scope: "workspace",
+    scopeId: WS,
+    approvalKey: "tool:write",
+    createdAt: new Date().toISOString(),
+  });
+  workspaceGrantStore.insert({
+    id: "b-policy-old-session-grant",
+    principalId: "reviewer-fixture",
+    scope: "work_session",
+    scopeId: workspaceGrantOldSession,
+    approvalKey: "tool:write",
+    createdAt: new Date().toISOString(),
+  });
+  workspaceGrantStore.insert({
+    id: "c-policy-other-owner-grant",
+    principalId: "owner-b",
+    scope: "work_session",
+    scopeId: sameWorkspaceOtherOwnerSession,
+    approvalKey: "tool:write",
+    createdAt: new Date().toISOString(),
+  });
+  workspaceGrantStore.insert({
+    id: "d-policy-other-workspace-grant",
+    principalId: "reviewer-fixture",
+    scope: "work_session",
+    scopeId: otherWorkspaceSession,
+    approvalKey: "tool:write",
+    createdAt: new Date().toISOString(),
+  });
+  const workspaceGrantServer = fakeServer();
+  registerPolicyTools(workspaceGrantServer as any, {
+    eventStore,
+    policyEngine: createPolicyEngine({ defaultMode: "allow", toolRules: {}, pathRules: [] }, workspaceGrantStore),
+    approvalRequests,
+    workSessions,
+    principalRole: "reviewer",
+  });
+  const firstGrantPage = await workspaceGrantServer.handlers.get("list_policy_grants")!({ workspaceId: WS, limit: 1 });
+  assert.deepEqual(firstGrantPage.structuredContent.grants.map((grant: { id: string }) => grant.id), ["a-policy-workspace-grant"]);
+  assert.equal(firstGrantPage.structuredContent.nextCursor, "a-policy-workspace-grant");
+  const secondGrantPage = await workspaceGrantServer.handlers.get("list_policy_grants")!({
+    workspaceId: WS,
+    limit: 1,
+    afterId: firstGrantPage.structuredContent.nextCursor,
+  });
+  assert.deepEqual(secondGrantPage.structuredContent.grants.map((grant: { id: string }) => grant.id), ["b-policy-old-session-grant"],
+    "workspace grant projection includes old sessions without scanning all grants in the Workspace App");
+  assert.equal(secondGrantPage.structuredContent.nextCursor, "b-policy-old-session-grant");
+  const thirdGrantPage = await workspaceGrantServer.handlers.get("list_policy_grants")!({
+    workspaceId: WS,
+    limit: 1,
+    afterId: secondGrantPage.structuredContent.nextCursor,
+  });
+  assert.deepEqual(thirdGrantPage.structuredContent.grants.map((grant: { id: string }) => grant.id), ["c-policy-other-owner-grant"]);
+  assert.equal(thirdGrantPage.structuredContent.nextCursor, undefined,
+    "workspace projection excludes grants whose sessions belong to other workspaces");
+  const ownerGrantServer = fakeServer();
+  registerPolicyTools(ownerGrantServer as any, {
+    eventStore,
+    policyEngine: createPolicyEngine({ defaultMode: "allow", toolRules: {}, pathRules: [] }, workspaceGrantStore),
+    approvalRequests,
+    workSessions,
+    principalRole: "reviewer",
+    ownerContextId: "owner-a",
+  });
+  const ownerGrantPage = await ownerGrantServer.handlers.get("list_policy_grants")!({ workspaceId: WS, limit: 10 });
+  assert.deepEqual(ownerGrantPage.structuredContent.grants.map((grant: { id: string }) => grant.id), [
+    "a-policy-workspace-grant",
+    "b-policy-old-session-grant",
+  ], "workspace grant pagination applies owner scoping inside the query without leaking hidden grant cursors");
   const callWorker = (name: string, args: any) => workerServer.handlers.get(name)!(args);
   const callReviewer = (name: string, args: any) => reviewerServer.handlers.get(name)!(args);
   const callOpenAIReviewer = (name: string, args: any) => reviewerOpenAIServer.handlers.get(name)!(args);
@@ -285,6 +499,27 @@ try {
   const callOwnerB = (name: string, args: any) => reviewerOwnerBServer.handlers.get(name)!(args);
   const callTransportA = (name: string, args: any) => reviewerTransportAServer.handlers.get(name)!(args);
   const callTransportB = (name: string, args: any) => reviewerTransportBServer.handlers.get(name)!(args);
+  const createIsolatedReviewerContext = (conversationId: string) => {
+    const isolatedServer = fakeServer();
+    const mcpSessionId = `review-session-${conversationId}`;
+    registerBridgeTools(isolatedServer as any, {
+      ...config,
+      principalRole: "reviewer",
+      principalId: "role:reviewer",
+      // Copyable host conversation IDs are correlation metadata only. The
+      // authenticated MCP session is the context-binding authority.
+      connectionConversationId: "same-untrusted-host-conversation",
+      connectionMcpSessionId: mcpSessionId,
+    });
+    return {
+      contextId: `principal:role:reviewer|mcp-session:${mcpSessionId}`,
+      call: (name: string, args: any) => isolatedServer.handlers.get(name)!(args),
+    };
+  };
+  const activateForReviewerContext = (routeId: string, contextId: string) => {
+    const grant = reviewThreads.createActivation({ routeId, ownerPrincipalId: "role:reviewer", reviewerPrincipalId: "role:reviewer" });
+    return reviewThreads.activate({ activationSecret: grant.activationSecret, principalId: "role:reviewer", contextId });
+  };
   const callClient = (name: string, args: any) => clientServer.handlers.get(name)!(args);
 
   // ── App visibility contract: every iframe-called tool grants app visibility ──
@@ -402,6 +637,450 @@ try {
     assert.ok(lateFb.isError, "late feedback on approved session is rejected");
   }
 
+  // ── Scenario 1.0: PTY-style retry identity replays one durable review submission ──
+  {
+    const sessionId = createSession();
+    const server = fakeServer();
+    registerBridgeTools(server as any, {
+      ...config,
+      principalRole: "worker",
+      mutationReceipts: createMutationReceiptStore(db),
+    } as BridgeConfig);
+    const call = (name: string, args: any) => server.handlers.get(name)!(args);
+    const request = {
+      sessionId,
+      message: "Retry this exact logical checkpoint safely.",
+      clientMutationId: "pty-review-retry-integration",
+    };
+    const first = await call("submit_for_review", request);
+    const retry = await call("submit_for_review", request);
+    assert.ok(!first.isError && !retry.isError, "the original submission and exact retry both return success");
+    assert.equal(retry.structuredContent.submissionId, first.structuredContent.submissionId,
+      "a lost CLI response can be retried with the same durable submission receipt");
+    assert.equal(workSessions.getSubmissions(sessionId).length, 1,
+      "same-key retry does not create a second review submission");
+    const conflicting = await call("submit_for_review", {
+      ...request,
+      message: "Different content must not reuse the receipt.",
+    });
+    assert.equal(conflicting.isError, true, "reusing the key for different content fails closed");
+    assert.equal(workSessions.getSubmissions(sessionId).length, 1,
+      "conflicting retry content cannot create another submission");
+  }
+
+  // ── Scenario 1.1: committed transfer stays committed during later live feedback ──
+  {
+    const sessionId = createSession();
+    await callWorker("submit_for_review", { sessionId });
+    const transferId = `committed-transfer-${sessionId}`;
+    eventStore.appendEvent({
+      type: "session.handoff",
+      sessionId,
+      payload: { transferId, runId: `run-${sessionId}`, fromAgent: "source", toAgent: "destination" },
+    });
+    eventStore.appendEvent({
+      type: "session.handoff.state",
+      sessionId,
+      payload: { transferId, state: "committed" },
+    });
+
+    const waiter = callWorker("await_review_feedback", { sessionId, timeoutMs: 5_000 });
+    const waiterDeadline = Date.now() + 1_000;
+    while (!liveWaiters.has(sessionId) && Date.now() < waiterDeadline) await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.ok(liveWaiters.has(sessionId), "destination worker is parked for its next review round");
+    await callReviewer("provide_review_feedback", {
+      sessionId,
+      verdict: "changes_requested",
+      comments: "Continue in the already transferred worker session.",
+    });
+    await runContinuationTick(config);
+    const handoffStates = eventStore.getEventsForSession(sessionId)
+      .filter((event) => event.type === "session.handoff.state" && (event.payload as Record<string, unknown>).transferId === transferId)
+      .map((event) => (event.payload as Record<string, unknown>).state);
+    assert.deepEqual(handoffStates, ["committed"],
+      "a later live continuation must not regress a completed transfer to quiescing_source");
+    const feedback = await waiter;
+    assert.equal(feedback.structuredContent.status, "feedback_ready");
+    assert.equal(feedback.structuredContent.feedback.verdict, "changes_requested");
+  }
+
+  // ── Scenario 1a: explicit handoff preserves origin and binds a fresh destination context ──
+  {
+    const sessionId = createSession();
+    await callReviewer("configure_review_loop", {
+      workSessionId: sessionId,
+      enabled: true,
+      mode: "isolated_review",
+      maxReviewRounds: 3,
+    });
+    const sourceAgent = agentRegistry.listAlive().find((agent) => agent.name === "cli-coding-agent")!;
+    const initialCheckpoint = await callWorker("submit_for_review", { sessionId, message: "Initial implementation checkpoint." });
+    assert.ok(!initialCheckpoint.isError);
+    const reviewRoute = reviewRoutes.getRouteBySession(sessionId)!;
+    const firstReviewHandoff = reviewRoutes.getHandoffBySubmission(
+      sessionId,
+      initialCheckpoint.structuredContent.submissionId,
+      initialCheckpoint.structuredContent.reviewEpoch,
+    )!;
+    const reviewContext = createIsolatedReviewerContext("cross-agent-review-continuity");
+    const reviewThread = activateForReviewerContext(reviewRoute.id, reviewContext.contextId);
+    const firstClaim = await reviewContext.call("claim_review_handoff", {
+      handoffId: firstReviewHandoff.id,
+      expectedRevision: firstReviewHandoff.revision,
+      reviewThreadId: reviewThread.id,
+    });
+    assert.ok(!firstClaim.isError, "the exact first submission is claimed by the selected reviewer thread");
+    const originalTask = `Implement the handoff fixture behavior. ${"Keep the full task context intact across the worker transfer. ".repeat(24)}`;
+    const originRun = agentRegistry.createRun({
+      agentName: sourceAgent.name,
+      agentId: sourceAgent.id,
+      workspaceSessionId: WS,
+      workSessionId: sessionId,
+      inputTask: originalTask,
+      inputPreview: originalTask.slice(0, 500),
+      status: "awaiting_review",
+    });
+    const parkedSourcePromise = callWorker("await_review_feedback", { sessionId, timeoutMs: 5000 });
+    const parkedDeadline = Date.now() + 1000;
+    while (!liveWaiters.has(sessionId) && Date.now() < parkedDeadline) await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.ok(liveWaiters.has(sessionId), "the source worker is parked on the review continuation before handoff");
+    const runId = originRun.runId;
+    const handoff = await callReviewer("handoff_work_session", {
+      sessionId,
+      toAgent: "stdio-transfer",
+      reason: "Continue using the second adapter.",
+    });
+    assert.equal(handoff.structuredContent.status, "requested", "handoff reports a durable request, not a completed transfer");
+    const parkedSource = await parkedSourcePromise;
+    assert.equal(parkedSource.structuredContent.status, "transferred", "the parked source is instructed to stop instead of consuming destination feedback");
+    assert.equal(liveWaiters.has(sessionId), false, "the source waiter is removed before destination dispatch");
+    const handoffEvent = eventStore.getEventsForSession(sessionId).find((event) => event.type === "session.handoff")!;
+    const handoffPayload = handoffEvent.payload as Record<string, any>;
+    assert.equal(handoffPayload.state, "requested");
+    assert.equal(handoffPayload.contextTransferPacket.task, originalTask,
+      "context transfer uses the exact original task rather than its bounded display preview");
+    assert.equal(handoffPayload.contextTransferPacket.taskSha256, createHash("sha256").update(originalTask).digest("hex"),
+      "context transfer carries the hash of the exact original task");
+    assert.equal(handoffPayload.contextTransferPacket.taskComplete, true);
+    assert.equal(handoffPayload.contextTransferPacket.checkpoint.snapshotKind, "git");
+    assert.equal(handoffPayload.contextTransferPacket.checkpoint.snapshotRef, currentSnapshot,
+      "context transfer binds the exact submitted checkpoint");
+    assert.equal(handoffPayload.contextTransferPacket.checkpoint.submissionId, initialCheckpoint.structuredContent.submissionId);
+    assert.equal(createHash("sha256").update(JSON.stringify(handoffPayload.contextTransferPacket)).digest("hex"), handoffPayload.contextTransferSha256,
+      "the persisted context packet has an immutable content hash");
+    const handoffFeedback = await reviewContext.call("submit_handoff_feedback", {
+      handoffId: firstReviewHandoff.id,
+      expectedRevision: firstClaim.structuredContent.revision,
+      verdict: "changes_requested",
+      comments: "Preserve the exact checkpoint and add the missing edge case.",
+      requiredActions: ["Add the missing edge case"],
+    });
+    assert.ok(!handoffFeedback.isError, `handoff review feedback must persist: ${JSON.stringify(handoffFeedback)}`);
+    await runContinuationTick({ ...config, resumeAgent: undefined });
+    const destinationPromptDeadline = Date.now() + 5_000;
+    while (Date.now() < destinationPromptDeadline) {
+      try {
+        const prompt = await import("node:fs/promises").then(({ readFile }) => readFile(destinationPromptPath, "utf8"));
+        if (prompt.includes("Immutable cross-agent context transfer")) break;
+      } catch { /* the adapter child has not received the prompt yet */ }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    const destinationPrompt = await import("node:fs/promises").then(({ readFile }) => readFile(destinationPromptPath, "utf8"));
+    assert.match(destinationPrompt, /Immutable cross-agent context transfer/, "the real ACP child receives the durable transfer packet in its prompt");
+    assert.ok(destinationPrompt.includes(originalTask), "the real ACP child receives the exact original task");
+    assert.ok(destinationPrompt.includes("Preserve the exact checkpoint and add the missing edge case."), "the real ACP child receives the latest committed reviewer feedback");
+    assert.ok(destinationPrompt.includes(`\"snapshotRef\": \"${currentSnapshot}\"`), "the real ACP child receives the checkpoint identity");
+    const destinationBody = destinationPrompt;
+    const transferContextEvent = eventStore.getEventsForSession(sessionId).find((event) => event.type === "session.handoff.context")!;
+    const transferContextPayload = transferContextEvent.payload as Record<string, any>;
+    const destination = agentRegistry.listAlive().find((agent) => agent.name === "stdio-transfer")!;
+    assert.equal(agentRegistry.getLatestDispatchAttemptForRun(runId)?.agentId, destination.id,
+      "the real adapter's resumed attempt is authenticated as the destination agent");
+    assert.ok(destinationBody.includes(String(handoff.structuredContent.transferId)));
+    assert.ok(destinationBody.includes(String(transferContextPayload.contextTransferSha256)));
+    assert.equal(transferContextPayload.contextTransferPacket.latestReviewerFeedback.comments,
+      "Preserve the exact checkpoint and add the missing edge case.", "the transfer packet includes the latest committed reviewer feedback");
+    assert.equal(transferContextPayload.contextTransferPacket.continuation.reviewEpoch,
+      continuationManager.listForSession(sessionId).at(-1)?.reviewEpoch, "the packet binds the exact continuation review epoch");
+    assert.equal(agentRegistry.getRun(runId)?.agentId, originRun.agentId, "the logical run retains the origin identity");
+    assert.equal(agentRegistry.getLatestDispatchAttemptForRun(runId)?.agentId, destination.id,
+      "the destination identity is stored on the new immutable attempt");
+    const completedDeadline = Date.now() + 5_000;
+    while (agentRegistry.getRun(runId)?.status !== "completed" && Date.now() < completedDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    assert.equal(agentRegistry.getRun(runId)?.status, "completed",
+      "the real stdio adapter's authoritative ACP end_turn settles the destination attempt");
+    const handoffStates = eventStore.getEventsForSession(sessionId)
+      .filter((event) => event.type === "session.handoff.state")
+      .map((event) => (event.payload as Record<string, unknown>).state);
+    assert.deepEqual(handoffStates.slice(-2), ["destination_ready", "committed"]);
+    const sameExecutorHandoff = await callReviewer("handoff_work_session", {
+      sessionId,
+      toAgent: "stdio-transfer",
+      reason: "The logical run still names its origin, but this is already the latest executor.",
+    });
+    assert.equal(sameExecutorHandoff.structuredContent.status, "unchanged",
+      "handoff ownership follows the latest durable dispatch attempt, not the immutable origin run");
+    assert.equal(eventStore.getEventsForSession(sessionId).filter((event) => event.type === "session.handoff").length, 1,
+      "a same-destination request does not create a spurious second transfer");
+
+    const secondCheckpoint = await callWorker("submit_for_review", {
+      sessionId,
+      message: "Destination implemented the requested edge case.",
+    });
+    assert.ok(!secondCheckpoint.isError, "the transferred destination can submit a second checkpoint to the original work session");
+    const secondSubmission = workSessions.get(sessionId)!.latestSubmission!;
+    const secondReviewHandoff = reviewRoutes.getHandoffBySubmission(sessionId, secondSubmission.id, secondSubmission.reviewEpoch)!;
+    assert.ok(secondReviewHandoff, "the second destination checkpoint creates its own immutable review handoff");
+    assert.equal(reviewRoutes.getRouteBySession(sessionId)?.id, reviewRoute.id, "round two remains bound to the original reviewer route");
+    const secondClaim = await reviewContext.call("claim_review_handoff", {
+      handoffId: secondReviewHandoff.id,
+      expectedRevision: secondReviewHandoff.revision,
+      reviewThreadId: reviewThread.id,
+    });
+    assert.ok(!secondClaim.isError, "the original reviewer thread can claim the destination's second checkpoint");
+    const destinationFeedbackWaiter = callWorker("await_review_feedback", { sessionId, timeoutMs: 5_000 });
+    const secondFeedback = await reviewContext.call("submit_handoff_feedback", {
+      handoffId: secondReviewHandoff.id,
+      expectedRevision: secondClaim.structuredContent.revision,
+      verdict: "approve",
+      comments: "Round two is approved on the same reviewer thread.",
+    });
+    assert.ok(!secondFeedback.isError, "the same reviewer thread commits round-two approval");
+    const destinationFeedback = await destinationFeedbackWaiter;
+    assert.equal(destinationFeedback.structuredContent.status, "feedback_ready", "the destination worker receives round-two feedback directly");
+    assert.equal(destinationFeedback.structuredContent.feedback.verdict, "approve");
+    assert.equal(workSessions.get(sessionId)?.id, sessionId, "review continuation preserves the original logical work session after transfer");
+    assert.equal(workSessions.get(sessionId)?.status, "approved", "round-two reviewer approval settles the original work session");
+  }
+
+  // ── Scenario 1a.1: later transfer records its current executor, not run origin ──
+  {
+    const sessionId = createSession();
+    const origin = agentRegistry.listAlive().find((agent) => agent.name === "cli-coding-agent")!;
+    const currentExecutor = agentRegistry.listAlive().find((agent) => agent.name === "stdio-transfer")!;
+    const nextExecutor = agentRegistry.listAlive().find((agent) => agent.name === "mimo-code")!;
+    const run = agentRegistry.createRun({
+      agentName: origin.name,
+      agentId: origin.id,
+      workspaceSessionId: WS,
+      workSessionId: sessionId,
+      inputTask: "Continue the already transferred work.",
+      status: "awaiting_review",
+    });
+    const latestAttemptKey = `sequential-transfer-source-${sessionId}`;
+    agentRegistry.beginDispatchAttempt({ key: latestAttemptKey, runId: run.runId, agentId: currentExecutor.id, attemptNumber: 2 });
+    agentRegistry.updateDispatchAttempt(latestAttemptKey, { status: "accepted", remoteRunId: "current-executor-run" });
+    const result = await callReviewer("handoff_work_session", {
+      sessionId,
+      toAgent: nextExecutor.name,
+      reason: "Transfer from the current executor after a prior handoff.",
+    });
+    assert.equal(result.structuredContent.status, "requested");
+    const event = eventStore.getEventsForSession(sessionId).find((candidate) => candidate.type === "session.handoff")!;
+    const payload = event.payload as Record<string, unknown>;
+    assert.equal(payload.fromAgentId, currentExecutor.id, "handoff provenance identifies the latest executor");
+    assert.equal(agentRegistry.getRun(run.runId)?.agentId, origin.id, "the run continues to retain its immutable origin identity");
+  }
+
+  // ── Scenario 1a.2: a re-registered destination cannot inherit an old transfer ──
+  {
+    const sessionId = createSession();
+    const source = agentRegistry.listAlive().find((agent) => agent.name === "cli-coding-agent")!;
+    const destination = agentRegistry.listAlive().find((agent) => agent.name === "mimo-code")!;
+    const submitted = await callWorker("submit_for_review", { sessionId, message: "Pin this handoff to the selected adapter identity." });
+    assert.ok(!submitted.isError);
+    agentRegistry.createRun({
+      agentName: source.name,
+      agentId: source.id,
+      workspaceSessionId: WS,
+      workSessionId: sessionId,
+      inputTask: "Continue only on the reviewer-selected destination identity.",
+      status: "awaiting_review",
+    });
+    const handoff = await callReviewer("handoff_work_session", { sessionId, toAgent: destination.name });
+    assert.equal(handoff.structuredContent.status, "requested");
+    await callReviewer("provide_review_feedback", {
+      sessionId,
+      submissionId: submitted.structuredContent.submissionId,
+      verdict: "changes_requested",
+      comments: "Continue after the explicit destination handoff.",
+    });
+
+    const rotatedRegistry = new Proxy(agentRegistry as any, {
+      get(target, property) {
+        if (property === "listAlive") {
+          return () => target.listAlive().map((agent: any) => agent.id === destination.id
+            ? { ...agent, id: `${agent.id}-replacement` }
+            : agent);
+        }
+        const value = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const before = receivedRuns.length;
+    await runContinuationTick({ ...config, agentRegistry: rotatedRegistry, resumeAgent: undefined } as BridgeConfig);
+    assert.equal(receivedRuns.length, before, "a replacement registration with the same name does not receive the old transfer");
+    assert.equal(continuationManager.listForSession(sessionId).at(-1)?.status, "pending",
+      "the continuation remains recoverable until an explicit destination rebind");
+    assert.ok(eventStore.getEventsForSession(sessionId).some((event) => event.type === "session.handoff.state"
+      && (event.payload as Record<string, unknown>).transferId === handoff.structuredContent.transferId
+      && (event.payload as Record<string, unknown>).state === "blocked"),
+    "the handoff records the destination identity mismatch for reviewer-visible recovery");
+
+    const rebindSession = createSession();
+    const origin = agentRegistry.listAlive().find((agent) => agent.name === "cli-coding-agent")!;
+    const priorDestinationAttempt = `rebind-source-${rebindSession}`;
+    const rebindRun = agentRegistry.createRun({
+      agentName: origin.name,
+      agentId: origin.id,
+      workspaceSessionId: WS,
+      workSessionId: rebindSession,
+      inputTask: "Continue under a reviewer-approved replacement adapter.",
+      status: "awaiting_review",
+    });
+    agentRegistry.beginDispatchAttempt({
+      key: priorDestinationAttempt,
+      runId: rebindRun.runId,
+      agentId: destination.id,
+      attemptNumber: 2,
+    });
+    agentRegistry.updateDispatchAttempt(priorDestinationAttempt, { status: "accepted", remoteRunId: "prior-destination-run" });
+    const rotatedReviewer = fakeServer();
+    registerBridgeTools(rotatedReviewer as any, {
+      ...config,
+      agentRegistry: rotatedRegistry,
+      principalRole: "reviewer",
+    } as BridgeConfig);
+    const rebind = await rotatedReviewer.handlers.get("handoff_work_session")!({
+      sessionId: rebindSession,
+      toAgent: destination.name,
+      reason: "Approve the replacement registration with the same routing name.",
+    });
+    assert.equal(rebind.structuredContent.status, "requested",
+      "a replacement with the same name can be explicitly re-bound by durable identity");
+    const rebindEvent = eventStore.getEventsForSession(rebindSession).find((event) => event.type === "session.handoff")!;
+    assert.equal((rebindEvent.payload as Record<string, unknown>).toAgentId, `${destination.id}-replacement`,
+      "the new transfer binds to the replacement registration identity");
+  }
+
+  // ── Scenario 1b: a live source lease fences destination mutation until quiescence ──
+  {
+    const sessionId = createSession();
+    const sourceAgent = agentRegistry.listAlive().find((agent) => agent.name === "cli-coding-agent")!;
+    const submitted = await callWorker("submit_for_review", { sessionId, message: "Live source checkpoint." });
+    assert.ok(!submitted.isError);
+    const sourceRun = agentRegistry.createRun({
+      agentName: sourceAgent.name,
+      agentId: sourceAgent.id,
+      workspaceSessionId: WS,
+      workSessionId: sessionId,
+      inputPreview: "Continue the live source task.",
+      status: "running",
+    });
+    const sourceDispatch = `handoff-live-source-${sessionId}`;
+    agentRegistry.beginDispatchAttempt({ key: sourceDispatch, runId: sourceRun.runId, agentId: sourceAgent.id, attemptNumber: 1 });
+    agentRegistry.updateDispatchAttempt(sourceDispatch, { status: "accepted", remoteRunId: "live-source-remote" });
+    agentRegistry.updateRun(sourceRun.runId, {
+      remoteRunId: "live-source-remote",
+      workerLeaseUntil: new Date(Date.now() + 60_000).toISOString(),
+    });
+    const handoff = await callReviewer("handoff_work_session", { sessionId, toAgent: "mimo-code", reason: "Wait for source quiescence." });
+    assert.equal(handoff.structuredContent.status, "requested");
+    await callReviewer("provide_review_feedback", {
+      sessionId,
+      submissionId: submitted.structuredContent.submissionId,
+      verdict: "changes_requested",
+      comments: "Continue after the source relinquishes its lease.",
+    });
+    assert.equal(agentRegistry.getRun(sourceRun.runId)?.status, "changes_requested");
+    assert.equal(agentRegistry.getRun(sourceRun.runId)?.agentId, sourceAgent.id);
+    assert.equal(agentRegistry.getLatestDispatchAttemptForRun(sourceRun.runId)?.agentId, sourceAgent.id);
+    assert.ok(Date.parse(agentRegistry.getRun(sourceRun.runId)?.workerLeaseUntil ?? "") > Date.now());
+    const before = receivedRuns.length;
+    await runContinuationTick({ ...config, resumeAgent: undefined });
+    assert.equal(receivedRuns.length, before, `destination is not dispatched while the source owns a live mutation lease; run=${JSON.stringify(agentRegistry.getRun(sourceRun.runId))}; attempt=${JSON.stringify(agentRegistry.getLatestDispatchAttemptForRun(sourceRun.runId))}; body=${JSON.stringify(receivedRuns.at(-1))}`);
+    assert.equal(continuationManager.listForSession(sessionId).at(-1)?.status, "pending",
+      "the continuation stays recoverable while source shutdown is pending");
+    assert.ok(eventStore.getEventsForSession(sessionId).some((event) => event.type === "session.handoff.state"
+      && (event.payload as Record<string, unknown>).state === "quiescing_source"));
+    agentRegistry.updateRun(sourceRun.runId, { status: "awaiting_review", workerLeaseUntil: null });
+    const pendingHandoffOutbox = dispatchOutbox.listByAggregate(continuationManager.listForSession(sessionId).at(-1)!.id)[0];
+    db.sqlite.prepare("update dispatch_outbox set available_at = ? where id = ?").run(new Date(Date.now() - 1000).toISOString(), pendingHandoffOutbox.id);
+    await runContinuationTick({ ...config, resumeAgent: undefined });
+    assert.equal(receivedRuns.length, before + 1, "destination dispatch begins after source quiescence is observed");
+    assert.equal(receivedRuns.at(-1)?.agent_id, agentRegistry.listAlive().find((agent) => agent.name === "mimo-code")?.id);
+    await callReviewer("cancel_work_session", { sessionId });
+    reviewWorkflow.finalizeCancellation({ sessionId, reason: "source quiescence fixture complete" });
+  }
+
+  // ── Scenario 2: dead agent (no live waiter) -> exactly one redispatch ──
+  // A lost destination acceptance response is reconciled by the exact durable
+  // attempt identity; it must never create a second destination launch.
+  {
+    const sessionId = createSession();
+    const submitted = await callWorker("submit_for_review", { sessionId, message: "Checkpoint before uncertain transfer." });
+    assert.ok(!submitted.isError);
+    const source = agentRegistry.listAlive().find((agent) => agent.name === "cli-coding-agent")!;
+    const origin = agentRegistry.createRun({
+      agentName: source.name,
+      agentId: source.id,
+      workspaceSessionId: WS,
+      workSessionId: sessionId,
+      inputPreview: "Transfer with acceptance response loss.",
+      status: "awaiting_review",
+    });
+    const handoff = await callReviewer("handoff_work_session", { sessionId, toAgent: "mimo-code", reason: "Exercise exact-attempt reconciliation." });
+    assert.equal(handoff.structuredContent.status, "requested");
+    const feedback = await callReviewer("provide_review_feedback", {
+      sessionId,
+      submissionId: submitted.structuredContent.submissionId,
+      verdict: "changes_requested",
+      comments: "Continue on the destination agent.",
+    });
+    assert.ok(!feedback.isError);
+    const continuation = continuationManager.listForSession(sessionId).at(-1)!;
+    const before = receivedRuns.length;
+    dropNextDispatchResponse = true;
+    await runContinuationTick({ ...config, resumeAgent: undefined });
+    assert.equal(receivedRuns.length, before + 1, "the destination receives one launch whose acceptance response is lost");
+    assert.equal(continuationManager.get(continuation.id)?.status, "reconciliation_required",
+      "uncertain destination acceptance is durably fenced from automatic redispatch");
+    assert.equal(agentRegistry.getRun(origin.runId)?.status, "dispatch_uncertain");
+    const attempt = agentRegistry.getLatestDispatchAttemptForRun(origin.runId)!;
+    assert.equal(attempt.status, "uncertain");
+    assert.ok(acceptedDispatches.has(attempt.dispatchIdempotencyKey), "the test adapter durably records the exact accepted dispatch");
+    const acceptedCount = receivedRuns.length;
+    await runContinuationTick({ ...config, resumeAgent: undefined });
+    assert.equal(receivedRuns.length, acceptedCount, "reconciliation does not issue a second worker launch");
+    assert.equal(continuationManager.get(continuation.id)?.status, "dispatched",
+      "the continuation commits after exact adapter lookup confirms acceptance");
+    assert.equal(agentRegistry.getLatestDispatchAttemptForRun(origin.runId)?.status, "accepted");
+    const handoffStates = eventStore.getEventsForSession(sessionId)
+      .filter((event) => event.type === "session.handoff.state")
+      .map((event) => (event.payload as Record<string, unknown>).state);
+    assert.deepEqual(handoffStates.slice(-2), ["destination_ready", "committed"]);
+    const destinationWaiter = callWorker("await_review_feedback", { sessionId, timeoutMs: 5_000 });
+    const secondSubmission = await callWorker("submit_for_review", {
+      sessionId,
+      message: "The destination completed the reconciled continuation.",
+    });
+    assert.ok(!secondSubmission.isError, "the destination can submit after uncertain acceptance is reconciled");
+    const secondFeedback = await callReviewer("provide_review_feedback", {
+      sessionId,
+      submissionId: secondSubmission.structuredContent.submissionId,
+      verdict: "approve",
+      comments: "The destination continuation is approved.",
+    });
+    assert.ok(!secondFeedback.isError, "the destination's second checkpoint can be reviewed");
+    const destinationFeedback = await destinationWaiter;
+    assert.equal(destinationFeedback.structuredContent.status, "feedback_ready");
+    assert.equal(destinationFeedback.structuredContent.feedback.verdict, "approve",
+      "reconciliation marks transferred feedback consumed, so the destination receives only round-two feedback");
+    await callReviewer("cancel_work_session", { sessionId });
+  }
+
   // ── Scenario 2: dead agent (no live waiter) -> exactly one redispatch ──
   {
     const sessionId = createSession();
@@ -481,8 +1160,12 @@ try {
     const pending = continuationManager.listForSession(sessionId).find((c) => c.status === "pending");
     assert.ok(pending, "changes_requested creates a pending continuation");
 
-    config.reviewWorkflow.cancelSession({ sessionId, reason: "test cancellation" });
-    assert.equal(workSessions.get(sessionId)!.status, "cancelled");
+    const cancellation = config.reviewWorkflow.cancelSession({ sessionId, reason: "test cancellation" });
+    assert.equal(cancellation.status, "cancelling",
+      "a correlated run with no remote ID or dispatch receipt remains fenced as an unknown worker state");
+    assert.equal(workSessions.get(sessionId)!.status, "cancelling");
+    assert.equal(eventStore.getEventsForSession(sessionId).some((event) => event.type === "agent.run.cancelled"), false,
+      "missing remote metadata does not fabricate worker shutdown");
     assert.equal(continuationManager.get(pending.id)?.status, "superseded");
 
     const before = resumeCalls;
@@ -517,9 +1200,14 @@ try {
     };
     await runContinuationTick(raceConfig);
     assert.equal(adapterCalls, 0, "no adapter call occurs after cancellation wins the dispatch race");
-    assert.equal(workSessions.get(sessionId)!.status, "cancelled");
+    assert.equal(workSessions.get(sessionId)!.status, "cancelling",
+      "cancellation during an uncertain continuation dispatch does not release the session early");
+    assert.equal(authorizeWorkSessionAction(workSessions, { workSessionId: sessionId, tool: "edit" }).allowed, false,
+      "cancellation fences further worker mutations");
+    assert.equal(authorizeWorkSessionAction(workSessions, { workSessionId: sessionId, tool: "await_review_feedback" }).allowed, true,
+      "an already waiting worker may observe the cancellation signal and exit");
     assert.equal(continuationManager.get(pending.id)?.status, "superseded", "late delivery CAS does not overwrite superseded continuation");
-    assert.equal(agentRegistry.getRun(run.runId)?.status, "cancelled", "logical run remains cancelled");
+    assert.equal(agentRegistry.getRun(run.runId)?.status, "cancelling", "logical run remains fenced until shutdown evidence arrives");
   }
 
   // ── Scenario 2d: pre-outbox pending continuations are backfilled into the outbox ──
@@ -940,6 +1628,96 @@ try {
       description: "The worker needs permission to continue.",
       options: [{ id: "allow", label: "Allow", effect: "approve", scope: "work_session" }],
     });
+    ptyObservationSessionId = sessionId;
+    const deliveryRoute = reviewRoutes.configure({
+      workSessionId: sessionId, ownerPrincipalId: "snapshot-owner", ownerContextId: "snapshot-owner-context",
+      enabled: true, mode: "isolated_review", maxReviewRounds: 3,
+      deliveryTransport: "native_cdp", browserProfileId: "reviewer-snapshot-profile",
+    });
+    const activation = reviewThreads.createActivation({
+      routeId: deliveryRoute.id, ownerPrincipalId: "snapshot-owner", reviewerPrincipalId: "snapshot-reviewer",
+    });
+    const deliveryThread = reviewThreads.activate({
+      activationSecret: activation.activationSecret, principalId: "snapshot-reviewer", contextId: "snapshot-reviewer-context",
+    });
+    const snapshotSubmission = workSessions.getLatestSubmission(sessionId)!;
+    const deliveryHandoff = reviewRoutes.createHandoff({
+      routeId: deliveryRoute.id, workSessionId: sessionId,
+      submissionId: snapshotSubmission.id, reviewEpoch: snapshotSubmission.reviewEpoch!,
+      snapshotKind: snapshotSubmission.snapshotKind!, snapshotRef: snapshotSubmission.snapshotRef!,
+      diffSha256: snapshotSubmission.diffSha256!, roundNumber: 1,
+    });
+    const snapshotReviewContext = createIsolatedReviewerContext("review-snapshot-status");
+    const snapshotActivation = reviewThreads.createActivation({
+      routeId: deliveryRoute.id, ownerPrincipalId: "snapshot-owner", reviewerPrincipalId: "role:reviewer",
+    });
+    const snapshotReviewThread = reviewThreads.activate({
+      activationSecret: snapshotActivation.activationSecret, principalId: "role:reviewer", contextId: snapshotReviewContext.contextId,
+    });
+    const snapshotDelivery = await snapshotReviewContext.call("claim_review_thread_deliveries", {});
+    const snapshotMessage = snapshotDelivery.structuredContent.messages[0];
+    assert.equal(snapshotMessage?.handoffId, deliveryHandoff.id, "the pinned reviewer context receives the exact queued packet");
+    const snapshotDeliveryAck = await snapshotReviewContext.call("acknowledge_review_thread_delivery", {
+      threadId: snapshotReviewThread.id, handoffId: deliveryHandoff.id, payloadSha256: snapshotMessage.payloadSha256, outcome: "accepted",
+    });
+    assert.ok(!snapshotDeliveryAck.isError, "the pinned reviewer context records host delivery acceptance");
+    const snapshotHandoffClaim = await snapshotReviewContext.call("claim_review_handoff", {
+      handoffId: deliveryHandoff.id, expectedRevision: deliveryHandoff.revision, reviewThreadId: snapshotReviewThread.id,
+    });
+    assert.ok(!snapshotHandoffClaim.isError, "snapshot review handoff is claimed by its bound reviewer thread");
+    db.sqlite.prepare(`update review_threads set browser_profile_id = ?, browser_generation = 3,
+      conversation_url = ?, conversation_key = ?, conversation_fingerprint = ?, conversation_binding_revision = 4,
+      conversation_binding_status = 'bound' where id = ?`)
+      .run("reviewer-snapshot-profile", "https://chatgpt.com/c/conversation_snapshot", "conversation_snapshot", "f".repeat(64), deliveryThread.id);
+    config.reviewBrowserJobs!.getActiveForThread = (threadId: string) => threadId === deliveryThread.id ? ({
+      id: "browser-turn-snapshot", status: "awaiting_feedback", attemptNumber: 2,
+      promptSubmittedAt: "2026-10-26T12:01:00.000Z", generationStartedAt: "2026-10-26T12:01:01.000Z",
+      generationFinishedAt: "2026-10-26T12:01:02.000Z",
+    } as any) : undefined;
+    const replyDestination = agentRegistry.listAlive().find((agent) => agent.name === "cli-coding-agent");
+    assert.ok(replyDestination, "snapshot reply fixture has a live destination agent");
+    const replyRun = agentRegistry.createRun({
+      agentName: replyDestination.name,
+      agentId: replyDestination.id,
+      workspaceSessionId: WS,
+      workSessionId: sessionId,
+      status: "running",
+      attemptNumber: 3,
+    });
+    const replyDispatchKey = "snapshot-reply-dispatch";
+    agentRegistry.beginDispatchAttempt({ key: replyDispatchKey, runId: replyRun.runId, agentId: replyDestination.id, attemptNumber: 4 });
+    agentRegistry.updateDispatchAttempt(replyDispatchKey, { status: "accepted", remoteRunId: "snapshot-reply-remote" });
+    const snapshotQuestion = agentMessages.post({
+      workSessionId: sessionId,
+      runId: replyRun.runId,
+      kind: "clarification_request",
+      title: "Clarify snapshot destination",
+      body: "Which endpoint should I use?",
+      data: { expectsReply: true, resumeOnReply: true },
+    });
+    agentMessages.waitForReply({
+      messageId: snapshotQuestion.id,
+      workSessionId: sessionId,
+      runId: replyRun.runId,
+      attempt: 3,
+      expectsReply: true,
+      resumeOnReply: true,
+    });
+    const snapshotReply = agentMessages.acceptReply({
+      messageId: snapshotQuestion.id,
+      workSessionId: sessionId,
+      body: "Use the staged endpoint.",
+      reviewerPrincipalId: "snapshot-reviewer",
+    }).reply;
+    agentMessages.recordReplyDispatch({
+      replyId: snapshotReply.id,
+      expectedStatus: "pending_delivery",
+      nextStatus: "awaiting_acknowledgement",
+      dispatchIdempotencyKey: replyDispatchKey,
+      runId: replyRun.runId,
+      attemptNumber: 4,
+      remoteRunId: "snapshot-reply-remote",
+    });
     const snapshot = await callReviewer("get_work_session_snapshot", { sessionId });
     assert.ok(!snapshot.isError, "work-session snapshot rehydrates");
     assert.equal(snapshot.structuredContent.latestSubmission.submissionId, submitted.structuredContent.submissionId);
@@ -949,6 +1727,37 @@ try {
     assert.equal(snapshot.structuredContent.pendingApprovals[0].approvalId, pendingApproval.approvalId);
     assert.equal(snapshot.structuredContent.pendingApprovals[0].title, pendingApproval.title);
     assert.equal(snapshot.structuredContent.pendingApprovals[0].options[0].id, "allow");
+    assert.equal(snapshot.structuredContent.agentPtys[0].processGeneration, 3,
+      "cold session hydration includes durable PTY ownership and generation");
+    assert.equal(snapshot.structuredContent.reviewLoop.deliveryTransport, "native_cdp");
+    assert.equal(snapshot.structuredContent.reviewLoop.browserProfileId, "reviewer-snapshot-profile");
+    assert.equal(snapshot.structuredContent.reviewLoop.conversation.key, "conversation_snapshot");
+    assert.equal(snapshot.structuredContent.reviewLoop.conversation.bindingRevision, 4);
+    assert.equal(snapshot.structuredContent.reviewLoop.deliveryMessage.status, "reviewer_claimed");
+    assert.equal(snapshot.structuredContent.reviewLoop.deliveryMessage.messageId,
+      reviewThreads.listMessages(deliveryThread.id).find((message) => message.handoffId === deliveryHandoff.id)?.id);
+    assert.equal(snapshot.structuredContent.reviewLoop.browserAttempt.status, "awaiting_feedback",
+      "snapshot exposes the current durable browser-turn state without claiming reviewer feedback");
+    const projectedReply = snapshot.structuredContent.agentMessages.find((message: { messageId: string }) => message.messageId === snapshotQuestion.id);
+    assert.equal(projectedReply.replyStatus, "awaiting_acknowledgement");
+    assert.equal(projectedReply.replyDeliveryAttemptNumber, 4);
+    assert.equal(projectedReply.replyDestinationAgentId, replyDestination.id,
+      "cold session hydration binds clarification state to the exact accepted destination attempt");
+    assert.equal(projectedReply.replyDestinationAgentName, replyDestination.name);
+    const ptyObservation = await callReviewer("observe_agent_pty", {
+      sessionId,
+      processSessionId: "proc_reviewer_observe",
+      afterCursor: 12,
+    });
+    assert.equal(ptyObservation.structuredContent.output, "read-only terminal output");
+    assert.equal(ptyObservation.structuredContent.outputCursor, 24);
+    assert.equal(ptyObservation.structuredContent.running, true);
+    const workerPtyObservation = await callWorker("observe_agent_pty", {
+      sessionId,
+      processSessionId: "proc_reviewer_observe",
+    });
+    assert.ok(workerPtyObservation.isError, "PTY output observation is reviewer-only");
+    ptyObservationSessionId = undefined;
     const surface = await callReviewer("get_workspace_session_surface", { workspaceId: WS });
     assert.ok(!surface.isError, "workspace session surface reads through the shared snapshot path");
     assert.ok(surface.structuredContent.sessions.some((entry: { sessionId: string }) => entry.sessionId === sessionId));
@@ -971,7 +1780,7 @@ try {
 
     // Simulate the workspace changing since the submission was captured.
     currentSnapshot = "changed-since-submit";
-    const changedWorkspace = await callReviewer("provide_review_feedback", {
+    const changedWorkspace = await snapshotReviewContext.call("provide_review_feedback", {
       sessionId,
       submissionId: submitted.structuredContent.submissionId,
       diffSha256: submitted.structuredContent.diffSha256,
@@ -982,7 +1791,7 @@ try {
     currentSnapshot = "deadbeef";
 
     reviewPatch = "";
-    const stale = await callReviewer("provide_review_feedback", {
+    const stale = await snapshotReviewContext.call("provide_review_feedback", {
       sessionId,
       submissionId: submitted.structuredContent.submissionId,
       diffSha256: "not-the-submitted-diff",
@@ -991,14 +1800,14 @@ try {
     });
     assert.ok(stale.isError, "stale diff hash cannot be approved");
 
-    const approved = await callReviewer("provide_review_feedback", {
+    const approved = await snapshotReviewContext.call("provide_review_feedback", {
       sessionId,
       submissionId: submitted.structuredContent.submissionId,
       diffSha256: submitted.structuredContent.diffSha256,
       reviewEpoch: submitted.structuredContent.reviewEpoch,
       verdict: "approve",
     });
-    assert.ok(!approved.isError, "current exact submission can be approved");
+    assert.ok(!approved.isError, `current exact submission can be approved: ${JSON.stringify(approved)}`);
     assert.equal(workSessions.get(sessionId)!.status, "approved");
     reviewPatch = "diff --git a/x.txt b/x.txt\n--- a/x.txt\n+++ b/x.txt\n@@ -1 +1 @@\n-old\n+new\n";
   }
@@ -1248,16 +2057,19 @@ try {
   // ── Scenario 12c: R06 — a governed route blocks unclaimed feedback and admits
   //    the exact claimed handoff through the authoritative workflow ──
   {
-    const sessionId = createSession();
-    const configured = await callReviewer("configure_review_loop", {
+    const sessionId = workSessions.create({ workspaceSessionId: WS, submittedBy: "webui", ownerContextId: "conversation:owner-a" }).id;
+    const configured = await callOwnerA("configure_review_loop", {
       workSessionId: sessionId, enabled: true, mode: "isolated_review", maxReviewRounds: 2,
     });
     assert.ok(!configured.isError, "reviewer can configure an isolated review route");
-    await callWorker("submit_for_review", { sessionId });
+    const submittedForLoop = await callWorker("submit_for_review", { sessionId });
+    assert.equal(submittedForLoop._meta?.card, undefined, "an active review loop sends its submission through MCP without adding a reviewer UI card");
     const submission = workSessions.get(sessionId)!.latestSubmission!;
     const route = reviewRoutes.getRouteBySession(sessionId)!;
     const handoff = reviewRoutes.getHandoffBySubmission(sessionId, submission.id, submission.reviewEpoch)!;
     assert.ok(handoff, "a governed submission creates a handoff");
+    const reviewContext = createIsolatedReviewerContext("owner-b-session-12c");
+    const thread = activateForReviewerContext(route.id, reviewContext.contextId);
 
     // Unclaimed handoff: ordinary feedback must be rejected by the workflow.
     const blocked = await callReviewer("provide_review_feedback", { sessionId, verdict: "approve" });
@@ -1265,10 +2077,51 @@ try {
     assert.equal(workSessions.get(sessionId)!.status, "awaiting_review", "blocked feedback did not mutate the session");
 
     // Claim the exact handoff, then the same feedback is admitted.
-    const claimed = await callReviewer("claim_review_handoff", { handoffId: handoff.id, expectedRevision: handoff.revision });
+    const claimed = await reviewContext.call("claim_review_handoff", { handoffId: handoff.id, expectedRevision: handoff.revision, reviewThreadId: thread.id, destinationConversationId: reviewContext.contextId });
     assert.ok(!claimed.isError, "reviewer claims the handoff: " + JSON.stringify(claimed.content));
-    const admitted = await callReviewer("provide_review_feedback", { sessionId, verdict: "changes_requested", comments: "Please address the reviewed issue before resubmitting." });
-    assert.ok(!admitted.isError, "claimed handoff admits review feedback: " + JSON.stringify(admitted.content));
+    const claimedSubmission = await reviewContext.call("get_review_submission", { sessionId, submissionId: submission.id });
+    assert.ok(!claimedSubmission.isError, "the activated reviewer can read the exact claimed submission from its separate context");
+    assert.match(String((claimedSubmission.structuredContent as { patch?: string }).patch ?? ""), /diff --git/, "the authorized reviewer receives the immutable submission diff");
+    assert.equal(claimedSubmission._meta?.card, undefined, "the reviewer receives the diff through MCP without a reviewer-facing UI card");
+    const crossContextFeedback = await callOwnerA("provide_review_feedback", { sessionId, verdict: "approve", comments: "wrong context" });
+    assert.ok(crossContextFeedback.isError, "the originating context cannot answer a handoff claimed by the separate reviewer context");
+    assert.equal(workSessions.get(sessionId)!.status, "awaiting_review", "cross-context feedback leaves the pending review unchanged");
+    const released = await reviewContext.call("release_review_handoff", {
+      handoffId: handoff.id,
+      expectedRevision: (claimed.structuredContent as { revision: number }).revision,
+    });
+    assert.ok(!released.isError, "the bound reviewer can release an unused claim");
+    const releasedSubmission = await reviewContext.call("get_review_submission", { sessionId, submissionId: submission.id });
+    assert.ok(releasedSubmission.isError, "releasing the claim removes the fresh context's submission-read authority");
+    const staleFeedback = await reviewContext.call("submit_handoff_feedback", {
+      handoffId: handoff.id,
+      expectedRevision: (claimed.structuredContent as { revision: number }).revision,
+      verdict: "approve",
+    });
+    assert.ok(staleFeedback.isError, "a released reviewer cannot commit feedback with its stale claim revision");
+    assert.equal(workSessions.get(sessionId)!.status, "awaiting_review", "stale feedback after release leaves the submission pending");
+    const releasedHandoff = reviewRoutes.getHandoffById(handoff.id)!;
+    const reclaimed = await reviewContext.call("claim_review_handoff", {
+      handoffId: handoff.id,
+      expectedRevision: releasedHandoff.revision,
+      reviewThreadId: thread.id,
+    });
+    assert.ok(!reclaimed.isError, "the activated context can reclaim the released handoff with its current revision");
+    const waiter = callWorker("await_review_feedback", { sessionId, timeoutMs: 5_000 });
+    const admitted = await reviewContext.call("submit_handoff_feedback", {
+      handoffId: handoff.id,
+      expectedRevision: (reclaimed.structuredContent as { revision: number }).revision,
+      verdict: "changes_requested",
+      comments: "Please address the reviewed issue before resubmitting.",
+      requiredActions: ["Fix the reviewed issue"],
+    });
+    assert.ok(!admitted.isError, "the authenticated WebUI reviewer submits feedback through its claimed handoff: " + JSON.stringify(admitted.content));
+    const returned = await waiter;
+    assert.equal(returned.structuredContent.status, "feedback_ready", "the blocked worker is woken by committed WebUI handoff feedback");
+    assert.equal(returned.structuredContent.feedback.verdict, "changes_requested");
+    assert.equal(returned.structuredContent.feedback.comments, "Please address the reviewed issue before resubmitting.");
+    assert.deepEqual(returned.structuredContent.feedback.requiredActions, ["Fix the reviewed issue"]);
+    assert.equal(workSessions.get(sessionId)!.status, "changes_requested");
     void route;
   }
 
@@ -1281,14 +2134,11 @@ try {
     const status = await callReviewer("get_review_loop_status", { workSessionId: sessionId });
     assert.ok(!status.isError, "reviewer can read review-loop status");
     assert.equal((status.structuredContent as { status?: string })?.status, "paused", "status reflects the pause");
-    // A submission while paused does not create a handoff (automation stopped).
-    await callWorker("submit_for_review", { sessionId });
-    const submission = workSessions.get(sessionId)!.latestSubmission!;
-    assert.equal(
-      reviewRoutes.getHandoffBySubmission(sessionId, submission.id, submission.reviewEpoch),
-      undefined,
-      "a paused route creates no handoff on submission",
-    );
+    // A submission while paused is blocked before mutation: the worker cannot
+    // create a stranded pending submission with no recoverable handoff.
+    const pausedSubmission = await callWorker("submit_for_review", { sessionId });
+    assert.ok(pausedSubmission.isError, "paused route blocks submission before mutation");
+    assert.equal(workSessions.get(sessionId)!.latestSubmission, undefined, "paused route does not create a stranded submission");
     const resumed = await callReviewer("resume_review_loop", { workSessionId: sessionId });
     assert.ok(!resumed.isError, "reviewer can resume the review loop");
     assert.equal((resumed.structuredContent as { status?: string })?.status, "active", "resume restores the active route");
@@ -1316,13 +2166,16 @@ try {
     // live waiter so reviewer feedback drives the automation deterministically.
     await callReviewer("configure_review_loop", {
       workSessionId: sessionId, enabled: true, mode: "pinned_conversation", maxReviewRounds: 3,
+      pinnedConversationId: "unknown-owner",
     });
 
     // Round 1: submit S1, reviewer claims the handoff and requests changes.
     await callWorker("submit_for_review", { sessionId });
     let sub = workSessions.get(sessionId)!.latestSubmission!;
     let handoff = reviewRoutes.getHandoffBySubmission(sessionId, sub.id, sub.reviewEpoch)!;
-    await callReviewer("claim_review_handoff", { handoffId: handoff.id, expectedRevision: handoff.revision });
+let claimResult: any;
+claimResult = await callReviewer("claim_review_handoff", { handoffId: handoff.id, expectedRevision: handoff.revision });
+    if (claimResult.isError) throw new Error(claimResult.content?.[0]?.text ?? "claim failed");
     await callReviewer("provide_review_feedback", { sessionId, verdict: "changes_requested", comments: "round 1 fix" });
     assert.equal(reviewRoutes.getRouteBySession(sessionId)!.completedReviewRounds, 1, "round 1 consumed a review round");
 
@@ -1330,7 +2183,8 @@ try {
     await callWorker("submit_for_review", { sessionId });
     sub = workSessions.get(sessionId)!.latestSubmission!;
     handoff = reviewRoutes.getHandoffBySubmission(sessionId, sub.id, sub.reviewEpoch)!;
-    await callReviewer("claim_review_handoff", { handoffId: handoff.id, expectedRevision: handoff.revision });
+claimResult = await callReviewer("claim_review_handoff", { handoffId: handoff.id, expectedRevision: handoff.revision });
+    if (claimResult.isError) throw new Error(claimResult.content?.[0]?.text ?? "claim failed");
     await callReviewer("provide_review_feedback", { sessionId, verdict: "changes_requested", comments: "round 2 fix" });
     assert.equal(reviewRoutes.getRouteBySession(sessionId)!.completedReviewRounds, 2, "round 2 consumed a review round");
 
@@ -1338,27 +2192,41 @@ try {
     await callWorker("submit_for_review", { sessionId });
     sub = workSessions.get(sessionId)!.latestSubmission!;
     handoff = reviewRoutes.getHandoffBySubmission(sessionId, sub.id, sub.reviewEpoch)!;
-    await callReviewer("claim_review_handoff", { handoffId: handoff.id, expectedRevision: handoff.revision });
+const claimError = await callReviewer("claim_review_handoff", { handoffId: handoff.id, expectedRevision: handoff.revision });
+    if (claimError.isError) throw new Error(claimError.content?.[0]?.text ?? "claim failed");
     await callReviewer("provide_review_feedback", { sessionId, verdict: "changes_requested", comments: "round 3 fix" });
     assert.equal(reviewRoutes.getRouteBySession(sessionId)!.completedReviewRounds, 3, "round 3 consumed the final review round");
 
-    // A 4th submission cannot open a new automatic review round: the route
-    // refuses to create a handoff once the budget is exhausted.
-    await callWorker("submit_for_review", { sessionId });
-    sub = workSessions.get(sessionId)!.latestSubmission!;
-    assert.equal(
-      reviewRoutes.getHandoffBySubmission(sessionId, sub.id, sub.reviewEpoch),
-      undefined,
-      "no 4th handoff is created once the round budget is exhausted",
-    );
-    // The reviewer's ordinary feedback is blocked because there is no claimed
-    // handoff, and the budget itself cannot be exceeded.
-    const overflow = await callReviewer("provide_review_feedback", { sessionId, verdict: "changes_requested", comments: "round 4" });
-    assert.ok(overflow.isError, "a 4th automatic round is blocked at the workflow boundary");
+    // A 4th submission is rejected at admission; it cannot open a new automatic
+    // review round, leave an orphan submission, or consume another round.
+    let fourthSubmission: any;
+    try {
+      fourthSubmission = await callWorker("submit_for_review", { sessionId });
+    } catch (error) {
+      fourthSubmission = { isError: true, content: [{ text: error instanceof Error ? error.message : String(error) }] };
+    }
+    assert.ok(fourthSubmission.isError, "a 4th automatic round is blocked at submission admission");
+    assert.match(String(fourthSubmission.content?.[0]?.text ?? ""), /review round limit reached/i);
+    assert.equal(workSessions.get(sessionId)!.latestSubmission?.submissionNumber, 3, "the budget refusal leaves no orphan submission");
+    assert.equal(reviewRoutes.getRouteBySession(sessionId)!.completedReviewRounds, 3, "the exhausted round count is unchanged");
+
+    const beforeExtension = reviewRoutes.getRouteBySession(sessionId)!;
+    const extension = await callReviewer("configure_review_loop", {
+      workSessionId: sessionId,
+      enabled: true,
+      mode: "pinned_conversation",
+      maxReviewRounds: 4,
+      expectedRevision: beforeExtension.revision,
+    });
+    assert.ok(!extension.isError, "the authorized route owner can explicitly extend the exhausted budget");
+    const extendedSubmission = await callWorker("submit_for_review", { sessionId });
+    assert.ok(!extendedSubmission.isError, "a new review round is admitted only after the explicit extension");
+    const extended = workSessions.get(sessionId)!.latestSubmission!;
+    assert.equal(reviewRoutes.getHandoffBySubmission(sessionId, extended.id, extended.reviewEpoch)?.roundNumber, 4, "the extended round number remains server-derived");
   }
 
-  // ── Experiment D: loop OFF creates fresh isolated handoffs and preserves
-  //    the original work session across submissions ──
+  // ── Experiment D: one activated reviewer thread receives fresh immutable
+  //    handoffs while preserving the original work session across submissions ──
   {
     const sessionId = createSession();
     const originalSessionId = sessionId;
@@ -1368,8 +2236,10 @@ try {
     await callWorker("submit_for_review", { sessionId });
     const s1 = workSessions.get(sessionId)!.latestSubmission!;
     const h1 = reviewRoutes.getHandoffBySubmission(sessionId, s1.id, s1.reviewEpoch)!;
-    await callReviewer("claim_review_handoff", { handoffId: h1.id, expectedRevision: h1.revision });
-    await callReviewer("provide_review_feedback", { sessionId, verdict: "changes_requested", comments: "fresh review 1" });
+    const reviewContext = createIsolatedReviewerContext("owner-b-session-loop");
+    const thread = activateForReviewerContext(reviewRoutes.getRouteBySession(sessionId)!.id, reviewContext.contextId);
+    await reviewContext.call("claim_review_handoff", { handoffId: h1.id, expectedRevision: h1.revision, reviewThreadId: thread.id });
+    await reviewContext.call("provide_review_feedback", { sessionId, verdict: "changes_requested", comments: "thread review 1" });
 
     await callWorker("submit_for_review", { sessionId });
     const s2 = workSessions.get(sessionId)!.latestSubmission!;
@@ -1378,9 +2248,9 @@ try {
     assert.notEqual(h1.reviewEpoch + ":" + h1.submissionId, h2.reviewEpoch + ":" + h2.submissionId, "handoffs bind to distinct submissions");
     // The original work session is never replaced by a fresh review.
     assert.equal(workSessions.get(sessionId)!.id, originalSessionId, "loop OFF does not create a new coding work session");
-    await callReviewer("claim_review_handoff", { handoffId: h2.id, expectedRevision: h2.revision });
-    const approved = await callReviewer("provide_review_feedback", { sessionId, verdict: "approve", comments: "fresh review 2" });
-    assert.ok(!approved.isError, "a fresh authorized handoff returns its verdict to the original work session");
+    await reviewContext.call("claim_review_handoff", { handoffId: h2.id, expectedRevision: h2.revision, reviewThreadId: thread.id });
+    const approved = await reviewContext.call("provide_review_feedback", { sessionId, verdict: "approve", comments: "thread review 2" });
+    assert.ok(!approved.isError, "the persistent authorized reviewer thread returns its verdict to the original work session");
   }
 
   // ── Experiment E: a route change mid-flight supersedes a stale claim ──
@@ -1390,7 +2260,10 @@ try {
     await callWorker("submit_for_review", { sessionId });
     const sub = workSessions.get(sessionId)!.latestSubmission!;
     const handoff = reviewRoutes.getHandoffBySubmission(sessionId, sub.id, sub.reviewEpoch)!;
-    await callReviewer("claim_review_handoff", { handoffId: handoff.id, expectedRevision: handoff.revision });
+    const reviewContext = createIsolatedReviewerContext("owner-b-session-stale");
+    const thread = activateForReviewerContext(reviewRoutes.getRouteBySession(sessionId)!.id, reviewContext.contextId);
+    const claimError = await reviewContext.call("claim_review_handoff", { handoffId: handoff.id, expectedRevision: handoff.revision, reviewThreadId: thread.id });
+    if (claimError.isError) throw new Error(claimError.content?.[0]?.text ?? "claim failed");
 
     // The reviewer switches routing mode before committing feedback. This
     // increments the route epoch, invalidating the handoff claimed against the
@@ -1403,7 +2276,7 @@ try {
       2,
       "a mode change advances the route epoch",
     );
-    const staleCommit = await callReviewer("provide_review_feedback", { sessionId, verdict: "changes_requested", comments: "stale route" });
+    const staleCommit = await reviewContext.call("provide_review_feedback", { sessionId, verdict: "changes_requested", comments: "stale route" });
     assert.ok(staleCommit.isError, "feedback claimed under a superseded route epoch is rejected");
     assert.equal(workSessions.get(sessionId)!.status, "awaiting_review", "the stale commit did not mutate the session");
   }
@@ -1529,11 +2402,9 @@ try {
     assert.ok(latest?.id && latest.snapshotCommit);
     assert.equal(missionLedger.canApprove(sessionId, { submissionId: latest.id, snapshotCommit: latest.snapshotCommit }).allowed, true, "current final integration report enables approval");
     currentSnapshot = "verification-workspace-mutated";
-    await assert.rejects(
-      () => callReviewer("approve_supervised_work", { workSessionId: sessionId }),
-      /Workspace snapshot changed since submission/,
-      "mission approval refuses a workspace that changed after the verified submission",
-    );
+    const staleApproval = await callReviewer("approve_supervised_work", { workSessionId: sessionId });
+    assert.ok(staleApproval.isError, "mission approval refuses a workspace that changed after the verified submission");
+    assert.match(String(staleApproval.content?.[0]?.text ?? ""), /Workspace snapshot changed since submission/);
     assert.equal(workSessions.get(sessionId)?.status, "awaiting_review", "stale mission approval leaves the exact submission pending");
     currentSnapshot = "verification-snapshot";
     const approved = await callReviewer("approve_supervised_work", { workSessionId: sessionId });
@@ -1676,8 +2547,136 @@ try {
     void owned;
   }
 
+  // ── K05: an accepted dispatch with a lost response remains recoverable. ──
+  {
+    dropNextDispatchResponse = true;
+    const uncertain = await callReviewer("submit_to_coding_agent", {
+      task: "continue after the adapter acceptance response is lost",
+      workspaceSessionId: UNCERTAIN_WS,
+    });
+    assert.equal(uncertain.structuredContent.status, "uncertain",
+      "a dropped acceptance response is reported as uncertain rather than failed");
+    const workSessionId = uncertain.structuredContent.workSessionId as string;
+    const runId = uncertain.structuredContent.runId as string;
+    const logicalRun = agentRegistry.getRun(runId)!;
+    const attempt = agentRegistry.getLatestDispatchAttemptForRun(runId)!;
+    assert.equal(logicalRun.status, "dispatch_uncertain", "uncertain transport does not terminally fail the logical run");
+    assert.equal(logicalRun.finishedAt, undefined, "uncertain transport has no false terminal timestamp");
+    assert.equal(attempt.status, "uncertain", "the durable attempt stays available for reconciliation");
+    assert.equal(workSessions.get(workSessionId)?.status, "in_progress", "the work session remains recoverable");
+    assert.ok(workSessions.getWorkspaceLeaseForSession(workSessionId), "the workspace fence stays with the unresolved worker");
+
+    const submitted = await callWorker("submit_for_review", { sessionId: workSessionId });
+    assert.ok(!submitted.isError, `a later submission remains correlated: ${JSON.stringify(submitted)}`);
+    assert.equal(agentRegistry.getRunByWorkSessionId(workSessionId)?.runId, runId,
+      "the later review submission resolves to the original logical run");
+  }
+
+  // ── Scheduled peer changes-requested feedback creates a fenced follow-up job. ──
+  {
+    const sessionId = createSession();
+    const priorSubmission = workSessions.submitForReview({
+      workSessionId: sessionId,
+      diff: "diff --git a/reports/audit.md b/reports/audit.md\n+prior report\n",
+      snapshotKind: "git",
+      snapshotRef: "a".repeat(40),
+      files: [{ path: "reports/audit.md", type: "new", additions: 1, removals: 0 }],
+      message: "Initial scheduled peer report",
+    });
+    const feedback = await reviewWorkflow.provideFeedback({
+      sessionId,
+      submissionId: priorSubmission.id,
+      diffSha256: priorSubmission.diffSha256,
+      reviewEpoch: priorSubmission.reviewEpoch,
+      verdict: "changes_requested",
+      comments: "Add the missing failure case and keep the report concise.",
+      invocationOrigin: "authenticated_reviewer",
+    });
+    assert.ok(feedback.continuationId);
+    const continuation = continuationManager.get(feedback.continuationId!)!;
+
+    const peerJobStore = openPeerJobStore(root, {
+      level: "silent", format: "json", requests: false, assets: false, toolCalls: false, shellCommands: false,
+    }, db);
+    const priorPeerJob = peerJobStore.createJob({
+      jobId: `job_${"1".repeat(8)}-${"1".repeat(4)}-${"1".repeat(4)}-${"1".repeat(4)}-${"1".repeat(12)}`,
+      peerId: "peer-scheduled",
+      workSessionId: sessionId,
+      workspaceSessionId: WS,
+      schedulerDispatchId: "dispatch-scheduled-peer",
+      repositoryId: "/tmp/scheduled-peer-repository",
+      baseRevision: "b".repeat(40),
+      taskClass: "read_only_audit",
+      instructionHash: createHash("sha256").update("prior scheduled instruction").digest("hex"),
+      instructions: "Inspect the repository and write reports/audit.md.",
+      allowedOutputs: ["reports/audit.md"],
+      maxRuntimeMs: 60_000,
+      maxArtifactBytes: 1024,
+    });
+    const peerClaim = peerJobStore.claimNextJob(priorPeerJob.peerId, Date.now())!;
+    peerJobStore.markStarted(peerClaim.attempt.attemptId, peerClaim.attempt.claimToken, priorPeerJob.peerId, Date.now());
+    const peerReceipt = {
+      jobId: priorPeerJob.jobId,
+      attemptId: peerClaim.attempt.attemptId,
+      actorClass: "muse_vm_process" as const,
+      baseRevision: priorPeerJob.baseRevision,
+      manifestSha256: manifestSha256(priorPeerJob.baseRevision, []),
+      files: [],
+      totalBytes: 0,
+      terminalState: "succeeded" as const,
+    };
+    peerJobStore.completeAttempt(peerClaim.attempt.attemptId, peerClaim.attempt.claimToken, priorPeerJob.peerId, peerReceipt, Date.now());
+    peerJobStore.markStaging(priorPeerJob.jobId, createHash("sha256").update(JSON.stringify(peerReceipt)).digest("hex"), Date.now());
+    peerJobStore.markAwaitingReview(priorPeerJob.jobId, {
+      receiptSha256: createHash("sha256").update(JSON.stringify(peerReceipt)).digest("hex"),
+      submissionId: priorSubmission.id,
+      reviewEpoch: priorSubmission.reviewEpoch,
+      snapshotKind: "git",
+      snapshotRef: "a".repeat(40),
+      diffSha256: priorSubmission.diffSha256!,
+    }, Date.now());
+    const priorFeedbackId = eventStore.getEventById(feedback.feedbackEventId!)!.payload.feedbackId as string;
+    peerJobStore.finalizeReview(priorPeerJob.jobId, {
+      submissionId: priorSubmission.id,
+      reviewEpoch: priorSubmission.reviewEpoch,
+      feedbackId: priorFeedbackId,
+      verdict: "changes_requested",
+    }, Date.now());
+    const previousPeerJobStore = getPeerJobStore();
+    setPeerJobStoreSingleton(peerJobStore);
+    try {
+      const scheduledJobs = {
+        getByWorkSessionId: (id: string) => id === sessionId
+          ? { id: "scheduled-peer-source", projectId: WS, workSessionId: sessionId, activeDispatchAttemptId: "scheduled-peer-attempt", dispatchTarget: { kind: "peer_pull", peerId: priorPeerJob.peerId } }
+          : undefined,
+        getAttempt: () => ({ dispatchId: "dispatch-scheduled-peer" }),
+      } as any;
+      await runContinuationTick({ ...config, scheduledJobs });
+      const resumedPeerJobId = scheduledPeerContinuationJobId(continuation.id);
+      const resumedPeerJob = peerJobStore.getJob(resumedPeerJobId);
+      assert.ok(resumedPeerJob, "the continuation becomes a durable peer job instead of failing for a missing ACP run");
+      assert.equal(resumedPeerJob.workSessionId, sessionId);
+      assert.equal(resumedPeerJob.workspaceSessionId, WS);
+      assert.equal(resumedPeerJob.baseRevision, priorPeerJob.baseRevision, "the follow-up remains fenced to the original immutable base");
+      assert.deepEqual(resumedPeerJob.allowedOutputs, priorPeerJob.allowedOutputs, "feedback cannot expand output authority");
+      assert.match(resumedPeerJob.instructions, /Add the missing failure case/);
+      assert.match(resumedPeerJob.instructions, /Exact prior checkpoint: git:/);
+      assert.match(resumedPeerJob.instructions, /complete final contents for every listed changed path/);
+      assert.equal(continuationManager.get(continuation.id)?.status, "dispatched");
+      assert.equal(continuationManager.get(continuation.id)?.target, `peer:${resumedPeerJobId}`);
+      assert.equal(workSessions.get(sessionId)?.lastConsumedFeedbackId, priorFeedbackId);
+    } finally {
+      setPeerJobStoreSingleton(previousPeerJobStore);
+      peerJobStore.close();
+    }
+  }
+
   console.log("bridge-flow.test.ts: all assertions passed");
 } finally {
+  if (destinationAdapter && destinationAdapter.exitCode === null) {
+    destinationAdapter.kill("SIGTERM");
+    await new Promise<void>((resolve) => destinationAdapter!.once("exit", () => resolve()));
+  }
   if (httpServer) await new Promise<void>((resolve) => httpServer!.close(() => resolve()));
   if (acpHttp) await new Promise<void>((resolve) => acpHttp!.close(() => resolve()));
   workSessions.close();

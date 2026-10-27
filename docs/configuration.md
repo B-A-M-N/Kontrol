@@ -73,6 +73,7 @@ kontrol config set publicBaseUrl https://kontrol.example.com
 | `KONTROL_MCP_REUSABLE_SESSION_IDLE_MS` | Idle TTL for reusable or multi-tool sessions. Defaults to `86400000` (24 hours). |
 | `KONTROL_MCP_SESSION_REAPER_INTERVAL_MS` | Session reaper interval. Defaults to `15000`. |
 | `KONTROL_MCP_LOGICAL_CONTINUITY_RETENTION_MS` | Retention for trusted logical-client metadata after a transport disconnect. Defaults to `259200000` (72 hours); this never reuses a transport or replays a request. |
+| `KONTROL_MCP_CLIENT_METRICS_HISTORY_LIMIT` | Maximum inactive logical-client metric rows retained in memory. Active clients are preserved separately. Defaults to `5000`. |
 | `KONTROL_MCP_SESSION_MAX_PER_CLIENT` | Per-logical-client session cap. Defaults to `20`. |
 | `KONTROL_MCP_SESSION_SOFT_CAP` | Global session soft cap for LRU pressure cleanup. Defaults to `150`. |
 | `KONTROL_MCP_SESSION_HARD_CAP` | Global session admission hard cap. Defaults to `200`. |
@@ -256,6 +257,38 @@ tunnel endpoint; a local idle-proxy run cannot create a qualification receipt.
 Pass `--expected-build-id BUILD_ID --result-file beta-external-catalog.json`.
 The final gate rejects a catalog captured before the candidate soak, a probe
 that ran before the soak ended, or missing streaming evidence.
+
+For an OpenAI Secure MCP Tunnel, the external host-facing hop is HTTPS while
+Kontrol's configured MCP target remains loopback HTTP. Run the soak with
+`--transport secure_mcp_tunnel`; its report binds the profile and configured
+tunnel ID. During that soak, capture the external host catalog and include
+operator-supplied tunnel metadata plus a real `await_workspace_events` call
+that waited at least 45 seconds and returned its terminal result:
+
+```json
+{
+  "transport": {
+    "source": "operator_supplied",
+    "kind": "openai_secure_mcp_tunnel",
+    "scheme": "https",
+    "tunnelId": "tunnel_..."
+  },
+  "streamingCall": {
+    "toolName": "await_workspace_events",
+    "requestedWaitMs": 45000,
+    "startedAt": "2026-10-13T18:00:00.000Z",
+    "finishedAt": "2026-10-13T18:00:45.000Z",
+    "terminalResultReceived": true
+  }
+}
+```
+
+After the soak, pass the same ID and loopback origin to the probe with
+`--transport secure_mcp_tunnel --tunnel-id "$KONTROL_TUNNEL_ID"`. It checks the
+live catalog locally and requires authenticated diagnostics to correlate the
+captured host session's long SSE call, heartbeat bytes, and completed response.
+The host catalog acknowledgement and HTTPS/tunnel metadata remain explicitly
+operator-supplied; server-side session and SSE evidence is machine-verified.
 
 For bounded visual qualification, set `KONTROL_UI_SCREENSHOT_DIR` when running
 `npm run test:ui`; the Chromium gate writes deterministic
@@ -446,16 +479,27 @@ duplex Agent Client Protocol directly over stdin/stdout:
 ACP_STDIO_AGENT_NAME=my-agent \
 ACP_STDIO_COMMAND=/path/to/agent \
 ACP_STDIO_ARGS_JSON='["acp"]' \
-ACP_STDIO_DISPATCH_METHOD=session/prompt \
 ACP_STDIO_ADAPTER_PORT=9921 \
 node scripts/acp-stdio-duplex-adapter.mjs
 ```
 
-The adapter registers as a normal Kontrol ACP peer and uses the reusable
-`createAcpDuplex` transport. Agent-initiated `session/request_permission` calls
-are converted into Kontrol approval requests and parked until the reviewer
-decides. Hermes currently uses `scripts/acp-hermes-native-adapter.mjs`, which
-bridges Hermes's Python ACP client into the same Kontrol approval/event system.
+The adapter registers as a normal Kontrol ACP peer and defaults to ACP v1. Set
+`ACP_STDIO_ENABLE_V2=1` to request ACP v2; v1-only agents may negotiate v1 as a
+fallback. For v2, completion comes from an idle `state_update` with
+`stopReason: "end_turn"`, and provider sessions resume through
+`session/resume`. V1 completion continues to require `stopReason: "end_turn"`
+in the `session/prompt` response. The adapter uses the reusable
+`createAcpDuplex` transport.
+Agent-initiated `session/request_permission` calls are converted into Kontrol
+approval requests and parked until the reviewer decides. Set
+`ACP_STDIO_DISPATCH_METHOD` only for a known wrapper with a nonstandard start
+method; that mode sends one direct JSON-RPC request and skips ACP initialization
+and session creation. Hermes currently uses
+`scripts/acp-hermes-native-adapter.mjs`, which bridges Hermes's Python ACP
+client into the same Kontrol approval/event system. To pass provider
+configuration, add only the required ordinary variable names to
+`KONTROL_CHILD_ENV_ALLOWLIST`; control-plane credentials remain filtered from
+the child environment.
 The adapter uses an activity-aware idle watchdog and a separate absolute run
 ceiling. Configure `KONTROL_HERMES_DEADMAN_IDLE_MS` for the idle threshold and
 `KONTROL_HERMES_MAX_RUN_SECONDS` for the hard upper bound; a known tool
@@ -471,6 +515,14 @@ Supervisor and verification concurrency are bounded independently:
 | `KONTROL_CRUSH_MAX_RUN_MS` | `86400000` | CRUSH absolute emergency ceiling regardless of activity |
 | `KONTROL_CRUSH_TERMINATE_GRACE_MS` | `5000` | Grace between SIGTERM and SIGKILL when terminating a stuck/cancelled CRUSH run |
 | `KONTROL_STARTUP_PROFILE` | `dev-fast` | `dev-fast` / `normal` / `release` preflight depth for start-all.sh. Fast development startup is the default; use `normal` or `release` for the complete test gate. |
+| `KONTROL_BETA_SOAK_URL` | Selected profile's endpoint | Optional `./start-all.sh --qualify` target override. Hosted mode requires a non-loopback HTTPS origin with `KONTROL_AUTH_MODE=oauth`; Secure MCP Tunnel mode requires loopback HTTP with `KONTROL_AUTH_MODE=tunnel`. |
+| `KONTROL_BETA_SOAK_TRANSPORT` | Derived from `KONTROL_AUTH_MODE` | `public_https` or `secure_mcp_tunnel`. Explicit selection must match the auth mode. Local HTTP qualification is rejected before the code gate or generation activation. |
+| `KONTROL_BETA_SOAK_HOURS` | `12` | Requested wall-clock soak duration for `start-all.sh --qualify`; the launcher enforces at least 12 hours and honors a larger `KONTROL_BETA_MIN_SOAK_HOURS`. |
+| `KONTROL_BETA_WORKSPACE_PATH` | Checkout root | Workspace used by soak read, continuity, approval, and resource exercises. The runner removes its uniquely named continuity marker after each exercise. |
+| `KONTROL_BETA_SOAK_REPORT` | `<checkout>/beta-soak.json` | Atomic progress and final report path. |
+| `KONTROL_BETA_SOAK_LOG` | `<stateDir>/beta-soak.log` | Background soak session log path. |
+| `KONTROL_BETA_APPROVAL_CADENCE` | `60` | Number of soak iterations between approval-resume exercises. |
+| `KONTROL_BETA_SSE_PROBE_CADENCE` | Once per hour, based on soak interval | Number of soak iterations between dual-session GET/POST SSE probes. Each probe verifies repeated heartbeat bytes and a terminal JSON-RPC response. |
 | `KONTROL_POLICY_MODE` | `allow` | Default trust posture: `allow` (read-only frictionless), `deny`, or `ask` (gate everything not explicitly allowed) |
 | `KONTROL_POLICY_TOOL_<TOOL>` | secure baseline (`ask` for bash/write/edit/apply_patch; read tools allow) | Per-tool override. With no explicit policy configured, Kontrol applies a secure baseline that gates shell and mutating tools behind approval while keeping read-only inspection frictionless. Any explicit per-tool rule or global mode replaces the baseline. |
 

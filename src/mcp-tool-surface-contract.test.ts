@@ -3,8 +3,7 @@ import { existsSync, mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
 import { createMcpServer } from "./mcp/workspace-server.js";
 import {
   mcpServerVersionFromBuildMeta,
@@ -119,7 +118,7 @@ try {
           hostToolCount: fingerprint.toolCount,
         },
       } as never);
-      assert.equal(observedHandshake?.status, "accepted", `${mode} exact host catalog acknowledgement should be accepted`);
+      assert.equal(observedHandshake?.status, "accepted", `${mode} exact host catalog acknowledgement should be accepted: ${JSON.stringify(observedHandshake)}`);
       assert.equal(observedHandshake?.serverCatalogSha256, fingerprint.sha256);
       await client.notification({
         method: TOOL_CATALOG_ACK_METHOD,
@@ -132,6 +131,17 @@ try {
       } as never);
       assert.equal(observedHandshake?.status, "rejected", `${mode} stale host catalog acknowledgement must be rejected`);
       assert.equal(observedHandshake?.reason, "host_catalog_fingerprint_mismatch");
+      await client.notification({
+        method: TOOL_CATALOG_ACK_METHOD,
+        params: {
+          contractVersion: 1,
+          serverVersion: "stale-immutable-server-version",
+          hostCatalogSha256: fingerprint.sha256,
+          hostToolCount: fingerprint.toolCount,
+        },
+      } as never);
+      assert.equal(observedHandshake?.status, "rejected", `${mode} a stale connected host version must be rejected`);
+      assert.equal(observedHandshake?.reason, "server_version_mismatch");
       const names = new Set(listed.tools.map((tool) => tool.name));
       for (const name of ["read", "grep", "glob", "ls", "git_status", "git_log", "git_diff", "git_show"]) {
         assert.ok(names.has(name), `${mode} must expose required inspection tool ${name}`);
@@ -180,7 +190,7 @@ function createServerWithHandshakeObserver(
   checkpoints: ReturnType<typeof createReviewCheckpointManager>,
   processSessions: ProcessSessionManager,
   connectionContext: { mcpSessionId: string },
-  onHandshake: NonNullable<Parameters<typeof createMcpServer>[25]>,
+  onHandshake: NonNullable<Parameters<typeof createMcpServer>[26]>,
 ) {
   return createMcpServer(
     config,              // 1
@@ -202,13 +212,14 @@ function createServerWithHandshakeObserver(
     undefined,           // 17 agentMessages
     undefined,           // 18 supervisorRuns
     undefined,           // 19 onSupervisorResume
-    undefined,           // 20 db
-    undefined,           // 21 mutationReceipts
-    undefined,           // 22 onWorkspaceAppResource
-    undefined,           // 23 onPhaseTiming
-    undefined,           // 24 scheduledJobs
-    undefined,           // 25 reviewRoutes
-    onHandshake,         // 26 onToolCatalogHandshake
+    undefined,           // 20 onScheduledJobCreated
+    undefined,           // 21 db
+    undefined,           // 22 mutationReceipts
+    undefined,           // 23 onWorkspaceAppResource
+    undefined,           // 24 onPhaseTiming
+    undefined,           // 25 scheduledJobs
+    undefined,           // 26 reviewRoutes
+    onHandshake,         // 27 onToolCatalogHandshake
   );
 }
 
@@ -247,6 +258,7 @@ const makeLeaseClient = async (context?: {
   workspaceSessionId?: string;
   workspaceLeaseNonce?: string;
   mcpSessionId?: string;
+  agentPtyReviewBinding?: { bindingId: string; processSessionId: string; processGeneration: number };
 }, policy?: { engine?: any; enforcer?: any }) => {
   const server = createMcpServer(
     leaseConfig,
@@ -259,6 +271,17 @@ const makeLeaseClient = async (context?: {
     undefined, undefined,
     context,
   );
+  if (context?.agentPtyReviewBinding) {
+    // The shared bridge is intentionally omitted from this isolated helper;
+    // register stand-ins so this case exercises the production visibility and
+    // invocation guards without constructing the full review workflow.
+    server.registerTool("submit_for_review", { title: "Submit for review", inputSchema: {} }, async () => ({
+      content: [{ type: "text" as const, text: "submitted" }],
+    }));
+    server.registerTool("await_review_feedback", { title: "Await review feedback", inputSchema: {} }, async () => ({
+      content: [{ type: "text" as const, text: "awaited" }],
+    }));
+  }
   const client = new Client({ name: "lease-fence-test", version: "1.0.0" });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
@@ -308,6 +331,29 @@ try {
     mcpSessionId: "lease-worker-current",
   });
   leaseClients.push(worker);
+
+  const ptyReview = await makeLeaseClient({
+    authenticatedRole: "worker",
+    workSessionId: workSession.id,
+    workspaceSessionId: workspaceId,
+    workspaceLeaseNonce: acquired.lease.leaseNonce,
+    mcpSessionId: "pty-review-only",
+    agentPtyReviewBinding: {
+      bindingId: "pty_binding_fixture",
+      processSessionId: "proc_pty_fixture",
+      processGeneration: 1,
+    },
+  });
+  leaseClients.push(ptyReview);
+  const ptyTools = await ptyReview.client.listTools();
+  assert.deepEqual(ptyTools.tools.map((tool) => tool.name).sort(), ["await_review_feedback", "submit_for_review"],
+    "PTY review credentials expose only the two worker review tools");
+  const ptyHiddenTool = await ptyReview.client.callTool({
+    name: "open_workspace",
+    arguments: { path: canonicalLeaseWorkspaceRoot, mode: "checkout" },
+  });
+  assert.equal(ptyHiddenTool.isError, true, "hidden tools remain unavailable even when invoked directly by name");
+
   const workerReopen = await worker.client.callTool({
     name: "open_workspace",
     arguments: { path: canonicalLeaseWorkspaceRoot, mode: "checkout" },
@@ -442,6 +488,8 @@ const gitHarnessRoot = mkdtempSync(join(tmpdir(), "kontrol-git-tools-"));
 const gitRoot = join(gitHarnessRoot, "repo");
 mkdirSync(gitRoot, { recursive: true });
 writeFileSync(join(gitRoot, "README.md"), "git inspection fixture\n");
+writeFileSync(join(gitRoot, "stable.txt"), "unchanged tracked file contents\n");
+writeFileSync(join(gitRoot, "empty.txt"), "");
 const gitFixtureIdentity = {
   name: execFileSync("git", ["config", "user.name"], { cwd: process.cwd(), encoding: "utf8" }).trim(),
   email: execFileSync("git", ["config", "user.email"], { cwd: process.cwd(), encoding: "utf8" }).trim(),
@@ -449,8 +497,11 @@ const gitFixtureIdentity = {
 execFileSync("git", ["init", "-q"], { cwd: gitRoot });
 execFileSync("git", ["config", "user.name", gitFixtureIdentity.name], { cwd: gitRoot });
 execFileSync("git", ["config", "user.email", gitFixtureIdentity.email], { cwd: gitRoot });
-execFileSync("git", ["add", "README.md"], { cwd: gitRoot });
+execFileSync("git", ["add", "README.md", "stable.txt", "empty.txt"], { cwd: gitRoot });
 execFileSync("git", ["commit", "-q", "-m", "init"], { cwd: gitRoot });
+writeFileSync(join(gitRoot, "README.md"), "updated tracked file contents\n");
+execFileSync("git", ["add", "README.md"], { cwd: gitRoot });
+execFileSync("git", ["commit", "-q", "-m", "update README"], { cwd: gitRoot });
 {
   await createMcpServerForGitFixture();
 }
@@ -486,6 +537,40 @@ async function createMcpServerForGitFixture(): Promise<void> {
       const result = await client.callTool({ name, arguments: { workspaceId, ...args } });
       assert.notEqual(result.isError, true, `${name} should not fail: ${JSON.stringify(result)}`);
       assert.notEqual((result.structuredContent as { status?: string }).status, "approval_required", `${name} must not prompt`);
+    }
+
+    // Reproduce the reported MCP failure at the public tool boundary. A large
+    // untracked-file list used to overflow execFile's maxBuffer before Kontrol
+    // could return a truncation marker.
+    const longNamePrefix = "untracked-";
+    for (let index = 0; index < 5_000; index++) {
+      const suffix = index.toString().padStart(4, "0");
+      writeFileSync(join(gitRoot, `${longNamePrefix}${"x".repeat(205)}-${suffix}.txt`), "x");
+    }
+    const oversizedStatus = await client.callTool({ name: "git_status", arguments: { workspaceId } });
+    assert.notEqual(oversizedStatus.isError, true, `large git_status must return bounded output: ${JSON.stringify(oversizedStatus)}`);
+    const oversizedStatusContent = oversizedStatus.structuredContent as { result?: string; truncated?: boolean; bytes?: number };
+    assert.equal(oversizedStatusContent.truncated, true, "large git_status reports truncation instead of a child maxBuffer error");
+    assert.ok((oversizedStatusContent.bytes ?? Infinity) <= 48_000, "large git_status remains inside the MCP inspection byte cap");
+    assert.match(oversizedStatusContent.result ?? "", /Truncated: Git inspection output exceeded its bounded capture\./);
+
+    const showCases = [
+      { path: "stable.txt", revision: "HEAD", expected: "unchanged tracked file contents\n", label: "unchanged tracked file" },
+      { path: "empty.txt", revision: "HEAD", expected: "", label: "empty tracked file" },
+      { path: "README.md", revision: "HEAD", expected: "updated tracked file contents\n", label: "file changed in the selected revision" },
+      { path: "README.md", revision: "HEAD~1", expected: "git inspection fixture\n", label: "historical file revision" },
+    ];
+    for (const testCase of showCases) {
+      const result = await client.callTool({
+        name: "git_show",
+        arguments: { workspaceId, path: testCase.path, revision: testCase.revision },
+      });
+      assert.notEqual(result.isError, true, `git_show returns ${testCase.label}: ${JSON.stringify(result)}`);
+      assert.equal(
+        (result.structuredContent as { result?: string }).result,
+        testCase.expected,
+        `git_show returns blob contents for ${testCase.label}`,
+      );
     }
   } finally {
     await client.close();

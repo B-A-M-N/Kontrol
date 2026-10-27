@@ -5,11 +5,11 @@
  * explicit dependency object destructured at function entry.
  */
 import { createHash, randomUUID } from "node:crypto";
+import { Readable } from "node:stream";
 import type { Socket } from "node:net";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
-import { checkResourceAllowed } from "@modelcontextprotocol/sdk/shared/auth-utils.js";
+import { createMcpHandler, InMemoryServerEventBus, isInitializeRequest, isLegacyRequest, checkResourceAllowed } from "@modelcontextprotocol/server";
+import type { McpServer } from "@modelcontextprotocol/server";
+import { NodeStreamableHTTPServerTransport, toWebRequest } from "@modelcontextprotocol/node";
 import type { ServerConfig } from "../config.js";
 import {
   handleMcpRequestWithDeadline,
@@ -30,12 +30,15 @@ import {
 } from "./mcp-session-state.js";
 import type { McpSessionLifecycle } from "./mcp-session-lifecycle.js";
 import type { ExpiredMcpOperationTracker } from "./mcp-expired-operations.js";
+import { sendCatalogRefreshNotification } from "./catalog-refresh.js";
 import type { McpOperationDiagnostics } from "./mcp-operation-diagnostics.js";
+import type { McpQualificationEvidenceJournal } from "./mcp-qualification-evidence.js";
 import type { McpPolicyWaiterRegistry } from "./policy-waiters.js";
 import type { LogicalContinuityIndex } from "../mcp-logical-continuity.js";
 import { startMcpSseHeartbeat } from "./mcp-sse-heartbeat.js";
 import { logEvent, requestPath, sessionIdPrefix } from "../logger.js";
 import { verifyWorkerToken, type WorkerTokenClaims } from "../acp-worker-token.mjs";
+import { exchangeAgentPtyReviewCredential } from "../agent-pty-review-credential.js";
 import {
   constantTimeStringEqual,
   createMcpServer,
@@ -54,10 +57,12 @@ import {
   workspaceAppResourceKind,
 } from "../workspace-app-resource.js";
 import type { DatabaseHandle } from "../db/client.js";
+import type { AgentPtyBindingStore } from "../agent-pty-bindings.js";
 import type { MutationReceiptStore } from "../mutation-receipts.js";
 import type { LiveWaiterRegistry } from "../acp-bridge.js";
 import type { Request, Response } from "express";
 import { readMcpToolSurface } from "../mcp/tool-names.js";
+import { fingerprintToolCatalog, TOOL_CATALOG_ACK_METHOD } from "../mcp/tool-catalog-handshake.js";
 
 function externalCorrelation(req: Request): string | undefined {
   for (const name of ["cf-ray", "x-kontrol-correlation-id", "x-request-id"]) {
@@ -65,6 +70,149 @@ function externalCorrelation(req: Request): string | undefined {
     if (value && value.length <= 128 && /^[A-Za-z0-9._:/-]+$/.test(value)) return value;
   }
   return undefined;
+}
+
+function ptyReviewCredential(req: Request, deps: McpHttpDeps): {
+  claims: WorkerTokenClaims;
+  binding: NonNullable<ReturnType<AgentPtyBindingStore["getByProcessSession"]>>;
+} | undefined {
+  const token = req.header("x-kontrol-worker-token");
+  if (!token || !deps.config.acpAgentSecret || !deps.agentPtyBindings) return undefined;
+  try {
+    const claims = verifyWorkerToken(token, deps.config.acpAgentSecret);
+    const scope = claims.agentPtyReview;
+    if (!scope || !Number.isSafeInteger(scope.processGeneration) || scope.processGeneration < 1) return undefined;
+    const binding = deps.agentPtyBindings.getByProcessSession(scope.processSessionId);
+    if (!binding || binding.id !== scope.bindingId || binding.processGeneration !== scope.processGeneration
+      || !["attached", "detached"].includes(binding.status)
+      || binding.workSessionId !== claims.workSessionId
+      || binding.workspaceSessionId !== claims.workspaceSessionId
+      || binding.runId !== claims.runId
+      || binding.ownerPrincipalId !== `worker-work-session:${claims.workSessionId}`) return undefined;
+    return { claims, binding };
+  } catch {
+    return undefined;
+  }
+}
+
+function presentsPtyReviewScope(token: string | undefined): boolean {
+  if (!token) return false;
+  try {
+    const payload = token.split(".")[1];
+    if (!payload) return false;
+    const claims = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as { agentPtyReview?: unknown };
+    return claims.agentPtyReview !== undefined;
+  } catch {
+    return false;
+  }
+}
+
+function qualificationCaptureId(req: Request): string | undefined {
+  const value = req.header("x-kontrol-qualification-capture-id")?.trim();
+  return value && value.length <= 256 && /^[A-Za-z0-9._:-]+$/.test(value) ? value : undefined;
+}
+
+function authenticatedConnection(req: Request, deps: McpHttpDeps, requestId?: string): {
+  context: ConnectionContext;
+  workerClaims?: WorkerTokenClaims;
+} {
+  const { config } = deps;
+  const peer = req.peerPrincipal;
+  const body = req.body as {
+    params?: {
+      clientInfo?: { name?: unknown };
+      _meta?: Record<string, unknown>;
+    };
+    clientInfo?: { name?: unknown };
+  } | undefined;
+  const clientName = body?.params?.clientInfo?.name ?? body?.clientInfo?.name;
+  const clientPlatformHint = typeof clientName === "string" ? clientName.slice(0, 200) : undefined;
+  const clientCapabilities = body?.params?._meta?.["io.modelcontextprotocol/clientCapabilities"];
+  const capabilities = clientCapabilities && typeof clientCapabilities === "object"
+    ? clientCapabilities as { extensions?: Record<string, unknown> }
+    : undefined;
+  if (peer) {
+    return {
+      context: {
+        authenticatedRole: "peer",
+        authSource: "peer_token",
+        authenticatedPrincipalId: peer.principalId,
+        listenerKind: "peer",
+        peerCapabilities: peer.capabilities,
+        peerGrantedRoots: peer.grantedRoots,
+        conversationId: conversationId(req),
+        clientPlatformHint,
+        clientCapabilities: capabilities,
+      },
+    };
+  }
+
+  let workerClaims: WorkerTokenClaims | undefined;
+  const workerToken = req.header("x-kontrol-worker-token");
+  if (workerToken && config.acpAgentSecret) {
+    try {
+      workerClaims = verifyWorkerToken(workerToken, config.acpAgentSecret);
+    } catch (error) {
+      logEvent(config.logging, "warn", "worker_token_rejected", {
+        requestId,
+        reason: error instanceof Error ? error.message : String(error),
+        ...requestLogFields(req, config),
+      });
+    }
+  }
+  const ptyCredential = ptyReviewCredential(req, deps);
+  if (workerClaims?.agentPtyReview && !ptyCredential) workerClaims = undefined;
+  if (ptyCredential) workerClaims = ptyCredential.claims;
+  const verifiedReviewer = constantTimeStringEqual(req.header("x-kontrol-reviewer-token"), config.acpReviewerSecret);
+  const verifiedTunnelReviewer = config.authMode === "tunnel"
+    && constantTimeStringEqual(req.header("x-kontrol-tunnel-reviewer"), config.tunnelReviewerSecret);
+  const oauthScopes = Array.isArray(req.auth?.scopes) ? req.auth.scopes : [];
+  const verifiedOAuthReviewer = deps.oauthEnabled() && oauthScopes.some((scope) =>
+    scope === "kontrol" || scope === "kontrol:review" || scope === "kontrol:approve"
+      || scope === "kontrol:mission" || scope === "kontrol:dispatch",
+  );
+  const context: ConnectionContext = {
+    authenticatedRole: workerClaims
+      ? "worker"
+      : verifiedReviewer || verifiedTunnelReviewer || verifiedOAuthReviewer
+        ? "reviewer"
+        : "client",
+    listenerKind: deps.publicListener?.() ? "owner_public" : "owner",
+    authSource: workerClaims
+      ? "worker_token"
+      : verifiedReviewer
+        ? "reviewer_token"
+        : verifiedTunnelReviewer
+          ? "tunnel_reviewer"
+          : deps.oauthEnabled()
+            ? "oauth"
+            : "anonymous",
+    authenticatedPrincipalId: workerClaims
+      ? `worker-work-session:${workerClaims.workSessionId}`
+      : req.auth?.clientId
+        ? `oauth-client:${req.auth.clientId}`
+        : verifiedReviewer
+          ? "reviewer-token"
+          : verifiedTunnelReviewer
+            ? "tunnel-reviewer"
+            : undefined,
+    workspaceSessionId: workerClaims?.workspaceSessionId || req.header("x-kontrol-workspace-session") || undefined,
+    workSessionId: workerClaims?.workSessionId,
+    runId: workerClaims?.runId || req.header("x-kontrol-run") || undefined,
+    continuationId: workerClaims?.continuationId || req.header("x-kontrol-continuation") || undefined,
+    ...(ptyCredential ? { agentPtyReviewBinding: {
+      bindingId: ptyCredential.binding.id,
+      processSessionId: ptyCredential.binding.processSessionId,
+      processGeneration: ptyCredential.binding.processGeneration,
+    } } : {}),
+    workspaceLeaseNonce:
+      (workerClaims as (WorkerTokenClaims & { workspaceLeaseNonce?: string }) | undefined)?.workspaceLeaseNonce
+      || (workerClaims ? req.header("x-kontrol-workspace-lease-nonce") ?? undefined : undefined),
+    conversationId: conversationId(req),
+    clientPlatformHint,
+    clientCapabilities: capabilities,
+  };
+  return { context, workerClaims };
 }
 
 function responseChunkBytes(chunk: unknown, encoding: unknown): number {
@@ -90,23 +238,51 @@ export interface McpHttpDeps {
   readonly mcpResourceAdmission: McpAdmission;
   readonly expiredMcpOperations: ExpiredMcpOperationTracker;
   readonly operationDiagnostics: McpOperationDiagnostics;
+  readonly qualificationEvidence: McpQualificationEvidenceJournal;
   readonly sessionLifecycle: McpSessionLifecycle;
   readonly recordUnknownSessionRequest?: (sessionId: string) => void;
   readonly recordFreshInitialization?: (reconnected: boolean, durationMs?: number) => void;
-  readonly recordMcpConnectionEvent?: (event: { kind: string; sessionId?: string; requestKind?: string; durationMs?: number }) => void;
+  readonly recordMcpConnectionEvent?: (event: { kind: string; sessionId?: string; requestId?: string; operationId?: string; requestKind?: string; toolName?: string; failureClass?: string; durationMs?: number }) => void;
   readonly workspaceAppResourceMetrics: { currentHashed: number; previousHashed: number; staleHashMisses: number; openAiCompatibility: number; legacyKontrol: number; devDesktopMigration: number };
   trackSocketAbort(socket: Socket, controller: AbortController): () => void;
   bearerAuth(): ((req: Request, res: Response, next: (error?: unknown) => void) => void) | undefined;
   resourceServerUrl(): URL | undefined;
   oauthEnabled(): boolean;
   shuttingDown(): boolean;
+  /**
+   * True when this handler serves the separately-authenticated peer listener.
+   * Peer requests carry a registry-verified req.peerPrincipal instead of OAuth
+   * context; on the peer listener a missing peer principal is always rejected.
+   */
+  isPeerListener?: () => boolean;
+  /**
+   * True only on the public OAuth MCP listener (P0-02). Structurally no peer
+   * principal can exist there: the peer middleware is never mounted on the
+   * public app, so peer identity derivation is unreachable and sessions are
+   * fenced to "owner_public".
+   */
+  publicListener?: () => boolean;
   serveWorkspaceAppResource(res: Response, requestId: string | undefined, body: { id?: unknown; params?: { uri?: unknown } }, sessionless: boolean, clientKey: string, abortSignal: AbortSignal | undefined, acceptEncoding?: string | undefined, context?: { sessionId?: string; generationId?: string }): Promise<boolean>;
-  createServerForSession(connectionContext: ConnectionContext): McpServer;
+  createServerForSession(
+    connectionContext: ConnectionContext,
+    onToolCatalogHandshake?: (sessionId: string | undefined, result: {
+      status: "accepted" | "rejected";
+      serverVersion: string;
+      captureId?: string;
+      serverCatalogSha256?: string;
+      hostCatalogSha256: string;
+      toolCount?: number;
+      acceptedAt: string;
+      reason?: string;
+    }) => void,
+  ): McpServer;
   supervisorWake(workSessionId: string): void;
+  onScheduledJobCreated?: () => void;
   mutationReceipts: MutationReceiptStore;
   workspaces: import("../workspaces.js").WorkspaceRegistry;
   reviewCheckpoints: import("../review-checkpoints.js").ReviewCheckpointManager;
   processSessions: import("../process-sessions.js").ProcessSessionManager;
+  agentPtyBindings?: AgentPtyBindingStore;
   workSessions: import("../work-sessions.js").WorkSessionManager;
   agentRegistry: import("../acp-registry.js").AgentRegistryManager;
   eventStore: import("../event-log.js").EventStore;
@@ -120,9 +296,84 @@ export interface McpHttpDeps {
   liveWaiters: LiveWaiterRegistry;
   agentMessages: import("../agent-messages.js").AgentMessageManager;
   supervisorRuns: import("../supervisor-runs.js").SupervisorRuns;
+  scheduledJobs?: import("../scheduling/scheduled-job-store.js").ScheduledJobStore;
+  reviewRoutes?: import("../review-handoff/route-store.js").ReviewRouteStore;
+  reviewBrowserController?: import("../review-browser/browser-controller.js").ReviewerBrowserController;
+  reviewThreads?: import("../review-thread/thread-store.js").ReviewThreadStore;
 }
 
-type CatalogRefreshPhase = "initialized" | "get_stream";
+function isLoopbackAddress(address: string | undefined): boolean {
+  return address === "127.0.0.1" || address === "::1" || address === "::ffff:127.0.0.1";
+}
+
+/** Exchange an expired or near-expiry PTY review token only while its exact
+ * process generation, run and workspace lease remain live. */
+export function handleAgentPtyCredentialRenewal(deps: McpHttpDeps, req: Request, res: Response): void {
+  res.setHeader("Cache-Control", "no-store");
+  if (req.method !== "POST") {
+    res.setHeader("Allow", "POST").status(405).json({ error: "method_not_allowed" });
+    return;
+  }
+  if (!isLoopbackAddress(req.socket.remoteAddress)) {
+    res.status(403).json({ error: "loopback_required" });
+    return;
+  }
+  const token = req.header("x-kontrol-worker-token");
+  if (!token || !deps.config.acpAgentSecret || !deps.agentPtyBindings) {
+    res.status(401).json({ error: "unauthorized" });
+    return;
+  }
+  try {
+    const renewed = exchangeAgentPtyReviewCredential({
+      token,
+      secret: deps.config.acpAgentSecret,
+      bindings: deps.agentPtyBindings,
+      processSessions: deps.processSessions,
+      workSessions: deps.workSessions,
+      agentRegistry: deps.agentRegistry,
+    });
+    res.status(200).json(renewed);
+  } catch {
+    res.status(403).json({ error: "pty_review_renewal_denied" });
+  }
+}
+
+type CatalogRefreshPhase = "initialized" | "get_stream" | "request_retry";
+
+const modernEventBuses = new WeakMap<McpHttpDeps, InMemoryServerEventBus>();
+const modernCatalogs = new WeakMap<McpHttpDeps, Map<string, { sha256: string; toolCount: number }>>();
+const modernCatalogAcknowledgements = new WeakMap<McpHttpDeps, Map<string, boolean>>();
+
+function modernEventBus(deps: McpHttpDeps): InMemoryServerEventBus {
+  let bus = modernEventBuses.get(deps);
+  if (!bus) {
+    bus = new InMemoryServerEventBus((error) => {
+      logEvent(deps.config.logging, "warn", "mcp_modern_event_listener_failed", {
+        reason: error.message,
+      });
+    });
+    modernEventBuses.set(deps, bus);
+  }
+  return bus;
+}
+
+function modernCatalogMap(deps: McpHttpDeps): Map<string, { sha256: string; toolCount: number }> {
+  let catalogs = modernCatalogs.get(deps);
+  if (!catalogs) {
+    catalogs = new Map();
+    modernCatalogs.set(deps, catalogs);
+  }
+  return catalogs;
+}
+
+function modernCatalogAcknowledgementMap(deps: McpHttpDeps): Map<string, boolean> {
+  let acknowledgements = modernCatalogAcknowledgements.get(deps);
+  if (!acknowledgements) {
+    acknowledgements = new Map();
+    modernCatalogAcknowledgements.set(deps, acknowledgements);
+  }
+  return acknowledgements;
+}
 
 function requestAdmissionTimeout(state: McpSessionState | undefined, config: ServerConfig): number {
   return state?.durableWorkerSession ? config.mcpAdmissionTimeoutMs : config.mcpInteractiveAdmissionTimeoutMs;
@@ -132,6 +383,8 @@ function catalogRefreshStats(state: McpSessionState) {
   return state.catalogRefresh ??= {
     initializedPulseAttempted: false,
     getStreamPulseAttempted: false,
+    deferredNoStreamAttempts: 0,
+    staleDeliveries: 0,
     toolListRefreshSent: false,
     resourceListRefreshSent: false,
     toolListRefreshAttempts: 0,
@@ -140,49 +393,102 @@ function catalogRefreshStats(state: McpSessionState) {
     resourceListRefreshSuccesses: 0,
     toolListRefreshFailures: 0,
     resourceListRefreshFailures: 0,
+    toolListRefreshInFlight: false,
+    resourceListRefreshInFlight: false,
   };
+}
+
+/**
+ * Delivery state belongs to the standalone stream that carries it. When that
+ * stream ends the channels are re-armed: the next standalone stream has to be
+ * able to deliver, because a success recorded against a stream that has since
+ * disappeared may never have reached the host.
+ */
+function rearmCatalogRefreshDelivery(state: McpSessionState): void {
+  const refresh = state.catalogRefresh;
+  if (!refresh) return;
+  refresh.toolListRefreshSent = false;
+  refresh.resourceListRefreshSent = false;
+  refresh.toolListRefreshAttempts = 0;
+  refresh.resourceListRefreshAttempts = 0;
+  refresh.toolListRefreshLastAttemptMs = undefined;
+  refresh.resourceListRefreshLastAttemptMs = undefined;
+}
+
+/**
+ * The standalone GET SSE stream is gone. The transport can no longer carry a
+ * server-initiated notification on it, and nothing recorded against it may
+ * suppress the delivery on the next standalone stream.
+ *
+ * The clear is fenced to the surface that owned it: a request that ends after
+ * a successor stream already established a new surface must not re-arm that
+ * successor. The owner passes the generation it established, and the clear
+ * only applies while the session still carries that surface.
+ */
+function clearStandaloneSseDelivery(state: McpSessionState, ownedGeneration?: number): void {
+  if (ownedGeneration !== undefined && (state.deliveryGeneration ?? 0) !== ownedGeneration) {
+    // A successor surface already replaced this one. The successor owns the
+    // delivery state; this late clear must not touch it.
+    return;
+  }
+  if (state.standaloneSseEstablished === true) {
+    // The surface identity changes, so a send that resolves against the surface
+    // that just ended is discarded instead of marking the channel sent. A
+    // second clear of the same surface changes nothing.
+    state.deliveryGeneration = (state.deliveryGeneration ?? 0) + 1;
+  }
+  state.standaloneSseEstablished = false;
+  rearmCatalogRefreshDelivery(state);
 }
 
 async function sendCatalogRefreshPulse(
   deps: McpHttpDeps,
   sessionId: string,
   phase: CatalogRefreshPhase,
+  retryDepth = 0,
 ): Promise<void> {
   const state = deps.mcpSessions.get(sessionId);
   const server = deps.mcpServers.get(sessionId);
   if (!state || !server || state.closing || state.closed) return;
+  modernEventBus(deps).publish({ kind: "tools_list_changed" });
+  modernEventBus(deps).publish({ kind: "resources_list_changed" });
   const refresh = catalogRefreshStats(state);
   if (phase === "initialized") {
-    if (refresh.initializedPulseAttempted) return;
     refresh.initializedPulseAttempted = true;
-  } else {
-    if (refresh.getStreamPulseAttempted) return;
+  } else if (phase === "get_stream") {
     refresh.getStreamPulseAttempted = true;
   }
   refresh.lastAttemptAt = new Date().toISOString();
 
+  // A server-initiated notification is only observable on a live standalone
+  // GET SSE channel. Without one the transport drops the message but still
+  // resolves the send, so recording that as a success would permanently
+  // suppress the pulse on the very channel that can carry it. Defer instead:
+  // the channel stays eligible and the GET-stream phase delivers the pulse.
+  if (state.standaloneSseEstablished !== true) {
+    refresh.deferredNoStreamAttempts += 1;
+    logEvent(deps.config.logging, "debug", "mcp_catalog_refresh_deferred", {
+      sessionIdPrefix: sessionIdPrefix(sessionId),
+      phase,
+      activeSseStreams: state.activeSseStreams,
+    });
+    return;
+  }
+
+  // The delivery surface that carries this pulse. When it ends while the send
+  // is in flight, the resolved send is discarded instead of marking the
+  // channel sent: a success recorded against a surface that has gone away may
+  // never have reached the host.
+  const deliveryGeneration = state.deliveryGeneration ?? 0;
+  const isDeliveryStillValid = (): boolean =>
+    (state.deliveryGeneration ?? 0) === deliveryGeneration
+    && state.standaloneSseEstablished === true;
+
   const sendOne = async (
     method: "tools" | "resources",
     send: () => Promise<void>,
-  ): Promise<void> => {
-    const attemptsKey = method === "tools" ? "toolListRefreshAttempts" : "resourceListRefreshAttempts";
-    const successesKey = method === "tools" ? "toolListRefreshSuccesses" : "resourceListRefreshSuccesses";
-    const failuresKey = method === "tools" ? "toolListRefreshFailures" : "resourceListRefreshFailures";
-    const sentKey = method === "tools" ? "toolListRefreshSent" : "resourceListRefreshSent";
-    refresh[attemptsKey] += 1;
-    let timer: NodeJS.Timeout | undefined;
-    try {
-      await Promise.race([
-        send(),
-        new Promise<never>((_, reject) => {
-          timer = setTimeout(() => reject(new Error("list-changed notification send deadline exceeded")), 1_500);
-          timer.unref?.();
-        }),
-      ]);
-      refresh[successesKey] += 1;
-      refresh[sentKey] = true;
-    } catch (error) {
-      refresh[failuresKey] += 1;
+  ): Promise<"stale" | "delivered"> => {
+    const outcome = await sendCatalogRefreshNotification(refresh, method, send, (error) => {
       logEvent(deps.config.logging, "warn", "mcp_catalog_refresh_failed", {
         sessionIdPrefix: sessionIdPrefix(sessionId),
         phase,
@@ -190,18 +496,46 @@ async function sendCatalogRefreshPulse(
         surfaceVersion: state.toolSurfaceVersion,
         error: error instanceof Error ? error.message : String(error),
       });
-    } finally {
-      if (timer) clearTimeout(timer);
-    }
+    }, Date.now(), { isDeliveryStillValid });
+    if (outcome !== "stale") return "delivered";
+    refresh.staleDeliveries += 1;
+    logEvent(deps.config.logging, "warn", "mcp_catalog_refresh_stale", {
+      sessionIdPrefix: sessionIdPrefix(sessionId),
+      phase,
+      method,
+      deliveryGeneration,
+    });
+    return "stale";
   };
 
-  await Promise.all([
+  const outcomes = await Promise.all([
     sendOne("tools", () => server.server.sendToolListChanged()),
     sendOne("resources", () => server.server.sendResourceListChanged()),
   ]);
+
+  if (outcomes.includes("stale") && retryDepth === 0 && state.standaloneSseEstablished === true) {
+    // A successor surface is live and the host is still owed the notification.
+    // Pay it there instead of waiting for the next pulse opportunity. One
+    // follow-up per pulse invocation, and the retry is bounded to one round.
+    void sendCatalogRefreshPulse(deps, sessionId, phase, retryDepth + 1);
+  }
 }
 
 export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res: Response): Promise<unknown> {
+  const presentedWorkerToken = req.header("x-kontrol-worker-token");
+  if (presentsPtyReviewScope(presentedWorkerToken) && !ptyReviewCredential(req, deps)) {
+    // A stale or rebound PTY credential must never fall through as an
+    // unauthenticated client session when OAuth is disabled.
+    res.status(401).json({ error: "unauthorized" });
+    return;
+  }
+  // Keep the established stateful 2025 route intact. Only requests classified
+  // as 2026 per-request traffic take the stateless handler below.
+  const webRequest = await toWebRequest(req, req.body);
+  if (!(await isLegacyRequest(webRequest, req.body))) {
+    return handleModernMcpHttpRequest(deps, req, res, webRequest);
+  }
+
   const {
     config,
     db,
@@ -215,6 +549,7 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
     mcpResourceAdmission,
     expiredMcpOperations,
     operationDiagnostics,
+    qualificationEvidence,
     sessionLifecycle,
     workspaceAppResourceMetrics,
     trackSocketAbort,
@@ -231,6 +566,7 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
     workspaces,
     reviewCheckpoints,
     processSessions,
+    agentPtyBindings,
     workSessions,
     agentRegistry,
     eventStore,
@@ -243,6 +579,8 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
     reviewWorkflow,
     agentMessages,
     supervisorRuns,
+    scheduledJobs,
+    reviewRoutes,
   } = deps;
   const {
     recordMcpTiming,
@@ -280,23 +618,39 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
         : "execution";
     const operationId = randomUUID();
     const externalCorrelationId = externalCorrelation(req);
+    const operationSessionState = sessionId ? mcpSessions.get(sessionId) : undefined;
+    const operationSessionIdSha256 = sessionId ? createHash("sha256").update(sessionId).digest("hex") : undefined;
+    const operationServerVersion = operationSessionState?.toolSurfaceVersion;
+    const operationCaptureId = qualificationCaptureId(req);
     operationDiagnostics.begin({
       operationId,
       requestId,
       externalCorrelationId,
       generationId: config.launchGenerationId,
       sessionIdPrefix: sessionIdPrefix(sessionId),
+      sessionIdSha256: operationSessionIdSha256,
+      serverBuildId: config.expectedBuildId,
+      serverVersion: operationServerVersion,
       method: req.method,
       rpcMethod: requestRpcMethod,
       toolName: requestToolName,
       startedAtMs: requestStartedAtMs,
       admissionClass,
     });
+    deps.recordMcpConnectionEvent?.({
+      kind: requestRpcMethod === "initialize" ? "initialize_started" : requestRpcMethod === "tools/call" ? "tool_call_started" : "request_started",
+      sessionId,
+      requestId: requestId ?? operationId,
+      operationId,
+      requestKind: requestRpcMethod ?? req.method,
+      ...(requestToolName ? { toolName: requestToolName } : {}),
+    });
     res.setHeader("x-kontrol-operation-id", operationId);
     res.setHeader("x-kontrol-request-id", requestId ?? operationId);
     if (externalCorrelationId) res.setHeader("x-kontrol-correlation-id", externalCorrelationId);
     let handlerStartedAt = 0;
     let handlerSettled = false;
+    let requestAdmissionWeight = 1;
     let responseBytes = 0;
     let heartbeatBytes = 0;
     let responseCloseClassification: string | undefined;
@@ -304,6 +658,14 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
     let transport: Transport | undefined;
     let sessionState: McpSessionState | undefined;
     let stopSseHeartbeat: (() => void) | undefined;
+    // True only for the request that established the standalone delivery
+    // surface. A rejected or duplicate GET must not tear down the surface that
+    // another live stream still carries.
+    let standaloneStreamEstablished = false;
+    // The delivery generation this request established. A late teardown of
+    // this request must not re-arm a successor surface that already replaced
+    // it.
+    let standaloneStreamGeneration: number | undefined;
     const requestAbort = new AbortController();
     const instrumentedResponse = res as unknown as {
       write: (...args: unknown[]) => unknown;
@@ -335,6 +697,7 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
             requestKind,
           });
         }, () => {
+          deps.recordMcpConnectionEvent?.({ kind: "sse_recovered", sessionId, requestKind });
           deps.recordMcpConnectionEvent?.({ kind: "sse_writer_drained", sessionId, requestKind });
           logEvent(config.logging, "info", "mcp_sse_writer_drained", {
             requestId,
@@ -343,9 +706,37 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
           });
         }, (bytes) => {
           heartbeatBytes += bytes;
+        }, {
+          maxStallMs: config.mcpSseMaxStallMs,
+          onStallTimeout: ({ stalledSince, lastSuccessfulWriteAt, consecutiveStallCount }) => {
+            deps.recordMcpConnectionEvent?.({ kind: "sse_stall_timeout", sessionId, requestKind, durationMs: Math.max(0, Date.now() - stalledSince) });
+            logEvent(config.logging, "warn", "mcp_sse_stall_timeout", {
+              requestId,
+              sessionIdPrefix: sessionIdPrefix(sessionId),
+              requestKind,
+              stalledSince: new Date(stalledSince).toISOString(),
+              lastSuccessfulWriteAt: new Date(lastSuccessfulWriteAt).toISOString(),
+              consecutiveStallCount,
+            });
+          },
         });
       }
-      if (req.method === "GET" && sessionId) void sendCatalogRefreshPulse(deps, sessionId, "get_stream");
+      if (req.method === "GET" && sessionId) {
+        // The transport registers the standalone GET stream before it writes
+        // these SSE headers, so a notification sent from here is deliverable
+        // on this channel.
+        const streamState = deps.mcpSessions.get(sessionId);
+        if (streamState && streamState.standaloneSseEstablished !== true) {
+          // A new delivery surface. Its identity changes, so a send that
+          // resolves against a previous surface can never mark the channel
+          // sent for this one.
+          streamState.standaloneSseEstablished = true;
+          streamState.deliveryGeneration = (streamState.deliveryGeneration ?? 0) + 1;
+          standaloneStreamEstablished = true;
+          standaloneStreamGeneration = streamState.deliveryGeneration;
+        }
+        void sendCatalogRefreshPulse(deps, sessionId, "get_stream");
+      }
     };
     const restoreResponseWriters = () => {
       if (responseWritersRestored) return;
@@ -436,6 +827,44 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
         sessionInFlight,
         connectionMetrics,
       });
+      deps.recordMcpConnectionEvent?.({
+        kind: completedResponseCloseClassification === "response_finished" ? "response_finished" : "stream_aborted",
+        sessionId,
+        requestId: requestId ?? operationId,
+        operationId,
+        requestKind: requestRpcMethod ?? req.method,
+        ...(requestToolName ? { toolName: requestToolName } : {}),
+        ...(requestErrorClass ? { failureClass: requestErrorClass } : {}),
+        durationMs: Math.max(0, finishedAtMs - requestStartedAtMs),
+      });
+      try {
+        const responseContentType = res.getHeader("content-type")?.toString().toLowerCase() ?? "";
+        qualificationEvidence.recordCompletedSseOperation({
+          operationId,
+          qualificationCaptureId: operationCaptureId,
+          serverBuildId: config.expectedBuildId,
+          serverVersion: operationServerVersion,
+          sessionIdSha256: operationSessionIdSha256,
+          httpMethod: req.method,
+          rpcMethod: requestRpcMethod,
+          toolName: requestToolName,
+          startedAt: new Date(requestStartedAtMs).toISOString(),
+          finishedAt: new Date(finishedAtMs).toISOString(),
+          durationMs: Math.max(0, finishedAtMs - requestStartedAtMs),
+          isSseResponse: responseContentType.includes("text/event-stream"),
+          httpStatus: res.statusCode,
+          responseBytes,
+          heartbeatBytes,
+          responseCloseClassification: completedResponseCloseClassification,
+          handlerStillRunning: !handlerSettled,
+        });
+      } catch (error) {
+        logEvent(config.logging, "error", "mcp_qualification_evidence_write_failed", {
+          operationId,
+          recordType: "external_sse",
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
       logEvent(config.logging, "debug", "mcp_operation_finished", {
         operationId,
         requestId,
@@ -487,6 +916,14 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
     // waiters) and they all no-op on a duplicated abort.
     req.once("aborted", abortIfDisconnected);
     const onResponseClose = () => {
+      if (standaloneStreamEstablished && sessionId) {
+        // The standalone GET stream that carried the delivery surface ended.
+        // This handler is registered before the transport registers its own
+        // stream cancellation, so the surface is cleared before the transport
+        // drops the stream.
+        const state = mcpSessions.get(sessionId);
+        if (state) clearStandaloneSseDelivery(state, standaloneStreamGeneration);
+      }
       // Cancel downstream work for this HTTP request, but preserve the MCP
       // session and any other concurrent requests sharing its transport. The
       // SDK owns individual SSE stream cancellation and session close() is
@@ -494,7 +931,7 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
       if (!res.writableFinished) {
         responseCloseClassification = "response_closed_before_finish";
         deps.recordMcpConnectionEvent?.({
-          kind: requestIsWaiter ? "watcher_aborted" : "response_channel_closed",
+          kind: requestIsSseStream ? "stream_aborted" : requestIsWaiter ? "watcher_aborted" : "response_channel_closed",
           sessionId,
           requestKind: requestIsSseStream ? "sse_stream" : req.method === "POST" ? "post_response" : "http_response",
         });
@@ -520,9 +957,20 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
     };
     const onResponseFinish = () => {
       responseCloseClassification ??= "response_finished";
+      if (standaloneStreamEstablished && sessionId) {
+        const state = mcpSessions.get(sessionId);
+        if (state) clearStandaloneSseDelivery(state, standaloneStreamGeneration);
+      }
       const finishedAt = performance.now();
       recordPhaseTiming("mcp.response", finishedAt - requestStartedAt);
       if (handlerStartedAt > 0) recordPhaseTiming("mcp.serialization", finishedAt - handlerStartedAt);
+      // A completed tools/list response is a later, useful retry opportunity:
+      // the transport is demonstrably carrying a response, and a failed
+      // initialize/stream notification can be retried without duplicating a
+      // channel that already accepted its change pulse.
+      if (req.method === "POST" && requestRpcMethod === "tools/list" && sessionId) {
+        void sendCatalogRefreshPulse(deps, sessionId, "request_retry");
+      }
       if (req.method === "DELETE" && sessionId) {
         deps.recordMcpConnectionEvent?.({ kind: "explicit_delete", sessionId, requestKind: "delete" });
         const state = mcpSessions.get(sessionId);
@@ -632,33 +1080,61 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
       });
     }
 
-    if (bearerAuth && !req.auth) {
-      await new Promise<void>((resolve, reject) => {
-        bearerAuth(req, res, (error?: unknown) => {
-          if (error) reject(error);
-          else resolve();
-        });
+    // Peer-authenticated requests (peer listener only) carry a registry-
+    // verified principal instead of OAuth context. The peer credential is the
+    // whole trust boundary: no OAuth resource assertion applies, and unsigned
+    // worker/reviewer/conversation headers are never evaluated for promotion.
+    const peerPrincipal = req.peerPrincipal;
+    const ptyCredential = ptyReviewCredential(req, deps);
+    if (peerPrincipal) {
+      logEvent(config.logging, "debug", "peer_request_authenticated", {
+        requestId,
+        peerId: peerPrincipal.peerId,
+        credentialId: peerPrincipal.credentialId,
+        method: req.method,
+        path: requestPath(req),
       });
-      if (res.headersSent) return;
-    }
-    if (bearerAuth) {
-      if (res.headersSent) return;
-      if (!req.auth?.resource || !checkResourceAllowed({ requestedResource: req.auth.resource, configuredResource: resourceServerUrl! })) {
+    } else {
+      if (bearerAuth && !req.auth && !ptyCredential) {
+        await new Promise<void>((resolve, reject) => {
+          bearerAuth(req, res, (error?: unknown) => {
+            if (error) reject(error);
+            else resolve();
+          });
+        });
+        if (res.headersSent) return;
+      }
+      if (bearerAuth && !ptyCredential) {
+        if (res.headersSent) return;
+        if (!req.auth?.resource || !checkResourceAllowed({ requestedResource: req.auth.resource, configuredResource: resourceServerUrl! })) {
+          logEvent(config.logging, "warn", "auth_denied", {
+            requestId,
+            method: req.method,
+            path: requestPath(req),
+            reason: "invalid_oauth_resource",
+            ...requestLogFields(req, config),
+          });
+          sendJsonRpcError(res, 401, -32001, "Unauthorized");
+          return;
+        }
+      } else if (config.authMode === "tunnel") {
+        // Tunnel mode is intentionally unauthenticated at the local MCP hop.
+        // The OpenAI Secure MCP Tunnel owns the external trust boundary. In
+        // particular, never let a stale KONTROL_TUNNEL_TOKEN or Authorization
+        // header turn this mode back into a second, unsynchronized auth gate.
+      }
+      if (deps.isPeerListener?.()) {
+        // Defense in depth: the peer middleware normally rejects unauthenticated
+        // requests before this handler runs; never serve one that slipped through.
         logEvent(config.logging, "warn", "auth_denied", {
           requestId,
           method: req.method,
           path: requestPath(req),
-          reason: "invalid_oauth_resource",
-          ...requestLogFields(req, config),
+          reason: "missing_peer_principal",
         });
         sendJsonRpcError(res, 401, -32001, "Unauthorized");
         return;
       }
-    } else if (config.authMode === "tunnel") {
-      // Tunnel mode is intentionally unauthenticated at the local MCP hop.
-      // The OpenAI Secure MCP Tunnel owns the external trust boundary. In
-      // particular, never let a stale KONTROL_TUNNEL_TOKEN or Authorization
-      // header turn this mode back into a second, unsynchronized auth gate.
     }
 
     // tunnel-client performs liveness and compatibility probes with an empty
@@ -702,7 +1178,39 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
           return;
         }
         sessionState = mcpSessions.get(sessionId);
-        if (config.authMode === "oauth" && sessionState && sessionState.logicalClientId !== logicalClientId(req)) {
+        // Identity continuity: an authenticated session (OAuth owner or peer)
+        // may only be resumed by the same logical client. A peer session's
+        // logical client IS the peer principal, so a rotated/revoked
+        // credential - or an owner/peer token presented on the other listener
+        // - cannot attach to an existing session.
+        // Authorization continuity: a peer session must be resumed only by a
+        // principal carrying the exact authorization revision/hash used at
+        // initialization. Credential rotation or grant changes create a fresh
+        // initialize and never let old transports exercise stale authority.
+        if (
+          peerPrincipal
+          && sessionState
+          && (sessionState.peerAuthorizationRevision !== peerPrincipal.grantRevision
+            || sessionState.peerAuthorizationHash !== peerPrincipal.grantHash)
+        ) {
+          logEvent(config.logging, "warn", "mcp_session_authorization_stale", {
+            requestId,
+            sessionIdPrefix: sessionIdPrefix(sessionId),
+            expectedRevision: sessionState.peerAuthorizationRevision,
+            actualRevision: peerPrincipal.grantRevision,
+          });
+          // Rejection alone leaves a stale standalone SSE transport attached.
+          // Close the transport and run the same lifecycle cleanup as an
+          // explicit close so direct process ownership and waiters are fenced.
+          finalizeMcpSession(sessionId, "client_closed", { evictionReason: "peer_authorization_superseded" });
+          sendJsonRpcError(res, 403, -32001, "MCP session authorization has been superseded; initialize a fresh session");
+          return;
+        }
+        if (
+          sessionState
+          && (config.authMode === "oauth" || sessionState.authSource === "peer_token")
+          && sessionState.logicalClientId !== logicalClientId(req)
+        ) {
           logEvent(config.logging, "warn", "mcp_session_client_mismatch", {
             requestId,
             sessionIdPrefix: sessionIdPrefix(sessionId),
@@ -722,6 +1230,24 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
             actualConversationId: requestedConversationId,
           });
           sendJsonRpcError(res, 403, -32001, "MCP session belongs to another conversation");
+          return;
+        }
+        // Fail-closed listener fence (P2-1): the request's listener kind must
+        // EQUAL the session's. A missing session record (transport without
+        // state — an anomaly) or an unknown kind is a mismatch, never a skip.
+        const requestListenerKind: "owner" | "peer" | "owner_public" = peerPrincipal
+          ? "peer"
+          : deps.publicListener?.()
+            ? "owner_public"
+            : "owner";
+        if (sessionState?.listenerKind !== requestListenerKind) {
+          logEvent(config.logging, "warn", "mcp_session_listener_mismatch", {
+            requestId,
+            sessionIdPrefix: sessionIdPrefix(sessionId),
+            expectedListener: sessionState?.listenerKind,
+            actualListener: requestListenerKind,
+          });
+          sendJsonRpcError(res, 403, -32001, "MCP session belongs to another listener");
           return;
         }
         if (
@@ -751,7 +1277,10 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
             logicalContinuity.touch(sessionState.logicalClientId, sessionState.sessionId, activityAt);
           }
           sessionRequestClass = requestIsSseStream ? "stream" : requestIsWaiter ? "waiter" : "execution";
-          if (sessionRequestClass === "stream") sessionState.activeSseStreams++;
+          if (sessionRequestClass === "stream") {
+            sessionState.activeSseStreams++;
+            sessionState.transportAttached = true;
+          }
           else if (sessionRequestClass === "waiter") sessionState.activeLongPollCount++;
           else {
             sessionState.inFlightRequests++;
@@ -841,6 +1370,25 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
             });
           }
         }
+        // Peer sessions are capped independently of the global session budget
+        // so a peer can never starve owner MCP traffic.
+        if (peerPrincipal && config.peer) {
+          const peerSessionCount = [...mcpSessions.values()].filter((entry) => entry.authSource === "peer_token").length;
+          if (peerSessionCount >= config.peer.maxActiveSessions) {
+            logEvent(config.logging, "warn", "mcp_session_rejected", {
+              requestId,
+              reason: "peer_session_limit_reached",
+              peerId: peerPrincipal.peerId,
+              current: peerSessionCount,
+              maxActiveSessions: config.peer.maxActiveSessions,
+            });
+            return res.status(503).json({
+              jsonrpc: "2.0",
+              id: (req.body as { id?: unknown } | undefined)?.id ?? null,
+              error: { code: -32000, message: "Peer session limit reached. Try again later." },
+            });
+          }
+        }
         // A generic clientInfo name/version is not a trustworthy owner: many
         // independent host transports can share it. Use only an instance,
         // conversation, or authenticated OAuth identity for aggressive caps.
@@ -873,7 +1421,7 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
         // cleanup; the transport property is only a fallback.
         let boundSessionId: string | undefined;
         let sessionMcpServer: McpServer | undefined;
-        transport = new StreamableHTTPServerTransport({
+        transport = new NodeStreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
           onsessioninitialized: (newSessionId) => {
             boundSessionId = newSessionId;
@@ -887,6 +1435,9 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
                 authenticatedRole: connectionContext.authenticatedRole ?? "client",
                 authenticatedPrincipalId: connectionContext.authenticatedPrincipalId,
                 authSource: connectionContext.authSource ?? "anonymous",
+                listenerKind: peerPrincipal ? "peer" : deps.publicListener?.() ? "owner_public" : "owner",
+                peerAuthorizationRevision: peerPrincipal?.grantRevision,
+                peerAuthorizationHash: peerPrincipal?.grantHash,
                 conversationId: requestConversationId,
                 approvalCorrelationId: clientIdentity.source === "client_info_fallback" ? undefined : clientId,
                 workSessionId: connectionContext.workSessionId,
@@ -900,6 +1451,7 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
                 resourceReadCount: 0,
                 activeLongPollCount: 0,
                 activeSseStreams: 0,
+                transportAttached: false,
                 activePolicyWaiters: 0,
                 closing: false,
                 closed: false,
@@ -983,86 +1535,9 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
         // role. A caller that omits/forges the token is treated as a
         // reviewer/client and cannot acquire worker rights (P0 #3: role is no
         // longer client-controlled).
-        const workerToken = req.header("x-kontrol-worker-token");
-        let verifiedClaims: WorkerTokenClaims | undefined;
-        if (workerToken && config.acpAgentSecret) {
-          try {
-            verifiedClaims = verifyWorkerToken(workerToken, config.acpAgentSecret);
-          } catch (err) {
-            logEvent(config.logging, "warn", "worker_token_rejected", {
-              requestId,
-              reason: err instanceof Error ? err.message : String(err),
-              ...requestLogFields(req, config),
-            });
-          }
-        }
-        const reviewerToken = req.header("x-kontrol-reviewer-token");
-        const verifiedReviewer = constantTimeStringEqual(reviewerToken, config.acpReviewerSecret);
-        // Tunnel mode deliberately has no bearer gate on the local hop. The
-        // managed tunnel adds this separate secret-backed assertion only to
-        // MCP target traffic, allowing the WebUI to retain reviewer authority
-        // without promoting every loopback client or unsigned attribution
-        // header to reviewer.
-        const tunnelReviewerToken = req.header("x-kontrol-tunnel-reviewer");
-        const verifiedTunnelReviewer = config.authMode === "tunnel"
-          && constantTimeStringEqual(tunnelReviewerToken, config.tunnelReviewerSecret);
-        const oauthScopes = Array.isArray(req.auth?.scopes) ? req.auth.scopes : [];
-        const verifiedOAuthReviewer = oauthEnabled && oauthScopes.some((scope) =>
-          scope === "kontrol" ||
-          scope === "kontrol:review" ||
-          scope === "kontrol:approve" ||
-          scope === "kontrol:mission" ||
-          scope === "kontrol:dispatch"
-        );
-
-        // A verified worker token authenticates this connection as a worker. It
-        // also provides the bound work sessions (workspace/run/continuation) so
-        // they cannot be spoofed by the headers below. Unsigned attribution
-        // headers are used ONLY when no token is present (a reviewer/client
-        // reaching /mcp directly) and never grant worker rights.
-        const connectionContext: ConnectionContext = {
-          authenticatedRole: verifiedClaims ? "worker" : (verifiedReviewer || verifiedTunnelReviewer || verifiedOAuthReviewer) ? "reviewer" : "client",
-          authSource: verifiedClaims
-            ? "worker_token"
-            : verifiedReviewer
-              ? "reviewer_token"
-              : verifiedTunnelReviewer
-                ? "tunnel_reviewer"
-                : oauthEnabled
-                  ? "oauth"
-                  : "anonymous",
-          authenticatedPrincipalId: verifiedClaims
-            ? `worker-work-session:${verifiedClaims.workSessionId}`
-            : req.auth?.clientId
-              ? `oauth-client:${req.auth.clientId}`
-              : verifiedReviewer
-                ? "reviewer-token"
-                : verifiedTunnelReviewer
-                  ? "tunnel-reviewer"
-                  : undefined,
-          workspaceSessionId:
-            verifiedClaims?.workspaceSessionId
-            || (req.header("x-kontrol-workspace-session") ?? undefined),
-          // A plain attribution header is never allowed to turn a client into
-          // a worker or to select the principal used for policy grants. Only
-          // the signed worker envelope supplies an operational work session.
-          workSessionId: verifiedClaims?.workSessionId,
-          runId:
-            verifiedClaims?.runId || (req.header("x-kontrol-run") ?? undefined),
-          continuationId:
-            verifiedClaims?.continuationId
-            || (req.header("x-kontrol-continuation") ?? undefined),
-          workspaceLeaseNonce:
-            (verifiedClaims as (WorkerTokenClaims & { workspaceLeaseNonce?: string }) | undefined)?.workspaceLeaseNonce
-            || (verifiedClaims ? req.header("x-kontrol-workspace-lease-nonce") ?? undefined : undefined),
-          conversationId: conversationId(req),
-          // clientInfo is caller-controlled; this hint affects dispatch
-          // preference only and never establishes identity or authority.
-          clientPlatformHint: (() => {
-            const name = (req.body as { params?: { clientInfo?: { name?: unknown } } } | undefined)?.params?.clientInfo?.name;
-            return typeof name === "string" ? name.slice(0, 200) : undefined;
-          })(),
-        };
+        // Authorization is resolved identically for modern and stateful legacy
+        // requests. Client identity hints remain dispatch preferences only.
+        const { context: connectionContext } = authenticatedConnection(req, deps, requestId);
 
         const serverCreateStarted = performance.now();
         const server = createMcpServer(
@@ -1085,6 +1560,7 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
           agentMessages,
           supervisorRuns,
           supervisorWake,
+          deps.onScheduledJobCreated,
           db,
           mutationReceipts,
           (uri) => {
@@ -1095,13 +1571,25 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
             else if (uri === DEVDESKTOP_WORKSPACE_APP_URI) workspaceAppResourceMetrics.devDesktopMigration++;
           },
           recordPhaseTiming,
-          undefined,
-          undefined,
+          scheduledJobs,
+          reviewRoutes,
           (catalogSessionId, handshake) => {
             if (!catalogSessionId) return;
             const state = mcpSessions.get(catalogSessionId);
             if (!state) return;
-            state.toolCatalogHandshake = { ...handshake };
+            const evidence = qualificationEvidence.recordCatalogAcknowledgement({
+              sessionId: catalogSessionId,
+              captureId: handshake.captureId,
+              serverBuildId: config.expectedBuildId,
+              serverVersion: handshake.serverVersion || state.toolSurfaceVersion || "unknown",
+              status: handshake.status,
+              serverCatalogSha256: handshake.serverCatalogSha256,
+              hostCatalogSha256: handshake.hostCatalogSha256,
+              toolCount: handshake.toolCount,
+              rejectionReason: handshake.reason,
+              observedAt: handshake.acceptedAt,
+            });
+            state.toolCatalogHandshake = { ...handshake, evidenceId: evidence.recordId };
             logEvent(config.logging, handshake.status === "accepted" ? "info" : "warn", "mcp_tool_catalog_handshake", {
               sessionIdPrefix: sessionIdPrefix(catalogSessionId),
               status: handshake.status,
@@ -1112,6 +1600,10 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
               reason: handshake.reason,
             });
           },
+          undefined,
+          qualificationEvidence,
+          deps.reviewBrowserController,
+          deps.reviewThreads,
         );
         sessionMcpServer = server;
         const initializedHandler = server.server.oninitialized;
@@ -1187,6 +1679,7 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
         const admission = requestIsWaiter ? mcpWaiterAdmission : mcpAdmission;
         admissionClass = requestIsWaiter ? "waiter" : "execution";
         const admissionWeight = requestIsWaiter ? 1 : mcpAdmissionWeight(requestRpcMethod, requestToolName);
+        requestAdmissionWeight = admissionWeight;
         const admissionStartedAt = performance.now();
         let acquiredAdmission: (() => void) | null;
         try {
@@ -1276,6 +1769,10 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
                   .update(sessionState?.logicalClientId ?? sessionId ?? "unowned")
                   .digest("hex")
                   .slice(0, 16),
+                ...(sessionState?.workSessionId ? {
+                  workSessionHash: createHash("sha256").update(sessionState.workSessionId).digest("hex").slice(0, 16),
+                } : {}),
+                admissionWeight: requestAdmissionWeight,
                 startedAtMs: requestStartedAtMs,
                 expiredAtMs: Date.now(),
               });
@@ -1357,7 +1854,13 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
       if (sessionId && handlerSettled) {
         const state = mcpSessions.get(sessionId);
         if (state && sessionRequestClass) {
-          if (sessionRequestClass === "stream" && state.activeSseStreams > 0) state.activeSseStreams--;
+          if (sessionRequestClass === "stream" && state.activeSseStreams > 0) {
+            state.activeSseStreams--;
+            state.transportAttached = state.activeSseStreams > 0;
+            if (state.activeSseStreams === 0 && standaloneStreamEstablished) {
+              clearStandaloneSseDelivery(state, standaloneStreamGeneration);
+            }
+          }
           else if (sessionRequestClass === "waiter" && state.activeLongPollCount > 0) state.activeLongPollCount--;
           else if (sessionRequestClass === "execution" && sessionExecutionCounted && state.inFlightRequests > 0) state.inFlightRequests--;
           const activityAt = Date.now();
@@ -1381,4 +1884,254 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
     } finally {
       finalizeOperationDiagnostic();
     }
+}
+
+async function handleModernMcpHttpRequest(
+  deps: McpHttpDeps,
+  req: Request,
+  res: Response,
+  webRequest: globalThis.Request,
+): Promise<void> {
+  if (deps.shuttingDown()) {
+    res.setHeader("Retry-After", "1");
+    res.status(503).json({
+      jsonrpc: "2.0",
+      id: (req.body as { id?: unknown } | undefined)?.id ?? null,
+      error: { code: -32000, message: "KONTROL is draining; retry after restart." },
+    });
+    return;
+  }
+
+  if (deps.isPeerListener?.() && !req.peerPrincipal) {
+    res.status(401).json({ error: "unauthorized" });
+    return;
+  }
+  const { context: connectionContext, workerClaims } = authenticatedConnection(
+    req,
+    deps,
+    res.locals.requestId as string | undefined,
+  );
+  const conversation = connectionContext.conversationId;
+  const principalId = connectionContext.authenticatedPrincipalId;
+  const peer = req.peerPrincipal;
+  const catalogIdentity = principalId
+    ? JSON.stringify([
+        connectionContext.listenerKind,
+        principalId,
+        connectionContext.authenticatedRole,
+        connectionContext.workSessionId,
+        connectionContext.workspaceSessionId,
+        conversation,
+        [...(connectionContext.peerCapabilities ?? [])].sort(),
+      ])
+    : undefined;
+  const catalogMap = modernCatalogMap(deps);
+  const acknowledgementMap = modernCatalogAcknowledgementMap(deps);
+  const contextForModernRequest: ConnectionContext = {
+    ...connectionContext,
+    toolCatalogFingerprint: catalogIdentity ? catalogMap.get(catalogIdentity) : undefined,
+  };
+
+  const requestId = res.locals.requestId as string | undefined;
+  const requestBody = req.body as { method?: unknown; id?: unknown; params?: { name?: unknown } } | undefined;
+  if (
+    deps.config.mcpToolCatalogAckRequired === true
+    && requestBody?.method === "tools/call"
+    && (!catalogIdentity || acknowledgementMap.get(catalogIdentity) !== true)
+  ) {
+    res.status(200).json({
+      jsonrpc: "2.0",
+      id: requestBody.id ?? null,
+      error: {
+        code: -32012,
+        message: "Kontrol requires the client to acknowledge its registered tools/list catalog before calling tools. Follow the kontrol.dev/tool-catalog-ack-v1 capability.",
+      },
+    });
+    return;
+  }
+  const requestKey = peer?.principalId ?? workerClaims?.workSessionId ?? req.auth?.clientId ?? req.ip ?? "anonymous";
+  const controller = new AbortController();
+  const abortFromWeb = () => controller.abort(webRequest.signal.reason);
+  webRequest.signal.addEventListener("abort", abortFromWeb, { once: true });
+  if (webRequest.signal.aborted) abortFromWeb();
+  let released = false;
+  let handlerSettled = false;
+  let responseFinished = false;
+  let releaseAdmission: (() => void) | undefined;
+  let closeModernHandler: (() => void) | undefined;
+  const releaseWhenQuiescent = () => {
+    if (!handlerSettled || !responseFinished || released) return;
+    released = true;
+    closeModernHandler?.();
+    closeModernHandler = undefined;
+    releaseAdmission?.();
+    releaseAdmission = undefined;
+    webRequest.signal.removeEventListener("abort", abortFromWeb);
+    res.off("close", onResponseClose);
+    res.off("finish", onResponseFinish);
+  };
+  const onResponseClose = () => {
+    if (!res.writableFinished) controller.abort(new Error("HTTP response closed"));
+    responseFinished = true;
+    releaseWhenQuiescent();
+  };
+  const onResponseFinish = () => {
+    responseFinished = true;
+    releaseWhenQuiescent();
+  };
+  const release = () => {
+    if (released) return;
+    released = true;
+    releaseAdmission?.();
+    releaseAdmission = undefined;
+    webRequest.signal.removeEventListener("abort", abortFromWeb);
+    res.off("close", onResponseClose);
+    res.off("finish", onResponseFinish);
+  };
+  res.once("close", onResponseClose);
+  res.once("finish", onResponseFinish);
+
+  try {
+    const acquired = await deps.mcpAdmission.acquire(
+      requestKey,
+      deps.config.mcpInteractiveAdmissionTimeoutMs,
+      1,
+      controller.signal,
+    );
+    if (!acquired) {
+      res.setHeader("Retry-After", "1");
+      res.status(503).json({
+        jsonrpc: "2.0",
+        id: requestBody?.id ?? null,
+        error: { code: -32029, message: "MCP request capacity is temporarily exhausted. Retry later." },
+      });
+      release();
+      return;
+    }
+    releaseAdmission = acquired;
+
+    const handler = createMcpHandler(
+      () => deps.createServerForSession(contextForModernRequest, (_sessionId, handshake) => {
+        if (!catalogIdentity) return;
+        if (!acknowledgementMap.has(catalogIdentity) && acknowledgementMap.size >= 256) {
+          const oldest = acknowledgementMap.keys().next().value as string | undefined;
+          if (oldest !== undefined) acknowledgementMap.delete(oldest);
+        }
+        acknowledgementMap.set(catalogIdentity, handshake.status === "accepted");
+        logEvent(deps.config.logging, handshake.status === "accepted" ? "info" : "warn", "mcp_modern_tool_catalog_handshake", {
+          requestId,
+          status: handshake.status,
+          serverCatalogSha256: handshake.serverCatalogSha256,
+          hostCatalogSha256: handshake.hostCatalogSha256,
+          toolCount: handshake.toolCount,
+          reason: handshake.reason,
+        });
+      }),
+      { legacy: "reject", bus: modernEventBus(deps) },
+    );
+    closeModernHandler = () => { void handler.close(); };
+    const rpcId = typeof requestBody?.id === "string" || typeof requestBody?.id === "number"
+      ? String(requestBody.id)
+      : undefined;
+    const scopedRequest = new Request(webRequest, { signal: controller.signal });
+    const executionDeadline = mcpRequestHasExecutionDeadline(
+      typeof requestBody?.method === "string" ? requestBody.method : undefined,
+      typeof requestBody?.params?.name === "string" ? requestBody.params.name : undefined,
+    );
+    let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+    const fetchPromise = mcpRequestContext.run({
+      signal: controller.signal,
+      mcpRequestId: rpcId ?? requestId,
+      conversationId: connectionContext.conversationId,
+      principalId: connectionContext.authenticatedPrincipalId,
+      approvalCorrelationId: conversation && principalId ? `${principalId}|conversation:${conversation}` : undefined,
+    }, () => handler.fetch(scopedRequest));
+    void fetchPromise.then(
+      () => {
+        handlerSettled = true;
+        releaseWhenQuiescent();
+      },
+      () => {
+        handlerSettled = true;
+        releaseWhenQuiescent();
+      },
+    );
+    let response: globalThis.Response;
+    if (executionDeadline) {
+      const timedOut = Symbol("mcp_execution_timeout");
+      const outcome = await Promise.race([
+        fetchPromise,
+        new Promise<typeof timedOut>((resolve) => {
+          deadlineTimer = setTimeout(() => {
+            controller.abort(new McpExecutionTimeoutError(deps.config.mcpExecutionTimeoutMs));
+            resolve(timedOut);
+          }, deps.config.mcpExecutionTimeoutMs);
+          deadlineTimer.unref?.();
+        }),
+      ]);
+      if (outcome === timedOut) {
+        res.status(504).json({
+          jsonrpc: "2.0",
+          id: requestBody?.id ?? null,
+          error: { code: -32001, message: "MCP request execution exceeded its deadline." },
+        });
+        responseFinished = true;
+        releaseWhenQuiescent();
+        return;
+      }
+      response = outcome;
+    } else {
+      response = await fetchPromise;
+    }
+    if (deadlineTimer) clearTimeout(deadlineTimer);
+
+    if (catalogIdentity && requestBody?.method === "tools/list" && response.ok) {
+      try {
+        const payload = await response.clone().json() as { result?: unknown };
+        const fingerprint = fingerprintToolCatalog(payload.result);
+        if (fingerprint) {
+          // Keep only a bounded set of authenticated client/profile receipts.
+          if (!catalogMap.has(catalogIdentity) && catalogMap.size >= 256) {
+            const oldest = catalogMap.keys().next().value as string | undefined;
+            if (oldest !== undefined) catalogMap.delete(oldest);
+          }
+          catalogMap.delete(catalogIdentity);
+          catalogMap.set(catalogIdentity, fingerprint);
+          if (!contextForModernRequest.toolCatalogFingerprint
+            || contextForModernRequest.toolCatalogFingerprint.sha256 !== fingerprint.sha256) {
+            acknowledgementMap.set(catalogIdentity, false);
+          }
+        }
+      } catch {
+        // The catalog is cached only when the exact JSON response can be
+        // fingerprinted. An absent receipt makes strict acknowledgement fail closed.
+      }
+    }
+
+    res.statusCode = response.status;
+    response.headers.forEach((value, name) => res.setHeader(name, value));
+    if (!response.body) {
+      res.end();
+      return;
+    }
+    Readable.fromWeb(response.body as import("node:stream/web").ReadableStream<Uint8Array>).pipe(res);
+  } catch (error) {
+    handlerSettled = true;
+    if (!res.headersSent) responseFinished = true;
+    releaseWhenQuiescent();
+    if (res.headersSent || res.destroyed) {
+      res.destroy(error instanceof Error ? error : undefined);
+      return;
+    }
+    logEvent(deps.config.logging, "error", "mcp_modern_request_failed", {
+      requestId,
+      reason: error instanceof Error ? error.message : String(error),
+      method: typeof requestBody?.method === "string" ? requestBody.method : undefined,
+    });
+    res.status(500).json({
+      jsonrpc: "2.0",
+      id: requestBody?.id ?? null,
+      error: { code: -32603, message: "Internal MCP request error" },
+    });
+  }
 }

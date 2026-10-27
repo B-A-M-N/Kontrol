@@ -5,12 +5,12 @@
  * this capability module owns one semantic slice of the reviewer/worker
  * control-plane API and receives the same typed BridgeConfig context.
  */
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer } from "@modelcontextprotocol/server";
 import type { BridgeConfig } from "./context.js";
 import { callRemoteAgent, selectHealthyAgent } from "../acp-gateway.js";
 import { registerMutationAppTool } from "./app-tool.js";
 import { supervisedMissionOptionsSchema, workOrderSchema } from "./context.js";
-import { acquireCheckoutModifyLease, captureMissionBaseline, checkoutLeaseMetadata, forbidden, isReviewer, liveOwnerContextId, requireWorkSessionRead, renderMissionPrompt, resolveDelegationContext, workSessionInstructions, workspaceAppModelAndAppMeta } from "./shared.js";
+import { acquireCheckoutModifyLease, captureMissionBaseline, checkoutLeaseMetadata, forbidden, isReviewer, liveOwnerContextId, livePrincipalId, requireWorkSessionRead, renderMissionPrompt, resolveDelegationContext, workSessionInstructions, workspaceAppModelAndAppMeta } from "./shared.js";
 import { z } from "zod/v4";
 
 export function registerDelegationTools(server: McpServer, config: BridgeConfig): void {
@@ -19,7 +19,7 @@ export function registerDelegationTools(server: McpServer, config: BridgeConfig)
     "submit_to_coding_agent",
     {
       title: "Submit task to coding agent",
-      description: "Optional reviewer-directed delegation from the WebUI to a currently dispatchable registered ACP harness. If agentName is omitted, Kontrol prefers the native registered harness for the caller platform (ChatGPT/OpenAI prefers Codex), then falls back to any healthy role=agent HTTP ACP adapter. The platform hint affects routing only. The WebUI remains the reviewer.",
+      description: "Reviewer-directed delegation to a registered ACP harness. An explicit agentName is honored exactly; required_delegate fails if that peer is unavailable and never falls back to another adapter. If agentName is omitted, the optional routing policy may select a healthy peer.",
       inputSchema: {
         task: z.string().trim().min(1).describe("Bounded instruction or task for the coding agent."),
         dispatchIntent: z.enum(["optional_assist", "required_delegate"]).optional().describe("Optional assistance falls back to direct workspace work when unavailable; required_delegate returns an error instead."),
@@ -46,6 +46,8 @@ export function registerDelegationTools(server: McpServer, config: BridgeConfig)
         retryable: z.boolean().optional(),
         fallback: z.string().optional(),
         reason: z.string().optional(),
+        agentName: z.string().optional(),
+        agentId: z.string().optional(),
       },
       _meta: workspaceAppModelAndAppMeta(),
       annotations: { readOnlyHint: false },
@@ -133,6 +135,7 @@ export function registerDelegationTools(server: McpServer, config: BridgeConfig)
           title: task.slice(0, 80),
           completionPolicy: missionContract ? "webui_approval_required" : completionPolicy ?? "webui_approval_required",
           ownerContextId: liveOwnerContextId(config) ?? config.principalId,
+          principalId: livePrincipalId(config),
         });
         wsId = created.id;
         createdSessionForDispatch = true;
@@ -178,6 +181,10 @@ export function registerDelegationTools(server: McpServer, config: BridgeConfig)
         return leaseError;
       }
       const dispatchLease = config.workSessions.getWorkspaceLeaseForSession(wsId);
+      const runBeforeDispatch = config.agentRegistry.getRunByWorkSessionId(wsId!);
+      const priorAttemptKey = runBeforeDispatch
+        ? config.agentRegistry.getLatestDispatchAttemptForRun(runBeforeDispatch.runId)?.dispatchIdempotencyKey
+        : undefined;
 
       let supervisorRun: ReturnType<NonNullable<typeof config.supervisorRuns>["create"]> | undefined;
       const rollbackDispatch = (reason: string, runId?: string) => {
@@ -239,6 +246,7 @@ export function registerDelegationTools(server: McpServer, config: BridgeConfig)
             agentRegistry: config.agentRegistry,
             workspaces: config.workspaces,
             workSessions: config.workSessions,
+            eventStore: config.eventStore,
             adapterSecret: config.adapterSecret,
           },
           {
@@ -255,21 +263,89 @@ export function registerDelegationTools(server: McpServer, config: BridgeConfig)
             fireAndForget: true,
           },
         );
+        if (result.status === "uncertain") {
+          // The adapter may have accepted this launch. Preserve the session,
+          // lease, and durable run correlation while the server reconciles the
+          // same idempotency key; a transport error is not worker failure.
+          if (supervisorRun) {
+            config.supervisorRuns?.transition({
+              id: supervisorRun.id,
+              expectedStatus: "created",
+              expectedRevision: supervisorRun.revision,
+              nextStatus: "worker_active",
+              lastError: result.error ?? "ACP dispatch acceptance is uncertain; reconciliation is pending.",
+            });
+          }
+          config.eventStore.appendEvent({
+            type: "agent.dispatch.uncertain",
+            sessionId: wsId!,
+            payload: { runId: result.runId, reason: result.error ?? "ACP dispatch acceptance is uncertain." },
+          });
+          return {
+            content: [{ type: "text" as const, text: `${selectedAgentName}: dispatch acceptance is uncertain. Run ${result.runId} remains attached to this work session while Kontrol reconciles the original launch.` }],
+            structuredContent: { runId: result.runId, remoteRunId: result.remoteRunId, workSessionId: wsId, workspaceSessionId, status: "uncertain", output: result.output, error: result.error, retryable: false, agentName: selectedAgentName, agentId: peer.id },
+          };
+        }
         if (result.status === "failed") {
           rollbackDispatch(result.error ?? "ACP dispatch failed", result.runId);
           return {
             content: [{ type: "text" as const, text: result.error ?? "ACP call failed with no error detail." }],
-            structuredContent: { runId: result.runId, remoteRunId: result.remoteRunId, workSessionId: wsId, workspaceSessionId, status: result.status, output: result.output, error: result.error },
+            structuredContent: { runId: result.runId, remoteRunId: result.remoteRunId, workSessionId: wsId, workspaceSessionId, status: result.status, output: result.output, error: result.error, agentName: selectedAgentName, agentId: peer.id },
             isError: true,
           };
         }
         if (supervisorRun) config.supervisorRuns?.transition({ id: supervisorRun.id, expectedStatus: "created", expectedRevision: supervisorRun.revision, nextStatus: "worker_active" });
         return {
           content: [{ type: "text" as const, text: result.output || "(no output)" }],
-          structuredContent: { runId: result.runId, remoteRunId: result.remoteRunId, workSessionId: wsId, workspaceSessionId, status: result.status, output: result.output },
+          structuredContent: { runId: result.runId, remoteRunId: result.remoteRunId, workSessionId: wsId, workspaceSessionId, status: result.status, output: result.output, agentName: selectedAgentName, agentId: peer.id },
         };
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error);
+        const correlatedRun = config.agentRegistry.getRunByWorkSessionId(wsId!);
+        const latestAttempt = correlatedRun
+          ? config.agentRegistry.getLatestDispatchAttemptForRun(correlatedRun.runId)
+          : undefined;
+        const newAttemptMayHaveReachedPeer = Boolean(
+          latestAttempt
+          && latestAttempt.dispatchIdempotencyKey !== priorAttemptKey
+          && ["dispatching", "uncertain", "accepted"].includes(latestAttempt.status),
+        );
+        if (newAttemptMayHaveReachedPeer || correlatedRun?.status === "dispatch_uncertain") {
+          const status = latestAttempt?.status === "accepted"
+            ? correlatedRun?.status ?? "running"
+            : "uncertain";
+          try {
+            if (supervisorRun) {
+              config.supervisorRuns?.transition({
+                id: supervisorRun.id,
+                expectedStatus: "created",
+                expectedRevision: supervisorRun.revision,
+                nextStatus: "worker_active",
+                lastError: errorMessage,
+              });
+            }
+          } catch { /* dispatch uncertainty stays durable even if supervisor bookkeeping needs reconciliation */ }
+          try {
+            config.eventStore.appendEvent({
+              type: "agent.dispatch.uncertain",
+              sessionId: wsId!,
+              payload: { runId: correlatedRun?.runId, reason: errorMessage },
+            });
+          } catch { /* the indexed dispatch attempt remains the recovery source */ }
+          return {
+            content: [{ type: "text" as const, text: `Submission follow-up failed after the dispatch may have reached the adapter: ${errorMessage}` }],
+            structuredContent: {
+              runId: correlatedRun?.runId,
+              remoteRunId: correlatedRun?.remoteRunId,
+              workSessionId: wsId,
+              workspaceSessionId,
+              status,
+              output: "",
+              error: errorMessage,
+              retryable: false,
+            },
+          };
+        }
         rollbackDispatch(errorMessage);
         return {
           content: [{ type: "text" as const, text: `Submission to coding agent failed: ${errorMessage}` }],

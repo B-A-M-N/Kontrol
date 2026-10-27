@@ -8,6 +8,9 @@ diagnostics.begin({
   externalCorrelationId: "ray-1",
   generationId: "generation-1",
   sessionIdPrefix: "session1",
+  sessionIdSha256: "a".repeat(64),
+  serverBuildId: "build-1",
+  serverVersion: "1.0.0+build-1",
   method: "POST",
   rpcMethod: "tools/call",
   toolName: "read",
@@ -38,6 +41,9 @@ assert.equal(snapshot.recent[0]?.operationId, "operation-1");
 assert.equal(snapshot.recent[0]?.responseBytes, 42);
 assert.equal(snapshot.recent[0]?.externalCorrelationId, "ray-1");
 assert.equal(snapshot.recent[0]?.generationId, "generation-1");
+assert.equal(snapshot.recent[0]?.sessionIdSha256, "a".repeat(64));
+assert.equal(snapshot.recent[0]?.serverBuildId, "build-1");
+assert.equal(snapshot.recent[0]?.serverVersion, "1.0.0+build-1");
 assert.equal(Object.hasOwn(snapshot.recent[0]!, "arguments"), false);
 
 console.log("mcp-operation-diagnostics.test.ts: all assertions passed");

@@ -5,8 +5,8 @@
  */
 import * as z from "zod/v4";
 
-export function resultOutputSchema(extra: z.ZodRawShape = {}): z.ZodRawShape {
-  return {
+export function resultOutputSchema(extra: z.ZodRawShape = {}) {
+  return z.object({
     tool: z.string().optional().describe("Stable tool discriminator for widget result delivery."),
     result: z
       .string()
@@ -17,7 +17,7 @@ export function resultOutputSchema(extra: z.ZodRawShape = {}): z.ZodRawShape {
     approvalId: z.string().optional(),
     retryable: z.boolean().optional(),
     ...extra,
-  };
+  });
 }
 
 /**

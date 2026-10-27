@@ -31,7 +31,6 @@ export function ensureWorkSessionView(workSessionId: string, workspaceSessionId:
       policyGrantsLoaded: false,
       openMessages: new Map(),
       feedbackStateBySubmission: new Map(),
-      reviewLoop: undefined,
       feedbackErrorBySubmission: new Map(),
     };
     workSessionViews.set(workSessionId, view);

@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { openDatabase } from "./db/client.js";
 import { createWorkSessionManager } from "./work-sessions.js";
 import { SqliteWorkspaceStore } from "./workspace-store.js";
+import { workSessionTerminalOutcome } from "./work-session-lifecycle.js";
 
 const root = await mkdtemp(join(tmpdir(), "kontrol-lifecycle-"));
 const database = openDatabase(root);
@@ -116,5 +117,20 @@ try {
   database.close();
   await rm(root, { recursive: true, force: true });
 }
+
+assert.equal(workSessionTerminalOutcome("agent.run.completed", "webui_approval_required"), undefined);
+assert.deepEqual(workSessionTerminalOutcome("agent.run.completed", "agent_completion"), {
+  terminal: true,
+  successful: true,
+  status: "completed",
+});
+assert.deepEqual(workSessionTerminalOutcome("agent.run.approved", "webui_approval_required"), {
+  terminal: true,
+  successful: true,
+  status: "approved",
+});
+assert.equal(workSessionTerminalOutcome("agent.run.rejected", "webui_approval_required")?.successful, false);
+assert.equal(workSessionTerminalOutcome("agent.run.failed_protocol", "webui_approval_required")?.status, "failed_protocol");
+assert.equal(workSessionTerminalOutcome("worker.attempt.exited", "webui_approval_required"), undefined);
 
 console.log("work-session-lifecycle.test.ts: all assertions passed");

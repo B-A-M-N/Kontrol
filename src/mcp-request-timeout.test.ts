@@ -46,6 +46,7 @@ const makeExpiredRecord = (operationId: string, toolName: string, startedAtMs: n
   rpcMethod: "tools/call",
   toolName,
   ownerHash: "0123456789abcdef",
+  admissionWeight: 2,
   startedAtMs,
   expiredAtMs: Date.now(),
 });
@@ -104,7 +105,7 @@ const makeExpiredRecord = (operationId: string, toolName: string, startedAtMs: n
 // expired-handler diagnostics must report the unavailable capacity accurately.
 {
   const admission = new McpAdmission(2, 2, 0);
-  const tracker = new ExpiredMcpOperationTracker();
+  const tracker = new ExpiredMcpOperationTracker(64, 15);
   const firstRelease = deferred();
   const secondRelease = deferred();
   const firstPermit = await admission.acquire("session-a", 100, 1);
@@ -135,9 +136,16 @@ const makeExpiredRecord = (operationId: string, toolName: string, startedAtMs: n
   assert.equal(admissionStats.availableWeight, 0);
   assert.equal(await admission.acquire("session-c", 0, 1), null, "new work must be rejected when timed-out handlers still own capacity");
   assert.equal(expiredStats.activeCount, 2);
-  assert.equal(expiredStats.active[0]?.state, "expired_but_running");
+  assert.equal(expiredStats.active[0]?.state, "CANCELLING");
   assert.ok(Number(expiredStats.active[0]?.expiredAgeMs) >= 0);
   assert.equal(expiredStats.active[0]?.toolName, "grep");
+  assert.equal(expiredStats.activeAdmissionWeight, 4);
+
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const stuckStats = tracker.snapshot();
+  assert.equal(stuckStats.stuckCount, 2, "unsettled handlers become explicitly STUCK after the cancellation grace");
+  assert.ok(stuckStats.oldestStuckHandlerAgeMs >= 0);
+  assert.equal(stuckStats.active[0]?.state, "STUCK");
 
   firstRelease.resolve();
   secondRelease.resolve();

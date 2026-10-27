@@ -1,0 +1,71 @@
+# Optional public edge with independent Tailscale and WireGuard upstream paths.
+# Both addresses must terminate the same Kontrol HTTPS gateway and share its
+# verified service identity. Replace all example addresses and certificate paths.
+{
+	servers {
+		max_header_size 32KiB
+	}
+}
+
+kontrol.example.com {
+	@mcp_or_auth path /mcp /.well-known/* /authorize /token /register /revoke /healthz
+
+	handle @mcp_or_auth {
+		reverse_proxy https://100.64.0.2:9444 https://10.74.0.2:9444 {
+			lb_policy first
+			# Active checks switch new requests to the independent route when one
+			# gateway address is down. Caddy retries remain disabled: an MCP POST
+			# with an ambiguous outcome must never be replayed by the edge.
+			health_uri /healthz
+			health_status 200
+			health_interval 10s
+			health_timeout 3s
+			health_fails 2
+			health_passes 2
+			health_headers {
+				Host kontrol-gateway.internal:9444
+			}
+
+			header_up -X-Forwarded-For
+			header_up -X-Forwarded-Host
+			header_up -X-Forwarded-Proto
+			header_up -X-Forwarded-Port
+			header_up -X-Forwarded-Protocol
+			header_up -X-Forwarded-Scheme
+			header_up -X-Real-IP
+			header_up -CF-Connecting-IP
+			header_up -True-Client-IP
+			header_up -Tailscale-User-Login
+			header_up -Tailscale-User-Name
+			header_up -Tailscale-User-Profile-Pic
+			header_up -Tailscale-User
+			header_up -X-Kontrol-*
+			header_up -Forwarded
+			header_up Host kontrol-gateway.internal:9444
+			flush_interval -1
+			transport http {
+				dial_timeout 5s
+				tls_timeout 10s
+				tls_server_name kontrol-gateway.internal
+				tls_trust_pool file /etc/caddy/pki/kontrol-gateway-ca.pem
+				tls_client_auth /etc/caddy/pki/bridge-client.crt /etc/caddy/pki/bridge-client.key
+				max_conns_per_host 128
+				read_timeout 3600s
+				write_timeout 3600s
+			}
+		}
+	}
+
+	handle {
+		respond 404
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		-Server
+	}
+	request_body {
+		max_size 8MB
+	}
+}

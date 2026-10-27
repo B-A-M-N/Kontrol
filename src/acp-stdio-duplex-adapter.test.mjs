@@ -6,11 +6,33 @@ const pkg = JSON.parse(readFileSync("package.json", "utf8"));
 
 assert.match(adapter, /dist\/acp-duplex\.js/);
 assert.match(adapter, /createAcpDuplex/);
+assert.match(adapter, /createAdapterEventSpool/);
+assert.match(adapter, /dispatch_idempotency_key: run\.dispatchIdempotencyKey/);
+assert.match(adapter, /final_output: run\.finalOutput/);
 assert.match(adapter, /session\/request_permission|requestPermission/);
 assert.match(adapter, /permission\.requested/);
 assert.match(adapter, /approvals\/\$\{approvalId\}\/decision/);
 assert.match(adapter, /ACP_STDIO_COMMAND/);
 assert.match(adapter, /ACP_STDIO_DISPATCH_METHOD/);
+assert.match(adapter, /run\.conn\.request\("initialize"/);
+assert.match(adapter, /nativeReplyResumeSupported = true/,
+  "the adapter advertises native reply resume only after ACP session-resume support is negotiated");
+assert.match(adapter, /capability !== "native-reply-resume"/,
+  "environment capability overrides cannot falsely claim native reply resume support");
+assert.match(adapter, /run\.conn\.request\("session\/new"/);
+assert.match(adapter, /prompt: \[\{ type: "text", text: run\.task \}\]/);
+assert.match(adapter, /validateReadOnlyDispatchRequest/);
+assert.match(adapter, /probeReadOnlyExecutionSandbox/);
+assert.match(adapter, /read_only_execution_grant/);
+assert.match(adapter, /recordAdapterDispatchReceipt\([^\n]+, "dispatching"/);
+assert.match(adapter, /prepareOwnedChild\(agentLaunch\.command/);
+assert.ok(adapter.indexOf('"dispatching", {') < adapter.indexOf("prepareOwnedChild(agentLaunch.command"), "dispatch admission is durable before creating a gated owner process");
+assert.ok(adapter.indexOf('launchState: "start_requested"') < adapter.indexOf("await launchGate.start()"), "start intent is durable before the worker launch gate opens");
+assert.match(adapter, /validateReadOnlyDispatchRequest\(body, workspaceRoot, ADAPTER_SECRET, agentIdentity\?\.agentId\)/,
+  "the generic ACP adapter verifies signed read-only execution authority before child launch");
+assert.match(adapter, /executionReceipt: run\.readOnlyExecutionReceipt/,
+  "the generic adapter persists the correlated execution receipt for recovery");
+assert.ok(adapter.indexOf("await launchGate.start()") < adapter.indexOf('run.remoteRunId, "running"'), "acceptance is persisted after the worker process starts");
 assert.match(adapter, /duplex-json-rpc/);
 assert.match(adapter, /reverse-permissions/);
 assert.ok(adapter.includes("url.match(/^\\/runs\\/([^/]+)\\/cancel$/)"));
@@ -20,6 +42,12 @@ assert.ok(
   pkg.files.includes("scripts/acp-stdio-duplex-adapter.mjs"),
   "stdio duplex adapter is included in the published package",
 );
+assert.ok(
+  pkg.files.includes("scripts/lib/read-only-execution.mjs"),
+  "shared execution grant and sandbox implementation is included with the adapters",
+);
+assert.ok(pkg.files.includes("scripts/lib/adapter-event-spool.mjs"),
+  "generic adapter recovery includes its durable lifecycle spool");
 assert.match(pkg.scripts["test:adapters"], /acp-stdio-duplex-adapter\.mjs/);
 assert.match(pkg.scripts["test:adapters"], /acp-stdio-duplex-adapter\.test\.mjs/);
 

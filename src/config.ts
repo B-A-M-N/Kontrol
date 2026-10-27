@@ -1,12 +1,17 @@
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { expandHomePath } from "./roots.js";
+import { expandHomePath, isPathInsideRoot } from "./roots.js";
+import type { PeerServerConfig } from "./peer/config-types.js";
+import { loadPeerCredentialFile } from "./peer/credentials.js";
 import type { LoggingConfig, LogFormat, LogLevel } from "./logger.js";
 import type { OAuthConfig } from "./oauth-provider.js";
 import type { PolicyConfig } from "./policy.js";
 import { loadPolicyConfig, policyCanAsk } from "./policy.js";
 import { loadKontrolFiles } from "./user-config.js";
 import { DEFAULT_DIRECT_APPROVAL_REATTACH_GRACE_MS } from "./policy-approval-defaults.js";
+import { parseIngressProfilesEnv, validateIngressProfiles } from "./ingress/validate.js";
+import { isUnspecifiedAddress } from "./ingress/host-policy.js";
+import type { IngressConfig } from "./ingress/types.js";
 
 export type ToolMode = "minimal" | "full" | "codex";
 export type WidgetMode = "off" | "changes" | "full";
@@ -50,12 +55,16 @@ export interface ServerConfig {
   acpAgentSecret?: string;
   /** Shared secret used by the reviewer (WebUI) for ACP calls. */
   acpReviewerSecret?: string;
+  /** Optional explicit Chromium executable for private reviewer browser profiles. */
+  reviewBrowserChromePath?: string;
   /**
    * P0 #9: secret Kontrol presents to ADAPTERS on outbound /runs, cancel, and
    * probe calls. Distinct from acpSharedSecret (legacy operator ingress) so
    * the adapter credential never doubles as a broad-authority operator key.
    */
   acpAdapterSecret?: string;
+  /** Network access inside scheduled read-only ACP sandboxes; host access is opt-in. */
+  readOnlyExecutionNetworkPolicy: "disabled" | "host";
   policy: PolicyConfig;
   /** P1 #50: Secret required for /diagnostics access (even on loopback). */
   diagnosticsSecret?: string;
@@ -123,6 +132,9 @@ export interface ServerConfig {
   mcpSessionReclaimGraceMs: number;
   /** Interval for standalone MCP SSE keep-alive comments. */
   mcpSseHeartbeatMs: number;
+  mcpSseMaxStallMs: number;
+  mcpShutdownDrainMs: number;
+  mcpOperationCancelGraceMs: number;
   /** Maximum execution time for ordinary, non-waiter MCP requests. */
   mcpExecutionTimeoutMs: number;
   /** Periodic maintenance scheduling and wall-clock budget. */
@@ -147,6 +159,8 @@ export interface ServerConfig {
   mcpSessionReaperIntervalMs: number;
   /** Retention for trusted logical-client continuity after transport loss. */
   mcpLogicalContinuityRetentionMs: number;
+  /** Retained inactive logical-client metric rows; active clients are never evicted. */
+  mcpClientMetricsHistoryLimit: number;
   mcpSessionMaxPerClient: number;
   mcpSessionSoftCap: number;
   mcpSessionHardCap: number;
@@ -154,6 +168,37 @@ export interface ServerConfig {
   mcpToolCatalogAckRequired?: boolean;
   /** Filesystem snapshot admission + retention limits (P0/P1 storage hardness). */
   fsSnapshot: FilesystemSnapshotConfig;
+  /**
+   * Optional, strictly opt-in peer listener configuration (e.g. for a Meta
+   * Muse integration). Undefined unless KONTROL_PEER_ENABLED=1. Peers are
+   * independently authenticated and scoped; this never changes AuthMode or
+   * owner/ACP credential behavior.
+   */
+  peer?: PeerServerConfig;
+  /**
+   * Optional, strictly opt-in public OAuth MCP listener (P0-02). Undefined
+   * unless KONTROL_PUBLIC_MCP_ENABLED=1; loadConfig refuses any deployment
+   * that enables it outside authMode=oauth or with a wildcard bind host.
+   * Serves only the OAuth-authenticated /mcp surface for public ingress —
+   * the tunnel-mode owner listener is never exposed through it.
+   */
+  publicMcp?: {
+    enabled: true;
+    port: number;
+    bindHost: string;
+    /** Edge-limiter caps (F2-1): successful OAuth-surface requests per minute per req.ip. */
+    edgeOAuthSurfaceMaxPerMinute: number;
+    /** /mcp tool-traffic requests per minute per req.ip. */
+    edgeMcpMaxPerMinute: number;
+    /** POST /authorize attempts per sliding 5-minute window per req.ip before 429s. */
+    edgeAuthorizeMaxAttemptsPerWindow: number;
+  };
+  /**
+   * Optional, strictly opt-in ingress profile configuration (PR-A). Undefined
+   * unless KONTROL_INGRESS_PROFILES is set. Purely declarative here: wiring
+   * into live listeners arrives in a later PR.
+   */
+  ingress?: IngressConfig;
 }
 
 function parsePort(value: string | number | undefined): number {
@@ -436,6 +481,12 @@ function parseAuthMode(value: string | undefined): AuthMode {
   throw new Error(`Invalid KONTROL_AUTH_MODE: ${value}. Expected "oauth" or "tunnel".`);
 }
 
+function parseReadOnlyExecutionNetworkPolicy(value: string | undefined): "disabled" | "host" {
+  if (!value || value === "disabled") return "disabled";
+  if (value === "host") return "host";
+  throw new Error(`Invalid KONTROL_READ_ONLY_NETWORK_POLICY: ${value}. Expected "disabled" or "host".`);
+}
+
 function isLoopbackHost(host: string): boolean {
   return host === "127.0.0.1" || host === "::1" || host === "localhost";
 }
@@ -508,6 +559,132 @@ function validateAcpSecrets(env: NodeJS.ProcessEnv): void {
   }
 }
 
+/**
+ * Peer listener configuration (M1). Parsed only when KONTROL_PEER_ENABLED=1;
+ * otherwise the feature is completely invisible and startup is unchanged.
+ * Every ambiguity is rejected at startup: missing port/credential file,
+ * wildcard binds, port collision with the main listener, an empty peer
+ * allowlist, or granted roots outside the configured allowed roots.
+ */
+function parsePeerConfig(
+  env: NodeJS.ProcessEnv,
+  allowedRoots: string[],
+  mainPort: number,
+): PeerServerConfig | undefined {
+  if (!parseBoolean(env.KONTROL_PEER_ENABLED)) return undefined;
+
+  const bindHost = env.KONTROL_PEER_BIND_HOST?.trim() || "127.0.0.1";
+  if (bindHost === "0.0.0.0" || bindHost === "::" || bindHost === "*" || bindHost === "0::") {
+    throw new Error(
+      `KONTROL_PEER_BIND_HOST=${bindHost} is a wildcard bind and is rejected. Bind a specific local or tailnet interface (for example a 100.x tailnet address) and put an explicitly protected HTTPS front end in front if remote exposure is required.`,
+    );
+  }
+
+  if (!env.KONTROL_PEER_PORT) {
+    throw new Error("KONTROL_PEER_PORT is required when KONTROL_PEER_ENABLED=1.");
+  }
+  const port = parsePositiveInteger(env.KONTROL_PEER_PORT, 0, "KONTROL_PEER_PORT");
+  if (port === mainPort) {
+    throw new Error(`KONTROL_PEER_PORT=${port} must differ from the main server port (${mainPort}).`);
+  }
+
+  const credentialFileRaw = env.KONTROL_PEER_CREDENTIAL_FILE?.trim();
+  if (!credentialFileRaw) {
+    throw new Error("KONTROL_PEER_CREDENTIAL_FILE is required when KONTROL_PEER_ENABLED=1.");
+  }
+  const credentialFile = resolve(expandHomePath(credentialFileRaw));
+  // Fail fast at startup: malformed registries and group/other-readable
+  // credential files are refused before any listener exists.
+  const { peers } = loadPeerCredentialFile(credentialFile);
+  if (peers.length === 0) {
+    throw new Error(`Peer credential registry ${credentialFile} contains no peers; refusing to start a peer listener with an empty allowlist.`);
+  }
+  const allowedPeers = peers.map((peer) => {
+    const grantedRoots = peer.grantedRoots.map((root) => resolve(expandHomePath(root)));
+    for (const root of grantedRoots) {
+      if (!allowedRoots.some((allowed) => isPathInsideRoot(root, allowed))) {
+        throw new Error(
+          `Peer "${peer.id}" grantedRoot ${root} is outside every configured allowed root; peer granted roots must be a subset of KONTROL_ALLOWED_ROOTS.`,
+        );
+      }
+    }
+    return { ...peer, grantedRoots };
+  });
+
+  return {
+    enabled: true,
+    bindHost,
+    port,
+    credentialFile,
+    maxActiveSessions: parsePositiveInteger(env.KONTROL_PEER_MAX_ACTIVE_SESSIONS, 8, "KONTROL_PEER_MAX_ACTIVE_SESSIONS"),
+    maxClaimedJobs: parsePositiveInteger(env.KONTROL_PEER_MAX_CLAIMED_JOBS, 8, "KONTROL_PEER_MAX_CLAIMED_JOBS"),
+    requestBytesLimit: parsePositiveInteger(env.KONTROL_PEER_REQUEST_BYTES_LIMIT, 1024 * 1024, "KONTROL_PEER_REQUEST_BYTES_LIMIT"),
+    allowedPeers,
+  };
+}
+
+/**
+ * Public OAuth MCP listener configuration (P0-02). Parsed only when
+ * KONTROL_PUBLIC_MCP_ENABLED is "1"/"true"; otherwise the field stays
+ * undefined and startup is unchanged (no app, no listener, no behavior).
+ * Ambiguity fails fast at load with the stable "public_mcp_invalid: " prefix:
+ * enabling outside OAuth mode (the tunnel-mode owner listener is
+ * unauthenticated and must never be exposed), wildcard bind hosts, and
+ * out-of-range ports.
+ */
+function parsePublicMcpConfig(env: NodeJS.ProcessEnv, authMode: AuthMode): ServerConfig["publicMcp"] {
+  const enabled = env.KONTROL_PUBLIC_MCP_ENABLED?.trim().toLowerCase();
+  if (enabled !== "1" && enabled !== "true") return undefined;
+
+  const PREFIX = "public_mcp_invalid: ";
+  if (authMode !== "oauth") {
+    throw new Error(
+      `${PREFIX}public listener requires authMode=oauth; the tunnel-mode owner listener is unauthenticated and must never be exposed`,
+    );
+  }
+  const bindHost = env.KONTROL_PUBLIC_MCP_BIND_HOST?.trim() || "127.0.0.1";
+  if (isUnspecifiedAddress(bindHost)) {
+    throw new Error(
+      `${PREFIX}KONTROL_PUBLIC_MCP_BIND_HOST=${bindHost} is a wildcard bind and is rejected. The public listener faces externally proxied traffic; bind a specific (normally loopback) interface and let the ingress front end terminate public exposure.`,
+    );
+  }
+  // Prefixed inline port parse (P2-3): every public-listener rejection carries
+  // the stable prefix, including parse failures from parsePositiveInteger.
+  let port: number;
+  try {
+    port = parsePositiveInteger(env.KONTROL_PUBLIC_MCP_PORT, 7678, "KONTROL_PUBLIC_MCP_PORT");
+  } catch (error) {
+    throw new Error(`${PREFIX}${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (port < 1 || port > 65535) {
+    throw new Error(`${PREFIX}KONTROL_PUBLIC_MCP_PORT=${port} is outside the valid port range 1-65535.`);
+  }
+  const parseEdgeCap = (name: string, fallback: number): number => {
+    try {
+      return parsePositiveInteger(env[name], fallback, name);
+    } catch (error) {
+      throw new Error(PREFIX + (error instanceof Error ? error.message : String(error)));
+    }
+  };
+  const edgeOAuthSurfaceMaxPerMinute = parseEdgeCap("KONTROL_PUBLIC_MCP_EDGE_OAUTH_MAX_PER_MINUTE", 60);
+  const edgeMcpMaxPerMinute = parseEdgeCap("KONTROL_PUBLIC_MCP_EDGE_MCP_MAX_PER_MINUTE", 240);
+  const edgeAuthorizeMaxAttemptsPerWindow = parseEdgeCap("KONTROL_PUBLIC_MCP_EDGE_AUTHORIZE_ATTEMPTS", 20);
+  // Upper bound: the throttle guarantee (one IP cannot spend half of the
+  // provider 50-failure global brute-force ceiling) only holds while the
+  // per-IP attempt budget stays below half that ceiling. A higher operator
+  // value would silently re-open the single-IP global-lockout path.
+  const EDGE_AUTHORIZE_ATTEMPT_CAP_CEILING = 25;
+  if (edgeAuthorizeMaxAttemptsPerWindow > EDGE_AUTHORIZE_ATTEMPT_CAP_CEILING) {
+    const shown = String(edgeAuthorizeMaxAttemptsPerWindow);
+    const max = String(EDGE_AUTHORIZE_ATTEMPT_CAP_CEILING);
+    const msg = "KONTROL_PUBLIC_MCP_EDGE_AUTHORIZE_ATTEMPTS=" + shown
+      + " exceeds the maximum of " + max
+      + ": the per-IP authorize-attempt budget must stay well below the provider global failure ceiling of 50 (the enforced bound admits at most cap+1 attempts per 5-minute span).";
+    throw new Error(PREFIX + msg);
+  }
+  return { enabled: true, port, bindHost, edgeOAuthSurfaceMaxPerMinute, edgeMcpMaxPerMinute, edgeAuthorizeMaxAttemptsPerWindow };
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
   const files = loadKontrolFiles(env);
   validateAcpSecrets(env);
@@ -524,7 +701,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     );
   }
 
+  // P0-02: parsed immediately after authMode so a public-listener misconfig
+  // (tunnel mode, wildcard bind) fails before any other validation — the
+  // stable "public_mcp_invalid: " prefix must be the error an operator sees.
+  const publicMcp = parsePublicMcpConfig(env, authMode);
+
   const policy = loadPolicyConfig(env);
+  const allowedRoots = parseAllowedRoots(env.KONTROL_ALLOWED_ROOTS ?? files.config.allowedRoots);
   // Direct policy approvals exist independently from ACP. In tunnel mode the
   // only reviewer authority is the secret-backed tunnel assertion, so an
   // ask-capable policy without one can mint approval cards that no surface is
@@ -555,7 +738,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     host,
     port,
     oauth: parseOAuthConfig(env, files.auth.ownerToken, authMode === "oauth"),
-    allowedRoots: parseAllowedRoots(env.KONTROL_ALLOWED_ROOTS ?? files.config.allowedRoots),
+    allowedRoots: allowedRoots,
     allowedHosts: parseAllowedHosts(env.KONTROL_ALLOWED_HOSTS, derivedAllowedHosts),
     publicBaseUrl,
     authMode,
@@ -585,9 +768,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     acpAgentSecret: env.KONTROL_ACP_AGENT_SECRET,
     /** Shared secret used by the reviewer (WebUI) for ACP calls. */
     acpReviewerSecret: env.KONTROL_ACP_REVIEWER_SECRET,
+    reviewBrowserChromePath: env.KONTROL_REVIEW_BROWSER_CHROME_PATH?.trim() || undefined,
     // P0 #9: outbound adapter credential; falls back to the legacy shared
     // secret only for backward compatibility.
     acpAdapterSecret: env.KONTROL_ACP_ADAPTER_SECRET ?? env.KONTROL_ACP_SHARED_SECRET,
+    readOnlyExecutionNetworkPolicy: parseReadOnlyExecutionNetworkPolicy(env.KONTROL_READ_ONLY_NETWORK_POLICY),
     policy,
     // P1 #50: Diagnostics secret — required for /diagnostics when set
     diagnosticsSecret: env.KONTROL_DIAGNOSTICS_SECRET,
@@ -637,6 +822,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     mcpMaxResourceReadsPerClient: parsePositiveInteger(env.KONTROL_MCP_MAX_RESOURCE_READS_PER_CLIENT, 1, "KONTROL_MCP_MAX_RESOURCE_READS_PER_CLIENT"),
     mcpMaxResourceReadQueue: parsePositiveInteger(env.KONTROL_MCP_MAX_RESOURCE_READ_QUEUE, 16, "KONTROL_MCP_MAX_RESOURCE_READ_QUEUE"),
     mcpSseHeartbeatMs: parsePositiveInteger(env.KONTROL_MCP_SSE_HEARTBEAT_MS, 15_000, "KONTROL_MCP_SSE_HEARTBEAT_MS"),
+    mcpSseMaxStallMs: parsePositiveInteger(env.KONTROL_MCP_SSE_MAX_STALL_MS, 30_000, "KONTROL_MCP_SSE_MAX_STALL_MS"),
+    mcpShutdownDrainMs: parsePositiveInteger(env.KONTROL_MCP_SHUTDOWN_DRAIN_MS, 30_000, "KONTROL_MCP_SHUTDOWN_DRAIN_MS"),
+    mcpOperationCancelGraceMs: parsePositiveInteger(env.KONTROL_MCP_OPERATION_CANCEL_GRACE_MS, 5_000, "KONTROL_MCP_OPERATION_CANCEL_GRACE_MS"),
     mcpSessionReclaimGraceMs: parsePositiveInteger(env.KONTROL_MCP_SESSION_RECLAIM_GRACE_MS, 5 * 60_000, "KONTROL_MCP_SESSION_RECLAIM_GRACE_MS"),
     mcpAdmissionTimeoutMs: parsePositiveInteger(
       env.KONTROL_MCP_ADMISSION_TIMEOUT_MS ?? env.KONTROL_MCP_REQUEST_DEADLINE_MS,
@@ -720,11 +908,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     mcpReusableSessionIdleMs: parsePositiveInteger(env.KONTROL_MCP_REUSABLE_SESSION_IDLE_MS, 24 * 60 * 60_000, "KONTROL_MCP_REUSABLE_SESSION_IDLE_MS"),
     mcpSessionReaperIntervalMs: parsePositiveInteger(env.KONTROL_MCP_SESSION_REAPER_INTERVAL_MS, 15_000, "KONTROL_MCP_SESSION_REAPER_INTERVAL_MS"),
     mcpLogicalContinuityRetentionMs: parsePositiveInteger(env.KONTROL_MCP_LOGICAL_CONTINUITY_RETENTION_MS, 72 * 60 * 60_000, "KONTROL_MCP_LOGICAL_CONTINUITY_RETENTION_MS"),
+    mcpClientMetricsHistoryLimit: parsePositiveInteger(env.KONTROL_MCP_CLIENT_METRICS_HISTORY_LIMIT, 5_000, "KONTROL_MCP_CLIENT_METRICS_HISTORY_LIMIT"),
     mcpSessionMaxPerClient: parsePositiveInteger(env.KONTROL_MCP_SESSION_MAX_PER_CLIENT, 20, "KONTROL_MCP_SESSION_MAX_PER_CLIENT"),
     mcpSessionSoftCap: parsePositiveInteger(env.KONTROL_MCP_SESSION_SOFT_CAP, 150, "KONTROL_MCP_SESSION_SOFT_CAP"),
     mcpSessionHardCap: parsePositiveInteger(env.KONTROL_MCP_SESSION_HARD_CAP, 200, "KONTROL_MCP_SESSION_HARD_CAP"),
     mcpToolCatalogAckRequired: parseBoolean(env.KONTROL_MCP_REQUIRE_TOOL_CATALOG_ACK),
     fsSnapshot: parseFsSnapshotConfig(env),
+    peer: parsePeerConfig(env, allowedRoots, port),
+    publicMcp,
   };
   const mcpConfig = config;
 
@@ -750,7 +941,19 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
   if (mcpConfig.mcpSessionReaperIntervalMs > mcpConfig.mcpUnusedSessionIdleMs) {
     throw new Error(`KONTROL_MCP_SESSION_REAPER_INTERVAL_MS=${mcpConfig.mcpSessionReaperIntervalMs} should not exceed the shortest idle TTL (KONTROL_MCP_UNUSED_SESSION_IDLE_MS=${mcpConfig.mcpUnusedSessionIdleMs}); idle sessions would linger a full extra interval.`);
   }
-  return config;
+
+  // PR-A: parse ingress profiles once at startup (undefined when unset) and
+  // validate them against the deployment context. No listener wiring yet.
+  const ingress = parseIngressProfilesEnv(env.KONTROL_INGRESS_PROFILES);
+  if (ingress) {
+    validateIngressProfiles(ingress.profiles, {
+      authMode,
+      peerEnabled: config.peer !== undefined,
+      hasPeerCredentials: config.peer !== undefined,
+      publicBaseUrl,
+    });
+  }
+  return { ...config, ingress };
 }
 
 function parsePublicBaseUrl(value: string): string {

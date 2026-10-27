@@ -26,8 +26,8 @@ try {
     { WorkspaceRegistry },
     { workspaceAppModelAndAppMeta },
   ] = await Promise.all([
-    import("@modelcontextprotocol/sdk/client/index.js"),
-    import("@modelcontextprotocol/sdk/inMemory.js"),
+    import("@modelcontextprotocol/client"),
+    import("@modelcontextprotocol/server"),
     import("./mcp/workspace-server.js"),
     import("./config.js"),
     import("./review-checkpoints.js"),

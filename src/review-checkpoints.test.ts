@@ -4,12 +4,37 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import assert from "node:assert/strict";
-import { createReviewCheckpointManager } from "./review-checkpoints.js";
+import { createReviewCheckpointManager, GitCheckpointCaptureCoordinator } from "./review-checkpoints.js";
 
 const execFileAsync = promisify(execFile);
 const root = await realpath(await mkdtemp(join(tmpdir(), "kontrol-review-checkpoints-test-")));
 
 try {
+  const coordinator = new GitCheckpointCaptureCoordinator();
+  let duplicateCaptureCount = 0;
+  const duplicateCapture = () => coordinator.run("/tmp/repo", "workspace-a", async () => {
+    duplicateCaptureCount += 1;
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
+    return "same-tree";
+  });
+  const [duplicateA, duplicateB] = await Promise.all([duplicateCapture(), duplicateCapture()]);
+  assert.equal(duplicateA, "same-tree");
+  assert.equal(duplicateB, "same-tree");
+  assert.equal(duplicateCaptureCount, 1, "overlapping captures of the same scope are single-flight");
+
+  let activeCaptures = 0;
+  let maxActiveCaptures = 0;
+  const serializedCapture = (scope: string) => coordinator.run("/tmp/serialized-repo", scope, async () => {
+    activeCaptures += 1;
+    maxActiveCaptures = Math.max(maxActiveCaptures, activeCaptures);
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
+    activeCaptures -= 1;
+    return scope;
+  });
+  const [scopeA, scopeB] = await Promise.all([serializedCapture("a"), serializedCapture("b")]);
+  assert.deepEqual([scopeA, scopeB], ["a", "b"]);
+  assert.equal(maxActiveCaptures, 1, "different workspace scopes in one repository serialize their temporary index captures");
+
   await git(root, ["init"]);
   await git(root, ["config", "user.name", "Kontrol Test"]);
   await git(root, ["config", "user.email", "kontrol-test@example.invalid"]);
@@ -121,6 +146,18 @@ try {
     markReviewed: false,
   });
   assert.equal(otherSession.summary.files, 3);
+
+  await writeFile(join(root, ".gitattributes"), "*.failure filter=checkpointfailure\n");
+  await writeFile(join(root, "trigger.failure"), "fail checkpoint capture\n");
+  await git(root, ["config", "filter.checkpointfailure.clean", "false"]);
+  await git(root, ["config", "filter.checkpointfailure.required", "true"]);
+  const failingManager = createReviewCheckpointManager();
+  await failingManager.initializeWorkspace({ workspaceId: "ws_checkpoint_failure", root });
+  const failedCheckpoint = await failingManager.getSnapshotInfo({ workspaceId: "ws_checkpoint_failure", root });
+  assert.equal(failedCheckpoint.available, false, "Git capture failure leaves the checkpoint unavailable");
+  assert.equal(failedCheckpoint.checkpointError?.operation, "git add", "structured diagnostics identify the failing Git operation");
+  assert.ok((failedCheckpoint.checkpointError?.stderr.length ?? Infinity) <= 1_000, "checkpoint stderr is bounded");
+  assert.ok(failedCheckpoint.checkpointError?.stderr, "checkpoint failure includes the sanitized Git diagnostic");
 } finally {
   await rm(root, { recursive: true, force: true });
 }

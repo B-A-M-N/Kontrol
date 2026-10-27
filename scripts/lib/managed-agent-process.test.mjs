@@ -6,10 +6,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   atomicWriteJson,
+  prepareOwnedChild,
   processAlive,
   processStartToken,
   readJsonOr,
   reconcileOwnedProcesses,
+  terminateProcessGroup,
 } from "./managed-agent-process.mjs";
 
 const root = await mkdtemp(join(tmpdir(), "kontrol-managed-agent-process-"));
@@ -65,6 +67,61 @@ try {
     assert.equal(groupReconciled.terminated, 1, "orphan process groups are terminated even after leader exit");
     assert.equal(processAlive({ pid: descendantPid, processStartToken: processStartToken(descendantPid) }), false, "orphan descendants are gone");
   }
+
+  const launchMarker = join(root, "worker-started");
+  const completedGate = await prepareOwnedChild("/bin/sh", ["-c", "exit 0"], {
+    cwd: root,
+    env: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
+  });
+  const completedGateExit = once(completedGate.child, "exit");
+  await completedGate.start();
+  let completedGateCode;
+  try {
+    [completedGateCode] = await Promise.race([
+      completedGateExit,
+      new Promise((_, reject) => setTimeout(() => {
+        reject(new Error("completed worker launch gate did not exit"));
+      }, 2_000).unref()),
+    ]);
+  } catch (error) {
+    await terminateProcessGroup({ pid: completedGate.child.pid, processGroupId: completedGate.child.pid, processStartToken: processStartToken(completedGate.child.pid) }, 1_000);
+    throw error;
+  }
+  assert.equal(completedGateCode, 0, "a naturally completed worker closes its owned launch gate with the worker exit code");
+
+  const launchGate = await prepareOwnedChild(process.execPath, [
+    "-e",
+    "require('node:fs').writeFileSync(process.argv[1], 'started'); setTimeout(() => {}, 60000)",
+    launchMarker,
+  ], { cwd: root, env: { PATH: process.env.PATH ?? "/usr/bin:/bin" } });
+  const launchOwner = {
+    pid: launchGate.child.pid,
+    processGroupId: launchGate.child.pid,
+    processStartToken: processStartToken(launchGate.child.pid),
+    launchState: "prepared",
+  };
+  await atomicWriteJson(ownedPath, [launchOwner]);
+  await assert.rejects(access(launchMarker), { code: "ENOENT" }, "a prepared launch gate cannot execute its worker");
+  launchOwner.launchState = "start_requested";
+  await atomicWriteJson(ownedPath, [launchOwner]);
+  await launchGate.start();
+  for (let attempt = 0; attempt < 40; attempt++) {
+    try { await access(launchMarker); break; } catch { await new Promise((resolve) => setTimeout(resolve, 25)); }
+  }
+  assert.equal(await readFile(launchMarker, "utf8"), "started", "worker starts only after the caller opens the durable launch gate");
+  const launchedChildExit = once(launchGate.child, "exit");
+  await terminateProcessGroup(launchOwner, 1_000);
+  await launchedChildExit;
+
+  const abortedMarker = join(root, "worker-must-not-start");
+  const abortedGate = await prepareOwnedChild(process.execPath, [
+    "-e",
+    "require('node:fs').writeFileSync(process.argv[1], 'started')",
+    abortedMarker,
+  ], { cwd: root, env: { PATH: process.env.PATH ?? "/usr/bin:/bin" } });
+  abortedGate.abort();
+  await once(abortedGate.child, "exit");
+  await assert.rejects(access(abortedMarker), { code: "ENOENT" }, "closing an unopened launch gate must not execute the worker");
 } finally {
   await rm(root, { recursive: true, force: true });
 }

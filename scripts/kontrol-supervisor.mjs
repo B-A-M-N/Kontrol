@@ -333,6 +333,7 @@ export function createMcpCanaryRunner({
     lastOk: undefined,
     lastError: undefined,
     lastDurationMs: 0,
+    runningDurationMs: 0,
     consecutiveFailures: 0,
     totalRuns: 0,
     totalFailures: 0,
@@ -342,20 +343,26 @@ export function createMcpCanaryRunner({
   function snapshot() {
     return {
       enabled: state.enabled,
-      running: state.running,
+      running: state.running || Boolean(activeChild),
       lastStartedAt: state.lastStartedAt,
       lastCompletedAt: state.lastCompletedAt,
       lastOk: state.lastOk,
       lastError: state.lastError,
       lastDurationMs: state.lastDurationMs,
+      runningDurationMs: (state.running || activeChild) && state.lastStartedAt ? Math.max(0, now() - Date.parse(state.lastStartedAt)) : 0,
       consecutiveFailures: state.consecutiveFailures,
       totalRuns: state.totalRuns,
       totalFailures: state.totalFailures,
     };
   }
 
+  let activePromise;
+  let activeChild;
+  let activeChildClosed;
+  let cancelActive = () => {};
+
   async function runIfDue(at = now()) {
-    if (!enabled || state.running || at < state.nextRunAt) return false;
+    if (!enabled || state.running || activeChild || at < state.nextRunAt) return false;
     state.running = true;
     state.lastStartedAt = new Date(at).toISOString();
     state.totalRuns += 1;
@@ -371,7 +378,7 @@ export function createMcpCanaryRunner({
     ];
     if (authorizationFile) args.push("--authorization-file", authorizationFile);
     if (expectedVersion) args.push("--expected-mcp-version", expectedVersion);
-    return await new Promise((resolvePromise) => {
+    const completion = new Promise((resolvePromise) => {
       let settled = false;
       let timeout;
       const finish = (ok, error) => {
@@ -379,10 +386,12 @@ export function createMcpCanaryRunner({
         settled = true;
         if (timeout) clearTimeout(timeout);
         state.running = false;
+        state.runningDurationMs = 0;
         state.lastCompletedAt = new Date(now()).toISOString();
         state.lastDurationMs = Math.max(0, now() - started);
         state.lastOk = ok;
         state.lastError = error;
+        cancelActive = () => {};
         if (ok) state.consecutiveFailures = 0;
         else {
           state.consecutiveFailures += 1;
@@ -401,6 +410,17 @@ export function createMcpCanaryRunner({
         finish(false, error instanceof Error ? error.message : String(error));
         return;
       }
+      activeChild = child;
+      activeChildClosed = new Promise((resolveClosed) => {
+        child.once("close", () => {
+          if (activeChild === child) activeChild = undefined;
+          resolveClosed();
+        });
+      });
+      cancelActive = () => {
+        try { child.kill("SIGTERM"); } catch { /* already exited */ }
+        finish(false, "shutdown");
+      };
       timeout = setTimeout(() => {
         finish(false, "timeout");
         try { child.kill("SIGTERM"); } catch { /* already exited */ }
@@ -408,9 +428,27 @@ export function createMcpCanaryRunner({
       child.once("error", (error) => finish(false, error instanceof Error ? error.message : String(error)));
       child.once("close", (code, signal) => finish(code === 0, code === 0 ? undefined : `exit:${code ?? "unknown"}${signal ? `:${signal}` : ""}`));
     });
+    activePromise = completion;
+    try { return await completion; }
+    finally { if (activePromise === completion) activePromise = undefined; }
   }
 
-  return { runIfDue, snapshot };
+  async function stop() {
+    cancelActive();
+    if (activeChild) {
+      try { activeChild.kill("SIGTERM"); } catch { /* already exited */ }
+    }
+    await activePromise;
+    const closePromise = activeChildClosed;
+    if (!activeChild || !closePromise) return;
+    const sleep = (ms) => new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
+    const closedAfterTerm = await Promise.race([closePromise.then(() => true), sleep(2_000).then(() => false)]);
+    if (closedAfterTerm || !activeChild) return;
+    try { activeChild.kill("SIGKILL"); } catch { /* already exited */ }
+    await Promise.race([closePromise, sleep(1_000)]);
+  }
+
+  return { runIfDue, snapshot, stop };
 }
 
 function restartSession(name, root, command) {
@@ -937,7 +975,12 @@ async function main() {
     // The canary has its own failure domain. It intentionally does not affect
     // `healthy` or enter the component recovery engine: an external route or
     // catalog problem must remain distinguishable from local process death.
-    await mcpCanary.runIfDue();
+    // Fresh MCP initialization and its read can consume the entire canary
+    // timeout. Keep that external probe in its own flight while this loop
+    // continues component health checks and readiness publication.
+    void mcpCanary.runIfDue().catch((error) => {
+      console.error(`[kontrol-supervisor] MCP canary task failed: ${error instanceof Error ? error.message : String(error)}`);
+    });
     const state = healthy ? "healthy" : recovery.isRecovering() ? "recovering" : "degraded";
     writeStatus(statusFile, status(state, results.tunnel));
   }
@@ -946,6 +989,7 @@ async function main() {
   const requestStop = () => {
     monitor?.stop();
     recovery.setStopping(true);
+    void mcpCanary.stop();
   };
   process.once("SIGINT", requestStop);
   process.once("SIGTERM", requestStop);
@@ -967,6 +1011,7 @@ async function main() {
     onError: (message) => console.error(`[kontrol-supervisor] ${message}`),
   });
   const result = await monitor.promise;
+  await mcpCanary.stop();
   if (result.terminalState === "fatal") process.exitCode = 1;
 }
 

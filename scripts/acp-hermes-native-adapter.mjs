@@ -2,28 +2,59 @@
 // Native Hermes ACP bridge.
 //
 // This adapter registers `hermes-agent` as an HTTP ACP peer for Kontrol, but
-// executes turns by spawning Hermes's native `hermes acp` stdio server through
+// executes turns through Hermes's native ACP stdio server via
 // scripts/hermes-native-runner.py. It is separate from acp-crush-adapter.mjs on
 // purpose: Hermes must not be represented as a CRUSH-style subprocess wrapper.
 
-import { spawn, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { createServer } from "node:http";
-import { randomUUID } from "node:crypto";
-import { delimiter, dirname, isAbsolute, join } from "node:path";
-import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { basename, delimiter, dirname, isAbsolute, join, resolve } from "node:path";
+import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync } from "node:fs";
 import { realpath, stat } from "node:fs/promises";
-import { fileURLToPath } from "node:url";
+import { homedir, tmpdir } from "node:os";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { clearAgentIdentity, identityHeaders, loadAgentIdentity, saveAgentIdentity } from "./lib/acp-agent-identity.mjs";
 import { readJsonBody, truncateUtf8Tail, writeAdapterError } from "./lib/adapter-http.mjs";
+import { probeFailureCategory, probeFailureDetail } from "./lib/adapter-diagnostics.mjs";
 import { buildToolEnvironment } from "./lib/tool-environment.mjs";
-import { adapterStatePath, atomicWriteJson, processStartToken, readJsonOr, reconcileOwnedProcesses, terminateProcessGroup } from "./lib/managed-agent-process.mjs";
+import { signWorkerToken, TOKEN_TTL_MS } from "./lib/acp-worker-token.mjs";
+import { adapterStatePath, atomicWriteJson, prepareOwnedChild, processStartToken, readJsonOr, reconcileOwnedProcesses, terminateProcessGroup } from "./lib/managed-agent-process.mjs";
 import { applyWorkspaceLeaseRenewal, workspaceLeaseDeadline, workspaceLeaseDeadlineReached } from "./lib/workspace-lease.mjs";
+import { formatHermesAcpAttempts, hermesAcpCandidates, selectHermesAcpEntry } from "./lib/hermes-acp-entry.mjs";
+import { classifyHermesStopReason } from "./lib/hermes-stop-reason.mjs";
+import { hermesPythonRuntimeRootFor, isSystemHermesPath } from "./lib/hermes-python-runtime.mjs";
+import { acknowledgeAdapterDispatchReceipt, adapterDispatchFingerprint, findAdapterDispatchReceipt, isTerminalAdapterDispatchStatus, loadAdapterDispatchReceipts, reconcileAdapterDispatchReceipts, recordAdapterDispatchReceipt } from "./lib/adapter-dispatch-receipts.mjs";
+const readOnlyModuleUrl = process.env.KONTROL_ARTIFACT_PATH
+  ? pathToFileURL(resolve(process.env.KONTROL_ARTIFACT_PATH, "read-only-execution.mjs"))
+  : new URL("./lib/read-only-execution.mjs", import.meta.url);
+const readOnlyExecutionModule = await import(readOnlyModuleUrl);
+const boundedWriteModuleUrl = process.env.KONTROL_ARTIFACT_PATH
+  ? pathToFileURL(resolve(process.env.KONTROL_ARTIFACT_PATH, "bounded-file-write.mjs"))
+  : new URL("./lib/bounded-file-write.mjs", import.meta.url);
+const boundedFileWriteModule = await import(boundedWriteModuleUrl);
+const { validateBoundedFileWriteDispatchRequest } = boundedFileWriteModule;
+const {
+  buildReadOnlySandboxCommand,
+  probeReadOnlyExecutionSandbox,
+  readOnlyWorkerEnvironment,
+  resolveExecutablePath,
+  validateReadOnlyDispatchRequest,
+} = readOnlyExecutionModule;
 
 const KONTROL_ACP_URL = process.env.KONTROL_ACP_URL || "http://127.0.0.1:7676/acp";
+const KONTROL_MCP_URL = process.env.KONTROL_MCP_URL || KONTROL_ACP_URL.replace(/\/acp$/, "/mcp");
 const AGENT_SECRET = process.env.KONTROL_ACP_AGENT_SECRET;
 const ADAPTER_SECRET = process.env.KONTROL_ACP_ADAPTER_SECRET;
 const HERMES_BIN = process.env.HERMES_BIN || "hermes";
+const HERMES_BIN_EXPLICIT = Boolean(process.env.HERMES_BIN);
+const HERMES_ACP_BIN = process.env.HERMES_ACP_BIN;
 const HERMES_AGENT_ROOT = process.env.HERMES_AGENT_ROOT || detectHermesAgentRoot() || process.cwd();
+// Optional operator-prepared profile containing only config.yaml and auth.json.
+// It is copied into per-run private scratch; the host Hermes home is never mounted.
+const HERMES_SANDBOX_HOME_PROFILE = process.env.KONTROL_HERMES_SANDBOX_HOME
+  ? resolve(process.env.KONTROL_HERMES_SANDBOX_HOME)
+  : undefined;
 const ADAPTER_PORT = Number(process.env.HERMES_ACP_ADAPTER_PORT || process.env.ACP_ADAPTER_PORT || "9911");
 const ADAPTER_HOST = process.env.HERMES_ACP_ADAPTER_HOST || "127.0.0.1";
 const RUNNER = fileURLToPath(new URL("./hermes-native-runner.py", import.meta.url));
@@ -31,13 +62,53 @@ const HERMES_ACP_COMPAT_PATH = fileURLToPath(new URL("./hermes-acp-compat", impo
 const DEADMAN_IDLE_MS = positiveDuration(process.env.KONTROL_HERMES_DEADMAN_IDLE_MS, 5 * 60_000);
 const MAX_RUN_MS = positiveDuration(process.env.KONTROL_HERMES_MAX_RUN_SECONDS, 2 * 60 * 60) * 1000;
 const FINAL_OUTPUT_BYTES = 2 * 1024 * 1024;
+const FAILURE_DIAGNOSTIC_BYTES = 16 * 1024;
 const OWNED_PROCESSES_PATH = process.env.KONTROL_HERMES_OWNED_PROCESSES
   || adapterStatePath("hermes", "owned-processes.json");
+const DISPATCH_RECEIPTS_PATH = process.env.KONTROL_HERMES_DISPATCH_RECEIPTS
+  || adapterStatePath("hermes", "dispatch-receipts.json");
 const TERMINAL_SPOOL_PATH = process.env.KONTROL_HERMES_TERMINAL_SPOOL
   || adapterStatePath("hermes", "terminal-spool.json");
+const PROVIDER_SESSIONS_PATH = process.env.KONTROL_HERMES_PROVIDER_SESSIONS
+  || adapterStatePath("hermes", "provider-sessions.json");
+const HERMES_SESSION_HOME_ROOT = resolve(process.env.KONTROL_HERMES_SESSION_HOME_ROOT
+  || join(dirname(PROVIDER_SESSIONS_PATH), "session-homes"));
 const EVENT_SPOOL_PATH = process.env.KONTROL_HERMES_EVENT_SPOOL
   || adapterStatePath("hermes", "event-spool.json");
 const EVENT_SPOOL_MAX_EVENTS = 512;
+const HERMES_READ_ONLY_PACKAGES = Object.freeze([
+  "agent",
+  "acp_adapter",
+  "gateway",
+  "hermes_cli",
+  "offblock",
+  "plugins",
+  "providers",
+  "tools",
+  "tui_gateway",
+]);
+const HERMES_READ_ONLY_ROOT_MODULES = Object.freeze([
+  "batch_runner.py",
+  "cli.py",
+  "hermes_bootstrap.py",
+  "hermes_constants.py",
+  "hermes_logging.py",
+  "hermes_state.py",
+  "hermes_state_common.py",
+  "hermes_state_portability.py",
+  "hermes_state_schema.py",
+  "hermes_state_search.py",
+  "hermes_time.py",
+  "mcp_serve.py",
+  "mini_swe_runner.py",
+  "model_tools.py",
+  "registration_lifecycle.py",
+  "run_agent.py",
+  "toolset_distributions.py",
+  "toolsets.py",
+  "trajectory_compressor.py",
+  "utils.py",
+]);
 
 if (process.argv.includes("--validate-imports")) {
   console.log("[hermes-native] import validation ok");
@@ -49,27 +120,55 @@ if (!AGENT_SECRET || !ADAPTER_SECRET) {
   process.exit(1);
 }
 
-const check = spawnSync(HERMES_BIN, ["acp", "--check"], {
-  encoding: "utf8",
-  // P1.10: explicit allowlist; hermes children get the toolchain plus the
-  // hermes root/python path, never launcher authority.
-  env: buildToolEnvironment(process.env, {
+function hermesCheckEnvironment() {
+  return buildToolEnvironment(process.env, {
     overrides: {
       HERMES_AGENT_ROOT,
       PYTHONPATH: withHermesPythonPath(process.env.PYTHONPATH),
     },
+  });
+}
+
+// Current upstream exposes `hermes-acp`; older installations may still only
+// provide `hermes acp`. Probe once and retain the exact successful command so
+// confined and ordinary launches use the same entry point.
+const hermesBinPath = resolveHermesBinaryPath();
+const hermesAcpSelection = selectHermesAcpEntry(
+  hermesAcpCandidates({ hermesAcpBin: HERMES_ACP_BIN, hermesBin: HERMES_BIN, hermesBinPath, hermesBinExplicit: HERMES_BIN_EXPLICIT }),
+  (entry) => spawnSync(entry.command, [...entry.args, "--check"], {
+    encoding: "utf8",
+    env: hermesCheckEnvironment(),
   }),
-});
-if (check.status !== 0) {
-  console.error("[hermes-native] hermes acp --check failed; refusing to register hermes-agent");
-  console.error((check.stderr || check.stdout || "").trim());
+);
+if (!hermesAcpSelection.entry) {
+  console.error("[hermes-native] no supported Hermes ACP entry point passed --check; refusing to register hermes-agent");
+  console.error(formatHermesAcpAttempts(hermesAcpSelection.attempts));
   process.exit(1);
 }
+const HERMES_ACP_ENTRY = hermesAcpSelection.entry;
+console.log(`[hermes-native] using Hermes ACP entry: ${HERMES_ACP_ENTRY.command} ${HERMES_ACP_ENTRY.args.join(" ")}`.trim());
 
 const PYTHON_BIN = resolveHermesPython();
 let degraded = PYTHON_BIN === null;
+const HERMES_ACP_PYTHON_SITE_ROOT = PYTHON_BIN ? resolveHermesAcpPythonSiteRoot(PYTHON_BIN) : undefined;
+const HERMES_READ_ONLY_TOOLCHAIN_STATUS = getHermesReadOnlyToolchainStatus(PYTHON_BIN, HERMES_ACP_PYTHON_SITE_ROOT);
+const HERMES_PROVIDER_GENERATION = createHash("sha256").update(JSON.stringify({
+  hermesRoot: resolve(HERMES_AGENT_ROOT),
+  hermesVersion: detectHermesVersion(),
+  python: PYTHON_BIN ? resolve(PYTHON_BIN) : null,
+  executable: resolveHermesExecutableIdentity(HERMES_ACP_ENTRY.command),
+  args: HERMES_ACP_ENTRY.args,
+})).digest("hex");
 const active = new Map();
 const ownedProcesses = new Map();
+const dispatchReceipts = await loadAdapterDispatchReceipts(DISPATCH_RECEIPTS_PATH);
+const providerSessionBindings = new Map();
+for (const [key, binding] of Object.entries(await readJsonOr(PROVIDER_SESSIONS_PATH, {}))) {
+  if (binding && typeof binding.workSessionId === "string" && typeof binding.providerSessionId === "string") {
+    providerSessionBindings.set(key, binding);
+  }
+}
+let providerSessionWrite = Promise.resolve();
 const pendingTerminalSpool = new Map();
 const pendingEventSpool = new Map();
 let agentIdentity = null;
@@ -80,6 +179,22 @@ let orphanProcessesTerminated = 0;
 const reconciliation = await reconcileOwnedProcesses(OWNED_PROCESSES_PATH, "hermes-native");
 orphanProcessesTerminated = reconciliation.terminated;
 reconciliationComplete = true;
+await reconcileAdapterDispatchReceipts(DISPATCH_RECEIPTS_PATH, dispatchReceipts, reconciliation.records);
+const recoveredRuns = reconciliation.records.filter((record) => record?.dispatchIdempotencyKey && record?.kontrolRunId
+  && findAdapterDispatchReceipt(dispatchReceipts, record.dispatchIdempotencyKey)?.status !== "unstarted");
+for (const record of recoveredRuns) {
+  const receipt = findAdapterDispatchReceipt(dispatchReceipts, record.dispatchIdempotencyKey);
+  if (!isTerminalAdapterDispatchStatus(receipt?.status)) {
+    await recordAdapterDispatchReceipt(DISPATCH_RECEIPTS_PATH, dispatchReceipts, record.dispatchIdempotencyKey, record.remoteRunId, "failed", {
+      requestFingerprint: receipt?.requestFingerprint ?? record.requestFingerprint,
+      workSessionId: receipt?.workSessionId ?? record.workSessionId,
+      workspaceSessionId: receipt?.workspaceSessionId ?? record.workspaceSessionId,
+      agentId: receipt?.agentId ?? record.agentId,
+      attemptNumber: receipt?.attemptNumber ?? record.attemptNumber,
+      lastError: "Adapter restarted and confirmed its detached Hermes worker stopped before a terminal result was recorded.",
+    });
+  }
+}
 for (const entry of await readJsonOr(TERMINAL_SPOOL_PATH, [])) {
   if (entry?.runId && entry.payload) pendingTerminalSpool.set(entry.runId, entry);
 }
@@ -93,6 +208,7 @@ if (degraded) {
 } else {
   try {
     await registerAgentWithRetry();
+    for (const record of recoveredRuns) await reportRecoveredRun(record);
     setInterval(() => heartbeat().catch((err) => console.warn("[hermes-native] heartbeat:", err.message)), 55_000);
   } catch (err) {
     degraded = true;
@@ -148,7 +264,7 @@ async function registerAgent() {
       url: `http://${ADAPTER_HOST}:${ADAPTER_PORT}`,
       description: "Native Hermes ACP stdio bridge with HTTP approval bridge",
       role: "agent",
-      capabilities: ["native-acp", "streaming", "tool-events", "http-approval-bridge", "review-barrier"],
+      capabilities: ["native-acp", "streaming", "tool-events", "http-approval-bridge", "review-barrier", "scheduled:read_only_audit", "scheduled:bounded_file_write"],
       ttlSeconds: 90,
     }),
   });
@@ -194,6 +310,28 @@ async function handle(req, res) {
       active: active.size,
       native: true,
       generationId: adapterGenerationId,
+      executionCapabilities: {
+        read_only_audit: {
+          supported: true,
+          grantPolicy: "kontrol_signed_attempt_bound",
+          confinementAvailable: Boolean(resolveExecutablePath("bwrap") && resolveExecutablePath("prlimit")),
+          executableAvailable: Boolean(PYTHON_BIN && resolveExecutablePath(PYTHON_BIN) && resolveExecutablePath(HERMES_ACP_ENTRY.command) && existsSync(RUNNER)),
+          toolchainAvailable: HERMES_READ_ONLY_TOOLCHAIN_STATUS.available,
+          ...(HERMES_READ_ONLY_TOOLCHAIN_STATUS.reason ? { toolchainFailure: HERMES_READ_ONLY_TOOLCHAIN_STATUS.reason } : {}),
+          cliInputContract: "hermes_public_acp_v1_session_prompt",
+          networkPolicies: ["disabled", "host"],
+        },
+        bounded_file_write: {
+          supported: true,
+          grantPolicy: "kontrol_signed_attempt_bound",
+          confinementAvailable: Boolean(resolveExecutablePath("bwrap") && resolveExecutablePath("prlimit")),
+          executableAvailable: Boolean(PYTHON_BIN && resolveExecutablePath(PYTHON_BIN) && resolveExecutablePath(HERMES_ACP_ENTRY.command) && existsSync(RUNNER)),
+          toolchainAvailable: HERMES_READ_ONLY_TOOLCHAIN_STATUS.available,
+          ...(HERMES_READ_ONLY_TOOLCHAIN_STATUS.reason ? { toolchainFailure: HERMES_READ_ONLY_TOOLCHAIN_STATUS.reason } : {}),
+          cliInputContract: "hermes_public_acp_v1_session_prompt",
+          networkPolicies: ["disabled", "host"],
+        },
+      },
     });
   }
   const cancelMatch = (req.url || "").match(/^\/runs\/([^/]+)\/cancel$/);
@@ -209,6 +347,33 @@ async function handle(req, res) {
     cancelRun(run, "cancelled by Kontrol");
     return writeJson(res, 202, { run_id: remoteRunId, status: "cancelled" });
   }
+  const dispatchLookup = (req.url || "").match(/^\/runs\/by-dispatch-id\/([^/]+)$/);
+  if (req.method === "GET" && dispatchLookup) {
+    if ((req.headers.authorization || "") !== `Bearer ${ADAPTER_SECRET}`) {
+      return writeJson(res, 401, { error: { code: "unauthorized" } });
+    }
+    const key = decodeURIComponent(dispatchLookup[1]);
+    const activeRun = [...active.values()].find((run) => run.dispatchIdempotencyKey === key);
+    const receipt = findAdapterDispatchReceipt(dispatchReceipts, key);
+    const remoteRunId = activeRun?.remoteRunId ?? receipt?.remoteRunId;
+    if (remoteRunId) {
+      const status = activeRun
+        ? activeRun.lifecycle === "RUNNING" ? "running" : "uncertain"
+        : receipt?.status ?? "uncertain";
+      return writeJson(res, 200, {
+        run_id: remoteRunId,
+        remote_run_id: remoteRunId,
+        accepted: !["dispatching", "uncertain", "unstarted"].includes(status),
+        status: status === "dispatching" ? "uncertain" : status,
+        dispatch_idempotency_key: key,
+        ...(activeRun?.readOnlyExecutionReceipt ?? receipt?.executionReceipt
+          ? { execution_receipt: activeRun?.readOnlyExecutionReceipt ?? receipt.executionReceipt }
+          : {}),
+        ...(receipt?.authoritativelyUnstarted ? { authoritatively_unstarted: true } : {}),
+      });
+    }
+    return writeJson(res, 404, { error: { code: "not_found" } });
+  }
   if (req.method !== "POST" || req.url !== "/runs") {
     return writeJson(res, 404, { error: { code: "not_found" } });
   }
@@ -216,30 +381,76 @@ async function handle(req, res) {
     return writeJson(res, 401, { error: { code: "unauthorized" } });
   }
   const body = await readJsonBody(req);
+  const requestFingerprint = adapterDispatchFingerprint(body);
+  const dispatchIdempotencyKey = typeof body.dispatch_idempotency_key === "string" && body.dispatch_idempotency_key.length > 0
+    ? body.dispatch_idempotency_key
+    : undefined;
+  if (dispatchIdempotencyKey) {
+    const receipt = findAdapterDispatchReceipt(dispatchReceipts, dispatchIdempotencyKey);
+    if (receipt) {
+      if (!receipt.requestFingerprint || receipt.requestFingerprint !== requestFingerprint) {
+        return writeJson(res, 409, { error: { code: receipt.requestFingerprint ? "dispatch_idempotency_conflict" : "dispatch_fingerprint_unavailable", message: "The original dispatch key is already bound to different or unverifiable request content." } });
+      }
+      return writeJson(res, 202, {
+        worker_token: run.workerToken,
+      run_id: receipt.remoteRunId,
+        remote_run_id: receipt.remoteRunId,
+        accepted: !["dispatching", "unstarted"].includes(receipt.status),
+        status: receipt.status === "dispatching" ? "uncertain" : receipt.status,
+        dispatch_idempotency_key: dispatchIdempotencyKey,
+        ...(receipt.executionReceipt ? { execution_receipt: receipt.executionReceipt } : {}),
+        ...(receipt.authoritativelyUnstarted ? { authoritatively_unstarted: true } : {}),
+        replayed: true,
+      });
+    }
+  }
   if (degraded) {
     return writeJson(res, 503, { error: { code: "degraded", message: "Hermes adapter is degraded: no Python interpreter found" } });
   }
   if (body.smoke_test) {
-    return writeJson(res, 202, { run_id: "hermes-native-smoke", smoke_test: true, native: true, accepted: true });
+    return writeJson(res, 202, { run_id: "hermes-native-smoke", smoke_test: true, native: true, accepted: true, status: "completed" });
   }
   const task = extractTask(body.input);
   if (!task.trim()) {
     return writeJson(res, 400, { error: { code: "invalid_task", message: "ACP task must be non-empty" } });
   }
-
   const workspaceRoot = await validateWorkspaceRoot(body.workspace_root);
+  const requestedMaxRuntimeMs = Number(body.scheduled_execution_policy?.maxRuntimeMs);
+  const runMaxRuntimeMs = Number.isSafeInteger(requestedMaxRuntimeMs) && requestedMaxRuntimeMs > 0
+    ? Math.min(MAX_RUN_MS, requestedMaxRuntimeMs)
+    : MAX_RUN_MS;
+  const readOnlyAuthorization = validateReadOnlyDispatchRequest(body, workspaceRoot, ADAPTER_SECRET, agentIdentity?.agentId);
+  if (readOnlyAuthorization.readOnly && !readOnlyAuthorization.valid) {
+    return writeJson(res, 403, { error: { code: "read_only_grant_invalid", message: "A valid Kontrol-issued read-only execution grant is required." } });
+  }
+  const boundedWriteAuthorization = validateBoundedFileWriteDispatchRequest(body, ADAPTER_SECRET, agentIdentity?.agentId);
+  if (boundedWriteAuthorization.boundedWrite && !boundedWriteAuthorization.valid) {
+    return writeJson(res, 403, { error: { code: "bounded_file_write_grant_invalid", message: "A valid Kontrol-issued bounded file-write grant is required." } });
+  }
+  if (body.context_transfer && !isValidContextTransfer(body.context_transfer)) {
+    return writeJson(res, 409, { error: { code: "context_transfer_invalid", message: "Cross-agent context transfer failed its immutable packet hash check." } });
+  }
   const run = {
     remoteRunId: `hermes_${randomUUID().slice(0, 8)}`,
     devRunId: body.parent_run_id || body.run_id,
     workSessionId: body.session_id,
     workspaceSessionId: body.workspace_session_id,
     agentId: body.agent_id,
+    dispatchIdempotencyKey,
+    contextTransfer: body.context_transfer,
+    attemptNumber: body.attempt_number,
+    requestFingerprint,
     task,
     workspaceRoot,
+    readOnlyAudit: readOnlyAuthorization.readOnly && !boundedWriteAuthorization.boundedWrite,
+    boundedFileWrite: boundedWriteAuthorization.boundedWrite,
+    workerToken: null,
+    boundedFileWriteGrant: boundedWriteAuthorization.grant,
+    readOnlyExecutionGrant: readOnlyAuthorization.grant,
     workspaceLeaseNonce: body.workspace_lease_nonce,
     workspaceLeaseExpiresAt: body.workspace_lease_expires_at,
     workspaceLeaseDeadlineAt: workspaceLeaseDeadline(body.workspace_lease_expires_at),
-    attemptNumber: body.attempt_number,
+    maxRunMs: runMaxRuntimeMs,
     startedAt: Date.now(),
     child: null,
     lifecycle: "STARTING",
@@ -248,65 +459,371 @@ async function handle(req, res) {
     pendingPermissions: new Map(),
     activeChildOperations: new Set(),
     lastRunnerActivityAt: Date.now(),
-    absoluteDeadlineAt: Date.now() + MAX_RUN_MS,
+    absoluteDeadlineAt: Date.now() + runMaxRuntimeMs,
     sawAgentMessage: false,
     sendChain: Promise.resolve(),
     deliveryErrors: [],
     eventSequence: 0,
     terminalOutcome: null,
     finalOutput: "",
+    stderrTail: "",
+    childExit: undefined,
   };
-  if (run.workSessionId && hasActiveSession(run.workSessionId)) {
-    return writeJson(res, 409, { error: { code: "duplicate_session", message: `work session already active: ${run.workSessionId}` } });
+  run.providerGeneration = HERMES_PROVIDER_GENERATION;
+  run.providerSessionScope = run.contextTransfer?.id
+    ? `${run.workSessionId}:transfer:${run.contextTransfer.id}`
+    : run.workSessionId;
+  const providerSessionKey = run.providerSessionScope ? hashProviderSessionKey(run.providerSessionScope) : undefined;
+  const existingProviderBinding = providerSessionKey ? providerSessionBindings.get(providerSessionKey) : undefined;
+  if (existingProviderBinding && (existingProviderBinding.workSessionId !== run.workSessionId
+    || existingProviderBinding.agentId !== run.agentId
+    || existingProviderBinding.workspaceRoot !== run.workspaceRoot
+    || existingProviderBinding.providerGeneration !== run.providerGeneration)) {
+    return writeJson(res, 409, {
+      error: { code: "continuation_session_binding_conflict", message: "The persisted Hermes provider session belongs to a different work session, agent, workspace, or provider generation." },
+    });
   }
-  if (run.workSessionId && (!run.workspaceLeaseNonce || workspaceLeaseDeadlineReached(run))) {
+  if (run.contextTransfer?.fresh && existingProviderBinding) {
+    return writeJson(res, 409, {
+      error: { code: "context_transfer_already_started", message: "This immutable context transfer already has a provider session; refusing to start it as a fresh transfer again." },
+    });
+  }
+  const requiresExistingProviderBinding = Boolean(run.continuationId && !run.contextTransfer?.fresh)
+    || Boolean(run.contextTransfer?.id && !run.contextTransfer.fresh);
+  if (requiresExistingProviderBinding && !existingProviderBinding) {
+    return writeJson(res, 409, {
+      error: { code: "continuation_session_missing", message: "No persisted Hermes provider session exists for this continuation; refusing to start a new conversation." },
+    });
+  }
+  run.providerSessionBinding = existingProviderBinding ?? null;
+  if (run.workSessionId) {
+    try {
+      run.hermesSessionHome = prepareHermesSessionHome(
+        run.providerSessionScope,
+        run.workspaceRoot,
+        !existingProviderBinding,
+        !run.readOnlyAudit && !run.boundedFileWrite,
+      );
+    } catch (error) {
+      const code = existingProviderBinding ? "continuation_session_missing" : "provider_session_storage_unavailable";
+      return writeJson(res, 503, { error: { code, message: error instanceof Error ? error.message : String(error) } });
+    }
+  }
+  if (run.workSessionId && hasActiveSession(run.workSessionId)) {
+    const existing = [...active.values()].find((item) => item.workSessionId === run.workSessionId);
+    return writeJson(res, 409, {
+      error: { code: "duplicate_session", message: `work session already active: ${run.workSessionId}` },
+      ...(existing ? { run_id: existing.remoteRunId, remote_run_id: existing.remoteRunId } : {}),
+      work_session_id: run.workSessionId,
+      ...(existing?.dispatchIdempotencyKey ? { dispatch_idempotency_key: existing.dispatchIdempotencyKey } : {}),
+    });
+  }
+  if (run.workSessionId) {
+    run.workerToken = signWorkerToken({
+      role: "worker",
+      workSessionId: run.workSessionId,
+      workspaceSessionId: run.workspaceSessionId ?? "",
+      runId: run.devRunId,
+      exp: Date.now() + TOKEN_TTL_MS,
+    }, AGENT_SECRET);
+  }
+  const execution = run.boundedFileWrite
+    ? {
+      mode: "bounded_file_write",
+      grant: run.boundedFileWriteGrant,
+      networkPolicy: run.boundedFileWriteGrant?.networkPolicy,
+      grantFingerprint: run.boundedFileWriteGrant
+        ? createHash("sha256").update(run.boundedFileWriteGrant.signature).digest("hex")
+        : undefined,
+    }
+    : {
+      mode: "read_only_audit",
+      grant: run.readOnlyExecutionGrant,
+      networkPolicy: run.readOnlyExecutionGrant?.networkPolicy,
+      grantFingerprint: run.readOnlyExecutionGrant
+        ? createHash("sha256").update(run.readOnlyExecutionGrant.signature).digest("hex")
+        : undefined,
+    };
+  if (!execution.grant || !execution.networkPolicy || !execution.grantFingerprint) {
+    return writeJson(res, 403, {
+      error: { code: "execution_grant_incomplete", message: "A complete signed execution grant is required for confined Hermes execution." },
+    });
+  }
+  if (run.boundedFileWrite && execution.networkPolicy !== "host") {
+    return writeJson(res, 503, {
+      error: {
+        code: "sandbox_control_plane_unavailable",
+        message: "Hermes bounded writes require the explicitly configured host network policy until Kontrol provides a local IPC transport inside an isolated network namespace.",
+      },
+    });
+  }
+  run.execution = execution;
+  if (run.workSessionId && !run.readOnlyAudit && !run.boundedFileWrite && (!run.workspaceLeaseNonce || workspaceLeaseDeadlineReached(run))) {
     return writeJson(res, 409, {
       error: { code: "workspace_lease_lost", message: "A live workspace lease nonce and expiry are required before a worker can start." },
     });
   }
-  active.set(run.remoteRunId, run);
-  reportEvent(run, "started");
-  const heartbeatTimer = setInterval(() => reportEvent(run, "heartbeat"), 20_000);
-  run.leaseWatchdogTimer = setInterval(() => {
-    if (workspaceLeaseDeadlineReached(run) && !run.finalized && !run.terminating) {
-      void terminateRun(run, "workspace lease renewal deadline elapsed", "failed");
+  if (run.readOnlyAudit || run.boundedFileWrite) {
+    try {
+      const pythonExecutable = resolveExecutablePath(PYTHON_BIN);
+      const hermesExecutable = resolveExecutablePath(HERMES_ACP_ENTRY.command);
+      if (!pythonExecutable || !hermesExecutable) {
+        throw Object.assign(new Error("Hermes Python or selected ACP executable cannot be resolved for confined execution."), { code: "sandbox_unavailable" });
+      }
+      if (!HERMES_READ_ONLY_TOOLCHAIN_STATUS.available || !HERMES_ACP_PYTHON_SITE_ROOT) {
+        throw Object.assign(new Error(`Hermes Python/ACP SDK toolchain is unavailable in the approved read-only environment${HERMES_READ_ONLY_TOOLCHAIN_STATUS.reason ? `: ${HERMES_READ_ONLY_TOOLCHAIN_STATUS.reason}` : "."}`), { code: "sandbox_unavailable" });
+      }
+      if (HERMES_SANDBOX_HOME_PROFILE) {
+        const profileInfo = lstatSync(HERMES_SANDBOX_HOME_PROFILE);
+        const profileRoot = realpathSync(HERMES_SANDBOX_HOME_PROFILE);
+        if (profileInfo.isSymbolicLink() || profileRoot === workspaceRoot || profileRoot.startsWith(`${workspaceRoot}/`)) {
+          throw Object.assign(new Error("Hermes sandbox profile must be a separate operator-prepared directory outside the workspace."), { code: "sandbox_unavailable" });
+        }
+      }
+      run.readOnlyRuntimeProjection = prepareHermesReadOnlyRuntime();
+      copyFileSync(RUNNER, join(run.readOnlyRuntimeProjection, "hermes-native-runner.py"));
+      mkdirSync(join(run.readOnlyRuntimeProjection, "lib"), { recursive: true, mode: 0o700 });
+      copyFileSync(join(dirname(RUNNER), "lib", "mcp_http_session.py"), join(run.readOnlyRuntimeProjection, "lib", "mcp_http_session.py"));
+      copyFileSync(join(HERMES_ACP_COMPAT_PATH, "sitecustomize.py"), join(run.readOnlyRuntimeProjection, "sitecustomize.py"));
+      const hermesSandboxCommand = `/opt/kontrol/hermes-bin/${basename(hermesExecutable)}`;
+      const hermesSandboxPython = join(dirname(hermesSandboxCommand), "python");
+      const hermesPythonBindFile = { source: pythonExecutable, target: hermesSandboxPython };
+      // A relocated CPython (the upstream Hermes runtime keeps its own
+      // interpreter generation) can only find its own standard library when
+      // PYTHONHOME names the runtime root that contains it. Without it the
+      // launcher fails inside Bubblewrap with an empty module search path.
+      const hermesPythonRuntimeRoot = hermesPythonRuntimeRootFor(pythonExecutable);
+      const hermesRuntimeBindFiles = [
+        { source: hermesExecutable, target: hermesSandboxCommand },
+        hermesPythonBindFile,
+      ];
+      const configuredToolchains = (process.env.KONTROL_VERIFY_TOOLCHAIN_PATHS ?? "").split(delimiter).filter(Boolean).map((path) => resolve(path));
+      const pythonUsesSystemRuntime = pythonExecutable.startsWith("/usr/") || pythonExecutable.startsWith("/bin/");
+      run.readOnlySandbox = buildReadOnlySandboxCommand({
+        workspaceRoot,
+        executable: pythonExecutable,
+        executableTarget: pythonUsesSystemRuntime ? undefined : pythonExecutable,
+        args: ["/opt/kontrol/hermes-runtime/hermes-native-runner.py"],
+        env: {
+          ...readOnlyWorkerEnvironment(process.env),
+          HERMES_AGENT_ROOT: "/opt/kontrol/hermes-runtime",
+          HERMES_HOME: run.hermesSessionHome ? "/opt/kontrol/hermes-session" : "/tmp/home/.hermes",
+          ...(hermesPythonRuntimeRoot ? { PYTHONHOME: hermesPythonRuntimeRoot } : {}),
+          PYTHONPATH: hermesReadOnlyPythonPath(),
+          PATH: `/opt/kontrol/bin:/opt/kontrol/hermes-bin:/usr/local/bin:/usr/bin:/bin`,
+          KONTROL_WORKSPACE_SESSION_ID: run.workspaceSessionId || "",
+          KONTROL_WORK_SESSION_ID: run.workSessionId || "",
+          KONTROL_PARENT_RUN_ID: run.devRunId || "",
+          ...(run.execution.mode === "bounded_file_write" ? { KONTROL_BOUNDED_FILE_WRITE: "1" } : { KONTROL_READ_ONLY_EXECUTION: "1" }),
+          ...(HERMES_SANDBOX_HOME_PROFILE ? { KONTROL_HERMES_PROFILE_SOURCE: "/opt/kontrol/hermes-runtime/hermes-profile" } : {}),
+          KONTROL_MCP_URL,
+          KONTROL_WORKER_TOKEN: run.workerToken,
+          KONTROL_HERMES_NATIVE_INPUT: JSON.stringify({
+            command: hermesSandboxCommand,
+            args: HERMES_ACP_ENTRY.args,
+            cwd: "/workspace",
+            task: run.task,
+            runId: run.remoteRunId,
+            workSessionId: run.workSessionId,
+            agentId: run.agentId,
+            workspaceRoot: run.workspaceRoot,
+            providerGeneration: run.providerGeneration,
+            sessionBinding: run.providerSessionBinding,
+            maxRunSeconds: Math.floor(run.maxRunMs / 1000),
+          }),
+        },
+        toolchainPaths: configuredToolchains,
+        networkPolicy: run.execution.networkPolicy,
+        writableBindMounts: run.hermesSessionHome ? [{ source: run.hermesSessionHome, target: "/opt/kontrol/hermes-session" }] : [],
+        bindMounts: [
+          { source: run.readOnlyRuntimeProjection, target: "/opt/kontrol/hermes-runtime" },
+          { source: HERMES_ACP_PYTHON_SITE_ROOT, target: "/opt/kontrol/hermes-python-packages" },
+        ],
+        bindFiles: hermesRuntimeBindFiles,
+      });
+      run.readOnlyBindMounts = [
+        { source: run.readOnlyRuntimeProjection, target: "/opt/kontrol/hermes-runtime" },
+        { source: HERMES_ACP_PYTHON_SITE_ROOT, target: "/opt/kontrol/hermes-python-packages" },
+      ];
+      run.readOnlyWritableBindMounts = run.hermesSessionHome
+        ? [{ source: run.hermesSessionHome, target: "/opt/kontrol/hermes-session" }]
+        : [];
+      run.readOnlyBindFiles = hermesRuntimeBindFiles;
+      probeReadOnlyExecutionSandbox({
+        workspaceRoot,
+        toolchainPaths: configuredToolchains,
+        bindMounts: run.readOnlyBindMounts,
+        writableBindMounts: run.readOnlyWritableBindMounts,
+        bindFiles: run.readOnlyBindFiles,
+        networkPolicy: run.execution.networkPolicy,
+      });
+      const launcherProbe = buildReadOnlySandboxCommand({
+        workspaceRoot,
+        executable: hermesExecutable,
+        executableTarget: hermesSandboxCommand,
+        args: [...HERMES_ACP_ENTRY.args, "--check"],
+        env: {
+          HERMES_AGENT_ROOT: "/opt/kontrol/hermes-runtime",
+          HERMES_HOME: "/tmp/home/.hermes",
+          ...(hermesPythonRuntimeRoot ? { PYTHONHOME: hermesPythonRuntimeRoot } : {}),
+          PYTHONPATH: hermesReadOnlyPythonPath(),
+          PATH: "/opt/kontrol/bin:/opt/kontrol/hermes-bin:/usr/local/bin:/usr/bin:/bin",
+        },
+        toolchainPaths: configuredToolchains,
+        bindMounts: run.readOnlyBindMounts,
+        bindFiles: [hermesPythonBindFile],
+        networkPolicy: run.execution.networkPolicy,
+      });
+      const launcherProbeResult = spawnSync(launcherProbe.command, launcherProbe.args, {
+        encoding: "utf8",
+        timeout: 15_000,
+        env: launcherProbe.env,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      if (launcherProbeResult.error || launcherProbeResult.status !== 0) {
+        // The bounded launcher stderr stays in the adapter log. It is never
+        // placed in the error message, which reaches a scheduled-job receipt.
+        // The log is still a log, so the stderr is scrubbed of credential
+        // material before it is printed. The message itself carries only a
+        // stable category: no path, no stderr, no spawn error text.
+        const category = probeFailureCategory(launcherProbeResult);
+        console.error(`[hermes-native] launcher preflight failed: ${category} ${probeFailureDetail(launcherProbeResult)}`);
+        throw Object.assign(new Error(`Hermes ACP launcher sandbox preflight failed: ${category}`), { code: "sandbox_unavailable" });
+      }
+      const runtimeProbe = buildReadOnlySandboxCommand({
+        workspaceRoot,
+        executable: pythonExecutable,
+        executableTarget: pythonUsesSystemRuntime ? undefined : pythonExecutable,
+        args: ["-c", "import acp; from acp.core import connect_to_agent; from acp.schema import ClientCapabilities, FileSystemCapabilities, Implementation, TextContentBlock; import acp_adapter.entry; import acp_adapter.server"],
+        env: {
+          HERMES_AGENT_ROOT: "/opt/kontrol/hermes-runtime",
+          ...(hermesPythonRuntimeRoot ? { PYTHONHOME: hermesPythonRuntimeRoot } : {}),
+          PYTHONPATH: hermesReadOnlyPythonPath(),
+          PATH: "/opt/kontrol/bin:/opt/kontrol/hermes-bin:/usr/local/bin:/usr/bin:/bin",
+        },
+        toolchainPaths: configuredToolchains,
+        bindMounts: run.readOnlyBindMounts,
+        bindFiles: run.readOnlyBindFiles,
+        networkPolicy: run.execution.networkPolicy,
+      });
+      const runtimeProbeResult = spawnSync(runtimeProbe.command, runtimeProbe.args, {
+        encoding: "utf8",
+        timeout: 10_000,
+        env: runtimeProbe.env,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      if (runtimeProbeResult.error || runtimeProbeResult.status !== 0) {
+        // The runtime probe is the same surface as the launcher probe: a
+        // Python traceback can echo a profile path, an environment value, or
+        // an authorization header. This message reaches the 503 body and
+        // therefore a scheduled-job receipt, so it carries only a stable
+        // category; the scrubbed detail goes to the adapter log.
+        const category = probeFailureCategory(runtimeProbeResult);
+        console.error(`[hermes-native] read-only runtime probe failed: ${category} ${probeFailureDetail(runtimeProbeResult)}`);
+        throw Object.assign(new Error(`Hermes read-only runtime probe failed: ${category}`), { code: "sandbox_unavailable" });
+      }
+      run.readOnlyExecutionReceipt = {
+        mode: run.execution.mode,
+        execution_grant: run.execution.grant,
+        issuer: "kontrol",
+        work_session_id: run.workSessionId,
+        workspace_session_id: run.workspaceSessionId,
+        parent_run_id: run.devRunId,
+        remote_run_id: run.remoteRunId,
+        attempt_number: run.attemptNumber,
+        dispatch_idempotency_key: dispatchIdempotencyKey,
+        grant_expires_at: run.execution.grant.expiresAt,
+        grant_fingerprint: run.execution.grantFingerprint,
+        network_policy: run.execution.networkPolicy,
+        confinement: run.execution.networkPolicy === "host" ? "bubblewrap-read-only-workspace-host-network" : "bubblewrap-read-only-workspace-no-network",
+      };
+    } catch (error) {
+      removeHermesReadOnlyRuntime(run);
+      if (error?.code === "sandbox_unavailable") {
+        return writeJson(res, 503, { error: { code: "sandbox_unavailable", message: error.message } });
+      }
+      throw error;
     }
-  }, 1_000);
-  run.leaseWatchdogTimer.unref?.();
-
-  const child = spawn(PYTHON_BIN, [RUNNER], {
-    cwd: workspaceRoot,
-    detached: true,
-    env: {
+  }
+  const hermesLaunch = {
+    command: run.readOnlySandbox?.command ?? PYTHON_BIN,
+    args: run.readOnlySandbox?.args ?? [RUNNER],
+    env: run.readOnlySandbox?.env ?? {
       ...safeEnv(),
       HERMES_AGENT_ROOT,
+      ...(run.hermesSessionHome ? { HERMES_HOME: run.hermesSessionHome } : {}),
       PYTHONPATH: withHermesPythonPath(process.env.PYTHONPATH),
       KONTROL_WORKSPACE_SESSION_ID: run.workspaceSessionId || "",
       KONTROL_WORK_SESSION_ID: run.workSessionId || "",
       KONTROL_PARENT_RUN_ID: run.devRunId || "",
       KONTROL_WORKSPACE_LEASE_NONCE: run.workspaceLeaseNonce || "",
       KONTROL_HERMES_NATIVE_INPUT: JSON.stringify({
-        command: HERMES_BIN,
-        args: ["acp"],
+        command: HERMES_ACP_ENTRY.command,
+        args: HERMES_ACP_ENTRY.args,
         cwd: workspaceRoot,
         task: run.task,
         runId: run.remoteRunId,
+        workSessionId: run.workSessionId,
+        agentId: run.agentId,
+        workspaceRoot: run.workspaceRoot,
+        providerGeneration: run.providerGeneration,
+        sessionBinding: run.providerSessionBinding,
         maxRunSeconds: Math.floor(MAX_RUN_MS / 1000),
       }),
     },
-  });
+  };
+  if (dispatchIdempotencyKey) {
+    await recordAdapterDispatchReceipt(DISPATCH_RECEIPTS_PATH, dispatchReceipts, dispatchIdempotencyKey, run.remoteRunId, "dispatching", {
+      launchGateVersion: 1,
+      parentRunId: run.devRunId,
+      attemptNumber: run.attemptNumber,
+      workSessionId: run.workSessionId,
+      workspaceSessionId: run.workspaceSessionId,
+      workspaceRoot,
+      agentId: run.agentId,
+      requestFingerprint,
+      executionReceipt: run.readOnlyExecutionReceipt,
+      intendedChild: {
+        command: hermesLaunch.command,
+        cwd: workspaceRoot,
+        argsSha256: createHash("sha256").update(JSON.stringify(hermesLaunch.args)).digest("hex"),
+      },
+    });
+  }
+  let launchGate;
+  try {
+    launchGate = await prepareOwnedChild(hermesLaunch.command, hermesLaunch.args, {
+      cwd: workspaceRoot,
+      env: hermesLaunch.env,
+    });
+  } catch (error) {
+    if (dispatchIdempotencyKey) {
+      await recordAdapterDispatchReceipt(DISPATCH_RECEIPTS_PATH, dispatchReceipts, dispatchIdempotencyKey, run.remoteRunId, "unstarted", {
+        authoritativelyUnstarted: true,
+        lastError: `Owned launch gate failed before the worker could start: ${error instanceof Error ? error.message : String(error)}`,
+      });
+    }
+    throw error;
+  }
+  run.launchGate = launchGate;
+  const child = launchGate.child;
   run.child = child;
   ownedProcesses.set(run.remoteRunId, {
     remoteRunId: run.remoteRunId,
     workSessionId: run.workSessionId,
     workspaceSessionId: run.workspaceSessionId,
     kontrolRunId: run.devRunId,
+    dispatchIdempotencyKey: run.dispatchIdempotencyKey,
+    attemptNumber: run.attemptNumber,
+    requestFingerprint: run.requestFingerprint,
+    readOnlyExecutionGrant: run.readOnlyExecutionGrant,
     pid: child.pid,
     processGroupId: child.pid,
     processStartToken: processStartToken(child.pid),
+    launchState: "prepared",
     workspaceRoot,
     adapterGenerationId,
-    commandIdentity: `${HERMES_BIN} acp via hermes-native-runner.py`,
+    commandIdentity: hermesLaunch.command,
     startedAt: run.startedAt,
   });
   try {
@@ -318,10 +835,64 @@ async function handle(req, res) {
     };
     active.delete(run.remoteRunId);
     ownedProcesses.delete(run.remoteRunId);
+    launchGate.abort();
     try { await terminateProcessGroup(ownership, 5_000); } catch { /* report the original persistence failure */ }
+    if (dispatchIdempotencyKey) {
+      await recordAdapterDispatchReceipt(DISPATCH_RECEIPTS_PATH, dispatchReceipts, dispatchIdempotencyKey, run.remoteRunId, "unstarted", {
+        authoritativelyUnstarted: true,
+        lastError: "Worker launch gate was closed because durable process ownership could not be recorded.",
+      }).catch(() => {});
+    }
     throw new Error(`cannot durably record child ownership: ${error instanceof Error ? error.message : String(error)}`);
   }
-  run.lifecycle = "RUNNING";
+  const ownership = ownedProcesses.get(run.remoteRunId);
+  ownership.launchState = "start_requested";
+  try {
+    await saveOwnedProcesses();
+  } catch (error) {
+    launchGate.abort();
+    const stopped = await terminateProcessGroup(ownership, 5_000).catch(() => false);
+    if (stopped) {
+      ownedProcesses.delete(run.remoteRunId);
+      await saveOwnedProcesses().catch(() => {});
+    } else {
+      await saveOwnedProcesses().catch(() => {});
+    }
+    if (stopped && dispatchIdempotencyKey) {
+      await recordAdapterDispatchReceipt(DISPATCH_RECEIPTS_PATH, dispatchReceipts, dispatchIdempotencyKey, run.remoteRunId, "unstarted", {
+        authoritativelyUnstarted: true,
+        lastError: "Worker launch gate was closed because durable start intent could not be recorded.",
+      }).catch(() => {});
+    }
+    throw new Error(`cannot durably record launch intent: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (dispatchIdempotencyKey) {
+    try {
+      await recordAdapterDispatchReceipt(DISPATCH_RECEIPTS_PATH, dispatchReceipts, dispatchIdempotencyKey, run.remoteRunId, "dispatching", {
+        launchState: "start_requested",
+      });
+    } catch (error) {
+      launchGate.abort();
+      const stopped = await terminateProcessGroup(ownership, 5_000).catch(() => false);
+      if (stopped) {
+        ownedProcesses.delete(run.remoteRunId);
+        await saveOwnedProcesses().catch(() => {});
+        await recordAdapterDispatchReceipt(DISPATCH_RECEIPTS_PATH, dispatchReceipts, dispatchIdempotencyKey, run.remoteRunId, "unstarted", {
+          authoritativelyUnstarted: true,
+          lastError: "Worker launch gate was closed because the durable start marker could not be recorded.",
+        }).catch(() => {});
+      }
+      throw error;
+    }
+  }
+  active.set(run.remoteRunId, run);
+  const heartbeatTimer = setInterval(() => reportEvent(run, "heartbeat"), 20_000);
+  run.leaseWatchdogTimer = setInterval(() => {
+    if (!run.readOnlyAudit && workspaceLeaseDeadlineReached(run) && !run.finalized && !run.terminating) {
+      void terminateRun(run, "workspace lease renewal deadline elapsed", "failed");
+    }
+  }, 1_000);
+  run.leaseWatchdogTimer.unref?.();
 
   // P1 #11: The Python runner is the authoritative turn-end detector.
   // It emits {"type":"complete"} when the turn is done. The JS adapter
@@ -332,7 +903,7 @@ async function handle(req, res) {
   run.deadmanTimer = setInterval(() => {
     if (run.finalized) return;
     if (Date.now() >= run.absoluteDeadlineAt) {
-      const elapsedMs = Date.now() - (run.absoluteDeadlineAt - MAX_RUN_MS);
+      const elapsedMs = Date.now() - (run.absoluteDeadlineAt - run.maxRunMs);
       console.warn(`[hermes-native] absolute run ceiling for ${run.remoteRunId} — ${elapsedMs}ms elapsed`);
       void terminateRun(run, `absolute run ceiling exceeded — ${Math.round(elapsedMs / 1000)}s`, "failed");
       return;
@@ -359,8 +930,12 @@ async function handle(req, res) {
       handleRunnerLine(run, line);
     }
   });
-  child.stderr.on("data", (chunk) => reportOutput(run, String(chunk), "stderr"));
-  child.on("error", (err) => {
+  child.stderr.on("data", (chunk) => {
+    const text = String(chunk);
+    run.stderrTail = truncateUtf8Tail(`${run.stderrTail}${text}`, FAILURE_DIAGNOSTIC_BYTES);
+    reportOutput(run, text, "stderr");
+  });
+  const handleChildError = (err) => {
     clearInterval(heartbeatTimer);
     clearInterval(run.leaseWatchdogTimer);
     clearInterval(run.deadmanTimer);
@@ -368,8 +943,16 @@ async function handle(req, res) {
     void saveOwnedProcesses().catch((error) => console.warn(`[hermes-native] failed to persist child ownership cleanup: ${error.message}`));
     if (run.finalized || run.terminating) return;
     void finalizeRun(run, "failed", err.message);
+  };
+  child.on("error", (err) => {
+    if (!run.acceptancePersisted) {
+      run.pendingChildError = err;
+      return;
+    }
+    handleChildError(err);
   });
-  child.on("exit", (code, signal) => {
+  const handleChildExit = (code, signal) => {
+    run.childExit = { code, signal };
     clearInterval(heartbeatTimer);
     clearInterval(run.leaseWatchdogTimer);
     if (stdoutBuffer.trim()) handleRunnerLine(run, stdoutBuffer);
@@ -386,9 +969,50 @@ async function handle(req, res) {
     } else {
       void finalizeRun(run, "failed", signal ? `terminated by ${signal}` : `exit code ${code}`);
     }
+  };
+  child.on("exit", (code, signal) => {
+    if (!run.acceptancePersisted) {
+      run.pendingChildExit = [code, signal];
+      return;
+    }
+    handleChildExit(code, signal);
   });
 
-  return writeJson(res, 202, { run_id: run.remoteRunId, remote_run_id: run.remoteRunId, accepted: true, mode: body.mode || "async" });
+  let acceptedReceipt;
+  run.launchOpenRequested = true;
+  try {
+    await launchGate.start();
+  } catch (error) {
+    await terminateRun(run, `worker launch outcome could not be confirmed: ${error instanceof Error ? error.message : String(error)}`, "failed");
+    throw error;
+  }
+  if (dispatchIdempotencyKey) {
+    try {
+      acceptedReceipt = await recordAdapterDispatchReceipt(DISPATCH_RECEIPTS_PATH, dispatchReceipts, dispatchIdempotencyKey, run.remoteRunId, "running", {
+        pid: child.pid,
+        launchState: "worker_started",
+      });
+    } catch (error) {
+      await terminateRun(run, "adapter could not persist accepted dispatch receipt", "failed");
+      return writeJson(res, 500, { error: { code: "receipt_persistence_failed", message: error instanceof Error ? error.message : String(error) } });
+    }
+  }
+  run.acceptancePersisted = true;
+  reportEvent(run, "started");
+  run.lifecycle = "RUNNING";
+  if (run.pendingChildError) handleChildError(run.pendingChildError);
+  else if (run.pendingChildExit) handleChildExit(...run.pendingChildExit);
+  const acceptedStatus = acceptedReceipt?.status ?? "running";
+  return writeJson(res, 202, {
+    worker_token: run.workerToken,
+    run_id: run.remoteRunId,
+    remote_run_id: run.remoteRunId,
+    accepted: true,
+    status: acceptedStatus,
+    ...(dispatchIdempotencyKey ? { dispatch_idempotency_key: dispatchIdempotencyKey } : {}),
+    mode: body.mode || "async",
+    ...(run.readOnlyExecutionReceipt ? { execution_receipt: run.readOnlyExecutionReceipt } : {}),
+  });
 }
 
 function handleRunnerLine(run, line) {
@@ -398,6 +1022,10 @@ function handleRunnerLine(run, line) {
   if (msg.type === "raw_update") return reportRawUpdate(run, msg.params);
   if (msg.type === "raw_request") return reportRawRequest(run, msg);
   if (msg.type === "permission_request") return handlePermissionRequest(run, msg);
+  if (msg.type === "session_binding") {
+    void persistHermesProviderSession(run, msg);
+    return;
+  }
   if (msg.type === "event") {
     noteChildOperation(run, msg.eventType, msg.data);
     const text = msg.data?.text || msg.data?.error || JSON.stringify(msg.data || {});
@@ -409,10 +1037,60 @@ function handleRunnerLine(run, line) {
     // P1 #11: Runner emitted explicit completion — finalize the turn.
     // The runner is the authoritative turn-end detector, not a timer.
     run.explicitCompletion = true;
-    void terminateRun(run, msg.stopReason || "Hermes reported completion", "completed");
+    const outcome = classifyHermesStopReason(msg.stopReason);
+    void terminateRun(run, outcome.message ?? "Hermes reported end_turn", outcome.status);
     return;
   }
   if (msg.type === "error") return reportOutput(run, msg.error || "Hermes ACP error", "error");
+}
+
+async function persistHermesProviderSession(run, msg) {
+  const requestId = typeof msg.requestId === "string" ? msg.requestId : "";
+  let accepted = false;
+  let error;
+  try {
+    if (!requestId || !run.workSessionId || !run.agentId
+      || msg.workSessionId !== run.workSessionId
+      || msg.agentId !== run.agentId
+      || msg.workspaceRoot !== run.workspaceRoot
+      || msg.providerGeneration !== run.providerGeneration
+      || typeof msg.providerSessionId !== "string"
+      || msg.providerSessionId.trim().length === 0) {
+      throw new Error("provider_session_binding_mismatch");
+    }
+    const key = hashProviderSessionKey(run.providerSessionScope ?? run.workSessionId);
+    const existing = providerSessionBindings.get(key);
+    if (existing && existing.providerSessionId !== msg.providerSessionId) {
+      throw new Error("provider_session_binding_conflict");
+    }
+    const previousBinding = existing;
+    providerSessionBindings.set(key, {
+      workSessionId: run.workSessionId,
+      agentId: run.agentId,
+      providerSessionId: msg.providerSessionId,
+      workspaceRoot: run.workspaceRoot,
+      providerGeneration: run.providerGeneration,
+      createdAt: existing?.createdAt ?? new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+    providerSessionWrite = providerSessionWrite.catch(() => undefined).then(() => atomicWriteJson(
+      PROVIDER_SESSIONS_PATH,
+      Object.fromEntries(providerSessionBindings),
+    ));
+    try {
+      await providerSessionWrite;
+    } catch (cause) {
+      if (previousBinding) providerSessionBindings.set(key, previousBinding);
+      else providerSessionBindings.delete(key);
+      throw cause;
+    }
+    accepted = true;
+  } catch (cause) {
+    error = cause instanceof Error ? cause.message : String(cause);
+    console.error(`[hermes-native] could not persist provider session binding: ${error}`);
+  }
+  if (!run.child?.stdin?.writable) return;
+  run.child.stdin.write(`${JSON.stringify({ type: "session_binding_ack", requestId, accepted, ...(error ? { error } : {}) })}\n`);
 }
 
 function reportRawUpdate(run, params) {
@@ -430,7 +1108,10 @@ function reportRawUpdate(run, params) {
   }
   if (updateType === "tool_call") {
     const status = String(update.status || update.toolCallStatus || "");
-    if (status === "completed") return reportStructured(run, "tool_completed", toolPayload(update));
+    if (status === "completed") {
+      const payload = toolPayload(update);
+      return reportStructured(run, "tool_completed", { ...payload, rawOutput: update.raw_output ?? update.rawOutput });
+    }
     if (status === "failed") return reportStructured(run, "tool_failed", toolPayload(update));
     return reportStructured(run, "tool_started", toolPayload(update));
   }
@@ -438,7 +1119,10 @@ function reportRawUpdate(run, params) {
     return reportStructured(run, "plan_updated", { raw: update, text: textFromContent(update.content) });
   }
   if (updateType.includes("tool") && updateType.includes("start")) return reportStructured(run, "tool_started", toolPayload(update));
-  if (updateType.includes("tool") && (updateType.includes("complete") || updateType.includes("end"))) return reportStructured(run, "tool_completed", toolPayload(update));
+  if (updateType === "tool_call_update" || updateType.includes("tool") && (updateType.includes("complete") || updateType.includes("end"))) {
+    const payload = toolPayload(update);
+    return reportStructured(run, "tool_completed", { ...payload, rawOutput: update.raw_output ?? update.rawOutput });
+  }
   if (updateType.includes("tool") && updateType.includes("fail")) return reportStructured(run, "tool_failed", toolPayload(update));
   if (updateType.includes("plan") || updateType.includes("todo")) return reportStructured(run, "plan_updated", { raw: update, text: textFromContent(update.content) });
   return reportOutput(run, JSON.stringify(update), `acp:${updateType}`);
@@ -463,7 +1147,9 @@ async function handlePermissionRequest(run, msg) {
   const requestId = String(msg.requestId || "");
   if (!requestId) return;
   const toolCall = msg.toolCall && typeof msg.toolCall === "object" ? msg.toolCall : {};
-  const options = normalizePermissionOptions(msg.options);
+  const options = normalizePermissionOptions(msg.options).map((option) => run.readOnlyAudit
+    ? { ...option, scope: "once" }
+    : option);
   const title = String(toolCall.title || "Hermes permission requested");
   const command = typeof toolCall.rawInput?.command === "string"
     ? toolCall.rawInput.command
@@ -498,6 +1184,9 @@ async function createKontrolApproval(run, payload) {
       type: "permission.requested",
       remote_run_id: run.remoteRunId,
       work_session_id: run.workSessionId,
+      attempt_number: run.attemptNumber,
+      workspace_lease_nonce: run.workspaceLeaseNonce,
+      ...(run.readOnlyExecutionGrant ? { read_only_execution_grant: run.readOnlyExecutionGrant } : {}),
       // Create-only: return the approval_id immediately. The adapter parks for
       // the decision on GET /approvals/:id/decision (no fail-closed timeout).
       payload: { ...payload, wait: false },
@@ -583,11 +1272,14 @@ function refreshOperationActivity(run) {
   }
 }
 
-function reportEvent(run, type, errorMessage, { allowFinalizing = false } = {}) {
+function reportEvent(run, type, errorMessage, { allowFinalizing = false, exitCode, signal, stderr } = {}) {
   const terminal = type === "completed" || type === "failed" || type === "cancelled";
   const payload = {
     payload: {
-      ...(errorMessage ? { error: errorMessage } : {}),
+      ...(errorMessage ? { error: truncateUtf8Tail(errorMessage, 4_000) } : {}),
+      ...(type === "failed" && Number.isInteger(exitCode) ? { exit_code: exitCode } : {}),
+      ...(type === "failed" && typeof signal === "string" && signal ? { signal } : {}),
+      ...(type === "failed" && typeof stderr === "string" && stderr ? { stderr: truncateUtf8Tail(stderr, FAILURE_DIAGNOSTIC_BYTES) } : {}),
       ...(terminal && run.finalOutput ? { final_output: run.finalOutput } : {}),
     },
   };
@@ -595,6 +1287,22 @@ function reportEvent(run, type, errorMessage, { allowFinalizing = false } = {}) 
     allowFinalizing,
     terminal: type === "completed" || type === "failed" || type === "cancelled",
   });
+}
+
+async function reportRecoveredRun(record) {
+  if (!record?.kontrolRunId || !record?.remoteRunId) return;
+  await fetch(`${KONTROL_ACP_URL}/runs/${record.kontrolRunId}/events`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", authorization: `Bearer ${AGENT_SECRET}`, ...identityHeaders(agentIdentity) },
+    body: JSON.stringify({
+      type: "failed",
+      remote_run_id: record.remoteRunId,
+      work_session_id: record.workSessionId,
+      attempt_number: record.attemptNumber,
+      ...(record.readOnlyExecutionGrant ? { read_only_execution_grant: record.readOnlyExecutionGrant } : {}),
+      payload: { error: "Adapter restarted and confirmed its detached Hermes worker stopped; its turn result is unavailable." },
+    }),
+  }).catch((error) => console.warn(`[hermes-native] recovered-run event delivery failed: ${error.message}`));
 }
 
 async function withRetry(fn, { retries = 2, backoff = 500 } = {}) {
@@ -682,6 +1390,7 @@ function spoolRunEvent(runId, event) {
 }
 
 async function deliverEvent(runId, event, run) {
+  let lastRejection;
   for (let attempt = 0; attempt <= 3; attempt += 1) {
     try {
       const response = await fetch(`${KONTROL_ACP_URL}/runs/${runId}/events`, {
@@ -693,18 +1402,43 @@ async function deliverEvent(runId, event, run) {
       if (response.ok) {
         if (
           run?.workSessionId &&
+          !run.readOnlyAudit &&
           (event.type === "started" || event.type === "heartbeat") &&
           !applyWorkspaceLeaseRenewal(run, body)
         ) return { acknowledged: false, leaseLost: true };
+        await acknowledgeTerminalDispatchReceipt(event, body);
         return { acknowledged: true, leaseLost: false };
       }
       if (response.status === 409 && body?.error?.code === "workspace_lease_lost") {
         return { acknowledged: false, leaseLost: true };
       }
+      lastRejection = {
+        status: response.status,
+        code: typeof body?.error?.code === "string" ? body.error.code : undefined,
+      };
     } catch { /* retry transient delivery failures until the local deadline */ }
     if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
   }
-  return { acknowledged: false, leaseLost: false };
+  return { acknowledged: false, leaseLost: false, ...lastRejection };
+}
+
+async function acknowledgeTerminalDispatchReceipt(event, responseBody) {
+  if (!responseBody?.dispatch_receipt_acknowledged
+    || !["completed", "failed", "cancelled", "exited"].includes(event?.type)
+    || typeof event?.remote_run_id !== "string"
+    || typeof event?.attempt_number !== "number"
+    || typeof event?.event_id !== "string"
+    || typeof responseBody.dispatch_idempotency_key !== "string"
+    || responseBody.remote_run_id !== event.remote_run_id
+    || responseBody.attempt_number !== event.attempt_number
+    || typeof responseBody.event_id !== "string"
+    || responseBody.event_id !== event.event_id) return false;
+  return acknowledgeAdapterDispatchReceipt(DISPATCH_RECEIPTS_PATH, dispatchReceipts, {
+    dispatchIdempotencyKey: responseBody.dispatch_idempotency_key,
+    remoteRunId: event.remote_run_id,
+    attemptNumber: event.attempt_number,
+    eventId: event.event_id,
+  });
 }
 
 function scheduleLeaseLossTermination(run) {
@@ -837,6 +1571,7 @@ function enqueueRunEvent(run, type, payload, { allowFinalizing = false, terminal
     work_session_id: run.workSessionId,
     attempt_number: run.attemptNumber,
     workspace_lease_nonce: run.workspaceLeaseNonce,
+    ...(run.readOnlyExecutionGrant ? { read_only_execution_grant: run.readOnlyExecutionGrant } : {}),
     payload,
   };
   // Terminal state is written before network delivery. This makes a short
@@ -858,7 +1593,12 @@ function enqueueRunEvent(run, type, payload, { allowFinalizing = false, terminal
         console.error(`[hermes-native] Kontrol rejected the workspace lease for ${run.remoteRunId}`);
         return false;
       }
-      if (!deliveryResult.acknowledged) throw new Error(`event delivery failed: ${type}`);
+      if (!deliveryResult.acknowledged) {
+        const rejection = deliveryResult.status
+          ? ` (Kontrol HTTP ${deliveryResult.status}${deliveryResult.code ? ` ${deliveryResult.code}` : ""})`
+          : "";
+        throw new Error(`event delivery failed: ${type}${rejection}`);
+      }
       if (!terminal) {
         pendingEventSpool.delete(event.event_id);
         await saveEventSpool();
@@ -885,6 +1625,7 @@ export function createAdapterEvent(run, type, payload) {
     work_session_id: run.workSessionId,
     attempt_number: run.attemptNumber,
     workspace_lease_nonce: run.workspaceLeaseNonce,
+    ...(run.readOnlyExecutionGrant ? { read_only_execution_grant: run.readOnlyExecutionGrant } : {}),
     payload,
   };
 }
@@ -908,14 +1649,27 @@ async function finalizeRun(run, status, stopReason) {
   run.finalized = true;
   clearInterval(run.deadmanTimer);
   clearInterval(run.leaseWatchdogTimer);
+  if (run.dispatchIdempotencyKey) {
+    await recordAdapterDispatchReceipt(DISPATCH_RECEIPTS_PATH, dispatchReceipts, run.dispatchIdempotencyKey, run.remoteRunId, status, {
+      lastError: status === "completed" ? undefined : stopReason,
+    }).catch((error) => console.warn(`[hermes-native] terminal receipt persistence failed: ${error.message}`));
+  }
   // P1 #12: Flush coalesced telemetry BEFORE terminal event
   flushAllCoalesced(run);
   // Wait for every queued telemetry frame, including the coalesced buffers
   // flushed above, before emitting the terminal frame. The terminal event is
   // the durable boundary consumed by Kontrol; it must be last.
   await run.sendChain;
-  await reportEvent(run, status, stopReason, { allowFinalizing: true });
+  await reportEvent(run, status, stopReason, {
+    allowFinalizing: true,
+    ...(status === "failed" ? {
+      exitCode: run.childExit?.code,
+      signal: run.childExit?.signal,
+      stderr: run.stderrTail,
+    } : {}),
+  });
   active.delete(run.remoteRunId);
+  removeHermesReadOnlyRuntime(run);
   run.lifecycle = "TERMINAL";
   return outcome;
 }
@@ -943,21 +1697,173 @@ function safeEnv() {
   return env;
 }
 
+function copyHermesRuntimeTree(source, destination) {
+  const excludedDirectories = new Set([
+    "__pycache__", ".git", ".crush", "tests", "test", "node_modules", "venv",
+    "web", "ui-tui", "evals", "logs", "sessions", "state", "memory",
+  ]);
+  const excludedFile = /^(?:\.env(?:\..*)?|\.envrc|\.netrc|credentials?(?:\..*)?|secrets?(?:\..*)?|auth\.json|token\.json|id_(?:rsa|ed25519)|.*\.(?:pem|key|sqlite|db|log))$/i;
+  mkdirSync(destination, { recursive: true, mode: 0o700 });
+  for (const name of readdirSync(source)) {
+    if (name.startsWith(".")) continue;
+    const from = join(source, name);
+    const to = join(destination, name);
+    let info;
+    try { info = lstatSync(from); } catch { continue; }
+    if (info.isSymbolicLink()) continue;
+    if (info.isDirectory()) {
+      if (excludedDirectories.has(name)) continue;
+      copyHermesRuntimeTree(from, to);
+    } else if (info.isFile() && !excludedFile.test(name)) {
+      copyFileSync(from, to);
+    }
+  }
+}
+
+function prepareHermesReadOnlyRuntime() {
+  const root = mkdtempSync(join(tmpdir(), `kontrol-hermes-runtime-${randomUUID()}-`));
+  try {
+    for (const name of HERMES_READ_ONLY_ROOT_MODULES) {
+      const source = join(HERMES_AGENT_ROOT, name);
+      if (!existsSync(source)) continue;
+      const info = lstatSync(source);
+      if (info.isFile() && !info.isSymbolicLink()) copyFileSync(source, join(root, name));
+    }
+    for (const name of HERMES_READ_ONLY_PACKAGES) {
+      const source = join(HERMES_AGENT_ROOT, name);
+      if (!existsSync(source)) continue;
+      const info = lstatSync(source);
+      if (info.isDirectory() && !info.isSymbolicLink()) copyHermesRuntimeTree(source, join(root, name));
+    }
+    if (HERMES_SANDBOX_HOME_PROFILE) {
+      const profileRoot = realpathSync(HERMES_SANDBOX_HOME_PROFILE);
+      if (!statSync(profileRoot).isDirectory()) throw new Error("Hermes sandbox profile must be a directory.");
+      const profileNames = readdirSync(profileRoot).sort();
+      if (profileNames.some((name) => !["auth.json", "config.yaml"].includes(name)) || !profileNames.includes("config.yaml")) {
+        throw new Error("Hermes sandbox profile may contain only config.yaml and optional auth.json.");
+      }
+      const projection = join(root, "hermes-profile");
+      mkdirSync(projection, { recursive: true, mode: 0o700 });
+      for (const name of profileNames) {
+        const source = join(profileRoot, name);
+        const info = lstatSync(source);
+        if (!info.isFile() || info.isSymbolicLink()) throw new Error(`Hermes sandbox profile entry is not a regular file: ${name}`);
+        copyFileSync(source, join(projection, name));
+        chmodSync(join(projection, name), 0o600);
+      }
+    }
+    if (!existsSync(join(root, "acp_adapter")) || !existsSync(join(root, "agent"))) {
+      throw new Error("Hermes read-only runtime projection is missing required ACP or agent modules.");
+    }
+    return root;
+  } catch (error) {
+    rmSync(root, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+function removeHermesReadOnlyRuntime(run) {
+  if (!run.readOnlyRuntimeProjection) return;
+  rmSync(run.readOnlyRuntimeProjection, { recursive: true, force: true });
+  run.readOnlyRuntimeProjection = undefined;
+}
+
 function positiveDuration(value, fallback) {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+function hashProviderSessionKey(workSessionId) {
+  return createHash("sha256").update(workSessionId).digest("hex");
+}
+
+function isValidContextTransfer(value) {
+  if (!value || typeof value.id !== "string" || value.id.length === 0
+    || typeof value.sha256 !== "string" || !/^[a-f0-9]{64}$/i.test(value.sha256)
+    || typeof value.fresh !== "boolean"
+    || !value.packet || typeof value.packet !== "object" || Array.isArray(value.packet)) return false;
+  return value.packet.transferId === value.id
+    && createHash("sha256").update(JSON.stringify(value.packet)).digest("hex") === value.sha256;
+}
+
+function prepareHermesSessionHome(workSessionId, workspaceRoot, createIfMissing, seedFromHostProfile) {
+  mkdirSync(HERMES_SESSION_HOME_ROOT, { recursive: true, mode: 0o700 });
+  const rootInfo = lstatSync(HERMES_SESSION_HOME_ROOT);
+  if (rootInfo.isSymbolicLink() || !rootInfo.isDirectory()) {
+    throw new Error("Hermes provider session storage root must be a real directory.");
+  }
+  chmodSync(HERMES_SESSION_HOME_ROOT, 0o700);
+  const root = realpathSync(HERMES_SESSION_HOME_ROOT);
+  if (root === workspaceRoot || root.startsWith(`${workspaceRoot}/`)) {
+    throw new Error("Hermes provider session storage must be outside the workspace.");
+  }
+  const home = join(root, hashProviderSessionKey(workSessionId));
+  let homeInfo;
+  try { homeInfo = lstatSync(home); } catch (error) {
+    if (error?.code !== "ENOENT" || !createIfMissing) throw error;
+    mkdirSync(home, { mode: 0o700 });
+    homeInfo = lstatSync(home);
+    if (seedFromHostProfile) {
+      try {
+        seedHermesProfile(home);
+      } catch (seedError) {
+        rmSync(home, { recursive: true, force: true });
+        throw seedError;
+      }
+    }
+  }
+  if (homeInfo.isSymbolicLink() || !homeInfo.isDirectory()) {
+    throw new Error("Hermes provider session home must be a real directory.");
+  }
+  if (typeof process.getuid === "function" && homeInfo.uid !== process.getuid()) {
+    throw new Error("Hermes provider session home is owned by another user.");
+  }
+  chmodSync(home, 0o700);
+  const resolvedHome = realpathSync(home);
+  if (resolvedHome !== home) throw new Error("Hermes provider session home escaped its private storage root.");
+  return resolvedHome;
+}
+
+function seedHermesProfile(home) {
+  const sourceRoot = resolve(process.env.HERMES_HOME || join(homedir(), ".hermes"));
+  for (const name of ["config.yaml", "auth.json"]) {
+    const source = join(sourceRoot, name);
+    if (!existsSync(source)) continue;
+    const info = lstatSync(source);
+    if (info.isSymbolicLink() || !info.isFile()) {
+      throw new Error(`Hermes provider profile entry is invalid: ${name}`);
+    }
+    const destination = join(home, name);
+    copyFileSync(source, destination);
+    chmodSync(destination, 0o600);
+  }
+}
+
+function resolveHermesExecutableIdentity(command) {
+  return resolveExecutablePath(command) ?? resolve(command);
+}
+
+function detectHermesVersion() {
+  try {
+    const pyproject = readFileSync(join(HERMES_AGENT_ROOT, "pyproject.toml"), "utf8");
+    return pyproject.match(/^version\s*=\s*["']([^"']+)["']/m)?.[1] ?? "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
 function resolveHermesPython() {
   const candidates = [
     process.env.HERMES_NATIVE_PYTHON,
-    `${HERMES_AGENT_ROOT}/.venv/bin/python`,
+    // Current upstream keeps its isolated Hermes runtime under `venv`; prefer
+    // it over a checkout-level `.venv`, which may resolve to an ambient Python.
     `${HERMES_AGENT_ROOT}/venv/bin/python`,
+    `${HERMES_AGENT_ROOT}/.venv/bin/python`,
     detectHermesPython(),
     "python3",
   ].filter(Boolean);
   for (const candidate of candidates) {
-    const result = spawnSync(candidate, ["-c", "import acp; import acp_adapter.client; assert hasattr(acp, 'connect_to_agent'); assert hasattr(acp, 'Client')"], {
+    const result = spawnSync(candidate, ["-c", "import acp; from acp.core import connect_to_agent; from acp.schema import ClientCapabilities, FileSystemCapabilities, Implementation, TextContentBlock; import acp_adapter.entry; import acp_adapter.server"], {
       encoding: "utf8",
       // P1.10: explicit allowlist (see the --check spawn above).
       env: buildToolEnvironment(process.env, {
@@ -1020,6 +1926,61 @@ function detectHermesPython() {
 
 function withHermesPythonPath(existing) {
   return [HERMES_ACP_COMPAT_PATH, HERMES_AGENT_ROOT, existing].filter(Boolean).join(delimiter);
+}
+
+function resolveHermesAcpPythonSiteRoot(pythonExecutable) {
+  const probe = spawnSync(pythonExecutable, [
+    "-c",
+    "import importlib.util, pathlib, sys; spec = importlib.util.find_spec('acp'); path = (spec.origin if spec and spec.origin else next(iter(spec.submodule_search_locations), '') if spec else ''); print(pathlib.Path(path).resolve().parent.parent if path.endswith('.py') else pathlib.Path(path).resolve().parent if path else '')",
+  ], {
+    encoding: "utf8",
+    timeout: 10_000,
+    env: hermesCheckEnvironment(),
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (probe.error || probe.status !== 0) return undefined;
+  const candidate = probe.stdout.trim().split(/\r?\n/).filter(Boolean).at(-1);
+  if (!candidate) return undefined;
+  try {
+    const root = realpathSync(candidate);
+    return statSync(root).isDirectory() && existsSync(join(root, "acp")) ? root : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function configuredHermesToolchains() {
+  return (process.env.KONTROL_VERIFY_TOOLCHAIN_PATHS ?? "").split(delimiter).filter(Boolean).flatMap((path) => {
+    try {
+      const root = realpathSync(resolve(path));
+      return statSync(root).isDirectory() ? [root] : [];
+    } catch {
+      return [];
+    }
+  });
+}
+
+function isInsideApprovedHermesToolchain(path, roots) {
+  return roots.some((root) => path === root || path.startsWith(`${root}/`));
+}
+
+function getHermesReadOnlyToolchainStatus(pythonExecutable, acpSiteRoot) {
+  if (!pythonExecutable || !resolveExecutablePath(pythonExecutable)) {
+    return { available: false, reason: "python_runtime_unavailable" };
+  }
+  if (!acpSiteRoot) return { available: false, reason: "acp_python_sdk_unavailable" };
+  const resolvedPython = resolveExecutablePath(pythonExecutable);
+  const pythonRuntimeRoot = dirname(dirname(resolvedPython));
+  const roots = configuredHermesToolchains();
+  const pythonApproved = isSystemHermesPath(pythonRuntimeRoot) || isInsideApprovedHermesToolchain(pythonRuntimeRoot, roots);
+  if (!pythonApproved) return { available: false, reason: "python_runtime_not_allowlisted" };
+  const packagesApproved = isSystemHermesPath(acpSiteRoot) || isInsideApprovedHermesToolchain(acpSiteRoot, roots);
+  if (!packagesApproved) return { available: false, reason: "acp_python_packages_not_allowlisted" };
+  return { available: true };
+}
+
+function hermesReadOnlyPythonPath() {
+  return ["/opt/kontrol/hermes-runtime", "/opt/kontrol/hermes-python-packages"].join(delimiter);
 }
 
 function hasActiveSession(workSessionId) {

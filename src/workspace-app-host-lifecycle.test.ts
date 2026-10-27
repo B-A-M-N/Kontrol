@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { App } from "@modelcontextprotocol/ext-apps";
 import { AppBridge } from "@modelcontextprotocol/ext-apps/app-bridge";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { InMemoryTransport } from "@modelcontextprotocol/server";
 import { cancelReconnect, connectWithRetry, setLifecycleHost } from "./ui/connection-lifecycle.js";
 
 async function connectPair(connectApp = true) {
@@ -21,7 +21,7 @@ async function connectPair(connectApp = true) {
     bridge.oninitialized = () => resolve();
   });
   const result = new Promise<unknown>((resolve) => {
-    app.ontoolresult = (value) => resolve(value);
+    app.addEventListener("toolresult", (value) => resolve(value));
   });
   await bridge.connect(bridgeTransport);
   if (connectApp) {
@@ -67,7 +67,7 @@ let rehydrations = 0;
 let renders = 0;
 const receivedAfterRecovery: unknown[] = [];
 const toolResultHandler = (value: unknown) => { receivedAfterRecovery.push(value); };
-active.app.ontoolresult = toolResultHandler;
+active.app.addEventListener("toolresult", toolResultHandler);
 await active.appTransport.close();
 await active.bridgeTransport.close();
 connected = false;
@@ -93,7 +93,7 @@ setLifecycleHost({
   setHostContext: () => {},
   recreateApp: async () => {
     active = await connectPair(false);
-    active.app.ontoolresult = toolResultHandler;
+    active.app.addEventListener("toolresult", toolResultHandler);
     reconnects += 1;
   },
   connectionState: () => state,

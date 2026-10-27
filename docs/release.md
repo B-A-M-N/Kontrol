@@ -60,18 +60,49 @@ enforces it mechanically inside the publish path:
    content SHA, source SHA, dependency fingerprint) produced by that commit.
 4. **12-hour wall-clock soak against that exact `buildId`** —
    `npm run soak:beta -- --hours 12 --build-id <buildId> ...`. Never rebuild
-   between soak and publish: the soak qualifies one immutable artifact.
-5. **Fresh external catalog probe** — capture the host-side `initialize`,
-   server `tools/list`, the host's registered callable catalog, and its catalog
-   acknowledgement on one session during the candidate soak, then run
+   between soak and publish: the soak qualifies one immutable artifact. The
+   runner also performs recurring dual-session GET/POST SSE probes and checks
+   actual heartbeat bytes plus server-side completion accounting. An HTTPS
+   `--url` exercises the deployed HTTPS origin; with OpenAI Secure MCP Tunnel,
+   use the loopback HTTP origin and treat tunnel-client readiness as the
+   separate outbound HTTPS observation. That local probe does not stand in for
+   a fresh connected-host catalog receipt.
+5. **External catalog observation** — if the connected host supplies a genuine
+   registry producer, capture its `initialize`, server `tools/list`, callable
+   catalog, and acknowledgement (including the matching `captureId`) on one
+   session during the candidate soak, then run
    `scripts/probe-mcp-tunnel.mjs` with `--host-catalog-file`,
    `--expected-mcp-version`, `--expected-build-id`, and `--result-file` after
    the soak ends. The probe opens a fresh server transport and fails on stale
-   versions or any missing/extra invocable tool.
+   versions or any missing/extra invocable tool. The reviewer handoff tools
+   retain the observation and investigation direction. A submitted descriptor
+   list is `operator_reported` unless a supported host integration supplied
+   the registry; the current ChatGPT path cannot expose that registry. In that
+   case `hostRegistrationVerified` remains false and the final gate cannot
+   qualify the release. For a published ChatGPT MCP app, a Business,
+   Enterprise, or Edu admin with app-management permission and a valid
+   connection opens **Workspace Settings → Apps**, selects the app's
+   **… → Action control → Refresh**, reviews the action diff, and explicitly
+   enables any new actions (disabled by default). Capture the release B catalog
+   after refresh and use a fresh MCP session for the probe. This operator
+   capture does not independently prove ChatGPT's registry; see
+   `docs/mcp-tool-catalog-ack.md` for the evidence boundary. For OpenAI Secure MCP Tunnel,
+   the capture must also bind the operator-supplied HTTPS tunnel ID and include
+   a 45-second `await_workspace_events` call with its exact
+   `x-kontrol-operation-id` response header on that same host session. The
+   post-soak probe targets the local loopback origin and matches the durable
+   server record by operation ID, full session hash, build/version, and time.
+   Catalog and SSE evidence survives session closure and process restart; it is
+   retained for 90 days, subject to the journal's bounded record cap. The
+   Secure Tunnel operation record verifies Kontrol's local response. The
+   operator-reported HTTPS tunnel observation remains a separate, unverified
+   host-facing transport fact.
 6. **Final joined receipt** — `npm run gate:beta:final` writes
    `beta-qualification.json` with `stage=combined, qualified=true` only when
    code receipt, soak receipt, external catalog receipt, candidate identity,
-   and clean checkout all match.
+   and clean checkout all match and the host registration evidence is
+   independently verified. Server refresh notifications are not proof that
+   the host refreshed its internal catalog.
 7. **Release verification** — `npm run release:verify` (receipt ↔ buildId ↔
    source SHA ↔ artifact, release-local import validation, clean checkout).
 8. **Staged package UAT** — the packed tarball installed into a clean prefix
@@ -92,6 +123,18 @@ npm run soak:beta -- --hours 12 --url "$KONTROL_PUBLIC_BASE_URL" --workspace-pat
 
 # 5. capture a fresh host catalog after soak completion, then probe the same URL
 npm run probe:tunnel -- --url "$KONTROL_PUBLIC_BASE_URL" --workspace "$PWD" --dual --cycles 1 \
+  --watcher-timeout-ms 18000 --heartbeat-count 2 --minimum-drain-events 2 \
+  --resource-load-reads 2 --diagnostics-secret "$KONTROL_DIAGNOSTICS_SECRET" \
+  --host-catalog-file external-tools-list.json \
+  --expected-mcp-version VERSION_PLUS_CONTENT_SHA \
+  --expected-build-id <buildId> \
+  --result-file beta-external-catalog.json
+
+# Secure MCP Tunnel alternative: capture the same connected host session during
+# the soak, including transport metadata and a completed 45-second SSE tool call.
+TUNNEL_ID="$(node -p 'JSON.parse(require("node:fs").readFileSync("beta-soak.json", "utf8")).transport.tunnelId')"
+npm run probe:tunnel -- --url http://127.0.0.1:7676 --workspace "$PWD" --dual --cycles 1 \
+  --transport secure_mcp_tunnel --tunnel-id "$TUNNEL_ID" \
   --watcher-timeout-ms 18000 --heartbeat-count 2 --minimum-drain-events 2 \
   --resource-load-reads 2 --diagnostics-secret "$KONTROL_DIAGNOSTICS_SECRET" \
   --host-catalog-file external-tools-list.json \

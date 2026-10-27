@@ -6,7 +6,8 @@ import type { WorkSessionViewState } from "./workspace-app.js";
 import { humanizeStatus } from "./ui-format.js";
 
 export function sessionCategory(view: WorkSessionViewState): string {
-  if (view.openMessages.size > 0 || view.unresolvedMessageCount > 0 || view.policyApprovals.size > 0 || view.pendingApprovalCount > 0) {
+  if ([...view.openMessages.values()].some((message) => message.status === "open")
+    || view.unresolvedMessageCount > 0 || view.policyApprovals.size > 0 || view.pendingApprovalCount > 0) {
     return "Needs input";
   }
   if (["awaiting_review", "review_in_progress", "changes_requested"].includes(view.status)

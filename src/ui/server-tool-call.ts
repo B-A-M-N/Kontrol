@@ -6,8 +6,9 @@
  * explicit host binding installed at boot.
  */
 import type { App } from "@modelcontextprotocol/ext-apps";
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import type { CallToolResult } from "@modelcontextprotocol/server";
 import type { ToolResultCard } from "./card-types.js";
+import { classifyMcpFailure, isMcpReconnectFailure } from "./mcp-failure.js";
 
 type ServerToolRequest = Parameters<App["callServerTool"]>[0];
 
@@ -80,11 +81,19 @@ export async function callServerToolChecked(request: ServerToolRequest, options:
   try {
     result = await app.callServerTool(request);
   } catch (transportError) {
-    // A transient host/tunnel failure should get one deterministic reconnect
-    // and rehydration attempt before the caller sees a permanent error.
+    const failure = classifyMcpFailure(transportError);
     const retryMode = retryModeForServerTool(String(request.name), options.retry);
+    if (failure === "ambiguous_completion" && retryMode !== "safe") {
+      throw new AmbiguousMutationError(String(request.name), transportError);
+    }
+    if (!isMcpReconnectFailure(failure)) throw transportError;
+    if (host.getApp() !== app) {
+      const replacement = host.getApp();
+      if (retryMode === "safe" && replacement) return replacement.callServerTool(request);
+      throw new AmbiguousMutationError(String(request.name), transportError);
+    }
     try {
-      await host.reconnect(transportError);
+      await host.reconnect({ failure, cause: transportError });
     } catch (reconnectError) {
       if (retryMode !== "safe") throw new AmbiguousMutationError(String(request.name), reconnectError);
       throw reconnectError;
@@ -105,7 +114,9 @@ export async function callServerToolChecked(request: ServerToolRequest, options:
     .map((block) => block.text)
     .join("\n")
     .trim();
-  throw new Error(message || "The server rejected the tool call.");
+  const error = new Error(message || "The server rejected the tool call.");
+  error.name = "McpToolError";
+  throw error;
 }
 
 export function cardFromMeta(result: CallToolResult): Partial<ToolResultCard> | undefined {

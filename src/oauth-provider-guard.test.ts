@@ -44,6 +44,8 @@ function makeConfig(overrides: Partial<OAuthConfig> = {}): OAuthConfig {
 
     // Window expiry resets the lockout.
     assert.equal(provider.isLockedOut(key, now + AUTH_LOCKOUT_MS + 1), false);
+    assert.equal((provider as unknown as { failures: Map<string, unknown> }).failures.size, 0,
+      "expired owner failure entries are removed from the domain-scoped map");
 
     // Global ceiling locks everything once enough distinct keys fail.
     for (let k = 0; k < AUTH_GLOBAL_MAX_FAILURES; k++) {
@@ -157,6 +159,39 @@ console.log("oauth-provider guard tests: rate limiting passed");
   }
 }
 console.log("oauth-provider guard tests: independent threshold matrix passed");
+
+// Public ingress failures have an independent global and per-client budget;
+// they cannot consume or clear the owner's lockout state.
+{
+  const provider = new SingleUserOAuthProvider(makeConfig(), new URL("http://127.0.0.1:7676"), root);
+  try {
+    const now = 5_100_000;
+    for (let i = 0; i < AUTH_GLOBAL_MAX_FAILURES; i++) {
+      provider.recordFailure(`public-client-${i}|198.51.100.${i}`, now, "public");
+    }
+    assert.equal(provider.publicGlobalFailureCount, AUTH_GLOBAL_MAX_FAILURES);
+    assert.equal(provider.isLockedOut("owner-client|127.0.0.1", now), false,
+      "public failures do not lock owner authorizations");
+    assert.equal(provider.globalFailureCount, 0, "public failures do not consume the owner global budget");
+    provider.recordFailure("owner-client|127.0.0.1", now);
+    assert.equal(provider.globalFailureCount, 1, "owner failures remain counted in the owner budget");
+    const expiredPublicKey = "public-expired|198.51.100.250";
+    provider.recordFailure(expiredPublicKey, now, "public");
+    assert.equal(provider.isLockedOut(expiredPublicKey, now + AUTH_LOCKOUT_MS + 1, "public"), false);
+    assert.equal((provider as unknown as { failures: Map<string, unknown> }).failures.has(`public|${expiredPublicKey}`), false,
+      "expired public failure entries are removed using their listener-scoped key");
+    provider.recordFailure("never-reused-public-key|198.51.100.251", now, "public");
+    const purged = provider.purgeExpiredFailures(now + AUTH_LOCKOUT_MS + 1);
+    assert.ok(purged > 0, "the maintenance sweep removes expired keys even when the client never retries");
+    assert.equal((provider as unknown as { failures: Map<string, unknown> }).failures.size, 0,
+      "expired listener-scoped failure state is bounded by maintenance");
+    provider.clearFailures("public-client-0|198.51.100.0", "public");
+    assert.equal(provider.globalFailureCount, 1, "a public success clears only the public budget");
+  } finally {
+    provider.close();
+  }
+}
+console.log("oauth-provider guard tests: listener failure-budget isolation passed");
 
 // ── Code expiry purge + outstanding-code cap ────────────────────────────────
 {

@@ -4,7 +4,7 @@ import {
   policyApprovalGrants,
   type PolicyApprovalGrantRow,
 } from "./db/schema.js";
-import type { GrantRecord, GrantStore } from "./policy.js";
+import type { EffectiveGrantPage, GrantRecord, GrantStore } from "./policy.js";
 
 /**
  * SQLite-backed durable grant store. Approvals survive Kontrol restarts.
@@ -18,6 +18,28 @@ export function createSqliteGrantStore(
   const database =
     typeof stateDirOrHandle === "string" ? openDatabase(stateDirOrHandle) : stateDirOrHandle;
   const sqlite = (database as { sqlite: { exec(q: string): unknown } }).sqlite;
+  const listWorkspaceEffective = database.sqlite.prepare(`
+    select g.id, g.principal_id as principalId, g.scope, g.scope_id as scopeId,
+      g.approval_key as approvalKey, g.created_at as createdAt,
+      g.expires_at as expiresAt, g.revoked_at as revokedAt, g.reviewer_id as reviewerId
+    from policy_approval_grants g
+    where g.revoked_at is null
+      and (g.expires_at is null or g.expires_at > ?)
+      and g.id > ?
+      and (
+        (g.scope = 'workspace' and g.scope_id = ?)
+        or (g.scope = 'work_session' and exists (
+          select 1 from work_sessions ws
+          where ws.id = g.scope_id and ws.workspace_session_id = ?
+        ))
+      )
+      and (? is null or g.principal_id = ? or (g.scope = 'work_session' and exists (
+        select 1 from work_sessions owner_ws
+        where owner_ws.id = g.scope_id and owner_ws.workspace_session_id = ? and owner_ws.owner_context_id = ?
+      )))
+    order by g.id asc
+    limit ?
+  `);
 
   // Ensure tables exist (idempotent; migration 12 creates them on fresh DBs).
   sqlite.exec(`
@@ -135,6 +157,28 @@ export function createSqliteGrantStore(
       return rows
         .filter((r) => !r.expiresAt || r.expiresAt > now)
         .map(rowToGrant);
+    },
+
+    listEffectiveForWorkspace(workspaceSessionId, afterId, limit, ownerContextId): EffectiveGrantPage {
+      const now = new Date().toISOString();
+      const boundedLimit = Number.isSafeInteger(limit) ? Math.max(1, Math.min(200, limit)) : 100;
+      const rows = listWorkspaceEffective.all(
+        now,
+        afterId ?? "",
+        workspaceSessionId,
+        workspaceSessionId,
+        ownerContextId ?? null,
+        ownerContextId ?? null,
+        workspaceSessionId,
+        ownerContextId ?? "",
+        boundedLimit + 1,
+      ) as PolicyApprovalGrantRow[];
+      const hasMore = rows.length > boundedLimit;
+      const pageRows = hasMore ? rows.slice(0, boundedLimit) : rows;
+      return {
+        grants: pageRows.map(rowToGrant),
+        ...(hasMore && pageRows.length ? { nextCursor: pageRows[pageRows.length - 1]!.id } : {}),
+      };
     },
   };
 }

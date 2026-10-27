@@ -94,9 +94,13 @@ Project scope boundary:
 
 Current implementation contracts:
 
-- Cancellation records a durable intermediate `cancelling` phase, requests the
-  remote worker stop, and becomes terminal only after worker shutdown or a
-  confirmed missing remote run; workspace leases remain fenced until then.
+- Scheduled cancellation records one durable request ID and the
+  `cancellation_requested` state before contacting a worker. Missing remote
+  metadata and termination acknowledgements are not proof of shutdown. A job
+  becomes terminal only after confirmed non-dispatch, confirmed remote absence,
+  or worker cancellation; workspace leases remain fenced until then. A
+  cancelling work session fences new worker actions, handoffs, and continuation
+  dispatches while already-waiting workers may drain the cancellation signal.
 - Unauthenticated liveness/readiness responses expose boolean status only.
   Build, process, session, and workflow diagnostics require the appropriate
   internal readiness or authenticated diagnostics boundary.
@@ -133,6 +137,39 @@ Current implementation contracts:
   revoked at terminal session state (including startup reconciliation), while
   workspace grants survive restart until explicitly revoked. A session grant
   is never offered without a concrete work-session ID.
+- Native-CDP reviewer authentication uses a separate durable auth state. Manual
+  sign-in runs in official Chrome without remote debugging, then the same
+  private profile is relaunched under loopback CDP and ChatGPT session readiness
+  is verified before conversation binding. Browser-process readiness and
+  authentication verification have separate timestamps; a restarted browser
+  must positively re-observe the bound conversation before dispatch. Manual
+  browser PID, process-start identity, boot identity, and generation are durable
+  so a restarted controller never assumes that ordinary Chrome exited.
+  Authentication-blocked review events stay durably suspended until human
+  recovery. Binding ambiguity or conversation mismatch suspends only that
+  thread's queued events until an explicit exact rebind. These suspension
+  reasons are resumed independently. Active generation keeps the exact
+  conversation busy without a second prompt. Manual Chrome binaries are
+  verified as official Google Chrome even when explicitly configured; launch
+  diagnostics are bounded and redacted.
+  Clean controller shutdown closes its owned Chrome process and loopback CDP
+  endpoint. Browser-process, CDP, authentication, binding, and dispatch health
+  remain separately observable. Credentials and cookies never enter MCP or
+  Kontrol storage. Expired browser dispatch leases requeue only attempts known
+  to be before the send boundary; later attempts remain fenced for exact
+  conversation reconciliation. Shutdown drains the dispatcher before closing
+  CDP or SQLite.
+- An expired post-dispatch browser attempt remains fenced until authenticated
+  feedback commits or the active reviewer explicitly inspects the exact bound
+  conversation and confirms the immutable prompt is absent. Recovery records
+  the reviewer principal and a hash of the inspection note before requeueing
+  the same immutable reviewer message; uncertain prompts are never auto-retried.
+- `outcome_verified` mission observations are recorded only by the authenticated
+  reviewer workflow and bind the exact submission, review epoch, snapshot,
+  contract-declared expected behavior, observer principal, and external-evidence
+  hash. `canApprove` consumes only matching receipts. `operationally_stable`
+  remains unsupported until its durability window and signed qualification
+  receipt exist.
 - Ordinary `bash` in minimal/full tool modes starts through
   `ProcessSessionManager` with a bounded request yield and an independent child
   timeout; a still-running command returns a process session for the read-only
@@ -172,6 +209,23 @@ Current implementation contracts:
   owned by `src/mission/` authority modules. `src/mission-ledger.ts` persists
   records and assembles packets; callers must consume its effective projections
   rather than infer completion from stored status fields.
+- Supervised mission callers may declare `completionClaim: implementation` or
+  `completionClaim: real_world_outcome`. Implementation remains the ordinary
+  default. A real-world claim requires exact expected behavior and is normalized
+  to `outcome_verified`; it cannot complete from implementation evidence alone.
+- MCP catalog-change notifications retry only failed tool/resource channels on
+  later eligible opportunities, with bounded attempts and backoff. A channel
+  counts as successful only when a live standalone GET SSE stream can carry the
+  notification: a send the transport drops because no such stream is attached
+  is not a success, stays eligible, and is delivered when the stream attaches.
+  Delivery state belongs to the standalone stream that carries it: a
+  successful channel is never resent while that stream stays attached, and the
+  channels are re-armed when it ends so the next standalone stream
+  re-delivers instead of inheriting a success the departed stream may never
+  have carried. A send that resolves after its stream ended is discarded as
+  stale rather than counted as a delivery: the channel stays eligible, its
+  bounded retry budget is not consumed, and a live successor surface receives
+  the notification without waiting for the next pulse opportunity.
 - Both supervised public entry paths use the same mission contract and
   reviewer-gated completion policy. Correction rounds are separate from the
   supervisor emergency cycle ceiling. Baseline capture is required before a
@@ -182,6 +236,26 @@ Current implementation contracts:
   known child operation or pending permission. `KONTROL_HERMES_MAX_RUN_SECONDS`
   remains the absolute safety ceiling, and `KONTROL_HERMES_DEADMAN_IDLE_MS`
   controls only the idle watchdog.
+- Hermes provider sessions are durably bound to the work session, selected
+  agent, workspace, and provider generation before the first prompt executes.
+  Continuations load that exact ACP session and fail closed when it is missing,
+  mismatched, or unsupported. Per-work-session Hermes homes are private
+  directories outside the checkout; confined runs mount only that session
+  directory writable while keeping the workspace and runtime projections
+  read-only. Only ACP `end_turn` counts as successful completion; cancellation,
+  refusal, limits, missing stop reasons, and unknown reasons do not.
+- Confined Hermes launches bind only the selected ACP executable and its
+  expected sibling Python interpreter, then run the exact selected entrypoint's
+  `--check` inside Bubblewrap before accepting the worker. A launcher that
+  cannot resolve that interpreter fails as `sandbox_unavailable`. A relocated
+  interpreter is given its own runtime root through `PYTHONHOME` so it can
+  find its standard library inside the sandbox; a launcher that cannot resolve
+  that runtime root still fails as `sandbox_unavailable`. Bounded launcher
+  and runtime-probe stderr stays in the adapter log, is scrubbed of credential
+  material before it is printed, and never reaches a scheduled-job receipt.
+  A probe failure message carries only a stable category
+  (`timed_out`, `spawn_failed`, `terminated_without_status`, `exit_<status>`): no path, no stderr, and no
+  spawn error text ever travel into the 503 body.
 - Tunnel supervision distinguishes local daemon liveness from remote
   control-plane state. Transient throttling, authentication, and upstream
   outages remain degraded without restarting a healthy tunnel/core; a local
@@ -189,11 +263,62 @@ Current implementation contracts:
   reconciliation restart. The external connector must establish a fresh MCP
   transport after a stale route; Kontrol never treats an old transport ID as
   durable continuity.
+- Ingress profiles are checked against exact route identity and authorization
+  topology. Tailscale route changes use profile-specific apply/disable receipts
+  and never global resets. A route's public exposure is read from the
+  union of both Tailscale status documents, so an attribution that survives in
+  only one of them is still read, and a renamed exposure field is recovered
+  when its name still identifies it as the funnel attribution. A boolean map
+  under any other name proves nothing - shape alone cannot tell a renamed
+  exposure map from an unrelated one - so the exposure of every route stays
+  unproven rather than guessed. Attribution completeness is a property of the
+  union of both documents, so an exposure that cannot be attributed, or about
+  which the two documents contradict each other, withholds the positive match
+  for every route of that profile: no route of it is reported as a proven
+  tailnet-private route, and its classification stays `UNKNOWN`.
+  Public bridge Caddy configuration is packaged with content hashes; its
+  optional Tailscale/WireGuard multipath uses an
+  mTLS-authenticated host gateway bound only to private interface addresses,
+  active health checks, and no automatic MCP request retries. Health evidence
+  remains profile-scoped and cannot restart a healthy Kontrol core.
+- The authenticated ingress Workspace App panel and `kontrol ingress doctor`
+  consume the same redacted route, qualification, and operation evidence. The
+  panel must label configured, locally observed, externally tested, and
+  authenticated states separately. Tailscale route mutation is owner/reviewer
+  gated and explicitly confirmed. Client endpoint preference remains client
+  configuration is client-local; only the owner stdio bridge may persist an
+  endpoint ordering preference, and it takes effect on subsequent connection
+  attempts rather than migrating a live MCP transport.
 - Adapter startup reconciles durable detached-child ownership before reporting
   `READY`; inability to terminate an orphan or persist ownership is fail-closed.
   CRUSH output events are coalesced and serialized so terminal lifecycle events
   cannot overtake queued telemetry. Terminal events are spooled durably before
   network delivery.
+- The generic stdio ACP adapter launches agents through ACP v1 `initialize`,
+  `session/new`, and `session/prompt`; custom nonstandard dispatch methods must
+  be explicitly configured. A scheduled `read_only_audit` uses a signed,
+  attempt-bound `read_only_execution_grant`, never a mutation lease. Bundled
+  adapters verify the grant against the local registered agent identity before
+  launch and require Linux bubblewrap to mount the canonical workspace
+  read-only and provide private scratch; unavailable confinement fails as
+  `sandbox_unavailable`. Network access is disabled by default. An operator may
+  set `KONTROL_READ_ONLY_NETWORK_POLICY=host` to share host networking for model
+  inference; that choice is signed into each grant and returned in its receipt,
+  and the agent cannot elevate it. A host-networked read-only run binds the host
+  resolver configuration read-only so it can resolve names; a run without host
+  networking observes no host resolver at all. Read-only agent environment
+  additions require `KONTROL_READ_ONLY_AGENT_ENV_ALLOWLIST`.
+- Adapter dispatch receipts bind the idempotency key to a canonical request
+  fingerprint and execution identity before worker launch. Identical retries
+  return the existing receipt, conflicting content is rejected, startup
+  reconciles receipts with owned-child records, and unresolved receipts are
+  retained until terminal evidence permits pruning. CRUSH, Hermes, and generic
+  stdio workers wait behind a closed launch gate until the wrapper process and
+  durable start intent are recorded. A `dispatching` receipt is authoritatively
+  `unstarted` only while there is evidence that the gate never opened; after
+  `start_requested`, recovery terminates the owned process group and fails the
+  run rather than risking duplicate execution. Adapters report `running` only
+  after confirming the agent child spawned.
 - Direct MCP policy approval returns a durable, retryable `approval_required`
   result immediately; it must not depend on an hours-long HTTP request.
   Controlled ACP/work-session approval may remain blocking. Durable approval
@@ -226,14 +351,81 @@ Current implementation contracts:
   stale metadata cannot be reused for a new release identity.
   `generation.json` owns active, previous, and last-known-good artifacts; those
   pointers rotate only after readiness is proven.
+- The published package ships only the files `package.json` declares. Every
+  relative import of a shipped script must resolve to a declared package file,
+  transitively; an undeclared sibling module installs cleanly and then fails
+  with `ERR_MODULE_NOT_FOUND` in the clean install. The package manifest
+  check enforces this. The manifest check is a scanner, not a pattern: the
+  specifier of an import is whatever string literal follows the import or
+  export keyword, in any quote style and on any number of lines, so a
+  single-quoted or multi-line import is found exactly like a double-quoted
+  one-line import. A commented-out import is not an import, and a path that
+  is only data - inside a log message - names no module.
+- Every test file in the repository must be EXECUTED by the canonical test
+  chain, not merely mentioned by it. `scripts/test-manifest.mjs` resolves the
+  chain the canonical test script actually runs - package.json script bodies,
+  the runner scripts they spawn, and the script arrays those runners really
+  RUN - and fails when a suite is outside it. A suite that genuinely cannot
+  run in the chain needs an entry in `scripts/test-manifest-allowlist.json` with a
+  documented reason, and a stale entry (the suite is executed again, or the
+  file is gone) is itself a failure. Reachability alone is not coverage: a
+  suite that only a standalone script runs protects no release.
+  Execution is proven by an invocation context, never by a mention: a suite
+  path counts only as an interpreter command in a package.json script body
+  or as an argument of a call in a runner the chain spawns that really starts
+  a process. A comment, a self-referencing log line, and a `node --check` parse
+  are not executions. A shell comment is not a command either: a suite named
+  behind a `#` widens neither the closure nor the executed set. A script-name
+  array widens the chain only when the
+  name reaches a process: a runner that only logs, prints, or asserts over
+  the array proves nothing, and a call whose name merely sounds like a spawn
+  is not a spawn unless it reaches the `node:child_process` API.
+  The path must reach the process as the program it starts or as an element
+  of its argument vector. A path that is only DATA - quoted in a log
+  message, carried in an environment value or an options object - names no
+  program and runs nothing, and a call quoted inside a string literal is not
+  a call at all. A spawn helper that lives in an imported local module is
+  real code at runtime, so the closure it drives counts.
+  In a script body only the FIRST positional argument of an interpreter is
+  the program it runs: a flag value (`--config`, `--import`) and an argument
+  after the program are data the program reads, so a path there names no
+  program. An interpreter flag the checker cannot classify fails the check,
+  because the checker cannot know whether such a flag consumes the argument
+  that follows it and therefore cannot know which token is the program. A
+  flag that consumes the next argument is classified as a value flag, a flag
+  that does not is classified as a boolean flag, and a flag whose value names
+  the program - a python module - is classified as a module flag. The paths
+  after a module flag are arguments to that program, and the checker cannot
+  tell a module that RUNS its arguments from one that only reads them, so a
+  suite reachable only that way is reported as unexecuted rather than
+  credited.
 - The MCP tool surface has a mandatory structured inspection contract:
   `read`, `grep`, `glob`, `ls`, `git_status`, `git_log`, `git_diff`, and
-  `git_show` are registered and verified in every tool mode. The server
+  `git_show` are registered and verified in every tool mode. `git_show` with a
+  validated `path` returns the file or tree object at `<revision>:<path>`;
+  without a path it returns revision metadata and stats. The server
   version includes the immutable artifact content identity; `open_workspace`,
   authenticated diagnostics, and `generation.json` expose the surface
   identity. A stale host catalog receives bounded list-changed notifications
   after initialize and when a GET SSE stream is established; clients must
   establish a fresh MCP initialize if their tool catalog remains stale.
+  The `kontrol.dev/tool-catalog-ack-v1` receipt fingerprints exact server and
+  host `tools/list` descriptors and immutable server version. Authenticated
+  diagnostics expose pending or rejected parity as a machine-readable
+  degradation; beta release qualification requires a fresh exact external-host
+  parity receipt. Clients without the extension remain visibly unqualified,
+  and strict deployments reject tool calls until an exact receipt is accepted.
+  Descriptor-cache identity includes the full effective tool-registration
+  profile and peer visibility profile; retained descriptors are bounded to
+  256 entries. The worker stdio bridge also carries all eight structured
+  inspection tools and `poll_process`, while its discovery and call allowlists
+  continue to exclude reviewer-only tools.
+- MCP HTTP classifies 2026 per-request traffic separately from the stateful
+  legacy Streamable HTTP session path. Both paths use the same tool
+  registration and authenticated connection-context derivation; legacy GET
+  SSE retains its session and catalog-refresh lifecycle. Modern subscriptions
+  share a process-local event bus and are fenced by HTTP admission until both
+  request execution and response streaming settle.
 - Workspace App resources use content-hashed HTML identities. Retain up to 64
   prior releases for 30 days as lazy immutable references; each historical
   modern URI and `.skybridge.html` alias must return the exact bytes matching
@@ -249,6 +441,9 @@ Current implementation contracts:
   report truncation. Ordinary tool cards do not copy result content into
   `_meta`; the Workspace App renders `result.content` when a compact card has
   no payload copy.
+- `glob` uses Pi's `fd` integration when available and falls back to Node's
+  built-in globber when `fd` is absent or rejects `--no-require-git`; both
+  paths keep `.git` and `node_modules` out of results.
 - Interactive MCP requests and Workspace App resource reads wait at most
   `KONTROL_MCP_INTERACTIVE_ADMISSION_TIMEOUT_MS` (default 8 seconds) for
   admission, with a per-session queued-request cap of 16. Durable authenticated
@@ -258,12 +453,112 @@ Current implementation contracts:
   bounded SSE comment heartbeats every 15 seconds by default with proxy
   buffering disabled. Operation diagnostics count `heartbeatBytes` separately
   from JSON-RPC `responseBytes`.
-- `read` returns a SHA-256 version of the complete file bytes. `write` and
-  `edit` accept an optional `expectedContentSha256`, while Codex
+- SSE responses track writer stalls and terminate only the affected response
+  after `KONTROL_MCP_SSE_MAX_STALL_MS` (30 seconds by default). A stalled
+  response does not close the MCP transport or change the authoritative state
+  of its unfinished operation; stall timeout, recovery, and stream abort have
+  distinct diagnostics.
+- Workspace App reconnects are limited to classified transport, expired-session,
+  and transient-availability failures. Tool, protocol, and authorization errors
+  do not invalidate a healthy App transport. Mutations with an ambiguous
+  outcome are reconciled and never blindly replayed; stale App generations
+  cannot initiate a second reconnect. Tool-result and host-context callbacks
+  use owned additive App event listeners; replacement and teardown remove the
+  prior generation's listeners before a new listener set is attached.
+- The stdio bridge retains its downstream MCP server during upstream
+  interruptions and rebuilds a fresh upstream session through a bounded,
+  single-flight reconnect lifecycle. It preserves worker attribution headers,
+  fences callbacks by connection generation, and never replays an operation
+  whose outcome is unknown.
+- An MCP handler that outlives its HTTP response deadline retains its admission
+  ownership until it actually settles. Cancellation moves through
+  `CANCELLING` to visible `STUCK` state after
+  `KONTROL_MCP_OPERATION_CANCEL_GRACE_MS`; diagnostics expose stuck age and
+  admission weight. Shutdown stops new admission and waits up to
+  `KONTROL_MCP_SHUTDOWN_DRAIN_MS`; if an execution remains active, its transport,
+  stores, and runtime ownership remain fenced for a later drain retry. Once
+  executions quiesce, passive MCP watchers may be woken by closing their
+  transports before dependent stores are closed.
+- `read` returns content and the SHA-256 version of the complete file bytes
+  from the same byte observation, including when returning a partial line
+  range. `write` and `edit` accept an optional `expectedContentSha256`, while Codex
   `apply_patch` accepts `expectedContentSha256ByPath`; supplied preconditions
   are checked under a process-wide, path-keyed mutation coordinator immediately
   before mutation, so overlapping same-version edits serialize and a
   `file_version_conflict` response leaves all files unchanged.
+- Scheduled dispatch keeps uncertain attempts active until authoritative
+  reconciliation. Kontrol persists the dispatch idempotency key before outbound
+  ACP traffic and uses direct local lookup plus adapter-side lookup after
+  response loss; it never blindly redelivers an uncertain launch. A server-owned
+  event projection advances a durable per-job event cursor and treats worker
+  turn completion, reviewer approval, rejection, failure, and cancellation as
+  distinct lifecycle outcomes. Scheduled jobs currently dispatch only to a
+  registered direct ACP adapter; peer-pull jobs remain a separate transport
+  with their own claim/result lifecycle and are not a scheduled dispatch
+  target.
+- Scheduled jobs are durably owned by authenticated principal and remain
+  recoverable from a fresh MCP transport for that principal; foreign principals
+  cannot read or cancel them. `get_scheduled_job_result` is a read-only receipt
+  over existing ACP runs, submissions, and mission evidence, with paged report
+  retrieval and explicit execution, review, verification, snapshot, and
+  cancellation request/remote-confirmation fields.
+  Scheduler history and recovery use SQL limits and cursors, bounded dispatch
+  concurrency, and diagnostics for due age, uncertain launches, unreconciled
+  attempt age, and dispatch throughput.
+- Scheduled job capability metadata describes both `read_only_audit` and
+  `bounded_file_write`; host catalog availability and a real bounded-write
+  receipt still require current external qualification evidence.
+- Scheduled worker completion is derived only from authenticated lifecycle
+  evidence bound to the authoritative dispatch attempt. Dispatch acceptance,
+  worker start/stop outcome, and reviewer approval remain separate; a rejected
+  pre-spawn attempt or a failed worker cannot produce `workerCompleted: true`.
+- Available terminal worker failure details are projected into bounded,
+  redacted reason, exit code, signal, and stderr-tail evidence for the exact run
+  and attempt. Explicit timeout and protocol reasons take precedence over
+  signal and exit-code fallback classes. Raw adapter diagnostic fields are
+  removed before event persistence.
+- Scheduled failure receipts may project pre-structured terminal events only
+  when run, attempt, and dispatch identities match the current attempt. Legacy
+  stderr is redacted and byte-bounded before it is exposed.
+- Scheduled result getters never persist artifacts or otherwise mutate durable
+  state. Lifecycle projection records a durable report-finalization obligation
+  before persisting the immutable report; bounded reconciliation retries any
+  incomplete finalization after failure or restart. Result receipts accept every
+  persisted finalization state: `pending`, `completed`, `no_output`, or
+  `unavailable`.
+- Scheduled verification execution has a durable reviewer-request idempotency
+  claim bound to job, work session, submission, review epoch, canonical snapshot,
+  policy, commands, and deadline. Identical retries reuse the running or
+  completed execution, conflicting reuse fails closed, expired executions
+  become durable failures, and a new reviewer request creates a separate
+  immutable report. The job receipt projects only evidence for the exact active
+  submission and snapshot; a newer failed report cannot be hidden by an older
+  passing report, and a scheduled pass alone does not claim independent outcome
+  verification.
+- Temporary scheduled-dispatch blockers use persisted exponential backoff with
+  bounded jitter and retain retry count, next eligible time, blocker, and last
+  attempted agent across restart. Permanent configuration blockers become
+  `blocked` and require a reviewer retry after correction; they are not retried
+  automatically.
+- Beta qualification records scheduled control-plane lifecycle evidence
+  separately from bundled-adapter security evidence. The
+  `scheduled-job-unattended-e2e.mjs` fixture does not qualify adapter
+  confinement; `scheduled-readonly-adapters-e2e.mjs`,
+  `acp-readonly-adapters.integration.test.mjs`, and
+  `adapter-launch-recovery.test.mjs` provide the named bundled-adapter,
+  signed-grant/receipt, and crash-recovery evidence.
+- Scheduled worker runtime deadlines stop when execution stops and do not count
+  human review waiting. Lifecycle events bind to the active dispatch attempt,
+  logical run, attempt number, and remote run where available; stale attempts
+  cannot resolve current cancellation. `operator_intervention` keeps the
+  original attempt reconcilable and prohibits automatic redispatch. Scheduler
+  phase failures are durably attributed and exposed through authenticated
+  serviceability diagnostics.
+- Scheduled verification commands must be declared and allowlisted before
+  dispatch. A reviewer starts them against the exact submitted snapshot in a
+  disposable, network-isolated bubblewrap workspace; the source checkout stays
+  read-only. Verification reports are immutable, content-hashed artifacts with
+  bounded UTF-8-safe pagination.
 - Periodic and startup reconciliation is bounded by pages/cursors so runtime
   state, approval expiry, direct-approval orphan cleanup, and telemetry work
   cannot become an unbounded synchronous serving-thread sweep.
@@ -275,6 +570,9 @@ Current implementation contracts:
   same project scope, and review/tool cursors use stable timestamp-plus-ID
   ordering. Older pending reviews are discoverable through an explicit stale
   history filter rather than silently disappearing from the active surface.
+- Historical pending-review UI uses the server's descending timestamp-plus-ID
+  keyset cursor, keeps loading state visible, and reports when the history is
+  exhausted. Workspace changes discard the prior history cursor.
 - `changes_requested` review feedback requires nonempty agent instructions.
   Durable bridge and policy mutations accept an optional authenticated
   principal-scoped `clientMutationId`; canonical request receipts replay
@@ -294,6 +592,9 @@ Current implementation contracts:
   directory and passes its exact path to child checks. It must not leave a
   partial `dist/` projection in the checkout. CI sets a local Git identity for
   synthetic repository fixtures.
+- `npm run uat:release` packs and installs through `scripts/package-stage.mjs`
+  so its end-to-end checks exercise an immutable candidate built from the
+  current source instead of a potentially stale checkout `dist/` projection.
 - Workspace App event waits default to 18 seconds so the watcher remains below
   common intermediary idle limits; reconnect retries recreate the host `App`
   transport while preserving the durable UI projection and draft state.
@@ -304,6 +605,11 @@ Current implementation contracts:
 - Worker-bound MCP transports are protected by the associated nonterminal,
   actively owned work session rather than by an unbounded TTL. Detached or
   terminal worker sessions become reclaimable after their normal grace period.
+- Scheduled read-only execution mode is persisted on the logical ACP run before
+  the adapter request is sent. Lifecycle events may bypass checkout mutation
+  lease renewal only when that persisted mode and a signed grant for the exact
+  current attempt both match; scheduled-job work-session linkage can lag the
+  first adapter event and is not lifecycle authority.
 - `kontrol-supervisor.mjs` contains probe/status exceptions, opens a
   cooldown-backed per-component circuit after repeated failed recovery, and
   publishes generation/PID/start-token identity. `start-all.sh` validates that
@@ -326,6 +632,26 @@ Current implementation contracts:
   should correlate a browser HAR, Kontrol diagnostics/logs, and tunnel delivery
   logs with `scripts/analyze-mcp-stream-failure.mjs`, which keeps exact-ID
   matches separate from timestamp proximity.
+- Authenticated MCP connection diagnostics expose a bounded lifecycle timeline
+  with request/operation IDs, generation, session prefix, outcome class, and
+  timing only. It excludes request bodies, tool arguments, and credentials;
+  local response-write evidence does not prove host delivery or acceptance.
+- External MCP qualification persists accepted/rejected catalog acknowledgements
+  and completed `await_workspace_events` POST SSE observations in SQLite.
+  Records contain content hashes, immutable build/version, full session SHA-256,
+  exact operation ID for SSE, capture ID when supplied, timing, byte counts,
+  and close classification; they never contain raw session IDs, arguments,
+  response bodies, bearer tokens, or conversation data. Authenticated diagnostics
+  can retrieve bounded evidence with exact build/capture/session/operation
+  filters. Evidence is retained for 90 days and the journal is capped at 20,000
+  records so qualification survives session eviction and process restart.
+- Reviewer-submitted host observations and handoff attachments are content
+  addressed and always `operator_reported`; `tools/list` plus an acknowledgement
+  cannot prove the host's internal callable registry. Until a genuine host
+  integration supplies that registry, `hostRegistrationVerified` stays false.
+  Secure MCP Tunnel's Kontrol-side SSE evidence is distinct from the
+  operator-reported host-facing HTTPS tunnel observation. List-changed pulses
+  prove only server notification delivery, not client registry refresh.
 - `scripts/probe-mcp-tunnel.mjs --dual` validates both fresh catalogs, uses
   reviewer authority for Workspace App event watchers when supplied, exercises
   an 18-second empty watcher heartbeat, reads actual repeated SSE heartbeat
@@ -338,25 +664,41 @@ Current implementation contracts:
   than merging arrays. A qualification capture has `capturedAt`, `captureId`,
   `initialize`, and the matching `toolsList`; the receipt labels the host
   exchange operator-supplied and Kontrol's live server exchange
-  machine-verified. Qualification requires the deployed HTTPS intermediary,
+  machine-verified. Qualification supports two mutually exclusive endpoint
+  profiles: a hosted public HTTPS origin with `KONTROL_AUTH_MODE=oauth`, or
+  OpenAI Secure MCP Tunnel with `KONTROL_AUTH_MODE=tunnel` and a loopback MCP
+  origin. `start-all.sh --qualify` derives the profile from auth mode unless
+  `KONTROL_BETA_SOAK_TRANSPORT` selects it explicitly, validates URL/profile
+  agreement before running the code gate or changing the generation, and
+  rejects local-only HTTP qualification. A single running generation and its
+  receipt bind to one endpoint profile; qualify the other profile in its own
+  run and retain its matching code, soak, and host-catalog evidence.
+  Qualification requires the deployed HTTPS intermediary,
   at least two GET heartbeat bytes per session, two observed drain recoveries,
   eight bounded inspections per cycle, a near-complete 45-second POST heartbeat
   with separately counted diagnostics, and concurrent resource reads;
-  localhost idle-proxy runs cannot create receipts.
+  localhost idle-proxy runs cannot create receipts. Secure MCP Tunnel
+  qualification keeps Kontrol on loopback HTTP, binds the operator-supplied
+  HTTPS transport to the exact tunnel ID and soak, and requires authenticated
+  diagnostics to correlate the same host session's completed 45-second SSE
+  tool call and heartbeat bytes.
   Pass `--host-catalog-file` to fail closed on missing/extra invocable tools
   and stale `serverInfo.version`.
   The default receipt path is `beta-external-catalog.json`; override it with
   `KONTROL_BETA_EXTERNAL_CATALOG_RECEIPT` when running the final gate.
   `beta-gate:final` requires its fresh parity receipt to target the soak origin,
-  match the candidate's immutable MCP version, be captured during the soak, and
-  be probed again after the soak ends with streaming evidence present.
+  match the candidate's immutable MCP version and transport identity, be
+  captured during the soak, and be probed again after the soak ends with
+  streaming evidence present.
 - `npm run probe:idle-proxy` is a localhost-only intermediary harness for the
   25-second idle-response acceptance scenario; it does not substitute for the
   real tunnel or ChatGPT host. Run the dual probe through it with the 18-second
   watcher interval before external qualification.
 - MCP shutdown is one shared retry-safe close operation: each subsystem phase
   is bounded, later phases still run after an earlier failure, and repeated
-  `close()` calls observe the same completion result.
+  `close()` calls observe the same completion result. Periodic maintenance
+  stops starting cycles and drains its active bounded step before database
+  closure.
 - For the systemd core unit, `restart` means restart the installed immutable
   release; `upgrade` selects the latest immutable build candidate (falling
   back to the checkout `dist/` projection), verifies readiness, and restores
@@ -423,3 +765,112 @@ MCP context isolation:
 - `write`, `edit`, and `apply_patch` return `instructions_required` with the
   full nested instruction contents and content hash before any mutation when
   governing instructions have not been acknowledged by that transport.
+- Review loops keep one Kontrol reviewer-thread identity per route epoch,
+  separate from each immutable submission handoff. A one-time expiring
+  activation grant is principal-scoped and stored only as a hash; reviewer
+  claims require the activated principal and authenticated context. Host
+  conversation IDs are correlation data and remain unverified unless a trusted
+  host adapter attests them. Handoff messages track preparation, presentation,
+  claim, and committed feedback separately. Pausing suppresses queued delivery
+  while preserving the thread binding; route-epoch changes fence old claims.
+  `completedReviewRounds` counts committed review feedback, while
+  `admittedReviewRounds` enforces the immutable submission ceiling. MCP does
+  not create or message a new ChatGPT conversation in the background; ChatGPT
+  review activation requires an explicit user-opened context and grant. Once
+  activated, the Workspace App event watcher may deliver queued review packets
+  into that same conversation through MCP Apps `ui/message` when the host
+  advertises messaging support. Delivery is acknowledged only after the host
+  accepts the message; an ambiguous response stays fenced for inspection and is
+  not blindly resent. The WebUI model reviews and submits feedback through the
+  existing handoff tools, while human approval remains in the existing approval
+  center. Review delivery may also use an explicitly selected, principal-owned
+  private Chromium profile. The reviewer must open ChatGPT, choose the exact
+  existing conversation, and bind that tab to the active review thread. Kontrol
+  never creates a ChatGPT conversation. Native CDP sends only the bounded,
+  hashed review packet and observes prompt acceptance as transport evidence.
+  The browser attempt remains active until authenticated feedback commits; page
+  generation is not a review outcome. Browser and worker-reply dispatchers wake
+  from post-commit outbox notifications, reconcile durable work at startup, and
+  use a deadline timer only for scheduled retries. Only authenticated review
+  tools commit feedback and wake the agent. Login or
+  verification screens require human action; uncertain sends remain fenced
+  until reconciled.
+- Clarification replies remain authoritative in the durable agent-reply store.
+  The `agent.reply.ready` outbox event wakes native-resume handling once; an
+  MCP waiter consumes replies through its subscribe-before-query wait and can
+  recover unacknowledged replies after reconnect. Outbox wake events are not
+  kept cycling as a substitute for reply persistence.
+- In native-CDP review mode, worker clarification and blocker messages are
+  queued to that route's bound conversation as advisory requests. Their replies
+  settle the browser turn and return through the durable agent-reply path; they
+  cannot commit a review verdict or grant workspace permissions.
+- Review handoff claims carry a bounded 15-minute lease. Feedback commit checks
+  the exact claim, principal, context, route epoch, pending submission, snapshot,
+  and unexpired lease in its authoritative transaction. A reviewer can renew an
+  expired claim through compare-and-swap; release clears all claim identity.
+- Cross-agent ACP handoffs persist an immutable context packet with the task,
+  prior work, exact checkpoint, latest reviewer feedback, and unresolved
+  requirements. New ACP runs persist the exact original task and its SHA-256;
+  the bounded input preview is display-only. A legacy run without the exact
+  task is marked incomplete when its preview is transferred. The packet hash
+  and transfer ID are carried through dispatch. The
+  durable handoff states are `requested`, `quiescing_source`,
+  `destination_ready`, and `committed`, with `blocked` and
+  `reconciliation_required` for nonterminal exceptions. A parked source waiter
+  receives a transfer signal; its live workspace lease continues to fence
+  destination mutation until quiescence. The logical ACP run retains its
+  origin agent identity while each dispatch attempt binds the selected
+  destination identity. An uncertain destination acceptance is never treated
+  as a committed transfer or blindly retried.
+- Generic stdio and Hermes ACP provider-session bindings are scoped by durable
+  work-session identity and transfer ID. Same-agent continuations reload their
+  existing provider session; a cross-agent transfer starts a separately bound
+  provider session and later destination continuations restore that session.
+  Generic ACP v1 continuation reload requires the agent to advertise
+  `loadSession`; otherwise it fails closed instead of starting an unrelated
+  conversation. ACP worker identity, the review WebUI thread, and the Kontrol
+  work session remain separate identities.
+- Historical MCP client metrics are bounded by
+  `KONTROL_MCP_CLIENT_METRICS_HISTORY_LIMIT` (default 5,000). Active client rows
+  are never pruned; retired rows are folded into aggregate counters, and the
+  bounded rolling tool-call sample is not used as the lifetime denominator.
+- Scheduler-local failure fingerprints are a bounded five-minute LRU hint.
+  Recurrence diagnostics reconcile against exact durable fingerprint matches;
+  they must not retain an unbounded map or scan an arbitrary tail of unrelated
+  scheduler events.
+- Snapshot GC marks retained manifests in resumable budgeted pages and
+  streams manifest/blob directory entries through resumable cursors; it does
+  not change capture, pinning, grace periods, or retention. It revalidates
+  durable roots between slices, and a newly live root invalidates the mark and
+  restarts collection. Snapshot diagnostics use the shared storage accounting
+  projection instead of repeating independent full store scans.
+- The supervisor MCP canary is observational and cannot hold up local health
+  ticks. Shutdown cancels and drains its active probe child.
+- Async ACP dispatch waiters subscribe to matching durable work-session run
+  events and keep a bounded registry-status fallback for missed or older event
+  paths. They do not poll the registry at a fixed two-second cadence for the
+  full submit timeout.
+
+## Peer integration (M1+M2, opt-in)
+
+- The peer listener (Meta Muse use case) exists only when KONTROL_PEER_ENABLED=1; otherwise no peer listener is created and owner/ACP/scheduled/review behavior is unchanged.
+- Peers authenticate with per-peer bearer credentials from a mode-0600 registry (KONTROL_PEER_CREDENTIAL_FILE), completely separate from the OAuth owner token and ACP secrets. Peers are never reviewers or workers; unsigned worker/reviewer/conversation headers never promote a peer.
+- The peer app (src/server/peer-app.ts) mounts only /mcp, /peer/* (the durable peer job protocol plus an authenticated 404 for unknown endpoints), and unauthenticated /peer/healthz liveness. No ACP router, OAuth flow, diagnostics, or static Workspace App assets.
+- Public OAuth ingress shares OAuth clients, codes, and token storage with the owner app, while a private request symbol selects independent owner/public per-client and global password-failure budgets. Public authorize traffic cannot consume or clear the owner's lockout budget; per-IP edge throttling remains an additional public abuse bound.
+- Peer MCP sessions are bound to listenerKind "peer" at initialize; cross-port session attach is denied, and credential revocation hot-reloads without restart. Peer tool catalogs are restricted to the granted capability profile (read-only inspect baseline) and enforced again at execution.
+- Peer workspace access is confined to registry-granted roots (subset of KONTROL_ALLOWED_ROOTS), checked before and after canonicalization (worktree opens check the SOURCE root); credential/private-state paths (.env-style files, state dir, ~/.kontrol) are denied by default.
+- M2: peers granted workspace:propose_patch may open managed worktrees for granted source roots and mutate files inside them (write/edit) with MANDATORY checkpoint tracking — the widget-visibility early return and the global allowUntrackedMutation escape never apply to peers. Direct checkout mutation by peers is denied (WorkspaceMutationAuthorityError). Peer worktree ownership is cached in process and persisted in a mode-0600 atomic sidecar (src/peer/workspace-guard.ts); startup restores exact principal bindings and fails closed on corrupt state. Peers may mutate only owned worktrees, granted-source re-check runs at every mutation, and list_managed_worktrees filters to the caller peer's entries. Peer worktrees are capped per peer by KONTROL_PEER_MAX_ACTIVE_SESSIONS on top of the existing managed-worktree limits. staged_file_write remains worker-role-bound and unusable by peers.
+- Only C1 (peer-initiated calls to approved Kontrol tools, now including isolated worktree mutation) is implemented. C3 (verified hosted-Muse-agent activation) is a follow-on milestone and must never be claimed from VM-process evidence. workspace:run_bounded remains reserved. The M3 durable peer job protocol is enforced: every /peer/jobs/* route requires the peer's owner-granted job:claim / job:complete / job:cancel_ack capability (403 peer_capability_denied otherwise); the owner enqueues through the owner-only enqueue_peer_job MCP tool (never in any peer tool profile; handler role-guarded to authenticated clients); a claim sets attempt certainty "unknown" — requeue happens only after an affirmative not-started report, otherwise expiry routes to awaiting_reconciliation (never auto-repeat); duplicate results are idempotent only when the stored receipt compares canonically identical, differing receipts answer 409 conflicting_result; receipts are persisted on the attempt and terminalState maps succeeded→result_received, failed/cancelled→terminal peer_reported_* job states; heartbeat leases are clamped to the job's maxRuntimeMs budget (410 runtime_budget_exceeded when exhausted); a bounded reaper (30s, unref'd) sweeps expired leases and its lifecycle binds to the peer job routes handle on app.locals (closed on shutdown and candidate rollback).
+- M5 WebUI visibility: the owner/reviewer MCP surface exposes peer listener status, enrolled peers, and durable job states via the read-only, secret-free list_peer_status tool (src/peer/peer-tools.ts; never in any peer tool profile, handler additionally denies peer/worker roles); job history uses SQL-limited stable createdAt+jobId cursor pages and returns at most 40 rows per page, with one indexed latest-attempt summary per returned job rather than loading full attempt histories; page counts describe only the returned page. The WebUI is a consumer of durable state, not authority.
+- Peer job creation is bound to an existing submittable work session and its exact workspace session. The destination must be a clean, managed worktree of the granted repository at the job's exact recorded base SHA; a peer supplied manifest does not select a write target. `propose_patch` and `bounded_execution` require a mission with a declared command or runtime probe. Artifact bytes arrive separately over a bounded octet-stream route, are content-hashed into private durable staging, and must exactly match the successful receipt. A durable `peer_job.result_received` outbox event drives idempotent staging into the bound managed worktree, a local baseline-relative snapshot, and the existing `submitForReview` workflow. Result processors serialize staging by workspace session so separate receipts cannot interleave writes or snapshots against the same worktree. Staging uses receipt-content-addressed temporary files and recovers only a matching temporary before baseline comparison, so a crash between fsync and rename is resumable without treating the known temporary as unrelated workspace content. The peer job stores the exact submission, review epoch, snapshot, diff hash, and verification projection. When a mission is bound, the server runs final verification against that exact submission and snapshot; without a mission verification contract, status is `not_configured`, never a verified claim. Authenticated committed feedback for that exact submission finalizes approval/rejection or records changes requested. Mission approval still consumes only qualifying mission evidence; peer receipts are not verification evidence. Hosted Muse activation (C3) remains unclaimed.
+- Legacy peer-job sidecar rows without both workspaceSessionId and workSessionId remain visible for reconciliation but are not claimable.
+
+## Child DOX Index
+
+| Path | Purpose |
+|------|---------|
+| `src/review-thread/` | Persistent reviewer-thread identity, activation authority, and message lifecycle |
+| `src/review-browser/` | Private Chromium profile lifecycle, exact ChatGPT conversation binding, and bounded review packet transport |
+| `src/server/` | Startup recovery, bounded reconciliation, and ordered server shutdown |
+| `src/ui/` | Workspace App hydration, event replay, and reviewer-visible recovery state |
+| `src/mission-ledger.ts` | Durable mission evidence, exact-snapshot approval projection, and external outcome receipts |

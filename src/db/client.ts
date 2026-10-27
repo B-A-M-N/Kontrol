@@ -47,7 +47,7 @@ export function openDatabase(stateDir: string, deploymentContext: DeploymentCont
     Number.isInteger(candidateSchemaVersion) ? candidateSchemaVersion : LATEST_SCHEMA_VERSION,
   );
   try {
-    migrateDatabase(sqlite);
+    migrateDatabase(sqlite, { deployedBuildId: deploymentContext.expectedBuildId });
     markMigrationCompleted(stateDir, deploymentId, LATEST_SCHEMA_VERSION);
   } catch (error) {
     markMigrationFailed(stateDir, deploymentId);

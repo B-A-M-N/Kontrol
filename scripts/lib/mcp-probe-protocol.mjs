@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 
 const CATALOG_WRAPPERS = ["payload", "result", "toolsList", "toolsListResult", "catalog"];
 const VERSION_WRAPPERS = ["payload", "result", "initialize", "initializeResult"];
+export const TOOL_CATALOG_ACK_METHOD = "notifications/experimental/kontrol/tool-catalog-accepted";
+export const TOOL_CATALOG_ACK_CAPABILITY = "kontrol.dev/tool-catalog-ack-v1";
 
 function isObject(value) {
   return typeof value === "object" && value !== null;
@@ -79,6 +81,13 @@ export function extractCatalog(value) {
     version: extractServerInfoVersion(value),
     sourcePath: locations[0].path,
   };
+}
+
+/** Read only an explicit host-registry field. Never substitute received
+ * tools/list for the host's callable registry. */
+export function extractRegisteredCatalog(envelope) {
+  if (!isObject(envelope) || !Object.hasOwn(envelope, "registeredCatalog")) return undefined;
+  return extractCatalog(envelope.registeredCatalog);
 }
 
 function canonicalJson(value) {

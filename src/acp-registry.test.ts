@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createAgentRegistryManager } from "./acp-registry.js";
+import { createAgentRegistryManager, hasConfirmedWorkerAttemptExit } from "./acp-registry.js";
 import { openDatabase } from "./db/client.js";
 
 async function withRegistry<T>(
@@ -20,6 +21,27 @@ async function withRegistry<T>(
     await rm(root, { recursive: true, force: true });
   }
 }
+
+const priorAttemptFinishedAt = "2026-10-12T18:00:00.000Z";
+assert.equal(hasConfirmedWorkerAttemptExit(
+  { finishedAt: priorAttemptFinishedAt },
+  { createdAt: "2026-10-12T17:59:00.000Z" },
+), true, "a finish after the latest dispatch attempt confirms worker exit");
+assert.equal(hasConfirmedWorkerAttemptExit(
+  { finishedAt: priorAttemptFinishedAt },
+  { createdAt: "2026-10-12T18:01:00.000Z" },
+), false, "a stale finish timestamp cannot prove a newer resumed attempt stopped");
+assert.equal(hasConfirmedWorkerAttemptExit(
+  { finishedAt: priorAttemptFinishedAt },
+), false, "missing dispatch metadata cannot prove worker shutdown");
+
+await withRegistry(undefined, async (registry) => {
+  const run = registry.createRun({ agentName: "resume-test", status: "awaiting_review" });
+  registry.updateRun(run.runId, { finishedAt: priorAttemptFinishedAt });
+  registry.updateRun(run.runId, { status: "resuming", finishedAt: undefined });
+  assert.equal(registry.getRun(run.runId)?.finishedAt, undefined,
+    "starting a new attempt clears the previous worker's terminal timestamp");
+});
 
 // ── Single-flight behavior (existing invariant) ─────────────────────────────
 await withRegistry({ enabled: true, allowedHosts: ["hooks.example.test"] }, async (registry) => {
@@ -87,6 +109,46 @@ await withRegistry({ enabled: true, allowedHosts: ["hooks.example.test"] }, asyn
 });
 
 console.log("acp-registry.test.ts: redirect rejection OK");
+
+// ── K-02: dispatch lookup is indexed and survives histories larger than the
+//    default recent-run window and a registry restart. ───────────────────────
+{
+  const root = await mkdtemp(join(tmpdir(), "kontrol-registry-dispatch-key-"));
+  try {
+    const dbA = openDatabase(root);
+    const registryA = createAgentRegistryManager(dbA);
+    const original = registryA.createRun({
+      agentName: "dispatch-agent",
+      agentId: "agent-dispatch",
+      workSessionId: "ws-dispatch-key",
+      inputTask: "Preserve the exact task across registry restart.",
+      status: "dispatch_uncertain",
+    });
+    registryA.beginDispatchAttempt({ key: "disp_original-response-lost", runId: original.runId, agentId: "agent-dispatch", attemptNumber: 1 });
+    registryA.updateDispatchAttempt("disp_original-response-lost", { status: "accepted", remoteRunId: "remote-original" });
+    for (let index = 0; index < 30; index++) {
+      registryA.createRun({ agentName: `newer-${index}`, status: "created" });
+    }
+    assert.equal(registryA.listRuns(undefined, 20).some((run) => run.runId === original.runId), false, "the original run is outside the recent history window");
+    registryA.close();
+    dbA.close();
+
+    const dbB = openDatabase(root);
+    const registryB = createAgentRegistryManager(dbB);
+    const attempt = registryB.getDispatchAttemptByIdempotencyKey("disp_original-response-lost");
+    const recovered = registryB.getRunByDispatchIdempotencyKey("disp_original-response-lost");
+    assert.equal(attempt?.runId, original.runId);
+    assert.equal(attempt?.remoteRunId, "remote-original");
+    assert.equal(recovered?.runId, original.runId);
+    assert.equal(recovered?.workSessionId, "ws-dispatch-key");
+    assert.equal(recovered?.inputTask, "Preserve the exact task across registry restart.");
+    assert.equal(recovered?.inputTaskSha256, createHash("sha256").update(recovered!.inputTask!).digest("hex"));
+    registryB.close();
+    dbB.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}
 
 // ── P0.4b: allowlist removed before retry -> blocked_policy, not delivered ──
 {

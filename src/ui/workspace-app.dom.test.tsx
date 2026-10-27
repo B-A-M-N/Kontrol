@@ -54,6 +54,64 @@ const { mountHeavyPayload } = await import("./heavy-payload.js");
 const { mountReviewPayload } = await import("./review-payload.js");
 const { renderSummaryBadge, unmountPayload } = await import("./payload-mount.js");
 const { getToolDisplay } = await import("./tool-display.js");
+const { renderPeerStatusPanel } = await import("./peer-status-panel.js");
+
+let requestedPeerCursor: string | undefined;
+let reconciledPeerJob: { jobId: string; expectedFailure: string } | undefined;
+let cancelledPeerJob: string | undefined;
+const peerPanel = renderPeerStatusPanel({
+  peer: { enabled: true, bindHost: "127.0.0.1", port: 7412 },
+  peers: [{ id: "peer-alpha", capabilities: ["bounded_file_write"] }],
+  jobs: [{
+    jobId: "job_abc123",
+    peerId: "peer-alpha",
+    workSessionId: "work-123",
+    workspaceSessionId: "workspace-456",
+    repositoryId: "repo-a",
+    status: "awaiting_review",
+    displayHint: "Peer result is staged and awaiting reviewer feedback.",
+    submissionId: "submission-789",
+    reviewEpoch: 2,
+    snapshotKind: "git",
+    snapshotRef: "deadbeef",
+    verificationStatus: "passed",
+    reviewVerdict: "pending",
+  }, {
+    jobId: "job_reconcile",
+    peerId: "peer-alpha",
+    workSessionId: "work-124",
+    workspaceSessionId: "workspace-457",
+    repositoryId: "repo-a",
+    status: "awaiting_reconciliation",
+    displayHint: "requires_owner_reconciliation",
+    resultProcessingFailure: "artifact_temporary_conflict",
+  }, {
+    jobId: "job_cancel",
+    peerId: "peer-alpha",
+    status: "running",
+    displayHint: "executing (VM process)",
+  }],
+  nextCursor: "cursor-next",
+}, {
+  previousAvailable: false,
+  reconcile: (jobId: string, expectedFailure: string) => { reconciledPeerJob = { jobId, expectedFailure }; },
+  cancel: (jobId: string) => { cancelledPeerJob = jobId; },
+  next: (cursor: string) => { requestedPeerCursor = cursor; },
+  previous: () => undefined,
+});
+assert.match(peerPanel.textContent ?? "", /job_abc123/, "peer lifecycle panel identifies the exact job");
+assert.match(peerPanel.textContent ?? "", /awaiting_review/, "peer lifecycle panel shows the current state");
+assert.match(peerPanel.textContent ?? "", /submission-789/, "peer lifecycle panel links the review submission identity");
+assert.match(peerPanel.textContent ?? "", /passed/, "peer lifecycle panel shows verification state");
+assert.match(peerPanel.textContent ?? "", /Retry local result processing/, "reconcilable peer results expose a local recovery action");
+assert.match(peerPanel.textContent ?? "", /Cancel peer job/, "active peer jobs expose owner cancellation");
+(peerPanel.querySelector(".peer-job-reconcile-button") as HTMLButtonElement).click();
+assert.deepEqual(reconciledPeerJob, { jobId: "job_reconcile", expectedFailure: "artifact_temporary_conflict" },
+  "recovery action is fenced to the exact job and observed failure");
+peerPanel.querySelectorAll<HTMLButtonElement>(".peer-job-cancel-button")[1]?.click();
+assert.equal(cancelledPeerJob, "job_cancel", "cancellation action targets the exact peer job");
+(peerPanel.querySelector("button.peer-status-page-button:last-of-type") as HTMLButtonElement).click();
+assert.equal(requestedPeerCursor, "cursor-next", "next page uses the server-issued cursor");
 
 const runningProcessCard: ToolResultCard = {
   tool: "bash",
@@ -206,18 +264,32 @@ assert.equal(reviewContainer.childElementCount, 0, "review renderer unmount is c
 (globalThis as { __KONTROL_UI_TEST_MODE__?: boolean }).__KONTROL_UI_TEST_MODE__ = true;
 let fakeConnectCount = 0;
 let fakeSurfaceFailures = 0;
+let fakeHistoricalResponse: (() => Promise<unknown>) | undefined;
 let fakeEventDelivered = false;
 let fakeReplayDelivered = false;
+const parkedWorkspaceWatchers = new Set<string>();
 let fakeMutationCalls = 0;
 const fakeToolCalls: string[] = [];
+const fakeToolArguments: Array<{ name: string; arguments?: Record<string, unknown> }> = [];
+let peerStatusPageCalls = 0;
+const fakeAppListeners = new Map<string, Set<(params: any) => void>>();
 // Durable pending approvals, keyed by workspace — the fake server is
 // authoritative, matching production: a policy-blocked request is persisted
 // before the approval_required response is returned.
 const fakePendingApprovals = new Map<string, Array<Record<string, unknown>>>();
 const fakeApp = {
-  ontoolresult: undefined as ((result: unknown) => void) | undefined,
-  onhostcontextchanged: undefined as ((context: unknown) => void) | undefined,
   onteardown: undefined as (() => Promise<unknown>) | undefined,
+  addEventListener(event: string, listener: (params: any) => void) {
+    const listeners = fakeAppListeners.get(event) ?? new Set();
+    listeners.add(listener);
+    fakeAppListeners.set(event, listeners);
+  },
+  removeEventListener(event: string, listener: (params: any) => void) {
+    fakeAppListeners.get(event)?.delete(listener);
+  },
+  emit(event: string, params: unknown) {
+    for (const listener of [...(fakeAppListeners.get(event) ?? [])]) listener(params);
+  },
   async connect() {
     fakeConnectCount += 1;
   },
@@ -228,10 +300,30 @@ const fakeApp = {
     const name = String(request.name ?? "");
     const workspaceId = String((request.arguments as { workspaceId?: string } | undefined)?.workspaceId ?? "");
     fakeToolCalls.push(name);
+    fakeToolArguments.push({ name, arguments: request.arguments });
+    if (name === "discover_agents") {
+      return { isError: false, content: [], structuredContent: { agents: [
+        { name: "hermes-agent", role: "agent", alive: true, healthy: true, dispatchable: true, probeStatus: 200, capabilities: [], checkedAt: new Date().toISOString() },
+        { name: "cli-coding-agent", role: "agent", alive: false, healthy: false, dispatchable: false, probeStatus: 0, probeNote: "heartbeat unavailable", capabilities: [], checkedAt: new Date().toISOString() },
+      ] } };
+    }
+    if (name === "submit_to_coding_agent") {
+      return { isError: false, content: [], structuredContent: { runId: "run-ui-agent", workSessionId: "session-ui-agent", workspaceSessionId: "workspace-dom", status: "running", agentName: "hermes-agent" } };
+    }
+    if (name === "list_peer_status") {
+      peerStatusPageCalls += 1;
+      return { isError: false, content: [], structuredContent: {
+        jobs: [{ jobId: "job_second_page", status: "completed", peerId: "peer-alpha", displayHint: "Peer result approved." }],
+        peers: [],
+      } };
+    }
     if (name === "get_workspace_session_surface") {
+      if ((request.arguments as { filter?: string } | undefined)?.filter === "stale_pending_review" && fakeHistoricalResponse) {
+        return await fakeHistoricalResponse();
+      }
       if (fakeSurfaceFailures > 0) {
         fakeSurfaceFailures -= 1;
-        throw new Error("simulated transport loss");
+        throw new Error("simulated socket hang up");
       }
       return { isError: false, content: [], structuredContent: { lastSeq: 5, sessions: [] } };
     }
@@ -240,7 +332,8 @@ const fakeApp = {
       return { isError: false, content: [], structuredContent: { approvals: fakePendingApprovals.get(workspaceId) ?? [] } };
     }
     if (name === "await_workspace_events") {
-      if (workspaceId === "workspace-fresh") {
+      if (workspaceId.startsWith("workspace-") && !parkedWorkspaceWatchers.has(workspaceId)) {
+        parkedWorkspaceWatchers.add(workspaceId);
         return { isError: false, content: [], structuredContent: { events: [], nextSeq: Number((request.arguments as { afterSeq?: number } | undefined)?.afterSeq ?? 0) } };
       }
       if (workspaceId === "workspace-dom" && !fakeReplayDelivered) {
@@ -270,7 +363,7 @@ const fakeApp = {
     }
     if (name === "provide_review_feedback") {
       fakeMutationCalls += 1;
-      throw new Error("simulated mutation transport loss");
+      throw new Error("simulated mutation socket hang up");
     }
     return { isError: false, content: [], structuredContent: {} };
   },
@@ -280,6 +373,31 @@ const { __workspaceAppTest, AmbiguousMutationError } = await import("./workspace
 const session = __workspaceAppTest.ensureWorkSessionView("session-dom", "workspace-dom", "run-dom");
 session.title = "DOM lifecycle";
 session.status = "in_progress";
+session.agentPtys = [{
+  processSessionId: "proc_dom_worker",
+  agentName: "hermes-agent",
+  processGeneration: 2,
+  outputCursor: 91,
+  status: "attached",
+  createdAt: new Date().toISOString(),
+}];
+session.reviewLoop = {
+  routeId: "route-dom",
+  reviewThreadId: "thread-dom",
+  reviewThreadStatus: "active",
+  status: "active",
+  mode: "pinned_conversation",
+  completedReviewRounds: 0,
+  admittedReviewRounds: 1,
+  maxReviewRounds: 3,
+  handoffId: "handoff-dom",
+  handoffStatus: "ready",
+  deliveryTransport: "native_cdp",
+  browserProfileId: "reviewer-profile-dom",
+  conversation: { key: "conversation_dom", url: "https://chatgpt.com/c/conversation_dom", bindingStatus: "bound", bindingRevision: 2, browserGeneration: 5 },
+  deliveryMessage: { messageId: "review-message-dom", kind: "initial_review", status: "presented", updatedAt: new Date().toISOString() },
+  browserAttempt: { attemptId: "browser-attempt-dom", status: "awaiting_feedback", attemptNumber: 1 },
+};
 session.openMessages.set("message-dom", {
   messageId: "message-dom",
   kind: "clarification_request",
@@ -287,6 +405,76 @@ session.openMessages.set("message-dom", {
   body: "Choose the migration path.",
   status: "open",
 });
+__workspaceAppTest.renderWorkSessionView(session);
+assert.match(document.querySelector(".agent-pty-status")?.textContent ?? "", /hermes-agent · generation 2 · attached · cursor 91/,
+  "work-session UI exposes the durable PTY owner, generation, lifecycle, and output cursor");
+assert.match(document.querySelector(".review-conversation")?.textContent ?? "", /conversation_dom · Bound · binding 2 · browser generation 5/,
+  "work-session UI shows the exact bound reviewer conversation and binding generation");
+assert.match(document.querySelector(".review-message")?.textContent ?? "", /Presented · Initial Review · review-message-dom/,
+  "work-session UI shows whether the immutable review message was queued or presented");
+assert.match(document.querySelector(".review-browser-attempt")?.textContent ?? "", /Awaiting Feedback · attempt 1/,
+  "work-session UI distinguishes accepted browser generation from committed reviewer feedback");
+const messageView = session.openMessages.get("message-dom")!;
+Object.assign(messageView, {
+  replyId: "reply-dom",
+  replyStatus: "pending_delivery",
+  replyBody: "Use the staged endpoint.",
+  replyDeliveryAttemptNumber: 3,
+  replyDestinationAgentId: "agent-destination-dom",
+  replyDestinationAgentName: "destination-coder",
+});
+__workspaceAppTest.renderWorkSessionView(session);
+assert.match(document.querySelector(".message-reply-status")?.textContent ?? "", /Reply queued for delivery · destination destination-coder · attempt 3/,
+  "a queued clarification is not rendered as already delivered and identifies its current destination attempt");
+for (const [status, expected] of [
+  ["dispatching", "Sending reply to the agent"],
+  ["reconciliation_required", "Delivery uncertain — reconciliation required"],
+  ["awaiting_acknowledgement", "Delivery accepted — awaiting agent acknowledgement"],
+  ["acknowledged", "Agent acknowledged reply"],
+  ["blocked", "Reply blocked — manual recovery required"],
+  ["cancelled", "Reply delivery cancelled"],
+  ["unknown_state", "Reply status unavailable"],
+] as const) {
+  messageView.replyStatus = status;
+  __workspaceAppTest.renderWorkSessionView(session);
+  assert.ok((document.querySelector(".message-reply-status")?.textContent ?? "").includes(expected),
+    `reply status ${status} has an accurate UI label`);
+}
+const activityBeforeReplyEvents = session.activity.slice();
+__workspaceAppTest.reduceWorkSessionEvent("session-dom", {
+  seq: 1,
+  id: "reply-accepted-dom",
+  type: "agent.message.reply_accepted",
+  sessionId: "session-dom",
+  payload: {
+    messageId: "message-dom", replyId: "reply-dom", status: "pending_delivery",
+    replyBody: "Use the staged endpoint.", deliveryAttemptNumber: 3,
+    destinationAgentId: "agent-destination-dom", destinationAgentName: "destination-coder",
+  },
+  createdAt: new Date().toISOString(),
+});
+assert.equal(messageView.replyStatus, "pending_delivery", "live reply acceptance keeps a resolved question visible until delivery settles");
+assert.equal(session.unresolvedMessageCount, 0, "an accepted reply no longer counts as unanswered input");
+__workspaceAppTest.reduceWorkSessionEvent("session-dom", {
+  seq: 2,
+  id: "reply-acknowledged-dom",
+  type: "agent.message.reply_acknowledged",
+  sessionId: "session-dom",
+  payload: { messageId: "message-dom", replyId: "reply-dom", status: "acknowledged", deliveryAttemptNumber: 3 },
+  createdAt: new Date().toISOString(),
+});
+assert.equal(messageView.replyStatus, "acknowledged", "live acknowledgement updates the durable reply projection");
+assert.notEqual(__workspaceAppTest.sessionCategory(session), "Needs input",
+  "an acknowledged reply does not leave the session switcher marked as awaiting reviewer input");
+session.lastSeq = 0;
+session.activity.splice(0, session.activity.length, ...activityBeforeReplyEvents);
+delete messageView.replyId;
+delete messageView.replyStatus;
+delete messageView.replyBody;
+delete messageView.replyDeliveryAttemptNumber;
+delete messageView.replyDestinationAgentId;
+delete messageView.replyDestinationAgentName;
+messageView.status = "open";
 __workspaceAppTest.renderWorkSessionView(session);
 const replyBox = document.querySelector<HTMLTextAreaElement>(".message-reply");
 assert.ok(replyBox, "open agent messages render a reply control");
@@ -306,32 +494,10 @@ assert.equal(document.activeElement, replyBox, "activity updates preserve review
 assert.equal(document.querySelectorAll(".message-reply").length, 1, "activity updates preserve the message tray DOM");
 assert.match(document.querySelector(".agent-event")?.textContent ?? "", /fragment-100/, "coalesced output updates the existing activity row");
 
-// U01: review-lifecycle header reflects the durable route state.
-{
-  const headerSession = __workspaceAppTest.ensureWorkSessionView("session-loop", "workspace-loop", "run-loop");
-  headerSession.status = "awaiting_review";
-  headerSession.reviewLoop = { routeId: "route-1", status: "active", mode: "isolated_review", completedReviewRounds: 1, maxReviewRounds: 3, handoffStatus: "claimed" };
-  __workspaceAppTest.renderWorkSessionView(headerSession);
-  const header = document.querySelector<HTMLElement>(".review-loop-header");
-  assert.ok(header && !header.hidden, "an active route renders the review-lifecycle header");
-  assert.match(header.textContent ?? "", /Review loop Active/i, "header shows the loop status");
-  assert.match(header.textContent ?? "", /Round 1\/3/, "header shows the current round against the maximum");
-  assert.match(header.textContent ?? "", /Fresh review per submission/i, "header shows the selected routing mode");
 
-  // Paused route is surfaced distinctly.
-  headerSession.reviewLoop = { routeId: "route-1", status: "paused", mode: "isolated_review", completedReviewRounds: 1, maxReviewRounds: 3 };
-  __workspaceAppTest.renderWorkSessionView(headerSession);
-  assert.match(document.querySelector(".review-loop-header")?.textContent ?? "", /Review loop Paused/i, "a paused route shows as paused");
-
-  // Budget-exhausted route warns that human review is required.
-  headerSession.reviewLoop = { routeId: "route-1", status: "active", mode: "isolated_review", completedReviewRounds: 3, maxReviewRounds: 3 };
-  __workspaceAppTest.renderWorkSessionView(headerSession);
-  assert.match(document.querySelector(".review-loop-header")?.textContent ?? "", /Round budget exhausted/i, "an exhausted budget warns");
-
-  // A session without a route hides the header.
-  const plain = __workspaceAppTest.ensureWorkSessionView("session-no-loop", "workspace-loop", "run-none");
-  __workspaceAppTest.renderWorkSessionView(plain);
-}
+// Review handoffs run through MCP in the active WebUI context; the Workspace
+// App does not render a separate reviewer-facing lifecycle surface.
+assert.equal(document.querySelector(".review-loop-header"), null, "review-loop state does not create a reviewer UI surface");
 
 const secondSession = __workspaceAppTest.ensureWorkSessionView("session-dom-2", "workspace-dom", "run-dom-2");
 secondSession.title = "Second session";
@@ -344,7 +510,7 @@ __workspaceAppTest.renderWorkSessionView(session);
 const sessionButtons = [...document.querySelectorAll<HTMLButtonElement>(".session-switcher-item")];
 assert.equal(sessionButtons.length, 3, "multiple recovered sessions render a switcher and historical-review disclosure");
 sessionButtons.find((button) => button.textContent?.includes("Second session"))?.click();
-__workspaceAppTest.renderWorkSessionView(secondSession);
+__workspaceAppTest.renderNow();
 assert.ok(document.querySelector(".session-switcher-item.selected")?.textContent?.includes("Second session"), "session switcher selects another work session");
 
 // Reconnect replay is cursor-safe and direct approvals remain outside the
@@ -393,7 +559,8 @@ assert.equal(session.activity.length, replayActivityCount, "overlapping event re
 // and does not blindly replay an ambiguous mutation.
 await __workspaceAppTest.boot();
 assert.equal(fakeConnectCount, 1, "initial app host connection succeeds");
-fakeApp.ontoolresult?.({
+assert.equal(fakeAppListeners.get("toolresult")?.size, 1, "tool results use one owned additive listener");
+fakeApp.emit("toolresult", {
   _meta: { tool: "open_workspace" },
   structuredContent: { workspaceId: "workspace-reconnect" },
   content: [],
@@ -401,7 +568,7 @@ fakeApp.ontoolresult?.({
 await settle();
 await settle();
 assert.equal(__workspaceAppTest.getConnectionState(), "CONNECTED", "app host reaches connected state");
-fakeApp.ontoolresult?.({
+fakeApp.emit("toolresult", {
   _meta: {},
   structuredContent: { tool: "read", path: "src/example.ts", result: "fallback result" },
   content: [{ type: "text", text: "fallback result" }],
@@ -411,7 +578,31 @@ assert.match(document.querySelector(".tool-title")?.textContent ?? "", /Read Fil
   "structuredContent.tool is accepted when _meta.tool is absent");
 assert.equal(__workspaceAppTest.getLastToolCard()?.payload?.content?.[0]?.text, "fallback result",
   "the Workspace App fills omitted metadata content from the MCP result content");
-fakeApp.ontoolresult?.({
+fakeApp.emit("toolresult", {
+  _meta: { tool: "list_peer_status", card: { tool: "list_peer_status", summary: {
+    jobs: [{ jobId: "job_first_page", status: "awaiting_review", displayHint: "Awaiting feedback." }],
+    peers: [],
+    nextCursor: "cursor-page-2",
+  } } },
+  structuredContent: {},
+  content: [],
+});
+await settle();
+assert.match(document.querySelector(".peer-status-panel")?.textContent ?? "", /job_first_page/,
+  "the peer status tool renders its exact current-page job records");
+(document.querySelector(".peer-status-page-button:last-of-type") as HTMLButtonElement).click();
+await settle();
+assert.equal(peerStatusPageCalls, 1, "the peer status next control requests one page");
+assert.equal(fakeToolArguments.at(-1)?.arguments?.cursor, "cursor-page-2", "the peer status next request carries the server cursor");
+assert.match(document.querySelector(".peer-status-panel")?.textContent ?? "", /job_second_page/,
+  "the next peer status page replaces the visible records");
+assert.equal((document.querySelector(".peer-status-page-button") as HTMLButtonElement).disabled, false,
+  "a previously loaded peer page can be revisited");
+(document.querySelector(".peer-status-page-button") as HTMLButtonElement).click();
+await settle();
+assert.match(document.querySelector(".peer-status-panel")?.textContent ?? "", /job_first_page/,
+  "previous returns to the retained peer status page without another server query");
+fakeApp.emit("toolresult", {
   _meta: { tool: "show_workspace_ui" },
   structuredContent: { tool: "show_workspace_ui", workspaceId: "workspace-ui-open", root: "/workspace", mode: "checkout", instruction: "Workspace UI ready" },
   content: [{ type: "text", text: "Workspace UI ready" }],
@@ -420,10 +611,27 @@ await settle();
 assert.match(document.querySelector(".tool-title")?.textContent ?? "", /Workspace/,
   "show_workspace_ui renders the workspace surface card");
 assert.ok(__workspaceAppTest.getLastSuccessfulHydrationAt(), "workspace state is hydrated after open_workspace");
+const workspaceDomSurfaceCalls = fakeToolArguments.filter((entry) => entry.name === "get_workspace_session_surface"
+  && entry.arguments?.workspaceId === "workspace-dom");
+assert.equal(workspaceDomSurfaceCalls[0]?.arguments?.filter, "all", "hydration fetches the recent session surface first");
+assert.equal(workspaceDomSurfaceCalls[0]?.arguments?.limit, 25, "the first surface page is bounded");
+assert.ok(workspaceDomSurfaceCalls.findIndex((entry) => entry.arguments?.filter === "live") > 0,
+  "live session pagination follows the first rendered page");
 __workspaceAppTest.activateWorkspace("workspace-dom");
-__workspaceAppTest.renderWorkSessionView(__workspaceAppTest.ensureWorkSessionView("session-dom", "workspace-dom", "run-dom"));
+__workspaceAppTest.renderWorkSessionView(secondSession);
 const agentBars = document.querySelectorAll(".agent-submit-bar");
 assert.equal(agentBars.length, 1, "renders create one persistent agent submit bar");
+await settle();
+const agentSelect = document.querySelector<HTMLSelectElement>(".agent-submit-agent");
+assert.ok(agentSelect, "agent task bar exposes live registered-agent selection");
+assert.deepEqual([...agentSelect!.options].map((option) => option.value), ["", "hermes-agent", "cli-coding-agent"], "selector includes registered agents and their live dispatchability state");
+const submitButton = document.querySelector<HTMLButtonElement>(".agent-submit-btn");
+agentSelect!.value = "cli-coding-agent";
+agentSelect!.dispatchEvent(new dom.window.Event("change", { bubbles: true }));
+assert.equal(submitButton?.disabled, true, "an unavailable explicitly selected agent cannot be dispatched");
+assert.match(document.querySelector(".agent-submit-status")?.textContent ?? "", /heartbeat unavailable/, "the unavailable peer's actual discovery reason is shown");
+agentSelect!.value = "hermes-agent";
+agentSelect!.dispatchEvent(new dom.window.Event("change", { bubbles: true }));
 const agentInput = document.querySelector<HTMLTextAreaElement>(".agent-submit-input");
 assert.ok(agentInput, "the agent task editor is multiline");
 agentInput.value = "line one\nline two";
@@ -433,31 +641,44 @@ agentInput.setSelectionRange(3, 7);
 const callsBeforeEditorKeys = fakeToolCalls.length;
 agentInput.dispatchEvent(new dom.window.KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
 assert.equal(fakeToolCalls.length, callsBeforeEditorKeys, "plain Enter inserts a newline without submitting");
-__workspaceAppTest.renderWorkSessionView(__workspaceAppTest.ensureWorkSessionView("session-dom", "workspace-dom", "run-dom"));
+assert.equal(document.activeElement, agentInput, "agent editor is focused before the application rerender");
+__workspaceAppTest.renderNow();
 assert.equal(document.querySelectorAll(".agent-submit-bar").length, 1, "telemetry renders do not duplicate the agent submit bar");
 assert.equal(document.querySelector<HTMLTextAreaElement>(".agent-submit-input")?.value, "line one\nline two", "draft persists across renders");
 assert.equal(document.activeElement, agentInput, "agent editor focus persists across renders");
 assert.equal(document.querySelector<HTMLTextAreaElement>(".agent-submit-input")?.selectionStart, 3, "agent editor selection persists across renders");
-agentInput.dispatchEvent(new dom.window.KeyboardEvent("keydown", { key: "Enter", ctrlKey: true, bubbles: true, cancelable: true }));
-await settle();
-assert.ok(fakeToolCalls.includes("submit_to_coding_agent"), "Ctrl+Enter submits the multiline agent task");
 agentInput.value = "::chatgpt-content-reference::";
 agentInput.dispatchEvent(new dom.window.Event("input", { bubbles: true }));
 assert.equal(document.querySelector<HTMLElement>(".agent-submit-reference-warning")?.hidden, false, "reference-only input is warned without being removed");
 assert.equal(document.querySelector<HTMLTextAreaElement>(".agent-submit-input")?.value, "::chatgpt-content-reference::", "reference-only warning keeps the pasted content visible");
-await settle();
 const replayedActivity = document.querySelectorAll(".agent-event").length;
 await waitForAssertion(
   () => __workspaceAppTest.getWorkSessionView("session-dom")?.lastSeq === 102
     && __workspaceAppTest.getWorkSessionView("session-reconnect")?.lastSeq === 6,
   `workspace hydration replays the committed event and advances the durable event cursor; active=${__workspaceAppTest.getActiveWorkspaceId()} domSeq=${__workspaceAppTest.getWorkSessionView("session-dom")?.lastSeq} reconnectSeq=${__workspaceAppTest.getWorkSessionView("session-reconnect")?.lastSeq} awaitCalls=${fakeToolCalls.filter((name) => name === "await_workspace_events").length}`,
 );
+const eventCatchup = fakeToolArguments.find((entry) => entry.name === "await_workspace_events"
+  && entry.arguments?.workspaceId === "workspace-dom"
+  && entry.arguments?.timeoutMs === 0);
+assert.equal(eventCatchup?.arguments?.timeoutMs, 0, "catch-up is nonblocking; the durable watcher owns the long wait");
+for (const metric of ["surface_first_page_ms", "first_useful_paint_ms", "approval_hydration_ms", "hydration_complete_ms"]) {
+  assert.ok(performance.getEntriesByName(`kontrol.${metric}`).length > 0, `startup timing records ${metric}`);
+}
 assert.equal(__workspaceAppTest.getWorkSessionView("session-dom")?.lastSeq, 102, "snapshot replay materializes a committed event during pagination");
 assert.equal(
   __workspaceAppTest.getWorkSessionView("session-reconnect")?.lastSeq,
   6,
   "event watcher catches up the durable event cursor",
 );
+
+agentInput.value = "line one\nline two";
+agentInput.dispatchEvent(new dom.window.Event("input", { bubbles: true }));
+agentInput.dispatchEvent(new dom.window.KeyboardEvent("keydown", { key: "Enter", ctrlKey: true, bubbles: true, cancelable: true }));
+await settle();
+assert.ok(fakeToolCalls.includes("submit_to_coding_agent"), "Ctrl+Enter submits the multiline agent task");
+const dispatchArgs = fakeToolArguments.slice().reverse().find((entry) => entry.name === "submit_to_coding_agent")?.arguments;
+assert.equal(dispatchArgs?.agentName, "hermes-agent", "the selected registered agent is passed explicitly");
+assert.equal(dispatchArgs?.dispatchIntent, "required_delegate", "an explicitly selected agent cannot fall back to another adapter");
 
 const surfaceCallsBeforeReconnect = fakeToolCalls.filter((name) => name === "get_workspace_session_surface").length;
 fakeSurfaceFailures = 1;
@@ -468,10 +689,67 @@ await __workspaceAppTest.callServerToolChecked({
 await settle();
 assert.ok(fakeConnectCount >= 2, "transport failure creates a fresh app host connection");
 assert.equal(__workspaceAppTest.getConnectionState(), "CONNECTED", "reconnected app host returns to connected state");
+assert.equal(fakeAppListeners.get("toolresult")?.size, 1, "reconnect removes the old listener before adding the replacement listener");
+assert.equal(fakeAppListeners.get("hostcontextchanged")?.size, 1, "host context listener is not duplicated across reconnects");
 assert.ok(
   fakeToolCalls.filter((name) => name === "get_workspace_session_surface").length > surfaceCallsBeforeReconnect + 1,
   "reconnect rehydrates durable workspace state before/alongside the safe retry",
 );
+
+// Historical review loading must page in the server's descending keyset order,
+// keep loading visible while a request is in flight, and stop only at the end.
+{
+  __workspaceAppTest.activateWorkspace("workspace-reconnect");
+  __workspaceAppTest.renderWorkSessionView(__workspaceAppTest.getWorkSessionView("session-reconnect")!);
+  let releaseFirstPage!: (value: unknown) => void;
+  fakeHistoricalResponse = () => new Promise((resolve) => { releaseFirstPage = resolve; });
+  const firstPageLoad = __workspaceAppTest.loadHistoricalPendingReviews();
+  await settle();
+  __workspaceAppTest.renderWorkSessionView(__workspaceAppTest.getWorkSessionView("session-reconnect")!);
+  assert.match(document.querySelector<HTMLButtonElement>(".history-action")?.textContent ?? "", /Loading older pending reviews/,
+    "history load state is visible while the server request is pending");
+  const firstPageSessions = Array.from({ length: 100 }, (_, index) => ({
+    sessionId: `history-${String(199 - index).padStart(3, "0")}`,
+    workspaceSessionId: "workspace-reconnect", status: "awaiting_review", runtimeState: "stale", lifecycle: "stale",
+    submittedBy: "reviewer", updatedAt: "2025-01-01T00:00:00.000Z", lastSeq: 0,
+  }));
+  releaseFirstPage({ isError: false, content: [], structuredContent: { lastSeq: 0, sessions: firstPageSessions } });
+  await firstPageLoad;
+  __workspaceAppTest.renderWorkSessionView(__workspaceAppTest.getWorkSessionView("session-reconnect")!);
+  assert.match(document.querySelector<HTMLButtonElement>(".history-action")?.textContent ?? "", /Load more older pending reviews/,
+    "a full page advertises that older history remains available");
+  fakeHistoricalResponse = async () => ({ isError: false, content: [], structuredContent: { lastSeq: 0, sessions: [{
+    sessionId: "history-099", workspaceSessionId: "workspace-reconnect", status: "awaiting_review", runtimeState: "stale", lifecycle: "stale",
+    submittedBy: "reviewer", updatedAt: "2025-01-01T00:00:00.000Z", lastSeq: 0,
+  }] } });
+  await __workspaceAppTest.loadHistoricalPendingReviews();
+  const historicalCalls = fakeToolArguments.filter((entry) => entry.name === "get_workspace_session_surface" && entry.arguments?.filter === "stale_pending_review");
+  assert.equal(historicalCalls.length, 2, "history is loaded as bounded pages");
+  assert.deepEqual({ afterUpdatedAt: historicalCalls[1]?.arguments?.afterUpdatedAt, afterSessionId: historicalCalls[1]?.arguments?.afterSessionId },
+    { afterUpdatedAt: "2025-01-01T00:00:00.000Z", afterSessionId: "history-100" },
+    "the second history page uses the exact timestamp-plus-session keyset cursor");
+  __workspaceAppTest.renderWorkSessionView(__workspaceAppTest.getWorkSessionView("session-reconnect")!);
+  const historyEnd = document.querySelector<HTMLButtonElement>(".history-action");
+  assert.match(historyEnd?.textContent ?? "", /No older pending reviews/, "the UI visibly marks the end of history");
+  assert.equal(historyEnd?.disabled, true);
+  fakeHistoricalResponse = undefined;
+
+  __workspaceAppTest.activateWorkspace("workspace-history-race");
+  let releaseStalePage!: (value: unknown) => void;
+  fakeHistoricalResponse = () => new Promise((resolve) => { releaseStalePage = resolve; });
+  const stalePageLoad = __workspaceAppTest.loadHistoricalPendingReviews();
+  await settle();
+  assert.equal(__workspaceAppTest.isHistoricalPendingReviewsLoading(), true);
+  __workspaceAppTest.activateWorkspace("workspace-history-next");
+  assert.equal(__workspaceAppTest.isHistoricalPendingReviewsLoading(), false, "switching workspaces releases the prior history loading state");
+  releaseStalePage({ isError: false, content: [], structuredContent: { lastSeq: 0, sessions: [{
+    sessionId: "must-not-leak", workspaceSessionId: "workspace-history-race", status: "awaiting_review", runtimeState: "stale", lifecycle: "stale",
+    submittedBy: "reviewer", updatedAt: "2025-01-01T00:00:00.000Z", lastSeq: 0,
+  }] } });
+  await stalePageLoad;
+  assert.equal(__workspaceAppTest.getWorkSessionView("must-not-leak"), undefined, "late history results from a previous workspace are discarded");
+  fakeHistoricalResponse = undefined;
+}
 
 await assert.rejects(
   __workspaceAppTest.callServerToolChecked({
@@ -699,7 +977,7 @@ assert.equal(__workspaceAppTest.getConnectionState(), "DISCONNECTED", "app teard
   assert.equal(fresh.getActiveWorkspaceId(), null, "a fresh iframe has no active workspace before any result");
   fakeEventDelivered = true; // keep the event watcher parked; no replay needed
 
-  fakeApp.ontoolresult?.({
+fakeApp.emit("toolresult", {
     _meta: {
       tool: "bash",
       card: {
@@ -758,7 +1036,7 @@ assert.equal(__workspaceAppTest.getConnectionState(), "DISCONNECTED", "app teard
 
   // Switching to a second, completely separate workspace must not inherit the
   // first workspace's approval, and back again restores it.
-  fakeApp.ontoolresult?.({
+fakeApp.emit("toolresult", {
     _meta: {
       tool: "bash",
       card: {

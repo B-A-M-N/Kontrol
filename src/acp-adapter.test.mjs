@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { realpath } from "node:fs/promises";
 import { mkdtemp, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -25,6 +26,19 @@ const t = async (name, fn) => {
 };
 
 const tempDirs = [];
+const crushSource = readFileSync("scripts/acp-crush-adapter.mjs", "utf8");
+assert.match(crushSource, /prepareOwnedChild\(agentLaunch\.command/);
+assert.ok(crushSource.indexOf('launchState: "start_requested"') < crushSource.indexOf("await launchGate.start()"),
+  "CRUSH start intent is durable before opening the worker launch gate");
+assert.ok(crushSource.indexOf("await launchGate.start()") < crushSource.indexOf('run.remoteRunId, "running"'),
+  "CRUSH acceptance is persisted only after the agent child has spawned");
+assert.match(crushSource, /validateReadOnlyDispatchRequest\(body, run\.workspaceRoot, ADAPTER_SECRET, agentIdentity\?\.agentId\)/,
+  "CRUSH verifies the server-signed read-only grant before preparing a child");
+assert.match(crushSource, /executionReceipt: run\.readOnlyExecutionReceipt/,
+  "CRUSH persists the correlated read-only receipt with its durable dispatch record");
+assert.match(crushSource, /else if \(workSessionId && \(!run\.workspaceLeaseNonce/,
+  "read-only CRUSH dispatch does not require a mutation lease");
+
 async function makeRealDir() {
   const dir = await mkdtemp(join(tmpdir(), "kontrol-adapter-test-"));
   tempDirs.push(dir);
@@ -47,8 +61,9 @@ try {
   {
     const mod = await loadAdapter({ ACP_AGENT_BIN: "crush" });
     const args = mod.buildAgentArgs("do the thing");
-    await t("crush builds run --debug --quiet argv without prompt leakage", () => {
-      assert.deepEqual(args, ["run", "--debug", "--quiet"]);
+    await t("crush receives a fixed positional instruction without task leakage", () => {
+      assert.deepEqual(args, ["run", "--debug", "--quiet", mod.CRUSH_STDIN_INSTRUCTION]);
+      assert.match(mod.CRUSH_STDIN_INSTRUCTION, /standard input/);
       assert.equal(args.some((arg) => arg.includes("do the thing")), false);
     });
     await t("crush registered agent name is cli-coding-agent", () => {
@@ -73,6 +88,22 @@ try {
       assert.equal(first.event_id, "crush-test:1");
       assert.equal(second.event_id, "crush-test:2");
       assert.equal(first.event_sequence < second.event_sequence, true);
+    });
+    await t("read-only CRUSH drops Kontrol tokens and bridge credentials", () => {
+      const env = mod.workerEnvironment({ readOnlyAudit: true }, {
+        KONTROL_CHILD_ENV_ALLOWLIST: "TEST_TOOLCHAIN_LABEL",
+        KONTROL_READ_ONLY_AGENT_ENV_ALLOWLIST: "OPENAI_API_KEY",
+        OPENAI_API_KEY: "provider-key",
+        TEST_TOOLCHAIN_LABEL: "approved-toolchain",
+        KONTROL_WORKER_TOKEN: "worker-secret",
+        KONTROL_BRIDGE_URL: "http://control-plane.invalid",
+        KONTROL_BRIDGE_ENV: "production",
+        KONTROL_READ_ONLY_EXECUTION: "1",
+      });
+      assert.deepEqual(env, {
+        TEST_TOOLCHAIN_LABEL: "approved-toolchain",
+        OPENAI_API_KEY: "provider-key",
+      });
     });
   }
 

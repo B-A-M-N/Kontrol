@@ -7,7 +7,7 @@
  * an explicit host binding installed at boot.
  */
 import type { App } from "@modelcontextprotocol/ext-apps";
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import type { CallToolResult } from "@modelcontextprotocol/server";
 import {
   isAgentRunCard,
   isReviewTool,
@@ -102,6 +102,8 @@ export interface SessionSurfaceHost {
   connectionState(): string;
   render(): void;
   historicalPendingReviewsLoaded(): boolean;
+  historicalPendingReviewsLoading(): boolean;
+  historicalPendingReviewsCursor(): { updatedAt: string; sessionId: string } | null;
   reviewCardFromSubmission(submission: ReviewSubmissionView, sessionId: string): ToolResultCard;
   getLastToolCard(): ToolResultCard | null;
   getErrorMessage(): string | null;
@@ -174,6 +176,47 @@ export function renderWorkSessionView(view: WorkSessionViewState): void {
   if (view.workSessionId) details.append(element("span", { className: "agent-meta-row", text: `work session: ${view.workSessionId}` }));
   if (view.runId) details.append(element("span", { className: "agent-meta-row", text: `run: ${view.runId}` }));
   if (view.lifecycle) details.append(element("span", { className: "agent-meta-row", text: `lifecycle: ${humanizeStatus(view.lifecycle)}` }));
+  if (view.reviewLoop) {
+    const review = view.reviewLoop;
+    details.append(element("span", {
+      className: "agent-meta-row review-route-status",
+      text: `Review route · ${review.deliveryTransport ?? "MCP App"} · ${humanizeStatus(review.status)} · ${review.completedReviewRounds}/${review.maxReviewRounds} rounds`,
+    }));
+    if (review.browserProfileId) {
+      details.append(element("span", { className: "agent-meta-row review-profile", text: `Reviewer browser profile · ${review.browserProfileId}` }));
+    }
+    if (review.conversation) {
+      const conversation = review.conversation;
+      details.append(element("span", {
+        className: "agent-meta-row review-conversation",
+        text: `Reviewer conversation · ${conversation.key ?? "unbound"} · ${humanizeStatus(conversation.bindingStatus ?? "unbound")}${conversation.bindingRevision ? ` · binding ${conversation.bindingRevision}` : ""}${conversation.browserGeneration ? ` · browser generation ${conversation.browserGeneration}` : ""}`,
+      }));
+    }
+    if (review.deliveryMessage) {
+      details.append(element("span", {
+        className: `agent-meta-row review-message review-delivery-status ${review.browserAttempt?.status ?? review.deliveryMessage.status}`,
+        text: `Review message · ${humanizeStatus(review.deliveryMessage.status)} · ${humanizeStatus(review.deliveryMessage.kind)} · ${review.deliveryMessage.messageId}`,
+      }));
+    }
+    if (review.browserAttempt) {
+      details.append(element("span", {
+        className: `agent-meta-row review-browser-attempt ${review.browserAttempt.status}`,
+        text: `Browser turn · ${humanizeStatus(review.browserAttempt.status)} · attempt ${review.browserAttempt.attemptNumber} · ${review.browserAttempt.attemptId}`,
+      }));
+    }
+    if (review.browserAttempt?.errorCode) {
+      details.append(element("span", {
+        className: "agent-meta-row review-delivery-error",
+        text: `Review delivery needs attention · ${review.browserAttempt.errorCode}`,
+      }));
+    }
+  }
+  for (const pty of view.agentPtys ?? []) {
+    details.append(element("span", {
+      className: `agent-meta-row agent-pty-status ${pty.status}`,
+      text: `PTY · ${pty.agentName} · generation ${pty.processGeneration} · ${pty.status} · cursor ${pty.outputCursor} · ${pty.processSessionId}`,
+    }));
+  }
   dom.meta.append(details);
   const hydrationAt = host.getLastSuccessfulHydrationAt();
   if (hydrationAt) {
@@ -192,7 +235,6 @@ export function renderWorkSessionView(view: WorkSessionViewState): void {
   }
 
   renderSessionSwitcher(dom.sessionSwitcher);
-  renderReviewLoopHeader(dom.reviewLoop, view);
   renderSessionNotice(dom.notice, view);
   // P0.3: a direct approval must be discoverable on every current surface.
   // When the reviewer's focus is inside an input/textarea, focus is preserved
@@ -268,44 +310,6 @@ export function renderWorkSessionView(view: WorkSessionViewState): void {
   maybeAppendAgentBar();
 }
 
-/**
- * U01: review-lifecycle header. Shows the selected routing mode, current round
- * against the configured maximum, and delivery status, so a reviewer can see at
- * a glance whether automation is active and which round is under way.
- */
-function renderReviewLoopHeader(slot: HTMLElement, view: WorkSessionViewState): void {
-  const loop = view.reviewLoop;
-  if (!loop || !loop.routeId) {
-    slot.hidden = true;
-    slot.replaceChildren();
-    return;
-  }
-  slot.hidden = false;
-  const mode = loop.mode === "pinned_conversation" ? "Pinned conversation" : loop.mode === "isolated_review" ? "Fresh review per submission" : (loop.mode ?? "Review");
-  const status = loop.status ?? "active";
-  const roundText = typeof loop.completedReviewRounds === "number" && typeof loop.maxReviewRounds === "number"
-    ? `${loop.completedReviewRounds}/${loop.maxReviewRounds}`
-    : "—";
-  slot.replaceChildren();
-  slot.append(
-    element("span", { className: `review-loop-status ${status}`, text: `Review loop ${humanizeStatus(status)}` }),
-    element("span", { className: "review-loop-mode", text: mode }),
-    element("span", { className: "review-loop-rounds", text: `Round ${roundText}` }),
-  );
-  // Distinguish awaiting reviewer attachment from awaiting reviewer decision —
-  // operationally different blockers.
-  const handoff = loop.handoffStatus;
-  if (handoff) {
-    slot.append(element("span", {
-      className: `review-loop-handoff ${handoff}`,
-      text: humanizeStatus(handoff),
-    }));
-  }
-  if (status === "active" && typeof loop.completedReviewRounds === "number" && typeof loop.maxReviewRounds === "number" && loop.completedReviewRounds >= loop.maxReviewRounds) {
-    slot.append(element("span", { className: "review-loop-warning", text: "Round budget exhausted — human review required." }));
-  }
-}
-
 export function createWorkSessionDom(workSessionId: string): WorkSessionDom {
   const main = element("main", { className: "shell workspace-surface" });
   const sessionSwitcher = element("nav", { className: "session-switcher", ariaLabel: "Work sessions" });
@@ -325,13 +329,12 @@ export function createWorkSessionDom(workSessionId: string): WorkSessionDom {
   const activityHeader = element("div", { className: "agent-activity-header", text: "Agent activity" });
   const activity = element("ul", { className: "agent-activity" });
   const approvals = element("div", { className: "approval-slot" });
-  const reviewLoop = element("div", { className: "review-loop-header", hidden: true });
   const review = element("section", { className: "session-review" });
   const reviewTitle = element("div", { className: "agent-activity-header" });
   const reviewPayload = element("div", { className: "review-payload" });
   const reviewFeedback = element("div", { className: "review-feedback" });
   review.append(reviewTitle, reviewPayload, reviewFeedback);
-  section.append(header, meta, notice, reviewLoop, mission, messages, activityHeader, activity, approvals, review);
+  section.append(header, meta, notice, mission, messages, activityHeader, activity, approvals, review);
   main.append(sessionSwitcher, section);
   return {
     workSessionId,
@@ -347,7 +350,6 @@ export function createWorkSessionDom(workSessionId: string): WorkSessionDom {
     activity,
     activitySeqs: new Set(),
     approvals,
-    reviewLoop,
     review,
     reviewTitle,
     reviewPayload,
@@ -379,13 +381,15 @@ export function renderSessionSwitcher(container: HTMLElement): void {
     button.addEventListener("click", () => selectWorkSession(approvalCenter.workSessionId));
     container.append(button);
   }
-  if (host.getActiveWorkspaceId() && !host.historicalPendingReviewsLoaded()) {
+  if (host.getActiveWorkspaceId()) {
+    const historyLoaded = host.historicalPendingReviewsLoaded();
+    const historyLoading = host.historicalPendingReviewsLoading();
     const history = element("button", {
       className: "session-switcher-item history-action",
       type: "button",
-      text: "Load older pending reviews",
-      ariaLabel: "Load older pending reviews",
-      disabled: !host.uiMutationsAllowed(),
+      text: historyLoading ? "Loading older pending reviews…" : historyLoaded ? "No older pending reviews" : host.historicalPendingReviewsCursor() ? "Load more older pending reviews" : "Load older pending reviews",
+      ariaLabel: historyLoaded ? "No older pending reviews" : "Load older pending reviews",
+      disabled: !host.uiMutationsAllowed() || historyLoading || historyLoaded,
     });
     history.dataset.focusKey = "session-history";
     history.addEventListener("click", () => { void loadHistoricalPendingReviews(); });
@@ -540,6 +544,8 @@ export function renderSessionNotice(container: HTMLElement, view: WorkSessionVie
   }
   container.hidden = false;
   container.className = `session-notice ${notice.tone}`;
+  if (notice.owner) container.dataset.noticeOwner = notice.owner;
+  else delete container.dataset.noticeOwner;
   container.replaceChildren(element("span", { text: notice.message }));
   if (notice.action) {
     const action = element("button", { className: "notice-action", type: "button", text: notice.action.label });
@@ -550,13 +556,14 @@ export function renderSessionNotice(container: HTMLElement, view: WorkSessionVie
 
 export function renderOpenMessages(container: HTMLElement, view: WorkSessionViewState): void {
   const stateKey = [...view.openMessages.values()]
-    .map((message) => `${message.messageId}:${message.status}:${message.title ?? ""}:${message.body ?? ""}:${message.replyStatus ?? "none"}:${host.messageMutationOutcomeUnknown.has(message.messageId) ? "unknown" : "ready"}`)
+    .map((message) => `${message.messageId}:${message.status}:${message.title ?? ""}:${message.body ?? ""}:${message.replyStatus ?? "none"}:${message.replyDestinationAgentId ?? ""}:${message.replyDeliveryAttemptNumber ?? ""}:${host.messageMutationOutcomeUnknown.has(message.messageId) ? "unknown" : "ready"}`)
     .join("|");
   if (container.dataset.stateKey === stateKey) return;
   container.replaceChildren();
   container.dataset.stateKey = stateKey;
   if (view.openMessages.size === 0) return;
-  container.append(element("div", { className: "message-heading", text: "Needs your input" }));
+  const needsInput = [...view.openMessages.values()].some((message) => message.status === "open" && !message.replyId);
+  container.append(element("div", { className: "message-heading", text: needsInput ? "Needs your input" : "Agent messages" }));
   for (const message of view.openMessages.values()) {
     const card = element("article", { className: "agent-message blocker" });
     card.append(
@@ -567,11 +574,29 @@ export function renderOpenMessages(container: HTMLElement, view: WorkSessionView
     );
     if (message.replyId) {
       const replyStatusText = message.replyStatus === "acknowledged"
-        ? "Agent received reply"
+        ? "Agent acknowledged reply"
         : message.replyStatus === "blocked"
-          ? "Cannot deliver automatically"
-          : "Reply saved — awaiting agent acknowledgement";
-      card.append(element("div", { className: "message-reply-status", text: replyStatusText }));
+          ? "Reply blocked — manual recovery required"
+          : message.replyStatus === "reconciliation_required"
+            ? "Delivery uncertain — reconciliation required"
+            : message.replyStatus === "dispatching"
+              ? "Sending reply to the agent"
+              : message.replyStatus === "pending_delivery"
+                ? "Reply queued for delivery"
+                : message.replyStatus === "cancelled"
+                  ? "Reply delivery cancelled"
+                  : message.replyStatus === "delivering" || message.replyStatus === "awaiting_acknowledgement"
+                    ? "Delivery accepted — awaiting agent acknowledgement"
+                    : "Reply status unavailable";
+      const destination = message.replyDestinationAgentName ?? message.replyDestinationAgentId;
+      const deliveryDetails = [
+        destination ? `destination ${destination}` : undefined,
+        message.replyDeliveryAttemptNumber !== undefined ? `attempt ${message.replyDeliveryAttemptNumber}` : undefined,
+      ].filter(Boolean).join(" · ");
+      card.append(element("div", {
+        className: "message-reply-status",
+        text: deliveryDetails ? `${replyStatusText} · ${deliveryDetails}` : replyStatusText,
+      }));
       if (message.replyBody) {
         card.append(element("div", { className: "message-reply-body", text: message.replyBody }));
       }
@@ -598,11 +623,20 @@ export function renderOpenMessages(container: HTMLElement, view: WorkSessionView
       void host.callServerToolChecked({
         name: "resolve_agent_message",
         arguments: { sessionId: view.workSessionId, messageId: message.messageId, reply: reply.value.trim() || undefined, clientMutationId: host.newClientMutationId() },
-      }).then(() => {
-        view.openMessages.delete(message.messageId);
-        view.unresolvedMessageCount = view.openMessages.size;
-        // Persistence is proven; worker acknowledgement is a separate state.
-        view.notice = { tone: "info", message: "Reply saved — awaiting agent acknowledgement." };
+      }).then((result) => {
+        const receipt = getStructuredContent<{ replyId?: string; status?: string }>(result);
+        if (receipt?.replyId) {
+          message.status = "resolved";
+          message.replyId = receipt.replyId;
+          message.replyStatus = receipt.status ?? "pending_delivery";
+          message.replyBody = reply.value.trim();
+          view.openMessages.set(message.messageId, message);
+          view.notice = { tone: "info", message: "Reply queued for delivery; worker acknowledgement is pending." };
+        } else {
+          view.openMessages.delete(message.messageId);
+          view.notice = { tone: "info", message: "Agent request resolved." };
+        }
+        view.unresolvedMessageCount = [...view.openMessages.values()].filter((entry) => entry.status === "open").length;
         host.scheduleRender();
       }).catch((error) => {
         if (error instanceof AmbiguousMutationError) {
@@ -700,6 +734,12 @@ export function renderAgentSubmitBar(): HTMLElement {
   input.setAttribute("aria-label", "Task for coding agent");
   input.dataset.focusKey = "agent-submit-input";
 
+  const agentSelect = document.createElement("select");
+  agentSelect.className = "agent-submit-agent";
+  agentSelect.setAttribute("aria-label", "Registered coding agent");
+  agentSelect.dataset.focusKey = "agent-submit-agent";
+  const refreshAgentsButton = element("button", { className: "agent-submit-refresh", type: "button", text: "Refresh agents" });
+
   const btn = element("button", { className: "agent-submit-btn", type: "button", text: "Send" });
   const status = element("div", { className: "agent-submit-status", role: "status", ariaLive: "polite" });
   const referenceWarning = element("div", { className: "agent-submit-reference-warning", role: "alert", hidden: true });
@@ -707,11 +747,14 @@ export function renderAgentSubmitBar(): HTMLElement {
   let dispatchOutcomeUnknown = false;
   let unresolvedReferencePayload = false;
   let recoveredReferencePayload = false;
+  type DispatchableAgent = { name: string; role: string; alive: boolean; healthy: boolean; dispatchable: boolean; probeNote?: string };
+  let agents: DispatchableAgent[] = [];
+  let agentDiscoveryReady = false;
 
-  const resizeInput = (): void => {
-    input.style.height = "auto";
-    input.style.height = `${Math.max(input.scrollHeight, 48)}px`;
+  const selectedAgent = (): DispatchableAgent | undefined => agents.find((agent) => agent.name === agentSelect.value);
+  const updateSubmitAvailability = (): void => {
     const value = input.value.trim();
+    const agent = selectedAgent();
     unresolvedReferencePayload = !recoveredReferencePayload && containsChatGptReferenceMarker(value);
     const referenceOnly = unresolvedReferencePayload && value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).every((line) => /^::chatgpt-content-reference\b/i.test(line));
     referenceWarning.hidden = !unresolvedReferencePayload;
@@ -720,7 +763,53 @@ export function renderAgentSubmitBar(): HTMLElement {
         ? "This paste contains only ChatGPT reference placeholders; the original message is missing. Paste plain text or the Markdown report instead."
         : "This task contains an unresolved ChatGPT reference placeholder. Paste the original content before sending."
       : "";
-    btn.disabled = dispatchOutcomeUnknown || unresolvedReferencePayload || value.length === 0;
+    btn.disabled = dispatchOutcomeUnknown || unresolvedReferencePayload || value.length === 0 || !agentDiscoveryReady || !agent || !agent.dispatchable;
+    if (agent && !agent.dispatchable) status.textContent = `${agent.name} is unavailable: ${agent.probeNote || "the ACP readiness probe did not pass"}. Refresh agents or select a dispatchable peer.`;
+    else if (agentDiscoveryReady && !agent) status.textContent = agents.length ? "Select a registered coding agent before sending." : "No registered agents are available.";
+    else if (!agentDiscoveryReady) status.textContent = "Checking registered agents…";
+  };
+
+  const refreshAgents = async (): Promise<void> => {
+    agentDiscoveryReady = false;
+    updateSubmitAvailability();
+    const result = await host.callServerToolChecked({ name: "discover_agents", arguments: {} });
+    const discovered = getStructuredContent<{ agents?: DispatchableAgent[] }>(result)?.agents;
+    if (!Array.isArray(discovered)) throw new Error("Agent discovery returned no authoritative registered-agent list.");
+    const priorSelection = agentSelect.value;
+    agents = discovered.filter((agent) => agent.role === "agent");
+    const placeholder = document.createElement("option");
+    placeholder.value = "";
+    placeholder.textContent = "Select a registered agent…";
+    agentSelect.replaceChildren(placeholder);
+    for (const agent of agents) {
+      const suffix = agent.dispatchable ? " · ready" : ` · unavailable: ${agent.probeNote || (!agent.alive ? "heartbeat unavailable" : "ACP readiness failed")}`;
+      const option = document.createElement("option");
+      option.value = agent.name;
+      option.textContent = `${agent.name}${suffix}`;
+      agentSelect.append(option);
+    }
+    if (agents.some((agent) => agent.name === priorSelection)) agentSelect.value = priorSelection;
+    agentDiscoveryReady = true;
+    updateSubmitAvailability();
+  };
+
+  agentSelect.addEventListener("change", updateSubmitAvailability);
+  refreshAgentsButton.addEventListener("click", () => {
+    refreshAgentsButton.disabled = true;
+    void refreshAgents().catch((error) => {
+      status.textContent = `Could not discover registered agents: ${error instanceof Error ? error.message : String(error)}.`;
+    }).finally(() => { refreshAgentsButton.disabled = false; });
+  });
+  void refreshAgents().catch((error) => {
+    agentDiscoveryReady = false;
+    updateSubmitAvailability();
+    status.textContent = `Could not discover registered agents: ${error instanceof Error ? error.message : String(error)}.`;
+  });
+
+  const resizeInput = (): void => {
+    input.style.height = "auto";
+    input.style.height = `${Math.max(input.scrollHeight, 48)}px`;
+    updateSubmitAvailability();
   };
 
   refresh.addEventListener("click", () => {
@@ -770,7 +859,8 @@ export function renderAgentSubmitBar(): HTMLElement {
 
   btn.addEventListener("click", () => {
     const task = input.value.trim();
-    if (!task || !host.getApp()) return;
+    const requestedAgent = agentSelect.value;
+    if (!task || !requestedAgent || !host.getApp()) return;
     if (unresolvedReferencePayload || containsChatGptReferenceMarker(task)) {
       resizeInput();
       status.textContent = "Resolve the ChatGPT reference placeholder before sending this task.";
@@ -780,11 +870,25 @@ export function renderAgentSubmitBar(): HTMLElement {
       status.textContent = "Open a workspace before dispatching a coding agent.";
       return;
     }
-    status.textContent = "Dispatching…";
+    status.textContent = `Rechecking ${requestedAgent} before dispatch…`;
     btn.setAttribute("disabled", "true");
-    void host.callServerToolChecked({
-        name: "submit_to_coding_agent",
-        arguments: { task, workspaceSessionId: host.getActiveWorkspaceId(), clientMutationId: host.newClientMutationId() },
+    void refreshAgents()
+      .then(() => {
+        const current = agents.find((agent) => agent.name === requestedAgent);
+        if (!current || !current.dispatchable) {
+          throw new Error(`${requestedAgent} is unavailable: ${current?.probeNote || "it is no longer registered or dispatchable"}. No alternate agent was selected.`);
+        }
+        status.textContent = `Dispatching to ${requestedAgent}…`;
+        return host.callServerToolChecked({
+          name: "submit_to_coding_agent",
+          arguments: {
+            task,
+            workspaceSessionId: host.getActiveWorkspaceId(),
+            agentName: requestedAgent,
+            dispatchIntent: "required_delegate",
+            clientMutationId: host.newClientMutationId(),
+          },
+        });
       })
       .then((result) => {
         const dispatch = getStructuredContent<{
@@ -794,6 +898,7 @@ export function renderAgentSubmitBar(): HTMLElement {
           workspaceSessionId: string;
           status: string;
           output: string;
+          agentName?: string;
           error?: string;
         }>(result);
 
@@ -815,7 +920,7 @@ export function renderAgentSubmitBar(): HTMLElement {
         host.setErrorMessage(null);
         input.value = "";
         resizeInput();
-        status.textContent = "Agent is working.";
+        status.textContent = `Dispatched to ${dispatch.agentName ?? requestedAgent}; agent is working.`;
         selectWorkSession(dispatch.workSessionId);
       })
       .catch((err) => {
@@ -831,7 +936,7 @@ export function renderAgentSubmitBar(): HTMLElement {
   });
 
   resizeInput();
-  bar.append(input, btn, status, referenceWarning, refresh);
+  bar.append(agentSelect, refreshAgentsButton, input, btn, status, referenceWarning, refresh);
   host.setAgentBar(bar);
   return bar;
 }

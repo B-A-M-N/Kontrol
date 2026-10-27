@@ -114,6 +114,9 @@ export interface AgentMessageView {
   replyId?: string;
   replyStatus?: string;
   replyBody?: string;
+  replyDeliveryAttemptNumber?: number;
+  replyDestinationAgentId?: string;
+  replyDestinationAgentName?: string;
 }
 
 export interface MissionPacketView {
@@ -130,18 +133,6 @@ export interface MissionPacketView {
 
 export type FeedbackState = "idle" | "submitting" | "submitted" | "error" | "outcome_unknown";
 
-export interface ReviewLoopViewState {
-  routeId?: string;
-  status?: string;
-  mode?: string;
-  completedReviewRounds?: number;
-  maxReviewRounds?: number;
-  roundNumber?: number;
-  revision?: number;
-  handoffId?: string;
-  handoffStatus?: string;
-}
-
 export interface WorkSessionViewState {
   workspaceSessionId: string;
   workSessionId: string;
@@ -151,6 +142,47 @@ export interface WorkSessionViewState {
   status: string;
   updatedAt?: string;
   lastHeartbeatAt?: string;
+  agentPtys?: Array<{
+    processSessionId: string;
+    agentName: string;
+    processGeneration: number;
+    outputCursor: number;
+    status: "attached" | "detached" | "exited" | "lost";
+    createdAt: string;
+    finishedAt?: string;
+  }>;
+  reviewLoop?: {
+    routeId: string;
+    reviewThreadId?: string;
+    reviewThreadStatus?: string;
+    status: string;
+    mode: string;
+    completedReviewRounds: number;
+    admittedReviewRounds: number;
+    maxReviewRounds: number;
+    roundNumber?: number;
+    handoffId?: string;
+    handoffStatus?: string;
+    deliveryTransport?: string;
+    browserProfileId?: string;
+    conversation?: {
+      key?: string;
+      url?: string;
+      bindingStatus?: string;
+      bindingRevision?: number;
+      browserGeneration?: number;
+    };
+    deliveryMessage?: { messageId: string; kind: string; status: string; updatedAt: string };
+    browserAttempt?: {
+      attemptId: string;
+      status: string;
+      attemptNumber: number;
+      errorCode?: string;
+      submittedAt?: string;
+      generationStartedAt?: string;
+      generationFinishedAt?: string;
+    };
+  };
   lifecycle?: string;
   runtimeState?: string;
   unresolvedMessageCount: number;
@@ -172,9 +204,10 @@ export interface WorkSessionViewState {
   notice?: {
     tone: "error" | "warning" | "success" | "info";
     message: string;
+    /** Owner boundary for narrowly scoped lifecycle cleanup. */
+    owner?: "workspace-watcher" | "selected-session-transport";
     action?: { label: string; run: () => void };
   };
-  reviewLoop?: ReviewLoopViewState;
   mission?: MissionPacketView;
   missionLoading?: boolean;
   missionError?: string;
@@ -225,7 +258,6 @@ export interface WorkSessionDom {
   activity: HTMLUListElement;
   activitySeqs: Set<number>;
   approvals: HTMLElement;
-  reviewLoop: HTMLElement;
   review: HTMLElement;
   reviewTitle: HTMLElement;
   reviewPayload: HTMLElement;

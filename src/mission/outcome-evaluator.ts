@@ -78,7 +78,14 @@ const OUTCOME_EVIDENCE_RANK = {
 export type OutcomeEvidenceLevel = keyof typeof OUTCOME_EVIDENCE_RANK;
 
 export interface OutcomeObservation {
+  submissionId: string;
+  reviewEpoch: number;
+  snapshotKind: string;
+  snapshotRef: string;
   observerIdentity: string;
+  observerPrincipalId: string;
+  observationSource: string;
+  externalEvidenceSha256: string;
   expectedBehavior: string;
   actualBehavior: string;
   status: string;
@@ -95,22 +102,33 @@ export interface OutcomeObservation {
  */
 export function evaluateOutcomeObservations(
   observations: OutcomeObservation[],
-  context: { submissionId: string; snapshotKind: string; snapshotRef: string },
+  context: { submissionId: string; reviewEpoch: number; snapshotKind: string; snapshotRef: string; expectedBehavior: string },
 ): { satisfied: boolean; reasons: string[] } {
   const reasons: string[] = [];
-  if (!observations.length) {
+  const matching = observations.filter((observation) =>
+    observation.submissionId === context.submissionId
+    && observation.reviewEpoch === context.reviewEpoch
+    && observation.snapshotKind === context.snapshotKind
+    && observation.snapshotRef === context.snapshotRef
+    && observation.expectedBehavior === context.expectedBehavior
+    && observation.observationSource === "firsthand_authenticated_external_reviewer"
+    && Boolean(observation.observerPrincipalId.trim())
+    && /^[a-f0-9]{64}$/.test(observation.externalEvidenceSha256),
+  );
+  if (!matching.length) {
     reasons.push("Mission requires independent outcome evidence; no outcome observations exist for the current submission.");
     return { satisfied: false, reasons };
   }
-  const rejection = observations
-    .filter((o) => o.status === "rejected")
-    .sort((a, b) => b.observedAt.localeCompare(a.observedAt))[0];
-  if (rejection) {
-    reasons.push(`Latest outcome observation from ${rejection.observerIdentity} rejected the expected behavior at ${rejection.observedAt}.`);
+  // Observation timestamps are server-assigned and monotonic within the exact
+  // submission/snapshot/review contract. Only the latest authoritative record
+  // decides the current result; an older rejection cannot override a later
+  // confirmation, and an older confirmation cannot hide a later rejection.
+  const latest = matching.sort((a, b) => b.observedAt.localeCompare(a.observedAt))[0]!;
+  if (latest.status === "rejected") {
+    reasons.push(`Latest outcome observation from ${latest.observerIdentity} rejected the expected behavior at ${latest.observedAt}.`);
     return { satisfied: false, reasons };
   }
-  const confirmations = observations.filter((o) => o.status === "confirmed" && o.observerIdentity.trim());
-  if (!confirmations.length) {
+  if (latest.status !== "confirmed" || !latest.observerIdentity.trim()) {
     reasons.push("Mission requires independent outcome evidence; no qualifying confirmed observation exists for the current submission.");
     return { satisfied: false, reasons };
   }
@@ -126,6 +144,13 @@ export function evaluateMissionOutcome(input: {
   outcomeEvidence?: OutcomeEvidenceLevel;
   currentReport?: OutcomeReport;
   currentSubmissionId?: string;
+  outcomeObservationContext?: {
+    submissionId: string;
+    reviewEpoch: number;
+    snapshotKind: string;
+    snapshotRef: string;
+    expectedBehavior: string;
+  };
   effectiveFindingResolutions?: Record<string, { resolved: boolean; reasons: string[] }>;
   outcomeObservations?: OutcomeObservation[];
 }): { allowed: boolean; reasons: string[] } {
@@ -148,10 +173,12 @@ export function evaluateMissionOutcome(input: {
   // outcome_verified and operationally_stable additionally require a
   // qualifying external outcome observation against the exact submission.
   if (OUTCOME_EVIDENCE_RANK[requiredStrength] >= OUTCOME_EVIDENCE_RANK.outcome_verified) {
-    const outcome = evaluateOutcomeObservations(input.outcomeObservations ?? [], {
+    const outcome = evaluateOutcomeObservations(input.outcomeObservations ?? [], input.outcomeObservationContext ?? {
       submissionId: input.currentSubmissionId ?? "",
+      reviewEpoch: -1,
       snapshotKind: "",
       snapshotRef: "",
+      expectedBehavior: "",
     });
     if (!outcome.satisfied) reasons.push(...outcome.reasons);
   }

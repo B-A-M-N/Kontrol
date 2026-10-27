@@ -35,7 +35,7 @@ export function policyFailureResponse(
   result: { allowed: boolean; approvalRequired?: boolean; approvalId?: string },
   deniedMessage: string,
   context: {
-    tool: "exec_command" | "write_stdin" | "read" | "write" | "edit" | "apply_patch" | "grep" | "glob" | "ls" | "bash" | "git_status" | "git_log" | "git_diff" | "git_show";
+    tool: string;
     workspaceId: string;
     path?: string;
     command?: string;
@@ -112,6 +112,7 @@ export async function enforceToolPolicy(
   paths?: PolicyInvocation["paths"],
   approvalResumeId?: string,
   operationContent?: unknown,
+  scheduledExecutionPolicy?: import("../work-session-action-guard.js").ScheduledExecutionPolicy,
 ): Promise<{ allowed: boolean; approvalRequired?: boolean; approvalId?: string }> {
   if (workSessions && workSessionId) {
     const sessionDecision = authorizeWorkSessionAction(workSessions, {
@@ -119,6 +120,7 @@ export async function enforceToolPolicy(
       tool,
       path: typeof path === "string" ? path : path?.relativePath,
       command,
+      scheduledExecutionPolicy,
     });
     if (!sessionDecision.allowed) return { allowed: false };
   }

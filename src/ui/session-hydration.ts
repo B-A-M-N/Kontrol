@@ -25,15 +25,28 @@ import type {
   WorkSessionViewState,
 } from "./session-view-types.js";
 import {
+  deliverQueuedReviewMessages,
   reduceWorkSessionEvent,
   workspaceEventTargetSessionId,
 } from "./workspace-event-reducer.js";
 import { callServerToolChecked, getStructuredContent } from "./server-tool-call.js";
 
 import type { App } from "@modelcontextprotocol/ext-apps";
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import type { CallToolResult } from "@modelcontextprotocol/server";
 
 export const WORKSPACE_EVENT_WAIT_MS = 18_000;
+
+function recordStartupDuration(name: string, startedAt: number): void {
+  if (typeof performance === "undefined" || typeof performance.measure !== "function") return;
+  const metric = `kontrol.${name}`;
+  performance.clearMeasures(metric);
+  performance.measure(metric, { start: startedAt, end: performance.now() });
+}
+
+async function afterRenderedFrame(): Promise<void> {
+  if (typeof requestAnimationFrame !== "function") return;
+  await new Promise<void>((resolveFrame) => requestAnimationFrame(() => resolveFrame()));
+}
 
 export interface HydrationHost {
   getApp(): App | null;
@@ -53,6 +66,10 @@ export interface HydrationHost {
   setLastSuccessfulHydrationAt(v: string | null): void;
   historicalPendingReviewsLoaded(): boolean;
   setHistoricalPendingReviewsLoaded(v: boolean): void;
+  historicalPendingReviewsCursor(): { updatedAt: string; sessionId: string } | null;
+  setHistoricalPendingReviewsCursor(v: { updatedAt: string; sessionId: string } | null): void;
+  historicalPendingReviewsLoading(): boolean;
+  setHistoricalPendingReviewsLoading(v: boolean): void;
   approvalRecoveryState(): "healthy" | "degraded" | "forbidden" | "disconnected";
   setApprovalRecoveryState(v: "healthy" | "degraded" | "forbidden" | "disconnected"): void;
   approvalAttentionDelivered: Set<string>;
@@ -74,14 +91,76 @@ const unsetHost: HydrationHost = new Proxy({} as HydrationHost, {
 });
 
 let host: HydrationHost = unsetHost;
+let historicalLoadGeneration = 0;
 export function setHydrationHost(next: HydrationHost): void {
   host = next;
+}
+
+export function invalidateHistoricalPendingReviewLoad(): void {
+  historicalLoadGeneration += 1;
+  host.setHistoricalPendingReviewsLoading(false);
+}
+
+/**
+ * Watcher-owned transport health is not durable work-session state. Keeping
+ * it separate lets recovery clear stale transport text without touching an
+ * approval, policy, or worker-error notice.
+ */
+export type WorkspaceWatcherHealth = "healthy" | "reconnecting" | "unavailable";
+
+const WATCHER_NOTICE_OWNER = "workspace-watcher";
+const TRANSPORT_NOTICE_OWNER = "selected-session-transport";
+
+let activeWatcherHealth: WorkspaceWatcherHealth = "healthy";
+
+function removeWatcherOwnedTransportNotices(): void {
+  const root = globalThis.document;
+  if (!root) return;
+  for (const notice of root.querySelectorAll<HTMLElement>(".session-notice[data-notice-owner]")) {
+    if (notice.dataset.noticeOwner === WATCHER_NOTICE_OWNER
+      || notice.dataset.noticeOwner === TRANSPORT_NOTICE_OWNER) {
+      notice.remove();
+    }
+  }
+}
+
+function setWatcherHealth(health: WorkspaceWatcherHealth, errorMessage?: string): void {
+  activeWatcherHealth = health;
+  removeWatcherOwnedTransportNotices();
+  if (health === "healthy") {
+    const selected = host.getSelectedWorkSessionId()
+      ? workSessionViews.get(host.getSelectedWorkSessionId()!)
+      : undefined;
+    if (selected?.notice?.owner === WATCHER_NOTICE_OWNER
+      || selected?.notice?.owner === TRANSPORT_NOTICE_OWNER) {
+      selected.notice = undefined;
+    }
+  } else {
+    const selected = host.getSelectedWorkSessionId()
+      ? workSessionViews.get(host.getSelectedWorkSessionId()!)
+      : undefined;
+    if (selected) {
+      selected.notice = {
+        tone: "warning",
+        message: health === "unavailable"
+          ? `Workspace activity connection unavailable: ${errorMessage ?? "unknown error"}`
+          : `Workspace activity connection interrupted: ${errorMessage ?? "reconnecting"}`,
+        owner: health === "unavailable" ? WATCHER_NOTICE_OWNER : TRANSPORT_NOTICE_OWNER,
+      };
+    }
+  }
+  host.scheduleRender();
+}
+
+export function workspaceWatcherHealth(): WorkspaceWatcherHealth {
+  return activeWatcherHealth;
 }
 
 const snapshotHydrations = new Map<string, Promise<void>>();
 
 export async function rehydrateActiveSessions(): Promise<void> {
   if (!host.getApp()) return;
+  const hydrationStartedAt = performance.now();
   // P0 #2: scoped rehydration. Only rehydrate sessions within the current
   // workspace. Never globally auto-rehydrate before the workspace is known.
   // P0 #1: use server-side snapshot + resume from lastSeq instead of replaying
@@ -91,15 +170,58 @@ export async function rehydrateActiveSessions(): Promise<void> {
 
   try {
     const pagedSessions = new Map<string, WorkspaceSurfaceSession>();
-    // Establish one authoritative watermark before paginating. A later page
-    // must never advance the cursor merely because it was read later; events
-    // committed after this boundary are replayed below by sequence.
+    // Fetch and paint the newest session page first. Its fixed watermark fences
+    // later pages and the event catch-up query so concurrent events remain
+    // replayable while live and pending surfaces hydrate.
     let snapshotWatermark: number | undefined;
     const boundaryResult = await callServerToolChecked({
       name: "get_workspace_session_surface",
-      arguments: { workspaceId, filter: "all", limit: 1 },
+      arguments: { workspaceId, filter: "all", limit: 25 },
     });
-    snapshotWatermark = getStructuredContent<{ lastSeq?: number }>(boundaryResult)?.lastSeq ?? 0;
+    const recentSurface = getStructuredContent<{ lastSeq?: number; sessions?: WorkspaceSurfaceSession[] }>(boundaryResult);
+    snapshotWatermark = recentSurface?.lastSeq ?? 0;
+    for (const session of recentSurface?.sessions ?? []) pagedSessions.set(session.sessionId, session);
+    recordStartupDuration("surface_first_page_ms", hydrationStartedAt);
+    for (const session of recentSurface?.sessions ?? []) {
+      const view = ensureWorkSessionView(session.sessionId, session.workspaceSessionId, session.runId ?? "");
+      view.status = session.status;
+      view.title = session.title;
+      view.submittedBy = session.submittedBy;
+      view.updatedAt = session.updatedAt;
+      view.lastHeartbeatAt = session.lastHeartbeatAt;
+      view.lifecycle = session.lifecycle;
+      view.runtimeState = session.runtimeState;
+      view.unresolvedMessageCount = session.unresolvedMessageCount;
+      view.pendingApprovalCount = session.pendingApprovalCount;
+      view.lastSeq = Math.max(view.lastSeq, session.lastSeq);
+      view.latestFeedback = session.latestFeedback;
+      if (session.latestSubmission) {
+        noteSubmission(view, {
+          submissionId: session.latestSubmission.submissionId,
+          sessionId: session.sessionId,
+          submissionNumber: session.latestSubmission.submissionNumber,
+          reviewEpoch: session.latestSubmission.reviewEpoch,
+          diffSha256: session.latestSubmission.diffSha256,
+          status: session.latestSubmission.status,
+          files: [],
+          patch: "",
+          fileCount: 0,
+          additions: session.latestSubmission.additions,
+          removals: session.latestSubmission.removals,
+        });
+      }
+    }
+    const newestRecent = [...(recentSurface?.sessions ?? [])]
+      .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt))[0];
+    const recentSelection = host.getSelectedWorkSessionId();
+    if (newestRecent && (!recentSelection
+      || workSessionViews.get(recentSelection)?.workspaceSessionId !== workspaceId
+      || isApprovalCenterId(recentSelection))) {
+      host.setSelectedWorkSessionId(newestRecent.sessionId);
+    }
+    host.scheduleRender();
+    await afterRenderedFrame();
+    recordStartupDuration("first_useful_paint_ms", hydrationStartedAt);
     const loadSurface = async (filter: "all" | "pending_review" | "live", pageSize: number, maxPages: number): Promise<void> => {
       let afterUpdatedAt: string | undefined;
       let afterSessionId: string | undefined;
@@ -132,9 +254,10 @@ export async function rehydrateActiveSessions(): Promise<void> {
     // tens of thousands of views; the cap is far above any real concurrent
     // control-plane surface and exposes "older available" via truncation.
     const HYDRATION_MAX_SESSIONS = 500;
-    await loadSurface("live", 50, HYDRATION_MAX_SESSIONS / 50);
-    await loadSurface("pending_review", 50, HYDRATION_MAX_SESSIONS / 50);
-    await loadSurface("all", 25, 1);
+    await Promise.all([
+      loadSurface("live", 50, HYDRATION_MAX_SESSIONS / 50),
+      loadSurface("pending_review", 50, HYDRATION_MAX_SESSIONS / 50),
+    ]);
     if (!host.getApp() || host.getActiveWorkspaceId() !== workspaceId) return;
     const replayWatermark = snapshotWatermark ?? 0;
     let replaySeq = replayWatermark;
@@ -143,7 +266,7 @@ export async function rehydrateActiveSessions(): Promise<void> {
       // during the page walk is returned even when it was not in any page.
       const replayResult = await callServerToolChecked({
         name: "await_workspace_events",
-        arguments: { workspaceId, afterSeq: replayWatermark, timeoutMs: 1_000 },
+        arguments: { workspaceId, afterSeq: replayWatermark, timeoutMs: 0 },
       });
       if (!host.getApp() || host.getActiveWorkspaceId() !== workspaceId) return;
       const replay = getStructuredContent<{ events?: AgentActivityEvent[]; nextSeq?: number }>(replayResult);
@@ -214,6 +337,7 @@ export async function rehydrateActiveSessions(): Promise<void> {
     // resolution whose response event died on the transport (e.g. Approve
     // committed, response lost, callServerToolChecked correctly refusing to
     // re-mutate) must remove the stale local card, not resurrect it.
+    const approvalHydrationStartedAt = performance.now();
     const directApprovals: PendingApprovalRecord[] = [];
     try {
       const approvalResult = await callServerToolChecked({
@@ -244,39 +368,33 @@ export async function rehydrateActiveSessions(): Promise<void> {
           ? "degraded"
           : "disconnected");
     }
+    recordStartupDuration("approval_hydration_ms", approvalHydrationStartedAt);
     if (directApprovals.length > 0) {
       const target = ensureWorkSessionView(approvalCenterId(workspaceId), workspaceId, "");
       for (const approval of directApprovals) mergePendingApproval(target, approval, workspaceId);
     }
-    // Workspace-scoped grants are durable across restart, so they must be
-    // rehydrated beside pending approvals instead of remaining invisible in
-    // the approval center. Work-session grants in this workspace are ALSO
-    // effective authority and belong in the same reviewer surface (grouped
-    // separately by renderPolicyGrants). Work-session grant scopeIds are
-    // work-session ids, so list unfiltered and map them to this workspace
-    // through the hydrated session views.
+    // Workspace-scoped grants and grants from every work session in this
+    // workspace are durable authority. Ask the server for that exact
+    // projection: the initial session surface is intentionally paginated and
+    // cannot be used as an authority filter for older work-session grants.
     const grantCenter = ensureWorkSessionView(approvalCenterId(workspaceId), workspaceId, "");
     try {
-      const [workspaceGrantResult, allWorkSessionGrants] = await Promise.all([
-        callServerToolChecked({
+      const grants: PolicyGrantView[] = [];
+      const seenCursors = new Set<string>();
+      let afterId: string | undefined;
+      do {
+        const grantPageResult = await callServerToolChecked({
           name: "list_policy_grants",
-          arguments: { scope: "workspace", scopeId: workspaceId },
-        }),
-        callServerToolChecked({
-          name: "list_policy_grants",
-          arguments: { scope: "work_session" },
-        }).catch(() => undefined as undefined),
-      ]);
-      const workSessionIdsInWorkspace = new Set(
-        [...workSessionViews.values()]
-          .filter((sessionView) => sessionView.workspaceSessionId === workspaceId)
-          .map((sessionView) => sessionView.workSessionId),
-      );
-      const grants = [
-        ...getStructuredContent<{ grants?: PolicyGrantView[] }>(workspaceGrantResult)?.grants ?? [],
-        ...(allWorkSessionGrants ? getStructuredContent<{ grants?: PolicyGrantView[] }>(allWorkSessionGrants)?.grants ?? [] : [])
-          .filter((grant) => workSessionIdsInWorkspace.has(grant.scopeId)),
-      ];
+          arguments: { workspaceId, limit: 100, ...(afterId ? { afterId } : {}) },
+        });
+        if (!host.getApp() || host.getActiveWorkspaceId() !== workspaceId) return;
+        const page = getStructuredContent<{ grants?: PolicyGrantView[]; nextCursor?: string }>(grantPageResult);
+        grants.push(...page?.grants ?? []);
+        const nextCursor = page?.nextCursor;
+        if (nextCursor && seenCursors.has(nextCursor)) throw new Error("Policy grant pagination returned a repeated cursor.");
+        if (nextCursor) seenCursors.add(nextCursor);
+        afterId = nextCursor;
+      } while (afterId);
       grantCenter.policyGrants.clear();
       for (const grant of grants) {
         if (grant && typeof grant.id === "string" && typeof grant.scopeId === "string") {
@@ -294,6 +412,7 @@ export async function rehydrateActiveSessions(): Promise<void> {
     if (selected && !isApprovalCenterId(selected.workSessionId)) await hydrateWorkSessionSnapshot(selected);
     if (!host.getApp() || host.getActiveWorkspaceId() !== workspaceId) return;
     host.setLastSuccessfulHydrationAt(new Date().toISOString());
+    recordStartupDuration("hydration_complete_ms", hydrationStartedAt);
     host.bumpWorkspaceWatcherGeneration();
     void watchWorkspaceEvents(workspaceId, host.workspaceEventCursor(), host.workspaceWatcherGeneration());
     host.scheduleRender();
@@ -405,6 +524,8 @@ export async function hydrateWorkSessionSnapshot(view: WorkSessionViewState): Pr
       status: string;
       runId?: string;
       lastHeartbeatAt?: string;
+      reviewLoop?: WorkSessionViewState["reviewLoop"];
+      agentPtys?: NonNullable<WorkSessionViewState["agentPtys"]>;
       lastSeq: number;
       recentActivity?: AgentActivityEvent[];
       hasMission: boolean;
@@ -430,8 +551,7 @@ export async function hydrateWorkSessionSnapshot(view: WorkSessionViewState): Pr
         createdAt?: string;
         expiresAt?: string;
       }>;
-      agentMessages?: Array<{ messageId: string; kind: string; author?: string; title?: string; body?: string; status?: string; runId?: string; createdAt?: string; replyId?: string; replyStatus?: string; replyBody?: string }>;
-      reviewLoop?: { routeId?: string; status?: string; mode?: string; completedReviewRounds?: number; maxReviewRounds?: number; roundNumber?: number; handoffId?: string; handoffStatus?: string };
+      agentMessages?: Array<{ messageId: string; kind: string; author?: string; title?: string; body?: string; status?: string; runId?: string; createdAt?: string; replyId?: string; replyStatus?: string; replyBody?: string; replyDeliveryAttemptNumber?: number; replyDestinationAgentId?: string; replyDestinationAgentName?: string }>;
     }>(snapResult);
     if (!snap) return;
 
@@ -440,6 +560,8 @@ export async function hydrateWorkSessionSnapshot(view: WorkSessionViewState): Pr
       view.status = snap.status;
       view.runId = snap.runId ?? view.runId;
       view.lastHeartbeatAt = snap.lastHeartbeatAt;
+      view.agentPtys = snap.agentPtys ?? [];
+      view.reviewLoop = snap.reviewLoop;
       if (snap.recentActivity) {
         view.activity = snap.recentActivity.slice(-200);
       }
@@ -494,13 +616,12 @@ export async function hydrateWorkSessionSnapshot(view: WorkSessionViewState): Pr
         replyId: message.replyId,
         replyStatus: message.replyStatus,
         replyBody: message.replyBody,
+        replyDeliveryAttemptNumber: message.replyDeliveryAttemptNumber,
+        replyDestinationAgentId: message.replyDestinationAgentId,
+        replyDestinationAgentName: message.replyDestinationAgentName,
       });
     }
-    view.unresolvedMessageCount = view.openMessages.size;
-    // Review-loop state is part of the snapshot contract when available.
-    if (snap.reviewLoop) {
-      view.reviewLoop = snap.reviewLoop;
-    }
+    view.unresolvedMessageCount = [...view.openMessages.values()].filter((message) => message.status === "open").length;
     for (const messageId of previousOpenMessageIds) {
       if (!view.openMessages.has(messageId)) host.messageMutationOutcomeUnknown.delete(messageId);
     }
@@ -641,12 +762,17 @@ export async function refreshMission(view: WorkSessionViewState): Promise<void> 
 
 export async function loadHistoricalPendingReviews(): Promise<void> {
   const workspaceId = host.getActiveWorkspaceId();
-  if (!workspaceId || !host.uiMutationsAllowed()) return;
+  if (!workspaceId || !host.uiMutationsAllowed() || host.historicalPendingReviewsLoaded() || host.historicalPendingReviewsLoading()) return;
+  const requestGeneration = ++historicalLoadGeneration;
+  host.setHistoricalPendingReviewsLoading(true);
+  host.render();
   try {
+    const cursor = host.historicalPendingReviewsCursor();
     const result = await callServerToolChecked({
       name: "get_workspace_session_surface",
-      arguments: { workspaceId, filter: "stale_pending_review", limit: 100 },
+      arguments: { workspaceId, filter: "stale_pending_review", limit: 100, ...(cursor ? { afterUpdatedAt: cursor.updatedAt, afterSessionId: cursor.sessionId } : {}) },
     });
+    if (requestGeneration !== historicalLoadGeneration || host.getActiveWorkspaceId() !== workspaceId) return;
     const surface = getStructuredContent<{ sessions?: WorkspaceSurfaceSession[] }>(result)?.sessions ?? [];
     for (const s of surface) {
       const view = ensureWorkSessionView(s.sessionId, s.workspaceSessionId, s.runId ?? "");
@@ -677,17 +803,30 @@ export async function loadHistoricalPendingReviews(): Promise<void> {
         });
       }
     }
-    host.setHistoricalPendingReviewsLoaded(true);
+    const last = surface.at(-1);
+    if (last) host.setHistoricalPendingReviewsCursor({ updatedAt: last.updatedAt, sessionId: last.sessionId });
+    host.setHistoricalPendingReviewsLoaded(surface.length < 100);
     host.setLastSuccessfulHydrationAt(new Date().toISOString());
   } catch (error) {
-    host.setErrorMessage(`Older reviews could not be loaded: ${error instanceof Error ? error.message : String(error)}`);
+    if (requestGeneration === historicalLoadGeneration && host.getActiveWorkspaceId() === workspaceId) {
+      host.setErrorMessage(`Older reviews could not be loaded: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  } finally {
+    if (requestGeneration === historicalLoadGeneration && host.getActiveWorkspaceId() === workspaceId) {
+      host.setHistoricalPendingReviewsLoading(false);
+      host.render();
+    }
   }
-  host.scheduleRender();
 }
 
 
 export async function watchWorkspaceEvents(workspaceId: string, initialSeq: number, generation: number): Promise<void> {
   let cursor = initialSeq;
+  // Recover queued deliveries on a fresh/reconnected reviewer widget even if
+  // its original activation or requeue event predates the current cursor.
+  try { await deliverQueuedReviewMessages(); } catch (error) {
+    host.noteHydrationFailure(`Review message delivery recovery failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
   // P1 #34: bounded exponential backoff with jitter. Resets after any
   // successful response so steady-state polling latency is unaffected.
   let retryDelayMs = 1_000;
@@ -732,16 +871,22 @@ export async function watchWorkspaceEvents(workspaceId: string, initialSeq: numb
       }
       cursor = Math.max(cursor, content.nextSeq);
       host.setWorkspaceEventCursor(cursor);
+      setWatcherHealth("healthy");
       host.scheduleRender();
     } catch (error) {
       if (host.workspaceWatcherGeneration() !== generation) return;
       const selectionNow = host.getSelectedWorkSessionId();
-    const selected = selectionNow ? workSessionViews.get(selectionNow) : undefined;
+      const selected = selectionNow ? workSessionViews.get(selectionNow) : undefined;
       if (selected) {
-        selected.notice = {
-          tone: "warning",
-          message: `Workspace activity connection interrupted: ${error instanceof Error ? error.message : String(error)}`,
-        };
+        setWatcherHealth(
+          error instanceof Error
+            && (/^(ECONN|EHOST|ENET|ETIMEDOUT)/i.test((error as Error & { code?: unknown }).code as string | undefined ?? "")
+              || /reconnect|closed|network|transport/i.test(error.message))
+            ? "reconnecting"
+            : "unavailable",
+          error instanceof Error ? error.message : String(error),
+        );
+        host.scheduleRender();
       }
       host.scheduleRender();
       // P1 #34: exponential backoff with jitter instead of a flat 1s retry.

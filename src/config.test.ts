@@ -13,6 +13,10 @@ const baseEnv = {
 };
 
 assert.equal(loadConfig(baseEnv).widgets, "changes");
+assert.equal(loadConfig(baseEnv).readOnlyExecutionNetworkPolicy, "disabled", "read-only ACP network access stays disabled by default");
+assert.equal(loadConfig({ ...baseEnv, KONTROL_READ_ONLY_NETWORK_POLICY: "host" }).readOnlyExecutionNetworkPolicy, "host",
+  "operators can explicitly enable host networking for scheduled ACP inference");
+assert.throws(() => loadConfig({ ...baseEnv, KONTROL_READ_ONLY_NETWORK_POLICY: "anything" }), /Invalid KONTROL_READ_ONLY_NETWORK_POLICY/);
 assert.equal(loadConfig(baseEnv).workspaceAppSmokeEnabled, false, "diagnostic app tooling stays hidden by default");
 assert.equal(loadConfig({ ...baseEnv, KONTROL_DEV_WORKSPACE_APP_SMOKE: "1" }).workspaceAppSmokeEnabled, true);
 assert.equal(loadConfig({ ...baseEnv, KONTROL_DEV_WORKSPACE_APP_SMOKE: "true" }).workspaceAppSmokeEnabled, false);
@@ -101,6 +105,8 @@ assert.equal(loadConfig(baseEnv).mcpEphemeralSessionIdleMs, 86_400_000);
 assert.equal(loadConfig(baseEnv).mcpReusableSessionIdleMs, 86_400_000);
 assert.equal(loadConfig(baseEnv).mcpSessionReaperIntervalMs, 15_000);
 assert.equal(loadConfig(baseEnv).mcpLogicalContinuityRetentionMs, 259_200_000);
+assert.equal(loadConfig(baseEnv).mcpClientMetricsHistoryLimit, 5_000);
+assert.equal(loadConfig({ ...baseEnv, KONTROL_MCP_CLIENT_METRICS_HISTORY_LIMIT: "256" }).mcpClientMetricsHistoryLimit, 256);
 assert.equal(loadConfig(baseEnv).mcpSessionMaxPerClient, 20);
 assert.equal(loadConfig(baseEnv).mcpSessionSoftCap, 150);
 assert.equal(loadConfig(baseEnv).mcpSessionHardCap, 200);
@@ -109,6 +115,9 @@ assert.equal(loadConfig(baseEnv).mcpAdmissionTimeoutMs, 120_000);
 assert.equal(loadConfig(baseEnv).mcpInteractiveAdmissionTimeoutMs, 8_000);
 assert.equal(loadConfig(baseEnv).mcpMaxQueuePerSession, 16);
 assert.equal(loadConfig(baseEnv).mcpSseHeartbeatMs, 15_000);
+assert.equal(loadConfig(baseEnv).mcpSseMaxStallMs, 30_000);
+assert.equal(loadConfig(baseEnv).mcpShutdownDrainMs, 30_000);
+assert.equal(loadConfig(baseEnv).mcpOperationCancelGraceMs, 5_000);
 assert.equal(loadConfig(baseEnv).mcpExecutionTimeoutMs, 30 * 60_000);
 assert.equal(loadConfig(baseEnv).maintenanceIntervalMs, 5 * 60_000);
 assert.equal(loadConfig(baseEnv).maintenanceBudgetMs, 250);
@@ -132,6 +141,7 @@ assert.equal(loadConfig(baseEnv).policyApprovalTimeoutMs, 24 * 60 * 60_000);
 assert.equal(loadConfig(baseEnv).policyDirectApprovalReattachGraceMs, 5 * 60_000);
 assert.equal(loadConfig({ ...baseEnv, KONTROL_MCP_ADMISSION_TIMEOUT_MS: "4321", KONTROL_MCP_EXECUTION_TIMEOUT_MS: "8765", KONTROL_POLICY_APPROVAL_TIMEOUT_MS: "9999" }).mcpAdmissionTimeoutMs, 4321);
 assert.equal(loadConfig({ ...baseEnv, KONTROL_MCP_INTERACTIVE_ADMISSION_TIMEOUT_MS: "4321", KONTROL_MCP_MAX_QUEUE_PER_SESSION: "9", KONTROL_MCP_SSE_HEARTBEAT_MS: "15001" }).mcpInteractiveAdmissionTimeoutMs, 4321);
+assert.equal(loadConfig({ ...baseEnv, KONTROL_MCP_SSE_MAX_STALL_MS: "4321" }).mcpSseMaxStallMs, 4321);
 assert.equal(loadConfig({ ...baseEnv, KONTROL_MAINTENANCE_INTERVAL_MS: "41", KONTROL_MAINTENANCE_BUDGET_MS: "17", KONTROL_INTEGRITY_INTERVAL_MS: "43", KONTROL_INTEGRITY_DEADLINE_MS: "19" }).maintenanceIntervalMs, 41);
 assert.equal(loadConfig({ ...baseEnv, KONTROL_MAINTENANCE_INTERVAL_MS: "41", KONTROL_MAINTENANCE_BUDGET_MS: "17", KONTROL_INTEGRITY_INTERVAL_MS: "43", KONTROL_INTEGRITY_DEADLINE_MS: "19" }).maintenanceBudgetMs, 17);
 assert.equal(loadConfig({ ...baseEnv, KONTROL_MAINTENANCE_INTERVAL_MS: "41", KONTROL_MAINTENANCE_BUDGET_MS: "17", KONTROL_INTEGRITY_INTERVAL_MS: "43", KONTROL_INTEGRITY_DEADLINE_MS: "19" }).integrityIntervalMs, 43);
@@ -431,6 +441,63 @@ assert.deepEqual(
   ["vendor-custom", "generated-tree"],
 );
 
+// PR-A: ingress profile configuration is parsed only when
+// KONTROL_INGRESS_PROFILES is set; unset stays bit-identical.
+assert.equal(loadConfig(baseEnv).ingress, undefined, "ingress stays undefined when KONTROL_INGRESS_PROFILES is unset");
+
+const ingressServeProfile = {
+  id: "serve-1",
+  kind: "tailscale_serve",
+  audience: "peer",
+  externalOrigin: "https://node.tail-scale.ts.net:8443",
+  target: "peer_listener",
+  enabled: true,
+  managedByKontrol: false,
+  allowedHosts: ["node.tail-scale.ts.net:8443"],
+};
+const ingressEnv = {
+  ...baseEnv,
+  KONTROL_PEER_ENABLED: "1",
+  KONTROL_PEER_PORT: "7677",
+  KONTROL_PEER_CREDENTIAL_FILE: join(emptyConfigDir, "peers.json"),
+  KONTROL_INGRESS_PROFILES: JSON.stringify([ingressServeProfile]),
+};
+writeFileSync(join(emptyConfigDir, "peers.json"), JSON.stringify({
+  version: 1,
+  peers: [{
+    id: "muse",
+    credentialId: "muse-peer",
+    credentialHash: "b".repeat(64),
+    capabilities: ["workspace:inspect"],
+    grantedRoots: [process.cwd()],
+  }],
+}));
+// Peer audience needs the peer listener enabled with credentials; writeFileSync
+// alone is not enough for the file-mode check, so use a permissive fixture.
+try {
+  chmodSync(join(emptyConfigDir, "peers.json"), 0o600);
+} catch {
+  // windows test hosts skip mode tightening
+}
+{
+  const config = loadConfig(ingressEnv);
+  assert.equal(config.ingress?.profiles.length, 1, "valid serve profile parses through");
+  assert.deepEqual(config.ingress?.profiles[0].allowedHosts, ["node.tail-scale.ts.net:8443"]);
+}
+assert.throws(
+  () => loadConfig({
+    ...ingressEnv,
+    KONTROL_INGRESS_PROFILES: JSON.stringify([ingressServeProfile, { ...ingressServeProfile, id: "serve-2" }]),
+  }),
+  /ingress_profiles_invalid/,
+  "duplicate ingress profile ids fail startup",
+);
+assert.throws(
+  () => loadConfig({ ...ingressEnv, KONTROL_INGRESS_PROFILES: "{not json" }),
+  /ingress_profiles_invalid/,
+  "malformed ingress JSON fails startup",
+);
+
 // Low water must not exceed high water.
 assert.throws(
   () => loadConfig({
@@ -440,3 +507,100 @@ assert.throws(
   }),
   /LOW_WATER_BYTES/,
 );
+
+// ---------------------------------------------------------------------------
+// PR-B: public MCP listener config (P0-02) — off by default, fail-fast at load.
+// ---------------------------------------------------------------------------
+assert.equal(
+  loadConfig(baseEnv).publicMcp,
+  undefined,
+  "publicMcp must be undefined unless KONTROL_PUBLIC_MCP_ENABLED is set (zero behavior)",
+);
+assert.equal(
+  loadConfig({ ...baseEnv, KONTROL_PUBLIC_MCP_ENABLED: "0" }).publicMcp,
+  undefined,
+  "any non-1/true value stays disabled",
+);
+assert.throws(
+  () => loadConfig({ ...baseEnv, KONTROL_AUTH_MODE: "tunnel", KONTROL_PUBLIC_MCP_ENABLED: "1" }),
+  /public_mcp_invalid: public listener requires authMode=oauth; the tunnel-mode owner listener is unauthenticated and must never be exposed/,
+  "public listener in tunnel mode fails at load",
+);
+assert.throws(
+  () => loadConfig({ ...baseEnv, KONTROL_PUBLIC_MCP_ENABLED: "1", KONTROL_PUBLIC_MCP_BIND_HOST: "0.0.0.0" }),
+  /public_mcp_invalid/,
+  "wildcard public bind host fails at load",
+);
+assert.throws(
+  () => loadConfig({ ...baseEnv, KONTROL_PUBLIC_MCP_ENABLED: "1", KONTROL_PUBLIC_MCP_BIND_HOST: "::" }),
+  /public_mcp_invalid/,
+  "IPv6 wildcard public bind host fails at load",
+);
+assert.throws(
+  () => loadConfig({ ...baseEnv, KONTROL_PUBLIC_MCP_ENABLED: "1", KONTROL_PUBLIC_MCP_PORT: "70000" }),
+  /public_mcp_invalid/,
+  "out-of-range public port fails at load",
+);
+assert.deepEqual(
+  loadConfig({ ...baseEnv, KONTROL_PUBLIC_MCP_ENABLED: "1" }).publicMcp,
+  { enabled: true, port: 7678, bindHost: "127.0.0.1", edgeOAuthSurfaceMaxPerMinute: 60, edgeMcpMaxPerMinute: 240, edgeAuthorizeMaxAttemptsPerWindow: 20 },
+  "enabled + oauth parses port/bindHost defaults",
+);
+assert.deepEqual(
+  loadConfig({ ...baseEnv, KONTROL_PUBLIC_MCP_ENABLED: "1", KONTROL_PUBLIC_MCP_PORT: "7900", KONTROL_PUBLIC_MCP_BIND_HOST: "127.0.0.2" }).publicMcp,
+  { enabled: true, port: 7900, bindHost: "127.0.0.2", edgeOAuthSurfaceMaxPerMinute: 60, edgeMcpMaxPerMinute: 240, edgeAuthorizeMaxAttemptsPerWindow: 20 },
+  "explicit port/bindHost parse through",
+);
+assert.deepEqual(
+  loadConfig({
+    ...baseEnv,
+    KONTROL_PUBLIC_MCP_ENABLED: "1",
+    KONTROL_PUBLIC_MCP_EDGE_OAUTH_MAX_PER_MINUTE: "90",
+    KONTROL_PUBLIC_MCP_EDGE_MCP_MAX_PER_MINUTE: "500",
+    KONTROL_PUBLIC_MCP_EDGE_AUTHORIZE_ATTEMPTS: "25",
+  }).publicMcp,
+  { enabled: true, port: 7678, bindHost: "127.0.0.1", edgeOAuthSurfaceMaxPerMinute: 90, edgeMcpMaxPerMinute: 500, edgeAuthorizeMaxAttemptsPerWindow: 25 },
+  "edge caps parse through",
+);
+assert.throws(
+  () => loadConfig({ ...baseEnv, KONTROL_PUBLIC_MCP_ENABLED: "1", KONTROL_PUBLIC_MCP_EDGE_AUTHORIZE_ATTEMPTS: "0" }),
+  /public_mcp_invalid/,
+  "non-positive edge cap fails with the stable prefix",
+);
+assert.throws(
+  () => loadConfig({ ...baseEnv, KONTROL_PUBLIC_MCP_ENABLED: "1", KONTROL_PUBLIC_MCP_EDGE_AUTHORIZE_ATTEMPTS: "26" }),
+  /public_mcp_invalid/,
+  "authorize-attempt cap above the provider-ceiling-safe maximum fails with the stable prefix",
+);
+assert.throws(
+  () => loadConfig({ ...baseEnv, KONTROL_PUBLIC_MCP_ENABLED: "1", KONTROL_PUBLIC_MCP_EDGE_MCP_MAX_PER_MINUTE: "abc" }),
+  /public_mcp_invalid/,
+  "non-numeric edge cap fails with the stable prefix",
+);
+
+// P1-3: wildcard bind rejection covers every unspecified-address spelling.
+for (const wildcardHost of ["0.0.0.0", "::", "::0", "0::", "0:0:0:0:0:0:0:0", "::ffff:0.0.0.0", "[::]", "[::0]", "[0:0:0:0:0:0:0:0]", "*",
+  // F2-C: hex mapped-spellings of the IPv4 wildcard.
+  "::ffff:0:0", "::ffff:0000:0000", "0:0:0:0:0:ffff:0:0", "[::ffff:0:0]", "::0.0.0.0"]) {
+  assert.throws(
+    () => loadConfig({ ...baseEnv, KONTROL_PUBLIC_MCP_ENABLED: "1", KONTROL_PUBLIC_MCP_BIND_HOST: wildcardHost }),
+    /public_mcp_invalid.*wildcard bind/i,
+    `unspecified-address spelling ${wildcardHost} must be rejected`,
+  );
+}
+for (const specificHost of ["127.0.0.1", "::1", "localhost", "fe80::1", "[::1]", "127.0.0.2",
+  // F2-C: mapped with a NONZERO embedded tail is a specific address.
+  "::ffff:127.0.0.1"]) {
+  assert.doesNotThrow(
+    () => loadConfig({ ...baseEnv, KONTROL_PUBLIC_MCP_ENABLED: "1", KONTROL_PUBLIC_MCP_BIND_HOST: specificHost }),
+    `specific bind host ${specificHost} must be accepted`,
+  );
+}
+// P2-3: port parse errors carry the stable prefix too.
+for (const badPort of ["0", "abc", "-1"]) {
+  assert.throws(
+    () => loadConfig({ ...baseEnv, KONTROL_PUBLIC_MCP_ENABLED: "1", KONTROL_PUBLIC_MCP_PORT: badPort }),
+    /public_mcp_invalid/,
+    `public port ${badPort} must fail with the public_mcp_invalid prefix`,
+  );
+}

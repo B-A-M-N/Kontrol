@@ -222,9 +222,32 @@ export function reviewOwnerContextId(config: BridgeConfig): string {
   return liveOwnerContextId(config) ?? config.principalId ?? "unknown-owner";
 }
 
+/**
+ * Review-thread authority must be bound to the server-issued MCP transport
+ * session, not an upstream conversation ID. The latter is correlation data
+ * supplied by the host and can be copied by another conversation.
+ */
+export function reviewerThreadContextId(config: BridgeConfig): string | undefined {
+  const identity = liveConnectionIdentity(config);
+  const principalId = identity.principalId?.trim();
+  const mcpSessionId = identity.mcpSessionId?.trim();
+  if (!principalId || !mcpSessionId) return undefined;
+  return `principal:${principalId}|mcp-session:${mcpSessionId}`;
+}
+
+export function reviewClaimContextId(config: BridgeConfig, mode: "isolated_review" | "pinned_conversation"): string | undefined {
+  return mode === "isolated_review" ? reviewerThreadContextId(config) : reviewOwnerContextId(config);
+}
+
 export function liveOwnerContextId(config: BridgeConfig): string | undefined {
   const identity = liveConnectionIdentity(config);
   return mcpOwnerContextId(identity);
+}
+
+/** Durable authenticated principal, distinct from transport/conversation scope. */
+export function livePrincipalId(config: BridgeConfig): string | undefined {
+  return config.connectionContext?.authenticatedPrincipalId?.trim()
+    || config.principalId?.trim();
 }
 
 export async function captureMissionBaseline(
@@ -359,20 +382,41 @@ export function requireWorkerDeliveryBinding(config: BridgeConfig, sessionId: st
 }
 
 export function requireWorkSessionMutation(config: BridgeConfig, sessionId: string) {
+  // Mutations must not inherit the durable-principal read-recovery branch:
+  // result visibility is broader than the authority to resume, approve,
+  // cancel, or otherwise modify a work session.
+  const canMutate = canMutateWorkSession(config, sessionId);
+  if (canMutate) return null;
   const access = requireWorkSessionRead(config, sessionId);
   if (access) return access;
-  const bind = assertWorkerSessionBinding(config, sessionId);
-  if (bind) return bind;
-  if (config.connectionContext && !liveOwnerContextId(config)) {
-    return forbidden(config.principalRole, "missing transport identity");
+  return forbidden(config.principalRole, "work-session mutation");
+}
+
+function canMutateWorkSession(config: BridgeConfig, sessionId: string): boolean {
+  if (config.principalRole === "worker") {
+    if (config.connectionWorkSessionId !== sessionId) return false;
+    const lease = config.workSessions.getWorkspaceLeaseForSession(sessionId);
+    if (lease && lease.leaseNonce !== config.connectionWorkspaceLeaseNonce) return false;
+    return true;
   }
-  return null;
+  const session = config.workSessions.get(sessionId);
+  const owner = liveOwnerContextId(config);
+  if (config.connectionContext || owner) {
+    if (!owner) return false;
+    return !session?.ownerContextId || session.ownerContextId === owner;
+  }
+  return isReviewer(config.principalRole);
 }
 
 export function requireWorkSessionRead(config: BridgeConfig, sessionId: string) {
   if (config.principalRole === "worker" && (config.connectionWorkSessionId === sessionId || !config.connectionWorkSessionId)) return null;
   const session = config.workSessions.get(sessionId);
   const owner = liveOwnerContextId(config);
+  const principal = livePrincipalId(config);
+  // A reconnecting owner has a durable principal but may not have the original
+  // conversation or transport. That identity is enough to read its delegated
+  // job result; it never broadens mutation or cross-conversation access.
+  if (session?.principalId && principal && session.principalId === principal) return null;
   if (session?.ownerContextId && owner && session.ownerContextId !== owner) {
     return forbidden(config.principalRole, "cross-conversation work-session read");
   }
@@ -406,10 +450,14 @@ export async function acquireCheckoutModifyLease(config: BridgeConfig, workspace
     takeover: options.takeover,
   });
   if (lease.acquired) return null;
+  const conflictingLease = config.workSessions.getActiveWorkspaceLease(canonicalRoot);
+  const conflictMessage = conflictingLease?.leaseKind === "peer_job"
+    ? `Workspace is reserved by peer job ${conflictingLease.ownerInstanceId.replace(/^peer-job:/, "")}; wait for result staging or cancel/reconcile that peer job before dispatching another modifying worker.`
+    : `Workspace root is already controlled by work session ${lease.conflictingWorkSessionId}. Use a separate worktree or cancel the existing session before dispatching another modifying worker.`;
   return {
     content: [{
       type: "text" as const,
-      text: `Workspace root is already controlled by work session ${lease.conflictingWorkSessionId}. Use a separate worktree or cancel the existing session before dispatching another modifying worker.`,
+      text: conflictMessage,
     }],
     structuredContent: {
       conflict: {

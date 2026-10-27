@@ -4,6 +4,7 @@
  * closures become an explicit dependency object.
  */
 import { createHash, timingSafeEqual } from "node:crypto";
+import { monitorEventLoopDelay } from "node:perf_hooks";
 import { readFileSync, statSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -16,9 +17,11 @@ import type { McpSessionState, WorkspaceAppResourceMetrics } from "./mcp-session
 import type { McpAdmission } from "./mcp-admission.js";
 import type { ExpiredMcpOperationTracker } from "./mcp-expired-operations.js";
 import type { McpOperationDiagnostics } from "./mcp-operation-diagnostics.js";
+import type { McpQualificationEvidenceJournal } from "./mcp-qualification-evidence.js";
 import type { Request, Response } from "express";
 import { toolListCacheDiagnostics } from "../mcp-tool-list-cache.js";
 import { readMcpToolSurface } from "../mcp/tool-names.js";
+import { readIngressManagementProjection } from "../ingress/ingress-tools.js";
 
 export interface DiagnosticsDeps {
   readonly config: ServerConfig;
@@ -28,9 +31,12 @@ export interface DiagnosticsDeps {
   readonly mcpResourceAdmission: McpAdmission;
   readonly expiredMcpOperations: ExpiredMcpOperationTracker;
   readonly operationDiagnostics: McpOperationDiagnostics;
+  readonly qualificationEvidence: McpQualificationEvidenceJournal;
   readonly sessionLifecycle: McpSessionLifecycle;
   readonly policyWaiters: McpPolicyWaiterRegistry;
   readonly workspaceAppResourceMetrics: WorkspaceAppResourceMetrics;
+  readonly workspaceStateMapTelemetry?: () => Record<string, number>;
+  readonly eventStoreMemoryTelemetry?: () => { available?: boolean; subscribers?: number; subscriberSessions?: number; subscriberWorkspaces?: number; globalSubscribers?: number; telemetryBuffers?: number; };
   readonly mcpConnectionMetrics: {
     unknownSessionRequests: number;
     freshInitializations: number;
@@ -47,6 +53,7 @@ export interface DiagnosticsDeps {
     events: Record<string, number>;
     byGeneration: Record<string, Record<string, number>>;
     byTransport: Record<string, Record<string, number>>;
+    timeline: Array<Record<string, unknown>>;
   };
   readonly logicalContinuity: { size(): number; snapshot(): unknown };
   readonly startupRecovery: Record<string, unknown>;
@@ -55,11 +62,33 @@ export interface DiagnosticsDeps {
   snapshotStoreDiagnostics(): Promise<Record<string, unknown>>;
   degradedAuditSnapshot(): Record<string, unknown>;
   processSessionMetrics(): unknown;
+  scheduledJobMetrics?(): unknown;
   countActiveWorkSessions(): number;
   countPendingReviews(): number;
   countAliveAgents(): number;
   listPendingApprovals(): Array<{ kind: string; origin?: string; approvalId: string; reattachDeadline?: string }>;
   sqlite(): { prepare?: (sql: string) => { get?: () => unknown } } | undefined;
+}
+
+/** Server-owned bounded event-loop sampling state (audit §7). */
+const eventLoopMonitor = monitorEventLoopDelay({ resolution: 10 });
+eventLoopMonitor.enable();
+const diagnosticsProcessStartedAt = performance.now();
+
+function eventLoopTelemetry() {
+  eventLoopMonitor.disable();
+  eventLoopMonitor.enable();
+  const mean = Number.isFinite(eventLoopMonitor.mean) ? eventLoopMonitor.mean / 1_000_000 : undefined;
+  const max = Number.isFinite(eventLoopMonitor.max) ? eventLoopMonitor.max / 1_000_000 : undefined;
+  const p99 = eventLoopMonitor.percentile(99) / 1_000_000;
+  return {
+    resolutionMs: 10,
+    sampleCount: eventLoopMonitor.count,
+    meanMs: mean,
+    maxMs: max,
+    p99Ms: Number.isFinite(p99) ? p99 : undefined,
+    uptimeMs: Math.round(performance.now() - diagnosticsProcessStartedAt),
+  };
 }
 
 export async function handleDiagnostics(deps: DiagnosticsDeps, req: Request, res: Response): Promise<unknown> {
@@ -79,6 +108,33 @@ export async function handleDiagnostics(deps: DiagnosticsDeps, req: Request, res
   const b = Buffer.from(expected);
   if (a.length !== b.length || !timingSafeEqual(a, b)) {
     return res.status(403).json({ ok: false, error: "Forbidden: valid X-Kontrol-Diagnostics credential required" });
+  }
+  const query = req.query as Record<string, unknown>;
+  const includeQualificationEvidence = query.qEvidence === "1";
+  const qualificationFilters: {
+    serverBuildId?: string;
+    captureId?: string;
+    sessionIdSha256?: string;
+    operationId?: string;
+  } = {};
+  if (includeQualificationEvidence) {
+    const filterFields = [
+      ["qBuild", "serverBuildId", 256],
+      ["qCapture", "captureId", 256],
+      ["qSession", "sessionIdSha256", 64],
+      ["qOperation", "operationId", 128],
+    ] as const;
+    for (const [queryKey, filterKey, maxLength] of filterFields) {
+      const raw = query[queryKey];
+      if (raw === undefined) continue;
+      if (typeof raw !== "string" || raw.length === 0 || raw.length > maxLength) {
+        return res.status(400).json({ ok: false, error: `Invalid ${queryKey} qualification evidence filter` });
+      }
+      if (filterKey === "sessionIdSha256" && !/^[a-f0-9]{64}$/.test(raw)) {
+        return res.status(400).json({ ok: false, error: `Invalid ${queryKey} qualification evidence filter` });
+      }
+      qualificationFilters[filterKey] = raw;
+    }
   }
   try {
     const sqlite = deps.sqlite();
@@ -142,6 +198,7 @@ export async function handleDiagnostics(deps: DiagnosticsDeps, req: Request, res
         return undefined;
       }
     })();
+    const workspaceStateMapTelemetry = deps.workspaceStateMapTelemetry?.() ?? { available: false };
     const mcpMetrics = {
       created: sessionLifecycle.metrics.created,
       evicted: sessionLifecycle.metrics.evicted,
@@ -172,8 +229,44 @@ export async function handleDiagnostics(deps: DiagnosticsDeps, req: Request, res
       memoryEstimate: sessionLifecycle.estimateMcpSessionMemoryCost(),
       reuse: sessionLifecycle.mcpSessionReuseMetrics(),
       terminationReasons: sessionLifecycle.mcpSessionTerminationMetrics(),
-      connectionRecovery: { ...deps.mcpConnectionMetrics },
+      connectionRecovery: {
+        ...deps.mcpConnectionMetrics,
+        timeline: deps.mcpConnectionMetrics.timeline.slice(-500),
+      },
       operationDiagnostics: deps.operationDiagnostics.snapshot(),
+      ...(includeQualificationEvidence
+        ? {
+            qualificationEvidence: {
+              source: "sqlite",
+              records: deps.qualificationEvidence.listRecent({ ...qualificationFilters, limit: 500 }),
+              associations: deps.qualificationEvidence.listQualificationAssociations({
+                serverBuildId: qualificationFilters.serverBuildId,
+                captureId: qualificationFilters.captureId,
+                sessionIdSha256: qualificationFilters.sessionIdSha256,
+                limit: 500,
+              }),
+              externalCatalogObservations: qualificationFilters.captureId && qualificationFilters.sessionIdSha256
+                ? deps.qualificationEvidence.listExternalCatalogObservations({
+                    serverBuildId: qualificationFilters.serverBuildId,
+                    captureId: qualificationFilters.captureId,
+                    sessionIdSha256: qualificationFilters.sessionIdSha256,
+                    limit: 10,
+                  })
+                : [],
+            },
+          }
+        : {}),
+      toolCatalogParity: (() => {
+        const sessions = [...mcpSessions.values()];
+        const degraded = sessions.filter((session) => session.toolCatalogHandshake?.status !== "accepted");
+        return {
+          status: sessions.length === 0 ? "unobserved" : degraded.length === 0 ? "matched" : "degraded",
+          required: config.mcpToolCatalogAckRequired === true,
+          activeSessions: sessions.length,
+          matchedSessions: sessions.length - degraded.length,
+          degradedSessions: degraded.length,
+        };
+      })(),
       policy: {
         unusedSessionIdleMs: config.mcpUnusedSessionIdleMs,
         ephemeralSessionIdleMs: config.mcpEphemeralSessionIdleMs,
@@ -210,6 +303,9 @@ export async function handleDiagnostics(deps: DiagnosticsDeps, req: Request, res
           resourceReadCount: state.resourceReadCount,
           activeLongPollCount: state.activeLongPollCount,
           activeSseStreams: state.activeSseStreams,
+          transportAttached: state.transportAttached,
+          standaloneSseEstablished: state.standaloneSseEstablished === true,
+          deliveryGeneration: state.deliveryGeneration ?? 0,
           activePolicyWaiters: state.activePolicyWaiters,
           inFlightRequests: state.inFlightRequests,
           durableWorkerSession: state.durableWorkerSession,
@@ -217,6 +313,14 @@ export async function handleDiagnostics(deps: DiagnosticsDeps, req: Request, res
           lastToolName: state.lastToolName,
           toolSurfaceVersion: state.toolSurfaceVersion,
           toolCatalogHandshake: state.toolCatalogHandshake ? { ...state.toolCatalogHandshake } : undefined,
+          toolCatalogParity: {
+            status: state.toolCatalogHandshake?.status === "accepted"
+              ? "matched"
+              : state.toolCatalogHandshake?.status === "rejected"
+                ? "mismatch"
+                : "unconfirmed",
+            degraded: state.toolCatalogHandshake?.status !== "accepted",
+          },
           catalogRefresh: state.catalogRefresh ? { ...state.catalogRefresh } : undefined,
         })),
       perClient: Object.entries([...mcpSessions.values()].reduce((acc, s) => {
@@ -266,6 +370,7 @@ export async function handleDiagnostics(deps: DiagnosticsDeps, req: Request, res
       pendingReviews,
       activeAcps,
       processSessions: deps.processSessionMetrics(),
+      scheduledJobs: deps.scheduledJobMetrics?.() ?? { available: false },
       totalMcpSessions,
       mcpSessionMetrics: mcpMetrics,
       startupRecovery: deps.startupRecovery,
@@ -274,12 +379,18 @@ export async function handleDiagnostics(deps: DiagnosticsDeps, req: Request, res
       snapshotStore: await deps.snapshotStoreDiagnostics(),
       generation: generationRecord,
       supervisor: supervisorStatus,
+      ingress: await readIngressManagementProjection(config),
       heapUsed: memUsage.heapUsed,
       heapTotal: memUsage.heapTotal,
       rss: memUsage.rss,
       external: memUsage.external,
       uptimeMs: Math.round(performance.now()),
       memoryUsage: memUsage,
+      memoryTelemetry: {
+        eventLoop: eventLoopTelemetry(),
+        workspaceStateMaps: workspaceStateMapTelemetry,
+        eventStore: deps.eventStoreMemoryTelemetry?.() ?? { available: false },
+      },
       pid: process.pid,
     });
   } catch (err) {

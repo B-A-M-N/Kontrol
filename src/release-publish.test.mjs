@@ -56,7 +56,7 @@ function runGit(cwd, ...args) {
 function writeCandidate(root, buildId, gitSha) {
   const candidate = join(root, "releases", buildId);
   for (const entry of ["ui"]) mkdirSync(join(candidate, entry), { recursive: true });
-  for (const entry of ["cli.js", "server.js", "acp-duplex.js", "acp-worker-token.mjs"]) {
+  for (const entry of ["cli.js", "server.js", "acp-duplex.js", "read-only-execution.mjs", "acp-worker-token.mjs"]) {
     writeFileSync(join(candidate, entry), "// candidate stub\n");
   }
   const workspaceAppHtml = "<!doctype html>\n";

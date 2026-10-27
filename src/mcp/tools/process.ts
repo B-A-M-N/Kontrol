@@ -5,7 +5,7 @@
 import * as z from "zod/v4";
 import { brandWorkSessionId, brandWorkspaceId } from "../../branded.js";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer } from "@modelcontextprotocol/server";
 import type { ServerConfig } from "../../config.js";
 import type { PolicyEngine } from "../../policy.js";
 import type { PolicyEnforcer } from "../../policy-enforcement.js";
@@ -24,6 +24,7 @@ import {
 } from "../process-tool-response.js";
 import { processSessionOwnerId } from "../connection-context.js";
 import type { ConnectionContext } from "../connection-context.js";
+import { createAgentPtyReviewCredential } from "../../agent-pty-review-credential.js";
 
 export function registerCodexProcessTools(
   server: McpServer,
@@ -35,7 +36,10 @@ export function registerCodexProcessTools(
   policyEngine?: PolicyEngine,
   connectionContext?: ConnectionContext,
   prepareForMutation?: (workspaceId: string) => Promise<void>,
+  scheduledExecutionPolicyFor?: (workSessionId: string) => import("../../work-session-action-guard.js").ScheduledExecutionPolicy | undefined,
 ): void {
+  const scheduledExecutionPolicy = (workSessionId: string | undefined) =>
+    workSessionId && scheduledExecutionPolicyFor ? scheduledExecutionPolicyFor(workSessionId) : undefined;
   registerAppTool(
     server,
     "exec_command",
@@ -52,6 +56,7 @@ export function registerCodexProcessTools(
           .boolean()
           .optional()
           .describe("Allocate a pseudo-terminal for interactive commands. Defaults to false."),
+        agentPty: z.boolean().optional().describe("Bind this interactive PTY to the authenticated worker run for durable observation after reconnect or restart. Requires an authenticated worker connection and tty=true."),
         columns: z.number().int().min(1).max(1_000).optional().describe("Initial PTY width. Defaults to 80."),
         rows: z.number().int().min(1).max(1_000).optional().describe("Initial PTY height. Defaults to 24."),
         workingDirectory: z
@@ -77,13 +82,21 @@ export function registerCodexProcessTools(
       ...toolWidgetDescriptorMeta(config, "shell"),
       annotations: SHELL_TOOL_ANNOTATIONS,
     },
-    async ({ workspaceId, cmd, approvalResumeId, clientMutationId, tty, columns, rows, workingDirectory, yieldTimeMs, maxOutputTokens }) => {
+    async ({ workspaceId, cmd, approvalResumeId, clientMutationId, tty, agentPty, columns, rows, workingDirectory, yieldTimeMs, maxOutputTokens }) => {
       const startedAt = performance.now();
       const blocked = await runMutationBarrier(prepareForMutation, workspaceId, "exec_command");
       if (blocked) return blocked;
       const workspace = workspaces.getWorkspace(workspaceId);
       const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
       if (bindingErr) return bindingErr;
+      if (agentPty && (connectionContext?.authenticatedRole !== "worker" || !tty
+        || !connectionContext.workSessionId || !connectionContext.workspaceSessionId
+        || !connectionContext.runId || !connectionContext.authenticatedPrincipalId || !config.acpAgentSecret)) {
+        return {
+          content: [{ type: "text" as const, text: "agentPty requires tty=true and a signed worker connection with a bound work session, run, workspace session, principal, and worker signing key." }],
+          isError: true,
+        };
+      }
       const cwd = workspaces.resolveWorkingDirectory(workspace, workingDirectory);
       const policyPath = canonicalPolicyPath(workspace.root, workingDirectory, cwd);
 
@@ -102,7 +115,8 @@ export function registerCodexProcessTools(
           cmd,
           undefined,
           approvalResumeId,
-          { cmd, workingDirectory, tty, columns, rows, yieldTimeMs, maxOutputTokens, clientMutationId },
+          { cmd, workingDirectory, tty, agentPty, columns, rows, yieldTimeMs, maxOutputTokens, clientMutationId },
+          scheduledExecutionPolicy(connectionContext?.workSessionId),
         );
         if (!approved.allowed) {
           return policyFailureResponse(approved, `Tool "exec_command" denied by policy. Command: ${cmd}`, {
@@ -119,6 +133,22 @@ export function registerCodexProcessTools(
           workspaceId,
           ownerId: processSessionOwnerId(connectionContext),
           workSessionId: connectionContext?.workSessionId,
+          principalId: connectionContext?.authenticatedPrincipalId,
+          ...(agentPty ? {
+            agentPtyBinding: {
+              workspaceSessionId: connectionContext!.workspaceSessionId!,
+              runId: connectionContext!.runId!,
+              ownerPrincipalId: connectionContext!.authenticatedPrincipalId!,
+              createReviewCredential: (binding) => createAgentPtyReviewCredential({
+                stateDir: config.stateDir,
+                host: config.host,
+                port: config.port,
+                secret: config.acpAgentSecret!,
+                binding,
+                workspaceLeaseNonce: connectionContext!.workspaceLeaseNonce,
+              }),
+            },
+          } : {}),
           command: cmd,
           cwd,
           tty,
@@ -218,6 +248,7 @@ export function registerCodexProcessTools(
           undefined,
           approvalResumeId,
           { sessionId, chars, columns, rows, yieldTimeMs, maxOutputTokens },
+          scheduledExecutionPolicy(connectionContext?.workSessionId),
         );
         if (!approved.allowed) {
           return policyFailureResponse(approved, `Tool "write_stdin" denied by policy: cannot send input to a gated process.`, {
@@ -281,10 +312,12 @@ export function registerProcessPollingTool(
         "Retrieve output and completion state for a process returned by bash. This tool never writes process input "
         + "and never consumes output: pass afterCursor (the outputCursor from your previous poll) to read only new "
         + "output; a retried identical poll at the same cursor returns the same output until retention evicts it "
-        + "(oldestAvailableCursor reports eviction). Omitting afterCursor advances the session's shared read pointer.",
+        + "(oldestAvailableCursor reports eviction). Omitting afterCursor advances the session's shared read pointer. "
+        + "After a transport reconnect, provide the recoveryCapability returned by bash to reattach for output polling only.",
       inputSchema: {
         workspaceId: z.string().describe("Workspace identifier used to start the process."),
         sessionId: z.string().describe("Opaque process session identifier returned by bash."),
+        recoveryCapability: z.string().min(40).max(200).optional().describe("Expiring output-only capability returned by bash for same-principal transport reattachment."),
         afterCursor: z
           .number()
           .int()
@@ -304,7 +337,7 @@ export function registerProcessPollingTool(
       // is a read-once operation, not an idempotent one.
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     },
-    async ({ workspaceId, sessionId, afterCursor, yieldTimeMs, maxOutputTokens }) => {
+    async ({ workspaceId, sessionId, recoveryCapability, afterCursor, yieldTimeMs, maxOutputTokens }) => {
       workspaces.getWorkspace(workspaceId);
       const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
       if (bindingErr) return bindingErr;
@@ -313,6 +346,8 @@ export function registerProcessPollingTool(
         sessionId,
         ownerId: processSessionOwnerId(connectionContext),
         workSessionId: connectionContext?.workSessionId,
+        principalId: connectionContext?.authenticatedPrincipalId,
+        recoveryCapability,
         afterCursor,
         yieldTimeMs,
         maxOutputTokens,

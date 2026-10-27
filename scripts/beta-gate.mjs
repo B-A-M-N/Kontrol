@@ -100,6 +100,18 @@ function runPhase(id, command, args, environment = {}) {
   return phase.status === "passed";
 }
 
+function runEvidencePhase(id, command, args, evidence) {
+  const phaseIndex = receipt.phases.length;
+  const passed = runPhase(id, command, args);
+  const phase = receipt.phases[phaseIndex];
+  phase.testName = evidence.testName;
+  phase.evidenceScope = evidence.scope;
+  phase.assertions = Object.fromEntries(evidence.assertions.map((assertion) => [assertion, passed]));
+  if (evidence.excludes?.length) phase.excludes = evidence.excludes;
+  persist();
+  return passed;
+}
+
 const dirtyPaths = gitStatus();
 const cleanPass = dirtyPaths.length === 0;
 receipt.source = {
@@ -121,9 +133,53 @@ receipt.phases.push(cleanPhase);
 persist();
 console.log(`[beta-gate] ${cleanPhase.status.toUpperCase()} clean-checkout${dirtyPaths.length ? ` (${dirtyPaths.length} changed paths)` : ""}`);
 
-// Run the complete local suite first. Later phases deliberately remain
-// independent so the receipt identifies whether a failure is test, packaging,
-// candidate boot, or recovery behavior.
+// Keep scheduled control-plane lifecycle evidence separate from proof of
+// bundled-adapter confinement: the unattended fixture's ACP endpoint writes
+// its artifact directly and cannot qualify the adapter security boundary.
+runEvidencePhase(
+  "scheduled-control-plane-lifecycle",
+  process.execPath,
+  ["--import", "tsx", "scripts/scheduled-job-unattended-e2e.mjs"],
+  {
+    testName: "scripts/scheduled-job-unattended-e2e.mjs",
+    scope: "public scheduling, production scheduler dispatch, work-session correlation, durable result, restart recovery, and terminal convergence",
+    assertions: ["public_schedule", "production_scheduler_dispatch", "work_session_correlation", "durable_result", "restart_recovery", "terminal_convergence"],
+    excludes: ["bundled_adapter_confinement", "read_only_sandbox_security"],
+  },
+);
+runEvidencePhase(
+  "scheduled-bundled-adapter-confinement",
+  process.execPath,
+  ["--import", "tsx", "scripts/scheduled-readonly-adapters-e2e.mjs"],
+  {
+    testName: "scripts/scheduled-readonly-adapters-e2e.mjs",
+    scope: "scheduled execution through the bundled CRUSH and Hermes adapters with real Bubblewrap confinement",
+    assertions: ["bundled_crush_adapter", "bundled_hermes_adapter", "real_bubblewrap_invoked", "workspace_mutations_denied", "symlink_escape_denied", "helper_process_confined", "read_only_execution_receipt_persisted"],
+  },
+);
+runEvidencePhase(
+  "bundled-adapter-grant-and-receipt",
+  process.execPath,
+  ["src/acp-readonly-adapters.integration.test.mjs"],
+  {
+    testName: "src/acp-readonly-adapters.integration.test.mjs",
+    scope: "adapter-level signed grant enforcement, confined execution, and controller receipt acknowledgement for CRUSH and Hermes",
+    assertions: ["forged_grant_rejected_before_launch", "signed_network_policy_enforced", "mutation_denied", "durable_receipt_acknowledged", "receipt_lookup_preserves_execution_identity"],
+  },
+);
+runEvidencePhase(
+  "bundled-adapter-crash-recovery",
+  process.execPath,
+  ["scripts/lib/adapter-launch-recovery.test.mjs"],
+  {
+    testName: "scripts/lib/adapter-launch-recovery.test.mjs",
+    scope: "durable adapter child ownership and launch-gate crash recovery",
+    assertions: ["pre_wrapper_crash_reconciled", "pre_ownership_crash_reconciled", "start_intent_crash_fails_closed", "spawned_child_terminated", "response_loss_does_not_duplicate_execution"],
+  },
+);
+
+// Later phases remain independent so the receipt identifies whether a failure
+// is runtime, packaging, candidate boot, or recovery behavior.
 runPhase("runtime-suite", "npm", ["run", "test:runtime"]);
 runPhase("package-install", "npm", ["run", "test:package"]);
 runPhase("installed-product-uat", "npm", ["run", "uat:release"]);

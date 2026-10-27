@@ -12,6 +12,7 @@ export const toolNames = {
   showWorkspaceUi: "show_workspace_ui",
   read: "read",
   write: "write",
+  stagedWrite: "staged_file_write",
   edit: "edit",
   grep: "grep",
   glob: "glob",
@@ -23,6 +24,8 @@ export const toolNames = {
   shell: "bash",
   pollProcess: "poll_process",
   writeStdin: "write_stdin",
+  enqueuePeerJob: "enqueue_peer_job",
+  cancelPeerJob: "cancel_peer_job",
 } as const;
 
 /**

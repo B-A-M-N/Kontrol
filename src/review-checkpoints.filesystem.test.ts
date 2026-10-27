@@ -16,7 +16,9 @@ symlinkSync(join(outside, "secret.txt"), join(root, "external-link"));
 const manager = createReviewCheckpointManager({ snapshotStoreRoot: storeRoot });
 const workspaceId = "plain-workspace";
 const info = await manager.getSnapshotInfo({ workspaceId, root });
-assert.deepEqual(info, { kind: "filesystem", available: true, diagnostic: undefined });
+// The manager also reports a checkpoint error slot, so the expected shape
+// carries it explicitly: the slot must be present and empty here.
+assert.deepEqual(info, { kind: "filesystem", available: true, diagnostic: undefined, checkpointError: undefined });
 const baseline = await manager.reviewChanges({ workspaceId, root, since: "workspace_open", markReviewed: false });
 assert.equal(baseline.snapshotKind, "filesystem");
 assert.match(baseline.snapshotRef, /^fs:sha256:[a-f0-9]{64}$/);

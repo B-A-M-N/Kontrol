@@ -646,6 +646,31 @@ export class WorkspaceRegistry {
   /** P2 #53: Observability for context file discovery. Always zero for lazy discovery. */
   lastScanMs = 0;
 
+  /** Bounded state-map telemetry for authenticated diagnostics (audit §7). */
+  stateMapTelemetry(): {
+    workspaces: number;
+    canonicalRoots: number;
+    sessions: number;
+    workspaceStates: number;
+    loadedAgentsFiles: number;
+    pendingWorktreeCreations: number;
+  } {
+    let workspaceStates = 0;
+    let loadedAgentsFiles = 0;
+    for (const byWorkspace of this.sessionStates.values()) {
+      workspaceStates += byWorkspace.size;
+      for (const state of byWorkspace.values()) loadedAgentsFiles += state.loadedAgentsFiles.size;
+    }
+    return {
+      workspaces: this.workspaces.size,
+      canonicalRoots: this.canonicalRootToId.size,
+      sessions: this.sessionStates.size,
+      workspaceStates,
+      loadedAgentsFiles,
+      pendingWorktreeCreations: this.pendingWorktreeCreations,
+    };
+  }
+
   /** @deprecated Use findAvailableAgentsFiles() — caching is internal. */
   async findAvailableAgentsFilesCached(root: string, loadedFiles: LoadedAgentsFile[]): Promise<AvailableAgentsFile[]> {
     return this.findAvailableAgentsFiles(root, loadedFiles);

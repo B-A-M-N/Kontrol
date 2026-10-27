@@ -93,8 +93,10 @@ async function openSession(): Promise<SseSession> {
   assert.equal(opened.response.status, 200, JSON.stringify(opened.payload));
   const workspaceResult = opened.payload?.result?.structuredContent ?? opened.payload?.result;
   assert.equal(workspaceResult?.versionControl, "none", "ordinary non-Git checkout uses filesystem tracking");
-  assert.equal(workspaceResult?.checkpointBackend, "filesystem", "ordinary non-Git checkout advertises its checkpoint backend");
-  assert.equal(workspaceResult?.capabilities?.changeTracking, true, "non-Git checkout retains change tracking");
+  assert.ok(["pending", "filesystem"].includes(workspaceResult?.checkpointBackend),
+    "ordinary non-Git checkout is pending on first open or reports its already-ready filesystem backend on reuse");
+  assert.equal(workspaceResult?.capabilities?.changeTracking, workspaceResult?.checkpointBackend === "filesystem",
+    "change tracking is advertised only after the deferred baseline has been captured");
   assert.equal(workspaceResult?.capabilities?.managedWorktree, false, "ordinary non-Git checkout is not treated as a managed worktree");
   const workspaceId = workspaceResult?.workspaceId;
   assert.equal(typeof workspaceId, "string", `open_workspace did not return a workspaceId: ${JSON.stringify(opened.payload)}`);

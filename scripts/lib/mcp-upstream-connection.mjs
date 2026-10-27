@@ -1,0 +1,160 @@
+/** Owns a reconnectable upstream MCP client while leaving the downstream server alive. */
+export class McpUpstreamConnection {
+  #createClient;
+  #prepareCandidate;
+  #qualifyClient;
+  #onConnectResult;
+  #onState;
+  #client = null;
+  #transport = null;
+  #generation = 0;
+  #state = "STARTING";
+  #reconnectPromise = null;
+  #retryTimer = null;
+  #pendingDelay = null;
+  #stopping = false;
+  #candidate;
+
+  constructor({ createClient, prepareCandidate, qualifyClient, onConnectResult = () => {}, onState = () => {}, maxAttempts = 8, baseDelayMs = 250, maxDelayMs = 15_000, recoveryWindowMs = 30_000, random = Math.random }) {
+    this.#createClient = createClient;
+    this.#prepareCandidate = prepareCandidate;
+    this.#qualifyClient = qualifyClient;
+    this.#onConnectResult = onConnectResult;
+    this.#onState = onState;
+    this.maxAttempts = maxAttempts;
+    this.baseDelayMs = baseDelayMs;
+    this.maxDelayMs = maxDelayMs;
+    this.recoveryWindowMs = recoveryWindowMs;
+    this.random = random;
+  }
+
+  maxAttempts;
+  baseDelayMs;
+  maxDelayMs;
+  recoveryWindowMs;
+  random;
+
+  #wait(ms) {
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (this.#pendingDelay === finish) this.#pendingDelay = null;
+        resolve();
+      };
+      const timer = setTimeout(finish, ms);
+      this.#pendingDelay = finish;
+    });
+  }
+
+  get state() { return this.#state; }
+  get generation() { return this.#generation; }
+
+  #setState(state) {
+    this.#state = state;
+    this.#onState(state, this.#generation, this.#candidate);
+  }
+
+  async start() {
+    if (this.#stopping) return;
+    this.#setState("STARTING");
+    try {
+      await this.#connectOnce();
+    } catch {
+      this.#setState("DEGRADED");
+      void this.reconnect();
+    }
+  }
+
+  async #connectOnce() {
+    if (this.#stopping) throw new Error("Upstream connection is stopping");
+    const generation = ++this.#generation;
+    const { client, transport, candidate } = this.#createClient();
+    this.#candidate = candidate;
+    this.#client = client;
+    this.#transport = transport;
+    client.onclose = () => {
+      if (generation !== this.#generation || this.#stopping) return;
+      if (candidate) this.#onConnectResult(candidate, false);
+      this.#client = null;
+      this.#transport = null;
+      this.#setState("DEGRADED");
+      void this.reconnect();
+    };
+    try {
+      await this.#prepareCandidate?.(candidate);
+      await client.connect(transport);
+      await this.#qualifyClient?.(client, candidate);
+      if (generation !== this.#generation || this.#stopping) {
+        try { await client.close(); } catch {}
+        throw new Error("Obsolete upstream connection generation");
+      }
+      if (candidate) this.#onConnectResult(candidate, true);
+      this.#setState("READY");
+    } catch (error) {
+      if (candidate) this.#onConnectResult(candidate, false);
+      if (generation === this.#generation) {
+        this.#client = null;
+        this.#transport = null;
+      }
+      try { await client.close(); } catch {}
+      throw error;
+    }
+  }
+
+  async reconnect() {
+    if (this.#stopping) return;
+    if (this.#reconnectPromise) return this.#reconnectPromise;
+    this.#reconnectPromise = (async () => {
+      this.#setState("RECONNECTING");
+      let retryAfterMs = 0;
+      for (let attempt = 0; attempt < this.maxAttempts && !this.#stopping; attempt += 1) {
+        if (attempt > 0) {
+          const ceiling = Math.min(this.maxDelayMs, this.baseDelayMs * (2 ** (attempt - 1)));
+          await this.#wait(Math.max(retryAfterMs, Math.floor(ceiling * (0.75 + this.random() * 0.5))));
+          retryAfterMs = 0;
+          if (this.#stopping) return;
+        }
+        try {
+          await this.#connectOnce();
+          return;
+        } catch (error) {
+          if (Number.isFinite(error?.retryAfterMs)) retryAfterMs = Math.max(1, error.retryAfterMs);
+          if (!this.#stopping) this.#setState("RECONNECTING");
+        }
+      }
+      if (this.#stopping) return;
+      this.#setState("DEGRADED");
+      this.#retryTimer = setTimeout(() => {
+        this.#retryTimer = null;
+        void this.reconnect();
+      }, this.recoveryWindowMs);
+      this.#retryTimer.unref?.();
+    })().finally(() => { this.#reconnectPromise = null; });
+    return this.#reconnectPromise;
+  }
+
+  requireClient() {
+    if (this.#state !== "READY" || !this.#client) {
+      throw new Error(`Kontrol upstream is ${this.#state.toLowerCase()}; request was not sent. Retry after the bridge reconnects.`);
+    }
+    return this.#client;
+  }
+
+  async close() {
+    if (this.#stopping) return;
+    this.#stopping = true;
+    this.#setState("STOPPING");
+    this.#pendingDelay?.();
+    if (this.#retryTimer) clearTimeout(this.#retryTimer);
+    this.#retryTimer = null;
+    ++this.#generation;
+    const client = this.#client;
+    this.#client = null;
+    this.#transport = null;
+    try { await client?.close(); } catch {}
+    this.#setState("STOPPED");
+  }
+}

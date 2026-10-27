@@ -156,9 +156,13 @@ try {
   // relative dependency remains release-local.
   const workerToken = join(root, "scripts/lib/acp-worker-token.mjs");
   if (existsSync(workerToken)) copyFileSync(workerToken, join(tempDist, "acp-worker-token.mjs"));
+  const readOnlyExecution = join(root, "scripts/lib/read-only-execution.mjs");
+  if (existsSync(readOnlyExecution)) copyFileSync(readOnlyExecution, join(tempDist, "read-only-execution.mjs"));
+  const boundedFileWrite = join(root, "scripts/lib/bounded-file-write.mjs");
+  if (existsSync(boundedFileWrite)) copyFileSync(boundedFileWrite, join(tempDist, "bounded-file-write.mjs"));
   chmodSync(join(tempDist, "cli.js"), 0o755);
 
-  for (const required of ["cli.js", "server.js", "acp-duplex.js", "build-meta.json", "ui/workspace-app.html"]) {
+  for (const required of ["cli.js", "server.js", "acp-duplex.js", "read-only-execution.mjs", "bounded-file-write.mjs", "build-meta.json", "ui/workspace-app.html"]) {
     if (required !== "build-meta.json" && !existsSync(join(tempDist, required))) {
       throw new Error(`Atomic build candidate is missing ${required}`);
     }

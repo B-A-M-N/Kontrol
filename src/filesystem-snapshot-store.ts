@@ -42,8 +42,9 @@
  *     blobs/⟨00..ff⟩/<sha256>
  */
 import { createHash, randomUUID } from "node:crypto";
-import { createReadStream, createWriteStream } from "node:fs";
+import { createReadStream, createWriteStream, type Dir } from "node:fs";
 import {
+  opendir,
   lstat,
   mkdir,
   readdir,
@@ -145,7 +146,7 @@ export interface FilesystemSnapshotStoreOptions {
    * Without it the store refuses DESTRUCTIVE GC (`gcSlice` with dryRun
    * unset/false and high-water emergency GC) rather than guessing what is
    * live. Read-only estimates keep accepting an explicit provider too. */
-  durableRoots?: () => Array<{ ref: string; terminal?: boolean; terminalAt?: string }>;
+  durableRoots?: () => Iterable<{ ref: string; terminal?: boolean; terminalAt?: string }>;
 }
 
 export interface FilesystemManifestEntry {
@@ -220,6 +221,33 @@ export interface GcSliceResult {
   corrupt: number;
 }
 
+export type SnapshotBlobAccounting = {
+  hash: string;
+  size: number;
+  classification: "live" | "grace_protected" | "reclaimable";
+  pinReasons: string[];
+};
+
+export interface SnapshotStorageAccounting {
+  generatedAt: string;
+  manifests: {
+    retainedLive: number;
+    retainedTerminal: number;
+    graceProtected: number;
+    reclaimable: number;
+    total: number;
+  };
+  blobs: {
+    counts: Record<SnapshotBlobAccounting["classification"], number>;
+    bytes: Record<SnapshotBlobAccounting["classification"], number>;
+    samples: SnapshotBlobAccounting[];
+    total: number;
+    totalBytes: number;
+  };
+  staging: { bytes: number };
+  pinnedRefsByReason: Record<string, string[]>;
+}
+
 const MB = 1024 * 1024;
 const GB = 1024 * MB;
 
@@ -252,18 +280,48 @@ export class FilesystemSnapshotStore {
     phase: 0 | 1;
     retained: Set<string>;
     marked: Set<string>;
-    blobCursor: number;
+    markStage: "classify" | "mark" | "expire" | null;
+    strongRoots: Set<string>;
+    terminalByRef: Map<string, { ref: string; refMtimeMs: number; ageAtMs: number }>;
+    protectedAfterTtl: Set<string>;
+    manifestDir: Dir | null;
+    markRefs: string[];
+    markCursor: number;
+    expiredRefs: string[];
+    expiredRefSet: Set<string>;
+    expireCursor: number;
+    blobRootDir: Dir | null;
+    blobShardDirs: string[] | null;
+    blobShardProbeIndex: number;
+    blobShardCursor: number;
+    blobDir: Dir | null;
+    blobFlatLayout: boolean | null;
+    pendingBlobFiles: Array<{ hash: string; path: string }>;
+    blobEnumerationDone: boolean;
     dirty: boolean;
-    /** Cached blob listing for the current sweep phase, so the full directory
-     * isn't re-enumerated on every bounded slice (O(n) total, not O(n²)). */
-    allBlobs: Array<{ hash: string; path: string }> | null;
   } = {
     phase: 0,
     retained: new Set(),
     marked: new Set(),
-    blobCursor: 0,
+    markStage: null,
+    strongRoots: new Set(),
+    terminalByRef: new Map(),
+    protectedAfterTtl: new Set(),
+    manifestDir: null,
+    markRefs: [],
+    markCursor: 0,
+    expiredRefs: [],
+    expiredRefSet: new Set(),
+    expireCursor: 0,
+    blobRootDir: null,
+    blobShardDirs: null,
+    blobShardProbeIndex: 0,
+    blobShardCursor: 0,
+    blobDir: null,
+    blobFlatLayout: null,
+    pendingBlobFiles: [],
+    blobEnumerationDone: false,
     dirty: false,
-    allBlobs: null,
   };
   private retentionMs: number;
   private retainPerWorkspace: number;
@@ -276,7 +334,7 @@ export class FilesystemSnapshotStore {
   /** P1.6: directory names never descended into during capture. */
   private excludedDirectories: Set<string> = new Set(DEFAULT_SNAPSHOT_EXCLUDED_DIRECTORIES);
   /** P0 GC safety: production durable-root provider (see options doc). */
-  private readonly durableRoots?: () => Array<{ ref: string; terminal?: boolean; terminalAt?: string }>;
+  private readonly durableRoots?: () => Iterable<{ ref: string; terminal?: boolean; terminalAt?: string }>;
 
   constructor(options: FilesystemSnapshotStoreOptions = {}) {
     this.storeRoot = resolve(options.storeRoot ?? join(tmpdir(), "kontrol-workspace-snapshots"));
@@ -309,7 +367,7 @@ export class FilesystemSnapshotStore {
    * call-site argument wins; the constructor-injected production provider is
    * the fallback. Destructive collection REQUIRES a provider — see gcSlice.
    */
-  private rootsProvider(explicit?: () => Array<{ ref: string; terminal?: boolean; terminalAt?: string }>): () => Array<{ ref: string; terminal?: boolean; terminalAt?: string }> {
+  private rootsProvider(explicit?: () => Iterable<{ ref: string; terminal?: boolean; terminalAt?: string }>): () => Iterable<{ ref: string; terminal?: boolean; terminalAt?: string }> {
     const provider = explicit ?? this.durableRoots;
     if (!provider) {
       throw new Error(
@@ -324,11 +382,23 @@ export class FilesystemSnapshotStore {
     return this.storeRoot;
   }
 
-  getStoreStatsForMetrics(): { manifests: number; activeCaptures: number; corruptionCount: number } {
+  getStoreStatsForMetrics(): {
+    manifests: number;
+    activeCaptures: number;
+    corruptionCount: number;
+    lastGcStartedAt?: string;
+    lastGcCompletedAt?: string;
+    lastGcReclaimedBlobs: number;
+    lastGcReclaimedBytes: number;
+  } {
     return {
       manifests: this.manifestsNow(),
       activeCaptures: this.activeCaptures.size,
       corruptionCount: this.corruptCount,
+      lastGcStartedAt: this.lastGcStartedAt,
+      lastGcCompletedAt: this.lastGcCompletedAt,
+      lastGcReclaimedBlobs: this.lastGcReclaimedBlobs,
+      lastGcReclaimedBytes: this.lastGcReclaimedBytes,
     };
   }
 
@@ -741,7 +811,7 @@ export class FilesystemSnapshotStore {
       if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
         return {};
       }
-      return {};
+      throw error;
     }
     let value: unknown;
     try {
@@ -868,7 +938,7 @@ export class FilesystemSnapshotStore {
    * whether the owning work session is terminal (for retention) or still
    * nonterminal (always pinned).
    */
-  private async collectRoots(listDbSnapshots?: () => Array<{ ref: string; terminal?: boolean; terminalAt?: string }>): Promise<{
+  private async collectRoots(listDbSnapshots?: () => Iterable<{ ref: string; terminal?: boolean; terminalAt?: string }>): Promise<{
     /** Strong pins: never expire during the collection. */
     strong: Set<string>;
     /** Retention-tracked terminal refs (expire retentionMs after the session
@@ -882,35 +952,62 @@ export class FilesystemSnapshotStore {
     // 1. Persisted baselines: open/presentation/legacy + session pins are
     //    strong pins (they are the live top-of-workspace refs).
     const baselineDir = join(this.storeRoot, "baselines");
-    let baselineFiles: string[] = [];
+    let baselineDirectory: Dir | undefined;
     try {
-      baselineFiles = (await readdir(baselineDir)).filter((name) => name.endsWith(".json"));
-    } catch {
-      baselineFiles = [];
+      baselineDirectory = await opendir(baselineDir);
+    } catch (error) {
+      if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) throw error;
     }
-    for (const file of baselineFiles) {
-      const raw = await readFile(join(baselineDir, file), "utf8").catch(() => undefined);
-      if (!raw) continue;
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(raw);
-      } catch {
-        continue;
-      }
-      const obj = parsed as { open?: WorkspaceSnapshot; presentation?: WorkspaceSnapshot; legacy?: WorkspaceSnapshot; sessions?: Record<string, WorkspaceSnapshot>; presentations?: Record<string, WorkspaceSnapshot> };
-      for (const key of ["open", "presentation", "legacy"] as const) {
-        const snap = obj[key];
-        if (snap && snap.kind === "filesystem" && snap.ref) strong.add(snap.ref);
-      }
-      if (obj.presentations && typeof obj.presentations === "object") {
-        for (const snapshot of Object.values(obj.presentations)) {
-          if (snapshot && snapshot.kind === "filesystem" && snapshot.ref) strong.add(snapshot.ref);
+    if (baselineDirectory) {
+      for await (const entry of baselineDirectory) {
+        if (!entry.name.endsWith(".json")) continue;
+        if (!entry.isFile()) {
+          await this.recordCorruption(`baseline:${entry.name}`, "baseline entry is not a regular file");
+          throw new Error(`Cannot establish snapshot roots: baseline ${entry.name} is not a regular file.`);
         }
-      }
-      if (obj.sessions && typeof obj.sessions === "object") {
-        for (const sref of Object.values(obj.sessions)) {
-          const snap = sref as WorkspaceSnapshot | undefined;
-          if (snap && snap.kind === "filesystem" && snap.ref) strong.add(snap.ref);
+        let raw: string;
+        try {
+          raw = await readFile(join(baselineDir, entry.name), "utf8");
+        } catch (error) {
+          if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") continue;
+          throw error;
+        }
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(raw);
+        } catch (error) {
+          await this.recordCorruption(`baseline:${entry.name}`, "invalid JSON in baseline file");
+          throw new Error(`Cannot establish snapshot roots: baseline ${entry.name} is corrupt.`, { cause: error });
+        }
+        const isSnapshot = (value: unknown): value is WorkspaceSnapshot => Boolean(
+          value && typeof value === "object"
+          && ((value as WorkspaceSnapshot).kind === "filesystem" || (value as WorkspaceSnapshot).kind === "git")
+          && typeof (value as WorkspaceSnapshot).ref === "string"
+          && (value as WorkspaceSnapshot).ref.length > 0,
+        );
+        const isSnapshotMap = (value: unknown): value is Record<string, WorkspaceSnapshot> => Boolean(
+          value && typeof value === "object" && !Array.isArray(value)
+          && Object.values(value as Record<string, unknown>).every(isSnapshot),
+        );
+        const obj = parsed as { root?: unknown; open?: unknown; presentation?: unknown; legacy?: unknown; sessions?: unknown; presentations?: unknown };
+        if (!obj || typeof obj !== "object" || typeof obj.root !== "string" || !obj.root
+          || !isSnapshot(obj.open) || !isSnapshot(obj.presentation) || !isSnapshot(obj.legacy)
+          || !isSnapshotMap(obj.sessions)
+          || (obj.presentations !== undefined && !isSnapshotMap(obj.presentations))) {
+          await this.recordCorruption(`baseline:${entry.name}`, "invalid structure in baseline file");
+          throw new Error(`Cannot establish snapshot roots: baseline ${entry.name} has an invalid structure.`);
+        }
+        for (const key of ["open", "presentation", "legacy"] as const) {
+          const snap = obj[key] as WorkspaceSnapshot;
+          if (snap.kind === "filesystem") strong.add(snap.ref);
+        }
+        if (obj.presentations !== undefined) {
+          for (const snapshot of Object.values(obj.presentations as Record<string, WorkspaceSnapshot>)) {
+            if (snapshot.kind === "filesystem") strong.add(snapshot.ref);
+          }
+        }
+        for (const snapshot of Object.values(obj.sessions as Record<string, WorkspaceSnapshot>)) {
+          if (snapshot.kind === "filesystem") strong.add(snapshot.ref);
         }
       }
     }
@@ -923,11 +1020,14 @@ export class FilesystemSnapshotStore {
       for (const snap of listDbSnapshots()) {
         if (!snap || !snap.ref) continue;
         if (snap.terminal) {
-          const refMtimeMs = await this.manifestMtimeMs(snap.ref);
-          if (refMtimeMs !== undefined) {
-            const terminalAtMs = snap.terminalAt !== undefined ? Date.parse(snap.terminalAt) : Number.NaN;
-            const ageAtMs = Number.isFinite(terminalAtMs) ? terminalAtMs : refMtimeMs;
-            terminal.push({ ref: snap.ref, refMtimeMs, ageAtMs });
+          const terminalAtMs = snap.terminalAt !== undefined ? Date.parse(snap.terminalAt) : Number.NaN;
+          if (Number.isFinite(terminalAtMs)) {
+            // A persisted terminal timestamp is authoritative; avoid one stat
+            // syscall per durable root on every resumable GC slice.
+            terminal.push({ ref: snap.ref, refMtimeMs: 0, ageAtMs: terminalAtMs });
+          } else {
+            const refMtimeMs = await this.manifestMtimeMs(snap.ref);
+            if (refMtimeMs !== undefined) terminal.push({ ref: snap.ref, refMtimeMs, ageAtMs: refMtimeMs });
           }
           // A terminal ref whose manifest was already collected simply isn't a
           // live ref anymore; nothing to pin.
@@ -937,6 +1037,23 @@ export class FilesystemSnapshotStore {
       }
     }
     return { strong, terminal };
+  }
+
+  /** Select the same newest terminal tail as a full stable sort, in O(T × N). */
+  private terminalTailRefs(terminal: Array<{ ref: string; ageAtMs: number }>): Set<string> {
+    const limit = this.retainPerWorkspace;
+    if (limit <= 0) return new Set();
+    const selected: Array<{ ref: string; ageAtMs: number; sourceIndex: number }> = [];
+    for (let sourceIndex = 0; sourceIndex < terminal.length; sourceIndex++) {
+      const candidate = terminal[sourceIndex]!;
+      const position = selected.findIndex((entry) => candidate.ageAtMs > entry.ageAtMs
+        || (candidate.ageAtMs === entry.ageAtMs && sourceIndex < entry.sourceIndex));
+      const insertAt = position < 0 ? selected.length : position;
+      if (insertAt >= limit) continue;
+      selected.splice(insertAt, 0, { ...candidate, sourceIndex });
+      if (selected.length > limit) selected.pop();
+    }
+    return new Set(selected.map((entry) => entry.ref));
   }
 
   /**
@@ -964,7 +1081,7 @@ export class FilesystemSnapshotStore {
      * durableRoots option): a destructive collection must never run against
      * an unvalidated (implicitly empty) root set. The provider must throw on
      * enumeration failure — never return [] to mean "could not read". */
-    listDbSnapshots?: () => Array<{ ref: string; terminal?: boolean; terminalAt?: string }>;
+    listDbSnapshots?: () => Iterable<{ ref: string; terminal?: boolean; terminalAt?: string }>;
     dryRun?: boolean;
   }): Promise<{ result: GcSliceResult; hasMore: boolean }> {
     const startedAt = performance.now();
@@ -982,46 +1099,92 @@ export class FilesystemSnapshotStore {
       corrupt: 0,
     };
 
-    // ----- phase 0: roots + retained manifests + mark blobs -----
-    if (this.gcState.phase === 0) {
+    const resetMark = () => {
+      this.gcState.phase = 0;
+      this.gcState.marked.clear();
+      this.gcState.retained.clear();
+      this.gcState.markStage = null;
+      this.gcState.strongRoots.clear();
+      this.gcState.terminalByRef.clear();
+      this.gcState.protectedAfterTtl.clear();
+      this.gcState.markRefs = [];
+      this.gcState.markCursor = 0;
+      this.gcState.expiredRefs = [];
+      this.gcState.expiredRefSet.clear();
+      this.gcState.expireCursor = 0;
+      this.closeGcDirectoryCursors();
+    };
+    const currentRootsAreCovered = async (): Promise<boolean> => {
       const { strong, terminal } = await this.collectRoots(listDbSnapshots);
-      const retained = new Set<string>();
-      // Retain the newest `retainPerWorkspace` terminal refs beyond their TTL so
-      // operators keep a bounded recent tail even after retention expires.
-      // Newest by terminal age (ageAtMs), not manifest mtime (P0).
-      const protectedAfterTtl = new Set([...terminal]
-        .sort((a, b) => b.ageAtMs - a.ageAtMs)
-        .slice(0, this.retainPerWorkspace)
-        .map((t) => t.ref));
-      const expired: string[] = [];
-      for (const f of await this.listManifestFiles()) {
-        const ref = FS_REF_PREFIX + f.replace(/\.json$/, "");
-        // A manifest that still exists is retained if it is a strong pin,
-        // within its retention window (terminal), or fresh (orphan grace).
-        // Retention ages from the terminal moment, not the manifest mtime.
-        const isStrong = strong.has(ref);
-        const terminalRef = terminal.find((t) => t.ref === ref);
-        const withinRetention = terminalRef !== undefined && nowMs - terminalRef.ageAtMs < this.retentionMs;
-        if (isStrong || withinRetention || protectedAfterTtl.has(ref)) {
-          retained.add(ref);
-        } else {
-          expired.push(ref);
-        }
+      for (const ref of strong) {
+        if (this.gcState.retained.has(ref)) continue;
+        if (this.gcState.expiredRefSet.has(ref) || await this.manifestMtimeMs(ref) !== undefined) return false;
       }
-      // Honoring orphan grace for very new manifests: anything fresh is kept.
-      for (const ref of expired) {
-        const mt = await this.manifestMtimeMs(ref);
-        const isNew = mt !== undefined && nowMs - mt < this.orphanGraceMs;
-        if (isNew) {
-          retained.add(ref);
-        } else {
-          if (!options.dryRun) await rm(this.manifestPath(ref), { force: true }).catch(() => undefined);
-          result.manifestsExpired++;
-        }
+      const tail = this.terminalTailRefs(terminal);
+      for (const entry of terminal) {
+        if (!(nowMs - entry.ageAtMs < this.retentionMs || tail.has(entry.ref)) || this.gcState.retained.has(entry.ref)) continue;
+        if (this.gcState.expiredRefSet.has(entry.ref) || await this.manifestMtimeMs(entry.ref) !== undefined) return false;
       }
-      result.manifestsRetained = retained.size;
-      // Mark blobs referenced by every retained manifest.
-      for (const ref of retained) {
+      return true;
+    };
+
+    // ----- phase 0: resumable root classification and manifest marking -----
+    if (this.gcState.phase === 0) {
+      if (this.gcState.markStage === null) {
+        const { strong, terminal } = await this.collectRoots(listDbSnapshots);
+        this.gcState.strongRoots = strong;
+        this.gcState.terminalByRef = new Map(terminal.map((entry) => [entry.ref, entry]));
+        this.gcState.protectedAfterTtl = this.terminalTailRefs(terminal);
+        this.gcState.manifestDir = await opendir(join(this.storeRoot, "manifests")).catch((error: NodeJS.ErrnoException) => {
+          if (error.code === "ENOENT") return null;
+          throw error;
+        });
+        this.gcState.retained.clear();
+        this.gcState.expiredRefs = [];
+        this.gcState.expiredRefSet.clear();
+        this.gcState.markRefs = [];
+        this.gcState.markCursor = 0;
+        this.gcState.expireCursor = 0;
+        this.gcState.marked.clear();
+        this.gcState.markStage = "classify";
+        if (this.lastGcStartedAt === undefined) this.lastGcStartedAt = new Date().toISOString();
+      }
+
+      let scanned = 0;
+      while (this.gcState.markStage === "classify"
+        && performance.now() - startedAt < options.budgetMs
+        && scanned < pageSize) {
+        const entry = await this.gcState.manifestDir?.read();
+        if (!entry) {
+          await this.gcState.manifestDir?.close().catch(() => undefined);
+          this.gcState.manifestDir = null;
+          this.gcState.markRefs = [...this.gcState.retained];
+          this.gcState.markStage = "mark";
+          break;
+        }
+        if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+        const file = entry.name;
+        const ref = FS_REF_PREFIX + file.replace(/\.json$/, "");
+        const terminalRef = this.gcState.terminalByRef.get(ref);
+        const retained = this.gcState.strongRoots.has(ref)
+          || (terminalRef !== undefined && nowMs - terminalRef.ageAtMs < this.retentionMs)
+          || this.gcState.protectedAfterTtl.has(ref);
+        if (retained) this.gcState.retained.add(ref);
+        else {
+          const mtime = await this.manifestMtimeMs(ref);
+          if (mtime !== undefined && nowMs - mtime < this.orphanGraceMs) this.gcState.retained.add(ref);
+          else {
+            this.gcState.expiredRefs.push(ref);
+            this.gcState.expiredRefSet.add(ref);
+          }
+        }
+        scanned++;
+      }
+      while (this.gcState.markStage === "mark"
+        && this.gcState.markCursor < this.gcState.markRefs.length
+        && performance.now() - startedAt < options.budgetMs
+        && scanned < pageSize) {
+        const ref = this.gcState.markRefs[this.gcState.markCursor++]!;
         try {
           const manifest = await this.readManifest({ kind: "filesystem", ref, createdAt: new Date(0).toISOString() });
           for (const entry of manifest.entries) {
@@ -1031,24 +1194,60 @@ export class FilesystemSnapshotStore {
           await this.recordCorruption(`manifest:${ref}`, error instanceof Error ? error.message : String(error));
           result.corrupt++;
         }
+        scanned++;
       }
-      this.gcState.retained = retained;
-      this.gcState.phase = 1;
-      this.gcState.blobCursor = 0;
+      if (this.gcState.markStage === "mark" && this.gcState.markCursor >= this.gcState.markRefs.length) {
+        this.gcState.markStage = "expire";
+      }
+      if (this.gcState.markStage !== "expire") {
+        result.manifestsRetained = this.gcState.retained.size;
+        return { result, hasMore: true };
+      }
       this.gcState.dirty = true;
-      // Snapshot the blob listing once for this sweep; reused across slices.
-      this.gcState.allBlobs = await this.listBlobFiles();
-      if (this.lastGcStartedAt === undefined) this.lastGcStartedAt = new Date().toISOString();
+    }
+
+    // Root changes between maintenance slices invalidate the cached mark. This
+    // prevents a newly referenced snapshot from inheriting an old unmarked set.
+    // This single check also covers the mark-to-sweep transition above; doing
+    // another full durable-root collection there doubled the largest
+    // synchronous part of a completed mark pass without adding a safety
+    // boundary (no destructive operation occurs between the two checks).
+    if (!(await currentRootsAreCovered())) {
+      resetMark();
       return { result, hasMore: true };
+    }
+    result.manifestsRetained = this.gcState.retained.size;
+
+    if (this.gcState.phase === 0) {
+      let deleted = 0;
+      while (this.gcState.expireCursor < this.gcState.expiredRefs.length
+        && performance.now() - startedAt < options.budgetMs
+        && deleted < pageSize) {
+        const ref = this.gcState.expiredRefs[this.gcState.expireCursor++]!;
+        if (!options.dryRun) await rm(this.manifestPath(ref), { force: true }).catch(() => undefined);
+        result.manifestsExpired++;
+        deleted++;
+      }
+      if (this.gcState.expireCursor < this.gcState.expiredRefs.length) return { result, hasMore: true };
+      this.gcState.phase = 1;
+      this.gcState.pendingBlobFiles = [];
+      this.gcState.blobEnumerationDone = false;
+      // Blob enumeration and reclamation now belong to the sweep phase, after
+      // the complete, budgeted manifest mark is established.
     }
 
     // ----- phase 1: sweep blobs in bounded pages -----
-    const allBlobs = this.gcState.allBlobs ?? (await this.listBlobFiles());
     const marked = this.gcState.marked;
     let scanned = 0;
-    let index = this.gcState.blobCursor;
-    while (index < allBlobs.length && performance.now() - startedAt < options.budgetMs && scanned < pageSize) {
-      const blobFile = allBlobs[index];
+    if (this.gcState.pendingBlobFiles.length === 0 && !this.gcState.blobEnumerationDone) {
+      const page = await this.nextGcBlobPage(pageSize);
+      this.gcState.pendingBlobFiles = page.files;
+      this.gcState.blobEnumerationDone = page.done;
+    }
+    while (this.gcState.pendingBlobFiles.length > 0
+      && performance.now() - startedAt < options.budgetMs
+      && scanned < pageSize) {
+      const blobFile = this.gcState.pendingBlobFiles.shift()!;
       const hash = blobFile.hash;
       if (marked.has(hash)) {
         result.blobsReachable++;
@@ -1070,11 +1269,9 @@ export class FilesystemSnapshotStore {
         }
       }
       scanned++;
-      index++;
-      this.gcState.blobCursor = index;
     }
 
-    const hasMore = index < allBlobs.length;
+    const hasMore = this.gcState.pendingBlobFiles.length > 0 || !this.gcState.blobEnumerationDone;
     if (hasMore) {
       return { result, hasMore: true };
     }
@@ -1083,8 +1280,11 @@ export class FilesystemSnapshotStore {
     this.gcState.phase = 0;
     this.gcState.marked.clear();
     this.gcState.retained.clear();
-    this.gcState.blobCursor = 0;
-    this.gcState.allBlobs = null;
+    this.gcState.markStage = null;
+    this.gcState.expiredRefs = [];
+    this.gcState.expiredRefSet.clear();
+    this.gcState.markRefs = [];
+    this.closeGcDirectoryCursors();
     if (!this.lastGcStartedAt) this.lastGcStartedAt = new Date().toISOString();
     this.lastGcCompletedAt = new Date().toISOString();
     this.lastGcReclaimedBlobs = result.blobsReclaimed;
@@ -1099,6 +1299,101 @@ export class FilesystemSnapshotStore {
     } catch {
       return [];
     }
+  }
+
+  /** Continue the blob-directory cursor without materializing the full CAS inventory. */
+  private async nextGcBlobPage(limit: number): Promise<{ files: Array<{ hash: string; path: string }>; done: boolean }> {
+    const state = this.gcState;
+    const files: Array<{ hash: string; path: string }> = [];
+    const blobsRoot = join(this.storeRoot, "blobs");
+    if (state.blobFlatLayout === null) {
+      state.blobShardDirs ??= [];
+      let probed = 0;
+      while (state.blobShardProbeIndex < 256 && probed < limit) {
+        const shard = state.blobShardProbeIndex.toString(16).padStart(2, "0");
+        const shardPath = join(blobsRoot, shard);
+        const shardStat = await lstat(shardPath).catch(() => undefined);
+        if (shardStat?.isDirectory()) state.blobShardDirs.push(shard);
+        state.blobShardProbeIndex++;
+        probed++;
+      }
+      if (state.blobShardProbeIndex < 256) return { files, done: false };
+      if (state.blobShardDirs.length > 0) {
+        state.blobFlatLayout = false;
+      } else {
+        try {
+          state.blobRootDir = await opendir(blobsRoot);
+          state.blobFlatLayout = true;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+          state.blobFlatLayout = true;
+          state.blobEnumerationDone = true;
+          return { files, done: true };
+        }
+      }
+    }
+
+    if (state.blobFlatLayout) {
+      const root = state.blobRootDir;
+      if (!root) return { files, done: true };
+      while (files.length < limit) {
+        const entry = await root.read();
+        if (!entry) {
+          await root.close().catch(() => undefined);
+          state.blobRootDir = null;
+          state.blobEnumerationDone = true;
+          break;
+        }
+        if (entry.isFile() && HASH_RE.test(entry.name)) files.push({ hash: entry.name, path: join(blobsRoot, entry.name) });
+      }
+      return { files, done: state.blobEnumerationDone };
+    }
+
+    const shards = state.blobShardDirs ?? [];
+    while (files.length < limit && state.blobShardCursor < shards.length) {
+      if (!state.blobDir) {
+        const shardPath = join(blobsRoot, shards[state.blobShardCursor]!);
+        try {
+          state.blobDir = await opendir(shardPath);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+            state.blobShardCursor++;
+            continue;
+          }
+          throw error;
+        }
+      }
+      const entry = await state.blobDir.read();
+      if (!entry) {
+        await state.blobDir.close().catch(() => undefined);
+        state.blobDir = null;
+        state.blobShardCursor++;
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      const shard = shards[state.blobShardCursor]!;
+      const hash = shard + entry.name;
+      if (HASH_RE.test(hash)) files.push({ hash, path: join(blobsRoot, shard, entry.name) });
+    }
+    const done = state.blobShardCursor >= shards.length && state.blobDir === null;
+    if (done) state.blobEnumerationDone = true;
+    return { files, done };
+  }
+
+  private closeGcDirectoryCursors(): void {
+    const state = this.gcState;
+    for (const dir of [state.manifestDir, state.blobRootDir, state.blobDir]) {
+      if (dir) void dir.close().catch(() => undefined);
+    }
+    state.manifestDir = null;
+    state.blobRootDir = null;
+    state.blobShardDirs = null;
+    state.blobShardProbeIndex = 0;
+    state.blobShardCursor = 0;
+    state.blobDir = null;
+    state.blobFlatLayout = null;
+    state.pendingBlobFiles = [];
+    state.blobEnumerationDone = false;
   }
 
   private async listBlobFiles(): Promise<Array<{ hash: string; path: string }>> {
@@ -1167,11 +1462,44 @@ export class FilesystemSnapshotStore {
     }
   }
 
+  private async stagingBytes(): Promise<number> {
+    let total = 0;
+    try {
+      const stagingParent = join(this.storeRoot, "staging");
+      for (const entry of await readdir(stagingParent)) {
+        total += await this.dirBytes(join(stagingParent, entry));
+      }
+    } catch { /* ignore */ }
+    return total;
+  }
+
   /** Directory byte usage (sharded + legacy, recursion for shards). */
   async approxStoreBytes(): Promise<{ blobs: number; blobBytes: number; manifests: number; stagingBytes: number }> {
+    const inventory = await this.collectStoreInventory(false);
+    return {
+      blobs: inventory.blobs.length,
+      blobBytes: inventory.blobBytes,
+      manifests: inventory.manifestFiles.length,
+      stagingBytes: inventory.stagingBytes,
+    };
+  }
+
+  private async collectStoreInventory(includeBlobSizes: boolean): Promise<{
+    blobs: Array<{ hash: string; path: string }>;
+    blobBytes: number;
+    blobSizes: Map<string, number>;
+    manifestFiles: string[];
+    stagingBytes: number;
+  }> {
     const blobs = await this.listBlobFiles();
     let blobBytes = 0;
-    for (const b of blobs) blobBytes += await this.sizeOf(b.path);
+    const blobSizes = new Map<string, number>();
+    for (const blob of blobs) {
+      const size = await this.sizeOf(blob.path);
+      blobBytes += size;
+      if (includeBlobSizes) blobSizes.set(blob.hash, size);
+    }
+    const manifestFiles = await this.listManifestFiles();
     let stagingBytes = 0;
     try {
       const stagingParent = join(this.storeRoot, "staging");
@@ -1181,12 +1509,7 @@ export class FilesystemSnapshotStore {
     } catch {
       /* ignore */
     }
-    return {
-      blobs: blobs.length,
-      blobBytes,
-      manifests: await this.listManifestFiles().then((f) => f.length),
-      stagingBytes,
-    };
+    return { blobs, blobBytes, blobSizes, manifestFiles, stagingBytes };
   }
 
   private async dirBytes(dir: string): Promise<number> {
@@ -1207,6 +1530,152 @@ export class FilesystemSnapshotStore {
     return total;
   }
 
+  /**
+   * Explain the current physical store without changing GC authority.
+   *
+   * Counts use the exact policy implemented by `gcSlice`: strong pins and
+   * terminal snapshots within retention (plus the recent per-workspace tail)
+   * are retained; fresh orphans are grace-protected; everything else is safe
+   * for the next destructive sweep. This is the operator-visible answer to
+   * "why is snapshot storage retained?", not a permission to delete evidence.
+   */
+  async storageAccounting(listDbSnapshots?: () => Iterable<{ ref: string; terminal?: boolean; terminalAt?: string }>): Promise<SnapshotStorageAccounting> {
+    const { strong, terminal } = await this.collectRoots(listDbSnapshots ?? this.durableRoots);
+    const nowMs = Date.now();
+    const terminalByRef = new Map(terminal.map((item) => [item.ref, item]));
+    const protectedAfterTtl = this.terminalTailRefs(terminal);
+
+    const account = new Map<string, { hash: string; size: number; classification: SnapshotBlobAccounting["classification"]; pinReasons: Set<string> }>();
+    const addBlob = async (hash: string, reason: string, classification: SnapshotBlobAccounting["classification"]) => {
+      if (!HASH_RE.test(hash)) return;
+      const existing = account.get(hash);
+      if (existing) {
+        existing.pinReasons.add(reason);
+        if (classification === "reclaimable") return;
+        if (existing.classification === "reclaimable" || (classification === "grace_protected" && existing.classification !== "live")) {
+          existing.classification = classification;
+        }
+        return;
+      }
+      const path = this.blobPath(hash);
+      const st = await lstat(path).catch(() => undefined);
+      if (!st || !st.isFile()) return;
+      account.set(hash, { hash, size: st.size, classification, pinReasons: new Set([reason]) });
+    };
+    const legacyHashes = new Set<string>();
+    try {
+      for (const name of await readdir(join(this.storeRoot, "blobs"))) {
+        if (HASH_RE.test(name)) legacyHashes.add(name);
+      }
+    } catch { /* no legacy blobs */ }
+
+    let retainedLiveManifests = 0;
+    let retainedTerminalManifests = 0;
+    let graceProtectedManifests = 0;
+    let reclaimableManifests = 0;
+    const pinReasons = new Map<string, Set<string>>();
+
+    const manifestFiles = await this.listManifestFiles();
+    for (const file of manifestFiles) {
+      const ref = FS_REF_PREFIX + file.replace(/\.json$/, "");
+      const terminalRef = terminalByRef.get(ref);
+      const withinRetention = terminalRef !== undefined && nowMs - terminalRef.ageAtMs < this.retentionMs;
+      const strongPinned = strong.has(ref);
+      const tailProtected = protectedAfterTtl.has(ref);
+      const retained = strongPinned || withinRetention || tailProtected;
+      const reasons: string[] = [];
+      if (strongPinned) reasons.push("strong_pin");
+      if (withinRetention) reasons.push("terminal_retention");
+      if (tailProtected) reasons.push("terminal_recent_tail");
+
+      let manifest: FilesystemManifest | undefined;
+      try {
+        manifest = await this.readManifest({ kind: "filesystem", ref, createdAt: new Date(0).toISOString() });
+      } catch (error) {
+        this.recordCorruption(`manifest:${ref}`, error instanceof Error ? error.message : String(error));
+      }
+      const reasonKey = reasons.length ? reasons.join("+") : "unpinned";
+      pinReasons.set(reasonKey, (pinReasons.get(reasonKey) ?? new Set()).add(ref));
+      if (!retained) {
+        const mtime = await this.manifestMtimeMs(ref);
+        const graceProtected = mtime !== undefined && nowMs - mtime < this.orphanGraceMs;
+        if (graceProtected) {
+          graceProtectedManifests++;
+          reasons.push("orphan_grace");
+        } else {
+          reclaimableManifests++;
+          reasons.push("gc_eligible");
+        }
+      } else if (terminalRef || (!strongPinned && (withinRetention || tailProtected))) {
+        retainedTerminalManifests++;
+      } else {
+        retainedLiveManifests++;
+      }
+
+      if (manifest) {
+        const classification: SnapshotBlobAccounting["classification"] = retained
+          ? "live"
+          : reasons.includes("orphan_grace") ? "grace_protected" : "reclaimable";
+        for (const entry of manifest.entries) {
+          if (entry.type !== "file") continue;
+          if (legacyHashes.has(entry.sha256)) {
+            await addBlob(entry.sha256, `${reasonKey}:legacy`, classification === "live" ? "live" : classification);
+          }
+          await addBlob(entry.sha256, reasonKey, classification);
+        }
+      }
+    }
+
+    const markedHashes = new Set(account.keys());
+    const stagingBytes = await this.stagingBytes();
+    for (const blob of await this.listBlobFiles()) {
+      if (markedHashes.has(blob.hash)) continue;
+      const ageMs = nowMs - ((await this.mtimeMs(blob.path)) ?? nowMs);
+      const graceProtected = ageMs < this.orphanGraceMs;
+      const size = await this.sizeOf(blob.path);
+      account.set(blob.hash, {
+        hash: blob.hash,
+        size,
+        classification: graceProtected ? "grace_protected" : "reclaimable",
+        pinReasons: new Set([graceProtected ? "orphan_grace" : "gc_eligible"]),
+      });
+    }
+
+    const blobs = [...account.values()].map((item) => ({
+      hash: item.hash,
+      size: item.size,
+      classification: item.classification,
+      pinReasons: [...item.pinReasons].sort(),
+    }));
+    const byClassification = { live: 0, grace_protected: 0, reclaimable: 0 } as Record<SnapshotBlobAccounting["classification"], number>;
+    const bytesByClassification = { ...byClassification } as Record<SnapshotBlobAccounting["classification"], number>;
+    for (const blob of blobs) {
+      byClassification[blob.classification]++;
+      bytesByClassification[blob.classification] += blob.size;
+    }
+    return {
+      generatedAt: new Date().toISOString(),
+      manifests: {
+        retainedLive: retainedLiveManifests,
+        retainedTerminal: retainedTerminalManifests,
+        graceProtected: graceProtectedManifests,
+        reclaimable: reclaimableManifests,
+        total: manifestFiles.length,
+      },
+      blobs: {
+        counts: byClassification,
+        bytes: bytesByClassification,
+        samples: blobs.sort((left, right) => right.size - left.size).slice(0, 20),
+        total: blobs.length,
+        totalBytes: blobs.reduce((sum, blob) => sum + blob.size, 0),
+      },
+      staging: { bytes: stagingBytes },
+      pinnedRefsByReason: Object.fromEntries([...pinReasons.entries()]
+        .map(([reason, refs]): [string, string[]] => [reason, [...refs].sort()])
+        .sort(([left], [right]) => left.localeCompare(right))),
+    };
+  }
+
   async storeStats(): Promise<StoreStats> {
     const approx = await this.approxStoreBytes();
     return {
@@ -1221,6 +1690,69 @@ export class FilesystemSnapshotStore {
       lastGcReclaimedBlobs: this.lastGcReclaimedBlobs,
       lastGcReclaimedBytes: this.lastGcReclaimedBytes,
       corruptionCount: this.corruptCount,
+    };
+  }
+
+  /**
+   * Produce the operator stats and reachable-byte estimate from one physical
+   * store inventory and one durable-root observation. This avoids re-listing
+   * manifests and re-statting reachable blobs in CLI stats/doctor paths.
+   */
+  async storeStatsWithReachability(
+    listDbSnapshots?: () => Iterable<{ ref: string; terminal?: boolean; terminalAt?: string }>,
+  ): Promise<{ stats: StoreStats; reachable: { blobs: number; bytes: number; manifests: number } }> {
+    const inventory = await this.collectStoreInventory(true);
+    const { strong, terminal } = await this.collectRoots(listDbSnapshots ?? this.durableRoots);
+    const now = Date.now();
+    const roots = new Set(strong);
+    const protectedAfterTtl = this.terminalTailRefs(terminal);
+    for (const item of terminal) {
+      if (now - item.ageAtMs < this.retentionMs || protectedAfterTtl.has(item.ref)) roots.add(item.ref);
+    }
+
+    const marked = new Set<string>();
+    let reachableManifests = 0;
+    let reachableBytes = 0;
+    for (const manifestFile of inventory.manifestFiles) {
+      const ref = FS_REF_PREFIX + manifestFile.replace(/\.json$/, "");
+      if (!roots.has(ref)) continue;
+      reachableManifests++;
+      try {
+        const manifest = await this.readManifest({ kind: "filesystem", ref, createdAt: new Date(0).toISOString() });
+        for (const entry of manifest.entries) {
+          if (entry.type !== "file" || marked.has(entry.sha256)) continue;
+          marked.add(entry.sha256);
+          const inventoriedSize = inventory.blobSizes.get(entry.sha256);
+          if (inventoriedSize !== undefined) {
+            reachableBytes += inventoriedSize;
+          } else {
+            // Preserve estimateReachableBytes() behavior for legacy flat blobs
+            // when a store also contains sharded blobs, which the ordinary
+            // inventory intentionally reports as the active layout only.
+            const verified = await this.verifyBlob(entry.sha256);
+            if (verified.ok) reachableBytes += verified.size;
+          }
+        }
+      } catch {
+        // Corrupt manifests are excluded by the existing read-only estimate.
+      }
+    }
+
+    return {
+      stats: {
+        manifests: inventory.manifestFiles.length,
+        blobs: inventory.blobs.length,
+        blobBytes: inventory.blobBytes,
+        stagingBytes: inventory.stagingBytes,
+        activeCaptures: this.activeCaptures.size,
+        incompleteTransactions: await this.countIncompleteTransactions(),
+        lastGcStartedAt: this.lastGcStartedAt,
+        lastGcCompletedAt: this.lastGcCompletedAt,
+        lastGcReclaimedBlobs: this.lastGcReclaimedBlobs,
+        lastGcReclaimedBytes: this.lastGcReclaimedBytes,
+        corruptionCount: this.corruptCount,
+      },
+      reachable: { blobs: marked.size, bytes: reachableBytes, manifests: reachableManifests },
     };
   }
 
@@ -1260,7 +1792,7 @@ export class FilesystemSnapshotStore {
    * baselines plus the optional DB root collector (same production roots GC
    * uses). This does not delete anything.
    */
-  async estimateReachableBytes(listDbSnapshots?: () => Array<{ ref: string; terminal?: boolean; terminalAt?: string }>): Promise<{
+  async estimateReachableBytes(listDbSnapshots?: () => Iterable<{ ref: string; terminal?: boolean; terminalAt?: string }>): Promise<{
     blobs: number;
     bytes: number;
     manifests: number;
@@ -1272,11 +1804,12 @@ export class FilesystemSnapshotStore {
     const { strong, terminal } = await this.collectRoots(listDbSnapshots ?? this.durableRoots);
     const now = Date.now();
     const roots = new Set(strong);
+    const protectedAfterTtl = this.terminalTailRefs(terminal);
     for (const t of terminal) {
       // Count terminal refs as reachable within their retention window and the
       // bounded recent tail, mirroring gcSlice's retention logic (aged from the
       // terminal moment, not manifest mtime — P0).
-      if (now - t.ageAtMs < this.retentionMs || [...terminal].sort((a, b) => b.ageAtMs - a.ageAtMs).slice(0, this.retainPerWorkspace).some((x) => x.ref === t.ref)) {
+      if (now - t.ageAtMs < this.retentionMs || protectedAfterTtl.has(t.ref)) {
         roots.add(t.ref);
       }
     }

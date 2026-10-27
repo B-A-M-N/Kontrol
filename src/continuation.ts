@@ -9,7 +9,7 @@ import { continuations, type ContinuationRow } from "./db/schema.js";
  * Status lifecycle: pending → claimed → delivered → completed
  */
 
-export type ContinuationStatus = "pending" | "claimed" | "dispatched" | "completed" | "superseded";
+export type ContinuationStatus = "pending" | "claimed" | "reconciliation_required" | "dispatched" | "completed" | "superseded";
 
 export interface Continuation {
   id: string;
@@ -51,6 +51,7 @@ export interface ContinuationManager {
   get(id: string): Continuation | undefined;
   getByFeedbackEventId(feedbackEventId: string): Continuation | undefined;
   listPending(sessionId?: string): Continuation[];
+  listReconciliationRequired(): Continuation[];
   listForSession(sessionId: string): Continuation[];
   claim(owner: string, opts?: { id?: string; sessionId?: string }): Continuation | null;
   release(owner: string, opts?: { id?: string; sessionId?: string }): void;
@@ -63,6 +64,8 @@ export interface ContinuationManager {
     claimOwner: string;
     targetRunId: string;
   }): boolean;
+  markReconciliationRequired(input: { id: string; claimOwner: string; targetRunId: string; reason: string }): boolean;
+  resolveReconciliation(input: { id: string; targetRunId: string; outcome: "dispatched" | "retry_safe" }): boolean;
   markDispatched(id: string): void;
   markCompleted(id: string): void;
   getPrompt(feedbackEventId: string): string | undefined;
@@ -89,6 +92,7 @@ export function createContinuationManager(
       verdict: input.verdict,
       requiredActions: input.requiredActions ?? [],
       allowedNextActions: input.allowedNextActions ?? [],
+      feedbackSummary: input.feedbackSummary,
       resumeInstructions: input.resumeInstructions,
       submissionMessage: input.submissionMessage,
     });
@@ -170,6 +174,14 @@ export function createContinuationManager(
       )
       .orderBy(asc(continuations.createdAt));
     return query.all().map(rowToContinuation);
+  }
+
+  function listReconciliationRequired(): Continuation[] {
+    return database.db.select().from(continuations)
+      .where(eq(continuations.status, "reconciliation_required"))
+      .orderBy(asc(continuations.createdAt))
+      .all()
+      .map(rowToContinuation);
   }
 
   function claim(owner: string, opts?: { id?: string; sessionId?: string }): Continuation | null {
@@ -307,6 +319,38 @@ export function createContinuationManager(
     return updated.changes > 0;
   }
 
+  function markReconciliationRequired(input: { id: string; claimOwner: string; targetRunId: string; reason: string }): boolean {
+    const updated = database.db.update(continuations)
+      .set({
+        status: "reconciliation_required",
+        target: input.targetRunId,
+        feedbackSummary: input.reason.slice(0, 2_000),
+        claimOwner: null,
+        claimedAt: null,
+      })
+      .where(and(
+        eq(continuations.id, input.id),
+        eq(continuations.status, "claimed"),
+        eq(continuations.claimOwner, input.claimOwner),
+      ))
+      .run();
+    return updated.changes > 0;
+  }
+
+  function resolveReconciliation(input: { id: string; targetRunId: string; outcome: "dispatched" | "retry_safe" }): boolean {
+    const updated = database.db.update(continuations)
+      .set(input.outcome === "dispatched"
+        ? { status: "dispatched", target: input.targetRunId, deliveredAt: new Date().toISOString(), feedbackSummary: null }
+        : { status: "pending", target: null, feedbackSummary: null })
+      .where(and(
+        eq(continuations.id, input.id),
+        eq(continuations.status, "reconciliation_required"),
+        eq(continuations.target, input.targetRunId),
+      ))
+      .run();
+    return updated.changes > 0;
+  }
+
   function markDispatched(id: string): void {
     database.db
       .update(continuations)
@@ -342,6 +386,7 @@ export function createContinuationManager(
     get,
     getByFeedbackEventId,
     listPending,
+    listReconciliationRequired,
     listForSession,
     claim,
     release,
@@ -349,6 +394,8 @@ export function createContinuationManager(
     supersede,
     supersedeForSession,
     markDelivered,
+    markReconciliationRequired,
+    resolveReconciliation,
     markDispatched,
     markCompleted,
     getPrompt,
@@ -387,6 +434,7 @@ function renderPrompt(input: {
   verdict: string;
   requiredActions: string[];
   allowedNextActions: string[];
+  feedbackSummary?: string;
   resumeInstructions?: string;
   submissionMessage?: string;
 }): string {
@@ -398,6 +446,12 @@ function renderPrompt(input: {
   lines.push(`Feedback event: ${input.feedbackEventId}`);
   lines.push(`Verdict: ${input.verdict}`);
   lines.push("");
+
+  if (input.feedbackSummary?.trim()) {
+    lines.push("Reviewer comments:");
+    lines.push(input.feedbackSummary.trim());
+    lines.push("");
+  }
 
   if (input.requiredActions.length > 0) {
     lines.push("Required actions:");

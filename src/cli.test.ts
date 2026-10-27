@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { completePtyReviewMutationId, getOrCreatePtyReviewMutationId, readPtyReviewFeedback, readPtyReviewMutationId, readPtyReviewMutationIntent, readPtyReviewSubmission } from "./pty-review-cli.js";
 
 const repositoryRoot = fileURLToPath(new URL("..", import.meta.url));
 
@@ -9,6 +12,64 @@ const packageJson = JSON.parse(readFileSync(new URL("../package.json", import.me
   version: string;
 };
 const cliSource = readFileSync(new URL("./cli.ts", import.meta.url), "utf8");
+
+const validSubmission = readPtyReviewSubmission({ structuredContent: { submissionId: "submission-1", status: "awaiting_review" } });
+assert.equal(validSubmission.ok, true, "a valid PTY review submission returns its durable receipt");
+assert.equal(readPtyReviewSubmission({ isError: true, content: [{ type: "text", text: "token expired" }] }).ok, false,
+  "MCP submission errors, including expired credentials, fail closed");
+assert.equal(readPtyReviewSubmission({ structuredContent: { status: "awaiting_review" } }).ok, false,
+  "a malformed submission response is not printed as a successful result");
+assert.deepEqual(readPtyReviewMutationId(["submit", "--client-mutation-id", "review-retry-1"]), {
+  ok: true,
+  clientMutationId: "review-retry-1",
+}, "PTY review retries can preserve a stable mutation identity");
+assert.equal(readPtyReviewMutationId(["submit", "--client-mutation-id"]).ok, false,
+  "a mutation identity cannot be omitted after its flag");
+assert.equal(readPtyReviewMutationId(["submit", "--client-mutation-id", "x".repeat(201)]).ok, false,
+  "mutation identity length matches the durable receipt contract");
+assert.equal(readPtyReviewMutationId(["submit", "--client-mutation-id", "first", "--client-mutation-id", "second"]).ok, false,
+  "duplicate mutation identity flags are rejected as ambiguous");
+assert.match(cliSource, /clientMutationId = mutationId\.clientMutationId[\s\S]*getOrCreatePtyReviewMutationId/,
+  "managed PTY submissions reuse pending identities or create one automatically");
+assert.match(cliSource, /prior PTY review submission has an unresolved response/,
+  "an explicit new identity cannot bypass an unresolved automatic submission");
+assert.match(cliSource, /clientMutationId,\n\s*\},/,
+  "every managed PTY review submission carries an idempotency identity");
+assert.match(cliSource, /getOrCreatePtyReviewMutationId\(mutationIntentPath\)/,
+  "managed PTY submissions persist a retry identity before contacting MCP");
+assert.match(cliSource, /completePtyReviewMutationId\(mutationIntentPath, clientMutationId\)/,
+  "managed PTY submissions clear the retry identity only after receiving a durable receipt");
+assert.match(cliSource, /--client-mutation-id <stable-id>/,
+  "PTY review help documents the retry identity option");
+const intentDirectory = mkdtempSync(join(tmpdir(), "kontrol-pty-review-intent-"));
+const intentPath = join(intentDirectory, "submission-intent");
+try {
+  const firstIntent = getOrCreatePtyReviewMutationId(intentPath);
+  assert.equal(getOrCreatePtyReviewMutationId(intentPath), firstIntent,
+    "a retry after losing the CLI response reuses its pending submission identity");
+  assert.equal(readPtyReviewMutationIntent(intentPath), firstIntent,
+    "pending submission identity can be checked before honoring an explicit override");
+  assert.equal(statSync(intentPath).mode & 0o077, 0,
+    "the persisted PTY retry identity is private to the agent process owner");
+  completePtyReviewMutationId(intentPath, firstIntent);
+  assert.equal(readPtyReviewMutationIntent(intentPath), undefined,
+    "a confirmed receipt clears the pending identity");
+  const nextIntent = getOrCreatePtyReviewMutationId(intentPath);
+  assert.notEqual(nextIntent, firstIntent,
+    "a later review round receives a fresh identity after the prior receipt is observed");
+  assert.throws(() => completePtyReviewMutationId(intentPath, firstIntent), /changed before receipt cleanup/,
+    "cleanup cannot erase a different pending submission after an unexpected race");
+  completePtyReviewMutationId(intentPath, nextIntent);
+} finally {
+  rmSync(intentDirectory, { recursive: true, force: true });
+}
+const feedbackTimeout = readPtyReviewFeedback({ structuredContent: { status: "timeout", sessionId: "work-1" } });
+assert.equal(feedbackTimeout.ok, true);
+assert.equal(feedbackTimeout.status, "timeout", "feedback timeout stays distinguishable so the CLI can continue waiting");
+assert.equal(readPtyReviewFeedback({ structuredContent: { status: "error", message: "Session cancelled" } }).ok, false,
+  "cancellation is a failing feedback result rather than a successful stdout receipt");
+assert.equal(readPtyReviewFeedback({ isError: true, content: [{ type: "text", text: "credential expired" }] }).ok, false,
+  "MCP feedback errors are surfaced as failures");
 
 assert.match(
   cliSource,
@@ -391,4 +452,175 @@ for (const flag of ["-v", "--version"]) {
     await new Promise<void>((r) => agent.close(() => r()));
   }
   rmSync(configDir, { recursive: true, force: true });
+}
+
+// P1-08: ingress inspect|plan — read-only Tailscale ingress CLI surface.
+{
+  // static wiring: command union, normalizeCommand, and the main switch
+  assert.match(
+    cliSource,
+    /type Command = "serve"[^;]*"ingress"[^;]*"version";/,
+    "ingress must be part of the Command union",
+  );
+  assert.match(cliSource, /command === "ingress"\) return "ingress";/, "normalizeCommand must accept ingress");
+  assert.match(cliSource, /case "ingress":\s+await runIngressCommand\(args\);/, "main switch must dispatch ingress");
+  assert.match(cliSource, /Usage: kontrol ingress <inspect\|plan\|apply\|disable\|reconcile\|doctor>/, "ingress help must expose observation and lifecycle commands");
+  assert.match(cliSource, /requires --confirm to authorize a Tailscale route change/, "route mutations must require explicit operator authorization");
+
+  // Mutation boundary gate: only the facts reader and the narrow controller
+  // may spawn Tailscale; both use execFile without a shell. The controller's
+  // argument grammar excludes resets and only accepts profile-scoped routes.
+  // Two complementary invariants:
+  // (1) tailscale-status.ts is the read-only facts executor and must never
+  //     contain mutation flags. (2) controller.ts is the only mutation
+  //     executor and keeps a narrow argument allowlist. (3) all other ingress
+  //     modules remain free of child-process capability.
+  const tailscaleStatusSource = readFileSync(fileURLToPath(new URL("./ingress/tailscale-status.ts", import.meta.url)), "utf8");
+  for (const [banner, label] of [
+    [new RegExp("--bg"), "the mutating --bg flag"],
+    [new RegExp("funnel reset"), "funnel state reset"],
+    [new RegExp("serve reset"), "serve state reset"],
+    [new RegExp("shell:"), "shell-enabled exec"],
+    [new RegExp("execSync"), "synchronous exec surface"],
+  ] as Array<[RegExp, string]>) {
+    assert.doesNotMatch(tailscaleStatusSource, banner, "tailscale-status.ts must never contain " + label);
+  }
+  // P3-C: pin the EXACT child_process import shape of tailscale-status.ts:
+  // execFile only (never exec/spawn/execSync, which are shell-prone or
+  // unguarded), and no require() escape hatch.
+  assert.match(tailscaleStatusSource, new RegExp('import [{] execFile [}] from "node:child_process"'), "tailscale-status.ts must import ONLY execFile from child_process");
+  assert.doesNotMatch(tailscaleStatusSource, new RegExp("require[(]"), "tailscale-status.ts must not use require()");
+  const execFileCallSites = tailscaleStatusSource.split("execFile(").length - 1;
+  assert.equal(execFileCallSites, 1, "tailscale-status.ts must have exactly ONE execFile call site (inside the guarded helper)");
+  const controllerSource = readFileSync(fileURLToPath(new URL("./ingress/controller.ts", import.meta.url)), "utf8");
+  assert.match(controllerSource, /import [{] execFile [}] from "node:child_process"/, "controller must use execFile, never a shell");
+  assert.equal(controllerSource.split("execFile(").length - 1, 1, "controller must have one guarded execFile site");
+  assert.match(controllerSource, /const allowed = \/\^\(serve\|funnel\)/, "controller must enforce exact Serve/Funnel argument grammar");
+  assert.doesNotMatch(controllerSource, /execSync|spawnSync/, "controller must never use a synchronous shell surface");
+  assert.match(controllerSource, /args\.some\(\(arg\) => arg === "reset"/, "controller explicitly rejects any reset argument");
+  // P3-D: scan the ingress directory so new modules cannot gain child process
+  // capability without being explicitly reviewed here.
+  const ingressDir = fileURLToPath(new URL("./ingress/", import.meta.url));
+  const pureIngressModules = readdirSync(ingressDir)
+    .filter((name) => name.endsWith(".ts") && !name.endsWith(".test.ts") && name !== "tailscale-status.ts" && name !== "controller.ts")
+    .sort()
+    .map((name) => "./ingress/" + name);
+  for (const gateFile of pureIngressModules) {
+    const source = readFileSync(fileURLToPath(new URL(gateFile, import.meta.url)), "utf8");
+    assert.doesNotMatch(source, new RegExp('from [\'\"]node:child_process|require[(][\'\"]node:child_process'), gateFile + " must never import child_process (pure logic only)");
+  }
+  // P1-B: cli.ts only calls the controller API. It must not gain a direct
+  // mutating flag or pass the Tailscale binary to any child process.
+  assert.doesNotMatch(cliSource, new RegExp("--bg"), "cli.ts must never contain the mutating --bg flag");
+  assert.doesNotMatch(cliSource, new RegExp("serve reset"), "cli.ts must never reset serve state");
+  assert.doesNotMatch(cliSource, new RegExp("funnel reset"), "cli.ts must never reset funnel state");
+  // The ban covers any quoted form of the binary name, including a backtick
+  // template, so the name cannot be smuggled into a spawn/exec call through a
+  // different quoting style.
+  assert.doesNotMatch(cliSource, new RegExp("[\\'\"\u0060]tailscale[\\'\"\u0060]"), "cli.ts must never pass the tailscale binary name to a spawn/exec call");
+
+  const runIngress = (subcommand: "inspect" | "plan", envOverrides: Record<string, string | undefined>) =>
+    spawnSync("npx", ["tsx", "src/cli.ts", "ingress", subcommand], {
+      cwd: repositoryRoot,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        KONTROL_CONFIG_DIR: "/tmp/kontrol-cli-ingress-test",
+        KONTROL_OAUTH_OWNER_TOKEN: "cli-ingress-owner-token-that-is-long-enough",
+        KONTROL_ALLOWED_ROOTS: process.cwd(),
+        ...envOverrides,
+      },
+    });
+  const runIngressPlan = (envOverrides: Record<string, string | undefined>) => runIngress("plan", envOverrides);
+
+  // Functional e2e (hermetic — plan never spawns tailscale): a
+  // secure_tunnel_listener-targeting profile is refused with a nonzero exit.
+  const tunnelProfile = {
+    id: "tunnel-1",
+    kind: "secure_mcp_tunnel",
+    audience: "owner_public",
+    externalOrigin: "https://kontrol.example.com",
+    target: "secure_tunnel_listener",
+    enabled: true,
+    allowedHosts: ["kontrol.example.com"],
+  };
+  const refused = runIngressPlan({
+    KONTROL_AUTH_MODE: "tunnel",
+    KONTROL_POLICY_MODE: "allow",
+    KONTROL_PUBLIC_BASE_URL: "https://kontrol.example.com",
+    KONTROL_INGRESS_PROFILES: JSON.stringify([tunnelProfile]),
+  });
+  assert.notEqual(refused.status, 0, "plan must exit nonzero when a profile is refused");
+  assert.match(refused.stdout ?? "", /plan only, nothing was executed/, "plan output must be clearly labeled dry-run");
+  assert.match(refused.stdout ?? "", /never proxy it through Tailscale/, "the tunnel-target refusal reason must be printed");
+
+  // Unconfigured deployment: the empty-list note, exit 0, bit-identical to
+  // the previous behavior apart from the new command itself.
+  const unconfigured = runIngressPlan({ KONTROL_INGRESS_PROFILES: undefined });
+  assert.equal(unconfigured.status, 0, "plan over an unconfigured profile list exits 0");
+  assert.match(unconfigured.stdout ?? "", /KONTROL_INGRESS_PROFILES is not configured/);
+  assert.doesNotMatch(unconfigured.stdout ?? "", /command:/, "an unconfigured plan must not print any command");
+
+  // Spawn tripwire (authoritative for BOTH subcommands): the sentinel
+  // APPENDS its argv to a hit file inside a PRIVATE os.tmpdir() scratch dir
+  // (never the developer-scratch .tmp-scratch/). `ingress plan` must leave
+  // NO hit file (it never spawns). `ingress inspect` must reach the facts
+  // layer through the sentinel and produce EXACTLY the four read-only fact
+  // invocations - catching any direct cli.ts spawn or allowlist bypass
+  // implementation-agnostically.
+  const scratch = mkdtempSync(join(tmpdir(), "kontrol-cli-tripwire-"));
+  const sentinelScript = join(scratch, "sentinel.sh");
+  const sentinelHit = join(scratch, "hit.txt");
+  writeFileSync(
+    sentinelScript,
+    "#!/bin/sh\nprintf '%s\\n' \"$@\" >> " + JSON.stringify(sentinelHit) + "\nexit 0\n",
+    { mode: 0o755 },
+  );
+  // The sentinel is a POSIX shell script. On Windows there is no /bin/sh, so
+  // the sentinel cannot run and the tripwire cannot observe anything. The
+  // platform guard follows the repository convention: the tripwire is a
+  // POSIX-only assertion, and the rest of this suite still runs everywhere.
+  const skipTripwire = process.platform === "win32";
+  try {
+    const serveProfile = {
+      id: "serve-pub",
+      kind: "tailscale_serve",
+      audience: "owner_public",
+      externalOrigin: "https://node.ts.net:8443",
+      target: "public_oauth_listener",
+      enabled: true,
+      managedByKontrol: false,
+      allowedHosts: ["node.ts.net:8443"],
+    };
+    const tripwireEnv = {
+      KONTROL_TAILSCALE_BIN: sentinelScript,
+      KONTROL_PUBLIC_BASE_URL: "https://node.ts.net:8443",
+      KONTROL_INGRESS_PROFILES: JSON.stringify([serveProfile]),
+    };
+    if (skipTripwire) {
+      console.log("cli.test.ts: spawn tripwire skipped on this platform (POSIX-only sentinel)");
+    } else {
+      const planTripwire = runIngressPlan(tripwireEnv);
+      assert.ok(planTripwire.status !== undefined, "plan tripwire run must complete");
+      assert.equal(existsSync(sentinelHit), false, "plan must NEVER spawn the tailscale binary");
+
+      // Pre-run cleanup so an interrupted earlier run cannot false-fail here.
+      rmSync(sentinelHit, { force: true });
+      const inspectTripwire = runIngress("inspect", tripwireEnv);
+      assert.ok(inspectTripwire.status !== undefined, "inspect tripwire run must complete");
+      assert.ok(existsSync(sentinelHit), "inspect must reach the tailscale facts layer through the sentinel");
+      // The sentinel appends one line per argv element (spawnSync passes the
+      // args flat), so the expected file is the flattened, ordered sequence of
+      // the four fact invocations. Any extra invocation or flag appends more
+      // lines and fails the deepEqual.
+      const invocations = readFileSync(sentinelHit, "utf8").split("\n").filter((line) => line !== "");
+      assert.deepEqual(
+        invocations,
+        ["version", "status", "--json", "serve", "status", "--json", "funnel", "status", "--json"],
+        "the facts layer may ONLY run the four read-only fact commands",
+      );
+    }
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
 }

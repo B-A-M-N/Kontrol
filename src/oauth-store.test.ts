@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { InvalidGrantError, InvalidTokenError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
+import { InvalidGrantError, InvalidTokenError } from "@modelcontextprotocol/server-legacy/auth";
 import { databasePath, openDatabase } from "./db/client.js";
 import { SingleUserOAuthProvider } from "./oauth-provider.js";
 import { DCR_UNUSED_GRACE_SECONDS, MAX_OAUTH_CLIENTS, SqliteOAuthClientsStore, SqliteOAuthStore } from "./oauth-store.js";
@@ -112,6 +112,41 @@ async function testDatabaseConfiguration(stateDir: string): Promise<void> {
       { version: 69, name: "review-handoff-routing" },
       { version: 70, name: "dispatch-outbox-claim-fencing" },
       { version: 71, name: "supervisor-oscillation-fingerprints" },
+      { version: 72, name: "review-route-session-uniqueness" },
+      { version: 73, name: "scheduled-dispatch-fencing" },
+      { version: 74, name: "scheduled-dispatch-outcome-separation" },
+      { version: 75, name: "acp-dispatch-idempotency-lookup" },
+      { version: 76, name: "scheduled-job-owner-cursors" },
+      { version: 77, name: "scheduled-job-cancellation-state" },
+      { version: 78, name: "scheduled-job-acp-attempt-identity" },
+      { version: 79, name: "scheduled-job-immutable-reports" },
+      { version: 80, name: "scheduled-job-execution-accounting" },
+      { version: 81, name: "acp-run-scheduled-execution-mode" },
+      { version: 82, name: "scheduled-job-result-ownership" },
+      { version: 83, name: "scheduled-state-times-and-verification-single-flight" },
+      { version: 84, name: "mcp-qualification-evidence" },
+      { version: 85, name: "external-catalog-observations-and-associations" },
+      { version: 86, name: "work-session-principal-identity" },
+      { version: 87, name: "scheduled-job-publication-receipts" },
+      { version: 88, name: "scheduled-job-reconcile-backoff" },
+      { version: 89, name: "historical-schema-drift-repair" },
+      { version: 90, name: "scheduled-dispatch-attempt-diagnostics" },
+      { version: 91, name: "persistent-review-threads" },
+      { version: 92, name: "review-handoff-claim-leases" },
+      { version: 93, name: "browser-review-transport" },
+      { version: 94, name: "review-browser-auth-state" },
+      { version: 95, name: "authenticated-outcome-observation-receipts" },
+      { version: 96, name: "review-browser-attempt-recovery-receipts" },
+      { version: 97, name: "review-browser-generation-observations" },
+      { version: 98, name: "scheduler-error-fingerprint-index" },
+      { version: 99, name: "filesystem-snapshot-root-indexes" },
+      { version: 100, name: "sqlite-peer-job-storage" },
+      { version: 101, name: "durable-agent-pty-bindings" },
+      { version: 102, name: "acp-run-exact-input-task" },
+      { version: 103, name: "review-browser-binding-revision-fence" },
+      { version: 104, name: "scheduled-job-peer-pull-target" },
+      { version: 105, name: "durable-agent-reply-dispatch-ack" },
+      { version: 106, name: "startup-recovery-selective-indexes" },
     ]);
   } finally {
     database.close();

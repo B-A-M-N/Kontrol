@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import { createServer as createNetServer } from "node:net";
@@ -18,6 +19,7 @@ import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { tmpdir } from "node:os";
 import { gunzipSync } from "node:zlib";
+import { testHarnessEnvironment } from "../scripts/lib/tool-environment.mjs";
 
 const root = process.cwd();
 const tmp = mkdtempSync(join(tmpdir(), "kontrol-package-"));
@@ -31,7 +33,7 @@ try {
   console.log("[package-release] staging + packing release artifact...");
   execFileSync("node", [join(root, "scripts", "package-stage.mjs"), "--pack-destination", tmp], {
     cwd: root,
-    env: { ...process.env, npm_config_cache: join(tmp, "npm-cache") },
+    env: testHarnessEnvironment(process.env, { overrides: { npm_config_cache: join(tmp, "npm-cache") } }),
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -49,6 +51,26 @@ try {
   assert.ok(existsSync(join(pkg, "dist/cli.js")), "packed package is missing dist/cli.js");
   assert.ok(existsSync(join(pkg, "dist/acp-worker-token.mjs")), "packed package is missing dist/acp-worker-token.mjs");
   assert.ok(existsSync(join(pkg, "dist/service.js")), "packed package is missing compiled service lifecycle code");
+  const packagedBridgeConfig = readFileSync(join(pkg, "deploy/bridge/Caddyfile.example"));
+  assert.deepEqual(
+    packagedBridgeConfig,
+    readFileSync(join(root, "deploy/bridge/Caddyfile.example")),
+    "packed release must carry the exact audited bridge configuration",
+  );
+  const bridgeManifest = JSON.parse(readFileSync(join(pkg, "deploy/bridge/ingress-config-manifest.json"), "utf8"));
+  assert.equal(bridgeManifest.schemaVersion, 2);
+  assert.equal(bridgeManifest.configPath, "deploy/bridge/Caddyfile.example");
+  assert.equal(
+    bridgeManifest.configSha256,
+    createHash("sha256").update(packagedBridgeConfig).digest("hex"),
+    "packaged bridge manifest must hash the exact included config bytes",
+  );
+  for (const name of ["Caddyfile.multipath.example", "KontrolGateway.Caddyfile.example"]) {
+    const packaged = readFileSync(join(pkg, "deploy/bridge", name));
+    assert.deepEqual(packaged, readFileSync(join(root, "deploy/bridge", name)), `packed release must carry ${name}`);
+    const receipt = bridgeManifest.configs?.find((entry) => entry.configPath === `deploy/bridge/${name}`);
+    assert.equal(receipt?.configSha256, createHash("sha256").update(packaged).digest("hex"), `release manifest must bind ${name}`);
+  }
   assert.equal(
     existsSync(join(pkg, "scripts/kontrol-user-service.sh")),
     false,
@@ -80,10 +102,7 @@ try {
     tarball,
   ], {
     cwd: tmp,
-    env: {
-      ...process.env,
-      npm_config_update_notifier: "false",
-    },
+    env: testHarnessEnvironment(process.env, { overrides: { npm_config_update_notifier: "false" } }),
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -142,8 +161,7 @@ try {
 
   const servicePort = await unusedTcpPort();
   const serviceState = join(tmp, "installed-state");
-  const serviceEnv = {
-    ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("KONTROL_POLICY_"))),
+  const serviceEnv = testHarnessEnvironment(process.env, { overrides: {
     HOST: "127.0.0.1",
     PORT: String(servicePort),
     KONTROL_AUTH_MODE: "tunnel",
@@ -158,7 +176,7 @@ try {
     // read-only discovery is frictionless, while arbitrary shell and file
     // mutation return approval_required without executing.
     KONTROL_TUNNEL_REVIEWER_SECRET: "package-release-reviewer-secret-long-enough",
-  };
+  } });
   const doctorOutput = execFileSync("node", [installedCli, "doctor"], {
     cwd: installPrefix,
     env: serviceEnv,
@@ -349,6 +367,13 @@ try {
     });
   }
 
+  for (const script of ["scripts/probe-ingress-bridge.mjs", "scripts/qualify-caddy-bridge.mjs", "scripts/lib/mcp-endpoint-selector.mjs", "scripts/mcp-owner-stdio-bridge.mjs"]) {
+    assert.ok(existsSync(join(installedPkg, script)), `clean install is missing ${script}`);
+  }
+  for (const module of ["dist/ingress/health-store.js", "dist/ingress/proxy-context.js"]) {
+    assert.ok(existsSync(join(installedPkg, module)), `clean install is missing qualification dependency ${module}`);
+  }
+
   console.log("package-release.test.mjs: shipped adapter imports validated");
 } finally {
   rmSync(tmp, { recursive: true, force: true });
@@ -536,13 +561,12 @@ function assertUserFacingBranding(pkg) {
 }
 
 function serviceEnvForInstall(tmpRoot, installPrefix) {
-  return {
-    ...process.env,
+  return testHarnessEnvironment(process.env, { overrides: {
     XDG_CONFIG_HOME: join(tmpRoot, "service-config-home"),
     XDG_DATA_HOME: join(tmpRoot, "service-data-home"),
     KONTROL_SERVICE_DATA_DIR: join(tmpRoot, "service-data"),
     KONTROL_ALLOWED_ROOTS: installPrefix,
-  };
+  } });
 }
 
 function removeAllowedAttribution(file, text) {

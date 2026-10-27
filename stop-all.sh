@@ -8,7 +8,7 @@ echo "[*] Stopping kontrol + tunnel-client + ACP adapters (graceful first)..."
 
 # P1 #43: Graceful shutdown — send SIGINT, wait, then escalate per-session.
 # We only touch sessions we own (exact tmux session names).
-SESSIONS=("kontrol-server" "kontrol-tunnel" "kontrol-supervisor" "kontrol-adapter" "kontrol-adapter-crush" "kontrol-adapter-hermes")
+SESSIONS=("kontrol-server" "kontrol-tunnel" "kontrol-supervisor" "kontrol-adapter" "kontrol-adapter-crush" "kontrol-adapter-hermes" "kontrol-beta-soak")
 
 for s in "${SESSIONS[@]}"; do
   if tmux has-session -t "$s" 2>/dev/null; then

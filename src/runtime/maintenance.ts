@@ -14,7 +14,7 @@ import type { ServerConfig } from "../config.js";
 import type { DatabaseHandle } from "../db/client.js";
 import type { FilesystemSnapshotStore } from "../filesystem-snapshot-store.js";
 import type { ReviewCheckpointManager } from "../review-checkpoints.js";
-import { collectDurableSnapshotRoots, type DurableSnapshotRoot } from "./snapshot-roots.js";
+import { iterateDurableSnapshotRoots, type DurableSnapshotRoot } from "./snapshot-roots.js";
 
 /** Canonical terminal work-session statuses (shared with server.ts). */
 export const terminalWorkSessionStatuses = new Set(["approved", "rejected", "cancelled", "failed", "failed_protocol"]);
@@ -40,10 +40,12 @@ export interface MaintenanceDeps {
   };
   reviewCheckpoints: Pick<ReviewCheckpointManager, "getSnapshotStore">;
   managedWorktreeGc?: () => Promise<{ removed: number; retained: number; failed: number }>;
+  /** Prune unreferenced, completed migration backups after retention. */
+  pruneDeploymentBackups?: () => string[];
 }
 
 export function createMaintenanceCoordinator(deps: MaintenanceDeps) {
-  const { config, db, workSessions, approvalRequests, eventStore, mutationReceipts, reviewCheckpoints, managedWorktreeGc } = deps;
+  const { config, db, workSessions, approvalRequests, eventStore, mutationReceipts, reviewCheckpoints, managedWorktreeGc, pruneDeploymentBackups } = deps;
   const reportMaintenanceFailure = (scope: string, error: unknown, fields: Record<string, unknown> = {}) => {
     const detail = error instanceof Error ? error.message : String(error);
     logEvent(config.logging, "error", "maintenance_failure", { scope, detail, ...fields });
@@ -62,6 +64,8 @@ export function createMaintenanceCoordinator(deps: MaintenanceDeps) {
   const COMPACT_BATCH_SIZE = 250;
   let maintenanceStopped = false;
   let maintenanceRunning = false;
+  let currentCycleCompletion: Promise<void> | undefined;
+  let resolveCurrentCycle: (() => void) | undefined;
   let runtimeReconciliationCursor: string | undefined;
   let compactionCursor: string | undefined;
   const maintenanceStats: {
@@ -102,7 +106,15 @@ export function createMaintenanceCoordinator(deps: MaintenanceDeps) {
   // swallowed that error and passed an empty root set to GC would turn "I
   // could not determine what data is live" into "nothing in SQLite is live".
   // The GC slice is skipped while degraded; the next cycle retries.
-  const collectFsSnapshotDbRoots = (): DurableSnapshotRoot[] => collectDurableSnapshotRoots(db);
+  let snapshotRootEnumerationFailed = false;
+  const collectFsSnapshotDbRoots = function* (): Generator<DurableSnapshotRoot> {
+    try {
+      yield* iterateDurableSnapshotRoots(db);
+    } catch (error) {
+      snapshotRootEnumerationFailed = true;
+      throw error;
+    }
+  };
 
   const snapshotGcSlice = async (
     store: FilesystemSnapshotStore,
@@ -157,6 +169,7 @@ export function createMaintenanceCoordinator(deps: MaintenanceDeps) {
     maintenanceStats.cycles++;
     maintenanceStats.lastStartedAt = new Date().toISOString();
     maintenanceStats.lastError = undefined;
+    currentCycleCompletion = new Promise<void>((resolve) => { resolveCurrentCycle = resolve; });
     const startedAt = performance.now();
     let page: string[] = [];
     let pageIndex = 0;
@@ -175,6 +188,10 @@ export function createMaintenanceCoordinator(deps: MaintenanceDeps) {
       maintenanceStats.maxDurationMs = Math.max(maintenanceStats.maxDurationMs, durationMs);
       maintenanceStats.lastCompletedAt = new Date().toISOString();
       maintenanceRunning = false;
+      const resolve = resolveCurrentCycle;
+      currentCycleCompletion = undefined;
+      resolveCurrentCycle = undefined;
+      resolve?.();
     };
 
     const step = async (): Promise<void> => {
@@ -260,38 +277,40 @@ export function createMaintenanceCoordinator(deps: MaintenanceDeps) {
           // advanced per yielded step; if it reports more work, the next cycle
           // resumes (never monopolizing the serving thread).
           const store = reviewCheckpoints.getSnapshotStore();
-          // P0 fail-closed: probe the durable root set BEFORE any GC slice.
-          // An enumeration failure marks maintenance degraded and skips GC
-          // entirely (reclaim nothing); the next cycle retries.
-          try {
-            collectFsSnapshotDbRoots();
-            maintenanceStats.snapshotRootsDegraded = false;
-            maintenanceStats.snapshotRootsLastError = undefined;
-          } catch (error) {
-            const detail = error instanceof Error ? error.message : String(error);
+          // gcSlice establishes durable roots before every destructive phase
+          // and fails closed. Observe that result directly instead of doing a
+          // redundant full SQLite root scan before each slice.
+          snapshotRootEnumerationFailed = false;
+          const slice = await snapshotGcSlice(store, MAINTENANCE_BUDGET_MS, MAINTENANCE_PAGE_SIZE);
+          if (snapshotRootEnumerationFailed) {
+            const detail = slice.error ?? "durable snapshot root enumeration failed";
             maintenanceStats.snapshotRootsDegraded = true;
             maintenanceStats.snapshotRootsLastError = detail;
             maintenanceStats.lastError = detail;
-            reportMaintenanceFailure("snapshot_gc_db_roots", error);
+            reportMaintenanceFailure("snapshot_gc_db_roots", detail);
             snapshotGcDone = true;
             setImmediate(step);
             return;
           }
-          const slice = await snapshotGcSlice(store, MAINTENANCE_BUDGET_MS, MAINTENANCE_PAGE_SIZE);
           if (slice.error) {
             maintenanceStats.lastError = slice.error;
             reportMaintenanceFailure("snapshot_gc", slice.error);
-            // Advance past the failing GC class so a corrupt store cannot wedge
-            // all future maintenance; it is retried next cycle.
-            snapshotGcDone = true;
-            setImmediate(step);
-            return;
+          } else {
+            maintenanceStats.snapshotRootsDegraded = false;
+            maintenanceStats.snapshotRootsLastError = undefined;
           }
           const wasDone = snapshotGcDone;
           snapshotGcDone = !slice.hasMore;
           // Once a full GC pass completes, drop stale session baseline pins so
           // the blobs they rooted become reclaimable.
           if (!wasDone && snapshotGcDone) await pruneStaleSessionBaselines();
+          if (pruneDeploymentBackups) {
+            try {
+              pruneDeploymentBackups();
+            } catch (error) {
+              reportMaintenanceFailure("deployment_backup_prune", error);
+            }
+          }
           setImmediate(step);
           return;
         }
@@ -353,11 +372,11 @@ export function createMaintenanceCoordinator(deps: MaintenanceDeps) {
   const maintenanceTimer = setInterval(runMaintenanceCycle, MAINTENANCE_INTERVAL_MS);
   maintenanceTimer.unref?.();
 
-  /** Stop the loop: no further cycles start; an in-flight cycle finishes its
-   * current bounded step. */
-  function stop(): void {
+  /** Stop new cycles and drain the active bounded step before dependent stores close. */
+  async function stop(): Promise<void> {
     maintenanceStopped = true;
     clearInterval(maintenanceTimer);
+    await currentCycleCompletion;
   }
 
   /** Seed the runtime-reconciliation cursor from startup recovery, so the

@@ -4,7 +4,13 @@ import type { PolicyEngine, PolicyDecision, ApprovalScope, PolicyInputPath } fro
 import { CANONICAL_TOOL_ALIASES } from "./policy.js";
 import type { EventStore } from "./event-log.js";
 
-export type PrincipalRole = "reviewer" | "worker" | "client";
+/**
+ * "peer" is a separately-authenticated integration identity. It carries NO
+ * reviewer or worker authority: every authorization decision keys off
+ * === "reviewer" / === "worker", so a peer always lands in the unprivileged
+ * client-like denial paths. Never add "peer" to reviewer allowlists.
+ */
+export type PrincipalRole = "reviewer" | "worker" | "client" | "peer";
 
 export interface PolicyInvocation {
   principalId: string;

@@ -41,6 +41,7 @@ export interface WorkSessionManager {
     title?: string;
     completionPolicy?: CompletionPolicy;
     ownerContextId?: string;
+    principalId?: string;
   }): WorkSession;
   get(id: string): WorkSession | undefined;
   listByWorkspace(workspaceSessionId: string, limit?: number): WorkSession[];
@@ -52,9 +53,11 @@ export interface WorkSessionManager {
     ownerInstanceId?: string;
     ttlMs?: number;
     takeover?: boolean;
+    leaseKind?: "modify" | "peer_job";
   }): WorkspaceLeaseResult;
   restoreWorkspaceLeaseForSession(previous: WorkspaceLease, expectedLeaseNonce: string): boolean;
   releaseWorkspaceLeasesForSession(workSessionId: string): number;
+  releaseWorkspaceLeaseForSession(workSessionId: string, leaseNonce: string): boolean;
   renewWorkspaceLeaseForSession(workSessionId: string, ttlMs: number | undefined, leaseNonce: string): number;
   getActiveWorkspaceLease(canonicalRoot: string): WorkspaceLease | undefined;
   getWorkspaceLeaseForSession(workSessionId: string): WorkspaceLease | undefined;
@@ -121,6 +124,7 @@ export interface WorkSessionManager {
     filter?: "all" | "pending_review" | "stale_pending_review" | "live",
     after?: WorkspaceSessionSurfaceCursor,
     ownerContextId?: string,
+    principalId?: string,
   ): WorkspaceSessionSurfaceEntry[];
   getWorkspaceEventCursor(workspaceSessionId?: string): number;
   /** P2 #10: Active-session projection with all needed fields in one query. */
@@ -178,6 +182,7 @@ export function createWorkSessionManager(
     acquireWorkspaceLease: (input) => leases.acquireWorkspaceLease(input),
     restoreWorkspaceLeaseForSession: (previous, expectedLeaseNonce) => leases.restoreWorkspaceLeaseForSession(previous, expectedLeaseNonce),
     releaseWorkspaceLeasesForSession: (workSessionId) => leases.releaseWorkspaceLeasesForSession(workSessionId),
+    releaseWorkspaceLeaseForSession: (workSessionId, leaseNonce) => leases.releaseWorkspaceLeaseForSession(workSessionId, leaseNonce),
     renewWorkspaceLeaseForSession: (workSessionId, ttlMs, leaseNonce) =>
       leases.renewWorkspaceLeaseForSession(workSessionId, ttlMs, leaseNonce),
     getActiveWorkspaceLease: (canonicalRoot) => leases.getActiveWorkspaceLease(canonicalRoot),
@@ -203,8 +208,8 @@ export function createWorkSessionManager(
     reconcileRuntimeStates: (afterSessionId, limit) => reconcileRuntimeStates(database, afterSessionId, limit),
     countActiveWorkSessions: () => queries.countActiveWorkSessions(),
     countPendingReviews: () => queries.countPendingReviews(),
-    getWorkspaceSessionSurface: (workspaceSessionId, limit, filter, after, ownerContextId) =>
-      queries.getWorkspaceSessionSurface(workspaceSessionId, limit, filter, after, ownerContextId),
+    getWorkspaceSessionSurface: (workspaceSessionId, limit, filter, after, ownerContextId, principalId) =>
+      queries.getWorkspaceSessionSurface(workspaceSessionId, limit, filter, after, ownerContextId, principalId),
     getWorkspaceEventCursor: (workspaceSessionId) => queries.getWorkspaceEventCursor(workspaceSessionId),
     listActiveWorkSessionsProjection: (workspaceSessionId) => queries.listActiveWorkSessionsProjection(workspaceSessionId),
     listSessionIdsNeedingCompaction: (afterSessionId, limit) => queries.listSessionIdsNeedingCompaction(afterSessionId, limit),

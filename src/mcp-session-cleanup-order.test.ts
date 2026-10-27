@@ -16,6 +16,7 @@ const config = loadConfig({
 });
 const state: McpSessionState = {
   sessionId: "session-cleanup-order",
+  listenerKind: "owner",
   sessionLabel: "mcp:client/mcp:session-cleanup-order",
   logicalClientId: "mcp:client",
   identitySource: "conversation",
@@ -32,6 +33,7 @@ const state: McpSessionState = {
   resourceReadCount: 0,
   activeLongPollCount: 0,
   activeSseStreams: 1,
+  transportAttached: true,
   activePolicyWaiters: 0,
   closing: false,
   closed: false,

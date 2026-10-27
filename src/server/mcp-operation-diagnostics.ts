@@ -4,6 +4,9 @@ export interface McpOperationStart {
   externalCorrelationId?: string;
   generationId?: string;
   sessionIdPrefix?: string;
+  sessionIdSha256?: string;
+  serverBuildId?: string;
+  serverVersion?: string;
   method: string;
   rpcMethod?: string;
   toolName?: string;
@@ -83,6 +86,9 @@ export class McpOperationDiagnostics {
         ...(operation.externalCorrelationId ? { externalCorrelationId: operation.externalCorrelationId } : {}),
         ...(operation.generationId ? { generationId: operation.generationId } : {}),
         ...(operation.sessionIdPrefix ? { sessionIdPrefix: operation.sessionIdPrefix } : {}),
+        ...(operation.sessionIdSha256 ? { sessionIdSha256: operation.sessionIdSha256 } : {}),
+        ...(operation.serverBuildId ? { serverBuildId: operation.serverBuildId } : {}),
+        ...(operation.serverVersion ? { serverVersion: operation.serverVersion } : {}),
         method: operation.method,
         ...(operation.rpcMethod ? { rpcMethod: operation.rpcMethod } : {}),
         ...(operation.toolName ? { toolName: operation.toolName } : {}),

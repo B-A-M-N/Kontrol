@@ -1,4 +1,4 @@
-import { copyFileSync, existsSync, chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, chmodSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import Database from "better-sqlite3";
 
@@ -174,6 +174,32 @@ export function markMigrationFailed(stateDir: string, deploymentId: string | und
     migrationFailed: true,
     updatedAt: new Date().toISOString(),
   } satisfies DeploymentMigrationRecord);
+}
+
+/**
+ * Prune unreferenced completed migration backups after retention. Protected
+ * generations and incomplete rollback records are never removed.
+ */
+export function pruneUnreferencedMigrationBackups(
+  stateDir: string,
+  protectedDeploymentIds: ReadonlySet<string>,
+  retentionMs: number,
+  now = Date.now(),
+): string[] {
+  const root = join(stateDir, "deployment-databases");
+  if (!existsSync(root)) return [];
+  const removed: string[] = [];
+  for (const deploymentId of readdirSync(root)) {
+    if (protectedDeploymentIds.has(deploymentId)) continue;
+    const record = readDeploymentMigrationRecord(stateDir, deploymentId);
+    if (!record || record.migrationFailed || record.rollbackRestoreRequired) continue;
+    const updatedAt = Date.parse(record.updatedAt);
+    if (!Number.isFinite(updatedAt) || now - updatedAt <= retentionMs) continue;
+    const target = join(root, deploymentId);
+    rmSync(target, { recursive: true, force: true });
+    removed.push(target);
+  }
+  return removed;
 }
 
 function currentDatabaseSchema(databasePath: string): number {

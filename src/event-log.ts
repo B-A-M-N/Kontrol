@@ -48,6 +48,16 @@ export type EventPredicate = (event: EventStoreEvent) => boolean;
 
 export type EventStoreTimingCallback = (phase: string, durationMs: number) => void;
 
+export interface EventStoreMemoryTelemetry {
+  /** Total live callbacks across per-session, workspace, and global maps. */
+  subscribers: number;
+  subscriberSessions: number;
+  subscriberWorkspaces: number;
+  globalSubscribers: number;
+  /** Pending coalesced telemetry fragments retained in memory. */
+  telemetryBuffers: number;
+}
+
 export interface EventStore {
  appendEvent(input: {
    id?: string;
@@ -60,6 +70,16 @@ export interface EventStore {
  publishEvents(events: EventStoreEvent[]): void;
 
  getEventsForSession(sessionId: string): EventStoreEvent[];
+
+ /** Read the durable session watermark without decoding its event history. */
+ getLatestEventSequenceForSession(sessionId: string): number;
+
+ /** Fetch one newest event without decoding an entire session history. */
+ getLatestEventForSession(
+   sessionId: string,
+   type: string,
+   payloadMatch?: { field: "transferId" | "runId"; value: string },
+ ): EventStoreEvent | undefined;
 
  /** Exact adapter event lookup for idempotent retry handling. */
  getEventById(eventId: string): EventStoreEvent | undefined;
@@ -151,7 +171,10 @@ export interface EventStore {
     predicate: EventPredicate,
     timeoutMs: number,
     signal?: AbortSignal,
+    onProgress?: (lastObservedSeq: number) => void,
   ): Promise<EventStoreEvent | null>;
+
+  memoryTelemetry(): EventStoreMemoryTelemetry;
 
   close(): void;
 }
@@ -168,6 +191,17 @@ export function createEventStore(
   const globalSubscribers = new Set<Subscriber>();
   const workspaceSubscribers = new Map<string, Set<Subscriber>>();
   const telemetryBuffers = new Map<string, TelemetryBuffer>();
+  const findTelemetryIngress = database.sqlite.prepare(`
+    select session_id, workspace_session_id, type, payload_sha256
+      from telemetry_ingress
+     where event_id = ?
+  `);
+  const insertTelemetryIngress = database.sqlite.prepare(`
+    insert into telemetry_ingress
+      (event_id, session_id, workspace_session_id, type, payload_json, payload_sha256, publish, status, received_at)
+    values (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+    on conflict(event_id) do nothing
+  `);
   const TELEMETRY_FLUSH_INTERVAL_MS = 250;
   const TELEMETRY_MAX_BYTES = 16 * 1024;
   const TELEMETRY_INGRESS_BATCH_SIZE = 512;
@@ -206,6 +240,14 @@ export function createEventStore(
       workspaceSessionId: input.workspaceSessionId ?? "",
       payload: input.payload,
     })).digest("hex");
+  }
+
+  function telemetryPayloadHashFromJson(input: { type: string; sessionId: string; workspaceSessionId?: string; }, payloadJson: string): string {
+    // stableJson sorts object keys lexically. The canonical envelope has the
+    // same key order and values as telemetryPayloadHash(), reusing the payload
+    // serialization already written to SQLite.
+    const canonicalEnvelope = `{"payload":${payloadJson},"sessionId":${JSON.stringify(input.sessionId)},"type":${JSON.stringify(input.type)},"workspaceSessionId":${JSON.stringify(input.workspaceSessionId ?? "")}}`;
+    return createHash("sha256").update(canonicalEnvelope).digest("hex");
   }
 
   function hasPendingTelemetryIngress(sessionId?: string): boolean {
@@ -325,27 +367,9 @@ export function createEventStore(
       throw new Error(`Telemetry ingress does not accept event type ${input.type}`);
     }
     const eventId = input.id ?? randomUUID();
-    const payloadJson = JSON.stringify(input.payload);
-    const payloadSha256 = telemetryPayloadHash(input);
-    const existing = database.sqlite.prepare(`
-      select session_id, workspace_session_id, type, payload_sha256
-        from telemetry_ingress
-       where event_id = ?
-    `).get(eventId) as { session_id: string; workspace_session_id?: string | null; type: string; payload_sha256: string } | undefined;
-    if (existing) {
-      if (existing.session_id !== input.sessionId
-        || (existing.workspace_session_id ?? undefined) !== input.workspaceSessionId
-        || existing.type !== input.type
-        || existing.payload_sha256 !== payloadSha256) {
-        throw new Error(`Adapter event id ${eventId} was reused with different telemetry content`);
-      }
-      return { eventId, duplicate: true };
-    }
-    database.sqlite.prepare(`
-      insert into telemetry_ingress
-        (event_id, session_id, workspace_session_id, type, payload_json, payload_sha256, publish, status, received_at)
-      values (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
-    `).run(
+    const payloadJson = stableJson(input.payload);
+    const payloadSha256 = telemetryPayloadHashFromJson(input, payloadJson);
+    const inserted = insertTelemetryIngress.run(
       eventId,
       input.sessionId,
       input.workspaceSessionId ?? null,
@@ -355,6 +379,17 @@ export function createEventStore(
       opts.publish === false ? 0 : 1,
       new Date().toISOString(),
     );
+    if (inserted.changes === 0) {
+      const existing = findTelemetryIngress.get(eventId) as { session_id: string; workspace_session_id?: string | null; type: string; payload_sha256: string } | undefined;
+      if (!existing) throw new Error(`Adapter event id ${eventId} conflicted but its telemetry receipt could not be read`);
+      if (existing.session_id !== input.sessionId
+        || (existing.workspace_session_id ?? undefined) !== input.workspaceSessionId
+        || existing.type !== input.type
+        || (existing.payload_sha256 !== payloadSha256 && existing.payload_sha256 !== telemetryPayloadHash(input))) {
+        throw new Error(`Adapter event id ${eventId} was reused with different telemetry content`);
+      }
+      return { eventId, duplicate: true };
+    }
     scheduleTelemetryIngressFlush();
     return { eventId, duplicate: false };
   }
@@ -687,6 +722,54 @@ export function createEventStore(
     }));
   }
 
+  function getLatestEventSequenceForSession(sessionId: string): number {
+    const row = database.sqlite.prepare(
+      "select coalesce(max(seq), 0) as seq from event_log where session_id = ?",
+    ).get(sessionId) as { seq?: number } | undefined;
+    return Number(row?.seq ?? 0);
+  }
+
+  function getLatestEventForSession(
+    sessionId: string,
+    type: string,
+    payloadMatch?: { field: "transferId" | "runId"; value: string },
+  ): EventStoreEvent | undefined {
+    const row = database.sqlite.prepare(`
+      select id, seq, type, session_id, workspace_session_id, payload, created_at
+      from event_log
+      where session_id = ? and type = ?
+        and (? is null or json_extract(payload, ?) = ?)
+      order by seq desc
+      limit 1
+    `).get(
+      sessionId,
+      type,
+      payloadMatch?.value ?? null,
+      payloadMatch ? `$.${payloadMatch.field}` : null,
+      payloadMatch?.value ?? null,
+    ) as {
+      id: string;
+      seq: number;
+      type: string;
+      session_id: string;
+      workspace_session_id?: string | null;
+      payload: string;
+      created_at: string;
+    } | undefined;
+    if (!row) return undefined;
+    return {
+      id: row.id,
+      seq: row.seq,
+      durable: true,
+      type: row.type,
+      sessionId: row.session_id,
+      workspaceSessionId: row.workspace_session_id ?? undefined,
+      workspaceProjectId: projectIdForWorkspaceSession(row.workspace_session_id ?? undefined),
+      payload: JSON.parse(row.payload) as Record<string, unknown>,
+      createdAt: row.created_at,
+    };
+  }
+
   function getEventsAfter(sessionId: string, afterSeq: number, limit = 500): EventStoreEvent[] {
     const rows = database.sqlite
       .prepare(
@@ -851,13 +934,20 @@ export function createEventStore(
     predicate: EventPredicate,
     timeoutMs: number,
     signal?: AbortSignal,
+    onProgress?: (lastObservedSeq: number) => void,
   ): Promise<EventStoreEvent | null> {
     return new Promise((resolve) => {
       let resolved = false;
+      let cursor = afterSeq;
 
       let timeout: ReturnType<typeof setTimeout> | undefined;
       let unsubscribe: (() => void) | undefined;
       const abort = () => finish(null);
+      const advanceCursor = (seq: number) => {
+        if (seq <= cursor) return;
+        cursor = seq;
+        onProgress?.(cursor);
+      };
 
       const finish = (event: EventStoreEvent | null) => {
         if (resolved) return;
@@ -871,16 +961,16 @@ export function createEventStore(
       // Subscribe first so a concurrently-published event cannot be lost
       // between the query below and the subscription.
       unsubscribe = subscribe(sessionId, (event) => {
-        if (resolved) return;
-        if (event.seq > afterSeq && predicate(event)) {
-          finish(event);
-        }
+        if (resolved || event.seq <= cursor) return;
+        advanceCursor(event.seq);
+        if (predicate(event)) finish(event);
       });
 
       // Re-query durable events after the subscription: something may have
       // been published between the subscribe and the original check.
-      const events = getEventsAfter(sessionId, afterSeq);
+      const events = getEventsAfter(sessionId, cursor);
       for (const event of events) {
+        advanceCursor(event.seq);
         if (predicate(event)) {
           finish(event);
           return;
@@ -1136,6 +1226,8 @@ export function createEventStore(
       for (const event of events) publish(event);
     },
     getEventsForSession,
+    getLatestEventSequenceForSession,
+    getLatestEventForSession,
     getEventById,
     getEventsAfter,
     getWorkspaceEventsAfter,
@@ -1148,6 +1240,13 @@ export function createEventStore(
     subscribeAll,
     waitForEvent,
     waitForMatchingEventAfter,
+    memoryTelemetry: (): EventStoreMemoryTelemetry => ({
+      subscribers: [...subscribers.values()].reduce((sum, set) => sum + set.size, 0),
+      subscriberSessions: subscribers.size,
+      subscriberWorkspaces: workspaceSubscribers.size,
+      globalSubscribers: globalSubscribers.size,
+      telemetryBuffers: telemetryBuffers.size,
+    }),
     close,
   };
 }

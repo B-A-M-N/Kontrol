@@ -300,6 +300,49 @@ policy.revokeGrant(grantA.id);
 assert.equal(grantStore.listEffective().some((g) => g.id === grantA.id), false, "exact revoke removes the targeted grant");
 assert.ok(grantStore.listEffective().some((g) => g.id === grantB.id), "exact revoke leaves a sibling work-session grant");
 assert.ok(grantStore.listEffective().some((g) => g.id === grantW.id), "exact revoke leaves a workspace grant");
+
+// Workspace-scoped grant hydration must not depend on the bounded UI session
+// page: the server projection includes old sessions, excludes other
+// workspaces, and keyset-paginates the effective result.
+const grantWorkspaceA = "workspace-grants-a";
+const grantWorkspaceB = "workspace-grants-b";
+seedWorkspace(root, grantWorkspaceA);
+seedWorkspace(root, grantWorkspaceB);
+const insertGrantTestSession = db.sqlite.prepare(`
+  insert into work_sessions (id, workspace_session_id, submitted_by, created_at, updated_at)
+  values (?, ?, ?, ?, ?)
+`);
+insertGrantTestSession.run("old-grant-session", grantWorkspaceA, "fixture", "2020-01-01T00:00:00.000Z", "2020-01-01T00:00:00.000Z");
+insertGrantTestSession.run("other-grant-session", grantWorkspaceB, "fixture", "2020-01-01T00:00:00.000Z", "2020-01-01T00:00:00.000Z");
+const insertWorkspaceTestGrant = (input: {
+  id: string;
+  scope: "workspace" | "work_session";
+  scopeId: string;
+  expiresAt?: string;
+}) => grantStore.insert({
+  id: input.id,
+  principalId: `principal-${input.id}`,
+  scope: input.scope,
+  scopeId: input.scopeId,
+  approvalKey: "tool:write",
+  createdAt: "2020-01-01T00:00:00.000Z",
+  ...(input.expiresAt ? { expiresAt: input.expiresAt } : {}),
+});
+insertWorkspaceTestGrant({ id: "a-workspace-grant", scope: "workspace", scopeId: grantWorkspaceA });
+insertWorkspaceTestGrant({ id: "b-old-session-grant", scope: "work_session", scopeId: "old-grant-session" });
+insertWorkspaceTestGrant({ id: "c-other-session-grant", scope: "work_session", scopeId: "other-grant-session" });
+insertWorkspaceTestGrant({ id: "d-expired-grant", scope: "workspace", scopeId: grantWorkspaceA, expiresAt: "2000-01-01T00:00:00.000Z" });
+const grantPageOne = policy.listGrantsForWorkspace(grantWorkspaceA, undefined, 1);
+assert.deepEqual(grantPageOne.grants.map((item) => item.id), ["a-workspace-grant"]);
+assert.equal(grantPageOne.nextCursor, "a-workspace-grant", "a full grant page returns a stable ID cursor");
+const grantPageTwo = policy.listGrantsForWorkspace(grantWorkspaceA, grantPageOne.nextCursor, 1);
+assert.deepEqual(grantPageTwo.grants.map((item) => item.id), ["b-old-session-grant"],
+  "workspace projection includes an older session absent from the active UI session page");
+assert.equal(grantPageTwo.nextCursor, undefined);
+assert.equal(policy.listGrantsForWorkspace(grantWorkspaceB).grants.some((item) => item.id === "b-old-session-grant"), false,
+  "work-session grants do not cross workspace boundaries");
+assert.equal(policy.listGrantsForWorkspace(grantWorkspaceA).grants.some((item) => item.id === "d-expired-grant"), false,
+  "workspace projection excludes expired authority");
 assert.equal(
   policy.isApproved("principal-exact-a", "tool:exact-a", { workspaceId: WS_ID, workSessionId: brandWorkSessionId("wsess-exact") }),
   false,

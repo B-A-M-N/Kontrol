@@ -116,6 +116,19 @@ try {
   const env2 = buildControlPlaneGitEnvironment({ GIT_INDEX_FILE: "/tmp/x" });
   assert.equal(env2.GIT_INDEX_FILE, "/tmp/x");
 
+  // Bounded inspection captures stop growing at the configured byte limit,
+  // but the child is still drained to completion so large status results do
+  // not turn into maxBuffer exceptions.
+  for (let index = 0; index < 40; index++) {
+    await writeFile(join(repo, `untracked-${index.toString().padStart(2, "0")}.txt`), "untracked\n");
+  }
+  const boundedStatus = await controlPlaneGit(repo, ["status", "--short", "--untracked-files=normal"], {
+    maxOutputBytes: 96,
+    timeoutMs: 5_000,
+  });
+  assert.equal(Buffer.byteLength(boundedStatus.stdout), 96);
+  assert.equal(boundedStatus.stdoutTruncated, true, "oversized Git status output is returned with an explicit truncation flag");
+
   console.log("git-runner.test.ts: all adversarial assertions passed");
 } finally {
   delete process.env.KONTROL_ACP_AGENT_SECRET;

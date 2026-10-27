@@ -22,7 +22,7 @@ const config = loadConfig({
   PORT: "1",
 });
 const workspace = workspaceStore.createSession({ id: "workspace-owner-review", root });
-const session = workSessions.create({ workspaceSessionId: workspace.id, submittedBy: "mcp", ownerContextId: "conversation:owner-b" });
+const session = workSessions.create({ workspaceSessionId: workspace.id, submittedBy: "mcp", ownerContextId: "conversation:owner-b", principalId: "principal-owner" });
 const bridgeBase = {
   workspaces: { getWorkspace: () => { throw new Error("not used"); } },
   workSessions,
@@ -35,6 +35,13 @@ const owner = requireWorkSessionRead({ ...bridgeBase, connectionConversationId: 
 assert.equal(owner, null, "owner B can read its own work session");
 const globalReviewer = requireWorkSessionRead({ ...bridgeBase }, session.id);
 assert.equal(globalReviewer, null, "ownerless reviewer retains the explicit global review surface");
+// Durable delegated-job recovery: the same authenticated principal returns on
+// a different conversation/transport and can read its own job outcome.
+const reconnectedOwner = requireWorkSessionRead({ ...bridgeBase, connectionContext: { authenticatedPrincipalId: "principal-owner", mcpSessionId: "new-transport" } }, session.id);
+assert.equal(reconnectedOwner, null, "the owning principal can recover its delegated job after reconnect");
+const foreignPrincipal = requireWorkSessionRead({ ...bridgeBase, connectionContext: { authenticatedPrincipalId: "principal-foreign", mcpSessionId: "new-transport" } }, session.id);
+assert.equal(foreignPrincipal?.isError, true, "a different principal cannot recover another owner's session");
+assert.match(foreignPrincipal?.content[0]?.text ?? "", /cross-conversation/);
 workSessions.close();
 workspaceStore.close?.();
 console.log("owner-scoped-review.test.ts: all assertions passed");

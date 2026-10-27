@@ -4,8 +4,8 @@
  *    write/edit/apply_patch/exec_command (REVIEW-01);
  *  - when no usable checkpoint backend exists, mutation fails CLOSED with a
  *    distinct `checkpoint_unavailable` status (never silent untracked mutation);
- *  - open_workspace reports the AUTHORITATIVE backend state, not a
- *    git-eligibility prediction;
+ *  - open_workspace defers baseline capture and read-only inspection remains
+ *    available even when the eventual checkpoint store is unavailable;
  *  - the explicit operator opt-in KONTROL_ALLOW_UNTRACKED_MUTATION=1 restores
  *    the old continue-anyway behavior as a deliberate, visible choice.
  */
@@ -13,8 +13,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
 import { createMcpServer, WorkspaceMutationBlockedError } from "./mcp/workspace-server.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { WorkspaceRegistry } from "./workspaces.js";
@@ -83,8 +82,8 @@ async function callTool(client: Client, name: string, args: Record<string, unkno
   const { client, close } = await startClient(baseEnv());
   const opened = await callTool(client, "open_workspace", { path: healthyRoot, mode: "checkout" });
   const structured = (opened as { structuredContent?: Record<string, unknown> }).structuredContent ?? {};
-  assert.equal(structured.checkpointBackend, "filesystem", "healthy non-Git workspace reports its real filesystem backend");
-  assert.equal((structured.capabilities as Record<string, unknown> | undefined)?.changeTracking, true, "healthy workspace tracks changes");
+  assert.equal(structured.checkpointBackend, "pending", "open_workspace defers filesystem baseline capture");
+  assert.equal((structured.capabilities as Record<string, unknown> | undefined)?.changeTracking, false, "change tracking becomes available after the mutation barrier initializes the baseline");
 
   const shell = await callTool(client, "bash", { workspaceId: structured.workspaceId, command: "echo barrier-crossed" });
   const shellStructured = (shell as { structuredContent?: Record<string, unknown>; isError?: boolean }).structuredContent ?? {};
@@ -92,21 +91,30 @@ async function callTool(client: Client, name: string, args: Record<string, unkno
   await close();
 }
 
-// ── Poisoned workspace: open_workspace reports unavailable; mutation fails closed ──
+// ── Poisoned workspace: open/read succeed; mutation still fails closed ──
 {
   const { client, close } = await startClient(baseEnv(), storeAsFile);
   const opened = await callTool(client, "open_workspace", { path: poisonedRoot, mode: "checkout" });
   const structured = (opened as { structuredContent?: Record<string, unknown> }).structuredContent ?? {};
-  assert.equal(
-    structured.checkpointBackend,
-    "unavailable",
-    `open_workspace reports the authoritative backend state, not a prediction: ${JSON.stringify(structured)}`,
-  );
+  assert.equal(structured.checkpointBackend, "pending", "open_workspace does not perform a checkpoint capture");
   assert.equal((structured.capabilities as Record<string, unknown> | undefined)?.changeTracking, false, "changeTracking is false when no backend is usable");
 
   const workspaceId = structured.workspaceId as string;
 
-  // Ordinary bash now crosses the barrier (P0.4) and is refused (P0.5).
+  const read = await callTool(client, "read", { workspaceId, path: "README.md" });
+  assert.notEqual(read.isError, true, `read-only file inspection is available before checkpoint capture: ${JSON.stringify(read)}`);
+  const readOnlyShell = await callTool(client, "bash", { workspaceId, command: "pwd", readOnlyInspection: true });
+  assert.notEqual(readOnlyShell.isError, true,
+    `allowlisted read-only shell inspection is available without a checkpoint: ${JSON.stringify(readOnlyShell)}`);
+  const deniedInspectionCommand = await callTool(client, "bash", {
+    workspaceId,
+    command: "touch should-not-exist",
+    readOnlyInspection: true,
+  });
+  assert.equal(deniedInspectionCommand.isError, true, "read-only mode rejects non-allowlisted commands before process launch");
+  assert.equal(existsSync(join(poisonedRoot, "should-not-exist")), false, "read-only mode cannot create workspace files");
+
+  // Mutation-capable tools still cross the readiness barrier and fail closed.
   for (const [tool, args] of [
     ["bash", { workspaceId, command: "echo should-not-run" }],
     ["write", { workspaceId, path: "new.txt", content: "nope" }],

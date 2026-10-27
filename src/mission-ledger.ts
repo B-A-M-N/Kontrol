@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { and, asc, desc, eq } from "drizzle-orm";
+import { and, asc, desc, eq, isNotNull } from "drizzle-orm";
 import { openDatabase, type DatabaseHandle } from "./db/client.js";
 import {
   missionAcceptanceCriteria,
@@ -23,7 +23,7 @@ import { fingerprintMissionContract, fingerprintMissionContractV1, fingerprintSt
 import { evaluateEffectiveFindingResolution, evaluateFindingResolutionEvidence, isEvidenceSourceAllowed, selectEffectiveEvidenceResult } from "./mission/evidence-authority.js";
 import { assertFindingStatusTransition, fingerprintFinding, mergeFindingEvidence } from "./mission/finding-authority.js";
 import { evaluateCorrectionPolicy } from "./mission/correction-policy.js";
-import { evaluateEffectiveCriteria, evaluateMissionOutcome, type OutcomeObservation } from "./mission/outcome-evaluator.js";
+import { evaluateEffectiveCriteria, evaluateMissionOutcome, evaluateOutcomeObservations, type OutcomeObservation } from "./mission/outcome-evaluator.js";
 
 export type CriterionStatus = "unverified" | "partially_verified" | "verified" | "failed";
 export type FindingStatus = "open" | "claimed_resolved" | "verified_resolved" | "waived";
@@ -114,6 +114,8 @@ export interface MissionContractInput {
   reviewCoverage?: string[];
   /** Minimum independent evidence strength required for completion. */
   outcomeEvidence?: "implementation_verified" | "integration_verified" | "outcome_verified" | "operationally_stable";
+  /** Distinguishes an implementation deliverable from a claimed real-world result. */
+  completionClaim?: "implementation" | "real_world_outcome";
   /** User-visible behavior the external observer must confirm for outcome_verified. */
   outcomeExpectedBehavior?: string;
 }
@@ -185,17 +187,29 @@ export interface MissionLedger {
   recordCompletionReport(missionId: string, input: { submissionId: string; snapshotKind?: WorkspaceSnapshotKind; snapshotRef?: string; snapshotCommit?: string; status: "passed" | "failed"; results: unknown; reviewCoverage?: string[]; uncertainty?: unknown[] }): void;
   recordReviewCoverage(missionId: string, input: { submissionId: string; snapshotKind?: WorkspaceSnapshotKind; snapshotRef?: string; snapshotCommit?: string; reviewCoverage?: string[]; uncertainty?: unknown[] }): void;
   getCompletionReportHash(workSessionId: string, context: CurrentApprovalContext): string | undefined;
+  getResultReceipt(workSessionId: string, context?: CurrentApprovalContext): {
+    missionId: string;
+    currentSubmissionId?: string;
+    approval: ApprovalPredicate;
+    requiredEvidenceLevel: "implementation_verified" | "integration_verified" | "outcome_verified" | "operationally_stable";
+    verificationEvidenceIds: string[];
+    outcomeObservationIds: string[];
+    completionReport?: ReturnType<typeof rowToCompletionReport>;
+    evidence: Array<ReturnType<typeof rowToEvidence>>;
+  } | undefined;
   getPacket(workSessionId: string, approvalContext?: CurrentApprovalContext): MissionReviewPacket;
   canApprove(workSessionId: string, context?: CurrentApprovalContext): ApprovalPredicate;
   recordOutcomeObservation(missionId: string, input: {
     submissionId: string;
+    reviewEpoch: number;
     snapshotKind: WorkspaceSnapshotKind;
     snapshotRef: string;
-    observerIdentity: string;
-    expectedBehavior: string;
+    observerPrincipalId: string;
+    evidenceBasis: "firsthand_external_observation";
+    externalEvidence: string;
     actualBehavior: string;
     status: "confirmed" | "rejected";
-  }): { id: string };
+  }): { id: string; receipt: { source: "firsthand_authenticated_external_reviewer"; observerPrincipalId: string; submissionId: string; reviewEpoch: number; snapshotKind: WorkspaceSnapshotKind; snapshotRef: string; expectedBehavior: string; evidenceSha256: string; observationSha256: string } };
   evaluateCriteria(workSessionId: string, context?: CurrentApprovalContext): EffectiveCriterionState[];
   /**
    * Decide whether a review round that surfaced new findings may EXTEND the
@@ -259,6 +273,9 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
       baselineKind: baselineIdentity?.kind,
       baselineRef: baselineIdentity?.ref,
       baselineCommit: baselineIdentity?.ref,
+      outcomeEvidence: input.completionClaim === "real_world_outcome"
+        ? input.outcomeEvidence ?? "outcome_verified"
+        : input.outcomeEvidence,
     };
     const criteria = (input.acceptanceCriteria ?? []).map((criterion) => ({
       ...criterion,
@@ -273,12 +290,17 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
     // external oracle/sustained-operation receipt, which is not yet implemented.
     // Fail closed at creation rather than silently weakening the approval gate
     // to an integration report.
-    if (input.outcomeEvidence === "operationally_stable") {
+    if (normalizedInput.completionClaim === "real_world_outcome"
+      && normalizedInput.outcomeEvidence !== "outcome_verified"
+      && normalizedInput.outcomeEvidence !== "operationally_stable") {
+      throw new Error("completionClaim real_world_outcome requires outcomeEvidence outcome_verified or stronger.");
+    }
+    if (normalizedInput.outcomeEvidence === "operationally_stable") {
       throw new Error("outcomeEvidence operationally_stable is not yet supported; sustained-operation oracle qualification is required before missions can demand it.");
     }
     // outcome_verified requires at least one declared expected-behavior
     // contract so the external observer knows what to confirm or reject.
-    if (input.outcomeEvidence === "outcome_verified" && !input.outcomeExpectedBehavior?.trim()) {
+    if (normalizedInput.outcomeEvidence === "outcome_verified" && !input.outcomeExpectedBehavior?.trim()) {
       throw new Error("outcomeEvidence outcome_verified requires a nonempty outcomeExpectedBehavior describing the user-visible result the observer must confirm.");
     }
     // P1-02: A mission that requires integration evidence must declare at
@@ -286,7 +308,7 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
     // cannot produce the required passing report. This is the authoritative
     // ledger invariant; the schema-level check above provides faster user
     // feedback at the tool boundary.
-    if (input.outcomeEvidence === "integration_verified" && !(input.finalVerification ?? []).length) {
+    if (normalizedInput.outcomeEvidence === "integration_verified" && !(input.finalVerification ?? []).length) {
       throw new Error("outcomeEvidence integration_verified requires at least one finalVerification command.");
     }
     const contractFingerprint = fingerprintMissionContract(normalizedInput, criteria);
@@ -336,7 +358,7 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
         maxCorrectionRounds: input.maxCorrectionRounds ?? 5,
         finalVerificationJson: JSON.stringify(input.finalVerification ?? []),
         reviewCoverageJson: JSON.stringify(input.reviewCoverage ?? []),
-        outcomeEvidence: input.outcomeEvidence ?? "implementation_verified",
+        outcomeEvidence: normalizedInput.outcomeEvidence ?? "implementation_verified",
         outcomeExpectedBehavior: input.outcomeExpectedBehavior ?? null,
         createdAt: now,
         updatedAt: now,
@@ -682,6 +704,83 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
     return { mission, criteria, findings, workOrders, evidence, completionReports, approval: canApprove(workSessionId, currentContext), criterionStates: evaluateCriteria(workSessionId, currentContext), currentSubmissionId: currentContext.submissionId };
   }
 
+  function getResultReceipt(workSessionId: string, approvalContext?: CurrentApprovalContext) {
+    const mission = getMissionByWorkSession(workSessionId);
+    if (!mission) return undefined;
+    const context = normalizeCurrentApprovalContext(approvalContext ?? getCurrentApprovalContext(workSessionId));
+    const approval = canApprove(workSessionId, context);
+    const requiredEvidenceLevel = mission.outcomeEvidence ?? "implementation_verified";
+    if (!context.submissionId) return {
+      missionId: mission.id,
+      approval,
+      requiredEvidenceLevel,
+      verificationEvidenceIds: [],
+      outcomeObservationIds: [],
+      evidence: [],
+    };
+
+    let completionReport: ReturnType<typeof rowToCompletionReport> | undefined;
+    if (context.snapshotKind && context.snapshotRef) {
+      const row = database.db.select().from(missionCompletionReports).where(and(
+        eq(missionCompletionReports.missionId, mission.id),
+        eq(missionCompletionReports.submissionId, context.submissionId),
+        eq(missionCompletionReports.snapshotKind, context.snapshotKind),
+        eq(missionCompletionReports.snapshotRef, context.snapshotRef),
+      )).orderBy(desc(missionCompletionReports.createdAt)).limit(1).get();
+      completionReport = row ? rowToCompletionReport(row) : undefined;
+    }
+
+    let evidence: Array<ReturnType<typeof rowToEvidence>> = [];
+    if (context.snapshotKind && context.snapshotRef && context.reviewEpoch !== undefined) {
+      evidence = database.db.select().from(missionEvidence).where(and(
+        eq(missionEvidence.missionId, mission.id),
+        eq(missionEvidence.submissionId, context.submissionId),
+        eq(missionEvidence.snapshotKind, context.snapshotKind),
+        eq(missionEvidence.snapshotRef, context.snapshotRef),
+        eq(missionEvidence.reviewEpoch, context.reviewEpoch),
+      )).orderBy(desc(missionEvidence.createdAt)).limit(100).all().map(rowToEvidence);
+    }
+    const verificationEvidenceIds = evidence.filter((entry) => {
+      const source = typeof (entry.details as { source?: unknown })?.source === "string"
+        ? (entry.details as { source: string }).source
+        : undefined;
+      return entry.status === "passed" && source !== "agent_claim";
+    }).map((entry) => entry.id);
+    const outcomeRows = context.snapshotKind && context.snapshotRef && context.reviewEpoch !== undefined
+      ? database.db.select().from(missionOutcomeObservations).where(and(
+          eq(missionOutcomeObservations.missionId, mission.id),
+          eq(missionOutcomeObservations.submissionId, context.submissionId),
+          eq(missionOutcomeObservations.reviewEpoch, context.reviewEpoch),
+          eq(missionOutcomeObservations.snapshotKind, context.snapshotKind),
+          eq(missionOutcomeObservations.snapshotRef, context.snapshotRef),
+          eq(missionOutcomeObservations.expectedBehavior, mission.outcomeExpectedBehavior ?? ""),
+          eq(missionOutcomeObservations.observationSource, "firsthand_authenticated_external_reviewer"),
+          isNotNull(missionOutcomeObservations.observerPrincipalId),
+          isNotNull(missionOutcomeObservations.externalEvidenceSha256),
+        )).orderBy(desc(missionOutcomeObservations.observedAt)).all()
+      : [];
+    const outcomeSatisfied = evaluateOutcomeObservations(outcomeRows.map(rowToOutcomeObservation), {
+      submissionId: context.submissionId,
+      reviewEpoch: context.reviewEpoch ?? -1,
+      snapshotKind: context.snapshotKind ?? "",
+      snapshotRef: context.snapshotRef ?? "",
+      expectedBehavior: mission.outcomeExpectedBehavior ?? "",
+    }).satisfied;
+    const outcomeObservationIds = outcomeSatisfied && outcomeRows[0]?.status === "confirmed" && outcomeRows[0].observerIdentity.trim()
+      ? [outcomeRows[0].id]
+      : [];
+    return {
+      missionId: mission.id,
+      currentSubmissionId: context.submissionId,
+      approval,
+      requiredEvidenceLevel,
+      verificationEvidenceIds,
+      outcomeObservationIds,
+      completionReport,
+      evidence,
+    };
+  }
+
   // P1 #26: Derive the current approval context from the latest pending
   // submission, so callers that don't pass an explicit context still get
   // consistent evidence-bound approval reasoning.
@@ -750,6 +849,13 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
           .where(and(
             eq(missionOutcomeObservations.missionId, mission.id),
             eq(missionOutcomeObservations.submissionId, currentContext.submissionId),
+            eq(missionOutcomeObservations.snapshotKind, currentSnapshot.kind),
+            eq(missionOutcomeObservations.snapshotRef, currentSnapshot.ref),
+            eq(missionOutcomeObservations.reviewEpoch, currentContext.reviewEpoch ?? -1),
+            eq(missionOutcomeObservations.expectedBehavior, mission.outcomeExpectedBehavior ?? ""),
+            eq(missionOutcomeObservations.observationSource, "firsthand_authenticated_external_reviewer"),
+            isNotNull(missionOutcomeObservations.observerPrincipalId),
+            isNotNull(missionOutcomeObservations.externalEvidenceSha256),
           ))
           .orderBy(desc(missionOutcomeObservations.observedAt))
           .all()
@@ -764,6 +870,13 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
       outcomeEvidence: mission.outcomeEvidence,
       currentSubmissionId: currentContext.submissionId,
       outcomeObservations,
+      outcomeObservationContext: {
+        submissionId: currentContext.submissionId ?? "",
+        reviewEpoch: currentContext.reviewEpoch ?? -1,
+        snapshotKind: currentSnapshot?.kind ?? "",
+        snapshotRef: currentSnapshot?.ref ?? "",
+        expectedBehavior: mission.outcomeExpectedBehavior ?? "",
+      },
       effectiveFindingResolutions,
       currentReport: currentReport ? {
         status: currentReport.status,
@@ -775,29 +888,56 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
 
   function recordOutcomeObservation(missionId: string, input: {
     submissionId: string;
+    reviewEpoch: number;
     snapshotKind: WorkspaceSnapshotKind;
     snapshotRef: string;
-    observerIdentity: string;
-    expectedBehavior: string;
+    observerPrincipalId: string;
+    evidenceBasis: "firsthand_external_observation";
+    externalEvidence: string;
     actualBehavior: string;
     status: "confirmed" | "rejected";
-  }): { id: string } {
+  }): { id: string; receipt: { source: "firsthand_authenticated_external_reviewer"; observerPrincipalId: string; submissionId: string; reviewEpoch: number; snapshotKind: WorkspaceSnapshotKind; snapshotRef: string; expectedBehavior: string; evidenceSha256: string; observationSha256: string } } {
     const mission = database.db.select().from(missionContracts).where(eq(missionContracts.id, missionId)).get();
     if (!mission) throw new Error(`Mission ${missionId} not found.`);
-    if (mission.outcomeEvidence !== "outcome_verified" && mission.outcomeEvidence !== "operationally_stable") {
+    if (mission.outcomeEvidence === "operationally_stable") throw new Error("operationally_stable outcome evidence remains unsupported until a durability window and signed qualification receipt exist.");
+    if (mission.outcomeEvidence !== "outcome_verified") {
       throw new Error(`Mission ${missionId} does not require outcome evidence (current level: ${mission.outcomeEvidence ?? "implementation_verified"}).`);
     }
-    if (!input.observerIdentity.trim()) throw new Error("Outcome observation requires a nonempty observerIdentity.");
-    if (!input.expectedBehavior.trim()) throw new Error("Outcome observation requires a nonempty expectedBehavior.");
+    if (!input.observerPrincipalId.trim()) throw new Error("Outcome observation requires an authenticated reviewer principal.");
+    if (input.evidenceBasis !== "firsthand_external_observation") throw new Error("Outcome verification requires a firsthand reviewer observation, not an agent self-report.");
+    const expectedBehavior = mission.outcomeExpectedBehavior?.trim();
+    if (!expectedBehavior) throw new Error("Outcome observation requires the user-visible behavior declared in the mission contract.");
+    if (!input.externalEvidence.trim()) throw new Error("Outcome observation requires external verification evidence.");
+    const evidenceSha256 = createHash("sha256").update(input.externalEvidence).digest("hex");
+    const observerIdentity = `principal:${input.observerPrincipalId}`;
     const id = `obs_${randomUUID()}`;
-    const now = new Date().toISOString();
+    const previous = database.db.select({ observedAt: missionOutcomeObservations.observedAt })
+      .from(missionOutcomeObservations)
+      .where(and(
+        eq(missionOutcomeObservations.missionId, missionId),
+        eq(missionOutcomeObservations.submissionId, input.submissionId),
+        eq(missionOutcomeObservations.reviewEpoch, input.reviewEpoch),
+        eq(missionOutcomeObservations.snapshotKind, input.snapshotKind),
+        eq(missionOutcomeObservations.snapshotRef, input.snapshotRef),
+        eq(missionOutcomeObservations.expectedBehavior, expectedBehavior),
+      ))
+      .orderBy(desc(missionOutcomeObservations.observedAt))
+      .limit(1)
+      .get();
+    const previousAt = previous ? Date.parse(previous.observedAt) : 0;
+    const now = new Date(Math.max(Date.now(), Number.isFinite(previousAt) ? previousAt + 1 : 0)).toISOString();
     const observationSha256 = createHash("sha256").update(JSON.stringify({
       missionId,
       submissionId: input.submissionId,
+      reviewEpoch: input.reviewEpoch,
       snapshotKind: input.snapshotKind,
       snapshotRef: input.snapshotRef,
-      observerIdentity: input.observerIdentity,
-      expectedBehavior: input.expectedBehavior,
+      observerIdentity,
+      observerPrincipalId: input.observerPrincipalId,
+      evidenceBasis: input.evidenceBasis,
+      source: "firsthand_authenticated_external_reviewer",
+      evidenceSha256,
+      expectedBehavior,
       actualBehavior: input.actualBehavior,
       status: input.status,
     })).digest("hex");
@@ -805,17 +945,25 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
       id,
       missionId,
       submissionId: input.submissionId,
+      reviewEpoch: input.reviewEpoch,
       snapshotKind: input.snapshotKind,
       snapshotRef: input.snapshotRef,
-      observerIdentity: input.observerIdentity,
-      expectedBehavior: input.expectedBehavior,
+      observerIdentity,
+      observerPrincipalId: input.observerPrincipalId,
+      observationSource: "firsthand_authenticated_external_reviewer",
+      externalEvidenceSha256: evidenceSha256,
+      expectedBehavior,
       actualBehavior: input.actualBehavior,
       status: input.status,
       observedAt: now,
       observationSha256,
     }).run();
     touchMission(missionId);
-    return { id };
+    return { id, receipt: {
+      source: "firsthand_authenticated_external_reviewer", observerPrincipalId: input.observerPrincipalId,
+      submissionId: input.submissionId, reviewEpoch: input.reviewEpoch, snapshotKind: input.snapshotKind, snapshotRef: input.snapshotRef,
+      expectedBehavior, evidenceSha256, observationSha256,
+    } };
   }
 
   function evaluateCriteria(workSessionId: string, context?: CurrentApprovalContext): EffectiveCriterionState[] {
@@ -1033,6 +1181,7 @@ export function createMissionLedger(stateDirOrHandle: string | DatabaseHandle): 
     recordCompletionReport,
     recordReviewCoverage,
     getCompletionReportHash,
+    getResultReceipt,
     getPacket,
     canApprove,
     recordOutcomeObservation,
@@ -1071,6 +1220,7 @@ function rowToMission(row: MissionContractRow) {
     finalVerification: parseJson(row.finalVerificationJson, []),
     reviewCoverage: parseJson<string[]>(row.reviewCoverageJson, []),
     outcomeEvidence: (row.outcomeEvidence ?? "implementation_verified") as MissionContractInput["outcomeEvidence"],
+    outcomeExpectedBehavior: row.outcomeExpectedBehavior ?? undefined,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };
@@ -1198,7 +1348,14 @@ function normalizeCurrentApprovalContext(context: CurrentApprovalContext): Curre
 
 function rowToOutcomeObservation(row: MissionOutcomeObservationRow): OutcomeObservation {
   return {
+    submissionId: row.submissionId,
+    reviewEpoch: row.reviewEpoch ?? -1,
+    snapshotKind: row.snapshotKind,
+    snapshotRef: row.snapshotRef,
     observerIdentity: row.observerIdentity,
+    observerPrincipalId: row.observerPrincipalId ?? "",
+    observationSource: row.observationSource,
+    externalEvidenceSha256: row.externalEvidenceSha256 ?? "",
     expectedBehavior: row.expectedBehavior,
     actualBehavior: row.actualBehavior,
     status: row.status,

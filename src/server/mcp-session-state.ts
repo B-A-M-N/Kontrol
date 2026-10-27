@@ -32,11 +32,21 @@ export interface McpSessionState {
   sessionId: string;
   sessionLabel: string;
   logicalClientId: string;
-  identitySource: "instance_header" | "conversation" | "oauth" | "client_info_fallback";
-  authenticatedRole: "worker" | "reviewer" | "client";
+  identitySource: "instance_header" | "conversation" | "oauth" | "client_info_fallback" | "peer";
+  authenticatedRole: "worker" | "reviewer" | "client" | "peer";
   /** Stable authenticated principal used to namespace durable owner identity. */
   authenticatedPrincipalId?: string;
-  authSource: "oauth" | "reviewer_token" | "worker_token" | "tunnel_reviewer" | "anonymous";
+  authSource: "oauth" | "reviewer_token" | "worker_token" | "tunnel_reviewer" | "peer_token" | "anonymous";
+  /**
+   * Listener that created this session; sessions never migrate between
+   * listeners. REQUIRED (P2-1): the fence in mcp-http.ts compares
+   * unconditionally, so an absent kind can never fail open.
+   */
+  listenerKind: "owner" | "peer" | "owner_public";
+  /** Monotonic peer authorization revision when this session initialized. */
+  peerAuthorizationRevision?: number;
+  /** Grant hash binding peer MCP sessions to their initialized grant set. */
+  peerAuthorizationHash?: string;
   conversationId?: string;
   approvalCorrelationId?: string;
   /** Durable work session that authenticated this worker transport, if any. */
@@ -53,6 +63,21 @@ export interface McpSessionState {
   resourceReadCount: number;
   activeLongPollCount: number;
   activeSseStreams: number;
+  /** A live GET SSE channel is attached; otherwise this is an idle retained session. */
+  transportAttached: boolean;
+  /**
+   * A standalone GET SSE channel is established and can carry server-initiated
+   * notifications. Set once the transport has written its SSE headers, which
+   * happens after the SDK registers the standalone stream, and cleared as soon
+   * as that stream ends.
+   */
+  standaloneSseEstablished?: boolean;
+  /**
+   * Monotonic identity of the current delivery surface. A send that resolves
+   * after the surface changed was recorded against a channel that no longer
+   * exists, so its success is discarded instead of marking the channel sent.
+   */
+  deliveryGeneration?: number;
   activePolicyWaiters: number;
   closing: boolean;
   closed: boolean;
@@ -63,6 +88,8 @@ export interface McpSessionState {
   toolSurfaceVersion?: string;
   toolCatalogHandshake?: {
     status: "pending" | "accepted" | "rejected";
+    captureId?: string;
+    evidenceId?: string;
     serverCatalogSha256?: string;
     hostCatalogSha256?: string;
     toolCount?: number;
@@ -72,6 +99,10 @@ export interface McpSessionState {
   catalogRefresh?: {
     initializedPulseAttempted: boolean;
     getStreamPulseAttempted: boolean;
+    /** Pulses deferred because no standalone GET SSE channel could carry them. */
+    deferredNoStreamAttempts: number;
+    /** Sends that resolved after the delivery surface that carried them ended. */
+    staleDeliveries: number;
     toolListRefreshSent: boolean;
     resourceListRefreshSent: boolean;
     toolListRefreshAttempts: number;
@@ -80,6 +111,10 @@ export interface McpSessionState {
     resourceListRefreshSuccesses: number;
     toolListRefreshFailures: number;
     resourceListRefreshFailures: number;
+    toolListRefreshLastAttemptMs?: number;
+    resourceListRefreshLastAttemptMs?: number;
+    toolListRefreshInFlight: boolean;
+    resourceListRefreshInFlight: boolean;
     lastAttemptAt?: string;
   };
   /** Durable reason for the last transport termination decision. */
@@ -114,6 +149,20 @@ export interface McpSessionClientMetrics {
   totalToolCalls: number;
   totalLifetimeMs: number;
   oldestIdleMs: number;
+  completedSessions: number;
+  lastSeenAt: number;
+}
+
+export interface McpSessionClientTotals {
+  sessionsCreated: number;
+  sessionsClosed: number;
+  sessionsExpired: number;
+  zeroToolSessions: number;
+  singleToolSessions: number;
+  multiToolSessions: number;
+  totalToolCalls: number;
+  totalLifetimeMs: number;
+  completedSessions: number;
 }
 
 export interface McpSessionMetrics {
@@ -123,6 +172,9 @@ export interface McpSessionMetrics {
   expired: number;
   inFlight: number;
   clients: Map<string, McpSessionClientMetrics>;
+  retiredClientTotals: McpSessionClientTotals;
+  retiredClientCount: number;
+  retainedHistoricalClientCount: number;
   windowEvents: Array<{ at: number; kind: McpSessionWindowKind }>;
   completedToolCounts: number[];
   terminationReasons: Map<string, number>;
@@ -174,6 +226,9 @@ export interface WorkspaceAppResourceMetrics {
   cacheBytes: number;
   maxCacheEntries: number;
   maxCacheBytes: number;
+  initialBuildDurationMs: number;
+  lastSerializationDurationMs: number;
+  maxSerializationDurationMs: number;
 }
 
 /** Explicit route-level HTTP body caps. These are deliberately finite: MCP
@@ -182,7 +237,7 @@ export interface WorkspaceAppResourceMetrics {
 export const MCP_HTTP_BODY_LIMIT_BYTES = 8 * 1024 * 1024;
 export const ACP_HTTP_BODY_LIMIT_BYTES = 4 * 1024 * 1024;
 
-export function rejectOversizedBody(limitBytes: number, protocol: "mcp" | "acp") {
+export function rejectOversizedBody(limitBytes: number, protocol: "mcp" | "acp" | "peer") {
   return (req: Request, res: Response, next: NextFunction): void => {
     const rawLength = req.header("content-length");
     const contentLength = rawLength === undefined ? undefined : Number(rawLength);
@@ -220,6 +275,19 @@ export function authenticatedAcpBodyGate(config: ServerConfig) {
 
 export interface RunningServer {
   app: Express;
+  /**
+   * Optional peer-facing app (KONTROL_PEER_ENABLED=1). It is bound as a second
+   * listener under the same runtime lock and shares every manager/DB handle;
+   * shutdown must close it alongside the owner listener.
+   */
+  peerApp?: Express;
+  /**
+   * Optional public OAuth MCP app (KONTROL_PUBLIC_MCP_ENABLED=1, oauth mode
+   * only). Bound as a third listener under the same runtime lock; shares
+   * every manager/DB handle; shutdown must close it alongside the owner and
+   * peer listeners.
+   */
+  publicApp?: Express;
   config: ServerConfig;
   dispatcher?: ContinuationDispatcher;
   close(): Promise<void>;
@@ -233,6 +301,13 @@ export function logicalClientIdentity(req: Request): { id: string; source: McpSe
   // so two conversations of the same client cannot touch each other's direct
   // processes or reattach to each other's pending approvals.
   const suppliedConversation = conversationId(req);
+  // A verified peer credential is a first-class authenticated identity: the
+  // logical client IS the peer principal. Unlike the OAuth branch, no
+  // conversation narrowing applies — user-supplied conversation correlation
+  // remains correlation only and never partitions or broadens peer identity.
+  if (req.peerPrincipal) {
+    return { id: req.peerPrincipal.principalId, source: "peer" };
+  }
   if (req.auth?.clientId) {
     return suppliedConversation
       ? { id: `oauth:${req.auth.clientId}|conversation:${suppliedConversation}`, source: "oauth" }

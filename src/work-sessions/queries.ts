@@ -116,6 +116,7 @@ export function createWorkSessionQueries(db: DatabaseHandle, deps: {
       filter: "all" | "pending_review" | "stale_pending_review" | "live" = "all",
       after?: WorkspaceSessionSurfaceCursor,
       ownerContextId?: string,
+      principalId?: string,
     ): WorkspaceSessionSurfaceEntry[] {
       const boundedLimit = Math.max(1, Math.min(200, Math.trunc(limit)));
       const projectId = workspaceSessionId ? projectIdForWorkspace(workspaceSessionId) : undefined;
@@ -123,7 +124,12 @@ export function createWorkSessionQueries(db: DatabaseHandle, deps: {
         ? projectId ? "ws.project_id = ?" : "ws.workspace_session_id = ?"
         : "1 = 1";
       const scopeParam = workspaceSessionId ? (projectId ?? workspaceSessionId) : undefined;
-      const rows = db.sqlite.prepare(`
+      const ownerScopeTerms = [
+        ...(ownerContextId ? ["ws.owner_context_id = ?"] : []),
+        ...(principalId ? ["ws.principal_id = ?"] : []),
+      ];
+      const ownerScopeSql = ownerScopeTerms.length ? `and (${ownerScopeTerms.join(" or ")})` : "";
+      const workspaceSurfaceSql = `
         select
           ws.id as session_id,
           ws.workspace_session_id,
@@ -156,7 +162,7 @@ export function createWorkSessionQueries(db: DatabaseHandle, deps: {
           (select f.reviewer_id from work_session_feedback f join work_session_submissions s on s.id = f.submission_id where f.work_session_id = ws.id order by s.submission_number desc, s.review_epoch desc, f.id desc limit 1) as latest_feedback_reviewer_id
         from work_sessions ws
         where ${scopeSql}
-          ${ownerContextId ? "and ws.owner_context_id = ?" : ""}
+          ${ownerScopeSql}
           ${after ? "and (ws.updated_at < ? or (ws.updated_at = ? and ws.id < ?))" : ""}
           and ${filter === "pending_review"
             ? "ws.status in ('awaiting_review', 'review_in_progress') and ws.runtime_state <> 'stale' and datetime(ws.updated_at) >= datetime('now', '-30 days')"
@@ -167,10 +173,11 @@ export function createWorkSessionQueries(db: DatabaseHandle, deps: {
               : "(ws.runtime_state in ('running', 'pending', 'detached', 'stale', 'orphaned') or ws.status in ('awaiting_review', 'review_in_progress', 'changes_requested')) and not (ws.status in ('awaiting_review', 'review_in_progress') and datetime(ws.updated_at) < datetime('now', '-30 days'))"}
         order by ws.updated_at desc, ws.id desc
         limit ?
-      `).all(...(
+      `;
+      const rows = db.sqlite.prepare(workspaceSurfaceSql).all(...(
         scopeParam
-          ? [scopeParam, ...(ownerContextId ? [ownerContextId] : []), ...(after ? [after.updatedAt, after.updatedAt, after.sessionId] : []), boundedLimit]
-          : [...(ownerContextId ? [ownerContextId] : []), ...(after ? [after.updatedAt, after.updatedAt, after.sessionId] : []), boundedLimit]
+          ? [scopeParam, ...(ownerContextId ? [ownerContextId] : []), ...(principalId ? [principalId] : []), ...(after ? [after.updatedAt, after.updatedAt, after.sessionId] : []), boundedLimit]
+          : [...(ownerContextId ? [ownerContextId] : []), ...(principalId ? [principalId] : []), ...(after ? [after.updatedAt, after.updatedAt, after.sessionId] : []), boundedLimit]
       )) as Array<Record<string, unknown>>;
 
       return rows.map((row) => {

@@ -34,6 +34,58 @@ try {
   assert.equal("segments" in durable[0].payload, false, "coalesced telemetry does not duplicate text in segments");
   assert.equal(durable[1].type, "agent.run.started");
   assert.ok(durable[1].seq > durable[0].seq);
+  assert.equal(events.getLatestEventSequenceForSession("session-1"), durable[1].seq,
+    "the indexed session watermark matches the newest durable event");
+  assert.equal(events.getLatestEventSequenceForSession("session-without-events"), 0,
+    "an empty session has a zero event watermark");
+  const watermarkPlan = database.sqlite.prepare(
+    "EXPLAIN QUERY PLAN select coalesce(max(seq), 0) from event_log where session_id = ?",
+  ).all("session-1") as Array<{ detail: string }>;
+  assert.ok(watermarkPlan.some((step) => step.detail.includes("event_log_session_seq_idx")),
+    "the latest-event watermark uses the session sequence index");
+  events.appendEvent({
+    type: "session.handoff",
+    sessionId: "session-handoff-index",
+    payload: { runId: "run-old", transferId: "transfer-old" },
+  });
+  events.appendEvent({
+    type: "session.handoff",
+    sessionId: "session-handoff-index",
+    payload: { runId: "run-new", transferId: "transfer-new" },
+  });
+  events.appendEvent({
+    type: "session.handoff.state",
+    sessionId: "session-handoff-index",
+    payload: { transferId: "transfer-old", state: "blocked" },
+  });
+  events.appendEvent({
+    type: "session.handoff.state",
+    sessionId: "session-handoff-index",
+    payload: { transferId: "transfer-new", state: "committed" },
+  });
+  assert.equal(events.getLatestEventForSession("session-handoff-index", "session.handoff")?.payload.runId, "run-new",
+    "latest typed event lookup returns one newest event without decoding session history");
+  assert.equal(events.getLatestEventForSession("session-handoff-index", "session.handoff", { field: "runId", value: "run-old" })?.payload.transferId,
+    "transfer-old", "handoff lookup can bind the newest matching run identity");
+  assert.equal(events.getLatestEventForSession("session-handoff-index", "session.handoff.state", { field: "transferId", value: "transfer-old" })?.payload.state,
+    "blocked", "handoff state lookup is scoped to the exact transfer");
+  const handoffLookupPlan = database.sqlite.prepare(`explain query plan select id, seq, type, session_id,
+    workspace_session_id, payload, created_at from event_log where session_id = 'session-handoff-index'
+    and type = 'session.handoff.state' and (null is null or json_extract(payload, '$.transferId') = 'transfer-old')
+    order by seq desc limit 1`).all() as Array<{ detail: string }>;
+  assert.ok(handoffLookupPlan.some((row) => row.detail.includes("event_log_session_type_seq_idx")),
+    "handoff recovery lookup uses the bounded session/type/sequence index");
+  const insertHistory = database.sqlite.prepare(`insert into event_log
+    (id, type, session_id, workspace_session_id, payload, created_at)
+    values (?, ?, 'session-handoff-index', null, '{}', '2026')`);
+  const insertHistoryBatch = database.sqlite.transaction(() => {
+    for (let index = 0; index < 2_000; index += 1) {
+      insertHistory.run(`history-${index}`, index % 2 ? "agent.run.output_delta" : "agent.run.completed");
+    }
+  });
+  insertHistoryBatch();
+  assert.equal(events.getLatestEventForSession("session-handoff-index", "session.handoff")?.payload.runId, "run-new",
+    "indexed handoff lookup remains correct with thousands of unrelated lifecycle and telemetry events");
   assert.ok(timingPhases.includes("sqlite.commit"), "event-store writes expose commit timing");
   assert.ok(timingPhases.includes("agent.time_to_first_event"), "first agent event timing is recorded");
   assert.ok(timingPhases.includes("agent.event_interval"), "agent event intervals are recorded");
@@ -51,6 +103,14 @@ try {
   assert.deepEqual(events.appendTelemetryIngress({ id: "adapter-event-1", type: "agent.run.output_delta", sessionId: "session-ingress", payload: ingressOne }), {
     eventId: "adapter-event-1", duplicate: true,
   }, "a retry with the same event id is durably deduplicated before event-log materialization");
+  assert.deepEqual(events.appendTelemetryIngress({
+    id: "adapter-event-1",
+    type: "agent.run.output_delta",
+    sessionId: "session-ingress",
+    payload: { text: ingressOne.text, channel: ingressOne.channel },
+  }), {
+    eventId: "adapter-event-1", duplicate: true,
+  }, "telemetry retries remain idempotent when object property order changes");
   assert.throws(() => events.appendTelemetryIngress({
     id: "adapter-event-1", type: "agent.run.output_delta", sessionId: "session-ingress", payload: { ...ingressOne, text: "tampered" },
   }), /reused with different telemetry content/);
@@ -60,6 +120,12 @@ try {
   assert.equal(ingressEvents.length, 1, "durable ingress rows coalesce to one event-log record");
   assert.equal(ingressEvents[0]?.payload.count, 2);
   assert.equal(ingressEvents[0]?.payload.text, "durable-one durable-two ");
+  assert.deepEqual(events.appendTelemetryIngress({ id: "adapter-event-1", type: "agent.run.output_delta", sessionId: "session-ingress", payload: ingressOne }), {
+    eventId: "adapter-event-1", duplicate: true,
+  }, "a retry remains idempotent after the ingress receipt has been materialized");
+  assert.throws(() => events.appendTelemetryIngress({
+    id: "adapter-event-1", type: "agent.run.output_delta", sessionId: "session-ingress", payload: { ...ingressOne, text: "tampered after commit" },
+  }), /reused with different telemetry content/, "a committed event ID cannot be reused with altered content");
   const mappedReceipt = events.getEventById("adapter-event-1");
   assert.equal(mappedReceipt?.id, "adapter-event-1");
   assert.equal(mappedReceipt?.seq, ingressEvents[0]?.seq);
@@ -154,6 +220,29 @@ try {
   const arrived = await pending;
   assert.equal(arrived.length, 1, "workspace waiter wakes for a later session event");
   assert.equal(arrived[0].type, "review.submitted");
+
+  const unrelatedRunEvent = events.appendEvent({
+    type: "agent.run.output_delta",
+    sessionId: "session-event-progress",
+    payload: { runId: "another-run", text: "unrelated" },
+  });
+  let observedSeq = 0;
+  const matchingRunEvent = events.waitForMatchingEventAfter(
+    "session-event-progress",
+    0,
+    (event) => event.payload.runId === "target-run",
+    1_000,
+    undefined,
+    (seq) => { observedSeq = Math.max(observedSeq, seq); },
+  );
+  assert.equal(observedSeq, unrelatedRunEvent.seq, "durable nonmatching events advance the caller's reconciliation cursor");
+  const targetRunEvent = events.appendEvent({
+    type: "review.submitted",
+    sessionId: "session-event-progress",
+    payload: { runId: "target-run" },
+  });
+  assert.equal((await matchingRunEvent)?.seq, targetRunEvent.seq, "the event waiter still resolves on the matching durable event");
+  assert.equal(observedSeq, targetRunEvent.seq, "live matching events also advance the caller's cursor");
 
   const abortController = new AbortController();
   const aborted = events.waitForWorkspaceEventsAfter("workspace-2", arrived[0].seq, 10_000, abortController.signal);

@@ -22,6 +22,7 @@ import type { ReviewWorkflowService } from "../review-workflow.js";
 import type { SupervisorRuns } from "../supervisor-runs.js";
 import type { WorkSessionManager } from "../work-sessions.js";
 import type { WorkspaceRegistry } from "../workspaces.js";
+import type { McpQualificationEvidenceJournal } from "../server/mcp-qualification-evidence.js";
 import { checkoutLeaseMetadata, compactMissionPacket, workSessionInstructions } from "./shared.js";
 import type { LiveWaiterRegistry } from "./shared.js";
 import { createHash } from "node:crypto";
@@ -67,6 +68,37 @@ export interface BridgeConfig {
   connectionWorkSessionId?: string;
   /** Live per-connection context; never snapshot it at registration time. */
   connectionContext?: import("../mcp/connection-context.js").ConnectionContext;
+  /** Read-only durable PTY binding projection for cold work-session hydration. */
+  agentPtyBindingsForWorkSession?: (workSessionId: string) => Array<{
+    processSessionId: string;
+    agentName: string;
+    processGeneration: number;
+    outputCursor: number;
+    status: string;
+    createdAt: string;
+    finishedAt?: string;
+  }>;
+  observeAgentPty?: (input: {
+    workSessionId: string;
+    processSessionId: string;
+    afterCursor?: number;
+    maxOutputCharacters?: number;
+  }) => {
+    output: string;
+    outputCursor: number;
+    oldestAvailableCursor: number;
+    outputTruncated: boolean;
+    running: boolean;
+    exitCode?: number;
+    signal?: string;
+    binding: {
+      agentName: string;
+      processGeneration: number;
+      status: string;
+      createdAt: string;
+      finishedAt?: string;
+    };
+  } | undefined;
   /** Transport identity used to scope workspace conversation state. */
   connectionMcpSessionId?: string;
   /** Trusted conversation identity used to scope durable work-session reads. */
@@ -93,8 +125,19 @@ export interface BridgeConfig {
   onPhaseTiming?: (phase: string, durationMs: number) => void;
   /** Durable one-shot scheduled-job store, shared with the server runtime. */
   scheduledJobs?: import("../scheduling/scheduled-job-store.js").ScheduledJobStore;
+  /** Reviewer-only lookup of an uncertain scheduled dispatch; never starts work. */
+  reconcileScheduledJob?: (jobId: string) => Promise<import("../scheduling/scheduled-job-store.js").ScheduledJob | undefined>;
+  /** Wake the scheduler timer when an earlier durable deadline is introduced. */
+  onScheduledJobCreated?: () => void;
   /** Durable review-route/handoff store, shared with review workflow. */
   reviewRoutes?: import("../review-handoff/route-store.js").ReviewRouteStore;
+  reviewThreads?: import("../review-thread/thread-store.js").ReviewThreadStore;
+  reviewBrowserJobs?: import("../review-thread/reviewer-job-store.js").ReviewerJobStore;
+  reviewBrowserController?: import("../review-browser/browser-controller.js").ReviewerBrowserController;
+  /** Durable, content-addressed external-host qualification evidence. */
+  qualificationEvidence?: McpQualificationEvidenceJournal;
+  /** Immutable MCP tool-surface version observed by this server process. */
+  toolSurfaceVersion?: string;
 }
 
 
@@ -145,6 +188,8 @@ export const supervisedMissionOptionsSchema = z.object({
   maxWallTimeMinutes: z.number().int().min(1).max(10_080).optional(),
   finalVerification: z.array(z.string()).optional(),
   reviewCoverage: z.array(z.string()).optional(),
+  completionClaim: z.enum(["implementation", "real_world_outcome"]).optional().describe("Declare whether completion means delivering/verifying an implementation or confirming a real-world result. real_world_outcome requires outcome_verified evidence and outcomeExpectedBehavior."),
+  outcomeExpectedBehavior: z.string().trim().min(1).max(8_000).optional().describe("Required when outcomeEvidence is outcome_verified; the exact user-visible behavior an authenticated external reviewer must observe."),
   outcomeEvidence: z.enum(["implementation_verified", "integration_verified", "outcome_verified", "operationally_stable"]).optional().describe("Minimum independent evidence strength required for mission completion. Defaults to implementation_verified for lightweight missions; outcome_verified requires an explicit outcome oracle beyond internal checks."),
   autonomyMode: z.enum(["manual", "verify_only", "correction_auto", "full"]).optional(),
   approvalMode: z.enum(["human_required", "policy_auto", "fully_automatic"]).optional(),
@@ -158,6 +203,22 @@ export const supervisedMissionOptionsSchema = z.object({
       path: ["finalVerification"],
       message: "outcomeEvidence integration_verified requires at least one finalVerification command.",
     });
+  }
+  if (data.outcomeEvidence === "outcome_verified" && !data.outcomeExpectedBehavior?.trim()) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["outcomeExpectedBehavior"],
+      message: "outcomeEvidence outcome_verified requires the exact user-visible behavior an authenticated external reviewer must confirm.",
+    });
+  }
+  if (data.completionClaim === "real_world_outcome"
+    && data.outcomeEvidence !== undefined
+    && data.outcomeEvidence !== "outcome_verified"
+    && data.outcomeEvidence !== "operationally_stable") {
+    ctx.addIssue({ code: "custom", path: ["outcomeEvidence"], message: "completionClaim real_world_outcome requires outcomeEvidence outcome_verified or stronger." });
+  }
+  if (data.completionClaim === "real_world_outcome" && !data.outcomeExpectedBehavior?.trim()) {
+    ctx.addIssue({ code: "custom", path: ["outcomeExpectedBehavior"], message: "completionClaim real_world_outcome requires the exact user-visible behavior an authenticated external reviewer must confirm." });
   }
 });
 export const findingSchema = z.object({
@@ -229,6 +290,7 @@ export async function dispatchAgentTask(
         agentRegistry: config.agentRegistry,
         workspaces: config.workspaces,
         workSessions: config.workSessions,
+        eventStore: config.eventStore,
         adapterSecret: config.adapterSecret,
       },
       {

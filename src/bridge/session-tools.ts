@@ -5,14 +5,15 @@
  * this capability module owns one semantic slice of the reviewer/worker
  * control-plane API and receives the same typed BridgeConfig context.
  */
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer } from "@modelcontextprotocol/server";
 import type { BridgeConfig } from "./context.js";
 import { cancelRemoteRun, selectHealthyAgent } from "../acp-gateway.js";
 import { TERMINAL_STATUSES } from "../review-workflow.js";
 import { registerMutationAppTool } from "./app-tool.js";
-import { assertWorkerSessionBinding, forbidden, isReviewer, liveConnectionIdentity, liveOwnerContextId, requireWorkSessionMutation, requireWorkSessionRead, workspaceAppModelAndAppMeta } from "./shared.js";
+import { assertWorkerSessionBinding, forbidden, isReviewer, liveConnectionIdentity, liveOwnerContextId, livePrincipalId, requireWorkSessionMutation, requireWorkSessionRead, workspaceAppModelAndAppMeta } from "./shared.js";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
 import { z } from "zod/v4";
+import { createHash, randomUUID } from "node:crypto";
 
 export function registerSessionTools(server: McpServer, config: BridgeConfig): void {
   registerMutationAppTool(
@@ -35,7 +36,7 @@ export function registerSessionTools(server: McpServer, config: BridgeConfig): v
     async ({ workspaceId, title, completionPolicy }) => {
       try {
         config.workspaces.getWorkspace(workspaceId);
-        const session = config.workSessions.create({ workspaceSessionId: workspaceId, submittedBy: "cli", title, completionPolicy, ownerContextId: liveOwnerContextId(config) ?? config.principalId });
+        const session = config.workSessions.create({ workspaceSessionId: workspaceId, submittedBy: "cli", title, completionPolicy, ownerContextId: liveOwnerContextId(config) ?? config.principalId, principalId: livePrincipalId(config) });
         config.workspaces.setActiveSession(workspaceId, session.id, liveConnectionIdentity(config).mcpSessionId);
         return {
           content: [{ type: "text" as const, text: `Session ${session.id} active. Tool calls will be logged. Use submit_for_review when ready.` }],
@@ -59,6 +60,7 @@ export function registerSessionTools(server: McpServer, config: BridgeConfig): v
       outputSchema: {
         sessionId: z.string(),
         status: z.string(),
+        principalId: z.string().optional(),
         submittedBy: z.string(),
         title: z.string().optional(),
         submissionCount: z.number(),
@@ -124,6 +126,7 @@ export function registerSessionTools(server: McpServer, config: BridgeConfig): v
         structuredContent: {
           sessionId: session.id,
           status: session.status,
+          principalId: session.principalId,
           submittedBy: session.submittedBy,
           title: session.title,
           submissionCount: submissions.length,
@@ -238,17 +241,56 @@ export function registerSessionTools(server: McpServer, config: BridgeConfig): v
           replyId: z.string().optional(),
           replyStatus: z.string().optional(),
           replyBody: z.string().optional(),
+          replyDeliveryAttemptNumber: z.number().optional(),
+          replyDestinationAgentId: z.string().optional(),
+          replyDestinationAgentName: z.string().optional(),
         })).optional(),
         lastEventSeq: z.number().optional(),
+        agentPtys: z.array(z.object({
+          processSessionId: z.string(),
+          agentName: z.string(),
+          processGeneration: z.number(),
+          outputCursor: z.number(),
+          status: z.enum(["attached", "detached", "exited", "lost"]),
+          createdAt: z.string(),
+          finishedAt: z.string().optional(),
+        })).optional(),
         reviewLoop: z.object({
           routeId: z.string(),
+          reviewThreadId: z.string().optional(),
+          reviewThreadStatus: z.string().optional(),
           status: z.string(),
           mode: z.string(),
           completedReviewRounds: z.number(),
+          admittedReviewRounds: z.number(),
           maxReviewRounds: z.number(),
           roundNumber: z.number().optional(),
           handoffId: z.string().optional(),
           handoffStatus: z.string().optional(),
+          deliveryTransport: z.string().optional(),
+          browserProfileId: z.string().optional(),
+          conversation: z.object({
+            key: z.string().optional(),
+            url: z.string().optional(),
+            bindingStatus: z.string().optional(),
+            bindingRevision: z.number().optional(),
+            browserGeneration: z.number().optional(),
+          }).optional(),
+          deliveryMessage: z.object({
+            messageId: z.string(),
+            kind: z.string(),
+            status: z.string(),
+            updatedAt: z.string(),
+          }).optional(),
+          browserAttempt: z.object({
+            attemptId: z.string(),
+            status: z.string(),
+            attemptNumber: z.number(),
+            errorCode: z.string().optional(),
+            submittedAt: z.string().optional(),
+            generationStartedAt: z.string().optional(),
+            generationFinishedAt: z.string().optional(),
+          }).optional(),
         }).optional(),
       },
       _meta: {},
@@ -318,26 +360,47 @@ export function registerSessionTools(server: McpServer, config: BridgeConfig): v
           }))
         : [];
       const agentMessages = config.agentMessages
-        ? config.agentMessages.list(sessionId).filter((m) => m.status === "open").map((m) => {
-            // Preserve the open question while joining any accepted reply so a
-            // cold WebUI can render "Reply saved — awaiting agent" rather than
-            // making the answered question look unanswered.
-            const reply = config.agentMessages!.listPendingReplies(sessionId).find((candidate) => candidate.messageId === m.id)
-              ?? config.agentMessages!.listReplies(sessionId).find((candidate) => candidate.messageId === m.id);
-            return {
-              messageId: m.id,
-              kind: m.kind,
-              author: m.author,
-              title: m.title,
-              body: m.body,
-              status: m.status,
-              runId: m.runId,
-              createdAt: m.createdAt,
-              replyId: reply?.id,
-              replyStatus: reply?.status,
-              replyBody: reply?.body,
-            };
-          })
+        ? (() => {
+            const repliesByMessageId = new Map(
+              config.agentMessages!.listReplies(sessionId).map((reply) => [reply.messageId, reply] as const),
+            );
+            const liveAgentsById = new Map(config.agentRegistry.listAlive().map((agent) => [agent.id, agent] as const));
+            return config.agentMessages!.list(sessionId)
+              .filter((message) => message.status === "open" || repliesByMessageId.has(message.id))
+              .map((m) => {
+                // Accepted replies resolve the message record. Keep those
+                // messages in the durable projection so cold hydration still
+                // shows delivery and acknowledgement state instead of dropping
+                // the reply.
+                const reply = repliesByMessageId.get(m.id);
+                const deliveryAttempt = reply?.deliveryDispatchIdempotencyKey
+                  ? config.agentRegistry.getDispatchAttemptByIdempotencyKey(reply.deliveryDispatchIdempotencyKey)
+                  : reply?.deliveryRunId
+                    ? config.agentRegistry.getLatestDispatchAttemptForRun(reply.deliveryRunId)
+                    : m.runId
+                      ? config.agentRegistry.getLatestDispatchAttemptForRun(m.runId)
+                      : undefined;
+                const destinationAgent = deliveryAttempt?.agentId
+                  ? liveAgentsById.get(deliveryAttempt.agentId)
+                  : undefined;
+                return {
+                  messageId: m.id,
+                  kind: m.kind,
+                  author: m.author,
+                  title: m.title,
+                  body: m.body,
+                  status: m.status,
+                  runId: m.runId,
+                  createdAt: m.createdAt,
+                  replyId: reply?.id,
+                  replyStatus: reply?.status,
+                  replyBody: reply?.body,
+                  replyDeliveryAttemptNumber: reply?.deliveryAttemptNumber ?? deliveryAttempt?.attemptNumber,
+                  replyDestinationAgentId: deliveryAttempt?.agentId,
+                  replyDestinationAgentName: destinationAgent?.name,
+                };
+              });
+          })()
         : [];
 
       return {
@@ -378,22 +441,56 @@ export function registerSessionTools(server: McpServer, config: BridgeConfig): v
           // Alias makes the cursor contract explicit to clients that use the
           // event-sourced terminology from the reliability protocol.
           lastEventSeq: lastSeq,
+          agentPtys: config.agentPtyBindingsForWorkSession?.(sessionId) ?? [],
           reviewLoop: config.reviewRoutes
             ? (() => {
                 const route = config.reviewRoutes!.getRouteBySession(sessionId);
                 const handoff = route && latestSubmission
                   ? config.reviewRoutes!.getHandoffBySubmission(sessionId, latestSubmission.id, latestSubmission.reviewEpoch ?? 0)
                   : undefined;
+                const thread = route ? config.reviewThreads?.getForRoute(route.id, route.routeEpoch) : undefined;
+                const threadMessages = thread ? config.reviewThreads?.listMessages(thread.id) ?? [] : [];
+                const deliveryMessage = handoff
+                  ? [...threadMessages].reverse().find((message) => message.handoffId === handoff.id)
+                  : [...threadMessages].reverse().find((message) => ["queued", "presenting", "presented", "reviewer_claimed", "awaiting_attachment", "failed"].includes(message.status));
+                const browserAttempt = thread ? config.reviewBrowserJobs?.getActiveForThread(thread.id) : undefined;
                 return route
                   ? {
                       routeId: route.id,
+                      reviewThreadId: thread?.id,
+                      reviewThreadStatus: thread?.status,
                       status: route.status,
                       mode: route.mode,
                       completedReviewRounds: route.completedReviewRounds,
+                      admittedReviewRounds: route.admittedReviewRounds,
                       maxReviewRounds: route.maxReviewRounds,
                       roundNumber: handoff?.roundNumber,
                       handoffId: handoff?.id,
                       handoffStatus: handoff?.status,
+                      deliveryTransport: route.deliveryTransport,
+                      browserProfileId: route.browserProfileId,
+                      conversation: thread ? {
+                        key: thread.conversationKey,
+                        url: thread.conversationUrl,
+                        bindingStatus: thread.conversationBindingStatus,
+                        bindingRevision: thread.conversationBindingRevision,
+                        browserGeneration: thread.browserGeneration,
+                      } : undefined,
+                      deliveryMessage: deliveryMessage ? {
+                        messageId: deliveryMessage.id,
+                        kind: deliveryMessage.kind,
+                        status: deliveryMessage.status,
+                        updatedAt: deliveryMessage.updatedAt,
+                      } : undefined,
+                      browserAttempt: browserAttempt ? {
+                        attemptId: browserAttempt.id,
+                        status: browserAttempt.status,
+                        attemptNumber: browserAttempt.attemptNumber,
+                        errorCode: browserAttempt.lastErrorCode,
+                        submittedAt: browserAttempt.promptSubmittedAt,
+                        generationStartedAt: browserAttempt.generationStartedAt,
+                        generationFinishedAt: browserAttempt.generationFinishedAt,
+                      } : undefined,
                     }
                   : undefined;
               })()
@@ -410,6 +507,63 @@ export function registerSessionTools(server: McpServer, config: BridgeConfig): v
       } finally {
         config.onPhaseTiming?.("workspace.snapshot_query", performance.now() - startedAt);
       }
+    },
+  );
+
+  registerAppTool(
+    server,
+    "observe_agent_pty",
+    {
+      title: "Observe agent terminal",
+      description: "Reviewer-only, read-only observation of an interactive PTY explicitly bound to a work session. Returns bounded output and cursor metadata; it cannot send input, resize, or signal the process.",
+      inputSchema: {
+        sessionId: z.string().min(1),
+        processSessionId: z.string().min(1),
+        afterCursor: z.number().int().nonnegative().optional(),
+        maxOutputCharacters: z.number().int().positive().max(20_000).optional(),
+      },
+      outputSchema: {
+        sessionId: z.string(),
+        processSessionId: z.string(),
+        agentName: z.string(),
+        processGeneration: z.number(),
+        status: z.enum(["attached", "detached", "exited", "lost"]),
+        running: z.boolean(),
+        output: z.string(),
+        outputCursor: z.number(),
+        oldestAvailableCursor: z.number(),
+        outputTruncated: z.boolean(),
+        exitCode: z.number().optional(),
+        signal: z.string().optional(),
+      },
+      _meta: {},
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    },
+    async ({ sessionId, processSessionId, afterCursor, maxOutputCharacters }) => {
+      if (!isReviewer(config.principalRole)) return forbidden(config.principalRole, "observe_agent_pty");
+      const access = requireWorkSessionRead(config, sessionId);
+      if (access) return access;
+      const observation = config.observeAgentPty?.({ workSessionId: sessionId, processSessionId, afterCursor, maxOutputCharacters });
+      if (!observation) {
+        return { content: [{ type: "text" as const, text: "PTY binding not found for this work session." }], isError: true };
+      }
+      return {
+        content: [{ type: "text" as const, text: observation.output || `PTY ${observation.binding.status}; no retained output in this range.` }],
+        structuredContent: {
+          sessionId,
+          processSessionId,
+          agentName: observation.binding.agentName,
+          processGeneration: observation.binding.processGeneration,
+          status: observation.binding.status,
+          running: observation.running,
+          output: observation.output,
+          outputCursor: observation.outputCursor,
+          oldestAvailableCursor: observation.oldestAvailableCursor,
+          outputTruncated: observation.outputTruncated,
+          exitCode: observation.exitCode,
+          signal: observation.signal,
+        },
+      };
     },
   );
 
@@ -487,6 +641,7 @@ export function registerSessionTools(server: McpServer, config: BridgeConfig): v
             filter,
             afterUpdatedAt && afterSessionId ? { updatedAt: afterUpdatedAt, sessionId: afterSessionId } : undefined,
             owner,
+            livePrincipalId(config),
           ),
         });
         const surface = config.db
@@ -539,7 +694,7 @@ export function registerSessionTools(server: McpServer, config: BridgeConfig): v
       }
       const owner = liveOwnerContextId(config);
       if (config.connectionContext && !owner) return forbidden(config.principalRole, "list_active_work_sessions");
-      const surface = config.workSessions.getWorkspaceSessionSurface(workspaceId, 50, "live", undefined, owner);
+      const surface = config.workSessions.getWorkspaceSessionSurface(workspaceId, 50, "live", undefined, owner, livePrincipalId(config));
       const mapped = surface.map((s) => {
         return {
           sessionId: s.sessionId,
@@ -582,7 +737,7 @@ export function registerSessionTools(server: McpServer, config: BridgeConfig): v
         reason: z.string().optional().describe("Why the session is being handed off (recorded)."),
         clientMutationId: z.string().min(1).max(200).optional(),
       },
-      outputSchema: { sessionId: z.string(), fromAgent: z.string().optional(), toAgent: z.string(), status: z.string() },
+      outputSchema: { sessionId: z.string(), fromAgent: z.string().optional(), toAgent: z.string(), status: z.string(), transferId: z.string().optional() },
       _meta: {},
       annotations: { readOnlyHint: false },
     },
@@ -595,6 +750,9 @@ export function registerSessionTools(server: McpServer, config: BridgeConfig): v
       if (access) return access;
       const session = config.workSessions.get(sessionId);
       if (!session) return { content: [{ type: "text" as const, text: "Session not found." }], isError: true };
+      if (session.status === "cancelling") {
+        return { content: [{ type: "text" as const, text: "Session is cancelling; wait for worker shutdown before handing it off." }], isError: true };
+      }
       if (TERMINAL_STATUSES.has(session.status)) {
         return { content: [{ type: "text" as const, text: `Session is ${session.status}; cannot hand off a terminal session.` }], isError: true };
       }
@@ -614,31 +772,108 @@ export function registerSessionTools(server: McpServer, config: BridgeConfig): v
       if (!run) {
         return { content: [{ type: "text" as const, text: "No correlated run to reassign for this session." }], isError: true };
       }
-      const fromAgent = run.agentName;
-      if (fromAgent === toAgent) {
+      const latestAttempt = config.agentRegistry.getLatestDispatchAttemptForRun(run.runId);
+      const currentAgentId = latestAttempt?.agentId ?? run.agentId;
+      const fromAgent = (currentAgentId ? config.agentRegistry.get(currentAgentId)?.name : undefined) ?? run.agentName;
+      // Agent names are routing labels, not execution identities. A restarted
+      // or re-registered adapter can reuse a name with a new durable ID; that
+      // is a new destination and must be eligible for an explicit handoff.
+      if (currentAgentId ? currentAgentId === selection.agent.id : fromAgent === toAgent) {
         return {
           content: [{ type: "text" as const, text: `Session already assigned to ${toAgent}.` }],
           structuredContent: { sessionId, fromAgent, toAgent, status: "unchanged" },
         };
       }
 
-      // Reassign the correlated run. The continuation dispatcher reads
-      // run.agentName when it routes the next resume, so this reroutes future
-      // work without disturbing the durable session/review state.
-      config.agentRegistry.updateRun(run.runId, { agentName: toAgent });
-      // Keep the mission's preferredAgent in sync — the dispatcher prefers it
-      // over run.agentName, so a stale work-order value would otherwise re-route
-      // the very next resume back to the old agent, silently undoing the handoff.
-      config.missionLedger?.setWorkOrderPreferredAgent(sessionId, toAgent);
+      const latestSubmission = config.workSessions.getLatestSubmission(sessionId);
+      const latestFeedback = config.workSessions.getLatestFeedback(sessionId);
+      const mission = config.missionLedger?.getPacket(sessionId);
+      const criteriaById = new Map((mission?.criterionStates ?? []).map((state) => [state.criterionId, state]));
+      const unresolvedRequirements = (mission?.criteria ?? [])
+        .filter((criterion) => (criteriaById.get(criterion.id)?.status ?? "pending") !== "verified")
+        .map((criterion) => ({
+          id: criterion.id,
+          description: criterion.description,
+          status: criteriaById.get(criterion.id)?.status ?? "pending",
+          priority: criterion.priority,
+        }));
+      const transferId = randomUUID();
+      const contextTransferPacket = {
+        version: 1,
+        transferId,
+        workSessionId: sessionId,
+        task: run.inputTask ?? run.inputPreview ?? session.title ?? "Continue the existing work session.",
+        taskSha256: run.inputTaskSha256,
+        taskComplete: run.inputTask !== undefined,
+        priorWork: {
+          latestRunOutput: run.outputPreview,
+          latestSubmission: latestSubmission ? {
+            submissionId: latestSubmission.id,
+            message: latestSubmission.message,
+            reviewEpoch: latestSubmission.reviewEpoch,
+            files: latestSubmission.files,
+            diffSha256: latestSubmission.diffSha256,
+          } : undefined,
+        },
+        checkpoint: latestSubmission ? {
+          submissionId: latestSubmission.id,
+          snapshotKind: latestSubmission.snapshotKind,
+          snapshotRef: latestSubmission.snapshotRef,
+          reviewEpoch: latestSubmission.reviewEpoch,
+        } : undefined,
+        latestReviewerFeedback: latestFeedback ? {
+          feedbackId: latestFeedback.id,
+          submissionId: latestFeedback.submissionId,
+          verdict: latestFeedback.verdict,
+          comments: latestFeedback.comments,
+          requiredActions: latestFeedback.requiredActionsJson ? JSON.parse(latestFeedback.requiredActionsJson) : undefined,
+          allowedNextActions: latestFeedback.allowedNextActionsJson ? JSON.parse(latestFeedback.allowedNextActionsJson) : undefined,
+          reviewerId: latestFeedback.reviewerId,
+          createdAt: latestFeedback.createdAt,
+        } : undefined,
+        unresolvedRequirements,
+        reason,
+        createdAt: new Date().toISOString(),
+      };
+      const packetJson = JSON.stringify(contextTransferPacket);
+      const contextTransferSha256 = createHash("sha256").update(packetJson).digest("hex");
       config.eventStore.appendEvent({
         type: "session.handoff",
         sessionId,
-        payload: { runId: run.runId, fromAgent, toAgent, reason },
+        payload: {
+          transferId,
+          runId: run.runId,
+          fromAgent,
+          // A handoff records the current executor as its source. The logical
+          // run's agentId remains the immutable origin and can differ after a
+          // prior committed transfer.
+          fromAgentId: currentAgentId,
+          toAgent,
+          toAgentId: selection.agent.id,
+          reason,
+          state: "requested",
+          contextTransferPacket,
+          contextTransferSha256,
+        },
       });
+      config.eventStore.appendEvent({
+        type: "session.handoff.state",
+        sessionId,
+        payload: {
+          transferId,
+          runId: run.runId,
+          fromAgent,
+          toAgent,
+          state: "requested",
+        },
+      });
+      // The durable event is the routing authority. Do not rewrite the logical
+      // run: its agent identity records the origin and historical attempts.
+      config.missionLedger?.setWorkOrderPreferredAgent(sessionId, toAgent);
 
       return {
-        content: [{ type: "text" as const, text: `Handed off session ${sessionId} from ${fromAgent} to ${toAgent}.` }],
-        structuredContent: { sessionId, fromAgent, toAgent, status: "handed_off" },
+        content: [{ type: "text" as const, text: `Handoff ${transferId} requested for session ${sessionId}, from ${fromAgent} to ${toAgent}. The transfer is not complete until the source is quiesced and the destination accepts its first attempt.` }],
+        structuredContent: { sessionId, fromAgent, toAgent, status: "requested", transferId },
       };
     },
   );

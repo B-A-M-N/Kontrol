@@ -36,6 +36,7 @@ export interface WorkSession {
   reviewEpoch: number;
   submittedBy: string;
   ownerContextId?: string;
+  principalId?: string;
   title?: string;
   lastConsumedFeedbackId?: string;
   lastConsumedReviewEpoch: number;
@@ -158,7 +159,7 @@ export interface WorkspaceLease {
   canonicalRoot: string;
   workspaceSessionId: string;
   workSessionId: string;
-  leaseKind: "modify";
+  leaseKind: "modify" | "peer_job";
   ownerInstanceId: string;
   /** Owner-generation fencing token. Explicit takeover rotates it; renewal preserves it. */
   leaseNonce: string;
@@ -173,6 +174,7 @@ export interface WorkspaceSessionSurfaceCursor {
 }
 
 export interface RuntimeReconciliationPage {
+  examined?: number;
   reconciled: number;
   markedStale: number;
   nextAfterId?: string;

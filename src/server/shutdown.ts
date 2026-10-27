@@ -6,12 +6,19 @@
  * dependency object.
  */
 import type { Transport } from "../mcp/workspace-server.js";
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer } from "@modelcontextprotocol/server";
 import type { McpSessionState, RunningServer } from "./mcp-session-state.js";
 import type { McpAdmission } from "./mcp-admission.js";
 import type { McpSessionLifecycle } from "./mcp-session-lifecycle.js";
 import type { DatabaseHandle } from "../db/client.js";
 import type { ServerConfig } from "../config.js";
+
+export class McpDrainIncompleteError extends Error {
+  constructor(active: number, weight: number) {
+    super(`MCP drain remains fenced: ${active} active request(s), admission weight ${weight}; stores and runtime ownership remain open`);
+    this.name = "McpDrainIncompleteError";
+  }
+}
 
 export interface ShutdownDeps {
   readonly config: ServerConfig;
@@ -26,6 +33,8 @@ export interface ShutdownDeps {
   readonly startupReconciliation: { stop(): void };
   readonly maintenance: { stop(): void };
   readonly reviewCheckpoints: { drain(): Promise<unknown> };
+  readonly reviewBrowserController?: { close(): Promise<void> };
+  readonly reviewerTurnDispatcher?: { stopAndDrain(): Promise<void> };
   readonly dispatcher: { stop(): void } | undefined;
   readonly supervisorRuntime: { stop(): void } | undefined;
   readonly replyDispatcher: { stop(): void } | undefined;
@@ -65,6 +74,7 @@ export function createShutdownController(deps: ShutdownDeps): Pick<RunningServer
   let closed = false;
   let draining: Promise<void> | undefined;
   let closePromise: Promise<void> | undefined;
+  let stage: "RUNNING" | "DRAINING" | "QUIESCENT" | "CLOSING" | "STOPPED" = "RUNNING";
   const { recordMcpSessionEnd } = sessionLifecycle;
   const closeTransport = async (transport: Transport): Promise<void> => {
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -83,6 +93,7 @@ export function createShutdownController(deps: ShutdownDeps): Pick<RunningServer
   const finalizeClose = (): Promise<void> => {
     if (closePromise) return closePromise;
     closePromise = (async () => {
+      stage = "CLOSING";
       const errors: Array<{ phase: string; error: unknown }> = [];
       const phase = async (name: string, action: () => unknown, timeoutMs = 5_000): Promise<void> => {
         let timer: ReturnType<typeof setTimeout> | undefined;
@@ -106,6 +117,8 @@ export function createShutdownController(deps: ShutdownDeps): Pick<RunningServer
       // graceful stop finishes active publishes and clears their staging; a hard
       // kill is covered by the durable transaction journal on next startup.
       await phase("review-checkpoints", () => deps.reviewCheckpoints.drain());
+      await phase("review-browser-turn-dispatcher", () => deps.reviewerTurnDispatcher?.stopAndDrain(), 6_000);
+      await phase("review-browser-controller", () => deps.reviewBrowserController?.close());
       await phase("dispatcher", () => deps.dispatcher?.stop());
       await phase("reply-dispatcher", () => deps.replyDispatcher?.stop());
       await phase("scheduled-job-runtime", () => deps.scheduledJobRuntime?.stop());
@@ -151,6 +164,7 @@ export function createShutdownController(deps: ShutdownDeps): Pick<RunningServer
       }
     })().finally(() => {
       closed = true;
+      stage = "STOPPED";
     });
     return closePromise;
   };
@@ -160,17 +174,55 @@ export function createShutdownController(deps: ShutdownDeps): Pick<RunningServer
       if (closed) return;
       if (draining) return draining;
       draining = (async () => {
-        // Reject new MCP admission first, then close transports so long polls
-        // are woken before the Node HTTP server waits for connection closure.
+        stage = "DRAINING";
+        // Fence new work first. Existing handlers retain permits until their
+        // SDK operation really settles; stores and transports stay open while
+        // that ownership drains.
         deps.shuttingDown.value = true;
         mcpAdmission.close();
         mcpWaiterAdmission.close();
         mcpResourceAdmission.close();
+        // Drain executions before closing transports. Passive long polls and
+        // SSE watchers are intentionally woken after executions quiesce; waiting
+        // for them first would keep shutdown asleep until the full watcher TTL.
+        const executionDeadline = Date.now() + deps.config.mcpShutdownDrainMs;
+        while (Date.now() < executionDeadline) {
+          const active = mcpAdmission.getStats?.().active ?? 0;
+          if (active === 0) break;
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+        const activeExecution = mcpAdmission.getStats?.();
+        if ((activeExecution?.active ?? 0) > 0) {
+          throw new McpDrainIncompleteError(activeExecution!.active, activeExecution!.activeWeight);
+        }
+        stage = "QUIESCENT";
         const activeTransports = [...transports.values()];
         for (const state of mcpSessions.values()) state.closing = true;
         await Promise.all(activeTransports.map(closeTransport));
+
+        // Closing transports wakes passive MCP waiters. Workspace App resource
+        // reads do not own those transports, so give both passive pools their
+        // own bounded completion window before any dependent store is closed.
+        const passiveDeadline = Date.now() + deps.config.mcpShutdownDrainMs;
+        while (Date.now() < passiveDeadline) {
+          const active = (mcpWaiterAdmission.getStats?.().active ?? 0)
+            + (mcpResourceAdmission.getStats?.().active ?? 0);
+          if (active === 0) break;
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+        const remaining = [mcpWaiterAdmission, mcpResourceAdmission]
+          .map((admission) => admission.getStats?.())
+          .filter((stats) => (stats?.active ?? 0) > 0);
+        if (remaining.length > 0) {
+          const active = remaining.reduce((sum, stats) => sum + (stats?.active ?? 0), 0);
+          const weight = remaining.reduce((sum, stats) => sum + (stats?.activeWeight ?? 0), 0);
+          throw new McpDrainIncompleteError(active, weight);
+        }
         await finalizeClose();
-      })();
+      })().catch((error) => {
+        draining = undefined;
+        throw error;
+      });
       return draining;
     },
   };

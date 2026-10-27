@@ -10,7 +10,7 @@ import { relative } from "node:path";
 import { realpath } from "node:fs/promises";
 import { brandWorkSessionId, brandWorkspaceId } from "../../branded.js";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer } from "@modelcontextprotocol/server";
 import type { ServerConfig } from "../../config.js";
 import type { PolicyEngine } from "../../policy.js";
 import type { PolicyEnforcer } from "../../policy-enforcement.js";
@@ -19,7 +19,7 @@ import {
   findFilesTool,
   grepFilesTool,
   listDirectoryTool,
-  readFileTool,
+  readFileSnapshotTool,
   writeFileTool,
 } from "../../pi-tools.js";
 import { DEFAULT_MAX_RUNTIME_MS, type ProcessSessionManager } from "../../process-sessions.js";
@@ -66,10 +66,20 @@ import {
 import { logToolCall } from "../tool-logging.js";
 import { runMutationBarrier } from "../mutation-barrier.js";
 import { assertWorkerWorkspaceBinding, processOutputSchema, processToolResponse } from "../process-tool-response.js";
+import { readOnlyShellInspectionError } from "../../read-only-shell.js";
+import { publishScheduledArtifact } from "../../scheduling/scheduled-artifact-publisher.js";
 import type { ToolEnvelope } from "../tool-envelope.js";
 import { processSessionOwnerId, type ConnectionContext } from "../connection-context.js";
 import { MISSING_FILE_VERSION, readFileVersion, withFileMutationLock } from "../../mutation-version.js";
 import { assertAllowedPath, expandHomePath } from "../../roots.js";
+import {
+  countPeerWorktrees,
+  peerMayProposePatches,
+  peerOwnsWorktree,
+  peerSensitivePathDenied,
+  peerWorkspaceDenied,
+  recordPeerWorktree,
+} from "../../peer/workspace-guard.js";
 
 export interface WorkspaceToolsDeps {
   readonly config: ServerConfig;
@@ -82,6 +92,26 @@ export interface WorkspaceToolsDeps {
   readonly trackToolEvent: ToolEnvelope["trackToolEvent"];
   readonly prepareForMutation: (workspaceId: string) => Promise<void>;
   readonly processSessions: ProcessSessionManager;
+  readonly scheduledExecutionPolicyFor?: (workSessionId: string) => import("../../work-session-action-guard.js").ScheduledExecutionPolicy | undefined;
+  readonly recordPublicationIntent?: (input: { jobId: string; intent: Record<string, unknown> }) => void;
+  readonly recordPublicationReceipt?: (input: { jobId: string; receipt: Record<string, unknown> }) => void;
+  readonly recordPublicationFailure?: (input: { jobId: string; receiptId: string; outcome: "rejected" | "conflict"; reason: string }) => void;
+  readonly scheduledJobFor?: (workSessionId: string) => {
+    id: string;
+    activeDispatchAttemptId?: string;
+    attemptNumber?: number;
+    acpRunId?: string;
+    dispatchIdempotencyKey?: string;
+    policySnapshotJson: {
+      allowedOutputs?: Array<{
+        path?: string;
+        operation?: string;
+        expectedSha256?: string;
+        overwrite?: string;
+        expectedPreviousSha256?: string;
+      }>;
+    };
+  } | undefined;
 }
 
 function instructionContent(files: Array<{ path: string; content: string }>, root: string): ToolContent[] {
@@ -249,7 +279,32 @@ export function registerWorkspaceTools(
   server: McpServer,
   deps: WorkspaceToolsDeps,
 ): ReadonlySet<string> {
-  const { config, workspaces, reviewCheckpoints, policyEngine, policyEnforcer, connectionContext, workSessions, trackToolEvent, prepareForMutation, processSessions } = deps;
+  const { config, workspaces, reviewCheckpoints, policyEngine, policyEnforcer, connectionContext, workSessions, trackToolEvent, prepareForMutation, processSessions, scheduledExecutionPolicyFor, recordPublicationIntent, recordPublicationReceipt, recordPublicationFailure, scheduledJobFor } = deps;
+  const scheduledExecutionPolicy = (workSessionId: string | undefined) =>
+    workSessionId && scheduledExecutionPolicyFor ? scheduledExecutionPolicyFor(workSessionId) : undefined;
+
+  /**
+   * Peer inspection guard (M1): peers are confined to owner-granted workspace
+   * roots, and credential/private-state paths (.env*, the Kontrol state dir,
+   * ~/.kontrol) are denied outright. Returns an error result to return, or
+   * undefined when the call may proceed. Owner/reviewer/worker connections
+   * are unaffected.
+   */
+  const peerInspectionDenied = (
+    workspace: { root: string; sourceRoot?: string },
+    absolutePath?: string,
+  ): { content: ReturnType<typeof textBlock>[]; isError: true } | undefined => {
+    if (connectionContext?.authenticatedRole !== "peer") return undefined;
+    // M2: worktree workspaces are granted against the SOURCE root; the
+    // worktree path itself lives under KONTROL_WORKTREE_ROOT.
+    const rootDenied = peerWorkspaceDenied(connectionContext, workspace.sourceRoot ?? workspace.root);
+    if (rootDenied) return { content: [textBlock(rootDenied)], isError: true };
+    if (absolutePath) {
+      const pathDenied = peerSensitivePathDenied(config, absolutePath);
+      if (pathDenied) return { content: [textBlock(pathDenied)], isError: true };
+    }
+    return undefined;
+  };
   const registeredToolNames = new Set<string>();
   const registeredTool = (name: string): string => {
     registeredToolNames.add(name);
@@ -261,7 +316,7 @@ export function registerWorkspaceTools(
     {
       title: "Open workspace",
       description:
-        "Open a local project directory as a coding workspace. Call this once per project folder or worktree before reading, editing, searching, writing, showing changes, or running commands. Reuse the returned workspaceId for later calls in the same folder; do not call open_workspace again unless switching folders/worktrees, changing checkout/worktree mode, the workspaceId is rejected as unknown, or the user explicitly asks to reopen. By default this opens the actual checkout; set mode=\"worktree\" when the user asks for an isolated or parallel coding session. Ordinary non-Git directories are valid checkout workspaces and use filesystem change tracking; only managed worktrees require Git. Review and code-edit work stays direct in the workspace; optional ACP delegation follows discover_agents and healthy-agent checks. Returns the workspace capabilities and project instructions.",
+        "Open a local project directory as a coding workspace. Call this once per project folder or worktree before reading, editing, searching, writing, showing changes, or running commands. Reuse the returned workspaceId for later calls in the same folder; do not call open_workspace again unless switching folders/worktrees, changing checkout/worktree mode, the workspaceId is rejected as unknown, or the user explicitly asks to reopen. By default this opens the actual checkout; set mode=\"worktree\" when the user asks for an isolated or parallel coding session. Ordinary non-Git directories are valid checkout workspaces and use filesystem change tracking; only managed worktrees require Git. Checkpoint capture is deferred until a review or mutation needs an exact baseline, so opening a workspace and using read-only inspection does not scan the working tree. Review and code-edit work stays direct in the workspace; optional ACP delegation follows discover_agents and healthy-agent checks. Returns the workspace capabilities and project instructions.",
       inputSchema: {
         path: z
           .string()
@@ -287,7 +342,9 @@ export function registerWorkspaceTools(
         sourceRoot: z.string().optional(),
         workspaceKind: z.enum(["checkout", "worktree"]),
         versionControl: z.enum(["git", "none", "unknown"]),
-        checkpointBackend: z.enum(["git", "filesystem", "unavailable"]),
+        checkpointBackend: z.enum(["git", "filesystem", "pending", "unavailable"]),
+        checkpointDiagnostic: z.string().optional(),
+        checkpointError: z.object({ code: z.string(), operation: z.string(), stderr: z.string() }).optional(),
         capabilities: z.object({
           read: z.boolean(),
           search: z.boolean(),
@@ -349,7 +406,48 @@ export function registerWorkspaceTools(
         }
         openedWorkspace = await workspaces.openExistingWorkspace(workspaceSessionId, connectionContext.mcpSessionId);
       } else {
+        // Peer connections are confined to owner-granted workspace roots.
+        // This check runs BEFORE any workspace state is created so an
+        // unauthorized open leaves no side effects, and again AFTER resolve
+        // because grants are compared against the canonical resolved root,
+        // not the lexical request path.
+        if (connectionContext?.authenticatedRole === "peer") {
+          if (mode === "worktree" && !peerMayProposePatches(connectionContext)) {
+            return { content: [textBlock("Forbidden: peers may not create managed worktrees.")], isError: true };
+          }
+          const requestedRoot = expandHomePath(path);
+          const preDenied = peerWorkspaceDenied(connectionContext, requestedRoot);
+          if (preDenied) return { content: [textBlock(preDenied)], isError: true };
+          if (mode === "worktree") {
+            // M2: per-peer managed-worktree cap. Reuses KONTROL_PEER_MAX_ACTIVE_SESSIONS
+            // (config.peer.maxActiveSessions, normally the concurrent peer-session cap)
+            // as the per-peer worktree budget, counted from this peer's ownership
+            // registry — never from the global enumeration. The global and per-project
+            // managed worktree limits inside openWorktreeWorkspace (src/workspaces.ts)
+            // still apply on top of this — they are not bypassed.
+            const cap = config.peer?.maxActiveSessions;
+            const principalId = connectionContext.authenticatedPrincipalId;
+            if (cap !== undefined && principalId && countPeerWorktrees(principalId) >= cap) {
+              return { content: [textBlock(`Forbidden: peer managed-worktree cap reached (${cap} via KONTROL_PEER_MAX_ACTIVE_SESSIONS). Retire a managed worktree first.`)], isError: true };
+            }
+          }
+        }
         openedWorkspace = await workspaces.openWorkspace({ path, mode, baseRef }, connectionContext?.mcpSessionId);
+        if (connectionContext?.authenticatedRole === "peer") {
+          // For worktree mode the worktree path lives under KONTROL_WORKTREE_ROOT,
+          // so the grant check must compare against the SOURCE root the peer was
+          // granted, not the worktree path.
+          const grantRoot = openedWorkspace.workspace.sourceRoot ?? openedWorkspace.workspace.root;
+          const postDenied = peerWorkspaceDenied(connectionContext, grantRoot);
+          if (postDenied) return { content: [textBlock(postDenied)], isError: true };
+          // M2 P0 fix: record ownership so this peer can mutate this worktree
+          // and enumerate it. Applies to both the new-create path and any
+          // existing-workspace reuse path that emerges from openWorkspace.
+          if (openedWorkspace.workspace.mode === "worktree") {
+            const principalId = connectionContext.authenticatedPrincipalId;
+            if (principalId) recordPeerWorktree(openedWorkspace.workspace.id, principalId, config.stateDir);
+          }
+        }
       }
       const { workspace, agentsFiles, availableAgentsFiles } = openedWorkspace;
       const gitEligibility = await getGitEligibility(workspace.root);
@@ -362,8 +460,10 @@ export function registerWorkspaceTools(
       const snapshotInfo = await reviewCheckpoints.getSnapshotInfo({
         workspaceId: workspace.id,
         root: workspace.root,
+        initialize: false,
+        kindHint: gitEligibility.ok ? "git" : "filesystem",
       });
-      const checkpointBackend = snapshotInfo.available ? snapshotInfo.kind : "unavailable";
+      const checkpointBackend = snapshotInfo.pending ? "pending" : snapshotInfo.available ? snapshotInfo.kind : "unavailable";
       const changeTracking = snapshotInfo.available;
       const visibleSkills = workspace.skills
         .filter((skill) => !skill.disableModelInvocation)
@@ -383,7 +483,7 @@ export function registerWorkspaceTools(
       const baseInstruction = config.skillsEnabled
         ? "Use this workspaceId in all subsequent tool calls for this project. Do not call open_workspace again for this same folder unless this workspaceId stops working, the user asks to reopen, or you switch to a different folder/worktree. Follow loaded agentsFiles instructions. Nested instructions are loaded automatically when later tools enter their directory. Review, diagnosis, architecture, and code-edit requests go directly through this workspace first. Delegate only when the reviewer explicitly asks for bounded assistance: call discover_agents, use only a currently dispatchable healthy role=agent peer, and if optional assistance is unavailable continue directly without an alternate ACP route. The WebUI reviewer remains the approval authority. When a task matches an available skill in skills, read its path before proceeding. For skills not listed here, use the search_skills tool to discover global skills by keyword."
         : "Use this workspaceId in all subsequent tool calls for this project. Do not call open_workspace again for this same folder unless this workspaceId stops working, the user asks to reopen, or you switch to a different folder/worktree. Follow loaded agentsFiles instructions. Nested instructions are loaded automatically when later tools enter their directory. Review, diagnosis, architecture, and code-edit requests go directly through this workspace first. Delegate only when the reviewer explicitly asks for bounded assistance: call discover_agents, use only a currently dispatchable healthy role=agent peer, and if optional assistance is unavailable continue directly without an alternate ACP route. The WebUI reviewer remains the approval authority.";
-      const instruction = `${baseInstruction} The active Kontrol server exposes ${toolSurface.requiredInspectionTools.join(", ")} in tool surface ${toolSurface.version}. If this client's catalog omits any of them, refresh or initialize a fresh MCP connection; meanwhile continue with available bounded structured tools such as read. Do not substitute bash or find for structured inspection.`;
+      const instruction = `${baseInstruction} The active Kontrol server exposes ${toolSurface.requiredInspectionTools.join(", ")} in tool surface ${toolSurface.version}. If this client's catalog omits any of them, refresh or initialize a fresh MCP connection; meanwhile continue with available bounded structured tools such as read. Ordinary bash remains checkpoint-gated; use bash with readOnlyInspection=true only for its narrow pwd/ls/Git inspection allowlist.`;
       const resultContent: ToolContent[] = [
         {
           type: "text" as const,
@@ -438,6 +538,8 @@ export function registerWorkspaceTools(
           workspaceKind,
           versionControl,
           checkpointBackend,
+          ...(snapshotInfo.diagnostic ? { checkpointDiagnostic: snapshotInfo.diagnostic } : {}),
+          ...(snapshotInfo.checkpointError ? { checkpointError: snapshotInfo.checkpointError } : {}),
           capabilities: {
             read: true,
             search: true,
@@ -491,6 +593,24 @@ export function registerWorkspaceTools(
       }
       try {
         const page = await workspaces.listManagedWorktrees(before);
+        if (connectionContext?.authenticatedRole === "peer") {
+          // M2 P0 fix: peers must never observe other principals' worktree
+          // ids/paths/sourceRoots — the page is filtered to worktrees this
+          // peer opened in this process. Owner/reviewer/writer callers see
+          // the unfiltered page.
+          const principalId = connectionContext.authenticatedPrincipalId;
+          const filteredPage = {
+            ...page,
+            worktrees: page.worktrees.filter((entry) =>
+              principalId !== undefined
+              && typeof entry.workspaceId === "string"
+              && peerOwnsWorktree(entry.workspaceId, principalId)),
+          };
+          return {
+            content: [textBlock(JSON.stringify(filteredPage, null, 2))],
+            structuredContent: filteredPage,
+          };
+        }
         return {
           content: [textBlock(JSON.stringify(page, null, 2))],
           structuredContent: page,
@@ -665,6 +785,10 @@ export function registerWorkspaceTools(
         if (bindingErr) return bindingErr;
       }
       const readPath = workspaces.resolveReadPath(workspace, input.path, connectionContext?.mcpSessionId);
+      {
+        const peerDenied = peerInspectionDenied(workspace, readPath.absolutePath);
+        if (peerDenied) return peerDenied;
+      }
       if (policyEnforcer && policyEngine) {
         const approved = await enforceToolPolicy(
           workSessions,
@@ -678,6 +802,7 @@ export function registerWorkspaceTools(
           undefined,
           input.approvalResumeId,
           input,
+          scheduledExecutionPolicy(connectionContext?.workSessionId),
         );
         if (!approved.allowed) {
           return policyFailureResponse(approved, `Tool "${toolNames.read}" denied by policy. Path: ${input.path}`, {
@@ -690,7 +815,7 @@ export function registerWorkspaceTools(
       const newlyApplicable = readPath.skillRead
         ? []
         : await workspaces.loadApplicableInstructions(workspace, input.path, connectionContext?.mcpSessionId);
-      const response = await readFileTool(
+      const response = await readFileSnapshotTool(
         { ...input, limit: Math.min(input.limit ?? MAX_READ_LINES, MAX_READ_LINES), path: readPath.absolutePath },
         {
           cwd: workspace.root,
@@ -715,7 +840,7 @@ export function registerWorkspaceTools(
         : response.content;
       const inspection = inspectionMetadata(responseContent, response.details, input.offset ?? 1);
       const responseForOutput = { ...response, content: inspection.content };
-      const contentSha256 = await readFileVersion(readPath.absolutePath);
+      const contentSha256 = response.contentSha256;
       const summary = {
         ...textSummary(inspection.content),
         offset: input.offset ?? 1,
@@ -762,6 +887,116 @@ export function registerWorkspaceTools(
   if (config.toolMode !== "codex") {
   registerAppTool(
     server,
+    registeredTool(toolNames.stagedWrite),
+    {
+      title: "Staged file write",
+      description: "Publish one signed bounded-write artifact through Kontrol's durable artifact publisher. Callable only by the signed worker bound to an active bounded-write scheduled job.",
+      inputSchema: {
+        workspaceId: z.string().describe("Signed worker's registered workspace identifier."),
+        path: z.string().describe("Exactly one authorized output path, relative to the workspace root."),
+        content: z.string().describe("Complete artifact content."),
+      },
+      outputSchema: resultOutputSchema({
+        contentSha256: z.string().optional(),
+        publicationReceipt: z.record(z.string(), z.unknown()).optional(),
+      }),
+      ...toolWidgetDescriptorMeta(config, "write"),
+      annotations: WRITE_TOOL_ANNOTATIONS,
+    },
+    async ({ workspaceId, ...input }) => {
+      const startedAt = performance.now();
+      if (connectionContext?.authenticatedRole !== "worker" || !connectionContext.workSessionId) {
+        return { content: [textBlock("Forbidden: staged_file_write requires a signed bounded-write worker.")], isError: true };
+      }
+      const workSessionId = connectionContext.workSessionId;
+      const scheduledPolicy = scheduledExecutionPolicy(workSessionId);
+      if (scheduledPolicy?.executionMode !== "bounded_file_write" || scheduledPolicy.workspaceAccess !== "staged_write" || scheduledPolicy.mutate !== true) {
+        return { content: [textBlock("Forbidden: staged_file_write requires an active bounded-write scheduled job.")], isError: true };
+      }
+      const scheduledJob = scheduledJobFor?.(workSessionId);
+      if (!scheduledJob) {
+        return { content: [textBlock("Forbidden: no scheduled job is bound to this worker.")], isError: true };
+      }
+      if (!scheduledJob.activeDispatchAttemptId || !Number.isSafeInteger(scheduledJob.attemptNumber) || (scheduledJob.attemptNumber ?? 0) < 1
+        || !scheduledJob.acpRunId || !scheduledJob.dispatchIdempotencyKey) {
+        return { content: [textBlock("Forbidden: the active ACP attempt identity is not durably bound.")], isError: true };
+      }
+      const authorizedOutput = Array.isArray(scheduledJob.policySnapshotJson.allowedOutputs)
+        ? scheduledJob.policySnapshotJson.allowedOutputs.find((output) => output?.path === input.path)
+        : undefined;
+      if (!authorizedOutput) {
+        return { content: [textBlock(`Forbidden: path "${input.path}" is not an authorized output.`)], isError: true };
+      }
+      if (!recordPublicationIntent || !recordPublicationReceipt || !recordPublicationFailure) {
+        return { content: [textBlock("Internal error: scheduled publication durability is unavailable.")], isError: true };
+      }
+      const workspace = workspaces.getWorkspace(workspaceId);
+      const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
+      if (bindingErr) return bindingErr;
+      const blocked = await runMutationBarrier(prepareForMutation, workspaceId, toolNames.stagedWrite);
+      if (blocked) return blocked;
+      const resolvedPath = workspaces.resolvePath(workspace, input.path);
+      const publication = await withFileMutationLock<LockedToolMutation<Awaited<ReturnType<typeof writeFileTool>>>>([resolvedPath], async (): Promise<LockedToolMutation<Awaited<ReturnType<typeof writeFileTool>>>> => {
+        const receipt = await publishScheduledArtifact({
+          jobId: scheduledJob.id,
+          workSessionId,
+          workspaceRoot: workspace.root,
+          path: input.path,
+          content: Buffer.from(input.content, "utf8"),
+          attemptId: scheduledJob.activeDispatchAttemptId,
+          attemptNumber: scheduledJob.attemptNumber,
+          runId: scheduledJob.acpRunId,
+          dispatchIdempotencyKey: scheduledJob.dispatchIdempotencyKey,
+          recordPublicationIntent: (intent) => recordPublicationIntent({ jobId: scheduledJob.id, intent }),
+          recordPublicationReceipt: (receipt) => recordPublicationReceipt({ jobId: scheduledJob.id, receipt: receipt as unknown as Record<string, unknown> }),
+          recordPublicationFailure: (receiptId, outcome, reason) => recordPublicationFailure({ jobId: scheduledJob.id, receiptId, outcome, reason }),
+          output: {
+            path: input.path,
+            operation: (authorizedOutput.operation === "replace" ? "replace" : "create") as "create" | "replace",
+            ...(authorizedOutput.expectedSha256 ? { expectedSha256: authorizedOutput.expectedSha256 } : {}),
+            overwrite: (authorizedOutput.overwrite === "expected_hash" ? "expected_hash" : "deny") as "deny" | "expected_hash",
+            ...(authorizedOutput.expectedPreviousSha256 ? { expectedPreviousSha256: authorizedOutput.expectedPreviousSha256 } : {}),
+          },
+        });
+        if (receipt.outcome !== "committed") {
+          const response: Awaited<ReturnType<typeof writeFileTool>> = {
+            content: [{ type: "text", text: `Artifact publication ${receipt.outcome}: ${receipt.reason ?? "unknown"}` }],
+            isError: true,
+          };
+          return { response, contentSha256: undefined };
+        }
+        return {
+          response: { content: [{ type: "text", text: `Published ${input.path} (sha256: ${receipt.sha256}, read-back verified).` }], isError: false },
+          contentSha256: receipt.sha256,
+        };
+      });
+      if ("versionConflict" in publication) return publication.versionConflict;
+      const response = publication.response;
+      if (response.isError) {
+        logFailedToolResponse(config, { tool: toolNames.stagedWrite, workspaceId, path: input.path }, response.content, startedAt);
+        return response;
+      }
+      const patch = newFilePatch(input.path, input.content);
+      const summary = { ...countDiffStats(patch), lines: contentLineCount(input.content), characters: input.content.length };
+      logToolCall(config, { tool: toolNames.stagedWrite, workspaceId, path: input.path, success: true, durationMs: Math.round(performance.now() - startedAt) });
+      trackToolEvent(workspaceId, toolNames.stagedWrite, input, response, startedAt);
+      return {
+        ...response,
+        _meta: {
+          tool: toolNames.stagedWrite,
+          card: { workspaceId, path: input.path, summary: { ...summary, contentSha256: publication.contentSha256 } },
+        },
+        structuredContent: {
+          tool: toolNames.stagedWrite,
+          result: contentText(response.content),
+          contentSha256: publication.contentSha256,
+        },
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
     registeredTool(toolNames.write),
     {
       title: "Write file",
@@ -798,12 +1033,43 @@ export function registerWorkspaceTools(
       const workspace = workspaces.getWorkspace(workspaceId);
       const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
       if (bindingErr) return bindingErr;
+      const scheduledPolicy = scheduledExecutionPolicy(connectionContext?.workSessionId);
+      const stagedWrite = scheduledPolicy?.executionMode === "bounded_file_write";
+      const writeTool = stagedWrite ? toolNames.stagedWrite : toolNames.write;
+      const scheduledJob = stagedWrite && connectionContext?.workSessionId
+        ? scheduledJobFor?.(connectionContext.workSessionId)
+        : undefined;
+      const authorizedOutput = stagedWrite && scheduledJob
+        ? scheduledJob.policySnapshotJson.allowedOutputs?.find((output) => output?.path === input.path)
+        : undefined;
+      if (stagedWrite) {
+        if (scheduledPolicy?.workspaceAccess !== "staged_write"
+          || scheduledPolicy.mutate !== true
+          || !Array.isArray(scheduledPolicy.allowedOutputs)) {
+          return { content: [textBlock("Forbidden: bounded-write execution policy is invalid.")], isError: true };
+        }
+        if (!scheduledJob) {
+          return { content: [textBlock("Forbidden: no scheduled job is bound to this worker.")], isError: true };
+        }
+        if (!authorizedOutput) {
+          return { content: [textBlock(`Forbidden: path "${input.path}" is not an authorized output.`)], isError: true };
+        }
+        if (!scheduledJob.activeDispatchAttemptId
+          || !Number.isSafeInteger(scheduledJob.attemptNumber)
+          || (scheduledJob.attemptNumber ?? 0) < 1
+          || !scheduledJob.acpRunId || !scheduledJob.dispatchIdempotencyKey) {
+          return { content: [textBlock("Forbidden: the active ACP attempt identity is not durably bound.")], isError: true };
+        }
+        if (!recordPublicationIntent || !recordPublicationReceipt || !recordPublicationFailure) {
+          return { content: [textBlock("Internal error: scheduled publication durability is unavailable.")], isError: true };
+        }
+      }
       const resolvedPath = workspaces.resolvePath(workspace, input.path);
       const policyPath = canonicalPolicyPath(workspace.root, input.path, resolvedPath);
 
       const newlyApplicable = await workspaces.loadApplicableInstructions(workspace, input.path, connectionContext?.mcpSessionId);
       if (newlyApplicable.length > 0 && input.instructionContentHash !== hashInstructionContent(newlyApplicable)) {
-        return instructionsRequiredResponse(toolNames.write, newlyApplicable, workspace.root, workspaceId, input.path, `Read and acknowledge the returned instructions, then retry write with instructionContentHash="${hashInstructionContent(newlyApplicable)}". No file was changed.`);
+        return instructionsRequiredResponse(writeTool, newlyApplicable, workspace.root, workspaceId, input.path, `Read and acknowledge the returned instructions, then retry write with instructionContentHash="${hashInstructionContent(newlyApplicable)}". No file was changed.`);
       }
 
       // Policy enforcement for file writes
@@ -814,43 +1080,86 @@ export function registerWorkspaceTools(
           brandWorkspaceId(workspaceId),
           connectionContext?.workSessionId ? brandWorkSessionId(connectionContext.workSessionId) : undefined,
           connectionContext?.runId,
-            toolNames.write,
+            writeTool,
             policyPath,
             undefined,
             undefined,
             input.approvalResumeId,
             { expectedContentSha256, ...input },
+            scheduledExecutionPolicy(connectionContext?.workSessionId),
           );
         if (!approved.allowed) {
-          return policyFailureResponse(approved, `Tool "${toolNames.write}" denied by policy. Path: ${input.path}`, {
-            tool: toolNames.write,
+          return policyFailureResponse(approved, `Tool "${writeTool}" denied by policy. Path: ${input.path}`, {
+            tool: writeTool,
             workspaceId,
             path: input.path,
           });
         }
       }
 
-      const mutation = await withFileMutationLock<LockedToolMutation<Awaited<ReturnType<typeof writeFileTool>>>>([resolvedPath], async (): Promise<LockedToolMutation<Awaited<ReturnType<typeof writeFileTool>>>> => {
-        const versionConflict = await checkFileVersion(
-          toolNames.write,
-          workspaceId,
-          resolvedPath,
-          expectedContentSha256,
-        );
-        if (versionConflict) return { versionConflict } as const;
-        const response = await writeFileTool(input, {
-          cwd: workspace.root,
-          root: workspace.root,
+      let mutation: LockedToolMutation<Awaited<ReturnType<typeof writeFileTool>>>;
+      if (stagedWrite) {
+        const activeJob = scheduledJob!;
+        const output = authorizedOutput!;
+        // Bounded scheduled writes route through the publisher for atomic
+        // replacement, symlink-escape rejection, and read-back verification.
+        mutation = await withFileMutationLock<LockedToolMutation<Awaited<ReturnType<typeof writeFileTool>>>>([resolvedPath], async (): Promise<LockedToolMutation<Awaited<ReturnType<typeof writeFileTool>>>> => {
+          const receipt = await publishScheduledArtifact({
+            jobId: activeJob.id,
+            workSessionId: connectionContext?.workSessionId ?? "",
+            workspaceRoot: workspace.root,
+            path: input.path,
+            content: Buffer.from(input.content, "utf8"),
+            attemptId: activeJob.activeDispatchAttemptId,
+            attemptNumber: activeJob.attemptNumber,
+            runId: activeJob.acpRunId,
+            dispatchIdempotencyKey: activeJob.dispatchIdempotencyKey,
+            recordPublicationIntent: (intent) => recordPublicationIntent!({ jobId: activeJob.id, intent }),
+            recordPublicationReceipt: (receipt) => recordPublicationReceipt!({ jobId: activeJob.id, receipt: receipt as unknown as Record<string, unknown> }),
+            recordPublicationFailure: (receiptId, outcome, reason) => recordPublicationFailure!({ jobId: activeJob.id, receiptId, outcome, reason }),
+            output: {
+              path: input.path,
+              operation: (output.operation === "replace" ? "replace" : "create") as "create" | "replace",
+              ...(output.expectedSha256 ? { expectedSha256: output.expectedSha256 } : {}),
+              overwrite: (output.overwrite === "expected_hash" ? "expected_hash" : "deny") as "deny" | "expected_hash",
+              ...(output.expectedPreviousSha256 ? { expectedPreviousSha256: output.expectedPreviousSha256 } : {}),
+            },
+          });
+          if (receipt.outcome !== "committed") {
+            const response: Awaited<ReturnType<typeof writeFileTool>> = {
+              content: [{ type: "text", text: `Artifact publication ${receipt.outcome}: ${receipt.reason ?? "unknown"}` }],
+              isError: true,
+            };
+            return { response, contentSha256: undefined };
+          }
+          return {
+            response: { content: [{ type: "text", text: `Published ${input.path} (sha256: ${receipt.sha256}, read-back verified).` }], isError: false },
+            contentSha256: receipt.sha256,
+          };
         });
-        if (response.isError) return { response, contentSha256: undefined } as const;
-        return { response, contentSha256: await readFileVersion(resolvedPath) } as const;
-      });
+      } else {
+        mutation = await withFileMutationLock<LockedToolMutation<Awaited<ReturnType<typeof writeFileTool>>>>([resolvedPath], async (): Promise<LockedToolMutation<Awaited<ReturnType<typeof writeFileTool>>>> => {
+          const versionConflict = await checkFileVersion(
+            writeTool,
+            workspaceId,
+            resolvedPath,
+            expectedContentSha256,
+          );
+          if (versionConflict) return { versionConflict } as const;
+          const response = await writeFileTool(input, {
+            cwd: workspace.root,
+            root: workspace.root,
+          });
+          if (response.isError) return { response, contentSha256: undefined } as const;
+          return { response, contentSha256: await readFileVersion(resolvedPath) } as const;
+        });
+      }
       if ("versionConflict" in mutation) return mutation.versionConflict;
       const response = mutation.response;
 
       if (response.isError) {
         logFailedToolResponse(config, {
-          tool: toolNames.write,
+          tool: writeTool,
           workspaceId,
           path: input.path,
         }, response.content, startedAt);
@@ -869,7 +1178,7 @@ export function registerWorkspaceTools(
         characters: input.content.length,
       };
       logToolCall(config, {
-        tool: toolNames.write,
+        tool: writeTool,
         workspaceId,
         path: input.path,
         success: true,
@@ -880,12 +1189,12 @@ export function registerWorkspaceTools(
         ? { ...response, content: [...instructionContent(newlyApplicable, workspace.root), ...response.content] }
         : response;
       const contentSha256 = mutation.contentSha256;
-      trackToolEvent(workspaceId, toolNames.write, input, responseWithInstructions, startedAt);
+      trackToolEvent(workspaceId, writeTool, input, responseWithInstructions, startedAt);
 
       return {
         ...responseWithInstructions,
         _meta: {
-          tool: toolNames.write,
+          tool: writeTool,
           card: {
             workspaceId,
             path: input.path,
@@ -897,7 +1206,7 @@ export function registerWorkspaceTools(
           },
         },
         structuredContent: {
-          tool: toolNames.write,
+          tool: writeTool,
           result: contentText(responseWithInstructions.content),
           contentSha256,
         },
@@ -976,6 +1285,7 @@ export function registerWorkspaceTools(
             undefined,
             input.approvalResumeId,
             { expectedContentSha256, ...input },
+            scheduledExecutionPolicy(connectionContext?.workSessionId),
           );
         if (!approved.allowed) {
           return policyFailureResponse(approved, `Tool "${toolNames.edit}" denied by policy. Path: ${input.path}`, {
@@ -1142,6 +1452,7 @@ export function registerWorkspaceTools(
             policyPaths,
             approvalResumeId,
             { patch, expectedContentSha256ByPath },
+            scheduledExecutionPolicy(connectionContext?.workSessionId),
           );
           if (!approved.allowed) {
             return policyFailureResponse(approved, `Tool "apply_patch" denied by policy.`, {
@@ -1357,6 +1668,13 @@ export function registerWorkspaceTools(
         const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
         if (bindingErr) return bindingErr;
       }
+        {
+          const peerDenied = peerInspectionDenied(
+            workspace,
+            input.path ? workspaces.resolvePath(workspace, input.path) : undefined,
+          );
+          if (peerDenied) return peerDenied;
+        }
         const policyPath = input.path
           ? canonicalPolicyPath(workspace.root, input.path, workspaces.resolvePath(workspace, input.path))
           : undefined;
@@ -1373,6 +1691,7 @@ export function registerWorkspaceTools(
             undefined,
             input.approvalResumeId,
             input,
+            scheduledExecutionPolicy(connectionContext?.workSessionId),
           );
           if (!approved.allowed) {
             return policyFailureResponse(approved, `Tool "${toolNames.grep}" denied by policy.`, {
@@ -1476,6 +1795,13 @@ export function registerWorkspaceTools(
         const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
         if (bindingErr) return bindingErr;
       }
+        {
+          const peerDenied = peerInspectionDenied(
+            workspace,
+            input.path ? workspaces.resolvePath(workspace, input.path) : undefined,
+          );
+          if (peerDenied) return peerDenied;
+        }
         const policyPath = input.path
           ? canonicalPolicyPath(workspace.root, input.path, workspaces.resolvePath(workspace, input.path))
           : undefined;
@@ -1492,6 +1818,7 @@ export function registerWorkspaceTools(
             undefined,
             input.approvalResumeId,
             input,
+            scheduledExecutionPolicy(connectionContext?.workSessionId),
           );
           if (!approved.allowed) {
             return policyFailureResponse(approved, `Tool "${toolNames.glob}" denied by policy.`, {
@@ -1596,6 +1923,10 @@ export function registerWorkspaceTools(
         if (bindingErr) return bindingErr;
       }
         const resolvedPath = workspaces.resolvePath(workspace, input.path);
+        {
+          const peerDenied = peerInspectionDenied(workspace, resolvedPath);
+          if (peerDenied) return peerDenied;
+        }
         const policyPath = canonicalPolicyPath(workspace.root, input.path, resolvedPath);
         if (policyEnforcer && policyEngine) {
           const approved = await enforceToolPolicy(
@@ -1610,6 +1941,7 @@ export function registerWorkspaceTools(
             undefined,
             input.approvalResumeId,
             input,
+            scheduledExecutionPolicy(connectionContext?.workSessionId),
           );
           if (!approved.allowed) {
             return policyFailureResponse(approved, `Tool "${toolNames.ls}" denied by policy. Path: ${input.path}`, {
@@ -1707,6 +2039,10 @@ export function registerWorkspaceTools(
       const workspace = workspaces.getWorkspace(workspaceId);
       const pathArgs = gitPathArg(workspaces, workspace, requestedPath);
       const absolutePath = requestedPath !== undefined ? workspaces.resolvePath(workspace, requestedPath) : undefined;
+      {
+        const peerDenied = peerInspectionDenied(workspace, absolutePath);
+        if (peerDenied) return peerDenied;
+      }
       if (policyEnforcer && policyEngine) {
         const approved = await enforceToolPolicy(
           workSessions,
@@ -1756,29 +2092,39 @@ export function registerWorkspaceTools(
     });
   };
 
+  const boundedGitText = (result: Awaited<ReturnType<typeof git>>, emptyText: string): string => {
+    const output = result.stdout || emptyText;
+    return result.stdoutTruncated
+      ? `${output}\n\n[Truncated: Git inspection output exceeded its bounded capture.]`
+      : output;
+  };
+
   registerGitInspection(toolNames.gitStatus, "Git status", "Read-only short Git status for an open workspace; never requires shell approval.", {}, async (root, path) => {
-    const result = await git(root, ["status", "--short", "--branch", "--untracked-files=all", ...(path ? ["--", path] : [])], { maxBuffer: 262_144, timeoutMs: 15_000 });
-    return result.stdout || "(clean)";
+    // Report untracked directories as entries instead of expanding every
+    // nested file. The bounded Git capture also prevents huge status output
+    // from failing before MCP can return a truncation marker.
+    const result = await git(root, ["status", "--short", "--branch", "--untracked-files=normal", ...(path ? ["--", path] : [])], { maxOutputBytes: 45_000, timeoutMs: 15_000 });
+    return boundedGitText(result, "(clean)");
   });
   registerGitInspection(toolNames.gitLog, "Git log", "Read-only bounded Git history for an open workspace.", { limit: z.number().int().min(1).max(100).optional() }, async (root, path, input) => {
     const limit = Number(input.limit ?? 20);
-    const result = await git(root, ["log", `--max-count=${limit}`, "--date=iso-strict", "--format=%H%x09%ad%x09%an%x09%s", ...(path ? ["--", path] : [])], { maxBuffer: 262_144, timeoutMs: 15_000 });
-    return result.stdout || "(no commits)";
+    const result = await git(root, ["log", `--max-count=${limit}`, "--date=iso-strict", "--format=%H%x09%ad%x09%an%x09%s", ...(path ? ["--", path] : [])], { maxOutputBytes: 45_000, timeoutMs: 15_000 });
+    return boundedGitText(result, "(no commits)");
   });
   registerGitInspection(toolNames.gitDiff, "Git diff", "Read-only unified diff for an open workspace. Use git show for committed file content.", { staged: z.boolean().optional() }, async (root, path, input) => {
     const args = ["diff", "--no-ext-diff", "--unified=3"];
     if (input.staged === true) args.push("--cached");
     if (path) args.push("--", path);
-    const result = await git(root, args, { maxBuffer: 262_144, timeoutMs: 15_000 });
-    return result.stdout || "(no diff)";
+    const result = await git(root, args, { maxOutputBytes: 45_000, timeoutMs: 15_000 });
+    return boundedGitText(result, "(no diff)");
   });
-  registerGitInspection(toolNames.gitShow, "Git show", "Read-only bounded Git object or file view for an open workspace.", { revision: z.string().regex(/^[A-Za-z0-9._/~^@{}-]+$/).default("HEAD") }, async (root, path, input) => {
+  registerGitInspection(toolNames.gitShow, "Git show", "Read-only bounded Git view for an open workspace. With path, returns the file or tree object at the selected revision; without path, returns revision metadata and stats.", { revision: z.string().regex(/^[A-Za-z0-9._/~^@{}-]+$/).default("HEAD") }, async (root, path, input) => {
     const revision = String(input.revision ?? "HEAD");
-    const args = ["show", "--no-ext-diff", "--no-textconv", "--format=fuller", revision];
-    if (path) args.push("--", path);
-    else args.push("--no-patch", "--stat");
-    const result = await git(root, args, { maxBuffer: 262_144, timeoutMs: 15_000 });
-    return result.stdout || "(empty object)";
+    const args = ["show", "--no-ext-diff", "--no-textconv"];
+    if (path) args.push(`${revision}:${path}`);
+    else args.push("--format=fuller", "--no-patch", "--stat", revision);
+    const result = await git(root, args, { maxOutputBytes: 45_000, timeoutMs: 15_000 });
+    return boundedGitText(result, path ? "" : "(empty object)");
   });
 
   if (config.toolMode !== "codex") {
@@ -1797,6 +2143,9 @@ export function registerWorkspaceTools(
           .describe(
             `Shell command to run. Must not create or modify project files; use ${toolNames.edit} or ${toolNames.write} for file changes.`,
           ),
+        readOnlyInspection: z.boolean().optional().describe(
+          "Run only the fixed pwd/ls/read-only Git inspection allowlist. This mode bypasses baseline capture but retains workspace binding and shell policy checks. Other commands require the normal review checkpoint.",
+        ),
         workingDirectory: z
           .string()
           .optional()
@@ -1821,12 +2170,18 @@ export function registerWorkspaceTools(
     },
     async ({ workspaceId, workingDirectory, ...input }) => {
       const startedAt = performance.now();
-      // REVIEW-01: shell is mutation-capable regardless of the command
-      // string — a textual "read-only" classification is not a security
-      // boundary. It crosses the same checkpoint-readiness barrier as
-      // write/edit/apply_patch/exec_command.
-      const blocked = await runMutationBarrier(prepareForMutation, workspaceId, toolNames.shell);
-      if (blocked) return blocked;
+      if (input.readOnlyInspection && connectionContext?.authenticatedRole === "peer") {
+        return { content: [textBlock("Forbidden: peer shell inspection is unavailable; use structured read-only inspection tools.")], isError: true };
+      }
+      if (input.readOnlyInspection) {
+        const inspectionError = readOnlyShellInspectionError(input.command);
+        if (inspectionError) return { content: [textBlock(inspectionError)], isError: true };
+      } else {
+        // Ordinary shell commands remain mutation-capable regardless of their
+        // text and cross the same checkpoint barrier as write/edit/patch.
+        const blocked = await runMutationBarrier(prepareForMutation, workspaceId, toolNames.shell);
+        if (blocked) return blocked;
+      }
       const workspace = workspaces.getWorkspace(workspaceId);
       const bindingErr = assertWorkerWorkspaceBinding(connectionContext, workSessions, workspaceId);
       if (bindingErr) return bindingErr;
@@ -1850,6 +2205,7 @@ export function registerWorkspaceTools(
           undefined,
           input.approvalResumeId,
           { workingDirectory, ...input },
+          scheduledExecutionPolicy(connectionContext?.workSessionId),
         );
         if (!approved.allowed) {
           return policyFailureResponse(approved, `Tool "${toolNames.shell}" denied by policy. Command: ${input.command}`, {
@@ -1874,7 +2230,9 @@ export function registerWorkspaceTools(
             workspaceId,
             ownerId: processSessionOwnerId(connectionContext),
             workSessionId: connectionContext?.workSessionId,
+            principalId: connectionContext?.authenticatedPrincipalId,
             command: input.command,
+            readOnlyInspection: input.readOnlyInspection === true,
             cwd,
             timeoutMs: timeoutSeconds * 1_000,
             yieldTimeMs: Math.min(timeoutSeconds * 1_000, 10_000),

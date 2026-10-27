@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# Restart the complete Kontrol generation through a serialized transaction.
-# Candidate preparation happens while the current tmux generation is serving;
-# the deployment controller retains recovery ownership through the cutover.
+# Restart the committed Kontrol artifact by default. --rebuild prepares,
+# validates, and activates a fresh immutable candidate before cutover.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -18,6 +17,8 @@ export KONTROL_ENV_FILE="$ENV_FILE"
 # resumes/activates a previously prepared candidate without re-preparing.
 # The value is validated as an immutable artifact by start-all.sh.
 ACTIVATE_ARTIFACT_PATH=""
+REBUILD_CANDIDATE=0
+RESTART_INSTALLED=1
 FILTERED_ARGS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -26,12 +27,25 @@ while [[ $# -gt 0 ]]; do
       ACTIVATE_ARTIFACT_PATH="$2"
       shift 2
       ;;
+    --rebuild)
+      REBUILD_CANDIDATE=1
+      RESTART_INSTALLED=0
+      shift
+      ;;
+    --restart-installed)
+      RESTART_INSTALLED=1
+      shift
+      ;;
     *)
       FILTERED_ARGS+=("$1")
       shift
       ;;
   esac
 done
+if [[ "$REBUILD_CANDIDATE" == "1" && "$RESTART_INSTALLED" == "1" ]]; then
+  echo "ERROR: --rebuild and --restart-installed are mutually exclusive." >&2
+  exit 2
+fi
 if [[ -n "$ACTIVATE_ARTIFACT_PATH" ]]; then
   [[ "$ACTIVATE_ARTIFACT_PATH" = /* ]] || ACTIVATE_ARTIFACT_PATH="$DESKTOP_PWD/$ACTIVATE_ARTIFACT_PATH"
   export KONTROL_ACTIVATE_ARTIFACT_PATH="$ACTIVATE_ARTIFACT_PATH"
@@ -136,7 +150,7 @@ on_exit() {
 trap on_exit EXIT
 
 OWNER_INFO="$(runtime_owner_info)"
-if [[ -n "$OWNER_INFO" ]]; then
+if [[ -n "$OWNER_INFO" && -n "$(json_field "$OWNER_INFO" launcher)" ]]; then
   OWNER_LAUNCHER="$(json_field "$OWNER_INFO" launcher)"
   PREVIOUS_ARTIFACT_PATH="$(json_field "$OWNER_INFO" artifactPath)"
   PREVIOUS_BUILD_ID="$(json_field "$OWNER_INFO" buildId)"
@@ -146,11 +160,13 @@ if [[ -n "$OWNER_INFO" ]]; then
       # start-all validates the inherited token and uses transaction-specific
       # candidate state, so a second restart cannot cross the cutover.
       if [[ -n "$ACTIVATE_ARTIFACT_PATH" ]]; then
-        # Explicit resume: validate and activate the named immutable artifact
-        # without creating a new candidate.
+        # Explicit artifact activation: use the exact named immutable release.
         echo "[*] Explicit artifact activation requested: $ACTIVATE_ARTIFACT_PATH" >&2
+        HANDOFF_STARTED=1
+        ./stop-all.sh
         KONTROL_USE_EXISTING_DIST=true ./start-all.sh --activate-existing "${START_ARGS[@]+"${START_ARGS[@]}"}"
-      else
+        HANDOFF_STARTED=0
+      elif [[ "$REBUILD_CANDIDATE" == "1" ]]; then
         if ! KONTROL_USE_EXISTING_DIST=false ./start-all.sh --prepare-only; then
           echo "ERROR: candidate preparation failed; the current Kontrol generation was left running." >&2
           exit 1
@@ -159,6 +175,14 @@ if [[ -n "$OWNER_INFO" ]]; then
         HANDOFF_STARTED=1
         ./stop-all.sh
         KONTROL_USE_EXISTING_DIST=true ./start-all.sh --activate-existing "${START_ARGS[@]+"${START_ARGS[@]}"}"
+        HANDOFF_STARTED=0
+      else
+        [[ -n "$PREVIOUS_ARTIFACT_PATH" ]] || { echo "ERROR: runtime.lock does not identify the installed immutable artifact." >&2; exit 1; }
+        echo "[*] Restarting committed release $PREVIOUS_BUILD_ID at $PREVIOUS_ARTIFACT_PATH without rebuilding." >&2
+        HANDOFF_STARTED=1
+        PREPARED_CANDIDATE_BUILD_ID="$PREVIOUS_BUILD_ID"
+        ./stop-all.sh
+        KONTROL_USE_EXISTING_DIST=true KONTROL_ACTIVATE_ARTIFACT_PATH="$PREVIOUS_ARTIFACT_PATH" ./start-all.sh --activate-existing "${START_ARGS[@]+"${START_ARGS[@]}"}"
         HANDOFF_STARTED=0
       fi
       ;;
@@ -176,12 +200,15 @@ if [[ -n "$OWNER_INFO" ]]; then
       ;;
   esac
 else
-  # No existing owner: start-all validates the inherited deployment lock, then
-  # releases it after the new generation is committed. An explicit artifact
-  # selector activates that candidate directly without a fresh preparation.
+  # With no live process, the committed generation record still identifies
+  # the immutable release for a normal restart.
   if [[ -n "$ACTIVATE_ARTIFACT_PATH" ]]; then
     KONTROL_USE_EXISTING_DIST=true ./start-all.sh --activate-existing "${START_ARGS[@]+"${START_ARGS[@]}"}"
+  elif [[ "$RESTART_INSTALLED" == "1" ]]; then
+    COMMITTED_ARTIFACT_PATH="$(json_file_field "$KONTROL_STATE_DIR/generation.json" artifactPath)"
+    [[ -n "$COMMITTED_ARTIFACT_PATH" ]] || { echo "ERROR: no committed immutable artifact is recorded; use the normal restart to build one." >&2; exit 1; }
+    KONTROL_USE_EXISTING_DIST=true KONTROL_ACTIVATE_ARTIFACT_PATH="$COMMITTED_ARTIFACT_PATH" ./start-all.sh --activate-existing "${START_ARGS[@]+"${START_ARGS[@]}"}"
   else
-    ./start-all.sh "${START_ARGS[@]+"${START_ARGS[@]}"}"
+    KONTROL_USE_EXISTING_DIST=false ./start-all.sh "${START_ARGS[@]+"${START_ARGS[@]}"}"
   fi
 fi

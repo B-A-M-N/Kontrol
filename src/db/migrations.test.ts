@@ -4,12 +4,33 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { databasePath, openDatabase } from "./client.js";
-import { LATEST_SCHEMA_VERSION, migrateDatabase } from "./migrations.js";
+import { inspectDatabaseSchemaContract, LATEST_SCHEMA_VERSION, migrateDatabase } from "./migrations.js";
 
 const sqlite = new Database(":memory:");
 sqlite.pragma("foreign_keys = ON");
 try {
   migrateDatabase(sqlite);
+  const schemaContract = inspectDatabaseSchemaContract(sqlite);
+  assert.equal(schemaContract.expectedTableCount, 51, "schema contract covers all Drizzle table mappings, including peer-job and PTY binding storage");
+  assert.deepEqual(schemaContract.missing, [], "all Drizzle tables and columns are present in migrated SQLite");
+  assert.equal(schemaContract.appliedVersion, LATEST_SCHEMA_VERSION);
+  const scheduledTargetColumns = sqlite.prepare("pragma table_info(scheduled_jobs)").all() as Array<{ name: string }>;
+  assert.ok(scheduledTargetColumns.some((column) => column.name === "dispatch_target"), "scheduled dispatch target is durable after migration");
+  assert.ok(scheduledTargetColumns.some((column) => column.name === "dispatch_peer_id"), "scheduled peer identity is durable after migration");
+  assert.ok(
+    (sqlite.prepare("select name from sqlite_master where type = 'index'").all() as Array<{ name: string }>)
+      .some((index) => index.name === "event_log_scheduled_error_fingerprint_time_idx"),
+    "scheduler recurrence lookup has a fingerprint/time index",
+  );
+  const recurrencePlan = sqlite.prepare(`
+    explain query plan
+    select count(*) from event_log
+     where type = 'scheduled_job.scheduler_error'
+       and created_at >= ?
+       and json_extract(payload, '$.fingerprint') = ?
+  `).all("2026-01-01T00:00:00.000Z", "fingerprint") as Array<{ detail: string }>;
+  assert.ok(recurrencePlan.some((row) => row.detail.includes("event_log_scheduled_error_fingerprint_time_idx")),
+    "durable recurrence count uses the bounded fingerprint/time lookup index");
   assert.ok(
     (sqlite.prepare("pragma table_info(work_session_submissions)").all() as Array<{ name: string }>)
       .some((column) => column.name === "files_json"),
@@ -20,6 +41,47 @@ try {
       .some((column) => column.name === "owner_context_id"),
     "work session owner context column is present after migration",
   );
+  assert.ok(
+    (sqlite.prepare("pragma table_info(review_handoffs)").all() as Array<{ name: string }>)
+      .some((column) => column.name === "claim_expires_at"),
+    "review handoff claim leases are durable after migration",
+  );
+  assert.ok(
+    (sqlite.prepare("pragma table_info(review_routes)").all() as Array<{ name: string }>)
+      .some((column) => column.name === "delivery_transport"),
+    "review routes persist their selected delivery transport",
+  );
+  assert.ok(
+    (sqlite.prepare("pragma table_info(review_threads)").all() as Array<{ name: string }>)
+      .some((column) => column.name === "conversation_fingerprint"),
+    "review threads persist exact browser conversation identity",
+  );
+  assert.ok(
+    (sqlite.prepare("pragma table_info(review_browser_turns)").all() as Array<{ name: string }>)
+      .some((column) => column.name === "lease_token_sha256"),
+    "browser review turns persist fenced delivery leases",
+  );
+  const browserTurnColumns = (sqlite.prepare("pragma table_info(review_browser_turns)").all() as Array<{ name: string }>).map((column) => column.name);
+  assert.ok(browserTurnColumns.includes("generation_started_at") && browserTurnColumns.includes("generation_started_observation_id")
+    && browserTurnColumns.includes("generation_finished_observation_id"), "browser turns persist bounded generation observation identity and timestamps");
+  assert.ok(browserTurnColumns.includes("binding_revision"), "browser turns persist the exact conversation-binding revision they claimed");
+  assert.ok(
+    (sqlite.prepare("pragma table_info(review_browser_turn_resolutions)").all() as Array<{ name: string }>)
+      .some((column) => column.name === "evidence_sha256"),
+    "operator browser recovery receipts persist only a hash of the inspection note",
+  );
+  assert.ok(
+    (sqlite.prepare("pragma table_info(review_browser_profiles)").all() as Array<{ name: string }>)
+      .some((column) => column.name === "owner_principal_id"),
+    "review browser profiles remain owned by the authenticated principal",
+  );
+  const reviewBrowserProfileColumns = (sqlite.prepare("pragma table_info(review_browser_profiles)").all() as Array<{ name: string }>).map((column) => column.name);
+  assert.ok(reviewBrowserProfileColumns.includes("browser_ready_at"), "browser readiness has a timestamp separate from authentication verification");
+  assert.ok(reviewBrowserProfileColumns.includes("manual_auth_pid") && reviewBrowserProfileColumns.includes("manual_auth_process_start_identity")
+    && reviewBrowserProfileColumns.includes("manual_auth_boot_identity") && reviewBrowserProfileColumns.includes("manual_auth_generation"),
+  "manual authentication ownership and generation are durable across controller restarts");
+  assert.ok(reviewBrowserProfileColumns.includes("browser_product") && reviewBrowserProfileColumns.includes("remote_debugging_enabled")
+    && reviewBrowserProfileColumns.includes("browser_launch_diagnostic"), "browser launch product, CDP mode, and bounded diagnostics are durable");
   assert.ok(
     (sqlite.prepare("pragma table_info(approval_requests)").all() as Array<{ name: string }>)
       .some((column) => column.name === "owner_context_id"),
@@ -54,6 +116,40 @@ try {
     (sqlite.prepare("pragma index_list(policy_approval_grants)").all() as Array<{ name: string }>)
       .some((index) => index.name === "policy_approval_grants_principal_idx"),
     "effective policy grants retain their indexed composite identity",
+  );
+  assert.ok(
+    (sqlite.prepare("pragma table_info(mcp_qualification_evidence)").all() as Array<{ name: string }>)
+      .some((column) => column.name === "content_sha256"),
+    "MCP qualification evidence is durably stored with content hashes",
+  );
+  const qualificationIndexes = (sqlite.prepare("pragma index_list(mcp_qualification_evidence)").all() as Array<{ name: string }>)
+    .map((index) => index.name);
+  for (const index of [
+    "mcp_qualification_evidence_build_idx",
+    "mcp_qualification_evidence_capture_idx",
+    "mcp_qualification_evidence_session_idx",
+    "mcp_qualification_evidence_operation_idx",
+  ]) {
+    assert.ok(qualificationIndexes.includes(index), `qualification evidence has its ${index} lookup index`);
+  }
+  assert.ok(
+    (sqlite.prepare("pragma table_info(mcp_external_catalog_observations)").all() as Array<{ name: string }>)
+      .some((column) => column.name === "content_sha256"),
+    "external host observations are retained as content-addressed records",
+  );
+  const associationIndexes = (sqlite.prepare("pragma index_list(mcp_qualification_associations)").all() as Array<{ name: string }>)
+    .map((index) => index.name);
+  for (const index of [
+    "mcp_qualification_associations_build_idx",
+    "mcp_qualification_associations_capture_idx",
+    "mcp_qualification_associations_session_idx",
+  ]) {
+    assert.ok(associationIndexes.includes(index), `qualification association has its ${index} lookup index`);
+  }
+  assert.ok(
+    (sqlite.prepare("pragma table_info(review_handoff_external_catalog_attachments)").all() as Array<{ name: string }>)
+      .some((column) => column.name === "investigation_direction"),
+    "reviewer capture handoff attachments retain the investigation direction",
   );
   sqlite.pragma("foreign_keys = OFF");
   sqlite.prepare(`

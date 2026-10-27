@@ -6,9 +6,9 @@
  */
 import { randomUUID } from "node:crypto";
 import express, { type Express, type NextFunction, type Request, type Response } from "express";
-import { hostHeaderValidation, localhostHostValidation } from "@modelcontextprotocol/sdk/server/middleware/hostHeaderValidation.js";
-import { mcpAuthRouter } from "@modelcontextprotocol/sdk/server/auth/router.js";
+import { hostHeaderValidation, localhostHostValidation } from "@modelcontextprotocol/express";
 import type { ServerConfig } from "../config.js";
+import type { DerivedAuth } from "./auth.js";
 import type { SingleUserOAuthProvider } from "../oauth-provider.js";
 import { logEvent, requestPath } from "../logger.js";
 import { requestLogFields } from "../mcp/workspace-server.js";
@@ -21,12 +21,18 @@ import {
   uiBuildDirectory,
 } from "./mcp-session-state.js";
 import type { RequestHandler } from "express";
+import { verifyWorkerToken } from "../acp-worker-token.mjs";
 
 export interface HttpAppDeps {
   readonly config: ServerConfig;
   readonly oauthProvider: SingleUserOAuthProvider | null;
   readonly resourceServerUrl: URL | undefined;
   readonly bearerAuth: ((req: Request, res: Response, next: (error?: unknown) => void) => void) | undefined;
+  /**
+   * The owner app's OAuth router from deriveAuth; the public listener builds
+   * its own (see src/server/auth.ts for the budget-isolation rationale).
+   */
+  readonly oauthRouter: NonNullable<DerivedAuth["oauthRouter"]> | undefined;
 }
 
 export function createHttpApp(deps: HttpAppDeps): { app: Express } {
@@ -80,17 +86,8 @@ export function createHttpApp(deps: HttpAppDeps): { app: Express } {
     next();
   });
 
-  if (deps.oauthProvider) {
-    app.use(
-      mcpAuthRouter({
-        provider: deps.oauthProvider,
-        issuerUrl: new URL(config.publicBaseUrl),
-        baseUrl: new URL(config.publicBaseUrl),
-        resourceServerUrl: deps.resourceServerUrl,
-        scopesSupported: config.oauth.scopes,
-        resourceName: "Kontrol",
-      }),
-    );
+  if (deps.oauthRouter) {
+    app.use(deps.oauthRouter);
   } else if (config.authMode === "tunnel") {
     // Tunnel mode has no OAuth gate on /mcp, but the OpenAI tunnel-client
     // probes these discovery paths during readiness. Serve static metadata so
@@ -121,7 +118,20 @@ export function createHttpApp(deps: HttpAppDeps): { app: Express } {
   // unauthenticated request from spending parser memory and avoids the SDK's
   // unconditional ~100 KB parser.
   if (deps.bearerAuth) {
-    app.use("/mcp", (req: Request, res: Response, next: NextFunction) => deps.bearerAuth!(req, res, next));
+    app.use("/mcp", (req: Request, res: Response, next: NextFunction) => {
+      const workerToken = req.header("x-kontrol-worker-token");
+      if (workerToken && deps.config.acpAgentSecret) {
+        try {
+          if (verifyWorkerToken(workerToken, deps.config.acpAgentSecret).agentPtyReview) {
+            next();
+            return;
+          }
+        } catch {
+          // Invalid and expired worker credentials continue through normal OAuth.
+        }
+      }
+      deps.bearerAuth!(req, res, next);
+    });
   }
   if (config.acpEnabled) {
     app.use(

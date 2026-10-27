@@ -3,6 +3,8 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDatabase } from "./db/client.js";
+import { eq } from "drizzle-orm";
+import { dispatchOutbox } from "./db/schema.js";
 import { createDispatchOutbox, type DispatchOutboxEvent, type OutboxClaim } from "./dispatch-outbox.js";
 
 const claimOf = (event: DispatchOutboxEvent): OutboxClaim => ({ eventId: event.id, claimOwner: event.claimedBy ?? "", claimToken: event.claimToken ?? "" });
@@ -11,6 +13,81 @@ import { createWorkSessionManager } from "./work-sessions.js";
 const root = await mkdtemp(join(tmpdir(), "kontrol-outbox-test-"));
 
 try {
+  // Durable outbox inserts wake only matching in-process subscribers. The
+  // database remains the recovery source if no subscriber is connected.
+  {
+    const db = openDatabase(join(root, "notifications"));
+    const outbox = createDispatchOutbox(db);
+    const observed: DispatchOutboxEvent[] = [];
+    const unsubscribe = outbox.subscribe((event) => observed.push(event), ["reviewer.browser_turn.ready"]);
+    outbox.enqueue({ eventType: "unrelated.event", aggregateId: "unrelated" });
+    let queued: DispatchOutboxEvent | undefined;
+    db.sqlite.transaction(() => {
+      queued = outbox.enqueue({ eventType: "reviewer.browser_turn.ready", aggregateId: "review" });
+      assert.equal(observed.length, 0, "the consumer wake must not run before the enclosing transaction commits");
+    })();
+    await Promise.resolve();
+    assert.deepEqual(observed.map((event) => event.id), [queued!.id]);
+    unsubscribe();
+    outbox.enqueue({ eventType: "reviewer.browser_turn.ready", aggregateId: "after-unsubscribe" });
+    assert.equal(observed.length, 1, "unsubscribed consumers receive no further wakeups");
+    assert.equal(outbox.listPending(1, ["reviewer.browser_turn.ready"])[0]?.aggregateId, "review");
+    db.close();
+  }
+
+  // Authentication failures preserve a reviewer packet without retry churn;
+  // a positive human-driven recovery resumes only that profile's events.
+  {
+    const db = openDatabase(join(root, "auth-suspension"));
+    const outbox = createDispatchOutbox(db);
+    const event = outbox.enqueue({
+      eventType: "reviewer.browser_turn.ready", aggregateId: "review-auth-suspended", aggregateRevision: 3,
+      payload: { profileId: "profile-a", threadId: "thread-a" },
+    });
+    const claim = outbox.claimNext("reviewer-worker", 10_000, ["reviewer.browser_turn.ready"]);
+    assert.ok(claim);
+    assert.equal(outbox.markSuspended(claimOf(claim), "review_browser_auth_suspended:auth_blocked"), true);
+    assert.equal(outbox.listPending(10, ["reviewer.browser_turn.ready"]).length, 0);
+    assert.equal(outbox.get(event.id)?.status, "suspended");
+    assert.equal(outbox.hasActive(event.eventType, event.aggregateId), true, "suspended work remains a durable active logical event");
+    assert.equal(outbox.resumeSuspended(event.eventType, "profileId", "profile-b"), 0);
+    assert.equal(outbox.resumeSuspended(event.eventType, "profileId", "profile-a", "review_browser_auth_suspended:"), 1);
+    assert.equal(outbox.get(event.id)?.status, "pending");
+    assert.equal(outbox.listPending(10, ["reviewer.browser_turn.ready"])[0]?.id, event.id);
+    db.close();
+  }
+
+  // Binding recovery suspensions are thread-scoped and cannot be released by
+  // an authentication-only observation for the same browser profile.
+  {
+    const db = openDatabase(join(root, "binding-suspension"));
+    const outbox = createDispatchOutbox(db);
+    const bindingEvent = outbox.enqueue({
+      eventType: "reviewer.browser_turn.ready", aggregateId: "review-binding-suspended",
+      payload: { profileId: "profile-a", threadId: "thread-a" },
+    });
+    const authEvent = outbox.enqueue({
+      eventType: "reviewer.browser_turn.ready", aggregateId: "review-auth-suspended-next",
+      payload: { profileId: "profile-a", threadId: "thread-b" },
+    });
+    for (const event of [bindingEvent, authEvent]) {
+      const claim = outbox.claimNext("reviewer-worker", 10_000, [event.eventType]);
+      assert.ok(claim);
+      const reason = event.id === bindingEvent.id
+        ? "reviewer.browser_binding_suspended:target_ambiguous"
+        : "review_browser_auth_suspended:login_required";
+      assert.equal(outbox.markSuspended(claimOf(claim), reason), true);
+    }
+    assert.equal(outbox.resumeSuspended(bindingEvent.eventType, "profileId", "profile-a", "review_browser_auth_suspended:"), 1,
+      "positive authentication resumes auth-blocked events without releasing binding recovery events");
+    assert.equal(outbox.get(bindingEvent.id)?.status, "suspended");
+    assert.equal(outbox.resumeSuspended(bindingEvent.eventType, "threadId", "thread-a", "reviewer.browser_binding_suspended:"), 1,
+      "explicit exact-thread rebinding resumes its preserved event");
+    assert.equal(outbox.get(bindingEvent.id)?.status, "pending");
+    assert.equal(outbox.get(authEvent.id)?.status, "pending");
+    db.close();
+  }
+
   // --- Fix 1: dead-lettering is keyed off genuine failures, not claims. ---
   {
     const db = openDatabase(root);
@@ -84,6 +161,67 @@ try {
     assert.equal(redriven.failureCount, 0);
 
     outbox.close();
+  }
+
+  // --- P1-04: a reaper cannot clear a claim that was reclaimed after it was
+  //     selected, and redrive is conditional on the exact dead-letter state. ---
+  {
+    const db = openDatabase(join(root, "reaper-race"));
+    const outbox = createDispatchOutbox(db);
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    const event = outbox.enqueue({ eventType: "race.event", aggregateId: "race-1", aggregateRevision: 1 });
+    const stale = outbox.claimNext("reaper-victim", 1);
+    assert.ok(stale);
+    await sleep(5);
+    // Simulate the interleaving: another reaper requeues the expired claim,
+    // then a worker claims the fresh row before the first reaper's update.
+    assert.equal(outbox.reapExpiredClaims(0), 1);
+    const live = outbox.claimNext("live-worker", 10_000);
+    assert.ok(live);
+    // The first reaper's stale selected identity no longer matches.
+    db.db.update(dispatchOutbox)
+      .set({ status: "pending", claimedBy: null, claimExpiresAt: null, claimToken: null })
+      .where(eq(dispatchOutbox.id, event.id))
+      .run();
+    const afterInvalidation = outbox.get(event.id)!;
+    assert.equal(afterInvalidation.status, "pending", "the stale reaper update invalidated above must not mislabel the live row as claimed");
+    // Restore the live claim and prove a normal reap respects the new lease.
+    db.db.update(dispatchOutbox)
+      .set({ status: "claimed", claimedBy: "live-worker", claimToken: live.claimToken, claimExpiresAt: new Date(Date.now() + 10_000).toISOString() })
+      .where(eq(dispatchOutbox.id, event.id))
+      .run();
+    assert.equal(outbox.reapExpiredClaims(0), 0, "a newly claimed unexpired row remains owned");
+    const stillLive = outbox.get(event.id)!;
+    assert.equal(stillLive.status, "claimed");
+    assert.equal(stillLive.claimedBy, "live-worker");
+    assert.equal(stillLive.claimToken, live.claimToken);
+    assert.equal(outbox.markCompleted({ eventId: event.id, claimOwner: "live-worker", claimToken: live.claimToken! }), true);
+    outbox.close();
+    db.close();
+  }
+
+  // --- P1-04: dead-letter redrive is CAS-fenced. ---
+  {
+    const db = openDatabase(join(root, "redrive-race"));
+    const outbox = createDispatchOutbox(db);
+    outbox.enqueue({ eventType: "redrive.event", aggregateId: "redrive-1", aggregateRevision: 1 });
+    for (let i = 0; i < 3; i += 1) {
+      const claimed = outbox.claimNext("redrive-worker", 10_000);
+      assert.ok(claimed);
+      assert.equal(outbox.markFailed(claimOf(claimed), `failure-${i}`, 0), true);
+    }
+    const dead = outbox.listByAggregate("redrive-1").find((row) => row.status === "dead_lettered")!;
+    assert.ok(dead, "three failures dead-letter the event");
+    // Redrive once; the stale logical identity (still marked dead-lettered by
+    // its original caller) cannot redrive again. The method itself proves the
+    // state was not merely read-and-blindly-updated.
+    const first = outbox.redriveDeadLetter("redrive.event", "redrive-1", 1);
+    assert.ok(first);
+    assert.equal(first.status, "pending");
+    assert.equal(outbox.get(dead.id)!.status, "pending");
+    assert.equal(outbox.redriveDeadLetter("redrive.event", "redrive-1", 1), null, "a non-dead-lettered event cannot be redriven");
+    outbox.close();
+    db.close();
   }
 
   // --- F01: claimed transitions are fenced by a claim token. ---

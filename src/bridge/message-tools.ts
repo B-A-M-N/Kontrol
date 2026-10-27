@@ -5,11 +5,11 @@
  * this capability module owns one semantic slice of the reviewer/worker
  * control-plane API and receives the same typed BridgeConfig context.
  */
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer } from "@modelcontextprotocol/server";
 import type { BridgeConfig } from "./context.js";
 import { AGENT_MESSAGE_KINDS } from "../agent-messages.js";
 import { registerMutationAppTool } from "./app-tool.js";
-import { forbidden, isReviewer, isWorkerOrClient, requireWorkerDeliveryBinding, requireWorkSessionMutation, requireWorkSessionRead, workspaceAppModelAndAppMeta } from "./shared.js";
+import { forbidden, isReviewer, requireWorkerDeliveryBinding, requireWorkSessionMutation, requireWorkSessionRead, workspaceAppModelAndAppMeta } from "./shared.js";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
 import { z } from "zod/v4";
 
@@ -36,7 +36,9 @@ export function registerMessageTools(server: McpServer, config: BridgeConfig): v
     },
     config,
     async ({ sessionId, kind, title, body, data, expectsReply, resumeOnReply }) => {
-      if (!isWorkerOrClient(config.principalRole)) {
+      // Agent-message creation is worker-only. Ordinary clients must use a
+      // separately authorized reviewer capability, never this agent-author path.
+      if (config.principalRole !== "worker") {
         return forbidden(config.principalRole, "post_agent_message");
       }
       if (!config.agentMessages) {
@@ -60,6 +62,28 @@ export function registerMessageTools(server: McpServer, config: BridgeConfig): v
           body,
           data: { ...data, expectsReply: expectsReply === true, resumeOnReply: resumeOnReply === true },
         });
+        let browserWakeQueued = false;
+        if (kind === "clarification_request" || kind === "blocker") {
+          const route = config.reviewRoutes?.getRouteBySession(sessionId);
+          const thread = route && route.mode === "isolated_review" && route.deliveryTransport === "native_cdp"
+            ? config.reviewThreads?.getForRoute(route.id, route.routeEpoch)
+            : undefined;
+          if (thread) {
+            const queued = config.reviewThreads?.queueAgentMessage({
+              threadId: thread.id, agentMessageId: message.id,
+              kind: kind as "clarification_request" | "blocker", title, body,
+            });
+            if (queued && route?.browserProfileId) {
+              config.dispatchOutbox?.enqueue({
+                eventType: "reviewer.browser_turn.ready",
+                aggregateId: queued.id,
+                aggregateRevision: queued.revision,
+                payload: { messageId: queued.id, threadId: thread.id, profileId: route.browserProfileId, routeEpoch: route.routeEpoch, revision: queued.revision },
+              });
+              browserWakeQueued = true;
+            }
+          }
+        }
         if (expectsReply === true) {
           config.agentMessages!.waitForReply({
             messageId: message.id,
@@ -87,13 +111,13 @@ export function registerMessageTools(server: McpServer, config: BridgeConfig): v
             runId: run?.runId,
           },
         }, { publish: false });
-        return { message, event };
+        return { message, event, browserWakeQueued };
       };
       const committed = config.db ? config.db.sqlite.transaction(commit)() : commit();
       config.eventStore.publishEvents([committed.event]);
       const message = committed.message;
       return {
-        content: [{ type: "text" as const, text: `Posted ${message.kind} (${message.id}).` }],
+        content: [{ type: "text" as const, text: `Posted ${message.kind} (${message.id})${committed.browserWakeQueued ? "; the bound reviewer conversation was queued" : ""}.` }],
         structuredContent: { messageId: message.id, status: message.status, kind: message.kind },
       };
     },
@@ -182,23 +206,38 @@ export function registerMessageTools(server: McpServer, config: BridgeConfig): v
         // delivery, not a proof of worker consumption. Empty reply keeps the
         // old explicit resolution semantics.
         if (reply && reply.trim()) {
-          const accepted = config.agentMessages!.acceptReply({
+          // getReply is keyed by reply ID, not message ID, so the authoritative
+          // duplicate signal is acceptReply returning a prior row.
+          const acceptedResult = config.agentMessages!.acceptReply({
             messageId,
             workSessionId: sessionId,
             body: reply,
             reviewerPrincipalId: config.principalId ?? `role:${config.principalRole ?? "reviewer"}`,
           });
-          const event = config.eventStore.appendEvent({
-            type: "agent.message.reply_accepted",
-            sessionId,
-            payload: {
-              messageId,
-              replyId: accepted.id,
-              replyRevision: accepted.replyRevision,
-              status: accepted.status,
-              replyToKind: existing.kind,
-            },
-          }, { publish: false });
+          const accepted = acceptedResult.reply;
+          const currentAttempt = existing.runId
+            ? config.agentRegistry.getLatestDispatchAttemptForRun(existing.runId)
+            : undefined;
+          const destinationAgent = currentAttempt?.agentId
+            ? config.agentRegistry.listAlive().find((agent) => agent.id === currentAttempt.agentId)
+            : undefined;
+          const event = acceptedResult.created
+            ? config.eventStore.appendEvent({
+                type: "agent.message.reply_accepted",
+                sessionId,
+                payload: {
+                  messageId,
+                  replyId: accepted.id,
+                  replyRevision: accepted.replyRevision,
+                  status: accepted.status,
+                  replyBody: accepted.body,
+                  deliveryAttemptNumber: currentAttempt?.attemptNumber,
+                  destinationAgentId: currentAttempt?.agentId,
+                  destinationAgentName: destinationAgent?.name,
+                  replyToKind: existing.kind,
+                },
+              }, { publish: false })
+            : undefined;
           config.dispatchOutbox?.enqueue({
             eventType: "agent.reply.ready",
             aggregateId: accepted.id,
@@ -223,6 +262,10 @@ export function registerMessageTools(server: McpServer, config: BridgeConfig): v
       const committed = config.db ? config.db.sqlite.transaction(commit)() : commit();
       if (committed.event) config.eventStore.publishEvents([committed.event]);
       if ("accepted" in committed && committed.accepted) {
+        const route = config.reviewRoutes?.getRouteBySession(sessionId);
+        if (route?.deliveryTransport === "native_cdp") {
+          config.reviewBrowserJobs?.settleForAgentMessage({ agentMessageId: messageId, routeEpoch: route.routeEpoch });
+        }
         return {
           content: [{ type: "text" as const, text: `Reply ${committed.accepted.id} saved; awaiting agent acknowledgement.` }],
           structuredContent: { messageId, replyId: committed.accepted.id, status: committed.accepted.status },

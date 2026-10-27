@@ -53,13 +53,23 @@ try {
     // deterministic browser fixture.
     window.__KONTROL_UI_TEST_MODE__ = false;
     window.__KONTROL_UI_TEST_APP_FACTORY__ = () => ({
-      ontoolresult: undefined,
-      onhostcontextchanged: undefined,
+      listeners: new Map(),
       onteardown: undefined,
+      addEventListener(event, listener) {
+        const listeners = this.listeners.get(event) ?? new Set();
+        listeners.add(listener);
+        this.listeners.set(event, listeners);
+      },
+      removeEventListener(event, listener) {
+        this.listeners.get(event)?.delete(listener);
+      },
+      emit(event, params) {
+        for (const listener of [...(this.listeners.get(event) ?? [])]) listener(params);
+      },
       async connect() {
         window.__KONTROL_TEST_APP__ = this;
         this.__workspaceId = workspaceId;
-        this.ontoolresult?.({
+        this.emit("toolresult", {
           _meta: { tool: "open_workspace" },
           structuredContent: { workspaceId: workspaceId },
           content: [],
@@ -223,6 +233,11 @@ try {
     );
   }
   await page.locator(".review-feedback").waitFor({ state: "attached", timeout: STARTUP_TIMEOUT_MS });
+  await page.waitForFunction(
+    () => document.querySelectorAll(".approval-card .feedback-btn").length === 2,
+    undefined,
+    { timeout: STARTUP_TIMEOUT_MS },
+  );
   await capture("initial-review-approval");
 
   assert.equal(await page.locator(".agent-meta-primary").textContent().then((text) => text?.includes("Awaiting review")), true, "primary session state is humanized");
@@ -239,7 +254,7 @@ try {
     node.focus();
     node.setSelectionRange(3, 7);
     node.dispatchEvent(new Event("input", { bubbles: true }));
-    window.__KONTROL_TEST_APP__.ontoolresult?.({
+    window.__KONTROL_TEST_APP__.emit("toolresult", {
       _meta: { tool: "open_workspace" },
       structuredContent: { workspaceId: window.__KONTROL_TEST_APP__.__workspaceId },
       content: [],

@@ -24,19 +24,42 @@ export const scheduledJobs = sqliteTable("scheduled_jobs", {
   executionMode: text("execution_mode").notNull().default("read_only_audit"),
   policySnapshotJson: text("policy_snapshot_json").notNull(),
   agentName: text("agent_name"),
+  dispatchTarget: text("dispatch_target").notNull().default("direct_acp"),
+  dispatchPeerId: text("dispatch_peer_id"),
   status: text("status").notNull().default("pending"),
   revision: integer("revision").notNull().default(1),
   workSessionId: text("work_session_id"),
+  /** Last durable work-session event projected into this job lifecycle. */
+  lifecycleEventCursor: integer("lifecycle_event_cursor").notNull().default(0),
+  /** Durable cancellation identity and latest worker-state evidence. */
+  cancellationRequestId: text("cancellation_request_id"),
+  cancellationPreviousStatus: text("cancellation_previous_status"),
+  cancellationRequestedAt: text("cancellation_requested_at"),
+  cancellationLastAttemptAt: text("cancellation_last_attempt_at"),
+  cancellationLastConfirmedState: text("cancellation_last_confirmed_state"),
+  /** Active dispatch-attempt fence; cleared when the attempt completes/releases. */
+  activeDispatchAttemptId: text("active_dispatch_attempt_id"),
   maxRuntimeMs: integer("max_runtime_ms").notNull(),
+  dispatchRetryCount: integer("dispatch_retry_count").notNull().default(0),
+  dispatchNextEligibleAt: text("dispatch_next_eligible_at"),
+  dispatchLastAttemptedAgent: text("dispatch_last_attempted_agent"),
+  dispatchBlockerKind: text("dispatch_blocker_kind"),
   /** Durable retry receipt key; null for tools that omit retry protection. */
   clientMutationId: text("client_mutation_id"),
   requestFingerprint: text("request_fingerprint").notNull().default("{}"),
   lastError: text("last_error"),
   createdAt: text("created_at").notNull(),
   updatedAt: text("updated_at").notNull(),
+  terminalAt: text("terminal_at"),
+  blockedAt: text("blocked_at"),
+  operatorInterventionAt: text("operator_intervention_at"),
+  lastStateChangedAt: text("last_state_changed_at"),
 }, (table) => [
   index("scheduled_jobs_status_due_idx").on(table.status, table.runAt),
   index("scheduled_jobs_owner_idx").on(table.ownerContextId, table.runAt),
+  index("scheduled_jobs_owner_cursor_idx").on(table.ownerContextId, table.id),
+  index("scheduled_jobs_principal_cursor_idx").on(table.principalId, table.id),
+  index("scheduled_jobs_cancellation_idx").on(table.status, table.cancellationLastAttemptAt, table.id),
   uniqueIndex("scheduled_jobs_principal_mutation_unique").on(table.principalId, table.clientMutationId).where(sql`${table.clientMutationId} is not null`),
 ]);
 
@@ -49,9 +72,36 @@ export const scheduledJobAttempts = sqliteTable("scheduled_job_attempts", {
   jobId: text("job_id").notNull().references(() => scheduledJobs.id, { onDelete: "cascade" }),
   dispatchId: text("dispatch_id").notNull(),
   startedAt: text("started_at").notNull(),
+  /** First server-authenticated worker start, distinct from scheduler dispatch claim time. */
+  executionStartedAt: text("execution_started_at"),
+  /** Current active worker segment; null while waiting for a reviewer or terminal result. */
+  executionActiveSince: text("execution_active_since"),
+  activeRuntimeMs: integer("active_runtime_ms").notNull().default(0),
+  executionStoppedAt: text("execution_stopped_at"),
+  executionReceiptJson: text("execution_receipt_json"),
+  /** Durable artifact-publication receipts from the bounded-write publisher. */
+  publicationReceiptsJson: text("publication_receipts_json"),
+  /** Durable exponential-backoff for uncertain dispatch reconciliation. */
+  reconcileProbeCount: integer("reconcile_probe_count").notNull().default(0),
+  nextReconcileAt: text("next_reconcile_at"),
+  lastReconcileEvidence: text("last_reconcile_evidence"),
+  /** Authenticated result for the latest bound ACP execution attempt. */
+  workerExecutionOutcome: text("worker_execution_outcome"),
+  workerExecutionAt: text("worker_execution_at"),
   completedAt: text("completed_at"),
+  /** External adapter handshake state, distinct from the final worker outcome. */
+  transportStatus: text("transport_status").notNull().default("dispatching"),
+  dispatcherInstanceId: text("dispatcher_instance_id"),
+  leaseExpiresAt: text("lease_expires_at"),
   agentName: text("agent_name"),
   acpRunId: text("acp_run_id"),
+  acpDispatchId: text("acp_dispatch_id"),
+  acpAttemptNumber: integer("acp_attempt_number"),
+  acpRemoteRunId: text("acp_remote_run_id"),
+  dispatchFailureClass: text("dispatch_failure_class"),
+  dispatchFailureReason: text("dispatch_failure_reason"),
+  dispatchProbeResultJson: text("dispatch_probe_result_json"),
+  nextEligibleAt: text("next_eligible_at"),
   outcome: text("outcome"),
 }, (table) => [
   index("scheduled_job_attempts_job_idx").on(table.jobId, table.startedAt),
@@ -59,6 +109,83 @@ export const scheduledJobAttempts = sqliteTable("scheduled_job_attempts", {
 
 export type ScheduledJobAttemptRow = typeof scheduledJobAttempts.$inferSelect;
 export type NewScheduledJobAttemptRow = typeof scheduledJobAttempts.$inferInsert;
+
+/** Immutable full worker report keyed by the scheduled logical job and ACP run. */
+export const scheduledJobReports = sqliteTable("scheduled_job_reports", {
+  id: text("id").primaryKey(),
+  jobId: text("job_id").notNull().references(() => scheduledJobs.id, { onDelete: "cascade" }),
+  runId: text("run_id").notNull(),
+  reportSha256: text("report_sha256").notNull(),
+  reportText: text("report_text").notNull(),
+  createdAt: text("created_at").notNull(),
+}, (table) => [
+  uniqueIndex("scheduled_job_reports_job_run_unique").on(table.jobId, table.runId),
+  index("scheduled_job_reports_hash_idx").on(table.jobId, table.reportSha256),
+]);
+
+export type ScheduledJobReportRow = typeof scheduledJobReports.$inferSelect;
+
+/** Durable single-flight record and immutable report for reviewer-run scheduled verification. */
+export const scheduledJobVerifications = sqliteTable("scheduled_job_verifications", {
+  id: text("id").primaryKey(),
+  jobId: text("job_id").notNull().references(() => scheduledJobs.id, { onDelete: "cascade" }),
+  requestKey: text("request_key").notNull(),
+  requestFingerprint: text("request_fingerprint").notNull(),
+  clientMutationId: text("client_mutation_id"),
+  executionIdentity: text("execution_identity").notNull().unique(),
+  workSessionId: text("work_session_id").notNull(),
+  submissionId: text("submission_id").notNull(),
+  reviewEpoch: integer("review_epoch").notNull(),
+  snapshotKind: text("snapshot_kind").notNull(),
+  snapshotRef: text("snapshot_ref").notNull(),
+  commandFingerprint: text("command_fingerprint").notNull(),
+  policyFingerprint: text("policy_fingerprint").notNull(),
+  status: text("status").notNull().default("running"),
+  deadlineAt: text("deadline_at").notNull(),
+  reportSha256: text("report_sha256"),
+  reportText: text("report_text"),
+  failureReason: text("failure_reason"),
+  createdAt: text("created_at").notNull(),
+  startedAt: text("started_at").notNull(),
+  finishedAt: text("finished_at"),
+}, (table) => [
+  uniqueIndex("scheduled_job_verifications_request_unique").on(table.jobId, table.requestKey),
+  uniqueIndex("scheduled_job_verifications_active_identity_unique").on(
+    table.jobId,
+    table.workSessionId,
+    table.submissionId,
+    table.reviewEpoch,
+    table.snapshotKind,
+    table.snapshotRef,
+    table.commandFingerprint,
+    table.policyFingerprint,
+  ).where(sql`${table.status} = 'running'`),
+  index("scheduled_job_verifications_current_idx").on(table.jobId, table.submissionId, table.reviewEpoch, table.createdAt),
+  index("scheduled_job_verifications_status_deadline_idx").on(table.status, table.deadlineAt, table.id),
+  index("scheduled_job_verifications_hash_idx").on(table.jobId, table.reportSha256),
+]);
+
+export type ScheduledJobVerificationRow = typeof scheduledJobVerifications.$inferSelect;
+
+/** Retryable finalization obligations for worker output after an authenticated terminal lifecycle event. */
+export const scheduledJobReportFinalizations = sqliteTable("scheduled_job_report_finalizations", {
+  id: text("id").primaryKey(),
+  jobId: text("job_id").notNull().references(() => scheduledJobs.id, { onDelete: "cascade" }),
+  runId: text("run_id").notNull(),
+  attemptNumber: integer("attempt_number").notNull(),
+  eventId: text("event_id").notNull(),
+  status: text("status").notNull().default("pending"),
+  reportText: text("report_text"),
+  reportSha256: text("report_sha256"),
+  lastError: text("last_error"),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+}, (table) => [
+  uniqueIndex("scheduled_job_report_finalizations_attempt_unique").on(table.jobId, table.runId, table.attemptNumber),
+  index("scheduled_job_report_finalizations_pending_idx").on(table.status, table.updatedAt, table.id),
+]);
+
+export type ScheduledJobReportFinalizationRow = typeof scheduledJobReportFinalizations.$inferSelect;
 
 export const telemetryIngress = sqliteTable("telemetry_ingress", {
   sequence: integer("sequence").primaryKey({ autoIncrement: true }),
@@ -178,6 +305,8 @@ export const workSessions = sqliteTable("work_sessions", {
   submittedBy: text("submitted_by").notNull(),
   /** Trusted conversation/transport owner that created this durable session. */
   ownerContextId: text("owner_context_id"),
+  /** Durable authenticated principal for reconnect-stable job ownership. */
+  principalId: text("principal_id"),
   title: text("title"),
   lastConsumedFeedbackId: text("last_consumed_feedback_id"),
   lastConsumedReviewEpoch: integer("last_consumed_review_epoch").notNull().default(0),
@@ -221,6 +350,8 @@ export const workSessionSubmissions = sqliteTable("work_session_submissions", {
 }, (table) => [
   index("wss_work_session_idx").on(table.workSessionId, table.submissionNumber),
   uniqueIndex("work_session_submission_number_unique").on(table.workSessionId, table.submissionNumber),
+  index("wss_filesystem_snapshot_roots_idx").on(table.snapshotRef, table.workSessionId)
+    .where(sql`${table.snapshotKind} = 'filesystem' and ${table.snapshotRef} is not null`),
 ]);
 
 export const workSessionFeedback = sqliteTable("work_session_feedback", {
@@ -320,7 +451,11 @@ export const acpRuns = sqliteTable("acp_runs", {
   workSessionId: text("work_session_id"),
   remoteRunId: text("remote_run_id"),
   attemptNumber: integer("attempt_number").notNull().default(1),
+  /** Server-owned execution authority, persisted before the adapter request. */
+  scheduledExecutionMode: text("scheduled_execution_mode"),
   status: text("status").notNull().default("created"),
+  inputTask: text("input_task"),
+  inputTaskSha256: text("input_task_sha256"),
   inputPreview: text("input_preview"),
   outputPreview: text("output_preview"),
   outputJson: text("output_json"),
@@ -337,6 +472,21 @@ export const acpRuns = sqliteTable("acp_runs", {
   uniqueIndex("acp_runs_one_logical_run_per_session")
     .on(table.workSessionId)
     .where(sql`${table.workSessionId} is not null`),
+]);
+
+/** One durable idempotency identity for each outbound ACP execution attempt. */
+export const acpRunDispatchAttempts = sqliteTable("acp_run_dispatch_attempts", {
+  dispatchIdempotencyKey: text("dispatch_idempotency_key").primaryKey(),
+  runId: text("run_id").notNull().references(() => acpRuns.runId, { onDelete: "cascade" }),
+  agentId: text("agent_id"),
+  attemptNumber: integer("attempt_number").notNull(),
+  remoteRunId: text("remote_run_id"),
+  status: text("status").notNull().default("dispatching"),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+}, (table) => [
+  uniqueIndex("acp_run_dispatch_attempts_run_attempt_unique").on(table.runId, table.attemptNumber),
+  index("acp_run_dispatch_attempts_run_idx").on(table.runId, table.attemptNumber),
 ]);
 
 export const agentWebhookQueue = sqliteTable("agent_webhook_queue", {
@@ -418,6 +568,9 @@ export const policyApprovalGrants = sqliteTable("policy_approval_grants", {
 }, (table) => [
   index("policy_approval_grants_principal_idx").on(
     table.principalId, table.scope, table.scopeId, table.approvalKey,
+  ),
+  index("policy_approval_grants_terminal_recovery_idx").on(
+    table.scope, table.revokedAt, table.scopeId, table.expiresAt,
   ),
 ]);
 
@@ -552,7 +705,13 @@ export const supervisorRuns = sqliteTable("supervisor_runs", {
   deadlineAt: text("deadline_at"),
   autonomyMode: text("autonomy_mode").notNull().default("manual"), approvalMode: text("approval_mode").notNull().default("human_required"),
   createdAt: text("created_at").notNull(), updatedAt: text("updated_at").notNull(),
-}, (table) => [uniqueIndex("supervisor_runs_mission_unique").on(table.missionId), uniqueIndex("supervisor_runs_work_session_unique").on(table.workSessionId), index("supervisor_runs_status_next_idx").on(table.status, table.nextActionAt)]);
+}, (table) => [
+  uniqueIndex("supervisor_runs_mission_unique").on(table.missionId),
+  uniqueIndex("supervisor_runs_work_session_unique").on(table.workSessionId),
+  index("supervisor_runs_status_next_idx").on(table.status, table.nextActionAt),
+  index("supervisor_runs_filesystem_snapshot_roots_idx").on(table.lastSnapshotRef)
+    .where(sql`${table.lastSnapshotKind} = 'filesystem' and ${table.lastSnapshotRef} is not null`),
+]);
 
 export const supervisorProgressSnapshots = sqliteTable("supervisor_progress_snapshots", {
   id: text("id").primaryKey(),
@@ -581,6 +740,8 @@ export const missionCompletionReports = sqliteTable("mission_completion_reports"
 }, (table) => [
   index("mission_completion_reports_current_idx").on(table.missionId, table.submissionId, table.snapshotCommit, table.createdAt),
   index("mission_completion_reports_identity_idx").on(table.missionId, table.submissionId, table.snapshotKind, table.snapshotRef, table.createdAt),
+  index("mission_completion_reports_filesystem_snapshot_roots_idx").on(table.snapshotRef)
+    .where(sql`${table.snapshotKind} = 'filesystem' and ${table.snapshotRef} is not null`),
 ]);
 export type MissionCompletionReportRow = typeof missionCompletionReports.$inferSelect;
 
@@ -588,10 +749,14 @@ export const missionOutcomeObservations = sqliteTable("mission_outcome_observati
   id: text("id").primaryKey(),
   missionId: text("mission_id").notNull().references(() => missionContracts.id, { onDelete: "cascade" }),
   submissionId: text("submission_id").notNull(),
+  reviewEpoch: integer("review_epoch"),
   snapshotKind: text("snapshot_kind").notNull(),
   snapshotRef: text("snapshot_ref").notNull(),
   /** Explicit external observer identity; server_test_runner is not valid here. */
   observerIdentity: text("observer_identity").notNull(),
+  observerPrincipalId: text("observer_principal_id"),
+  observationSource: text("observation_source").notNull().default("legacy_operator_reported"),
+  externalEvidenceSha256: text("external_evidence_sha256"),
   /** Declared user-visible behavior that the observer confirmed or rejected. */
   expectedBehavior: text("expected_behavior").notNull(),
   actualBehavior: text("actual_behavior").notNull(),
@@ -691,6 +856,8 @@ export const missionEvidence = sqliteTable("mission_evidence", {
 }, (table) => [
   index("mission_evidence_mission_idx").on(table.missionId, table.createdAt),
   index("mission_evidence_criterion_idx").on(table.criterionId, table.createdAt),
+  index("mission_evidence_filesystem_snapshot_roots_idx").on(table.snapshotRef)
+    .where(sql`${table.snapshotKind} = 'filesystem' and ${table.snapshotRef} is not null`),
 ]);
 
 export type MissionContractRow = typeof missionContracts.$inferSelect;
@@ -745,6 +912,10 @@ export const agentMessageReplies = sqliteTable("agent_message_replies", {
   bodySha256: text("body_sha256").notNull(),
   reviewerPrincipalId: text("reviewer_principal_id").notNull(),
   status: text("status").notNull().default("pending_delivery"),
+  deliveryDispatchIdempotencyKey: text("delivery_dispatch_idempotency_key"),
+  deliveryRunId: text("delivery_run_id"),
+  deliveryAttemptNumber: integer("delivery_attempt_number"),
+  deliveryRemoteRunId: text("delivery_remote_run_id"),
   createdAt: text("created_at").notNull(),
   acknowledgedAt: text("acknowledged_at"),
   acknowledgedRunId: text("acknowledged_run_id"),
@@ -753,6 +924,7 @@ export const agentMessageReplies = sqliteTable("agent_message_replies", {
 }, (table) => [
   uniqueIndex("agent_message_replies_message_revision_unique").on(table.messageId, table.replyRevision),
   index("agent_message_replies_session_idx").on(table.workSessionId, table.status),
+  index("agent_message_replies_delivery_recovery_idx").on(table.status, table.createdAt, table.id),
 ]);
 
 /** Durable worker waiting intent for a clarification reply (cold-start resumption). */
@@ -786,16 +958,21 @@ export const reviewRoutes = sqliteTable("review_routes", {
   ownerContextId: text("owner_context_id").notNull(),
   mode: text("mode").notNull().default("isolated_review"),
   deliveryPolicy: text("delivery_policy").notNull().default("explicit_user_action"),
+  deliveryTransport: text("delivery_transport").notNull().default("mcp_app"),
+  browserProfileId: text("browser_profile_id"),
   pinnedConversationId: text("pinned_conversation_id"),
   maxReviewRounds: integer("max_review_rounds").notNull().default(3),
   completedReviewRounds: integer("completed_review_rounds").notNull().default(0),
+  admittedReviewRounds: integer("admitted_review_rounds").notNull().default(0),
   status: text("status").notNull().default("disabled"),
   routeEpoch: integer("route_epoch").notNull().default(1),
   revision: integer("revision").notNull().default(1),
+  warningAcknowledgedAt: text("warning_acknowledged_at"),
   createdAt: text("created_at").notNull(),
   updatedAt: text("updated_at").notNull(),
 }, (table) => [
   index("review_routes_work_session_idx").on(table.workSessionId, table.status),
+  uniqueIndex("review_routes_work_session_unique").on(table.workSessionId),
 ]);
 
 export type ReviewRouteRow = typeof reviewRoutes.$inferSelect;
@@ -820,12 +997,220 @@ export const reviewHandoffs = sqliteTable("review_handoffs", {
   revision: integer("revision").notNull().default(1),
   createdAt: text("created_at").notNull(),
   claimedAt: text("claimed_at"),
+  claimExpiresAt: text("claim_expires_at"),
   completedAt: text("completed_at"),
 }, (table) => [
   index("review_handoffs_session_submission_idx").on(table.workSessionId, table.submissionId),
   index("review_handoffs_status_idx").on(table.status, table.createdAt),
+  index("review_handoffs_recovery_idx").on(table.id)
+    .where(sql`${table.status} not in ('closed', 'feedback_committed')`),
   uniqueIndex("review_handoffs_submission_active_unique").on(table.submissionId, table.reviewEpoch),
 ]);
 
 export type ReviewHandoffRow = typeof reviewHandoffs.$inferSelect;
 export type NewReviewHandoffRow = typeof reviewHandoffs.$inferInsert;
+
+/** One application-level reviewer context bound to a route generation. */
+export const reviewThreads = sqliteTable("review_threads", {
+  id: text("id").primaryKey(),
+  routeId: text("route_id").notNull().references(() => reviewRoutes.id, { onDelete: "cascade" }),
+  routeEpoch: integer("route_epoch").notNull(),
+  workSessionId: text("work_session_id").notNull().references(() => workSessions.id, { onDelete: "cascade" }),
+  ownerPrincipalId: text("owner_principal_id").notNull(),
+  reviewerPrincipalId: text("reviewer_principal_id"),
+  reviewerContextId: text("reviewer_context_id"),
+  hostKind: text("host_kind").notNull().default("kontrol_ui"),
+  hostConversationId: text("host_conversation_id"),
+  hostBindingVerified: integer("host_binding_verified", { mode: "boolean" }).notNull().default(false),
+  reviewerBindingId: text("reviewer_binding_id"),
+  browserProfileId: text("browser_profile_id"),
+  browserGeneration: integer("browser_generation"),
+  browserTargetId: text("browser_target_id"),
+  browserCdpSessionId: text("browser_cdp_session_id"),
+  conversationUrl: text("conversation_url"),
+  conversationKey: text("conversation_key"),
+  conversationFingerprint: text("conversation_fingerprint"),
+  conversationBindingRevision: integer("conversation_binding_revision"),
+  conversationBindingStatus: text("conversation_binding_status"),
+  conversationBindingAssurance: text("conversation_binding_assurance"),
+  resumeChallengeSha256: text("resume_challenge_sha256"),
+  resumeChallengeExpiresAt: text("resume_challenge_expires_at"),
+  bindingGeneration: integer("binding_generation").notNull().default(0),
+  status: text("status").notNull().default("pending_activation"),
+  maxRounds: integer("max_rounds").notNull(),
+  revision: integer("revision").notNull().default(1),
+  createdAt: text("created_at").notNull(),
+  activatedAt: text("activated_at"),
+  closedAt: text("closed_at"),
+}, (table) => [
+  uniqueIndex("review_threads_route_epoch_unique").on(table.routeId, table.routeEpoch),
+  index("review_threads_session_status_idx").on(table.workSessionId, table.status),
+]);
+
+export const reviewThreadActivations = sqliteTable("review_thread_activations", {
+  id: text("id").primaryKey(),
+  threadId: text("thread_id").notNull().references(() => reviewThreads.id, { onDelete: "cascade" }),
+  routeId: text("route_id").notNull(),
+  routeEpoch: integer("route_epoch").notNull(),
+  principalId: text("principal_id").notNull(),
+  activationSecretSha256: text("activation_secret_sha256").notNull().unique(),
+  createdAt: text("created_at").notNull(),
+  expiresAt: text("expires_at").notNull(),
+  consumedAt: text("consumed_at"),
+  revokedAt: text("revoked_at"),
+}, (table) => [
+  index("review_thread_activations_thread_expiry_idx").on(table.threadId, table.expiresAt),
+]);
+
+export const reviewThreadMessages = sqliteTable("review_thread_messages", {
+  id: text("id").primaryKey(),
+  threadId: text("thread_id").notNull().references(() => reviewThreads.id, { onDelete: "cascade" }),
+  routeEpoch: integer("route_epoch").notNull(),
+  workSessionId: text("work_session_id").notNull(),
+  handoffId: text("handoff_id").notNull(),
+  submissionId: text("submission_id").notNull(),
+  reviewEpoch: integer("review_epoch").notNull(),
+  roundNumber: integer("round_number").notNull(),
+  kind: text("kind").notNull(),
+  payloadJson: text("payload_json").notNull(),
+  payloadSha256: text("payload_sha256").notNull(),
+  status: text("status").notNull().default("awaiting_activation"),
+  revision: integer("revision").notNull().default(1),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+}, (table) => [
+  uniqueIndex("review_thread_messages_submission_unique").on(table.threadId, table.submissionId, table.reviewEpoch),
+  index("review_thread_messages_delivery_idx").on(table.threadId, table.status, table.createdAt),
+]);
+
+export const reviewBrowserTurns = sqliteTable("review_browser_turns", {
+  id: text("id").primaryKey(),
+  reviewMessageId: text("review_message_id").notNull().references(() => reviewThreadMessages.id, { onDelete: "cascade" }),
+  reviewThreadId: text("review_thread_id").notNull(),
+  routeEpoch: integer("route_epoch").notNull(),
+  profileId: text("profile_id").notNull(),
+  conversationFingerprint: text("conversation_fingerprint").notNull(),
+  bindingRevision: integer("binding_revision"),
+  attemptNumber: integer("attempt_number").notNull(),
+  browserGeneration: integer("browser_generation"),
+  leaseOwner: text("lease_owner"),
+  leaseTokenSha256: text("lease_token_sha256"),
+  leaseExpiresAt: text("lease_expires_at"),
+  state: text("state").notNull(),
+  promptSha256: text("prompt_sha256").notNull(),
+  baselineUserMessageCount: integer("baseline_user_message_count"),
+  baselineAssistantMessageCount: integer("baseline_assistant_message_count"),
+  submittedAt: text("submitted_at"),
+  generationStartedAt: text("generation_started_at"),
+  generationStartedObservationId: text("generation_started_observation_id"),
+  generationFinishedAt: text("generation_finished_at"),
+  generationFinishedObservationId: text("generation_finished_observation_id"),
+  feedbackCommittedAt: text("feedback_committed_at"),
+  errorCode: text("error_code"),
+  createdAt: text("created_at").notNull(),
+}, (table) => [
+  uniqueIndex("review_browser_turns_message_number_unique").on(table.reviewMessageId, table.attemptNumber),
+  index("review_browser_turns_state_lease_idx").on(table.state, table.leaseExpiresAt),
+  uniqueIndex("review_browser_turns_message_active_unique").on(table.reviewMessageId).where(sql`${table.state} in ('leased', 'browser_ready', 'dispatching', 'prompt_accepted', 'model_generating', 'generation_finished', 'awaiting_feedback', 'uncertain')`),
+  uniqueIndex("review_browser_turns_thread_active_unique").on(table.reviewThreadId).where(sql`${table.state} in ('leased', 'browser_ready', 'dispatching', 'prompt_accepted', 'model_generating', 'generation_finished', 'awaiting_feedback', 'uncertain')`),
+]);
+
+export const reviewBrowserTurnResolutions = sqliteTable("review_browser_turn_resolutions", {
+  attemptId: text("attempt_id").primaryKey().references(() => reviewBrowserTurns.id, { onDelete: "cascade" }),
+  reviewThreadId: text("review_thread_id").notNull(),
+  routeEpoch: integer("route_epoch").notNull(),
+  reviewerPrincipalId: text("reviewer_principal_id").notNull(),
+  resolution: text("resolution").notNull(),
+  evidenceSha256: text("evidence_sha256").notNull(),
+  createdAt: text("created_at").notNull(),
+}, (table) => [
+  index("review_browser_turn_resolutions_thread_idx").on(table.reviewThreadId, table.createdAt),
+]);
+
+export const reviewBrowserProfiles = sqliteTable("review_browser_profiles", {
+  id: text("id").primaryKey(),
+  ownerPrincipalId: text("owner_principal_id").notNull(),
+  browserEngine: text("browser_engine").notNull().default("chromium"),
+  mode: text("mode").notNull().default("headed"),
+  status: text("status").notNull().default("stopped"),
+  authState: text("auth_state").notNull().default("unknown"),
+  generation: integer("generation").notNull().default(0),
+  browserReadyAt: text("browser_ready_at"),
+  lastVerifiedAt: text("last_verified_at"),
+  manualAuthPid: integer("manual_auth_pid"),
+  manualAuthProcessStartIdentity: text("manual_auth_process_start_identity"),
+  manualAuthBootIdentity: text("manual_auth_boot_identity"),
+  manualAuthGeneration: integer("manual_auth_generation"),
+  browserProduct: text("browser_product"),
+  remoteDebuggingEnabled: integer("remote_debugging_enabled", { mode: "boolean" }),
+  browserLaunchDiagnostic: text("browser_launch_diagnostic"),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+}, (table) => [
+  index("review_browser_profiles_owner_idx").on(table.ownerPrincipalId, table.status),
+]);
+
+/** Peer-pull jobs are durable local control-plane records, separate from ACP scheduled dispatch. */
+export const peerJobs = sqliteTable("peer_jobs", {
+  id: text("job_id").primaryKey(),
+  peerId: text("peer_id").notNull(),
+  status: text("status").notNull(),
+  createdAt: text("created_at").notNull(),
+  taskClass: text("task_class").notNull(),
+  repositoryId: text("repository_id").notNull(),
+  workspaceSessionId: text("workspace_session_id"),
+  workSessionId: text("work_session_id"),
+  recordJson: text("record_json").notNull(),
+}, (table) => [
+  index("peer_jobs_peer_created_cursor_idx").on(table.peerId, table.createdAt, table.id),
+  index("peer_jobs_peer_status_created_idx").on(table.peerId, table.status, table.createdAt, table.id),
+  index("peer_jobs_status_created_idx").on(table.status, table.createdAt, table.id),
+  index("peer_jobs_work_session_idx").on(table.workSessionId, table.id),
+]);
+
+export const peerJobAttempts = sqliteTable("peer_job_attempts", {
+  id: text("attempt_id").primaryKey(),
+  jobId: text("job_id").notNull().references(() => peerJobs.id, { onDelete: "cascade" }),
+  status: text("status").notNull(),
+  generation: integer("generation").notNull(),
+  createdAt: text("created_at").notNull(),
+  leaseExpiresAt: text("lease_expires_at").notNull(),
+  outcomeCertainty: text("outcome_certainty").notNull(),
+  recordJson: text("record_json").notNull(),
+}, (table) => [
+  index("peer_job_attempts_job_created_idx").on(table.jobId, table.createdAt, table.id),
+  index("peer_job_attempts_job_generation_idx").on(table.jobId, table.generation),
+  index("peer_job_attempts_active_lease_idx").on(table.status, table.leaseExpiresAt, table.id),
+]);
+
+export const peerJobStoreMetadata = sqliteTable("peer_job_store_metadata", {
+  key: text("key").primaryKey(),
+  value: text("value").notNull(),
+});
+
+/** Authenticated worker PTYs are durably correlated without making shell
+ * output itself a workflow event. Process IDs are never reused as authority;
+ * every launch receives a monotonically increasing work-session generation. */
+export const agentPtyBindings = sqliteTable("agent_pty_bindings", {
+  id: text("id").primaryKey(),
+  processSessionId: text("process_session_id").notNull().unique(),
+  workspaceSessionId: text("workspace_session_id").notNull()
+    .references(() => workspaceSessions.id, { onDelete: "cascade" }),
+  workSessionId: text("work_session_id").notNull()
+    .references(() => workSessions.id, { onDelete: "cascade" }),
+  runId: text("run_id").notNull()
+    .references(() => acpRuns.runId, { onDelete: "restrict" }),
+  agentName: text("agent_name").notNull(),
+  ownerPrincipalId: text("owner_principal_id").notNull(),
+  processGeneration: integer("process_generation").notNull(),
+  outputCursor: integer("output_cursor").notNull().default(0),
+  status: text("status").notNull(),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+  finishedAt: text("finished_at"),
+}, (table) => [
+  uniqueIndex("agent_pty_bindings_work_generation_unique").on(table.workSessionId, table.processGeneration),
+  index("agent_pty_bindings_work_session_idx").on(table.workSessionId, table.createdAt, table.id),
+  index("agent_pty_bindings_run_idx").on(table.runId, table.processGeneration),
+  index("agent_pty_bindings_status_idx").on(table.status, table.updatedAt),
+]);

@@ -5,12 +5,18 @@
  * this capability module owns one semantic slice of the reviewer/worker
  * control-plane API and receives the same typed BridgeConfig context.
  */
-import { callRemoteAgent, selectHealthyAgent } from "../acp-gateway.js";
+import { createHash } from "node:crypto";
+import { callRemoteAgent, lookupPeerDispatch, selectHealthyAgent } from "../acp-gateway.js";
 import type { AgentCallResult } from "../acp-gateway.js";
 import { DEFAULT_CLAIM_LEASE_MS } from "../continuation.js";
 import type { Continuation } from "../continuation.js";
 import type { DispatchOutboxEvent, OutboxClaim } from "../dispatch-outbox.js";
 import { TERMINAL_STATUSES } from "../review-workflow.js";
+import { getPeerJobStore } from "../peer/jobs/store.js";
+import { MAX_INSTRUCTION_BYTES } from "../peer/jobs/service.js";
+import { scheduledPeerContinuationJobId } from "../scheduling/scheduled-job-dispatch.js";
+
+const DISPATCH_BLOCKED_SESSION_STATUSES = new Set([...TERMINAL_STATUSES, "cancelling"]);
 import type { BridgeConfig } from "./context.js";
 import { acquireCheckoutModifyLease, checkoutLeaseMetadata, defaultLiveWaiters, renderMissionPrompt, resolveHealthyAgentUrl, workSessionInstructions } from "./shared.js";
 import type { LiveWaiterRegistry } from "./shared.js";
@@ -97,6 +103,114 @@ export async function runContinuationTick(
     });
   };
   const claimOf = (event: DispatchOutboxEvent): OutboxClaim => ({ eventId: event.id, claimOwner: event.claimedBy ?? "", claimToken: event.claimToken ?? "" });
+  const latestHandoff = (sessionId: string) => config.eventStore.getLatestEventForSession(sessionId, "session.handoff");
+  const handoffState = (sessionId: string, transferId: unknown): string | undefined => {
+    if (typeof transferId !== "string") return undefined;
+    const event = config.eventStore.getLatestEventForSession(sessionId, "session.handoff.state", { field: "transferId", value: transferId });
+    const state = (event?.payload as { state?: unknown } | undefined)?.state;
+    return typeof state === "string" ? state : undefined;
+  };
+  const handoffForRun = (sessionId: string, runId: string) => config.eventStore.getLatestEventForSession(
+    sessionId, "session.handoff", { field: "runId", value: runId },
+  );
+  const recordHandoffState = (sessionId: string, handoff: NonNullable<ReturnType<typeof latestHandoff>>, state: string, detail?: string) => {
+    const payload = handoff.payload as Record<string, unknown>;
+    const lastState = config.eventStore.getLatestEventForSession(sessionId, "session.handoff.state", {
+      field: "transferId",
+      value: String(payload.transferId ?? ""),
+    })?.payload as Record<string, unknown> | undefined;
+    if (lastState?.transferId === payload.transferId && lastState?.state === state && lastState?.detail === detail) return;
+    config.eventStore.appendEvent({
+      type: "session.handoff.state",
+      sessionId,
+      payload: {
+        transferId: payload.transferId,
+        runId: payload.runId,
+        fromAgent: payload.fromAgent,
+        toAgent: payload.toAgent,
+        state,
+        ...(detail ? { detail } : {}),
+      },
+    });
+  };
+  const markTransferredFeedbackConsumed = (sessionId: string, packet: unknown) => {
+    const feedbackId = (packet as { latestReviewerFeedback?: { feedbackId?: unknown } } | undefined)
+      ?.latestReviewerFeedback?.feedbackId;
+    if (typeof feedbackId === "string") config.workSessions.markFeedbackConsumed(sessionId, feedbackId);
+  };
+  const reconcileHandoffContinuations = async () => {
+    for (const continuation of config.continuationManager.listReconciliationRequired()) {
+      const session = config.workSessions.get(continuation.sessionId);
+      const run = continuation.target ? config.agentRegistry.getRun(continuation.target) : undefined;
+      const handoff = continuation.target ? handoffForRun(continuation.sessionId, continuation.target) : undefined;
+      const handoffPayload = handoff?.payload as Record<string, unknown> | undefined;
+      if (!session || !run || !handoff || typeof handoffPayload?.transferId !== "string") continue;
+      const attempt = config.agentRegistry.getLatestDispatchAttemptForRun(run.runId);
+      if (!attempt || !attempt.agentId || attempt.attemptNumber !== run.attemptNumber) continue;
+      const destinationId = typeof handoffPayload.toAgentId === "string" ? handoffPayload.toAgentId : undefined;
+      if (!destinationId || attempt.agentId !== destinationId) continue;
+      let accepted = attempt.status === "accepted" && Boolean(attempt.remoteRunId);
+      let remoteRunId = attempt.remoteRunId;
+      if (!accepted) {
+        const agent = config.agentRegistry.get(attempt.agentId);
+        if (!agent || !agent.alive) continue;
+        const lookup = await lookupPeerDispatch({
+          agentUrl: agent.url,
+          adapterSecret: config.adapterSecret,
+          dispatchIdempotencyKey: attempt.dispatchIdempotencyKey,
+        }).catch(() => ({ status: "unknown" as const }));
+        if (lookup.status === "unknown") continue;
+        if (lookup.status === "unstarted") {
+          config.agentRegistry.updateDispatchAttempt(attempt.dispatchIdempotencyKey, { status: "unstarted" });
+          if (config.continuationManager.resolveReconciliation({
+            id: continuation.id,
+            targetRunId: run.runId,
+            outcome: "retry_safe",
+          })) {
+            recordHandoffState(continuation.sessionId, handoff, "retry_safe", "The destination adapter confirmed this attempt never started; a fresh attempt is safe.");
+          }
+          continue;
+        }
+        accepted = true;
+        remoteRunId = lookup.remoteRunId;
+        if (remoteRunId) {
+          config.agentRegistry.updateDispatchAttempt(attempt.dispatchIdempotencyKey, { status: "accepted", remoteRunId });
+        }
+      }
+      if (!accepted || !remoteRunId) continue;
+      config.agentRegistry.updateRun(run.runId, {
+        status: "running",
+        remoteRunId,
+        attemptNumber: attempt.attemptNumber,
+        lastHeartbeatAt: new Date().toISOString(),
+        finishedAt: undefined,
+        errorMessage: undefined,
+      });
+      if (!config.continuationManager.resolveReconciliation({
+        id: continuation.id,
+        targetRunId: run.runId,
+        outcome: "dispatched",
+      })) continue;
+      recordHandoffState(continuation.sessionId, handoff, "destination_ready");
+      recordHandoffState(continuation.sessionId, handoff, "committed");
+      const transferId = handoffPayload.transferId;
+      const latestTransferContext = config.eventStore.getLatestEventForSession(
+        continuation.sessionId,
+        "session.handoff.context",
+        { field: "transferId", value: String(transferId) },
+      );
+      markTransferredFeedbackConsumed(
+        continuation.sessionId,
+        (latestTransferContext?.payload as { contextTransferPacket?: unknown } | undefined)?.contextTransferPacket
+          ?? handoffPayload.contextTransferPacket,
+      );
+      config.eventStore.appendEvent({
+        type: "continuation.delivered",
+        sessionId: continuation.sessionId,
+        payload: { continuationId: continuation.id, runId: run.runId, remoteRunId, attemptNumber: attempt.attemptNumber, reconciled: true },
+      });
+    }
+  };
   const markContinuationDispatchFailed = (event: DispatchOutboxEvent | undefined, continuation: Continuation, reason: string) => {
     if (!event || !config.dispatchOutbox) return;
     config.dispatchOutbox.markFailed(claimOf(event), reason, DEFAULT_CLAIM_LEASE_MS);
@@ -127,7 +241,17 @@ export async function runContinuationTick(
   ): Promise<"completed" | "deferred" | "failed"> => {
       // A live agent is already parked on await_review_feedback for this session:
       // the feedback event will wake it directly. Do NOT spawn a second worker.
+      const handoff = latestHandoff(cont.sessionId);
+      const handoffPayload = handoff?.payload as Record<string, unknown> | undefined;
       if (liveWaiters.has(cont.sessionId)) {
+        // A committed handoff means the live waiter belongs to the current
+        // destination worker. Later review feedback should wake that worker
+        // normally; recording quiescing_source here would regress the durable
+        // handoff and make its next wait look like an uncommitted transfer.
+        if (handoff && handoffPayload?.toAgent && handoffState(cont.sessionId, handoffPayload.transferId) !== "committed") {
+          recordHandoffState(cont.sessionId, handoff, "quiescing_source", "Waiting for the source worker's handoff signal and waiter shutdown.");
+          return "deferred";
+        }
         if (outboxEvent) config.dispatchOutbox?.markCompleted(claimOf(outboxEvent));
         return "completed";
       }
@@ -137,7 +261,7 @@ export async function runContinuationTick(
         outboxEvent ? config.dispatchOutbox?.markCompleted(claimOf(outboxEvent)) : undefined;
         return "completed";
       }
-      if (TERMINAL_STATUSES.has(session.status)) {
+      if (DISPATCH_BLOCKED_SESSION_STATUSES.has(session.status)) {
         supersedeContinuation(cont.id, cont.sessionId, `session is ${session.status}`);
         outboxEvent ? config.dispatchOutbox?.markCompleted(claimOf(outboxEvent)) : undefined;
         return "completed";
@@ -150,7 +274,7 @@ export async function runContinuationTick(
         return "completed";
       }
       const claimedSession = config.workSessions.get(claimed.sessionId);
-      if (!claimedSession || TERMINAL_STATUSES.has(claimedSession.status)) {
+      if (!claimedSession || DISPATCH_BLOCKED_SESSION_STATUSES.has(claimedSession.status)) {
         const reason = claimedSession ? `session is ${claimedSession.status}` : "session not found";
         supersedeContinuation(claimed.id, claimed.sessionId, reason);
         outboxEvent ? config.dispatchOutbox?.markCompleted(claimOf(outboxEvent)) : undefined;
@@ -160,6 +284,155 @@ export async function runContinuationTick(
       if (claimed.verdict !== "changes_requested") {
         // Defensive: pending continuations should only be changes_requested.
         config.continuationManager.markCompleted(claimed.id);
+        outboxEvent ? config.dispatchOutbox?.markCompleted(claimOf(outboxEvent)) : undefined;
+        return "completed";
+      }
+
+      // Scheduled peer work has no ACP run to resume. Continue it by creating
+      // one durable follow-up peer job bound to the same work session and the
+      // exact previously reviewed snapshot. The deterministic job ID makes a
+      // crash between enqueue and continuation acknowledgement recoverable.
+      const scheduledPeer = config.scheduledJobs?.getByWorkSessionId(claimed.sessionId);
+      if (scheduledPeer?.dispatchTarget.kind === "peer_pull") {
+        const peerStore = getPeerJobStore();
+        const peerJobId = scheduledPeerContinuationJobId(claimed.id);
+        const scheduledAttempt = scheduledPeer.activeDispatchAttemptId
+          ? config.scheduledJobs?.getAttempt(scheduledPeer.id, scheduledPeer.activeDispatchAttemptId)
+          : undefined;
+        const session = config.workSessions.get(claimed.sessionId);
+        const latestFeedback = config.workSessions.getLatestFeedback(claimed.sessionId);
+        const feedbackEvent = config.eventStore.getEventById(claimed.feedbackEventId);
+        if (!peerStore || !scheduledAttempt || !session || session.status !== "changes_requested" && session.status !== "resuming"
+          || scheduledPeer.workSessionId !== claimed.sessionId
+          || !latestFeedback || latestFeedback.id !== claimed.reviewId || latestFeedback.verdict !== "changes_requested"
+          || !feedbackEvent || feedbackEvent.type !== "review.feedback.provided"
+          || feedbackEvent.sessionId !== claimed.sessionId
+          || feedbackEvent.payload.feedbackId !== claimed.reviewId
+          || feedbackEvent.payload.submissionId === undefined
+          || feedbackEvent.payload.verdict !== "changes_requested") {
+          const reason = "Peer continuation is missing its durable store, work session, or exact authenticated feedback event.";
+          config.continuationManager.release(dispatcherId, { id: claimed.id });
+          config.eventStore.appendEvent({ type: "continuation.dispatch_failed", sessionId: claimed.sessionId, payload: { continuationId: claimed.id, reason } });
+          markContinuationDispatchFailed(outboxEvent, claimed, reason);
+          return "failed";
+        }
+        const prior = peerStore.getLatestJobForWorkSession(scheduledPeer.dispatchTarget.peerId, claimed.sessionId, peerJobId);
+        const existingPeerContinuation = peerStore.getJob(peerJobId);
+        let peerJob = existingPeerContinuation;
+        if (peerJob) {
+          const priorReview = prior?.resultProcessing;
+          const priorSubmission = priorReview?.submissionId
+            ? config.workSessions.getSubmissions(claimed.sessionId).find((candidate) => candidate.id === priorReview.submissionId)
+            : undefined;
+          if (peerJob.peerId !== scheduledPeer.dispatchTarget.peerId
+            || peerJob.workSessionId !== claimed.sessionId
+            || peerJob.workspaceSessionId !== scheduledPeer.projectId
+            || peerJob.schedulerDispatchId !== scheduledAttempt.dispatchId
+            || prior?.status !== "review_changes_requested"
+            || prior.schedulerDispatchId !== scheduledAttempt.dispatchId
+            || priorReview?.reviewVerdict !== "changes_requested"
+            || priorReview.feedbackId !== claimed.reviewId
+            || priorReview.reviewEpoch !== claimed.reviewEpoch
+            || priorReview.diffSha256 !== claimed.reviewedDiffHash
+            || feedbackEvent.payload.submissionId !== priorReview.submissionId
+            || feedbackEvent.payload.reviewedDiffHash !== priorReview.diffSha256
+            || priorSubmission?.diffSha256 !== priorReview.diffSha256
+            || priorSubmission?.snapshotKind !== priorReview.snapshotKind
+            || priorSubmission?.snapshotRef !== priorReview.snapshotRef
+            || !peerJob.instructions.includes(claimed.promptText)) {
+            const reason = "The deterministic peer continuation does not match the exact authenticated feedback and reviewed snapshot.";
+            config.continuationManager.release(dispatcherId, { id: claimed.id });
+            config.eventStore.appendEvent({ type: "continuation.dispatch_failed", sessionId: claimed.sessionId, payload: { continuationId: claimed.id, reason } });
+            markContinuationDispatchFailed(outboxEvent, claimed, reason);
+            return "failed";
+          }
+        } else {
+          const processing = prior?.resultProcessing;
+          const submission = processing?.submissionId
+            ? config.workSessions.getSubmissions(claimed.sessionId).find((candidate) => candidate.id === processing.submissionId)
+            : undefined;
+          const changedPaths = submission?.files?.map((file) => file.path) ?? [];
+          const outputsPermitSnapshot = changedPaths.length > 0 && changedPaths.every((path) => prior!.allowedOutputs.some((output) =>
+            output === "*" || path === output || path.startsWith(`${output}/`),
+          ));
+          const exactPriorReview = prior?.status === "review_changes_requested"
+            && prior.schedulerDispatchId === scheduledAttempt.dispatchId
+            && prior.resultProcessing?.reviewVerdict === "changes_requested"
+            && prior.resultProcessing.feedbackId === claimed.reviewId
+            && prior.resultProcessing.reviewEpoch === claimed.reviewEpoch
+            && prior.resultProcessing.diffSha256 === claimed.reviewedDiffHash
+            && feedbackEvent.payload.submissionId === prior.resultProcessing.submissionId
+            && feedbackEvent.payload.reviewedDiffHash === prior.resultProcessing.diffSha256
+            && submission?.diffSha256 === prior.resultProcessing.diffSha256
+            && submission?.snapshotKind === prior.resultProcessing.snapshotKind
+            && submission?.snapshotRef === prior.resultProcessing.snapshotRef
+            && outputsPermitSnapshot;
+          if (!prior || !submission || !exactPriorReview) {
+            const reason = "No exact peer result and snapshot match the authenticated changes-requested feedback; follow-up dispatch is fenced.";
+            config.continuationManager.release(dispatcherId, { id: claimed.id });
+            config.eventStore.appendEvent({ type: "continuation.dispatch_failed", sessionId: claimed.sessionId, payload: { continuationId: claimed.id, reason } });
+            markContinuationDispatchFailed(outboxEvent, claimed, reason);
+            return "failed";
+          }
+          const instructions = [
+            "Continue the existing scheduled peer task in the same logical work session.",
+            `Original task:\n${prior.instructions}`,
+            `Reviewer continuation:\n${claimed.promptText}`,
+            `Exact prior checkpoint: ${submission.snapshotKind}:${submission.snapshotRef}`,
+            `Prior submission SHA-256: ${submission.diffSha256}`,
+            `Prior submission patch (context only; the exact changed paths are already listed below):\n${submission.diff ?? "[patch unavailable]"}`,
+            `Return the complete final contents for every listed changed path: ${changedPaths.join(", ")}.`,
+            "Do not add output paths or alter files outside the existing peer job's allowedOutputs.",
+          ].join("\n\n");
+          if (Buffer.byteLength(instructions, "utf8") > MAX_INSTRUCTION_BYTES) {
+            const reason = "The exact reviewed patch and continuation exceed the peer instruction limit; a bounded peer continuation cannot be created.";
+            config.continuationManager.release(dispatcherId, { id: claimed.id });
+            config.eventStore.appendEvent({ type: "continuation.dispatch_failed", sessionId: claimed.sessionId, payload: { continuationId: claimed.id, reason } });
+            markContinuationDispatchFailed(outboxEvent, claimed, reason);
+            return "failed";
+          }
+          try {
+            peerJob = peerStore.createJob({
+              jobId: peerJobId,
+              peerId: prior.peerId,
+              workSessionId: prior.workSessionId,
+              workspaceSessionId: prior.workspaceSessionId,
+              schedulerDispatchId: scheduledAttempt.dispatchId,
+              repositoryId: prior.repositoryId,
+              baseRevision: prior.baseRevision,
+              taskClass: prior.taskClass,
+              instructionHash: createHash("sha256").update(instructions).digest("hex"),
+              instructions,
+              allowedOutputs: prior.allowedOutputs,
+              maxRuntimeMs: prior.maxRuntimeMs,
+              maxArtifactBytes: prior.maxArtifactBytes,
+            });
+          } catch (error) {
+            const reason = error instanceof Error ? error.message : String(error);
+            config.continuationManager.release(dispatcherId, { id: claimed.id });
+            config.eventStore.appendEvent({ type: "continuation.dispatch_failed", sessionId: claimed.sessionId, payload: { continuationId: claimed.id, reason } });
+            markContinuationDispatchFailed(outboxEvent, claimed, reason);
+            return "failed";
+          }
+        }
+        const delivered = config.continuationManager.markDelivered({
+          id: claimed.id,
+          expectedStatus: "claimed",
+          claimOwner: dispatcherId,
+          targetRunId: `peer:${peerJob.jobId}`,
+        });
+        if (!delivered) {
+          outboxEvent
+            ? config.dispatchOutbox?.release(claimOf(outboxEvent), DEFAULT_CLAIM_LEASE_MS, "peer continuation delivery CAS failed")
+            : undefined;
+          return "deferred";
+        }
+        config.workSessions.markFeedbackConsumed(claimed.sessionId, claimed.reviewId);
+        config.eventStore.appendEvent({
+          type: "continuation.delivered",
+          sessionId: claimed.sessionId,
+          payload: { continuationId: claimed.id, transport: "peer_pull", peerJobId: peerJob.jobId, peerId: peerJob.peerId },
+        });
         outboxEvent ? config.dispatchOutbox?.markCompleted(claimOf(outboxEvent)) : undefined;
         return "completed";
       }
@@ -180,13 +453,16 @@ export async function runContinuationTick(
       }
       const missionPacket = config.missionLedger?.getPacket(claimed.sessionId);
       const preferredAgent = missionPacket?.workOrders[0]?.preferredAgent;
-      const agentName = preferredAgent || existingRun.agentName;
+      const agentName = (typeof handoffPayload?.toAgent === "string" ? handoffPayload.toAgent : undefined)
+        || preferredAgent
+        || existingRun.agentName;
       const selection = await selectHealthyAgent(config.agentRegistry.listAlive(), {
         name: agentName,
         role: "agent",
         adapterSecret: config.adapterSecret,
       });
       if (!selection.agent) {
+        if (handoff) recordHandoffState(cont.sessionId, handoff, "blocked", `No healthy registered destination agent named ${agentName}.`);
         // No healthy agent — release the claim so a later wakeup retries it
         // (the lease prevents it from being re-claimed too eagerly after a blip).
         config.continuationManager.release(dispatcherId, { id: claimed.id });
@@ -196,9 +472,107 @@ export async function runContinuationTick(
         return "deferred";
       }
 
+      // A handoff binds to the exact adapter identity selected by the
+      // reviewer. If the name now resolves to a replacement registration,
+      // do not silently route the immutable transfer packet to that identity;
+      // require an explicit new handoff so the destination context is bound
+      // and reviewed against the replacement adapter.
+      const requestedDestinationId = typeof handoffPayload?.toAgentId === "string"
+        ? handoffPayload.toAgentId
+        : undefined;
+      if (handoff && requestedDestinationId && requestedDestinationId !== selection.agent.id) {
+        const detail = `Selected destination identity changed (expected ${requestedDestinationId}, found ${selection.agent.id}); a new handoff is required.`;
+        recordHandoffState(cont.sessionId, handoff, "blocked", detail);
+        config.continuationManager.release(dispatcherId, { id: claimed.id });
+        outboxEvent
+          ? config.dispatchOutbox?.release(claimOf(outboxEvent), DEFAULT_CLAIM_LEASE_MS, detail)
+          : undefined;
+        return "deferred";
+      }
+
+      const initialTransferPacket = handoffPayload?.toAgentId === selection.agent.id
+        ? handoffPayload.contextTransferPacket as Record<string, unknown> | undefined
+        : undefined;
+      const transferId = typeof handoffPayload?.transferId === "string" && initialTransferPacket
+        ? handoffPayload.transferId
+        : undefined;
+      const previousAttempt = config.agentRegistry.getLatestDispatchAttemptForRun(existingRun.runId);
+      const previousAgentId = previousAttempt?.agentId ?? existingRun.agentId;
+      const switchingAgent = Boolean(transferId && previousAgentId && previousAgentId !== selection.agent.id);
+      const retryingKnownUnstartedTransfer = Boolean(
+        transferId
+        && previousAttempt?.agentId === selection.agent.id
+        && previousAttempt.status === "unstarted",
+      );
+      const freshContextTransfer = switchingAgent || retryingKnownUnstartedTransfer;
+      const liveSourceLease = Boolean(
+        switchingAgent
+        && !TERMINAL_STATUSES.has(existingRun.status)
+        && existingRun.status !== "cancelling"
+        && existingRun.workerLeaseUntil
+        && Date.parse(existingRun.workerLeaseUntil) > Date.now(),
+      );
+      if (liveSourceLease && handoff) {
+        recordHandoffState(cont.sessionId, handoff, "quiescing_source", "The source attempt still owns a live workspace lease.");
+        config.continuationManager.release(dispatcherId, { id: claimed.id });
+        outboxEvent
+          ? config.dispatchOutbox?.release(claimOf(outboxEvent), DEFAULT_CLAIM_LEASE_MS, "Waiting for source worker quiescence")
+          : undefined;
+        return "deferred";
+      }
+      if (switchingAgent && handoff) {
+        recordHandoffState(cont.sessionId, handoff, "quiescing_source", "Source worker quiescence is confirmed; destination preparation may proceed.");
+      }
+      const transferPacket = transferId && initialTransferPacket
+        ? {
+            ...initialTransferPacket,
+            continuation: {
+              continuationId: claimed.id,
+              reviewEpoch: claimed.reviewEpoch,
+              prompt: claimed.promptText,
+            },
+            priorWork: {
+              ...(initialTransferPacket.priorWork as Record<string, unknown> | undefined),
+              latestRunOutput: existingRun.outputPreview,
+              latestSubmission: session.latestSubmission ? {
+                submissionId: session.latestSubmission.id,
+                message: session.latestSubmission.message,
+                reviewEpoch: session.latestSubmission.reviewEpoch,
+                files: session.latestSubmission.files,
+                diffSha256: session.latestSubmission.diffSha256,
+              } : undefined,
+            },
+            checkpoint: session.latestSubmission ? {
+              submissionId: session.latestSubmission.id,
+              snapshotKind: session.latestSubmission.snapshotKind,
+              snapshotRef: session.latestSubmission.snapshotRef,
+              reviewEpoch: session.latestSubmission.reviewEpoch,
+            } : initialTransferPacket.checkpoint,
+            latestReviewerFeedback: session.latestFeedback ? {
+              feedbackId: session.latestFeedback.id,
+              submissionId: session.latestFeedback.submissionId,
+              verdict: session.latestFeedback.verdict,
+              comments: session.latestFeedback.comments,
+              requiredActions: session.latestFeedback.requiredActionsJson ? JSON.parse(session.latestFeedback.requiredActionsJson) : undefined,
+              allowedNextActions: session.latestFeedback.allowedNextActionsJson ? JSON.parse(session.latestFeedback.allowedNextActionsJson) : undefined,
+              reviewerId: session.latestFeedback.reviewerId,
+              createdAt: session.latestFeedback.createdAt,
+            } : initialTransferPacket.latestReviewerFeedback,
+          }
+        : undefined;
+      const transferSha256 = transferPacket ? createHash("sha256").update(JSON.stringify(transferPacket)).digest("hex") : undefined;
+      if (transferId && transferPacket && handoff) {
+        config.eventStore.appendEvent({
+          type: "session.handoff.context",
+          sessionId: claimed.sessionId,
+          payload: { transferId, contextTransferPacket: transferPacket, contextTransferSha256: transferSha256 },
+        });
+      }
+
+      let requiresTransferReconciliation = false;
       try {
         const preDispatchSession = config.workSessions.get(claimed.sessionId);
-        if (!preDispatchSession || TERMINAL_STATUSES.has(preDispatchSession.status)) {
+        if (!preDispatchSession || DISPATCH_BLOCKED_SESSION_STATUSES.has(preDispatchSession.status)) {
           const reason = preDispatchSession ? `session is ${preDispatchSession.status}` : "session not found";
           supersedeContinuation(claimed.id, claimed.sessionId, reason);
           outboxEvent ? config.dispatchOutbox?.markCompleted(claimOf(outboxEvent)) : undefined;
@@ -207,7 +581,7 @@ export async function runContinuationTick(
         if (config.beforeContinuationDispatch) {
           await config.beforeContinuationDispatch(claimed, claimed.sessionId);
           const afterHookSession = config.workSessions.get(claimed.sessionId);
-          if (!afterHookSession || TERMINAL_STATUSES.has(afterHookSession.status)) {
+          if (!afterHookSession || DISPATCH_BLOCKED_SESSION_STATUSES.has(afterHookSession.status)) {
             const reason = afterHookSession ? `session is ${afterHookSession.status}` : "session not found";
             supersedeContinuation(claimed.id, claimed.sessionId, reason);
             outboxEvent ? config.dispatchOutbox?.markCompleted(claimOf(outboxEvent)) : undefined;
@@ -223,7 +597,9 @@ export async function runContinuationTick(
           await config.resumeAgent(claimed, claimed.sessionId);
           result = { runId: claimed.id, agentName, attemptNumber: 1, status: "running", output: "" };
         } else {
-          result = await defaultResume(config, claimed, session, agentName);
+          result = await defaultResume(config, claimed, session, agentName, transferId && transferPacket && transferSha256
+            ? { id: transferId, sha256: transferSha256, packet: transferPacket, fresh: freshContextTransfer }
+            : undefined);
         }
 
         // callRemoteAgent() catches transport errors and returns status:"failed"
@@ -231,6 +607,10 @@ export async function runContinuationTick(
         // RELEASED (not marked delivered) and a later wakeup retries it.
         if (result.status === "failed") {
           throw new Error(result.error ?? "ACP continuation dispatch failed");
+        }
+        if (transferId && result.status === "uncertain") {
+          requiresTransferReconciliation = true;
+          throw new Error("Cross-agent transfer dispatch is uncertain; reconcile the exact destination attempt before retrying.");
         }
 
         // Persist the REAL kontrol run id so reconciliation/delivery records are
@@ -242,10 +622,25 @@ export async function runContinuationTick(
           targetRunId: result.runId,
         });
         if (!delivered) {
+          if (transferId && handoff) {
+            requiresTransferReconciliation = true;
+            recordHandoffState(claimed.sessionId, handoff, "reconciliation_required", "Destination accepted work but the continuation delivery claim could not be committed.");
+          }
           outboxEvent
             ? config.dispatchOutbox?.release(claimOf(outboxEvent), DEFAULT_CLAIM_LEASE_MS, "continuation delivery CAS failed")
             : undefined;
           return "deferred";
+        }
+
+        if (transferId && handoff) {
+          recordHandoffState(claimed.sessionId, handoff, "destination_ready");
+          recordHandoffState(claimed.sessionId, handoff, "committed");
+          // The immutable transfer packet carries the latest reviewer feedback
+          // into the destination's fresh provider session. Mark that feedback
+          // consumed only after destination acceptance is durably recorded, so
+          // its first await_review_feedback cannot replay the already delivered
+          // changes_requested event as though it were round-two feedback.
+          markTransferredFeedbackConsumed(claimed.sessionId, transferPacket);
         }
 
         // Publish after the continuation is delivered so subscribers react without
@@ -260,8 +655,21 @@ export async function runContinuationTick(
       } catch (error) {
         // Availability failures release the logical outbox row with backoff;
         // only genuine failures consume the dead-letter budget.
-        config.continuationManager.release(dispatcherId, { id: claimed.id });
         const reason = error instanceof Error ? error.message : String(error);
+        if (requiresTransferReconciliation && transferId && handoff) {
+          const latestAttempt = config.agentRegistry.getLatestDispatchAttemptForRun(existingRun.runId);
+          const persisted = latestAttempt && config.continuationManager.markReconciliationRequired({
+            id: claimed.id,
+            claimOwner: dispatcherId,
+            targetRunId: existingRun.runId,
+            reason,
+          });
+          if (persisted) recordHandoffState(claimed.sessionId, handoff, "reconciliation_required", reason);
+          if (outboxEvent) config.dispatchOutbox?.release(claimOf(outboxEvent), DEFAULT_CLAIM_LEASE_MS, reason);
+          return "deferred";
+        }
+        config.continuationManager.release(dispatcherId, { id: claimed.id });
+        if (transferId && handoff) recordHandoffState(claimed.sessionId, handoff, "blocked", reason);
         if (isTemporaryDispatchUnavailability(reason)) {
           outboxEvent
             ? config.dispatchOutbox?.release(claimOf(outboxEvent), DEFAULT_CLAIM_LEASE_MS, reason)
@@ -274,6 +682,7 @@ export async function runContinuationTick(
   };
 
   try {
+    await reconcileHandoffContinuations();
     if (config.dispatchOutbox) {
       for (const cont of config.continuationManager.listPending()) {
         if (!config.dispatchOutbox.hasLogical("continuation.ready", cont.id, cont.reviewEpoch)) {
@@ -319,8 +728,16 @@ export async function runContinuationTick(
     for (const cont of config.continuationManager.listPending()) {
       await dispatchContinuation(cont);
     }
-  } catch {
-    // Swallow; next drain retries unclaimed continuations.
+  } catch (error) {
+    // The next bounded tick retries durable, still-pending work. Report only a
+    // stable category here: adapter messages can contain host paths or other
+    // request data and do not belong in startup/dispatcher diagnostics.
+    const reason = error instanceof Error ? error.message : "";
+    const category = /SQLITE_BUSY|database is locked/i.test(reason) ? "database_busy"
+      : /ECONNREFUSED|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|socket hang up/i.test(reason) ? "transport_unavailable"
+        : /timed? ?out|deadline/i.test(reason) ? "timeout"
+          : "unexpected";
+    console.warn(`[kontrol] continuation dispatcher tick failed (${category}); pending work remains retryable`);
   }
 }
 
@@ -333,6 +750,7 @@ export async function defaultResume(
   continuation: Continuation,
   session: { workspaceSessionId: string },
   agentName = "cli-coding-agent",
+  contextTransfer?: { id: string; sha256: string; packet: Record<string, unknown>; fresh: boolean },
 ): Promise<AgentCallResult> {
   const previousLease = config.workSessions.getWorkspaceLeaseForSession(continuation.sessionId);
   const activePreviousLease = previousLease && Date.parse(previousLease.expiresAt) > Date.now() ? previousLease : undefined;
@@ -346,12 +764,15 @@ export async function defaultResume(
   const missionPrompt = renderMissionPrompt(config, continuation.sessionId, continuation.promptText);
   const task = [
     continuation.promptText,
+    contextTransfer?.fresh
+      ? `Immutable cross-agent context transfer (sha256 ${contextTransfer.sha256}):\n${JSON.stringify(contextTransfer.packet, null, 2)}`
+      : undefined,
     missionPrompt,
     `Continue from review feedback. ${workSessionInstructions(continuation.sessionId, agent)}`,
   ].filter(Boolean).join("\n\n");
   try {
     const result = await callRemoteAgent(
-      { agentRegistry: config.agentRegistry, workspaces: config.workspaces, workSessions: config.workSessions, adapterSecret: config.adapterSecret },
+      { agentRegistry: config.agentRegistry, workspaces: config.workspaces, workSessions: config.workSessions, eventStore: config.eventStore, adapterSecret: config.adapterSecret },
       {
       agentUrl: await resolveHealthyAgentUrl(config, agentName),
       agentName,
@@ -361,6 +782,7 @@ export async function defaultResume(
       workSessionId: continuation.sessionId,
       existingRunId: run?.runId,
       continuationId: continuation.id,
+      ...(contextTransfer ? { contextTransfer } : {}),
       ...checkoutLeaseMetadata(config, continuation.sessionId),
       mode: "async",
       fireAndForget: true,

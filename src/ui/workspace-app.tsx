@@ -4,7 +4,7 @@ import {
   applyHostFonts,
   applyHostStyleVariables,
 } from "@modelcontextprotocol/ext-apps";
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import type { CallToolResult } from "@modelcontextprotocol/server";
 import {
   isEditTool,
   isExpandableCard,
@@ -88,6 +88,8 @@ import {
 import type { LegacyReviewDom, WorkSessionDom } from "./session-view-types.js";
 import { formatElapsed, humanizeStatus } from "./ui-format.js";
 import { approvalCenterId, isApprovalCenterId } from "./approval-center.js";
+import { renderIngressManagementPanel } from "./ingress-management.js";
+import { renderPeerStatusPanel, type PeerStatusProjection } from "./peer-status-panel.js";
 import { relativeSessionAge, sessionCategory } from "./session-view-helpers.js";
 import {
   currentPayloadContainerElement,
@@ -101,6 +103,9 @@ import {
 } from "./payload-mount.js";
 import {
   connectBootstrapWithRetry,
+  connectWithRetry,
+  advanceAppInstanceGeneration,
+  bindAppInstanceCallback,
   cancelReconnect,
   reconnectApp,
   renderApprovalCenterView,
@@ -120,6 +125,7 @@ import {
 import {
   fetchReviewDiff,
   hydrateWorkSessionSnapshot,
+  invalidateHistoricalPendingReviewLoad,
   loadHistoricalPendingReviews,
   queueSessionRehydration,
   reconcileAuthoritativeApprovals,
@@ -165,6 +171,7 @@ import {
   getStructuredContent,
   setServerToolHost,
 } from "./server-tool-call.js";
+import { classifyMcpFailure, isMcpReconnectFailure } from "./mcp-failure.js";
 
 // ── Work-session view model ───────────────────────────
 // A run is a long-lived workflow, not a succession of unrelated single cards.
@@ -172,6 +179,7 @@ import {
 // the live activity timeline, and the current review submission + feedback.
 
 let app: App | null = null;
+let disposeAppEventListeners: (() => void) | undefined;
 let connected = false;
 let connectionError: string | null = null;
 type ConnectionState = "CONNECTING" | "CONNECTED" | "DEGRADED" | "RECONNECTING" | "DISCONNECTED";
@@ -204,10 +212,17 @@ const messageMutationOutcomeUnknown = new Set<string>();
 type ApprovalRecoveryState = "healthy" | "degraded" | "forbidden" | "disconnected";
 let approvalRecoveryState: ApprovalRecoveryState = "healthy";
 let lastToolCard: ToolResultCard | null = null;
+let peerStatusPageHistory: PeerStatusProjection[] = [];
+let peerStatusLoading = false;
+let peerStatusError: string | null = null;
+let peerStatusReconcilingJobId: string | null = null;
+let peerStatusCancellingJobId: string | null = null;
 let rehydrationPromise: Promise<void> | null = null;
 let rehydrationRequested = false;
 let lastSuccessfulHydrationAt: string | null = null;
 let historicalPendingReviewsLoaded = false;
+let historicalPendingReviewsLoading = false;
+let historicalPendingReviewsCursor: { updatedAt: string; sessionId: string } | null = null;
 
 // View-local UI state (replaced the previous globals).
 let expanded = false;
@@ -253,6 +268,31 @@ function restoreFocusSnapshot(snapshot: FocusSnapshot | undefined): void {
 }
 
 let heartbeatRefreshTimer: ReturnType<typeof setInterval> | undefined;
+// Current-bound handler refs for the replacement App; stale instance closures
+// are never copied directly onto the replacement.
+const toolResultHandlerRef: { current?: (result: unknown) => void } = {};
+const hostContextHandlerRef: { current?: (ctx: unknown) => void } = {};
+const teardownHandlerRef: { current?: () => Promise<unknown> | void } = {};
+
+function attachAppEventListeners(target: App): () => void {
+  const onToolResult = bindAppInstanceCallback((result) => {
+    toolResultHandlerRef.current?.(result);
+  });
+  const onHostContextChanged = bindAppInstanceCallback((context) => {
+    hostContextHandlerRef.current?.(context);
+  });
+  target.addEventListener("toolresult", onToolResult);
+  target.addEventListener("hostcontextchanged", onHostContextChanged);
+  // ext-apps 1.7.5 implements removeEventListener through ProtocolWithEvents,
+  // but its App declaration omits the inherited public method.
+  const removeListener = (target as unknown as {
+    removeEventListener: (event: string, listener: (params: never) => void) => void;
+  }).removeEventListener;
+  return () => {
+    removeListener.call(target, "toolresult", onToolResult as (params: never) => void);
+    removeListener.call(target, "hostcontextchanged", onHostContextChanged as (params: never) => void);
+  };
+}
 
 function syncHeartbeatRefreshTimer(): void {
   const view = selectedWorkSessionId ? workSessionViews.get(selectedWorkSessionId) : undefined;
@@ -304,18 +344,20 @@ setLifecycleHost({
     setHostContext: (v) => { hostContext = v as HostContext | undefined; },
     recreateApp: async () => {
       const previous = app as (App & { close?: () => Promise<void> }) | null;
-      const toolResultHandler = previous?.ontoolresult;
-      const hostContextHandler = previous?.onhostcontextchanged;
-      const teardownHandler = previous?.onteardown;
+      advanceAppInstanceGeneration();
+      disposeAppEventListeners?.();
+      disposeAppEventListeners = undefined;
       try { await previous?.close?.(); } catch { /* the failed transport is already being replaced */ }
       const replacement = (uiTestAppFactory?.() ?? new App(
         { name: "kontrol-tool-cards", version: "0.4.0" },
         {},
       )) as App;
       installAppErrorHandler(replacement);
-      replacement.ontoolresult = toolResultHandler;
-      replacement.onhostcontextchanged = hostContextHandler;
-      replacement.onteardown = teardownHandler;
+      disposeAppEventListeners = attachAppEventListeners(replacement);
+      replacement.onteardown = bindAppInstanceCallback(async () => {
+        await teardownHandlerRef.current?.();
+        return {};
+      });
       app = replacement;
     },
     applyHostContext,
@@ -387,6 +429,8 @@ setLifecycleHost({
     connectionState: () => connectionState,
     render: () => render(),
     historicalPendingReviewsLoaded: () => historicalPendingReviewsLoaded,
+    historicalPendingReviewsLoading: () => historicalPendingReviewsLoading,
+    historicalPendingReviewsCursor: () => historicalPendingReviewsCursor,
     reviewCardFromSubmission,
     getLastToolCard: () => lastToolCard,
     setLastToolCard: (v) => { lastToolCard = v; },
@@ -421,6 +465,10 @@ setLifecycleHost({
     setLastSuccessfulHydrationAt: (v) => { lastSuccessfulHydrationAt = v; },
     historicalPendingReviewsLoaded: () => historicalPendingReviewsLoaded,
     setHistoricalPendingReviewsLoaded: (v) => { historicalPendingReviewsLoaded = v; },
+    historicalPendingReviewsLoading: () => historicalPendingReviewsLoading,
+    setHistoricalPendingReviewsLoading: (v) => { historicalPendingReviewsLoading = v; },
+    historicalPendingReviewsCursor: () => historicalPendingReviewsCursor,
+    setHistoricalPendingReviewsCursor: (v) => { historicalPendingReviewsCursor = v; },
     approvalRecoveryState: () => approvalRecoveryState,
     setApprovalRecoveryState: (v) => { approvalRecoveryState = v; },
     approvalAttentionDelivered,
@@ -490,7 +538,7 @@ async function bootInternal(): Promise<void> {
     );
   installAppErrorHandler(app);
 
-  app.ontoolresult = (result) => {
+  const handleToolResult = (result: Parameters<NonNullable<App["ontoolresult"]>>[0]) => {
     const structuredContent = getStructuredContent<Partial<ToolResultCard>>(result);
     const metaCard = cardFromMeta(result);
     const card = metaCard
@@ -589,29 +637,44 @@ async function bootInternal(): Promise<void> {
     // work-session selection; session recovery and supervision should remain
     // anchored even when unrelated tool cards arrive.
     lastToolCard = { ...structured, tool };
+    if (tool === "list_peer_status") {
+      peerStatusPageHistory = [((structured.summary ?? {}) as PeerStatusProjection)];
+      peerStatusLoading = false;
+      peerStatusError = null;
+    }
     expanded = isShellTool(tool) && structured.summary?.running === true;
     reviewFilesExpanded = false;
     errorMessage = null;
     render();
   };
 
-  app.onhostcontextchanged = (ctx) => {
-    hostContext = { ...hostContext, ...ctx };
+  toolResultHandlerRef.current = (result) => {
+    handleToolResult(result as Parameters<NonNullable<App["ontoolresult"]>>[0]);
+  };
+
+  const handleHostContext = (ctx: unknown) => {
+    hostContext = { ...hostContext, ...(ctx as Record<string, unknown>) };
     applyHostContext();
     renderPayloadIfNeeded();
   };
+  hostContextHandlerRef.current = handleHostContext;
+  disposeAppEventListeners = attachAppEventListeners(app);
 
-  app.onteardown = async () => {
+  const handleTeardown = async () => {
     cancelReconnect();
     connected = false;
     connectionState = "DISCONNECTED";
     workspaceWatcherGeneration += 1;
+    disposeAppEventListeners?.();
+    disposeAppEventListeners = undefined;
     // Preserve the last authoritative projection, draft, selection, and
     // review state while a replacement App/transport is negotiated. The
     // replacement connection rehydrates before mutations are enabled.
     app = null;
     return {};
   };
+  teardownHandlerRef.current = handleTeardown;
+  app.onteardown = bindAppInstanceCallback(handleTeardown);
 
   bootstrapStage = "app-connect";
   await connectBootstrapWithRetry();
@@ -642,14 +705,30 @@ function reportBootstrapFailure(error: unknown): void {
   connectionError = formatBootstrapDiagnostic(bootstrapStage, error);
   errorMessage = connectionError;
   renderConnectionError(connectionError);
+  if (app) {
+    // Keep a bounded recovery window after bootstrap's initial attempts. If
+    // the host has removed the channel, onteardown clears `app` and cancels it.
+    void connectWithRetry(error).catch((retryError) => {
+      if (!app) return;
+      connectionError = formatBootstrapDiagnostic("host-transport", retryError);
+      connectionState = "DISCONNECTED";
+      connected = false;
+      renderConnectionError(connectionError);
+    });
+  }
 }
 
 function installAppErrorHandler(target: App): void {
   // The ext-apps runtime exposes this callback, while the checked-in SDK
   // declaration currently omits it. Keep the narrow cast local to the bridge.
-  (target as App & { onerror?: (error: unknown) => void }).onerror = (error) => {
+  (target as App & { onerror?: (error: unknown) => void }).onerror = bindAppInstanceCallback((error) => {
+    const failure = classifyMcpFailure(error);
     const message = formatBootstrapDiagnostic(connected ? "host-transport" : bootstrapStage, error);
     connectionError = message;
+    if (!isMcpReconnectFailure(failure)) {
+      render();
+      return;
+    }
     if (!connected) {
       connectionState = "DISCONNECTED";
       errorMessage = message;
@@ -658,14 +737,17 @@ function installAppErrorHandler(target: App): void {
     }
     connectionState = "DEGRADED";
     render();
-    void reconnectApp(error).catch(() => undefined);
-  };
+    void reconnectApp({ failure, cause: error }).catch(() => undefined);
+  });
 }
 
 function activateWorkspace(newWorkspaceId: string): void {
   if (activeWorkspaceId !== newWorkspaceId) {
+    invalidateHistoricalPendingReviewLoad();
     activeWorkspaceId = newWorkspaceId;
     historicalPendingReviewsLoaded = false;
+    historicalPendingReviewsLoading = false;
+    historicalPendingReviewsCursor = null;
     // P0.5 isolation invariant: a workspace transition must start on the
     // new workspace's own surface. Old-workspace state is kept internally
     // for a fast return but can never render under the new selection.
@@ -777,6 +859,128 @@ function renderNowInternal(): void {
 
   const card = lastToolCard;
   ensureSurface(`tool:${card.tool}`);
+  if (card.tool === "list_peer_status") {
+    const currentProjection = (card.summary ?? {}) as PeerStatusProjection;
+    appRoot.replaceChildren(renderPeerStatusPanel(currentProjection, {
+      previousAvailable: peerStatusPageHistory.length > 1,
+      loading: peerStatusLoading,
+      reconcilingJobId: peerStatusReconcilingJobId,
+      cancellingJobId: peerStatusCancellingJobId,
+      error: peerStatusError,
+      previous: () => {
+        if (peerStatusLoading || peerStatusPageHistory.length < 2 || lastToolCard?.tool !== "list_peer_status") return;
+        peerStatusPageHistory.pop();
+        lastToolCard = { ...lastToolCard, summary: peerStatusPageHistory[peerStatusPageHistory.length - 1] };
+        peerStatusError = null;
+        render();
+      },
+      next: (cursor) => {
+        if (peerStatusLoading || lastToolCard?.tool !== "list_peer_status") return;
+        peerStatusLoading = true;
+        peerStatusError = null;
+        render();
+        void callServerToolChecked({ name: "list_peer_status", arguments: { cursor, limit: 20 } }, { retry: "safe" })
+          .then((result) => {
+            if (lastToolCard?.tool !== "list_peer_status") return;
+            const projection = result.structuredContent as PeerStatusProjection | undefined;
+            if (!projection || !Array.isArray(projection.jobs)) {
+              throw new Error("The peer status response did not include a job page.");
+            }
+            peerStatusPageHistory.push(projection);
+            lastToolCard = { ...lastToolCard, summary: projection };
+            peerStatusLoading = false;
+            render();
+          })
+          .catch((error) => {
+            if (lastToolCard?.tool !== "list_peer_status") return;
+            peerStatusLoading = false;
+            peerStatusError = error instanceof Error ? error.message : String(error);
+            render();
+          });
+      },
+      reconcile: (jobId, expectedFailure) => {
+        if (peerStatusLoading || peerStatusReconcilingJobId || lastToolCard?.tool !== "list_peer_status") return;
+        peerStatusReconcilingJobId = jobId;
+        peerStatusError = null;
+        render();
+        void callServerToolChecked({
+          name: "reconcile_peer_job_result",
+          arguments: { jobId, expectedFailure, clientMutationId: newClientMutationId() },
+        }, { retry: "reconcile" })
+          .then(async (result) => {
+            if (result.isError) throw new Error(result.content?.map((item) => item.type === "text" ? item.text : "").join("\n") || "Peer result recovery was rejected.");
+            const refreshed = await callServerToolChecked({ name: "list_peer_status", arguments: { limit: 20 } }, { retry: "safe" });
+            const projection = refreshed.structuredContent as PeerStatusProjection | undefined;
+            if (!projection || !Array.isArray(projection.jobs)) throw new Error("Peer status refresh did not return a job page.");
+            peerStatusPageHistory[peerStatusPageHistory.length - 1] = projection;
+            lastToolCard = { ...lastToolCard!, tool: "list_peer_status", summary: projection };
+            peerStatusReconcilingJobId = null;
+            peerStatusError = null;
+            render();
+          })
+          .catch((error) => {
+            peerStatusReconcilingJobId = null;
+            peerStatusError = error instanceof Error ? error.message : String(error);
+            if (lastToolCard?.tool !== "list_peer_status") {
+              lastToolCard = { tool: "list_peer_status", summary: currentProjection } as ToolResultCard;
+            }
+            render();
+          });
+      },
+      cancel: (jobId) => {
+        if (peerStatusLoading || peerStatusCancellingJobId || lastToolCard?.tool !== "list_peer_status") return;
+        peerStatusCancellingJobId = jobId;
+        peerStatusError = null;
+        render();
+        void callServerToolChecked({
+          name: "cancel_peer_job",
+          arguments: { jobId, clientMutationId: newClientMutationId() },
+        }, { retry: "reconcile" })
+          .then(async (result) => {
+            if (result.isError) throw new Error(result.content?.map((item) => item.type === "text" ? item.text : "").join("\n") || "Peer job cancellation was rejected.");
+            const refreshed = await callServerToolChecked({ name: "list_peer_status", arguments: { limit: 20 } }, { retry: "safe" });
+            const projection = refreshed.structuredContent as PeerStatusProjection | undefined;
+            if (!projection || !Array.isArray(projection.jobs)) throw new Error("Peer status refresh did not return a job page.");
+            peerStatusPageHistory[peerStatusPageHistory.length - 1] = projection;
+            lastToolCard = { ...lastToolCard!, tool: "list_peer_status", summary: projection };
+            peerStatusCancellingJobId = null;
+            peerStatusError = null;
+            render();
+          })
+          .catch((error) => {
+            peerStatusCancellingJobId = null;
+            peerStatusError = error instanceof Error ? error.message : String(error);
+            render();
+          });
+      },
+    }));
+    return;
+  }
+  if (card.tool === "ingress_management") {
+    appRoot.replaceChildren(renderIngressManagementPanel(card.summary ?? {}, {
+      manage: async (action, profileId, preferredEndpointIds) => {
+        try {
+          const result = await callServerToolChecked({
+            name: "ingress_management",
+            arguments: {
+              action,
+              ...(profileId ? { profileId } : {}),
+              ...(preferredEndpointIds ? { preferredEndpointIds } : {}),
+              ...(action === "inspect" ? {} : { confirm: true }),
+            },
+          }, { retry: action === "inspect" ? "safe" : "reconcile" });
+          const projection = result.structuredContent as Record<string, unknown> | undefined;
+          if (!projection) throw new Error("The ingress server returned no authoritative status projection.");
+          lastToolCard = { ...lastToolCard!, summary: projection };
+          errorMessage = null;
+        } catch (error) {
+          errorMessage = error instanceof Error ? error.message : String(error);
+        }
+        render();
+      },
+    }, errorMessage));
+    return;
+  }
   const display = getToolDisplay(card);
   if (card.tool === "open_approval_center") {
     renderApprovalCenterCard(card);
@@ -873,6 +1077,8 @@ export { AmbiguousMutationError } from "./server-tool-call.js";
 export const __workspaceAppTest = {
   ensureWorkSessionView,
   renderWorkSessionView,
+  sessionCategory,
+  renderNow,
   reduceWorkSessionEvent,
   workspaceEventTargetSessionId,
   boot,
@@ -888,4 +1094,6 @@ export const __workspaceAppTest = {
   surfaceNewDirectApprovalResolved: (workspaceId: string) => maybeRestoreAfterApprovalResolved(workspaceId),
   selectWorkSession,
   reconcileAuthoritativeApprovals,
+  loadHistoricalPendingReviews,
+  isHistoricalPendingReviewsLoading: () => historicalPendingReviewsLoading,
 };

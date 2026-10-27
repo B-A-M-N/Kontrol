@@ -9,13 +9,16 @@ import { approvalCenterId } from "./approval-center.js";
 import { noteSubmission, workSessionViews } from "./session-views.js";
 import { parsePolicyApprovalOptions } from "./review-feedback.js";
 import type { App } from "@modelcontextprotocol/ext-apps";
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import type { CallToolResult } from "@modelcontextprotocol/server";
+import { workSessionTerminalOutcome } from "../work-session-lifecycle.js";
 import { getStructuredContent } from "./server-tool-call.js";
 import type {
   AgentActivityEvent,
   ReviewSubmissionView,
   WorkSessionViewState,
 } from "./session-view-types.js";
+import { deliverPendingReviewMessages } from "./review-thread-delivery.js";
+import { createMcpAppsReviewHostAdapter } from "../review-thread/host-adapter.js";
 
 export interface ReducerHost {
   getApp(): App | null;
@@ -30,6 +33,18 @@ export interface ReducerHost {
 let host: ReducerHost;
 export function setReducerHost(next: ReducerHost): void {
   host = next;
+}
+
+export async function deliverQueuedReviewMessages(): Promise<void> {
+  const app = host.getApp();
+  // A missing capability means this host cannot be used as the delivery
+  // channel. Keep packets queued and make no claim that the reviewer saw them.
+  if (!app) return;
+  await deliverPendingReviewMessages({
+    adapter: createMcpAppsReviewHostAdapter(app),
+    callTool: host.callServerToolChecked,
+    onUncertain: (message) => { host.setErrorMessage(message); host.render(); },
+  });
 }
 
 export function workspaceEventTargetSessionId(event: AgentActivityEvent): string {
@@ -66,6 +81,7 @@ export function reduceWorkSessionEvent(sessionId: string, event: AgentActivityEv
     return;
   }
   view.updatedAt = event.createdAt;
+  const terminalOutcome = workSessionTerminalOutcome(event.type, "webui_approval_required");
 
   // Coalesce adjacent transcript fragments so a fast agent does not turn each
   // 250ms flush into a separate visible activity row.
@@ -185,16 +201,10 @@ export function reduceWorkSessionEvent(sessionId: string, event: AgentActivityEv
     view.status = "awaiting_resume";
   } else if (event.type === "worker.attempt.failed" || event.type === "worker.attempt.exited") {
     view.status = "awaiting_resume";
-  } else if (event.type === "agent.run.failed_protocol") {
-    view.status = "failed_protocol";
-  } else if (event.type === "agent.run.approved") {
-    view.status = "approved";
-  } else if (event.type === "agent.run.rejected") {
-    view.status = "rejected";
   } else if (event.type === "agent.run.cancellation_requested") {
     view.status = "cancelling";
-  } else if (event.type === "agent.run.failed" || event.type === "agent.run.cancelled") {
-    view.status = event.type === "agent.run.failed" ? "failed" : "cancelled";
+  } else if (terminalOutcome) {
+    view.status = terminalOutcome.status;
   } else if (event.type === "policy.approval_requested" || event.type === "approval.requested") {
     const approvalId = String(event.payload?.approvalId ?? "");
     if (approvalId) {
@@ -237,50 +247,50 @@ export function reduceWorkSessionEvent(sessionId: string, event: AgentActivityEv
         runId: typeof event.payload?.runId === "string" ? event.payload.runId : undefined,
         createdAt: typeof event.payload?.createdAt === "string" ? event.payload.createdAt : event.createdAt,
       });
-      view.unresolvedMessageCount = view.openMessages.size;
+      view.unresolvedMessageCount = [...view.openMessages.values()].filter((message) => message.status === "open").length;
     }
-  } else if (event.type === "review.route.configured") {
-    view.reviewLoop = {
-      routeId: String(event.payload?.routeId ?? ""),
-      status: String(event.payload?.status ?? ""),
-      mode: String(event.payload?.mode ?? ""),
-      maxReviewRounds: Number(event.payload?.maxReviewRounds ?? 0),
-      completedReviewRounds: Number(event.payload?.completedReviewRounds ?? 0),
-      revision: Number(event.payload?.revision ?? 0),
-    };
   } else if (event.type === "review.handoff.created") {
-    view.reviewLoop = {
-      ...view.reviewLoop,
-      handoffId: String(event.payload?.handoffId ?? ""),
-      handoffStatus: String(event.payload?.status ?? ""),
-      roundNumber: Number(event.payload?.roundNumber ?? 0),
-    };
-  } else if (event.type === "review.route.status_changed") {
-    view.reviewLoop = {
-      ...view.reviewLoop,
-      status: String(event.payload?.status ?? ""),
-      revision: Number(event.payload?.revision ?? 0),
-    };
-    const nextStatus = String(event.payload?.status ?? "");
-    view.notice = nextStatus === "paused"
-      ? { tone: "info", message: "Review loop paused. New automatic corrections are stopped." }
-      : nextStatus === "active"
-        ? { tone: "info", message: "Review loop resumed." }
-        : { tone: "warning", message: `Review loop ${nextStatus}.` };
-  } else if (event.type === "review.loop.limit_reached") {
-    view.notice = { tone: "warning", message: "Review round limit reached. Human review is required before further automatic rounds." };
-  } else if (event.type === "review.loop.correction_blocked") {
-    view.notice = { tone: "warning", message: "Automatic correction stopped: the review loop is paused or its round budget is exhausted." };
-  } else if (event.type === "agent.message.resolved" || event.type === "agent.message.reply_accepted") {
+    void deliverQueuedReviewMessages().catch((error) => {
+      host.setErrorMessage(`Could not deliver the review submission to this WebUI context: ${error instanceof Error ? error.message : String(error)}`);
+      host.render();
+    });
+  } else if (event.type === "review.thread.activated" || event.type === "review.thread.delivery_requeued") {
+    void deliverQueuedReviewMessages().catch((error) => {
+      host.setErrorMessage(`Could not deliver queued review submissions to this WebUI context: ${error instanceof Error ? error.message : String(error)}`);
+      host.render();
+    });
+  } else if (event.type === "agent.message.resolved") {
     const messageId = String(event.payload?.messageId ?? "");
     if (messageId) {
       view.openMessages.delete(messageId);
       host.messageMutationOutcomeUnknown.delete(messageId);
-      view.unresolvedMessageCount = view.openMessages.size;
-      if (event.type === "agent.message.reply_accepted") {
-        view.notice = { tone: "info", message: "Reply saved — awaiting agent acknowledgement." };
-      }
+      view.unresolvedMessageCount = [...view.openMessages.values()].filter((message) => message.status === "open").length;
     }
+  } else if (event.type === "agent.message.reply_accepted"
+    || event.type === "agent.message.reply_delivery_state"
+    || event.type === "agent.message.reply_acknowledged") {
+    const messageId = String(event.payload?.messageId ?? "");
+    const message = view.openMessages.get(messageId);
+    if (message) {
+      message.status = "resolved";
+      message.replyId = typeof event.payload?.replyId === "string" ? event.payload.replyId : message.replyId;
+      message.replyStatus = event.type === "agent.message.reply_acknowledged"
+        ? "acknowledged"
+        : typeof event.payload?.status === "string" ? event.payload.status : "pending_delivery";
+      message.replyBody = typeof event.payload?.replyBody === "string" ? event.payload.replyBody : message.replyBody;
+      message.replyDeliveryAttemptNumber = typeof event.payload?.deliveryAttemptNumber === "number"
+        ? event.payload.deliveryAttemptNumber
+        : message.replyDeliveryAttemptNumber;
+      message.replyDestinationAgentId = typeof event.payload?.destinationAgentId === "string"
+        ? event.payload.destinationAgentId
+        : message.replyDestinationAgentId;
+      message.replyDestinationAgentName = typeof event.payload?.destinationAgentName === "string"
+        ? event.payload.destinationAgentName
+        : message.replyDestinationAgentName;
+      host.messageMutationOutcomeUnknown.delete(messageId);
+      view.unresolvedMessageCount = [...view.openMessages.values()].filter((entry) => entry.status === "open").length;
+    }
+    if (event.type === "agent.message.reply_accepted") view.notice = { tone: "info", message: "Reply queued for delivery; worker acknowledgement is pending." };
   } else if (event.type === "session.handoff") {
     // Run identity and durable state are unchanged; only the agent handling the
     // next resume differs, so we just surface a notice.

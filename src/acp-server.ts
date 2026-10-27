@@ -36,6 +36,8 @@ export function createAcpServer(
   agentSecret?: string,
   reviewerSecret?: string,
   webhookPolicy?: WebhookPolicy,
+  database?: import("./db/client.js").DatabaseHandle,
+  scheduledJobs?: import("./scheduling/scheduled-job-store.js").ScheduledJobStore,
 ): Router {
   // continuationManager is accepted for signature compatibility; the ACP HTTP
   // surface itself never dispatches through it (native ACP continuations
@@ -55,6 +57,7 @@ export function createAcpServer(
       approvalRequests,
       agentSecret,
       reviewerSecret,
+      scheduledJobs,
     },
     webhookPolicy,
   );

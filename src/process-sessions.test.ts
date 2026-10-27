@@ -1,5 +1,15 @@
 import assert from "node:assert/strict";
+import { mkdirSync } from "node:fs";
 import { HeadTailBuffer, OutputLog, ProcessSessionManager } from "./process-sessions.js";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { openDatabase } from "./db/client.js";
+import { createAgentPtyBindingStore } from "./agent-pty-bindings.js";
+import { createWorkSessionManager } from "./work-sessions/index.js";
+import { createAgentRegistryManager } from "./acp-registry.js";
+import { createWorkspaceStore } from "./workspace-store.js";
+import { processSessionOwnerId } from "./mcp/connection-context.js";
 
 const smallBuffer = new HeadTailBuffer(100);
 smallBuffer.append("hello\n");
@@ -110,6 +120,139 @@ const background = await manager.start({
 assert.equal(background.running, true);
 assert.ok(background.sessionId);
 assert.equal(typeof background.sessionId, "string");
+
+// An authenticated owner can reattach through a fresh transport using the
+// bounded output-only capability returned by the original launch.
+const recoveryManager = new ProcessSessionManager({
+  maxRunningProcesses: 4,
+  maxRunningProcessesPerOwner: 4,
+  idleTimeoutMs: 10_000,
+  maxRuntimeMs: 10_000,
+  reaperIntervalMs: 25,
+});
+try {
+  const recoverable = await recoveryManager.start({
+    workspaceId: "workspace-recovery",
+    ownerId: "transport-A",
+    principalId: "principal-A",
+    cwd: process.cwd(),
+    command: `${node} -e "console.log('recovered output'); process.stdin.once('data', () => process.exit(0))"`,
+    yieldTimeMs: 30,
+  });
+  assert.equal(recoverable.running, true);
+  assert.ok(recoverable.sessionId);
+  assert.ok(recoverable.recoveryCapability);
+  assert.ok(recoverable.recoveryCapability.length >= 40);
+
+  let recoveredOutput = "";
+  const firstPollDeadline = Date.now() + 2_000;
+  while (Date.now() < firstPollDeadline && !/recovered output/.test(recoveredOutput)) {
+    const reattached = await recoveryManager.write({
+      workspaceId: "workspace-recovery",
+      sessionId: recoverable.sessionId!,
+      ownerId: "transport-B",
+      principalId: "principal-A",
+      recoveryCapability: recoverable.recoveryCapability,
+      afterCursor: 0,
+      yieldTimeMs: 20,
+    });
+    recoveredOutput = reattached.output;
+    if (!/recovered output/.test(recoveredOutput)) await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.match(recoveredOutput, /recovered output/,
+    "the same authenticated principal reads output after the transport owner changes");
+  await recoveryManager.terminateByOwner("transport-A");
+  assert.equal(recoveryManager.getMetrics().running, 1,
+    "transport teardown preserves a process while its output-recovery capability is live");
+  const reattachedAfterDisconnect = await recoveryManager.write({
+    workspaceId: "workspace-recovery",
+    sessionId: recoverable.sessionId!,
+    ownerId: "transport-B",
+    principalId: "principal-A",
+    recoveryCapability: recoverable.recoveryCapability,
+    afterCursor: 0,
+    yieldTimeMs: 1,
+  });
+  assert.match(reattachedAfterDisconnect.output, /recovered output/);
+
+  await assert.rejects(recoveryManager.write({
+    workspaceId: "workspace-recovery",
+    sessionId: recoverable.sessionId!,
+    principalId: "principal-B",
+    recoveryCapability: recoverable.recoveryCapability,
+    afterCursor: 0,
+    yieldTimeMs: 1,
+  }), /another principal/);
+  await assert.rejects(recoveryManager.write({
+    workspaceId: "workspace-other",
+    sessionId: recoverable.sessionId!,
+    principalId: "principal-A",
+    recoveryCapability: recoverable.recoveryCapability,
+    afterCursor: 0,
+    yieldTimeMs: 1,
+  }), /another workspace/);
+  await assert.rejects(recoveryManager.write({
+    workspaceId: "workspace-recovery",
+    sessionId: "proc_wrong_process",
+    principalId: "principal-A",
+    recoveryCapability: recoverable.recoveryCapability,
+    afterCursor: 0,
+    yieldTimeMs: 1,
+  }), /another process/);
+  await assert.rejects(recoveryManager.write({
+    workspaceId: "workspace-recovery",
+    sessionId: recoverable.sessionId!,
+    recoveryCapability: recoverable.recoveryCapability,
+    afterCursor: 0,
+    yieldTimeMs: 1,
+  }), /authenticated principal/);
+  await assert.rejects(recoveryManager.write({
+    workspaceId: "workspace-recovery",
+    sessionId: recoverable.sessionId!,
+    principalId: "principal-A",
+    recoveryCapability: recoverable.recoveryCapability,
+    chars: "must not reach stdin\n",
+    yieldTimeMs: 1,
+  }), /output polling only/);
+
+  const record = [...(recoveryManager as any).recoveryCapabilities.values()][0];
+  record.expiresAt = Date.now() - 1;
+  await assert.rejects(recoveryManager.write({
+    workspaceId: "workspace-recovery",
+    sessionId: recoverable.sessionId!,
+    principalId: "principal-A",
+    recoveryCapability: recoverable.recoveryCapability,
+    afterCursor: 0,
+    yieldTimeMs: 1,
+  }), /invalid, expired, or revoked/);
+
+  const revocable = await recoveryManager.start({
+    workspaceId: "workspace-recovery",
+    ownerId: "transport-A",
+    principalId: "principal-A",
+    cwd: process.cwd(),
+    command: `${node} -e "process.stdin.once('data', () => process.exit(0))"`,
+    yieldTimeMs: 5,
+  });
+  assert.ok(revocable.recoveryCapability);
+  assert.equal(recoveryManager.revokeRecoveryCapability(revocable.recoveryCapability!, "principal-A"), true);
+  await assert.rejects(recoveryManager.write({
+    workspaceId: "workspace-recovery",
+    sessionId: revocable.sessionId!,
+    ownerId: "transport-B",
+    principalId: "principal-A",
+    recoveryCapability: revocable.recoveryCapability,
+    afterCursor: 0,
+    yieldTimeMs: 1,
+  }), /invalid, expired, or revoked/);
+
+  await recoveryManager.terminateByOwner("transport-A");
+  assert.equal(recoveryManager.getMetrics().running, 0,
+    "expired and explicitly revoked capabilities no longer protect sessions from owner cleanup");
+  recoveryManager.terminate("workspace-recovery", revocable.sessionId!, "transport-A");
+} finally {
+  await recoveryManager.shutdown();
+}
 
 await assert.rejects(
   manager.write({
@@ -552,6 +695,167 @@ try {
     );
   } finally {
     await lifetimeManager.shutdown();
+  }
+}
+
+// ── Authenticated worker PTY identity survives restart as a fenced record ──
+{
+  assert.equal(processSessionOwnerId({ authenticatedRole: "worker", workSessionId: "pty-work" }), "work-session:pty-work");
+  assert.equal(processSessionOwnerId({ authenticatedRole: "reviewer", workSessionId: "pty-work", mcpSessionId: "reviewer-mcp" }), "reviewer-mcp",
+    "reviewer work-session visibility does not grant terminal input ownership");
+  const stateDir = await mkdtemp(join(tmpdir(), "kontrol-agent-pty-binding-"));
+  const db = openDatabase(stateDir);
+  const workspaces = createWorkspaceStore(db);
+  const workSessions = createWorkSessionManager(db);
+  const agents = createAgentRegistryManager(db);
+  try {
+    const workspace = workspaces.createSession({ id: "workspace-pty-binding", root: process.cwd() });
+    const workSession = workSessions.create({ workspaceSessionId: workspace.id, submittedBy: "pty-binding-test" });
+    const run = agents.createRun({
+      agentName: "pty-agent-fixture",
+      workspaceSessionId: workspace.id,
+      workSessionId: workSession.id,
+      status: "running",
+    });
+    const bindings = createAgentPtyBindingStore(db.sqlite);
+    const first = bindings.attach({
+      processSessionId: "proc_pty_fixture_1",
+      workspaceSessionId: workspace.id,
+      workSessionId: workSession.id,
+      runId: run.runId,
+      ownerPrincipalId: `worker-work-session:${workSession.id}`,
+      running: true,
+      outputCursor: 0,
+    });
+    assert.equal(first.agentName, "pty-agent-fixture");
+    assert.equal(first.status, "attached");
+    bindings.advanceOutputCursor(first.processSessionId, first.processGeneration + 1, 29);
+    assert.equal(bindings.getByProcessSession(first.processSessionId)?.outputCursor, 0,
+      "an output callback with the wrong generation cannot update a durable PTY binding");
+    bindings.advanceOutputCursor(first.processSessionId, first.processGeneration, 17);
+    bindings.advanceOutputCursor(first.processSessionId, first.processGeneration, 12);
+    assert.equal(bindings.getByProcessSession(first.processSessionId)?.outputCursor, 17,
+      "persisted output cursor never moves backwards");
+    assert.equal(bindings.markUnresolvedLost("2026-10-26T12:00:00.000Z"), 1,
+      "startup reconciliation does not infer that an old PTY is still running");
+    assert.equal(bindings.getByProcessSession(first.processSessionId)?.status, "lost");
+    assert.equal(bindings.getByProcessSession(first.processSessionId)?.finishedAt, undefined,
+      "lost ownership is not misreported as a confirmed process exit");
+
+    const second = bindings.attach({
+      processSessionId: "proc_pty_fixture_2",
+      workspaceSessionId: workspace.id,
+      workSessionId: workSession.id,
+      runId: run.runId,
+      ownerPrincipalId: `worker-work-session:${workSession.id}`,
+      running: true,
+      outputCursor: 0,
+    });
+    assert.equal(second.processGeneration, first.processGeneration + 1,
+      "a replacement PTY receives a new durable generation instead of inheriting the prior binding");
+    bindings.advanceOutputCursor(second.processSessionId, second.processGeneration - 1, 29);
+    assert.equal(bindings.getByProcessSession(second.processSessionId)?.outputCursor, 0,
+      "a stale prior-generation output callback cannot advance the replacement PTY cursor");
+    bindings.advanceOutputCursor(second.processSessionId, second.processGeneration, 7);
+    bindings.finish(second.processSessionId, second.processGeneration - 1, 29);
+    assert.equal(bindings.getByProcessSession(second.processSessionId)?.status, "attached",
+      "a stale prior-generation exit callback cannot finish the replacement PTY");
+    bindings.finish(second.processSessionId, second.processGeneration, 29);
+    assert.equal(bindings.getByProcessSession(second.processSessionId)?.status, "exited");
+    assert.equal(bindings.getByProcessSession(second.processSessionId)?.outputCursor, 29);
+
+    if (process.platform !== "win32") {
+      const ptyManager = new ProcessSessionManager({ agentPtyBindings: bindings, childEnvironmentAllowlist: [] });
+      try {
+        const launched = await ptyManager.start({
+          workspaceId: workspace.id,
+          ownerId: `work-session:${workSession.id}`,
+          workSessionId: workSession.id,
+          principalId: `worker-work-session:${workSession.id}`,
+          command: `${node} -e "process.stdout.write('pty-agent-output\\n'); setTimeout(() => process.exit(0), 500)"`,
+          cwd: process.cwd(),
+          tty: true,
+          yieldTimeMs: 50,
+          agentPtyBinding: {
+            workspaceSessionId: workspace.id,
+            runId: run.runId,
+            ownerPrincipalId: `worker-work-session:${workSession.id}`,
+          },
+        });
+        assert.ok(launched.sessionId, "interactive worker launch returns a process session");
+        let observation = ptyManager.observeAgentPty({ workSessionId: workSession.id, processSessionId: launched.sessionId! });
+        for (let index = 0; index < 20 && !(observation?.output ?? "").includes("pty-agent-output"); index += 1) {
+          await new Promise((resolve) => setTimeout(resolve, 25));
+          observation = ptyManager.observeAgentPty({ workSessionId: workSession.id, processSessionId: launched.sessionId! });
+        }
+        assert.equal(observation?.binding.agentName, "pty-agent-fixture");
+        assert.match(observation?.output ?? "", /pty-agent-output/,
+          "read-only reviewer observation sees PTY output without consuming its worker cursor");
+        const replayedObservation = ptyManager.observeAgentPty({
+          workSessionId: workSession.id,
+          processSessionId: launched.sessionId!,
+          afterCursor: 0,
+        });
+        assert.equal(replayedObservation?.output, observation?.output,
+          "repeating an observation at the same cursor is nondestructive");
+
+        const credentialPath = join(stateDir, "agent-pty-review-test", "credential.json");
+        mkdirSync(dirname(credentialPath), { recursive: true });
+        let credentialCleaned = false;
+        const credentialLaunch = await ptyManager.start({
+          workspaceId: workspace.id,
+          ownerId: `work-session:${workSession.id}`,
+          workSessionId: workSession.id,
+          principalId: `worker-work-session:${workSession.id}`,
+          command: `${node} -e "process.stdout.write(String(process.env.KONTROL_AGENT_PTY_CREDENTIAL_FILE) + '|' + String(process.env.KONTROL_AGENT_PTY_TOKEN))"`,
+          cwd: process.cwd(),
+          tty: true,
+          yieldTimeMs: 40,
+          agentPtyBinding: {
+            workspaceSessionId: workspace.id,
+            runId: run.runId,
+            ownerPrincipalId: `worker-work-session:${workSession.id}`,
+            createReviewCredential: (binding) => {
+              assert.ok(binding.id.startsWith("pty_"), "credential is created only after durable binding exists");
+              return { credentialFilePath: credentialPath, cleanup: () => { credentialCleaned = true; } };
+            },
+          },
+        });
+        let credentialObservation = ptyManager.observeAgentPty({
+          workSessionId: workSession.id,
+          processSessionId: credentialLaunch.sessionId!,
+        });
+        for (let index = 0; index < 20 && !credentialCleaned; index += 1) {
+          await new Promise((resolve) => setTimeout(resolve, 25));
+          credentialObservation = ptyManager.observeAgentPty({
+            workSessionId: workSession.id,
+            processSessionId: credentialLaunch.sessionId!,
+          });
+        }
+        assert.match(credentialObservation?.output ?? "", /agent-pty-review-test\/credential\.json\|undefined/,
+          "the PTY receives only the private credential file path, never a bearer token in its environment");
+        assert.equal(credentialCleaned, true, "the private credential is removed after the PTY exits");
+
+        await assert.rejects(ptyManager.write({
+          workspaceId: workspace.id,
+          sessionId: launched.sessionId!,
+          ownerId: "reviewer-mcp-session",
+          workSessionId: workSession.id,
+          principalId: "reviewer-principal",
+          chars: "unauthorized input\\n",
+          yieldTimeMs: 20,
+        }), /another|Unknown process session|does not belong/,
+        "a reviewer with observation access cannot send terminal input");
+      } finally {
+        await ptyManager.shutdown();
+      }
+    }
+  } finally {
+    agents.close();
+    workSessions.close?.();
+    workspaces.close?.();
+    db.close();
+    await rm(stateDir, { recursive: true, force: true });
   }
 }
 

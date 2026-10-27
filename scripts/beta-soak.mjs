@@ -8,9 +8,12 @@
 import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { validateBetaFaultMatrix } from "./beta-soak-contract.mjs";
 
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
+const execFileAsync = promisify(execFile);
 
 function option(name, fallback) {
   const index = process.argv.indexOf(name);
@@ -22,8 +25,15 @@ if (!Number.isFinite(hours) || hours <= 0) {
   throw new Error("Usage: beta-soak.mjs --hours HOURS [--url URL] [--interval-ms MS] [--report PATH] [--conversation ID] [--workspace-path PATH] [--build-id BUILD_ID] [--diagnostics-secret SECRET] [--tunnel-url URL] [--reviewer-secret SECRET] [--approval-cadence N]");
 }
 const baseUrl = String(option("--url", "http://127.0.0.1:7676")).replace(/\/$/, "");
+const targetUrl = new URL(baseUrl);
+const transportMode = String(option("--transport", targetUrl.protocol === "https:"
+  ? "public_https"
+  : (process.env.KONTROL_AUTH_MODE === "tunnel" && ["localhost", "127.0.0.1", "::1"].includes(targetUrl.hostname)
+    ? "secure_mcp_tunnel"
+    : "local_http")));
 const intervalMs = Math.max(250, Number(option("--interval-ms", "5000")));
 const resourceReadCadence = Number(option("--resource-read-cadence", String(Math.max(1, Math.floor(60 * 60_000 / intervalMs)))));
+const sseProbeCadence = Number(option("--sse-probe-cadence", String(resourceReadCadence)));
 const reportPath = resolve(String(option("--report", `${root}/beta-soak.json`)));
 const conversationId = String(option("--conversation", `beta-soak-${process.pid}`));
 const workspacePath = option("--workspace-path");
@@ -45,6 +55,18 @@ const reviewerSecret = option("--reviewer-secret", process.env.KONTROL_TUNNEL_RE
 const approvalCadence = Math.max(1, Number(option("--approval-cadence", "10")));
 if (!Number.isInteger(resourceReadCadence) || resourceReadCadence < 1) {
   throw new Error("--resource-read-cadence must be a positive integer");
+}
+if (!Number.isInteger(sseProbeCadence) || sseProbeCadence < 1) {
+  throw new Error("--sse-probe-cadence must be a positive integer");
+}
+if (!["public_https", "secure_mcp_tunnel", "local_http"].includes(transportMode)) {
+  throw new Error("--transport must be public_https, secure_mcp_tunnel, or local_http");
+}
+if (transportMode === "public_https" && (targetUrl.protocol !== "https:" || ["localhost", "127.0.0.1", "::1"].includes(targetUrl.hostname))) {
+  throw new Error("public_https transport requires a non-loopback HTTPS --url");
+}
+if (transportMode === "secure_mcp_tunnel" && (targetUrl.protocol !== "http:" || !["localhost", "127.0.0.1", "::1"].includes(targetUrl.hostname))) {
+  throw new Error("secure_mcp_tunnel transport requires a loopback HTTP --url; the tunnel's external hop is HTTPS");
 }
 
 function readSupervisedMissionLoopQualification() {
@@ -77,6 +99,15 @@ const report = {
   startedAt: new Date().toISOString(),
   requestedHours: hours,
   targetUrl: baseUrl,
+  transport: {
+    mode: transportMode,
+    mcpOriginProtocol: targetUrl.protocol.slice(0, -1),
+    httpsBoundary: transportMode === "public_https" ? "public_mcp_origin" : transportMode === "secure_mcp_tunnel" ? "openai_secure_mcp_tunnel" : undefined,
+    tunnelProfile: transportMode === "secure_mcp_tunnel" ? (process.env.KONTROL_TUNNEL_PROFILE ?? "sample_mcp_with_dcr") : undefined,
+    tunnelId: transportMode === "secure_mcp_tunnel" ? process.env.KONTROL_TUNNEL_ID : undefined,
+    tunnelStatusSource: undefined,
+    tunnelProbeStatus: undefined,
+  },
   intervalMs,
   conversationId,
   expectedBuildId,
@@ -103,7 +134,14 @@ const report = {
     diagnosticsRequired: !skipDiagnostics,
     tunnelRequired: !skipTunnel,
     tunnelUrl: skipTunnel ? undefined : tunnelUrl,
+    sseProbeRequired: true,
+    sseProbeCadence,
+    sseProbeUrl: baseUrl,
+    sseProbePath: transportMode === "secure_mcp_tunnel" ? "local_mcp_origin; remote_https_is_openai_managed" : "selected_mcp_origin",
   },
+  sseProbeRuns: 0,
+  sseProbeFailures: 0,
+  sseLastEvidence: undefined,
   snapshots: { started: undefined, finished: undefined },
   assertions: {},
   lastError: undefined,
@@ -333,10 +371,114 @@ async function checkTunnel() {
   try {
     await requestAt(tunnelUrl, "/healthz");
     await requestAt(tunnelUrl, "/readyz");
+    if (transportMode === "secure_mcp_tunnel") {
+      const statusResponse = await fetch(`${tunnelUrl}/api/status`, { signal: AbortSignal.timeout(5_000) });
+      if (statusResponse.ok) {
+        const status = await statusResponse.json();
+        const tunnelId = status?.control_plane_tunnel_id ?? status?.tunnel_id ?? status?.tunnel?.id;
+        const probeStatus = status?.probe_status ?? status?.main?.probe_status ?? status?.channels?.main?.probe_status;
+        if (typeof tunnelId !== "string" || !tunnelId.startsWith("tunnel_")) {
+          throw new Error("tunnel-client /api/status did not report a stable tunnel ID");
+        }
+        if (process.env.KONTROL_TUNNEL_ID && process.env.KONTROL_TUNNEL_ID !== tunnelId) {
+          throw new Error("tunnel-client /api/status tunnel ID differs from KONTROL_TUNNEL_ID");
+        }
+        if (probeStatus && probeStatus !== "ok") {
+          throw new Error(`tunnel-client MCP probe is ${String(probeStatus)}`);
+        }
+        if (report.transport.tunnelId && report.transport.tunnelId !== tunnelId) {
+          throw new Error("Secure MCP Tunnel ID changed during the soak");
+        }
+        report.transport.tunnelId = tunnelId;
+        report.transport.tunnelStatusSource = "tunnel_client_api_status";
+        report.transport.tunnelProbeStatus = probeStatus ?? "readyz_only";
+      } else if (statusResponse.status === 404 && process.env.KONTROL_TUNNEL_ID?.startsWith("tunnel_")) {
+        report.transport.tunnelStatusSource = "configured_tunnel_id";
+      } else if (statusResponse.status === 404) {
+        throw new Error("Secure MCP Tunnel qualification requires KONTROL_TUNNEL_ID when tunnel-client /api/status is unavailable");
+      } else {
+        throw new Error(`tunnel-client /api/status returned HTTP ${statusResponse.status}`);
+      }
+    }
   } catch (error) {
     report.tunnelFailures++;
     report.tunnelLastError = error instanceof Error ? error.message : String(error);
     throw error;
+  }
+}
+
+// Periodically run the same dual-session streaming probe used by release
+// qualification. The probe verifies real GET and POST SSE bytes, then checks
+// the terminal response and server-side heartbeat accounting. Under Secure
+// MCP Tunnel this call targets Kontrol's private loopback origin; HTTPS is
+// supplied by tunnel-client on its outbound OpenAI connection and is reported
+// separately from the local HTTP hop.
+async function checkSseStreaming() {
+  const probePath = join(root, "scripts", "probe-mcp-tunnel.mjs");
+  const workspace = workspacePath ?? root;
+  const heartbeatInterval = Number(process.env.KONTROL_MCP_SSE_HEARTBEAT_MS ?? "15000");
+  const args = [
+    probePath,
+    "--url", baseUrl,
+    "--workspace", workspace,
+    "--dual",
+    "--cycles", "1",
+    "--tool-name", "read",
+    "--read-path", readPath,
+    "--watcher-timeout-ms", "18000",
+    "--heartbeat-interval-ms", String(heartbeatInterval),
+    "--heartbeat-count", "2",
+    "--resource-load-reads", "2",
+    "--post-heartbeat-ms", "45000",
+  ];
+  const childEnv = {
+    PATH: process.env.PATH ?? "/usr/bin:/bin",
+    HOME: process.env.HOME ?? root,
+    TMPDIR: process.env.TMPDIR ?? "/tmp",
+    ...(diagnosticsSecret ? { KONTROL_DIAGNOSTICS_SECRET: diagnosticsSecret } : {}),
+    ...(process.env.KONTROL_MCP_CANARY_AUTHORIZATION
+      ? { KONTROL_MCP_CANARY_AUTHORIZATION: process.env.KONTROL_MCP_CANARY_AUTHORIZATION }
+      : {}),
+    ...((process.env.KONTROL_MCP_TUNNEL_REVIEWER
+      || process.env.KONTROL_TUNNEL_REVIEWER_SECRET
+      || process.env.KONTROL_ACP_REVIEWER_SECRET)
+      ? {
+        KONTROL_MCP_TUNNEL_REVIEWER: process.env.KONTROL_MCP_TUNNEL_REVIEWER
+          || process.env.KONTROL_TUNNEL_REVIEWER_SECRET
+          || process.env.KONTROL_ACP_REVIEWER_SECRET,
+      }
+      : {}),
+    ...(process.env.KONTROL_MCP_SSE_HEARTBEAT_MS
+      ? { KONTROL_MCP_SSE_HEARTBEAT_MS: process.env.KONTROL_MCP_SSE_HEARTBEAT_MS }
+      : {}),
+  };
+  report.sseProbeRuns++;
+  persist();
+  try {
+    const { stdout } = await execFileAsync(process.execPath, args, {
+      cwd: root,
+      env: childEnv,
+      timeout: Math.max(120_000, heartbeatInterval * 6 + 30_000),
+      maxBuffer: 2 * 1024 * 1024,
+    });
+    const evidence = JSON.parse(stdout.trim().split(/\r?\n/).at(-1));
+    if (evidence?.ok !== true || evidence?.dualSession !== true || !evidence?.postHeartbeat) {
+      throw new Error("streaming probe returned incomplete GET/POST SSE evidence");
+    }
+    report.sseLastEvidence = {
+      observedAt: new Date().toISOString(),
+      url: baseUrl,
+      transportMode,
+      heartbeatBytesObserved: evidence.heartbeatBytesObserved,
+      drainRecoveryEvents: evidence.drainRecoveryEvents,
+      resourceLoadReads: evidence.resourceLoadReads,
+      boundedInspectionCalls: evidence.boundedInspectionCalls,
+      postHeartbeat: evidence.postHeartbeat,
+    };
+  } catch (error) {
+    report.sseProbeFailures++;
+    report.sseLastError = error instanceof Error ? error.message : String(error);
+    throw new Error(`SSE streaming probe failed: ${report.sseLastError}`);
   }
 }
 
@@ -356,13 +498,15 @@ async function checkTunnel() {
 // provided; otherwise the exercise degrades to the identity assertion (3/4)
 // which needs no durable filesystem state.
 async function exerciseConversationContinuity() {
-  const markerName = `.kontrol-soak-continuity-${report.iterations}.txt`;
+  const markerName = `.kontrol-soak-continuity-${process.pid}-${Date.now()}-${report.iterations}.txt`;
   const markerText = `continuity-${process.pid}-${report.iterations}`;
 
   // 1. Conversation A: durable write.
   let sessionIdA;
   let written = false;
   let workspaceId;
+  let approvalResumeId;
+  let reviewerSessionId;
   try {
     const initA = await rpc("initialize", {
       protocolVersion: "2025-06-18",
@@ -379,14 +523,65 @@ async function exerciseConversationContinuity() {
       }, sessionIdA);
       workspaceId = opened.payload?.result?.structuredContent?.workspaceId;
       if (!workspaceId) throw new Error("continuity open_workspace returned no workspaceId");
-      await rpc("tools/call", {
+      // Read the configured workspace file first so any applicable AGENTS.md
+      // instructions are delivered and acknowledged in this transport before
+      // the mutation attempt.
+      const instructionRead = await rpc("tools/call", {
+        name: "read",
+        arguments: { workspaceId, path: readPath },
+      }, sessionIdA);
+      if (instructionRead.payload?.result?.isError === true) {
+        throw new Error("continuity could not read the configured workspace instructions");
+      }
+
+      const writeAttempt = await rpc("tools/call", {
         name: "write",
         arguments: { workspaceId, path: markerName, content: `${markerText}\n` },
       }, sessionIdA);
-      written = true;
+      const writeResult = writeAttempt.payload?.result;
+      const writeCard = writeResult?.structuredContent;
+      if (writeResult?.isError === true || writeCard?.status === "instructions_required") {
+        throw new Error(`continuity marker write failed: ${JSON.stringify(writeCard ?? writeResult)}`);
+      }
+      if (writeCard?.status === "approval_required") {
+        approvalResumeId = writeCard.approvalId;
+        if (typeof approvalResumeId !== "string" || approvalResumeId.length === 0) {
+          throw new Error("continuity marker write requires approval but returned no approvalId");
+        }
+
+        // A human reviewer decision is required by the active workspace
+        // policy. The configured reviewer credential is the qualification
+        // harness's reviewer authority, matching exerciseApprovalResume().
+        const reviewerInit = await rpc("initialize", {
+          protocolVersion: "2025-06-18",
+          capabilities: {},
+          clientInfo: { name: "kontrol-beta-soak-continuity-reviewer", version: "1" },
+        }, undefined, { reviewer: true, headerless: true });
+        reviewerSessionId = reviewerInit.sessionId;
+        if (!reviewerSessionId) throw new Error("continuity reviewer initialize did not return mcp-session-id");
+        await rpc("notifications/initialized", {}, reviewerSessionId, { reviewer: true, headerless: true });
+        const listing = await rpc("tools/call", {
+          name: "list_pending_approvals",
+          arguments: { workspaceId },
+        }, reviewerSessionId, { reviewer: true, headerless: true });
+        const approvals = listing.payload?.result?.structuredContent?.approvals ?? [];
+        if (!approvals.some((entry) => entry.approvalId === approvalResumeId)) {
+          throw new Error(`continuity approval ${approvalResumeId} is missing from the reviewer listing`);
+        }
+        const decision = await rpc("tools/call", {
+          name: "provide_policy_approval",
+          arguments: { approvalId: approvalResumeId, decision: "approve", reason: "kontrol-beta-soak conversation continuity" },
+        }, reviewerSessionId, { reviewer: true, headerless: true });
+        if (decision.payload?.result?.isError === true) {
+          throw new Error(`continuity approval failed: ${JSON.stringify(decision.payload.result)}`);
+        }
+      } else {
+        written = true;
+      }
     }
   } finally {
     try { await closeSession(sessionIdA); } catch { /* transport replacement is the point */ }
+    try { await closeSession(reviewerSessionId); } catch { /* reviewer cleanup */ }
   }
 
   // 2/3. Fresh transport, same conversation: durable state must be visible.
@@ -399,13 +594,38 @@ async function exerciseConversationContinuity() {
   if (!sessionIdA2) throw new Error("continuity reconnect initialize did not return mcp-session-id");
   try {
     await rpc("notifications/initialized", {}, sessionIdA2);
-    if (written) {
+    if (workspacePath) {
       const reopened = await rpc("tools/call", {
         name: "open_workspace",
         arguments: { path: workspacePath, mode: "checkout" },
       }, sessionIdA2);
       const reopenedId = reopened.payload?.result?.structuredContent?.workspaceId;
       if (!reopenedId) throw new Error("continuity reconnect open_workspace returned no workspaceId");
+      const instructionRead = await rpc("tools/call", {
+        name: "read",
+        arguments: { workspaceId: reopenedId, path: readPath },
+      }, sessionIdA2);
+      if (instructionRead.payload?.result?.isError === true) {
+        throw new Error("continuity reconnect could not read the configured workspace instructions");
+      }
+      if (approvalResumeId) {
+        const retry = await rpc("tools/call", {
+          name: "write",
+          arguments: {
+            workspaceId: reopenedId,
+            path: markerName,
+            content: `${markerText}\n`,
+            approvalResumeId,
+          },
+        }, sessionIdA2);
+        const retryResult = retry.payload?.result;
+        const retryCard = retryResult?.structuredContent;
+        if (retryResult?.isError === true || retryCard?.status === "approval_required" || retryCard?.status === "instructions_required") {
+          throw new Error(`continuity marker retry failed: ${JSON.stringify(retryCard ?? retryResult)}`);
+        }
+        written = true;
+      }
+      if (!written) throw new Error("continuity marker write was not completed before reconnect");
       const readBack = await rpc("tools/call", {
         name: "read",
         arguments: { workspaceId: reopenedId, path: markerName },
@@ -468,6 +688,13 @@ async function exerciseConversationContinuity() {
         if (String(error?.message ?? "").includes("conversation isolation broken")) throw error;
         // Foreign-side setup failures (e.g. no capacity) are not continuity
         // failures; the ownership assertion above already ran.
+      }
+    }
+    if (workspacePath) {
+      try {
+        rmSync(join(workspacePath, markerName), { force: true });
+      } catch (error) {
+        throw new Error(`continuity marker cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
   }
@@ -603,6 +830,7 @@ async function iteration() {
     await request("/core-readyz");
     await request("/readyz");
     await checkTunnel();
+    if (report.iterations % sseProbeCadence === 0) await checkSseStreaming();
     const initialized = await rpc("initialize", {
       protocolVersion: "2025-06-18",
       capabilities: {},
@@ -711,7 +939,7 @@ if (!skipDiagnostics) {
   }
 }
 persist();
-console.log(`[beta-soak] running for ${hours}h against ${baseUrl}; report=${reportPath}`);
+console.log(`[beta-soak] running for ${hours}h against ${baseUrl} (transport=${transportMode}, SSE probe every ${sseProbeCadence} iterations); report=${reportPath}`);
 while (!stopping && Date.now() < deadline) {
   await iteration();
   if (!stopping && Date.now() < deadline) {
@@ -743,7 +971,10 @@ if (startedSnapshot && finishedSnapshot) {
     noLivePolicyWaiters: finishedSnapshot.sessions.activePolicyWaiters === 0,
     noLeakedProcessSessions: (finishedSnapshot.processSessions?.running ?? 0) === 0,
     diagnosticsContract: finishedSnapshot.diagnosticsContract === true,
-    tunnelEndpointsHealthy: report.tunnelFailures === 0 && report.tunnelChecks > 0,
+    tunnelEndpointsHealthy: report.tunnelFailures === 0
+      && report.tunnelChecks > 0
+      && report.sseProbeRuns > 0
+      && report.sseProbeFailures === 0,
     databaseIntegrityHealthy: finishedSnapshot.databaseIntegrity?.ok === true
       && finishedSnapshot.databaseIntegrity?.status === "healthy"
       && finishedSnapshot.databaseIntegrity?.timedOut !== true,

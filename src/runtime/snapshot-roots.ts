@@ -24,7 +24,7 @@ export interface DurableSnapshotRoot {
   terminalAt?: string;
 }
 
-export type DurableRootCollector = () => DurableSnapshotRoot[];
+export type DurableRootCollector = () => Iterable<DurableSnapshotRoot>;
 
 /**
  * Enumerate every filesystem snapshot ref the database still references, with
@@ -35,8 +35,18 @@ export type DurableRootCollector = () => DurableSnapshotRoot[];
  * no database yet, and there are then zero DB roots to protect.
  */
 export function collectDurableSnapshotRoots(db: DatabaseHandle | undefined): DurableSnapshotRoot[] {
-  if (!db) return [];
   const roots: DurableSnapshotRoot[] = [];
+  for (const root of iterateDurableSnapshotRoots(db)) roots.push(root);
+  return roots;
+}
+
+/**
+ * Stream every database-held filesystem snapshot reference. GC consumes this
+ * directly so SQLite's `.all()` result and a second root array are never held
+ * at the same time. Query failures still propagate during iteration.
+ */
+export function* iterateDurableSnapshotRoots(db: DatabaseHandle | undefined): Generator<DurableSnapshotRoot> {
+  if (!db) return;
   // work_session_submissions, terminal by owning work_session.status, aged
   // from work_sessions.terminal_at.
   const submissions = db.sqlite.prepare(
@@ -44,27 +54,26 @@ export function collectDurableSnapshotRoots(db: DatabaseHandle | undefined): Dur
     + " from work_session_submissions wss"
     + " left join work_sessions ws on ws.id = wss.work_session_id"
     + " where wss.snapshot_kind = 'filesystem' and wss.snapshot_ref is not null",
-  ).all() as Array<{ ref?: string; status?: string; terminal_at?: string | null }>;
+  ).iterate() as Iterable<{ ref?: string; status?: string; terminal_at?: string | null }>;
   for (const row of submissions) {
     if (row.ref) {
-      roots.push({
+      yield {
         ref: row.ref,
         terminal: row.status ? terminalWorkSessionStatuses.has(row.status) : undefined,
         ...(row.terminal_at ? { terminalAt: row.terminal_at } : {}),
-      });
+      };
     }
   }
   // mission_evidence, mission_completion_reports: always strong pins.
   for (const table of ["mission_evidence", "mission_completion_reports"]) {
     const rows = db.sqlite.prepare(
       `select snapshot_ref as ref from ${table} where snapshot_kind = 'filesystem' and snapshot_ref is not null`,
-    ).all() as Array<{ ref?: string }>;
-    for (const row of rows) if (row.ref) roots.push({ ref: row.ref });
+    ).iterate() as Iterable<{ ref?: string }>;
+    for (const row of rows) if (row.ref) yield { ref: row.ref };
   }
   // supervisor_runs.last_snapshot_ref.
   const runs = db.sqlite.prepare(
     "select last_snapshot_ref as ref from supervisor_runs where last_snapshot_kind = 'filesystem' and last_snapshot_ref is not null",
-  ).all() as Array<{ ref?: string }>;
-  for (const row of runs) if (row.ref) roots.push({ ref: row.ref });
-  return roots;
+  ).iterate() as Iterable<{ ref?: string }>;
+  for (const row of runs) if (row.ref) yield { ref: row.ref };
 }

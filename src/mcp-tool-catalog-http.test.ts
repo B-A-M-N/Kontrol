@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -16,28 +17,41 @@ const stateDir = mkdtempSync(join(tmpdir(), "kontrol-catalog-ack-state-"));
 const configDir = mkdtempSync(join(tmpdir(), "kontrol-catalog-ack-config-"));
 const worktreeRoot = mkdtempSync(join(tmpdir(), "kontrol-catalog-ack-worktrees-"));
 mkdirSync(workspaceRoot, { recursive: true });
+mkdirSync(join(workspaceRoot, "src"), { recursive: true });
+mkdirSync(join(workspaceRoot, "scripts"), { recursive: true });
 writeFileSync(join(workspaceRoot, "README.md"), "catalog ack test\n");
+writeFileSync(join(workspaceRoot, "package.json"), "{}\n");
+writeFileSync(join(workspaceRoot, "AGENTS.md"), "# Test workspace\n");
+writeFileSync(join(workspaceRoot, "src", "index.ts"), "export {};\n");
 const diagnosticsSecret = "catalog-ack-test-diagnostics-secret";
-const config = loadConfig({
+const tunnelReviewerSecret = "catalog-ack-test-tunnel-reviewer-secret-32chars";
+writeFileSync(join(configDir, "tunnel-reviewer.secret"), tunnelReviewerSecret, { mode: 0o600 });
+let config = loadConfig({
   KONTROL_CONFIG_DIR: configDir,
   KONTROL_ALLOWED_ROOTS: workspaceRoot,
   KONTROL_STATE_DIR: stateDir,
   KONTROL_WORKTREE_ROOT: worktreeRoot,
   KONTROL_AUTH_MODE: "tunnel",
-  KONTROL_ACP_ENABLED: "false",
+  KONTROL_ACP_ENABLED: "true",
+  KONTROL_ACP_AGENT_SECRET: "catalog-ack-test-agent-secret-32chars",
+  KONTROL_ACP_REVIEWER_SECRET: "catalog-ack-test-reviewer-secret-32chars",
+  KONTROL_ACP_ADAPTER_SECRET: "catalog-ack-test-adapter-secret-32chars",
+  KONTROL_TUNNEL_REVIEWER_SECRET: tunnelReviewerSecret,
   KONTROL_POLICY_MODE: "allow",
   KONTROL_TOOL_MODE: "full",
   KONTROL_LOG_LEVEL: "error",
   KONTROL_DIAGNOSTICS_SECRET: diagnosticsSecret,
+  KONTROL_BUILD_ID: "catalog-ack-build-test",
+  KONTROL_MCP_SSE_HEARTBEAT_MS: "1000",
   KONTROL_MCP_REQUIRE_TOOL_CATALOG_ACK: "1",
 });
 
-const running = createServer(config);
-const httpServer = running.app.listen(0, "127.0.0.1");
+let running = createServer(config);
+let httpServer = running.app.listen(0, "127.0.0.1");
 await new Promise<void>((resolve) => httpServer.once("listening", resolve));
-const address = httpServer.address();
+let address = httpServer.address();
 assert.ok(address && typeof address === "object");
-const url = `http://127.0.0.1:${address.port}/mcp`;
+let url = `http://127.0.0.1:${address.port}/mcp`;
 let nextId = 0;
 
 async function rpc(method: string, params: Record<string, unknown>, sessionId?: string): Promise<{ response: Response; payload?: any; sessionId?: string }> {
@@ -46,6 +60,7 @@ async function rpc(method: string, params: Record<string, unknown>, sessionId?: 
     headers: {
       "content-type": "application/json",
       accept: "application/json, text/event-stream",
+      "x-kontrol-tunnel-reviewer": tunnelReviewerSecret,
       ...(sessionId ? { "mcp-session-id": sessionId } : {}),
     },
     body: JSON.stringify({ jsonrpc: "2.0", id: ++nextId, method, params }),
@@ -67,12 +82,157 @@ async function notification(method: string, params: Record<string, unknown>, ses
       "content-type": "application/json",
       accept: "application/json, text/event-stream",
       "mcp-session-id": sessionId,
+      "x-kontrol-tunnel-reviewer": tunnelReviewerSecret,
     },
     body: JSON.stringify({ jsonrpc: "2.0", method, params }),
   });
 }
 
+const modernEnvelope = {
+  "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+  "io.modelcontextprotocol/clientInfo": { name: "catalog-ack-modern-http-test", version: "1.0.0" },
+  "io.modelcontextprotocol/clientCapabilities": {
+    extensions: { [TOOL_CATALOG_ACK_CAPABILITY]: { contractVersion: 1 } },
+  },
+};
+
+async function modernRpc(method: string, params: Record<string, unknown>, id: number): Promise<{ response: Response; payload: any }> {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      accept: "application/json",
+      "mcp-protocol-version": "2026-07-28",
+      "mcp-method": method,
+      ...(typeof params.name === "string" ? { "mcp-name": params.name } : {}),
+      "x-kontrol-tunnel-reviewer": tunnelReviewerSecret,
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id,
+      method,
+      params: { ...params, _meta: modernEnvelope },
+    }),
+  });
+  return { response, payload: response.headers.get("content-type")?.includes("json") ? await response.json() : undefined };
+}
+
+async function modernNotification(method: string, params: Record<string, unknown>): Promise<Response> {
+  return fetch(url, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      accept: "application/json",
+      "mcp-protocol-version": "2026-07-28",
+      "mcp-method": method,
+      "x-kontrol-tunnel-reviewer": tunnelReviewerSecret,
+    },
+    body: JSON.stringify({ jsonrpc: "2.0", method, params: { ...params, _meta: modernEnvelope } }),
+  });
+}
+
+const sseReaderBuffers = new WeakMap<ReadableStreamDefaultReader<Uint8Array>, string>();
+async function readSseMessage(reader: ReadableStreamDefaultReader<Uint8Array>, abort: AbortController, expected: string): Promise<any> {
+  let buffered = sseReaderBuffers.get(reader) ?? "";
+  const decoder = new TextDecoder();
+  while (true) {
+    const separator = buffered.search(/\r?\n\r?\n/);
+    if (separator >= 0) {
+      const frame = buffered.slice(0, separator);
+      buffered = buffered.slice(separator).replace(/^\r?\n\r?\n/, "");
+      sseReaderBuffers.set(reader, buffered);
+      const data = frame.split(/\r?\n/).filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trim()).join("\n");
+      if (data) return JSON.parse(data);
+      continue;
+    }
+    const timer = setTimeout(() => abort.abort(new Error(`timed out waiting for modern subscription event: ${expected}`)), 5_000);
+    let chunk: ReadableStreamReadResult<Uint8Array>;
+    try {
+      chunk = await reader.read();
+    } finally {
+      clearTimeout(timer);
+    }
+    if (chunk.done) throw new Error("modern subscription stream ended before the expected event");
+    buffered += decoder.decode(chunk.value, { stream: true });
+  }
+}
+
 try {
+  const modernDiscovery = await modernRpc("server/discover", {}, ++nextId);
+  assert.equal(modernDiscovery.response.status, 200, JSON.stringify(modernDiscovery.payload));
+  assert.ok(modernDiscovery.payload?.result?.supportedVersions?.includes("2026-07-28"),
+    "server/discover advertises the negotiated modern protocol revision");
+  assert.equal(modernDiscovery.payload?.result?.capabilities?.tools?.listChanged, true,
+    "modern server discovery declares tool list change notifications");
+  assert.equal(modernDiscovery.payload?.result?.capabilities?.resources?.listChanged, true,
+    "modern server discovery declares resource list change notifications");
+
+  const modernList = await modernRpc("tools/list", {}, ++nextId);
+  assert.equal(modernList.response.status, 200, JSON.stringify(modernList.payload));
+  const modernFingerprint = fingerprintToolCatalog(modernList.payload?.result);
+  assert.ok(modernFingerprint, "2026 tools/list catalog must be fingerprintable");
+  const modernServerVersion = modernList.payload?.result?._meta?.["io.modelcontextprotocol/serverInfo"]?.version;
+  assert.equal(typeof modernServerVersion, "string", "2026 responses expose immutable server identity");
+
+  const modernBeforeAck = await modernRpc("tools/call", {
+    name: "open_workspace",
+    arguments: { path: workspaceRoot, mode: "checkout" },
+  }, ++nextId);
+  assert.equal(modernBeforeAck.payload?.error?.code, -32012,
+    "strict mode rejects modern tool calls until the exact catalog is acknowledged");
+  const modernAck = await modernNotification(TOOL_CATALOG_ACK_METHOD, {
+    contractVersion: 1,
+    serverVersion: modernServerVersion,
+    hostCatalogSha256: modernFingerprint.sha256,
+    hostToolCount: modernFingerprint.toolCount,
+  });
+  assert.ok([200, 202].includes(modernAck.status), `modern catalog acknowledgement returned HTTP ${modernAck.status}`);
+  const modernAfterAck = await modernRpc("tools/call", {
+    name: "open_workspace",
+    arguments: { path: workspaceRoot, mode: "checkout" },
+  }, ++nextId);
+  assert.equal(modernAfterAck.response.status, 200, JSON.stringify(modernAfterAck.payload));
+  assert.notEqual(modernAfterAck.payload?.error?.code, -32012,
+    "modern catalog acknowledgement survives the next stateless HTTP request");
+
+  const modernListenAbort = new AbortController();
+  const modernListenResponse = await fetch(url, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      accept: "text/event-stream",
+      "mcp-protocol-version": "2026-07-28",
+      "mcp-method": "subscriptions/listen",
+      "x-kontrol-tunnel-reviewer": tunnelReviewerSecret,
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: "catalog-listen",
+      method: "subscriptions/listen",
+      params: {
+        notifications: { toolsListChanged: true, resourcesListChanged: true },
+        _meta: modernEnvelope,
+      },
+    }),
+    signal: modernListenAbort.signal,
+  });
+  assert.equal(modernListenResponse.status, 200, `modern subscriptions/listen returned HTTP ${modernListenResponse.status}`);
+  assert.match(modernListenResponse.headers.get("content-type") ?? "", /text\/event-stream/i,
+    "modern subscriptions/listen returns a long-lived SSE response");
+  assert.ok(modernListenResponse.body, "modern subscriptions/listen exposes its response stream");
+  const modernListenReader = modernListenResponse.body.getReader();
+  try {
+    const acknowledged = await readSseMessage(modernListenReader, modernListenAbort, "acknowledgement");
+    assert.equal(acknowledged.method, "notifications/subscriptions/acknowledged",
+      "modern subscription is acknowledged before any change event");
+    assert.deepEqual(acknowledged.params.notifications, { toolsListChanged: true, resourcesListChanged: true });
+    assert.equal(acknowledged.params._meta?.["io.modelcontextprotocol/subscriptionId"], "catalog-listen",
+      "acknowledgement is correlated to this listen request");
+  } catch (error) {
+    modernListenAbort.abort(error);
+    throw error;
+  }
+
   const initialized = await rpc("initialize", {
     protocolVersion: "2025-06-18",
     capabilities: { extensions: { [TOOL_CATALOG_ACK_CAPABILITY]: { contractVersion: 1 } } },
@@ -82,6 +242,21 @@ try {
   const sessionId = initialized.sessionId;
   assert.ok(sessionId, "initialize must return the MCP session ID");
   await notification("notifications/initialized", {}, sessionId);
+  try {
+    const modernRefresh = await readSseMessage(modernListenReader, modernListenAbort, "tool catalog refresh");
+    assert.equal(modernRefresh.method, "notifications/tools/list_changed",
+      "a real catalog refresh reaches the active modern subscription stream");
+    assert.equal(modernRefresh.params?._meta?.["io.modelcontextprotocol/subscriptionId"], "catalog-listen",
+      "modern catalog notifications carry the owning subscription ID");
+    const modernResourceRefresh = await readSseMessage(modernListenReader, modernListenAbort, "resource catalog refresh");
+    assert.equal(modernResourceRefresh.method, "notifications/resources/list_changed",
+      "resource catalog refreshes also reach the active modern subscription stream");
+    assert.equal(modernResourceRefresh.params?._meta?.["io.modelcontextprotocol/subscriptionId"], "catalog-listen",
+      "resource notifications carry the owning subscription ID");
+  } finally {
+    modernListenAbort.abort();
+    await modernListenReader.cancel().catch(() => undefined);
+  }
 
   const beforeAck = await rpc("tools/call", {
     name: "open_workspace",
@@ -99,10 +274,36 @@ try {
   const ackResponse = await notification(TOOL_CATALOG_ACK_METHOD, {
     contractVersion: 1,
     serverVersion,
+    captureId: "catalog-ack-capture-test",
     hostCatalogSha256: fingerprint.sha256,
     hostToolCount: fingerprint.toolCount,
   }, sessionId);
   assert.ok([200, 202].includes(ackResponse.status), `ack notification returned HTTP ${ackResponse.status}`);
+
+  const unsupportedClient = await rpc("initialize", {
+    protocolVersion: "2025-06-18",
+    capabilities: {},
+    clientInfo: { name: "catalog-ack-http-unsupported-client", version: "1.0.0" },
+  });
+  assert.equal(unsupportedClient.response.status, 200, JSON.stringify(unsupportedClient.payload));
+  const unsupportedSessionId = unsupportedClient.sessionId;
+  assert.ok(unsupportedSessionId, "fresh initialization must return a session ID");
+  await notification("notifications/initialized", {}, unsupportedSessionId);
+  const unsupportedListed = await rpc("tools/list", {}, unsupportedSessionId);
+  const unsupportedFingerprint = fingerprintToolCatalog(unsupportedListed.payload?.result);
+  assert.ok(unsupportedFingerprint, "fresh transport catalog must be fingerprintable");
+  await notification(TOOL_CATALOG_ACK_METHOD, {
+    contractVersion: 1,
+    serverVersion: unsupportedClient.payload?.result?.serverInfo?.version,
+    hostCatalogSha256: unsupportedFingerprint.sha256,
+    hostToolCount: unsupportedFingerprint.toolCount,
+  }, unsupportedSessionId);
+  const unsupportedCall = await rpc("tools/call", {
+    name: "open_workspace",
+    arguments: { path: workspaceRoot, mode: "checkout" },
+  }, unsupportedSessionId);
+  assert.equal(unsupportedCall.payload?.error?.code, -32012,
+    "strict catalog mode must fail closed for clients missing the acknowledgement extension");
 
   const opened = await rpc("tools/call", {
     name: "open_workspace",
@@ -110,6 +311,15 @@ try {
   }, sessionId);
   assert.equal(opened.response.status, 200, JSON.stringify(opened.payload));
   assert.notEqual(opened.payload?.result?.isError, true, JSON.stringify(opened.payload));
+  const workspaceId = (opened.payload?.result?.structuredContent ?? opened.payload?.result)?.workspaceId;
+  assert.equal(typeof workspaceId, "string", "open_workspace must return the workspace id used by the SSE evidence call");
+  const sseCall = await rpc("tools/call", {
+    name: "await_workspace_events",
+    arguments: { workspaceId, afterSeq: 0, timeoutMs: 1_000 },
+  }, sessionId);
+  assert.equal(sseCall.response.status, 200, JSON.stringify(sseCall.payload));
+  const sseOperationId = sseCall.response.headers.get("x-kontrol-operation-id");
+  assert.ok(sseOperationId, "completed SSE tool responses must expose their exact server operation ID");
 
   const diagnosticsResponse = await fetch(new URL("/diagnostics", url), {
     headers: { "x-kontrol-diagnostics": diagnosticsSecret },
@@ -121,12 +331,403 @@ try {
   assert.equal(session?.toolCatalogHandshake?.status, "accepted");
   assert.equal(session?.toolCatalogHandshake?.serverCatalogSha256, fingerprint.sha256);
   assert.equal(session?.toolCatalogHandshake?.hostCatalogSha256, fingerprint.sha256);
+  assert.equal(session?.toolCatalogParity?.status, "matched");
+  assert.equal(session?.toolCatalogParity?.degraded, false);
+  const unsupportedSessionHash = createHash("sha256").update(unsupportedSessionId).digest("hex");
+  const unsupportedDiagnostic = diagnostics.mcpSessionMetrics.sessions.find((item: any) => item.sessionIdSha256 === unsupportedSessionHash);
+  assert.equal(unsupportedDiagnostic?.toolCatalogHandshake?.status, "rejected");
+  assert.equal(unsupportedDiagnostic?.toolCatalogHandshake?.reason, "client_capability_missing");
+  assert.equal(unsupportedDiagnostic?.toolCatalogParity?.status, "mismatch");
+  assert.equal(unsupportedDiagnostic?.toolCatalogParity?.degraded, true);
+  assert.equal(diagnostics.mcpSessionMetrics.toolCatalogParity.status, "degraded");
+  assert.equal(diagnostics.mcpSessionMetrics.toolCatalogParity.degradedSessions, 1);
+
+  const badFingerprintClient = await rpc("initialize", {
+    protocolVersion: "2025-06-18",
+    capabilities: { extensions: { [TOOL_CATALOG_ACK_CAPABILITY]: { contractVersion: 1 } } },
+    clientInfo: { name: "catalog-ack-http-bad-fingerprint-client", version: "1.0.0" },
+  });
+  assert.equal(badFingerprintClient.response.status, 200, JSON.stringify(badFingerprintClient.payload));
+  const badFingerprintSessionId = badFingerprintClient.sessionId;
+  assert.ok(badFingerprintSessionId, "bad-fingerprint initialization must return a session ID");
+  await notification("notifications/initialized", {}, badFingerprintSessionId);
+  const badFingerprintList = await rpc("tools/list", {}, badFingerprintSessionId);
+  const badFingerprintCatalog = fingerprintToolCatalog(badFingerprintList.payload?.result);
+  assert.ok(badFingerprintCatalog);
+  const wrongFingerprint = badFingerprintCatalog.sha256 === "0".repeat(64) ? "1".repeat(64) : "0".repeat(64);
+  await notification(TOOL_CATALOG_ACK_METHOD, {
+    contractVersion: 1,
+    serverVersion: badFingerprintClient.payload?.result?.serverInfo?.version,
+    hostCatalogSha256: wrongFingerprint,
+    hostToolCount: badFingerprintCatalog.toolCount,
+  }, badFingerprintSessionId);
+  const badFingerprintCall = await rpc("tools/call", {
+    name: "open_workspace",
+    arguments: { path: workspaceRoot, mode: "checkout" },
+  }, badFingerprintSessionId);
+  assert.equal(badFingerprintCall.payload?.error?.code, -32012,
+    "strict-mode tools/call must fail closed after an incorrect catalog fingerprint");
+  const badFingerprintDiagnostics = await fetch(new URL("/diagnostics", url), {
+    headers: { "x-kontrol-diagnostics": diagnosticsSecret },
+  }).then((response) => response.json()) as any;
+  const badFingerprintSessionHash = createHash("sha256").update(badFingerprintSessionId).digest("hex");
+  const badFingerprintHandshake = badFingerprintDiagnostics.mcpSessionMetrics.sessions
+    .find((item: any) => item.sessionIdSha256 === badFingerprintSessionHash)?.toolCatalogHandshake;
+  assert.equal(badFingerprintHandshake?.status, "rejected");
+  assert.equal(badFingerprintHandshake?.reason, "host_catalog_fingerprint_mismatch");
+
+  const evidenceUrl = new URL("/diagnostics", url);
+  evidenceUrl.searchParams.set("qEvidence", "1");
+  evidenceUrl.searchParams.set("qBuild", "catalog-ack-build-test");
+  evidenceUrl.searchParams.set("qSession", sessionHash);
+  const evidenceResponse = await fetch(evidenceUrl, {
+    headers: { "x-kontrol-diagnostics": diagnosticsSecret },
+  });
+  assert.equal(evidenceResponse.status, 200);
+  const evidenceDiagnostics = await evidenceResponse.json() as any;
+  const evidenceRecords = evidenceDiagnostics.mcpSessionMetrics.qualificationEvidence.records;
+  const persistedAck = evidenceRecords.find((item: any) => item.recordType === "catalog_acknowledgement"
+    && item.captureId === "catalog-ack-capture-test");
+  assert.equal(persistedAck?.status, "accepted");
+  assert.equal(persistedAck?.serverBuildId, "catalog-ack-build-test");
+  assert.equal(persistedAck?.sessionIdSha256, sessionHash);
+  assert.match(persistedAck?.contentSha256 ?? "", /^[a-f0-9]{64}$/);
+  const persistedSse = evidenceRecords.find((item: any) => item.recordType === "external_sse"
+    && item.operationId === sseOperationId);
+  assert.ok(persistedSse, "completed external SSE operation metadata must be stored outside the in-memory ring");
+  assert.equal(persistedSse?.sessionIdSha256, sessionHash);
+  assert.equal(persistedSse?.serverBuildId, "catalog-ack-build-test");
+  const unsupportedEvidenceUrl = new URL(evidenceUrl);
+  unsupportedEvidenceUrl.searchParams.set("qSession", unsupportedSessionHash);
+  const unsupportedEvidenceResponse = await fetch(unsupportedEvidenceUrl, {
+    headers: { "x-kontrol-diagnostics": diagnosticsSecret },
+  });
+  assert.equal(unsupportedEvidenceResponse.status, 200);
+  const unsupportedEvidence = await unsupportedEvidenceResponse.json() as any;
+  assert.ok(unsupportedEvidence.mcpSessionMetrics.qualificationEvidence.records.some((item: any) =>
+    item.recordType === "catalog_acknowledgement" && item.status === "rejected"
+      && item.sessionIdSha256 === unsupportedSessionHash),
+  "rejected acknowledgements remain available as server-observed evidence");
+  const badFingerprintEvidenceUrl = new URL(evidenceUrl);
+  badFingerprintEvidenceUrl.searchParams.set("qSession", badFingerprintSessionHash);
+  const badFingerprintEvidence = await fetch(badFingerprintEvidenceUrl, {
+    headers: { "x-kontrol-diagnostics": diagnosticsSecret },
+  }).then((response) => response.json()) as any;
+  assert.ok(badFingerprintEvidence.mcpSessionMetrics.qualificationEvidence.records.some((item: any) =>
+    item.recordType === "catalog_acknowledgement" && item.status === "rejected"
+      && item.rejectionReason === "host_catalog_fingerprint_mismatch"
+      && item.sessionIdSha256 === badFingerprintSessionHash),
+  "incorrect catalog fingerprints remain durably classified as rejected");
 
   await fetch(url, { method: "DELETE", headers: { "mcp-session-id": sessionId } }).catch(() => {});
+  await fetch(url, { method: "DELETE", headers: { "mcp-session-id": unsupportedSessionId } }).catch(() => {});
+  await fetch(url, { method: "DELETE", headers: { "mcp-session-id": badFingerprintSessionId } }).catch(() => {});
+  const evidenceAfterClose = await fetch(evidenceUrl, {
+    headers: { "x-kontrol-diagnostics": diagnosticsSecret },
+  });
+  assert.equal(evidenceAfterClose.status, 200);
+  const afterCloseDiagnostics = await evidenceAfterClose.json() as any;
+  assert.ok(afterCloseDiagnostics.mcpSessionMetrics.qualificationEvidence.records.some((item: any) => item.recordId === persistedAck.recordId),
+    "qualification acknowledgement evidence must survive session closure");
+  assert.ok(afterCloseDiagnostics.mcpSessionMetrics.qualificationEvidence.records.some((item: any) => item.recordId === persistedSse.recordId),
+    "completed SSE evidence must survive session closure");
+
+  await running.drain();
+  await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+  await running.close();
+  running = createServer(config);
+  httpServer = running.app.listen(0, "127.0.0.1");
+  await new Promise<void>((resolve) => httpServer.once("listening", resolve));
+  address = httpServer.address();
+  assert.ok(address && typeof address === "object");
+  url = `http://127.0.0.1:${address.port}/mcp`;
+  const diagnosticsBaseUrl = new URL("/diagnostics", url);
+  diagnosticsBaseUrl.search = evidenceUrl.search;
+  const evidenceAfterRestart = await fetch(diagnosticsBaseUrl, {
+    headers: { "x-kontrol-diagnostics": diagnosticsSecret },
+  });
+  assert.equal(evidenceAfterRestart.status, 200);
+  const restartedDiagnostics = await evidenceAfterRestart.json() as any;
+  const restartedRecords = restartedDiagnostics.mcpSessionMetrics.qualificationEvidence.records;
+  assert.ok(restartedRecords.some((item: any) => item.recordId === persistedAck.recordId),
+    "catalog acknowledgement evidence remains correlated after a Kontrol restart");
+  assert.ok(restartedRecords.some((item: any) => item.recordId === persistedSse.recordId),
+    "completed SSE evidence remains correlated after a Kontrol restart");
+  assert.ok(!restartedDiagnostics.mcpSessionMetrics.sessions.some((item: any) => item.sessionIdSha256 === sessionHash),
+    "the post-restart evidence lookup does not depend on retaining the MCP session");
+
+  // Model a release transition that materially changes callable descriptors.
+  // A host reconnects through the supported MCP path, sees the new catalog,
+  // and must acknowledge that catalog before strict-mode calls resume.
+  await running.drain();
+  await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+  await running.close();
+  config = loadConfig({
+    KONTROL_CONFIG_DIR: configDir,
+    KONTROL_ALLOWED_ROOTS: workspaceRoot,
+    KONTROL_STATE_DIR: stateDir,
+    KONTROL_WORKTREE_ROOT: worktreeRoot,
+    KONTROL_AUTH_MODE: "tunnel",
+    KONTROL_ACP_ENABLED: "true",
+    KONTROL_ACP_AGENT_SECRET: "catalog-ack-test-agent-secret-32chars",
+    KONTROL_ACP_REVIEWER_SECRET: "catalog-ack-test-reviewer-secret-32chars",
+    KONTROL_ACP_ADAPTER_SECRET: "catalog-ack-test-adapter-secret-32chars",
+    KONTROL_TUNNEL_REVIEWER_SECRET: tunnelReviewerSecret,
+    KONTROL_POLICY_MODE: "allow",
+    KONTROL_TOOL_MODE: "codex",
+    KONTROL_LOG_LEVEL: "error",
+    KONTROL_DIAGNOSTICS_SECRET: diagnosticsSecret,
+    KONTROL_BUILD_ID: "catalog-ack-build-test-release-b",
+    KONTROL_MCP_SSE_HEARTBEAT_MS: "1000",
+    KONTROL_MCP_REQUIRE_TOOL_CATALOG_ACK: "1",
+  });
+  running = createServer(config);
+  httpServer = running.app.listen(0, "127.0.0.1");
+  await new Promise<void>((resolve) => httpServer.once("listening", resolve));
+  address = httpServer.address();
+  assert.ok(address && typeof address === "object");
+  url = `http://127.0.0.1:${address.port}/mcp`;
+
+  const releaseBInitialize = await rpc("initialize", {
+    protocolVersion: "2025-06-18",
+    capabilities: { extensions: { [TOOL_CATALOG_ACK_CAPABILITY]: { contractVersion: 1 } } },
+    clientInfo: { name: "catalog-ack-release-transition", version: "1.0.0" },
+  });
+  assert.equal(releaseBInitialize.response.status, 200, JSON.stringify(releaseBInitialize.payload));
+  const releaseBSessionId = releaseBInitialize.sessionId;
+  assert.ok(releaseBSessionId, "release B reconnect must create a fresh MCP session");
+  await notification("notifications/initialized", {}, releaseBSessionId);
+  const releaseBToolsList = await rpc("tools/list", {}, releaseBSessionId);
+  const releaseBCatalog = fingerprintToolCatalog(releaseBToolsList.payload?.result);
+  assert.ok(releaseBCatalog, "release B must expose a fingerprintable callable catalog");
+  assert.notEqual(releaseBCatalog.sha256, fingerprint.sha256,
+    "release B's materially changed descriptor set must differ from release A");
+  assert.ok(releaseBToolsList.payload?.result?.tools?.some((tool: any) => tool.name === "exec_command"),
+    "the release B catalog must include its newly registered Codex tool");
+  const staleReleaseAAcknowledgement = await notification(TOOL_CATALOG_ACK_METHOD, {
+    contractVersion: 1,
+    serverVersion,
+    hostCatalogSha256: fingerprint.sha256,
+    hostToolCount: fingerprint.toolCount,
+  }, releaseBSessionId);
+  assert.ok([200, 202].includes(staleReleaseAAcknowledgement.status));
+  const staleReleaseBCall = await rpc("tools/call", {
+    name: "open_workspace",
+    arguments: { path: workspaceRoot, mode: "checkout" },
+  }, releaseBSessionId);
+  assert.equal(staleReleaseBCall.payload?.error?.code, -32012,
+    "a catalog captured from release A must not authorize strict-mode calls on release B");
+  const releaseBAcknowledgement = await notification(TOOL_CATALOG_ACK_METHOD, {
+    contractVersion: 1,
+    serverVersion: releaseBInitialize.payload?.result?.serverInfo?.version,
+    captureId: "release-transition-b",
+    hostCatalogSha256: releaseBCatalog.sha256,
+    hostToolCount: releaseBCatalog.toolCount,
+  }, releaseBSessionId);
+  assert.ok([200, 202].includes(releaseBAcknowledgement.status));
+
+  // Reads a standalone SSE stream until the predicate matches or the deadline
+  // passes. A read that is still in flight when the deadline passes is
+  // abandoned, not lost: its eventual rejection (the stream is cancelled
+  // afterwards) is consumed so it never surfaces as an unhandled rejection.
+  const readStreamUntil = async (
+    reader: ReadableStreamDefaultReader<Uint8Array>,
+    predicate: (bytes: string) => boolean,
+    timeoutMs: number,
+  ): Promise<string> => {
+    let bytes = "";
+    let pending: Promise<ReadableStreamReadResult<Uint8Array>> | undefined;
+    const deadline = Date.now() + timeoutMs;
+    while (!predicate(bytes) && Date.now() < deadline) {
+      pending ??= reader.read();
+      const remaining = Math.max(1, deadline - Date.now());
+      const result = await Promise.race([
+        pending,
+        new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), remaining)),
+      ]);
+      if (result === "timeout") break;
+      pending = undefined;
+      if (result.done) break;
+      bytes += new TextDecoder().decode(result.value);
+    }
+    if (pending) pending.catch(() => {});
+    return bytes;
+  };
+  const releaseBHash = createHash("sha256").update(releaseBSessionId).digest("hex");
+  const readReleaseBSession = async (): Promise<any> => {
+    const diagnostics = await fetch(new URL("/diagnostics", url), {
+      headers: { "x-kontrol-diagnostics": diagnosticsSecret },
+    }).then((response) => response.json()) as any;
+    return diagnostics.mcpSessionMetrics.sessions
+      .find((item: any) => item.sessionIdSha256 === releaseBHash);
+  };
+
+  const refreshController = new AbortController();
+  const refreshStream = await fetch(url, {
+    method: "GET",
+    headers: {
+      accept: "text/event-stream",
+      "mcp-session-id": releaseBSessionId,
+      "x-kontrol-tunnel-reviewer": tunnelReviewerSecret,
+    },
+    signal: refreshController.signal,
+  });
+  assert.equal(refreshStream.status, 200, "the connected host can use the normal GET stream refresh path");
+  const refreshReader = refreshStream.body?.getReader();
+  assert.ok(refreshReader);
+  try {
+    const refreshBytes = await readStreamUntil(
+      refreshReader,
+      (bytes) => bytes.includes("notifications/tools/list_changed"),
+      5_000,
+    );
+    assert.match(refreshBytes, /notifications\/tools\/list_changed/,
+      "release B sends the supported tools/list_changed refresh pulse over the existing GET stream");
+
+    // A delivered channel is not resent while its standalone stream stays
+    // attached: neither the retry opportunity of a later tools/list response
+    // nor the periodic SSE heartbeat may duplicate the notification.
+    const retryOpportunity = await rpc("tools/list", {}, releaseBSessionId);
+    assert.ok(retryOpportunity.payload?.result?.tools, "the retry opportunity still answers tools/list");
+    const afterRetryBytes = await readStreamUntil(
+      refreshReader,
+      (bytes) => bytes.includes("notifications/tools/list_changed"),
+      2_500,
+    );
+    assert.doesNotMatch(afterRetryBytes, /notifications\/tools\/list_changed/,
+      "a delivered channel is never resent for the same session refresh state on the same standalone stream");
+
+    const inStreamSession = await readReleaseBSession();
+    assert.equal(inStreamSession?.catalogRefresh?.toolListRefreshAttempts, 1,
+      "a pulse deferred for lack of a standalone stream consumes no send attempt");
+    assert.equal(inStreamSession?.catalogRefresh?.toolListRefreshSuccesses, 1,
+      "the delivered channel succeeds exactly once while its standalone stream stays attached");
+    assert.equal(inStreamSession?.catalogRefresh?.toolListRefreshFailures, 0,
+      "a delivered channel records no send failure");
+    assert.ok((inStreamSession?.catalogRefresh?.deferredNoStreamAttempts ?? 0) >= 1,
+      "a pulse attempted before any GET stream existed is recorded as deferred, never as a delivered success");
+  } finally {
+    refreshController.abort();
+    await refreshStream.body?.cancel().catch(() => {});
+    refreshReader.releaseLock();
+  }
+
+  // The standalone stream ended. Its delivery state is re-armed, so a success
+  // recorded against a stream that has since disappeared can never suppress
+  // the notification on the next standalone stream.
+  let rearmedSession: any;
+  const rearmDeadline = Date.now() + 5_000;
+  do {
+    rearmedSession = await readReleaseBSession();
+    if (rearmedSession?.catalogRefresh?.toolListRefreshSent === false) break;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  } while (Date.now() < rearmDeadline);
+  assert.equal(rearmedSession?.catalogRefresh?.toolListRefreshSent, false,
+    "a finished standalone stream re-arms the delivery so its success cannot suppress the next stream");
+
+  const secondController = new AbortController();
+  let secondStream: Response | undefined;
+  for (let attempt = 0; attempt < 20 && !secondStream; attempt++) {
+    const candidate = await fetch(url, {
+      method: "GET",
+      headers: {
+        accept: "text/event-stream",
+        "mcp-session-id": releaseBSessionId,
+        "x-kontrol-tunnel-reviewer": tunnelReviewerSecret,
+      },
+      signal: secondController.signal,
+    });
+    if (candidate.status === 200) secondStream = candidate;
+    else {
+      await candidate.body?.cancel().catch(() => {});
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+  assert.ok(secondStream, "the host can attach a new standalone stream after the previous one ended");
+  const secondReader = secondStream.body?.getReader();
+  assert.ok(secondReader);
+  try {
+    const secondBytes = await readStreamUntil(
+      secondReader,
+      (bytes) => bytes.includes("notifications/tools/list_changed"),
+      5_000,
+    );
+    assert.match(secondBytes, /notifications\/tools\/list_changed/,
+      "a re-armed standalone stream re-delivers the catalog refresh notification");
+  } finally {
+    secondController.abort();
+    await secondStream.body?.cancel().catch(() => {});
+    secondReader.releaseLock();
+  }
+  const releaseBHandshake = await rpc("tools/call", {
+    name: "open_workspace",
+    arguments: { path: workspaceRoot, mode: "checkout" },
+  }, releaseBSessionId);
+  assert.notEqual(releaseBHandshake.payload?.result?.isError, true,
+    "fresh release B registration and acknowledgement restore ordinary calls");
+  const releaseBDiagnostics = await fetch(new URL("/diagnostics", url), {
+    headers: { "x-kontrol-diagnostics": diagnosticsSecret },
+  }).then((response) => response.json()) as any;
+  const releaseBSession = releaseBDiagnostics.mcpSessionMetrics.sessions
+    .find((item: any) => item.sessionIdSha256 === releaseBHash);
+  assert.equal(releaseBSession?.toolCatalogHandshake?.status, "accepted");
+  assert.ok((releaseBSession?.catalogRefresh?.toolListRefreshSuccesses ?? 0) >= 1,
+    "authenticated diagnostics distinguish a successful refresh notification from a client registry capture");
+
+  const probeChild = spawn(process.execPath, [
+    "scripts/probe-mcp-tunnel.mjs",
+    "--url", url.replace(/\/mcp$/, ""),
+    "--dual",
+    "--cycles", "1",
+    "--workspace", workspaceRoot,
+    "--watcher-timeout-ms", "1000",
+    "--heartbeat-interval-ms", "1000",
+    "--heartbeat-count", "1",
+    "--heartbeat-timeout-ms", "5000",
+    "--resource-load-reads", "2",
+    "--minimum-drain-events", "0",
+    "--tool-name", "exec_command",
+    "--tool-command", "printf tunnel-regression-ok",
+    "--diagnostics-secret", diagnosticsSecret,
+    "--tunnel-reviewer-file", join(configDir, "tunnel-reviewer.secret"),
+  ], {
+    cwd: process.cwd(),
+    env: { PATH: process.env.PATH ?? "", KONTROL_MCP_SSE_HEARTBEAT_MS: "1000" },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let probeStdout = "";
+  let probeStderr = "";
+  probeChild.stdout.setEncoding("utf8").on("data", (chunk: string) => { probeStdout += chunk; });
+  probeChild.stderr.setEncoding("utf8").on("data", (chunk: string) => { probeStderr += chunk; });
+  const probeResult = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+    const timeout = setTimeout(() => probeChild.kill("SIGTERM"), 60_000);
+    probeChild.once("error", (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    });
+    probeChild.once("close", (code, signal) => {
+      clearTimeout(timeout);
+      resolve({ code, signal });
+    });
+  });
+  assert.equal(probeResult.code, 0,
+    `strict-mode dual probe must complete its initial and replacement sessions; signal=${probeResult.signal}; stderr=${probeStderr}; stdout=${probeStdout}`);
+  const probeReport = JSON.parse(probeStdout.trim().split(/\r?\n/).at(-1) ?? "{}");
+  assert.equal(probeReport.ok, true);
+  assert.ok(probeReport.probeClientAcknowledgements.length >= 3,
+    "both dual sessions and the replacement session must acknowledge independently");
+  assert.ok(probeReport.probeClientAcknowledgements.every((item: any) =>
+    item.source === "kontrol_probe_client" && item.status === "accepted"
+      && /^[a-f0-9]{64}$/.test(item.sessionIdSha256)),
+  "probe-client acknowledgements must be accepted and labeled separately from external-host evidence");
+  assert.equal(new Set(probeReport.probeClientAcknowledgements.map((item: any) => item.sessionIdSha256)).size,
+    probeReport.probeClientAcknowledgements.length,
+  "each replacement transport must acknowledge its own catalog session");
   console.log("mcp-tool-catalog-http.test.ts: strict-mode handshake passed");
 } finally {
   await running.drain();
   await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+  await running.close();
   rmSync(workspaceRoot, { recursive: true, force: true });
   rmSync(stateDir, { recursive: true, force: true });
   rmSync(configDir, { recursive: true, force: true });

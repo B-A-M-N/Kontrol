@@ -11,7 +11,7 @@ import { writeFile, readFile, mkdir, open } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
-import { FilesystemSnapshotStore, FilesystemSnapshotLimits, DEFAULT_SNAPSHOT_LIMITS } from "./filesystem-snapshot-store.js";
+import { FilesystemSnapshotStore, FilesystemSnapshotLimits, DEFAULT_SNAPSHOT_LIMITS, type WorkspaceSnapshot } from "./filesystem-snapshot-store.js";
 
 function makeRoot(prefix: string): string {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -152,6 +152,28 @@ function snap(ref: string, terminal = false): { ref: string; terminal?: boolean 
   const store2 = new FilesystemSnapshotStore({ storeRoot });
   assert.equal(await store2.validateSnapshot(s1), true, "persisted baseline validates");
   assert.equal((await store2.storeStats()).blobs, blobsAfterBaseline, "no recapture happened on reinit with a valid persisted baseline");
+}
+
+// Combined stats and reachability share the same store inventory while
+// preserving the existing standalone results exactly.
+{
+  const { store, workspaceRoot } = makeStore();
+  file(workspaceRoot, "retained.txt", "retained-accounting-content\n");
+  const retained = await store.capture(workspaceRoot);
+  await store.saveBaselines("ws-accounting", workspaceRoot, {
+    open: retained,
+    presentation: retained,
+    legacy: retained,
+    sessions: new Map(),
+  });
+  file(workspaceRoot, "orphan.txt", "orphan-accounting-content\n");
+  await store.capture(workspaceRoot);
+
+  const expectedStats = await store.storeStats();
+  const expectedReachability = await store.estimateReachableBytes();
+  const combined = await store.storeStatsWithReachability();
+  assert.deepEqual(combined.stats, expectedStats, "combined stats match the existing stats query");
+  assert.deepEqual(combined.reachable, expectedReachability, "combined reachable bytes match the existing estimate");
 }
 
 // --- 7. GC reachability: unpinned manifest/blob reclaimed, pinned retained ---
@@ -427,17 +449,175 @@ function snap(ref: string, terminal = false): { ref: string; terminal?: boolean 
   assert.equal(existsSync(store.blobPath(extraHash)), true, "published blob survived concurrent GC");
 }
 
+// A root that appears after a bounded GC slice invalidates the old mark before
+// its manifest or blobs can be swept.
+{
+  const { store, workspaceRoot } = makeStore();
+  file(workspaceRoot, "late-root.txt", "late-root-content\n");
+  const lateRoot = await store.capture(workspaceRoot);
+  file(workspaceRoot, "other.txt", "other-content\n");
+  await store.capture(workspaceRoot);
+
+  let roots: Array<{ ref: string; terminal?: boolean }> = [];
+  const first = await store.gcSlice({ budgetMs: 1000, pageSize: 1, dryRun: false, listDbSnapshots: () => roots });
+  assert.equal(first.hasMore, true, "small GC page leaves resumable work");
+  roots = [{ ref: lateRoot.ref, terminal: false }];
+  await gcToCompletion(store, () => roots);
+
+  assert.equal(existsSync(store.manifestPath(lateRoot.ref)), true, "newly rooted manifest survives mark restart");
+  const manifest = await store.readManifest(lateRoot);
+  for (const entry of manifest.entries) {
+    if (entry.type === "file" && entry.sha256) {
+      assert.equal(existsSync(store.blobPath(entry.sha256)), true, `newly rooted blob ${entry.sha256} survives`);
+    }
+  }
+}
+
+// A process restart during each resumable GC phase discards only in-memory
+// cursors. The next store instance reconstructs reachability from durable
+// baseline roots and completes reclamation without deleting the rooted tree.
+{
+  const { store: initialStore, storeRoot, workspaceRoot } = makeStore({ limits: { retentionMs: 0, retainPerWorkspace: 0 } });
+  const limits = { orphanGraceMs: 0, retentionMs: 0, retainPerWorkspace: 0 };
+  file(workspaceRoot, "durable.txt", "durable snapshot content\n");
+  const durable = await initialStore.capture(workspaceRoot);
+  await initialStore.saveBaselines("ws-gc-restart", workspaceRoot, {
+    open: durable, presentation: durable, legacy: durable, sessions: new Map(),
+  });
+  const unrooted: WorkspaceSnapshot[] = [];
+  for (let index = 0; index < 4; index++) {
+    file(workspaceRoot, `garbage-${index}.txt`, `unrooted snapshot ${index}\n`);
+    unrooted.push(await initialStore.capture(workspaceRoot));
+  }
+  await initialStore.saveBaselines("ws-gc-restart", workspaceRoot, {
+    open: durable,
+    presentation: durable,
+    legacy: durable,
+    sessions: new Map([["ws-gc-restart-pinned", unrooted[0]!]]),
+  });
+
+  let store = initialStore;
+  const roots = () => [];
+  const state = (candidate: FilesystemSnapshotStore) => (candidate as unknown as { gcState: {
+    phase: number;
+    markStage: string | null;
+    markCursor: number;
+    expireCursor: number;
+    expiredRefs: string[];
+  } }).gcState;
+  const advanceUntil = async (predicate: () => boolean, message: string) => {
+    for (let index = 0; index < 500 && !predicate(); index++) {
+      await store.gcSlice({ budgetMs: 1000, pageSize: 1, dryRun: false, listDbSnapshots: roots });
+    }
+    assert.ok(predicate(), message);
+  };
+  const restart = async () => {
+    (store as unknown as { closeGcDirectoryCursors(): void }).closeGcDirectoryCursors();
+    await store.close();
+    store = new FilesystemSnapshotStore({ storeRoot, limits });
+  };
+
+  await store.gcSlice({ budgetMs: 1000, pageSize: 1, dryRun: false, listDbSnapshots: roots });
+  assert.equal(state(store).phase, 0);
+  assert.equal(state(store).markStage, "classify");
+  await restart();
+
+  await advanceUntil(() => state(store).markStage === "mark" && state(store).markCursor > 0,
+    "GC reaches the manifest mark phase before restart");
+  await restart();
+
+  await advanceUntil(() => state(store).markStage === "expire" && state(store).expireCursor > 0
+    && state(store).expireCursor < state(store).expiredRefs.length,
+  "GC reaches the partial manifest-expiration phase before restart");
+  await restart();
+
+  await advanceUntil(() => state(store).phase === 1,
+    "GC reaches the blob-sweep phase before restart");
+  await restart();
+  await gcToCompletion(store, roots);
+
+  assert.equal(existsSync(store.manifestPath(durable.ref)), true, "durable snapshot manifest survives every GC restart");
+  const durableManifest = await store.readManifest(durable);
+  for (const entry of durableManifest.entries) {
+    if (entry.type === "file") assert.equal(existsSync(store.blobPath(entry.sha256)), true, "durable snapshot blob survives every GC restart");
+  }
+  assert.equal(existsSync(store.manifestPath(unrooted[0]!.ref)), true, "secondary durable baseline survives every GC restart");
+  for (const snapshot of unrooted.slice(1)) assert.equal(existsSync(store.manifestPath(snapshot.ref)), false, "unrooted manifest is eventually reclaimed after restart");
+  await store.close();
+}
+
+// GC continues through sharded blob directories with a cursor instead of
+// materializing the full content-addressed inventory for each slice.
+{
+  const { store } = makeStore();
+  for (let index = 0; index < 300; index++) {
+    const hash = sha256(`gc-orphan-${index}`);
+    const path = store.blobPath(hash);
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(path, `orphan-${index}`);
+  }
+  let hasMore = true;
+  let reclaimed = 0;
+  let slices = 0;
+  while (hasMore) {
+    const slice = await store.gcSlice({ budgetMs: 1000, pageSize: 7, dryRun: false, listDbSnapshots: () => [] });
+    reclaimed += slice.result.blobsReclaimed;
+    hasMore = slice.hasMore;
+    slices++;
+    assert.ok(slices < 100, "bounded page cursor completes without restarting its directory walk");
+  }
+  assert.equal(reclaimed, 300, "all unreferenced blobs are reclaimed across small pages");
+  assert.equal((await store.storeStats()).blobs, 0, "completed GC leaves no test orphan blobs");
+}
+
+// A completed mark is validated once immediately before the destructive
+// phase. Collecting the same durable root set twice at that boundary adds a
+// full SQLite scan without protecting any intervening mutation.
+{
+  const { store } = makeStore({});
+  let rootCollections = 0;
+  const collectionsPerSlice: number[] = [];
+  let hasMore = true;
+  while (hasMore) {
+    const before = rootCollections;
+    const slice = await store.gcSlice({
+      budgetMs: 1000,
+      pageSize: 100,
+      dryRun: false,
+      listDbSnapshots: () => {
+        rootCollections++;
+        return [];
+      },
+    });
+    hasMore = slice.hasMore;
+    collectionsPerSlice.push(rootCollections - before);
+  }
+  assert.ok(collectionsPerSlice.length > 1, "empty store completes its GC mark and sweep");
+  assert.equal(collectionsPerSlice[0], 2, "mark pass uses initial roots plus one pre-sweep revalidation");
+  assert.ok(collectionsPerSlice.slice(1).every((count) => count === 1), "later sweep slices validate roots once");
+  await store.close();
+}
+
 // --- 15. Baseline corruption: malformed baseline reported as corrupt, not absent ---
 {
   const storeRoot = makeRoot("kontrol-fss-corrupt-");
   const store = new FilesystemSnapshotStore({ storeRoot });
   const workspace = "ws-corrupt";
   await mkdir(join(storeRoot, "baselines"), { recursive: true });
+  await mkdir(join(storeRoot, "manifests"), { recursive: true });
+  const pinnedRef = "fs:sha256:" + "c".repeat(64);
+  await writeFile(store.manifestPath(pinnedRef), JSON.stringify({ version: 1, entries: [] }));
   await writeFile(join(storeRoot, "baselines", `${workspace}.json`), '{"root": "broken json');
   const loaded = await store.loadBaselines(workspace);
   assert.equal(loaded, undefined, "corrupt baseline yields no baseline value");
   const stats = await store.storeStats();
   assert.ok(stats.corruptionCount >= 1, "corruption reported rather than silently treated as absent");
+  await assert.rejects(
+    () => store.gcSlice({ budgetMs: 1000, dryRun: false, listDbSnapshots: () => [] }),
+    /Cannot establish snapshot roots/,
+    "destructive GC fails closed when baseline roots cannot be parsed",
+  );
+  assert.equal(existsSync(store.manifestPath(pinnedRef)), true, "corrupt baseline cannot cause a pinned snapshot to be deleted");
 
   // A missing baseline (ENOENT) is NOT corruption.
   const fresh = new FilesystemSnapshotStore({ storeRoot });
@@ -491,3 +671,46 @@ function snap(ref: string, terminal = false): { ref: string; terminal?: boolean 
 }
 
 console.log("filesystem-snapshot-store: all scenarios passed");
+
+// --- Audit §8: storage accounting explains pins without bypassing GC roots ---
+{
+  const storeRoot = makeRoot("kontrol-fss-accounting-");
+  const workspaceRoot = makeRoot("kontrol-fss-accounting-root-");
+  const store = new FilesystemSnapshotStore({
+    storeRoot,
+    limits: { orphanGraceMs: 0, retentionMs: 30_000, retainPerWorkspace: 0 },
+  });
+  file(workspaceRoot, "pinned.txt", "pinned evidence\n");
+  const pinned = await store.capture(workspaceRoot);
+  await store.saveBaselines("ws-accounting", workspaceRoot, {
+    open: pinned, presentation: pinned, legacy: pinned, sessions: new Map(),
+  });
+
+  file(workspaceRoot, "terminal.txt", "terminal evidence\n");
+  const terminal = await store.capture(workspaceRoot);
+
+  file(workspaceRoot, "unpinned.txt", "unpinned content\n");
+  const unpinned = await store.capture(workspaceRoot);
+
+  const accounting = await store.storageAccounting(() => [
+    { ref: pinned.ref, terminal: false },
+    { ref: terminal.ref, terminal: true, terminalAt: new Date().toISOString() },
+  ]);
+  assert.equal(accounting.manifests.retainedLive, 1, "strong pin classified as live");
+  assert.equal(accounting.manifests.retainedTerminal, 1, "terminal retention classified separately");
+  assert.equal(accounting.manifests.reclaimable, 1, "unpinned manifest is gc-eligible");
+  assert.ok(accounting.blobs.counts.live >= 2, "live evidence blobs counted");
+  assert.ok(accounting.blobs.counts.reclaimable >= 1, "unreferenced blob is reclaimable");
+  assert.deepEqual(accounting.pinnedRefsByReason.strong_pin, [pinned.ref], "strong pin reason is exposed");
+  assert.ok(accounting.pinnedRefsByReason.terminal_retention.includes(terminal.ref), "terminal pin reason is exposed");
+
+  // Accounting is observability only: GC still owns destructive collection.
+  await gcToCompletion(store, () => [
+    { ref: pinned.ref, terminal: false },
+    { ref: terminal.ref, terminal: true, terminalAt: new Date().toISOString() },
+  ]);
+  assert.equal(existsSync(store.manifestPath(pinned.ref)), true, "strong pin survives after accounting");
+  assert.equal(existsSync(store.manifestPath(terminal.ref)), true, "retained terminal survives after accounting");
+  assert.equal(existsSync(store.manifestPath(unpinned.ref)), false, "accounting did not interfere with normal GC");
+  await store.close();
+}

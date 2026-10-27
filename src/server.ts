@@ -7,13 +7,11 @@ import os from "node:os";
 import { join, dirname, relative, resolve, sep } from "node:path";
 import { realpath } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { hostHeaderValidation, localhostHostValidation } from "@modelcontextprotocol/sdk/server/middleware/hostHeaderValidation.js";
-import { mcpAuthRouter, getOAuthProtectedResourceMetadataUrl } from "@modelcontextprotocol/sdk/server/auth/router.js";
-import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { isInitializeRequest, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { checkResourceAllowed, resourceUrlFromServerUrl } from "@modelcontextprotocol/sdk/shared/auth-utils.js";
+import { ListToolsRequestSchema } from "@modelcontextprotocol/core";
+import { NodeStreamableHTTPServerTransport } from "@modelcontextprotocol/node";
+import { requireBearerAuth } from "@modelcontextprotocol/server-legacy/auth";
+import { hostHeaderValidation, localhostHostValidation } from "@modelcontextprotocol/express";
+import { McpServer, isInitializeRequest, checkResourceAllowed, resourceUrlFromServerUrl } from "@modelcontextprotocol/server";
 import {
   registerAppResource,
   registerAppTool,
@@ -42,12 +40,14 @@ import {
 } from "./pi-tools.js";
 import { SingleUserOAuthProvider } from "./oauth-provider.js";
 import { ProcessSessionManager, type ProcessSnapshot } from "./process-sessions.js";
+import { createAgentPtyBindingStore } from "./agent-pty-bindings.js";
+import { removeStaleAgentPtyReviewCredentials } from "./agent-pty-review-credential.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { FilesystemSnapshotStore } from "./filesystem-snapshot-store.js";
 import { createMaintenanceCoordinator } from "./runtime/maintenance.js";
 import { createDatabaseIntegrityMonitor } from "./runtime/database-integrity.js";
 import { createStartupReconciliation } from "./server/startup-recovery.js";
-import { createShutdownController } from "./server/shutdown.js";
+import { createShutdownController, McpDrainIncompleteError } from "./server/shutdown.js";
 import { createAcpRuntime } from "./server/acp-runtime.js";
 import {
   constantTimeStringEqual,
@@ -74,12 +74,17 @@ import { createContinuationManager } from "./continuation.js";
 import { createDispatchOutbox } from "./dispatch-outbox.js";
 import { createScheduledJobStore } from "./scheduling/scheduled-job-store.js";
 import { createReviewRouteStore } from "./review-handoff/route-store.js";
+import { createReviewThreadStore } from "./review-thread/thread-store.js";
+import { createReviewerJobStore } from "./review-thread/reviewer-job-store.js";
+import { createReviewerBrowserController } from "./review-browser/browser-controller.js";
+import { createReviewerTurnDispatcher } from "./review-browser/turn-dispatcher.js";
 import { setDefaultAcpTimeout } from "./acp-gateway.js";
 import { createSupervisorRuns } from "./supervisor-runs.js";
 import { shutdownMissionVerifiers } from "./mission-verifier.js";
 import { createReviewWorkflowService, type ReviewWorkflowService } from "./review-workflow.js";
 import { databasePath, openDatabase, type DatabaseHandle } from "./db/client.js";
-import { LATEST_SCHEMA_VERSION } from "./db/migrations.js";
+import { pruneUnreferencedMigrationBackups } from "./db/deployment-backup.js";
+import { inspectDatabaseSchemaContract, LATEST_SCHEMA_VERSION } from "./db/migrations.js";
 import { createPolicyEngine, policyCanAsk, type PolicyConfig, type PolicyEngine, type ApprovalScope } from "./policy.js";
 import { createSqliteGrantStore } from "./policy-grants.js";
 import { registerPolicyTools } from "./policy-tools.js";
@@ -98,6 +103,7 @@ import { mcpSessionIdleReason, mcpSessionIdleTtl } from "./mcp-session-policy.js
 import { LogicalContinuityIndex } from "./mcp-logical-continuity.js";
 import { installCachedToolList, toolListCacheDiagnostics } from "./mcp-tool-list-cache.js";
 import { isPathInsideRoot } from "./roots.js";
+import { brandBuildId } from "./branded.js";
 
 
 /**
@@ -110,9 +116,10 @@ import { createPolicyWaiterRegistry } from "./server/policy-waiters.js";
 import { createMcpSessionLifecycle } from "./server/mcp-session-lifecycle.js";
 import { healthz, readinessChecks, sendReadiness } from "./server/readiness.js";
 import { handleDiagnostics } from "./server/diagnostics.js";
-import { handleMcpHttpRequest, type McpHttpDeps } from "./server/mcp-http.js";
+import { handleAgentPtyCredentialRenewal, handleMcpHttpRequest, type McpHttpDeps } from "./server/mcp-http.js";
 import { ExpiredMcpOperationTracker } from "./server/mcp-expired-operations.js";
 import { McpOperationDiagnostics } from "./server/mcp-operation-diagnostics.js";
+import { McpQualificationEvidenceJournal } from "./server/mcp-qualification-evidence.js";
 import {
   handleMcpRequestWithDeadline,
   McpAdmission,
@@ -148,6 +155,11 @@ import {
 } from "./server/mcp-session-state.js";
 import { deriveAuth } from "./server/auth.js";
 import { createHttpApp, mountWorkspaceAppAssets } from "./server/app.js";
+import { createPeerHttpApp } from "./server/peer-app.js";
+import { createPublicMcpApp } from "./server/public-mcp-app.js";
+import { trustedProxyPolicyForIngressProfiles } from "./ingress/proxy-context.js";
+import { PeerCredentialRegistry } from "./peer/auth.js";
+import { restorePeerWorktreeOwners } from "./peer/workspace-guard.js";
 import { createWorkspaceAppResourceServer } from "./server/workspace-resource-route.js";
 // P1.2 decomposition: admission classes/weights/queue live in
 // src/server/mcp-admission.ts; session-state types, identity derivation, and
@@ -270,7 +282,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     config.mcpMaxResourceReadQueue,
     config.mcpMaxQueuePerSession,
   );
-  const expiredMcpOperations = new ExpiredMcpOperationTracker();
+  const expiredMcpOperations = new ExpiredMcpOperationTracker(64, config.mcpOperationCancelGraceMs);
   const operationDiagnostics = new McpOperationDiagnostics();
   const workspaceAppResourceMetrics: WorkspaceAppResourceMetrics = {
     currentHashed: 0,
@@ -295,11 +307,14 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     cacheBytes: 0,
     maxCacheEntries: 0,
     maxCacheBytes: 0,
+    initialBuildDurationMs: 0,
+    lastSerializationDurationMs: 0,
+    maxSerializationDurationMs: 0,
   };
   const workspaceAppResources = createWorkspaceAppResourceServer(config, workspaceAppResourceMetrics, mcpResourceAdmission);
   const serveWorkspaceAppResource = workspaceAppResources.serve;
-  const { oauthEnabled, oauthProvider, bearerAuth, resourceServerUrl } = deriveAuth(config);
-  const { app } = createHttpApp({ config, oauthProvider, resourceServerUrl, bearerAuth });
+  const { oauthEnabled, oauthProvider, bearerAuth, resourceServerUrl, oauthRouter } = deriveAuth(config);
+  const { app } = createHttpApp({ config, oauthProvider, resourceServerUrl, bearerAuth, oauthRouter });
   // ONE shared DB handle for every manager + the review workflow service, so the
   // workflow can commit state + event log in a SINGLE transaction (P1 #15).
   // P0.3: deployment identity flows from the entrypoint-resolved context via
@@ -307,7 +322,10 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
   const db: DatabaseHandle = openDatabase(config.stateDir, {
     deploymentId: deploymentContext.deploymentId,
     expectedSchemaVersion: deploymentContext.expectedSchemaVersion,
+    expectedBuildId: deploymentContext.expectedBuildId ?? (buildMeta.buildId ? brandBuildId(buildMeta.buildId) : undefined),
   });
+  if (config.peer) restorePeerWorktreeOwners(config.stateDir);
+  const qualificationEvidence = new McpQualificationEvidenceJournal(db.sqlite);
   const mutationReceipts = createMutationReceiptStore(db);
   const workspaceStore = createWorkspaceStore(db);
   const workspaces = new WorkspaceRegistry(config, workspaceStore);
@@ -323,8 +341,15 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     // P1.6: operator-extended exclusion list, added to the defaults.
     excludedDirectories: config.fsSnapshot.excludedDirectories,
   });
+  const agentPtyBindings = createAgentPtyBindingStore(db.sqlite);
+  const staleAgentPtyBindings = agentPtyBindings.markUnresolvedLost();
+  removeStaleAgentPtyReviewCredentials(config.stateDir);
+  if (staleAgentPtyBindings > 0) {
+    console.warn(`[kontrol] marked ${staleAgentPtyBindings} prior agent PTY binding(s) lost during startup reconciliation`);
+  }
   const processSessions = new ProcessSessionManager({
     childEnvironmentAllowlist: config.childEnvironmentAllowlist,
+    agentPtyBindings,
     // P1 #14: operator-tunable resource controls; manager applies defaults
     // for anything unset.
     ...(config.processMaxRunning !== undefined && { maxRunningProcesses: config.processMaxRunning }),
@@ -382,6 +407,13 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
       const schema = db.sqlite.prepare("select max(version) as v from kontrol_schema_migrations").get() as { v?: number } | undefined;
       return Number(schema?.v ?? 0);
     },
+    schemaContract: () => {
+      const contract = inspectDatabaseSchemaContract(db.sqlite, { deployedBuildId: buildMeta.buildId });
+      return {
+        ok: contract.ok,
+        detail: `expectedVersion=${contract.expectedVersion}; deployedBuildId=${contract.deployedBuildId ?? "unknown"}; missing=${JSON.stringify(contract.missing)}`,
+      };
+    },
     executionAdmissionStats: () => mcpAdmission.getStats(),
     workspaceRegistryInitialized: () => Boolean(workspaces && workspaceStore),
     reviewSubsystemInitialized: () => Boolean(reviewWorkflow && workSessions && eventStore),
@@ -407,6 +439,16 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
   const dispatchOutbox = createDispatchOutbox(db);
   const scheduledJobs = createScheduledJobStore(db, dispatchOutbox);
   const reviewRoutes = createReviewRouteStore(db);
+  const reviewThreads = createReviewThreadStore(db);
+  const reviewBrowserJobs = createReviewerJobStore(db);
+  const reviewBrowserController = createReviewerBrowserController({
+    database: db,
+    stateDir: config.stateDir,
+    dispatchOutbox,
+    chromePath: config.reviewBrowserChromePath,
+  });
+  const reviewerTurnDispatcher = createReviewerTurnDispatcher({ outbox: dispatchOutbox, jobs: reviewBrowserJobs, browser: reviewBrowserController });
+  reviewerTurnDispatcher.start();
   const supervisorRuns = createSupervisorRuns(db);
   const approvalRequests = createApprovalRequestManager(db, {
     directReattachGraceMs: config.policyDirectApprovalReattachGraceMs,
@@ -439,6 +481,12 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     releasedSupervisorLeases: 0,
     reconciledWorkSessions: 0,
     markedStaleWorkSessions: 0,
+    recoveryWork: {
+      examinedRows: 0,
+      modifiedRows: 0,
+      totalDurationMs: 0,
+      longestSynchronousSliceMs: 0,
+    },
   };
   startupRecovery.releasedSupervisorLeases = supervisorRuns.releaseExpiredClaims();
   const startupReconciliation = createStartupReconciliation({
@@ -464,6 +512,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     missionLedger,
     dispatchOutbox,
     reviewRoutes,
+    reviewBrowserJobs,
   });
   // Shared live-waiter registry: the singleton dispatcher and every MCP client
   // consult the SAME instance, so a parked agent suppresses duplicate dispatch
@@ -521,7 +570,9 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     if (window.sessionsCreated > 10 || (window.toolCalls > 0 && window.sessionsPerToolCall >= 0.75)) {
       logEvent(config.logging, "warn", "mcp_session_reuse_low", {
         ...window,
-        logicalClients: mcpSessionMetrics.clients.size,
+        logicalClientsRetained: mcpSessionMetrics.clients.size,
+        retiredClientMetricRows: mcpSessionMetrics.retiredClientCount,
+        retainedHistoricalClientMetricRows: mcpSessionMetrics.retainedHistoricalClientCount,
       });
     }
   }, 60_000);
@@ -536,24 +587,26 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
   const snapshotStoreDiagnostics = async (): Promise<Record<string, unknown>> => {
     try {
       const store = reviewCheckpoints.getSnapshotStore();
-      const stats = await store.storeStats();
-      const movable = Number(stats.blobBytes) || 0;
-      const reachable = await store.estimateReachableBytes(collectFsSnapshotDbRoots);
+      const accounting = await store.storageAccounting(collectFsSnapshotDbRoots);
+      const runtimeStats = store.getStoreStatsForMetrics();
+      const reachableBlobs = accounting.blobs.counts.live;
+      const reachableBytes = accounting.blobs.bytes.live;
       return {
-        blobs: stats.blobs,
-        blobBytes: stats.blobBytes,
-        manifests: stats.manifests,
-        retainedManifests: reachable.manifests,
-        reachableBlobs: reachable.blobs,
-        reachableBytes: reachable.bytes,
-        orphanEstimate: Math.max(0, stats.blobs - reachable.blobs),
-        orphanBytesEstimate: Math.max(0, movable - reachable.bytes),
-        stagingBytes: stats.stagingBytes,
-        activeCaptures: stats.activeCaptures,
-        lastGcStartedAt: stats.lastGcStartedAt,
-        lastGcCompletedAt: stats.lastGcCompletedAt,
-        lastGcReclaimedBlobs: stats.lastGcReclaimedBlobs,
-        lastGcReclaimedBytes: stats.lastGcReclaimedBytes,
+        accounting,
+        blobs: accounting.blobs.total,
+        blobBytes: accounting.blobs.totalBytes,
+        manifests: accounting.manifests.total,
+        retainedManifests: accounting.manifests.retainedLive + accounting.manifests.retainedTerminal,
+        reachableBlobs,
+        reachableBytes,
+        orphanEstimate: Math.max(0, accounting.blobs.total - reachableBlobs),
+        orphanBytesEstimate: Math.max(0, accounting.blobs.totalBytes - reachableBytes),
+        stagingBytes: accounting.staging.bytes,
+        activeCaptures: runtimeStats.activeCaptures,
+        lastGcStartedAt: runtimeStats.lastGcStartedAt,
+        lastGcCompletedAt: runtimeStats.lastGcCompletedAt,
+        lastGcReclaimedBlobs: runtimeStats.lastGcReclaimedBlobs,
+        lastGcReclaimedBytes: runtimeStats.lastGcReclaimedBytes,
       };
     } catch (error) {
       return { error: error instanceof Error ? error.message : String(error) };
@@ -578,9 +631,23 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     events: {} as Record<string, number>,
     byGeneration: {} as Record<string, Record<string, number>>,
     byTransport: {} as Record<string, Record<string, number>>,
+    timeline: [] as Array<Record<string, unknown>>,
   };
-  const recordMcpConnectionEvent = (event: { kind: string; sessionId?: string; requestKind?: string; durationMs?: number }): void => {
+  const recordMcpConnectionEvent = (event: { kind: string; sessionId?: string; requestId?: string; operationId?: string; requestKind?: string; toolName?: string; failureClass?: string; durationMs?: number }): void => {
     const kind = event.kind;
+    mcpConnectionMetrics.timeline.push({
+      at: new Date().toISOString(),
+      kind,
+      generationId: config.launchGenerationId || "unknown-generation",
+      ...(event.sessionId ? { sessionIdPrefix: sessionIdPrefix(event.sessionId) } : {}),
+      ...(event.requestId ? { requestId: event.requestId } : {}),
+      ...(event.operationId ? { operationId: event.operationId } : {}),
+      ...(event.requestKind ? { requestKind: event.requestKind } : {}),
+      ...(event.toolName ? { toolName: event.toolName } : {}),
+      ...(event.failureClass ? { failureClass: event.failureClass } : {}),
+      ...(event.durationMs !== undefined ? { durationMs: Math.max(0, event.durationMs) } : {}),
+    });
+    if (mcpConnectionMetrics.timeline.length > 500) mcpConnectionMetrics.timeline.splice(0, mcpConnectionMetrics.timeline.length - 500);
     mcpConnectionMetrics.events[kind] = (mcpConnectionMetrics.events[kind] ?? 0) + 1;
     const generation = config.launchGenerationId || "unknown-generation";
     const transport = event.sessionId ? (sessionIdPrefix(event.sessionId) ?? "sessionless") : "sessionless";
@@ -623,6 +690,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     mcpResourceAdmission,
     expiredMcpOperations,
     operationDiagnostics,
+    qualificationEvidence,
     sessionLifecycle,
     workspaceAppResourceMetrics,
     recordUnknownSessionRequest: (sessionId: string) => {
@@ -644,7 +712,11 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     oauthEnabled: () => oauthEnabled,
     shuttingDown: () => shuttingDown,
     serveWorkspaceAppResource,
-    createServerForSession: (connectionContext: ConnectionContext) => createMcpServer(
+    onScheduledJobCreated: () => scheduledJobRuntimeRef?.wake(),
+    createServerForSession: (
+      connectionContext: ConnectionContext,
+      onToolCatalogHandshake?: Parameters<typeof createMcpServer>[26],
+    ) => createMcpServer(
       config,
       workspaces,
       reviewCheckpoints,
@@ -664,6 +736,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
       agentMessages,
       supervisorRuns,
       supervisorWake,
+      () => scheduledJobRuntimeRef?.wake(),
       db,
       mutationReceipts,
       (uri) => {
@@ -675,12 +748,18 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
       recordPhaseTiming,
       scheduledJobs,
       reviewRoutes,
-      (uri) => { /* noop handshake */ },
+      onToolCatalogHandshake ?? ((uri) => { /* noop handshake */ }),
+      (jobId) => reconcileScheduledJob?.(jobId) ?? Promise.resolve(undefined),
+      qualificationEvidence,
+      reviewBrowserController,
+      reviewThreads,
+      reviewBrowserJobs,
     ),
     mutationReceipts,
     workspaces,
     reviewCheckpoints,
     processSessions,
+    agentPtyBindings,
     workSessions,
     agentRegistry,
     eventStore,
@@ -695,7 +774,75 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     agentMessages,
     supervisorRuns,
     supervisorWake,
+    scheduledJobs,
+    reviewRoutes,
+    reviewThreads,
+    reviewBrowserController,
+    reviewerTurnDispatcher,
   };
+
+  // Peer listener (M1): strictly opt-in, separately authenticated, sharing
+  // every manager/DB/session map with the owner app. The MCP handler is the
+  // same code path with isPeerListener set; req.peerPrincipal (attached by
+  // the peer middleware) drives all peer authorization.
+  let peerApp: import("express").Express | undefined;
+  if (config.peer) {
+    const peerRegistry = PeerCredentialRegistry.open(config.peer.credentialFile);
+    const peerMcpDeps: McpHttpDeps = { ...mcpHttpDeps, isPeerListener: () => true };
+    peerApp = createPeerHttpApp({
+      config,
+      registry: peerRegistry,
+      isShuttingDown: () => shuttingDown,
+      workspaces,
+      workSessions,
+      reviewCheckpoints,
+      reviewWorkflow,
+      eventStore,
+      dispatchOutbox,
+      missionLedger,
+      database: db,
+      handleMcpRequest: (req, res) => {
+        void handleMcpHttpRequest(peerMcpDeps, req, res);
+      },
+    });
+  }
+
+  // Public OAuth MCP listener (P0-02): strictly opt-in via config.publicMcp
+  // (which loadConfig only produces in authMode=oauth). Shares every
+  // manager/DB/session map with the owner app through the deps spread; only
+  // the listener-kind fence differs (publicListener → "owner_public"
+  // sessions). Auth is derived ONCE above: the same provider, bearer gate,
+  // and resource URL as the owner listener — never a second provider.
+  let publicApp: import("express").Express | undefined;
+  if (config.publicMcp) {
+    const publicMcpDeps: McpHttpDeps = { ...mcpHttpDeps, publicListener: () => true };
+    // P0-04 wiring: the trusted-proxy policy derives ONCE at startup from the
+    // enabled owner_public profiles TARGETING the public OAuth listener
+    // (F3-C: a secure_tunnel_listener profile's relay peers must never become
+    // trusted peers here — the helper filters target too; this call-site
+    // filter keeps the contract visible where the policy is derived).
+    const publicProxyPolicy = trustedProxyPolicyForIngressProfiles(
+      config.ingress?.profiles.filter(
+        (profile) => profile.audience === "owner_public" && profile.target === "public_oauth_listener",
+      ),
+    );
+    publicApp = createPublicMcpApp({
+      config,
+      oauthProvider: oauthProvider!,
+      resourceServerUrl: resourceServerUrl!,
+      bearerAuth: bearerAuth!,
+      // F2-A: the public app builds its OWN OAuth router with SDK rate
+      // limiters disabled — the owner keeps deriveAuth's router and budgets.
+      trustedProxyPolicy: publicProxyPolicy,
+      // F2-1: operator-tunable edge caps from config.
+      edgeOAuthSurfaceMaxPerMinute: config.publicMcp.edgeOAuthSurfaceMaxPerMinute,
+      edgeMcpMaxPerMinute: config.publicMcp.edgeMcpMaxPerMinute,
+      edgeAuthorizeMaxAttemptsPerWindow: config.publicMcp.edgeAuthorizeMaxAttemptsPerWindow,
+      handleMcpRequest: (req, res) => {
+        void handleMcpHttpRequest(publicMcpDeps, req, res);
+      },
+    }).app;
+  }
 
   const diagnosticsDeps = {
     config,
@@ -705,9 +852,12 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     mcpResourceAdmission,
     expiredMcpOperations,
     operationDiagnostics,
+    qualificationEvidence,
     sessionLifecycle,
     policyWaiters,
     workspaceAppResourceMetrics,
+    workspaceStateMapTelemetry: () => workspaces.stateMapTelemetry(),
+    eventStoreMemoryTelemetry: () => eventStore.memoryTelemetry(),
     mcpConnectionMetrics,
     logicalContinuity,
     startupRecovery,
@@ -716,6 +866,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     snapshotStoreDiagnostics,
     degradedAuditSnapshot,
     processSessionMetrics: () => processSessions.getMetrics(),
+    scheduledJobMetrics: () => scheduledJobRuntime?.getMetrics() ?? { available: false },
     countActiveWorkSessions: () => workSessions.countActiveWorkSessions(),
     countPendingReviews: () => workSessions.countPendingReviews(),
     countAliveAgents: () => agentRegistry?.listAlive?.()?.length ?? 0,
@@ -743,8 +894,13 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
       config.acpAgentSecret,
       config.acpReviewerSecret,
       { enabled: config.webhookEnabled, allowedHosts: config.webhookAllowedHosts },
+      db,
+      scheduledJobs,
     ));
   }
+  app.post("/pty-review/renew", (req, res) => {
+    handleAgentPtyCredentialRenewal(mcpHttpDeps, req, res);
+  });
   app.all("/mcp", (req, res) => {
     void handleMcpHttpRequest(mcpHttpDeps, req, res);
   });
@@ -771,10 +927,12 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
   let supervisorRuntime: import("./supervisor-runtime.js").SupervisorRuntime | undefined;
   let replyDispatcher: import("./bridge/reply-dispatcher.js").ReplyDispatcher | undefined;
   let scheduledJobRuntime: import("./scheduling/scheduled-job-runtime.js").ScheduledJobRuntime | undefined;
+  let scheduledJobRuntimeRef: import("./scheduling/scheduled-job-runtime.js").ScheduledJobRuntime | undefined;
+  let reconcileScheduledJob: ((jobId: string) => Promise<import("./scheduling/scheduled-job-store.js").ScheduledJob | undefined>) | undefined;
   if (config.acpEnabled) {
     const acp = createAcpRuntime({
       config,
-      bridge: { workspaces, workSessions, reviewCheckpoints, agentRegistry, eventStore, continuationManager, dispatchOutbox, missionLedger, supervisorRuns, agentMessages, liveWaiters, scheduledJobs, reviewRoutes },
+      bridge: { workspaces, workSessions, reviewCheckpoints, agentRegistry, eventStore, continuationManager, dispatchOutbox, missionLedger, supervisorRuns, agentMessages, liveWaiters, scheduledJobs, reviewRoutes, reviewThreads, onScheduledJobCreated: () => scheduledJobRuntimeRef?.wake() },
       reviewWorkflow,
       recordPhaseTiming,
       database: db,
@@ -783,6 +941,8 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     supervisorRuntime = acp.supervisorRuntime;
     replyDispatcher = acp.replyDispatcher;
     scheduledJobRuntime = acp.scheduledJobRuntime;
+    scheduledJobRuntimeRef = acp.scheduledJobRuntime;
+    reconcileScheduledJob = acp.reconcileScheduledJob;
   }
 
   const shutdown = createShutdownController({
@@ -815,12 +975,20 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     processSessions,
     shutdownMissionVerifiers,
     integrity,
+    reviewBrowserController,
+    reviewerTurnDispatcher,
   });
   return {
     app,
+    peerApp,
+    publicApp,
     config,
     dispatcher,
-    close: shutdown.close,
+    close: async () => {
+      const peerJobRoutesHandle = (peerApp?.locals as { peerJobRoutesHandle?: { close?: () => Promise<void> } } | undefined)?.peerJobRoutesHandle;
+      await peerJobRoutesHandle?.close?.();
+      await shutdown.close();
+    },
     drain: shutdown.drain,
   };
 }
@@ -857,7 +1025,7 @@ export async function runServer(config = loadConfig()): Promise<void> {
     if (ownsRuntimeLock) await releaseRuntimeLock(runtimeLock);
     throw error;
   }
-  const { app, close, drain } = serverResources;
+  const { app, peerApp, publicApp, close, drain } = serverResources;
   const runtimeIdentity = createRuntimeIdentityRecord(
     buildMeta,
     process.argv.join(" "),
@@ -937,10 +1105,145 @@ export async function runServer(config = loadConfig()): Promise<void> {
     if (ownsRuntimeLock) await releaseRuntimeLock(runtimeLock);
     throw new Error(`kontrol failed to listen on ${config.host}:${config.port}: ${error instanceof Error ? error.message : String(error)}`);
   });
+  let peerHttpServer: import("node:http").Server | undefined;
+  let closePeerHttpServer: (() => Promise<void>) | undefined;
+  if (peerApp && config.peer) {
+    peerHttpServer = peerApp.listen(config.peer.port, config.peer.bindHost);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const onListening = () => {
+          peerHttpServer!.off("error", onError);
+          resolve();
+        };
+        const onError = (error: Error) => {
+          peerHttpServer!.off("listening", onListening);
+          reject(error);
+        };
+        peerHttpServer!.once("listening", onListening);
+        peerHttpServer!.once("error", onError);
+      });
+      console.log(`peer listener: http://${config.peer.bindHost}:${config.peer.port}/mcp (authenticated peers only)`);
+    } catch (error) {
+      // Candidate launch rollback: close both listener objects and the
+      // shared app resources; never publish a healthy generation with only
+      // one of the configured listeners alive.
+      try {
+        if (peerHttpServer.listening) {
+          await new Promise<void>((resolve) => peerHttpServer!.close(() => resolve()));
+        } else {
+          peerHttpServer.closeAllConnections?.();
+        }
+      } catch {
+        // Socket never became ours; resource cleanup below remains authoritative.
+      }
+      await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+      // Stop the peer job reaper and close the job store before the shared
+      // close() — a job-route teardown failure must never mask the original
+      // bind failure.
+      try {
+        const peerJobRoutesHandle = (peerApp?.locals as { peerJobRoutesHandle?: { close?: () => Promise<void> } } | undefined)?.peerJobRoutesHandle;
+        await peerJobRoutesHandle?.close?.();
+      } catch {
+        // Resource cleanup below remains authoritative.
+      }
+      await close();
+      if (ownsRuntimeLock) await releaseRuntimeLock(runtimeLock);
+      throw new Error(`kontrol peer listener failed to bind ${config.peer.bindHost}:${config.peer.port}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    closePeerHttpServer = async () => {
+      if (peerHttpServer!.listening) {
+        await new Promise<void>((resolve) => {
+          let settled = false;
+          const finish = () => {
+            if (settled) return;
+            settled = true;
+            resolve();
+          };
+          const deadline = setTimeout(() => {
+            (peerHttpServer as { closeAllConnections?: () => void }).closeAllConnections?.();
+            finish();
+          }, 5_000);
+          peerHttpServer!.close(() => {
+            clearTimeout(deadline);
+            finish();
+          });
+        });
+      }
+      // The listener no longer accepts requests. Drain the durable peer-result
+      // consumer before its sidecar and shared outbox/database are closed.
+      try {
+        const peerJobRoutesHandle = (peerApp?.locals as { peerJobRoutesHandle?: { close?: () => Promise<void> } } | undefined)?.peerJobRoutesHandle;
+        await peerJobRoutesHandle?.close?.();
+      } catch {
+        // Socket shutdown remains authoritative; shared shutdown reports its own drain failures.
+      }
+    };
+  }
+  let publicHttpServer: import("node:http").Server | undefined;
+  let closePublicHttpServer: (() => Promise<void>) | undefined;
+  if (publicApp && config.publicMcp) {
+    publicHttpServer = publicApp.listen(config.publicMcp.port, config.publicMcp.bindHost);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const onListening = () => {
+          publicHttpServer!.off("error", onError);
+          resolve();
+        };
+        const onError = (error: Error) => {
+          publicHttpServer!.off("listening", onListening);
+          reject(error);
+        };
+        publicHttpServer!.once("listening", onListening);
+        publicHttpServer!.once("error", onError);
+      });
+      console.log(`public MCP listener: http://${config.publicMcp.bindHost}:${config.publicMcp.port}/mcp (OAuth required)`);
+    } catch (error) {
+      // Candidate launch rollback (mirrors the peer bind block): close the
+      // failing listener object, every already-bound listener, and the shared
+      // app resources; never publish a half-bound generation.
+      try {
+        if (publicHttpServer.listening) {
+          await new Promise<void>((resolve) => publicHttpServer!.close(() => resolve()));
+        } else {
+          publicHttpServer.closeAllConnections?.();
+        }
+      } catch {
+        // Socket never became ours; resource cleanup below remains authoritative.
+      }
+      await closePeerHttpServer?.();
+      await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+      await close();
+      if (ownsRuntimeLock) await releaseRuntimeLock(runtimeLock);
+      throw new Error(`kontrol public MCP listener failed to bind ${config.publicMcp.bindHost}:${config.publicMcp.port}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    closePublicHttpServer = () => new Promise<void>((resolve) => {
+      if (!publicHttpServer!.listening) {
+        resolve();
+        return;
+      }
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        resolve();
+      };
+      const deadline = setTimeout(() => {
+        (publicHttpServer as { closeAllConnections?: () => void }).closeAllConnections?.();
+        finish();
+      }, 5_000);
+      publicHttpServer!.close(() => {
+        clearTimeout(deadline);
+        finish();
+      });
+    });
+  }
+
   try {
     writeRuntimeIdentity(config.stateDir, runtimeIdentity);
     runtimeIdentityWritten = true;
   } catch (error) {
+    await closePeerHttpServer?.();
+    await closePublicHttpServer?.();
     await close();
     await new Promise<void>((resolve) => httpServer.close(() => resolve()));
     if (ownsRuntimeLock) await releaseRuntimeLock(runtimeLock);
@@ -969,12 +1272,24 @@ export async function runServer(config = loadConfig()): Promise<void> {
           finish();
         });
       });
+      await closePeerHttpServer?.();
+      await closePublicHttpServer?.();
       await close();
       if (runtimeIdentityWritten) removeRuntimeIdentity(config.stateDir, runtimeIdentity.instanceId);
       if (ownsRuntimeLock) await releaseRuntimeLock(runtimeLock);
       process.exit(0);
     } catch (error) {
       console.error(`kontrol graceful shutdown failed: ${error instanceof Error ? error.message : String(error)}`);
+      if (error instanceof McpDrainIncompleteError) {
+        // Leave the generation, transports, and SQLite alive while the
+        // authoritative handlers still own admission. A later signal can
+        // retry the drain after they settle; emergency process termination
+        // remains the supervisor's bounded stop policy.
+        shutdownStarted = false;
+        process.once("SIGINT", shutdown);
+        process.once("SIGTERM", shutdown);
+        return;
+      }
       await close();
       if (runtimeIdentityWritten) removeRuntimeIdentity(config.stateDir, runtimeIdentity.instanceId);
       if (ownsRuntimeLock) await releaseRuntimeLock(runtimeLock);

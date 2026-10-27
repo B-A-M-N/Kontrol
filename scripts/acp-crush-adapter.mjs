@@ -20,17 +20,29 @@
 //              registration is a smoke test. Real dispatches REQUIRE a valid
 //              workspace_root (fail-closed, see validateWorkspaceRoot).
 
-import { spawn } from "node:child_process";
 import { readFile, realpath, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { createServer } from "node:http";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
 import { signWorkerToken, TOKEN_TTL_MS } from "./lib/acp-worker-token.mjs";
 import { clearAgentIdentity, identityHeaders, loadAgentIdentity, saveAgentIdentity } from "./lib/acp-agent-identity.mjs";
 import { readJsonBody, truncateUtf8Tail, writeAdapterError } from "./lib/adapter-http.mjs";
-import { adapterStatePath, atomicWriteJson, processStartToken, reconcileOwnedProcesses, terminateProcessGroup } from "./lib/managed-agent-process.mjs";
+import { adapterStatePath, atomicWriteJson, prepareOwnedChild, processStartToken, reconcileOwnedProcesses, terminateProcessGroup } from "./lib/managed-agent-process.mjs";
 import { applyWorkspaceLeaseRenewal, workspaceLeaseDeadline, workspaceLeaseDeadlineReached } from "./lib/workspace-lease.mjs";
+import { acknowledgeAdapterDispatchReceipt, adapterDispatchFingerprint, findAdapterDispatchReceipt, isTerminalAdapterDispatchStatus, loadAdapterDispatchReceipts, reconcileAdapterDispatchReceipts, recordAdapterDispatchReceipt } from "./lib/adapter-dispatch-receipts.mjs";
+const readOnlyModuleUrl = process.env.KONTROL_ARTIFACT_PATH
+  ? pathToFileURL(resolve(process.env.KONTROL_ARTIFACT_PATH, "read-only-execution.mjs"))
+  : new URL("./lib/read-only-execution.mjs", import.meta.url);
+const readOnlyExecutionModule = await import(readOnlyModuleUrl);
+const {
+  buildReadOnlySandboxCommand,
+  probeReadOnlyExecutionSandbox,
+  readOnlyWorkerEnvironment,
+  resolveExecutablePath,
+  validateReadOnlyDispatchRequest,
+} = readOnlyExecutionModule;
 
 const KONTROL_ACP_URL = process.env.KONTROL_ACP_URL || "http://127.0.0.1:7676/acp";
 const AGENT_SECRET = process.env.KONTROL_ACP_AGENT_SECRET;
@@ -58,6 +70,7 @@ const HEARTBEAT_INTERVAL_MS = 55_000;
 const RUN_HEARTBEAT_MS = 10_000;
 const REPLAY_WINDOW_MS = 24 * 60 * 60 * 1000;
 const REPLAY_STORE_PATH = process.env.ACP_ADAPTER_REPLAY_STORE || adapterStatePath("crush", "replay.json");
+const DISPATCH_RECEIPTS_PATH = process.env.KONTROL_CRUSH_DISPATCH_RECEIPTS || adapterStatePath("crush", "dispatch-receipts.json");
 const OWNED_PROCESSES_PATH = process.env.KONTROL_CRUSH_OWNED_PROCESSES
   || process.env.KONTROL_ACP_OWNED_PROCESSES
   || adapterStatePath("crush", "owned-processes.json");
@@ -86,10 +99,12 @@ if (process.argv.includes("--validate-imports")) {
 const activeProcesses = new Map(); // pid -> { child, run }
 const activeBySession = new Map(); // workSessionId -> run
 const replayByDispatchKey = new Map(); // `${devRunId}:${continuationId}` -> accepted response
+const dispatchReceipts = new Map();
 const ownedProcesses = new Map(); // remoteRunId -> durable detached-child identity
 let agentIdentity = null;
 let shuttingDown = false;
 const adapterGenerationId = process.env.KONTROL_LAUNCH_GENERATION_ID || "unknown";
+const TERMINAL_REPLAY_STATUSES = new Set(["completed", "failed", "failed_protocol", "cancelled", "rejected", "unstarted"]);
 let reconciliationComplete = false;
 let orphanProcessesTerminated = 0;
 
@@ -105,8 +120,49 @@ async function main() {
   const reconciliation = await reconcileOwnedProcesses(OWNED_PROCESSES_PATH, "adapter");
   orphanProcessesTerminated = reconciliation.terminated;
   reconciliationComplete = true;
+  for (const [key, receipt] of await loadAdapterDispatchReceipts(DISPATCH_RECEIPTS_PATH)) dispatchReceipts.set(key, receipt);
   await loadReplayStore();
+  const launchRecovery = await reconcileAdapterDispatchReceipts(DISPATCH_RECEIPTS_PATH, dispatchReceipts, reconciliation.records);
+  for (const { receipt, status } of launchRecovery) {
+    updateReplayReceipt(receipt.key, receipt.remoteRunId, status, {
+      authoritativelyUnstarted: receipt.authoritativelyUnstarted,
+      error: receipt.lastError,
+    });
+  }
+  const recoveredRuns = reconciliation.records.filter((record) => record?.dispatchIdempotencyKey && record?.kontrolRunId
+    && findAdapterDispatchReceipt(dispatchReceipts, record.dispatchIdempotencyKey)?.status !== "unstarted");
+  for (const record of recoveredRuns) {
+    const prior = replayByDispatchKey.get(record.dispatchIdempotencyKey);
+    const receipt = findAdapterDispatchReceipt(dispatchReceipts, record.dispatchIdempotencyKey);
+    const priorStatus = prior?.status ?? prior?.response?.status ?? receipt?.status;
+    if (!TERMINAL_REPLAY_STATUSES.has(priorStatus)) {
+      const error = "Adapter restarted and confirmed its detached CRUSH worker stopped before a terminal result was recorded.";
+      if (prior) updateReplayReceipt(record.dispatchIdempotencyKey, record.remoteRunId, "failed", { error });
+      else replayByDispatchKey.set(record.dispatchIdempotencyKey, {
+        response: {
+          run_id: record.remoteRunId,
+          remote_run_id: record.remoteRunId,
+          accepted: true,
+          status: "failed",
+          dispatch_idempotency_key: record.dispatchIdempotencyKey,
+        },
+        status: "failed",
+        createdAt: receipt?.createdAt ?? Date.now(),
+        requestFingerprint: receipt?.requestFingerprint ?? record.requestFingerprint,
+      });
+      await recordAdapterDispatchReceipt(DISPATCH_RECEIPTS_PATH, dispatchReceipts, record.dispatchIdempotencyKey, record.remoteRunId, "failed", {
+        requestFingerprint: receipt?.requestFingerprint ?? record.requestFingerprint,
+        workSessionId: receipt?.workSessionId ?? record.workSessionId,
+        workspaceSessionId: receipt?.workspaceSessionId ?? record.workspaceSessionId,
+        agentId: receipt?.agentId ?? record.agentId,
+        attemptNumber: receipt?.attemptNumber ?? record.attemptNumber,
+        lastError: error,
+      });
+    }
+  }
+  await saveReplayStore();
   agentIdentity = await registerAgent();
+  for (const record of recoveredRuns) await reportRecoveredRun(record);
   startHeartbeat();
 
   process.on("SIGTERM", shutdown);
@@ -137,7 +193,7 @@ async function registerAgent() {
         url: `http://${ADAPTER_HOST}:${ADAPTER_PORT}`,
         description: `ACP adapter wrapping the ${AGENT_BIN} coding agent`,
         role: "agent",
-        capabilities: ["file-read", "file-write", "shell", "submit-review", `agent:${AGENT_BIN}`],
+        capabilities: ["file-read", "file-write", "shell", "submit-review", "scheduled:read_only_audit", `agent:${AGENT_BIN}`],
         ttlSeconds: Math.max(60, Math.floor(HEARTBEAT_INTERVAL_MS / 1000) + 30),
       }),
     });
@@ -189,6 +245,8 @@ async function handleRequest(req, res) {
 
   if (url === "/health" && method === "GET") {
     const ready = reconciliationComplete && !shuttingDown;
+    const executableAvailable = Boolean(resolveExecutablePath(CRUSH_BIN));
+    const confinementAvailable = Boolean(resolveExecutablePath("bwrap") && resolveExecutablePath("prlimit"));
     return writeJson(res, ready ? 200 : 503, {
       ok: ready,
       ready,
@@ -197,6 +255,16 @@ async function handleRequest(req, res) {
       orphanProcessesTerminated,
       workers: activeProcesses.size,
       generationId: adapterGenerationId,
+      executionCapabilities: {
+        read_only_audit: {
+          supported: true,
+          grantPolicy: "kontrol_signed_attempt_bound",
+          confinementAvailable,
+          executableAvailable,
+          cliInputContract: "crush_positional_instruction_plus_stdin_v1",
+          networkPolicies: ["disabled", "host"],
+        },
+      },
     });
   }
 
@@ -208,6 +276,39 @@ async function handleRequest(req, res) {
     }
     const body = await readJsonBody(req);
     return handleRunRequest(req, res, body);
+  }
+
+  const dispatchLookupMatch = url.match(/^\/runs\/by-dispatch-id\/([^/]+)$/);
+  if (dispatchLookupMatch && method === "GET") {
+    if ((req.headers.authorization || "") !== `Bearer ${ADAPTER_SECRET}`) {
+      return writeJson(res, 401, { error: { code: "unauthorized" } });
+    }
+    const key = decodeURIComponent(dispatchLookupMatch[1]);
+    const active = [...activeProcesses.values()].find(({ run }) => run.dispatchIdempotencyKey === key)?.run;
+    const replay = replayByDispatchKey.get(key);
+    const response = active
+      ? {
+        run_id: active.remoteRunId,
+        remote_run_id: active.remoteRunId,
+        accepted: active.launchState === "running",
+        status: active.launchState === "running" ? "running" : "uncertain",
+        dispatch_idempotency_key: key,
+        ...(active.readOnlyExecutionReceipt ? { execution_receipt: active.readOnlyExecutionReceipt } : {}),
+      }
+      : replay?.response;
+    if (response?.run_id || response?.remote_run_id) {
+      return writeJson(res, 200, {
+        ...response,
+        accepted: response.accepted === true,
+        status: response.status === "dispatching" ? "uncertain" : response.status,
+        dispatch_idempotency_key: response.dispatch_idempotency_key ?? key,
+        ...(response.authoritatively_unstarted === true || response.status === "unstarted"
+          ? { authoritatively_unstarted: true }
+          : {}),
+        ...(!response.execution_receipt && receipt?.executionReceipt ? { execution_receipt: receipt.executionReceipt } : {}),
+      });
+    }
+    return writeJson(res, 404, { error: { code: "not_found", message: "dispatch key has no authoritative accepted run" } });
   }
 
   const cancelMatch = url.match(/^\/runs\/([^/]+)\/cancel$/);
@@ -238,6 +339,7 @@ async function handleRequest(req, res) {
 }
 
 async function handleRunRequest(req, res, body) {
+  const requestFingerprint = adapterDispatchFingerprint(body);
   const devRunId = body.parent_run_id || body.run_id || `dev_${randomUUID()}`;
   const workspaceSessionId = body.workspace_session_id;
   // The Kontrol-owned work session (review/work-session) id. This is what binds
@@ -249,7 +351,9 @@ async function handleRunRequest(req, res, body) {
   const token = body.token;
   const mode = body.mode;
   const workspaceRootRaw = body.workspace_root;
-  const dispatchKey = continuationId ? `${devRunId}:${continuationId}` : undefined;
+  const dispatchKey = typeof body.dispatch_idempotency_key === "string" && body.dispatch_idempotency_key.length > 0
+    ? body.dispatch_idempotency_key
+    : continuationId ? `${devRunId}:${continuationId}` : undefined;
   const smokeTest = body.smoke_test === true || body?.metadata?.kontrol_smoke_test === true;
 
   if (!smokeTest && !task.trim()) {
@@ -261,8 +365,25 @@ async function handleRunRequest(req, res, body) {
   if (dispatchKey) {
     pruneReplayStore();
     const replay = replayByDispatchKey.get(dispatchKey);
-    if (replay) {
-      return writeJson(res, 202, { ...replay.response, replayed: true });
+    const receipt = findAdapterDispatchReceipt(dispatchReceipts, dispatchKey);
+    if (replay || receipt) {
+      const priorFingerprint = receipt?.requestFingerprint ?? replay?.requestFingerprint;
+      if (!priorFingerprint || priorFingerprint !== requestFingerprint) {
+        return writeJson(res, 409, { error: { code: priorFingerprint ? "dispatch_idempotency_conflict" : "dispatch_fingerprint_unavailable", message: "The original dispatch key is already bound to different or unverifiable request content." } });
+      }
+      const response = replay?.response ?? {
+        run_id: receipt.remoteRunId,
+        remote_run_id: receipt.remoteRunId,
+        accepted: !["dispatching", "unstarted"].includes(receipt.status),
+        status: receipt.status,
+        dispatch_idempotency_key: dispatchKey,
+        ...(receipt.authoritativelyUnstarted ? { authoritatively_unstarted: true } : {}),
+      };
+      return writeJson(res, 202, {
+        ...response,
+        ...(!response.execution_receipt && receipt?.executionReceipt ? { execution_receipt: receipt.executionReceipt } : {}),
+        replayed: true,
+      });
     }
   }
 
@@ -270,9 +391,11 @@ async function handleRunRequest(req, res, body) {
   if (workSessionId && activeBySession.has(workSessionId)) {
     const existing = activeBySession.get(workSessionId);
     return writeJson(res, 409, {
-      error: { code: "conflict", message: "A worker is already running for this work session" },
+      error: { code: "duplicate_session", message: "A worker is already running for this work session" },
       run_id: existing.remoteRunId,
+      remote_run_id: existing.remoteRunId,
       work_session_id: workSessionId,
+      dispatch_idempotency_key: existing.dispatchIdempotencyKey,
     });
   }
 
@@ -283,6 +406,8 @@ async function handleRunRequest(req, res, body) {
     workSessionId,
     agentId,
     continuationId,
+    dispatchIdempotencyKey: dispatchKey,
+    launchState: "dispatching",
     workspaceRoot: null, // set below; validateWorkspaceRoot throws on bad input
     task,
     mode,
@@ -291,6 +416,7 @@ async function handleRunRequest(req, res, body) {
     workspaceLeaseExpiresAt: body.workspace_lease_expires_at,
     workspaceLeaseDeadlineAt: workspaceLeaseDeadline(body.workspace_lease_expires_at),
     attemptNumber: body.attempt_number,
+    requestFingerprint,
     startedAt: Date.now(),
     finalized: false,
     stdout: "",
@@ -326,15 +452,11 @@ async function handleRunRequest(req, res, body) {
       run_id: run.remoteRunId,
       remote_run_id: run.remoteRunId,
       accepted: true,
+      status: "completed",
+      ...(dispatchKey ? { dispatch_idempotency_key: dispatchKey } : {}),
       mode: mode || "async",
       smoke_test: true,
       agent_bin: resolveAgentBin(),
-    });
-  }
-
-  if (workSessionId && (!run.workspaceLeaseNonce || workspaceLeaseDeadlineReached(run))) {
-    return writeJson(res, 409, {
-      error: { code: "workspace_lease_lost", message: "A live workspace lease nonce and expiry are required before a worker can start." },
     });
   }
 
@@ -349,6 +471,54 @@ async function handleRunRequest(req, res, body) {
       return writeJson(res, 400, { error: { code: "invalid_workspace_root", message: err.message } });
     }
     throw err;
+  }
+
+  const readOnlyAuthorization = validateReadOnlyDispatchRequest(body, run.workspaceRoot, ADAPTER_SECRET, agentIdentity?.agentId);
+  if (readOnlyAuthorization.readOnly && !readOnlyAuthorization.valid) {
+    return writeJson(res, 403, { error: { code: "read_only_grant_invalid", message: "A valid Kontrol-issued read-only execution grant is required." } });
+  }
+  run.readOnlyAudit = readOnlyAuthorization.readOnly;
+  run.readOnlyExecutionGrant = readOnlyAuthorization.readOnly ? readOnlyAuthorization.grant : undefined;
+  if (run.readOnlyAudit) {
+    const executable = resolveExecutablePath(CRUSH_BIN);
+    if (!executable) {
+      return writeJson(res, 503, { error: { code: "sandbox_unavailable", message: "The configured CRUSH executable cannot be resolved for confined execution." } });
+    }
+    try {
+      probeReadOnlyExecutionSandbox({ workspaceRoot: run.workspaceRoot, networkPolicy: run.readOnlyExecutionGrant.networkPolicy });
+      run.readOnlySandbox = buildReadOnlySandboxCommand({
+        workspaceRoot: run.workspaceRoot,
+        executable,
+        args: buildAgentArgs(),
+        env: workerEnvironment(run),
+        networkPolicy: run.readOnlyExecutionGrant.networkPolicy,
+      });
+    } catch (error) {
+      if (error?.code === "sandbox_unavailable") {
+        return writeJson(res, 503, { error: { code: "sandbox_unavailable", message: error.message } });
+      }
+      throw error;
+    }
+    const grant = run.readOnlyExecutionGrant;
+    run.readOnlyExecutionReceipt = {
+      mode: "read_only_audit",
+      execution_grant: grant,
+      issuer: "kontrol",
+      work_session_id: workSessionId,
+      workspace_session_id: workspaceSessionId,
+      parent_run_id: devRunId,
+      remote_run_id: run.remoteRunId,
+      attempt_number: run.attemptNumber,
+      dispatch_idempotency_key: dispatchKey,
+      grant_expires_at: grant.expiresAt,
+      grant_fingerprint: createHash("sha256").update(grant.signature).digest("hex"),
+      network_policy: grant.networkPolicy,
+      confinement: grant.networkPolicy === "host" ? "bubblewrap-read-only-workspace-host-network" : "bubblewrap-read-only-workspace-no-network",
+    };
+  } else if (workSessionId && (!run.workspaceLeaseNonce || workspaceLeaseDeadlineReached(run))) {
+    return writeJson(res, 409, {
+      error: { code: "workspace_lease_lost", message: "A live workspace mutation lease nonce and expiry are required before a modifying worker can start." },
+    });
   }
 
   // Issue a signed worker token so Kontrol can authenticate this worker's role
@@ -366,8 +536,57 @@ async function handleRunRequest(req, res, body) {
     }, AGENT_SECRET);
   }
 
+  const agentLaunch = buildAgentLaunch(run);
+
+  if (dispatchKey) {
+    replayByDispatchKey.set(dispatchKey, {
+      response: {
+        run_id: run.remoteRunId,
+        remote_run_id: run.remoteRunId,
+        accepted: false,
+        status: "dispatching",
+        dispatch_idempotency_key: dispatchKey,
+      },
+      status: "dispatching",
+      createdAt: Date.now(),
+      requestFingerprint,
+      workspaceRoot: run.workspaceRoot,
+      workSessionId: run.workSessionId,
+      workspaceSessionId: run.workspaceSessionId,
+      agentId: run.agentId,
+      attemptNumber: run.attemptNumber,
+    });
+    try {
+      await recordAdapterDispatchReceipt(DISPATCH_RECEIPTS_PATH, dispatchReceipts, dispatchKey, run.remoteRunId, "dispatching", {
+        launchGateVersion: 1,
+        parentRunId: run.devRunId,
+        requestFingerprint,
+        workspaceRoot: run.workspaceRoot,
+        workSessionId: run.workSessionId,
+        workspaceSessionId: run.workspaceSessionId,
+        agentId: run.agentId,
+        attemptNumber: run.attemptNumber,
+        executionReceipt: run.readOnlyExecutionReceipt,
+        intendedChild: {
+          command: agentLaunch.command,
+          cwd: run.workspaceRoot,
+          argsSha256: createHash("sha256").update(JSON.stringify(agentLaunch.args)).digest("hex"),
+        },
+      });
+      await saveReplayStore();
+    } catch (error) {
+      return writeJson(res, 500, { error: { code: "receipt_persistence_failed", message: error instanceof Error ? error.message : String(error) } });
+    }
+  }
+
   try {
-    const child = spawnAgent(run);
+    const launchGate = await prepareOwnedChild(agentLaunch.command, agentLaunch.args, {
+      cwd: run.workspaceRoot,
+      env: agentLaunch.env,
+    });
+    run.launchGate = launchGate;
+    const child = launchGate.child;
+    child.stdin.end(run.task);
     activeProcesses.set(child.pid, { child, run });
     run.childPid = child.pid;
     ownedProcesses.set(run.remoteRunId, {
@@ -375,12 +594,18 @@ async function handleRunRequest(req, res, body) {
       workSessionId: run.workSessionId,
       workspaceSessionId: run.workspaceSessionId,
       kontrolRunId: run.devRunId,
+      dispatchIdempotencyKey: run.dispatchIdempotencyKey,
+      attemptNumber: run.attemptNumber,
+      requestFingerprint,
+      executionReceipt: run.readOnlyExecutionReceipt,
+      readOnlyExecutionGrant: run.readOnlyExecutionGrant,
       pid: child.pid,
       processGroupId: child.pid,
       processStartToken: processStartToken(child.pid),
+      launchState: "prepared",
       workspaceRoot: run.workspaceRoot,
       adapterGenerationId,
-      commandIdentity: `${CRUSH_BIN} run --debug --quiet`,
+      commandIdentity: agentLaunch.command,
       startedAt: run.startedAt,
     });
     try {
@@ -392,8 +617,18 @@ async function handleRunRequest(req, res, body) {
       };
       activeProcesses.delete(child.pid);
       ownedProcesses.delete(run.remoteRunId);
+      launchGate.abort();
       try { await terminateProcessGroup(ownership, 5_000); } catch { /* report the original persistence failure */ }
       throw new Error(`cannot durably record child ownership: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const ownership = ownedProcesses.get(run.remoteRunId);
+    ownership.launchState = "start_requested";
+    run.launchState = "start_requested";
+    await saveOwnedProcesses();
+    if (dispatchKey) {
+      await recordAdapterDispatchReceipt(DISPATCH_RECEIPTS_PATH, dispatchReceipts, dispatchKey, run.remoteRunId, "dispatching", {
+        launchState: "start_requested",
+      });
     }
 
     // Per-run heartbeat (P1 #7): Kontrol writes workerLeaseUntil on each
@@ -424,18 +659,13 @@ async function handleRunRequest(req, res, body) {
       }
     }, RUN_HEARTBEAT_MS);
     const leaseWatchdogTimer = setInterval(() => {
-      if (workspaceLeaseDeadlineReached(run) && !run.finalized && !run.terminating) {
+      if (!run.readOnlyAudit && workspaceLeaseDeadlineReached(run) && !run.finalized && !run.terminating) {
         void terminateRun(run, "workspace lease renewal deadline elapsed", "failed");
       }
     }, 1_000).unref?.();
     const stopHeartbeat = () => clearInterval(heartbeatTimer);
 
-    child.on("spawn", () => {
-      console.log(`[run ${run.remoteRunId}] spawned pid=${child.pid} cwd=${run.workspaceRoot}`);
-      reportEvent(run, "started");
-    });
-
-    child.on("error", (err) => {
+    const handleChildError = (err) => {
       console.error(`[run ${run.remoteRunId}] spawn error:`, err.message);
       stopHeartbeat();
       clearInterval(leaseWatchdogTimer);
@@ -443,9 +673,16 @@ async function handleRunRequest(req, res, body) {
       ownedProcesses.delete(run.remoteRunId);
       void saveOwnedProcesses().catch((error) => console.warn(`[adapter] failed to persist child ownership cleanup: ${error.message}`));
       if (!run.terminating) void finalizeRun(run, "failed", err.message);
+    };
+    child.on("error", (err) => {
+      if (!run.acceptancePersisted) {
+        run.pendingChildError = err;
+        return;
+      }
+      handleChildError(err);
     });
 
-    child.on("exit", (code, signal) => {
+    const handleChildExit = (code, signal) => {
       stopHeartbeat();
       clearInterval(leaseWatchdogTimer);
       activeProcesses.delete(child.pid);
@@ -471,6 +708,13 @@ async function handleRunRequest(req, res, body) {
           { exitCode: code, signal },
         );
       }
+    };
+    child.on("exit", (code, signal) => {
+      if (!run.acceptancePersisted) {
+        run.pendingChildExit = [code, signal];
+        return;
+      }
+      handleChildExit(code, signal);
     });
 
     child.stdout.on("data", (d) => {
@@ -491,18 +735,53 @@ async function handleRunRequest(req, res, body) {
       activeBySession.set(workSessionId, run);
     }
 
+    run.launchOpenRequested = true;
+    await launchGate.start();
+    if (dispatchKey) {
+      await recordAdapterDispatchReceipt(DISPATCH_RECEIPTS_PATH, dispatchReceipts, dispatchKey, run.remoteRunId, "running", {
+        requestFingerprint,
+        pid: child.pid,
+        launchState: "worker_started",
+      });
+    }
+    run.acceptancePersisted = true;
+    run.launchState = "running";
+    console.log(`[run ${run.remoteRunId}] worker spawned pid=${child.pid} cwd=${run.workspaceRoot}`);
+    reportEvent(run, "started");
+
     const acceptedResponse = {
       run_id: run.remoteRunId,
       remote_run_id: run.remoteRunId,
       accepted: true,
+      status: "running",
+      ...(dispatchKey ? { dispatch_idempotency_key: dispatchKey } : {}),
       mode: mode || "sync",
+      ...(run.readOnlyExecutionReceipt ? { execution_receipt: run.readOnlyExecutionReceipt } : {}),
     };
     if (dispatchKey) {
-      replayByDispatchKey.set(dispatchKey, { response: acceptedResponse, createdAt: Date.now() });
-      void saveReplayStore();
+      replayByDispatchKey.set(dispatchKey, { response: acceptedResponse, status: "running", createdAt: Date.now() });
+      await saveReplayStore();
     }
+    if (run.pendingChildError) handleChildError(run.pendingChildError);
+    else if (run.pendingChildExit) handleChildExit(...run.pendingChildExit);
     return writeJson(res, 202, acceptedResponse);
   } catch (err) {
+    if (!run.launchOpenRequested) run.launchGate?.abort();
+    if (run.childPid && !run.finalized) {
+      await terminateRun(run, "adapter could not durably accept the dispatch", "failed");
+    } else if (dispatchKey) {
+      updateReplayReceipt(dispatchKey, run.remoteRunId, "failed", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      await saveReplayStore().catch(() => {});
+      await recordAdapterDispatchReceipt(DISPATCH_RECEIPTS_PATH, dispatchReceipts, dispatchKey, run.remoteRunId, "failed", {
+        requestFingerprint,
+        lastError: err instanceof Error ? err.message : String(err),
+      }).catch(() => {});
+    }
+    if (err?.code === "sandbox_unavailable") {
+      return writeJson(res, 503, { error: { code: "sandbox_unavailable", message: err.message } });
+    }
     return writeJson(res, 500, { error: { message: err.message } });
   }
 }
@@ -529,8 +808,13 @@ export function extractTask(input) {
 // Exported so it can be unit-tested without spawning the model. The installed
 // CRUSH build does not support `--no-color`; it supports `--quiet`, and the
 // adapter already suppresses ANSI via NO_COLOR=1 in workerEnvironment().
+export const CRUSH_STDIN_INSTRUCTION = "Execute the complete task supplied on standard input.";
+
 export function buildCrushArgs() {
-  return ["run", "--debug", "--quiet"];
+  // CRUSH requires a positional prompt to enter run mode. Keep that prompt
+  // fixed and non-sensitive; the complete task remains on stdin so it never
+  // appears in process listings or routine adapter logs.
+  return ["run", "--debug", "--quiet", CRUSH_STDIN_INSTRUCTION];
 }
 
 export function buildAgentArgs() {
@@ -546,20 +830,31 @@ export function appendBoundedOutput(current, next, limit = OUTPUT_TAIL_CHARS) {
   return truncateUtf8Tail(combined, limit);
 }
 
-function spawnAgent(run) {
+function buildAgentLaunch(run) {
   const bin = resolveAgentBin();
   const args = buildAgentArgs();
   console.log(`[run ${run.remoteRunId}] launching ${CRUSH_BIN} ${args.slice(0, 3).join(" ")} ...`);
-  const child = spawn(bin, args, {
-    cwd: run.workspaceRoot,
-    env: workerEnvironment(run),
-    detached: true,
-  });
-  child.stdin.end(run.task);
-  return child;
+  if (run.readOnlyAudit) {
+    const sandbox = run.readOnlySandbox;
+    if (!sandbox) {
+      const error = new Error("Read-only sandbox was not prepared before worker launch.");
+      error.code = "sandbox_unavailable";
+      throw error;
+    }
+    return {
+      command: sandbox.command,
+      args: sandbox.args,
+      cwd: run.workspaceRoot,
+      env: { PATH: process.env.PATH || "/usr/bin:/bin" },
+    };
+  }
+  return { command: bin, args, cwd: run.workspaceRoot, env: workerEnvironment(run) };
 }
 
-function workerEnvironment(run) {
+export function workerEnvironment(run, source = process.env) {
+  if (run.readOnlyAudit) {
+    return readOnlyWorkerEnvironment(source);
+  }
   const allowed = [
     "HOME",
     "PATH",
@@ -580,7 +875,7 @@ function workerEnvironment(run) {
   ];
   const env = {};
   for (const key of allowed) {
-    if (process.env[key] !== undefined) env[key] = process.env[key];
+    if (source[key] !== undefined) env[key] = source[key];
   }
   env.NO_COLOR = "1";
   env.TERM = "dumb";
@@ -615,18 +910,44 @@ async function loadReplayStore() {
 function pruneReplayStore() {
   const cutoff = Date.now() - REPLAY_WINDOW_MS;
   for (const [key, value] of replayByDispatchKey) {
-    if (!value?.createdAt || value.createdAt < cutoff) replayByDispatchKey.delete(key);
+    const status = value?.status ?? value?.response?.status;
+    if (TERMINAL_REPLAY_STATUSES.has(status) && value?.createdAt && value.createdAt < cutoff) replayByDispatchKey.delete(key);
   }
+  while (replayByDispatchKey.size > 10_000) {
+    const oldestTerminal = [...replayByDispatchKey].find(([, value]) => TERMINAL_REPLAY_STATUSES.has(value?.status ?? value?.response?.status))?.[0];
+    if (!oldestTerminal) break;
+    replayByDispatchKey.delete(oldestTerminal);
+  }
+}
+
+function updateReplayReceipt(key, remoteRunId, status, details = {}) {
+  const prior = replayByDispatchKey.get(key);
+  if (prior && prior.response?.remote_run_id && prior.response.remote_run_id !== remoteRunId) {
+    throw new Error(`dispatch replay identity conflict for ${key}`);
+  }
+  if (prior && TERMINAL_REPLAY_STATUSES.has(prior.status ?? prior.response?.status)
+    && (prior.status ?? prior.response?.status) !== status) {
+    return prior;
+  }
+  const response = {
+    ...prior?.response,
+    run_id: remoteRunId,
+    remote_run_id: remoteRunId,
+    accepted: status !== "unstarted",
+    status,
+    dispatch_idempotency_key: key,
+    ...(status === "unstarted" && details.authoritativelyUnstarted ? { authoritatively_unstarted: true } : {}),
+    ...(details.error ? { error: { message: details.error } } : {}),
+  };
+  const value = { ...prior, response, status, createdAt: prior?.createdAt ?? Date.now(), updatedAt: Date.now() };
+  replayByDispatchKey.set(key, value);
+  return value;
 }
 
 async function saveReplayStore() {
   pruneReplayStore();
   const obj = Object.fromEntries(replayByDispatchKey);
-  try {
-    await atomicWriteJson(REPLAY_STORE_PATH, obj);
-  } catch (err) {
-    console.warn(`[adapter] failed to persist replay store: ${err.message}`);
-  }
+  await atomicWriteJson(REPLAY_STORE_PATH, obj);
 }
 
 async function saveOwnedProcesses() {
@@ -684,6 +1005,13 @@ async function finalizeRun(run, status, error, details) {
   }
   run.finalized = true;
   console.log(`[run ${run.remoteRunId}] finalize: ${status}${error ? `: ${error}` : ""}`);
+  if (run.dispatchIdempotencyKey) {
+    updateReplayReceipt(run.dispatchIdempotencyKey, run.remoteRunId, status, { error });
+    await saveReplayStore().catch((receiptError) => console.warn(`[adapter] terminal replay receipt failed: ${receiptError.message}`));
+    await recordAdapterDispatchReceipt(DISPATCH_RECEIPTS_PATH, dispatchReceipts, run.dispatchIdempotencyKey, run.remoteRunId, status, {
+      lastError: error,
+    }).catch((receiptError) => console.warn(`[adapter] terminal dispatch receipt failed: ${receiptError.message}`));
+  }
 
   flushAllOutput(run);
   // Output telemetry and the terminal event share one ordered queue. This
@@ -768,6 +1096,7 @@ async function reportEvent(run, type, errorMessage, details) {
     work_session_id: run.workSessionId,
     attempt_number: run.attemptNumber,
     workspace_lease_nonce: run.workspaceLeaseNonce,
+    ...(run.readOnlyExecutionGrant ? { read_only_execution_grant: run.readOnlyExecutionGrant } : {}),
     type,
     payload: {
       status: type,
@@ -782,6 +1111,22 @@ async function reportEvent(run, type, errorMessage, details) {
   }, terminal);
 }
 
+async function reportRecoveredRun(record) {
+  if (!record?.kontrolRunId || !record?.remoteRunId) return;
+  await fetch(`${KONTROL_ACP_URL}/runs/${record.kontrolRunId}/events`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", authorization: `Bearer ${AGENT_SECRET}`, ...identityHeaders(agentIdentity) },
+    body: JSON.stringify({
+      type: "failed",
+      remote_run_id: record.remoteRunId,
+      work_session_id: record.workSessionId,
+      attempt_number: record.attemptNumber,
+      ...(record.readOnlyExecutionGrant ? { read_only_execution_grant: record.readOnlyExecutionGrant } : {}),
+      payload: { error: "Adapter restarted and confirmed its detached CRUSH worker stopped; its turn result is unavailable." },
+    }),
+  }).catch((error) => console.warn(`[adapter] recovered-run event delivery failed: ${error.message}`));
+}
+
 export function createAdapterEvent(run, type, payload) {
   return {
     event_id: `${run.remoteRunId}:${++run.eventSequence}`,
@@ -791,6 +1136,7 @@ export function createAdapterEvent(run, type, payload) {
     work_session_id: run.workSessionId,
     attempt_number: run.attemptNumber,
     workspace_lease_nonce: run.workspaceLeaseNonce,
+    ...(run.readOnlyExecutionGrant ? { read_only_execution_grant: run.readOnlyExecutionGrant } : {}),
     payload,
   };
 }
@@ -816,7 +1162,10 @@ function enqueueRunEvent(run, event, terminal = false) {
         return false;
       }
       if (!deliveryResult.acknowledged) {
-        console.error(`[run ${run.remoteRunId}] failed to report ${event.type}`);
+        const rejection = deliveryResult.status
+          ? ` (Kontrol HTTP ${deliveryResult.status}${deliveryResult.code ? ` ${deliveryResult.code}` : ""})`
+          : "";
+        console.error(`[run ${run.remoteRunId}] failed to report ${event.type}${rejection}`);
         return false;
       }
       if (!terminal && !run.syntheticSmoke) {
@@ -879,6 +1228,7 @@ function spoolRunEvent(runId, event) {
 }
 
 async function deliverEvent(runId, event, run) {
+  let lastRejection;
   for (let attempt = 0; attempt <= 3; attempt += 1) {
     try {
       const response = await fetch(`${KONTROL_ACP_URL}/runs/${runId}/events`, {
@@ -890,18 +1240,43 @@ async function deliverEvent(runId, event, run) {
       if (response.ok) {
         if (
           run?.workSessionId &&
+          !run.readOnlyAudit &&
           (event.type === "started" || event.type === "heartbeat") &&
           !applyWorkspaceLeaseRenewal(run, body)
         ) return { acknowledged: false, leaseLost: true };
+        await acknowledgeTerminalDispatchReceipt(event, body);
         return { acknowledged: true, leaseLost: false };
       }
       if (response.status === 409 && body?.error?.code === "workspace_lease_lost") {
         return { acknowledged: false, leaseLost: true };
       }
+      lastRejection = {
+        status: response.status,
+        code: typeof body?.error?.code === "string" ? body.error.code : undefined,
+      };
     } catch { /* retry transient delivery failures until the local deadline */ }
     if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
   }
-  return { acknowledged: false, leaseLost: false };
+  return { acknowledged: false, leaseLost: false, ...lastRejection };
+}
+
+async function acknowledgeTerminalDispatchReceipt(event, responseBody) {
+  if (!responseBody?.dispatch_receipt_acknowledged
+    || !["completed", "failed", "cancelled", "exited"].includes(event?.type)
+    || typeof event?.remote_run_id !== "string"
+    || typeof event?.attempt_number !== "number"
+    || typeof event?.event_id !== "string"
+    || typeof responseBody.dispatch_idempotency_key !== "string"
+    || responseBody.remote_run_id !== event.remote_run_id
+    || responseBody.attempt_number !== event.attempt_number
+    || typeof responseBody.event_id !== "string"
+    || responseBody.event_id !== event.event_id) return false;
+  return acknowledgeAdapterDispatchReceipt(DISPATCH_RECEIPTS_PATH, dispatchReceipts, {
+    dispatchIdempotencyKey: responseBody.dispatch_idempotency_key,
+    remoteRunId: event.remote_run_id,
+    attemptNumber: event.attempt_number,
+    eventId: event.event_id,
+  });
 }
 
 function scheduleLeaseLossTermination(run) {

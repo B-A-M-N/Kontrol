@@ -140,6 +140,11 @@ export interface GrantRecord {
   reviewerId?: string;
 }
 
+export interface EffectiveGrantPage {
+  grants: GrantRecord[];
+  nextCursor?: string;
+}
+
 /** Pluggable durable grant store (backed by SQLite in production). */
 export interface GrantStore {
   insert(grant: GrantRecord): void;
@@ -152,6 +157,8 @@ export interface GrantStore {
   getEffective(grantId: string): GrantRecord | undefined;
   /** All currently-effective (non-revoked, non-expired) grants. */
   listEffective(): GrantRecord[];
+  /** Keyset-paginated effective grants scoped to a workspace and its work sessions. */
+  listEffectiveForWorkspace(workspaceSessionId: string, afterId: string | undefined, limit: number, ownerContextId?: string): EffectiveGrantPage;
 }
 
 export interface PolicyEngine {
@@ -219,6 +226,8 @@ export interface PolicyEngine {
   revokeGrant(grantId: string): void;
   /** List effective durable grants for reviewer diagnostics/tools. */
   listGrants(scope?: ApprovalScope, scopeId?: string): GrantRecord[];
+  /** Page effective workspace grants plus grants for every work session in that workspace. */
+  listGrantsForWorkspace(workspaceSessionId: string, afterId?: string, limit?: number, ownerContextId?: string): EffectiveGrantPage;
 }
 
 export interface PolicyConfig {
@@ -842,6 +851,12 @@ export function createPolicyEngine(
     return grants.filter((grant) => (!scope || grant.scope === scope) && (!scopeId || grant.scopeId === scopeId));
   }
 
+  function listGrantsForWorkspace(workspaceSessionId: string, afterId?: string, limit = 100, ownerContextId?: string): EffectiveGrantPage {
+    if (!grantStore) return { grants: [] };
+    const boundedLimit = Number.isSafeInteger(limit) ? Math.max(1, Math.min(200, limit)) : 100;
+    return grantStore.listEffectiveForWorkspace(workspaceSessionId, afterId, boundedLimit, ownerContextId);
+  }
+
   return {
     evaluate,
     isApproved,
@@ -863,6 +878,7 @@ export function createPolicyEngine(
     revokeScope,
     revokeGrant,
     listGrants,
+    listGrantsForWorkspace,
   };
 }
 

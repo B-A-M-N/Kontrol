@@ -62,9 +62,11 @@ kontrol up
 `kontrol up` uses the checkout's `.env` and performs the same preflight and
 readiness checks as `start-all.sh`.
 
-The checkout also provides `./restart-kontrol.sh` for development/integration
-generations. It builds and verifies the replacement generation
-before stopping old owned processes and rolls back if a readiness stage fails.
+The checkout's `./restart-kontrol.sh` restarts the committed immutable release
+without rebuilding source. Use `./restart-kontrol.sh --rebuild` to typecheck,
+build, verify, and activate a new candidate; the current generation keeps
+serving during preparation and is restored if readiness fails. Run
+`npm run gate:beta` for full release qualification.
 
 For the complete stable-beta release gate, run:
 
@@ -100,6 +102,61 @@ workspace read in each fresh MCP transport. The runner records latency,
 reconnect, transient, stale-route, diagnostic, supervisor, tunnel, integrity,
 and leak metrics in `beta-soak.json`. It exits nonzero if the soak is
 interrupted, observes a failed iteration, or its final assertions fail.
+
+For a one-command local qualification launch, use:
+
+```bash
+./start-all.sh --qualify
+```
+
+This runs `gate:beta:code` first, then activates that exact immutable
+candidate and starts the 12-hour soak in the separate `kontrol-beta-soak`
+tmux session after the stack is ready. The soak runs in the background, so
+the MCP server remains available while you use it. Check `beta-soak.json`,
+read the log from `KONTROL_BETA_SOAK_LOG` (default: the Kontrol state
+directory's `beta-soak.log`), or attach with
+`tmux attach -t kontrol-beta-soak`. `./stop-all.sh` stops the monitor with the
+rest of the stack and leaves an `interrupted` report.
+
+The launcher requires `KONTROL_DIAGNOSTICS_SECRET` and a reviewer secret in
+the environment file. It supports two qualification profiles. For a hosted
+endpoint, set `KONTROL_AUTH_MODE=oauth` and a non-loopback HTTPS
+`KONTROL_PUBLIC_BASE_URL`; the monitor probes that HTTPS origin. For OpenAI
+Secure MCP Tunnel, set `KONTROL_AUTH_MODE=tunnel`; the monitor probes the
+loopback MCP origin while `tunnel-client` carries the external connection over
+HTTPS and reports tunnel readiness. These profiles use different auth trust
+boundaries, so one running generation qualifies one profile at a time. The
+launcher rejects local-only HTTP or a URL/profile mismatch before running the
+code gate or changing the active generation. Each profile still needs fresh
+external host-catalog evidence for its exact endpoint and candidate.
+
+`KONTROL_BETA_SOAK_TRANSPORT` can explicitly select `public_https` or
+`secure_mcp_tunnel`; it must match `KONTROL_AUTH_MODE`. `KONTROL_BETA_SOAK_URL`
+overrides the matching profile's target. The duration, workspace, report, and
+log can be set with `KONTROL_BETA_SOAK_HOURS`,
+`KONTROL_BETA_WORKSPACE_PATH`, `KONTROL_BETA_SOAK_REPORT`, and
+`KONTROL_BETA_SOAK_LOG`; `KONTROL_BETA_SSE_PROBE_CADENCE` changes how often
+the streaming probe runs. The stable-beta minimum remains 12 hours.
+
+Use the same launcher for each profile, with its matching settings in `.env`.
+For a hosted endpoint:
+
+```dotenv
+KONTROL_AUTH_MODE=oauth
+KONTROL_PUBLIC_BASE_URL=https://kontrol.example.com
+KONTROL_BETA_SOAK_TRANSPORT=public_https
+```
+
+For OpenAI Secure MCP Tunnel:
+
+```dotenv
+KONTROL_AUTH_MODE=tunnel
+KONTROL_BETA_SOAK_TRANSPORT=secure_mcp_tunnel
+```
+
+Run `./start-all.sh --qualify` after selecting either profile. Each run creates
+evidence for that exact endpoint and build; switching profiles starts a new
+qualification run.
 
 Routine development startup defaults to the fast preflight (syntax/typecheck
 plus a fresh atomic build) so reconnecting does not rerun the entire test
@@ -242,6 +299,35 @@ can use the server concurrently. Workspace and review continuity is carried by
 explicit durable IDs rather than by assuming that separate transports belong to
 one conversation.
 
+## Peer Integration
+
+An opt-in peer integration lets an independently authenticated remote peer — the
+primary use case being Meta's hosted consumer Muse agent at `muse.ai`, reached
+over a Tailscale tailnet or another approved path — call a scoped subset of
+Kontrol's MCP tools under sharing rules the owner grants. Peers are **not**
+reviewers or workers, and the default peer profile is read-only inspection. The
+feature is off by default and adds a second HTTP listener only when explicitly
+enabled; with it off, the main MCP listener is unchanged. See
+[Peer Integration](docs/peer-integration.md) for configuration, the credential
+registry format, security properties, and rollback.
+
+The peer integration has three distinct capability levels:
+
+- **C1 — peer-initiated MCP access: implemented.** A Muse-owned client can call
+  owner-granted Kontrol tools. Patch proposals are confined to managed
+  worktrees and remain subject to Kontrol's review workflow.
+- **C2 — durable Muse Secure VM jobs: implemented with bounded scope.** The
+  owner can enqueue durable jobs for peer software to claim and report. Results
+  are validated, staged into the exact managed worktree, captured in a
+  baseline-relative snapshot, and submitted to the existing human-review flow.
+  Verification is reported only when a job has a mission verification
+  contract; peer results do not grant approval authority.
+- **C3 — activating the hosted Muse agent: planned, not supported yet.** This
+  means Kontrol initiating a turn in a user's consumer Muse conversation. It
+  requires a separately authorized Muse skill, schedule, or connector and
+  independent evidence that it activated the hosted agent. Secure VM execution
+  alone does not establish C3.
+
 ## What Agents Can Do
 
 Once connected, an agent can open an approved project folder as a workspace and:
@@ -273,6 +359,26 @@ If agent stopped: it reads feedback when it resumes
 ```
 
 This loop lives in Kontrol's event log, not in any specific host. You can review submissions from the same interface you use to chat, from a terminal, or from a future tool.
+
+An agent running in a Kontrol-managed PTY can submit and wait with `kontrol review submit`. For safe retries after an uncertain CLI result, pass `--client-mutation-id <stable-id>` and reuse that same ID for the same logical submission; the successful receipt includes the ID.
+
+### Optional Native CDP Delivery
+
+The MCP App and authorized MCP reviewer tools remain the primary review
+surfaces. Native Chrome DevTools Protocol (CDP) is an optional transport for
+delivering a review packet and observing whether a response is generating; it
+does not read review verdicts or approve work. Feedback and approval still go
+through Kontrol's authenticated review workflow.
+
+When native CDP is enabled, sign in manually in the dedicated profile using
+official Google Chrome with remote debugging disabled. Close every Chrome
+window for that profile before Kontrol relaunches it with a loopback-only CDP
+endpoint and verifies the ChatGPT session. Kontrol then requires an explicit,
+exact conversation binding before dispatch. It never accepts passwords, codes,
+recovery details, or cookies through MCP, automates identity-provider sign-in,
+or treats browser output as review authority. See
+[`src/review-browser/AGENTS.md`](src/review-browser/AGENTS.md) for the transport
+contract.
 
 ## Skill Names
 

@@ -12,6 +12,31 @@ import { openDatabase, databasePath } from "./db/client.js";
 import { createReviewWorkflowService } from "./review-workflow.js";
 import { authorizeWorkSessionAction } from "./work-session-action-guard.js";
 
+// P1-02: scheduled read-only audit policy must be enforced at the tool boundary,
+// not by prompt instructions.
+{
+  const policy = { executionMode: "read_only_audit", workspaceAccess: "read_only", mutate: false } as const;
+  const toolCases: Array<[string, boolean]> = [
+    ["read", true],
+    ["grep", true],
+    ["glob", true],
+    ["ls", true],
+    ["write", false],
+    ["edit", false],
+    ["apply_patch", false],
+    ["bash", false],
+    ["exec_command", false],
+    ["write_stdin", false],
+  ];
+  for (const [tool, expected] of toolCases) {
+    const decision = authorizeWorkSessionAction(
+      { get: () => ({ completionPolicy: "webui_approval_required", status: "in_progress" }) } as never,
+      { workSessionId: "scheduled-read-only", tool, scheduledExecutionPolicy: policy },
+    );
+    assert.equal(decision.allowed, expected, `scheduled read-only policy decision for ${tool}`);
+  }
+}
+
 const root = await mkdtemp(join(tmpdir(), "kontrol-enforcement-"));
 
 function fakeServer(): { registerTool: (n: string, _c: unknown, h: (a: any) => any) => undefined; handlers: Map<string, (a: any) => any> } {
@@ -130,7 +155,7 @@ try {
       for await (const chunk of req) chunks.push(Buffer.from(chunk));
       receivedRuns.push(chunks.length ? JSON.parse(Buffer.concat(chunks).toString()) : {});
       res.writeHead(202, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ run_id: `remote-${receivedRuns.length}`, status: "running", output: [] }));
+      res.end(JSON.stringify({ run_id: `remote-${receivedRuns.length}`, accepted: true, status: "running", output: [] }));
       return;
     }
     res.writeHead(200, { "Content-Type": "application/json" });

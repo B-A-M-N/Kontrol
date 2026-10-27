@@ -139,6 +139,7 @@ export function reconcileRuntimeStates(
     `).run(...parameters);
   }
   return {
+    examined: rows.length,
     reconciled,
     markedStale,
     nextAfterId: rows.length > 0 ? rows[rows.length - 1]!.id : undefined,

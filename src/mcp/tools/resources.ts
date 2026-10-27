@@ -3,7 +3,7 @@
  * OpenAI-compatibility, and DevDesktop-migration template URIs. Extracted
  * verbatim from src/mcp/workspace-server.ts (P1.3).
  */
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer } from "@modelcontextprotocol/server";
 import {
   registerAppResource,
   registerAppTool,
@@ -102,7 +102,7 @@ export function registerWorkspaceAppResources(
         annotations: { readOnlyHint: true, idempotentHint: true },
       },
       async () => ({
-        content: [{ type: "text", text: "The diagnostic Workspace App is open. Its status will report whether the MCP Apps handshake connected." }],
+        content: [{ type: "text" as const, text: "The diagnostic Workspace App is open. Its status will report whether the MCP Apps handshake connected." }],
         structuredContent: { status: "opened", resourceUri: WORKSPACE_APP_SMOKE_URI },
       }),
     );

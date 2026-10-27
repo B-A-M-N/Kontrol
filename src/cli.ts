@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 import { createRequire } from "node:module";
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync, rmSync, statSync, statfsSync, writeFileSync } from "node:fs";
-import { stdin as input, stdout as output } from "node:process";
-import { dirname, join, resolve } from "node:path";
+import { existsSync, lstatSync, readFileSync, realpathSync, rmSync, statSync, statfsSync, writeFileSync } from "node:fs";
+import { stdin as input, stderr as errorOutput, stdout as output } from "node:process";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as prompts from "@clack/prompts";
 import { getShellConfig } from "@earendil-works/pi-coding-agent";
@@ -25,8 +25,23 @@ import {
   type KontrolUserConfig,
 } from "./user-config.js";
 import { expandHomePath } from "./roots.js";
+import {
+  buildIngressPlan,
+  buildIngressReport,
+  defaultLocalProbe,
+  expectedLocalTargetPort,
+  validationContextFromConfig,
+  type IngressPlanEntry,
+} from "./ingress/profile-status.js";
+import { readTailscaleFacts, sanitizeProxyTarget } from "./ingress/tailscale-status.js";
+import { validateIngressProfiles } from "./ingress/validate.js";
+import { applyIngressProfile, disableIngressProfile, listIngressOperationReceipts, reconcileIngressProfile } from "./ingress/controller.js";
+import { latestIngressHealthByProfile } from "./ingress/health-store.js";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { completePtyReviewMutationId, getOrCreatePtyReviewMutationId, readPtyReviewFeedback, readPtyReviewMutationId, readPtyReviewMutationIntent, readPtyReviewSubmission } from "./pty-review-cli.js";
 
-type Command = "serve" | "up" | "init" | "doctor" | "config" | "service" | "snapshots" | "review-loop" | "agent" | "help" | "version";
+type Command = "serve" | "up" | "init" | "doctor" | "config" | "service" | "snapshots" | "review-loop" | "review" | "agent" | "ingress" | "help" | "version";
 const require = createRequire(import.meta.url);
 const SUPPORTED_NODE_RANGE = ">=22.19 <23 || >=24 <25 || >=26 <27";
 
@@ -62,8 +77,14 @@ async function main(argv: string[]): Promise<void> {
     case "review-loop":
       await runReviewLoopCommand(args);
       return;
+    case "review":
+      await runPtyReviewCommand(args);
+      return;
     case "agent":
       await runAgentCommand(args);
+      return;
+    case "ingress":
+      await runIngressCommand(args);
       return;
     case "help":
       printHelp();
@@ -78,10 +99,134 @@ function normalizeCommand(command: string | undefined): Command {
   if (!command || command === "serve" || command === "start") return "serve";
   if (command === "up" || command === "init" || command === "doctor" || command === "config" || command === "service" || command === "snapshots") return command;
   if (command === "review-loop") return "review-loop";
+  if (command === "review") return "review";
   if (command === "agent") return "agent";
+  if (command === "ingress") return "ingress";
   if (command === "help" || command === "--help" || command === "-h") return "help";
   if (command === "version" || command === "--version" || command === "-v") return "version";
   throw new Error(`Unknown command: ${command}`);
+}
+
+/** Submit and await review through the existing worker MCP tools. The only
+ * credential available to this command is a private, generation-bound file
+ * created for an explicitly launched agent PTY. */
+async function runPtyReviewCommand(args: string[]): Promise<void> {
+  const sub = args[0];
+  if (!sub || sub === "help") {
+    output.write("Usage: kontrol review submit [--message <text>] [--client-mutation-id <stable-id>] [--no-wait]\n");
+    return;
+  }
+  if (sub !== "submit") throw new Error(`Unknown review subcommand: ${sub} (expected submit)`);
+  const mutationId = readPtyReviewMutationId(args);
+  if (!mutationId.ok) {
+    errorOutput.write(`${mutationId.error}\n`);
+    process.exitCode = 1;
+    return;
+  }
+  const credentialPath = process.env.KONTROL_AGENT_PTY_CREDENTIAL_FILE;
+  if (!credentialPath) throw new Error("This command is available only inside a Kontrol-managed agent PTY.");
+  const canonicalPath = realpathSync(credentialPath);
+  const fileStat = lstatSync(credentialPath);
+  const directoryStat = lstatSync(dirname(canonicalPath));
+  if (!fileStat.isFile() || fileStat.isSymbolicLink() || (fileStat.mode & 0o077) !== 0
+    || !directoryStat.isDirectory() || directoryStat.isSymbolicLink()
+    || !basename(dirname(canonicalPath)).startsWith("agent-pty-review-")
+    || basename(canonicalPath) !== "credential.json") {
+    throw new Error("PTY review credential file is not a private Kontrol credential.");
+  }
+  const credential = JSON.parse(readFileSync(canonicalPath, "utf8")) as {
+    mcpUrl?: unknown;
+    token?: unknown;
+    workSessionId?: unknown;
+  };
+  if (typeof credential.mcpUrl !== "string" || typeof credential.token !== "string"
+    || typeof credential.workSessionId !== "string") {
+    throw new Error("PTY review credential file is malformed.");
+  }
+  const mutationIntentPath = join(dirname(canonicalPath), "submission-intent");
+  const pendingMutationId = readPtyReviewMutationIntent(mutationIntentPath);
+  if (mutationId.clientMutationId && pendingMutationId && mutationId.clientMutationId !== pendingMutationId) {
+    throw new Error("A prior PTY review submission has an unresolved response; retry it with its pending mutation ID before starting another submission.");
+  }
+  const clientMutationId = mutationId.clientMutationId
+    ?? pendingMutationId
+    ?? getOrCreatePtyReviewMutationId(mutationIntentPath);
+  const ownsAutomaticIntent = !mutationId.clientMutationId || pendingMutationId === clientMutationId;
+  const credentialToken = credential.token;
+  const endpoint = new URL(credential.mcpUrl);
+  if (endpoint.protocol !== "http:" || !["127.0.0.1", "localhost", "[::1]"].includes(endpoint.hostname)
+    || endpoint.pathname !== "/mcp" || endpoint.search || endpoint.hash) {
+    throw new Error("PTY review endpoint must be loopback HTTP.");
+  }
+  let client: Client | undefined;
+  const connectWithRenewedCredential = async () => {
+    const renewal = await fetch(new URL("/pty-review/renew", endpoint), {
+      method: "POST",
+      headers: { "x-kontrol-worker-token": credentialToken },
+      signal: AbortSignal.timeout(5_000),
+    });
+    const renewed = await renewal.json().catch(() => undefined) as { token?: unknown } | undefined;
+    if (!renewal.ok || typeof renewed?.token !== "string") {
+      throw new Error(`PTY review credential renewal failed (${renewal.status}).`);
+    }
+    const renewedToken = renewed.token as string;
+    const nextClient = new Client({ name: "kontrol-pty-review", version: "1.0.0" });
+    const transport = new StreamableHTTPClientTransport(endpoint, {
+      requestInit: { headers: { "x-kontrol-worker-token": renewedToken } },
+      reconnectionOptions: {
+        maxRetries: 0,
+        initialReconnectionDelay: 100,
+        maxReconnectionDelay: 1_000,
+        reconnectionDelayGrowFactor: 1.5,
+      },
+    });
+    try {
+      await nextClient.connect(transport);
+      client = nextClient;
+    } catch (error) {
+      await nextClient.close().catch(() => undefined);
+      throw error;
+    }
+  };
+  try {
+    await connectWithRenewedCredential();
+    const submitted = await client!.callTool({
+      name: "submit_for_review",
+      arguments: {
+        sessionId: credential.workSessionId,
+        ...(flagValue(args, "--message") ? { message: flagValue(args, "--message") } : {}),
+        clientMutationId,
+      },
+    });
+    const submission = readPtyReviewSubmission(submitted);
+    if (!submission.ok) {
+      errorOutput.write(`${submission.error}\n`);
+      process.exitCode = 1;
+      return;
+    }
+    if (ownsAutomaticIntent) completePtyReviewMutationId(mutationIntentPath, clientMutationId);
+    output.write(`${JSON.stringify({ ...submission.receipt, clientMutationId })}\n`);
+    if (args.includes("--no-wait")) return;
+    for (;;) {
+      const feedback = await client!.callTool({
+        name: "await_review_feedback",
+        arguments: { sessionId: credential.workSessionId, timeoutMs: 900_000 },
+      });
+      const received = readPtyReviewFeedback(feedback);
+      if (!received.ok) {
+        errorOutput.write(`${received.error}\n`);
+        process.exitCode = 1;
+        return;
+      }
+      output.write(`${JSON.stringify(received.receipt)}\n`);
+      if (received.status !== "timeout") return;
+      await client!.close().catch(() => undefined);
+      client = undefined;
+      await connectWithRenewedCredential();
+    }
+  } finally {
+    await client?.close().catch(() => undefined);
+  }
 }
 
 function runSnapshotsCommand(args: string[]): Promise<void> {
@@ -216,6 +361,176 @@ async function runAgentCommand(args: string[]): Promise<void> {
   throw new Error(`Unknown agent subcommand: ${sub} (expected list|add|remove)`);
 }
 
+const INGRESS_USAGE = [
+  "Usage: kontrol ingress <inspect|plan|apply|disable|reconcile|doctor> [profile-id] [--confirm] [--json]",
+  "",
+  "  inspect  Read-only observation: Tailscale facts, a bounded loopback probe of expected",
+  "           local target ports, and an expected-vs-observed report per profile.",
+  "  plan     Dry-run planner: prints the tailscale serve/funnel commands this deployment",
+  "           would need. Nothing is executed.",
+  "  apply    Apply one enabled profile after recording a durable operation intent (--confirm required).",
+  "  disable  Remove only a route with a matching Kontrol ownership receipt (--confirm required).",
+  "  reconcile Observe and resolve an interrupted apply/disable operation; never retries commands.",
+  "  doctor   Show route mapping state and recent durable operation receipts.",
+  "",
+  "Apply and disable never reset Serve/Funnel globally and refuse routes owned outside Kontrol.",
+  "",
+].join("\n");
+
+/**
+ * Tailscale ingress observation, dry-run planning, and profile-scoped route
+ * lifecycle. Mutation requires an explicit --confirm and durable receipts.
+ */
+async function runIngressCommand(args: string[]): Promise<void> {
+  const sub = args[0];
+  const json = args.slice(1).includes("--json");
+  if (!sub || sub === "help" || sub === "--help" || sub === "-h") {
+    output.write(INGRESS_USAGE);
+    return;
+  }
+  if (["apply", "disable", "reconcile"].includes(sub)) {
+    const profileId = args[1];
+    if (!profileId || profileId.startsWith("--")) throw new Error(`Usage: kontrol ingress ${sub} <profile-id>${sub === "reconcile" ? "" : " --confirm"}`);
+    const confirm = args.includes("--confirm");
+    if (sub !== "reconcile" && !confirm) throw new Error(`kontrol ingress ${sub} requires --confirm to authorize a Tailscale route change`);
+    if (args.slice(2).some((arg) => arg !== "--confirm" && arg !== "--json")) throw new Error(`Unexpected argument for ingress ${sub}`);
+    const config = loadConfig();
+    const operation = sub === "apply"
+      ? await applyIngressProfile(config, config.stateDir, profileId)
+      : sub === "disable"
+        ? await disableIngressProfile(config, config.stateDir, profileId)
+        : await reconcileIngressProfile(config, config.stateDir, profileId);
+    if (json) console.log(JSON.stringify({ operation: operation ?? null }, null, 2));
+    else {
+      // The failure class is the operator-facing reason: a route change that
+      // failed because the tailnet has Serve disabled must not read like an
+      // opaque non-zero exit.
+      console.log(operation
+        ? `ingress ${operation.action} ${operation.profileId}: ${operation.state}${operation.failureClass ? ` (${operation.failureClass})` : ""} (${operation.operationId})`
+        : `ingress ${profileId}: no operation receipt`);
+    }
+    if (operation && ["failed", "reconciliation_required"].includes(operation.state)) process.exitCode = 1;
+    return;
+  }
+  if (sub !== "inspect" && sub !== "plan" && sub !== "doctor") {
+    throw new Error(`Unknown ingress subcommand: ${sub} (expected inspect|plan|apply|disable|reconcile|doctor)`);
+  }
+  const config = loadConfig();
+  const profiles = config.ingress?.profiles ?? [];
+  if (sub === "doctor") {
+    if (config.ingress) validateIngressProfiles(config.ingress.profiles, validationContextFromConfig(config));
+    const facts = await readTailscaleFacts();
+    const probes = await probeExpectedLocalPorts(config);
+    const report = buildIngressReport(config, facts, probes);
+    const receipts = listIngressOperationReceipts(config.stateDir);
+    const health = latestIngressHealthByProfile(config.stateDir);
+    const result = { report, health, receipts: receipts.slice(-32) };
+    if (json) console.log(JSON.stringify(result, null, 2));
+    else {
+      console.log("kontrol ingress doctor — observations are profile-scoped; mapping does not imply external readiness");
+      for (const warning of facts.warnings) console.log(`warning: ${warning}`);
+      for (const status of report.profiles) {
+        const latest = [...receipts].reverse().find((receipt) => receipt.profileId === status.id);
+        const healthStatus = health.find((item) => item.profileId === status.id);
+        console.log(`  [${status.id}] ${status.privacy} ${status.classification}${healthStatus ? `; last qualification=${healthStatus.state}/${healthStatus.evidenceTier} at ${healthStatus.observedAt}` : ""}${latest ? `; last operation=${latest.action}/${latest.state}` : ""}`);
+      }
+      if (receipts.length === 0) console.log("  no durable ingress operation receipts");
+      if (health.length === 0) console.log("  no durable ingress health observations");
+    }
+    if (facts.warnings.length > 0 || report.profiles.some((profile) => profile.enabled && ["UNKNOWN", "MISMATCH", "LOCAL_DOWN", "NETWORK_DOWN"].includes(profile.classification))) process.exitCode = 1;
+    return;
+  }
+  if (sub === "plan") {
+    let entries: IngressPlanEntry[];
+    try {
+      // The planner validates first and rethrows with the stable
+      // ingress_profiles_invalid prefix; surface it verbatim on stderr.
+      entries = buildIngressPlan(config);
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exitCode = 1;
+      return;
+    }
+    if (json) {
+      console.log(JSON.stringify({ entries }, null, 2));
+    } else {
+      console.log("kontrol ingress plan — plan only, nothing was executed");
+      if (config.ingress === undefined) console.log("note: KONTROL_INGRESS_PROFILES is not configured");
+      for (const entry of entries) {
+        console.log(`  [${entry.id}] ${entry.kind} (${entry.privacy})`);
+        if (entry.command !== undefined) console.log(`    command: ${entry.command}`);
+        if (entry.refused !== undefined) console.log(`    refused: ${entry.refused}`);
+        if (entry.note !== undefined) console.log(`    note: ${entry.note}`);
+      }
+    }
+    const enabledTailscaleIds = new Set(
+      profiles.filter((p) => p.enabled && (p.kind === "tailscale_serve" || p.kind === "tailscale_funnel")).map((p) => p.id),
+    );
+    const anyRefused = entries.some((entry) => entry.refused !== undefined);
+    const missingCommand = entries.some((entry) => enabledTailscaleIds.has(entry.id) && entry.command === undefined);
+    if (anyRefused || missingCommand) process.exitCode = 1;
+    return;
+  }
+
+  // inspect: validate with EXACTLY the startup context (src/config.ts) before
+  // observing anything, so an invalid profile list fails closed the same way.
+  if (config.ingress) {
+    try {
+      validateIngressProfiles(config.ingress.profiles, validationContextFromConfig(config));
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exitCode = 1;
+      return;
+    }
+  }
+  const facts = await readTailscaleFacts();
+  const probeResults = await probeExpectedLocalPorts(config);
+  const report = buildIngressReport(config, facts, probeResults);
+  if (json) {
+    console.log(JSON.stringify(report, null, 2));
+  } else {
+    console.log("kontrol ingress inspect — read-only, no Tailscale mutations");
+    if (config.ingress === undefined) console.log("note: KONTROL_INGRESS_PROFILES is not configured");
+    console.log(`tailscale: version=${report.cliVersion ?? "unavailable"} backendState=${report.backendState ?? "unavailable"} dns=${report.dnsName ?? "unavailable"}`);
+    for (const warning of facts.warnings) console.log(`warning: ${warning}`);
+    for (const status of report.profiles) {
+      console.log(`  [${status.id}] ${status.kind} audience=${status.audience} privacy=${status.privacy} enabled=${status.enabled}`);
+      console.log(`    ${status.externalOrigin} -> ${status.expectedLocalTarget ?? "(no local target)"}`);
+      const observedText = status.observed ? sanitizeProxyTarget(status.observed.proxyTarget) : "(none)";
+      const funnelMark = status.observed?.allowFunnel === true ? " [FUNNEL-EXPOSED: public internet]" : status.observed?.allowFunnel === false ? " [funnel: off]" : "";
+      console.log(`    observed: ${observedText}${funnelMark}`);
+      console.log(`    classification: ${status.classification}`);
+      for (const note of status.notes) console.log(`    note: ${note}`);
+    }
+  }
+  const enabledTailscale = new Set(
+    profiles.filter((p) => p.enabled && (p.kind === "tailscale_serve" || p.kind === "tailscale_funnel")).map((p) => p.id),
+  );
+  const allMatched = report.profiles
+    .filter((status) => enabledTailscale.has(status.id))
+    .every((status) => status.classification === "MAPPING_MATCHED");
+  // Any facts-layer warning means part of the observation could not run; the
+  // report still prints (with notes) but automation must see a nonzero exit.
+  if (!allMatched || facts.warnings.length > 0) process.exitCode = 1;
+}
+
+/** Sequentially probe the expected local ports of enabled tailscale profiles
+ * (deduped). secure_tunnel_listener targets are never probed. */
+async function probeExpectedLocalPorts(config: Parameters<typeof expectedLocalTargetPort>[1]): Promise<Map<number, boolean>> {
+  const ports = new Set<number>();
+  for (const profile of config.ingress?.profiles ?? []) {
+    if (!profile.enabled) continue;
+    if (profile.kind !== "tailscale_serve" && profile.kind !== "tailscale_funnel") continue;
+    const port = expectedLocalTargetPort(profile, config);
+    if (port !== null) ports.add(port);
+  }
+  const results = new Map<number, boolean>();
+  for (const port of ports) {
+    results.set(port, await defaultLocalProbe(port));
+  }
+  return results;
+}
+
 function fsSnapshotStoreFromConfig(): FilesystemSnapshotStore {
   const config = loadConfig();
   // P0 GC safety: the store's durable-root provider is the SAME production
@@ -240,11 +555,10 @@ function formatBytes(value: number): string {
 
 async function snapshotsStats(): Promise<void> {
   const store = fsSnapshotStoreFromConfig();
-  const stats = await store.storeStats();
-  const reachable = await store.estimateReachableBytes();
+  const { stats, reachable } = await store.storeStatsWithReachability();
   const orphanBlobs = Math.max(0, stats.blobs - reachable.blobs);
   const orphanBytes = Math.max(0, stats.blobBytes - reachable.bytes);
-  const incomplete = await store.countIncompleteTransactionsPublic();
+  const incomplete = stats.incompleteTransactions;
   const storeRoot = store.storePath;
   console.log(`Store: ${storeRoot}`);
   console.log("");
@@ -632,12 +946,11 @@ async function runDoctor(options: { strict?: boolean } = {}): Promise<void> {
         limits: config.fsSnapshot,
         durableRoots: () => collectDurableSnapshotRoots(doctorDb),
       });
-      const stats = await store.storeStats();
-      const reachable = await store.estimateReachableBytes();
+      const { stats, reachable } = await store.storeStatsWithReachability();
       const orphan = Math.max(0, stats.blobs - reachable.blobs);
       const orphanRatio = stats.blobs > 0 ? orphan / stats.blobs : 0;
       const highWater = config.fsSnapshot.highWaterBytes;
-      const incomplete = await store.countIncompleteTransactionsPublic();
+      const incomplete = stats.incompleteTransactions;
       const problems: string[] = [];
       if (orphanRatio > 0.3) problems.push(`orphan ratio ${(orphanRatio * 100).toFixed(0)}%`);
       if (highWater && stats.blobBytes > highWater) problems.push("store over high-water mark");
@@ -693,7 +1006,7 @@ async function runDoctor(options: { strict?: boolean } = {}): Promise<void> {
     const distDir = existsSync(join(moduleDir, "build-meta.json"))
       ? moduleDir
       : resolve(process.cwd(), "dist");
-    const requiredArtifacts = ["cli.js", "server.js", "acp-duplex.js", "build-meta.json", "ui/workspace-app.html"];
+    const requiredArtifacts = ["cli.js", "server.js", "acp-duplex.js", "read-only-execution.mjs", "build-meta.json", "ui/workspace-app.html"];
     const missingArtifacts = requiredArtifacts.filter((file) => !existsSync(resolve(distDir, file)));
     doctorResult("Build artifacts", missingArtifacts.length === 0 ? "PASS" : "FAIL", missingArtifacts.length === 0 ? distDir : `missing ${missingArtifacts.join(", ")}`);
     const buildMeta = readBuildIdentity(resolve(distDir, "build-meta.json"));
@@ -974,7 +1287,9 @@ function printHelp(): void {
       "  kontrol service install|start|stop|restart|upgrade|status|logs|uninstall",
       "  kontrol snapshots stats|gc",
       "  kontrol review-loop status|on|off|pause|resume --session <workSessionId>",
+      "  kontrol review submit [--message <text>] [--client-mutation-id <stable-id>] [--no-wait]   Submit from an agent PTY and await feedback",
       "  kontrol agent list|add|remove      Register any loopback HTTP ACP agent",
+      "  kontrol ingress inspect|plan|apply|disable|reconcile|doctor   Tailscale route control and qualification",
       "  kontrol -v, --version   Print the installed version",
       "",
       "For temporary tunnels:",

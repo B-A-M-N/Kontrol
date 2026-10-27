@@ -9,7 +9,7 @@ import { mutationPrincipalId, runWithMutationReceipt } from "../mutation-receipt
 import type { BridgeConfig } from "./context.js";
 import { liveOwnerContextId } from "./shared.js";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer } from "@modelcontextprotocol/server";
 
 export function registerMutationAppTool(
   server: McpServer,
@@ -26,7 +26,16 @@ export function registerMutationAppTool(
       operation: name,
       clientMutationId,
       request,
-      execute: () => handler(input),
+      execute: async () => {
+        try {
+          return await handler(input);
+        } catch (error) {
+          return {
+            content: [{ type: "text" as const, text: error instanceof Error ? error.message : String(error) }],
+            isError: true as const,
+          };
+        }
+      },
     });
   }) as any);
 }

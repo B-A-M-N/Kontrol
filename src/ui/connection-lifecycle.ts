@@ -42,14 +42,31 @@ let host: LifecycleHost;
 
 // Reconnect de-dup: overlapping transport failures collapse into one retry.
 let reconnectPromise: Promise<void> | null = null;
+let bootstrapPromise: Promise<void> | null = null;
 let reconnectGeneration = 0;
 const reconnectWaiters = new Set<() => void>();
+// SDK callbacks are reattached to replacement App instances. A late callback
+// from the obsolete instance must not disturb the replacement's connection.
+let appInstanceGeneration = 0;
 export function setLifecycleHost(next: LifecycleHost): void {
   host = next;
 }
 
+function recordHostConnectDuration(startedAt: number): void {
+  if (typeof performance === "undefined" || typeof performance.measure !== "function") return;
+  performance.clearMeasures("kontrol.host_connect_ms");
+  performance.measure("kontrol.host_connect_ms", { start: startedAt, end: performance.now() });
+}
+
+/** Advance fencing when an App instance is replaced without a teardown. */
+export function advanceAppInstanceGeneration(): number {
+  appInstanceGeneration += 1;
+  return appInstanceGeneration;
+}
+
 /** Cancel the current reconnect owner and wake any bounded retry backoff. */
 export function cancelReconnect(): void {
+  appInstanceGeneration += 1;
   reconnectGeneration += 1;
   for (const wake of reconnectWaiters) wake();
   reconnectWaiters.clear();
@@ -85,8 +102,28 @@ function finishConnection(generation: number): boolean {
   return true;
 }
 
+/**
+ * Fence a callback to the App instance that installed it. Replacement and
+ * teardown both advance the generation, so a stale SDK callback is ignored.
+ */
+export function bindAppInstanceCallback<Args extends unknown[], Result>(
+  callback: (...args: Args) => Result,
+): (...args: Args) => Result {
+  const generation = appInstanceGeneration;
+  return (...args) => {
+    if (generation !== appInstanceGeneration) return undefined as Result;
+    return callback(...args);
+  };
+}
+
 /** Initial App startup gets one bounded retry and then shows a terminal error. */
-export async function connectBootstrapWithRetry(): Promise<void> {
+export function connectBootstrapWithRetry(): Promise<void> {
+  if (bootstrapPromise) return bootstrapPromise;
+  bootstrapPromise = connectBootstrapOwner().finally(() => { bootstrapPromise = null; });
+  return bootstrapPromise;
+}
+
+async function connectBootstrapOwner(): Promise<void> {
   const generation = reconnectGeneration;
   let lastError: unknown;
   for (let attempt = 0; attempt < 2 && generation === reconnectGeneration; attempt += 1) {
@@ -94,7 +131,9 @@ export async function connectBootstrapWithRetry(): Promise<void> {
     host.setConnectionState(attempt === 0 ? "CONNECTING" : "RECONNECTING");
     host.scheduleRender();
     try {
+      const connectStartedAt = performance.now();
       await host.connectApp();
+      recordHostConnectDuration(connectStartedAt);
       if (finishConnection(generation)) return;
       break;
     } catch (error) {
@@ -122,11 +161,13 @@ export async function connectBootstrapWithRetry(): Promise<void> {
 export async function connectWithRetry(reason?: unknown): Promise<void> {
   const generation = reconnectGeneration;
   let retryDelayMs = 1_000;
-  while (generation === reconnectGeneration && host.app() && !host.isConnected()) {
+  for (let attempt = 0; attempt < 8 && generation === reconnectGeneration && host.app() && !host.isConnected(); attempt += 1) {
     host.setConnectionState(retryDelayMs === 1_000 && !reason ? "CONNECTING" : "RECONNECTING");
     host.scheduleRender();
     try {
+      const connectStartedAt = performance.now();
       await host.connectApp();
+      recordHostConnectDuration(connectStartedAt);
       if (finishConnection(generation)) return;
       break;
     } catch (connectErrorValue) {
@@ -152,16 +193,30 @@ export async function connectWithRetry(reason?: unknown): Promise<void> {
       reason = undefined;
     }
   }
+  if (generation === reconnectGeneration && !host.isConnected()) {
+    host.setConnected(false);
+    host.setConnectionState("DISCONNECTED");
+    host.setConnectionError("The host connection is still unavailable. Reconnect the host and try again.");
+    host.scheduleRender();
+  }
   throw new Error("The MCP host connection is unavailable.");
 }
 
 
 export async function reconnectApp(reason: unknown): Promise<void> {
+  if (bootstrapPromise) return bootstrapPromise;
   if (reconnectPromise) return reconnectPromise;
   reconnectPromise = (async () => {
     if (!host.app()) throw new Error("The MCP host connection is unavailable.");
     host.setConnected(false);
     host.bumpWorkspaceWatcherGeneration();
+    // A transport can report closed while the SDK App still retains its
+    // transport reference. Calling connect() on that instance is rejected
+    // with "App is already connected" even though the host channel is dead.
+    // Replace it before the first reconnect attempt instead of surfacing that
+    // avoidable failure and only then creating a fresh instance.
+    await host.recreateApp();
+    if (!host.app()) throw new Error("The MCP host connection is unavailable.");
     await connectWithRetry(reason);
   })().finally(() => {
     reconnectPromise = null;

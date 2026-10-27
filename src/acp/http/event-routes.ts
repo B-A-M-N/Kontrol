@@ -7,13 +7,62 @@
  * the blocking approval long-poll.
  */
 import type { Router } from "express";
+import { realpath } from "node:fs/promises";
 import { serializeFinalAcpResult } from "../../acp-registry.js";
+import { verifyReadOnlyExecutionGrant } from "../../read-only-execution.mjs";
 import type { ApprovalOption, ApprovalRequestManager } from "../../approval-requests.js";
 import type { AcpContext, AcpRole } from "./context.js";
 import { APPROVAL_WAIT_TIMEOUT_MS } from "./context.js";
 import type { makeAuth } from "./auth.js";
 import type { makeReviewBarrier } from "./review-barrier.js";
 import { acpRunEventSchema } from "./schemas.js";
+import { redactString } from "../../redaction.js";
+
+function boundedDiagnosticTail(value: unknown, maxBytes = 4_000): string | undefined {
+  if (typeof value !== "string" || value.length === 0) return undefined;
+  const redacted = redactString(value.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, ""));
+  const bytes = Buffer.from(redacted, "utf8");
+  if (bytes.byteLength <= maxBytes) return redacted;
+  return new TextDecoder().decode(bytes.subarray(-maxBytes)).replace(/^\uFFFD/, "");
+}
+
+function workerFailureEvidence(input: {
+  payload?: Record<string, unknown>;
+  eventId?: string;
+  runId: string;
+  attemptNumber: number;
+}): {
+  phase: "execution";
+  category: string;
+  reason?: string;
+  exitCode?: number;
+  signal?: string;
+  sanitizedStderrTail?: string;
+  eventId?: string;
+  runId: string;
+  attemptNumber: number;
+} {
+  const exitCode = input.payload?.exit_code;
+  const signal = typeof input.payload?.signal === "string" ? boundedDiagnosticTail(input.payload.signal, 128) : undefined;
+  const reason = boundedDiagnosticTail(input.payload?.error ?? input.payload?.message ?? input.payload?.reason);
+  const category = reason && /timeout|timed out|deadman|run ceiling/i.test(reason) ? "timeout"
+    : reason && /protocol_incomplete/i.test(reason) ? "protocol_failure"
+      : signal ? "signal_termination"
+        : typeof exitCode === "number" && Number.isInteger(exitCode) && exitCode !== 0 ? "nonzero_exit"
+          : "worker_failure";
+  const stderr = boundedDiagnosticTail(input.payload?.stderr);
+  return {
+    phase: "execution",
+    category,
+    ...(reason ? { reason } : {}),
+    ...(typeof exitCode === "number" && Number.isInteger(exitCode) ? { exitCode } : {}),
+    ...(signal ? { signal } : {}),
+    ...(stderr ? { sanitizedStderrTail: stderr } : {}),
+    ...(input.eventId ? { eventId: input.eventId } : {}),
+    runId: input.runId,
+    attemptNumber: input.attemptNumber,
+  };
+}
 
 export function registerEventRoutes(
   router: Router,
@@ -58,6 +107,53 @@ export function registerEventRoutes(
     "user_input_required",
   ]);
 
+// These payload keys are populated from Kontrol's persisted run, current
+// attempt, or authenticated request envelope. Adapters may include arbitrary
+// diagnostic fields, but cannot claim server-owned event identity.
+const SERVER_OWNED_EVENT_PAYLOAD_FIELDS = new Set([
+  "runId",
+  "remoteRunId",
+  "attemptNumber",
+  "dispatchId",
+  "workSessionId",
+  "eventId",
+  "workerFailureEvidence",
+]);
+
+const ADAPTER_TERMINAL_EVENT_TYPES = new Set(["completed", "failed", "cancelled", "exited"]);
+
+function dispatchReceiptAcknowledgement(
+  body: { type?: string; event_id?: string; remote_run_id?: string; attempt_number?: number },
+  run: { runId: string; remoteRunId?: string },
+  attempt: { dispatchIdempotencyKey: string; runId: string; attemptNumber: number; remoteRunId?: string } | undefined,
+  durableOutcomeObserved: boolean,
+): Record<string, unknown> | undefined {
+  if (!durableOutcomeObserved || !body.type || !ADAPTER_TERMINAL_EVENT_TYPES.has(body.type)) return undefined;
+  if (!attempt?.dispatchIdempotencyKey || attempt.runId !== run.runId || !attempt.remoteRunId) return undefined;
+  if (typeof body.event_id !== "string" || body.event_id.length === 0) return undefined;
+  if (body.attempt_number !== attempt.attemptNumber || body.remote_run_id !== attempt.remoteRunId) return undefined;
+  return {
+    dispatch_receipt_acknowledged: true,
+    dispatch_idempotency_key: attempt.dispatchIdempotencyKey,
+    remote_run_id: attempt.remoteRunId,
+    attempt_number: attempt.attemptNumber,
+    event_id: body.event_id,
+  };
+}
+
+function eventMatchesDispatch(event: { type: string; payload: Record<string, unknown> }, run: { runId: string; remoteRunId?: string }, body: { type?: string; event_id?: string; remote_run_id?: string; attempt_number?: number }, attempt: { dispatchIdempotencyKey: string; runId: string; attemptNumber: number; remoteRunId?: string } | undefined): boolean {
+  return Boolean(
+    body.type
+    && ADAPTER_TERMINAL_EVENT_TYPES.has(body.type)
+    && attempt?.dispatchIdempotencyKey
+    && event.payload.runId === run.runId
+    && event.payload.remoteRunId === body.remote_run_id
+    && event.payload.remoteRunId === attempt.remoteRunId
+    && event.payload.attemptNumber === body.attempt_number
+    && event.payload.dispatchId === attempt.dispatchIdempotencyKey,
+  );
+}
+
   router.post("/runs/:run_id/events", async (req, res) => {
     const role = authGate(req, res, ["agent", "operator"]);
     if (!role) return;
@@ -71,6 +167,20 @@ export function registerEventRoutes(
       return;
     }
     const body = parsedEvent.data;
+    const authoritativeAttempt = agentRegistry.getLatestDispatchAttemptForRun(run.runId);
+    const eventDispatchAttempt = body.dispatch_idempotency_key
+      ? agentRegistry.getDispatchAttemptByIdempotencyKey(body.dispatch_idempotency_key)
+      : authoritativeAttempt;
+    // Run identity is immutable origin provenance; the dispatch attempt owns
+    // the authenticated destination identity for a resumed execution.
+    const eventAgentId = eventDispatchAttempt?.agentId ?? run.agentId;
+    if (body.dispatch_idempotency_key && (!eventDispatchAttempt
+      || eventDispatchAttempt.runId !== run.runId
+      || body.attempt_number !== eventDispatchAttempt.attemptNumber
+      || body.remote_run_id !== eventDispatchAttempt.remoteRunId)) {
+      res.status(409).json({ error: { code: "dispatch_attempt_mismatch", message: "Lifecycle event does not match its durable dispatch attempt." } });
+      return;
+    }
 
     if (!body.type || (!ADAPTER_EVENT_TYPE_TO_RUN[body.type] && !APPROVAL_EVENT_TYPES.has(body.type))) {
       res.status(400).json({ error: { code: "invalid_input", message: "unknown or missing event type" } });
@@ -84,26 +194,87 @@ export function registerEventRoutes(
     if (role === "agent") {
       // Agent ownership is header-bound; accepting the body copy here would
       // let a caller choose which registered identity it claims to be.
-      if (!requireAgentOwnership(req, res, role, run.agentId)) return;
-      if (body.agent_id && body.agent_id !== run.agentId) {
-        res.status(403).json({ error: { code: "forbidden", message: "agent_id does not match the bound run" } });
+      if (!requireAgentOwnership(req, res, role, eventAgentId)) return;
+      if (body.agent_id && body.agent_id !== eventAgentId) {
+        res.status(403).json({ error: { code: "forbidden", message: "agent_id does not match the bound dispatch attempt" } });
         return;
       }
+    }
+
+    // A scheduled read-only execution has no checkout mutation lease. The
+    // gateway persists its execution mode on the ACP run before sending the
+    // adapter request, because the scheduler's work-session link may not yet
+    // have been projected onto the scheduled-job row when an eager worker
+    // reports its first event. The signed grant must still bind this exact
+    // current attempt and workspace.
+    let readOnlyExecutionAuthorized = false;
+    if (run.scheduledExecutionMode === "read_only_audit") {
+      let workspaceRoot: string | undefined;
+      try {
+        workspaceRoot = run.workspaceSessionId
+          ? await realpath(ctx.workspaces.getWorkspace(run.workspaceSessionId).root)
+          : undefined;
+      } catch { /* reject below when the canonical workspace cannot be recovered */ }
+      const grantValid = Boolean(
+        eventDispatchAttempt
+        && run.workSessionId
+        && workspaceRoot
+        && eventAgentId
+        && verifyReadOnlyExecutionGrant(
+          body.read_only_execution_grant,
+          ctx.adapterSecret ?? ctx.sharedSecret,
+          {
+            workSessionId: run.workSessionId,
+            workspaceSessionId: run.workspaceSessionId,
+            workspaceRoot,
+            agentId: eventAgentId,
+            runId: run.runId,
+            attemptNumber: body.attempt_number ?? run.attemptNumber,
+            dispatchIdempotencyKey: eventDispatchAttempt.dispatchIdempotencyKey,
+          },
+        ),
+      );
+      if (!grantValid) {
+        res.status(403).json({ error: { code: "read_only_grant_invalid", message: "Scheduled read-only event lacks a valid current-attempt execution grant." } });
+        return;
+      }
+      readOnlyExecutionAuthorized = true;
     }
 
     // P0 #7: bind lifecycle events to the exact dispatch attempt. An event
     // from a superseded attempt is recorded diagnostically and idempotently
     // acked — it must never mutate the current attempt's state.
     if (body.attempt_number !== undefined && run.attemptNumber !== undefined && body.attempt_number !== run.attemptNumber) {
+      const priorStaleEvent = body.event_id ? eventStore?.getEventById(body.event_id) : undefined;
+      if (priorStaleEvent) {
+        const acknowledgement = eventMatchesDispatch(priorStaleEvent, run, body, eventDispatchAttempt)
+          ? dispatchReceiptAcknowledgement(body, run, eventDispatchAttempt, true)
+          : undefined;
+        res.status(202).json({
+          run_id: run.runId,
+          status: run.status,
+          accepted: true,
+          duplicate: true,
+          stale_attempt: true,
+          ...(acknowledgement ?? {}),
+        });
+        return;
+      }
       eventStore?.appendEvent({
+        id: body.event_id,
         type: "agent.event.stale_attempt",
         sessionId: run.workSessionId ?? run.workspaceSessionId ?? "",
         payload: {
           runId: run.runId,
+          remoteRunId: body.remote_run_id,
+          attemptNumber: body.attempt_number,
+          dispatchId: eventDispatchAttempt?.dispatchIdempotencyKey,
           eventAttempt: body.attempt_number,
           currentAttempt: run.attemptNumber,
           eventType: body.type,
-          remoteRunId: body.remote_run_id,
+          ...(stringPayload(body.payload?.final_output) !== undefined
+            ? { final_output: stringPayload(body.payload?.final_output) }
+            : {}),
         },
       }, { publish: false });
       if (body.type === "started" || body.type === "heartbeat") {
@@ -115,7 +286,11 @@ export function registerEventRoutes(
         });
         return;
       }
-      res.status(202).json({ run_id: run.runId, status: run.status, ignored: true, stale_attempt: true });
+      const staleEvent = body.event_id ? eventStore?.getEventById(body.event_id) : undefined;
+      const acknowledgement = eventMatchesDispatch(staleEvent ?? { type: "agent.event.stale_attempt", payload: {} }, run, body, eventDispatchAttempt)
+        ? dispatchReceiptAcknowledgement(body, run, eventDispatchAttempt, true)
+        : undefined;
+      res.status(202).json({ run_id: run.runId, status: run.status, ignored: true, stale_attempt: true, ...(acknowledgement ?? {}) });
       return;
     }
 
@@ -129,7 +304,7 @@ export function registerEventRoutes(
     // possession of the exact nonce issued for this dispatch; Kontrol must not
     // look up and renew its own current token on the adapter's behalf.
     let workspaceLeaseExpiresAt: string | undefined;
-    if ((body.type === "started" || body.type === "heartbeat") && run.workSessionId) {
+    if ((body.type === "started" || body.type === "heartbeat") && run.workSessionId && !readOnlyExecutionAuthorized) {
       if (!body.workspace_lease_nonce) {
         res.status(409).json({
           error: {
@@ -165,7 +340,17 @@ export function registerEventRoutes(
     if (body.event_id && eventStore) {
       const existing = eventStore.getEventById(body.event_id);
       if (existing) {
-        res.status(202).json({ run_id: run.runId, status: run.status, accepted: true, duplicate: true, event_id: body.event_id });
+        const acknowledgement = eventMatchesDispatch(existing, run, body, eventDispatchAttempt)
+          ? dispatchReceiptAcknowledgement(body, run, eventDispatchAttempt, true)
+          : undefined;
+        res.status(202).json({
+          run_id: run.runId,
+          status: run.status,
+          accepted: true,
+          duplicate: true,
+          event_id: body.event_id,
+          ...(acknowledgement ?? {}),
+        });
         return;
       }
     }
@@ -211,7 +396,7 @@ export function registerEventRoutes(
         workspaceSessionId,
         workSessionId: sessionId,
         runId: run.runId,
-        agentId: run.agentId ?? run.agentName,
+        agentId: eventAgentId ?? run.agentName,
         title: stringPayload(payload.title) ?? stringPayload(payload.tool) ?? "Agent approval requested",
         description: stringPayload(payload.description) ?? stringPayload(payload.message),
         risk: stringPayload(payload.risk),
@@ -322,13 +507,76 @@ export function registerEventRoutes(
       session !== undefined &&
       !TERMINAL_SESSION_STATUSES.has(session.status);
     if (sessionId && eventStore && !awaitingReviewCrash && !workflowHandledCancellation) {
-      const eventType = gatedCompletedTurn ? "worker.turn.completed" : ADAPTER_EVENT_TYPE_TO_RUN[body.type]!;
+      const scheduledJobForSession = sessionId ? ctx.scheduledJobs?.getByWorkSessionId(sessionId) : undefined;
+      const scheduledAttempt = scheduledJobForSession
+        ? ctx.scheduledJobs!.getAttempt(scheduledJobForSession.id)
+        : undefined;
+      const authorizedOutputs = Array.isArray(scheduledJobForSession?.policySnapshotJson.allowedOutputs)
+        ? scheduledJobForSession.policySnapshotJson.allowedOutputs as Array<{ path?: string; expectedSha256?: string }>
+        : [];
+      const currentAttemptId = scheduledAttempt?.id;
+      const currentAttemptNumber = scheduledAttempt?.acpAttemptNumber ?? run.attemptNumber ?? 1;
+      const committedReceipts = (scheduledAttempt?.publicationReceipts ?? []).filter((receipt: Record<string, unknown>) =>
+        receipt.outcome === "committed"
+        && receipt.readBackVerified === true
+        && receipt.attemptId === currentAttemptId
+        && receipt.attemptNumber === currentAttemptNumber);
+      const receiptPaths = new Set<string>();
+      let conflictingCommittedReceipts = false;
+      for (const receipt of committedReceipts) {
+        const path = typeof receipt.path === "string" ? receipt.path : undefined;
+        if (!path || receiptPaths.has(path)) {
+          conflictingCommittedReceipts = true;
+          break;
+        }
+        receiptPaths.add(path);
+      }
+      const unresolvedPublicationFailure = (scheduledAttempt?.publicationReceipts ?? []).some((receipt: Record<string, unknown>) =>
+        receipt.outcome === "rejected" || receipt.outcome === "conflict");
+      const outputsVerified = authorizedOutputs.length > 0
+        && authorizedOutputs.every((output) =>
+          typeof output?.path === "string"
+          && receiptPaths.has(output.path)
+          && committedReceipts.some((receipt: Record<string, unknown>) =>
+            receipt.path === output.path
+            && (output.expectedSha256 === undefined || receipt.sha256 === output.expectedSha256)));
+      const autonomousBoundedWrite = body.type === "completed"
+        && session?.completionPolicy === "agent_completion"
+        && scheduledJobForSession?.executionMode === "bounded_file_write"
+        && outputsVerified
+        && !conflictingCommittedReceipts
+        && !unresolvedPublicationFailure;
+      const eventType = (gatedCompletedTurn || autonomousBoundedWrite) ? "worker.turn.completed" : ADAPTER_EVENT_TYPE_TO_RUN[body.type]!;
+      const failureEvidence = body.type === "failed" || body.type === "exited"
+        ? workerFailureEvidence({
+            payload: body.payload,
+            eventId: body.event_id,
+            runId: run.runId,
+            attemptNumber: run.attemptNumber ?? 1,
+          })
+        : undefined;
+      const adapterPayload = Object.fromEntries(
+        Object.entries(body.payload ?? {}).filter(([key]) =>
+          !SERVER_OWNED_EVENT_PAYLOAD_FIELDS.has(key)
+          && !(failureEvidence && ["error", "message", "stderr", "exit_code", "signal"].includes(key))),
+      );
       const eventPayload = {
+        ...adapterPayload,
+        ...(autonomousBoundedWrite ? { autonomousCompletion: true } : {}),
+        ...(failureEvidence
+          ? {
+              workerFailureEvidence: failureEvidence,
+              ...(failureEvidence.reason ? { reason: failureEvidence.reason } : {}),
+            }
+          : {}),
         runId: run.runId,
         remoteRunId: body.remote_run_id ?? run.remoteRunId,
+        attemptNumber: body.attempt_number ?? run.attemptNumber ?? 1,
+        ...(eventDispatchAttempt?.dispatchIdempotencyKey
+          ? { dispatchId: eventDispatchAttempt.dispatchIdempotencyKey }
+          : {}),
         workSessionId: sessionId,
         ...(body.event_id ? { eventId: body.event_id } : {}),
-        ...(body.payload ?? {}),
       };
       if (eventType === "agent.run.output_delta" || eventType === "agent.run.thought_delta") {
         // This writes the event-id receipt and fragment to SQLite before the
@@ -355,7 +603,21 @@ export function registerEventRoutes(
     } else if (body.type === "cancelled") {
       const session = sessionId ? workSessions.get(sessionId) : undefined;
       if (session && !TERMINAL_SESSION_STATUSES.has(session.status) && reviewWorkflow) {
-        await reviewWorkflow.finalizeCancellation({ sessionId: session.id, reason: stringPayload(body.payload?.message) ?? "worker cancelled" });
+        await reviewWorkflow.finalizeCancellation({
+          sessionId: session.id,
+          reason: stringPayload(body.payload?.message) ?? "worker cancelled",
+          ...(body.event_id && body.remote_run_id && body.attempt_number !== undefined && eventDispatchAttempt?.dispatchIdempotencyKey
+            ? {
+                adapterEvent: {
+                  id: body.event_id,
+                  runId: run.runId,
+                  remoteRunId: body.remote_run_id,
+                  attemptNumber: body.attempt_number,
+                  dispatchIdempotencyKey: eventDispatchAttempt.dispatchIdempotencyKey,
+                },
+              }
+            : {}),
+        });
       } else {
         agentRegistry.updateRun(run.runId, { status: "cancelled", finishedAt: now, workerLeaseUntil: null });
       }
@@ -367,7 +629,13 @@ export function registerEventRoutes(
       // still open. Map to `failed`; only a zero-exit in the wrong session
       // state (handled by evaluateCompletion) is a protocol failure.
       const session = sessionId ? workSessions.get(sessionId) : undefined;
-      const errorMessage = stringPayload(body.payload?.message) ?? "worker process exited";
+      const failureEvidence = workerFailureEvidence({
+        payload: body.payload,
+        eventId: body.event_id,
+        runId: run.runId,
+        attemptNumber: run.attemptNumber ?? 1,
+      });
+      const errorMessage = failureEvidence.reason ?? "worker process exited";
       if (session && session.status === "awaiting_review") {
         // Worker died after submitting but before the reviewer responded. Keep
         // the durable review OPEN (resumable): mark the attempt detached and do
@@ -380,16 +648,38 @@ export function registerEventRoutes(
           workerLeaseUntil: null,
         });
         eventStore?.appendEvent({
+          id: body.event_id,
           type: "worker.attempt.failed",
           sessionId: session.id,
-          payload: { runId: run.runId, resumable: true, reason: errorMessage },
+          payload: {
+            runId: run.runId,
+            remoteRunId: run.remoteRunId,
+            attemptNumber: run.attemptNumber ?? 1,
+            ...(eventDispatchAttempt?.dispatchIdempotencyKey ? { dispatchId: eventDispatchAttempt.dispatchIdempotencyKey } : {}),
+            resumable: true,
+            reason: errorMessage,
+            workerFailureEvidence: failureEvidence,
+            ...(stringPayload(body.payload?.final_output) !== undefined
+              ? { final_output: stringPayload(body.payload?.final_output) }
+              : {}),
+            ...(body.payload?.report_availability === "unavailable" || body.payload?.report_availability === "no_output"
+              ? { report_availability: body.payload.report_availability }
+              : {}),
+          },
         });
       } else if (session && !TERMINAL_SESSION_STATUSES.has(session.status)) {
         workSessions.updateStatus(session.id, "failed");
         eventStore?.appendEvent({
           type: "agent.run.failed",
           sessionId: session.id,
-          payload: { runId: run.runId, reason: errorMessage },
+          payload: {
+            runId: run.runId,
+            remoteRunId: run.remoteRunId,
+            attemptNumber: run.attemptNumber ?? 1,
+            ...(eventDispatchAttempt?.dispatchIdempotencyKey ? { dispatchId: eventDispatchAttempt.dispatchIdempotencyKey } : {}),
+            reason: errorMessage,
+            workerFailureEvidence: failureEvidence,
+          },
         });
         agentRegistry.updateRun(run.runId, { status: "failed", errorMessage, finishedAt: now });
       } else {
@@ -399,12 +689,20 @@ export function registerEventRoutes(
 
     const finalRun = agentRegistry.getRun(run.runId);
     const finalSession = finalRun?.workSessionId ? workSessions.get(finalRun.workSessionId) : undefined;
+    const persistedTerminalEvent = body.event_id ? eventStore?.getEventById(body.event_id) : undefined;
+    const dispatchReceiptAck = dispatchReceiptAcknowledgement(
+      body,
+      run,
+      eventDispatchAttempt,
+      Boolean(persistedTerminalEvent && eventMatchesDispatch(persistedTerminalEvent, run, body, eventDispatchAttempt)),
+    );
     res.status(202).json({
       run_id: run.runId,
       status: finalRun?.status ?? run.status,
       work_session_status: finalSession?.status,
       ...(workspaceLeaseExpiresAt ? { workspace_lease_expires_at: workspaceLeaseExpiresAt } : {}),
       accepted: true,
+      ...(dispatchReceiptAck ?? {}),
     });
   });
 

@@ -40,7 +40,7 @@ function writeRequiredFiles(artifact) {
     workspaceAppBuildId: createHash("sha256").update(workspaceAppHtml).digest("hex").slice(0, 12),
     workspaceAppHistory: [],
   }) + "\n");
-  for (const file of ["cli.js", "server.js", "acp-duplex.js", "acp-worker-token.mjs"]) {
+  for (const file of ["cli.js", "server.js", "acp-duplex.js", "read-only-execution.mjs", "acp-worker-token.mjs"]) {
     writeFileSync(join(artifact, file), "export {};\n");
   }
   writeFileSync(join(artifact, "ui", "workspace-app.html"), workspaceAppHtml);

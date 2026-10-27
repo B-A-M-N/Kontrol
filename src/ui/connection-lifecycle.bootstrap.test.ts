@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { cancelReconnect, connectBootstrapWithRetry, setLifecycleHost, type LifecycleHost } from "./connection-lifecycle.js";
+import { cancelReconnect, connectBootstrapWithRetry, reconnectApp, setLifecycleHost, type LifecycleHost } from "./connection-lifecycle.js";
 
 function makeHost(connectApp: () => Promise<void>) {
   let connected = false;
@@ -61,6 +61,31 @@ assert.equal(succeedsOnRetry.connected, true);
 assert.equal(succeedsOnRetry.state, "CONNECTED");
 assert.equal(succeedsOnRetry.connectionError, null);
 assert.equal(succeedsOnRetry.rehydrationCount, 1);
+assert.ok(performance.getEntriesByName("kontrol.host_connect_ms").length > 0,
+  "host connection latency is recorded for startup diagnosis");
+
+let transportAttached = true;
+let reconnectConnectAttempts = 0;
+const replacesClosedTransport = makeHost(async () => {
+  reconnectConnectAttempts += 1;
+  if (transportAttached) throw new Error("App is already connected. Call close() before connecting again.");
+  transportAttached = true;
+});
+replacesClosedTransport.host.setConnected(true);
+setLifecycleHost({
+  ...replacesClosedTransport.host,
+  recreateApp: async () => {
+    await replacesClosedTransport.host.recreateApp();
+    transportAttached = false;
+  },
+});
+await Promise.all([
+  reconnectApp(new Error("MCP error -32000: Connection closed")),
+  reconnectApp(new Error("MCP error -32000: Connection closed")),
+]);
+assert.equal(reconnectConnectAttempts, 1, "reconnect replaces an App that still owns a closed transport before calling connect");
+assert.equal(replacesClosedTransport.recreateCount, 1, "reconnect closes/replaces the stale SDK App exactly once");
+assert.equal(replacesClosedTransport.connected, true, "fresh App reconnect reaches CONNECTED");
 
 let cancelledAttempts = 0;
 const cancelledBootstrap = makeHost(async () => {
@@ -85,5 +110,21 @@ assert.equal(remainsFailed.recreateCount, 1);
 assert.equal(remainsFailed.connected, false);
 assert.equal(remainsFailed.state, "DISCONNECTED");
 assert.equal(remainsFailed.connectionError, "bootstrap failed 2");
+
+let delayedHostAvailable = false;
+let delayedHostAttempts = 0;
+const delayedHost = makeHost(async () => {
+  delayedHostAttempts += 1;
+  if (!delayedHostAvailable) throw new Error("host is not attached yet");
+});
+setLifecycleHost(delayedHost.host);
+await assert.rejects(connectBootstrapWithRetry(), /host is not attached yet/);
+assert.equal(delayedHost.connected, false, "exhausted bootstrap remains in a recoverable disconnected state");
+delayedHostAvailable = true;
+await reconnectApp(new Error("user requested reconnect after host became available"));
+assert.equal(delayedHost.connected, true, "explicit reconnect recovers after the host becomes available later");
+assert.equal(delayedHost.state, "CONNECTED");
+assert.equal(delayedHost.rehydrationCount, 1, "recovery queues authoritative server-state hydration");
+assert.equal(delayedHostAttempts, 3, "later host recovery uses a fresh connection attempt");
 
 console.log("connection-lifecycle.bootstrap.test.ts: bounded bootstrap retry assertions passed");

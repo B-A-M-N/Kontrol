@@ -30,6 +30,11 @@ assert.ok(!smokeCurl.includes(doubleSmokeContinuation), "CRUSH smoke curl must n
 assert.match(script, /core-readyz/);
 assert.match(script, /KONTROL_ACP_AGENTS/);
 assert.match(script, /kontrol-supervisor/);
+assert.match(
+  script,
+  /if ! start_beta_soak_monitor; then[\s\S]*--qualify did not start the soak monitor; qualification is not running[\s\S]*exit 1\n\s+fi/,
+  "qualification mode must fail when it cannot start the soak monitor",
+);
 assert.match(script, /scripts\/kontrol-tunnel\.sh/);
 const tunnelScript = readText("scripts/kontrol-tunnel.sh");
 assert.match(tunnelScript, /KONTROL_TUNNEL_PROFILE/);
@@ -81,7 +86,10 @@ assert.match(script, /kontrol-adapter-hermes\.log/);
 assert.match(script, /Recent adapter log/);
 assert.match(script, /HERMES_ACP_ADAPTER_PORT:-9911/);
 assert.match(script, /HERMES_ACP_COMPAT_PATH="\$DESKTOP_PWD\/scripts\/hermes-acp-compat"/);
-assert.match(script, /PYTHONPATH="\$HERMES_ACP_COMPAT_PATH:\$\{PYTHONPATH:-\}" "\$\{HERMES_BIN:-hermes\}" acp --check/);
+assert.match(script, /HERMES_ACP_CHECK_COMMAND=\(\)/);
+assert.match(script, /HERMES_ACP_BIN:-/);
+assert.match(script, /hermes-acp/);
+assert.match(script, /PYTHONPATH="\$HERMES_ACP_COMPAT_PATH:\$\{PYTHONPATH:-\}" "\$\{HERMES_ACP_CHECK_COMMAND\[@\]\}" --check/);
 assert.match(script, /node scripts\/acp-hermes-native-adapter\.mjs/);
 assert.match(script, /probe-kontrol-readiness\.mjs/);
 assert.match(script, /effective-policy --json/);
@@ -112,9 +120,19 @@ assert.match(readinessProbe, /await jsonOrText\(reviewerReadiness\)/, "reviewer 
 assert.match(readinessProbe, /REQUIRED_INSPECTION_TOOLS/, "readiness must use the canonical eight-tool registry");
 assert.match(readinessProbe, /git_status.*git_log.*git_diff.*git_show/s, "readiness must exercise all Git inspection tools");
 assert.match(readinessProbe, /open_approval_center/, "ask-capable readiness must exercise the reviewer approval center");
+assert.match(readinessProbe, /reviewerHeaderName[\s\S]*x-kontrol-tunnel-reviewer[\s\S]*x-kontrol-reviewer-token/,
+  "readiness must use the tunnel-specific reviewer assertion header in tunnel mode");
+assert.match(readinessProbe, /\[reviewerHeaderName\]: reviewerToken/,
+  "reviewer readiness sends the selected credential only in its matching authority header");
+assert.match(readinessProbe, /--rpc-timeout-ms/,
+  "readiness RPC timeout is configurable for large but bounded workspace inspections");
 assert.match(readinessProbe, /jsonOrText/);
 assert.match(readinessProbe, /args\.includes\("--probe-bash"\)/);
 assert.match(readinessProbe, /if \(probeBash\)/);
+assert.match(readinessProbe, /readOnlyInspection: true/,
+  "the optional Bash readiness probe must use the checkpoint-independent inspection path");
+assert.match(readinessProbe, /inputSchema\?\.properties\?\.readOnlyInspection/,
+  "readiness must reject a stale Bash tool schema without read-only inspection support");
 assert.match(readFileSync("restart-kontrol.sh", "utf8"), /node|start-all/);
 
 console.log("start-all.test.mjs: all assertions passed");

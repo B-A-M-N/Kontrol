@@ -42,6 +42,7 @@ function loadSmoke(artifactPath) {
   const entrypoints = [
     "server.js",
     "acp-duplex.js",
+    "read-only-execution.mjs",
     "acp-worker-token.mjs",
     // Import worker entrypoints too: a release that boots the HTTP server but
     // cannot resolve a background worker is not independently loadable.

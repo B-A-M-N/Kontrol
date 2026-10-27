@@ -10,6 +10,7 @@
 import type { Request, Response, Router } from "express";
 import { brandWorkSessionId, brandWorkspaceId } from "../../branded.js";
 import {
+  hasConfirmedWorkerAttemptExit,
   serializeFinalAcpResult,
   type AgentRegistryManager,
 } from "../../acp-registry.js";
@@ -20,7 +21,7 @@ import { ACP_TOOL_POLICY_NAMES } from "../../policy-enforcement.js";
 import { authorizeWorkSessionAction } from "../../work-session-action-guard.js";
 import { redactValue, redactedPreview } from "../../redaction.js";
 import type { AcpContext, AcpRole } from "./context.js";
-import { MUTATING_LOCAL_AGENTS } from "./context.js";
+import { MUTATING_LOCAL_AGENTS, READ_ONLY_AUDIT_ALLOWED_AGENTS } from "./context.js";
 import type { makeAuth } from "./auth.js";
 import type { makeSseHub } from "./sse-hub.js";
 import type { makeRunSupport } from "./run-support.js";
@@ -35,6 +36,10 @@ export function registerRunRoutes(
   barrier: ReturnType<typeof makeReviewBarrier>,
 ) {
   const { workspaces, workSessions, agentRegistry, eventStore, reviewCheckpoints, reviewWorkflow, policyEnforcer, adapterSecret, sharedSecret } = ctx;
+  const workSessionScheduledJob = (workSessionId: string) => {
+    const row = ctx.database?.sqlite.prepare("select execution_mode as executionMode from scheduled_jobs where work_session_id = ? limit 1").get(workSessionId) as { executionMode?: string } | undefined;
+    return row;
+  };
   const { authGate } = auth;
   const { emitSse, sseSubscribe, requestAbortSignal } = sse;
   const { resolveCwd, extractTaskText, resolveRunContext, acquireCheckoutModifyLease } = support;
@@ -167,6 +172,11 @@ export function registerRunRoutes(
     });
     if (!context) return;
     const { session, workspaceRoot, createdSession } = context;
+    const scheduledJob = workSessionScheduledJob(session.id);
+    if (scheduledJob?.executionMode === "read_only_audit" && !READ_ONLY_AUDIT_ALLOWED_AGENTS.has(agent_name)) {
+      res.status(403).json({ agent_name, status: "failed", error: { message: `Tool "${agent_name}" denied by read-only audit policy.` }, output: [] });
+      return;
+    }
     if (MUTATING_LOCAL_AGENTS.has(agent_name) && !(await acquireCheckoutModifyLease(res, session.workspaceSessionId, workspaceRoot, session.id))) {
       if (createdSession) workSessions.updateStatus(session.id, "cancelled");
       return;
@@ -432,10 +442,14 @@ export function registerRunRoutes(
       return;
     }
 
+    const reviewerRole = authGate(req, res, ["reviewer"]);
+    if (!reviewerRole) return;
     try {
       const result = await reviewWorkflow.provideFeedback({
         sessionId,
         submissionId: submissionId ?? "",
+        invocationOrigin: "authenticated_reviewer",
+        reviewerOwnerContextId: `acp:${req.ip}`,
         diffSha256,
         reviewEpoch,
         verdict: verdict as "approve" | "changes_requested" | "reject",
@@ -485,14 +499,16 @@ export function registerRunRoutes(
       return;
     }
     const workSessionId = run.workSessionId;
+    const terminalSessionStatuses = new Set(["completed", "approved", "rejected", "cancelled", "failed", "failed_protocol"]);
     // Resolve the correlated work session and delegate to the authoritative
     // workflow. Cancellation first enters `cancelling`; the checkout lease and
     // logical run remain fenced until the worker reports that it actually
     // stopped.
     let remoteCancellation: Awaited<ReturnType<typeof cancelRemoteRun>> | undefined;
+    let cancellationStatus: string | undefined;
     if (workSessionId && reviewWorkflow) {
       try {
-        await reviewWorkflow.cancelSession({ sessionId: workSessionId, reason: "cancelled via ACP" });
+        cancellationStatus = reviewWorkflow.cancelSession({ sessionId: workSessionId, reason: "cancelled via ACP" }).status;
       } catch (error) {
         const status = error instanceof Error && "httpStatus" in error ? (error as { httpStatus: number }).httpStatus : 500;
         // A 4xx (e.g. already terminal) is not fatal; a 5xx is.
@@ -500,6 +516,39 @@ export function registerRunRoutes(
           res.status(status).json({ error: { code: "server_error", message: error instanceof Error ? error.message : "Failed" } });
           return;
         }
+      }
+      if (cancellationStatus && terminalSessionStatuses.has(cancellationStatus)) {
+        const finalRun = agentRegistry.getRun(run.runId);
+        emitSse(run.runId, `run.${cancellationStatus}`, { run_id: run.runId, status: cancellationStatus });
+        res.status(200).json({
+          run_id: run.runId,
+          status: cancellationStatus,
+          remote_cancellation: { acknowledged: false, error: "Work session is already terminal." },
+          output: [],
+          created_at: run.createdAt,
+          finished_at: finalRun?.finishedAt,
+        });
+        return;
+      }
+      const latestAttempt = agentRegistry.getLatestDispatchAttemptForRun(run.runId);
+      if (hasConfirmedWorkerAttemptExit(run, latestAttempt)) {
+        cancellationStatus = reviewWorkflow.finalizeCancellation({
+          sessionId: workSessionId,
+          reason: "the current worker attempt had already exited",
+        }).status;
+      }
+      if (cancellationStatus && terminalSessionStatuses.has(cancellationStatus)) {
+        const finalRun = agentRegistry.getRun(run.runId);
+        emitSse(run.runId, `run.${cancellationStatus}`, { run_id: run.runId, status: cancellationStatus });
+        res.status(202).json({
+          run_id: run.runId,
+          status: cancellationStatus,
+          remote_cancellation: { acknowledged: true, error: "Worker attempt exit was already confirmed." },
+          output: [],
+          created_at: run.createdAt,
+          finished_at: finalRun?.finishedAt,
+        });
+        return;
       }
     } else {
       agentRegistry.updateRun(run.runId, { status: "cancelling" });
@@ -515,11 +564,16 @@ export function registerRunRoutes(
       { agentRegistry, workspaces, workSessions, adapterSecret: adapterSecret ?? sharedSecret },
       run,
     );
-    if (workSessionId && reviewWorkflow && (!run.remoteRunId || (!remoteCancellation.acknowledged && remoteCancellation.status === 404))) {
-      await reviewWorkflow.finalizeCancellation({ sessionId: workSessionId, reason: "no live worker remained" });
-    }
     const finalRun = agentRegistry.getRun(run.runId);
-    emitSse(run.runId, "run.cancelled", { run_id: run.runId, status: finalRun?.status ?? "cancelling" });
+    if (finalRun?.status === "cancelled") {
+      emitSse(run.runId, "run.cancelled", { run_id: run.runId, status: finalRun.status });
+    } else {
+      emitSse(run.runId, "run.cancellation_requested", {
+        run_id: run.runId,
+        status: finalRun?.status ?? "cancelling",
+        remote_cancellation: remoteCancellation,
+      });
+    }
     res.status(202).json({ run_id: run.runId, status: finalRun?.status ?? "cancelling", remote_cancellation: remoteCancellation, output: [], created_at: run.createdAt, finished_at: finalRun?.finishedAt });
   });
 

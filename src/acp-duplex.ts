@@ -86,6 +86,8 @@ export interface AcpClientHandler {
   readTextFile?(params: FsReadParams): Promise<{ content: string }>;
   writeTextFile?(params: FsWriteParams): Promise<void>;
   sessionUpdate?(params: SessionUpdateParams): void;
+  /** Notifies the protocol handler when its underlying stdio stream closes. */
+  connectionClosed?(): void;
   /** Any other agent-initiated method. Reject to send a JSON-RPC error. */
   extMethod?(method: string, params: unknown): Promise<unknown>;
 }
@@ -201,6 +203,7 @@ export function createAcpDuplex(
   stream.onClose(() => {
     closed = true;
     inboundAbort.abort();
+    handler.connectionClosed?.();
     for (const [, waiter] of pending) waiter.reject(new Error("ACP duplex stream closed"));
     pending.clear();
   });

@@ -12,7 +12,7 @@
 export class WorkspaceMutationBlockedError extends Error {
   readonly workspaceId: string;
   readonly code = "checkpoint_unavailable";
-  constructor(workspaceId: string, message: string) {
+  constructor(workspaceId: string, message: string, readonly checkpointError?: { code: string; operation: string; stderr: string }) {
     super(message);
     this.name = "WorkspaceMutationBlockedError";
     this.workspaceId = workspaceId;
@@ -89,10 +89,18 @@ export function checkpointUnavailableResponse(error: WorkspaceMutationBlockedErr
         tool,
         workspaceId: error.workspaceId,
         status: "checkpoint_unavailable",
-        summary: { status: "checkpoint_unavailable" },
+        summary: {
+          status: "checkpoint_unavailable",
+          ...(error.checkpointError ? { operation: error.checkpointError.operation, code: error.checkpointError.code } : {}),
+        },
       },
     },
-    structuredContent: { result: message, status: "checkpoint_unavailable", retryable: false },
+    structuredContent: {
+      result: message,
+      status: "checkpoint_unavailable",
+      retryable: false,
+      ...(error.checkpointError ? { checkpointError: error.checkpointError } : {}),
+    },
   };
 }
 

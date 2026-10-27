@@ -5,12 +5,12 @@
  * this capability module owns one semantic slice of the reviewer/worker
  * control-plane API and receives the same typed BridgeConfig context.
  */
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer } from "@modelcontextprotocol/server";
 import type { BridgeConfig } from "./context.js";
 import { callRemoteAgent, probeAgent, selectHealthyAgent } from "../acp-gateway.js";
 import { loadSkillIndex } from "../skills.js";
 import { registerMutationAppTool } from "./app-tool.js";
-import { acquireCheckoutModifyLease, checkoutLeaseMetadata, forbidden, isReviewer, liveOwnerContextId, requireWorkSessionRead, resolveDelegationContext, workSessionInstructions } from "./shared.js";
+import { acquireCheckoutModifyLease, checkoutLeaseMetadata, forbidden, isReviewer, liveOwnerContextId, livePrincipalId, requireWorkSessionRead, resolveDelegationContext, workSessionInstructions } from "./shared.js";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
 import { z } from "zod/v4";
 
@@ -99,6 +99,9 @@ export function registerAgentTools(server: McpServer, config: BridgeConfig): voi
         workSessionId: z.string().optional(),
         workspaceSessionId: z.string().optional(),
         status: z.string(),
+        dispatchStatus: z.string().optional(),
+        workerStatus: z.string().optional(),
+        outcomeObserved: z.boolean().optional(),
         output: z.string().optional(),
         error: z.string().optional(),
         retryable: z.boolean().optional(),
@@ -145,6 +148,7 @@ export function registerAgentTools(server: McpServer, config: BridgeConfig): voi
         title: task.slice(0, 80),
         completionPolicy: "webui_approval_required",
         ownerContextId: liveOwnerContextId(config) ?? config.principalId,
+        principalId: livePrincipalId(config),
       }).id;
       const leaseError = await acquireCheckoutModifyLease(config, workspaceSessionId, wsId);
       if (leaseError) {
@@ -154,7 +158,7 @@ export function registerAgentTools(server: McpServer, config: BridgeConfig): voi
 
       try {
         const result = await callRemoteAgent(
-          { agentRegistry: config.agentRegistry, workspaces: config.workspaces, workSessions: config.workSessions, adapterSecret: config.adapterSecret },
+          { agentRegistry: config.agentRegistry, workspaces: config.workspaces, workSessions: config.workSessions, eventStore: config.eventStore, adapterSecret: config.adapterSecret },
           {
             agentUrl: selection.agent.url,
             agentName,
@@ -174,13 +178,24 @@ export function registerAgentTools(server: McpServer, config: BridgeConfig): voi
           config.eventStore.appendEvent({ type: "agent.dispatch.failed", sessionId: wsId, payload: { runId: result.runId, reason: result.error ?? "ACP dispatch failed" } });
           return {
             content: [{ type: "text" as const, text: `${agentName}: failed\n${result.error ?? "(no error detail)"}` }],
-            structuredContent: { runId: result.runId, workSessionId: wsId, workspaceSessionId, status: result.status, output: result.output, error: result.error },
+            structuredContent: { runId: result.runId, workSessionId: wsId, workspaceSessionId, status: result.status, dispatchStatus: "accepted", workerStatus: "unknown", outcomeObserved: false, output: result.output, error: result.error },
             isError: true,
+          };
+        }
+        if (result.status === "uncertain") {
+          config.eventStore.appendEvent({
+            type: "agent.dispatch.uncertain",
+            sessionId: wsId,
+            payload: { runId: result.runId, reason: result.error ?? "ACP dispatch acceptance is uncertain." },
+          });
+          return {
+            content: [{ type: "text" as const, text: `${agentName}: dispatch acceptance is uncertain. Run ${result.runId} remains attached to work session ${wsId} while Kontrol reconciles the original launch.` }],
+            structuredContent: { runId: result.runId, workSessionId: wsId, workspaceSessionId, status: "uncertain", dispatchStatus: "uncertain", workerStatus: "unknown", outcomeObserved: false, output: result.output, error: result.error, retryable: false },
           };
         }
         return {
           content: [{ type: "text" as const, text: `${agentName}: ${result.status}\n${result.output.slice(0, 5000)}${result.error ? `\nError: ${result.error}` : ""}` }],
-          structuredContent: { runId: result.runId, workSessionId: wsId, workspaceSessionId, status: result.status, output: result.output, error: result.error },
+          structuredContent: { runId: result.runId, workSessionId: wsId, workspaceSessionId, status: result.status, dispatchStatus: "accepted", workerStatus: "unknown", outcomeObserved: false, output: result.output, error: result.error },
         };
       } catch (error) {
         if (createdWorkSession) config.workSessions.updateStatus(wsId, "failed");

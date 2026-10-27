@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { and, asc, eq } from "drizzle-orm";
+import { and, asc, eq, inArray, isNull, or } from "drizzle-orm";
 import { openDatabase, type DatabaseHandle } from "./db/client.js";
 import { agentMessages, agentMessageReplies, agentReplyWaits, type AgentMessageReplyRow, type AgentMessageRow, type AgentReplyWaitRow } from "./db/schema.js";
 
@@ -20,7 +20,7 @@ export const AGENT_MESSAGE_KINDS: AgentMessageKind[] = [
 
 export type AgentMessageStatus = "open" | "resolved";
 
-export type AgentReplyStatus = "pending_delivery" | "delivering" | "acknowledged" | "blocked" | "cancelled";
+export type AgentReplyStatus = "pending_delivery" | "dispatching" | "reconciliation_required" | "delivering" | "awaiting_acknowledgement" | "acknowledged" | "blocked" | "cancelled";
 
 export interface AgentMessageReply {
   id: string;
@@ -31,6 +31,10 @@ export interface AgentMessageReply {
   bodySha256: string;
   reviewerPrincipalId: string;
   status: AgentReplyStatus;
+  deliveryDispatchIdempotencyKey?: string;
+  deliveryRunId?: string;
+  deliveryAttemptNumber?: number;
+  deliveryRemoteRunId?: string;
   createdAt: string;
   acknowledgedAt?: string;
   acknowledgedRunId?: string;
@@ -80,12 +84,21 @@ export interface AgentMessageManager {
   get(id: string): AgentMessage | undefined;
   list(workSessionId: string, opts?: { kind?: AgentMessageKind; openOnly?: boolean }): AgentMessage[];
   resolve(id: string): { message: AgentMessage | undefined; changed: boolean };
-  acceptReply(input: { messageId: string; workSessionId: string; body: string; reviewerPrincipalId: string }): AgentMessageReply;
+  acceptReply(input: { messageId: string; workSessionId: string; body: string; reviewerPrincipalId: string }): { reply: AgentMessageReply; created: boolean };
   getReply(replyId: string): AgentMessageReply | undefined;
   listPendingReplies(workSessionId: string): AgentMessageReply[];
   listReplies(workSessionId: string): AgentMessageReply[];
-  acknowledgeReply(input: { replyId: string; workSessionId: string; runId: string; attempt: number; actorId: string }): AgentMessageReply;
+  acknowledgeReply(input: { replyId: string; workSessionId: string; runId: string; attempt: number; actorId: string; expectedReplyRevision?: number }): { reply: AgentMessageReply; created: boolean };
   setReplyDelivery(input: { replyId: string; expectedStatus: AgentReplyStatus; nextStatus: AgentReplyStatus }): AgentMessageReply | undefined;
+  recordReplyDispatch(input: {
+    replyId: string;
+    expectedStatus: AgentReplyStatus;
+    nextStatus: "dispatching" | "reconciliation_required" | "awaiting_acknowledgement" | "blocked";
+    dispatchIdempotencyKey: string;
+    runId?: string;
+    attemptNumber?: number;
+    remoteRunId?: string;
+  }): AgentMessageReply | undefined;
   waitForReply(input: { messageId: string; workSessionId: string; runId?: string; attempt: number; expectsReply: boolean; resumeOnReply: boolean }): AgentReplyWait;
   getActiveWaitForMessage(messageId: string): AgentReplyWait | undefined;
   closeWait(input: { messageId: string; workSessionId: string }): void;
@@ -183,6 +196,10 @@ export function createAgentMessageManager(
       bodySha256: row.bodySha256,
       reviewerPrincipalId: row.reviewerPrincipalId,
       status: row.status as AgentReplyStatus,
+      deliveryDispatchIdempotencyKey: row.deliveryDispatchIdempotencyKey ?? undefined,
+      deliveryRunId: row.deliveryRunId ?? undefined,
+      deliveryAttemptNumber: row.deliveryAttemptNumber ?? undefined,
+      deliveryRemoteRunId: row.deliveryRemoteRunId ?? undefined,
       createdAt: row.createdAt,
       acknowledgedAt: row.acknowledgedAt ?? undefined,
       acknowledgedRunId: row.acknowledgedRunId ?? undefined,
@@ -191,7 +208,7 @@ export function createAgentMessageManager(
     };
   }
 
-  function acceptReply(input: { messageId: string; workSessionId: string; body: string; reviewerPrincipalId: string }): AgentMessageReply {
+  function acceptReply(input: { messageId: string; workSessionId: string; body: string; reviewerPrincipalId: string }): { reply: AgentMessageReply; created: boolean } {
     if (!input.body.trim()) throw new Error("Reply body must not be empty.");
     const existingForMessage = database.db.select().from(agentMessageReplies)
       .where(eq(agentMessageReplies.messageId, input.messageId))
@@ -201,7 +218,7 @@ export function createAgentMessageManager(
       if (prior.bodySha256 === createHash("sha256").update(input.body).digest("hex")
         && prior.reviewerPrincipalId === input.reviewerPrincipalId
         && prior.workSessionId === input.workSessionId) {
-        return rowToReply(prior);
+        return { reply: rowToReply(prior), created: false };
       }
       throw new Error(`Message ${input.messageId} already has an accepted reply.`);
     }
@@ -230,7 +247,7 @@ export function createAgentMessageManager(
     })();
     const created = getReply(id);
     if (!created) throw new Error("Reply commit could not be read back.");
-    return created;
+    return { reply: created, created: true };
   }
 
   function getReply(replyId: string): AgentMessageReply | undefined {
@@ -240,7 +257,9 @@ export function createAgentMessageManager(
 
   function listPendingReplies(workSessionId: string): AgentMessageReply[] {
     return database.db.select().from(agentMessageReplies)
-      .where(and(eq(agentMessageReplies.workSessionId, workSessionId), eq(agentMessageReplies.status, "pending_delivery")))
+      .where(and(eq(agentMessageReplies.workSessionId, workSessionId), inArray(agentMessageReplies.status, [
+        "pending_delivery", "dispatching", "reconciliation_required", "delivering", "awaiting_acknowledgement",
+      ])))
       .orderBy(asc(agentMessageReplies.createdAt))
       .all().map(rowToReply);
   }
@@ -252,14 +271,23 @@ export function createAgentMessageManager(
       .all().map(rowToReply);
   }
 
-  function acknowledgeReply(input: { replyId: string; workSessionId: string; runId: string; attempt: number; actorId: string }): AgentMessageReply {
+  function acknowledgeReply(input: { replyId: string; workSessionId: string; runId: string; attempt: number; actorId: string; expectedReplyRevision?: number }): { reply: AgentMessageReply; created: boolean } {
     const existing = getReply(input.replyId);
     if (!existing || existing.workSessionId !== input.workSessionId) throw new Error("Reply not found for this session.");
+    if (input.expectedReplyRevision !== undefined && existing.replyRevision !== input.expectedReplyRevision) throw new Error("Reply revision conflict; stale acknowledgement rejected.");
     if (existing.status === "acknowledged") {
-      if (existing.acknowledgedRunId === input.runId && existing.acknowledgedAttempt === input.attempt) return existing;
+      if (existing.acknowledgedRunId === input.runId && existing.acknowledgedAttempt === input.attempt) return { reply: existing, created: false };
       throw new Error("Reply is already acknowledged by a different logical run or attempt.");
     }
-    if (existing.status !== "pending_delivery" && existing.status !== "delivering") throw new Error(`Reply cannot be acknowledged from status ${existing.status}.`);
+    if (!["pending_delivery", "dispatching", "reconciliation_required", "delivering", "awaiting_acknowledgement"].includes(existing.status)) {
+      throw new Error(`Reply cannot be acknowledged from status ${existing.status}.`);
+    }
+    if (existing.deliveryAttemptNumber !== undefined && existing.deliveryAttemptNumber !== input.attempt) {
+      throw new Error("Reply acknowledgement does not match its accepted delivery attempt.");
+    }
+    if (existing.deliveryRunId !== undefined && existing.deliveryRunId !== input.runId) {
+      throw new Error("Reply acknowledgement does not match its logical run.");
+    }
     const wait = getActiveWaitForMessage(existing.messageId);
     const currentAttempt = wait?.workerAttempt ?? 1;
     if (input.attempt < currentAttempt) throw new Error("Stale worker attempt cannot acknowledge the reply.");
@@ -276,7 +304,7 @@ export function createAgentMessageManager(
       .run();
     if (updated.changes !== 1) throw new Error("Reply acknowledgement conflict; its delivery state changed concurrently.");
     closeWait({ messageId: existing.messageId, workSessionId: input.workSessionId });
-    return getReply(input.replyId)!;
+    return { reply: getReply(input.replyId)!, created: true };
   }
 
   function setReplyDelivery(input: { replyId: string; expectedStatus: AgentReplyStatus; nextStatus: AgentReplyStatus }): AgentMessageReply | undefined {
@@ -284,6 +312,25 @@ export function createAgentMessageManager(
       .set({ status: input.nextStatus })
       .where(and(eq(agentMessageReplies.id, input.replyId), eq(agentMessageReplies.status, input.expectedStatus)))
       .run();
+    return updated.changes === 1 ? getReply(input.replyId) : undefined;
+  }
+
+  function recordReplyDispatch(input: Parameters<AgentMessageManager["recordReplyDispatch"]>[0]): AgentMessageReply | undefined {
+    const row = database.db.select().from(agentMessageReplies).where(eq(agentMessageReplies.id, input.replyId)).get();
+    if (!row || (row.deliveryDispatchIdempotencyKey && row.deliveryDispatchIdempotencyKey !== input.dispatchIdempotencyKey)
+      || (input.runId && row.deliveryRunId && row.deliveryRunId !== input.runId)) return undefined;
+    const updated = database.db.update(agentMessageReplies).set({
+      status: input.nextStatus,
+      deliveryDispatchIdempotencyKey: input.dispatchIdempotencyKey,
+      ...(input.runId !== undefined ? { deliveryRunId: input.runId } : {}),
+      ...(input.attemptNumber !== undefined ? { deliveryAttemptNumber: input.attemptNumber } : {}),
+      ...(input.remoteRunId !== undefined ? { deliveryRemoteRunId: input.remoteRunId } : {}),
+    }).where(and(
+      eq(agentMessageReplies.id, input.replyId),
+      eq(agentMessageReplies.status, input.expectedStatus),
+      or(isNull(agentMessageReplies.deliveryDispatchIdempotencyKey), eq(agentMessageReplies.deliveryDispatchIdempotencyKey, input.dispatchIdempotencyKey)),
+      ...(input.runId ? [or(isNull(agentMessageReplies.deliveryRunId), eq(agentMessageReplies.deliveryRunId, input.runId))] : []),
+    )).run();
     return updated.changes === 1 ? getReply(input.replyId) : undefined;
   }
 
@@ -366,7 +413,7 @@ export function createAgentMessageManager(
   // P1 #11: DB owned by server
   function close(): void { }
 
-  return { post, get, list, resolve, acceptReply, getReply, listPendingReplies, listReplies, acknowledgeReply, setReplyDelivery, waitForReply, getActiveWaitForMessage, closeWait, close };
+  return { post, get, list, resolve, acceptReply, getReply, listPendingReplies, listReplies, acknowledgeReply, setReplyDelivery, recordReplyDispatch, waitForReply, getActiveWaitForMessage, closeWait, close };
 }
 
 function rowToMessage(row: AgentMessageRow): AgentMessage {
