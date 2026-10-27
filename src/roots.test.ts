@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync, symlinkSync } from "node:fs";
+import { mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { assertAllowedPath, assertNoSymlinkComponentsSync, expandHomePath, isPathInsideRoot, isPathInsideRootCanonical, resolveAllowedPath, resolveAllowedPathCanonical } from "./roots.js";
@@ -52,7 +52,7 @@ if (process.platform !== "win32") {
     assertNoSymlinkComponentsSync(join(aliasedWorkspace, "new-file.txt"), aliasedWorkspace);
     assert.equal(
       await resolveAllowedPathCanonical("new-file.txt", aliasedWorkspace, [aliasedWorkspace], aliasedWorkspace),
-      join(workspace, "new-file.txt"),
+      join(realpathSync(workspace), "new-file.txt"),
       "canonical path resolution accepts a trusted OS-style root alias and returns the physical destination",
     );
 
