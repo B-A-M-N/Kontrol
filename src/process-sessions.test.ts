@@ -821,11 +821,13 @@ try {
             },
           },
         });
+        const expectedCredentialOutput = /agent-pty-review-test\/credential\.json\|undefined/;
         let credentialObservation = ptyManager.observeAgentPty({
           workSessionId: workSession.id,
           processSessionId: credentialLaunch.sessionId!,
         });
-        for (let index = 0; index < 20 && !credentialCleaned; index += 1) {
+        for (let index = 0; index < 100
+          && (!credentialCleaned || !expectedCredentialOutput.test(credentialObservation?.output ?? "")); index += 1) {
           await new Promise((resolve) => setTimeout(resolve, 25));
           credentialObservation = ptyManager.observeAgentPty({
             workSessionId: workSession.id,

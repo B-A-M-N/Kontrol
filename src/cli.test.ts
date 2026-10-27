@@ -11,7 +11,7 @@ const repositoryRoot = fileURLToPath(new URL("..", import.meta.url));
 const packageJson = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
   version: string;
 };
-const cliSource = readFileSync(new URL("./cli.ts", import.meta.url), "utf8");
+const cliSource = readFileSync(new URL("./cli.ts", import.meta.url), "utf8").replace(/\r\n/g, "\n");
 
 const validSubmission = readPtyReviewSubmission({ structuredContent: { submissionId: "submission-1", status: "awaiting_review" } });
 assert.equal(validSubmission.ok, true, "a valid PTY review submission returns its durable receipt");

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { execFileSync, spawnSync } from "node:child_process";
+import { writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { chmod, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -16,12 +17,16 @@ const workspaceRoot = join(root, "workspace");
 const fakeBubblewrap = join(root, "bwrap");
 const capturedCwd = join(root, "sandbox-cwd.txt");
 const commandLaunches = join(root, "command-launches.txt");
+const verificationClaimsReady = join(root, "verification-claims-ready");
 
 function createVerificationJobs() {
   const executions = new Map<string, ScheduledVerificationExecution>();
+  let verificationClaimCount = 0;
   return {
     executions,
     claimVerificationExecution(input: ScheduledVerificationClaimInput) {
+      verificationClaimCount += 1;
+      if (verificationClaimCount === 3) writeFileSync(verificationClaimsReady, "ready");
       const prior = executions.get(input.requestKey);
       if (prior) {
         if (prior.requestFingerprint !== input.requestFingerprint) throw new Error("Verification idempotency key was already used with different content.");
@@ -112,6 +117,7 @@ try {
     "  shift",
     "done",
     "[ \"$unshare\" = 1 ] && [ \"$bind\" = 1 ] || exit 91",
+    `while [ ! -f ${JSON.stringify(verificationClaimsReady)} ]; do sleep 0.01; done`,
     `printf '%s' "$PWD" > ${JSON.stringify(capturedCwd)}`,
     `printf 'launch\\n' >> ${JSON.stringify(commandLaunches)}`,
     "shift",
