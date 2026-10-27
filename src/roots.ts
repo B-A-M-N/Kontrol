@@ -92,16 +92,19 @@ export function assertNoSymlinkComponentsSync(absolutePath: string, trustedRoot?
  * within the allowed roots. This prevents symlink escapes where a path passes
  * the lexical allowlist check but resolves to an unallowed target.
  */
-export async function resolveAllowedPathCanonical(inputPath: string, cwd: string, allowedRoots: string[]): Promise<string> {
+export async function resolveAllowedPathCanonical(inputPath: string, cwd: string, allowedRoots: string[], trustedRoot?: string): Promise<string> {
   const absolutePath = resolve(cwd, inputPath);
   const canonicalRoots = await getCanonicalRoots(allowedRoots);
+  const symlinkBoundary = trustedRoot && isPathInsideRoot(absolutePath, trustedRoot)
+    ? trustedRoot
+    : allowedRoots.find((root) => isPathInsideRoot(absolutePath, root));
   try {
-    await rejectSymlinkComponents(absolutePath);
+    await rejectSymlinkComponents(absolutePath, symlinkBoundary);
     const canonical = await realpath(absolutePath);
     return assertAllowedPath(canonical, canonicalRoots);
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
-    return resolveWritablePath(absolutePath, canonicalRoots);
+    return resolveWritablePath(absolutePath, canonicalRoots, symlinkBoundary);
   }
 }
 
@@ -111,9 +114,9 @@ export async function resolveAllowedPathCanonical(inputPath: string, cwd: string
  * that, then reattach the remainder. Rejects any existing symlink component
  * that escapes the canonical workspace.
  */
-export async function resolveWritablePath(absolutePath: string, canonicalRoots?: string[]): Promise<string> {
+export async function resolveWritablePath(absolutePath: string, canonicalRoots?: string[], trustedRoot?: string): Promise<string> {
   const roots = canonicalRoots ?? await getCanonicalRoots([process.cwd()]);
-  await rejectSymlinkComponents(absolutePath);
+  await rejectSymlinkComponents(absolutePath, trustedRoot);
 
   let existing = absolutePath;
   while (true) {
@@ -143,9 +146,27 @@ export async function resolveWritablePath(absolutePath: string, canonicalRoots?:
 }
 
 /** Reject symlink traversal, including symlinks that point back inside root. */
-async function rejectSymlinkComponents(absolutePath: string): Promise<void> {
+async function rejectSymlinkComponents(absolutePath: string, trustedRoot?: string): Promise<void> {
   let current: string = sep;
-  const components = absolutePath.split(sep).filter(Boolean);
+  let components: string[];
+  if (trustedRoot !== undefined) {
+    const root = resolve(trustedRoot);
+    const rootRelative = relative(root, absolutePath);
+    if (isAbsolute(rootRelative) || rootRelative === ".." || rootRelative.startsWith(`..${sep}`)) {
+      throw new AccessDeniedError(`Path is outside workspace root: ${absolutePath}`);
+    }
+    // OS aliases such as macOS /var -> /private/var may contain symlinks
+    // before an already-authorized workspace root. Validate the root itself
+    // and every descendant, while leaving those system ancestors untouched.
+    const rootMetadata = await lstat(root);
+    if (rootMetadata.isSymbolicLink() || !rootMetadata.isDirectory()) {
+      throw new AccessDeniedError(`Workspace root must be a regular directory: ${root}`);
+    }
+    current = root;
+    components = rootRelative.split(sep).filter(Boolean);
+  } else {
+    components = absolutePath.split(sep).filter(Boolean);
+  }
   for (const component of components) {
     current = resolve(current, component);
     try {

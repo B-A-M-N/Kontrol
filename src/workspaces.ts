@@ -213,7 +213,7 @@ export class WorkspaceRegistry {
    * scans descendants looking for AGENTS.md/CLAUDE.md files.
    */
   async loadApplicableInstructions(workspace: Workspace, inputPath: string, sessionId = DEFAULT_WORKSPACE_SESSION_ID): Promise<LoadedAgentsFile[]> {
-    const resolved = await resolveAllowedPathCanonical(inputPath, workspace.root, [workspace.root]);
+    const resolved = await resolveAllowedPathCanonical(inputPath, workspace.root, [workspace.root], workspace.root);
     let directory = resolved;
     try {
       if (!(await stat(resolved)).isDirectory()) directory = dirname(resolved);

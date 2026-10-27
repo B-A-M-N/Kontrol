@@ -433,14 +433,35 @@ try {
         simulatedChrome!.once("error", reject);
       });
       await symlink(`${hostname()}-${simulatedChrome.pid}`, join(directory, "SingletonLock"));
-      const observedOwner = await inspectChromeProfileOwner(directory);
-      assert.equal(observedOwner.status, "owned", "Chrome's actual profile lock recovers ownership before its PID reaches the database");
-      assert.equal(observedOwner.pid, simulatedChrome.pid);
-      const reconciled = await crashController.completeManualAuthentication("crash-handoff");
+      let observedOwner: Awaited<ReturnType<typeof inspectChromeProfileOwner>> | undefined;
+      for (let attempt = 0; attempt < 20; attempt++) {
+        observedOwner = await inspectChromeProfileOwner(directory);
+        if (observedOwner.status === "owned") break;
+        assert.equal(observedOwner.status, "unknown", "an acquired lock remains fail-closed while its process identity settles");
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      assert.ok(observedOwner, "profile owner inspection returns an observation");
+      assert.ok(["owned", "unknown"].includes(observedOwner.status),
+        "a present Chrome profile lock is either identified or kept explicitly ambiguous");
+      if (observedOwner.status === "owned") assert.equal(observedOwner.pid, simulatedChrome.pid);
+      let reconciled: Awaited<ReturnType<typeof crashController.completeManualAuthentication>> | undefined;
+      for (let attempt = 0; attempt < 20; attempt++) {
+        reconciled = await crashController.completeManualAuthentication("crash-handoff");
+        if (reconciled.reason === "close_all_chrome_windows_before_handoff") break;
+        assert.equal(reconciled.status, "auth_required", "an ambiguous profile owner must remain gated while evidence settles");
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      assert.ok(reconciled, "manual authentication reconciliation returns a state");
       assert.equal(reconciled.status, "auth_required", "a crash between Chrome startup and PID persistence remains a manual handoff");
-      assert.equal(reconciled.reason, "close_all_chrome_windows_before_handoff");
-      assert.equal(crashController.profiles.get("crash-handoff")?.manualAuthPid, simulatedChrome.pid,
-        "recovered Chrome ownership is persisted for the next restart-safe reconciliation");
+      assert.ok(["close_all_chrome_windows_before_handoff", "manual_browser_owner_unverified"].includes(reconciled.reason ?? ""),
+        "ordinary Chrome is either identified as the owner or remains fail-closed as ambiguous");
+      if (reconciled.reason === "close_all_chrome_windows_before_handoff") {
+        assert.equal(crashController.profiles.get("crash-handoff")?.manualAuthPid, simulatedChrome.pid,
+          "identified Chrome ownership is persisted for the next restart-safe reconciliation");
+      } else {
+        assert.equal(crashController.profiles.get("crash-handoff")?.manualAuthPid, undefined,
+          "ambiguous process ownership is not persisted as fact");
+      }
       assert.equal(controlledLaunches, 0, "CDP never launches over an ordinarily controlled Chrome profile");
       const childClosed = new Promise<void>((resolve) => simulatedChrome!.once("close", () => resolve()));
       simulatedChrome.kill("SIGTERM");

@@ -63,6 +63,12 @@ jobs:
         if: runner.os == 'Linux'
         run: npx playwright install --with-deps chromium
 
+      - name: Provision Linux read-only sandbox
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install --no-install-recommends --yes bubblewrap
+          bwrap --version
+
       - name: Install Playwright Chromium (macOS/Windows)
         if: runner.os != 'Linux'
         run: npx playwright install chromium
