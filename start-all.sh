@@ -434,20 +434,36 @@ resolve_artifact_path() {
   local requested_path="$1"
   local resolved_path
   # Resolve and check containment with Node so native Windows paths and
-  # Git-Bash paths compare in the same platform's path semantics. `readlink
-  # -f` can return a different spelling for the same Windows release path.
+  # Git-Bash paths compare in the same platform's path semantics. Windows may
+  # spell the same temp directory with its long name in Git Bash and its 8.3
+  # alias in a junction target, so containment there uses filesystem identity.
   resolved_path="$(node --input-type=module -e '
     import { realpathSync, statSync } from "node:fs";
-    import { isAbsolute, relative, sep } from "node:path";
+    import { dirname, isAbsolute, relative, sep } from "node:path";
     try {
       const requested = realpathSync(process.argv[1]);
       const releases = realpathSync(process.argv[2]);
-      const rel = relative(releases, requested);
-      if (!statSync(requested).isDirectory()
-        || !rel
-        || rel === ".."
-        || rel.startsWith(`..${sep}`)
-        || isAbsolute(rel)) process.exit(1);
+      if (!statSync(requested).isDirectory()) process.exit(1);
+      if (process.platform === "win32") {
+        const releasesStat = statSync(releases);
+        if (!releasesStat.isDirectory() || releasesStat.ino === 0) process.exit(1);
+        let ancestor = dirname(requested);
+        let contained = false;
+        while (true) {
+          const ancestorStat = statSync(ancestor);
+          if (ancestorStat.dev === releasesStat.dev && ancestorStat.ino === releasesStat.ino) {
+            contained = true;
+            break;
+          }
+          const parent = dirname(ancestor);
+          if (parent === ancestor) break;
+          ancestor = parent;
+        }
+        if (!contained) process.exit(1);
+      } else {
+        const rel = relative(releases, requested);
+        if (!rel || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) process.exit(1);
+      }
       process.stdout.write(requested);
     } catch { process.exit(1); }
   ' "$requested_path" "$DESKTOP_PWD/releases" 2>/dev/null || true)"
