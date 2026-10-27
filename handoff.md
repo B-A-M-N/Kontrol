@@ -1,15 +1,16 @@
 # Kontrol multipath ingress — remaining work
 
-Updated: 2026-10-26 (eleventh revision)
+Updated: 2026-10-26 (twelfth revision)
 Repository: `/home/bamn/devspace`
 Branch: `audit-k02-k04`
 Starting HEAD for this revision: `44c247a`. The change is the reviewed
 range `44c247a..858e18f` - the commits of this change, listed below. The
 range is pinned to those commits on purpose: this branch is shared, other
 workstreams have since committed on top of it, and a moving `HEAD` would
-make every range claim in this record false. The last seven rows of the commit
-table sit on top of that range: four documentation commits, which change only
-this file, and three test-contract fixes, which each change one test file.
+make every range claim in this record false. The last ten rows of the commit
+table sit on top of that range: six documentation commits, which change only
+this file, three test-contract fixes, which each change one test file, and
+one harness fix, which changes the runtime test runner.
 Commits are local only. Do not push without separate authorization.
 Preserve the untracked scratch directories: `.tmp-scratch/` and
 `.tmp-handoff-evidence/`, which holds the verification logs cited
@@ -20,10 +21,10 @@ below.
 These commits are local only; nothing was pushed. The table has one row per
 commit of this change - the commits of the reviewed range
 `44c247a..858e18f`, then the documentation commits that pin that range,
-then the three test-contract fixes that restore the canonical chain, and
-finally this revision's documentation commit - and no count is stated in
-prose, because every documentation commit would have to restate a number
-that its own commit changes.
+then the three test-contract fixes and the harness fix that restore the
+canonical chain, and finally this revision's documentation commit - and no
+count is stated in prose, because every documentation commit would have to
+restate a number that its own commit changes.
 
 | # | Commit | Subject |
 |---|--------|---------|
@@ -43,7 +44,10 @@ that its own commit changes.
 | 14 | `8bd3973` | `docs: record the stale checkpoint assertion and the restored canonical chain` |
 | 15 | `4535e9f` | `test(checkpoints): carry the checkpoint error slot in the expected snapshot shape` |
 | 16 | `7b5749a` | `test(store): pin the two migrations the sibling commits declared` |
-| 17 | this commit | `docs: record the three stale sibling assertions and the restored canonical chain` |
+| 17 | `ecf8076` | `docs: record the three stale sibling assertions and the restored canonical chain` |
+| 18 | `f946754` | `docs: close the round-20 findings on the test-file count and the review tallies` |
+| 19 | `a98998e` | `test(chain): give the lifecycle step the compiled runtime artifact` |
+| 20 | this commit | `docs: record the pristine-tree lifecycle failure and the harness fix` |
 
 Requirement source:
 `/home/bamn/.codex/attachments/458e9b15-a1ec-4247-aa20-19ec878f9be9/pasted-text-1.txt`
@@ -564,11 +568,12 @@ What round 13 verified, from the code rather than from the prose:
   `git diff --name-only 44c247a..858e18f` matches the reviewed file list
   exactly. At the time of round 13 the range
   was `44c247a..e5a07c8`; every commit after it in this workstream changes
-  only `handoff.md`, except the three test-contract fixes of section 13,
-  which touch three test files outside that set, so the range and its file
-  count are unchanged. The range is written as `44c247a..858e18f` - this change's
-  own commits - so the claim stays checkable after other workstreams commit
-  on this branch;
+  only `handoff.md`, except the three test-contract fixes and the harness
+  fix of section 13, which touch four files outside that set, so the range
+  and its file count are unchanged. The range is written as
+  `44c247a..858e18f` - this change's own commits -
+  so the claim stays checkable after other workstreams commit on this
+  branch;
 - each of the five commits contains only files that belong to its stated
   subject, and neither `.tmp-scratch/` nor the generated
   `ingress-qualification-matrix.json` is in any commit;
@@ -606,12 +611,16 @@ builds the app into a temporary artifact directory and points that variable at
 the build. It is now recorded in the environment notes below.
 
 
-### 13. Three stale assertions in sibling tests broke the chain, and all three are fixed
+### 13. Three stale assertions and one missing prerequisite broke the chain, and all four are fixed
 
 Re-running the canonical chain against this revision's tree failed in three
-suites that this change does not touch. Each failure was a stale expectation
-left behind by a sibling commit on this branch, and in each case the
-expectation - not the contract - was what was wrong.
+suites that this change does not touch, and then failed a fourth time in the
+lifecycle step for a reason of the same kind: a sibling commit on this branch
+changed what the chain needs, and the chain did not supply it. Each of the
+three suite failures was a stale expectation left behind by a sibling commit,
+and in each case the expectation - not the contract - was what was wrong. The
+fourth failure was a missing prerequisite in the chain's own harness, and the
+harness was what was wrong.
 
 **The checkpoint contract (`src/peer-mutation.test.ts`, `7a62023`).** The
 sibling commit `839987b` ("fix(checkpoints): defer capture until review
@@ -658,6 +667,41 @@ schema actually records.
 
 All three were expectation drift, not behaviour changes, and each fix leaves
 its suite asserting the property it asserted before.
+
+**The lifecycle step's runtime artifact (`scripts/run-runtime-tests.mjs`,
+`a98998e`).** The sibling commit `e29fc6f` ("feat: converge peer jobs and
+agent review transfers") added a step to `src/bridge-flow.test.ts`: it spawns
+the bundled stdio duplex adapter (`scripts/acp-stdio-duplex-adapter.mjs`) as a
+child process and waits for that child to become ready. The adapter resolves
+its transport from `KONTROL_ARTIFACT_PATH` when that variable is set, and
+falls back to `../dist/acp-duplex.js` relative to the script when it is not.
+The canonical chain compiles the runtime artifact into a temporary directory
+and points `KONTROL_ARTIFACT_PATH` at it - but only for the `test:adapters`
+step. The `test:lifecycle` step runs later in the same list, so the compiled
+artifact is already available, and yet it ran without the variable: the
+spawned adapter fell back to the checkout's `dist/` directory.
+
+In the shared checkout that fallback finds an untracked `dist/` projection - in
+this checkout a build dated 2026-09-06, while the source it stands for was
+changed on 2026-10-26 - so the suite runs against a stale build instead of the
+current source. In a pristine extraction - `git archive` of a commit into an
+empty directory, which is how this record verifies the chain - there is no
+`dist/` at all, and the spawned adapter fails with `ERR_MODULE_NOT_FOUND` for
+`dist/acp-duplex.js`. The chain therefore depended on an untracked build
+output that the chain is designed not to need:
+`scripts/run-runtime-tests.mjs` exists precisely so that the chain never
+depends on a `dist/` projection in the checkout.
+
+`a98998e` gives the `test:lifecycle` step the same compiled artifact
+directory the `test:adapters` step already receives. The artifact is compiled
+once and stays valid for the rest of the chain, so every step that spawns a
+bundled adapter child is given the artifact the chain itself built. The
+change adds an environment variable to a test step: it changes no assertion,
+relaxes no assertion and removes none. Verified directly: with
+`KONTROL_ARTIFACT_PATH` pointed at the compiled artifact,
+`src/bridge-flow.test.ts` passes in a pristine tree ("bridge-flow.test.ts:
+all assertions passed"), and the whole `test:lifecycle` step passes with the
+variable set.
 
 ## Still missing — operator-gated deployment evidence
 
@@ -825,10 +869,17 @@ guard scoped its review evidence over the whole tracked tree and concurrent
 work in this checkout changed it; both returned no findings. Round 20
 reviewed this revision's commits as well - the pinned range, the
 documentation commits and the three test-contract fixes of section 13 - and
-returned changes requested on two documentation findings, both of which are
-closed in this revision. The closing round re-reviews that same committed
-state against the two fixes, and its verdict is recorded with the workflow
-guard.
+returned changes requested on three documentation findings, all of which are
+closed in this revision. Round 21 re-reviewed that same committed state,
+confirmed the round-20 findings closed, and returned changes requested on
+three further findings: the final-run log the document cited ended in a
+failed run, the commit table did not name every commit of this workstream,
+and the rounds narrative tallied two documentation findings where the round
+it describes produced three. All three are closed in this revision, together
+with the fourth failure of section 13 - the lifecycle step's missing runtime
+artifact - which that same review surfaced by reading the failed run. The
+closing round re-reviews the state after the harness fix, and its verdict is
+recorded with the workflow guard.
 | Round | Reviewer | Verdict | Outcome |
 |-------|----------|---------|---------|
 | 1 | `glm-5.3-flash` | changes requested | The deferral gate alone was insufficient: the transport could still drop a notification on a stream that ended mid-send. Led to the stale-discard path. |
@@ -851,6 +902,7 @@ guard.
 | 18 | `glm-5.3-flash` | approve, no findings | The committed state was re-recorded after the workflow guard scoped its review evidence over the whole tracked tree; no finding. |
 | 19 | `glm-5.3-flash` | approve, no findings | The same committed state was re-recorded again after concurrent work in the checkout changed the tracked tree; no finding. |
 | 20 | `deepseek-v4-flash` | changes requested, 1 P2 and 2 P3 | The change was reviewed as the committed state, reconstructed with `git archive` rather than read from the shared working tree. The review found no code-level defect: the three contracts are implemented, the three test fixes assert real invariants rather than tautologies, and the canonical-chain check provably executes every test file. Its findings are documentation findings, and all three are closed in this revision. The P2: two present-tense statements of the test-file count said 198 files and 26 runners, which is what the reviewed range's tip reports, while this revision's committed tree reports 199 files and 27 runners because a concurrent commit added a test file - both statements now name the tree they hold for (section 6 and the verification evidence). The P3s: the round-10 narrative tallied one P1 while the section's own body labels two P1 clauses, and the peer-mutation section said the suite kept asserting "the same property" although the asserted value changed - both are reconciled (sections 10 and 13). |
+| 21 | `glm-5.3-flash` | changes requested, 1 P2 and 2 P3 | The round-20 findings were confirmed closed from the code and from the checker, and three new documentation findings were returned. The P2: the final-run log the document cited ended in a failed run, and the failure was a missing prerequisite in the chain's own harness rather than a defect in the change under review - the sibling commit `e29fc6f` made `src/bridge-flow.test.ts` spawn a bundled adapter, and the chain did not give the lifecycle step the compiled artifact that spawn needs. The first P3: the commit table did not name every commit of this workstream, and its header still counted the commits that sit on top of the reviewed range as four documentation commits and three test-contract fixes. The second P3: the rounds narrative tallied two documentation findings where the round it describes produced three. All three are closed in this revision (section 13, the commit table and the rounds narrative). |
 
 
 The mutation table in section 1 is the executable form of these reviews: each
@@ -930,18 +982,17 @@ Executed in this pass (all from the repository root):
 - `npm test` - the full canonical chain, run in an isolated tree that holds
   exactly a committed tree of this change (no other working-tree edit is
   present in it), so the result is not contaminated by concurrent work in the
-  shared checkout. `EXIT=0` on every run. Two runs of this pass are cited
-  here. Both are pristine extractions - `git archive` of a commit, unpacked
-  into an empty directory whose tracked files are exactly the committed ones -
-  and both carry their own locked dependency set (`npm ci`), because the
-  shared checkout's `node_modules` has moved on since these trees were
-  built:
+  shared checkout. Two runs of this pass are cited here. Both are pristine
+  extractions - `git archive` of a commit, unpacked into an empty directory
+  whose tracked files are exactly the committed ones - and each carries its
+  own locked dependency set (`npm ci`):
   - the reviewed range's tip (`858e18f`, 575 tracked files), recorded in
     `.tmp-handoff-evidence/test-npm-test-range-858e18f.log`; its
     `test:manifest` step reports "198 test files all executed by the
     canonical chain (14 scripts, 26 runners)" and the run ends
     `NPM_TEST_EXIT=0`;
-  - this revision's final commit, recorded in
+  - the last commit of this workstream that changes anything other than this
+    document (`a98998e`), recorded in
     `.tmp-handoff-evidence/test-npm-test-final.log`; its `test:manifest`
     step reports "199 test files all executed by the canonical chain (14
     scripts, 27 runners)" - the range's own tree reports 198 files and 26
@@ -956,15 +1007,21 @@ Executed in this pass (all from the repository root):
   `test:unit` chain run on its own, recorded in
   `.tmp-handoff-evidence/unit-each-8bd3973.log` - named the two remaining
   stale suites (`src/review-checkpoints.filesystem.test.ts` and
-  `src/oauth-store.test.ts`) out of 109. The logs of the earlier full-chain
-  runs of this pass (`.tmp-scratch/test-npm-test-r13.log` through
+  `src/oauth-store.test.ts`) out of 109. A later pristine run against
+  `ecf8076`, recorded in
+  `.tmp-handoff-evidence/test-npm-test-ecf8076.log`, ended
+  `NPM_TEST_EXIT=1`: it failed in the lifecycle step with
+  `ERR_MODULE_NOT_FOUND` for `dist/acp-duplex.js`, which is the fourth
+  failure of section 13 and the reason for `a98998e`.
+  The logs of the earlier full-chain runs of this pass (`.tmp-scratch/test-npm-test-r13.log` through
   `.tmp-scratch/test-npm-test-r17.log`) were removed by a concurrent cleanup
   of the untracked scratch directory, so they are no longer on disk and are
   not cited as evidence here. The logs are local artifacts, not committed.
-  One caveat for a reader who re-runs an isolated tree: it pins
-  `@modelcontextprotocol/ext-apps` 1.7.5, while the shared checkout's
-  `node_modules` now carries 2.0.3, so that tree needs its own dependency
-  set (`npm ci`) to compile.
+  One caveat for a reader who re-runs an isolated tree of the reviewed
+  range: that tree pins `@modelcontextprotocol/ext-apps` 1.7.5, while the
+  shared checkout's `node_modules` and every later tree - including the
+  tree of `a98998e` - pin 2.0.3, so the range's tree needs its own
+  dependency set (`npm ci`) to compile.
 - `node --import tsx scripts/scheduled-readonly-adapters-e2e.mjs` — CRUSH and
   Hermes both dispatched and stayed confined.
 - `KONTROL_CADDY_BIN=/tmp/caddy npm run qualify:ingress` — 12 pass,
@@ -974,9 +1031,9 @@ Executed in this pass (all from the repository root):
 
 One row per file. These are exactly the files the reviewed range touches,
 and they are the same 34 files that `git diff --name-only 44c247a..858e18f`
-names. Three files outside that set are touched by later commits of this
-workstream - the stale sibling assertions fixed in section 13 - and they are
-listed in their own table below.
+names. Four files outside that set are touched by later commits of this
+workstream - the stale sibling assertions and the harness fix of section 13
+- and they are listed in their own table below.
 
 | File | Change |
 |------|--------|
@@ -1015,13 +1072,14 @@ listed in their own table below.
 | `handoff.md` | this record |
 | `HANDOFF.md` | the earlier scheduled-job audit record, updated with the deployment status this pass verified |
 
-### Three files outside the reviewed range
+### Four files outside the reviewed range
 
 | File | Change | Commit |
 |------|--------|--------|
 | `src/peer-mutation.test.ts` | the change-tracking assertion now follows the deferred checkpoint contract: the backend is reported as `pending` at open time, and change tracking is claimed only when the backend can actually track changes (section 13) | `7a62023` |
 | `src/review-checkpoints.filesystem.test.ts` | the pinned snapshot shape carries the `checkpointError` slot the checkpoint manager now returns, so the suite asserts that the slot is present and empty in the success case (section 13) | `4535e9f` |
 | `src/oauth-store.test.ts` | the pinned migration list carries the two migrations the sibling commits declared (versions 105 and 106); the list is still pinned exactly (section 13) | `7b5749a` |
+| `scripts/run-runtime-tests.mjs` | the runtime test runner gives the `test:lifecycle` step the compiled runtime artifact it already gives `test:adapters`, so a suite that spawns a bundled adapter child no longer falls back to the checkout's untracked `dist/` (section 13) | `a98998e` |
 
 ### Suites this change newly executes
 
@@ -1029,6 +1087,10 @@ None of these suites is modified by this change; their contents are
 unchanged. What changed is that the canonical chain now executes them,
 so a failure in one of them now fails the chain. The list is the same
 13-suite list as the table in section 6.
+One of them - `src/ui/review-thread-delivery.test.ts` - covers an
+implementation file that the range does touch,
+`src/ui/review-thread-delivery.ts`, but the change there is four comment
+lines and the suite file itself is untouched.
 
 | Suite | Now executed by |
 |-------|-----------------|
@@ -1072,3 +1134,11 @@ so a failure in one of them now fails the chain. The list is the same
   point `KONTROL_WORKSPACE_APP_HTML_PATH` at a built artifact. The canonical
   chain needs no preparation, because `scripts/run-runtime-tests.mjs` builds
   the app into a temporary artifact directory and points the variable at it.
+- A suite that spawns a bundled adapter child needs the compiled runtime
+  artifact. `scripts/acp-stdio-duplex-adapter.mjs` resolves
+  `acp-duplex.js` and `read-only-execution.mjs` from
+  `KONTROL_ARTIFACT_PATH` when that variable is set, and falls back to the
+  checkout's `dist/` otherwise. The canonical chain supplies the compiled
+  artifact to the `test:adapters` and `test:lifecycle` steps; a suite
+  run on its own needs `KONTROL_ARTIFACT_PATH` pointed at a compiled
+  artifact, or a `dist/` projection in the checkout.
