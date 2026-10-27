@@ -498,7 +498,7 @@ resolve_dist_artifact() {
 
 load_committed_generation() {
   if [[ -f "$GENERATION_RECORD" ]]; then
-    local committed_artifact committed_build previous_build previous_artifact last_good_build last_good_artifact committed_surface
+    local committed_artifact committed_build previous_build previous_artifact last_good_build last_good_artifact committed_surface committed_artifact_valid
     committed_artifact="$(read_json_field "$GENERATION_RECORD" artifactPath)"
     committed_build="$(read_json_field "$GENERATION_RECORD" activeBuildId)"
     previous_build="$(read_json_field "$GENERATION_RECORD" previousBuildId)"
@@ -506,7 +506,22 @@ load_committed_generation() {
     last_good_build="$(read_json_field "$GENERATION_RECORD" lastKnownGoodBuildId)"
     last_good_artifact="$(read_json_field "$GENERATION_RECORD" lastKnownGoodArtifactPath)"
     committed_surface="$(read_json_field "$GENERATION_RECORD" mcpToolSurfaceVersion)"
+    committed_artifact_valid=0
     if [[ -n "$committed_artifact" ]] && resolve_artifact_path "$committed_artifact" >/dev/null 2>&1; then
+      if [[ -z "$committed_build" || "$ARTIFACT_BUILD_ID" == "$committed_build" ]]; then
+        committed_artifact_valid=1
+      fi
+    fi
+    # A Git-Bash/Windows restart may deserialize an equivalent 8.3/long-path
+    # spelling that cannot be resolved through the original junction path.
+    # Re-select only by the committed build ID, then apply the same immutable
+    # release containment and directory/metadata identity checks.
+    if [[ "$committed_artifact_valid" != "1" && -n "$committed_build" ]] \
+      && resolve_artifact_path "$DESKTOP_PWD/releases/$committed_build" >/dev/null 2>&1 \
+      && [[ "$ARTIFACT_BUILD_ID" == "$committed_build" ]]; then
+      committed_artifact_valid=1
+    fi
+    if [[ "$committed_artifact_valid" == "1" ]]; then
       COMMITTED_GENERATION_PRESENT=1
       PREVIOUS_BUILD_ID="$ARTIFACT_BUILD_ID"
       PREVIOUS_ARTIFACT_PATH="$ACTIVE_ARTIFACT_PATH"
