@@ -8,11 +8,12 @@
  * environment. The runner must neutralize all of these.
  */
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, writeFile, chmod } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, writeFile, chmod, symlink, realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { controlPlaneGit, buildControlPlaneGitEnvironment } from "./git-runner.js";
+import { getGitEligibility } from "./git.js";
 
 const tmp = await mkdtemp(join(tmpdir(), "kontrol-git-runner-test-"));
 const markers = join(tmp, "markers");
@@ -68,6 +69,13 @@ try {
   runGit(repo, ["commit", "-m", "initial"]);
 
   // --- Control-plane operations over the hostile repo ----------------------
+  const repoAlias = join(tmp, "hostile-repo-alias");
+  await symlink(repo, repoAlias, process.platform === "win32" ? "junction" : "dir");
+  const eligibility = await getGitEligibility(repoAlias);
+  assert.equal(eligibility.ok, true);
+  assert.equal(eligibility.gitRoot, await realpath(repo),
+    "Git eligibility returns the canonical root when accessed through an alias");
+
   await controlPlaneGit(repo, ["rev-parse", "--show-toplevel"]);
   // Temporary-index snapshot pattern used by review checkpoints:
   const { stdout: treeOut } = await controlPlaneGit(repo, ["read-tree", "HEAD"]);
