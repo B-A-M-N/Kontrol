@@ -182,7 +182,7 @@ const explicitLegacy = hermesAcpCandidates({
   hermesBinExplicit: true,
 });
 assert.deepEqual(explicitLegacy.slice(0, 2).map(({ command, args }) => ({ command, args })), [
-  { command: "/fixture/hermes-acp", args: [] },
+  { command: join(dirname("/fixture/hermes-test-double"), "hermes-acp"), args: [] },
   { command: "/fixture/hermes-test-double", args: ["acp"] },
 ], "an explicit HERMES_BIN does not get shadowed by an unrelated hermes-acp on PATH");
 

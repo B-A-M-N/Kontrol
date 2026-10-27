@@ -463,7 +463,7 @@ let claimToken: string;
 
 // --- Concurrent results targeting one worktree are serialized ---------------
 {
-  const resultRoot = mkdtempSync(join(tmpdir(), "kontrol-peer-result-lock-"));
+  const resultRoot = realTempDir("kontrol-peer-result-lock-");
   const bytesByJob = new Map([["job_lock_a", Buffer.from("a")], ["job_lock_b", Buffer.from("b")]]);
   const jobs = new Map<string, PeerJob>();
   const attempts = new Map<string, any[]>();
