@@ -24,13 +24,14 @@ const stuck = new FakeResponse();
 stuck.writes = [false];
 let timedOut: any;
 let timedOutAt = 0;
-const stopStuck = startMcpSseHeartbeat(stuck, 5, () => {}, () => {}, undefined, {
+let stalledAt = 0;
+const stopStuck = startMcpSseHeartbeat(stuck, 5, () => { stalledAt = performance.now(); }, () => {}, undefined, {
   maxStallMs: 20,
-  onStallTimeout: (details) => { timedOut = details; timedOutAt = Date.now(); },
+  onStallTimeout: (details) => { timedOut = details; timedOutAt = performance.now(); },
 });
 assert.equal(await waitFor(() => stuck.destroyed, 1_000), true, "a permanently stalled response is destroyed within a bounded deadline");
-assert.ok(timedOutAt - timedOut.stalledSince >= 20, "the response is not destroyed before its configured stall deadline");
-assert.ok(timedOutAt - timedOut.stalledSince < 1_000, "the stall timeout remains bounded under runner scheduling delays");
+assert.ok(timedOutAt - stalledAt >= 20, "the response is not destroyed before its configured stall deadline");
+assert.ok(timedOutAt - stalledAt < 1_000, "the stall timeout remains bounded under runner scheduling delays");
 assert.equal(timedOut.consecutiveStallCount, 1);
 assert.equal(stuck.listenerCount("drain"), 0, "timeout removes the drain listener");
 stopStuck();
