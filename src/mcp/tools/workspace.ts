@@ -436,10 +436,16 @@ export function registerWorkspaceTools(
         if (connectionContext?.authenticatedRole === "peer") {
           // For worktree mode the worktree path lives under KONTROL_WORKTREE_ROOT,
           // so the grant check must compare against the SOURCE root the peer was
-          // granted, not the worktree path.
-          const grantRoot = openedWorkspace.workspace.sourceRoot ?? openedWorkspace.workspace.root;
-          const postDenied = peerWorkspaceDenied(connectionContext, grantRoot);
-          if (postDenied) return { content: [textBlock(postDenied)], isError: true };
+          // granted, not the worktree path. Checkout mode already checked the
+          // requested path against the peer grant before opening; the registry
+          // then resolves it and enforces the server allowlist. Only worktree
+          // mode needs a post-open grant check because its managed source root
+          // is resolved independently of the requested workspace path.
+          if (openedWorkspace.workspace.mode === "worktree") {
+            const grantRoot = openedWorkspace.workspace.sourceRoot ?? openedWorkspace.workspace.root;
+            const postDenied = peerWorkspaceDenied(connectionContext, grantRoot);
+            if (postDenied) return { content: [textBlock(postDenied)], isError: true };
+          }
           // M2 P0 fix: record ownership so this peer can mutate this worktree
           // and enumerate it. Applies to both the new-create path and any
           // existing-workspace reuse path that emerges from openWorkspace.
