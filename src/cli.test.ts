@@ -49,7 +49,7 @@ try {
     "a retry after losing the CLI response reuses its pending submission identity");
   assert.equal(readPtyReviewMutationIntent(intentPath), firstIntent,
     "pending submission identity can be checked before honoring an explicit override");
-  assert.equal(statSync(intentPath).mode & 0o077, 0,
+  if (process.platform !== "win32") assert.equal(statSync(intentPath).mode & 0o077, 0,
     "the persisted PTY retry identity is private to the agent process owner");
   completePtyReviewMutationId(intentPath, firstIntent);
   assert.equal(readPtyReviewMutationIntent(intentPath), undefined,

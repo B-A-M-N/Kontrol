@@ -266,7 +266,8 @@ try {
   });
   assert.equal(preferenceResult.isError, undefined, "the preference change succeeded");
   assert.deepEqual(JSON.parse(readFileSync(preferenceFile, "utf8")).endpointIds, ["origin-b", "origin-a"]);
-  assert.equal(statSync(preferenceFile).mode & 0o777, 0o600, "the preference file stays owner-only");
+  if (process.platform !== "win32") assert.equal(statSync(preferenceFile).mode & 0o777, 0o600,
+    "the preference file stays owner-only");
   assert.deepEqual(
     preferenceResult.structuredContent.endpointPreference.endpointIds,
     ["origin-b", "origin-a"],

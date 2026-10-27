@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, rmSync, symlinkSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { assertAllowedPath, assertNoSymlinkComponentsSync, expandHomePath, isPathInsideRoot, resolveAllowedPath, resolveAllowedPathCanonical } from "./roots.js";
+import { assertAllowedPath, assertNoSymlinkComponentsSync, expandHomePath, isPathInsideRoot, isPathInsideRootCanonical, resolveAllowedPath, resolveAllowedPathCanonical } from "./roots.js";
 
 const home = homedir();
 
@@ -47,6 +47,8 @@ if (process.platform !== "win32") {
     mkdirSync(workspace, { recursive: true });
     symlinkSync(physicalParent, aliasParent, "dir");
     const aliasedWorkspace = join(aliasParent, "workspace");
+    assert.equal(isPathInsideRootCanonical(aliasedWorkspace, workspace), true,
+      "grant checks equate a trusted workspace with its OS alias");
     assertNoSymlinkComponentsSync(join(aliasedWorkspace, "new-file.txt"), aliasedWorkspace);
     assert.equal(
       await resolveAllowedPathCanonical("new-file.txt", aliasedWorkspace, [aliasedWorkspace], aliasedWorkspace),

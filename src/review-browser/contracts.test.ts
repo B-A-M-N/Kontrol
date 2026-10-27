@@ -158,7 +158,7 @@ try {
     assert.equal(profile.authState, "unknown", "authentication status is independent of browser process status");
     const directory = await profiles.profileDirectory(profile.id);
     assert.ok(directory.startsWith(join(root, "state", "reviewer-browser", "profiles")));
-    assert.equal((await stat(directory)).mode & 0o777, 0o700);
+    if (process.platform !== "win32") assert.equal((await stat(directory)).mode & 0o777, 0o700);
     assert.throws(() => profiles.create({ id: "../outside", ownerPrincipalId: "reviewer-1" }));
     assert.throws(() => profiles.create({ id: "reviewer-default", ownerPrincipalId: "reviewer-2" }), /another principal/i);
   } finally { db.close(); }
@@ -463,7 +463,9 @@ try {
           "ambiguous process ownership is not persisted as fact");
       }
       assert.equal(controlledLaunches, 0, "CDP never launches over an ordinarily controlled Chrome profile");
-      const childClosed = new Promise<void>((resolve) => simulatedChrome!.once("close", () => resolve()));
+      const childClosed = simulatedChrome.exitCode !== null || simulatedChrome.signalCode !== null
+        ? Promise.resolve()
+        : new Promise<void>((resolve) => simulatedChrome!.once("close", () => resolve()));
       simulatedChrome.kill("SIGTERM");
       await childClosed;
       simulatedChrome = undefined;
@@ -472,7 +474,7 @@ try {
       assert.equal(completed.status, "authenticated", "the recovered handoff continues after ordinary Chrome exits");
       assert.equal(controlledLaunches, 1);
     } finally {
-      if (simulatedChrome && simulatedChrome.exitCode === null) {
+      if (simulatedChrome && simulatedChrome.exitCode === null && simulatedChrome.signalCode === null) {
         const childClosed = new Promise<void>((resolve) => simulatedChrome!.once("close", () => resolve()));
         simulatedChrome.kill("SIGTERM");
         await childClosed;

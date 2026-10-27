@@ -5,7 +5,7 @@
  * operator enrolled.
  */
 import type { PeerCapability, PeerDescriptor } from "./config-types.js";
-import { isPathInsideRoot } from "../roots.js";
+import { isPathInsideRootCanonical } from "../roots.js";
 
 export interface PeerPrincipal {
   peerId: string;
@@ -45,5 +45,5 @@ export function authorizePeerAction(principal: PeerPrincipal, capability: PeerCa
 
 /** Canonical root containment: true when `root` equals or is inside at least one granted root. */
 export function peerGrantsRoot(principal: PeerPrincipal, root: string): boolean {
-  return principal.grantedRoots.some((granted) => isPathInsideRoot(root, granted));
+  return principal.grantedRoots.some((granted) => isPathInsideRootCanonical(root, granted));
 }

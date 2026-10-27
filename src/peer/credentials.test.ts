@@ -137,9 +137,11 @@ const credentialFile = join(dir, "peer-credentials.json");
 writeFileSync(credentialFile, serialize([validPeer()]));
 
 chmodSync(credentialFile, 0o644);
-assert.throws(() => loadPeerCredentialFile(credentialFile), /chmod 600 required/, "mode 0644 rejected");
 chmodSync(credentialFile, 0o666);
-assert.throws(() => loadPeerCredentialFile(credentialFile), /chmod 600 required/, "mode 0666 rejected");
+if (process.platform !== "win32") {
+  assert.throws(() => loadPeerCredentialFile(credentialFile), /chmod 600 required/, "mode 0644 rejected");
+  assert.throws(() => loadPeerCredentialFile(credentialFile), /chmod 600 required/, "mode 0666 rejected");
+}
 chmodSync(credentialFile, 0o600);
 const loaded = loadPeerCredentialFile(credentialFile);
 assert.equal(loaded.version, 1);

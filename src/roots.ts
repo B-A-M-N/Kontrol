@@ -1,7 +1,7 @@
 import { homedir } from "node:os";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { lstat, realpath } from "node:fs/promises";
-import { lstatSync } from "node:fs";
+import { lstatSync, realpathSync } from "node:fs";
 
 export class AccessDeniedError extends Error {
   constructor(message: string) {
@@ -31,6 +31,16 @@ export function isPathInsideRoot(path: string, root: string): boolean {
     relationship === "" ||
     (!isAbsolute(relationship) && !components.includes(".."))
   );
+}
+
+/** Compare existing filesystem roots after resolving OS aliases such as macOS /var. */
+export function isPathInsideRootCanonical(path: string, root: string): boolean {
+  try {
+    return isPathInsideRoot(realpathSync(path), realpathSync(root));
+  } catch {
+    // Preserve lexical behavior for configured paths that do not exist yet.
+    return isPathInsideRoot(path, root);
+  }
 }
 
 export function assertAllowedPath(path: string, allowedRoots: string[]): string {
