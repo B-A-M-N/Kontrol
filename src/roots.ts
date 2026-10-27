@@ -20,8 +20,8 @@ export function expandHomePath(path: string): string {
 }
 
 export function isPathInsideRoot(path: string, root: string): boolean {
-  const resolvedPath = resolve(expandHomePath(path));
-  const resolvedRoot = resolve(expandHomePath(root));
+  const resolvedPath = normalizeContainmentPath(resolve(expandHomePath(path)));
+  const resolvedRoot = normalizeContainmentPath(resolve(expandHomePath(root)));
   const relationship = relative(resolvedRoot, resolvedPath);
 
   // Reject exact parent traversal components only. A child named `..cache`
@@ -31,6 +31,15 @@ export function isPathInsideRoot(path: string, root: string): boolean {
     relationship === "" ||
     (!isAbsolute(relationship) && !components.includes(".."))
   );
+}
+
+function normalizeContainmentPath(path: string): string {
+  if (process.platform !== "win32") return path;
+  // fs.realpath may return Win32 extended-length paths while callers and
+  // configuration keep ordinary drive paths. They name the same location,
+  // but path.relative treats the two spellings as different roots.
+  if (path.startsWith("\\\\?\\UNC\\")) return `\\\\${path.slice(8)}`;
+  return path.startsWith("\\\\?\\") ? path.slice(4) : path;
 }
 
 /** Compare existing filesystem roots after resolving OS aliases such as macOS /var. */
