@@ -12,4 +12,3 @@ To experiment with a profile, copy it into:
 Then adjust the commands and flags for your local setup.
 
 See `docs/agent-profile-schema.md` for the draft schema.
-

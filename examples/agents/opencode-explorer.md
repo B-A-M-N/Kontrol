@@ -55,4 +55,3 @@ Good tasks:
 - Explain a subsystem.
 - Identify test coverage gaps.
 - Compare possible implementation locations.
-

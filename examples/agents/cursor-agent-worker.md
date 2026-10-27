@@ -59,4 +59,3 @@ Good tasks:
 
 Because this profile uses `fresh_prompt_with_context`, include the previous
 worker summary and review findings when sending follow-up work.
-
