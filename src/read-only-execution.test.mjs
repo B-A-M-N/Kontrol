@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
+import { chmodSync, mkdtempSync, writeFileSync, mkdirSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import {
@@ -11,7 +11,7 @@ import {
   verifyReadOnlyExecutionGrant,
 } from "./read-only-execution.mjs";
 
-const root = mkdtempSync(join(tmpdir(), "kontrol-read-only-execution-"));
+const root = realpathSync(mkdtempSync(join(tmpdir(), "kontrol-read-only-execution-")));
 try {
   const workspaceRoot = join(root, "workspace");
   const binDir = join(root, "bin");
