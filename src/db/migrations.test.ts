@@ -75,6 +75,13 @@ try {
       .some((column) => column.name === "owner_principal_id"),
     "review browser profiles remain owned by the authenticated principal",
   );
+  const reviewBrowserProfileColumns = (sqlite.prepare("pragma table_info(review_browser_profiles)").all() as Array<{ name: string }>).map((column) => column.name);
+  assert.ok(reviewBrowserProfileColumns.includes("browser_ready_at"), "browser readiness has a timestamp separate from authentication verification");
+  assert.ok(reviewBrowserProfileColumns.includes("manual_auth_pid") && reviewBrowserProfileColumns.includes("manual_auth_process_start_identity")
+    && reviewBrowserProfileColumns.includes("manual_auth_boot_identity") && reviewBrowserProfileColumns.includes("manual_auth_generation"),
+  "manual authentication ownership and generation are durable across controller restarts");
+  assert.ok(reviewBrowserProfileColumns.includes("browser_product") && reviewBrowserProfileColumns.includes("remote_debugging_enabled")
+    && reviewBrowserProfileColumns.includes("browser_launch_diagnostic"), "browser launch product, CDP mode, and bounded diagnostics are durable");
   assert.ok(
     (sqlite.prepare("pragma table_info(approval_requests)").all() as Array<{ name: string }>)
       .some((column) => column.name === "owner_context_id"),

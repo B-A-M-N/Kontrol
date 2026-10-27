@@ -3,7 +3,7 @@ import { and, asc, eq, gt, inArray, isNull, lt, lte, notInArray, or } from "driz
 import { openDatabase, type DatabaseHandle } from "./db/client.js";
 import { dispatchOutbox, type DispatchOutboxRow } from "./db/schema.js";
 
-export type OutboxStatus = "pending" | "claimed" | "completed" | "failed" | "dead_lettered";
+export type OutboxStatus = "pending" | "claimed" | "suspended" | "completed" | "failed" | "dead_lettered";
 
 export interface DispatchOutboxEvent {
   id: string;
@@ -66,6 +66,12 @@ export interface DispatchOutbox {
   markCompleted(claim: OutboxClaim): boolean;
 
   markFailed(claim: OutboxClaim, error: string, retryDelayMs: number): boolean;
+
+  /** Preserve claimed work without retries until an explicit operator-driven resume. */
+  markSuspended(claim: OutboxClaim, reason: string): boolean;
+
+  /** Resume durable events matching a payload identity and optional suspension reason prefix. */
+  resumeSuspended(eventType: string, payloadKey: string, payloadValue: string, reasonPrefix?: string): number;
 
   get(id: string): DispatchOutboxEvent | undefined;
   listByAggregate(aggregateId: string): DispatchOutboxEvent[];
@@ -312,6 +318,39 @@ export function createDispatchOutbox(
     return result.changes === 1;
   }
 
+  function markSuspended(claim: OutboxClaim, reason: string): boolean {
+    const result = database.db.update(dispatchOutbox).set({
+      status: "suspended", claimedBy: null, claimExpiresAt: null, claimToken: null, lastError: reason,
+    }).where(fencedClaimWhere(claim)).run();
+    return result.changes === 1;
+  }
+
+  function resumeSuspended(eventType: string, payloadKey: string, payloadValue: string, reasonPrefix?: string): number {
+    if (!/^[A-Za-z0-9_]+$/.test(payloadKey)) throw new Error("Outbox resume payload key is invalid.");
+    if (reasonPrefix !== undefined && (reasonPrefix.length === 0 || reasonPrefix.length > 160 || /[\r\n\0]/.test(reasonPrefix))) {
+      throw new Error("Outbox resume reason prefix is invalid.");
+    }
+    const path = `$."${payloadKey}"`;
+    const reasonClause = reasonPrefix === undefined ? "" : " and substr(last_error, 1, ?) = ?";
+    const parameters = reasonPrefix === undefined
+      ? [eventType, path, payloadValue]
+      : [eventType, path, payloadValue, reasonPrefix.length, reasonPrefix];
+    const candidates = database.sqlite.prepare(`select id from dispatch_outbox
+      where event_type = ? and status = 'suspended' and json_extract(payload_json, ?) = ?${reasonClause}`).all(...parameters) as Array<{ id: string }>;
+    let resumed = 0;
+    const now = new Date().toISOString();
+    for (const candidate of candidates) {
+      const result = database.sqlite.prepare(`update dispatch_outbox
+        set status = 'pending', available_at = ?, last_error = null
+        where id = ? and status = 'suspended'`).run(now, candidate.id);
+      if (result.changes !== 1) continue;
+      const row = database.db.select().from(dispatchOutbox).where(eq(dispatchOutbox.id, candidate.id)).get();
+      if (row) queueMicrotask(() => notify(rowToEvent(row)));
+      resumed += 1;
+    }
+    return resumed;
+  }
+
   function listPending(limit = 50, eventTypes?: string[]): DispatchOutboxEvent[] {
     return database.db
       .select()
@@ -330,7 +369,7 @@ export function createDispatchOutbox(
       .where(and(
         eq(dispatchOutbox.eventType, eventType),
         eq(dispatchOutbox.aggregateId, aggregateId),
-        or(eq(dispatchOutbox.status, "pending"), eq(dispatchOutbox.status, "claimed")),
+        or(eq(dispatchOutbox.status, "pending"), eq(dispatchOutbox.status, "claimed"), eq(dispatchOutbox.status, "suspended")),
       ))
       .limit(1)
       .get();
@@ -392,6 +431,8 @@ export function createDispatchOutbox(
     release,
     markCompleted,
     markFailed,
+    markSuspended,
+    resumeSuspended,
     get,
     listByAggregate,
     listPending,

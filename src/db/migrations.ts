@@ -118,6 +118,8 @@ const migrations: Migration[] = [
   { version: 104, name: "scheduled-job-peer-pull-target", up: migrateScheduledJobPeerPullTarget },
   { version: 105, name: "durable-agent-reply-dispatch-ack", up: migrateAgentReplyDispatchAck },
   { version: 106, name: "startup-recovery-selective-indexes", up: migrateStartupRecoverySelectiveIndexes },
+  { version: 107, name: "review-browser-durable-auth-ownership", up: migrateReviewBrowserDurableAuthOwnership },
+  { version: 108, name: "review-browser-launch-diagnostics", up: migrateReviewBrowserLaunchDiagnostics },
 ];
 
 function migrateStartupRecoverySelectiveIndexes(sqlite: Database.Database): void {
@@ -242,6 +244,20 @@ function migrateAgentPtyBindings(sqlite: Database.Database): void {
 
 function migrateReviewerBrowserAuthState(sqlite: Database.Database): void {
   addColumnIfMissing(sqlite, "review_browser_profiles", "auth_state", "text not null default 'unknown'");
+}
+
+function migrateReviewBrowserDurableAuthOwnership(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "review_browser_profiles", "browser_ready_at", "text");
+  addColumnIfMissing(sqlite, "review_browser_profiles", "manual_auth_pid", "integer");
+  addColumnIfMissing(sqlite, "review_browser_profiles", "manual_auth_process_start_identity", "text");
+  addColumnIfMissing(sqlite, "review_browser_profiles", "manual_auth_boot_identity", "text");
+  addColumnIfMissing(sqlite, "review_browser_profiles", "manual_auth_generation", "integer");
+}
+
+function migrateReviewBrowserLaunchDiagnostics(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "review_browser_profiles", "browser_product", "text");
+  addColumnIfMissing(sqlite, "review_browser_profiles", "remote_debugging_enabled", "integer");
+  addColumnIfMissing(sqlite, "review_browser_profiles", "browser_launch_diagnostic", "text");
 }
 
 function migrateAuthenticatedOutcomeObservationReceipts(sqlite: Database.Database): void {

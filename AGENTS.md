@@ -140,9 +140,23 @@ Current implementation contracts:
 - Native-CDP reviewer authentication uses a separate durable auth state. Manual
   sign-in runs in official Chrome without remote debugging, then the same
   private profile is relaunched under loopback CDP and ChatGPT session readiness
-  is verified before conversation binding. Credentials and cookies never enter
-  MCP or Kontrol storage. Expired browser dispatch leases requeue only attempts
-  known to be before the send boundary; later attempts remain fenced for exact
+  is verified before conversation binding. Browser-process readiness and
+  authentication verification have separate timestamps; a restarted browser
+  must positively re-observe the bound conversation before dispatch. Manual
+  browser PID, process-start identity, boot identity, and generation are durable
+  so a restarted controller never assumes that ordinary Chrome exited.
+  Authentication-blocked review events stay durably suspended until human
+  recovery. Binding ambiguity or conversation mismatch suspends only that
+  thread's queued events until an explicit exact rebind. These suspension
+  reasons are resumed independently. Active generation keeps the exact
+  conversation busy without a second prompt. Manual Chrome binaries are
+  verified as official Google Chrome even when explicitly configured; launch
+  diagnostics are bounded and redacted.
+  Clean controller shutdown closes its owned Chrome process and loopback CDP
+  endpoint. Browser-process, CDP, authentication, binding, and dispatch health
+  remain separately observable. Credentials and cookies never enter MCP or
+  Kontrol storage. Expired browser dispatch leases requeue only attempts known
+  to be before the send boundary; later attempts remain fenced for exact
   conversation reconciliation. Shutdown drains the dispatcher before closing
   CDP or SQLite.
 - An expired post-dispatch browser attempt remains fenced until authenticated

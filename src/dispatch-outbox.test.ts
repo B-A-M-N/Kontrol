@@ -35,6 +35,59 @@ try {
     db.close();
   }
 
+  // Authentication failures preserve a reviewer packet without retry churn;
+  // a positive human-driven recovery resumes only that profile's events.
+  {
+    const db = openDatabase(join(root, "auth-suspension"));
+    const outbox = createDispatchOutbox(db);
+    const event = outbox.enqueue({
+      eventType: "reviewer.browser_turn.ready", aggregateId: "review-auth-suspended", aggregateRevision: 3,
+      payload: { profileId: "profile-a", threadId: "thread-a" },
+    });
+    const claim = outbox.claimNext("reviewer-worker", 10_000, ["reviewer.browser_turn.ready"]);
+    assert.ok(claim);
+    assert.equal(outbox.markSuspended(claimOf(claim), "review_browser_auth_suspended:auth_blocked"), true);
+    assert.equal(outbox.listPending(10, ["reviewer.browser_turn.ready"]).length, 0);
+    assert.equal(outbox.get(event.id)?.status, "suspended");
+    assert.equal(outbox.hasActive(event.eventType, event.aggregateId), true, "suspended work remains a durable active logical event");
+    assert.equal(outbox.resumeSuspended(event.eventType, "profileId", "profile-b"), 0);
+    assert.equal(outbox.resumeSuspended(event.eventType, "profileId", "profile-a", "review_browser_auth_suspended:"), 1);
+    assert.equal(outbox.get(event.id)?.status, "pending");
+    assert.equal(outbox.listPending(10, ["reviewer.browser_turn.ready"])[0]?.id, event.id);
+    db.close();
+  }
+
+  // Binding recovery suspensions are thread-scoped and cannot be released by
+  // an authentication-only observation for the same browser profile.
+  {
+    const db = openDatabase(join(root, "binding-suspension"));
+    const outbox = createDispatchOutbox(db);
+    const bindingEvent = outbox.enqueue({
+      eventType: "reviewer.browser_turn.ready", aggregateId: "review-binding-suspended",
+      payload: { profileId: "profile-a", threadId: "thread-a" },
+    });
+    const authEvent = outbox.enqueue({
+      eventType: "reviewer.browser_turn.ready", aggregateId: "review-auth-suspended-next",
+      payload: { profileId: "profile-a", threadId: "thread-b" },
+    });
+    for (const event of [bindingEvent, authEvent]) {
+      const claim = outbox.claimNext("reviewer-worker", 10_000, [event.eventType]);
+      assert.ok(claim);
+      const reason = event.id === bindingEvent.id
+        ? "reviewer.browser_binding_suspended:target_ambiguous"
+        : "review_browser_auth_suspended:login_required";
+      assert.equal(outbox.markSuspended(claimOf(claim), reason), true);
+    }
+    assert.equal(outbox.resumeSuspended(bindingEvent.eventType, "profileId", "profile-a", "review_browser_auth_suspended:"), 1,
+      "positive authentication resumes auth-blocked events without releasing binding recovery events");
+    assert.equal(outbox.get(bindingEvent.id)?.status, "suspended");
+    assert.equal(outbox.resumeSuspended(bindingEvent.eventType, "threadId", "thread-a", "reviewer.browser_binding_suspended:"), 1,
+      "explicit exact-thread rebinding resumes its preserved event");
+    assert.equal(outbox.get(bindingEvent.id)?.status, "pending");
+    assert.equal(outbox.get(authEvent.id)?.status, "pending");
+    db.close();
+  }
+
   // --- Fix 1: dead-lettering is keyed off genuine failures, not claims. ---
   {
     const db = openDatabase(root);

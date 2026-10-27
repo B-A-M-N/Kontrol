@@ -6,7 +6,7 @@ import { canonicalReviewerConversation } from "./target-binding.js";
 export type BrowserReadiness =
   | { status: "ready"; conversationUrl: string; conversationKey: string }
   | { status: "generation_active"; conversationUrl: string; conversationKey: string }
-  | { status: "login_required" | "verification_required" | "identity_provider_unsupported_browser" | "session_expired" | "authentication_handoff_failed" | "connector_authorization_required" | "composer_unavailable" | "wrong_conversation" | "browser_disconnected"; detail?: string };
+  | { status: "login_required" | "verification_required" | "identity_provider_rejected" | "identity_provider_unsupported_browser" | "session_expired" | "authentication_handoff_failed" | "connector_authorization_required" | "composer_unavailable" | "wrong_conversation" | "navigation_unconfirmed" | "browser_transport_failed" | "browser_disconnected"; detail?: string };
 export type AuthenticationFailure = "login_required" | "identity_provider_unsupported_browser" | "verification_required" | "session_expired" | "authentication_handoff_failed";
 export interface TurnBaseline { conversationKey: string; userMessageCount: number; assistantMessageCount: number; capturedAt: string }
 export type PromptSubmission = { status: "accepted"; submittedAt: string; conversationKey: string }
@@ -14,12 +14,22 @@ export type PromptSubmission = { status: "accepted"; submittedAt: string; conver
   | { status: "uncertain"; reason: string };
 export type GenerationState = "not_started" | "generating" | "finished" | "blocked" | "unknown";
 
+export class BrowserReadinessError extends Error {
+  constructor(readonly readiness: BrowserReadiness["status"]) {
+    super(`Reviewer browser is not ready: ${readiness}.`);
+    this.name = "BrowserReadinessError";
+  }
+}
+
 const ORIGIN = "https://chatgpt.com";
 const COMPOSERS = ["#prompt-textarea", "[data-testid='prompt-textarea']", "[contenteditable='true'][role='textbox']"];
 const SENDS = ["button[data-testid='send-button']", "button[aria-label='Send prompt']", "button[aria-label^='Send' i]"];
 const STOPS = ["button[data-testid='stop-button']", "button[aria-label*='Stop generating' i]"];
 const inspectPage = `(() => {
-  const url = location.href, path = location.pathname, body = (document.body?.innerText || '').toLowerCase();
+  const url = location.href, parsed = new URL(url), path = parsed.pathname;
+  if (parsed.hostname.toLowerCase() === 'accounts.google.com') return {status:'identity_provider_rejected'};
+  if (!/(^|\\.)chatgpt\\.com$/i.test(parsed.hostname)) return {status:'wrong_conversation'};
+  const body = (document.body?.innerText || '').toLowerCase();
   const visible = e => { const r=e.getBoundingClientRect(), s=getComputedStyle(e); return r.width>0 && r.height>0 && s.display!=='none' && s.visibility!=='hidden'; };
   const select = selectors => { const set=new Set(); for (const s of selectors) for (const e of document.querySelectorAll(s)) if (visible(e)) set.add(e); return [...set]; };
   if (/^\\/auth\\/(login|signin)|^\\/login/.test(path)) return {status:'login_required'};
@@ -51,12 +61,12 @@ export class ChatGptPageDriver {
       const canonical = canonicalReviewerConversation(value.url ?? "");
       if (canonical.key !== expectedKey || canonical.key !== this.target.conversationKey) return { status: "wrong_conversation" };
       return { status: "ready", conversationUrl: canonical.url, conversationKey: canonical.key };
-    } catch { return { status: "browser_disconnected" }; }
+    } catch { return { status: "browser_transport_failed" }; }
   }
 
   async captureBaseline(): Promise<TurnBaseline> {
     const ready = await this.inspect();
-    if (ready.status !== "ready") throw new Error(`Reviewer browser is not ready: ${ready.status}.`);
+    if (ready.status !== "ready") throw new BrowserReadinessError(ready.status);
     const counts = await this.evaluate<{ userMessageCount: number; assistantMessageCount: number }>(`(() => ({userMessageCount:document.querySelectorAll('[data-message-author-role="user"]').length,assistantMessageCount:document.querySelectorAll('[data-message-author-role="assistant"]').length}))()`);
     return { conversationKey: ready.conversationKey, ...counts, capturedAt: new Date().toISOString() };
   }
@@ -116,8 +126,8 @@ export class ChatGptPageDriver {
 
   async observeGeneration(baseline: TurnBaseline, attemptId?: string): Promise<GenerationState> {
     const ready = await this.inspect(baseline.conversationKey);
-    if (["login_required", "verification_required", "identity_provider_unsupported_browser", "session_expired", "authentication_handoff_failed", "wrong_conversation"].includes(ready.status)) return "blocked";
-    if (ready.status === "browser_disconnected") return "unknown";
+    if (["login_required", "verification_required", "identity_provider_rejected", "identity_provider_unsupported_browser", "session_expired", "authentication_handoff_failed", "wrong_conversation"].includes(ready.status)) return "blocked";
+    if (ready.status === "browser_transport_failed" || ready.status === "browser_disconnected") return "unknown";
     if (ready.status === "generation_active") return "generating";
     if (ready.status !== "ready") return "not_started";
     const state = await this.evaluate<{ assistants: number; generating: boolean; attemptPresent: boolean }>(`(() => {
@@ -133,8 +143,8 @@ export class ChatGptPageDriver {
 
   async waitForGeneration(baseline: TurnBaseline, attemptId: string, phase: "start" | "finish", timeoutMs = 30 * 60_000): Promise<GenerationState> {
     const ready = await this.inspect(baseline.conversationKey);
-    if (["login_required", "verification_required", "identity_provider_unsupported_browser", "session_expired", "authentication_handoff_failed", "wrong_conversation"].includes(ready.status)) return "blocked";
-    if (ready.status === "browser_disconnected") return "unknown";
+    if (["login_required", "verification_required", "identity_provider_rejected", "identity_provider_unsupported_browser", "session_expired", "authentication_handoff_failed", "wrong_conversation"].includes(ready.status)) return "blocked";
+    if (ready.status === "browser_transport_failed" || ready.status === "browser_disconnected") return "unknown";
     const expression = `new Promise(resolve => {
       const baseline=${JSON.stringify(baseline)}, attempt=${JSON.stringify(attemptId)}, phase=${JSON.stringify(phase)};
       const visible=e=>{const r=e.getBoundingClientRect(),s=getComputedStyle(e);return r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden'};

@@ -10,6 +10,7 @@ import { registerHandoffTools } from "./handoff-tools.js";
 import { mcpOwnerContextId } from "../mcp/owner-context.js";
 import { McpQualificationEvidenceJournal } from "../server/mcp-qualification-evidence.js";
 import { reviewerThreadContextId } from "./shared.js";
+import { ManualAuthenticationRequiredError } from "../review-browser/browser-controller.js";
 
 const root = await mkdtemp(join(tmpdir(), "kontrol-handoff-tools-test-"));
 
@@ -106,9 +107,18 @@ try {
     },
     reviewBrowserController: {
       profiles: { get: (profileId: string) => profileId === "reviewer-profile" ? { id: profileId, ownerPrincipalId: "user-a" } : undefined },
+      inspectHealth: async () => ({
+        browserProcess: "running" as const, cdpConnection: "connected" as const, authState: "authenticated",
+        lastVerifiedAt: "2026-01-01T00:00:00.000Z", browserProduct: "Google Chrome 136.0", remoteDebuggingEnabled: true,
+        bindings: { bound: 1, recoveryRequired: 0, other: 0 }, dispatch: { queued: 0, active: 0, uncertain: 0, blocked: 0 },
+      }),
+      openLoginPage: async (profileId: string) => {
+        browserAuthCalls.push(`legacy-login:${profileId}`);
+        throw new ManualAuthenticationRequiredError();
+      },
       beginManualAuthentication: async (profileId: string) => {
         browserAuthCalls.push(`begin:${profileId}`);
-        return { profileId, generation: 4, browserPid: 4321 };
+        return { profileId, generation: 4, browserPid: 4321, browserProduct: "Google Chrome 136.0", remoteDebuggingEnabled: false as const, browserLaunchDiagnostic: "" };
       },
       completeManualAuthentication: async (profileId: string) => {
         browserAuthCalls.push(`complete:${profileId}`);
@@ -173,12 +183,27 @@ try {
 
   const authStarted = await reviewerClient.callTool({ name: "begin_reviewer_browser_auth", arguments: { profileId: "reviewer-profile" } });
   assert.equal(authStarted.isError, undefined, "authenticated reviewers can start the dedicated ordinary-Chrome auth handoff");
-  assert.deepEqual(authStarted.structuredContent, { profileId: "reviewer-profile", generation: 4, browserPid: 4321 });
+  assert.deepEqual(authStarted.structuredContent, {
+    profileId: "reviewer-profile", generation: 4, browserPid: 4321,
+    browserProduct: "Google Chrome 136.0", remoteDebuggingEnabled: false, browserLaunchDiagnostic: "",
+  });
   assert.match(JSON.stringify(authStarted.content), /without remote debugging/);
   const authCompleted = await reviewerClient.callTool({ name: "complete_reviewer_browser_auth", arguments: { profileId: "reviewer-profile" } });
   assert.equal(authCompleted.isError, undefined);
   assert.equal((authCompleted.structuredContent as { status: string }).status, "auth_required");
-  assert.deepEqual(browserAuthCalls, ["begin:reviewer-profile", "complete:reviewer-profile"]);
+  const legacyLogin = await reviewerClient.callTool({ name: "open_reviewer_browser_login", arguments: { profileId: "reviewer-profile" } });
+  assert.deepEqual(legacyLogin.structuredContent, {
+    profileId: "reviewer-profile", code: "manual_authentication_required", retryable: false,
+    requiredAction: "begin_reviewer_browser_auth",
+  }, "the compatibility action cannot open ChatGPT under CDP and directs reviewers to ordinary Chrome");
+  const browserHealth = await reviewerClient.callTool({ name: "inspect_reviewer_browser_health", arguments: { profileId: "reviewer-profile" } });
+  assert.equal(browserHealth.isError, undefined);
+  assert.deepEqual(browserHealth.structuredContent, {
+    browserProcess: "running", cdpConnection: "connected", authState: "authenticated",
+    lastVerifiedAt: "2026-01-01T00:00:00.000Z", browserProduct: "Google Chrome 136.0", remoteDebuggingEnabled: true,
+    bindings: { bound: 1, recoveryRequired: 0, other: 0 }, dispatch: { queued: 0, active: 0, uncertain: 0, blocked: 0 },
+  }, "health reports process, CDP, authentication, conversation binding, and dispatch independently");
+  assert.deepEqual(browserAuthCalls, ["begin:reviewer-profile", "complete:reviewer-profile", "legacy-login:reviewer-profile"]);
 
   const clientConfig = { ...reviewerConfig, principalRole: "client" };
   const clientServer = new McpServer({ name: "handoff-client-auth-test", version: "1.0.0" });
@@ -199,7 +224,7 @@ try {
   assert.equal(deniedBrowserRecovery.isError, true, "non-reviewers cannot release an uncertain browser-attempt fence");
   const deniedBrowserAuth = await client.callTool({ name: "begin_reviewer_browser_auth", arguments: { profileId: "reviewer-profile" } });
   assert.equal(deniedBrowserAuth.isError, true, "non-reviewers cannot launch ordinary Chrome for reviewer authentication");
-  assert.deepEqual(browserAuthCalls, ["begin:reviewer-profile", "complete:reviewer-profile"], "denied auth requests never reach the browser controller");
+  assert.deepEqual(browserAuthCalls, ["begin:reviewer-profile", "complete:reviewer-profile", "legacy-login:reviewer-profile"], "denied auth requests never reach the browser controller");
   await Promise.all([reviewerClient.close(), reviewerServer.close(), client.close(), clientServer.close()]);
   db.close();
 } finally {

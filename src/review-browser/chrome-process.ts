@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { chmod, lstat, mkdir, open, readFile, readlink, unlink } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { chmod, lstat, mkdir, open, readFile, readlink, realpath, rename, unlink } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { CdpClient } from "./cdp-client.js";
@@ -12,7 +13,10 @@ export interface OwnedChrome {
   profileDirectory: string;
   generation: number;
   browserPid?: number;
+  processStartIdentity?: string;
+  bootIdentity?: string;
   version: Record<string, unknown>;
+  launchDiagnostics: { product: string; remoteDebuggingEnabled: boolean; stderr: string };
   cdp: CdpClient;
   reused: boolean;
   detach(): Promise<void>;
@@ -65,6 +69,51 @@ function chromeEnvironment(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
     if (value !== undefined) result[key] = value;
   }
   return result;
+}
+
+function captureChromeStderr(child: ChildProcess): () => string {
+  let buffer = "";
+  child.stderr?.setEncoding("utf8");
+  child.stderr?.on("data", (chunk: string) => {
+    buffer = (buffer + chunk).slice(-8192);
+  });
+  return () => buffer
+    .replace(/\bBearer\s+[^\s"'`]+/gi, "Bearer [redacted]")
+    .replace(/\b(cookie|token|password|secret|authorization)(\s*[=:]\s*)[^\s,;"'`]+/gi, "$1$2[redacted]")
+    .replace(/--user-data-dir=\S+/gi, "--user-data-dir=[private]")
+    .replace(/ws:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):\d+\/devtools\/browser\/[A-Za-z0-9_-]+/gi, "ws://127.0.0.1:[port]/devtools/browser/[redacted]")
+    .replace(/\/(?:home|Users|tmp|var|private)\/[^\s:'"`]+/g, "[local-path]")
+    .slice(-2048);
+}
+
+export function isOfficialChromeInstallPath(platform: NodeJS.Platform, path: string): boolean {
+  const normalized = path.replace(/\\/g, "/");
+  if (platform === "linux") return /^\/(?:opt\/google\/chrome|usr\/lib\/google-chrome)\//i.test(normalized);
+  if (platform === "darwin") return /\/Google Chrome\.app\/Contents\/MacOS\/Google Chrome$/i.test(normalized);
+  if (platform === "win32") return /^[A-Za-z]:\/Program Files(?: \(x86\))?\/Google\/Chrome\/Application\/chrome\.exe$/i.test(normalized);
+  return false;
+}
+
+async function verifyOfficialChrome(executable: string, environment: NodeJS.ProcessEnv): Promise<string> {
+  const binary = await realpath(executable).catch(() => resolve(executable));
+  if (!isOfficialChromeInstallPath(process.platform, binary)) {
+    throw new Error("Manual authentication requires the official Google Chrome installation path; the selected executable is not in a verified location.");
+  }
+  const child = spawn(binary, ["--version"], { stdio: ["ignore", "pipe", "pipe"], env: chromeEnvironment(environment), windowsHide: true });
+  let output = "";
+  const append = (chunk: string) => { output = (output + chunk).slice(-1024); };
+  child.stdout?.setEncoding("utf8").on("data", append);
+  child.stderr?.setEncoding("utf8").on("data", append);
+  const result = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolvePromise, reject) => {
+    const timer = setTimeout(() => { child.kill("SIGKILL"); reject(new Error("Official Chrome binary verification timed out.")); }, 5_000);
+    child.once("error", () => { clearTimeout(timer); reject(new Error("Could not verify the configured official Chrome binary.")); });
+    child.once("close", (code, signal) => { clearTimeout(timer); resolvePromise({ code, signal }); });
+  });
+  const version = output.trim().replace(/\s+/g, " ").slice(0, 160);
+  if (result.code !== 0 || !/^Google Chrome\s+[\w. -]+$/i.test(version)) {
+    throw new Error("Manual authentication requires the official Google Chrome binary; the selected executable did not identify as Google Chrome.");
+  }
+  return version;
 }
 
 async function assertPrivateProfile(profileDirectory: string): Promise<void> {
@@ -141,6 +190,44 @@ async function verifyExisting(profileDirectory: string): Promise<{ cdp: CdpClien
   } catch (error) { await cdp.close(); throw error; }
 }
 
+export interface ChromeProfileOwnerObservation {
+  status: "empty" | "owned" | "unknown";
+  pid?: number;
+  processStartIdentity?: string;
+  bootIdentity?: string;
+  remoteDebuggingEnabled?: boolean;
+}
+
+/** Inspect the browser's own profile lock after a controller crash. This is
+ * distinct from the Kontrol ownership lock: it identifies any surviving
+ * Chrome process that still owns the private profile. */
+export async function inspectChromeProfileOwner(profileDirectory: string): Promise<ChromeProfileOwnerObservation> {
+  const absolute = resolve(profileDirectory);
+  await assertPrivateProfile(absolute);
+  let singletonPresent = false;
+  try { await lstat(join(absolute, "SingletonLock")); singletonPresent = true; }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") return { status: "unknown" };
+  }
+  let endpoint: string | undefined;
+  try { endpoint = await readDebugEndpoint(absolute); }
+  catch { return { status: "unknown" }; }
+  let pid: number | undefined;
+  try { pid = await chromePidForProfile(absolute); }
+  catch { return { status: "unknown" }; }
+  if (pid) {
+    const [start, boot] = await Promise.all([processStartIdentity(pid), bootIdentity()]);
+    return {
+      status: "owned", pid,
+      ...(start ? { processStartIdentity: start } : {}),
+      ...(boot ? { bootIdentity: boot } : {}),
+      remoteDebuggingEnabled: Boolean(endpoint),
+    };
+  }
+  if (singletonPresent || endpoint) return { status: "unknown" };
+  return { status: "empty", remoteDebuggingEnabled: false };
+}
+
 async function waitForEndpoint(profileDirectory: string, child: ChildProcess, timeoutMs: number): Promise<string> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -161,32 +248,154 @@ async function waitForExit(child: ChildProcess, timeoutMs: number): Promise<bool
   });
 }
 
-async function acquireProfileLock(profileDirectory: string, generation: number): Promise<() => Promise<void>> {
+async function waitForOwnedProcessExit(input: { pid: number; processStartIdentity?: string; bootIdentity?: string }, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const state = await inspectOwnedProcess(input);
+    if (state === "dead" || state === "different") return true;
+    if (state === "unknown") return false;
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
+  }
+  return false;
+}
+
+type PidState = "alive" | "dead" | "unknown";
+
+function probePid(pid: number): PidState {
+  try {
+    process.kill(pid, 0);
+    return "alive";
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ESRCH") return "dead";
+    return "unknown";
+  }
+}
+
+async function processStartIdentity(pid: number): Promise<string | undefined> {
+  if (process.platform !== "linux") return undefined;
+  try {
+    const stat = await readFile(`/proc/${pid}/stat`, "utf8");
+    const close = stat.lastIndexOf(")");
+    if (close < 0) return undefined;
+    // /proc/<pid>/stat field 22 (starttime); the remainder starts at field 3.
+    return stat.slice(close + 1).trim().split(/\s+/)[19];
+  } catch { return undefined; }
+}
+
+async function bootIdentity(): Promise<string | undefined> {
+  if (process.platform !== "linux") return undefined;
+  try { return (await readFile("/proc/sys/kernel/random/boot_id", "utf8")).trim(); }
+  catch { return undefined; }
+}
+
+interface ProfileLockRecord {
+  pid: number;
+  generation: number;
+  lockId: string;
+  processStartIdentity?: string;
+  bootIdentity?: string;
+  acquiredAt: string;
+}
+
+export type OwnedProcessState = "same" | "dead" | "different" | "unknown";
+
+export async function inspectOwnedProcess(input: { pid: number; processStartIdentity?: string; bootIdentity?: string }): Promise<OwnedProcessState> {
+  const pidState = probePid(input.pid);
+  if (pidState === "dead") return "dead";
+  const [start, boot] = await Promise.all([processStartIdentity(input.pid), bootIdentity()]);
+  if (input.bootIdentity && boot && input.bootIdentity !== boot) return "different";
+  if (input.processStartIdentity && start && input.processStartIdentity !== start) return "different";
+  if (pidState === "unknown" || !input.processStartIdentity || !start) return "unknown";
+  return "same";
+}
+
+async function lockOwnerIsStale(record: ProfileLockRecord): Promise<boolean> {
+  const state = probePid(record.pid);
+  if (state === "dead") return true;
+  if (state === "unknown") return false;
+  const [start, boot] = await Promise.all([processStartIdentity(record.pid), bootIdentity()]);
+  if (record.bootIdentity && boot && record.bootIdentity !== boot) return true;
+  if (record.processStartIdentity && start && record.processStartIdentity !== start) return true;
+  return false;
+}
+
+export async function acquireReviewerProfileLock(profileDirectory: string, generation: number): Promise<() => Promise<void>> {
   if (activeProfileLocks.has(profileDirectory)) throw new Error("Another browser controller in this process owns the selected reviewer profile.");
   await assertPrivateProfile(profileDirectory);
   const lockPath = join(profileDirectory, "kontrol-controller.lock");
   await mkdir(profileDirectory, { recursive: true, mode: 0o700 });
+  const lockId = randomUUID();
+  const [startIdentity, bootId] = await Promise.all([processStartIdentity(process.pid), bootIdentity()]);
+  const record: ProfileLockRecord = {
+    pid: process.pid,
+    generation,
+    lockId,
+    ...(startIdentity ? { processStartIdentity: startIdentity } : {}),
+    ...(bootId ? { bootIdentity: bootId } : {}),
+    acquiredAt: new Date().toISOString(),
+  };
   let lockHandle;
   try { lockHandle = await open(lockPath, "wx", 0o600); }
   catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-    let ownerPid: number | undefined;
-    try { ownerPid = Number((JSON.parse(await readFile(lockPath, "utf8")) as { pid?: unknown }).pid); } catch { /* reconcile only a conclusively dead process */ }
-    if (ownerPid && ownerPid !== process.pid) {
-      try { process.kill(ownerPid, 0); throw new Error("Another Kontrol browser controller owns this profile."); }
-      catch (probeError) { if (probeError instanceof Error && probeError.message === "Another Kontrol browser controller owns this profile.") throw probeError; }
+    let raw: string;
+    let prior: ProfileLockRecord;
+    try {
+      raw = await readFile(lockPath, "utf8");
+      const parsed = JSON.parse(raw) as Partial<ProfileLockRecord>;
+      if (!Number.isSafeInteger(parsed.pid) || (parsed.pid ?? 0) <= 0 || !Number.isSafeInteger(parsed.generation)
+        || typeof parsed.lockId !== "string" || !parsed.lockId) throw new Error("invalid lock record");
+      prior = parsed as ProfileLockRecord;
+    } catch {
+      throw new Error("Reviewer browser profile lock is unreadable or ambiguous; refusing to reclaim it.");
     }
-    await unlink(lockPath).catch(() => undefined);
-    lockHandle = await open(lockPath, "wx", 0o600);
+    if (!await lockOwnerIsStale(prior)) throw new Error("Another reviewer browser controller owns this profile, or its ownership cannot be verified.");
+    // Rename is the compare-and-swap: among concurrent reclaimers only one can
+    // move this exact lock entry. A contender then creates the replacement with wx.
+    const quarantine = `${lockPath}.reclaim-${randomUUID()}`;
+    try { await rename(lockPath, quarantine); }
+    catch (renameError) {
+      if ((renameError as NodeJS.ErrnoException).code === "ENOENT") throw new Error("Reviewer browser profile lock changed during stale-owner recovery; retry acquisition.");
+      throw renameError;
+    }
+    try {
+      if (await readFile(quarantine, "utf8") !== raw) {
+        await rename(quarantine, lockPath).catch(() => undefined);
+        throw new Error("Reviewer browser profile lock changed during stale-owner recovery; refusing to reclaim it.");
+      }
+      await unlink(quarantine);
+    } catch (reclaimError) {
+      // Do not overwrite a successor lock if one appeared while validating.
+      if ((reclaimError as NodeJS.ErrnoException).code !== "ENOENT") {
+        await open(lockPath, "wx", 0o600).then(async (handle) => { await handle.writeFile(raw); await handle.close(); }).catch(() => undefined);
+      }
+      throw reclaimError;
+    }
+    try { lockHandle = await open(lockPath, "wx", 0o600); }
+    catch (createError) {
+      if ((createError as NodeJS.ErrnoException).code === "EEXIST") throw new Error("Another reviewer browser controller acquired the profile during stale-owner recovery.");
+      throw createError;
+    }
   }
   activeProfileLocks.add(profileDirectory);
-  await lockHandle.writeFile(JSON.stringify({ pid: process.pid, generation, acquiredAt: new Date().toISOString() }));
+  await lockHandle.writeFile(JSON.stringify(record));
   await lockHandle.close();
-  return async () => { await unlink(lockPath).catch(() => undefined); activeProfileLocks.delete(profileDirectory); };
+  return async () => {
+    try {
+      const current = JSON.parse(await readFile(lockPath, "utf8")) as Partial<ProfileLockRecord>;
+      if (current.lockId === lockId) await unlink(lockPath);
+    } catch { /* a successor or external recovery owns the path now */ }
+    activeProfileLocks.delete(profileDirectory);
+  };
 }
 
 export interface ManualChromeAuthentication {
   readonly browserPid?: number;
+  readonly browserProduct: string;
+  readonly processStartIdentity?: string;
+  readonly bootIdentity?: string;
+  launchDiagnostic(): string;
   hasExited(): boolean;
   releaseAfterExit(): Promise<void>;
   close(): Promise<boolean>;
@@ -194,7 +403,7 @@ export interface ManualChromeAuthentication {
 
 export async function launchManualAuthenticationChrome(options: Pick<ChromeProcessOptions, "profileDirectory" | "generation" | "chromePath" | "startupTimeoutMs" | "environment">): Promise<ManualChromeAuthentication> {
   const profileDirectory = resolve(options.profileDirectory);
-  const releaseLock = await acquireProfileLock(profileDirectory, options.generation);
+  const releaseLock = await acquireReviewerProfileLock(profileDirectory, options.generation);
   let child: ChildProcess | undefined;
   try {
     const existingOwner = await chromePidForProfile(profileDirectory);
@@ -202,9 +411,12 @@ export async function launchManualAuthenticationChrome(options: Pick<ChromeProce
     const hasDebugEndpoint = Boolean(await readDebugEndpoint(profileDirectory));
     if (existingOwner || hasProfileLock || hasDebugEndpoint) throw new Error("The selected reviewer profile is already open or has unresolved browser ownership; close Chrome and reconcile the profile before beginning manual authentication.");
     const executable = chromeBinary(options.chromePath, "manual_authentication");
+    const environment = options.environment ?? process.env;
+    const browserProduct = await verifyOfficialChrome(executable, environment);
     child = spawn(executable, chromeArguments(profileDirectory, "manual_authentication"), {
-      stdio: "ignore", env: chromeEnvironment(options.environment ?? process.env), windowsHide: false,
+      stdio: ["ignore", "ignore", "pipe"], env: chromeEnvironment(environment), windowsHide: false,
     });
+    const launchDiagnostic = captureChromeStderr(child);
     const deadline = Date.now() + (options.startupTimeoutMs ?? 30_000);
     let owned = false;
     while (Date.now() < deadline) {
@@ -213,6 +425,8 @@ export async function launchManualAuthenticationChrome(options: Pick<ChromeProce
       await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
     }
     if (!owned) throw new Error("Official Chrome did not establish ownership of the reviewer profile before the startup deadline.");
+    const startIdentity = child.pid ? await processStartIdentity(child.pid) : undefined;
+    const bootId = await bootIdentity();
     let released = false;
     const release = async () => {
       if (released) return;
@@ -224,6 +438,10 @@ export async function launchManualAuthenticationChrome(options: Pick<ChromeProce
     };
     return {
       ...(child.pid ? { browserPid: child.pid } : {}),
+      browserProduct,
+      ...(startIdentity ? { processStartIdentity: startIdentity } : {}),
+      ...(bootId ? { bootIdentity: bootId } : {}),
+      launchDiagnostic,
       hasExited: () => child!.exitCode !== null || child!.signalCode !== null,
       releaseAfterExit: release,
       async close() {
@@ -243,23 +461,31 @@ export async function launchManualAuthenticationChrome(options: Pick<ChromeProce
 
 export async function launchOrReconnectChrome(options: ChromeProcessOptions): Promise<OwnedChrome> {
   const profileDirectory = resolve(options.profileDirectory);
-  const releaseLock = await acquireProfileLock(profileDirectory, options.generation);
+  const releaseLock = await acquireReviewerProfileLock(profileDirectory, options.generation);
   let child: ChildProcess | undefined;
   let cdp: CdpClient | undefined;
+  let launchDiagnostic = () => "";
   let stopped = false;
   try {
     const existing = await verifyExisting(profileDirectory);
     if (existing) {
       cdp = existing.cdp;
-      return createHandle(existing.pid, existing.version, true);
+      const [startIdentity, bootId] = existing.pid
+        ? await Promise.all([processStartIdentity(existing.pid), bootIdentity()])
+        : [undefined, undefined];
+      return createHandle(existing.pid, existing.version, true, "", startIdentity, bootId);
     }
     const executable = chromeBinary(options.chromePath);
-    child = spawn(executable, chromeArguments(profileDirectory, "controlled_review", options.mode), { stdio: "ignore", env: chromeEnvironment(options.environment ?? process.env), windowsHide: false });
+    child = spawn(executable, chromeArguments(profileDirectory, "controlled_review", options.mode), { stdio: ["ignore", "ignore", "pipe"], env: chromeEnvironment(options.environment ?? process.env), windowsHide: false });
+    launchDiagnostic = captureChromeStderr(child);
     const endpoint = await waitForEndpoint(profileDirectory, child, options.startupTimeoutMs ?? 30_000);
     cdp = await new CdpClient(endpoint, 5_000).connect();
     const version = await cdp.send<Record<string, unknown>>("Browser.getVersion");
     if (typeof version.product !== "string" || !/Chrome|Chromium/i.test(version.product)) throw new Error("The launched browser did not identify itself as Chromium.");
-    return createHandle(child.pid, version, false);
+    const [startIdentity, bootId] = child.pid
+      ? await Promise.all([processStartIdentity(child.pid), bootIdentity()])
+      : [undefined, undefined];
+    return createHandle(child.pid, version, false, launchDiagnostic(), startIdentity, bootId);
   } catch (error) {
     await cdp?.close().catch(() => undefined);
     if (child?.pid && child.exitCode === null) {
@@ -270,38 +496,53 @@ export async function launchOrReconnectChrome(options: ChromeProcessOptions): Pr
     throw error;
   }
 
-  function createHandle(browserPid: number | undefined, version: Record<string, unknown>, reused: boolean): OwnedChrome {
+  function createHandle(browserPid: number | undefined, version: Record<string, unknown>, reused: boolean, diagnostic: string, startIdentity?: string, bootId?: string): OwnedChrome {
     const activeCdp = cdp!;
     return {
       profileDirectory,
       generation: options.generation,
       browserPid,
+      processStartIdentity: startIdentity,
+      bootIdentity: bootId,
       version,
+      launchDiagnostics: { product: String(version.product ?? "unknown"), remoteDebuggingEnabled: true, stderr: diagnostic },
       cdp: activeCdp,
       reused,
       async detach() {
         if (stopped) return;
-        stopped = true;
         await activeCdp.close().catch(() => undefined);
         await releaseLock();
+        stopped = true;
       },
       async close() {
         if (stopped) return;
-        stopped = true;
-        let closedByBrowser = false;
-        try { await activeCdp.send("Browser.close", {}, undefined, 5_000); closedByBrowser = true; } catch { /* the process exit observation below decides recovery */ }
+        try { await activeCdp.send("Browser.close", {}, undefined, 5_000); } catch { /* the process exit observation below decides recovery */ }
         await activeCdp.close().catch(() => undefined);
         if (child) {
           const exited = await waitForExit(child, 8_000);
           if (!exited) {
             const pidMatches = await chromePidForProfile(profileDirectory).catch(() => undefined);
-            if (pidMatches === child.pid) { child.kill("SIGTERM"); await waitForExit(child, 2_000); }
+            if (pidMatches !== child.pid) throw new Error("Could not prove ownership of the Chrome process during shutdown; profile lock remains held.");
+            child.kill("SIGTERM");
+            if (!await waitForExit(child, 2_000)) throw new Error("Chrome did not exit after shutdown; profile lock remains held.");
           }
         } else if (reused && browserPid) {
-          const pidMatches = await chromePidForProfile(profileDirectory).catch(() => undefined);
-          if (pidMatches === browserPid && !closedByBrowser) throw new Error("Could not safely stop the reconnected Chromium process.");
+          if (!await waitForOwnedProcessExit({ pid: browserPid, processStartIdentity: startIdentity, bootIdentity: bootId }, 8_000)) {
+            const pidMatches = await chromePidForProfile(profileDirectory).catch(() => undefined);
+            const currentIdentity = await inspectOwnedProcess({ pid: browserPid, processStartIdentity: startIdentity, bootIdentity: bootId });
+            if (pidMatches !== browserPid || currentIdentity !== "same") throw new Error("Could not prove ownership of the reconnected Chrome process; profile lock remains held.");
+            try { process.kill(browserPid, "SIGTERM"); }
+            catch { throw new Error("Could not stop the reconnected Chrome process; profile lock remains held."); }
+            if (!await waitForOwnedProcessExit({ pid: browserPid, processStartIdentity: startIdentity, bootIdentity: bootId }, 2_000)) {
+              throw new Error("Reconnected Chrome did not exit after shutdown; profile lock remains held.");
+            }
+          }
+        }
+        if (await chromePidForProfile(profileDirectory)) {
+          throw new Error("Chrome still owns the reviewer profile after shutdown; the profile lock remains held.");
         }
         await releaseLock();
+        stopped = true;
       },
     };
   }

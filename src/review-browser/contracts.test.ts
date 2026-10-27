@@ -1,17 +1,18 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, stat } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdtemp, mkdir, readFile, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDatabase } from "../db/client.js";
 import { createReviewerBrowserProfileStore } from "./profile-store.js";
 import { createReviewerBrowserController } from "./browser-controller.js";
 import { createReviewRouteStore } from "../review-handoff/route-store.js";
 import { createReviewThreadStore } from "../review-thread/thread-store.js";
-import { bindReviewerTarget, canonicalReviewerConversation, restoreReviewerTarget, reviewerConversationFingerprint } from "./target-binding.js";
+import { bindReviewerTarget, canonicalReviewerConversation, restoreReviewerTarget, reviewerConversationFingerprint, ReviewerTargetError } from "./target-binding.js";
 import type { CdpClient } from "./cdp-client.js";
-import { ChatGptPageDriver, type TurnBaseline } from "./chatgpt-page-driver.js";
+import { BrowserReadinessError, ChatGptPageDriver, type TurnBaseline } from "./chatgpt-page-driver.js";
 import type { BoundReviewerTarget } from "./target-binding.js";
-import { chromeArguments } from "./chrome-process.js";
+import { acquireReviewerProfileLock, chromeArguments, inspectChromeProfileOwner, isOfficialChromeInstallPath } from "./chrome-process.js";
 import { createReviewerTurnDispatcher } from "./turn-dispatcher.js";
 
 const root = await mkdtemp(join(tmpdir(), "kontrol-review-browser-test-"));
@@ -26,6 +27,42 @@ try {
   const controlledArgs = chromeArguments("/private/reviewer-profile", "controlled_review", "headed");
   assert.ok(controlledArgs.includes("--remote-debugging-address=127.0.0.1"));
   assert.ok(controlledArgs.includes("--user-data-dir=/private/reviewer-profile"), "both modes use the same dedicated profile");
+  assert.equal(isOfficialChromeInstallPath("linux", "/opt/google/chrome/google-chrome"), true);
+  assert.equal(isOfficialChromeInstallPath("linux", "/tmp/custom-chromium"), false,
+    "an explicitly configured arbitrary executable is not accepted for manual authentication");
+  {
+    const lockProfile = join(root, "lock-profile");
+    await mkdir(lockProfile, { recursive: true, mode: 0o700 });
+    await writeFile(join(lockProfile, "kontrol-controller.lock"), JSON.stringify({ pid: 2_000_000, generation: 8, lockId: "dead-owner" }));
+    const acquisitions = await Promise.allSettled([
+      acquireReviewerProfileLock(lockProfile, 9),
+      acquireReviewerProfileLock(lockProfile, 10),
+    ]);
+    assert.equal(acquisitions.filter((result) => result.status === "fulfilled").length, 1,
+      "concurrent controllers cannot both reclaim a conclusively dead owner's lock");
+    const acquired = acquisitions.find((result): result is PromiseFulfilledResult<() => Promise<void>> => result.status === "fulfilled")!;
+    const record = JSON.parse(await readFile(join(lockProfile, "kontrol-controller.lock"), "utf8")) as { pid: number; generation: number; lockId: string };
+    assert.equal(record.pid, process.pid);
+    assert.ok([9, 10].includes(record.generation));
+    assert.notEqual(record.lockId, "dead-owner");
+    await acquired.value();
+    await writeFile(join(lockProfile, "kontrol-controller.lock"), JSON.stringify({ pid: process.pid, generation: 10, lockId: "live-owner" }));
+    await assert.rejects(acquireReviewerProfileLock(lockProfile, 11), /owns this profile|cannot be verified/i,
+      "a live owner cannot be displaced");
+    const inaccessibleProfile = join(root, "inaccessible-lock-profile");
+    await mkdir(inaccessibleProfile, { recursive: true, mode: 0o700 });
+    const inaccessiblePid = 2_000_001;
+    await writeFile(join(inaccessibleProfile, "kontrol-controller.lock"), JSON.stringify({ pid: inaccessiblePid, generation: 10, lockId: "inaccessible-owner" }));
+    const originalKill = process.kill;
+    process.kill = ((pid: number, signal?: number | NodeJS.Signals) => {
+      if (pid === inaccessiblePid) throw Object.assign(new Error("permission denied"), { code: "EPERM" });
+      return originalKill(pid, signal);
+    }) as typeof process.kill;
+    try {
+      await assert.rejects(acquireReviewerProfileLock(inaccessibleProfile, 11), /owns this profile|cannot be verified/i,
+        "an inaccessible owner is not mistaken for a stale lock");
+    } finally { process.kill = originalKill; }
+  }
   for (const url of ["http://chatgpt.com/c/conversation_12345678", "https://chatgpt.com/", "https://chatgpt.com/c/short", "https://evil.example/c/conversation_12345678"]) {
     assert.throws(() => canonicalReviewerConversation(url));
   }
@@ -47,6 +84,71 @@ try {
   const restored = await restoreReviewerTarget({ cdp: fakeCdp, binding: { ...binding, targetId: "closed-tab" }, browserGeneration: 3 });
   assert.equal(restored.targetId, "tab-1", "restoration finds the exact conversation instead of selecting the first tab");
   assert.equal(restored.browserGeneration, 3);
+  targets[0]!.url = "https://accounts.google.com/signin";
+  await assert.rejects(bindReviewerTarget({ cdp: fakeCdp, profileId: "reviewer", reviewThreadId: "thread-1", browserGeneration: 2, targetId: "tab-1", bindingRevision: 2 }),
+    (error: unknown) => error instanceof Error && (error as { code?: string }).code === "identity_provider_rejected",
+    "a selected identity-provider page is never treated as a conversation");
+  await assert.rejects(restoreReviewerTarget({ cdp: fakeCdp, binding, browserGeneration: 3 }),
+    (error: unknown) => error instanceof Error && (error as { code?: string }).code === "identity_provider_rejected",
+    "restoration classifies a bound tab redirected to Google as an authentication block");
+  targets[0]!.url = canonical.url;
+
+  let racingReads = 0;
+  let racingDetachCalls = 0;
+  const racingCdp = {
+    async send(method: string) {
+      if (method === "Target.getTargets") {
+        racingReads += 1;
+        return { targetInfos: [{ targetId: "racing-tab", type: "page", url: racingReads === 1 ? canonical.url : "https://chatgpt.com/c/other_12345678", title: "Review" }] };
+      }
+      if (method === "Target.attachToTarget") return { sessionId: "racing-session" };
+      if (method === "Target.detachFromTarget") { racingDetachCalls += 1; return {}; }
+      return {};
+    },
+  } as unknown as CdpClient;
+  await assert.rejects(bindReviewerTarget({ cdp: racingCdp, profileId: "reviewer", reviewThreadId: "thread-race", browserGeneration: 2, targetId: "racing-tab", bindingRevision: 1 }),
+    (error: unknown) => error instanceof Error && (error as { code?: string }).code === "wrong_conversation",
+    "a tab that changes conversations during attachment fails closed");
+  assert.equal(racingDetachCalls, 1, "a failed exact-target attachment detaches its CDP session");
+
+  const ambiguousCdp = {
+    async send(method: string) {
+      if (method === "Target.getTargets") return { targetInfos: [
+        { targetId: "duplicate-a", type: "page", url: canonical.url, title: "Review A" },
+        { targetId: "duplicate-b", type: "page", url: canonical.url, title: "Review B" },
+      ] };
+      return {};
+    },
+  } as unknown as CdpClient;
+  await assert.rejects(restoreReviewerTarget({ cdp: ambiguousCdp, binding: { ...binding, targetId: "closed-tab" }, browserGeneration: 3 }),
+    (error: unknown) => error instanceof Error && (error as { code?: string }).code === "target_ambiguous",
+    "multiple tabs with the saved conversation require explicit recovery");
+
+  const navigatingTargets: Array<{ targetId: string; type: string; url: string; title: string }> = [];
+  let navigationReads = 0;
+  const navigatingCdp = {
+    async send(method: string, params: Record<string, unknown> = {}) {
+      if (method === "Target.getTargets") {
+        navigationReads += 1;
+        const target = navigatingTargets[0];
+        if (target && navigationReads >= 3) target.url = canonical.url;
+        return { targetInfos: navigatingTargets };
+      }
+      if (method === "Target.createTarget") {
+        navigatingTargets.push({ targetId: "navigating-tab", type: "page", url: "about:blank", title: "" });
+        return { targetId: "navigating-tab" };
+      }
+      if (method === "Target.attachToTarget") return { sessionId: "navigating-session" };
+      return {};
+    },
+  } as unknown as CdpClient;
+  const navigated = await restoreReviewerTarget({
+    cdp: navigatingCdp,
+    binding: { ...binding, targetId: "closed-tab" },
+    browserGeneration: 3,
+  });
+  assert.equal(navigated.targetId, "navigating-tab", "restoration waits for the exact new target to finish navigation");
+  assert.ok(navigationReads >= 5, "restoration observes a stable exact conversation after navigation");
 
   const db = openDatabase(join(root, "state"));
   try {
@@ -70,30 +172,50 @@ try {
     const handoffLaunch = new Promise<any>((resolve) => { releaseHandoffLaunch = resolve; });
     let manualExited = false;
     let manualCloseCalls = 0;
-    const fakeChrome = (generation: number, authenticated = false) => ({
+    let controlledCloseCalls = 0;
+    let handoffDiagnosticCreated = false;
+    let handoffRedirectsGoogle = false;
+    let handoffTabs: Array<{ targetId: string; type: string; url: string; title: string }> = [];
+    const fakeChrome = (generation: number, authenticated = false, emptyTabs = false) => {
+      const targets: Array<{ targetId: string; type: string; url: string; title: string }> = emptyTabs ? [] : [
+        { targetId: "auth-tab", type: "page", url: "https://chatgpt.com/", title: "ChatGPT" },
+        { targetId: "review-tab", type: "page", url: "https://chatgpt.com/c/conversation_binding1", title: "Review" },
+      ];
+      if (emptyTabs) handoffTabs = targets;
+      return ({
       profileDirectory: join(root, "controller-state", "profile"), generation, browserPid: 999,
       version: { product: "Chrome/test" }, reused: false,
-      cdp: { async send(method: string) {
-        if (method === "Target.getTargets") return { targetInfos: [
-          { targetId: "auth-tab", type: "page", url: "https://chatgpt.com/", title: "ChatGPT" },
-          { targetId: "review-tab", type: "page", url: "https://chatgpt.com/c/conversation_binding1", title: "Review" },
-        ] };
+      launchDiagnostics: { product: "Google Chrome 136.0", remoteDebuggingEnabled: true, stderr: "" },
+      cdp: { async send(method: string, params: Record<string, unknown> = {}) {
+        if (method === "Browser.getVersion") return { product: "Chrome/test" };
+        if (method === "Target.getTargets") return { targetInfos: targets };
+        if (method === "Target.createTarget") {
+          handoffDiagnosticCreated = true;
+          targets.push({ targetId: "diagnostic-tab", type: "page", url: handoffRedirectsGoogle ? "https://accounts.google.com/signin" : String(params.url), title: "ChatGPT" });
+          return { targetId: "diagnostic-tab" };
+        }
         if (method === "Target.attachToTarget") return { sessionId: "auth-session" };
-        if (method === "Runtime.evaluate") return { result: { value: { authenticated, loginRequired: false, verificationRequired: false } } };
+        if (method === "Runtime.evaluate") return { result: { value: {
+          status: "ready", url: "https://chatgpt.com/c/conversation_binding1", key: "conversation_binding1",
+          authenticated, loginRequired: false, verificationRequired: false, unsupportedBrowser: false,
+        } } };
         return {};
       } },
-      async detach() {}, async close() {},
-    });
+      async detach() {}, async close() { controlledCloseCalls += 1; },
+      });
+    };
     const controller = createReviewerBrowserController({
       database: controllerDb, stateDir: join(root, "controller-state"),
       launchControlled: async (options) => {
         controlledLaunches += 1;
         if (controlledLaunches === 1) return initialLaunch;
         if (controlledLaunches === 2) return handoffLaunch;
-        return fakeChrome(options.generation, true) as any;
+        return fakeChrome(options.generation, true, handoffRedirectsGoogle) as any;
       },
       launchManualAuthentication: async (options) => ({
         browserPid: 1000,
+        browserProduct: "Google Chrome 136.0",
+        launchDiagnostic: () => "",
         hasExited: () => manualExited,
         async releaseAfterExit() { if (!manualExited) throw new Error("still running"); },
         async close() { manualCloseCalls += 1; manualExited = true; return true; },
@@ -109,8 +231,17 @@ try {
         "manual auth cannot overlap a profile start");
       releaseInitialLaunch(fakeChrome(1) as any);
       await Promise.all([startA, startB]);
+      assert.ok(controller.profiles.get("controller-test")?.browserReadyAt, "successful process and CDP startup records browser readiness");
+      assert.equal(controller.profiles.get("controller-test")?.authState, "unknown",
+        "a controlled-browser launch without an authentication observation remains unknown");
+      assert.equal(controller.profiles.get("controller-test")?.lastVerifiedAt, undefined,
+        "starting a browser does not claim that ChatGPT authentication was verified");
       const auth = await controller.beginManualAuthentication("controller-test");
       assert.equal(auth.generation, 2);
+      assert.equal(auth.browserLaunchDiagnostic, "", "manual Chrome launch diagnostics are returned after redaction");
+      assert.equal(controller.profiles.get("controller-test")?.browserProduct, "Google Chrome 136.0");
+      assert.equal(controller.profiles.get("controller-test")?.remoteDebuggingEnabled, false,
+        "the profile records that the manual authentication launch had no CDP endpoint");
       assert.equal(controller.profiles.get("controller-test")?.authState, "manual_auth_in_progress");
       await assert.rejects(controller.startProfile("controller-test"), /manual authentication owns this profile/i,
         "controlled mode cannot start while ordinary Chrome owns the profile");
@@ -119,10 +250,22 @@ try {
       for (let i = 0; i < 50 && controlledLaunches < 2; i += 1) await new Promise((resolve) => setTimeout(resolve, 2));
       await assert.rejects(controller.startProfile("controller-test"), /operation is already running/i,
         "profile restart cannot overlap authentication handoff verification");
-      releaseHandoffLaunch(fakeChrome(3, true) as any);
+      releaseHandoffLaunch(fakeChrome(3, true, true) as any);
       const completed = await completing;
       assert.equal(completed.status, "authenticated", "controlled relaunch verifies the persisted ChatGPT session");
+      assert.equal(handoffDiagnosticCreated, true, "an empty restored-tab list opens one diagnostic ChatGPT tab before checking authentication");
       assert.equal(controller.profiles.get("controller-test")?.authState, "authenticated");
+      assert.ok(controller.profiles.get("controller-test")?.lastVerifiedAt, "lastVerifiedAt records positive ChatGPT authentication observation");
+      handoffRedirectsGoogle = true;
+      manualExited = false;
+      await controller.beginManualAuthentication("controller-test");
+      manualExited = true;
+      const rejectedIdentityProvider = await controller.completeManualAuthentication("controller-test");
+      assert.equal(rejectedIdentityProvider.status, "auth_blocked", "a diagnostic-tab redirect to Google ends the handoff as an authentication block");
+      assert.equal(rejectedIdentityProvider.reason, "identity_provider_rejected_after_handoff");
+      assert.equal(controller.profiles.get("controller-test")?.authState, "auth_blocked");
+      handoffRedirectsGoogle = false;
+      handoffTabs.push({ targetId: "review-tab", type: "page", url: "https://chatgpt.com/c/conversation_binding1", title: "Review" });
 
       controllerDb.sqlite.prepare("insert into workspace_sessions (id, root, status, mode, managed, created_at, last_used_at) values (?, '/tmp', 'active', 'checkout', 'false', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')")
         .run("ws-controller-binding");
@@ -141,6 +284,18 @@ try {
         profileId: "controller-test", reviewThreadId: thread.id, targetId: "review-tab", principalId: "reviewer-1",
       });
       assert.equal(binding.bindingRevision, 1);
+      const boundTarget = handoffTabs.find((candidate) => candidate.targetId === "review-tab")!;
+      const savedReviewUrl = boundTarget.url;
+      boundTarget.url = "https://accounts.google.com/signin";
+      await assert.rejects(controller.restoreThread(thread.id),
+        (error: unknown) => error instanceof Error && (error as { readiness?: string }).readiness === "identity_provider_rejected",
+        "Google redirects from a bound conversation become a typed authentication block");
+      assert.equal(controller.profiles.get("controller-test")?.authState, "auth_blocked",
+        "an identity-provider redirect suspends the profile instead of leaving it eligible for automatic retry");
+      boundTarget.url = savedReviewUrl;
+      const restoredAfterAuth = await controller.restoreThread(thread.id);
+      assert.equal(restoredAfterAuth.readiness?.status, "ready",
+        "a fresh positive authenticated observation clears the transient identity-provider block");
       const now = new Date().toISOString();
       controllerDb.sqlite.prepare(`insert into review_thread_messages
         (id, thread_id, route_epoch, work_session_id, handoff_id, submission_id, review_epoch, round_number, kind,
@@ -160,7 +315,12 @@ try {
       await assert.rejects(controller.bindConversation({
         profileId: "controller-test", reviewThreadId: thread.id, targetId: "review-tab", principalId: "reviewer-1",
       }), /active browser turn/i, "target rebinding cannot race a claimed prompt after the physical dispatch boundary");
+      const health = await controller.inspectHealth("controller-test");
+      assert.equal(health.cdpConnection, "connected");
+      assert.deepEqual(health.bindings, { bound: 0, recoveryRequired: 1, other: 0 });
+      assert.deepEqual(health.dispatch, { queued: 0, active: 1, uncertain: 0, blocked: 0 });
       await controller.close();
+      assert.ok(controlledCloseCalls >= 2, "controller shutdown closes the owned CDP browser instead of detaching and leaving its endpoint running");
     } finally { controllerDb.close(); }
 
     const shutdownDb = openDatabase(join(root, "controller-shutdown-state"));
@@ -168,6 +328,8 @@ try {
     const shutdownController = createReviewerBrowserController({
       database: shutdownDb, stateDir: join(root, "controller-shutdown-state"),
       launchManualAuthentication: async () => ({
+        browserProduct: "Google Chrome 136.0",
+        launchDiagnostic: () => "",
         hasExited: () => false,
         async releaseAfterExit() {},
         async close() { shutdownManualCloseCalls += 1; return true; },
@@ -179,6 +341,124 @@ try {
       await shutdownController.close();
       assert.equal(shutdownManualCloseCalls, 1, "controller shutdown closes an ordinary Chrome authentication process and releases ownership");
     } finally { shutdownDb.close(); }
+
+    const restartDb = openDatabase(join(root, "controller-restart-state"));
+    let restartLaunches = 0;
+    let simulatedSessionSurvives = true;
+    const restartedController = createReviewerBrowserController({
+      database: restartDb,
+      stateDir: join(root, "controller-restart-state"),
+      launchControlled: async (options) => {
+        restartLaunches += 1;
+        return {
+          profileDirectory: options.profileDirectory, generation: options.generation, browserPid: 777,
+          version: { product: "Chrome/test" }, reused: false,
+          launchDiagnostics: { product: "Chrome/test", remoteDebuggingEnabled: true, stderr: "" },
+          cdp: { async send(method: string) {
+            if (method === "Target.getTargets") return { targetInfos: [{ targetId: "recovered-auth-tab", type: "page", url: "https://chatgpt.com/", title: "ChatGPT" }] };
+            if (method === "Target.attachToTarget") return { sessionId: "recovered-auth-session" };
+            if (method === "Runtime.evaluate") return { result: { value: { url: "https://chatgpt.com/", authenticated: simulatedSessionSurvives, loginRequired: !simulatedSessionSurvives, verificationRequired: false, unsupportedBrowser: false } } };
+            return {};
+          } },
+          async detach() {}, async close() {},
+        } as any;
+      },
+    });
+    try {
+      restartedController.createProfile({ profileId: "restart-auth", ownerPrincipalId: "reviewer-1" });
+      restartedController.profiles.transition({ profileId: "restart-auth", expectedGeneration: 0, status: "starting", authState: "manual_auth_in_progress" });
+      restartedController.profiles.transition({
+        profileId: "restart-auth", expectedGeneration: 1, status: "login_required", authState: "manual_auth_in_progress",
+        manualAuthOwner: { pid: 2_000_000, generation: 1 },
+      });
+      const recovered = await restartedController.completeManualAuthentication("restart-auth");
+      assert.equal(recovered.status, "authenticated", "a restarted controller reconciles a durably recorded, conclusively dead manual-browser owner");
+      assert.equal(restartedController.profiles.get("restart-auth")?.manualAuthPid, undefined, "completed handoff clears durable manual-process ownership");
+      assert.equal(restartedController.profiles.get("restart-auth")?.authState, "authenticated");
+      simulatedSessionSurvives = false;
+      restartedController.createProfile({ profileId: "restart-expired", ownerPrincipalId: "reviewer-1" });
+      restartedController.profiles.transition({ profileId: "restart-expired", expectedGeneration: 0, status: "starting", authState: "manual_auth_in_progress" });
+      restartedController.profiles.transition({ profileId: "restart-expired", expectedGeneration: 1, status: "login_required", authState: "manual_auth_in_progress",
+        manualAuthOwner: { pid: 2_000_001, generation: 1 } });
+      const expiredSession = await restartedController.completeManualAuthentication("restart-expired");
+      assert.equal(expiredSession.status, "auth_required", "a session that does not survive CDP relaunch returns to manual authentication");
+      assert.equal(expiredSession.reason, "chatgpt_session_not_authenticated_after_browser_handoff");
+      assert.equal(restartedController.profiles.get("restart-expired")?.lastVerifiedAt, undefined,
+        "a failed relaunch authentication observation never records lastVerifiedAt");
+      restartedController.createProfile({ profileId: "restart-live", ownerPrincipalId: "reviewer-1" });
+      restartedController.profiles.transition({ profileId: "restart-live", expectedGeneration: 0, status: "starting", authState: "manual_auth_in_progress" });
+      restartedController.profiles.transition({ profileId: "restart-live", expectedGeneration: 1, status: "login_required", authState: "manual_auth_in_progress",
+        manualAuthOwner: { pid: process.pid, generation: 1 } });
+      const launchCountBeforeLiveOwner = restartLaunches;
+      const liveOwnerResult = await restartedController.completeManualAuthentication("restart-live");
+      assert.equal(liveOwnerResult.status, "auth_required", "a live or identity-ambiguous manual browser owner is not presumed closed after restart");
+      assert.equal(liveOwnerResult.reason, "manual_browser_owner_unverified");
+      assert.equal(restartLaunches, launchCountBeforeLiveOwner, "controlled CDP launch waits until durable manual-browser ownership is resolved");
+    } finally { restartDb.close(); }
+  }
+
+  {
+    const crashDb = openDatabase(join(root, "manual-auth-crash-reconciliation"));
+    let controlledLaunches = 0;
+    const crashController = createReviewerBrowserController({
+      database: crashDb,
+      stateDir: join(root, "manual-auth-crash-reconciliation"),
+      launchControlled: async (options) => {
+        controlledLaunches += 1;
+        return {
+          profileDirectory: options.profileDirectory, generation: options.generation, browserPid: 876,
+          version: { product: "Chrome/test" }, reused: false,
+          launchDiagnostics: { product: "Chrome/test", remoteDebuggingEnabled: true, stderr: "" },
+          cdp: { async send(method: string) {
+            if (method === "Target.getTargets") return { targetInfos: [{ targetId: "post-crash-tab", type: "page", url: "https://chatgpt.com/c/crash_12345678", title: "ChatGPT" }] };
+            if (method === "Target.attachToTarget") return { sessionId: "post-crash-session" };
+            if (method === "Runtime.evaluate") return { result: { value: {
+              status: "ready", url: "https://chatgpt.com/c/crash_12345678", key: "crash_12345678",
+              authenticated: true, loginRequired: false, verificationRequired: false, unsupportedBrowser: false,
+            } } };
+            return {};
+          } },
+          async detach() {}, async close() {},
+        } as any;
+      },
+    });
+    let simulatedChrome: ReturnType<typeof spawn> | undefined;
+    try {
+      crashController.createProfile({ profileId: "crash-handoff", ownerPrincipalId: "reviewer-1" });
+      crashController.profiles.transition({ profileId: "crash-handoff", expectedGeneration: 0, status: "starting", authState: "manual_auth_in_progress" });
+      const directory = await crashController.profiles.profileDirectory("crash-handoff");
+      simulatedChrome = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", `--user-data-dir=${directory}`], { stdio: "ignore" });
+      await new Promise<void>((resolve, reject) => {
+        simulatedChrome!.once("spawn", resolve);
+        simulatedChrome!.once("error", reject);
+      });
+      await symlink(`${hostname()}-${simulatedChrome.pid}`, join(directory, "SingletonLock"));
+      const observedOwner = await inspectChromeProfileOwner(directory);
+      assert.equal(observedOwner.status, "owned", "Chrome's actual profile lock recovers ownership before its PID reaches the database");
+      assert.equal(observedOwner.pid, simulatedChrome.pid);
+      const reconciled = await crashController.completeManualAuthentication("crash-handoff");
+      assert.equal(reconciled.status, "auth_required", "a crash between Chrome startup and PID persistence remains a manual handoff");
+      assert.equal(reconciled.reason, "close_all_chrome_windows_before_handoff");
+      assert.equal(crashController.profiles.get("crash-handoff")?.manualAuthPid, simulatedChrome.pid,
+        "recovered Chrome ownership is persisted for the next restart-safe reconciliation");
+      assert.equal(controlledLaunches, 0, "CDP never launches over an ordinarily controlled Chrome profile");
+      const childClosed = new Promise<void>((resolve) => simulatedChrome!.once("close", () => resolve()));
+      simulatedChrome.kill("SIGTERM");
+      await childClosed;
+      simulatedChrome = undefined;
+      await unlink(join(directory, "SingletonLock"));
+      const completed = await crashController.completeManualAuthentication("crash-handoff");
+      assert.equal(completed.status, "authenticated", "the recovered handoff continues after ordinary Chrome exits");
+      assert.equal(controlledLaunches, 1);
+    } finally {
+      if (simulatedChrome && simulatedChrome.exitCode === null) {
+        const childClosed = new Promise<void>((resolve) => simulatedChrome!.once("close", () => resolve()));
+        simulatedChrome.kill("SIGTERM");
+        await childClosed;
+      }
+      await crashController.close();
+      crashDb.close();
+    }
   }
 
   const driverCommands: string[] = [];
@@ -205,6 +485,20 @@ try {
   } as unknown as CdpClient;
   const pageTarget: BoundReviewerTarget = { targetId: "tab-1", sessionId: "session-1", conversationUrl: canonical.url, conversationKey: canonical.key, browserGeneration: 2 };
   const driver = new ChatGptPageDriver(driverCdp, pageTarget);
+  let identityProviderExpression = "";
+  const identityProviderDriver = new ChatGptPageDriver({
+    async send(method: string, params: Record<string, unknown> = {}) {
+      if (method === "Runtime.evaluate") {
+        identityProviderExpression = String(params.expression);
+        return { result: { value: { status: "identity_provider_rejected" } } };
+      }
+      return {};
+    },
+  } as unknown as CdpClient, pageTarget);
+  assert.deepEqual(await identityProviderDriver.inspect(), { status: "identity_provider_rejected" },
+    "an identity-provider destination is classified without scraping its page body");
+  assert.ok(identityProviderExpression.indexOf("accounts.google.com") < identityProviderExpression.indexOf("document.body"),
+    "Google destination detection returns before any identity-provider body is read");
   const baseline = await driver.captureBaseline();
   const sent = await driver.submitPrompt({ prompt: "bounded review packet", attemptId: "attempt-1", expectedConversationKey: canonical.key, baseline });
   assert.equal(sent.status, "accepted", JSON.stringify(sent));
@@ -330,6 +624,110 @@ try {
   assert.equal(acceptedThenAckFailed.transitions.at(-1), "uncertain", "a lost durable acknowledgement after host acceptance keeps the send boundary uncertain");
   assert.equal(acceptedThenAckFailed.wasCompleted(), true, "the accepted prompt's outbox item is fenced against redelivery after acknowledgement failure");
   await acceptedThenAckFailed.dispatcher.stopAndDrain();
+
+  {
+    const event = { id: "event-auth-handoff", aggregateId: "message-auth-handoff", payload: { messageId: "message-auth-handoff", threadId: "thread-auth-handoff", profileId: "profile-auth-handoff" }, status: "claimed", claimToken: "token", claimedBy: "worker" };
+    let suspended = false;
+    let launched = false;
+    let eventClaimed = false;
+    const dispatcher = createReviewerTurnDispatcher({
+      outbox: {
+        subscribe: () => () => undefined, reapExpiredClaims: () => 0,
+        claimNext: () => { if (eventClaimed) return null; eventClaimed = true; return event; }, listPending: () => [], get: () => event,
+        markSuspended: (_claim: unknown, reason: string) => { suspended = reason === "review_browser_auth_suspended:handoff_pending"; return true; },
+        markFailed: () => false, markCompleted: () => false,
+      } as any,
+      jobs: { claim: () => { throw new Error("auth-blocked work must remain queued before attempt claim"); }, reconcileExpiredAttempts: () => ({ reconciled: 0, uncertain: 0, fenced: 0 }) } as any,
+      browser: {
+        profiles: { get: () => ({ id: "profile-auth-handoff", generation: 3, status: "login_required", mode: "headed", authState: "handoff_pending" }) },
+        startProfile: async () => { launched = true; throw new Error("authentication blocks must not auto-restart Chrome"); },
+      } as any,
+    });
+    dispatcher.start();
+    await dispatcher.drainOnce();
+    assert.equal(suspended, true, "queued work stays suspended while ordinary Chrome authentication ownership is unresolved");
+    assert.equal(launched, false, "a pending manual-auth handoff never triggers automatic controlled-browser restart");
+    await dispatcher.stopAndDrain();
+  }
+
+  {
+    const event = { id: "event-binding-ambiguous", aggregateId: "message-binding-ambiguous", payload: { messageId: "message-binding-ambiguous", threadId: "thread-binding-ambiguous", profileId: "profile-binding-ambiguous" }, status: "claimed", claimToken: "token", claimedBy: "worker" };
+    let suspensionReason = "";
+    let eventClaimed = false;
+    let attemptClaimed = false;
+    const dispatcher = createReviewerTurnDispatcher({
+      outbox: {
+        subscribe: () => () => undefined, reapExpiredClaims: () => 0,
+        claimNext: () => { if (eventClaimed) return null; eventClaimed = true; return event; }, listPending: () => [], get: () => event,
+        markSuspended: (_claim: unknown, reason: string) => { suspensionReason = reason; return true; },
+        markFailed: () => false, markCompleted: () => false,
+      } as any,
+      jobs: { claim: () => { attemptClaimed = true; return undefined; }, reconcileExpiredAttempts: () => ({ reconciled: 0, uncertain: 0, fenced: 0 }) } as any,
+      browser: {
+        profiles: { get: () => ({ id: "profile-binding-ambiguous", generation: 4, status: "ready", mode: "headed", authState: "authenticated" }) },
+        restoreThread: async () => { throw new ReviewerTargetError("target_ambiguous", "Two tabs show the saved conversation."); },
+      } as any,
+    });
+    dispatcher.start();
+    await dispatcher.drainOnce();
+    assert.equal(suspensionReason, "reviewer.browser_binding_suspended:target_ambiguous",
+      "ambiguous exact-target recovery suspends the queued packet without consuming retries");
+    assert.equal(attemptClaimed, false, "no review attempt is claimed until the conversation binding is explicit");
+    await dispatcher.stopAndDrain();
+  }
+
+  {
+    const event = { id: "event-verification-required", aggregateId: "message-verification-required", payload: { messageId: "message-verification-required", threadId: "thread-verification-required", profileId: "profile-verification-required" }, status: "claimed", claimToken: "token", claimedBy: "worker" };
+    let profile = { id: "profile-verification-required", generation: 5, status: "ready", mode: "headed", authState: "authenticated" };
+    let suspensionReason = "";
+    let eventClaimed = false;
+    const dispatcher = createReviewerTurnDispatcher({
+      outbox: {
+        subscribe: () => () => undefined, reapExpiredClaims: () => 0,
+        claimNext: () => { if (eventClaimed) return null; eventClaimed = true; return event; }, listPending: () => [], get: () => event,
+        markSuspended: (_claim: unknown, reason: string) => { suspensionReason = reason; return true; },
+        markFailed: () => false, markCompleted: () => false,
+      } as any,
+      jobs: { claim: () => { throw new Error("a verification challenge must stop before claiming a turn"); }, reconcileExpiredAttempts: () => ({ reconciled: 0, uncertain: 0, fenced: 0 }) } as any,
+      browser: {
+        profiles: { get: () => profile },
+        restoreThread: async () => {
+          profile = { ...profile, status: "blocked", authState: "auth_blocked" };
+          throw new BrowserReadinessError("verification_required");
+        },
+      } as any,
+    });
+    dispatcher.start();
+    await dispatcher.drainOnce();
+    assert.equal(suspensionReason, "review_browser_auth_suspended:verification_required",
+      "verification challenges retain the exact failure category while suspending queued work");
+    await dispatcher.stopAndDrain();
+  }
+
+  {
+    const event = { id: "event-generation-active", aggregateId: "message-generation-active", payload: { messageId: "message-generation-active", threadId: "thread-generation-active", profileId: "profile-generation-active" }, status: "claimed", claimToken: "token", claimedBy: "worker" };
+    let releasedDelay = -1;
+    let claimedAttempt = false;
+    let eventClaimed = false;
+    const dispatcher = createReviewerTurnDispatcher({
+      outbox: {
+        subscribe: () => () => undefined, reapExpiredClaims: () => 0,
+        claimNext: () => { if (eventClaimed) return null; eventClaimed = true; return event; }, listPending: () => [], get: () => event,
+        release: (_claim: unknown, delay: number) => { releasedDelay = delay; return true; },
+        markFailed: () => false, markCompleted: () => false,
+      } as any,
+      jobs: { claim: () => { claimedAttempt = true; return undefined; }, reconcileExpiredAttempts: () => ({ reconciled: 0, uncertain: 0, fenced: 0 }) } as any,
+      browser: {
+        profiles: { get: () => ({ id: "profile-generation-active", generation: 4, status: "busy", mode: "headed", authState: "authenticated" }) },
+        restoreThread: async () => ({ target: pageTarget, driver: {}, readiness: { status: "generation_active", conversationUrl: canonical.url, conversationKey: canonical.key } }),
+      } as any,
+    });
+    dispatcher.start();
+    await dispatcher.drainOnce();
+    assert.equal(claimedAttempt, false, "a generating conversation is not claimed for a second turn");
+    assert.equal(releasedDelay, 5_000, "work waits briefly for the exact conversation generation to settle");
+    await dispatcher.stopAndDrain();
+  }
 
   // Independent selected conversations must progress concurrently; a slow
   // review in one conversation must not hold the global browser dispatcher.

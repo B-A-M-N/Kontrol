@@ -22,10 +22,41 @@ export interface BoundReviewerTarget {
 }
 
 export class ReviewerTargetError extends Error {
-  constructor(readonly code: "wrong_conversation" | "recovery_required" | "target_ambiguous" | "no_target", message: string) {
+  constructor(readonly code: "wrong_conversation" | "recovery_required" | "target_ambiguous" | "no_target" | "navigation_unconfirmed" | "identity_provider_rejected", message: string) {
     super(message);
     this.name = "ReviewerTargetError";
   }
+}
+
+async function waitForExactTarget(input: {
+  cdp: CdpClient; targetId: string; expectedKey: string; timeoutMs?: number;
+}): Promise<{ targetId: string; url: string; title: string }> {
+  const deadline = Date.now() + (input.timeoutMs ?? 10_000);
+  let lastUrl = "";
+  let stableReads = 0;
+  while (Date.now() < deadline) {
+    const target = (await discoverReviewerTargets(input.cdp)).find((candidate) => candidate.targetId === input.targetId);
+    if (!target) throw new ReviewerTargetError("navigation_unconfirmed", "The exact reviewer tab disappeared while its navigation was being confirmed.");
+    if (target.url === lastUrl && target.url !== "about:blank") stableReads += 1;
+    else stableReads = 0;
+    lastUrl = target.url;
+    if (/^https:\/\/accounts\.google\.com\//i.test(target.url)) {
+      throw new ReviewerTargetError("identity_provider_rejected", "The controlled browser navigated to the identity provider; stop and use manual authentication.");
+    }
+    try {
+      if (canonicalReviewerConversation(target.url).key !== input.expectedKey) {
+        throw new ReviewerTargetError("wrong_conversation", "The exact reviewer tab navigated to a different conversation.");
+      }
+      if (stableReads >= 2) return target;
+    } catch (error) {
+      if (error instanceof ReviewerTargetError) throw error;
+      if (target.url !== "about:blank" && !target.url.startsWith("chrome://newtab")) {
+        // Keep waiting through an in-flight redirect, but never select a different tab.
+      }
+    }
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
+  }
+  throw new ReviewerTargetError("navigation_unconfirmed", "The exact reviewer conversation did not finish navigating before the bounded deadline.");
 }
 
 export function canonicalReviewerConversation(value: string): { url: string; key: string } {
@@ -62,6 +93,9 @@ export async function bindReviewerTarget(input: {
   if (!input.targetId.trim()) throw new ReviewerTargetError("no_target", "An exact reviewer tab target ID is required.");
   const info = (await discoverReviewerTargets(input.cdp)).filter((target) => target.targetId === input.targetId);
   if (info.length !== 1) throw new ReviewerTargetError("no_target", "The explicitly selected reviewer tab is no longer available.");
+  if (/^https:\/\/accounts\.google\.com\//i.test(info[0]!.url)) {
+    throw new ReviewerTargetError("identity_provider_rejected", "The selected tab is on the identity provider; use manual authentication before binding a conversation.");
+  }
   const canonical = canonicalReviewerConversation(info[0]!.url);
   if (input.expectedConversationKey && input.expectedConversationKey !== canonical.key) {
     throw new ReviewerTargetError("wrong_conversation", "The selected tab does not match the saved reviewer conversation.");
@@ -69,7 +103,18 @@ export async function bindReviewerTarget(input: {
   const attached = await input.cdp.send<{ sessionId?: string }>("Target.attachToTarget", { targetId: input.targetId, flatten: true });
   if (typeof attached.sessionId !== "string" || !attached.sessionId) throw new ReviewerTargetError("no_target", "Chromium did not attach a CDP session to the selected tab.");
   const rechecked = (await discoverReviewerTargets(input.cdp)).find((target) => target.targetId === input.targetId);
-  if (!rechecked || canonicalReviewerConversation(rechecked.url).key !== canonical.key) {
+  let recheckedKey: string | undefined;
+  try {
+    if (rechecked && /^https:\/\/accounts\.google\.com\//i.test(rechecked.url)) {
+      throw new ReviewerTargetError("identity_provider_rejected", "The selected tab navigated to the identity provider while Kontrol was attaching.");
+    }
+    if (rechecked) recheckedKey = canonicalReviewerConversation(rechecked.url).key;
+  } catch (error) {
+    await input.cdp.send("Target.detachFromTarget", { sessionId: attached.sessionId }).catch(() => undefined);
+    if (error instanceof ReviewerTargetError) throw error;
+    throw new ReviewerTargetError("navigation_unconfirmed", "The selected tab did not retain a verifiable ChatGPT conversation while Kontrol was attaching.");
+  }
+  if (!rechecked || recheckedKey !== canonical.key) {
     await input.cdp.send("Target.detachFromTarget", { sessionId: attached.sessionId }).catch(() => undefined);
     throw new ReviewerTargetError("wrong_conversation", "The reviewer tab navigated while Kontrol was attaching.");
   }
@@ -104,8 +149,22 @@ export async function restoreReviewerTarget(input: {
   let target = input.binding.targetId
     ? (await discoverReviewerTargets(input.cdp)).find((candidate) => candidate.targetId === input.binding.targetId)
     : undefined;
-  if (target && canonicalReviewerConversation(target.url).key !== canonical.key) {
-    throw new ReviewerTargetError("wrong_conversation", "The previously bound browser tab now displays a different conversation.");
+  if (target) {
+    if (/^https:\/\/accounts\.google\.com\//i.test(target.url)) {
+      throw new ReviewerTargetError("identity_provider_rejected", "The controlled browser is on the identity provider; stop and use manual authentication.");
+    }
+    if (target.url === "about:blank" || target.url.startsWith("chrome://newtab")) {
+      target = await waitForExactTarget({ cdp: input.cdp, targetId: target.targetId, expectedKey: canonical.key });
+    } else {
+      try {
+        if (canonicalReviewerConversation(target.url).key !== canonical.key) {
+          throw new ReviewerTargetError("wrong_conversation", "The previously bound browser tab now displays a different conversation.");
+        }
+      } catch (error) {
+        if (error instanceof ReviewerTargetError) throw error;
+        throw new ReviewerTargetError("wrong_conversation", "The previously bound browser tab no longer displays a valid ChatGPT conversation.");
+      }
+    }
   }
   if (!target) {
     const matches = (await discoverReviewerTargets(input.cdp)).filter((candidate) => {
@@ -117,17 +176,15 @@ export async function restoreReviewerTarget(input: {
   if (!target) {
     const created = await input.cdp.send<{ targetId?: string }>("Target.createTarget", { url: canonical.url });
     if (typeof created.targetId !== "string") throw new ReviewerTargetError("no_target", "Chromium could not restore the exact reviewer conversation.");
-    target = (await discoverReviewerTargets(input.cdp)).find((candidate) => candidate.targetId === created.targetId);
-    if (!target || canonicalReviewerConversation(target.url).key !== canonical.key) {
-      throw new ReviewerTargetError("wrong_conversation", "Chromium did not restore the exact saved reviewer conversation.");
-    }
+    target = await waitForExactTarget({ cdp: input.cdp, targetId: created.targetId, expectedKey: canonical.key });
   }
   const attached = await input.cdp.send<{ sessionId?: string }>("Target.attachToTarget", { targetId: target.targetId, flatten: true });
   if (typeof attached.sessionId !== "string") throw new ReviewerTargetError("no_target", "Could not attach to the restored reviewer tab.");
-  const verified = (await discoverReviewerTargets(input.cdp)).find((candidate) => candidate.targetId === target!.targetId);
-  if (!verified || canonicalReviewerConversation(verified.url).key !== canonical.key) {
+  let verified: { targetId: string; url: string; title: string };
+  try { verified = await waitForExactTarget({ cdp: input.cdp, targetId: target.targetId, expectedKey: canonical.key }); }
+  catch (error) {
     await input.cdp.send("Target.detachFromTarget", { sessionId: attached.sessionId }).catch(() => undefined);
-    throw new ReviewerTargetError("wrong_conversation", "Restored tab changed conversation during attachment.");
+    throw error;
   }
   return { targetId: verified.targetId, sessionId: attached.sessionId,
     conversationUrl: canonical.url, conversationKey: canonical.key, browserGeneration: input.browserGeneration };

@@ -1,11 +1,16 @@
 import type { DispatchOutbox, DispatchOutboxEvent, OutboxClaim } from "../dispatch-outbox.js";
 import type { ReviewerBrowserController } from "./browser-controller.js";
 import type { ReviewerJobStore, ReviewerJobClaim } from "../review-thread/reviewer-job-store.js";
+import { BrowserReadinessError } from "./chatgpt-page-driver.js";
+import { ReviewerTargetError } from "./target-binding.js";
 
 const EVENT = "reviewer.browser_turn.ready";
 const LEASE_MS = 30 * 60_000;
 const RENEW_INTERVAL_MS = 5 * 60_000;
 const MAX_INFLIGHT_TURNS = 4;
+const AUTH_FAILURES = new Set(["login_required", "verification_required", "identity_provider_rejected", "identity_provider_unsupported_browser", "session_expired", "authentication_handoff_failed", "connector_authorization_required"]);
+const BINDING_RECOVERY_FAILURES = new Set(["recovery_required", "target_ambiguous", "wrong_conversation"]);
+const RETRYABLE_BROWSER_FAILURES = new Set(["navigation_unconfirmed", "browser_transport_failed", "browser_disconnected"]);
 
 export interface ReviewerTurnDispatcher {
   start(): void;
@@ -34,6 +39,24 @@ export function createReviewerTurnDispatcher(input: {
     if (!input.outbox.markCompleted(claim)) {
       console.warn("reviewer_browser_outbox_completion_fenced", { eventId, ...(attemptId ? { attemptId } : {}) });
     }
+  }
+  function recordAuthenticationBlock(profileId: string, reason: string): void {
+    const current = input.browser.profiles.get(profileId);
+    if (!current || !AUTH_FAILURES.has(reason)) return;
+    try {
+      input.browser.profiles.transition({
+        profileId, expectedGeneration: current.generation,
+        status: reason === "login_required" ? "login_required" : "blocked",
+        authState: reason === "login_required" ? "manual_auth_required" : "auth_blocked",
+      });
+    } catch { /* a concurrent generation transition owns the newer profile state */ }
+  }
+  function recordBrowserTransportFailure(profileId: string, reason: string): void {
+    if (!RETRYABLE_BROWSER_FAILURES.has(reason) || !["browser_transport_failed", "browser_disconnected"].includes(reason)) return;
+    const current = input.browser.profiles.get(profileId);
+    if (!current) return;
+    try { input.browser.profiles.transition({ profileId, expectedGeneration: current.generation, status: "recovering" }); }
+    catch { /* a concurrent generation transition owns the newer profile state */ }
   }
   const activeTurns = new Map<string, { claim: ReviewerJobClaim; profileId: string; generation: number; crossedDispatchBoundary: boolean; shutdownPersisted: boolean; eventClaim: OutboxClaim }>();
   const conversationTails = new Map<string, Promise<void>>();
@@ -68,12 +91,20 @@ export function createReviewerTurnDispatcher(input: {
       input.outbox.markFailed(eventClaim, "review_browser_profile_unavailable", LEASE_MS);
       return;
     }
+    if (["manual_auth_required", "manual_auth_in_progress", "handoff_pending", "auth_blocked"].includes(profile.authState)) {
+      input.outbox.markSuspended(eventClaim, `review_browser_auth_suspended:${profile.authState}`);
+      return;
+    }
     try {
       if (!profile.generation || profile.status === "stopped" || profile.status === "recovering" || profile.status === "blocked") {
         profile = await input.browser.startProfile(profileId, profile.mode);
       }
       const threadId = typeof event.payload.threadId === "string" ? event.payload.threadId : "";
       const restored = await input.browser.restoreThread(threadId);
+      if (restored.readiness?.status === "generation_active") {
+        input.outbox.release(eventClaim, 5_000, "bound_conversation_generation_active");
+        return;
+      }
       if (stopped) {
         input.outbox.markFailed(eventClaim, "shutdown_before_dispatch", LEASE_MS);
         return;
@@ -118,34 +149,64 @@ export function createReviewerTurnDispatcher(input: {
           input.jobs.transition({ attemptId: turnClaim.attemptId, leaseToken: turnClaim.leaseToken, profileId, browserGeneration: profile.generation, nextStatus: "generation_finished" });
           input.jobs.transition({ attemptId: turnClaim.attemptId, leaseToken: turnClaim.leaseToken, profileId, browserGeneration: profile.generation, nextStatus: "awaiting_feedback" });
         } else {
+          if (generation === "blocked") recordAuthenticationBlock(profileId, "session_expired");
           input.jobs.transition({ attemptId: turnClaim.attemptId, leaseToken: turnClaim.leaseToken, profileId, browserGeneration: profile.generation,
             nextStatus: "uncertain", errorCode: generation === "blocked" ? "authentication_lost_during_review" : "generation_observation_unavailable" });
         }
       } else if (result.status === "uncertain") {
+        if (AUTH_FAILURES.has(result.reason)) recordAuthenticationBlock(profileId, result.reason);
         input.jobs.transition({ attemptId: turnClaim.attemptId, leaseToken: turnClaim.leaseToken, profileId, browserGeneration: profile.generation, nextStatus: "uncertain", errorCode: result.reason });
         markCompleted(eventClaim, event.id, turnClaim.attemptId);
       } else {
-        const blocked = ["login_required", "verification_required", "identity_provider_unsupported_browser", "session_expired", "authentication_handoff_failed", "connector_authorization_required"].includes(result.reason);
+        const authBlocked = AUTH_FAILURES.has(result.reason);
+        const blocked = authBlocked || ["authentication_handoff_failed", "connector_authorization_required"].includes(result.reason);
+        if (authBlocked) recordAuthenticationBlock(profileId, result.reason);
+        else recordBrowserTransportFailure(profileId, result.reason);
         input.jobs.transition({ attemptId: turnClaim.attemptId, leaseToken: turnClaim.leaseToken, profileId, browserGeneration: profile.generation, nextStatus: blocked ? "blocked_auth" : "blocked_browser", errorCode: result.reason });
-        markCompleted(eventClaim, event.id, turnClaim.attemptId);
+        if (authBlocked) input.outbox.markSuspended(eventClaim, `review_browser_auth_suspended:${result.reason}`);
+        else if (BINDING_RECOVERY_FAILURES.has(result.reason)) {
+          input.browser.requireBindingRecovery(threadId, result.reason);
+          input.outbox.markSuspended(eventClaim, `reviewer.browser_binding_suspended:${result.reason}`);
+        }
+        else if (RETRYABLE_BROWSER_FAILURES.has(result.reason)) input.outbox.release(eventClaim, 5_000, result.reason);
+        else input.outbox.markFailed(eventClaim, result.reason, LEASE_MS);
       }
     } catch (error) {
       const latest = input.outbox.get(event.id);
       if (turnClaim) {
         const profile = input.browser.profiles.get(profileId!);
+        const readiness = error instanceof BrowserReadinessError ? error.readiness : undefined;
+        const authBlocked = readiness !== undefined && AUTH_FAILURES.has(readiness);
+        const retryableBrowserFailure = readiness !== undefined && RETRYABLE_BROWSER_FAILURES.has(readiness);
+        if (authBlocked) recordAuthenticationBlock(profileId!, readiness!);
+        else if (retryableBrowserFailure) recordBrowserTransportFailure(profileId!, readiness!);
         if (profile) {
           try {
             input.jobs.transition({ attemptId: turnClaim.attemptId, leaseToken: turnClaim.leaseToken, profileId: profileId!, browserGeneration: profile.generation,
-              nextStatus: crossedDispatchBoundary ? "uncertain" : "blocked_browser",
-              errorCode: crossedDispatchBoundary ? "dispatch_result_unavailable" : "browser_not_ready_before_dispatch" });
+              nextStatus: crossedDispatchBoundary ? "uncertain" : authBlocked ? "blocked_auth" : "blocked_browser",
+              errorCode: crossedDispatchBoundary ? "dispatch_result_unavailable" : authBlocked ? readiness : "browser_not_ready_before_dispatch" });
           } catch { /* a stale/fenced attempt remains durable for reconciliation */ }
         }
         if (latest?.status === "claimed") {
           if (crossedDispatchBoundary) markCompleted(eventClaim, event.id, turnClaim.attemptId);
+          else if (authBlocked) input.outbox.markSuspended(eventClaim, `review_browser_auth_suspended:${readiness}`);
+          else if (retryableBrowserFailure) input.outbox.release(eventClaim, 5_000, readiness!);
           else input.outbox.markFailed(eventClaim, "browser_not_ready_before_dispatch", LEASE_MS);
         }
       } else if (latest?.status === "claimed") {
-        input.outbox.markFailed(eventClaim, error instanceof Error ? error.message.slice(0, 300) : "browser_dispatch_failed", LEASE_MS);
+        const latestProfile = input.browser.profiles.get(profileId!);
+        const readiness = error instanceof BrowserReadinessError ? error.readiness : undefined;
+        if (readiness !== undefined && AUTH_FAILURES.has(readiness)) {
+          input.outbox.markSuspended(eventClaim, `review_browser_auth_suspended:${readiness}`);
+        } else if (latestProfile && ["manual_auth_required", "manual_auth_in_progress", "handoff_pending", "auth_blocked"].includes(latestProfile.authState)) {
+          input.outbox.markSuspended(eventClaim, `review_browser_auth_suspended:${latestProfile.authState}`);
+        } else if (error instanceof ReviewerTargetError && BINDING_RECOVERY_FAILURES.has(error.code)) {
+          input.outbox.markSuspended(eventClaim, `reviewer.browser_binding_suspended:${error.code}`);
+        } else if (readiness !== undefined && RETRYABLE_BROWSER_FAILURES.has(readiness)) {
+          input.outbox.release(eventClaim, 5_000, readiness);
+        } else {
+          input.outbox.markFailed(eventClaim, error instanceof Error ? error.message.slice(0, 300) : "browser_dispatch_failed", LEASE_MS);
+        }
       }
     } finally {
       if (leaseHeartbeat) clearInterval(leaseHeartbeat);

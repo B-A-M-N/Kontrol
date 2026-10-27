@@ -16,7 +16,15 @@ export interface ReviewerBrowserProfile {
   status: ReviewerBrowserProfileStatus;
   authState: ReviewerBrowserAuthState;
   generation: number;
+  browserReadyAt?: string;
   lastVerifiedAt?: string;
+  manualAuthPid?: number;
+  manualAuthProcessStartIdentity?: string;
+  manualAuthBootIdentity?: string;
+  manualAuthGeneration?: number;
+  browserProduct?: string;
+  remoteDebuggingEnabled?: boolean;
+  browserLaunchDiagnostic?: string;
 }
 
 const PROFILE_ID = /^[a-z][a-z0-9-]{0,47}$/;
@@ -42,7 +50,15 @@ function fromRow(row: typeof reviewBrowserProfiles.$inferSelect): ReviewerBrowse
     status: row.status as ReviewerBrowserProfileStatus,
     authState: row.authState as ReviewerBrowserAuthState,
     generation: row.generation,
+    browserReadyAt: row.browserReadyAt ?? undefined,
     lastVerifiedAt: row.lastVerifiedAt ?? undefined,
+    manualAuthPid: row.manualAuthPid ?? undefined,
+    manualAuthProcessStartIdentity: row.manualAuthProcessStartIdentity ?? undefined,
+    manualAuthBootIdentity: row.manualAuthBootIdentity ?? undefined,
+    manualAuthGeneration: row.manualAuthGeneration ?? undefined,
+    browserProduct: row.browserProduct ?? undefined,
+    remoteDebuggingEnabled: row.remoteDebuggingEnabled ?? undefined,
+    browserLaunchDiagnostic: row.browserLaunchDiagnostic ?? undefined,
   };
 }
 
@@ -51,7 +67,13 @@ export interface ReviewerBrowserProfileStore {
   get(profileId: string): ReviewerBrowserProfile | undefined;
   listForOwner(ownerPrincipalId: string): ReviewerBrowserProfile[];
   profileDirectory(profileId: string): Promise<string>;
-  transition(input: { profileId: string; expectedGeneration: number; status: ReviewerBrowserProfileStatus; mode?: ReviewerBrowserMode; authState?: ReviewerBrowserAuthState; verified?: boolean }): ReviewerBrowserProfile;
+  transition(input: {
+    profileId: string; expectedGeneration: number; status: ReviewerBrowserProfileStatus;
+    mode?: ReviewerBrowserMode; authState?: ReviewerBrowserAuthState; verified?: boolean; browserReady?: boolean;
+    manualAuthOwner?: { pid: number; generation: number; processStartIdentity?: string; bootIdentity?: string };
+    clearManualAuthOwner?: boolean;
+    browserLaunch?: { product: string; remoteDebuggingEnabled: boolean; diagnostic?: string };
+  }): ReviewerBrowserProfile;
 }
 
 export function createReviewerBrowserProfileStore(database: DatabaseHandle, stateDir: string): ReviewerBrowserProfileStore {
@@ -110,7 +132,24 @@ export function createReviewerBrowserProfileStore(database: DatabaseHandle, stat
         authState: input.authState ?? current.authState,
         mode: input.mode ?? current.mode,
         generation,
+        browserReadyAt: input.browserReady ? now : current.browserReadyAt,
         lastVerifiedAt: input.verified ? now : current.lastVerifiedAt,
+        ...(input.browserLaunch ? {
+          browserProduct: input.browserLaunch.product,
+          remoteDebuggingEnabled: input.browserLaunch.remoteDebuggingEnabled,
+          browserLaunchDiagnostic: input.browserLaunch.diagnostic ?? null,
+        } : {}),
+        ...(input.clearManualAuthOwner ? {
+          manualAuthPid: null,
+          manualAuthProcessStartIdentity: null,
+          manualAuthBootIdentity: null,
+          manualAuthGeneration: null,
+        } : input.manualAuthOwner ? {
+          manualAuthPid: input.manualAuthOwner.pid,
+          manualAuthProcessStartIdentity: input.manualAuthOwner.processStartIdentity ?? null,
+          manualAuthBootIdentity: input.manualAuthOwner.bootIdentity ?? null,
+          manualAuthGeneration: input.manualAuthOwner.generation,
+        } : {}),
         updatedAt: now,
       }).where(and(eq(reviewBrowserProfiles.id, current.id), eq(reviewBrowserProfiles.generation, current.generation))).run();
       if (updated.changes !== 1) throw new Error("Reviewer browser profile transition lost its compare-and-swap.");

@@ -13,6 +13,7 @@ import { forbidden, isReviewer, reviewClaimContextId, reviewOwnerContextId, revi
 import { z } from "zod/v4";
 import { and, desc, eq, sql } from "drizzle-orm";
 import { createReviewPacket } from "../review-thread/review-packet.js";
+import { ManualAuthenticationRequiredError } from "../review-browser/browser-controller.js";
 import { reviewBrowserTurns, reviewThreadMessages } from "../db/schema.js";
 import { createHash } from "node:crypto";
 import {
@@ -187,14 +188,21 @@ export function registerHandoffTools(server: McpServer, config: BridgeConfig): v
     title: "Start reviewer browser profile",
     description: "Start or switch the dedicated Chromium profile. Headed and headless modes share one persistent profile and cannot overlap.",
     inputSchema: { profileId: z.string(), mode: z.enum(["headed", "headless"]).optional() },
-    outputSchema: { profileId: z.string(), mode: z.string(), status: z.string(), generation: z.number() }, _meta: {}, annotations: { readOnlyHint: false },
+    outputSchema: {
+      profileId: z.string(), mode: z.string(), status: z.string(), generation: z.number(),
+      browserProduct: z.string().optional(), remoteDebuggingEnabled: z.boolean().optional(), browserLaunchDiagnostic: z.string().optional(),
+    }, _meta: {}, annotations: { readOnlyHint: false },
   }, config, async ({ profileId, mode }) => {
     if (!isReviewer(config.principalRole)) return forbidden(config.principalRole, "start_reviewer_browser_profile");
     const owner = config.reviewBrowserController?.profiles.get(profileId);
     if (!owner || owner.ownerPrincipalId !== config.principalId) return { content: [{ type: "text" as const, text: "Reviewer browser profile owner authorization failed." }], isError: true };
     try {
       const profile = await config.reviewBrowserController!.startProfile(profileId, mode);
-      return { content: [{ type: "text" as const, text: `Reviewer browser profile ${profile.id} is ${profile.status} in ${profile.mode} mode.` }], structuredContent: { profileId: profile.id, mode: profile.mode, status: profile.status, generation: profile.generation } };
+      return { content: [{ type: "text" as const, text: `Reviewer browser profile ${profile.id} is ${profile.status} in ${profile.mode} mode.` }], structuredContent: {
+        profileId: profile.id, mode: profile.mode, status: profile.status, generation: profile.generation,
+        browserProduct: profile.browserProduct, remoteDebuggingEnabled: profile.remoteDebuggingEnabled,
+        browserLaunchDiagnostic: profile.browserLaunchDiagnostic,
+      } };
     } catch (error) { return { content: [{ type: "text" as const, text: error instanceof Error ? error.message : String(error) }], isError: true }; }
   });
 
@@ -213,25 +221,57 @@ export function registerHandoffTools(server: McpServer, config: BridgeConfig): v
     } catch (error) { return { content: [{ type: "text" as const, text: error instanceof Error ? error.message : String(error) }], isError: true }; }
   });
 
+  registerAppTool(server, "inspect_reviewer_browser_health", {
+    title: "Inspect reviewer browser health",
+    description: "Report separate browser-process, CDP, authentication, exact-binding, and dispatch states for an owned reviewer profile.",
+    inputSchema: { profileId: z.string() },
+    outputSchema: {
+      browserProcess: z.enum(["running", "manual_authentication", "ownership_unknown", "not_attached", "stopped"]),
+      cdpConnection: z.enum(["connected", "disconnected", "disabled", "not_attached"]),
+      authState: z.string(), lastVerifiedAt: z.string().optional(), browserProduct: z.string().optional(),
+      remoteDebuggingEnabled: z.boolean().optional(), browserLaunchDiagnostic: z.string().optional(),
+      bindings: z.object({ bound: z.number(), recoveryRequired: z.number(), other: z.number() }),
+      dispatch: z.object({ queued: z.number(), active: z.number(), uncertain: z.number(), blocked: z.number() }),
+    }, _meta: {}, annotations: { readOnlyHint: true },
+  }, async ({ profileId }) => {
+    if (!isReviewer(config.principalRole)) return forbidden(config.principalRole, "inspect_reviewer_browser_health");
+    const owner = config.reviewBrowserController?.profiles.get(profileId);
+    if (!owner || owner.ownerPrincipalId !== config.principalId) return { content: [{ type: "text" as const, text: "Reviewer browser profile owner authorization failed." }], isError: true };
+    try {
+      const health = await config.reviewBrowserController!.inspectHealth(profileId);
+      return { content: [{ type: "text" as const, text: `Browser ${health.browserProcess}; CDP ${health.cdpConnection}; authentication ${health.authState}.` }], structuredContent: health };
+    } catch (error) { return { content: [{ type: "text" as const, text: error instanceof Error ? error.message : String(error) }], isError: true }; }
+  });
+
   registerMutationAppTool(server, "open_reviewer_browser_login", {
     title: "Open reviewer browser login",
-    description: "Compatibility login opener for an existing controlled browser. If the identity provider rejects a software-controlled browser, use begin_reviewer_browser_auth and complete_reviewer_browser_auth to sign in in ordinary Chrome before Kontrol enables CDP.",
-    inputSchema: { profileId: z.string() }, outputSchema: { profileId: z.string(), targetId: z.string() }, _meta: {}, annotations: { readOnlyHint: false },
+    description: "Deprecated authentication action. Controlled-browser sign-in is disabled; use begin_reviewer_browser_auth to sign in manually in ordinary Chrome.",
+    inputSchema: { profileId: z.string() }, outputSchema: {
+      profileId: z.string(), code: z.literal("manual_authentication_required"), retryable: z.literal(false),
+      requiredAction: z.literal("begin_reviewer_browser_auth"),
+    }, _meta: {}, annotations: { readOnlyHint: false },
   }, config, async ({ profileId }) => {
     if (!isReviewer(config.principalRole)) return forbidden(config.principalRole, "open_reviewer_browser_login");
     const owner = config.reviewBrowserController?.profiles.get(profileId);
     if (!owner || owner.ownerPrincipalId !== config.principalId) return { content: [{ type: "text" as const, text: "Reviewer browser profile owner authorization failed." }], isError: true };
     try {
-      const opened = await config.reviewBrowserController!.openLoginPage(profileId);
-      return { content: [{ type: "text" as const, text: "ChatGPT opened in the dedicated headed reviewer browser. Complete login or verification manually, then bind the exact conversation." }], structuredContent: { profileId, targetId: opened.targetId } };
-    } catch (error) { return { content: [{ type: "text" as const, text: error instanceof Error ? error.message : String(error) }], isError: true }; }
+      await config.reviewBrowserController!.openLoginPage(profileId);
+      return { content: [{ type: "text" as const, text: "Controlled-browser sign-in is disabled. Sign in through begin_reviewer_browser_auth in ordinary Chrome." }],
+        structuredContent: { profileId, code: "manual_authentication_required", retryable: false, requiredAction: "begin_reviewer_browser_auth" } };
+    } catch (error) {
+      if (error instanceof ManualAuthenticationRequiredError) return {
+        content: [{ type: "text" as const, text: error.message }],
+        structuredContent: { profileId, code: error.code, retryable: error.retryable, requiredAction: error.requiredAction },
+      };
+      return { content: [{ type: "text" as const, text: error instanceof Error ? error.message : String(error) }], isError: true };
+    }
   });
 
   registerMutationAppTool(server, "begin_reviewer_browser_auth", {
     title: "Begin reviewer browser authentication",
     description: "Open the dedicated persistent profile in official Chrome without remote debugging so the reviewer can sign in manually. Never send passwords, one-time codes, recovery codes, or cookies through Kontrol.",
     inputSchema: { profileId: z.string() },
-    outputSchema: { profileId: z.string(), generation: z.number(), browserPid: z.number().optional() },
+    outputSchema: { profileId: z.string(), generation: z.number(), browserPid: z.number().optional(), browserProduct: z.string(), remoteDebuggingEnabled: z.literal(false), browserLaunchDiagnostic: z.string().optional() },
     _meta: {}, annotations: { readOnlyHint: false },
   }, config, async ({ profileId }) => {
     if (!isReviewer(config.principalRole)) return forbidden(config.principalRole, "begin_reviewer_browser_auth");
