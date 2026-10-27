@@ -520,7 +520,7 @@ for (const flag of ["-v", "--version"]) {
   assert.doesNotMatch(cliSource, new RegExp("[\\'\"\u0060]tailscale[\\'\"\u0060]"), "cli.ts must never pass the tailscale binary name to a spawn/exec call");
 
   const runIngress = (subcommand: "inspect" | "plan", envOverrides: Record<string, string | undefined>) =>
-    spawnSync("npx", ["tsx", "src/cli.ts", "ingress", subcommand], {
+    spawnSync(process.execPath, [join(repositoryRoot, "node_modules", "tsx", "dist", "cli.mjs"), "src/cli.ts", "ingress", subcommand], {
       cwd: repositoryRoot,
       encoding: "utf8",
       env: {
