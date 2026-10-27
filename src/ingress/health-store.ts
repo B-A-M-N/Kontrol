@@ -8,6 +8,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { syncDirectory } from "../fs-durability.js";
 import { join } from "node:path";
 import { isIngressEvidenceTier, type IngressEvidenceTier } from "./evidence-tier.js";
 
@@ -136,8 +137,7 @@ function writeStore(stateDir: string, store: HealthStore): void {
   try { writeFileSync(fd, JSON.stringify(store)); fsyncSync(fd); }
   finally { closeSync(fd); }
   renameSync(temporary, path);
-  const dirFd = openSync(stateDir, "r");
-  try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
+  syncDirectory(stateDir);
 }
 
 function withLock<T>(stateDir: string, run: () => T): T {

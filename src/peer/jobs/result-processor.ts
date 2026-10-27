@@ -1,6 +1,7 @@
 /** Reconcile a peer result into a bounded local snapshot and the reviewer workflow. */
 import { createHash } from "node:crypto";
 import { closeSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { syncDirectory } from "../../fs-durability.js";
 import { realpath } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import type { ReviewCheckpointManager } from "../../review-checkpoints.js";
@@ -68,8 +69,7 @@ function writeArtifact(root: string, path: string, bytes: Buffer): void {
   }
   assertNoSymlinkComponentsSync(parent);
   renameSync(temporary, target);
-  const dirFd = openSync(parent, "r");
-  try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
+  syncDirectory(parent);
 }
 
 /** Complete only the exact content-addressed temp left by this receipt. */
@@ -91,8 +91,7 @@ function recoverArtifactTemporary(root: string, path: string, bytes: Buffer): vo
   assertExpectedTemporary(temporary, hash, path);
   assertNoSymlinkComponentsSync(parent);
   renameSync(temporary, target);
-  const dirFd = openSync(parent, "r");
-  try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
+  syncDirectory(parent);
 }
 
 function assertExpectedTemporary(temporary: string, expectedHash: string, path: string): void {
