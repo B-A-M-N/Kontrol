@@ -90,6 +90,7 @@ try {
   const resolvedExecutable = resolveExecutablePath("test-agent", binDir);
   assert.equal(resolvedExecutable, executable);
   assert.equal(resolveExecutablePath("missing-agent", delimiter), undefined);
+  if (process.platform === "linux") {
   const launch = buildReadOnlySandboxCommand({
     workspaceRoot,
     executable,
@@ -172,6 +173,13 @@ try {
     bindFiles: [{ source: hermesCli, target: "/workspace/escape" }],
     bubblewrapPath: bubblewrap,
   }), /outside the workspace and scratch directory/);
+  } else {
+    assert.throws(
+      () => buildReadOnlySandboxCommand({ workspaceRoot, executable, bubblewrapPath: bubblewrap }),
+      (error) => error?.code === "sandbox_unavailable",
+      "unsupported platforms reject confined execution explicitly instead of silently running without a sandbox",
+    );
+  }
 } finally {
   rmSync(root, { recursive: true, force: true });
 }
