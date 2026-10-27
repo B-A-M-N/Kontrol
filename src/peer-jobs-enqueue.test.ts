@@ -6,7 +6,7 @@
  * Harness pattern: src/peer-listener.test.ts.
  */
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomBytes, createHash } from "node:crypto";
@@ -30,11 +30,12 @@ const token = "Bearer " + CREDENTIAL_ID + ":" + SECRET;
 const INSTRUCTIONS = "say the nonce potato";
 const expectedInstructionHash = createHash("sha256").update(INSTRUCTIONS, "utf8").digest("hex");
 
-const root = mkdtempSync(join(tmpdir(), "kontrol-enqueue-root-"));
-const outsideRoot = mkdtempSync(join(tmpdir(), "kontrol-enqueue-outside-"));
-const stateDir = mkdtempSync(join(tmpdir(), "kontrol-enqueue-state-"));
-const worktreeRoot = mkdtempSync(join(tmpdir(), "kontrol-enqueue-worktrees-"));
-const configDir = mkdtempSync(join(tmpdir(), "kontrol-enqueue-config-"));
+const realTempDir = (prefix: string) => realpathSync(mkdtempSync(join(tmpdir(), prefix)));
+const root = realTempDir("kontrol-enqueue-root-");
+const outsideRoot = realTempDir("kontrol-enqueue-outside-");
+const stateDir = realTempDir("kontrol-enqueue-state-");
+const worktreeRoot = realTempDir("kontrol-enqueue-worktrees-");
+const configDir = realTempDir("kontrol-enqueue-config-");
 
 writeFileSync(join(root, "hello.txt"), "hello from enqueue e2e\n");
 execFileSync("git", ["init", "-q"], { cwd: root });
