@@ -179,8 +179,16 @@ const job = { jobId: "job-test", workSessionId: "ws-test", workspaceRoot, attemp
     recordPublicationReceipt: () => undefined,
     recordPublicationFailure: () => undefined,
   });
-  receipt_ok(result, "parent symlink swap");
-  assert.equal(readFileSync(join(heldParent, "anchored.txt"), "utf8"), "anchored\n");
+  if (process.platform === "linux") {
+    receipt_ok(result, "parent symlink swap");
+    assert.equal(readFileSync(join(heldParent, "anchored.txt"), "utf8"), "anchored\n");
+  } else {
+    // Non-Linux development runners do not have the Linux /proc/self/fd
+    // directory anchor used by the production publisher. A race must fail
+    // closed rather than follow the replacement symlink.
+    assert.equal(result.outcome, "rejected", `unsupported platform race must fail closed: ${result.reason ?? ""}`);
+    assert.equal(existsSync(join(heldParent, "anchored.txt")), false);
+  }
   assert.equal(existsSync(join(outside, "anchored.txt")), false);
   rmSync(root, { recursive: true, force: true });
   rmSync(outside, { recursive: true, force: true });
