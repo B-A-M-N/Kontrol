@@ -282,7 +282,7 @@ function fakeExec(responses: Record<string, FakeResponse>): TailscaleExec & { ca
     // JSON (or is absent for the Node-on-Windows probe), so parsing stays null.
     assert.equal(facts.backendState, null);
     assert.equal(facts.dnsName, null);
-    assert.equal(facts.warnings.length, 3);
+    assert.equal(facts.warnings.length, process.platform === "win32" ? 4 : 3);
     if (process.platform !== "win32") assert.match(facts.warnings[0], /^tailscale status --json returned malformed JSON$/);
   } finally {
     if (previous === undefined) delete process.env.KONTROL_TAILSCALE_BIN;
