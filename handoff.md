@@ -1,16 +1,16 @@
 # Kontrol multipath ingress — remaining work
 
-Updated: 2026-10-26 (twelfth revision)
+Updated: 2026-10-26 (thirteenth revision)
 Repository: `/home/bamn/devspace`
 Branch: `audit-k02-k04`
 Starting HEAD for this revision: `44c247a`. The change is the reviewed
 range `44c247a..858e18f` - the commits of this change, listed below. The
 range is pinned to those commits on purpose: this branch is shared, other
 workstreams have since committed on top of it, and a moving `HEAD` would
-make every range claim in this record false. The last ten rows of the commit
-table sit on top of that range: six documentation commits, which change only
-this file, three test-contract fixes, which each change one test file, and
-one harness fix, which changes the runtime test runner.
+make every range claim in this record false. The last eleven rows of the
+commit table sit on top of that range: seven documentation commits, which
+change only this file, three test-contract fixes, which each change one test
+file, and one harness fix, which changes the runtime test runner.
 Commits are local only. Do not push without separate authorization.
 Preserve the untracked scratch directories: `.tmp-scratch/` and
 `.tmp-handoff-evidence/`, which holds the verification logs cited
@@ -19,12 +19,11 @@ below.
 ## Local commits (not pushed)
 
 These commits are local only; nothing was pushed. The table has one row per
-commit of this change - the commits of the reviewed range
-`44c247a..858e18f`, then the documentation commits that pin that range,
-then the three test-contract fixes and the harness fix that restore the
-canonical chain, and finally this revision's documentation commit - and no
-count is stated in prose, because every documentation commit would have to
-restate a number that its own commit changes.
+commit of this change, in the order the commits were made - the reviewed
+range `44c247a..858e18f` first, then the commits that sit on top of it,
+this revision's own documentation commit last - and no count is stated in
+prose, because every documentation commit would have to restate a number that
+its own commit changes.
 
 | # | Commit | Subject |
 |---|--------|---------|
@@ -47,7 +46,8 @@ restate a number that its own commit changes.
 | 17 | `ecf8076` | `docs: record the three stale sibling assertions and the restored canonical chain` |
 | 18 | `f946754` | `docs: close the round-20 findings on the test-file count and the review tallies` |
 | 19 | `a98998e` | `test(chain): give the lifecycle step the compiled runtime artifact` |
-| 20 | this commit | `docs: record the pristine-tree lifecycle failure and the harness fix` |
+| 20 | `c630677` | `docs: record the pristine-tree lifecycle failure and the harness fix` |
+| 21 | this commit | `docs: record the deployed artifact and the re-verified ingress state` |
 
 Requirement source:
 `/home/bamn/.codex/attachments/458e9b15-a1ec-4247-aa20-19ec878f9be9/pasted-text-1.txt`
@@ -725,6 +725,11 @@ Facts verified on this host on 2026-10-25:
 - A second tailnet node is reachable and usable as the probing client:
   `ssh pop-os-1` works (`pop-os-1.tail8d285a.ts.net`, a node distinct
   from the serving node `pop-os.tail8d285a.ts.net`).
+- Re-verified on 2026-10-26, against the deployment that is live now: the
+  live core still runs `KONTROL_AUTH_MODE=tunnel` and still sets neither
+  `KONTROL_INGRESS_PROFILES` nor any peer setting;
+  `kontrol ingress inspect --json` still reports `profiles: []`; and
+  `tailscale serve status` still reports no serve configuration.
 
 Steps:
 
@@ -877,9 +882,13 @@ failed run, the commit table did not name every commit of this workstream,
 and the rounds narrative tallied two documentation findings where the round
 it describes produced three. All three are closed in this revision, together
 with the fourth failure of section 13 - the lifecycle step's missing runtime
-artifact - which that same review surfaced by reading the failed run. The
-closing round re-reviews the state after the harness fix, and its verdict is
-recorded with the workflow guard.
+artifact - which that same review surfaced by reading the failed run. Round
+22 re-reviewed that same committed state after the harness fix, reconstructed
+with `git archive` rather than read from the shared working tree, and returned
+approve with no finding at any severity tier: it confirmed all six findings
+of rounds 20 and 21 closed, and the harness fix correct, minimal and
+regression-free. The closing round re-reviews the state after this revision's
+documentation change, and its verdict is recorded with the workflow guard.
 | Round | Reviewer | Verdict | Outcome |
 |-------|----------|---------|---------|
 | 1 | `glm-5.3-flash` | changes requested | The deferral gate alone was insufficient: the transport could still drop a notification on a stream that ended mid-send. Led to the stale-discard path. |
@@ -903,6 +912,7 @@ recorded with the workflow guard.
 | 19 | `glm-5.3-flash` | approve, no findings | The same committed state was re-recorded again after concurrent work in the checkout changed the tracked tree; no finding. |
 | 20 | `deepseek-v4-flash` | changes requested, 1 P2 and 2 P3 | The change was reviewed as the committed state, reconstructed with `git archive` rather than read from the shared working tree. The review found no code-level defect: the three contracts are implemented, the three test fixes assert real invariants rather than tautologies, and the canonical-chain check provably executes every test file. Its findings are documentation findings, and all three are closed in this revision. The P2: two present-tense statements of the test-file count said 198 files and 26 runners, which is what the reviewed range's tip reports, while this revision's committed tree reports 199 files and 27 runners because a concurrent commit added a test file - both statements now name the tree they hold for (section 6 and the verification evidence). The P3s: the round-10 narrative tallied one P1 while the section's own body labels two P1 clauses, and the peer-mutation section said the suite kept asserting "the same property" although the asserted value changed - both are reconciled (sections 10 and 13). |
 | 21 | `glm-5.3-flash` | changes requested, 1 P2 and 2 P3 | The round-20 findings were confirmed closed from the code and from the checker, and three new documentation findings were returned. The P2: the final-run log the document cited ended in a failed run, and the failure was a missing prerequisite in the chain's own harness rather than a defect in the change under review - the sibling commit `e29fc6f` made `src/bridge-flow.test.ts` spawn a bundled adapter, and the chain did not give the lifecycle step the compiled artifact that spawn needs. The first P3: the commit table did not name every commit of this workstream, and its header still counted the commits that sit on top of the reviewed range as four documentation commits and three test-contract fixes. The second P3: the rounds narrative tallied two documentation findings where the round it describes produced three. All three are closed in this revision (section 13, the commit table and the rounds narrative). |
+| 22 | `deepseek-v4-flash` | approve, no findings | The round-21 findings were confirmed closed from the code and from a pristine reconstruction of the committed state: the harness fix gives the lifecycle step the compiled runtime artifact, so `src/bridge-flow.test.ts` prints "all assertions passed" and the whole chain ends `NPM_TEST_EXIT=0` at 199 files and 27 runners; the commit table names every commit of the workstream; the rounds narrative tallies the three findings round 21 produced; and the cited final-run log ends in a successful run. The reviewer recomputed the checker counts independently - 198 files and 26 runners at the reviewed range's tip, 199 files and 27 runners at this revision's tree - and reported no finding. |
 
 
 The mutation table in section 1 is the executable form of these reviews: each
@@ -997,9 +1007,9 @@ Executed in this pass (all from the repository root):
     step reports "199 test files all executed by the canonical chain (14
     scripts, 27 runners)" - the range's own tree reports 198 files and 26
     runners, and the difference is one test file a concurrent commit added -
-    and the run ends `NPM_TEST_EXIT=0`. The only change this workstream
-    makes after that commit is this document, and a document cannot change a
-    test result.
+    and the run ends `NPM_TEST_EXIT=0`. The only changes this workstream
+    makes after that commit are this file's own documentation commits, and a
+    document cannot change a test result.
   The runs that surfaced the stale assertions of section 13 are recorded in
   this history: a run against `50e7faf` failed in
   `src/peer-mutation.test.ts` and surfaced the stale checkpoint assertion,
@@ -1115,10 +1125,17 @@ lines and the suite file itself is untouched.
   scenario `unverified` (never `pass`). The generated report
   `ingress-qualification-matrix.json` is a local artifact and is not
   committed.
-- The live deployment still runs the older immutable artifact
-  `releases/f1552d7fc7f87e10`; this pass changed source only. Deploy the
-  new candidate through the normal `./restart-kontrol.sh` prepare/activate
-  path.
+- The live deployment runs the immutable artifact that
+  `~/.local/share/kontrol/generation.json` names in `artifactPath`. As of
+  2026-10-26 that is `releases/61b1fdcf6e57f81b`, whose `build-meta.json`
+  records `gitSha: c630677` - this pass's tip - and whose
+  `server/mcp-http.js` carries this pass's runtime change
+  (`deferredNoStreamAttempts`, `staleDeliveries`, `deliveryGeneration`).
+  That build was made from a working tree that also held another session's
+  uncommitted edits (`gitDirty: 15`), so the deployed bytes are not exactly
+  the committed tree of this pass. When the deployment must match the
+  committed state exactly, build and activate a clean candidate through the
+  normal `./restart-kontrol.sh` prepare/activate path.
 - `tailscale serve` does not fail fast in the disabled state; the
   controller classifies the failure (`serve_not_enabled`,
   `command_timed_out`) instead of reporting an opaque exit code.
