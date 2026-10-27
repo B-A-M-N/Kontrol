@@ -59,14 +59,22 @@ try {
     assert.notEqual(verificationCacheKey("npm test", "toolchain-v1", changedToolchain), firstKey,
       "toolchain path changes invalidate cached verification");
 
-    const changedSandbox = await createVerificationExecutionContext({
-      sandbox: true,
-      childEnvironmentAllowlist: ["VERIFIER_CACHE_TEST_FLAG"],
-      verifyToolchainPaths: [join(root, "toolchain-a")],
-      sandboxExecutablePath: join(root, "sandbox-b"),
-    });
-    assert.notEqual(verificationCacheKey("npm test", "toolchain-v1", changedSandbox), firstKey,
-      "sandbox mode and implementation changes invalidate cached verification");
+    if (process.platform === "linux") {
+      const changedSandbox = await createVerificationExecutionContext({
+        sandbox: true,
+        childEnvironmentAllowlist: ["VERIFIER_CACHE_TEST_FLAG"],
+        verifyToolchainPaths: [join(root, "toolchain-a")],
+        sandboxExecutablePath: join(root, "sandbox-b"),
+      });
+      assert.notEqual(verificationCacheKey("npm test", "toolchain-v1", changedSandbox), firstKey,
+        "sandbox mode and implementation changes invalidate cached verification");
+    } else {
+      await assert.rejects(
+        createVerificationExecutionContext({ sandbox: true }),
+        /no supported sandbox primitive/,
+        "unsupported hosts reject sandboxed verification instead of silently running it unsandboxed",
+      );
+    }
   } finally {
     if (originalCacheEnv === undefined) delete process.env.VERIFIER_CACHE_TEST_FLAG;
     else process.env.VERIFIER_CACHE_TEST_FLAG = originalCacheEnv;
