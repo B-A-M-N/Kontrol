@@ -201,6 +201,7 @@ Kontrol looks in standard Agent Skills locations:
 
 - `~/.agents/skills`
 - project `.agents/skills`
+- `~/.devspace/skills`
 
 It also checks compatibility and custom paths:
 

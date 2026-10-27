@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   loadSkills,
   type Skill,

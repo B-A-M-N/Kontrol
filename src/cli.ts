@@ -17,6 +17,7 @@ import { createReviewRouteStore } from "./review-handoff/route-store.js";
 import { runServiceCommand } from "./service.js";
 import { isRuntimeIdentityLive, readBuildIdentity, readRuntimeIdentity } from "./runtime-identity.js";
 import {
+  ensureDevspaceDefaultSkills,
   generateOwnerToken,
   loadKontrolFiles,
   writeKontrolAuth,
@@ -810,6 +811,7 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
       `Mode: ${authMode === "tunnel" ? "OpenAI Secure MCP Tunnel (loopback-only)" : "Public URL (OAuth)"}`,
       `Config: ${configPath}`,
       `Auth: ${authPath}`,
+      ...seededSkillPaths.map((path) => `Default skill: ${path}`),
       `Local MCP URL: http://${config.host}:${config.port}/mcp`,
       ...(publicBaseUrl ? [`Public MCP URL: ${publicBaseUrl}/mcp`] : []),
       ...(authMode === "tunnel"

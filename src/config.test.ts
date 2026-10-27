@@ -73,6 +73,13 @@ assert.throws(
   "identical agent/reviewer secrets rejected",
 );
 
+const seededConfigDir = mkdtempSync(join(tmpdir(), "devspace-seeded-skills-test-"));
+const seededSkillPaths = ensureDevspaceDefaultSkills({ DEVSPACE_CONFIG_DIR: seededConfigDir });
+assert.deepEqual(seededSkillPaths, [join(seededConfigDir, "skills", "local-agent-delegation", "SKILL.md")]);
+assert.equal(existsSync(seededSkillPaths[0]), true);
+assert.match(readFileSync(seededSkillPaths[0], "utf8"), /name: local-agent-delegation/);
+assert.deepEqual(ensureDevspaceDefaultSkills({ DEVSPACE_CONFIG_DIR: seededConfigDir }), []);
+
 assert.throws(
   () => loadConfig({ ...baseEnv, KONTROL_ACP_SHARED_SECRET: "legacy-short" }),
   /at least 32 characters/,

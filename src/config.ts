@@ -46,6 +46,7 @@ export interface ServerConfig {
   managedWorktreeRetentionMs: number;
   skillsEnabled: boolean;
   skillPaths: string[];
+  devspaceSkillsDir: string;
   agentDir: string;
   logging: LoggingConfig;
   acpEnabled: boolean;

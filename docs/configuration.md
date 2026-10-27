@@ -443,6 +443,7 @@ Kontrol discovers standard Agent Skills from:
 
 - `~/.agents/skills`
 - project `.agents/skills`
+- `~/.devspace/skills`
 
 It also keeps compatibility with:
 

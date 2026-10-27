@@ -119,6 +119,16 @@ export function generateOwnerToken(): string {
   return randomBytes(32).toString("base64url");
 }
 
+export function ensureDevspaceDefaultSkills(env: NodeJS.ProcessEnv = process.env): string[] {
+  const targetPath = join(devspaceSkillsDir(env), "local-agent-delegation", "SKILL.md");
+  if (existsSync(targetPath)) return [];
+
+  const sourcePath = new URL("../skills/local-agent-delegation/SKILL.md", import.meta.url);
+  mkdirSync(dirname(targetPath), { recursive: true });
+  writeFileSync(targetPath, readFileSync(sourcePath, "utf8"), { mode: 0o644 });
+  return [targetPath];
+}
+
 function readJsonFile<T>(filePath: string): T {
   try {
     return JSON.parse(readFileSync(filePath, "utf8")) as T;
