@@ -987,3 +987,19 @@ function localPublicBaseUrl(host: string, port: number): string {
     : publicHost;
   return `http://${formattedHost}:${port}`;
 }
+
+function parsePublicBaseUrl(value: string): string {
+  const parsed = new URL(value);
+  parsed.hash = "";
+  parsed.search = "";
+  parsed.pathname = parsed.pathname.replace(/\/+$/, "");
+  return parsed.toString().replace(/\/$/, "");
+}
+
+function localPublicBaseUrl(host: string, port: number): string {
+  const publicHost = host === "0.0.0.0" || host === "::" ? "127.0.0.1" : host;
+  const formattedHost = publicHost.includes(":") && !publicHost.startsWith("[")
+    ? `[${publicHost}]`
+    : publicHost;
+  return `http://${formattedHost}:${port}`;
+}

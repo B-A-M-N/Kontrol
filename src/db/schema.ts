@@ -286,6 +286,41 @@ export const clientMutationReceipts = sqliteTable("client_mutation_receipts", {
   index("client_mutation_receipts_updated_idx").on(table.updatedAt),
 ]);
 
+export const oauthClients = sqliteTable(
+  "oauth_clients",
+  {
+    clientId: text("client_id").primaryKey(),
+    clientJson: text("client_json").notNull(),
+    issuedAt: integer("issued_at").notNull(),
+  },
+);
+
+export const oauthAccessTokens = sqliteTable(
+  "oauth_access_tokens",
+  {
+    tokenHash: text("token_hash").primaryKey(),
+    clientId: text("client_id")
+      .notNull()
+      .references(() => oauthClients.clientId, { onDelete: "cascade" }),
+    scopesJson: text("scopes_json").notNull(),
+    expiresAt: integer("expires_at").notNull(),
+    resource: text("resource"),
+  },
+);
+
+export const oauthRefreshTokens = sqliteTable(
+  "oauth_refresh_tokens",
+  {
+    tokenHash: text("token_hash").primaryKey(),
+    clientId: text("client_id")
+      .notNull()
+      .references(() => oauthClients.clientId, { onDelete: "cascade" }),
+    scopesJson: text("scopes_json").notNull(),
+    expiresAt: integer("expires_at").notNull(),
+    resource: text("resource"),
+  },
+);
+
 export type WorkspaceSessionRow = typeof workspaceSessions.$inferSelect;
 export type NewWorkspaceSessionRow = typeof workspaceSessions.$inferInsert;
 export type LoadedAgentFileRow = typeof loadedAgentFiles.$inferSelect;

@@ -1305,4 +1305,13 @@ if (await isMainModule()) {
     console.error(error instanceof Error ? error.message : String(error));
     process.exitCode = 1;
   });
+
+  const shutdown = () => {
+    httpServer.close(() => {
+      close();
+      process.exit(0);
+    });
+  };
+  process.once("SIGINT", shutdown);
+  process.once("SIGTERM", shutdown);
 }
