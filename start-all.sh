@@ -469,17 +469,10 @@ resolve_artifact_path() {
 }
 
 resolve_dist_artifact() {
-  # Git Bash does not consistently report Windows directory junctions as `-L`.
-  # Node's lstat recognizes both POSIX symlinks and Windows junctions, matching
-  # the runtime's artifact identity checks on every supported development OS.
-  if ! node --input-type=module -e '
-    import { lstatSync } from "node:fs";
-    try { process.exit(lstatSync(process.argv[1]).isSymbolicLink() ? 0 : 1); }
-    catch { process.exit(1); }
-  ' "$DESKTOP_PWD/dist" && ! readlink -- "$DESKTOP_PWD/dist" >/dev/null 2>&1; then
-    echo "ERROR: dist/ must be an immutable releases/<buildId> symlink when used as an artifact selector." >&2
-    return 1
-  fi
+  # Validate the canonical target instead of requiring POSIX symlink metadata:
+  # Windows directory junctions are valid projections, but Git Bash `-L` and
+  # `readlink` do not consistently recognize them. resolve_artifact_path below
+  # rejects ordinary directories because their real path is outside releases/.
   resolve_artifact_path "$DESKTOP_PWD/dist"
 }
 
