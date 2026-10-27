@@ -303,6 +303,7 @@ writeFileSync(
 
 const fileConfig = loadConfig({ KONTROL_CONFIG_DIR: configDir });
 assert.equal(fileConfig.port, 8787);
+assert.equal(fileConfig.goalsEnabled, true);
 assert.equal(fileConfig.oauth.ownerToken, "persisted-owner-token-long-enough");
 assert.equal(fileConfig.publicBaseUrl, "https://kontrol.example.com");
 assert.deepEqual(fileConfig.allowedHosts, [

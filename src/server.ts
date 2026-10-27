@@ -22,6 +22,7 @@ import type { Express, NextFunction, Request, Response } from "express";
 import * as z from "zod/v4";
 import { applyPatch, parsePatch } from "./apply-patch.js";
 import { loadConfig, type ServerConfig, type WidgetMode } from "./config.js";
+import { createGoalStore, type GoalStore, type WorkspaceGoal } from "./goal-store.js";
 import {
   logEvent,
   requestIp,

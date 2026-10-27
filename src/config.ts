@@ -691,6 +691,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
   validateAcpSecrets(env);
   const host = env.HOST ?? files.config.host ?? "127.0.0.1";
   const port = parsePort(env.PORT ?? files.config.port);
+  const toolMode = parseToolMode(env);
   const publicBaseUrl = parsePublicBaseUrl(
     env.KONTROL_PUBLIC_BASE_URL ?? files.config.publicBaseUrl ?? localPublicBaseUrl(host, port),
   );
