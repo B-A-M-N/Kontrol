@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync, symlinkSync, chmodSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync, symlinkSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { hermesPythonRuntimeRootFor, isSystemHermesPath } from "../scripts/lib/hermes-python-runtime.mjs";
 
-const root = mkdtempSync(join(tmpdir(), "hermes-python-runtime-"));
+const root = realpathSync(mkdtempSync(join(tmpdir(), "hermes-python-runtime-")));
 try {
   // A relocated runtime whose lib/pythonX.Y holds a real standard library.
   const relocated = join(root, "relocated");
