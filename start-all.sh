@@ -3,8 +3,12 @@
 # Reliable daemon start via tmux. Readiness is mandatory before "BOTH UP".
 # P1 #41: Transactional — track launched components and roll back on failure.
 set -euo pipefail
-cd "$(dirname "$0")"
-DESKTOP_PWD="$PWD"
+cd -P "$(dirname "$0")"
+# Keep a physical checkout path for artifact validation. Git Bash may retain a
+# logical `/tmp/...` spelling after `cd .` even when Node created the fixture
+# under a native Windows temp directory; that spelling can make a later
+# generation lookup resolve against a different path namespace.
+DESKTOP_PWD="$(pwd -P)"
 export DESKTOP_PWD
 
 PREPARE_ONLY=0
