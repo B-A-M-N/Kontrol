@@ -462,7 +462,7 @@ resolve_dist_artifact() {
     import { lstatSync } from "node:fs";
     try { process.exit(lstatSync(process.argv[1]).isSymbolicLink() ? 0 : 1); }
     catch { process.exit(1); }
-  ' "$DESKTOP_PWD/dist"; then
+  ' "$DESKTOP_PWD/dist" && ! readlink -- "$DESKTOP_PWD/dist" >/dev/null 2>&1; then
     echo "ERROR: dist/ must be an immutable releases/<buildId> symlink when used as an artifact selector." >&2
     return 1
   fi
