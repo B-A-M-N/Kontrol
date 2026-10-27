@@ -490,6 +490,16 @@ async function runAdapterCase(name) {
   }
 }
 
-await runAdapterCase("crush");
-await runAdapterCase("hermes");
-console.log("scripts/scheduled-readonly-adapters-e2e.mjs: passed");
+if (process.platform === "linux") {
+  await runAdapterCase("crush");
+  await runAdapterCase("hermes");
+  console.log("scripts/scheduled-readonly-adapters-e2e.mjs: passed");
+} else {
+  assert.throws(
+    () => findBubblewrap(),
+    (error) => error?.code === "sandbox_unavailable"
+      && error.message.includes("supported only on Linux"),
+    "scheduled read-only ACP execution must fail closed before dispatch on hosts without Linux Bubblewrap confinement",
+  );
+  console.log(`scheduled-readonly-adapters-e2e: ${process.platform} fail-closed confinement contract passed`);
+}
