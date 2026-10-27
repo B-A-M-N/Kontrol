@@ -180,7 +180,7 @@ export class WorkspaceRegistry {
     if (!isPathInsideRoot(absolutePath, workspace.root)) {
       throw new Error(`Path is outside workspace root: ${inputPath}`);
     }
-    assertNoSymlinkComponentsSync(absolutePath);
+    assertNoSymlinkComponentsSync(absolutePath, workspace.root);
 
     return absolutePath;
   }

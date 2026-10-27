@@ -48,9 +48,28 @@ export function resolveAllowedPath(inputPath: string, cwd: string, allowedRoots:
 }
 
 /** Synchronous counterpart used immediately before filesystem mutations. */
-export function assertNoSymlinkComponentsSync(absolutePath: string): void {
+export function assertNoSymlinkComponentsSync(absolutePath: string, trustedRoot?: string): void {
+  const target = resolve(absolutePath);
   let current: string = sep;
-  const components = resolve(absolutePath).split(sep).filter(Boolean);
+  let components: string[];
+  if (trustedRoot !== undefined) {
+    const root = resolve(trustedRoot);
+    const rootRelative = relative(root, target);
+    if (isAbsolute(rootRelative) || rootRelative === ".." || rootRelative.startsWith(`..${sep}`)) {
+      throw new AccessDeniedError(`Path is outside workspace root: ${absolutePath}`);
+    }
+    // Check from the workspace boundary down. OS path aliases such as
+    // macOS /var -> /private/var may contain symlinks before the boundary;
+    // they do not redirect a child outside the already-authorized root.
+    const rootMetadata = lstatSync(root);
+    if (rootMetadata.isSymbolicLink() || !rootMetadata.isDirectory()) {
+      throw new AccessDeniedError(`Workspace root must be a regular directory: ${root}`);
+    }
+    current = root;
+    components = rootRelative.split(sep).filter(Boolean);
+  } else {
+    components = target.split(sep).filter(Boolean);
+  }
   for (const component of components) {
     current = resolve(current, component);
     try {
@@ -58,7 +77,7 @@ export function assertNoSymlinkComponentsSync(absolutePath: string): void {
       if (metadata.isSymbolicLink()) {
         throw new AccessDeniedError(`Symlink path components are not permitted: ${absolutePath}`);
       }
-      if (!metadata.isDirectory() && current !== resolve(absolutePath)) {
+      if (!metadata.isDirectory() && current !== target) {
         throw new AccessDeniedError(`Path component is not a directory: ${current}`);
       }
     } catch (err) {

@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
-import { homedir } from "node:os";
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { assertAllowedPath, expandHomePath, isPathInsideRoot, resolveAllowedPath } from "./roots.js";
+import { assertAllowedPath, assertNoSymlinkComponentsSync, expandHomePath, isPathInsideRoot, resolveAllowedPath } from "./roots.js";
 
 const home = homedir();
 
@@ -35,4 +36,28 @@ if (process.platform === "win32") {
     () => assertAllowedPath("C:\\Users\\Administrator", ["G:\\Projects\\Dev\\Github\\kontrol"]),
     /Path is outside allowed roots/,
   );
+}
+
+if (process.platform !== "win32") {
+  const fixture = mkdtempSync(join(tmpdir(), "kontrol-root-alias-"));
+  try {
+    const physicalParent = join(fixture, "physical");
+    const workspace = join(physicalParent, "workspace");
+    const aliasParent = join(fixture, "alias");
+    mkdirSync(workspace, { recursive: true });
+    symlinkSync(physicalParent, aliasParent, "dir");
+    const aliasedWorkspace = join(aliasParent, "workspace");
+    assertNoSymlinkComponentsSync(join(aliasedWorkspace, "new-file.txt"), aliasedWorkspace);
+
+    const outside = join(fixture, "outside");
+    mkdirSync(outside);
+    symlinkSync(outside, join(workspace, "escape"), "dir");
+    assert.throws(
+      () => assertNoSymlinkComponentsSync(join(aliasedWorkspace, "escape", "new-file.txt"), aliasedWorkspace),
+      /Symlink path components are not permitted/,
+      "trusted workspace roots may have an OS path alias, but child symlinks remain denied",
+    );
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
 }
