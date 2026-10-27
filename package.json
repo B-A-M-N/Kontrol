@@ -158,8 +158,8 @@
     "@types/react": "^19.2.15",
     "@types/react-dom": "^19.2.3",
     "@types/semver": "^7.7.1",
-    "@vscode/ripgrep": "1.18.0",
     "@vitejs/plugin-react": "^6.0.2",
+    "@vscode/ripgrep": "1.18.0",
     "jsdom": "^26.1.0",
     "playwright": "^1.62.1",
     "tsx": "^4.22.3",
@@ -169,7 +169,7 @@
   },
   "overrides": {
     "express": {
-      "qs": "^6.16.0"
+      "qs": "^6.17.0"
     },
     "@earendil-works/pi-coding-agent": {
       "undici": "8.12.3"
