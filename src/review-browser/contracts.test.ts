@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, realpath, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -15,7 +15,7 @@ import type { BoundReviewerTarget } from "./target-binding.js";
 import { acquireReviewerProfileLock, chromeArguments, inspectChromeProfileOwner, isOfficialChromeInstallPath } from "./chrome-process.js";
 import { createReviewerTurnDispatcher } from "./turn-dispatcher.js";
 
-const root = await mkdtemp(join(tmpdir(), "kontrol-review-browser-test-"));
+const root = await realpath(await mkdtemp(join(tmpdir(), "kontrol-review-browser-test-")));
 try {
   const canonical = canonicalReviewerConversation("https://www.chatgpt.com/c/conversation_12345678?foo=1#x");
   assert.deepEqual(canonical, { url: "https://chatgpt.com/c/conversation_12345678", key: "conversation_12345678" });
