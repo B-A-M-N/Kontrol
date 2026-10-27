@@ -21,7 +21,7 @@ tunnel) behaves exactly as before.
 > (a Muse-owned client calling approved Kontrol MCP tools): the read-only
 > inspection surface plus, when the owner grants `workspace:propose_patch`,
 > review-gated isolated mutation inside managed worktrees. The outbound job
-> protocol (**C2**) is **implemented as of M3, bounded as follows**: peers
+> protocol (**C2**) is implemented with bounded capabilities: peers
 > granted the `job:` capability family can claim durable peer-scoped jobs
 > over `POST /peer/jobs/claim` (every job route also REQUIRES the matching
 > `job:*` capability and answers `403 peer_capability_denied` without it),
@@ -30,8 +30,12 @@ tunnel) behaves exactly as before.
 > correlated, validated results — with uncertain-outcome reconciliation and
 > `actorClass` honesty labeling (`muse_vm_process` only; `meta_muse_agent`
 > is rejected because C3 evidence does not exist). The owner enqueues jobs
-> through the owner-only `enqueue_peer_job` MCP tool. **No artifact staging
-> or review binding yet (follow-on).** **C3** is not claimed at all.
+> through the owner-only `enqueue_peer_job` MCP tool. Successful artifacts are
+> staged into the exact managed worktree, captured in a baseline-relative
+> snapshot, and submitted through the existing review workflow. Mission-bound
+> jobs receive verification against that exact snapshot; without a mission
+> contract, verification is `not_configured`. Peers never approve their own
+> results. **C3** remains a planned, unsupported follow-on.
 
 ## Capability distinction: C1, C2, C3
 
@@ -40,9 +44,9 @@ never be conflated, and evidence for a lower level never implies a higher one.
 
 | Capability | What it means | Status |
 | --- | --- | --- |
-| **C1** | A Muse-owned client calls an approved subset of Kontrol MCP tools when Muse (not Kontrol) initiates the connection. | Peer-listener portion **implemented** in this milestone (read-only inspection surface). |
-| **C2** | Durable task exchange with software running in the Muse Secure VM via outbound pull (Kontrol periodically claims/pulls task batches). Mutating and job-oriented capabilities (`workspace:propose_patch`, `workspace:run_bounded`, and the `job:` capability family) belong here. | **Partially implemented (M3):** durable peer-scoped job claim/heartbeat/result protocol with fenced leases and uncertain-outcome reconciliation; no artifact staging or review binding yet (follow-on). The M3 label is `vm_executor_result` semantics. |
-| **C3** | Verified activation of the actual hosted Muse agent — Kontrol initiating turns in a user's real consumer Muse conversation. | **Not supported.** |
+| **C1** | A Muse-owned client calls an approved subset of Kontrol MCP tools when Muse (not Kontrol) initiates the connection. | **Implemented:** read-only inspection plus opt-in, review-gated mutation in managed worktrees. |
+| **C2** | Durable task exchange with software running in the Muse Secure VM via outbound pull. | **Implemented with bounded capabilities:** durable peer jobs, fenced leases, uncertain-outcome reconciliation, validated result staging, exact-worktree snapshots, and review submission. `workspace:run_bounded` remains reserved. Mission verification runs only when a job has a declared verification contract. |
+| **C3** | Verified activation of the actual hosted Muse agent — Kontrol initiating turns in a user's real consumer Muse conversation. | **Planned, not supported.** |
 
 **Never claim C3 from C2 evidence.** C2 proves only that software inside the
 Muse Secure VM exchanged task data with Kontrol. It says nothing about whether
@@ -51,14 +55,14 @@ activation requires a user-approved Muse skill, schedule, or connector that must
 be verified separately; the peer listener does **not** provide any API for
 initiating turns in a Muse conversation.
 
-Because the peer listener is Muse-initiated outbound (see below), the current
-milestone covers the peer side of C1 plus the owner-side enqueue half of C2
-(the `enqueue_peer_job` tool and the `/peer/jobs/*` protocol). Mutation
-capabilities beyond review-gated worktree mutation are still reserved; their
-environment variables and capability values that remain unimplemented stay
-inert until a later milestone activates them.
+Because the peer listener is Muse-initiated outbound (see below), Kontrol does
+not start hosted Muse conversations. The owner can enqueue C2 jobs, and
+authorized peer software claims them through `/peer/jobs/*`; successful results
+enter the existing checkpoint, verification, and human-review path. Capabilities
+that remain reserved, including `workspace:run_bounded`, stay inert until a
+later milestone activates them.
 
-## The M3 durable peer job protocol (C2)
+## Durable peer jobs (C2)
 
 The owner enqueues jobs; the peer pulls them. Nothing runs on the peer unless
 the peer itself makes an outbound call.
@@ -152,9 +156,13 @@ peer job routes handle.
 
 ### Honest C2 scope
 
-No artifact staging and no review binding yet: a `result_received` job's
-manifest is validated and stored, but artifacts are not staged into review
-checkpoints. C3 (hosted Muse-agent activation) remains unclaimed.
+A successful receipt is not approval evidence. Kontrol validates the receipt,
+stages its artifacts into the job's exact managed worktree, captures a
+baseline-relative snapshot, and creates a submission through the existing
+review workflow. When a mission contract is attached, verification binds to
+that exact submission and snapshot; otherwise the verification projection is
+`not_configured`. Only authenticated reviewer feedback determines approval.
+C3 (hosted Muse-agent activation) remains planned and unsupported.
 
 ## Reviewer/owner visibility (`list_peer_status`, M5)
 
@@ -301,9 +309,9 @@ Supporting fields:
 | `workspace:inspect` | Read-only structured inspection (`read`, `grep`, `glob`, `ls`, git tools) plus `open_workspace`. | **Implemented** (default peer profile). |
 | `workspace:propose_patch` | Review-gated isolated mutation: peers may open managed worktrees for granted source roots and mutate files inside them (`write`, `edit`) with mandatory checkpoint tracking. Direct checkout mutation is always denied; peers cannot approve their own changes. | **Implemented** (opt-in per peer). |
 | `workspace:run_bounded` | Run a bounded command in an approved workspace. | **Reserved** (follow-on). |
-| `job:claim` | Claim an outbound task from the job queue (C2); also gates `started`, `renew`, `fail`, `not-started`, `status`, `instructions`, and `/peer/commands`. | **Implemented (M3)** via the `/peer/jobs/*` protocol (durable peer-scoped jobs; no artifact staging yet). |
-| `job:complete` | Report an outbound task result (C2). | **Implemented (M3)** via `POST /peer/jobs/:jobId/result` with validated, persisted receipts (no artifact staging yet). |
-| `job:cancel_ack` | Acknowledge cancellation of an outbound task (C2). | **Implemented (M3)** via `POST /peer/jobs/:jobId/cancel-ack`. |
+| `job:claim` | Claim an outbound task from the job queue (C2); also gates `started`, `renew`, `fail`, `not-started`, `status`, `instructions`, and `/peer/commands`. | **Implemented** via the `/peer/jobs/*` protocol with durable peer-scoped jobs and fenced leases. |
+| `job:complete` | Report an outbound task result (C2). | **Implemented** via `POST /peer/jobs/:jobId/result`; validated receipts drive exact-worktree artifact staging and review submission. |
+| `job:cancel_ack` | Acknowledge cancellation of an outbound task (C2). | **Implemented** via `POST /peer/jobs/:jobId/cancel-ack`. |
 
 The default peer profile is `workspace:inspect` only. Do not assume any reserved
 capability is active in the current milestone.

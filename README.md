@@ -311,6 +311,23 @@ enabled; with it off, the main MCP listener is unchanged. See
 [Peer Integration](docs/peer-integration.md) for configuration, the credential
 registry format, security properties, and rollback.
 
+The peer integration has three distinct capability levels:
+
+- **C1 — peer-initiated MCP access: implemented.** A Muse-owned client can call
+  owner-granted Kontrol tools. Patch proposals are confined to managed
+  worktrees and remain subject to Kontrol's review workflow.
+- **C2 — durable Muse Secure VM jobs: implemented with bounded scope.** The
+  owner can enqueue durable jobs for peer software to claim and report. Results
+  are validated, staged into the exact managed worktree, captured in a
+  baseline-relative snapshot, and submitted to the existing human-review flow.
+  Verification is reported only when a job has a mission verification
+  contract; peer results do not grant approval authority.
+- **C3 — activating the hosted Muse agent: planned, not supported yet.** This
+  means Kontrol initiating a turn in a user's consumer Muse conversation. It
+  requires a separately authorized Muse skill, schedule, or connector and
+  independent evidence that it activated the hosted agent. Secure VM execution
+  alone does not establish C3.
+
 ## What Agents Can Do
 
 Once connected, an agent can open an approved project folder as a workspace and:
@@ -344,6 +361,24 @@ If agent stopped: it reads feedback when it resumes
 This loop lives in Kontrol's event log, not in any specific host. You can review submissions from the same interface you use to chat, from a terminal, or from a future tool.
 
 An agent running in a Kontrol-managed PTY can submit and wait with `kontrol review submit`. For safe retries after an uncertain CLI result, pass `--client-mutation-id <stable-id>` and reuse that same ID for the same logical submission; the successful receipt includes the ID.
+
+### Optional Native CDP Delivery
+
+The MCP App and authorized MCP reviewer tools remain the primary review
+surfaces. Native Chrome DevTools Protocol (CDP) is an optional transport for
+delivering a review packet and observing whether a response is generating; it
+does not read review verdicts or approve work. Feedback and approval still go
+through Kontrol's authenticated review workflow.
+
+When native CDP is enabled, sign in manually in the dedicated profile using
+official Google Chrome with remote debugging disabled. Close every Chrome
+window for that profile before Kontrol relaunches it with a loopback-only CDP
+endpoint and verifies the ChatGPT session. Kontrol then requires an explicit,
+exact conversation binding before dispatch. It never accepts passwords, codes,
+recovery details, or cookies through MCP, automates identity-provider sign-in,
+or treats browser output as review authority. See
+[`src/review-browser/AGENTS.md`](src/review-browser/AGENTS.md) for the transport
+contract.
 
 ## Skill Names
 
