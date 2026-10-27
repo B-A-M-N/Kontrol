@@ -794,6 +794,7 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
     let operationDiagnosticFinalized = false;
     const finalizeOperationDiagnostic = () => {
       if (operationDiagnosticFinalized) return;
+      if (!res.writableFinished && !res.destroyed) return;
       operationDiagnosticFinalized = true;
       const finishedAtMs = Date.now();
       const completedResponseCloseClassification = responseCloseClassification
@@ -826,16 +827,6 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
         resourceAdmission,
         sessionInFlight,
         connectionMetrics,
-      });
-      deps.recordMcpConnectionEvent?.({
-        kind: completedResponseCloseClassification === "response_finished" ? "response_finished" : "stream_aborted",
-        sessionId,
-        requestId: requestId ?? operationId,
-        operationId,
-        requestKind: requestRpcMethod ?? req.method,
-        ...(requestToolName ? { toolName: requestToolName } : {}),
-        ...(requestErrorClass ? { failureClass: requestErrorClass } : {}),
-        durationMs: Math.max(0, finishedAtMs - requestStartedAtMs),
       });
       try {
         const responseContentType = res.getHeader("content-type")?.toString().toLowerCase() ?? "";
@@ -900,6 +891,10 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
     let requestListenersCleaned = false;
     const cleanupRequestListeners = () => {
       if (requestListenersCleaned) return;
+      // The handler may settle before Node flushes its response. Keep the
+      // terminal listeners and abort ownership until finish or close so the
+      // recorded lifecycle matches what the peer actually received.
+      if (!res.writableFinished && !res.destroyed) return;
       requestListenersCleaned = true;
       req.off("aborted", abortIfDisconnected);
       res.off("close", onResponseClose);
@@ -953,10 +948,20 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
       stopSseHeartbeat?.();
       stopSseHeartbeat = undefined;
       abortIfDisconnected();
+      finalizeOperationDiagnostic();
       cleanupRequestListeners();
     };
     const onResponseFinish = () => {
       responseCloseClassification ??= "response_finished";
+      deps.recordMcpConnectionEvent?.({
+        kind: "response_finished",
+        sessionId,
+        requestId: requestId ?? operationId,
+        operationId,
+        requestKind: requestRpcMethod ?? req.method,
+        ...(requestToolName ? { toolName: requestToolName } : {}),
+        durationMs: Math.max(0, Date.now() - requestStartedAtMs),
+      });
       if (standaloneStreamEstablished && sessionId) {
         const state = mcpSessions.get(sessionId);
         if (state) clearStandaloneSseDelivery(state, standaloneStreamGeneration);
@@ -988,6 +993,7 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
       }
       stopSseHeartbeat?.();
       stopSseHeartbeat = undefined;
+      finalizeOperationDiagnostic();
       cleanupRequestListeners();
     };
     res.once("close", onResponseClose);

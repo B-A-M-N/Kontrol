@@ -93,7 +93,10 @@ export class EndpointPreferenceStore {
   read() {
     if (!existsSync(this.#path)) return [...this.#profileIds];
     const stats = lstatSync(this.#path);
-    if (!stats.isFile() || stats.isSymbolicLink() || (stats.mode & 0o077) !== 0
+    if (!stats.isFile() || stats.isSymbolicLink()
+      // Windows Node stats do not report Unix permission bits; this file only
+      // stores endpoint ordering, while its ACL inherits the user's profile.
+      || (process.platform !== "win32" && (stats.mode & 0o077) !== 0)
       || (typeof process.getuid === "function" && stats.uid !== process.getuid())) {
       throw new Error("endpoint preference file must be an owner-only regular file");
     }
