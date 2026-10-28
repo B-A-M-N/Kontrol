@@ -761,6 +761,19 @@ function processParentPid(pid) {
 }
 
 function killController(controller, markerPath, signal = "SIGKILL") {
+  if (process.platform === "win32") {
+    // Killing only the paused fake executable leaves its Bash parent alive on
+    // Windows. Terminate the controller's full process tree to model the same
+    // abrupt supervisor death as the POSIX PID-ancestry path below.
+    assert.ok(Number.isInteger(controller.child.pid), "controller child must have a PID before termination");
+    const result = spawnSync("taskkill", ["/PID", String(controller.child.pid), "/T", "/F"], { encoding: "utf8" });
+    assert.equal(
+      result.status,
+      0,
+      `taskkill must terminate the controller process tree (status=${result.status}, error=${result.error?.message ?? "none"})\n${result.stdout ?? ""}\n${result.stderr ?? ""}`,
+    );
+    return;
+  }
   const pids = [];
   let current = Number(readFileSync(markerPath, "utf8").trim());
   while (Number.isInteger(current) && current > 1 && current !== process.pid && current !== controller.child.pid && !pids.includes(current)) {
