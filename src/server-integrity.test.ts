@@ -21,10 +21,12 @@ const config = loadConfig({
   KONTROL_POLICY_MODE: "allow",
   KONTROL_LOG_LEVEL: "error",
   KONTROL_DIAGNOSTICS_SECRET: "integrity-test-secret",
+  // Exercise a genuinely slow diagnostic while keeping enough deadline
+  // margin for loaded CI workers to start and complete the scan.
+  KONTROL_INTEGRITY_TEST_DELAY_MS: "6000",
+  KONTROL_INTEGRITY_DEADLINE_MS: "20000",
 });
 
-const previousDelay = process.env.KONTROL_INTEGRITY_TEST_DELAY_MS;
-process.env.KONTROL_INTEGRITY_TEST_DELAY_MS = "6000";
 const running = createServer(config);
 const httpServer = running.app.listen(0, "127.0.0.1");
 await new Promise<void>((resolve) => httpServer.once("listening", resolve));
@@ -49,6 +51,4 @@ try {
   await running.drain();
   await new Promise<void>((resolve) => httpServer.close(() => resolve()));
   removeRuntimeIdentity(stateDir, runtimeIdentity.instanceId);
-  if (previousDelay === undefined) delete process.env.KONTROL_INTEGRITY_TEST_DELAY_MS;
-  else process.env.KONTROL_INTEGRITY_TEST_DELAY_MS = previousDelay;
 }

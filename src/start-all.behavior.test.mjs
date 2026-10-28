@@ -774,6 +774,16 @@ function killController(controller, markerPath, signal = "SIGKILL") {
   }
 }
 
+function assertControllerKilledAbruptly(result, label) {
+  if (process.platform === "win32") {
+    // Node reports forced Windows process termination with an exit status;
+    // POSIX reports the terminating signal separately.
+    assert.ok(Number.isInteger(result.status) && result.status !== 0, `${label} must exit unsuccessfully after forced termination`);
+    return;
+  }
+  assert.equal(result.signal, "SIGKILL", `${label} must be killed by SIGKILL`);
+}
+
 function waitForPath(path, timeoutMs = 15_000) {
   return new Promise((resolve) => {
     const deadline = Date.now() + timeoutMs;
@@ -949,7 +959,7 @@ try {
   assert.equal(await waitForPath(prepareCrashMarker), true, "controller must reach candidate preparation before SIGKILL");
   killController(prepareCrashController, prepareCrashMarker);
   const prepareCrashResult = await prepareCrashController.result;
-  assert.equal(prepareCrashResult.signal, "SIGKILL", "preparation controller must be killed abruptly");
+  assertControllerKilledAbruptly(prepareCrashResult, "preparation controller");
   assert.equal(liveRuntimeOwner(prepareCrashLock), true, "abrupt preparation death must leave the old serving owner alive");
   assert.equal(pathExists(join(prepareCrashState, "deployment.lock")), true, "abrupt preparation death must leave a reclaimable deployment record");
   const prepareCrashRecovery = runRestart(writeEnvironment(prepareCrashState, 17684, { useExistingDist: true }));
@@ -982,7 +992,7 @@ try {
   assert.equal(pathExists(join(fakeTmuxState, "kontrol-server.pid")), false, "post-stop pause must occur after the old server session is gone");
   killController(postStopCrashController, postStopCrashMarker);
   const postStopCrashResult = await postStopCrashController.result;
-  assert.equal(postStopCrashResult.signal, "SIGKILL", "post-stop controller must be killed abruptly");
+  assertControllerKilledAbruptly(postStopCrashResult, "post-stop controller");
   const postStopGenerationBeforeRecovery = JSON.parse(readFileSync(join(postStopCrashState, "generation.json"), "utf8"));
   assert.equal(postStopGenerationBeforeRecovery.activeBuildId, baseBuildId, "an interrupted handoff must retain A as the committed generation");
   assert.equal(pathExists(join(postStopCrashState, "deployment.lock")), true, "post-stop controller death must leave a reclaimable deployment record");
