@@ -906,7 +906,7 @@ try {
 
   // Two deployment controllers must serialize before either can overwrite
   // candidate state or stop the serving generation.
-  removeLink(join(root, "dist"));
+  removeFixtureDirectoryProjection(join(root, "dist"), root);
   symlinkDirectory(baseRelease, join(root, "dist"));
   const concurrentState = mkdtempSync(join(harnessRoot, "state-concurrent-"));
   const concurrentEnv = writeEnvironment(concurrentState, 17681, { useExistingDist: true, buildDelaySeconds: "2" });
@@ -936,7 +936,7 @@ try {
   // that happens during candidate preparation, the serving generation must
   // remain intact and a later controller must be able to reclaim the stale
   // deployment lock and complete a new handoff.
-  removeLink(join(root, "dist"));
+  removeFixtureDirectoryProjection(join(root, "dist"), root);
   symlinkDirectory(baseRelease, join(root, "dist"));
   const prepareCrashState = mkdtempSync(join(harnessRoot, "state-controller-crash-prepare-"));
   const prepareCrashEnv = writeEnvironment(prepareCrashState, 17684, { useExistingDist: true });
@@ -965,7 +965,7 @@ try {
   // controller has acquired serving ownership. The next controller must
   // converge by activating a candidate and, when that candidate is unhealthy,
   // restoring the exact committed A release rather than leaving no owner.
-  removeLink(join(root, "dist"));
+  removeFixtureDirectoryProjection(join(root, "dist"), root);
   symlinkDirectory(baseRelease, join(root, "dist"));
   const postStopCrashState = mkdtempSync(join(harnessRoot, "state-controller-crash-post-stop-"));
   const postStopCrashEnv = writeEnvironment(postStopCrashState, 17685, { useExistingDist: true });
@@ -998,7 +998,7 @@ try {
   process.kill(postStopCrashLock.launcherPid, "SIGTERM");
   stopFakeSessions();
 
-  removeLink(join(root, "dist"));
+  removeFixtureDirectoryProjection(join(root, "dist"), root);
   removeGeneratedArtifact(join(root, "dist.previous"), undefined);
   symlinkDirectory(baseRelease, join(root, "dist"));
 
@@ -1039,7 +1039,7 @@ try {
   // The old generation is stopped before activation starts. Force the first
   // runtime-lock acquisition in that activation to fail; the activation trap
   // must reacquire ownership and restore A rather than leaving the stack down.
-  removeLink(join(root, "dist"));
+  removeFixtureDirectoryProjection(join(root, "dist"), root);
   symlinkDirectory(baseRelease, join(root, "dist"));
   const gapState = mkdtempSync(join(harnessRoot, "state-handoff-gap-"));
   const gapMarker = join(harnessRoot, "fail-runtime-lock-once");
@@ -1064,7 +1064,7 @@ try {
   // The deployment-lock check itself is another post-stop boundary. A fresh
   // controller must recover the exact committed release instead of exiting
   // with no runtime owner and no rollback attempt.
-  removeLink(join(root, "dist"));
+  removeFixtureDirectoryProjection(join(root, "dist"), root);
   symlinkDirectory(baseRelease, join(root, "dist"));
   const deploymentGapState = mkdtempSync(join(harnessRoot, "state-deployment-gap-"));
   const deploymentGapMarker = join(harnessRoot, "fail-deployment-check-once");
@@ -1090,7 +1090,7 @@ try {
   process.kill(deploymentGapLock.launcherPid, "SIGTERM");
   stopFakeSessions();
 
-  removeLink(join(root, "dist"));
+  removeFixtureDirectoryProjection(join(root, "dist"), root);
   removeGeneratedArtifact(join(root, "dist.previous"), undefined);
   symlinkDirectory(baseRelease, join(root, "dist"));
   const rollbackState = mkdtempSync(join(harnessRoot, "state-rollback-"));
@@ -1131,7 +1131,7 @@ try {
   // rollback attempt to fail. restart-kontrol.sh must then recover through
   // its outer emergency trap, using the candidate record's build ID rather
   // than silently recording "unknown" provenance.
-  removeLink(join(root, "dist"));
+  removeFixtureDirectoryProjection(join(root, "dist"), root);
   symlinkDirectory(baseRelease, join(root, "dist"));
   const outerRecoveryState = mkdtempSync(join(harnessRoot, "state-outer-recovery-"));
   const outerRecoveryMarker = join(harnessRoot, "fail-server-launch-twice");
@@ -1154,7 +1154,7 @@ try {
   process.kill(outerRecoveryLock.launcherPid, "SIGTERM");
   stopFakeSessions();
 
-  removeLink(join(root, "dist"));
+  removeFixtureDirectoryProjection(join(root, "dist"), root);
   removeGeneratedArtifact(join(root, "dist.previous"), undefined);
   symlinkDirectory(baseRelease, join(root, "dist"));
   const failedRollbackState = mkdtempSync(join(harnessRoot, "state-rollback-failed-"));
