@@ -1,7 +1,7 @@
 import { homedir } from "node:os";
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { lstat, realpath } from "node:fs/promises";
-import { lstatSync, realpathSync } from "node:fs";
+import { lstatSync, realpathSync, statSync } from "node:fs";
 
 export class AccessDeniedError extends Error {
   constructor(message: string) {
@@ -45,7 +45,30 @@ function normalizeContainmentPath(path: string): string {
 /** Compare existing filesystem roots after resolving OS aliases such as macOS /var. */
 export function isPathInsideRootCanonical(path: string, root: string): boolean {
   try {
-    return isPathInsideRoot(realpathSync(path), realpathSync(root));
+    const canonicalPath = realpathSync(path);
+    const canonicalRoot = realpathSync(root);
+    if (isPathInsideRoot(canonicalPath, canonicalRoot)) return true;
+
+    // Windows may preserve 8.3 aliases in one canonical path while returning
+    // the long name for the other. Compare filesystem identity while walking
+    // the resolved candidate's parent chain so equivalent spellings of the
+    // same directory stay authorized. Symlinks have already been resolved;
+    // inaccessible paths or unstable file IDs remain fail closed.
+    if (process.platform === "win32") {
+      const rootIdentity = statSync(canonicalRoot);
+      if (rootIdentity.ino === 0) return false;
+      let current = canonicalPath;
+      while (true) {
+        const candidateIdentity = statSync(current);
+        if (candidateIdentity.ino !== 0
+          && candidateIdentity.dev === rootIdentity.dev
+          && candidateIdentity.ino === rootIdentity.ino) return true;
+        const parent = dirname(current);
+        if (parent === current) return false;
+        current = parent;
+      }
+    }
+    return false;
   } catch {
     // Authorization checks fail closed when either canonical path cannot be
     // established; lexical containment cannot rule out an inaccessible link.
