@@ -267,7 +267,7 @@ writeExecutable(join(fakeBin, "npm"), [
   "fi",
   "if [ \"$task\" = \"build\" ]; then",
   "  if [ -n \"${FAKE_BUILD_DELAY_SECONDS:-}\" ]; then /bin/sleep \"$FAKE_BUILD_DELAY_SECONDS\"; fi",
-  "  candidate=\"$FAKE_REPO_ROOT/releases/$FAKE_CANDIDATE_BUILD_ID\"",
+  "  candidate=\"$(printf '%s' \"$FAKE_REPO_ROOT\" | tr \"\\\\\\\\\" \"/\")/releases/$FAKE_CANDIDATE_BUILD_ID\"",
   "  mkdir -p \"$candidate/ui\"",
   "  printf '{\"buildId\":\"%s\",\"schemaVersion\":0,\"minReadableSchemaVersion\":0,\"maxReadableSchemaVersion\":0,\"releaseFormatVersion\":2}\\n' \"$FAKE_CANDIDATE_BUILD_ID\" > \"$candidate/build-meta.json\"",
   "  : > \"$candidate/cli.js\"",
