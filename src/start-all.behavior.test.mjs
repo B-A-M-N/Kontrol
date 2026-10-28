@@ -603,6 +603,13 @@ function writeEnvironment(stateDir, port, options) {
   // escape characters there, so keep fixture paths in the slash form that
   // Bash and Node both accept on Windows.
   const shellPath = (path) => process.platform === "win32" ? path.replaceAll("\\", "/") : path;
+  // Marker paths are consumed by Git Bash builtins and POSIX utilities. A
+  // native `C:/...` path works for Node but is not a reliable Bash path; use
+  // the MSYS `/c/...` spelling for these shell-only values.
+  const shellMarkerPath = (path) => {
+    const normalized = shellPath(path);
+    return process.platform === "win32" ? normalized.replace(/^([A-Za-z]):\//, (_, drive) => `/${drive.toLowerCase()}/`) : normalized;
+  };
   writeFileSync(envPath, [
     "HOST=127.0.0.1",
     "PORT=" + port,
@@ -624,18 +631,18 @@ function writeEnvironment(stateDir, port, options) {
     "FAKE_CANDIDATE_BUILD_ID=" + candidateBuildId,
     "FAKE_FAIL_BUILD_ID=" + (opts.failBuildId || ""),
     "FAKE_FAIL_APP_PROBE_BUILD_ID=" + (opts.failAppProbeBuildId || ""),
-    "FAKE_ROLLBACK_APP_PROBE_MARKER=" + (opts.rollbackAppProbeMarker || ""),
+    "FAKE_ROLLBACK_APP_PROBE_MARKER=" + (opts.rollbackAppProbeMarker ? shellMarkerPath(opts.rollbackAppProbeMarker) : ""),
     "FAKE_FAIL_ALL=" + (opts.failAll ? "true" : "false"),
     "FAKE_FAIL_RUNTIME_LOCK_ACQUIRE_ONCE=" + (opts.failRuntimeLockAcquireOnce ? "true" : "false"),
-    "FAKE_RUNTIME_LOCK_FAILURE_MARKER=" + (opts.runtimeLockFailureMarker || ""),
+    "FAKE_RUNTIME_LOCK_FAILURE_MARKER=" + (opts.runtimeLockFailureMarker ? shellMarkerPath(opts.runtimeLockFailureMarker) : ""),
     "FAKE_FAIL_DEPLOYMENT_LOCK_CHECK_ONCE=" + (opts.failDeploymentLockCheckOnce ? "true" : "false"),
     "FAKE_REMOVE_DEPLOYMENT_LOCK_ON_CHECK_ONCE=" + (opts.removeDeploymentLockOnCheckOnce ? "true" : "false"),
-    "FAKE_DEPLOYMENT_LOCK_FAILURE_MARKER=" + (opts.deploymentLockFailureMarker || ""),
-    "FAKE_FAIL_SERVER_LAUNCH_MARKER=" + (opts.failServerLaunchMarker || ""),
+    "FAKE_DEPLOYMENT_LOCK_FAILURE_MARKER=" + (opts.deploymentLockFailureMarker ? shellMarkerPath(opts.deploymentLockFailureMarker) : ""),
+    "FAKE_FAIL_SERVER_LAUNCH_MARKER=" + (opts.failServerLaunchMarker ? shellMarkerPath(opts.failServerLaunchMarker) : ""),
     "FAKE_BUILD_DELAY_SECONDS=" + (opts.buildDelaySeconds || ""),
     "FAKE_PAUSE_RELEASE_PROBE=" + (opts.pauseReleaseProbe ? "true" : "false"),
     "FAKE_PAUSE_RUNTIME_LOCK_ACQUIRE=" + (opts.pauseRuntimeLockAcquire ? "true" : "false"),
-    "FAKE_PAUSE_MARKER=" + (opts.pauseMarker || ""),
+    "FAKE_PAUSE_MARKER=" + (opts.pauseMarker ? shellMarkerPath(opts.pauseMarker) : ""),
   ].join("\n") + "\n");
   return envPath;
 }
