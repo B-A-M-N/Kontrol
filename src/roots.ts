@@ -55,12 +55,12 @@ export function isPathInsideRootCanonical(path: string, root: string): boolean {
     // same directory stay authorized. Symlinks have already been resolved;
     // inaccessible paths or unstable file IDs remain fail closed.
     if (process.platform === "win32") {
-      const rootIdentity = statSync(canonicalRoot);
-      if (rootIdentity.ino === 0) return false;
+      const rootIdentity = statSync(canonicalRoot, { bigint: true });
+      if (rootIdentity.ino === 0n) return false;
       let current = canonicalPath;
       while (true) {
-        const candidateIdentity = statSync(current);
-        if (candidateIdentity.ino !== 0
+        const candidateIdentity = statSync(current, { bigint: true });
+        if (candidateIdentity.ino !== 0n
           && candidateIdentity.dev === rootIdentity.dev
           && candidateIdentity.ino === rootIdentity.ino) return true;
         const parent = dirname(current);
