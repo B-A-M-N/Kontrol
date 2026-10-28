@@ -1040,7 +1040,7 @@ try {
   assert.equal(handoffGeneration.activeBuildId, baseBuildId);
   assert.equal(handoffGeneration.lastKnownGoodBuildId, baseBuildId);
   assert.equal(normalizeFilesystemPath(handoffGeneration.lastKnownGoodArtifactPath), canonicalBaseRelease);
-  assert.equal(normalizeFilesystemPath(readlinkSync(join(root, "dist"))), canonicalBaseRelease);
+  assert.equal(normalizeFilesystemPath(realpathSync(join(root, "dist"))), canonicalBaseRelease);
 
   // Rebuild the same failing candidate again. Rollback must continue to use
   // the committed A record; the failed B candidate must never become the
@@ -1054,7 +1054,7 @@ try {
   assert.equal(repeatedHandoffGeneration.lastKnownGoodBuildId, baseBuildId);
   assert.equal(normalizeFilesystemPath(repeatedHandoffGeneration.lastKnownGoodArtifactPath), canonicalBaseRelease);
   assert.notEqual(repeatedHandoffGeneration.lastKnownGoodBuildId, candidateBuildId);
-  assert.equal(normalizeFilesystemPath(readlinkSync(join(root, "dist"))), canonicalBaseRelease);
+  assert.equal(normalizeFilesystemPath(realpathSync(join(root, "dist"))), canonicalBaseRelease);
   const repeatedHandoffLock = JSON.parse(readFileSync(join(handoffState, "runtime.lock"), "utf8"));
   process.kill(repeatedHandoffLock.launcherPid, "SIGTERM");
   stopFakeSessions();
@@ -1143,9 +1143,9 @@ try {
   assert.equal(rollbackDeployment.requestedBuildId, candidateBuildId);
   assert.equal(rollbackDeployment.failedBuildId, candidateBuildId);
   assert.equal(rollbackDeployment.lastKnownGoodBuildId, baseBuildId);
-  assert.equal(normalizeFilesystemPath(readlinkSync(join(root, "dist"))), canonicalBaseRelease);
+  assert.equal(normalizeFilesystemPath(realpathSync(join(root, "dist"))), canonicalBaseRelease);
   assert.ok(pathExists(candidateRelease), "failed candidate release must be retained for forensics");
-  assert.equal(normalizeFilesystemPath(readlinkSync(join(root, "dist"))), canonicalBaseRelease, "failed candidate must not replace the active projection");
+  assert.equal(normalizeFilesystemPath(realpathSync(join(root, "dist"))), canonicalBaseRelease, "failed candidate must not replace the active projection");
   const rollbackLock = JSON.parse(readFileSync(join(rollbackState, "runtime.lock"), "utf8"));
   process.kill(rollbackLock.launcherPid, "SIGTERM");
   stopFakeSessions();
@@ -1189,7 +1189,7 @@ try {
   assert.equal(failedGeneration.rollback, true);
   assert.equal(failedGeneration.failedBuildId, candidateBuildId);
   assert.equal(pathExists(join(failedRollbackState, "runtime.lock")), false, "failed controller must release its lock");
-  assert.equal(normalizeFilesystemPath(readlinkSync(join(root, "dist"))), normalizeFilesystemPath(baseRelease));
+  assert.equal(normalizeFilesystemPath(realpathSync(join(root, "dist"))), normalizeFilesystemPath(baseRelease));
   console.log("start-all.behavior.test.mjs: startup, lock handoff, conflict, crash recovery, rollback, and failed rollback passed");
 } finally {
   restoreHarness();
