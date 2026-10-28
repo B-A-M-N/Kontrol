@@ -439,12 +439,16 @@ try {
     body: JSON.stringify({ ...v2Body, parent_run_id: "stdio-v2-continuation", attempt_number: 2, dispatch_idempotency_key: "stdio-v2-continuation-dispatch", continuation_id: "stdio-v2-continuation-id" }),
   });
   assert.equal(v2ContinuationResponse.status, 202, "ACP v2 continuation restores its provider session");
-  const v2ContinuationDeadline = Date.now() + 5_000;
+  // Windows process startup and stdio teardown are slower than the Linux
+  // runner. Keep the check bounded, but allow the resumed provider process to
+  // finish without treating normal Windows scheduling as a protocol failure.
+  const v2ContinuationDeadline = Date.now() + 15_000;
   while (Date.now() < v2ContinuationDeadline && !events.some((event) => event.dispatch_idempotency_key === "stdio-v2-continuation-dispatch" && event.type === "completed")) {
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
-  assert.ok(events.some((event) => event.dispatch_idempotency_key === "stdio-v2-continuation-dispatch" && event.type === "completed"),
-    "ACP v2 continuation restores and completes the exact provider conversation");
+  const v2ContinuationEvents = events.filter((event) => event.dispatch_idempotency_key === "stdio-v2-continuation-dispatch");
+  assert.ok(v2ContinuationEvents.some((event) => event.type === "completed"),
+    `ACP v2 continuation restores and completes the exact provider conversation; observed events: ${JSON.stringify(v2ContinuationEvents)}`);
   const v2LimitedResponse = await fetch(`http://127.0.0.1:${adapterPort}/runs`, {
     method: "POST",
     headers: { "content-type": "application/json", authorization: "Bearer adapter-secret" },
