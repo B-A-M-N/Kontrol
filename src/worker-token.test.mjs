@@ -46,7 +46,10 @@ t("wrong secret rejected", () => {
   assert.throws(() => verifyWorkerToken(signWorkerToken(baseClaims, secret), "wrong"), WorkerTokenError);
 });
 t("tampered signature rejected", () => {
-  const tok = signWorkerToken(baseClaims, secret).slice(0, -2) + "ZZ";
+  const [header, payload, signature] = signWorkerToken(baseClaims, secret).split(".");
+  const tamperedSignature = Buffer.from(signature, "base64url");
+  tamperedSignature[0] ^= 0x01;
+  const tok = `${header}.${payload}.${tamperedSignature.toString("base64url")}`;
   assert.throws(() => verifyWorkerToken(tok, secret), WorkerTokenError);
 });
 t("tampered payload rejected", () => {
