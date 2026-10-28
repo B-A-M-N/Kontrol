@@ -11,6 +11,7 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  rmdirSync,
   readlinkSync,
   renameSync,
   symlinkSync,
@@ -299,6 +300,34 @@ function removeLink(path) {
   } catch (error) {
     if (error?.code !== "ENOENT") throw error;
   }
+}
+
+function removeFixtureDirectoryProjection(path, expectedTarget) {
+  let stats;
+  try {
+    stats = lstatSync(path);
+  } catch (error) {
+    if (error?.code === "ENOENT") return;
+    throw error;
+  }
+  const actualTarget = realpathSync(path);
+  const expectedRealTarget = realpathSync(expectedTarget);
+  const normalize = (value) => process.platform === "win32" ? value.toLowerCase() : value;
+  if (normalize(actualTarget) !== normalize(expectedRealTarget)) {
+    throw new Error(`behavior harness refuses to remove projection outside its expected release: ${path}`);
+  }
+  if (stats.isSymbolicLink()) {
+    unlinkSync(path);
+    return;
+  }
+  // Node's lstat reports Windows directory junctions as directories on some
+  // runner versions. rmdir removes the junction itself; the realpath identity
+  // check above ensures it still targets this test's owned release.
+  if (process.platform === "win32" && stats.isDirectory()) {
+    rmdirSync(path);
+    return;
+  }
+  throw new Error(`behavior harness refuses to remove non-link ${path}`);
 }
 
 function removeGeneratedArtifact(path, originalBackup) {
@@ -793,7 +822,7 @@ try {
   // a rollback attempting to restore the failed candidate to itself. The
   // mutable dist projection is deliberately absent: generation.json is the
   // authoritative pointer once an immutable release has been committed.
-  removeLink(join(root, "dist"));
+  removeFixtureDirectoryProjection(join(root, "dist"), baseRelease);
   const sameGenerationRestart = runLauncher(successfulEnv);
   assert.equal(sameGenerationRestart.status, 0, "restarting the committed release without a dist projection should be allowed:\n" + sameGenerationRestart.stdout + "\n" + sameGenerationRestart.stderr);
   assert.match(sameGenerationRestart.stdout + sameGenerationRestart.stderr, /Reusing previously validated immutable release/);
