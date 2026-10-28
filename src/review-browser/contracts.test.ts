@@ -427,13 +427,18 @@ try {
       crashController.createProfile({ profileId: "crash-handoff", ownerPrincipalId: "reviewer-1" });
       crashController.profiles.transition({ profileId: "crash-handoff", expectedGeneration: 0, status: "starting", authState: "manual_auth_in_progress" });
       const directory = await crashController.profiles.profileDirectory("crash-handoff");
-      simulatedChrome = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", `--user-data-dir=${directory}`], { stdio: "ignore" });
+      const simulatedChromeTitle = `Chrome --user-data-dir=${directory}`;
+      simulatedChrome = spawn(process.execPath, ["-e", `process.title = ${JSON.stringify(simulatedChromeTitle)}; setInterval(() => {}, 1000);`], { stdio: "ignore" });
       await new Promise<void>((resolve, reject) => {
         simulatedChrome!.once("spawn", resolve);
         simulatedChrome!.once("error", reject);
       });
       await symlink(`${hostname()}-${simulatedChrome.pid}`, join(directory, "SingletonLock"));
-      const observedOwner = await inspectChromeProfileOwner(directory);
+      let observedOwner = await inspectChromeProfileOwner(directory);
+      for (let attempt = 0; observedOwner.status === "unknown" && attempt < 20; attempt += 1) {
+        await new Promise((resolveDelay) => setTimeout(resolveDelay, 25));
+        observedOwner = await inspectChromeProfileOwner(directory);
+      }
       assert.equal(observedOwner.status, "owned", "Chrome's actual profile lock recovers ownership before its PID reaches the database");
       assert.equal(observedOwner.pid, simulatedChrome.pid);
       const reconciled = await crashController.completeManualAuthentication("crash-handoff");
