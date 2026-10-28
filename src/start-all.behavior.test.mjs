@@ -14,6 +14,7 @@ import {
   rmdirSync,
   readlinkSync,
   renameSync,
+  statSync,
   symlinkSync,
   unlinkSync,
   writeFileSync,
@@ -23,7 +24,7 @@ import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const realCheckoutRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
@@ -302,7 +303,7 @@ function removeLink(path) {
   }
 }
 
-function removeFixtureDirectoryProjection(path, expectedTarget) {
+function removeFixtureDirectoryProjection(path, fixtureRoot) {
   let stats;
   try {
     stats = lstatSync(path);
@@ -311,23 +312,55 @@ function removeFixtureDirectoryProjection(path, expectedTarget) {
     throw error;
   }
   const actualTarget = realpathSync(path);
-  const expectedRealTarget = realpathSync(expectedTarget);
-  const normalize = (value) => process.platform === "win32" ? value.toLowerCase() : value;
-  if (normalize(actualTarget) !== normalize(expectedRealTarget)) {
-    throw new Error(`behavior harness refuses to remove projection outside its expected release: ${path}`);
+  const fixtureRealRoot = realpathSync(fixtureRoot);
+  let contained = false;
+  if (process.platform === "win32") {
+    // Windows may spell the same temp root through its long or 8.3 name.
+    // Compare filesystem identity while walking the resolved target upward.
+    const rootStats = statSync(fixtureRealRoot);
+    if (rootStats.ino !== 0) {
+      let ancestor = actualTarget;
+      while (true) {
+        const ancestorStats = statSync(ancestor);
+        if (ancestorStats.dev === rootStats.dev && ancestorStats.ino === rootStats.ino) {
+          contained = true;
+          break;
+        }
+        const parent = dirname(ancestor);
+        if (parent === ancestor) break;
+        ancestor = parent;
+      }
+    }
+  } else {
+    const relativeTarget = relative(fixtureRealRoot, actualTarget);
+    contained = relativeTarget === ""
+      || (relativeTarget !== ".." && !relativeTarget.startsWith(`..${sep}`) && !isAbsolute(relativeTarget));
+  }
+  if (!contained) {
+    throw new Error(`behavior harness refuses to remove projection outside its owned fixture: ${path}`);
   }
   if (stats.isSymbolicLink()) {
     unlinkSync(path);
     return;
   }
   // Node's lstat reports Windows directory junctions as directories on some
-  // runner versions. rmdir removes the junction itself; the realpath identity
-  // check above ensures it still targets this test's owned release.
+  // runner versions. rmdir removes the junction itself. If it is a real
+  // fixture directory instead, remove it recursively only after the resolved
+  // target has been proven to remain inside this test's private checkout.
   if (process.platform === "win32" && stats.isDirectory()) {
-    rmdirSync(path);
+    try {
+      rmdirSync(path);
+    } catch (error) {
+      if (error?.code !== "ENOTEMPTY" && error?.code !== "EEXIST") throw error;
+      rmSync(path, { recursive: true, force: true });
+    }
     return;
   }
-  throw new Error(`behavior harness refuses to remove non-link ${path}`);
+  if (stats.isDirectory()) {
+    rmSync(path, { recursive: true, force: true });
+    return;
+  }
+  throw new Error(`behavior harness refuses to remove non-directory projection ${path}`);
 }
 
 function removeGeneratedArtifact(path, originalBackup) {
@@ -822,7 +855,7 @@ try {
   // a rollback attempting to restore the failed candidate to itself. The
   // mutable dist projection is deliberately absent: generation.json is the
   // authoritative pointer once an immutable release has been committed.
-  removeFixtureDirectoryProjection(join(root, "dist"), baseRelease);
+  removeFixtureDirectoryProjection(join(root, "dist"), root);
   const sameGenerationRestart = runLauncher(successfulEnv);
   assert.equal(sameGenerationRestart.status, 0, "restarting the committed release without a dist projection should be allowed:\n" + sameGenerationRestart.stdout + "\n" + sameGenerationRestart.stderr);
   assert.match(sameGenerationRestart.stdout + sameGenerationRestart.stderr, /Reusing previously validated immutable release/);
