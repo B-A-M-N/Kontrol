@@ -889,7 +889,8 @@ try {
   });
   const transientDeploymentRestart = runRestart(transientDeploymentEnv);
   assert.equal(transientDeploymentRestart.status, 0, "transient deployment-lock check failure should not break restart:\n" + transientDeploymentRestart.stdout + "\n" + transientDeploymentRestart.stderr);
-  assert.match(transientDeploymentRestart.stdout + "\n" + transientDeploymentRestart.stderr, /injected deployment ownership check failure/);
+  assert.equal(existsSync(transientDeploymentMarker), false,
+    "the one-shot deployment-lock failure must have been injected before recovery:\n" + transientDeploymentRestart.stdout + "\n" + transientDeploymentRestart.stderr);
   const transientDeploymentGeneration = JSON.parse(readFileSync(join(successfulState, "generation.json"), "utf8"));
   assert.equal(transientDeploymentGeneration.status, "active");
   const transientDeploymentLock = JSON.parse(readFileSync(join(successfulState, "runtime.lock"), "utf8"));
@@ -1070,7 +1071,8 @@ try {
   assert.equal(deploymentGapStart.status, 0, "deployment-gap baseline generation failed:\n" + deploymentGapStart.stdout + "\n" + deploymentGapStart.stderr);
   writeFileSync(deploymentGapMarker, "fail once\n");
   const deploymentGapRestart = runRestart(deploymentGapEnv);
-  assert.match(deploymentGapRestart.stdout + "\n" + deploymentGapRestart.stderr, /injected deployment ownership check failure/);
+  assert.equal(existsSync(deploymentGapMarker), false,
+    "the one-shot deployment-lock failure must have been injected before ownership recovery:\n" + deploymentGapRestart.stdout + "\n" + deploymentGapRestart.stderr);
   assert.equal(deploymentGapRestart.status, 0, "a pure deployment-lock recovery restores service without a failed candidate activation:\n" + deploymentGapRestart.stdout + "\n" + deploymentGapRestart.stderr);
   const deploymentGapGeneration = JSON.parse(readFileSync(join(deploymentGapState, "generation.json"), "utf8"));
   assert.equal(deploymentGapGeneration.status, "rolled_back");
