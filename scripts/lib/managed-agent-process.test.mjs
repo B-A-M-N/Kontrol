@@ -10,12 +10,26 @@ import {
   processAlive,
   processStartToken,
   readJsonOr,
+  renameWithRetry,
   reconcileOwnedProcesses,
   terminateProcessGroup,
 } from "./managed-agent-process.mjs";
 
 const root = await mkdtemp(join(tmpdir(), "kontrol-managed-agent-process-"));
 try {
+  let renameAttempts = 0;
+  await renameWithRetry("temporary.json", "state.json", async () => {
+    renameAttempts++;
+    if (renameAttempts < 3) throw Object.assign(new Error("transient destination lock"), { code: "EPERM" });
+  });
+  assert.equal(renameAttempts, 3, "atomic publication retries transient filesystem locks");
+  let permanentRenameAttempts = 0;
+  await assert.rejects(renameWithRetry("temporary.json", "state.json", async () => {
+    permanentRenameAttempts++;
+    throw Object.assign(new Error("destination missing"), { code: "ENOENT" });
+  }), { code: "ENOENT" });
+  assert.equal(permanentRenameAttempts, 1, "atomic publication does not retry permanent rename failures");
+
   const statePath = join(root, "state.json");
   await Promise.all(
     Array.from({ length: 24 }, (_, index) => atomicWriteJson(statePath, { writer: index })),

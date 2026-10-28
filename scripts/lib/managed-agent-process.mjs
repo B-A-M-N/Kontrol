@@ -6,6 +6,8 @@ import { dirname, join } from "node:path";
 import { once } from "node:events";
 
 const atomicWriteQueues = new Map();
+const ATOMIC_RENAME_RETRY_DELAYS_MS = [10, 20, 40, 80, 160];
+const TRANSIENT_RENAME_ERROR_CODES = new Set(["EPERM", "EACCES", "EBUSY"]);
 
 async function withAtomicWriteLock(path, operation) {
   const preceding = atomicWriteQueues.get(path) ?? Promise.resolve();
@@ -258,12 +260,27 @@ export async function atomicWriteJson(path, value) {
       } finally {
         await handle.close();
       }
-      await rename(temporary, path);
+      await renameWithRetry(temporary, path);
     } catch (error) {
       await unlink(temporary).catch(() => {});
       throw error;
     }
   });
+}
+
+/** Retry short-lived destination locks (notably Windows antivirus/indexer
+ * handles) without weakening the atomic replace or hiding persistent errors. */
+export async function renameWithRetry(source, destination, renameOperation = rename) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await renameOperation(source, destination);
+      return;
+    } catch (error) {
+      const delayMs = ATOMIC_RENAME_RETRY_DELAYS_MS[attempt];
+      if (!delayMs || !TRANSIENT_RENAME_ERROR_CODES.has(error?.code)) throw error;
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
 }
 
 export async function readJsonOr(path, fallback) {
