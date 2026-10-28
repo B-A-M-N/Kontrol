@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, realpathSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, readFileSync, realpathSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { dirname, resolve, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -136,31 +136,42 @@ async function acquireRuntimeLockGuard(stateDir: string): Promise<RuntimeLockGua
     pid: process.pid,
     startToken: processStartToken(process.pid),
   };
+  const candidatePath = `${path}.${guard.token}.candidate`;
+  // Publish only a complete guard record. O_EXCL on a newly created file
+  // exposes the pathname before its JSON bytes are written; another process
+  // can mistake that transient empty file for a stale guard and reclaim it.
+  // A hard link atomically installs this already-complete inode without
+  // replacing a guard another contender installed first.
+  writeFileSync(candidatePath, `${JSON.stringify(guard)}\n`, { flag: "wx", mode: 0o600 });
   const deadline = Date.now() + 10_000;
-  for (;;) {
-    try {
-      writeFileSync(path, `${JSON.stringify(guard)}\n`, { flag: "wx", mode: 0o600 });
-      return guard;
-    } catch (error) {
-      const errno = error as NodeJS.ErrnoException;
-      if (errno.code !== "EEXIST") throw error;
-      let existing: RuntimeLockGuardRecord | undefined;
-      try { existing = JSON.parse(readFileSync(path, "utf8")) as RuntimeLockGuardRecord; } catch { /* reclaim malformed guard atomically */ }
-      if (isRuntimeLockGuardLive(existing)) {
-        if (Date.now() >= deadline) throw new Error("Timed out waiting for Kontrol runtime-lock arbitration.");
-        await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
-        continue;
-      }
-      // Rename is the arbitration step for stale takeover. Only the process
-      // that wins this atomic rename may remove the stale guard and retry O_EXCL.
-      const reclaimPath = `${path}.reclaim-${guard.token}`;
+  try {
+    for (;;) {
       try {
-        renameSync(path, reclaimPath);
-        unlinkSync(reclaimPath);
-      } catch {
-        // Another contender won the stale-guard race; re-read and retry.
+        linkSync(candidatePath, path);
+        return guard;
+      } catch (error) {
+        const errno = error as NodeJS.ErrnoException;
+        if (errno.code !== "EEXIST") throw error;
+        let existing: RuntimeLockGuardRecord | undefined;
+        try { existing = JSON.parse(readFileSync(path, "utf8")) as RuntimeLockGuardRecord; } catch { /* reclaim malformed legacy guard atomically */ }
+        if (isRuntimeLockGuardLive(existing)) {
+          if (Date.now() >= deadline) throw new Error("Timed out waiting for Kontrol runtime-lock arbitration.");
+          await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
+          continue;
+        }
+        // Rename is the arbitration step for stale takeover. Only the process
+        // that wins this atomic rename may remove the stale guard and retry.
+        const reclaimPath = `${path}.reclaim-${guard.token}`;
+        try {
+          renameSync(path, reclaimPath);
+          unlinkSync(reclaimPath);
+        } catch {
+          // Another contender won the stale-guard race; re-read and retry.
+        }
       }
     }
+  } finally {
+    unlinkSync(candidatePath);
   }
 }
 

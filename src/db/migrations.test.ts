@@ -4,7 +4,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { databasePath, openDatabase } from "./client.js";
-import { inspectDatabaseSchemaContract, LATEST_SCHEMA_VERSION, migrateDatabase } from "./migrations.js";
+import { inspectDatabaseSchemaContract, LATEST_SCHEMA_VERSION, migrationChain, migrateDatabase } from "./migrations.js";
+
+assert.deepEqual(
+  migrationChain.map((migration) => migration.version),
+  Array.from({ length: LATEST_SCHEMA_VERSION }, (_, index) => index + 1),
+  "migration versions are contiguous, ordered, and represented exactly once",
+);
+assert.equal(
+  new Set(migrationChain.map((migration) => migration.name)).size,
+  migrationChain.length,
+  "migration names are unique",
+);
 
 const sqlite = new Database(":memory:");
 sqlite.pragma("foreign_keys = ON");

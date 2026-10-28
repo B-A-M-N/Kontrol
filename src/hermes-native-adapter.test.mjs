@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { dirname, join } from "node:path";
 import { readFileSync } from "node:fs";
 import { hermesAcpCandidates, selectHermesAcpEntry } from "../scripts/lib/hermes-acp-entry.mjs";
 import { classifyHermesStopReason } from "../scripts/lib/hermes-stop-reason.mjs";
@@ -150,7 +151,7 @@ const currentCandidates = hermesAcpCandidates({
   hermesBinPath: "/opt/hermes/bin/hermes",
 });
 assert.deepEqual(currentCandidates.slice(0, 2).map(({ command, args }) => ({ command, args })), [
-  { command: "/opt/hermes/bin/hermes-acp", args: [] },
+  { command: join(dirname("/opt/hermes/bin/hermes"), "hermes-acp"), args: [] },
   { command: "hermes-acp", args: [] },
 ], "the upstream standalone ACP entry is preferred to the compatibility subcommand");
 assert.deepEqual(currentCandidates.at(-1), {
@@ -181,7 +182,7 @@ const explicitLegacy = hermesAcpCandidates({
   hermesBinExplicit: true,
 });
 assert.deepEqual(explicitLegacy.slice(0, 2).map(({ command, args }) => ({ command, args })), [
-  { command: "/fixture/hermes-acp", args: [] },
+  { command: join(dirname("/fixture/hermes-test-double"), "hermes-acp"), args: [] },
   { command: "/fixture/hermes-test-double", args: ["acp"] },
 ], "an explicit HERMES_BIN does not get shadowed by an unrelated hermes-acp on PATH");
 

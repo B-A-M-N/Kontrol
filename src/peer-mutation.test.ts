@@ -260,7 +260,10 @@ let worktreeRootPath: string;
 
   // Test 3: direct-checkout mutation is denied.
   const checkout = await peer.callTool("open_workspace", { path: root, mode: "checkout" }, sessionId);
+  assert.equal(checkout.payload?.result?.isError, undefined,
+    `peer may open its granted checkout for inspection before a mutation is denied: ${JSON.stringify(checkout.payload)}`);
   const checkoutId = checkout.payload?.result?.structuredContent?.workspaceId;
+  assert.equal(typeof checkoutId, "string", `checkout open returns a workspaceId: ${JSON.stringify(checkout.payload)}`);
   const directWrite = await peer.callTool("write", { workspaceId: checkoutId, path: "direct.txt", content: "x" }, sessionId);
   assert.equal(directWrite.payload?.result?.isError, true, "direct checkout write must be denied for peers");
   assert.match(JSON.stringify(directWrite.payload), /managed worktrees/);

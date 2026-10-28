@@ -21,6 +21,7 @@ export function startMcpSseHeartbeat(
   let timer: NodeJS.Timeout;
   let stallTimer: NodeJS.Timeout | undefined;
   let stalledSince = 0;
+  let stalledSinceMonotonic = 0;
   let lastSuccessfulWriteAt = Date.now();
   let consecutiveStallCount = 0;
 
@@ -39,6 +40,7 @@ export function startMcpSseHeartbeat(
     stallTimer = undefined;
     lastSuccessfulWriteAt = Date.now();
     stalledSince = 0;
+    stalledSinceMonotonic = 0;
     onDrained();
   };
 
@@ -56,17 +58,25 @@ export function startMcpSseHeartbeat(
       if (!writable) {
         stalled = true;
         stalledSince = Date.now();
+        stalledSinceMonotonic = performance.now();
         consecutiveStallCount += 1;
         onStalled();
         const maxStallMs = options.maxStallMs ?? 30_000;
         if (maxStallMs > 0) {
-          stallTimer = setTimeout(() => {
+          const enforceStallDeadline = (): void => {
             if (stopped || !stalled) return;
+            const remainingMs = maxStallMs - (performance.now() - stalledSinceMonotonic);
+            if (remainingMs > 0) {
+              stallTimer = setTimeout(enforceStallDeadline, remainingMs);
+              stallTimer.unref?.();
+              return;
+            }
             const details = { stalledSince, lastSuccessfulWriteAt, consecutiveStallCount };
             stop();
             options.onStallTimeout?.(details);
             response.destroy?.(new Error("MCP SSE writer exceeded its stall deadline"));
-          }, maxStallMs);
+          };
+          stallTimer = setTimeout(enforceStallDeadline, maxStallMs);
           stallTimer.unref?.();
         }
       } else {

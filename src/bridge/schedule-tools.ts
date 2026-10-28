@@ -19,7 +19,7 @@ import { parseScheduledVerificationCommand } from "../scheduling/verification-pr
 import { verifyScheduledJob } from "../scheduling/scheduled-verification.js";
 import { projectScheduledVerification, scheduledVerificationFingerprints } from "../scheduling/scheduled-verification-projection.js";
 import { z } from "zod/v4";
-import { isPathInsideRoot } from "../roots.js";
+import { isPathInsideRootCanonical } from "../roots.js";
 import { getPeerJobStore } from "../peer/jobs/store.js";
 import { scheduledPeerJobId } from "../scheduling/scheduled-job-dispatch.js";
 
@@ -160,7 +160,7 @@ export function registerScheduleTools(server: McpServer, config: BridgeConfig): 
           if (missingCapabilities.length) {
             throw new Error(`Peer ${dispatchTarget.peerId} lacks required scheduled-job capabilities: ${missingCapabilities.join(", ")}.`);
           }
-          if (!peer.grantedRoots.some((root) => isPathInsideRoot(workspace.sourceRoot!, root))) {
+          if (!peer.grantedRoots.some((root) => isPathInsideRootCanonical(workspace.sourceRoot!, root))) {
             throw new Error(`Peer ${dispatchTarget.peerId} is not granted the selected worktree's source repository.`);
           }
         }

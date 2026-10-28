@@ -72,6 +72,20 @@ async function requestJson(url, { method = "GET", body, secret = ADAPTER_SECRET 
   return { response, json };
 }
 
+async function requestAfterSessionDrains(url, body) {
+  const deadline = Date.now() + 5_000;
+  let result;
+  do {
+    result = await requestJson(url, { method: "POST", body });
+    if (result.response.status !== 409 || result.json.error?.code !== "duplicate_session") return result;
+    // Terminal delivery is acknowledged before the adapter finishes its
+    // local child/session cleanup. A continuation is safe to retry only when
+    // the adapter explicitly rejects it as duplicate_session (pre-dispatch).
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  } while (Date.now() < deadline);
+  return result;
+}
+
 function makeReadOnlyBody({ workspaceRoot, agentId, runId, workSessionId, dispatchKey, grant, taskText = task, attemptNumber = 1, continuationId, contextTransfer }) {
   return {
     workspace_root: workspaceRoot,
@@ -550,9 +564,7 @@ async function runHermes(root) {
       dispatchKey: transferContinuationKey,
       attemptNumber: 4,
     });
-    const transferContinuation = await requestJson(`${baseUrl}/runs`, {
-      method: "POST",
-      body: makeReadOnlyBody({
+    const transferContinuation = await requestAfterSessionDrains(`${baseUrl}/runs`, makeReadOnlyBody({
         workspaceRoot: state.workspaceRoot,
         agentId,
         runId: transferRunId,
@@ -563,8 +575,7 @@ async function runHermes(root) {
         attemptNumber: 4,
         continuationId: "hermes-transfer-round-two",
         contextTransfer: { ...transferContext, fresh: false },
-      }),
-    });
+      }));
     assert.equal(transferContinuation.response.status, 202, `${transferContinuation.json.error?.message ?? "Hermes transfer continuation was not accepted"}\n${logs}`);
     const transferContinuationTerminal = await waitFor("Hermes transfer continuation terminal event", () => events.find((event) =>
       ["completed", "failed", "cancelled"].includes(event.type) && event.remote_run_id === transferContinuation.json.run_id))
@@ -609,12 +620,21 @@ async function runHermes(root) {
   }
 }
 
-const root = await mkdtemp(join(tmpdir(), "kontrol-readonly-adapters-"));
-try {
-  await mkdir(join(root, "crush"), { recursive: true });
-  await runCrush(join(root, "crush"));
-  await mkdir(join(root, "hermes"), { recursive: true });
-  await runHermes(join(root, "hermes"));
-} finally {
-  await rm(root, { recursive: true, force: true });
+if (process.platform !== "linux") {
+  assert.throws(
+    () => findBubblewrap(),
+    (error) => error?.code === "sandbox_unavailable",
+    "non-Linux hosts fail closed instead of claiming to run the Linux-only confined adapter integration",
+  );
+  console.log("acp-readonly-adapters.integration: unsupported platform fails closed; execution integration is Linux-only");
+} else {
+  const root = await mkdtemp(join(tmpdir(), "kontrol-readonly-adapters-"));
+  try {
+    await mkdir(join(root, "crush"), { recursive: true });
+    await runCrush(join(root, "crush"));
+    await mkdir(join(root, "hermes"), { recursive: true });
+    await runHermes(join(root, "hermes"));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 }

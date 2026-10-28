@@ -11,6 +11,7 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
+import { databasePath, openDatabase } from "./client.js";
 import { migrateDatabase, LATEST_SCHEMA_VERSION, migrationChain as migrations } from "./migrations.js";
 
 function newSqlite(): Database.Database {
@@ -91,6 +92,79 @@ function migrateUpTo(sqlite: Database.Database, targetVersion: number): void {
   }
 }
 console.log("migration-fixtures: previous-release upgrade with data survival passed");
+
+// ── Fixture A2: deployed schema 106 → current 108, with rollback image ──────
+{
+  const stateDir = mkdtempSync(join(tmpdir(), "kontrol-mig-v106-v108-"));
+  const path = databasePath(stateDir);
+  try {
+    const previous = new Database(path);
+    previous.pragma("foreign_keys = ON");
+    migrateUpTo(previous, 106);
+    previous.prepare(`
+      insert into review_browser_profiles (id, owner_principal_id, created_at, updated_at)
+      values (?, ?, ?, ?)
+    `).run("profile-v106", "owner-v106", "2026-10-26T00:00:00.000Z", "2026-10-26T00:00:00.000Z");
+    previous.close();
+
+    const upgraded = openDatabase(stateDir);
+    try {
+      const versions = appliedVersions(upgraded.sqlite);
+      assert.deepEqual(versions, Array.from({ length: 108 }, (_, index) => index + 1),
+        "schema 106 upgrades through migrations 107 and 108 exactly once");
+      assert.equal(Math.max(...versions), LATEST_SCHEMA_VERSION,
+        "the completed ledger agrees with the canonical current schema version");
+      assert.deepEqual(
+        upgraded.sqlite.prepare("select id, owner_principal_id, auth_state, generation from review_browser_profiles where id = ?")
+          .get("profile-v106"),
+        { id: "profile-v106", owner_principal_id: "owner-v106", auth_state: "unknown", generation: 0 },
+        "existing reviewer profile data survives the 106-to-108 upgrade",
+      );
+      const profileColumns = new Set((upgraded.sqlite.prepare("pragma table_info(review_browser_profiles)").all() as Array<{ name: string }>).map((column) => column.name));
+      for (const column of ["browser_ready_at", "manual_auth_pid", "manual_auth_process_start_identity", "manual_auth_boot_identity", "manual_auth_generation", "browser_product", "remote_debugging_enabled", "browser_launch_diagnostic"]) {
+        assert.ok(profileColumns.has(column), `migration 107/108 adds ${column}`);
+      }
+    } finally {
+      upgraded.close();
+    }
+
+    const backupPath = `${path}.pre-migration-v106-to-v108.bak`;
+    assert.ok(existsSync(backupPath), "106-to-108 upgrade retains its pre-migration database image");
+    const backup = new Database(backupPath, { readonly: true });
+    try {
+      assert.deepEqual(appliedVersions(backup), Array.from({ length: 106 }, (_, index) => index + 1),
+        "rollback image remains at schema 106");
+      assert.equal(
+        (backup.prepare("select count(*) as count from review_browser_profiles where id = ?").get("profile-v106") as { count: number }).count,
+        1,
+        "rollback image preserves pre-upgrade reviewer data",
+      );
+      const backupColumns = new Set((backup.prepare("pragma table_info(review_browser_profiles)").all() as Array<{ name: string }>).map((column) => column.name));
+      assert.equal(backupColumns.has("browser_ready_at"), false, "rollback image has no schema 107 changes");
+    } finally {
+      backup.close();
+    }
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+}
+console.log("migration-fixtures: schema 106 to 108 upgrade, data survival, and backup passed");
+
+// ── Fixture A3: failed 107 migration is atomic and fails closed ──────────────
+{
+  const sqlite = newSqlite();
+  try {
+    migrateUpTo(sqlite, 106);
+    sqlite.exec("drop table review_browser_profiles");
+    assert.throws(() => migrateDatabase(sqlite), /no such table: review_browser_profiles/,
+      "a migration whose expected source table is missing fails closed");
+    assert.deepEqual(appliedVersions(sqlite), Array.from({ length: 106 }, (_, index) => index + 1),
+      "failed migration does not advance the ledger or leave a partial 107/108 state");
+  } finally {
+    sqlite.close();
+  }
+}
+console.log("migration-fixtures: failed schema 107 migration rolled back atomically");
 
 // ── Fixture B: interrupted migration resumes cleanly ─────────────────────────
 {

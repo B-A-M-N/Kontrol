@@ -62,7 +62,7 @@ assert.equal(await readFile(join(root, "alpha.txt"), "utf8"), "one\nchanged\nthr
 assert.equal(await readFile(join(root, "windows.txt"), "utf8"), "first\r\nupdated\r\n");
 await assert.rejects(readFile(join(root, "remove.txt"), "utf8"), /ENOENT/);
 
-if (process.platform !== "win32") await chmod(join(root, "alpha.txt"), 0o755);
+if (String(process.platform) !== "win32") await chmod(join(root, "alpha.txt"), 0o755);
 const moveResult = await applyPatch(
   root,
   `*** Begin Patch
@@ -78,9 +78,7 @@ assert.deepEqual(moveResult.files, [
   { path: "moved/alpha.txt", previousPath: "alpha.txt", operation: "move" },
 ]);
 assert.equal(await readFile(join(root, "moved/alpha.txt"), "utf8"), "ONE\nchanged\nthree\n");
-if (process.platform !== "win32") {
-  assert.notEqual((await stat(join(root, "moved/alpha.txt"))).mode & 0o111, 0);
-}
+if (String(process.platform) !== "win32") assert.notEqual((await stat(join(root, "moved/alpha.txt"))).mode & 0o111, 0);
 await assert.rejects(readFile(join(root, "alpha.txt"), "utf8"), /ENOENT/);
 
 await assert.rejects(

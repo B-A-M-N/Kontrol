@@ -11,8 +11,10 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  rmdirSync,
   readlinkSync,
   renameSync,
+  statSync,
   symlinkSync,
   unlinkSync,
   writeFileSync,
@@ -22,7 +24,7 @@ import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const realCheckoutRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
@@ -64,6 +66,13 @@ mkdirSync(fakeTmuxState, { recursive: true });
 function writeExecutable(path, source) {
   writeFileSync(path, source);
   chmodSync(path, 0o755);
+}
+
+function symlinkDirectory(target, path) {
+  // Windows requires the type for directory links; `junction` also works on
+  // runners without Developer Mode, where directory symlink creation is not
+  // available to unprivileged processes.
+  symlinkSync(target, path, process.platform === "win32" ? "junction" : "dir");
 }
 
 const shellQuote = (value) => "'" + String(value).replaceAll("'", "'\\''") + "'";
@@ -258,7 +267,7 @@ writeExecutable(join(fakeBin, "npm"), [
   "fi",
   "if [ \"$task\" = \"build\" ]; then",
   "  if [ -n \"${FAKE_BUILD_DELAY_SECONDS:-}\" ]; then /bin/sleep \"$FAKE_BUILD_DELAY_SECONDS\"; fi",
-  "  candidate=\"$FAKE_REPO_ROOT/releases/$FAKE_CANDIDATE_BUILD_ID\"",
+  "  candidate=\"$(printf '%s' \"$FAKE_REPO_ROOT\" | tr \"\\\\\\\\\" \"/\")/releases/$FAKE_CANDIDATE_BUILD_ID\"",
   "  mkdir -p \"$candidate/ui\"",
   "  printf '{\"buildId\":\"%s\",\"schemaVersion\":0,\"minReadableSchemaVersion\":0,\"maxReadableSchemaVersion\":0,\"releaseFormatVersion\":2}\\n' \"$FAKE_CANDIDATE_BUILD_ID\" > \"$candidate/build-meta.json\"",
   "  : > \"$candidate/cli.js\"",
@@ -292,6 +301,66 @@ function removeLink(path) {
   } catch (error) {
     if (error?.code !== "ENOENT") throw error;
   }
+}
+
+function removeFixtureDirectoryProjection(path, fixtureRoot) {
+  let stats;
+  try {
+    stats = lstatSync(path);
+  } catch (error) {
+    if (error?.code === "ENOENT") return;
+    throw error;
+  }
+  const actualTarget = realpathSync(path);
+  const fixtureRealRoot = realpathSync(fixtureRoot);
+  let contained = false;
+  if (process.platform === "win32") {
+    // Windows may spell the same temp root through its long or 8.3 name.
+    // Compare filesystem identity while walking the resolved target upward.
+    const rootStats = statSync(fixtureRealRoot);
+    if (rootStats.ino !== 0) {
+      let ancestor = actualTarget;
+      while (true) {
+        const ancestorStats = statSync(ancestor);
+        if (ancestorStats.dev === rootStats.dev && ancestorStats.ino === rootStats.ino) {
+          contained = true;
+          break;
+        }
+        const parent = dirname(ancestor);
+        if (parent === ancestor) break;
+        ancestor = parent;
+      }
+    }
+  } else {
+    const relativeTarget = relative(fixtureRealRoot, actualTarget);
+    contained = relativeTarget === ""
+      || (relativeTarget !== ".." && !relativeTarget.startsWith(`..${sep}`) && !isAbsolute(relativeTarget));
+  }
+  if (!contained) {
+    throw new Error(`behavior harness refuses to remove projection outside its owned fixture: ${path}`);
+  }
+  if (stats.isSymbolicLink()) {
+    unlinkSync(path);
+    return;
+  }
+  // Node's lstat reports Windows directory junctions as directories on some
+  // runner versions. rmdir removes the junction itself. If it is a real
+  // fixture directory instead, remove it recursively only after the resolved
+  // target has been proven to remain inside this test's private checkout.
+  if (process.platform === "win32" && stats.isDirectory()) {
+    try {
+      rmdirSync(path);
+    } catch (error) {
+      if (error?.code !== "ENOTEMPTY" && error?.code !== "EEXIST") throw error;
+      rmSync(path, { recursive: true, force: true });
+    }
+    return;
+  }
+  if (stats.isDirectory()) {
+    rmSync(path, { recursive: true, force: true });
+    return;
+  }
+  throw new Error(`behavior harness refuses to remove non-directory projection ${path}`);
 }
 
 function removeGeneratedArtifact(path, originalBackup) {
@@ -534,6 +603,13 @@ function writeEnvironment(stateDir, port, options) {
   // escape characters there, so keep fixture paths in the slash form that
   // Bash and Node both accept on Windows.
   const shellPath = (path) => process.platform === "win32" ? path.replaceAll("\\", "/") : path;
+  // Marker paths are consumed by Git Bash builtins and POSIX utilities. A
+  // native `C:/...` path works for Node but is not a reliable Bash path; use
+  // the MSYS `/c/...` spelling for these shell-only values.
+  const shellMarkerPath = (path) => {
+    const normalized = shellPath(path);
+    return process.platform === "win32" ? normalized.replace(/^([A-Za-z]):\//, (_, drive) => `/${drive.toLowerCase()}/`) : normalized;
+  };
   writeFileSync(envPath, [
     "HOST=127.0.0.1",
     "PORT=" + port,
@@ -555,18 +631,18 @@ function writeEnvironment(stateDir, port, options) {
     "FAKE_CANDIDATE_BUILD_ID=" + candidateBuildId,
     "FAKE_FAIL_BUILD_ID=" + (opts.failBuildId || ""),
     "FAKE_FAIL_APP_PROBE_BUILD_ID=" + (opts.failAppProbeBuildId || ""),
-    "FAKE_ROLLBACK_APP_PROBE_MARKER=" + (opts.rollbackAppProbeMarker || ""),
+    "FAKE_ROLLBACK_APP_PROBE_MARKER=" + (opts.rollbackAppProbeMarker ? shellMarkerPath(opts.rollbackAppProbeMarker) : ""),
     "FAKE_FAIL_ALL=" + (opts.failAll ? "true" : "false"),
     "FAKE_FAIL_RUNTIME_LOCK_ACQUIRE_ONCE=" + (opts.failRuntimeLockAcquireOnce ? "true" : "false"),
-    "FAKE_RUNTIME_LOCK_FAILURE_MARKER=" + (opts.runtimeLockFailureMarker || ""),
+    "FAKE_RUNTIME_LOCK_FAILURE_MARKER=" + (opts.runtimeLockFailureMarker ? shellMarkerPath(opts.runtimeLockFailureMarker) : ""),
     "FAKE_FAIL_DEPLOYMENT_LOCK_CHECK_ONCE=" + (opts.failDeploymentLockCheckOnce ? "true" : "false"),
     "FAKE_REMOVE_DEPLOYMENT_LOCK_ON_CHECK_ONCE=" + (opts.removeDeploymentLockOnCheckOnce ? "true" : "false"),
-    "FAKE_DEPLOYMENT_LOCK_FAILURE_MARKER=" + (opts.deploymentLockFailureMarker || ""),
-    "FAKE_FAIL_SERVER_LAUNCH_MARKER=" + (opts.failServerLaunchMarker || ""),
+    "FAKE_DEPLOYMENT_LOCK_FAILURE_MARKER=" + (opts.deploymentLockFailureMarker ? shellMarkerPath(opts.deploymentLockFailureMarker) : ""),
+    "FAKE_FAIL_SERVER_LAUNCH_MARKER=" + (opts.failServerLaunchMarker ? shellMarkerPath(opts.failServerLaunchMarker) : ""),
     "FAKE_BUILD_DELAY_SECONDS=" + (opts.buildDelaySeconds || ""),
     "FAKE_PAUSE_RELEASE_PROBE=" + (opts.pauseReleaseProbe ? "true" : "false"),
     "FAKE_PAUSE_RUNTIME_LOCK_ACQUIRE=" + (opts.pauseRuntimeLockAcquire ? "true" : "false"),
-    "FAKE_PAUSE_MARKER=" + (opts.pauseMarker || ""),
+    "FAKE_PAUSE_MARKER=" + (opts.pauseMarker ? shellMarkerPath(opts.pauseMarker) : ""),
   ].join("\n") + "\n");
   return envPath;
 }
@@ -685,6 +761,19 @@ function processParentPid(pid) {
 }
 
 function killController(controller, markerPath, signal = "SIGKILL") {
+  if (process.platform === "win32") {
+    // Killing only the paused fake executable leaves its Bash parent alive on
+    // Windows. Terminate the controller's full process tree to model the same
+    // abrupt supervisor death as the POSIX PID-ancestry path below.
+    assert.ok(Number.isInteger(controller.child.pid), "controller child must have a PID before termination");
+    const result = spawnSync("taskkill", ["/PID", String(controller.child.pid), "/T", "/F"], { encoding: "utf8" });
+    assert.equal(
+      result.status,
+      0,
+      `taskkill must terminate the controller process tree (status=${result.status}, error=${result.error?.message ?? "none"})\n${result.stdout ?? ""}\n${result.stderr ?? ""}`,
+    );
+    return;
+  }
   const pids = [];
   let current = Number(readFileSync(markerPath, "utf8").trim());
   while (Number.isInteger(current) && current > 1 && current !== process.pid && current !== controller.child.pid && !pids.includes(current)) {
@@ -696,6 +785,16 @@ function killController(controller, markerPath, signal = "SIGKILL") {
     try { process.kill(pid, signal); }
     catch (error) { if (error?.code !== "ESRCH") throw error; }
   }
+}
+
+function assertControllerKilledAbruptly(result, label) {
+  if (process.platform === "win32") {
+    // Node reports forced Windows process termination with an exit status;
+    // POSIX reports the terminating signal separately.
+    assert.ok(Number.isInteger(result.status) && result.status !== 0, `${label} must exit unsuccessfully after forced termination`);
+    return;
+  }
+  assert.equal(result.signal, "SIGKILL", `${label} must be killed by SIGKILL`);
 }
 
 function waitForPath(path, timeoutMs = 15_000) {
@@ -735,9 +834,13 @@ writeFileSync(join(baseRelease, "ui", "workspace-app.html"), baseWorkspaceAppHtm
 // filesystem paths for the same canonical artifact identity.
 const normalizeFilesystemPath = (path) => resolve(path);
 const canonicalBaseRelease = normalizeFilesystemPath(realpathSync(baseRelease));
+function assertDistBuildId(expectedBuildId, message = "dist projection must resolve to the expected immutable build") {
+  const metadata = JSON.parse(readFileSync(join(root, "dist", "build-meta.json"), "utf8"));
+  assert.equal(metadata.buildId, expectedBuildId, message);
+}
 
 try {
-  symlinkSync(baseRelease, join(root, "dist"));
+  symlinkDirectory(baseRelease, join(root, "dist"));
 
   const successfulState = mkdtempSync(join(harnessRoot, "state-success-"));
   const successfulEnv = writeEnvironment(successfulState, 17676, { useExistingDist: true });
@@ -783,9 +886,13 @@ try {
 
   // A clean restart after the process/supervisor disappeared may legitimately
   // select the same committed immutable release. It must not be mistaken for
-  // a rollback attempting to restore the failed candidate to itself.
+  // a rollback attempting to restore the failed candidate to itself. The
+  // mutable dist projection is deliberately absent: generation.json is the
+  // authoritative pointer once an immutable release has been committed.
+  removeFixtureDirectoryProjection(join(root, "dist"), root);
   const sameGenerationRestart = runLauncher(successfulEnv);
-  assert.equal(sameGenerationRestart.status, 0, "restarting the committed release should be allowed:\n" + sameGenerationRestart.stdout + "\n" + sameGenerationRestart.stderr);
+  assert.equal(sameGenerationRestart.status, 0, "restarting the committed release without a dist projection should be allowed:\n" + sameGenerationRestart.stdout + "\n" + sameGenerationRestart.stderr);
+  assert.match(sameGenerationRestart.stdout + sameGenerationRestart.stderr, /Reusing previously validated immutable release/);
   const sameGeneration = JSON.parse(readFileSync(join(successfulState, "generation.json"), "utf8"));
   assert.equal(sameGeneration.status, "active");
   assert.equal(sameGeneration.activeBuildId, baseBuildId);
@@ -816,7 +923,8 @@ try {
   });
   const transientDeploymentRestart = runRestart(transientDeploymentEnv);
   assert.equal(transientDeploymentRestart.status, 0, "transient deployment-lock check failure should not break restart:\n" + transientDeploymentRestart.stdout + "\n" + transientDeploymentRestart.stderr);
-  assert.match(transientDeploymentRestart.stdout + "\n" + transientDeploymentRestart.stderr, /injected deployment ownership check failure/);
+  assert.equal(existsSync(transientDeploymentMarker), false,
+    "the one-shot deployment-lock failure must have been injected before recovery:\n" + transientDeploymentRestart.stdout + "\n" + transientDeploymentRestart.stderr);
   const transientDeploymentGeneration = JSON.parse(readFileSync(join(successfulState, "generation.json"), "utf8"));
   assert.equal(transientDeploymentGeneration.status, "active");
   const transientDeploymentLock = JSON.parse(readFileSync(join(successfulState, "runtime.lock"), "utf8"));
@@ -825,8 +933,8 @@ try {
 
   // Two deployment controllers must serialize before either can overwrite
   // candidate state or stop the serving generation.
-  removeLink(join(root, "dist"));
-  symlinkSync(baseRelease, join(root, "dist"));
+  removeFixtureDirectoryProjection(join(root, "dist"), root);
+  symlinkDirectory(baseRelease, join(root, "dist"));
   const concurrentState = mkdtempSync(join(harnessRoot, "state-concurrent-"));
   const concurrentEnv = writeEnvironment(concurrentState, 17681, { useExistingDist: true, buildDelaySeconds: "2" });
   const concurrentStart = runLauncher(concurrentEnv);
@@ -855,8 +963,8 @@ try {
   // that happens during candidate preparation, the serving generation must
   // remain intact and a later controller must be able to reclaim the stale
   // deployment lock and complete a new handoff.
-  removeLink(join(root, "dist"));
-  symlinkSync(baseRelease, join(root, "dist"));
+  removeFixtureDirectoryProjection(join(root, "dist"), root);
+  symlinkDirectory(baseRelease, join(root, "dist"));
   const prepareCrashState = mkdtempSync(join(harnessRoot, "state-controller-crash-prepare-"));
   const prepareCrashEnv = writeEnvironment(prepareCrashState, 17684, { useExistingDist: true });
   const prepareCrashStart = runLauncher(prepareCrashEnv);
@@ -868,7 +976,7 @@ try {
   assert.equal(await waitForPath(prepareCrashMarker), true, "controller must reach candidate preparation before SIGKILL");
   killController(prepareCrashController, prepareCrashMarker);
   const prepareCrashResult = await prepareCrashController.result;
-  assert.equal(prepareCrashResult.signal, "SIGKILL", "preparation controller must be killed abruptly");
+  assertControllerKilledAbruptly(prepareCrashResult, "preparation controller");
   assert.equal(liveRuntimeOwner(prepareCrashLock), true, "abrupt preparation death must leave the old serving owner alive");
   assert.equal(pathExists(join(prepareCrashState, "deployment.lock")), true, "abrupt preparation death must leave a reclaimable deployment record");
   const prepareCrashRecovery = runRestart(writeEnvironment(prepareCrashState, 17684, { useExistingDist: true }));
@@ -884,8 +992,8 @@ try {
   // controller has acquired serving ownership. The next controller must
   // converge by activating a candidate and, when that candidate is unhealthy,
   // restoring the exact committed A release rather than leaving no owner.
-  removeLink(join(root, "dist"));
-  symlinkSync(baseRelease, join(root, "dist"));
+  removeFixtureDirectoryProjection(join(root, "dist"), root);
+  symlinkDirectory(baseRelease, join(root, "dist"));
   const postStopCrashState = mkdtempSync(join(harnessRoot, "state-controller-crash-post-stop-"));
   const postStopCrashEnv = writeEnvironment(postStopCrashState, 17685, { useExistingDist: true });
   const postStopCrashStart = runLauncher(postStopCrashEnv);
@@ -901,7 +1009,7 @@ try {
   assert.equal(pathExists(join(fakeTmuxState, "kontrol-server.pid")), false, "post-stop pause must occur after the old server session is gone");
   killController(postStopCrashController, postStopCrashMarker);
   const postStopCrashResult = await postStopCrashController.result;
-  assert.equal(postStopCrashResult.signal, "SIGKILL", "post-stop controller must be killed abruptly");
+  assertControllerKilledAbruptly(postStopCrashResult, "post-stop controller");
   const postStopGenerationBeforeRecovery = JSON.parse(readFileSync(join(postStopCrashState, "generation.json"), "utf8"));
   assert.equal(postStopGenerationBeforeRecovery.activeBuildId, baseBuildId, "an interrupted handoff must retain A as the committed generation");
   assert.equal(pathExists(join(postStopCrashState, "deployment.lock")), true, "post-stop controller death must leave a reclaimable deployment record");
@@ -917,9 +1025,9 @@ try {
   process.kill(postStopCrashLock.launcherPid, "SIGTERM");
   stopFakeSessions();
 
-  removeLink(join(root, "dist"));
+  removeFixtureDirectoryProjection(join(root, "dist"), root);
   removeGeneratedArtifact(join(root, "dist.previous"), undefined);
-  symlinkSync(baseRelease, join(root, "dist"));
+  symlinkDirectory(baseRelease, join(root, "dist"));
 
   // Exercise the complete restart handoff: A remains healthy during
   // preparation, is stopped only after B is built, and B's failed readiness
@@ -936,7 +1044,7 @@ try {
   assert.equal(handoffGeneration.activeBuildId, baseBuildId);
   assert.equal(handoffGeneration.lastKnownGoodBuildId, baseBuildId);
   assert.equal(normalizeFilesystemPath(handoffGeneration.lastKnownGoodArtifactPath), canonicalBaseRelease);
-  assert.equal(normalizeFilesystemPath(readlinkSync(join(root, "dist"))), canonicalBaseRelease);
+  assertDistBuildId(baseBuildId);
 
   // Rebuild the same failing candidate again. Rollback must continue to use
   // the committed A record; the failed B candidate must never become the
@@ -950,7 +1058,7 @@ try {
   assert.equal(repeatedHandoffGeneration.lastKnownGoodBuildId, baseBuildId);
   assert.equal(normalizeFilesystemPath(repeatedHandoffGeneration.lastKnownGoodArtifactPath), canonicalBaseRelease);
   assert.notEqual(repeatedHandoffGeneration.lastKnownGoodBuildId, candidateBuildId);
-  assert.equal(normalizeFilesystemPath(readlinkSync(join(root, "dist"))), canonicalBaseRelease);
+  assertDistBuildId(baseBuildId);
   const repeatedHandoffLock = JSON.parse(readFileSync(join(handoffState, "runtime.lock"), "utf8"));
   process.kill(repeatedHandoffLock.launcherPid, "SIGTERM");
   stopFakeSessions();
@@ -958,8 +1066,8 @@ try {
   // The old generation is stopped before activation starts. Force the first
   // runtime-lock acquisition in that activation to fail; the activation trap
   // must reacquire ownership and restore A rather than leaving the stack down.
-  removeLink(join(root, "dist"));
-  symlinkSync(baseRelease, join(root, "dist"));
+  removeFixtureDirectoryProjection(join(root, "dist"), root);
+  symlinkDirectory(baseRelease, join(root, "dist"));
   const gapState = mkdtempSync(join(harnessRoot, "state-handoff-gap-"));
   const gapMarker = join(harnessRoot, "fail-runtime-lock-once");
   const gapEnv = writeEnvironment(gapState, 17680, { useExistingDist: true, failRuntimeLockAcquireOnce: true, runtimeLockFailureMarker: gapMarker });
@@ -983,8 +1091,8 @@ try {
   // The deployment-lock check itself is another post-stop boundary. A fresh
   // controller must recover the exact committed release instead of exiting
   // with no runtime owner and no rollback attempt.
-  removeLink(join(root, "dist"));
-  symlinkSync(baseRelease, join(root, "dist"));
+  removeFixtureDirectoryProjection(join(root, "dist"), root);
+  symlinkDirectory(baseRelease, join(root, "dist"));
   const deploymentGapState = mkdtempSync(join(harnessRoot, "state-deployment-gap-"));
   const deploymentGapMarker = join(harnessRoot, "fail-deployment-check-once");
   const deploymentGapEnv = writeEnvironment(deploymentGapState, 17682, {
@@ -997,7 +1105,8 @@ try {
   assert.equal(deploymentGapStart.status, 0, "deployment-gap baseline generation failed:\n" + deploymentGapStart.stdout + "\n" + deploymentGapStart.stderr);
   writeFileSync(deploymentGapMarker, "fail once\n");
   const deploymentGapRestart = runRestart(deploymentGapEnv);
-  assert.match(deploymentGapRestart.stdout + "\n" + deploymentGapRestart.stderr, /injected deployment ownership check failure/);
+  assert.equal(existsSync(deploymentGapMarker), false,
+    "the one-shot deployment-lock failure must have been injected before ownership recovery:\n" + deploymentGapRestart.stdout + "\n" + deploymentGapRestart.stderr);
   assert.equal(deploymentGapRestart.status, 0, "a pure deployment-lock recovery restores service without a failed candidate activation:\n" + deploymentGapRestart.stdout + "\n" + deploymentGapRestart.stderr);
   const deploymentGapGeneration = JSON.parse(readFileSync(join(deploymentGapState, "generation.json"), "utf8"));
   assert.equal(deploymentGapGeneration.status, "rolled_back");
@@ -1008,9 +1117,9 @@ try {
   process.kill(deploymentGapLock.launcherPid, "SIGTERM");
   stopFakeSessions();
 
-  removeLink(join(root, "dist"));
+  removeFixtureDirectoryProjection(join(root, "dist"), root);
   removeGeneratedArtifact(join(root, "dist.previous"), undefined);
-  symlinkSync(baseRelease, join(root, "dist"));
+  symlinkDirectory(baseRelease, join(root, "dist"));
   const rollbackState = mkdtempSync(join(harnessRoot, "state-rollback-"));
   const rollbackAppProbeMarker = join(harnessRoot, "rollback-app-probe-compatibility-flag");
   const rollbackEnv = writeEnvironment(rollbackState, 17677, {
@@ -1038,9 +1147,9 @@ try {
   assert.equal(rollbackDeployment.requestedBuildId, candidateBuildId);
   assert.equal(rollbackDeployment.failedBuildId, candidateBuildId);
   assert.equal(rollbackDeployment.lastKnownGoodBuildId, baseBuildId);
-  assert.equal(normalizeFilesystemPath(readlinkSync(join(root, "dist"))), canonicalBaseRelease);
+  assertDistBuildId(baseBuildId);
   assert.ok(pathExists(candidateRelease), "failed candidate release must be retained for forensics");
-  assert.equal(normalizeFilesystemPath(readlinkSync(join(root, "dist"))), canonicalBaseRelease, "failed candidate must not replace the active projection");
+  assertDistBuildId(baseBuildId, "failed candidate must not replace the active projection");
   const rollbackLock = JSON.parse(readFileSync(join(rollbackState, "runtime.lock"), "utf8"));
   process.kill(rollbackLock.launcherPid, "SIGTERM");
   stopFakeSessions();
@@ -1049,8 +1158,8 @@ try {
   // rollback attempt to fail. restart-kontrol.sh must then recover through
   // its outer emergency trap, using the candidate record's build ID rather
   // than silently recording "unknown" provenance.
-  removeLink(join(root, "dist"));
-  symlinkSync(baseRelease, join(root, "dist"));
+  removeFixtureDirectoryProjection(join(root, "dist"), root);
+  symlinkDirectory(baseRelease, join(root, "dist"));
   const outerRecoveryState = mkdtempSync(join(harnessRoot, "state-outer-recovery-"));
   const outerRecoveryMarker = join(harnessRoot, "fail-server-launch-twice");
   const outerRecoveryEnv = writeEnvironment(outerRecoveryState, 17683, { useExistingDist: true, failServerLaunchMarker: outerRecoveryMarker });
@@ -1072,9 +1181,9 @@ try {
   process.kill(outerRecoveryLock.launcherPid, "SIGTERM");
   stopFakeSessions();
 
-  removeLink(join(root, "dist"));
+  removeFixtureDirectoryProjection(join(root, "dist"), root);
   removeGeneratedArtifact(join(root, "dist.previous"), undefined);
-  symlinkSync(baseRelease, join(root, "dist"));
+  symlinkDirectory(baseRelease, join(root, "dist"));
   const failedRollbackState = mkdtempSync(join(harnessRoot, "state-rollback-failed-"));
   const failedRollbackEnv = writeEnvironment(failedRollbackState, 17678, { useExistingDist: false, failAll: true });
   const failedRollback = runLauncher(failedRollbackEnv);
@@ -1084,7 +1193,7 @@ try {
   assert.equal(failedGeneration.rollback, true);
   assert.equal(failedGeneration.failedBuildId, candidateBuildId);
   assert.equal(pathExists(join(failedRollbackState, "runtime.lock")), false, "failed controller must release its lock");
-  assert.equal(normalizeFilesystemPath(readlinkSync(join(root, "dist"))), normalizeFilesystemPath(baseRelease));
+  assertDistBuildId(baseBuildId);
   console.log("start-all.behavior.test.mjs: startup, lock handoff, conflict, crash recovery, rollback, and failed rollback passed");
 } finally {
   restoreHarness();

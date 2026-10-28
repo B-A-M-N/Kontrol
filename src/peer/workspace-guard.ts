@@ -9,8 +9,9 @@ import { homedir } from "node:os";
 import { basename, resolve } from "node:path";
 import { closeSync, existsSync, fsyncSync, openSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
+import { syncDirectory } from "../fs-durability.js";
 import type { ServerConfig } from "../config.js";
-import { isPathInsideRoot } from "../roots.js";
+import { isPathInsideRoot, isPathInsideRootCanonical } from "../roots.js";
 import type { ConnectionContext } from "../mcp/connection-context.js";
 
 /**
@@ -24,7 +25,7 @@ export function peerWorkspaceDenied(
 ): string | undefined {
   if (connectionContext?.authenticatedRole !== "peer") return undefined;
   const grants = connectionContext.peerGrantedRoots ?? [];
-  if (grants.some((grant) => isPathInsideRoot(workspaceRoot, grant))) return undefined;
+  if (grants.some((grant) => isPathInsideRootCanonical(workspaceRoot, grant))) return undefined;
   return `Forbidden: peer is not granted access to workspace root ${workspaceRoot}.`;
 }
 
@@ -78,8 +79,7 @@ function persistPeerWorktreeOwners(stateDir: string): void {
   }
   try {
     renameSync(temporaryPath, path);
-    const directoryFd = openSync(resolve(stateDir), "r");
-    try { fsyncSync(directoryFd); } finally { closeSync(directoryFd); }
+    syncDirectory(resolve(stateDir));
   } catch (error) {
     // Keep the old authority record intact if publication failed. A leftover
     // uniquely named temporary file is inert and can be removed by bounded

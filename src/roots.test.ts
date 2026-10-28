@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
-import { homedir } from "node:os";
+import { randomUUID } from "node:crypto";
+import { mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { assertAllowedPath, expandHomePath, isPathInsideRoot, resolveAllowedPath } from "./roots.js";
+import { assertAllowedPath, assertNoSymlinkComponentsSync, expandHomePath, isPathInsideRoot, isPathInsideRootCanonical, resolveAllowedPath, resolveAllowedPathCanonical } from "./roots.js";
 
 const home = homedir();
 
@@ -29,10 +31,50 @@ assert.equal(isPathInsideRoot("/workspace/..cache", "/workspace"), true, "a chil
 assert.equal(isPathInsideRoot("/workspace/..", "/workspace"), false, "an exact parent component escapes");
 assert.equal(isPathInsideRoot("/workspace/sub/..foo", "/workspace"), true, "a nested child named ..foo is inside");
 assert.equal(isPathInsideRoot("/outside/file", "/workspace"), false, "unrelated absolute path escapes");
+assert.equal(
+  isPathInsideRootCanonical(join(tmpdir(), `kontrol-missing-root-${randomUUID()}`), tmpdir()),
+  false,
+  "canonical grant checks fail closed when the requested path cannot be resolved",
+);
 
 if (process.platform === "win32") {
   assert.throws(
     () => assertAllowedPath("C:\\Users\\Administrator", ["G:\\Projects\\Dev\\Github\\kontrol"]),
     /Path is outside allowed roots/,
   );
+}
+
+if (process.platform !== "win32") {
+  const fixture = mkdtempSync(join(tmpdir(), "kontrol-root-alias-"));
+  try {
+    const physicalParent = join(fixture, "physical");
+    const workspace = join(physicalParent, "workspace");
+    const aliasParent = join(fixture, "alias");
+    mkdirSync(workspace, { recursive: true });
+    symlinkSync(physicalParent, aliasParent, "dir");
+    const aliasedWorkspace = join(aliasParent, "workspace");
+    assert.equal(isPathInsideRootCanonical(aliasedWorkspace, workspace), true,
+      "grant checks equate a trusted workspace with its OS alias");
+    assertNoSymlinkComponentsSync(join(aliasedWorkspace, "new-file.txt"), aliasedWorkspace);
+    assert.equal(
+      await resolveAllowedPathCanonical("new-file.txt", aliasedWorkspace, [aliasedWorkspace], aliasedWorkspace),
+      join(realpathSync(workspace), "new-file.txt"),
+      "canonical path resolution accepts a trusted OS-style root alias and returns the physical destination",
+    );
+
+    const outside = join(fixture, "outside");
+    mkdirSync(outside);
+    symlinkSync(outside, join(workspace, "escape"), "dir");
+    assert.throws(
+      () => assertNoSymlinkComponentsSync(join(aliasedWorkspace, "escape", "new-file.txt"), aliasedWorkspace),
+      /Symlink path components are not permitted/,
+      "trusted workspace roots may have an OS path alias, but child symlinks remain denied",
+    );
+    await assert.rejects(
+      () => resolveAllowedPathCanonical("escape/new-file.txt", aliasedWorkspace, [aliasedWorkspace], aliasedWorkspace),
+      /Symlink path components are not permitted/,
+    );
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
 }

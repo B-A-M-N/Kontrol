@@ -1,5 +1,5 @@
 import { mkdtemp, rm } from "node:fs/promises";
-import { mkdir, readFile as readFileAsync, readdir, lstat, readlink, symlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile as readFileAsync, readdir, lstat, readlink, realpath, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import { join, relative, resolve, dirname, sep } from "node:path";
@@ -297,6 +297,10 @@ export function createReviewCheckpointManager(options: {
     states.set(workspaceId, state);
 
     try {
+      // Canonicalize both paths before deriving a Git pathspec. Git may report
+      // a linked worktree via its physical path while an allowed workspace
+      // still carries an OS alias (notably /var vs /private/var on macOS).
+      const canonicalRoot = await realpath(root);
       const eligibility = await getGitEligibility(root);
       if (!eligibility.ok || !eligibility.gitRoot) {
         const store = getFsStore();
@@ -333,7 +337,7 @@ export function createReviewCheckpointManager(options: {
       }
 
       state.gitRoot = eligibility.gitRoot;
-      state.workspaceRelativePath = relative(eligibility.gitRoot, root) || ".";
+      state.workspaceRelativePath = relative(eligibility.gitRoot, canonicalRoot) || ".";
       const commit = await createWorkingTreeSnapshot(eligibility.gitRoot, state.workspaceRelativePath);
       await git(eligibility.gitRoot, ["update-ref", state.openRef, commit]);
       await git(eligibility.gitRoot, ["update-ref", state.presentationRef, commit]);

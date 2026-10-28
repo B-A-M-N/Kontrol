@@ -124,8 +124,10 @@ assert.equal(missing.snapshot().reason, "missing", "missing registry reports its
 
 // Wrong permissions are also an immediate revocation event.
 writeRegistry([baseDescriptor]);
-chmodSync(registryPath, 0o640);
-assert.equal(failClosed.authenticate(token), undefined, "over-permissive registry fails closed");
+if (process.platform !== "win32") {
+  chmodSync(registryPath, 0o640);
+  assert.equal(failClosed.authenticate(token), undefined, "over-permissive POSIX registry fails closed");
+}
 chmodSync(registryPath, 0o600);
 
 // Middleware: success sets req.peerPrincipal; failure responds 401 with a

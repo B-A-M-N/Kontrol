@@ -39,7 +39,10 @@ try {
   assert.equal(receipt.contentSha256, written.contentSha256);
   assert.equal(JSON.stringify(receipt).includes(secret), false);
   assert.equal(JSON.stringify(receipt).includes("/private/path"), false);
-  assert.equal(statSync(path).mode & 0o777, 0o600);
+  // Windows Node exposes compatibility mode bits, not the file's effective
+  // ACL. The atomic receipt and payload assertions apply on every platform;
+  // exact 0600 verification is meaningful on POSIX hosts only.
+  if (process.platform !== "win32") assert.equal(statSync(path).mode & 0o777, 0o600);
   assert.deepEqual(readdirSync(root), ["qualification.failed.json"], "the final file appears atomically without a temporary sibling");
 } finally {
   rmSync(root, { recursive: true, force: true });

@@ -14,7 +14,7 @@ import { acquireCheckoutModifyLease, checkoutLeaseMetadata, workSessionInstructi
 import type { ScheduledJob, ScheduledJobStore } from "./scheduled-job-store.js";
 import type { PeerJobStore } from "../peer/jobs/store.js";
 import { enforcePeerJobsCap } from "../peer/jobs/service.js";
-import { isPathInsideRoot } from "../roots.js";
+import { isPathInsideRootCanonical } from "../roots.js";
 
 export interface ScheduledDispatchResult {
   status: "dispatched" | "blocked" | "failed" | "uncertain";
@@ -113,7 +113,7 @@ export async function dispatchScheduledJob(
         probeResult: { dispatchTarget: "peer_pull", workspaceMode: workspace.mode, managedWorktree: workspace.worktree?.managed === true },
       };
     }
-    if (!descriptor.grantedRoots.some((root) => isPathInsideRoot(workspace.sourceRoot!, root))) {
+    if (!descriptor.grantedRoots.some((root) => isPathInsideRootCanonical(workspace.sourceRoot!, root))) {
       return {
         status: "blocked",
         blockerKind: "permanent_configuration",

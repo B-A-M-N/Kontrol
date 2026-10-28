@@ -11,7 +11,7 @@ const repositoryRoot = fileURLToPath(new URL("..", import.meta.url));
 const packageJson = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
   version: string;
 };
-const cliSource = readFileSync(new URL("./cli.ts", import.meta.url), "utf8");
+const cliSource = readFileSync(new URL("./cli.ts", import.meta.url), "utf8").replace(/\r\n/g, "\n");
 
 const validSubmission = readPtyReviewSubmission({ structuredContent: { submissionId: "submission-1", status: "awaiting_review" } });
 assert.equal(validSubmission.ok, true, "a valid PTY review submission returns its durable receipt");
@@ -49,7 +49,7 @@ try {
     "a retry after losing the CLI response reuses its pending submission identity");
   assert.equal(readPtyReviewMutationIntent(intentPath), firstIntent,
     "pending submission identity can be checked before honoring an explicit override");
-  assert.equal(statSync(intentPath).mode & 0o077, 0,
+  if (process.platform !== "win32") assert.equal(statSync(intentPath).mode & 0o077, 0,
     "the persisted PTY retry identity is private to the agent process owner");
   completePtyReviewMutationId(intentPath, firstIntent);
   assert.equal(readPtyReviewMutationIntent(intentPath), undefined,
@@ -520,7 +520,7 @@ for (const flag of ["-v", "--version"]) {
   assert.doesNotMatch(cliSource, new RegExp("[\\'\"\u0060]tailscale[\\'\"\u0060]"), "cli.ts must never pass the tailscale binary name to a spawn/exec call");
 
   const runIngress = (subcommand: "inspect" | "plan", envOverrides: Record<string, string | undefined>) =>
-    spawnSync("npx", ["tsx", "src/cli.ts", "ingress", subcommand], {
+    spawnSync(process.execPath, [join(repositoryRoot, "node_modules", "tsx", "dist", "cli.mjs"), "src/cli.ts", "ingress", subcommand], {
       cwd: repositoryRoot,
       encoding: "utf8",
       env: {

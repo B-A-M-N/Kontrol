@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:http";
@@ -93,7 +93,7 @@ try {
   assert.match(unavailableToolchain.reason ?? "", /Python runtime or ACP SDK.*approved sandbox toolchains/);
   assert.equal(sessionCreations, 0, "a missing Hermes toolchain is rejected before scheduled worker creation");
 
-  const peerState = mkdtempSync(join(tmpdir(), "scheduled-peer-dispatch-"));
+  const peerState = realpathSync(mkdtempSync(join(tmpdir(), "scheduled-peer-dispatch-")));
   const peerStore = openPeerJobStore(peerState, { level: "silent", format: "json", requests: false, assets: false, toolCalls: false, shellCommands: false } as any);
   try {
     const worktreeRoot = join(peerState, "worktree");
@@ -219,7 +219,8 @@ try {
     });
     await processor.process(peerStore.getJob(firstPeerJobId)!);
     const awaitingReview = peerStore.getJob(firstPeerJobId)!;
-    assert.equal(awaitingReview.status, "awaiting_review");
+    assert.equal(awaitingReview.status, "awaiting_review",
+      `the staged receipt should reach review (reconciliation failure: ${awaitingReview.resultProcessing?.failure ?? "none"})`);
     assert.equal(awaitingReview.workSessionId, "wsess-scheduled-peer");
     assert.equal(awaitingReview.resultProcessing?.submissionId, "submission-scheduled-peer");
     assert.equal(submissions.length, 1, "exactly one review submission is created from the peer receipt");

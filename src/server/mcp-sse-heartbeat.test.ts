@@ -11,16 +11,27 @@ class FakeResponse extends EventEmitter {
 }
 
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+async function waitFor(predicate: () => boolean, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) return false;
+    await wait(10);
+  }
+  return true;
+}
 
 const stuck = new FakeResponse();
 stuck.writes = [false];
 let timedOut: any;
-const stopStuck = startMcpSseHeartbeat(stuck, 5, () => {}, () => {}, undefined, {
+let timedOutAt = 0;
+let stalledAt = 0;
+const stopStuck = startMcpSseHeartbeat(stuck, 5, () => { stalledAt = performance.now(); }, () => {}, undefined, {
   maxStallMs: 20,
-  onStallTimeout: (details) => { timedOut = details; },
+  onStallTimeout: (details) => { timedOut = details; timedOutAt = performance.now(); },
 });
-await wait(40);
-assert.equal(stuck.destroyed, true, "a permanently stalled response is destroyed within its deadline");
+assert.equal(await waitFor(() => stuck.destroyed, 1_000), true, "a permanently stalled response is destroyed within a bounded deadline");
+assert.ok(timedOutAt - stalledAt >= 20, "the response is not destroyed before its configured stall deadline");
+assert.ok(timedOutAt - stalledAt < 1_000, "the stall timeout remains bounded under runner scheduling delays");
 assert.equal(timedOut.consecutiveStallCount, 1);
 assert.equal(stuck.listenerCount("drain"), 0, "timeout removes the drain listener");
 stopStuck();

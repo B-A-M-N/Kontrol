@@ -51,6 +51,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Provision test tools
+        run: node scripts/provision-test-tools.mjs
+
       - name: Configure fixture Git identity
         run: |
           git config --local user.name "Kontrol CI"
@@ -59,6 +62,14 @@ jobs:
       - name: Install Playwright Chromium (Linux)
         if: runner.os == 'Linux'
         run: npx playwright install --with-deps chromium
+
+      - name: Provision Linux read-only sandbox
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes bubblewrap apparmor-profiles
+          sudo apparmor_parser -r /usr/share/apparmor/extra-profiles/bwrap-userns-restrict
+          bwrap --version
 
       - name: Install Playwright Chromium (macOS/Windows)
         if: runner.os != 'Linux'
@@ -69,6 +80,10 @@ jobs:
 
       - name: Test
         run: npm test
+        env:
+          # CI tests must use the npm-packaged ripgrep rather than Pi's
+          # opportunistic GitHub-release downloader.
+          PI_OFFLINE: "1"
 
       - name: Build
         run: npm run build

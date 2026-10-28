@@ -265,17 +265,25 @@ function fakeExec(responses: Record<string, FakeResponse>): TailscaleExec & { ca
 // a real tailscale spawn) and never rejects ---
 {
   const previous = process.env.KONTROL_TAILSCALE_BIN;
-  process.env.KONTROL_TAILSCALE_BIN = "/bin/echo";
+  process.env.KONTROL_TAILSCALE_BIN = process.platform === "win32" ? process.execPath : "/bin/echo";
   try {
     const facts = await readTailscaleFacts();
-    // /bin/echo prints its arguments: "version" for the version call, so the
-    // override was honored (the real binary would print 1.102.2).
-    assert.equal(facts.cliVersion, "version");
-    // "status --json" echoed back is not JSON -> malformed-JSON warnings.
+    if (process.platform === "win32") {
+      // Node treats "version" as a script path and reports it missing. This
+      // proves the override was invoked without relying on a POSIX utility.
+      assert.equal(facts.cliVersion, null);
+      assert.match(facts.warnings[0] ?? "", /^tailscale version failed \(exit 1\)$/);
+    } else {
+      // /bin/echo prints its arguments: "version" for the version call, so
+      // the override was honored (the real binary would print 1.102.2).
+      assert.equal(facts.cliVersion, "version");
+    }
+    // The configured executable's remaining output is not valid Tailscale
+    // JSON (or is absent for the Node-on-Windows probe), so parsing stays null.
     assert.equal(facts.backendState, null);
     assert.equal(facts.dnsName, null);
-    assert.equal(facts.warnings.length, 3);
-    assert.match(facts.warnings[0], /^tailscale status --json returned malformed JSON$/);
+    assert.equal(facts.warnings.length, process.platform === "win32" ? 4 : 3);
+    if (process.platform !== "win32") assert.match(facts.warnings[0], /^tailscale status --json returned malformed JSON$/);
   } finally {
     if (previous === undefined) delete process.env.KONTROL_TAILSCALE_BIN;
     else process.env.KONTROL_TAILSCALE_BIN = previous;
@@ -350,7 +358,7 @@ function fakeExec(responses: Record<string, FakeResponse>): TailscaleExec & { ca
 // --- defaultTailscaleExec REFUSES mutation commands before any spawn ---
 {
   const previous = process.env.KONTROL_TAILSCALE_BIN;
-  process.env.KONTROL_TAILSCALE_BIN = "/bin/echo";
+  process.env.KONTROL_TAILSCALE_BIN = process.platform === "win32" ? process.execPath : "/bin/echo";
   try {
     // The guard throws SYNCHRONOUSLY before any spawn/promise, so these are
     // assert.throws — a rejection would prove nothing about pre-spawn timing.
@@ -363,9 +371,14 @@ function fakeExec(responses: Record<string, FakeResponse>): TailscaleExec & { ca
     assert.throws(() => defaultTailscaleExec(["down"]), /read-only/);
     assert.throws(() => defaultTailscaleExec(["serve", "reset"]), /read-only/);
     assert.throws(() => defaultTailscaleExec(["funnel", "reset"]), /read-only/);
-    // Read-only invocations still work (echo resolves a result).
+    // Read-only invocations reach the configured executable on every runner.
     const facts = await readTailscaleFacts();
-    assert.equal(facts.cliVersion, "version");
+    if (process.platform === "win32") {
+      assert.equal(facts.cliVersion, null);
+      assert.match(facts.warnings[0] ?? "", /^tailscale version failed \(exit 1\)$/);
+    } else {
+      assert.equal(facts.cliVersion, "version");
+    }
   } finally {
     if (previous === undefined) delete process.env.KONTROL_TAILSCALE_BIN;
     else process.env.KONTROL_TAILSCALE_BIN = previous;

@@ -32,8 +32,10 @@ try {
   });
   try {
     assert.equal(existsSync(credential.credentialFilePath), true);
-    assert.equal(statSync(credential.credentialFilePath).mode & 0o777, 0o600);
-    assert.equal(statSync(dirname(credential.credentialFilePath)).mode & 0o777, 0o700);
+    if (process.platform !== "win32") {
+      assert.equal(statSync(credential.credentialFilePath).mode & 0o777, 0o600);
+      assert.equal(statSync(dirname(credential.credentialFilePath)).mode & 0o777, 0o700);
+    }
     const payload = JSON.parse(readFileSync(credential.credentialFilePath, "utf8")) as {
       mcpUrl: string;
       token: string;

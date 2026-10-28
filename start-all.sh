@@ -3,8 +3,12 @@
 # Reliable daemon start via tmux. Readiness is mandatory before "BOTH UP".
 # P1 #41: Transactional — track launched components and roll back on failure.
 set -euo pipefail
-cd "$(dirname "$0")"
-DESKTOP_PWD="$PWD"
+cd -P "$(dirname "$0")"
+# Keep a physical checkout path for artifact validation. Git Bash may retain a
+# logical `/tmp/...` spelling after `cd .` even when Node created the fixture
+# under a native Windows temp directory; that spelling can make a later
+# generation lookup resolve against a different path namespace.
+DESKTOP_PWD="$(pwd -P)"
 export DESKTOP_PWD
 
 PREPARE_ONLY=0
@@ -429,19 +433,49 @@ restore_database_if_needed() {
 resolve_artifact_path() {
   local requested_path="$1"
   local resolved_path
-  resolved_path="$(readlink -f -- "$requested_path" 2>/dev/null || true)"
-  if [[ -z "$resolved_path" || ! -d "$resolved_path" ]]; then
+  # Resolve and check containment with Node so native Windows paths and
+  # Git-Bash paths compare in the same platform's path semantics. Windows may
+  # spell the same temp directory with its long name in Git Bash and its 8.3
+  # alias in a junction target, so containment there uses filesystem identity.
+  resolved_path="$(node --input-type=module -e '
+    import { realpathSync, statSync } from "node:fs";
+    import { dirname, isAbsolute, relative, sep } from "node:path";
+    try {
+      const requested = realpathSync(process.argv[1]);
+      const releases = realpathSync(process.argv[2]);
+      if (!statSync(requested).isDirectory()) process.exit(1);
+      if (process.platform === "win32") {
+        const releasesStat = statSync(releases);
+        if (!releasesStat.isDirectory() || releasesStat.ino === 0) process.exit(1);
+        let ancestor = dirname(requested);
+        let contained = false;
+        while (true) {
+          const ancestorStat = statSync(ancestor);
+          if (ancestorStat.dev === releasesStat.dev && ancestorStat.ino === releasesStat.ino) {
+            contained = true;
+            break;
+          }
+          const parent = dirname(ancestor);
+          if (parent === ancestor) break;
+          ancestor = parent;
+        }
+        if (!contained) process.exit(1);
+      } else {
+        const rel = relative(releases, requested);
+        if (!rel || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) process.exit(1);
+      }
+      process.stdout.write(requested);
+    } catch { process.exit(1); }
+  ' "$requested_path" "$DESKTOP_PWD/releases" 2>/dev/null || true)"
+  if [[ -z "$resolved_path" ]]; then
     echo "ERROR: immutable artifact does not exist: $requested_path" >&2
     return 1
   fi
-  case "$resolved_path" in
-    "$DESKTOP_PWD/releases/"*) ;;
-    *)
-      echo "ERROR: serving artifact is outside immutable releases/: $resolved_path" >&2
-      return 1
-      ;;
-  esac
-  local directory_build_id="${resolved_path##*/}"
+  local directory_build_id
+  directory_build_id="$(node --input-type=module -e '
+    import { basename } from "node:path";
+    process.stdout.write(basename(process.argv[1]));
+  ' "$resolved_path")"
   local metadata_build_id="$(read_json_field "$resolved_path/build-meta.json" buildId)"
   ARTIFACT_SCHEMA_VERSION="$(read_json_field "$resolved_path/build-meta.json" schemaVersion)"
   ARTIFACT_MAX_READABLE_SCHEMA_VERSION="$(read_json_field "$resolved_path/build-meta.json" maxReadableSchemaVersion)"
@@ -455,16 +489,16 @@ resolve_artifact_path() {
 }
 
 resolve_dist_artifact() {
-  if [[ ! -L "$DESKTOP_PWD/dist" ]]; then
-    echo "ERROR: dist/ must be an immutable releases/<buildId> symlink when used as an artifact selector." >&2
-    return 1
-  fi
+  # Validate the canonical target instead of requiring POSIX symlink metadata:
+  # Windows directory junctions are valid projections, but Git Bash `-L` and
+  # `readlink` do not consistently recognize them. resolve_artifact_path below
+  # rejects ordinary directories because their real path is outside releases/.
   resolve_artifact_path "$DESKTOP_PWD/dist"
 }
 
 load_committed_generation() {
   if [[ -f "$GENERATION_RECORD" ]]; then
-    local committed_artifact committed_build previous_build previous_artifact last_good_build last_good_artifact committed_surface
+    local committed_artifact committed_build previous_build previous_artifact last_good_build last_good_artifact committed_surface committed_artifact_valid
     committed_artifact="$(read_json_field "$GENERATION_RECORD" artifactPath)"
     committed_build="$(read_json_field "$GENERATION_RECORD" activeBuildId)"
     previous_build="$(read_json_field "$GENERATION_RECORD" previousBuildId)"
@@ -472,7 +506,22 @@ load_committed_generation() {
     last_good_build="$(read_json_field "$GENERATION_RECORD" lastKnownGoodBuildId)"
     last_good_artifact="$(read_json_field "$GENERATION_RECORD" lastKnownGoodArtifactPath)"
     committed_surface="$(read_json_field "$GENERATION_RECORD" mcpToolSurfaceVersion)"
+    committed_artifact_valid=0
     if [[ -n "$committed_artifact" ]] && resolve_artifact_path "$committed_artifact" >/dev/null 2>&1; then
+      if [[ -z "$committed_build" || "$ARTIFACT_BUILD_ID" == "$committed_build" ]]; then
+        committed_artifact_valid=1
+      fi
+    fi
+    # A Git-Bash/Windows restart may deserialize an equivalent 8.3/long-path
+    # spelling that cannot be resolved through the original junction path.
+    # Re-select only by the committed build ID, then apply the same immutable
+    # release containment and directory/metadata identity checks.
+    if [[ "$committed_artifact_valid" != "1" && -n "$committed_build" ]] \
+      && resolve_artifact_path "$DESKTOP_PWD/releases/$committed_build" >/dev/null 2>&1 \
+      && [[ "$ARTIFACT_BUILD_ID" == "$committed_build" ]]; then
+      committed_artifact_valid=1
+    fi
+    if [[ "$committed_artifact_valid" == "1" ]]; then
       COMMITTED_GENERATION_PRESENT=1
       PREVIOUS_BUILD_ID="$ARTIFACT_BUILD_ID"
       PREVIOUS_ARTIFACT_PATH="$ACTIVE_ARTIFACT_PATH"
@@ -489,7 +538,7 @@ load_committed_generation() {
   # Migration path for a running pre-generation-record checkout. This is only
   # a fallback selector; build-atomic never rotates it and activation commits
   # the new release only after readiness succeeds.
-  if [[ -z "$PREVIOUS_ARTIFACT_PATH" && -L "$DESKTOP_PWD/dist" ]] && resolve_dist_artifact >/dev/null 2>&1; then
+  if [[ -z "$PREVIOUS_ARTIFACT_PATH" ]] && resolve_dist_artifact >/dev/null 2>&1; then
     PREVIOUS_BUILD_ID="$ARTIFACT_BUILD_ID"
     PREVIOUS_ARTIFACT_PATH="$ACTIVE_ARTIFACT_PATH"
   fi
@@ -1490,7 +1539,14 @@ if [[ "$ACTIVATE_EXISTING" == "1" ]]; then
     echo "[*] Activating prepared immutable candidate ${CANDIDATE_BUILD_ID} at ${CANDIDATE_ARTIFACT_PATH}."
   fi
 elif [[ "${KONTROL_USE_EXISTING_DIST:-false}" == "true" ]]; then
-  resolve_dist_artifact || exit 1
+  # After an unplanned controller exit the mutable dist projection may be
+  # missing or stale while generation.json still names the committed release.
+  # Prefer that validated immutable artifact; dist remains the migration path
+  # for checkouts that predate generation records.
+  if [[ -z "$PREVIOUS_ARTIFACT_PATH" ]] \
+    || ! resolve_artifact_path "$PREVIOUS_ARTIFACT_PATH" >/dev/null 2>&1; then
+    resolve_dist_artifact || exit 1
+  fi
   CANDIDATE_BUILD_ID="$ARTIFACT_BUILD_ID"
   CANDIDATE_ARTIFACT_PATH="$ACTIVE_ARTIFACT_PATH"
   echo "[*] Reusing previously validated immutable release ${CANDIDATE_BUILD_ID}."

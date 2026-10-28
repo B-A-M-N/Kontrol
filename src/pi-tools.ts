@@ -79,7 +79,7 @@ async function runTool<TInput, TDetails = unknown>(
 }
 
 export async function readFileTool(input: ReadToolInput, context: ToolContext): Promise<ToolResponse> {
-  const path = await resolveAllowedPathCanonical(input.path, context.cwd, context.readRoots ?? [context.root]);
+  const path = await resolveAllowedPathCanonical(input.path, context.cwd, context.readRoots ?? [context.root], context.root);
   const tool = createReadTool(context.cwd);
 
   return runTool((params) => tool.execute("read_file", params), {
@@ -94,14 +94,14 @@ export async function readFileSnapshotTool(
   input: ReadToolInput,
   context: ToolContext,
 ): Promise<ToolResponse & { contentSha256?: string }> {
-  const path = await resolveAllowedPathCanonical(input.path, context.cwd, context.readRoots ?? [context.root]);
+  const path = await resolveAllowedPathCanonical(input.path, context.cwd, context.readRoots ?? [context.root], context.root);
   let observedBytes: Buffer | undefined;
   const tool = createReadTool(context.cwd, {
     operations: {
       access: async (absolutePath) => fsAccess(absolutePath, constants.R_OK),
       detectImageMimeType: detectSupportedImageMimeTypeFromFile,
       readFile: async (absolutePath) => {
-        const canonical = await resolveAllowedPathCanonical(absolutePath, context.cwd, context.readRoots ?? [context.root]);
+        const canonical = await resolveAllowedPathCanonical(absolutePath, context.cwd, context.readRoots ?? [context.root], context.root);
         observedBytes = await fsReadFile(canonical);
         return observedBytes;
       },
@@ -121,7 +121,7 @@ export async function readFileSnapshotTool(
 }
 
 export async function writeFileTool(input: WriteToolInput, context: ToolContext): Promise<ToolResponse> {
-  const path = await resolveAllowedPathCanonical(input.path, context.cwd, [context.root]);
+  const path = await resolveAllowedPathCanonical(input.path, context.cwd, [context.root], context.root);
   const tool = createWriteTool(context.cwd);
 
   return runTool((params) => tool.execute("write_file", params), {
@@ -131,7 +131,7 @@ export async function writeFileTool(input: WriteToolInput, context: ToolContext)
 }
 
 export async function editFileTool(input: EditToolInput, context: ToolContext): Promise<ToolResponse<EditToolDetails>> {
-  const path = await resolveAllowedPathCanonical(input.path, context.cwd, [context.root]);
+  const path = await resolveAllowedPathCanonical(input.path, context.cwd, [context.root], context.root);
   const tool = createEditTool(context.cwd);
 
   return runTool((params) => tool.execute("edit_file", params), {
@@ -141,14 +141,14 @@ export async function editFileTool(input: EditToolInput, context: ToolContext): 
 }
 
 export async function grepFilesTool(input: GrepToolInput, context: ToolContext): Promise<ToolResponse> {
-  if (input.path) await resolveAllowedPathCanonical(input.path, context.cwd, [context.root]);
+  if (input.path) await resolveAllowedPathCanonical(input.path, context.cwd, [context.root], context.root);
   const tool = createGrepTool(context.cwd);
 
   return runTool((params) => tool.execute("grep_files", params), input, context);
 }
 
 export async function findFilesTool(input: FindToolInput, context: ToolContext): Promise<ToolResponse> {
-  if (input.path) await resolveAllowedPathCanonical(input.path, context.cwd, [context.root]);
+  if (input.path) await resolveAllowedPathCanonical(input.path, context.cwd, [context.root], context.root);
   const tool = createFindTool(context.cwd);
   const result = await runTool((params) => tool.execute("find_files", params), input, context);
   const text = result.content.map((part) => part.type === "text" ? part.text : "").join("\n");
@@ -186,7 +186,7 @@ export async function findFilesTool(input: FindToolInput, context: ToolContext):
 }
 
 export async function listDirectoryTool(input: LsToolInput, context: ToolContext): Promise<ToolResponse> {
-  if (input.path) await resolveAllowedPathCanonical(input.path, context.cwd, [context.root]);
+  if (input.path) await resolveAllowedPathCanonical(input.path, context.cwd, [context.root], context.root);
   const tool = createLsTool(context.cwd);
 
   return runTool((params) => tool.execute("list_directory", params), input, context);

@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { realpath } from "node:fs/promises";
 import { controlPlaneGit, type GitCommandResult } from "./git-runner.js";
 
 export type { GitCommandResult };
@@ -39,7 +40,12 @@ export async function getGitEligibility(cwd: string): Promise<GitEligibility> {
     };
   }
 
-  const gitRoot = (await git(cwd, ["rev-parse", "--show-toplevel"])).stdout.trim();
+  // Git may report the lexical path stored in a linked-worktree .git file,
+  // while callers (and workspace roots) use the filesystem's canonical path.
+  // On macOS this commonly differs between /var and /private/var. Keep both
+  // identities aligned before deriving workspace-relative Git pathspecs.
+  const reportedRoot = (await git(cwd, ["rev-parse", "--show-toplevel"])).stdout.trim();
+  const gitRoot = await realpath(reportedRoot);
   try {
     await git(gitRoot, ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]);
   } catch {

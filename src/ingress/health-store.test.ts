@@ -22,7 +22,7 @@ try {
   };
   const saved = appendIngressHealthObservation(stateDir, base);
   assert.match(saved.observationId, /^[0-9a-f-]{36}$/);
-  assert.equal(statSync(join(stateDir, "ingress-health.json")).mode & 0o777, 0o600);
+  if (process.platform !== "win32") assert.equal(statSync(join(stateDir, "ingress-health.json")).mode & 0o777, 0o600);
   assert.equal(listIngressHealthObservations(stateDir, "public-main").length, 1);
   assert.equal(latestIngressHealthByProfile(stateDir)[0]?.profileId, "public-main");
   const persisted = readFileSync(join(stateDir, "ingress-health.json"), "utf8");

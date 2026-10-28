@@ -6,6 +6,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { syncDirectory } from "../fs-durability.js";
 import { join, resolve } from "node:path";
 import { execFile } from "node:child_process";
 import type { IngressConfigSource } from "./profile-status.js";
@@ -74,8 +75,7 @@ function saveStore(stateDir: string, store: IngressReceiptStore): void {
   try { writeFileSync(fd, JSON.stringify(store)); fsyncSync(fd); }
   finally { closeSync(fd); }
   renameSync(temporary, path);
-  const dirFd = openSync(stateDir, "r");
-  try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
+  syncDirectory(stateDir);
 }
 
 function withMutationLock<T>(stateDir: string, run: () => Promise<T>): Promise<T> {

@@ -68,6 +68,7 @@
     "build:app": "vite build && vite build --config vite.workspace-app-smoke.config.ts && node scripts/check-workspace-app-bundle.mjs",
     "dev": "node scripts/dev-server.mjs",
     "postinstall": "node scripts/fix-node-pty-permissions.mjs",
+    "pretest": "node scripts/provision-test-tools.mjs",
     "start": "node scripts/start.mjs",
     "up": "node dist/cli.js up",
     "test": "npm run test:manifest && npm run test:runtime && npm run test:package",
@@ -85,7 +86,7 @@
     "test:cold-start": "node scripts/cold-start-messaging-e2e.mjs && node --import tsx scripts/scheduled-job-e2e.mjs",
     "test:integration": "node src/start-all.test.mjs && node src/release-artifact.test.mjs && node src/start-all.behavior.test.mjs && node scripts/kontrol-supervisor.test.mjs && tsx src/process-sessions.test.ts && tsx src/server-integrity.test.ts && tsx src/server/startup-recovery.test.ts && tsx src/peer-failures.test.ts && tsx src/peer-listener.test.ts && tsx src/peer-jobs-enqueue.test.ts && tsx src/ingress/qualification.integration.test.ts && node scripts/lib/mcp-owner-bridge.integration.test.mjs && tsx src/server/shutdown.test.ts && tsx src/mcp-process-continuity.test.ts && tsx src/mcp-minimal-process.test.ts && tsx src/work-session-lifecycle.test.ts && tsx src/approval-requests.test.ts && tsx src/server-admission.test.ts && tsx src/acp-gateway.test.ts && tsx src/acp-identity.test.ts && tsx src/acp-lifecycle.test.ts && tsx src/continuation.test.ts && tsx src/dispatch-outbox.test.ts && tsx src/bridge-flow.test.ts && tsx src/bridge/reply-flow.test.ts && tsx src/bridge/reply-dispatcher.test.ts && tsx src/bridge/schedule-tools.test.ts && tsx src/scheduling/scheduled-verification.test.ts && tsx src/scheduling/scheduled-jobs.test.ts && node --import tsx scripts/scheduled-readonly-adapters-e2e.mjs && tsx src/review-handoff/route-store.test.ts && node src/lifecycle-soak.test.mjs",
     "test:lifecycle": "npm run test:integration",
-    "test:runtime": "node scripts/run-runtime-tests.mjs",
+    "test:runtime": "node scripts/provision-test-tools.mjs && node scripts/run-runtime-tests.mjs",
     "test:package": "node src/package-files-manifest.test.mjs && node src/release-bundle.test.mjs && node src/release-publish.test.mjs && node src/package-release.test.mjs",
     "test:package-release": "node src/package-release.test.mjs",
     "test:workspace-app": "node scripts/probe-workspace-app.mjs",
@@ -136,7 +137,7 @@
     "@modelcontextprotocol/express": "^2.0.2",
     "@modelcontextprotocol/ext-apps": "^2.0.3",
     "@modelcontextprotocol/node": "^2.1.2",
-    "@modelcontextprotocol/sdk": "^1.31.0",
+    "@modelcontextprotocol/sdk": "^1.32.2",
     "@modelcontextprotocol/server": "^2.4.0",
     "@modelcontextprotocol/server-legacy": "^2.4.0",
     "@pierre/diffs": "^1.2.5",
@@ -147,7 +148,7 @@
     "react": "^19.2.6",
     "react-dom": "^19.2.6",
     "semver": "^7.8.4",
-    "zod": "^4.4.3"
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
@@ -158,6 +159,7 @@
     "@types/react-dom": "^19.2.3",
     "@types/semver": "^7.7.1",
     "@vitejs/plugin-react": "^6.0.2",
+    "@vscode/ripgrep": "1.18.0",
     "jsdom": "^26.1.0",
     "playwright": "^1.62.1",
     "tsx": "^4.22.3",
@@ -167,7 +169,10 @@
   },
   "overrides": {
     "express": {
-      "qs": "^6.16.0"
+      "qs": "^6.17.0"
+    },
+    "@earendil-works/pi-coding-agent": {
+      "undici": "8.12.3"
     }
   },
   "optionalDependencies": {

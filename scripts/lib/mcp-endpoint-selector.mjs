@@ -93,7 +93,10 @@ export class EndpointPreferenceStore {
   read() {
     if (!existsSync(this.#path)) return [...this.#profileIds];
     const stats = lstatSync(this.#path);
-    if (!stats.isFile() || stats.isSymbolicLink() || (stats.mode & 0o077) !== 0
+    if (!stats.isFile() || stats.isSymbolicLink()
+      // Windows Node stats do not report Unix permission bits; this file only
+      // stores endpoint ordering, while its ACL inherits the user's profile.
+      || (process.platform !== "win32" && (stats.mode & 0o077) !== 0)
       || (typeof process.getuid === "function" && stats.uid !== process.getuid())) {
       throw new Error("endpoint preference file must be an owner-only regular file");
     }
@@ -115,8 +118,13 @@ export class EndpointPreferenceStore {
     finally { closeSync(fd); }
     try {
       renameSync(temporary, this.#path);
-      const dirFd = openSync(dirname(this.#path), "r");
-      try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
+      // Windows does not expose directory handles that Node can fsync. The
+      // preference payload itself is flushed before the atomic rename above;
+      // supported Linux production releases also flush the containing entry.
+      if (process.platform !== "win32") {
+        const dirFd = openSync(dirname(this.#path), "r");
+        try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
+      }
     } catch (error) {
       try { unlinkSync(temporary); } catch {}
       throw error;
@@ -139,7 +147,12 @@ export function authorizationForEndpoint(endpoint) {
   if (endpoint.auth.type === "none" || endpoint.auth.type === "worker_envelope") return "";
   let stats;
   try { stats = statSync(endpoint.auth.credentialRef); } catch { throw new Error("endpoint " + endpoint.id + " credential file is unavailable"); }
-  if (!stats.isFile() || (stats.mode & 0o077) !== 0 || (typeof process.getuid === "function" && stats.uid !== process.getuid())) throw new Error("endpoint " + endpoint.id + " credential file must be owner-only");
+  // Node exposes POSIX mode bits on Unix. On Windows, permission authority is
+  // the inherited ACL; stat.mode is a compatibility value and cannot prove
+  // whether the current user is the only principal allowed to read the file.
+  // Linux is the supported production lifecycle platform.
+  if (!stats.isFile() || (process.platform !== "win32" && (stats.mode & 0o077) !== 0)
+    || (typeof process.getuid === "function" && stats.uid !== process.getuid())) throw new Error("endpoint " + endpoint.id + " credential file must be owner-only");
   const authorization = readFileSync(endpoint.auth.credentialRef, "utf8").trim();
   if (!/^Bearer [^\s]+$/.test(authorization) || /[\x00-\x1f]/.test(authorization)) throw new Error("endpoint " + endpoint.id + " credential file must contain one raw Bearer value");
   return authorization;

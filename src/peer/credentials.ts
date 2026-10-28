@@ -152,13 +152,15 @@ export function parsePeerCredentialFile(raw: string): PeerCredentialFile {
 }
 
 /**
- * Load + validate the registry file. Enforces unix permission hygiene
- * BEFORE reading: the file must exist and (stat.mode & 0o077) must be 0
- * (i.e. 0600 or 0400); otherwise throw. Throws on parse errors too.
+ * Load + validate the registry file. Enforces POSIX permission hygiene
+ * BEFORE reading: on Linux/macOS the file must exist and (stat.mode & 0o077)
+ * must be 0 (i.e. 0600 or 0400); Windows ACLs are inherited from the user's
+ * config directory because Node does not expose their effective DACL in mode.
+ * Throws on parse errors too.
  */
 export function loadPeerCredentialFile(filePath: string): PeerCredentialFile {
   const stat = statSync(filePath);
-  if ((stat.mode & 0o077) !== 0) {
+  if (process.platform !== "win32" && (stat.mode & 0o077) !== 0) {
     throw new Error(`Peer credential file ${filePath} must not be group/other accessible (chmod 600 required)`);
   }
   return parsePeerCredentialFile(readFileSync(filePath, "utf8"));

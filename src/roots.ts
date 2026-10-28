@@ -1,7 +1,7 @@
 import { homedir } from "node:os";
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { lstat, realpath } from "node:fs/promises";
-import { lstatSync } from "node:fs";
+import { lstatSync, realpathSync, statSync } from "node:fs";
 
 export class AccessDeniedError extends Error {
   constructor(message: string) {
@@ -20,8 +20,8 @@ export function expandHomePath(path: string): string {
 }
 
 export function isPathInsideRoot(path: string, root: string): boolean {
-  const resolvedPath = resolve(expandHomePath(path));
-  const resolvedRoot = resolve(expandHomePath(root));
+  const resolvedPath = normalizeContainmentPath(resolve(expandHomePath(path)));
+  const resolvedRoot = normalizeContainmentPath(resolve(expandHomePath(root)));
   const relationship = relative(resolvedRoot, resolvedPath);
 
   // Reject exact parent traversal components only. A child named `..cache`
@@ -31,6 +31,49 @@ export function isPathInsideRoot(path: string, root: string): boolean {
     relationship === "" ||
     (!isAbsolute(relationship) && !components.includes(".."))
   );
+}
+
+function normalizeContainmentPath(path: string): string {
+  if (process.platform !== "win32") return path;
+  // fs.realpath may return Win32 extended-length paths while callers and
+  // configuration keep ordinary drive paths. They name the same location,
+  // but path.relative treats the two spellings as different roots.
+  if (path.startsWith("\\\\?\\UNC\\")) return `\\\\${path.slice(8)}`;
+  return path.startsWith("\\\\?\\") ? path.slice(4) : path;
+}
+
+/** Compare existing filesystem roots after resolving OS aliases such as macOS /var. */
+export function isPathInsideRootCanonical(path: string, root: string): boolean {
+  try {
+    const canonicalPath = realpathSync(path);
+    const canonicalRoot = realpathSync(root);
+    if (isPathInsideRoot(canonicalPath, canonicalRoot)) return true;
+
+    // Windows may preserve 8.3 aliases in one canonical path while returning
+    // the long name for the other. Compare filesystem identity while walking
+    // the resolved candidate's parent chain so equivalent spellings of the
+    // same directory stay authorized. Symlinks have already been resolved;
+    // inaccessible paths or unstable file IDs remain fail closed.
+    if (process.platform === "win32") {
+      const rootIdentity = statSync(canonicalRoot, { bigint: true });
+      if (rootIdentity.ino === 0n) return false;
+      let current = canonicalPath;
+      while (true) {
+        const candidateIdentity = statSync(current, { bigint: true });
+        if (candidateIdentity.ino !== 0n
+          && candidateIdentity.dev === rootIdentity.dev
+          && candidateIdentity.ino === rootIdentity.ino) return true;
+        const parent = dirname(current);
+        if (parent === current) return false;
+        current = parent;
+      }
+    }
+    return false;
+  } catch {
+    // Authorization checks fail closed when either canonical path cannot be
+    // established; lexical containment cannot rule out an inaccessible link.
+    return false;
+  }
 }
 
 export function assertAllowedPath(path: string, allowedRoots: string[]): string {
@@ -48,9 +91,28 @@ export function resolveAllowedPath(inputPath: string, cwd: string, allowedRoots:
 }
 
 /** Synchronous counterpart used immediately before filesystem mutations. */
-export function assertNoSymlinkComponentsSync(absolutePath: string): void {
+export function assertNoSymlinkComponentsSync(absolutePath: string, trustedRoot?: string): void {
+  const target = resolve(absolutePath);
   let current: string = sep;
-  const components = resolve(absolutePath).split(sep).filter(Boolean);
+  let components: string[];
+  if (trustedRoot !== undefined) {
+    const root = resolve(trustedRoot);
+    const rootRelative = relative(root, target);
+    if (isAbsolute(rootRelative) || rootRelative === ".." || rootRelative.startsWith(`..${sep}`)) {
+      throw new AccessDeniedError(`Path is outside workspace root: ${absolutePath}`);
+    }
+    // Check from the workspace boundary down. OS path aliases such as
+    // macOS /var -> /private/var may contain symlinks before the boundary;
+    // they do not redirect a child outside the already-authorized root.
+    const rootMetadata = lstatSync(root);
+    if (rootMetadata.isSymbolicLink() || !rootMetadata.isDirectory()) {
+      throw new AccessDeniedError(`Workspace root must be a regular directory: ${root}`);
+    }
+    current = root;
+    components = rootRelative.split(sep).filter(Boolean);
+  } else {
+    components = target.split(sep).filter(Boolean);
+  }
   for (const component of components) {
     current = resolve(current, component);
     try {
@@ -58,7 +120,7 @@ export function assertNoSymlinkComponentsSync(absolutePath: string): void {
       if (metadata.isSymbolicLink()) {
         throw new AccessDeniedError(`Symlink path components are not permitted: ${absolutePath}`);
       }
-      if (!metadata.isDirectory() && current !== resolve(absolutePath)) {
+      if (!metadata.isDirectory() && current !== target) {
         throw new AccessDeniedError(`Path component is not a directory: ${current}`);
       }
     } catch (err) {
@@ -73,16 +135,19 @@ export function assertNoSymlinkComponentsSync(absolutePath: string): void {
  * within the allowed roots. This prevents symlink escapes where a path passes
  * the lexical allowlist check but resolves to an unallowed target.
  */
-export async function resolveAllowedPathCanonical(inputPath: string, cwd: string, allowedRoots: string[]): Promise<string> {
+export async function resolveAllowedPathCanonical(inputPath: string, cwd: string, allowedRoots: string[], trustedRoot?: string): Promise<string> {
   const absolutePath = resolve(cwd, inputPath);
   const canonicalRoots = await getCanonicalRoots(allowedRoots);
+  const symlinkBoundary = trustedRoot && isPathInsideRoot(absolutePath, trustedRoot)
+    ? trustedRoot
+    : allowedRoots.find((root) => isPathInsideRoot(absolutePath, root));
   try {
-    await rejectSymlinkComponents(absolutePath);
+    await rejectSymlinkComponents(absolutePath, symlinkBoundary);
     const canonical = await realpath(absolutePath);
     return assertAllowedPath(canonical, canonicalRoots);
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
-    return resolveWritablePath(absolutePath, canonicalRoots);
+    return resolveWritablePath(absolutePath, canonicalRoots, symlinkBoundary);
   }
 }
 
@@ -92,9 +157,9 @@ export async function resolveAllowedPathCanonical(inputPath: string, cwd: string
  * that, then reattach the remainder. Rejects any existing symlink component
  * that escapes the canonical workspace.
  */
-export async function resolveWritablePath(absolutePath: string, canonicalRoots?: string[]): Promise<string> {
+export async function resolveWritablePath(absolutePath: string, canonicalRoots?: string[], trustedRoot?: string): Promise<string> {
   const roots = canonicalRoots ?? await getCanonicalRoots([process.cwd()]);
-  await rejectSymlinkComponents(absolutePath);
+  await rejectSymlinkComponents(absolutePath, trustedRoot);
 
   let existing = absolutePath;
   while (true) {
@@ -124,9 +189,27 @@ export async function resolveWritablePath(absolutePath: string, canonicalRoots?:
 }
 
 /** Reject symlink traversal, including symlinks that point back inside root. */
-async function rejectSymlinkComponents(absolutePath: string): Promise<void> {
+async function rejectSymlinkComponents(absolutePath: string, trustedRoot?: string): Promise<void> {
   let current: string = sep;
-  const components = absolutePath.split(sep).filter(Boolean);
+  let components: string[];
+  if (trustedRoot !== undefined) {
+    const root = resolve(trustedRoot);
+    const rootRelative = relative(root, absolutePath);
+    if (isAbsolute(rootRelative) || rootRelative === ".." || rootRelative.startsWith(`..${sep}`)) {
+      throw new AccessDeniedError(`Path is outside workspace root: ${absolutePath}`);
+    }
+    // OS aliases such as macOS /var -> /private/var may contain symlinks
+    // before an already-authorized workspace root. Validate the root itself
+    // and every descendant, while leaving those system ancestors untouched.
+    const rootMetadata = await lstat(root);
+    if (rootMetadata.isSymbolicLink() || !rootMetadata.isDirectory()) {
+      throw new AccessDeniedError(`Workspace root must be a regular directory: ${root}`);
+    }
+    current = root;
+    components = rootRelative.split(sep).filter(Boolean);
+  } else {
+    components = absolutePath.split(sep).filter(Boolean);
+  }
   for (const component of components) {
     current = resolve(current, component);
     try {

@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -51,6 +51,17 @@ try {
   assert.equal(clean.summary.files, 0);
   assert.equal(clean.patch, "");
   assert.match(clean.result, /No changes/);
+
+  const rootAlias = join(tmpdir(), `kontrol-review-checkpoints-alias-${process.pid}`);
+  await symlink(root, rootAlias, process.platform === "win32" ? "junction" : "dir");
+  try {
+    const aliasManager = createReviewCheckpointManager();
+    await aliasManager.initializeWorkspace({ workspaceId: "ws_review_alias", root: rootAlias });
+    const aliasClean = await aliasManager.reviewChanges({ workspaceId: "ws_review_alias", root: rootAlias });
+    assert.equal(aliasClean.summary.files, 0, "Git checkpoint paths stay inside the repository when opened through an OS path alias");
+  } finally {
+    await rm(rootAlias, { force: true });
+  }
 
   await writeFile(join(root, "README.md"), "hello\nworld\n");
   await writeFile(join(root, "new.txt"), "new\n");

@@ -8,6 +8,7 @@ import { createHash } from "node:crypto";
 import { createServer } from "node:http";
 import { execFileSync, spawn } from "node:child_process";
 import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -314,6 +315,7 @@ async function runAdapterCase(name) {
   const baseUrl = `http://127.0.0.1:${serverPort}`;
   let server;
   let adapter;
+  let client;
   let sharedDb;
   try {
     server = await startServer({ root, stateDir, configDir, port: serverPort });
@@ -337,90 +339,37 @@ async function runAdapterCase(name) {
     const { openDatabase } = await import("../src/db/client.js");
     const { createDispatchOutbox } = await import("../src/dispatch-outbox.js");
     const { createScheduledJobStore } = await import("../src/scheduling/scheduled-job-store.js");
-    const { createScheduledJobRuntime } = await import("../src/scheduling/scheduled-job-runtime.js");
-    const { dispatchScheduledJob } = await import("../src/scheduling/scheduled-job-dispatch.js");
-    const { loadConfig } = await import("../src/config.js");
     const { createAgentRegistryManager } = await import("../src/acp-registry.js");
-    const { createWorkSessionManager } = await import("../src/work-sessions.js");
-    const { SqliteWorkspaceStore } = await import("../src/workspace-store.js");
-    const { WorkspaceRegistry } = await import("../src/workspaces.js");
 
     sharedDb = openDatabase(stateDir);
     const outbox = createDispatchOutbox(sharedDb);
     const jobs = createScheduledJobStore(sharedDb, outbox);
-    const serverConfig = loadConfig({
-      KONTROL_CONFIG_DIR: configDir,
-      KONTROL_ALLOWED_ROOTS: root,
-      KONTROL_STATE_DIR: stateDir,
-      KONTROL_AUTH_MODE: "tunnel",
-      KONTROL_ACP_ENABLED: "true",
-      KONTROL_TOOL_MODE: "full",
-      KONTROL_POLICY_MODE: "allow",
-      KONTROL_READ_ONLY_NETWORK_POLICY: "disabled",
-      KONTROL_ACP_AGENT_SECRET: AGENT_SECRET,
-      KONTROL_ACP_ADAPTER_SECRET: ADAPTER_SECRET,
-      KONTROL_ACP_REVIEWER_SECRET: REVIEWER_SECRET,
-      KONTROL_ALLOWED_ROOTS_ACK: "1",
-      PORT: String(serverPort),
-    });
     const agentRegistry = createAgentRegistryManager(sharedDb);
     const expectedAgent = name === "crush" ? "cli-coding-agent" : "hermes-agent";
     await waitFor(`${name} registration`, () => agentRegistry.listAlive().find((agentInfo) => agentInfo.name === expectedAgent));
-    const workSessions = createWorkSessionManager(sharedDb);
-    const workspaceStore = new SqliteWorkspaceStore(sharedDb);
-    const workspaces = new WorkspaceRegistry(serverConfig, workspaceStore);
-    const opened = await workspaces.openWorkspace(workspace.workspaceRoot);
-
-    const job = jobs.create({
-      principalId: `scheduled-${name}-principal`,
-      ownerContextId: `principal:scheduled-${name}-principal|transport:e2e`,
-      projectId: opened.workspace.id,
-      workspaceRoot: workspace.workspaceRoot,
+    client = new Client({ name: "scheduled-readonly-e2e", version: "1.0.0" });
+    await client.connect(new StreamableHTTPClientTransport(new URL(`${baseUrl}/mcp`), {
+      requestInit: { headers: { "x-kontrol-tunnel-reviewer": REVIEWER_SECRET } },
+    }));
+    const opened = await client.callTool({ name: "open_workspace", arguments: { path: workspace.workspaceRoot, mode: "checkout" } });
+    const workspaceId = opened.structuredContent?.workspaceId;
+    assert.ok(workspaceId, `${name} opened its workspace through the production MCP surface`);
+    const created = await client.callTool({ name: "schedule_job", arguments: {
+      workspaceId,
       runAt: new Date(Date.now() - 1_000).toISOString(),
-      instructionJson: { instructions: TASK },
+      instructions: TASK,
       executionMode: "read_only_audit",
-      policySnapshotJson: { workspaceAccess: "read_only" },
+      maxRuntimeMinutes: 3,
       agentName: expectedAgent,
-      maxRuntimeMs: 180_000,
-    });
-    const runtime = createScheduledJobRuntime({
-      database: sharedDb,
-      jobs,
-      dispatchOutbox: outbox,
-      pollMs: 60_000,
-      dispatch: async (jobId) => {
-        const current = jobs.get(jobId);
-        if (!current) return { status: "failed", reason: "scheduled job disappeared" };
-        const outcome = await dispatchScheduledJob({
-          workspaces,
-          workSessions,
-          agentRegistry,
-          adapterSecret: ADAPTER_SECRET,
-          serverConfig,
-          eventStore: null,
-          continuationManager: null,
-          reviewWorkflow: null,
-          missionLedger: null,
-          supervisorRuns: null,
-        }, jobs, current);
-        return {
-          status: outcome.status,
-          workSessionId: outcome.workSessionId,
-          runId: outcome.runId,
-          remoteRunId: outcome.remoteRunId,
-          attemptNumber: outcome.attemptNumber,
-          executionReceipt: outcome.executionReceipt,
-          reason: outcome.reason,
-        };
-      },
-    });
-
-    await runtime.drainOnce();
-    // The server started its production scheduler during startup. This E2E
-    // runtime also drains the shared outbox, so either scheduler may own the
-    // due event. Wait for the durable accepted projection instead of assuming
-    // this test runtime claimed it first. A very fast fixture may already have
-    // advanced into review by the time acceptance becomes visible.
+    } });
+    assert.equal(created.isError, undefined, `${name} schedule_job MCP call succeeded`);
+    const scheduledJobId = created.structuredContent?.scheduledJobId;
+    assert.ok(scheduledJobId, `${name} schedule_job returned its durable job identity`);
+    const job = jobs.get(scheduledJobId);
+    assert.ok(job, `${name} scheduled job is visible through the durable store`);
+    // Creating through schedule_job wakes the server-owned production
+    // scheduler. A very fast fixture may already have advanced into review by
+    // the time acceptance becomes visible.
     const dispatched = await waitFor(() => {
       const current = jobs.get(job.id);
       const attempt = jobs.getAttempt(job.id);
@@ -471,7 +420,8 @@ async function runAdapterCase(name) {
     await assert.rejects(readFile(join(workspace.workspaceRoot, "helper-write.txt")), { code: "ENOENT" },
       `${name} helper process did not create a workspace file`);
 
-    runtime.stop();
+    await client.close();
+    client = undefined;
     sharedDb.close();
     sharedDb = undefined;
     console.log(`scheduled-readonly-adapters-e2e: ${name} passed`);
@@ -480,6 +430,7 @@ async function runAdapterCase(name) {
     if (detail) error.message += `\n${detail.slice(-8_000)}`;
     throw error;
   } finally {
+    await client?.close().catch(() => undefined);
     sharedDb?.close();
     await stopChild(adapter);
     await stopChild(server);
@@ -490,6 +441,16 @@ async function runAdapterCase(name) {
   }
 }
 
-await runAdapterCase("crush");
-await runAdapterCase("hermes");
-console.log("scripts/scheduled-readonly-adapters-e2e.mjs: passed");
+if (process.platform === "linux") {
+  await runAdapterCase("crush");
+  await runAdapterCase("hermes");
+  console.log("scripts/scheduled-readonly-adapters-e2e.mjs: passed");
+} else {
+  assert.throws(
+    () => findBubblewrap(),
+    (error) => error?.code === "sandbox_unavailable"
+      && error.message.includes("supported only on Linux"),
+    "scheduled read-only ACP execution must fail closed before dispatch on hosts without Linux Bubblewrap confinement",
+  );
+  console.log(`scheduled-readonly-adapters-e2e: ${process.platform} fail-closed confinement contract passed`);
+}

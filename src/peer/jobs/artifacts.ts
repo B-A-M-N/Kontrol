@@ -2,6 +2,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { syncDirectory } from "../../fs-durability.js";
 import { PeerJobError } from "./contracts.js";
 import type { PeerJob, PeerJobResultReceipt } from "./contracts.js";
 import { canonicalizeManifestPath } from "./service.js";
@@ -44,8 +45,7 @@ function writeIndex(path: string, index: UploadIndex): void {
     closeSync(fd);
   }
   renameSync(temporary, path);
-  const dirFd = openSync(dirname(path), "r");
-  try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
+  syncDirectory(dirname(path));
 }
 
 function peerJobDirectory(stateDir: string, jobId: string, attemptId: string): string {
@@ -110,8 +110,7 @@ export function createPeerArtifactStore(stateDir: string): PeerArtifactStore {
           closeSync(fd);
         }
         renameSync(temporary, blobPath);
-        const dirFd = openSync(directory, "r");
-        try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
+        syncDirectory(directory);
       }
       Object.defineProperty(index.files, path, { value: { sha256: digest, bytes: bytes.byteLength }, enumerable: true, configurable: true, writable: true });
       writeIndex(indexPath, index);

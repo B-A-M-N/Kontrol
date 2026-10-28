@@ -28,7 +28,10 @@ function syncDirectory(path: string): void {
 
 function readPrivateIntent(path: string): string {
   const stats = lstatSync(path);
-  if (!stats.isFile() || stats.isSymbolicLink() || (stats.mode & 0o077) !== 0) {
+  // Node's mode bits do not expose Windows ACL permissions; keep the type and
+  // symlink checks on every platform, and enforce POSIX privacy where visible.
+  const modeIsPrivate = process.platform === "win32" || (stats.mode & 0o077) === 0;
+  if (!stats.isFile() || stats.isSymbolicLink() || !modeIsPrivate) {
     throw new Error("PTY review submission intent is not a private regular file.");
   }
   const value = readFileSync(path, "utf8").trim();

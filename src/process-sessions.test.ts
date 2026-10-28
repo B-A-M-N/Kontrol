@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { HeadTailBuffer, OutputLog, ProcessSessionManager } from "./process-sessions.js";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -800,6 +800,7 @@ try {
           "repeating an observation at the same cursor is nondestructive");
 
         const credentialPath = join(stateDir, "agent-pty-review-test", "credential.json");
+        const credentialEnvironmentPath = join(stateDir, "agent-pty-review-test", "observed-environment.json");
         mkdirSync(dirname(credentialPath), { recursive: true });
         let credentialCleaned = false;
         const credentialLaunch = await ptyManager.start({
@@ -807,7 +808,7 @@ try {
           ownerId: `work-session:${workSession.id}`,
           workSessionId: workSession.id,
           principalId: `worker-work-session:${workSession.id}`,
-          command: `${node} -e "process.stdout.write(String(process.env.KONTROL_AGENT_PTY_CREDENTIAL_FILE) + '|' + String(process.env.KONTROL_AGENT_PTY_TOKEN))"`,
+          command: `${node} -e 'require("node:fs").writeFileSync(${JSON.stringify(credentialEnvironmentPath)}, JSON.stringify({credentialFile:process.env.KONTROL_AGENT_PTY_CREDENTIAL_FILE,token:process.env.KONTROL_AGENT_PTY_TOKEN}))'`,
           cwd: process.cwd(),
           tty: true,
           yieldTimeMs: 40,
@@ -825,15 +826,24 @@ try {
           workSessionId: workSession.id,
           processSessionId: credentialLaunch.sessionId!,
         });
-        for (let index = 0; index < 20 && !credentialCleaned; index += 1) {
+        for (let index = 0; index < 100
+          && (!credentialCleaned || !existsSync(credentialEnvironmentPath)); index += 1) {
           await new Promise((resolve) => setTimeout(resolve, 25));
           credentialObservation = ptyManager.observeAgentPty({
             workSessionId: workSession.id,
             processSessionId: credentialLaunch.sessionId!,
           });
         }
-        assert.match(credentialObservation?.output ?? "", /agent-pty-review-test\/credential\.json\|undefined/,
-          "the PTY receives only the private credential file path, never a bearer token in its environment");
+        assert.ok(existsSync(credentialEnvironmentPath),
+          `the PTY child observed its environment before exit (output: ${credentialObservation?.output ?? ""})`);
+        const credentialEnvironment = JSON.parse(readFileSync(credentialEnvironmentPath, "utf8")) as {
+          credentialFile?: string;
+          token?: string;
+        };
+        assert.equal(credentialEnvironment.credentialFile, credentialPath,
+          "the PTY receives the private credential file path");
+        assert.equal(credentialEnvironment.token, undefined,
+          "the PTY never receives a bearer token in its environment");
         assert.equal(credentialCleaned, true, "the private credential is removed after the PTY exits");
 
         await assert.rejects(ptyManager.write({
