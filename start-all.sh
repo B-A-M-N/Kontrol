@@ -368,6 +368,26 @@ capture_database_deployment_state() {
   DATABASE_ROLLBACK_RESTORE_REQUIRED="$(read_json_text_field "$inspection" rollbackRestoreRequired)"
 }
 
+validate_candidate_database_compatibility() {
+  local candidate_max
+  candidate_max="${ARTIFACT_MAX_READABLE_SCHEMA_VERSION:-${ARTIFACT_SCHEMA_VERSION:-}}"
+  if [[ ! "$candidate_max" =~ ^[0-9]+$ ]]; then
+    candidate_max="${ARTIFACT_SCHEMA_VERSION:-}"
+  fi
+  if [[ ! "$candidate_max" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: candidate artifact has no valid maximum readable schema version." >&2
+    return 1
+  fi
+
+  DATABASE_CANDIDATE_SCHEMA_VERSION="${ARTIFACT_SCHEMA_VERSION:-0}"
+  capture_database_deployment_state || return 1
+  if [[ "${DATABASE_ORIGINAL_SCHEMA_VERSION:-0}" =~ ^[0-9]+$ ]] \
+    && (( DATABASE_ORIGINAL_SCHEMA_VERSION > candidate_max )); then
+    echo "ERROR: refusing candidate ${ARTIFACT_BUILD_ID}: database schema ${DATABASE_ORIGINAL_SCHEMA_VERSION} exceeds candidate read limit ${candidate_max}. The active generation was left untouched." >&2
+    return 1
+  fi
+}
+
 load_database_migration_state() {
   # Only a schema-changing deployment creates this journal. Most starts have
   # no migration state, so avoid a cold tsx/native SQLite subprocess on the
@@ -1512,6 +1532,7 @@ else
   echo "[*] Validating candidate module closure and booting it on an isolated port..."
   node scripts/probe-release.mjs --boot "$CANDIDATE_ARTIFACT_PATH"
 fi
+validate_candidate_database_compatibility || exit 1
 write_candidate_record "prepared" "$CANDIDATE_BUILD_ID" "$CANDIDATE_ARTIFACT_PATH"
 write_deployment_record "prepared" "immutable candidate passed preflight and isolated boot" "" || true
 echo "[*] Preflight + build passed."
