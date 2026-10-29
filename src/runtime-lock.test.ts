@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { createInterface } from "node:readline";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -92,41 +93,62 @@ try {
       launcherPid: 999_999_999,
       launcherStartToken: "proc:stale",
     }));
+    const barrierPath = join(stateDir, `contenders-ready-${round}`);
     const children = Array.from({ length: 6 }, (_, index) => {
       const child = spawn(process.execPath, [
-        "--import", "tsx", "src/runtime-lock.ts", "acquire",
-        "--state-dir", stateDir,
-        "--launcher", "serve",
-        "--generation-id", `child-${round}-${index}`,
-        "--build-id", `build-${round}-${index}`,
-        "--artifact-path", `/releases/child-${round}-${index}`,
-        "--port", "7676",
-        // Hold the winning lock long enough for all six tsx child processes
-        // to reach arbitration on slower CI runners before any stale takeover.
-        "--hold-ms", "10000",
+        "--import", "tsx", "--input-type=module", "-e",
+        `import { access } from "node:fs/promises";
+         import { setTimeout as delay } from "node:timers/promises";
+         import { acquireRuntimeLock } from "./src/runtime-lock.ts";
+         const [stateDir, generationId, barrierPath] = process.argv.slice(1);
+         process.stdout.write("ready\\n");
+         while (true) { try { await access(barrierPath); break; } catch { await delay(10); } }
+         await acquireRuntimeLock(stateDir, {
+           launcher: "serve", generationId, buildId: generationId,
+           artifactPath: "/releases/" + generationId, port: 7676,
+         });
+         process.stdout.write("acquired\\n");
+         await delay(10000);`,
+        stateDir,
+        `child-${round}-${index}`,
+        barrierPath,
       ], { cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"] });
-      const firstResult = new Promise<{ pid: number; acquired: boolean }>((resolve) => {
-        let settled = false;
-        const settle = (result: { pid: number; acquired: boolean }) => {
-          if (settled) return;
-          settled = true;
-          resolve(result);
-        };
-        child.stdout.on("data", () => settle({ pid: child.pid!, acquired: true }));
-        child.once("close", () => settle({ pid: child.pid!, acquired: false }));
+      const lines = createInterface({ input: child.stdout });
+      const ready = new Promise<number>((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error("runtime lock contender did not reach the arbitration barrier")), 30_000);
+        lines.on("line", (line) => {
+          if (line !== "ready") return;
+          clearTimeout(timeout);
+          resolve(child.pid!);
+        });
+        child.once("error", (error) => {
+          clearTimeout(timeout);
+          reject(error);
+        });
+        child.once("close", (code) => {
+          clearTimeout(timeout);
+          if (code !== 0) reject(new Error(`runtime lock contender exited before arbitration (status ${code})`));
+        });
+      });
+      const acquired = new Promise<number>((resolve) => {
+        lines.on("line", (line) => { if (line === "acquired") resolve(child.pid!); });
       });
       const done = new Promise<{ pid: number; code: number | null }>((resolve) => {
-        child.once("close", (code) => resolve({ pid: child.pid!, code }));
+        child.once("close", (code) => {
+          lines.close();
+          resolve({ pid: child.pid!, code });
+        });
       });
-      return { child, firstResult, done };
+      return { child, ready, acquired, done };
     });
     try {
-      const firstResults = await Promise.all(children.map((child) => child.firstResult));
-      const first = firstResults.find((result) => result.acquired);
-      assert.ok(first, "one child must acquire the stale lock");
+      await Promise.all(children.map((child) => child.ready));
+      await writeFile(barrierPath, "start all contenders together");
+      const first = await Promise.race(children.map((child) => child.acquired));
       const current = readRuntimeLock(stateDir);
       assert.ok(current, "winner lock remains durable while its owner is alive");
       assert.ok(children.some((child) => child.child.pid === current.launcherPid), "lock PID belongs to a contender");
+      assert.equal(first, current.launcherPid, "the observed winner matches the durable lock owner");
       if (process.platform === "linux") {
         assert.equal(processStartToken(current.launcherPid), current.launcherStartToken, "winner start token is authoritative");
       } else {

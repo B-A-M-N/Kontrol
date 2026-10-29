@@ -23,6 +23,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { buildChildEnvironment } from "./process-environment.js";
 import { resolveAllowedPath, resolveAllowedPathCanonical } from "./roots.js";
+import "./pi-tool-provisioning.js";
 
 type McpContent = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
 export type ToolResponse<TDetails = unknown> = {
