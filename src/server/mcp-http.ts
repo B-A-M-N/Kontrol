@@ -279,6 +279,7 @@ export interface McpHttpDeps {
   supervisorWake(workSessionId: string): void;
   onScheduledJobCreated?: () => void;
   mutationReceipts: MutationReceiptStore;
+  goalStore?: import("../goal-store.js").GoalStore;
   workspaces: import("../workspaces.js").WorkspaceRegistry;
   reviewCheckpoints: import("../review-checkpoints.js").ReviewCheckpointManager;
   processSessions: import("../process-sessions.js").ProcessSessionManager;
@@ -1604,6 +1605,8 @@ export async function handleMcpHttpRequest(deps: McpHttpDeps, req: Request, res:
           qualificationEvidence,
           deps.reviewBrowserController,
           deps.reviewThreads,
+          undefined,
+          deps.goalStore,
         );
         sessionMcpServer = server;
         const initializedHandler = server.server.oninitialized;

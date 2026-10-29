@@ -13,6 +13,7 @@ import { ListToolsRequestSchema } from "@modelcontextprotocol/core";
 import { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod/v4";
 import type { ServerConfig } from "../config.js";
+import type { GoalStore } from "../goal-store.js";
 import { assertAllowedPath, expandHomePath } from "../roots.js";
 import { peerGrantsRoot, peerPrincipalFromDescriptor } from "../peer/principal.js";
 import { getPeerJobStore } from "../peer/jobs/store.js";
@@ -61,6 +62,7 @@ import { createToolEnvelope } from "./tool-envelope.js";
 import { readMcpServerVersion } from "./tool-logging.js";
 import { registerWorkspaceAppResources } from "./tools/resources.js";
 import { registerWorkspaceTools } from "./tools/workspace.js";
+import { registerGoalTools } from "./tools/goals.js";
 import { registerCodexProcessTools, registerProcessPollingTool } from "./tools/process.js";
 import type { ConnectionContext } from "./connection-context.js";
 import { mcpOwnerContextId } from "./owner-context.js";
@@ -161,6 +163,7 @@ export function createMcpServer(
   reviewBrowserController?: import("../review-browser/browser-controller.js").ReviewerBrowserController,
   reviewThreads?: import("../review-thread/thread-store.js").ReviewThreadStore,
   reviewBrowserJobs?: import("../review-thread/reviewer-job-store.js").ReviewerJobStore,
+  goalStore?: GoalStore,
 ): McpServer {
   // note: parameters remain in declared order; scheduledJobs precedes reviewRoutes.
   const serverConstructionStartedAt = performance.now();
@@ -203,6 +206,8 @@ export function createMcpServer(
     config.toolMode,
     config.widgets,
     config.skillsEnabled,
+    config.goalsEnabled,
+    Boolean(goalStore),
     config.acpEnabled,
     Boolean(workSessions),
     Boolean(agentRegistry),
@@ -300,6 +305,7 @@ export function createMcpServer(
   const { trackToolEvent, prepareForMutation } = envelope;
 
   registerWorkspaceAppResources(server, config, onWorkspaceAppResource);
+  if (config.goalsEnabled && goalStore) registerGoalTools(server, config, workspaces, goalStore);
 
   const workspaceToolNames = registerWorkspaceTools(server, {
     config,

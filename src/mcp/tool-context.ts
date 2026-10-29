@@ -12,6 +12,7 @@ import {
 
 export type ToolWidgetKind =
   | "workspace"
+  | "goal"
   | "read"
   | "write"
   | "edit"

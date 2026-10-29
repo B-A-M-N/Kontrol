@@ -8,7 +8,7 @@
 
 import assert from "node:assert/strict";
 import { createServer as createHttpServer } from "node:http";
-import { readFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { tmpdir } from "node:os";
@@ -24,6 +24,9 @@ const envFile = join(configDir, "soak.env");
 const diagnosticsSecret = "lifecycle-soak-diagnostics-secret";
 const reviewerToken = "lifecycle-soak-reviewer-token-that-is-long-enough";
 writeFileSync(join(root, "marker.txt"), "lifecycle-soak-marker\n");
+const alternateRoot = join(root, "alternate-workspace");
+mkdirSync(alternateRoot, { recursive: true });
+writeFileSync(join(alternateRoot, "marker.txt"), "alternate-workspace-marker\n");
 writeFileSync(envFile, [
   `KONTROL_CONFIG_DIR=${configDir}`,
   `KONTROL_ALLOWED_ROOTS=${root}`,
@@ -223,6 +226,7 @@ try {
     KONTROL_AUTH_MODE: "tunnel",
     KONTROL_ACP_ENABLED: "false",
     KONTROL_TOOL_MODE: "full",
+    KONTROL_GOALS: "1",
     KONTROL_POLICY_MODE: "allow",
     KONTROL_POLICY_TOOL_WRITE: "ask",
     KONTROL_POLICY_TOOL_BASH: "ask",
@@ -388,6 +392,44 @@ try {
   assert.equal(opened.response.status, 200, JSON.stringify(opened.payload));
   const workspaceId = opened.payload?.result?.structuredContent?.workspaceId ?? opened.payload?.result?.workspaceId;
   assert.equal(typeof workspaceId, "string");
+  const goalTools = await rpc("tools/list", {}, { sessionId: workerSession, conversationId: workerConversation });
+  assert.equal(goalTools.response.status, 200, JSON.stringify(goalTools.payload));
+  const goalToolNames = new Set((goalTools.payload?.result?.tools ?? []).map((tool) => tool.name));
+  assert.deepEqual(["create_goal", "get_goal", "update_goal"].filter((name) => !goalToolNames.has(name)), [],
+    "enabled workspace goals are registered on the actual MCP server");
+  const noGoal = await rpc("tools/call", {
+    name: "get_goal", arguments: { workspaceId },
+  }, { sessionId: workerSession, conversationId: workerConversation });
+  assert.equal(noGoal.payload?.result?.structuredContent?.goal, null);
+  const goalCreated = await rpc("tools/call", {
+    name: "create_goal", arguments: { workspaceId, objective: "survive Kontrol restart and workspace switching" },
+  }, { sessionId: workerSession, conversationId: workerConversation });
+  assert.equal(goalCreated.response.status, 200, JSON.stringify(goalCreated.payload));
+  const goalId = goalCreated.payload?.result?.structuredContent?.goal?.goalId;
+  assert.equal(goalCreated.payload?.result?.structuredContent?.goal?.status, "active");
+  assert.equal(typeof goalId, "string");
+
+  const alternateOpened = await rpc("tools/call", {
+    name: "open_workspace", arguments: { path: alternateRoot, mode: "checkout" },
+  }, { sessionId: workerSession, conversationId: workerConversation });
+  assert.equal(alternateOpened.response.status, 200, JSON.stringify(alternateOpened.payload));
+  const alternateWorkspaceId = alternateOpened.payload?.result?.structuredContent?.workspaceId;
+  assert.equal(typeof alternateWorkspaceId, "string");
+  assert.notEqual(alternateWorkspaceId, workspaceId, "switching folders creates a separate workspace identity");
+  const alternateGoal = await rpc("tools/call", {
+    name: "get_goal", arguments: { workspaceId: alternateWorkspaceId },
+  }, { sessionId: workerSession, conversationId: workerConversation });
+  assert.equal(alternateGoal.payload?.result?.structuredContent?.goal, null,
+    "the alternate workspace does not inherit the first workspace's goal");
+  const alternateRead = await rpc("tools/call", {
+    name: "read", arguments: { workspaceId: alternateWorkspaceId, path: "marker.txt" },
+  }, { sessionId: workerSession, conversationId: workerConversation });
+  assert.match(JSON.stringify(alternateRead.payload), /alternate-workspace-marker/);
+  const reopened = await rpc("tools/call", {
+    name: "open_workspace", arguments: { path: root, mode: "checkout" },
+  }, { sessionId: workerSession, conversationId: workerConversation });
+  assert.equal(reopened.payload?.result?.structuredContent?.workspaceId, workspaceId,
+    "switching back restores the original workspace identity");
 
   const reviewerSession = await openSession(undefined, true);
   const firstWrite = await rpc("tools/call", {
@@ -405,6 +447,11 @@ try {
   await closeSession(workerSession);
 
   const retrySession = await openSession(workerConversation);
+  const resumedGoal = await rpc("tools/call", {
+    name: "get_goal", arguments: { workspaceId },
+  }, { sessionId: retrySession, conversationId: workerConversation });
+  assert.equal(resumedGoal.payload?.result?.structuredContent?.goal?.goalId, goalId,
+    "a fresh MCP session can restore the same durable workspace goal");
   const retryWrite = await rpc("tools/call", {
     name: "write",
     arguments: { workspaceId, path: "approved.txt", content: "approved by soak\n" },
@@ -518,6 +565,11 @@ try {
     return (await httpStatus("/healthz")) === 200 && (await httpStatus("/core-readyz")) === 200;
   }, 30000, "post-crash server recovery");
   const recoveredSession = await openSession("lifecycle-post-crash");
+  const recoveredGoal = await rpc("tools/call", {
+    name: "get_goal", arguments: { workspaceId },
+  }, { sessionId: recoveredSession, conversationId: "lifecycle-post-crash" });
+  assert.equal(recoveredGoal.payload?.result?.structuredContent?.goal?.goalId, goalId,
+    "workspace goal survives an abrupt server death and restart");
   const recoveredRead = await rpc("tools/call", {
     name: "read",
     arguments: { workspaceId, path: "marker.txt" },

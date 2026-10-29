@@ -22,7 +22,7 @@ import type { Express, NextFunction, Request, Response } from "express";
 import * as z from "zod/v4";
 import { applyPatch, parsePatch } from "./apply-patch.js";
 import { loadConfig, type ServerConfig, type WidgetMode } from "./config.js";
-import { createGoalStore, type GoalStore, type WorkspaceGoal } from "./goal-store.js";
+import { createGoalStore } from "./goal-store.js";
 import {
   logEvent,
   requestIp,
@@ -325,6 +325,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     expectedSchemaVersion: deploymentContext.expectedSchemaVersion,
     expectedBuildId: deploymentContext.expectedBuildId ?? (buildMeta.buildId ? brandBuildId(buildMeta.buildId) : undefined),
   });
+  const goalStore = createGoalStore(db);
   if (config.peer) restorePeerWorktreeOwners(config.stateDir);
   const qualificationEvidence = new McpQualificationEvidenceJournal(db.sqlite);
   const mutationReceipts = createMutationReceiptStore(db);
@@ -692,6 +693,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
     expiredMcpOperations,
     operationDiagnostics,
     qualificationEvidence,
+    goalStore,
     sessionLifecycle,
     workspaceAppResourceMetrics,
     recordUnknownSessionRequest: (sessionId: string) => {
@@ -755,6 +757,7 @@ export function createServer(config = loadConfig(), deploymentContext: Deploymen
       reviewBrowserController,
       reviewThreads,
       reviewBrowserJobs,
+      goalStore,
     ),
     mutationReceipts,
     workspaces,

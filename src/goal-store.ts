@@ -25,9 +25,11 @@ export interface GoalStore {
 
 export class SqliteGoalStore implements GoalStore {
   private readonly database: DatabaseHandle;
+  private readonly ownsDatabase: boolean;
 
-  constructor(stateDir: string) {
-    this.database = openDatabase(stateDir);
+  constructor(source: string | DatabaseHandle) {
+    this.ownsDatabase = typeof source === "string";
+    this.database = typeof source === "string" ? openDatabase(source) : source;
   }
 
   getGoal(workspaceId: string): WorkspaceGoal | undefined {
@@ -104,12 +106,12 @@ export class SqliteGoalStore implements GoalStore {
   }
 
   close(): void {
-    this.database.close();
+    if (this.ownsDatabase) this.database.close();
   }
 }
 
-export function createGoalStore(stateDir: string): GoalStore {
-  return new SqliteGoalStore(stateDir);
+export function createGoalStore(source: string | DatabaseHandle): GoalStore {
+  return new SqliteGoalStore(source);
 }
 
 export function validateObjective(value: string): string {
