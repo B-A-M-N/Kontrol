@@ -1,4 +1,4 @@
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync, readdirSync, statSync } from "node:fs";
+import { chmodSync, copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync, readdirSync, statSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { join, resolve } from "node:path";
@@ -160,9 +160,11 @@ try {
   if (existsSync(readOnlyExecution)) copyFileSync(readOnlyExecution, join(tempDist, "read-only-execution.mjs"));
   const boundedFileWrite = join(root, "scripts/lib/bounded-file-write.mjs");
   if (existsSync(boundedFileWrite)) copyFileSync(boundedFileWrite, join(tempDist, "bounded-file-write.mjs"));
+  const bundledSkills = join(root, "skills");
+  if (existsSync(bundledSkills)) cpSync(bundledSkills, join(tempDist, "skills"), { recursive: true });
   chmodSync(join(tempDist, "cli.js"), 0o755);
 
-  for (const required of ["cli.js", "server.js", "acp-duplex.js", "read-only-execution.mjs", "bounded-file-write.mjs", "build-meta.json", "ui/workspace-app.html"]) {
+  for (const required of ["cli.js", "server.js", "acp-duplex.js", "read-only-execution.mjs", "bounded-file-write.mjs", "build-meta.json", "ui/workspace-app.html", "skills/local-agent-delegation/SKILL.md"]) {
     if (required !== "build-meta.json" && !existsSync(join(tempDist, required))) {
       throw new Error(`Atomic build candidate is missing ${required}`);
     }

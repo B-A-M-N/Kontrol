@@ -80,7 +80,7 @@ try {
   assert.equal(claimed.status, "claimed");
   const renewedClaim = routes.renewHandoffClaim({
     handoffId: h1.id, expectedRevision: claimed.revision, principalId: "user-b",
-    ownerContextId: "review-context-b", claimLeaseMs: 10_000,
+    ownerContextId: "review-context-b", claimLeaseMs: 1_250,
   });
   assert.equal(renewedClaim.revision, claimed.revision + 1, "renewal uses compare-and-swap revisioning");
   assert.equal(renewedClaim.claimedAt, claimed.claimedAt, "renewal preserves the cumulative lease start");
@@ -103,9 +103,10 @@ try {
   }
   assert.ok(competing, "two conversations cannot claim the same handoff revision");
 
-  await new Promise((resolve) => setTimeout(resolve, 1_050));
+  db.sqlite.prepare("update review_handoffs set claim_expires_at = ? where id = ?")
+    .run("1970-01-01T00:00:00.000Z", h1.id);
   const reclaimedExpiredClaim = routes.claimHandoff({
-    handoffId: h1.id, expectedRevision: claimed.revision, principalId: "user-b",
+    handoffId: h1.id, expectedRevision: renewedClaim.revision, principalId: "user-b",
     ownerContextId: "review-context-b", reviewThreadId: activated.id, claimLeaseMs: 10_000,
   });
   assert.equal(reclaimedExpiredClaim.status, "claimed", "an expired crashed-reviewer lease can be reclaimed with a fresh revision");

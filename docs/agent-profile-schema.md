@@ -1,29 +1,29 @@
-# DevSpace agent profile schema
+# Kontrol agent profile schema
 
-DevSpace agent profiles are a draft format for describing local coding-agent
+Kontrol agent profiles are a draft format for describing local coding-agent
 CLIs in a way that can later be validated, rendered to the model, and migrated
 to protocol-backed backends such as ACP.
 
-This page documents copyable templates only. DevSpace does not currently parse
-or load `~/.devspace/agents/*.md` profiles.
+This page documents copyable templates only. Kontrol does not currently parse
+or load `~/.kontrol/agents/*.md` profiles.
 
 ## File format
 
 Profiles are Markdown files with YAML front matter. The front matter is intended
-for DevSpace. The Markdown body is intended for the model and the user.
+for Kontrol. The Markdown body is intended for the model and the user.
 
 ## Top-level fields
 
 | Field | Required | Description |
 | --- | --- | --- |
-| `schema` | Yes | Schema identifier. Use `devspace-agent/v1`. |
+| `schema` | Yes | Schema identifier. Use `kontrol-agent/v1`. |
 | `name` | Yes | Stable profile name, usually matching the file basename. |
 | `description` | Yes | One-sentence purpose shown in future agent catalogs. |
 | `provider` | Yes | Provider key, such as `codex`, `claude`, `opencode`, `cursor`, `pi`, or `copilot`. |
 | `backend` | Yes | Backend type. Current examples use `cli`; future profiles may use `acp_stdio`. |
 | `capabilities` | Yes | Conservative capability flags. |
 | `workspace` | Yes | Default workspace and isolation behavior. |
-| `actions` | Yes | Lifecycle commands or DevSpace-managed lifecycle strategies. |
+| `actions` | Yes | Lifecycle commands or Kontrol-managed lifecycle strategies. |
 | `safety` | Yes | Guardrails the model should preserve when delegating work. |
 
 ## Capability fields
@@ -43,7 +43,7 @@ underlying CLI may have. Prefer conservative defaults for examples.
 
 | Field | Values | Description |
 | --- | --- | --- |
-| `default` | `current` | Start from the current DevSpace workspace by default. |
+| `default` | `current` | Start from the current Kontrol workspace by default. |
 | `isolation` | `none`, `user_decides`, `worktree`, `temp` | How isolated the task should be before delegation. |
 | `writeMode` | `read_only`, `allowed` | Whether this profile is allowed to write files. |
 
@@ -70,10 +70,10 @@ actions:
     output: jsonl
 
   read:
-    strategy: devspace_process_poll
+    strategy: kontrol_process_poll
 
   cancel:
-    strategy: devspace_process_signal
+    strategy: kontrol_process_signal
     signal: SIGINT
 
   diff:
@@ -99,8 +99,8 @@ Future implementations should reject unknown placeholders by default.
 | --- | --- |
 | `resume_command` | Run another CLI command to continue an existing agent session. |
 | `fresh_prompt_with_context` | Start a fresh prompt that includes prior summaries and review context. |
-| `devspace_process_poll` | Poll a DevSpace-managed process session for output. |
-| `devspace_process_signal` | Send a signal to a DevSpace-managed process session. |
+| `kontrol_process_poll` | Poll a Kontrol-managed process session for output. |
+| `kontrol_process_signal` | Send a signal to a Kontrol-managed process session. |
 | `git_diff` | Inspect changed files with Git after the agent completes. |
 | `none` | The action is intentionally unavailable. |
 

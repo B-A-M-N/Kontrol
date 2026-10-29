@@ -41,8 +41,10 @@ export async function deliverPendingReviewMessages(input: {
     return { status: "tool_error", reason };
   }
   const claim = getStructuredContent<ClaimedDeliveries>(result);
-  if (!claim) return "idle";
-  let delivered = false;
+  if (!claim) return { status: "tool_error", reason: "Review delivery queue returned no structured claim." };
+  const accepted: string[] = [];
+  let rejected: string | undefined;
+  let uncertain: { handoffId: string; reason: string } | undefined;
   // The default is a host-boundary guard, not a redundant coalescing: the
   // structured content arrives from the server over MCP and is not
   // type-checked at runtime, so a malformed payload must not crash the

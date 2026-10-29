@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
+import { existsSync, readFileSync } from "node:fs";
 import { chmodSync, mkdtempSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "./config.js";
-import { writeKontrolAuth, writeKontrolConfig } from "./user-config.js";
+import { ensureKontrolDefaultSkills, writeKontrolAuth, writeKontrolConfig } from "./user-config.js";
 
 const emptyConfigDir = mkdtempSync(join(tmpdir(), "kontrol-empty-config-test-"));
 const baseEnv = {
@@ -27,6 +28,10 @@ assert.equal(loadConfig(baseEnv).toolMode, "minimal");
 assert.equal(loadConfig({ ...baseEnv, KONTROL_TOOL_MODE: "minimal" }).toolMode, "minimal");
 assert.equal(loadConfig({ ...baseEnv, KONTROL_TOOL_MODE: "full" }).toolMode, "full");
 assert.equal(loadConfig({ ...baseEnv, KONTROL_TOOL_MODE: "codex" }).toolMode, "codex");
+assert.equal(loadConfig(baseEnv).goalsEnabled, false, "goals stay disabled in the minimal tool profile by default");
+assert.equal(loadConfig({ ...baseEnv, KONTROL_TOOL_MODE: "codex" }).goalsEnabled, true, "the codex profile enables workspace goals by default");
+assert.equal(loadConfig({ ...baseEnv, KONTROL_GOALS: "0" }).goalsEnabled, false, "the explicit goals setting can disable goals");
+assert.equal(loadConfig({ ...baseEnv, KONTROL_GOALS: "1" }).goalsEnabled, true, "the explicit goals setting can enable goals");
 assert.equal(loadConfig({ ...baseEnv, KONTROL_MINIMAL_TOOLS: "0" }).toolMode, "full");
 assert.equal(loadConfig({ ...baseEnv, KONTROL_MINIMAL_TOOLS: "1" }).toolMode, "minimal");
 assert.equal(loadConfig(baseEnv).skillsEnabled, true);
@@ -74,11 +79,12 @@ assert.throws(
 );
 
 const seededConfigDir = mkdtempSync(join(tmpdir(), "devspace-seeded-skills-test-"));
-const seededSkillPaths = ensureDevspaceDefaultSkills({ DEVSPACE_CONFIG_DIR: seededConfigDir });
+const seededSkillPaths = ensureKontrolDefaultSkills({ KONTROL_CONFIG_DIR: seededConfigDir });
 assert.deepEqual(seededSkillPaths, [join(seededConfigDir, "skills", "local-agent-delegation", "SKILL.md")]);
 assert.equal(existsSync(seededSkillPaths[0]), true);
 assert.match(readFileSync(seededSkillPaths[0], "utf8"), /name: local-agent-delegation/);
-assert.deepEqual(ensureDevspaceDefaultSkills({ DEVSPACE_CONFIG_DIR: seededConfigDir }), []);
+assert.deepEqual(ensureKontrolDefaultSkills({ KONTROL_CONFIG_DIR: seededConfigDir }), []);
+assert.equal(loadConfig({ ...baseEnv, KONTROL_CONFIG_DIR: seededConfigDir }).kontrolSkillsDir, join(seededConfigDir, "skills"));
 
 assert.throws(
   () => loadConfig({ ...baseEnv, KONTROL_ACP_SHARED_SECRET: "legacy-short" }),
@@ -292,6 +298,7 @@ writeFileSync(
     port: 8787,
     allowedRoots: [process.cwd()],
     publicBaseUrl: "https://kontrol.example.com",
+    goalsEnabled: true,
   }),
 );
 writeFileSync(

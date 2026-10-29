@@ -200,7 +200,7 @@ finite execution only, while `activeLongPolls`, `activeSseStreams`, and
 `executionAdmission` object reports active/available weight, queue depth,
 capacity rejections by tool and weight, and the `waiterAdmission` object reports
 the independent parked-wait budget. `mcpSessionMetrics.workspaceAppResources`
-counts current hashed, OpenAI compatibility, legacy Kontrol, and DevDesktop
+counts current hashed, OpenAI compatibility, legacy Kontrol, and older UI
 migration resource hits. `mcpSessionMetrics.logicalContinuity` reports the
 bounded server-side metadata retained for trusted OAuth, client-instance, and
 explicit conversation identities after transport loss. A reconnect always
@@ -443,7 +443,7 @@ Kontrol discovers standard Agent Skills from:
 
 - `~/.agents/skills`
 - project `.agents/skills`
-- `~/.devspace/skills`
+- `~/.kontrol/skills`
 
 It also keeps compatibility with:
 

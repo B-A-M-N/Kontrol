@@ -58,6 +58,15 @@ async function waitFor(description, predicate, timeoutMs = 8_000) {
   throw new Error(`Timed out waiting for ${description}`);
 }
 
+async function waitForAdapterIdle(baseUrl, adapterName) {
+  await waitFor(`${adapterName} run cleanup`, async () => {
+    const response = await fetch(`${baseUrl}/health`);
+    if (!response.ok) return false;
+    const health = await response.json();
+    return health.active === 0;
+  });
+}
+
 async function requestJson(url, { method = "GET", body, secret = ADAPTER_SECRET } = {}) {
   const response = await fetch(url, {
     method,
@@ -208,7 +217,7 @@ async function createBubblewrapWrapper(root) {
   return { wrapper, marker };
 }
 
-async function assertConfinedResult({ adapterName, state, accepted, events, outsideFile, logs }) {
+async function assertConfinedResult({ adapterName, state, accepted, events, outsideFile, logs, dispatchKey }) {
   assert.equal(accepted.execution_receipt?.issuer, "kontrol", `${adapterName} returns Kontrol's execution receipt`);
   assert.equal(accepted.execution_receipt?.network_policy, "disabled", `${adapterName} uses the signed no-network policy`);
   assert.equal(accepted.execution_receipt?.confinement, "bubblewrap-read-only-workspace-no-network");
@@ -225,6 +234,8 @@ async function assertConfinedResult({ adapterName, state, accepted, events, outs
       const observedTypes = events.map((event) => event.type).filter(Boolean).join(", ");
       throw new Error(`${error.message}; observed events=${observedTypes}; adapter=${logs}`);
     });
+  assert.ok(events.length > 0 && events.every((event) => event.dispatch_idempotency_key === dispatchKey),
+    `${adapterName} lifecycle events bind to their exact durable dispatch attempt`);
   assert.equal(sha256(await readFile(join(state.workspaceRoot, "source.txt"))), state.sourceHash, `${adapterName} left source bytes unchanged`);
   assert.equal(sha256(await readFile(join(state.workspaceRoot, ".git", "config"))), state.gitConfigHash, `${adapterName} left Git config unchanged`);
   assert.equal(sha256(await readFile(outsideFile)), state.outsideHash, `${adapterName} left a symlink target outside the workspace unchanged`);
@@ -289,7 +300,7 @@ async function runCrush(root) {
     assert.equal(result.json.accepted, true);
     assert.equal(result.json.dispatch_idempotency_key, dispatchKey);
     assert.ok(result.json.run_id);
-    await assertConfinedResult({ adapterName: "CRUSH", state, accepted: result.json, events, outsideFile: state.outsideFile, logs });
+    await assertConfinedResult({ adapterName: "CRUSH", state, accepted: result.json, events, outsideFile: state.outsideFile, logs, dispatchKey });
     const completed = events.find((event) => event.type === "completed");
     const finalOutput = completed?.payload?.final_output;
     assert.equal(typeof finalOutput, "string", "CRUSH completion includes captured worker output, not only a successful spawn");
@@ -438,8 +449,9 @@ async function runHermes(root) {
     assert.equal(result.json.accepted, true);
     assert.equal(result.json.dispatch_idempotency_key, dispatchKey);
     assert.ok(result.json.run_id);
-    await assertConfinedResult({ adapterName: "Hermes", state, accepted: result.json, events, outsideFile: state.outsideFile, logs });
+    await assertConfinedResult({ adapterName: "Hermes", state, accepted: result.json, events, outsideFile: state.outsideFile, logs, dispatchKey });
     await assertReceiptAcknowledged({ adapterName: "Hermes", receiptsPath: join(root, "hermes-receipts.json"), dispatchKey, remoteRunId: result.json.run_id, control });
+    await waitForAdapterIdle(baseUrl, "Hermes");
     const lookup = await requestJson(`${baseUrl}/runs/by-dispatch-id/${encodeURIComponent(dispatchKey)}`);
     assert.equal(lookup.response.status, 200);
     assert.equal(lookup.json.run_id, result.json.run_id);
@@ -477,6 +489,7 @@ async function runHermes(root) {
       remoteRunId: continued.json.run_id,
       control,
     });
+    await waitForAdapterIdle(baseUrl, "Hermes");
     const sessionHome = join(root, "hermes-session-homes", sha256(workSessionId));
     assert.equal(await readFile(join(sessionHome, "loaded-session-id"), "utf8"), "fixture-session",
       "the continuation loaded the same Hermes provider session from its persistent per-work-session home");
@@ -535,6 +548,7 @@ async function runHermes(root) {
       remoteRunId: transferred.json.run_id,
       control,
     });
+    await waitForAdapterIdle(baseUrl, "Hermes cross-provider transfer");
     const transferSessionHome = join(root, "hermes-session-homes", sha256(`${workSessionId}:transfer:${transferId}`));
     assert.equal(await readFile(join(transferSessionHome, "fixture-last-prompt"), "utf8"), transferTask,
       "the Hermes ACP child receives the exact immutable transfer packet, checkpoint, and reviewer feedback");
@@ -570,6 +584,7 @@ async function runHermes(root) {
       ["completed", "failed", "cancelled"].includes(event.type) && event.remote_run_id === transferContinuation.json.run_id))
       .catch((error) => { throw new Error(`${error.message}; events=${JSON.stringify(events)}; adapter=${logs}`); });
     assert.equal(transferContinuationTerminal.type, "completed", `Hermes transfer continuation failed: ${JSON.stringify(transferContinuationTerminal)}\n${logs}`);
+    await waitForAdapterIdle(baseUrl, "Hermes transfer continuation");
     assert.equal(await readFile(join(transferSessionHome, "loaded-session-id"), "utf8"), "fixture-session",
       "the cross-provider continuation restored the transfer-scoped Hermes conversation");
 

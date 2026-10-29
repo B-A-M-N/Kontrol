@@ -1,18 +1,18 @@
 # Codex Tool Mode Manual QA
 
-Run these checks against a disposable Git repository inside an allowed DevSpace
-root. Keep the DevSpace server logs visible during the test.
+Run these checks against a disposable Git repository inside an allowed Kontrol
+root. Keep the Kontrol server logs visible during the test.
 
 ## Setup
 
 1. Build the current branch with `npm ci && npm run build`.
-2. Start DevSpace with `DEVSPACE_TOOL_MODE=codex devspace serve`.
-3. Connect or refresh the DevSpace connector in ChatGPT.
+2. Start Kontrol with `KONTROL_TOOL_MODE=codex kontrol serve`.
+3. Connect or refresh the Kontrol connector in ChatGPT.
 4. Open the disposable repository with `open_workspace`.
 5. Confirm the core tools are `open_workspace`, `read`, `apply_patch`,
    `exec_command`, and `write_stdin`.
 6. Confirm `write`, `edit`, `bash`, `grep`, `glob`, and `ls` are absent.
-7. If `DEVSPACE_WIDGETS=changes`, also expect `show_changes`.
+7. If `KONTROL_WIDGETS=changes`, also expect `show_changes`.
 
 ## Apply Patch
 
@@ -41,8 +41,8 @@ root. Keep the DevSpace server logs visible during the test.
 3. Poll with empty `chars`; confirm output is not duplicated.
 4. Poll until completion; confirm the final exit code and no `sessionId`.
 5. Poll the completed session again; confirm it is unknown.
-6. Reconnect MCP without restarting DevSpace and confirm polling still works.
-7. Restart DevSpace and confirm old process session IDs are invalid.
+6. Reconnect MCP without restarting Kontrol and confirm polling still works.
+7. Restart Kontrol and confirm old process session IDs are invalid.
 
 ## Input, Interrupt, And PTY
 
@@ -56,18 +56,18 @@ root. Keep the DevSpace server logs visible during the test.
 ## Cleanup
 
 1. Start a non-PTY command that creates a long-running child process.
-2. Stop DevSpace with SIGINT and verify both shell and child exit.
+2. Stop Kontrol with SIGINT and verify both shell and child exit.
 3. Repeat with a PTY command.
 4. Confirm no process remains after server exit.
 5. Repeat session cycles and check that memory use does not steadily increase.
 
 ## Existing Mode Regression
 
-1. Start without `DEVSPACE_TOOL_MODE`; confirm `minimal` remains the default.
+1. Start without `KONTROL_TOOL_MODE`; confirm `minimal` remains the default.
 2. Minimal must expose `read`, `write`, `edit`, and `bash`, but not Codex tools
    or dedicated search tools.
-3. `DEVSPACE_TOOL_MODE=full` must add `grep`, `glob`, and `ls`.
-4. With no explicit mode, `DEVSPACE_MINIMAL_TOOLS=1` maps to minimal and `0`
+3. `KONTROL_TOOL_MODE=full` must add `grep`, `glob`, and `ls`.
+4. With no explicit mode, `KONTROL_MINIMAL_TOOLS=1` maps to minimal and `0`
    maps to full.
-5. Set `DEVSPACE_TOOL_MODE=codex` with `DEVSPACE_MINIMAL_TOOLS=0`; confirm the
+5. Set `KONTROL_TOOL_MODE=codex` with `KONTROL_MINIMAL_TOOLS=0`; confirm the
    explicit Codex mode wins.

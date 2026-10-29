@@ -151,7 +151,6 @@ export class WorkspaceRegistry {
           : undefined,
       ...this.loadSkillsForWorkspace(root),
     };
-    for (const file of this.loadInitialAgentsFiles(root)) restoredWorkspace.loadedAgentsFiles.set(file.path, file);
     this.store?.touchSession(workspaceId);
     this.workspaces.set(restoredWorkspace.id, restoredWorkspace);
 
@@ -531,44 +530,6 @@ export class WorkspaceRegistry {
           : undefined,
       ...this.loadSkillsForWorkspace(session.root),
     };
-    this.workspaces.set(workspace.id, workspace);
-    const canonicalKey = session.root;
-    this.canonicalRootToId.set(canonicalKey, workspace.id);
-    return workspace;
-  }
-
-  private async restoreWorkspaceFromSession(session: {
-    id: string;
-    projectId?: string;
-    root: string;
-    mode: WorkspaceMode;
-    sourceRoot?: string;
-    baseRef?: string;
-    baseSha?: string;
-    managed: boolean;
-  }): Promise<Workspace> {
-    const workspace: Workspace = {
-      id: session.id,
-      projectId: session.projectId,
-      root: session.root,
-      mode: session.mode,
-      sourceRoot: session.sourceRoot,
-      worktree:
-        session.mode === "worktree"
-          ? {
-              path: session.root,
-              baseRef: session.baseRef ?? "HEAD",
-              baseSha: session.baseSha ?? "",
-              dirtySource: false,
-              detached: true,
-              managed: session.managed,
-            }
-          : undefined,
-      ...this.loadSkillsForWorkspace(session.root),
-      activatedSkillDirs: new Set(),
-      loadedAgentsFiles: new Map(),
-    };
-    for (const file of this.loadInitialAgentsFiles(session.root)) workspace.loadedAgentsFiles.set(file.path, file);
     this.workspaces.set(workspace.id, workspace);
     const canonicalKey = session.root;
     this.canonicalRootToId.set(canonicalKey, workspace.id);

@@ -305,62 +305,11 @@ export const workspaceGoals = sqliteTable(
   ],
 );
 
-export const loadedAgentFiles = sqliteTable("loaded_agent_files", {
-  workspaceSessionId: text("workspace_session_id")
-    .notNull()
-    .references(() => workspaceSessions.id, { onDelete: "cascade" }),
-  path: text("path").notNull(),
-  contentHash: text("content_hash").notNull(),
-  content: text("content").notNull(),
-  loadedAt: text("loaded_at").notNull(),
-  lastSeenAt: text("last_seen_at").notNull(),
-}, (table) => [
-  primaryKey({ columns: [table.workspaceSessionId, table.path] }),
-  index("loaded_agent_files_path_idx").on(table.path),
-]);
-
-export const oauthClients = sqliteTable("oauth_clients", {
-  clientId: text("client_id").primaryKey(),
-  clientJson: text("client_json").notNull(),
-  issuedAt: integer("issued_at").notNull(),
-});
-
-export const oauthAccessTokens = sqliteTable("oauth_access_tokens", {
-  tokenHash: text("token_hash").primaryKey(),
-  clientId: text("client_id").notNull().references(() => oauthClients.clientId, { onDelete: "cascade" }),
-  scopesJson: text("scopes_json").notNull(),
-  expiresAt: integer("expires_at").notNull(),
-  resource: text("resource"),
-});
-
-export const oauthRefreshTokens = sqliteTable("oauth_refresh_tokens", {
-  tokenHash: text("token_hash").primaryKey(),
-  clientId: text("client_id").notNull().references(() => oauthClients.clientId, { onDelete: "cascade" }),
-  scopesJson: text("scopes_json").notNull(),
-  expiresAt: integer("expires_at").notNull(),
-  resource: text("resource"),
-});
-
-/** Durable client-side mutation identity. A response loss must never cause a
- * reconnecting WebUI to execute the same logical mutation twice. */
-export const clientMutationReceipts = sqliteTable("client_mutation_receipts", {
-  principalId: text("principal_id").notNull(),
-  operation: text("operation").notNull(),
-  clientMutationId: text("client_mutation_id").notNull(),
-  requestHash: text("request_hash").notNull(),
-  status: text("status").notNull().default("pending"),
-  resultJson: text("result_json"),
-  createdAt: text("created_at").notNull(),
-  updatedAt: text("updated_at").notNull(),
-}, (table) => [
-  primaryKey({ columns: [table.principalId, table.operation, table.clientMutationId] }),
-  index("client_mutation_receipts_updated_idx").on(table.updatedAt),
-]);
-
 export type WorkspaceSessionRow = typeof workspaceSessions.$inferSelect;
 export type NewWorkspaceSessionRow = typeof workspaceSessions.$inferInsert;
 export type LoadedAgentFileRow = typeof loadedAgentFiles.$inferSelect;
 export type NewLoadedAgentFileRow = typeof loadedAgentFiles.$inferInsert;
+export type WorkspaceGoalRow = typeof workspaceGoals.$inferSelect;
 
 export const workSessions = sqliteTable("work_sessions", {
   id: text("id").primaryKey(),

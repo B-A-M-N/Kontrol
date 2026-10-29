@@ -51,7 +51,7 @@ function compileRuntimeArtifact() {
 // KONTROL_ARTIFACT_PATH and falls back to ../dist/ only when it is unset.
 // The artifact directory is compiled once and stays valid for every later
 // step, so each step that spawns an adapter is given the same directory.
-const artifactSteps = new Set(["test:adapters", "test:lifecycle"]);
+const artifactSteps = new Set(["test:adapters", "test:lifecycle", "test:review-thread"]);
 let artifactCompiled = false;
 
 function run(script) {
@@ -78,6 +78,8 @@ try {
     "test:syntax",
     "test:manifest",
     "build:app",
+    "test:review-browser",
+    "test:review-loop-integration",
     "test:unit",
     "test:find-compat",
     "test:adapters",
@@ -85,6 +87,7 @@ try {
     "test:security",
     "test:policy",
     "test:lifecycle",
+    "test:review-thread",
   ]) {
     run(script);
   }

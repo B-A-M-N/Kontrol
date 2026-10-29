@@ -1,4 +1,4 @@
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { accessSync, constants, existsSync, realpathSync, statSync } from "node:fs";
 import { basename, delimiter, dirname, isAbsolute, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -227,6 +227,12 @@ export function buildReadOnlySandboxCommand({
     throw new ReadOnlySandboxUnavailableError(`Required read-only execution path is unavailable: ${error.message}`);
   }
   const runtimePaths = parseToolchainPaths(toolchainPaths, sourceRoot);
+  const runtimeTargets = new Map(runtimePaths.map((path) => [
+    path,
+    path.startsWith("/tmp/")
+      ? `/opt/kontrol/toolchains/${createHash("sha256").update(path).digest("hex").slice(0, 16)}`
+      : path,
+  ]));
   if (!["disabled", "host"].includes(networkPolicy)) {
     throw new ReadOnlySandboxUnavailableError(`Invalid read-only network policy: ${networkPolicy}`);
   }
@@ -249,6 +255,16 @@ export function buildReadOnlySandboxCommand({
     TERM: "dumb",
     ...env,
   };
+  for (const [source, target] of [...runtimeTargets].sort(([left], [right]) => right.length - left.length)) {
+    for (const [name, value] of Object.entries(sandboxEnv)) {
+      if (typeof value !== "string") continue;
+      sandboxEnv[name] = value.split(delimiter).map((entry) =>
+        entry === source || entry.startsWith(`${source}/`)
+          ? `${target}${entry.slice(source.length)}`
+          : entry,
+      ).join(delimiter);
+    }
+  }
   const result = [
     "--die-with-parent",
     "--new-session",
@@ -309,7 +325,7 @@ export function buildReadOnlySandboxCommand({
     result.push("--ro-bind", executablePath, sandboxExecutable);
   }
   for (const path of runtimePaths) {
-    const target = path;
+    const target = runtimeTargets.get(path);
     addMountTree(target, result, createdDirectories);
     if (target === "/" || target === "/workspace" || target.startsWith("/workspace/") || target === "/tmp" || target.startsWith("/tmp/")) {
       throw new ReadOnlySandboxUnavailableError(`Read-only runtime bind target is reserved: ${target}`);

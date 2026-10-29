@@ -1,7 +1,6 @@
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve, sep } from "node:path";
-import { fileURLToPath } from "node:url";
 import {
   loadSkills,
   type Skill,
@@ -9,6 +8,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import type { ServerConfig } from "./config.js";
 import { expandHomePath, isPathInsideRoot } from "./roots.js";
+import { kontrolBundledSkillsDir } from "./user-config.js";
 
 export interface LoadedSkills {
   skills: Skill[];
@@ -24,6 +24,7 @@ export interface SkillReadResolution {
 export interface SkillConfig {
   skillsEnabled: boolean;
   agentDir: string;
+  kontrolSkillsDir?: string;
   skillPaths?: string[];
 }
 
@@ -35,10 +36,20 @@ export function effectiveSkillPaths(config: SkillConfig, cwd: string): {
     resolve(cwd, ".agents", "skills"),
   ]);
   const projectLocalSet = new Set(projectLocal);
+  const kontrolSkills = config.kontrolSkillsDir
+    ? resolveSkillPath(config.kontrolSkillsDir, cwd)
+    : undefined;
+  const bundledSkills = kontrolBundledSkillsDir();
+  const bundledDefaultSkill = kontrolSkills
+    && existsSync(join(kontrolSkills, "local-agent-delegation", "SKILL.md"))
+    ? []
+    : [bundledSkills];
 
   const global = uniqueExistingPaths([
     join(homedir(), ".agents", "skills"),
+    ...(kontrolSkills ? [kontrolSkills] : []),
     join(config.agentDir, "skills"),
+    ...bundledDefaultSkill,
     ...(config.skillPaths ?? []).map((path) => resolveSkillPath(path, cwd)),
   ]).filter((path) => !projectLocalSet.has(path));
 

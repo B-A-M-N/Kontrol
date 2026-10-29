@@ -602,7 +602,7 @@ async function handle(req, res) {
       run.readOnlySandbox = buildReadOnlySandboxCommand({
         workspaceRoot,
         executable: pythonExecutable,
-        executableTarget: pythonUsesSystemRuntime ? undefined : pythonExecutable,
+        executableTarget: pythonUsesSystemRuntime ? undefined : hermesSandboxPython,
         args: ["/opt/kontrol/hermes-runtime/hermes-native-runner.py"],
         env: {
           ...readOnlyWorkerEnvironment(process.env),
@@ -693,7 +693,7 @@ async function handle(req, res) {
       const runtimeProbe = buildReadOnlySandboxCommand({
         workspaceRoot,
         executable: pythonExecutable,
-        executableTarget: pythonUsesSystemRuntime ? undefined : pythonExecutable,
+        executableTarget: pythonUsesSystemRuntime ? undefined : hermesSandboxPython,
         args: ["-c", "import acp; from acp.core import connect_to_agent; from acp.schema import ClientCapabilities, FileSystemCapabilities, Implementation, TextContentBlock; import acp_adapter.entry; import acp_adapter.server"],
         env: {
           HERMES_AGENT_ROOT: "/opt/kontrol/hermes-runtime",
@@ -1299,6 +1299,7 @@ async function reportRecoveredRun(record) {
       remote_run_id: record.remoteRunId,
       work_session_id: record.workSessionId,
       attempt_number: record.attemptNumber,
+      dispatch_idempotency_key: record.dispatchIdempotencyKey,
       ...(record.readOnlyExecutionGrant ? { read_only_execution_grant: record.readOnlyExecutionGrant } : {}),
       payload: { error: "Adapter restarted and confirmed its detached Hermes worker stopped; its turn result is unavailable." },
     }),
@@ -1570,6 +1571,7 @@ function enqueueRunEvent(run, type, payload, { allowFinalizing = false, terminal
     remote_run_id: run.remoteRunId,
     work_session_id: run.workSessionId,
     attempt_number: run.attemptNumber,
+    dispatch_idempotency_key: run.dispatchIdempotencyKey,
     workspace_lease_nonce: run.workspaceLeaseNonce,
     ...(run.readOnlyExecutionGrant ? { read_only_execution_grant: run.readOnlyExecutionGrant } : {}),
     payload,
@@ -1624,6 +1626,7 @@ export function createAdapterEvent(run, type, payload) {
     remote_run_id: run.remoteRunId,
     work_session_id: run.workSessionId,
     attempt_number: run.attemptNumber,
+    dispatch_idempotency_key: run.dispatchIdempotencyKey,
     workspace_lease_nonce: run.workspaceLeaseNonce,
     ...(run.readOnlyExecutionGrant ? { read_only_execution_grant: run.readOnlyExecutionGrant } : {}),
     payload,

@@ -60,7 +60,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer } from "@modelcontextprotocol/server";
 
 import { openDatabase } from "./db/client.js";
 import { createWorkSessionManager } from "./work-sessions.js";

@@ -13,6 +13,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { expandHomePath } from "./roots.js";
 
 /** P1.9: an auxiliary production component managed beside the core unit.
@@ -38,6 +39,7 @@ export interface KontrolUserConfig {
   authMode?: "oauth" | "tunnel";
   stateDir?: string;
   worktreeRoot?: string;
+  goalsEnabled?: boolean;
   agentDir?: string;
   acpKnownAgents?: Array<{ name: string; url: string; description?: string }>;
   /** P1.9: auxiliary production components installed as their own systemd
@@ -75,6 +77,18 @@ export function kontrolConfigPath(env: NodeJS.ProcessEnv = process.env): string 
 
 export function kontrolAuthPath(env: NodeJS.ProcessEnv = process.env): string {
   return join(kontrolConfigDir(env), "auth.json");
+}
+
+export function kontrolSkillsDir(env: NodeJS.ProcessEnv = process.env): string {
+  return join(kontrolConfigDir(env), "skills");
+}
+
+export function kontrolBundledSkillsDir(): string {
+  const moduleDirectory = dirname(fileURLToPath(import.meta.url));
+  const adjacentSkill = join(moduleDirectory, "skills", "local-agent-delegation", "SKILL.md");
+  return existsSync(adjacentSkill)
+    ? join(moduleDirectory, "skills")
+    : join(moduleDirectory, "..", "skills");
 }
 
 export function loadKontrolFiles(env: NodeJS.ProcessEnv = process.env): KontrolFiles {
@@ -119,11 +133,11 @@ export function generateOwnerToken(): string {
   return randomBytes(32).toString("base64url");
 }
 
-export function ensureDevspaceDefaultSkills(env: NodeJS.ProcessEnv = process.env): string[] {
-  const targetPath = join(devspaceSkillsDir(env), "local-agent-delegation", "SKILL.md");
+export function ensureKontrolDefaultSkills(env: NodeJS.ProcessEnv = process.env): string[] {
+  const targetPath = join(kontrolSkillsDir(env), "local-agent-delegation", "SKILL.md");
   if (existsSync(targetPath)) return [];
 
-  const sourcePath = new URL("../skills/local-agent-delegation/SKILL.md", import.meta.url);
+  const sourcePath = join(kontrolBundledSkillsDir(), "local-agent-delegation", "SKILL.md");
   mkdirSync(dirname(targetPath), { recursive: true });
   writeFileSync(targetPath, readFileSync(sourcePath, "utf8"), { mode: 0o644 });
   return [targetPath];

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { chmodSync, mkdtempSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
@@ -133,6 +134,26 @@ try {
   });
   assert.ok(configuredRuntime.args.some((value, index) => value === "--ro-bind" && configuredRuntime.args[index + 1] === "/usr"),
     "explicitly approved runtime directories are mounted read-only without a builder ReferenceError");
+
+  const temporaryToolchain = join(root, "approved-toolchain");
+  mkdirSync(temporaryToolchain);
+  const temporaryToolchainTarget = `/opt/kontrol/toolchains/${createHash("sha256").update(temporaryToolchain).digest("hex").slice(0, 16)}`;
+  const temporaryRuntime = buildReadOnlySandboxCommand({
+    workspaceRoot,
+    executable,
+    env: { PYTHONHOME: join(temporaryToolchain, ".venv") },
+    toolchainPaths: [temporaryToolchain],
+    bubblewrapPath: bubblewrap,
+  });
+  assert.ok(temporaryRuntime.args.some((value, index) => value === "--ro-bind"
+    && temporaryRuntime.args[index + 1] === temporaryToolchain
+    && temporaryRuntime.args[index + 2] === temporaryToolchainTarget),
+  "an approved toolchain under the host /tmp tree is mounted read-only at a stable non-scratch sandbox path");
+  const pythonHomeIndex = temporaryRuntime.args.indexOf("PYTHONHOME");
+  assert.equal(temporaryRuntime.args[pythonHomeIndex + 1], `${temporaryToolchainTarget}/.venv`,
+    "runtime environment paths are rewritten to the mounted toolchain target");
+  assert.equal(temporaryRuntime.args.includes(temporaryToolchain), true,
+    "the host toolchain source remains bound read-only without becoming the sandbox destination");
 
   const hermesSessionHome = join(root, "hermes-session-home");
   mkdirSync(hermesSessionHome);

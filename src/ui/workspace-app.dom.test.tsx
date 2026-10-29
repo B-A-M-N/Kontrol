@@ -271,6 +271,8 @@ const parkedWorkspaceWatchers = new Set<string>();
 let fakeMutationCalls = 0;
 const fakeToolCalls: string[] = [];
 const fakeToolArguments: Array<{ name: string; arguments?: Record<string, unknown> }> = [];
+let fakeReviewMessage: string | undefined;
+let fakeReviewQueue: Array<Record<string, unknown>> = [];
 let peerStatusPageCalls = 0;
 const fakeAppListeners = new Map<string, Set<(params: any) => void>>();
 // Durable pending approvals, keyed by workspace — the fake server is
@@ -1093,7 +1095,6 @@ fakeApp.emit("toolresult", {
 // queued packet without a separate review surface or unrelated renderer call.
 {
   fakeToolCalls.length = 0;
-  fakeReviewActivationEventDelivered = false;
   fakeReviewMessage = undefined;
   fakeReviewQueue = [{
     threadId: "review-thread-1",
@@ -1109,7 +1110,7 @@ fakeApp.emit("toolresult", {
   const freshApp = await import(`./workspace-app.js?review-activation=${Date.now()}`);
   const fresh = (freshApp as typeof import("./workspace-app.js")).__workspaceAppTest;
   await fresh.boot();
-  fakeApp.ontoolresult?.({
+  fakeApp.emit("toolresult", {
     structuredContent: {
       tool: "activate_review_thread",
       threadId: "review-thread-1",

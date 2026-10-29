@@ -7,6 +7,7 @@ import { openDatabase, type DatabaseHandle } from "../db/client.js";
 import { reviewRoutes, reviewThreads } from "../db/schema.js";
 import { createReviewerBrowserProfileStore } from "./profile-store.js";
 import { createReviewerBrowserController, type ReviewerBrowserController } from "./browser-controller.js";
+import { BrowserReadinessError } from "./chatgpt-page-driver.js";
 import { canonicalReviewerConversation, reviewerConversationFingerprint } from "./target-binding.js";
 import type { CdpClient } from "./cdp-client.js";
 import type { OwnedChrome } from "./chrome-process.js";
@@ -69,6 +70,7 @@ function fakeChrome(cdp: FakeCdp, generation = 1): OwnedChrome {
     generation,
     browserPid: 4242,
     version: { product: "Chromium" },
+    launchDiagnostics: { product: "Chromium", remoteDebuggingEnabled: true, stderr: "" },
     cdp: cdp as unknown as CdpClient,
     reused: false,
     async detach() { /* no-op */ },
@@ -119,7 +121,7 @@ async function newScenario(): Promise<Scenario> {
   const profiles = createReviewerBrowserProfileStore(db, dir);
   profiles.create({ id: "reviewer", ownerPrincipalId: "owner" });
   const controller = createReviewerBrowserController({
-    database: db, stateDir: dir, launchChrome: async () => fakeChrome(cdp),
+    database: db, stateDir: dir, launchControlled: async () => fakeChrome(cdp),
   });
   return { db, stateDir: dir, controller, cdp, routeId, threadId };
 }
@@ -135,7 +137,9 @@ try {
     const s = await newScenario();
     scenarios.push(s);
     s.cdp.failOnPageEnable = true;
-    await assert.rejects(() => s.controller.restoreThread(s.threadId), /Page.enable/i);
+    await assert.rejects(() => s.controller.restoreThread(s.threadId), (error: unknown) =>
+      error instanceof BrowserReadinessError && error.readiness === "browser_transport_failed",
+    );
     assert.equal(s.cdp.attached.size, 0, `Page.enable failure leaks session: ${[...s.cdp.attached].join(",")}`);
     const thread = s.db.db.select().from(reviewThreads).where(eq(reviewThreads.id, s.threadId)).get()!;
     assert.equal(thread.browserCdpSessionId, "legacy-session", "failed enable restore must not replace the durable session");
@@ -148,12 +152,15 @@ try {
     const s = await newScenario();
     scenarios.push(s);
     s.cdp.failOnRuntimeEnable = true;
-    await assert.rejects(() => s.controller.restoreThread(s.threadId), /Runtime.enable/i);
+    await assert.rejects(() => s.controller.restoreThread(s.threadId), (error: unknown) =>
+      error instanceof BrowserReadinessError && error.readiness === "browser_transport_failed",
+    );
     assert.equal(s.cdp.attached.size, 0, "Runtime.enable failure leaks the ephemeral session");
   }
 
   // -------------------------------------------------------------------------
-  // 3. inspect "not ready": session detached and recovery recorded.
+  // 3. Authentication challenge: the fresh session is detached, while the
+  //    exact thread binding stays intact and the profile is visibly blocked.
   // -------------------------------------------------------------------------
   {
     const s = await newScenario();
@@ -162,7 +169,10 @@ try {
     await assert.rejects(() => s.controller.restoreThread(s.threadId), /not ready/i);
     assert.equal(s.cdp.attached.size, 0, "not-ready inspect leaks the ephemeral session");
     const thread = s.db.db.select().from(reviewThreads).where(eq(reviewThreads.id, s.threadId)).get()!;
-    assert.equal(thread.conversationBindingStatus, "recovery_required", "not-ready restore marks recovery_required");
+    assert.equal(thread.conversationBindingStatus, "bound", "authentication recovery preserves the exact conversation binding");
+    const profile = createReviewerBrowserProfileStore(s.db, s.stateDir).get("reviewer");
+    assert.equal(profile?.status, "blocked", "the authentication challenge blocks the profile");
+    assert.equal(profile?.authState, "auth_blocked", "the authentication challenge is durably visible for human recovery");
   }
 
   // -------------------------------------------------------------------------

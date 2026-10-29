@@ -20,7 +20,7 @@ try {
   const projectRoot = join(root, "project");
   const agentDir = join(root, "agent");
   const explicitSkills = join(root, "explicit-skills");
-  const devspaceSkills = join(root, ".devspace", "skills");
+  const kontrolSkills = join(root, ".kontrol", "skills");
   const globalAgentsSkills = join(root, ".agents", "skills");
   const projectAgentsSkills = join(projectRoot, ".agents", "skills");
   const globalClaudeSkills = join(root, ".claude", "skills");
@@ -33,7 +33,7 @@ try {
   await mkdir(join(agentDir, "skills", "global-skill"), { recursive: true });
   await mkdir(join(explicitSkills, "duplicate"), { recursive: true });
   await mkdir(join(explicitSkills, "disabled"), { recursive: true });
-  await mkdir(join(devspaceSkills, "devspace-local-skill"), { recursive: true });
+  await mkdir(join(kontrolSkills, "kontrol-local-skill"), { recursive: true });
 
   await writeFile(
     join(globalAgentsSkills, "agent-global-skill", "SKILL.md"),
@@ -91,11 +91,11 @@ try {
     ].join("\n"),
   );
   await writeFile(
-    join(devspaceSkills, "devspace-local-skill", "SKILL.md"),
+    join(kontrolSkills, "kontrol-local-skill", "SKILL.md"),
     [
       "---",
-      "name: devspace-local-skill",
-      "description: DevSpace local skill description.",
+      "name: kontrol-local-skill",
+      "description: Kontrol local skill description.",
       "---",
       "",
       "# DevSpace Local Skill",
@@ -159,7 +159,7 @@ try {
   assert.equal(loaded.skills.some((skill) => skill.name === "claude-global-skill"), true);
   assert.equal(loaded.skills.some((skill) => skill.name === "claude-project-skill"), true);
   assert.equal(loaded.skills.some((skill) => skill.name === "project-skill"), false);
-  assert.equal(loaded.skills.some((skill) => skill.name === "devspace-local-skill"), true);
+  assert.equal(loaded.skills.some((skill) => skill.name === "kontrol-local-skill"), true);
   assert.equal(loaded.skills.some((skill) => skill.name === "local-agent-delegation"), true);
   assert.equal(loaded.skills.filter((skill) => skill.name === "duplicate-skill").length, 1);
   assert.equal(loaded.skills.some((skill) => skill.name === "hidden-skill"), true);

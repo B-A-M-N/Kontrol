@@ -120,7 +120,27 @@ const migrations: Migration[] = [
   { version: 106, name: "startup-recovery-selective-indexes", up: migrateStartupRecoverySelectiveIndexes },
   { version: 107, name: "review-browser-durable-auth-ownership", up: migrateReviewBrowserDurableAuthOwnership },
   { version: 108, name: "review-browser-launch-diagnostics", up: migrateReviewBrowserLaunchDiagnostics },
+  { version: 109, name: "workspace-goals", up: migrateWorkspaceGoals },
 ];
+
+function migrateWorkspaceGoals(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table if not exists workspace_goals (
+      workspace_session_id text primary key not null,
+      goal_id text not null,
+      objective text not null,
+      status text not null,
+      created_at text not null,
+      updated_at text not null,
+      completed_at text,
+      foreign key (workspace_session_id) references workspace_sessions(id) on delete cascade
+    );
+    create index if not exists workspace_goals_goal_id_idx
+      on workspace_goals(goal_id);
+    create index if not exists workspace_goals_status_idx
+      on workspace_goals(status, updated_at);
+  `);
+}
 
 function migrateStartupRecoverySelectiveIndexes(sqlite: Database.Database): void {
   sqlite.exec(`

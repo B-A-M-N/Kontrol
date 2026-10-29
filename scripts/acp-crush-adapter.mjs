@@ -1095,6 +1095,7 @@ async function reportEvent(run, type, errorMessage, details) {
     remote_run_id: run.remoteRunId,
     work_session_id: run.workSessionId,
     attempt_number: run.attemptNumber,
+    dispatch_idempotency_key: run.dispatchIdempotencyKey,
     workspace_lease_nonce: run.workspaceLeaseNonce,
     ...(run.readOnlyExecutionGrant ? { read_only_execution_grant: run.readOnlyExecutionGrant } : {}),
     type,
@@ -1121,6 +1122,7 @@ async function reportRecoveredRun(record) {
       remote_run_id: record.remoteRunId,
       work_session_id: record.workSessionId,
       attempt_number: record.attemptNumber,
+      dispatch_idempotency_key: record.dispatchIdempotencyKey,
       ...(record.readOnlyExecutionGrant ? { read_only_execution_grant: record.readOnlyExecutionGrant } : {}),
       payload: { error: "Adapter restarted and confirmed its detached CRUSH worker stopped; its turn result is unavailable." },
     }),
@@ -1135,6 +1137,7 @@ export function createAdapterEvent(run, type, payload) {
     remote_run_id: run.remoteRunId,
     work_session_id: run.workSessionId,
     attempt_number: run.attemptNumber,
+    dispatch_idempotency_key: run.dispatchIdempotencyKey,
     workspace_lease_nonce: run.workspaceLeaseNonce,
     ...(run.readOnlyExecutionGrant ? { read_only_execution_grant: run.readOnlyExecutionGrant } : {}),
     payload,
@@ -1366,6 +1369,9 @@ function flushOutput(run, channel) {
   return enqueueRunEvent(run, {
     remote_run_id: run.remoteRunId,
     work_session_id: run.workSessionId || undefined,
+    attempt_number: run.attemptNumber,
+    dispatch_idempotency_key: run.dispatchIdempotencyKey,
+    ...(run.readOnlyExecutionGrant ? { read_only_execution_grant: run.readOnlyExecutionGrant } : {}),
     type: "output_delta",
     payload: { text: entry.text, channel, coalesced: true, count: entry.count },
   }, false);

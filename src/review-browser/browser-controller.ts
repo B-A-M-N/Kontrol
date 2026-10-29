@@ -563,53 +563,65 @@ export function createReviewerBrowserController(input: {
       profiles.transition({ profileId: profile.id, expectedGeneration: profile.generation, status: "recovering" });
       throw new BrowserReadinessError("browser_transport_failed");
     }
+    const previousTarget = bindings.get(thread.id);
+    let sessionCommitted = false;
     try {
-      await chrome.cdp.send("Page.enable", {}, target.sessionId);
-      await chrome.cdp.send("Runtime.enable", {}, target.sessionId);
-    } catch {
-      profiles.transition({ profileId: profile.id, expectedGeneration: profile.generation, status: "recovering" });
-      throw new BrowserReadinessError("browser_transport_failed");
-    }
-    const driver = new ChatGptPageDriver(chrome.cdp, target);
-    const readiness = await driver.inspect(key);
-    if (readiness.status === "generation_active" || readiness.status === "ready") {
-      profile = profiles.transition({
-        profileId: profile.id, expectedGeneration: profile.generation,
-        status: readiness.status === "generation_active" ? "busy" : "ready",
-        authState: "authenticated", verified: true,
-      });
-      input.dispatchOutbox?.resumeSuspended(REVIEW_TURN_EVENT, "profileId", profile.id, AUTH_SUSPENSION_PREFIX);
-    } else if (AUTH_BLOCKED_STATUSES.has(readiness.status)) {
-      profiles.transition({
-        profileId: profile.id, expectedGeneration: profile.generation,
-        status: readiness.status === "login_required" ? "login_required" : "blocked",
-        authState: readiness.status === "login_required" ? "manual_auth_required" : "auth_blocked",
-      });
-      throw new BrowserReadinessError(readiness.status);
-    } else if (readiness.status === "wrong_conversation") {
-      const status = "recovery_required";
-      input.database.db.update(reviewThreads).set({ conversationBindingStatus: status, revision: thread.revision + 1 })
-        .where(and(eq(reviewThreads.id, thread.id), eq(reviewThreads.revision, thread.revision))).run();
-      throw new ReviewerTargetError("wrong_conversation", `Bound reviewer conversation is not ready: ${readiness.status}.`);
-    } else {
-      if (["browser_transport_failed", "browser_disconnected"].includes(readiness.status)) {
+      try {
+        await chrome.cdp.send("Page.enable", {}, target.sessionId);
+        await chrome.cdp.send("Runtime.enable", {}, target.sessionId);
+      } catch {
         profiles.transition({ profileId: profile.id, expectedGeneration: profile.generation, status: "recovering" });
+        throw new BrowserReadinessError("browser_transport_failed");
       }
-      throw new BrowserReadinessError(readiness.status);
+      const driver = new ChatGptPageDriver(chrome.cdp, target);
+      const readiness = await driver.inspect(key);
+      if (readiness.status === "generation_active" || readiness.status === "ready") {
+        profile = profiles.transition({
+          profileId: profile.id, expectedGeneration: profile.generation,
+          status: readiness.status === "generation_active" ? "busy" : "ready",
+          authState: "authenticated", verified: true,
+        });
+        input.dispatchOutbox?.resumeSuspended(REVIEW_TURN_EVENT, "profileId", profile.id, AUTH_SUSPENSION_PREFIX);
+      } else if (AUTH_BLOCKED_STATUSES.has(readiness.status)) {
+        profiles.transition({
+          profileId: profile.id, expectedGeneration: profile.generation,
+          status: readiness.status === "login_required" ? "login_required" : "blocked",
+          authState: readiness.status === "login_required" ? "manual_auth_required" : "auth_blocked",
+        });
+        throw new BrowserReadinessError(readiness.status);
+      } else if (readiness.status === "wrong_conversation") {
+        const status = "recovery_required";
+        input.database.db.update(reviewThreads).set({ conversationBindingStatus: status, revision: thread.revision + 1 })
+          .where(and(eq(reviewThreads.id, thread.id), eq(reviewThreads.revision, thread.revision))).run();
+        throw new ReviewerTargetError("wrong_conversation", `Bound reviewer conversation is not ready: ${readiness.status}.`);
+      } else {
+        if (["browser_transport_failed", "browser_disconnected"].includes(readiness.status)) {
+          profiles.transition({ profileId: profile.id, expectedGeneration: profile.generation, status: "recovering" });
+        }
+        throw new BrowserReadinessError(readiness.status);
+      }
+      const restoredBinding = input.database.db.update(reviewThreads).set({
+        browserGeneration: profile.generation,
+        browserTargetId: target.targetId,
+        browserCdpSessionId: target.sessionId,
+        conversationBindingStatus: "bound",
+        revision: thread.revision + 1,
+      }).where(and(eq(reviewThreads.id, thread.id), eq(reviewThreads.revision, thread.revision))).run();
+      if (restoredBinding.changes !== 1) {
+        throw new Error("Reviewer conversation restoration lost its thread revision compare-and-swap; recovery is required.");
+      }
+      sessionCommitted = true;
+      bindings.set(thread.id, target);
+      if (previousTarget && previousTarget.sessionId !== target.sessionId
+        && previousTarget.browserGeneration === profile.generation) {
+        await chrome.cdp.send("Target.detachFromTarget", { sessionId: previousTarget.sessionId }).catch(() => undefined);
+      }
+      return { target, driver, readiness };
+    } finally {
+      if (!sessionCommitted) {
+        await chrome.cdp.send("Target.detachFromTarget", { sessionId: target.sessionId }).catch(() => undefined);
+      }
     }
-    const restoredBinding = input.database.db.update(reviewThreads).set({
-      browserGeneration: profile.generation,
-      browserTargetId: target.targetId,
-      browserCdpSessionId: target.sessionId,
-      conversationBindingStatus: "bound",
-      revision: thread.revision + 1,
-    }).where(and(eq(reviewThreads.id, thread.id), eq(reviewThreads.revision, thread.revision))).run();
-    if (restoredBinding.changes !== 1) {
-      await chrome.cdp.send("Target.detachFromTarget", { sessionId: target.sessionId }).catch(() => undefined);
-      throw new Error("Reviewer conversation restoration lost its thread revision compare-and-swap; recovery is required.");
-    }
-    bindings.set(thread.id, target);
-    return { target, driver, readiness };
   }
 
   async function inspectHealth(profileId: string) {

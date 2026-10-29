@@ -7,7 +7,7 @@ import type { LoggingConfig, LogFormat, LogLevel } from "./logger.js";
 import type { OAuthConfig } from "./oauth-provider.js";
 import type { PolicyConfig } from "./policy.js";
 import { loadPolicyConfig, policyCanAsk } from "./policy.js";
-import { loadKontrolFiles } from "./user-config.js";
+import { kontrolSkillsDir, loadKontrolFiles } from "./user-config.js";
 import { DEFAULT_DIRECT_APPROVAL_REATTACH_GRACE_MS } from "./policy-approval-defaults.js";
 import { parseIngressProfilesEnv, validateIngressProfiles } from "./ingress/validate.js";
 import { isUnspecifiedAddress } from "./ingress/host-policy.js";
@@ -44,9 +44,10 @@ export interface ServerConfig {
   managedWorktreeProjectLimit: number;
   managedWorktreeGlobalLimit: number;
   managedWorktreeRetentionMs: number;
+  goalsEnabled: boolean;
   skillsEnabled: boolean;
   skillPaths: string[];
-  devspaceSkillsDir: string;
+  kontrolSkillsDir: string;
   agentDir: string;
   logging: LoggingConfig;
   acpEnabled: boolean;
@@ -759,8 +760,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     managedWorktreeProjectLimit: parsePositiveInteger(env.KONTROL_MANAGED_WORKTREE_PROJECT_LIMIT, 8, "KONTROL_MANAGED_WORKTREE_PROJECT_LIMIT"),
     managedWorktreeGlobalLimit: parsePositiveInteger(env.KONTROL_MANAGED_WORKTREE_GLOBAL_LIMIT, 32, "KONTROL_MANAGED_WORKTREE_GLOBAL_LIMIT"),
     managedWorktreeRetentionMs: parsePositiveInteger(env.KONTROL_MANAGED_WORKTREE_RETENTION_MS, 7 * 24 * 60 * 60_000, "KONTROL_MANAGED_WORKTREE_RETENTION_MS"),
+    goalsEnabled: env.KONTROL_GOALS === undefined
+      ? (files.config.goalsEnabled ?? toolMode === "codex")
+      : parseBoolean(env.KONTROL_GOALS),
     skillsEnabled: env.KONTROL_SKILLS === undefined ? true : parseBoolean(env.KONTROL_SKILLS),
     skillPaths: parsePathList(env.KONTROL_SKILL_PATHS),
+    kontrolSkillsDir: kontrolSkillsDir(env),
     agentDir: resolve(expandHomePath(env.KONTROL_AGENT_DIR ?? files.config.agentDir ?? defaultAgentDir())),
     logging: parseLoggingConfig(env),
     acpEnabled: env.KONTROL_ACP_ENABLED === undefined ? true : parseBoolean(env.KONTROL_ACP_ENABLED),

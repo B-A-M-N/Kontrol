@@ -427,7 +427,7 @@ try {
       crashController.createProfile({ profileId: "crash-handoff", ownerPrincipalId: "reviewer-1" });
       crashController.profiles.transition({ profileId: "crash-handoff", expectedGeneration: 0, status: "starting", authState: "manual_auth_in_progress" });
       const directory = await crashController.profiles.profileDirectory("crash-handoff");
-      simulatedChrome = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", `--user-data-dir=${directory}`], { stdio: "ignore" });
+      simulatedChrome = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", "--", `--user-data-dir=${directory}`], { stdio: "ignore" });
       await new Promise<void>((resolve, reject) => {
         simulatedChrome!.once("spawn", resolve);
         simulatedChrome!.once("error", reject);

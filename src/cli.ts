@@ -17,7 +17,7 @@ import { createReviewRouteStore } from "./review-handoff/route-store.js";
 import { runServiceCommand } from "./service.js";
 import { isRuntimeIdentityLive, readBuildIdentity, readRuntimeIdentity } from "./runtime-identity.js";
 import {
-  ensureDevspaceDefaultSkills,
+  ensureKontrolDefaultSkills,
   generateOwnerToken,
   loadKontrolFiles,
   writeKontrolAuth,
@@ -672,7 +672,7 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
 
   try {
     prompts.intro("Kontrol setup");
-    const seededSkillPaths = ensureDevspaceDefaultSkills();
+    const seededSkillPaths = ensureKontrolDefaultSkills();
 
     // ── Auth/transport mode: an explicit setup choice, not an env-only
     // afterthought. OAuth = public/reverse-proxy deployments with Kontrol's

@@ -142,6 +142,10 @@ export function getToolDisplay(card: ToolResultCard): ToolDisplay {
       return { icon: reviewIcon(), title: "Show Changes", label, tone: "review" };
     case "submit_for_review":
       return { icon: reviewIcon(), title: "Review Submission", label, tone: "review" };
+    case "activate_review_thread":
+      return { icon: reviewIcon(), title: "Activate Review Thread", label, tone: "review" };
+    case "reattach_review_thread":
+      return { icon: reviewIcon(), title: "Reattach Review Thread", label, tone: "review" };
     case "submit_to_coding_agent":
       return { icon: agentIcon(), title: "Coding Agent", label, tone: "agent" };
     case "open_approval_center":

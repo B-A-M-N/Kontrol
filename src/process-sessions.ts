@@ -756,47 +756,6 @@ export class ProcessSessionManager {
     await Promise.race([Promise.all(sessions.map((session) => session.exitPromise)), timeout]);
   }
 
-  private assertCapacity(ownerId: string): void {
-    const running = [...this.sessions.values()].filter((session) => session.running);
-    if (running.length >= this.maxRunningProcesses) {
-      throw new Error(`Process session limit reached (${this.maxRunningProcesses} running processes).`);
-    }
-    const ownerRunning = running.filter((session) => session.ownerId === ownerId).length;
-    if (ownerRunning >= this.maxRunningProcessesPerOwner) {
-      throw new Error(`Process session limit reached for owner (${this.maxRunningProcessesPerOwner} running processes).`);
-    }
-  }
-
-  private async reapExpired(): Promise<void> {
-    const now = Date.now();
-    for (const session of this.sessions.values()) {
-      if (!session.running) continue;
-      const idle = now - Math.max(session.lastClientActivityAt, session.lastProcessActivityAt) >= this.idleTimeoutMs;
-      const overRuntime = now - session.startedAt >= this.maxRuntimeMs;
-      if (idle || overRuntime) {
-        session.process?.kill("SIGTERM");
-        void this.escalateIfRunning(session);
-      }
-    }
-  }
-
-  private async escalateIfRunning(session: ProcessSession): Promise<void> {
-    await Promise.race([session.exitPromise, new Promise<void>((resolve) => {
-      const timer = setTimeout(resolve, 1_000);
-      timer.unref?.();
-    })]);
-    if (session.running) session.process?.kill("SIGKILL");
-  }
-
-  private async waitForSessions(sessions: ProcessSession[], timeoutMs: number): Promise<void> {
-    if (sessions.length === 0) return;
-    const timeout = new Promise<void>((resolve) => {
-      const timer = setTimeout(resolve, timeoutMs);
-      timer.unref?.();
-    });
-    await Promise.race([Promise.all(sessions.map((session) => session.exitPromise)), timeout]);
-  }
-
   private async waitForExit(session: ProcessSession, yieldTimeMs: number): Promise<void> {
     let timer: NodeJS.Timeout | undefined;
     try {

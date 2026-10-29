@@ -17,6 +17,8 @@ export type ToolName =
   | "poll_process"
   | "submit_for_review"
   | "submit_to_coding_agent"
+  | "activate_review_thread"
+  | "reattach_review_thread"
   | "open_approval_center"
   | "list_peer_status"
   | "ingress_management";
@@ -102,6 +104,8 @@ export function isToolName(value: unknown): value is ToolName {
     value === "poll_process" ||
     value === "submit_for_review" ||
     value === "submit_to_coding_agent" ||
+    value === "activate_review_thread" ||
+    value === "reattach_review_thread" ||
     value === "open_approval_center" ||
     value === "list_peer_status" ||
     value === "ingress_management"
