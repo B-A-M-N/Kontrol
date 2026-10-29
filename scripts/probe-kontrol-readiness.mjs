@@ -147,8 +147,10 @@ for (const expected of agentSpecs) {
   const actual = agents.find((agent) => agent.name === expected.name);
   assert.ok(actual, `required agent ${expected.name} was not discovered`);
   assert.equal(actual.url, expected.url, `agent ${expected.name} registered the wrong URL`);
+  assert.equal(actual.role, "agent", `required worker ${expected.name} is not registered with role=agent`);
   assert.equal(actual.alive, true, `agent ${expected.name} is not alive`);
   assert.notEqual(actual.healthy, false, `agent ${expected.name} failed its health probe`);
+  assert.equal(actual.dispatchable, true, `agent ${expected.name} is not dispatchable`);
 }
 
 const opened = await callTool("open_workspace", { path: workspace, mode: "checkout" });
@@ -263,4 +265,10 @@ if (sessionId) {
   }).catch(() => {});
 }
 
-console.log(JSON.stringify({ ok: true, buildId: health.build?.buildId, workspace, agents: agents.map((agent) => ({ name: agent.name, url: agent.url, healthy: agent.healthy })) }));
+const acpAgents = agents
+  .filter((peer) => peer.role === "agent")
+  .map((agent) => ({ name: agent.name, url: agent.url, healthy: agent.healthy, dispatchable: agent.dispatchable }));
+const nonWorkerPeers = agents
+  .filter((peer) => peer.role !== "agent")
+  .map((peer) => ({ name: peer.name, url: peer.url, role: peer.role, alive: peer.alive }));
+console.log(JSON.stringify({ ok: true, buildId: health.build?.buildId, workspace, acpAgents, nonWorkerPeers }));
