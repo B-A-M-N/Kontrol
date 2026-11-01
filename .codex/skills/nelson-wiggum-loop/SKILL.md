@@ -21,7 +21,7 @@ The agent registry makes the split explicit:
 
 | Name | Role | Meaning |
 |------|------|---------|
-| `cli-coding-agent` | `agent` | The worker. Registers itself at runtime via `POST /acp/agents/register`. Executes tasks, submits work for review. |
+| worker agent | `agent` | The worker: Hermes, Muse Code, MuseFI, a CLI coding agent, or a PTY-backed worker. Registers at runtime via `POST /acp/agents/register`. Executes tasks, submits work for review. Dispatch only a currently `dispatchable` healthy `role: "agent"` peer returned by `discover_agents`; never reroute a task requested for one worker type to another. |
 | `webui` | `reviewer` | The reviewer. Seeded by Kontrol as a well-known reviewer entry and the only signer of "A-okay". |
 
 Kontrol is the **broker** that hosts the WebUI's reviewer tool
@@ -85,6 +85,14 @@ When the WebUI is the active surface in a work session:
 6. **`approve` is the "A-okay"** — it is the sole signal that the loop is complete. Only emit it when the exact submitted snapshot is acceptable.
 7. `changes_requested` returns control to the worker with nonempty comments; the loop continues.
 8. `reject` ends the session; the worker must stop modifying files.
+
+## Authority boundaries (do not cross these)
+
+- Reviewer-only tools (`submit_to_coding_agent`, `call_acp_agent`, `discover_agents`, `provide_review_feedback`, `begin/continue/approve_supervised_work`, review-handoff activation/claim tools) require the reviewer principal. A worker calling them gets `Forbidden`; never present them as worker-callable.
+- `webui` is a reviewer, never an ACP worker. Workers cannot approve their own work, assign themselves reviewer authority, invent a reviewer conversation, or alter their loop budget.
+- No tool auto-creates a ChatGPT conversation. `prepare_review_thread_activation` mints a one-time expiring grant for an explicitly opened reviewer context; browser conversation creation is disabled unless the operator enables it.
+- Caller conversation IDs are correlation data, never authority. Reviewer binding is principal plus the server-issued MCP transport session.
+- The two review paths stay distinct: native ACP workers complete through the external review barrier (submission/message stores); PTY workers submit through their credential-scoped tools. Never pretend one originated from the other.
 
 ## Completion Criterion
 
