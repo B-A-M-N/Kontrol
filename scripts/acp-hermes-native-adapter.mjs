@@ -314,7 +314,9 @@ async function handle(req, res) {
         read_only_audit: {
           supported: true,
           grantPolicy: "kontrol_signed_attempt_bound",
-          confinementAvailable: Boolean(resolveExecutablePath("bwrap") && resolveExecutablePath("prlimit")),
+          // Confinement is enforced by Bubblewrap alone (see crush adapter):
+          // prlimit is never executed on this path, so it must not gate it.
+          confinementAvailable: Boolean(resolveExecutablePath("bwrap")),
           executableAvailable: Boolean(PYTHON_BIN && resolveExecutablePath(PYTHON_BIN) && resolveExecutablePath(HERMES_ACP_ENTRY.command) && existsSync(RUNNER)),
           toolchainAvailable: HERMES_READ_ONLY_TOOLCHAIN_STATUS.available,
           ...(HERMES_READ_ONLY_TOOLCHAIN_STATUS.reason ? { toolchainFailure: HERMES_READ_ONLY_TOOLCHAIN_STATUS.reason } : {}),
@@ -324,7 +326,8 @@ async function handle(req, res) {
         bounded_file_write: {
           supported: true,
           grantPolicy: "kontrol_signed_attempt_bound",
-          confinementAvailable: Boolean(resolveExecutablePath("bwrap") && resolveExecutablePath("prlimit")),
+          // Same Bubblewrap-only confinement as read_only_audit above.
+          confinementAvailable: Boolean(resolveExecutablePath("bwrap")),
           executableAvailable: Boolean(PYTHON_BIN && resolveExecutablePath(PYTHON_BIN) && resolveExecutablePath(HERMES_ACP_ENTRY.command) && existsSync(RUNNER)),
           toolchainAvailable: HERMES_READ_ONLY_TOOLCHAIN_STATUS.available,
           ...(HERMES_READ_ONLY_TOOLCHAIN_STATUS.reason ? { toolchainFailure: HERMES_READ_ONLY_TOOLCHAIN_STATUS.reason } : {}),
@@ -617,7 +620,10 @@ async function handle(req, res) {
       run.readOnlySandbox = buildReadOnlySandboxCommand({
         workspaceRoot,
         executable: pythonExecutable,
-        executableTarget: pythonUsesSystemRuntime ? undefined : pythonExecutable,
+        // A relocated interpreter is bind-mounted at hermesSandboxPython;
+        // the host path is not a valid sandbox target (it lives under /tmp
+        // scratch or the workspace), so aim at the mounted sandbox path.
+        executableTarget: pythonUsesSystemRuntime ? undefined : hermesSandboxPython,
         args: ["/opt/kontrol/hermes-runtime/hermes-native-runner.py"],
         env: {
           ...readOnlyWorkerEnvironment(process.env),
@@ -708,7 +714,8 @@ async function handle(req, res) {
       const runtimeProbe = buildReadOnlySandboxCommand({
         workspaceRoot,
         executable: pythonExecutable,
-        executableTarget: pythonUsesSystemRuntime ? undefined : pythonExecutable,
+        // Same relocated-interpreter target as the worker launch above.
+        executableTarget: pythonUsesSystemRuntime ? undefined : hermesSandboxPython,
         args: ["-c", "import acp; from acp.core import connect_to_agent; from acp.schema import ClientCapabilities, FileSystemCapabilities, Implementation, TextContentBlock; import acp_adapter.entry; import acp_adapter.server"],
         env: {
           HERMES_AGENT_ROOT: "/opt/kontrol/hermes-runtime",

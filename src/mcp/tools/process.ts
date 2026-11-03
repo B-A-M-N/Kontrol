@@ -26,7 +26,14 @@ import { processSessionOwnerId } from "../connection-context.js";
 import type { ConnectionContext } from "../connection-context.js";
 import { createAgentPtyReviewCredential } from "../../agent-pty-review-credential.js";
 
-export function registerCodexProcessTools(
+/**
+ * Shared process launch/interact surface (exec_command / write_stdin).
+ * Registered in every tool mode so non-Codex hosts get the same TTY,
+ * timeout, idempotency, and policy enforcement as Codex hosts. Enforcement
+ * stays in one implementation: the checkpoint barrier, the canonical "bash"
+ * policy rule, and ProcessSessionManager ownership checks below.
+ */
+export function registerProcessControlTools(
   server: McpServer,
   config: ServerConfig,
   workspaces: WorkspaceRegistry,
@@ -188,7 +195,7 @@ export function registerCodexProcessTools(
     {
       title: "Write to process",
       description:
-        "Poll or write characters to a process returned by exec_command. Omit chars or pass an empty string to poll. Pass \\u0003 to send Ctrl-C.",
+        "Poll or write characters to a process returned by exec_command. Omit chars or pass an empty string to poll. Pass \\u0003 to send Ctrl-C. Supplying columns/rows resizes the PTY and requires the same process-control authorization as writing input; a poll with no input and no resize is read-only.",
       inputSchema: {
         workspaceId: z.string().describe("Workspace identifier used to start the process."),
         sessionId: z.string().describe("Opaque process session identifier returned by exec_command."),
@@ -218,8 +225,12 @@ export function registerCodexProcessTools(
     async ({ workspaceId, sessionId, chars, approvalResumeId, columns, rows, yieldTimeMs, maxOutputTokens }) => {
       const startedAt = performance.now();
       const hasInput = Boolean(chars && chars.length > 0);
+      const hasResize = columns !== undefined || rows !== undefined;
       // Writing input to a process can mutate the workspace via that process;
-      // gate it behind the baseline like exec_command. Outline-free poll stays fast.
+      // gate it behind the baseline like exec_command. A resize cannot touch
+      // the workspace, but it is still an interactive control operation and
+      // needs its own policy authorization below. A poll with no input and
+      // no resize stays a fast read/wait operation.
       if (hasInput) {
         const blocked = await runMutationBarrier(prepareForMutation, workspaceId, "write_stdin");
         if (blocked) return blocked;
@@ -229,10 +240,12 @@ export function registerCodexProcessTools(
       if (bindingErr) return bindingErr;
 
       // Policy enforcement (P0 #3): writing NONEMPTY input to a process is a
-      // run_commands action and must be gated. A poll-only write_stdin (no
-      // chars / empty string) cannot alter process state, so it stays a
-      // read/wait operation and is not gated.
-      if (hasInput && policyEnforcer && policyEngine) {
+      // run_commands action and must be gated. Resizing a PTY is a separate
+      // interactive control operation with its own authorization: a
+      // resize-only call carries no input but still steers the session, so it
+      // is gated too. A poll with no input and no resize cannot alter process
+      // state, so it stays a read/wait operation and is not gated.
+      if ((hasInput || hasResize) && policyEnforcer && policyEngine) {
         const approved = await enforceToolPolicy(
           workSessions,
           policyEnforcer,
@@ -251,7 +264,7 @@ export function registerCodexProcessTools(
           scheduledExecutionPolicy(connectionContext?.workSessionId),
         );
         if (!approved.allowed) {
-          return policyFailureResponse(approved, `Tool "write_stdin" denied by policy: cannot send input to a gated process.`, {
+          return policyFailureResponse(approved, `Tool "write_stdin" denied by policy: cannot ${hasInput ? "send input to" : "resize"} a gated process.`, {
             tool: "write_stdin",
             workspaceId,
             command: chars,
@@ -295,6 +308,12 @@ export function registerCodexProcessTools(
  * path, so callers can recover a detached `bash` process without reopening a
  * command-sized HTTP request.
  */
+/**
+ * Compatibility alias: Codex-mode registration is now the shared
+ * cross-mode process control surface. Prefer registerProcessControlTools.
+ */
+export const registerCodexProcessTools = registerProcessControlTools;
+
 export function registerProcessPollingTool(
   server: McpServer,
   config: ServerConfig,

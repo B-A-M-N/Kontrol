@@ -37,6 +37,17 @@ function isReviewer(role?: PrincipalRole): boolean {
   return role === "reviewer";
 }
 
+/**
+ * Server-validated scope for a generic approval option. The option is the
+ * authenticated grant breadth: an option that declares no scope authorizes
+ * exactly one execution. Client-supplied scope is never consulted here —
+ * resolve() independently rejects any requested scope the option does not
+ * carry, so a broader durable grant cannot be smuggled through this path.
+ */
+export function genericApprovalScope(option: { scope?: "once" | "work_session" | "workspace" }): "once" | "work_session" | "workspace" {
+  return option.scope ?? "once";
+}
+
 function liveOwner(config: PolicyToolConfig): string | undefined {
   // A reviewer transport without an explicit conversation header is the
   // global approval surface. Its disposable MCP transport identity must not
@@ -120,6 +131,26 @@ function approvalLifecycleState(approval: {
   if (approval.reattachDeadline && approval.reattachDeadline <= nowIso) return "abandoned_operation";
   return "pending_human_approval";
 }
+
+/** Exact per-approval status contract. Unlike the pending-only list tools,
+ * this reports terminal state (approved/denied/expired/cancelled) and
+ * one-shot consumption, so reviewers never infer an outcome from absence. */
+export const approvalStatusSchema = z.object({
+  approvalId: z.string(),
+  found: z.boolean(),
+  status: z.enum(["pending", "approved", "denied", "expired", "cancelled", "unknown"]),
+  consumed: z.boolean(),
+  consumedAt: z.string().optional(),
+  resolvedAt: z.string().optional(),
+  optionId: z.string().optional(),
+  effect: z.enum(["approve", "deny", "changes_requested"]).optional(),
+  scope: z.enum(["once", "work_session", "workspace"]).optional(),
+  reviewerId: z.string().optional(),
+  reason: z.string().optional(),
+  workspaceId: z.string().optional(),
+  workSessionId: z.string().optional(),
+  origin: z.enum(["direct_mcp", "work_session"]).optional(),
+});
 
 /** Canonical approval-card contract shared by list/open tools and the UI. */
 export const approvalCardSchema = z.object({
@@ -325,6 +356,88 @@ export function registerPolicyTools(
     },
   );
 
+  registerAppTool(
+    server,
+    "get_approval_status",
+    {
+      title: "Get approval status",
+      description: "Read the exact status and one-shot consumption state of one approval request: pending, approved, denied, expired, or cancelled. Reviewer-only. Absence from list_pending_approvals alone never proves an outcome — query here instead of inferring it.",
+      inputSchema: {
+        approvalId: z.string().describe("Approval request ID from list_pending_approvals or open_approval_center."),
+      },
+      outputSchema: {
+        approval: approvalStatusSchema,
+      },
+      _meta: workspaceAppCallableMeta(),
+      annotations: { readOnlyHint: true, destructiveHint: false },
+    },
+    async ({ approvalId }) => {
+      if (!isReviewer(config.principalRole)) {
+        return {
+          content: [{ type: "text" as const, text: "Forbidden: get_approval_status requires reviewer authority." }],
+          isError: true,
+        };
+      }
+      if (config.connectionContext && !config.connectionContext.mcpSessionId?.trim()) return missingOwnerResponse();
+      const owner = liveOwner(config);
+      const forbidOtherConversation = {
+        content: [{ type: "text" as const, text: "Forbidden: approval belongs to another conversation." }],
+        isError: true as const,
+      };
+      const durable = config.approvalRequests?.get(approvalId);
+      if (durable) {
+        if (owner && durable.ownerContextId && durable.ownerContextId !== owner) return forbidOtherConversation;
+        const resolution = (durable.resolution ?? {}) as {
+          optionId?: string; effect?: "approve" | "deny" | "changes_requested";
+          scope?: "once" | "work_session" | "workspace"; reviewerId?: string; reason?: string;
+        };
+        const approval = {
+          approvalId: durable.approvalId,
+          found: true as const,
+          status: durable.status,
+          consumed: durable.consumedAt != null,
+          ...(durable.consumedAt ? { consumedAt: durable.consumedAt } : {}),
+          ...(durable.resolvedAt ? { resolvedAt: durable.resolvedAt } : {}),
+          ...(resolution.optionId ? { optionId: resolution.optionId } : {}),
+          ...(resolution.effect ? { effect: resolution.effect } : {}),
+          ...(resolution.scope ? { scope: resolution.scope } : {}),
+          ...(resolution.reviewerId ? { reviewerId: resolution.reviewerId } : {}),
+          ...(resolution.reason ? { reason: resolution.reason } : {}),
+          workspaceId: durable.workspaceSessionId,
+          ...(durable.workSessionId ? { workSessionId: durable.workSessionId } : {}),
+          ...(durable.origin ? { origin: durable.origin } : {}),
+        };
+        return {
+          content: [{ type: "text" as const, text: `Approval ${approvalId} is ${approval.status}${approval.consumed ? " (consumed)" : ""}.` }],
+          structuredContent: { approval },
+        };
+      }
+      const pending = config.policyEngine.getPendingApprovals().find((a) => a.id === approvalId);
+      if (pending) {
+        if (owner && pending.ownerContextId && pending.ownerContextId !== owner) return forbidOtherConversation;
+        const approval = {
+          approvalId: pending.id,
+          found: true as const,
+          status: "pending" as const,
+          consumed: false,
+          workspaceId: pending.workspaceId,
+          ...(pending.workSessionId ? { workSessionId: pending.workSessionId } : {}),
+          ...(pending.origin ? { origin: pending.origin } : {}),
+        };
+        return {
+          content: [{ type: "text" as const, text: `Approval ${approvalId} is pending.` }],
+          structuredContent: { approval },
+        };
+      }
+      return {
+        content: [{ type: "text" as const, text: `No approval record for ${approvalId}.` }],
+        structuredContent: {
+          approval: { approvalId, found: false as const, status: "unknown" as const, consumed: false },
+        },
+      };
+    },
+  );
+
   registerMutationPolicyTool(
     server,
     "provide_policy_approval",
@@ -375,6 +488,7 @@ export function registerPolicyTools(
               status: "denied",
               optionId: decision,
               effect: option.effect,
+              reviewerId: config.principalId ?? "reviewer",
               reason: reason ?? "Changes requested",
             });
             config.eventStore.appendEvent({
@@ -391,6 +505,9 @@ export function registerPolicyTools(
           const resolved = config.approvalRequests?.resolve(approvalId, {
             status: approve ? "approved" : "denied",
             optionId: decision,
+            effect: option.effect,
+            scope: approve ? genericApprovalScope(option) : undefined,
+            reviewerId: config.principalId ?? "reviewer",
             reason,
           });
           config.eventStore.appendEvent({
@@ -402,6 +519,8 @@ export function registerPolicyTools(
               decision: approve ? "approve" : "deny",
               optionId: decision,
               effect: option?.effect,
+              scope: approve ? genericApprovalScope(option) : undefined,
+              reviewerId: config.principalId ?? "reviewer",
               status: resolved?.status ?? (approve ? "approved" : "denied"),
               reason,
             },

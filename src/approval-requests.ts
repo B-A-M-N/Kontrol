@@ -303,7 +303,27 @@ export function createApprovalRequestManager(
       if (expectedEffect && option.effect !== expectedEffect) {
         throw new Error(`Approval option ${input.optionId} has effect ${option.effect}, not ${expectedEffect}`);
       }
+      // Option/scope consistency: the server-validated option declares the
+      // grant breadth. An option that declares no scope authorizes exactly
+      // one execution. A requested scope that does not match is refused,
+      // never silently converted; denials carry no scope.
+      const expectedScope = option.scope ?? "once";
+      if (input.status === "approved") {
+        if (input.scope !== undefined && input.scope !== expectedScope) {
+          throw new Error(`Approval scope ${input.scope} does not match option ${input.optionId} scope ${expectedScope}`);
+        }
+        input = { ...input, scope: expectedScope };
+      } else {
+        // Denials never authorize anything (consumers only honor approved
+        // rows), so a carried scope is normalized away rather than rejected:
+        // the policy-engine path replays its decision event scope here.
+        input = { ...input, scope: undefined };
+      }
     }
+    // Note: a scope without a selected option is the policy-engine mirror
+    // path (policy.ts resolvePending replays the server-validated decision
+    // event into the durable row). That scope is derived from the reviewer
+    // decision enum, never from client input, so it is accepted as-is.
     const now = new Date().toISOString();
     const resolution = {
       optionId: input.optionId,

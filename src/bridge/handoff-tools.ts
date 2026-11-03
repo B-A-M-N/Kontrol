@@ -14,7 +14,7 @@ import { z } from "zod/v4";
 import { and, desc, eq, sql } from "drizzle-orm";
 import { createReviewPacket } from "../review-thread/review-packet.js";
 import { ManualAuthenticationRequiredError } from "../review-browser/browser-controller.js";
-import { reviewBrowserTurns, reviewThreadMessages } from "../db/schema.js";
+import { reviewBrowserTurnResolutions, reviewBrowserTurns, reviewThreadMessages } from "../db/schema.js";
 import { createHash } from "node:crypto";
 import {
   ExternalCatalogObservationSubmissionSchema,
@@ -90,6 +90,9 @@ export function registerHandoffTools(server: McpServer, config: BridgeConfig): v
         browserProfileId: z.string().optional(),
         maxReviewRounds: z.number().int().min(1).max(10).default(3),
         pinnedConversationId: z.string().optional(),
+        skillId: z.string().optional().describe("Governing review-loop skill identifier. All-or-nothing with skillVersion and skillConfigSha256; omit all three for a reviewer-asserted budget."),
+        skillVersion: z.string().optional().describe("Governing skill version."),
+        skillConfigSha256: z.string().optional().describe("Lowercase hex SHA-256 of the governing skill configuration."),
         expectedRevision: z.number().int().min(1).optional(),
       },
       outputSchema: {
@@ -101,13 +104,16 @@ export function registerHandoffTools(server: McpServer, config: BridgeConfig): v
         completedReviewRounds: z.number(),
         admittedReviewRounds: z.number(),
         maxReviewRounds: z.number(),
+        skillId: z.string().optional(),
+        skillVersion: z.string().optional(),
+        skillConfigSha256: z.string().optional(),
         warning: z.string().optional(),
       },
       _meta: {},
       annotations: { readOnlyHint: false },
     },
     config,
-    async ({ workSessionId, enabled, mode, deliveryTransport, browserProfileId, maxReviewRounds, pinnedConversationId, expectedRevision }) => {
+    async ({ workSessionId, enabled, mode, deliveryTransport, browserProfileId, maxReviewRounds, pinnedConversationId, skillId, skillVersion, skillConfigSha256, expectedRevision }) => {
       if (!isReviewer(config.principalRole)) return forbidden(config.principalRole, "configure_review_loop");
       const access = requireWorkSessionMutation(config, workSessionId);
       if (access) return access;
@@ -131,12 +137,15 @@ export function registerHandoffTools(server: McpServer, config: BridgeConfig): v
           pinnedConversationId,
           deliveryTransport,
           browserProfileId,
+          skillId,
+          skillVersion,
+          skillConfigSha256,
           expectedRevision,
         });
         config.eventStore.appendEvent({
           type: "review.route.configured",
           sessionId: workSessionId,
-          payload: { routeId: route.id, status: route.status, mode: route.mode, deliveryTransport: route.deliveryTransport, maxReviewRounds: route.maxReviewRounds, revision: route.revision, routeEpoch: route.routeEpoch },
+          payload: { routeId: route.id, status: route.status, mode: route.mode, deliveryTransport: route.deliveryTransport, maxReviewRounds: route.maxReviewRounds, skillId: route.skillId, skillVersion: route.skillVersion, skillConfigSha256: route.skillConfigSha256, revision: route.revision, routeEpoch: route.routeEpoch },
         });
         // C05: warn once, when enabling a multi-round pinned review — the
         // configuration where repeated handoffs accumulate the most drift risk.
@@ -161,6 +170,9 @@ export function registerHandoffTools(server: McpServer, config: BridgeConfig): v
             completedReviewRounds: route.completedReviewRounds,
             admittedReviewRounds: route.admittedReviewRounds,
             maxReviewRounds: route.maxReviewRounds,
+            skillId: route.skillId,
+            skillVersion: route.skillVersion,
+            skillConfigSha256: route.skillConfigSha256,
             warning,
           },
         };
@@ -479,24 +491,36 @@ export function registerHandoffTools(server: McpServer, config: BridgeConfig): v
       const recentMessages = config.reviewThreads!.listMessages(threadId).slice(-20);
       const attempts = new Map(recentMessages.map((message) => [message.id, config.db?.db.select().from(reviewBrowserTurns)
         .where(eq(reviewBrowserTurns.reviewMessageId, message.id)).orderBy(desc(reviewBrowserTurns.attemptNumber)).limit(1).get()]));
+      const terminalReasonByAttempt = new Map<string, string>();
+      for (const attempt of attempts.values()) {
+        if (!attempt || attempt.state !== "failed") continue;
+        const receipt = config.db?.db.select().from(reviewBrowserTurnResolutions)
+          .where(eq(reviewBrowserTurnResolutions.attemptId, attempt.id)).get();
+        if (receipt?.resolution === "reviewer_unrecoverable") {
+          terminalReasonByAttempt.set(attempt.id, receipt.reasonCode ?? "unspecified");
+        }
+      }
       const messages = recentMessages.map((message) => {
         const attempt = attempts.get(message.id);
+        const terminalReason = attempt ? terminalReasonByAttempt.get(attempt.id) : undefined;
         const deliveryState = attempt?.state === "uncertain" ? "dispatch_uncertain"
           : attempt?.state === "awaiting_feedback" ? "awaiting_reviewer_action"
             : attempt?.state === "prompt_accepted" || attempt?.state === "model_generating" || attempt?.state === "generation_finished" ? "prompt_accepted"
-              : ["blocked_auth", "blocked_browser", "failed"].includes(attempt?.state ?? "") || message.status === "failed" ? "recovery_required"
-                : ["feedback_committed", "settled"].includes(attempt?.state ?? "") ? "feedback_committed"
-                : message.status === "presented" ? "prompt_accepted"
-                  : message.status === "queued" ? "pending_delivery"
-                    : message.status === "settled" ? "feedback_committed"
-                      : "delivery_pending";
+              : terminalReason !== undefined ? "reviewer_unrecoverable"
+                : ["blocked_auth", "blocked_browser", "failed"].includes(attempt?.state ?? "") || message.status === "failed" ? "recovery_required"
+                  : ["feedback_committed", "settled"].includes(attempt?.state ?? "") ? "feedback_committed"
+                    : message.status === "presented" ? "prompt_accepted"
+                      : message.status === "queued" ? "pending_delivery"
+                        : message.status === "settled" ? "feedback_committed"
+                          : "delivery_pending";
         const nextAction = deliveryState === "pending_delivery" ? "Deliver the queued packet through the active reviewer context."
           : deliveryState === "dispatch_uncertain" ? "Inspect the exact conversation and resolve this attempt before any resend."
             : deliveryState === "prompt_accepted" ? "Wait for generation or inspect the exact conversation; generation is not a verdict."
               : deliveryState === "awaiting_reviewer_action" ? "Submit feedback through the authenticated review tools."
                 : deliveryState === "feedback_committed" ? "No reviewer action is pending for this message."
-                  : deliveryState === "recovery_required" ? "Check browser login, profile ownership, and connection, then resolve the durable attempt."
-                    : "Check the active reviewer transport and delivery receipt.";
+                  : deliveryState === "reviewer_unrecoverable" ? `The reviewer declared this attempt terminally unrecoverable (${terminalReason}). Await operator decision; do not resend. Preserved partial text is unverified diagnostic context, not a verdict.`
+                    : deliveryState === "recovery_required" ? "Check browser login, profile ownership, and connection, then resolve the durable attempt."
+                      : "Check the active reviewer transport and delivery receipt.";
         return {
           handoffId: message.handoffId, submissionId: message.submissionId,
           reviewEpoch: message.reviewEpoch, roundNumber: message.roundNumber, kind: message.kind,
@@ -589,6 +613,65 @@ export function registerHandoffTools(server: McpServer, config: BridgeConfig): v
         return {
           content: [{ type: "text" as const, text: "The exact uncertain attempt was reconciled from your conversation inspection. The same immutable reviewer message is queued for a new delivery attempt." }],
           structuredContent: { attemptId, status: "queued" as const, ...result },
+        };
+      } catch (error) {
+        return { content: [{ type: "text" as const, text: error instanceof Error ? error.message : String(error) }], isError: true };
+      }
+    },
+  );
+
+  registerMutationAppTool(
+    server,
+    "record_reviewer_browser_outcome",
+    {
+      title: "Record a terminal reviewer browser outcome",
+      description: "After inspecting the exact bound ChatGPT conversation, declare a stranded browser attempt terminally unrecoverable. This records a reviewer-signed terminal receipt with the preserved partial evidence marked unverified, and releases the thread fence so workers stop waiting. Only the bound reviewer can declare it; it never overrides committed feedback and preserved text is never a verdict.",
+      inputSchema: {
+        attemptId: z.string(),
+        threadId: z.string(),
+        classification: z.literal("reviewer_unrecoverable"),
+        reasonCode: z.string().trim().min(1).max(120),
+        confirmNoFeedbackCommitted: z.literal(true),
+        inspectionEvidence: z.string().trim().min(12).max(2_000),
+      },
+      outputSchema: {
+        attemptId: z.string(), status: z.literal("failed"), classification: z.string(),
+        reasonCode: z.string(), evidenceSha256: z.string(), partialSeq: z.number().nullable(),
+        partialComplete: z.literal(false),
+      },
+      _meta: {}, annotations: { readOnlyHint: false },
+    },
+    config,
+    async ({ attemptId, threadId, classification, reasonCode, confirmNoFeedbackCommitted, inspectionEvidence }) => {
+      if (!isReviewer(config.principalRole)) return forbidden(config.principalRole, "record_reviewer_browser_outcome");
+      const thread = config.reviewThreads?.getById(threadId);
+      const reviewerPrincipalId = config.principalId ?? `role:${config.principalRole ?? "reviewer"}`;
+      if (!config.reviewBrowserJobs || !thread || thread.status !== "active"
+        || thread.reviewerPrincipalId !== reviewerPrincipalId
+        || thread.reviewerContextId !== reviewerThreadContextId(config)
+        || confirmNoFeedbackCommitted !== true) {
+        return { content: [{ type: "text" as const, text: "An active browser review thread bound to this authenticated reviewer context is required." }], isError: true };
+      }
+      try {
+        const result = config.reviewBrowserJobs.recordTerminalOutcome({
+          attemptId, reviewThreadId: thread.id, routeEpoch: thread.routeEpoch, reviewerPrincipalId,
+          classification, reasonCode, inspectionEvidence,
+        });
+        config.eventStore.appendEvent({
+          type: "review.browser_turn.terminal_outcome", sessionId: thread.workSessionId,
+          payload: {
+            threadId: thread.id, attemptId, classification: result.classification,
+            reasonCode: result.reasonCode, evidenceSha256: result.evidenceSha256,
+            partialSeq: result.partialSeq, partialComplete: result.partialComplete,
+          },
+        });
+        return {
+          content: [{ type: "text" as const, text: "The stranded attempt was declared terminally unrecoverable. Workers waiting on it must await operator decision; preserved partial text is unverified diagnostic context, not a verdict." }],
+          structuredContent: {
+            attemptId, status: "failed" as const, classification: result.classification,
+            reasonCode: result.reasonCode, evidenceSha256: result.evidenceSha256,
+            partialSeq: result.partialSeq, partialComplete: result.partialComplete,
+          },
         };
       } catch (error) {
         return { content: [{ type: "text" as const, text: error instanceof Error ? error.message : String(error) }], isError: true };

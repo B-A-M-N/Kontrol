@@ -961,6 +961,9 @@ export const reviewRoutes = sqliteTable("review_routes", {
   deliveryTransport: text("delivery_transport").notNull().default("mcp_app"),
   browserProfileId: text("browser_profile_id"),
   pinnedConversationId: text("pinned_conversation_id"),
+  skillId: text("skill_id"),
+  skillVersion: text("skill_version"),
+  skillConfigSha256: text("skill_config_sha256"),
   maxReviewRounds: integer("max_review_rounds").notNull().default(3),
   completedReviewRounds: integer("completed_review_rounds").notNull().default(0),
   admittedReviewRounds: integer("admitted_review_rounds").notNull().default(0),
@@ -1107,6 +1110,7 @@ export const reviewBrowserTurns = sqliteTable("review_browser_turns", {
   generationFinishedObservationId: text("generation_finished_observation_id"),
   feedbackCommittedAt: text("feedback_committed_at"),
   errorCode: text("error_code"),
+  lastProgressAt: text("last_progress_at"),
   createdAt: text("created_at").notNull(),
 }, (table) => [
   uniqueIndex("review_browser_turns_message_number_unique").on(table.reviewMessageId, table.attemptNumber),
@@ -1121,10 +1125,23 @@ export const reviewBrowserTurnResolutions = sqliteTable("review_browser_turn_res
   routeEpoch: integer("route_epoch").notNull(),
   reviewerPrincipalId: text("reviewer_principal_id").notNull(),
   resolution: text("resolution").notNull(),
+  reasonCode: text("reason_code"),
   evidenceSha256: text("evidence_sha256").notNull(),
   createdAt: text("created_at").notNull(),
 }, (table) => [
   index("review_browser_turn_resolutions_thread_idx").on(table.reviewThreadId, table.createdAt),
+]);
+
+export const reviewBrowserPartialObservations = sqliteTable("review_browser_partial_observations", {
+  attemptId: text("attempt_id").notNull().references(() => reviewBrowserTurns.id, { onDelete: "cascade" }),
+  seq: integer("seq").notNull(),
+  textSha256: text("text_sha256").notNull(),
+  textPrefix: text("text_prefix").notNull(),
+  capturedAt: text("captured_at").notNull(),
+  provenance: text("provenance").notNull(),
+}, (table) => [
+  primaryKey({ columns: [table.attemptId, table.seq] }),
+  index("review_browser_partial_observations_attempt_idx").on(table.attemptId, table.seq),
 ]);
 
 export const reviewBrowserProfiles = sqliteTable("review_browser_profiles", {

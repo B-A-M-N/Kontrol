@@ -120,6 +120,9 @@ const migrations: Migration[] = [
   { version: 106, name: "startup-recovery-selective-indexes", up: migrateStartupRecoverySelectiveIndexes },
   { version: 107, name: "review-browser-durable-auth-ownership", up: migrateReviewBrowserDurableAuthOwnership },
   { version: 108, name: "review-browser-launch-diagnostics", up: migrateReviewBrowserLaunchDiagnostics },
+  { version: 109, name: "review-route-skill-provenance", up: migrateReviewRouteSkillProvenance },
+  { version: 110, name: "review-browser-partial-observations", up: migrateReviewBrowserPartialObservations },
+  { version: 111, name: "review-browser-terminal-outcome", up: migrateReviewBrowserTerminalOutcome },
 ];
 
 function migrateStartupRecoverySelectiveIndexes(sqlite: Database.Database): void {
@@ -258,6 +261,33 @@ function migrateReviewBrowserLaunchDiagnostics(sqlite: Database.Database): void 
   addColumnIfMissing(sqlite, "review_browser_profiles", "browser_product", "text");
   addColumnIfMissing(sqlite, "review_browser_profiles", "remote_debugging_enabled", "integer");
   addColumnIfMissing(sqlite, "review_browser_profiles", "browser_launch_diagnostic", "text");
+}
+
+function migrateReviewRouteSkillProvenance(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "review_routes", "skill_id", "text");
+  addColumnIfMissing(sqlite, "review_routes", "skill_version", "text");
+  addColumnIfMissing(sqlite, "review_routes", "skill_config_sha256", "text");
+}
+
+function migrateReviewBrowserPartialObservations(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "review_browser_turns", "last_progress_at", "text");
+  sqlite.exec(`
+    create table if not exists review_browser_partial_observations (
+      attempt_id text not null references review_browser_turns(id) on delete cascade,
+      seq integer not null,
+      text_sha256 text not null,
+      text_prefix text not null,
+      captured_at text not null,
+      provenance text not null,
+      primary key (attempt_id, seq)
+    );
+    create index if not exists review_browser_partial_observations_attempt_idx
+      on review_browser_partial_observations(attempt_id, seq);
+  `);
+}
+
+function migrateReviewBrowserTerminalOutcome(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "review_browser_turn_resolutions", "reason_code", "text");
 }
 
 function migrateAuthenticatedOutcomeObservationReceipts(sqlite: Database.Database): void {
@@ -2450,7 +2480,7 @@ function migrateExternalCatalogObservationsAndAssociations(sqlite: Database.Data
 
 function addColumnIfMissing(
   sqlite: Database.Database,
-  table: "workspace_sessions" | "work_sessions" | "work_session_submissions" | "work_session_feedback" | "agent_registry" | "continuations" | "acp_runs" | "agent_webhook_queue" | "dispatch_outbox" | "approval_requests" | "mission_evidence" | "event_log" | "supervisor_runs" | "mission_acceptance_criteria" | "mission_review_findings" | "mission_contracts" | "mission_completion_reports" | "scheduled_jobs" | "scheduled_job_attempts" | "review_routes" | "review_handoffs" | "review_threads" | "review_browser_turns" | "review_browser_profiles" | "mission_outcome_observations" | "agent_message_replies",
+  table: "workspace_sessions" | "work_sessions" | "work_session_submissions" | "work_session_feedback" | "agent_registry" | "continuations" | "acp_runs" | "agent_webhook_queue" | "dispatch_outbox" | "approval_requests" | "mission_evidence" | "event_log" | "supervisor_runs" | "mission_acceptance_criteria" | "mission_review_findings" | "mission_contracts" | "mission_completion_reports" | "scheduled_jobs" | "scheduled_job_attempts" | "review_routes" | "review_handoffs" | "review_threads" | "review_browser_turns" | "review_browser_turn_resolutions" | "review_browser_profiles" | "mission_outcome_observations" | "agent_message_replies",
   column: string,
   definition: string,
 ): void {

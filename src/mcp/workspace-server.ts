@@ -61,7 +61,7 @@ import { createToolEnvelope } from "./tool-envelope.js";
 import { readMcpServerVersion } from "./tool-logging.js";
 import { registerWorkspaceAppResources } from "./tools/resources.js";
 import { registerWorkspaceTools } from "./tools/workspace.js";
-import { registerCodexProcessTools, registerProcessPollingTool } from "./tools/process.js";
+import { registerProcessControlTools, registerProcessPollingTool } from "./tools/process.js";
 import type { ConnectionContext } from "./connection-context.js";
 import { mcpOwnerContextId } from "./owner-context.js";
 import { peerAllowedToolNames, peerToolProfileKey } from "../peer/tool-profile.js";
@@ -81,7 +81,15 @@ export { type ConnectionContext, processSessionOwnerId } from "./connection-cont
 const toolListDescriptorCache = new Map<string, Promise<unknown>>();
 const TOOL_LIST_DESCRIPTOR_CACHE_MAX_ENTRIES = 256;
 const PEER_JOB_WORKSPACE_RESERVATION_MS = 100 * 365 * 24 * 60 * 60 * 1000;
-const PTY_REVIEW_TOOL_NAMES = new Set(["submit_for_review", "await_review_feedback"]);
+// Bounded worker relay set for PTY-review-credential connections: review
+// submission/feedback plus agent messaging. Reviewer-only tools and the
+// general worker catalog stay out; add nothing here without a contract test.
+const PTY_RELAY_TOOL_NAMES = new Set([
+  "submit_for_review",
+  "await_review_feedback",
+  "post_agent_message",
+  "await_agent_reply",
+]);
 const toolSchemaCacheByConfig = new WeakMap<ServerConfig, Map<string, unknown>>();
 
 function isZodSchema(value: unknown): value is { safeParse: (input: unknown) => unknown } {
@@ -237,7 +245,7 @@ export function createMcpServer(
   const isPtyReviewCredential = Boolean(connectionContext?.agentPtyReviewBinding);
   const canSeeTool = (name: string) =>
     (!peerTools || peerTools.has(name))
-    && (!isPtyReviewCredential || PTY_REVIEW_TOOL_NAMES.has(name));
+    && (!isPtyReviewCredential || PTY_RELAY_TOOL_NAMES.has(name));
   const registerTool = server.registerTool.bind(server);
   server.registerTool = ((name: string, definition: any, callback: any) => {
     const key = `${toolRegistrationProfile}:${name}`;
@@ -500,16 +508,17 @@ export function createMcpServer(
     };
   });
 
-  if (config.toolMode === "codex") {
-    // P1-02: scheduled read-only execution policy is enforced at the tool boundary.
-    registerCodexProcessTools(server, config, workspaces, processSessions, workSessions, policyEnforcer, policyEngine, connectionContext, prepareForMutation, scheduledExecutionPolicyFor);
-  }
+  // Shared process launch/interact surface in every tool mode: exec_command
+  // (TTY choice, timeout, idempotency, policy) and write_stdin (separately
+  // authorized stdin and resize; pure polls stay read-only). Enforcement is
+  // the same single implementation in all modes.
+  // P1-02: scheduled read-only execution policy is enforced at the tool boundary.
+  registerProcessControlTools(server, config, workspaces, processSessions, workSessions, policyEnforcer, policyEngine, connectionContext, prepareForMutation, scheduledExecutionPolicyFor);
 
   // Policy approval tools — available whenever policy engine is configured.
-  // The MCP /mcp surface is reached by the WebUI (reviewer) and ordinary
-  // clients, NOT by the worker (the worker reaches Kontrol through the
-  // stdio bridge, which hides these tools). Mark the caller as a reviewer so
-  // provide_policy_approval is permitted here.
+  // The role is passed through from the authenticated transport: only a
+  // reviewer-authenticated session may decide approvals. Workers see the
+  // tools on some transports but are denied at execution by the role gate.
   if (policyEngine && eventStore) {
     registerPolicyTools(server, {
       eventStore,
