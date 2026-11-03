@@ -556,6 +556,7 @@ async function handle(req, res) {
   }
   active.set(run.remoteRunId, run);
   const heartbeatTimer = setInterval(() => reportEvent(run, "heartbeat"), 20_000);
+  run.heartbeatTimer = heartbeatTimer;
 
   try {
     const launchGate = await prepareOwnedChild(agentLaunch.command, agentLaunch.args, {
@@ -857,13 +858,46 @@ async function dispatchTurn(run) {
     throw new Error(`ACP prompt did not complete successfully (stopReason: ${stopReason}).`);
   }
   if (run.acpProtocolVersion != null) markLiveProvenVersion(run.acpProtocolVersion);
-  if (run.acpProtocolVersion !== 2) run.finalOutput = normalizeAcpPromptOutput(result);
+  if (run.acpProtocolVersion !== 2) {
+    run.finalOutput = (normalizeAcpPromptOutput(result)
+      ?? [...(run.v1AgentMessages?.values() ?? [])].join("")) || undefined;
+  }
   reportStructured(run, "output_delta", {
     channel: "result",
     ...(run.finalOutput !== undefined ? { text: run.finalOutput } : {}),
     resultType: typeof result,
   });
   run.authoritativeCompletion = true;
+  await settleSuccessfulTurn(run);
+}
+
+// An authoritative end_turn finalizes the logical run immediately: a
+// persistent ACP server stays alive after completing a turn, so waiting for
+// process exit would stall the terminal event forever. Settlement is
+// idempotent with the process-exit and cancellation paths via run.finalized
+// and removal from the active map: whoever settles first wins, and the exit
+// handler never emits a second terminal event.
+async function settleSuccessfulTurn(run) {
+  if (run.finalized) return;
+  run.finalized = true;
+  active.delete(run.remoteRunId);
+  if (run.heartbeatTimer) clearInterval(run.heartbeatTimer);
+  run.terminalDeliveryPromise = reportEvent(run, "completed", undefined, {
+    onEventCreated: (event) => { run.terminalEvent = event; },
+  });
+  const delivered = await run.terminalDeliveryPromise;
+  // Close the ACP transport, then bounded process-group shutdown. Durable
+  // process ownership is retained until shutdown is confirmed: an event
+  // receipt alone never proves the child was reaped.
+  try { run.conn?.close(); } catch { /* transport already gone */ }
+  if (run.child?.pid) {
+    await terminateProcessGroup({
+      pid: run.child.pid,
+      processGroupId: run.child.pid,
+      processStartToken: processStartToken(run.child.pid),
+    }, 5_000).catch(() => false);
+  }
+  await finalizeOwnedProcessAfterTerminal(run, run.terminalEvent, delivered);
 }
 
 async function waitForResumedSessionIdle(run) {
@@ -953,6 +987,21 @@ function createKontrolHttpHandler(run) {
             : "");
         } else if (update.sessionUpdate === "agent_message_chunk" && update.content?.type === "text" && typeof update.content.text === "string") {
           run.v2AgentMessages.set(update.messageId, (run.v2AgentMessages.get(update.messageId) ?? "") + update.content.text);
+        }
+      }
+      // ACP v1 servers (including Muse) stream turn text as agent_message /
+      // agent_message_chunk notifications while the bare session/prompt
+      // response carries only stopReason. Accumulate the streamed text so a
+      // textless response frame does not erase the turn's actual output.
+      if (run.acpProtocolVersion !== 2 && (!params?.sessionId || params.sessionId === run.acpSessionId)) {
+        if (!run.v1AgentMessages) run.v1AgentMessages = new Map();
+        if (update?.sessionUpdate === "agent_message" && typeof update?.messageId === "string") {
+          run.v1AgentMessages.set(update.messageId, Array.isArray(update.content)
+            ? update.content.filter((part) => part?.type === "text" && typeof part.text === "string").map((part) => part.text).join("")
+            : "");
+        } else if (update?.sessionUpdate === "agent_message_chunk" && update?.content?.type === "text" && typeof update.content.text === "string") {
+          const key = typeof update?.messageId === "string" ? update.messageId : "stream";
+          run.v1AgentMessages.set(key, (run.v1AgentMessages.get(key) ?? "") + update.content.text);
         }
       }
       if (run.v2TurnWaiter && params?.sessionId === run.acpSessionId

@@ -466,7 +466,25 @@ async function runHermes(root) {
       attemptNumber: 2,
       continuationId: "continuation-2",
     });
-    const continued = await requestJson(`${baseUrl}/runs`, { method: "POST", body: continuationBody });
+    // The control stub observes a terminal event when the adapter POSTs it,
+    // but the adapter leaves the active map only after that delivery
+    // resolves. A follow-up dispatch may therefore see a transient 409
+    // naming the just-completed run. Retry only in that case; a conflict
+    // naming any other run is a real session leak and must fail.
+    const postRun = async (payload, knownCompletedRunId) => {
+      const deadline = Date.now() + 10_000;
+      for (;;) {
+        const attempt = await requestJson(`${baseUrl}/runs`, { method: "POST", body: payload });
+        if (attempt.response.status === 202) return attempt;
+        const conflictRun = attempt.json?.run_id ?? attempt.json?.remote_run_id;
+        if (attempt.response.status === 409 && conflictRun === knownCompletedRunId && Date.now() <= deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 200));
+          continue;
+        }
+        return attempt;
+      }
+    };
+    const continued = await postRun(continuationBody, result.json.run_id);
     assert.equal(continued.response.status, 202, `${continued.json.error?.message ?? "Hermes continuation was not accepted"}\n${logs}`);
     assert.ok(continued.json.run_id);
     await waitFor("Hermes continuation completion", () => events.find((event) => event.type === "completed" && event.remote_run_id === continued.json.run_id));
@@ -508,9 +526,7 @@ async function runHermes(root) {
       dispatchKey: transferDispatchKey,
       attemptNumber: 3,
     });
-    const transferred = await requestJson(`${baseUrl}/runs`, {
-      method: "POST",
-      body: makeReadOnlyBody({
+    const transferred = await postRun(makeReadOnlyBody({
         workspaceRoot: state.workspaceRoot,
         agentId,
         runId: transferRunId,
@@ -521,8 +537,7 @@ async function runHermes(root) {
         attemptNumber: 3,
         continuationId: "continuation-from-crush",
         contextTransfer: transferContext,
-      }),
-    });
+      }), continued.json.run_id);
     assert.equal(transferred.response.status, 202, `${transferred.json.error?.message ?? "Hermes rejected a valid fresh cross-provider transfer"}\n${logs}`);
     const transferTerminal = await waitFor("Hermes cross-provider transfer terminal event", () => events.find((event) =>
       ["completed", "failed", "cancelled"].includes(event.type) && event.remote_run_id === transferred.json.run_id))
@@ -550,9 +565,7 @@ async function runHermes(root) {
       dispatchKey: transferContinuationKey,
       attemptNumber: 4,
     });
-    const transferContinuation = await requestJson(`${baseUrl}/runs`, {
-      method: "POST",
-      body: makeReadOnlyBody({
+    const transferContinuation = await postRun(makeReadOnlyBody({
         workspaceRoot: state.workspaceRoot,
         agentId,
         runId: transferRunId,
@@ -563,8 +576,7 @@ async function runHermes(root) {
         attemptNumber: 4,
         continuationId: "hermes-transfer-round-two",
         contextTransfer: { ...transferContext, fresh: false },
-      }),
-    });
+      }), transferred.json.run_id);
     assert.equal(transferContinuation.response.status, 202, `${transferContinuation.json.error?.message ?? "Hermes transfer continuation was not accepted"}\n${logs}`);
     const transferContinuationTerminal = await waitFor("Hermes transfer continuation terminal event", () => events.find((event) =>
       ["completed", "failed", "cancelled"].includes(event.type) && event.remote_run_id === transferContinuation.json.run_id))

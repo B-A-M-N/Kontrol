@@ -11,7 +11,11 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+// Run the adapter from the tree under test, never a hardcoded checkout path.
+const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 import { createServer } from "node:http";
 
 const root = mkdtempSync(join(tmpdir(), "kontrol-muse-profiles-"));
@@ -57,7 +61,7 @@ process.stdin.on("data", (chunk) => {
     } else if (message.method === "session/prompt") {
       note({ method: "session/prompt", text: message.params?.prompt?.[0]?.text });
       process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { sessionId: "sess-" + tag, stopReason: "end_turn", content: [{ type: "text", text: "done-" + tag }] } }) + "\\n");
-      setTimeout(() => process.exit(0), 20);
+      /* persistent: the fixture stays alive after end_turn; the adapter must settle completion and clean up */;
     }
   }
 });
@@ -99,7 +103,7 @@ const spawnProfile = (tag, port, experimentalGate) => {
   writeFileSync(envPath, "");
   let adapterOutput = "";
   const child = spawn(process.execPath, ["scripts/acp-stdio-duplex-adapter.mjs"], {
-    cwd: "/home/bamn/devspace",
+    cwd: repoRoot,
     env: {
       ...process.env,
       KONTROL_ACP_AGENT_SECRET: "regression-agent-secret",
@@ -212,6 +216,27 @@ try {
   assert.ok(!readFileSync(receiptsA, "utf8").includes("muse-isolation-b"),
     "the muse-code receipt store never records the musefi dispatch key");
 
+  // 5b. Terminal completion is recorded from the authoritative end_turn
+  // while each profile's agent child is still alive: the fixture never
+  // exits on its own, so a completed status proves settlement does not
+  // wait for process exit.
+  const completedBy = async (instance, key) => {
+    const deadline = Date.now() + 5_000;
+    for (;;) {
+      const res = await fetch(`http://127.0.0.1:${instance.port}/runs/by-dispatch-id/${key}`, {
+        headers: { authorization: `Bearer ${ADAPTER_SECRET}` },
+      });
+      const body = await res.json();
+      if (body.status === "completed") return true;
+      if (Date.now() > deadline) return false;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  };
+  assert.ok(await completedBy(instances["muse-code-test"], "muse-isolation-a"),
+    "muse-code run completes while its agent child stays alive");
+  assert.ok(await completedBy(instances["musefi-test"], "muse-isolation-b"),
+    "musefi run completes while its agent child stays alive");
+
   console.log("acp-muse-profiles.test.mjs: two profiles isolated (names, env, routing, state) — passed");
 
   // 6. Malformed or credential-bearing agent env is rejected at startup,
@@ -226,7 +251,7 @@ try {
   ];
   for (const [json, why] of badEnvs) {
     const probe = spawn(process.execPath, ["scripts/acp-stdio-duplex-adapter.mjs", "--validate-imports"], {
-      cwd: "/home/bamn/devspace",
+      cwd: repoRoot,
       env: {
         ...process.env,
         KONTROL_ACP_AGENT_SECRET: "x",
@@ -238,14 +263,14 @@ try {
     });
     let stderr = "";
     probe.stderr.on("data", (chunk) => { stderr += String(chunk); });
-    const exitCode = await new Promise((resolve) => probe.once("exit", resolve));
+    const exitCode = await Promise.race([new Promise((resolve) => probe.once("exit", resolve)), new Promise((_, reject) => setTimeout(() => reject(new Error("agent-env probe did not exit")), 10_000))]);
     assert.equal(exitCode, 1, `invalid agent env (${why}) fails fast`);
     assert.match(stderr, /ACP_STDIO_AGENT_ENV_JSON/, `invalid agent env (${why}) names the offending variable`);
   }
   console.log("acp-muse-profiles.test.mjs: credential-bearing agent env rejected — passed");
 } finally {
   for (const instance of Object.values(instances)) instance.child.kill("SIGTERM");
-  await Promise.all(Object.values(instances).map((instance) => new Promise((resolve) => instance.child.once("exit", resolve))));
+  await Promise.all(Object.values(instances).map((instance) => Promise.race([new Promise((resolve) => instance.child.once("exit", resolve)), new Promise((resolve) => setTimeout(resolve, 10_000))])));
   stub.close();
   rmSync(root, { recursive: true, force: true });
 }
