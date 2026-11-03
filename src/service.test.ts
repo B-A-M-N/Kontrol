@@ -36,7 +36,11 @@ const unit = renderUserServiceUnit({
   workingDirectory: join(root, "working directory"),
 });
 const normalizedUnitPaths = unit.replaceAll("\\\\", "/");
-assert.match(unit, /WorkingDirectory=".*working directory"/);
+// Bare path (no quotes): systemd 249 — the production host's version —
+// rejects a quoted WorkingDirectory as "not absolute" (verified with
+// systemd-analyze). Quoting it encodes a unit the host cannot load.
+assert.match(unit, /WorkingDirectory=.*working directory/);
+assert.doesNotMatch(unit, /WorkingDirectory="/);
 assert.match(unit, /EnvironmentFile=".*environment with spaces"/);
 assert.doesNotMatch(unit, /EnvironmentFile=-/);
 assert.match(unit, /RestartPreventExitStatus=78/);
@@ -981,6 +985,61 @@ try {
       assert.ok(existsSync(join(unitDir, "kontrol-hermes.service")), "rollback restores the removed member file");
       const restored = JSON.parse(readFileSync(servicePaths(env).statePath, "utf8")) as { buildId: string };
       assert.equal(restored.buildId, "build-fresh", "rejected upgrade keeps the installed build");
+    }
+
+    // 17. Out-of-band migrated database: when the live schema was already
+    // newer than the installed build before the upgrade (migrated by an
+    // earlier generation), a failed candidate rolls back files and state
+    // without demanding a database restore there is nothing to undo — and
+    // leaves the database byte-identical.
+    {
+      const env = gateEnv("outband-db");
+      writeEnvFile("outband-db");
+      writeKontrolConfig({ serviceComponents: [
+        { name: "tunnel", kind: "tunnel", command: ["tunnel-client", "run"] },
+      ] }, env);
+      const staleBuild = makeArtifact("outband stale", "build-outband-stale", 113, 113);
+      const candidateBuild = makeArtifact("outband candidate", "build-outband", 116, 116);
+      const fixturePaths = servicePaths(env);
+      let targetStarted = false;
+      const active = new Set<string>();
+      const unitDirOf = (): string => dirname(servicePaths(env).unitPath);
+      const deps: GateDeps = {
+        currentArtifactPath: () => staleBuild,
+        requireSystemd: () => undefined,
+        systemctl: (_paths, args) => {
+          const call = args.join(" ");
+          if (call === "stop kontrol.target") { targetStarted = false; active.clear(); }
+          else if (call === "enable --now kontrol.target") {
+            targetStarted = true;
+            for (const file of readdirSync(unitDirOf())) {
+              if (/^kontrol-.+\.service$/.test(file)) active.add(file);
+            }
+          }
+        },
+        waitForReady: async () => undefined,
+        probeUnitActive: (unit) => (unit === "kontrol.target" ? targetStarted : active.has(unit)),
+        probeUnitEnabled: () => true,
+      };
+      await runServiceCommand(["install"], env, deps);
+      // The earlier generation migrates the live database past what the
+      // installed build can read; the candidate is compatible with it.
+      writeRawDb(join(gateRoot, "outband-db", "database state"), 116);
+      const dbBefore = readFileSync(join(fixturePaths.stateDir, "kontrol.sqlite"));
+      await assert.rejects(
+        () => runServiceCommand(["upgrade"], env, {
+          ...deps,
+          currentArtifactPath: () => candidateBuild,
+          waitForReady: async (_paths, state) => {
+            if (state.buildId === "build-outband") throw new Error("candidate failed");
+          },
+        }),
+        /failed readiness; previous build build-outband-stale and database were restored/,
+        "an untouched newer database does not block rollback",
+      );
+      assert.deepEqual(readFileSync(join(fixturePaths.stateDir, "kontrol.sqlite")), dbBefore, "rollback leaves the out-of-band database byte-identical");
+      const restored = JSON.parse(readFileSync(fixturePaths.statePath, "utf8")) as { buildId: string };
+      assert.equal(restored.buildId, "build-outband-stale", "rejected upgrade keeps the installed build");
     }
 
     // 16. Rollback restores exact prior enablement: a member that was

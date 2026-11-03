@@ -757,7 +757,10 @@ export function renderComponentServiceUnit(options: {
     "",
     "[Service]",
     "Type=simple",
-    `WorkingDirectory=${systemdQuote(options.workingDirectory)}`,
+    // Bare path: systemd 249 on the supported host rejects a quoted
+    // WorkingDirectory as "not absolute". (EnvironmentFile/Environment
+    // quoting is accepted by the same systemd and stays quoted.)
+    `WorkingDirectory=${options.workingDirectory}`,
     `EnvironmentFile=${systemdQuote(options.environmentFile)}`,
     `Environment=${systemdQuote(`KONTROL_LAUNCHER=systemd`)}`,
     `Environment=${systemdQuote(`KONTROL_EXPECTED_BUILD_ID=${options.buildId}`)}`,
@@ -815,7 +818,10 @@ export function renderUserServiceUnit(options: {
     "",
     "[Service]",
     "Type=simple",
-    `WorkingDirectory=${systemdQuote(options.workingDirectory)}`,
+    // Bare path: systemd 249 on the supported host rejects a quoted
+    // WorkingDirectory as "not absolute". (EnvironmentFile/Environment
+    // quoting is accepted by the same systemd and stays quoted.)
+    `WorkingDirectory=${options.workingDirectory}`,
     `EnvironmentFile=${systemdQuote(options.environmentFile)}`,
     `Environment=${systemdQuote("KONTROL_LAUNCHER=systemd")}`,
     `Environment=${systemdQuote(`KONTROL_EXPECTED_BUILD_ID=${options.buildId}`)}`,
@@ -1198,6 +1204,12 @@ async function upgrade(paths: ServicePaths, dependencies: ServiceCommandDependen
     requireTunnelReviewerWiring(upgradeComponents, env);
     // Gates before mutation: a rejected candidate leaves no trace.
     preflightCandidateAgainstLiveDatabase(paths, build);
+    // Live schema baseline for rollback: the database restore is required
+    // only when this deployment itself raised the schema past what it
+    // found. An already-newer database (migrated out-of-band) is left
+    // untouched — there is nothing this deployment did to undo.
+    const preMutationInspection = inspectLiveDatabase(paths.stateDir);
+    const preMutationLiveSchema = preMutationInspection.status === "ok" ? preMutationInspection.schemaVersion : undefined;
     // Snapshots before mutation: unit files, installed state, the
     // environment file, and member enablement are all restored on failure.
     const unitSnapshot = snapshotUnitFiles(paths);
@@ -1252,7 +1264,8 @@ async function upgrade(paths: ServicePaths, dependencies: ServiceCommandDependen
           stateDir: paths.stateDir,
           deploymentId,
           maxReadableSchemaVersion: previous.maxReadableSchemaVersion,
-          expectedOriginalSchemaVersion: previous.schemaVersion,
+          expectedOriginalSchemaVersion: preMutationLiveSchema ?? previous.schemaVersion,
+          preMutationSchemaVersion: preMutationLiveSchema,
         });
         record = updateDeploymentRecord(paths, record, { databaseRestore });
         restoreUnitFiles(unitSnapshot);
