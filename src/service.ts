@@ -757,11 +757,13 @@ export function renderComponentServiceUnit(options: {
     "",
     "[Service]",
     "Type=simple",
-    // Bare path: systemd 249 on the supported host rejects a quoted
-    // WorkingDirectory as "not absolute". (EnvironmentFile/Environment
-    // quoting is accepted by the same systemd and stays quoted.)
+    // Bare paths: systemd 249 on the supported host rejects quoted
+    // WorkingDirectory and EnvironmentFile paths as "not absolute"
+    // (EnvironmentFile is silently ignored when quoted, so the service
+    // then starts without its environment). Environment= assignments and
+    // ExecStart arguments are not path directives and stay quoted.
     `WorkingDirectory=${options.workingDirectory}`,
-    `EnvironmentFile=${systemdQuote(options.environmentFile)}`,
+    `EnvironmentFile=${options.environmentFile}`,
     `Environment=${systemdQuote(`KONTROL_LAUNCHER=systemd`)}`,
     `Environment=${systemdQuote(`KONTROL_EXPECTED_BUILD_ID=${options.buildId}`)}`,
     `ExecStart=/usr/bin/env ${execArgs}`,
@@ -818,11 +820,13 @@ export function renderUserServiceUnit(options: {
     "",
     "[Service]",
     "Type=simple",
-    // Bare path: systemd 249 on the supported host rejects a quoted
-    // WorkingDirectory as "not absolute". (EnvironmentFile/Environment
-    // quoting is accepted by the same systemd and stays quoted.)
+    // Bare paths: systemd 249 on the supported host rejects quoted
+    // WorkingDirectory and EnvironmentFile paths as "not absolute"
+    // (EnvironmentFile is silently ignored when quoted, so the service
+    // then starts without its environment). Environment= assignments and
+    // ExecStart arguments are not path directives and stay quoted.
     `WorkingDirectory=${options.workingDirectory}`,
-    `EnvironmentFile=${systemdQuote(options.environmentFile)}`,
+    `EnvironmentFile=${options.environmentFile}`,
     `Environment=${systemdQuote("KONTROL_LAUNCHER=systemd")}`,
     `Environment=${systemdQuote(`KONTROL_EXPECTED_BUILD_ID=${options.buildId}`)}`,
     `Environment=${systemdQuote(`KONTROL_EXPECTED_SCHEMA_VERSION=${options.schemaVersion}`)}`,

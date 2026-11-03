@@ -36,12 +36,16 @@ const unit = renderUserServiceUnit({
   workingDirectory: join(root, "working directory"),
 });
 const normalizedUnitPaths = unit.replaceAll("\\\\", "/");
-// Bare path (no quotes): systemd 249 — the production host's version —
-// rejects a quoted WorkingDirectory as "not absolute" (verified with
-// systemd-analyze). Quoting it encodes a unit the host cannot load.
+// Bare paths (no quotes): systemd 249 — the production host's version —
+// rejects a quoted WorkingDirectory as "not absolute", and silently
+// ignores a quoted EnvironmentFile (verified live: the service then
+// starts without its environment and exits "not configured"). Quoting
+// either encodes a unit the host cannot run. The spaces in the fixture
+// paths prove no quotes are emitted even when quoting looks tempting.
 assert.match(unit, /WorkingDirectory=.*working directory/);
 assert.doesNotMatch(unit, /WorkingDirectory="/);
-assert.match(unit, /EnvironmentFile=".*environment with spaces"/);
+assert.match(unit, /EnvironmentFile=.*environment with spaces/);
+assert.doesNotMatch(unit, /EnvironmentFile="/);
 assert.doesNotMatch(unit, /EnvironmentFile=-/);
 assert.match(unit, /RestartPreventExitStatus=78/);
 assert.match(unit, /Environment="KONTROL_ARTIFACT_PATH=.*release with spaces"/);
