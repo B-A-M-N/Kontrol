@@ -288,6 +288,7 @@ export const clientMutationReceipts = sqliteTable("client_mutation_receipts", {
 
 export type WorkspaceSessionRow = typeof workspaceSessions.$inferSelect;
 export type NewWorkspaceSessionRow = typeof workspaceSessions.$inferInsert;
+export type WorkspaceGoalRow = typeof workspaceGoals.$inferSelect;
 export type LoadedAgentFileRow = typeof loadedAgentFiles.$inferSelect;
 export type NewLoadedAgentFileRow = typeof loadedAgentFiles.$inferInsert;
 
@@ -335,6 +336,8 @@ export const workSessionSubmissions = sqliteTable("work_session_submissions", {
    * could not represent, so reviewers see the blind spot and an ordinary
    * approval is refused until explicitly accepted. Null = fully covered. */
   coverageJson: text("coverage_json"),
+  /** Explicit three-state assessment; legacy missing data migrates to unknown. */
+  coverageStatus: text("coverage_status", { enum: ["complete", "incomplete", "unknown"] }).notNull().default("unknown"),
   /** Exact working-tree snapshot commit the diff was captured against. Bound to
    * the submission so approval can require the workspace to still equal this
    * tree (fixes stale-approval after a concurrent submission in the same
@@ -353,6 +356,25 @@ export const workSessionSubmissions = sqliteTable("work_session_submissions", {
   index("wss_filesystem_snapshot_roots_idx").on(table.snapshotRef, table.workSessionId)
     .where(sql`${table.snapshotKind} = 'filesystem' and ${table.snapshotRef} is not null`),
 ]);
+
+export const workspaceGoals = sqliteTable(
+  "workspace_goals",
+  {
+    workspaceSessionId: text("workspace_session_id")
+      .primaryKey()
+      .references(() => workspaceSessions.id, { onDelete: "cascade" }),
+    goalId: text("goal_id").notNull(),
+    objective: text("objective").notNull(),
+    status: text("status", { enum: ["active", "blocked", "complete"] }).notNull(),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+    completedAt: text("completed_at"),
+  },
+  (table) => [
+    index("workspace_goals_goal_id_idx").on(table.goalId),
+    index("workspace_goals_status_idx").on(table.status, table.updatedAt),
+  ],
+);
 
 export const workSessionFeedback = sqliteTable("work_session_feedback", {
   id: text("id").primaryKey(),
@@ -523,6 +545,7 @@ export const continuations = sqliteTable("continuations", {
   verdict: text("verdict").notNull(),
   requiredActionsJson: text("required_actions_json").notNull().default("[]"),
   allowedNextActionsJson: text("allowed_next_actions_json").notNull().default("[]"),
+  allowedNextActionsSource: text("allowed_next_actions_source").notNull().default("legacy_unspecified"),
   reviewedDiffHash: text("reviewed_diff_hash"),
   feedbackSummary: text("feedback_summary"),
   resumeInstructions: text("resume_instructions"),
@@ -590,6 +613,7 @@ export const approvalRequests = sqliteTable("approval_requests", {
   principalId: text("principal_id"),
   approvalKey: text("approval_key"),
   operationHash: text("operation_hash"),
+  commandDigest: text("command_digest"),
   mcpSessionId: text("mcp_session_id"),
   mcpRequestId: text("mcp_request_id"),
   waiterKey: text("waiter_key"),

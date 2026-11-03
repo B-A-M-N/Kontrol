@@ -1,4 +1,5 @@
 import type Database from "better-sqlite3";
+import { shellTelemetrySync } from "../redaction.js";
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { getTableName, isTable } from "drizzle-orm";
@@ -120,9 +121,24 @@ const migrations: Migration[] = [
   { version: 106, name: "startup-recovery-selective-indexes", up: migrateStartupRecoverySelectiveIndexes },
   { version: 107, name: "review-browser-durable-auth-ownership", up: migrateReviewBrowserDurableAuthOwnership },
   { version: 108, name: "review-browser-launch-diagnostics", up: migrateReviewBrowserLaunchDiagnostics },
-  { version: 109, name: "review-route-skill-provenance", up: migrateReviewRouteSkillProvenance },
-  { version: 110, name: "review-browser-partial-observations", up: migrateReviewBrowserPartialObservations },
-  { version: 111, name: "review-browser-terminal-outcome", up: migrateReviewBrowserTerminalOutcome },
+  // Versions 109-113 follow the production lineage exactly (names and
+  // bodies): the live database already records them, so any rename or
+  // reorder here would fork the ledger. See reconcile note in 114-116.
+  { version: 109, name: "workspace-goals", up: migrateWorkspaceGoals },
+  { version: 110, name: "fail-closed-review-coverage-state", up: migrateReviewCoverageState },
+  { version: 111, name: "durable-review-mutation-provenance", up: migrateDurableReviewMutationProvenance },
+  { version: 112, name: "redacted-approval-command-previews", up: migrateApprovalCommandRedaction },
+  { version: 113, name: "continuation-action-permission-provenance", up: migrateContinuationActionPermissionProvenance },
+  // The review skill-provenance, partial-observation, and terminal-outcome
+  // schema changes were developed against this line as 109-111 before the
+  // production lineage was reconciled. On any database that already records
+  // the production 109-111 above, re-issuing them under 109-111 would be
+  // ambiguous, so they are re-based here as 114-116 with identical bodies:
+  // additive, idempotent, and safe to apply on top of production schema 113
+  // or a fresh database.
+  { version: 114, name: "review-route-skill-provenance", up: migrateReviewRouteSkillProvenance },
+  { version: 115, name: "review-browser-partial-observations", up: migrateReviewBrowserPartialObservations },
+  { version: 116, name: "review-browser-terminal-outcome", up: migrateReviewBrowserTerminalOutcome },
 ];
 
 function migrateStartupRecoverySelectiveIndexes(sqlite: Database.Database): void {
@@ -261,6 +277,78 @@ function migrateReviewBrowserLaunchDiagnostics(sqlite: Database.Database): void 
   addColumnIfMissing(sqlite, "review_browser_profiles", "browser_product", "text");
   addColumnIfMissing(sqlite, "review_browser_profiles", "remote_debugging_enabled", "integer");
   addColumnIfMissing(sqlite, "review_browser_profiles", "browser_launch_diagnostic", "text");
+}
+
+function migrateContinuationActionPermissionProvenance(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "continuations", "allowed_next_actions_source", "text not null default 'legacy_unspecified'");
+}
+
+function migrateWorkspaceGoals(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table if not exists workspace_goals (
+      workspace_session_id text primary key not null,
+      goal_id text not null,
+      objective text not null,
+      status text not null,
+      created_at text not null,
+      updated_at text not null,
+      completed_at text,
+      foreign key (workspace_session_id) references workspace_sessions(id) on delete cascade
+    );
+    create index if not exists workspace_goals_goal_id_idx
+      on workspace_goals(goal_id);
+    create index if not exists workspace_goals_status_idx
+      on workspace_goals(status, updated_at);
+  `);
+}
+
+function migrateReviewCoverageState(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "work_session_submissions", "coverage_status", "text not null default 'unknown'");
+  // Older rows only stored non-empty known omissions. A missing or malformed
+  // record cannot prove that a pending submission was fully covered.
+  const rows = sqlite.prepare(`
+    select id, coverage_json as coverageJson
+      from work_session_submissions
+     where coverage_json is not null
+       and coverage_status = 'unknown'
+  `).all() as Array<{ id: string; coverageJson: string }>;
+  const update = sqlite.prepare("update work_session_submissions set coverage_status = 'incomplete' where id = ?");
+  for (const row of rows) {
+    try {
+      const parsed = JSON.parse(row.coverageJson) as { uncoveredPaths?: unknown };
+      if (Array.isArray(parsed?.uncoveredPaths) && parsed.uncoveredPaths.length > 0) update.run(row.id);
+    } catch {
+      // Malformed legacy evidence remains unknown and cannot authorize approval.
+    }
+  }
+}
+
+function migrateDurableReviewMutationProvenance(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table if not exists review_mutation_provenance (
+      id text primary key not null,
+      workspace_id text not null,
+      work_session_id text not null default '',
+      operation_id text not null,
+      path text,
+      state text not null check (state in ('pending', 'applied', 'unknown')),
+      created_at text not null,
+      resolved_at text
+    );
+    create index if not exists review_mutation_provenance_scope_idx
+      on review_mutation_provenance(workspace_id, work_session_id, state, created_at);
+  `);
+}
+
+function migrateApprovalCommandRedaction(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "approval_requests", "command_digest", "text");
+  const rows = sqlite.prepare("select id, command from approval_requests where kind = 'tool' and command_digest is null")
+    .all() as Array<{ id: string; command: string }>;
+  const update = sqlite.prepare("update approval_requests set command_digest = ?, command = ? where id = ?");
+  for (const row of rows) {
+    const telemetry = shellTelemetrySync(row.command ?? "");
+    update.run(telemetry.commandHash, row.command ? telemetry.commandPreview : null, row.id);
+  }
 }
 
 function migrateReviewRouteSkillProvenance(sqlite: Database.Database): void {
